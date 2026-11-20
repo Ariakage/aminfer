@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M0 — project initialization (started 2026-11-20).
+M0 completed (2026-11-20). Next: M1 — GPU and weight foundation.
 
 ## Milestones
 
@@ -15,7 +15,7 @@ Status-row IDs refer to [status.md](status.md).
 
 | Milestone | Goal | Status rows | Exit criteria | State |
 | --- | --- | --- | --- | --- |
-| M0 | Project initialization | F1–F9 | `zig build` and `zig build test` pass in Debug and ReleaseSafe; docs baseline committed; local ikat index built | In progress |
+| M0 | Project initialization | F1–F9 | `zig build` and `zig build test` pass in Debug and ReleaseSafe; docs baseline committed; local ikat index built | Completed |
 | M1 | GPU and weight foundation | R1, R2, F6 (hot path), W1–W4, G1, G2, C9 | Wired budget enforced at startup; `.amf` round-trip (tools → Zig) with alignment validation; fused dequant GEMV / GEMM match a reference within tolerance; effective bandwidth measured per kernel | Not started |
 | M2 | Non-speculative decode | W5, W6, C1, C2, R3, R4, G3, G4 | Greedy end-to-end decode of the primary target from `.amf`; baseline tokens/s and bytes per token recorded | Not started |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2; speedup over the M2 baseline, acceptance-length and experts-per-pass statistics recorded | Not started |
@@ -53,7 +53,7 @@ Confirmed, or before an accepted design is tuned.
 - [x] Bridge: NoCopy buffer and Metal 4 smoke dispatch, test first (F5, F6)
 - [x] `tools/` uv scaffold (F7)
 - [x] `justfile` shortcuts (F8)
-- [ ] Verify Debug / ReleaseSafe / ReleaseFast; build the local ikat index
+- [x] Verify Debug / ReleaseSafe / ReleaseFast; build the local ikat index
 
 ## Verification log
 
@@ -72,6 +72,7 @@ Only checks that actually ran are listed.
 | 2026-11-20 | F5, F6: `zig build`; `zig build test` (Debug, ReleaseSafe): 20/20 tests; direct test binary with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 20/20 tests | Pass |
 | 2026-11-20 | F7: `cd tools && uv sync`; `uv run python -m unittest discover -s tests`: 4/4 tests; `uv run aminfer-tools --help` | Pass |
 | 2026-11-20 | F8: `just --list`, `just fmt-check`, `just sysctl-show`, `just swap-check`, `just tools-test`, `just probe` (sudo recipes not run) | Pass |
+| 2026-11-20 | M0 final gate: `zig fmt --check`, zero `catch {}`, `zig build` + `zig build test` (Debug, ReleaseSafe, ReleaseFast: 20/20 tests), `minos 26.0`, `tools` unittest (4/4), 28 markdown files link-checked (0 broken), `ikat init` | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -94,7 +95,7 @@ Update this before the context window runs out or when handing off.
 - Last updated: 2026-11-20
 - Commits so far: `1ad0da8` AGENTS.md, `6d5053d` license, `3a573a5` docs baseline,
   `0518ea8` build graph and probe, `06e8656` wired regions, `e6c9221` ExpertSource,
-  `1b49162` Metal 4 bridge, `f1cd47f` tools scaffold
-- In flight: final M0 verification (Debug / ReleaseSafe / ReleaseFast) and local ikat index
+  `1b49162` Metal 4 bridge, `f1cd47f` tools scaffold, `a89b83e` justfile
+- In flight: none (M0 complete; ready for M1)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md)
