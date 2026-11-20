@@ -53,12 +53,16 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
   64-byte `model_id`.
 - **Directory** — `tensor_count` fixed 128-byte `TensorEntry` records,
   zero-padded to a 16 KiB multiple: 48-byte name, `TensorKind`, `DType`
-  (implemented in M1: `f16`, `f32`, `q4_affine`, `q3_affine`; confirmed for M2.5:
-  `bf16 = 4` per [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)),
+  (implemented in M1: `f16`, `f32`, `q4_affine`, `q3_affine`; M2.5:
+  `bf16 = 4` per [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md);
+  Confirmed / Optional Pipeline for M4/M5: additive `QuantScheme` variants
+  `q2_affine`, `q6_affine`, `q8_affine` per
+  [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)),
   bit-width, rank, group size (`64` for affine quantized tensors, `0` for
   unquantized tensors), layer and expert indices, blob CRC-32, 4-element shape,
   16 KiB-aligned `blob_offset` and `blob_bytes`, `data_bytes`, 64 B-aligned
-  `params_offset`, and `params_bytes`.
+  `params_offset`, and `params_bytes`. Together, `dtype`, `quant_bits`, and
+  `group_size` form each block's static, immutable `QuantScheme` tag.
 - **Blobs** — each starts on a 16 KiB boundary and is zero-padded to a
   16 KiB multiple. For quantized 2D matrices (`[N, K]`, `K % 64 == 0`), bytes
   `[0..data_bytes)` hold MLX-compatible LSB-first packed weights (4-bit: 2
@@ -75,11 +79,59 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
   - Implemented in M1 (status row W4): single-file MLX community quantized
     safetensors (affine, group size 64; `bf16` scales/biases converted to `f16`
     on export).
-  - Confirmed for M2.5 (status row W12, [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)):
+  - Implemented in M2.5 (status row W12, [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)):
     streaming multi-shard Hugging Face / MLX checkpoints
     (`model.safetensors.index.json` across shard files with bounded host RAM)
     plus native bit-exact `BF16` / `FP16` unquantized and mixed-precision tensor
     export.
+  - **Confirmed / Optional Pipeline** (M4/M5, capabilities `W14` / `G13` in
+    [../status.md](../status.md),
+    [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)):
+    opt-in offline GSQ + RCO per-tensor / per-expert hybrid quantization
+    (`--quant-profile gsq-rco`, with `--quant-profile uniform` remaining the
+    default).
+
+## Optional GSQ-RCO quantization
+
+> **Confirmed / Optional Pipeline** — accepted in
+> [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md), not yet
+> implemented; authoritative status lives in [../status.md](../status.md)
+> (capabilities `W14` and `G13`, targeting M4/M5).
+
+- **100% offline in `tools/`**: sensitivity profiling (**GSQ** — group / layer /
+  expert sensitivity-guided quantization, combining calibration sensitivity with
+  offline expert heat statistics) and weight reconstruction / residual error
+  compensation (**RCO**) execute strictly offline in Python during `.amf`
+  export (`--quant-profile uniform | gsq-rco`). Zero Python, calibration logic,
+  or dynamic sensitivity scoring enters the Zig runtime
+  ([ADR-0001](../decisions/0001-language-and-toolchain-boundaries.md)).
+- **Immutable block-level `QuantScheme` in `.amf`**: each tensor or routed
+  expert blob carries its static `QuantScheme` (`q2_affine`, `q3_affine`,
+  `q4_affine`, `q6_affine`, `q8_affine`, `f16`, `bf16` with fixed compile-time
+  `group_size`) in its 128-byte `TensorEntry`, leaving 16 KiB page alignment,
+  64 B `params_offset` alignment, and CRC-32 IEEE validation unchanged.
+- **Per-tensor / per-expert granularity only**: every linear projection matrix
+  or routed MoE expert (`gate_proj` / `up_proj` / `down_proj`) has strictly one
+  uniform `QuantScheme`. Intra-tensor / sub-matrix mixed-bit packing across
+  channels, rows, or groups inside a single matrix is **explicitly forbidden**,
+  preserving 128-bit coalesced GPU loads, constant row strides, and zero
+  simdgroup divergence.
+- **Zero-branch runtime dispatch and byte-accurate pruning**: at startup, the
+  Zig loader validates every block's `QuantScheme` and binds each tensor /
+  expert slot directly to its `comptime` / Metal-function-constant-specialized
+  pipeline ([ADR-0014](../decisions/0014-compile-time-specialization.md)). In
+  heterogeneous MoE layers, CSR active-expert deduplication buckets active
+  experts by `QuantScheme`, and expert-byte-budget tree pruning
+  ([ADR-0009](../decisions/0009-expert-byte-budget-tree-pruning.md)) prices
+  each expert using its exact static byte size `b_{l,e}` from `.amf` — with zero
+  dynamic heuristics, zero inner-loop shader branches, and zero hot-path
+  allocation.
+- **Mandatory uniform baseline comparison**: `--quant-profile gsq-rco` is
+  strictly opt-in and never replaces the uniform `.amf` path (`3-bit`, `4-bit`,
+  `FP16`, `BF16`). Every GSQ + RCO build must be benchmarked side-by-side
+  against its uniform baseline on perplexity / output fidelity, wired DRAM
+  footprint (`swapouts_delta = 0`), effective `bytes/token`, and `tok/s` in
+  [../benchmarks/results.md](../benchmarks/results.md).
 
 ## Cold-expert I/O path
 

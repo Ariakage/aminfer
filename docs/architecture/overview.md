@@ -27,7 +27,7 @@ are larger, or decode faster, than any single engine allows.
 | CPU P-cores | L1 suffix-automaton drafting with zero allocation; lock-free scheduling; dual-source tree merging and expert-byte-budget pruning |
 | CPU E-cores | Asynchronous cold-expert prefetch from NVMe (`F_NOCACHE`, `aio_read` + `kqueue`) into 16 KiB-aligned ring slots |
 | ANE | L2 drafting: the same-family small draft model and pipelined drafting; EAGLE / MTP heads when the benchmark gate selects the ANE; attention blocks of the hybrid chunked prefill; cross-layer MoE expert prediction |
-| GPU (Metal) | L3: fused 3/4-bit dequantization and native FP16 / BF16 GEMV / GEMM, MoE expert gather and tree-attention verification; FFN / MoE half of the hybrid prefill; EAGLE / MTP heads when the gate selects the GPU |
+| GPU (Metal) | L3: fused 3/4-bit dequantization and native FP16 / BF16 GEMV / GEMM (plus optional static per-tensor / per-expert `QuantScheme` dispatch per [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)), MoE expert gather and tree-attention verification; FFN / MoE half of the hybrid prefill; EAGLE / MTP heads when the gate selects the GPU |
 | Wired DRAM | Hot experts, dense weights, KV tiles, activations and expert slots — 16 KiB aligned, `mlock`ed, inside the wired budget |
 | NVMe SSD | Cold experts in `.amf` files; N-gram tables |
 | Thunderbolt peer | Remote expert memory (future) |
@@ -73,7 +73,7 @@ The stages, their dependencies and what overlaps with what are described in
 | Engine core | Zig 0.17.1 | `src/` | Scheduler, memory pools, lock-free rings, L1 suffix automaton, async I/O, kqueue SSE server, model execution plan |
 | Hardware bridge | Objective-C (ARC) behind a pure C header | `src/bridge/` | The only code that calls Apple frameworks (Metal, CoreML, IOSurface, Foundation; CoreVideo where pixel-buffer-backed `MLMultiArray` requires it) |
 | GPU kernels | Metal Shading Language | `src/kernels/` | Dequantization GEMV / GEMM, MoE gather, attention and tree attention |
-| Offline tools | Python, managed by uv | `tools/` | `.amf` export, expert heat statistics, CoreML `.mlpackage` export |
+| Offline tools | Python, managed by uv | `tools/` | `.amf` export (default uniform precision; optional offline GSQ + RCO per-tensor / per-expert quantization per [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)), expert heat statistics, CoreML `.mlpackage` export |
 
 The boundaries and the build graph are fixed by
 [ADR-0001](../decisions/0001-language-and-toolchain-boundaries.md): Zig reads

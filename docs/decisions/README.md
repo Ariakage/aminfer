@@ -34,6 +34,7 @@ items. ADRs record decisions, not capability status — that lives in
 | [0014](0014-compile-time-specialization.md) | Compile-time specialization of hot code | Accepted | 2026-11-20 |
 | [0015](0015-tiered-frontier-model-roadmap.md) | Tiered frontier model roadmap (`Qwen3.8-Flash-Next` and `DeepSeek-V4.1-Flash-1017`) | Accepted | 2026-11-20 |
 | [0016](0016-native-fp16-bf16-and-multishard-import.md) | Native FP16 / BF16 execution and multi-shard safetensors import (M2.5) | Accepted | 2026-11-20 |
+| [0017](0017-optional-gsq-rco-hybrid-quantization.md) | Optional offline GSQ + RCO per-expert / per-layer hybrid quantization | Accepted | 2026-11-21 |
 
 ## Template
 

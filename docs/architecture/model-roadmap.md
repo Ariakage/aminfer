@@ -36,6 +36,39 @@ matching M1/M2 `.amf` packing).
 | **Tier 2** (M6) | **`Qwen3.8-Flash-Next`** (`qwen4_exp`) | 125B backbone (6B active/tok) + 51B PLE + 4B MTP | ~54.7 GiB backbone + NVMe-sharded PLE | **128 GB+ Max / Ultra** (full backbone wired) · **24 GB M4** (wired hot set + NVMe cold experts & PLE via ANE prediction + E-core async I/O) |
 | **Tier 3** (M7 / Future) | **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`) | 552B CED MoE (8B prefill / 16B decode) + 196B Engram (~748B total) | ~241.5 GiB backbone + ~86 GiB Engram (>330 GiB on disk; ~7.0 GiB/tok decode reads) | **512 GB Ultra** (full backbone wired on 800 GB/s bus) · **Multi-Mac 128–256 GB Thunderbolt 5 RDMA cluster** (`thunderbolt_peer`); **not viable on 24 GB M4** (< 0.7 tok/s NVMe bound) |
 
+### Optional GSQ-RCO footprint reduction across Tiers 1–3
+
+> **Confirmed / Optional Pipeline** ([ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md),
+> capabilities `W14` / `G13` in [../status.md](../status.md), not yet
+> implemented).
+
+The uniform-precision sizes in the matrix above (`3-bit`, `4-bit`, `FP16` /
+`BF16`) remain the default export path and mandatory benchmark baseline. As an
+opt-in offline pipeline in `tools/` (`--quant-profile gsq-rco`), GSQ + RCO can
+assign static per-tensor / per-expert `QuantScheme` tags in `.amf` (strictly
+whole-matrix / whole-expert, never intra-tensor mixed-bit) to reduce wired DRAM
+and NVMe footprint across MoE tiers:
+
+- **Tier 1 (`Qwen3-30B-A3B`)**: keep sensitive attention projections, routers,
+  and hot routed experts at higher precision (`q4_affine` / `bf16`) while
+  packing low-sensitivity or cold routed experts at `q3_affine` / `q2_affine`,
+  expanding 24 GB M4 wired headroom for KV tiles and speculative draft heads
+  (or improving fidelity within the same wired budget).
+- **Tier 2 (`Qwen3.8-Flash-Next`, 512 routed experts + `shared_expert`)**:
+  protect `shared_expert`, dense GDN/QSA projections, and hot routed experts
+  while compressing the long tail of cold routed experts to `q3_affine` /
+  `q2_affine`, shrinking both the 128 GB+ wired footprint and per-expert NVMe
+  direct-I/O bytes (`b_{l,e}`) streamed on 24 GB M4.
+- **Tier 3 (`DeepSeek-V4.1-Flash-1017`, 552B CED MoE)**: lower total backbone
+  wired footprint on 512 GB Ultra nodes and reduce per-expert bytes transferred
+  across Thunderbolt 5 RDMA clusters (24 GB M4 remains out of scope per
+  [ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md)).
+
+Every `--quant-profile gsq-rco` build must be benchmarked side-by-side against
+its uniform-precision `.amf` baseline on perplexity / output fidelity, wired
+DRAM footprint (`swapouts_delta = 0`), effective `bytes/token`, and `tok/s` in
+[../benchmarks/results.md](../benchmarks/results.md).
+
 ## Tier 2: `Qwen3.8-Flash-Next` (`qwen4_exp`) design fit and required work
 
 ### Architectural alignment with aminfer
