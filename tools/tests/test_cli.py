@@ -31,6 +31,17 @@ class CliTests(unittest.TestCase):
         self.assertIn("expert-heat", text)
         self.assertIn("export-coreml", text)
 
+    def test_pack_amf_help_lists_m25_options(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+            main(["pack-amf", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = out.getvalue()
+        for flag in ("--dtype", "--tie-word-embeddings", "--keep-tied-lm-head", "index.json"):
+            self.assertIn(flag, text)
+        for mode in ("auto", "f16", "bf16"):
+            self.assertIn(mode, text)
+
     def test_planned_subcommands_report_unimplemented(self) -> None:
         for cmd in ("expert-heat", "export-coreml"):
             err = io.StringIO()

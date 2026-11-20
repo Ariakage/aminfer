@@ -30,7 +30,25 @@ pub const DType = enum(u8) {
     f32 = 1,
     q4_affine = 2,
     q3_affine = 3,
+    /// Unquantized bfloat16 (ADR-0016): `quant_bits = 0`, 2 bytes per element.
+    bf16 = 4,
+
+    /// Bytes per element for unquantized dtypes; `null` for affine-quantized ones.
+    pub fn unquantizedElemSize(self: DType) ?u64 {
+        return switch (self) {
+            .f16, .bf16 => 2,
+            .f32 => 4,
+            .q4_affine, .q3_affine => null,
+        };
+    }
 };
+
+/// Chunk size used to stream blob CRC verification from disk (bounded memory).
+pub const VERIFY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+comptime {
+    if (VERIFY_CHUNK_BYTES % page.APPLE_PAGE_SIZE != 0) @compileError("VERIFY_CHUNK_BYTES must be 16 KiB aligned");
+}
 
 /// 128-byte wire header at byte 0 of page 0 (little-endian, zero implicit padding).
 pub const Header = extern struct {
@@ -148,12 +166,21 @@ pub const IoError = std.posix.UnexpectedError || error{
     ReadFailed,
 };
 
+/// Name -> directory index map. Keys borrow the `name` bytes of the owning
+/// `Parsed.entries` slice, which stays at a fixed heap address for the lifetime
+/// of the `Parsed` value.
+pub const NameIndex = std.StringHashMapUnmanaged(u32);
+
 pub const Parsed = struct {
     header: Header,
     entries: []TensorEntry,
     file_size: u64,
+    /// O(1) tensor lookup built during validation; freed by `deinit`.
+    index: NameIndex = .empty,
 
     pub fn deinit(self: *Parsed, allocator: std.mem.Allocator) void {
+        self.index.deinit(allocator);
+        self.index = .empty;
         allocator.free(self.entries);
         self.entries = &.{};
     }
@@ -162,7 +189,13 @@ pub const Parsed = struct {
         return std.mem.sliceTo(&self.header.model_id, 0);
     }
 
+    /// O(1) average lookup of a tensor entry by name.
     pub fn find(self: *const Parsed, name: []const u8) ?*const TensorEntry {
+        if (self.index.count() == self.entries.len) {
+            const idx = self.index.get(name) orelse return null;
+            return &self.entries[idx];
+        }
+        // Fallback for a hand-assembled `Parsed` whose index was never built.
         for (self.entries) |*entry| {
             if (std.mem.eql(u8, entry.nameSlice(), name)) return entry;
         }
@@ -195,8 +228,9 @@ pub const Parsed = struct {
             return error.DirectoryChecksumMismatch;
         }
 
-        try validateEntries(allocator, &hdr, entries, bytes.len);
-        return .{ .header = hdr, .entries = entries, .file_size = bytes.len };
+        var index = try validateEntries(allocator, &hdr, entries, bytes.len);
+        errdefer index.deinit(allocator);
+        return .{ .header = hdr, .entries = entries, .file_size = bytes.len, .index = index };
     }
 
     /// Verifies the CRC-32 of every blob in an in-memory `.amf` image.
@@ -282,13 +316,15 @@ pub const AmfFile = struct {
             return error.DirectoryChecksumMismatch;
         }
 
-        try validateEntries(allocator, &hdr, entries, file_size);
+        var index = try validateEntries(allocator, &hdr, entries, file_size);
+        errdefer index.deinit(allocator);
         return .{
             .fd = fd,
             .parsed = .{
                 .header = hdr,
                 .entries = entries,
                 .file_size = file_size,
+                .index = index,
             },
         };
     }
@@ -314,21 +350,37 @@ pub const AmfFile = struct {
         return dst;
     }
 
-    /// Streams every blob through a scratch buffer to verify all blob CRCs on disk.
+    /// Streams every blob through one reusable, bounded scratch buffer
+    /// (at most `VERIFY_CHUNK_BYTES`) to verify all blob CRCs on disk, so
+    /// multi-GiB `.amf` files verify with constant memory.
     pub fn verifyAllBlobs(self: *const AmfFile, allocator: std.mem.Allocator) (ParseError || IoError)!void {
-        var scratch_len: usize = 0;
-        for (self.parsed.entries) |*entry| {
-            scratch_len = @max(scratch_len, @as(usize, @intCast(entry.blob_bytes)));
-        }
-        if (scratch_len == 0) return;
+        return self.verifyAllBlobsChunked(allocator, VERIFY_CHUNK_BYTES);
+    }
+
+    /// `verifyAllBlobs` with an explicit 16 KiB-multiple chunk size (tests use
+    /// one page to exercise multi-chunk streaming on tiny files).
+    pub fn verifyAllBlobsChunked(
+        self: *const AmfFile,
+        allocator: std.mem.Allocator,
+        chunk_bytes: usize,
+    ) (ParseError || IoError)!void {
+        std.debug.assert(chunk_bytes > 0 and chunk_bytes % page.APPLE_PAGE_SIZE == 0);
+        var max_blob: u64 = 0;
+        for (self.parsed.entries) |*entry| max_blob = @max(max_blob, entry.blob_bytes);
+        if (max_blob == 0) return;
+        const scratch_len: usize = @intCast(@min(max_blob, @as(u64, chunk_bytes)));
         const buf = try allocator.alignedAlloc(u8, .fromByteUnits(page.APPLE_PAGE_SIZE), scratch_len);
         defer allocator.free(buf);
         for (self.parsed.entries) |*entry| {
-            const len: usize = @intCast(entry.blob_bytes);
-            try preadExact(self.fd, buf[0..len], entry.blob_offset);
-            if (std.hash.Crc32.hash(buf[0..len]) != entry.blob_crc32) {
-                return error.BlobChecksumMismatch;
+            var hasher = std.hash.Crc32.init();
+            var done: u64 = 0;
+            while (done < entry.blob_bytes) {
+                const take: usize = @intCast(@min(entry.blob_bytes - done, @as(u64, scratch_len)));
+                try preadExact(self.fd, buf[0..take], entry.blob_offset + done);
+                hasher.update(buf[0..take]);
+                done += take;
             }
+            if (hasher.final() != entry.blob_crc32) return error.BlobChecksumMismatch;
         }
     }
 };
@@ -375,22 +427,29 @@ const Range = struct {
     }
 };
 
+/// Validates every directory record and returns the O(1) name index (caller
+/// owns it). Duplicate names are detected through the same hash map, so the
+/// whole pass is O(N log N) (dominated by the overlap sort) instead of O(N^2).
 fn validateEntries(
     allocator: std.mem.Allocator,
     hdr: *const Header,
     entries: []const TensorEntry,
     file_size: u64,
-) ParseError!void {
+) ParseError!NameIndex {
     const data_start = hdr.directory_offset + hdr.directory_bytes;
     const ranges = try allocator.alloc(Range, entries.len);
     defer allocator.free(ranges);
 
+    var index: NameIndex = .empty;
+    errdefer index.deinit(allocator);
+    try index.ensureTotalCapacity(allocator, hdr.tensor_count);
+
     for (entries, 0..) |*entry, i| {
         const name = entry.nameSlice();
         if (name.len == 0) return error.EmptyTensorName;
-        for (entries[0..i]) |*prev| {
-            if (std.mem.eql(u8, prev.nameSlice(), name)) return error.DuplicateTensorName;
-        }
+        const gop = index.getOrPutAssumeCapacity(name);
+        if (gop.found_existing) return error.DuplicateTensorName;
+        gop.value_ptr.* = @intCast(i);
         _ = try entry.tensorKind();
         const dtype = try entry.dataType();
         if (entry.rank == 0 or entry.rank > 4) return error.InvalidRank;
@@ -406,7 +465,7 @@ fn validateEntries(
         if (blob_end > file_size) return error.BlobOutOfBounds;
 
         switch (dtype) {
-            .f16, .f32 => {
+            .f16, .bf16, .f32 => {
                 if (entry.quant_bits != 0 or entry.group_size != 0) return error.InvalidQuantization;
                 if (entry.params_offset != 0 or entry.params_bytes != 0) return error.MisalignedParams;
                 var elems: u64 = 1;
@@ -414,7 +473,7 @@ fn validateEntries(
                     if (entry.shape[d] == 0) return error.InvalidShape;
                     elems = std.math.mul(u64, elems, entry.shape[d]) catch return error.InvalidShape;
                 }
-                const elem_size: u64 = if (dtype == .f16) 2 else 4;
+                const elem_size: u64 = dtype.unquantizedElemSize() orelse unreachable;
                 const expected_bytes = std.math.mul(u64, elems, elem_size) catch return error.InvalidShape;
                 if (entry.data_bytes != expected_bytes or entry.data_bytes > entry.blob_bytes) {
                     return error.InvalidShape;
@@ -448,6 +507,7 @@ fn validateEntries(
     for (1..ranges.len) |i| {
         if (ranges[i].start < ranges[i - 1].end) return error.OverlappingBlobs;
     }
+    return index;
 }
 
 fn buildTestAmf(allocator: std.mem.Allocator, entry: TensorEntry, blob_data: []const u8) ![]u8 {
@@ -694,4 +754,238 @@ test "AmfFile opens with F_NOCACHE, verifies CRCs and loads into WiredArena" {
     const loaded = try amf_file.loadBlob(found, &arena);
     try std.testing.expectEqual(page.APPLE_PAGE_SIZE, loaded.len);
     try std.testing.expectEqualSlices(u8, &payload, loaded[0..payload.len]);
+}
+
+/// Builds an `.amf` image with one 16 KiB blob per entry (each blob filled
+/// with a per-entry byte pattern). Entry blob offsets, sizes and CRCs plus the
+/// directory and header CRCs are computed here.
+fn buildTestAmfMulti(allocator: std.mem.Allocator, entries_in: []const TensorEntry) ![]u8 {
+    const count = entries_in.len;
+    const dir_offset: usize = page.APPLE_PAGE_SIZE;
+    const dir_raw = count * @sizeOf(TensorEntry);
+    const dir_bytes: usize = try page.alignUp(dir_raw);
+    const data_start = dir_offset + dir_bytes;
+    const total = data_start + count * page.APPLE_PAGE_SIZE;
+
+    const image = try allocator.alloc(u8, total);
+    errdefer allocator.free(image);
+    @memset(image, 0);
+
+    for (entries_in, 0..) |entry, i| {
+        const blob_offset = data_start + i * page.APPLE_PAGE_SIZE;
+        const blob = image[blob_offset..][0..page.APPLE_PAGE_SIZE];
+        @memset(blob[0..@intCast(entry.data_bytes)], @truncate(i *% 31 +% 7));
+        var e = entry;
+        e.blob_offset = blob_offset;
+        e.blob_bytes = page.APPLE_PAGE_SIZE;
+        e.blob_crc32 = std.hash.Crc32.hash(blob);
+        @memcpy(image[dir_offset + i * @sizeOf(TensorEntry) ..][0..@sizeOf(TensorEntry)], std.mem.asBytes(&e));
+    }
+
+    var hdr: Header = .{
+        .magic = MAGIC,
+        .version = FORMAT_VERSION,
+        .flags = 0,
+        .page_size = page.APPLE_PAGE_SIZE,
+        .checksum_algo = CHECKSUM_CRC32_IEEE,
+        .tensor_count = @intCast(count),
+        .reserved0 = 0,
+        .directory_offset = dir_offset,
+        .directory_bytes = dir_bytes,
+        .directory_crc32 = std.hash.Crc32.hash(image[dir_offset..][0..dir_raw]),
+        .header_crc32 = 0,
+        .model_id = @splat(0),
+        .reserved1 = 0,
+    };
+    const model = "multi-model";
+    @memcpy(hdr.model_id[0..model.len], model);
+    hdr.header_crc32 = computeHeaderCrc32(&hdr);
+    @memcpy(image[0..@sizeOf(Header)], std.mem.asBytes(&hdr));
+    return image;
+}
+
+fn bf16TestEntry() TensorEntry {
+    var entry = TensorEntry.zeroed("layers.0.self_attn.q_proj.weight", .dense, .bf16);
+    entry.rank = 2;
+    entry.layer = 0;
+    entry.shape = .{ 4, 64, 0, 0 };
+    entry.data_bytes = 4 * 64 * 2;
+    return entry;
+}
+
+test "DType.bf16 is wire value 4 and parses as an unquantized 2-byte tensor" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(DType.bf16));
+    try std.testing.expectEqual(@as(?u64, 2), DType.bf16.unquantizedElemSize());
+    try std.testing.expectEqual(@as(?u64, 2), DType.f16.unquantizedElemSize());
+    try std.testing.expectEqual(@as(?u64, 4), DType.f32.unquantizedElemSize());
+    try std.testing.expectEqual(@as(?u64, null), DType.q3_affine.unquantizedElemSize());
+
+    var payload: [512]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i);
+    const image = try buildTestAmf(gpa, bf16TestEntry(), &payload);
+    defer gpa.free(image);
+
+    var parsed = try Parsed.parseBytes(gpa, image);
+    defer parsed.deinit(gpa);
+    const found = parsed.find("layers.0.self_attn.q_proj.weight") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DType.bf16, try found.dataType());
+    try std.testing.expectEqual(@as(u8, 0), found.quant_bits);
+    try std.testing.expectEqual(@as(u64, 512), found.data_bytes);
+    try parsed.verifyAllBlobsFromBytes(image);
+    try std.testing.expect(parsed.find("layers.0.self_attn.q_proj") == null);
+}
+
+test "validator rejects invalid bf16 metadata" {
+    const gpa = std.testing.allocator;
+    const payload: [2048]u8 = @splat(0x3F);
+
+    const Case = struct { err: ParseError, entry: TensorEntry };
+    var cases: [9]Case = undefined;
+    var n: usize = 0;
+
+    var e = bf16TestEntry();
+    e.quant_bits = 16; // ADR-0016 contract: unquantized bf16 carries quant_bits = 0.
+    cases[n] = .{ .err = error.InvalidQuantization, .entry = e };
+    n += 1;
+
+    e = bf16TestEntry();
+    e.group_size = 64;
+    cases[n] = .{ .err = error.InvalidQuantization, .entry = e };
+    n += 1;
+
+    e = bf16TestEntry();
+    e.params_offset = 512;
+    cases[n] = .{ .err = error.MisalignedParams, .entry = e };
+    n += 1;
+
+    e = bf16TestEntry();
+    e.params_bytes = 64;
+    cases[n] = .{ .err = error.MisalignedParams, .entry = e };
+    n += 1;
+
+    e = bf16TestEntry();
+    e.data_bytes = 4 * 64 * 4; // f32-sized payload
+    cases[n] = .{ .err = error.InvalidShape, .entry = e };
+    n += 1;
+
+    e = bf16TestEntry();
+    e.shape = .{ 4, 0, 0, 0 };
+    cases[n] = .{ .err = error.InvalidShape, .entry = e };
+    n += 1;
+
+    e = bf16TestEntry();
+    e.rank = 0;
+    cases[n] = .{ .err = error.InvalidRank, .entry = e };
+    n += 1;
+
+    e = bf16TestEntry();
+    e.rank = 5;
+    cases[n] = .{ .err = error.InvalidRank, .entry = e };
+    n += 1;
+
+    e = bf16TestEntry();
+    e.dtype = 5; // unknown dtype past bf16
+    cases[n] = .{ .err = error.InvalidDType, .entry = e };
+    n += 1;
+
+    for (cases[0..n]) |c| {
+        const image = try buildTestAmf(gpa, c.entry, &payload);
+        defer gpa.free(image);
+        try std.testing.expectError(c.err, Parsed.parseBytes(gpa, image));
+    }
+
+    // data_bytes larger than the blob is rejected too.
+    e = bf16TestEntry();
+    e.rank = 1;
+    e.shape = .{ page.APPLE_PAGE_SIZE, 0, 0, 0 }; // 32 KiB of bf16 > one 16 KiB blob
+    e.data_bytes = 2 * page.APPLE_PAGE_SIZE;
+    const image = try buildTestAmf(gpa, e, &payload);
+    defer gpa.free(image);
+    try std.testing.expectError(error.InvalidShape, Parsed.parseBytes(gpa, image));
+}
+
+test "hash-indexed lookup and duplicate detection over thousands of entries" {
+    const gpa = std.testing.allocator;
+    const count: usize = 4096;
+    const entries = try gpa.alloc(TensorEntry, count);
+    defer gpa.free(entries);
+
+    var name_buf: [48]u8 = undefined;
+    for (entries, 0..) |*entry, i| {
+        const name = try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj.weight", .{ i / 128, i % 128 });
+        entry.* = TensorEntry.zeroed(name, .hot_expert, if (i % 2 == 0) .bf16 else .f16);
+        entry.rank = 1;
+        entry.layer = @intCast(i / 128);
+        entry.expert = @intCast(i % 128);
+        entry.shape = .{ 64, 0, 0, 0 };
+        entry.data_bytes = 128;
+    }
+
+    const image = try buildTestAmfMulti(gpa, entries);
+    defer gpa.free(image);
+
+    var parsed = try Parsed.parseBytes(gpa, image);
+    defer parsed.deinit(gpa);
+    try std.testing.expectEqual(count, parsed.entries.len);
+    try std.testing.expectEqual(@as(u32, count), parsed.index.count());
+    try parsed.verifyAllBlobsFromBytes(image);
+
+    for (0..count) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj.weight", .{ i / 128, i % 128 });
+        const found = parsed.find(name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(&parsed.entries[i], found);
+        try std.testing.expectEqual(@as(u16, @intCast(i % 128)), found.expert);
+    }
+    try std.testing.expect(parsed.find("layers.99.mlp.experts.0.gate_proj.weight") == null);
+    try std.testing.expect(parsed.find("") == null);
+
+    // The same hash map rejects a duplicate placed at the very end.
+    entries[count - 1] = entries[0];
+    const dup_image = try buildTestAmfMulti(gpa, entries);
+    defer gpa.free(dup_image);
+    try std.testing.expectError(error.DuplicateTensorName, Parsed.parseBytes(gpa, dup_image));
+}
+
+test "AmfFile.verifyAllBlobsChunked streams multi-chunk blobs and detects corruption" {
+    const gpa = std.testing.allocator;
+    const payload_len = 3 * page.APPLE_PAGE_SIZE - 100;
+    const payload = try gpa.alloc(u8, payload_len);
+    defer gpa.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 13);
+
+    var entry = TensorEntry.zeroed("embed_tokens.weight", .embedding, .bf16);
+    entry.rank = 2;
+    entry.shape = .{ 6, (payload_len / 2) / 6, 0, 0 };
+    entry.data_bytes = @as(u64, entry.shape[0]) * entry.shape[1] * 2;
+
+    const image = try buildTestAmf(gpa, entry, payload);
+    defer gpa.free(image);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chunked.amf", .data = image });
+    // Corrupt the last page of the 3-page blob in a second file.
+    const bad = try gpa.dupe(u8, image);
+    defer gpa.free(bad);
+    bad[bad.len - 1] ^= 0x5A;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chunked_bad.amf", .data = bad });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const raw_path = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], ".zig-cache/tmp/{s}/chunked.amf", .{tmp.sub_path});
+    path_buf[raw_path.len] = 0;
+    var good_file = try AmfFile.open(gpa, path_buf[0..raw_path.len :0]);
+    defer good_file.close(gpa);
+    try good_file.verifyAllBlobsChunked(gpa, page.APPLE_PAGE_SIZE);
+    try good_file.verifyAllBlobs(gpa);
+    const found = good_file.parsed.find("embed_tokens.weight") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DType.bf16, try found.dataType());
+
+    var bad_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const bad_path = try std.fmt.bufPrint(bad_buf[0 .. bad_buf.len - 1], ".zig-cache/tmp/{s}/chunked_bad.amf", .{tmp.sub_path});
+    bad_buf[bad_path.len] = 0;
+    var bad_file = try AmfFile.open(gpa, bad_buf[0..bad_path.len :0]);
+    defer bad_file.close(gpa);
+    try std.testing.expectError(error.BlobChecksumMismatch, bad_file.verifyAllBlobsChunked(gpa, page.APPLE_PAGE_SIZE));
+    try std.testing.expectError(error.BlobChecksumMismatch, bad_file.verifyAllBlobs(gpa));
 }

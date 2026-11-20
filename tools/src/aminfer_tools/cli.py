@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
+import time
 from collections.abc import Sequence
 
 from aminfer_tools import APPLE_PAGE_SIZE
-from aminfer_tools.amf import pack_amf_from_safetensors
+from aminfer_tools.amf import DTYPE_MODES, pack_amf_from_safetensors
 from aminfer_tools.synth import PRESETS, generate_qwen3_bundle
 
 
@@ -47,12 +48,48 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pack = sub.add_parser(
         "pack-amf",
-        help="Pack MLX affine quantized safetensors into a 16 KiB-aligned .amf v0 file",
+        help=(
+            "Stream a safetensors checkpoint (single file, index.json or directory) "
+            "into a 16 KiB-aligned .amf v0 file"
+        ),
     )
-    pack.add_argument("--input", required=True, type=pathlib.Path, help="Input .safetensors path")
+    pack.add_argument(
+        "--input",
+        required=True,
+        type=pathlib.Path,
+        help=(
+            "Input .safetensors file, model.safetensors.index.json, or checkpoint directory "
+            "(auto-locates model.safetensors.index.json or model.safetensors)"
+        ),
+    )
     pack.add_argument("--output", required=True, type=pathlib.Path, help="Output .amf path")
     pack.add_argument("--model-id", default="aminfer-model", help="Model identifier stored in header")
     pack.add_argument("--group-size", type=int, default=64, help="Quantization group size (default: 64)")
+    pack.add_argument(
+        "--dtype",
+        choices=DTYPE_MODES,
+        default="auto",
+        help=(
+            "Unquantized tensor precision: auto preserves F16/BF16/F32 bit-exact; "
+            "f16 converts BF16 to F16; bf16 converts F16 to BF16 (default: auto)"
+        ),
+    )
+    pack_tie = pack.add_mutually_exclusive_group()
+    pack_tie.add_argument(
+        "--tie-word-embeddings",
+        dest="tie_word_embeddings",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Skip a duplicate lm_head when embed_tokens is present (default: read config.json)",
+    )
+    pack_tie.add_argument(
+        "--keep-tied-lm-head",
+        dest="tie_word_embeddings",
+        action="store_const",
+        const=False,
+        help="Always emit lm_head even if config.json sets tie_word_embeddings",
+    )
     pack.add_argument(
         "--cold-experts",
         default=None,
@@ -122,6 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "pack-amf":
         cold = _parse_cold_experts(args.cold_experts)
+        started = time.monotonic()
         metas = pack_amf_from_safetensors(
             args.input,
             args.output,
@@ -129,9 +167,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             group_size=args.group_size,
             cold_experts=cold,
             all_experts_cold=args.all_experts_cold,
+            dtype_mode=args.dtype,
+            tie_word_embeddings=args.tie_word_embeddings,
         )
+        elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
-        print(f"packed {len(metas)} tensors into {args.output} ({total_bytes} bytes)")
+        by_dtype: dict[str, int] = {}
+        for m in metas:
+            by_dtype[m.dtype.name.lower()] = by_dtype.get(m.dtype.name.lower(), 0) + 1
+        dtype_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_dtype.items()))
+        print(
+            f"packed {len(metas)} tensors into {args.output} ({total_bytes} bytes) "
+            f"in {elapsed:.1f} s [{dtype_summary}]"
+        )
         return 0
 
     if args.command == "synth-qwen3":

@@ -525,7 +525,7 @@ pub const Qwen3Model = struct {
                     for (0..64) |j| self.x_host[g * 64 + j] = @floatCast(tmp[j]);
                 }
             },
-            .f32 => unreachable,
+            .f32, .bf16 => unreachable,
         }
     }
 
@@ -827,7 +827,7 @@ fn loadInternal(
     }
     switch (embed_dt) {
         .f16, .q3_affine, .q4_affine => {},
-        .f32 => return error.UnexpectedTensorDType,
+        .f32, .bf16 => return error.UnexpectedTensorDType,
     }
 
     const final_norm_entry = try findRequired(parsed, "norm.weight");
@@ -1125,7 +1125,7 @@ fn loadInternal(
         .f16 => @as(usize, h) * @sizeOf(f16),
         .q3_affine => try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).rowWeightBytes(h),
         .q4_affine => try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).rowWeightBytes(h),
-        .f32 => unreachable,
+        .f32, .bf16 => unreachable,
     };
     const embed_row_alg_bytes: u64 = embed_row_bytes + if (embed_dt == .f16) @as(u64, 0) else (@as(u64, h / 64) * @sizeOf(quant.ScaleBias));
     const global_head_bytes: u64 = embed_row_alg_bytes + final_norm_entry.data_bytes + lm_head_qb.alg_bytes;
