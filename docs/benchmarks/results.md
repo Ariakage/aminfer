@@ -1051,3 +1051,407 @@ decode.swapouts_delta            0
 decode.token_ids                 [121296, 151333, 151333, 151333, 106281, 53955, 53955, 24113, 52463, 23579, 13999, 7871, 18364, 18364, 7871, 23579]
 decode.text                       v121296 v151333 v151333 v151333 v106281 v053955 v053955 v024113 v052463 v023579 v013999 v007871 v018364 v018364 v007871 v023579
 ```
+
+## M2.5 Native FP16 / BF16 kernels and real-checkpoint benchmarks (standalone ReleaseFast)
+
+Measured on 2026-11-20–2026-11-21 on the Apple M4 24 GiB baseline (`Mac16,12`,
+macOS 27.2 `26B123`, default kernel tunables `wired_budget_mib = 18186`) at git
+commit `1893ab6` (incorporating `2a48c66` W12 `.amf` `bf16` + multi-shard
+streaming packer and `32dc321` G12 Metal 4 native `FP16`/`BF16` kernels) via
+standalone non-root ReleaseFast `./zig-out/bin/aminfer`. All `.amf` files and
+temporary artifacts were placed strictly on external NVMe
+(`/Volumes/Akari/models/amf/`, `TMPDIR=/Volumes/Akari/.tmp`).
+
+### M2.5 methodology notes
+
+1. **Multi-shard streaming `.amf` conversion (`W12`)**: All three local
+   Hugging Face / MLX checkpoints (`Qwen/Qwen3-0.6B` BF16,
+   `mlx-community/Qwen3-14B-4bit`, and `mlx-community/Qwen3-30B-A3B-3bit`) were
+   converted via `aminfer-tools pack-amf --dtype auto` (two-pass header-first
+   layout + bounded-RAM streaming with incremental CRC-32; peak RSS measured via
+   `/usr/bin/time -l`) and validated end-to-end with ReleaseFast
+   `./zig-out/bin/aminfer verify-amf` (`F_NOCACHE`, `<= 8 MiB` streaming CRC
+   buffer).
+2. **Native `FP16` / `BF16` GEMV & GEMM calibration (`G12`, `aminfer bench-m25`)**:
+   Mirrors M1's 16 C9 shapes (`1×2048×2048`, `1×6144×2048`, `1×2048×768`,
+   `1×4096×4096`, plus `M = 16` and `M = 64` on `2048×2048` and `4096×4096`)
+   over a single 97 MiB `Budget`-checked `WiredArena` with a 96 MiB rotating
+   weight pool (3–32 slots per shape so even 32 MiB `4096×4096` matrices bust
+   M4 L2/SLC). Algorithmic traffic per dispatch is `weight + x + y`
+   (`(N*K + M*K + M*N) * 2` bytes); compute throughput is reported as
+   `TFLOP/s = (2 * M * N * K * dispatches) / (elapsed_ns * 1000)`.
+3. **Real-checkpoint full-depth decode & `bench-decode` (`W13`)**: Executes the
+   complete real 28-layer (`Qwen3-0.6B` BF16), 40-layer (`Qwen3-14B-4bit`), and
+   48-layer (`Qwen3-30B-A3B-3bit`) models end-to-end through `aminfer decode`
+   (English & Chinese ChatML prompts, `--max-tokens 32`, checking coherent
+   readable text and `swapouts_delta = 0`) and `aminfer bench-decode
+   --prefill-tokens 511 --decode-steps 16` (measured at exact `seq_len = 512`).
+4. **Hot-path `malloc_zone_statistics` note**: As documented in
+   [ADR-0011](../decisions/0011-metal4-zero-allocation-hot-path.md), a fresh
+   `MTL4CommandQueue` lazily fills Apple's bounded internal Metal 4 driver pool
+   (~2,000 × 64 B ≈ 128 KiB) across early commits before flattening to `0` in
+   steady state. Accordingly, standalone short `decode` runs (6–32 steps) show
+   `2 × 64 B` per commit inside the driver pool fill window, while full
+   `bench-decode` (`515` warmup commits) reaches `0 blocks / 0 B` on
+   `Qwen3-0.6B` BF16 and `2 blocks / 352 B` on `Qwen3-14B-4bit` /
+   `Qwen3-30B-A3B-3bit` with zero allocations from aminfer and `swapouts_delta = 0`
+   across every run.
+
+### Multi-shard `.amf` conversion and verification summary (`W12`)
+
+| Real checkpoint | Source shards | `.amf` tensors | Precision mix in `.amf` (`--dtype auto`) | `.amf` file size (B) | Pack time (s) | Pack peak RSS | `verify-amf` time (s) | `verify-amf` RSS |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| **`Qwen/Qwen3-0.6B`** | 1 | 310 | Pure `BF16` (`lm_head` deduped via `tie_word_embeddings = true`) | 1,193,885,696 | 4.7 | 35 MB | 4.6 | 21 MB |
+| **`mlx-community/Qwen3-14B-4bit`** | 2 | 443 | 282 `q4_affine` (incl. `embed_tokens`, `lm_head`) + 161 `bf16` norms | 8,309,669,888 | 50.4 | 116 MB | 28.3 | 21 MB |
+| **`mlx-community/Qwen3-30B-A3B-3bit`** | 3 | 18,867 | 18,432 per-expert `q3_affine` + 192 `q3_affine` attn + 48 `q3_affine` routers + `q3_affine` embed/head + 193 `bf16` norms | 13,363,314,688 | 111.6 | 127 MB | 50.9 | 25 MB |
+
+Peak Python RSS stayed well below the 512 MiB target (**35–127 MB** even when
+streaming and slicing the 12.44 GiB, 3-shard `Qwen3-30B-A3B-3bit` checkpoint
+into 18,867 16 KiB-aligned blobs), and Zig `verify-amf` stayed at **21–25 MB**
+RSS across all three files.
+
+### M2.5 native `FP16` / `BF16` GEMV & GEMM calibration summary (`G12`)
+
+Measured via standalone ReleaseFast `./zig-out/bin/aminfer bench-m25`
+(`wired_budget_mib = 18186`, `arena_mib = 97`, `swapouts_delta = 0`,
+`pageouts_delta = 0`):
+
+| Kernel | Shape (`M×N×K`) | Bytes/dispatch | Weight slots | Latency (us) | Effective `beta` (GB/s) | % of 120 GB/s bus | Compute (TFLOP/s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gemv_f16` | `1×2048×2048` | 8,396,800 | 12 | 110.39 | 76.07 | 63.4% | 0.076 |
+| `gemv_f16` | `1×6144×2048` | 25,182,208 | 4 | 319.71 | 78.77 | 65.6% | 0.079 |
+| `gemv_f16` | `1×2048×768` | 3,151,360 | 32 | 40.98 | 76.90 | 64.1% | 0.077 |
+| `gemv_f16` | `1×4096×4096` | 33,570,816 | 3 | 386.94 | **86.76** | **72.3%** | 0.087 |
+| `gemv_bf16` | `1×2048×2048` | 8,396,800 | 12 | 108.40 | 77.46 | 64.5% | 0.077 |
+| `gemv_bf16` | `1×6144×2048` | 25,182,208 | 4 | 320.88 | 78.48 | 65.4% | 0.078 |
+| `gemv_bf16` | `1×2048×768` | 3,151,360 | 32 | 36.70 | 85.86 | 71.6% | 0.086 |
+| `gemv_bf16` | `1×4096×4096` | 33,570,816 | 3 | 380.39 | **88.25** | **73.5%** | 0.088 |
+| `gemm_f16` | `16×2048×2048` | 8,519,680 | 12 | 121.76 | 69.97 | 58.3% | 1.102 |
+| `gemm_f16` | `16×4096×4096` | 33,816,576 | 3 | 444.96 | 76.00 | 63.3% | 1.207 |
+| `gemm_f16` | `64×2048×2048` | 8,912,896 | 12 | 199.55 | 44.67 | 37.2% | **2.690** |
+| `gemm_f16` | `64×4096×4096` | 34,603,008 | 3 | 913.26 | 37.89 | 31.6% | 2.351 |
+| `gemm_bf16` | `16×2048×2048` | 8,519,680 | 12 | 153.73 | 55.42 | 46.2% | 0.873 |
+| `gemm_bf16` | `16×4096×4096` | 33,816,576 | 3 | 489.96 | 69.02 | 57.5% | 1.096 |
+| `gemm_bf16` | `64×2048×2048` | 8,912,896 | 12 | 214.01 | 41.65 | 34.7% | **2.509** |
+| `gemm_bf16` | `64×4096×4096` | 34,603,008 | 3 | 868.59 | 39.84 | 33.2% | 2.472 |
+
+Notes:
+- Native `BF16` GEMV matches or slightly edges `FP16` GEMV (**88.25 GB/s / 73.5%
+  bus** vs **86.76 GB/s / 72.3% bus** on `1×4096×4096`), confirming zero penalty
+  for preserving upstream `BF16` weights natively on Apple9 Metal 4.
+- Batched `simdgroup_half8x8` and `simdgroup_bfloat8x8` GEMM (accumulating into
+  `simdgroup_float8x8` `FP32`) sustain **2.47–2.69 TFLOP/s** at `M = 64` and
+  **1.10–1.21 TFLOP/s** (`69–76 GB/s`) at `M = 16`, directly benefiting M3
+  speculative tree verification and M4 prefill.
+
+### Real-checkpoint full-layer decode summary vs M2 4-layer projections (`seq_len = 512`)
+
+| Real model (`.amf`) | Layers | Shards | Wired (MiB) | `load_ms` | Measured `ms/tok` | Measured `tok/s` | Bytes/tok | Effective `beta` (GB/s / % bus) | M2 4L linear projection (`tok/s`) | Delta vs M2 projection | `swapouts` delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | ---: |
+| **`Qwen3-0.6B` (BF16, tied)** | 28 | 1 | 1,251 | 4,433.8 | 20.884 | **47.88** | 1,250,936,832 | 59.90 (49.9%) | 55.20 *(M2.5 4L synth)* | -13.3% *(short 32-tok EN/ZH: 62.98–66.17 tok/s, 75.5–79.3 GB/s)* | 0 |
+| **`Qwen3-14B-4bit` (q4 + bf16 norms)** | 40 | 1 | 8,086 | 29,793.1 | 104.997 | **9.52** | 7,954,260,800 | 75.76 (63.1%) | 9.74 *(M2 4L synth)* | **-2.3%** (`2.423` vs `2.436 ms/L`, exact bytes match; short EN/ZH: 10.56–10.67 tok/s, 83.1–84.0 GB/s) | 0 |
+| **`Qwen3-30B-A3B-3bit` (q3 + bf16 norms)** | 48 | 1 | 12,839 | 53,596.4 | 19.282 | **51.86** | 1,381,577,600 | 71.65 (59.7%) | 40.79 *(M2 4L synth)* | **+27.1%** (`0.402` vs `0.477 ms/L`; quantized `q3` routers save 19.7 MB/tok + 48L command-buffer amortization + real expert locality) | 0 |
+
+Real-checkpoint interactive `aminfer decode` summary (English & Chinese ChatML
+prompts, `--max-tokens 32`, `swapouts_delta = 0` on all runs):
+
+| Real model | Prompt | Generated text | `decode_tok_per_s` | Effective `beta` (GB/s) | `swapouts` delta |
+| --- | --- | --- | ---: | ---: | ---: |
+| `Qwen3-0.6B` (`bf16`) | EN capital | `The capital of France is Paris.<\|im_end\|>` | 51.27 | 61.31 | 0 |
+| `Qwen3-0.6B` (`bf16`) | ZH capital | `中国的首都是北京。<\|im_end\|>` | 50.31 | 60.14 | 0 |
+| `Qwen3-0.6B` (`bf16`) | EN UMA (32 tok) | `Unified Memory is a feature in Apple Silicon that allows the system to share data between the CPU and the GPU, improving performance by reducing the need for frequent memory swaps` | **62.98** | 75.48 | 0 |
+| `Qwen3-0.6B` (`bf16`) | ZH UMA (32 tok) | `苹果的统一内存架构（Unified Memory Architecture, UMA）通过将多个核心的内存共享为一个单一的内存池，提高了内存的利用率和` | **66.17** | 79.29 | 0 |
+| `Qwen3-14B-4bit` (`q4`) | EN capital | `The capital of France is Paris.<\|im_end\|>` | 10.67 | 84.00 | 0 |
+| `Qwen3-14B-4bit` (`q4`) | ZH capital | `中国的首都是北京。<\|im_end\|>` | 10.56 | 83.13 | 0 |
+| `Qwen3-30B-A3B-3bit` (`q3`) | EN capital | `The capital of France is Paris.<\|im_end\|>` | 50.49 | 67.36 | 0 |
+| `Qwen3-30B-A3B-3bit` (`q3`) | ZH capital | `中国的首都是北京。<\|im_end\|>` | 42.61 | 56.84 | 0 |
+
+### Verbatim standalone `aminfer bench-m25` raw stdout (commit `1893ab6`)
+
+```text
+M2.5 Native FP16 / BF16 GEMV & GEMM Bandwidth Calibration
+m25.wired_budget_mib             18186
+m25.arena_mib                    97
+kernel     shape              bytes/disp   slots   latency(us)   beta(GB/s)   bus(%)   tflops
+gemv_f16   1x2048x2048           8396800      12        110.39        76.07     63.4    0.076
+gemv_f16   1x6144x2048          25182208       4        319.71        78.77     65.6    0.079
+gemv_f16   1x2048x768            3151360      32         40.98        76.90     64.1    0.077
+gemv_f16   1x4096x4096          33570816       3        386.94        86.76     72.3    0.087
+gemv_bf16  1x2048x2048           8396800      12        108.40        77.46     64.5    0.077
+gemv_bf16  1x6144x2048          25182208       4        320.88        78.48     65.4    0.078
+gemv_bf16  1x2048x768            3151360      32         36.70        85.86     71.6    0.086
+gemv_bf16  1x4096x4096          33570816       3        380.39        88.25     73.5    0.088
+gemm_f16   16x2048x2048          8519680      12        121.76        69.97     58.3    1.102
+gemm_f16   16x4096x4096         33816576       3        444.96        76.00     63.3    1.207
+gemm_f16   64x2048x2048          8912896      12        199.55        44.67     37.2    2.690
+gemm_f16   64x4096x4096         34603008       3        913.26        37.89     31.6    2.351
+gemm_bf16  16x2048x2048          8519680      12        153.73        55.42     46.2    0.873
+gemm_bf16  16x4096x4096         33816576       3        489.96        69.02     57.5    1.096
+gemm_bf16  64x2048x2048          8912896      12        214.01        41.65     34.7    2.509
+gemm_bf16  64x4096x4096         34603008       3        868.59        39.84     33.2    2.472
+m25.dense.swapouts_delta         0
+m25.dense.pageouts_delta         0
+
+M2.5 Synthetic BF16 End-to-End Greedy Decode from .amf (Qwen3-0.6B Geometry)
+decode_bench.target              qwen3-0.6b-bf16-synth
+decode_bench.arch                qwen3 (bf16)
+decode_bench.seq_len             512
+decode_bench.shards              1
+decode_bench.wired_mib           433
+decode_bench.load_ms             1545.9
+decode_bench.measured_layers     4
+decode_bench.measured_ms_per_tok 5.539
+decode_bench.measured_tok_per_s  180.54
+decode_bench.measured_layer_ms   0.524
+decode_bench.measured_head_ms    3.443
+decode_bench.measured_bytes_tok  445421568
+decode_bench.measured_beta_gbs   80.42 (67.0% bus)
+decode_bench.scaled_layers       28 (linear: 28 * layer_ms + head_ms)
+decode_bench.scaled_ms_per_tok   18.115
+decode_bench.scaled_tok_per_s    55.20
+decode_bench.scaled_bytes_tok    1250936832
+decode_bench.scaled_beta_gbs     69.06 (57.5% bus)
+decode_bench.malloc_blocks_delta 32
+decode_bench.malloc_bytes_delta  2048
+decode_bench.swapouts_delta      0
+decode_bench.pageouts_delta      0
+
+M2.5 Overall Swap Check
+m25.swap.status                  ok
+m25.swap.swapouts_delta          0
+m25.swap.pageouts_delta          0
+m25.swap.used_mib                10410
+```
+
+### Verbatim real-checkpoint `verify-amf`, `decode`, and `bench-decode` raw stdout (commit `1893ab6`)
+
+```text
+=== 1. Qwen3-0.6B BF16 (28L, tied embeddings) ===
+amf.status       ok
+amf.model_id     qwen3-0.6b-bf16
+amf.tensors      310
+amf.file_bytes   1193885696
+amf.wired_bytes  1193820160
+amf.cold_bytes   0
+
+decode.arch                      qwen3 (bf16)
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1195
+decode.prompt_tokens             24
+decode.generated_tokens          8
+decode.prefill_ms                441.664
+decode.decode_ms_per_tok         19.505
+decode.decode_tok_per_s          51.27
+decode.bytes_per_tok             1195771904
+decode.effective_gbs             61.31
+decode.malloc_blocks_delta       14
+decode.malloc_bytes_delta        896
+decode.swapouts_delta            0
+decode.token_ids                 [785, 6722, 315, 9625, 374, 12095, 13, 151645]
+decode.text                      The capital of France is Paris.<|im_end|>
+
+decode.arch                      qwen3 (bf16)
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1195
+decode.prompt_tokens             22
+decode.generated_tokens          6
+decode.prefill_ms                395.189
+decode.decode_ms_per_tok         19.876
+decode.decode_tok_per_s          50.31
+decode.bytes_per_tok             1195313152
+decode.effective_gbs             60.14
+decode.malloc_blocks_delta       10
+decode.malloc_bytes_delta        640
+decode.swapouts_delta            0
+decode.token_ids                 [105538, 59975, 100132, 68990, 1773, 151645]
+decode.text                      中国的首都是北京。<|im_end|>
+
+decode.arch                      qwen3 (bf16)
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1195
+decode.prompt_tokens             23
+decode.generated_tokens          32
+decode.prefill_ms                307.262
+decode.decode_ms_per_tok         15.877
+decode.decode_tok_per_s          62.98
+decode.bytes_per_tok             1198409728
+decode.effective_gbs             75.48
+decode.malloc_blocks_delta       62
+decode.malloc_bytes_delta        3968
+decode.swapouts_delta            0
+decode.token_ids                 [85379, 13850, 374, 264, 4565, 304, 8162, 37150, 429, 6147, 279, 1849, 311, 4332, 821, 1948, 279, 13940, 323, 279, 22670, 11, 18392, 5068, 553, 17719, 279, 1184, 369, 20757, 4938, 73151]
+decode.text                      Unified Memory is a feature in Apple Silicon that allows the system to share data between the CPU and the GPU, improving performance by reducing the need for frequent memory swaps
+
+decode.arch                      qwen3 (bf16)
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1195
+decode.prompt_tokens             23
+decode.generated_tokens          32
+decode.prefill_ms                291.474
+decode.decode_ms_per_tok         15.114
+decode.decode_tok_per_s          66.17
+decode.bytes_per_tok             1198409728
+decode.effective_gbs             79.29
+decode.malloc_blocks_delta       62
+decode.malloc_bytes_delta        3968
+decode.swapouts_delta            0
+decode.token_ids                 [104167, 9370, 103967, 111390, 106379, 9909, 85379, 13850, 37843, 11, 547, 4835, 7552, 67338, 44063, 101213, 100185, 9370, 111390, 101203, 17714, 46944, 106215, 9370, 111390, 100230, 3837, 105953, 111390, 9370, 113766, 33108]
+decode.text                      苹果的统一内存架构（Unified Memory Architecture, UMA）通过将多个核心的内存共享为一个单一的内存池，提高了内存的利用率和
+
+decode_bench.target              qwen3
+decode_bench.arch                qwen3 (bf16)
+decode_bench.seq_len             512
+decode_bench.shards              1
+decode_bench.wired_mib           1251
+decode_bench.load_ms             4433.8
+decode_bench.measured_layers     28
+decode_bench.measured_ms_per_tok 20.884
+decode_bench.measured_tok_per_s  47.88
+decode_bench.measured_layer_ms   0.574
+decode_bench.measured_head_ms    4.815
+decode_bench.measured_bytes_tok  1250936832
+decode_bench.measured_beta_gbs   59.90 (49.9% bus)
+decode_bench.scaled_layers       28 (linear: 28 * layer_ms + head_ms)
+decode_bench.scaled_ms_per_tok   20.884
+decode_bench.scaled_tok_per_s    47.88
+decode_bench.scaled_bytes_tok    1250936832
+decode_bench.scaled_beta_gbs     59.90 (49.9% bus)
+decode_bench.malloc_blocks_delta 0
+decode_bench.malloc_bytes_delta  0
+decode_bench.swapouts_delta      0
+decode_bench.pageouts_delta      1
+
+=== 2. Qwen3-14B-4bit (40L, q4_affine + bf16 norms) ===
+amf.status       ok
+amf.model_id     qwen3-14b-4bit
+amf.tensors      443
+amf.file_bytes   8309669888
+amf.wired_bytes  8309587968
+amf.cold_bytes   0
+
+decode.arch                      qwen3 (q4)
+decode.layers                    40
+decode.shards                    1
+decode.wired_mib                 8006
+decode.prompt_tokens             24
+decode.generated_tokens          8
+decode.prefill_ms                2364.012
+decode.decode_ms_per_tok         93.758
+decode.decode_tok_per_s          10.67
+decode.bytes_per_tok             7875453760
+decode.effective_gbs             84.00
+decode.malloc_blocks_delta       16
+decode.malloc_bytes_delta        1504
+decode.swapouts_delta            0
+decode.token_ids                 [785, 6722, 315, 9625, 374, 12095, 13, 151645]
+decode.text                      The capital of France is Paris.<|im_end|>
+
+decode.arch                      qwen3 (q4)
+decode.layers                    40
+decode.shards                    1
+decode.wired_mib                 8006
+decode.prompt_tokens             22
+decode.generated_tokens          6
+decode.prefill_ms                2059.952
+decode.decode_ms_per_tok         94.730
+decode.decode_tok_per_s          10.56
+decode.bytes_per_tok             7874798400
+decode.effective_gbs             83.13
+decode.malloc_blocks_delta       12
+decode.malloc_bytes_delta        1184
+decode.swapouts_delta            0
+decode.token_ids                 [105538, 59975, 100132, 68990, 1773, 151645]
+decode.text                      中国的首都是北京。<|im_end|>
+
+decode_bench.target              qwen3
+decode_bench.arch                qwen3 (q4)
+decode_bench.seq_len             512
+decode_bench.shards              1
+decode_bench.wired_mib           8086
+decode_bench.load_ms             29793.1
+decode_bench.measured_layers     40
+decode_bench.measured_ms_per_tok 104.997
+decode_bench.measured_tok_per_s  9.52
+decode_bench.measured_layer_ms   2.423
+decode_bench.measured_head_ms    8.074
+decode_bench.measured_bytes_tok  7954260800
+decode_bench.measured_beta_gbs   75.76 (63.1% bus)
+decode_bench.scaled_layers       40 (linear: 40 * layer_ms + head_ms)
+decode_bench.scaled_ms_per_tok   104.997
+decode_bench.scaled_tok_per_s    9.52
+decode_bench.scaled_bytes_tok    7954260800
+decode_bench.scaled_beta_gbs     75.76 (63.1% bus)
+decode_bench.malloc_blocks_delta 2
+decode_bench.malloc_bytes_delta  352
+decode_bench.swapouts_delta      0
+decode_bench.pageouts_delta      7
+
+=== 3. Qwen3-30B-A3B-3bit (48L, 128 experts, q3_affine + bf16 norms) ===
+amf.status       ok
+amf.model_id     qwen3-30b-a3b-3bit
+amf.tensors      18867
+amf.file_bytes   13363314688
+amf.wired_bytes  13360873472
+amf.cold_bytes   0
+
+decode.arch                      qwen3_moe (q3)
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 12791
+decode.prompt_tokens             24
+decode.generated_tokens          8
+decode.prefill_ms                782.584
+decode.decode_ms_per_tok         19.808
+decode.decode_tok_per_s          50.49
+decode.bytes_per_tok             1334293376
+decode.effective_gbs             67.36
+decode.malloc_blocks_delta       16
+decode.malloc_bytes_delta        1248
+decode.swapouts_delta            0
+decode.token_ids                 [785, 6722, 315, 9625, 374, 12095, 13, 151645]
+decode.text                      The capital of France is Paris.<|im_end|>
+
+decode.arch                      qwen3_moe (q3)
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 12791
+decode.prompt_tokens             22
+decode.generated_tokens          6
+decode.prefill_ms                635.024
+decode.decode_ms_per_tok         23.469
+decode.decode_tok_per_s          42.61
+decode.bytes_per_tok             1333900160
+decode.effective_gbs             56.84
+decode.malloc_blocks_delta       10
+decode.malloc_bytes_delta        640
+decode.swapouts_delta            0
+decode.token_ids                 [105538, 59975, 100132, 68990, 1773, 151645]
+decode.text                      中国的首都是北京。<|im_end|>
+
+decode_bench.target              qwen3_moe
+decode_bench.arch                qwen3_moe (q3)
+decode_bench.seq_len             512
+decode_bench.shards              1
+decode_bench.wired_mib           12839
+decode_bench.load_ms             53596.4
+decode_bench.measured_layers     48
+decode_bench.measured_ms_per_tok 19.282
+decode_bench.measured_tok_per_s  51.86
+decode_bench.measured_layer_ms   0.402
+decode_bench.measured_head_ms    0.000
+decode_bench.measured_bytes_tok  1381577600
+decode_bench.measured_beta_gbs   71.65 (59.7% bus)
+decode_bench.scaled_layers       48 (linear: 48 * layer_ms + head_ms)
+decode_bench.scaled_ms_per_tok   19.301
+decode_bench.scaled_tok_per_s    51.81
+decode_bench.scaled_bytes_tok    1381577600
+decode_bench.scaled_beta_gbs     71.58 (59.7% bus)
+decode_bench.malloc_blocks_delta 2
+decode_bench.malloc_bytes_delta  352
+decode_bench.swapouts_delta      0
+decode_bench.pageouts_delta      16
+```

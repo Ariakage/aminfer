@@ -49,7 +49,8 @@ Schedule **Milestone M2.5** immediately before M3 with the following design:
 
 1. **Add `DType.bf16 = 4` to `.amf` v0 (`W12`).**
    - Extend `amf.DType` in `src/format/amf.zig` and `tools/src/aminfer_tools/amf.py`
-     with `bf16 = 4` (`quant_bits = 16`, `group_size = 0`, `params_bytes = 0`),
+     with `bf16 = 4` (`quant_bits = 0` matching unquantized `f16`/`f32`,
+     `group_size = 0`, `params_bytes = 0`, 2 bytes per element),
      keeping the 128-byte `Header`, 128-byte `TensorEntry`, `FORMAT_VERSION = 1`,
      and 16 KiB blob alignment unchanged.
    - `aminfer-tools pack-amf` preserves unquantized `BF16` tensors bit-exact as
@@ -139,13 +140,29 @@ Schedule **Milestone M2.5** immediately before M3 with the following design:
     `SHA-256` verified): MLX quantizes `embed_tokens` and the MoE router
     `mlp.gate` (3-bit affine group-64) and stores routed experts as stacked 3D
     `mlp.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}` tensors
-    (`[128, N, K_packed]`), which `pack-amf` will slice/pack into `.amf`
-    expert blobs (and either dequantize tiny quantized routers/embeddings or
-    support quantized embedding lookup in M2.5).
+    (`[128, N, K_packed]`), which `pack-amf` slices/packs into per-expert `.amf`
+    blobs while preserving quantized `embed_tokens` and `mlp.gate` routers
+    natively.
+- **M2.5 real-checkpoint verification (2026-11-20–2026-11-21 on Apple M4 24 GiB,
+  commits `2a48c66..1893ab6`, full telemetry in
+  [../benchmarks/results.md](../benchmarks/results.md)):**
+  - Streaming multi-shard conversion (`aminfer-tools pack-amf --dtype auto`)
+    converted all three checkpoints with bounded host RAM (**35–127 MB** peak
+    Python RSS) and verified via `aminfer verify-amf` (**21–25 MB** RSS).
+  - Native `FP16`/`BF16` Metal 4 kernels reached **88.25 GB/s** (`gemv_bf16`)
+    and **86.76 GB/s** (`gemv_f16`) at `1×4096×4096`, and **2.51–2.69 TFLOP/s**
+    on `M = 64` `simdgroup_bfloat8x8` / `simdgroup_half8x8` GEMM.
+  - All three real checkpoints produced coherent bilingual (English & Chinese)
+    greedy output with `swapouts_delta = 0` over the `f16` residual stream and
+    `RGBA16Float` IOSurface `KvTile` boundary: `Qwen3-0.6B` BF16 28L (**47.88
+    tok/s** at `seq=512`, **62.98–66.17 tok/s** on 32-token decode),
+    `Qwen3-14B-4bit` 40L (**9.52 tok/s** at `seq=512`, **75.76–84.00 GB/s**),
+    and `Qwen3-30B-A3B-3bit` 48L (**51.86 tok/s** at `seq=512`, **71.65 GB/s**).
 
 ## Open items
 
-- Evaluate in M2.5 benchmarks whether inter-layer residual streams should remain
-  `f16` universally (sufficient for QK-Norm models like Qwen3) or expose an
-  optional `bf16` activation buffer mode for future architectures without
-  QK-Norm whose hidden states can exceed `±65,504`.
+- For Qwen3 checkpoints (`Qwen3-0.6B` BF16, `Qwen3-14B-4bit`,
+  `Qwen3-30B-A3B-3bit`), keeping the inter-layer residual stream in `f16` and
+  `KvTile` in `RGBA16Float` was verified lossless and coherent end-to-end;
+  revisit an optional `bf16` activation buffer mode in M6/M7 only if a future
+  architecture without QK-Norm exhibits hidden states exceeding `±65,504`.
