@@ -49,6 +49,7 @@ fn probe(out: *Io.Writer) !void {
     const device = try aminfer.metal.Device.open();
     defer device.close();
     const info = try device.info();
+    const wired_budget = aminfer.budget.Budget.fromHost(facts, info, .{});
     try out.print(
         \\gpu.name                         {s}
         \\gpu.apple_family                 {d}
@@ -57,6 +58,8 @@ fn probe(out: *Io.Writer) !void {
         \\gpu.recommended_working_set_mib  {d}
         \\gpu.max_buffer_mib               {d}
         \\ane.cores                        {d}
+        \\budget.wired_limit_mib           {d}
+        \\budget.binding_limit             {s}
         \\
     , .{
         info.name(),
@@ -66,5 +69,7 @@ fn probe(out: *Io.Writer) !void {
         info.recommendedMaxWorkingSetSize() >> 20,
         info.maxBufferLength() >> 20,
         info.aneCoreCount(),
+        wired_budget.limit_bytes >> 20,
+        wired_budget.binding_limit.label(),
     });
 }

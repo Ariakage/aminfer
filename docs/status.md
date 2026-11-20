@@ -37,7 +37,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
-| R1 | Wired budget computed at startup (default headroom ≥ 3 GiB; refuse plans over budget) | Confirmed | M1 | [ADR-0012](decisions/0012-wired-memory-budget-headroom.md) |
+| R1 | Wired budget computed at startup (default headroom ≥ 3 GiB; refuse plans over budget) | Implemented | M1 | [ADR-0012](decisions/0012-wired-memory-budget-headroom.md) |
 | R2 | GPU residency through `MTLResidencySet` | Confirmed | M1 | [memory.md](architecture/memory.md) |
 | R3 | KV tiles: IOSurface (fp16 `OneComponent16Half`, 64 B row stride) viewed as `MTLTexture` | Confirmed | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
 | R4 | KV tile granularity (one 512-token chunk per layer) and token- vs channel-major rows | Draft | M2 (spike S1) | [memory.md](architecture/memory.md#kv-tiles) |

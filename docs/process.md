@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M0 completed (2026-11-20). Next: M1 — GPU and weight foundation.
+M1 — GPU and weight foundation (started 2026-11-20; M0 completed).
 
 ## Milestones
 
@@ -16,7 +16,7 @@ Status-row IDs refer to [status.md](status.md).
 | Milestone | Goal | Status rows | Exit criteria | State |
 | --- | --- | --- | --- | --- |
 | M0 | Project initialization | F1–F9 | `zig build` and `zig build test` pass in Debug and ReleaseSafe; docs baseline committed; local ikat index built | Completed |
-| M1 | GPU and weight foundation | R1, R2, F6 (hot path), W1–W4, G1, G2, C9 | Wired budget enforced at startup; `.amf` round-trip (tools → Zig) with alignment validation; fused dequant GEMV / GEMM match a reference within tolerance; effective bandwidth measured per kernel | Not started |
+| M1 | GPU and weight foundation | R1, R2, F6 (hot path), W1–W4, G1, G2, C9 | Wired budget enforced at startup; `.amf` round-trip (tools → Zig) with alignment validation; fused dequant GEMV / GEMM match a reference within tolerance; effective bandwidth measured per kernel | In progress |
 | M2 | Non-speculative decode | W5, W6, C1, C2, R3, R4, G3, G4 | Greedy end-to-end decode of the primary target from `.amf`; baseline tokens/s and bytes per token recorded | Not started |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2; speedup over the M2 baseline, acceptance-length and experts-per-pass statistics recorded | Not started |
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Not started |
@@ -55,6 +55,15 @@ Confirmed, or before an accepted design is tuned.
 - [x] `justfile` shortcuts (F8)
 - [x] Verify Debug / ReleaseSafe / ReleaseFast; build the local ikat index
 
+## M1 task list
+
+- [x] Startup wired-memory budget enforcement and `WiredArena` slicer (R1)
+- [ ] Compile-time quantization spec (`G2` host) and `.amf` v0 reader/validator (W1, W3)
+- [ ] Offline `.amf` v0 packer and MLX safetensors importer in `tools/` + round-trip validation (W2, W4)
+- [ ] Metal 4 multi-frame hot path, command batching, residency set and specialized pipelines (F6, R2, G2 GPU)
+- [ ] Fused 3-bit and 4-bit dequantization GEMV / GEMM Metal kernels verified against CPU reference (G1, G2)
+- [ ] Benchmark harness with swap checks (`C9`), per-kernel bandwidth calibration and Spike S2 measurement
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -73,6 +82,7 @@ Only checks that actually ran are listed.
 | 2026-11-20 | F7: `cd tools && uv sync`; `uv run python -m unittest discover -s tests`: 4/4 tests; `uv run aminfer-tools --help` | Pass |
 | 2026-11-20 | F8: `just --list`, `just fmt-check`, `just sysctl-show`, `just swap-check`, `just tools-test`, `just probe` (sudo recipes not run) | Pass |
 | 2026-11-20 | M0 final gate: `zig fmt --check`, zero `catch {}`, `zig build` + `zig build test` (Debug, ReleaseSafe, ReleaseFast: 20/20 tests), `minos 26.0`, `tools` unittest (4/4), 28 markdown files link-checked (0 broken), `ikat init` | Pass |
+| 2026-11-20 | R1: `zig build`, `aminfer probe` (`budget.wired_limit_mib 18186`, binding `MTLDevice.recommendedMaxWorkingSetSize`), `zig build test` (Debug, ReleaseSafe): 27/27 tests | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
