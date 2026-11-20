@@ -43,8 +43,28 @@ nodes. Large trees can make verification slower than plain decoding.
   bandwidth than deduplicating ones, so deduplication only paid off at 5–8
   tokens per pass or never (arXiv 2610.34440) — our kernels and cost model
   must account for this.
+- **Spike S5 and real-checkpoint M3 validation closed (2026-11-21, Apple M4
+  24 GiB)** — see
+  [../benchmarks/results.md](../benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5):
+  - On `Qwen3-30B-A3B` geometry (`q3`, `E = 128`, `top_k = 8`, `H = 2048`,
+    `I = 768`), our weight-stationary CSR-deduplicated MoE kernel crossed over
+    the per-slot baseline at `M = 2` under correlated routing (`1.36×` at
+    `M = 4`, `1.78×` / `36.78 GB/s` at `M = 8`, `1.87×` at `M = 16`, saving
+    `65.0–91.0%` of weight reads) and at `M = 16` under uniform random routing
+    (`1.08×` at `M = 16`, `1.35×` at `M = 32`).
+  - On the real 48-layer `Qwen3-30B-A3B-3bit` checkpoint paired with
+    `RedHatAI/Qwen3-30B-A3B-speculator.eagle3` (reasoning prompt, `T = 0`, 100%
+    bit-for-bit lossless), verifying an unpruned `cap = 16` EAGLE-3 tree slowed
+    decoding from `46.00` to `24.93 tok/s` (`0.54×`, `31.28` unique
+    experts/layer). Enabling `D7` submodular expert-byte-budget pruning cut
+    verified nodes from `13.44` to `2.93`, halved active experts to `15.83/layer`
+    (`-49.4%`) in `0.390 ms/round`, cut DRAM bytes per accepted token by
+    `-32.4%`, and restored throughput to `48.38 tok/s` (**`1.94×`** vs unpruned
+    and **`1.05×`** vs baseline).
 
 ## Open items
 
-- Spike S5: unique experts per layer versus tree size for Qwen3-30B-A3B, and
-  the effective bandwidth of deduplicated versus per-slot kernels.
+- Spike S5: **closed in M3** (recorded in
+  [../benchmarks/results.md](../benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5)).
+- Learned ANE cross-layer expert prediction (`A2`) and NVMe cold-expert
+  prefetch penalties (`C3`–`C5`) remain scheduled for M4.

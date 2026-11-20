@@ -1455,3 +1455,640 @@ decode_bench.malloc_bytes_delta  352
 decode_bench.swapouts_delta      0
 decode_bench.pageouts_delta      16
 ```
+
+
+## M3 speculative decoding and Spikes S4 & S5
+
+Measured on 2026-11-21 on the Apple M4 24 GiB baseline at commit `034492f`
+(standalone ReleaseFast `./zig-out/bin/aminfer bench-m3`, `decode`, and
+`spec-decode`, default kernel tunables, `wired_budget_mib = 18186`,
+`swapouts_delta = 0` and `prefill_swapouts_delta = 0` across all archived runs).
+
+All real-checkpoint `T = 0` comparisons were machine-verified for **100%
+bit-for-bit identical generated `token_ids`** between non-speculative
+`aminfer decode` and `aminfer spec-decode`. Hot-path engine data structures
+(L1 suffix automaton, draft trie, D7 pruner, GPU verification workspaces, and
+acceptance buffers) perform **zero Zig dynamic heap allocations** after startup;
+small non-zero `malloc_blocks_delta` values on short CLI decode runs (~64 B per
+Metal 4 command-buffer submission) reflect Apple's bounded internal Metal 4
+driver pool warming up below the 2,048-round steady-state threshold documented
+in Spike S2 (`sam.malloc_blocks_delta = 0` on CPU, `s2.malloc_blocks_in_use_delta = 0`
+in steady state).
+
+Real EAGLE-3 draft checkpoint packed into `.amf` v0 (`W12`/`D2`) via
+`aminfer-tools pack-amf` and validated with `aminfer verify-amf`:
+- `RedHatAI/Qwen3-30B-A3B-speculator.eagle3` → `qwen3-30b-a3b-eagle3.amf`:
+  15 tensors (`bf16` weights + `u32` `d2t` 32,000-entry reduced-vocab map),
+  `1,044,217,856 B` (`996 MiB`), `wired_bytes = 1,044,185,088 B`, `cold_bytes = 0`.
+
+### Spike S4: CoreML ANE zero-copy handoff, D5 placement gate, and DRAM contention
+
+| Measurement | Workload | ANE (`us`) | ANE + handoff (`us`) | GPU in-CB (`us`) | `uses_ane` / `zero_copy` | Decision / Delta |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| Round-trip handoff | `GPU → CPU → ANE → CPU → GPU` tiny IOSurface | 92.46 *(ANE predict)* | **574.64** *(total round-trip)* | 332.33 *(GPU baseline)* | `yes` / `yes` | `574.64 us` handoff overhead per round |
+| Draft head (`M = 1`) | `2L × 2048×2048 fp16` | 366.93 | 941.57 | **201.87** | `yes` / `yes` | **`d5_gate = gpu`** (`4.66×` faster) |
+| Draft head (`batch = 32`) | `2L × 2048×2048 fp16` | 363.20 | 937.84 | **277.36** | `yes` / `yes` | **`d5_gate = gpu`** (`3.38×` faster) |
+| DRAM contention (`q3`) | Concurrent 40 MiB ANE stream (`50.00 GB/s`) + GPU `gemv_q3` | — | — | solo `70.91 GB/s` → concurrent `49.09 GB/s` | `yes` | **`-30.8%`** GPU bandwidth |
+| DRAM contention (`q4`) | Concurrent 40 MiB ANE stream (`50.00 GB/s`) + GPU `gemv_q4` | — | — | solo `77.92 GB/s` → concurrent `52.57 GB/s` | `yes` | **`-32.5%`** GPU bandwidth |
+
+Takeaways (closing **Spike S4** and settling **D5** on Apple M4):
+- Zero-copy IOSurface backing between Metal and CoreML/ANE (`uses_ane = yes`,
+  `zero_copy_backing = yes`) works without host copies, but a full round-trip
+  handoff costs `574.64 us`. Because EAGLE/MTP drafting is serial with
+  verification ([ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md)),
+  in-command-buffer GPU execution beats ANE+handoff by `3.38–4.66×`, so the
+  `D5` startup calibration gate selects `.gpu` on Apple M4.
+- Concurrent 40 MiB ANE weight streaming sustains `50.00 GB/s` on unified DRAM
+  and trims concurrent GPU GEMV bandwidth by `30.8–32.5%`, providing concrete
+  contention parameters for M4/M5 scheduling (`A1`, `A2`, `D8`).
+
+### Spike S5: Unique active experts vs tree size and CSR-dedup vs per-slot MoE
+
+Measured on `Qwen3-30B-A3B` MoE geometry (`q3`, `E = 128`, `top_k = 8`,
+`H = 2048`, `I = 768`, 252.0 MiB rotating expert weight pool):
+
+| Routing | `M` | Mean `\|U(T)\|` | Total slots | Weight reads saved | CSR-dedup (`us`) | Per-slot (`us`) | Dedup `beta` (GB/s) | Per-slot unique `beta` (GB/s) | Per-slot raw `beta` (GB/s) | Dedup speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Correlated | 1 | 8.0 | 8 | 0.0% | 258.24 | 237.32 | 63.95 | 69.59 | 69.59 | 0.92× |
+| Correlated | 2 | 9.3 | 16 | 41.8% | 365.90 | 367.26 | 52.54 | 52.35 | 89.94 | **1.00×** *(crossover)* |
+| Correlated | 4 | 11.2 | 32 | 65.0% | 512.37 | 695.38 | 45.08 | 33.21 | 95.00 | **1.36×** |
+| Correlated | 8 | 13.6 | 64 | 78.7% | 764.80 | 1,360.09 | **36.78** | 20.68 | 97.14 | **1.78×** |
+| Correlated | 16 | 17.4 | 128 | 86.4% | 1,475.00 | 2,758.62 | 24.32 | 13.00 | 95.79 | **1.87×** |
+| Correlated | 32 | 23.0 | 256 | 91.0% | 2,942.96 | 5,431.57 | 16.13 | 8.74 | 97.30 | **1.85×** |
+| Uniform | 1 | 8.0 | 8 | 0.0% | 278.25 | 251.84 | 59.35 | 65.58 | 65.58 | 0.91× |
+| Uniform | 2 | 15.4 | 16 | 3.5% | 481.17 | 434.38 | 66.23 | 73.37 | 76.04 | 0.90× |
+| Uniform | 4 | 29.2 | 32 | 8.8% | 881.16 | 788.50 | 68.38 | 76.42 | 83.78 | 0.89× |
+| Uniform | 8 | 52.5 | 64 | 18.0% | 1,596.99 | 1,408.13 | 67.87 | 76.97 | 93.83 | 0.88× |
+| Uniform | 16 | 82.0 | 128 | 35.9% | 2,518.45 | 2,719.27 | 67.22 | 62.25 | 97.17 | **1.08×** *(crossover)* |
+| Uniform | 32 | 112.6 | 256 | 56.0% | 4,164.71 | 5,618.64 | 55.83 | 41.38 | 94.06 | **1.35×** |
+
+Takeaways (closing **Spike S5** and calibrating **D7**):
+- Under correlated tree routing, CSR deduplication matches per-slot at `M = 2`
+  and beats it by **`1.36–1.87×`** for `M = 4..32` (`65.0–91.0%` fewer expert
+  weight reads). Under uniform routing, crossover occurs at `M = 16` (`1.08×`).
+- Calibrated `beta_dedup = 36.78 GB/s` at `M = 8` (and the steeper per-token
+  cost curve as `|U(T)|` grows) feeds the `D7` cost model directly
+  ([ADR-0009](../decisions/0009-expert-byte-budget-tree-pruning.md)).
+
+### L1 suffix automaton latency (`D1`, 32,768-token context)
+
+| Metric | Measured value | Charter target |
+| --- | ---: | --- |
+| Preallocated arena size (`max_tokens = 32,768`) | `5.14 MiB` | Fixed preallocated |
+| Online append latency | `0.108 us/tok` | Amortized O(1) |
+| Active-state query latency (10,000 queries) | **`0.041 us`** (`41 ns`) | **`< 50.00 us`** (`1,220×` headroom) |
+| Suffix-walk query latency | `0.154 us` | `< 50.00 us` |
+| Max observed single-query latency | `5.917 us` | `< 50.00 us` |
+| Hot-path `malloc` delta (`blocks` / `bytes`) | **`0` / `0 B`** | `0` |
+
+### Real-checkpoint end-to-end speculative decoding summary (`D1`–`D3`, `D5`–`D7`, `D9`, `G5`)
+
+| Real model & workload | Mode | `T` | Prompt → Gen | `prefill_ms` | `decode tok/s` | Speedup vs base | Mean `tau` | Drafted → Verified nodes | L1 seed rounds | Unique experts / L | Bytes / acc tok (vs base) | Exact `token_ids` match | `swapouts` delta |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- | ---: |
+| **`Qwen3-0.6B` (BF16, 28L)** TypeScript edit | Baseline `decode` | 0.0 | 106 → 55 | 1,179.3 | 69.20 | 1.00× | 1.000 | — | — | — | 1,210.6 MB | baseline | 0 |
+| **`Qwen3-0.6B` (BF16, 28L)** TypeScript edit | `L1` (`cap=8`) | 0.0 | 106 → 55 | 107.2 *(11.0×)* | **327.49** | **4.73×** | **5.600** | 11.80 → 6.40 | 6 / 10 | — | 215.6 MB (`-82.2%`) | **55 / 55 (100%)** | 0 |
+| **`Qwen3-0.6B` (BF16, 28L)** Fibonacci prompt | `L1` stochastic (`seed=42`) | 0.7 | 13 → 48 | 39.3 | 69.28 | — | 1.175 | 3.90 → 2.23 | 1 / 40 | — | 1,018.1 MB | stochastic `D9` | 0 |
+| **`Qwen3-14B-4bit` (q4, 40L)** TypeScript edit | Baseline `decode` | 0.0 | 106 → 60 | 10,198.8 | 10.23 | 1.00× | 1.000 | — | — | — | 7,897.4 MB | baseline | 0 |
+| **`Qwen3-14B-4bit` (q4, 40L)** TypeScript edit | `L1` (`cap=8`) | 0.0 | 106 → 60 | 3,262.6 *(3.13×)* | **17.45** | **1.71×** | **4.357** | 12.14 → 6.43 | 8 / 14 | — | 1,811.6 MB (`-77.1%`) | **60 / 60 (100%)** | 0 |
+| **`Qwen3-30B-A3B-3bit` (48L MoE)** C++20 reasoning (`<think>`) | Baseline `decode` | 0.0 | 44 → 64 | 1,039.9 | 46.00 | 1.00× | 1.000 | — | — | 8.00 | 1,341.8 MB | baseline | 0 |
+| **`Qwen3-30B-A3B-3bit` (48L MoE)** C++20 reasoning (`<think>`) | `EAGLE-3` `--no-prune` (`cap=16`) | 0.0 | 44 → 64 | 580.4 | 24.93 | 0.54× | 3.150 | 12.65 → 12.65 | 1 / 20 | 31.28 | 1,158.0 MB (`-13.7%`) | **64 / 64 (100%)** | 0 |
+| **`Qwen3-30B-A3B-3bit` (48L MoE)** C++20 reasoning (`<think>`) | **`EAGLE-3 + L1 + D7`** (`cap=16`) | 0.0 | 44 → 64 | 597.5 *(1.74×)* | **48.38** | **1.05×** *(**1.94×** vs unpruned)* | 2.333 | 13.44 → 2.93 | 3 / 27 | **15.83** (`-49.4%`) | **906.4 MB (`-32.4%`)** | **64 / 64 (100%)** | 0 |
+| **`Qwen3-30B-A3B-3bit` (48L MoE)** TypeScript edit (`/no_think`) | Baseline `decode` | 0.0 | 82 → 59 | 1,754.3 | 50.15 | 1.00× | 1.000 | — | — | 8.00 | 1,345.0 MB | baseline | 0 |
+| **`Qwen3-30B-A3B-3bit` (48L MoE)** TypeScript edit (`/no_think`) | **`L1 + D7`** (`cap=16`) | 0.0 | 82 → 59 | 832.5 *(2.11×)* | **59.24** | **1.18×** | 2.500 | 11.83 → 2.92 | 17 / 24 | 15.82 | 846.8 MB (`-37.0%`) | **59 / 59 (100%)** | 0 |
+| **`Qwen3-30B-A3B-3bit` (48L MoE)** TypeScript edit (`/no_think`) | `EAGLE-3 + L1 + D7` (`cap=16`) | 0.0 | 82 → 59 | 1,042.4 | 33.82 | 0.67× | **3.412** | 14.65 → 3.88 | **14 / 17** | 19.79 | **736.0 MB (`-45.3%`)** | **59 / 59 (100%)** | 0 |
+
+Key engineering findings from M3 real-checkpoint benchmarks:
+1. **ADR-0009 validated empirically on 48-layer MoE**: Verifying an unpruned
+   `cap = 16` EAGLE-3 tree on `Qwen3-30B-A3B-3bit` explodes active experts from
+   `8.00` to `31.28/layer` (`verify = 109.12 ms/round`) and slows decode to
+   `24.93 tok/s` (`0.54×` baseline). `D7` submodular expert-byte-budget pruning
+   runs in `0.390 ms/round`, trims `13.44 → 2.93` verified nodes, halves active
+   experts to `15.83/layer` (`-49.4%`), cuts DRAM traffic `-32.4%`, and achieves
+   **`48.38 tok/s`** (**`1.94×`** vs unpruned, **`1.05×`** vs baseline).
+2. **Dual-source `D6` synergy vs unquantized BF16 draft-head cost**: On
+   repetitive code editing, combining `L1` (`14/17` seed rounds) with `EAGLE-3`
+   lifts `tau` from `2.500` to **`3.412`** (`accept_hist = [1:2, 2:1, 3:3, 4:10, 5:1]`)
+   and achieves the lowest DRAM traffic (**`736.0 MB/acc_tok`, `-45.3%`**).
+   However, because the upstream EAGLE-3 checkpoint is unquantized `BF16`
+   (`996 MiB`), sequential `syncAccepted` (`8.31 ms/round`) plus the wider
+   `3.88`-node (`19.79`-expert) verification pass makes `L1-only + D7` faster
+   on repetitive edits (**`59.24 tok/s`, `1.18×`** vs baseline), while
+   `EAGLE-3 + L1 + D7` wins on non-repetitive reasoning (`48.38 tok/s`).
+   Quantizing the EAGLE-3 head to `q4` (~250 MiB) and adding learned cross-layer
+   expert prediction (`A2`) + `simdgroup_matrix` batched MoE tiling are clear
+   M4/M5 follow-ups.
+3. **Dense targets & batched prefill win immediately**: Because dense targets
+   have zero expert-union explosion, `L1` speculative decoding delivers
+   **`4.73×`** (`327.49 tok/s`, `-82.2%` bytes) on `Qwen3-0.6B` BF16 and
+   **`1.71×`** (`17.45 tok/s`, `-77.1%` bytes) on `Qwen3-14B-4bit`, while
+   batched `prefillChunk` accelerates prompt prefill by **`1.74–11.0×`**.
+4. **Numeric boundary note (`seq_len > 128` on 48L MoE)**: Unifying the
+   weight-stationary `dequant8 + dot` path in `moe_ffn.metal` and gating
+   8-token tile-max to `num_splits > 1` in `kv_attention.metal` yields 100%
+   bit-for-bit parity between `decode` and `spec-decode` across all four
+   archived suites above (including dense `Qwen3-14B-4bit` at `seq_len = 166`
+   and 48L MoE `Qwen3-30B-A3B-3bit` at `seq_len = 141`). On longer 48L MoE
+   prompts where `chooseNumSplits(seq_len)` vs `chooseTreeNumSplits(base_pos)`
+   crosses the `128`-token FlashDecoding split boundary mid-tree, 1-ULP FP32
+   attention reduction order differences can occasionally flip a near-tie MoE
+   router gate across 48 layers.
+
+### Verbatim standalone `aminfer bench-m3` raw stdout (commit `034492f`)
+
+```text
+=== M3 Speculative Decoding & Placement Gate Benchmarks ===
+
+Spike S4 CoreML ANE Zero-Copy Handoff, D5 Gate & Bandwidth Contention
+s4.ane_cores                     16
+s4.handoff.uses_ane              yes
+s4.handoff.zero_copy_backing     yes
+s4.handoff.roundtrip_us          574.64
+s4.handoff.ane_tiny_predict_us   92.46
+s4.handoff.gpu_baseline_us       332.33
+s4.draft.shape                   2L x 2048x2048 fp16 (batch=32)
+s4.draft.m1.ane_uses_ne          yes (zero_copy=yes)
+s4.draft.m1.ane_us               366.93 (with_handoff=941.57)
+s4.draft.m1.gpu_in_cb_us         201.87
+s4.draft.m1.d5_gate              gpu
+s4.draft.batch.ane_uses_ne       yes (zero_copy=yes)
+s4.draft.batch.ane_us            363.20 (with_handoff=937.84)
+s4.draft.batch.gpu_in_cb_us      277.36
+s4.draft.batch.d5_gate           gpu
+s4.contention.ane_stream_mib     40.0 (uses_ane=yes, iters=77, ane_bw=50.00 GB/s)
+s4.contention.gemv_q3            solo=70.91 GB/s  concurrent=49.09 GB/s  delta=30.8%
+s4.contention.gemv_q4            solo=77.92 GB/s  concurrent=52.57 GB/s  delta=32.5%
+s4.swapouts_delta                0
+s4.pageouts_delta                0
+
+Spike S5 Unique Active Experts vs Tree Size & CSR-Dedup vs Per-Slot MoE
+s5.geometry                      q3, E=128, top_k=8, H=2048, I=768, pool=252.0 MiB
+s5.beta_dedup_gbs                36.78
+s5.crossover_m.correlated        2
+s5.crossover_m.uniform           16
+routing      M    |U(T)|  slots  saved%  dedup(us)  slot(us)  dedup_GB/s  slot_uGB/s  slot_rGB/s  speedup
+correlated   1      8.0      8     0.0     258.24    237.32       63.95       69.59       69.59    0.92x
+correlated   2      9.3     16    41.8     365.90    367.26       52.54       52.35       89.94    1.00x
+correlated   4     11.2     32    65.0     512.37    695.38       45.08       33.21       95.00    1.36x
+correlated   8     13.6     64    78.7     764.80   1360.09       36.78       20.68       97.14    1.78x
+correlated  16     17.4    128    86.4    1475.00   2758.62       24.32       13.00       95.79    1.87x
+correlated  32     23.0    256    91.0    2942.96   5431.57       16.13        8.74       97.30    1.85x
+uniform      1      8.0      8     0.0     278.25    251.84       59.35       65.58       65.58    0.91x
+uniform      2     15.4     16     3.5     481.17    434.38       66.23       73.37       76.04    0.90x
+uniform      4     29.2     32     8.8     881.16    788.50       68.38       76.42       83.78    0.89x
+uniform      8     52.5     64    18.0    1596.99   1408.13       67.87       76.97       93.83    0.88x
+uniform     16     82.0    128    35.9    2518.45   2719.27       67.22       62.25       97.17    1.08x
+uniform     32    112.6    256    56.0    4164.71   5618.64       55.83       41.38       94.06    1.35x
+s5.swapouts_delta                0
+s5.pageouts_delta                0
+
+L1 Suffix Automaton Latency (D1, target < 50.00 us)
+sam.context_tokens               32768
+sam.arena_mib                    5.14
+sam.append_us_per_tok            0.108
+sam.query_active_us              0.041
+sam.query_suffix_us              0.154
+sam.max_query_us                 5.917
+sam.queries                      10000
+sam.seed_hits                    10000
+sam.mean_draft_len               8.00
+sam.malloc_blocks_delta          0
+sam.malloc_bytes_delta           0
+
+Synthetic End-to-End Speculative Decode Check (MoE q3 + EAGLE-3 + L1 + D7)
+spec_synth.mode                  eagle3
+spec_synth.placement             gpu
+spec_synth.lossless_match        yes
+spec_synth.generated_tokens      12
+spec_synth.rounds                7
+spec_synth.mean_accept_len       1.571
+spec_synth.drafted_nodes         7.57
+spec_synth.verified_nodes        1.57
+spec_synth.unique_experts_layer  2.07
+spec_synth.bytes_per_acc_tok     94022
+spec_synth.malloc_blocks_delta   92
+spec_synth.malloc_bytes_delta    5888
+spec_synth.swapouts_delta        0
+
+M3 Swap Check
+m3.swap.status                   ok
+m3.swap.swapouts_delta           0
+m3.swap.pageouts_delta           0
+```
+
+### Verbatim real-checkpoint `verify-amf`, `decode`, and `spec-decode` raw stdout (commit `034492f`)
+
+```text
+=== Real EAGLE-3 Draft Checkpoint Verification ===
+amf.status       ok
+amf.model_id     qwen3-30b-a3b-eagle3
+amf.tensors      15
+amf.file_bytes   1044217856
+amf.wired_bytes  1044185088
+amf.cold_bytes   0
+
+=== 1. Qwen3-0.6B BF16: BASELINE DECODE (T=0) ===
+decode.arch                      qwen3 (bf16)
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1195
+decode.prompt_tokens             106
+decode.generated_tokens          55
+decode.prefill_ms                1179.288
+decode.decode_ms_per_tok         14.450
+decode.decode_tok_per_s          69.20
+decode.bytes_per_tok             1210566656
+decode.effective_gbs             83.78
+decode.malloc_blocks_delta       108
+decode.malloc_bytes_delta        6912
+decode.swapouts_delta            0
+decode.token_ids                 [4970, 55099, 341, 220, 877, 25, 914, 280, 220, 5934, 25, 914, 280, 220, 2551, 25, 914, 280, 220, 48831, 4820, 914, 280, 220, 33051, 25, 914, 280, 630, 4970, 5787, 2648, 341, 220, 877, 25, 914, 280, 220, 72516, 25, 914, 280, 220, 96923, 25, 914, 280, 220, 33051, 25, 914, 280, 92, 151645]
+decode.text                      interface UserProfile {
+  id: string;
+  username: string;
+  email: string;
+  updatedAt?: string;
+  createdAt: string;
+}
+
+interface ProjectConfig {
+  id: string;
+  projectName: string;
+  ownerId: string;
+  createdAt: string;
+}<|im_end|>
+
+=== 1B. Qwen3-0.6B BF16: SPEC-DECODE L1 (T=0) ===
+spec.arch                        qwen3 (bf16)
+spec.mode                        l1
+spec.placement                   gpu (requested=auto)
+spec.pruning                     enabled (cap=8, depth=4, width=2)
+spec.temperature                 0.00
+spec.layers                      28
+spec.shards                      1
+spec.wired_mib                   1217
+spec.prompt_tokens               106
+spec.generated_tokens            55
+spec.rounds                      10
+spec.mean_accept_len             5.600
+spec.accept_hist                 [1:1, 2:2, 5:1, 6:1, 8:5]
+spec.drafted_nodes_per_round     11.80
+spec.verified_nodes_per_round    6.40
+spec.l1_seed_rounds              6
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  107.225
+spec.decode_ms_per_tok           3.054
+spec.decode_tok_per_s            327.49
+spec.draft_ms_per_round          0.000
+spec.prune_ms_per_round          0.001
+spec.verify_ms_per_round         16.166
+spec.commit_sync_ms_per_round    0.320
+spec.bytes_per_accepted_tok      215635968
+spec.effective_gbs               73.23
+spec.malloc_blocks_delta         41
+spec.malloc_bytes_delta          2656
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [4970, 55099, 341, 220, 877, 25, 914, 280, 220, 5934, 25, 914, 280, 220, 2551, 25, 914, 280, 220, 48831, 4820, 914, 280, 220, 33051, 25, 914, 280, 630, 4970, 5787, 2648, 341, 220, 877, 25, 914, 280, 220, 72516, 25, 914, 280, 220, 96923, 25, 914, 280, 220, 33051, 25, 914, 280, 92, 151645]
+spec.text                        interface UserProfile {
+  id: string;
+  username: string;
+  email: string;
+  updatedAt?: string;
+  createdAt: string;
+}
+
+interface ProjectConfig {
+  id: string;
+  projectName: string;
+  ownerId: string;
+  createdAt: string;
+}<|im_end|>
+
+=== 1C. Qwen3-0.6B BF16: SPEC-DECODE L1 STOCHASTIC (T=0.7, seed=42) ===
+spec.arch                        qwen3 (bf16)
+spec.mode                        l1
+spec.placement                   gpu (requested=auto)
+spec.pruning                     enabled (cap=8, depth=4, width=2)
+spec.temperature                 0.70
+spec.layers                      28
+spec.shards                      1
+spec.wired_mib                   1217
+spec.prompt_tokens               13
+spec.generated_tokens            48
+spec.rounds                      40
+spec.mean_accept_len             1.175
+spec.accept_hist                 [1:36, 2:1, 3:3]
+spec.drafted_nodes_per_round     3.90
+spec.verified_nodes_per_round    2.23
+spec.l1_seed_rounds              1
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  39.276
+spec.decode_ms_per_tok           14.434
+spec.decode_tok_per_s            69.28
+spec.draft_ms_per_round          0.000
+spec.prune_ms_per_round          0.000
+spec.verify_ms_per_round         15.323
+spec.commit_sync_ms_per_round    0.425
+spec.bytes_per_accepted_tok      1018136663
+spec.effective_gbs               70.54
+spec.malloc_blocks_delta         162
+spec.malloc_bytes_delta          10400
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [729, 15801, 1445, 11, 1932, 761, 579, 8, 11397, 1140, 320, 1607, 8, 1380, 308, 374, 279, 1372, 315, 5424, 311, 470, 11, 323, 1932, 761, 579, 374, 279, 7192, 897, 315, 279, 79683, 8500, 13, 1416, 1932, 761, 579, 374, 537, 3897, 11, 9658, 429, 1932, 761]
+spec.text                         function fib(n, max_fib) → list (list) where n is the number of elements to return, and max_fib is the maximum value of the Fibonacci sequence. If max_fib is not provided, assume that max_f
+
+=== 2A. Qwen3-14B-4bit: BASELINE DECODE (T=0) ===
+decode.arch                      qwen3 (q4)
+decode.layers                    40
+decode.shards                    1
+decode.wired_mib                 8006
+decode.prompt_tokens             106
+decode.generated_tokens          60
+decode.prefill_ms                10198.800
+decode.decode_ms_per_tok         97.708
+decode.decode_tok_per_s          10.23
+decode.bytes_per_tok             7897408320
+decode.effective_gbs             80.83
+decode.malloc_blocks_delta       120
+decode.malloc_bytes_delta        8096
+decode.swapouts_delta            0
+decode.token_ids                 [4970, 55099, 341, 220, 877, 25, 914, 280, 220, 5934, 25, 914, 280, 220, 2551, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 4820, 914, 280, 630, 4970, 5787, 2648, 341, 220, 877, 25, 914, 280, 220, 72516, 25, 914, 280, 220, 96923, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 4820, 914, 280, 92, 151645]
+decode.text                      interface UserProfile {
+  id: string;
+  username: string;
+  email: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+interface ProjectConfig {
+  id: string;
+  projectName: string;
+  ownerId: string;
+  createdAt: string;
+  updatedAt?: string;
+}<|im_end|>
+
+=== 2B. Qwen3-14B-4bit: SPEC-DECODE L1 cap=8 (T=0) ===
+spec.arch                        qwen3 (q4)
+spec.mode                        l1
+spec.placement                   gpu (requested=auto)
+spec.pruning                     enabled (cap=8, depth=4, width=2)
+spec.temperature                 0.00
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   8050
+spec.prompt_tokens               106
+spec.generated_tokens            60
+spec.rounds                      14
+spec.mean_accept_len             4.357
+spec.accept_hist                 [1:3, 2:2, 3:1, 4:1, 5:3, 8:4]
+spec.drafted_nodes_per_round     12.14
+spec.verified_nodes_per_round    6.43
+spec.l1_seed_rounds              8
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  3262.574
+spec.decode_ms_per_tok           57.320
+spec.decode_tok_per_s            17.45
+spec.draft_ms_per_round          0.001
+spec.prune_ms_per_round          0.002
+spec.verify_ms_per_round         240.941
+spec.commit_sync_ms_per_round    0.618
+spec.bytes_per_accepted_tok      1811583465
+spec.effective_gbs               32.68
+spec.malloc_blocks_delta         58
+spec.malloc_bytes_delta          4128
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [4970, 55099, 341, 220, 877, 25, 914, 280, 220, 5934, 25, 914, 280, 220, 2551, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 4820, 914, 280, 630, 4970, 5787, 2648, 341, 220, 877, 25, 914, 280, 220, 72516, 25, 914, 280, 220, 96923, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 4820, 914, 280, 92, 151645]
+spec.text                        interface UserProfile {
+  id: string;
+  username: string;
+  email: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+interface ProjectConfig {
+  id: string;
+  projectName: string;
+  ownerId: string;
+  createdAt: string;
+  updatedAt?: string;
+}<|im_end|>
+
+=== 3A. Qwen3-30B-A3B-3bit: BASELINE DECODE (C++20 Reasoning, T=0) ===
+decode.arch                      qwen3_moe (q3)
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 12791
+decode.prompt_tokens             44
+decode.generated_tokens          64
+decode.prefill_ms                1039.859
+decode.decode_ms_per_tok         21.741
+decode.decode_tok_per_s          46.00
+decode.bytes_per_tok             1341764480
+decode.effective_gbs             61.72
+decode.malloc_blocks_delta       126
+decode.malloc_bytes_delta        8064
+decode.swapouts_delta            0
+decode.token_ids                 [151667, 198, 32313, 11, 358, 1184, 311, 4211, 264, 5296, 12577, 3175, 45254, 3828, 3175, 14859, 11761, 10058, 4147, 304, 356, 1027, 17, 15, 13, 6771, 594, 1191, 553, 88646, 1128, 264, 10058, 4147, 374, 13, 1084, 594, 264, 26931, 1334, 1380, 279, 4147, 702, 264, 8356, 1379, 11, 323, 582, 990, 14937, 311, 3754, 279, 1968, 323, 9787, 13, 8704, 432, 594, 5296]
+decode.text                      <think>
+Okay, I need to implement a lock-free single-producer single-consumer ring buffer in C++20. Let's start by recalling what a ring buffer is. It's a circular array where the buffer has a fixed size, and we use indices to track the head and tail. Since it's lock
+
+=== 3B. Qwen3-30B-A3B-3bit: EAGLE-3 + L1 + D7 PRUNED (C++20 Reasoning, T=0) ===
+spec.arch                        qwen3_moe (q3)
+spec.mode                        eagle3
+spec.placement                   gpu (requested=gpu)
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.layers                      48
+spec.shards                      1
+spec.wired_mib                   13876
+spec.prompt_tokens               44
+spec.generated_tokens            64
+spec.rounds                      27
+spec.mean_accept_len             2.333
+spec.accept_hist                 [1:7, 2:6, 3:12, 4:2]
+spec.drafted_nodes_per_round     13.44
+spec.verified_nodes_per_round    2.93
+spec.l1_seed_rounds              3
+spec.unique_experts_per_layer    15.83
+spec.prefill_ms                  597.451
+spec.decode_ms_per_tok           20.671
+spec.decode_tok_per_s            48.38
+spec.draft_ms_per_round          5.111
+spec.prune_ms_per_round          0.390
+spec.verify_ms_per_round         37.148
+spec.commit_sync_ms_per_round    5.554
+spec.bytes_per_accepted_tok      906427004
+spec.effective_gbs               43.85
+spec.malloc_blocks_delta         358
+spec.malloc_bytes_delta          22912
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [151667, 198, 32313, 11, 358, 1184, 311, 4211, 264, 5296, 12577, 3175, 45254, 3828, 3175, 14859, 11761, 10058, 4147, 304, 356, 1027, 17, 15, 13, 6771, 594, 1191, 553, 88646, 1128, 264, 10058, 4147, 374, 13, 1084, 594, 264, 26931, 1334, 1380, 279, 4147, 702, 264, 8356, 1379, 11, 323, 582, 990, 14937, 311, 3754, 279, 1968, 323, 9787, 13, 8704, 432, 594, 5296]
+spec.text                        <think>
+Okay, I need to implement a lock-free single-producer single-consumer ring buffer in C++20. Let's start by recalling what a ring buffer is. It's a circular array where the buffer has a fixed size, and we use indices to track the head and tail. Since it's lock
+
+=== 3C. Qwen3-30B-A3B-3bit: EAGLE-3 --no-prune (C++20 Reasoning, T=0) ===
+spec.arch                        qwen3_moe (q3)
+spec.mode                        eagle3
+spec.placement                   gpu (requested=gpu)
+spec.pruning                     disabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.layers                      48
+spec.shards                      1
+spec.wired_mib                   13832
+spec.prompt_tokens               44
+spec.generated_tokens            64
+spec.rounds                      20
+spec.mean_accept_len             3.150
+spec.accept_hist                 [1:4, 2:5, 3:6, 4:2, 5:2, 13:1]
+spec.drafted_nodes_per_round     12.65
+spec.verified_nodes_per_round    12.65
+spec.l1_seed_rounds              1
+spec.unique_experts_per_layer    31.28
+spec.prefill_ms                  580.399
+spec.decode_ms_per_tok           40.107
+spec.decode_tok_per_s            24.93
+spec.draft_ms_per_round          6.960
+spec.prune_ms_per_round          0.000
+spec.verify_ms_per_round         109.120
+spec.commit_sync_ms_per_round    10.191
+spec.bytes_per_accepted_tok      1157991170
+spec.effective_gbs               28.87
+spec.malloc_blocks_delta         178
+spec.malloc_bytes_delta          11392
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [151667, 198, 32313, 11, 358, 1184, 311, 4211, 264, 5296, 12577, 3175, 45254, 3828, 3175, 14859, 11761, 10058, 4147, 304, 356, 1027, 17, 15, 13, 6771, 594, 1191, 553, 88646, 1128, 264, 10058, 4147, 374, 13, 1084, 594, 264, 26931, 1334, 1380, 279, 4147, 702, 264, 8356, 1379, 11, 323, 582, 990, 14937, 311, 3754, 279, 1968, 323, 9787, 13, 8704, 432, 594, 5296]
+spec.text                        <think>
+Okay, I need to implement a lock-free single-producer single-consumer ring buffer in C++20. Let's start by recalling what a ring buffer is. It's a circular array where the buffer has a fixed size, and we use indices to track the head and tail. Since it's lock
+
+=== 4A. Qwen3-30B-A3B-3bit: BASELINE DECODE (TypeScript Code Edit, T=0) ===
+decode.arch                      qwen3_moe (q3)
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 12791
+decode.prompt_tokens             82
+decode.generated_tokens          59
+decode.prefill_ms                1754.316
+decode.decode_ms_per_tok         19.939
+decode.decode_tok_per_s          50.15
+decode.bytes_per_tok             1345008512
+decode.effective_gbs             67.46
+decode.malloc_blocks_delta       116
+decode.malloc_bytes_delta        7424
+decode.swapouts_delta            0
+decode.token_ids                 [4970, 2657, 341, 220, 877, 25, 914, 280, 220, 829, 25, 914, 280, 220, 2551, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 25, 914, 280, 532, 4970, 7909, 341, 220, 877, 25, 914, 280, 220, 2265, 25, 914, 280, 220, 6372, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 25, 914, 280, 92, 151645]
+decode.text                      interface User {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
+  updatedAt: string;
+}
+interface Team {
+  id: string;
+  title: string;
+  owner: string;
+  createdAt: string;
+  updatedAt: string;
+}<|im_end|>
+
+=== 4B. Qwen3-30B-A3B-3bit: L1-ONLY + D7 PRUNED (TypeScript Code Edit, T=0) ===
+spec.arch                        qwen3_moe (q3)
+spec.mode                        l1
+spec.placement                   gpu (requested=auto)
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.layers                      48
+spec.shards                      1
+spec.wired_mib                   12839
+spec.prompt_tokens               82
+spec.generated_tokens            59
+spec.rounds                      24
+spec.mean_accept_len             2.500
+spec.accept_hist                 [1:10, 2:3, 3:1, 4:9, 5:1]
+spec.drafted_nodes_per_round     11.83
+spec.verified_nodes_per_round    2.92
+spec.l1_seed_rounds              17
+spec.unique_experts_per_layer    15.82
+spec.prefill_ms                  832.505
+spec.decode_ms_per_tok           16.881
+spec.decode_tok_per_s            59.24
+spec.draft_ms_per_round          0.000
+spec.prune_ms_per_round          0.484
+spec.verify_ms_per_round         39.292
+spec.commit_sync_ms_per_round    1.007
+spec.bytes_per_accepted_tok      846832661
+spec.effective_gbs               51.89
+spec.malloc_blocks_delta         162
+spec.malloc_bytes_delta          14528
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [4970, 2657, 341, 220, 877, 25, 914, 280, 220, 829, 25, 914, 280, 220, 2551, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 25, 914, 280, 532, 4970, 7909, 341, 220, 877, 25, 914, 280, 220, 2265, 25, 914, 280, 220, 6372, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 25, 914, 280, 92, 151645]
+spec.text                        interface User {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
+  updatedAt: string;
+}
+interface Team {
+  id: string;
+  title: string;
+  owner: string;
+  createdAt: string;
+  updatedAt: string;
+}<|im_end|>
+
+=== 4C. Qwen3-30B-A3B-3bit: EAGLE-3 + L1 D6 SEED + D7 PRUNED (TypeScript Code Edit, T=0) ===
+spec.arch                        qwen3_moe (q3)
+spec.mode                        eagle3
+spec.placement                   gpu (requested=gpu)
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.layers                      48
+spec.shards                      1
+spec.wired_mib                   13876
+spec.prompt_tokens               82
+spec.generated_tokens            59
+spec.rounds                      17
+spec.mean_accept_len             3.412
+spec.accept_hist                 [1:2, 2:1, 3:3, 4:10, 5:1]
+spec.drafted_nodes_per_round     14.65
+spec.verified_nodes_per_round    3.88
+spec.l1_seed_rounds              14
+spec.unique_experts_per_layer    19.79
+spec.prefill_ms                  1042.391
+spec.decode_ms_per_tok           29.572
+spec.decode_tok_per_s            33.82
+spec.draft_ms_per_round          1.223
+spec.prune_ms_per_round          0.837
+spec.verify_ms_per_round         90.498
+spec.commit_sync_ms_per_round    8.306
+spec.bytes_per_accepted_tok      735950738
+spec.effective_gbs               24.89
+spec.malloc_blocks_delta         154
+spec.malloc_bytes_delta          9856
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [4970, 2657, 341, 220, 877, 25, 914, 280, 220, 829, 25, 914, 280, 220, 2551, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 25, 914, 280, 532, 4970, 7909, 341, 220, 877, 25, 914, 280, 220, 2265, 25, 914, 280, 220, 6372, 25, 914, 280, 220, 33051, 25, 914, 280, 220, 48831, 25, 914, 280, 92, 151645]
+spec.text                        interface User {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
+  updatedAt: string;
+}
+interface Team {
+  id: string;
+  title: string;
+  owner: string;
+  createdAt: string;
+  updatedAt: string;
+}<|im_end|>
+```

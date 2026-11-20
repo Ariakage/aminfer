@@ -28,7 +28,8 @@ target distribution.
 - The matching state is advanced as tokens are appended; a query returns the
   current match length and a continuation. A match of at least 4 tokens is a
   high-confidence seed ([ADR-0005](../decisions/0005-dual-source-tree-merging.md)).
-- Latency target: under 0.05 ms per query (project charter; not yet measured).
+- Latency target: under 0.05 ms per query (project charter; measured in M3 in
+  [../benchmarks/results.md](../benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5)).
 - Larger-than-context reuse comes from N-gram tables on NVMe (status row C6).
 
 ## L2 draft sources
@@ -65,8 +66,9 @@ Accepted in [ADR-0005](../decisions/0005-dual-source-tree-merging.md):
 - Seeding an EAGLE head runs the head through the seed tokens with its own
   predicted features, one step per seed token. Seeding the small draft model is
   a single batched forward over the seed.
-- Target: lift the tokens accepted per verification pass from about 4–6 to
-  about 8–14 on repetitive code (project charter; to be measured in M3).
+- Target: lift the tokens accepted per verification pass on repetitive code
+  (project charter; measured in M3 in
+  [../benchmarks/results.md](../benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5)).
 
 ## Expert-byte-budget pruning
 

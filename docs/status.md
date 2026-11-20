@@ -71,7 +71,7 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | G2 | Compile-time specialization (Zig `comptime`; Metal function constants on the GPU side) | Implemented | M1 | [ADR-0014](decisions/0014-compile-time-specialization.md) |
 | G3 | MoE gather / grouped GEMM with experts deduplicated across verified tokens | Implemented | M2 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md), [results.md](benchmarks/results.md) |
 | G4 | Decode attention over KV tiles | Implemented | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), [results.md](benchmarks/results.md) |
-| G5 | Tree-attention verification with ancestor mask and accepted-path KV commit | Confirmed | M3 | [speculative-decoding.md](architecture/speculative-decoding.md) |
+| G5 | Tree-attention verification with ancestor mask and accepted-path KV commit | Implemented | M3 | [speculative-decoding.md](architecture/speculative-decoding.md), [results.md](benchmarks/results.md) |
 | G6 | GPU half of the hybrid prefill (FFN / MoE) | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
 | G7 | High-expert-count MoE (`>= 512` routed experts, top-10+) with unconditional `shared_expert` SwiGLU accumulation | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | G8 | Gated DeltaNet (GDN) chunked-prefill and recurrent decode Metal 4 kernels | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
@@ -84,15 +84,15 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
-| D1 | L1 suffix automaton, preallocated, zero allocation after startup | Confirmed | M3 | [speculative-decoding.md](architecture/speculative-decoding.md#l1-suffix-automaton) |
-| D2 | EAGLE-2 dynamic draft tree with EAGLE-3 and EAGLE-2 head formats | Confirmed | M3 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md) |
-| D3 | MTP heads | Confirmed | M3 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md) |
+| D1 | L1 suffix automaton, preallocated, zero allocation after startup | Implemented | M3 | [speculative-decoding.md](architecture/speculative-decoding.md#l1-suffix-automaton), [results.md](benchmarks/results.md) |
+| D2 | EAGLE-2 dynamic draft tree with EAGLE-3 and EAGLE-2 head formats | Implemented | M3 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md), [results.md](benchmarks/results.md) |
+| D3 | MTP heads | Implemented | M3 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md) |
 | D4 | Same-family small draft model (≈0.5B class, e.g. Qwen3-0.6B) for models without EAGLE / MTP | Confirmed | M4 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md) |
-| D5 | Benchmark-gated placement of EAGLE / MTP heads (ANE vs GPU) | Confirmed | M3 | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) |
-| D6 | Dual-source tree merging (L1 seed prefix ≥ 4 tokens → L2) | Confirmed | M3 | [ADR-0005](decisions/0005-dual-source-tree-merging.md) |
-| D7 | Expert-byte-budget tree pruning (dense models: node budget) | Confirmed | M3 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) |
+| D5 | Benchmark-gated placement of EAGLE / MTP heads (ANE vs GPU) | Implemented | M3 | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md), [results.md](benchmarks/results.md) |
+| D6 | Dual-source tree merging (L1 seed prefix ≥ 4 tokens → L2) | Implemented | M3 | [ADR-0005](decisions/0005-dual-source-tree-merging.md), [results.md](benchmarks/results.md) |
+| D7 | Expert-byte-budget tree pruning (dense models: node budget) | Implemented | M3 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md), [results.md](benchmarks/results.md) |
 | D8 | PEARL-style pipelined drafting for the independent small draft | Confirmed (design Draft) | M5 | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) |
-| D9 | Lossless stochastic acceptance for temperature > 0 | Confirmed | M3 | [speculative-decoding.md](architecture/speculative-decoding.md) |
+| D9 | Lossless stochastic acceptance for temperature > 0 | Implemented | M3 | [speculative-decoding.md](architecture/speculative-decoding.md), [results.md](benchmarks/results.md) |
 | D10 | DSpark semi-autoregressive speculative decoding adapter under `DraftSource` | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 
 ## Neural Engine

@@ -37,8 +37,23 @@ GPU bandwidth alone. Two facts contradict that premise:
 - On-chip SRAM: about 2 MB working set on M1 (arXiv 2606.22283); throughput
   cliff near 32 MB on M4 (maderix ANE benchmarks). See
   [../architecture/hardware.md](../architecture/hardware.md).
+- **Spike S4 closed (M3, 2026-11-21, Apple M4 24 GiB)** — see
+  [../benchmarks/results.md](../benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5):
+  - Zero-copy IOSurface `GPU → CPU → ANE → CPU → GPU` round-trip handoff
+    measured `574.64 us` (`ane_tiny_predict_us = 92.46 us`, `uses_ane = yes`,
+    `zero_copy_backing = yes`).
+  - For a `2L × 2048×2048 fp16` draft workload, ANE took `366.93 us` (`941.57 us`
+    with handoff) at `M = 1` and `363.20 us` (`937.84 us` with handoff) at
+    `batch = 32`, versus `201.87 us` (`M = 1`) and `277.36 us` (`batch = 32`)
+    for in-command-buffer GPU execution. The `D5` startup gate therefore selects
+    `.gpu` on Apple M4.
+  - Concurrent `40 MiB` ANE weight streaming (`50.00 GB/s`) reduced GPU
+    `gemv_q3` bandwidth by `30.8%` (`70.91 → 49.09 GB/s`) and `gemv_q4` by
+    `32.5%` (`77.92 → 52.57 GB/s`), confirming unified-DRAM contention that
+    must be budgeted during M4/M5 concurrent ANE workloads.
 
 ## Open items
 
-- Spike S4: hand-off latency and bandwidth contention.
+- Spike S4: **closed in M3** (recorded in
+  [../benchmarks/results.md](../benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5)).
 - Pipelined-drafting design for the small draft model (status row D8).
