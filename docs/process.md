@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M1 — GPU and weight foundation (started 2026-11-20; M0 completed).
+M1 — GPU and weight foundation completed (2026-11-20); ready for M2 (non-speculative decode).
 
 ## Milestones
 
@@ -16,7 +16,7 @@ Status-row IDs refer to [status.md](status.md).
 | Milestone | Goal | Status rows | Exit criteria | State |
 | --- | --- | --- | --- | --- |
 | M0 | Project initialization | F1–F9 | `zig build` and `zig build test` pass in Debug and ReleaseSafe; docs baseline committed; local ikat index built | Completed |
-| M1 | GPU and weight foundation | R1, R2, F6 (hot path), W1–W4, G1, G2, C9 | Wired budget enforced at startup; `.amf` round-trip (tools → Zig) with alignment validation; fused dequant GEMV / GEMM match a reference within tolerance; effective bandwidth measured per kernel | In progress |
+| M1 | GPU and weight foundation | R1, R2, F6 (hot path), W1–W4, G1, G2, C9 | Wired budget enforced at startup; `.amf` round-trip (tools → Zig) with alignment validation; fused dequant GEMV / GEMM match a reference within tolerance; effective bandwidth measured per kernel | Completed |
 | M2 | Non-speculative decode | W5, W6, C1, C2, R3, R4, G3, G4 | Greedy end-to-end decode of the primary target from `.amf`; baseline tokens/s and bytes per token recorded | Not started |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2; speedup over the M2 baseline, acceptance-length and experts-per-pass statistics recorded | Not started |
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Not started |
@@ -31,7 +31,7 @@ Confirmed, or before an accepted design is tuned.
 | ID | Question | Feeds | Milestone | State |
 | --- | --- | --- | --- | --- |
 | S1 | KV tile read path: R16Float vs RGBA16Float texture vs aliasing `MTLBuffer`; token- vs channel-major rows; decode-attention bandwidth | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), R4 | M2 | Open |
-| S2 | Metal 4 steady-state allocations and encode overhead per decode round (Instruments Allocations, signposts) | [ADR-0011](decisions/0011-metal4-zero-allocation-hot-path.md) | M1 | Open |
+| S2 | Metal 4 steady-state allocations and encode overhead per decode round (Instruments Allocations, signposts) | [ADR-0011](decisions/0011-metal4-zero-allocation-hot-path.md) | M1 | Closed |
 | S3 | Cold-expert reads: `aio_read` + `kqueue` vs E-core `pread` workers; queue depth 1–16; 2–3 MiB reads with `F_NOCACHE`; QoS and I/O-policy effects; p50 / p99 latency | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), C4 | M4 | Open |
 | S4 | ANE handoff latency (GPU → CPU → ANE → CPU → GPU) and bandwidth contention of concurrent ANE weight streaming on GPU GEMV | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) | M3 | Open |
 | S5 | Unique experts per layer versus draft-tree size for Qwen3-30B-A3B; effective bandwidth of deduplicated vs per-slot expert kernels | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) | M3 | Open |
@@ -62,7 +62,46 @@ Confirmed, or before an accepted design is tuned.
 - [x] Offline `.amf` v0 packer and MLX safetensors importer in `tools/` + round-trip validation (W2, W4)
 - [x] Metal 4 multi-frame hot path, command batching, residency set and specialized pipelines (F6, R2, G2 GPU)
 - [x] Fused 3-bit and 4-bit dequantization GEMV / GEMM Metal kernels verified against CPU reference (G1, G2)
-- [ ] Benchmark harness with swap checks (`C9`), per-kernel bandwidth calibration and Spike S2 measurement
+- [x] Benchmark harness with swap checks (`C9`), per-kernel bandwidth calibration and Spike S2 measurement
+
+## M1 calibration and Spike S2 results
+
+Measured on 2026-11-20 on the Apple M4 24 GiB baseline (`just bench`,
+ReleaseFast, single 81 MiB `WiredArena` validated against the 18,186 MiB host
+budget, ≥ 64 MiB rotating weight pool streaming from unified DRAM,
+`swapouts_delta = 0`, `pageouts_delta = 0`):
+
+| Kernel | Shape (`M×N×K`) | Bytes/dispatch | Latency (us) | Effective `beta` (GB/s) | % of 120 GB/s bus |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `gemv_q4` | `1×2048×2048` | 2,367,488 | 29.34 | 80.70 | 67.3% |
+| `gemv_q4` | `1×6144×2048` | 7,094,272 | 72.10 | 98.40 | 82.0% |
+| `gemv_q4` | `1×2048×768` | 890,368 | 12.42 | 71.68 | 59.7% |
+| `gemv_q4` | `1×4096×4096` | 9,453,568 | 97.07 | 97.39 | 81.2% |
+| `gemv_q3` | `1×2048×2048` | 1,843,200 | 22.98 | 80.21 | 66.8% |
+| `gemv_q3` | `1×6144×2048` | 5,521,408 | 62.27 | 88.67 | 73.9% |
+| `gemv_q3` | `1×2048×768` | 693,760 | 11.08 | 62.59 | 52.2% |
+| `gemv_q3` | `1×4096×4096` | 7,356,416 | 80.41 | 91.49 | 76.2% |
+| `gemm_q4` | `16×2048×2048` | 2,490,368 | 102.90 | 24.20 | 20.2% |
+| `gemm_q4` | `16×4096×4096` | 9,699,328 | 391.94 | 24.75 | 20.6% |
+| `gemm_q4` | `64×2048×2048` | 2,883,584 | 200.90 | 14.35 | 12.0% |
+| `gemm_q4` | `64×4096×4096` | 10,485,760 | 802.19 | 13.07 | 10.9% |
+| `gemm_q3` | `16×2048×2048` | 1,966,080 | 103.61 | 18.98 | 15.8% |
+| `gemm_q3` | `16×4096×4096` | 7,602,176 | 400.62 | 18.98 | 15.8% |
+| `gemm_q3` | `64×2048×2048` | 2,359,296 | 203.82 | 11.58 | 9.6% |
+| `gemm_q3` | `64×4096×4096` | 8,388,608 | 817.41 | 10.26 | 8.6% |
+
+Spike S2 (1,000 steady-state rounds × 32 dispatches/round on a 2-frame Metal 4
+`Compute` ring with `insert_barrier_before` and uniform streaming, after
+2,048-round driver-pool warmup):
+
+| Metric | Value |
+| --- | --- |
+| CPU encode time | 7.69 us/round (240.2 ns/dispatch) |
+| Full pipelined round time | 96.00 us/round |
+| `malloc_zone_statistics` `blocks_in_use` delta | 0 |
+| `malloc_zone_statistics` `size_in_use` delta | 0 B |
+| `malloc_zone_statistics` `size_allocated` delta | 0 B |
+| System `swapouts` / `pageouts` delta | 0 / 0 |
 
 ## Verification log
 
@@ -87,6 +126,7 @@ Only checks that actually ran are listed.
 | 2026-11-20 | W2, W4: `cd tools && uv run python -m unittest discover -s tests`: 7/7 tests (incl. MLX safetensors → `pack-amf` → `zig-out/bin/aminfer verify-amf` cross-language round-trip) | Pass |
 | 2026-11-20 | F6 (hot path), R2, G2 (GPU): `zig build`, `zig build test` (Debug, ReleaseSafe): 37/37 tests; `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 37/37 tests | Pass |
 | 2026-11-20 | G1: `zig build`, `zig build test` (Debug, ReleaseSafe): 42/42 tests (3/4-bit GEMV & GEMM vs CPU fp32 reference + `.amf` → `WiredArena` → GPU round-trip); `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 42/42 tests | Pass |
+| 2026-11-20 | C9, Spike S2, M1 final gate: `zig fmt --check`, zero `catch {}`, `zig build`, `zig build test` (Debug, ReleaseSafe): 50/50 tests; direct test binary with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 50/50 tests; `just bench` (`ReleaseFast` `aminfer bench`): 16 C9 shapes + 1,000-round S2 (0 steady-state malloc delta, 0 swapouts); `tools` unittest (7/7) | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -107,9 +147,18 @@ session.
 Update this before the context window runs out or when handing off.
 
 - Last updated: 2026-11-20
-- Commits so far: `1ad0da8` AGENTS.md, `6d5053d` license, `3a573a5` docs baseline,
-  `0518ea8` build graph and probe, `06e8656` wired regions, `e6c9221` ExpertSource,
-  `1b49162` Metal 4 bridge, `f1cd47f` tools scaffold, `a89b83e` justfile
-- In flight: none (M0 complete; ready for M1)
+- Commits so far:
+  - M0: `1ad0da8` AGENTS.md, `6d5053d` license, `3a573a5` docs baseline,
+    `0518ea8` build graph and probe, `06e8656` wired regions, `e6c9221`
+    ExpertSource, `1b49162` Metal 4 bridge, `f1cd47f` tools scaffold, `a89b83e`
+    justfile, `0430fe1` M0 close-out
+  - M1: `936f16c` wired budget & `WiredArena` (R1), `36eb191` comptime quant
+    specs & `.amf` v0 reader/validator (W1, W3, G2 host), `3a90c56` `.amf`
+    packer & MLX importer (W2, W4), `04d0a62` Metal 4 multi-frame batching &
+    specialized pipelines (F6 hot path, R2, G2 GPU), `65a1a62` fused 3/4-bit
+    dequant GEMV/GEMM kernels (G1), `6bfe351` VM/heap probe, C9 bandwidth
+    calibration & Spike S2 harness (C9, S2)
+- In flight: none (M1 complete; ready for M2)
 - Awaiting the user: nothing
-- Key evidence: [architecture/hardware.md](architecture/hardware.md)
+- Key evidence: [architecture/hardware.md](architecture/hardware.md),
+  [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md)

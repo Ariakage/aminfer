@@ -101,7 +101,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | C6 | N-gram tables on NVMe for L1 | Draft | M5 | [experts-and-storage.md](architecture/experts-and-storage.md#n-gram-tables-on-nvme) |
 | C7 | kqueue SSE server | Confirmed | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
 | C8 | Server API shape (for example OpenAI-compatible streaming) | Undecided | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
-| C9 | Benchmark harness with `powermetrics` and swap checks | Draft | M1 | [system-tuning.md](guides/system-tuning.md) |
+| C9 | Benchmark harness with `powermetrics` and swap checks (`aminfer bench`, `just bench`) | Implemented | M1 | [system-tuning.md](guides/system-tuning.md) |
 
 ## Scale-out
 

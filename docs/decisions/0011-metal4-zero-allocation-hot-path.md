@@ -38,7 +38,21 @@ dynamic allocation.
   `MTL4CommandAllocator` documents `reset` as reusing its internal heaps.
 - The baseline exposes `newMTL4CommandQueue`, `newCommandAllocator` and
   `MTLResidencySet`.
+- **Spike S2 (measured 2026-11-20 on Apple M4, macOS 27.2, ReleaseFast `aminfer bench`):**
+  - Workload: 1,000 steady-state multi-dispatch rounds on a 2-frame `Compute`
+    ring (32 fused-dequant dispatches/round with `insert_barrier_before` and
+    uniform ring streaming, 32,000 dispatches total) after a 2,048-round
+    driver-pool warmup.
+  - CPU encode overhead: `7.69–7.90 us/round` (`240–247 ns/dispatch`); full
+    pipelined round time `96.0–101.7 us/round`.
+  - Steady-state `malloc_zone_statistics` deltas across the 1,000 rounds:
+    `blocks_in_use = 0`, `size_in_use = 0 B`, `size_allocated = 0 B`.
+  - Driver warmup observation: on a fresh `MTL4CommandQueue`, Apple's Metal 4
+    driver lazily populates a bounded internal pool (~2,000 × 64 B ≈ 128 KiB)
+    over the first ~2,000 commits, after which allocations flatten to zero in
+    steady state.
 
 ## Open items
 
-- Spike S2: steady-state allocations and encode overhead per decode round.
+- None (Spike S2 closed on 2026-11-20; full M1 benchmark summary recorded in
+  [../process.md](../process.md#m1-calibration-and-spike-s2-results)).
