@@ -26,7 +26,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | F1 | `build.zig` graph: Zig core + ObjC bridge (translate-c) + embedded `.metallib` + tests | Implemented | M0 | [ADR-0001](decisions/0001-language-and-toolchain-boundaries.md) |
 | F2 | 16 KiB page-aligned wired regions (`mmap` + `mlock`) with boundary checks | Implemented | M0 | [ADR-0002](decisions/0002-page-alignment-and-zero-copy.md) |
 | F3 | Platform probe: Metal device and Neural Engine facts (`aminfer probe`) | Implemented | M0 | [hardware.md](architecture/hardware.md) |
-| F4 | `ExpertSource` tagged union (`thunderbolt_peer` reserved) | Confirmed | M0 | [ADR-0003](decisions/0003-expert-source-tagged-union.md) |
+| F4 | `ExpertSource` tagged union (`thunderbolt_peer` reserved) | Implemented | M0 | [ADR-0003](decisions/0003-expert-source-tagged-union.md) |
 | F5 | Zero-copy `MTLBuffer` over a wired region (`newBufferWithBytesNoCopy`) | Confirmed | M0 | [ADR-0002](decisions/0002-page-alignment-and-zero-copy.md) |
 | F6 | Metal 4 command path (reusable allocator and command buffer, residency set, shared-event completion) | Confirmed | M0 smoke, M1 hot path | [ADR-0011](decisions/0011-metal4-zero-allocation-hot-path.md) |
 | F7 | uv-managed offline tools scaffold | Confirmed | M0 | [ADR-0001](decisions/0001-language-and-toolchain-boundaries.md) |
