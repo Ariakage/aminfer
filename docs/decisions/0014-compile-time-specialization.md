@@ -14,18 +14,22 @@ cycles on the CPU and divergence on the GPU.
 
 1. **Confirmed**: Zig `comptime` generates branch-free specialized host code
    for each supported combination of quantization bits, group size, MoE top-k
-   and tree width; unsupported combinations are compile errors.
-2. **Draft**: on the GPU the same configuration tables drive Metal function
-   constants, so each kernel variant is specialized when its pipeline is
-   created at startup, never on the hot path.
+   and tree width (`src/quant/spec.zig`); unsupported combinations are compile
+   errors.
+2. **Confirmed**: on the GPU the same configuration tables drive Metal
+   function constants through `MTL4SpecializedFunctionDescriptor` and
+   `MTLFunctionConstantValues` (`ami_pipeline_create_specialized`), so each
+   kernel variant is specialized when its pipeline is created at startup, never
+   on the hot path.
 
 ## Consequences
 
 - Supported combinations are enumerated explicitly; adding one is a code
   change, not a runtime flag.
-- Binary size grows with the number of variants.
+- Startup compiles one pipeline state per active specialization; the binary
+  embeds one shared `.metallib`.
 
 ## Open items
 
-- Confirm the function-constant mechanism and the variant count when the first
-  kernels land (M1).
+- None for M1 (3-bit and 4-bit group-64 variants); MoE top-k and tree-width
+  variants join in M2–M3.

@@ -29,16 +29,29 @@ struct ami_pipeline {
     void *mtl_pipeline; // id<MTLComputePipelineState>, retained
 };
 
-struct ami_compute {
-    void *mtl_queue;          // id<MTL4CommandQueue>, retained
+typedef struct ami_frame_slot {
     void *mtl_allocator;      // id<MTL4CommandAllocator>, retained
     void *mtl_command_buffer; // id<MTL4CommandBuffer>, retained
     void *mtl_arg_table;      // id<MTL4ArgumentTable>, retained
-    void *mtl_residency_set;  // id<MTLResidencySet>, retained
-    void *mtl_event;          // id<MTLSharedEvent>, retained
-    uint64_t next_signal;
+    void *mtl_uniform_buffer; // id<MTLBuffer>, retained (preallocated uniform ring)
+    uint8_t *uniform_base;    // cached mtl_uniform_buffer.contents
+    uint64_t uniform_gpu;     // cached mtl_uniform_buffer.gpuAddress
     uint64_t last_signal;
-    bool allocator_busy;
+    bool in_flight;
+} ami_frame_slot;
+
+struct ami_compute {
+    void *mtl_queue;                 // id<MTL4CommandQueue>, retained
+    void *mtl_user_residency_set;    // id<MTLResidencySet>, retained
+    void *mtl_internal_residency_set;// id<MTLResidencySet>, retained (uniform rings)
+    void *mtl_event;                 // id<MTLSharedEvent>, retained
+    void *active_encoder;            // id<MTL4ComputeCommandEncoder>, retained while frame open
+    uint32_t frame_count;
+    uint32_t next_slot;
+    int32_t active_slot;             // -1 when no frame is open
+    uint32_t uniform_cursor;
+    uint64_t next_signal;
+    ami_frame_slot slots[AMI_MAX_FRAMES_IN_FLIGHT];
 };
 
 static id<MTLDevice> device_of(const ami_device *device) {
@@ -58,8 +71,6 @@ static id<MTLComputePipelineState> pipeline_of(const ami_pipeline *pipeline) {
 }
 
 static uint32_t highest_apple_family(id<MTLDevice> device) {
-    // MTLGPUFamilyApple1 = 1001 ... probe upward-compatible values numerically
-    // so that families newer than the SDK enum are still reported.
     for (NSInteger family = 1020; family >= 1001; family--) {
         if ([device supportsFamily:(MTLGPUFamily)family]) {
             return (uint32_t)(family - 1000);
@@ -232,11 +243,20 @@ uint64_t ami_buffer_gpu_address(const ami_buffer *buffer) {
 
 ami_status ami_pipeline_create(ami_device *device, const ami_library *library,
                                const char *function_name, ami_pipeline **out_pipeline) {
+    return ami_pipeline_create_specialized(device, library, function_name, NULL, 0, out_pipeline);
+}
+
+ami_status ami_pipeline_create_specialized(ami_device *device, const ami_library *library,
+                                           const char *function_name,
+                                           const ami_fn_constant *constants,
+                                           size_t constant_count,
+                                           ami_pipeline **out_pipeline) {
     if (out_pipeline == NULL) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
     *out_pipeline = NULL;
-    if (device == NULL || library == NULL || function_name == NULL) {
+    if (device == NULL || library == NULL || function_name == NULL ||
+        (constant_count > 0 && constants == NULL)) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
     @autoreleasepool {
@@ -258,9 +278,34 @@ ami_status ami_pipeline_create(ami_device *device, const ami_library *library,
             return AMI_ERR_PIPELINE;
         }
 
-        MTL4LibraryFunctionDescriptor *fn_desc = [[MTL4LibraryFunctionDescriptor alloc] init];
-        fn_desc.library = mtl_library;
-        fn_desc.name = name;
+        MTL4LibraryFunctionDescriptor *base_desc = [[MTL4LibraryFunctionDescriptor alloc] init];
+        base_desc.library = mtl_library;
+        base_desc.name = name;
+
+        MTL4FunctionDescriptor *fn_desc = base_desc;
+        if (constant_count > 0) {
+            MTLFunctionConstantValues *values = [[MTLFunctionConstantValues alloc] init];
+            for (size_t i = 0; i < constant_count; i++) {
+                if (constants[i].type == AMI_CONST_U32) {
+                    uint32_t v = constants[i].value;
+                    [values setConstantValue:&v
+                                        type:MTLDataTypeUInt
+                                     atIndex:(NSUInteger)constants[i].index];
+                } else if (constants[i].type == AMI_CONST_BOOL) {
+                    bool b = (constants[i].value != 0);
+                    [values setConstantValue:&b
+                                        type:MTLDataTypeBool
+                                     atIndex:(NSUInteger)constants[i].index];
+                } else {
+                    return AMI_ERR_INVALID_ARGUMENT;
+                }
+            }
+            MTL4SpecializedFunctionDescriptor *spec_desc =
+                [[MTL4SpecializedFunctionDescriptor alloc] init];
+            spec_desc.functionDescriptor = base_desc;
+            spec_desc.constantValues = values;
+            fn_desc = spec_desc;
+        }
 
         MTL4ComputePipelineDescriptor *pipe_desc = [[MTL4ComputePipelineDescriptor alloc] init];
         pipe_desc.computeFunctionDescriptor = fn_desc;
@@ -291,12 +336,32 @@ void ami_pipeline_destroy(ami_pipeline *pipeline) {
     free(pipeline);
 }
 
+uint32_t ami_pipeline_max_threads_per_threadgroup(const ami_pipeline *pipeline) {
+    if (pipeline == NULL) {
+        return 0;
+    }
+    return (uint32_t)pipeline_of(pipeline).maxTotalThreadsPerThreadgroup;
+}
+
+static void release_frame_slot(ami_frame_slot *slot) {
+    if (slot->mtl_uniform_buffer != NULL) CFRelease(slot->mtl_uniform_buffer);
+    if (slot->mtl_arg_table != NULL) CFRelease(slot->mtl_arg_table);
+    if (slot->mtl_command_buffer != NULL) CFRelease(slot->mtl_command_buffer);
+    if (slot->mtl_allocator != NULL) CFRelease(slot->mtl_allocator);
+    memset(slot, 0, sizeof *slot);
+}
+
 ami_status ami_compute_create(ami_device *device, ami_compute **out_compute) {
+    return ami_compute_create_with_frames(device, 2, out_compute);
+}
+
+ami_status ami_compute_create_with_frames(ami_device *device, uint32_t frames_in_flight,
+                                          ami_compute **out_compute) {
     if (out_compute == NULL) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
     *out_compute = NULL;
-    if (device == NULL) {
+    if (device == NULL || frames_in_flight == 0 || frames_in_flight > AMI_MAX_FRAMES_IN_FLIGHT) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
     @autoreleasepool {
@@ -309,58 +374,79 @@ ami_status ami_compute_create(ami_device *device, ami_compute **out_compute) {
         if (queue == nil) {
             return AMI_ERR_COMPUTE;
         }
-        id<MTL4CommandAllocator> allocator = [mtl_device newCommandAllocator];
-        if (allocator == nil) {
-            return AMI_ERR_COMPUTE;
-        }
-        id<MTL4CommandBuffer> command_buffer = [mtl_device newCommandBuffer];
-        if (command_buffer == nil) {
-            return AMI_ERR_COMPUTE;
-        }
 
         NSError *error = nil;
-        MTL4ArgumentTableDescriptor *table_desc = [[MTL4ArgumentTableDescriptor alloc] init];
-        table_desc.maxBufferBindCount = AMI_MAX_BUFFER_BINDINGS;
-        table_desc.initializeBindings = YES;
-        id<MTL4ArgumentTable> arg_table = [mtl_device newArgumentTableWithDescriptor:table_desc
-                                                                               error:&error];
-        if (arg_table == nil) {
+        MTLResidencySetDescriptor *user_res_desc = [[MTLResidencySetDescriptor alloc] init];
+        user_res_desc.initialCapacity = AMI_MAX_BUFFER_BINDINGS;
+        id<MTLResidencySet> user_res = [mtl_device newResidencySetWithDescriptor:user_res_desc
+                                                                           error:&error];
+        if (user_res == nil) {
             return AMI_ERR_COMPUTE;
         }
+        [user_res commit];
+        [user_res requestResidency];
 
-        MTLResidencySetDescriptor *res_desc = [[MTLResidencySetDescriptor alloc] init];
-        res_desc.initialCapacity = AMI_MAX_BUFFER_BINDINGS;
-        id<MTLResidencySet> residency_set = [mtl_device newResidencySetWithDescriptor:res_desc
-                                                                                error:&error];
-        if (residency_set == nil) {
+        MTLResidencySetDescriptor *int_res_desc = [[MTLResidencySetDescriptor alloc] init];
+        int_res_desc.initialCapacity = frames_in_flight;
+        id<MTLResidencySet> int_res = [mtl_device newResidencySetWithDescriptor:int_res_desc
+                                                                          error:&error];
+        if (int_res == nil) {
+            [user_res endResidency];
             return AMI_ERR_COMPUTE;
         }
-        [residency_set commit];
-        [residency_set requestResidency];
-        [queue addResidencySet:residency_set];
 
         id<MTLSharedEvent> event = [mtl_device newSharedEvent];
         if (event == nil) {
-            [queue removeResidencySet:residency_set];
-            [residency_set endResidency];
+            [user_res endResidency];
             return AMI_ERR_COMPUTE;
         }
 
         ami_compute *compute = calloc(1, sizeof *compute);
         if (compute == NULL) {
-            [queue removeResidencySet:residency_set];
-            [residency_set endResidency];
+            [user_res endResidency];
             return AMI_ERR_OUT_OF_MEMORY;
         }
         compute->mtl_queue = (__bridge_retained void *)queue;
-        compute->mtl_allocator = (__bridge_retained void *)allocator;
-        compute->mtl_command_buffer = (__bridge_retained void *)command_buffer;
-        compute->mtl_arg_table = (__bridge_retained void *)arg_table;
-        compute->mtl_residency_set = (__bridge_retained void *)residency_set;
+        compute->mtl_user_residency_set = (__bridge_retained void *)user_res;
+        compute->mtl_internal_residency_set = (__bridge_retained void *)int_res;
         compute->mtl_event = (__bridge_retained void *)event;
+        compute->frame_count = frames_in_flight;
+        compute->next_slot = 0;
+        compute->active_slot = -1;
+        compute->uniform_cursor = 0;
         compute->next_signal = 1;
-        compute->last_signal = 0;
-        compute->allocator_busy = false;
+
+        const size_t uniform_bytes = AMI_UNIFORM_STRIDE * AMI_UNIFORM_SLOTS_PER_FRAME;
+        for (uint32_t i = 0; i < frames_in_flight; i++) {
+            id<MTL4CommandAllocator> allocator = [mtl_device newCommandAllocator];
+            id<MTL4CommandBuffer> cb = [mtl_device newCommandBuffer];
+
+            MTL4ArgumentTableDescriptor *table_desc = [[MTL4ArgumentTableDescriptor alloc] init];
+            table_desc.maxBufferBindCount = AMI_MAX_BUFFER_BINDINGS;
+            table_desc.initializeBindings = YES;
+            id<MTL4ArgumentTable> arg_table = [mtl_device newArgumentTableWithDescriptor:table_desc
+                                                                                   error:&error];
+            id<MTLBuffer> uniform_buf =
+                [mtl_device newBufferWithLength:uniform_bytes
+                                        options:MTLResourceStorageModeShared];
+            if (allocator == nil || cb == nil || arg_table == nil || uniform_buf == nil) {
+                ami_compute_destroy(compute);
+                return AMI_ERR_COMPUTE;
+            }
+            [int_res addAllocation:uniform_buf];
+            compute->slots[i].mtl_allocator = (__bridge_retained void *)allocator;
+            compute->slots[i].mtl_command_buffer = (__bridge_retained void *)cb;
+            compute->slots[i].mtl_arg_table = (__bridge_retained void *)arg_table;
+            compute->slots[i].mtl_uniform_buffer = (__bridge_retained void *)uniform_buf;
+            compute->slots[i].uniform_base = (uint8_t *)uniform_buf.contents;
+            compute->slots[i].uniform_gpu = (uint64_t)uniform_buf.gpuAddress;
+        }
+
+        [int_res commit];
+        [int_res requestResidency];
+        [queue addResidencySet:user_res];
+        [queue addResidencySet:int_res];
+
         *out_compute = compute;
     }
     return AMI_OK;
@@ -370,21 +456,44 @@ void ami_compute_destroy(ami_compute *compute) {
     if (compute == NULL) {
         return;
     }
+    ami_compute_abort_frame(compute);
     @autoreleasepool {
+        id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)compute->mtl_event;
+        uint64_t max_sig = 0;
+        for (uint32_t i = 0; i < compute->frame_count; i++) {
+            if (compute->slots[i].in_flight && compute->slots[i].last_signal > max_sig) {
+                max_sig = compute->slots[i].last_signal;
+            }
+        }
+        if (max_sig > 0 && event != nil) {
+            [event waitUntilSignaledValue:max_sig timeoutMS:5000];
+        }
+
         id<MTL4CommandQueue> queue = (__bridge id<MTL4CommandQueue>)compute->mtl_queue;
-        id<MTLResidencySet> residency_set =
-            (__bridge id<MTLResidencySet>)compute->mtl_residency_set;
-        [queue removeResidencySet:residency_set];
-        [residency_set removeAllAllocations];
-        [residency_set commit];
-        [residency_set endResidency];
+        id<MTLResidencySet> user_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
+        id<MTLResidencySet> int_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_internal_residency_set;
+        if (queue != nil && user_res != nil) [queue removeResidencySet:user_res];
+        if (queue != nil && int_res != nil) [queue removeResidencySet:int_res];
+        if (user_res != nil) {
+            [user_res removeAllAllocations];
+            [user_res commit];
+            [user_res endResidency];
+        }
+        if (int_res != nil) {
+            [int_res removeAllAllocations];
+            [int_res commit];
+            [int_res endResidency];
+        }
     }
-    CFRelease(compute->mtl_event);
-    CFRelease(compute->mtl_residency_set);
-    CFRelease(compute->mtl_arg_table);
-    CFRelease(compute->mtl_command_buffer);
-    CFRelease(compute->mtl_allocator);
-    CFRelease(compute->mtl_queue);
+    for (uint32_t i = 0; i < AMI_MAX_FRAMES_IN_FLIGHT; i++) {
+        release_frame_slot(&compute->slots[i]);
+    }
+    if (compute->mtl_event != NULL) CFRelease(compute->mtl_event);
+    if (compute->mtl_internal_residency_set != NULL) CFRelease(compute->mtl_internal_residency_set);
+    if (compute->mtl_user_residency_set != NULL) CFRelease(compute->mtl_user_residency_set);
+    if (compute->mtl_queue != NULL) CFRelease(compute->mtl_queue);
     free(compute);
 }
 
@@ -402,13 +511,37 @@ ami_status ami_compute_make_resident(ami_compute *compute, ami_buffer *const *bu
         }
     }
     @autoreleasepool {
-        id<MTLResidencySet> residency_set =
-            (__bridge id<MTLResidencySet>)compute->mtl_residency_set;
+        id<MTLResidencySet> user_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
         for (size_t i = 0; i < count; i++) {
-            [residency_set addAllocation:buffer_of(buffers[i])];
+            [user_res addAllocation:buffer_of(buffers[i])];
         }
-        [residency_set commit];
-        [residency_set requestResidency];
+        [user_res commit];
+        [user_res requestResidency];
+    }
+    return AMI_OK;
+}
+
+ami_status ami_compute_remove_resident(ami_compute *compute, ami_buffer *const *buffers,
+                                       size_t count) {
+    if (compute == NULL || (count > 0 && buffers == NULL)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (count == 0) {
+        return AMI_OK;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (buffers[i] == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    @autoreleasepool {
+        id<MTLResidencySet> user_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
+        for (size_t i = 0; i < count; i++) {
+            [user_res removeAllocation:buffer_of(buffers[i])];
+        }
+        [user_res commit];
     }
     return AMI_OK;
 }
@@ -418,10 +551,191 @@ ami_status ami_compute_clear_residency(ami_compute *compute) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
     @autoreleasepool {
-        id<MTLResidencySet> residency_set =
-            (__bridge id<MTLResidencySet>)compute->mtl_residency_set;
-        [residency_set removeAllAllocations];
-        [residency_set commit];
+        id<MTLResidencySet> user_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
+        [user_res removeAllAllocations];
+        [user_res commit];
+    }
+    return AMI_OK;
+}
+
+ami_status ami_compute_begin_frame(ami_compute *compute, uint64_t timeout_ms,
+                                   uint32_t *out_slot) {
+    if (compute == NULL || compute->active_slot >= 0) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    uint32_t slot_idx = compute->next_slot;
+    ami_frame_slot *slot = &compute->slots[slot_idx];
+
+    @autoreleasepool {
+        id<MTL4CommandAllocator> allocator =
+            (__bridge id<MTL4CommandAllocator>)slot->mtl_allocator;
+        id<MTL4CommandBuffer> cb = (__bridge id<MTL4CommandBuffer>)slot->mtl_command_buffer;
+        id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)compute->mtl_event;
+
+        if (slot->in_flight) {
+            if (![event waitUntilSignaledValue:slot->last_signal timeoutMS:timeout_ms]) {
+                return AMI_ERR_TIMEOUT;
+            }
+            [allocator reset];
+            slot->in_flight = false;
+        }
+
+        [cb beginCommandBufferWithAllocator:allocator];
+        id<MTL4ComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+        if (encoder == nil) {
+            [cb endCommandBuffer];
+            [allocator reset];
+            return AMI_ERR_COMPUTE;
+        }
+        compute->active_encoder = (__bridge_retained void *)encoder;
+        compute->active_slot = (int32_t)slot_idx;
+        compute->uniform_cursor = 0;
+        if (out_slot != NULL) {
+            *out_slot = slot_idx;
+        }
+    }
+    return AMI_OK;
+}
+
+void ami_compute_abort_frame(ami_compute *compute) {
+    if (compute == NULL || compute->active_slot < 0) {
+        return;
+    }
+    ami_frame_slot *slot = &compute->slots[compute->active_slot];
+    @autoreleasepool {
+        if (compute->active_encoder != NULL) {
+            id<MTL4ComputeCommandEncoder> encoder =
+                (__bridge_transfer id<MTL4ComputeCommandEncoder>)compute->active_encoder;
+            compute->active_encoder = NULL;
+            [encoder endEncoding];
+        }
+        id<MTL4CommandBuffer> cb = (__bridge id<MTL4CommandBuffer>)slot->mtl_command_buffer;
+        id<MTL4CommandAllocator> allocator =
+            (__bridge id<MTL4CommandAllocator>)slot->mtl_allocator;
+        [cb endCommandBuffer];
+        [allocator reset];
+    }
+    compute->active_slot = -1;
+    compute->uniform_cursor = 0;
+}
+
+ami_status ami_compute_encode_dispatch(ami_compute *compute, const ami_pipeline *pipeline,
+                                       const ami_buffer_binding *bindings, size_t binding_count,
+                                       const void *uniform_bytes, size_t uniform_len,
+                                       uint64_t grid_x, uint64_t grid_y, uint64_t grid_z,
+                                       uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
+                                       uint32_t dispatch_mode, uint32_t insert_barrier_before) {
+    if (compute == NULL || compute->active_slot < 0 || compute->active_encoder == NULL ||
+        pipeline == NULL || grid_x == 0 || grid_y == 0 || grid_z == 0 ||
+        tg_x == 0 || tg_y == 0 || tg_z == 0 ||
+        (binding_count > 0 && bindings == NULL) ||
+        (uniform_len > 0 && uniform_bytes == NULL) ||
+        uniform_len > AMI_UNIFORM_STRIDE ||
+        (dispatch_mode != AMI_DISPATCH_THREADS && dispatch_mode != AMI_DISPATCH_THREADGROUPS)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    size_t total_bindings = binding_count + (uniform_len > 0 ? 1u : 0u);
+    if (total_bindings > AMI_MAX_BUFFER_BINDINGS) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    for (size_t i = 0; i < binding_count; i++) {
+        if (bindings[i].buffer == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+
+    ami_frame_slot *slot = &compute->slots[compute->active_slot];
+    if (uniform_len > 0 && compute->uniform_cursor >= AMI_UNIFORM_SLOTS_PER_FRAME) {
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    @autoreleasepool {
+        id<MTL4ComputeCommandEncoder> encoder =
+            (__bridge id<MTL4ComputeCommandEncoder>)compute->active_encoder;
+        id<MTL4ArgumentTable> arg_table = (__bridge id<MTL4ArgumentTable>)slot->mtl_arg_table;
+        id<MTLComputePipelineState> state = pipeline_of(pipeline);
+
+        if (insert_barrier_before != 0) {
+            [encoder barrierAfterEncoderStages:MTLStageDispatch
+                           beforeEncoderStages:MTLStageDispatch
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+        }
+
+        for (size_t i = 0; i < binding_count; i++) {
+            MTLGPUAddress addr = buffer_of(bindings[i].buffer).gpuAddress + bindings[i].offset;
+            [arg_table setAddress:addr atIndex:(NSUInteger)i];
+        }
+
+        if (uniform_len > 0) {
+            size_t u_off = (size_t)compute->uniform_cursor * AMI_UNIFORM_STRIDE;
+            memcpy(slot->uniform_base + u_off, uniform_bytes, uniform_len);
+            [arg_table setAddress:(slot->uniform_gpu + u_off)
+                          atIndex:(NSUInteger)binding_count];
+            compute->uniform_cursor++;
+        }
+
+        [encoder setComputePipelineState:state];
+        [encoder setArgumentTable:arg_table];
+
+        MTLSize grid = MTLSizeMake((NSUInteger)grid_x, (NSUInteger)grid_y, (NSUInteger)grid_z);
+        MTLSize tg = MTLSizeMake((NSUInteger)tg_x, (NSUInteger)tg_y, (NSUInteger)tg_z);
+        if (dispatch_mode == AMI_DISPATCH_THREADS) {
+            [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+        } else {
+            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        }
+    }
+    return AMI_OK;
+}
+
+ami_status ami_compute_commit_frame(ami_compute *compute, uint64_t *out_signal) {
+    if (compute == NULL || compute->active_slot < 0 || compute->active_encoder == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    uint32_t slot_idx = (uint32_t)compute->active_slot;
+    ami_frame_slot *slot = &compute->slots[slot_idx];
+    @autoreleasepool {
+        id<MTL4ComputeCommandEncoder> encoder =
+            (__bridge_transfer id<MTL4ComputeCommandEncoder>)compute->active_encoder;
+        compute->active_encoder = NULL;
+        [encoder endEncoding];
+
+        id<MTL4CommandBuffer> cb = (__bridge id<MTL4CommandBuffer>)slot->mtl_command_buffer;
+        id<MTL4CommandQueue> queue = (__bridge id<MTL4CommandQueue>)compute->mtl_queue;
+        id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)compute->mtl_event;
+
+        [cb endCommandBuffer];
+        const id<MTL4CommandBuffer> batch[1] = {cb};
+        [queue commit:batch count:1];
+
+        uint64_t sig = compute->next_signal++;
+        slot->last_signal = sig;
+        slot->in_flight = true;
+        [queue signalEvent:event value:sig];
+
+        compute->active_slot = -1;
+        compute->uniform_cursor = 0;
+        compute->next_slot = (slot_idx + 1u) % compute->frame_count;
+        if (out_signal != NULL) {
+            *out_signal = sig;
+        }
+    }
+    return AMI_OK;
+}
+
+ami_status ami_compute_wait(ami_compute *compute, uint64_t signal, uint64_t timeout_ms) {
+    if (compute == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (signal == 0) {
+        return AMI_OK;
+    }
+    @autoreleasepool {
+        id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)compute->mtl_event;
+        if (![event waitUntilSignaledValue:signal timeoutMS:timeout_ms]) {
+            return AMI_ERR_TIMEOUT;
+        }
     }
     return AMI_OK;
 }
@@ -433,67 +747,30 @@ ami_status ami_compute_dispatch_1d_sync(ami_compute *compute, const ami_pipeline
         buffer_count > AMI_MAX_BUFFER_BINDINGS || (buffer_count > 0 && buffers == NULL)) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
+    ami_buffer_binding bindings[AMI_MAX_BUFFER_BINDINGS];
     for (size_t i = 0; i < buffer_count; i++) {
         if (buffers[i] == NULL) {
             return AMI_ERR_INVALID_ARGUMENT;
         }
+        bindings[i].buffer = buffers[i];
+        bindings[i].offset = 0;
     }
-    @autoreleasepool {
-        id<MTL4CommandQueue> queue = (__bridge id<MTL4CommandQueue>)compute->mtl_queue;
-        id<MTL4CommandAllocator> allocator =
-            (__bridge id<MTL4CommandAllocator>)compute->mtl_allocator;
-        id<MTL4CommandBuffer> command_buffer =
-            (__bridge id<MTL4CommandBuffer>)compute->mtl_command_buffer;
-        id<MTL4ArgumentTable> arg_table =
-            (__bridge id<MTL4ArgumentTable>)compute->mtl_arg_table;
-        id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)compute->mtl_event;
-        id<MTLComputePipelineState> state = pipeline_of(pipeline);
-
-        // Never reset an allocator whose previous submission is still in flight.
-        if (compute->allocator_busy) {
-            if (![event waitUntilSignaledValue:compute->last_signal timeoutMS:timeout_ms]) {
-                return AMI_ERR_TIMEOUT;
-            }
-            [allocator reset];
-            compute->allocator_busy = false;
-        }
-
-        for (size_t i = 0; i < buffer_count; i++) {
-            [arg_table setAddress:buffer_of(buffers[i]).gpuAddress atIndex:(NSUInteger)i];
-        }
-
-        [command_buffer beginCommandBufferWithAllocator:allocator];
-        id<MTL4ComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            [command_buffer endCommandBuffer];
-            [allocator reset];
-            return AMI_ERR_COMPUTE;
-        }
-
-        [encoder setComputePipelineState:state];
-        [encoder setArgumentTable:arg_table];
-
-        NSUInteger max_tg = state.maxTotalThreadsPerThreadgroup;
-        NSUInteger tg_width =
-            (threads < (uint64_t)max_tg) ? (NSUInteger)threads : max_tg;
-        [encoder dispatchThreads:MTLSizeMake((NSUInteger)threads, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
-        [encoder endEncoding];
-        [command_buffer endCommandBuffer];
-
-        const id<MTL4CommandBuffer> batch[1] = {command_buffer};
-        [queue commit:batch count:1];
-
-        uint64_t signal_value = compute->next_signal++;
-        compute->last_signal = signal_value;
-        compute->allocator_busy = true;
-        [queue signalEvent:event value:signal_value];
-
-        if (![event waitUntilSignaledValue:signal_value timeoutMS:timeout_ms]) {
-            return AMI_ERR_TIMEOUT;
-        }
-        [allocator reset];
-        compute->allocator_busy = false;
+    ami_status st = ami_compute_begin_frame(compute, timeout_ms, NULL);
+    if (st != AMI_OK) {
+        return st;
     }
-    return AMI_OK;
+    uint64_t max_tg = ami_pipeline_max_threads_per_threadgroup(pipeline);
+    uint64_t tg = threads < max_tg ? threads : max_tg;
+    st = ami_compute_encode_dispatch(compute, pipeline, bindings, buffer_count, NULL, 0,
+                                     threads, 1, 1, tg, 1, 1, AMI_DISPATCH_THREADS, 0);
+    if (st != AMI_OK) {
+        ami_compute_abort_frame(compute);
+        return st;
+    }
+    uint64_t sig = 0;
+    st = ami_compute_commit_frame(compute, &sig);
+    if (st != AMI_OK) {
+        return st;
+    }
+    return ami_compute_wait(compute, sig, timeout_ms);
 }

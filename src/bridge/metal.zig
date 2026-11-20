@@ -9,6 +9,10 @@ const page = @import("../mem/page.zig");
 /// The kernel library compiled from `src/kernels/*.metal` by `build.zig`.
 const embedded_metallib = @embedFile("aminfer_metallib");
 
+pub const MAX_BUFFER_BINDINGS: usize = c.AMI_MAX_BUFFER_BINDINGS;
+pub const MAX_FRAMES_IN_FLIGHT: u32 = c.AMI_MAX_FRAMES_IN_FLIGHT;
+pub const MAX_UNIFORM_BYTES: usize = c.AMI_UNIFORM_STRIDE;
+
 pub const Error = error{
     InvalidArgument,
     NoDevice,
@@ -132,28 +136,163 @@ pub const Buffer = struct {
     }
 };
 
+/// Buffer plus byte offset for Metal 4 argument-table GPU-address binding.
+pub const BufferBinding = struct {
+    buffer: Buffer,
+    offset: u64 = 0,
+};
+
+/// Startup Metal function-constant value for compile-time GPU specialization (ADR-0014).
+pub const FnConstant = struct {
+    index: u32,
+    value: union(enum) {
+        u32: u32,
+        bool: bool,
+    },
+};
+
 /// Compute pipeline built at startup through the Metal 4 compiler.
 pub const Pipeline = struct {
     handle: *c.ami_pipeline,
 
     pub fn init(device: Device, library: Library, function_name: [:0]const u8) Error!Pipeline {
+        return initSpecialized(device, library, function_name, &.{});
+    }
+
+    pub fn initSpecialized(
+        device: Device,
+        library: Library,
+        function_name: [:0]const u8,
+        constants: []const FnConstant,
+    ) Error!Pipeline {
+        const max_constants = 16;
+        if (constants.len > max_constants) return error.InvalidArgument;
+        var raw: [max_constants]c.ami_fn_constant = undefined;
+        for (constants, 0..) |fc, i| {
+            raw[i] = switch (fc.value) {
+                .u32 => |v| .{ .index = fc.index, .type = c.AMI_CONST_U32, .value = v },
+                .bool => |b| .{ .index = fc.index, .type = c.AMI_CONST_BOOL, .value = if (b) 1 else 0 },
+            };
+        }
+        const ptr: ?[*]const c.ami_fn_constant = if (constants.len > 0) &raw else null;
         var handle: ?*c.ami_pipeline = null;
-        try check(c.ami_pipeline_create(device.handle, library.handle, function_name.ptr, &handle));
+        try check(c.ami_pipeline_create_specialized(
+            device.handle,
+            library.handle,
+            function_name.ptr,
+            ptr,
+            constants.len,
+            &handle,
+        ));
         return .{ .handle = handle orelse return error.NullHandle };
     }
 
     pub fn close(self: Pipeline) void {
         c.ami_pipeline_destroy(self.handle);
     }
+
+    pub fn maxThreadsPerThreadgroup(self: Pipeline) u32 {
+        return c.ami_pipeline_max_threads_per_threadgroup(self.handle);
+    }
 };
 
-/// Reusable Metal 4 compute submission context (ADR-0011).
+/// Reusable multi-frame Metal 4 compute submission context (ADR-0011).
 pub const Compute = struct {
     handle: *c.ami_compute,
 
+    /// An open command-buffer frame; call `commit` or `abort`.
+    pub const Frame = struct {
+        compute: *Compute,
+        slot: u32,
+        open: bool,
+
+        /// Encodes a dispatch whose grid is specified in total threads.
+        pub fn encodeThreads(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            uniform_bytes: ?[]const u8,
+            grid: [3]u64,
+            threadgroup: [3]u64,
+            insert_barrier_before: bool,
+        ) Error!void {
+            return self.encode(pipeline, bindings, uniform_bytes, grid, threadgroup, c.AMI_DISPATCH_THREADS, insert_barrier_before);
+        }
+
+        /// Encodes a dispatch whose grid is specified in threadgroups.
+        pub fn encodeThreadgroups(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            uniform_bytes: ?[]const u8,
+            grid_groups: [3]u64,
+            threadgroup: [3]u64,
+            insert_barrier_before: bool,
+        ) Error!void {
+            return self.encode(pipeline, bindings, uniform_bytes, grid_groups, threadgroup, c.AMI_DISPATCH_THREADGROUPS, insert_barrier_before);
+        }
+
+        fn encode(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            uniform_bytes: ?[]const u8,
+            grid: [3]u64,
+            threadgroup: [3]u64,
+            mode: u32,
+            insert_barrier_before: bool,
+        ) Error!void {
+            if (!self.open) return error.InvalidArgument;
+            if (bindings.len > MAX_BUFFER_BINDINGS) return error.InvalidArgument;
+            var raw: [MAX_BUFFER_BINDINGS]c.ami_buffer_binding = undefined;
+            for (bindings, 0..) |b, i| {
+                raw[i] = .{ .buffer = b.buffer.handle, .offset = b.offset };
+            }
+            const b_ptr: ?[*]const c.ami_buffer_binding = if (bindings.len > 0) &raw else null;
+            const u_ptr: ?*const anyopaque = if (uniform_bytes) |u| u.ptr else null;
+            const u_len: usize = if (uniform_bytes) |u| u.len else 0;
+            try check(c.ami_compute_encode_dispatch(
+                self.compute.handle,
+                pipeline.handle,
+                b_ptr,
+                bindings.len,
+                u_ptr,
+                u_len,
+                grid[0],
+                grid[1],
+                grid[2],
+                threadgroup[0],
+                threadgroup[1],
+                threadgroup[2],
+                mode,
+                if (insert_barrier_before) 1 else 0,
+            ));
+        }
+
+        /// Ends encoding, commits the command buffer and returns its completion signal.
+        pub fn commit(self: *Frame) Error!u64 {
+            if (!self.open) return error.InvalidArgument;
+            var signal: u64 = 0;
+            self.open = false;
+            try check(c.ami_compute_commit_frame(self.compute.handle, &signal));
+            return signal;
+        }
+
+        /// Aborts an uncommitted frame and resets its allocator. Safe to call in `errdefer`.
+        pub fn abort(self: *Frame) void {
+            if (!self.open) return;
+            self.open = false;
+            c.ami_compute_abort_frame(self.compute.handle);
+        }
+    };
+
     pub fn init(device: Device) Error!Compute {
+        return initWithFrames(device, 2);
+    }
+
+    pub fn initWithFrames(device: Device, frames_in_flight: u32) Error!Compute {
         var handle: ?*c.ami_compute = null;
-        try check(c.ami_compute_create(device.handle, &handle));
+        try check(c.ami_compute_create_with_frames(device.handle, frames_in_flight, &handle));
         return .{ .handle = handle orelse return error.NullHandle };
     }
 
@@ -161,7 +300,7 @@ pub const Compute = struct {
         c.ami_compute_destroy(self.handle);
     }
 
-    /// Adds buffers to this context's residency set and commits residency.
+    /// Adds buffers to this context's user residency set and commits residency.
     /// Zero heap allocation: submits in fixed stack batches.
     pub fn makeResident(self: Compute, buffers: []const Buffer) Error!void {
         const batch_cap = 64;
@@ -177,12 +316,40 @@ pub const Compute = struct {
         }
     }
 
-    /// Removes all allocations from this context's residency set and commits.
+    /// Removes buffers from this context's user residency set and commits.
+    pub fn removeResident(self: Compute, buffers: []const Buffer) Error!void {
+        const batch_cap = 64;
+        var offset: usize = 0;
+        while (offset < buffers.len) {
+            const count = @min(batch_cap, buffers.len - offset);
+            var handles: [batch_cap]?*c.ami_buffer = undefined;
+            for (buffers[offset .. offset + count], 0..) |buf, i| {
+                handles[i] = buf.handle;
+            }
+            try check(c.ami_compute_remove_resident(self.handle, &handles, count));
+            offset += count;
+        }
+    }
+
+    /// Removes all caller allocations from this context's user residency set.
     pub fn clearResidency(self: Compute) Error!void {
         try check(c.ami_compute_clear_residency(self.handle));
     }
 
-    /// Encodes a 1D dispatch on the reusable command buffer and waits for
+    /// Acquires the next reusable frame slot, waiting only if that slot's prior
+    /// GPU work has not yet finished.
+    pub fn beginFrame(self: *Compute, timeout_ms: u64) Error!Frame {
+        var slot: u32 = 0;
+        try check(c.ami_compute_begin_frame(self.handle, timeout_ms, &slot));
+        return .{ .compute = self, .slot = slot, .open = true };
+    }
+
+    /// Waits on the shared event until `signal` has been reached by the GPU.
+    pub fn wait(self: Compute, signal: u64, timeout_ms: u64) Error!void {
+        try check(c.ami_compute_wait(self.handle, signal, timeout_ms));
+    }
+
+    /// Encodes a single 1D dispatch on the reusable command buffer and waits for
     /// shared-event completion. `buffers[i]` binds to `[[buffer(i)]]`.
     pub fn dispatch1dSync(
         self: Compute,
@@ -191,10 +358,10 @@ pub const Compute = struct {
         threads: u64,
         timeout_ms: u64,
     ) Error!void {
-        if (threads == 0 or buffers.len > c.AMI_MAX_BUFFER_BINDINGS) {
+        if (threads == 0 or buffers.len > MAX_BUFFER_BINDINGS) {
             return error.InvalidArgument;
         }
-        var handles: [c.AMI_MAX_BUFFER_BINDINGS]?*c.ami_buffer = undefined;
+        var handles: [MAX_BUFFER_BINDINGS]?*c.ami_buffer = undefined;
         for (buffers, 0..) |buf, i| {
             handles[i] = buf.handle;
         }
@@ -298,4 +465,72 @@ test "dispatch validates arguments and residency can be cleared" {
     try compute.makeResident(&.{buffer});
     try std.testing.expectError(error.InvalidArgument, compute.dispatch1dSync(pipeline, &.{buffer}, 0, 1000));
     try compute.clearResidency();
+}
+
+test "specialized pipeline, intra-encoder barrier, uniforms and multi-frame ring work end-to-end" {
+    const device = try Device.open();
+    defer device.close();
+    const library = try Library.openEmbedded(device);
+    defer library.close();
+
+    const iota_pipe = try Pipeline.init(device, library, "ami_smoke_iota");
+    defer iota_pipe.close();
+    const scale_pipe = try Pipeline.initSpecialized(
+        device,
+        library,
+        "ami_smoke_scale_add",
+        &.{.{ .index = 0, .value = .{ .u32 = 3 } }},
+    );
+    defer scale_pipe.close();
+
+    const threads = 1024;
+    const region = try page.WiredRegion.init(2 * page.APPLE_PAGE_SIZE);
+    defer region.deinit();
+    const buffer = try Buffer.wrap(device, region.bytes);
+    defer buffer.close();
+
+    // Two frames in flight; run 6 frames to wrap the allocator ring multiple times.
+    var compute = try Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{buffer});
+
+    const SmokeParams = extern struct { addend: u32 };
+    var last_sig: u64 = 0;
+
+    for (0..6) |round| {
+        const offset: u64 = (round % 2) * page.APPLE_PAGE_SIZE;
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try frame.encodeThreads(
+            iota_pipe,
+            &.{.{ .buffer = buffer, .offset = offset }},
+            null,
+            .{ threads, 1, 1 },
+            .{ 256, 1, 1 },
+            false,
+        );
+        const params: SmokeParams = .{ .addend = @intCast(round + 7) };
+        try frame.encodeThreads(
+            scale_pipe,
+            &.{.{ .buffer = buffer, .offset = offset }},
+            std.mem.asBytes(&params),
+            .{ threads, 1, 1 },
+            .{ 256, 1, 1 },
+            true,
+        );
+        last_sig = try frame.commit();
+    }
+
+    try compute.wait(last_sig, 5000);
+
+    // Round 4 wrote page 0 (addend = 11); round 5 wrote page 1 (addend = 12).
+    const page0: []const u32 = @ptrCast(region.bytes[0..page.APPLE_PAGE_SIZE]);
+    const page1: []const u32 = @ptrCast(region.bytes[page.APPLE_PAGE_SIZE..]);
+    for (0..threads) |i| {
+        const base: u32 = @as(u32, @intCast(i)) ^ 0xA5A5A5A5;
+        try std.testing.expectEqual(base *% 3 +% 11, page0[i]);
+        try std.testing.expectEqual(base *% 3 +% 12, page1[i]);
+    }
+
+    try compute.removeResident(&.{buffer});
 }

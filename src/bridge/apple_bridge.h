@@ -17,6 +17,9 @@ extern "C" {
 
 #define AMI_PAGE_SIZE 16384u
 #define AMI_MAX_BUFFER_BINDINGS 16u
+#define AMI_MAX_FRAMES_IN_FLIGHT 4u
+#define AMI_UNIFORM_STRIDE 256u
+#define AMI_UNIFORM_SLOTS_PER_FRAME 256u
 
 typedef int32_t ami_status;
 
@@ -33,6 +36,16 @@ enum {
     AMI_ERR_UNSUPPORTED = 9,
 };
 
+enum {
+    AMI_CONST_U32 = 0,
+    AMI_CONST_BOOL = 1,
+};
+
+enum {
+    AMI_DISPATCH_THREADS = 0,
+    AMI_DISPATCH_THREADGROUPS = 1,
+};
+
 /* Owns one id<MTLDevice>. */
 typedef struct ami_device ami_device;
 
@@ -45,7 +58,7 @@ typedef struct ami_buffer ami_buffer;
 /* Owns one id<MTLComputePipelineState>. */
 typedef struct ami_pipeline ami_pipeline;
 
-/* Owns the reusable Metal 4 submission objects (ADR-0011). */
+/* Owns the reusable multi-frame Metal 4 submission objects (ADR-0011). */
 typedef struct ami_compute ami_compute;
 
 typedef struct ami_device_info {
@@ -57,6 +70,19 @@ typedef struct ami_device_info {
     uint32_t apple_gpu_family;                 /* highest MTLGPUFamilyAppleN, 0 if none */
     uint32_t ane_core_count;                   /* 0 when CoreML reports no Neural Engine */
 } ami_device_info;
+
+/* Function constant entry for startup pipeline specialization (ADR-0014). */
+typedef struct ami_fn_constant {
+    uint32_t index;
+    uint32_t type; /* AMI_CONST_U32 or AMI_CONST_BOOL */
+    uint32_t value;
+} ami_fn_constant;
+
+/* Sub-range binding of a resident MTLBuffer at `buffer->gpuAddress + offset`. */
+typedef struct ami_buffer_binding {
+    const ami_buffer *buffer;
+    uint64_t offset;
+} ami_buffer_binding;
 
 /* Opens the system default Metal device. */
 ami_status ami_device_create(ami_device **out_device);
@@ -89,31 +115,63 @@ uint64_t ami_buffer_gpu_address(const ami_buffer *buffer);
 
 /*
  * Compiles a compute pipeline for `function_name` from `library` using the
- * Metal 4 compiler. Startup only; never call on the hot path.
+ * Metal 4 compiler, optionally specializing with function constants (ADR-0014).
+ * Startup only; never call on the hot path.
  */
 ami_status ami_pipeline_create(ami_device *device, const ami_library *library,
                                const char *function_name, ami_pipeline **out_pipeline);
+ami_status ami_pipeline_create_specialized(ami_device *device, const ami_library *library,
+                                           const char *function_name,
+                                           const ami_fn_constant *constants,
+                                           size_t constant_count,
+                                           ami_pipeline **out_pipeline);
 void ami_pipeline_destroy(ami_pipeline *pipeline);
+uint32_t ami_pipeline_max_threads_per_threadgroup(const ami_pipeline *pipeline);
 
 /*
- * Creates a Metal 4 compute context: command queue, reusable command
- * allocator and command buffer, argument table, residency set and shared event
- * (ADR-0011).
+ * Creates a Metal 4 compute context with `frames_in_flight` reusable allocator /
+ * command-buffer / argument-table / uniform-buffer slots (1..AMI_MAX_FRAMES_IN_FLIGHT),
+ * a user residency set, and a shared event (ADR-0011).
  */
 ami_status ami_compute_create(ami_device *device, ami_compute **out_compute);
+ami_status ami_compute_create_with_frames(ami_device *device, uint32_t frames_in_flight,
+                                          ami_compute **out_compute);
 void ami_compute_destroy(ami_compute *compute);
 
-/* Adds buffers to the context's residency set and commits residency. */
+/* Manages caller buffers in the context's user residency set. */
 ami_status ami_compute_make_resident(ami_compute *compute, ami_buffer *const *buffers,
                                      size_t count);
-
-/* Removes all allocations from the context's residency set and commits. */
+ami_status ami_compute_remove_resident(ami_compute *compute, ami_buffer *const *buffers,
+                                       size_t count);
 ami_status ami_compute_clear_residency(ami_compute *compute);
 
 /*
- * Encodes a 1D compute dispatch into the reusable Metal 4 command buffer,
- * commits it, signals the shared event and waits up to `timeout_ms` ms.
- * `buffers[i]` is bound to `[[buffer(i)]]`; `buffer_count <= AMI_MAX_BUFFER_BINDINGS`.
+ * Multi-dispatch Metal 4 frame encoding (zero heap allocation on the hot path).
+ * Call sequence: begin_frame -> 1+ encode_dispatch -> commit_frame -> wait.
+ */
+ami_status ami_compute_begin_frame(ami_compute *compute, uint64_t timeout_ms,
+                                   uint32_t *out_slot);
+void ami_compute_abort_frame(ami_compute *compute);
+
+/*
+ * Encodes one compute dispatch into the active frame's encoder.
+ * `bindings[0..binding_count)` bind to `[[buffer(0..binding_count-1)]]`.
+ * When `uniform_len > 0`, `uniform_bytes` (<= AMI_UNIFORM_STRIDE) is copied
+ * into the frame's preallocated uniform ring and bound at `[[buffer(binding_count)]]`.
+ */
+ami_status ami_compute_encode_dispatch(ami_compute *compute, const ami_pipeline *pipeline,
+                                       const ami_buffer_binding *bindings, size_t binding_count,
+                                       const void *uniform_bytes, size_t uniform_len,
+                                       uint64_t grid_x, uint64_t grid_y, uint64_t grid_z,
+                                       uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
+                                       uint32_t dispatch_mode, uint32_t insert_barrier_before);
+
+ami_status ami_compute_commit_frame(ami_compute *compute, uint64_t *out_signal);
+ami_status ami_compute_wait(ami_compute *compute, uint64_t signal, uint64_t timeout_ms);
+
+/*
+ * Convenience single-dispatch synchronous helper built on the reusable frame
+ * path. `buffers[i]` binds to `[[buffer(i)]]`.
  */
 ami_status ami_compute_dispatch_1d_sync(ami_compute *compute, const ami_pipeline *pipeline,
                                         ami_buffer *const *buffers, size_t buffer_count,

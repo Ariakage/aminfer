@@ -28,7 +28,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | F3 | Platform probe: Metal device and Neural Engine facts (`aminfer probe`) | Implemented | M0 | [hardware.md](architecture/hardware.md) |
 | F4 | `ExpertSource` tagged union (`thunderbolt_peer` reserved) | Implemented | M0 | [ADR-0003](decisions/0003-expert-source-tagged-union.md) |
 | F5 | Zero-copy `MTLBuffer` over a wired region (`newBufferWithBytesNoCopy`) | Implemented | M0 | [ADR-0002](decisions/0002-page-alignment-and-zero-copy.md) |
-| F6 | Metal 4 command path (reusable allocator and command buffer, residency set, shared-event completion) | Implemented (M0 smoke; M1 hot path Confirmed) | M0 smoke, M1 hot path | [ADR-0011](decisions/0011-metal4-zero-allocation-hot-path.md) |
+| F6 | Metal 4 command path (reusable allocator and command buffer, residency set, shared-event completion) | Implemented | M0 smoke, M1 hot path | [ADR-0011](decisions/0011-metal4-zero-allocation-hot-path.md) |
 | F7 | uv-managed offline tools scaffold | Implemented | M0 | [ADR-0001](decisions/0001-language-and-toolchain-boundaries.md) |
 | F8 | `justfile` shortcuts (`sysctl`, `uv`, `powermetrics`) | Implemented | M0 | [system-tuning.md](guides/system-tuning.md) |
 | F9 | Platform probe: sysctl facts (page size, memory, core counts, wire limits) | Implemented | M0 | [hardware.md](architecture/hardware.md) |
@@ -38,7 +38,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
 | R1 | Wired budget computed at startup (default headroom ≥ 3 GiB; refuse plans over budget) | Implemented | M1 | [ADR-0012](decisions/0012-wired-memory-budget-headroom.md) |
-| R2 | GPU residency through `MTLResidencySet` | Confirmed | M1 | [memory.md](architecture/memory.md) |
+| R2 | GPU residency through `MTLResidencySet` | Implemented | M1 | [memory.md](architecture/memory.md) |
 | R3 | KV tiles: IOSurface (fp16 `OneComponent16Half`, 64 B row stride) viewed as `MTLTexture` | Confirmed | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
 | R4 | KV tile granularity (one 512-token chunk per layer) and token- vs channel-major rows | Draft | M2 (spike S1) | [memory.md](architecture/memory.md#kv-tiles) |
 | R5 | int8 KV tiles (`OneComponent8`) | Undecided | — | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
@@ -61,7 +61,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
 | G1 | Fused 3/4-bit dequantization GEMV / GEMM kernels | Confirmed | M1 | [overview.md](architecture/overview.md) |
-| G2 | Compile-time specialization (Zig `comptime`; Metal function constants on the GPU side) | Implemented (Zig comptime; GPU function constants Confirmed) | M1 | [ADR-0014](decisions/0014-compile-time-specialization.md) |
+| G2 | Compile-time specialization (Zig `comptime`; Metal function constants on the GPU side) | Implemented | M1 | [ADR-0014](decisions/0014-compile-time-specialization.md) |
 | G3 | MoE gather / grouped GEMM with experts deduplicated across verified tokens | Confirmed | M2 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) |
 | G4 | Decode attention over KV tiles | Confirmed | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
 | G5 | Tree-attention verification with ancestor mask and accepted-path KV commit | Confirmed | M3 | [speculative-decoding.md](architecture/speculative-decoding.md) |
