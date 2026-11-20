@@ -1,8 +1,5 @@
 # Development setup
 
-> The build graph lands during M0; until then the build commands below are the
-> target workflow. See [../process.md](../process.md).
-
 ## Requirements
 
 | Tool | Version | Notes |
@@ -32,7 +29,17 @@ zig build                              # Debug build
 zig build test                         # full test suite (Debug)
 zig build test -Doptimize=ReleaseSafe  # safety and alignment checks kept on
 zig build -Doptimize=ReleaseFast       # benchmarks only
+zig build run -- probe                 # print this machine's platform facts
 ```
+
+Build notes:
+
+- The default target is the native CPU with a deployment floor of macOS 26.0
+  (the binary records `minos 26.0`). Overriding the minimum OS version makes
+  the target non-native, which disables Zig's own SDK detection, so `build.zig`
+  resolves the SDK with `xcrun --sdk macosx --show-sdk-path`.
+- Kernels in `src/kernels/` are compiled into one `.metallib` that is embedded
+  in the binary; nothing needs to be installed next to it.
 
 Policy ([../../AGENTS.md](../../AGENTS.md)): after every code change,
 `zig build` must compile cleanly and `zig build test` must pass. Changes that

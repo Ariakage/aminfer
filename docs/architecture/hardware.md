@@ -6,8 +6,8 @@
 
 Measured on 2026-11-20 on the baseline machine: Apple M4, 24 GiB, macOS 27.2,
 Xcode 27.1, Metal Toolchain 27A266a, Zig 0.17.1. The probes were throwaway
-programs outside the repository; once M0 lands, `aminfer probe` re-measures
-the CPU, memory and Metal facts from the repository.
+programs outside the repository; `aminfer probe` (status rows F3 and F9)
+re-measures these facts from the repository.
 
 | Fact | Value | Source |
 | --- | --- | --- |

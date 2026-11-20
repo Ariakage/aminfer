@@ -1,0 +1,18 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Python offline tools (uv)
+tools/.venv/
+__pycache__/
+*.pyc
+
+# Model artifacts are never committed
+*.amf
+*.safetensors
+*.gguf
+*.mlpackage/
+*.mlmodelc/
+
+# macOS
+.DS_Store

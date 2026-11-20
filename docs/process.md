@@ -15,7 +15,7 @@ Status-row IDs refer to [status.md](status.md).
 
 | Milestone | Goal | Status rows | Exit criteria | State |
 | --- | --- | --- | --- | --- |
-| M0 | Project initialization | F1–F8 | `zig build` and `zig build test` pass in Debug and ReleaseSafe; docs baseline committed; local ikat index built | In progress |
+| M0 | Project initialization | F1–F9 | `zig build` and `zig build test` pass in Debug and ReleaseSafe; docs baseline committed; local ikat index built | In progress |
 | M1 | GPU and weight foundation | R1, R2, F6 (hot path), W1–W4, G1, G2, C9 | Wired budget enforced at startup; `.amf` round-trip (tools → Zig) with alignment validation; fused dequant GEMV / GEMM match a reference within tolerance; effective bandwidth measured per kernel | Not started |
 | M2 | Non-speculative decode | W5, W6, C1, C2, R3, R4, G3, G4 | Greedy end-to-end decode of the primary target from `.amf`; baseline tokens/s and bytes per token recorded | Not started |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2; speedup over the M2 baseline, acceptance-length and experts-per-pass statistics recorded | Not started |
@@ -46,12 +46,11 @@ Confirmed, or before an accepted design is tuned.
 - [x] Dual MIT / Apache-2.0 license (commit `6d5053d`)
 - [x] Documentation baseline: README, architecture, decisions, guides, status,
       process
-- [ ] `build.zig` graph: Zig core + ObjC bridge (translate-c) + embedded
-      `.metallib` + tests (F1)
-- [ ] 16 KiB wired regions and sysctl probe, test first (F2, F3)
+- [x] `build.zig` graph: Zig core + ObjC bridge (translate-c) + embedded
+      `.metallib` + tests, with `aminfer probe` for Metal and ANE facts (F1, F3)
+- [ ] 16 KiB wired regions and sysctl probe, test first (F2, F9)
 - [ ] `ExpertSource` tagged union, test first (F4)
-- [ ] Bridge: Metal device facts, NoCopy buffer, Metal 4 smoke dispatch;
-      `aminfer probe` CLI, test first (F3, F5, F6)
+- [ ] Bridge: NoCopy buffer and Metal 4 smoke dispatch, test first (F5, F6)
 - [ ] `tools/` uv scaffold (F7) and `justfile` (F8)
 - [ ] Verify Debug / ReleaseSafe / ReleaseFast; build the local ikat index
 
@@ -66,6 +65,7 @@ Only checks that actually ran are listed.
 | 2026-11-20 | `aio_read` with `SIGEV_KEVENT` on macOS 27.2 | Pass: `EVFILT_AIO` delivered, bytes in `kevent64.ext[1]`, data matches; `aio_return` afterwards fails with `EINVAL` |
 | 2026-11-20 | IOSurface fp16 tile → R16Float and RGBA16Float textures, with `MTL_DEBUG_LAYER=1` | Pass |
 | 2026-11-20 | `xcrun metal -std=metal4.0 -mmacosx-version-min=26.0` | Pass (after installing the Metal Toolchain) |
+| 2026-11-20 | F1: `zig build`; `zig build test` (Debug, ReleaseSafe): 3/3 tests; `aminfer probe` matches the throwaway probe; binary `minos 26.0` | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -86,7 +86,7 @@ session.
 Update this before the context window runs out or when handing off.
 
 - Last updated: 2026-11-20
-- Commits so far: `1ad0da8` AGENTS.md, `6d5053d` license
-- In flight: `build.zig` graph (F1)
+- Commits so far: `1ad0da8` AGENTS.md, `6d5053d` license, `3a573a5` docs baseline
+- In flight: 16 KiB wired regions and sysctl probe (F2, F9)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md)
