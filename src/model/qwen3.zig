@@ -1,5 +1,6 @@
-//! End-to-end Qwen3-MoE (3-bit) and Qwen3-Dense (4-bit) non-speculative greedy
-//! decode engine (W6, docs/status.md).
+//! End-to-end Qwen3-MoE and Qwen3-Dense non-speculative greedy decode engine
+//! supporting native FP16, BF16, 3-bit/4-bit affine quantized, and
+//! mixed-precision `.amf` checkpoints (W6, W13, ADR-0016).
 //!
 //! Loads `.amf` weights into one or more `Budget`-checked `WiredArena` shards
 //! (supporting models exceeding `MTLDevice.maxBufferLength`), allocates
@@ -35,7 +36,12 @@ pub const ModelArch = enum {
 
 pub const ModelConfig = struct {
     arch: ModelArch,
-    quant_bits: quant.QuantBits,
+    /// Affine quantization width when configured in `config.json`; `null` for
+    /// unquantized FP16 / BF16 checkpoints (ADR-0016).
+    quant_bits: ?quant.QuantBits = null,
+    /// Preferred unquantized 16-bit floating-point dtype parsed from
+    /// `"torch_dtype"` (`"bfloat16"` or `"float16"`, default `.bf16`).
+    default_float_dtype: quant.FloatDType = .bf16,
     group_size: u16 = 64,
     vocab_size: u32,
     hidden_size: u32,
@@ -62,6 +68,19 @@ pub const ModelConfig = struct {
         OutOfMemory,
     };
 
+    pub fn precisionLabel(self: ModelConfig) []const u8 {
+        if (self.quant_bits) |qb| {
+            return switch (qb) {
+                .q3 => "q3",
+                .q4 => "q4",
+            };
+        }
+        return switch (self.default_float_dtype) {
+            .f16 => "f16",
+            .bf16 => "bf16",
+        };
+    }
+
     pub fn qDim(self: ModelConfig) u32 {
         return self.num_attention_heads * self.head_dim;
     }
@@ -71,7 +90,11 @@ pub const ModelConfig = struct {
     }
 
     pub fn validate(self: ModelConfig) ConfigError!void {
-        if (self.group_size != 64) return error.InvalidConfig;
+        const align_req: u32 = if (self.quant_bits != null) blk: {
+            if (self.group_size != 64) return error.InvalidConfig;
+            break :blk self.group_size;
+        } else 4;
+
         if (self.vocab_size == 0 or self.hidden_size == 0 or self.num_hidden_layers == 0 or
             self.num_attention_heads == 0 or self.num_key_value_heads == 0 or
             self.max_position_embeddings == 0)
@@ -79,10 +102,10 @@ pub const ModelConfig = struct {
             return error.InvalidConfig;
         }
         if (self.head_dim != 64 and self.head_dim != 128) return error.InvalidConfig;
-        if ((self.hidden_size % self.group_size) != 0) return error.InvalidConfig;
+        if ((self.hidden_size % align_req) != 0) return error.InvalidConfig;
         if ((self.num_attention_heads % self.num_key_value_heads) != 0) return error.InvalidConfig;
-        if ((self.qDim() % self.group_size) != 0) return error.InvalidConfig;
-        if ((self.kvDim() % self.group_size) != 0) return error.InvalidConfig;
+        if ((self.qDim() % align_req) != 0) return error.InvalidConfig;
+        if ((self.kvDim() % align_req) != 0) return error.InvalidConfig;
         if (self.rms_norm_eps <= 0.0 or self.rope_theta <= 0.0) return error.InvalidConfig;
 
         switch (self.arch) {
@@ -93,12 +116,12 @@ pub const ModelConfig = struct {
                 {
                     return error.InvalidConfig;
                 }
-                if (self.moe_intermediate_size == 0 or (self.moe_intermediate_size % self.group_size) != 0) {
+                if (self.moe_intermediate_size == 0 or (self.moe_intermediate_size % align_req) != 0) {
                     return error.InvalidConfig;
                 }
             },
             .qwen3_dense => {
-                if (self.intermediate_size == 0 or (self.intermediate_size % self.group_size) != 0) {
+                if (self.intermediate_size == 0 or (self.intermediate_size % align_req) != 0) {
                     return error.InvalidConfig;
                 }
             },
@@ -136,9 +159,26 @@ pub const ModelConfig = struct {
             break :blk hidden_size / num_q_heads;
         };
 
-        var quant_bits: quant.QuantBits = if (arch == .qwen3_moe) .q3 else .q4;
+        const default_float_dtype: quant.FloatDType = blk: {
+            if (jsonReqString(obj, "torch_dtype")) |dt| {
+                if (std.mem.eql(u8, dt, "float16")) break :blk .f16;
+                if (std.mem.eql(u8, dt, "bfloat16")) break :blk .bf16;
+            }
+            break :blk .bf16;
+        };
+
+        var quant_bits: ?quant.QuantBits = null;
         var group_size: u16 = 64;
-        if (obj.get("quantization") orelse obj.get("quantization_config")) |qval| {
+        const q_val: ?std.json.Value = blk: {
+            if (obj.get("quantization")) |v| {
+                if (v != .null) break :blk v;
+            }
+            if (obj.get("quantization_config")) |v| {
+                if (v != .null) break :blk v;
+            }
+            break :blk null;
+        };
+        if (q_val) |qval| {
             if (qval != .object) return error.InvalidJson;
             if (jsonOptU32(qval.object, "bits")) |b| {
                 quant_bits = switch (b) {
@@ -156,6 +196,7 @@ pub const ModelConfig = struct {
         const cfg: ModelConfig = .{
             .arch = arch,
             .quant_bits = quant_bits,
+            .default_float_dtype = default_float_dtype,
             .group_size = group_size,
             .vocab_size = vocab_size,
             .hidden_size = hidden_size,
@@ -257,13 +298,18 @@ pub const StepError = error{
     PositionOutOfRange,
 } || metal.Error || dequant.EncodeError || moe.EncodeError;
 
-const QuantBinding = struct {
-    qweight: metal.BufferBinding,
-    scale_bias: metal.BufferBinding,
+const LinearBinding = struct {
+    weight: metal.BufferBinding,
+    scale_bias: ?metal.BufferBinding,
     n: u32,
     k: u32,
-    bits: quant.QuantBits,
+    dtype: quant.WeightDType,
     alg_bytes: u64,
+};
+
+const NormBinding = struct {
+    binding: metal.BufferBinding,
+    dtype: quant.FloatDType,
 };
 
 const WeightShard = struct {
@@ -272,25 +318,26 @@ const WeightShard = struct {
 };
 
 const LayerWeights = struct {
-    input_layernorm: metal.BufferBinding,
-    q_proj: QuantBinding,
-    k_proj: QuantBinding,
-    v_proj: QuantBinding,
-    o_proj: QuantBinding,
+    input_layernorm: NormBinding,
+    q_proj: LinearBinding,
+    k_proj: LinearBinding,
+    v_proj: LinearBinding,
+    o_proj: LinearBinding,
     q_norm: ?metal.BufferBinding,
     k_norm: ?metal.BufferBinding,
-    post_attention_layernorm: metal.BufferBinding,
+    qk_norm_dtype: quant.FloatDType,
+    post_attention_layernorm: NormBinding,
 
     // MoE-specific (valid when config.arch == .qwen3_moe)
-    router_weights: metal.BufferBinding,
-    router_dtype: moe.RouterWeightDType,
+    router: moe.RouterSource,
+    expert_dtype: quant.WeightDType,
     expert_weights_buf: metal.Buffer,
     expert_table: metal.BufferBinding,
 
     // Dense-specific (valid when config.arch == .qwen3_dense)
-    dense_gate: QuantBinding,
-    dense_up: QuantBinding,
-    dense_down: QuantBinding,
+    dense_gate: LinearBinding,
+    dense_up: LinearBinding,
+    dense_down: LinearBinding,
 
     // Bindless KV chunk table for this layer (`[num_chunks]KvTilePair` in scratch buffer)
     kv_tiles_binding: metal.BufferBinding,
@@ -375,16 +422,12 @@ pub const Qwen3Model = struct {
     kv_tiles: []metal.KvTile,
     layers: []LayerWeights,
 
-    // Global weights
-    embed_dtype: amf.DType,
-    embed_data: []const u8,
-    embed_params: []const quant.ScaleBias,
-    embed_row_bytes: usize,
-    final_norm: metal.BufferBinding,
-    lm_head: QuantBinding,
+    // Global weights (`lm_head` aliases `embed` directly when `tie_word_embeddings` is true)
+    embed: LinearBinding,
+    final_norm: NormBinding,
+    lm_head: LinearBinding,
 
     // Preallocated hot-path activation slices & bindings inside `scratch_arena`/`scratch_buf`
-    x_host: []f16,
     logits_host: []const f16,
     out_token_id_host: *u32,
 
@@ -406,7 +449,7 @@ pub const Qwen3Model = struct {
     dense_act_bind: metal.BufferBinding,
 
     // Precomputed algorithmic traffic constants
-    per_layer_static_bytes: u64,
+    total_layers_static_bytes: u64,
     global_head_bytes: u64,
 
     pub fn loadFromBytes(
@@ -460,12 +503,12 @@ pub const Qwen3Model = struct {
         return self.total_wired_bytes;
     }
 
-    /// Algorithmic bytes transferred by one transformer layer at `seq_len`
+    /// Mean algorithmic bytes transferred by one transformer layer at `seq_len`
     /// (dense attention weights + active FFN weights + norms + KV read/write).
     pub fn bytesPerLayerToken(self: *const Qwen3Model, seq_len: u32) u64 {
         const kv_read: u64 = 2 * @as(u64, self.config.num_key_value_heads) * seq_len * self.config.head_dim * @sizeOf(f16);
         const kv_write: u64 = 2 * @as(u64, self.config.num_key_value_heads) * self.config.head_dim * @sizeOf(f16);
-        return self.per_layer_static_bytes + kv_read + kv_write;
+        return (self.total_layers_static_bytes / self.config.num_hidden_layers) + kv_read + kv_write;
     }
 
     /// Algorithmic bytes transferred by global embedding row + final norm + `lm_head`.
@@ -475,7 +518,9 @@ pub const Qwen3Model = struct {
 
     /// Algorithmic bytes transferred by one complete `stepDecode` at `seq_len`.
     pub fn bytesPerDecodeToken(self: *const Qwen3Model, seq_len: u32) u64 {
-        return @as(u64, self.config.num_hidden_layers) * self.bytesPerLayerToken(seq_len) + self.global_head_bytes;
+        const kv_per_layer: u64 =
+            2 * @as(u64, self.config.num_key_value_heads) * (@as(u64, seq_len) + 1) * self.config.head_dim * @sizeOf(f16);
+        return self.total_layers_static_bytes + @as(u64, self.config.num_hidden_layers) * kv_per_layer + self.global_head_bytes;
     }
 
     pub fn readLogitsF16(self: *const Qwen3Model) []const f16 {
@@ -495,95 +540,91 @@ pub const Qwen3Model = struct {
         return self.runStep(token_id, pos, false);
     }
 
-    fn embedLookupToWiredX(self: *Qwen3Model, token_id: u32) void {
-        const h: usize = self.config.hidden_size;
-        const tok: usize = token_id;
-        switch (self.embed_dtype) {
-            .f16 => {
-                const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, self.embed_data));
-                @memcpy(self.x_host, src[tok * h ..][0..h]);
-            },
-            .q3_affine => {
-                const Q3 = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
-                const gs = h / 64;
-                const qrow = self.embed_data[tok * self.embed_row_bytes ..][0..self.embed_row_bytes];
-                const sb_row = self.embed_params[tok * gs ..][0..gs];
-                var tmp: [64]f32 = undefined;
-                for (0..gs) |g| {
-                    Q3.dequantizeGroup(qrow[g * Q3.groupWeightBytes() ..][0..Q3.groupWeightBytes()], sb_row[g], &tmp);
-                    for (0..64) |j| self.x_host[g * 64 + j] = @floatCast(tmp[j]);
-                }
-            },
-            .q4_affine => {
-                const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
-                const gs = h / 64;
-                const qrow = self.embed_data[tok * self.embed_row_bytes ..][0..self.embed_row_bytes];
-                const sb_row = self.embed_params[tok * gs ..][0..gs];
-                var tmp: [64]f32 = undefined;
-                for (0..gs) |g| {
-                    Q4.dequantizeGroup(qrow[g * Q4.groupWeightBytes() ..][0..Q4.groupWeightBytes()], sb_row[g], &tmp);
-                    for (0..64) |j| self.x_host[g * 64 + j] = @floatCast(tmp[j]);
-                }
-            },
-            .f32, .bf16 => unreachable,
-        }
-    }
-
     fn kvTileAt(self: *const Qwen3Model, layer_idx: usize, chunk_idx: usize) struct { k: metal.KvTile, v: metal.KvTile } {
         const base = (layer_idx * @as(usize, self.num_chunks) + chunk_idx) * 2;
         return .{ .k = self.kv_tiles[base], .v = self.kv_tiles[base + 1] };
+    }
+
+    fn encodeLinearGemv(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        lin: LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
+        switch (lin.dtype) {
+            .f16 => try self.dequant_pipes.encodeDenseGemv(frame, .f16, .{
+                .x = x,
+                .weight = lin.weight,
+                .y = y,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .bf16 => try self.dequant_pipes.encodeDenseGemv(frame, .bf16, .{
+                .x = x,
+                .weight = lin.weight,
+                .y = y,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .q4_affine => try self.dequant_pipes.encodeGemv(frame, .q4, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .q3_affine => try self.dequant_pipes.encodeGemv(frame, .q3, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+        }
     }
 
     fn runStep(self: *Qwen3Model, token_id: u32, pos: u32, skip_lm_head: bool) StepError!u32 {
         if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
         if (pos >= self.max_seq_len) return error.PositionOutOfRange;
 
-        // 1. Zero-alloc embedding lookup straight into wired shared memory.
-        self.embedLookupToWiredX(token_id);
-
         const cur_seq_len: u32 = pos + 1;
         const chunk_idx: usize = @intCast(pos / self.chunk_tokens);
 
-        // 2. Encode the entire multi-layer step into ONE Metal 4 command buffer.
+        // Encode embedding lookup + all transformer layers + optional head into
+        // ONE reusable Metal 4 command buffer with zero CPU copies or heap allocs.
         var frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
 
+        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            .weight = self.embed.weight,
+            .scale_bias = self.embed.scale_bias,
+            .tokens = .{ .token_id = token_id },
+            .out = self.x_bind,
+            .m = 1,
+            .vocab_size = self.config.vocab_size,
+            .hidden_size = self.config.hidden_size,
+        }, false);
+
         for (self.layers, 0..) |layer, l| {
-            // input_layernorm: x -> x_norm
+            // input_layernorm: x -> x_norm (waits on embed lookup or prior layer)
             try self.attn_pipes.encodeRmsNorm(&frame, .{
                 .x = self.x_bind,
-                .w = layer.input_layernorm,
+                .w = layer.input_layernorm.binding,
                 .y = self.x_norm_bind,
                 .num_rows = 1,
                 .hidden_dim = self.config.hidden_size,
                 .eps = self.config.rms_norm_eps,
-            }, l > 0);
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true);
 
             // q_proj, k_proj, v_proj read x_norm concurrently into disjoint outputs.
-            try self.dequant_pipes.encodeGemv(&frame, layer.q_proj.bits, .{
-                .x = self.x_norm_bind,
-                .qweight = layer.q_proj.qweight,
-                .scale_bias = layer.q_proj.scale_bias,
-                .y = self.q_bind,
-                .n = layer.q_proj.n,
-                .k = layer.q_proj.k,
-            }, true);
-            try self.dequant_pipes.encodeGemv(&frame, layer.k_proj.bits, .{
-                .x = self.x_norm_bind,
-                .qweight = layer.k_proj.qweight,
-                .scale_bias = layer.k_proj.scale_bias,
-                .y = self.k_bind,
-                .n = layer.k_proj.n,
-                .k = layer.k_proj.k,
-            }, false);
-            try self.dequant_pipes.encodeGemv(&frame, layer.v_proj.bits, .{
-                .x = self.x_norm_bind,
-                .qweight = layer.v_proj.qweight,
-                .scale_bias = layer.v_proj.scale_bias,
-                .y = self.v_bind,
-                .n = layer.v_proj.n,
-                .k = layer.v_proj.k,
-            }, false);
+            try self.encodeLinearGemv(&frame, layer.q_proj, self.x_norm_bind, self.q_bind, true);
+            try self.encodeLinearGemv(&frame, layer.k_proj, self.x_norm_bind, self.k_bind, false);
+            try self.encodeLinearGemv(&frame, layer.v_proj, self.x_norm_bind, self.v_bind, false);
 
             // QK-Norm + NeoX RoPE + direct RGBA16Float IOSurface KV-tile write.
             const kv_pair = self.kvTileAt(l, chunk_idx);
@@ -602,6 +643,7 @@ pub const Qwen3Model = struct {
                 .chunk_tokens = self.chunk_tokens,
                 .rms_eps = self.config.rms_norm_eps,
                 .rope_theta = self.config.rope_theta,
+                .norm_dtype = layer.qk_norm_dtype,
             }, true);
 
             // GQA decode attention over committed IOSurface KV tiles.
@@ -619,14 +661,7 @@ pub const Qwen3Model = struct {
             }, true);
 
             // o_proj + residual add into x.
-            try self.dequant_pipes.encodeGemv(&frame, layer.o_proj.bits, .{
-                .x = self.attn_out_bind,
-                .qweight = layer.o_proj.qweight,
-                .scale_bias = layer.o_proj.scale_bias,
-                .y = self.proj_out_bind,
-                .n = layer.o_proj.n,
-                .k = layer.o_proj.k,
-            }, true);
+            try self.encodeLinearGemv(&frame, layer.o_proj, self.attn_out_bind, self.proj_out_bind, true);
             try self.moe_pipes.encodeResidualAdd(&frame, .{
                 .x = self.x_bind,
                 .delta = self.proj_out_bind,
@@ -636,20 +671,21 @@ pub const Qwen3Model = struct {
             // post_attention_layernorm: x -> x_norm
             try self.attn_pipes.encodeRmsNorm(&frame, .{
                 .x = self.x_bind,
-                .w = layer.post_attention_layernorm,
+                .w = layer.post_attention_layernorm.binding,
                 .y = self.x_norm_bind,
                 .num_rows = 1,
                 .hidden_dim = self.config.hidden_size,
                 .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
             }, true);
 
             // FFN + residual add into x.
             switch (self.config.arch) {
                 .qwen3_moe => {
                     const ws = &(self.moe_ws.?);
-                    try self.moe_pipes.encodeMoELayer(&frame, self.config.quant_bits, .{
+                    const moe_args: moe.MoELayerArgs = .{
                         .x = self.x_norm_bind,
-                        .router = .{ .weights = .{ .binding = layer.router_weights, .dtype = layer.router_dtype } },
+                        .router = layer.router,
                         .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
                         .expert_table = layer.expert_table,
                         .workspace = ws,
@@ -662,39 +698,24 @@ pub const Qwen3Model = struct {
                         .hidden_size = self.config.hidden_size,
                         .intermediate_size = self.config.moe_intermediate_size,
                         .norm_topk_prob = self.config.norm_topk_prob,
-                    }, true);
+                    };
+                    switch (layer.expert_dtype) {
+                        .q3_affine => try self.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
+                        .q4_affine => try self.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
+                        .f16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
+                        .bf16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
+                    }
                 },
                 .qwen3_dense => {
-                    try self.dequant_pipes.encodeGemv(&frame, layer.dense_gate.bits, .{
-                        .x = self.x_norm_bind,
-                        .qweight = layer.dense_gate.qweight,
-                        .scale_bias = layer.dense_gate.scale_bias,
-                        .y = self.dense_gate_bind,
-                        .n = layer.dense_gate.n,
-                        .k = layer.dense_gate.k,
-                    }, true);
-                    try self.dequant_pipes.encodeGemv(&frame, layer.dense_up.bits, .{
-                        .x = self.x_norm_bind,
-                        .qweight = layer.dense_up.qweight,
-                        .scale_bias = layer.dense_up.scale_bias,
-                        .y = self.dense_up_bind,
-                        .n = layer.dense_up.n,
-                        .k = layer.dense_up.k,
-                    }, false);
+                    try self.encodeLinearGemv(&frame, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, true);
+                    try self.encodeLinearGemv(&frame, layer.dense_up, self.x_norm_bind, self.dense_up_bind, false);
                     try self.moe_pipes.encodeSiluMul(&frame, .{
                         .gate = self.dense_gate_bind,
                         .up = self.dense_up_bind,
                         .out = self.dense_act_bind,
                         .count = self.config.intermediate_size,
                     }, true);
-                    try self.dequant_pipes.encodeGemv(&frame, layer.dense_down.bits, .{
-                        .x = self.dense_act_bind,
-                        .qweight = layer.dense_down.qweight,
-                        .scale_bias = layer.dense_down.scale_bias,
-                        .y = self.proj_out_bind,
-                        .n = layer.dense_down.n,
-                        .k = layer.dense_down.k,
-                    }, true);
+                    try self.encodeLinearGemv(&frame, layer.dense_down, self.dense_act_bind, self.proj_out_bind, true);
                     try self.moe_pipes.encodeResidualAdd(&frame, .{
                         .x = self.x_bind,
                         .delta = self.proj_out_bind,
@@ -707,20 +728,14 @@ pub const Qwen3Model = struct {
         if (!skip_lm_head) {
             try self.attn_pipes.encodeRmsNorm(&frame, .{
                 .x = self.x_bind,
-                .w = self.final_norm,
+                .w = self.final_norm.binding,
                 .y = self.x_norm_bind,
                 .num_rows = 1,
                 .hidden_dim = self.config.hidden_size,
                 .eps = self.config.rms_norm_eps,
+                .w_dtype = self.final_norm.dtype,
             }, true);
-            try self.dequant_pipes.encodeGemv(&frame, self.lm_head.bits, .{
-                .x = self.x_norm_bind,
-                .qweight = self.lm_head.qweight,
-                .scale_bias = self.lm_head.scale_bias,
-                .y = self.logits_bind,
-                .n = self.lm_head.n,
-                .k = self.lm_head.k,
-            }, true);
+            try self.encodeLinearGemv(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, true);
             try self.moe_pipes.encodeArgmax(&frame, .{
                 .logits = self.logits_bind,
                 .out_token_id = self.out_token_id_bind,
@@ -739,24 +754,53 @@ fn findRequired(parsed: *const amf.Parsed, name: []const u8) LoadError!*const am
     return parsed.find(name) orelse error.MissingTensor;
 }
 
-fn findEither(parsed: *const amf.Parsed, primary: []const u8, fallback: []const u8) LoadError!*const amf.TensorEntry {
-    return parsed.find(primary) orelse parsed.find(fallback) orelse error.MissingTensor;
+fn findLinear(parsed: *const amf.Parsed, base: []const u8) LoadError!*const amf.TensorEntry {
+    if (parsed.find(base)) |e| return e;
+    var alt_buf: [64]u8 = undefined;
+    const with_weight = std.fmt.bufPrint(&alt_buf, "{s}.weight", .{base}) catch return error.MissingTensor;
+    return parsed.find(with_weight) orelse error.MissingTensor;
 }
 
-fn validateF16_1D(entry: *const amf.TensorEntry, dim: u32) LoadError!void {
-    if ((try entry.dataType()) != .f16) return error.UnexpectedTensorDType;
-    if (entry.rank != 1 or entry.shape[0] != dim) return error.UnexpectedTensorShape;
-}
-
-fn validateQuant2D(entry: *const amf.TensorEntry, n: u32, k: u32) LoadError!quant.QuantBits {
+fn validateNorm1D(entry: *const amf.TensorEntry, dim: u32) LoadError!quant.FloatDType {
     const dt = try entry.dataType();
-    const bits: quant.QuantBits = switch (dt) {
-        .q3_affine => .q3,
-        .q4_affine => .q4,
-        else => return error.UnexpectedTensorDType,
+    if (entry.rank != 1 or entry.shape[0] != dim) return error.UnexpectedTensorShape;
+    return switch (dt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        else => error.UnexpectedTensorDType,
     };
+}
+
+fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) LoadError!quant.WeightDType {
+    const dt = try entry.dataType();
     if (entry.rank != 2 or entry.shape[0] != n or entry.shape[1] != k) return error.UnexpectedTensorShape;
-    return bits;
+    return switch (dt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .q4_affine => blk: {
+            if ((k % 64) != 0) return error.UnalignedK;
+            break :blk .q4_affine;
+        },
+        .q3_affine => blk: {
+            if ((k % 64) != 0) return error.UnalignedK;
+            break :blk .q3_affine;
+        },
+        .f32 => error.UnexpectedTensorDType,
+    };
+}
+
+fn validateRouter2D(entry: *const amf.TensorEntry, num_experts: u32, hidden_size: u32) LoadError!amf.DType {
+    const dt = try entry.dataType();
+    if (entry.rank != 2 or entry.shape[0] != num_experts or entry.shape[1] != hidden_size) {
+        return error.UnexpectedTensorShape;
+    }
+    switch (dt) {
+        .f16, .bf16, .f32 => {},
+        .q4_affine, .q3_affine => {
+            if ((hidden_size % 64) != 0) return error.UnalignedK;
+        },
+    }
+    return dt;
 }
 
 const LoadedBlob = struct {
@@ -769,13 +813,21 @@ const LoadedBlob = struct {
         return .{ .buffer = self.buffer, .offset = self.offset };
     }
 
-    fn asQuantBinding(self: LoadedBlob, bits: quant.QuantBits) QuantBinding {
+    fn asNormBinding(self: LoadedBlob, dtype: quant.FloatDType) NormBinding {
+        return .{ .binding = self.asBinding(), .dtype = dtype };
+    }
+
+    fn asLinearBinding(self: LoadedBlob, dtype: quant.WeightDType) LinearBinding {
+        const sb: ?metal.BufferBinding = switch (dtype) {
+            .f16, .bf16 => null,
+            .q4_affine, .q3_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
+        };
         return .{
-            .qweight = .{ .buffer = self.buffer, .offset = self.offset },
-            .scale_bias = .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
+            .weight = .{ .buffer = self.buffer, .offset = self.offset },
+            .scale_bias = sb,
             .n = self.entry.shape[0],
             .k = self.entry.shape[1],
-            .bits = bits,
+            .dtype = dtype,
             .alg_bytes = self.entry.data_bytes + self.entry.params_bytes,
         };
     }
@@ -807,8 +859,8 @@ fn loadInternal(
     const max_seq_len = @min(options.max_seq_len, config.max_position_embeddings);
     const num_chunks: u32 = (max_seq_len + options.chunk_tokens - 1) / options.chunk_tokens;
 
-    // Worst-case dispatches in one stepDecode command buffer: 15 per layer + 3 global.
-    const max_dispatches: u64 = @as(u64, config.num_hidden_layers) * 15 + 3;
+    // Worst-case dispatches in one stepDecode command buffer: 1 embed + 15 per layer + 3 global.
+    const max_dispatches: u64 = 1 + @as(u64, config.num_hidden_layers) * 15 + 3;
     if (max_dispatches > metal.UNIFORM_SLOTS_PER_FRAME) {
         return error.TooManyDispatchesForFrame;
     }
@@ -820,24 +872,17 @@ fn loadInternal(
     const kv_dim = config.kvDim();
 
     // --- 1. Resolve & validate all required directory entries up front ---
-    const embed_entry = try findEither(parsed, "embed_tokens", "embed_tokens.weight");
-    const embed_dt = try embed_entry.dataType();
-    if (embed_entry.rank != 2 or embed_entry.shape[0] != config.vocab_size or embed_entry.shape[1] != h) {
-        return error.UnexpectedTensorShape;
-    }
-    switch (embed_dt) {
-        .f16, .q3_affine, .q4_affine => {},
-        .f32, .bf16 => return error.UnexpectedTensorDType,
-    }
+    const embed_entry = try findLinear(parsed, "embed_tokens");
+    const embed_wdt = try validateLinear2D(embed_entry, config.vocab_size, h);
 
     const final_norm_entry = try findRequired(parsed, "norm.weight");
-    try validateF16_1D(final_norm_entry, h);
+    const final_norm_dt = try validateNorm1D(final_norm_entry, h);
 
     const lm_head_entry = if (config.tie_word_embeddings)
         embed_entry
     else
-        try findEither(parsed, "lm_head", "lm_head.weight");
-    _ = try validateQuant2D(lm_head_entry, config.vocab_size, h);
+        try findLinear(parsed, "lm_head");
+    const lm_head_wdt = try validateLinear2D(lm_head_entry, config.vocab_size, h);
 
     const group_count = 1 + num_layers;
     const group_bytes = try allocator.alloc(u64, group_count);
@@ -852,78 +897,79 @@ fn loadInternal(
         var bytes_l: u64 = 0;
 
         const in_ln = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable);
-        try validateF16_1D(in_ln, h);
+        _ = try validateNorm1D(in_ln, h);
         bytes_l += in_ln.blob_bytes;
 
-        const q_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable);
-        _ = try validateQuant2D(q_e, q_dim, h);
+        const q_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable);
+        _ = try validateLinear2D(q_e, q_dim, h);
         bytes_l += q_e.blob_bytes;
 
-        const k_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable);
-        _ = try validateQuant2D(k_e, kv_dim, h);
+        const k_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable);
+        _ = try validateLinear2D(k_e, kv_dim, h);
         bytes_l += k_e.blob_bytes;
 
-        const v_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
-        _ = try validateQuant2D(v_e, kv_dim, h);
+        const v_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
+        _ = try validateLinear2D(v_e, kv_dim, h);
         bytes_l += v_e.blob_bytes;
 
-        const o_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
-        _ = try validateQuant2D(o_e, h, q_dim);
+        const o_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
+        _ = try validateLinear2D(o_e, h, q_dim);
         bytes_l += o_e.blob_bytes;
 
-        if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable)) |qn| {
-            try validateF16_1D(qn, config.head_dim);
-            bytes_l += qn.blob_bytes;
-        }
-        if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable)) |kn| {
-            try validateF16_1D(kn, config.head_dim);
-            bytes_l += kn.blob_bytes;
+        const qn_opt = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable);
+        const kn_opt = parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable);
+        if ((qn_opt != null) != (kn_opt != null)) return error.MissingTensor;
+        if (qn_opt) |qn| {
+            const qn_dt = try validateNorm1D(qn, config.head_dim);
+            const kn_dt = try validateNorm1D(kn_opt.?, config.head_dim);
+            if (qn_dt != kn_dt) return error.UnexpectedTensorDType;
+            bytes_l += qn.blob_bytes + kn_opt.?.blob_bytes;
         }
 
         const post_ln = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable);
-        try validateF16_1D(post_ln, h);
+        _ = try validateNorm1D(post_ln, h);
         bytes_l += post_ln.blob_bytes;
 
         switch (config.arch) {
             .qwen3_moe => {
-                var alt_buf: [64]u8 = undefined;
-                const router_e = try findEither(
-                    parsed,
-                    std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate.weight", .{l}) catch unreachable,
-                    std.fmt.bufPrint(&alt_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable,
-                );
-                const rdt = try router_e.dataType();
-                if (rdt != .f16 and rdt != .f32) return error.UnexpectedTensorDType;
-                if (router_e.rank != 2 or router_e.shape[0] != config.num_experts or router_e.shape[1] != h) {
-                    return error.UnexpectedTensorShape;
-                }
+                const router_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable);
+                _ = try validateRouter2D(router_e, config.num_experts, h);
                 bytes_l += router_e.blob_bytes;
 
+                var layer_exp_dt: ?quant.WeightDType = null;
                 for (0..config.num_experts) |e_idx| {
-                    const gp = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
-                    if ((try validateQuant2D(gp, config.moe_intermediate_size, h)) != config.quant_bits) return error.UnexpectedTensorDType;
+                    const gp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
+                    const gp_dt = try validateLinear2D(gp, config.moe_intermediate_size, h);
+                    if (layer_exp_dt) |expected| {
+                        if (gp_dt != expected) return error.UnexpectedTensorDType;
+                    } else {
+                        layer_exp_dt = gp_dt;
+                        if (gp_dt == .f16 or gp_dt == .bf16) {
+                            if ((h % 4) != 0 or (config.moe_intermediate_size % 4) != 0) return error.UnalignedK;
+                        }
+                    }
                     bytes_l += gp.blob_bytes;
 
-                    const up = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
-                    if ((try validateQuant2D(up, config.moe_intermediate_size, h)) != config.quant_bits) return error.UnexpectedTensorDType;
+                    const up = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
+                    if ((try validateLinear2D(up, config.moe_intermediate_size, h)) != layer_exp_dt.?) return error.UnexpectedTensorDType;
                     bytes_l += up.blob_bytes;
 
-                    const dp = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
-                    if ((try validateQuant2D(dp, h, config.moe_intermediate_size)) != config.quant_bits) return error.UnexpectedTensorDType;
+                    const dp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
+                    if ((try validateLinear2D(dp, h, config.moe_intermediate_size)) != layer_exp_dt.?) return error.UnexpectedTensorDType;
                     bytes_l += dp.blob_bytes;
                 }
             },
             .qwen3_dense => {
-                const gp = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
-                _ = try validateQuant2D(gp, config.intermediate_size, h);
+                const gp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
+                _ = try validateLinear2D(gp, config.intermediate_size, h);
                 bytes_l += gp.blob_bytes;
 
-                const up = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable);
-                _ = try validateQuant2D(up, config.intermediate_size, h);
+                const up = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable);
+                _ = try validateLinear2D(up, config.intermediate_size, h);
                 bytes_l += up.blob_bytes;
 
-                const dp = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable);
-                _ = try validateQuant2D(dp, h, config.intermediate_size);
+                const dp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable);
+                _ = try validateLinear2D(dp, h, config.intermediate_size);
                 bytes_l += dp.blob_bytes;
             },
         }
@@ -1101,7 +1147,7 @@ fn loadInternal(
         dense_act_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(da.ptr) };
     }
 
-    // --- 8. Load global weight blobs into shard 0 ---
+    // --- 8. Load global weight blobs into shard 0 (zero-duplicate tied lm_head) ---
     const g_shard = &shards[group_shard[0]];
     const embed_blob = try loadBlobIntoShard(source, embed_entry, g_shard, options.verify_crcs);
     const final_norm_blob = try loadBlobIntoShard(source, final_norm_entry, g_shard, options.verify_crcs);
@@ -1110,37 +1156,29 @@ fn loadInternal(
     else
         try loadBlobIntoShard(source, lm_head_entry, g_shard, options.verify_crcs);
 
-    const lm_head_bits = try validateQuant2D(lm_head_entry, config.vocab_size, h);
-    const lm_head_qb = lm_head_blob.asQuantBinding(lm_head_bits);
+    const embed_lin = embed_blob.asLinearBinding(embed_wdt);
+    const lm_head_lin = lm_head_blob.asLinearBinding(lm_head_wdt);
 
-    const embed_data = embed_blob.slice[0..@intCast(embed_entry.data_bytes)];
-    const embed_params: []const quant.ScaleBias = if (embed_dt == .f16)
-        &.{}
-    else
-        @alignCast(std.mem.bytesAsSlice(
-            quant.ScaleBias,
-            embed_blob.slice[@intCast(embed_entry.params_offset)..][0..@intCast(embed_entry.params_bytes)],
-        ));
-    const embed_row_bytes: usize = switch (embed_dt) {
-        .f16 => @as(usize, h) * @sizeOf(f16),
-        .q3_affine => try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).rowWeightBytes(h),
-        .q4_affine => try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).rowWeightBytes(h),
-        .f32, .bf16 => unreachable,
+    const embed_row_alg_bytes: u64 = switch (embed_wdt) {
+        .f16, .bf16 => @as(u64, h) * 2,
+        .q3_affine => (try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).rowWeightBytes(h)) +
+            @as(u64, h / 64) * @sizeOf(quant.ScaleBias),
+        .q4_affine => (try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).rowWeightBytes(h)) +
+            @as(u64, h / 64) * @sizeOf(quant.ScaleBias),
     };
-    const embed_row_alg_bytes: u64 = embed_row_bytes + if (embed_dt == .f16) @as(u64, 0) else (@as(u64, h / 64) * @sizeOf(quant.ScaleBias));
-    const global_head_bytes: u64 = embed_row_alg_bytes + final_norm_entry.data_bytes + lm_head_qb.alg_bytes;
+    const global_head_bytes: u64 = embed_row_alg_bytes + final_norm_entry.data_bytes + lm_head_lin.alg_bytes;
 
     // --- 9. Load per-layer weights into assigned shards & build device tables ---
     const layers = try allocator.alloc(LayerWeights, num_layers);
     errdefer allocator.free(layers);
 
-    var per_layer_static_bytes: u64 = 0;
-    const dummy_quant: QuantBinding = .{
-        .qweight = .{ .buffer = scratch_buf, .offset = 0 },
-        .scale_bias = .{ .buffer = scratch_buf, .offset = 0 },
+    var total_layers_static_bytes: u64 = 0;
+    const dummy_linear: LinearBinding = .{
+        .weight = .{ .buffer = scratch_buf, .offset = 0 },
+        .scale_bias = null,
         .n = 0,
         .k = 0,
-        .bits = config.quant_bits,
+        .dtype = .bf16,
         .alg_bytes = 0,
     };
 
@@ -1156,106 +1194,127 @@ fn loadInternal(
         }
 
         const in_ln_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable);
-        const in_ln_b = try loadBlobIntoShard(source, in_ln_e, l_shard, options.verify_crcs);
+        const in_ln_dt = try validateNorm1D(in_ln_e, h);
+        const in_ln_b = (try loadBlobIntoShard(source, in_ln_e, l_shard, options.verify_crcs)).asNormBinding(in_ln_dt);
 
-        const q_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable);
-        const q_b = (try loadBlobIntoShard(source, q_e, l_shard, options.verify_crcs)).asQuantBinding(try validateQuant2D(q_e, q_dim, h));
+        const q_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable);
+        const q_b = (try loadBlobIntoShard(source, q_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(q_e, q_dim, h));
 
-        const k_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable);
-        const k_b = (try loadBlobIntoShard(source, k_e, l_shard, options.verify_crcs)).asQuantBinding(try validateQuant2D(k_e, kv_dim, h));
+        const k_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable);
+        const k_b = (try loadBlobIntoShard(source, k_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(k_e, kv_dim, h));
 
-        const v_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
-        const v_b = (try loadBlobIntoShard(source, v_e, l_shard, options.verify_crcs)).asQuantBinding(try validateQuant2D(v_e, kv_dim, h));
+        const v_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
+        const v_b = (try loadBlobIntoShard(source, v_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(v_e, kv_dim, h));
 
-        const o_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
-        const o_b = (try loadBlobIntoShard(source, o_e, l_shard, options.verify_crcs)).asQuantBinding(try validateQuant2D(o_e, h, q_dim));
+        const o_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
+        const o_b = (try loadBlobIntoShard(source, o_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(o_e, h, q_dim));
 
         var q_norm_bind: ?metal.BufferBinding = null;
+        var k_norm_bind: ?metal.BufferBinding = null;
+        var qk_norm_dtype: quant.FloatDType = .f16;
         var qk_norm_bytes: u64 = 0;
         if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable)) |qn_e| {
+            qk_norm_dtype = try validateNorm1D(qn_e, config.head_dim);
             q_norm_bind = (try loadBlobIntoShard(source, qn_e, l_shard, options.verify_crcs)).asBinding();
             qk_norm_bytes += qn_e.data_bytes;
         }
-        var k_norm_bind: ?metal.BufferBinding = null;
         if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable)) |kn_e| {
             k_norm_bind = (try loadBlobIntoShard(source, kn_e, l_shard, options.verify_crcs)).asBinding();
             qk_norm_bytes += kn_e.data_bytes;
         }
 
         const post_ln_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable);
-        const post_ln_b = try loadBlobIntoShard(source, post_ln_e, l_shard, options.verify_crcs);
+        const post_ln_dt = try validateNorm1D(post_ln_e, h);
+        const post_ln_b = (try loadBlobIntoShard(source, post_ln_e, l_shard, options.verify_crcs)).asNormBinding(post_ln_dt);
 
         var layer_w: LayerWeights = .{
-            .input_layernorm = in_ln_b.asBinding(),
+            .input_layernorm = in_ln_b,
             .q_proj = q_b,
             .k_proj = k_b,
             .v_proj = v_b,
             .o_proj = o_b,
             .q_norm = q_norm_bind,
             .k_norm = k_norm_bind,
-            .post_attention_layernorm = post_ln_b.asBinding(),
-            .router_weights = .{ .buffer = scratch_buf, .offset = 0 },
-            .router_dtype = .f16,
+            .qk_norm_dtype = qk_norm_dtype,
+            .post_attention_layernorm = post_ln_b,
+            .router = .{ .weights = .{ .binding = .{ .buffer = scratch_buf, .offset = 0 }, .dtype = .f16 } },
+            .expert_dtype = .q3_affine,
             .expert_weights_buf = l_shard.buffer,
             .expert_table = .{ .buffer = scratch_buf, .offset = 0 },
-            .dense_gate = dummy_quant,
-            .dense_up = dummy_quant,
-            .dense_down = dummy_quant,
+            .dense_gate = dummy_linear,
+            .dense_up = dummy_linear,
+            .dense_down = dummy_linear,
             .kv_tiles_binding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(kv_tbl_raw.ptr) },
         };
 
         var ffn_active_bytes: u64 = 0;
         switch (config.arch) {
             .qwen3_moe => {
-                var alt_buf: [64]u8 = undefined;
-                const router_e = try findEither(
-                    parsed,
-                    std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate.weight", .{l}) catch unreachable,
-                    std.fmt.bufPrint(&alt_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable,
-                );
+                const router_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable);
+                const router_dt = try validateRouter2D(router_e, config.num_experts, h);
                 const router_b = try loadBlobIntoShard(source, router_e, l_shard, options.verify_crcs);
-                layer_w.router_weights = router_b.asBinding();
-                layer_w.router_dtype = if ((try router_e.dataType()) == .f16) .f16 else .f32;
+                layer_w.router = switch (router_dt) {
+                    .f16 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .f16 } },
+                    .bf16 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .bf16 } },
+                    .f32 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .f32 } },
+                    .q4_affine => .{ .quant_weights = .{
+                        .qweight = router_b.asBinding(),
+                        .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
+                        .bits = .q4,
+                    } },
+                    .q3_affine => .{ .quant_weights = .{
+                        .qweight = router_b.asBinding(),
+                        .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
+                        .bits = .q3,
+                    } },
+                };
 
                 const exp_tbl_raw = try scratch_arena.allocAligned(@as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights), 64);
                 const exp_tbl: []moe.ExpertWeights = @alignCast(std.mem.bytesAsSlice(moe.ExpertWeights, exp_tbl_raw));
                 layer_w.expert_table = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(exp_tbl_raw.ptr) };
 
+                var exp_dt: quant.WeightDType = .q3_affine;
                 for (0..config.num_experts) |e_idx| {
-                    const gp_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
+                    const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
+                    const gp_dt = try validateLinear2D(gp_e, config.moe_intermediate_size, h);
+                    if (e_idx == 0) exp_dt = gp_dt;
                     const gp_b = try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs);
 
-                    const up_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
+                    const up_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
                     const up_b = try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs);
 
-                    const dp_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
+                    const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
                     const dp_b = try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs);
 
+                    const is_float = (exp_dt == .f16 or exp_dt == .bf16);
                     exp_tbl[e_idx] = .{
                         .gate_qweight_offset = gp_b.offset,
-                        .gate_sb_offset = gp_b.offset + gp_e.params_offset,
+                        .gate_sb_offset = if (is_float) 0 else gp_b.offset + gp_e.params_offset,
                         .up_qweight_offset = up_b.offset,
-                        .up_sb_offset = up_b.offset + up_e.params_offset,
+                        .up_sb_offset = if (is_float) 0 else up_b.offset + up_e.params_offset,
                         .down_qweight_offset = dp_b.offset,
-                        .down_sb_offset = dp_b.offset + dp_e.params_offset,
+                        .down_sb_offset = if (is_float) 0 else dp_b.offset + dp_e.params_offset,
                     };
                 }
-                ffn_active_bytes = router_e.data_bytes + try moe.expertLayerBytes(
-                    config.quant_bits,
-                    config.num_experts_per_tok,
-                    h,
-                    config.moe_intermediate_size,
-                );
+                layer_w.expert_dtype = exp_dt;
+
+                const router_bytes: u64 = router_e.data_bytes + router_e.params_bytes;
+                const experts_bytes: u64 = switch (exp_dt) {
+                    .q3_affine => try moe.expertLayerBytes(.q3, config.num_experts_per_tok, h, config.moe_intermediate_size),
+                    .q4_affine => try moe.expertLayerBytes(.q4, config.num_experts_per_tok, h, config.moe_intermediate_size),
+                    .f16, .bf16 => try moe.expertLayerBytesFloat(config.num_experts_per_tok, h, config.moe_intermediate_size),
+                };
+                ffn_active_bytes = router_bytes + experts_bytes;
             },
             .qwen3_dense => {
-                const gp_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
-                const gp_b = (try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs)).asQuantBinding(try validateQuant2D(gp_e, config.intermediate_size, h));
+                const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
+                const gp_b = (try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(gp_e, config.intermediate_size, h));
 
-                const up_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable);
-                const up_b = (try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs)).asQuantBinding(try validateQuant2D(up_e, config.intermediate_size, h));
+                const up_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable);
+                const up_b = (try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(up_e, config.intermediate_size, h));
 
-                const dp_e = try findRequired(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable);
-                const dp_b = (try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs)).asQuantBinding(try validateQuant2D(dp_e, h, config.intermediate_size));
+                const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable);
+                const dp_b = (try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(dp_e, h, config.intermediate_size));
 
                 layer_w.dense_gate = gp_b;
                 layer_w.dense_up = up_b;
@@ -1264,12 +1323,10 @@ fn loadInternal(
             },
         }
 
-        if (l == 0) {
-            per_layer_static_bytes =
-                in_ln_e.data_bytes + post_ln_e.data_bytes + qk_norm_bytes +
-                q_b.alg_bytes + k_b.alg_bytes + v_b.alg_bytes + o_b.alg_bytes +
-                ffn_active_bytes;
-        }
+        total_layers_static_bytes +=
+            in_ln_e.data_bytes + post_ln_e.data_bytes + qk_norm_bytes +
+            q_b.alg_bytes + k_b.alg_bytes + v_b.alg_bytes + o_b.alg_bytes +
+            ffn_active_bytes;
         layers[l] = layer_w;
     }
 
@@ -1293,13 +1350,9 @@ fn loadInternal(
         .scratch_buf = scratch_buf,
         .kv_tiles = kv_tiles,
         .layers = layers,
-        .embed_dtype = embed_dt,
-        .embed_data = embed_data,
-        .embed_params = embed_params,
-        .embed_row_bytes = embed_row_bytes,
-        .final_norm = final_norm_blob.asBinding(),
-        .lm_head = lm_head_qb,
-        .x_host = @alignCast(std.mem.bytesAsSlice(f16, x_raw)),
+        .embed = embed_lin,
+        .final_norm = final_norm_blob.asNormBinding(final_norm_dt),
+        .lm_head = lm_head_lin,
         .logits_host = @alignCast(std.mem.bytesAsSlice(f16, logits_raw)),
         .out_token_id_host = @ptrCast(@alignCast(out_tok_raw.ptr)),
         .x_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_raw.ptr) },
@@ -1316,7 +1369,7 @@ fn loadInternal(
         .dense_gate_bind = dense_gate_bind,
         .dense_up_bind = dense_up_bind,
         .dense_act_bind = dense_act_bind,
-        .per_layer_static_bytes = per_layer_static_bytes,
+        .total_layers_static_bytes = total_layers_static_bytes,
         .global_head_bytes = global_head_bytes,
     };
 }
@@ -1325,7 +1378,7 @@ fn loadInternal(
 // Tests
 // ---------------------------------------------------------------------------
 
-test "ModelConfig.fromJson parses Qwen3-MoE and Qwen3-Dense configs and rejects invalid inputs" {
+test "ModelConfig.fromJson parses MLX quantized and HF unquantized BF16/FP16 configs" {
     const gpa = std.testing.allocator;
     const moe_json =
         \\{
@@ -1351,13 +1404,15 @@ test "ModelConfig.fromJson parses Qwen3-MoE and Qwen3-Dense configs and rejects 
     ;
     const moe_cfg = try ModelConfig.fromJson(gpa, moe_json);
     try std.testing.expectEqual(ModelArch.qwen3_moe, moe_cfg.arch);
-    try std.testing.expectEqual(quant.QuantBits.q3, moe_cfg.quant_bits);
+    try std.testing.expectEqual(@as(?quant.QuantBits, .q3), moe_cfg.quant_bits);
+    try std.testing.expectEqualStrings("q3", moe_cfg.precisionLabel());
     try std.testing.expectEqual(@as(u32, 4096), moe_cfg.qDim());
     try std.testing.expectEqual(@as(u32, 512), moe_cfg.kvDim());
     try std.testing.expectEqual(@as(u32, 128), moe_cfg.num_experts);
     try std.testing.expectEqual(@as(u32, 8), moe_cfg.num_experts_per_tok);
     try std.testing.expectEqual(@as(?u32, 151645), moe_cfg.eos_token_id);
 
+    // MLX config using `quantization_config` only
     const dense_json =
         \\{
         \\  "model_type": "qwen3",
@@ -1372,14 +1427,66 @@ test "ModelConfig.fromJson parses Qwen3-MoE and Qwen3-Dense configs and rejects 
         \\  "rope_theta": 1000000.0,
         \\  "tie_word_embeddings": true,
         \\  "eos_token_id": 151645,
-        \\  "quantization": { "bits": 4, "group_size": 64 }
+        \\  "quantization_config": { "bits": 4, "group_size": 64 }
         \\}
     ;
     const dense_cfg = try ModelConfig.fromJson(gpa, dense_json);
     try std.testing.expectEqual(ModelArch.qwen3_dense, dense_cfg.arch);
-    try std.testing.expectEqual(quant.QuantBits.q4, dense_cfg.quant_bits);
+    try std.testing.expectEqual(@as(?quant.QuantBits, .q4), dense_cfg.quant_bits);
+    try std.testing.expectEqualStrings("q4", dense_cfg.precisionLabel());
     try std.testing.expectEqual(@as(u32, 17408), dense_cfg.intermediate_size);
     try std.testing.expect(dense_cfg.tie_word_embeddings);
+
+    // Unquantized HuggingFace Qwen3-0.6B BF16 config (`qDim = 2048 != hidden_size = 1024`)
+    const bf16_json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "vocab_size": 151936,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 28,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "intermediate_size": 3072,
+        \\  "rms_norm_eps": 1e-6,
+        \\  "rope_theta": 1000000,
+        \\  "max_position_embeddings": 40960,
+        \\  "tie_word_embeddings": true,
+        \\  "torch_dtype": "bfloat16",
+        \\  "bos_token_id": 151643,
+        \\  "eos_token_id": 151645
+        \\}
+    ;
+    const bf16_cfg = try ModelConfig.fromJson(gpa, bf16_json);
+    try std.testing.expectEqual(ModelArch.qwen3_dense, bf16_cfg.arch);
+    try std.testing.expectEqual(@as(?quant.QuantBits, null), bf16_cfg.quant_bits);
+    try std.testing.expectEqual(quant.FloatDType.bf16, bf16_cfg.default_float_dtype);
+    try std.testing.expectEqualStrings("bf16", bf16_cfg.precisionLabel());
+    try std.testing.expectEqual(@as(u32, 2048), bf16_cfg.qDim());
+    try std.testing.expectEqual(@as(u32, 1024), bf16_cfg.hidden_size);
+    try std.testing.expect(bf16_cfg.tie_word_embeddings);
+
+    // Unquantized FP16 config relaxes % 64 == 0 to % 4 == 0
+    const fp16_relaxed_json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "vocab_size": 512,
+        \\  "hidden_size": 132,
+        \\  "num_hidden_layers": 2,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 64,
+        \\  "intermediate_size": 196,
+        \\  "torch_dtype": "float16"
+        \\}
+    ;
+    var fp16_cfg = try ModelConfig.fromJson(gpa, fp16_relaxed_json);
+    try std.testing.expectEqual(@as(?quant.QuantBits, null), fp16_cfg.quant_bits);
+    try std.testing.expectEqual(quant.FloatDType.f16, fp16_cfg.default_float_dtype);
+    try std.testing.expectEqualStrings("f16", fp16_cfg.precisionLabel());
+    // Same non-64-aligned geometry must be rejected when quantized:
+    fp16_cfg.quant_bits = .q4;
+    try std.testing.expectError(error.InvalidConfig, fp16_cfg.validate());
 
     try std.testing.expectError(error.UnsupportedArchitecture, ModelConfig.fromJson(gpa, "{\"model_type\":\"llama\"}"));
     try std.testing.expectError(error.InvalidJson, ModelConfig.fromJson(gpa, "{broken"));
@@ -1397,6 +1504,15 @@ const SyntheticRecord = struct {
     rank: u8,
     data: []u8,
     params: []u8,
+};
+
+const SynthDTypeSpec = struct {
+    linear_dtype: quant.WeightDType,
+    embed_dtype: quant.WeightDType,
+    norm_dtype: quant.FloatDType = .f16,
+    router_dtype: amf.DType = .f16,
+    expert_dtype: ?quant.WeightDType = null,
+    use_weight_suffix: bool = false,
 };
 
 fn nextRng(state: *u64) u64 {
@@ -1445,28 +1561,45 @@ fn fillQuantTensor(
     return .{ .data = data, .params = params };
 }
 
-fn fillF16Tensor(
+fn fillFloat16Tensor(
     allocator: std.mem.Allocator,
+    dtype: quant.FloatDType,
     elems: usize,
     amp: f32,
     centered_one: bool,
     seed: u64,
 ) ![]u8 {
     var rng = seed ^ 0xA076_1D64_78BD_642F;
-    const raw = try allocator.alloc(u8, elems * @sizeOf(f16));
-    const vals: []f16 = @alignCast(std.mem.bytesAsSlice(f16, raw));
+    const raw = try allocator.alloc(u8, elems * @sizeOf(u16));
+    const vals: []u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
     for (vals) |*v| {
         const u = @as(f32, @floatFromInt(nextRng(&rng) & 0xFFFF)) / 65535.0;
         const f = if (centered_one) (0.95 + 0.1 * u) else ((u * 2.0 - 1.0) * amp);
-        v.* = @floatCast(f);
+        v.* = quant.f32ToFloatBits(dtype, f);
     }
     return raw;
 }
 
-fn buildSyntheticAmfImage(
+fn weightDTypeToAmf(wdt: quant.WeightDType) amf.DType {
+    return switch (wdt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .q4_affine => .q4_affine,
+        .q3_affine => .q3_affine,
+    };
+}
+
+fn floatDTypeToAmf(fdt: quant.FloatDType) amf.DType {
+    return switch (fdt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+    };
+}
+
+fn buildSyntheticAmfImageWithSpec(
     allocator: std.mem.Allocator,
     cfg: ModelConfig,
-    embed_f16: bool,
+    spec: SynthDTypeSpec,
     seed: u64,
 ) ![]u8 {
     var recs: std.ArrayList(SyntheticRecord) = .empty;
@@ -1479,144 +1612,184 @@ fn buildSyntheticAmfImage(
         recs.deinit(allocator);
     }
 
-    const q_dtype: amf.DType = if (cfg.quant_bits == .q3) .q3_affine else .q4_affine;
-    const bits_u8: u8 = cfg.quant_bits.bitWidth();
     const h = cfg.hidden_size;
     const q_dim = cfg.qDim();
     const kv_dim = cfg.kvDim();
+    const exp_wdt = spec.expert_dtype orelse spec.linear_dtype;
     var t_idx: u64 = 1;
 
-    const addQuant = struct {
+    const addWeight2D = struct {
         fn call(
             alloc: std.mem.Allocator,
             list: *std.ArrayList(SyntheticRecord),
-            name: []u8,
+            base_name: []const u8,
+            use_suffix: bool,
             kind: amf.TensorKind,
-            dtype: amf.DType,
-            bits: quant.QuantBits,
+            wdt: quant.WeightDType,
             layer: u16,
             expert: u16,
             n: u32,
             k: u32,
-            scale: f32,
+            amp_or_scale: f32,
             s: u64,
         ) !void {
+            const is_float = (wdt == .f16 or wdt == .bf16);
+            const name = if (use_suffix and is_float)
+                try std.fmt.allocPrint(alloc, "{s}.weight", .{base_name})
+            else
+                try alloc.dupe(u8, base_name);
             errdefer alloc.free(name);
-            const q = try fillQuantTensor(alloc, bits, n, k, scale, s);
-            errdefer {
-                alloc.free(q.data);
-                alloc.free(q.params);
+
+            switch (wdt) {
+                .f16, .bf16 => {
+                    const fdt: quant.FloatDType = if (wdt == .f16) .f16 else .bf16;
+                    const data = try fillFloat16Tensor(alloc, fdt, @as(usize, n) * k, amp_or_scale, false, s);
+                    errdefer alloc.free(data);
+                    try list.append(alloc, .{
+                        .name = name,
+                        .kind = kind,
+                        .dtype = floatDTypeToAmf(fdt),
+                        .quant_bits = 0,
+                        .group_size = 0,
+                        .layer = layer,
+                        .expert = expert,
+                        .shape = .{ n, k, 0, 0 },
+                        .rank = 2,
+                        .data = data,
+                        .params = try alloc.alloc(u8, 0),
+                    });
+                },
+                .q3_affine, .q4_affine => {
+                    const qb: quant.QuantBits = if (wdt == .q3_affine) .q3 else .q4;
+                    const q = try fillQuantTensor(alloc, qb, n, k, amp_or_scale, s);
+                    errdefer {
+                        alloc.free(q.data);
+                        alloc.free(q.params);
+                    }
+                    try list.append(alloc, .{
+                        .name = name,
+                        .kind = kind,
+                        .dtype = weightDTypeToAmf(wdt),
+                        .quant_bits = qb.bitWidth(),
+                        .group_size = 64,
+                        .layer = layer,
+                        .expert = expert,
+                        .shape = .{ n, k, 0, 0 },
+                        .rank = 2,
+                        .data = q.data,
+                        .params = q.params,
+                    });
+                },
             }
-            try list.append(alloc, .{
-                .name = name,
-                .kind = kind,
-                .dtype = dtype,
-                .quant_bits = bits.bitWidth(),
-                .group_size = 64,
-                .layer = layer,
-                .expert = expert,
-                .shape = .{ n, k, 0, 0 },
-                .rank = 2,
-                .data = q.data,
-                .params = q.params,
-            });
         }
     }.call;
 
-    const addF16 = struct {
+    const addNorm1D = struct {
         fn call(
             alloc: std.mem.Allocator,
             list: *std.ArrayList(SyntheticRecord),
             name: []u8,
-            kind: amf.TensorKind,
+            fdt: quant.FloatDType,
             layer: u16,
-            shape: [4]u32,
-            rank: u8,
-            amp: f32,
-            centered_one: bool,
+            dim: u32,
             s: u64,
         ) !void {
             errdefer alloc.free(name);
-            var elems: usize = 1;
-            for (0..rank) |d| elems *= shape[d];
-            const data = try fillF16Tensor(alloc, elems, amp, centered_one, s);
+            const data = try fillFloat16Tensor(alloc, fdt, dim, 0.05, true, s);
             errdefer alloc.free(data);
             try list.append(alloc, .{
                 .name = name,
-                .kind = kind,
-                .dtype = .f16,
+                .kind = .norm,
+                .dtype = floatDTypeToAmf(fdt),
                 .quant_bits = 0,
                 .group_size = 0,
                 .layer = layer,
                 .expert = amf.NO_EXPERT,
-                .shape = shape,
-                .rank = rank,
+                .shape = .{ dim, 0, 0, 0 },
+                .rank = 1,
                 .data = data,
                 .params = try alloc.alloc(u8, 0),
             });
         }
     }.call;
 
+    const scaleFor = struct {
+        fn call(wdt: quant.WeightDType, inv_sqrt: f32) f32 {
+            return switch (wdt) {
+                .q3_affine => 0.35 * inv_sqrt,
+                .q4_affine => 0.17 * inv_sqrt,
+                .f16, .bf16 => 1.0 * inv_sqrt,
+            };
+        }
+    }.call;
+
     // embed_tokens
-    if (embed_f16) {
-        try addF16(allocator, &recs, try allocator.dupe(u8, "embed_tokens"), .embedding, amf.NO_LAYER, .{ cfg.vocab_size, h, 0, 0 }, 2, 0.25, false, seed + t_idx);
-    } else {
-        const emb_s: f32 = if (bits_u8 == 3) 0.08 else 0.04;
-        try addQuant(allocator, &recs, try allocator.dupe(u8, "embed_tokens"), .embedding, q_dtype, cfg.quant_bits, amf.NO_LAYER, amf.NO_EXPERT, cfg.vocab_size, h, emb_s, seed + t_idx);
-    }
+    const emb_scale: f32 = switch (spec.embed_dtype) {
+        .q3_affine => 0.08,
+        .q4_affine => 0.04,
+        .f16, .bf16 => 0.25,
+    };
+    try addWeight2D(allocator, &recs, "embed_tokens", spec.use_weight_suffix, .embedding, spec.embed_dtype, amf.NO_LAYER, amf.NO_EXPERT, cfg.vocab_size, h, emb_scale, seed + t_idx);
     t_idx += 1;
 
     const inv_sqrt_h = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
     const inv_sqrt_q = 1.0 / @sqrt(@as(f32, @floatFromInt(q_dim)));
-    const base_mul: f32 = if (bits_u8 == 3) 0.35 else 0.17;
 
+    var name_buf: [64]u8 = undefined;
     for (0..cfg.num_hidden_layers) |l_usize| {
         const l: u16 = @intCast(l_usize);
-        try addF16(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.input_layernorm.weight", .{l}), .norm, l, .{ h, 0, 0, 0 }, 1, 0.05, true, seed + t_idx);
+        try addNorm1D(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.input_layernorm.weight", .{l}), spec.norm_dtype, l, h, seed + t_idx);
         t_idx += 1;
-        try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.q_proj", .{l}), .dense, q_dtype, cfg.quant_bits, l, amf.NO_EXPERT, q_dim, h, base_mul * inv_sqrt_h, seed + t_idx);
+        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, q_dim, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
         t_idx += 1;
-        try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.k_proj", .{l}), .dense, q_dtype, cfg.quant_bits, l, amf.NO_EXPERT, kv_dim, h, base_mul * inv_sqrt_h, seed + t_idx);
+        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, kv_dim, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
         t_idx += 1;
-        try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.v_proj", .{l}), .dense, q_dtype, cfg.quant_bits, l, amf.NO_EXPERT, kv_dim, h, base_mul * inv_sqrt_h, seed + t_idx);
+        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, kv_dim, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
         t_idx += 1;
-        try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.o_proj", .{l}), .dense, q_dtype, cfg.quant_bits, l, amf.NO_EXPERT, h, q_dim, base_mul * inv_sqrt_q, seed + t_idx);
+        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, h, q_dim, scaleFor(spec.linear_dtype, inv_sqrt_q), seed + t_idx);
         t_idx += 1;
-        try addF16(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.q_norm.weight", .{l}), .norm, l, .{ cfg.head_dim, 0, 0, 0 }, 1, 0.05, true, seed + t_idx);
+        try addNorm1D(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.q_norm.weight", .{l}), spec.norm_dtype, l, cfg.head_dim, seed + t_idx);
         t_idx += 1;
-        try addF16(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.k_norm.weight", .{l}), .norm, l, .{ cfg.head_dim, 0, 0, 0 }, 1, 0.05, true, seed + t_idx);
+        try addNorm1D(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.k_norm.weight", .{l}), spec.norm_dtype, l, cfg.head_dim, seed + t_idx);
         t_idx += 1;
-        try addF16(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.post_attention_layernorm.weight", .{l}), .norm, l, .{ h, 0, 0, 0 }, 1, 0.05, true, seed + t_idx);
+        try addNorm1D(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.post_attention_layernorm.weight", .{l}), spec.norm_dtype, l, h, seed + t_idx);
         t_idx += 1;
 
         if (cfg.arch == .qwen3_moe) {
-            try addF16(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.mlp.gate.weight", .{l}), .router, l, .{ cfg.num_experts, h, 0, 0 }, 2, 0.6 * inv_sqrt_h, false, seed + t_idx);
+            const router_base = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable;
+            switch (spec.router_dtype) {
+                .f16 => try addWeight2D(allocator, &recs, router_base, true, .router, .f16, l, amf.NO_EXPERT, cfg.num_experts, h, 0.6 * inv_sqrt_h, seed + t_idx),
+                .bf16 => try addWeight2D(allocator, &recs, router_base, true, .router, .bf16, l, amf.NO_EXPERT, cfg.num_experts, h, 0.6 * inv_sqrt_h, seed + t_idx),
+                .q3_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q3_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.25 * inv_sqrt_h, seed + t_idx),
+                .q4_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q4_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.12 * inv_sqrt_h, seed + t_idx),
+                .f32 => return error.UnexpectedTensorDType,
+            }
             t_idx += 1;
             const inv_sqrt_mi = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.moe_intermediate_size)));
             for (0..cfg.num_experts) |e_usize| {
                 const e: u16 = @intCast(e_usize);
-                try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }), .hot_expert, q_dtype, cfg.quant_bits, l, e, cfg.moe_intermediate_size, h, base_mul * inv_sqrt_h, seed + t_idx);
+                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, exp_wdt, l, e, cfg.moe_intermediate_size, h, scaleFor(exp_wdt, inv_sqrt_h), seed + t_idx);
                 t_idx += 1;
-                try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }), .hot_expert, q_dtype, cfg.quant_bits, l, e, cfg.moe_intermediate_size, h, base_mul * inv_sqrt_h, seed + t_idx);
+                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, exp_wdt, l, e, cfg.moe_intermediate_size, h, scaleFor(exp_wdt, inv_sqrt_h), seed + t_idx);
                 t_idx += 1;
-                try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }), .hot_expert, q_dtype, cfg.quant_bits, l, e, h, cfg.moe_intermediate_size, base_mul * inv_sqrt_mi, seed + t_idx);
+                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, exp_wdt, l, e, h, cfg.moe_intermediate_size, scaleFor(exp_wdt, inv_sqrt_mi), seed + t_idx);
                 t_idx += 1;
             }
         } else {
             const inv_sqrt_di = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.intermediate_size)));
-            try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.mlp.gate_proj", .{l}), .dense, q_dtype, cfg.quant_bits, l, amf.NO_EXPERT, cfg.intermediate_size, h, base_mul * inv_sqrt_h, seed + t_idx);
+            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, cfg.intermediate_size, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
             t_idx += 1;
-            try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.mlp.up_proj", .{l}), .dense, q_dtype, cfg.quant_bits, l, amf.NO_EXPERT, cfg.intermediate_size, h, base_mul * inv_sqrt_h, seed + t_idx);
+            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, cfg.intermediate_size, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
             t_idx += 1;
-            try addQuant(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.mlp.down_proj", .{l}), .dense, q_dtype, cfg.quant_bits, l, amf.NO_EXPERT, h, cfg.intermediate_size, base_mul * inv_sqrt_di, seed + t_idx);
+            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, h, cfg.intermediate_size, scaleFor(spec.linear_dtype, inv_sqrt_di), seed + t_idx);
             t_idx += 1;
         }
     }
 
-    try addF16(allocator, &recs, try allocator.dupe(u8, "norm.weight"), .norm, amf.NO_LAYER, .{ h, 0, 0, 0 }, 1, 0.05, true, seed + t_idx);
+    try addNorm1D(allocator, &recs, try allocator.dupe(u8, "norm.weight"), spec.norm_dtype, amf.NO_LAYER, h, seed + t_idx);
     t_idx += 1;
     if (!cfg.tie_word_embeddings) {
-        try addQuant(allocator, &recs, try allocator.dupe(u8, "lm_head"), .lm_head, q_dtype, cfg.quant_bits, amf.NO_LAYER, amf.NO_EXPERT, cfg.vocab_size, h, 0.5 * base_mul * inv_sqrt_h, seed + t_idx);
+        try addWeight2D(allocator, &recs, "lm_head", spec.use_weight_suffix, .lm_head, spec.linear_dtype, amf.NO_LAYER, amf.NO_EXPERT, cfg.vocab_size, h, 0.5 * scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
     }
 
     // Serialize all records into a valid 16 KiB-aligned .amf v0 image.
@@ -1693,8 +1866,26 @@ fn buildSyntheticAmfImage(
     return image;
 }
 
+fn buildSyntheticAmfImage(
+    allocator: std.mem.Allocator,
+    cfg: ModelConfig,
+    embed_f16: bool,
+    seed: u64,
+) ![]u8 {
+    const lin_wdt: quant.WeightDType = if (cfg.quant_bits) |qb|
+        quant.WeightDType.fromQuant(qb)
+    else
+        quant.WeightDType.fromFloat(cfg.default_float_dtype);
+    return buildSyntheticAmfImageWithSpec(allocator, cfg, .{
+        .linear_dtype = lin_wdt,
+        .embed_dtype = if (embed_f16) .f16 else lin_wdt,
+        .norm_dtype = .f16,
+        .router_dtype = .f16,
+    }, seed);
+}
+
 /// Full CPU fp32 reference transformer executing the exact same `.amf` weights
-/// step-for-step for Qwen3-MoE (3-bit) and Qwen3-Dense (4-bit) verification.
+/// step-for-step for FP16, BF16, 3-bit/4-bit, and mixed-precision Qwen3 models.
 const CpuTransformerRef = struct {
     cfg: ModelConfig,
     bytes: []const u8,
@@ -1735,32 +1926,63 @@ const CpuTransformerRef = struct {
         self.parsed.deinit(allocator);
     }
 
-    fn f16Slice(self: *const CpuTransformerRef, name: []const u8) ![]const f16 {
+    fn normBits(self: *const CpuTransformerRef, name: []const u8) !struct { dtype: quant.FloatDType, bits: []const u16 } {
         const e = self.parsed.find(name) orelse return error.MissingTensor;
+        const dt = try e.dataType();
+        const fdt: quant.FloatDType = switch (dt) {
+            .f16 => .f16,
+            .bf16 => .bf16,
+            else => return error.UnexpectedTensorDType,
+        };
         const start: usize = @intCast(e.blob_offset);
         const len: usize = @intCast(e.data_bytes);
-        return @alignCast(std.mem.bytesAsSlice(f16, self.bytes[start .. start + len]));
+        return .{
+            .dtype = fdt,
+            .bits = @alignCast(std.mem.bytesAsSlice(u16, self.bytes[start .. start + len])),
+        };
     }
 
-    fn quantMatvec(self: *const CpuTransformerRef, name: []const u8, x: []const f16, y: []f32) !void {
-        const e = self.parsed.find(name) orelse return error.MissingTensor;
+    fn linearMatvec(self: *const CpuTransformerRef, base_name: []const u8, x: []const f16, y: []f32) !void {
+        const e = try findLinear(&self.parsed, base_name);
         const blob_start: usize = @intCast(e.blob_offset);
-        const qweight = self.bytes[blob_start .. blob_start + @as(usize, @intCast(e.data_bytes))];
-        const sb_start = blob_start + @as(usize, @intCast(e.params_offset));
-        const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
-            quant.ScaleBias,
-            self.bytes[sb_start .. sb_start + @as(usize, @intCast(e.params_bytes))],
-        ));
+        const raw = self.bytes[blob_start .. blob_start + @as(usize, @intCast(e.data_bytes))];
         const dt = try e.dataType();
         switch (dt) {
-            .q3_affine => try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).matmulRef(x, qweight, sbs, y, 1, e.shape[0], e.shape[1]),
-            .q4_affine => try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).matmulRef(x, qweight, sbs, y, 1, e.shape[0], e.shape[1]),
-            else => return error.UnexpectedTensorDType,
+            .f16 => {
+                const w_bits: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
+                try quant.denseGemvCpuRef(.f16, x, w_bits, y, e.shape[0], e.shape[1]);
+            },
+            .bf16 => {
+                const w_bits: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
+                try quant.denseGemvCpuRef(.bf16, x, w_bits, y, e.shape[0], e.shape[1]);
+            },
+            .q3_affine, .q4_affine => {
+                const sb_start = blob_start + @as(usize, @intCast(e.params_offset));
+                const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    self.bytes[sb_start .. sb_start + @as(usize, @intCast(e.params_bytes))],
+                ));
+                switch (dt) {
+                    .q3_affine => try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).matmulRef(x, raw, sbs, y, 1, e.shape[0], e.shape[1]),
+                    .q4_affine => try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).matmulRef(x, raw, sbs, y, 1, e.shape[0], e.shape[1]),
+                    else => unreachable,
+                }
+            },
+            .f32 => {
+                const wf: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, raw));
+                const n: usize = e.shape[0];
+                const k: usize = e.shape[1];
+                for (0..n) |row| {
+                    var acc: f32 = 0.0;
+                    for (0..k) |j| acc += @as(f32, @floatCast(x[j])) * wf[row * k + j];
+                    y[row] = acc;
+                }
+            },
         }
     }
 
     fn embedLookup(self: *const CpuTransformerRef, token_id: u32, out_f16: []f16) !void {
-        const e = self.parsed.find("embed_tokens") orelse return error.MissingTensor;
+        const e = try findLinear(&self.parsed, "embed_tokens");
         const h: usize = self.cfg.hidden_size;
         const blob_start: usize = @intCast(e.blob_offset);
         const dt = try e.dataType();
@@ -1768,6 +1990,14 @@ const CpuTransformerRef = struct {
             .f16 => {
                 const all: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, self.bytes[blob_start .. blob_start + @as(usize, @intCast(e.data_bytes))]));
                 @memcpy(out_f16, all[@as(usize, token_id) * h ..][0..h]);
+            },
+            .bf16 => {
+                const all: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, self.bytes[blob_start .. blob_start + @as(usize, @intCast(e.data_bytes))]));
+                const row = all[@as(usize, token_id) * h ..][0..h];
+                for (0..h) |j| {
+                    const v = std.math.clamp(quant.bf16ToF32(row[j]), -65504.0, 65504.0);
+                    out_f16[j] = @floatCast(v);
+                }
             },
             .q3_affine => {
                 const Q3 = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
@@ -1803,7 +2033,7 @@ const CpuTransformerRef = struct {
                     for (0..64) |j| out_f16[g * 64 + j] = @floatCast(tmp[j]);
                 }
             },
-            else => return error.UnexpectedTensorDType,
+            .f32 => return error.UnexpectedTensorDType,
         }
     }
 
@@ -1844,29 +2074,29 @@ const CpuTransformerRef = struct {
 
         var name_buf: [64]u8 = undefined;
         for (0..self.cfg.num_hidden_layers) |l| {
-            const in_ln = try self.f16Slice(try std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}));
-            attention.rmsNormCpuRef(x, in_ln, x_norm_f32, 1, h, self.cfg.rms_norm_eps);
+            const in_ln = try self.normBits(try std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}));
+            attention.rmsNormCpuRefDType(x, in_ln.dtype, in_ln.bits, x_norm_f32, 1, h, self.cfg.rms_norm_eps);
             for (0..h) |i| x_norm[i] = @floatCast(x_norm_f32[i]);
 
-            try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}), x_norm, q_f32);
-            try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}), x_norm, k_f32);
-            try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}), x_norm, v_f32);
+            try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}), x_norm, q_f32);
+            try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}), x_norm, k_f32);
+            try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}), x_norm, v_f32);
             for (0..q_dim) |i| q_f16[i] = @floatCast(q_f32[i]);
             for (0..kv_dim) |i| {
                 k_f16[i] = @floatCast(k_f32[i]);
                 v_f16[i] = @floatCast(v_f32[i]);
             }
 
-            const qn = try self.f16Slice(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}));
-            const kn = try self.f16Slice(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}));
+            const qn = try self.normBits(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}));
+            const kn = try self.normBits(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}));
             for (0..self.cfg.num_attention_heads) |qh| {
-                attention.qkNormRopeHeadCpuRef(q_f16[qh * hd ..][0..hd], qn, head_tmp, pos, self.cfg.rms_norm_eps, self.cfg.rope_theta);
+                attention.qkNormRopeHeadCpuRefDType(q_f16[qh * hd ..][0..hd], qn.dtype, qn.bits, head_tmp, pos, self.cfg.rms_norm_eps, self.cfg.rope_theta);
                 for (0..hd) |d| q_f16[qh * hd + d] = @floatCast(head_tmp[d]);
             }
             const layer_kv_base = l * @as(usize, self.max_seq_len) * kv_dim;
             const pos_kv_base = layer_kv_base + @as(usize, pos) * kv_dim;
             for (0..self.cfg.num_key_value_heads) |kvh| {
-                attention.qkNormRopeHeadCpuRef(k_f16[kvh * hd ..][0..hd], kn, head_tmp, pos, self.cfg.rms_norm_eps, self.cfg.rope_theta);
+                attention.qkNormRopeHeadCpuRefDType(k_f16[kvh * hd ..][0..hd], kn.dtype, kn.bits, head_tmp, pos, self.cfg.rms_norm_eps, self.cfg.rope_theta);
                 for (0..hd) |d| {
                     self.k_cache[pos_kv_base + kvh * hd + d] = @floatCast(head_tmp[d]);
                     self.v_cache[pos_kv_base + kvh * hd + d] = v_f16[kvh * hd + d];
@@ -1887,25 +2117,20 @@ const CpuTransformerRef = struct {
             );
             for (0..q_dim) |i| attn_out_f16[i] = @floatCast(attn_out_f32[i]);
 
-            try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}), attn_out_f16, proj_f32);
+            try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}), attn_out_f16, proj_f32);
             for (0..h) |i| {
                 const delta: f32 = @floatCast(@as(f16, @floatCast(proj_f32[i])));
                 x[i] = @floatCast(@as(f32, @floatCast(x[i])) + delta);
             }
 
-            const post_ln = try self.f16Slice(try std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}));
-            attention.rmsNormCpuRef(x, post_ln, x_norm_f32, 1, h, self.cfg.rms_norm_eps);
+            const post_ln = try self.normBits(try std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}));
+            attention.rmsNormCpuRefDType(x, post_ln.dtype, post_ln.bits, x_norm_f32, 1, h, self.cfg.rms_norm_eps);
             for (0..h) |i| x_norm[i] = @floatCast(x_norm_f32[i]);
 
             if (self.cfg.arch == .qwen3_moe) {
-                const router_w = try self.f16Slice(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate.weight", .{l}));
                 const r_logits = try allocator.alloc(f32, self.cfg.num_experts);
                 defer allocator.free(r_logits);
-                for (0..self.cfg.num_experts) |e_idx| {
-                    var acc: f32 = 0.0;
-                    for (0..h) |j| acc += @as(f32, @floatCast(x_norm[j])) * @as(f32, @floatCast(router_w[e_idx * h + j]));
-                    r_logits[e_idx] = acc;
-                }
+                try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}), x_norm, r_logits);
                 var route = try moe.routeTopKRef(allocator, r_logits, 1, self.cfg.num_experts, self.cfg.num_experts_per_tok, self.cfg.norm_topk_prob);
                 defer route.deinit(allocator);
 
@@ -1923,10 +2148,10 @@ const CpuTransformerRef = struct {
                 for (0..self.cfg.num_experts_per_tok) |k_idx| {
                     const eid = route.topk_experts[k_idx];
                     const rw = route.topk_weights[k_idx];
-                    try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, eid }), x_norm, g_f32);
-                    try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, eid }), x_norm, u_f32);
+                    try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, eid }), x_norm, g_f32);
+                    try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, eid }), x_norm, u_f32);
                     for (0..mi) |i| act_f16[i] = @floatCast(moe.siluF32(g_f32[i]) * u_f32[i]);
-                    try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, eid }), act_f16, proj_f32);
+                    try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, eid }), act_f16, proj_f32);
                     for (0..h) |i| sum_f32[i] += rw * proj_f32[i];
                 }
                 for (0..h) |i| x[i] = @floatCast(@as(f32, @floatCast(x[i])) + sum_f32[i]);
@@ -1938,14 +2163,14 @@ const CpuTransformerRef = struct {
                 defer allocator.free(u_f32);
                 const act_f16 = try allocator.alloc(f16, di);
                 defer allocator.free(act_f16);
-                try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}), x_norm, g_f32);
-                try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}), x_norm, u_f32);
+                try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}), x_norm, g_f32);
+                try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}), x_norm, u_f32);
                 for (0..di) |i| {
                     const gf: f32 = @floatCast(@as(f16, @floatCast(g_f32[i])));
                     const uf: f32 = @floatCast(@as(f16, @floatCast(u_f32[i])));
                     act_f16[i] = @floatCast(moe.siluF32(gf) * uf);
                 }
-                try self.quantMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}), act_f16, proj_f32);
+                try self.linearMatvec(try std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}), act_f16, proj_f32);
                 for (0..h) |i| {
                     const delta: f32 = @floatCast(@as(f16, @floatCast(proj_f32[i])));
                     x[i] = @floatCast(@as(f32, @floatCast(x[i])) + delta);
@@ -1953,12 +2178,12 @@ const CpuTransformerRef = struct {
             }
         }
 
-        const final_ln = try self.f16Slice("norm.weight");
-        attention.rmsNormCpuRef(x, final_ln, x_norm_f32, 1, h, self.cfg.rms_norm_eps);
+        const final_ln = try self.normBits("norm.weight");
+        attention.rmsNormCpuRefDType(x, final_ln.dtype, final_ln.bits, x_norm_f32, 1, h, self.cfg.rms_norm_eps);
         for (0..h) |i| x_norm[i] = @floatCast(x_norm_f32[i]);
 
         const head_name = if (self.cfg.tie_word_embeddings) "embed_tokens" else "lm_head";
-        try self.quantMatvec(head_name, x_norm, self.logits);
+        try self.linearMatvec(head_name, x_norm, self.logits);
 
         const logits_f16 = try allocator.alloc(f16, self.cfg.vocab_size);
         defer allocator.free(logits_f16);
@@ -2155,6 +2380,212 @@ test "Qwen3Model loads from F_NOCACHE disk .amf and matches CPU reference across
         const pos: u32 = @intCast(step_idx);
         const expected = try cpu_ref.step(gpa, tok, pos);
         const got = try model.stepDecode(tok, pos);
+        try std.testing.expectEqual(expected, got);
+        tok = got;
+    }
+}
+
+test "Qwen3-Dense pure BF16 (tie_word_embeddings, qDim != hidden_size, .weight names) matches CPU fp32 reference" {
+    const gpa = std.testing.allocator;
+    // Mirrors Qwen3-0.6B layout: qDim = 4*64 = 256 != hidden_size = 128,
+    // tie_word_embeddings = true, all tensors BF16 with `.weight` suffixes.
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 256,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 384,
+        .tie_word_embeddings = true,
+    };
+    const image = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .bf16,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+        .use_weight_suffix = true,
+    }, 600);
+    defer gpa.free(image);
+
+    var cpu_ref = try CpuTransformerRef.init(gpa, image, cfg, 64);
+    defer cpu_ref.deinit(gpa);
+
+    var model = try Qwen3Model.loadFromBytes(gpa, image, cfg, .{ .max_seq_len = 64 });
+    defer model.deinit(gpa);
+
+    // Zero-duplicate tie_word_embeddings: lm_head reuses embed_tokens's exact wired offset & buffer.
+    try std.testing.expectEqual(model.embed.weight.offset, model.lm_head.weight.offset);
+    try std.testing.expectEqual(quant.WeightDType.bf16, model.embed.dtype);
+    try std.testing.expectEqual(quant.WeightDType.bf16, model.lm_head.dtype);
+    try std.testing.expectEqual(quant.FloatDType.bf16, model.final_norm.dtype);
+
+    var tok: u32 = 19;
+    for (0..6) |step_idx| {
+        const pos: u32 = @intCast(step_idx);
+        const expected = try cpu_ref.step(gpa, tok, pos);
+        const got = try model.stepDecode(tok, pos);
+
+        const gpu_logits = model.readLogitsF16();
+        for (0..cfg.vocab_size) |v| {
+            const g: f32 = @floatCast(gpu_logits[v]);
+            const e: f32 = cpu_ref.logits[v];
+            try std.testing.expectApproxEqAbs(e, g, @max(0.05, @abs(e) * 0.04));
+        }
+        try std.testing.expectEqual(expected, got);
+        tok = got;
+    }
+}
+
+test "Qwen3-Dense pure FP16 and Qwen3-MoE pure BF16 match CPU fp32 reference step-for-step" {
+    const gpa = std.testing.allocator;
+
+    // 1. Pure FP16 untied dense with relaxed (% 4 == 0, non-64) hidden & intermediate dims
+    {
+        const cfg: ModelConfig = .{
+            .arch = .qwen3_dense,
+            .quant_bits = null,
+            .default_float_dtype = .f16,
+            .vocab_size = 192,
+            .hidden_size = 132,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 4,
+            .num_key_value_heads = 2,
+            .head_dim = 64,
+            .intermediate_size = 196,
+            .tie_word_embeddings = false,
+        };
+        const image = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+            .linear_dtype = .f16,
+            .embed_dtype = .f16,
+            .norm_dtype = .f16,
+            .use_weight_suffix = true,
+        }, 1600);
+        defer gpa.free(image);
+
+        var cpu_ref = try CpuTransformerRef.init(gpa, image, cfg, 32);
+        defer cpu_ref.deinit(gpa);
+
+        var model = try Qwen3Model.loadFromBytes(gpa, image, cfg, .{ .max_seq_len = 32 });
+        defer model.deinit(gpa);
+
+        var tok: u32 = 11;
+        for (0..5) |step_idx| {
+            const pos: u32 = @intCast(step_idx);
+            const expected = try cpu_ref.step(gpa, tok, pos);
+            const got = try model.stepDecode(tok, pos);
+
+            const gpu_logits = model.readLogitsF16();
+            for (0..cfg.vocab_size) |v| {
+                const g: f32 = @floatCast(gpu_logits[v]);
+                const e: f32 = cpu_ref.logits[v];
+                try std.testing.expectApproxEqAbs(e, g, @max(0.05, @abs(e) * 0.04));
+            }
+            try std.testing.expectEqual(expected, got);
+            tok = got;
+        }
+    }
+
+    // 2. Pure BF16 MoE (bf16 experts + bf16 router + bf16 norms)
+    {
+        const cfg: ModelConfig = .{
+            .arch = .qwen3_moe,
+            .quant_bits = null,
+            .default_float_dtype = .bf16,
+            .vocab_size = 192,
+            .hidden_size = 128,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 4,
+            .num_key_value_heads = 2,
+            .head_dim = 64,
+            .moe_intermediate_size = 128,
+            .num_experts = 8,
+            .num_experts_per_tok = 2,
+            .norm_topk_prob = true,
+        };
+        const image = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+            .linear_dtype = .bf16,
+            .embed_dtype = .bf16,
+            .norm_dtype = .bf16,
+            .router_dtype = .bf16,
+            .expert_dtype = .bf16,
+            .use_weight_suffix = true,
+        }, 2600);
+        defer gpa.free(image);
+
+        var cpu_ref = try CpuTransformerRef.init(gpa, image, cfg, 32);
+        defer cpu_ref.deinit(gpa);
+
+        var model = try Qwen3Model.loadFromBytes(gpa, image, cfg, .{ .max_seq_len = 32 });
+        defer model.deinit(gpa);
+
+        var tok: u32 = 23;
+        for (0..5) |step_idx| {
+            const pos: u32 = @intCast(step_idx);
+            const expected = try cpu_ref.step(gpa, tok, pos);
+            const got = try model.stepDecode(tok, pos);
+
+            const gpu_logits = model.readLogitsF16();
+            for (0..cfg.vocab_size) |v| {
+                const g: f32 = @floatCast(gpu_logits[v]);
+                const e: f32 = cpu_ref.logits[v];
+                try std.testing.expectApproxEqAbs(e, g, @max(0.05, @abs(e) * 0.04));
+            }
+            try std.testing.expectEqual(expected, got);
+            tok = got;
+        }
+    }
+}
+
+test "Qwen3-MoE mixed-precision (q3 experts + q3 router + q3 embed + bf16 norms) matches CPU fp32 reference" {
+    const gpa = std.testing.allocator;
+    // Mirrors real mlx-community/Qwen3-30B-A3B-3bit layout:
+    // q3 attention/experts/router/embed/lm_head + bf16 norms.
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .default_float_dtype = .bf16,
+        .vocab_size = 256,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 8,
+        .num_experts_per_tok = 2,
+        .norm_topk_prob = true,
+    };
+    const image = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q3_affine,
+        .embed_dtype = .q3_affine,
+        .norm_dtype = .bf16,
+        .router_dtype = .q3_affine,
+        .expert_dtype = .q3_affine,
+        .use_weight_suffix = false,
+    }, 3030);
+    defer gpa.free(image);
+
+    var cpu_ref = try CpuTransformerRef.init(gpa, image, cfg, 64);
+    defer cpu_ref.deinit(gpa);
+
+    var model = try Qwen3Model.loadFromBytes(gpa, image, cfg, .{ .max_seq_len = 64 });
+    defer model.deinit(gpa);
+
+    var tok: u32 = 41;
+    for (0..6) |step_idx| {
+        const pos: u32 = @intCast(step_idx);
+        const expected = try cpu_ref.step(gpa, tok, pos);
+        const got = try model.stepDecode(tok, pos);
+
+        const gpu_logits = model.readLogitsF16();
+        for (0..cfg.vocab_size) |v| {
+            const g: f32 = @floatCast(gpu_logits[v]);
+            const e: f32 = cpu_ref.logits[v];
+            try std.testing.expectApproxEqAbs(e, g, @max(0.05, @abs(e) * 0.04));
+        }
         try std.testing.expectEqual(expected, got);
         tok = got;
     }

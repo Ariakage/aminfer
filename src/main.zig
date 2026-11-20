@@ -10,9 +10,10 @@ const usage =
     \\commands:
     \\  probe             print the kernel, Metal and Neural Engine facts of this machine
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1 (C9, S2) and M2 (S1, G3, G4, .amf decode) benchmarks
+    \\  bench             run full M1 (C9, S2), M2 (S1, G3, G4, .amf decode) and M2.5 (FP16/BF16) benchmarks
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
+    \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
     \\  bench-decode      benchmark end-to-end greedy decode on a specific .amf + config.json
     \\                    --amf <path> --config <path> [--scale-layers N] [--prefill-tokens N]
     \\                    [--decode-steps N] [--no-verify-crc]
@@ -38,6 +39,8 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM1(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m2")) {
         try runBenchM2(arena, out);
+    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m25")) {
+        try runBenchM25(arena, out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-decode")) {
         try runBenchDecode(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "decode")) {
@@ -244,11 +247,13 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
 
     var decode_ns: u64 = 0;
     var timed_decode_steps: u64 = 0;
+    var decode_heap_delta: aminfer.vmstat.HeapDelta = std.mem.zeroes(aminfer.vmstat.HeapDelta);
     if (cli.max_tokens > 0) {
         generated[0] = next_tok;
         gen_count = 1;
         const hit_eos = (!cli.ignore_eos and cfg.eos_token_id != null and next_tok == cfg.eos_token_id.?);
         if (!hit_eos) {
+            const heap_before = try aminfer.vmstat.Snapshot.capture();
             const dec_t0 = try aminfer.vmstat.nowNs();
             while (gen_count < cli.max_tokens) {
                 next_tok = try model.stepDecode(next_tok, pos);
@@ -259,7 +264,9 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
                 if (!cli.ignore_eos and cfg.eos_token_id != null and next_tok == cfg.eos_token_id.?) break;
             }
             const dec_t1 = try aminfer.vmstat.nowNs();
+            const heap_after = try aminfer.vmstat.Snapshot.capture();
             decode_ns = dec_t1 - dec_t0;
+            decode_heap_delta = aminfer.vmstat.heapDelta(heap_before, heap_after);
         }
     }
 
@@ -282,7 +289,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         0.0;
 
     try out.print(
-        \\decode.arch                      {s} (q{d})
+        \\decode.arch                      {s} ({s})
         \\decode.layers                    {d}
         \\decode.shards                    {d}
         \\decode.wired_mib                 {d}
@@ -293,11 +300,13 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         \\decode.decode_tok_per_s          {d:.2}
         \\decode.bytes_per_tok             {d}
         \\decode.effective_gbs             {d:.2}
+        \\decode.malloc_blocks_delta       {d}
+        \\decode.malloc_bytes_delta        {d}
         \\decode.swapouts_delta            {d}
         \\decode.token_ids                 [
     , .{
         cfg.arch.label(),
-        cfg.quant_bits.bitWidth(),
+        cfg.precisionLabel(),
         cfg.num_hidden_layers,
         model.shardCount(),
         model.totalWiredBytes() >> 20,
@@ -308,6 +317,8 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         decode_tok_per_s,
         bytes_per_tok,
         effective_gbs,
+        decode_heap_delta.blocks_in_use,
+        decode_heap_delta.size_in_use,
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
     });
     for (generated[0..gen_count], 0..) |tid, idx| {
@@ -347,10 +358,18 @@ fn runBenchM2(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try report.write(out);
 }
 
+fn runBenchM25(allocator: std.mem.Allocator, out: *Io.Writer) !void {
+    var report = try aminfer.bench.runM25(allocator);
+    defer report.deinit(allocator);
+    try report.write(out);
+}
+
 fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM1(allocator, out);
     try out.flush();
     try runBenchM2(allocator, out);
+    try out.flush();
+    try runBenchM25(allocator, out);
 }
 
 fn verifyAmf(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) !void {

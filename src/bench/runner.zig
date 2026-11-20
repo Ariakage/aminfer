@@ -1069,6 +1069,8 @@ fn makePlan(
 
 /// Streams a deterministic, valid, 16 KiB-aligned `.amf` v0 file for `cfg`
 /// straight to disk with bounded (~1 MiB) scratch memory.
+/// Supports both affine-quantized (`q3`/`q4`) and native unquantized (`f16`/`bf16`)
+/// configs.
 pub fn writeSyntheticQwen3AmfFile(
     allocator: std.mem.Allocator,
     path: [:0]const u8,
@@ -1080,60 +1082,77 @@ pub fn writeSyntheticQwen3AmfFile(
     const h = cfg.hidden_size;
     const q_dim = cfg.qDim();
     const kv_dim = cfg.kvDim();
-    const q_dtype: amf.DType = if (cfg.quant_bits == .q3) .q3_affine else .q4_affine;
-    const bits_u8: u8 = cfg.quant_bits.bitWidth();
+    const is_quant = cfg.quant_bits != null;
+    const lin_dtype: amf.DType = if (cfg.quant_bits) |qb|
+        (if (qb == .q3) .q3_affine else .q4_affine)
+    else
+        (if (cfg.default_float_dtype == .f16) .f16 else .bf16);
+    const norm_dtype: amf.DType = if (is_quant) .f16 else lin_dtype;
+    const bits_u8: u8 = if (cfg.quant_bits) |qb| qb.bitWidth() else 0;
+    const gs_u16: u16 = if (is_quant) 64 else 0;
     const inv_sqrt_h = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
     const inv_sqrt_q = 1.0 / @sqrt(@as(f32, @floatFromInt(q_dim)));
-    const base_mul: f32 = if (bits_u8 == 3) 0.35 else 0.17;
+    const base_mul: f32 = switch (lin_dtype) {
+        .q3_affine => 0.35,
+        .q4_affine => 0.17,
+        .f16, .bf16 => 0.5,
+        .f32 => unreachable,
+    };
 
     var plans: std.ArrayList(StreamTensorPlan) = .empty;
     defer plans.deinit(allocator);
 
     try plans.append(allocator, makePlan(
-        "embed_tokens",
+        if (is_quant) "embed_tokens" else "embed_tokens.weight",
         .embedding,
-        q_dtype,
+        lin_dtype,
         bits_u8,
-        64,
+        gs_u16,
         amf.NO_LAYER,
         amf.NO_EXPERT,
         .{ cfg.vocab_size, h, 0, 0 },
         2,
-        if (bits_u8 == 3) 0.06 else 0.03,
+        switch (lin_dtype) {
+            .q3_affine => 0.06,
+            .q4_affine => 0.03,
+            .f16, .bf16 => 0.15,
+            .f32 => unreachable,
+        },
     ));
 
+    const suf: []const u8 = if (is_quant) "" else ".weight";
     var name_buf: [64]u8 = undefined;
     for (0..cfg.num_hidden_layers) |l_usize| {
         const l: u16 = @intCast(l_usize);
-        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable, .norm, .f16, 0, 0, l, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, 1.0));
-        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable, .dense, q_dtype, bits_u8, 64, l, amf.NO_EXPERT, .{ q_dim, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
-        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable, .dense, q_dtype, bits_u8, 64, l, amf.NO_EXPERT, .{ kv_dim, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
-        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable, .dense, q_dtype, bits_u8, 64, l, amf.NO_EXPERT, .{ kv_dim, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
-        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable, .dense, q_dtype, bits_u8, 64, l, amf.NO_EXPERT, .{ h, q_dim, 0, 0 }, 2, base_mul * inv_sqrt_q));
-        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable, .norm, .f16, 0, 0, l, amf.NO_EXPERT, .{ cfg.head_dim, 0, 0, 0 }, 1, 1.0));
-        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable, .norm, .f16, 0, 0, l, amf.NO_EXPERT, .{ cfg.head_dim, 0, 0, 0 }, 1, 1.0));
-        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable, .norm, .f16, 0, 0, l, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, 1.0));
+        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable, .norm, norm_dtype, 0, 0, l, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, 1.0));
+        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj{s}", .{ l, suf }) catch unreachable, .dense, lin_dtype, bits_u8, gs_u16, l, amf.NO_EXPERT, .{ q_dim, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
+        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj{s}", .{ l, suf }) catch unreachable, .dense, lin_dtype, bits_u8, gs_u16, l, amf.NO_EXPERT, .{ kv_dim, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
+        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj{s}", .{ l, suf }) catch unreachable, .dense, lin_dtype, bits_u8, gs_u16, l, amf.NO_EXPERT, .{ kv_dim, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
+        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj{s}", .{ l, suf }) catch unreachable, .dense, lin_dtype, bits_u8, gs_u16, l, amf.NO_EXPERT, .{ h, q_dim, 0, 0 }, 2, base_mul * inv_sqrt_q));
+        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable, .norm, norm_dtype, 0, 0, l, amf.NO_EXPERT, .{ cfg.head_dim, 0, 0, 0 }, 1, 1.0));
+        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable, .norm, norm_dtype, 0, 0, l, amf.NO_EXPERT, .{ cfg.head_dim, 0, 0, 0 }, 1, 1.0));
+        try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable, .norm, norm_dtype, 0, 0, l, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, 1.0));
 
         if (cfg.arch == .qwen3_moe) {
-            try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate.weight", .{l}) catch unreachable, .router, .f16, 0, 0, l, amf.NO_EXPERT, .{ cfg.num_experts, h, 0, 0 }, 2, 0.5 * inv_sqrt_h));
+            try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate.weight", .{l}) catch unreachable, .router, norm_dtype, 0, 0, l, amf.NO_EXPERT, .{ cfg.num_experts, h, 0, 0 }, 2, 0.5 * inv_sqrt_h));
             const inv_sqrt_mi = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.moe_intermediate_size)));
             for (0..cfg.num_experts) |e_usize| {
                 const e: u16 = @intCast(e_usize);
-                try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable, .hot_expert, q_dtype, bits_u8, 64, l, e, .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
-                try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable, .hot_expert, q_dtype, bits_u8, 64, l, e, .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
-                try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable, .hot_expert, q_dtype, bits_u8, 64, l, e, .{ h, cfg.moe_intermediate_size, 0, 0 }, 2, base_mul * inv_sqrt_mi));
+                try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj{s}", .{ l, e, suf }) catch unreachable, .hot_expert, lin_dtype, bits_u8, gs_u16, l, e, .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
+                try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj{s}", .{ l, e, suf }) catch unreachable, .hot_expert, lin_dtype, bits_u8, gs_u16, l, e, .{ cfg.moe_intermediate_size, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
+                try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj{s}", .{ l, e, suf }) catch unreachable, .hot_expert, lin_dtype, bits_u8, gs_u16, l, e, .{ h, cfg.moe_intermediate_size, 0, 0 }, 2, base_mul * inv_sqrt_mi));
             }
         } else {
             const inv_sqrt_di = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.intermediate_size)));
-            try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable, .dense, q_dtype, bits_u8, 64, l, amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
-            try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable, .dense, q_dtype, bits_u8, 64, l, amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
-            try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable, .dense, q_dtype, bits_u8, 64, l, amf.NO_EXPERT, .{ h, cfg.intermediate_size, 0, 0 }, 2, base_mul * inv_sqrt_di));
+            try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj{s}", .{ l, suf }) catch unreachable, .dense, lin_dtype, bits_u8, gs_u16, l, amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
+            try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj{s}", .{ l, suf }) catch unreachable, .dense, lin_dtype, bits_u8, gs_u16, l, amf.NO_EXPERT, .{ cfg.intermediate_size, h, 0, 0 }, 2, base_mul * inv_sqrt_h));
+            try plans.append(allocator, makePlan(std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj{s}", .{ l, suf }) catch unreachable, .dense, lin_dtype, bits_u8, gs_u16, l, amf.NO_EXPERT, .{ h, cfg.intermediate_size, 0, 0 }, 2, base_mul * inv_sqrt_di));
         }
     }
 
-    try plans.append(allocator, makePlan("norm.weight", .norm, .f16, 0, 0, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, 1.0));
+    try plans.append(allocator, makePlan("norm.weight", .norm, norm_dtype, 0, 0, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, 1.0));
     if (!cfg.tie_word_embeddings) {
-        try plans.append(allocator, makePlan("lm_head", .lm_head, q_dtype, bits_u8, 64, amf.NO_LAYER, amf.NO_EXPERT, .{ cfg.vocab_size, h, 0, 0 }, 2, 0.45 * base_mul * inv_sqrt_h));
+        try plans.append(allocator, makePlan(if (is_quant) "lm_head" else "lm_head.weight", .lm_head, lin_dtype, bits_u8, gs_u16, amf.NO_LAYER, amf.NO_EXPERT, .{ cfg.vocab_size, h, 0, 0 }, 2, 0.45 * base_mul * inv_sqrt_h));
     }
 
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
@@ -1258,29 +1277,30 @@ pub fn writeSyntheticQwen3AmfFile(
         } else {
             var elems: usize = 1;
             for (0..p.rank) |d| elems *= p.shape[d];
-            data_bytes = elems * @sizeOf(f16);
+            data_bytes = elems * @sizeOf(u16);
             blob_bytes = try page.alignUp(@intCast(data_bytes));
 
-            var f16_table: [257]f16 = undefined;
-            for (&f16_table) |*v| {
+            const float_dt: quant.FloatDType = if (p.dtype == .bf16) .bf16 else .f16;
+            var u16_table: [257]u16 = undefined;
+            for (&u16_table) |*v| {
                 rng ^= rng << 13;
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
                 const u = @as(f32, @floatFromInt(rng & 0xFFFF)) / 65535.0;
                 const f = if (p.kind == .norm) (0.95 + 0.1 * u) else ((u * 2.0 - 1.0) * p.scale_hint);
-                v.* = @floatCast(f);
+                v.* = quant.f32ToFloatBits(float_dt, f);
             }
-            const f16_chunk: []f16 = @alignCast(std.mem.bytesAsSlice(f16, chunk_buf));
+            const u16_chunk: []u16 = @alignCast(std.mem.bytesAsSlice(u16, chunk_buf));
             var rem_elems = elems;
             var phase: usize = 0;
             while (rem_elems > 0) {
-                const take_elems = @min(rem_elems, f16_chunk.len);
+                const take_elems = @min(rem_elems, u16_chunk.len);
                 for (0..take_elems) |i| {
-                    f16_chunk[i] = f16_table[phase];
+                    u16_chunk[i] = u16_table[phase];
                     phase += 1;
-                    if (phase == f16_table.len) phase = 0;
+                    if (phase == u16_table.len) phase = 0;
                 }
-                const bytes_slice = std.mem.sliceAsBytes(f16_chunk[0..take_elems]);
+                const bytes_slice = std.mem.sliceAsBytes(u16_chunk[0..take_elems]);
                 try writeAllFd(fd, bytes_slice);
                 hasher.update(bytes_slice);
                 rem_elems -= take_elems;
@@ -1367,7 +1387,8 @@ pub const DecodeBenchResult = struct {
     label_buf: [64]u8,
     label_len: usize,
     arch: qwen3.ModelArch,
-    quant_bits: quant.QuantBits,
+    quant_bits: ?quant.QuantBits,
+    default_float_dtype: quant.FloatDType = .bf16,
     measured_layers: u32,
     scale_layers: u32,
     seq_len: u32,
@@ -1385,6 +1406,19 @@ pub const DecodeBenchResult = struct {
 
     pub fn label(self: *const DecodeBenchResult) []const u8 {
         return self.label_buf[0..self.label_len];
+    }
+
+    pub fn precisionLabel(self: DecodeBenchResult) []const u8 {
+        if (self.quant_bits) |qb| {
+            return switch (qb) {
+                .q3 => "q3",
+                .q4 => "q4",
+            };
+        }
+        return switch (self.default_float_dtype) {
+            .f16 => "f16",
+            .bf16 => "bf16",
+        };
     }
 
     pub fn measuredMsPerTok(self: DecodeBenchResult) f64 {
@@ -1432,7 +1466,7 @@ pub const DecodeBenchResult = struct {
     pub fn write(self: *const DecodeBenchResult, out: *std.Io.Writer) std.Io.Writer.Error!void {
         try out.print(
             \\decode_bench.target              {s}
-            \\decode_bench.arch                {s} (q{d})
+            \\decode_bench.arch                {s} ({s})
             \\decode_bench.seq_len             {d}
             \\decode_bench.shards              {d}
             \\decode_bench.wired_mib           {d}
@@ -1457,7 +1491,7 @@ pub const DecodeBenchResult = struct {
         , .{
             self.label(),
             self.arch.label(),
-            self.quant_bits.bitWidth(),
+            self.precisionLabel(),
             self.seq_len,
             self.shard_count,
             self.wired_bytes >> 20,
@@ -1551,6 +1585,7 @@ pub fn runDecodeBenchFromFile(
         .label_len = copy_len,
         .arch = cfg.arch,
         .quant_bits = cfg.quant_bits,
+        .default_float_dtype = cfg.default_float_dtype,
         .measured_layers = cfg.num_hidden_layers,
         .scale_layers = opts.scale_layers,
         .seq_len = seq_len,
@@ -1611,6 +1646,17 @@ pub const M2Report = struct {
 
 pub const M2BenchError = attention.BenchError || MoeBenchError || DecodeBenchError;
 
+fn tempDirPrefix() []const u8 {
+    if (std.c.getenv("TMPDIR")) |raw| {
+        var slice: []const u8 = std.mem.sliceTo(raw, 0);
+        while (slice.len > 1 and slice[slice.len - 1] == '/') {
+            slice = slice[0 .. slice.len - 1];
+        }
+        if (slice.len > 0) return slice;
+    }
+    return "/tmp";
+}
+
 /// Runs the complete M2 benchmark suite: Spike S1, G3 MoE deduplicated FFN,
 /// G4 GQA KV-tile decode attention, and end-to-end `.amf` greedy decode on
 /// real 4-layer Qwen3-30B-A3B-3bit (scaled to 48L) and Qwen3-14B-4bit (scaled to 40L).
@@ -1624,8 +1670,9 @@ pub fn runM2(allocator: std.mem.Allocator) M2BenchError!M2Report {
     errdefer g4.deinit(allocator);
 
     const pid = std.c.getpid();
-    var moe_path_buf: [128]u8 = undefined;
-    const moe_raw = std.fmt.bufPrint(moe_path_buf[0 .. moe_path_buf.len - 1], "/tmp/aminfer-m2-moe-{d}.amf", .{pid}) catch unreachable;
+    const tmp_dir = tempDirPrefix();
+    var moe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const moe_raw = std.fmt.bufPrint(moe_path_buf[0 .. moe_path_buf.len - 1], "{s}/aminfer-m2-moe-{d}.amf", .{ tmp_dir, pid }) catch unreachable;
     moe_path_buf[moe_raw.len] = 0;
     const moe_path: [:0]const u8 = moe_path_buf[0..moe_raw.len :0];
 
@@ -1655,8 +1702,8 @@ pub fn runM2(allocator: std.mem.Allocator) M2BenchError!M2Report {
         .verify_crcs = true,
     });
 
-    var dense_path_buf: [128]u8 = undefined;
-    const dense_raw = std.fmt.bufPrint(dense_path_buf[0 .. dense_path_buf.len - 1], "/tmp/aminfer-m2-dense-{d}.amf", .{pid}) catch unreachable;
+    var dense_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dense_raw = std.fmt.bufPrint(dense_path_buf[0 .. dense_path_buf.len - 1], "{s}/aminfer-m2-dense-{d}.amf", .{ tmp_dir, pid }) catch unreachable;
     dense_path_buf[dense_raw.len] = 0;
     const dense_path: [:0]const u8 = dense_path_buf[0..dense_raw.len :0];
 
@@ -1692,6 +1739,493 @@ pub fn runM2(allocator: std.mem.Allocator) M2BenchError!M2Report {
         .g4 = g4,
         .decode_moe = decode_moe,
         .decode_dense = decode_dense,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// M2.5 Native FP16 / BF16 GEMV & GEMM Bandwidth Calibration + BF16 Decode
+// ---------------------------------------------------------------------------
+
+pub const DenseKernelKind = enum {
+    gemv_f16,
+    gemv_bf16,
+    gemm_f16,
+    gemm_bf16,
+
+    pub fn floatDType(self: DenseKernelKind) quant.FloatDType {
+        return switch (self) {
+            .gemv_f16, .gemm_f16 => .f16,
+            .gemv_bf16, .gemm_bf16 => .bf16,
+        };
+    }
+
+    pub fn isGemv(self: DenseKernelKind) bool {
+        return switch (self) {
+            .gemv_f16, .gemv_bf16 => true,
+            .gemm_f16, .gemm_bf16 => false,
+        };
+    }
+
+    pub fn label(self: DenseKernelKind) []const u8 {
+        return switch (self) {
+            .gemv_f16 => "gemv_f16",
+            .gemv_bf16 => "gemv_bf16",
+            .gemm_f16 => "gemm_f16",
+            .gemm_bf16 => "gemm_bf16",
+        };
+    }
+};
+
+pub const DenseCase = struct {
+    kind: DenseKernelKind,
+    m: u32,
+    n: u32,
+    k: u32,
+};
+
+pub const DEFAULT_M25_CASES = [_]DenseCase{
+    // M=1 decode GEMV calibration (f16)
+    .{ .kind = .gemv_f16, .m = 1, .n = 2048, .k = 2048 },
+    .{ .kind = .gemv_f16, .m = 1, .n = 6144, .k = 2048 },
+    .{ .kind = .gemv_f16, .m = 1, .n = 2048, .k = 768 },
+    .{ .kind = .gemv_f16, .m = 1, .n = 4096, .k = 4096 },
+    // M=1 decode GEMV calibration (bf16)
+    .{ .kind = .gemv_bf16, .m = 1, .n = 2048, .k = 2048 },
+    .{ .kind = .gemv_bf16, .m = 1, .n = 6144, .k = 2048 },
+    .{ .kind = .gemv_bf16, .m = 1, .n = 2048, .k = 768 },
+    .{ .kind = .gemv_bf16, .m = 1, .n = 4096, .k = 4096 },
+    // M=16 and M=64 speculative/prefill GEMM calibration (f16)
+    .{ .kind = .gemm_f16, .m = 16, .n = 2048, .k = 2048 },
+    .{ .kind = .gemm_f16, .m = 16, .n = 4096, .k = 4096 },
+    .{ .kind = .gemm_f16, .m = 64, .n = 2048, .k = 2048 },
+    .{ .kind = .gemm_f16, .m = 64, .n = 4096, .k = 4096 },
+    // M=16 and M=64 speculative/prefill GEMM calibration (bf16)
+    .{ .kind = .gemm_bf16, .m = 16, .n = 2048, .k = 2048 },
+    .{ .kind = .gemm_bf16, .m = 16, .n = 4096, .k = 4096 },
+    .{ .kind = .gemm_bf16, .m = 64, .n = 2048, .k = 2048 },
+    .{ .kind = .gemm_bf16, .m = 64, .n = 4096, .k = 4096 },
+};
+
+pub const DenseBenchConfig = struct {
+    cases: []const DenseCase = &DEFAULT_M25_CASES,
+    /// Rotating weight pool size (>= 64 MiB per shape so even 32 MiB 4096x4096
+    /// matrices rotate past M4 L2/SLC). Set to 0 in unit smoke tests.
+    min_working_set_bytes: usize = 96 * 1024 * 1024,
+    dvfs_warmup_batches: u32 = 16,
+    warmup_batches: u32 = 4,
+    gemv_timed_batches: u32 = 8,
+    gemv_dispatches_per_batch: u32 = 16,
+    gemm_timed_batches: u32 = 4,
+    gemm_dispatches_per_batch: u32 = 16,
+    timeout_ms: u64 = 30_000,
+};
+
+pub const DenseCaseResult = struct {
+    case: DenseCase,
+    bytes_per_dispatch: u64,
+    dispatches: u64,
+    weight_slots: usize,
+    elapsed_ns: u64,
+
+    pub fn latencyUs(self: DenseCaseResult) f64 {
+        if (self.dispatches == 0) return 0.0;
+        return (@as(f64, @floatFromInt(self.elapsed_ns)) / @as(f64, @floatFromInt(self.dispatches))) / 1000.0;
+    }
+
+    pub fn effectiveBandwidthGbs(self: DenseCaseResult) f64 {
+        if (self.elapsed_ns == 0) return 0.0;
+        const total_bytes = @as(f64, @floatFromInt(self.bytes_per_dispatch)) * @as(f64, @floatFromInt(self.dispatches));
+        return total_bytes / @as(f64, @floatFromInt(self.elapsed_ns));
+    }
+
+    pub fn busUtilizationPct(self: DenseCaseResult) f64 {
+        return (self.effectiveBandwidthGbs() / M4_BUS_BANDWIDTH_GBS) * 100.0;
+    }
+
+    pub fn effectiveTflops(self: DenseCaseResult) f64 {
+        if (self.elapsed_ns == 0) return 0.0;
+        const flops = 2.0 * @as(f64, @floatFromInt(self.case.m)) *
+            @as(f64, @floatFromInt(self.case.n)) *
+            @as(f64, @floatFromInt(self.case.k)) *
+            @as(f64, @floatFromInt(self.dispatches));
+        // flops / elapsed_ns = GFLOP/s; divide by 1000 for TFLOP/s.
+        return (flops / @as(f64, @floatFromInt(self.elapsed_ns))) / 1000.0;
+    }
+};
+
+pub const DenseBenchReport = struct {
+    wired_budget_bytes: u64,
+    arena_bytes: u64,
+    results: []DenseCaseResult,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn deinit(self: *DenseBenchReport, allocator: std.mem.Allocator) void {
+        allocator.free(self.results);
+        self.results = &.{};
+    }
+
+    pub fn write(self: *const DenseBenchReport, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\M2.5 Native FP16 / BF16 GEMV & GEMM Bandwidth Calibration
+            \\m25.wired_budget_mib             {d}
+            \\m25.arena_mib                    {d}
+            \\kernel     shape              bytes/disp   slots   latency(us)   beta(GB/s)   bus(%)   tflops
+            \\
+        , .{
+            self.wired_budget_bytes >> 20,
+            self.arena_bytes >> 20,
+        });
+        for (self.results) |res| {
+            var shape_buf: [40]u8 = undefined;
+            const shape = std.fmt.bufPrint(&shape_buf, "{d}x{d}x{d}", .{
+                res.case.m,
+                res.case.n,
+                res.case.k,
+            }) catch unreachable;
+            try out.print(
+                \\{s: <10} {s: <18} {d: >10}   {d: >5}   {d: >11.2}   {d: >10.2}   {d: >6.1}   {d: >6.3}
+                \\
+            , .{
+                res.case.kind.label(),
+                shape,
+                res.bytes_per_dispatch,
+                res.weight_slots,
+                res.latencyUs(),
+                res.effectiveBandwidthGbs(),
+                res.busUtilizationPct(),
+                res.effectiveTflops(),
+            });
+        }
+        try out.print(
+            \\m25.dense.swapouts_delta         {d}
+            \\m25.dense.pageouts_delta         {d}
+            \\
+        , .{
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+const DenseCaseLayout = struct {
+    w_bytes: usize,
+    x_bytes: usize,
+    y_bytes: usize,
+    bytes_per_dispatch: u64,
+};
+
+fn computeDenseCaseLayout(case: DenseCase) (quant.ShapeError || error{InvalidConfig})!DenseCaseLayout {
+    if (case.m == 0 or case.n == 0 or case.k == 0) return error.ZeroDimension;
+    if (case.kind.isGemv() and case.m != 1) return error.InvalidConfig;
+
+    const w_elems = std.math.mul(usize, case.n, case.k) catch return error.Overflow;
+    const w_bytes = std.math.mul(usize, w_elems, @sizeOf(u16)) catch return error.Overflow;
+    const x_elems = std.math.mul(usize, case.m, case.k) catch return error.Overflow;
+    const x_bytes = std.math.mul(usize, x_elems, @sizeOf(f16)) catch return error.Overflow;
+    const y_elems = std.math.mul(usize, case.m, case.n) catch return error.Overflow;
+    const y_bytes = std.math.mul(usize, y_elems, @sizeOf(f16)) catch return error.Overflow;
+
+    const wx = std.math.add(u64, w_bytes, x_bytes) catch return error.Overflow;
+    const total = std.math.add(u64, wx, y_bytes) catch return error.Overflow;
+    return .{
+        .w_bytes = w_bytes,
+        .x_bytes = x_bytes,
+        .y_bytes = y_bytes,
+        .bytes_per_dispatch = total,
+    };
+}
+
+/// Computes the algorithmic minimum bytes transferred per native FP16/BF16 dispatch
+/// (`weight + x + y`).
+pub fn denseBytesMovedPerDispatch(case: DenseCase) (quant.ShapeError || error{InvalidConfig})!u64 {
+    return (try computeDenseCaseLayout(case)).bytes_per_dispatch;
+}
+
+fn fillDenseWeightPool(weight_pool: []u8, dtype: quant.FloatDType) void {
+    var table: [257]u16 = undefined;
+    var state: u64 = 0xD1B5_4A32_D192_ED03 ^ @as(u64, @backingInt(dtype));
+    for (&table) |*v| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        const u = @as(f32, @floatFromInt(state & 0xFFFF)) / 65535.0;
+        const f = (u * 2.0 - 1.0) * 0.03125;
+        v.* = quant.f32ToFloatBits(dtype, f);
+    }
+    const words: []u16 = @alignCast(std.mem.bytesAsSlice(u16, weight_pool));
+    var phase: usize = 0;
+    for (words) |*w| {
+        w.* = table[phase];
+        phase += 1;
+        if (phase == table.len) phase = 0;
+    }
+}
+
+/// Executes M2.5 native FP16 / BF16 GEMV and GEMM bandwidth calibration over a
+/// single `Budget`-checked, zero-copy `WiredArena`, enforcing zero swapouts.
+pub fn runDenseBench(allocator: std.mem.Allocator, config: DenseBenchConfig) Error!DenseBenchReport {
+    if (config.gemv_timed_batches == 0 or
+        config.gemv_dispatches_per_batch == 0 or
+        config.gemv_dispatches_per_batch > MAX_DISPATCHES_PER_FRAME or
+        config.gemm_timed_batches == 0 or
+        config.gemm_dispatches_per_batch == 0 or
+        config.gemm_dispatches_per_batch > MAX_DISPATCHES_PER_FRAME)
+    {
+        return error.InvalidConfig;
+    }
+
+    var max_w_stride: usize = 64;
+    var max_x_bytes: usize = 64;
+    var max_y_bytes: usize = 64;
+    for (config.cases) |case| {
+        const layout = try computeDenseCaseLayout(case);
+        max_w_stride = @max(max_w_stride, amf.align64(layout.w_bytes));
+        max_x_bytes = @max(max_x_bytes, amf.align64(layout.x_bytes));
+        max_y_bytes = @max(max_y_bytes, amf.align64(layout.y_bytes));
+    }
+
+    const weight_pool_bytes = amf.align64(@max(max_w_stride, config.min_working_set_bytes));
+    const raw_arena_bytes = weight_pool_bytes + max_x_bytes + max_y_bytes + 4 * page.APPLE_PAGE_SIZE;
+    const arena_bytes = try page.alignUp(raw_arena_bytes);
+
+    const facts = try sysinfo.Facts.read();
+    const device = try metal.Device.open();
+    defer device.close();
+    const info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, info, .{});
+
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try dequant.DequantPipelines.init(device, library);
+    defer pipes.close();
+
+    const results = try allocator.alloc(DenseCaseResult, config.cases.len);
+    errdefer allocator.free(results);
+
+    const vm_before = try vmstat.Snapshot.capture();
+
+    var arena = try arena_mod.WiredArena.init(arena_bytes, wired_budget);
+    defer arena.deinit();
+
+    const weight_pool = try arena.allocAligned(weight_pool_bytes, 64);
+    const x_raw = try arena.allocAligned(max_x_bytes, 64);
+    const y_raw = try arena.allocAligned(max_y_bytes, 64);
+
+    const x_table = [_]f16{
+        @floatCast(0.03125),
+        @floatCast(-0.015625),
+        @floatCast(0.046875),
+        @floatCast(-0.03125),
+        @floatCast(0.015625),
+        @floatCast(-0.046875),
+        @floatCast(0.0625),
+        @floatCast(-0.0625),
+    };
+    const x_slice: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    for (x_slice, 0..) |*v, i| v.* = x_table[i & 7];
+    @memset(y_raw, 0);
+
+    const w_base_off: u64 = arena.offsetOf(weight_pool.ptr);
+    const x_off: u64 = arena.offsetOf(x_raw.ptr);
+    const y_off: u64 = arena.offsetOf(y_raw.ptr);
+    const y_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, y_raw));
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    var filled_dtype: ?quant.FloatDType = null;
+    for (config.cases, 0..) |case, case_idx| {
+        const dt = case.kind.floatDType();
+        if (filled_dtype != dt) {
+            fillDenseWeightPool(weight_pool, dt);
+            filled_dtype = dt;
+        }
+        const layout = try computeDenseCaseLayout(case);
+        const w_stride = amf.align64(layout.w_bytes);
+        const num_slots: usize = @max(@as(usize, 1), weight_pool_bytes / w_stride);
+
+        const timed_batches = if (case.kind.isGemv()) config.gemv_timed_batches else config.gemm_timed_batches;
+        const dispatches_per_batch = if (case.kind.isGemv()) config.gemv_dispatches_per_batch else config.gemm_dispatches_per_batch;
+
+        var slot_cursor: usize = 0;
+        const warmups = config.warmup_batches + if (case_idx == 0) config.dvfs_warmup_batches else 0;
+        var warmup_sig: u64 = 0;
+        for (0..warmups) |_| {
+            var frame = try compute.beginFrame(config.timeout_ms);
+            errdefer frame.abort();
+            for (0..dispatches_per_batch) |d| {
+                const slot = slot_cursor % num_slots;
+                slot_cursor += 1;
+                const w_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = w_base_off + @as(u64, slot) * w_stride };
+                if (case.kind.isGemv()) {
+                    try pipes.encodeDenseGemv(&frame, dt, .{
+                        .x = .{ .buffer = gpu_buf, .offset = x_off },
+                        .weight = w_bind,
+                        .y = .{ .buffer = gpu_buf, .offset = y_off },
+                        .n = case.n,
+                        .k = case.k,
+                    }, d > 0);
+                } else {
+                    try pipes.encodeDenseGemm(&frame, dt, .{
+                        .x = .{ .buffer = gpu_buf, .offset = x_off },
+                        .weight = w_bind,
+                        .y = .{ .buffer = gpu_buf, .offset = y_off },
+                        .m = case.m,
+                        .n = case.n,
+                        .k = case.k,
+                    }, d > 0);
+                }
+            }
+            warmup_sig = try frame.commit();
+        }
+        if (warmup_sig != 0) try compute.wait(warmup_sig, config.timeout_ms);
+
+        var last_sig: u64 = 0;
+        const t0 = try vmstat.nowNs();
+        for (0..timed_batches) |_| {
+            var frame = try compute.beginFrame(config.timeout_ms);
+            errdefer frame.abort();
+            for (0..dispatches_per_batch) |d| {
+                const slot = slot_cursor % num_slots;
+                slot_cursor += 1;
+                const w_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = w_base_off + @as(u64, slot) * w_stride };
+                if (case.kind.isGemv()) {
+                    try pipes.encodeDenseGemv(&frame, dt, .{
+                        .x = .{ .buffer = gpu_buf, .offset = x_off },
+                        .weight = w_bind,
+                        .y = .{ .buffer = gpu_buf, .offset = y_off },
+                        .n = case.n,
+                        .k = case.k,
+                    }, d > 0);
+                } else {
+                    try pipes.encodeDenseGemm(&frame, dt, .{
+                        .x = .{ .buffer = gpu_buf, .offset = x_off },
+                        .weight = w_bind,
+                        .y = .{ .buffer = gpu_buf, .offset = y_off },
+                        .m = case.m,
+                        .n = case.n,
+                        .k = case.k,
+                    }, d > 0);
+                }
+            }
+            last_sig = try frame.commit();
+        }
+        try compute.wait(last_sig, config.timeout_ms);
+        const t1 = try vmstat.nowNs();
+
+        const y_count: usize = @as(usize, case.m) * case.n;
+        if (!std.math.isFinite(y_f16[0]) or !std.math.isFinite(y_f16[y_count - 1])) {
+            return error.NonFiniteOutput;
+        }
+
+        results[case_idx] = .{
+            .case = case,
+            .bytes_per_dispatch = layout.bytes_per_dispatch,
+            .dispatches = @as(u64, timed_batches) * dispatches_per_batch,
+            .weight_slots = num_slots,
+            .elapsed_ns = t1 - t0,
+        };
+    }
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .wired_budget_bytes = wired_budget.limit_bytes,
+        .arena_bytes = arena.capacity(),
+        .results = results,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub const M25Report = struct {
+    dense: DenseBenchReport,
+    decode_bf16: DecodeBenchResult,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn deinit(self: *M25Report, allocator: std.mem.Allocator) void {
+        self.dense.deinit(allocator);
+    }
+
+    pub fn write(self: *const M25Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.writeAll("\n");
+        try self.dense.write(out);
+        try out.writeAll("\nM2.5 Synthetic BF16 End-to-End Greedy Decode from .amf (Qwen3-0.6B Geometry)\n");
+        try self.decode_bf16.write(out);
+        try out.print(
+            \\
+            \\M2.5 Overall Swap Check
+            \\m25.swap.status                  ok
+            \\m25.swap.swapouts_delta          {d}
+            \\m25.swap.pageouts_delta          {d}
+            \\m25.swap.used_mib                {d}
+            \\
+        , .{
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+            self.vm_after.swap_used_bytes >> 20,
+        });
+    }
+};
+
+pub const M25BenchError = Error || DecodeBenchError;
+
+/// Runs the M2.5 benchmark suite: native FP16 / BF16 GEMV & GEMM bandwidth
+/// calibration across C9 shapes + synthetic BF16 end-to-end `.amf` greedy decode
+/// (Qwen3-0.6B geometry, `tie_word_embeddings = true`, 4L scaled to 28L).
+pub fn runM25(allocator: std.mem.Allocator) M25BenchError!M25Report {
+    const vm_before = try vmstat.Snapshot.capture();
+
+    var dense = try runDenseBench(allocator, .{});
+    errdefer dense.deinit(allocator);
+
+    const pid = std.c.getpid();
+    const tmp_dir = tempDirPrefix();
+    var bf16_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const bf16_raw = std.fmt.bufPrint(bf16_path_buf[0 .. bf16_path_buf.len - 1], "{s}/aminfer-m25-bf16-{d}.amf", .{ tmp_dir, pid }) catch unreachable;
+    bf16_path_buf[bf16_raw.len] = 0;
+    const bf16_path: [:0]const u8 = bf16_path_buf[0..bf16_raw.len :0];
+
+    const bf16_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 151936,
+        .hidden_size = 1024,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 16,
+        .num_key_value_heads = 8,
+        .head_dim = 128,
+        .intermediate_size = 3072,
+        .tie_word_embeddings = true,
+    };
+    try writeSyntheticQwen3AmfFile(allocator, bf16_path, bf16_cfg, 6);
+    defer _ = std.c.unlink(bf16_path.ptr);
+    const decode_bf16 = try runDecodeBenchFromFile(allocator, bf16_path, bf16_cfg, .{
+        .label = "qwen3-0.6b-bf16-synth",
+        .scale_layers = 28,
+        .prefill_tokens = 511,
+        .warmup_steps = 4,
+        .decode_steps = 16,
+        .max_seq_len = 576,
+        .verify_crcs = true,
+    });
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .dense = dense,
+        .decode_bf16 = decode_bf16,
         .vm_before = vm_before,
         .vm_after = vm_after,
     };
@@ -1878,4 +2412,93 @@ test "runDecodeBenchFromFile measures real .amf greedy decode and linear layer s
     try std.testing.expect(res.measured_bytes_per_tok > 0);
     try std.testing.expect(res.extrapolated_bytes_per_tok > res.measured_bytes_per_tok);
     try std.testing.expectEqual(@as(u64, 0), res.swapouts_delta);
+}
+
+test "denseBytesMovedPerDispatch and DEFAULT_M25_CASES cover all 16 FP16/BF16 shapes" {
+    try std.testing.expectEqual(@as(usize, 16), DEFAULT_M25_CASES.len);
+    // f16 (2048, 2048), M=1: w=2048*2048*2=8388608, x=4096, y=4096
+    const f16_gemv = try denseBytesMovedPerDispatch(.{ .kind = .gemv_f16, .m = 1, .n = 2048, .k = 2048 });
+    try std.testing.expectEqual(@as(u64, 8_388_608 + 4096 + 4096), f16_gemv);
+
+    // bf16 (4096, 4096), M=16: w=33554432, x=131072, y=131072
+    const bf16_gemm = try denseBytesMovedPerDispatch(.{ .kind = .gemm_bf16, .m = 16, .n = 4096, .k = 4096 });
+    try std.testing.expectEqual(@as(u64, 33_554_432 + 131_072 + 131_072), bf16_gemm);
+
+    for (DEFAULT_M25_CASES) |case| {
+        const bytes = try denseBytesMovedPerDispatch(case);
+        try std.testing.expect(bytes > 0);
+    }
+    try std.testing.expectError(error.InvalidConfig, denseBytesMovedPerDispatch(.{ .kind = .gemv_bf16, .m = 2, .n = 64, .k = 64 }));
+    try std.testing.expectError(error.ZeroDimension, denseBytesMovedPerDispatch(.{ .kind = .gemm_f16, .m = 0, .n = 64, .k = 64 }));
+}
+
+test "runDenseBench and synthetic BF16 decode smoke test exercise M2.5 pipelines without swap" {
+    const gpa = std.testing.allocator;
+    const smoke_cases = [_]DenseCase{
+        .{ .kind = .gemv_f16, .m = 1, .n = 64, .k = 128 },
+        .{ .kind = .gemv_bf16, .m = 1, .n = 64, .k = 128 },
+        .{ .kind = .gemm_f16, .m = 16, .n = 64, .k = 128 },
+        .{ .kind = .gemm_bf16, .m = 16, .n = 64, .k = 128 },
+    };
+    var report = try runDenseBench(gpa, .{
+        .cases = &smoke_cases,
+        .min_working_set_bytes = 0,
+        .dvfs_warmup_batches = 0,
+        .warmup_batches = 1,
+        .gemv_timed_batches = 1,
+        .gemv_dispatches_per_batch = 4,
+        .gemm_timed_batches = 1,
+        .gemm_dispatches_per_batch = 2,
+        .timeout_ms = 5000,
+    });
+    defer report.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, smoke_cases.len), report.results.len);
+    for (report.results) |res| {
+        try std.testing.expect(res.elapsed_ns > 0);
+        try std.testing.expect(res.effectiveBandwidthGbs() > 0.0);
+        try std.testing.expect(res.effectiveTflops() > 0.0);
+    }
+    try vmstat.checkNoSwap(report.vm_before, report.vm_after);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "gemv_bf16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "gemm_f16") != null);
+
+    // Synthetic BF16 tied-embedding Qwen3 decode bench round-trip
+    const bf16_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 256,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 384,
+        .tie_word_embeddings = true,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const raw_path = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], ".zig-cache/tmp/{s}/tiny_bf16.amf", .{tmp.sub_path});
+    path_buf[raw_path.len] = 0;
+    const amf_path: [:0]const u8 = path_buf[0..raw_path.len :0];
+
+    try writeSyntheticQwen3AmfFile(gpa, amf_path, bf16_cfg, 600);
+    const dec = try runDecodeBenchFromFile(gpa, amf_path, bf16_cfg, .{
+        .label = "tiny-bf16",
+        .scale_layers = 28,
+        .prefill_tokens = 4,
+        .warmup_steps = 1,
+        .decode_steps = 4,
+        .max_seq_len = 32,
+        .verify_crcs = true,
+    });
+    try std.testing.expectEqualStrings("bf16", dec.precisionLabel());
+    try std.testing.expect(dec.measuredMsPerTok() > 0.0);
+    try std.testing.expectEqual(@as(u64, 0), dec.swapouts_delta);
 }
