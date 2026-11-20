@@ -32,6 +32,7 @@ items. ADRs record decisions, not capability status — that lives in
 | [0012](0012-wired-memory-budget-headroom.md) | Wired memory budget with headroom | Accepted | 2026-11-20 |
 | [0013](0013-eagle-tree-and-head-formats.md) | EAGLE-2 draft trees with EAGLE-3 / EAGLE-2 heads, MTP and small drafts | Accepted | 2026-11-20 |
 | [0014](0014-compile-time-specialization.md) | Compile-time specialization of hot code | Accepted | 2026-11-20 |
+| [0015](0015-tiered-frontier-model-roadmap.md) | Tiered frontier model roadmap (`Qwen3.8-Flash-Next` and `DeepSeek-V4.1-Flash-1017`) | Accepted | 2026-11-20 |
 
 ## Template
 

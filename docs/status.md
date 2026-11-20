@@ -17,7 +17,7 @@ Last updated: 2026-11-20.
 | **Undecided** | Open question; the options are listed in the referenced document. |
 | **Future** | Long-term plan; at most an interface is reserved. |
 
-Milestones (M0–M5) are defined in [process.md](process.md#milestones).
+Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 
 ## Foundation
 
@@ -42,6 +42,8 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | R3 | KV tiles: IOSurface (fp16 `OneComponent16Half`, 64 B row stride) viewed as `MTLTexture` | Implemented | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
 | R4 | KV tile granularity (one 512-token chunk per layer) and token-major `RGBA16Float` rows | Implemented | M2 (spike S1) | [memory.md](architecture/memory.md#kv-tiles), [results.md](benchmarks/results.md) |
 | R5 | int8 KV tiles (`OneComponent8`) | Undecided | — | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
+| R6 | Fixed-size recurrent state arenas in `WiredArena` for Gated DeltaNet layers (3:1 hybrid with `KvTile`s) | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| R7 | MLA + CSA2 (`Full` / `Reindex` / `Reuse`) cross-layer KV sharing, FP4 KV (`E2M1` + `E4M3` scale, 890 B/tok) and SWA bounded replay | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 
 ## Model, weights and format
 
@@ -55,6 +57,9 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | W6 | Primary target Qwen3-30B-A3B (3-bit); secondary Qwen3-14B (4-bit, dense) | Implemented | M2 | [memory.md](architecture/memory.md#budget-estimates), [results.md](benchmarks/results.md) |
 | W7 | CoreML `.mlpackage` export for ANE graphs (draft model, attention blocks, expert predictor) | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
 | W8 | Offline expert heat statistics | Confirmed | M4 | [experts-and-storage.md](architecture/experts-and-storage.md) |
+| W9 | Composable model operator registry (`BackboneKind`, `AttentionKind`, `FfnKind`, `ResidualKind`, `MemoryLookupKind`) | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| W10 | Tier 2 target: **`Qwen3.8-Flash-Next`** (`qwen4_exp`, 125B/A6B + 51B PLE + 4B MTP) `.amf` converter (vision-tower strip, sharded PLE) and runtime | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| W11 | Tier 3 target: **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`, 552B CED MoE + 196B Engram) `.amf` converter and Causal Encoder-Decoder scheduler (512 GB Ultra / TB5 cluster) | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 
 ## GPU (L3)
 
@@ -66,6 +71,11 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | G4 | Decode attention over KV tiles | Implemented | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), [results.md](benchmarks/results.md) |
 | G5 | Tree-attention verification with ancestor mask and accepted-path KV commit | Confirmed | M3 | [speculative-decoding.md](architecture/speculative-decoding.md) |
 | G6 | GPU half of the hybrid prefill (FFN / MoE) | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
+| G7 | High-expert-count MoE (`>= 512` routed experts, top-10+) with unconditional `shared_expert` SwiGLU accumulation | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| G8 | Gated DeltaNet (GDN) chunked-prefill and recurrent decode Metal 4 kernels | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| G9 | Qwen Sparse Attention (QSA) micro-block indexer with YaRN and interleaved MRoPE (`[11, 11, 10]`) | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| G10 | Multi-branch residual stream kernels: 4-branch Gated Residual (GR) and Single-Pass mHC (Mega-mHC) | Confirmed (GR: M6) / Future (mHC: M7) | M6–M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| G11 | MLA + CSA2 hierarchical sparse indexer and FP4 (`E2M1` + `E4M3` scale) KV encode/decode kernels | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 
 ## Speculative decoding (L1 / L2)
 
@@ -80,6 +90,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | D7 | Expert-byte-budget tree pruning (dense models: node budget) | Confirmed | M3 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) |
 | D8 | PEARL-style pipelined drafting for the independent small draft | Confirmed (design Draft) | M5 | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) |
 | D9 | Lossless stochastic acceptance for temperature > 0 | Confirmed | M3 | [speculative-decoding.md](architecture/speculative-decoding.md) |
+| D10 | DSpark semi-autoregressive speculative decoding adapter under `DraftSource` | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 
 ## Neural Engine
 
@@ -102,10 +113,12 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | C7 | kqueue SSE server | Confirmed | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
 | C8 | Server API shape (for example OpenAI-compatible streaming) | Undecided | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
 | C9 | Benchmark harness with `powermetrics` and swap checks (`aminfer bench`, `just bench`) | Implemented | M1 | [system-tuning.md](guides/system-tuning.md) |
+| C10 | Sparse external lookup tables on NVMe (`F_NOCACHE` `.amf` row prefetch for 51B PLE and 196B Engram) | Confirmed (PLE: M6) / Future (Engram: M7) | M6–M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 
 ## Scale-out
 
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
-| X1 | Thunderbolt-peer expert source (TB4 TCP; TB5 RDMA on macOS 26.2+) | Future (interface reserved) | — | [ADR-0003](decisions/0003-expert-source-tagged-union.md) |
-| X2 | Multi-Mac expert-parallel inference | Future | — | [experts-and-storage.md](architecture/experts-and-storage.md#thunderbolt-peer) |
+| X1 | Thunderbolt-peer expert source (TB4 TCP; TB5 RDMA on macOS 26.2+) | Future (interface reserved) | M7 | [ADR-0003](decisions/0003-expert-source-tagged-union.md) |
+| X2 | Multi-Mac expert-parallel inference | Future | M7 | [experts-and-storage.md](architecture/experts-and-storage.md#thunderbolt-peer) |
+| X3 | Distributed serving of 500B+ frontier MoEs (`DeepSeek-V4.1-Flash-1017`) across Thunderbolt 5 RDMA Mac clusters | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |

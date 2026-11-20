@@ -2,8 +2,10 @@
 
 A bare-metal, ultra-low-latency LLM inference engine for Apple Silicon.
 
-> Early development — aminfer does not run a model yet. What works today is
-> listed in [docs/status.md](docs/status.md); progress is in
+> Active development — M0–M2 (wired memory budget, `.amf` toolchain, Metal 4
+> hot path, IOSurface KV tiles, and non-speculative greedy decode for Qwen3-MoE
+> / Qwen3-Dense) are complete. What works today is listed in
+> [docs/status.md](docs/status.md); progress and milestones live in
 > [docs/process.md](docs/process.md).
 
 aminfer targets M4 / M5-class Apple Silicon. The baseline is a 24 GB M4, and
@@ -21,8 +23,14 @@ running every engine of the SoC concurrently on one zero-copy memory pool:
 
 Speculative decoding prioritizes EAGLE-2 draft trees (with EAGLE-3 or EAGLE-2
 heads) and MTP heads, falls back to a same-family small draft model, and
-prices MoE draft trees by the expert bytes they make the GPU read. The full
-design starts at
+prices MoE draft trees by the expert bytes they make the GPU read. Beyond the
+initial `Qwen3-30B-A3B` / `Qwen3-14B` baselines, the tiered model roadmap
+targets **`Qwen3.8-Flash-Next`** (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert
+MoE + 51B NVMe PLE) and **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`: 552B
+Causal Encoder-Decoder MoE + 196B Engram + CSA2/FP4 KV on 512 GB Ultra and
+Thunderbolt 5 RDMA clusters); see
+[docs/architecture/model-roadmap.md](docs/architecture/model-roadmap.md). The
+full design starts at
 [docs/architecture/overview.md](docs/architecture/overview.md).
 
 ## Technology

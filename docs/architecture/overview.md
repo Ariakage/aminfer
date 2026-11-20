@@ -135,4 +135,6 @@ the bridge through `b.addTranslateC` (Zig 0.17.1 removed `@cImport`), and
   merging, expert-byte-budget pruning, verification
 - [experts-and-storage.md](experts-and-storage.md) — `ExpertSource`, `.amf`,
   cold-expert I/O, expert prediction, Thunderbolt peer
+- [model-roadmap.md](model-roadmap.md) — composable model axes and tiered
+  roadmap (`Qwen3.8-Flash-Next`, `DeepSeek-V4.1-Flash-1017`)
 - [../decisions/README.md](../decisions/README.md) — ADR index

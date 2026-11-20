@@ -21,7 +21,8 @@ Status-row IDs refer to [status.md](status.md).
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2; speedup over the M2 baseline, acceptance-length and experts-per-pass statistics recorded | Not started |
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Not started |
 | M5 | Serving and pipelining | C6–C8, D8 | Streaming server under load; pipelined-drafting gain measured | Not started |
-| Future | Scale-out | X1, X2 | — | — |
+| M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`) | R6, W9, W10, G7–G9, G10 (GR), C10 (PLE) | Composable model operator graph; `Qwen3.8-Flash-Next` (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end (128 GB+ full wired residency; 24 GB M4 hot/cold + PLE async prefetch without swap) | Not started |
+| M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
 ## Spikes
 
@@ -183,7 +184,11 @@ user accepted ADR-0008 (benchmark-gated draft placement), ADR-0009
 (Metal 4 hot path, macOS 26.0 floor), ADR-0012 (wired budget headroom) and
 ADR-0013 (EAGLE-2 tree with EAGLE-3 / EAGLE-2 heads). ADR-0001 to ADR-0007 and
 ADR-0014 record the project charter and the four new requirements of the same
-session.
+session. After M2 completed on 2026-11-20, the user added the tiered frontier
+model roadmap ([ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md)):
+Tier 2 `Qwen3.8-Flash-Next` (`qwen4_exp`, M6) and Tier 3
+`DeepSeek-V4.1-Flash-1017` (`deepseek41`, M7 / 512 GB Ultra & Thunderbolt 5 RDMA
+clusters).
 
 ## Session handoff snapshot
 
@@ -207,7 +212,8 @@ Update this before the context window runs out or when handing off.
     W5), `e29033f` IOSurface KV tiles, Spike S1 & GQA decode attention (R3, R4,
     S1, G4), `3a90b9f` deduplicated MoE gather/SwiGLU & greedy argmax (G3),
     `c2b5856` M2 build/root wiring, `3197b12` Qwen3-MoE & Qwen3-Dense greedy
-    decode engine (W6), `517ba0d` M2 benchmarks & `aminfer decode` CLI
+    decode engine (W6), `517ba0d` M2 benchmarks & `aminfer decode` CLI,
+    `e1ea8a7` M2 close-out & benchmark archive update
 - In flight: none (M2 complete; ready for M3 speculative decoding)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
