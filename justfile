@@ -31,9 +31,13 @@ fmt-check:
 probe:
     zig build run -- probe
 
-# Run C9 kernel bandwidth calibration and Spike S2 hot-path benchmark (ReleaseFast).
+# Run full M1 + M2 benchmark suite (ReleaseFast).
 bench:
     zig build -Doptimize=ReleaseFast && ./zig-out/bin/aminfer bench
+
+# Run M2 benchmarks only: Spike S1, G3 MoE, G4 GQA, and end-to-end .amf decode (ReleaseFast).
+bench-m2:
+    zig build -Doptimize=ReleaseFast && ./zig-out/bin/aminfer bench-m2
 
 # Show current wired-memory limits and physical RAM.
 sysctl-show:
