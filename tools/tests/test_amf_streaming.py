@@ -21,6 +21,7 @@ from aminfer_tools.amf import (
     DType,
     TensorKind,
     bf16_bytes_to_f16_bytes,
+    d2t_deltas_to_u32_bytes,
     f16_bytes_to_bf16_bytes,
     pack_amf_from_safetensors,
     resolve_checkpoint,
@@ -147,6 +148,27 @@ class ConversionTests(unittest.TestCase):
             bf16_bytes_to_f16_bytes(bf16([1.0e5]))
         # bf16 -> f16 -> bf16 is lossless for values representable in both.
         self.assertEqual(f16_bytes_to_bf16_bytes(bf16_bytes_to_f16_bytes(bf16(vals))), bf16(vals))
+
+    def test_d2t_deltas_to_u32_bytes_i64_i32_and_bounds(self) -> None:
+        deltas_i64 = [0, 0, 5, 100, 87669]
+        raw64 = struct.pack(f"<{len(deltas_i64)}q", *deltas_i64)
+        got64 = struct.unpack(f"<{len(deltas_i64)}I", d2t_deltas_to_u32_bytes(raw64, elem_bytes=8, start_index=10))
+        self.assertEqual(list(got64), [10 + j + d for j, d in enumerate(deltas_i64)])
+
+        deltas_i32 = [0, 3, -1]
+        raw32 = struct.pack(f"<{len(deltas_i32)}i", *deltas_i32)
+        got32 = struct.unpack(f"<{len(deltas_i32)}I", d2t_deltas_to_u32_bytes(raw32, elem_bytes=4, start_index=1))
+        self.assertEqual(list(got32), [1, 5, 2])
+
+        # Out-of-range target_id (< 0 or >= 2^32) must fail loudly.
+        with self.assertRaises(ValueError):
+            d2t_deltas_to_u32_bytes(struct.pack("<q", -1), elem_bytes=8, start_index=0)
+        with self.assertRaises(ValueError):
+            d2t_deltas_to_u32_bytes(struct.pack("<q", 1 << 32), elem_bytes=8, start_index=0)
+        with self.assertRaises(ValueError):
+            d2t_deltas_to_u32_bytes(b"\x00\x01\x02", elem_bytes=4)
+        with self.assertRaises(ValueError):
+            d2t_deltas_to_u32_bytes(b"\x00\x00", elem_bytes=2)
 
 
 class StreamingPackTests(unittest.TestCase):
@@ -423,6 +445,126 @@ class StreamingPackTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             pack_amf_from_safetensors(dup / "a.safetensors", self.tmp / "d.amf", model_id="d", dtype_mode="fp8")
+
+    def test_eagle3_d2t_conversion_t2d_skip_and_exclude_tensors(self) -> None:
+        rng = random.Random(2026)
+        ckpt = self.tmp / "eagle3"
+        ckpt.mkdir()
+        vocab, draft_vocab, h = 64, 24, 64
+        # Strictly increasing target IDs in [0, vocab); store raw EAGLE-3 deltas (target - i).
+        target_ids = sorted(rng.sample(range(vocab), draft_vocab))
+        d2t_deltas = [tid - i for i, tid in enumerate(target_ids)]
+        t2d_flags = bytes(1 if i in set(target_ids) else 0 for i in range(vocab))
+
+        tensors = {
+            "d2t": ("I64", [draft_vocab], struct.pack(f"<{draft_vocab}q", *d2t_deltas)),
+            "t2d": ("BOOL", [vocab], t2d_flags),
+            "embed_tokens.weight": ("BF16", [vocab, h], bf16([rng.uniform(-0.5, 0.5) for _ in range(vocab * h)])),
+            "fc.weight": ("BF16", [h, 3 * h], bf16([rng.uniform(-0.2, 0.2) for _ in range(h * 3 * h)])),
+            "layers.0.hidden_norm.weight": ("BF16", [h], bf16([1.0] * h)),
+            "layers.0.input_layernorm.weight": ("BF16", [h], bf16([1.0] * h)),
+            "pre_fc_norm_embedding.weight": ("BF16", [h], bf16([1.0] * h)),
+            "lm_head.weight": ("BF16", [draft_vocab, h], bf16([rng.uniform(-0.2, 0.2) for _ in range(draft_vocab * h)])),
+        }
+        write_safetensors(ckpt / "model.safetensors", tensors)
+        (ckpt / "config.json").write_text(
+            json.dumps({"architectures": ["Eagle3DraftModel"], "draft_vocab_size": draft_vocab, "tie_word_embeddings": True})
+        )
+
+        out = self.tmp / "eagle3.amf"
+        with redirect_stdout(io.StringIO()):
+            rc = main(["pack-amf", "--input", str(ckpt), "--output", str(out), "--model-id", "eagle3-smoke"])
+        self.assertEqual(rc, 0)
+
+        _, entries, data = read_amf(out)
+        # t2d is skipped; lm_head is kept despite tie_word_embeddings because shape differs; embed_tokens kept by default.
+        self.assertNotIn("t2d", entries)
+        self.assertIn("embed_tokens.weight", entries)
+        self.assertIn("lm_head.weight", entries)
+        self.assertEqual(len(entries), 7)
+
+        d2t_ent = entries["d2t"]
+        self.assertEqual(d2t_ent["dtype"], DType.U32)
+        self.assertEqual(d2t_ent["kind"], TensorKind.DENSE)
+        self.assertEqual(d2t_ent["shape"], (draft_vocab,))
+        self.assertEqual((d2t_ent["quant_bits"], d2t_ent["group_size"], d2t_ent["params_bytes"]), (0, 0, 0))
+        self.assertEqual(d2t_ent["data_bytes"], draft_vocab * 4)
+        got_ids = list(struct.unpack(f"<{draft_vocab}I", blob_data(data, d2t_ent)))
+        self.assertEqual(got_ids, target_ids)
+
+        # Norm whose name also contains "embed" still classifies as NORM.
+        self.assertEqual(entries["pre_fc_norm_embedding.weight"]["kind"], TensorKind.NORM)
+
+        # Tiny-chunk streaming of I64 d2t produces byte-identical output.
+        chunked = self.tmp / "eagle3_chunked.amf"
+        with mock.patch.object(amf, "_CONVERT_CHUNK_ELEMS", 7):
+            pack_amf_from_safetensors(ckpt, chunked, model_id="eagle3-smoke")
+        self.assertEqual(chunked.read_bytes(), data)
+        self.verify_with_zig(out, 7)
+
+        # --exclude-tensors omits embed_tokens.weight cleanly.
+        no_emb = self.tmp / "eagle3_no_emb.amf"
+        with redirect_stdout(io.StringIO()):
+            rc = main(
+                [
+                    "pack-amf",
+                    "--input",
+                    str(ckpt),
+                    "--output",
+                    str(no_emb),
+                    "--model-id",
+                    "eagle3-no-emb",
+                    "--exclude-tensors",
+                    "embed_tokens.weight,pre_fc_norm_embedding.weight",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        _, no_emb_entries, _ = read_amf(no_emb)
+        self.assertNotIn("embed_tokens.weight", no_emb_entries)
+        self.assertNotIn("pre_fc_norm_embedding.weight", no_emb_entries)
+        self.assertIn("d2t", no_emb_entries)
+        self.verify_with_zig(no_emb, 5)
+
+        # I32 d2t and direct U32 d2t both pack as DType.U32.
+        st_i32 = self.tmp / "d2t_i32.safetensors"
+        write_safetensors(
+            st_i32,
+            {
+                "d2t": ("I32", [draft_vocab], struct.pack(f"<{draft_vocab}i", *d2t_deltas)),
+                "norm.weight": ("BF16", [h], bf16([1.0] * h)),
+            },
+        )
+        out_i32 = self.tmp / "d2t_i32.amf"
+        pack_amf_from_safetensors(st_i32, out_i32, model_id="i32-d2t")
+        _, e_i32, d_i32 = read_amf(out_i32)
+        self.assertEqual(list(struct.unpack(f"<{draft_vocab}I", blob_data(d_i32, e_i32["d2t"]))), target_ids)
+        self.verify_with_zig(out_i32, 2)
+
+        st_u32 = self.tmp / "d2t_u32.safetensors"
+        write_safetensors(
+            st_u32,
+            {
+                "d2t": ("U32", [draft_vocab], struct.pack(f"<{draft_vocab}I", *target_ids)),
+            },
+        )
+        out_u32 = self.tmp / "d2t_u32.amf"
+        pack_amf_from_safetensors(st_u32, out_u32, model_id="u32-d2t")
+        _, e_u32, d_u32 = read_amf(out_u32)
+        self.assertEqual(list(struct.unpack(f"<{draft_vocab}I", blob_data(d_u32, e_u32["d2t"]))), target_ids)
+        self.verify_with_zig(out_u32, 1)
+
+        # Out-of-bounds d2t delta and unexpected BOOL tensor are rejected cleanly.
+        st_bad_d2t = self.tmp / "bad_d2t.safetensors"
+        write_safetensors(st_bad_d2t, {"d2t": ("I64", [2], struct.pack("<2q", 0, -5))})
+        with self.assertRaisesRegex(ValueError, "outside u32 range"):
+            pack_amf_from_safetensors(st_bad_d2t, self.tmp / "bad_d2t.amf", model_id="bad")
+        self.assertFalse((self.tmp / "bad_d2t.amf").exists())
+        self.assertFalse((self.tmp / "bad_d2t.amf.partial").exists())
+
+        st_bad_bool = self.tmp / "bad_bool.safetensors"
+        write_safetensors(st_bad_bool, {"mask": ("BOOL", [4], b"\x01\x00\x01\x00")})
+        with self.assertRaisesRegex(ValueError, "unsupported unquantized dtype BOOL"):
+            pack_amf_from_safetensors(st_bad_bool, self.tmp / "bad_bool.amf", model_id="bad")
 
 
 if __name__ == "__main__":

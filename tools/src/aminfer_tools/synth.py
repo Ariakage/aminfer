@@ -29,6 +29,7 @@ from aminfer_tools.amf import (
     DType,
     PackedTensorMeta,
     TensorKind,
+    f16_bytes_to_bf16_bytes,
 )
 
 _STREAM_CHUNK_BYTES = 16 * 1024 * 1024
@@ -737,7 +738,14 @@ def _build_f16_tile(rng: random.Random, amp: float, centered_one: bool, entries:
     return bytes(buf)
 
 
-def _stream_tensor_blob(fh, plan: _TensorPlan, seed: int, blob_offset: int) -> PackedTensorMeta:
+def _stream_tensor_blob(
+    fh,
+    plan: _TensorPlan,
+    seed: int,
+    blob_offset: int,
+    *,
+    u32_payload: bytes | None = None,
+) -> PackedTensorMeta:
     rng = random.Random(_tensor_seed(seed, plan.name))
     crc = 0
 
@@ -765,7 +773,7 @@ def _stream_tensor_blob(fh, plan: _TensorPlan, seed: int, blob_offset: int) -> P
 
         if blob_bytes > content_len:
             crc = _stream_zeros(fh, blob_bytes - content_len, crc)
-    elif plan.dtype == DType.F16:
+    elif plan.dtype in (DType.F16, DType.BF16):
         elems = 1
         for d in plan.shape:
             elems *= d
@@ -780,8 +788,24 @@ def _stream_tensor_blob(fh, plan: _TensorPlan, seed: int, blob_offset: int) -> P
             tile = _build_f16_tile(rng, plan.scale_hint, centered_one=False, entries=257)
         else:
             tile = _build_f16_tile(rng, plan.scale_hint, centered_one=False, entries=4099)
+        if plan.dtype == DType.BF16:
+            tile = f16_bytes_to_bf16_bytes(tile)
         crc = _stream_tiled(fh, tile, data_bytes, crc)
 
+        if blob_bytes > data_bytes:
+            crc = _stream_zeros(fh, blob_bytes - data_bytes, crc)
+    elif plan.dtype == DType.U32:
+        elems = 1
+        for d in plan.shape:
+            elems *= d
+        data_bytes = elems * 4
+        params_offset = 0
+        params_bytes = 0
+        blob_bytes = _align_up(data_bytes, APPLE_PAGE_SIZE)
+        if u32_payload is None or len(u32_payload) != data_bytes:
+            raise ValueError(f"missing or mismatched u32 payload for {plan.name!r}")
+        fh.write(u32_payload)
+        crc = zlib.crc32(u32_payload, crc)
         if blob_bytes > data_bytes:
             crc = _stream_zeros(fh, blob_bytes - data_bytes, crc)
     else:
@@ -805,22 +829,14 @@ def _stream_tensor_blob(fh, plan: _TensorPlan, seed: int, blob_offset: int) -> P
     )
 
 
-def generate_qwen3_bundle(
-    output_dir: pathlib.Path,
-    config: Qwen3SynthConfig,
+def _write_planned_amf(
+    amf_path: pathlib.Path,
+    model_id: str,
+    plans: list[_TensorPlan],
+    seed: int,
     *,
-    seed: int = 42,
-    cold_experts: Iterable[tuple[int, int]] = (),
-) -> SynthBundle:
-    """Generate deterministic `model.amf`, `config.json`, and `tokenizer.json` in `output_dir`."""
-    config.validate()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    amf_path = output_dir / "model.amf"
-    config_path = output_dir / "config.json"
-    tokenizer_path = output_dir / "tokenizer.json"
-
-    plans = _plan_qwen3_tensors(config, set(cold_experts))
+    u32_payloads: dict[str, bytes] | None = None,
+) -> list[PackedTensorMeta]:
     tensor_count = len(plans)
     dir_offset = APPLE_PAGE_SIZE
     dir_raw_len = tensor_count * ENTRY_STRUCT.size
@@ -832,7 +848,8 @@ def generate_qwen3_bundle(
         _stream_zeros(fh, dir_offset + dir_bytes, 0)
         cursor = dir_offset + dir_bytes
         for plan in plans:
-            meta = _stream_tensor_blob(fh, plan, seed, cursor)
+            payload = u32_payloads.get(plan.name) if u32_payloads else None
+            meta = _stream_tensor_blob(fh, plan, seed, cursor, u32_payload=payload)
             metas.append(meta)
             cursor += meta.blob_bytes
 
@@ -865,7 +882,7 @@ def generate_qwen3_bundle(
             )
         dir_crc = zlib.crc32(dir_raw) & 0xFFFFFFFF
 
-        model_id_bytes = config.model_id.encode("utf-8")
+        model_id_bytes = model_id.encode("utf-8")
         header_zero_crc = HEADER_STRUCT.pack(
             AMF_MAGIC,
             AMF_VERSION,
@@ -908,6 +925,26 @@ def generate_qwen3_bundle(
             dir_page[0 : len(dir_raw)] = dir_raw
             fh.seek(dir_offset)
             fh.write(dir_page)
+    return metas
+
+
+def generate_qwen3_bundle(
+    output_dir: pathlib.Path,
+    config: Qwen3SynthConfig,
+    *,
+    seed: int = 42,
+    cold_experts: Iterable[tuple[int, int]] = (),
+) -> SynthBundle:
+    """Generate deterministic `model.amf`, `config.json`, and `tokenizer.json` in `output_dir`."""
+    config.validate()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    amf_path = output_dir / "model.amf"
+    config_path = output_dir / "config.json"
+    tokenizer_path = output_dir / "tokenizer.json"
+
+    plans = _plan_qwen3_tensors(config, set(cold_experts))
+    metas = _write_planned_amf(amf_path, config.model_id, plans, seed)
 
     config_path.write_text(
         json.dumps(config.to_hf_config_dict(), indent=2) + "\n",
@@ -922,6 +959,506 @@ def generate_qwen3_bundle(
         amf_path=amf_path,
         config_path=config_path,
         tokenizer_path=tokenizer_path,
+        metas=metas,
+        total_bytes=amf_path.stat().st_size,
+        config=config,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic synthetic L2 draft head bundles (ADR-0013: EAGLE-3, EAGLE-2, MTP)
+# ---------------------------------------------------------------------------
+
+DRAFT_FORMATS = ("eagle3", "eagle2", "mtp")
+DRAFT_DTYPES = ("bf16", "f16")
+
+
+@dataclass(frozen=True)
+class DraftSynthConfig:
+    model_id: str
+    draft_format: str  # "eagle3", "eagle2", or "mtp"
+    vocab_size: int
+    draft_vocab_size: int
+    hidden_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    intermediate_size: int
+    num_hidden_layers: int = 1
+    dtype: str = "bf16"
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 10_000.0
+    max_position_embeddings: int = 2048
+    norm_before_residual: bool = True
+    aux_layer_ids: tuple[int, ...] | None = None
+    target_hidden_size: int | None = None
+    include_embed_tokens: bool = True
+    include_lm_head: bool = True
+    include_qk_norm: bool = False
+
+    def with_overrides(self, **kwargs: object) -> DraftSynthConfig:
+        return replace(self, **kwargs)  # type: ignore[arg-type]
+
+    @property
+    def float_dtype(self) -> DType:
+        return DType.BF16 if self.dtype == "bf16" else DType.F16
+
+    @property
+    def num_aux_layers(self) -> int:
+        return len(self.aux_layer_ids) if self.aux_layer_ids else 3
+
+    @property
+    def effective_target_hidden_size(self) -> int:
+        return self.target_hidden_size if self.target_hidden_size is not None else self.hidden_size
+
+    def validate(self) -> None:
+        if len(self.model_id.encode("utf-8")) == 0 or len(self.model_id.encode("utf-8")) > 63:
+            raise ValueError(f"model_id must be 1..63 UTF-8 bytes, got {self.model_id!r}")
+        if self.draft_format not in DRAFT_FORMATS:
+            raise ValueError(f"draft_format must be one of {DRAFT_FORMATS}, got {self.draft_format!r}")
+        if self.dtype not in DRAFT_DTYPES:
+            raise ValueError(f"dtype must be one of {DRAFT_DTYPES}, got {self.dtype!r}")
+        if self.vocab_size < 16:
+            raise ValueError(f"vocab_size must be >= 16, got {self.vocab_size}")
+        if self.draft_format == "eagle3":
+            if not (1 <= self.draft_vocab_size <= self.vocab_size):
+                raise ValueError(
+                    f"draft_vocab_size must be in 1..vocab_size ({self.vocab_size}), got {self.draft_vocab_size}"
+                )
+        elif self.draft_vocab_size != self.vocab_size:
+            raise ValueError(
+                f"{self.draft_format} requires draft_vocab_size == vocab_size "
+                f"({self.draft_vocab_size} != {self.vocab_size})"
+            )
+        if self.num_hidden_layers < 1:
+            raise ValueError(f"num_hidden_layers must be >= 1, got {self.num_hidden_layers}")
+        if self.hidden_size <= 0 or self.hidden_size % 64 != 0:
+            raise ValueError(f"hidden_size must be a positive multiple of 64, got {self.hidden_size}")
+        if self.effective_target_hidden_size <= 0 or self.effective_target_hidden_size % 64 != 0:
+            raise ValueError(
+                f"target_hidden_size must be a positive multiple of 64, got {self.effective_target_hidden_size}"
+            )
+        if self.head_dim <= 0 or self.head_dim % 32 != 0:
+            raise ValueError(f"head_dim must be a positive multiple of 32, got {self.head_dim}")
+        if self.num_attention_heads <= 0 or self.num_key_value_heads <= 0:
+            raise ValueError("attention head counts must be positive")
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+        if self.intermediate_size <= 0 or self.intermediate_size % 64 != 0:
+            raise ValueError(f"intermediate_size must be a positive multiple of 64, got {self.intermediate_size}")
+        if self.aux_layer_ids is not None:
+            if len(self.aux_layer_ids) == 0 or min(self.aux_layer_ids) < 0:
+                raise ValueError(f"aux_layer_ids must be non-empty non-negative ints, got {self.aux_layer_ids!r}")
+            if len(set(self.aux_layer_ids)) != len(self.aux_layer_ids):
+                raise ValueError(f"aux_layer_ids must be distinct, got {self.aux_layer_ids!r}")
+
+    def to_config_dict(self) -> dict[str, object]:
+        if self.draft_format == "eagle3":
+            return {
+                "architectures": ["Eagle3DraftModel"],
+                "speculators_model_type": "eagle3",
+                "draft_vocab_size": self.draft_vocab_size,
+                "eagle_aux_hidden_state_layer_ids": (
+                    list(self.aux_layer_ids) if self.aux_layer_ids is not None else None
+                ),
+                "norm_before_residual": self.norm_before_residual,
+                "target_hidden_size": self.target_hidden_size,
+                "transformer_layer_config": {
+                    "attention_bias": False,
+                    "head_dim": self.head_dim,
+                    "hidden_act": "silu",
+                    "hidden_size": self.hidden_size,
+                    "intermediate_size": self.intermediate_size,
+                    "max_position_embeddings": self.max_position_embeddings,
+                    "mlp_bias": False,
+                    "model_type": "llama",
+                    "num_attention_heads": self.num_attention_heads,
+                    "num_hidden_layers": self.num_hidden_layers,
+                    "num_key_value_heads": self.num_key_value_heads,
+                    "rms_norm_eps": self.rms_norm_eps,
+                    "rope_theta": self.rope_theta,
+                    "vocab_size": self.vocab_size,
+                },
+            }
+        if self.draft_format == "eagle2":
+            return {
+                "architectures": ["EagleLlamaForCausalLM"],
+                "model_type": "eagle",
+                "draft_format": "eagle2",
+                "vocab_size": self.vocab_size,
+                "hidden_size": self.hidden_size,
+                "num_hidden_layers": self.num_hidden_layers,
+                "num_attention_heads": self.num_attention_heads,
+                "num_key_value_heads": self.num_key_value_heads,
+                "head_dim": self.head_dim,
+                "intermediate_size": self.intermediate_size,
+                "rms_norm_eps": self.rms_norm_eps,
+                "rope_theta": self.rope_theta,
+                "max_position_embeddings": self.max_position_embeddings,
+                "has_qk_norm": self.include_qk_norm,
+                "share_embed_tokens": not self.include_embed_tokens,
+            }
+        return {
+            "architectures": ["MtpDraftModel"],
+            "model_type": "mtp",
+            "draft_format": "mtp",
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_nextn_predict_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "head_dim": self.head_dim,
+            "intermediate_size": self.intermediate_size,
+            "rms_norm_eps": self.rms_norm_eps,
+            "rope_theta": self.rope_theta,
+            "max_position_embeddings": self.max_position_embeddings,
+            "has_qk_norm": self.include_qk_norm,
+            "share_lm_head": not self.include_lm_head,
+            "share_embed_tokens": not self.include_embed_tokens,
+        }
+
+
+DRAFT_PRESETS: dict[str, DraftSynthConfig] = {
+    "tiny-eagle3": DraftSynthConfig(
+        model_id="tiny-eagle3-draft",
+        draft_format="eagle3",
+        vocab_size=512,
+        draft_vocab_size=256,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        dtype="bf16",
+        rope_theta=10_000.0,
+        max_position_embeddings=2048,
+        norm_before_residual=True,
+        include_embed_tokens=True,
+        include_lm_head=True,
+        include_qk_norm=False,
+    ),
+    "tiny-eagle2": DraftSynthConfig(
+        model_id="tiny-eagle2-draft",
+        draft_format="eagle2",
+        vocab_size=512,
+        draft_vocab_size=512,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        dtype="bf16",
+        rope_theta=1_000_000.0,
+        max_position_embeddings=2048,
+        include_embed_tokens=True,
+        include_lm_head=True,
+        include_qk_norm=False,
+    ),
+    "tiny-mtp": DraftSynthConfig(
+        model_id="tiny-mtp-draft",
+        draft_format="mtp",
+        vocab_size=512,
+        draft_vocab_size=512,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        dtype="bf16",
+        rope_theta=1_000_000.0,
+        max_position_embeddings=2048,
+        include_embed_tokens=False,
+        include_lm_head=False,
+        include_qk_norm=True,
+    ),
+    "qwen3-30b-a3b-eagle3": DraftSynthConfig(
+        model_id="qwen3-30b-a3b-eagle3-synth",
+        draft_format="eagle3",
+        vocab_size=151936,
+        draft_vocab_size=64000,
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        intermediate_size=6144,
+        num_hidden_layers=1,
+        dtype="bf16",
+        rope_theta=10_000.0,
+        max_position_embeddings=40960,
+        norm_before_residual=True,
+        include_embed_tokens=True,
+        include_lm_head=True,
+        include_qk_norm=False,
+    ),
+}
+
+
+@dataclass(frozen=True)
+class DraftBundle:
+    amf_path: pathlib.Path
+    config_path: pathlib.Path
+    metas: list[PackedTensorMeta]
+    total_bytes: int
+    config: DraftSynthConfig
+
+
+def _build_synthetic_d2t_bytes(vocab_size: int, draft_vocab_size: int, seed: int) -> bytes:
+    """Build deterministic, strictly increasing u32 target token IDs in `[0, vocab_size)`."""
+    if draft_vocab_size == vocab_size:
+        ids = list(range(vocab_size))
+    else:
+        rng = random.Random(_tensor_seed(seed, "d2t"))
+        prefix = min(draft_vocab_size // 2, 256)
+        rest_count = draft_vocab_size - prefix
+        rest = rng.sample(range(prefix, vocab_size), rest_count)
+        rest.sort()
+        ids = list(range(prefix)) + rest
+    return struct.pack(f"<{len(ids)}I", *ids)
+
+
+def _plan_draft_tensors(config: DraftSynthConfig) -> list[_TensorPlan]:
+    fdt = config.float_dtype
+    h = config.hidden_size
+    h_tgt = config.effective_target_hidden_size
+    q_dim = config.num_attention_heads * config.head_dim
+    kv_dim = config.num_key_value_heads * config.head_dim
+    inter = config.intermediate_size
+    inv_sqrt_h = 1.0 / math.sqrt(h)
+    inv_sqrt_q = 1.0 / math.sqrt(q_dim)
+    inv_sqrt_inter = 1.0 / math.sqrt(inter)
+
+    plans: list[_TensorPlan] = []
+
+    if config.draft_format == "eagle3":
+        plans.append(
+            _TensorPlan("d2t", TensorKind.DENSE, DType.U32, 0, 0, NO_LAYER, NO_EXPERT, (config.draft_vocab_size,), 0.0)
+        )
+        if config.include_embed_tokens:
+            plans.append(
+                _TensorPlan(
+                    "embed_tokens.weight",
+                    TensorKind.EMBEDDING,
+                    fdt,
+                    0,
+                    0,
+                    NO_LAYER,
+                    NO_EXPERT,
+                    (config.vocab_size, h),
+                    0.20,
+                )
+            )
+        fc_in = config.num_aux_layers * h_tgt
+        plans.append(
+            _TensorPlan("fc.weight", TensorKind.DENSE, fdt, 0, 0, NO_LAYER, NO_EXPERT, (h, fc_in), 0.5 / math.sqrt(fc_in))
+        )
+        for layer in range(config.num_hidden_layers):
+            qkv_in = 2 * h if layer == 0 else h
+            qkv_scale = 0.5 / math.sqrt(qkv_in)
+            plans.append(
+                _TensorPlan(f"layers.{layer}.input_layernorm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (h,), 1.0)
+            )
+            if layer == 0:
+                plans.append(
+                    _TensorPlan(f"layers.{layer}.hidden_norm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (h,), 1.0)
+                )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.q_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (q_dim, qkv_in), qkv_scale)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.k_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (kv_dim, qkv_in), qkv_scale)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.v_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (kv_dim, qkv_in), qkv_scale)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.o_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (h, q_dim), 0.5 * inv_sqrt_q)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.post_attention_layernorm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (h,), 1.0)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.mlp.gate_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (inter, h), 0.5 * inv_sqrt_h)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.mlp.up_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (inter, h), 0.5 * inv_sqrt_h)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.mlp.down_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (h, inter), 0.5 * inv_sqrt_inter)
+            )
+        plans.append(_TensorPlan("norm.weight", TensorKind.NORM, fdt, 0, 0, NO_LAYER, NO_EXPERT, (h,), 1.0))
+        if config.include_lm_head:
+            plans.append(
+                _TensorPlan(
+                    "lm_head.weight",
+                    TensorKind.LM_HEAD,
+                    fdt,
+                    0,
+                    0,
+                    NO_LAYER,
+                    NO_EXPERT,
+                    (config.draft_vocab_size, h),
+                    0.5 * inv_sqrt_h,
+                )
+            )
+        return plans
+
+    if config.draft_format == "eagle2":
+        if config.include_embed_tokens:
+            plans.append(
+                _TensorPlan(
+                    "embed_tokens.weight",
+                    TensorKind.EMBEDDING,
+                    fdt,
+                    0,
+                    0,
+                    NO_LAYER,
+                    NO_EXPERT,
+                    (config.vocab_size, h),
+                    0.20,
+                )
+            )
+        plans.append(
+            _TensorPlan("fc.weight", TensorKind.DENSE, fdt, 0, 0, NO_LAYER, NO_EXPERT, (h, 2 * h), 0.5 / math.sqrt(2 * h))
+        )
+        for layer in range(config.num_hidden_layers):
+            plans.append(
+                _TensorPlan(f"layers.{layer}.input_layernorm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (h,), 1.0)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.q_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (q_dim, h), 0.5 * inv_sqrt_h)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.k_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (kv_dim, h), 0.5 * inv_sqrt_h)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.v_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (kv_dim, h), 0.5 * inv_sqrt_h)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.o_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (h, q_dim), 0.5 * inv_sqrt_q)
+            )
+            if config.include_qk_norm:
+                plans.append(
+                    _TensorPlan(f"layers.{layer}.self_attn.q_norm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (config.head_dim,), 1.0)
+                )
+                plans.append(
+                    _TensorPlan(f"layers.{layer}.self_attn.k_norm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (config.head_dim,), 1.0)
+                )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.post_attention_layernorm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (h,), 1.0)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.mlp.gate_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (inter, h), 0.5 * inv_sqrt_h)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.mlp.up_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (inter, h), 0.5 * inv_sqrt_h)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.mlp.down_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (h, inter), 0.5 * inv_sqrt_inter)
+            )
+        plans.append(_TensorPlan("norm.weight", TensorKind.NORM, fdt, 0, 0, NO_LAYER, NO_EXPERT, (h,), 1.0))
+        if config.include_lm_head:
+            plans.append(
+                _TensorPlan("lm_head.weight", TensorKind.LM_HEAD, fdt, 0, 0, NO_LAYER, NO_EXPERT, (config.vocab_size, h), 0.5 * inv_sqrt_h)
+            )
+        return plans
+
+    # MTP (D3 Multi-Token Prediction module)
+    if config.include_embed_tokens:
+        plans.append(
+            _TensorPlan(
+                "embed_tokens.weight",
+                TensorKind.EMBEDDING,
+                fdt,
+                0,
+                0,
+                NO_LAYER,
+                NO_EXPERT,
+                (config.vocab_size, h),
+                0.20,
+            )
+        )
+    plans.append(_TensorPlan("enorm.weight", TensorKind.NORM, fdt, 0, 0, NO_LAYER, NO_EXPERT, (h,), 1.0))
+    plans.append(_TensorPlan("hnorm.weight", TensorKind.NORM, fdt, 0, 0, NO_LAYER, NO_EXPERT, (h,), 1.0))
+    plans.append(
+        _TensorPlan("eh_proj.weight", TensorKind.DENSE, fdt, 0, 0, NO_LAYER, NO_EXPERT, (h, 2 * h), 0.5 / math.sqrt(2 * h))
+    )
+    for layer in range(config.num_hidden_layers):
+        plans.append(
+            _TensorPlan(f"layers.{layer}.input_layernorm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (h,), 1.0)
+        )
+        plans.append(
+            _TensorPlan(f"layers.{layer}.self_attn.q_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (q_dim, h), 0.5 * inv_sqrt_h)
+        )
+        plans.append(
+            _TensorPlan(f"layers.{layer}.self_attn.k_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (kv_dim, h), 0.5 * inv_sqrt_h)
+        )
+        plans.append(
+            _TensorPlan(f"layers.{layer}.self_attn.v_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (kv_dim, h), 0.5 * inv_sqrt_h)
+        )
+        plans.append(
+            _TensorPlan(f"layers.{layer}.self_attn.o_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (h, q_dim), 0.5 * inv_sqrt_q)
+        )
+        if config.include_qk_norm:
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.q_norm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (config.head_dim,), 1.0)
+            )
+            plans.append(
+                _TensorPlan(f"layers.{layer}.self_attn.k_norm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (config.head_dim,), 1.0)
+            )
+        plans.append(
+            _TensorPlan(f"layers.{layer}.post_attention_layernorm.weight", TensorKind.NORM, fdt, 0, 0, layer, NO_EXPERT, (h,), 1.0)
+        )
+        plans.append(
+            _TensorPlan(f"layers.{layer}.mlp.gate_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (inter, h), 0.5 * inv_sqrt_h)
+        )
+        plans.append(
+            _TensorPlan(f"layers.{layer}.mlp.up_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (inter, h), 0.5 * inv_sqrt_h)
+        )
+        plans.append(
+            _TensorPlan(f"layers.{layer}.mlp.down_proj.weight", TensorKind.DENSE, fdt, 0, 0, layer, NO_EXPERT, (h, inter), 0.5 * inv_sqrt_inter)
+        )
+    plans.append(_TensorPlan("shared_head.norm.weight", TensorKind.NORM, fdt, 0, 0, NO_LAYER, NO_EXPERT, (h,), 1.0))
+    if config.include_lm_head:
+        plans.append(
+            _TensorPlan("lm_head.weight", TensorKind.LM_HEAD, fdt, 0, 0, NO_LAYER, NO_EXPERT, (config.vocab_size, h), 0.5 * inv_sqrt_h)
+        )
+    return plans
+
+
+def generate_draft_bundle(
+    output_dir: pathlib.Path,
+    config: DraftSynthConfig,
+    *,
+    seed: int = 42,
+) -> DraftBundle:
+    """Generate deterministic L2 draft head `model.amf` and `config.json` in `output_dir`.
+
+    Supports all three ADR-0013 draft head layouts: `eagle3`, `eagle2`, and `mtp`.
+    """
+    config.validate()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    amf_path = output_dir / "model.amf"
+    config_path = output_dir / "config.json"
+
+    plans = _plan_draft_tensors(config)
+    u32_payloads: dict[str, bytes] = {}
+    if config.draft_format == "eagle3":
+        u32_payloads["d2t"] = _build_synthetic_d2t_bytes(config.vocab_size, config.draft_vocab_size, seed)
+
+    metas = _write_planned_amf(amf_path, config.model_id, plans, seed, u32_payloads=u32_payloads)
+    config_path.write_text(
+        json.dumps(config.to_config_dict(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    return DraftBundle(
+        amf_path=amf_path,
+        config_path=config_path,
         metas=metas,
         total_bytes=amf_path.stat().st_size,
         config=config,

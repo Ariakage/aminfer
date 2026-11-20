@@ -32,12 +32,15 @@ pub const DType = enum(u8) {
     q3_affine = 3,
     /// Unquantized bfloat16 (ADR-0016): `quant_bits = 0`, 2 bytes per element.
     bf16 = 4,
+    /// Unquantized 32-bit unsigned integer (e.g. EAGLE-3 `d2t` vocab maps,
+    /// ADR-0013): `quant_bits = 0`, 4 bytes per element.
+    u32 = 5,
 
     /// Bytes per element for unquantized dtypes; `null` for affine-quantized ones.
     pub fn unquantizedElemSize(self: DType) ?u64 {
         return switch (self) {
             .f16, .bf16 => 2,
-            .f32 => 4,
+            .f32, .u32 => 4,
             .q4_affine, .q3_affine => null,
         };
     }
@@ -465,7 +468,7 @@ fn validateEntries(
         if (blob_end > file_size) return error.BlobOutOfBounds;
 
         switch (dtype) {
-            .f16, .bf16, .f32 => {
+            .f16, .bf16, .f32, .u32 => {
                 if (entry.quant_bits != 0 or entry.group_size != 0) return error.InvalidQuantization;
                 if (entry.params_offset != 0 or entry.params_bytes != 0) return error.MisalignedParams;
                 var elems: u64 = 1;
@@ -885,7 +888,7 @@ test "validator rejects invalid bf16 metadata" {
     n += 1;
 
     e = bf16TestEntry();
-    e.dtype = 5; // unknown dtype past bf16
+    e.dtype = 6; // unknown dtype past u32
     cases[n] = .{ .err = error.InvalidDType, .entry = e };
     n += 1;
 
@@ -988,4 +991,99 @@ test "AmfFile.verifyAllBlobsChunked streams multi-chunk blobs and detects corrup
     defer bad_file.close(gpa);
     try std.testing.expectError(error.BlobChecksumMismatch, bad_file.verifyAllBlobsChunked(gpa, page.APPLE_PAGE_SIZE));
     try std.testing.expectError(error.BlobChecksumMismatch, bad_file.verifyAllBlobs(gpa));
+}
+
+fn u32TestEntry() TensorEntry {
+    var entry = TensorEntry.zeroed("d2t", .dense, .u32);
+    entry.rank = 1;
+    entry.shape = .{ 64, 0, 0, 0 };
+    entry.data_bytes = 64 * 4;
+    return entry;
+}
+
+test "DType.u32 is wire value 5 and parses as an unquantized 4-byte tensor" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(DType.u32));
+    try std.testing.expectEqual(@as(?u64, 4), DType.u32.unquantizedElemSize());
+
+    var ids: [64]u32 = undefined;
+    for (&ids, 0..) |*slot, i| slot.* = @intCast(i * 3 + 10);
+    const image = try buildTestAmf(gpa, u32TestEntry(), std.mem.sliceAsBytes(&ids));
+    defer gpa.free(image);
+
+    var parsed = try Parsed.parseBytes(gpa, image);
+    defer parsed.deinit(gpa);
+    const found = parsed.find("d2t") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DType.u32, try found.dataType());
+    try std.testing.expectEqual(TensorKind.dense, try found.tensorKind());
+    try std.testing.expectEqual(@as(u8, 0), found.quant_bits);
+    try std.testing.expectEqual(@as(u16, 0), found.group_size);
+    try std.testing.expectEqual(@as(u64, 64 * 4), found.data_bytes);
+    try parsed.verifyAllBlobsFromBytes(image);
+
+    const cap = 4 * page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = 16 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = cap,
+        .global_user_wire_limit = cap,
+        .gpu_working_set_bytes = cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(cap, budget);
+    defer arena.deinit();
+
+    const loaded = try parsed.loadBlobFromBytes(image, found, &arena);
+    const got_ids: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, loaded[0 .. 64 * 4]));
+    try std.testing.expectEqualSlices(u32, &ids, got_ids);
+}
+
+test "validator rejects invalid u32 metadata" {
+    const gpa = std.testing.allocator;
+    const payload: [256]u8 = @splat(0);
+
+    const Case = struct { err: ParseError, entry: TensorEntry };
+    var cases: [7]Case = undefined;
+    var n: usize = 0;
+
+    var e = u32TestEntry();
+    e.quant_bits = 32;
+    cases[n] = .{ .err = error.InvalidQuantization, .entry = e };
+    n += 1;
+
+    e = u32TestEntry();
+    e.group_size = 64;
+    cases[n] = .{ .err = error.InvalidQuantization, .entry = e };
+    n += 1;
+
+    e = u32TestEntry();
+    e.params_offset = 256;
+    cases[n] = .{ .err = error.MisalignedParams, .entry = e };
+    n += 1;
+
+    e = u32TestEntry();
+    e.params_bytes = 64;
+    cases[n] = .{ .err = error.MisalignedParams, .entry = e };
+    n += 1;
+
+    e = u32TestEntry();
+    e.data_bytes = 64 * 2; // wrong element size (2 instead of 4)
+    cases[n] = .{ .err = error.InvalidShape, .entry = e };
+    n += 1;
+
+    e = u32TestEntry();
+    e.rank = 0;
+    cases[n] = .{ .err = error.InvalidRank, .entry = e };
+    n += 1;
+
+    e = u32TestEntry();
+    e.rank = 5;
+    cases[n] = .{ .err = error.InvalidRank, .entry = e };
+    n += 1;
+
+    for (cases[0..n]) |c| {
+        const image = try buildTestAmf(gpa, c.entry, &payload);
+        defer gpa.free(image);
+        try std.testing.expectError(c.err, Parsed.parseBytes(gpa, image));
+    }
 }

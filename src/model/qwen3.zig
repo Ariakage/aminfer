@@ -785,7 +785,7 @@ fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) LoadError!qua
             if ((k % 64) != 0) return error.UnalignedK;
             break :blk .q3_affine;
         },
-        .f32 => error.UnexpectedTensorDType,
+        .f32, .u32 => error.UnexpectedTensorDType,
     };
 }
 
@@ -799,6 +799,7 @@ fn validateRouter2D(entry: *const amf.TensorEntry, num_experts: u32, hidden_size
         .q4_affine, .q3_affine => {
             if ((hidden_size % 64) != 0) return error.UnalignedK;
         },
+        .u32 => return error.UnexpectedTensorDType,
     }
     return dt;
 }
@@ -1267,6 +1268,7 @@ fn loadInternal(
                         .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
                         .bits = .q3,
                     } },
+                    .u32 => unreachable,
                 };
 
                 const exp_tbl_raw = try scratch_arena.allocAligned(@as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights), 64);
@@ -1762,7 +1764,7 @@ fn buildSyntheticAmfImageWithSpec(
                 .bf16 => try addWeight2D(allocator, &recs, router_base, true, .router, .bf16, l, amf.NO_EXPERT, cfg.num_experts, h, 0.6 * inv_sqrt_h, seed + t_idx),
                 .q3_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q3_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.25 * inv_sqrt_h, seed + t_idx),
                 .q4_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q4_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.12 * inv_sqrt_h, seed + t_idx),
-                .f32 => return error.UnexpectedTensorDType,
+                .f32, .u32 => return error.UnexpectedTensorDType,
             }
             t_idx += 1;
             const inv_sqrt_mi = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.moe_intermediate_size)));
@@ -1978,6 +1980,7 @@ const CpuTransformerRef = struct {
                     y[row] = acc;
                 }
             },
+            .u32 => return error.UnexpectedTensorDType,
         }
     }
 
@@ -2033,7 +2036,7 @@ const CpuTransformerRef = struct {
                     for (0..64) |j| out_f16[g * 64 + j] = @floatCast(tmp[j]);
                 }
             },
-            .f32 => return error.UnexpectedTensorDType,
+            .f32, .u32 => return error.UnexpectedTensorDType,
         }
     }
 

@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import pathlib
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -15,9 +16,12 @@ from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import DType, TensorKind
 from aminfer_tools.cli import main
 from aminfer_tools.synth import (
+    DRAFT_PRESETS,
     PRESETS,
+    DraftSynthConfig,
     Qwen3SynthConfig,
     bytes_to_unicode,
+    generate_draft_bundle,
     generate_qwen3_bundle,
 )
 
@@ -290,6 +294,154 @@ class SynthTests(unittest.TestCase):
                 moe_intermediate_size=0,
                 num_experts=0,
                 num_experts_per_tok=0,
+            ).validate()
+
+    def test_synth_draft_eagle3_eagle2_mtp_and_zig_verify(self) -> None:
+        self.assertTrue(AMINFER_BIN.exists(), f"missing {AMINFER_BIN}; run `zig build` first")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+
+            # 1. EAGLE-3: deterministic, exact RedHatAI/Eagle3DraftModel tensor layout + u32 d2t.
+            e3_cfg = DRAFT_PRESETS["tiny-eagle3"]
+            b1 = generate_draft_bundle(tmp / "e3_1", e3_cfg, seed=42)
+            b2 = generate_draft_bundle(tmp / "e3_2", e3_cfg, seed=42)
+            b3 = generate_draft_bundle(tmp / "e3_3", e3_cfg, seed=99)
+            self.assertEqual(_sha256(b1.amf_path), _sha256(b2.amf_path))
+            self.assertEqual(_sha256(b1.config_path), _sha256(b2.config_path))
+            self.assertNotEqual(_sha256(b1.amf_path), _sha256(b3.amf_path))
+            self.assertEqual(b1.amf_path.stat().st_size % APPLE_PAGE_SIZE, 0)
+
+            e3_by_name = {m.name: m for m in b1.metas}
+            self.assertEqual(len(e3_by_name), 15)
+            h = e3_cfg.hidden_size
+            q_dim = e3_cfg.num_attention_heads * e3_cfg.head_dim
+            kv_dim = e3_cfg.num_key_value_heads * e3_cfg.head_dim
+            self.assertEqual(e3_by_name["d2t"].dtype, DType.U32)
+            self.assertEqual(e3_by_name["d2t"].kind, TensorKind.DENSE)
+            self.assertEqual(e3_by_name["d2t"].shape, (e3_cfg.draft_vocab_size,))
+            self.assertEqual(e3_by_name["fc.weight"].shape, (h, 3 * h))
+            self.assertEqual(e3_by_name["layers.0.input_layernorm.weight"].shape, (h,))
+            self.assertEqual(e3_by_name["layers.0.hidden_norm.weight"].shape, (h,))
+            self.assertEqual(e3_by_name["layers.0.self_attn.q_proj.weight"].shape, (q_dim, 2 * h))
+            self.assertEqual(e3_by_name["layers.0.self_attn.k_proj.weight"].shape, (kv_dim, 2 * h))
+            self.assertEqual(e3_by_name["layers.0.self_attn.v_proj.weight"].shape, (kv_dim, 2 * h))
+            self.assertEqual(e3_by_name["layers.0.self_attn.o_proj.weight"].shape, (h, q_dim))
+            self.assertEqual(e3_by_name["layers.0.post_attention_layernorm.weight"].shape, (h,))
+            self.assertEqual(e3_by_name["layers.0.mlp.gate_proj.weight"].shape, (e3_cfg.intermediate_size, h))
+            self.assertEqual(e3_by_name["layers.0.mlp.up_proj.weight"].shape, (e3_cfg.intermediate_size, h))
+            self.assertEqual(e3_by_name["layers.0.mlp.down_proj.weight"].shape, (h, e3_cfg.intermediate_size))
+            self.assertEqual(e3_by_name["norm.weight"].shape, (h,))
+            self.assertEqual(e3_by_name["lm_head.weight"].shape, (e3_cfg.draft_vocab_size, h))
+            self.assertEqual(e3_by_name["embed_tokens.weight"].shape, (e3_cfg.vocab_size, h))
+
+            # Validate d2t bytes are strictly increasing unique u32 target token IDs < vocab_size.
+            raw_amf = b1.amf_path.read_bytes()
+            d2t_m = e3_by_name["d2t"]
+            d2t_ids = list(
+                struct.unpack(
+                    f"<{e3_cfg.draft_vocab_size}I",
+                    raw_amf[d2t_m.blob_offset : d2t_m.blob_offset + d2t_m.data_bytes],
+                )
+            )
+            self.assertEqual(len(set(d2t_ids)), e3_cfg.draft_vocab_size)
+            self.assertEqual(d2t_ids, sorted(d2t_ids))
+            self.assertLess(max(d2t_ids), e3_cfg.vocab_size)
+
+            e3_json = json.loads(b1.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(e3_json["architectures"], ["Eagle3DraftModel"])
+            self.assertEqual(e3_json["draft_vocab_size"], e3_cfg.draft_vocab_size)
+            self.assertTrue(e3_json["norm_before_residual"])
+            self.assertIsNone(e3_json["eagle_aux_hidden_state_layer_ids"])
+            self.assertEqual(e3_json["transformer_layer_config"]["hidden_size"], h)
+            self.assertEqual(e3_json["transformer_layer_config"]["vocab_size"], e3_cfg.vocab_size)
+
+            # 2. EAGLE-2: fc.weight [H, 2*H] + 1 standard GQA decoder layer + norm + lm_head.
+            e2_cfg = DRAFT_PRESETS["tiny-eagle2"]
+            b_e2 = generate_draft_bundle(tmp / "e2", e2_cfg, seed=11)
+            e2_by_name = {m.name: m for m in b_e2.metas}
+            self.assertEqual(e2_by_name["fc.weight"].shape, (h, 2 * h))
+            self.assertEqual(e2_by_name["layers.0.self_attn.q_proj.weight"].shape, (q_dim, h))
+            self.assertEqual(e2_by_name["layers.0.self_attn.k_proj.weight"].shape, (kv_dim, h))
+            self.assertEqual(e2_by_name["lm_head.weight"].shape, (e2_cfg.vocab_size, h))
+            self.assertEqual(e2_by_name["norm.weight"].shape, (h,))
+            self.assertNotIn("d2t", e2_by_name)
+            self.assertNotIn("layers.0.hidden_norm.weight", e2_by_name)
+            e2_json = json.loads(b_e2.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(e2_json["draft_format"], "eagle2")
+
+            # 3. MTP (D3): enorm, hnorm, eh_proj [H, 2*H], QK-norm GQA layer, shared_head.norm, optional lm_head.
+            mtp_cfg = DRAFT_PRESETS["tiny-mtp"]
+            b_mtp = generate_draft_bundle(tmp / "mtp", mtp_cfg, seed=13)
+            mtp_by_name = {m.name: m for m in b_mtp.metas}
+            self.assertEqual(mtp_by_name["enorm.weight"].shape, (h,))
+            self.assertEqual(mtp_by_name["hnorm.weight"].shape, (h,))
+            self.assertEqual(mtp_by_name["eh_proj.weight"].shape, (h, 2 * h))
+            self.assertEqual(mtp_by_name["layers.0.self_attn.q_norm.weight"].shape, (mtp_cfg.head_dim,))
+            self.assertEqual(mtp_by_name["layers.0.self_attn.k_norm.weight"].shape, (mtp_cfg.head_dim,))
+            self.assertEqual(mtp_by_name["shared_head.norm.weight"].shape, (h,))
+            self.assertNotIn("lm_head.weight", mtp_by_name)
+            self.assertNotIn("embed_tokens.weight", mtp_by_name)
+            mtp_json = json.loads(b_mtp.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(mtp_json["draft_format"], "mtp")
+            self.assertTrue(mtp_json["has_qk_norm"])
+            self.assertTrue(mtp_json["share_lm_head"])
+
+            # MTP with dedicated lm_head + f16 weights + no qk-norm via CLI.
+            mtp_cli_dir = tmp / "mtp_cli"
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = main(
+                    [
+                        "synth-draft",
+                        "--format",
+                        "mtp",
+                        "--output-dir",
+                        str(mtp_cli_dir),
+                        "--dtype",
+                        "f16",
+                        "--no-qk-norm",
+                        "--include-lm-head",
+                        "--seed",
+                        "7",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("synthesized mtp draft", buf.getvalue())
+            mtp_cli_json = json.loads((mtp_cli_dir / "config.json").read_text(encoding="utf-8"))
+            self.assertFalse(mtp_cli_json["has_qk_norm"])
+            self.assertFalse(mtp_cli_json["share_lm_head"])
+
+            # Cross-language verification of every generated draft .amf by Zig verify-amf.
+            for amf_path in (b1.amf_path, b_e2.amf_path, b_mtp.amf_path, mtp_cli_dir / "model.amf"):
+                proc = subprocess.run(
+                    [str(AMINFER_BIN), "verify-amf", str(amf_path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 0, msg=f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}")
+                self.assertIn("amf.status       ok", proc.stdout)
+
+    def test_invalid_draft_configs_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            DRAFT_PRESETS["tiny-eagle3"].with_overrides(draft_format="unknown").validate()
+        with self.assertRaises(ValueError):
+            DRAFT_PRESETS["tiny-eagle3"].with_overrides(draft_vocab_size=9999).validate()
+        with self.assertRaises(ValueError):
+            DRAFT_PRESETS["tiny-eagle2"].with_overrides(draft_vocab_size=256).validate()
+        with self.assertRaises(ValueError):
+            DRAFT_PRESETS["tiny-mtp"].with_overrides(dtype="fp8").validate()
+        with self.assertRaises(ValueError):
+            DraftSynthConfig(
+                model_id="bad",
+                draft_format="eagle3",
+                vocab_size=512,
+                draft_vocab_size=256,
+                hidden_size=100,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=64,
+                intermediate_size=256,
             ).validate()
 
 

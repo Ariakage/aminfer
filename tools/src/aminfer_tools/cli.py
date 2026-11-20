@@ -10,7 +10,14 @@ from collections.abc import Sequence
 
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import DTYPE_MODES, pack_amf_from_safetensors
-from aminfer_tools.synth import PRESETS, generate_qwen3_bundle
+from aminfer_tools.synth import (
+    DRAFT_DTYPES,
+    DRAFT_FORMATS,
+    DRAFT_PRESETS,
+    PRESETS,
+    generate_draft_bundle,
+    generate_qwen3_bundle,
+)
 
 
 def align_up(length: int, alignment: int = APPLE_PAGE_SIZE) -> int:
@@ -35,6 +42,19 @@ def _parse_cold_experts(raw: str | None) -> set[tuple[int, int]]:
             raise ValueError(f"expected LAYER:EXPERT in --cold-experts, got {item!r}")
         result.add((int(layer_str), int(expert_str)))
     return result
+
+
+def _parse_csv(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [tok.strip() for tok in raw.split(",") if tok.strip()]
+
+
+def _parse_int_csv(raw: str | None) -> tuple[int, ...] | None:
+    items = _parse_csv(raw)
+    if not items:
+        return None
+    return tuple(int(tok) for tok in items)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -100,6 +120,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Mark every expert tensor as cold_expert",
     )
+    pack.add_argument(
+        "--exclude-tensors",
+        default=None,
+        help="Comma-separated tensor names to omit from the output .amf (e.g. embed_tokens.weight)",
+    )
 
     synth = sub.add_parser(
         "synth-qwen3",
@@ -143,6 +168,54 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated LAYER:EXPERT pairs to mark as cold_expert",
     )
 
+    draft = sub.add_parser(
+        "synth-draft",
+        help="Generate deterministic synthetic L2 draft head bundles (eagle3, eagle2, mtp; ADR-0013)",
+    )
+    draft_src = draft.add_mutually_exclusive_group(required=True)
+    draft_src.add_argument(
+        "--format",
+        choices=DRAFT_FORMATS,
+        default=None,
+        help="L2 draft head layout (starts from matching tiny-* preset)",
+    )
+    draft_src.add_argument(
+        "--preset",
+        choices=sorted(DRAFT_PRESETS.keys()),
+        default=None,
+        help="Named synthetic draft head preset",
+    )
+    draft.add_argument(
+        "--output-dir",
+        required=True,
+        type=pathlib.Path,
+        help="Directory where model.amf and config.json are written",
+    )
+    draft.add_argument("--vocab-size", type=int, default=None, help="Override target vocabulary size")
+    draft.add_argument("--draft-vocab-size", type=int, default=None, help="Override EAGLE-3 reduced draft vocabulary size")
+    draft.add_argument("--hidden-size", type=int, default=None, help="Override hidden size")
+    draft.add_argument("--num-heads", type=int, default=None, help="Override attention head count")
+    draft.add_argument("--num-kv-heads", type=int, default=None, help="Override KV head count")
+    draft.add_argument("--head-dim", type=int, default=None, help="Override attention head dimension")
+    draft.add_argument("--intermediate-size", type=int, default=None, help="Override MLP intermediate dimension")
+    draft.add_argument("--dtype", choices=DRAFT_DTYPES, default=None, help="Weight precision (default: preset)")
+    draft.add_argument("--model-id", default=None, help="Override model identifier stored in .amf header")
+    draft.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed (default: 42)")
+    draft.add_argument(
+        "--aux-layer-ids",
+        default=None,
+        help="Comma-separated EAGLE-3 aux hidden state layer IDs (e.g. 2,24,45)",
+    )
+    draft_qk = draft.add_mutually_exclusive_group()
+    draft_qk.add_argument("--qk-norm", dest="include_qk_norm", action="store_const", const=True, default=None)
+    draft_qk.add_argument("--no-qk-norm", dest="include_qk_norm", action="store_const", const=False)
+    draft_emb = draft.add_mutually_exclusive_group()
+    draft_emb.add_argument("--include-embed-tokens", dest="include_embed_tokens", action="store_const", const=True, default=None)
+    draft_emb.add_argument("--no-embed-tokens", dest="include_embed_tokens", action="store_const", const=False)
+    draft_lm = draft.add_mutually_exclusive_group()
+    draft_lm.add_argument("--include-lm-head", dest="include_lm_head", action="store_const", const=True, default=None)
+    draft_lm.add_argument("--no-lm-head", dest="include_lm_head", action="store_const", const=False)
+
     sub.add_parser(
         "expert-heat",
         help="Compute offline MoE expert activation heat statistics (planned: M4)",
@@ -159,6 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "pack-amf":
         cold = _parse_cold_experts(args.cold_experts)
+        excludes = _parse_csv(args.exclude_tensors)
         started = time.monotonic()
         metas = pack_amf_from_safetensors(
             args.input,
@@ -169,6 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             all_experts_cold=args.all_experts_cold,
             dtype_mode=args.dtype,
             tie_word_embeddings=args.tie_word_embeddings,
+            exclude_tensors=excludes,
         )
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
@@ -179,6 +254,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"packed {len(metas)} tensors into {args.output} ({total_bytes} bytes) "
             f"in {elapsed:.1f} s [{dtype_summary}]"
+        )
+        return 0
+
+    if args.command == "synth-draft":
+        preset_key = args.preset if args.preset is not None else f"tiny-{args.format}"
+        cfg = DRAFT_PRESETS[preset_key]
+        overrides: dict[str, object] = {}
+        if args.vocab_size is not None:
+            overrides["vocab_size"] = args.vocab_size
+            if cfg.draft_format != "eagle3" and args.draft_vocab_size is None:
+                overrides["draft_vocab_size"] = args.vocab_size
+        if args.draft_vocab_size is not None:
+            overrides["draft_vocab_size"] = args.draft_vocab_size
+        if args.hidden_size is not None:
+            overrides["hidden_size"] = args.hidden_size
+        if args.num_heads is not None:
+            overrides["num_attention_heads"] = args.num_heads
+        if args.num_kv_heads is not None:
+            overrides["num_key_value_heads"] = args.num_kv_heads
+        if args.head_dim is not None:
+            overrides["head_dim"] = args.head_dim
+        if args.intermediate_size is not None:
+            overrides["intermediate_size"] = args.intermediate_size
+        if args.dtype is not None:
+            overrides["dtype"] = args.dtype
+        if args.model_id is not None:
+            overrides["model_id"] = args.model_id
+        aux_ids = _parse_int_csv(args.aux_layer_ids)
+        if aux_ids is not None:
+            overrides["aux_layer_ids"] = aux_ids
+        if args.include_qk_norm is not None:
+            overrides["include_qk_norm"] = args.include_qk_norm
+        if args.include_embed_tokens is not None:
+            overrides["include_embed_tokens"] = args.include_embed_tokens
+        if args.include_lm_head is not None:
+            overrides["include_lm_head"] = args.include_lm_head
+        if overrides:
+            cfg = cfg.with_overrides(**overrides)
+        bundle = generate_draft_bundle(args.output_dir, cfg, seed=args.seed)
+        print(
+            f"synthesized {cfg.draft_format} draft ({len(bundle.metas)} tensors, "
+            f"{bundle.total_bytes} bytes) into {bundle.amf_path.parent}"
         )
         return 0
 

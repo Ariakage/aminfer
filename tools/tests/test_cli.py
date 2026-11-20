@@ -28,6 +28,7 @@ class CliTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("pack-amf", text)
         self.assertIn("synth-qwen3", text)
+        self.assertIn("synth-draft", text)
         self.assertIn("expert-heat", text)
         self.assertIn("export-coreml", text)
 
@@ -37,10 +38,19 @@ class CliTests(unittest.TestCase):
             main(["pack-amf", "--help"])
         self.assertEqual(ctx.exception.code, 0)
         text = out.getvalue()
-        for flag in ("--dtype", "--tie-word-embeddings", "--keep-tied-lm-head", "index.json"):
+        for flag in ("--dtype", "--tie-word-embeddings", "--keep-tied-lm-head", "--exclude-tensors", "index.json"):
             self.assertIn(flag, text)
         for mode in ("auto", "f16", "bf16"):
             self.assertIn(mode, text)
+
+    def test_synth_draft_help_lists_m3_formats(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+            main(["synth-draft", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        text = out.getvalue()
+        for token in ("--format", "--preset", "eagle3", "eagle2", "mtp", "--output-dir"):
+            self.assertIn(token, text)
 
     def test_planned_subcommands_report_unimplemented(self) -> None:
         for cmd in ("expert-heat", "export-coreml"):

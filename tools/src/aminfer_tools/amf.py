@@ -88,6 +88,7 @@ class DType(enum.IntEnum):
     Q4_AFFINE = 2
     Q3_AFFINE = 3
     BF16 = 4
+    U32 = 5
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,39 @@ def f16_bytes_to_bf16_bytes(raw: bytes | bytearray | memoryview) -> bytes:
     return out.tobytes()
 
 
+def d2t_deltas_to_u32_bytes(
+    raw: bytes | bytearray | memoryview,
+    *,
+    elem_bytes: int,
+    start_index: int = 0,
+    what: str = "d2t",
+) -> bytes:
+    """Convert EAGLE-3 signed `d2t` offset deltas (I64 or I32) to direct u32 target token IDs.
+
+    Each entry `j` (global draft token index `i = start_index + j`) maps to
+    `target_id = i + int(d2t[i])`, validated to lie within `0 <= target_id < 2^32`.
+    """
+    if elem_bytes not in (4, 8):
+        raise ValueError(f"{what}: expected 4- or 8-byte signed integers, got {elem_bytes}")
+    if len(raw) % elem_bytes != 0:
+        raise ValueError(f"{what}: byte length {len(raw)} is not a multiple of {elem_bytes}")
+    count = len(raw) // elem_bytes
+    fmt_in = "q" if elem_bytes == 8 else "i"
+    deltas = struct.unpack(f"<{count}{fmt_in}", raw)
+    out = array.array("I")
+    for j, delta in enumerate(deltas):
+        idx = start_index + j
+        target_id = idx + delta
+        if target_id < 0 or target_id > 0xFFFFFFFF:
+            raise ValueError(
+                f"{what}[{idx}]: target token id {idx} + {delta} = {target_id} is outside u32 range"
+            )
+        out.append(target_id)
+    if sys.byteorder != "little":
+        out.byteswap()
+    return out.tobytes()
+
+
 def interleave_scale_bias_f16(scales_f16: bytes, biases_f16: bytes) -> bytes:
     """Interleave separate fp16 scales and biases into half2(scale, bias) pairs."""
     if len(scales_f16) != len(biases_f16) or len(scales_f16) % 2 != 0:
@@ -228,12 +262,12 @@ def _classify_tensor(
         is_cold = all_experts_cold or (layer, expert) in cold_experts
         return (TensorKind.COLD_EXPERT if is_cold else TensorKind.HOT_EXPERT, layer, expert)
     lower = name.lower()
+    if "norm" in lower:
+        return (TensorKind.NORM, layer, expert)
     if "embed" in lower:
         return (TensorKind.EMBEDDING, layer, expert)
     if "lm_head" in lower:
         return (TensorKind.LM_HEAD, layer, expert)
-    if "norm" in lower:
-        return (TensorKind.NORM, layer, expert)
     if lower.endswith(".mlp.gate") or lower.endswith(".mlp.gate.weight"):
         return (TensorKind.ROUTER, layer, expert)
     return (TensorKind.DENSE, layer, expert)
@@ -434,7 +468,7 @@ class _PlannedEntry:
     expert: int
     shape: tuple[int, ...]
     data: _ByteRange
-    data_convert: str | None  # None, "bf16_to_f16" or "f16_to_bf16"
+    data_convert: str | None  # None, "bf16_to_f16", "f16_to_bf16", "d2t_i64_to_u32", "d2t_i32_to_u32"
     scales: _ByteRange | None
     biases: _ByteRange | None
     data_bytes: int
@@ -556,7 +590,17 @@ def _unquantized_target(dtype_str: str, dtype_mode: str, name: str) -> tuple[DTy
         return (DType.F16, "bf16_to_f16") if dtype_mode == "f16" else (DType.BF16, None)
     if dtype_str == "F32":
         return DType.F32, None
+    if dtype_str == "U32":
+        return DType.U32, None
     raise ValueError(f"unsupported unquantized dtype {dtype_str} for {name}")
+
+
+def _is_d2t_name(norm_name: str) -> bool:
+    return norm_name == "d2t" or norm_name.endswith(".d2t")
+
+
+def _is_t2d_name(norm_name: str) -> bool:
+    return norm_name == "t2d" or norm_name.endswith(".t2d")
 
 
 def _make_entry(
@@ -578,7 +622,10 @@ def _make_entry(
         raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(name_bytes)}: {name!r}")
     if not (1 <= len(shape) <= 4):
         raise ValueError(f"tensor rank must be 1..4 for {name!r}, got {len(shape)}")
-    data_bytes = data.length  # conversions between f16 and bf16 preserve byte length
+    if data_convert == "d2t_i64_to_u32":
+        data_bytes = (data.length // 8) * 4
+    else:
+        data_bytes = data.length  # f16<->bf16, i32->u32 and raw copies preserve byte length
     if scales is not None:
         params_offset = _align_up(data_bytes, 64)
         groups = scales.length // _SAFETENSORS_DTYPE_BYTES[scales.dtype]
@@ -629,6 +676,7 @@ def plan_amf_entries(
     cold_experts: Iterable[tuple[int, int]] = (),
     all_experts_cold: bool = False,
     tie_word_embeddings: bool = False,
+    exclude_tensors: Iterable[str] = (),
 ) -> list[_PlannedEntry]:
     """Pass 1: plan every output entry from shard headers alone."""
     if group_size != 64:
@@ -636,6 +684,15 @@ def plan_amf_entries(
     if dtype_mode not in DTYPE_MODES:
         raise ValueError(f"dtype_mode must be one of {DTYPE_MODES}, got {dtype_mode!r}")
     cold_set = set(cold_experts)
+    excluded: set[str] = set()
+    for item in exclude_tensors:
+        tok = item.strip()
+        if tok:
+            excluded.add(tok)
+            excluded.add(_normalize_lenient(tok))
+
+    def is_excluded(raw_name: str) -> bool:
+        return raw_name in excluded or _normalize_lenient(raw_name) in excluded
 
     quant_prefixes: set[str] = set()
     for name in tensors:
@@ -645,11 +702,16 @@ def plan_amf_entries(
                 quant_prefixes.add(prefix)
 
     def is_lm_head(name: str) -> bool:
-        return _normalize_lenient(name) in ("lm_head", "lm_head.weight") or _normalize_lenient(name).startswith(
-            "lm_head."
-        )
+        norm = _normalize_lenient(name)
+        return norm in ("lm_head", "lm_head.weight") or norm.startswith("lm_head.")
 
-    has_embed = any(_normalize_lenient(n) in ("embed_tokens.weight", "embed_tokens.scales") for n in tensors)
+    embed_rows: int | None = None
+    for n, t in tensors.items():
+        if _normalize_lenient(n) in ("embed_tokens.weight", "embed_tokens.scales"):
+            if not is_excluded(n) and not is_excluded("embed_tokens"):
+                embed_rows = t.shape[0] if t.shape else None
+                break
+    has_embed = embed_rows is not None
     skip_lm_head = tie_word_embeddings and has_embed
 
     entries: list[_PlannedEntry] = []
@@ -660,7 +722,9 @@ def plan_amf_entries(
         s = tensors[f"{prefix}.scales"]
         b = tensors[f"{prefix}.biases"]
         consumed.update((w.name, s.name, b.name))
-        if skip_lm_head and is_lm_head(prefix):
+        if is_excluded(prefix) or is_excluded(w.name):
+            continue
+        if skip_lm_head and is_lm_head(prefix) and (embed_rows is None or w.shape[0] == embed_rows):
             continue
         if w.dtype != "U32":
             raise ValueError(f"expected U32 packed weights for {w.name}, got {w.dtype}")
@@ -728,9 +792,21 @@ def plan_amf_entries(
         if name in consumed:
             continue
         t = tensors[name]
-        if skip_lm_head and is_lm_head(name):
+        norm_lenient = _normalize_lenient(name)
+        if is_excluded(name):
             continue
-        amf_dtype, convert = _unquantized_target(t.dtype, dtype_mode, name)
+        # EAGLE-3 training-only target-to-draft boolean mask is omitted at inference.
+        if t.dtype == "BOOL" and _is_t2d_name(norm_lenient):
+            continue
+        if skip_lm_head and is_lm_head(name) and (embed_rows is None or t.shape[0] == embed_rows):
+            continue
+        if _is_d2t_name(norm_lenient) and t.dtype in ("I64", "I32"):
+            if len(t.shape) != 1 or t.shape[0] == 0:
+                raise ValueError(f"EAGLE-3 d2t tensor {name!r} must be non-empty 1D, got shape {list(t.shape)}")
+            amf_dtype = DType.U32
+            convert: str | None = "d2t_i64_to_u32" if t.dtype == "I64" else "d2t_i32_to_u32"
+        else:
+            amf_dtype, convert = _unquantized_target(t.dtype, dtype_mode, name)
         if name.endswith(".weight"):
             switch = _SWITCH_MLP_RE.match(name[: -len(".weight")])
         else:
@@ -853,6 +929,24 @@ def _stream_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) 
             take = min(_COPY_CHUNK_BYTES, entry.data.length - done)
             w.write(_read_exact(src, entry.data.offset + done, take))
             done += take
+    elif entry.data_convert in ("d2t_i64_to_u32", "d2t_i32_to_u32"):
+        elem_bytes = 8 if entry.data_convert == "d2t_i64_to_u32" else 4
+        step = _CONVERT_CHUNK_ELEMS * elem_bytes
+        done = 0
+        elem_idx = 0
+        while done < entry.data.length:
+            take = min(step, entry.data.length - done)
+            raw = _read_exact(src, entry.data.offset + done, take)
+            w.write(
+                d2t_deltas_to_u32_bytes(
+                    raw,
+                    elem_bytes=elem_bytes,
+                    start_index=elem_idx,
+                    what=entry.name,
+                )
+            )
+            done += take
+            elem_idx += take // elem_bytes
     else:
         step = _CONVERT_CHUNK_ELEMS * 2
         done = 0
@@ -908,16 +1002,20 @@ def pack_amf_from_safetensors(
     all_experts_cold: bool = False,
     dtype_mode: str = "auto",
     tie_word_embeddings: bool | None = None,
+    exclude_tensors: Iterable[str] = (),
 ) -> list[PackedTensorMeta]:
     """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
 
     `input_path` may be a `.safetensors` file, a `model.safetensors.index.json`
     file, or a checkpoint directory. `dtype_mode` is `auto` (preserve unquantized
-    F16 / BF16 / F32 bit-exact), `f16` (convert unquantized BF16 to F16), or
-    `bf16` (convert unquantized F16 to BF16). MLX affine `.weight/.scales/.biases`
-    triples always pack as `q3_affine` / `q4_affine` with `half2(scale, bias)`
-    parameters. `tie_word_embeddings=None` reads `config.json` next to the
-    input; when tied, a duplicate `lm_head` is not emitted.
+    F16 / BF16 / F32 / U32 bit-exact), `f16` (convert unquantized BF16 to F16),
+    or `bf16` (convert unquantized F16 to BF16). EAGLE-3 `d2t` signed offset
+    tables (`I64` / `I32`, 1D) are converted to direct `u32` target token IDs
+    (`i + d2t[i]`), and training-only `BOOL` `t2d` masks are skipped. MLX affine
+    `.weight/.scales/.biases` triples always pack as `q3_affine` / `q4_affine`
+    with `half2(scale, bias)` parameters. `tie_word_embeddings=None` reads
+    `config.json` next to the input; when tied (and shapes match), a duplicate
+    `lm_head` is not emitted.
     """
     model_id_bytes = model_id.encode("utf-8")
     if len(model_id_bytes) == 0 or len(model_id_bytes) > 63:
@@ -933,6 +1031,7 @@ def pack_amf_from_safetensors(
         cold_experts=cold_experts,
         all_experts_cold=all_experts_cold,
         tie_word_embeddings=tie,
+        exclude_tensors=exclude_tensors,
     )
 
     tensor_count = len(plan)
