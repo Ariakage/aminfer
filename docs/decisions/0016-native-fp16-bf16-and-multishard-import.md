@@ -125,9 +125,23 @@ Schedule **Milestone M2.5** immediately before M3 with the following design:
   compiles `bfloat`, `bfloat4`, `simdgroup_bfloat8x8`, and `simdgroup_half8x8`
   `simdgroup_multiply_accumulate` into `simdgroup_float8x8` cleanly with zero
   warnings.
-- Local reference checkpoints staged on external NVMe (`/Volumes/Akari/models/`):
-  `Qwen/Qwen3-0.6B` (`BF16`, 1 shard), `mlx-community/Qwen3-14B-4bit` (2 shards),
-  and `mlx-community/Qwen3-30B-A3B-3bit` (3 shards).
+- Local reference checkpoints downloaded and verified on external NVMe
+  (`/Volumes/Akari/models/`), revealing three real-checkpoint layout details
+  that M2.5's importer and loader will handle directly:
+  - `Qwen/Qwen3-0.6B` (`1.40 GiB`, 1 shard, `311` tensors, all `BF16`,
+    `tie_word_embeddings: true` with both `embed_tokens.weight` and
+    `lm_head.weight` present, `qDim = 2048 != hidden_size = 1024`).
+  - `mlx-community/Qwen3-14B-4bit` (`7.74 GiB`, 2 shards, `1007` tensors,
+    `SHA-256` verified): MLX quantizes `embed_tokens` (`U32 [151936, 640]`,
+    4-bit affine group-64) as well as linear projections, while norms are
+    `BF16`.
+  - `mlx-community/Qwen3-30B-A3B-3bit` (`12.44 GiB`, 3 shards, `1351` tensors,
+    `SHA-256` verified): MLX quantizes `embed_tokens` and the MoE router
+    `mlp.gate` (3-bit affine group-64) and stores routed experts as stacked 3D
+    `mlp.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}` tensors
+    (`[128, N, K_packed]`), which `pack-amf` will slice/pack into `.amf`
+    expert blobs (and either dequantize tiny quantized routers/embeddings or
+    support quantized embedding lookup in M2.5).
 
 ## Open items
 
