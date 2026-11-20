@@ -29,7 +29,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | F4 | `ExpertSource` tagged union (`thunderbolt_peer` reserved) | Implemented | M0 | [ADR-0003](decisions/0003-expert-source-tagged-union.md) |
 | F5 | Zero-copy `MTLBuffer` over a wired region (`newBufferWithBytesNoCopy`) | Implemented | M0 | [ADR-0002](decisions/0002-page-alignment-and-zero-copy.md) |
 | F6 | Metal 4 command path (reusable allocator and command buffer, residency set, shared-event completion) | Implemented (M0 smoke; M1 hot path Confirmed) | M0 smoke, M1 hot path | [ADR-0011](decisions/0011-metal4-zero-allocation-hot-path.md) |
-| F7 | uv-managed offline tools scaffold | Confirmed | M0 | [ADR-0001](decisions/0001-language-and-toolchain-boundaries.md) |
+| F7 | uv-managed offline tools scaffold | Implemented | M0 | [ADR-0001](decisions/0001-language-and-toolchain-boundaries.md) |
 | F8 | `justfile` shortcuts (`sysctl`, `uv`, `powermetrics`) | Confirmed | M0 | [system-tuning.md](guides/system-tuning.md) |
 | F9 | Platform probe: sysctl facts (page size, memory, core counts, wire limits) | Implemented | M0 | [hardware.md](architecture/hardware.md) |
 

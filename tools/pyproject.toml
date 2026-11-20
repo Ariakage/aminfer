@@ -1,0 +1,18 @@
+[project]
+name = "aminfer-tools"
+version = "0.0.0"
+description = "Offline model conversion, expert heat analysis, and CoreML export tools for aminfer"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+authors = [
+    { name = "ariakage", email = "ariakage233@gmail.com" },
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+aminfer-tools = "aminfer_tools.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"

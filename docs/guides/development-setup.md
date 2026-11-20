@@ -56,7 +56,8 @@ GPU; they do not run in headless CI without one.
 ```sh
 cd tools
 uv sync
-uv run --help
+uv run aminfer-tools --help
+uv run python -m unittest discover -s tests
 ```
 
 ## Repository index
