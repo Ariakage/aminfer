@@ -21,7 +21,7 @@ Status-row IDs refer to [status.md](status.md).
 | M2.5 | Standard FP16 / BF16 and multi-shard import | W12, W13, G12 | Multi-shard `aminfer-tools pack-amf` converts local `Qwen3-30B-A3B-3bit`, `Qwen3-14B-4bit`, and `Qwen3-0.6B` (`BF16`) with bounded RAM; native `FP16` and `BF16` GEMV / GEMM / MoE SwiGLU match CPU fp32 reference; real-checkpoint greedy decode verified end-to-end (incl. `Qwen3-0.6B` `BF16`) with bandwidth archived in [benchmarks/results.md](benchmarks/results.md) | Completed |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2/M2.5; speedup over the non-speculative baseline, acceptance-length and experts-per-pass statistics recorded | Completed |
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Not started |
-| M5 | Serving and pipelining | C6–C8, D8 | Streaming server under load; pipelined-drafting gain measured | Not started |
+| M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Not started |
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`) | R6, W9, W10, G7–G9, G10 (GR), C10 (PLE) | Composable model operator graph; `Qwen3.8-Flash-Next` (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end (128 GB+ full wired residency; 24 GB M4 hot/cold + PLE async prefetch without swap) | Not started |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
@@ -278,6 +278,11 @@ Tier 2 `Qwen3.8-Flash-Next` (`qwen4_exp`, M6) and Tier 3
 clusters), and scheduled **M2.5** right before M3 for native `FP16` / `BF16`
 execution and multi-shard safetensors streaming import
 ([ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md)).
+During M3 close-out on 2026-11-21, the optional offline **GSQ + RCO**
+per-tensor / per-expert hybrid quantization pipeline (`W14`, `G13`, targeting
+M5 with strict per-block granularity and zero runtime Python or intra-tensor
+bit mixing) was accepted as
+[ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md).
 
 ## Session handoff snapshot
 
@@ -314,8 +319,11 @@ Update this before the context window runs out or when handing off.
     KV commit, CoreML ANE zero-copy bridge & Spikes `S4`/`S5` (`G5`, `D5`, `S4`,
     `S5`), `d240329` `.amf` `u32` dtype & EAGLE-3/EAGLE-2/MTP draft head packers,
     `034492f` end-to-end `DraftHead`/`SpecEngine`/`Qwen3Model.verifyTree`,
-    `aminfer spec-decode` & `bench-m3` (`D2`, `D3`, `D5`–`D7`, `D9`, `G5`), plus
-    M3 benchmark archive & close-out docs
+    `aminfer spec-decode` & `bench-m3` (`D2`, `D3`, `D5`–`D7`, `D9`, `G5`),
+    `e46b7f5` M3 benchmark archive & close-out docs
+  - Roadmap docs: `880d487` optional offline GSQ+RCO hybrid quantization
+    ([ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md)), plus
+    `W14`/`G13` status & process registration
 - In flight: none (M3 completed; ready to begin M4 Neural Engine and storage)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
@@ -325,4 +333,5 @@ Update this before the context window runs out or when handing off.
   [decisions/0009-expert-byte-budget-tree-pruning.md](decisions/0009-expert-byte-budget-tree-pruning.md),
   [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md),
   [decisions/0013-eagle-tree-and-head-formats.md](decisions/0013-eagle-tree-and-head-formats.md),
-  [decisions/0016-native-fp16-bf16-and-multishard-import.md](decisions/0016-native-fp16-bf16-and-multishard-import.md)
+  [decisions/0016-native-fp16-bf16-and-multishard-import.md](decisions/0016-native-fp16-bf16-and-multishard-import.md),
+  [decisions/0017-optional-gsq-rco-hybrid-quantization.md](decisions/0017-optional-gsq-rco-hybrid-quantization.md)

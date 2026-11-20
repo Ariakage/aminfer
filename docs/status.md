@@ -62,6 +62,7 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | W11 | Tier 3 target: **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`, 552B CED MoE + 196B Engram) `.amf` converter and Causal Encoder-Decoder scheduler (512 GB Ultra / TB5 cluster) | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | W12 | Multi-shard Hugging Face / MLX safetensors (`model.safetensors.index.json`) streaming import and `.amf` `bf16` (`DType.bf16 = 4`) weight support | Implemented | M2.5 | [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md), [experts-and-storage.md](architecture/experts-and-storage.md#amf-format), [results.md](benchmarks/results.md) |
 | W13 | Standard unquantized and mixed-precision `FP16` / `BF16` model execution (`tie_word_embeddings`, per-tensor dtype dispatch, `RGBA16Float` `KvTile` boundary; verified on `Qwen3-0.6B` BF16, `Qwen3-14B-4bit`, and `Qwen3-30B-A3B-3bit`) | Implemented | M2.5 | [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md), [memory.md](architecture/memory.md#kv-tiles), [results.md](benchmarks/results.md) |
+| W14 | Optional offline Python GSQ + RCO sensitivity & residual-compensation `.amf` exporter with static per-tensor / per-expert `QuantScheme` tags (`q2`/`q3`/`q4`/`q6`/`q8` affine + `f16`/`bf16`) | Confirmed | M5 | [ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md), [experts-and-storage.md](architecture/experts-and-storage.md) |
 
 ## GPU (L3)
 
@@ -79,6 +80,7 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | G10 | Multi-branch residual stream kernels: 4-branch Gated Residual (GR) and Single-Pass mHC (Mega-mHC) | Confirmed (GR: M6) / Future (mHC: M7) | M6–M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | G11 | MLA + CSA2 hierarchical sparse indexer and FP4 (`E2M1` + `E4M3` scale) KV encode/decode kernels | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | G12 | Native `FP16` (`half4` / `simdgroup_half8x8`) and `BF16` (`bfloat4` / `simdgroup_bfloat8x8`) dense & MoE GEMV / GEMM / SwiGLU Metal 4 kernels with FP32 accumulation | Implemented | M2.5 | [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md), [ADR-0014](decisions/0014-compile-time-specialization.md), [results.md](benchmarks/results.md) |
+| G13 | Branch-free `comptime` / Metal function-constant per-block `QuantScheme` dispatch and scheme-bucketed MoE gather (strict per-tensor / per-expert granularity; zero intra-tensor bit mixing) | Confirmed | M5 | [ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md), [ADR-0014](decisions/0014-compile-time-specialization.md) |
 
 ## Speculative decoding (L1 / L2)
 
