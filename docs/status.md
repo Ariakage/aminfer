@@ -60,6 +60,8 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | W9 | Composable model operator registry (`BackboneKind`, `AttentionKind`, `FfnKind`, `ResidualKind`, `MemoryLookupKind`) | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | W10 | Tier 2 target: **`Qwen3.8-Flash-Next`** (`qwen4_exp`, 125B/A6B + 51B PLE + 4B MTP) `.amf` converter (vision-tower strip, sharded PLE) and runtime | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | W11 | Tier 3 target: **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`, 552B CED MoE + 196B Engram) `.amf` converter and Causal Encoder-Decoder scheduler (512 GB Ultra / TB5 cluster) | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| W12 | Multi-shard Hugging Face / MLX safetensors (`model.safetensors.index.json`) streaming import and `.amf` `bf16` (`DType.bf16 = 4`) weight support | Confirmed | M2.5 | [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md), [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
+| W13 | Standard unquantized and mixed-precision `FP16` / `BF16` model execution (`tie_word_embeddings`, per-tensor dtype dispatch, `RGBA16Float` `KvTile` boundary; verified on `Qwen3-0.6B` BF16) | Confirmed | M2.5 | [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md), [memory.md](architecture/memory.md#kv-tiles) |
 
 ## GPU (L3)
 
@@ -76,6 +78,7 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | G9 | Qwen Sparse Attention (QSA) micro-block indexer with YaRN and interleaved MRoPE (`[11, 11, 10]`) | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | G10 | Multi-branch residual stream kernels: 4-branch Gated Residual (GR) and Single-Pass mHC (Mega-mHC) | Confirmed (GR: M6) / Future (mHC: M7) | M6–M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | G11 | MLA + CSA2 hierarchical sparse indexer and FP4 (`E2M1` + `E4M3` scale) KV encode/decode kernels | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| G12 | Native `FP16` (`half4` / `simdgroup_half8x8`) and `BF16` (`bfloat4` / `simdgroup_bfloat8x8`) dense & MoE GEMV / GEMM / SwiGLU Metal 4 kernels with FP32 accumulation | Confirmed | M2.5 | [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md), [ADR-0014](decisions/0014-compile-time-specialization.md) |
 
 ## Speculative decoding (L1 / L2)
 

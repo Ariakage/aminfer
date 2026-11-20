@@ -18,7 +18,7 @@ running every engine of the SoC concurrently on one zero-copy memory pool:
 | CPU P-cores | L1 zero-allocation suffix-automaton drafting, lock-free scheduling |
 | CPU E-cores | Cold-expert prefetch from NVMe (`F_NOCACHE`, `aio_read` + `kqueue`) |
 | Neural Engine | L2 drafting, attention half of the chunked prefill, MoE expert prediction |
-| GPU (Metal) | L3 fused 3/4-bit dequantization, MoE gather and tree-attention verification |
+| GPU (Metal) | L3 fused 3/4-bit dequantization & native FP16 / BF16 compute, MoE gather and tree-attention verification |
 | Storage | 16 KiB-aligned wired hot experts; NVMe cold experts (`.amf`) and N-gram tables |
 
 Speculative decoding prioritizes EAGLE-2 draft trees (with EAGLE-3 or EAGLE-2

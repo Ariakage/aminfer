@@ -32,7 +32,7 @@ matching M1/M2 `.amf` packing).
 
 | Tier | Representative models | Total / active params | 3-bit backbone + table size | Target Apple Silicon hardware |
 | --- | --- | --- | --- | --- |
-| **Tier 1** (M2–M5) | `Qwen3-30B-A3B` (3-bit), `Qwen3-14B` (4-bit); extensible to Llama 3/4, Mistral, Gemma, DeepSeek-V2/V3 | 30.5B / 3B active (MoE); 14B dense | ~12.4 GiB (30B-3bit); ~7.5 GiB (14B-4bit) | **24 GB M4 baseline** (fully wired in RAM) and up |
+| **Tier 1** (M2–M5, incl. M2.5 FP16/BF16) | `Qwen3-30B-A3B` (3-bit / BF16), `Qwen3-14B` (4-bit / BF16), `Qwen3-0.6B`–`8B` (BF16 / FP16); extensible to Llama 3/4, Mistral, Gemma, DeepSeek-V2/V3 | 0.6B–30.5B (3B active MoE; 0.6B–14B dense) | ~12.4 GiB (30B-3bit), ~7.5 GiB (14B-4bit), ~1.2–15.3 GiB (0.6B–8B BF16) | **24 GB M4 baseline** (30B-3bit, 14B-4bit, ≤8B BF16/FP16 fully wired) · **36–128 GB+ Macs** (14B/30B BF16/FP16 fully wired, [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)) |
 | **Tier 2** (M6) | **`Qwen3.8-Flash-Next`** (`qwen4_exp`) | 125B backbone (6B active/tok) + 51B PLE + 4B MTP | ~54.7 GiB backbone + NVMe-sharded PLE | **128 GB+ Max / Ultra** (full backbone wired) · **24 GB M4** (wired hot set + NVMe cold experts & PLE via ANE prediction + E-core async I/O) |
 | **Tier 3** (M7 / Future) | **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`) | 552B CED MoE (8B prefill / 16B decode) + 196B Engram (~748B total) | ~241.5 GiB backbone + ~86 GiB Engram (>330 GiB on disk; ~7.0 GiB/tok decode reads) | **512 GB Ultra** (full backbone wired on 800 GB/s bus) · **Multi-Mac 128–256 GB Thunderbolt 5 RDMA cluster** (`thunderbolt_peer`); **not viable on 24 GB M4** (< 0.7 tok/s NVMe bound) |
 

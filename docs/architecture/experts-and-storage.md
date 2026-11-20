@@ -53,22 +53,33 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
   64-byte `model_id`.
 - **Directory** — `tensor_count` fixed 128-byte `TensorEntry` records,
   zero-padded to a 16 KiB multiple: 48-byte name, `TensorKind`, `DType`
-  (`f16`, `f32`, `q4_affine`, `q3_affine`), bit-width, rank, group size (`64`),
-  layer and expert indices, blob CRC-32, 4-element shape, 16 KiB-aligned
-  `blob_offset` and `blob_bytes`, `data_bytes`, 64 B-aligned `params_offset`,
-  and `params_bytes`.
+  (implemented in M1: `f16`, `f32`, `q4_affine`, `q3_affine`; confirmed for M2.5:
+  `bf16 = 4` per [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)),
+  bit-width, rank, group size (`64` for affine quantized tensors, `0` for
+  unquantized tensors), layer and expert indices, blob CRC-32, 4-element shape,
+  16 KiB-aligned `blob_offset` and `blob_bytes`, `data_bytes`, 64 B-aligned
+  `params_offset`, and `params_bytes`.
 - **Blobs** — each starts on a 16 KiB boundary and is zero-padded to a
   16 KiB multiple. For quantized 2D matrices (`[N, K]`, `K % 64 == 0`), bytes
   `[0..data_bytes)` hold MLX-compatible LSB-first packed weights (4-bit: 2
   values/byte, 32 B/group; 3-bit: 8 values/3 bytes, 24 B/group), followed at
   `params_offset` (64 B aligned) by interleaved `half2(scale, bias)` per group
-  (`w = q * scale + bias`). GPU kernels read this blob layout directly without
+  (`w = q * scale + bias`). Unquantized `f16`, `bf16` (M2.5), and `f32` tensors
+  store contiguous little-endian elements in `[0..data_bytes)` with
+  `params_bytes = 0`. GPU kernels read these blob layouts directly without
   repacking.
 - Written offline by `tools/`; the Zig reader (`AmfFile.open`, `F_NOCACHE`)
   validates header, directory CRC, alignment, bounds, non-overlapping blobs
   and blob CRCs at startup, never on the hot path.
-- Conversion source (status row W4): MLX community quantized safetensors
-  (affine, group size 64; `bf16` scales/biases converted to `f16` on export).
+- Conversion sources:
+  - Implemented in M1 (status row W4): single-file MLX community quantized
+    safetensors (affine, group size 64; `bf16` scales/biases converted to `f16`
+    on export).
+  - Confirmed for M2.5 (status row W12, [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)):
+    streaming multi-shard Hugging Face / MLX checkpoints
+    (`model.safetensors.index.json` across shard files with bounded host RAM)
+    plus native bit-exact `BF16` / `FP16` unquantized and mixed-precision tensor
+    export.
 
 ## Cold-expert I/O path
 

@@ -96,6 +96,12 @@ Settled tile layout (confirmed in Spike S1, raw measurements in
   bindless `KvTilePair` (`{k_tex_id, v_tex_id}`) buffer in `WiredArena` paired
   with `MTLResidencySet` registration (`makeTilesResident`).
 - Still undecided: int8 tiles (`OneComponent8`, status row R5).
+- Unquantized `BF16` models (confirmed for M2.5,
+  [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)) keep
+  `KvTile` in `OneComponent16Half` / `RGBA16Float`: neither `MTLPixelFormat` nor
+  CoreML's zero-copy `MLMultiArray(pixelBuffer:shape:)` offers a `BF16`
+  IOSurface format, and post-QK-Norm / post-RoPE K/V vectors fit comfortably in
+  IEEE `fp16` range.
 
 ## Budget estimates
 
@@ -118,6 +124,14 @@ head dim 128, 128 experts, top-8, expert intermediate size 768). Not measured.
 - The 4-bit plan exceeds the defaults. It needs raised limits (still leaving
   ≥ 3 GiB of headroom) or moving the coldest experts to NVMe; a 4-bit expert
   of this model is 2,654,208 B, exactly 162 pages of 16 KiB.
+- Standard unquantized `FP16` / `BF16` weights (2 B/parameter, confirmed for
+  M2.5 in [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md))
+  scale across hardware tiers without changing the memory model: the **24 GB M4
+  baseline** wires up to the ~8B class (`Qwen3-0.6B` ≈ 1.2 GiB, `4B` ≈ 7.6 GiB,
+  `8B` ≈ 15.3 GiB), whereas full-wired `Qwen3-14B` (`BF16`, ≈ 27.6 GiB) and
+  `Qwen3-30B-A3B` (`BF16`, ≈ 56.9 GiB) target **36 GB / 64 GB / 128 GB+** Macs
+  (and are rejected upfront on 24 GB M4 by startup budget validation rather than
+  swapping).
 
 ## No swap
 

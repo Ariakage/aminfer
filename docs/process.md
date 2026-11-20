@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M2 — non-speculative decode completed (2026-11-20); ready for M3 (speculative decoding).
+M2 — non-speculative decode completed (2026-11-20); next: **M2.5 — standard FP16 / BF16 execution and multi-shard safetensors import** (scheduled right before M3 speculative decoding per [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md)).
 
 ## Milestones
 
@@ -18,7 +18,8 @@ Status-row IDs refer to [status.md](status.md).
 | M0 | Project initialization | F1–F9 | `zig build` and `zig build test` pass in Debug and ReleaseSafe; docs baseline committed; local ikat index built | Completed |
 | M1 | GPU and weight foundation | R1, R2, F6 (hot path), W1–W4, G1, G2, C9 | Wired budget enforced at startup; `.amf` round-trip (tools → Zig) with alignment validation; fused dequant GEMV / GEMM match a reference within tolerance; effective bandwidth measured per kernel | Completed |
 | M2 | Non-speculative decode | W5, W6, C1, C2, R3, R4, G3, G4 | Greedy end-to-end decode of the primary target from `.amf`; baseline tokens/s and bytes per token recorded | Completed |
-| M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2; speedup over the M2 baseline, acceptance-length and experts-per-pass statistics recorded | Not started |
+| M2.5 | Standard FP16 / BF16 and multi-shard import | W12, W13, G12 | Multi-shard `aminfer-tools pack-amf` converts local `Qwen3-30B-A3B-3bit`, `Qwen3-14B-4bit`, and `Qwen3-0.6B` (`BF16`) with bounded RAM; native `FP16` and `BF16` GEMV / GEMM / MoE SwiGLU match CPU fp32 reference; real-checkpoint greedy decode verified end-to-end (incl. `Qwen3-0.6B` `BF16`) with bandwidth archived in [benchmarks/results.md](benchmarks/results.md) | Not started |
+| M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2/M2.5; speedup over the non-speculative baseline, acceptance-length and experts-per-pass statistics recorded | Not started |
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Not started |
 | M5 | Serving and pipelining | C6–C8, D8 | Streaming server under load; pipelined-drafting gain measured | Not started |
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`) | R6, W9, W10, G7–G9, G10 (GR), C10 (PLE) | Composable model operator graph; `Qwen3.8-Flash-Next` (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end (128 GB+ full wired residency; 24 GB M4 hot/cold + PLE async prefetch without swap) | Not started |
@@ -144,6 +145,14 @@ Apple M4 24 GiB (`aminfer bench`, ReleaseFast at commit `517ba0da`, default
     linear 40-layer scaling **`102.622 ms/tok` (`9.74 tok/s`, `7,954,260,800 B/tok`,
     `77.51 GB/s`)**.
 
+## M2.5 task list
+
+- [ ] `.amf` `DType.bf16 = 4` in `src/format/amf.zig` and `tools/src/aminfer_tools/amf.py` (`--dtype auto|f16|bf16`), keeping 16 KiB alignment and CRC-32 validation intact (`W12`)
+- [ ] Streaming multi-shard `model.safetensors.index.json` importer in `aminfer-tools pack-amf` (header-first directory layout + bounded-RAM shard streaming across `Qwen3-30B-A3B-3bit`, `Qwen3-14B-4bit`, and `Qwen3-0.6B` `BF16`) (`W12`)
+- [ ] Specialized Metal 4 `FP16` (`half4` / `simdgroup_half8x8`) and `BF16` (`bfloat4` / `simdgroup_bfloat8x8`) GEMV, GEMM, MoE SwiGLU, embedding, RMSNorm, and `lm_head` kernels with FP32 accumulation (`G12`)
+- [ ] `Qwen3Model` unquantized / mixed-precision weight path (`quantization_config` optional, per-tensor `amf.DType` dispatch, zero-duplicate `tie_word_embeddings`, `RGBA16Float` `KvTile` boundary) verified against CPU fp32 reference (`W13`)
+- [ ] End-to-end real-checkpoint conversion & greedy decode verification (`Qwen/Qwen3-0.6B` `BF16` + multi-shard MLX checkpoints in `/Volumes/Akari/models/`) and `FP16` / `BF16` kernel bandwidth benchmarks archived in [benchmarks/results.md](benchmarks/results.md)
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -171,6 +180,7 @@ Only checks that actually ran are listed.
 | 2026-11-20 | Privileged `sysctl` & `powermetrics` telemetry: `iogpu.wired_limit_mb=21504`, `vm.global_user_wire_limit=22548578304`, `vm.user_wire_limit=22548578304` (all rc=0) raised non-root `aminfer probe` `recommendedMaxWorkingSetSize` and `budget.wired_limit_mib` from `18186` to `21504 MiB` (`physical_headroom`); reverse-order restore verified back to `0` / `19585050869` / `18186 MiB`; `powermetrics --samplers cpu_power,gpu_power,ane_power -i 500 -n 6` during `aminfer bench` captured peak GPU `1470 MHz` (`1459 MHz` active avg, `70.98%` active, `1513 mW`), ANE `0 mW`, `0` swapouts; archived in [benchmarks/results.md](benchmarks/results.md) | Pass |
 | 2026-11-20 | M2 `tools/synth.py` + `synth-qwen3`: `cd tools && uv run python -m unittest discover -s tests -v`: 14/14 tests (incl. cross-language `aminfer verify-amf` on tiny + real 1-layer Qwen3-30B-A3B-3bit & Qwen3-14B-4bit `.amf` bundles) | Pass |
 | 2026-11-20 | M2 final gate (`W5`, `W6`, `C1`, `C2`, `R3`, `R4`, `G3`, `G4`, `S1`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build`, `zig build test` (Debug, ReleaseSafe, ReleaseFast): 96/96 tests (95 lib + 1 cli); direct Debug test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (API + GPU Validation enabled): 95/95 tests; ReleaseFast `./zig-out/bin/aminfer bench` (C9 + S2 + S1 + G3 + G4 + 4-layer `.amf` Qwen3-30B-A3B-3bit & Qwen3-14B-4bit decode, `0` hot-path malloc delta, `0` swapouts) + end-to-end `synth-qwen3` → `aminfer decode` (`tiny-moe`, `tiny-dense`, 4-layer `qwen3-30b-a3b-3bit`, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md) | Pass |
+| 2026-11-20 | Throwaway probe (not in repo): `xcrun -sdk macosx metal -std=metal4.0 -mmacosx-version-min=26.0 -Wall -Wextra -Werror` with `bfloat4`, `simdgroup_bfloat8x8`, and `simdgroup_half8x8` accumulating into `simdgroup_float8x8` | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -188,7 +198,9 @@ session. After M2 completed on 2026-11-20, the user added the tiered frontier
 model roadmap ([ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md)):
 Tier 2 `Qwen3.8-Flash-Next` (`qwen4_exp`, M6) and Tier 3
 `DeepSeek-V4.1-Flash-1017` (`deepseek41`, M7 / 512 GB Ultra & Thunderbolt 5 RDMA
-clusters).
+clusters), and scheduled **M2.5** right before M3 for native `FP16` / `BF16`
+execution and multi-shard safetensors streaming import
+([ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md)).
 
 ## Session handoff snapshot
 
@@ -214,9 +226,11 @@ Update this before the context window runs out or when handing off.
     `c2b5856` M2 build/root wiring, `3197b12` Qwen3-MoE & Qwen3-Dense greedy
     decode engine (W6), `517ba0d` M2 benchmarks & `aminfer decode` CLI,
     `e1ea8a7` M2 close-out & benchmark archive update
-- In flight: none (M2 complete; ready for M3 speculative decoding)
+  - Roadmap: `188dc75` tiered frontier model roadmap (`ADR-0015`)
+- In flight: none (ready to begin M2.5 standard FP16 / BF16 & multi-shard safetensors import)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [benchmarks/results.md](benchmarks/results.md),
   [decisions/0004-kv-cache-iosurface-texture-sharing.md](decisions/0004-kv-cache-iosurface-texture-sharing.md),
-  [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md)
+  [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md),
+  [decisions/0016-native-fp16-bf16-and-multishard-import.md](decisions/0016-native-fp16-bf16-and-multishard-import.md)
