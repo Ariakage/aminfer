@@ -22,5 +22,6 @@ cd tools
 uv sync
 uv run aminfer-tools --help
 uv run aminfer-tools pack-amf --input model.safetensors --output model.amf --model-id qwen3
+uv run aminfer-tools synth-qwen3 --preset tiny-moe --output-dir /tmp/qwen3-tiny
 uv run python -m unittest discover -s tests
 ```

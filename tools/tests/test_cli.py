@@ -27,6 +27,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
         text = out.getvalue()
         self.assertIn("pack-amf", text)
+        self.assertIn("synth-qwen3", text)
         self.assertIn("expert-heat", text)
         self.assertIn("export-coreml", text)
 

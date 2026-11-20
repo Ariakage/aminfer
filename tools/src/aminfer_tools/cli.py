@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import pack_amf_from_safetensors
+from aminfer_tools.synth import PRESETS, generate_qwen3_bundle
 
 
 def align_up(length: int, alignment: int = APPLE_PAGE_SIZE) -> int:
@@ -63,6 +64,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Mark every expert tensor as cold_expert",
     )
 
+    synth = sub.add_parser(
+        "synth-qwen3",
+        help="Generate deterministic synthetic Qwen3-MoE or Qwen3-Dense .amf, config.json and tokenizer.json",
+    )
+    synth.add_argument(
+        "--preset",
+        required=True,
+        choices=sorted(PRESETS.keys()),
+        help="Model geometry preset",
+    )
+    synth.add_argument(
+        "--output-dir",
+        required=True,
+        type=pathlib.Path,
+        help="Directory where model.amf, config.json and tokenizer.json are written",
+    )
+    synth.add_argument("--num-layers", type=int, default=None, help="Override number of transformer layers")
+    synth.add_argument("--vocab-size", type=int, default=None, help="Override vocabulary size")
+    synth.add_argument("--model-id", default=None, help="Override model identifier stored in .amf header")
+    synth.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed (default: 42)")
+    tie_group = synth.add_mutually_exclusive_group()
+    tie_group.add_argument(
+        "--tie-word-embeddings",
+        action="store_true",
+        help="Share embed_tokens with quantized lm_head",
+    )
+    tie_group.add_argument(
+        "--untie-word-embeddings",
+        action="store_true",
+        help="Emit a distinct quantized lm_head tensor",
+    )
+    synth.add_argument(
+        "--embed-f16",
+        action="store_true",
+        help="Store embed_tokens as F16 instead of quantized affine weights",
+    )
+    synth.add_argument(
+        "--cold-experts",
+        default=None,
+        help="Comma-separated LAYER:EXPERT pairs to mark as cold_expert",
+    )
+
     sub.add_parser(
         "expert-heat",
         help="Compute offline MoE expert activation heat statistics (planned: M4)",
@@ -89,6 +132,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         total_bytes = args.output.stat().st_size
         print(f"packed {len(metas)} tensors into {args.output} ({total_bytes} bytes)")
+        return 0
+
+    if args.command == "synth-qwen3":
+        cfg = PRESETS[args.preset]
+        overrides: dict[str, object] = {}
+        if args.num_layers is not None:
+            overrides["num_hidden_layers"] = args.num_layers
+        if args.vocab_size is not None:
+            overrides["vocab_size"] = args.vocab_size
+        if args.model_id is not None:
+            overrides["model_id"] = args.model_id
+        if args.tie_word_embeddings:
+            overrides["tie_word_embeddings"] = True
+        elif args.untie_word_embeddings:
+            overrides["tie_word_embeddings"] = False
+        if args.embed_f16:
+            overrides["embed_f16"] = True
+        if overrides:
+            cfg = cfg.with_overrides(**overrides)
+        cold = _parse_cold_experts(args.cold_experts)
+        bundle = generate_qwen3_bundle(
+            args.output_dir,
+            cfg,
+            seed=args.seed,
+            cold_experts=cold,
+        )
+        print(
+            f"synthesized {len(bundle.metas)} tensors ({bundle.total_bytes} bytes) "
+            f"into {bundle.amf_path.parent}"
+        )
         return 0
 
     print(
