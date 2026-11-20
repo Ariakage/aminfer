@@ -16,6 +16,7 @@ pub const qos = @import("platform/qos.zig");
 pub const sysinfo = @import("platform/sysinfo.zig");
 pub const vmstat = @import("platform/vmstat.zig");
 pub const tokenizer = @import("model/tokenizer.zig");
+pub const qwen3 = @import("model/qwen3.zig");
 pub const bench = @import("bench/runner.zig");
 
 test {
@@ -34,5 +35,6 @@ test {
     _ = sysinfo;
     _ = vmstat;
     _ = tokenizer;
+    _ = qwen3;
     _ = bench;
 }
