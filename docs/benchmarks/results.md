@@ -747,3 +747,307 @@ GPU idle residency:  64.90%
 GPU Power: 400 mW
 
 ```
+
+## M2 Spike S1, G3 MoE, G4 GQA and end-to-end `.amf` decode (standalone ReleaseFast)
+
+Measured on 2026-11-20 on the Apple M4 24 GiB baseline (`Mac16,12`, macOS 27.2
+`26B123`, default kernel tunables `wired_budget_mib = 18186`) at git commit
+`517ba0da9094849813575a9520da28daaea78721` via standalone non-root
+`./zig-out/bin/aminfer bench` (ReleaseFast) and end-to-end
+`aminfer-tools synth-qwen3` → `./zig-out/bin/aminfer decode`.
+
+### M2 methodology notes
+
+1. **Spike S1 (IOSurface KV-tile read bandwidth)**: Allocates 2 rotated context
+   banks × 32 chunks × 2 tiles (K, V) = 128 IOSurface-backed `CVPixelBuffer`s
+   (`OneComponent16Half`, explicit 16 KiB-aligned `kIOSurfaceAllocSize = 524,288 B`,
+   `bytesPerRow = 256 B`, 64 MiB total K+V across both banks to bust M4 L2/SLC)
+   representing a 16,384-token Qwen3-30B-A3B KV context (`q=32, kv=4, d=128,
+   chunk=512`), registered in `MTLResidencySet`. Measures 8 × 8 = 64 dispatches
+   per mode across `{token_major, channel_major}` × `{RGBA16Float, R16Float,
+   alias MTLBuffer}` (`33,554,432 B/dispatch`) and probes `mlock` support on
+   IOSurface-mapped pages.
+2. **G3 MoE deduplicated gather / SwiGLU**: Allocates all 128 distinct 3-bit
+   Qwen3-30B-A3B experts (`hidden=2048, moe_intermediate=768`, 252 MiB total
+   resident weights in one `Budget`-checked `WiredArena`, naturally exceeding
+   SLC) and rotates router-logit banks across all 128 experts for `M=1`
+   (`U=8/8` slots) and `M=8` (`U=24/64` and `U=40/64` slots). Reports exact
+   GPU-verified `ScheduleHeader.num_unique_experts` (`U`), deduplicated weight
+   bytes (`expertLayerBytes(q3, U, 2048, 768)`), naive per-slot weight bytes
+   (`expertLayerBytes(q3, M*k, 2048, 768)`), percentage bytes saved, and
+   effective decimal GB/s.
+3. **G4 GQA KV-tile decode attention**: Benchmarks production
+   `AttentionPipelines.encodeGqaDecodeAttn` (FlashDecoding split-KV over
+   bindless `RGBA16Float` token-major `KvTilePair` arrays) on Qwen3-30B-A3B
+   geometry (`q=32, kv=4, d=128, chunk=512`) at `seq_len = 512, 4096, 16384`
+   using rotated tile banks totaling `>= 64 MiB`.
+4. **M2 end-to-end greedy decode from `.amf`**: Streams a valid 4-layer `.amf`
+   v0 file (with `F_NOCACHE` write + `F_NOCACHE` load + full CRC-32 check,
+   full `vocab_size = 151,936`, real per-layer Qwen3-30B-A3B-3bit and
+   Qwen3-14B-4bit dimensions) into a `Budget.fromHost`-checked `WiredArena` +
+   IOSurface `KvTile`s + `MTLResidencySet`. Genuinely prefills 511 KV positions
+   via `prefillToken`, warms up 4 steps, then times 16 steady-state `stepDecode`
+   calls (`T_full`) and 16 `prefillToken` body-only calls (`T_body`) at exact
+   `seq_len = 512`.
+   - **Direct measurement** is the measured 4-layer `.amf` decode step (`T_4L`,
+     `T_layer = T_body / 4`, `T_head = T_4L - T_body`, `bytes_4L`).
+   - **Linear full-depth scaling** (`N = 48` layers for Qwen3-30B-A3B-3bit;
+     `N = 40` layers for Qwen3-14B-4bit) is computed transparently as
+     `T_NL = N * T_layer + T_head` and `bytes_NL = N * bytes_per_layer + bytes_global_head`
+     so the global `lm_head` + `argmax` step is counted exactly once rather than
+     multiplied by `N/4`.
+
+### Spike S1 IOSurface KV-tile read bandwidth summary
+
+Geometry: `q=32, kv=4, d=128, chunk=512, 32 chunks (ctx=16,384), 2 rotated banks (64 MiB K+V)`.
+IOSurface facts: `bytes_per_row = 256 B`, `data_bytes = 524,288 B`,
+`alloc_bytes = 524,288 B`, `IOSurfaceGetAllocSize = 524,288 B` (exact 16 KiB
+multiple via explicit `kIOSurfaceAllocSize`), `iosurface_mlock_supported = yes`.
+
+| Layout | Access mode | Bytes/dispatch | Latency (us) | Effective `beta` (GB/s) | % of 120 GB/s bus |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `token_major` | `rgba16f` (`tex.read(half4)`) | 33,554,432 | 418.22 | 80.23 | 66.9% |
+| `token_major` | `r16f` (`tex.read(half)`) | 33,554,432 | 365.73 | 91.75 | 76.5% |
+| `token_major` | `alias_buf` (`MTLBuffer`) | 33,554,432 | 408.48 | 82.14 | 68.5% |
+| `channel_major` | `rgba16f` (`tex.read(half4)`) | 33,554,432 | 421.37 | 79.63 | 66.4% |
+| `channel_major` | `r16f` (`tex.read(half)`) | 33,554,432 | 416.37 | 80.59 | 67.2% |
+| `channel_major` | `alias_buf` (`MTLBuffer`) | 33,554,432 | 426.41 | 78.69 | 65.6% |
+
+Decision (`R4` settled): **token-major `RGBA16Float`** (`width = head_dim / 4`,
+`height = num_kv_heads * 512`, one 512-token chunk per layer). Texture views
+match or outperform aliasing `MTLBuffer` reads with zero copy penalty, while
+token-major `RGBA16Float` enables single-instruction `tex.write(half4)` decode
+KV append without read-modify-write, clean partial-chunk `seq_len` bounds, and
+**85.61 GB/s (71.3% bus)** in production FlashDecoding GQA below.
+
+### G3 MoE deduplicated gather / SwiGLU summary
+
+Geometry: Qwen3-30B-A3B 3-bit (`E=128, k=8, hidden=2048, moe_intermediate=768`,
+all 128 experts resident = 252 MiB).
+
+| `M` | Unique experts `U / slots` | Dedup bytes | Naive bytes | Weight bytes saved | Latency (us) | Dedup `beta` (GB/s) | % of 120 GB/s bus | Naive-equiv (GB/s) |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `8/8` | 16,515,072 | 16,515,072 | 0.0% | 228.34 | 72.33 | 60.3% | 72.33 |
+| 8 | `24/64` | 49,545,216 | 132,120,576 | 62.5% | 2,096.27 | 23.63 | 19.7% | 63.03 |
+| 8 | `40/64` | 82,575,360 | 132,120,576 | 37.5% | 2,124.23 | 38.87 | 32.4% | 62.20 |
+
+Note: `M=1` uses the fast SIMD32 GEMV path (`72.33 GB/s`), whereas `M=8`
+deduplicates 37.5%–62.5% of expert weight bytes while currently running a
+scalar-accumulating multi-token loop (compute-bound at `2.1 ms`); upgrading the
+`count_u > 1` path to `simdgroup_matrix` is a prime M3 (`G5` / `S5`) speedup
+opportunity.
+
+### G4 GQA KV-tile decode attention summary
+
+Geometry: Qwen3-30B-A3B (`q=32, kv=4, d=128, chunk=512`, `RGBA16Float` token-major
+IOSurface tiles, rotated banks `>= 64 MiB`).
+
+| `seq_len` | Chunks | Splits | Banks | Bytes/dispatch | Latency (us) | Effective `beta` (GB/s) | % of 120 GB/s bus |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 1 | 8 | 64 | 1,048,576 | 24.55 | 42.72 | 35.6% |
+| 4,096 | 8 | 32 | 8 | 8,388,608 | 106.98 | 78.42 | 65.3% |
+| 16,384 | 32 | 32 | 2 | 33,554,432 | 391.96 | 85.61 | 71.3% |
+
+### M2 end-to-end greedy decode from `.amf` summary (`seq_len = 512`, `vocab = 151,936`)
+
+| Target model | Measurement basis | Layers | Wired (MiB) | `ms/tok` | `tok/s` | Bytes/tok | Effective `beta` (GB/s) | % bus | Hot-path `malloc` delta | `swapouts` delta |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| **Qwen3-30B-A3B (3-bit MoE)** | Measured 4-layer `.amf` (`0.477 ms/L + 1.598 ms head`) | 4 | 1,310 | 3.508 | 285.05 | 241,564,544 | 68.86 | 57.4% | 0 blocks / 0 B | 0 |
+| **Qwen3-30B-A3B (3-bit MoE)** | Extrapolated linear scaling (`48 * layer_ms + head_ms`) | 48 | — | 24.515 | **40.79** | **1,401,238,400** | 57.16 | 47.6% | — | — |
+| **Qwen3-14B (4-bit Dense)** | Measured 4-layer `.amf` (`2.436 ms/L + 5.182 ms head`) | 4 | 1,561 | 14.926 | 67.00 | 1,189,256,000 | 79.68 | 66.4% | 0 blocks / 0 B | 0 |
+| **Qwen3-14B (4-bit Dense)** | Extrapolated linear scaling (`40 * layer_ms + head_ms`) | 40 | — | 102.622 | **9.74** | **7,954,260,800** | 77.51 | 64.6% | — | — |
+
+### Verbatim standalone `aminfer bench` M1+M2 raw stdout (commit `517ba0da`)
+
+```text
+bench.gpu                        Apple M4
+bench.wired_budget_mib           18186
+bench.arena_mib                  81
+bench.bus_peak_gbs               120.0
+
+C9 Kernel Bandwidth Calibration
+kernel    shape              bytes/disp   slots   latency(us)   beta(GB/s)   bus(%)
+gemv_q4   1x2048x2048           2367488      32         28.68        82.55     68.8
+gemv_q4   1x6144x2048           7094272      10         80.88        87.71     73.1
+gemv_q4   1x2048x768             890368      85         17.14        51.95     43.3
+gemv_q4   1x4096x4096           9453568       8        106.03        89.16     74.3
+gemv_q3   1x2048x2048           1843200      42         23.48        78.50     65.4
+gemv_q3   1x6144x2048           5521408      14         68.79        80.27     66.9
+gemv_q3   1x2048x768             693760     113         10.56        65.67     54.7
+gemv_q3   1x4096x4096           7356416      10         83.90        87.68     73.1
+gemm_q4   16x2048x2048          2490368      32        102.12        24.39     20.3
+gemm_q4   16x4096x4096          9699328       8        399.72        24.27     20.2
+gemm_q4   64x2048x2048          2883584      32        208.64        13.82     11.5
+gemm_q4   64x4096x4096         10485760       8        817.72        12.82     10.7
+gemm_q3   16x2048x2048          1966080      42        105.22        18.69     15.6
+gemm_q3   16x4096x4096          7602176      10        406.40        18.71     15.6
+gemm_q3   64x2048x2048          2359296      42        210.30        11.22      9.3
+gemm_q3   64x4096x4096          8388608      10        829.09        10.12      8.4
+
+Spike S2 Metal 4 Steady-State Hot Path
+s2.rounds                        1000
+s2.dispatches_per_round          32
+s2.cpu_encode_us_per_round       9.52
+s2.cpu_encode_ns_per_dispatch    297.5
+s2.full_round_us                 100.20
+s2.malloc_blocks_in_use_delta    0
+s2.malloc_size_in_use_delta      0
+s2.malloc_size_allocated_delta   0
+
+Swap Check
+swap.status                      ok
+swap.swapouts_delta              0
+swap.pageouts_delta              0
+swap.used_mib                    4624
+
+Spike S1 IOSurface KV-Tile Read Bandwidth
+s1.geometry                      q=32,kv=4,d=128,chunk=512,chunks=32 (ctx=16384),banks=2
+s1.tile_bytes_per_row            256
+s1.tile_data_bytes               524288
+s1.tile_alloc_bytes              524288
+s1.tile_surface_alloc_size       524288
+s1.iosurface_mlock_supported     yes
+layout          access      bytes/disp   latency(us)   beta(GB/s)   bus(%)
+token_major     rgba16f       33554432        418.22        80.23     66.9
+token_major     r16f          33554432        365.73        91.75     76.5
+token_major     alias_buf     33554432        408.48        82.14     68.5
+channel_major   rgba16f       33554432        421.37        79.63     66.4
+channel_major   r16f          33554432        416.37        80.59     67.2
+channel_major   alias_buf     33554432        426.41        78.69     65.6
+s1.swapouts_delta                0
+s1.pageouts_delta                0
+
+G3 MoE Deduplicated Gather / SwiGLU FFN (3-bit Qwen3-30B-A3B Geometry)
+m    E    k   U/slots   dedup_bytes   naive_bytes   saved(%)   latency(us)   beta(GB/s)   bus(%)   naive_eq(GB/s)
+1    128  8   8/8          16515072      16515072        0.0        228.34        72.33     60.3            72.33
+8    128  8   24/64        49545216     132120576       62.5       2096.27        23.63     19.7            63.03
+8    128  8   40/64        82575360     132120576       37.5       2124.23        38.87     32.4            62.20
+g3.swapouts_delta                0
+g3.pageouts_delta                0
+
+G4 GQA Decode Attention over RGBA16Float IOSurface KV Tiles
+seq_len   chunks   splits   banks   bytes/disp   latency(us)   beta(GB/s)   bus(%)
+512            1        8      64      1048576         24.55        42.72     35.6
+4096           8       32       8      8388608        106.98        78.42     65.3
+16384         32       32       2     33554432        391.96        85.61     71.3
+g4.swapouts_delta                0
+g4.pageouts_delta                0
+
+M2 End-to-End Greedy Decode from .amf (Primary & Secondary Targets)
+decode_bench.target              qwen3-30b-a3b-3bit
+decode_bench.arch                qwen3_moe (q3)
+decode_bench.seq_len             512
+decode_bench.shards              1
+decode_bench.wired_mib           1310
+decode_bench.load_ms             3343.7
+decode_bench.measured_layers     4
+decode_bench.measured_ms_per_tok 3.508
+decode_bench.measured_tok_per_s  285.05
+decode_bench.measured_layer_ms   0.477
+decode_bench.measured_head_ms    1.598
+decode_bench.measured_bytes_tok  241564544
+decode_bench.measured_beta_gbs   68.86 (57.4% bus)
+decode_bench.scaled_layers       48 (linear: 48 * layer_ms + head_ms)
+decode_bench.scaled_ms_per_tok   24.515
+decode_bench.scaled_tok_per_s    40.79
+decode_bench.scaled_bytes_tok    1401238400
+decode_bench.scaled_beta_gbs     57.16 (47.6% bus)
+decode_bench.malloc_blocks_delta 0
+decode_bench.malloc_bytes_delta  0
+decode_bench.swapouts_delta      0
+decode_bench.pageouts_delta      1
+
+decode_bench.target              qwen3-14b-4bit
+decode_bench.arch                qwen3 (q4)
+decode_bench.seq_len             512
+decode_bench.shards              1
+decode_bench.wired_mib           1561
+decode_bench.load_ms             4351.0
+decode_bench.measured_layers     4
+decode_bench.measured_ms_per_tok 14.926
+decode_bench.measured_tok_per_s  67.00
+decode_bench.measured_layer_ms   2.436
+decode_bench.measured_head_ms    5.182
+decode_bench.measured_bytes_tok  1189256000
+decode_bench.measured_beta_gbs   79.68 (66.4% bus)
+decode_bench.scaled_layers       40 (linear: 40 * layer_ms + head_ms)
+decode_bench.scaled_ms_per_tok   102.622
+decode_bench.scaled_tok_per_s    9.74
+decode_bench.scaled_bytes_tok    7954260800
+decode_bench.scaled_beta_gbs     77.51 (64.6% bus)
+decode_bench.malloc_blocks_delta 0
+decode_bench.malloc_bytes_delta  0
+decode_bench.swapouts_delta      0
+decode_bench.pageouts_delta      81
+
+M2 Overall Swap Check
+m2.swap.status                   ok
+m2.swap.swapouts_delta           0
+m2.swap.pageouts_delta           87
+m2.swap.used_mib                 4616
+```
+
+### Verbatim end-to-end `synth-qwen3` → `aminfer decode` raw stdout (commit `517ba0da`)
+
+```text
+=== 1. Generate & Decode tiny-moe (3-bit) ===
+synthesized 69 tensors (1196032 bytes) into /tmp/aminfer-decode-smoke-kvnRG0/tiny-moe
+amf.status       ok
+amf.model_id     qwen3-tiny-moe-3bit
+amf.tensors      69
+amf.file_bytes   1196032
+amf.wired_bytes  1163264
+amf.cold_bytes   0
+decode.arch                      qwen3_moe (q3)
+decode.layers                    2
+decode.shards                    1
+decode.wired_mib                 1
+decode.prompt_tokens             8
+decode.generated_tokens          16
+decode.prefill_ms                5.120
+decode.decode_ms_per_tok         0.414
+decode.decode_tok_per_s          2414.62
+decode.bytes_per_tok             231224
+decode.effective_gbs             0.56
+decode.swapouts_delta            0
+decode.token_ids                 [236, 407, 107, 327, 107, 407, 359, 407, 359, 336, 407, 17, 327, 17, 327, 17]
+decode.text                       v000407k v000327k v000407 v000359 v000407 v000359 v000336 v000407  v000327  v000327 
+=== 2. Generate & Decode tiny-dense (4-bit) ===
+synthesized 25 tensors (671744 bytes) into /tmp/aminfer-decode-smoke-kvnRG0/tiny-dense
+amf.status       ok
+amf.model_id     qwen3-tiny-dense-4bit
+amf.tensors      25
+amf.file_bytes   671744
+amf.wired_bytes  638976
+amf.cold_bytes   0
+decode.arch                      qwen3 (q4)
+decode.layers                    2
+decode.shards                    1
+decode.wired_mib                 1
+decode.prompt_tokens             6
+decode.generated_tokens          16
+decode.prefill_ms                3.869
+decode.decode_ms_per_tok         0.386
+decode.decode_tok_per_s          2590.90
+decode.bytes_per_tok             282440
+decode.effective_gbs             0.73
+decode.swapouts_delta            0
+decode.token_ids                 [264, 301, 301, 336, 264, 9, 93, 411, 114, 114, 264, 301, 336, 28, 63, 355]
+decode.text                      hell v000301 v000301 v000336hell	] v000411rrhell v000301 v000336 ? v000355
+=== 3. Generate & Decode 4-layer qwen3-30b-a3b-3bit (full 151936 vocab) ===
+synthesized 1575 tensors (1364869120 bytes) into /tmp/aminfer-decode-smoke-kvnRG0/q30b-4l
+decode.arch                      qwen3_moe (q3)
+decode.layers                    4
+decode.shards                    1
+decode.wired_mib                 1306
+decode.prompt_tokens             5
+decode.generated_tokens          16
+decode.prefill_ms                72.887
+decode.decode_ms_per_tok         3.576
+decode.decode_tok_per_s          279.61
+decode.bytes_per_tok             237534080
+decode.effective_gbs             66.42
+decode.swapouts_delta            0
+decode.token_ids                 [121296, 151333, 151333, 151333, 106281, 53955, 53955, 24113, 52463, 23579, 13999, 7871, 18364, 18364, 7871, 23579]
+decode.text                       v121296 v151333 v151333 v151333 v106281 v053955 v053955 v024113 v052463 v023579 v013999 v007871 v018364 v018364 v007871 v023579
+```

@@ -40,19 +40,38 @@ with zero bytes copied and no relayout.
 
 ## Evidence
 
-Measured on the baseline ([../architecture/hardware.md](../architecture/hardware.md)):
+Measured on the baseline ([../architecture/hardware.md](../architecture/hardware.md),
+full raw telemetry in [../benchmarks/results.md](../benchmarks/results.md)):
 
-- A 128 × 512 `OneComponent16Half` pixel buffer has 256-byte rows (multiple of
-  64 B) and a 16 KiB-aligned base; `IOSurfaceGetAllocSize` was 131,136 B, not a
-  16 KiB multiple.
-- R16Float (128 × 512) and RGBA16Float (32 × 512) textures were both created on
-  that surface, also with `MTL_DEBUG_LAYER=1`.
-- `MLMultiArray(pixelBuffer:shape:)` accepted the surface with shape
-  `[4, 128, 128]`.
+- M0 probe: a 128 × 512 `OneComponent16Half` pixel buffer had 256-byte rows
+  (multiple of 64 B) and a 16 KiB-aligned base; default `IOSurfaceGetAllocSize`
+  was 131,136 B, not a 16 KiB multiple. R16Float (128 × 512) and RGBA16Float
+  (32 × 512) textures were both created on that surface under
+  `MTL_DEBUG_LAYER=1`, and `MLMultiArray(pixelBuffer:shape:)` accepted the
+  surface with shape `[4, 128, 128]`.
+- **Spike S1 (closed 2026-11-20, M2)** on Qwen3-30B-A3B KV geometry
+  (`q=32, kv=4, d=128, chunk=512`, 32 chunks = 16,384 context, 2 rotated banks =
+  64 MiB K+V, ReleaseFast commit `517ba0da`, `swapouts_delta = 0`):
+  - Passing an explicit 16 KiB-aligned `kIOSurfaceAllocSize` yields exact
+    `bytes_per_row = 256 B`, `data_bytes = alloc_bytes = surface_alloc_size = 524,288 B`
+    (32 pages of 16 KiB) with 16 KiB-aligned base address.
+  - `mlock()` over IOSurface-mapped pages succeeded on macOS 27.2
+    (`iosurface_mlock_supported = yes`); `KvTile` exposes an optional `mlock`
+    flag alongside `MTLResidencySet` tracking.
+  - Texture reads match or exceed aliasing `MTLBuffer` reads (zero texture-view
+    penalty): token-major `RGBA16Float` `80.23 GB/s`, `R16Float` `91.75 GB/s`,
+    aliasing `MTLBuffer` `82.14 GB/s`; channel-major `RGBA16Float` `79.63 GB/s`,
+    `R16Float` `80.59 GB/s`, aliasing `MTLBuffer` `78.69 GB/s`.
+  - Production FlashDecoding split-KV GQA (`G4`) over bindless token-major
+    `RGBA16Float` `KvTile`s reached `42.72 GB/s` (`24.55 us`) at `seq_len=512`,
+    `78.42 GB/s` (`106.98 us`) at `seq_len=4096`, and **`85.61 GB/s` (`391.96 us`,
+    71.3% of the 120 GB/s bus)** at `seq_len=16384`.
+  - **Settled R4 layout**: one 512-token chunk per layer, **token-major
+    `RGBA16Float`** (`width = head_dim / 4`, `height = num_kv_heads * 512`),
+    giving single-instruction `tex.write(half4)` decode KV append without
+    read-modify-write, clean partial-chunk `seq_len` bounds, and full-bus GQA
+    reads.
 
 ## Open items
 
-- Spike S1: RGBA16Float versus R16Float texture reads versus an aliasing
-  `MTLBuffer` view; token-major versus channel-major rows; whether the mapped
-  range should also be `mlock`ed.
 - int8 KV tiles (`OneComponent8`) — undecided (status row R5).

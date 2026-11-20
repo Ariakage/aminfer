@@ -50,7 +50,8 @@ is rejected with a clear error. Raising the limits is described in
   not track residency implicitly, so nothing outside the set may be used by a
   kernel ([ADR-0011](../decisions/0011-metal4-zero-allocation-hot-path.md)).
 - **IOSurface tiles**: created at startup and added to the residency set.
-  Whether their mapped range should also be `mlock`ed is open (spike S1).
+  Spike S1 verified that `mlock()` succeeds on IOSurface-mapped pages on macOS
+  27.2 (`KvTileOptions.mlock` is exposed alongside `MTLResidencySet` tracking).
 
 ## Zero-copy paths
 
@@ -71,26 +72,30 @@ Accepted direction ([ADR-0004](../decisions/0004-kv-cache-iosurface-texture-shar
 KV lives in IOSurface-backed fp16 tiles that the ANE writes and the GPU reads
 as textures with `tex.read(uint2(x, y))`.
 
-Draft tile layout (to settle in spike S1):
+Settled tile layout (confirmed in Spike S1, raw measurements in
+[../benchmarks/results.md](../benchmarks/results.md)):
 
-- One tile per layer, per K or V, per 512-token prefill chunk. For
+- One tile per layer, per K or V, per 512-token chunk (`R4`). For
   Qwen3-30B-A3B (4 KV heads, head dim 128) a K tile is
   4 × 512 × 128 × 2 B = 512 KiB: an fp16 surface of width 128 and height 2048
-  with 256-byte rows.
-- Tiles are created with an explicit allocation size that is a multiple of
-  16 KiB, because `IOSurfaceGetAllocSize` of a default pixel buffer exceeded
-  the data size by 64 B in our probe. The allocation size is never used as a
-  Metal buffer length.
-- The GPU view is RGBA16Float with width 32 (four head dimensions per texel);
-  R16Float and RG16Float views are allowed. A tile has at most 16,384 rows,
-  the texture dimension limit.
+  with 256-byte rows and exact `kIOSurfaceAllocSize = 524,288 B` (32 pages of
+  16 KiB).
+- Tiles are created with an explicit `kIOSurfaceAllocSize` multiple of 16 KiB
+  and base-address / 64 B row-stride checks at startup (`src/bridge/apple_bridge.m`).
+- **Token-major rows** (`row = kv_head * chunk_tokens + slot_in_chunk`,
+  `col = dim / 4`) viewed as **`RGBA16Float`** (`width = head_dim / 4`, e.g. 32
+  for `head_dim = 128`). Spike S1 showed texture reads match or beat aliasing
+  `MTLBuffer` views (`80.23–91.75 GB/s` vs `82.14 GB/s`), and production
+  FlashDecoding GQA over token-major `RGBA16Float` tiles reaches `85.61 GB/s`
+  at 16K context while keeping decode KV append a single `tex.write(half4)`
+  with no read-modify-write. `R16Float` views remain supported by `KvTile`.
 - Decode-time KV produced by the GPU is written into the same tile format
-  (shader write), so one attention kernel family reads both.
-- Kernels reach tiles through an argument table of texture resource IDs
-  indexed by layer and chunk.
-- Open: token-major rows (`[kv_head][token][dim]`) versus channel-major rows
-  (K transposed, closer to the ANE's preferred internal layout); texture reads
-  versus an aliasing `MTLBuffer` view; int8 tiles (`OneComponent8`).
+  (`ami_qknorm_rope_kv_write`), so one attention kernel family reads both
+  prefill and decode KV.
+- Kernels reach arbitrarily many resident chunks (up to 32K+ context) through a
+  bindless `KvTilePair` (`{k_tex_id, v_tex_id}`) buffer in `WiredArena` paired
+  with `MTLResidencySet` registration (`makeTilesResident`).
+- Still undecided: int8 tiles (`OneComponent8`, status row R5).
 
 ## Budget estimates
 

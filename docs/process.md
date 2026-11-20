@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M1 — GPU and weight foundation completed (2026-11-20); ready for M2 (non-speculative decode).
+M2 — non-speculative decode completed (2026-11-20); ready for M3 (speculative decoding).
 
 ## Milestones
 
@@ -17,7 +17,7 @@ Status-row IDs refer to [status.md](status.md).
 | --- | --- | --- | --- | --- |
 | M0 | Project initialization | F1–F9 | `zig build` and `zig build test` pass in Debug and ReleaseSafe; docs baseline committed; local ikat index built | Completed |
 | M1 | GPU and weight foundation | R1, R2, F6 (hot path), W1–W4, G1, G2, C9 | Wired budget enforced at startup; `.amf` round-trip (tools → Zig) with alignment validation; fused dequant GEMV / GEMM match a reference within tolerance; effective bandwidth measured per kernel | Completed |
-| M2 | Non-speculative decode | W5, W6, C1, C2, R3, R4, G3, G4 | Greedy end-to-end decode of the primary target from `.amf`; baseline tokens/s and bytes per token recorded | Not started |
+| M2 | Non-speculative decode | W5, W6, C1, C2, R3, R4, G3, G4 | Greedy end-to-end decode of the primary target from `.amf`; baseline tokens/s and bytes per token recorded | Completed |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2; speedup over the M2 baseline, acceptance-length and experts-per-pass statistics recorded | Not started |
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Not started |
 | M5 | Serving and pipelining | C6–C8, D8 | Streaming server under load; pipelined-drafting gain measured | Not started |
@@ -30,7 +30,7 @@ Confirmed, or before an accepted design is tuned.
 
 | ID | Question | Feeds | Milestone | State |
 | --- | --- | --- | --- | --- |
-| S1 | KV tile read path: R16Float vs RGBA16Float texture vs aliasing `MTLBuffer`; token- vs channel-major rows; decode-attention bandwidth | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), R4 | M2 | Open |
+| S1 | KV tile read path: R16Float vs RGBA16Float texture vs aliasing `MTLBuffer`; token- vs channel-major rows; decode-attention bandwidth | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), R4 | M2 | Closed |
 | S2 | Metal 4 steady-state allocations and encode overhead per decode round (Instruments Allocations, signposts) | [ADR-0011](decisions/0011-metal4-zero-allocation-hot-path.md) | M1 | Closed |
 | S3 | Cold-expert reads: `aio_read` + `kqueue` vs E-core `pread` workers; queue depth 1–16; 2–3 MiB reads with `F_NOCACHE`; QoS and I/O-policy effects; p50 / p99 latency | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), C4 | M4 | Open |
 | S4 | ANE handoff latency (GPU → CPU → ANE → CPU → GPU) and bandwidth contention of concurrent ANE weight streaming on GPU GEMV | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) | M3 | Open |
@@ -107,6 +107,42 @@ Spike S2 (1,000 steady-state rounds × 32 dispatches/round on a 2-frame Metal 4
 | `malloc_zone_statistics` `size_allocated` delta | 0 B |
 | System `swapouts` / `pageouts` delta | 0 / 0 |
 
+## M2 task list
+
+- [x] Deterministic synthetic Qwen3-MoE (3-bit) & Qwen3-Dense (4-bit) `.amf` / `config.json` / `tokenizer.json` generator in `tools/` (`synth-qwen3`)
+- [x] Preallocated lock-free SPSC / MPSC rings (`C1`), macOS QoS / disk I/O steering (`C2`), and native Zig Qwen byte-level BPE tokenizer (`W5`)
+- [x] IOSurface `OneComponent16Half` KV tiles with zero-copy `RGBA16Float` / `R16Float` views (`R3`), Spike S1 microbenchmark (`S1`, `R4`), RMSNorm, QK-Norm/NeoX RoPE/KV-Write and FlashDecoding split-KV GQA decode attention (`G4`)
+- [x] MoE router, deduplicated active-expert fused 3/4-bit SwiGLU FFN (`G3`), dense SwiGLU utilities and single-dispatch GPU greedy argmax
+- [x] End-to-end Qwen3-MoE & Qwen3-Dense greedy decode engine (`W6`) with multi-shard `WiredArena` support, zero hot-path heap allocation, and step-for-step CPU fp32 reference verification
+- [x] CLI `aminfer decode` + M2 ReleaseFast benchmark suite (`aminfer bench` / `aminfer bench-m2`) archived in [benchmarks/results.md](benchmarks/results.md)
+
+## M2 non-speculative decode and Spike S1 results
+
+Canonical methodology, full tables, and verbatim raw run outputs live in
+[benchmarks/results.md](benchmarks/results.md). Key M2 baseline measurements on
+Apple M4 24 GiB (`aminfer bench`, ReleaseFast at commit `517ba0da`, default
+18,186 MiB wired budget, `swapouts_delta = 0`, hot-path `malloc` delta `0`):
+
+- **Spike S1 (`R4` settled)**: token-major `RGBA16Float` `80.23 GB/s` and
+  `R16Float` `91.75 GB/s` vs aliasing `MTLBuffer` `82.14 GB/s` (zero
+  texture-view penalty; exact 16 KiB-aligned `kIOSurfaceAllocSize = 524,288 B`;
+  `mlock` supported). Settled on **512-token chunks, token-major `RGBA16Float`**.
+- **`G4` GQA decode attention**: `24.55 us` (`42.72 GB/s`) at `seq_len=512`,
+  `106.98 us` (`78.42 GB/s`) at `seq_len=4096`, and **`391.96 us` (`85.61 GB/s`,
+  71.3% bus)** at `seq_len=16384`.
+- **`G3` MoE deduplicated FFN (3-bit, `E=128, k=8`)**: `M=1` `228.34 us`
+  (`72.33 GB/s`); `M=8` saves `62.5%` weight bytes at `U=24/64` (`49.5 MB` vs
+  `132.1 MB` naive) and `37.5%` at `U=40/64`.
+- **End-to-end greedy decode from `.amf` (`seq_len = 512`, `vocab = 151,936`)**:
+  - **Qwen3-30B-A3B (3-bit MoE)**: measured 4-layer `.amf` `3.508 ms/tok`
+    (`285.05 tok/s`, `241.6 MB/tok`, `68.86 GB/s`, `0.477 ms/L + 1.598 ms head`);
+    linear 48-layer scaling **`24.515 ms/tok` (`40.79 tok/s`, `1,401,238,400 B/tok`,
+    `57.16 GB/s`)**.
+  - **Qwen3-14B (4-bit Dense)**: measured 4-layer `.amf` `14.926 ms/tok`
+    (`67.00 tok/s`, `1,189.3 MB/tok`, `79.68 GB/s`, `2.436 ms/L + 5.182 ms head`);
+    linear 40-layer scaling **`102.622 ms/tok` (`9.74 tok/s`, `7,954,260,800 B/tok`,
+    `77.51 GB/s`)**.
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -132,6 +168,8 @@ Only checks that actually ran are listed.
 | 2026-11-20 | G1: `zig build`, `zig build test` (Debug, ReleaseSafe): 42/42 tests (3/4-bit GEMV & GEMM vs CPU fp32 reference + `.amf` → `WiredArena` → GPU round-trip); `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 42/42 tests | Pass |
 | 2026-11-20 | C9, Spike S2, M1 final gate: `zig fmt --check`, zero `catch {}`, `zig build`, `zig build test` (Debug, ReleaseSafe): 50/50 tests; direct test binary with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 50/50 tests; `just bench` (`ReleaseFast` `aminfer bench`): 16 C9 shapes + 1,000-round S2 (0 steady-state malloc delta, 0 swapouts); `tools` unittest (7/7) | Pass |
 | 2026-11-20 | Privileged `sysctl` & `powermetrics` telemetry: `iogpu.wired_limit_mb=21504`, `vm.global_user_wire_limit=22548578304`, `vm.user_wire_limit=22548578304` (all rc=0) raised non-root `aminfer probe` `recommendedMaxWorkingSetSize` and `budget.wired_limit_mib` from `18186` to `21504 MiB` (`physical_headroom`); reverse-order restore verified back to `0` / `19585050869` / `18186 MiB`; `powermetrics --samplers cpu_power,gpu_power,ane_power -i 500 -n 6` during `aminfer bench` captured peak GPU `1470 MHz` (`1459 MHz` active avg, `70.98%` active, `1513 mW`), ANE `0 mW`, `0` swapouts; archived in [benchmarks/results.md](benchmarks/results.md) | Pass |
+| 2026-11-20 | M2 `tools/synth.py` + `synth-qwen3`: `cd tools && uv run python -m unittest discover -s tests -v`: 14/14 tests (incl. cross-language `aminfer verify-amf` on tiny + real 1-layer Qwen3-30B-A3B-3bit & Qwen3-14B-4bit `.amf` bundles) | Pass |
+| 2026-11-20 | M2 final gate (`W5`, `W6`, `C1`, `C2`, `R3`, `R4`, `G3`, `G4`, `S1`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build`, `zig build test` (Debug, ReleaseSafe, ReleaseFast): 96/96 tests (95 lib + 1 cli); direct Debug test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (API + GPU Validation enabled): 95/95 tests; ReleaseFast `./zig-out/bin/aminfer bench` (C9 + S2 + S1 + G3 + G4 + 4-layer `.amf` Qwen3-30B-A3B-3bit & Qwen3-14B-4bit decode, `0` hot-path malloc delta, `0` swapouts) + end-to-end `synth-qwen3` → `aminfer decode` (`tiny-moe`, `tiny-dense`, 4-layer `qwen3-30b-a3b-3bit`, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md) | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -162,9 +200,17 @@ Update this before the context window runs out or when handing off.
     packer & MLX importer (W2, W4), `04d0a62` Metal 4 multi-frame batching &
     specialized pipelines (F6 hot path, R2, G2 GPU), `65a1a62` fused 3/4-bit
     dequant GEMV/GEMM kernels (G1), `6bfe351` VM/heap probe, C9 bandwidth
-    calibration & Spike S2 harness (C9, S2)
-- In flight: none (M1 complete; ready for M2)
+    calibration & Spike S2 harness (C9, S2), `1632227` M1 close-out, `9ab393b`
+    unified benchmark log & sysctl/powermetrics verification
+  - M2: `dfb2906` synthetic Qwen3 MoE/dense `.amf` & tokenizer generator,
+    `bd05973` lock-free rings, QoS steering & native Qwen BPE tokenizer (C1, C2,
+    W5), `e29033f` IOSurface KV tiles, Spike S1 & GQA decode attention (R3, R4,
+    S1, G4), `3a90b9f` deduplicated MoE gather/SwiGLU & greedy argmax (G3),
+    `c2b5856` M2 build/root wiring, `3197b12` Qwen3-MoE & Qwen3-Dense greedy
+    decode engine (W6), `517ba0d` M2 benchmarks & `aminfer decode` CLI
+- In flight: none (M2 complete; ready for M3 speculative decoding)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [benchmarks/results.md](benchmarks/results.md),
+  [decisions/0004-kv-cache-iosurface-texture-sharing.md](decisions/0004-kv-cache-iosurface-texture-sharing.md),
   [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md)

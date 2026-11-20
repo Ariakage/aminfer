@@ -39,8 +39,8 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | --- | --- | --- | --- | --- |
 | R1 | Wired budget computed at startup (default headroom ≥ 3 GiB; refuse plans over budget) | Implemented | M1 | [ADR-0012](decisions/0012-wired-memory-budget-headroom.md) |
 | R2 | GPU residency through `MTLResidencySet` | Implemented | M1 | [memory.md](architecture/memory.md) |
-| R3 | KV tiles: IOSurface (fp16 `OneComponent16Half`, 64 B row stride) viewed as `MTLTexture` | Confirmed | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
-| R4 | KV tile granularity (one 512-token chunk per layer) and token- vs channel-major rows | Draft | M2 (spike S1) | [memory.md](architecture/memory.md#kv-tiles) |
+| R3 | KV tiles: IOSurface (fp16 `OneComponent16Half`, 64 B row stride) viewed as `MTLTexture` | Implemented | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
+| R4 | KV tile granularity (one 512-token chunk per layer) and token-major `RGBA16Float` rows | Implemented | M2 (spike S1) | [memory.md](architecture/memory.md#kv-tiles), [results.md](benchmarks/results.md) |
 | R5 | int8 KV tiles (`OneComponent8`) | Undecided | — | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
 
 ## Model, weights and format
@@ -51,8 +51,8 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | W2 | `.amf` writer in `tools/` | Implemented | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
 | W3 | `.amf` reader and startup validation in Zig | Implemented | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
 | W4 | Import MLX community quantized safetensors (affine, group 64) as the conversion source | Implemented | M1 | [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
-| W5 | Native Zig tokenizer (Qwen BPE) | Draft | M2 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
-| W6 | Primary target Qwen3-30B-A3B (3-bit); secondary Qwen3-14B (4-bit, dense) | Draft | M2 | [memory.md](architecture/memory.md#budget-estimates) |
+| W5 | Native Zig tokenizer (Qwen BPE) | Implemented | M2 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
+| W6 | Primary target Qwen3-30B-A3B (3-bit); secondary Qwen3-14B (4-bit, dense) | Implemented | M2 | [memory.md](architecture/memory.md#budget-estimates), [results.md](benchmarks/results.md) |
 | W7 | CoreML `.mlpackage` export for ANE graphs (draft model, attention blocks, expert predictor) | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
 | W8 | Offline expert heat statistics | Confirmed | M4 | [experts-and-storage.md](architecture/experts-and-storage.md) |
 
@@ -62,8 +62,8 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | --- | --- | --- | --- | --- |
 | G1 | Fused 3/4-bit dequantization GEMV / GEMM kernels | Implemented | M1 | [overview.md](architecture/overview.md) |
 | G2 | Compile-time specialization (Zig `comptime`; Metal function constants on the GPU side) | Implemented | M1 | [ADR-0014](decisions/0014-compile-time-specialization.md) |
-| G3 | MoE gather / grouped GEMM with experts deduplicated across verified tokens | Confirmed | M2 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) |
-| G4 | Decode attention over KV tiles | Confirmed | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
+| G3 | MoE gather / grouped GEMM with experts deduplicated across verified tokens | Implemented | M2 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md), [results.md](benchmarks/results.md) |
+| G4 | Decode attention over KV tiles | Implemented | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), [results.md](benchmarks/results.md) |
 | G5 | Tree-attention verification with ancestor mask and accepted-path KV commit | Confirmed | M3 | [speculative-decoding.md](architecture/speculative-decoding.md) |
 | G6 | GPU half of the hybrid prefill (FFN / MoE) | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
 
@@ -93,8 +93,8 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
-| C1 | Lock-free SPSC / MPSC rings with preallocated slots | Confirmed | M2 | [runtime-pipeline.md](architecture/runtime-pipeline.md#threading-model) |
-| C2 | QoS-based core steering (no hard affinity on Apple Silicon) and I/O policy for prefetch threads | Draft | M2 | [hardware.md](architecture/hardware.md#core-steering) |
+| C1 | Lock-free SPSC / MPSC rings with preallocated slots | Implemented | M2 | [runtime-pipeline.md](architecture/runtime-pipeline.md#threading-model) |
+| C2 | QoS-based core steering (no hard affinity on Apple Silicon) and I/O policy for prefetch threads | Implemented | M2 | [hardware.md](architecture/hardware.md#core-steering) |
 | C3 | Cold experts: `F_NOCACHE` + `aio_read` + `kqueue` (`EVFILT_AIO`) into 16 KiB slots | Confirmed | M4 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
 | C4 | E-core `pread` worker fallback when kernel AIO concurrency limits throughput | Draft | M4 (spike S3) | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
 | C5 | Hot / cold expert cache policy | Draft | M4 | [experts-and-storage.md](architecture/experts-and-storage.md) |
