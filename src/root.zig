@@ -18,6 +18,9 @@ pub const vmstat = @import("platform/vmstat.zig");
 pub const tokenizer = @import("model/tokenizer.zig");
 pub const qwen3 = @import("model/qwen3.zig");
 pub const bench = @import("bench/runner.zig");
+pub const sam = @import("spec/sam.zig");
+pub const tree = @import("spec/tree.zig");
+pub const accept = @import("spec/accept.zig");
 
 test {
     _ = metal;
@@ -37,4 +40,7 @@ test {
     _ = tokenizer;
     _ = qwen3;
     _ = bench;
+    _ = sam;
+    _ = tree;
+    _ = accept;
 }
