@@ -581,71 +581,144 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
         return;
     }
 
-    // Multi-token deduplicated path: dequantize each expert row ONCE across up to 16 tokens.
-    constexpr uint T_BLK = 16u;
-    for (uint t_base = 0u; t_base < count_u; t_base += T_BLK) {
-        const uint t_cnt = min(T_BLK, count_u - t_base);
-        uint toks[T_BLK];
-        for (uint t = 0u; t < t_cnt; t++) {
-            toks[t] = token_indices[s0 + t_base + t];
-        }
+    // Multi-token deduplicated path: zero-spill scalar-register batching
+    // dequantizing each expert row ONCE across up to 8 tokens (with a 4-token
+    // fast path for small buckets `count_u <= 4`).
+    for (uint t_base = 0u; t_base < count_u; ) {
+        const uint rem = count_u - t_base;
+        if (rem <= 4u) {
+            const uint t0 = token_indices[s0 + t_base + 0u];
+            const uint t1 = token_indices[s0 + t_base + min(1u, rem - 1u)];
+            const uint t2 = token_indices[s0 + t_base + min(2u, rem - 1u)];
+            const uint t3 = token_indices[s0 + t_base + min(3u, rem - 1u)];
+            const device half *x0 = x + ulong(t0) * p.hidden_size;
+            const device half *x1 = x + ulong(t1) * p.hidden_size;
+            const device half *x2 = x + ulong(t2) * p.hidden_size;
+            const device half *x3 = x + ulong(t3) * p.hidden_size;
 
-        for (uint r = 0u; r < ROWS_PER_SG; r++) {
-            const uint row = row0 + r;
-            if (row >= p.intermediate_size) {
-                break;
-            }
-            float g_acc[T_BLK];
-            float u_acc[T_BLK];
-            for (uint t = 0u; t < t_cnt; t++) {
-                g_acc[t] = 0.0f;
-                u_acc[t] = 0.0f;
-            }
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (row >= p.intermediate_size) {
+                    break;
+                }
+                float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
+                float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+                const ulong row_w_base = ulong(row) * p.row_bytes;
+                const ulong row_sb_base = ulong(row) * p.num_groups;
 
-            const ulong row_w_base = ulong(row) * p.row_bytes;
-            const ulong row_sb_base = ulong(row) * p.num_groups;
+                for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+                    const uint g = g_base + sub_group;
+                    if (g >= p.num_groups) {
+                        continue;
+                    }
+                    const half2 gsb = gate_sb[row_sb_base + g];
+                    const half2 usb = up_sb[row_sb_base + g];
+                    float4 gw0, gw1, uw0, uw1;
+                    if (Q_BITS == 4u) {
+                        const uint w_off = g * 32u + lane_in_grp * 4u;
+                        dequant8_q4(*(const device uint32_t *)(gate_qw + row_w_base + w_off), float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q4(*(const device uint32_t *)(up_qw + row_w_base + w_off), float(usb.x), float(usb.y), uw0, uw1);
+                    } else {
+                        const uint w_off = g * 24u + lane_in_grp * 3u;
+                        const device uchar *gwp = gate_qw + row_w_base + w_off;
+                        const device uchar *uwp = up_qw + row_w_base + w_off;
+                        dequant8_q3(gwp[0], gwp[1], gwp[2], float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q3(uwp[0], uwp[1], uwp[2], float(usb.x), float(usb.y), uw0, uw1);
+                    }
 
-            for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
-                const uint g = g_base + sub_group;
-                if (g >= p.num_groups) {
-                    continue;
+                    const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+                    { const float4 a = float4(*(const device half4 *)(x0 + k_off)); const float4 b = float4(*(const device half4 *)(x0 + k_off + 4u)); g0 += dot(a, gw0) + dot(b, gw1); u0 += dot(a, uw0) + dot(b, uw1); }
+                    { const float4 a = float4(*(const device half4 *)(x1 + k_off)); const float4 b = float4(*(const device half4 *)(x1 + k_off + 4u)); g1 += dot(a, gw0) + dot(b, gw1); u1 += dot(a, uw0) + dot(b, uw1); }
+                    if (rem > 2u) { const float4 a = float4(*(const device half4 *)(x2 + k_off)); const float4 b = float4(*(const device half4 *)(x2 + k_off + 4u)); g2 += dot(a, gw0) + dot(b, gw1); u2 += dot(a, uw0) + dot(b, uw1); }
+                    if (rem > 3u) { const float4 a = float4(*(const device half4 *)(x3 + k_off)); const float4 b = float4(*(const device half4 *)(x3 + k_off + 4u)); g3 += dot(a, gw0) + dot(b, gw1); u3 += dot(a, uw0) + dot(b, uw1); }
                 }
 
-                const half2 gsb = gate_sb[row_sb_base + g];
-                const half2 usb = up_sb[row_sb_base + g];
-                float4 gw0, gw1, uw0, uw1;
-                if (Q_BITS == 4u) {
-                    const uint w_off = g * 32u + lane_in_grp * 4u;
-                    const uint32_t gw = *(const device uint32_t *)(gate_qw + row_w_base + w_off);
-                    const uint32_t uw = *(const device uint32_t *)(up_qw + row_w_base + w_off);
-                    dequant8_q4(gw, float(gsb.x), float(gsb.y), gw0, gw1);
-                    dequant8_q4(uw, float(usb.x), float(usb.y), uw0, uw1);
-                } else {
-                    const uint w_off = g * 24u + lane_in_grp * 3u;
-                    const device uchar *gwp = gate_qw + row_w_base + w_off;
-                    const device uchar *uwp = up_qw + row_w_base + w_off;
-                    dequant8_q3(gwp[0], gwp[1], gwp[2], float(gsb.x), float(gsb.y), gw0, gw1);
-                    dequant8_q3(uwp[0], uwp[1], uwp[2], float(usb.x), float(usb.y), uw0, uw1);
-                }
-
-                const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
-                for (uint t = 0u; t < t_cnt; t++) {
-                    const device half *x_tok = x + ulong(toks[t]) * p.hidden_size + k_off;
-                    const float4 fx0 = float4(*(const device half4 *)(x_tok));
-                    const float4 fx1 = float4(*(const device half4 *)(x_tok + 4u));
-                    g_acc[t] += dot(fx0, gw0) + dot(fx1, gw1);
-                    u_acc[t] += dot(fx0, uw0) + dot(fx1, uw1);
-                }
-            }
-
-            for (uint t = 0u; t < t_cnt; t++) {
-                const float gt = simd_sum(g_acc[t]);
-                const float ut = simd_sum(u_acc[t]);
+                const float sg0 = simd_sum(g0), su0 = simd_sum(u0);
+                const float sg1 = simd_sum(g1), su1 = simd_sum(u1);
+                const float sg2 = simd_sum(g2), su2 = simd_sum(u2);
+                const float sg3 = simd_sum(g3), su3 = simd_sum(u3);
                 if (lane == 0u) {
-                    const ulong slot = ulong(s0 + t_base + t);
-                    inter[slot * p.intermediate_size + row] = half(fast_silu(gt) * ut);
+                    inter[ulong(s0 + t_base + 0u) * p.intermediate_size + row] = half(fast_silu(sg0) * su0);
+                    if (rem > 1u) inter[ulong(s0 + t_base + 1u) * p.intermediate_size + row] = half(fast_silu(sg1) * su1);
+                    if (rem > 2u) inter[ulong(s0 + t_base + 2u) * p.intermediate_size + row] = half(fast_silu(sg2) * su2);
+                    if (rem > 3u) inter[ulong(s0 + t_base + 3u) * p.intermediate_size + row] = half(fast_silu(sg3) * su3);
                 }
             }
+            t_base += rem;
+        } else {
+            const uint t_cnt = min(8u, rem);
+            const device half *x0 = x + ulong(token_indices[s0 + t_base + 0u]) * p.hidden_size;
+            const device half *x1 = x + ulong(token_indices[s0 + t_base + 1u]) * p.hidden_size;
+            const device half *x2 = x + ulong(token_indices[s0 + t_base + 2u]) * p.hidden_size;
+            const device half *x3 = x + ulong(token_indices[s0 + t_base + 3u]) * p.hidden_size;
+            const device half *x4 = x + ulong(token_indices[s0 + t_base + 4u]) * p.hidden_size;
+            const device half *x5 = x + ulong(token_indices[s0 + t_base + min(5u, t_cnt - 1u)]) * p.hidden_size;
+            const device half *x6 = x + ulong(token_indices[s0 + t_base + min(6u, t_cnt - 1u)]) * p.hidden_size;
+            const device half *x7 = x + ulong(token_indices[s0 + t_base + min(7u, t_cnt - 1u)]) * p.hidden_size;
+
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (row >= p.intermediate_size) {
+                    break;
+                }
+                float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
+                float g4 = 0.0f, g5 = 0.0f, g6 = 0.0f, g7 = 0.0f;
+                float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+                float u4 = 0.0f, u5 = 0.0f, u6 = 0.0f, u7 = 0.0f;
+                const ulong row_w_base = ulong(row) * p.row_bytes;
+                const ulong row_sb_base = ulong(row) * p.num_groups;
+
+                for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+                    const uint g = g_base + sub_group;
+                    if (g >= p.num_groups) {
+                        continue;
+                    }
+                    const half2 gsb = gate_sb[row_sb_base + g];
+                    const half2 usb = up_sb[row_sb_base + g];
+                    float4 gw0, gw1, uw0, uw1;
+                    if (Q_BITS == 4u) {
+                        const uint w_off = g * 32u + lane_in_grp * 4u;
+                        dequant8_q4(*(const device uint32_t *)(gate_qw + row_w_base + w_off), float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q4(*(const device uint32_t *)(up_qw + row_w_base + w_off), float(usb.x), float(usb.y), uw0, uw1);
+                    } else {
+                        const uint w_off = g * 24u + lane_in_grp * 3u;
+                        const device uchar *gwp = gate_qw + row_w_base + w_off;
+                        const device uchar *uwp = up_qw + row_w_base + w_off;
+                        dequant8_q3(gwp[0], gwp[1], gwp[2], float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q3(uwp[0], uwp[1], uwp[2], float(usb.x), float(usb.y), uw0, uw1);
+                    }
+
+                    const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+                    { const float4 a = float4(*(const device half4 *)(x0 + k_off)); const float4 b = float4(*(const device half4 *)(x0 + k_off + 4u)); g0 += dot(a, gw0) + dot(b, gw1); u0 += dot(a, uw0) + dot(b, uw1); }
+                    { const float4 a = float4(*(const device half4 *)(x1 + k_off)); const float4 b = float4(*(const device half4 *)(x1 + k_off + 4u)); g1 += dot(a, gw0) + dot(b, gw1); u1 += dot(a, uw0) + dot(b, uw1); }
+                    { const float4 a = float4(*(const device half4 *)(x2 + k_off)); const float4 b = float4(*(const device half4 *)(x2 + k_off + 4u)); g2 += dot(a, gw0) + dot(b, gw1); u2 += dot(a, uw0) + dot(b, uw1); }
+                    { const float4 a = float4(*(const device half4 *)(x3 + k_off)); const float4 b = float4(*(const device half4 *)(x3 + k_off + 4u)); g3 += dot(a, gw0) + dot(b, gw1); u3 += dot(a, uw0) + dot(b, uw1); }
+                    { const float4 a = float4(*(const device half4 *)(x4 + k_off)); const float4 b = float4(*(const device half4 *)(x4 + k_off + 4u)); g4 += dot(a, gw0) + dot(b, gw1); u4 += dot(a, uw0) + dot(b, uw1); }
+                    if (t_cnt > 5u) { const float4 a = float4(*(const device half4 *)(x5 + k_off)); const float4 b = float4(*(const device half4 *)(x5 + k_off + 4u)); g5 += dot(a, gw0) + dot(b, gw1); u5 += dot(a, uw0) + dot(b, uw1); }
+                    if (t_cnt > 6u) { const float4 a = float4(*(const device half4 *)(x6 + k_off)); const float4 b = float4(*(const device half4 *)(x6 + k_off + 4u)); g6 += dot(a, gw0) + dot(b, gw1); u6 += dot(a, uw0) + dot(b, uw1); }
+                    if (t_cnt > 7u) { const float4 a = float4(*(const device half4 *)(x7 + k_off)); const float4 b = float4(*(const device half4 *)(x7 + k_off + 4u)); g7 += dot(a, gw0) + dot(b, gw1); u7 += dot(a, uw0) + dot(b, uw1); }
+                }
+
+                const float sg0 = simd_sum(g0), su0 = simd_sum(u0);
+                const float sg1 = simd_sum(g1), su1 = simd_sum(u1);
+                const float sg2 = simd_sum(g2), su2 = simd_sum(u2);
+                const float sg3 = simd_sum(g3), su3 = simd_sum(u3);
+                const float sg4 = simd_sum(g4), su4 = simd_sum(u4);
+                const float sg5 = simd_sum(g5), su5 = simd_sum(u5);
+                const float sg6 = simd_sum(g6), su6 = simd_sum(u6);
+                const float sg7 = simd_sum(g7), su7 = simd_sum(u7);
+                if (lane == 0u) {
+                    inter[ulong(s0 + t_base + 0u) * p.intermediate_size + row] = half(fast_silu(sg0) * su0);
+                    inter[ulong(s0 + t_base + 1u) * p.intermediate_size + row] = half(fast_silu(sg1) * su1);
+                    inter[ulong(s0 + t_base + 2u) * p.intermediate_size + row] = half(fast_silu(sg2) * su2);
+                    inter[ulong(s0 + t_base + 3u) * p.intermediate_size + row] = half(fast_silu(sg3) * su3);
+                    inter[ulong(s0 + t_base + 4u) * p.intermediate_size + row] = half(fast_silu(sg4) * su4);
+                    if (t_cnt > 5u) inter[ulong(s0 + t_base + 5u) * p.intermediate_size + row] = half(fast_silu(sg5) * su5);
+                    if (t_cnt > 6u) inter[ulong(s0 + t_base + 6u) * p.intermediate_size + row] = half(fast_silu(sg6) * su6);
+                    if (t_cnt > 7u) inter[ulong(s0 + t_base + 7u) * p.intermediate_size + row] = half(fast_silu(sg7) * su7);
+                }
+            }
+            t_base += t_cnt;
         }
     }
 }
@@ -774,62 +847,119 @@ kernel void ami_moe_down_proj(const device half *inter [[buffer(0)]],
         return;
     }
 
-    // Multi-token deduplicated path: dequantize each down_proj row ONCE across up to 16 tokens.
-    constexpr uint T_BLK = 16u;
-    for (uint t_base = 0u; t_base < count_u; t_base += T_BLK) {
-        const uint t_cnt = min(T_BLK, count_u - t_base);
+    // Multi-token deduplicated path: zero-spill scalar-register batching
+    // dequantizing each down_proj row ONCE across up to 8 tokens (with 4-token fast path).
+    for (uint t_base = 0u; t_base < count_u; ) {
+        const uint rem = count_u - t_base;
+        if (rem <= 4u) {
+            const device half *i0 = inter + ulong(s0 + t_base + 0u) * p.intermediate_size;
+            const device half *i1 = inter + ulong(s0 + t_base + min(1u, rem - 1u)) * p.intermediate_size;
+            const device half *i2 = inter + ulong(s0 + t_base + min(2u, rem - 1u)) * p.intermediate_size;
+            const device half *i3 = inter + ulong(s0 + t_base + min(3u, rem - 1u)) * p.intermediate_size;
 
-        for (uint r = 0u; r < ROWS_PER_SG; r++) {
-            const uint row = row0 + r;
-            if (row >= p.hidden_size) {
-                break;
-            }
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (row >= p.hidden_size) {
+                    break;
+                }
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                const ulong row_w_base = ulong(row) * p.row_bytes;
+                const ulong row_sb_base = ulong(row) * p.num_groups;
 
-            float acc[T_BLK];
-            for (uint t = 0u; t < t_cnt; t++) {
-                acc[t] = 0.0f;
-            }
+                for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+                    const uint g = g_base + sub_group;
+                    if (g >= p.num_groups) {
+                        continue;
+                    }
+                    const half2 sb = down_sb[row_sb_base + g];
+                    float4 dw0, dw1;
+                    if (Q_BITS == 4u) {
+                        const uint w_off = g * 32u + lane_in_grp * 4u;
+                        dequant8_q4(*(const device uint32_t *)(down_qw + row_w_base + w_off), float(sb.x), float(sb.y), dw0, dw1);
+                    } else {
+                        const uint w_off = g * 24u + lane_in_grp * 3u;
+                        const device uchar *wp = down_qw + row_w_base + w_off;
+                        dequant8_q3(wp[0], wp[1], wp[2], float(sb.x), float(sb.y), dw0, dw1);
+                    }
 
-            const ulong row_w_base = ulong(row) * p.row_bytes;
-            const ulong row_sb_base = ulong(row) * p.num_groups;
-
-            for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
-                const uint g = g_base + sub_group;
-                if (g >= p.num_groups) {
-                    continue;
+                    const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+                    a0 += dot(float4(*(const device half4 *)(i0 + k_off)), dw0) + dot(float4(*(const device half4 *)(i0 + k_off + 4u)), dw1);
+                    a1 += dot(float4(*(const device half4 *)(i1 + k_off)), dw0) + dot(float4(*(const device half4 *)(i1 + k_off + 4u)), dw1);
+                    if (rem > 2u) a2 += dot(float4(*(const device half4 *)(i2 + k_off)), dw0) + dot(float4(*(const device half4 *)(i2 + k_off + 4u)), dw1);
+                    if (rem > 3u) a3 += dot(float4(*(const device half4 *)(i3 + k_off)), dw0) + dot(float4(*(const device half4 *)(i3 + k_off + 4u)), dw1);
                 }
 
-                const half2 sb = down_sb[row_sb_base + g];
-                float4 dw0, dw1;
-                if (Q_BITS == 4u) {
-                    const uint w_off = g * 32u + lane_in_grp * 4u;
-                    const uint32_t dw = *(const device uint32_t *)(down_qw + row_w_base + w_off);
-                    dequant8_q4(dw, float(sb.x), float(sb.y), dw0, dw1);
-                } else {
-                    const uint w_off = g * 24u + lane_in_grp * 3u;
-                    const device uchar *wp = down_qw + row_w_base + w_off;
-                    dequant8_q3(wp[0], wp[1], wp[2], float(sb.x), float(sb.y), dw0, dw1);
-                }
-
-                const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
-                for (uint t = 0u; t < t_cnt; t++) {
-                    const device half *in_row = inter + ulong(s0 + t_base + t) * p.intermediate_size + k_off;
-                    const float4 fx0 = float4(*(const device half4 *)(in_row));
-                    const float4 fx1 = float4(*(const device half4 *)(in_row + 4u));
-                    acc[t] += dot(fx0, dw0) + dot(fx1, dw1);
-                }
-            }
-
-            for (uint t = 0u; t < t_cnt; t++) {
-                const float total = simd_sum(acc[t]);
+                const float sa0 = simd_sum(a0), sa1 = simd_sum(a1), sa2 = simd_sum(a2), sa3 = simd_sum(a3);
                 if (lane == 0u) {
-                    const uint s = s0 + t_base + t;
-                    const uint tok = token_indices[s];
-                    const uint k_idx = slot_k_indices[s];
-                    const float rw = routing_weights[s];
-                    down_out[(ulong(tok) * p.top_k + k_idx) * p.hidden_size + row] = total * rw;
+                    { const uint s = s0 + t_base + 0u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa0 * routing_weights[s]; }
+                    if (rem > 1u) { const uint s = s0 + t_base + 1u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa1 * routing_weights[s]; }
+                    if (rem > 2u) { const uint s = s0 + t_base + 2u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa2 * routing_weights[s]; }
+                    if (rem > 3u) { const uint s = s0 + t_base + 3u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa3 * routing_weights[s]; }
                 }
             }
+            t_base += rem;
+        } else {
+            const uint t_cnt = min(8u, rem);
+            const device half *i0 = inter + ulong(s0 + t_base + 0u) * p.intermediate_size;
+            const device half *i1 = inter + ulong(s0 + t_base + 1u) * p.intermediate_size;
+            const device half *i2 = inter + ulong(s0 + t_base + 2u) * p.intermediate_size;
+            const device half *i3 = inter + ulong(s0 + t_base + 3u) * p.intermediate_size;
+            const device half *i4 = inter + ulong(s0 + t_base + 4u) * p.intermediate_size;
+            const device half *i5 = inter + ulong(s0 + t_base + min(5u, t_cnt - 1u)) * p.intermediate_size;
+            const device half *i6 = inter + ulong(s0 + t_base + min(6u, t_cnt - 1u)) * p.intermediate_size;
+            const device half *i7 = inter + ulong(s0 + t_base + min(7u, t_cnt - 1u)) * p.intermediate_size;
+
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (row >= p.hidden_size) {
+                    break;
+                }
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+                const ulong row_w_base = ulong(row) * p.row_bytes;
+                const ulong row_sb_base = ulong(row) * p.num_groups;
+
+                for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+                    const uint g = g_base + sub_group;
+                    if (g >= p.num_groups) {
+                        continue;
+                    }
+                    const half2 sb = down_sb[row_sb_base + g];
+                    float4 dw0, dw1;
+                    if (Q_BITS == 4u) {
+                        const uint w_off = g * 32u + lane_in_grp * 4u;
+                        dequant8_q4(*(const device uint32_t *)(down_qw + row_w_base + w_off), float(sb.x), float(sb.y), dw0, dw1);
+                    } else {
+                        const uint w_off = g * 24u + lane_in_grp * 3u;
+                        const device uchar *wp = down_qw + row_w_base + w_off;
+                        dequant8_q3(wp[0], wp[1], wp[2], float(sb.x), float(sb.y), dw0, dw1);
+                    }
+
+                    const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+                    a0 += dot(float4(*(const device half4 *)(i0 + k_off)), dw0) + dot(float4(*(const device half4 *)(i0 + k_off + 4u)), dw1);
+                    a1 += dot(float4(*(const device half4 *)(i1 + k_off)), dw0) + dot(float4(*(const device half4 *)(i1 + k_off + 4u)), dw1);
+                    a2 += dot(float4(*(const device half4 *)(i2 + k_off)), dw0) + dot(float4(*(const device half4 *)(i2 + k_off + 4u)), dw1);
+                    a3 += dot(float4(*(const device half4 *)(i3 + k_off)), dw0) + dot(float4(*(const device half4 *)(i3 + k_off + 4u)), dw1);
+                    a4 += dot(float4(*(const device half4 *)(i4 + k_off)), dw0) + dot(float4(*(const device half4 *)(i4 + k_off + 4u)), dw1);
+                    if (t_cnt > 5u) a5 += dot(float4(*(const device half4 *)(i5 + k_off)), dw0) + dot(float4(*(const device half4 *)(i5 + k_off + 4u)), dw1);
+                    if (t_cnt > 6u) a6 += dot(float4(*(const device half4 *)(i6 + k_off)), dw0) + dot(float4(*(const device half4 *)(i6 + k_off + 4u)), dw1);
+                    if (t_cnt > 7u) a7 += dot(float4(*(const device half4 *)(i7 + k_off)), dw0) + dot(float4(*(const device half4 *)(i7 + k_off + 4u)), dw1);
+                }
+
+                const float sa0 = simd_sum(a0), sa1 = simd_sum(a1), sa2 = simd_sum(a2), sa3 = simd_sum(a3);
+                const float sa4 = simd_sum(a4), sa5 = simd_sum(a5), sa6 = simd_sum(a6), sa7 = simd_sum(a7);
+                if (lane == 0u) {
+                    { const uint s = s0 + t_base + 0u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa0 * routing_weights[s]; }
+                    { const uint s = s0 + t_base + 1u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa1 * routing_weights[s]; }
+                    { const uint s = s0 + t_base + 2u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa2 * routing_weights[s]; }
+                    { const uint s = s0 + t_base + 3u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa3 * routing_weights[s]; }
+                    { const uint s = s0 + t_base + 4u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa4 * routing_weights[s]; }
+                    if (t_cnt > 5u) { const uint s = s0 + t_base + 5u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa5 * routing_weights[s]; }
+                    if (t_cnt > 6u) { const uint s = s0 + t_base + 6u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa6 * routing_weights[s]; }
+                    if (t_cnt > 7u) { const uint s = s0 + t_base + 7u; down_out[(ulong(token_indices[s]) * p.top_k + slot_k_indices[s]) * p.hidden_size + row] = sa7 * routing_weights[s]; }
+                }
+            }
+            t_base += t_cnt;
         }
     }
 }
@@ -1341,6 +1471,584 @@ kernel void ami_embed_lookup(const device uchar *weight [[buffer(0)]],
             for (uint j = 0u; j < 8u; j++) {
                 dst[j] = half(fma(float((word >> (j * 3u)) & 0x7u), scale, bias));
             }
+        }
+    }
+}
+
+// ===========================================================================
+// Milestone M3: Batched Argmax Rows, Fused Top-K Draft Logits Extraction,
+// and Non-Deduplicated Per-Slot MoE SwiGLU Kernels (Spike S5 / ADR-0009).
+// ===========================================================================
+
+struct ArgmaxRowsParams {
+    uint num_rows;
+    uint vocab_size;
+    uint aligned_vec4;
+    uint _pad;
+};
+
+struct TopKCandidate {
+    uint token_id;
+    float prob;
+    float log_prob;
+    uint _pad;
+};
+
+struct TopKLogitsRowsParams {
+    uint num_rows;
+    uint vocab_size;
+    uint top_k;
+    uint aligned_vec4;
+};
+
+struct MoePerSlotParams {
+    uint hidden_size;
+    uint intermediate_size;
+    uint num_groups;
+    uint row_bytes;
+    uint m;
+    uint top_k;
+};
+
+static_assert(sizeof(ArgmaxRowsParams) == 16, "ArgmaxRowsParams must be 16 bytes");
+static_assert(sizeof(TopKCandidate) == 16, "TopKCandidate must be 16 bytes");
+static_assert(sizeof(TopKLogitsRowsParams) == 16, "TopKLogitsRowsParams must be 16 bytes");
+static_assert(sizeof(MoePerSlotParams) == 24, "MoePerSlotParams must be 24 bytes");
+
+// ---------------------------------------------------------------------------
+// Kernel 13: Batched M-Row Greedy Argmax (`[M, vocab_size]` f16/f32 -> `[M]u32`)
+//
+// Specialized on LOGITS_F16 (function_constant(3)). Deterministic smallest-
+// index tie breaking. Grid: (num_rows, 1, 1) threadgroups, up to 1024 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_argmax_rows(const device uchar *logits_raw [[buffer(0)]],
+                            device uint *out_token_ids [[buffer(1)]],
+                            constant ArgmaxRowsParams &p [[buffer(2)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint tg_size [[threads_per_threadgroup]],
+                            uint sg_id [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= p.num_rows) {
+        return;
+    }
+
+    threadgroup float s_vals[32];
+    threadgroup uint s_idxs[32];
+
+    float best_v = -INFINITY;
+    uint best_i = 0xFFFFFFFFu;
+
+    if (LOGITS_F16) {
+        const device half *logits = ((const device half *)logits_raw) + ulong(row) * p.vocab_size;
+        if (p.aligned_vec4 != 0u) {
+            const uint vec_n = p.vocab_size >> 2;
+            const device half4 *vlogits = (const device half4 *)logits;
+            for (uint vi = tid; vi < vec_n; vi += tg_size) {
+                const float4 fv = float4(vlogits[vi]);
+                const uint base = vi << 2;
+                if (fv.x > best_v || (fv.x == best_v && (base + 0u) < best_i)) { best_v = fv.x; best_i = base + 0u; }
+                if (fv.y > best_v || (fv.y == best_v && (base + 1u) < best_i)) { best_v = fv.y; best_i = base + 1u; }
+                if (fv.z > best_v || (fv.z == best_v && (base + 2u) < best_i)) { best_v = fv.z; best_i = base + 2u; }
+                if (fv.w > best_v || (fv.w == best_v && (base + 3u) < best_i)) { best_v = fv.w; best_i = base + 3u; }
+            }
+            const uint tail = vec_n << 2;
+            for (uint i = tail + tid; i < p.vocab_size; i += tg_size) {
+                const float v = float(logits[i]);
+                if (v > best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
+            }
+        } else {
+            for (uint i = tid; i < p.vocab_size; i += tg_size) {
+                const float v = float(logits[i]);
+                if (v > best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
+            }
+        }
+    } else {
+        const device float *logits = ((const device float *)logits_raw) + ulong(row) * p.vocab_size;
+        if (p.aligned_vec4 != 0u) {
+            const uint vec_n = p.vocab_size >> 2;
+            const device float4 *vlogits = (const device float4 *)logits;
+            for (uint vi = tid; vi < vec_n; vi += tg_size) {
+                const float4 fv = vlogits[vi];
+                const uint base = vi << 2;
+                if (fv.x > best_v || (fv.x == best_v && (base + 0u) < best_i)) { best_v = fv.x; best_i = base + 0u; }
+                if (fv.y > best_v || (fv.y == best_v && (base + 1u) < best_i)) { best_v = fv.y; best_i = base + 1u; }
+                if (fv.z > best_v || (fv.z == best_v && (base + 2u) < best_i)) { best_v = fv.z; best_i = base + 2u; }
+                if (fv.w > best_v || (fv.w == best_v && (base + 3u) < best_i)) { best_v = fv.w; best_i = base + 3u; }
+            }
+            const uint tail = vec_n << 2;
+            for (uint i = tail + tid; i < p.vocab_size; i += tg_size) {
+                const float v = logits[i];
+                if (v > best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
+            }
+        } else {
+            for (uint i = tid; i < p.vocab_size; i += tg_size) {
+                const float v = logits[i];
+                if (v > best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
+            }
+        }
+    }
+
+    for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+        const float ov = simd_shuffle_down(best_v, offset);
+        const uint oi = simd_shuffle_down(best_i, offset);
+        if (ov > best_v || (ov == best_v && oi < best_i)) {
+            best_v = ov;
+            best_i = oi;
+        }
+    }
+
+    if (lane == 0u) {
+        s_vals[sg_id] = best_v;
+        s_idxs[sg_id] = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg_id == 0u) {
+        const uint num_sgs = tg_size >> 5;
+        float fv = (lane < num_sgs) ? s_vals[lane] : -INFINITY;
+        uint fi = (lane < num_sgs) ? s_idxs[lane] : 0xFFFFFFFFu;
+        for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+            const float ov = simd_shuffle_down(fv, offset);
+            const uint oi = simd_shuffle_down(fi, offset);
+            if (ov > fv || (ov == fv && oi < fi)) {
+                fv = ov;
+                fi = oi;
+            }
+        }
+        if (lane == 0u) {
+            out_token_ids[row] = (fi == 0xFFFFFFFFu) ? 0u : fi;
+        }
+    }
+}
+
+static inline void topk_consider(float v,
+                                 uint idx,
+                                 uint k,
+                                 thread float *top_v,
+                                 thread uint *top_i,
+                                 thread float &min_v,
+                                 thread uint &min_i,
+                                 thread float &local_m,
+                                 thread float &local_sum) {
+    if (v > local_m) {
+        local_sum = (local_sum > 0.0f) ? fma(local_sum, exp(local_m - v), 1.0f) : 1.0f;
+        local_m = v;
+    } else if (isfinite(v)) {
+        local_sum += exp(v - local_m);
+    }
+
+    if (v > min_v || (v == min_v && idx < min_i)) {
+        uint pos = k - 1u;
+        while (pos > 0u) {
+            const float pv = top_v[pos - 1u];
+            const uint pi = top_i[pos - 1u];
+            if (v > pv || (v == pv && idx < pi)) {
+                top_v[pos] = pv;
+                top_i[pos] = pi;
+                pos--;
+            } else {
+                break;
+            }
+        }
+        top_v[pos] = v;
+        top_i[pos] = idx;
+        min_v = top_v[k - 1u];
+        min_i = top_i[k - 1u];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 14: Fused Single-Dispatch Row-Wise FP32 Softmax + Top-K Extraction
+//
+// `[M, vocab_size]` (f16 or f32 via LOGITS_F16) -> `[M, top_k]` TopKCandidate
+// (`top_k <= 16`). One 256-thread (8-simdgroup) threadgroup per row performs a
+// single streaming pass computing exact FP32 online `(max, sum_exp)` and
+// per-thread top-K, then merges exact top-K candidates with deterministic
+// smallest-index tie breaking.
+// ---------------------------------------------------------------------------
+kernel void ami_topk_logits_rows(const device uchar *logits_raw [[buffer(0)]],
+                                 device TopKCandidate *out_cands [[buffer(1)]],
+                                 constant TopKLogitsRowsParams &p [[buffer(2)]],
+                                 uint row [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]],
+                                 uint sg_id [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= p.num_rows) {
+        return;
+    }
+
+    const uint k = min(p.top_k, 16u);
+    float top_v[16];
+    uint top_i[16];
+    for (uint j = 0u; j < k; j++) {
+        top_v[j] = -INFINITY;
+        top_i[j] = 0xFFFFFFFFu;
+    }
+    float min_v = -INFINITY;
+    uint min_i = 0xFFFFFFFFu;
+    float local_m = -INFINITY;
+    float local_sum = 0.0f;
+
+    if (LOGITS_F16) {
+        const device half *logits = ((const device half *)logits_raw) + ulong(row) * p.vocab_size;
+        if (p.aligned_vec4 != 0u) {
+            const uint vec_n = p.vocab_size >> 2;
+            const device half4 *vlogits = (const device half4 *)logits;
+            for (uint vi = tid; vi < vec_n; vi += 256u) {
+                const float4 fv = float4(vlogits[vi]);
+                const uint base = vi << 2;
+                topk_consider(fv.x, base + 0u, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+                topk_consider(fv.y, base + 1u, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+                topk_consider(fv.z, base + 2u, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+                topk_consider(fv.w, base + 3u, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+            }
+            const uint tail = vec_n << 2;
+            for (uint i = tail + tid; i < p.vocab_size; i += 256u) {
+                topk_consider(float(logits[i]), i, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+            }
+        } else {
+            for (uint i = tid; i < p.vocab_size; i += 256u) {
+                topk_consider(float(logits[i]), i, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+            }
+        }
+    } else {
+        const device float *logits = ((const device float *)logits_raw) + ulong(row) * p.vocab_size;
+        if (p.aligned_vec4 != 0u) {
+            const uint vec_n = p.vocab_size >> 2;
+            const device float4 *vlogits = (const device float4 *)logits;
+            for (uint vi = tid; vi < vec_n; vi += 256u) {
+                const float4 fv = vlogits[vi];
+                const uint base = vi << 2;
+                topk_consider(fv.x, base + 0u, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+                topk_consider(fv.y, base + 1u, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+                topk_consider(fv.z, base + 2u, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+                topk_consider(fv.w, base + 3u, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+            }
+            const uint tail = vec_n << 2;
+            for (uint i = tail + tid; i < p.vocab_size; i += 256u) {
+                topk_consider(logits[i], i, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+            }
+        } else {
+            for (uint i = tid; i < p.vocab_size; i += 256u) {
+                topk_consider(logits[i], i, k, top_v, top_i, min_v, min_i, local_m, local_sum);
+            }
+        }
+    }
+
+    threadgroup float s_m[8];
+    threadgroup float s_sum[8];
+    threadgroup float s_vals[8];
+    threadgroup uint s_idxs[8];
+    threadgroup float s_row_max;
+    threadgroup float s_row_sum;
+    threadgroup float s_log_row_sum;
+    threadgroup uint s_win_i;
+
+    // Reduce exact FP32 (max, sum_exp) across all 256 threads.
+    const float sg_m = simd_max(local_m);
+    const float sg_sum = simd_sum((local_sum > 0.0f) ? (local_sum * exp(local_m - sg_m)) : 0.0f);
+    if (lane == 0u) {
+        s_m[sg_id] = sg_m;
+        s_sum[sg_id] = sg_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float rm = -INFINITY;
+        for (uint s = 0u; s < 8u; s++) {
+            if (s_sum[s] > 0.0f) {
+                rm = max(rm, s_m[s]);
+            }
+        }
+        float rsum = 0.0f;
+        for (uint s = 0u; s < 8u; s++) {
+            if (s_sum[s] > 0.0f) {
+                rsum += s_sum[s] * exp(s_m[s] - rm);
+            }
+        }
+        s_row_max = rm;
+        s_row_sum = rsum;
+        s_log_row_sum = (rsum > 0.0f) ? log(rsum) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong out_base = ulong(row) * k;
+    uint cur = 0u;
+    for (uint out_k = 0u; out_k < k; out_k++) {
+        float cv = (cur < k) ? top_v[cur] : -INFINITY;
+        uint ci = (cur < k) ? top_i[cur] : 0xFFFFFFFFu;
+        for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+            const float ov = simd_shuffle_down(cv, offset);
+            const uint oi = simd_shuffle_down(ci, offset);
+            if (ov > cv || (ov == cv && oi < ci)) {
+                cv = ov;
+                ci = oi;
+            }
+        }
+        if (lane == 0u) {
+            s_vals[sg_id] = cv;
+            s_idxs[sg_id] = ci;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_id == 0u) {
+            float fv = (lane < 8u) ? s_vals[lane] : -INFINITY;
+            uint fi = (lane < 8u) ? s_idxs[lane] : 0xFFFFFFFFu;
+            for (ushort offset = 4u; offset > 0u; offset >>= 1u) {
+                const float ov = simd_shuffle_down(fv, offset);
+                const uint oi = simd_shuffle_down(fi, offset);
+                if (ov > fv || (ov == fv && oi < fi)) {
+                    fv = ov;
+                    fi = oi;
+                }
+            }
+            if (lane == 0u) {
+                s_win_i = fi;
+                TopKCandidate cand;
+                if (fi != 0xFFFFFFFFu && s_row_sum > 0.0f) {
+                    cand.token_id = fi;
+                    cand.log_prob = (fv - s_row_max) - s_log_row_sum;
+                    cand.prob = exp(fv - s_row_max) / s_row_sum;
+                    cand._pad = 0u;
+                } else {
+                    cand.token_id = 0u;
+                    cand.prob = 0.0f;
+                    cand.log_prob = -INFINITY;
+                    cand._pad = 0u;
+                }
+                out_cands[out_base + out_k] = cand;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (cur < k && top_i[cur] == s_win_i) {
+            cur++;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 15: Non-Deduplicated Per-Slot MoE Fused 3-bit / 4-bit Gate + Up + SwiGLU
+// (Spike S5 comparison path vs CSR-deduplicated Kernel 3, ADR-0009).
+//
+// Grid: (ceil(intermediate_size / 8), m * top_k, 1) threadgroups, 128 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_moe_gate_up_swiglu_perslot(const device half *x [[buffer(0)]],
+                                           const device uchar *weights_base [[buffer(1)]],
+                                           const device ExpertWeights *expert_table [[buffer(2)]],
+                                           const device uint *topk_experts [[buffer(3)]],
+                                           device half *inter [[buffer(4)]],
+                                           constant MoePerSlotParams &p [[buffer(5)]],
+                                           uint2 tg_pos [[threadgroup_position_in_grid]],
+                                           uint sg_id [[simdgroup_index_in_threadgroup]],
+                                           uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint ROWS_PER_SG = 2u;
+    const uint slot = tg_pos.y;
+    const uint total_slots = p.m * p.top_k;
+    if (slot >= total_slots) {
+        return;
+    }
+
+    const uint row0 = tg_pos.x * 8u + sg_id * ROWS_PER_SG;
+    if (row0 >= p.intermediate_size) {
+        return;
+    }
+
+    const uint tok = slot / p.top_k;
+    const uint expert_id = topk_experts[slot];
+    const ExpertWeights ew = expert_table[expert_id];
+    const device uchar *gate_qw = weights_base + ew.gate_qweight_offset;
+    const device half2 *gate_sb = (const device half2 *)(weights_base + ew.gate_sb_offset);
+    const device uchar *up_qw = weights_base + ew.up_qweight_offset;
+    const device half2 *up_sb = (const device half2 *)(weights_base + ew.up_sb_offset);
+
+    const uint sub_group = lane >> 3;
+    const uint lane_in_grp = lane & 7u;
+    const device half *x_tok = x + ulong(tok) * p.hidden_size;
+    const bool full_rows = (row0 + ROWS_PER_SG <= p.intermediate_size);
+
+    float g_acc[ROWS_PER_SG] = {0.0f, 0.0f};
+    float u_acc[ROWS_PER_SG] = {0.0f, 0.0f};
+
+    for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+        const uint g = g_base + sub_group;
+        if (g >= p.num_groups) {
+            continue;
+        }
+        const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+        const float4 fx0 = float4(*(const device half4 *)(x_tok + k_off));
+        const float4 fx1 = float4(*(const device half4 *)(x_tok + k_off + 4u));
+        const float x_sum = (fx0.x + fx0.y) + (fx0.z + fx0.w) +
+                            (fx1.x + fx1.y) + (fx1.z + fx1.w);
+
+        if (Q_BITS == 4u) {
+            const float4 px0 = float4(fx0.x,
+                                      fx0.y * (1.0f / 16.0f),
+                                      fx0.z * (1.0f / 256.0f),
+                                      fx0.w * (1.0f / 4096.0f));
+            const float4 px1 = float4(fx1.x,
+                                      fx1.y * (1.0f / 16.0f),
+                                      fx1.z * (1.0f / 256.0f),
+                                      fx1.w * (1.0f / 4096.0f));
+            const uint w_off = g * 32u + lane_in_grp * 4u;
+
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (full_rows || row < p.intermediate_size) {
+                    const ulong row_w_off = ulong(row) * p.row_bytes + w_off;
+                    const ulong row_sb_off = ulong(row) * p.num_groups + g;
+                    const uint32_t gw = *(const device uint32_t *)(gate_qw + row_w_off);
+                    const half2 gsb = gate_sb[row_sb_off];
+                    g_acc[r] = fma(qdot8_q4(gw, px0, px1), float(gsb.x), fma(x_sum, float(gsb.y), g_acc[r]));
+
+                    const uint32_t uw = *(const device uint32_t *)(up_qw + row_w_off);
+                    const half2 usb = up_sb[row_sb_off];
+                    u_acc[r] = fma(qdot8_q4(uw, px0, px1), float(usb.x), fma(x_sum, float(usb.y), u_acc[r]));
+                }
+            }
+        } else {
+            const float4 px0 = float4(fx0.x,
+                                      fx0.y * (1.0f / 8.0f),
+                                      fx0.z * (1.0f / 64.0f),
+                                      fx0.w * (1.0f / 2.0f));
+            const float4 px1 = float4(fx1.x * (1.0f / 16.0f),
+                                      fx1.y * (1.0f / 128.0f),
+                                      fx1.z * (1.0f / 4.0f),
+                                      fx1.w * (1.0f / 32.0f));
+            const float x2_hi = fx0.z * 4.0f;
+            const float x5_hi = fx1.y * 2.0f;
+            const uint w_off = g * 24u + lane_in_grp * 3u;
+
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (full_rows || row < p.intermediate_size) {
+                    const ulong row_w_off = ulong(row) * p.row_bytes + w_off;
+                    const ulong row_sb_off = ulong(row) * p.num_groups + g;
+                    const device uchar *gwp = gate_qw + row_w_off;
+                    const half2 gsb = gate_sb[row_sb_off];
+                    g_acc[r] = fma(qdot8_q3(gwp[0], gwp[1], gwp[2], px0, px1, x2_hi, x5_hi),
+                                   float(gsb.x), fma(x_sum, float(gsb.y), g_acc[r]));
+
+                    const device uchar *uwp = up_qw + row_w_off;
+                    const half2 usb = up_sb[row_sb_off];
+                    u_acc[r] = fma(qdot8_q3(uwp[0], uwp[1], uwp[2], px0, px1, x2_hi, x5_hi),
+                                   float(usb.x), fma(x_sum, float(usb.y), u_acc[r]));
+                }
+            }
+        }
+    }
+
+    const ulong out_base = ulong(slot) * p.intermediate_size;
+    for (uint r = 0u; r < ROWS_PER_SG; r++) {
+        const float gt = simd_sum(g_acc[r]);
+        const float ut = simd_sum(u_acc[r]);
+        if (lane == 0u && (row0 + r) < p.intermediate_size) {
+            inter[out_base + row0 + r] = half(fast_silu(gt) * ut);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 16: Non-Deduplicated Per-Slot MoE Fused 3-bit / 4-bit Down Projection
+// (Spike S5 comparison path vs CSR-deduplicated Kernel 4, ADR-0009).
+//
+// Grid: (ceil(hidden_size / 16), m * top_k, 1) threadgroups, 128 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_moe_down_proj_perslot(const device half *inter [[buffer(0)]],
+                                      const device uchar *weights_base [[buffer(1)]],
+                                      const device ExpertWeights *expert_table [[buffer(2)]],
+                                      const device uint *topk_experts [[buffer(3)]],
+                                      const device float *topk_weights [[buffer(4)]],
+                                      device float *down_out [[buffer(5)]],
+                                      constant MoePerSlotParams &p [[buffer(6)]],
+                                      uint2 tg_pos [[threadgroup_position_in_grid]],
+                                      uint sg_id [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint ROWS_PER_SG = 4u;
+    const uint slot = tg_pos.y;
+    const uint total_slots = p.m * p.top_k;
+    if (slot >= total_slots) {
+        return;
+    }
+
+    const uint row0 = tg_pos.x * 16u + sg_id * ROWS_PER_SG;
+    if (row0 >= p.hidden_size) {
+        return;
+    }
+
+    const uint expert_id = topk_experts[slot];
+    const float rw = topk_weights[slot];
+    const ExpertWeights ew = expert_table[expert_id];
+    const device uchar *down_qw = weights_base + ew.down_qweight_offset;
+    const device half2 *down_sb = (const device half2 *)(weights_base + ew.down_sb_offset);
+
+    const uint sub_group = lane >> 3;
+    const uint lane_in_grp = lane & 7u;
+    const device half *in_row = inter + ulong(slot) * p.intermediate_size;
+    const bool full_rows = (row0 + ROWS_PER_SG <= p.hidden_size);
+    float acc[ROWS_PER_SG] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+        const uint g = g_base + sub_group;
+        if (g >= p.num_groups) {
+            continue;
+        }
+        const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+        const float4 fx0 = float4(*(const device half4 *)(in_row + k_off));
+        const float4 fx1 = float4(*(const device half4 *)(in_row + k_off + 4u));
+        const float x_sum = (fx0.x + fx0.y) + (fx0.z + fx0.w) +
+                            (fx1.x + fx1.y) + (fx1.z + fx1.w);
+
+        if (Q_BITS == 4u) {
+            const float4 px0 = float4(fx0.x,
+                                      fx0.y * (1.0f / 16.0f),
+                                      fx0.z * (1.0f / 256.0f),
+                                      fx0.w * (1.0f / 4096.0f));
+            const float4 px1 = float4(fx1.x,
+                                      fx1.y * (1.0f / 16.0f),
+                                      fx1.z * (1.0f / 256.0f),
+                                      fx1.w * (1.0f / 4096.0f));
+            const uint w_off = g * 32u + lane_in_grp * 4u;
+
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (full_rows || row < p.hidden_size) {
+                    const uint32_t dw = *(const device uint32_t *)(down_qw + ulong(row) * p.row_bytes + w_off);
+                    const half2 sb = down_sb[ulong(row) * p.num_groups + g];
+                    acc[r] = fma(qdot8_q4(dw, px0, px1), float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+                }
+            }
+        } else {
+            const float4 px0 = float4(fx0.x,
+                                      fx0.y * (1.0f / 8.0f),
+                                      fx0.z * (1.0f / 64.0f),
+                                      fx0.w * (1.0f / 2.0f));
+            const float4 px1 = float4(fx1.x * (1.0f / 16.0f),
+                                      fx1.y * (1.0f / 128.0f),
+                                      fx1.z * (1.0f / 4.0f),
+                                      fx1.w * (1.0f / 32.0f));
+            const float x2_hi = fx0.z * 4.0f;
+            const float x5_hi = fx1.y * 2.0f;
+            const uint w_off = g * 24u + lane_in_grp * 3u;
+
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (full_rows || row < p.hidden_size) {
+                    const device uchar *wp = down_qw + ulong(row) * p.row_bytes + w_off;
+                    const half2 sb = down_sb[ulong(row) * p.num_groups + g];
+                    acc[r] = fma(qdot8_q3(wp[0], wp[1], wp[2], px0, px1, x2_hi, x5_hi),
+                                 float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+                }
+            }
+        }
+    }
+
+    const ulong out_base = ulong(slot) * p.hidden_size;
+    for (uint r = 0u; r < ROWS_PER_SG; r++) {
+        const float total = simd_sum(acc[r]);
+        if (lane == 0u && (row0 + r) < p.hidden_size) {
+            down_out[out_base + row0 + r] = total * rw;
         }
     }
 }

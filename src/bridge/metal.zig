@@ -16,6 +16,8 @@ pub const KV_TILE_ROW_ALIGN_F16: u32 = c.AMI_KV_TILE_ROW_ALIGN_F16;
 pub const MAX_FRAMES_IN_FLIGHT: u32 = c.AMI_MAX_FRAMES_IN_FLIGHT;
 pub const MAX_UNIFORM_BYTES: usize = c.AMI_UNIFORM_STRIDE;
 pub const UNIFORM_SLOTS_PER_FRAME: u32 = c.AMI_UNIFORM_SLOTS_PER_FRAME;
+pub const ANE_MAX_DIMS: usize = c.AMI_ANE_MAX_DIMS;
+pub const ANE_MAX_BINDINGS: usize = c.AMI_ANE_MAX_BINDINGS;
 
 pub const Error = error{
     InvalidArgument,
@@ -28,6 +30,7 @@ pub const Error = error{
     Timeout,
     Unsupported,
     TileCreationFailed,
+    AneFailed,
     /// The bridge returned a status this wrapper does not know.
     UnexpectedStatus,
     /// The bridge reported success but returned a null handle.
@@ -49,6 +52,7 @@ fn check(status: c.ami_status) Error!void {
         c.AMI_ERR_TIMEOUT => error.Timeout,
         c.AMI_ERR_UNSUPPORTED => error.Unsupported,
         c.AMI_ERR_TILE => error.TileCreationFailed,
+        c.AMI_ERR_ANE => error.AneFailed,
         else => error.UnexpectedStatus,
     };
 }
@@ -623,6 +627,412 @@ pub const Compute = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// CoreML / Apple Neural Engine zero-copy IOSurface bridge (ADR-0004, D5, S4)
+// ---------------------------------------------------------------------------
+
+/// CoreML `MLComputeUnits` selection for `AneModel` loading.
+pub const AneComputeUnits = enum {
+    cpu_and_neural_engine,
+    all,
+    cpu_only,
+    cpu_and_gpu,
+
+    fn toRaw(self: AneComputeUnits) u32 {
+        return switch (self) {
+            .cpu_and_neural_engine => c.AMI_ANE_COMPUTE_CPU_AND_NE,
+            .all => c.AMI_ANE_COMPUTE_ALL,
+            .cpu_only => c.AMI_ANE_COMPUTE_CPU_ONLY,
+            .cpu_and_gpu => c.AMI_ANE_COMPUTE_CPU_AND_GPU,
+        };
+    }
+};
+
+/// `MLComputePlan` placement summary for a loaded CoreML model.
+pub const AneModelInfo = struct {
+    raw: c.ami_ane_model_info,
+
+    pub fn totalLayers(self: AneModelInfo) u32 {
+        return self.raw.total_layers;
+    }
+    pub fn anePreferredLayers(self: AneModelInfo) u32 {
+        return self.raw.ane_preferred_layers;
+    }
+    pub fn gpuPreferredLayers(self: AneModelInfo) u32 {
+        return self.raw.gpu_preferred_layers;
+    }
+    pub fn cpuPreferredLayers(self: AneModelInfo) u32 {
+        return self.raw.cpu_preferred_layers;
+    }
+    pub fn usesNeuralEngine(self: AneModelInfo) bool {
+        return self.raw.ane_preferred_layers > 0;
+    }
+};
+
+/// Result metadata from one CoreML prediction call.
+pub const AnePredictInfo = struct {
+    raw: c.ami_ane_predict_info,
+
+    pub fn outputsZeroCopyMatched(self: AnePredictInfo) u32 {
+        return self.raw.outputs_zero_copy_matched;
+    }
+    pub fn outputsTotal(self: AnePredictInfo) u32 {
+        return self.raw.outputs_total;
+    }
+    pub fn allOutputsZeroCopy(self: AnePredictInfo) bool {
+        return self.raw.outputs_total > 0 and
+            self.raw.outputs_zero_copy_matched == self.raw.outputs_total;
+    }
+};
+
+/// Zero-copy `MLMultiArray` view over an IOSurface-backed `KvTile`
+/// (`kCVPixelFormatType_OneComponent16Half`, ADR-0004).
+pub const AneTensor = struct {
+    handle: *c.ami_ane_tensor,
+
+    /// Wraps `tile`'s IOSurface `CVPixelBuffer` with `shape` (2..5 dims).
+    /// Requires `shape[shape.len - 1] == tile.rowF16` and
+    /// `product(shape[0..shape.len - 1]) == tile.rows`.
+    pub fn fromKvTile(tile: KvTile, shape: []const u32) Error!AneTensor {
+        if (shape.len < 2 or shape.len > ANE_MAX_DIMS) {
+            return error.InvalidArgument;
+        }
+        var handle: ?*c.ami_ane_tensor = null;
+        try check(c.ami_ane_tensor_from_kv_tile(tile.handle, shape.ptr, shape.len, &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    pub fn close(self: AneTensor) void {
+        c.ami_ane_tensor_destroy(self.handle);
+    }
+};
+
+/// Named tensor binding for CoreML inputs or zero-copy `outputBackings`.
+pub const AneBinding = struct {
+    name: [:0]const u8,
+    tensor: AneTensor,
+};
+
+/// Preallocated CoreML input provider + `MLPredictionOptions.outputBackings`
+/// built once at startup so hot-path ANE predictions do not rebuild Foundation
+/// dictionaries on every call.
+pub const AnePlan = struct {
+    handle: *c.ami_ane_plan,
+
+    pub fn init(inputs: []const AneBinding, outputs: []const AneBinding) Error!AnePlan {
+        if (inputs.len == 0 or inputs.len > ANE_MAX_BINDINGS or
+            outputs.len == 0 or outputs.len > ANE_MAX_BINDINGS)
+        {
+            return error.InvalidArgument;
+        }
+        var raw_in: [ANE_MAX_BINDINGS]c.ami_ane_binding = undefined;
+        for (inputs, 0..) |b, i| {
+            raw_in[i] = .{ .name = b.name.ptr, .tensor = b.tensor.handle };
+        }
+        var raw_out: [ANE_MAX_BINDINGS]c.ami_ane_binding = undefined;
+        for (outputs, 0..) |b, i| {
+            raw_out[i] = .{ .name = b.name.ptr, .tensor = b.tensor.handle };
+        }
+        var handle: ?*c.ami_ane_plan = null;
+        try check(c.ami_ane_plan_create(&raw_in, inputs.len, &raw_out, outputs.len, &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    pub fn close(self: AnePlan) void {
+        c.ami_ane_plan_destroy(self.handle);
+    }
+};
+
+/// Compiled and loaded CoreML model targeting the Apple Neural Engine (or CPU/GPU).
+pub const AneModel = struct {
+    handle: *c.ami_ane_model,
+
+    /// Compiles (`.mlmodel` / `.mlpackage`) and loads, or directly loads
+    /// (`.mlmodelc`), a CoreML model from disk. Startup only.
+    pub fn loadPath(path: [:0]const u8, units: AneComputeUnits) Error!AneModel {
+        if (path.len == 0) return error.InvalidArgument;
+        var handle: ?*c.ami_ane_model = null;
+        try check(c.ami_ane_model_load_path(path.ptr, units.toRaw(), &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    /// Compiles and loads a CoreML `.mlmodel` protobuf directly from in-memory
+    /// bytes via `MLModelAsset` (zero temporary disk files). Startup only.
+    pub fn loadSpecData(spec_bytes: []const u8, units: AneComputeUnits) Error!AneModel {
+        if (spec_bytes.len == 0) return error.InvalidArgument;
+        var handle: ?*c.ami_ane_model = null;
+        try check(c.ami_ane_model_load_spec_data(spec_bytes.ptr, spec_bytes.len, units.toRaw(), &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    pub fn close(self: AneModel) void {
+        c.ami_ane_model_destroy(self.handle);
+    }
+
+    pub fn info(self: AneModel) Error!AneModelInfo {
+        var raw: c.ami_ane_model_info = undefined;
+        try check(c.ami_ane_model_query(self.handle, &raw));
+        return .{ .raw = raw };
+    }
+
+    /// Executes synchronous prediction using a preallocated `AnePlan` with
+    /// zero-copy IOSurface input tensors and `outputBackings`.
+    pub fn predict(self: AneModel, plan: AnePlan) Error!AnePredictInfo {
+        var raw: c.ami_ane_predict_info = undefined;
+        try check(c.ami_ane_model_predict(self.handle, plan.handle, &raw));
+        return .{ .raw = raw };
+    }
+
+    /// One-shot prediction convenience helper (builds a transient `AnePlan`).
+    pub fn predictOneShot(
+        self: AneModel,
+        inputs: []const AneBinding,
+        outputs: []const AneBinding,
+    ) Error!AnePredictInfo {
+        if (inputs.len == 0 or inputs.len > ANE_MAX_BINDINGS or
+            outputs.len == 0 or outputs.len > ANE_MAX_BINDINGS)
+        {
+            return error.InvalidArgument;
+        }
+        var raw_in: [ANE_MAX_BINDINGS]c.ami_ane_binding = undefined;
+        for (inputs, 0..) |b, i| {
+            raw_in[i] = .{ .name = b.name.ptr, .tensor = b.tensor.handle };
+        }
+        var raw_out: [ANE_MAX_BINDINGS]c.ami_ane_binding = undefined;
+        for (outputs, 0..) |b, i| {
+            raw_out[i] = .{ .name = b.name.ptr, .tensor = b.tensor.handle };
+        }
+        var raw: c.ami_ane_predict_info = undefined;
+        try check(c.ami_ane_model_predict_oneshot(
+            self.handle,
+            &raw_in,
+            inputs.len,
+            &raw_out,
+            outputs.len,
+            &raw,
+        ));
+        return .{ .raw = raw };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Pure-Zig minimal CoreML .mlmodel protobuf emitter (zero Python/coremltools)
+// ---------------------------------------------------------------------------
+
+pub const CoreMlLinearOp = enum {
+    /// Native ANE 1x1 2D convolution over 4D `[1, C_in, 1, S]` -> `[1, C_out, 1, S]`.
+    conv1x1,
+    /// Dense `innerProduct` over 2D `[M, C_in]` -> `[M, C_out]`.
+    inner_product,
+};
+
+pub const CoreMlLinearLayer = struct {
+    c_in: u32,
+    c_out: u32,
+    /// Row-major `[c_out, c_in]` fp16 weights (`len == c_out * c_in`).
+    weights_f16: []const f16,
+};
+
+pub const CoreMlLinearModelSpec = struct {
+    op: CoreMlLinearOp = .conv1x1,
+    /// For `.conv1x1`: spatial width `S` (multiple of 32 for 64 B IOSurface rows).
+    /// For `.inner_product`: batch rows `M` (`>= 1`).
+    batch_or_spatial: u32 = 32,
+    /// CoreML protobuf specificationVersion (`7` required for `FLOAT16` I/O,
+    /// `4` for `FLOAT32` I/O with fp16 weights).
+    specification_version: u32 = 7,
+    /// ArrayFeatureType dataType: `65552` (`FLOAT16`) or `65568` (`FLOAT32`).
+    io_float16: bool = true,
+    input_name: []const u8 = "x",
+    output_name: []const u8 = "y",
+    layers: []const CoreMlLinearLayer,
+};
+
+pub const ProtoEmitError = error{
+    InvalidSpec,
+    OutOfMemory,
+};
+
+fn pbAppendVarint(allocator: std.mem.Allocator, out: *std.ArrayList(u8), val: u64) !void {
+    var v = val;
+    while (v >= 0x80) {
+        try out.append(allocator, @as(u8, @intCast((v & 0x7F) | 0x80)));
+        v >>= 7;
+    }
+    try out.append(allocator, @as(u8, @intCast(v)));
+}
+
+fn pbAppendTag(allocator: std.mem.Allocator, out: *std.ArrayList(u8), field: u32, wire_type: u3) !void {
+    try pbAppendVarint(allocator, out, (@as(u64, field) << 3) | wire_type);
+}
+
+fn pbAppendVarintField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), field: u32, val: u64) !void {
+    try pbAppendTag(allocator, out, field, 0);
+    try pbAppendVarint(allocator, out, val);
+}
+
+fn pbAppendBytesField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), field: u32, payload: []const u8) !void {
+    try pbAppendTag(allocator, out, field, 2);
+    try pbAppendVarint(allocator, out, payload.len);
+    try out.appendSlice(allocator, payload);
+}
+
+fn pbBuildFeatureDesc(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    shape: []const u32,
+    io_float16: bool,
+) ![]u8 {
+    // ArrayFeatureType: shape (1), dataType (2: FLOAT16 = 65552, FLOAT32 = 65568)
+    var arr_type: std.ArrayList(u8) = .empty;
+    defer arr_type.deinit(allocator);
+    for (shape) |d| {
+        try pbAppendVarintField(allocator, &arr_type, 1, d);
+    }
+    const dtype_val: u64 = if (io_float16) 65552 else 65568;
+    try pbAppendVarintField(allocator, &arr_type, 2, dtype_val);
+
+    // FeatureType: multiArrayType (5)
+    var feat_type: std.ArrayList(u8) = .empty;
+    defer feat_type.deinit(allocator);
+    try pbAppendBytesField(allocator, &feat_type, 5, arr_type.items);
+
+    // FeatureDescription: name (1), type (3)
+    var desc: std.ArrayList(u8) = .empty;
+    errdefer desc.deinit(allocator);
+    try pbAppendBytesField(allocator, &desc, 1, name);
+    try pbAppendBytesField(allocator, &desc, 3, feat_type.items);
+    return desc.toOwnedSlice(allocator);
+}
+
+/// Emits a valid CoreML `.mlmodel` protobuf byte slice containing one or more
+/// stacked fp16 linear layers (`1x1 convolution` or `innerProduct`), suitable
+/// for direct in-memory loading with `AneModel.loadSpecData` or disk saving.
+pub fn emitCoreMlLinearModel(
+    allocator: std.mem.Allocator,
+    spec: CoreMlLinearModelSpec,
+) ProtoEmitError![]u8 {
+    if (spec.layers.len == 0 or spec.batch_or_spatial == 0 or
+        spec.input_name.len == 0 or spec.output_name.len == 0)
+    {
+        return error.InvalidSpec;
+    }
+    for (spec.layers, 0..) |layer, idx| {
+        if (layer.c_in == 0 or layer.c_out == 0) return error.InvalidSpec;
+        const expected_len = std.math.mul(usize, layer.c_out, layer.c_in) catch return error.InvalidSpec;
+        if (layer.weights_f16.len != expected_len) return error.InvalidSpec;
+        if (idx > 0 and spec.layers[idx - 1].c_out != layer.c_in) return error.InvalidSpec;
+    }
+
+    const first_in = spec.layers[0].c_in;
+    const last_out = spec.layers[spec.layers.len - 1].c_out;
+
+    const in_shape_3d = [_]u32{ first_in, 1, spec.batch_or_spatial };
+    const out_shape_3d = [_]u32{ last_out, 1, spec.batch_or_spatial };
+    const in_shape_2d = [_]u32{ spec.batch_or_spatial, first_in };
+    const out_shape_2d = [_]u32{ spec.batch_or_spatial, last_out };
+
+    // Always use 2D [M, C] with EXACT_ARRAY_MAPPING for innerProduct so
+    // CVPixelBuffer-backed MLMultiArray tensors always have rank >= 2.
+    const use_exact_mapping = (spec.op == .inner_product);
+    const in_shape: []const u32 = switch (spec.op) {
+        .conv1x1 => &in_shape_3d,
+        .inner_product => &in_shape_2d,
+    };
+    const out_shape: []const u32 = switch (spec.op) {
+        .conv1x1 => &out_shape_3d,
+        .inner_product => &out_shape_2d,
+    };
+
+    const in_feat = try pbBuildFeatureDesc(allocator, spec.input_name, in_shape, spec.io_float16);
+    defer allocator.free(in_feat);
+    const out_feat = try pbBuildFeatureDesc(allocator, spec.output_name, out_shape, spec.io_float16);
+    defer allocator.free(out_feat);
+
+    // ModelDescription: input (1), output (10)
+    var model_desc: std.ArrayList(u8) = .empty;
+    defer model_desc.deinit(allocator);
+    try pbAppendBytesField(allocator, &model_desc, 1, in_feat);
+    try pbAppendBytesField(allocator, &model_desc, 10, out_feat);
+
+    // NeuralNetwork: repeated NeuralNetworkLayer layers (1), arrayInputShapeMapping (5)
+    var nn: std.ArrayList(u8) = .empty;
+    defer nn.deinit(allocator);
+    if (use_exact_mapping) {
+        // EXACT_ARRAY_MAPPING = 1 (allows 2D [M, C] inputs in CoreML NeuralNetwork)
+        try pbAppendVarintField(allocator, &nn, 5, 1);
+    }
+
+    var name_buf: [32]u8 = undefined;
+    var prev_buf: [32]u8 = undefined;
+    var next_buf: [32]u8 = undefined;
+
+    for (spec.layers, 0..) |layer, idx| {
+        const layer_name = std.fmt.bufPrint(&name_buf, "linear_{d}", .{idx}) catch return error.InvalidSpec;
+        const in_blob = if (idx == 0)
+            spec.input_name
+        else
+            std.fmt.bufPrint(&prev_buf, "h_{d}", .{idx - 1}) catch return error.InvalidSpec;
+        const out_blob = if (idx + 1 == spec.layers.len)
+            spec.output_name
+        else
+            std.fmt.bufPrint(&next_buf, "h_{d}", .{idx}) catch return error.InvalidSpec;
+
+        // WeightParams: float16Value (2)
+        var w_params: std.ArrayList(u8) = .empty;
+        defer w_params.deinit(allocator);
+        try pbAppendBytesField(allocator, &w_params, 2, std.mem.sliceAsBytes(layer.weights_f16));
+
+        var layer_msg: std.ArrayList(u8) = .empty;
+        defer layer_msg.deinit(allocator);
+        try pbAppendBytesField(allocator, &layer_msg, 1, layer_name);
+        try pbAppendBytesField(allocator, &layer_msg, 2, in_blob);
+        try pbAppendBytesField(allocator, &layer_msg, 3, out_blob);
+
+        switch (spec.op) {
+            .conv1x1 => {
+                // ConvolutionLayerParams:
+                // outputChannels(1), kernelChannels(2), nGroups(10),
+                // kernelSize(20) x2, stride(30) x2, valid(50), hasBias(70), weights(90)
+                var conv: std.ArrayList(u8) = .empty;
+                defer conv.deinit(allocator);
+                try pbAppendVarintField(allocator, &conv, 1, layer.c_out);
+                try pbAppendVarintField(allocator, &conv, 2, layer.c_in);
+                try pbAppendVarintField(allocator, &conv, 10, 1);
+                try pbAppendVarintField(allocator, &conv, 20, 1);
+                try pbAppendVarintField(allocator, &conv, 20, 1);
+                try pbAppendVarintField(allocator, &conv, 30, 1);
+                try pbAppendVarintField(allocator, &conv, 30, 1);
+                try pbAppendBytesField(allocator, &conv, 50, &.{});
+                try pbAppendVarintField(allocator, &conv, 70, 0);
+                try pbAppendBytesField(allocator, &conv, 90, w_params.items);
+                try pbAppendBytesField(allocator, &layer_msg, 100, conv.items);
+            },
+            .inner_product => {
+                // InnerProductLayerParams:
+                // inputChannels(1), outputChannels(2), hasBias(10), weights(20)
+                var ip: std.ArrayList(u8) = .empty;
+                defer ip.deinit(allocator);
+                try pbAppendVarintField(allocator, &ip, 1, layer.c_in);
+                try pbAppendVarintField(allocator, &ip, 2, layer.c_out);
+                try pbAppendVarintField(allocator, &ip, 10, 0);
+                try pbAppendBytesField(allocator, &ip, 20, w_params.items);
+                try pbAppendBytesField(allocator, &layer_msg, 140, ip.items);
+            },
+        }
+
+        try pbAppendBytesField(allocator, &nn, 1, layer_msg.items);
+    }
+
+    // Root Model: specificationVersion (1), description (2), neuralNetwork (500)
+    var root: std.ArrayList(u8) = .empty;
+    errdefer root.deinit(allocator);
+    try pbAppendVarintField(allocator, &root, 1, spec.specification_version);
+    try pbAppendBytesField(allocator, &root, 2, model_desc.items);
+    try pbAppendBytesField(allocator, &root, 500, nn.items);
+    return root.toOwnedSlice(allocator);
+}
+
 test "default device is a unified-memory Apple GPU with Metal 4" {
     const device = try Device.open();
     defer device.close();
@@ -974,4 +1384,208 @@ test "KvTile texture binding via MTL4ArgumentTable writes RGBA16Float zero-copy 
 
     try compute.removeTilesResident(&.{ k_tile, v_tile });
     try compute.removeResident(&.{gpu_buf});
+}
+
+test "UNIFORM_SLOTS_PER_FRAME accommodates 48-layer tree verification and in-CB drafting" {
+    try std.testing.expectEqual(@as(u32, 2048), UNIFORM_SLOTS_PER_FRAME);
+}
+
+test "CoreML ANE zero-copy IOSurface conv1x1 and innerProduct match CPU reference with zero-copy outputBackings" {
+    const gpa = std.testing.allocator;
+    const device = try Device.open();
+    defer device.close();
+
+    // Case 1: 1x1 convolution [1, C_in=64, 1, S=32] -> [1, C_out=64, 1, S=32]
+    // Native ANE layout with 64-byte aligned IOSurface rows (32 f16 = 64 B).
+    {
+        const c_in: u32 = 64;
+        const c_out: u32 = 64;
+        const s_dim: u32 = 32;
+
+        const w = try gpa.alloc(f16, @as(usize, c_out) * c_in);
+        defer gpa.free(w);
+        for (0..c_out) |co| {
+            for (0..c_in) |ci| {
+                const v: i32 = @as(i32, @intCast((co * 13 + ci * 7 + 3) % 19)) - 9;
+                w[co * c_in + ci] = @floatCast(@as(f32, @floatFromInt(v)) * 0.03125);
+            }
+        }
+
+        const spec_bytes = try emitCoreMlLinearModel(gpa, .{
+            .op = .conv1x1,
+            .batch_or_spatial = s_dim,
+            .layers = &.{.{ .c_in = c_in, .c_out = c_out, .weights_f16 = w }},
+        });
+        defer gpa.free(spec_bytes);
+
+        const model = try AneModel.loadSpecData(spec_bytes, .cpu_and_neural_engine);
+        defer model.close();
+        const minfo = try model.info();
+        try std.testing.expect(minfo.totalLayers() >= 1);
+        if ((try device.info()).aneCoreCount() > 0) {
+            try std.testing.expect(minfo.usesNeuralEngine());
+        }
+
+        const in_tile = try KvTile.init(device, s_dim, c_in, .{ .alias_buffer = true });
+        defer in_tile.close();
+        const out_tile = try KvTile.init(device, s_dim, c_out, .{ .alias_buffer = true });
+        defer out_tile.close();
+
+        // Shape validation rejects mismatched tile geometry.
+        try std.testing.expectError(error.InvalidArgument, AneTensor.fromKvTile(in_tile, &.{ c_in, 1, s_dim + 32 }));
+        try std.testing.expectError(error.InvalidArgument, AneTensor.fromKvTile(in_tile, &.{}));
+
+        const in_tensor = try AneTensor.fromKvTile(in_tile, &.{ c_in, 1, s_dim });
+        defer in_tensor.close();
+        const out_tensor = try AneTensor.fromKvTile(out_tile, &.{ c_out, 1, s_dim });
+        defer out_tensor.close();
+
+        const plan = try AnePlan.init(
+            &.{.{ .name = "x", .tensor = in_tensor }},
+            &.{.{ .name = "y", .tensor = out_tensor }},
+        );
+        defer plan.close();
+
+        const x_host = try gpa.alloc(f16, @as(usize, c_in) * s_dim);
+        defer gpa.free(x_host);
+        {
+            var g = try in_tile.lock(false);
+            errdefer g.release();
+            const dst = g.f16Slice();
+            for (0..c_in) |ci| {
+                for (0..s_dim) |si| {
+                    const v: i32 = @as(i32, @intCast((ci * 11 + si * 5 + 1) % 23)) - 11;
+                    const h: f16 = @floatCast(@as(f32, @floatFromInt(v)) * 0.0625);
+                    dst[ci * s_dim + si] = h;
+                    x_host[ci * s_dim + si] = h;
+                }
+            }
+            try g.unlock();
+        }
+        {
+            var g = try out_tile.lock(false);
+            errdefer g.release();
+            @memset(g.bytes, 0);
+            try g.unlock();
+        }
+
+        const pred_info = try model.predict(plan);
+        try std.testing.expectEqual(@as(u32, 1), pred_info.outputsTotal());
+        try std.testing.expect(pred_info.allOutputsZeroCopy());
+
+        // Read output directly from out_tile's IOSurface pages and verify W @ X.
+        var og = try out_tile.lock(true);
+        errdefer og.release();
+        const got_slice = og.f16Slice();
+        for (0..c_out) |co| {
+            for (0..s_dim) |si| {
+                var acc: f32 = 0.0;
+                for (0..c_in) |ci| {
+                    acc += @as(f32, @floatCast(w[co * c_in + ci])) *
+                        @as(f32, @floatCast(x_host[ci * s_dim + si]));
+                }
+                const got: f32 = @floatCast(got_slice[co * s_dim + si]);
+                const tol: f32 = @max(0.02, @abs(acc) * 0.02);
+                try std.testing.expectApproxEqAbs(acc, got, tol);
+            }
+        }
+        try og.unlock();
+    }
+
+    // Case 2: innerProduct [M=2, C_in=64] -> [M=2, C_out=64] + loadPath from disk
+    {
+        const m_dim: u32 = 2;
+        const c_in: u32 = 64;
+        const c_out: u32 = 64;
+
+        const w = try gpa.alloc(f16, @as(usize, c_out) * c_in);
+        defer gpa.free(w);
+        for (0..c_out) |co| {
+            for (0..c_in) |ci| {
+                const v: i32 = @as(i32, @intCast((co * 5 + ci * 9 + 7) % 17)) - 8;
+                w[co * c_in + ci] = @floatCast(@as(f32, @floatFromInt(v)) * 0.03125);
+            }
+        }
+
+        const spec_bytes = try emitCoreMlLinearModel(gpa, .{
+            .op = .inner_product,
+            .batch_or_spatial = m_dim,
+            .layers = &.{.{ .c_in = c_in, .c_out = c_out, .weights_f16 = w }},
+        });
+        defer gpa.free(spec_bytes);
+
+        const tmp_dir = std.c.getenv("TMPDIR") orelse "/Volumes/Akari/.tmp";
+        var path_buf: [512]u8 = undefined;
+        const path_slice = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}/aminfer_test_ip_{d}.mlmodel", .{
+            std.mem.sliceTo(tmp_dir, 0),
+            std.c.getpid(),
+        });
+        path_buf[path_slice.len] = 0;
+        const path_z: [:0]const u8 = path_buf[0..path_slice.len :0];
+        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.unlink(path_z.ptr);
+        {
+            defer _ = std.c.close(fd);
+            var written: usize = 0;
+            while (written < spec_bytes.len) {
+                const n = std.c.write(fd, spec_bytes.ptr + written, spec_bytes.len - written);
+                try std.testing.expect(n > 0);
+                written += @intCast(n);
+            }
+        }
+
+        const model = try AneModel.loadPath(path_z, .cpu_and_neural_engine);
+        defer model.close();
+
+        const in_tile = try KvTile.init(device, c_in, m_dim, .{});
+        defer in_tile.close();
+        const out_tile = try KvTile.init(device, c_out, m_dim, .{});
+        defer out_tile.close();
+
+        const in_tensor = try AneTensor.fromKvTile(in_tile, &.{ m_dim, c_in });
+        defer in_tensor.close();
+        const out_tensor = try AneTensor.fromKvTile(out_tile, &.{ m_dim, c_out });
+        defer out_tensor.close();
+
+        const x_host = try gpa.alloc(f16, @as(usize, m_dim) * c_in);
+        defer gpa.free(x_host);
+        {
+            var g = try in_tile.lock(false);
+            errdefer g.release();
+            const dst = g.f16Slice();
+            for (0..m_dim) |mi| {
+                for (0..c_in) |ci| {
+                    const v: i32 = @as(i32, @intCast((mi * 17 + ci * 3 + 2) % 21)) - 10;
+                    const h: f16 = @floatCast(@as(f32, @floatFromInt(v)) * 0.0625);
+                    dst[mi * c_in + ci] = h;
+                    x_host[mi * c_in + ci] = h;
+                }
+            }
+            try g.unlock();
+        }
+
+        const pred_info = try model.predictOneShot(
+            &.{.{ .name = "x", .tensor = in_tensor }},
+            &.{.{ .name = "y", .tensor = out_tensor }},
+        );
+        try std.testing.expectEqual(@as(u32, 1), pred_info.outputsTotal());
+
+        var og = try out_tile.lock(true);
+        errdefer og.release();
+        const got_slice = og.f16Slice();
+        for (0..m_dim) |mi| {
+            for (0..c_out) |co| {
+                var acc: f32 = 0.0;
+                for (0..c_in) |ci| {
+                    acc += @as(f32, @floatCast(x_host[mi * c_in + ci])) *
+                        @as(f32, @floatCast(w[co * c_in + ci]));
+                }
+                const got: f32 = @floatCast(got_slice[mi * c_out + co]);
+                const tol: f32 = @max(0.02, @abs(acc) * 0.02);
+                try std.testing.expectApproxEqAbs(acc, got, tol);
+            }
+        }
+        try og.unlock();
+    }
 }

@@ -22,7 +22,9 @@ extern "C" {
 #define AMI_KV_TILE_ROW_ALIGN_F16 32u
 #define AMI_MAX_FRAMES_IN_FLIGHT 4u
 #define AMI_UNIFORM_STRIDE 256u
-#define AMI_UNIFORM_SLOTS_PER_FRAME 1024u
+#define AMI_UNIFORM_SLOTS_PER_FRAME 2048u
+#define AMI_ANE_MAX_DIMS 5u
+#define AMI_ANE_MAX_BINDINGS 16u
 
 typedef int32_t ami_status;
 
@@ -38,6 +40,14 @@ enum {
     AMI_ERR_TIMEOUT = 8,
     AMI_ERR_UNSUPPORTED = 9,
     AMI_ERR_TILE = 10,
+    AMI_ERR_ANE = 11,
+};
+
+enum {
+    AMI_ANE_COMPUTE_CPU_AND_NE = 0,
+    AMI_ANE_COMPUTE_ALL = 1,
+    AMI_ANE_COMPUTE_CPU_ONLY = 2,
+    AMI_ANE_COMPUTE_CPU_AND_GPU = 3,
 };
 
 enum {
@@ -259,6 +269,87 @@ ami_status ami_compute_wait(ami_compute *compute, uint64_t signal, uint64_t time
 ami_status ami_compute_dispatch_1d_sync(ami_compute *compute, const ami_pipeline *pipeline,
                                         ami_buffer *const *buffers, size_t buffer_count,
                                         uint64_t threads, uint64_t timeout_ms);
+
+/* -------------------------------------------------------------------------
+ * CoreML / Apple Neural Engine zero-copy IOSurface bridge (ADR-0004, D5, S4)
+ * ------------------------------------------------------------------------- */
+
+/* Owns one compiled & loaded CoreML MLModel and its MLComputePlan summary. */
+typedef struct ami_ane_model ami_ane_model;
+
+/* Owns one zero-copy MLMultiArray wrapping an IOSurface-backed KvTile. */
+typedef struct ami_ane_tensor ami_ane_tensor;
+
+/* Owns preallocated input MLDictionaryFeatureProvider + MLPredictionOptions outputBackings. */
+typedef struct ami_ane_plan ami_ane_plan;
+
+typedef struct ami_ane_binding {
+    const char *name;
+    const ami_ane_tensor *tensor;
+} ami_ane_binding;
+
+typedef struct ami_ane_model_info {
+    uint32_t compute_units;
+    uint32_t total_layers;
+    uint32_t ane_preferred_layers;
+    uint32_t gpu_preferred_layers;
+    uint32_t cpu_preferred_layers;
+    uint32_t reserved;
+} ami_ane_model_info;
+
+typedef struct ami_ane_predict_info {
+    uint32_t outputs_zero_copy_matched;
+    uint32_t outputs_total;
+} ami_ane_predict_info;
+
+/*
+ * Compiles (.mlmodel / .mlpackage) and loads, or directly loads (.mlmodelc),
+ * a CoreML model from disk with the requested compute units. Startup only.
+ */
+ami_status ami_ane_model_load_path(const char *path, uint32_t compute_units,
+                                   ami_ane_model **out_model);
+
+/*
+ * Compiles and loads a CoreML .mlmodel protobuf directly from in-memory bytes
+ * via MLModelAsset (zero temporary disk files). Startup only.
+ */
+ami_status ami_ane_model_load_spec_data(const void *spec_bytes, size_t spec_len,
+                                        uint32_t compute_units,
+                                        ami_ane_model **out_model);
+
+void ami_ane_model_destroy(ami_ane_model *model);
+ami_status ami_ane_model_query(const ami_ane_model *model, ami_ane_model_info *out_info);
+
+/*
+ * Wraps an IOSurface-backed KvTile's CVPixelBuffer (OneComponent16Half) as a
+ * zero-copy fp16 MLMultiArray with `shape[0..rank)` (ADR-0004).
+ * Requires shape[rank - 1] == tile.row_f16 and product(shape[0..rank-1]) == tile.rows.
+ */
+ami_status ami_ane_tensor_from_kv_tile(const ami_kv_tile *tile, const uint32_t *shape,
+                                       size_t rank, ami_ane_tensor **out_tensor);
+void ami_ane_tensor_destroy(ami_ane_tensor *tensor);
+
+/*
+ * Preallocates input feature provider and outputBackings MLPredictionOptions
+ * so repeated ANE predictions execute with zero per-call dictionary creation.
+ */
+ami_status ami_ane_plan_create(const ami_ane_binding *inputs, size_t input_count,
+                               const ami_ane_binding *outputs, size_t output_count,
+                               ami_ane_plan **out_plan);
+void ami_ane_plan_destroy(ami_ane_plan *plan);
+
+/*
+ * Runs synchronous CoreML prediction using preallocated zero-copy IOSurface
+ * inputs and outputBackings. `out_info` (optional) reports zero-copy backing hits.
+ */
+ami_status ami_ane_model_predict(const ami_ane_model *model, const ami_ane_plan *plan,
+                                 ami_ane_predict_info *out_info);
+
+/* One-shot prediction convenience helper (builds a transient plan). */
+ami_status ami_ane_model_predict_oneshot(const ami_ane_model *model,
+                                         const ami_ane_binding *inputs, size_t input_count,
+                                         const ami_ane_binding *outputs, size_t output_count,
+                                         ami_ane_predict_info *out_info);
 
 #ifdef __cplusplus
 }

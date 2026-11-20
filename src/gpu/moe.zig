@@ -16,11 +16,15 @@ const arena_mod = @import("../mem/arena.zig");
 const budget_mod = @import("../mem/budget.zig");
 const quant = @import("../quant/spec.zig");
 const amf = @import("../format/amf.zig");
+const sysinfo = @import("../platform/sysinfo.zig");
+const vmstat = @import("../platform/vmstat.zig");
 
 /// Maximum supported number of MoE experts per layer.
 pub const MAX_EXPERTS: u32 = 256;
 /// Maximum supported number of active experts per token (`top_k`).
 pub const MAX_TOP_K: u32 = 16;
+/// Maximum batched rows for `encodeArgmaxRows` and `encodeTopKLogitsRows`.
+pub const MAX_LOGIT_ROWS: u32 = 64;
 
 /// Device-memory expert weight offset table entry (48 bytes, zero padding).
 /// All offsets are 64-bit byte offsets from the bound resident weights buffer,
@@ -118,6 +122,41 @@ pub const EmbedParams = extern struct {
     _pad: u32 = 0,
 };
 
+/// Uniform payload matching `struct ArgmaxRowsParams` in `moe_ffn.metal`.
+pub const ArgmaxRowsParams = extern struct {
+    num_rows: u32,
+    vocab_size: u32,
+    aligned_vec4: u32,
+    _pad: u32 = 0,
+};
+
+/// Output candidate written by `encodeTopKLogitsRows` (`[M, top_k]`).
+/// Matches `struct TopKCandidate` in `moe_ffn.metal` (16 bytes).
+pub const TopKCandidate = extern struct {
+    token_id: u32,
+    prob: f32,
+    log_prob: f32,
+    _pad: u32 = 0,
+};
+
+/// Uniform payload matching `struct TopKLogitsRowsParams` in `moe_ffn.metal`.
+pub const TopKLogitsRowsParams = extern struct {
+    num_rows: u32,
+    vocab_size: u32,
+    top_k: u32,
+    aligned_vec4: u32,
+};
+
+/// Uniform payload matching `struct MoePerSlotParams` in `moe_ffn.metal`.
+pub const MoePerSlotParams = extern struct {
+    hidden_size: u32,
+    intermediate_size: u32,
+    num_groups: u32,
+    row_bytes: u32,
+    m: u32,
+    top_k: u32,
+};
+
 comptime {
     if (@sizeOf(ExpertWeights) != 48) @compileError("ExpertWeights must be 48 bytes");
     if (@sizeOf(ScheduleHeader) != 16) @compileError("ScheduleHeader must be 16 bytes");
@@ -130,6 +169,10 @@ comptime {
     if (@sizeOf(ArgmaxParams) != 8) @compileError("ArgmaxParams must be 8 bytes");
     if (@sizeOf(RouterQParams) != 32) @compileError("RouterQParams must be 32 bytes");
     if (@sizeOf(EmbedParams) != 32) @compileError("EmbedParams must be 32 bytes");
+    if (@sizeOf(ArgmaxRowsParams) != 16) @compileError("ArgmaxRowsParams must be 16 bytes");
+    if (@sizeOf(TopKCandidate) != 16) @compileError("TopKCandidate must be 16 bytes");
+    if (@sizeOf(TopKLogitsRowsParams) != 16) @compileError("TopKLogitsRowsParams must be 16 bytes");
+    if (@sizeOf(MoePerSlotParams) != 24) @compileError("MoePerSlotParams must be 24 bytes");
 }
 
 pub const LogitsDType = enum {
@@ -454,6 +497,27 @@ pub const ArgmaxArgs = struct {
     vocab_size: u32,
 };
 
+/// Batched `[num_rows, vocab_size]` greedy argmax arguments (`1 <= num_rows <= 64`).
+pub const ArgmaxRowsArgs = struct {
+    logits: metal.BufferBinding,
+    out_token_ids: metal.BufferBinding,
+    num_rows: u32,
+    vocab_size: u32,
+    logits_dtype: LogitsDType = .f16,
+};
+
+/// Batched `[num_rows, vocab_size]` fused FP32 softmax + top-k extraction
+/// arguments (`1 <= num_rows <= 64`, `1 <= top_k <= 16`).
+pub const TopKLogitsRowsArgs = struct {
+    logits: metal.BufferBinding,
+    /// `[num_rows, top_k]` `TopKCandidate` output buffer in wired shared RAM.
+    out_candidates: metal.BufferBinding,
+    num_rows: u32,
+    vocab_size: u32,
+    top_k: u32,
+    logits_dtype: LogitsDType = .f16,
+};
+
 /// Startup-compiled specialized Metal 4 pipelines for MoE routing,
 /// deduplicated 3-bit / 4-bit expert SwiGLU FFN, dense SwiGLU utilities,
 /// and GPU greedy argmax.
@@ -484,6 +548,14 @@ pub const MoePipelines = struct {
     embed_bf16: metal.Pipeline,
     embed_q4: metal.Pipeline,
     embed_q3: metal.Pipeline,
+    argmax_rows_f16: metal.Pipeline,
+    argmax_rows_f32: metal.Pipeline,
+    topk_logits_rows_f16: metal.Pipeline,
+    topk_logits_rows_f32: metal.Pipeline,
+    gate_up_swiglu_perslot_q4: metal.Pipeline,
+    gate_up_swiglu_perslot_q3: metal.Pipeline,
+    down_proj_perslot_q4: metal.Pipeline,
+    down_proj_perslot_q3: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!MoePipelines {
         const router_proj_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_router_proj", &.{
@@ -627,6 +699,50 @@ pub const MoePipelines = struct {
         });
         errdefer embed_q3.close();
 
+        const argmax_rows_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_argmax_rows", &.{
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer argmax_rows_f16.close();
+
+        const argmax_rows_f32 = try metal.Pipeline.initSpecialized(device, library, "ami_argmax_rows", &.{
+            .{ .index = 3, .value = .{ .bool = false } },
+        });
+        errdefer argmax_rows_f32.close();
+
+        const topk_logits_rows_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_topk_logits_rows", &.{
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer topk_logits_rows_f16.close();
+
+        const topk_logits_rows_f32 = try metal.Pipeline.initSpecialized(device, library, "ami_topk_logits_rows", &.{
+            .{ .index = 3, .value = .{ .bool = false } },
+        });
+        errdefer topk_logits_rows_f32.close();
+
+        const gate_up_swiglu_perslot_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_gate_up_swiglu_perslot", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gate_up_swiglu_perslot_q4.close();
+
+        const gate_up_swiglu_perslot_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_gate_up_swiglu_perslot", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gate_up_swiglu_perslot_q3.close();
+
+        const down_proj_perslot_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_down_proj_perslot", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer down_proj_perslot_q4.close();
+
+        const down_proj_perslot_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_down_proj_perslot", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer down_proj_perslot_q3.close();
+
         return .{
             .router_proj_f16 = router_proj_f16,
             .router_proj_f32 = router_proj_f32,
@@ -654,10 +770,26 @@ pub const MoePipelines = struct {
             .embed_bf16 = embed_bf16,
             .embed_q4 = embed_q4,
             .embed_q3 = embed_q3,
+            .argmax_rows_f16 = argmax_rows_f16,
+            .argmax_rows_f32 = argmax_rows_f32,
+            .topk_logits_rows_f16 = topk_logits_rows_f16,
+            .topk_logits_rows_f32 = topk_logits_rows_f32,
+            .gate_up_swiglu_perslot_q4 = gate_up_swiglu_perslot_q4,
+            .gate_up_swiglu_perslot_q3 = gate_up_swiglu_perslot_q3,
+            .down_proj_perslot_q4 = down_proj_perslot_q4,
+            .down_proj_perslot_q3 = down_proj_perslot_q3,
         };
     }
 
     pub fn close(self: MoePipelines) void {
+        self.down_proj_perslot_q3.close();
+        self.down_proj_perslot_q4.close();
+        self.gate_up_swiglu_perslot_q3.close();
+        self.gate_up_swiglu_perslot_q4.close();
+        self.topk_logits_rows_f32.close();
+        self.topk_logits_rows_f16.close();
+        self.argmax_rows_f32.close();
+        self.argmax_rows_f16.close();
         self.embed_q3.close();
         self.embed_q4.close();
         self.embed_bf16.close();
@@ -1352,6 +1484,250 @@ pub const MoePipelines = struct {
             insert_barrier_before,
         );
     }
+
+    /// Encodes batched `M`-row greedy argmax (`[num_rows, vocab_size]` f16/f32 ->
+    /// `[num_rows]u32`, `1 <= num_rows <= 64`) with deterministic smallest-index
+    /// tie breaking. Zero heap allocation on the hot path.
+    pub fn encodeArgmaxRows(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        args: ArgmaxRowsArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.vocab_size == 0) return error.ZeroDimension;
+        if (args.num_rows > MAX_LOGIT_ROWS) return error.InvalidArgument;
+
+        const pipe, const vec_align: u64 = switch (args.logits_dtype) {
+            .f16 => .{ self.argmax_rows_f16, 8 },
+            .f32 => .{ self.argmax_rows_f32, 16 },
+        };
+        const max_tg = pipe.maxThreadsPerThreadgroup();
+        const aligned_tg: u32 = @min(@as(u32, 1024), max_tg & ~@as(u32, 31));
+        const tg_size: u64 = if (aligned_tg >= 32) aligned_tg else 32;
+        const can_vec4 = (args.logits.offset % vec_align) == 0 and (args.vocab_size % 4) == 0;
+        const params: ArgmaxRowsParams = .{
+            .num_rows = args.num_rows,
+            .vocab_size = args.vocab_size,
+            .aligned_vec4 = if (can_vec4) 1 else 0,
+        };
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.logits, args.out_token_ids },
+            std.mem.asBytes(&params),
+            .{ args.num_rows, 1, 1 },
+            .{ tg_size, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes single-dispatch fused FP32 softmax + top-K candidate extraction
+    /// (`[num_rows, vocab_size]` -> `[num_rows, top_k]` `TopKCandidate`,
+    /// `1 <= num_rows <= 64`, `1 <= top_k <= 16`). One 256-thread threadgroup
+    /// per row; zero heap allocation on the hot path.
+    pub fn encodeTopKLogitsRows(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        args: TopKLogitsRowsArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.vocab_size == 0) return error.ZeroDimension;
+        if (args.num_rows > MAX_LOGIT_ROWS) return error.InvalidArgument;
+        if (args.top_k == 0 or args.top_k > MAX_TOP_K or args.top_k > args.vocab_size) {
+            return error.UnsupportedTopK;
+        }
+
+        const pipe, const vec_align: u64 = switch (args.logits_dtype) {
+            .f16 => .{ self.topk_logits_rows_f16, 8 },
+            .f32 => .{ self.topk_logits_rows_f32, 16 },
+        };
+        const can_vec4 = (args.logits.offset % vec_align) == 0 and (args.vocab_size % 4) == 0;
+        const params: TopKLogitsRowsParams = .{
+            .num_rows = args.num_rows,
+            .vocab_size = args.vocab_size,
+            .top_k = args.top_k,
+            .aligned_vec4 = if (can_vec4) 1 else 0,
+        };
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.logits, args.out_candidates },
+            std.mem.asBytes(&params),
+            .{ args.num_rows, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes non-deduplicated per-slot 3-bit / 4-bit MoE gate+up+SwiGLU
+    /// (`Spike S5` comparison path against CSR-deduplicated `encodeGateUpSwiglu`).
+    pub fn encodeGateUpSwigluPerSlot(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        bits: quant.QuantBits,
+        args: GateUpSwigluArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.num_experts == 0 or args.top_k == 0 or
+            args.hidden_size == 0 or args.intermediate_size == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if (args.num_experts > MAX_EXPERTS) return error.UnsupportedExpertCount;
+        if (args.top_k > MAX_TOP_K or args.top_k > args.num_experts) return error.UnsupportedTopK;
+        if (args.m > args.workspace.spec.max_tokens or
+            args.num_experts > args.workspace.spec.num_experts or
+            args.top_k > args.workspace.spec.top_k or
+            args.intermediate_size > args.workspace.spec.intermediate_size)
+        {
+            return error.WorkspaceTooSmall;
+        }
+
+        const num_groups, const row_bytes, const pipe = switch (bits) {
+            .q4 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.hidden_size), try Ops.rowWeightBytes(args.hidden_size), self.gate_up_swiglu_perslot_q4 };
+            },
+            .q3 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.hidden_size), try Ops.rowWeightBytes(args.hidden_size), self.gate_up_swiglu_perslot_q3 };
+            },
+        };
+        const params: MoePerSlotParams = .{
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
+            .num_groups = @intCast(num_groups),
+            .row_bytes = @intCast(row_bytes),
+            .m = args.m,
+            .top_k = args.top_k,
+        };
+        const groups_x: u64 = (@as(u64, args.intermediate_size) + 7) / 8;
+        const total_slots: u64 = @as(u64, args.m) * args.top_k;
+        const ws = args.workspace;
+        const wb = args.workspace_buf;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.x,
+                args.weights_base,
+                args.expert_table,
+                .{ .buffer = wb, .offset = ws.scratch_topk_experts_off },
+                .{ .buffer = wb, .offset = ws.inter_off },
+            },
+            std.mem.asBytes(&params),
+            .{ groups_x, total_slots, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes non-deduplicated per-slot 3-bit / 4-bit MoE down projection
+    /// (`Spike S5` comparison path against CSR-deduplicated `encodeDownProj`).
+    pub fn encodeDownProjPerSlot(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        bits: quant.QuantBits,
+        args: DownProjArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.num_experts == 0 or args.top_k == 0 or
+            args.hidden_size == 0 or args.intermediate_size == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if (args.num_experts > MAX_EXPERTS) return error.UnsupportedExpertCount;
+        if (args.top_k > MAX_TOP_K or args.top_k > args.num_experts) return error.UnsupportedTopK;
+        if (args.m > args.workspace.spec.max_tokens or
+            args.num_experts > args.workspace.spec.num_experts or
+            args.top_k > args.workspace.spec.top_k or
+            args.hidden_size > args.workspace.spec.hidden_size or
+            args.intermediate_size > args.workspace.spec.intermediate_size)
+        {
+            return error.WorkspaceTooSmall;
+        }
+
+        const num_groups, const row_bytes, const pipe = switch (bits) {
+            .q4 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.intermediate_size), try Ops.rowWeightBytes(args.intermediate_size), self.down_proj_perslot_q4 };
+            },
+            .q3 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.intermediate_size), try Ops.rowWeightBytes(args.intermediate_size), self.down_proj_perslot_q3 };
+            },
+        };
+        const params: MoePerSlotParams = .{
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
+            .num_groups = @intCast(num_groups),
+            .row_bytes = @intCast(row_bytes),
+            .m = args.m,
+            .top_k = args.top_k,
+        };
+        const groups_x: u64 = (@as(u64, args.hidden_size) + 15) / 16;
+        const total_slots: u64 = @as(u64, args.m) * args.top_k;
+        const ws = args.workspace;
+        const wb = args.workspace_buf;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                .{ .buffer = wb, .offset = ws.inter_off },
+                args.weights_base,
+                args.expert_table,
+                .{ .buffer = wb, .offset = ws.scratch_topk_experts_off },
+                .{ .buffer = wb, .offset = ws.scratch_topk_weights_off },
+                .{ .buffer = wb, .offset = ws.down_out_off },
+            },
+            std.mem.asBytes(&params),
+            .{ groups_x, total_slots, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes a complete non-deduplicated per-slot MoE FFN layer (Spike S5).
+    pub fn encodeMoELayerPerSlot(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        bits: quant.QuantBits,
+        args: MoELayerArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        try self.encodeRouting(frame, args, insert_barrier_before);
+
+        try self.encodeGateUpSwigluPerSlot(frame, bits, .{
+            .x = args.x,
+            .weights_base = args.weights_base,
+            .expert_table = args.expert_table,
+            .workspace = args.workspace,
+            .workspace_buf = args.workspace_buf,
+            .m = args.m,
+            .num_experts = args.num_experts,
+            .top_k = args.top_k,
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
+        }, true);
+
+        try self.encodeDownProjPerSlot(frame, bits, .{
+            .weights_base = args.weights_base,
+            .expert_table = args.expert_table,
+            .workspace = args.workspace,
+            .workspace_buf = args.workspace_buf,
+            .m = args.m,
+            .num_experts = args.num_experts,
+            .top_k = args.top_k,
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
+        }, true);
+
+        try self.encodeReduce(frame, .{
+            .workspace = args.workspace,
+            .workspace_buf = args.workspace_buf,
+            .residual = args.residual,
+            .out = args.out,
+            .m = args.m,
+            .hidden_size = args.hidden_size,
+            .top_k = args.top_k,
+        }, true);
+    }
 };
 
 /// Algorithmic minimum weight + scale_bias bytes read by one deduplicated MoE
@@ -1419,6 +1795,728 @@ pub fn argmaxRef(logits: []const f16) u32 {
         }
     }
     return if (best_i == 0xFFFF_FFFF) 0 else best_i;
+}
+
+/// CPU reference greedy argmax over `[num_rows, vocab_size]` `f16` or `f32` logits.
+pub fn argmaxRowsRef(
+    logits_dtype: LogitsDType,
+    logits_raw: []const u8,
+    out_token_ids: []u32,
+    num_rows: usize,
+    vocab_size: usize,
+) void {
+    std.debug.assert(vocab_size > 0 and out_token_ids.len >= num_rows);
+    for (0..num_rows) |row| {
+        var best_v: f32 = -std.math.inf(f32);
+        var best_i: u32 = 0xFFFF_FFFF;
+        switch (logits_dtype) {
+            .f16 => {
+                const slice: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, logits_raw));
+                const r = slice[row * vocab_size ..][0..vocab_size];
+                for (r, 0..) |lv, idx| {
+                    const v: f32 = @floatCast(lv);
+                    const ui: u32 = @intCast(idx);
+                    if (v > best_v or (v == best_v and ui < best_i)) {
+                        best_v = v;
+                        best_i = ui;
+                    }
+                }
+            },
+            .f32 => {
+                const slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+                const r = slice[row * vocab_size ..][0..vocab_size];
+                for (r, 0..) |v, idx| {
+                    const ui: u32 = @intCast(idx);
+                    if (v > best_v or (v == best_v and ui < best_i)) {
+                        best_v = v;
+                        best_i = ui;
+                    }
+                }
+            },
+        }
+        out_token_ids[row] = if (best_i == 0xFFFF_FFFF) 0 else best_i;
+    }
+}
+
+/// CPU fp64/fp32 reference row-wise softmax + exact top-K extraction
+/// (`[num_rows, vocab_size]` -> `[num_rows, top_k]` `TopKCandidate`).
+pub fn topKLogitsRowsRef(
+    logits_dtype: LogitsDType,
+    logits_raw: []const u8,
+    out_cands: []TopKCandidate,
+    num_rows: usize,
+    vocab_size: usize,
+    top_k: usize,
+) void {
+    std.debug.assert(vocab_size > 0 and top_k > 0 and top_k <= MAX_TOP_K and top_k <= vocab_size);
+    std.debug.assert(out_cands.len >= num_rows * top_k);
+
+    for (0..num_rows) |row| {
+        var top_v: [MAX_TOP_K]f32 = @splat(-std.math.inf(f32));
+        var top_i: [MAX_TOP_K]u32 = @splat(0xFFFF_FFFF);
+
+        var max_v: f64 = -std.math.inf(f64);
+        for (0..vocab_size) |idx| {
+            const v: f32 = switch (logits_dtype) {
+                .f16 => @floatCast(@as([]const f16, @alignCast(std.mem.bytesAsSlice(f16, logits_raw)))[row * vocab_size + idx]),
+                .f32 => @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, logits_raw)))[row * vocab_size + idx],
+            };
+            const fv: f64 = v;
+            if (fv > max_v) max_v = fv;
+
+            const ui: u32 = @intCast(idx);
+            if (v > top_v[top_k - 1] or (v == top_v[top_k - 1] and ui < top_i[top_k - 1])) {
+                var pos: usize = top_k - 1;
+                while (pos > 0) : (pos -= 1) {
+                    if (v > top_v[pos - 1] or (v == top_v[pos - 1] and ui < top_i[pos - 1])) {
+                        top_v[pos] = top_v[pos - 1];
+                        top_i[pos] = top_i[pos - 1];
+                    } else break;
+                }
+                top_v[pos] = v;
+                top_i[pos] = ui;
+            }
+        }
+
+        var sum_exp: f64 = 0.0;
+        for (0..vocab_size) |idx| {
+            const v: f32 = switch (logits_dtype) {
+                .f16 => @floatCast(@as([]const f16, @alignCast(std.mem.bytesAsSlice(f16, logits_raw)))[row * vocab_size + idx]),
+                .f32 => @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, logits_raw)))[row * vocab_size + idx],
+            };
+            if (std.math.isFinite(v)) {
+                sum_exp += @exp(@as(f64, v) - max_v);
+            }
+        }
+        const log_sum: f64 = @log(sum_exp);
+        for (0..top_k) |k_idx| {
+            const lp: f64 = (@as(f64, top_v[k_idx]) - max_v) - log_sum;
+            out_cands[row * top_k + k_idx] = .{
+                .token_id = top_i[k_idx],
+                .prob = @floatCast(@exp(lp)),
+                .log_prob = @floatCast(lp),
+            };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spike S5: Unique Active Experts vs Tree Size & Dedup vs Per-Slot MoE (ADR-0009)
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_SPIKE_S5_M = [_]u32{ 1, 2, 4, 8, 16, 32 };
+
+pub const SpikeS5Routing = enum {
+    correlated,
+    uniform,
+
+    pub fn label(self: SpikeS5Routing) []const u8 {
+        return switch (self) {
+            .correlated => "correlated",
+            .uniform => "uniform",
+        };
+    }
+};
+
+pub const SpikeS5Config = struct {
+    bits: quant.QuantBits = .q3,
+    num_experts: u32 = 128,
+    top_k: u32 = 8,
+    hidden_size: u32 = 2048,
+    intermediate_size: u32 = 768,
+    m_values: []const u32 = &DEFAULT_SPIKE_S5_M,
+    /// Number of shifted routing banks spanning all experts so the active DRAM
+    /// working set exceeds M4 L2/SLC (>= 64 MiB).
+    num_routing_banks: u32 = 16,
+    min_working_set_bytes: usize = 64 * 1024 * 1024,
+    dvfs_warmup_batches: u32 = 12,
+    warmup_batches: u32 = 4,
+    timed_batches: u32 = 6,
+    dispatches_per_batch: u32 = 8,
+    timeout_ms: u64 = 30_000,
+};
+
+pub const SpikeS5CaseResult = struct {
+    routing: SpikeS5Routing,
+    m: u32,
+    mean_unique_experts: f64,
+    total_slots: u32,
+    unique_bytes_per_dispatch: f64,
+    slot_bytes_per_dispatch: u64,
+    dedup_latency_us: f64,
+    perslot_latency_us: f64,
+    /// Effective bandwidth on unique expert weight bytes for CSR-deduplicated MoE (GB/s).
+    dedup_beta_gbs: f64,
+    /// Effective bandwidth on unique expert weight bytes for per-slot MoE (GB/s, apples-to-apples).
+    perslot_beta_unique_gbs: f64,
+    /// Raw slot throughput for per-slot MoE (`M * top_k * expert_bytes / elapsed_ns`, GB/s).
+    perslot_beta_raw_gbs: f64,
+    /// `perslot_latency_us / dedup_latency_us` (> 1.0 means dedup is faster).
+    dedup_speedup_vs_perslot: f64,
+    bytes_saved_pct: f64,
+};
+
+pub const SpikeS5Error = error{
+    InvalidConfig,
+    NonFiniteOutput,
+    OutOfMemory,
+} || EncodeError || WorkspaceError || vmstat.Error || vmstat.SwapError || sysinfo.Error ||
+    metal.WrapError || arena_mod.WiredArena.InitError;
+
+pub const SpikeS5Report = struct {
+    config: SpikeS5Config,
+    pool_bytes: u64,
+    results: []SpikeS5CaseResult,
+    /// Calibrated CSR-deduplicated MoE effective bandwidth (GB/s) for `D7` pruning.
+    beta_dedup_gbs: f64,
+    /// Per-tree-size calibrated deduplicated MoE bandwidth table `[0..64]` (GB/s)
+    /// ready for `PruneCostModel.beta_gbs_by_m` (ADR-0009).
+    beta_dedup_by_m: [65]f32,
+    /// Per-tree-size per-slot MoE effective unique bandwidth table `[0..64]` (GB/s).
+    beta_perslot_by_m: [65]f32,
+    /// Smallest tested `M` where CSR-deduplicated beats per-slot under correlated routing (0 if never).
+    crossover_m_correlated: u32,
+    /// Smallest tested `M` where CSR-deduplicated beats per-slot under uniform routing (0 if never).
+    crossover_m_uniform: u32,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn deinit(self: *SpikeS5Report, allocator: std.mem.Allocator) void {
+        allocator.free(self.results);
+        self.results = &.{};
+    }
+
+    pub fn write(self: *const SpikeS5Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        const bits_label: []const u8 = switch (self.config.bits) {
+            .q3 => "q3",
+            .q4 => "q4",
+        };
+        try out.print(
+            \\Spike S5 Unique Active Experts vs Tree Size & CSR-Dedup vs Per-Slot MoE
+            \\s5.geometry                      {s}, E={d}, top_k={d}, H={d}, I={d}, pool={d:.1} MiB
+            \\s5.beta_dedup_gbs                {d:.2}
+            \\s5.crossover_m.correlated        {d}
+            \\s5.crossover_m.uniform           {d}
+            \\routing      M    |U(T)|  slots  saved%  dedup(us)  slot(us)  dedup_GB/s  slot_uGB/s  slot_rGB/s  speedup
+            \\
+        , .{
+            bits_label,
+            self.config.num_experts,
+            self.config.top_k,
+            self.config.hidden_size,
+            self.config.intermediate_size,
+            @as(f64, @floatFromInt(self.pool_bytes)) / (1024.0 * 1024.0),
+            self.beta_dedup_gbs,
+            self.crossover_m_correlated,
+            self.crossover_m_uniform,
+        });
+        for (self.results) |r| {
+            try out.print(
+                \\{s: <11} {d: >2}  {d: >7.1}  {d: >5}  {d: >6.1}  {d: >9.2}  {d: >8.2}  {d: >10.2}  {d: >10.2}  {d: >10.2}  {d: >6.2}x
+                \\
+            , .{
+                r.routing.label(),
+                r.m,
+                r.mean_unique_experts,
+                r.total_slots,
+                r.bytes_saved_pct,
+                r.dedup_latency_us,
+                r.perslot_latency_us,
+                r.dedup_beta_gbs,
+                r.perslot_beta_unique_gbs,
+                r.perslot_beta_raw_gbs,
+                r.dedup_speedup_vs_perslot,
+            });
+        }
+        try out.print(
+            \\s5.swapouts_delta                {d}
+            \\s5.pageouts_delta                {d}
+            \\
+        , .{
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+fn splitMix64(state: *u64) u64 {
+    state.* +%= 0x9E3779B97F4A7C15;
+    var z = state.*;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
+fn randUnitF32(state: *u64) f32 {
+    const bits: u32 = @truncate(splitMix64(state) >> 40); // 24-bit mantissa
+    return @as(f32, @floatFromInt(bits)) / 16_777_216.0;
+}
+
+fn fillSpikeS5RoutingBank(
+    routing: SpikeS5Routing,
+    logits: []f32,
+    m: u32,
+    num_experts: u32,
+    bank: usize,
+) void {
+    var rng: u64 = 0xA5A5_1234_5678_0001 ^ (@as(u64, bank) *% 0x9E37_79B9) ^ (@as(u64, m) << 32) ^
+        (@as(u64, @backingInt(routing)) << 48);
+    const shift: u32 = @intCast((bank * @max(@as(usize, 1), num_experts / 16)) % num_experts);
+
+    for (0..m) |tok| {
+        // Approximate tree depth for correlated branch drift: log2(tok + 1).
+        const depth_f: f32 = @floatFromInt(31 - @clz(@as(u32, @intCast(tok + 1))));
+        for (0..num_experts) |e| {
+            const val: f32 = switch (routing) {
+                .uniform => randUnitF32(&rng) * 4.0 - 2.0,
+                .correlated => blk: {
+                    const rank: u32 = (@as(u32, @intCast(e)) + num_experts - shift) % num_experts;
+                    const zipf_base: f32 = 3.5 / (1.0 + 0.28 * @as(f32, @floatFromInt(rank)));
+                    // Centered triangular-like noise (sum of 3 uniforms - 1.5).
+                    const n_raw = (randUnitF32(&rng) + randUnitF32(&rng) + randUnitF32(&rng)) - 1.5;
+                    const drift = 0.45 + 0.08 * depth_f;
+                    break :blk zipf_base + n_raw * drift;
+                },
+            };
+            logits[tok * num_experts + e] = val;
+        }
+    }
+}
+
+fn countUniqueExpertsCpu(logits: []const f32, m: u32, num_experts: u32, top_k: u32) u32 {
+    var seen: [MAX_EXPERTS]bool = @splat(false);
+    var vals: [MAX_EXPERTS]f32 = undefined;
+    var unique_cnt: u32 = 0;
+
+    for (0..m) |tok| {
+        const row = logits[tok * num_experts ..][0..num_experts];
+        @memcpy(vals[0..num_experts], row);
+        for (0..top_k) |_| {
+            var best_v: f32 = -std.math.inf(f32);
+            var best_e: u32 = 0xFFFF_FFFF;
+            for (0..num_experts) |e| {
+                const ue: u32 = @intCast(e);
+                if (vals[e] > best_v or (vals[e] == best_v and ue < best_e)) {
+                    best_v = vals[e];
+                    best_e = ue;
+                }
+            }
+            if (best_e < num_experts) {
+                vals[best_e] = -std.math.inf(f32);
+                if (!seen[best_e]) {
+                    seen[best_e] = true;
+                    unique_cnt += 1;
+                }
+            }
+        }
+    }
+    return unique_cnt;
+}
+
+fn fillInterpolatedBetaTable(table: *[65]f32, m_vals: []const u32, betas: []const f64) void {
+    if (m_vals.len == 0) {
+        @memset(table, 60.0);
+        return;
+    }
+    for (0..65) |m_idx| {
+        const m_u: u32 = @intCast(@max(m_idx, 1));
+        if (m_u <= m_vals[0]) {
+            table[m_idx] = @floatCast(betas[0]);
+            continue;
+        }
+        if (m_u >= m_vals[m_vals.len - 1]) {
+            table[m_idx] = @floatCast(betas[m_vals.len - 1]);
+            continue;
+        }
+        var found = false;
+        for (0..m_vals.len - 1) |i| {
+            if (m_u >= m_vals[i] and m_u <= m_vals[i + 1]) {
+                const m0: f64 = @floatFromInt(m_vals[i]);
+                const m1: f64 = @floatFromInt(m_vals[i + 1]);
+                const t: f64 = if (m1 > m0) (@as(f64, @floatFromInt(m_u)) - m0) / (m1 - m0) else 0.0;
+                table[m_idx] = @floatCast(betas[i] + t * (betas[i + 1] - betas[i]));
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            table[m_idx] = @floatCast(betas[m_vals.len - 1]);
+        }
+    }
+}
+
+/// Runs Spike S5 on real Apple Silicon hardware (ADR-0009):
+/// a) Unique active experts per layer `|U(T)|` vs tree size `M` under correlated
+///    and uniform routing, and
+/// b) Effective bandwidth `beta` (GB/s) and latency (us) of CSR-deduplicated vs
+///    non-deduplicated per-slot MoE over rotating wired pools (`>= 64 MiB`,
+///    `swapouts_delta = 0`), returning calibrated `beta_dedup_gbs` and `[65]f32`
+///    lookup tables for `D7` expert-byte-budget pruning.
+pub fn runSpikeS5(allocator: std.mem.Allocator, config: SpikeS5Config) SpikeS5Error!SpikeS5Report {
+    if (config.m_values.len == 0 or config.num_experts == 0 or config.num_experts > MAX_EXPERTS or
+        config.top_k == 0 or config.top_k > MAX_TOP_K or config.top_k > config.num_experts or
+        config.hidden_size == 0 or config.intermediate_size == 0 or
+        config.num_routing_banks == 0 or config.timed_batches == 0 or config.dispatches_per_batch == 0)
+    {
+        return error.InvalidConfig;
+    }
+
+    var max_m: u32 = 0;
+    for (config.m_values) |mv| {
+        if (mv == 0 or mv > MAX_LOGIT_ROWS) return error.InvalidConfig;
+        if (mv > max_m) max_m = mv;
+    }
+
+    const facts = try sysinfo.Facts.read();
+    const device = try metal.Device.open();
+    defer device.close();
+    const dev_info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    const vm_before = try vmstat.Snapshot.capture();
+
+    // Compute per-expert quantized blob sizes (16 KiB-aligned per projection).
+    const gu_w_bytes: usize, const gu_sb_bytes: usize, const dn_w_bytes: usize, const dn_sb_bytes: usize = switch (config.bits) {
+        .q3 => blk: {
+            const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+            break :blk .{
+                try Ops.packedWeightBytes(config.intermediate_size, config.hidden_size),
+                try Ops.scaleBiasBytes(config.intermediate_size, config.hidden_size),
+                try Ops.packedWeightBytes(config.hidden_size, config.intermediate_size),
+                try Ops.scaleBiasBytes(config.hidden_size, config.intermediate_size),
+            };
+        },
+        .q4 => blk: {
+            const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+            break :blk .{
+                try Ops.packedWeightBytes(config.intermediate_size, config.hidden_size),
+                try Ops.scaleBiasBytes(config.intermediate_size, config.hidden_size),
+                try Ops.packedWeightBytes(config.hidden_size, config.intermediate_size),
+                try Ops.scaleBiasBytes(config.hidden_size, config.intermediate_size),
+            };
+        },
+    };
+
+    const gu_sb_off = amf.align64(gu_w_bytes);
+    const gu_blob_bytes = try page.alignUp(gu_sb_off + gu_sb_bytes);
+    const dn_sb_off = amf.align64(dn_w_bytes);
+    const dn_blob_bytes = try page.alignUp(dn_sb_off + dn_sb_bytes);
+    const per_expert_bytes = 2 * gu_blob_bytes + dn_blob_bytes;
+    const single_pool_bytes = @as(usize, config.num_experts) * per_expert_bytes;
+    const num_pools: usize = if (config.min_working_set_bytes == 0)
+        1
+    else
+        @max(@as(usize, 1), (config.min_working_set_bytes + single_pool_bytes - 1) / single_pool_bytes);
+    const total_pool_bytes = single_pool_bytes * num_pools;
+
+    const ws_spec: WorkspaceSpec = .{
+        .max_tokens = max_m,
+        .num_experts = config.num_experts,
+        .top_k = config.top_k,
+        .hidden_size = config.hidden_size,
+        .intermediate_size = config.intermediate_size,
+    };
+    const ws_bytes = try MoeWorkspace.requiredBytes(ws_spec);
+    const table_bytes = amf.align64(@as(usize, config.num_experts) * @sizeOf(ExpertWeights));
+    const all_tables_bytes = table_bytes * num_pools;
+    const x_bytes = amf.align64(@as(usize, max_m) * config.hidden_size * @sizeOf(f16));
+    const bank_logits_bytes = amf.align64(@as(usize, max_m) * config.num_experts * @sizeOf(f32));
+    const all_logits_bytes = bank_logits_bytes * config.num_routing_banks;
+
+    const arena_cap = try page.alignUp(
+        total_pool_bytes + ws_bytes + all_tables_bytes + x_bytes * 2 + all_logits_bytes + 8 * page.APPLE_PAGE_SIZE,
+    );
+    var arena = try arena_mod.WiredArena.init(arena_cap, wired_budget);
+    defer arena.deinit();
+
+    // Reserve a non-zero page prefix so every expert offset is non-zero.
+    _ = try arena.allocPages(page.APPLE_PAGE_SIZE);
+
+    const tables_raw = try arena.allocAligned(all_tables_bytes, 64);
+    const table_offs = try allocator.alloc(u64, num_pools);
+    defer allocator.free(table_offs);
+
+    // Initialize 4 template expert blobs once, then replicate across all experts/pools
+    // to keep CPU setup fast while touching distinct physical wired DRAM pages.
+    var tmpl_g: [4][]u8 = undefined;
+    var tmpl_u: [4][]u8 = undefined;
+    var tmpl_d: [4][]u8 = undefined;
+
+    for (0..num_pools) |p_idx| {
+        const tbl_off_in_buf = p_idx * table_bytes;
+        const tbl_slice: []ExpertWeights = @alignCast(std.mem.bytesAsSlice(
+            ExpertWeights,
+            tables_raw[tbl_off_in_buf .. tbl_off_in_buf + @as(usize, config.num_experts) * @sizeOf(ExpertWeights)],
+        ));
+        table_offs[p_idx] = arena.offsetOf(tables_raw.ptr) + tbl_off_in_buf;
+
+        for (0..config.num_experts) |e| {
+            const g_blob = try arena.allocPages(gu_blob_bytes);
+            const u_blob = try arena.allocPages(gu_blob_bytes);
+            const d_blob = try arena.allocPages(dn_blob_bytes);
+
+            if (p_idx == 0 and e < 4) {
+                @memset(g_blob, 0);
+                @memset(u_blob, 0);
+                @memset(d_blob, 0);
+                switch (config.bits) {
+                    .q3 => {
+                        try fillSyntheticQuantMatrix(.{ .bits = .q3, .group_size = 64 }, g_blob[0..gu_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, g_blob[gu_sb_off .. gu_sb_off + gu_sb_bytes])), config.intermediate_size, config.hidden_size, e * 3 + 1);
+                        try fillSyntheticQuantMatrix(.{ .bits = .q3, .group_size = 64 }, u_blob[0..gu_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, u_blob[gu_sb_off .. gu_sb_off + gu_sb_bytes])), config.intermediate_size, config.hidden_size, e * 3 + 2);
+                        try fillSyntheticQuantMatrix(.{ .bits = .q3, .group_size = 64 }, d_blob[0..dn_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, d_blob[dn_sb_off .. dn_sb_off + dn_sb_bytes])), config.hidden_size, config.intermediate_size, e * 3 + 3);
+                    },
+                    .q4 => {
+                        try fillSyntheticQuantMatrix(.{ .bits = .q4, .group_size = 64 }, g_blob[0..gu_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, g_blob[gu_sb_off .. gu_sb_off + gu_sb_bytes])), config.intermediate_size, config.hidden_size, e * 3 + 1);
+                        try fillSyntheticQuantMatrix(.{ .bits = .q4, .group_size = 64 }, u_blob[0..gu_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, u_blob[gu_sb_off .. gu_sb_off + gu_sb_bytes])), config.intermediate_size, config.hidden_size, e * 3 + 2);
+                        try fillSyntheticQuantMatrix(.{ .bits = .q4, .group_size = 64 }, d_blob[0..dn_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, d_blob[dn_sb_off .. dn_sb_off + dn_sb_bytes])), config.hidden_size, config.intermediate_size, e * 3 + 3);
+                    },
+                }
+                tmpl_g[e] = g_blob;
+                tmpl_u[e] = u_blob;
+                tmpl_d[e] = d_blob;
+            } else {
+                const src = e & 3;
+                @memcpy(g_blob, tmpl_g[src]);
+                @memcpy(u_blob, tmpl_u[src]);
+                @memcpy(d_blob, tmpl_d[src]);
+            }
+
+            const g_off = arena.offsetOf(g_blob.ptr);
+            const u_off = arena.offsetOf(u_blob.ptr);
+            const d_off = arena.offsetOf(d_blob.ptr);
+            tbl_slice[e] = .{
+                .gate_qweight_offset = g_off,
+                .gate_sb_offset = g_off + gu_sb_off,
+                .up_qweight_offset = u_off,
+                .up_sb_offset = u_off + gu_sb_off,
+                .down_qweight_offset = d_off,
+                .down_sb_offset = d_off + dn_sb_off,
+            };
+        }
+    }
+
+    const ws = try MoeWorkspace.init(&arena, ws_spec);
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const out_raw = try arena.allocAligned(x_bytes, 64);
+    const logits_banks_raw = try arena.allocAligned(all_logits_bytes, 64);
+
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw[0 .. @as(usize, max_m) * config.hidden_size * @sizeOf(f16)]));
+    const out_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw[0 .. @as(usize, max_m) * config.hidden_size * @sizeOf(f16)]));
+    for (x_f16, 0..) |*v, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 17 + 11) % 31)) - 15;
+        v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.03125);
+    }
+    @memset(out_raw, 0);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    // Single frame in flight because all batches reuse one MoeWorkspace;
+    // dispatches within each batch are serialized by intra-encoder barriers.
+    var compute = try metal.Compute.initWithFrames(device, 1);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const x_bind = metal.BufferBinding{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) };
+    const out_bind = metal.BufferBinding{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) };
+    const w_base = metal.BufferBinding{ .buffer = gpu_buf, .offset = 0 };
+    const logits_base_off = arena.offsetOf(logits_banks_raw.ptr);
+
+    const routings = [_]SpikeS5Routing{ .correlated, .uniform };
+    const results = try allocator.alloc(SpikeS5CaseResult, routings.len * config.m_values.len);
+    errdefer allocator.free(results);
+
+    const corr_dedup_betas = try allocator.alloc(f64, config.m_values.len);
+    defer allocator.free(corr_dedup_betas);
+    const corr_perslot_betas = try allocator.alloc(f64, config.m_values.len);
+    defer allocator.free(corr_perslot_betas);
+
+    const one_expert_bytes = try expertLayerBytes(config.bits, 1, config.hidden_size, config.intermediate_size);
+
+    var first_case = true;
+    var crossover_corr: u32 = 0;
+    var crossover_unif: u32 = 0;
+
+    for (routings, 0..) |routing, ri| {
+        for (config.m_values, 0..) |m_val, mi| {
+            // Populate all routing banks for this (routing, M) and compute exact mean |U(T)|.
+            var total_u: u64 = 0;
+            for (0..config.num_routing_banks) |b| {
+                const off = b * bank_logits_bytes;
+                const b_slice: []f32 = @alignCast(std.mem.bytesAsSlice(
+                    f32,
+                    logits_banks_raw[off .. off + @as(usize, m_val) * config.num_experts * @sizeOf(f32)],
+                ));
+                fillSpikeS5RoutingBank(routing, b_slice, m_val, config.num_experts, b);
+                total_u += countUniqueExpertsCpu(b_slice, m_val, config.num_experts, config.top_k);
+            }
+            const mean_u = @as(f64, @floatFromInt(total_u)) / @as(f64, @floatFromInt(config.num_routing_banks));
+            const total_slots = m_val * config.top_k;
+            const unique_bytes_per_disp = mean_u * @as(f64, @floatFromInt(one_expert_bytes));
+            const slot_bytes_per_disp = one_expert_bytes * total_slots;
+
+            // Measure CSR-deduplicated vs per-slot back-to-back over identical banks.
+            var dedup_ns: u64 = 0;
+            var perslot_ns: u64 = 0;
+            const total_disps: u64 = @as(u64, config.timed_batches) * config.dispatches_per_batch;
+
+            inline for (.{ true, false }) |is_dedup| {
+                const warmups = config.warmup_batches + if (first_case and is_dedup) config.dvfs_warmup_batches else 0;
+                var bank_cursor: usize = 0;
+                var wsig: u64 = 0;
+                for (0..warmups) |_| {
+                    var frame = try compute.beginFrame(config.timeout_ms);
+                    errdefer frame.abort();
+                    for (0..config.dispatches_per_batch) |d| {
+                        const bank = bank_cursor % config.num_routing_banks;
+                        const pool = bank_cursor % num_pools;
+                        bank_cursor += 1;
+                        const layer_args: MoELayerArgs = .{
+                            .x = x_bind,
+                            .router = .{ .logits = .{
+                                .binding = .{ .buffer = gpu_buf, .offset = logits_base_off + @as(u64, bank) * bank_logits_bytes },
+                                .dtype = .f32,
+                            } },
+                            .weights_base = w_base,
+                            .expert_table = .{ .buffer = gpu_buf, .offset = table_offs[pool] },
+                            .workspace = &ws,
+                            .workspace_buf = gpu_buf,
+                            .out = out_bind,
+                            .m = m_val,
+                            .num_experts = config.num_experts,
+                            .top_k = config.top_k,
+                            .hidden_size = config.hidden_size,
+                            .intermediate_size = config.intermediate_size,
+                            .norm_topk_prob = true,
+                        };
+                        if (is_dedup) {
+                            try pipes.encodeMoELayer(&frame, config.bits, layer_args, d > 0);
+                        } else {
+                            try pipes.encodeMoELayerPerSlot(&frame, config.bits, layer_args, d > 0);
+                        }
+                    }
+                    wsig = try frame.commit();
+                }
+                if (wsig != 0) try compute.wait(wsig, config.timeout_ms);
+
+                var lsig: u64 = 0;
+                const t0 = try vmstat.nowNs();
+                for (0..config.timed_batches) |_| {
+                    var frame = try compute.beginFrame(config.timeout_ms);
+                    errdefer frame.abort();
+                    for (0..config.dispatches_per_batch) |d| {
+                        const bank = bank_cursor % config.num_routing_banks;
+                        const pool = bank_cursor % num_pools;
+                        bank_cursor += 1;
+                        const layer_args: MoELayerArgs = .{
+                            .x = x_bind,
+                            .router = .{ .logits = .{
+                                .binding = .{ .buffer = gpu_buf, .offset = logits_base_off + @as(u64, bank) * bank_logits_bytes },
+                                .dtype = .f32,
+                            } },
+                            .weights_base = w_base,
+                            .expert_table = .{ .buffer = gpu_buf, .offset = table_offs[pool] },
+                            .workspace = &ws,
+                            .workspace_buf = gpu_buf,
+                            .out = out_bind,
+                            .m = m_val,
+                            .num_experts = config.num_experts,
+                            .top_k = config.top_k,
+                            .hidden_size = config.hidden_size,
+                            .intermediate_size = config.intermediate_size,
+                            .norm_topk_prob = true,
+                        };
+                        if (is_dedup) {
+                            try pipes.encodeMoELayer(&frame, config.bits, layer_args, d > 0);
+                        } else {
+                            try pipes.encodeMoELayerPerSlot(&frame, config.bits, layer_args, d > 0);
+                        }
+                    }
+                    lsig = try frame.commit();
+                }
+                try compute.wait(lsig, config.timeout_ms);
+                const t1 = try vmstat.nowNs();
+
+                if (!std.math.isFinite(out_f16[0])) return error.NonFiniteOutput;
+                if (is_dedup) {
+                    dedup_ns = t1 - t0;
+                } else {
+                    perslot_ns = t1 - t0;
+                }
+            }
+            first_case = false;
+
+            const dedup_us = (@as(f64, @floatFromInt(dedup_ns)) / @as(f64, @floatFromInt(total_disps))) / 1000.0;
+            const perslot_us = (@as(f64, @floatFromInt(perslot_ns)) / @as(f64, @floatFromInt(total_disps))) / 1000.0;
+            const dedup_beta = if (dedup_ns > 0) (unique_bytes_per_disp * @as(f64, @floatFromInt(total_disps))) / @as(f64, @floatFromInt(dedup_ns)) else 0.0;
+            const perslot_beta_u = if (perslot_ns > 0) (unique_bytes_per_disp * @as(f64, @floatFromInt(total_disps))) / @as(f64, @floatFromInt(perslot_ns)) else 0.0;
+            const perslot_beta_r = if (perslot_ns > 0) (@as(f64, @floatFromInt(slot_bytes_per_disp)) * @as(f64, @floatFromInt(total_disps))) / @as(f64, @floatFromInt(perslot_ns)) else 0.0;
+            const speedup = if (dedup_us > 0.0) perslot_us / dedup_us else 1.0;
+            const saved_pct = (1.0 - (mean_u / @as(f64, @floatFromInt(total_slots)))) * 100.0;
+
+            results[ri * config.m_values.len + mi] = .{
+                .routing = routing,
+                .m = m_val,
+                .mean_unique_experts = mean_u,
+                .total_slots = total_slots,
+                .unique_bytes_per_dispatch = unique_bytes_per_disp,
+                .slot_bytes_per_dispatch = slot_bytes_per_disp,
+                .dedup_latency_us = dedup_us,
+                .perslot_latency_us = perslot_us,
+                .dedup_beta_gbs = dedup_beta,
+                .perslot_beta_unique_gbs = perslot_beta_u,
+                .perslot_beta_raw_gbs = perslot_beta_r,
+                .dedup_speedup_vs_perslot = speedup,
+                .bytes_saved_pct = saved_pct,
+            };
+
+            if (routing == .correlated) {
+                corr_dedup_betas[mi] = dedup_beta;
+                corr_perslot_betas[mi] = perslot_beta_u;
+                if (crossover_corr == 0 and dedup_us <= perslot_us) {
+                    crossover_corr = m_val;
+                }
+            } else {
+                if (crossover_unif == 0 and dedup_us <= perslot_us) {
+                    crossover_unif = m_val;
+                }
+            }
+        }
+    }
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    var beta_dedup_by_m: [65]f32 = undefined;
+    var beta_perslot_by_m: [65]f32 = undefined;
+    fillInterpolatedBetaTable(&beta_dedup_by_m, config.m_values, corr_dedup_betas);
+    fillInterpolatedBetaTable(&beta_perslot_by_m, config.m_values, corr_perslot_betas);
+
+    // Representative calibrated scalar beta_dedup_gbs (at M=8 if present, else median index).
+    var rep_beta = corr_dedup_betas[corr_dedup_betas.len / 2];
+    for (config.m_values, 0..) |mv, mi| {
+        if (mv == 8) {
+            rep_beta = corr_dedup_betas[mi];
+            break;
+        }
+    }
+
+    return .{
+        .config = config,
+        .pool_bytes = total_pool_bytes,
+        .results = results,
+        .beta_dedup_gbs = rep_beta,
+        .beta_dedup_by_m = beta_dedup_by_m,
+        .beta_perslot_by_m = beta_perslot_by_m,
+        .crossover_m_correlated = crossover_corr,
+        .crossover_m_uniform = crossover_unif,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
 }
 
 pub const RouteRefResult = struct {
@@ -3472,4 +4570,366 @@ test "GPU embedding lookup rejects quantized tables without scale_bias and multi
         .vocab_size = 8,
         .hidden_size = 100,
     }, false));
+}
+
+test "ami_argmax_rows finds exact greedy token IDs across M=1..64, f16/f32, ties, odd and 151936 vocabs" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    const cases = [_]struct { dtype: LogitsDType, m: u32, vocab: u32, unaligned: bool }{
+        .{ .dtype = .f16, .m = 1, .vocab = 1, .unaligned = false },
+        .{ .dtype = .f16, .m = 8, .vocab = 37, .unaligned = true },
+        .{ .dtype = .f16, .m = 16, .vocab = 1025, .unaligned = false },
+        .{ .dtype = .f16, .m = 64, .vocab = 2048, .unaligned = false },
+        .{ .dtype = .f16, .m = 4, .vocab = 151_936, .unaligned = false },
+        .{ .dtype = .f32, .m = 8, .vocab = 37, .unaligned = true },
+        .{ .dtype = .f32, .m = 16, .vocab = 2048, .unaligned = false },
+        .{ .dtype = .f32, .m = 4, .vocab = 64_000, .unaligned = false },
+    };
+
+    for (cases) |tc| {
+        const elem_bytes: usize = if (tc.dtype == .f16) @sizeOf(f16) else @sizeOf(f32);
+        const extra: usize = if (tc.unaligned) elem_bytes else 0;
+        const data_bytes: usize = @as(usize, tc.m) * tc.vocab * elem_bytes;
+        const out_bytes: usize = @as(usize, tc.m) * @sizeOf(u32);
+        var arena = try makeTestArena(data_bytes + extra + out_bytes + 512);
+        defer arena.deinit();
+
+        const logits_raw = try arena.allocAligned(data_bytes + extra, 64);
+        const out_raw = try arena.allocAligned(out_bytes, 64);
+        const out_ids: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_raw));
+        @memset(out_ids, 0xDEAD_BEEF);
+
+        const payload = logits_raw[extra .. extra + data_bytes];
+        for (0..tc.m) |row| {
+            const winner: usize = (row * 997 + 13) % tc.vocab;
+            const tie_idx: usize = @min(tc.vocab - 1, winner + 7);
+            const all_neg = (row & 1) == 1;
+            for (0..tc.vocab) |i| {
+                var val: f32 = if (all_neg)
+                    -10.0 - @as(f32, @floatFromInt((row * 17 + i) % 83)) * 0.125
+                else
+                    @as(f32, @floatFromInt(@as(i32, @intCast((row * 31 + i * 19 + 5) % 61)) - 30)) * 0.25;
+                if (i == winner or (tc.vocab > 8 and i == tie_idx)) {
+                    val = if (all_neg) -1.25 else 21.5;
+                }
+                if (tc.dtype == .f16) {
+                    const sl: []f16 = @alignCast(std.mem.bytesAsSlice(f16, payload));
+                    sl[row * tc.vocab + i] = @floatCast(val);
+                } else {
+                    const sl: []f32 = @alignCast(std.mem.bytesAsSlice(f32, payload));
+                    sl[row * tc.vocab + i] = val;
+                }
+            }
+        }
+
+        const ref_ids = try gpa.alloc(u32, tc.m);
+        defer gpa.free(ref_ids);
+        argmaxRowsRef(tc.dtype, payload, ref_ids, tc.m, tc.vocab);
+
+        const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer gpu_buf.close();
+        var compute = try metal.Compute.init(device);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeArgmaxRows(&frame, .{
+            .logits = .{ .buffer = gpu_buf, .offset = arena.offsetOf(logits_raw.ptr) + extra },
+            .out_token_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) },
+            .num_rows = tc.m,
+            .vocab_size = tc.vocab,
+            .logits_dtype = tc.dtype,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        for (0..tc.m) |row| {
+            try std.testing.expectEqual(ref_ids[row], out_ids[row]);
+        }
+    }
+}
+
+test "ami_topk_logits_rows computes exact FP32 softmax probabilities and top-k across M=1..64 and 151936 vocab" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    const cases = [_]struct { dtype: LogitsDType, m: u32, vocab: u32, top_k: u32 }{
+        .{ .dtype = .f16, .m = 1, .vocab = 1, .top_k = 1 },
+        .{ .dtype = .f16, .m = 8, .vocab = 37, .top_k = 4 },
+        .{ .dtype = .f16, .m = 16, .vocab = 1025, .top_k = 8 },
+        .{ .dtype = .f16, .m = 64, .vocab = 2048, .top_k = 16 },
+        .{ .dtype = .f16, .m = 4, .vocab = 64_000, .top_k = 8 },
+        .{ .dtype = .f16, .m = 4, .vocab = 151_936, .top_k = 16 },
+        .{ .dtype = .f32, .m = 8, .vocab = 257, .top_k = 8 },
+    };
+
+    for (cases) |tc| {
+        const elem_bytes: usize = if (tc.dtype == .f16) @sizeOf(f16) else @sizeOf(f32);
+        const data_bytes: usize = @as(usize, tc.m) * tc.vocab * elem_bytes;
+        const out_bytes: usize = @as(usize, tc.m) * tc.top_k * @sizeOf(TopKCandidate);
+        var arena = try makeTestArena(data_bytes + out_bytes + 512);
+        defer arena.deinit();
+
+        const logits_raw = try arena.allocAligned(data_bytes, 64);
+        const out_raw = try arena.allocAligned(out_bytes, 64);
+        @memset(out_raw, 0);
+        const out_cands: []const TopKCandidate = @alignCast(std.mem.bytesAsSlice(TopKCandidate, out_raw));
+
+        for (0..tc.m) |row| {
+            // Keep background logits moderate and plant distinct top peaks + ties so
+            // both exact tie breaking and full-vocab softmax normalization are exercised.
+            for (0..tc.vocab) |i| {
+                const c: i32 = @as(i32, @intCast((row * 29 + i * 17 + 7) % 41)) - 20;
+                const val: f32 = @as(f32, @floatFromInt(c)) * 0.125;
+                if (tc.dtype == .f16) {
+                    const sl: []f16 = @alignCast(std.mem.bytesAsSlice(f16, logits_raw));
+                    sl[row * tc.vocab + i] = @floatCast(val);
+                } else {
+                    const sl: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+                    sl[row * tc.vocab + i] = val;
+                }
+            }
+            const num_peaks = @min(tc.top_k + 2, tc.vocab);
+            for (0..num_peaks) |p| {
+                const idx = (row * 131 + p * 7919 + 3) % tc.vocab;
+                // Deliberately include an exact tie between p=1 and p=2.
+                const peak_val: f32 = if (p == 2) 10.5 else (11.0 - 0.5 * @as(f32, @floatFromInt(p)));
+                if (tc.dtype == .f16) {
+                    const sl: []f16 = @alignCast(std.mem.bytesAsSlice(f16, logits_raw));
+                    sl[row * tc.vocab + idx] = @floatCast(peak_val);
+                } else {
+                    const sl: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+                    sl[row * tc.vocab + idx] = peak_val;
+                }
+            }
+        }
+
+        const ref_cands = try gpa.alloc(TopKCandidate, @as(usize, tc.m) * tc.top_k);
+        defer gpa.free(ref_cands);
+        topKLogitsRowsRef(tc.dtype, logits_raw, ref_cands, tc.m, tc.vocab, tc.top_k);
+
+        const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer gpu_buf.close();
+        var compute = try metal.Compute.init(device);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeTopKLogitsRows(&frame, .{
+            .logits = .{ .buffer = gpu_buf, .offset = arena.offsetOf(logits_raw.ptr) },
+            .out_candidates = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) },
+            .num_rows = tc.m,
+            .vocab_size = tc.vocab,
+            .top_k = tc.top_k,
+            .logits_dtype = tc.dtype,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        for (0..tc.m) |row| {
+            var prob_sum: f32 = 0.0;
+            for (0..tc.top_k) |k_idx| {
+                const idx = row * tc.top_k + k_idx;
+                const exp_c = ref_cands[idx];
+                const got_c = out_cands[idx];
+                try std.testing.expectEqual(exp_c.token_id, got_c.token_id);
+                try std.testing.expectApproxEqAbs(exp_c.prob, got_c.prob, @max(1e-5, exp_c.prob * 1e-4));
+                try std.testing.expectApproxEqAbs(exp_c.log_prob, got_c.log_prob, @max(1e-4, @abs(exp_c.log_prob) * 1e-4));
+                prob_sum += got_c.prob;
+            }
+            try std.testing.expect(prob_sum > 0.0 and prob_sum <= 1.0001);
+        }
+    }
+}
+
+fn verifyPerSlotMatchesDedup(
+    comptime spec: quant.QuantSpec,
+    m: u32,
+    num_experts: u32,
+    top_k: u32,
+    hidden_size: u32,
+    intermediate_size: u32,
+) !void {
+    const Ops = quant.QuantOps(spec);
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    const gu_w_bytes = try Ops.packedWeightBytes(intermediate_size, hidden_size);
+    const gu_sb_off = amf.align64(gu_w_bytes);
+    const gu_sb_bytes = try Ops.scaleBiasBytes(intermediate_size, hidden_size);
+    const gu_blob = try page.alignUp(gu_sb_off + gu_sb_bytes);
+    const dn_w_bytes = try Ops.packedWeightBytes(hidden_size, intermediate_size);
+    const dn_sb_off = amf.align64(dn_w_bytes);
+    const dn_sb_bytes = try Ops.scaleBiasBytes(hidden_size, intermediate_size);
+    const dn_blob = try page.alignUp(dn_sb_off + dn_sb_bytes);
+
+    const ws_spec: WorkspaceSpec = .{
+        .max_tokens = m,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+    };
+    const ws_bytes = try MoeWorkspace.requiredBytes(ws_spec);
+    const table_bytes = @as(usize, num_experts) * @sizeOf(ExpertWeights);
+    const x_bytes = @as(usize, m) * hidden_size * @sizeOf(f16);
+    const logits_bytes = @as(usize, m) * num_experts * @sizeOf(f32);
+    var arena = try makeTestArena(@as(usize, num_experts) * (2 * gu_blob + dn_blob) + ws_bytes + table_bytes + x_bytes * 3 + logits_bytes + 8 * page.APPLE_PAGE_SIZE);
+    defer arena.deinit();
+    _ = try arena.allocPages(page.APPLE_PAGE_SIZE);
+
+    const table_raw = try arena.allocAligned(table_bytes, 64);
+    const expert_table: []ExpertWeights = @alignCast(std.mem.bytesAsSlice(ExpertWeights, table_raw));
+    for (0..num_experts) |e| {
+        const gb = try arena.allocPages(gu_blob);
+        const ub = try arena.allocPages(gu_blob);
+        const db = try arena.allocPages(dn_blob);
+        @memset(gb, 0);
+        @memset(ub, 0);
+        @memset(db, 0);
+        try fillSyntheticQuantMatrix(spec, gb[0..gu_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, gb[gu_sb_off .. gu_sb_off + gu_sb_bytes])), intermediate_size, hidden_size, e * 3 + 1);
+        try fillSyntheticQuantMatrix(spec, ub[0..gu_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, ub[gu_sb_off .. gu_sb_off + gu_sb_bytes])), intermediate_size, hidden_size, e * 3 + 2);
+        try fillSyntheticQuantMatrix(spec, db[0..dn_w_bytes], @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, db[dn_sb_off .. dn_sb_off + dn_sb_bytes])), hidden_size, intermediate_size, e * 3 + 3);
+        const go = arena.offsetOf(gb.ptr);
+        const uo = arena.offsetOf(ub.ptr);
+        const do = arena.offsetOf(db.ptr);
+        expert_table[e] = .{
+            .gate_qweight_offset = go,
+            .gate_sb_offset = go + gu_sb_off,
+            .up_qweight_offset = uo,
+            .up_sb_offset = uo + gu_sb_off,
+            .down_qweight_offset = do,
+            .down_sb_offset = do + dn_sb_off,
+        };
+    }
+
+    const ws = try MoeWorkspace.init(&arena, ws_spec);
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const out_dedup_raw = try arena.allocAligned(x_bytes, 64);
+    const out_slot_raw = try arena.allocAligned(x_bytes, 64);
+    const logits_raw = try arena.allocAligned(logits_bytes, 64);
+
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    const out_dedup: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_dedup_raw));
+    const out_slot: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_slot_raw));
+    const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+
+    for (x_f16, 0..) |*v, idx| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((idx * 17 + 11) % 31)) - 15)) * 0.03125);
+    fillSpikeS5RoutingBank(.correlated, logits_f32, m, num_experts, 0);
+
+    const ref_out = try gpa.alloc(f32, x_f16.len);
+    defer gpa.free(ref_out);
+    var rref = try moeLayerRef(spec, gpa, x_f16, logits_f32, arena.bytes(), expert_table, null, ref_out, m, num_experts, top_k, hidden_size, intermediate_size, true);
+    defer rref.deinit(gpa);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const base_args: MoELayerArgs = .{
+        .x = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) },
+        .router = .{ .logits = .{ .binding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(logits_raw.ptr) }, .dtype = .f32 } },
+        .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+        .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(table_raw.ptr) },
+        .workspace = &ws,
+        .workspace_buf = gpu_buf,
+        .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_dedup_raw.ptr) },
+        .m = m,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+    };
+
+    var f1 = try compute.beginFrame(5000);
+    errdefer f1.abort();
+    try pipes.encodeMoELayer(&f1, spec.bits, base_args, false);
+    const s1 = try f1.commit();
+    try compute.wait(s1, 5000);
+
+    var slot_args = base_args;
+    slot_args.out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_slot_raw.ptr) };
+    var f2 = try compute.beginFrame(5000);
+    errdefer f2.abort();
+    try pipes.encodeMoELayerPerSlot(&f2, spec.bits, slot_args, false);
+    const s2 = try f2.commit();
+    try compute.wait(s2, 5000);
+
+    for (ref_out, 0..) |expected, idx| {
+        const d_got: f32 = @floatCast(out_dedup[idx]);
+        const s_got: f32 = @floatCast(out_slot[idx]);
+        const tol: f32 = @max(0.02, @abs(expected) * 0.02);
+        try std.testing.expectApproxEqAbs(expected, d_got, tol);
+        try std.testing.expectApproxEqAbs(expected, s_got, tol);
+        try std.testing.expectApproxEqAbs(d_got, s_got, @max(0.015, @abs(d_got) * 0.015));
+    }
+}
+
+test "non-deduplicated per-slot 3-bit and 4-bit MoE matches deduplicated CSR MoE and CPU ref" {
+    try verifyPerSlotMatchesDedup(.{ .bits = .q3, .group_size = 64 }, 1, 16, 8, 256, 192);
+    try verifyPerSlotMatchesDedup(.{ .bits = .q3, .group_size = 64 }, 8, 32, 8, 192, 128);
+    try verifyPerSlotMatchesDedup(.{ .bits = .q4, .group_size = 64 }, 1, 16, 8, 256, 192);
+    try verifyPerSlotMatchesDedup(.{ .bits = .q4, .group_size = 64 }, 8, 32, 8, 192, 128);
+}
+
+test "Spike S5 benchmark smoke test exercises correlated/uniform routing, dedup vs per-slot, and beta table" {
+    const gpa = std.testing.allocator;
+    const ms = [_]u32{ 1, 4, 8 };
+    var rep = try runSpikeS5(gpa, .{
+        .bits = .q3,
+        .num_experts = 32,
+        .top_k = 8,
+        .hidden_size = 256,
+        .intermediate_size = 192,
+        .m_values = &ms,
+        .num_routing_banks = 4,
+        .min_working_set_bytes = 0,
+        .dvfs_warmup_batches = 0,
+        .warmup_batches = 1,
+        .timed_batches = 2,
+        .dispatches_per_batch = 2,
+        .timeout_ms = 10_000,
+    });
+    defer rep.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 6), rep.results.len);
+    try std.testing.expect(rep.beta_dedup_gbs > 0.0);
+    for (rep.results) |r| {
+        try std.testing.expect(r.mean_unique_experts >= 8.0);
+        try std.testing.expect(r.dedup_latency_us > 0.0);
+        try std.testing.expect(r.perslot_latency_us > 0.0);
+        try std.testing.expect(r.dedup_beta_gbs > 0.0);
+        try std.testing.expect(r.perslot_beta_unique_gbs > 0.0);
+    }
+    // Correlated routing at M=8 should have strictly fewer unique experts than uniform.
+    try std.testing.expect(rep.results[2].mean_unique_experts <= rep.results[5].mean_unique_experts);
+    for (rep.beta_dedup_by_m) |b| try std.testing.expect(b > 0.0);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try rep.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "s5.beta_dedup_gbs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "correlated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "uniform") != null);
 }

@@ -1130,3 +1130,497 @@ ami_status ami_compute_dispatch_1d_sync(ami_compute *compute, const ami_pipeline
     }
     return ami_compute_wait(compute, sig, timeout_ms);
 }
+
+/* -------------------------------------------------------------------------
+ * CoreML / Apple Neural Engine zero-copy IOSurface bridge (ADR-0004, D5, S4)
+ * ------------------------------------------------------------------------- */
+
+struct ami_ane_model {
+    void *ml_model;          // MLModel *, retained
+    void *temp_compiled_url; // NSURL *, retained (deleted on destroy if non-NULL)
+    ami_ane_model_info info;
+};
+
+struct ami_ane_tensor {
+    void *ml_array; // MLMultiArray *, retained (backed zero-copy by CVPixelBuffer)
+    CVPixelBufferRef pixel_buffer; // borrowed for zero-copy identity checks
+    uint32_t rank;
+    uint32_t shape[AMI_ANE_MAX_DIMS];
+};
+
+struct ami_ane_plan {
+    void *input_provider; // MLDictionaryFeatureProvider *, retained
+    void *options;        // MLPredictionOptions *, retained
+    uint32_t output_count;
+    void *output_names[AMI_ANE_MAX_BINDINGS];  // NSString *, retained
+    void *output_arrays[AMI_ANE_MAX_BINDINGS]; // MLMultiArray *, retained
+    CVPixelBufferRef output_pbs[AMI_ANE_MAX_BINDINGS];
+};
+
+static bool ane_compute_units_from_raw(uint32_t raw, MLComputeUnits *out_units) {
+    switch (raw) {
+    case AMI_ANE_COMPUTE_CPU_AND_NE:
+        *out_units = MLComputeUnitsCPUAndNeuralEngine;
+        return true;
+    case AMI_ANE_COMPUTE_ALL:
+        *out_units = MLComputeUnitsAll;
+        return true;
+    case AMI_ANE_COMPUTE_CPU_ONLY:
+        *out_units = MLComputeUnitsCPUOnly;
+        return true;
+    case AMI_ANE_COMPUTE_CPU_AND_GPU:
+        *out_units = MLComputeUnitsCPUAndGPU;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void record_device_usage(MLComputePlanDeviceUsage *usage, ami_ane_model_info *info) {
+    if (usage == nil || info == NULL) {
+        return;
+    }
+    info->total_layers++;
+    id<MLComputeDeviceProtocol> pref = usage.preferredComputeDevice;
+    if ([pref isKindOfClass:[MLNeuralEngineComputeDevice class]]) {
+        info->ane_preferred_layers++;
+    } else if ([pref isKindOfClass:[MLGPUComputeDevice class]]) {
+        info->gpu_preferred_layers++;
+    } else if ([pref isKindOfClass:[MLCPUComputeDevice class]]) {
+        info->cpu_preferred_layers++;
+    }
+}
+
+static void populate_compute_plan_info(MLComputePlan *plan, ami_ane_model_info *info) {
+    if (plan == nil || info == NULL) {
+        return;
+    }
+    MLModelStructure *structure = plan.modelStructure;
+    if (structure.neuralNetwork != nil) {
+        for (MLModelStructureNeuralNetworkLayer *layer in structure.neuralNetwork.layers) {
+            record_device_usage([plan computeDeviceUsageForNeuralNetworkLayer:layer], info);
+        }
+    } else if (structure.program != nil) {
+        for (NSString *fn_name in structure.program.functions) {
+            MLModelStructureProgramFunction *fn = structure.program.functions[fn_name];
+            if (fn != nil && fn.block != nil) {
+                for (MLModelStructureProgramOperation *op in fn.block.operations) {
+                    record_device_usage([plan computeDeviceUsageForMLProgramOperation:op], info);
+                }
+            }
+        }
+    }
+}
+
+ami_status ami_ane_model_load_path(const char *path, uint32_t compute_units,
+                                   ami_ane_model **out_model) {
+    if (out_model == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_model = NULL;
+    MLComputeUnits units = MLComputeUnitsCPUAndNeuralEngine;
+    if (path == NULL || path[0] == '\0' || !ane_compute_units_from_raw(compute_units, &units)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        NSString *ns_path = [NSString stringWithUTF8String:path];
+        if (ns_path == nil) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+        NSURL *src_url = [NSURL fileURLWithPath:ns_path];
+        if (src_url == nil) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+
+        NSURL *compiled_url = src_url;
+        bool owns_temp = false;
+        NSString *ext = ns_path.pathExtension.lowercaseString;
+        if (![ext isEqualToString:@"mlmodelc"]) {
+            dispatch_semaphore_t compile_sem = dispatch_semaphore_create(0);
+            if (compile_sem == NULL) {
+                return AMI_ERR_OUT_OF_MEMORY;
+            }
+            __block NSURL *out_compiled = nil;
+            [MLModel compileModelAtURL:src_url
+                     completionHandler:^(NSURL *c_url, NSError *c_err) {
+                         (void)c_err;
+                         out_compiled = c_url;
+                         dispatch_semaphore_signal(compile_sem);
+                     }];
+            dispatch_semaphore_wait(compile_sem, DISPATCH_TIME_FOREVER);
+            if (out_compiled == nil) {
+                return AMI_ERR_ANE;
+            }
+            compiled_url = out_compiled;
+            owns_temp = true;
+        }
+
+        MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
+        cfg.computeUnits = units;
+
+        NSError *error = nil;
+        MLModel *ml_model = [MLModel modelWithContentsOfURL:compiled_url
+                                              configuration:cfg
+                                                      error:&error];
+        if (ml_model == nil) {
+            if (owns_temp) {
+                [[NSFileManager defaultManager] removeItemAtURL:compiled_url error:nil];
+            }
+            return AMI_ERR_ANE;
+        }
+
+        ami_ane_model *model = calloc(1, sizeof *model);
+        if (model == NULL) {
+            ml_model = nil;
+            if (owns_temp) {
+                [[NSFileManager defaultManager] removeItemAtURL:compiled_url error:nil];
+            }
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        model->info.compute_units = compute_units;
+
+        // Inspect MLComputePlan to record ANE / GPU / CPU layer placement.
+        dispatch_semaphore_t plan_sem = dispatch_semaphore_create(0);
+        if (plan_sem != NULL) {
+            __block MLComputePlan *loaded_plan = nil;
+            [MLComputePlan loadContentsOfURL:compiled_url
+                               configuration:cfg
+                           completionHandler:^(MLComputePlan *p, NSError *p_err) {
+                               (void)p_err;
+                               loaded_plan = p;
+                               dispatch_semaphore_signal(plan_sem);
+                           }];
+            dispatch_semaphore_wait(plan_sem, DISPATCH_TIME_FOREVER);
+            populate_compute_plan_info(loaded_plan, &model->info);
+        }
+
+        model->ml_model = (__bridge_retained void *)ml_model;
+        if (owns_temp) {
+            model->temp_compiled_url = (__bridge_retained void *)compiled_url;
+        }
+        *out_model = model;
+    }
+    return AMI_OK;
+}
+
+ami_status ami_ane_model_load_spec_data(const void *spec_bytes, size_t spec_len,
+                                        uint32_t compute_units,
+                                        ami_ane_model **out_model) {
+    if (out_model == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_model = NULL;
+    MLComputeUnits units = MLComputeUnitsCPUAndNeuralEngine;
+    if (spec_bytes == NULL || spec_len == 0 || !ane_compute_units_from_raw(compute_units, &units)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytes:spec_bytes length:spec_len];
+        if (data == nil) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        NSError *error = nil;
+        MLModelAsset *asset = [MLModelAsset modelAssetWithSpecificationData:data error:&error];
+        if (asset == nil) {
+            return AMI_ERR_ANE;
+        }
+
+        MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
+        cfg.computeUnits = units;
+
+        dispatch_semaphore_t load_sem = dispatch_semaphore_create(0);
+        if (load_sem == NULL) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        __block MLModel *loaded_model = nil;
+        [MLModel loadModelAsset:asset
+                  configuration:cfg
+              completionHandler:^(MLModel *m, NSError *m_err) {
+                  (void)m_err;
+                  loaded_model = m;
+                  dispatch_semaphore_signal(load_sem);
+              }];
+        dispatch_semaphore_wait(load_sem, DISPATCH_TIME_FOREVER);
+        if (loaded_model == nil) {
+            return AMI_ERR_ANE;
+        }
+
+        ami_ane_model *model = calloc(1, sizeof *model);
+        if (model == NULL) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        model->info.compute_units = compute_units;
+
+        dispatch_semaphore_t plan_sem = dispatch_semaphore_create(0);
+        if (plan_sem != NULL) {
+            __block MLComputePlan *loaded_plan = nil;
+            [MLComputePlan loadModelAsset:asset
+                            configuration:cfg
+                        completionHandler:^(MLComputePlan *p, NSError *p_err) {
+                            (void)p_err;
+                            loaded_plan = p;
+                            dispatch_semaphore_signal(plan_sem);
+                        }];
+            dispatch_semaphore_wait(plan_sem, DISPATCH_TIME_FOREVER);
+            populate_compute_plan_info(loaded_plan, &model->info);
+        }
+
+        model->ml_model = (__bridge_retained void *)loaded_model;
+        *out_model = model;
+    }
+    return AMI_OK;
+}
+
+void ami_ane_model_destroy(ami_ane_model *model) {
+    if (model == NULL) {
+        return;
+    }
+    if (model->ml_model != NULL) {
+        CFRelease(model->ml_model);
+        model->ml_model = NULL;
+    }
+    if (model->temp_compiled_url != NULL) {
+        @autoreleasepool {
+            NSURL *url = (__bridge_transfer NSURL *)model->temp_compiled_url;
+            model->temp_compiled_url = NULL;
+            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        }
+    }
+    free(model);
+}
+
+ami_status ami_ane_model_query(const ami_ane_model *model, ami_ane_model_info *out_info) {
+    if (model == NULL || out_info == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_info = model->info;
+    return AMI_OK;
+}
+
+ami_status ami_ane_tensor_from_kv_tile(const ami_kv_tile *tile, const uint32_t *shape,
+                                       size_t rank, ami_ane_tensor **out_tensor) {
+    if (out_tensor == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_tensor = NULL;
+    if (tile == NULL || tile->pixel_buffer == NULL || shape == NULL ||
+        rank < 2 || rank > AMI_ANE_MAX_DIMS) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    uint64_t leading_rows = 1u;
+    for (size_t i = 0; i < rank; i++) {
+        if (shape[i] == 0u) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+        if (i + 1u < rank) {
+            if (leading_rows > UINT64_MAX / (uint64_t)shape[i]) {
+                return AMI_ERR_INVALID_ARGUMENT;
+            }
+            leading_rows *= (uint64_t)shape[i];
+        }
+    }
+    if (shape[rank - 1u] != tile->row_f16 || leading_rows != (uint64_t)tile->rows) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        NSMutableArray<NSNumber *> *ns_shape = [NSMutableArray arrayWithCapacity:rank];
+        for (size_t i = 0; i < rank; i++) {
+            [ns_shape addObject:@(shape[i])];
+        }
+
+        // Balance CoreVideo ownership whether CoreML retains or adopts pixel_buffer.
+        CFIndex rc_before = CFGetRetainCount(tile->pixel_buffer);
+        MLMultiArray *arr = [[MLMultiArray alloc] initWithPixelBuffer:tile->pixel_buffer
+                                                                shape:ns_shape];
+        if (arr == nil) {
+            return AMI_ERR_ANE;
+        }
+        CFIndex rc_after = CFGetRetainCount(tile->pixel_buffer);
+        if (rc_after <= rc_before) {
+            CVPixelBufferRetain(tile->pixel_buffer);
+        }
+
+        ami_ane_tensor *tensor = calloc(1, sizeof *tensor);
+        if (tensor == NULL) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        tensor->ml_array = (__bridge_retained void *)arr;
+        tensor->pixel_buffer = tile->pixel_buffer;
+        tensor->rank = (uint32_t)rank;
+        for (size_t i = 0; i < rank; i++) {
+            tensor->shape[i] = shape[i];
+        }
+        *out_tensor = tensor;
+    }
+    return AMI_OK;
+}
+
+void ami_ane_tensor_destroy(ami_ane_tensor *tensor) {
+    if (tensor == NULL) {
+        return;
+    }
+    if (tensor->ml_array != NULL) {
+        CFRelease(tensor->ml_array);
+        tensor->ml_array = NULL;
+    }
+    free(tensor);
+}
+
+ami_status ami_ane_plan_create(const ami_ane_binding *inputs, size_t input_count,
+                               const ami_ane_binding *outputs, size_t output_count,
+                               ami_ane_plan **out_plan) {
+    if (out_plan == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_plan = NULL;
+    if (input_count == 0 || input_count > AMI_ANE_MAX_BINDINGS || inputs == NULL ||
+        output_count == 0 || output_count > AMI_ANE_MAX_BINDINGS || outputs == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    for (size_t i = 0; i < input_count; i++) {
+        if (inputs[i].name == NULL || inputs[i].name[0] == '\0' || inputs[i].tensor == NULL ||
+            inputs[i].tensor->ml_array == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    for (size_t i = 0; i < output_count; i++) {
+        if (outputs[i].name == NULL || outputs[i].name[0] == '\0' || outputs[i].tensor == NULL ||
+            outputs[i].tensor->ml_array == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+
+    @autoreleasepool {
+        NSMutableDictionary<NSString *, MLFeatureValue *> *in_dict =
+            [NSMutableDictionary dictionaryWithCapacity:input_count];
+        for (size_t i = 0; i < input_count; i++) {
+            NSString *key = [NSString stringWithUTF8String:inputs[i].name];
+            if (key == nil) {
+                return AMI_ERR_INVALID_ARGUMENT;
+            }
+            MLMultiArray *arr = (__bridge MLMultiArray *)inputs[i].tensor->ml_array;
+            MLFeatureValue *fv = [MLFeatureValue featureValueWithMultiArray:arr];
+            if (fv == nil) {
+                return AMI_ERR_ANE;
+            }
+            in_dict[key] = fv;
+        }
+
+        NSError *error = nil;
+        MLDictionaryFeatureProvider *provider =
+            [[MLDictionaryFeatureProvider alloc] initWithDictionary:in_dict error:&error];
+        if (provider == nil) {
+            return AMI_ERR_ANE;
+        }
+
+        NSMutableDictionary<NSString *, id> *out_backings =
+            [NSMutableDictionary dictionaryWithCapacity:output_count];
+        ami_ane_plan *plan = calloc(1, sizeof *plan);
+        if (plan == NULL) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+
+        for (size_t i = 0; i < output_count; i++) {
+            NSString *key = [NSString stringWithUTF8String:outputs[i].name];
+            if (key == nil) {
+                ami_ane_plan_destroy(plan);
+                return AMI_ERR_INVALID_ARGUMENT;
+            }
+            MLMultiArray *arr = (__bridge MLMultiArray *)outputs[i].tensor->ml_array;
+            out_backings[key] = arr;
+            plan->output_names[i] = (__bridge_retained void *)key;
+            plan->output_arrays[i] = (__bridge_retained void *)arr;
+            plan->output_pbs[i] = outputs[i].tensor->pixel_buffer;
+            plan->output_count = (uint32_t)(i + 1u);
+        }
+
+        MLPredictionOptions *opts = [[MLPredictionOptions alloc] init];
+        opts.outputBackings = out_backings;
+
+        plan->input_provider = (__bridge_retained void *)provider;
+        plan->options = (__bridge_retained void *)opts;
+        *out_plan = plan;
+    }
+    return AMI_OK;
+}
+
+void ami_ane_plan_destroy(ami_ane_plan *plan) {
+    if (plan == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < plan->output_count; i++) {
+        if (plan->output_names[i] != NULL) CFRelease(plan->output_names[i]);
+        if (plan->output_arrays[i] != NULL) CFRelease(plan->output_arrays[i]);
+    }
+    if (plan->options != NULL) CFRelease(plan->options);
+    if (plan->input_provider != NULL) CFRelease(plan->input_provider);
+    free(plan);
+}
+
+ami_status ami_ane_model_predict(const ami_ane_model *model, const ami_ane_plan *plan,
+                                 ami_ane_predict_info *out_info) {
+    if (out_info != NULL) {
+        memset(out_info, 0, sizeof *out_info);
+    }
+    if (model == NULL || model->ml_model == NULL || plan == NULL ||
+        plan->input_provider == NULL || plan->options == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        MLModel *ml_model = (__bridge MLModel *)model->ml_model;
+        MLDictionaryFeatureProvider *provider =
+            (__bridge MLDictionaryFeatureProvider *)plan->input_provider;
+        MLPredictionOptions *opts = (__bridge MLPredictionOptions *)plan->options;
+
+        NSError *error = nil;
+        id<MLFeatureProvider> result = [ml_model predictionFromFeatures:provider
+                                                                options:opts
+                                                                  error:&error];
+        if (result == nil) {
+            return AMI_ERR_ANE;
+        }
+
+        uint32_t matched = 0;
+        for (uint32_t i = 0; i < plan->output_count; i++) {
+            NSString *name = (__bridge NSString *)plan->output_names[i];
+            MLMultiArray *expected_arr = (__bridge MLMultiArray *)plan->output_arrays[i];
+            MLFeatureValue *fv = [result featureValueForName:name];
+            MLMultiArray *got_arr = (fv != nil) ? fv.multiArrayValue : nil;
+            if (got_arr == nil) {
+                return AMI_ERR_ANE;
+            }
+            if (got_arr == expected_arr ||
+                (got_arr.pixelBuffer != NULL && got_arr.pixelBuffer == plan->output_pbs[i])) {
+                matched++;
+            } else {
+                // CoreML did not honor outputBacking (e.g. CPUOnly fallback); copy into destination
+                // while accurately reporting zero-copy miss via `outputs_zero_copy_matched`.
+                [got_arr transferToMultiArray:expected_arr];
+            }
+        }
+        if (out_info != NULL) {
+            out_info->outputs_zero_copy_matched = matched;
+            out_info->outputs_total = plan->output_count;
+        }
+    }
+    return AMI_OK;
+}
+
+ami_status ami_ane_model_predict_oneshot(const ami_ane_model *model,
+                                         const ami_ane_binding *inputs, size_t input_count,
+                                         const ami_ane_binding *outputs, size_t output_count,
+                                         ami_ane_predict_info *out_info) {
+    ami_ane_plan *plan = NULL;
+    ami_status st = ami_ane_plan_create(inputs, input_count, outputs, output_count, &plan);
+    if (st != AMI_OK) {
+        return st;
+    }
+    st = ami_ane_model_predict(model, plan, out_info);
+    ami_ane_plan_destroy(plan);
+    return st;
+}
