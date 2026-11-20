@@ -1,0 +1,53 @@
+# Decision records
+
+Architecture Decision Records (ADRs) for aminfer. Each ADR captures one
+decision: its context, the decision itself, consequences, evidence and open
+items. ADRs record decisions, not capability status — that lives in
+[../status.md](../status.md).
+
+## Status values
+
+| Status | Meaning |
+| --- | --- |
+| Proposed | Under discussion; not binding. |
+| Accepted | Binding until superseded. |
+| Superseded | Replaced by a later ADR (linked). |
+| Rejected | Considered and declined; kept for the record. |
+
+## Index
+
+| ADR | Title | Status | Date |
+| --- | --- | --- | --- |
+| [0001](0001-language-and-toolchain-boundaries.md) | Language and toolchain boundaries | Accepted | 2026-11-20 |
+| [0002](0002-page-alignment-and-zero-copy.md) | 16 KiB page alignment, wired memory and zero-copy sharing | Accepted | 2026-11-20 |
+| [0003](0003-expert-source-tagged-union.md) | `ExpertSource` tagged union and the reserved Thunderbolt peer | Accepted | 2026-11-20 |
+| [0004](0004-kv-cache-iosurface-texture-sharing.md) | NPU → GPU KV sharing through IOSurface-backed Metal textures | Accepted | 2026-11-20 |
+| [0005](0005-dual-source-tree-merging.md) | Dual-source tree merging of L1 and L2 drafts | Accepted | 2026-11-20 |
+| [0006](0006-amf-cold-experts-direct-io.md) | `.amf` cold-expert format and `F_NOCACHE` direct I/O | Accepted | 2026-11-20 |
+| [0007](0007-docs-single-source-of-truth.md) | Documentation taxonomy and single sources of truth | Accepted | 2026-11-20 |
+| [0008](0008-benchmark-gated-draft-placement.md) | Benchmark-gated placement of L2 drafting | Accepted | 2026-11-20 |
+| [0009](0009-expert-byte-budget-tree-pruning.md) | Expert-byte-budget pruning of draft trees | Accepted | 2026-11-20 |
+| [0010](0010-hybrid-wavefront-prefill.md) | Hybrid ANE / GPU wavefront prefill | Accepted | 2026-11-20 |
+| [0011](0011-metal4-zero-allocation-hot-path.md) | Metal 4 zero-allocation hot path and the macOS 26.0 floor | Accepted | 2026-11-20 |
+| [0012](0012-wired-memory-budget-headroom.md) | Wired memory budget with headroom | Accepted | 2026-11-20 |
+| [0013](0013-eagle-tree-and-head-formats.md) | EAGLE-2 draft trees with EAGLE-3 / EAGLE-2 heads, MTP and small drafts | Accepted | 2026-11-20 |
+| [0014](0014-compile-time-specialization.md) | Compile-time specialization of hot code | Accepted | 2026-11-20 |
+
+## Template
+
+```markdown
+# ADR-NNNN: Title
+
+- Status: Proposed | Accepted | Superseded by ADR-XXXX | Rejected
+- Date: YYYY-MM-DD
+- Source: who asked for or approved it, and where
+
+## Context
+## Decision
+## Consequences
+## Evidence
+## Open items
+```
+
+Open items that need measurement become spikes in
+[../process.md](../process.md#spikes).

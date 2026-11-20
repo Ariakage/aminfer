@@ -1,0 +1,121 @@
+# Memory model
+
+> Design reference; status lives in [../status.md](../status.md).
+
+## Page invariant
+
+- `APPLE_PAGE_SIZE = 16384`. It equals `std.heap.page_size_min` for
+  `aarch64-macos` (checked at compile time) and `hw.pagesize` (checked at
+  startup).
+- Every buffer shared with Metal (`newBufferWithBytesNoCopy`) or through
+  IOSurface has a 16 KiB-aligned start address and a total length that is a
+  multiple of 16 KiB.
+- Our code enforces the rule with runtime checks at every bridge boundary —
+  kept in ReleaseFast, because they run at startup, not per round. Metal
+  itself accepted a non-multiple NoCopy length in our probe, even with
+  `MTL_DEBUG_LAYER=1` ([hardware.md](hardware.md)), so its validation cannot be
+  relied on.
+- Rationale and consequences:
+  [ADR-0002](../decisions/0002-page-alignment-and-zero-copy.md).
+
+## Wired regions
+
+- Allocated once at startup with `mmap(MAP_ANON | MAP_PRIVATE)` (page-aligned
+  by construction), lengths rounded up to 16 KiB, then pinned with `mlock`.
+- A failed `mlock` is an error, never a silent fallback to pageable memory.
+- Regions are carved into arenas: dense weights and hot experts, KV tiles,
+  activations and scratch, cold-expert slots, draft-model buffers, suffix
+  automaton tables. Nothing is allocated after startup
+  ([runtime-pipeline.md](runtime-pipeline.md#hot-path-rules)).
+
+## Two limits, one budget
+
+| Limit | Governs | Baseline default |
+| --- | --- | --- |
+| `vm.user_wire_limit`, `vm.global_user_wire_limit` | `mlock` (CPU-side wiring) | 18.24 GiB |
+| `iogpu.wired_limit_mb` → `recommendedMaxWorkingSetSize` | GPU-resident working set | 18,186 MiB |
+
+The same bytes count against both limits. The wired budget
+([ADR-0012](../decisions/0012-wired-memory-budget-headroom.md)) is computed at
+startup as the minimum of the configured cap, physical memory minus the
+headroom (default 3 GiB) and both limits; a model plan larger than the budget
+is rejected with a clear error. Raising the limits is described in
+[../guides/system-tuning.md](../guides/system-tuning.md).
+
+## Residency
+
+- **CPU**: `mlock` of the wired regions.
+- **GPU**: one `MTLResidencySet` holding every long-lived buffer and texture,
+  committed at startup and attached to the Metal 4 command queue. Metal 4 does
+  not track residency implicitly, so nothing outside the set may be used by a
+  kernel ([ADR-0011](../decisions/0011-metal4-zero-allocation-hot-path.md)).
+- **IOSurface tiles**: created at startup and added to the residency set.
+  Whether their mapped range should also be `mlock`ed is open (spike S1).
+
+## Zero-copy paths
+
+| Producer → consumer | Mechanism |
+| --- | --- |
+| CPU ↔ GPU | Wired region wrapped once with `newBufferWithBytesNoCopy` (shared storage) |
+| ANE ↔ GPU (KV, activations) | IOSurface created as an fp16 `CVPixelBuffer`; CoreML sees it as `MLMultiArray(pixelBuffer:shape:)` through output backings; Metal sees it through `newTextureWithDescriptor:iosurface:plane:` ([ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md)) |
+| NVMe → GPU | `F_NOCACHE` read straight into a wired slot whose `MTLBuffer` already exists ([ADR-0006](../decisions/0006-amf-cold-experts-direct-io.md)) |
+| GPU → CPU (tokens, logits, acceptance) | Shared-storage buffers in a wired region; completion through `MTLSharedEvent` |
+
+No tensor is ever copied between engines. Copies inside one engine — for
+example moving the accepted path's KV rows into committed tiles on the GPU —
+are ordinary kernel work.
+
+## KV tiles
+
+Accepted direction ([ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md)):
+KV lives in IOSurface-backed fp16 tiles that the ANE writes and the GPU reads
+as textures with `tex.read(uint2(x, y))`.
+
+Draft tile layout (to settle in spike S1):
+
+- One tile per layer, per K or V, per 512-token prefill chunk. For
+  Qwen3-30B-A3B (4 KV heads, head dim 128) a K tile is
+  4 × 512 × 128 × 2 B = 512 KiB: an fp16 surface of width 128 and height 2048
+  with 256-byte rows.
+- Tiles are created with an explicit allocation size that is a multiple of
+  16 KiB, because `IOSurfaceGetAllocSize` of a default pixel buffer exceeded
+  the data size by 64 B in our probe. The allocation size is never used as a
+  Metal buffer length.
+- The GPU view is RGBA16Float with width 32 (four head dimensions per texel);
+  R16Float and RG16Float views are allowed. A tile has at most 16,384 rows,
+  the texture dimension limit.
+- Decode-time KV produced by the GPU is written into the same tile format
+  (shader write), so one attention kernel family reads both.
+- Kernels reach tiles through an argument table of texture resource IDs
+  indexed by layer and chunk.
+- Open: token-major rows (`[kv_head][token][dim]`) versus channel-major rows
+  (K transposed, closer to the ANE's preferred internal layout); texture reads
+  versus an aliasing `MTLBuffer` view; int8 tiles (`OneComponent8`).
+
+## Budget estimates
+
+Estimates for the primary target on the 24 GB baseline, derived from public
+model configurations (Qwen3-30B-A3B: 30.5B parameters, 48 layers, 4 KV heads,
+head dim 128, 128 experts, top-8, expert intermediate size 768). Not measured.
+
+| Item | 3-bit weights | 4-bit weights |
+| --- | --- | --- |
+| Weights (MLX-style affine, group 64: about 3.5 / 4.5 bits per weight) | ≈ 12.4 GiB | ≈ 16.0 GiB |
+| KV cache, 32K tokens, fp16 (96 KiB per token) | 3.0 GiB | 3.0 GiB |
+| EAGLE-3 head (≈ 120M parameters, fp16) | ≈ 0.22 GiB | ≈ 0.22 GiB |
+| ANE attention-block weights for the hybrid prefill (≈ 0.9B parameters, 4-bit palettized) | ≈ 0.42 GiB | ≈ 0.42 GiB |
+| Activations and scratch | ≈ 0.5 GiB | ≈ 0.5 GiB |
+| Suffix automaton tables (32K tokens) | < 4 MiB | < 4 MiB |
+| **Total** | **≈ 16.5 GiB** | **≈ 20.1 GiB** |
+
+- The 3-bit plan fits under the default limits with about 7.5 GiB left for
+  macOS, so cold experts on NVMe are not needed for it.
+- The 4-bit plan exceeds the defaults. It needs raised limits (still leaving
+  ≥ 3 GiB of headroom) or moving the coldest experts to NVMe; a 4-bit expert
+  of this model is 2,654,208 B, exactly 162 pages of 16 KiB.
+
+## No swap
+
+Hot data never pages: wired regions cannot, and nothing on the hot path lives
+outside them. The benchmark harness (status row C9) records `vm_stat` swap-outs
+and `vm.swapusage` before and after each run and fails the run if either grows.
