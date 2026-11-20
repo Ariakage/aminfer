@@ -48,9 +48,9 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
 | W1 | `.amf` format: 16 KiB-aligned header, directory and blobs | Implemented | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
-| W2 | `.amf` writer in `tools/` | Confirmed | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
+| W2 | `.amf` writer in `tools/` | Implemented | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
 | W3 | `.amf` reader and startup validation in Zig | Implemented | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
-| W4 | Import MLX community quantized safetensors (affine, group 64) as the conversion source | Draft | M1 | [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
+| W4 | Import MLX community quantized safetensors (affine, group 64) as the conversion source | Implemented | M1 | [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
 | W5 | Native Zig tokenizer (Qwen BPE) | Draft | M2 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
 | W6 | Primary target Qwen3-30B-A3B (3-bit); secondary Qwen3-14B (4-bit, dense) | Draft | M2 | [memory.md](architecture/memory.md#budget-estimates) |
 | W7 | CoreML `.mlpackage` export for ANE graphs (draft model, attention blocks, expert predictor) | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |

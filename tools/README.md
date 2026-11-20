@@ -21,5 +21,6 @@ Capability status for each tool is tracked in
 cd tools
 uv sync
 uv run aminfer-tools --help
+uv run aminfer-tools pack-amf --input model.safetensors --output model.amf --model-id qwen3
 uv run python -m unittest discover -s tests
 ```

@@ -31,7 +31,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("export-coreml", text)
 
     def test_planned_subcommands_report_unimplemented(self) -> None:
-        for cmd in ("pack-amf", "expert-heat", "export-coreml"):
+        for cmd in ("expert-heat", "export-coreml"):
             err = io.StringIO()
             with redirect_stderr(err):
                 code = main([cmd])
