@@ -47,9 +47,9 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
-| W1 | `.amf` format: 16 KiB-aligned header, directory and blobs | Confirmed (layout Draft) | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
+| W1 | `.amf` format: 16 KiB-aligned header, directory and blobs | Implemented | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
 | W2 | `.amf` writer in `tools/` | Confirmed | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
-| W3 | `.amf` reader and startup validation in Zig | Confirmed | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
+| W3 | `.amf` reader and startup validation in Zig | Implemented | M1 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
 | W4 | Import MLX community quantized safetensors (affine, group 64) as the conversion source | Draft | M1 | [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
 | W5 | Native Zig tokenizer (Qwen BPE) | Draft | M2 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
 | W6 | Primary target Qwen3-30B-A3B (3-bit); secondary Qwen3-14B (4-bit, dense) | Draft | M2 | [memory.md](architecture/memory.md#budget-estimates) |
@@ -61,7 +61,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
 | G1 | Fused 3/4-bit dequantization GEMV / GEMM kernels | Confirmed | M1 | [overview.md](architecture/overview.md) |
-| G2 | Compile-time specialization (Zig `comptime`; Metal function constants on the GPU side) | Confirmed (GPU mechanism Draft) | M1 | [ADR-0014](decisions/0014-compile-time-specialization.md) |
+| G2 | Compile-time specialization (Zig `comptime`; Metal function constants on the GPU side) | Implemented (Zig comptime; GPU function constants Confirmed) | M1 | [ADR-0014](decisions/0014-compile-time-specialization.md) |
 | G3 | MoE gather / grouped GEMM with experts deduplicated across verified tokens | Confirmed | M2 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) |
 | G4 | Decode attention over KV tiles | Confirmed | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
 | G5 | Tree-attention verification with ancestor mask and accepted-path KV commit | Confirmed | M3 | [speculative-decoding.md](architecture/speculative-decoding.md) |

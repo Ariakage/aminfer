@@ -40,26 +40,35 @@ pub const ExpertSource = union(enum) {
 aminfer Model Format, accepted in
 [ADR-0006](../decisions/0006-amf-cold-experts-direct-io.md). Standard
 safetensors and GGUF headers and tensor layouts are not 16 KiB aligned, so
-they cannot be read straight into wired slots. Draft v0 layout:
+they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
 
-- Little-endian. Every section offset and length is a multiple of 16 KiB.
-- **Page 0** — header: magic, format version, model identifier, quantization
-  scheme, tensor count, directory offset and length, checksum algorithm.
-- **Directory** — fixed-size records: tensor kind, layer, expert index,
-  quantization bits, group size, shape, blob offset, blob length, checksum.
-- **Blobs** — each starts on a 16 KiB boundary and is zero-padded to a
-  16 KiB multiple. An expert blob holds its gate, up and down projections
-  (packed weights, scales, biases) contiguously, in exactly the layout the
-  Metal kernels read, so a slot is usable as soon as the read completes.
-- Written only by `tools/`; the Zig reader validates the header, directory
-  bounds and alignment at startup, never on the hot path.
-- Conversion source (Draft, status row W4): MLX community quantized
-  safetensors (affine, group size 64), which already exist for the target
-  models.
-- Open: one container for all weights (dense, hot and cold, residency decided
-  at load time) versus cold-expert packs only; checksum algorithm (CRC-32 IEEE,
-  available in both Zig `std` and Python's `zlib`, versus BLAKE2b); no
+- Little-endian, unified container (dense weights, hot experts, cold experts,
+  embeddings, norms, routers, LM head; residency decided by `TensorKind` at
+  load time). Every section offset and length is a multiple of 16 KiB; no
   compression in v0.
+- **Page 0** — 128-byte `Header` zero-padded to 16 KiB: magic
+  `"AMF0\x00\x00\x00\x00"`, version `1`, page size `16384`, checksum algorithm
+  `1` (CRC-32 IEEE / ISO-HDLC), tensor count, directory offset (`16384`),
+  directory length (16 KiB multiple), directory CRC-32, header CRC-32,
+  64-byte `model_id`.
+- **Directory** — `tensor_count` fixed 128-byte `TensorEntry` records,
+  zero-padded to a 16 KiB multiple: 48-byte name, `TensorKind`, `DType`
+  (`f16`, `f32`, `q4_affine`, `q3_affine`), bit-width, rank, group size (`64`),
+  layer and expert indices, blob CRC-32, 4-element shape, 16 KiB-aligned
+  `blob_offset` and `blob_bytes`, `data_bytes`, 64 B-aligned `params_offset`,
+  and `params_bytes`.
+- **Blobs** — each starts on a 16 KiB boundary and is zero-padded to a
+  16 KiB multiple. For quantized 2D matrices (`[N, K]`, `K % 64 == 0`), bytes
+  `[0..data_bytes)` hold MLX-compatible LSB-first packed weights (4-bit: 2
+  values/byte, 32 B/group; 3-bit: 8 values/3 bytes, 24 B/group), followed at
+  `params_offset` (64 B aligned) by interleaved `half2(scale, bias)` per group
+  (`w = q * scale + bias`). GPU kernels read this blob layout directly without
+  repacking.
+- Written offline by `tools/`; the Zig reader (`AmfFile.open`, `F_NOCACHE`)
+  validates header, directory CRC, alignment, bounds, non-overlapping blobs
+  and blob CRCs at startup, never on the hot path.
+- Conversion source (status row W4): MLX community quantized safetensors
+  (affine, group size 64; `bf16` scales/biases converted to `f16` on export).
 
 ## Cold-expert I/O path
 

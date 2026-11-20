@@ -6,6 +6,8 @@ pub const expert = @import("expert/source.zig");
 pub const page = @import("mem/page.zig");
 pub const budget = @import("mem/budget.zig");
 pub const arena = @import("mem/arena.zig");
+pub const quant = @import("quant/spec.zig");
+pub const amf = @import("format/amf.zig");
 pub const sysinfo = @import("platform/sysinfo.zig");
 
 test {
@@ -14,5 +16,7 @@ test {
     _ = page;
     _ = budget;
     _ = arena;
+    _ = quant;
+    _ = amf;
     _ = sysinfo;
 }
