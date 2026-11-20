@@ -11,7 +11,10 @@ const frameworks = [_][]const u8{ "Foundation", "Metal", "CoreML" };
 
 const objc_flags = [_][]const u8{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" };
 
-const kernel_sources = [_][]const u8{"src/kernels/smoke.metal"};
+const kernel_sources = [_][]const u8{
+    "src/kernels/smoke.metal",
+    "src/kernels/dequant_gemm.metal",
+};
 
 pub fn build(b: *std.Build) void {
     // Native CPU features (Apple M-series), deployment floor macOS 26.0.

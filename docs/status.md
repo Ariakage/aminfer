@@ -60,7 +60,7 @@ Milestones (M0–M5) are defined in [process.md](process.md#milestones).
 
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
-| G1 | Fused 3/4-bit dequantization GEMV / GEMM kernels | Confirmed | M1 | [overview.md](architecture/overview.md) |
+| G1 | Fused 3/4-bit dequantization GEMV / GEMM kernels | Implemented | M1 | [overview.md](architecture/overview.md) |
 | G2 | Compile-time specialization (Zig `comptime`; Metal function constants on the GPU side) | Implemented | M1 | [ADR-0014](decisions/0014-compile-time-specialization.md) |
 | G3 | MoE gather / grouped GEMM with experts deduplicated across verified tokens | Confirmed | M2 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) |
 | G4 | Decode attention over KV tiles | Confirmed | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |

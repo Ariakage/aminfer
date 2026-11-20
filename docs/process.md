@@ -61,7 +61,7 @@ Confirmed, or before an accepted design is tuned.
 - [x] Compile-time quantization spec (`G2` host) and `.amf` v0 reader/validator (W1, W3)
 - [x] Offline `.amf` v0 packer and MLX safetensors importer in `tools/` + round-trip validation (W2, W4)
 - [x] Metal 4 multi-frame hot path, command batching, residency set and specialized pipelines (F6, R2, G2 GPU)
-- [ ] Fused 3-bit and 4-bit dequantization GEMV / GEMM Metal kernels verified against CPU reference (G1, G2)
+- [x] Fused 3-bit and 4-bit dequantization GEMV / GEMM Metal kernels verified against CPU reference (G1, G2)
 - [ ] Benchmark harness with swap checks (`C9`), per-kernel bandwidth calibration and Spike S2 measurement
 
 ## Verification log
@@ -86,6 +86,7 @@ Only checks that actually ran are listed.
 | 2026-11-20 | W1, W3, G2 (host): `zig build`, `zig build test` (Debug, ReleaseSafe): 36/36 tests (incl. `F_NOCACHE` disk `.amf` load, CRC-32 & overlap rejection) | Pass |
 | 2026-11-20 | W2, W4: `cd tools && uv run python -m unittest discover -s tests`: 7/7 tests (incl. MLX safetensors → `pack-amf` → `zig-out/bin/aminfer verify-amf` cross-language round-trip) | Pass |
 | 2026-11-20 | F6 (hot path), R2, G2 (GPU): `zig build`, `zig build test` (Debug, ReleaseSafe): 37/37 tests; `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 37/37 tests | Pass |
+| 2026-11-20 | G1: `zig build`, `zig build test` (Debug, ReleaseSafe): 42/42 tests (3/4-bit GEMV & GEMM vs CPU fp32 reference + `.amf` → `WiredArena` → GPU round-trip); `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 42/42 tests | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).

@@ -8,6 +8,7 @@ pub const budget = @import("mem/budget.zig");
 pub const arena = @import("mem/arena.zig");
 pub const quant = @import("quant/spec.zig");
 pub const amf = @import("format/amf.zig");
+pub const dequant = @import("gpu/dequant.zig");
 pub const sysinfo = @import("platform/sysinfo.zig");
 
 test {
@@ -18,5 +19,6 @@ test {
     _ = arena;
     _ = quant;
     _ = amf;
+    _ = dequant;
     _ = sysinfo;
 }
