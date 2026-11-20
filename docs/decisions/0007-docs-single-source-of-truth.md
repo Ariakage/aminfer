@@ -13,17 +13,25 @@ many documents.
 ## Decision
 
 1. `docs/` is split by kind: `docs/architecture/` (architecture design),
-   `docs/decisions/` (ADRs) and `docs/guides/` (build and environment guides).
-   Nothing else goes in the `docs/` root except the two files below.
+   `docs/benchmarks/` (benchmark methodology, environment, summary metrics
+   and raw run records), `docs/decisions/` (ADRs) and `docs/guides/` (build
+   and environment guides). Nothing else goes in the `docs/` root except the
+   two files below.
 2. All project progress converges on `docs/process.md` — milestones, spikes,
    task lists, verification log and the session handoff snapshot.
 3. All implemented, unimplemented and planned capabilities converge on
    `docs/status.md`.
-4. Other documents link to those two files instead of restating status or
-   progress. ADR status values describe decisions, not capabilities.
+4. All measured performance metrics, benchmark methodology, run environments
+   and verbatim raw benchmark/telemetry records converge on
+   `docs/benchmarks/results.md`.
+5. Other documents link to those three files instead of restating status,
+   progress or raw benchmark results. ADR status values describe decisions,
+   not capabilities.
 
 ## Consequences
 
 - A change that alters a capability updates `docs/status.md` in the same
-  commit; a finished task updates `docs/process.md`.
+  commit; a finished task updates `docs/process.md`; a benchmark, calibration
+  or telemetry run records its full methodology, environment and raw outputs
+  in `docs/benchmarks/results.md`.
 - Architecture documents describe design only.

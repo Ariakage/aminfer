@@ -47,6 +47,7 @@ tools/               # uv-managed Python offline toolchain (never at runtime)
 docs/process.md      # the only progress record
 docs/status.md       # the only implemented / unimplemented / planned record
 docs/architecture/   # architecture design
+docs/benchmarks/     # benchmark methodology, environment, metrics and raw records
 docs/decisions/      # ADRs (technical decision records)
 docs/guides/         # build and environment guides
 ```
@@ -182,6 +183,8 @@ Hard rules from the project charter. Rationale and evidence live in
 - Categorize documents under `docs/` subdirectories; do not put everything in
   the `docs/` root:
   - `docs/architecture/` — architecture design;
+  - `docs/benchmarks/` — benchmark methodology, environment, summary metrics
+    and raw run records, converged in `docs/benchmarks/results.md`;
   - `docs/decisions/` — ADRs (technical decision records);
   - `docs/guides/` — build and environment guides.
 - Project progress is recorded only in `docs/process.md`; do not scatter it
@@ -189,6 +192,9 @@ Hard rules from the project charter. Rationale and evidence live in
 - Implemented capabilities, unimplemented capabilities and future plans are
   recorded only in `docs/status.md`; other documents link to it instead of
   restating status.
+- Measured performance metrics and raw benchmark records converge in
+  `docs/benchmarks/results.md`; other documents link to it instead of
+  duplicating raw run outputs.
 
 ## Delivery notes
 

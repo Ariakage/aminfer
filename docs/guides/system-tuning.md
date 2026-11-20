@@ -47,16 +47,27 @@ Risks: this leaves about 1.5 GiB to macOS and every other process. Close other
 applications first; expect stalls if the system needs more memory. Use it only
 for measured benchmark runs.
 
-Writing the `vm.*` wire limits has not yet been verified on the baseline (it
-requires `sudo`); record the outcome in [../process.md](../process.md) the
-first time it is done.
+Verified on 2026-11-20 on the Apple M4 24 GiB baseline (macOS 27.2, build
+`26B123`): setting `iogpu.wired_limit_mb=21504`,
+`vm.global_user_wire_limit=22548578304` and `vm.user_wire_limit=22548578304`
+all succeeded (exit code 0). A subsequent non-root `aminfer probe` immediately
+observed `MTLDevice.recommendedMaxWorkingSetSize` and `budget.wired_limit_mib`
+increase from `18,186 MiB` to `21,504 MiB` (binding limit switching to
+`physical_headroom`), while `maxBufferLength` remained `13,639 MiB`. Restoring
+in reverse order (`vm.user_wire_limit`, then `vm.global_user_wire_limit`, then
+`iogpu.wired_limit_mb=0`) also succeeded (exit code 0) and returned
+`aminfer probe` to the baseline defaults. Raise `vm.global_user_wire_limit`
+before `vm.user_wire_limit`, and lower `vm.user_wire_limit` before
+`vm.global_user_wire_limit`. Full verbatim output is recorded in
+[../benchmarks/results.md](../benchmarks/results.md#privileged-tunables-sysctl-verification)
+and logged in [../process.md](../process.md#verification-log).
 
 ### Reset
 
 ```sh
-sudo sysctl -w iogpu.wired_limit_mb=0
-sudo sysctl -w vm.global_user_wire_limit=19585050869
 sudo sysctl -w vm.user_wire_limit=19585050869
+sudo sysctl -w vm.global_user_wire_limit=19585050869
+sudo sysctl -w iogpu.wired_limit_mb=0
 ```
 
 Use the defaults recorded on your own machine; a reboot also restores them.

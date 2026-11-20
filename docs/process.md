@@ -66,29 +66,33 @@ Confirmed, or before an accepted design is tuned.
 
 ## M1 calibration and Spike S2 results
 
-Measured on 2026-11-20 on the Apple M4 24 GiB baseline (`just bench`,
-ReleaseFast, single 81 MiB `WiredArena` validated against the 18,186 MiB host
-budget, ≥ 64 MiB rotating weight pool streaming from unified DRAM,
-`swapouts_delta = 0`, `pageouts_delta = 0`):
+Canonical methodology, hardware/software environment, full summary tables,
+`sysctl` verification, `powermetrics` telemetry and verbatim raw run outputs
+live in [benchmarks/results.md](benchmarks/results.md).
+
+Measured on 2026-11-20 on the Apple M4 24 GiB baseline (`aminfer bench`,
+ReleaseFast at commit `16322279`, single 81 MiB `WiredArena` validated against
+the 18,186 MiB host budget, ≥ 64 MiB rotating weight pool streaming from
+unified DRAM, `swapouts_delta = 0`, `pageouts_delta = 0`):
 
 | Kernel | Shape (`M×N×K`) | Bytes/dispatch | Latency (us) | Effective `beta` (GB/s) | % of 120 GB/s bus |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `gemv_q4` | `1×2048×2048` | 2,367,488 | 29.34 | 80.70 | 67.3% |
-| `gemv_q4` | `1×6144×2048` | 7,094,272 | 72.10 | 98.40 | 82.0% |
-| `gemv_q4` | `1×2048×768` | 890,368 | 12.42 | 71.68 | 59.7% |
-| `gemv_q4` | `1×4096×4096` | 9,453,568 | 97.07 | 97.39 | 81.2% |
-| `gemv_q3` | `1×2048×2048` | 1,843,200 | 22.98 | 80.21 | 66.8% |
-| `gemv_q3` | `1×6144×2048` | 5,521,408 | 62.27 | 88.67 | 73.9% |
-| `gemv_q3` | `1×2048×768` | 693,760 | 11.08 | 62.59 | 52.2% |
-| `gemv_q3` | `1×4096×4096` | 7,356,416 | 80.41 | 91.49 | 76.2% |
-| `gemm_q4` | `16×2048×2048` | 2,490,368 | 102.90 | 24.20 | 20.2% |
-| `gemm_q4` | `16×4096×4096` | 9,699,328 | 391.94 | 24.75 | 20.6% |
-| `gemm_q4` | `64×2048×2048` | 2,883,584 | 200.90 | 14.35 | 12.0% |
-| `gemm_q4` | `64×4096×4096` | 10,485,760 | 802.19 | 13.07 | 10.9% |
-| `gemm_q3` | `16×2048×2048` | 1,966,080 | 103.61 | 18.98 | 15.8% |
-| `gemm_q3` | `16×4096×4096` | 7,602,176 | 400.62 | 18.98 | 15.8% |
-| `gemm_q3` | `64×2048×2048` | 2,359,296 | 203.82 | 11.58 | 9.6% |
-| `gemm_q3` | `64×4096×4096` | 8,388,608 | 817.41 | 10.26 | 8.6% |
+| `gemv_q4` | `1×2048×2048` | 2,367,488 | 29.38 | 80.58 | 67.2% |
+| `gemv_q4` | `1×6144×2048` | 7,094,272 | 90.86 | 78.08 | 65.1% |
+| `gemv_q4` | `1×2048×768` | 890,368 | 14.31 | 62.21 | 51.8% |
+| `gemv_q4` | `1×4096×4096` | 9,453,568 | 95.74 | 98.74 | 82.3% |
+| `gemv_q3` | `1×2048×2048` | 1,843,200 | 24.41 | 75.51 | 62.9% |
+| `gemv_q3` | `1×6144×2048` | 5,521,408 | 63.22 | 87.34 | 72.8% |
+| `gemv_q3` | `1×2048×768` | 693,760 | 11.04 | 62.83 | 52.4% |
+| `gemv_q3` | `1×4096×4096` | 7,356,416 | 86.89 | 84.67 | 70.6% |
+| `gemm_q4` | `16×2048×2048` | 2,490,368 | 105.82 | 23.54 | 19.6% |
+| `gemm_q4` | `16×4096×4096` | 9,699,328 | 401.20 | 24.18 | 20.1% |
+| `gemm_q4` | `64×2048×2048` | 2,883,584 | 210.40 | 13.71 | 11.4% |
+| `gemm_q4` | `64×4096×4096` | 10,485,760 | 812.83 | 12.90 | 10.8% |
+| `gemm_q3` | `16×2048×2048` | 1,966,080 | 103.55 | 18.99 | 15.8% |
+| `gemm_q3` | `16×4096×4096` | 7,602,176 | 403.27 | 18.85 | 15.7% |
+| `gemm_q3` | `64×2048×2048` | 2,359,296 | 209.73 | 11.25 | 9.4% |
+| `gemm_q3` | `64×4096×4096` | 8,388,608 | 828.26 | 10.13 | 8.4% |
 
 Spike S2 (1,000 steady-state rounds × 32 dispatches/round on a 2-frame Metal 4
 `Compute` ring with `insert_barrier_before` and uniform streaming, after
@@ -96,8 +100,8 @@ Spike S2 (1,000 steady-state rounds × 32 dispatches/round on a 2-frame Metal 4
 
 | Metric | Value |
 | --- | --- |
-| CPU encode time | 7.69 us/round (240.2 ns/dispatch) |
-| Full pipelined round time | 96.00 us/round |
+| CPU encode time | 7.78 us/round (243.3 ns/dispatch) |
+| Full pipelined round time | 98.23 us/round |
 | `malloc_zone_statistics` `blocks_in_use` delta | 0 |
 | `malloc_zone_statistics` `size_in_use` delta | 0 B |
 | `malloc_zone_statistics` `size_allocated` delta | 0 B |
@@ -127,6 +131,7 @@ Only checks that actually ran are listed.
 | 2026-11-20 | F6 (hot path), R2, G2 (GPU): `zig build`, `zig build test` (Debug, ReleaseSafe): 37/37 tests; `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 37/37 tests | Pass |
 | 2026-11-20 | G1: `zig build`, `zig build test` (Debug, ReleaseSafe): 42/42 tests (3/4-bit GEMV & GEMM vs CPU fp32 reference + `.amf` → `WiredArena` → GPU round-trip); `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 42/42 tests | Pass |
 | 2026-11-20 | C9, Spike S2, M1 final gate: `zig fmt --check`, zero `catch {}`, `zig build`, `zig build test` (Debug, ReleaseSafe): 50/50 tests; direct test binary with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 50/50 tests; `just bench` (`ReleaseFast` `aminfer bench`): 16 C9 shapes + 1,000-round S2 (0 steady-state malloc delta, 0 swapouts); `tools` unittest (7/7) | Pass |
+| 2026-11-20 | Privileged `sysctl` & `powermetrics` telemetry: `iogpu.wired_limit_mb=21504`, `vm.global_user_wire_limit=22548578304`, `vm.user_wire_limit=22548578304` (all rc=0) raised non-root `aminfer probe` `recommendedMaxWorkingSetSize` and `budget.wired_limit_mib` from `18186` to `21504 MiB` (`physical_headroom`); reverse-order restore verified back to `0` / `19585050869` / `18186 MiB`; `powermetrics --samplers cpu_power,gpu_power,ane_power -i 500 -n 6` during `aminfer bench` captured peak GPU `1470 MHz` (`1459 MHz` active avg, `70.98%` active, `1513 mW`), ANE `0 mW`, `0` swapouts; archived in [benchmarks/results.md](benchmarks/results.md) | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -161,4 +166,5 @@ Update this before the context window runs out or when handing off.
 - In flight: none (M1 complete; ready for M2)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
+  [benchmarks/results.md](benchmarks/results.md),
   [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md)

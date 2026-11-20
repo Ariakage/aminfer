@@ -46,6 +46,7 @@ the wired-memory limits: [docs/guides/system-tuning.md](docs/guides/system-tunin
 | Path | Contents |
 | --- | --- |
 | [docs/architecture/](docs/architecture/overview.md) | Architecture design |
+| [docs/benchmarks/](docs/benchmarks/results.md) | Benchmark methodology, metrics and raw telemetry |
 | [docs/decisions/](docs/decisions/README.md) | Decision records (ADRs) |
 | [docs/guides/](docs/guides/development-setup.md) | Build and environment guides |
 | [docs/status.md](docs/status.md) | Implemented, unimplemented and planned capabilities |
