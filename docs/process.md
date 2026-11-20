@@ -50,7 +50,7 @@ Confirmed, or before an accepted design is tuned.
       `.metallib` + tests, with `aminfer probe` for Metal and ANE facts (F1, F3)
 - [x] 16 KiB wired regions and sysctl probe, test first (F2, F9)
 - [x] `ExpertSource` tagged union, test first (F4)
-- [ ] Bridge: NoCopy buffer and Metal 4 smoke dispatch, test first (F5, F6)
+- [x] Bridge: NoCopy buffer and Metal 4 smoke dispatch, test first (F5, F6)
 - [ ] `tools/` uv scaffold (F7) and `justfile` (F8)
 - [ ] Verify Debug / ReleaseSafe / ReleaseFast; build the local ikat index
 
@@ -68,6 +68,7 @@ Only checks that actually ran are listed.
 | 2026-11-20 | F1: `zig build`; `zig build test` (Debug, ReleaseSafe): 3/3 tests; `aminfer probe` matches the throwaway probe; binary `minos 26.0` | Pass |
 | 2026-11-20 | F2, F9: `zig build test` (Debug, ReleaseSafe): 10/10 tests; `aminfer probe` sysctl output matches [hardware.md](architecture/hardware.md) | Pass |
 | 2026-11-20 | F4: `zig build test` (Debug, ReleaseSafe): 16/16 tests | Pass |
+| 2026-11-20 | F5, F6: `zig build`; `zig build test` (Debug, ReleaseSafe): 20/20 tests; direct test binary with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: 20/20 tests | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -89,7 +90,7 @@ Update this before the context window runs out or when handing off.
 
 - Last updated: 2026-11-20
 - Commits so far: `1ad0da8` AGENTS.md, `6d5053d` license, `3a573a5` docs baseline,
-  `0518ea8` build graph and probe, `06e8656` wired regions
-- In flight: NoCopy buffers and Metal 4 smoke dispatch (F5, F6)
+  `0518ea8` build graph and probe, `06e8656` wired regions, `e6c9221` ExpertSource
+- In flight: `tools/` uv scaffold and `justfile` (F7, F8)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md)
