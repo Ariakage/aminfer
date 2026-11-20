@@ -4,12 +4,15 @@
 // release them in the matching *_destroy function.
 
 #import <CoreML/CoreML.h>
+#import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #include "apple_bridge.h"
 
@@ -23,6 +26,22 @@ struct ami_library {
 
 struct ami_buffer {
     void *mtl_buffer; // id<MTLBuffer>, retained
+};
+
+struct ami_kv_tile {
+    CVPixelBufferRef pixel_buffer; // retained via CoreVideo
+    IOSurfaceRef surface;          // borrowed from pixel_buffer
+    void *mtl_rgba_texture;        // id<MTLTexture> (RGBA16Float), retained
+    void *mtl_r16_texture;         // id<MTLTexture> (R16Float), retained
+    ami_buffer *alias_buffer;      // optional zero-copy MTLBuffer, owned
+    void *base_addr;               // 16 KiB-aligned IOSurface base address
+    uint32_t row_f16;
+    uint32_t rows;
+    uint32_t bytes_per_row;
+    uint32_t is_mlocked;
+    uint64_t data_bytes;
+    uint64_t alloc_bytes;
+    uint64_t surface_alloc_size;
 };
 
 struct ami_pipeline {
@@ -64,6 +83,13 @@ static id<MTLLibrary> library_of(const ami_library *library) {
 
 static id<MTLBuffer> buffer_of(const ami_buffer *buffer) {
     return (__bridge id<MTLBuffer>)buffer->mtl_buffer;
+}
+
+static id<MTLTexture> tile_texture_of(const ami_kv_tile *tile, uint32_t view) {
+    if (view == AMI_TEX_VIEW_R16F) {
+        return (__bridge id<MTLTexture>)tile->mtl_r16_texture;
+    }
+    return (__bridge id<MTLTexture>)tile->mtl_rgba_texture;
 }
 
 static id<MTLComputePipelineState> pipeline_of(const ami_pipeline *pipeline) {
@@ -241,6 +267,253 @@ uint64_t ami_buffer_gpu_address(const ami_buffer *buffer) {
     return (uint64_t)buffer_of(buffer).gpuAddress;
 }
 
+ami_status ami_kv_tile_create(ami_device *device, uint32_t row_f16, uint32_t rows,
+                              uint32_t flags, ami_kv_tile **out_tile) {
+    if (out_tile == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_tile = NULL;
+    const uint32_t valid_flags = AMI_KV_TILE_FLAG_ALIAS_BUFFER | AMI_KV_TILE_FLAG_MLOCK;
+    if (device == NULL || row_f16 == 0 || rows == 0 ||
+        (row_f16 % AMI_KV_TILE_ROW_ALIGN_F16) != 0 ||
+        row_f16 > AMI_MAX_TEXTURE_DIM || rows > AMI_MAX_TEXTURE_DIM ||
+        (flags & ~valid_flags) != 0) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    const uint64_t bytes_per_row = (uint64_t)row_f16 * 2u;
+    const uint64_t data_bytes = bytes_per_row * (uint64_t)rows;
+    const uint64_t alloc_bytes =
+        ((data_bytes + AMI_PAGE_SIZE - 1u) / AMI_PAGE_SIZE) * AMI_PAGE_SIZE;
+
+    @autoreleasepool {
+        NSDictionary *surface_props = @{
+            (__bridge id)kIOSurfaceWidth: @(row_f16),
+            (__bridge id)kIOSurfaceHeight: @(rows),
+            (__bridge id)kIOSurfaceBytesPerElement: @2,
+            (__bridge id)kIOSurfaceBytesPerRow: @(bytes_per_row),
+            (__bridge id)kIOSurfaceAllocSize: @(alloc_bytes),
+            (__bridge id)kIOSurfacePixelFormat: @(kCVPixelFormatType_OneComponent16Half),
+        };
+        IOSurfaceRef created_surface = IOSurfaceCreate((__bridge CFDictionaryRef)surface_props);
+        if (created_surface == NULL) {
+            return AMI_ERR_TILE;
+        }
+
+        NSDictionary *pb_attrs = @{
+            (__bridge id)kCVPixelBufferMetalCompatibilityKey: @YES,
+        };
+        CVPixelBufferRef pixel_buffer = NULL;
+        CVReturn cv_ret = CVPixelBufferCreateWithIOSurface(
+            kCFAllocatorDefault,
+            created_surface,
+            (__bridge CFDictionaryRef)pb_attrs,
+            &pixel_buffer);
+        CFRelease(created_surface);
+        if (cv_ret != kCVReturnSuccess || pixel_buffer == NULL) {
+            return AMI_ERR_TILE;
+        }
+
+        IOSurfaceRef surface = CVPixelBufferGetIOSurface(pixel_buffer);
+        if (surface == NULL ||
+            CVPixelBufferGetPixelFormatType(pixel_buffer) != kCVPixelFormatType_OneComponent16Half) {
+            CVPixelBufferRelease(pixel_buffer);
+            return AMI_ERR_TILE;
+        }
+
+        const size_t actual_bpr = IOSurfaceGetBytesPerRow(surface);
+        const size_t surface_alloc = IOSurfaceGetAllocSize(surface);
+        void *base_addr = IOSurfaceGetBaseAddress(surface);
+        if (base_addr == NULL ||
+            ((uintptr_t)base_addr % AMI_PAGE_SIZE) != 0 ||
+            actual_bpr != bytes_per_row ||
+            (actual_bpr % 64u) != 0 ||
+            surface_alloc < alloc_bytes) {
+            CVPixelBufferRelease(pixel_buffer);
+            return AMI_ERR_TILE;
+        }
+
+        id<MTLDevice> mtl_device = device_of(device);
+
+        MTLTextureDescriptor *rgba_desc =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                               width:(NSUInteger)(row_f16 / 4u)
+                                                              height:(NSUInteger)rows
+                                                           mipmapped:NO];
+        rgba_desc.storageMode = MTLStorageModeShared;
+        rgba_desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        id<MTLTexture> rgba_tex = [mtl_device newTextureWithDescriptor:rgba_desc
+                                                             iosurface:surface
+                                                                 plane:0];
+        if (rgba_tex == nil) {
+            CVPixelBufferRelease(pixel_buffer);
+            return AMI_ERR_TILE;
+        }
+
+        MTLTextureDescriptor *r16_desc =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
+                                                               width:(NSUInteger)row_f16
+                                                              height:(NSUInteger)rows
+                                                           mipmapped:NO];
+        r16_desc.storageMode = MTLStorageModeShared;
+        r16_desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        id<MTLTexture> r16_tex = [mtl_device newTextureWithDescriptor:r16_desc
+                                                            iosurface:surface
+                                                                plane:0];
+        if (r16_tex == nil) {
+            CVPixelBufferRelease(pixel_buffer);
+            return AMI_ERR_TILE;
+        }
+
+        uint32_t is_mlocked = 0;
+        if ((flags & AMI_KV_TILE_FLAG_MLOCK) != 0) {
+            if (mlock(base_addr, (size_t)alloc_bytes) != 0) {
+                CVPixelBufferRelease(pixel_buffer);
+                return AMI_ERR_TILE;
+            }
+            is_mlocked = 1;
+        }
+
+        ami_buffer *alias_buffer = NULL;
+        if ((flags & AMI_KV_TILE_FLAG_ALIAS_BUFFER) != 0) {
+            ami_status st = ami_buffer_wrap(device, base_addr, (size_t)alloc_bytes, &alias_buffer);
+            if (st != AMI_OK) {
+                if (is_mlocked != 0) {
+                    munlock(base_addr, (size_t)alloc_bytes);
+                }
+                CVPixelBufferRelease(pixel_buffer);
+                return st;
+            }
+        }
+
+        ami_kv_tile *tile = calloc(1, sizeof *tile);
+        if (tile == NULL) {
+            if (alias_buffer != NULL) {
+                ami_buffer_destroy(alias_buffer);
+            }
+            if (is_mlocked != 0) {
+                munlock(base_addr, (size_t)alloc_bytes);
+            }
+            CVPixelBufferRelease(pixel_buffer);
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+
+        tile->pixel_buffer = pixel_buffer;
+        tile->surface = surface;
+        tile->mtl_rgba_texture = (__bridge_retained void *)rgba_tex;
+        tile->mtl_r16_texture = (__bridge_retained void *)r16_tex;
+        tile->alias_buffer = alias_buffer;
+        tile->base_addr = base_addr;
+        tile->row_f16 = row_f16;
+        tile->rows = rows;
+        tile->bytes_per_row = (uint32_t)actual_bpr;
+        tile->is_mlocked = is_mlocked;
+        tile->data_bytes = data_bytes;
+        tile->alloc_bytes = alloc_bytes;
+        tile->surface_alloc_size = (uint64_t)surface_alloc;
+        *out_tile = tile;
+    }
+    return AMI_OK;
+}
+
+void ami_kv_tile_destroy(ami_kv_tile *tile) {
+    if (tile == NULL) {
+        return;
+    }
+    if (tile->alias_buffer != NULL) {
+        ami_buffer_destroy(tile->alias_buffer);
+    }
+    if (tile->mtl_r16_texture != NULL) {
+        CFRelease(tile->mtl_r16_texture);
+    }
+    if (tile->mtl_rgba_texture != NULL) {
+        CFRelease(tile->mtl_rgba_texture);
+    }
+    if (tile->is_mlocked != 0 && tile->base_addr != NULL && tile->alloc_bytes > 0) {
+        munlock(tile->base_addr, (size_t)tile->alloc_bytes);
+    }
+    if (tile->pixel_buffer != NULL) {
+        CVPixelBufferRelease(tile->pixel_buffer);
+    }
+    free(tile);
+}
+
+ami_status ami_kv_tile_query(const ami_kv_tile *tile, ami_kv_tile_info *out_info) {
+    if (tile == NULL || out_info == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_info, 0, sizeof *out_info);
+    out_info->row_f16 = tile->row_f16;
+    out_info->rows = tile->rows;
+    out_info->bytes_per_row = tile->bytes_per_row;
+    out_info->has_alias_buffer = (tile->alias_buffer != NULL) ? 1u : 0u;
+    out_info->is_mlocked = tile->is_mlocked;
+    out_info->data_bytes = tile->data_bytes;
+    out_info->alloc_bytes = tile->alloc_bytes;
+    out_info->surface_alloc_size = tile->surface_alloc_size;
+    out_info->rgba_resource_id = ami_kv_tile_rgba_resource_id(tile);
+    out_info->r16_resource_id = ami_kv_tile_r16_resource_id(tile);
+    out_info->alias_gpu_address =
+        (tile->alias_buffer != NULL) ? ami_buffer_gpu_address(tile->alias_buffer) : 0u;
+    return AMI_OK;
+}
+
+uint64_t ami_kv_tile_rgba_resource_id(const ami_kv_tile *tile) {
+    if (tile == NULL || tile->mtl_rgba_texture == NULL) {
+        return 0;
+    }
+    return tile_texture_of(tile, AMI_TEX_VIEW_RGBA16F).gpuResourceID._impl;
+}
+
+uint64_t ami_kv_tile_r16_resource_id(const ami_kv_tile *tile) {
+    if (tile == NULL || tile->mtl_r16_texture == NULL) {
+        return 0;
+    }
+    return tile_texture_of(tile, AMI_TEX_VIEW_R16F).gpuResourceID._impl;
+}
+
+ami_buffer *ami_kv_tile_alias_buffer(const ami_kv_tile *tile) {
+    if (tile == NULL) {
+        return NULL;
+    }
+    return tile->alias_buffer;
+}
+
+ami_status ami_kv_tile_lock(ami_kv_tile *tile, uint32_t read_only,
+                            void **out_base_ptr, size_t *out_bytes_per_row,
+                            size_t *out_data_bytes) {
+    if (out_base_ptr != NULL) *out_base_ptr = NULL;
+    if (out_bytes_per_row != NULL) *out_bytes_per_row = 0;
+    if (out_data_bytes != NULL) *out_data_bytes = 0;
+    if (tile == NULL || out_base_ptr == NULL || out_bytes_per_row == NULL ||
+        out_data_bytes == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    CVPixelBufferLockFlags lock_flags = (read_only != 0) ? kCVPixelBufferLock_ReadOnly : 0;
+    CVReturn ret = CVPixelBufferLockBaseAddress(tile->pixel_buffer, lock_flags);
+    if (ret != kCVReturnSuccess) {
+        return AMI_ERR_TILE;
+    }
+    void *base = CVPixelBufferGetBaseAddress(tile->pixel_buffer);
+    if (base == NULL || ((uintptr_t)base % AMI_PAGE_SIZE) != 0) {
+        CVPixelBufferUnlockBaseAddress(tile->pixel_buffer, lock_flags);
+        return AMI_ERR_TILE;
+    }
+    *out_base_ptr = base;
+    *out_bytes_per_row = CVPixelBufferGetBytesPerRow(tile->pixel_buffer);
+    *out_data_bytes = (size_t)tile->data_bytes;
+    return AMI_OK;
+}
+
+ami_status ami_kv_tile_unlock(ami_kv_tile *tile, uint32_t read_only) {
+    if (tile == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    CVPixelBufferLockFlags lock_flags = (read_only != 0) ? kCVPixelBufferLock_ReadOnly : 0;
+    CVReturn ret = CVPixelBufferUnlockBaseAddress(tile->pixel_buffer, lock_flags);
+    return (ret == kCVReturnSuccess) ? AMI_OK : AMI_ERR_TILE;
+}
+
 ami_status ami_pipeline_create(ami_device *device, const ami_library *library,
                                const char *function_name, ami_pipeline **out_pipeline) {
     return ami_pipeline_create_specialized(device, library, function_name, NULL, 0, out_pipeline);
@@ -377,7 +650,7 @@ ami_status ami_compute_create_with_frames(ami_device *device, uint32_t frames_in
 
         NSError *error = nil;
         MTLResidencySetDescriptor *user_res_desc = [[MTLResidencySetDescriptor alloc] init];
-        user_res_desc.initialCapacity = AMI_MAX_BUFFER_BINDINGS;
+        user_res_desc.initialCapacity = 128;
         id<MTLResidencySet> user_res = [mtl_device newResidencySetWithDescriptor:user_res_desc
                                                                            error:&error];
         if (user_res == nil) {
@@ -423,6 +696,7 @@ ami_status ami_compute_create_with_frames(ami_device *device, uint32_t frames_in
 
             MTL4ArgumentTableDescriptor *table_desc = [[MTL4ArgumentTableDescriptor alloc] init];
             table_desc.maxBufferBindCount = AMI_MAX_BUFFER_BINDINGS;
+            table_desc.maxTextureBindCount = AMI_MAX_TEXTURE_BINDINGS;
             table_desc.initializeBindings = YES;
             id<MTL4ArgumentTable> arg_table = [mtl_device newArgumentTableWithDescriptor:table_desc
                                                                                    error:&error];
@@ -546,6 +820,63 @@ ami_status ami_compute_remove_resident(ami_compute *compute, ami_buffer *const *
     return AMI_OK;
 }
 
+ami_status ami_compute_make_tiles_resident(ami_compute *compute, ami_kv_tile *const *tiles,
+                                           size_t count) {
+    if (compute == NULL || (count > 0 && tiles == NULL)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (count == 0) {
+        return AMI_OK;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (tiles[i] == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    @autoreleasepool {
+        id<MTLResidencySet> user_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
+        for (size_t i = 0; i < count; i++) {
+            [user_res addAllocation:tile_texture_of(tiles[i], AMI_TEX_VIEW_RGBA16F)];
+            [user_res addAllocation:tile_texture_of(tiles[i], AMI_TEX_VIEW_R16F)];
+            if (tiles[i]->alias_buffer != NULL) {
+                [user_res addAllocation:buffer_of(tiles[i]->alias_buffer)];
+            }
+        }
+        [user_res commit];
+        [user_res requestResidency];
+    }
+    return AMI_OK;
+}
+
+ami_status ami_compute_remove_tiles_resident(ami_compute *compute, ami_kv_tile *const *tiles,
+                                             size_t count) {
+    if (compute == NULL || (count > 0 && tiles == NULL)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (count == 0) {
+        return AMI_OK;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (tiles[i] == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    @autoreleasepool {
+        id<MTLResidencySet> user_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
+        for (size_t i = 0; i < count; i++) {
+            [user_res removeAllocation:tile_texture_of(tiles[i], AMI_TEX_VIEW_RGBA16F)];
+            [user_res removeAllocation:tile_texture_of(tiles[i], AMI_TEX_VIEW_R16F)];
+            if (tiles[i]->alias_buffer != NULL) {
+                [user_res removeAllocation:buffer_of(tiles[i]->alias_buffer)];
+            }
+        }
+        [user_res commit];
+    }
+    return AMI_OK;
+}
+
 ami_status ami_compute_clear_residency(ami_compute *compute) {
     if (compute == NULL) {
         return AMI_ERR_INVALID_ARGUMENT;
@@ -626,10 +957,24 @@ ami_status ami_compute_encode_dispatch(ami_compute *compute, const ami_pipeline 
                                        uint64_t grid_x, uint64_t grid_y, uint64_t grid_z,
                                        uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
                                        uint32_t dispatch_mode, uint32_t insert_barrier_before) {
+    return ami_compute_encode_dispatch_ex(compute, pipeline, bindings, binding_count, NULL, 0,
+                                          uniform_bytes, uniform_len, grid_x, grid_y, grid_z,
+                                          tg_x, tg_y, tg_z, dispatch_mode, insert_barrier_before);
+}
+
+ami_status ami_compute_encode_dispatch_ex(ami_compute *compute, const ami_pipeline *pipeline,
+                                          const ami_buffer_binding *bindings, size_t binding_count,
+                                          const ami_texture_binding *textures, size_t texture_count,
+                                          const void *uniform_bytes, size_t uniform_len,
+                                          uint64_t grid_x, uint64_t grid_y, uint64_t grid_z,
+                                          uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
+                                          uint32_t dispatch_mode, uint32_t insert_barrier_before) {
     if (compute == NULL || compute->active_slot < 0 || compute->active_encoder == NULL ||
         pipeline == NULL || grid_x == 0 || grid_y == 0 || grid_z == 0 ||
         tg_x == 0 || tg_y == 0 || tg_z == 0 ||
         (binding_count > 0 && bindings == NULL) ||
+        (texture_count > 0 && textures == NULL) ||
+        texture_count > AMI_MAX_TEXTURE_BINDINGS ||
         (uniform_len > 0 && uniform_bytes == NULL) ||
         uniform_len > AMI_UNIFORM_STRIDE ||
         (dispatch_mode != AMI_DISPATCH_THREADS && dispatch_mode != AMI_DISPATCH_THREADGROUPS)) {
@@ -641,6 +986,12 @@ ami_status ami_compute_encode_dispatch(ami_compute *compute, const ami_pipeline 
     }
     for (size_t i = 0; i < binding_count; i++) {
         if (bindings[i].buffer == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    for (size_t i = 0; i < texture_count; i++) {
+        if (textures[i].tile == NULL ||
+            (textures[i].view != AMI_TEX_VIEW_RGBA16F && textures[i].view != AMI_TEX_VIEW_R16F)) {
             return AMI_ERR_INVALID_ARGUMENT;
         }
     }
@@ -673,6 +1024,11 @@ ami_status ami_compute_encode_dispatch(ami_compute *compute, const ami_pipeline 
             [arg_table setAddress:(slot->uniform_gpu + u_off)
                           atIndex:(NSUInteger)binding_count];
             compute->uniform_cursor++;
+        }
+
+        for (size_t i = 0; i < texture_count; i++) {
+            id<MTLTexture> tex = tile_texture_of(textures[i].tile, textures[i].view);
+            [arg_table setTexture:tex.gpuResourceID atIndex:(NSUInteger)i];
         }
 
         [encoder setComputePipelineState:state];

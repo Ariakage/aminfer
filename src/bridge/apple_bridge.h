@@ -17,9 +17,12 @@ extern "C" {
 
 #define AMI_PAGE_SIZE 16384u
 #define AMI_MAX_BUFFER_BINDINGS 16u
+#define AMI_MAX_TEXTURE_BINDINGS 16u
+#define AMI_MAX_TEXTURE_DIM 16384u
+#define AMI_KV_TILE_ROW_ALIGN_F16 32u
 #define AMI_MAX_FRAMES_IN_FLIGHT 4u
 #define AMI_UNIFORM_STRIDE 256u
-#define AMI_UNIFORM_SLOTS_PER_FRAME 256u
+#define AMI_UNIFORM_SLOTS_PER_FRAME 1024u
 
 typedef int32_t ami_status;
 
@@ -34,6 +37,18 @@ enum {
     AMI_ERR_COMPUTE = 7,
     AMI_ERR_TIMEOUT = 8,
     AMI_ERR_UNSUPPORTED = 9,
+    AMI_ERR_TILE = 10,
+};
+
+enum {
+    AMI_TEX_VIEW_RGBA16F = 0,
+    AMI_TEX_VIEW_R16F = 1,
+};
+
+enum {
+    AMI_KV_TILE_FLAG_NONE = 0u,
+    AMI_KV_TILE_FLAG_ALIAS_BUFFER = 1u << 0,
+    AMI_KV_TILE_FLAG_MLOCK = 1u << 1,
 };
 
 enum {
@@ -54,6 +69,13 @@ typedef struct ami_library ami_library;
 
 /* Owns one zero-copy id<MTLBuffer> wrapping caller-owned wired memory. */
 typedef struct ami_buffer ami_buffer;
+
+/*
+ * Owns one IOSurface-backed CVPixelBuffer (OneComponent16Half), zero-copy
+ * RGBA16Float and R16Float MTLTexture views, and an optional zero-copy
+ * MTLBuffer alias over the same 16 KiB-aligned pages (ADR-0004).
+ */
+typedef struct ami_kv_tile ami_kv_tile;
 
 /* Owns one id<MTLComputePipelineState>. */
 typedef struct ami_pipeline ami_pipeline;
@@ -83,6 +105,29 @@ typedef struct ami_buffer_binding {
     const ami_buffer *buffer;
     uint64_t offset;
 } ami_buffer_binding;
+
+/* Binding of a resident KvTile's zero-copy MTLTexture view at `[[texture(i)]]`. */
+typedef struct ami_texture_binding {
+    const ami_kv_tile *tile;
+    uint32_t view; /* AMI_TEX_VIEW_RGBA16F or AMI_TEX_VIEW_R16F */
+    uint32_t reserved;
+} ami_texture_binding;
+
+/* Metadata and GPU resource handles of an IOSurface-backed KV tile. */
+typedef struct ami_kv_tile_info {
+    uint32_t row_f16;            /* width in fp16 elements (multiple of 32) */
+    uint32_t rows;               /* height in rows (1..16384) */
+    uint32_t bytes_per_row;      /* verified multiple of 64 */
+    uint32_t has_alias_buffer;   /* 0 or 1 */
+    uint32_t is_mlocked;         /* 0 or 1 */
+    uint32_t reserved;
+    uint64_t data_bytes;         /* rows * bytes_per_row */
+    uint64_t alloc_bytes;        /* explicit 16 KiB-aligned allocation size */
+    uint64_t surface_alloc_size; /* raw IOSurfaceGetAllocSize(surface) */
+    uint64_t rgba_resource_id;   /* RGBA16Float MTLTexture.gpuResourceID._impl */
+    uint64_t r16_resource_id;    /* R16Float MTLTexture.gpuResourceID._impl */
+    uint64_t alias_gpu_address;  /* MTLBuffer.gpuAddress if alias created, else 0 */
+} ami_kv_tile_info;
 
 /* Opens the system default Metal device. */
 ami_status ami_device_create(ami_device **out_device);
@@ -114,6 +159,28 @@ void ami_buffer_destroy(ami_buffer *buffer);
 uint64_t ami_buffer_gpu_address(const ami_buffer *buffer);
 
 /*
+ * Creates an IOSurface-backed fp16 CVPixelBuffer (OneComponent16Half) with
+ * `row_f16` (multiple of 32, <= 16384) and `rows` (1..16384), explicit 16 KiB-
+ * aligned kIOSurfaceAllocSize, zero-copy RGBA16Float (width = row_f16 / 4) and
+ * R16Float (width = row_f16) MTLTexture views, and optional zero-copy MTLBuffer
+ * alias (AMI_KV_TILE_FLAG_ALIAS_BUFFER) or mlock (AMI_KV_TILE_FLAG_MLOCK).
+ */
+ami_status ami_kv_tile_create(ami_device *device, uint32_t row_f16, uint32_t rows,
+                              uint32_t flags, ami_kv_tile **out_tile);
+void ami_kv_tile_destroy(ami_kv_tile *tile);
+ami_status ami_kv_tile_query(const ami_kv_tile *tile, ami_kv_tile_info *out_info);
+uint64_t ami_kv_tile_rgba_resource_id(const ami_kv_tile *tile);
+uint64_t ami_kv_tile_r16_resource_id(const ami_kv_tile *tile);
+/* Borrowed handle owned by `tile`; NULL unless AMI_KV_TILE_FLAG_ALIAS_BUFFER was set. */
+ami_buffer *ami_kv_tile_alias_buffer(const ami_kv_tile *tile);
+
+/* CPU lock/unlock for test setup and inspection; never used on the GPU hot path. */
+ami_status ami_kv_tile_lock(ami_kv_tile *tile, uint32_t read_only,
+                            void **out_base_ptr, size_t *out_bytes_per_row,
+                            size_t *out_data_bytes);
+ami_status ami_kv_tile_unlock(ami_kv_tile *tile, uint32_t read_only);
+
+/*
  * Compiles a compute pipeline for `function_name` from `library` using the
  * Metal 4 compiler, optionally specializing with function constants (ADR-0014).
  * Startup only; never call on the hot path.
@@ -138,11 +205,15 @@ ami_status ami_compute_create_with_frames(ami_device *device, uint32_t frames_in
                                           ami_compute **out_compute);
 void ami_compute_destroy(ami_compute *compute);
 
-/* Manages caller buffers in the context's user residency set. */
+/* Manages caller buffers and KV tiles in the context's user residency set. */
 ami_status ami_compute_make_resident(ami_compute *compute, ami_buffer *const *buffers,
                                      size_t count);
 ami_status ami_compute_remove_resident(ami_compute *compute, ami_buffer *const *buffers,
                                        size_t count);
+ami_status ami_compute_make_tiles_resident(ami_compute *compute, ami_kv_tile *const *tiles,
+                                           size_t count);
+ami_status ami_compute_remove_tiles_resident(ami_compute *compute, ami_kv_tile *const *tiles,
+                                             size_t count);
 ami_status ami_compute_clear_residency(ami_compute *compute);
 
 /*
@@ -165,6 +236,18 @@ ami_status ami_compute_encode_dispatch(ami_compute *compute, const ami_pipeline 
                                        uint64_t grid_x, uint64_t grid_y, uint64_t grid_z,
                                        uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
                                        uint32_t dispatch_mode, uint32_t insert_barrier_before);
+
+/*
+ * Extended dispatch encoding that also binds `textures[0..texture_count)` to
+ * `[[texture(0..texture_count-1)]]` in the frame's Metal 4 argument table.
+ */
+ami_status ami_compute_encode_dispatch_ex(ami_compute *compute, const ami_pipeline *pipeline,
+                                          const ami_buffer_binding *bindings, size_t binding_count,
+                                          const ami_texture_binding *textures, size_t texture_count,
+                                          const void *uniform_bytes, size_t uniform_len,
+                                          uint64_t grid_x, uint64_t grid_y, uint64_t grid_z,
+                                          uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
+                                          uint32_t dispatch_mode, uint32_t insert_barrier_before);
 
 ami_status ami_compute_commit_frame(ami_compute *compute, uint64_t *out_signal);
 ami_status ami_compute_wait(ami_compute *compute, uint64_t signal, uint64_t timeout_ms);

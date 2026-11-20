@@ -6,14 +6,15 @@ const std = @import("std");
 /// Platform floor: macOS 26.0 on Apple Silicon (ADR-0011).
 const macos_floor: std.SemanticVersion = .{ .major = 26, .minor = 0, .patch = 0 };
 
-/// Apple frameworks the bridge may call (ADR-0001).
-const frameworks = [_][]const u8{ "Foundation", "Metal", "CoreML" };
+/// Apple frameworks the bridge may call (ADR-0001, ADR-0004).
+const frameworks = [_][]const u8{ "Foundation", "Metal", "CoreML", "IOSurface", "CoreVideo" };
 
 const objc_flags = [_][]const u8{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" };
 
 const kernel_sources = [_][]const u8{
     "src/kernels/smoke.metal",
     "src/kernels/dequant_gemm.metal",
+    "src/kernels/kv_attention.metal",
 };
 
 pub fn build(b: *std.Build) void {

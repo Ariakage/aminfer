@@ -10,8 +10,12 @@ const page = @import("../mem/page.zig");
 const embedded_metallib = @embedFile("aminfer_metallib");
 
 pub const MAX_BUFFER_BINDINGS: usize = c.AMI_MAX_BUFFER_BINDINGS;
+pub const MAX_TEXTURE_BINDINGS: usize = c.AMI_MAX_TEXTURE_BINDINGS;
+pub const MAX_TEXTURE_DIM: u32 = c.AMI_MAX_TEXTURE_DIM;
+pub const KV_TILE_ROW_ALIGN_F16: u32 = c.AMI_KV_TILE_ROW_ALIGN_F16;
 pub const MAX_FRAMES_IN_FLIGHT: u32 = c.AMI_MAX_FRAMES_IN_FLIGHT;
 pub const MAX_UNIFORM_BYTES: usize = c.AMI_UNIFORM_STRIDE;
+pub const UNIFORM_SLOTS_PER_FRAME: u32 = c.AMI_UNIFORM_SLOTS_PER_FRAME;
 
 pub const Error = error{
     InvalidArgument,
@@ -23,6 +27,7 @@ pub const Error = error{
     ComputeFailed,
     Timeout,
     Unsupported,
+    TileCreationFailed,
     /// The bridge returned a status this wrapper does not know.
     UnexpectedStatus,
     /// The bridge reported success but returned a null handle.
@@ -43,6 +48,7 @@ fn check(status: c.ami_status) Error!void {
         c.AMI_ERR_COMPUTE => error.ComputeFailed,
         c.AMI_ERR_TIMEOUT => error.Timeout,
         c.AMI_ERR_UNSUPPORTED => error.Unsupported,
+        c.AMI_ERR_TILE => error.TileCreationFailed,
         else => error.UnexpectedStatus,
     };
 }
@@ -142,6 +148,177 @@ pub const BufferBinding = struct {
     offset: u64 = 0,
 };
 
+/// Metal texture view format over an IOSurface-backed fp16 KV tile (ADR-0004).
+pub const TextureView = enum {
+    /// RGBA16Float view (`width = row_f16 / 4`, default for decode attention).
+    rgba16f,
+    /// R16Float view (`width = row_f16`, scalar fp16 view).
+    r16f,
+
+    fn toRaw(self: TextureView) u32 {
+        return switch (self) {
+            .rgba16f => c.AMI_TEX_VIEW_RGBA16F,
+            .r16f => c.AMI_TEX_VIEW_R16F,
+        };
+    }
+};
+
+/// Texture view binding for Metal 4 argument-table `[[texture(i)]]` slots.
+pub const TextureBinding = struct {
+    tile: KvTile,
+    view: TextureView = .rgba16f,
+};
+
+/// Optional features when creating an IOSurface-backed `KvTile`.
+pub const KvTileOptions = struct {
+    /// Also create a zero-copy `MTLBuffer` alias over the 16 KiB-aligned pages.
+    alias_buffer: bool = false,
+    /// Attempt to `mlock` the IOSurface mapped pages.
+    mlock: bool = false,
+};
+
+pub const KvTileInfo = struct {
+    raw: c.ami_kv_tile_info,
+
+    pub fn rowF16(self: KvTileInfo) u32 {
+        return self.raw.row_f16;
+    }
+    pub fn rows(self: KvTileInfo) u32 {
+        return self.raw.rows;
+    }
+    pub fn bytesPerRow(self: KvTileInfo) u32 {
+        return self.raw.bytes_per_row;
+    }
+    pub fn hasAliasBuffer(self: KvTileInfo) bool {
+        return self.raw.has_alias_buffer != 0;
+    }
+    pub fn isMlocked(self: KvTileInfo) bool {
+        return self.raw.is_mlocked != 0;
+    }
+    pub fn dataBytes(self: KvTileInfo) u64 {
+        return self.raw.data_bytes;
+    }
+    pub fn allocBytes(self: KvTileInfo) u64 {
+        return self.raw.alloc_bytes;
+    }
+    pub fn surfaceAllocSize(self: KvTileInfo) u64 {
+        return self.raw.surface_alloc_size;
+    }
+    pub fn rgbaResourceId(self: KvTileInfo) u64 {
+        return self.raw.rgba_resource_id;
+    }
+    pub fn r16ResourceId(self: KvTileInfo) u64 {
+        return self.raw.r16_resource_id;
+    }
+    pub fn aliasGpuAddress(self: KvTileInfo) u64 {
+        return self.raw.alias_gpu_address;
+    }
+};
+
+/// IOSurface-backed fp16 KV cache tile shared zero-copy across CoreML/ANE
+/// (`CVPixelBuffer` `OneComponent16Half`), Metal `RGBA16Float` / `R16Float`
+/// textures, and an optional zero-copy `MTLBuffer` alias (ADR-0004).
+pub const KvTile = struct {
+    handle: *c.ami_kv_tile,
+
+    /// Scoped CPU lock over the tile's IOSurface pages (tests/inspection only).
+    pub const LockGuard = struct {
+        tile: KvTile,
+        read_only: bool,
+        locked: bool,
+        bytes: []align(page.APPLE_PAGE_SIZE) u8,
+        bytes_per_row: usize,
+
+        pub fn f16Slice(self: LockGuard) []f16 {
+            return @alignCast(std.mem.bytesAsSlice(f16, self.bytes));
+        }
+
+        pub fn unlock(self: *LockGuard) Error!void {
+            if (!self.locked) return error.InvalidArgument;
+            self.locked = false;
+            try check(c.ami_kv_tile_unlock(self.tile.handle, if (self.read_only) 1 else 0));
+        }
+
+        /// Safe cleanup for `errdefer` when an error occurs before `unlock`.
+        pub fn release(self: *LockGuard) void {
+            if (!self.locked) return;
+            self.locked = false;
+            const st = c.ami_kv_tile_unlock(self.tile.handle, if (self.read_only) 1 else 0);
+            std.debug.assert(st == c.AMI_OK);
+        }
+    };
+
+    pub fn init(device: Device, row_f16: u32, rows: u32, options: KvTileOptions) Error!KvTile {
+        if (row_f16 == 0 or rows == 0 or
+            (row_f16 % KV_TILE_ROW_ALIGN_F16) != 0 or
+            row_f16 > MAX_TEXTURE_DIM or
+            rows > MAX_TEXTURE_DIM)
+        {
+            return error.InvalidArgument;
+        }
+        var flags: u32 = c.AMI_KV_TILE_FLAG_NONE;
+        if (options.alias_buffer) flags |= c.AMI_KV_TILE_FLAG_ALIAS_BUFFER;
+        if (options.mlock) flags |= c.AMI_KV_TILE_FLAG_MLOCK;
+
+        var handle: ?*c.ami_kv_tile = null;
+        try check(c.ami_kv_tile_create(device.handle, row_f16, rows, flags, &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    pub fn close(self: KvTile) void {
+        c.ami_kv_tile_destroy(self.handle);
+    }
+
+    pub fn info(self: KvTile) Error!KvTileInfo {
+        var raw: c.ami_kv_tile_info = undefined;
+        try check(c.ami_kv_tile_query(self.handle, &raw));
+        return .{ .raw = raw };
+    }
+
+    pub fn rgbaResourceId(self: KvTile) u64 {
+        return c.ami_kv_tile_rgba_resource_id(self.handle);
+    }
+
+    pub fn r16ResourceId(self: KvTile) u64 {
+        return c.ami_kv_tile_r16_resource_id(self.handle);
+    }
+
+    /// Returns a borrowed `Buffer` view over the IOSurface allocation when
+    /// created with `options.alias_buffer = true`. Do not call `close()` on it;
+    /// the owning `KvTile` releases it on `KvTile.close()`.
+    pub fn aliasBuffer(self: KvTile) ?Buffer {
+        const ptr = c.ami_kv_tile_alias_buffer(self.handle) orelse return null;
+        return .{ .handle = ptr };
+    }
+
+    /// Locks the IOSurface for CPU access (test initialization and verification).
+    pub fn lock(self: KvTile, read_only: bool) Error!LockGuard {
+        var base_ptr: ?*anyopaque = null;
+        var bpr: usize = 0;
+        var data_bytes: usize = 0;
+        try check(c.ami_kv_tile_lock(
+            self.handle,
+            if (read_only) 1 else 0,
+            &base_ptr,
+            &bpr,
+            &data_bytes,
+        ));
+        const raw_ptr = base_ptr orelse return error.NullHandle;
+        if (!std.mem.isAligned(@intFromPtr(raw_ptr), page.APPLE_PAGE_SIZE)) {
+            _ = c.ami_kv_tile_unlock(self.handle, if (read_only) 1 else 0);
+            return error.TileCreationFailed;
+        }
+        const aligned_ptr: [*]align(page.APPLE_PAGE_SIZE) u8 = @ptrCast(@alignCast(raw_ptr));
+        return .{
+            .tile = self,
+            .read_only = read_only,
+            .locked = true,
+            .bytes = aligned_ptr[0..data_bytes],
+            .bytes_per_row = bpr,
+        };
+    }
+};
+
 /// Startup Metal function-constant value for compile-time GPU specialization (ADR-0014).
 pub const FnConstant = struct {
     index: u32,
@@ -216,7 +393,7 @@ pub const Compute = struct {
             threadgroup: [3]u64,
             insert_barrier_before: bool,
         ) Error!void {
-            return self.encode(pipeline, bindings, uniform_bytes, grid, threadgroup, c.AMI_DISPATCH_THREADS, insert_barrier_before);
+            return self.encodeEx(pipeline, bindings, &.{}, uniform_bytes, grid, threadgroup, c.AMI_DISPATCH_THREADS, insert_barrier_before);
         }
 
         /// Encodes a dispatch whose grid is specified in threadgroups.
@@ -229,13 +406,42 @@ pub const Compute = struct {
             threadgroup: [3]u64,
             insert_barrier_before: bool,
         ) Error!void {
-            return self.encode(pipeline, bindings, uniform_bytes, grid_groups, threadgroup, c.AMI_DISPATCH_THREADGROUPS, insert_barrier_before);
+            return self.encodeEx(pipeline, bindings, &.{}, uniform_bytes, grid_groups, threadgroup, c.AMI_DISPATCH_THREADGROUPS, insert_barrier_before);
         }
 
-        fn encode(
+        /// Encodes a threads-grid dispatch with explicit texture bindings.
+        pub fn encodeThreadsWithTextures(
             self: *Frame,
             pipeline: Pipeline,
             bindings: []const BufferBinding,
+            textures: []const TextureBinding,
+            uniform_bytes: ?[]const u8,
+            grid: [3]u64,
+            threadgroup: [3]u64,
+            insert_barrier_before: bool,
+        ) Error!void {
+            return self.encodeEx(pipeline, bindings, textures, uniform_bytes, grid, threadgroup, c.AMI_DISPATCH_THREADS, insert_barrier_before);
+        }
+
+        /// Encodes a threadgroups-grid dispatch with explicit texture bindings.
+        pub fn encodeThreadgroupsWithTextures(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            textures: []const TextureBinding,
+            uniform_bytes: ?[]const u8,
+            grid_groups: [3]u64,
+            threadgroup: [3]u64,
+            insert_barrier_before: bool,
+        ) Error!void {
+            return self.encodeEx(pipeline, bindings, textures, uniform_bytes, grid_groups, threadgroup, c.AMI_DISPATCH_THREADGROUPS, insert_barrier_before);
+        }
+
+        fn encodeEx(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            textures: []const TextureBinding,
             uniform_bytes: ?[]const u8,
             grid: [3]u64,
             threadgroup: [3]u64,
@@ -243,19 +449,28 @@ pub const Compute = struct {
             insert_barrier_before: bool,
         ) Error!void {
             if (!self.open) return error.InvalidArgument;
-            if (bindings.len > MAX_BUFFER_BINDINGS) return error.InvalidArgument;
-            var raw: [MAX_BUFFER_BINDINGS]c.ami_buffer_binding = undefined;
-            for (bindings, 0..) |b, i| {
-                raw[i] = .{ .buffer = b.buffer.handle, .offset = b.offset };
+            if (bindings.len > MAX_BUFFER_BINDINGS or textures.len > MAX_TEXTURE_BINDINGS) {
+                return error.InvalidArgument;
             }
-            const b_ptr: ?[*]const c.ami_buffer_binding = if (bindings.len > 0) &raw else null;
+            var raw_bufs: [MAX_BUFFER_BINDINGS]c.ami_buffer_binding = undefined;
+            for (bindings, 0..) |b, i| {
+                raw_bufs[i] = .{ .buffer = b.buffer.handle, .offset = b.offset };
+            }
+            var raw_texs: [MAX_TEXTURE_BINDINGS]c.ami_texture_binding = undefined;
+            for (textures, 0..) |t, i| {
+                raw_texs[i] = .{ .tile = t.tile.handle, .view = t.view.toRaw(), .reserved = 0 };
+            }
+            const b_ptr: ?[*]const c.ami_buffer_binding = if (bindings.len > 0) &raw_bufs else null;
+            const t_ptr: ?[*]const c.ami_texture_binding = if (textures.len > 0) &raw_texs else null;
             const u_ptr: ?*const anyopaque = if (uniform_bytes) |u| u.ptr else null;
             const u_len: usize = if (uniform_bytes) |u| u.len else 0;
-            try check(c.ami_compute_encode_dispatch(
+            try check(c.ami_compute_encode_dispatch_ex(
                 self.compute.handle,
                 pipeline.handle,
                 b_ptr,
                 bindings.len,
+                t_ptr,
+                textures.len,
                 u_ptr,
                 u_len,
                 grid[0],
@@ -327,6 +542,37 @@ pub const Compute = struct {
                 handles[i] = buf.handle;
             }
             try check(c.ami_compute_remove_resident(self.handle, &handles, count));
+            offset += count;
+        }
+    }
+
+    /// Adds KV tiles' zero-copy textures (and alias buffers if present) to the
+    /// user residency set and commits residency. Zero heap allocation.
+    pub fn makeTilesResident(self: Compute, tiles: []const KvTile) Error!void {
+        const batch_cap = 64;
+        var offset: usize = 0;
+        while (offset < tiles.len) {
+            const count = @min(batch_cap, tiles.len - offset);
+            var handles: [batch_cap]?*c.ami_kv_tile = undefined;
+            for (tiles[offset .. offset + count], 0..) |tile, i| {
+                handles[i] = tile.handle;
+            }
+            try check(c.ami_compute_make_tiles_resident(self.handle, &handles, count));
+            offset += count;
+        }
+    }
+
+    /// Removes KV tiles' allocations from the user residency set and commits.
+    pub fn removeTilesResident(self: Compute, tiles: []const KvTile) Error!void {
+        const batch_cap = 64;
+        var offset: usize = 0;
+        while (offset < tiles.len) {
+            const count = @min(batch_cap, tiles.len - offset);
+            var handles: [batch_cap]?*c.ami_kv_tile = undefined;
+            for (tiles[offset .. offset + count], 0..) |tile, i| {
+                handles[i] = tile.handle;
+            }
+            try check(c.ami_compute_remove_tiles_resident(self.handle, &handles, count));
             offset += count;
         }
     }
@@ -533,4 +779,199 @@ test "specialized pipeline, intra-encoder barrier, uniforms and multi-frame ring
     }
 
     try compute.removeResident(&.{buffer});
+}
+
+test "KvTile enforces 16 KiB alignment, 64-byte row stride, and dimension limits" {
+    const device = try Device.open();
+    defer device.close();
+
+    // Invalid geometries rejected at the bridge boundary.
+    try std.testing.expectError(error.InvalidArgument, KvTile.init(device, 0, 64, .{}));
+    try std.testing.expectError(error.InvalidArgument, KvTile.init(device, 16, 64, .{}));
+    try std.testing.expectError(error.InvalidArgument, KvTile.init(device, 128, 0, .{}));
+    try std.testing.expectError(error.InvalidArgument, KvTile.init(device, 128, MAX_TEXTURE_DIM + 1, .{}));
+    try std.testing.expectError(error.InvalidArgument, KvTile.init(device, MAX_TEXTURE_DIM + 32, 8, .{}));
+
+    // Qwen3-30B-A3B KV chunk tile: 4 KV heads * 512 tokens = 2048 rows, 128 fp16/row = 512 KiB.
+    const tile = try KvTile.init(device, 128, 2048, .{ .alias_buffer = true });
+    defer tile.close();
+
+    const meta = try tile.info();
+    try std.testing.expectEqual(@as(u32, 128), meta.rowF16());
+    try std.testing.expectEqual(@as(u32, 2048), meta.rows());
+    try std.testing.expectEqual(@as(u32, 256), meta.bytesPerRow());
+    try std.testing.expectEqual(@as(u32, 0), meta.bytesPerRow() % 64);
+    try std.testing.expectEqual(@as(u64, 512 * 1024), meta.dataBytes());
+    try std.testing.expectEqual(@as(u64, 512 * 1024), meta.allocBytes());
+    try std.testing.expectEqual(@as(u64, 0), meta.allocBytes() % page.APPLE_PAGE_SIZE);
+    try std.testing.expect(meta.surfaceAllocSize() >= meta.allocBytes());
+    try std.testing.expect(meta.rgbaResourceId() != 0);
+    try std.testing.expect(meta.r16ResourceId() != 0);
+    try std.testing.expect(meta.rgbaResourceId() != meta.r16ResourceId());
+    try std.testing.expectEqual(meta.rgbaResourceId(), tile.rgbaResourceId());
+    try std.testing.expectEqual(meta.r16ResourceId(), tile.r16ResourceId());
+    try std.testing.expect(meta.hasAliasBuffer());
+    try std.testing.expect(meta.aliasGpuAddress() != 0);
+
+    // Non-page-multiple data size still rounds alloc_bytes up to 16 KiB.
+    const small = try KvTile.init(device, 32, 10, .{});
+    defer small.close();
+    const small_meta = try small.info();
+    try std.testing.expectEqual(@as(u64, 640), small_meta.dataBytes());
+    try std.testing.expectEqual(@as(u64, page.APPLE_PAGE_SIZE), small_meta.allocBytes());
+    try std.testing.expect(!small_meta.hasAliasBuffer());
+    try std.testing.expectEqual(@as(?Buffer, null), small.aliasBuffer());
+}
+
+test "KvTile CPU lock and alias MTLBuffer share physical pages zero-copy with GPU" {
+    const device = try Device.open();
+    defer device.close();
+    const library = try Library.openEmbedded(device);
+    defer library.close();
+    const iota_pipe = try Pipeline.init(device, library, "ami_smoke_iota");
+    defer iota_pipe.close();
+
+    // 128 fp16 * 64 rows = 16 KiB (4096 u32 words).
+    const tile = try KvTile.init(device, 128, 64, .{ .alias_buffer = true });
+    defer tile.close();
+    const alias = tile.aliasBuffer() orelse return error.TestUnexpectedResult;
+
+    {
+        var guard = try tile.lock(false);
+        errdefer guard.release();
+        try std.testing.expect(std.mem.isAligned(@intFromPtr(guard.bytes.ptr), page.APPLE_PAGE_SIZE));
+        try std.testing.expectEqual(@as(usize, 256), guard.bytes_per_row);
+        @memset(guard.bytes, 0);
+        try guard.unlock();
+    }
+
+    var compute = try Compute.init(device);
+    defer compute.close();
+    try compute.makeTilesResident(&.{tile});
+
+    const threads: u64 = 4096;
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+    try frame.encodeThreads(
+        iota_pipe,
+        &.{.{ .buffer = alias, .offset = 0 }},
+        null,
+        .{ threads, 1, 1 },
+        .{ 256, 1, 1 },
+        false,
+    );
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+
+    {
+        var guard = try tile.lock(true);
+        errdefer guard.release();
+        const words: []const u32 = @ptrCast(guard.bytes);
+        for (words, 0..) |word, i| {
+            try std.testing.expectEqual(@as(u32, @intCast(i)) ^ 0xA5A5A5A5, word);
+        }
+        try guard.unlock();
+    }
+
+    try compute.removeTilesResident(&.{tile});
+}
+
+test "KvTile texture binding via MTL4ArgumentTable writes RGBA16Float zero-copy to IOSurface" {
+    const device = try Device.open();
+    defer device.close();
+    const library = try Library.openEmbedded(device);
+    defer library.close();
+    const pipe = try Pipeline.init(device, library, "ami_qknorm_rope_kv_write");
+    defer pipe.close();
+
+    const Params = extern struct {
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        pos: u32,
+        chunk_tokens: u32,
+        slot_in_chunk: u32,
+        rms_eps: f32,
+        rope_theta: f32,
+        apply_qk_norm: u32,
+        _pad0: u32 = 0,
+        _pad1: u32 = 0,
+        _pad2: u32 = 0,
+    };
+
+    const head_dim: u32 = 64;
+    const chunk_tokens: u32 = 32;
+    const slot: u32 = 5;
+
+    const region = try page.WiredRegion.init(page.APPLE_PAGE_SIZE);
+    defer region.deinit();
+    const vals: []f16 = @alignCast(std.mem.bytesAsSlice(f16, region.bytes));
+    @memset(vals, @floatCast(0.0));
+    // Q [0..64), K [64..128), V [128..192)
+    for (0..head_dim) |d| {
+        vals[d] = @floatCast(@as(f32, @floatFromInt(d + 1)) * 0.25);
+        vals[head_dim + d] = @floatCast(@as(f32, @floatFromInt(d + 1)) * 0.5);
+        vals[2 * head_dim + d] = @floatCast(@as(f32, @floatFromInt(d + 1)) * -0.125);
+    }
+
+    const gpu_buf = try Buffer.wrap(device, region.bytes);
+    defer gpu_buf.close();
+    const k_tile = try KvTile.init(device, head_dim, chunk_tokens, .{});
+    defer k_tile.close();
+    const v_tile = try KvTile.init(device, head_dim, chunk_tokens, .{});
+    defer v_tile.close();
+
+    var compute = try Compute.init(device);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    try compute.makeTilesResident(&.{ k_tile, v_tile });
+
+    // pos = 0, apply_qk_norm = 0 => RoPE is identity so K and V copy directly into row `slot`.
+    const params: Params = .{
+        .num_q_heads = 1,
+        .num_kv_heads = 1,
+        .head_dim = head_dim,
+        .pos = 0,
+        .chunk_tokens = chunk_tokens,
+        .slot_in_chunk = slot,
+        .rms_eps = 1e-6,
+        .rope_theta = 1_000_000.0,
+        .apply_qk_norm = 0,
+    };
+    const q_bind = BufferBinding{ .buffer = gpu_buf, .offset = 0 };
+    const k_bind = BufferBinding{ .buffer = gpu_buf, .offset = head_dim * @sizeOf(f16) };
+    const v_bind = BufferBinding{ .buffer = gpu_buf, .offset = 2 * head_dim * @sizeOf(f16) };
+
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+    try frame.encodeThreadgroupsWithTextures(
+        pipe,
+        &.{ q_bind, k_bind, v_bind, q_bind, q_bind },
+        &.{
+            .{ .tile = k_tile, .view = .rgba16f },
+            .{ .tile = v_tile, .view = .rgba16f },
+        },
+        std.mem.asBytes(&params),
+        .{ 2, 1, 1 },
+        .{ 32, 1, 1 },
+        false,
+    );
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+
+    var kg = try k_tile.lock(true);
+    errdefer kg.release();
+    var vg = try v_tile.lock(true);
+    errdefer vg.release();
+    const k_row = kg.f16Slice()[slot * head_dim .. (slot + 1) * head_dim];
+    const v_row = vg.f16Slice()[slot * head_dim .. (slot + 1) * head_dim];
+    for (0..head_dim) |d| {
+        try std.testing.expectEqual(vals[head_dim + d], k_row[d]);
+        try std.testing.expectEqual(vals[2 * head_dim + d], v_row[d]);
+    }
+    try vg.unlock();
+    try kg.unlock();
+
+    try compute.removeTilesResident(&.{ k_tile, v_tile });
+    try compute.removeResident(&.{gpu_buf});
 }
