@@ -15,6 +15,7 @@ const kernel_sources = [_][]const u8{
     "src/kernels/smoke.metal",
     "src/kernels/dequant_gemm.metal",
     "src/kernels/kv_attention.metal",
+    "src/kernels/moe_ffn.metal",
 };
 
 pub fn build(b: *std.Build) void {
