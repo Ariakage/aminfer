@@ -302,3 +302,261 @@ kernel void ami_dequant_gemm(const device half *x [[buffer(0)]],
         }
     }
 }
+
+// ===========================================================================
+// Native unquantized FP16 / BF16 dense GEMV and GEMM (G12, ADR-0016).
+//
+// Specialized at startup on DENSE_W_BF16 (false: `half` weights, true:
+// `bfloat` weights). Activations are always `half` and outputs `half`; every
+// dot product and matrix multiply-accumulate accumulates in FP32.
+// ===========================================================================
+
+constant bool DENSE_W_BF16 [[function_constant(2)]];
+
+struct DenseParams {
+    uint m;
+    uint n;
+    uint k;
+    uint _pad;
+};
+
+static inline float4 dense_load_w4(const device uchar *w, ulong elem) {
+    if (DENSE_W_BF16) {
+        return float4(*(const device bfloat4 *)(w + elem * 2ul));
+    }
+    return float4(*(const device half4 *)(w + elem * 2ul));
+}
+
+static inline float dense_load_w1(const device uchar *w, ulong elem) {
+    if (DENSE_W_BF16) {
+        return float(*(const device bfloat *)(w + elem * 2ul));
+    }
+    return float(*(const device half *)(w + elem * 2ul));
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 3: Dense GEMV (M = 1 decode hot path, projections and lm_head)
+//
+// Geometry: 4 simdgroups/threadgroup (128 threads), 4 output rows/simdgroup
+// (16 rows/threadgroup). With K % 4 == 0 every lane issues coalesced 8-byte
+// `half4` / `bfloat4` loads (two independent loads per step, 256 elements per
+// simdgroup step) and reuses each X vector across 4 rows; otherwise a scalar
+// strided path handles arbitrary K.
+// ---------------------------------------------------------------------------
+kernel void ami_dense_gemv(const device half *x [[buffer(0)]],
+                           const device uchar *w [[buffer(1)]],
+                           device half *y [[buffer(2)]],
+                           constant DenseParams &p [[buffer(3)]],
+                           uint tg_id [[threadgroup_position_in_grid]],
+                           uint sg_id [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint ROWS_PER_SG = 4u;
+    const uint row0 = tg_id * 16u + sg_id * ROWS_PER_SG;
+    if (row0 >= p.n) {
+        return;
+    }
+
+    // Clamp out-of-range rows onto the last valid row so loads stay in bounds
+    // without divergent branches; their results are never stored.
+    ulong row_base[ROWS_PER_SG];
+    for (uint r = 0u; r < ROWS_PER_SG; r++) {
+        row_base[r] = ulong(min(row0 + r, p.n - 1u)) * p.k;
+    }
+    float acc[ROWS_PER_SG] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if ((p.k & 3u) == 0u) {
+        const uint vec_k = p.k >> 2;
+        const device half4 *x4 = (const device half4 *)x;
+        uint i = lane;
+        for (; i + 32u < vec_k; i += 64u) {
+            const float4 xa = float4(x4[i]);
+            const float4 xb = float4(x4[i + 32u]);
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const float4 wa = dense_load_w4(w, row_base[r] + ulong(i) * 4ul);
+                const float4 wb = dense_load_w4(w, row_base[r] + ulong(i + 32u) * 4ul);
+                acc[r] = fma(xa.x, wa.x, acc[r]);
+                acc[r] = fma(xa.y, wa.y, acc[r]);
+                acc[r] = fma(xa.z, wa.z, acc[r]);
+                acc[r] = fma(xa.w, wa.w, acc[r]);
+                acc[r] = fma(xb.x, wb.x, acc[r]);
+                acc[r] = fma(xb.y, wb.y, acc[r]);
+                acc[r] = fma(xb.z, wb.z, acc[r]);
+                acc[r] = fma(xb.w, wb.w, acc[r]);
+            }
+        }
+        for (; i < vec_k; i += 32u) {
+            const float4 xa = float4(x4[i]);
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const float4 wa = dense_load_w4(w, row_base[r] + ulong(i) * 4ul);
+                acc[r] = fma(xa.x, wa.x, acc[r]);
+                acc[r] = fma(xa.y, wa.y, acc[r]);
+                acc[r] = fma(xa.z, wa.z, acc[r]);
+                acc[r] = fma(xa.w, wa.w, acc[r]);
+            }
+        }
+    } else {
+        for (uint kk = lane; kk < p.k; kk += 32u) {
+            const float xv = float(x[kk]);
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                acc[r] = fma(xv, dense_load_w1(w, row_base[r] + kk), acc[r]);
+            }
+        }
+    }
+
+    for (uint r = 0u; r < ROWS_PER_SG; r++) {
+        const float total = simd_sum(acc[r]);
+        if (lane == 0u && (row0 + r) < p.n) {
+            y[row0 + r] = half(total);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 4: Dense GEMM (M > 1 prefill & speculative tree verification)
+//
+// Tile: BM = 32, BN = 32, BK = 32. 4 simdgroups/threadgroup (128 threads),
+// arranged 2x2: each simdgroup accumulates a 16x16 FP32 tile with four
+// `simdgroup_float8x8` accumulators. FP16 weights use `simdgroup_half8x8`
+// fragments; BF16 weights stage both the X tile (converted from `half`) and
+// the W tile as `bfloat` and use `simdgroup_bfloat8x8` fragments. Arbitrary
+// M >= 1, N and K are supported with zero-filled boundary tiles.
+// ---------------------------------------------------------------------------
+constant constexpr uint DG_BM = 32u;
+constant constexpr uint DG_BN = 32u;
+constant constexpr uint DG_BK = 32u;
+constant constexpr uint DG_BK_PAD = 40u; // +8 elements avoids bank conflicts
+
+template <typename T>
+static inline void dense_gemm_stage(const device half *x,
+                                    const device uchar *w,
+                                    threadgroup T *As,
+                                    threadgroup T *Bs,
+                                    constant DenseParams &p,
+                                    uint m_base,
+                                    uint n_base,
+                                    uint k_base,
+                                    uint tid) {
+    const uint ld_row = tid >> 2;          // 0..31
+    const uint ld_col = (tid & 3u) * 8u;   // 0, 8, 16, 24
+    const uint gk = k_base + ld_col;
+    const bool vec_ok = ((p.k & 3u) == 0u) && (gk + 8u <= p.k);
+
+    // X tile [BM, BK] -> As (converted to T)
+    {
+        threadgroup T *dst = As + ld_row * DG_BK_PAD + ld_col;
+        const uint gm = m_base + ld_row;
+        if (gm < p.m && vec_ok) {
+            const device half4 *src = (const device half4 *)(x + ulong(gm) * p.k + gk);
+            const float4 a0 = float4(src[0]);
+            const float4 a1 = float4(src[1]);
+            dst[0] = T(a0.x); dst[1] = T(a0.y); dst[2] = T(a0.z); dst[3] = T(a0.w);
+            dst[4] = T(a1.x); dst[5] = T(a1.y); dst[6] = T(a1.z); dst[7] = T(a1.w);
+        } else {
+            for (uint j = 0u; j < 8u; j++) {
+                const uint kk = gk + j;
+                const float v = (gm < p.m && kk < p.k) ? float(x[ulong(gm) * p.k + kk]) : 0.0f;
+                dst[j] = T(v);
+            }
+        }
+    }
+
+    // W tile [BN, BK] -> Bs (stored row-major by output column n)
+    {
+        threadgroup T *dst = Bs + ld_row * DG_BK_PAD + ld_col;
+        const uint gn = n_base + ld_row;
+        if (gn < p.n && vec_ok) {
+            const ulong e = ulong(gn) * p.k + gk;
+            const float4 b0 = dense_load_w4(w, e);
+            const float4 b1 = dense_load_w4(w, e + 4ul);
+            dst[0] = T(b0.x); dst[1] = T(b0.y); dst[2] = T(b0.z); dst[3] = T(b0.w);
+            dst[4] = T(b1.x); dst[5] = T(b1.y); dst[6] = T(b1.z); dst[7] = T(b1.w);
+        } else {
+            for (uint j = 0u; j < 8u; j++) {
+                const uint kk = gk + j;
+                const float v = (gn < p.n && kk < p.k) ? dense_load_w1(w, ulong(gn) * p.k + kk) : 0.0f;
+                dst[j] = T(v);
+            }
+        }
+    }
+}
+
+template <typename T>
+static inline void dense_gemm_mma(threadgroup T *As,
+                                  threadgroup T *Bs,
+                                  thread simdgroup_float8x8 (&acc)[2][2],
+                                  uint sg_m,
+                                  uint sg_n) {
+    for (uint kk = 0u; kk < DG_BK; kk += 8u) {
+        simdgroup_matrix<T, 8, 8> a_frag[2];
+        simdgroup_matrix<T, 8, 8> b_frag[2];
+        simdgroup_load(a_frag[0], As + (sg_m + 0u) * DG_BK_PAD + kk, DG_BK_PAD);
+        simdgroup_load(a_frag[1], As + (sg_m + 8u) * DG_BK_PAD + kk, DG_BK_PAD);
+        simdgroup_load(b_frag[0], Bs + (sg_n + 0u) * DG_BK_PAD + kk, DG_BK_PAD, ulong2(0, 0), true);
+        simdgroup_load(b_frag[1], Bs + (sg_n + 8u) * DG_BK_PAD + kk, DG_BK_PAD, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(acc[0][0], a_frag[0], b_frag[0], acc[0][0]);
+        simdgroup_multiply_accumulate(acc[0][1], a_frag[0], b_frag[1], acc[0][1]);
+        simdgroup_multiply_accumulate(acc[1][0], a_frag[1], b_frag[0], acc[1][0]);
+        simdgroup_multiply_accumulate(acc[1][1], a_frag[1], b_frag[1], acc[1][1]);
+    }
+}
+
+kernel void ami_dense_gemm(const device half *x [[buffer(0)]],
+                           const device uchar *w [[buffer(1)]],
+                           device half *y [[buffer(2)]],
+                           constant DenseParams &p [[buffer(3)]],
+                           uint2 tg_pos [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint sg_id [[simdgroup_index_in_threadgroup]]) {
+    const uint n_base = tg_pos.x * DG_BN;
+    const uint m_base = tg_pos.y * DG_BM;
+    if (m_base >= p.m || n_base >= p.n) {
+        return;
+    }
+
+    // Raw 16-bit storage reinterpreted as `half` or `bfloat` per specialization.
+    threadgroup half As_raw[DG_BM * DG_BK_PAD];
+    threadgroup half Bs_raw[DG_BN * DG_BK_PAD];
+    threadgroup float Cs[DG_BM * DG_BN];
+
+    simdgroup_float8x8 acc[2][2];
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 2u; j++) {
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    const uint sg_m = (sg_id >> 1) * 16u;
+    const uint sg_n = (sg_id & 1u) * 16u;
+
+    for (uint k_base = 0u; k_base < p.k; k_base += DG_BK) {
+        if (DENSE_W_BF16) {
+            threadgroup bfloat *As = (threadgroup bfloat *)As_raw;
+            threadgroup bfloat *Bs = (threadgroup bfloat *)Bs_raw;
+            dense_gemm_stage<bfloat>(x, w, As, Bs, p, m_base, n_base, k_base, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            dense_gemm_mma<bfloat>(As, Bs, acc, sg_m, sg_n);
+        } else {
+            dense_gemm_stage<half>(x, w, As_raw, Bs_raw, p, m_base, n_base, k_base, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            dense_gemm_mma<half>(As_raw, Bs_raw, acc, sg_m, sg_n);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 2u; j++) {
+            simdgroup_store(acc[i][j], &Cs[(sg_m + i * 8u) * DG_BN + (sg_n + j * 8u)], DG_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < DG_BM * DG_BN; idx += 128u) {
+        const uint r = idx / DG_BN;
+        const uint cc = idx % DG_BN;
+        const uint gm = m_base + r;
+        const uint gn = n_base + cc;
+        if (gm < p.m && gn < p.n) {
+            y[ulong(gm) * p.n + gn] = half(Cs[idx]);
+        }
+    }
+}

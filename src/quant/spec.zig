@@ -39,6 +39,109 @@ pub const ShapeError = error{
     Overflow,
 };
 
+/// Unquantized 16-bit floating-point weight storage (ADR-0016).
+pub const FloatDType = enum(u8) {
+    f16 = 0,
+    bf16 = 1,
+};
+
+/// Per-tensor weight storage for GPU kernels that accept either unquantized
+/// 16-bit floats or MLX affine group-64 quantized codes (ADR-0014, ADR-0016).
+pub const WeightDType = enum(u8) {
+    f16 = 0,
+    bf16 = 1,
+    q4_affine = 2,
+    q3_affine = 3,
+
+    pub fn fromFloat(dtype: FloatDType) WeightDType {
+        return switch (dtype) {
+            .f16 => .f16,
+            .bf16 => .bf16,
+        };
+    }
+
+    pub fn fromQuant(bits: QuantBits) WeightDType {
+        return switch (bits) {
+            .q4 => .q4_affine,
+            .q3 => .q3_affine,
+        };
+    }
+};
+
+/// Widens raw `bfloat16` bits to `f32` exactly.
+pub fn bf16ToF32(bits: u16) f32 {
+    return @bitCast(@as(u32, bits) << 16);
+}
+
+/// Narrows `f32` to raw `bfloat16` bits with IEEE round-to-nearest-even.
+/// NaN stays NaN (quiet bit forced); infinities and signed zero are preserved.
+pub fn f32ToBf16(val: f32) u16 {
+    const u: u32 = @bitCast(val);
+    if (std.math.isNan(val)) return @truncate((u >> 16) | 0x0040);
+    const lsb: u32 = (u >> 16) & 1;
+    const rounded: u32 = u +% (0x7FFF + lsb);
+    return @truncate(rounded >> 16);
+}
+
+/// Widens one raw 16-bit weight (`f16` or `bf16` bit pattern) to `f32`.
+pub inline fn floatBitsToF32(dtype: FloatDType, bits: u16) f32 {
+    return switch (dtype) {
+        .f16 => @floatCast(@as(f16, @bitCast(bits))),
+        .bf16 => bf16ToF32(bits),
+    };
+}
+
+/// Narrows `f32` to a raw 16-bit weight bit pattern of `dtype` (RNE).
+pub inline fn f32ToFloatBits(dtype: FloatDType, val: f32) u16 {
+    return switch (dtype) {
+        .f16 => @bitCast(@as(f16, @floatCast(val))),
+        .bf16 => f32ToBf16(val),
+    };
+}
+
+/// CPU fp32 reference for dense `y[n] = sum_k x[k] * W[n, k]`.
+/// `w` holds raw `f16` or `bf16` bits of a row-major `[n, k]` matrix.
+pub fn denseGemvCpuRef(
+    dtype: FloatDType,
+    x: []const f16,
+    w: []const u16,
+    y: []f32,
+    n: usize,
+    k: usize,
+) (ShapeError || error{BufferTooSmall})!void {
+    return denseGemmCpuRef(dtype, x, w, y, 1, n, k);
+}
+
+/// CPU fp32 reference for dense `Y[m, n] = sum_k X[m, k] * W[n, k]`.
+/// `x` is `[m, k]` fp16, `w` holds raw `f16` or `bf16` bits of `[n, k]`, and
+/// `y` is `[m, n]` f32. Accumulates strictly in `f32`.
+pub fn denseGemmCpuRef(
+    dtype: FloatDType,
+    x: []const f16,
+    w: []const u16,
+    y: []f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) (ShapeError || error{BufferTooSmall})!void {
+    if (m == 0 or n == 0 or k == 0) return error.ZeroDimension;
+    const xk = std.math.mul(usize, m, k) catch return error.Overflow;
+    const wk = std.math.mul(usize, n, k) catch return error.Overflow;
+    const yn = std.math.mul(usize, m, n) catch return error.Overflow;
+    if (x.len < xk or w.len < wk or y.len < yn) return error.BufferTooSmall;
+    for (0..m) |mi| {
+        const x_row = x[mi * k ..][0..k];
+        for (0..n) |ni| {
+            const w_row = w[ni * k ..][0..k];
+            var acc: f32 = 0.0;
+            for (0..k) |ki| {
+                acc += @as(f32, @floatCast(x_row[ki])) * floatBitsToF32(dtype, w_row[ki]);
+            }
+            y[mi * n + ni] = acc;
+        }
+    }
+}
+
 /// Generates branch-free, compile-time-specialized quantization helpers and
 /// CPU fp32 reference math for `spec`. Unsupported configurations are compile
 /// errors.
@@ -244,6 +347,58 @@ test "3-bit pack and dequantize matches MLX 8-in-3-bytes bitstream" {
         const expected: f32 = @as(f32, @floatFromInt(codes[i])) * 0.125 - 0.5;
         try std.testing.expectApproxEqAbs(expected, val, 1e-6);
     }
+}
+
+test "bf16 conversion is exact on widening and round-to-nearest-even on narrowing" {
+    try std.testing.expectEqual(@as(f32, 1.0), bf16ToF32(0x3F80));
+    try std.testing.expectEqual(@as(f32, -2.0), bf16ToF32(0xC000));
+    try std.testing.expectEqual(@as(u16, 0x3F80), f32ToBf16(1.0));
+    try std.testing.expectEqual(@as(u16, 0x8000), f32ToBf16(-0.0));
+    try std.testing.expectEqual(@as(u16, 0x7F80), f32ToBf16(std.math.inf(f32)));
+    try std.testing.expect(std.math.isNan(bf16ToF32(f32ToBf16(std.math.nan(f32)))));
+    // Exactly halfway between 0x3F80 and 0x3F81: ties to even (0x3F80).
+    try std.testing.expectEqual(@as(u16, 0x3F80), f32ToBf16(@bitCast(@as(u32, 0x3F808000))));
+    // Halfway between 0x3F81 and 0x3F82: ties to even (0x3F82).
+    try std.testing.expectEqual(@as(u16, 0x3F82), f32ToBf16(@bitCast(@as(u32, 0x3F818000))));
+    // Just above halfway rounds up.
+    try std.testing.expectEqual(@as(u16, 0x3F81), f32ToBf16(@bitCast(@as(u32, 0x3F808001))));
+    // Large magnitudes beyond the fp16 range survive bf16 round-trips.
+    try std.testing.expectApproxEqRel(@as(f32, 1.0e6), bf16ToF32(f32ToBf16(1.0e6)), 1e-2);
+    // Every bf16 bit pattern (non-NaN) round-trips exactly.
+    var bits: u32 = 0;
+    while (bits <= 0xFFFF) : (bits += 1) {
+        const b: u16 = @intCast(bits);
+        const f = bf16ToF32(b);
+        if (std.math.isNan(f)) continue;
+        try std.testing.expectEqual(b, f32ToBf16(f));
+    }
+}
+
+test "dense CPU reference GEMM matches explicit f16 and bf16 dot products" {
+    const m = 2;
+    const n = 3;
+    const k = 5;
+    var x: [m * k]f16 = undefined;
+    for (&x, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25);
+    inline for (.{ FloatDType.f16, FloatDType.bf16 }) |dt| {
+        var w: [n * k]u16 = undefined;
+        for (&w, 0..) |*v, i| v.* = f32ToFloatBits(dt, @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.5);
+        var y: [m * n]f32 = undefined;
+        try denseGemmCpuRef(dt, &x, &w, &y, m, n, k);
+        for (0..m) |mi| {
+            for (0..n) |ni| {
+                var expected: f32 = 0.0;
+                for (0..k) |ki| expected += @as(f32, @floatCast(x[mi * k + ki])) * floatBitsToF32(dt, w[ni * k + ki]);
+                try std.testing.expectEqual(expected, y[mi * n + ni]);
+            }
+        }
+        var y1: [n]f32 = undefined;
+        try denseGemvCpuRef(dt, x[0..k], &w, &y1, n, k);
+        for (0..n) |ni| try std.testing.expectEqual(y[ni], y1[ni]);
+    }
+    var tiny: [1]f32 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, denseGemmCpuRef(.f16, &x, &[_]u16{0}, &tiny, 1, 1, 2));
+    try std.testing.expectError(error.ZeroDimension, denseGemmCpuRef(.bf16, &x, &[_]u16{0}, &tiny, 0, 1, 1));
 }
 
 test "reference quantized matmul matches explicit dequantized dot product" {

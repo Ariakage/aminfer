@@ -5,6 +5,25 @@ using namespace metal;
 
 constant uint ATTN_HEAD_DIM [[function_constant(0)]];
 constant uint S1_ACCESS_MODE [[function_constant(1)]];
+// Norm weight storage for RMSNorm / QK-Norm: false = `half`, true = `bfloat`
+// (ADR-0016). Variance and scaling accumulate in FP32 either way.
+constant bool NORM_W_BF16 [[function_constant(2)]];
+
+// `bf16` is always a compile-time constant at every call site (a function
+// constant or a literal), so the untaken branch is eliminated.
+static inline float norm_w1(const device uchar *w, uint i, bool bf16) {
+    if (bf16) {
+        return float(((const device bfloat *)w)[i]);
+    }
+    return float(((const device half *)w)[i]);
+}
+
+static inline float4 norm_w4(const device uchar *w, uint i4, bool bf16) {
+    if (bf16) {
+        return float4(((const device bfloat4 *)w)[i4]);
+    }
+    return float4(((const device half4 *)w)[i4]);
+}
 
 // Bindless pair of resident IOSurface-backed Metal texture views for one KV chunk.
 struct KvTilePair {
@@ -75,18 +94,19 @@ static inline float half_simd_sum(float v) {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 1: RMSNorm (fp16 -> fp16, fp32 accumulation; supports in-place y == x)
+// Kernel 1: RMSNorm (fp16 -> fp16 with `half` or `bfloat` weights selected by
+// NORM_W_BF16, fp32 accumulation; supports in-place y == x)
 //
 // Grid: (num_rows, 1, 1) threadgroups, 256 threads (8 simdgroups) per row.
 // ---------------------------------------------------------------------------
-kernel void ami_rmsnorm_f16(const device half *x [[buffer(0)]],
-                            const device half *w [[buffer(1)]],
-                            device half *y [[buffer(2)]],
-                            constant RmsNormParams &p [[buffer(3)]],
-                            uint row [[threadgroup_position_in_grid]],
-                            uint tid [[thread_index_in_threadgroup]],
-                            uint sg_id [[simdgroup_index_in_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]]) {
+kernel void ami_rmsnorm(const device half *x [[buffer(0)]],
+                        const device uchar *w [[buffer(1)]],
+                        device half *y [[buffer(2)]],
+                        constant RmsNormParams &p [[buffer(3)]],
+                        uint row [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint sg_id [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
     if (row >= p.num_rows) {
         return;
     }
@@ -130,37 +150,39 @@ kernel void ami_rmsnorm_f16(const device half *x [[buffer(0)]],
     if ((p.hidden_dim & 3u) == 0u) {
         const uint vec_len = p.hidden_dim >> 2;
         const device half4 *x4 = (const device half4 *)x_row;
-        const device half4 *w4 = (const device half4 *)w;
         device half4 *y4 = (device half4 *)y_row;
         for (uint i = tid; i < vec_len; i += 256u) {
-            const float4 v = (float4(x4[i]) * inv_rms) * float4(w4[i]);
+            const float4 v = (float4(x4[i]) * inv_rms) * norm_w4(w, i, NORM_W_BF16);
             y4[i] = half4(v);
         }
     } else {
         for (uint i = tid; i < p.hidden_dim; i += 256u) {
-            const float v = (float(x_row[i]) * inv_rms) * float(w[i]);
+            const float v = (float(x_row[i]) * inv_rms) * norm_w1(w, i, NORM_W_BF16);
             y_row[i] = half(v);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 2: Optional Qwen3 QK-Norm + NeoX half-split RoPE + KV-Tile Write
+// Kernel 2: Optional Qwen3 QK-Norm (`half` or `bfloat` norm weights selected by
+// NORM_W_BF16) + NeoX half-split RoPE + KV-Tile Write
 //
 // Grid: (num_q_heads + num_kv_heads, 1, 1) threadgroups, 32 threads (1 simdgroup).
 // Updates Q in-place and writes rotated K and raw V directly into the current
 // 512-token chunk's RGBA16Float IOSurface KV tiles (token-major rows).
 // ---------------------------------------------------------------------------
-kernel void ami_qknorm_rope_kv_write(device half *q [[buffer(0)]],
-                                     const device half *k [[buffer(1)]],
-                                     const device half *v [[buffer(2)]],
-                                     const device half *q_norm [[buffer(3)]],
-                                     const device half *k_norm [[buffer(4)]],
-                                     constant QkNormRopeKvParams &p [[buffer(5)]],
-                                     texture2d<half, access::write> k_tex [[texture(0)]],
-                                     texture2d<half, access::write> v_tex [[texture(1)]],
-                                     uint tg_id [[threadgroup_position_in_grid]],
-                                     uint lane [[thread_index_in_simdgroup]]) {
+static inline void qknorm_rope_kv_write_impl(device half *q,
+                                             const device half *k,
+                                             const device half *v,
+                                             const device uchar *q_norm,
+                                             const device uchar *k_norm,
+                                             constant QkNormRopeKvParams &p,
+                                             texture2d<half, access::write> k_tex,
+                                             texture2d<half, access::write> v_tex,
+                                             threadgroup float *vec,
+                                             uint tg_id,
+                                             uint lane,
+                                             bool norm_bf16) {
     const uint total_heads = p.num_q_heads + p.num_kv_heads;
     if (tg_id >= total_heads) {
         return;
@@ -170,8 +192,6 @@ kernel void ami_qknorm_rope_kv_write(device half *q [[buffer(0)]],
     const uint head_idx = is_q ? tg_id : (tg_id - p.num_q_heads);
     const uint d_dim = p.head_dim;
     const uint half_dim = d_dim >> 1;
-
-    threadgroup float vec[256];
 
     const device half *src = is_q ? (q + ulong(head_idx) * d_dim)
                                   : (k + ulong(head_idx) * d_dim);
@@ -185,9 +205,9 @@ kernel void ami_qknorm_rope_kv_write(device half *q [[buffer(0)]],
     if (p.apply_qk_norm != 0u) {
         const float total_sq = simd_sum(sum_sq);
         const float inv_rms = rsqrt(total_sq / float(d_dim) + p.rms_eps);
-        const device half *nw = is_q ? q_norm : k_norm;
+        const device uchar *nw = is_q ? q_norm : k_norm;
         for (uint d = lane; d < d_dim; d += 32u) {
-            vec[d] = (vec[d] * inv_rms) * float(nw[d]);
+            vec[d] = (vec[d] * inv_rms) * norm_w1(nw, d, norm_bf16);
         }
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -227,6 +247,39 @@ kernel void ami_qknorm_rope_kv_write(device half *q [[buffer(0)]],
             v_tex.write(v_src[col], uint2(col, row));
         }
     }
+}
+
+
+// Specialized entry point used by `AttentionPipelines` (NORM_W_BF16 selects
+// `half` or `bfloat` QK-norm weights).
+kernel void ami_qknorm_rope_kv_write_norm(device half *q [[buffer(0)]],
+                                          const device half *k [[buffer(1)]],
+                                          const device half *v [[buffer(2)]],
+                                          const device uchar *q_norm [[buffer(3)]],
+                                          const device uchar *k_norm [[buffer(4)]],
+                                          constant QkNormRopeKvParams &p [[buffer(5)]],
+                                          texture2d<half, access::write> k_tex [[texture(0)]],
+                                          texture2d<half, access::write> v_tex [[texture(1)]],
+                                          uint tg_id [[threadgroup_position_in_grid]],
+                                          uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float vec[256];
+    qknorm_rope_kv_write_impl(q, k, v, q_norm, k_norm, p, k_tex, v_tex, vec, tg_id, lane, NORM_W_BF16);
+}
+
+// Unspecialized `half` QK-norm entry point (kept for bridge-level tests and
+// callers that build the pipeline without function constants).
+kernel void ami_qknorm_rope_kv_write(device half *q [[buffer(0)]],
+                                     const device half *k [[buffer(1)]],
+                                     const device half *v [[buffer(2)]],
+                                     const device uchar *q_norm [[buffer(3)]],
+                                     const device uchar *k_norm [[buffer(4)]],
+                                     constant QkNormRopeKvParams &p [[buffer(5)]],
+                                     texture2d<half, access::write> k_tex [[texture(0)]],
+                                     texture2d<half, access::write> v_tex [[texture(1)]],
+                                     uint tg_id [[threadgroup_position_in_grid]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float vec[256];
+    qknorm_rope_kv_write_impl(q, k, v, q_norm, k_norm, p, k_tex, v_tex, vec, tg_id, lane, false);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,11 @@
 //! GPU MoE router, deduplicated active-expert fused 3-bit / 4-bit affine
 //! SwiGLU FFN (G3), dense SwiGLU utilities, and single-dispatch greedy argmax.
+//! M2.5 (G12, ADR-0016) adds BF16 and MLX-quantized routers, native FP16 /
+//! BF16 deduplicated MoE SwiGLU, and GPU embedding lookup.
 //!
 //! All pipelines are compiled once at startup using Metal 4 function constants
-//! (`Q_BITS`, `Q_GROUP_SIZE`, `MOE_TOP_K`, `LOGITS_F16`, `ROUTER_W_F16`) and
+//! (`Q_BITS`, `Q_GROUP_SIZE`, `MOE_TOP_K`, `LOGITS_F16`, `ROUTER_W_F16`,
+//! `ROUTER_W_BF16`, `MOE_W_BF16`, `EMBED_KIND`) and
 //! execute strictly over preallocated wired workspaces with zero hot-path
 //! dynamic heap allocation (ADR-0009, ADR-0011, ADR-0014).
 
@@ -23,7 +26,10 @@ pub const MAX_TOP_K: u32 = 16;
 /// All offsets are 64-bit byte offsets from the bound resident weights buffer,
 /// supporting multi-GiB `WiredArena` `MTLBuffer`s without 32-bit overflow.
 /// Every offset must be at least 4-byte aligned (`.amf` blobs are 16 KiB
-/// aligned and `params_offset` is 64-byte aligned).
+/// aligned and `params_offset` is 64-byte aligned). For the FP16 / BF16 MoE
+/// path (`encodeMoELayerFloat`) the `*_qweight_offset` fields hold the byte
+/// offsets of row-major `[N, K]` 16-bit matrices (at least 8-byte aligned) and
+/// the `*_sb_offset` fields are ignored (set them to 0).
 pub const ExpertWeights = extern struct {
     gate_qweight_offset: u64,
     gate_sb_offset: u64,
@@ -88,6 +94,30 @@ pub const ArgmaxParams = extern struct {
     aligned_half4: u32,
 };
 
+/// Uniform payload matching `struct RouterQParams` in `moe_ffn.metal`.
+pub const RouterQParams = extern struct {
+    m: u32,
+    num_experts: u32,
+    hidden_size: u32,
+    num_groups: u32,
+    row_bytes: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
+/// Uniform payload matching `struct EmbedParams` in `moe_ffn.metal`.
+pub const EmbedParams = extern struct {
+    m: u32,
+    vocab_size: u32,
+    hidden_size: u32,
+    row_bytes: u32,
+    num_groups: u32,
+    use_token_buffer: u32,
+    token_id: u32,
+    _pad: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(ExpertWeights) != 48) @compileError("ExpertWeights must be 48 bytes");
     if (@sizeOf(ScheduleHeader) != 16) @compileError("ScheduleHeader must be 16 bytes");
@@ -98,6 +128,8 @@ comptime {
     if (@sizeOf(MoeReduceParams) != 16) @compileError("MoeReduceParams must be 16 bytes");
     if (@sizeOf(ElemParams) != 4) @compileError("ElemParams must be 4 bytes");
     if (@sizeOf(ArgmaxParams) != 8) @compileError("ArgmaxParams must be 8 bytes");
+    if (@sizeOf(RouterQParams) != 32) @compileError("RouterQParams must be 32 bytes");
+    if (@sizeOf(EmbedParams) != 32) @compileError("EmbedParams must be 32 bytes");
 }
 
 pub const LogitsDType = enum {
@@ -108,6 +140,7 @@ pub const LogitsDType = enum {
 pub const RouterWeightDType = enum {
     f16,
     f32,
+    bf16,
 };
 
 pub const WorkspaceSpec = struct {
@@ -283,6 +316,17 @@ pub const RouterProjArgs = struct {
     hidden_size: u32,
 };
 
+/// MLX affine group-64 quantized router projection (`logits` is `f32 [m, E]`).
+pub const RouterProjQuantArgs = struct {
+    x: metal.BufferBinding,
+    qweight: metal.BufferBinding,
+    scale_bias: metal.BufferBinding,
+    logits: metal.BufferBinding,
+    m: u32,
+    num_experts: u32,
+    hidden_size: u32,
+};
+
 pub const RouteTopKArgs = struct {
     logits: metal.BufferBinding,
     workspace: *const MoeWorkspace,
@@ -337,6 +381,14 @@ pub const RouterSource = union(enum) {
         binding: metal.BufferBinding,
         dtype: LogitsDType,
     },
+    /// MLX affine 3-bit / 4-bit group-64 router weights `[num_experts, hidden]`
+    /// (e.g. real `Qwen3-30B-A3B-3bit` `mlp.gate`), producing `f32` logits in
+    /// the workspace.
+    quant_weights: struct {
+        qweight: metal.BufferBinding,
+        scale_bias: metal.BufferBinding,
+        bits: quant.QuantBits,
+    },
 };
 
 pub const MoELayerArgs = struct {
@@ -356,6 +408,31 @@ pub const MoELayerArgs = struct {
     hidden_size: u32,
     intermediate_size: u32,
     norm_topk_prob: bool = true,
+};
+
+/// Alias spelling used by M2.5 integration code.
+pub const MoeLayerArgs = MoELayerArgs;
+
+/// Token ID source for `encodeEmbedLookup`.
+pub const EmbedTokens = union(enum) {
+    /// Single token ID streamed through the uniform ring (decode, `m = 1`).
+    token_id: u32,
+    /// GPU-resident `u32 [m]` token-ID buffer (prefill / batched lookup).
+    token_ids: metal.BufferBinding,
+};
+
+/// GPU embedding lookup writing `f16 [m, hidden_size]` into `out`.
+pub const EmbedLookupArgs = struct {
+    /// `[vocab_size, hidden_size]` table (`f16` / `bf16`), or packed MLX
+    /// affine group-64 codes (`q4_affine` / `q3_affine`).
+    weight: metal.BufferBinding,
+    /// `half2(scale, bias)` group parameters; required for quantized tables.
+    scale_bias: ?metal.BufferBinding = null,
+    tokens: EmbedTokens,
+    out: metal.BufferBinding,
+    m: u32 = 1,
+    vocab_size: u32,
+    hidden_size: u32,
 };
 
 pub const SiluMulArgs = struct {
@@ -396,15 +473,28 @@ pub const MoePipelines = struct {
     silu_mul_f16: metal.Pipeline,
     residual_add_f16: metal.Pipeline,
     argmax_f16: metal.Pipeline,
+    router_proj_bf16: metal.Pipeline,
+    router_proj_q4: metal.Pipeline,
+    router_proj_q3: metal.Pipeline,
+    gate_up_swiglu_f16: metal.Pipeline,
+    gate_up_swiglu_bf16: metal.Pipeline,
+    down_proj_f16: metal.Pipeline,
+    down_proj_bf16: metal.Pipeline,
+    embed_f16: metal.Pipeline,
+    embed_bf16: metal.Pipeline,
+    embed_q4: metal.Pipeline,
+    embed_q3: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!MoePipelines {
         const router_proj_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_router_proj", &.{
             .{ .index = 4, .value = .{ .bool = true } },
+            .{ .index = 5, .value = .{ .bool = false } },
         });
         errdefer router_proj_f16.close();
 
         const router_proj_f32 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_router_proj", &.{
             .{ .index = 4, .value = .{ .bool = false } },
+            .{ .index = 5, .value = .{ .bool = false } },
         });
         errdefer router_proj_f32.close();
 
@@ -475,6 +565,68 @@ pub const MoePipelines = struct {
         const argmax_f16 = try metal.Pipeline.init(device, library, "ami_argmax_f16");
         errdefer argmax_f16.close();
 
+        const router_proj_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_router_proj", &.{
+            .{ .index = 4, .value = .{ .bool = false } },
+            .{ .index = 5, .value = .{ .bool = true } },
+        });
+        errdefer router_proj_bf16.close();
+
+        const router_proj_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_router_proj_q", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer router_proj_q4.close();
+
+        const router_proj_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_router_proj_q", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer router_proj_q3.close();
+
+        const gate_up_swiglu_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_gate_up_swiglu_float", &.{
+            .{ .index = 6, .value = .{ .bool = false } },
+        });
+        errdefer gate_up_swiglu_f16.close();
+
+        const gate_up_swiglu_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_gate_up_swiglu_float", &.{
+            .{ .index = 6, .value = .{ .bool = true } },
+        });
+        errdefer gate_up_swiglu_bf16.close();
+
+        const down_proj_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_down_proj_float", &.{
+            .{ .index = 6, .value = .{ .bool = false } },
+        });
+        errdefer down_proj_f16.close();
+
+        const down_proj_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_down_proj_float", &.{
+            .{ .index = 6, .value = .{ .bool = true } },
+        });
+        errdefer down_proj_bf16.close();
+
+        const embed_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_embed_lookup", &.{
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 7, .value = .{ .u32 = @backingInt(quant.WeightDType.f16) } },
+        });
+        errdefer embed_f16.close();
+
+        const embed_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_embed_lookup", &.{
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 7, .value = .{ .u32 = @backingInt(quant.WeightDType.bf16) } },
+        });
+        errdefer embed_bf16.close();
+
+        const embed_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_embed_lookup", &.{
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 7, .value = .{ .u32 = @backingInt(quant.WeightDType.q4_affine) } },
+        });
+        errdefer embed_q4.close();
+
+        const embed_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_embed_lookup", &.{
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 7, .value = .{ .u32 = @backingInt(quant.WeightDType.q3_affine) } },
+        });
+        errdefer embed_q3.close();
+
         return .{
             .router_proj_f16 = router_proj_f16,
             .router_proj_f32 = router_proj_f32,
@@ -491,10 +643,32 @@ pub const MoePipelines = struct {
             .silu_mul_f16 = silu_mul_f16,
             .residual_add_f16 = residual_add_f16,
             .argmax_f16 = argmax_f16,
+            .router_proj_bf16 = router_proj_bf16,
+            .router_proj_q4 = router_proj_q4,
+            .router_proj_q3 = router_proj_q3,
+            .gate_up_swiglu_f16 = gate_up_swiglu_f16,
+            .gate_up_swiglu_bf16 = gate_up_swiglu_bf16,
+            .down_proj_f16 = down_proj_f16,
+            .down_proj_bf16 = down_proj_bf16,
+            .embed_f16 = embed_f16,
+            .embed_bf16 = embed_bf16,
+            .embed_q4 = embed_q4,
+            .embed_q3 = embed_q3,
         };
     }
 
     pub fn close(self: MoePipelines) void {
+        self.embed_q3.close();
+        self.embed_q4.close();
+        self.embed_bf16.close();
+        self.embed_f16.close();
+        self.down_proj_bf16.close();
+        self.down_proj_f16.close();
+        self.gate_up_swiglu_bf16.close();
+        self.gate_up_swiglu_f16.close();
+        self.router_proj_q3.close();
+        self.router_proj_q4.close();
+        self.router_proj_bf16.close();
         self.argmax_f16.close();
         self.residual_add_f16.close();
         self.silu_mul_f16.close();
@@ -525,6 +699,7 @@ pub const MoePipelines = struct {
         const pipe = switch (weight_dtype) {
             .f16 => self.router_proj_f16,
             .f32 => self.router_proj_f32,
+            .bf16 => self.router_proj_bf16,
         };
         const params: RouterProjParams = .{
             .m = args.m,
@@ -768,31 +943,7 @@ pub const MoePipelines = struct {
         args: MoELayerArgs,
         insert_barrier_before: bool,
     ) EncodeError!void {
-        const logits_binding, const logits_dtype, const route_barrier = switch (args.router) {
-            .weights => |w| blk: {
-                const lb = args.workspace.routerLogitsBinding(args.workspace_buf);
-                try self.encodeRouterProj(frame, w.dtype, .{
-                    .x = args.x,
-                    .router_weights = w.binding,
-                    .logits = lb,
-                    .m = args.m,
-                    .num_experts = args.num_experts,
-                    .hidden_size = args.hidden_size,
-                }, insert_barrier_before);
-                break :blk .{ lb, LogitsDType.f32, true };
-            },
-            .logits => |l| .{ l.binding, l.dtype, insert_barrier_before },
-        };
-
-        try self.encodeRouteTopK(frame, logits_dtype, .{
-            .logits = logits_binding,
-            .workspace = args.workspace,
-            .workspace_buf = args.workspace_buf,
-            .m = args.m,
-            .num_experts = args.num_experts,
-            .top_k = args.top_k,
-            .norm_topk_prob = args.norm_topk_prob,
-        }, route_barrier);
+        try self.encodeRouting(frame, args, insert_barrier_before);
 
         try self.encodeGateUpSwiglu(frame, bits, .{
             .x = args.x,
@@ -828,6 +979,316 @@ pub const MoePipelines = struct {
             .hidden_size = args.hidden_size,
             .top_k = args.top_k,
         }, true);
+    }
+
+    /// Encodes the optional router projection (f32 / f16 / bf16 / quantized
+    /// weights) followed by softmax + top-k + CSR deduplication.
+    fn encodeRouting(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        args: MoELayerArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        const logits_binding, const logits_dtype, const route_barrier = switch (args.router) {
+            .weights => |w| blk: {
+                const lb = args.workspace.routerLogitsBinding(args.workspace_buf);
+                try self.encodeRouterProj(frame, w.dtype, .{
+                    .x = args.x,
+                    .router_weights = w.binding,
+                    .logits = lb,
+                    .m = args.m,
+                    .num_experts = args.num_experts,
+                    .hidden_size = args.hidden_size,
+                }, insert_barrier_before);
+                break :blk .{ lb, LogitsDType.f32, true };
+            },
+            .quant_weights => |q| blk: {
+                const lb = args.workspace.routerLogitsBinding(args.workspace_buf);
+                try self.encodeRouterProjQuant(frame, q.bits, .{
+                    .x = args.x,
+                    .qweight = q.qweight,
+                    .scale_bias = q.scale_bias,
+                    .logits = lb,
+                    .m = args.m,
+                    .num_experts = args.num_experts,
+                    .hidden_size = args.hidden_size,
+                }, insert_barrier_before);
+                break :blk .{ lb, LogitsDType.f32, true };
+            },
+            .logits => |l| .{ l.binding, l.dtype, insert_barrier_before },
+        };
+
+        try self.encodeRouteTopK(frame, logits_dtype, .{
+            .logits = logits_binding,
+            .workspace = args.workspace,
+            .workspace_buf = args.workspace_buf,
+            .m = args.m,
+            .num_experts = args.num_experts,
+            .top_k = args.top_k,
+            .norm_topk_prob = args.norm_topk_prob,
+        }, route_barrier);
+    }
+
+    /// Encodes an MLX affine 3-bit / 4-bit group-64 router projection writing
+    /// `f32` logits `[m, num_experts]`. Zero heap allocation.
+    pub fn encodeRouterProjQuant(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        bits: quant.QuantBits,
+        args: RouterProjQuantArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.num_experts == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        if (args.num_experts > MAX_EXPERTS) return error.UnsupportedExpertCount;
+        const num_groups, const row_bytes, const pipe = switch (bits) {
+            .q4 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.hidden_size), try Ops.rowWeightBytes(args.hidden_size), self.router_proj_q4 };
+            },
+            .q3 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.hidden_size), try Ops.rowWeightBytes(args.hidden_size), self.router_proj_q3 };
+            },
+        };
+        const params: RouterQParams = .{
+            .m = args.m,
+            .num_experts = args.num_experts,
+            .hidden_size = args.hidden_size,
+            .num_groups = @intCast(num_groups),
+            .row_bytes = @intCast(row_bytes),
+        };
+        const groups_x: u64 = (@as(u64, args.num_experts) + 15) / 16;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.qweight, args.scale_bias, args.logits },
+            std.mem.asBytes(&params),
+            .{ groups_x, args.m, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes the deduplicated FP16 / BF16 expert gate + up + SwiGLU
+    /// (`ExpertWeights.*_qweight_offset` = byte offsets of `[N, K]` matrices).
+    pub fn encodeGateUpSwigluFloat(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.FloatDType,
+        args: GateUpSwigluArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.num_experts == 0 or args.top_k == 0 or
+            args.hidden_size == 0 or args.intermediate_size == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if (args.hidden_size % 4 != 0 or args.intermediate_size % 4 != 0) return error.UnalignedK;
+        if (args.num_experts > MAX_EXPERTS) return error.UnsupportedExpertCount;
+        if (args.top_k > MAX_TOP_K or args.top_k > args.num_experts) return error.UnsupportedTopK;
+        if (args.m > args.workspace.spec.max_tokens or
+            args.num_experts > args.workspace.spec.num_experts or
+            args.top_k > args.workspace.spec.top_k or
+            args.intermediate_size > args.workspace.spec.intermediate_size)
+        {
+            return error.WorkspaceTooSmall;
+        }
+        const pipe = switch (dtype) {
+            .f16 => self.gate_up_swiglu_f16,
+            .bf16 => self.gate_up_swiglu_bf16,
+        };
+        const params: MoeGateUpParams = .{
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
+            .num_groups = 0,
+            .row_bytes = args.hidden_size * 2,
+        };
+        const groups_x: u64 = (@as(u64, args.intermediate_size) + 15) / 16;
+        const max_active: u64 = @min(@as(u64, args.m) * args.top_k, args.num_experts);
+        const ws = args.workspace;
+        const wb = args.workspace_buf;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.x,
+                args.weights_base,
+                args.expert_table,
+                .{ .buffer = wb, .offset = ws.schedule_header_off },
+                .{ .buffer = wb, .offset = ws.unique_experts_off },
+                .{ .buffer = wb, .offset = ws.expert_token_offsets_off },
+                .{ .buffer = wb, .offset = ws.token_indices_off },
+                .{ .buffer = wb, .offset = ws.inter_off },
+            },
+            std.mem.asBytes(&params),
+            .{ groups_x, max_active, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes the deduplicated FP16 / BF16 expert down projection scaled by
+    /// routing weights into the fp32 `down_out` workspace.
+    pub fn encodeDownProjFloat(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.FloatDType,
+        args: DownProjArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.num_experts == 0 or args.top_k == 0 or
+            args.hidden_size == 0 or args.intermediate_size == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if (args.hidden_size % 4 != 0 or args.intermediate_size % 4 != 0) return error.UnalignedK;
+        if (args.num_experts > MAX_EXPERTS) return error.UnsupportedExpertCount;
+        if (args.top_k > MAX_TOP_K or args.top_k > args.num_experts) return error.UnsupportedTopK;
+        if (args.m > args.workspace.spec.max_tokens or
+            args.num_experts > args.workspace.spec.num_experts or
+            args.top_k > args.workspace.spec.top_k or
+            args.hidden_size > args.workspace.spec.hidden_size or
+            args.intermediate_size > args.workspace.spec.intermediate_size)
+        {
+            return error.WorkspaceTooSmall;
+        }
+        const pipe = switch (dtype) {
+            .f16 => self.down_proj_f16,
+            .bf16 => self.down_proj_bf16,
+        };
+        const params: MoeDownParams = .{
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
+            .num_groups = 0,
+            .row_bytes = args.intermediate_size * 2,
+            .top_k = args.top_k,
+        };
+        const groups_x: u64 = (@as(u64, args.hidden_size) + 15) / 16;
+        const max_active: u64 = @min(@as(u64, args.m) * args.top_k, args.num_experts);
+        const ws = args.workspace;
+        const wb = args.workspace_buf;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                .{ .buffer = wb, .offset = ws.inter_off },
+                args.weights_base,
+                args.expert_table,
+                .{ .buffer = wb, .offset = ws.schedule_header_off },
+                .{ .buffer = wb, .offset = ws.unique_experts_off },
+                .{ .buffer = wb, .offset = ws.expert_token_offsets_off },
+                .{ .buffer = wb, .offset = ws.token_indices_off },
+                .{ .buffer = wb, .offset = ws.routing_weights_off },
+                .{ .buffer = wb, .offset = ws.slot_k_indices_off },
+                .{ .buffer = wb, .offset = ws.down_out_off },
+            },
+            std.mem.asBytes(&params),
+            .{ groups_x, max_active, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes a complete deduplicated FP16 / BF16 MoE FFN layer into `frame`:
+    /// optional router projection (f32 / f16 / bf16 / quantized) ->
+    /// `ami_moe_route_topk` -> `ami_moe_gate_up_swiglu_float` ->
+    /// `ami_moe_down_proj_float` -> `ami_moe_reduce_f16`. Zero heap allocation.
+    pub fn encodeMoELayerFloat(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.FloatDType,
+        args: MoELayerArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.hidden_size % 4 != 0 or args.intermediate_size % 4 != 0) return error.UnalignedK;
+        try self.encodeRouting(frame, args, insert_barrier_before);
+
+        try self.encodeGateUpSwigluFloat(frame, dtype, .{
+            .x = args.x,
+            .weights_base = args.weights_base,
+            .expert_table = args.expert_table,
+            .workspace = args.workspace,
+            .workspace_buf = args.workspace_buf,
+            .m = args.m,
+            .num_experts = args.num_experts,
+            .top_k = args.top_k,
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
+        }, true);
+
+        try self.encodeDownProjFloat(frame, dtype, .{
+            .weights_base = args.weights_base,
+            .expert_table = args.expert_table,
+            .workspace = args.workspace,
+            .workspace_buf = args.workspace_buf,
+            .m = args.m,
+            .num_experts = args.num_experts,
+            .top_k = args.top_k,
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
+        }, true);
+
+        try self.encodeReduce(frame, .{
+            .workspace = args.workspace,
+            .workspace_buf = args.workspace_buf,
+            .residual = args.residual,
+            .out = args.out,
+            .m = args.m,
+            .hidden_size = args.hidden_size,
+            .top_k = args.top_k,
+        }, true);
+    }
+
+    /// Encodes a GPU embedding lookup (`out[m, :] = table[token[m], :]`) for
+    /// `f16`, `bf16`, `q4_affine` or `q3_affine` tables, writing `f16
+    /// [m, hidden_size]` with zero CPU copies. Out-of-range token IDs yield zero
+    /// rows. Zero heap allocation.
+    pub fn encodeEmbedLookup(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.WeightDType,
+        args: EmbedLookupArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.vocab_size == 0 or args.hidden_size == 0) return error.ZeroDimension;
+        const pipe, const row_bytes: usize, const num_groups: usize = switch (dtype) {
+            .f16 => .{ self.embed_f16, @as(usize, args.hidden_size) * 2, 0 },
+            .bf16 => .{ self.embed_bf16, @as(usize, args.hidden_size) * 2, 0 },
+            .q4_affine => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                break :blk .{ self.embed_q4, try Ops.rowWeightBytes(args.hidden_size), try Ops.groupsPerRow(args.hidden_size) };
+            },
+            .q3_affine => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                break :blk .{ self.embed_q3, try Ops.rowWeightBytes(args.hidden_size), try Ops.groupsPerRow(args.hidden_size) };
+            },
+        };
+        const sb_binding: metal.BufferBinding = switch (dtype) {
+            .f16, .bf16 => args.scale_bias orelse args.weight,
+            .q4_affine, .q3_affine => args.scale_bias orelse return error.InvalidArgument,
+        };
+        const use_buf: bool, const tok_id: u32, const tok_binding: metal.BufferBinding = switch (args.tokens) {
+            .token_id => |t| blk: {
+                if (args.m != 1) return error.InvalidArgument;
+                break :blk .{ false, t, args.weight };
+            },
+            .token_ids => |b| .{ true, 0, b },
+        };
+        const params: EmbedParams = .{
+            .m = args.m,
+            .vocab_size = args.vocab_size,
+            .hidden_size = args.hidden_size,
+            .row_bytes = std.math.cast(u32, row_bytes) orelse return error.Overflow,
+            .num_groups = @intCast(num_groups),
+            .use_token_buffer = if (use_buf) 1 else 0,
+            .token_id = tok_id,
+        };
+        const vec_cols: u64 = (@as(u64, args.hidden_size) + 7) / 8;
+        try frame.encodeThreads(
+            pipe,
+            &.{ args.weight, sb_binding, tok_binding, args.out },
+            std.mem.asBytes(&params),
+            .{ vec_cols, args.m, 1 },
+            .{ @min(vec_cols, 64), 1, 1 },
+            insert_barrier_before,
+        );
     }
 
     pub fn encodeSiluMul(
@@ -2340,5 +2801,675 @@ test "encode helpers validate dimensions, alignment, and workspace capacity" {
         .top_k = 2,
         .hidden_size = 65,
         .intermediate_size = 64,
+    }, false));
+}
+
+// ---------------------------------------------------------------------------
+// M2.5 CPU fp32 references: BF16 / quantized routers, FP16 / BF16 MoE layer,
+// and embedding lookup (G12, ADR-0016)
+// ---------------------------------------------------------------------------
+
+/// Algorithmic minimum weight bytes read by one deduplicated FP16 / BF16 MoE
+/// layer when `unique_experts` distinct experts are active.
+pub fn expertLayerBytesFloat(unique_experts: u32, hidden_size: u32, intermediate_size: u32) quant.ShapeError!u64 {
+    const per_expert = std.math.mul(u64, @as(u64, 3 * 2) * hidden_size, intermediate_size) catch return error.Overflow;
+    return std.math.mul(u64, per_expert, unique_experts) catch return error.Overflow;
+}
+
+/// CPU fp32 reference router projection over `f16` / `bf16` weights
+/// (`w_bits` holds raw 16-bit patterns of `[num_experts, hidden]`).
+pub fn routerProjFloatRef(
+    dtype: quant.FloatDType,
+    x: []const f16,
+    w_bits: []const u16,
+    logits_f32: []f32,
+    m: u32,
+    num_experts: u32,
+    hidden_size: u32,
+) (quant.ShapeError || error{BufferTooSmall})!void {
+    return quant.denseGemmCpuRef(dtype, x, w_bits, logits_f32, m, num_experts, hidden_size);
+}
+
+/// CPU fp32 reference router projection over MLX affine group-64 weights.
+pub fn routerProjQuantRef(
+    comptime spec: quant.QuantSpec,
+    x: []const f16,
+    qweight: []const u8,
+    scale_bias: []const quant.ScaleBias,
+    logits_f32: []f32,
+    m: u32,
+    num_experts: u32,
+    hidden_size: u32,
+) (quant.ShapeError || error{BufferTooSmall})!void {
+    return quant.QuantOps(spec).matmulRef(x, qweight, scale_bias, logits_f32, m, num_experts, hidden_size);
+}
+
+fn floatMatrixAt(weights_base: []const u8, offset: u64, n: usize, k: usize) []const u16 {
+    const off: usize = @intCast(offset);
+    return @alignCast(std.mem.bytesAsSlice(u16, weights_base[off..][0 .. n * k * @sizeOf(u16)]));
+}
+
+/// Full CPU fp32 reference for an FP16 / BF16 MoE layer over an arena byte
+/// buffer and `ExpertWeights` byte-offset table (`*_sb_offset` ignored).
+pub fn moeLayerFloatRef(
+    dtype: quant.FloatDType,
+    allocator: std.mem.Allocator,
+    x: []const f16,
+    logits_f32: []const f32,
+    weights_base: []const u8,
+    expert_table: []const ExpertWeights,
+    residual: ?[]const f16,
+    out_f32: []f32,
+    m: u32,
+    num_experts: u32,
+    top_k: u32,
+    hidden_size: u32,
+    intermediate_size: u32,
+    norm_topk_prob: bool,
+) !RouteRefResult {
+    var route = try routeTopKRef(allocator, logits_f32, m, num_experts, top_k, norm_topk_prob);
+    errdefer route.deinit(allocator);
+
+    const gate_buf = try allocator.alloc(f32, intermediate_size);
+    defer allocator.free(gate_buf);
+    const up_buf = try allocator.alloc(f32, intermediate_size);
+    defer allocator.free(up_buf);
+    const inter_f16 = try allocator.alloc(f16, intermediate_size);
+    defer allocator.free(inter_f16);
+    const down_buf = try allocator.alloc(f32, hidden_size);
+    defer allocator.free(down_buf);
+
+    for (0..@as(usize, m) * hidden_size) |i| {
+        out_f32[i] = if (residual) |res| @as(f32, @floatCast(res[i])) else 0.0;
+    }
+
+    for (0..m) |tok| {
+        const x_tok = x[tok * hidden_size ..][0..hidden_size];
+        const out_tok = out_f32[tok * hidden_size ..][0..hidden_size];
+        for (0..top_k) |k_idx| {
+            const e = route.topk_experts[tok * top_k + k_idx];
+            const rw = route.topk_weights[tok * top_k + k_idx];
+            const ew = expert_table[e];
+            const gate_w = floatMatrixAt(weights_base, ew.gate_qweight_offset, intermediate_size, hidden_size);
+            const up_w = floatMatrixAt(weights_base, ew.up_qweight_offset, intermediate_size, hidden_size);
+            const down_w = floatMatrixAt(weights_base, ew.down_qweight_offset, hidden_size, intermediate_size);
+            try quant.denseGemvCpuRef(dtype, x_tok, gate_w, gate_buf, intermediate_size, hidden_size);
+            try quant.denseGemvCpuRef(dtype, x_tok, up_w, up_buf, intermediate_size, hidden_size);
+            for (0..intermediate_size) |i| {
+                inter_f16[i] = @floatCast(siluF32(gate_buf[i]) * up_buf[i]);
+            }
+            try quant.denseGemvCpuRef(dtype, inter_f16, down_w, down_buf, hidden_size, intermediate_size);
+            for (0..hidden_size) |i| out_tok[i] += down_buf[i] * rw;
+        }
+    }
+    return route;
+}
+
+/// CPU fp32 reference embedding lookup. `table` holds raw `f16` / `bf16`
+/// `[vocab, hidden]` elements or packed MLX affine group-64 codes; quantized
+/// tables require `scale_bias`. Out-of-range token IDs produce zero rows.
+pub fn embedLookupRef(
+    dtype: quant.WeightDType,
+    table: []const u8,
+    scale_bias: ?[]const quant.ScaleBias,
+    token_ids: []const u32,
+    out: []f32,
+    vocab_size: u32,
+    hidden_size: u32,
+) (quant.ShapeError || error{ BufferTooSmall, MissingScaleBias })!void {
+    const h: usize = hidden_size;
+    if (out.len < token_ids.len * h) return error.BufferTooSmall;
+    for (token_ids, 0..) |tok, row| {
+        const dst = out[row * h ..][0..h];
+        if (tok >= vocab_size) {
+            @memset(dst, 0.0);
+            continue;
+        }
+        switch (dtype) {
+            .f16, .bf16 => {
+                const fdt: quant.FloatDType = if (dtype == .f16) .f16 else .bf16;
+                const row_bits: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, table[tok * h * 2 ..][0 .. h * 2]));
+                for (0..h) |i| dst[i] = quant.floatBitsToF32(fdt, row_bits[i]);
+            },
+            inline .q4_affine, .q3_affine => |q| {
+                const Ops = quant.QuantOps(.{ .bits = if (q == .q4_affine) .q4 else .q3, .group_size = 64 });
+                const sbs = scale_bias orelse return error.MissingScaleBias;
+                const groups = try Ops.groupsPerRow(h);
+                const row_bytes = try Ops.rowWeightBytes(h);
+                const gb = Ops.groupWeightBytes();
+                var deq: [64]f32 = undefined;
+                for (0..groups) |g| {
+                    Ops.dequantizeGroup(table[tok * row_bytes + g * gb ..][0..gb], sbs[tok * groups + g], &deq);
+                    @memcpy(dst[g * 64 ..][0..64], &deq);
+                }
+            },
+        }
+    }
+}
+
+fn verifyRouterFloat(dtype: RouterWeightDType, m: u32, num_experts: u32, hidden: u32) !void {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    const fdt: quant.FloatDType = if (dtype == .bf16) .bf16 else .f16;
+    const x_bytes: usize = @as(usize, m) * hidden * @sizeOf(f16);
+    const w_bytes: usize = @as(usize, num_experts) * hidden * @sizeOf(u16);
+    const l_bytes: usize = @as(usize, m) * num_experts * @sizeOf(f32);
+    var arena = try makeTestArena(x_bytes + w_bytes + l_bytes + 512);
+    defer arena.deinit();
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const w_raw = try arena.allocAligned(w_bytes, 64);
+    const l_raw = try arena.allocAligned(l_bytes, 64);
+    @memset(l_raw, 0);
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    const w_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_raw));
+    const l_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, l_raw));
+    for (x_f16, 0..) |*v, i| {
+        const c: i32 = @as(i32, @intCast((i * 11 + 3) % 23)) - 11;
+        v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.0625);
+    }
+    for (w_bits, 0..) |*v, i| {
+        const c: i32 = @as(i32, @intCast((i * 7 + 5) % 19)) - 9;
+        v.* = quant.f32ToFloatBits(fdt, @as(f32, @floatFromInt(c)) * 0.03125 + @as(f32, @floatFromInt(i % 3)) / 300.0);
+    }
+    const ref = try gpa.alloc(f32, @as(usize, m) * num_experts);
+    defer gpa.free(ref);
+    try routerProjFloatRef(fdt, x_f16, w_bits, ref, m, num_experts, hidden);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+    try pipes.encodeRouterProj(&frame, dtype, .{
+        .x = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) },
+        .router_weights = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w_raw.ptr) },
+        .logits = .{ .buffer = gpu_buf, .offset = arena.offsetOf(l_raw.ptr) },
+        .m = m,
+        .num_experts = num_experts,
+        .hidden_size = hidden,
+    }, false);
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+    for (ref, 0..) |expected, i| {
+        try std.testing.expectApproxEqAbs(expected, l_f32[i], @max(1e-3, @abs(expected) * 1e-4));
+    }
+}
+
+test "ami_moe_router_proj computes bf16 router logits on standard and odd shapes" {
+    try verifyRouterFloat(.bf16, 1, 128, 256);
+    try verifyRouterFloat(.bf16, 8, 128, 192);
+    try verifyRouterFloat(.bf16, 5, 17, 67);
+    try verifyRouterFloat(.f16, 3, 33, 2048);
+}
+
+fn verifyRouterQuant(comptime spec: quant.QuantSpec, m: u32, num_experts: u32, hidden: u32) !void {
+    const Ops = quant.QuantOps(spec);
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    const qw_bytes = try Ops.packedWeightBytes(num_experts, hidden);
+    const sb_bytes = try Ops.scaleBiasBytes(num_experts, hidden);
+    const x_bytes: usize = @as(usize, m) * hidden * @sizeOf(f16);
+    const l_bytes: usize = @as(usize, m) * num_experts * @sizeOf(f32);
+    var arena = try makeTestArena(qw_bytes + sb_bytes + x_bytes + l_bytes + 1024);
+    defer arena.deinit();
+    const qw_raw = try arena.allocAligned(qw_bytes, 64);
+    const sb_raw = try arena.allocAligned(sb_bytes, 64);
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const l_raw = try arena.allocAligned(l_bytes, 64);
+    @memset(l_raw, 0);
+    const sbs: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_raw));
+    try fillSyntheticQuantMatrix(spec, qw_raw, sbs, num_experts, hidden, 5);
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    for (x_f16, 0..) |*v, i| {
+        const c: i32 = @as(i32, @intCast((i * 13 + 1) % 29)) - 14;
+        v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.03125);
+    }
+    const l_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, l_raw));
+    const ref = try gpa.alloc(f32, @as(usize, m) * num_experts);
+    defer gpa.free(ref);
+    try routerProjQuantRef(spec, x_f16, qw_raw, sbs, ref, m, num_experts, hidden);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+    try pipes.encodeRouterProjQuant(&frame, spec.bits, .{
+        .x = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) },
+        .qweight = .{ .buffer = gpu_buf, .offset = arena.offsetOf(qw_raw.ptr) },
+        .scale_bias = .{ .buffer = gpu_buf, .offset = arena.offsetOf(sb_raw.ptr) },
+        .logits = .{ .buffer = gpu_buf, .offset = arena.offsetOf(l_raw.ptr) },
+        .m = m,
+        .num_experts = num_experts,
+        .hidden_size = hidden,
+    }, false);
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+    for (ref, 0..) |expected, i| {
+        try std.testing.expectApproxEqAbs(expected, l_f32[i], @max(2e-3, @abs(expected) * 1e-3));
+    }
+}
+
+test "ami_moe_router_proj_q computes q3 and q4 router logits matching CPU fp32 reference" {
+    // Real Qwen3-30B-A3B-3bit router geometry: q3_affine [128, 2048].
+    try verifyRouterQuant(.{ .bits = .q3, .group_size = 64 }, 1, 128, 2048);
+    try verifyRouterQuant(.{ .bits = .q3, .group_size = 64 }, 8, 128, 2048);
+    try verifyRouterQuant(.{ .bits = .q4, .group_size = 64 }, 1, 128, 2048);
+    try verifyRouterQuant(.{ .bits = .q4, .group_size = 64 }, 3, 17, 192);
+    try verifyRouterQuant(.{ .bits = .q3, .group_size = 64 }, 5, 33, 320);
+}
+
+const FloatRouterMode = enum { logits, bf16_weights, q3_weights };
+
+fn verifyFullMoELayerFloat(
+    dtype: quant.FloatDType,
+    m: u32,
+    num_experts: u32,
+    top_k: u32,
+    hidden_size: u32,
+    intermediate_size: u32,
+    router_mode: FloatRouterMode,
+    with_residual: bool,
+) !void {
+    const gpa = std.testing.allocator;
+    const Q3 = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    const gu_bytes: usize = @as(usize, intermediate_size) * hidden_size * @sizeOf(u16);
+    const dn_bytes: usize = gu_bytes;
+    const gu_blob = try page.alignUp(gu_bytes);
+    const dn_blob = try page.alignUp(dn_bytes);
+    const all_experts_bytes = @as(usize, num_experts) * (2 * gu_blob + dn_blob);
+
+    const ws_spec: WorkspaceSpec = .{
+        .max_tokens = m,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+    };
+    const ws_bytes = try MoeWorkspace.requiredBytes(ws_spec);
+    const table_bytes = @as(usize, num_experts) * @sizeOf(ExpertWeights);
+    const x_bytes = @as(usize, m) * hidden_size * @sizeOf(f16);
+    const router_bytes = @as(usize, num_experts) * hidden_size * @sizeOf(u16);
+    const logits_bytes = @as(usize, m) * num_experts * @sizeOf(f32);
+    var arena = try makeTestArena(all_experts_bytes + ws_bytes + table_bytes + 2 * x_bytes +
+        2 * router_bytes + logits_bytes + 8 * page.APPLE_PAGE_SIZE);
+    defer arena.deinit();
+    _ = try arena.allocPages(page.APPLE_PAGE_SIZE);
+
+    const table_raw = try arena.allocAligned(table_bytes, 64);
+    const expert_table: []ExpertWeights = @alignCast(std.mem.bytesAsSlice(ExpertWeights, table_raw));
+    for (0..num_experts) |e| {
+        const blobs = [_][]align(page.APPLE_PAGE_SIZE) u8{
+            try arena.allocPages(gu_blob),
+            try arena.allocPages(gu_blob),
+            try arena.allocPages(dn_blob),
+        };
+        for (blobs, 0..) |blob, which| {
+            const bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, blob[0..gu_bytes]));
+            for (bits, 0..) |*v, i| {
+                const c: i32 = @as(i32, @intCast((e * 37 + which * 11 + i * 7 + 3) % 41)) - 20;
+                v.* = quant.f32ToFloatBits(dtype, @as(f32, @floatFromInt(c)) * 0.004 + @as(f32, @floatFromInt(i % 3)) / 900.0);
+            }
+        }
+        expert_table[e] = .{
+            .gate_qweight_offset = arena.offsetOf(blobs[0].ptr),
+            .gate_sb_offset = 0,
+            .up_qweight_offset = arena.offsetOf(blobs[1].ptr),
+            .up_sb_offset = 0,
+            .down_qweight_offset = arena.offsetOf(blobs[2].ptr),
+            .down_sb_offset = 0,
+        };
+    }
+
+    const ws = try MoeWorkspace.init(&arena, ws_spec);
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const out_raw = try arena.allocAligned(x_bytes, 64);
+    const router_raw = try arena.allocAligned(router_bytes, 64);
+    const router_sb_raw = try arena.allocAligned(router_bytes, 64);
+    const logits_raw = try arena.allocAligned(logits_bytes, 64);
+
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    const out_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw));
+    for (x_f16, 0..) |*v, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 17 + 11) % 31)) - 15;
+        v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.03125);
+    }
+    const resid_copy = try gpa.alloc(f16, x_f16.len);
+    defer gpa.free(resid_copy);
+    for (out_f16, 0..) |*v, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 13 + 7) % 19)) - 9;
+        v.* = if (with_residual) @floatCast(@as(f32, @floatFromInt(c)) * 0.0625) else @floatCast(0.0);
+        resid_copy[idx] = v.*;
+    }
+
+    const ref_logits = try gpa.alloc(f32, @as(usize, m) * num_experts);
+    defer gpa.free(ref_logits);
+    var q3_sbs: []quant.ScaleBias = &.{};
+    switch (router_mode) {
+        .logits => {
+            const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+            for (0..m) |tok| {
+                for (0..num_experts) |e| {
+                    var v: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((tok * 13 + e * 5) % 23)) - 11)) * 0.125;
+                    if (e < top_k) {
+                        v = 3.5 - 0.1 * @as(f32, @floatFromInt(e));
+                    } else if (e == (top_k + (tok % 3)) % num_experts) {
+                        v = 4.0;
+                    }
+                    logits_f32[tok * num_experts + e] = v;
+                    ref_logits[tok * num_experts + e] = v;
+                }
+            }
+        },
+        .bf16_weights => {
+            const rw: []u16 = @alignCast(std.mem.bytesAsSlice(u16, router_raw));
+            for (0..num_experts) |e| {
+                for (0..hidden_size) |k| {
+                    const c: i32 = @as(i32, @intCast((e * 11 + k * 3 + 1) % 17)) - 8;
+                    const boost: f32 = if (e < top_k + 2) 0.05 else 0.0;
+                    rw[e * hidden_size + k] = quant.f32ToBf16(@as(f32, @floatFromInt(c)) * 0.015625 + boost);
+                }
+            }
+            try routerProjFloatRef(.bf16, x_f16, rw, ref_logits, m, num_experts, hidden_size);
+        },
+        .q3_weights => {
+            const qw_bytes = try Q3.packedWeightBytes(num_experts, hidden_size);
+            const sb_bytes = try Q3.scaleBiasBytes(num_experts, hidden_size);
+            q3_sbs = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, router_sb_raw[0..sb_bytes]));
+            try fillSyntheticQuantMatrix(.{ .bits = .q3, .group_size = 64 }, router_raw[0..qw_bytes], q3_sbs, num_experts, hidden_size, 9);
+            try routerProjQuantRef(.{ .bits = .q3, .group_size = 64 }, x_f16, router_raw[0..qw_bytes], q3_sbs, ref_logits, m, num_experts, hidden_size);
+        },
+    }
+
+    const ref_out = try gpa.alloc(f32, @as(usize, m) * hidden_size);
+    defer gpa.free(ref_out);
+    var route_ref = try moeLayerFloatRef(
+        dtype,
+        gpa,
+        x_f16,
+        ref_logits,
+        arena.bytes(),
+        expert_table,
+        if (with_residual) resid_copy else null,
+        ref_out,
+        m,
+        num_experts,
+        top_k,
+        hidden_size,
+        intermediate_size,
+        true,
+    );
+    defer route_ref.deinit(gpa);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const router_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(router_raw.ptr) };
+    const out_binding: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) };
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+    try pipes.encodeMoELayerFloat(&frame, dtype, .{
+        .x = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) },
+        .router = switch (router_mode) {
+            .logits => .{ .logits = .{ .binding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(logits_raw.ptr) }, .dtype = .f32 } },
+            .bf16_weights => .{ .weights = .{ .binding = router_bind, .dtype = .bf16 } },
+            .q3_weights => .{ .quant_weights = .{
+                .qweight = router_bind,
+                .scale_bias = .{ .buffer = gpu_buf, .offset = arena.offsetOf(router_sb_raw.ptr) },
+                .bits = .q3,
+            } },
+        },
+        .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+        .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(table_raw.ptr) },
+        .workspace = &ws,
+        .workspace_buf = gpu_buf,
+        .residual = if (with_residual) out_binding else null,
+        .out = out_binding,
+        .m = m,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+        .norm_topk_prob = true,
+    }, false);
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+
+    try std.testing.expectEqual(route_ref.num_unique, ws.schedule_header.num_unique_experts);
+    if (router_mode == .logits and m > 1) {
+        try std.testing.expect(ws.schedule_header.num_unique_experts < m * top_k);
+    }
+    for (ref_out, 0..) |expected, idx| {
+        const got: f32 = @floatCast(out_f16[idx]);
+        try std.testing.expectApproxEqAbs(expected, got, @max(0.01, @abs(expected) * 0.01));
+    }
+}
+
+test "deduplicated FP16 MoE layer matches CPU fp32 reference on M=1 decode and M=8 batch" {
+    try verifyFullMoELayerFloat(.f16, 1, 16, 8, 256, 192, .bf16_weights, false);
+    try verifyFullMoELayerFloat(.f16, 8, 32, 8, 192, 128, .logits, true);
+    try verifyFullMoELayerFloat(.f16, 8, 16, 8, 256, 96, .q3_weights, true);
+    try verifyFullMoELayerFloat(.f16, 5, 17, 3, 68, 36, .logits, false);
+}
+
+test "deduplicated BF16 MoE layer matches CPU fp32 reference on M=1 decode and M=8 batch" {
+    try verifyFullMoELayerFloat(.bf16, 1, 16, 8, 256, 192, .q3_weights, true);
+    try verifyFullMoELayerFloat(.bf16, 8, 32, 8, 192, 128, .logits, true);
+    try verifyFullMoELayerFloat(.bf16, 8, 16, 4, 128, 64, .bf16_weights, false);
+    try verifyFullMoELayerFloat(.bf16, 5, 17, 3, 68, 36, .logits, true);
+}
+
+test "FP16 / BF16 MoE encoders reject K not divisible by 4" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+    const ws_spec: WorkspaceSpec = .{ .max_tokens = 1, .num_experts = 4, .top_k = 2, .hidden_size = 66, .intermediate_size = 64 };
+    var arena = try makeTestArena(try MoeWorkspace.requiredBytes(ws_spec));
+    defer arena.deinit();
+    const ws = try MoeWorkspace.init(&arena, ws_spec);
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+    var frame = try compute.beginFrame(5000);
+    defer frame.abort();
+    const b: metal.BufferBinding = .{ .buffer = buf };
+    try std.testing.expectError(error.UnalignedK, pipes.encodeMoELayerFloat(&frame, .bf16, .{
+        .x = b,
+        .router = .{ .logits = .{ .binding = b, .dtype = .f32 } },
+        .weights_base = b,
+        .expert_table = b,
+        .workspace = &ws,
+        .workspace_buf = buf,
+        .out = b,
+        .m = 1,
+        .num_experts = 4,
+        .top_k = 2,
+        .hidden_size = 66,
+        .intermediate_size = 64,
+    }, false));
+    try std.testing.expectEqual(@as(u64, 3 * 2 * 2048 * 768 * 8), try expertLayerBytesFloat(8, 2048, 768));
+}
+
+const EmbedTokenMode = enum { uniform, buffer };
+
+fn verifyEmbedLookup(dtype: quant.WeightDType, vocab: u32, hidden: u32, m: u32, mode: EmbedTokenMode) !void {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    const table_bytes: usize, const sb_bytes: usize = switch (dtype) {
+        .f16, .bf16 => .{ @as(usize, vocab) * hidden * 2, 0 },
+        .q4_affine => blk: {
+            const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+            break :blk .{ try Ops.packedWeightBytes(vocab, hidden), try Ops.scaleBiasBytes(vocab, hidden) };
+        },
+        .q3_affine => blk: {
+            const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+            break :blk .{ try Ops.packedWeightBytes(vocab, hidden), try Ops.scaleBiasBytes(vocab, hidden) };
+        },
+    };
+    const out_bytes: usize = @as(usize, m) * hidden * @sizeOf(f16);
+    var arena = try makeTestArena(try page.alignUp(table_bytes) + sb_bytes + out_bytes + 4096);
+    defer arena.deinit();
+    const table_raw = try arena.allocPages(try page.alignUp(table_bytes));
+    const sb_raw = try arena.allocAligned(@max(sb_bytes, 64), 64);
+    const ids_raw = try arena.allocAligned(@as(usize, m) * @sizeOf(u32), 64);
+    const out_raw = try arena.allocAligned(out_bytes, 64);
+    @memset(out_raw, 0xFF);
+
+    var sbs: ?[]quant.ScaleBias = null;
+    switch (dtype) {
+        .f16, .bf16 => {
+            const fdt: quant.FloatDType = if (dtype == .f16) .f16 else .bf16;
+            const bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, table_raw[0..table_bytes]));
+            for (bits, 0..) |*v, i| {
+                const c: i32 = @as(i32, @intCast((i * 31 + 17) % 61)) - 30;
+                v.* = quant.f32ToFloatBits(fdt, @as(f32, @floatFromInt(c)) * 0.01 + @as(f32, @floatFromInt(i % 7)) / 7000.0);
+            }
+        },
+        .q4_affine => {
+            const s: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_raw[0..sb_bytes]));
+            try fillSyntheticQuantMatrix(.{ .bits = .q4, .group_size = 64 }, table_raw[0..table_bytes], s, vocab, hidden, 3);
+            sbs = s;
+        },
+        .q3_affine => {
+            const s: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_raw[0..sb_bytes]));
+            try fillSyntheticQuantMatrix(.{ .bits = .q3, .group_size = 64 }, table_raw[0..table_bytes], s, vocab, hidden, 4);
+            sbs = s;
+        },
+    }
+
+    const ids: []u32 = @alignCast(std.mem.bytesAsSlice(u32, ids_raw));
+    for (ids, 0..) |*id, i| id.* = @intCast((i * 97 + 13) % vocab);
+    if (mode == .uniform) {
+        std.debug.assert(m == 1);
+        ids[0] = vocab - 1;
+    } else if (m > 2) {
+        ids[1] = vocab + 5; // out of range -> zero row
+        ids[2] = ids[0]; // duplicate token
+    }
+
+    const ref = try gpa.alloc(f32, @as(usize, m) * hidden);
+    defer gpa.free(ref);
+    try embedLookupRef(dtype, table_raw, sbs, ids, ref, vocab, hidden);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+    try pipes.encodeEmbedLookup(&frame, dtype, .{
+        .weight = .{ .buffer = gpu_buf, .offset = arena.offsetOf(table_raw.ptr) },
+        .scale_bias = if (sbs != null) .{ .buffer = gpu_buf, .offset = arena.offsetOf(sb_raw.ptr) } else null,
+        .tokens = switch (mode) {
+            .uniform => .{ .token_id = ids[0] },
+            .buffer => .{ .token_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(ids_raw.ptr) } },
+        },
+        .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) },
+        .m = m,
+        .vocab_size = vocab,
+        .hidden_size = hidden,
+    }, false);
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+
+    const out_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw));
+    for (ref, 0..) |expected, i| {
+        const got: f32 = @floatCast(out_f16[i]);
+        switch (dtype) {
+            // f16 copies are bit-exact; bf16 -> f16 is a single RNE rounding.
+            .f16, .bf16 => try std.testing.expectEqual(@as(f32, @floatCast(@as(f16, @floatCast(expected)))), got),
+            .q4_affine, .q3_affine => try std.testing.expectApproxEqAbs(expected, got, @max(1e-3, @abs(expected) * 2e-3)),
+        }
+    }
+}
+
+test "GPU embedding lookup matches CPU reference for f16, bf16, q4 and q3 tables" {
+    try verifyEmbedLookup(.f16, 1000, 2048, 1, .uniform);
+    try verifyEmbedLookup(.f16, 300, 100, 8, .buffer);
+    try verifyEmbedLookup(.bf16, 1000, 1024, 1, .uniform);
+    try verifyEmbedLookup(.bf16, 300, 1030, 8, .buffer);
+    try verifyEmbedLookup(.q4_affine, 257, 640, 8, .buffer);
+    try verifyEmbedLookup(.q4_affine, 151, 5120, 1, .uniform);
+    try verifyEmbedLookup(.q3_affine, 151, 2048, 1, .uniform);
+    try verifyEmbedLookup(.q3_affine, 97, 192, 5, .buffer);
+}
+
+test "GPU embedding lookup rejects quantized tables without scale_bias and multi-token uniforms" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+    var arena = try makeTestArena(page.APPLE_PAGE_SIZE);
+    defer arena.deinit();
+    _ = try arena.allocPages(page.APPLE_PAGE_SIZE);
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+    var frame = try compute.beginFrame(5000);
+    defer frame.abort();
+    const b: metal.BufferBinding = .{ .buffer = buf };
+    try std.testing.expectError(error.InvalidArgument, pipes.encodeEmbedLookup(&frame, .q3_affine, .{
+        .weight = b,
+        .tokens = .{ .token_id = 0 },
+        .out = b,
+        .vocab_size = 8,
+        .hidden_size = 64,
+    }, false));
+    try std.testing.expectError(error.InvalidArgument, pipes.encodeEmbedLookup(&frame, .f16, .{
+        .weight = b,
+        .tokens = .{ .token_id = 0 },
+        .out = b,
+        .m = 2,
+        .vocab_size = 8,
+        .hidden_size = 64,
+    }, false));
+    try std.testing.expectError(error.UnalignedK, pipes.encodeEmbedLookup(&frame, .q4_affine, .{
+        .weight = b,
+        .scale_bias = b,
+        .tokens = .{ .token_id = 0 },
+        .out = b,
+        .vocab_size = 8,
+        .hidden_size = 100,
     }, false));
 }

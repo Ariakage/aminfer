@@ -1,6 +1,7 @@
-//! GPU fused 3-bit and 4-bit affine dequantization GEMV and GEMM (G1, G2).
+//! GPU fused 3-bit and 4-bit affine dequantization GEMV and GEMM (G1, G2),
+//! plus native unquantized FP16 / BF16 dense GEMV and GEMM (G12, ADR-0016).
 //! Pipelines are compiled once at startup using Metal function constants
-//! (`Q_BITS`, `Q_GROUP_SIZE`) matching `src/quant/spec.zig`.
+//! (`Q_BITS`, `Q_GROUP_SIZE`, `DENSE_W_BF16`) matching `src/quant/spec.zig`.
 
 const std = @import("std");
 const metal = @import("../bridge/metal.zig");
@@ -38,6 +39,41 @@ pub const GemmArgs = struct {
     k: u32,
 };
 
+/// Uniform payload matching `struct DenseParams` in `dequant_gemm.metal`.
+pub const DenseParams = extern struct {
+    m: u32,
+    n: u32,
+    k: u32,
+    _pad: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(DequantParams) != 20) @compileError("DequantParams must be 20 bytes");
+    if (@sizeOf(DenseParams) != 16) @compileError("DenseParams must be 16 bytes");
+}
+
+/// Dense FP16 / BF16 GEMV: `x` is `f16 [k]`, `weight` is `f16` or `bf16`
+/// row-major `[n, k]`, `y` is `f16 [n]`. Bindings must be at least 8-byte
+/// aligned (`.amf` blobs are 16 KiB aligned) for the `K % 4 == 0` fast path.
+pub const DenseGemvArgs = struct {
+    x: metal.BufferBinding,
+    weight: metal.BufferBinding,
+    y: metal.BufferBinding,
+    n: u32,
+    k: u32,
+};
+
+/// Dense FP16 / BF16 GEMM: `x` is `f16 [m, k]`, `weight` is `f16` or `bf16`
+/// row-major `[n, k]`, `y` is `f16 [m, n]`.
+pub const DenseGemmArgs = struct {
+    x: metal.BufferBinding,
+    weight: metal.BufferBinding,
+    y: metal.BufferBinding,
+    m: u32,
+    n: u32,
+    k: u32,
+};
+
 pub const EncodeError = metal.Error || quant.ShapeError;
 
 /// Startup-compiled specialized Metal 4 pipelines for 3-bit and 4-bit
@@ -47,6 +83,10 @@ pub const DequantPipelines = struct {
     gemv_q3: metal.Pipeline,
     gemm_q4: metal.Pipeline,
     gemm_q3: metal.Pipeline,
+    gemv_f16: metal.Pipeline,
+    gemv_bf16: metal.Pipeline,
+    gemm_f16: metal.Pipeline,
+    gemm_bf16: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!DequantPipelines {
         const gemv_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv", &.{
@@ -73,15 +113,43 @@ pub const DequantPipelines = struct {
         });
         errdefer gemm_q3.close();
 
+        const gemv_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
+        errdefer gemv_f16.close();
+
+        const gemv_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer gemv_bf16.close();
+
+        const gemm_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
+        errdefer gemm_f16.close();
+
+        const gemm_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer gemm_bf16.close();
+
         return .{
             .gemv_q4 = gemv_q4,
             .gemv_q3 = gemv_q3,
             .gemm_q4 = gemm_q4,
             .gemm_q3 = gemm_q3,
+            .gemv_f16 = gemv_f16,
+            .gemv_bf16 = gemv_bf16,
+            .gemm_f16 = gemm_f16,
+            .gemm_bf16 = gemm_bf16,
         };
     }
 
     pub fn close(self: DequantPipelines) void {
+        self.gemm_bf16.close();
+        self.gemm_f16.close();
+        self.gemv_bf16.close();
+        self.gemv_f16.close();
         self.gemm_q3.close();
         self.gemm_q4.close();
         self.gemv_q3.close();
@@ -154,6 +222,59 @@ pub const DequantPipelines = struct {
         try frame.encodeThreadgroups(
             pipe,
             &.{ args.x, args.qweight, args.scale_bias, args.y },
+            std.mem.asBytes(&params),
+            .{ groups_x, groups_y, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes a native FP16 / BF16 dense GEMV (`M = 1`), e.g. attention / FFN
+    /// projections and the `lm_head` (`N = 151936`). Zero heap allocation.
+    pub fn encodeDenseGemv(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.FloatDType,
+        args: DenseGemvArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const pipe = switch (dtype) {
+            .f16 => self.gemv_f16,
+            .bf16 => self.gemv_bf16,
+        };
+        const params: DenseParams = .{ .m = 1, .n = args.n, .k = args.k };
+        const groups_x: u64 = (@as(u64, args.n) + 15) / 16;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.weight, args.y },
+            std.mem.asBytes(&params),
+            .{ groups_x, 1, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes a native FP16 / BF16 dense GEMM (`M >= 1`) with FP32
+    /// `simdgroup_float8x8` accumulation. Zero heap allocation.
+    pub fn encodeDenseGemm(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.FloatDType,
+        args: DenseGemmArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const pipe = switch (dtype) {
+            .f16 => self.gemm_f16,
+            .bf16 => self.gemm_bf16,
+        };
+        const params: DenseParams = .{ .m = args.m, .n = args.n, .k = args.k };
+        const groups_x: u64 = (@as(u64, args.n) + 31) / 32;
+        const groups_y: u64 = (@as(u64, args.m) + 31) / 32;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.weight, args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 128, 1, 1 },
@@ -428,4 +549,175 @@ test "end-to-end .amf blob loads into WiredArena and executes on GPU without cop
         const got: f32 = @floatCast(y_f16[idx]);
         try std.testing.expectApproxEqAbs(expected, got, @max(0.02, @abs(expected) * 0.015));
     }
+}
+
+fn verifyDense(dtype: quant.FloatDType, m: usize, n: usize, k: usize, use_gemm: bool, big_weights: bool) !void {
+    const gpa = std.testing.allocator;
+
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try DequantPipelines.init(device, library);
+    defer pipes.close();
+
+    const x_bytes = m * k * @sizeOf(f16);
+    const w_bytes = n * k * @sizeOf(u16);
+    const y_bytes = m * n * @sizeOf(f16);
+    const arena_cap = try page.alignUp(w_bytes) + try page.alignUp(x_bytes + 256) +
+        try page.alignUp(y_bytes + 256) + 2 * page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    const w_raw = try arena.allocPages(try page.alignUp(w_bytes));
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const y_raw = try arena.allocAligned(y_bytes, 64);
+    @memset(y_raw, 0xFF);
+
+    const w_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_raw[0..w_bytes]));
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    const y_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_raw));
+
+    for (w_bits, 0..) |*v, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 29 + 7) % 37)) - 18;
+        var val: f32 = @as(f32, @floatFromInt(c)) * 0.0078125;
+        // BF16 exercise: magnitudes beyond the fp16 range (> 65504) stay finite.
+        if (big_weights and (idx % k) == 0) val = 3.0e5 + 1024.0 * @as(f32, @floatFromInt((idx / k) % 5));
+        v.* = quant.f32ToFloatBits(dtype, val);
+    }
+    for (x_f16, 0..) |*v, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 17 + 11) % 31)) - 15;
+        v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.0625);
+        if (big_weights and (idx % k) == 0) v.* = @floatCast(0.0078125);
+    }
+
+    const ref = try gpa.alloc(f32, m * n);
+    defer gpa.free(ref);
+    try quant.denseGemmCpuRef(dtype, x_f16, w_bits, ref, m, n, k);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const x_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) };
+    const w_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w_raw.ptr) };
+    const y_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_raw.ptr) };
+
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+    if (use_gemm) {
+        try pipes.encodeDenseGemm(&frame, dtype, .{
+            .x = x_b,
+            .weight = w_b,
+            .y = y_b,
+            .m = @intCast(m),
+            .n = @intCast(n),
+            .k = @intCast(k),
+        }, false);
+    } else {
+        std.debug.assert(m == 1);
+        try pipes.encodeDenseGemv(&frame, dtype, .{
+            .x = x_b,
+            .weight = w_b,
+            .y = y_b,
+            .n = @intCast(n),
+            .k = @intCast(k),
+        }, false);
+    }
+    const sig = try frame.commit();
+    try compute.wait(sig, 10_000);
+
+    // GEMM BF16 stages X as bfloat (8-bit mantissa); allow its rounding error.
+    const x_rel: f32 = if (use_gemm and dtype == .bf16) 1.0 / 256.0 else 1.0 / 2048.0;
+    for (0..m) |mi| {
+        for (0..n) |ni| {
+            var abs_sum: f32 = 0.0;
+            for (0..k) |ki| {
+                abs_sum += @abs(@as(f32, @floatCast(x_f16[mi * k + ki])) * quant.floatBitsToF32(dtype, w_bits[ni * k + ki]));
+            }
+            const expected = ref[mi * n + ni];
+            const got: f32 = @floatCast(y_f16[mi * n + ni]);
+            const tol: f32 = 2e-3 + abs_sum * x_rel + @abs(expected) * (1.0 / 1024.0);
+            try std.testing.expect(std.math.isFinite(got));
+            try std.testing.expectApproxEqAbs(expected, got, tol);
+        }
+    }
+}
+
+test "dense FP16 GEMV matches CPU fp32 reference on aligned, tail, odd-K and lm_head-wide shapes" {
+    try verifyDense(.f16, 1, 16, 64, false, false);
+    try verifyDense(.f16, 1, 37, 100, false, false);
+    try verifyDense(.f16, 1, 33, 67, false, false);
+    try verifyDense(.f16, 1, 1024, 1024, false, false);
+    try verifyDense(.f16, 1, 8, 5120, false, false);
+    try verifyDense(.f16, 1, 151936, 64, false, false);
+}
+
+test "dense BF16 GEMV matches CPU fp32 reference including weights beyond the fp16 range" {
+    try verifyDense(.bf16, 1, 16, 64, false, false);
+    try verifyDense(.bf16, 1, 37, 100, false, false);
+    try verifyDense(.bf16, 1, 33, 67, false, false);
+    try verifyDense(.bf16, 1, 1024, 1024, false, false);
+    try verifyDense(.bf16, 1, 151936, 64, false, false);
+    try verifyDense(.bf16, 1, 64, 2048, false, true);
+}
+
+test "dense FP16 GEMM (simdgroup_half8x8) matches CPU fp32 reference on arbitrary M, N, K" {
+    try verifyDense(.f16, 1, 40, 36, true, false);
+    try verifyDense(.f16, 2, 37, 100, true, false);
+    try verifyDense(.f16, 7, 33, 67, true, false);
+    try verifyDense(.f16, 16, 64, 256, true, false);
+    try verifyDense(.f16, 37, 53, 192, true, false);
+    try verifyDense(.f16, 64, 128, 1024, true, false);
+}
+
+test "dense BF16 GEMM (simdgroup_bfloat8x8) matches CPU fp32 reference on arbitrary M, N, K" {
+    try verifyDense(.bf16, 1, 40, 36, true, false);
+    try verifyDense(.bf16, 2, 37, 100, true, false);
+    try verifyDense(.bf16, 7, 33, 67, true, false);
+    try verifyDense(.bf16, 16, 64, 256, true, false);
+    try verifyDense(.bf16, 37, 53, 192, true, false);
+    try verifyDense(.bf16, 64, 128, 1024, true, false);
+    try verifyDense(.bf16, 8, 48, 2048, true, true);
+}
+
+test "dense encoders reject zero dimensions" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try DequantPipelines.init(device, library);
+    defer pipes.close();
+
+    const cap = 2 * page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = 8 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = cap,
+        .global_user_wire_limit = cap,
+        .gpu_working_set_bytes = cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(cap, budget);
+    defer arena.deinit();
+    _ = try arena.allocPages(page.APPLE_PAGE_SIZE);
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+    var frame = try compute.beginFrame(5000);
+    defer frame.abort();
+    const b: metal.BufferBinding = .{ .buffer = buf };
+    try std.testing.expectError(error.ZeroDimension, pipes.encodeDenseGemv(&frame, .f16, .{ .x = b, .weight = b, .y = b, .n = 0, .k = 4 }, false));
+    try std.testing.expectError(error.ZeroDimension, pipes.encodeDenseGemm(&frame, .bf16, .{ .x = b, .weight = b, .y = b, .m = 0, .n = 4, .k = 4 }, false));
 }

@@ -12,6 +12,13 @@ constant uint Q_GROUP_SIZE [[function_constant(1)]];
 constant uint MOE_TOP_K [[function_constant(2)]];
 constant bool LOGITS_F16 [[function_constant(3)]];
 constant bool ROUTER_W_F16 [[function_constant(4)]];
+// Native BF16 router weights (ADR-0016); takes precedence over ROUTER_W_F16.
+constant bool ROUTER_W_BF16 [[function_constant(5)]];
+// Native FP16 / BF16 expert weights for the dense-float MoE SwiGLU (ADR-0016).
+constant bool MOE_W_BF16 [[function_constant(6)]];
+// Embedding table storage: 0 = f16, 1 = bf16, 2 = q4_affine, 3 = q3_affine
+// (matches `quant.WeightDType`).
+constant uint EMBED_KIND [[function_constant(7)]];
 
 struct ExpertWeights {
     ulong gate_qweight_offset;
@@ -139,6 +146,7 @@ static inline void dequant8_q3(uchar b0, uchar b1, uchar b2,
 
 // ---------------------------------------------------------------------------
 // Kernel 1: MoE Router Projection (`[M, hidden] @ router_w^T -> [M, E] f32`)
+// with f32, f16 (ROUTER_W_F16) or bf16 (ROUTER_W_BF16) router weights.
 //
 // 4 simdgroups / threadgroup (128 threads), 1 simdgroup per (tok, expert).
 // ---------------------------------------------------------------------------
@@ -159,7 +167,13 @@ kernel void ami_moe_router_proj(const device half *x [[buffer(0)]],
     if ((p.hidden_size & 3u) == 0u) {
         const uint vec_k = p.hidden_size >> 2;
         const device half4 *x_row = (const device half4 *)(x + ulong(tok) * p.hidden_size);
-        if (ROUTER_W_F16) {
+        if (ROUTER_W_BF16) {
+            const device bfloat4 *w_row =
+                (const device bfloat4 *)(((const device bfloat *)router_w) + ulong(e) * p.hidden_size);
+            for (uint k = lane; k < vec_k; k += 32u) {
+                acc += dot(float4(x_row[k]), float4(w_row[k]));
+            }
+        } else if (ROUTER_W_F16) {
             const device half4 *w_row =
                 (const device half4 *)(((const device half *)router_w) + ulong(e) * p.hidden_size);
             for (uint k = lane; k < vec_k; k += 32u) {
@@ -174,7 +188,12 @@ kernel void ami_moe_router_proj(const device half *x [[buffer(0)]],
         }
     } else {
         const device half *x_row = x + ulong(tok) * p.hidden_size;
-        if (ROUTER_W_F16) {
+        if (ROUTER_W_BF16) {
+            const device bfloat *w_row = ((const device bfloat *)router_w) + ulong(e) * p.hidden_size;
+            for (uint k = lane; k < p.hidden_size; k += 32u) {
+                acc = fma(float(x_row[k]), float(w_row[k]), acc);
+            }
+        } else if (ROUTER_W_F16) {
             const device half *w_row = ((const device half *)router_w) + ulong(e) * p.hidden_size;
             for (uint k = lane; k < p.hidden_size; k += 32u) {
                 acc = fma(float(x_row[k]), float(w_row[k]), acc);
@@ -965,6 +984,363 @@ kernel void ami_argmax_f16(const device half *logits [[buffer(0)]],
         }
         if (lane == 0u) {
             out_token_id[0] = (fi == 0xFFFFFFFFu) ? 0u : fi;
+        }
+    }
+}
+
+// ===========================================================================
+// M2.5 (G12, ADR-0016): quantized router, native FP16 / BF16 deduplicated MoE
+// SwiGLU, and GPU embedding lookup. All reductions accumulate in FP32.
+// ===========================================================================
+
+struct RouterQParams {
+    uint m;
+    uint num_experts;
+    uint hidden_size;
+    uint num_groups;
+    uint row_bytes;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct EmbedParams {
+    uint m;
+    uint vocab_size;
+    uint hidden_size;
+    uint row_bytes;
+    uint num_groups;
+    uint use_token_buffer;
+    uint token_id;
+    uint _pad;
+};
+
+// ---------------------------------------------------------------------------
+// Kernel 9: MLX affine 3-bit / 4-bit group-64 Router Projection
+// (`[M, hidden] @ dequant(router_qw)^T -> [M, E] f32`), e.g. the real
+// Qwen3-30B-A3B-3bit `mlp.gate` (`q3_affine [128, 2048]`).
+//
+// Geometry: 4 simdgroups/threadgroup (128 threads), 4 experts/simdgroup
+// (16 experts/threadgroup), grid (ceil(E / 16), M).
+// ---------------------------------------------------------------------------
+kernel void ami_moe_router_proj_q(const device half *x [[buffer(0)]],
+                                  const device uchar *qweight [[buffer(1)]],
+                                  const device half2 *scale_bias [[buffer(2)]],
+                                  device float *logits [[buffer(3)]],
+                                  constant RouterQParams &p [[buffer(4)]],
+                                  uint2 tg_pos [[threadgroup_position_in_grid]],
+                                  uint sg_id [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint ROWS_PER_SG = 4u;
+    const uint tok = tg_pos.y;
+    const uint row0 = tg_pos.x * 16u + sg_id * ROWS_PER_SG;
+    if (tok >= p.m || row0 >= p.num_experts) {
+        return;
+    }
+
+    const device half *x_tok = x + ulong(tok) * p.hidden_size;
+    const uint sub_group = lane >> 3;
+    const uint lane_in_grp = lane & 7u;
+    float acc[ROWS_PER_SG] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+        const uint g = g_base + sub_group;
+        if (g >= p.num_groups) {
+            continue;
+        }
+        const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+        const float4 fx0 = float4(*(const device half4 *)(x_tok + k_off));
+        const float4 fx1 = float4(*(const device half4 *)(x_tok + k_off + 4u));
+        const float x_sum = (fx0.x + fx0.y) + (fx0.z + fx0.w) + (fx1.x + fx1.y) + (fx1.z + fx1.w);
+
+        if (Q_BITS == 4u) {
+            const float4 px0 = float4(fx0.x, fx0.y * (1.0f / 16.0f), fx0.z * (1.0f / 256.0f), fx0.w * (1.0f / 4096.0f));
+            const float4 px1 = float4(fx1.x, fx1.y * (1.0f / 16.0f), fx1.z * (1.0f / 256.0f), fx1.w * (1.0f / 4096.0f));
+            const uint w_off = g * 32u + lane_in_grp * 4u;
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = min(row0 + r, p.num_experts - 1u);
+                const uint32_t w = *(const device uint32_t *)(qweight + ulong(row) * p.row_bytes + w_off);
+                const half2 sb = scale_bias[ulong(row) * p.num_groups + g];
+                acc[r] = fma(qdot8_q4(w, px0, px1), float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+            }
+        } else {
+            const float4 px0 = float4(fx0.x, fx0.y * (1.0f / 8.0f), fx0.z * (1.0f / 64.0f), fx0.w * (1.0f / 2.0f));
+            const float4 px1 = float4(fx1.x * (1.0f / 16.0f), fx1.y * (1.0f / 128.0f), fx1.z * (1.0f / 4.0f), fx1.w * (1.0f / 32.0f));
+            const float x2_hi = fx0.z * 4.0f;
+            const float x5_hi = fx1.y * 2.0f;
+            const uint w_off = g * 24u + lane_in_grp * 3u;
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = min(row0 + r, p.num_experts - 1u);
+                const device uchar *wp = qweight + ulong(row) * p.row_bytes + w_off;
+                const half2 sb = scale_bias[ulong(row) * p.num_groups + g];
+                acc[r] = fma(qdot8_q3(wp[0], wp[1], wp[2], px0, px1, x2_hi, x5_hi),
+                             float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+            }
+        }
+    }
+
+    for (uint r = 0u; r < ROWS_PER_SG; r++) {
+        const float total = simd_sum(acc[r]);
+        if (lane == 0u && (row0 + r) < p.num_experts) {
+            logits[ulong(tok) * p.num_experts + row0 + r] = total;
+        }
+    }
+}
+
+static inline float4 moe_load_w4(const device uchar *w, ulong elem) {
+    if (MOE_W_BF16) {
+        return float4(*(const device bfloat4 *)(w + elem * 2ul));
+    }
+    return float4(*(const device half4 *)(w + elem * 2ul));
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 10: Deduplicated MoE FP16 / BF16 Gate + Up + SwiGLU
+//
+// Geometry: 4 simdgroups/threadgroup (128 threads), 4 output rows/simdgroup
+// (16 rows/threadgroup); tg_pos.y indexes active unique expert `u`. Each
+// active expert streams its gate/up rows with coalesced `half4` / `bfloat4`
+// loads ONCE per block of up to 4 assigned tokens (weight-stationary register
+// batching: 1-token slots read weights exactly once; multi-token slots reuse
+// each weight vector across the token block). Requires hidden_size % 4 == 0.
+// Expert `ExpertWeights.*_qweight_offset` entries are byte offsets of
+// row-major `[N, K]` 16-bit matrices (`*_sb_offset` unused).
+// ---------------------------------------------------------------------------
+kernel void ami_moe_gate_up_swiglu_float(const device half *x [[buffer(0)]],
+                                         const device uchar *weights_base [[buffer(1)]],
+                                         const device ExpertWeights *expert_table [[buffer(2)]],
+                                         const device MoeScheduleHeader *sched_hdr [[buffer(3)]],
+                                         const device uint *unique_experts [[buffer(4)]],
+                                         const device uint *expert_token_offsets [[buffer(5)]],
+                                         const device uint *token_indices [[buffer(6)]],
+                                         device half *inter [[buffer(7)]],
+                                         constant MoeGateUpParams &p [[buffer(8)]],
+                                         uint2 tg_pos [[threadgroup_position_in_grid]],
+                                         uint sg_id [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint RPS = 4u;
+    constexpr uint TB = 4u;
+    const uint u = tg_pos.y;
+    if (u >= sched_hdr->num_unique_experts) {
+        return;
+    }
+    const uint row0 = tg_pos.x * 16u + sg_id * RPS;
+    if (row0 >= p.intermediate_size) {
+        return;
+    }
+    const uint s0 = expert_token_offsets[u];
+    const uint count_u = expert_token_offsets[u + 1u] - s0;
+    if (count_u == 0u) {
+        return;
+    }
+
+    const ExpertWeights ew = expert_table[unique_experts[u]];
+    const device uchar *gate_w = weights_base + ew.gate_qweight_offset;
+    const device uchar *up_w = weights_base + ew.up_qweight_offset;
+
+    ulong row_base[RPS];
+    for (uint r = 0u; r < RPS; r++) {
+        row_base[r] = ulong(min(row0 + r, p.intermediate_size - 1u)) * p.hidden_size;
+    }
+    const uint vec_k = p.hidden_size >> 2;
+
+    for (uint t_base = 0u; t_base < count_u; t_base += TB) {
+        const uint t_cnt = min(TB, count_u - t_base);
+        const device half4 *xt[TB];
+        for (uint t = 0u; t < TB; t++) {
+            const uint tok = token_indices[s0 + t_base + min(t, t_cnt - 1u)];
+            xt[t] = (const device half4 *)(x + ulong(tok) * p.hidden_size);
+        }
+
+        float g_acc[RPS][TB];
+        float u_acc[RPS][TB];
+        for (uint r = 0u; r < RPS; r++) {
+            for (uint t = 0u; t < TB; t++) {
+                g_acc[r][t] = 0.0f;
+                u_acc[r][t] = 0.0f;
+            }
+        }
+
+        for (uint i = lane; i < vec_k; i += 32u) {
+            float4 xv[TB];
+            for (uint t = 0u; t < TB; t++) {
+                xv[t] = float4(xt[t][i]);
+            }
+            for (uint r = 0u; r < RPS; r++) {
+                const float4 gw = moe_load_w4(gate_w, row_base[r] + ulong(i) * 4ul);
+                const float4 uw = moe_load_w4(up_w, row_base[r] + ulong(i) * 4ul);
+                for (uint t = 0u; t < TB; t++) {
+                    g_acc[r][t] += dot(xv[t], gw);
+                    u_acc[r][t] += dot(xv[t], uw);
+                }
+            }
+        }
+
+        for (uint r = 0u; r < RPS; r++) {
+            for (uint t = 0u; t < TB; t++) {
+                const float gt = simd_sum(g_acc[r][t]);
+                const float ut = simd_sum(u_acc[r][t]);
+                if (lane == 0u && t < t_cnt && (row0 + r) < p.intermediate_size) {
+                    const ulong slot = ulong(s0 + t_base + t);
+                    inter[slot * p.intermediate_size + row0 + r] = half(fast_silu(gt) * ut);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 11: Deduplicated MoE FP16 / BF16 Down Projection * Routing Weight
+//
+// Geometry: 4 simdgroups/threadgroup, 4 output rows/simdgroup (16 rows per
+// threadgroup), weight-stationary token blocks of 4. Writes fp32 partials to
+// down_out[(tok * top_k + k_idx) * hidden_size + row] with zero atomics.
+// Requires intermediate_size % 4 == 0.
+// ---------------------------------------------------------------------------
+kernel void ami_moe_down_proj_float(const device half *inter [[buffer(0)]],
+                                    const device uchar *weights_base [[buffer(1)]],
+                                    const device ExpertWeights *expert_table [[buffer(2)]],
+                                    const device MoeScheduleHeader *sched_hdr [[buffer(3)]],
+                                    const device uint *unique_experts [[buffer(4)]],
+                                    const device uint *expert_token_offsets [[buffer(5)]],
+                                    const device uint *token_indices [[buffer(6)]],
+                                    const device float *routing_weights [[buffer(7)]],
+                                    const device uint *slot_k_indices [[buffer(8)]],
+                                    device float *down_out [[buffer(9)]],
+                                    constant MoeDownParams &p [[buffer(10)]],
+                                    uint2 tg_pos [[threadgroup_position_in_grid]],
+                                    uint sg_id [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint RPS = 4u;
+    constexpr uint TB = 4u;
+    const uint u = tg_pos.y;
+    if (u >= sched_hdr->num_unique_experts) {
+        return;
+    }
+    const uint row0 = tg_pos.x * 16u + sg_id * RPS;
+    if (row0 >= p.hidden_size) {
+        return;
+    }
+    const uint s0 = expert_token_offsets[u];
+    const uint count_u = expert_token_offsets[u + 1u] - s0;
+    if (count_u == 0u) {
+        return;
+    }
+
+    const ExpertWeights ew = expert_table[unique_experts[u]];
+    const device uchar *down_w = weights_base + ew.down_qweight_offset;
+
+    ulong row_base[RPS];
+    for (uint r = 0u; r < RPS; r++) {
+        row_base[r] = ulong(min(row0 + r, p.hidden_size - 1u)) * p.intermediate_size;
+    }
+    const uint vec_k = p.intermediate_size >> 2;
+
+    for (uint t_base = 0u; t_base < count_u; t_base += TB) {
+        const uint t_cnt = min(TB, count_u - t_base);
+        const device half4 *it[TB];
+        for (uint t = 0u; t < TB; t++) {
+            const uint slot = s0 + t_base + min(t, t_cnt - 1u);
+            it[t] = (const device half4 *)(inter + ulong(slot) * p.intermediate_size);
+        }
+
+        float acc[RPS][TB];
+        for (uint r = 0u; r < RPS; r++) {
+            for (uint t = 0u; t < TB; t++) {
+                acc[r][t] = 0.0f;
+            }
+        }
+
+        for (uint i = lane; i < vec_k; i += 32u) {
+            float4 iv[TB];
+            for (uint t = 0u; t < TB; t++) {
+                iv[t] = float4(it[t][i]);
+            }
+            for (uint r = 0u; r < RPS; r++) {
+                const float4 dw = moe_load_w4(down_w, row_base[r] + ulong(i) * 4ul);
+                for (uint t = 0u; t < TB; t++) {
+                    acc[r][t] += dot(iv[t], dw);
+                }
+            }
+        }
+
+        for (uint t = 0u; t < TB; t++) {
+            const uint s = s0 + t_base + min(t, t_cnt - 1u);
+            const uint tok = token_indices[s];
+            const uint k_idx = slot_k_indices[s];
+            const float rw = routing_weights[s];
+            const ulong out_base = (ulong(tok) * p.top_k + k_idx) * p.hidden_size;
+            for (uint r = 0u; r < RPS; r++) {
+                const float total = simd_sum(acc[r][t]);
+                if (lane == 0u && t < t_cnt && (row0 + r) < p.hidden_size) {
+                    down_out[out_base + row0 + r] = total * rw;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 12: GPU Embedding Lookup (`out[m, :] = embed[token_id[m], :]`)
+//
+// Reads one `[vocab_size, hidden_size]` table row per token in f16, bf16,
+// q4_affine or q3_affine (EMBED_KIND) and writes `half [M, hidden_size]`
+// directly into the residual stream (zero CPU copy; the same table can back a
+// tied `lm_head`). Token IDs come from a uniform (single-token decode) or a
+// `uint [M]` buffer. Out-of-range IDs produce zero rows instead of faulting.
+// Each thread produces 8 consecutive outputs; grid (ceil(hidden / 8), M).
+// ---------------------------------------------------------------------------
+kernel void ami_embed_lookup(const device uchar *weight [[buffer(0)]],
+                             const device half2 *scale_bias [[buffer(1)]],
+                             const device uint *token_ids [[buffer(2)]],
+                             device half *out [[buffer(3)]],
+                             constant EmbedParams &p [[buffer(4)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    const uint row = gid.y;
+    const uint col0 = gid.x * 8u;
+    if (row >= p.m || col0 >= p.hidden_size) {
+        return;
+    }
+    const uint tok = (p.use_token_buffer != 0u) ? token_ids[row] : p.token_id;
+    device half *dst = out + ulong(row) * p.hidden_size + col0;
+    const uint n = min(8u, p.hidden_size - col0);
+
+    if (tok >= p.vocab_size) {
+        for (uint j = 0u; j < n; j++) {
+            dst[j] = half(0.0h);
+        }
+        return;
+    }
+
+    if (EMBED_KIND == 0u) {
+        const device half *src = (const device half *)weight + ulong(tok) * p.hidden_size + col0;
+        for (uint j = 0u; j < n; j++) {
+            dst[j] = src[j];
+        }
+    } else if (EMBED_KIND == 1u) {
+        // bf16 -> f16: saturate instead of overflowing to infinity.
+        const device bfloat *src = (const device bfloat *)weight + ulong(tok) * p.hidden_size + col0;
+        for (uint j = 0u; j < n; j++) {
+            dst[j] = half(clamp(float(src[j]), -65504.0f, 65504.0f));
+        }
+    } else {
+        const uint g = col0 / Q_GROUP_SIZE;
+        const uint lane_in_grp = (col0 % Q_GROUP_SIZE) >> 3;
+        const half2 sb = scale_bias[ulong(tok) * p.num_groups + g];
+        const float scale = float(sb.x);
+        const float bias = float(sb.y);
+        const device uchar *row_w = weight + ulong(tok) * p.row_bytes;
+        if (EMBED_KIND == 2u) {
+            const uint32_t w = *(const device uint32_t *)(row_w + g * 32u + lane_in_grp * 4u);
+            for (uint j = 0u; j < 8u; j++) {
+                dst[j] = half(fma(float((w >> (j * 4u)) & 0xFu), scale, bias));
+            }
+        } else {
+            const device uchar *wp = row_w + g * 24u + lane_in_grp * 3u;
+            const uint word = uint(wp[0]) | (uint(wp[1]) << 8) | (uint(wp[2]) << 16);
+            for (uint j = 0u; j < 8u; j++) {
+                dst[j] = half(fma(float((word >> (j * 3u)) & 0x7u), scale, bias));
+            }
         }
     }
 }

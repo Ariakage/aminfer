@@ -1,5 +1,7 @@
 //! IOSurface KV-tile attention kernels, Spike S1 microbenchmark, RMSNorm,
 //! QK-Norm + NeoX RoPE + KV-Write, and GQA decode attention (R3, R4, S1, G4).
+//! RMSNorm and QK-Norm accept `f16` or `bf16` norm weights through the
+//! `NORM_W_BF16` Metal function constant (G12, ADR-0016).
 
 const std = @import("std");
 const metal = @import("../bridge/metal.zig");
@@ -7,6 +9,7 @@ const page = @import("../mem/page.zig");
 const arena_mod = @import("../mem/arena.zig");
 const budget_mod = @import("../mem/budget.zig");
 const amf = @import("../format/amf.zig");
+const quant = @import("../quant/spec.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const vmstat = @import("../platform/vmstat.zig");
 
@@ -105,11 +108,13 @@ comptime {
 
 pub const RmsNormArgs = struct {
     x: metal.BufferBinding,
+    /// `[hidden_dim]` norm weights stored as `w_dtype`.
     w: metal.BufferBinding,
     y: metal.BufferBinding,
     num_rows: u32 = 1,
     hidden_dim: u32,
     eps: f32 = 1e-6,
+    w_dtype: quant.FloatDType = .f16,
 };
 
 pub const QkNormRopeKvArgs = struct {
@@ -119,9 +124,9 @@ pub const QkNormRopeKvArgs = struct {
     k: metal.BufferBinding,
     /// `[num_kv_heads, head_dim]` fp16, read-only.
     v: metal.BufferBinding,
-    /// Optional `[head_dim]` fp16 Qwen3 Q-norm weights (null skips QK-norm).
+    /// Optional `[head_dim]` Qwen3 Q-norm weights in `norm_dtype` (null skips QK-norm).
     q_norm: ?metal.BufferBinding = null,
-    /// Optional `[head_dim]` fp16 Qwen3 K-norm weights (null skips QK-norm).
+    /// Optional `[head_dim]` Qwen3 K-norm weights in `norm_dtype` (null skips QK-norm).
     k_norm: ?metal.BufferBinding = null,
     /// Current 512-token chunk's K tile (`RGBA16Float`).
     k_tile: metal.KvTile,
@@ -134,6 +139,8 @@ pub const QkNormRopeKvArgs = struct {
     chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
     rms_eps: f32 = 1e-6,
     rope_theta: f32 = 1_000_000.0,
+    /// Storage dtype of `q_norm` / `k_norm`.
+    norm_dtype: quant.FloatDType = .f16,
 };
 
 pub const GqaDecodeArgs = struct {
@@ -193,19 +200,37 @@ pub fn chooseNumSplits(num_kv_heads: u32, seq_len: u32, chunk_tokens: u32, max_s
 /// Startup-compiled Metal 4 compute pipelines for RMSNorm, QK-Norm + NeoX RoPE
 /// + KV-tile write, and specialized GQA decode attention (`head_dim = 64, 128`).
 pub const AttentionPipelines = struct {
+    /// `ami_rmsnorm` specialized for `f16` norm weights.
     rmsnorm: metal.Pipeline,
+    /// `ami_qknorm_rope_kv_write` specialized for `f16` norm weights.
     qknorm_rope_kv_write: metal.Pipeline,
+    rmsnorm_bf16: metal.Pipeline,
+    qknorm_rope_kv_write_bf16: metal.Pipeline,
     gqa_split_d64: metal.Pipeline,
     gqa_reduce_d64: metal.Pipeline,
     gqa_split_d128: metal.Pipeline,
     gqa_reduce_d128: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!AttentionPipelines {
-        const rmsnorm = try metal.Pipeline.init(device, library, "ami_rmsnorm_f16");
+        const rmsnorm = try metal.Pipeline.initSpecialized(device, library, "ami_rmsnorm", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
         errdefer rmsnorm.close();
 
-        const qknorm_rope_kv_write = try metal.Pipeline.init(device, library, "ami_qknorm_rope_kv_write");
+        const qknorm_rope_kv_write = try metal.Pipeline.initSpecialized(device, library, "ami_qknorm_rope_kv_write_norm", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
         errdefer qknorm_rope_kv_write.close();
+
+        const rmsnorm_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_rmsnorm", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer rmsnorm_bf16.close();
+
+        const qknorm_rope_kv_write_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_qknorm_rope_kv_write_norm", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer qknorm_rope_kv_write_bf16.close();
 
         const gqa_split_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_decode_attn_split", &.{
             .{ .index = 0, .value = .{ .u32 = 64 } },
@@ -230,6 +255,8 @@ pub const AttentionPipelines = struct {
         return .{
             .rmsnorm = rmsnorm,
             .qknorm_rope_kv_write = qknorm_rope_kv_write,
+            .rmsnorm_bf16 = rmsnorm_bf16,
+            .qknorm_rope_kv_write_bf16 = qknorm_rope_kv_write_bf16,
             .gqa_split_d64 = gqa_split_d64,
             .gqa_reduce_d64 = gqa_reduce_d64,
             .gqa_split_d128 = gqa_split_d128,
@@ -242,11 +269,14 @@ pub const AttentionPipelines = struct {
         self.gqa_split_d128.close();
         self.gqa_reduce_d64.close();
         self.gqa_split_d64.close();
+        self.qknorm_rope_kv_write_bf16.close();
+        self.rmsnorm_bf16.close();
         self.qknorm_rope_kv_write.close();
         self.rmsnorm.close();
     }
 
-    /// Encodes `ami_rmsnorm_f16` (zero heap allocation on the hot path).
+    /// Encodes `ami_rmsnorm` specialized for `args.w_dtype` (zero heap
+    /// allocation on the hot path).
     pub fn encodeRmsNorm(
         self: AttentionPipelines,
         frame: *metal.Compute.Frame,
@@ -261,8 +291,12 @@ pub const AttentionPipelines = struct {
             .hidden_dim = args.hidden_dim,
             .eps = args.eps,
         };
+        const pipe = switch (args.w_dtype) {
+            .f16 => self.rmsnorm,
+            .bf16 => self.rmsnorm_bf16,
+        };
         try frame.encodeThreadgroups(
-            self.rmsnorm,
+            pipe,
             &.{ args.x, args.w, args.y },
             std.mem.asBytes(&params),
             .{ args.num_rows, 1, 1 },
@@ -271,7 +305,9 @@ pub const AttentionPipelines = struct {
         );
     }
 
-    /// Encodes `ami_qknorm_rope_kv_write` (zero heap allocation on the hot path).
+    /// Encodes `ami_qknorm_rope_kv_write_norm` specialized for
+    /// `args.norm_dtype`, writing `RGBA16Float` K/V texels into the IOSurface
+    /// `KvTile`s (ADR-0004). Zero heap allocation on the hot path.
     pub fn encodeQkNormRopeKvWrite(
         self: AttentionPipelines,
         frame: *metal.Compute.Frame,
@@ -302,8 +338,12 @@ pub const AttentionPipelines = struct {
             .apply_qk_norm = if (has_qn) 1 else 0,
         };
         const total_heads: u64 = @as(u64, args.num_q_heads) + @as(u64, args.num_kv_heads);
+        const pipe = switch (args.norm_dtype) {
+            .f16 => self.qknorm_rope_kv_write,
+            .bf16 => self.qknorm_rope_kv_write_bf16,
+        };
         try frame.encodeThreadgroupsWithTextures(
-            self.qknorm_rope_kv_write,
+            pipe,
             &.{ args.q, args.k, args.v, qn_binding, kn_binding },
             &.{
                 .{ .tile = args.k_tile, .view = .rgba16f },
@@ -1150,6 +1190,79 @@ pub fn rmsNormCpuRef(x: []const f16, w: []const f16, out: []f32, num_rows: usize
     }
 }
 
+/// CPU fp32 RMSNorm reference with `f16` or `bf16` norm weights (`w_bits`
+/// holds raw 16-bit patterns of `w_dtype`).
+pub fn rmsNormCpuRefDType(
+    x: []const f16,
+    w_dtype: quant.FloatDType,
+    w_bits: []const u16,
+    out: []f32,
+    num_rows: usize,
+    hidden_dim: usize,
+    eps: f32,
+) void {
+    for (0..num_rows) |r| {
+        const x_row = x[r * hidden_dim .. (r + 1) * hidden_dim];
+        const y_row = out[r * hidden_dim .. (r + 1) * hidden_dim];
+        var sum_sq: f64 = 0.0;
+        for (x_row) |v| {
+            const fv: f64 = @floatCast(v);
+            sum_sq += fv * fv;
+        }
+        const inv_rms: f32 = @floatCast(1.0 / @sqrt(sum_sq / @as(f64, @floatFromInt(hidden_dim)) + @as(f64, eps)));
+        for (0..hidden_dim) |i| {
+            const fv: f32 = @floatCast(x_row[i]);
+            y_row[i] = (fv * inv_rms) * quant.floatBitsToF32(w_dtype, w_bits[i]);
+        }
+    }
+}
+
+/// CPU fp32 QK-Norm + NeoX RoPE reference for one head with `f16` or `bf16`
+/// norm weights (`norm_w_bits` holds raw 16-bit patterns of `norm_dtype`).
+pub fn qkNormRopeHeadCpuRefDType(
+    src: []const f16,
+    norm_dtype: quant.FloatDType,
+    norm_w_bits: ?[]const u16,
+    out: []f32,
+    pos: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+) void {
+    const d = src.len;
+    if (norm_w_bits) |nw| {
+        var sum_sq: f64 = 0.0;
+        for (src) |v| {
+            const fv: f64 = @floatCast(v);
+            sum_sq += fv * fv;
+        }
+        const inv_rms: f32 = @floatCast(1.0 / @sqrt(sum_sq / @as(f64, @floatFromInt(d)) + @as(f64, rms_eps)));
+        for (0..d) |i| {
+            const fv: f32 = @floatCast(src[i]);
+            out[i] = (fv * inv_rms) * quant.floatBitsToF32(norm_dtype, nw[i]);
+        }
+    } else {
+        for (0..d) |i| out[i] = @floatCast(src[i]);
+    }
+    ropeNeoxInPlace(out, pos, rope_theta);
+}
+
+fn ropeNeoxInPlace(out: []f32, pos: u32, rope_theta: f32) void {
+    const d = out.len;
+    const half_d = d / 2;
+    const log_theta: f64 = @log(@as(f64, rope_theta));
+    const fpos: f64 = @floatFromInt(pos);
+    for (0..half_d) |j| {
+        const inv_freq: f64 = @exp(-log_theta * (@as(f64, @floatFromInt(2 * j)) / @as(f64, @floatFromInt(d))));
+        const angle: f64 = fpos * inv_freq;
+        const c: f64 = @cos(angle);
+        const s: f64 = @sin(angle);
+        const x0: f64 = out[j];
+        const x1: f64 = out[j + half_d];
+        out[j] = @floatCast(x0 * c - x1 * s);
+        out[j + half_d] = @floatCast(x1 * c + x0 * s);
+    }
+}
+
 pub fn qkNormRopeHeadCpuRef(
     src: []const f16,
     norm_w: ?[]const f16,
@@ -1257,6 +1370,10 @@ fn testBudget(cap: usize) budget_mod.Budget {
 }
 
 fn verifyRmsNormCase(num_rows: u32, hidden_dim: u32, in_place: bool) !void {
+    return verifyRmsNormCaseDType(.f16, num_rows, hidden_dim, in_place);
+}
+
+fn verifyRmsNormCaseDType(w_dtype: quant.FloatDType, num_rows: u32, hidden_dim: u32, in_place: bool) !void {
     const gpa = std.testing.allocator;
     const device = try metal.Device.open();
     defer device.close();
@@ -1276,20 +1393,27 @@ fn verifyRmsNormCase(num_rows: u32, hidden_dim: u32, in_place: bool) !void {
     const y_raw = if (in_place) x_raw else try arena.allocAligned(x_bytes, 64);
 
     const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw[0 .. @as(usize, num_rows) * hidden_dim * @sizeOf(f16)]));
-    const w_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, w_raw[0 .. @as(usize, hidden_dim) * @sizeOf(f16)]));
+    const w_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_raw[0 .. @as(usize, hidden_dim) * @sizeOf(u16)]));
     const y_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_raw[0 .. @as(usize, num_rows) * hidden_dim * @sizeOf(f16)]));
 
     for (x_f16, 0..) |*v, i| {
         const c: i32 = @as(i32, @intCast((i * 19 + 7) % 41)) - 20;
         v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.125);
     }
-    for (w_f16, 0..) |*v, i| {
-        v.* = @floatCast(0.5 + 0.05 * @as(f32, @floatFromInt(i % 17)));
+    for (w_bits, 0..) |*v, i| {
+        // 1/3 multiples are inexact in both f16 and bf16, so the bf16 path
+        // reads genuinely different bits than an f16 table would.
+        v.* = quant.f32ToFloatBits(w_dtype, 0.5 + 0.05 * @as(f32, @floatFromInt(i % 17)) + @as(f32, @floatFromInt(i % 3)) / 3.0);
     }
 
     const ref = try gpa.alloc(f32, @as(usize, num_rows) * hidden_dim);
     defer gpa.free(ref);
-    rmsNormCpuRef(x_f16, w_f16, ref, num_rows, hidden_dim, 1e-6);
+    if (w_dtype == .f16) {
+        const w_f16: []const f16 = @ptrCast(w_bits);
+        rmsNormCpuRef(x_f16, w_f16, ref, num_rows, hidden_dim, 1e-6);
+    } else {
+        rmsNormCpuRefDType(x_f16, w_dtype, w_bits, ref, num_rows, hidden_dim, 1e-6);
+    }
 
     const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
     defer gpu_buf.close();
@@ -1306,6 +1430,7 @@ fn verifyRmsNormCase(num_rows: u32, hidden_dim: u32, in_place: bool) !void {
         .num_rows = num_rows,
         .hidden_dim = hidden_dim,
         .eps = 1e-6,
+        .w_dtype = w_dtype,
     }, false);
     const sig = try frame.commit();
     try compute.wait(sig, 5000);
@@ -1325,7 +1450,27 @@ test "ami_rmsnorm_f16 matches CPU fp32 reference on LLM, odd, batched and in-pla
     try verifyRmsNormCase(1, 5120, false);
 }
 
+test "ami_rmsnorm with bf16 weights matches CPU fp32 reference on LLM, odd, batched and in-place shapes" {
+    try verifyRmsNormCaseDType(.bf16, 1, 64, false);
+    try verifyRmsNormCaseDType(.bf16, 1, 37, false);
+    try verifyRmsNormCaseDType(.bf16, 4, 192, false);
+    try verifyRmsNormCaseDType(.bf16, 1, 1024, true);
+    try verifyRmsNormCaseDType(.bf16, 3, 5120, false);
+}
+
 fn verifyQkNormRopeKvWriteCase(
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    pos: u32,
+    apply_qk_norm: bool,
+    rope_theta: f32,
+) !void {
+    return verifyQkNormRopeKvWriteCaseDType(.f16, num_q_heads, num_kv_heads, head_dim, pos, apply_qk_norm, rope_theta);
+}
+
+fn verifyQkNormRopeKvWriteCaseDType(
+    norm_dtype: quant.FloatDType,
     num_q_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
@@ -1360,8 +1505,8 @@ fn verifyQkNormRopeKvWriteCase(
     const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw[0 .. @as(usize, num_q_heads) * head_dim * @sizeOf(f16)]));
     const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw[0 .. @as(usize, num_kv_heads) * head_dim * @sizeOf(f16)]));
     const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw[0 .. @as(usize, num_kv_heads) * head_dim * @sizeOf(f16)]));
-    const qn_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, qn_raw[0 .. @as(usize, head_dim) * @sizeOf(f16)]));
-    const kn_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, kn_raw[0 .. @as(usize, head_dim) * @sizeOf(f16)]));
+    const qn_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, qn_raw[0 .. @as(usize, head_dim) * @sizeOf(u16)]));
+    const kn_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, kn_raw[0 .. @as(usize, head_dim) * @sizeOf(u16)]));
 
     for (q_f16, 0..) |*v, i| {
         const c: i32 = @as(i32, @intCast((i * 13 + 3) % 29)) - 14;
@@ -1375,8 +1520,8 @@ fn verifyQkNormRopeKvWriteCase(
         const c: i32 = @as(i32, @intCast((i * 23 + 11) % 31)) - 15;
         v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.0625);
     }
-    for (qn_f16, 0..) |*v, i| v.* = @floatCast(0.75 + 0.04 * @as(f32, @floatFromInt(i % 13)));
-    for (kn_f16, 0..) |*v, i| v.* = @floatCast(0.60 + 0.05 * @as(f32, @floatFromInt(i % 11)));
+    for (qn_bits, 0..) |*v, i| v.* = quant.f32ToFloatBits(norm_dtype, 0.75 + 0.04 * @as(f32, @floatFromInt(i % 13)) + @as(f32, @floatFromInt(i % 3)) / 7.0);
+    for (kn_bits, 0..) |*v, i| v.* = quant.f32ToFloatBits(norm_dtype, 0.60 + 0.05 * @as(f32, @floatFromInt(i % 11)) + @as(f32, @floatFromInt(i % 5)) / 9.0);
 
     const q_ref = try gpa.alloc(f32, q_f16.len);
     defer gpa.free(q_ref);
@@ -1384,9 +1529,10 @@ fn verifyQkNormRopeKvWriteCase(
     defer gpa.free(k_ref);
 
     for (0..num_q_heads) |h| {
-        qkNormRopeHeadCpuRef(
+        qkNormRopeHeadCpuRefDType(
             q_f16[h * head_dim .. (h + 1) * head_dim],
-            if (apply_qk_norm) qn_f16 else null,
+            norm_dtype,
+            if (apply_qk_norm) qn_bits else null,
             q_ref[h * head_dim .. (h + 1) * head_dim],
             pos,
             1e-6,
@@ -1394,9 +1540,10 @@ fn verifyQkNormRopeKvWriteCase(
         );
     }
     for (0..num_kv_heads) |h| {
-        qkNormRopeHeadCpuRef(
+        qkNormRopeHeadCpuRefDType(
             k_f16[h * head_dim .. (h + 1) * head_dim],
-            if (apply_qk_norm) kn_f16 else null,
+            norm_dtype,
+            if (apply_qk_norm) kn_bits else null,
             k_ref[h * head_dim .. (h + 1) * head_dim],
             pos,
             1e-6,
@@ -1441,6 +1588,7 @@ fn verifyQkNormRopeKvWriteCase(
         .chunk_tokens = chunk_tokens,
         .rms_eps = 1e-6,
         .rope_theta = rope_theta,
+        .norm_dtype = norm_dtype,
     }, false);
     const sig = try frame.commit();
     try compute.wait(sig, 5000);
@@ -1484,6 +1632,13 @@ test "ami_qknorm_rope_kv_write matches CPU fp32 reference with/without QK-norm a
     try verifyQkNormRopeKvWriteCase(32, 4, 128, 519, true, 1_000_000.0);
     try verifyQkNormRopeKvWriteCase(40, 8, 128, 17, false, 10_000.0);
     try verifyQkNormRopeKvWriteCase(4, 2, 64, 511, true, 1_000_000.0);
+}
+
+test "ami_qknorm_rope_kv_write with bf16 QK-norm weights writes RGBA16Float KV tiles matching CPU fp32 reference" {
+    try verifyQkNormRopeKvWriteCaseDType(.bf16, 16, 8, 128, 0, true, 1_000_000.0);
+    try verifyQkNormRopeKvWriteCaseDType(.bf16, 32, 4, 128, 519, true, 1_000_000.0);
+    try verifyQkNormRopeKvWriteCaseDType(.bf16, 4, 2, 64, 511, true, 1_000_000.0);
+    try verifyQkNormRopeKvWriteCaseDType(.bf16, 40, 8, 128, 17, false, 10_000.0);
 }
 
 fn verifyGqaDecodeCase(
