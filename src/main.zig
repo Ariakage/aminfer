@@ -10,6 +10,7 @@ const usage =
     \\commands:
     \\  probe             print the kernel, Metal and Neural Engine facts of this machine
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
+    \\  bench             run C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\
 ;
 
@@ -23,10 +24,18 @@ pub fn main(init: std.process.Init) !void {
         try probe(out);
     } else if (args.len == 3 and std.mem.eql(u8, args[1], "verify-amf")) {
         try verifyAmf(arena, args[2], out);
+    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
+        try runBench(arena, out);
     } else {
         try out.writeAll(usage);
     }
     try out.flush();
+}
+
+fn runBench(allocator: std.mem.Allocator, out: *Io.Writer) !void {
+    var report = try aminfer.bench.run(allocator, .{});
+    defer report.deinit(allocator);
+    try report.write(out);
 }
 
 fn verifyAmf(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) !void {

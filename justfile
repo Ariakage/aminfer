@@ -31,6 +31,10 @@ fmt-check:
 probe:
     zig build run -- probe
 
+# Run C9 kernel bandwidth calibration and Spike S2 hot-path benchmark (ReleaseFast).
+bench:
+    zig build -Doptimize=ReleaseFast && ./zig-out/bin/aminfer bench
+
 # Show current wired-memory limits and physical RAM.
 sysctl-show:
     sysctl iogpu.wired_limit_mb vm.user_wire_limit vm.global_user_wire_limit hw.memsize

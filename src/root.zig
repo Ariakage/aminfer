@@ -10,6 +10,8 @@ pub const quant = @import("quant/spec.zig");
 pub const amf = @import("format/amf.zig");
 pub const dequant = @import("gpu/dequant.zig");
 pub const sysinfo = @import("platform/sysinfo.zig");
+pub const vmstat = @import("platform/vmstat.zig");
+pub const bench = @import("bench/runner.zig");
 
 test {
     _ = metal;
@@ -21,4 +23,6 @@ test {
     _ = amf;
     _ = dequant;
     _ = sysinfo;
+    _ = vmstat;
+    _ = bench;
 }
