@@ -8,7 +8,7 @@ const usage =
     \\usage: aminfer <command>
     \\
     \\commands:
-    \\  probe    print the Metal and Neural Engine facts of this machine
+    \\  probe    print the kernel, Metal and Neural Engine facts of this machine
     \\
 ;
 
@@ -26,6 +26,26 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn probe(out: *Io.Writer) !void {
+    const facts = try aminfer.sysinfo.Facts.read();
+    try out.print(
+        \\sys.page_size                    {d}
+        \\sys.memory_mib                   {d}
+        \\cpu.performance_cores            {d}
+        \\cpu.efficiency_cores             {d}
+        \\wire.user_limit_bytes            {d}
+        \\wire.global_limit_bytes          {d}
+        \\wire.gpu_limit_mib               {d}
+        \\
+    , .{
+        facts.page_size,
+        facts.memory_bytes >> 20,
+        facts.performance_cores,
+        facts.efficiency_cores,
+        facts.user_wire_limit,
+        facts.global_user_wire_limit,
+        facts.gpu_wired_limit_mib,
+    });
+
     const device = try aminfer.metal.Device.open();
     defer device.close();
     const info = try device.info();
