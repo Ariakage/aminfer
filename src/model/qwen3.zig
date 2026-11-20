@@ -21,6 +21,7 @@ const attention = @import("../gpu/attention.zig");
 const moe = @import("../gpu/moe.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const vmstat = @import("../platform/vmstat.zig");
+const tree_mod = @import("../spec/tree.zig");
 
 pub const ModelArch = enum {
     qwen3_moe,
@@ -270,9 +271,32 @@ fn jsonOptF32(obj: std.json.ObjectMap, key: []const u8) ?f32 {
     };
 }
 
+/// Maximum number of target layers sampled during fast GPU router expert prediction (D7).
+pub const MAX_EXPERT_PRED_LAYERS: u32 = 8;
+
+/// Returns the default 0-indexed transformer layer outputs tapped for EAGLE-3
+/// (`[1, N/2 - 1, N - 4]` for `N >= 5`, matching vLLM/speculators `[2, N//2, N - 3]`
+/// in HF 1-based `hidden_states` indexing, e.g. `[1, 23, 44]` for 48-layer Qwen3-30B-A3B).
+pub fn defaultEagle3AuxLayerIds(num_layers: u32) [3]u32 {
+    if (num_layers <= 1) return .{ 0, 0, 0 };
+    if (num_layers == 2) return .{ 0, 0, 1 };
+    if (num_layers == 3) return .{ 0, 1, 2 };
+    if (num_layers == 4) return .{ 0, 1, 3 };
+    return .{ 1, num_layers / 2 - 1, num_layers - 4 };
+}
+
 pub const LoadOptions = struct {
     max_seq_len: u32 = 2048,
     chunk_tokens: u32 = attention.DEFAULT_CHUNK_TOKENS,
+    /// Maximum speculative tree nodes verified in one `verifyTree` pass
+    /// (`1` = decode-only; up to `attention.MAX_TREE_NODES = 64`).
+    max_tree_nodes: u32 = 1,
+    /// Captures 3 EAGLE-3 auxiliary layer outputs (`[max_tree_nodes, 3*H]`) and
+    /// top-layer unnormalized hidden states (`[max_tree_nodes, H]`) for L2 drafting.
+    enable_feature_taps: bool = false,
+    /// Optional explicit 0-indexed transformer layer IDs for EAGLE-3 aux feature taps.
+    /// Defaults to `defaultEagle3AuxLayerIds(config.num_hidden_layers)`.
+    aux_layer_ids: ?[3]u32 = null,
     /// Optional per-shard `WiredArena` ceiling (defaults to `MTLDevice.maxBufferLength`).
     max_shard_bytes: ?usize = null,
     /// Optional explicit wired budget override (defaults to `Budget.fromHost`).
@@ -296,9 +320,25 @@ pub const LoadError = error{
 pub const StepError = error{
     TokenOutOfRange,
     PositionOutOfRange,
+    TreeNotEnabled,
+    TreeTooLarge,
 } || metal.Error || dequant.EncodeError || moe.EncodeError;
 
-const LinearBinding = struct {
+pub const VerifyTreeResult = struct {
+    num_nodes: u32,
+    /// `[num_nodes]` greedy argmax token IDs computed on GPU (`encodeArgmaxRows`).
+    argmax_tokens: []const u32,
+    /// Flat `[num_nodes * vocab_size]` `f16` target logits in wired shared RAM.
+    logits_f16: []const f16,
+    /// Sum of measured unique active experts across all MoE layers (`0` for dense).
+    total_unique_experts: u64,
+    /// Mean measured unique active experts per layer (`0.0` for dense).
+    avg_unique_experts_per_layer: f64,
+    /// Algorithmic bytes moved during this verification pass (using measured unique experts).
+    actual_bytes_moved: u64,
+};
+
+pub const LinearBinding = struct {
     weight: metal.BufferBinding,
     scale_bias: ?metal.BufferBinding,
     n: u32,
@@ -307,7 +347,7 @@ const LinearBinding = struct {
     alg_bytes: u64,
 };
 
-const NormBinding = struct {
+pub const NormBinding = struct {
     binding: metal.BufferBinding,
     dtype: quant.FloatDType,
 };
@@ -402,6 +442,9 @@ pub const Qwen3Model = struct {
     max_seq_len: u32,
     chunk_tokens: u32,
     num_chunks: u32,
+    max_tree_nodes: u32,
+    enable_feature_taps: bool,
+    aux_layer_ids: [3]u32,
     timeout_ms: u64,
     wired_budget_bytes: u64,
     total_wired_bytes: u64,
@@ -428,7 +471,9 @@ pub const Qwen3Model = struct {
     lm_head: LinearBinding,
 
     // Preallocated hot-path activation slices & bindings inside `scratch_arena`/`scratch_buf`
+    x_host: []f16,
     logits_host: []const f16,
+    out_token_ids_host: []u32,
     out_token_id_host: *u32,
 
     x_bind: metal.BufferBinding,
@@ -442,14 +487,43 @@ pub const Qwen3Model = struct {
     out_token_id_bind: metal.BufferBinding,
     gqa_scratch_bind: metal.BufferBinding,
 
+    // Preallocated M3 tree-verification & feature-tap scratch (zero hot-path heap alloc)
+    tree_token_ids_host: []u32,
+    tree_positions_host: []u32,
+    tree_ancestor_masks_host: []u64,
+    tree_accepted_nodes_host: []u32,
+    tree_token_ids_bind: metal.BufferBinding,
+    tree_positions_bind: metal.BufferBinding,
+    tree_ancestor_masks_bind: metal.BufferBinding,
+    tree_accepted_nodes_bind: metal.BufferBinding,
+    tree_k_base_off: u64,
+    tree_v_base_off: u64,
+    tree_kv_layer_stride: u64,
+    gqa_tree_scratch_bind: metal.BufferBinding,
+
+    aux_concat_host: []f16,
+    aux_concat_bind: metal.BufferBinding,
+    accepted_aux_host: []f16,
+    accepted_aux_bind: metal.BufferBinding,
+    accepted_top_host: []f16,
+    accepted_top_bind: metal.BufferBinding,
+
     // Arch-specific FFN scratch
     moe_ws: ?moe.MoeWorkspace,
+    layer_sched_hdr_base_off: u64,
+    layer_sched_hdr_raw: []u8,
+    pred_topk_base_off: u64,
+    pred_topk_layer_stride: u64,
+    pred_topk_host: []u32,
     dense_gate_bind: metal.BufferBinding,
     dense_up_bind: metal.BufferBinding,
     dense_act_bind: metal.BufferBinding,
 
     // Precomputed algorithmic traffic constants
     total_layers_static_bytes: u64,
+    total_layers_non_expert_bytes: u64,
+    single_expert_bytes: u64,
+    embed_row_alg_bytes: u64,
     global_head_bytes: u64,
 
     pub fn loadFromBytes(
@@ -503,6 +577,14 @@ pub const Qwen3Model = struct {
         return self.total_wired_bytes;
     }
 
+    pub fn singleExpertBytes(self: *const Qwen3Model) u64 {
+        return self.single_expert_bytes;
+    }
+
+    pub fn totalLayersNonExpertBytes(self: *const Qwen3Model) u64 {
+        return self.total_layers_non_expert_bytes;
+    }
+
     /// Mean algorithmic bytes transferred by one transformer layer at `seq_len`
     /// (dense attention weights + active FFN weights + norms + KV read/write).
     pub fn bytesPerLayerToken(self: *const Qwen3Model, seq_len: u32) u64 {
@@ -524,7 +606,22 @@ pub const Qwen3Model = struct {
     }
 
     pub fn readLogitsF16(self: *const Qwen3Model) []const f16 {
-        return self.logits_host;
+        return self.logits_host[0..self.config.vocab_size];
+    }
+
+    /// Returns the unnormalized top-layer hidden state `[num_nodes * hidden_size]`
+    /// written by the most recent `stepDecode`, `prefillToken`, or `verifyTree`.
+    pub fn readTopHiddenF16(self: *const Qwen3Model, num_nodes: u32) []const f16 {
+        const count = @as(usize, @min(num_nodes, self.max_tree_nodes)) * self.config.hidden_size;
+        return self.x_host[0..count];
+    }
+
+    /// Returns the concatenated 3-layer EAGLE-3 auxiliary features
+    /// `[num_nodes * 3 * hidden_size]` when `enable_feature_taps == true`.
+    pub fn readAuxConcatF16(self: *const Qwen3Model, num_nodes: u32) []const f16 {
+        if (!self.enable_feature_taps) return &.{};
+        const count = @as(usize, @min(num_nodes, self.max_tree_nodes)) * 3 * self.config.hidden_size;
+        return self.aux_concat_host[0..count];
     }
 
     /// Populates KV cache at `pos` for `token_id`, skipping final norm / `lm_head` / argmax.
@@ -545,7 +642,15 @@ pub const Qwen3Model = struct {
         return .{ .k = self.kv_tiles[base], .v = self.kv_tiles[base + 1] };
     }
 
-    fn encodeLinearGemv(
+    fn treeKBinding(self: *const Qwen3Model, layer_idx: usize) metal.BufferBinding {
+        return .{ .buffer = self.scratch_buf, .offset = self.tree_k_base_off + @as(u64, layer_idx) * self.tree_kv_layer_stride };
+    }
+
+    fn treeVBinding(self: *const Qwen3Model, layer_idx: usize) metal.BufferBinding {
+        return .{ .buffer = self.scratch_buf, .offset = self.tree_v_base_off + @as(u64, layer_idx) * self.tree_kv_layer_stride };
+    }
+
+    pub fn encodeLinearGemv(
         self: *const Qwen3Model,
         frame: *metal.Compute.Frame,
         lin: LinearBinding,
@@ -584,6 +689,84 @@ pub const Qwen3Model = struct {
                 .n = lin.n,
                 .k = lin.k,
             }, insert_barrier_before),
+        }
+    }
+
+    /// Encodes a linear projection for `m >= 1` rows, using `encodeLinearGemv`
+    /// for `m == 1` and weight-stationary bit-exact batched GEMV for `m > 1`.
+    pub fn encodeLinearBatched(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        lin: LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        m: u32,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
+        if (m == 1) {
+            return self.encodeLinearGemv(frame, lin, x, y, insert_barrier_before);
+        }
+        switch (lin.dtype) {
+            .f16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .f16, .{
+                .x = x,
+                .weight = lin.weight,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .bf16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .bf16, .{
+                .x = x,
+                .weight = lin.weight,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .q4_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q4, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .q3_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q3, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+        }
+    }
+
+    fn encodeAuxTapIfMatched(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        layer_idx: usize,
+        num_nodes: u32,
+    ) moe.EncodeError!void {
+        if (!self.enable_feature_taps) return;
+        const h = self.config.hidden_size;
+        var barrier = true;
+        for (self.aux_layer_ids, 0..) |tap_l, slot| {
+            if (layer_idx == tap_l) {
+                try self.moe_pipes.encodeCopyStrided(frame, .{
+                    .src = self.x_bind,
+                    .dst = self.aux_concat_bind,
+                    .num_rows = num_nodes,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .src_col_off = 0,
+                    .dst_stride = 3 * h,
+                    .dst_col_off = @as(u32, @intCast(slot)) * h,
+                }, barrier);
+                barrier = false;
+            }
         }
     }
 
@@ -723,6 +906,8 @@ pub const Qwen3Model = struct {
                     }, true);
                 },
             }
+
+            try self.encodeAuxTapIfMatched(&frame, l, 1);
         }
 
         if (!skip_lm_head) {
@@ -747,6 +932,486 @@ pub const Qwen3Model = struct {
         try self.compute.wait(sig, self.timeout_ms);
         self.seq_len = cur_seq_len;
         return if (skip_lm_head) 0 else self.out_token_id_host.*;
+    }
+
+    /// Executes one batched `M`-node speculative tree verification forward pass
+    /// inside a single reusable Metal 4 command buffer (G5), writing temporary
+    /// rotated K/V rows into per-layer scratch buffers without mutating committed
+    /// IOSurface `KvTile`s until `commitTreeKv` is called. Zero dynamic heap alloc.
+    pub fn verifyTree(
+        self: *Qwen3Model,
+        token_ids: []const u32,
+        positions: []const u32,
+        ancestor_masks: []const u64,
+        base_pos: u32,
+        compute_logits: bool,
+    ) StepError!VerifyTreeResult {
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (token_ids.len == 0 or token_ids.len != positions.len or token_ids.len != ancestor_masks.len) {
+            return error.InvalidArgument;
+        }
+        if (token_ids.len > self.max_tree_nodes) return error.TreeTooLarge;
+        if (base_pos > self.max_seq_len) return error.PositionOutOfRange;
+
+        const m: u32 = @intCast(token_ids.len);
+        for (0..m) |i| {
+            if (token_ids[i] >= self.config.vocab_size) return error.TokenOutOfRange;
+            if (positions[i] >= self.max_seq_len) return error.PositionOutOfRange;
+        }
+        @memcpy(self.tree_token_ids_host[0..m], token_ids);
+        @memcpy(self.tree_positions_host[0..m], positions);
+        @memcpy(self.tree_ancestor_masks_host[0..m], ancestor_masks);
+
+        const h = self.config.hidden_size;
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+
+        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            .weight = self.embed.weight,
+            .scale_bias = self.embed.scale_bias,
+            .tokens = .{ .token_ids = self.tree_token_ids_bind },
+            .out = self.x_bind,
+            .m = m,
+            .vocab_size = self.config.vocab_size,
+            .hidden_size = h,
+        }, false);
+
+        for (self.layers, 0..) |layer, l| {
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.x_bind,
+                .w = layer.input_layernorm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true);
+
+            try self.encodeLinearBatched(&frame, layer.q_proj, self.x_norm_bind, self.q_bind, m, true);
+            try self.encodeLinearBatched(&frame, layer.k_proj, self.x_norm_bind, self.k_bind, m, false);
+            try self.encodeLinearBatched(&frame, layer.v_proj, self.x_norm_bind, self.v_bind, m, false);
+
+            const k_tree_bind = self.treeKBinding(l);
+            const v_tree_bind = self.treeVBinding(l);
+            try self.attn_pipes.encodeTreeQkNormRope(&frame, .{
+                .q = self.q_bind,
+                .k = self.k_bind,
+                .v = self.v_bind,
+                .q_norm = layer.q_norm,
+                .k_norm = layer.k_norm,
+                .positions = self.tree_positions_bind,
+                .k_tree_out = k_tree_bind,
+                .v_tree_out = v_tree_bind,
+                .num_nodes = m,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .rms_eps = self.config.rms_norm_eps,
+                .rope_theta = self.config.rope_theta,
+                .norm_dtype = layer.qk_norm_dtype,
+            }, true);
+
+            try self.attn_pipes.encodeGqaTreeVerifyAttn(&frame, .{
+                .q = self.q_bind,
+                .kv_tiles = if (base_pos > 0) layer.kv_tiles_binding else null,
+                .base_pos = base_pos,
+                .k_tree = k_tree_bind,
+                .v_tree = v_tree_bind,
+                .ancestor_masks = self.tree_ancestor_masks_bind,
+                .out = self.attn_out_bind,
+                .scratch = self.gqa_tree_scratch_bind,
+                .max_splits = attention.MAX_SPLITS,
+                .num_nodes = m,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .chunk_tokens = self.chunk_tokens,
+            }, true);
+
+            try self.encodeLinearBatched(&frame, layer.o_proj, self.attn_out_bind, self.proj_out_bind, m, true);
+            try self.moe_pipes.encodeResidualAdd(&frame, .{
+                .x = self.x_bind,
+                .delta = self.proj_out_bind,
+                .count = m * h,
+            }, true);
+
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.x_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, true);
+
+            switch (self.config.arch) {
+                .qwen3_moe => {
+                    // Use per-layer ScheduleHeader offset so all layers' unique active
+                    // expert counts remain readable after the single command buffer completes.
+                    var layer_ws = self.moe_ws.?;
+                    layer_ws.schedule_header_off = self.layer_sched_hdr_base_off + @as(u64, l) * 64;
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = self.x_norm_bind,
+                        .router = layer.router,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = &layer_ws,
+                        .workspace_buf = self.scratch_buf,
+                        .residual = self.x_bind,
+                        .out = self.x_bind,
+                        .m = m,
+                        .num_experts = self.config.num_experts,
+                        .top_k = self.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = self.config.moe_intermediate_size,
+                        .norm_topk_prob = self.config.norm_topk_prob,
+                    };
+                    switch (layer.expert_dtype) {
+                        .q3_affine => try self.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
+                        .q4_affine => try self.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
+                        .f16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
+                        .bf16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
+                    }
+                },
+                .qwen3_dense => {
+                    try self.encodeLinearBatched(&frame, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, m, true);
+                    try self.encodeLinearBatched(&frame, layer.dense_up, self.x_norm_bind, self.dense_up_bind, m, false);
+                    try self.moe_pipes.encodeSiluMul(&frame, .{
+                        .gate = self.dense_gate_bind,
+                        .up = self.dense_up_bind,
+                        .out = self.dense_act_bind,
+                        .count = m * self.config.intermediate_size,
+                    }, true);
+                    try self.encodeLinearBatched(&frame, layer.dense_down, self.dense_act_bind, self.proj_out_bind, m, true);
+                    try self.moe_pipes.encodeResidualAdd(&frame, .{
+                        .x = self.x_bind,
+                        .delta = self.proj_out_bind,
+                        .count = m * h,
+                    }, true);
+                },
+            }
+
+            try self.encodeAuxTapIfMatched(&frame, l, m);
+        }
+
+        if (compute_logits) {
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.x_bind,
+                .w = self.final_norm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = self.final_norm.dtype,
+            }, true);
+            try self.encodeLinearBatched(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, m, true);
+            try self.moe_pipes.encodeArgmaxRows(&frame, .{
+                .logits = self.logits_bind,
+                .out_token_ids = self.out_token_id_bind,
+                .num_rows = m,
+                .vocab_size = self.config.vocab_size,
+                .logits_dtype = .f16,
+            }, true);
+        }
+
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+
+        var total_unique: u64 = 0;
+        if (self.config.arch == .qwen3_moe) {
+            for (0..self.layers.len) |l| {
+                const hdr: *const moe.ScheduleHeader = @ptrCast(@alignCast(self.layer_sched_hdr_raw.ptr + l * 64));
+                total_unique += hdr.num_unique_experts;
+            }
+        }
+        const avg_unique: f64 = if (self.config.arch == .qwen3_moe)
+            @as(f64, @floatFromInt(total_unique)) / @as(f64, @floatFromInt(self.layers.len))
+        else
+            0.0;
+
+        const kv_per_layer: u64 =
+            2 * @as(u64, self.config.num_key_value_heads) * (@as(u64, base_pos) + m) * self.config.head_dim * @sizeOf(f16);
+        const kv_total: u64 = @as(u64, self.config.num_hidden_layers) * kv_per_layer;
+        const head_bytes: u64 = if (compute_logits)
+            @as(u64, m) * self.embed_row_alg_bytes + (self.global_head_bytes - self.embed_row_alg_bytes)
+        else
+            @as(u64, m) * self.embed_row_alg_bytes;
+        const layer_weight_bytes: u64 = if (self.config.arch == .qwen3_moe)
+            self.total_layers_non_expert_bytes + total_unique * self.single_expert_bytes
+        else
+            self.total_layers_static_bytes;
+
+        return .{
+            .num_nodes = m,
+            .argmax_tokens = self.out_token_ids_host[0..m],
+            .logits_f16 = self.logits_host[0 .. @as(usize, m) * self.config.vocab_size],
+            .total_unique_experts = total_unique,
+            .avg_unique_experts_per_layer = avg_unique,
+            .actual_bytes_moved = layer_weight_bytes + kv_total + head_bytes,
+        };
+    }
+
+    /// Commits ONLY the `accepted_nodes` KV rows from the most recent `verifyTree`
+    /// pass into committed IOSurface `RGBA16Float` `KvTile`s at sequence positions
+    /// `base_pos .. base_pos + accepted_nodes.len`, handling chunk boundaries cleanly,
+    /// and gathers accepted target feature taps (`accepted_aux_bind`, `accepted_top_bind`)
+    /// in the same Metal 4 command buffer. Zero dynamic heap allocation.
+    pub fn commitTreeKv(
+        self: *Qwen3Model,
+        base_pos: u32,
+        accepted_nodes: []const u16,
+    ) StepError!void {
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (accepted_nodes.len == 0 or accepted_nodes.len > self.max_tree_nodes) return error.InvalidArgument;
+        const accepted_count: u32 = @intCast(accepted_nodes.len);
+        if (base_pos + accepted_count > self.max_seq_len) return error.PositionOutOfRange;
+
+        for (accepted_nodes, 0..) |node_idx, i| {
+            if (node_idx >= self.max_tree_nodes) return error.InvalidArgument;
+            self.tree_accepted_nodes_host[i] = node_idx;
+        }
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+
+        // Commit accepted K/V rows per layer; loop handles even tiny test chunk sizes
+        // where `accepted_count` might span >2 chunks (for 512-token chunks it runs once).
+        var first_dispatch = true;
+        var offset: u32 = 0;
+        while (offset < accepted_count) {
+            const cur_base = base_pos + offset;
+            const chunk0: u32 = cur_base / self.chunk_tokens;
+            const max_end_in_two_chunks: u32 = (chunk0 + 2) * self.chunk_tokens;
+            const remain = accepted_count - offset;
+            const take: u32 = @min(remain, max_end_in_two_chunks - cur_base);
+            const crosses = ((cur_base + take - 1) / self.chunk_tokens) > chunk0;
+
+            for (0..self.layers.len) |l| {
+                const t0 = self.kvTileAt(l, @intCast(chunk0));
+                const t1 = if (crosses) self.kvTileAt(l, @intCast(chunk0 + 1)) else null;
+                try self.attn_pipes.encodeKvTreeCommit(&frame, .{
+                    .k_tree = self.treeKBinding(l),
+                    .v_tree = self.treeVBinding(l),
+                    .accepted_nodes = .{ .inline_u16 = accepted_nodes[offset .. offset + take] },
+                    .accepted_count = take,
+                    .k_tile0 = t0.k,
+                    .v_tile0 = t0.v,
+                    .k_tile1 = if (t1) |p| p.k else null,
+                    .v_tile1 = if (t1) |p| p.v else null,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .base_pos = cur_base,
+                    .chunk_tokens = self.chunk_tokens,
+                }, !first_dispatch);
+                first_dispatch = false;
+            }
+            offset += take;
+        }
+
+        if (self.enable_feature_taps) {
+            const h = self.config.hidden_size;
+            try self.moe_pipes.encodeGatherRows(&frame, .{
+                .src = self.aux_concat_bind,
+                .indices = self.tree_accepted_nodes_bind,
+                .dst = self.accepted_aux_bind,
+                .count = accepted_count,
+                .row_elems = 3 * h,
+            }, false);
+            try self.moe_pipes.encodeGatherRows(&frame, .{
+                .src = self.x_bind,
+                .indices = self.tree_accepted_nodes_bind,
+                .dst = self.accepted_top_bind,
+                .count = accepted_count,
+                .row_elems = h,
+            }, false);
+        }
+
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+        self.seq_len = base_pos + accepted_count;
+    }
+
+    /// Batched causal prompt prefill chunk (`1 <= tokens.len <= max_tree_nodes`)
+    /// reusing `verifyTree` + `commitTreeKv` with zero heap allocation.
+    pub fn prefillChunk(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        start_pos: u32,
+        compute_logits: bool,
+    ) StepError!u32 {
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (tokens.len == 0 or tokens.len > self.max_tree_nodes) return error.TreeTooLarge;
+        const m: usize = tokens.len;
+        var positions: [attention.MAX_TREE_NODES]u32 = undefined;
+        var masks: [attention.MAX_TREE_NODES]u64 = undefined;
+        var accepted: [attention.MAX_TREE_NODES]u16 = undefined;
+        for (0..m) |i| {
+            positions[i] = start_pos + @as(u32, @intCast(i));
+            masks[i] = if (i == 63) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(i + 1))) - 1;
+            accepted[i] = @intCast(i);
+        }
+        const vr = try self.verifyTree(tokens, positions[0..m], masks[0..m], start_pos, compute_logits);
+        try self.commitTreeKv(start_pos, accepted[0..m]);
+        return if (compute_logits) vr.argmax_tokens[m - 1] else 0;
+    }
+
+    fn runPredictMoEExpertsFrame(
+        self: *Qwen3Model,
+        frame: *metal.Compute.Frame,
+        hidden_bind: metal.BufferBinding,
+        num_nodes: u32,
+        sampled: u32,
+        initial_barrier: bool,
+    ) StepError!void {
+        const n_layers = self.config.num_hidden_layers;
+        const h = self.config.hidden_size;
+        const top_k = self.config.num_experts_per_tok;
+        const base_ws = self.moe_ws.?;
+
+        for (0..sampled) |s| {
+            const l_idx: usize = if (sampled == n_layers)
+                s
+            else
+                (@as(usize, s) * (n_layers - 1)) / (sampled - 1);
+            const layer = self.layers[l_idx];
+
+            try self.attn_pipes.encodeRmsNorm(frame, .{
+                .x = hidden_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = num_nodes,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, initial_barrier or s > 0);
+
+            var ws = base_ws;
+            ws.scratch_topk_experts_off = self.pred_topk_base_off + @as(u64, s) * self.pred_topk_layer_stride;
+            const logits_bind = ws.routerLogitsBinding(self.scratch_buf);
+            switch (layer.router) {
+                .weights => |w| try self.moe_pipes.encodeRouterProj(frame, w.dtype, .{
+                    .x = self.x_norm_bind,
+                    .router_weights = w.binding,
+                    .logits = logits_bind,
+                    .m = num_nodes,
+                    .num_experts = self.config.num_experts,
+                    .hidden_size = h,
+                }, true),
+                .quant_weights => |q| try self.moe_pipes.encodeRouterProjQuant(frame, q.bits, .{
+                    .x = self.x_norm_bind,
+                    .qweight = q.qweight,
+                    .scale_bias = q.scale_bias,
+                    .logits = logits_bind,
+                    .m = num_nodes,
+                    .num_experts = self.config.num_experts,
+                    .hidden_size = h,
+                }, true),
+                .logits => return error.InvalidArgument,
+            }
+            try self.moe_pipes.encodeRouteTopK(frame, .f32, .{
+                .logits = logits_bind,
+                .workspace = &ws,
+                .workspace_buf = self.scratch_buf,
+                .m = num_nodes,
+                .num_experts = self.config.num_experts,
+                .top_k = top_k,
+                .norm_topk_prob = self.config.norm_topk_prob,
+            }, true);
+        }
+    }
+
+    fn unpackPredictedBitsets(
+        self: *const Qwen3Model,
+        num_nodes: u32,
+        sampled: u32,
+        out_bitsets: []tree_mod.ExpertBitset,
+    ) void {
+        const top_k = self.config.num_experts_per_tok;
+        const stride_u32: usize = @intCast(self.pred_topk_layer_stride / @sizeOf(u32));
+        for (0..num_nodes) |v| {
+            for (0..sampled) |s| {
+                var bs = tree_mod.ExpertBitset.empty();
+                const row_base = s * stride_u32 + v * @as(usize, top_k);
+                for (0..top_k) |k_idx| {
+                    const eid = self.pred_topk_host[row_base + k_idx];
+                    if (eid < tree_mod.ExpertBitset.MAX_EXPERTS) {
+                        bs.set(eid);
+                    }
+                }
+                out_bitsets[v * sampled + s] = bs;
+            }
+        }
+    }
+
+    /// Predicts per-node MoE expert bitsets across up to `MAX_EXPERT_PRED_LAYERS`
+    /// evenly spaced target layers by applying the target model's own
+    /// `post_attention_layernorm` + router gate to `hidden_bind [num_nodes, H]`
+    /// inside a single tiny Metal 4 frame (D7 / ADR-0009).
+    ///
+    /// Writes `out_bitsets[v * sampled_layers + s]` and returns `sampled_layers`
+    /// (`0` for dense models). Zero dynamic heap allocation.
+    pub fn predictMoEExperts(
+        self: *Qwen3Model,
+        hidden_bind: metal.BufferBinding,
+        num_nodes: u32,
+        out_bitsets: []tree_mod.ExpertBitset,
+    ) StepError!u32 {
+        if (self.config.arch != .qwen3_moe or num_nodes == 0) return 0;
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (num_nodes > self.max_tree_nodes) return error.TreeTooLarge;
+
+        const sampled: u32 = @min(self.config.num_hidden_layers, MAX_EXPERT_PRED_LAYERS);
+        if (out_bitsets.len < @as(usize, num_nodes) * sampled) return error.InvalidArgument;
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+        try self.runPredictMoEExpertsFrame(&frame, hidden_bind, num_nodes, sampled, false);
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+
+        self.unpackPredictedBitsets(num_nodes, sampled, out_bitsets);
+        return sampled;
+    }
+
+    /// Embedding-based expert prediction for tree token IDs across up to
+    /// `MAX_EXPERT_PRED_LAYERS` evenly spaced target layers in a single Metal 4 frame.
+    /// Works uniformly for root, L1, L2 internal, and unexpanded leaf nodes with zero
+    /// dynamic heap allocation.
+    pub fn predictMoEExpertsForTokens(
+        self: *Qwen3Model,
+        token_ids: []const u32,
+        out_bitsets: []tree_mod.ExpertBitset,
+    ) StepError!u32 {
+        if (self.config.arch != .qwen3_moe or token_ids.len == 0) return 0;
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (token_ids.len > self.max_tree_nodes) return error.TreeTooLarge;
+        const m: u32 = @intCast(token_ids.len);
+        const sampled: u32 = @min(self.config.num_hidden_layers, MAX_EXPERT_PRED_LAYERS);
+        if (out_bitsets.len < @as(usize, m) * sampled) return error.InvalidArgument;
+        for (token_ids) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
+        @memcpy(self.tree_token_ids_host[0..m], token_ids);
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            .weight = self.embed.weight,
+            .scale_bias = self.embed.scale_bias,
+            .tokens = .{ .token_ids = self.tree_token_ids_bind },
+            .out = self.x_bind,
+            .m = m,
+            .vocab_size = self.config.vocab_size,
+            .hidden_size = self.config.hidden_size,
+        }, false);
+        try self.runPredictMoEExpertsFrame(&frame, self.x_bind, m, sampled, true);
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+
+        self.unpackPredictedBitsets(m, sampled, out_bitsets);
+        return sampled;
     }
 };
 
@@ -857,11 +1522,23 @@ fn loadInternal(
 ) LoadError!Qwen3Model {
     try config.validate();
     if (options.max_seq_len == 0 or options.chunk_tokens == 0) return error.InvalidConfig;
+    if (options.max_tree_nodes == 0 or options.max_tree_nodes > attention.MAX_TREE_NODES) {
+        return error.InvalidConfig;
+    }
+    const max_tree_nodes: u32 = options.max_tree_nodes;
+    const aux_layer_ids: [3]u32 = options.aux_layer_ids orelse defaultEagle3AuxLayerIds(config.num_hidden_layers);
+    if (options.enable_feature_taps) {
+        for (aux_layer_ids) |tap_l| {
+            if (tap_l >= config.num_hidden_layers) return error.InvalidConfig;
+        }
+    }
+
     const max_seq_len = @min(options.max_seq_len, config.max_position_embeddings);
     const num_chunks: u32 = (max_seq_len + options.chunk_tokens - 1) / options.chunk_tokens;
 
-    // Worst-case dispatches in one stepDecode command buffer: 1 embed + 15 per layer + 3 global.
-    const max_dispatches: u64 = 1 + @as(u64, config.num_hidden_layers) * 15 + 3;
+    // Worst-case dispatches in one stepDecode / verifyTree command buffer:
+    // 1 embed + 15 per layer + 3 aux taps + 3 global.
+    const max_dispatches: u64 = 1 + @as(u64, config.num_hidden_layers) * 15 + 6;
     if (max_dispatches > metal.UNIFORM_SLOTS_PER_FRAME) {
         return error.TooManyDispatchesForFrame;
     }
@@ -1007,8 +1684,14 @@ fn loadInternal(
         group_shard[g_idx] = shard_sizes.items.len - 1;
     }
 
-    // Compute scratch arena footprint.
+    // Compute scratch arena footprint (scaled by `max_tree_nodes` for zero hot-path alloc).
+    const m_cap: usize = max_tree_nodes;
+    const tree_enabled = max_tree_nodes > 1;
     const gqa_layout = attention.gqaScratchLayout(config.num_attention_heads, config.head_dim, attention.MAX_SPLITS);
+    const gqa_tree_bytes: usize = if (tree_enabled)
+        amf.align64(attention.gqaTreeScratchLayout(max_tree_nodes, config.num_attention_heads, config.head_dim, attention.MAX_SPLITS).total_bytes)
+    else
+        0;
     const kv_tbl_per_layer = amf.align64(@as(usize, num_chunks) * @sizeOf(attention.KvTilePair));
     const expert_tbl_per_layer: usize = if (config.arch == .qwen3_moe)
         amf.align64(@as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights))
@@ -1016,7 +1699,7 @@ fn loadInternal(
         0;
     const moe_ws_bytes: usize = if (config.arch == .qwen3_moe)
         try moe.MoeWorkspace.requiredBytes(.{
-            .max_tokens = 1,
+            .max_tokens = max_tree_nodes,
             .num_experts = config.num_experts,
             .top_k = config.num_experts_per_tok,
             .hidden_size = h,
@@ -1024,24 +1707,57 @@ fn loadInternal(
         })
     else
         0;
+    const layer_sched_hdr_bytes: usize = if (config.arch == .qwen3_moe and tree_enabled)
+        num_layers * 64
+    else
+        0;
+    const pred_sampled_layers: usize = if (config.arch == .qwen3_moe and tree_enabled)
+        @min(num_layers, MAX_EXPERT_PRED_LAYERS)
+    else
+        0;
+    const pred_topk_layer_stride: usize = if (pred_sampled_layers > 0)
+        amf.align64(m_cap * @as(usize, config.num_experts_per_tok) * @sizeOf(u32))
+    else
+        0;
+    const pred_topk_total_bytes: usize = pred_sampled_layers * pred_topk_layer_stride;
     const dense_ffn_scratch: usize = if (config.arch == .qwen3_dense)
-        3 * amf.align64(@as(usize, config.intermediate_size) * @sizeOf(f16))
+        3 * amf.align64(m_cap * @as(usize, config.intermediate_size) * @sizeOf(f16))
+    else
+        0;
+    const tree_kv_layer_stride: usize = if (tree_enabled)
+        amf.align64(m_cap * @as(usize, kv_dim) * @sizeOf(f16))
+    else
+        0;
+    const tree_meta_bytes: usize = if (tree_enabled)
+        amf.align64(m_cap * @sizeOf(u32)) * 3 + // token_ids, positions, accepted_nodes
+            amf.align64(m_cap * @sizeOf(u64)) + // ancestor_masks
+            2 * num_layers * tree_kv_layer_stride // per-layer tree K & V
+    else
+        0;
+    const feature_tap_bytes: usize = if (options.enable_feature_taps)
+        2 * amf.align64(m_cap * 3 * @as(usize, h) * @sizeOf(f16)) + // aux_concat, accepted_aux
+            amf.align64(m_cap * @as(usize, h) * @sizeOf(f16)) // accepted_top
     else
         0;
 
     const scratch_raw: usize =
-        2 * amf.align64(@as(usize, h) * @sizeOf(f16)) + // x, x_norm
-        2 * amf.align64(@as(usize, q_dim) * @sizeOf(f16)) + // q, attn_out
-        2 * amf.align64(@as(usize, kv_dim) * @sizeOf(f16)) + // k, v
-        amf.align64(@as(usize, h) * @sizeOf(f16)) + // proj_out
-        amf.align64(@as(usize, config.vocab_size) * @sizeOf(f16)) + // logits
-        64 + // out_token_id
-        gqa_layout.total_bytes +
+        2 * amf.align64(m_cap * @as(usize, h) * @sizeOf(f16)) + // x, x_norm
+        2 * amf.align64(m_cap * @as(usize, q_dim) * @sizeOf(f16)) + // q, attn_out
+        2 * amf.align64(m_cap * @as(usize, kv_dim) * @sizeOf(f16)) + // k, v
+        amf.align64(m_cap * @as(usize, h) * @sizeOf(f16)) + // proj_out
+        amf.align64(m_cap * @as(usize, config.vocab_size) * @sizeOf(f16)) + // logits
+        amf.align64(m_cap * @sizeOf(u32)) + // out_token_ids
+        amf.align64(gqa_layout.total_bytes) +
+        gqa_tree_bytes +
+        tree_meta_bytes +
+        feature_tap_bytes +
         num_layers * kv_tbl_per_layer +
         num_layers * expert_tbl_per_layer +
         moe_ws_bytes +
+        layer_sched_hdr_bytes +
+        pred_topk_total_bytes +
         dense_ffn_scratch +
-        4 * page.APPLE_PAGE_SIZE;
+        8 * page.APPLE_PAGE_SIZE;
     const scratch_arena_bytes = try page.alignUp(scratch_raw);
 
     // Compute total KV tile bytes (exact 16 KiB multiple per tile).
@@ -1112,21 +1828,80 @@ fn loadInternal(
     try compute.makeTilesResident(kv_tiles);
 
     // --- 7. Carve hot-path scratch buffers & populate bindless KV tile tables ---
-    const x_raw = try scratch_arena.allocAligned(@as(usize, h) * @sizeOf(f16), 64);
-    const x_norm_raw = try scratch_arena.allocAligned(@as(usize, h) * @sizeOf(f16), 64);
-    const q_raw = try scratch_arena.allocAligned(@as(usize, q_dim) * @sizeOf(f16), 64);
-    const k_raw = try scratch_arena.allocAligned(@as(usize, kv_dim) * @sizeOf(f16), 64);
-    const v_raw = try scratch_arena.allocAligned(@as(usize, kv_dim) * @sizeOf(f16), 64);
-    const attn_out_raw = try scratch_arena.allocAligned(@as(usize, q_dim) * @sizeOf(f16), 64);
-    const proj_out_raw = try scratch_arena.allocAligned(@as(usize, h) * @sizeOf(f16), 64);
-    const logits_raw = try scratch_arena.allocAligned(@as(usize, config.vocab_size) * @sizeOf(f16), 64);
-    const out_tok_raw = try scratch_arena.allocAligned(@sizeOf(u32), 64);
+    const x_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
+    const x_norm_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
+    const q_raw = try scratch_arena.allocAligned(m_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
+    const k_raw = try scratch_arena.allocAligned(m_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
+    const v_raw = try scratch_arena.allocAligned(m_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
+    const attn_out_raw = try scratch_arena.allocAligned(m_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
+    const proj_out_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
+    const logits_raw = try scratch_arena.allocAligned(m_cap * @as(usize, config.vocab_size) * @sizeOf(f16), 64);
+    const out_tok_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
     const gqa_scratch_raw = try scratch_arena.allocAligned(gqa_layout.total_bytes, 64);
     @memset(out_tok_raw, 0);
 
+    var tree_token_ids_host: []u32 = &.{};
+    var tree_positions_host: []u32 = &.{};
+    var tree_ancestor_masks_host: []u64 = &.{};
+    var tree_accepted_nodes_host: []u32 = &.{};
+    var tree_token_ids_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var tree_positions_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var tree_ancestor_masks_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var tree_accepted_nodes_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var tree_k_base_off: u64 = 0;
+    var tree_v_base_off: u64 = 0;
+    var gqa_tree_scratch_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    if (tree_enabled) {
+        const tt_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
+        const tp_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
+        const tm_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u64), 64);
+        const ta_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
+        const tk_raw = try scratch_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
+        const tv_raw = try scratch_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
+        const gt_raw = try scratch_arena.allocAligned(gqa_tree_bytes, 64);
+        @memset(tt_raw, 0);
+        @memset(tp_raw, 0);
+        @memset(tm_raw, 0);
+        @memset(ta_raw, 0);
+        tree_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, tt_raw));
+        tree_positions_host = @alignCast(std.mem.bytesAsSlice(u32, tp_raw));
+        tree_ancestor_masks_host = @alignCast(std.mem.bytesAsSlice(u64, tm_raw));
+        tree_accepted_nodes_host = @alignCast(std.mem.bytesAsSlice(u32, ta_raw));
+        tree_token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tt_raw.ptr) };
+        tree_positions_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tp_raw.ptr) };
+        tree_ancestor_masks_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tm_raw.ptr) };
+        tree_accepted_nodes_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(ta_raw.ptr) };
+        tree_k_base_off = scratch_arena.offsetOf(tk_raw.ptr);
+        tree_v_base_off = scratch_arena.offsetOf(tv_raw.ptr);
+        gqa_tree_scratch_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gt_raw.ptr) };
+    }
+
+    var aux_concat_host: []f16 = &.{};
+    var aux_concat_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var accepted_aux_host: []f16 = &.{};
+    var accepted_aux_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var accepted_top_host: []f16 = &.{};
+    var accepted_top_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    if (options.enable_feature_taps) {
+        const aux_bytes = m_cap * 3 * @as(usize, h) * @sizeOf(f16);
+        const top_bytes = m_cap * @as(usize, h) * @sizeOf(f16);
+        const ac_raw = try scratch_arena.allocAligned(aux_bytes, 64);
+        const aa_raw = try scratch_arena.allocAligned(aux_bytes, 64);
+        const at_raw = try scratch_arena.allocAligned(top_bytes, 64);
+        @memset(ac_raw, 0);
+        @memset(aa_raw, 0);
+        @memset(at_raw, 0);
+        aux_concat_host = @alignCast(std.mem.bytesAsSlice(f16, ac_raw));
+        aux_concat_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(ac_raw.ptr) };
+        accepted_aux_host = @alignCast(std.mem.bytesAsSlice(f16, aa_raw));
+        accepted_aux_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(aa_raw.ptr) };
+        accepted_top_host = @alignCast(std.mem.bytesAsSlice(f16, at_raw));
+        accepted_top_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(at_raw.ptr) };
+    }
+
     const moe_ws: ?moe.MoeWorkspace = if (config.arch == .qwen3_moe)
         try moe.MoeWorkspace.init(&scratch_arena, .{
-            .max_tokens = 1,
+            .max_tokens = max_tree_nodes,
             .num_experts = config.num_experts,
             .top_k = config.num_experts_per_tok,
             .hidden_size = h,
@@ -1135,11 +1910,26 @@ fn loadInternal(
     else
         null;
 
+    var layer_sched_hdr_base_off: u64 = 0;
+    var layer_sched_hdr_raw: []u8 = &.{};
+    var pred_topk_base_off: u64 = 0;
+    var pred_topk_host: []u32 = &.{};
+    if (config.arch == .qwen3_moe and tree_enabled) {
+        layer_sched_hdr_raw = try scratch_arena.allocAligned(layer_sched_hdr_bytes, 64);
+        @memset(layer_sched_hdr_raw, 0);
+        layer_sched_hdr_base_off = scratch_arena.offsetOf(layer_sched_hdr_raw.ptr);
+
+        const pt_raw = try scratch_arena.allocAligned(pred_topk_total_bytes, 64);
+        @memset(pt_raw, 0);
+        pred_topk_base_off = scratch_arena.offsetOf(pt_raw.ptr);
+        pred_topk_host = @alignCast(std.mem.bytesAsSlice(u32, pt_raw));
+    }
+
     var dense_gate_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var dense_up_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var dense_act_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     if (config.arch == .qwen3_dense) {
-        const inter_bytes = @as(usize, config.intermediate_size) * @sizeOf(f16);
+        const inter_bytes = m_cap * @as(usize, config.intermediate_size) * @sizeOf(f16);
         const dg = try scratch_arena.allocAligned(inter_bytes, 64);
         const du = try scratch_arena.allocAligned(inter_bytes, 64);
         const da = try scratch_arena.allocAligned(inter_bytes, 64);
@@ -1174,6 +1964,8 @@ fn loadInternal(
     errdefer allocator.free(layers);
 
     var total_layers_static_bytes: u64 = 0;
+    var total_layers_non_expert_bytes: u64 = 0;
+    var single_expert_bytes: u64 = 0;
     const dummy_linear: LinearBinding = .{
         .weight = .{ .buffer = scratch_buf, .offset = 0 },
         .scale_bias = null,
@@ -1248,7 +2040,11 @@ fn loadInternal(
             .kv_tiles_binding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(kv_tbl_raw.ptr) },
         };
 
+        const attn_static_bytes: u64 =
+            in_ln_e.data_bytes + post_ln_e.data_bytes + qk_norm_bytes +
+            q_b.alg_bytes + k_b.alg_bytes + v_b.alg_bytes + o_b.alg_bytes;
         var ffn_active_bytes: u64 = 0;
+        var layer_non_expert_bytes: u64 = attn_static_bytes;
         switch (config.arch) {
             .qwen3_moe => {
                 const router_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable);
@@ -1301,12 +2097,15 @@ fn loadInternal(
                 layer_w.expert_dtype = exp_dt;
 
                 const router_bytes: u64 = router_e.data_bytes + router_e.params_bytes;
-                const experts_bytes: u64 = switch (exp_dt) {
-                    .q3_affine => try moe.expertLayerBytes(.q3, config.num_experts_per_tok, h, config.moe_intermediate_size),
-                    .q4_affine => try moe.expertLayerBytes(.q4, config.num_experts_per_tok, h, config.moe_intermediate_size),
-                    .f16, .bf16 => try moe.expertLayerBytesFloat(config.num_experts_per_tok, h, config.moe_intermediate_size),
+                const one_exp: u64 = switch (exp_dt) {
+                    .q3_affine => try moe.expertLayerBytes(.q3, 1, h, config.moe_intermediate_size),
+                    .q4_affine => try moe.expertLayerBytes(.q4, 1, h, config.moe_intermediate_size),
+                    .f16, .bf16 => try moe.expertLayerBytesFloat(1, h, config.moe_intermediate_size),
                 };
+                if (single_expert_bytes == 0) single_expert_bytes = one_exp;
+                const experts_bytes: u64 = one_exp * config.num_experts_per_tok;
                 ffn_active_bytes = router_bytes + experts_bytes;
+                layer_non_expert_bytes += router_bytes;
             },
             .qwen3_dense => {
                 const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
@@ -1322,21 +2121,25 @@ fn loadInternal(
                 layer_w.dense_up = up_b;
                 layer_w.dense_down = dp_b;
                 ffn_active_bytes = gp_b.alg_bytes + up_b.alg_bytes + dp_b.alg_bytes;
+                layer_non_expert_bytes += ffn_active_bytes;
             },
         }
 
-        total_layers_static_bytes +=
-            in_ln_e.data_bytes + post_ln_e.data_bytes + qk_norm_bytes +
-            q_b.alg_bytes + k_b.alg_bytes + v_b.alg_bytes + o_b.alg_bytes +
-            ffn_active_bytes;
+        total_layers_static_bytes += attn_static_bytes + ffn_active_bytes;
+        total_layers_non_expert_bytes += layer_non_expert_bytes;
         layers[l] = layer_w;
     }
+
+    const out_tok_ids_slice: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_tok_raw));
 
     return .{
         .config = config,
         .max_seq_len = max_seq_len,
         .chunk_tokens = options.chunk_tokens,
         .num_chunks = num_chunks,
+        .max_tree_nodes = max_tree_nodes,
+        .enable_feature_taps = options.enable_feature_taps,
+        .aux_layer_ids = aux_layer_ids,
         .timeout_ms = options.timeout_ms,
         .wired_budget_bytes = wired_budget.limit_bytes,
         .total_wired_bytes = total_wired_bytes,
@@ -1355,8 +2158,10 @@ fn loadInternal(
         .embed = embed_lin,
         .final_norm = final_norm_blob.asNormBinding(final_norm_dt),
         .lm_head = lm_head_lin,
+        .x_host = @alignCast(std.mem.bytesAsSlice(f16, x_raw)),
         .logits_host = @alignCast(std.mem.bytesAsSlice(f16, logits_raw)),
-        .out_token_id_host = @ptrCast(@alignCast(out_tok_raw.ptr)),
+        .out_token_ids_host = out_tok_ids_slice,
+        .out_token_id_host = &out_tok_ids_slice[0],
         .x_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_raw.ptr) },
         .x_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_norm_raw.ptr) },
         .q_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(q_raw.ptr) },
@@ -1367,11 +2172,37 @@ fn loadInternal(
         .logits_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(logits_raw.ptr) },
         .out_token_id_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(out_tok_raw.ptr) },
         .gqa_scratch_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gqa_scratch_raw.ptr) },
+        .tree_token_ids_host = tree_token_ids_host,
+        .tree_positions_host = tree_positions_host,
+        .tree_ancestor_masks_host = tree_ancestor_masks_host,
+        .tree_accepted_nodes_host = tree_accepted_nodes_host,
+        .tree_token_ids_bind = tree_token_ids_bind,
+        .tree_positions_bind = tree_positions_bind,
+        .tree_ancestor_masks_bind = tree_ancestor_masks_bind,
+        .tree_accepted_nodes_bind = tree_accepted_nodes_bind,
+        .tree_k_base_off = tree_k_base_off,
+        .tree_v_base_off = tree_v_base_off,
+        .tree_kv_layer_stride = tree_kv_layer_stride,
+        .gqa_tree_scratch_bind = gqa_tree_scratch_bind,
+        .aux_concat_host = aux_concat_host,
+        .aux_concat_bind = aux_concat_bind,
+        .accepted_aux_host = accepted_aux_host,
+        .accepted_aux_bind = accepted_aux_bind,
+        .accepted_top_host = accepted_top_host,
+        .accepted_top_bind = accepted_top_bind,
         .moe_ws = moe_ws,
+        .layer_sched_hdr_base_off = layer_sched_hdr_base_off,
+        .layer_sched_hdr_raw = layer_sched_hdr_raw,
+        .pred_topk_base_off = pred_topk_base_off,
+        .pred_topk_layer_stride = pred_topk_layer_stride,
+        .pred_topk_host = pred_topk_host,
         .dense_gate_bind = dense_gate_bind,
         .dense_up_bind = dense_up_bind,
         .dense_act_bind = dense_act_bind,
         .total_layers_static_bytes = total_layers_static_bytes,
+        .total_layers_non_expert_bytes = total_layers_non_expert_bytes,
+        .single_expert_bytes = single_expert_bytes,
+        .embed_row_alg_bytes = embed_row_alg_bytes,
         .global_head_bytes = global_head_bytes,
     };
 }
@@ -1508,7 +2339,7 @@ const SyntheticRecord = struct {
     params: []u8,
 };
 
-const SynthDTypeSpec = struct {
+pub const SynthDTypeSpec = struct {
     linear_dtype: quant.WeightDType,
     embed_dtype: quant.WeightDType,
     norm_dtype: quant.FloatDType = .f16,
@@ -1598,7 +2429,7 @@ fn floatDTypeToAmf(fdt: quant.FloatDType) amf.DType {
     };
 }
 
-fn buildSyntheticAmfImageWithSpec(
+pub fn buildSyntheticAmfImageWithSpec(
     allocator: std.mem.Allocator,
     cfg: ModelConfig,
     spec: SynthDTypeSpec,
@@ -2591,5 +3422,172 @@ test "Qwen3-MoE mixed-precision (q3 experts + q3 router + q3 embed + bf16 norms)
         }
         try std.testing.expectEqual(expected, got);
         tok = got;
+    }
+}
+
+test "verifyTree + commitTreeKv + feature taps match stepDecode bit-for-bit across chunk boundaries on MoE and Dense BF16" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { cfg: ModelConfig, spec: SynthDTypeSpec }{
+        .{
+            .cfg = .{
+                .arch = .qwen3_moe,
+                .quant_bits = .q3,
+                .default_float_dtype = .bf16,
+                .vocab_size = 256,
+                .hidden_size = 128,
+                .num_hidden_layers = 5,
+                .num_attention_heads = 4,
+                .num_key_value_heads = 2,
+                .head_dim = 64,
+                .moe_intermediate_size = 128,
+                .num_experts = 8,
+                .num_experts_per_tok = 2,
+                .norm_topk_prob = true,
+            },
+            .spec = .{
+                .linear_dtype = .q3_affine,
+                .embed_dtype = .q3_affine,
+                .norm_dtype = .bf16,
+                .router_dtype = .q3_affine,
+                .expert_dtype = .q3_affine,
+            },
+        },
+        .{
+            .cfg = .{
+                .arch = .qwen3_dense,
+                .quant_bits = null,
+                .default_float_dtype = .bf16,
+                .vocab_size = 256,
+                .hidden_size = 128,
+                .num_hidden_layers = 3,
+                .num_attention_heads = 4,
+                .num_key_value_heads = 2,
+                .head_dim = 64,
+                .intermediate_size = 256,
+                .tie_word_embeddings = true,
+            },
+            .spec = .{
+                .linear_dtype = .bf16,
+                .embed_dtype = .bf16,
+                .norm_dtype = .bf16,
+                .use_weight_suffix = true,
+            },
+        },
+    };
+
+    for (cases, 0..) |tc, ci| {
+        const image = try buildSyntheticAmfImageWithSpec(gpa, tc.cfg, tc.spec, 777 + ci);
+        defer gpa.free(image);
+
+        // Reference sequential greedy sequence of 14 tokens across chunk_tokens = 8 boundary.
+        var ref_model = try Qwen3Model.loadFromBytes(gpa, image, tc.cfg, .{
+            .max_seq_len = 32,
+            .chunk_tokens = 8,
+            .enable_feature_taps = true,
+        });
+        defer ref_model.deinit(gpa);
+
+        var seq: [15]u32 = undefined;
+        seq[0] = 19;
+        var pos: u32 = 0;
+        for (0..14) |s| {
+            seq[s + 1] = try ref_model.stepDecode(seq[s], pos);
+            pos += 1;
+        }
+        // Capture single-token feature taps at pos = 5 for cross-checking against verifyTree.
+        ref_model.resetKvCache();
+        for (0..6) |s| {
+            _ = try ref_model.stepDecode(seq[s], @intCast(s));
+        }
+        const ref_aux_pos5 = try gpa.dupe(f16, ref_model.readAuxConcatF16(1));
+        defer gpa.free(ref_aux_pos5);
+        const ref_top_pos5 = try gpa.dupe(f16, ref_model.readTopHiddenF16(1));
+        defer gpa.free(ref_top_pos5);
+
+        // Speculative tree model with chunk_tokens = 8 (forces chunk 0 -> 1 boundary commit!).
+        var tree_model = try Qwen3Model.loadFromBytes(gpa, image, tc.cfg, .{
+            .max_seq_len = 32,
+            .chunk_tokens = 8,
+            .max_tree_nodes = 16,
+            .enable_feature_taps = true,
+        });
+        defer tree_model.deinit(gpa);
+
+        // Prefill 0..5 via prefillChunk (5 tokens) so base_pos = 5 -> commit of 5 tokens crosses 8!
+        _ = try tree_model.prefillChunk(seq[0..5], 0, false);
+        try std.testing.expectEqual(@as(u32, 5), tree_model.seq_len);
+
+        // Build a branching tree at base_pos = 5 where:
+        //   node 0: seq[5] (pos 5, root)
+        //   node 1: wrong sibling of root (pos 6, mask 0b000011)
+        //   node 2: seq[6] (pos 6, mask 0b000101)  -- correct child!
+        //   node 3: seq[7] (pos 7, mask 0b001101)  -- correct child!
+        //   node 4: wrong child of node 2 (pos 7, mask 0b010101)
+        //   node 5: seq[8] (pos 8, mask 0b101101)  -- crosses chunk 0->1!
+        //   node 6: seq[9] (pos 9, mask 0b1101101) -- chunk 1!
+        const wrong_tok: u32 = (seq[6] + 1) % tc.cfg.vocab_size;
+        const wrong_tok2: u32 = (seq[7] + 1) % tc.cfg.vocab_size;
+        const tokens = [_]u32{ seq[5], wrong_tok, seq[6], seq[7], wrong_tok2, seq[8], seq[9] };
+        const positions = [_]u32{ 5, 6, 6, 7, 7, 8, 9 };
+        const masks = [_]u64{
+            0b0000001,
+            0b0000011,
+            0b0000101,
+            0b0001101,
+            0b0010101,
+            0b0101101,
+            0b1101101,
+        };
+
+        const vr = try tree_model.verifyTree(&tokens, &positions, &masks, 5, true);
+        try std.testing.expectEqual(@as(u32, 7), vr.num_nodes);
+        try std.testing.expectEqual(seq[6], vr.argmax_tokens[0]);
+        try std.testing.expectEqual(seq[7], vr.argmax_tokens[2]);
+        try std.testing.expectEqual(seq[8], vr.argmax_tokens[3]);
+        try std.testing.expectEqual(seq[9], vr.argmax_tokens[5]);
+        try std.testing.expectEqual(seq[10], vr.argmax_tokens[6]);
+        if (tc.cfg.arch == .qwen3_moe) {
+            try std.testing.expect(vr.total_unique_experts >= tc.cfg.num_hidden_layers * tc.cfg.num_experts_per_tok);
+            try std.testing.expect(vr.avg_unique_experts_per_layer >= @as(f64, @floatFromInt(tc.cfg.num_experts_per_tok)));
+        }
+        try std.testing.expect(vr.actual_bytes_moved > 0);
+
+        // Verify node 0's tapped features match single-token stepDecode at pos 5 closely.
+        const tree_aux0 = tree_model.readAuxConcatF16(1);
+        const tree_top0 = tree_model.readTopHiddenF16(1);
+        for (ref_aux_pos5, tree_aux0) |a, b| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(a)), @as(f32, @floatCast(b)), 2e-2);
+        }
+        for (ref_top_pos5, tree_top0) |a, b| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(a)), @as(f32, @floatCast(b)), 2e-2);
+        }
+
+        // Commit accepted path [0, 2, 3, 5, 6] across chunk boundary 5..9 -> seq_len = 10.
+        const accepted = [_]u16{ 0, 2, 3, 5, 6 };
+        try tree_model.commitTreeKv(5, &accepted);
+        try std.testing.expectEqual(@as(u32, 10), tree_model.seq_len);
+
+        // Verify accepted_aux_host[0] and accepted_top_host[0] gathered cleanly.
+        const h: usize = tc.cfg.hidden_size;
+        try std.testing.expectEqualSlices(f16, tree_aux0[0 .. 3 * h], tree_model.accepted_aux_host[0 .. 3 * h]);
+        try std.testing.expectEqualSlices(f16, tree_top0[0..h], tree_model.accepted_top_host[0..h]);
+
+        // Subsequent stepDecode steps 10..14 must match sequential reference bit-for-bit!
+        var cur = seq[10];
+        for (10..14) |s| {
+            const nxt = try tree_model.stepDecode(cur, @intCast(s));
+            try std.testing.expectEqual(seq[s + 1], nxt);
+            cur = nxt;
+        }
+
+        // Exercise router-based MoE expert prediction helper (D7).
+        if (tc.cfg.arch == .qwen3_moe) {
+            var bitsets: [7 * MAX_EXPERT_PRED_LAYERS]tree_mod.ExpertBitset = undefined;
+            const sampled = try tree_model.predictMoEExpertsForTokens(&tokens, &bitsets);
+            try std.testing.expectEqual(tc.cfg.num_hidden_layers, sampled);
+            for (0..tokens.len * sampled) |bi| {
+                try std.testing.expectEqual(tc.cfg.num_experts_per_tok, bitsets[bi].count());
+            }
+        }
     }
 }

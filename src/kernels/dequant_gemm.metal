@@ -303,6 +303,194 @@ kernel void ami_dequant_gemm(const device half *x [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel 2b: Weight-Stationary Batched Dequant GEMV (M = 1..64 tree verify)
+//
+// Geometry: 4 simdgroups/threadgroup (128 threads), 2 output rows/simdgroup
+// (8 output rows/threadgroup), up to 8 tokens per tg_pos.y block.
+// Issues 2 independent DRAM weight/scale_bias loads per step (full M4 MLP),
+// computes `px0, px1, x_sum` ONCE per token and reuses across both rows, and
+// uses a single `x_base` pointer for low register pressure and high occupancy.
+// Preserves exact bit-for-bit FP32 FMA order with `ami_dequant_gemv`.
+// ---------------------------------------------------------------------------
+static inline void qdot8_pair_q4(const device half *x_row,
+                                 uint k_off,
+                                 uint32_t w0, float s0, float b0,
+                                 uint32_t w1, float s1, float b1,
+                                 thread float &a0,
+                                 thread float &a1) {
+    const float4 fx0 = float4(*(const device half4 *)(x_row + k_off));
+    const float4 fx1 = float4(*(const device half4 *)(x_row + k_off + 4u));
+    const float x_sum = (fx0.x + fx0.y) + (fx0.z + fx0.w) +
+                        (fx1.x + fx1.y) + (fx1.z + fx1.w);
+    const float4 px0 = float4(fx0.x,
+                              fx0.y * (1.0f / 16.0f),
+                              fx0.z * (1.0f / 256.0f),
+                              fx0.w * (1.0f / 4096.0f));
+    const float4 px1 = float4(fx1.x,
+                              fx1.y * (1.0f / 16.0f),
+                              fx1.z * (1.0f / 256.0f),
+                              fx1.w * (1.0f / 4096.0f));
+    a0 = fma(qdot8_q4(w0, px0, px1), s0, fma(x_sum, b0, a0));
+    a1 = fma(qdot8_q4(w1, px0, px1), s1, fma(x_sum, b1, a1));
+}
+
+static inline void qdot8_pair_q3(const device half *x_row,
+                                 uint k_off,
+                                 uchar r0_b0, uchar r0_b1, uchar r0_b2, float s0, float b0,
+                                 uchar r1_b0, uchar r1_b1, uchar r1_b2, float s1, float b1,
+                                 thread float &a0,
+                                 thread float &a1) {
+    const float4 fx0 = float4(*(const device half4 *)(x_row + k_off));
+    const float4 fx1 = float4(*(const device half4 *)(x_row + k_off + 4u));
+    const float x_sum = (fx0.x + fx0.y) + (fx0.z + fx0.w) +
+                        (fx1.x + fx1.y) + (fx1.z + fx1.w);
+    const float4 px0 = float4(fx0.x,
+                              fx0.y * (1.0f / 8.0f),
+                              fx0.z * (1.0f / 64.0f),
+                              fx0.w * (1.0f / 2.0f));
+    const float4 px1 = float4(fx1.x * (1.0f / 16.0f),
+                              fx1.y * (1.0f / 128.0f),
+                              fx1.z * (1.0f / 4.0f),
+                              fx1.w * (1.0f / 32.0f));
+    const float x2_hi = fx0.z * 4.0f;
+    const float x5_hi = fx1.y * 2.0f;
+    a0 = fma(qdot8_q3(r0_b0, r0_b1, r0_b2, px0, px1, x2_hi, x5_hi), s0, fma(x_sum, b0, a0));
+    a1 = fma(qdot8_q3(r1_b0, r1_b1, r1_b2, px0, px1, x2_hi, x5_hi), s1, fma(x_sum, b1, a1));
+}
+
+kernel void ami_dequant_gemv_batch(const device half *x [[buffer(0)]],
+                                   const device uchar *qweight [[buffer(1)]],
+                                   const device half2 *scale_bias [[buffer(2)]],
+                                   device half *y [[buffer(3)]],
+                                   constant DequantParams &p [[buffer(4)]],
+                                   uint2 tg_pos [[threadgroup_position_in_grid]],
+                                   uint sg_id [[simdgroup_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = (tg_pos.x * 4u + sg_id) * 2u;
+    const uint m_base = tg_pos.y * 8u;
+    if (row0 >= p.n || m_base >= p.m) {
+        return;
+    }
+    const uint row1 = min(row0 + 1u, p.n - 1u);
+    const bool has_row1 = (row0 + 1u) < p.n;
+    const uint tile_m = min(8u, p.m - m_base);
+    const uint sub_group = lane >> 3;
+    const uint lane_in_grp = lane & 7u;
+
+    const device uchar *w_row0 = qweight + ulong(row0) * p.row_bytes;
+    const device uchar *w_row1 = qweight + ulong(row1) * p.row_bytes;
+    const device half2 *sb_row0 = scale_bias + ulong(row0) * p.num_groups;
+    const device half2 *sb_row1 = scale_bias + ulong(row1) * p.num_groups;
+
+    const device half *x_base = x + ulong(m_base) * p.k;
+    const ulong x_stride = ulong(p.k);
+
+    float a0_0 = 0.0f, a0_1 = 0.0f, a0_2 = 0.0f, a0_3 = 0.0f;
+    float a0_4 = 0.0f, a0_5 = 0.0f, a0_6 = 0.0f, a0_7 = 0.0f;
+    float a1_0 = 0.0f, a1_1 = 0.0f, a1_2 = 0.0f, a1_3 = 0.0f;
+    float a1_4 = 0.0f, a1_5 = 0.0f, a1_6 = 0.0f, a1_7 = 0.0f;
+
+    for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+        const uint g = g_base + sub_group;
+        if (g >= p.num_groups) {
+            continue;
+        }
+        const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+        const half2 sb0 = sb_row0[g];
+        const half2 sb1 = sb_row1[g];
+        const float s0 = float(sb0.x), b0 = float(sb0.y);
+        const float s1 = float(sb1.x), b1 = float(sb1.y);
+
+        if (Q_BITS == 4u) {
+            const uint w_off = g * 32u + lane_in_grp * 4u;
+            const uint32_t w0 = *(const device uint32_t *)(w_row0 + w_off);
+            const uint32_t w1 = *(const device uint32_t *)(w_row1 + w_off);
+            qdot8_pair_q4(x_base + 0ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_0, a1_0);
+            if (tile_m > 1u) qdot8_pair_q4(x_base + 1ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_1, a1_1);
+            if (tile_m > 2u) qdot8_pair_q4(x_base + 2ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_2, a1_2);
+            if (tile_m > 3u) qdot8_pair_q4(x_base + 3ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_3, a1_3);
+            if (tile_m > 4u) {
+                qdot8_pair_q4(x_base + 4ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_4, a1_4);
+                if (tile_m > 5u) qdot8_pair_q4(x_base + 5ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_5, a1_5);
+                if (tile_m > 6u) qdot8_pair_q4(x_base + 6ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_6, a1_6);
+                if (tile_m > 7u) qdot8_pair_q4(x_base + 7ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_7, a1_7);
+            }
+        } else if (Q_BITS == 3u) {
+            const uint w_off = g * 24u + lane_in_grp * 3u;
+            const device uchar *wp0 = w_row0 + w_off;
+            const device uchar *wp1 = w_row1 + w_off;
+            const uchar r0_0 = wp0[0], r0_1 = wp0[1], r0_2 = wp0[2];
+            const uchar r1_0 = wp1[0], r1_1 = wp1[1], r1_2 = wp1[2];
+            qdot8_pair_q3(x_base + 0ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_0, a1_0);
+            if (tile_m > 1u) qdot8_pair_q3(x_base + 1ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_1, a1_1);
+            if (tile_m > 2u) qdot8_pair_q3(x_base + 2ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_2, a1_2);
+            if (tile_m > 3u) qdot8_pair_q3(x_base + 3ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_3, a1_3);
+            if (tile_m > 4u) {
+                qdot8_pair_q3(x_base + 4ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_4, a1_4);
+                if (tile_m > 5u) qdot8_pair_q3(x_base + 5ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_5, a1_5);
+                if (tile_m > 6u) qdot8_pair_q3(x_base + 6ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_6, a1_6);
+                if (tile_m > 7u) qdot8_pair_q3(x_base + 7ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_7, a1_7);
+            }
+        }
+    }
+
+    const float t0_0 = simd_sum(a0_0), t1_0 = simd_sum(a1_0);
+    if (lane == 0u) {
+        y[ulong(m_base + 0u) * p.n + row0] = half(t0_0);
+        if (has_row1) y[ulong(m_base + 0u) * p.n + row1] = half(t1_0);
+    }
+    if (tile_m > 1u) {
+        const float t0_1 = simd_sum(a0_1), t1_1 = simd_sum(a1_1);
+        if (lane == 0u) {
+            y[ulong(m_base + 1u) * p.n + row0] = half(t0_1);
+            if (has_row1) y[ulong(m_base + 1u) * p.n + row1] = half(t1_1);
+        }
+    }
+    if (tile_m > 2u) {
+        const float t0_2 = simd_sum(a0_2), t1_2 = simd_sum(a1_2);
+        if (lane == 0u) {
+            y[ulong(m_base + 2u) * p.n + row0] = half(t0_2);
+            if (has_row1) y[ulong(m_base + 2u) * p.n + row1] = half(t1_2);
+        }
+    }
+    if (tile_m > 3u) {
+        const float t0_3 = simd_sum(a0_3), t1_3 = simd_sum(a1_3);
+        if (lane == 0u) {
+            y[ulong(m_base + 3u) * p.n + row0] = half(t0_3);
+            if (has_row1) y[ulong(m_base + 3u) * p.n + row1] = half(t1_3);
+        }
+    }
+    if (tile_m > 4u) {
+        const float t0_4 = simd_sum(a0_4), t1_4 = simd_sum(a1_4);
+        if (lane == 0u) {
+            y[ulong(m_base + 4u) * p.n + row0] = half(t0_4);
+            if (has_row1) y[ulong(m_base + 4u) * p.n + row1] = half(t1_4);
+        }
+        if (tile_m > 5u) {
+            const float t0_5 = simd_sum(a0_5), t1_5 = simd_sum(a1_5);
+            if (lane == 0u) {
+                y[ulong(m_base + 5u) * p.n + row0] = half(t0_5);
+                if (has_row1) y[ulong(m_base + 5u) * p.n + row1] = half(t1_5);
+            }
+        }
+        if (tile_m > 6u) {
+            const float t0_6 = simd_sum(a0_6), t1_6 = simd_sum(a1_6);
+            if (lane == 0u) {
+                y[ulong(m_base + 6u) * p.n + row0] = half(t0_6);
+                if (has_row1) y[ulong(m_base + 6u) * p.n + row1] = half(t1_6);
+            }
+        }
+        if (tile_m > 7u) {
+            const float t0_7 = simd_sum(a0_7), t1_7 = simd_sum(a1_7);
+            if (lane == 0u) {
+                y[ulong(m_base + 7u) * p.n + row0] = half(t0_7);
+                if (has_row1) y[ulong(m_base + 7u) * p.n + row1] = half(t1_7);
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Native unquantized FP16 / BF16 dense GEMV and GEMM (G12, ADR-0016).
 //
@@ -557,6 +745,181 @@ kernel void ami_dense_gemm(const device half *x [[buffer(0)]],
         const uint gn = n_base + cc;
         if (gm < p.m && gn < p.n) {
             y[ulong(gm) * p.n + gn] = half(Cs[idx]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 4b: Weight-Stationary Batched Dense FP16/BF16 GEMV (M = 1..64)
+//
+// Geometry: 4 simdgroups/threadgroup (128 threads), 2 output rows/simdgroup
+// (8 output rows/threadgroup), up to 8 tokens per tg_pos.y block.
+// Issues 2x2 independent DRAM weight loads per step and reuses each token's
+// activation vector across both rows without truncating `half` activations to
+// `bfloat`, matching `ami_dense_gemv` bit-for-bit in FP32 accumulation order.
+// ---------------------------------------------------------------------------
+static inline float dense_fma4(float4 x, float4 w, float acc) {
+    acc = fma(x.x, w.x, acc);
+    acc = fma(x.y, w.y, acc);
+    acc = fma(x.z, w.z, acc);
+    acc = fma(x.w, w.w, acc);
+    return acc;
+}
+
+static inline void dense_pair_step2(const device half4 *x_row,
+                                    uint i,
+                                    float4 w0a, float4 w0b,
+                                    float4 w1a, float4 w1b,
+                                    thread float &a0,
+                                    thread float &a1) {
+    const float4 xa = float4(x_row[i]);
+    const float4 xb = float4(x_row[i + 32u]);
+    a0 = dense_fma4(xb, w0b, dense_fma4(xa, w0a, a0));
+    a1 = dense_fma4(xb, w1b, dense_fma4(xa, w1a, a1));
+}
+
+static inline void dense_pair_step1(const device half4 *x_row,
+                                    uint i,
+                                    float4 w0a,
+                                    float4 w1a,
+                                    thread float &a0,
+                                    thread float &a1) {
+    const float4 xa = float4(x_row[i]);
+    a0 = dense_fma4(xa, w0a, a0);
+    a1 = dense_fma4(xa, w1a, a1);
+}
+
+kernel void ami_dense_gemv_batch(const device half *x [[buffer(0)]],
+                                 const device uchar *w [[buffer(1)]],
+                                 device half *y [[buffer(2)]],
+                                 constant DenseParams &p [[buffer(3)]],
+                                 uint2 tg_pos [[threadgroup_position_in_grid]],
+                                 uint sg_id [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    const uint row0 = (tg_pos.x * 4u + sg_id) * 2u;
+    const uint m_base = tg_pos.y * 8u;
+    if (row0 >= p.n || m_base >= p.m) {
+        return;
+    }
+    const uint row1 = min(row0 + 1u, p.n - 1u);
+    const bool has_row1 = (row0 + 1u) < p.n;
+    const uint tile_m = min(8u, p.m - m_base);
+    const ulong row_base0 = ulong(row0) * p.k;
+    const ulong row_base1 = ulong(row1) * p.k;
+
+    const device half *x_base = x + ulong(m_base) * p.k;
+    const ulong x_stride = ulong(p.k);
+
+    float a0_0 = 0.0f, a0_1 = 0.0f, a0_2 = 0.0f, a0_3 = 0.0f;
+    float a0_4 = 0.0f, a0_5 = 0.0f, a0_6 = 0.0f, a0_7 = 0.0f;
+    float a1_0 = 0.0f, a1_1 = 0.0f, a1_2 = 0.0f, a1_3 = 0.0f;
+    float a1_4 = 0.0f, a1_5 = 0.0f, a1_6 = 0.0f, a1_7 = 0.0f;
+
+    if ((p.k & 3u) == 0u) {
+        const uint vec_k = p.k >> 2;
+        const device half4 *x_base4 = (const device half4 *)x_base;
+        const ulong vec_stride = ulong(vec_k);
+
+        uint i = lane;
+        for (; i + 32u < vec_k; i += 64u) {
+            const float4 w0a = dense_load_w4(w, row_base0 + ulong(i) * 4ul);
+            const float4 w0b = dense_load_w4(w, row_base0 + ulong(i + 32u) * 4ul);
+            const float4 w1a = dense_load_w4(w, row_base1 + ulong(i) * 4ul);
+            const float4 w1b = dense_load_w4(w, row_base1 + ulong(i + 32u) * 4ul);
+            dense_pair_step2(x_base4 + 0ul * vec_stride, i, w0a, w0b, w1a, w1b, a0_0, a1_0);
+            if (tile_m > 1u) dense_pair_step2(x_base4 + 1ul * vec_stride, i, w0a, w0b, w1a, w1b, a0_1, a1_1);
+            if (tile_m > 2u) dense_pair_step2(x_base4 + 2ul * vec_stride, i, w0a, w0b, w1a, w1b, a0_2, a1_2);
+            if (tile_m > 3u) dense_pair_step2(x_base4 + 3ul * vec_stride, i, w0a, w0b, w1a, w1b, a0_3, a1_3);
+            if (tile_m > 4u) {
+                dense_pair_step2(x_base4 + 4ul * vec_stride, i, w0a, w0b, w1a, w1b, a0_4, a1_4);
+                if (tile_m > 5u) dense_pair_step2(x_base4 + 5ul * vec_stride, i, w0a, w0b, w1a, w1b, a0_5, a1_5);
+                if (tile_m > 6u) dense_pair_step2(x_base4 + 6ul * vec_stride, i, w0a, w0b, w1a, w1b, a0_6, a1_6);
+                if (tile_m > 7u) dense_pair_step2(x_base4 + 7ul * vec_stride, i, w0a, w0b, w1a, w1b, a0_7, a1_7);
+            }
+        }
+        for (; i < vec_k; i += 32u) {
+            const float4 w0a = dense_load_w4(w, row_base0 + ulong(i) * 4ul);
+            const float4 w1a = dense_load_w4(w, row_base1 + ulong(i) * 4ul);
+            dense_pair_step1(x_base4 + 0ul * vec_stride, i, w0a, w1a, a0_0, a1_0);
+            if (tile_m > 1u) dense_pair_step1(x_base4 + 1ul * vec_stride, i, w0a, w1a, a0_1, a1_1);
+            if (tile_m > 2u) dense_pair_step1(x_base4 + 2ul * vec_stride, i, w0a, w1a, a0_2, a1_2);
+            if (tile_m > 3u) dense_pair_step1(x_base4 + 3ul * vec_stride, i, w0a, w1a, a0_3, a1_3);
+            if (tile_m > 4u) {
+                dense_pair_step1(x_base4 + 4ul * vec_stride, i, w0a, w1a, a0_4, a1_4);
+                if (tile_m > 5u) dense_pair_step1(x_base4 + 5ul * vec_stride, i, w0a, w1a, a0_5, a1_5);
+                if (tile_m > 6u) dense_pair_step1(x_base4 + 6ul * vec_stride, i, w0a, w1a, a0_6, a1_6);
+                if (tile_m > 7u) dense_pair_step1(x_base4 + 7ul * vec_stride, i, w0a, w1a, a0_7, a1_7);
+            }
+        }
+    } else {
+        for (uint kk = lane; kk < p.k; kk += 32u) {
+            const float w0v = dense_load_w1(w, row_base0 + kk);
+            const float w1v = dense_load_w1(w, row_base1 + kk);
+            { const float xv = float(x_base[0ul * x_stride + kk]); a0_0 = fma(xv, w0v, a0_0); a1_0 = fma(xv, w1v, a1_0); }
+            if (tile_m > 1u) { const float xv = float(x_base[1ul * x_stride + kk]); a0_1 = fma(xv, w0v, a0_1); a1_1 = fma(xv, w1v, a1_1); }
+            if (tile_m > 2u) { const float xv = float(x_base[2ul * x_stride + kk]); a0_2 = fma(xv, w0v, a0_2); a1_2 = fma(xv, w1v, a1_2); }
+            if (tile_m > 3u) { const float xv = float(x_base[3ul * x_stride + kk]); a0_3 = fma(xv, w0v, a0_3); a1_3 = fma(xv, w1v, a1_3); }
+            if (tile_m > 4u) {
+                { const float xv = float(x_base[4ul * x_stride + kk]); a0_4 = fma(xv, w0v, a0_4); a1_4 = fma(xv, w1v, a1_4); }
+                if (tile_m > 5u) { const float xv = float(x_base[5ul * x_stride + kk]); a0_5 = fma(xv, w0v, a0_5); a1_5 = fma(xv, w1v, a1_5); }
+                if (tile_m > 6u) { const float xv = float(x_base[6ul * x_stride + kk]); a0_6 = fma(xv, w0v, a0_6); a1_6 = fma(xv, w1v, a1_6); }
+                if (tile_m > 7u) { const float xv = float(x_base[7ul * x_stride + kk]); a0_7 = fma(xv, w0v, a0_7); a1_7 = fma(xv, w1v, a1_7); }
+            }
+        }
+    }
+
+    const float t0_0 = simd_sum(a0_0), t1_0 = simd_sum(a1_0);
+    if (lane == 0u) {
+        y[ulong(m_base + 0u) * p.n + row0] = half(t0_0);
+        if (has_row1) y[ulong(m_base + 0u) * p.n + row1] = half(t1_0);
+    }
+    if (tile_m > 1u) {
+        const float t0_1 = simd_sum(a0_1), t1_1 = simd_sum(a1_1);
+        if (lane == 0u) {
+            y[ulong(m_base + 1u) * p.n + row0] = half(t0_1);
+            if (has_row1) y[ulong(m_base + 1u) * p.n + row1] = half(t1_1);
+        }
+    }
+    if (tile_m > 2u) {
+        const float t0_2 = simd_sum(a0_2), t1_2 = simd_sum(a1_2);
+        if (lane == 0u) {
+            y[ulong(m_base + 2u) * p.n + row0] = half(t0_2);
+            if (has_row1) y[ulong(m_base + 2u) * p.n + row1] = half(t1_2);
+        }
+    }
+    if (tile_m > 3u) {
+        const float t0_3 = simd_sum(a0_3), t1_3 = simd_sum(a1_3);
+        if (lane == 0u) {
+            y[ulong(m_base + 3u) * p.n + row0] = half(t0_3);
+            if (has_row1) y[ulong(m_base + 3u) * p.n + row1] = half(t1_3);
+        }
+    }
+    if (tile_m > 4u) {
+        const float t0_4 = simd_sum(a0_4), t1_4 = simd_sum(a1_4);
+        if (lane == 0u) {
+            y[ulong(m_base + 4u) * p.n + row0] = half(t0_4);
+            if (has_row1) y[ulong(m_base + 4u) * p.n + row1] = half(t1_4);
+        }
+        if (tile_m > 5u) {
+            const float t0_5 = simd_sum(a0_5), t1_5 = simd_sum(a1_5);
+            if (lane == 0u) {
+                y[ulong(m_base + 5u) * p.n + row0] = half(t0_5);
+                if (has_row1) y[ulong(m_base + 5u) * p.n + row1] = half(t1_5);
+            }
+        }
+        if (tile_m > 6u) {
+            const float t0_6 = simd_sum(a0_6), t1_6 = simd_sum(a1_6);
+            if (lane == 0u) {
+                y[ulong(m_base + 6u) * p.n + row0] = half(t0_6);
+                if (has_row1) y[ulong(m_base + 6u) * p.n + row1] = half(t1_6);
+            }
+        }
+        if (tile_m > 7u) {
+            const float t0_7 = simd_sum(a0_7), t1_7 = simd_sum(a1_7);
+            if (lane == 0u) {
+                y[ulong(m_base + 7u) * p.n + row0] = half(t0_7);
+                if (has_row1) y[ulong(m_base + 7u) * p.n + row1] = half(t1_7);
+            }
         }
     }
 }

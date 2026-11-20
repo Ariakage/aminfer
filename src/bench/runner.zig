@@ -14,6 +14,10 @@ const dequant = @import("../gpu/dequant.zig");
 const attention = @import("../gpu/attention.zig");
 const moe = @import("../gpu/moe.zig");
 const qwen3 = @import("../model/qwen3.zig");
+const sam_mod = @import("../spec/sam.zig");
+const tree_mod = @import("../spec/tree.zig");
+const draft_mod = @import("../spec/draft.zig");
+const engine_mod = @import("../spec/engine.zig");
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -2231,6 +2235,400 @@ pub fn runM25(allocator: std.mem.Allocator) M25BenchError!M25Report {
     };
 }
 
+// ============================================================================
+// M3 Speculative Decoding Benchmark Suite (Spikes S4/S5, L1 SAM, Synthetic E2E)
+// ============================================================================
+
+pub const SamLatencyResult = struct {
+    context_tokens: u32,
+    queries: u32,
+    sam_arena_bytes: u64,
+    append_us_per_tok: f64,
+    query_active_us: f64,
+    query_suffix_us: f64,
+    max_query_us: f64,
+    seed_hits: u32,
+    mean_draft_len: f64,
+    heap_delta: vmstat.HeapDelta,
+
+    pub fn write(self: *const SamLatencyResult, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\L1 Suffix Automaton Latency (D1, target < 50.00 us)
+            \\sam.context_tokens               {d}
+            \\sam.arena_mib                    {d:.2}
+            \\sam.append_us_per_tok            {d:.3}
+            \\sam.query_active_us              {d:.3}
+            \\sam.query_suffix_us              {d:.3}
+            \\sam.max_query_us                 {d:.3}
+            \\sam.queries                      {d}
+            \\sam.seed_hits                    {d}
+            \\sam.mean_draft_len               {d:.2}
+            \\sam.malloc_blocks_delta          {d}
+            \\sam.malloc_bytes_delta           {d}
+            \\
+        , .{
+            self.context_tokens,
+            @as(f64, @floatFromInt(self.sam_arena_bytes)) / (1024.0 * 1024.0),
+            self.append_us_per_tok,
+            self.query_active_us,
+            self.query_suffix_us,
+            self.max_query_us,
+            self.queries,
+            self.seed_hits,
+            self.mean_draft_len,
+            self.heap_delta.blocks_in_use,
+            self.heap_delta.size_in_use,
+        });
+    }
+};
+
+pub const SpecSynthResult = struct {
+    mode: draft_mod.DraftMode,
+    effective_placement: draft_mod.Placement,
+    lossless_match: bool,
+    generated_tokens: u32,
+    rounds: u64,
+    mean_accept_len: f64,
+    mean_drafted_nodes: f64,
+    mean_verified_nodes: f64,
+    mean_unique_experts_per_layer: f64,
+    bytes_per_accepted_tok: f64,
+    heap_delta: vmstat.HeapDelta,
+    swapouts_delta: u64,
+
+    pub fn write(self: *const SpecSynthResult, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\Synthetic End-to-End Speculative Decode Check (MoE q3 + EAGLE-3 + L1 + D7)
+            \\spec_synth.mode                  {s}
+            \\spec_synth.placement             {s}
+            \\spec_synth.lossless_match        {s}
+            \\spec_synth.generated_tokens      {d}
+            \\spec_synth.rounds                {d}
+            \\spec_synth.mean_accept_len       {d:.3}
+            \\spec_synth.drafted_nodes         {d:.2}
+            \\spec_synth.verified_nodes        {d:.2}
+            \\spec_synth.unique_experts_layer  {d:.2}
+            \\spec_synth.bytes_per_acc_tok     {d:.0}
+            \\spec_synth.malloc_blocks_delta   {d}
+            \\spec_synth.malloc_bytes_delta    {d}
+            \\spec_synth.swapouts_delta        {d}
+            \\
+        , .{
+            self.mode.label(),
+            self.effective_placement.label(),
+            if (self.lossless_match) "yes" else "NO",
+            self.generated_tokens,
+            self.rounds,
+            self.mean_accept_len,
+            self.mean_drafted_nodes,
+            self.mean_verified_nodes,
+            self.mean_unique_experts_per_layer,
+            self.bytes_per_accepted_tok,
+            self.heap_delta.blocks_in_use,
+            self.heap_delta.size_in_use,
+            self.swapouts_delta,
+        });
+    }
+};
+
+pub const M3Config = struct {
+    s4: attention.SpikeS4Config = .{},
+    s5: moe.SpikeS5Config = .{},
+    sam_context_tokens: u32 = 32_768,
+    sam_queries: u32 = 10_000,
+    synth_gen_tokens: u32 = 12,
+};
+
+pub const M3Report = struct {
+    s4: attention.SpikeS4Report,
+    s5: moe.SpikeS5Report,
+    sam: SamLatencyResult,
+    synth_spec: SpecSynthResult,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn deinit(self: *M3Report, allocator: std.mem.Allocator) void {
+        self.s5.deinit(allocator);
+    }
+
+    pub fn write(self: *const M3Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.writeAll("\n=== M3 Speculative Decoding & Placement Gate Benchmarks ===\n\n");
+        try self.s4.write(out);
+        try out.writeAll("\n");
+        try self.s5.write(out);
+        try out.writeAll("\n");
+        try self.sam.write(out);
+        try out.writeAll("\n");
+        try self.synth_spec.write(out);
+        try out.print(
+            \\
+            \\M3 Swap Check
+            \\m3.swap.status                   ok
+            \\m3.swap.swapouts_delta           {d}
+            \\m3.swap.pageouts_delta           {d}
+            \\
+        , .{
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+pub const M3Error = error{
+    LosslessMismatch,
+} || attention.SpikeS4Error || moe.SpikeS5Error || sam_mod.InitError || sam_mod.AppendError ||
+    qwen3.LoadError || qwen3.StepError || draft_mod.DraftLoadError ||
+    engine_mod.InitError || engine_mod.RunError || vmstat.Error;
+
+/// Benchmarks zero-allocation L1 `SuffixAutomaton` build and query latency at
+/// `context_tokens` (default 32,768 tokens, target `< 50 us` per query).
+pub fn runSamLatencyBench(context_tokens: u32, queries: u32) M3Error!SamLatencyResult {
+    const facts = try sysinfo.Facts.read();
+    const device = try metal.Device.open();
+    defer device.close();
+    const dev_info = try device.info();
+    const host_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+
+    const sam_bytes = try sam_mod.SuffixAutomaton.requiredBytes(context_tokens);
+    const arena_bytes = try page.alignUp(sam_bytes);
+    var sam_arena = try arena_mod.WiredArena.init(arena_bytes, host_budget);
+    defer sam_arena.deinit();
+
+    const backing = try sam_arena.allocAligned(sam_bytes, sam_mod.SuffixAutomaton.backing_alignment);
+    var sam = try sam_mod.SuffixAutomaton.initFromBuffer(backing, context_tokens);
+
+    // Build realistic code-like token stream: repeating 32-token blocks interspersed with unique tokens.
+    const t_app0 = try vmstat.nowNs();
+    var state: u64 = 0xD15E_A5E5_1234_5678;
+    for (0..context_tokens) |idx| {
+        const block_pos = idx & 63;
+        const tok: u32 = if (block_pos < 24)
+            100 + @as(u32, @intCast(block_pos)) + @as(u32, @intCast(((idx >> 6) & 3) * 32))
+        else blk: {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            break :blk 1000 + @as(u32, @intCast(state % 50_000));
+        };
+        try sam.append(tok);
+    }
+    const t_app1 = try vmstat.nowNs();
+
+    var out_buf: [16]u32 = undefined;
+    var tail: [16]u32 = undefined;
+    for (0..16) |k| tail[k] = 100 + @as(u32, @intCast(k));
+
+    const heap_before = try vmstat.Snapshot.capture();
+    var seed_hits: u32 = 0;
+    var draft_len_sum: u64 = 0;
+    var max_q_ns: u64 = 0;
+
+    const t_act0 = try vmstat.nowNs();
+    for (0..queries) |q_idx| {
+        const q0 = try vmstat.nowNs();
+        const r = sam.queryActive(16, &out_buf);
+        const q1 = try vmstat.nowNs();
+        if (q1 - q0 > max_q_ns) max_q_ns = q1 - q0;
+        if (r.is_seed) seed_hits += 1;
+        draft_len_sum += r.draft_len;
+        std.mem.doNotOptimizeAway(out_buf[q_idx & 15]);
+    }
+    const t_act1 = try vmstat.nowNs();
+
+    const t_suf0 = try vmstat.nowNs();
+    for (0..queries) |q_idx| {
+        tail[0] = 100 + @as(u32, @intCast((q_idx & 3) * 32));
+        for (1..16) |k| tail[k] = tail[0] + @as(u32, @intCast(k));
+        const q0 = try vmstat.nowNs();
+        const r = sam.querySuffix(&tail, 16, &out_buf);
+        const q1 = try vmstat.nowNs();
+        if (q1 - q0 > max_q_ns) max_q_ns = q1 - q0;
+        if (r.is_seed) seed_hits += 1;
+        draft_len_sum += r.draft_len;
+        std.mem.doNotOptimizeAway(out_buf[q_idx & 15]);
+    }
+    const t_suf1 = try vmstat.nowNs();
+    const heap_after = try vmstat.Snapshot.capture();
+
+    const total_q: f64 = @floatFromInt(@as(u64, queries) * 2);
+    return .{
+        .context_tokens = context_tokens,
+        .queries = queries,
+        .sam_arena_bytes = arena_bytes,
+        .append_us_per_tok = (@as(f64, @floatFromInt(t_app1 - t_app0)) / @as(f64, @floatFromInt(context_tokens))) / 1000.0,
+        .query_active_us = (@as(f64, @floatFromInt(t_act1 - t_act0)) / @as(f64, @floatFromInt(queries))) / 1000.0,
+        .query_suffix_us = (@as(f64, @floatFromInt(t_suf1 - t_suf0)) / @as(f64, @floatFromInt(queries))) / 1000.0,
+        .max_query_us = @as(f64, @floatFromInt(max_q_ns)) / 1000.0,
+        .seed_hits = seed_hits,
+        .mean_draft_len = @as(f64, @floatFromInt(draft_len_sum)) / total_q,
+        .heap_delta = vmstat.heapDelta(heap_before, heap_after),
+    };
+}
+
+/// Runs an in-memory synthetic MoE 3-bit + EAGLE-3 + L1 + D7 speculative decode
+/// benchmark verifying 100% token identity vs `Qwen3Model.stepDecode` and zero swap.
+pub fn runSpecSynthBench(allocator: std.mem.Allocator, gen_tokens: u32) M3Error!SpecSynthResult {
+    const cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .vocab_size = 64,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .moe_intermediate_size = 128,
+        .num_experts = 4,
+        .num_experts_per_tok = 2,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1_000_000.0,
+        .max_position_embeddings = 64,
+        .tie_word_embeddings = false,
+        .norm_topk_prob = true,
+    };
+    const model_bytes = try qwen3.buildSyntheticAmfImageWithSpec(allocator, cfg, .{
+        .linear_dtype = .q3_affine,
+        .embed_dtype = .f16,
+        .norm_dtype = .f16,
+        .router_dtype = .f16,
+        .expert_dtype = .q3_affine,
+    }, 0x0003_5EC0);
+    defer allocator.free(model_bytes);
+
+    const dcfg: draft_mod.DraftConfig = .{
+        .format = .eagle3,
+        .vocab_size = cfg.vocab_size,
+        .draft_vocab_size = 32,
+        .hidden_size = cfg.hidden_size,
+        .target_hidden_size = cfg.hidden_size,
+        .num_hidden_layers = 1,
+        .num_attention_heads = cfg.num_attention_heads,
+        .num_key_value_heads = cfg.num_key_value_heads,
+        .head_dim = cfg.head_dim,
+        .intermediate_size = 128,
+        .rms_norm_eps = cfg.rms_norm_eps,
+        .rope_theta = 10_000.0,
+        .max_position_embeddings = 64,
+        .norm_before_residual = true,
+        .aux_layer_ids = qwen3.defaultEagle3AuxLayerIds(cfg.num_hidden_layers),
+    };
+    const draft_bytes = try draft_mod.buildSyntheticDraftAmfImage(allocator, dcfg, 0x0003_E300);
+    defer allocator.free(draft_bytes);
+
+    const prompt = [_]u32{ 3, 7, 11, 15, 19, 3, 7, 11, 15 };
+    const n_gen: usize = @min(@as(usize, gen_tokens), 32);
+
+    // Reference sequential greedy decode.
+    var ref_model = try qwen3.Qwen3Model.loadFromBytes(allocator, model_bytes, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .verify_crcs = true,
+    });
+    defer ref_model.deinit(allocator);
+
+    var ref_out: [32]u32 = undefined;
+    var pos: u32 = 0;
+    for (prompt[0 .. prompt.len - 1]) |tok| {
+        try ref_model.prefillToken(tok, pos);
+        pos += 1;
+    }
+    var cur = try ref_model.stepDecode(prompt[prompt.len - 1], pos);
+    pos += 1;
+    ref_out[0] = cur;
+    for (1..n_gen) |step| {
+        cur = try ref_model.stepDecode(cur, pos);
+        pos += 1;
+        ref_out[step] = cur;
+    }
+
+    // Speculative decode (`EAGLE-3` + `L1` + `D7` + `.auto` placement).
+    var spec_model = try qwen3.Qwen3Model.loadFromBytes(allocator, model_bytes, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+        .verify_crcs = true,
+    });
+    defer spec_model.deinit(allocator);
+
+    var dh = try draft_mod.DraftHead.loadFromBytes(allocator, &spec_model, draft_bytes, dcfg, .{
+        .placement = .auto,
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .max_tree_slots = 16,
+    });
+    defer dh.deinit(allocator, &spec_model);
+
+    var eng = try engine_mod.SpecEngine.init(allocator, &spec_model, &dh, .{
+        .mode = .eagle3,
+        .placement = .auto,
+        .max_tree_nodes = 12,
+        .max_draft_depth = 4,
+        .branch_width = 2,
+        .top_k_per_node = 3,
+        .temperature = 0.0,
+        .enable_pruning = true,
+    });
+    defer eng.deinit(allocator);
+
+    const vm_before = try vmstat.Snapshot.capture();
+    var spec_out: [32]u32 = undefined;
+    spec_out[0] = try eng.prefill(&prompt, null);
+
+    const heap_before = try vmstat.Snapshot.capture();
+    var produced: usize = 1;
+    while (produced < n_gen) {
+        const rs = try eng.stepRound(null, spec_out[produced..n_gen]);
+        produced += rs.emitted_count;
+    }
+    const heap_after = try vmstat.Snapshot.capture();
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    const match = std.mem.eql(u32, ref_out[0..n_gen], spec_out[0..n_gen]);
+    if (!match) return error.LosslessMismatch;
+
+    return .{
+        .mode = .eagle3,
+        .effective_placement = eng.effectivePlacement(),
+        .lossless_match = match,
+        .generated_tokens = @intCast(n_gen),
+        .rounds = eng.stats.rounds,
+        .mean_accept_len = eng.stats.meanAcceptanceLength(),
+        .mean_drafted_nodes = eng.stats.meanDraftedNodes(),
+        .mean_verified_nodes = eng.stats.meanVerifiedNodes(),
+        .mean_unique_experts_per_layer = eng.stats.meanUniqueExpertsPerLayer(),
+        .bytes_per_accepted_tok = eng.stats.bytesPerAcceptedToken(),
+        .heap_delta = vmstat.heapDelta(heap_before, heap_after),
+        .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+    };
+}
+
+pub fn runM3WithConfig(allocator: std.mem.Allocator, config: M3Config) M3Error!M3Report {
+    const vm_before = try vmstat.Snapshot.capture();
+    const s4 = try attention.runSpikeS4(allocator, config.s4);
+    var s5 = try moe.runSpikeS5(allocator, config.s5);
+    errdefer s5.deinit(allocator);
+    const sam_res = try runSamLatencyBench(config.sam_context_tokens, config.sam_queries);
+    const synth_res = try runSpecSynthBench(allocator, config.synth_gen_tokens);
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .s4 = s4,
+        .s5 = s5,
+        .sam = sam_res,
+        .synth_spec = synth_res,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM3(allocator: std.mem.Allocator) M3Error!M3Report {
+    return runM3WithConfig(allocator, .{});
+}
+
 test "bytesMovedPerDispatch matches exact algorithmic traffic and validates shapes" {
     // q4 (2048, 2048), M=1: w = 2048*1024 = 2097152, sb = 2048*32*4 = 262144, x = 4096, y = 4096
     const q4_gemv = try bytesMovedPerDispatch(.{ .kind = .gemv_q4, .m = 1, .n = 2048, .k = 2048 });
@@ -2501,4 +2899,66 @@ test "runDenseBench and synthetic BF16 decode smoke test exercise M2.5 pipelines
     try std.testing.expectEqualStrings("bf16", dec.precisionLabel());
     try std.testing.expect(dec.measuredMsPerTok() > 0.0);
     try std.testing.expectEqual(@as(u64, 0), dec.swapouts_delta);
+}
+
+test "runM3WithConfig exercises Spike S4, Spike S5, L1 SAM latency, and synthetic E2E spec decode" {
+    const gpa = std.testing.allocator;
+    const s5_ms = [_]u32{ 1, 4 };
+    var report = try runM3WithConfig(gpa, .{
+        .s4 = .{
+            .handoff_c = 64,
+            .handoff_s = 32,
+            .handoff_warmup_iters = 1,
+            .handoff_timed_iters = 3,
+            .draft_hidden = 128,
+            .draft_layers = 1,
+            .draft_batch = 32,
+            .draft_warmup_iters = 1,
+            .draft_timed_iters = 3,
+            .gpu_dispatches_per_batch = 2,
+            .stream_hidden = 128,
+            .stream_layers = 1,
+            .stream_spatial = 32,
+            .gpu_gemv_n = 128,
+            .gpu_gemv_k = 128,
+            .min_working_set_bytes = 0,
+            .contention_warmup_batches = 1,
+            .contention_timed_batches = 2,
+            .contention_dispatches_per_batch = 2,
+            .timeout_ms = 10_000,
+        },
+        .s5 = .{
+            .bits = .q3,
+            .num_experts = 16,
+            .top_k = 4,
+            .hidden_size = 128,
+            .intermediate_size = 128,
+            .m_values = &s5_ms,
+            .num_routing_banks = 4,
+            .min_working_set_bytes = 0,
+            .dvfs_warmup_batches = 0,
+            .warmup_batches = 1,
+            .timed_batches = 2,
+            .dispatches_per_batch = 2,
+            .timeout_ms = 10_000,
+        },
+        .sam_context_tokens = 2048,
+        .sam_queries = 500,
+        .synth_gen_tokens = 6,
+    });
+    defer report.deinit(gpa);
+
+    try std.testing.expect(report.sam.query_active_us < 50.0);
+    try std.testing.expect(report.sam.seed_hits > 0);
+    try std.testing.expect(report.synth_spec.lossless_match);
+    try std.testing.expectEqual(@as(u64, 0), report.synth_spec.swapouts_delta);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Spike S4 CoreML ANE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Spike S5 Unique Active Experts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "L1 Suffix Automaton Latency") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "spec_synth.lossless_match") != null);
 }

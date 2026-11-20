@@ -388,7 +388,7 @@ kernel void ami_gqa_decode_attn_split(const device half *q [[buffer(0)]],
                 }
 
                 if (active_q) {
-                    if (n_tok == 8u) {
+                    if (p.num_splits > 1u && n_tok == 8u) {
                         float s0 = simd_sum(dot(q_vec, float4(tg_k[buf][0u * 32u + lane]))) * scale_log2e;
                         float s1 = simd_sum(dot(q_vec, float4(tg_k[buf][1u * 32u + lane]))) * scale_log2e;
                         float s2 = simd_sum(dot(q_vec, float4(tg_k[buf][2u * 32u + lane]))) * scale_log2e;
@@ -1212,7 +1212,7 @@ kernel void ami_gqa_tree_verify_attn_split(const device half *q [[buffer(0)]],
                     }
 
                     if (active_q) {
-                        if (n_tok == 8u) {
+                        if (p.num_splits > 1u && n_tok == 8u) {
                             float s0 = simd_sum(dot(q_vec, float4(tg_k[buf][0u * 32u + lane]))) * scale_log2e;
                             float s1 = simd_sum(dot(q_vec, float4(tg_k[buf][1u * 32u + lane]))) * scale_log2e;
                             float s2 = simd_sum(dot(q_vec, float4(tg_k[buf][2u * 32u + lane]))) * scale_log2e;

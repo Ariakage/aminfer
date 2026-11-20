@@ -83,10 +83,14 @@ pub const DequantPipelines = struct {
     gemv_q3: metal.Pipeline,
     gemm_q4: metal.Pipeline,
     gemm_q3: metal.Pipeline,
+    gemv_batch_q4: metal.Pipeline,
+    gemv_batch_q3: metal.Pipeline,
     gemv_f16: metal.Pipeline,
     gemv_bf16: metal.Pipeline,
     gemm_f16: metal.Pipeline,
     gemm_bf16: metal.Pipeline,
+    gemv_batch_f16: metal.Pipeline,
+    gemv_batch_bf16: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!DequantPipelines {
         const gemv_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv", &.{
@@ -113,6 +117,18 @@ pub const DequantPipelines = struct {
         });
         errdefer gemm_q3.close();
 
+        const gemv_batch_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv_batch", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gemv_batch_q4.close();
+
+        const gemv_batch_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv_batch", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gemv_batch_q3.close();
+
         const gemv_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv", &.{
             .{ .index = 2, .value = .{ .bool = false } },
         });
@@ -133,23 +149,41 @@ pub const DequantPipelines = struct {
         });
         errdefer gemm_bf16.close();
 
+        const gemv_batch_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv_batch", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
+        errdefer gemv_batch_f16.close();
+
+        const gemv_batch_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv_batch", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer gemv_batch_bf16.close();
+
         return .{
             .gemv_q4 = gemv_q4,
             .gemv_q3 = gemv_q3,
             .gemm_q4 = gemm_q4,
             .gemm_q3 = gemm_q3,
+            .gemv_batch_q4 = gemv_batch_q4,
+            .gemv_batch_q3 = gemv_batch_q3,
             .gemv_f16 = gemv_f16,
             .gemv_bf16 = gemv_bf16,
             .gemm_f16 = gemm_f16,
             .gemm_bf16 = gemm_bf16,
+            .gemv_batch_f16 = gemv_batch_f16,
+            .gemv_batch_bf16 = gemv_batch_bf16,
         };
     }
 
     pub fn close(self: DequantPipelines) void {
+        self.gemv_batch_bf16.close();
+        self.gemv_batch_f16.close();
         self.gemm_bf16.close();
         self.gemm_f16.close();
         self.gemv_bf16.close();
         self.gemv_f16.close();
+        self.gemv_batch_q3.close();
+        self.gemv_batch_q4.close();
         self.gemm_q3.close();
         self.gemm_q4.close();
         self.gemv_q3.close();
@@ -250,6 +284,74 @@ pub const DequantPipelines = struct {
             &.{ args.x, args.weight, args.y },
             std.mem.asBytes(&params),
             .{ groups_x, 1, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes a weight-stationary batched 3/4-bit dequant GEMV (`1 <= m <= 64`)
+    /// matching `encodeGemv` bit-for-bit in FP32 accumulation order while reading
+    /// each weight row once per 8-token block. Zero heap allocation.
+    pub fn encodeGemvBatch(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        bits: quant.QuantBits,
+        args: GemmArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.n == 0) return error.ZeroDimension;
+        const num_groups, const row_bytes, const pipe = switch (bits) {
+            .q4 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_batch_q4 };
+            },
+            .q3 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_batch_q3 };
+            },
+        };
+        const params: DequantParams = .{
+            .m = args.m,
+            .n = args.n,
+            .k = args.k,
+            .num_groups = @intCast(num_groups),
+            .row_bytes = @intCast(row_bytes),
+        };
+        const groups_x: u64 = (@as(u64, args.n) + 7) / 8;
+        const groups_y: u64 = (@as(u64, args.m) + 7) / 8;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.qweight, args.scale_bias, args.y },
+            std.mem.asBytes(&params),
+            .{ groups_x, groups_y, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes a weight-stationary batched FP16 / BF16 dense GEMV (`1 <= m <= 64`)
+    /// matching `encodeDenseGemv` bit-for-bit (no `bfloat` activation truncation)
+    /// while reading each weight row once per 8-token block. Zero heap allocation.
+    pub fn encodeDenseGemvBatch(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.FloatDType,
+        args: DenseGemmArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const pipe = switch (dtype) {
+            .f16 => self.gemv_batch_f16,
+            .bf16 => self.gemv_batch_bf16,
+        };
+        const params: DenseParams = .{ .m = args.m, .n = args.n, .k = args.k };
+        const groups_x: u64 = (@as(u64, args.n) + 7) / 8;
+        const groups_y: u64 = (@as(u64, args.m) + 7) / 8;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.weight, args.y },
+            std.mem.asBytes(&params),
+            .{ groups_x, groups_y, 1 },
             .{ 128, 1, 1 },
             insert_barrier_before,
         );
@@ -720,4 +822,152 @@ test "dense encoders reject zero dimensions" {
     const b: metal.BufferBinding = .{ .buffer = buf };
     try std.testing.expectError(error.ZeroDimension, pipes.encodeDenseGemv(&frame, .f16, .{ .x = b, .weight = b, .y = b, .n = 0, .k = 4 }, false));
     try std.testing.expectError(error.ZeroDimension, pipes.encodeDenseGemm(&frame, .bf16, .{ .x = b, .weight = b, .y = b, .m = 0, .n = 4, .k = 4 }, false));
+    try std.testing.expectError(error.ZeroDimension, pipes.encodeGemvBatch(&frame, .q4, .{ .x = b, .qweight = b, .scale_bias = b, .y = b, .m = 0, .n = 4, .k = 64 }, false));
+    try std.testing.expectError(error.ZeroDimension, pipes.encodeDenseGemvBatch(&frame, .bf16, .{ .x = b, .weight = b, .y = b, .m = 0, .n = 4, .k = 4 }, false));
+}
+
+test "batched GEMV matches M=1 GEMV bit-for-bit across q3, q4, f16 and bf16" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try DequantPipelines.init(device, library);
+    defer pipes.close();
+
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+
+    const m: u32 = 13;
+    const n: u32 = 37;
+    const k: u32 = 128;
+
+    const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+    const Q3 = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+    const w_q4_bytes = try Q4.packedWeightBytes(n, k);
+    const sb_q4_bytes = try Q4.scaleBiasBytes(n, k);
+    const w_q3_bytes = try Q3.packedWeightBytes(n, k);
+    const sb_q3_bytes = try Q3.scaleBiasBytes(n, k);
+    const w_f_bytes: usize = @as(usize, n) * k * @sizeOf(u16);
+    const x_bytes: usize = @as(usize, m) * k * @sizeOf(f16);
+    const y_bytes: usize = @as(usize, m) * n * @sizeOf(f16);
+
+    const cap = try page.alignUp(
+        amf.align64(w_q4_bytes) + amf.align64(sb_q4_bytes) +
+            amf.align64(w_q3_bytes) + amf.align64(sb_q3_bytes) +
+            amf.align64(w_f_bytes) * 2 +
+            amf.align64(x_bytes) + amf.align64(y_bytes) * 2 + 4 * page.APPLE_PAGE_SIZE,
+    );
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = cap,
+        .global_user_wire_limit = cap,
+        .gpu_working_set_bytes = cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(cap, budget);
+    defer arena.deinit();
+
+    const w_q4 = try arena.allocAligned(w_q4_bytes, 64);
+    const sb_q4_raw = try arena.allocAligned(sb_q4_bytes, 64);
+    const w_q3 = try arena.allocAligned(w_q3_bytes, 64);
+    const sb_q3_raw = try arena.allocAligned(sb_q3_bytes, 64);
+    const w_f16_raw = try arena.allocAligned(w_f_bytes, 64);
+    const w_bf16_raw = try arena.allocAligned(w_f_bytes, 64);
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const y_ref_raw = try arena.allocAligned(y_bytes, 64);
+    const y_bat_raw = try arena.allocAligned(y_bytes, 64);
+
+    for (w_q4, 0..) |*b, idx| b.* = @truncate(idx * 37 + 13);
+    for (w_q3, 0..) |*b, idx| b.* = @truncate(idx * 29 + 7);
+    const sb_q4: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_q4_raw));
+    for (sb_q4, 0..) |*sb, idx| sb.* = .{ .scale = @floatCast(0.03 + 0.005 * @as(f32, @floatFromInt(idx % 7))), .bias = @floatCast(-0.2) };
+    const sb_q3: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_q3_raw));
+    for (sb_q3, 0..) |*sb, idx| sb.* = .{ .scale = @floatCast(0.04 + 0.005 * @as(f32, @floatFromInt(idx % 5))), .bias = @floatCast(-0.15) };
+    const w_f16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_f16_raw));
+    const w_bf16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_bf16_raw));
+    for (0..@as(usize, n) * k) |idx| {
+        const val = (@as(f32, @floatFromInt(@as(i32, @intCast((idx * 19 + 3) % 23)) - 11))) * 0.0625;
+        w_f16[idx] = quant.f32ToFloatBits(.f16, val);
+        w_bf16[idx] = quant.f32ToFloatBits(.bf16, val);
+    }
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    for (x_f16, 0..) |*v, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 17 + 5) % 29)) - 14;
+        v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.0625);
+    }
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const y_ref: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, y_ref_raw));
+    const y_bat: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, y_bat_raw));
+    const x_off = arena.offsetOf(x_raw.ptr);
+    const y_ref_off = arena.offsetOf(y_ref_raw.ptr);
+    const y_bat_off = arena.offsetOf(y_bat_raw.ptr);
+
+    // 1. q4 & q3 quantized bit-exact check
+    for ([_]struct { bits: quant.QuantBits, w_off: u64, sb_off: u64 }{
+        .{ .bits = .q4, .w_off = arena.offsetOf(w_q4.ptr), .sb_off = arena.offsetOf(sb_q4_raw.ptr) },
+        .{ .bits = .q3, .w_off = arena.offsetOf(w_q3.ptr), .sb_off = arena.offsetOf(sb_q3_raw.ptr) },
+    }) |tc| {
+        @memset(y_ref_raw, 0);
+        @memset(y_bat_raw, 0);
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        for (0..m) |row| {
+            try pipes.encodeGemv(&frame, tc.bits, .{
+                .x = .{ .buffer = gpu_buf, .offset = x_off + @as(u64, row) * k * @sizeOf(f16) },
+                .qweight = .{ .buffer = gpu_buf, .offset = tc.w_off },
+                .scale_bias = .{ .buffer = gpu_buf, .offset = tc.sb_off },
+                .y = .{ .buffer = gpu_buf, .offset = y_ref_off + @as(u64, row) * n * @sizeOf(f16) },
+                .n = n,
+                .k = k,
+            }, row > 0);
+        }
+        try pipes.encodeGemvBatch(&frame, tc.bits, .{
+            .x = .{ .buffer = gpu_buf, .offset = x_off },
+            .qweight = .{ .buffer = gpu_buf, .offset = tc.w_off },
+            .scale_bias = .{ .buffer = gpu_buf, .offset = tc.sb_off },
+            .y = .{ .buffer = gpu_buf, .offset = y_bat_off },
+            .m = m,
+            .n = n,
+            .k = k,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+        try std.testing.expectEqualSlices(u16, y_ref, y_bat);
+    }
+
+    // 2. f16 & bf16 dense bit-exact check
+    for ([_]struct { dt: quant.FloatDType, w_off: u64 }{
+        .{ .dt = .f16, .w_off = arena.offsetOf(w_f16_raw.ptr) },
+        .{ .dt = .bf16, .w_off = arena.offsetOf(w_bf16_raw.ptr) },
+    }) |tc| {
+        @memset(y_ref_raw, 0);
+        @memset(y_bat_raw, 0);
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        for (0..m) |row| {
+            try pipes.encodeDenseGemv(&frame, tc.dt, .{
+                .x = .{ .buffer = gpu_buf, .offset = x_off + @as(u64, row) * k * @sizeOf(f16) },
+                .weight = .{ .buffer = gpu_buf, .offset = tc.w_off },
+                .y = .{ .buffer = gpu_buf, .offset = y_ref_off + @as(u64, row) * n * @sizeOf(f16) },
+                .n = n,
+                .k = k,
+            }, row > 0);
+        }
+        try pipes.encodeDenseGemvBatch(&frame, tc.dt, .{
+            .x = .{ .buffer = gpu_buf, .offset = x_off },
+            .weight = .{ .buffer = gpu_buf, .offset = tc.w_off },
+            .y = .{ .buffer = gpu_buf, .offset = y_bat_off },
+            .m = m,
+            .n = n,
+            .k = k,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+        try std.testing.expectEqualSlices(u16, y_ref, y_bat);
+    }
 }

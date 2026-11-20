@@ -157,6 +157,26 @@ pub const MoePerSlotParams = extern struct {
     top_k: u32,
 };
 
+/// Uniform payload matching `struct CopyStridedParams` in `moe_ffn.metal`.
+pub const CopyStridedParams = extern struct {
+    num_rows: u32,
+    copy_cols: u32,
+    src_stride: u32,
+    src_col_off: u32,
+    dst_stride: u32,
+    dst_col_off: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+/// Uniform payload matching `struct GatherRowsParams` in `moe_ffn.metal`.
+pub const GatherRowsParams = extern struct {
+    count: u32,
+    row_elems: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(ExpertWeights) != 48) @compileError("ExpertWeights must be 48 bytes");
     if (@sizeOf(ScheduleHeader) != 16) @compileError("ScheduleHeader must be 16 bytes");
@@ -173,6 +193,8 @@ comptime {
     if (@sizeOf(TopKCandidate) != 16) @compileError("TopKCandidate must be 16 bytes");
     if (@sizeOf(TopKLogitsRowsParams) != 16) @compileError("TopKLogitsRowsParams must be 16 bytes");
     if (@sizeOf(MoePerSlotParams) != 24) @compileError("MoePerSlotParams must be 24 bytes");
+    if (@sizeOf(CopyStridedParams) != 32) @compileError("CopyStridedParams must be 32 bytes");
+    if (@sizeOf(GatherRowsParams) != 16) @compileError("GatherRowsParams must be 16 bytes");
 }
 
 pub const LogitsDType = enum {
@@ -518,6 +540,27 @@ pub const TopKLogitsRowsArgs = struct {
     logits_dtype: LogitsDType = .f16,
 };
 
+/// Strided 2D `f16` copy arguments (`ami_copy_strided_f16`).
+pub const CopyStridedArgs = struct {
+    src: metal.BufferBinding,
+    dst: metal.BufferBinding,
+    num_rows: u32,
+    copy_cols: u32,
+    src_stride: u32,
+    src_col_off: u32 = 0,
+    dst_stride: u32,
+    dst_col_off: u32 = 0,
+};
+
+/// Indexed `f16` row gather arguments (`ami_gather_rows_f16`).
+pub const GatherRowsArgs = struct {
+    src: metal.BufferBinding,
+    indices: metal.BufferBinding,
+    dst: metal.BufferBinding,
+    count: u32,
+    row_elems: u32,
+};
+
 /// Startup-compiled specialized Metal 4 pipelines for MoE routing,
 /// deduplicated 3-bit / 4-bit expert SwiGLU FFN, dense SwiGLU utilities,
 /// and GPU greedy argmax.
@@ -556,6 +599,8 @@ pub const MoePipelines = struct {
     gate_up_swiglu_perslot_q3: metal.Pipeline,
     down_proj_perslot_q4: metal.Pipeline,
     down_proj_perslot_q3: metal.Pipeline,
+    copy_strided_f16: metal.Pipeline,
+    gather_rows_f16: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!MoePipelines {
         const router_proj_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_router_proj", &.{
@@ -743,6 +788,12 @@ pub const MoePipelines = struct {
         });
         errdefer down_proj_perslot_q3.close();
 
+        const copy_strided_f16 = try metal.Pipeline.init(device, library, "ami_copy_strided_f16");
+        errdefer copy_strided_f16.close();
+
+        const gather_rows_f16 = try metal.Pipeline.init(device, library, "ami_gather_rows_f16");
+        errdefer gather_rows_f16.close();
+
         return .{
             .router_proj_f16 = router_proj_f16,
             .router_proj_f32 = router_proj_f32,
@@ -778,10 +829,14 @@ pub const MoePipelines = struct {
             .gate_up_swiglu_perslot_q3 = gate_up_swiglu_perslot_q3,
             .down_proj_perslot_q4 = down_proj_perslot_q4,
             .down_proj_perslot_q3 = down_proj_perslot_q3,
+            .copy_strided_f16 = copy_strided_f16,
+            .gather_rows_f16 = gather_rows_f16,
         };
     }
 
     pub fn close(self: MoePipelines) void {
+        self.gather_rows_f16.close();
+        self.copy_strided_f16.close();
         self.down_proj_perslot_q3.close();
         self.down_proj_perslot_q4.close();
         self.gate_up_swiglu_perslot_q3.close();
@@ -1727,6 +1782,63 @@ pub const MoePipelines = struct {
             .hidden_size = args.hidden_size,
             .top_k = args.top_k,
         }, true);
+    }
+
+    /// Encodes a strided 2D `f16` copy (`ami_copy_strided_f16`). Zero heap allocation.
+    pub fn encodeCopyStrided(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        args: CopyStridedArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_rows == 0 or args.copy_cols == 0 or args.src_stride == 0 or args.dst_stride == 0) {
+            return error.ZeroDimension;
+        }
+        if (args.src_col_off + args.copy_cols > args.src_stride or
+            args.dst_col_off + args.copy_cols > args.dst_stride)
+        {
+            return error.InvalidArgument;
+        }
+        const params: CopyStridedParams = .{
+            .num_rows = args.num_rows,
+            .copy_cols = args.copy_cols,
+            .src_stride = args.src_stride,
+            .src_col_off = args.src_col_off,
+            .dst_stride = args.dst_stride,
+            .dst_col_off = args.dst_col_off,
+        };
+        const groups_x: u64 = (@as(u64, args.copy_cols) + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.copy_strided_f16,
+            &.{ args.src, args.dst },
+            std.mem.asBytes(&params),
+            .{ groups_x, args.num_rows, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes an indexed `f16` row gather (`ami_gather_rows_f16`). Zero heap allocation.
+    pub fn encodeGatherRows(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        args: GatherRowsArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.count == 0 or args.row_elems == 0) return error.ZeroDimension;
+        const params: GatherRowsParams = .{
+            .count = args.count,
+            .row_elems = args.row_elems,
+        };
+        const groups_x: u64 = (@as(u64, args.row_elems) + 255) / 256;
+        try frame.encodeThreadgroups(
+            self.gather_rows_f16,
+            &.{ args.src, args.indices, args.dst },
+            std.mem.asBytes(&params),
+            .{ groups_x, args.count, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
     }
 };
 

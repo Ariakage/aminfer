@@ -21,6 +21,8 @@ pub const bench = @import("bench/runner.zig");
 pub const sam = @import("spec/sam.zig");
 pub const tree = @import("spec/tree.zig");
 pub const accept = @import("spec/accept.zig");
+pub const draft = @import("spec/draft.zig");
+pub const engine = @import("spec/engine.zig");
 
 test {
     _ = metal;
@@ -43,4 +45,6 @@ test {
     _ = sam;
     _ = tree;
     _ = accept;
+    _ = draft;
+    _ = engine;
 }

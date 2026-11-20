@@ -117,7 +117,8 @@ static inline float qdot8_q3(uchar b0, uchar b1, uchar b2,
     return acc;
 }
 
-// Weight-stationary 8-element affine dequantization for multi-token expert reuse.
+// Weight-stationary 8-element affine dequantization shared by both `count_u == 1`
+// and `count_u > 1` deduplicated MoE paths for bit-exact FP32 accumulation parity.
 static inline void dequant8_q4(uint32_t w, float scale, float bias,
                                thread float4 &w0, thread float4 &w1) {
     w0 = float4(fma(float((w >>  0u) & 0xFu), scale, bias),
@@ -508,64 +509,27 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
             const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
             const float4 fx0 = float4(*(const device half4 *)(x_tok + k_off));
             const float4 fx1 = float4(*(const device half4 *)(x_tok + k_off + 4u));
-            const float x_sum = (fx0.x + fx0.y) + (fx0.z + fx0.w) +
-                                (fx1.x + fx1.y) + (fx1.z + fx1.w);
 
-            if (Q_BITS == 4u) {
-                const float4 px0 = float4(fx0.x,
-                                          fx0.y * (1.0f / 16.0f),
-                                          fx0.z * (1.0f / 256.0f),
-                                          fx0.w * (1.0f / 4096.0f));
-                const float4 px1 = float4(fx1.x,
-                                          fx1.y * (1.0f / 16.0f),
-                                          fx1.z * (1.0f / 256.0f),
-                                          fx1.w * (1.0f / 4096.0f));
-                const uint w_off = g * 32u + lane_in_grp * 4u;
-
-                for (uint r = 0u; r < ROWS_PER_SG; r++) {
-                    const uint row = row0 + r;
-                    if (full_rows || row < p.intermediate_size) {
-                        const ulong row_w_off = ulong(row) * p.row_bytes + w_off;
-                        const ulong row_sb_off = ulong(row) * p.num_groups + g;
-
-                        const uint32_t gw = *(const device uint32_t *)(gate_qw + row_w_off);
-                        const half2 gsb = gate_sb[row_sb_off];
-                        g_acc[r] = fma(qdot8_q4(gw, px0, px1), float(gsb.x), fma(x_sum, float(gsb.y), g_acc[r]));
-
-                        const uint32_t uw = *(const device uint32_t *)(up_qw + row_w_off);
-                        const half2 usb = up_sb[row_sb_off];
-                        u_acc[r] = fma(qdot8_q4(uw, px0, px1), float(usb.x), fma(x_sum, float(usb.y), u_acc[r]));
-                    }
-                }
-            } else if (Q_BITS == 3u) {
-                const float4 px0 = float4(fx0.x,
-                                          fx0.y * (1.0f / 8.0f),
-                                          fx0.z * (1.0f / 64.0f),
-                                          fx0.w * (1.0f / 2.0f));
-                const float4 px1 = float4(fx1.x * (1.0f / 16.0f),
-                                          fx1.y * (1.0f / 128.0f),
-                                          fx1.z * (1.0f / 4.0f),
-                                          fx1.w * (1.0f / 32.0f));
-                const float x2_hi = fx0.z * 4.0f;
-                const float x5_hi = fx1.y * 2.0f;
-                const uint w_off = g * 24u + lane_in_grp * 3u;
-
-                for (uint r = 0u; r < ROWS_PER_SG; r++) {
-                    const uint row = row0 + r;
-                    if (full_rows || row < p.intermediate_size) {
-                        const ulong row_w_off = ulong(row) * p.row_bytes + w_off;
-                        const ulong row_sb_off = ulong(row) * p.num_groups + g;
-
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (full_rows || row < p.intermediate_size) {
+                    const ulong row_sb_off = ulong(row) * p.num_groups + g;
+                    const half2 gsb = gate_sb[row_sb_off];
+                    const half2 usb = up_sb[row_sb_off];
+                    float4 gw0, gw1, uw0, uw1;
+                    if (Q_BITS == 4u) {
+                        const ulong row_w_off = ulong(row) * p.row_bytes + g * 32u + lane_in_grp * 4u;
+                        dequant8_q4(*(const device uint32_t *)(gate_qw + row_w_off), float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q4(*(const device uint32_t *)(up_qw + row_w_off), float(usb.x), float(usb.y), uw0, uw1);
+                    } else {
+                        const ulong row_w_off = ulong(row) * p.row_bytes + g * 24u + lane_in_grp * 3u;
                         const device uchar *gwp = gate_qw + row_w_off;
-                        const half2 gsb = gate_sb[row_sb_off];
-                        g_acc[r] = fma(qdot8_q3(gwp[0], gwp[1], gwp[2], px0, px1, x2_hi, x5_hi),
-                                       float(gsb.x), fma(x_sum, float(gsb.y), g_acc[r]));
-
                         const device uchar *uwp = up_qw + row_w_off;
-                        const half2 usb = up_sb[row_sb_off];
-                        u_acc[r] = fma(qdot8_q3(uwp[0], uwp[1], uwp[2], px0, px1, x2_hi, x5_hi),
-                                       float(usb.x), fma(x_sum, float(usb.y), u_acc[r]));
+                        dequant8_q3(gwp[0], gwp[1], gwp[2], float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q3(uwp[0], uwp[1], uwp[2], float(usb.x), float(usb.y), uw0, uw1);
                     }
+                    g_acc[r] += dot(fx0, gw0) + dot(fx1, gw1);
+                    u_acc[r] += dot(fx0, uw0) + dot(fx1, uw1);
                 }
             }
         }
@@ -582,8 +546,8 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
     }
 
     // Multi-token deduplicated path: zero-spill scalar-register batching
-    // dequantizing each expert row ONCE across up to 8 tokens (with a 4-token
-    // fast path for small buckets `count_u <= 4`).
+    // dequantizing each expert row ONCE across up to 8 tokens (with 4-token fast
+    // path), bit-for-bit identical in FP32 accumulation order to `count_u == 1u`.
     for (uint t_base = 0u; t_base < count_u; ) {
         const uint rem = count_u - t_base;
         if (rem <= 4u) {
@@ -628,7 +592,7 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
 
                     const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
                     { const float4 a = float4(*(const device half4 *)(x0 + k_off)); const float4 b = float4(*(const device half4 *)(x0 + k_off + 4u)); g0 += dot(a, gw0) + dot(b, gw1); u0 += dot(a, uw0) + dot(b, uw1); }
-                    { const float4 a = float4(*(const device half4 *)(x1 + k_off)); const float4 b = float4(*(const device half4 *)(x1 + k_off + 4u)); g1 += dot(a, gw0) + dot(b, gw1); u1 += dot(a, uw0) + dot(b, uw1); }
+                    if (rem > 1u) { const float4 a = float4(*(const device half4 *)(x1 + k_off)); const float4 b = float4(*(const device half4 *)(x1 + k_off + 4u)); g1 += dot(a, gw0) + dot(b, gw1); u1 += dot(a, uw0) + dot(b, uw1); }
                     if (rem > 2u) { const float4 a = float4(*(const device half4 *)(x2 + k_off)); const float4 b = float4(*(const device half4 *)(x2 + k_off + 4u)); g2 += dot(a, gw0) + dot(b, gw1); u2 += dot(a, uw0) + dot(b, uw1); }
                     if (rem > 3u) { const float4 a = float4(*(const device half4 *)(x3 + k_off)); const float4 b = float4(*(const device half4 *)(x3 + k_off + 4u)); g3 += dot(a, gw0) + dot(b, gw1); u3 += dot(a, uw0) + dot(b, uw1); }
                 }
@@ -786,49 +750,21 @@ kernel void ami_moe_down_proj(const device half *inter [[buffer(0)]],
             const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
             const float4 fx0 = float4(*(const device half4 *)(in_row + k_off));
             const float4 fx1 = float4(*(const device half4 *)(in_row + k_off + 4u));
-            const float x_sum = (fx0.x + fx0.y) + (fx0.z + fx0.w) +
-                                (fx1.x + fx1.y) + (fx1.z + fx1.w);
 
-            if (Q_BITS == 4u) {
-                const float4 px0 = float4(fx0.x,
-                                          fx0.y * (1.0f / 16.0f),
-                                          fx0.z * (1.0f / 256.0f),
-                                          fx0.w * (1.0f / 4096.0f));
-                const float4 px1 = float4(fx1.x,
-                                          fx1.y * (1.0f / 16.0f),
-                                          fx1.z * (1.0f / 256.0f),
-                                          fx1.w * (1.0f / 4096.0f));
-                const uint w_off = g * 32u + lane_in_grp * 4u;
-
-                for (uint r = 0u; r < ROWS_PER_SG; r++) {
-                    const uint row = row0 + r;
-                    if (full_rows || row < p.hidden_size) {
-                        const uint32_t dw = *(const device uint32_t *)(down_qw + ulong(row) * p.row_bytes + w_off);
-                        const half2 sb = down_sb[ulong(row) * p.num_groups + g];
-                        acc[r] = fma(qdot8_q4(dw, px0, px1), float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (full_rows || row < p.hidden_size) {
+                    const half2 sb = down_sb[ulong(row) * p.num_groups + g];
+                    float4 dw0, dw1;
+                    if (Q_BITS == 4u) {
+                        const ulong row_w_off = ulong(row) * p.row_bytes + g * 32u + lane_in_grp * 4u;
+                        dequant8_q4(*(const device uint32_t *)(down_qw + row_w_off), float(sb.x), float(sb.y), dw0, dw1);
+                    } else {
+                        const ulong row_w_off = ulong(row) * p.row_bytes + g * 24u + lane_in_grp * 3u;
+                        const device uchar *wp = down_qw + row_w_off;
+                        dequant8_q3(wp[0], wp[1], wp[2], float(sb.x), float(sb.y), dw0, dw1);
                     }
-                }
-            } else if (Q_BITS == 3u) {
-                const float4 px0 = float4(fx0.x,
-                                          fx0.y * (1.0f / 8.0f),
-                                          fx0.z * (1.0f / 64.0f),
-                                          fx0.w * (1.0f / 2.0f));
-                const float4 px1 = float4(fx1.x * (1.0f / 16.0f),
-                                          fx1.y * (1.0f / 128.0f),
-                                          fx1.z * (1.0f / 4.0f),
-                                          fx1.w * (1.0f / 32.0f));
-                const float x2_hi = fx0.z * 4.0f;
-                const float x5_hi = fx1.y * 2.0f;
-                const uint w_off = g * 24u + lane_in_grp * 3u;
-
-                for (uint r = 0u; r < ROWS_PER_SG; r++) {
-                    const uint row = row0 + r;
-                    if (full_rows || row < p.hidden_size) {
-                        const device uchar *wp = down_qw + ulong(row) * p.row_bytes + w_off;
-                        const half2 sb = down_sb[ulong(row) * p.num_groups + g];
-                        acc[r] = fma(qdot8_q3(wp[0], wp[1], wp[2], px0, px1, x2_hi, x5_hi),
-                                     float(sb.x), fma(x_sum, float(sb.y), acc[r]));
-                    }
+                    acc[r] += dot(fx0, dw0) + dot(fx1, dw1);
                 }
             }
         }
@@ -848,7 +784,8 @@ kernel void ami_moe_down_proj(const device half *inter [[buffer(0)]],
     }
 
     // Multi-token deduplicated path: zero-spill scalar-register batching
-    // dequantizing each down_proj row ONCE across up to 8 tokens (with 4-token fast path).
+    // dequantizing each down_proj row ONCE across up to 8 tokens (with 4-token
+    // fast path), bit-for-bit identical in FP32 accumulation order to `count_u == 1u`.
     for (uint t_base = 0u; t_base < count_u; ) {
         const uint rem = count_u - t_base;
         if (rem <= 4u) {
@@ -884,7 +821,7 @@ kernel void ami_moe_down_proj(const device half *inter [[buffer(0)]],
 
                     const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
                     a0 += dot(float4(*(const device half4 *)(i0 + k_off)), dw0) + dot(float4(*(const device half4 *)(i0 + k_off + 4u)), dw1);
-                    a1 += dot(float4(*(const device half4 *)(i1 + k_off)), dw0) + dot(float4(*(const device half4 *)(i1 + k_off + 4u)), dw1);
+                    if (rem > 1u) a1 += dot(float4(*(const device half4 *)(i1 + k_off)), dw0) + dot(float4(*(const device half4 *)(i1 + k_off + 4u)), dw1);
                     if (rem > 2u) a2 += dot(float4(*(const device half4 *)(i2 + k_off)), dw0) + dot(float4(*(const device half4 *)(i2 + k_off + 4u)), dw1);
                     if (rem > 3u) a3 += dot(float4(*(const device half4 *)(i3 + k_off)), dw0) + dot(float4(*(const device half4 *)(i3 + k_off + 4u)), dw1);
                 }
@@ -2051,4 +1988,71 @@ kernel void ami_moe_down_proj_perslot(const device half *inter [[buffer(0)]],
             down_out[out_base + row0 + r] = total * rw;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 17: Strided 2D f16 Row Copy (feature-tap packing & [e_norm, h_norm]
+// concatenation for EAGLE-3 / EAGLE-2 / MTP draft heads, M3).
+//
+// Copies `[num_rows, copy_cols]` from `src[row * src_stride + src_col_off]`
+// to `dst[row * dst_stride + dst_col_off]`.
+// Grid: (ceil(copy_cols / 256), num_rows, 1) threadgroups, 256 threads.
+// ---------------------------------------------------------------------------
+struct CopyStridedParams {
+    uint num_rows;
+    uint copy_cols;
+    uint src_stride;
+    uint src_col_off;
+    uint dst_stride;
+    uint dst_col_off;
+    uint _pad0;
+    uint _pad1;
+};
+
+static_assert(sizeof(CopyStridedParams) == 32, "CopyStridedParams must be 32 bytes");
+
+kernel void ami_copy_strided_f16(const device half *src [[buffer(0)]],
+                                 device half *dst [[buffer(1)]],
+                                 constant CopyStridedParams &p [[buffer(2)]],
+                                 uint2 tg_pos [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+    const uint row = tg_pos.y;
+    const uint col = tg_pos.x * 256u + tid;
+    if (row >= p.num_rows || col >= p.copy_cols) {
+        return;
+    }
+    dst[ulong(row) * p.dst_stride + p.dst_col_off + col] =
+        src[ulong(row) * p.src_stride + p.src_col_off + col];
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 18: Indexed f16 Row Gather (zero-CPU-copy accepted-node target
+// feature gather and EAGLE-2 parent-state gather, M3).
+//
+// For `out_row in 0..count`: copies `src[indices[out_row] * row_elems + col]`
+// into `dst[out_row * row_elems + col]`.
+// Grid: (ceil(row_elems / 256), count, 1) threadgroups, 256 threads.
+// ---------------------------------------------------------------------------
+struct GatherRowsParams {
+    uint count;
+    uint row_elems;
+    uint _pad0;
+    uint _pad1;
+};
+
+static_assert(sizeof(GatherRowsParams) == 16, "GatherRowsParams must be 16 bytes");
+
+kernel void ami_gather_rows_f16(const device half *src [[buffer(0)]],
+                                const device uint *indices [[buffer(1)]],
+                                device half *dst [[buffer(2)]],
+                                constant GatherRowsParams &p [[buffer(3)]],
+                                uint2 tg_pos [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]]) {
+    const uint out_row = tg_pos.y;
+    const uint col = tg_pos.x * 256u + tid;
+    if (out_row >= p.count || col >= p.row_elems) {
+        return;
+    }
+    const uint src_row = indices[out_row];
+    dst[ulong(out_row) * p.row_elems + col] = src[ulong(src_row) * p.row_elems + col];
 }
