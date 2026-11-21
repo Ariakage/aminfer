@@ -1604,6 +1604,10 @@ fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) DraftLoadErro
             if ((k % 64) != 0) return error.UnalignedK;
             break :blk .q3_affine;
         },
+        .q2_affine => blk: {
+            if ((k % 64) != 0) return error.UnalignedK;
+            break :blk .q2_affine;
+        },
         .f32, .u32 => error.UnexpectedTensorDType,
     };
 }
@@ -1625,7 +1629,7 @@ const LoadedBlob = struct {
     fn asLinearBinding(self: LoadedBlob, dtype: quant.WeightDType) qwen3.LinearBinding {
         const sb: ?metal.BufferBinding = switch (dtype) {
             .f16, .bf16 => null,
-            .q4_affine, .q3_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
+            .q4_affine, .q3_affine, .q2_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
         };
         return .{
             .weight = .{ .buffer = self.buffer, .offset = self.offset },
@@ -1674,7 +1678,7 @@ fn convertWeightBlobToF16(
                 out[i] = @floatCast(v);
             }
         },
-        .q3_affine, .q4_affine => return error.UnexpectedTensorDType,
+        .q2_affine, .q3_affine, .q4_affine => return error.UnexpectedTensorDType,
     }
     return out;
 }

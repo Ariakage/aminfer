@@ -1117,11 +1117,13 @@ fn fillDeterministicF16(dst: []f16, seed: usize, scale: f32) void {
     }
 }
 
+const Q2Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
 const Q3Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
 const Q4Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
 
 fn packedWeightBytesBits(bits: quant.QuantBits, n: usize, k: usize) quant.ShapeError!usize {
     return switch (bits) {
+        .q2 => Q2Ops.packedWeightBytes(n, k),
         .q3 => Q3Ops.packedWeightBytes(n, k),
         .q4 => Q4Ops.packedWeightBytes(n, k),
     };
@@ -1129,6 +1131,7 @@ fn packedWeightBytesBits(bits: quant.QuantBits, n: usize, k: usize) quant.ShapeE
 
 fn scaleBiasBytesBits(bits: quant.QuantBits, n: usize, k: usize) quant.ShapeError!usize {
     return switch (bits) {
+        .q2 => Q2Ops.scaleBiasBytes(n, k),
         .q3 => Q3Ops.scaleBiasBytes(n, k),
         .q4 => Q4Ops.scaleBiasBytes(n, k),
     };
@@ -1173,6 +1176,7 @@ fn fillQuantMatrixBits(
     seed: usize,
 ) quant.ShapeError!void {
     return switch (bits) {
+        .q2 => fillQuantMatrix(.{ .bits = .q2, .group_size = 64 }, qweight, scale_bias, n, k, seed),
         .q3 => fillQuantMatrix(.{ .bits = .q3, .group_size = 64 }, qweight, scale_bias, n, k, seed),
         .q4 => fillQuantMatrix(.{ .bits = .q4, .group_size = 64 }, qweight, scale_bias, n, k, seed),
     };
@@ -1644,6 +1648,7 @@ pub fn runSpikeS6(allocator: std.mem.Allocator, config: SpikeS6Config) SpikeS6Er
     const exp_tbl: []moe.ExpertWeights = @alignCast(std.mem.bytesAsSlice(moe.ExpertWeights, exp_tbl_raw[0 .. @as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights)]));
     var rng: u64 = 0x517C_C1B7_2722_0A95;
     const moe_mid: f32 = switch (config.moe_bits) {
+        .q2 => 1.5,
         .q3 => 3.5,
         .q4 => 7.5,
     };

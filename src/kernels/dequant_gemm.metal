@@ -1,6 +1,6 @@
-// Fused affine 3-bit and 4-bit (MLX group_size=64) dequantization GEMV and
-// GEMM kernels (G1, G2). Specialized at startup via Metal function constants
-// so hot loops carry zero bit-width branching (ADR-0014).
+// Fused affine 2-bit, 3-bit and 4-bit (MLX group_size=64) dequantization GEMV
+// and GEMM kernels (G1, G2, G13). Specialized at startup via Metal function
+// constants so hot loops carry zero bit-width branching (ADR-0014, ADR-0017).
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
@@ -47,6 +47,19 @@ static inline float qdot8_q3(uchar b0, uchar b1, uchar b2,
     acc = fma(float(b2 & 0x1Cu), px1.z, acc);
     acc = fma(float(b2 & 0xE0u), px1.w, acc);
     return acc;
+}
+
+static inline float qdot8_q2(uint16_t w, float4 px0, float4 px1) {
+    const uint lo = uint(w & 0xFFu);
+    const uint hi = uint(w >> 8);
+    return fma(float(lo & 0x03u), px0.x,
+           fma(float(lo & 0x0Cu), px0.y,
+           fma(float(lo & 0x30u), px0.z,
+           fma(float(lo & 0xC0u), px0.w,
+           fma(float(hi & 0x03u), px1.x,
+           fma(float(hi & 0x0Cu), px1.y,
+           fma(float(hi & 0x30u), px1.z,
+               float(hi & 0xC0u) * px1.w)))))));
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +160,36 @@ kernel void ami_dequant_gemv(const device half *x [[buffer(0)]],
                         const device uchar *wp = qweight + ulong(row) * p.row_bytes + w_off;
                         const half2 sb = scale_bias[ulong(row) * p.num_groups + g];
                         const float qd = qdot8_q3(wp[0], wp[1], wp[2], px0, px1, x2_hi, x5_hi);
+                        acc[r] = fma(qd, float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+                    }
+                }
+            }
+        } else if (Q_BITS == 2u) {
+            const float4 px0 = float4(fx0.x,
+                                      fx0.y * (1.0f / 4.0f),
+                                      fx0.z * (1.0f / 16.0f),
+                                      fx0.w * (1.0f / 64.0f));
+            const float4 px1 = float4(fx1.x,
+                                      fx1.y * (1.0f / 4.0f),
+                                      fx1.z * (1.0f / 16.0f),
+                                      fx1.w * (1.0f / 64.0f));
+            const uint w_off = g * 16u + lane_in_grp * 2u;
+
+            if (full_rows) {
+                for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                    const uint row = row0 + r;
+                    const uint16_t w = *(const device uint16_t *)(qweight + ulong(row) * p.row_bytes + w_off);
+                    const half2 sb = scale_bias[ulong(row) * p.num_groups + g];
+                    const float qd = qdot8_q2(w, px0, px1);
+                    acc[r] = fma(qd, float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+                }
+            } else {
+                for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                    const uint row = row0 + r;
+                    if (row < p.n) {
+                        const uint16_t w = *(const device uint16_t *)(qweight + ulong(row) * p.row_bytes + w_off);
+                        const half2 sb = scale_bias[ulong(row) * p.num_groups + g];
+                        const float qd = qdot8_q2(w, px0, px1);
                         acc[r] = fma(qd, float(sb.x), fma(x_sum, float(sb.y), acc[r]));
                     }
                 }
@@ -254,6 +297,11 @@ kernel void ami_dequant_gemm(const device half *x [[buffer(0)]],
                             b_dst[blk * 8u + j] = half(fma(float((word >> (j * 3u)) & 0x7u), scale, bias));
                         }
                     }
+                } else if (Q_BITS == 2u) {
+                    const uint32_t w = *(const device uint32_t *)(qweight + ulong(gn) * p.row_bytes + g * 16u + load_chunk * 4u);
+                    for (uint j = 0u; j < 16u; j++) {
+                        b_dst[j] = half(fma(float((w >> (j * 2u)) & 0x3u), scale, bias));
+                    }
                 }
             } else {
                 const half4 z = half4(0.0h);
@@ -359,6 +407,28 @@ static inline void qdot8_pair_q3(const device half *x_row,
     a1 = fma(qdot8_q3(r1_b0, r1_b1, r1_b2, px0, px1, x2_hi, x5_hi), s1, fma(x_sum, b1, a1));
 }
 
+static inline void qdot8_pair_q2(const device half *x_row,
+                                 uint k_off,
+                                 uint16_t w0, float s0, float b0,
+                                 uint16_t w1, float s1, float b1,
+                                 thread float &a0,
+                                 thread float &a1) {
+    const float4 fx0 = float4(*(const device half4 *)(x_row + k_off));
+    const float4 fx1 = float4(*(const device half4 *)(x_row + k_off + 4u));
+    const float x_sum = (fx0.x + fx0.y) + (fx0.z + fx0.w) +
+                        (fx1.x + fx1.y) + (fx1.z + fx1.w);
+    const float4 px0 = float4(fx0.x,
+                              fx0.y * (1.0f / 4.0f),
+                              fx0.z * (1.0f / 16.0f),
+                              fx0.w * (1.0f / 64.0f));
+    const float4 px1 = float4(fx1.x,
+                              fx1.y * (1.0f / 4.0f),
+                              fx1.z * (1.0f / 16.0f),
+                              fx1.w * (1.0f / 64.0f));
+    a0 = fma(qdot8_q2(w0, px0, px1), s0, fma(x_sum, b0, a0));
+    a1 = fma(qdot8_q2(w1, px0, px1), s1, fma(x_sum, b1, a1));
+}
+
 kernel void ami_dequant_gemv_batch(const device half *x [[buffer(0)]],
                                    const device uchar *qweight [[buffer(1)]],
                                    const device half2 *scale_bias [[buffer(2)]],
@@ -431,6 +501,20 @@ kernel void ami_dequant_gemv_batch(const device half *x [[buffer(0)]],
                 if (tile_m > 5u) qdot8_pair_q3(x_base + 5ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_5, a1_5);
                 if (tile_m > 6u) qdot8_pair_q3(x_base + 6ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_6, a1_6);
                 if (tile_m > 7u) qdot8_pair_q3(x_base + 7ul * x_stride, k_off, r0_0, r0_1, r0_2, s0, b0, r1_0, r1_1, r1_2, s1, b1, a0_7, a1_7);
+            }
+        } else if (Q_BITS == 2u) {
+            const uint w_off = g * 16u + lane_in_grp * 2u;
+            const uint16_t w0 = *(const device uint16_t *)(w_row0 + w_off);
+            const uint16_t w1 = *(const device uint16_t *)(w_row1 + w_off);
+            qdot8_pair_q2(x_base + 0ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_0, a1_0);
+            if (tile_m > 1u) qdot8_pair_q2(x_base + 1ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_1, a1_1);
+            if (tile_m > 2u) qdot8_pair_q2(x_base + 2ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_2, a1_2);
+            if (tile_m > 3u) qdot8_pair_q2(x_base + 3ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_3, a1_3);
+            if (tile_m > 4u) {
+                qdot8_pair_q2(x_base + 4ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_4, a1_4);
+                if (tile_m > 5u) qdot8_pair_q2(x_base + 5ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_5, a1_5);
+                if (tile_m > 6u) qdot8_pair_q2(x_base + 6ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_6, a1_6);
+                if (tile_m > 7u) qdot8_pair_q2(x_base + 7ul * x_stride, k_off, w0, s0, b0, w1, s1, b1, a0_7, a1_7);
             }
         }
     }

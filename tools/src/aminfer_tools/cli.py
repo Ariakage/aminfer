@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
     DTYPE_MODES,
+    QUANT_PROFILES,
     SME2_PACK_MODES,
     SME2_REPACK_TARGETS,
     TensorLayout,
@@ -20,6 +21,7 @@ from aminfer_tools.amf import (
     repack_amf_sme2,
     retag_amf_cold_experts,
 )
+from aminfer_tools.gsq_rco import gsq_convert
 from aminfer_tools.coreml import (
     COREML_KINDS,
     COREML_OPS,
@@ -166,6 +168,109 @@ def _build_parser() -> argparse.ArgumentParser:
             "(ADR-0018, W15): none (default, row_major), routers, or all-linear"
         ),
     )
+    pack.add_argument(
+        "--quant-profile",
+        choices=QUANT_PROFILES,
+        default="uniform",
+        help=(
+            "Quantization profile: uniform (default, preserves source dtypes unchanged) or "
+            "gsq-rco (ADR-0017 offline GSQ + RCO per-tensor / per-expert hybrid quantization)"
+        ),
+    )
+    pack.add_argument(
+        "--target-bits",
+        type=float,
+        default=None,
+        help="Target average effective bits/weight when --quant-profile gsq-rco is selected (default: 3.25)",
+    )
+    pack.add_argument(
+        "--no-rco",
+        action="store_true",
+        help="Disable RCO scale/bias refinement (use naive min-max baseline) under --quant-profile gsq-rco",
+    )
+    pack.add_argument(
+        "--manifest",
+        type=pathlib.Path,
+        default=None,
+        help="Optional JSON output path for the GSQ+RCO allocation report",
+    )
+    pack.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel worker processes for offline GSQ+RCO quantization (default: 1)",
+    )
+
+    gsq = sub.add_parser(
+        "gsq-convert",
+        help=(
+            "Convert a float/quantized safetensors checkpoint or existing .amf into a "
+            "GSQ + RCO hybrid-quantized 16 KiB-aligned .amf v0 file (ADR-0017, W14)"
+        ),
+    )
+    gsq.add_argument(
+        "--input",
+        required=True,
+        type=pathlib.Path,
+        help="Input .amf file, .safetensors file, model.safetensors.index.json, or checkpoint directory",
+    )
+    gsq.add_argument("--output", required=True, type=pathlib.Path, help="Output .amf path")
+    gsq.add_argument(
+        "--target-bits",
+        required=True,
+        type=float,
+        help="Target average effective bits/weight across all model weights (e.g. 3.25)",
+    )
+    gsq.add_argument(
+        "--heat-profile",
+        type=pathlib.Path,
+        default=None,
+        help="Optional W8 schema-v1 heat.json profile guiding MoE expert sensitivity & cold tagging",
+    )
+    gsq.add_argument("--model-id", default=None, help="Override model identifier stored in header")
+    gsq.add_argument("--group-size", type=int, default=64, help="Quantization group size (default: 64)")
+    gsq.add_argument(
+        "--dtype",
+        choices=DTYPE_MODES,
+        default="auto",
+        help="Float fallback dtype for unquantized tensors: auto (default), f16, or bf16",
+    )
+    gsq_tie = gsq.add_mutually_exclusive_group()
+    gsq_tie.add_argument(
+        "--tie-word-embeddings",
+        dest="tie_word_embeddings",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Skip a duplicate lm_head when embed_tokens is present (default: read config.json)",
+    )
+    gsq_tie.add_argument(
+        "--keep-tied-lm-head",
+        dest="tie_word_embeddings",
+        action="store_const",
+        const=False,
+        help="Always emit lm_head even if config.json sets tie_word_embeddings",
+    )
+    gsq.add_argument("--cold-experts", default=None, help="Comma-separated LAYER:EXPERT cold pairs")
+    gsq.add_argument(
+        "--cold-experts-per-layer",
+        type=int,
+        default=None,
+        help="Override cold expert count per layer when using --heat-profile",
+    )
+    gsq.add_argument("--all-experts-cold", action="store_true", help="Mark every expert tensor as cold_expert")
+    gsq.add_argument("--exclude-tensors", default=None, help="Comma-separated tensor names to omit")
+    gsq.add_argument(
+        "--sme2-pack",
+        choices=SME2_PACK_MODES,
+        default="none",
+        help="Pre-pack eligible 2D weights into sme2_panel64: none (default), routers, or all-linear",
+    )
+    gsq.add_argument("--no-rco", action="store_true", help="Use naive min-max instead of RCO refinement")
+    gsq.add_argument("--rco-iters", type=int, default=3, help="RCO alternating OLS iterations per group (default: 3)")
+    gsq.add_argument("--sample-rows", type=int, default=32, help="Rows sampled per tensor for GSQ scoring (default: 32)")
+    gsq.add_argument("--manifest", type=pathlib.Path, default=None, help="Optional JSON allocation manifest path")
+    gsq.add_argument("--workers", type=int, default=1, help="Parallel worker processes (default: 1)")
 
     repack = sub.add_parser(
         "repack-sme2",
@@ -499,6 +604,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             heat_profile=args.heat_profile,
             cold_experts_per_layer=args.cold_experts_per_layer,
             sme2_pack=args.sme2_pack,
+            quant_profile=args.quant_profile,
+            target_bits=args.target_bits,
+            use_rco=not args.no_rco,
+            manifest_path=args.manifest,
+            workers=args.workers,
         )
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
@@ -513,6 +623,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"packed {len(metas)} tensors into {args.output} ({total_bytes} bytes) "
             f"in {elapsed:.1f} s [{dtype_summary}{sme2_note}]"
+        )
+        return 0
+
+    if args.command == "gsq-convert":
+        cold = _parse_cold_experts(args.cold_experts)
+        excludes = _parse_csv(args.exclude_tensors)
+        started = time.monotonic()
+        rep = gsq_convert(
+            args.input,
+            args.output,
+            target_bits=args.target_bits,
+            model_id=args.model_id,
+            group_size=args.group_size,
+            dtype_mode=args.dtype,
+            heat_profile=args.heat_profile,
+            cold_experts=cold,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            all_experts_cold=args.all_experts_cold,
+            tie_word_embeddings=args.tie_word_embeddings,
+            exclude_tensors=excludes,
+            sme2_pack=args.sme2_pack,
+            use_rco=not args.no_rco,
+            rco_iters=args.rco_iters,
+            sample_rows=args.sample_rows,
+            manifest_path=args.manifest,
+            workers=args.workers,
+        )
+        elapsed = time.monotonic() - started
+        total_bytes = args.output.stat().st_size
+        by_dtype: dict[str, int] = {}
+        for m in rep.metas:
+            by_dtype[m.dtype.name.lower()] = by_dtype.get(m.dtype.name.lower(), 0) + 1
+        dtype_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_dtype.items()))
+        print(
+            f"gsq-converted {len(rep.metas)} tensors into {args.output} ({total_bytes} bytes, "
+            f"target={rep.target_bits:.2f}b, effective={rep.effective_bits:.3f}b, "
+            f"rco={'on' if rep.use_rco else 'off'}) in {elapsed:.1f} s [{dtype_summary}]"
         )
         return 0
 

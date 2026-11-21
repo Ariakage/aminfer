@@ -22,6 +22,7 @@ pub const SME2_QUANT_HEADER_BYTES: u64 = 128;
 pub const SME2_F16_GROUP_BYTES: u64 = 2048; // 32 kp chunks * 32 u16 lanes
 pub const SME2_Q4_GROUP_BYTES: u64 = 640; // 128 B inline header + 512 B packed codes
 pub const SME2_Q3_GROUP_BYTES: u64 = 512; // 128 B inline header + 384 B packed codes
+pub const SME2_Q2_GROUP_BYTES: u64 = 384; // 128 B inline header + 256 B packed codes
 
 /// Single-owner tensor byte layout stored in the low byte of `TensorEntry.reserved0`
 /// (ADR-0018, W15). Existing `.amf` v0 files carry `reserved0 == 0` (`row_major`).
@@ -57,13 +58,16 @@ pub const DType = enum(u8) {
     /// Unquantized 32-bit unsigned integer (e.g. EAGLE-3 `d2t` vocab maps,
     /// ADR-0013): `quant_bits = 0`, 4 bytes per element.
     u32 = 5,
+    /// MLX-compatible 2-bit affine group-64 quantization (ADR-0017, W14/G13):
+    /// `quant_bits = 2`, 16 B packed codes + 4 B `half2(scale, bias)` per 64 weights.
+    q2_affine = 6,
 
     /// Bytes per element for unquantized dtypes; `null` for affine-quantized ones.
     pub fn unquantizedElemSize(self: DType) ?u64 {
         return switch (self) {
             .f16, .bf16 => 2,
             .f32, .u32 => 4,
-            .q4_affine, .q3_affine => null,
+            .q4_affine, .q3_affine, .q2_affine => null,
         };
     }
 };
@@ -181,6 +185,10 @@ pub fn sme2Panel64BlobBytes(dtype: DType, n: u64, k: u64, group_size: u16) Parse
         .q3_affine => blk: {
             if (group_size != SME2_GROUP_K) return error.InvalidQuantization;
             break :blk SME2_Q3_GROUP_BYTES;
+        },
+        .q2_affine => blk: {
+            if (group_size != SME2_GROUP_K) return error.InvalidQuantization;
+            break :blk SME2_Q2_GROUP_BYTES;
         },
         .f32, .u32 => return error.InvalidTensorLayout,
     };
@@ -556,8 +564,13 @@ fn validateEntries(
                             return error.InvalidShape;
                         }
                     },
-                    .q4_affine, .q3_affine => {
-                        const expected_bits: u8 = if (dtype == .q4_affine) 4 else 3;
+                    .q4_affine, .q3_affine, .q2_affine => {
+                        const expected_bits: u8 = switch (dtype) {
+                            .q4_affine => 4,
+                            .q3_affine => 3,
+                            .q2_affine => 2,
+                            else => unreachable,
+                        };
                         if (entry.rank != 2) return error.InvalidRank;
                         if (entry.quant_bits != expected_bits or entry.group_size != 64) {
                             return error.InvalidQuantization;
@@ -593,6 +606,11 @@ fn validateEntries(
                     },
                     .q3_affine => {
                         if (entry.quant_bits != 3 or entry.group_size != SME2_GROUP_K) {
+                            return error.InvalidQuantization;
+                        }
+                    },
+                    .q2_affine => {
+                        if (entry.quant_bits != 2 or entry.group_size != SME2_GROUP_K) {
                             return error.InvalidQuantization;
                         }
                     },
@@ -988,7 +1006,7 @@ test "validator rejects invalid bf16 metadata" {
     n += 1;
 
     e = bf16TestEntry();
-    e.dtype = 6; // unknown dtype past u32
+    e.dtype = 7; // unknown dtype past q2_affine
     cases[n] = .{ .err = error.InvalidDType, .entry = e };
     n += 1;
 
@@ -1393,4 +1411,81 @@ test "validator accepts valid sme2_panel64 blobs and rejects malformed reserved0
     const big_img = try buildTestAmf(gpa, big_entry, bf16_buf);
     defer gpa.free(big_img);
     try std.testing.expectError(error.BlobOutOfBounds, Parsed.parseBytes(gpa, big_img));
+}
+
+test "DType.q2_affine is wire value 6 and validates both row_major and sme2_panel64 layouts" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(u8, 6), @backingInt(DType.q2_affine));
+    try std.testing.expectEqual(@as(?u64, null), DType.q2_affine.unquantizedElemSize());
+    try std.testing.expectEqual(@as(u64, 384), try sme2Panel64BlobBytes(.q2_affine, 16, 64, 64));
+    try std.testing.expectEqual(@as(u64, 2 * 3 * 384), try sme2Panel64BlobBytes(.q2_affine, 17, 192, 64));
+    try std.testing.expectError(error.InvalidQuantization, sme2Panel64BlobBytes(.q2_affine, 16, 64, 32));
+
+    // 1. row_major q2_affine (ADR-0017: 16 B codes + 4 B ScaleBias per group-64)
+    const Q2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+    const n: u32 = 8;
+    const k: u32 = 128;
+    const data_bytes = try Q2.packedWeightBytes(n, k);
+    const params_offset = align64(data_bytes);
+    const params_bytes = try Q2.scaleBiasBytes(n, k);
+    try std.testing.expectEqual(@as(usize, 256), data_bytes);
+    try std.testing.expectEqual(@as(usize, 64), params_bytes);
+
+    const blob = try gpa.alloc(u8, params_offset + params_bytes);
+    defer gpa.free(blob);
+    @memset(blob, 0xE4);
+
+    var entry = TensorEntry.zeroed("layers.0.mlp.experts.5.gate_proj", .hot_expert, .q2_affine);
+    entry.quant_bits = 2;
+    entry.rank = 2;
+    entry.group_size = 64;
+    entry.layer = 0;
+    entry.expert = 5;
+    entry.shape = .{ n, k, 0, 0 };
+    entry.data_bytes = data_bytes;
+    entry.params_offset = params_offset;
+    entry.params_bytes = params_bytes;
+
+    const img = try buildTestAmf(gpa, entry, blob);
+    defer gpa.free(img);
+    var parsed = try Parsed.parseBytes(gpa, img);
+    defer parsed.deinit(gpa);
+    try parsed.verifyAllBlobsFromBytes(img);
+    const found = parsed.find("layers.0.mlp.experts.5.gate_proj") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DType.q2_affine, try found.dataType());
+    try std.testing.expectEqual(@as(u8, 2), found.quant_bits);
+    try std.testing.expectEqual(TensorLayout.row_major, try found.tensorLayout());
+
+    // Reject wrong quant_bits for q2_affine
+    var bad_bits = entry;
+    bad_bits.quant_bits = 3;
+    const bad_bits_img = try buildTestAmf(gpa, bad_bits, blob);
+    defer gpa.free(bad_bits_img);
+    try std.testing.expectError(error.InvalidQuantization, Parsed.parseBytes(gpa, bad_bits_img));
+
+    // 2. sme2_panel64 q2_affine (384 B per (panel, group))
+    const q2_sme_len = try sme2Panel64BlobBytes(.q2_affine, 19, 128, 64);
+    try std.testing.expectEqual(@as(u64, 2 * 2 * 384), q2_sme_len);
+    const q2_sme_buf = try gpa.alloc(u8, @intCast(q2_sme_len));
+    defer gpa.free(q2_sme_buf);
+    @memset(q2_sme_buf, 0x1B);
+
+    var sme_entry = TensorEntry.zeroed("layers.0.mlp.experts.5.down_proj", .cold_expert, .q2_affine);
+    sme_entry.quant_bits = 2;
+    sme_entry.rank = 2;
+    sme_entry.group_size = 64;
+    sme_entry.layer = 0;
+    sme_entry.expert = 5;
+    sme_entry.shape = .{ 19, 128, 0, 0 };
+    sme_entry.data_bytes = q2_sme_len;
+    sme_entry.setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
+
+    const sme_img = try buildTestAmf(gpa, sme_entry, q2_sme_buf);
+    defer gpa.free(sme_img);
+    var parsed_sme = try Parsed.parseBytes(gpa, sme_img);
+    defer parsed_sme.deinit(gpa);
+    try parsed_sme.verifyAllBlobsFromBytes(sme_img);
+    const found_sme = parsed_sme.find("layers.0.mlp.experts.5.down_proj") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DType.q2_affine, try found_sme.dataType());
+    try std.testing.expectEqual(TensorLayout.sme2_panel64, try found_sme.tensorLayout());
 }

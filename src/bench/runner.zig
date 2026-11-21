@@ -33,6 +33,7 @@ const MAX_DISPATCHES_PER_FRAME: u32 = 256;
 
 const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
 const Q3 = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+const Q2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
 
 pub const KernelKind = enum {
     gemv_q4,
@@ -278,10 +279,12 @@ fn computeCaseLayout(case: Case) (quant.ShapeError || error{InvalidConfig})!Case
     const w_bytes = switch (case.kind.bits()) {
         .q4 => try Q4.packedWeightBytes(case.n, case.k),
         .q3 => try Q3.packedWeightBytes(case.n, case.k),
+        .q2 => try Q2.packedWeightBytes(case.n, case.k),
     };
     const sb_bytes = switch (case.kind.bits()) {
         .q4 => try Q4.scaleBiasBytes(case.n, case.k),
         .q3 => try Q3.scaleBiasBytes(case.n, case.k),
+        .q2 => try Q2.scaleBiasBytes(case.n, case.k),
     };
     const x_elems = std.math.mul(usize, case.m, case.k) catch return error.Overflow;
     const x_bytes = std.math.mul(usize, x_elems, @sizeOf(f16)) catch return error.Overflow;
@@ -774,6 +777,12 @@ pub fn runMoeBench(allocator: std.mem.Allocator, config: MoeBenchConfig) MoeBenc
             return error.InvalidConfig;
         }
         const gu_w_bytes, const gu_sb_bytes, const dn_w_bytes, const dn_sb_bytes = switch (case.bits) {
+            .q2 => .{
+                try Q2.packedWeightBytes(case.intermediate_size, case.hidden_size),
+                try Q2.scaleBiasBytes(case.intermediate_size, case.hidden_size),
+                try Q2.packedWeightBytes(case.hidden_size, case.intermediate_size),
+                try Q2.scaleBiasBytes(case.hidden_size, case.intermediate_size),
+            },
             .q3 => .{
                 try Q3.packedWeightBytes(case.intermediate_size, case.hidden_size),
                 try Q3.scaleBiasBytes(case.intermediate_size, case.hidden_size),
@@ -1093,7 +1102,11 @@ pub fn writeSyntheticQwen3AmfFile(
     const kv_dim = cfg.kvDim();
     const is_quant = cfg.quant_bits != null;
     const lin_dtype: amf.DType = if (cfg.quant_bits) |qb|
-        (if (qb == .q3) .q3_affine else .q4_affine)
+        switch (qb) {
+            .q2 => .q2_affine,
+            .q3 => .q3_affine,
+            .q4 => .q4_affine,
+        }
     else
         (if (cfg.default_float_dtype == .f16) .f16 else .bf16);
     const norm_dtype: amf.DType = if (is_quant) .f16 else lin_dtype;
@@ -1102,6 +1115,7 @@ pub fn writeSyntheticQwen3AmfFile(
     const inv_sqrt_h = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
     const inv_sqrt_q = 1.0 / @sqrt(@as(f32, @floatFromInt(q_dim)));
     const base_mul: f32 = switch (lin_dtype) {
+        .q2_affine => 0.65,
         .q3_affine => 0.35,
         .q4_affine => 0.17,
         .f16, .bf16 => 0.5,
@@ -1122,6 +1136,7 @@ pub fn writeSyntheticQwen3AmfFile(
         .{ cfg.vocab_size, h, 0, 0 },
         2,
         switch (lin_dtype) {
+            .q2_affine => 0.12,
             .q3_affine => 0.06,
             .q4_affine => 0.03,
             .f16, .bf16 => 0.15,
@@ -1199,15 +1214,17 @@ pub fn writeSyntheticQwen3AmfFile(
         var params_bytes: u64 = 0;
         var blob_bytes: u64 = 0;
 
-        if (p.dtype == .q3_affine or p.dtype == .q4_affine) {
+        if (p.dtype == .q2_affine or p.dtype == .q3_affine or p.dtype == .q4_affine) {
             const n: usize = p.shape[0];
             const k: usize = p.shape[1];
             data_bytes = switch (p.dtype) {
+                .q2_affine => try Q2.packedWeightBytes(n, k),
                 .q3_affine => try Q3.packedWeightBytes(n, k),
                 .q4_affine => try Q4.packedWeightBytes(n, k),
                 else => unreachable,
             };
             params_bytes = switch (p.dtype) {
+                .q2_affine => try Q2.scaleBiasBytes(n, k),
                 .q3_affine => try Q3.scaleBiasBytes(n, k),
                 .q4_affine => try Q4.scaleBiasBytes(n, k),
                 else => unreachable,
@@ -1246,7 +1263,12 @@ pub fn writeSyntheticQwen3AmfFile(
             }
 
             // Stream finite well-scaled ScaleBias pairs.
-            const mid: f32 = if (p.dtype == .q3_affine) 3.5 else 7.5;
+            const mid: f32 = switch (p.dtype) {
+                .q2_affine => 1.5,
+                .q3_affine => 3.5,
+                .q4_affine => 7.5,
+                else => unreachable,
+            };
             var sb_table: [257]quant.ScaleBias = undefined;
             for (&sb_table) |*sb| {
                 rng ^= rng << 13;
@@ -1430,6 +1452,7 @@ pub const DecodeBenchResult = struct {
     pub fn precisionLabel(self: DecodeBenchResult) []const u8 {
         if (self.quant_bits) |qb| {
             return switch (qb) {
+                .q2 => "q2",
                 .q3 => "q3",
                 .q4 => "q4",
             };

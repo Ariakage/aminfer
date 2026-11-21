@@ -147,6 +147,7 @@ pub const ModelConfig = struct {
     pub fn precisionLabel(self: ModelConfig) []const u8 {
         if (self.quant_bits) |qb| {
             return switch (qb) {
+                .q2 => "q2",
                 .q3 => "q3",
                 .q4 => "q4",
             };
@@ -258,6 +259,7 @@ pub const ModelConfig = struct {
             if (qval != .object) return error.InvalidJson;
             if (jsonOptU32(qval.object, "bits")) |b| {
                 quant_bits = switch (b) {
+                    2 => .q2,
                     3 => .q3,
                     4 => .q4,
                     else => return error.InvalidConfig,
@@ -519,6 +521,8 @@ const SmeExpertTriple = struct {
     gate: []const u8,
     up: []const u8,
     down: []const u8,
+    dtype: quant.WeightDType = .q3_affine,
+    param_kind: amf.QuantParamKind = .affine_scale_bias,
     is_cold: bool = false,
 };
 
@@ -541,9 +545,16 @@ const LayerWeights = struct {
     router_panel_dtype: ?sme.PanelDType = null,
     /// Zero-copy slice into the owning `WiredArena` shard when `router_layout == .sme2_panel64`.
     router_sme_packed: ?[]const u8 = null,
+    /// Uniform expert dtype when `is_heterogeneous_moe == false`; expert 0's dtype otherwise.
     expert_dtype: quant.WeightDType,
     expert_layout: amf.TensorLayout = .row_major,
     expert_param_kind: amf.QuantParamKind = .affine_scale_bias,
+    /// True iff experts inside this layer span > 1 `WeightDType` scheme (G13, ADR-0017).
+    is_heterogeneous_moe: bool = false,
+    /// Static expert count per `WeightDType` bucket in this layer (`sum == num_experts`).
+    expert_scheme_counts: [moe.NUM_SCHEME_BUCKETS]u32 = @splat(0),
+    /// Device-resident `[num_experts]u8` mapping `expert_id -> @backingInt(WeightDType)`.
+    expert_schemes_bind: metal.BufferBinding,
     expert_weights_buf: metal.Buffer,
     expert_table: metal.BufferBinding,
     expert_table_host: []moe.ExpertWeights,
@@ -863,6 +874,15 @@ pub const Qwen3Model = struct {
     embed_row_alg_bytes: u64,
     global_head_bytes: u64,
 
+    // M5 G13 Static Per-Expert Quantization Scheme & Exact Byte Tables (ADR-0017)
+    is_heterogeneous_moe: bool,
+    /// Flat `[num_hidden_layers * num_experts]` static per-expert `WeightDType` (empty for dense).
+    expert_dtypes: []quant.WeightDType,
+    /// Flat `[num_hidden_layers * num_experts]` exact algorithmic bytes per expert (empty for dense).
+    expert_bytes: []u64,
+    /// Flat `[num_hidden_layers * num_experts]` `u32` byte table for `D7` pruning (`PruneCostModel`).
+    expert_bytes_u32: []u32,
+
     // M4 Cold-Expert NVMe Streaming + ANE Predictor & Hybrid Wavefront Prefill runtimes
     cold_rt: ?*ColdRuntime,
     hybrid_rt: ?*HybridPrefillRuntime,
@@ -908,6 +928,9 @@ pub const Qwen3Model = struct {
             crt.deinit(allocator);
             self.cold_rt = null;
         }
+        if (self.expert_bytes_u32.len > 0) allocator.free(self.expert_bytes_u32);
+        if (self.expert_bytes.len > 0) allocator.free(self.expert_bytes);
+        if (self.expert_dtypes.len > 0) allocator.free(self.expert_dtypes);
         for (self.layers) |layer| {
             if (layer.expert_sme_blobs) |esb| allocator.free(esb);
         }
@@ -940,6 +963,37 @@ pub const Qwen3Model = struct {
 
     pub fn singleExpertBytes(self: *const Qwen3Model) u64 {
         return self.single_expert_bytes;
+    }
+
+    /// True iff any MoE layer in this checkpoint stores mixed per-expert
+    /// quantization schemes (G13 / ADR-0017). False for dense and uniform MoE models.
+    pub fn isHeterogeneousMoe(self: *const Qwen3Model) bool {
+        return self.is_heterogeneous_moe;
+    }
+
+    /// Exact algorithmic weight + scale_bias bytes read for expert `(layer, expert)`
+    /// (`gate_proj + up_proj + down_proj`), exposed for `SpecEngine` `D7` pruning.
+    pub fn expertBytes(self: *const Qwen3Model, layer: usize, expert: usize) u64 {
+        std.debug.assert(self.config.arch == .qwen3_moe);
+        const idx = layer * @as(usize, self.config.num_experts) + expert;
+        return self.expert_bytes[idx];
+    }
+
+    /// Static `WeightDType` scheme of expert `(layer, expert)` (`ADR-0017`).
+    pub fn expertDType(self: *const Qwen3Model, layer: usize, expert: usize) quant.WeightDType {
+        std.debug.assert(self.config.arch == .qwen3_moe);
+        const idx = layer * @as(usize, self.config.num_experts) + expert;
+        return self.expert_dtypes[idx];
+    }
+
+    /// Flat `[num_hidden_layers * num_experts]` `u32` expert byte table for `D7` pruning.
+    pub fn expertBytesFlatU32(self: *const Qwen3Model) []const u32 {
+        return self.expert_bytes_u32;
+    }
+
+    /// Flat `[num_hidden_layers * num_experts]` static per-expert `WeightDType` table.
+    pub fn expertDTypesFlat(self: *const Qwen3Model) []const quant.WeightDType {
+        return self.expert_dtypes;
     }
 
     pub fn totalLayersNonExpertBytes(self: *const Qwen3Model) u64 {
@@ -1131,6 +1185,14 @@ pub const Qwen3Model = struct {
                 .n = lin.n,
                 .k = lin.k,
             }, insert_barrier_before),
+            .q2_affine => try self.dequant_pipes.encodeGemv(frame, .q2, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
         }
     }
 
@@ -1175,6 +1237,15 @@ pub const Qwen3Model = struct {
                 .k = lin.k,
             }, insert_barrier_before),
             .q3_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q3, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .q2_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q2, .{
                 .x = x,
                 .qweight = lin.weight,
                 .scale_bias = lin.scale_bias.?,
@@ -1286,6 +1357,42 @@ pub const Qwen3Model = struct {
                 .n = lin.n,
                 .k = lin.k,
             }, insert_barrier_before),
+            .q2_affine => try self.dequant_pipes.encodeGemm(frame, .q2, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+        }
+    }
+
+    /// Dispatches one complete MoE FFN layer onto GPU: preserves the fast
+    /// single-dispatch path untouched for uniform layers, and uses G13
+    /// zero-sync scheme-bucketed dispatch for heterogeneous layers (`ADR-0017`).
+    fn encodeMoELayerDispatch(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        layer: LayerWeights,
+        moe_args: moe.MoELayerArgs,
+        insert_barrier_before: bool,
+    ) moe.EncodeError!void {
+        if (layer.is_heterogeneous_moe) {
+            try self.moe_pipes.encodeMoELayerHetero(frame, .{
+                .base = moe_args,
+                .expert_schemes = layer.expert_schemes_bind,
+                .scheme_counts = layer.expert_scheme_counts,
+            }, insert_barrier_before);
+        } else {
+            switch (layer.expert_dtype) {
+                .q2_affine => try self.moe_pipes.encodeMoELayer(frame, .q2, moe_args, insert_barrier_before),
+                .q3_affine => try self.moe_pipes.encodeMoELayer(frame, .q3, moe_args, insert_barrier_before),
+                .q4_affine => try self.moe_pipes.encodeMoELayer(frame, .q4, moe_args, insert_barrier_before),
+                .f16 => try self.moe_pipes.encodeMoELayerFloat(frame, .f16, moe_args, insert_barrier_before),
+                .bf16 => try self.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, insert_barrier_before),
+            }
         }
     }
 
@@ -1441,12 +1548,7 @@ pub const Qwen3Model = struct {
                         .intermediate_size = self.config.moe_intermediate_size,
                         .norm_topk_prob = self.config.norm_topk_prob,
                     };
-                    switch (layer.expert_dtype) {
-                        .q3_affine => try self.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
-                        .q4_affine => try self.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
-                        .f16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
-                        .bf16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
-                    }
+                    try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
                 },
                 .qwen3_dense => {
                     try self.encodeLinearGemv(&frame, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, true);
@@ -1634,12 +1736,7 @@ pub const Qwen3Model = struct {
                         .intermediate_size = self.config.moe_intermediate_size,
                         .norm_topk_prob = self.config.norm_topk_prob,
                     };
-                    switch (layer.expert_dtype) {
-                        .q3_affine => try self.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
-                        .q4_affine => try self.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
-                        .f16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
-                        .bf16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
-                    }
+                    try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
                 },
                 .qwen3_dense => {
                     try self.encodeLinearBatched(&frame, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, m, true);
@@ -2056,6 +2153,25 @@ pub const Qwen3Model = struct {
                     }
                 }
             },
+            .q2_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                const groups = h / 64;
+                const row_bytes = groups * Ops.groupWeightBytes();
+                const sb_off: usize = @intCast(self.embed.scale_bias.?.offset);
+                for (token_ids, 0..) |tid, r| {
+                    const row_w = w_off + @as(usize, tid) * row_bytes;
+                    const row_sb = sb_off + @as(usize, tid) * groups * @sizeOf(quant.ScaleBias);
+                    const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                        quant.ScaleBias,
+                        shard_bytes[row_sb .. row_sb + groups * @sizeOf(quant.ScaleBias)],
+                    ));
+                    const dst = out_f32[r * h .. (r + 1) * h];
+                    for (0..groups) |g| {
+                        const goff = row_w + g * Ops.groupWeightBytes();
+                        Ops.dequantizeGroup(shard_bytes[goff..][0..Ops.groupWeightBytes()], sbs[g], dst[g * 64 ..][0..64]);
+                    }
+                }
+            },
         }
     }
 
@@ -2345,15 +2461,18 @@ pub const Qwen3Model = struct {
             if (cnt == 0) continue;
 
             // Gather this expert's rows into contiguous `x_f32_scratch` (reinterpreted as u16)
-            // or slice directly when `cnt == 1` (`M = 1` decode zero-copy fast path!).
+            // or slice directly when `cnt == 1` and activation dtype matches (`M = 1` zero-copy fast path!).
             const e_triple = experts[eid];
+            const e_pdt = if (layer.is_heterogeneous_moe) weightDTypeToPanelDType(e_triple.dtype) else pdt;
+            const e_pkind = if (layer.is_heterogeneous_moe) amfParamKindToSme(e_triple.param_kind) else pkind;
+            const e_act_matches = (e_pdt.activationIsBf16() == pdt.activationIsBf16());
             const hint: sme.CacheHint = if (e_triple.is_cold) .non_temporal else .temporal;
-            if (cnt == 1) {
+            if (cnt == 1 and e_act_matches) {
                 const r = active_rows[0];
                 try evalSwiGluExpertSme2(
                     &srt.dispatcher,
-                    pdt,
-                    pkind,
+                    e_pdt,
+                    e_pkind,
                     hint,
                     e_triple.gate,
                     e_triple.up,
@@ -2373,14 +2492,24 @@ pub const Qwen3Model = struct {
             } else {
                 // Pack `cnt` active token rows into `srt.x_f32_scratch` raw bytes (`cnt * h * 2 <= m * h * 4`).
                 const x_gather: []u16 = @alignCast(std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(srt.x_f32_scratch))[0 .. cnt * h]);
-                for (0..cnt) |ci| {
-                    const r = active_rows[ci];
-                    @memcpy(x_gather[ci * h .. (ci + 1) * h], x_act_all[r * h .. (r + 1) * h]);
+                if (e_act_matches) {
+                    for (0..cnt) |ci| {
+                        const r = active_rows[ci];
+                        @memcpy(x_gather[ci * h .. (ci + 1) * h], x_act_all[r * h .. (r + 1) * h]);
+                    }
+                } else {
+                    const e_act_fdt: quant.FloatDType = if (e_pdt.activationIsBf16()) .bf16 else .f16;
+                    for (0..cnt) |ci| {
+                        const r = active_rows[ci];
+                        const src_row = x_norm_f16[r * h .. (r + 1) * h];
+                        const dst_row = x_gather[ci * h .. (ci + 1) * h];
+                        for (0..h) |c| dst_row[c] = quant.f32ToFloatBits(e_act_fdt, @floatCast(src_row[c]));
+                    }
                 }
                 try evalSwiGluExpertSme2(
                     &srt.dispatcher,
-                    pdt,
-                    pkind,
+                    e_pdt,
+                    e_pkind,
                     hint,
                     e_triple.gate,
                     e_triple.up,
@@ -2581,12 +2710,7 @@ pub const Qwen3Model = struct {
                             .intermediate_size = self.config.moe_intermediate_size,
                             .norm_topk_prob = self.config.norm_topk_prob,
                         };
-                        switch (layer.expert_dtype) {
-                            .q3_affine => try self.moe_pipes.encodeMoELayer(f, .q3, moe_args, had),
-                            .q4_affine => try self.moe_pipes.encodeMoELayer(f, .q4, moe_args, had),
-                            .f16 => try self.moe_pipes.encodeMoELayerFloat(f, .f16, moe_args, had),
-                            .bf16 => try self.moe_pipes.encodeMoELayerFloat(f, .bf16, moe_args, had),
-                        }
+                        try self.encodeMoELayerDispatch(f, layer, moe_args, had);
                     }
                 },
                 .qwen3_dense => {
@@ -2814,12 +2938,7 @@ pub const Qwen3Model = struct {
                             .intermediate_size = self.config.moe_intermediate_size,
                             .norm_topk_prob = self.config.norm_topk_prob,
                         };
-                        switch (layer.expert_dtype) {
-                            .q3_affine => try self.moe_pipes.encodeMoELayer(f, .q3, moe_args, had),
-                            .q4_affine => try self.moe_pipes.encodeMoELayer(f, .q4, moe_args, had),
-                            .f16 => try self.moe_pipes.encodeMoELayerFloat(f, .f16, moe_args, had),
-                            .bf16 => try self.moe_pipes.encodeMoELayerFloat(f, .bf16, moe_args, had),
-                        }
+                        try self.encodeMoELayerDispatch(f, layer, moe_args, had);
                     }
                 },
                 .qwen3_dense => {
@@ -3106,15 +3225,28 @@ pub const Qwen3Model = struct {
             }, barrier_before),
             .logits => return error.InvalidArgument,
         }
-        try self.moe_pipes.encodeRouteTopK(frame, .f32, .{
-            .logits = logits_bind,
-            .workspace = ws,
-            .workspace_buf = ws_buf,
-            .m = m,
-            .num_experts = self.config.num_experts,
-            .top_k = self.config.num_experts_per_tok,
-            .norm_topk_prob = self.config.norm_topk_prob,
-        }, true);
+        if (layer.is_heterogeneous_moe) {
+            try self.moe_pipes.encodeRouteTopKBucketed(frame, .f32, .{
+                .logits = logits_bind,
+                .expert_schemes = layer.expert_schemes_bind,
+                .workspace = ws,
+                .workspace_buf = ws_buf,
+                .m = m,
+                .num_experts = self.config.num_experts,
+                .top_k = self.config.num_experts_per_tok,
+                .norm_topk_prob = self.config.norm_topk_prob,
+            }, true);
+        } else {
+            try self.moe_pipes.encodeRouteTopK(frame, .f32, .{
+                .logits = logits_bind,
+                .workspace = ws,
+                .workspace_buf = ws_buf,
+                .m = m,
+                .num_experts = self.config.num_experts,
+                .top_k = self.config.num_experts_per_tok,
+                .norm_topk_prob = self.config.norm_topk_prob,
+            }, true);
+        }
     }
 
     fn encodeMoEGateUpDown(
@@ -3129,6 +3261,26 @@ pub const Qwen3Model = struct {
         barrier_before: bool,
     ) moe.EncodeError!void {
         const layer = self.layers[l];
+        if (layer.is_heterogeneous_moe) {
+            const base: moe.MoELayerArgs = .{
+                .x = x_norm,
+                .router = layer.router,
+                .weights_base = .{ .buffer = weights_buf, .offset = 0 },
+                .expert_table = layer.expert_table,
+                .workspace = ws,
+                .workspace_buf = ws_buf,
+                .residual = null,
+                .out = x_norm,
+                .m = m,
+                .num_experts = self.config.num_experts,
+                .top_k = self.config.num_experts_per_tok,
+                .hidden_size = self.config.hidden_size,
+                .intermediate_size = self.config.moe_intermediate_size,
+                .norm_topk_prob = self.config.norm_topk_prob,
+            };
+            try self.moe_pipes.encodeGateUpDownHetero(frame, base, layer.expert_scheme_counts, true, barrier_before);
+            return;
+        }
         const gu_args: moe.GateUpSwigluArgs = .{
             .x = x_norm,
             .weights_base = .{ .buffer = weights_buf, .offset = 0 },
@@ -3153,6 +3305,10 @@ pub const Qwen3Model = struct {
             .intermediate_size = self.config.moe_intermediate_size,
         };
         switch (layer.expert_dtype) {
+            .q2_affine => {
+                try self.moe_pipes.encodeGateUpSwiglu(frame, .q2, gu_args, barrier_before);
+                try self.moe_pipes.encodeDownProj(frame, .q2, dp_args, true);
+            },
             .q3_affine => {
                 try self.moe_pipes.encodeGateUpSwiglu(frame, .q3, gu_args, barrier_before);
                 try self.moe_pipes.encodeDownProj(frame, .q3, dp_args, true);
@@ -3270,6 +3426,10 @@ pub const Qwen3Model = struct {
         }
         ws.schedule_header.num_unique_experts = hot_u;
         ws.schedule_header.total_assignments = hot_a;
+        const n_exp: usize = self.config.num_experts;
+        if (layer.is_heterogeneous_moe) {
+            ws.rebuildSchemeBucketsCpu(self.expert_dtypes[l * n_exp .. (l + 1) * n_exp]);
+        }
 
         var hot_frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer hot_frame.abort();
@@ -3298,6 +3458,9 @@ pub const Qwen3Model = struct {
         }
         ws.schedule_header.num_unique_experts = cold_u;
         ws.schedule_header.total_assignments = cold_a;
+        if (layer.is_heterogeneous_moe) {
+            ws.rebuildSchemeBucketsCpu(self.expert_dtypes[l * n_exp .. (l + 1) * n_exp]);
+        }
         return .{ .weights_buf = pool_buf, .num_unique = num_unique };
     }
 
@@ -3776,12 +3939,7 @@ pub const Qwen3Model = struct {
                         .intermediate_size = self.config.moe_intermediate_size,
                         .norm_topk_prob = self.config.norm_topk_prob,
                     };
-                    switch (layer.expert_dtype) {
-                        .q3_affine => try self.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
-                        .q4_affine => try self.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
-                        .f16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
-                        .bf16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
-                    }
+                    try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
                 },
             }
         }
@@ -3957,12 +4115,7 @@ pub const Qwen3Model = struct {
                     .intermediate_size = self.config.moe_intermediate_size,
                     .norm_topk_prob = self.config.norm_topk_prob,
                 };
-                switch (layer.expert_dtype) {
-                    .q3_affine => try self.moe_pipes.encodeMoELayer(frame, .q3, moe_args, true),
-                    .q4_affine => try self.moe_pipes.encodeMoELayer(frame, .q4, moe_args, true),
-                    .f16 => try self.moe_pipes.encodeMoELayerFloat(frame, .f16, moe_args, true),
-                    .bf16 => try self.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, true),
-                }
+                try self.encodeMoELayerDispatch(frame, layer, moe_args, true);
             },
         }
     }
@@ -4600,6 +4753,24 @@ pub const Qwen3Model = struct {
                     }
                 }
             },
+            .q2_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                const groups = try Ops.groupsPerRow(k);
+                const rb = try Ops.rowWeightBytes(k);
+                const sb_off: usize = @intCast(lin.scale_bias.?.offset);
+                const sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    shard_bytes[sb_off .. sb_off + n * groups * @sizeOf(quant.ScaleBias)],
+                ));
+                var gbuf: [64]f32 = undefined;
+                for (0..n) |row| {
+                    for (0..groups) |g| {
+                        const goff = w_off + row * rb + g * Ops.groupWeightBytes();
+                        Ops.dequantizeGroup(shard_bytes[goff..][0..Ops.groupWeightBytes()], sb[row * groups + g], &gbuf);
+                        for (0..64) |j| out[row * k + g * 64 + j] = @floatCast(gbuf[j]);
+                    }
+                }
+            },
         }
         return out;
     }
@@ -5190,6 +5361,7 @@ fn weightDTypeToPanelDType(wdt: quant.WeightDType) sme.PanelDType {
         .bf16 => .bf16,
         .q4_affine => .q4_affine,
         .q3_affine => .q3_affine,
+        .q2_affine => .q2_affine,
     };
 }
 
@@ -5199,6 +5371,7 @@ fn amfDTypeToPanelDType(dt: amf.DType) LoadError!sme.PanelDType {
         .bf16 => .bf16,
         .q4_affine => .q4_affine,
         .q3_affine => .q3_affine,
+        .q2_affine => .q2_affine,
         .f32, .u32 => error.UnexpectedTensorDType,
     };
 }
@@ -5307,7 +5480,33 @@ fn unpackPanel64ToF16(
                                 }
                             }
                         },
-                        .q2_affine => return error.UnexpectedTensorDType,
+                        .q2_affine => {
+                            for (0..32) |kp| {
+                                for (0..8) |b| {
+                                    const byte = codes[kp * 8 + b];
+                                    const c0 = 2 * b;
+                                    const c1 = c0 + 1;
+                                    if (c0 < valid_cols) {
+                                        const row0 = col_base + c0;
+                                        const q00 = byte & 0x03;
+                                        const q01 = (byte >> 2) & 0x03;
+                                        const w00 = if (param_kind == .affine_scale_bias) @as(f32, @floatFromInt(q00)) * scales[c0] + biases[c0] else lut[q00] + biases[c0];
+                                        const w01 = if (param_kind == .affine_scale_bias) @as(f32, @floatFromInt(q01)) * scales[c0] + biases[c0] else lut[q01] + biases[c0];
+                                        out[row0 * k + k_base + 2 * kp] = @floatCast(w00);
+                                        out[row0 * k + k_base + 2 * kp + 1] = @floatCast(w01);
+                                    }
+                                    if (c1 < valid_cols) {
+                                        const row1 = col_base + c1;
+                                        const q10 = (byte >> 4) & 0x03;
+                                        const q11 = (byte >> 6) & 0x03;
+                                        const w10 = if (param_kind == .affine_scale_bias) @as(f32, @floatFromInt(q10)) * scales[c1] + biases[c1] else lut[q10] + biases[c1];
+                                        const w11 = if (param_kind == .affine_scale_bias) @as(f32, @floatFromInt(q11)) * scales[c1] + biases[c1] else lut[q11] + biases[c1];
+                                        out[row1 * k + k_base + 2 * kp] = @floatCast(w10);
+                                        out[row1 * k + k_base + 2 * kp + 1] = @floatCast(w11);
+                                    }
+                                }
+                            }
+                        },
                         else => unreachable,
                     }
                 },
@@ -5355,6 +5554,10 @@ fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) LoadError!qua
             if ((k % 64) != 0) return error.UnalignedK;
             break :blk .q3_affine;
         },
+        .q2_affine => blk: {
+            if ((k % 64) != 0) return error.UnalignedK;
+            break :blk .q2_affine;
+        },
         .f32, .u32 => error.UnexpectedTensorDType,
     };
 }
@@ -5372,7 +5575,7 @@ fn validateRouter2D(entry: *const amf.TensorEntry, num_experts: u32, hidden_size
     }
     switch (dt) {
         .f16, .bf16, .f32 => {},
-        .q4_affine, .q3_affine => {
+        .q4_affine, .q3_affine, .q2_affine => {
             if ((hidden_size % 64) != 0) return error.UnalignedK;
         },
         .u32 => return error.UnexpectedTensorDType,
@@ -5401,7 +5604,7 @@ const LoadedBlob = struct {
             null
         else switch (dtype) {
             .f16, .bf16 => null,
-            .q4_affine, .q3_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
+            .q4_affine, .q3_affine, .q2_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
         };
         return .{
             .weight = .{ .buffer = self.buffer, .offset = self.offset },
@@ -5570,8 +5773,12 @@ fn loadCore(
     const num_chunks: u32 = (max_seq_len + options.chunk_tokens - 1) / options.chunk_tokens;
 
     // Worst-case dispatches in one stepDecode / verifyTree command buffer:
-    // 1 embed + 15 per layer + 3 aux taps + 3 global.
-    const max_dispatches: u64 = 1 + @as(u64, config.num_hidden_layers) * 15 + 6;
+    // 1 embed + 15 per uniform layer (+ up to 2*(NUM_SCHEME_BUCKETS-1) for hetero MoE) + 3 aux taps + 3 global.
+    const per_layer_max_dispatches: u64 = if (config.arch == .qwen3_moe)
+        15 + 2 * (moe.NUM_SCHEME_BUCKETS - 1)
+    else
+        15;
+    const max_dispatches: u64 = 1 + @as(u64, config.num_hidden_layers) * per_layer_max_dispatches + 6;
     if (max_dispatches > metal.UNIFORM_SLOTS_PER_FRAME) {
         return error.TooManyDispatchesForFrame;
     }
@@ -5685,42 +5892,32 @@ fn loadCore(
                 _ = try validateRouter2D(router_e, config.num_experts, h);
                 bytes_l += router_e.blob_bytes;
 
-                var layer_exp_dt: ?quant.WeightDType = null;
                 var layer_exp_layout: ?amf.TensorLayout = null;
-                var layer_exp_pk: ?amf.QuantParamKind = null;
                 for (0..config.num_experts) |e_idx| {
                     const gp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
                     const gp_dt = try validateLinear2D(gp, config.moe_intermediate_size, h);
                     const gp_layout = try gp.tensorLayout();
                     const gp_pk = try gp.quantParamKind();
-                    if (layer_exp_dt) |expected| {
-                        if (gp_dt != expected) return error.UnexpectedTensorDType;
-                    } else {
-                        layer_exp_dt = gp_dt;
-                        if (gp_dt == .f16 or gp_dt == .bf16) {
-                            if ((h % 4) != 0 or (config.moe_intermediate_size % 4) != 0) return error.UnalignedK;
-                        }
+                    if (gp_dt == .f16 or gp_dt == .bf16) {
+                        if ((h % 4) != 0 or (config.moe_intermediate_size % 4) != 0) return error.UnalignedK;
                     }
                     if (layer_exp_layout) |exp_lay| {
                         if (gp_layout != exp_lay) return error.InvalidTensorLayout;
                     } else {
                         layer_exp_layout = gp_layout;
                     }
-                    if (layer_exp_pk) |exp_pk| {
-                        if (gp_pk != exp_pk) return error.InvalidQuantParamKind;
-                    } else {
-                        layer_exp_pk = gp_pk;
-                    }
 
+                    // ADR-0017 strict per-expert uniformity: gate/up/down within expert (l, e)
+                    // MUST share one WeightDType, TensorLayout, and QuantParamKind.
                     const up = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
-                    if ((try validateLinear2D(up, config.moe_intermediate_size, h)) != layer_exp_dt.?) return error.UnexpectedTensorDType;
-                    if ((try up.tensorLayout()) != layer_exp_layout.?) return error.InvalidTensorLayout;
-                    if ((try up.quantParamKind()) != layer_exp_pk.?) return error.InvalidQuantParamKind;
+                    if ((try validateLinear2D(up, config.moe_intermediate_size, h)) != gp_dt) return error.UnexpectedTensorDType;
+                    if ((try up.tensorLayout()) != gp_layout) return error.InvalidTensorLayout;
+                    if ((try up.quantParamKind()) != gp_pk) return error.InvalidQuantParamKind;
 
                     const dp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
-                    if ((try validateLinear2D(dp, h, config.moe_intermediate_size)) != layer_exp_dt.?) return error.UnexpectedTensorDType;
-                    if ((try dp.tensorLayout()) != layer_exp_layout.?) return error.InvalidTensorLayout;
-                    if ((try dp.quantParamKind()) != layer_exp_pk.?) return error.InvalidQuantParamKind;
+                    if ((try validateLinear2D(dp, h, config.moe_intermediate_size)) != gp_dt) return error.UnexpectedTensorDType;
+                    if ((try dp.tensorLayout()) != gp_layout) return error.InvalidTensorLayout;
+                    if ((try dp.quantParamKind()) != gp_pk) return error.InvalidQuantParamKind;
 
                     if (layer_exp_layout.? == .sme2_panel64) {
                         // Single-owner SME2 experts live in wired shard RAM; cold-tagged ones
@@ -5841,6 +6038,10 @@ fn loadCore(
         amf.align64(@as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights))
     else
         0;
+    const expert_schemes_per_layer: usize = if (config.arch == .qwen3_moe)
+        amf.align64(@as(usize, config.num_experts))
+    else
+        0;
     const moe_ws_bytes: usize = if (config.arch == .qwen3_moe)
         try moe.MoeWorkspace.requiredBytes(.{
             .max_tokens = max_tree_nodes,
@@ -5902,6 +6103,7 @@ fn loadCore(
         feature_tap_bytes +
         num_layers * kv_tbl_per_layer +
         num_layers * expert_tbl_per_layer +
+        num_layers * expert_schemes_per_layer +
         moe_ws_bytes +
         layer_sched_hdr_bytes +
         pred_topk_total_bytes +
@@ -6172,6 +6374,8 @@ fn loadCore(
 
     const embed_row_alg_bytes: u64 = switch (embed_wdt) {
         .f16, .bf16 => @as(u64, h) * 2,
+        .q2_affine => (try quant.QuantOps(.{ .bits = .q2, .group_size = 64 }).rowWeightBytes(h)) +
+            @as(u64, h / 64) * @sizeOf(quant.ScaleBias),
         .q3_affine => (try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).rowWeightBytes(h)) +
             @as(u64, h / 64) * @sizeOf(quant.ScaleBias),
         .q4_affine => (try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).rowWeightBytes(h)) +
@@ -6180,6 +6384,26 @@ fn loadCore(
     const global_head_bytes: u64 = embed_row_alg_bytes + final_norm_entry.data_bytes + lm_head_lin.alg_bytes;
 
     // --- 9. Load per-layer weights into assigned shards & build device tables ---
+    const total_expert_slots: usize = if (config.arch == .qwen3_moe)
+        num_layers * @as(usize, config.num_experts)
+    else
+        0;
+    const expert_dtypes: []quant.WeightDType = if (total_expert_slots > 0)
+        try allocator.alloc(quant.WeightDType, total_expert_slots)
+    else
+        &.{};
+    errdefer if (expert_dtypes.len > 0) allocator.free(expert_dtypes);
+    const expert_bytes: []u64 = if (total_expert_slots > 0)
+        try allocator.alloc(u64, total_expert_slots)
+    else
+        &.{};
+    errdefer if (expert_bytes.len > 0) allocator.free(expert_bytes);
+    const expert_bytes_u32: []u32 = if (total_expert_slots > 0)
+        try allocator.alloc(u32, total_expert_slots)
+    else
+        &.{};
+    errdefer if (expert_bytes_u32.len > 0) allocator.free(expert_bytes_u32);
+
     const layers = try allocator.alloc(LayerWeights, num_layers);
     var layers_built: usize = 0;
     errdefer {
@@ -6191,7 +6415,9 @@ fn loadCore(
 
     var total_layers_static_bytes: u64 = 0;
     var total_layers_non_expert_bytes: u64 = 0;
+    var total_expert_bytes_sum: u64 = 0;
     var single_expert_bytes: u64 = 0;
+    var model_is_heterogeneous_moe: bool = false;
     const dummy_linear: LinearBinding = .{
         .weight = .{ .buffer = scratch_buf, .offset = 0 },
         .scale_bias = null,
@@ -6264,6 +6490,7 @@ fn loadCore(
             .post_attention_layernorm = post_ln_b,
             .router = .{ .weights = .{ .binding = .{ .buffer = scratch_buf, .offset = 0 }, .dtype = .f16 } },
             .expert_dtype = .q3_affine,
+            .expert_schemes_bind = .{ .buffer = scratch_buf, .offset = 0 },
             .expert_weights_buf = l_shard.buffer,
             .expert_table = .{ .buffer = scratch_buf, .offset = 0 },
             .expert_table_host = &.{},
@@ -6308,6 +6535,11 @@ fn loadCore(
                             .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
                             .bits = .q3,
                         } },
+                        .q2_affine => .{ .quant_weights = .{
+                            .qweight = router_b.asBinding(),
+                            .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
+                            .bits = .q2,
+                        } },
                         .u32 => unreachable,
                     };
                 }
@@ -6317,21 +6549,38 @@ fn loadCore(
                 layer_w.expert_table = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(exp_tbl_raw.ptr) };
                 layer_w.expert_table_host = exp_tbl;
 
+                const schemes_raw = try scratch_arena.allocAligned(amf.align64(config.num_experts), 64);
+                @memset(schemes_raw, 0);
+                layer_w.expert_schemes_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(schemes_raw.ptr) };
+
                 var exp_dt: quant.WeightDType = .q3_affine;
                 var exp_layout: amf.TensorLayout = .row_major;
                 var exp_pk: amf.QuantParamKind = .affine_scale_bias;
-                for (0..config.num_experts) |e_idx| {
+                var layer_exp_bytes_sum: u64 = 0;
+                const n_exp_usize: usize = config.num_experts;
+                for (0..n_exp_usize) |e_idx| {
                     const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
                     const gp_dt = try validateLinear2D(gp_e, config.moe_intermediate_size, h);
+                    const gp_pk = try gp_e.quantParamKind();
                     if (e_idx == 0) {
                         exp_dt = gp_dt;
                         exp_layout = try gp_e.tensorLayout();
-                        exp_pk = try gp_e.quantParamKind();
+                        exp_pk = gp_pk;
                         if (exp_layout == .sme2_panel64) {
                             has_sme2_weights = true;
                             layer_w.expert_sme_blobs = try allocator.alloc(SmeExpertTriple, config.num_experts);
                         }
                     }
+                    const one_exp_e: u64 = try moe.singleExpertBytesForDType(gp_dt, h, config.moe_intermediate_size);
+                    const flat_idx = l * n_exp_usize + e_idx;
+                    expert_dtypes[flat_idx] = gp_dt;
+                    expert_bytes[flat_idx] = one_exp_e;
+                    expert_bytes_u32[flat_idx] = @intCast(@min(one_exp_e, std.math.maxInt(u32)));
+                    layer_exp_bytes_sum += one_exp_e;
+                    total_expert_bytes_sum += one_exp_e;
+                    schemes_raw[e_idx] = @backingInt(gp_dt);
+                    layer_w.expert_scheme_counts[@backingInt(gp_dt)] += 1;
+
                     const up_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
                     const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
 
@@ -6346,6 +6595,8 @@ fn loadCore(
                             .gate = gp_b.slice[0..@intCast(gp_e.data_bytes)],
                             .up = up_b.slice[0..@intCast(up_e.data_bytes)],
                             .down = dp_b.slice[0..@intCast(dp_e.data_bytes)],
+                            .dtype = gp_dt,
+                            .param_kind = gp_pk,
                             .is_cold = is_cold,
                         };
                         exp_tbl[e_idx] = std.mem.zeroes(moe.ExpertWeights);
@@ -6365,7 +6616,7 @@ fn loadCore(
                     const up_b = try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs);
                     const dp_b = try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs);
 
-                    const is_float = (exp_dt == .f16 or exp_dt == .bf16);
+                    const is_float = (gp_dt == .f16 or gp_dt == .bf16);
                     const ew: moe.ExpertWeights = .{
                         .gate_qweight_offset = gp_b.offset,
                         .gate_sb_offset = if (is_float) 0 else gp_b.offset + gp_e.params_offset,
@@ -6386,18 +6637,19 @@ fn loadCore(
                         });
                     }
                 }
+                var active_schemes: u32 = 0;
+                for (layer_w.expert_scheme_counts) |cnt| {
+                    if (cnt > 0) active_schemes += 1;
+                }
+                layer_w.is_heterogeneous_moe = (active_schemes > 1);
+                if (layer_w.is_heterogeneous_moe) model_is_heterogeneous_moe = true;
                 layer_w.expert_dtype = exp_dt;
                 layer_w.expert_layout = exp_layout;
                 layer_w.expert_param_kind = exp_pk;
 
                 const router_bytes: u64 = router_e.data_bytes + router_e.params_bytes;
-                const one_exp: u64 = switch (exp_dt) {
-                    .q3_affine => try moe.expertLayerBytes(.q3, 1, h, config.moe_intermediate_size),
-                    .q4_affine => try moe.expertLayerBytes(.q4, 1, h, config.moe_intermediate_size),
-                    .f16, .bf16 => try moe.expertLayerBytesFloat(1, h, config.moe_intermediate_size),
-                };
-                if (single_expert_bytes == 0) single_expert_bytes = one_exp;
-                const experts_bytes: u64 = one_exp * config.num_experts_per_tok;
+                const mean_exp_l: u64 = layer_exp_bytes_sum / config.num_experts;
+                const experts_bytes: u64 = mean_exp_l * config.num_experts_per_tok;
                 ffn_active_bytes = router_bytes + experts_bytes;
                 layer_non_expert_bytes += router_bytes;
             },
@@ -6427,6 +6679,10 @@ fn loadCore(
         total_layers_non_expert_bytes += layer_non_expert_bytes;
         layers[l] = layer_w;
         layers_built += 1;
+    }
+
+    if (total_expert_slots > 0) {
+        single_expert_bytes = total_expert_bytes_sum / total_expert_slots;
     }
 
     const out_tok_ids_slice: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_tok_raw));
@@ -6519,6 +6775,10 @@ fn loadCore(
         .single_expert_bytes = single_expert_bytes,
         .embed_row_alg_bytes = embed_row_alg_bytes,
         .global_head_bytes = global_head_bytes,
+        .is_heterogeneous_moe = model_is_heterogeneous_moe,
+        .expert_dtypes = expert_dtypes,
+        .expert_bytes = expert_bytes,
+        .expert_bytes_u32 = expert_bytes_u32,
         .cold_rt = cold_rt,
         .hybrid_rt = null,
         .has_sme2_weights = has_sme2_weights,
@@ -6665,6 +6925,12 @@ pub const SynthDTypeSpec = struct {
     norm_dtype: quant.FloatDType = .f16,
     router_dtype: amf.DType = .f16,
     expert_dtype: ?quant.WeightDType = null,
+    /// Optional per-expert scheme cycle (`expert_dtypes_cycle[e % len]`) for G13 tests.
+    expert_dtypes_cycle: ?[]const quant.WeightDType = null,
+    /// Optional per-layer linear scheme cycle (`layer_linear_dtypes_cycle[l % len]`) for mixed-layer dense tests.
+    layer_linear_dtypes_cycle: ?[]const quant.WeightDType = null,
+    /// When true, intentionally mismatches layer 0 expert 0 `up_proj` dtype to test strict per-expert rejection.
+    mismatch_expert0_up: bool = false,
     use_weight_suffix: bool = false,
 };
 
@@ -6687,10 +6953,12 @@ fn fillQuantTensor(
 ) !struct { data: []u8, params: []u8 } {
     var rng = seed ^ 0x9E37_79B9_7F4A_7C15;
     const w_bytes = switch (bits) {
+        .q2 => try quant.QuantOps(.{ .bits = .q2, .group_size = 64 }).packedWeightBytes(n, k),
         .q3 => try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).packedWeightBytes(n, k),
         .q4 => try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).packedWeightBytes(n, k),
     };
     const sb_bytes = switch (bits) {
+        .q2 => try quant.QuantOps(.{ .bits = .q2, .group_size = 64 }).scaleBiasBytes(n, k),
         .q3 => try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).scaleBiasBytes(n, k),
         .q4 => try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).scaleBiasBytes(n, k),
     };
@@ -6701,7 +6969,11 @@ fn fillQuantTensor(
     const params = try allocator.alloc(u8, sb_bytes);
     errdefer allocator.free(params);
     const sbs: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, params));
-    const mid: f32 = if (bits == .q3) 3.5 else 7.5;
+    const mid: f32 = switch (bits) {
+        .q2 => 1.5,
+        .q3 => 3.5,
+        .q4 => 7.5,
+    };
     for (sbs) |*sb| {
         const u = @as(f32, @floatFromInt(nextRng(&rng) & 0xFF)) / 255.0;
         const s = scale_base * (0.75 + 0.5 * u);
@@ -6739,6 +7011,7 @@ fn weightDTypeToAmf(wdt: quant.WeightDType) amf.DType {
         .bf16 => .bf16,
         .q4_affine => .q4_affine,
         .q3_affine => .q3_affine,
+        .q2_affine => .q2_affine,
     };
 }
 
@@ -6812,8 +7085,13 @@ pub fn buildSyntheticAmfImageWithSpec(
                         .params = try alloc.alloc(u8, 0),
                     });
                 },
-                .q3_affine, .q4_affine => {
-                    const qb: quant.QuantBits = if (wdt == .q3_affine) .q3 else .q4;
+                .q2_affine, .q3_affine, .q4_affine => {
+                    const qb: quant.QuantBits = switch (wdt) {
+                        .q2_affine => .q2,
+                        .q3_affine => .q3,
+                        .q4_affine => .q4,
+                        else => unreachable,
+                    };
                     const q = try fillQuantTensor(alloc, qb, n, k, amp_or_scale, s);
                     errdefer {
                         alloc.free(q.data);
@@ -6869,6 +7147,7 @@ pub fn buildSyntheticAmfImageWithSpec(
     const scaleFor = struct {
         fn call(wdt: quant.WeightDType, inv_sqrt: f32) f32 {
             return switch (wdt) {
+                .q2_affine => 0.65 * inv_sqrt,
                 .q3_affine => 0.35 * inv_sqrt,
                 .q4_affine => 0.17 * inv_sqrt,
                 .f16, .bf16 => 1.0 * inv_sqrt,
@@ -6878,6 +7157,7 @@ pub fn buildSyntheticAmfImageWithSpec(
 
     // embed_tokens
     const emb_scale: f32 = switch (spec.embed_dtype) {
+        .q2_affine => 0.15,
         .q3_affine => 0.08,
         .q4_affine => 0.04,
         .f16, .bf16 => 0.25,
@@ -6891,15 +7171,19 @@ pub fn buildSyntheticAmfImageWithSpec(
     var name_buf: [64]u8 = undefined;
     for (0..cfg.num_hidden_layers) |l_usize| {
         const l: u16 = @intCast(l_usize);
+        const layer_lin_dt: quant.WeightDType = if (spec.layer_linear_dtypes_cycle) |cyc|
+            cyc[l_usize % cyc.len]
+        else
+            spec.linear_dtype;
         try addNorm1D(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.input_layernorm.weight", .{l}), spec.norm_dtype, l, h, seed + t_idx);
         t_idx += 1;
-        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, q_dim, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
+        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, layer_lin_dt, l, amf.NO_EXPERT, q_dim, h, scaleFor(layer_lin_dt, inv_sqrt_h), seed + t_idx);
         t_idx += 1;
-        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, kv_dim, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
+        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, layer_lin_dt, l, amf.NO_EXPERT, kv_dim, h, scaleFor(layer_lin_dt, inv_sqrt_h), seed + t_idx);
         t_idx += 1;
-        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, kv_dim, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
+        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, layer_lin_dt, l, amf.NO_EXPERT, kv_dim, h, scaleFor(layer_lin_dt, inv_sqrt_h), seed + t_idx);
         t_idx += 1;
-        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, h, q_dim, scaleFor(spec.linear_dtype, inv_sqrt_q), seed + t_idx);
+        try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, layer_lin_dt, l, amf.NO_EXPERT, h, q_dim, scaleFor(layer_lin_dt, inv_sqrt_q), seed + t_idx);
         t_idx += 1;
         try addNorm1D(allocator, &recs, try std.fmt.allocPrint(allocator, "layers.{d}.self_attn.q_norm.weight", .{l}), spec.norm_dtype, l, cfg.head_dim, seed + t_idx);
         t_idx += 1;
@@ -6913,6 +7197,7 @@ pub fn buildSyntheticAmfImageWithSpec(
             switch (spec.router_dtype) {
                 .f16 => try addWeight2D(allocator, &recs, router_base, true, .router, .f16, l, amf.NO_EXPERT, cfg.num_experts, h, 0.6 * inv_sqrt_h, seed + t_idx),
                 .bf16 => try addWeight2D(allocator, &recs, router_base, true, .router, .bf16, l, amf.NO_EXPERT, cfg.num_experts, h, 0.6 * inv_sqrt_h, seed + t_idx),
+                .q2_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q2_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.45 * inv_sqrt_h, seed + t_idx),
                 .q3_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q3_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.25 * inv_sqrt_h, seed + t_idx),
                 .q4_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q4_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.12 * inv_sqrt_h, seed + t_idx),
                 .f32, .u32 => return error.UnexpectedTensorDType,
@@ -6921,20 +7206,28 @@ pub fn buildSyntheticAmfImageWithSpec(
             const inv_sqrt_mi = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.moe_intermediate_size)));
             for (0..cfg.num_experts) |e_usize| {
                 const e: u16 = @intCast(e_usize);
-                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, exp_wdt, l, e, cfg.moe_intermediate_size, h, scaleFor(exp_wdt, inv_sqrt_h), seed + t_idx);
+                const e_dt: quant.WeightDType = if (spec.expert_dtypes_cycle) |cyc|
+                    cyc[(l_usize + e_usize) % cyc.len]
+                else
+                    exp_wdt;
+                const up_dt: quant.WeightDType = if (spec.mismatch_expert0_up and l == 0 and e == 0)
+                    (if (e_dt == .q2_affine) .q4_affine else .q2_affine)
+                else
+                    e_dt;
+                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, e_dt, l, e, cfg.moe_intermediate_size, h, scaleFor(e_dt, inv_sqrt_h), seed + t_idx);
                 t_idx += 1;
-                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, exp_wdt, l, e, cfg.moe_intermediate_size, h, scaleFor(exp_wdt, inv_sqrt_h), seed + t_idx);
+                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, up_dt, l, e, cfg.moe_intermediate_size, h, scaleFor(up_dt, inv_sqrt_h), seed + t_idx);
                 t_idx += 1;
-                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, exp_wdt, l, e, h, cfg.moe_intermediate_size, scaleFor(exp_wdt, inv_sqrt_mi), seed + t_idx);
+                try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable, spec.use_weight_suffix, .hot_expert, e_dt, l, e, h, cfg.moe_intermediate_size, scaleFor(e_dt, inv_sqrt_mi), seed + t_idx);
                 t_idx += 1;
             }
         } else {
             const inv_sqrt_di = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.intermediate_size)));
-            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, cfg.intermediate_size, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
+            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, layer_lin_dt, l, amf.NO_EXPERT, cfg.intermediate_size, h, scaleFor(layer_lin_dt, inv_sqrt_h), seed + t_idx);
             t_idx += 1;
-            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, cfg.intermediate_size, h, scaleFor(spec.linear_dtype, inv_sqrt_h), seed + t_idx);
+            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, layer_lin_dt, l, amf.NO_EXPERT, cfg.intermediate_size, h, scaleFor(layer_lin_dt, inv_sqrt_h), seed + t_idx);
             t_idx += 1;
-            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, spec.linear_dtype, l, amf.NO_EXPERT, h, cfg.intermediate_size, scaleFor(spec.linear_dtype, inv_sqrt_di), seed + t_idx);
+            try addWeight2D(allocator, &recs, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable, spec.use_weight_suffix, .dense, layer_lin_dt, l, amf.NO_EXPERT, h, cfg.intermediate_size, scaleFor(layer_lin_dt, inv_sqrt_di), seed + t_idx);
             t_idx += 1;
         }
     }
@@ -7109,13 +7402,14 @@ const CpuTransformerRef = struct {
                 const w_bits: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
                 try quant.denseGemvCpuRef(.bf16, x, w_bits, y, e.shape[0], e.shape[1]);
             },
-            .q3_affine, .q4_affine => {
+            .q2_affine, .q3_affine, .q4_affine => {
                 const sb_start = blob_start + @as(usize, @intCast(e.params_offset));
                 const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
                     quant.ScaleBias,
                     self.bytes[sb_start .. sb_start + @as(usize, @intCast(e.params_bytes))],
                 ));
                 switch (dt) {
+                    .q2_affine => try quant.QuantOps(.{ .bits = .q2, .group_size = 64 }).matmulRef(x, raw, sbs, y, 1, e.shape[0], e.shape[1]),
                     .q3_affine => try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).matmulRef(x, raw, sbs, y, 1, e.shape[0], e.shape[1]),
                     .q4_affine => try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).matmulRef(x, raw, sbs, y, 1, e.shape[0], e.shape[1]),
                     else => unreachable,
@@ -7151,6 +7445,23 @@ const CpuTransformerRef = struct {
                 for (0..h) |j| {
                     const v = std.math.clamp(quant.bf16ToF32(row[j]), -65504.0, 65504.0);
                     out_f16[j] = @floatCast(v);
+                }
+            },
+            .q2_affine => {
+                const Q2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                const rb = try Q2.rowWeightBytes(h);
+                const gs = try Q2.groupsPerRow(h);
+                const qrow = self.bytes[blob_start + @as(usize, token_id) * rb ..][0..rb];
+                const sb_start = blob_start + @as(usize, @intCast(e.params_offset));
+                const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    self.bytes[sb_start .. sb_start + @as(usize, @intCast(e.params_bytes))],
+                ));
+                const sb_row = sbs[@as(usize, token_id) * gs ..][0..gs];
+                var tmp: [64]f32 = undefined;
+                for (0..gs) |g| {
+                    Q2.dequantizeGroup(qrow[g * Q2.groupWeightBytes() ..][0..Q2.groupWeightBytes()], sb_row[g], &tmp);
+                    for (0..64) |j| out_f16[g * 64 + j] = @floatCast(tmp[j]);
                 }
             },
             .q3_affine => {
@@ -8205,6 +8516,12 @@ fn repackAmfBytesToSme2(
                     const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, src_blob[sb_off .. sb_off + sb_len]));
                     try sme.packMlxQuantPanel64(.q3, src_blob[0..@intCast(e.data_bytes)], sbs, n, k, dst[0..packed_len]);
                 },
+                .q2_affine => {
+                    const sb_off: usize = @intCast(e.params_offset);
+                    const sb_len: usize = @intCast(e.params_bytes);
+                    const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, src_blob[sb_off .. sb_off + sb_len]));
+                    try sme.packMlxQuantPanel64(.q2, src_blob[0..@intCast(e.data_bytes)], sbs, n, k, dst[0..packed_len]);
+                },
                 else => unreachable,
             }
             ne.setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
@@ -8502,7 +8819,7 @@ test "M4.5 C12 evalSwiGluExpertSme2 non-temporal ldnt1b matches FP32 reference a
     const m: usize = 6;
     const h: usize = 128;
     const inter: usize = 64;
-    const dtypes = [_]sme.PanelDType{ .bf16, .q4_affine, .q3_affine };
+    const dtypes = [_]sme.PanelDType{ .bf16, .q4_affine, .q3_affine, .q2_affine };
 
     var rng_st: u64 = 0x51C1_0045;
     for (dtypes) |dt| {
@@ -8560,7 +8877,12 @@ test "M4.5 C12 evalSwiGluExpertSme2 non-temporal ldnt1b matches FP32 reference a
             try sme.packDensePanel64(dt, u_u16, inter, h, up_p);
             try sme.packDensePanel64(dt, d_u16, h, inter, down_p);
         } else {
-            const mask: u8 = if (dt == .q4_affine) 0x0F else 0x07;
+            const mask: u8 = switch (dt) {
+                .q4_affine => 0x0F,
+                .q3_affine => 0x07,
+                .q2_affine => 0x03,
+                else => unreachable,
+            };
             const g_codes = try gpa.alloc(u8, inter * h);
             defer gpa.free(g_codes);
             const u_codes = try gpa.alloc(u8, inter * h);
@@ -8682,4 +9004,179 @@ test "M4.5 D11 sampleFromLastLogits uses Secure Enclave TRNG and replays bit-exa
     var seq_replay: [8]u32 = undefined;
     for (&seq_replay) |*t| t.* = try model.sampleFromLastLogits(0.8, replay.random(), p_res);
     try std.testing.expectEqualSlices(u32, &seq_a, &seq_replay);
+}
+
+test "M5 G13 Qwen3Model heterogeneous per-expert MoE ({q2,q3,q4,f16,bf16}) matches CPU fp32 ref on decode and verifyTree" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q2,
+        .group_size = 64,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 10,
+        .num_experts_per_tok = 4,
+        .norm_topk_prob = true,
+        .tie_word_embeddings = false,
+    };
+    const all5 = [_]quant.WeightDType{ .q2_affine, .q3_affine, .q4_affine, .f16, .bf16 };
+    const img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .q4_affine,
+        .norm_dtype = .f16,
+        .router_dtype = .q2_affine,
+        .expert_dtypes_cycle = &all5,
+    }, 0x5150_A115);
+    defer gpa.free(img);
+
+    var model = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+        .max_seq_len = 32,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 8,
+    });
+    defer model.deinit(gpa);
+
+    // Static metadata verification for SpecEngine D7 pruning.
+    try std.testing.expect(model.isHeterogeneousMoe());
+    try std.testing.expectEqual(@as(usize, 20), model.expertBytesFlatU32().len);
+    for (0..cfg.num_hidden_layers) |l| {
+        for (0..cfg.num_experts) |e| {
+            const exp_dt = all5[(l + e) % all5.len];
+            try std.testing.expectEqual(exp_dt, model.expertDType(l, e));
+            const exp_b = try moe.singleExpertBytesForDType(exp_dt, cfg.hidden_size, cfg.moe_intermediate_size);
+            try std.testing.expectEqual(exp_b, model.expertBytes(l, e));
+            try std.testing.expectEqual(@as(u32, @intCast(exp_b)), model.expertBytesFlatU32()[l * cfg.num_experts + e]);
+        }
+    }
+
+    var cpu = try CpuTransformerRef.init(gpa, img, cfg, 32);
+    defer cpu.deinit(gpa);
+
+    // 1. Multi-step decode parity vs CPU fp32 reference.
+    const prompt = [_]u32{ 3, 17, 42, 9 };
+    for (prompt, 0..) |tok, pos| {
+        const gpu_next = try model.stepDecode(tok, @intCast(pos));
+        const cpu_next = try cpu.step(gpa, tok, @intCast(pos));
+        try std.testing.expectEqual(cpu_next, gpu_next);
+        const gpu_logits = model.readLogitsF16();
+        for (cpu.logits, 0..) |exp, i| {
+            const got: f32 = @floatCast(gpu_logits[i]);
+            try std.testing.expectApproxEqAbs(exp, got, @max(0.06, @abs(exp) * 0.04));
+        }
+    }
+
+    // 2. Speculative tree verifyTree parity (4-node chain) vs sequential CPU ref.
+    const tree_toks = [_]u32{ 11, 25, 61, 88 };
+    const tree_pos = [_]u32{ 4, 5, 6, 7 };
+    const tree_masks = [_]u64{ 0b0001, 0b0011, 0b0111, 0b1111 };
+    const vr = try model.verifyTree(&tree_toks, &tree_pos, &tree_masks, 4, true);
+    for (tree_toks, 0..) |tok, i| {
+        const cpu_next = try cpu.step(gpa, tok, tree_pos[i]);
+        try std.testing.expectEqual(cpu_next, vr.argmax_tokens[i]);
+    }
+}
+
+test "M5 ADR-0017 rejects intra-expert dtype mismatch and preserves uniform MoE fast path" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q2,
+        .group_size = 64,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 4,
+        .num_experts_per_tok = 2,
+        .norm_topk_prob = true,
+        .tie_word_embeddings = true,
+    };
+
+    // 1. Mismatched up_proj inside expert 0 MUST fail with error.UnexpectedTensorDType.
+    const bad_img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q3_affine,
+        .embed_dtype = .q4_affine,
+        .expert_dtype = .q2_affine,
+        .mismatch_expert0_up = true,
+    }, 0xBAD_E001);
+    defer gpa.free(bad_img);
+    try std.testing.expectError(
+        error.UnexpectedTensorDType,
+        Qwen3Model.loadFromBytes(gpa, bad_img, cfg, .{ .max_seq_len = 16, .chunk_tokens = 16 }),
+    );
+
+    // 2. Uniform q2_affine MoE keeps `isHeterogeneousMoe() == false` (untouched fast path) and matches CPU ref.
+    const uni_img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q2_affine,
+        .embed_dtype = .q2_affine,
+        .router_dtype = .q2_affine,
+        .expert_dtype = .q2_affine,
+    }, 0x0002_0002);
+    defer gpa.free(uni_img);
+
+    var uni_model = try Qwen3Model.loadFromBytes(gpa, uni_img, cfg, .{ .max_seq_len = 16, .chunk_tokens = 16 });
+    defer uni_model.deinit(gpa);
+    try std.testing.expect(!uni_model.isHeterogeneousMoe());
+
+    var uni_cpu = try CpuTransformerRef.init(gpa, uni_img, cfg, 16);
+    defer uni_cpu.deinit(gpa);
+    for ([_]u32{ 5, 29, 77 }, 0..) |tok, pos| {
+        const g = try uni_model.stepDecode(tok, @intCast(pos));
+        const c = try uni_cpu.step(gpa, tok, @intCast(pos));
+        try std.testing.expectEqual(c, g);
+    }
+}
+
+test "M5 G13 mixed per-layer dense Qwen3 ({q2,q3,q4,bf16}) matches CPU fp32 ref" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q2,
+        .group_size = 64,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 192,
+        .tie_word_embeddings = false,
+    };
+    const layer_dts = [_]quant.WeightDType{ .bf16, .q4_affine, .q3_affine, .q2_affine };
+    const img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .q4_affine,
+        .norm_dtype = .bf16,
+        .layer_linear_dtypes_cycle = &layer_dts,
+    }, 0xDE11_5E05);
+    defer gpa.free(img);
+
+    var model = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+        .max_seq_len = 16,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 4,
+    });
+    defer model.deinit(gpa);
+    try std.testing.expect(!model.isHeterogeneousMoe());
+
+    var cpu = try CpuTransformerRef.init(gpa, img, cfg, 16);
+    defer cpu.deinit(gpa);
+    for ([_]u32{ 2, 19, 63 }, 0..) |tok, pos| {
+        const g = try model.stepDecode(tok, @intCast(pos));
+        const c = try cpu.step(gpa, tok, @intCast(pos));
+        try std.testing.expectEqual(c, g);
+        const gpu_logits = model.readLogitsF16();
+        for (cpu.logits, 0..) |exp, i| {
+            const got: f32 = @floatCast(gpu_logits[i]);
+            try std.testing.expectApproxEqAbs(exp, got, @max(0.06, @abs(exp) * 0.04));
+        }
+    }
 }

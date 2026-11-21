@@ -574,7 +574,7 @@ pub fn packQuantAffinePanel64(
     }
 }
 
-/// Repacks MLX-format row-major `q4_affine` or `q3_affine` weights directly into
+/// Repacks MLX-format row-major `q4_affine`, `q3_affine`, or `q2_affine` weights directly into
 /// `sme2_panel64` (`QuantParamKind.affine_scale_bias`) with zero heap allocations.
 pub fn packMlxQuantPanel64(
     bits: quant.QuantBits,
@@ -587,6 +587,7 @@ pub fn packMlxQuantPanel64(
     const dtype: PanelDType = switch (bits) {
         .q4 => .q4_affine,
         .q3 => .q3_affine,
+        .q2 => .q2_affine,
     };
     const total_bytes = try packedBlobBytes(dtype, n, k);
     const groups = k / GROUP_SIZE;
@@ -594,6 +595,7 @@ pub fn packMlxQuantPanel64(
     const src_grp_bytes: usize = switch (bits) {
         .q4 => 32,
         .q3 => 24,
+        .q2 => 16,
     };
     const row_bytes = std.math.mul(usize, groups, src_grp_bytes) catch return error.Overflow;
     const src_total = std.math.mul(usize, n, row_bytes) catch return error.Overflow;
@@ -642,6 +644,15 @@ pub fn packMlxQuantPanel64(
                                 }
                             }
                         },
+                        .q2 => {
+                            for (0..16) |i| {
+                                const b = src[i];
+                                panel_codes[c][4 * i + 0] = b & 0x03;
+                                panel_codes[c][4 * i + 1] = (b >> 2) & 0x03;
+                                panel_codes[c][4 * i + 2] = (b >> 4) & 0x03;
+                                panel_codes[c][4 * i + 3] = (b >> 6) & 0x03;
+                            }
+                        },
                     }
                 } else {
                     @memset(&panel_codes[c], 0);
@@ -674,6 +685,19 @@ pub fn packMlxQuantPanel64(
                             code_dst[h_off + 0 + i] = quads[0][i] | ((q3b & 0x01) << 3) | ((q3b & 0x10) << 3);
                             code_dst[h_off + 64 + i] = quads[1][i] | ((q3b & 0x02) << 2) | ((q3b & 0x20) << 2);
                             code_dst[h_off + 128 + i] = quads[2][i] | ((q3b & 0x04) << 1) | ((q3b & 0x40) << 1);
+                        }
+                    }
+                },
+                .q2 => {
+                    for (0..32) |kp| {
+                        for (0..8) |b| {
+                            const c0 = 2 * b;
+                            const c1 = c0 + 1;
+                            const c00 = panel_codes[c0][2 * kp] & 0x03;
+                            const c01 = panel_codes[c0][2 * kp + 1] & 0x03;
+                            const c10 = panel_codes[c1][2 * kp] & 0x03;
+                            const c11 = panel_codes[c1][2 * kp + 1] & 0x03;
+                            code_dst[kp * 8 + b] = c00 | (c01 << 2) | (c10 << 4) | (c11 << 6);
                         }
                     }
                 },

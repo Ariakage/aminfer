@@ -76,15 +76,18 @@ pub const DenseGemmArgs = struct {
 
 pub const EncodeError = metal.Error || quant.ShapeError;
 
-/// Startup-compiled specialized Metal 4 pipelines for 3-bit and 4-bit
-/// group-64 affine dequantization GEMV and GEMM (G1, G2).
+/// Startup-compiled specialized Metal 4 pipelines for 2-bit, 3-bit and 4-bit
+/// group-64 affine dequantization GEMV and GEMM (G1, G2, G13).
 pub const DequantPipelines = struct {
     gemv_q4: metal.Pipeline,
     gemv_q3: metal.Pipeline,
+    gemv_q2: metal.Pipeline,
     gemm_q4: metal.Pipeline,
     gemm_q3: metal.Pipeline,
+    gemm_q2: metal.Pipeline,
     gemv_batch_q4: metal.Pipeline,
     gemv_batch_q3: metal.Pipeline,
+    gemv_batch_q2: metal.Pipeline,
     gemv_f16: metal.Pipeline,
     gemv_bf16: metal.Pipeline,
     gemm_f16: metal.Pipeline,
@@ -105,6 +108,12 @@ pub const DequantPipelines = struct {
         });
         errdefer gemv_q3.close();
 
+        const gemv_q2 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gemv_q2.close();
+
         const gemm_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm", &.{
             .{ .index = 0, .value = .{ .u32 = 4 } },
             .{ .index = 1, .value = .{ .u32 = 64 } },
@@ -117,6 +126,12 @@ pub const DequantPipelines = struct {
         });
         errdefer gemm_q3.close();
 
+        const gemm_q2 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gemm_q2.close();
+
         const gemv_batch_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv_batch", &.{
             .{ .index = 0, .value = .{ .u32 = 4 } },
             .{ .index = 1, .value = .{ .u32 = 64 } },
@@ -128,6 +143,12 @@ pub const DequantPipelines = struct {
             .{ .index = 1, .value = .{ .u32 = 64 } },
         });
         errdefer gemv_batch_q3.close();
+
+        const gemv_batch_q2 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv_batch", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gemv_batch_q2.close();
 
         const gemv_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv", &.{
             .{ .index = 2, .value = .{ .bool = false } },
@@ -162,10 +183,13 @@ pub const DequantPipelines = struct {
         return .{
             .gemv_q4 = gemv_q4,
             .gemv_q3 = gemv_q3,
+            .gemv_q2 = gemv_q2,
             .gemm_q4 = gemm_q4,
             .gemm_q3 = gemm_q3,
+            .gemm_q2 = gemm_q2,
             .gemv_batch_q4 = gemv_batch_q4,
             .gemv_batch_q3 = gemv_batch_q3,
+            .gemv_batch_q2 = gemv_batch_q2,
             .gemv_f16 = gemv_f16,
             .gemv_bf16 = gemv_bf16,
             .gemm_f16 = gemm_f16,
@@ -182,10 +206,13 @@ pub const DequantPipelines = struct {
         self.gemm_f16.close();
         self.gemv_bf16.close();
         self.gemv_f16.close();
+        self.gemv_batch_q2.close();
         self.gemv_batch_q3.close();
         self.gemv_batch_q4.close();
+        self.gemm_q2.close();
         self.gemm_q3.close();
         self.gemm_q4.close();
+        self.gemv_q2.close();
         self.gemv_q3.close();
         self.gemv_q4.close();
     }
@@ -206,6 +233,10 @@ pub const DequantPipelines = struct {
             .q3 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
                 break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_q3 };
+            },
+            .q2 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_q2 };
             },
         };
         const params: DequantParams = .{
@@ -242,6 +273,10 @@ pub const DequantPipelines = struct {
             .q3 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
                 break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_q3 };
+            },
+            .q2 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_q2 };
             },
         };
         const params: DequantParams = .{
@@ -308,6 +343,10 @@ pub const DequantPipelines = struct {
             .q3 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
                 break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_batch_q3 };
+            },
+            .q2 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_batch_q2 };
             },
         };
         const params: DequantParams = .{
@@ -512,6 +551,12 @@ test "3-bit fused dequant GEMV matches CPU fp32 reference on exact, odd and LLM 
     try verifySpec(.{ .bits = .q3, .group_size = 64 }, 1, 512, 1024);
 }
 
+test "2-bit fused dequant GEMV matches CPU fp32 reference on exact, odd and LLM shapes" {
+    try verifySpec(.{ .bits = .q2, .group_size = 64 }, 1, 16, 64);
+    try verifySpec(.{ .bits = .q2, .group_size = 64 }, 1, 37, 192);
+    try verifySpec(.{ .bits = .q2, .group_size = 64 }, 1, 512, 1024);
+}
+
 test "4-bit fused dequant GEMM matches CPU fp32 reference across small, odd and tiled batches" {
     try verifySpec(.{ .bits = .q4, .group_size = 64 }, 7, 37, 192);
     try verifySpec(.{ .bits = .q4, .group_size = 64 }, 16, 64, 256);
@@ -524,6 +569,13 @@ test "3-bit fused dequant GEMM matches CPU fp32 reference across small, odd and 
     try verifySpec(.{ .bits = .q3, .group_size = 64 }, 16, 64, 256);
     try verifySpec(.{ .bits = .q3, .group_size = 64 }, 37, 53, 192);
     try verifySpec(.{ .bits = .q3, .group_size = 64 }, 64, 128, 256);
+}
+
+test "2-bit fused dequant GEMM matches CPU fp32 reference across small, odd and tiled batches" {
+    try verifySpec(.{ .bits = .q2, .group_size = 64 }, 7, 37, 192);
+    try verifySpec(.{ .bits = .q2, .group_size = 64 }, 16, 64, 256);
+    try verifySpec(.{ .bits = .q2, .group_size = 64 }, 37, 53, 192);
+    try verifySpec(.{ .bits = .q2, .group_size = 64 }, 64, 128, 256);
 }
 
 test "end-to-end .amf blob loads into WiredArena and executes on GPU without copying" {
@@ -826,7 +878,7 @@ test "dense encoders reject zero dimensions" {
     try std.testing.expectError(error.ZeroDimension, pipes.encodeDenseGemvBatch(&frame, .bf16, .{ .x = b, .weight = b, .y = b, .m = 0, .n = 4, .k = 4 }, false));
 }
 
-test "batched GEMV matches M=1 GEMV bit-for-bit across q3, q4, f16 and bf16" {
+test "batched GEMV matches M=1 GEMV bit-for-bit across q2, q3, q4, f16 and bf16" {
     const device = try metal.Device.open();
     defer device.close();
     const library = try metal.Library.openEmbedded(device);
@@ -843,10 +895,13 @@ test "batched GEMV matches M=1 GEMV bit-for-bit across q3, q4, f16 and bf16" {
 
     const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
     const Q3 = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+    const Q2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
     const w_q4_bytes = try Q4.packedWeightBytes(n, k);
     const sb_q4_bytes = try Q4.scaleBiasBytes(n, k);
     const w_q3_bytes = try Q3.packedWeightBytes(n, k);
     const sb_q3_bytes = try Q3.scaleBiasBytes(n, k);
+    const w_q2_bytes = try Q2.packedWeightBytes(n, k);
+    const sb_q2_bytes = try Q2.scaleBiasBytes(n, k);
     const w_f_bytes: usize = @as(usize, n) * k * @sizeOf(u16);
     const x_bytes: usize = @as(usize, m) * k * @sizeOf(f16);
     const y_bytes: usize = @as(usize, m) * n * @sizeOf(f16);
@@ -854,6 +909,7 @@ test "batched GEMV matches M=1 GEMV bit-for-bit across q3, q4, f16 and bf16" {
     const cap = try page.alignUp(
         amf.align64(w_q4_bytes) + amf.align64(sb_q4_bytes) +
             amf.align64(w_q3_bytes) + amf.align64(sb_q3_bytes) +
+            amf.align64(w_q2_bytes) + amf.align64(sb_q2_bytes) +
             amf.align64(w_f_bytes) * 2 +
             amf.align64(x_bytes) + amf.align64(y_bytes) * 2 + 4 * page.APPLE_PAGE_SIZE,
     );
@@ -872,6 +928,8 @@ test "batched GEMV matches M=1 GEMV bit-for-bit across q3, q4, f16 and bf16" {
     const sb_q4_raw = try arena.allocAligned(sb_q4_bytes, 64);
     const w_q3 = try arena.allocAligned(w_q3_bytes, 64);
     const sb_q3_raw = try arena.allocAligned(sb_q3_bytes, 64);
+    const w_q2 = try arena.allocAligned(w_q2_bytes, 64);
+    const sb_q2_raw = try arena.allocAligned(sb_q2_bytes, 64);
     const w_f16_raw = try arena.allocAligned(w_f_bytes, 64);
     const w_bf16_raw = try arena.allocAligned(w_f_bytes, 64);
     const x_raw = try arena.allocAligned(x_bytes, 64);
@@ -880,10 +938,13 @@ test "batched GEMV matches M=1 GEMV bit-for-bit across q3, q4, f16 and bf16" {
 
     for (w_q4, 0..) |*b, idx| b.* = @truncate(idx * 37 + 13);
     for (w_q3, 0..) |*b, idx| b.* = @truncate(idx * 29 + 7);
+    for (w_q2, 0..) |*b, idx| b.* = @truncate(idx * 43 + 11);
     const sb_q4: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_q4_raw));
     for (sb_q4, 0..) |*sb, idx| sb.* = .{ .scale = @floatCast(0.03 + 0.005 * @as(f32, @floatFromInt(idx % 7))), .bias = @floatCast(-0.2) };
     const sb_q3: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_q3_raw));
     for (sb_q3, 0..) |*sb, idx| sb.* = .{ .scale = @floatCast(0.04 + 0.005 * @as(f32, @floatFromInt(idx % 5))), .bias = @floatCast(-0.15) };
+    const sb_q2: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, sb_q2_raw));
+    for (sb_q2, 0..) |*sb, idx| sb.* = .{ .scale = @floatCast(0.06 + 0.008 * @as(f32, @floatFromInt(idx % 5))), .bias = @floatCast(-0.12) };
     const w_f16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_f16_raw));
     const w_bf16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_bf16_raw));
     for (0..@as(usize, n) * k) |idx| {
@@ -907,10 +968,11 @@ test "batched GEMV matches M=1 GEMV bit-for-bit across q3, q4, f16 and bf16" {
     const y_ref_off = arena.offsetOf(y_ref_raw.ptr);
     const y_bat_off = arena.offsetOf(y_bat_raw.ptr);
 
-    // 1. q4 & q3 quantized bit-exact check
+    // 1. q4, q3 & q2 quantized bit-exact check
     for ([_]struct { bits: quant.QuantBits, w_off: u64, sb_off: u64 }{
         .{ .bits = .q4, .w_off = arena.offsetOf(w_q4.ptr), .sb_off = arena.offsetOf(sb_q4_raw.ptr) },
         .{ .bits = .q3, .w_off = arena.offsetOf(w_q3.ptr), .sb_off = arena.offsetOf(sb_q3_raw.ptr) },
+        .{ .bits = .q2, .w_off = arena.offsetOf(w_q2.ptr), .sb_off = arena.offsetOf(sb_q2_raw.ptr) },
     }) |tc| {
         @memset(y_ref_raw, 0);
         @memset(y_bat_raw, 0);

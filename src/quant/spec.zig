@@ -1,12 +1,13 @@
-//! Compile-time quantization specialization (ADR-0014): MLX-compatible affine
-//! 3-bit and 4-bit group quantization, branch-free per-spec helpers, and CPU
-//! fp32 reference dequantization / matrix multiplication used to verify GPU
-//! kernels.
+//! Compile-time quantization specialization (ADR-0014, ADR-0017): MLX-compatible
+//! affine 2-bit, 3-bit, and 4-bit group quantization, branch-free per-spec
+//! helpers, and CPU fp32 reference dequantization / matrix multiplication used
+//! to verify GPU kernels.
 
 const std = @import("std");
 
-/// Supported affine weight bit-widths (ADR-0014).
+/// Supported affine weight bit-widths (ADR-0014, ADR-0017).
 pub const QuantBits = enum(u8) {
+    q2 = 2,
     q3 = 3,
     q4 = 4,
 
@@ -46,12 +47,15 @@ pub const FloatDType = enum(u8) {
 };
 
 /// Per-tensor weight storage for GPU kernels that accept either unquantized
-/// 16-bit floats or MLX affine group-64 quantized codes (ADR-0014, ADR-0016).
+/// 16-bit floats or MLX affine group-64 quantized codes (ADR-0014, ADR-0016, ADR-0017).
 pub const WeightDType = enum(u8) {
     f16 = 0,
     bf16 = 1,
     q4_affine = 2,
     q3_affine = 3,
+    q2_affine = 4,
+
+    pub const COUNT: usize = 5;
 
     pub fn fromFloat(dtype: FloatDType) WeightDType {
         return switch (dtype) {
@@ -64,6 +68,14 @@ pub const WeightDType = enum(u8) {
         return switch (bits) {
             .q4 => .q4_affine,
             .q3 => .q3_affine,
+            .q2 => .q2_affine,
+        };
+    }
+
+    pub fn isQuantized(self: WeightDType) bool {
+        return switch (self) {
+            .f16, .bf16 => false,
+            .q4_affine, .q3_affine, .q2_affine => true,
         };
     }
 };
@@ -151,7 +163,7 @@ pub fn QuantOps(comptime spec: QuantSpec) type {
     }
     const bits: usize = spec.bits.bitWidth();
     const gs: usize = spec.group_size;
-    // 4-bit: 64 * 4 / 8 = 32 B; 3-bit: 64 * 3 / 8 = 24 B.
+    // 4-bit: 64 * 4 / 8 = 32 B; 3-bit: 64 * 3 / 8 = 24 B; 2-bit: 64 * 2 / 8 = 16 B.
     const group_bytes: usize = (gs * bits) / 8;
 
     return struct {
@@ -210,6 +222,14 @@ pub fn QuantOps(comptime spec: QuantSpec) type {
                     out[blk * 3 + 1] = @truncate(word >> 8);
                     out[blk * 3 + 2] = @truncate(word >> 16);
                 }
+            } else if (comptime spec.bits == .q2) {
+                for (0..gs / 4) |i| {
+                    const c0: u8 = codes[4 * i + 0] & 0x03;
+                    const c1: u8 = codes[4 * i + 1] & 0x03;
+                    const c2: u8 = codes[4 * i + 2] & 0x03;
+                    const c3: u8 = codes[4 * i + 3] & 0x03;
+                    out[i] = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6);
+                }
             } else {
                 @compileError("unsupported QuantBits");
             }
@@ -235,6 +255,14 @@ pub fn QuantOps(comptime spec: QuantSpec) type {
                         const q: u8 = @intCast((word >> @intCast(j * 3)) & 0x07);
                         out[blk * 8 + j] = @as(f32, @floatFromInt(q)) * scale + bias;
                     }
+                }
+            } else if (comptime spec.bits == .q2) {
+                for (0..gs / 4) |i| {
+                    const byte = packed_group[i];
+                    out[4 * i + 0] = @as(f32, @floatFromInt(byte & 0x03)) * scale + bias;
+                    out[4 * i + 1] = @as(f32, @floatFromInt((byte >> 2) & 0x03)) * scale + bias;
+                    out[4 * i + 2] = @as(f32, @floatFromInt((byte >> 4) & 0x03)) * scale + bias;
+                    out[4 * i + 3] = @as(f32, @floatFromInt((byte >> 6) & 0x03)) * scale + bias;
                 }
             } else {
                 @compileError("unsupported QuantBits");
@@ -425,6 +453,59 @@ test "reference quantized matmul matches explicit dequantized dot product" {
     var y: [m * n]f32 = undefined;
     try Q3.matmulRef(&x, &qweight, &sbs, &y, m, n, k);
 
+    for (0..m) |mi| {
+        for (0..n) |ni| {
+            var expected: f32 = 0.0;
+            for (0..k) |ki| expected += @as(f32, @floatCast(x[mi * k + ki])) * dense_w[ni][ki];
+            try std.testing.expectApproxEqAbs(expected, y[mi * n + ni], 1e-4);
+        }
+    }
+}
+
+test "QuantOps 2-bit computes exact byte sizes, LSB-first packing, dequant and matmulRef" {
+    const Q2 = QuantOps(.{ .bits = .q2, .group_size = 64 });
+    try std.testing.expectEqual(@as(u8, 2), QuantBits.q2.bitWidth());
+    try std.testing.expectEqual(WeightDType.q2_affine, WeightDType.fromQuant(.q2));
+    try std.testing.expect(WeightDType.q2_affine.isQuantized());
+    try std.testing.expectEqual(@as(usize, 16), Q2.groupWeightBytes());
+    try std.testing.expectEqual(@as(usize, 512), try Q2.rowWeightBytes(2048));
+    try std.testing.expectEqual(@as(usize, 2048 * 512), try Q2.packedWeightBytes(2048, 2048));
+    try std.testing.expectEqual(@as(usize, 2048 * 32 * 4), try Q2.scaleBiasBytes(2048, 2048));
+    try std.testing.expectError(error.UnalignedK, Q2.rowWeightBytes(65));
+
+    var codes: [64]u8 = undefined;
+    for (&codes, 0..) |*c, i| c.* = @intCast((i * 3 + 1) & 0x03);
+    var packed_buf: [Q2.groupWeightBytes()]u8 = undefined;
+    Q2.packGroup(&codes, &packed_buf);
+
+    // Byte 0 holds codes[0] | (codes[1]<<2) | (codes[2]<<4) | (codes[3]<<6).
+    const expected_b0: u8 = codes[0] | (codes[1] << 2) | (codes[2] << 4) | (codes[3] << 6);
+    try std.testing.expectEqual(expected_b0, packed_buf[0]);
+
+    const sb: ScaleBias = .{ .scale = @floatCast(0.5), .bias = @floatCast(-0.75) };
+    var out: [64]f32 = undefined;
+    Q2.dequantizeGroup(&packed_buf, sb, &out);
+    for (out, 0..) |val, i| {
+        const expected: f32 = @as(f32, @floatFromInt(codes[i])) * 0.5 - 0.75;
+        try std.testing.expectApproxEqAbs(expected, val, 1e-6);
+    }
+
+    const m = 2;
+    const n = 3;
+    const k = 64;
+    var qweight: [n * Q2.groupWeightBytes()]u8 = undefined;
+    var sbs: [n]ScaleBias = undefined;
+    var dense_w: [n][k]f32 = undefined;
+    for (0..n) |row| {
+        for (&codes, 0..) |*c, col| c.* = @intCast((row * 5 + col * 3 + 1) & 0x03);
+        Q2.packGroup(&codes, qweight[row * 16 ..][0..16]);
+        sbs[row] = .{ .scale = @floatCast(0.25 * @as(f32, @floatFromInt(row + 1))), .bias = @floatCast(-0.375) };
+        Q2.dequantizeGroup(qweight[row * 16 ..][0..16], sbs[row], &dense_w[row]);
+    }
+    var x: [m * k]f16 = undefined;
+    for (&x, 0..) |*v, idx| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(idx % 13)) - 6)) * 0.125);
+    var y: [m * n]f32 = undefined;
+    try Q2.matmulRef(&x, &qweight, &sbs, &y, m, n, k);
     for (0..m) |mi| {
         for (0..n) |ni| {
             var expected: f32 = 0.0;

@@ -1931,6 +1931,10 @@ fn runGemvContentionPass(
     timeout_ms: u64,
 ) SpikeS4Error!f64 {
     const bytes_per_disp: u64 = switch (bits) {
+        .q2 => blk: {
+            const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+            break :blk (try Ops.packedWeightBytes(n, k)) + (try Ops.scaleBiasBytes(n, k));
+        },
         .q3 => blk: {
             const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
             break :blk (try Ops.packedWeightBytes(n, k)) + (try Ops.scaleBiasBytes(n, k));

@@ -16,8 +16,8 @@ constant bool ROUTER_W_F16 [[function_constant(4)]];
 constant bool ROUTER_W_BF16 [[function_constant(5)]];
 // Native FP16 / BF16 expert weights for the dense-float MoE SwiGLU (ADR-0016).
 constant bool MOE_W_BF16 [[function_constant(6)]];
-// Embedding table storage: 0 = f16, 1 = bf16, 2 = q4_affine, 3 = q3_affine
-// (matches `quant.WeightDType`).
+// Embedding table storage: 0 = f16, 1 = bf16, 2 = q4_affine, 3 = q3_affine,
+// 4 = q2_affine (matches `quant.WeightDType`).
 constant uint EMBED_KIND [[function_constant(7)]];
 
 struct ExpertWeights {
@@ -117,6 +117,19 @@ static inline float qdot8_q3(uchar b0, uchar b1, uchar b2,
     return acc;
 }
 
+static inline float qdot8_q2(uint16_t w, float4 px0, float4 px1) {
+    const uint lo = uint(w & 0xFFu);
+    const uint hi = uint(w >> 8);
+    return fma(float(lo & 0x03u), px0.x,
+           fma(float(lo & 0x0Cu), px0.y,
+           fma(float(lo & 0x30u), px0.z,
+           fma(float(lo & 0xC0u), px0.w,
+           fma(float(hi & 0x03u), px1.x,
+           fma(float(hi & 0x0Cu), px1.y,
+           fma(float(hi & 0x30u), px1.z,
+               float(hi & 0xC0u) * px1.w)))))));
+}
+
 // Weight-stationary 8-element affine dequantization shared by both `count_u == 1`
 // and `count_u > 1` deduplicated MoE paths for bit-exact FP32 accumulation parity.
 static inline void dequant8_q4(uint32_t w, float scale, float bias,
@@ -143,6 +156,19 @@ static inline void dequant8_q3(uchar b0, uchar b1, uchar b2,
                 fma(float((word >> 15u) & 0x7u), scale, bias),
                 fma(float((word >> 18u) & 0x7u), scale, bias),
                 fma(float((word >> 21u) & 0x7u), scale, bias));
+}
+
+static inline void dequant8_q2(uint16_t w, float scale, float bias,
+                               thread float4 &w0, thread float4 &w1) {
+    const uint u = uint(w);
+    w0 = float4(fma(float((u >>  0u) & 0x3u), scale, bias),
+                fma(float((u >>  2u) & 0x3u), scale, bias),
+                fma(float((u >>  4u) & 0x3u), scale, bias),
+                fma(float((u >>  6u) & 0x3u), scale, bias));
+    w1 = float4(fma(float((u >>  8u) & 0x3u), scale, bias),
+                fma(float((u >> 10u) & 0x3u), scale, bias),
+                fma(float((u >> 12u) & 0x3u), scale, bias),
+                fma(float((u >> 14u) & 0x3u), scale, bias));
 }
 
 // ---------------------------------------------------------------------------
@@ -521,12 +547,16 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
                         const ulong row_w_off = ulong(row) * p.row_bytes + g * 32u + lane_in_grp * 4u;
                         dequant8_q4(*(const device uint32_t *)(gate_qw + row_w_off), float(gsb.x), float(gsb.y), gw0, gw1);
                         dequant8_q4(*(const device uint32_t *)(up_qw + row_w_off), float(usb.x), float(usb.y), uw0, uw1);
-                    } else {
+                    } else if (Q_BITS == 3u) {
                         const ulong row_w_off = ulong(row) * p.row_bytes + g * 24u + lane_in_grp * 3u;
                         const device uchar *gwp = gate_qw + row_w_off;
                         const device uchar *uwp = up_qw + row_w_off;
                         dequant8_q3(gwp[0], gwp[1], gwp[2], float(gsb.x), float(gsb.y), gw0, gw1);
                         dequant8_q3(uwp[0], uwp[1], uwp[2], float(usb.x), float(usb.y), uw0, uw1);
+                    } else {
+                        const ulong row_w_off = ulong(row) * p.row_bytes + g * 16u + lane_in_grp * 2u;
+                        dequant8_q2(*(const device uint16_t *)(gate_qw + row_w_off), float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q2(*(const device uint16_t *)(up_qw + row_w_off), float(usb.x), float(usb.y), uw0, uw1);
                     }
                     g_acc[r] += dot(fx0, gw0) + dot(fx1, gw1);
                     u_acc[r] += dot(fx0, uw0) + dot(fx1, uw1);
@@ -582,12 +612,16 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
                         const uint w_off = g * 32u + lane_in_grp * 4u;
                         dequant8_q4(*(const device uint32_t *)(gate_qw + row_w_base + w_off), float(gsb.x), float(gsb.y), gw0, gw1);
                         dequant8_q4(*(const device uint32_t *)(up_qw + row_w_base + w_off), float(usb.x), float(usb.y), uw0, uw1);
-                    } else {
+                    } else if (Q_BITS == 3u) {
                         const uint w_off = g * 24u + lane_in_grp * 3u;
                         const device uchar *gwp = gate_qw + row_w_base + w_off;
                         const device uchar *uwp = up_qw + row_w_base + w_off;
                         dequant8_q3(gwp[0], gwp[1], gwp[2], float(gsb.x), float(gsb.y), gw0, gw1);
                         dequant8_q3(uwp[0], uwp[1], uwp[2], float(usb.x), float(usb.y), uw0, uw1);
+                    } else {
+                        const uint w_off = g * 16u + lane_in_grp * 2u;
+                        dequant8_q2(*(const device uint16_t *)(gate_qw + row_w_base + w_off), float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q2(*(const device uint16_t *)(up_qw + row_w_base + w_off), float(usb.x), float(usb.y), uw0, uw1);
                     }
 
                     const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
@@ -644,12 +678,16 @@ kernel void ami_moe_gate_up_swiglu(const device half *x [[buffer(0)]],
                         const uint w_off = g * 32u + lane_in_grp * 4u;
                         dequant8_q4(*(const device uint32_t *)(gate_qw + row_w_base + w_off), float(gsb.x), float(gsb.y), gw0, gw1);
                         dequant8_q4(*(const device uint32_t *)(up_qw + row_w_base + w_off), float(usb.x), float(usb.y), uw0, uw1);
-                    } else {
+                    } else if (Q_BITS == 3u) {
                         const uint w_off = g * 24u + lane_in_grp * 3u;
                         const device uchar *gwp = gate_qw + row_w_base + w_off;
                         const device uchar *uwp = up_qw + row_w_base + w_off;
                         dequant8_q3(gwp[0], gwp[1], gwp[2], float(gsb.x), float(gsb.y), gw0, gw1);
                         dequant8_q3(uwp[0], uwp[1], uwp[2], float(usb.x), float(usb.y), uw0, uw1);
+                    } else {
+                        const uint w_off = g * 16u + lane_in_grp * 2u;
+                        dequant8_q2(*(const device uint16_t *)(gate_qw + row_w_base + w_off), float(gsb.x), float(gsb.y), gw0, gw1);
+                        dequant8_q2(*(const device uint16_t *)(up_qw + row_w_base + w_off), float(usb.x), float(usb.y), uw0, uw1);
                     }
 
                     const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
@@ -759,10 +797,13 @@ kernel void ami_moe_down_proj(const device half *inter [[buffer(0)]],
                     if (Q_BITS == 4u) {
                         const ulong row_w_off = ulong(row) * p.row_bytes + g * 32u + lane_in_grp * 4u;
                         dequant8_q4(*(const device uint32_t *)(down_qw + row_w_off), float(sb.x), float(sb.y), dw0, dw1);
-                    } else {
+                    } else if (Q_BITS == 3u) {
                         const ulong row_w_off = ulong(row) * p.row_bytes + g * 24u + lane_in_grp * 3u;
                         const device uchar *wp = down_qw + row_w_off;
                         dequant8_q3(wp[0], wp[1], wp[2], float(sb.x), float(sb.y), dw0, dw1);
+                    } else {
+                        const ulong row_w_off = ulong(row) * p.row_bytes + g * 16u + lane_in_grp * 2u;
+                        dequant8_q2(*(const device uint16_t *)(down_qw + row_w_off), float(sb.x), float(sb.y), dw0, dw1);
                     }
                     acc[r] += dot(fx0, dw0) + dot(fx1, dw1);
                 }
@@ -813,10 +854,13 @@ kernel void ami_moe_down_proj(const device half *inter [[buffer(0)]],
                     if (Q_BITS == 4u) {
                         const uint w_off = g * 32u + lane_in_grp * 4u;
                         dequant8_q4(*(const device uint32_t *)(down_qw + row_w_base + w_off), float(sb.x), float(sb.y), dw0, dw1);
-                    } else {
+                    } else if (Q_BITS == 3u) {
                         const uint w_off = g * 24u + lane_in_grp * 3u;
                         const device uchar *wp = down_qw + row_w_base + w_off;
                         dequant8_q3(wp[0], wp[1], wp[2], float(sb.x), float(sb.y), dw0, dw1);
+                    } else {
+                        const uint w_off = g * 16u + lane_in_grp * 2u;
+                        dequant8_q2(*(const device uint16_t *)(down_qw + row_w_base + w_off), float(sb.x), float(sb.y), dw0, dw1);
                     }
 
                     const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
@@ -866,10 +910,13 @@ kernel void ami_moe_down_proj(const device half *inter [[buffer(0)]],
                     if (Q_BITS == 4u) {
                         const uint w_off = g * 32u + lane_in_grp * 4u;
                         dequant8_q4(*(const device uint32_t *)(down_qw + row_w_base + w_off), float(sb.x), float(sb.y), dw0, dw1);
-                    } else {
+                    } else if (Q_BITS == 3u) {
                         const uint w_off = g * 24u + lane_in_grp * 3u;
                         const device uchar *wp = down_qw + row_w_base + w_off;
                         dequant8_q3(wp[0], wp[1], wp[2], float(sb.x), float(sb.y), dw0, dw1);
+                    } else {
+                        const uint w_off = g * 16u + lane_in_grp * 2u;
+                        dequant8_q2(*(const device uint16_t *)(down_qw + row_w_base + w_off), float(sb.x), float(sb.y), dw0, dw1);
                     }
 
                     const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
@@ -1130,7 +1177,7 @@ kernel void ami_moe_router_proj_q(const device half *x [[buffer(0)]],
                 const half2 sb = scale_bias[ulong(row) * p.num_groups + g];
                 acc[r] = fma(qdot8_q4(w, px0, px1), float(sb.x), fma(x_sum, float(sb.y), acc[r]));
             }
-        } else {
+        } else if (Q_BITS == 3u) {
             const float4 px0 = float4(fx0.x, fx0.y * (1.0f / 8.0f), fx0.z * (1.0f / 64.0f), fx0.w * (1.0f / 2.0f));
             const float4 px1 = float4(fx1.x * (1.0f / 16.0f), fx1.y * (1.0f / 128.0f), fx1.z * (1.0f / 4.0f), fx1.w * (1.0f / 32.0f));
             const float x2_hi = fx0.z * 4.0f;
@@ -1142,6 +1189,16 @@ kernel void ami_moe_router_proj_q(const device half *x [[buffer(0)]],
                 const half2 sb = scale_bias[ulong(row) * p.num_groups + g];
                 acc[r] = fma(qdot8_q3(wp[0], wp[1], wp[2], px0, px1, x2_hi, x5_hi),
                              float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+            }
+        } else {
+            const float4 px0 = float4(fx0.x, fx0.y * (1.0f / 4.0f), fx0.z * (1.0f / 16.0f), fx0.w * (1.0f / 64.0f));
+            const float4 px1 = float4(fx1.x, fx1.y * (1.0f / 4.0f), fx1.z * (1.0f / 16.0f), fx1.w * (1.0f / 64.0f));
+            const uint w_off = g * 16u + lane_in_grp * 2u;
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = min(row0 + r, p.num_experts - 1u);
+                const uint16_t w = *(const device uint16_t *)(qweight + ulong(row) * p.row_bytes + w_off);
+                const half2 sb = scale_bias[ulong(row) * p.num_groups + g];
+                acc[r] = fma(qdot8_q2(w, px0, px1), float(sb.x), fma(x_sum, float(sb.y), acc[r]));
             }
         }
     }
@@ -1402,11 +1459,17 @@ kernel void ami_embed_lookup(const device uchar *weight [[buffer(0)]],
             for (uint j = 0u; j < 8u; j++) {
                 dst[j] = half(fma(float((w >> (j * 4u)) & 0xFu), scale, bias));
             }
-        } else {
+        } else if (EMBED_KIND == 3u) {
             const device uchar *wp = row_w + g * 24u + lane_in_grp * 3u;
             const uint word = uint(wp[0]) | (uint(wp[1]) << 8) | (uint(wp[2]) << 16);
             for (uint j = 0u; j < 8u; j++) {
                 dst[j] = half(fma(float((word >> (j * 3u)) & 0x7u), scale, bias));
+            }
+        } else {
+            const uint16_t w = *(const device uint16_t *)(row_w + g * 16u + lane_in_grp * 2u);
+            const uint u = uint(w);
+            for (uint j = 0u; j < 8u; j++) {
+                dst[j] = half(fma(float((u >> (j * 2u)) & 0x3u), scale, bias));
             }
         }
     }
@@ -1844,7 +1907,7 @@ kernel void ami_moe_gate_up_swiglu_perslot(const device half *x [[buffer(0)]],
                     u_acc[r] = fma(qdot8_q4(uw, px0, px1), float(usb.x), fma(x_sum, float(usb.y), u_acc[r]));
                 }
             }
-        } else {
+        } else if (Q_BITS == 3u) {
             const float4 px0 = float4(fx0.x,
                                       fx0.y * (1.0f / 8.0f),
                                       fx0.z * (1.0f / 64.0f),
@@ -1871,6 +1934,31 @@ kernel void ami_moe_gate_up_swiglu_perslot(const device half *x [[buffer(0)]],
                     const half2 usb = up_sb[row_sb_off];
                     u_acc[r] = fma(qdot8_q3(uwp[0], uwp[1], uwp[2], px0, px1, x2_hi, x5_hi),
                                    float(usb.x), fma(x_sum, float(usb.y), u_acc[r]));
+                }
+            }
+        } else {
+            const float4 px0 = float4(fx0.x,
+                                      fx0.y * (1.0f / 4.0f),
+                                      fx0.z * (1.0f / 16.0f),
+                                      fx0.w * (1.0f / 64.0f));
+            const float4 px1 = float4(fx1.x,
+                                      fx1.y * (1.0f / 4.0f),
+                                      fx1.z * (1.0f / 16.0f),
+                                      fx1.w * (1.0f / 64.0f));
+            const uint w_off = g * 16u + lane_in_grp * 2u;
+
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (full_rows || row < p.intermediate_size) {
+                    const ulong row_w_off = ulong(row) * p.row_bytes + w_off;
+                    const ulong row_sb_off = ulong(row) * p.num_groups + g;
+                    const uint16_t gw = *(const device uint16_t *)(gate_qw + row_w_off);
+                    const half2 gsb = gate_sb[row_sb_off];
+                    g_acc[r] = fma(qdot8_q2(gw, px0, px1), float(gsb.x), fma(x_sum, float(gsb.y), g_acc[r]));
+
+                    const uint16_t uw = *(const device uint16_t *)(up_qw + row_w_off);
+                    const half2 usb = up_sb[row_sb_off];
+                    u_acc[r] = fma(qdot8_q2(uw, px0, px1), float(usb.x), fma(x_sum, float(usb.y), u_acc[r]));
                 }
             }
         }
@@ -1956,7 +2044,7 @@ kernel void ami_moe_down_proj_perslot(const device half *inter [[buffer(0)]],
                     acc[r] = fma(qdot8_q4(dw, px0, px1), float(sb.x), fma(x_sum, float(sb.y), acc[r]));
                 }
             }
-        } else {
+        } else if (Q_BITS == 3u) {
             const float4 px0 = float4(fx0.x,
                                       fx0.y * (1.0f / 8.0f),
                                       fx0.z * (1.0f / 64.0f),
@@ -1976,6 +2064,25 @@ kernel void ami_moe_down_proj_perslot(const device half *inter [[buffer(0)]],
                     const half2 sb = down_sb[ulong(row) * p.num_groups + g];
                     acc[r] = fma(qdot8_q3(wp[0], wp[1], wp[2], px0, px1, x2_hi, x5_hi),
                                  float(sb.x), fma(x_sum, float(sb.y), acc[r]));
+                }
+            }
+        } else {
+            const float4 px0 = float4(fx0.x,
+                                      fx0.y * (1.0f / 4.0f),
+                                      fx0.z * (1.0f / 16.0f),
+                                      fx0.w * (1.0f / 64.0f));
+            const float4 px1 = float4(fx1.x,
+                                      fx1.y * (1.0f / 4.0f),
+                                      fx1.z * (1.0f / 16.0f),
+                                      fx1.w * (1.0f / 64.0f));
+            const uint w_off = g * 16u + lane_in_grp * 2u;
+
+            for (uint r = 0u; r < ROWS_PER_SG; r++) {
+                const uint row = row0 + r;
+                if (full_rows || row < p.hidden_size) {
+                    const uint16_t dw = *(const device uint16_t *)(down_qw + ulong(row) * p.row_bytes + w_off);
+                    const half2 sb = down_sb[ulong(row) * p.num_groups + g];
+                    acc[r] = fma(qdot8_q2(dw, px0, px1), float(sb.x), fma(x_sum, float(sb.y), acc[r]));
                 }
             }
         }
@@ -2055,4 +2162,289 @@ kernel void ami_gather_rows_f16(const device half *src [[buffer(0)]],
     }
     const uint src_row = indices[out_row];
     dst[ulong(out_row) * p.row_elems + col] = src[ulong(src_row) * p.row_elems + col];
+}
+
+// ===========================================================================
+// Milestone M5 (G13, ADR-0017): Scheme-Bucketed Heterogeneous MoE CSR Routing
+//
+// Single 256-thread threadgroup computes FP32 softmax + top-K (identical to
+// `ami_moe_route_topk`), then partitions active unique experts by their static
+// `WeightDType` scheme (`0=f16, 1=bf16, 2=q4, 3=q3, 4=q2`) into 5 disjoint
+// preallocated CSR buckets sharing `token_indices`, `routing_weights`,
+// `slot_k_indices`, `inter` and `down_out` with zero CPU-GPU roundtrips and
+// zero dynamic allocation. Also fills the unified `sched_hdr`/`unique_experts`/
+// `expert_token_offsets` arrays so telemetry and cold-expert pinning work
+// transparently.
+// ===========================================================================
+
+struct BucketRouteParams {
+    uint m;
+    uint num_experts;
+    uint top_k;
+    uint norm_topk_prob;
+    uint bucket_unique_stride;
+    uint bucket_offsets_stride;
+    uint _pad0;
+    uint _pad1;
+};
+
+static_assert(sizeof(BucketRouteParams) == 32, "BucketRouteParams must be 32 bytes");
+
+kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(0)]],
+                                        device MoeScheduleHeader *sched_hdr [[buffer(1)]],
+                                        device uint *unique_experts [[buffer(2)]],
+                                        device uint *expert_token_offsets [[buffer(3)]],
+                                        device uint *token_indices [[buffer(4)]],
+                                        device float *routing_weights [[buffer(5)]],
+                                        device uint *slot_k_indices [[buffer(6)]],
+                                        device uint *scratch_topk_experts [[buffer(7)]],
+                                        device float *scratch_topk_weights [[buffer(8)]],
+                                        const device uchar *expert_schemes [[buffer(9)]],
+                                        device uchar *bucket_headers [[buffer(10)]],
+                                        device uint *bucket_unique_experts [[buffer(11)]],
+                                        device uint *bucket_expert_token_offsets [[buffer(12)]],
+                                        constant BucketRouteParams &p [[buffer(13)]],
+                                        uint tid [[thread_index_in_threadgroup]],
+                                        uint sg_id [[simdgroup_index_in_threadgroup]],
+                                        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint NUM_SCHEMES = 5u;
+    threadgroup atomic_uint s_counts[256];
+    threadgroup atomic_uint s_cursors[256];
+    threadgroup uint s_prefix_tmp[8];
+    threadgroup uint s_u_cnt;
+    threadgroup uint s_a_cnt;
+
+    const uint top_k = (MOE_TOP_K > 0u) ? MOE_TOP_K : min(p.top_k, 16u);
+
+    // Phase 0: clear per-expert token histograms.
+    atomic_store_explicit(&s_counts[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 1: parallel per-token fp32 softmax & top-k in registers (8 tokens/wave).
+    for (uint tok = sg_id; tok < p.m; tok += 8u) {
+        float vals[8];
+        float local_max = -INFINITY;
+        for (uint r = 0u; r < 8u; r++) {
+            const uint e = lane + r * 32u;
+            if (e < p.num_experts) {
+                const float v = LOGITS_F16
+                    ? float(((const device half *)logits_raw)[ulong(tok) * p.num_experts + e])
+                    : ((const device float *)logits_raw)[ulong(tok) * p.num_experts + e];
+                vals[r] = v;
+                local_max = max(local_max, v);
+            } else {
+                vals[r] = -INFINITY;
+            }
+        }
+
+        const float max_v = simd_max(local_max);
+        float local_sum = 0.0f;
+        for (uint r = 0u; r < 8u; r++) {
+            const uint e = lane + r * 32u;
+            if (e < p.num_experts) {
+                const float ex = exp(vals[r] - max_v);
+                vals[r] = ex;
+                local_sum += ex;
+            } else {
+                vals[r] = -INFINITY;
+            }
+        }
+
+        const float sum_exp = simd_sum(local_sum);
+        const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+        for (uint r = 0u; r < 8u; r++) {
+            const uint e = lane + r * 32u;
+            if (e < p.num_experts) {
+                vals[r] *= inv_sum;
+            }
+        }
+
+        uint sel_e[16];
+        float sel_w[16];
+        float w_sum = 0.0f;
+
+        if (MOE_TOP_K > 0u) {
+            for (uint k = 0u; k < MOE_TOP_K; k++) {
+                float best_v = -INFINITY;
+                uint best_e = 0xFFFFFFFFu;
+                for (uint r = 0u; r < 8u; r++) {
+                    const uint e = lane + r * 32u;
+                    if (e < p.num_experts) {
+                        const float v = vals[r];
+                        if (v > best_v || (v == best_v && e < best_e)) {
+                            best_v = v;
+                            best_e = e;
+                        }
+                    }
+                }
+                for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+                    const float ov = simd_shuffle_down(best_v, offset);
+                    const uint oe = simd_shuffle_down(best_e, offset);
+                    if (ov > best_v || (ov == best_v && oe < best_e)) {
+                        best_v = ov;
+                        best_e = oe;
+                    }
+                }
+                const uint raw_win_e = simd_broadcast_first(best_e);
+                const uint win_e = (raw_win_e < p.num_experts) ? raw_win_e : 0u;
+                const float win_v = simd_broadcast_first(best_v);
+                if ((win_e & 31u) == lane) {
+                    vals[win_e >> 5] = -INFINITY;
+                }
+                if (lane == 0u) {
+                    sel_e[k] = win_e;
+                    sel_w[k] = win_v;
+                    w_sum += win_v;
+                }
+            }
+        } else {
+            for (uint k = 0u; k < top_k; k++) {
+                float best_v = -INFINITY;
+                uint best_e = 0xFFFFFFFFu;
+                for (uint r = 0u; r < 8u; r++) {
+                    const uint e = lane + r * 32u;
+                    if (e < p.num_experts) {
+                        const float v = vals[r];
+                        if (v > best_v || (v == best_v && e < best_e)) {
+                            best_v = v;
+                            best_e = e;
+                        }
+                    }
+                }
+                for (ushort offset = 16u; offset > 0u; offset >>= 1u) {
+                    const float ov = simd_shuffle_down(best_v, offset);
+                    const uint oe = simd_shuffle_down(best_e, offset);
+                    if (ov > best_v || (ov == best_v && oe < best_e)) {
+                        best_v = ov;
+                        best_e = oe;
+                    }
+                }
+                const uint raw_win_e = simd_broadcast_first(best_e);
+                const uint win_e = (raw_win_e < p.num_experts) ? raw_win_e : 0u;
+                const float win_v = simd_broadcast_first(best_v);
+                if ((win_e & 31u) == lane) {
+                    vals[win_e >> 5] = -INFINITY;
+                }
+                if (lane == 0u) {
+                    sel_e[k] = win_e;
+                    sel_w[k] = win_v;
+                    w_sum += win_v;
+                }
+            }
+        }
+
+        if (lane == 0u) {
+            const float renorm = (p.norm_topk_prob != 0u && w_sum > 0.0f) ? (1.0f / w_sum) : 1.0f;
+            const ulong base = ulong(tok) * top_k;
+            for (uint k = 0u; k < top_k; k++) {
+                const uint e = sel_e[k];
+                scratch_topk_experts[base + k] = e;
+                scratch_topk_weights[base + k] = sel_w[k] * renorm;
+                atomic_fetch_add_explicit(&s_counts[e], 1u, memory_order_relaxed);
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    // Phase 2: partition active experts by static scheme into disjoint CSR slices.
+    const uint cnt = (tid < p.num_experts)
+        ? atomic_load_explicit(&s_counts[tid], memory_order_relaxed)
+        : 0u;
+    const uint is_active = (cnt > 0u) ? 1u : 0u;
+    const uint my_scheme = (tid < p.num_experts)
+        ? min(uint(expert_schemes[tid]), NUM_SCHEMES - 1u)
+        : NUM_SCHEMES;
+
+    uint running_u_base = 0u;
+    uint running_a_base = 0u;
+    for (uint s = 0u; s < NUM_SCHEMES; s++) {
+        const uint in_s = (is_active != 0u && my_scheme == s) ? 1u : 0u;
+        const uint cnt_s = (my_scheme == s) ? cnt : 0u;
+
+        // 2a. Exclusive prefix sum of `in_s` -> bucket-local unique index `u_in_s` and total `u_cnt_s`.
+        const uint sg_act_excl = simd_prefix_exclusive_sum(in_s);
+        if (lane == 31u) {
+            s_prefix_tmp[sg_id] = sg_act_excl + in_s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0u) {
+            const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+            const uint ex = simd_prefix_exclusive_sum(v);
+            if (lane < 8u) {
+                s_prefix_tmp[lane] = ex;
+            }
+            if (lane == 7u) {
+                s_u_cnt = ex + v;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint u_in_s = s_prefix_tmp[sg_id] + sg_act_excl;
+        const uint u_cnt_s = s_u_cnt;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2b. Exclusive prefix sum of `cnt_s` -> bucket-local assignment offset `a_in_s` and total `a_cnt_s`.
+        const uint sg_cnt_excl = simd_prefix_exclusive_sum(cnt_s);
+        if (lane == 31u) {
+            s_prefix_tmp[sg_id] = sg_cnt_excl + cnt_s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0u) {
+            const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+            const uint ex = simd_prefix_exclusive_sum(v);
+            if (lane < 8u) {
+                s_prefix_tmp[lane] = ex;
+            }
+            if (lane == 7u) {
+                s_a_cnt = ex + v;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint a_in_s = s_prefix_tmp[sg_id] + sg_cnt_excl;
+        const uint a_cnt_s = s_a_cnt;
+
+        const ulong u_base_off = ulong(s) * p.bucket_unique_stride;
+        const ulong o_base_off = ulong(s) * p.bucket_offsets_stride;
+        if (in_s != 0u) {
+            const uint slot_off = running_a_base + a_in_s;
+            atomic_store_explicit(&s_cursors[tid], slot_off, memory_order_relaxed);
+            bucket_unique_experts[u_base_off + u_in_s] = tid;
+            bucket_expert_token_offsets[o_base_off + u_in_s] = slot_off;
+            unique_experts[running_u_base + u_in_s] = tid;
+            expert_token_offsets[running_u_base + u_in_s] = slot_off;
+        }
+        if (tid == 0u) {
+            bucket_expert_token_offsets[o_base_off + u_cnt_s] = running_a_base + a_cnt_s;
+            device MoeScheduleHeader *bhdr = (device MoeScheduleHeader *)(bucket_headers + ulong(s) * 64ul);
+            bhdr->num_unique_experts = u_cnt_s;
+            bhdr->total_assignments = a_cnt_s;
+            bhdr->m = p.m;
+            bhdr->top_k = top_k;
+        }
+        running_u_base += u_cnt_s;
+        running_a_base += a_cnt_s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        expert_token_offsets[running_u_base] = running_a_base;
+        sched_hdr->num_unique_experts = running_u_base;
+        sched_hdr->total_assignments = running_a_base;
+        sched_hdr->m = p.m;
+        sched_hdr->top_k = top_k;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: scatter token assignments into each active expert's contiguous CSR range.
+    const uint total_assign = p.m * top_k;
+    for (uint idx = tid; idx < total_assign; idx += 256u) {
+        const uint tok = idx / top_k;
+        const uint k_idx = idx - tok * top_k;
+        const uint e = scratch_topk_experts[idx];
+        const float w = scratch_topk_weights[idx];
+        const uint dst = atomic_fetch_add_explicit(&s_cursors[e], 1u, memory_order_relaxed);
+        token_indices[dst] = tok;
+        routing_weights[dst] = w;
+        slot_k_indices[dst] = k_idx;
+    }
 }
