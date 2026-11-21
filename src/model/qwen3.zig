@@ -9616,8 +9616,8 @@ pub fn repackAmfBytesToSme2(
         const should_pack: bool = switch (targets) {
             .routers => kind == .router,
             .all_linear => switch (kind) {
-                .router, .dense, .hot_expert, .cold_expert, .lm_head => true,
-                .embedding, .norm => false,
+                .router, .dense, .hot_expert, .cold_expert, .lm_head, .shared_expert, .loop_adapter => true,
+                .embedding, .norm, .sparse_table => false,
             },
         };
         if (mark_cold_expert_from) |cold_from| {

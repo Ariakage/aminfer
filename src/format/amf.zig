@@ -46,6 +46,26 @@ pub const TensorKind = enum(u8) {
     norm = 4,
     router = 5,
     lm_head = 6,
+    /// Wired shared MoE expert (ADR-0015, Qwen3.8 / DeepSeek-V4.1).
+    shared_expert = 7,
+    /// Cold 16 KiB-aligned NVMe `F_NOCACHE` PLE / Engram row table (ADR-0015, C10).
+    /// Must remain on disk (excluded from `totalWiredBytes()` and `loadWired()`).
+    sparse_table = 8,
+    /// Wired recurrent `Step-LoRA` adapter (`lora_a`, `lora_b`, `alpha`, ADR-0019, W16).
+    loop_adapter = 9,
+
+    /// Returns `true` for tensor kinds loaded into startup wired RAM and `false`
+    /// for cold NVMe-streamed kinds (`cold_expert`, `sparse_table`).
+    pub fn isWired(self: TensorKind) bool {
+        return switch (self) {
+            .dense, .hot_expert, .embedding, .norm, .router, .lm_head, .shared_expert, .loop_adapter => true,
+            .cold_expert, .sparse_table => false,
+        };
+    }
+
+    pub fn isCold(self: TensorKind) bool {
+        return !self.isWired();
+    }
 };
 
 pub const DType = enum(u8) {
@@ -153,7 +173,13 @@ pub const TensorEntry = extern struct {
         self.reserved0 = @as(u16, @backingInt(layout)) | (@as(u16, @backingInt(param_kind)) << 8);
     }
 
-    /// Exposes a cold-expert directory record as an `ExpertSource.local_nvme_ssd`.
+    /// Returns `true` when this tensor is wired in RAM at startup (`false` for
+    /// cold NVMe tensors such as `cold_expert` and `sparse_table`).
+    pub fn isWired(self: *const TensorEntry) ParseError!bool {
+        return (try self.tensorKind()).isWired();
+    }
+
+    /// Exposes a cold-expert or sparse-table directory record as an `ExpertSource.local_nvme_ssd`.
     pub fn asNvmeSource(self: *const TensorEntry, file_index: u16) expert.NvmeExpert.InitError!expert.ExpertSource {
         return .{ .local_nvme_ssd = try expert.NvmeExpert.init(file_index, self.blob_offset, self.blob_bytes) };
     }
@@ -325,6 +351,53 @@ pub const Parsed = struct {
         }
     }
 
+    /// Returns total 16 KiB-aligned blob bytes across all startup-wired tensors.
+    /// Cold NVMe tensors (`cold_expert` and `sparse_table`) are excluded.
+    pub fn totalWiredBytes(self: *const Parsed) u64 {
+        var total: u64 = 0;
+        for (self.entries) |*entry| {
+            const kind = std.enums.fromInt(TensorKind, entry.kind) orelse continue;
+            if (kind.isWired()) {
+                total += entry.blob_bytes;
+            }
+        }
+        return total;
+    }
+
+    /// Returns total 16 KiB-aligned blob bytes across all cold NVMe tensors
+    /// (`cold_expert` and `sparse_table`).
+    pub fn totalColdBytes(self: *const Parsed) u64 {
+        var total: u64 = 0;
+        for (self.entries) |*entry| {
+            const kind = std.enums.fromInt(TensorKind, entry.kind) orelse continue;
+            if (kind.isCold()) {
+                total += entry.blob_bytes;
+            }
+        }
+        return total;
+    }
+
+    /// Loads every startup-wired blob from an in-memory `.amf` image into `arena`
+    /// with CRC-32 verification. Cold entries (`cold_expert`, `sparse_table`) stay
+    /// `null` and consume zero wired bytes. Caller owns the returned pointer slice.
+    pub fn loadWiredFromBytes(
+        self: *const Parsed,
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        arena: *arena_mod.WiredArena,
+    ) (ParseError || arena_mod.WiredArena.AllocError)![]?[]align(page.APPLE_PAGE_SIZE) u8 {
+        const out = try allocator.alloc(?[]align(page.APPLE_PAGE_SIZE) u8, self.entries.len);
+        errdefer allocator.free(out);
+        @memset(out, null);
+
+        for (self.entries, 0..) |*entry, i| {
+            if (try entry.isWired()) {
+                out[i] = try self.loadBlobFromBytes(bytes, entry, arena);
+            }
+        }
+        return out;
+    }
+
     /// Copies one validated blob from an in-memory `.amf` image into a 16 KiB
     /// page slice carved from `arena` and verifies its CRC-32.
     pub fn loadBlobFromBytes(
@@ -412,6 +485,35 @@ pub const AmfFile = struct {
     pub fn close(self: *AmfFile, allocator: std.mem.Allocator) void {
         self.parsed.deinit(allocator);
         _ = std.c.close(self.fd);
+    }
+
+    pub fn totalWiredBytes(self: *const AmfFile) u64 {
+        return self.parsed.totalWiredBytes();
+    }
+
+    pub fn totalColdBytes(self: *const AmfFile) u64 {
+        return self.parsed.totalColdBytes();
+    }
+
+    /// Loads every startup-wired blob from disk via `F_NOCACHE` `pread` into
+    /// `arena` with CRC-32 verification. Cold entries (`cold_expert`, `sparse_table`)
+    /// stay `null`, perform zero disk reads, and consume zero wired bytes.
+    /// Caller owns the returned slice of optional blob pointers.
+    pub fn loadWired(
+        self: *const AmfFile,
+        allocator: std.mem.Allocator,
+        arena: *arena_mod.WiredArena,
+    ) (ParseError || IoError || arena_mod.WiredArena.AllocError)![]?[]align(page.APPLE_PAGE_SIZE) u8 {
+        const out = try allocator.alloc(?[]align(page.APPLE_PAGE_SIZE) u8, self.parsed.entries.len);
+        errdefer allocator.free(out);
+        @memset(out, null);
+
+        for (self.parsed.entries, 0..) |*entry, i| {
+            if (try entry.isWired()) {
+                out[i] = try self.loadBlob(entry, arena);
+            }
+        }
+        return out;
     }
 
     /// Reads one blob directly into a 16 KiB-aligned `WiredArena` slice via
@@ -530,11 +632,19 @@ fn validateEntries(
         const gop = index.getOrPutAssumeCapacity(name);
         if (gop.found_existing) return error.DuplicateTensorName;
         gop.value_ptr.* = @intCast(i);
-        _ = try entry.tensorKind();
+        const kind = try entry.tensorKind();
         const dtype = try entry.dataType();
         const layout = try entry.tensorLayout();
         const param_kind = try entry.quantParamKind();
         if (entry.rank == 0 or entry.rank > 4) return error.InvalidRank;
+
+        if (kind == .sparse_table) {
+            // C10 NVMe PLE / Engram row tables must be 2D `[num_rows, embed_dim, 0, 0]`
+            // in row-major layout so individual rows stream cleanly via 16 KiB F_NOCACHE reads.
+            if (entry.rank != 2) return error.InvalidRank;
+            if (layout != .row_major) return error.InvalidTensorLayout;
+            if (entry.shape[2] != 0 or entry.shape[3] != 0) return error.InvalidShape;
+        }
 
         if (entry.blob_offset < data_start or
             entry.blob_offset % page.APPLE_PAGE_SIZE != 0 or
@@ -1488,4 +1598,218 @@ test "DType.q2_affine is wire value 6 and validates both row_major and sme2_pane
     const found_sme = parsed_sme.find("layers.0.mlp.experts.5.down_proj") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(DType.q2_affine, try found_sme.dataType());
     try std.testing.expectEqual(TensorLayout.sme2_panel64, try found_sme.tensorLayout());
+}
+
+test "M6 TensorKind extensions: shared_expert, sparse_table, loop_adapter and wired/cold isolation" {
+    const gpa = std.testing.allocator;
+
+    // 1. Exact wire values and wired/cold classification.
+    try std.testing.expectEqual(@as(u8, 7), @backingInt(TensorKind.shared_expert));
+    try std.testing.expectEqual(@as(u8, 8), @backingInt(TensorKind.sparse_table));
+    try std.testing.expectEqual(@as(u8, 9), @backingInt(TensorKind.loop_adapter));
+
+    try std.testing.expect(TensorKind.dense.isWired());
+    try std.testing.expect(TensorKind.hot_expert.isWired());
+    try std.testing.expect(TensorKind.shared_expert.isWired());
+    try std.testing.expect(TensorKind.loop_adapter.isWired());
+    try std.testing.expect(!TensorKind.cold_expert.isWired());
+    try std.testing.expect(TensorKind.cold_expert.isCold());
+    try std.testing.expect(!TensorKind.sparse_table.isWired());
+    try std.testing.expect(TensorKind.sparse_table.isCold());
+
+    // 2. Build mixed multi-tensor .amf image with wired + cold entries (one 16 KiB page each).
+    var entries: [5]TensorEntry = undefined;
+
+    entries[0] = TensorEntry.zeroed("layers.0.mlp.shared_expert.gate_proj", .shared_expert, .f16);
+    entries[0].rank = 2;
+    entries[0].layer = 0;
+    entries[0].shape = .{ 16, 64, 0, 0 };
+    entries[0].data_bytes = 16 * 64 * 2;
+
+    entries[1] = TensorEntry.zeroed("layers.0.loop.1.lora_a", .loop_adapter, .bf16);
+    entries[1].rank = 2;
+    entries[1].layer = 0;
+    entries[1].shape = .{ 16, 64, 0, 0 };
+    entries[1].data_bytes = try sme2Panel64BlobBytes(.bf16, 16, 64, 0);
+    entries[1].setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
+
+    entries[2] = TensorEntry.zeroed("layers.0.loop.alpha", .loop_adapter, .f32);
+    entries[2].rank = 1;
+    entries[2].layer = 0;
+    entries[2].shape = .{ 4, 0, 0, 0 };
+    entries[2].data_bytes = 4 * 4;
+
+    entries[3] = TensorEntry.zeroed("layers.0.mlp.experts.9.gate_proj", .cold_expert, .f16);
+    entries[3].rank = 2;
+    entries[3].layer = 0;
+    entries[3].expert = 9;
+    entries[3].shape = .{ 16, 64, 0, 0 };
+    entries[3].data_bytes = 16 * 64 * 2;
+
+    entries[4] = TensorEntry.zeroed("ple.layers.0.shard.0.weight", .sparse_table, .bf16);
+    entries[4].rank = 2;
+    entries[4].layer = 0;
+    entries[4].shape = .{ 32, 64, 0, 0 };
+    entries[4].data_bytes = 32 * 64 * 2;
+
+    const image = try buildTestAmfMulti(gpa, &entries);
+    defer gpa.free(image);
+
+    var parsed = try Parsed.parseBytes(gpa, image);
+    defer parsed.deinit(gpa);
+    try parsed.verifyAllBlobsFromBytes(image);
+
+    // Wired total must include shared_expert + 2 loop_adapter entries (3 pages),
+    // and strictly exclude cold_expert + sparse_table (2 pages).
+    try std.testing.expectEqual(@as(u64, 3 * page.APPLE_PAGE_SIZE), parsed.totalWiredBytes());
+    try std.testing.expectEqual(@as(u64, 2 * page.APPLE_PAGE_SIZE), parsed.totalColdBytes());
+
+    const ple_entry = parsed.find("ple.layers.0.shard.0.weight") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(TensorKind.sparse_table, try ple_entry.tensorKind());
+    try std.testing.expect(!(try ple_entry.isWired()));
+    // Sparse tables also expose their 16 KiB direct-I/O range via asNvmeSource.
+    const nvme_src = try ple_entry.asNvmeSource(0);
+    try std.testing.expectError(error.NotResident, nvme_src.residentBytes());
+
+    // Load wired blobs into a WiredArena sized strictly to totalWiredBytes() (3 pages):
+    // if sparse_table or cold_expert were mistakenly loaded, allocation would fail OutOfSpace!
+    const exact_cap: usize = @intCast(parsed.totalWiredBytes());
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = 16 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = exact_cap,
+        .global_user_wire_limit = exact_cap,
+        .gpu_working_set_bytes = exact_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var mem_arena = try arena_mod.WiredArena.init(exact_cap, budget);
+    defer mem_arena.deinit();
+
+    const wired_from_bytes = try parsed.loadWiredFromBytes(gpa, image, &mem_arena);
+    defer gpa.free(wired_from_bytes);
+    try std.testing.expectEqual(@as(usize, 0), mem_arena.remaining());
+    try std.testing.expect(wired_from_bytes[0] != null); // shared_expert
+    try std.testing.expect(wired_from_bytes[1] != null); // loop_adapter lora_a
+    try std.testing.expect(wired_from_bytes[2] != null); // loop_adapter alpha
+    try std.testing.expect(wired_from_bytes[3] == null); // cold_expert excluded
+    try std.testing.expect(wired_from_bytes[4] == null); // sparse_table excluded
+
+    // Disk round-trip via AmfFile.open (F_NOCACHE) + AmfFile.loadWired().
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "m6_mixed.amf", .data = image });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const raw_path = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], ".zig-cache/tmp/{s}/m6_mixed.amf", .{tmp.sub_path});
+    path_buf[raw_path.len] = 0;
+    const rel_path: [:0]const u8 = path_buf[0..raw_path.len :0];
+
+    var amf_file = try AmfFile.open(gpa, rel_path);
+    defer amf_file.close(gpa);
+    try amf_file.verifyAllBlobs(gpa);
+    try std.testing.expectEqual(@as(u64, 3 * page.APPLE_PAGE_SIZE), amf_file.totalWiredBytes());
+    try std.testing.expectEqual(@as(u64, 2 * page.APPLE_PAGE_SIZE), amf_file.totalColdBytes());
+
+    var disk_arena = try arena_mod.WiredArena.init(exact_cap, budget);
+    defer disk_arena.deinit();
+    const wired_from_disk = try amf_file.loadWired(gpa, &disk_arena);
+    defer gpa.free(wired_from_disk);
+    try std.testing.expectEqual(@as(usize, 0), disk_arena.remaining());
+    try std.testing.expect(wired_from_disk[0] != null);
+    try std.testing.expect(wired_from_disk[1] != null);
+    try std.testing.expect(wired_from_disk[2] != null);
+    try std.testing.expect(wired_from_disk[3] == null);
+    try std.testing.expect(wired_from_disk[4] == null);
+    try std.testing.expectEqualSlices(u8, wired_from_bytes[0].?, wired_from_disk[0].?);
+    try std.testing.expectEqualSlices(u8, wired_from_bytes[1].?, wired_from_disk[1].?);
+
+    // 3. Reject malformed sparse_table metadata (wrong rank, non-zero trailing shape, sme2_panel64).
+    const small_buf: [2048]u8 = @splat(0x42);
+
+    var bad_rank = TensorEntry.zeroed("ple.layers.0.weight", .sparse_table, .f16);
+    bad_rank.rank = 1;
+    bad_rank.shape = .{ 64, 0, 0, 0 };
+    bad_rank.data_bytes = 64 * 2;
+    const bad_rank_img = try buildTestAmf(gpa, bad_rank, &small_buf);
+    defer gpa.free(bad_rank_img);
+    try std.testing.expectError(error.InvalidRank, Parsed.parseBytes(gpa, bad_rank_img));
+
+    var bad_tail = TensorEntry.zeroed("ple.layers.0.weight", .sparse_table, .f16);
+    bad_tail.rank = 2;
+    bad_tail.shape = .{ 8, 64, 1, 0 };
+    bad_tail.data_bytes = 8 * 64 * 2;
+    const bad_tail_img = try buildTestAmf(gpa, bad_tail, &small_buf);
+    defer gpa.free(bad_tail_img);
+    try std.testing.expectError(error.InvalidShape, Parsed.parseBytes(gpa, bad_tail_img));
+
+    var bad_layout = TensorEntry.zeroed("ple.layers.0.weight", .sparse_table, .f16);
+    bad_layout.rank = 2;
+    bad_layout.shape = .{ 16, 64, 0, 0 };
+    bad_layout.data_bytes = try sme2Panel64BlobBytes(.f16, 16, 64, 0);
+    bad_layout.setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
+    const bad_layout_img = try buildTestAmf(gpa, bad_layout, &small_buf);
+    defer gpa.free(bad_layout_img);
+    try std.testing.expectError(error.InvalidTensorLayout, Parsed.parseBytes(gpa, bad_layout_img));
+}
+
+test "QuantParamKind.lut16_codebook (reserved0=0x0101) validates across q4/q3/q2 sme2_panel64 and rejects row_major" {
+    const gpa = std.testing.allocator;
+
+    const specs = [_]struct { dtype: DType, bits: u8 }{
+        .{ .dtype = .q4_affine, .bits = 4 },
+        .{ .dtype = .q3_affine, .bits = 3 },
+        .{ .dtype = .q2_affine, .bits = 2 },
+    };
+
+    for (specs) |sp| {
+        const blob_len = try sme2Panel64BlobBytes(sp.dtype, 25, 128, 64);
+        const buf = try gpa.alloc(u8, @intCast(blob_len));
+        defer gpa.free(buf);
+        @memset(buf, 0x6D);
+
+        var entry = TensorEntry.zeroed("layers.0.mlp.shared_expert.down_proj", .shared_expert, sp.dtype);
+        entry.quant_bits = sp.bits;
+        entry.rank = 2;
+        entry.group_size = 64;
+        entry.layer = 0;
+        entry.shape = .{ 25, 128, 0, 0 };
+        entry.data_bytes = blob_len;
+        entry.setLayoutAndParamKind(.sme2_panel64, .lut16_codebook);
+        try std.testing.expectEqual(@as(u16, 0x0101), entry.reserved0);
+
+        const img = try buildTestAmf(gpa, entry, buf);
+        defer gpa.free(img);
+        var parsed = try Parsed.parseBytes(gpa, img);
+        defer parsed.deinit(gpa);
+        try parsed.verifyAllBlobsFromBytes(img);
+
+        const found = parsed.find("layers.0.mlp.shared_expert.down_proj") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u16, 0x0101), found.reserved0);
+        try std.testing.expectEqual(TensorLayout.sme2_panel64, try found.tensorLayout());
+        try std.testing.expectEqual(QuantParamKind.lut16_codebook, try found.quantParamKind());
+        try std.testing.expectEqual(TensorKind.shared_expert, try found.tensorKind());
+
+        // Reject lut16_codebook on row_major quantized tensor (`reserved0 == 0x0100`).
+        const rm_data: u64 = 16 * ((128 * @as(u64, sp.bits)) / 8);
+        const rm_params_off: u64 = align64(@intCast(rm_data));
+        const rm_params: u64 = 16 * (128 / 64) * @sizeOf(quant.ScaleBias);
+        const rm_buf = try gpa.alloc(u8, @intCast(rm_params_off + rm_params));
+        defer gpa.free(rm_buf);
+        @memset(rm_buf, 0x22);
+
+        var bad_rm = TensorEntry.zeroed("bad.rm.lut16", .dense, sp.dtype);
+        bad_rm.quant_bits = sp.bits;
+        bad_rm.rank = 2;
+        bad_rm.group_size = 64;
+        bad_rm.shape = .{ 16, 128, 0, 0 };
+        bad_rm.data_bytes = rm_data;
+        bad_rm.params_offset = rm_params_off;
+        bad_rm.params_bytes = rm_params;
+        bad_rm.setLayoutAndParamKind(.row_major, .lut16_codebook);
+        try std.testing.expectEqual(@as(u16, 0x0100), bad_rm.reserved0);
+
+        const bad_img = try buildTestAmf(gpa, bad_rm, rm_buf);
+        defer gpa.free(bad_img);
+        try std.testing.expectError(error.InvalidQuantParamKind, Parsed.parseBytes(gpa, bad_img));
+    }
 }
