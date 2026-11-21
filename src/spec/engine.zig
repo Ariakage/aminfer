@@ -1,15 +1,18 @@
 //! End-to-end speculative decoding engine combining:
-//! - L1 CPU Suffix Automaton (`D1`, `src/spec/sam.zig`),
+//! - L1 CPU Suffix Automaton (`D1`, `src/spec/sam.zig`) + C6 NVMe Direct-I/O
+//!   N-Gram Table (`src/spec/ngram_nvme.zig`, ADR-0006),
 //! - L2 EAGLE-3 / EAGLE-2 / MTP draft heads with benchmark-gated ANE/GPU placement
 //!   (`D2`, `D3`, `D5`, `src/spec/draft.zig`, ADR-0008, ADR-0013),
+//! - Standalone same-family SmallDraftModel (`D4`) with target-latency-gated
+//!   PEARL asynchronous pipelined pre-drafting (`D8`, ADR-0008),
 //! - Dual-source prefix trie merging (`D6`, `src/spec/tree.zig`, ADR-0005),
-//! - Expert-byte-budget submodular tree pruning (`D7`, `src/spec/tree.zig`, ADR-0009),
+//! - Expert-byte-budget submodular tree pruning (`D7`, `src/spec/tree.zig`, ADR-0009, ADR-0017),
 //! - L3 GPU tree-attention verification and KV commit (`G5`, `src/model/qwen3.zig`),
 //! - Lossless greedy (`T = 0`) and stochastic (`T > 0`) verification (`D9`, `src/spec/accept.zig`).
 //!
-//! All scratch state, suffix automaton storage, draft trees, expert bitsets, and
-//! residual sampling buffers are preallocated once at startup. The decode round
-//! hot path (`stepRound`) performs zero dynamic heap allocation.
+//! All scratch state, suffix automaton storage, draft trees, PEARL worker state,
+//! expert bitsets, and residual sampling buffers are preallocated once at startup.
+//! The decode round hot path (`stepRound`) performs zero dynamic heap allocation.
 
 const std = @import("std");
 const page = @import("../mem/page.zig");
@@ -23,11 +26,42 @@ const sam_mod = @import("sam.zig");
 const tree_mod = @import("tree.zig");
 const accept_mod = @import("accept.zig");
 const draft_mod = @import("draft.zig");
+const ngram_nvme = @import("ngram_nvme.zig");
 const rng_mod = @import("../runtime/rng.zig");
+const qos = @import("../platform/qos.zig");
+const vmstat = @import("../platform/vmstat.zig");
 const sme = @import("../cpu/sme.zig");
 
 pub const MAX_TREE_NODES: u16 = tree_mod.MAX_SUPPORTED_NODES;
 const MAX_PRED_LAYERS: usize = qwen3.MAX_EXPERT_PRED_LAYERS;
+const PEARL_MAX_BONUS_ROOTS: usize = 2;
+
+/// Target-latency-gated PEARL async pipelined small-draft policy (`D8`, ADR-0008).
+pub const PearlMode = enum {
+    /// Enable automatically when `small_draft != null` and target verify latency
+    /// `>= pearl_min_target_us` (default 40 ms, e.g. `Qwen3-14B-4bit`).
+    auto,
+    /// Disable PEARL pipelining unconditionally.
+    off,
+    /// Force PEARL async pipelining on whenever `small_draft != null` owns an
+    /// independent Metal 4 compute queue.
+    on,
+
+    pub fn label(self: PearlMode) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .off => "off",
+            .on => "on",
+        };
+    }
+
+    pub fn parse(str: []const u8) error{InvalidPearlMode}!PearlMode {
+        if (std.mem.eql(u8, str, "auto")) return .auto;
+        if (std.mem.eql(u8, str, "off")) return .off;
+        if (std.mem.eql(u8, str, "on")) return .on;
+        return error.InvalidPearlMode;
+    }
+};
 
 pub const SpecConfig = struct {
     mode: draft_mod.DraftMode = .l1_only,
@@ -56,6 +90,12 @@ pub const SpecConfig = struct {
     sam_capacity: u32 = 0,
     /// Optional explicit D7 cost model (`null` auto-calibrates from target geometry).
     cost_model: ?tree_mod.PruneCostModel = null,
+    /// D8 target-latency-gated PEARL async pipelined small-draft mode (ADR-0008).
+    pearl_mode: PearlMode = .auto,
+    /// Minimum target verification latency (us) enabling `.auto` PEARL (default 40 ms).
+    pearl_min_target_us: f64 = 40_000.0,
+    /// Optional C6 NVMe `F_NOCACHE` N-gram table queried when L1 SAM match `< 4`.
+    ngram_table: ?*ngram_nvme.NvmeNgramTable = null,
 };
 
 pub const SpecStats = struct {
@@ -83,6 +123,20 @@ pub const SpecStats = struct {
     prune_ns: u64 = 0,
     verify_ns: u64 = 0,
     commit_sync_ns: u64 = 0,
+    // C6 NVMe N-gram telemetry
+    ngram_queries: u64 = 0,
+    ngram_hits: u64 = 0,
+    ngram_seed_hits: u64 = 0,
+    ngram_cache_hits: u64 = 0,
+    ngram_nvme_reads: u64 = 0,
+    // D8 PEARL async pipelining telemetry
+    pearl_enabled: bool = false,
+    pearl_rounds: u64 = 0,
+    pearl_hits: u64 = 0,
+    pearl_partial_prefix_hits: u64 = 0,
+    pearl_rollbacks: u64 = 0,
+    pearl_saved_ns: u64 = 0,
+    pearl_worker_ns: u64 = 0,
 
     pub fn meanAcceptanceLength(self: *const SpecStats) f64 {
         if (self.rounds == 0) return 0.0;
@@ -121,6 +175,8 @@ pub const RoundSummary = struct {
     l1_is_seed: bool,
     avg_unique_experts_per_layer: f64,
     actual_bytes_moved: u64,
+    ngram_match_len: u32 = 0,
+    pearl_hit: bool = false,
 };
 
 pub const InitError = error{
@@ -132,7 +188,7 @@ pub const InitError = error{
     BudgetExceeded,
     OutOfMemory,
 } || sam_mod.InitError || arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError ||
-    budget_mod.PlanError;
+    budget_mod.PlanError || std.Thread.SpawnError || qos.Error;
 
 pub const RunError = error{
     EmptyPrompt,
@@ -141,7 +197,8 @@ pub const RunError = error{
     OutputBufferTooSmall,
     TokenOutOfRange,
     MissingRng,
-} || qwen3.StepError || draft_mod.DraftStepError || tree_mod.PruneError || accept_mod.VerifyError;
+} || qwen3.StepError || draft_mod.DraftStepError || tree_mod.PruneError ||
+    accept_mod.VerifyError || ngram_nvme.QueryError;
 
 /// Derives a calibrated M4 hardware cost model for D7 submodular tree pruning
 /// (ADR-0009) from the loaded target model geometry and Spike S5 bandwidth curve.
@@ -193,15 +250,430 @@ pub fn defaultCostModelForTarget(target: *const qwen3.Qwen3Model) tree_mod.Prune
     return tree_mod.PruneCostModel.dense(t_fixed_us, c_tok_us);
 }
 
+// ---------------------------------------------------------------------------
+// D8 Target-Latency-Gated PEARL Async Pipelined Small-Draft Worker (ADR-0008)
+// ---------------------------------------------------------------------------
+
+const PearlWorkerState = enum(u8) {
+    idle = 0,
+    running = 1,
+    done = 2,
+    shutdown = 3,
+};
+
+const PearlJob = struct {
+    base_pos: u32 = 0,
+    committed_before: u32 = 0,
+    pending_sync_len: u8 = 0,
+    pending_sync_tok: u32 = 0,
+    lead_len: u16 = 0,
+    lead_tokens: [MAX_TREE_NODES]u32 = @splat(0),
+    sync_len: u16 = 0,
+    sync_tokens: [MAX_TREE_NODES + 1]u32 = @splat(0),
+    max_draft_depth: u16 = 4,
+    branch_width: u16 = 2,
+    top_k: u32 = 3,
+    min_frontier_prob: f32 = 0.12,
+    candidate_cap: u16 = 16,
+    max_seq_len: u32 = 0,
+};
+
+const PearlResult = struct {
+    num_roots: u8 = 0,
+    bonus_tokens: [PEARL_MAX_BONUS_ROOTS]u32 = @splat(0),
+    trees: [PEARL_MAX_BONUS_ROOTS]tree_mod.DraftTree(MAX_TREE_NODES) = .{
+        tree_mod.DraftTree(MAX_TREE_NODES).init(0),
+        tree_mod.DraftTree(MAX_TREE_NODES).init(0),
+    },
+    committed_after_sync: u32 = 0,
+    elapsed_ns: u64 = 0,
+    err: ?qwen3.StepError = null,
+};
+
+/// Heap-pinned persistent `USER_INTERACTIVE` PEARL worker spawned ONCE at
+/// `SpecEngine.initWithSmallDraft` (zero per-round thread creation and zero
+/// hot-path heap allocation). Overlaps `small_draft` round-`r+1` pre-drafting
+/// on `small_draft.model.compute` concurrently while the main thread runs
+/// `target.verifyTree(T_r)` on `target.compute`.
+const PearlRuntime = struct {
+    small_draft: *draft_mod.SmallDraftModel,
+    mutex: std.c.pthread_mutex_t,
+    work_cond: std.c.pthread_cond_t,
+    done_cond: std.c.pthread_cond_t,
+    state: PearlWorkerState,
+    ready: bool,
+    init_err: ?qos.Error,
+    thread: std.Thread,
+
+    job: PearlJob,
+    result: PearlResult,
+
+    // Preallocated worker-local scratch (never touched by main thread while `.running`).
+    slot_ancestor_masks: [MAX_TREE_NODES]u64,
+    node_slots: [PEARL_MAX_BONUS_ROOTS][MAX_TREE_NODES]u16,
+    node_expanded: [PEARL_MAX_BONUS_ROOTS][MAX_TREE_NODES]bool,
+    batch_tokens: [MAX_TREE_NODES]u32,
+    batch_positions: [MAX_TREE_NODES]u32,
+    batch_roots: [MAX_TREE_NODES]u8,
+    batch_nodes: [MAX_TREE_NODES]u16,
+    batch_cands: [MAX_TREE_NODES * draft_mod.MAX_DRAFT_TOP_K]moe.TopKCandidate,
+
+    fn init(allocator: std.mem.Allocator, sd: *draft_mod.SmallDraftModel) InitError!*PearlRuntime {
+        const rt = try allocator.create(PearlRuntime);
+        errdefer allocator.destroy(rt);
+
+        rt.* = .{
+            .small_draft = sd,
+            .mutex = std.c.PTHREAD_MUTEX_INITIALIZER,
+            .work_cond = std.c.PTHREAD_COND_INITIALIZER,
+            .done_cond = std.c.PTHREAD_COND_INITIALIZER,
+            .state = .idle,
+            .ready = false,
+            .init_err = null,
+            .thread = undefined,
+            .job = .{},
+            .result = .{},
+            .slot_ancestor_masks = @splat(0),
+            .node_slots = @splat(@splat(tree_mod.NO_NODE)),
+            .node_expanded = @splat(@splat(false)),
+            .batch_tokens = @splat(0),
+            .batch_positions = @splat(0),
+            .batch_roots = @splat(0),
+            .batch_nodes = @splat(0),
+            .batch_cands = undefined,
+        };
+
+        rt.thread = try std.Thread.spawn(.{}, workerMain, .{rt});
+
+        // Wait for startup handshake confirming P-core USER_INTERACTIVE QoS.
+        _ = std.c.pthread_mutex_lock(&rt.mutex);
+        while (!rt.ready) {
+            _ = std.c.pthread_cond_wait(&rt.done_cond, &rt.mutex);
+        }
+        const init_err = rt.init_err;
+        _ = std.c.pthread_mutex_unlock(&rt.mutex);
+
+        if (init_err) |err| {
+            rt.thread.join();
+            _ = std.c.pthread_cond_destroy(&rt.done_cond);
+            _ = std.c.pthread_cond_destroy(&rt.work_cond);
+            _ = std.c.pthread_mutex_destroy(&rt.mutex);
+            allocator.destroy(rt);
+            return err;
+        }
+        return rt;
+    }
+
+    fn deinit(self: *PearlRuntime, allocator: std.mem.Allocator) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        while (self.state == .running) {
+            _ = std.c.pthread_cond_wait(&self.done_cond, &self.mutex);
+        }
+        self.state = .shutdown;
+        _ = std.c.pthread_cond_broadcast(&self.work_cond);
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+        self.thread.join();
+        _ = std.c.pthread_cond_destroy(&self.done_cond);
+        _ = std.c.pthread_cond_destroy(&self.work_cond);
+        _ = std.c.pthread_mutex_destroy(&self.mutex);
+        allocator.destroy(self);
+    }
+
+    fn launch(self: *PearlRuntime, job: PearlJob) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        std.debug.assert(self.state == .idle);
+        self.job = job;
+        self.result = .{};
+        self.state = .running;
+        _ = std.c.pthread_cond_signal(&self.work_cond);
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    fn collectResult(self: *PearlRuntime) PearlResult {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        while (self.state == .running) {
+            _ = std.c.pthread_cond_wait(&self.done_cond, &self.mutex);
+        }
+        const res = self.result;
+        if (self.state == .done) {
+            self.state = .idle;
+        }
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        return res;
+    }
+
+    fn waitIdle(self: *PearlRuntime) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        while (self.state == .running) {
+            _ = std.c.pthread_cond_wait(&self.done_cond, &self.mutex);
+        }
+        if (self.state == .done) {
+            self.state = .idle;
+        }
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    fn workerMain(self: *PearlRuntime) void {
+        var init_err: ?qos.Error = null;
+        if (qos.steerPerformanceCore(.user_interactive)) {} else |err| {
+            init_err = err;
+        }
+
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        self.init_err = init_err;
+        self.ready = true;
+        _ = std.c.pthread_cond_signal(&self.done_cond);
+        if (init_err != null) {
+            _ = std.c.pthread_mutex_unlock(&self.mutex);
+            return;
+        }
+
+        while (true) {
+            while (self.state != .running and self.state != .shutdown) {
+                _ = std.c.pthread_cond_wait(&self.work_cond, &self.mutex);
+            }
+            if (self.state == .shutdown) {
+                _ = std.c.pthread_mutex_unlock(&self.mutex);
+                return;
+            }
+            _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+            const t0 = vmstat.nowNs() catch 0;
+            var res: PearlResult = .{};
+            self.executeJob(&res) catch |err| {
+                res.err = err;
+            };
+            const t1 = vmstat.nowNs() catch t0;
+            res.elapsed_ns = t1 -| t0;
+
+            _ = std.c.pthread_mutex_lock(&self.mutex);
+            self.result = res;
+            if (self.state == .running) {
+                self.state = .done;
+            }
+            _ = std.c.pthread_cond_signal(&self.done_cond);
+        }
+    }
+
+    fn selectFrontierForRoot(
+        self: *PearlRuntime,
+        tree: *const tree_mod.DraftTree(MAX_TREE_NODES),
+        root_idx: usize,
+        target_depth: u16,
+        max_pick: usize,
+        allow_fallback: bool,
+        out_start: usize,
+    ) usize {
+        if (max_pick == 0) return 0;
+        var picked: usize = 0;
+        var v: u16 = 1;
+        while (v < tree.count) : (v += 1) {
+            if (self.node_expanded[root_idx][v]) continue;
+            const node = tree.nodes[v];
+            if (node.depth >= target_depth) continue;
+            if (self.node_slots[root_idx][node.parent] == tree_mod.NO_NODE) continue;
+            if (node.cum_prob < self.job.min_frontier_prob) continue;
+
+            if (picked < max_pick) {
+                self.batch_nodes[out_start + picked] = v;
+                self.batch_roots[out_start + picked] = @intCast(root_idx);
+                picked += 1;
+            } else if (node.cum_prob > tree.nodes[self.batch_nodes[out_start + picked - 1]].cum_prob) {
+                self.batch_nodes[out_start + picked - 1] = v;
+                self.batch_roots[out_start + picked - 1] = @intCast(root_idx);
+            } else {
+                continue;
+            }
+
+            var j: usize = picked - 1;
+            while (j > 0) : (j -= 1) {
+                const cur_p = tree.nodes[self.batch_nodes[out_start + j]].cum_prob;
+                const prev_p = tree.nodes[self.batch_nodes[out_start + j - 1]].cum_prob;
+                if (cur_p > prev_p) {
+                    const tmp = self.batch_nodes[out_start + j - 1];
+                    self.batch_nodes[out_start + j - 1] = self.batch_nodes[out_start + j];
+                    self.batch_nodes[out_start + j] = tmp;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if (picked == 0 and allow_fallback) {
+            var best_v: u16 = tree_mod.NO_NODE;
+            var best_p: f32 = -1.0;
+            var u: u16 = 1;
+            while (u < tree.count) : (u += 1) {
+                if (self.node_expanded[root_idx][u]) continue;
+                const node = tree.nodes[u];
+                if (node.depth >= target_depth) continue;
+                if (self.node_slots[root_idx][node.parent] == tree_mod.NO_NODE) continue;
+                if (node.cum_prob > best_p) {
+                    best_p = node.cum_prob;
+                    best_v = u;
+                }
+            }
+            if (best_v != tree_mod.NO_NODE and best_p > 0.0) {
+                self.batch_nodes[out_start] = best_v;
+                self.batch_roots[out_start] = @intCast(root_idx);
+                picked = 1;
+            }
+        }
+        return picked;
+    }
+
+    fn executeJob(self: *PearlRuntime, res: *PearlResult) qwen3.StepError!void {
+        const sd = self.small_draft;
+        const job = &self.job;
+        const eff_top_k: u32 = @min(job.top_k, sd.model.config.vocab_size);
+
+        // 1. Speculatively commit `[pending_sync_tok?, lead_tokens[0..lead_len]]` into
+        //    `small_draft`'s KV cache in ONE batched pass -> yields top-K predicted bonus tokens.
+        if (job.sync_len > 0) {
+            try sd.syncAcceptedChunked(job.sync_tokens[0..job.sync_len], job.committed_before, eff_top_k);
+        }
+        const next_base_pos = sd.seqLen();
+        res.committed_after_sync = next_base_pos;
+
+        const bonus_cands = sd.rootCandidates();
+        if (bonus_cands.len == 0 or next_base_pos + 1 >= job.max_seq_len) return;
+
+        const num_roots: usize = @min(
+            PEARL_MAX_BONUS_ROOTS,
+            @min(bonus_cands.len, @as(usize, sd.maxTreeSlots())),
+        );
+        if (num_roots == 0) return;
+
+        // 2. Step all speculated bonus root candidates (`b_0`, `b_1`) in ONE batched
+        //    `stepTreeBatch` call at slots `0..num_roots` (without committing `b_j` to KV yet).
+        @memset(&self.slot_ancestor_masks, 0);
+        for (0..num_roots) |r| {
+            const btok = bonus_cands[r].token_id;
+            res.bonus_tokens[r] = btok;
+            res.trees[r].reset(btok);
+            @memset(&self.node_slots[r], tree_mod.NO_NODE);
+            @memset(&self.node_expanded[r], false);
+            self.node_slots[r][0] = @intCast(r);
+            self.node_expanded[r][0] = true;
+            self.slot_ancestor_masks[r] = @as(u64, 1) << @as(u6, @intCast(r));
+            self.batch_tokens[r] = btok;
+            self.batch_positions[r] = next_base_pos;
+        }
+
+        const got_k0 = try sd.stepTreeBatch(
+            self.batch_tokens[0..num_roots],
+            self.batch_positions[0..num_roots],
+            self.slot_ancestor_masks[0..num_roots],
+            0,
+            eff_top_k,
+            self.batch_cands[0 .. num_roots * @as(usize, eff_top_k)],
+        );
+        for (0..num_roots) |r| {
+            const row = self.batch_cands[r * got_k0 .. (r + 1) * got_k0];
+            for (row) |cand| {
+                if (res.trees[r].count >= job.candidate_cap and
+                    res.trees[r].findChild(0, cand.token_id) == null)
+                {
+                    break;
+                }
+                _ = res.trees[r].insertChild(0, cand.token_id, cand.prob, .l2);
+            }
+        }
+        res.num_roots = @intCast(num_roots);
+
+        const max_rem_depth: u16 = @intCast(@min(
+            @as(u32, MAX_TREE_NODES - 1),
+            job.max_seq_len - 1 - next_base_pos,
+        ));
+        const target_depth: u16 = @min(job.max_draft_depth, max_rem_depth);
+        if (target_depth <= 1) return;
+
+        // 3. Expand depths `2 .. target_depth` across speculated roots concurrently
+        //    in shared batched `stepTreeBatch` calls.
+        var used_slots: u32 = @intCast(num_roots);
+        var level: u16 = 1;
+        while (level < target_depth) : (level += 1) {
+            if (used_slots >= sd.maxTreeSlots()) break;
+            const rem_slots: usize = @as(usize, sd.maxTreeSlots() - used_slots);
+
+            var picked: usize = 0;
+            if (res.trees[0].count < job.candidate_cap) {
+                const cap0 = @min(@as(usize, job.branch_width), rem_slots);
+                picked += self.selectFrontierForRoot(&res.trees[0], 0, target_depth, cap0, level == 1, 0);
+            }
+            if (num_roots > 1 and picked < rem_slots and res.trees[1].count < job.candidate_cap) {
+                const cap1 = @min(@max(@as(usize, 1), @as(usize, job.branch_width) / 2), rem_slots - picked);
+                picked += self.selectFrontierForRoot(&res.trees[1], 1, target_depth, cap1, false, picked);
+            }
+            if (picked == 0) break;
+
+            const slot_start = used_slots;
+            for (0..picked) |i| {
+                const r_idx: usize = self.batch_roots[i];
+                const v = self.batch_nodes[i];
+                const node = res.trees[r_idx].nodes[v];
+                const parent_slot = self.node_slots[r_idx][node.parent];
+                const slot_idx = slot_start + @as(u32, @intCast(i));
+                self.slot_ancestor_masks[slot_idx] =
+                    self.slot_ancestor_masks[parent_slot] | (@as(u64, 1) << @as(u6, @intCast(slot_idx)));
+                self.batch_tokens[i] = node.token_id;
+                self.batch_positions[i] = next_base_pos + node.depth;
+            }
+
+            const total_slots = slot_start + @as(u32, @intCast(picked));
+            const got_k = try sd.stepTreeBatch(
+                self.batch_tokens[0..picked],
+                self.batch_positions[0..picked],
+                self.slot_ancestor_masks[0..total_slots],
+                slot_start,
+                eff_top_k,
+                self.batch_cands[0 .. picked * @as(usize, eff_top_k)],
+            );
+
+            for (0..picked) |i| {
+                const r_idx: usize = self.batch_roots[i];
+                const v = self.batch_nodes[i];
+                const slot_idx = slot_start + @as(u32, @intCast(i));
+                self.node_slots[r_idx][v] = @intCast(slot_idx);
+                self.node_expanded[r_idx][v] = true;
+
+                const row = self.batch_cands[i * got_k .. (i + 1) * got_k];
+                for (row) |cand| {
+                    if (res.trees[r_idx].count >= job.candidate_cap and
+                        res.trees[r_idx].findChild(v, cand.token_id) == null)
+                    {
+                        break;
+                    }
+                    _ = res.trees[r_idx].insertChild(v, cand.token_id, cand.prob, .l2);
+                }
+            }
+            used_slots = total_slots;
+        }
+    }
+};
+
 pub const SpecEngine = struct {
     target: *qwen3.Qwen3Model,
     draft_head: ?*draft_mod.DraftHead,
     small_draft: ?*draft_mod.SmallDraftModel,
+    ngram_table: ?*ngram_nvme.NvmeNgramTable,
     config: SpecConfig,
     cost_model: tree_mod.PruneCostModel,
 
     sam_arena: arena_mod.WiredArena,
     sam: sam_mod.SuffixAutomaton,
+
+    // Heap-pinned persistent PEARL worker (`D8`, null when `small_draft == null` or `.off`).
+    pearl_rt: ?*PearlRuntime,
+    pearl_enabled: bool,
+    verify_us_ema: f64,
+    has_pearl_ready_tree: bool,
+    pearl_ready_tree: tree_mod.DraftTree(MAX_TREE_NODES),
+    pearl_pending_sync_len: u8,
+    pearl_pending_sync_tok: u32,
+    pearl_lead_tokens: [MAX_TREE_NODES]u32,
+    pearl_rollback_buf: [MAX_TREE_NODES + 1]u32,
 
     // Preallocated hot-path scratch buffers (zero dynamic heap allocation on `stepRound`).
     draft_tree: tree_mod.DraftTree(MAX_TREE_NODES),
@@ -221,6 +693,8 @@ pub const SpecEngine = struct {
     batch_nodes: [MAX_TREE_NODES]u16,
     batch_cands: [MAX_TREE_NODES * draft_mod.MAX_DRAFT_TOP_K]moe.TopKCandidate,
     l1_buf: [MAX_TREE_NODES]u32,
+    ngram_buf: [MAX_TREE_NODES]u32,
+    prefetch_tail_buf: [ngram_nvme.MAX_CTX_LEN]u32,
     shifted_tokens: [MAX_TREE_NODES]u32,
     p_res: []f32,
 
@@ -239,7 +713,8 @@ pub const SpecEngine = struct {
     }
 
     /// Initializes `SpecEngine` paired with a standalone same-family small draft
-    /// model (`D4`, e.g. `Qwen3-0.6B` with `Qwen3-14B-4bit`).
+    /// model (`D4`, e.g. `Qwen3-0.6B` with `Qwen3-14B-4bit`) and optional `D8`
+    /// PEARL async pipelining worker thread.
     pub fn initWithSmallDraft(
         allocator: std.mem.Allocator,
         target: *qwen3.Qwen3Model,
@@ -247,6 +722,20 @@ pub const SpecEngine = struct {
         config: SpecConfig,
     ) InitError!SpecEngine {
         return initInternal(allocator, target, null, small_draft, config);
+    }
+
+    fn computeInitialPearlEnabled(
+        config: SpecConfig,
+        small_draft: ?*draft_mod.SmallDraftModel,
+        cost: tree_mod.PruneCostModel,
+    ) bool {
+        const sd = small_draft orelse return false;
+        if (!sd.hasOwnComputeQueue()) return false;
+        return switch (config.pearl_mode) {
+            .off => false,
+            .on => true,
+            .auto => @as(f64, cost.t_fixed_us) >= config.pearl_min_target_us,
+        };
     }
 
     fn initInternal(
@@ -264,6 +753,7 @@ pub const SpecEngine = struct {
         if (config.top_k_per_node == 0 or config.top_k_per_node > draft_mod.MAX_DRAFT_TOP_K) return error.InvalidConfig;
         if (config.l1_max_draft >= MAX_TREE_NODES) return error.InvalidConfig;
         if (!std.math.isFinite(config.temperature) or config.temperature < 0.0) return error.InvalidConfig;
+        if (!std.math.isFinite(config.pearl_min_target_us) or config.pearl_min_target_us < 0.0) return error.InvalidConfig;
 
         switch (config.mode) {
             .l1_only => {},
@@ -315,14 +805,36 @@ pub const SpecEngine = struct {
 
         const cost = config.cost_model orelse defaultCostModelForTarget(target);
 
+        var pearl_rt: ?*PearlRuntime = null;
+        if (small_draft) |sd| {
+            if (config.pearl_mode != .off and sd.hasOwnComputeQueue()) {
+                pearl_rt = try PearlRuntime.init(allocator, sd);
+            }
+        }
+        errdefer if (pearl_rt) |prt| prt.deinit(allocator);
+
+        const pearl_enabled = computeInitialPearlEnabled(config, small_draft, cost);
+        var stats: SpecStats = .{};
+        stats.pearl_enabled = pearl_enabled;
+
         return .{
             .target = target,
             .draft_head = draft_head,
             .small_draft = small_draft,
+            .ngram_table = config.ngram_table,
             .config = config,
             .cost_model = cost,
             .sam_arena = sam_arena,
             .sam = sam,
+            .pearl_rt = pearl_rt,
+            .pearl_enabled = pearl_enabled,
+            .verify_us_ema = 0.0,
+            .has_pearl_ready_tree = false,
+            .pearl_ready_tree = tree_mod.DraftTree(MAX_TREE_NODES).init(0),
+            .pearl_pending_sync_len = 0,
+            .pearl_pending_sync_tok = 0,
+            .pearl_lead_tokens = @splat(0),
+            .pearl_rollback_buf = @splat(0),
             .draft_tree = tree_mod.DraftTree(MAX_TREE_NODES).init(0),
             .eval_tree = tree_mod.DraftTree(MAX_TREE_NODES).init(0),
             .tree_slot_of_node = @splat(tree_mod.NO_NODE),
@@ -340,29 +852,46 @@ pub const SpecEngine = struct {
             .batch_nodes = @splat(0),
             .batch_cands = undefined,
             .l1_buf = @splat(0),
+            .ngram_buf = @splat(0),
+            .prefetch_tail_buf = @splat(0),
             .shifted_tokens = @splat(0),
             .p_res = p_res,
             .next_pos = 0,
             .last_token = 0,
             .has_prefilled = false,
-            .stats = .{},
+            .stats = stats,
         };
     }
 
     pub fn deinit(self: *SpecEngine, allocator: std.mem.Allocator) void {
+        if (self.pearl_rt) |prt| {
+            prt.deinit(allocator);
+            self.pearl_rt = null;
+        }
         allocator.free(self.p_res);
         self.sam_arena.deinit();
     }
 
+    pub fn setNgramTable(self: *SpecEngine, tbl: ?*ngram_nvme.NvmeNgramTable) void {
+        self.ngram_table = tbl;
+    }
+
     pub fn reset(self: *SpecEngine) void {
+        if (self.pearl_rt) |prt| prt.waitIdle();
         self.target.seq_len = 0;
         if (self.draft_head) |dh| dh.reset();
         if (self.small_draft) |sd| sd.reset();
         self.sam.reset();
+        self.has_pearl_ready_tree = false;
+        self.pearl_pending_sync_len = 0;
+        self.pearl_pending_sync_tok = 0;
+        self.verify_us_ema = 0.0;
+        self.pearl_enabled = computeInitialPearlEnabled(self.config, self.small_draft, self.cost_model);
         self.next_pos = 0;
         self.last_token = 0;
         self.has_prefilled = false;
         self.stats = .{};
+        self.stats.pearl_enabled = self.pearl_enabled;
     }
 
     pub fn totalWiredBytes(self: *const SpecEngine) u64 {
@@ -372,7 +901,8 @@ pub const SpecEngine = struct {
             sd.totalWiredBytes()
         else
             0;
-        return self.target.total_wired_bytes + draft_bytes + self.sam_arena.bytes().len;
+        const ngram_bytes: u64 = if (self.ngram_table) |nt| nt.totalWiredBytes() else 0;
+        return self.target.total_wired_bytes + draft_bytes + self.sam_arena.bytes().len + ngram_bytes;
     }
 
     pub fn effectivePlacement(self: *const SpecEngine) draft_mod.Placement {
@@ -481,6 +1011,11 @@ pub const SpecEngine = struct {
             };
         }
 
+        // C6: Asynchronously prefetch the first round's `.ang` context bucket page.
+        if (self.ngram_table) |nt| {
+            _ = try nt.prefetch(self.sam.historySlice());
+        }
+
         // Prefill standalone same-family small draft model (`D4`, zero target hidden-state dep).
         if (self.small_draft) |sd| {
             try sd.prefillAndSeedRoot(prompt_tokens, first_tok, self.config.top_k_per_node);
@@ -493,13 +1028,35 @@ pub const SpecEngine = struct {
         return first_tok;
     }
 
+    /// Builds up to `MAX_CTX_LEN` tail tokens combining `sam.historySlice()` and
+    /// `extra_tokens` for speculative C6 NVMe N-gram prefetching (zero heap alloc).
+    fn buildPrefetchTail(self: *SpecEngine, extra_tokens: []const u32) []const u32 {
+        const hist = self.sam.historySlice();
+        const total = hist.len + extra_tokens.len;
+        const need: usize = @min(total, ngram_nvme.MAX_CTX_LEN);
+        if (need == 0) return &.{};
+        const from_extra: usize = @min(extra_tokens.len, need);
+        const from_hist: usize = need - from_extra;
+        if (from_hist > 0) {
+            @memcpy(self.prefetch_tail_buf[0..from_hist], hist[hist.len - from_hist .. hist.len]);
+        }
+        if (from_extra > 0) {
+            @memcpy(
+                self.prefetch_tail_buf[from_hist..need],
+                extra_tokens[extra_tokens.len - from_extra .. extra_tokens.len],
+            );
+        }
+        return self.prefetch_tail_buf[0..need];
+    }
+
     /// Executes one full speculative decode round with zero dynamic heap allocation:
-    /// 1) L1 Suffix Automaton query (`D1`, `D6`),
-    /// 2) L2 dynamic EAGLE-2/3/MTP expansion with per-level D7 early stopping (`D2`, `D3`, `D5`),
+    /// 1) L1 Suffix Automaton (`D1`, `D6`) + optional C6 NVMe `.ang` query when SAM `< 4`,
+    /// 2) L2 dynamic EAGLE-2/3/MTP / SmallDraft expansion (or zero-wait D8 PEARL reuse),
     /// 3) D7 expert-byte-budget submodular pruning (`D7`),
-    /// 4) L3 GPU tree-attention verification (`G5`),
+    /// 4) L3 GPU tree-attention verification (`G5`) overlapped with C6 NVMe prefetch &
+    ///    D8 PEARL round-`r+1` pre-drafting on `small_draft`'s independent compute queue,
     /// 5) Lossless greedy (`T = 0`) or stochastic (`T > 0`) acceptance (`D9`),
-    /// 6) Target KV commit + L1 SAM update + L2 draft KV/feature sync.
+    /// 6) Target KV commit + L1 SAM update + L2 draft KV/feature sync or PEARL hit/O(1) rollback.
     ///
     /// Writes `1..=min(out_tokens.len, max_tree_nodes)` newly generated tokens into
     /// `out_tokens[0..summary.emitted_count]`.
@@ -533,30 +1090,107 @@ pub const SpecEngine = struct {
 
         const t_draft_start = std.Io.Timestamp.now(std.Options.debug_io, .awake);
 
-        // Reset draft tree to root node `0` = `last_token`.
-        self.draft_tree.reset(self.last_token);
+        // Adopt pre-drafted D8 PEARL tree if available, otherwise reset tree to root `0` = `last_token`.
+        var used_pearl_tree = false;
+        if (self.has_pearl_ready_tree and self.pearl_ready_tree.nodes[0].token_id == self.last_token) {
+            self.draft_tree.copyTruncatedFrom(&self.pearl_ready_tree, max_allowed_depth, candidate_cap);
+            self.has_pearl_ready_tree = false;
+            used_pearl_tree = true;
+        } else {
+            self.has_pearl_ready_tree = false;
+            self.draft_tree.reset(self.last_token);
+        }
         @memset(&self.tree_slot_of_node, tree_mod.NO_NODE);
         @memset(&self.slot_expanded, false);
         @memset(&self.slot_ancestor_masks, 0);
         self.tree_slot_of_node[0] = 0; // root hidden lives in draft `hidden_pool[0]`
         self.slot_expanded[0] = true;
 
-        // 1. L1 Suffix Automaton query (`D1`, `D6`, ADR-0005).
+        // 1. L1 Suffix Automaton (`D1`, `D6`, ADR-0005) + C6 NVMe N-gram fallback when SAM `< 4`.
         const l1_cap: usize = @min(
             @as(usize, self.config.l1_max_draft),
             @min(@as(usize, max_allowed_depth), @as(usize, candidate_cap - 1)),
         );
-        const l1_q = if (l1_cap > 0)
+        const sam_q = if (l1_cap > 0)
             self.sam.queryActive(l1_cap, self.l1_buf[0..l1_cap])
         else
             sam_mod.QueryResult{ .match_len = 0, .draft_len = 0, .is_seed = false };
 
-        const l1_res = self.draft_tree.insertL1Continuation(
-            l1_q.match_len,
-            self.l1_buf[0..l1_q.draft_len],
-            self.config.l1_seed_step_prob,
-            self.config.l1_branch_step_prob,
-        );
+        var effective_l1_match_len: u32 = sam_q.match_len;
+        var ngram_match_len: u32 = 0;
+        var l1_res: tree_mod.InsertL1Result = .{
+            .inserted_count = 0,
+            .chain_len = 0,
+            .seed_tail_node = 0,
+            .is_seed = false,
+        };
+
+        if (l1_cap > 0 and sam_q.match_len < sam_mod.SEED_MIN_MATCH_LEN and self.ngram_table != null) {
+            const nt = self.ngram_table.?;
+            const reads_before = nt.stats.nvme_reads;
+            const nq = try nt.query(self.sam.historySlice(), self.ngram_buf[0..l1_cap]);
+            self.stats.ngram_queries += 1;
+            self.stats.ngram_nvme_reads += nt.stats.nvme_reads -| reads_before;
+            if (nq.cache_hit) self.stats.ngram_cache_hits += 1;
+
+            if (nq.draft_len > 0) {
+                ngram_match_len = nq.match_len;
+                self.stats.ngram_hits += 1;
+                if (nq.is_seed) self.stats.ngram_seed_hits += 1;
+
+                const ngram_seed_prob: f32 = @max(
+                    self.config.l1_branch_step_prob,
+                    self.config.l1_seed_step_prob * @max(@as(f32, 0.75), nq.step_prob),
+                );
+                const ngram_branch_prob: f32 = self.config.l1_branch_step_prob * @max(@as(f32, 0.5), nq.step_prob);
+
+                if (nq.match_len > sam_q.match_len) {
+                    l1_res = self.draft_tree.insertL1Continuation(
+                        nq.match_len,
+                        self.ngram_buf[0..nq.draft_len],
+                        ngram_seed_prob,
+                        ngram_branch_prob,
+                    );
+                    effective_l1_match_len = nq.match_len;
+                    if (sam_q.draft_len > 0) {
+                        _ = self.draft_tree.insertL1Continuation(
+                            sam_q.match_len,
+                            self.l1_buf[0..sam_q.draft_len],
+                            self.config.l1_seed_step_prob,
+                            self.config.l1_branch_step_prob,
+                        );
+                    }
+                } else {
+                    l1_res = self.draft_tree.insertL1Continuation(
+                        sam_q.match_len,
+                        self.l1_buf[0..sam_q.draft_len],
+                        self.config.l1_seed_step_prob,
+                        self.config.l1_branch_step_prob,
+                    );
+                    _ = self.draft_tree.insertL1Continuation(
+                        nq.match_len,
+                        self.ngram_buf[0..nq.draft_len],
+                        ngram_seed_prob,
+                        ngram_branch_prob,
+                    );
+                }
+            } else {
+                l1_res = self.draft_tree.insertL1Continuation(
+                    sam_q.match_len,
+                    self.l1_buf[0..sam_q.draft_len],
+                    self.config.l1_seed_step_prob,
+                    self.config.l1_branch_step_prob,
+                );
+            }
+        } else {
+            l1_res = self.draft_tree.insertL1Continuation(
+                sam_q.match_len,
+                self.l1_buf[0..sam_q.draft_len],
+                self.config.l1_seed_step_prob,
+                self.config.l1_branch_step_prob,
+            );
+        }
+
         if (l1_res.is_seed) {
             self.stats.l1_seed_rounds += 1;
         } else if (l1_res.chain_len > 0) {
@@ -564,29 +1198,33 @@ pub const SpecEngine = struct {
         }
 
         // 2. L2 Draft Head or D4 Small Draft Model dynamic tree expansion (`D2`-`D7`).
-        if (self.draft_head) |dh| {
-            if (max_allowed_depth >= 1 and candidate_cap > 1) {
-                try self.expandWithDraftHead(
-                    dh,
-                    base_pos,
-                    max_allowed_depth,
-                    candidate_cap,
-                    hard_cap,
-                    l1_res,
-                    t_draft_start,
-                );
-            }
-        } else if (self.small_draft) |sd| {
-            if (max_allowed_depth >= 1 and candidate_cap > 1) {
-                try self.expandWithSmallDraft(
-                    sd,
-                    base_pos,
-                    max_allowed_depth,
-                    candidate_cap,
-                    hard_cap,
-                    l1_res,
-                    t_draft_start,
-                );
+        //    When D8 PEARL already pre-drafted `draft_tree` during the prior round's
+        //    `verifyTree`, skip synchronous small-draft expansion completely!
+        if (!used_pearl_tree) {
+            if (self.draft_head) |dh| {
+                if (max_allowed_depth >= 1 and candidate_cap > 1) {
+                    try self.expandWithDraftHead(
+                        dh,
+                        base_pos,
+                        max_allowed_depth,
+                        candidate_cap,
+                        hard_cap,
+                        l1_res,
+                        t_draft_start,
+                    );
+                }
+            } else if (self.small_draft) |sd| {
+                if (max_allowed_depth >= 1 and candidate_cap > 1) {
+                    try self.expandWithSmallDraft(
+                        sd,
+                        base_pos,
+                        max_allowed_depth,
+                        candidate_cap,
+                        hard_cap,
+                        l1_res,
+                        t_draft_start,
+                    );
+                }
             }
         }
 
@@ -594,7 +1232,7 @@ pub const SpecEngine = struct {
         const draft_ns: u64 = @intCast(@max(@as(i96, 0), t_draft_start.durationTo(t_draft_end).toNanoseconds()));
         const drafted_nodes: u16 = self.draft_tree.count;
 
-        // 3. Final D7 expert-byte-budget submodular pruning (`ADR-0009`).
+        // 3. Final D7 expert-byte-budget submodular pruning (`ADR-0009`, `ADR-0017`).
         const t_prune_start = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         if (self.config.enable_pruning and self.draft_tree.count > 1) {
             const draft_us: f32 = @floatCast(@as(f64, @floatFromInt(draft_ns)) / 1000.0);
@@ -602,6 +1240,66 @@ pub const SpecEngine = struct {
         }
         const t_prune_end = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         const prune_ns: u64 = @intCast(@max(@as(i96, 0), t_prune_start.durationTo(t_prune_end).toNanoseconds()));
+
+        // Extract highest-probability lead path of pruned `T_r` for C6 prefetch and D8 PEARL.
+        const lead_len: u16 = self.draft_tree.highestProbPath(null, &self.pearl_lead_tokens);
+
+        // C6: Overlapped background NVMe prefetch of the predicted next-round context page.
+        if (self.ngram_table) |nt| {
+            const pred_tail = self.buildPrefetchTail(self.pearl_lead_tokens[0..lead_len]);
+            if (pred_tail.len >= nt.header.min_ngram) {
+                _ = try nt.prefetch(pred_tail);
+            }
+        }
+
+        // D8 PEARL: Launch asynchronous round-`r+1` pre-drafting on `small_draft`'s
+        // independent Metal 4 queue right before `target.verifyTree(T_r)`!
+        var pearl_launched = false;
+        errdefer if (pearl_launched) {
+            if (self.pearl_rt) |prt| prt.waitIdle();
+        };
+        if (self.pearl_enabled) {
+            if (self.pearl_rt) |prt| {
+                if (self.small_draft) |sd| {
+                    const committed_before = sd.seqLen();
+                    const sync_len: usize = @as(usize, self.pearl_pending_sync_len) + @as(usize, lead_len);
+                    const next_base_pos: u32 = base_pos + 1 + @as(u32, lead_len);
+                    if (next_base_pos < max_seq and
+                        committed_before + sync_len <= sd.maxSeqLen() and
+                        sync_len <= MAX_TREE_NODES)
+                    {
+                        var job: PearlJob = .{
+                            .base_pos = base_pos,
+                            .committed_before = committed_before,
+                            .pending_sync_len = self.pearl_pending_sync_len,
+                            .pending_sync_tok = self.pearl_pending_sync_tok,
+                            .lead_len = lead_len,
+                            .sync_len = @intCast(sync_len),
+                            .max_draft_depth = self.config.max_draft_depth,
+                            .branch_width = self.config.branch_width,
+                            .top_k = self.config.top_k_per_node,
+                            .min_frontier_prob = self.config.min_frontier_prob,
+                            .candidate_cap = candidate_cap,
+                            .max_seq_len = max_seq,
+                        };
+                        if (lead_len > 0) {
+                            @memcpy(job.lead_tokens[0..lead_len], self.pearl_lead_tokens[0..lead_len]);
+                        }
+                        var s_idx: usize = 0;
+                        if (self.pearl_pending_sync_len > 0) {
+                            job.sync_tokens[0] = self.pearl_pending_sync_tok;
+                            s_idx = 1;
+                        }
+                        if (lead_len > 0) {
+                            @memcpy(job.sync_tokens[s_idx .. s_idx + lead_len], self.pearl_lead_tokens[0..lead_len]);
+                        }
+                        prt.launch(job);
+                        pearl_launched = true;
+                        self.stats.pearl_rounds += 1;
+                    }
+                }
+            }
+        }
 
         // 4. L3 GPU Tree Verification (`G5`).
         const t_verify_start = std.Io.Timestamp.now(std.Options.debug_io, .awake);
@@ -644,7 +1342,7 @@ pub const SpecEngine = struct {
                 out_tokens,
             );
 
-        // 6. Commit accepted target KV + gather target features + advance L1 SAM + sync L2 DraftHead.
+        // 6. Commit accepted target KV + advance L1 SAM + sync L2 DraftHead / D8 PEARL resolve.
         const t_commit_start = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         const emitted = out_tokens[0..acc.emitted_token_count];
 
@@ -658,6 +1356,12 @@ pub const SpecEngine = struct {
             }
         }
 
+        // C6: Prefetch actual committed context tail if it diverged from speculated tail.
+        if (self.ngram_table) |nt| {
+            _ = try nt.prefetch(self.sam.historySlice());
+        }
+
+        var round_pearl_hit = false;
         if (self.draft_head) |dh| {
             const top_k: u32 = if (base_pos + acc.emitted_token_count < max_seq)
                 self.config.top_k_per_node
@@ -670,16 +1374,112 @@ pub const SpecEngine = struct {
                 base_pos,
                 top_k,
             );
+        } else if (pearl_launched) {
+            const prt = self.pearl_rt.?;
+            const pres = prt.collectResult();
+            pearl_launched = false;
+            self.stats.pearl_worker_ns += pres.elapsed_ns;
+            if (pres.err) |err| return err;
+
+            if (base_pos + acc.emitted_token_count < max_seq) {
+                const path_matched = (acc.draft_accepted == lead_len) and
+                    std.mem.eql(u32, emitted[0..lead_len], self.pearl_lead_tokens[0..lead_len]);
+                var matched_root: ?usize = null;
+                if (path_matched) {
+                    for (0..pres.num_roots) |r_idx| {
+                        if (pres.bonus_tokens[r_idx] == acc.bonus_token) {
+                            matched_root = r_idx;
+                            break;
+                        }
+                    }
+                }
+
+                if (matched_root) |r_idx| {
+                    // Full PEARL hit: reuse pre-drafted `T_{r+1}` directly on the next round!
+                    self.pearl_ready_tree = pres.trees[r_idx];
+                    self.has_pearl_ready_tree = true;
+                    self.pearl_pending_sync_len = 1;
+                    self.pearl_pending_sync_tok = acc.bonus_token;
+                    self.stats.pearl_hits += 1;
+                    self.stats.pearl_saved_ns += @min(verify_ns, pres.elapsed_ns);
+                    round_pearl_hit = true;
+                } else {
+                    // O(1) PEARL rollback with causal KV prefix reuse!
+                    const sd = self.small_draft.?;
+                    const committed_before = prt.job.committed_before;
+                    const spec_committed = prt.job.sync_tokens[0..prt.job.sync_len];
+
+                    var needed_len: usize = 0;
+                    if (prt.job.pending_sync_len > 0) {
+                        self.pearl_rollback_buf[0] = prt.job.pending_sync_tok;
+                        needed_len = 1;
+                    }
+                    @memcpy(self.pearl_rollback_buf[needed_len .. needed_len + emitted.len], emitted);
+                    needed_len += emitted.len;
+
+                    const max_prefix = @min(spec_committed.len, needed_len);
+                    var matched_prefix: usize = 0;
+                    while (matched_prefix < max_prefix and
+                        spec_committed[matched_prefix] == self.pearl_rollback_buf[matched_prefix])
+                    {
+                        matched_prefix += 1;
+                    }
+                    // Keep at least the final bonus token to sync so `sd.rootCandidates()` is refreshed.
+                    if (matched_prefix == needed_len and matched_prefix > 0) {
+                        matched_prefix -= 1;
+                    }
+
+                    const rewind_pos: u32 = committed_before + @as(u32, @intCast(matched_prefix));
+                    sd.rewindKvLen(rewind_pos) catch unreachable;
+                    try sd.syncAcceptedChunked(
+                        self.pearl_rollback_buf[matched_prefix..needed_len],
+                        rewind_pos,
+                        self.config.top_k_per_node,
+                    );
+                    self.pearl_pending_sync_len = 0;
+                    self.has_pearl_ready_tree = false;
+                    self.stats.pearl_rollbacks += 1;
+                    if (matched_prefix > prt.job.pending_sync_len) {
+                        self.stats.pearl_partial_prefix_hits += 1;
+                    }
+                }
+            } else {
+                self.pearl_pending_sync_len = 0;
+                self.has_pearl_ready_tree = false;
+            }
         } else if (self.small_draft) |sd| {
             if (base_pos + acc.emitted_token_count < max_seq) {
-                try sd.syncAccepted(emitted, base_pos + 1, self.config.top_k_per_node);
+                if (self.pearl_pending_sync_len > 0) {
+                    self.pearl_rollback_buf[0] = self.pearl_pending_sync_tok;
+                    @memcpy(self.pearl_rollback_buf[1 .. 1 + emitted.len], emitted);
+                    try sd.syncAcceptedChunked(
+                        self.pearl_rollback_buf[0 .. 1 + emitted.len],
+                        base_pos,
+                        self.config.top_k_per_node,
+                    );
+                    self.pearl_pending_sync_len = 0;
+                } else {
+                    try sd.syncAcceptedChunked(emitted, base_pos + 1, self.config.top_k_per_node);
+                }
+            } else {
+                self.pearl_pending_sync_len = 0;
             }
         }
 
         const t_commit_end = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         const commit_sync_ns: u64 = @intCast(@max(@as(i96, 0), t_commit_start.durationTo(t_commit_end).toNanoseconds()));
 
-        // 7. Advance sequence state and accumulate round telemetry.
+        // 7. Advance sequence state, update D8 `.auto` target-latency gate, and record telemetry.
+        const verify_us: f64 = @as(f64, @floatFromInt(verify_ns)) / 1000.0;
+        self.verify_us_ema = if (self.stats.rounds == 0)
+            verify_us
+        else
+            (0.7 * self.verify_us_ema + 0.3 * verify_us);
+        if (self.config.pearl_mode == .auto and self.pearl_rt != null) {
+            self.pearl_enabled = (self.verify_us_ema >= self.config.pearl_min_target_us);
+            self.stats.pearl_enabled = self.pearl_enabled;
+        }
+
         self.next_pos = base_pos + acc.emitted_token_count;
         self.last_token = acc.bonus_token;
 
@@ -705,10 +1505,12 @@ pub const SpecEngine = struct {
             .draft_accepted = acc.draft_accepted,
             .drafted_nodes = drafted_nodes,
             .verified_nodes = verified_nodes,
-            .l1_match_len = l1_q.match_len,
+            .l1_match_len = effective_l1_match_len,
             .l1_is_seed = l1_res.is_seed,
             .avg_unique_experts_per_layer = vr.avg_unique_experts_per_layer,
             .actual_bytes_moved = vr.actual_bytes_moved,
+            .ngram_match_len = ngram_match_len,
+            .pearl_hit = used_pearl_tree or round_pearl_hit,
         };
     }
 
@@ -1739,4 +2541,383 @@ test "M4.5 D11 SpecEngine Secure Enclave TRNG seeds replay bit-exact with explic
         p2 += rs.emitted_count;
     }
     try std.testing.expectEqualSlices(u32, &out_hw, &out_replay);
+}
+
+test {
+    _ = ngram_nvme;
+}
+
+test "M5 C6 SpecEngine with F_NOCACHE NvmeNgramTable produces seed hits and 100% bit-exact T=0 tokens" {
+    const allocator = std.testing.allocator;
+    const cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 64,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .tie_word_embeddings = true,
+    };
+    const image = try qwen3.buildSyntheticAmfImageWithSpec(allocator, cfg, .{
+        .linear_dtype = .bf16,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+    }, 0xC6_0001);
+    defer allocator.free(image);
+
+    // Strictly unique prompt tokens (zero in-context SAM matches!).
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6 };
+
+    // 1. Reference sequential greedy decode (`T = 0`).
+    var ref = try qwen3.Qwen3Model.loadFromBytes(allocator, image, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 8,
+    });
+    defer ref.deinit(allocator);
+
+    var expected: [14]u32 = undefined;
+    for (prompt[0 .. prompt.len - 1], 0..) |tok, i| try ref.prefillToken(tok, @intCast(i));
+    expected[0] = try ref.stepDecode(prompt[prompt.len - 1], @intCast(prompt.len - 1));
+    for (1..expected.len) |s| {
+        expected[s] = try ref.stepDecode(expected[s - 1], @intCast(prompt.len - 1 + s));
+    }
+
+    // 2. Build an `.ang` v1 table on `/Volumes/Akari/.tmp` indexing the corpus continuation
+    //    after `[prompt[3], prompt[4], prompt[5], expected[0]]` -> `expected[1..9]` plus a second hop!
+    const tmp_ang: [:0]const u8 = "/Volumes/Akari/.tmp/aminfer-test-m5-c6-engine.ang";
+    defer _ = std.c.unlink(tmp_ang.ptr);
+
+    const ctx1 = [_]u32{ prompt[3], prompt[4], prompt[5], expected[0] };
+    const ctx2 = [_]u32{ expected[5], expected[6], expected[7], expected[8] };
+    const entries = [_]ngram_nvme.BuildEntry{
+        .{ .ctx = &ctx1, .cont = expected[1..9], .hit_count = 30, .step_prob = 0.95 },
+        .{ .ctx = &ctx2, .cont = expected[9..14], .hit_count = 20, .step_prob = 0.92 },
+    };
+    try ngram_nvme.writeTableFile(allocator, tmp_ang, &entries, .{
+        .num_buckets = 16,
+        .vocab_size = cfg.vocab_size,
+        .corpus_id = "m5-c6-engine-test",
+        .include_table_crc = true,
+    });
+
+    var tbl = try ngram_nvme.NvmeNgramTable.open(allocator, tmp_ang, .{
+        .cache_pages = 8,
+        .max_inflight = 2,
+        .io_backend = .kqueue_aio,
+        .verify_table_crc = true,
+    });
+    defer tbl.deinit(allocator);
+
+    // 3. Run SpecEngine WITH `.ang` table attached (`l1_only`, `T = 0`).
+    var tgt = try qwen3.Qwen3Model.loadFromBytes(allocator, image, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 8,
+        .max_tree_nodes = 16,
+    });
+    defer tgt.deinit(allocator);
+
+    var eng = try SpecEngine.init(allocator, &tgt, null, .{
+        .mode = .l1_only,
+        .max_tree_nodes = 12,
+        .l1_max_draft = 8,
+        .temperature = 0.0,
+        .enable_pruning = true,
+        .ngram_table = &tbl,
+    });
+    defer eng.deinit(allocator);
+
+    var actual: [14]u32 = undefined;
+    actual[0] = try eng.prefill(&prompt, null);
+    var prod: usize = 1;
+    while (prod < actual.len) {
+        const rs = try eng.stepRound(null, actual[prod..]);
+        prod += rs.emitted_count;
+    }
+
+    try std.testing.expectEqualSlices(u32, &expected, &actual);
+    try std.testing.expect(eng.stats.ngram_queries > 0);
+    try std.testing.expect(eng.stats.ngram_hits > 0);
+    try std.testing.expect(eng.stats.ngram_seed_hits > 0);
+    try std.testing.expect(eng.stats.draft_accepted >= 6);
+    try std.testing.expect(eng.stats.meanAcceptanceLength() > 2.0);
+    try std.testing.expect(tbl.stats.prefetch_submitted > 0);
+
+    // Optional cross-language Python `ngram.py` -> Zig `NvmeNgramTable` verification
+    // when invoked with `AMINFER_TEST_PYTHON_ANG=/path/to/python_built.ang`
+    // containing `[100, 101, 102, 103] -> [104, 105, 106, 107]`.
+    if (std.c.getenv("AMINFER_TEST_PYTHON_ANG")) |env_ptr| {
+        const py_path: [:0]const u8 = std.mem.span(env_ptr);
+        const py_hdr = try ngram_nvme.verifyFile(allocator, py_path);
+        try std.testing.expect(py_hdr.total_entries > 0);
+        try std.testing.expect(py_hdr.hasTableCrc());
+
+        var py_tbl = try ngram_nvme.NvmeNgramTable.open(allocator, py_path, .{
+            .cache_pages = 8,
+            .max_inflight = 2,
+            .io_backend = .kqueue_aio,
+            .verify_table_crc = true,
+        });
+        defer py_tbl.deinit(allocator);
+
+        var py_out: [8]u32 = undefined;
+        const py_q = try py_tbl.query(&[_]u32{ 100, 101, 102, 103 }, &py_out);
+        try std.testing.expectEqual(@as(u32, 4), py_q.match_len);
+        try std.testing.expect(py_q.is_seed);
+        try std.testing.expectEqualSlices(u32, &[_]u32{ 104, 105, 106, 107 }, py_out[0..py_q.draft_len]);
+    }
+}
+
+test "M5 D8 PEARL async pipelined SmallDraft matches pearl=off and stepDecode 100% bit-for-bit across hits, rollbacks, auto gate, and T>0" {
+    const allocator = std.testing.allocator;
+
+    const dense_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .vocab_size = 64,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1_000_000.0,
+        .max_position_embeddings = 64,
+        .tie_word_embeddings = false,
+    };
+    const draft_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .vocab_size = 64,
+        .hidden_size = 64,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1_000_000.0,
+        .max_position_embeddings = 64,
+        .tie_word_embeddings = false,
+    };
+
+    const tgt_bytes = try qwen3.buildSyntheticAmfImageWithSpec(allocator, dense_cfg, .{
+        .linear_dtype = .bf16,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+    }, 0xD800_0001);
+    defer allocator.free(tgt_bytes);
+
+    const small_bytes = try qwen3.buildSyntheticAmfImageWithSpec(allocator, draft_cfg, .{
+        .linear_dtype = .bf16,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+    }, 0xD800_0002);
+    defer allocator.free(small_bytes);
+
+    const prompt = [_]u32{ 3, 8, 15, 22, 29, 36 };
+
+    // Reference sequential greedy decode (`T = 0`).
+    var ref = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_bytes, dense_cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 8,
+    });
+    defer ref.deinit(allocator);
+    var expected: [16]u32 = undefined;
+    for (prompt[0 .. prompt.len - 1], 0..) |tok, i| try ref.prefillToken(tok, @intCast(i));
+    expected[0] = try ref.stepDecode(prompt[prompt.len - 1], @intCast(prompt.len - 1));
+    for (1..expected.len) |s| {
+        expected[s] = try ref.stepDecode(expected[s - 1], @intCast(prompt.len - 1 + s));
+    }
+
+    // 1. Self-draft PEARL `on` vs `off`: exercises full PEARL speculation hits (`pearl_hits > 0`, `pearl_saved_ns > 0`).
+    {
+        var spec_tgt = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_bytes, dense_cfg, .{
+            .max_seq_len = 64,
+            .chunk_tokens = 8,
+            .max_tree_nodes = 16,
+        });
+        defer spec_tgt.deinit(allocator);
+
+        var sd = try draft_mod.SmallDraftModel.loadFromBytes(allocator, &spec_tgt, tgt_bytes, dense_cfg, .{
+            .placement = .gpu,
+            .max_seq_len = 64,
+            .chunk_tokens = 8,
+            .max_tree_slots = 16,
+            .own_compute_queue = true,
+        });
+        defer sd.deinit(allocator);
+
+        // 1a. PEARL off baseline
+        var eng_off = try SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .branch_width = 2,
+            .top_k_per_node = 3,
+            .temperature = 0.0,
+            .enable_pruning = true,
+            .pearl_mode = .off,
+        });
+        defer eng_off.deinit(allocator);
+        try std.testing.expect(!eng_off.stats.pearl_enabled);
+
+        var out_off: [16]u32 = undefined;
+        out_off[0] = try eng_off.prefill(&prompt, null);
+        var p_off: usize = 1;
+        while (p_off < out_off.len) {
+            const rs = try eng_off.stepRound(null, out_off[p_off..]);
+            p_off += rs.emitted_count;
+        }
+        try std.testing.expectEqualSlices(u32, &expected, &out_off);
+        try std.testing.expectEqual(@as(u64, 0), eng_off.stats.pearl_rounds);
+
+        // 1b. PEARL on (true concurrent hardware overlap!)
+        var eng_on = try SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .branch_width = 2,
+            .top_k_per_node = 3,
+            .temperature = 0.0,
+            .enable_pruning = false,
+            .pearl_mode = .on,
+        });
+        defer eng_on.deinit(allocator);
+        try std.testing.expect(eng_on.stats.pearl_enabled);
+
+        var out_on: [16]u32 = undefined;
+        out_on[0] = try eng_on.prefill(&prompt, null);
+        var p_on: usize = 1;
+        while (p_on < out_on.len) {
+            const rs = try eng_on.stepRound(null, out_on[p_on..]);
+            p_on += rs.emitted_count;
+        }
+        try std.testing.expectEqualSlices(u32, &expected, &out_on);
+        try std.testing.expectEqualSlices(u32, &out_off, &out_on);
+        try std.testing.expect(eng_on.stats.pearl_rounds > 0);
+        try std.testing.expect(eng_on.stats.pearl_hits > 0);
+        try std.testing.expect(eng_on.stats.pearl_saved_ns > 0);
+        try std.testing.expect(eng_on.stats.meanAcceptanceLength() > 2.0);
+    }
+
+    // 2. Distinct small draft PEARL `on`: exercises O(1) rollback path (`pearl_rollbacks > 0`)
+    //    AND `.auto` target-latency gate (`40 ms` default stays off on fast synthetic target,
+    //    low threshold gates on dynamically!) + `T = 0.7` stochastic lossless run!
+    {
+        var spec_tgt = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_bytes, dense_cfg, .{
+            .max_seq_len = 64,
+            .chunk_tokens = 8,
+            .max_tree_nodes = 16,
+        });
+        defer spec_tgt.deinit(allocator);
+
+        var sd = try draft_mod.SmallDraftModel.loadFromBytes(allocator, &spec_tgt, small_bytes, draft_cfg, .{
+            .placement = .gpu,
+            .max_seq_len = 64,
+            .chunk_tokens = 8,
+            .max_tree_slots = 16,
+            .own_compute_queue = true,
+        });
+        defer sd.deinit(allocator);
+
+        // 2a. PEARL on with mismatched small draft -> heavy O(1) KV rollbacks, 100% bit-exact T=0!
+        var eng_rb = try SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .branch_width = 2,
+            .top_k_per_node = 3,
+            .temperature = 0.0,
+            .enable_pruning = false,
+            .pearl_mode = .on,
+        });
+        defer eng_rb.deinit(allocator);
+
+        var out_rb: [16]u32 = undefined;
+        out_rb[0] = try eng_rb.prefill(&prompt, null);
+        var p_rb: usize = 1;
+        while (p_rb < out_rb.len) {
+            const rs = try eng_rb.stepRound(null, out_rb[p_rb..]);
+            p_rb += rs.emitted_count;
+        }
+        try std.testing.expectEqualSlices(u32, &expected, &out_rb);
+        try std.testing.expect(eng_rb.stats.pearl_rounds > 0);
+        try std.testing.expect(eng_rb.stats.pearl_rollbacks > 0);
+
+        // 2b. `.auto` with default 40 ms gate stays OFF on tiny fast synthetic target!
+        var eng_auto_off = try SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .temperature = 0.0,
+            .pearl_mode = .auto,
+            .pearl_min_target_us = 40_000.0,
+        });
+        defer eng_auto_off.deinit(allocator);
+        try std.testing.expect(!eng_auto_off.stats.pearl_enabled);
+        var out_ao: [10]u32 = undefined;
+        out_ao[0] = try eng_auto_off.prefill(&prompt, null);
+        var p_ao: usize = 1;
+        while (p_ao < out_ao.len) {
+            const rs = try eng_auto_off.stepRound(null, out_ao[p_ao..]);
+            p_ao += rs.emitted_count;
+        }
+        try std.testing.expectEqualSlices(u32, expected[0..10], &out_ao);
+        try std.testing.expect(!eng_auto_off.stats.pearl_enabled);
+        try std.testing.expectEqual(@as(u64, 0), eng_auto_off.stats.pearl_rounds);
+
+        // 2c. `.auto` with low threshold (1 us) gates ON dynamically!
+        var eng_auto_on = try SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .temperature = 0.0,
+            .pearl_mode = .auto,
+            .pearl_min_target_us = 1.0,
+        });
+        defer eng_auto_on.deinit(allocator);
+        var out_an: [10]u32 = undefined;
+        out_an[0] = try eng_auto_on.prefill(&prompt, null);
+        var p_an: usize = 1;
+        while (p_an < out_an.len) {
+            const rs = try eng_auto_on.stepRound(null, out_an[p_an..]);
+            p_an += rs.emitted_count;
+        }
+        try std.testing.expectEqualSlices(u32, expected[0..10], &out_an);
+        try std.testing.expect(eng_auto_on.stats.pearl_enabled);
+        try std.testing.expect(eng_auto_on.stats.pearl_rounds > 0);
+
+        // 2d. Stochastic T = 0.7 with PEARL on: valid tokens, zero errors, reproducible with same seed!
+        var eng_st = try SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .temperature = 0.7,
+            .pearl_mode = .on,
+        });
+        defer eng_st.deinit(allocator);
+
+        var rng_a = try rng_mod.RequestRng.init(0xD8_570C);
+        var st_a: [12]u32 = undefined;
+        st_a[0] = try eng_st.prefill(&prompt, rng_a.random());
+        var ps_a: usize = 1;
+        while (ps_a < st_a.len) {
+            const rs = try eng_st.stepRound(rng_a.random(), st_a[ps_a..]);
+            ps_a += rs.emitted_count;
+        }
+        for (st_a) |t| try std.testing.expect(t < dense_cfg.vocab_size);
+
+        var rng_b = try rng_mod.RequestRng.init(0xD8_570C);
+        var st_b: [12]u32 = undefined;
+        st_b[0] = try eng_st.prefill(&prompt, rng_b.random());
+        var ps_b: usize = 1;
+        while (ps_b < st_b.len) {
+            const rs = try eng_st.stepRound(rng_b.random(), st_b[ps_b..]);
+            ps_b += rs.emitted_count;
+        }
+        try std.testing.expectEqualSlices(u32, &st_a, &st_b);
+    }
 }

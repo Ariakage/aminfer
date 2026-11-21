@@ -287,6 +287,11 @@ pub const DraftLoadOptions = struct {
     max_tree_slots: u32 = attention.MAX_TREE_NODES,
     verify_crcs: bool = true,
     timeout_ms: u64 = 30_000,
+    /// When true (default), `SmallDraftModel` uses its own independent Metal 4
+    /// `Compute` command queue + residency set (distinct from `target.compute`)
+    /// so `D8` PEARL can overlap round-`r+1` pre-drafting concurrently on
+    /// hardware with `target.verifyTree(T_r)` (ADR-0008).
+    own_compute_queue: bool = true,
 };
 
 pub const DraftLoadError = error{
@@ -1184,6 +1189,7 @@ pub const SmallDraftLoadError = error{
 /// heap allocation.
 pub const SmallDraftModel = struct {
     model: qwen3.Qwen3Model,
+    own_compute_queue: bool,
     requested_placement: Placement,
     effective_placement: Placement,
     placement_gate_ane_us: f64,
@@ -1203,6 +1209,7 @@ pub const SmallDraftModel = struct {
         const load_opts = try buildLoadOptions(target, config, options);
         var model = try qwen3.Qwen3Model.loadFromBytes(allocator, amf_bytes, config, load_opts);
         errdefer model.deinit(allocator);
+        std.debug.assert(model.compute.handle != target.compute.handle);
         return finalizeInit(allocator, model, options);
     }
 
@@ -1216,6 +1223,7 @@ pub const SmallDraftModel = struct {
         const load_opts = try buildLoadOptions(target, config, options);
         var model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, config, load_opts);
         errdefer model.deinit(allocator);
+        std.debug.assert(model.compute.handle != target.compute.handle);
         return finalizeInit(allocator, model, options);
     }
 
@@ -1300,6 +1308,7 @@ pub const SmallDraftModel = struct {
         const zc_ok = if (ane_proj) |ap| ap.zero_copy_ok else true;
         return .{
             .model = model,
+            .own_compute_queue = options.own_compute_queue,
             .requested_placement = options.placement,
             .effective_placement = effective_placement,
             .placement_gate_ane_us = gate_ane_us,
@@ -1322,6 +1331,35 @@ pub const SmallDraftModel = struct {
     pub fn reset(self: *SmallDraftModel) void {
         self.model.resetKvCache();
         self.root_top_k_count = 0;
+    }
+
+    pub fn hasOwnComputeQueue(self: *const SmallDraftModel) bool {
+        return self.own_compute_queue;
+    }
+
+    /// Rewinds committed KV length in O(1) without GPU work or allocation
+    /// (`D8` PEARL rollback, ADR-0008). Causal KV rows at `< new_seq_len`
+    /// remain intact and subsequent `syncAccepted` overwrites `>= new_seq_len`.
+    pub fn rewindKvLen(self: *SmallDraftModel, new_seq_len: u32) error{InvalidArgument}!void {
+        if (new_seq_len > self.model.seq_len or new_seq_len > self.model.max_seq_len) {
+            return error.InvalidArgument;
+        }
+        self.model.seq_len = new_seq_len;
+        self.root_top_k_count = 0;
+    }
+
+    /// Saves cached root candidates into a caller-owned fixed buffer (zero alloc).
+    pub fn saveRootCandidates(self: *const SmallDraftModel, out: *[MAX_DRAFT_TOP_K]moe.TopKCandidate) u32 {
+        const n = self.root_top_k_count;
+        if (n > 0) @memcpy(out[0..n], self.root_candidates[0..n]);
+        return n;
+    }
+
+    /// Restores cached root candidates from a saved snapshot (zero alloc).
+    pub fn restoreRootCandidates(self: *SmallDraftModel, src: []const moe.TopKCandidate) void {
+        const n = @min(src.len, MAX_DRAFT_TOP_K);
+        if (n > 0) @memcpy(self.root_candidates[0..n], src[0..n]);
+        self.root_top_k_count = @intCast(n);
     }
 
     pub fn totalWiredBytes(self: *const SmallDraftModel) u64 {
@@ -1426,6 +1464,29 @@ pub const SmallDraftModel = struct {
         );
         @memcpy(self.root_candidates[0..eff_k], cands[0..eff_k]);
         self.root_top_k_count = eff_k;
+    }
+
+    /// Like `syncAccepted`, automatically splitting across `maxTreeSlots()` if
+    /// `tokens.len > maxTreeSlots()` (e.g. pending PEARL root + full accepted chain).
+    pub fn syncAcceptedChunked(
+        self: *SmallDraftModel,
+        tokens: []const u32,
+        base_pos: u32,
+        top_k: u32,
+    ) qwen3.StepError!void {
+        if (tokens.len == 0) return error.InvalidArgument;
+        const cap: usize = self.model.max_tree_nodes;
+        var off: usize = 0;
+        while (off < tokens.len) {
+            const take = @min(cap, tokens.len - off);
+            const is_last = (off + take == tokens.len);
+            try self.syncAccepted(
+                tokens[off .. off + take],
+                base_pos + @as(u32, @intCast(off)),
+                if (is_last) top_k else 0,
+            );
+            off += take;
+        }
     }
 
     /// Runs an entire L1 `>= 4` seed chain `[s_1..s_c]` in ONE batched forward pass
@@ -2734,6 +2795,46 @@ test "D4 SmallDraftModel loads standalone Qwen3 draft, prefills, seeds L1 chain,
     try sd.syncAccepted(&acc, 5, 3);
     try std.testing.expectEqual(@as(u32, 7), sd.seqLen());
     try std.testing.expectEqual(@as(usize, 3), sd.rootCandidates().len);
+
+    // D8 PEARL verification: independent compute queue + O(1) KV rewind exactness!
+    try std.testing.expect(sd.hasOwnComputeQueue());
+    try std.testing.expect(sd.model.compute.handle != target.compute.handle);
+
+    var sd_ctrl = try SmallDraftModel.loadFromBytes(gpa, &target, draft_bytes, draft_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .max_tree_slots = 16,
+        .own_compute_queue = true,
+    });
+    defer sd_ctrl.deinit(gpa);
+
+    // 1. Control model: prefill [3,5,7,9]+11, directly sync [13, 19].
+    try sd_ctrl.prefillAndSeedRoot(&prompt, 11, 3);
+    try sd_ctrl.syncAccepted(&[_]u32{ 13, 19 }, 5, 3);
+
+    // 2. PEARL model: prefill [3,5,7,9]+11, speculatively commit [13, 15, 17],
+    //    rewind in O(1) to pos 6 (reusing causal KV of `13` at pos 5!), then sync only `[19]`.
+    try sd.prefillAndSeedRoot(&prompt, 11, 3);
+    try sd.syncAccepted(&[_]u32{ 13, 15, 17 }, 5, 3);
+    try std.testing.expectEqual(@as(u32, 8), sd.seqLen());
+    try sd.rewindKvLen(6);
+    try std.testing.expectEqual(@as(u32, 6), sd.seqLen());
+    try std.testing.expectEqual(@as(usize, 0), sd.rootCandidates().len);
+    try sd.syncAccepted(&[_]u32{19}, 6, 3);
+    try std.testing.expectEqual(@as(u32, 7), sd.seqLen());
+
+    // Exact bit-for-bit candidate parity between O(1)-rewound PEARL KV and clean control!
+    const got_cands = sd.rootCandidates();
+    const exp_cands = sd_ctrl.rootCandidates();
+    try std.testing.expectEqual(exp_cands.len, got_cands.len);
+    for (exp_cands, got_cands) |e, g| {
+        try std.testing.expectEqual(e.token_id, g.token_id);
+        try std.testing.expectApproxEqAbs(e.prob, g.prob, 1e-4);
+    }
+
+    // Invalid forward rewind must fail explicitly.
+    try std.testing.expectError(error.InvalidArgument, sd.rewindKvLen(8));
 }
 
 fn buildSyntheticTargetBf16ForTest(allocator: std.mem.Allocator, cfg: qwen3.ModelConfig, seed: u64) ![]u8 {

@@ -140,19 +140,28 @@ comptime {
     if (@sizeOf(ExpertBitset) != 32) @compileError("ExpertBitset must be 32 bytes");
 }
 
-/// Calibrated hardware verification cost model for D7 submodular pruning (ADR-0009).
+/// Calibrated hardware verification cost model for D7 submodular pruning
+/// (ADR-0009, ADR-0017).
 ///
 /// Predicted verification time (in microseconds):
-/// ```
-/// t(T) = t_fixed_us
-///      + |T| * c_tok_us
-///      + sum_{l=0..num_layers-1} (unique_hot_l * expert_bytes
-///          + unique_cold_l * (expert_bytes + cold_penalty_bytes))
-///        / (beta_gbs_by_m[|T|] * 1000.0)
-/// ```
-/// because `1 GB/s = 1000 B/us`. When `num_experts == 0` or `expert_bytes == 0`,
-/// the expert byte term vanishes and the rule reduces cleanly to a dense
-/// node/latency budget.
+/// - Uniform experts (`expert_bytes_table == null and expert_bw_gbs_table == null`):
+///   ```
+///   t(T) = t_fixed_us
+///        + |T| * c_tok_us
+///        + sum_{l=0..num_layers-1} (unique_hot_l * expert_bytes
+///            + unique_cold_l * (expert_bytes + cold_penalty_bytes))
+///          / (beta_gbs_by_m[|T|] * 1000.0)
+///   ```
+/// - Heterogeneous GSQ+RCO experts (`ADR-0017`, `expert_bytes_table` and/or
+///   `expert_bw_gbs_table` provided, indexed `[l * num_experts + e]`):
+///   ```
+///   t(T) = t_fixed_us + |T| * c_tok_us
+///        + sum_l sum_{e in U_l(T)} (b_{l,e} * expert_table_scale) / (beta_{l,e} * 1000.0)
+///        + (unique_cold_total * cold_penalty_bytes) / (beta_gbs_by_m[|T|] * 1000.0)
+///   ```
+/// because `1 GB/s = 1000 B/us`. When `num_experts == 0` or neither scalar
+/// `expert_bytes` nor `expert_bytes_table` is set, the expert term vanishes and
+/// the rule reduces cleanly to a dense node/latency budget.
 pub const PruneCostModel = struct {
     t_fixed_us: f32,
     c_tok_us: f32,
@@ -161,6 +170,15 @@ pub const PruneCostModel = struct {
     beta_gbs_by_m: [65]f32,
     num_layers: u32,
     num_experts: u32,
+    /// Optional `[num_layers * num_experts]` static per-expert byte sizes (`b_{l,e}`, ADR-0017).
+    /// When `null`, every expert uses the uniform `expert_bytes` scalar.
+    expert_bytes_table: ?[]const u32 = null,
+    /// Optional `[num_layers * num_experts]` calibrated effective bandwidths in GB/s
+    /// (`beta_{scheme(l,e)}`, ADR-0017). When `null`, uses `beta_gbs_by_m[|T|]`.
+    expert_bw_gbs_table: ?[]const f32 = null,
+    /// Scaling multiplier applied to `expert_bytes_table` entries (e.g. sampled-layer
+    /// scale * correlation calibration factor; defaults to `1.0`).
+    expert_table_scale: f32 = 1.0,
 
     /// Convenience dense cost model with zero expert bytes.
     pub fn dense(t_fixed_us: f32, c_tok_us: f32) PruneCostModel {
@@ -197,7 +215,12 @@ pub const PruneCostModel = struct {
     }
 
     pub inline fn isMoe(self: PruneCostModel) bool {
-        return self.num_experts > 0 and self.expert_bytes > 0.0 and self.num_layers > 0;
+        return self.num_experts > 0 and self.num_layers > 0 and
+            (self.expert_bytes > 0.0 or self.expert_bytes_table != null);
+    }
+
+    pub inline fn hasPerExpertTable(self: PruneCostModel) bool {
+        return self.expert_bytes_table != null or self.expert_bw_gbs_table != null;
     }
 };
 
@@ -450,6 +473,75 @@ pub fn DraftTree(comptime max_nodes: u16) type {
             }
         }
 
+        /// Extracts the highest-probability greedy chain starting from root `0`
+        /// down to a leaf for `D8` PEARL speculative round-`r+1` pre-drafting
+        /// (ADR-0008). Writes `[n_1, ..., n_d]` into `out_nodes` (if non-null)
+        /// and their tokens `[tok_1, ..., tok_d]` into `out_tokens`, returning
+        /// path length `d` (`0` when only root `0` is present). Zero heap alloc.
+        pub fn highestProbPath(
+            self: *const Self,
+            out_nodes: ?[]u16,
+            out_tokens: []u32,
+        ) u16 {
+            if (self.count <= 1 or out_tokens.len == 0) return 0;
+            const max_len: usize = if (out_nodes) |ns| @min(ns.len, out_tokens.len) else out_tokens.len;
+            var cur: u16 = 0;
+            var len: usize = 0;
+            while (len < max_len) {
+                var c = self.nodes[cur].first_child;
+                if (c == NO_NODE) break;
+                var best_c: u16 = c;
+                var best_prob: f32 = self.nodes[c].step_prob;
+                var best_is_seed: bool = self.nodes[c].source == .l1_seed;
+                c = self.nodes[c].next_sibling;
+                while (c != NO_NODE) : (c = self.nodes[c].next_sibling) {
+                    const p = self.nodes[c].step_prob;
+                    const is_seed = self.nodes[c].source == .l1_seed;
+                    const better = (p > best_prob) or
+                        (p == best_prob and is_seed and !best_is_seed);
+                    if (better) {
+                        best_c = c;
+                        best_prob = p;
+                        best_is_seed = is_seed;
+                    }
+                }
+                if (out_nodes) |ns| ns[len] = best_c;
+                out_tokens[len] = self.nodes[best_c].token_id;
+                len += 1;
+                cur = best_c;
+            }
+            return @intCast(len);
+        }
+
+        /// Copies `src` into `self` while strictly enforcing `max_depth_limit`
+        /// and `max_nodes_limit` (preserving topological order, ancestor masks,
+        /// probabilities, and node provenance). Used by `D8` PEARL when adopting
+        /// a pre-drafted tree into a round with a tighter remaining token budget.
+        pub fn copyTruncatedFrom(
+            self: *Self,
+            src: *const Self,
+            max_depth_limit: u16,
+            max_nodes_limit: u16,
+        ) void {
+            std.debug.assert(src.count >= 1);
+            self.reset(src.nodes[0].token_id);
+            const cap = @min(max_nodes_limit, max_nodes);
+            if (cap <= 1 or max_depth_limit == 0 or src.count <= 1) return;
+
+            var old_to_new: [max_nodes]u16 = @splat(NO_NODE);
+            old_to_new[0] = 0;
+            var i: u16 = 1;
+            while (i < src.count and self.count < cap) : (i += 1) {
+                const n = src.nodes[i];
+                if (n.depth > max_depth_limit) continue;
+                const new_parent = old_to_new[n.parent];
+                if (new_parent == NO_NODE) continue;
+                if (self.insertChild(new_parent, n.token_id, n.step_prob, n.source)) |ni| {
+                    old_to_new[i] = ni;
+                }
+            }
+        }
+
         /// Evaluates the current tree's expected tokens, predicted verification time,
         /// throughput score `V(T)/t(T)`, and unique experts/layer under `cost`
         /// without mutating the tree.
@@ -464,33 +556,27 @@ pub fn DraftTree(comptime max_nodes: u16) type {
 
             const use_moe = cost.isMoe();
             var total_expert_bytes: f64 = 0.0;
+            var total_direct_us: f64 = 0.0;
             var unique_sum: u64 = 0;
 
             if (use_moe) {
                 const n_layers: usize = cost.num_layers;
                 const experts = node_experts orelse return error.MissingExpertBitsets;
-                const has_cold = cold_experts_by_layer != null and cost.cold_penalty_bytes > 0.0;
-                const eb: f64 = @as(f64, cost.expert_bytes);
-                const cpb: f64 = @as(f64, cost.cold_penalty_bytes);
 
                 for (0..n_layers) |l| {
                     var u = ExpertBitset.empty();
                     for (0..self.count) |v| {
                         u.unionInPlace(experts[v * n_layers + l]);
                     }
-                    const tot = u.count();
-                    unique_sum += tot;
-                    if (has_cold) {
-                        const cold_cnt = u.intersectWith(cold_experts_by_layer.?[l]).count();
-                        total_expert_bytes += @as(f64, @floatFromInt(tot)) * eb +
-                            @as(f64, @floatFromInt(cold_cnt)) * cpb;
-                    } else {
-                        total_expert_bytes += @as(f64, @floatFromInt(tot)) * eb;
-                    }
+                    const cold_mask: ?ExpertBitset = if (cold_experts_by_layer) |cm| cm[l] else null;
+                    const delta = accumulateLayerExperts(cost, l, u, cold_mask);
+                    unique_sum += delta.unique_count;
+                    total_expert_bytes += delta.scaled_bytes;
+                    total_direct_us += delta.direct_time_us;
                 }
             }
 
-            const t_us = evalTimeUs(cost, self.count, use_moe, total_expert_bytes);
+            const t_us = evalTimeUs(cost, self.count, use_moe, total_expert_bytes, total_direct_us);
             if (!(t_us > 0.0) or !std.math.isFinite(t_us)) return error.InvalidCostModel;
             const v_toks: f64 = @as(f64, self.expectedTokens());
             const avg_unique: f32 = if (use_moe)
@@ -509,8 +595,8 @@ pub fn DraftTree(comptime max_nodes: u16) type {
 
         /// Greedily selects the ancestor-closed subtree `T` (containing root `0`,
         /// `|T| <= hard_cap`) that maximizes `V(T) / t(T)` using exact per-layer
-        /// marginal expert-union byte accounting (ADR-0009), then compacts the
-        /// surviving nodes into topological order `0..kept_nodes` and refreshes
+        /// marginal expert-union byte accounting (ADR-0009, ADR-0017), then compacts
+        /// the surviving nodes into topological order `0..kept_nodes` and refreshes
         /// `parent`, `first_child`, `next_sibling`, and `ancestor_mask`.
         ///
         /// Performs zero dynamic heap allocation.
@@ -528,6 +614,7 @@ pub fn DraftTree(comptime max_nodes: u16) type {
             try validateCostModel(cost, self.count, eff_cap, node_experts, cold_experts_by_layer);
 
             const use_moe = cost.isMoe();
+            const use_table = use_moe and cost.hasPerExpertTable();
             const n_layers: usize = if (use_moe) cost.num_layers else 0;
             const has_cold = use_moe and cold_experts_by_layer != null and cost.cold_penalty_bytes > 0.0;
             const eb: f64 = @as(f64, cost.expert_bytes);
@@ -535,6 +622,7 @@ pub fn DraftTree(comptime max_nodes: u16) type {
 
             var union_by_layer: [MAX_PRUNE_LAYERS]ExpertBitset = undefined;
             var cur_expert_bytes: f64 = 0.0;
+            var cur_direct_us: f64 = 0.0;
             var cur_unique_sum: u64 = 0;
 
             if (use_moe) {
@@ -542,22 +630,18 @@ pub fn DraftTree(comptime max_nodes: u16) type {
                 for (0..n_layers) |l| {
                     const b = experts[l]; // root node 0
                     union_by_layer[l] = b;
-                    const tot = b.count();
-                    cur_unique_sum += tot;
-                    if (has_cold) {
-                        const cold_cnt = b.intersectWith(cold_experts_by_layer.?[l]).count();
-                        cur_expert_bytes += @as(f64, @floatFromInt(tot)) * eb +
-                            @as(f64, @floatFromInt(cold_cnt)) * cpb;
-                    } else {
-                        cur_expert_bytes += @as(f64, @floatFromInt(tot)) * eb;
-                    }
+                    const cold_mask: ?ExpertBitset = if (cold_experts_by_layer) |cm| cm[l] else null;
+                    const delta = accumulateLayerExperts(cost, l, b, cold_mask);
+                    cur_unique_sum += delta.unique_count;
+                    cur_expert_bytes += delta.scaled_bytes;
+                    cur_direct_us += delta.direct_time_us;
                 }
             }
 
             var selected_mask: u64 = 1; // Root node 0 is always selected.
             var selected_count: u16 = 1;
             var cur_value: f64 = 1.0; // V({0}) = 1.0 (bonus token)
-            var cur_time: f64 = evalTimeUs(cost, 1, use_moe, cur_expert_bytes);
+            var cur_time: f64 = evalTimeUs(cost, 1, use_moe, cur_expert_bytes, cur_direct_us);
             if (!(cur_time > 0.0) or !std.math.isFinite(cur_time)) return error.InvalidCostModel;
             var cur_score: f64 = cur_value / cur_time;
 
@@ -567,6 +651,7 @@ pub fn DraftTree(comptime max_nodes: u16) type {
                 var best_value: f64 = cur_value;
                 var best_time: f64 = cur_time;
                 var best_expert_bytes: f64 = cur_expert_bytes;
+                var best_direct_us: f64 = cur_direct_us;
                 var best_delta_unique: u64 = 0;
                 var best_cum_prob: f32 = -1.0;
 
@@ -585,11 +670,24 @@ pub fn DraftTree(comptime max_nodes: u16) type {
                     if (!(v_prob > 0.0)) continue;
 
                     var delta_bytes: f64 = 0.0;
+                    var delta_direct_us: f64 = 0.0;
                     var delta_unique: u64 = 0;
                     if (use_moe) {
                         const experts = node_experts.?;
                         const base = @as(usize, v) * n_layers;
-                        if (has_cold) {
+                        if (use_table) {
+                            for (0..n_layers) |l| {
+                                const added = experts[base + l].difference(union_by_layer[l]);
+                                if (added.words[0] == 0 and added.words[1] == 0 and added.words[2] == 0 and added.words[3] == 0) {
+                                    continue;
+                                }
+                                const cold_mask: ?ExpertBitset = if (cold_experts_by_layer) |cm| cm[l] else null;
+                                const d = accumulateLayerExperts(cost, l, added, cold_mask);
+                                delta_unique += d.unique_count;
+                                delta_bytes += d.scaled_bytes;
+                                delta_direct_us += d.direct_time_us;
+                            }
+                        } else if (has_cold) {
                             const cold_masks = cold_experts_by_layer.?;
                             for (0..n_layers) |l| {
                                 const added = experts[base + l].difference(union_by_layer[l]);
@@ -612,7 +710,8 @@ pub fn DraftTree(comptime max_nodes: u16) type {
 
                     const cand_value = cur_value + @as(f64, v_prob);
                     const cand_expert_bytes = cur_expert_bytes + delta_bytes;
-                    const cand_time = evalTimeUs(cost, next_count, use_moe, cand_expert_bytes);
+                    const cand_direct_us = cur_direct_us + delta_direct_us;
+                    const cand_time = evalTimeUs(cost, next_count, use_moe, cand_expert_bytes, cand_direct_us);
                     if (!(cand_time > 0.0)) continue;
                     const cand_score = cand_value / cand_time;
 
@@ -626,6 +725,7 @@ pub fn DraftTree(comptime max_nodes: u16) type {
                         best_value = cand_value;
                         best_time = cand_time;
                         best_expert_bytes = cand_expert_bytes;
+                        best_direct_us = cand_direct_us;
                         best_delta_unique = delta_unique;
                         best_cum_prob = v_prob;
                     }
@@ -639,6 +739,7 @@ pub fn DraftTree(comptime max_nodes: u16) type {
                 cur_time = best_time;
                 cur_score = best_score;
                 cur_expert_bytes = best_expert_bytes;
+                cur_direct_us = best_direct_us;
                 cur_unique_sum += best_delta_unique;
 
                 if (use_moe) {
@@ -723,6 +824,63 @@ pub fn DraftTree(comptime max_nodes: u16) type {
     };
 }
 
+const ExpertCostDelta = struct {
+    unique_count: u64 = 0,
+    scaled_bytes: f64 = 0.0,
+    direct_time_us: f64 = 0.0,
+};
+
+fn accumulateLayerExperts(
+    cost: PruneCostModel,
+    layer: usize,
+    added: ExpertBitset,
+    cold_mask: ?ExpertBitset,
+) ExpertCostDelta {
+    if (!cost.hasPerExpertTable()) {
+        const tot = added.count();
+        if (tot == 0) return .{};
+        var bytes: f64 = @as(f64, @floatFromInt(tot)) * @as(f64, cost.expert_bytes);
+        if (cold_mask) |cm| {
+            if (cost.cold_penalty_bytes > 0.0) {
+                const cold_cnt = added.intersectWith(cm).count();
+                bytes += @as(f64, @floatFromInt(cold_cnt)) * @as(f64, cost.cold_penalty_bytes);
+            }
+        }
+        return .{ .unique_count = tot, .scaled_bytes = bytes, .direct_time_us = 0.0 };
+    }
+
+    var delta: ExpertCostDelta = .{};
+    const n_exp: usize = cost.num_experts;
+    const layer_off: usize = layer * n_exp;
+    const scale: f64 = @as(f64, cost.expert_table_scale);
+    const cpb: f64 = @as(f64, cost.cold_penalty_bytes);
+    const has_cold = cold_mask != null and cost.cold_penalty_bytes > 0.0;
+
+    inline for (0..4) |w_idx| {
+        var w = added.words[w_idx];
+        while (w != 0) {
+            const bit: usize = @ctz(w);
+            w &= w - 1;
+            const e: usize = w_idx * 64 + bit;
+            if (e >= n_exp) continue;
+            delta.unique_count += 1;
+            const eb: f64 = if (cost.expert_bytes_table) |tbl|
+                @as(f64, @floatFromInt(tbl[layer_off + e])) * scale
+            else
+                @as(f64, cost.expert_bytes);
+            if (cost.expert_bw_gbs_table) |bw_tbl| {
+                delta.direct_time_us += eb / (@as(f64, bw_tbl[layer_off + e]) * 1000.0);
+            } else {
+                delta.scaled_bytes += eb;
+            }
+            if (has_cold and cold_mask.?.contains(@intCast(e))) {
+                delta.scaled_bytes += cpb;
+            }
+        }
+    }
+    return delta;
+}
+
 fn validateCostModel(
     cost: PruneCostModel,
     node_count: u16,
@@ -734,6 +892,7 @@ fn validateCostModel(
     if (!std.math.isFinite(cost.c_tok_us) or cost.c_tok_us < 0.0) return error.InvalidCostModel;
     if (!std.math.isFinite(cost.expert_bytes) or cost.expert_bytes < 0.0) return error.InvalidCostModel;
     if (!std.math.isFinite(cost.cold_penalty_bytes) or cost.cold_penalty_bytes < 0.0) return error.InvalidCostModel;
+    if (!std.math.isFinite(cost.expert_table_scale) or !(cost.expert_table_scale > 0.0)) return error.InvalidCostModel;
 
     if (cost.isMoe()) {
         if (cost.num_layers > MAX_PRUNE_LAYERS) return error.TooManyLayers;
@@ -742,6 +901,19 @@ fn validateCostModel(
         if (experts.len < needed) return error.BufferTooSmall;
         if (cold_experts_by_layer) |cold| {
             if (cold.len < cost.num_layers) return error.BufferTooSmall;
+        }
+        if (cost.hasPerExpertTable()) {
+            if (cost.num_experts > ExpertBitset.MAX_EXPERTS) return error.InvalidCostModel;
+            const tbl_needed = @as(usize, cost.num_layers) * @as(usize, cost.num_experts);
+            if (cost.expert_bytes_table) |tbl| {
+                if (tbl.len < tbl_needed) return error.BufferTooSmall;
+            }
+            if (cost.expert_bw_gbs_table) |bw_tbl| {
+                if (bw_tbl.len < tbl_needed) return error.BufferTooSmall;
+                for (bw_tbl[0..tbl_needed]) |b| {
+                    if (!std.math.isFinite(b) or !(b > 0.0)) return error.InvalidCostModel;
+                }
+            }
         }
         var m: u16 = 1;
         while (m <= max_m) : (m += 1) {
@@ -758,11 +930,12 @@ inline fn evalTimeUs(
     node_count: u16,
     use_moe: bool,
     expert_bytes_total: f64,
+    expert_direct_us: f64,
 ) f64 {
     const base = @as(f64, cost.t_fixed_us) + @as(f64, @floatFromInt(node_count)) * @as(f64, cost.c_tok_us);
     if (!use_moe) return base;
     const bytes_per_us = @as(f64, cost.beta_gbs_by_m[node_count]) * 1000.0;
-    return base + expert_bytes_total / bytes_per_us;
+    return base + expert_direct_us + expert_bytes_total / bytes_per_us;
 }
 
 /// Compile-time specialized tree aliases matching GPU `TREE_MAX_NODES` variants (ADR-0014).
@@ -1029,4 +1202,110 @@ test "pruneToOptimalSubtree uses M-dependent beta_gbs_by_m and validates cost mo
     var too_many_layers = cost;
     too_many_layers.num_layers = MAX_PRUNE_LAYERS + 1;
     try std.testing.expectError(error.TooManyLayers, tree.pruneToOptimalSubtree(too_many_layers, &experts, null, 16));
+}
+
+test "M5 D7 PruneCostModel supports ADR-0017 per-expert byte and bandwidth tables" {
+    const num_layers: u32 = 2;
+    const num_experts: u32 = 8;
+
+    // 1. Uniform table must match uniform scalar identically.
+    var t_scalar = SmallTree.init(0);
+    const s1 = t_scalar.insertChild(0, 10, 0.75, .l2) orelse unreachable;
+    _ = t_scalar.insertChild(s1, 11, 0.70, .l2) orelse unreachable;
+    var t_table = t_scalar;
+
+    var exp_uniform: [3 * num_layers]ExpertBitset = @splat(ExpertBitset.empty());
+    for (0..num_layers) |l| {
+        exp_uniform[0 * num_layers + l].set(0);
+        exp_uniform[1 * num_layers + l].set(1);
+        exp_uniform[2 * num_layers + l].set(2);
+    }
+
+    const uniform_bytes: [num_layers * num_experts]u32 = @splat(1_000_000);
+    const uniform_bw: [num_layers * num_experts]f32 = @splat(80.0);
+
+    const scalar_cost = PruneCostModel.uniformBeta(50.0, 4.0, 1_000_000.0, 0.0, 80.0, num_layers, num_experts);
+    var table_cost = scalar_cost;
+    table_cost.expert_bytes = 0.0; // Verify `isMoe()` works solely from `expert_bytes_table`.
+    table_cost.expert_bytes_table = &uniform_bytes;
+    table_cost.expert_bw_gbs_table = &uniform_bw;
+
+    const sum_scalar = try t_scalar.pruneToOptimalSubtree(scalar_cost, &exp_uniform, null, 16);
+    const sum_table = try t_table.pruneToOptimalSubtree(table_cost, &exp_uniform, null, 16);
+    try std.testing.expectEqual(sum_scalar.kept_nodes, sum_table.kept_nodes);
+    try std.testing.expectApproxEqAbs(sum_scalar.predicted_time_us, sum_table.predicted_time_us, 1e-4);
+    try std.testing.expectApproxEqAbs(sum_scalar.expected_tokens, sum_table.expected_tokens, 1e-5);
+
+    // 2. Heterogeneous GSQ+RCO: expert 1 is cheap q2_affine (400 KB @ 90 GB/s),
+    //    while expert 2 is heavy bf16 (6 MB @ 60 GB/s). Given equal probabilities,
+    //    D7 must keep the cheap q2 branch and prune the heavy bf16 branch!
+    var t_het = SmallTree.init(0);
+    const cheap_branch = t_het.insertChild(0, 100, 0.55, .l2) orelse unreachable;
+    const heavy_branch = t_het.insertChild(0, 200, 0.55, .l2) orelse unreachable;
+
+    var exp_het: [3 * num_layers]ExpertBitset = @splat(ExpertBitset.empty());
+    for (0..num_layers) |l| {
+        exp_het[0 * num_layers + l].set(0);
+        exp_het[cheap_branch * num_layers + l].set(1);
+        exp_het[heavy_branch * num_layers + l].set(2);
+    }
+
+    var het_bytes: [num_layers * num_experts]u32 = @splat(1_000_000);
+    var het_bw: [num_layers * num_experts]f32 = @splat(70.0);
+    for (0..num_layers) |l| {
+        het_bytes[l * num_experts + 0] = 1_000_000;
+        het_bw[l * num_experts + 0] = 75.0;
+        het_bytes[l * num_experts + 1] = 400_000; // q2_affine
+        het_bw[l * num_experts + 1] = 90.0;
+        het_bytes[l * num_experts + 2] = 6_000_000; // bf16
+        het_bw[l * num_experts + 2] = 60.0;
+    }
+
+    var het_cost = PruneCostModel.uniformBeta(100.0, 2.0, 0.0, 0.0, 70.0, num_layers, num_experts);
+    het_cost.expert_bytes_table = &het_bytes;
+    het_cost.expert_bw_gbs_table = &het_bw;
+
+    const sum_het = try t_het.pruneToOptimalSubtree(het_cost, &exp_het, null, 16);
+    try std.testing.expectEqual(@as(u16, 2), sum_het.kept_nodes);
+    try std.testing.expect(t_het.findChild(0, 100) != null);
+    try std.testing.expectEqual(@as(?u16, null), t_het.findChild(0, 200));
+
+    // 3. Table validation rejects short tables or non-positive bandwidths.
+    var bad_short = het_cost;
+    bad_short.expert_bytes_table = het_bytes[0 .. num_layers * num_experts - 1];
+    try std.testing.expectError(error.BufferTooSmall, t_het.scoreCurrentTree(bad_short, &exp_het, null));
+
+    var bad_bw_arr = het_bw;
+    bad_bw_arr[3] = 0.0;
+    var bad_bw = het_cost;
+    bad_bw.expert_bw_gbs_table = &bad_bw_arr;
+    try std.testing.expectError(error.InvalidCostModel, t_het.scoreCurrentTree(bad_bw, &exp_het, null));
+}
+
+test "M5 D8 DraftTree highestProbPath and copyTruncatedFrom preserve topology and caps" {
+    var tree = DefaultTree.init(42);
+    const a1 = tree.insertChild(0, 10, 0.40, .l2) orelse unreachable;
+    _ = tree.insertChild(a1, 11, 0.90, .l2) orelse unreachable;
+    const b1 = tree.insertChild(0, 20, 0.85, .l2) orelse unreachable;
+    const b2 = tree.insertChild(b1, 21, 0.30, .l2) orelse unreachable;
+    const b2_hi = tree.insertChild(b1, 22, 0.75, .l1_seed) orelse unreachable;
+    const b3 = tree.insertChild(b2_hi, 23, 0.80, .l1_seed) orelse unreachable;
+    _ = b2;
+
+    var nodes_out: [8]u16 = undefined;
+    var toks_out: [8]u32 = undefined;
+    const path_len = tree.highestProbPath(&nodes_out, &toks_out);
+    try std.testing.expectEqual(@as(u16, 3), path_len);
+    try std.testing.expectEqualSlices(u16, &[_]u16{ b1, b2_hi, b3 }, nodes_out[0..path_len]);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 20, 22, 23 }, toks_out[0..path_len]);
+
+    // Truncate to depth <= 2 and cap <= 4 nodes.
+    var trunc = DefaultTree.init(0);
+    trunc.copyTruncatedFrom(&tree, 2, 4);
+    try std.testing.expectEqual(@as(u32, 42), trunc.nodes[0].token_id);
+    try std.testing.expectEqual(@as(u16, 4), trunc.count);
+    try std.testing.expect(trunc.max_depth <= 2);
+    // Root (0) + a1 (depth 1) + a2 (depth 2) + b1 (depth 1) = 4 nodes; b3 (depth 3) excluded.
+    try std.testing.expect(trunc.findChild(0, 10) != null);
+    try std.testing.expect(trunc.findChild(0, 20) != null);
 }
