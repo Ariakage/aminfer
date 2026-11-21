@@ -476,20 +476,27 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
     if kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT):
         return "moe_expert"
     if ".self_attn." in name:
-        if ".v_proj" in name or ".o_proj" in name:
-            return "attn_vo"
+        if ".v_proj" in name:
+            return "attn_v"
+        if ".o_proj" in name:
+            return "attn_o"
         return "attn_qk"
     if ".mlp." in name:
+        if ".down_proj" in name:
+            return "ffn_down"
         return "dense_ffn"
     return "dense"
 
 
 _ROLE_WEIGHT = {
     "router": 10.0,
-    "embedding": 4.0,
-    "lm_head": 4.0,
-    "attn_vo": 3.0,
+    "embedding": 6.0,
+    "lm_head": 6.0,
+    "attn_v": 3.2,
+    "attn_o": 3.2,
+    "attn_vo": 3.2,
     "attn_qk": 2.4,
+    "ffn_down": 1.8,
     "dense_ffn": 1.0,
     "moe_expert": 1.0,
     "dense": 1.2,
@@ -617,6 +624,41 @@ def solve_gsq_allocation(
                 if cur_bytes + extra <= budget_bytes:
                     chosen_idx[idx] = target_j
                     cur_bytes += extra
+
+    # Protection pass 3: protect boundary layers (layer 0 and final layer, critical
+    # for lexical/multilingual encoding and final logit projection) and attention
+    # projections at >= q4_affine when budget permits.
+    layer_indices = [u.layer for u in units if u.layer != NO_LAYER]
+    max_unit_layer = max(layer_indices) if layer_indices else -1
+    has_boundary_layers = max_unit_layer >= 3
+
+    def _protect_floor(predicate) -> None:
+        nonlocal cur_bytes
+        # Order deterministically by highest sensitivity first so tighter budgets
+        # protect the most critical units first.
+        order = [
+            idx for idx, u in enumerate(units)
+            if predicate(u)
+        ]
+        order.sort(key=lambda i: (-units[i].sensitivity, units[i].unit_id))
+        for idx in order:
+            u = units[idx]
+            target_j = chosen_idx[idx]
+            for j, c in enumerate(u.candidates):
+                if c.dtype == DType.Q4_AFFINE:
+                    target_j = j
+                    break
+            if target_j > chosen_idx[idx]:
+                extra = u.candidates[target_j].alg_bytes - u.candidates[chosen_idx[idx]].alg_bytes
+                if cur_bytes + extra <= budget_bytes:
+                    chosen_idx[idx] = target_j
+                    cur_bytes += extra
+
+    if has_boundary_layers:
+        _protect_floor(
+            lambda u: u.role != "moe_expert" and u.layer in (0, max_unit_layer)
+        )
+    _protect_floor(lambda u: u.role in ("attn_v", "attn_o", "attn_vo", "attn_qk"))
 
     # Main greedy marginal-distortion-per-byte knapsack over lower convex hull.
     # Tie-break deterministically by (-sensitivity, unit_id).
@@ -1393,24 +1435,37 @@ def gsq_convert(
         if len(model_id_bytes) == 0 or len(model_id_bytes) > 63:
             raise ValueError(f"model_id must be 1..63 UTF-8 bytes: {model_id_str!r}")
 
-        # 1. Extract layer-norm Hessian proxies (mean(ln_w^2)) for input & post-attention norms.
-        ln_in_energy: dict[int, float] = {}
-        ln_post_energy: dict[int, float] = {}
+        # 1. Extract scale-invariant layer-norm channel peakiness (`max(|w|) / rms(w)`)
+        #    for input & post-attention norms. Raw `mean(w^2)` grows by orders of
+        #    magnitude with depth in pre-norm Transformers (e.g. Qwen3 L0 vs L26),
+        #    which would invert sensitivity and starve early layers.
+        ln_in_peak: dict[int, float] = {}
+        ln_post_peak: dict[int, float] = {}
         max_layer = 0
         for t in src.tensors:
             if t.layer != NO_LAYER and t.layer > max_layer:
                 max_layer = t.layer
             if t.kind == TensorKind.NORM and len(t.shape) == 1 and t.layer != NO_LAYER:
                 vals = src.read_1d_f32(t)
-                energy = math.sumprod(vals, vals) / max(1, len(vals))
+                mean_sq = math.sumprod(vals, vals) / max(1, len(vals))
+                rms = math.sqrt(mean_sq) if mean_sq > 0.0 else 0.0
+                max_abs = max((abs(v) for v in vals), default=0.0)
+                peakiness = (max_abs / rms) if rms > 0.0 else 1.0
                 if "input_layernorm" in t.name:
-                    ln_in_energy[t.layer] = energy
+                    ln_in_peak[t.layer] = peakiness
                 elif "post_attention_layernorm" in t.name:
-                    ln_post_energy[t.layer] = energy
+                    ln_post_peak[t.layer] = peakiness
+
+        def _median(vals: Iterable[float]) -> float:
+            s = sorted(vals)
+            if not s:
+                return 1.0
+            mid = len(s) // 2
+            return s[mid] if (len(s) & 1) else 0.5 * (s[mid - 1] + s[mid])
 
         num_layers = max_layer + 1
-        mean_ln_in = (sum(ln_in_energy.values()) / len(ln_in_energy)) if ln_in_energy else 1.0
-        mean_ln_post = (sum(ln_post_energy.values()) / len(ln_post_energy)) if ln_post_energy else 1.0
+        med_ln_in = _median(ln_in_peak.values())
+        med_ln_post = _median(ln_post_peak.values())
 
         # 2. Partition tensors into pinned (unquantizable) vs atomic QuantUnits.
         #    MoE experts `(layer, expert)` are grouped so gate/up/down share ONE uniform DType!
@@ -1449,16 +1504,25 @@ def gsq_convert(
         def _layer_u_curve(layer: int) -> float:
             if layer == NO_LAYER or num_layers <= 1:
                 return 1.25
+            if num_layers >= 4:
+                if layer == 0 or layer == num_layers - 1:
+                    return 2.2
+                if layer == 1 or layer == num_layers - 2:
+                    return 1.5
             frac = layer / (num_layers - 1)
-            return 1.0 + 0.5 * (1.0 - 4.0 * frac * (1.0 - frac))
+            return 1.0 + 0.35 * (1.0 - 4.0 * frac * (1.0 - frac))
 
         def _hessian_proxy(role: str, layer: int) -> float:
             if layer == NO_LAYER:
                 return 1.0
-            if role in ("attn_qk", "attn_vo") and layer in ln_in_energy and mean_ln_in > 0.0:
-                return max(0.25, min(4.0, ln_in_energy[layer] / mean_ln_in))
-            if role in ("dense_ffn", "moe_expert", "router") and layer in ln_post_energy and mean_ln_post > 0.0:
-                return max(0.25, min(4.0, ln_post_energy[layer] / mean_ln_post))
+            # Only apply input_layernorm proxy to projections directly fed by it
+            # (`q_proj`, `k_proj`, `v_proj`; NOT `o_proj`), and post_attention_layernorm
+            # proxy only to projections directly fed by it (`gate`, `up`, `router`,
+            # `moe_expert`; NOT standalone `ffn_down`).
+            if role in ("attn_qk", "attn_v") and layer in ln_in_peak and med_ln_in > 0.0:
+                return max(0.85, min(1.6, ln_in_peak[layer] / med_ln_in))
+            if role in ("dense_ffn", "moe_expert", "router") and layer in ln_post_peak and med_ln_post > 0.0:
+                return max(0.85, min(1.6, ln_post_peak[layer] / med_ln_post))
             return 1.0
 
         def _build_unit(unit_id: str, members: list[_SourceTensor], role: str, layer: int, expert: int) -> QuantUnitInput:

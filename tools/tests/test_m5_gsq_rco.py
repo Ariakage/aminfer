@@ -801,6 +801,87 @@ class M5GsqRcoTests(unittest.TestCase):
                     msg=f"{label} Zig Metal 4 tokens {zig_tokens} != CPU FP32 ref {ref_tokens}",
                 )
 
+    def test_gsq_scale_invariant_ln_proxy_protects_boundary_layers_and_attention(self) -> None:
+        """Depth-growing RMSNorm gammas (1000x larger at deep layers) must not starve layer 0."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            rng = random.Random(20261121)
+            tensors: dict[str, tuple[str, tuple[int, ...], bytes]] = {}
+            num_layers = 6
+            h = 64
+            inter = 128
+            vocab = 128
+
+            def _vals_to_bf16(vals: list[float]) -> bytes:
+                f32_buf = struct.pack(f"<{len(vals)}f", *vals)
+                out = bytearray(len(vals) * 2)
+                out[0::2] = f32_buf[2::4]
+                out[1::2] = f32_buf[3::4]
+                return bytes(out)
+
+            def _rand_bf16(rows: int, cols: int, scale: float = 0.05) -> bytes:
+                return _rand_bf16_bytes(rng, rows * cols, scale)
+
+            tensors["model.embed_tokens.weight"] = ("BF16", (vocab, h), _rand_bf16(vocab, h))
+            tensors["model.norm.weight"] = ("BF16", (h,), _vals_to_bf16([1.0] * h))
+            for l in range(num_layers):
+                # Emulate Qwen3 depth growth: layer 0 has tiny gamma (0.05), deep layers grow 100x+.
+                gamma_scale = 0.05 * (4.0 ** l)
+                tensors[f"model.layers.{l}.input_layernorm.weight"] = (
+                    "BF16",
+                    (h,),
+                    _vals_to_bf16([gamma_scale] * h),
+                )
+                tensors[f"model.layers.{l}.post_attention_layernorm.weight"] = (
+                    "BF16",
+                    (h,),
+                    _vals_to_bf16([gamma_scale] * h),
+                )
+                for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                    tensors[f"model.layers.{l}.self_attn.{proj}.weight"] = ("BF16", (h, h), _rand_bf16(h, h))
+                for proj, shape in (
+                    ("gate_proj", (inter, h)),
+                    ("up_proj", (inter, h)),
+                    ("down_proj", (h, inter)),
+                ):
+                    tensors[f"model.layers.{l}.mlp.{proj}.weight"] = ("BF16", shape, _rand_bf16(*shape))
+
+            sf_dir = tmp / "model"
+            sf_dir.mkdir()
+            _write_safetensors(sf_dir / "model.safetensors", tensors)
+            (sf_dir / "config.json").write_text(
+                json.dumps({"tie_word_embeddings": True, "num_hidden_layers": num_layers}),
+                encoding="utf-8",
+            )
+            out_amf = tmp / "out.amf"
+            rep = gsq_convert(sf_dir, out_amf, target_bits=4.15, model_id="ln-scale-test", use_rco=True)
+            chosen = {
+                name.removesuffix(".weight"): u.chosen_dtype
+                for u in rep.allocation.units
+                for name in u.tensor_names
+            }
+            # Boundary layers (0 and num_layers - 1) and attention projections must be >= q4_affine.
+            for name in (
+                "embed_tokens",
+                "layers.0.self_attn.o_proj",
+                "layers.0.mlp.down_proj",
+                "layers.0.mlp.gate_proj",
+                f"layers.{num_layers - 1}.self_attn.o_proj",
+                f"layers.{num_layers - 1}.mlp.down_proj",
+            ):
+                self.assertIn(
+                    chosen[name],
+                    (DType.Q4_AFFINE, DType.BF16, DType.F16),
+                    msg=f"{name} unexpectedly dropped to {chosen[name]}",
+                )
+            # Layer 0 o_proj sensitivity must not be lower than interior layer 3 o_proj sensitivity.
+            sens = {
+                name.removesuffix(".weight"): u.sensitivity
+                for u in rep.allocation.units
+                for name in u.tensor_names
+            }
+            self.assertGreater(sens["layers.0.self_attn.o_proj"], sens["layers.3.self_attn.o_proj"])
+
 
 if __name__ == "__main__":
     unittest.main()
