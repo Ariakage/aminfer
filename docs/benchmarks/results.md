@@ -2948,3 +2948,500 @@ spec.swapouts_delta              0
 spec.token_ids                   [279, 2874, 374, 429, 279, 3853, 1231, 387, 7726, 311, 264, 2155, 4938, 3728, 2337, 11320, 11, 323, 279, 5306, 27454, 315, 279, 3853, 1231, 3635, 8318, 13, 17471, 25351, 429, 279, 3853, 374, 537, 7726, 11, 773, 279, 5306, 27454, 7146, 2697, 13, 4354, 11, 979, 1667, 3312, 14, 11421, 11, 279, 19415, 9463, 28872, 8983, 1229, 369, 601, 13, 2055, 11, 979]
 spec.text                         the reason is that the future may be moved to a different memory location during execution, and the internal pointers of the future may become invalid. Pin ensures that the future is not moved, so the internal pointers remain valid. However, when using async/await, the compiler automatically manages pinning for us. So, when
 ```
+
+
+## M4.5 bare-metal ARMv9 SME2 engine, Spike S7, C13 bus contention and D11 TRNG
+
+Measured on 2026-11-21 on the Apple M4 24 GiB baseline at commit `b23f787`
+(ReleaseFast `./zig-out/bin/aminfer probe`, `bench-m45`, `verify-amf`, `decode`,
+and `spec-decode`, default kernel tunables, `wired_budget_mib = 18186`,
+`swapouts_delta = 0` and `prefill_swapouts_delta = 0` across all archived runs).
+
+### Binary ABI, M1–M3 backward compatibility, and `otool -tvV` zero-spill audit (`C11`, `C12`)
+
+| Check | Command / scope | Measured result |
+| --- | --- | --- |
+| Deployment floor | `otool -l ./zig-out/bin/aminfer` (`LC_BUILD_VERSION`) | `minos 26.0`, `sdk 27.0` |
+| M1–M3 zero-leak check | `zig build -Doptimize=ReleaseFast -Dcpu=apple_m1` + `otool -tvV` | `34` `_ami_sme2_*` symbols; **`0`** SME/SVE instructions outside `_ami_sme2_*` |
+| Pre-`smstart` callee-save ABI | Native ReleaseFast `otool -tvV` across all `30` `_ami_sme2_*` entry kernels | `smstart = 1`, `smstop = 1`, `pre_saves = 10` (`x19–x30` + `d8–d15` saved before `smstart`), `post_restores = 10` (restored after `smstop`) |
+| Inner K-loop register spill audit | Native ReleaseFast `otool -tvV` between `smstart` and `smstop` | **`0`** stack-pointer (`[sp`) loads/stores across all `34` `_ami_sme2_*` symbols |
+
+### Spike S7: 3-way ARMv9.2 `.s` SME2 microkernels vs Apple `Accelerate` (`cblas_sgemm`)
+
+Measured via `./zig-out/bin/aminfer bench-m45` (`host.sme2=true`, `svl_bytes=64`,
+`pcore_clusters=1`, `cpus_per_l2=4`, `pcore_l2_kib=16384`, `swapouts_delta = 0`).
+`vs_acc` compares SME2 against pre-dequantized FP32 `cblas_sgemm`; `vs_dq+ac`
+compares SME2 against scalar dequantization + `cblas_sgemm` for quantized types.
+
+| Scenario | Dtype | Hint | `M×N×K` | `T` | `sme2_us` | Eff. `GB/s` | `GFLOP/s` | `acc_us` | `vs_acc` | `vs_dq+ac` |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `l2_router` | `bf16` | `ld1` | `1×128×2048` | 1 | 4.33 | 122.06 | 121.00 | 3.08 | 0.71× | 0.71× |
+| `l2_router` | `bf16` | `ld1` | `16×128×2048` | 1 | **11.58** | 51.63 | 724.22 | 24.33 | **2.10×** | **2.10×** |
+| `l2_router` | `q4` | `ld1` | `1×128×2048` | 1 | 4.17 | 40.42 | 125.82 | 3.67 | 0.88× | **18.92×** |
+| `l2_router` | `q4` | `ld1` | `16×128×2048` | 1 | **16.63** | 14.29 | 504.58 | 22.42 | **1.35×** | **5.93×** |
+| `l2_proj` | `bf16` | `ld1` | `8×1024×2048` | 4 | **49.58** | 85.91 | 676.73 | 198.29 | **4.00×** | **4.00×** |
+| `l2_proj` | `bf16` | `ld1` | `16×1024×2048` | 4 | **46.13** | 93.78 | **1,454.93** | 175.33 | **3.80×** | **3.80×** |
+| `l2_proj` | `bf16` | `ld1` | `32×1024×2048` | 4 | **90.75** | 49.11 | 1,478.98 | 183.88 | **2.03×** | **2.03×** |
+| `l2_proj` | `bf16` | `ld1` | `128×1024×2048` | 4 | 345.71 | 15.17 | **1,552.96** | 446.17 | **1.29×** | **1.29×** |
+| `l2_proj` | `f16` | `ld1` | `16×1024×2048` | 4 | **48.00** | 90.11 | 1,398.10 | 182.21 | **3.80×** | **3.80×** |
+| `l2_proj` | `f16` | `ld1` | `512×1024×2048` | 4 | 1,355.92 | 6.19 | **1,583.79** | 1,436.13 | **1.06×** | **1.06×** |
+| `l2_proj` | `q4` | `ld1` | `1×1024×2048` | 4 | 31.25 | 42.21 | 134.22 | 31.63 | 1.01× | **18.78×** |
+| `l2_proj` | `q4` | `ld1` | `16×1024×2048` | 4 | **80.92** | 17.82 | 829.35 | 170.67 | **2.11×** | **9.31×** |
+| `l2_proj` | `q4` | `ld1` | `32×1024×2048` | 4 | **87.96** | 17.88 | **1,525.93** | 172.92 | **1.97×** | **8.38×** |
+| `l2_proj` | `q4` | `ld1` | `128×1024×2048` | 4 | 342.33 | 6.89 | **1,568.27** | 437.25 | **1.28×** | **2.98×** |
+| `l2_proj` | `q3` | `ld1` | `1×1024×2048` | 4 | 42.92 | 24.62 | 97.73 | 31.17 | 0.73× | **14.06×** |
+| `l2_proj` | `q3` | `ld1` | `128×1024×2048` | 4 | 347.00 | 6.04 | **1,547.18** | 443.21 | **1.28×** | **2.86×** |
+| `l2_proj` | `q2` | `ld1` | `1×1024×2048` | 4 | 28.71 | 27.68 | 146.10 | 24.08 | 0.84× | **20.43×** |
+| `l2_proj` | `q2` | `ld1` | `128×1024×2048` | 4 | 364.17 | 5.04 | **1,474.24** | 426.21 | **1.17×** | **2.72×** |
+| `dram_slc_bust` | `bf16` | `ld1` | `1×4096×4096` | 4 | 522.17 | 64.31 | 64.26 | 1,016.96 | **1.95×** | **1.95×** |
+| `dram_slc_bust` | `bf16` | `ldnt` | `1×4096×4096` | 4 | **473.67** | **70.89** | 70.84 | 1,036.92 | **2.19×** | **2.19×** |
+| `dram_slc_bust` | `bf16` | `ld1` | `16×4096×4096` | 4 | **488.92** | 69.43 | 1,098.08 | 2,188.63 | **4.48×** | **4.48×** |
+| `dram_slc_bust` | `bf16` | `ld1` | `128×4096×4096` | 4 | 2,588.83 | 14.18 | **1,659.04** | 3,762.33 | **1.45×** | **1.45×** |
+| `dram_slc_bust` | `q4` | `ld1` | `1×4096×4096` | 4 | **218.38** | 48.13 | 153.66 | 1,003.46 | **4.60×** | **26.12×** |
+| `dram_slc_bust` | `q4` | `ldnt` | `1×4096×4096` | 4 | 219.54 | 47.87 | 152.84 | 997.83 | **4.55×** | **25.41×** |
+| `dram_slc_bust` | `q3` | `ldnt` | `1×4096×4096` | 4 | 313.04 | 26.88 | 107.19 | 986.33 | **3.15×** | **17.81×** |
+| `dram_slc_bust` | `q2` | `ldnt` | `1×4096×4096` | 4 | **208.50** | 30.29 | 160.93 | 995.42 | **4.77×** | **26.56×** |
+
+P-cluster thread scaling sweep (`1 / 2 / 4` threads on M4's single 4-core P-cluster):
+- **L2-hot compute** (`bf16 16×2048×2048`, `bf16 128×2048×2048`, `q4 1×2048×2048`): 1 thread already saturates `95–100%` of M4's shared SME2 matrix unit (`1.00–1.05×` at 2–4T, peaking at **`1,716.73 GFLOP/s`** at 2T `M=128`, dropping to `0.91×` at 4T), empirically confirming [ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md)'s 1-worker-per-P-cluster rule for compute-bound workloads.
+- **DRAM-bound `q4` `1×4096×4096`**: scales `1.00× → 1.17× → 1.24×` (`54.49 → 63.73 → 67.74 GB/s`) across `1 / 2 / 4` threads as additional P-cores expose more DRAM memory-level parallelism.
+
+### `C13` concurrent Metal 4 GPU + CPU SME2 bus gate, `ldnt1b` L2 preservation, and router calibration
+
+| Scenario | SME2 workload | GPU solo (`GB/s`) | GPU concurrent (`GB/s`) | GPU delta | SME2 solo (`us`) | SME2 conc (`us`) | Aggregate (`GB/s`) | Net speedup | Gate (`> 1.05×`) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `gpu+sme2_l2_router` | `bf16 16×1024×2048` (L2-hot) | 78.04 | **79.62** | **+2.0%** | 44.4 | 56.9 | **155.57** | **1.80×** | **PASS** |
+| `gpu+sme2_dram_ld1` | `q4 1×4096×4096` (DRAM `ld1b`) | 78.04 | 68.29 | -12.5% | 212.1 | 470.1 | 90.65 | **1.33×** | **PASS** |
+| `gpu+sme2_dram_ldnt1` | `q4 1×4096×4096` (DRAM `ldnt1b`) | 78.04 | **71.64** | **-8.2%** | 198.0 | 480.9 | **93.49** | **1.33×** | **PASS** |
+
+- **`ldnt1b` cold-expert L2 cache preservation (`4 MiB` hot router + `16.88 MiB` cold `q4` SwiGLU stream)**:
+  - Hot router baseline: **`44.17 us`**.
+  - After sweeping `6` cold `q4` experts with temporal **`ld1b`**: hot router degrades **`+40.9%`** to **`62.25 us`** (`cold = 86.31 us/expert`).
+  - After sweeping `6` cold `q4` experts with non-temporal **`ldnt1b`**: hot router holds at **`44.08 us` (`-0.2%`, zero L2 eviction)** and cold experts also run faster at **`81.51 us/expert` (`-5.6%`)**.
+- **L2-resident SME2 vs Metal 4 GPU speculative tree router prediction (`8×128×2048`, `4 MiB` bank)**:
+  - `M = 1`: GPU `573.46 us` vs SME2 **`32.38 us`** (**`17.71×`**, `100.00%` top-k agreement).
+  - `M = 8`: GPU `857.92 us` vs SME2 **`74.75 us`** (**`11.48×`**, `100.00%` top-k agreement).
+  - `M = 16`: GPU `759.17 us` vs SME2 **`106.13 us`** (**`7.15×`**, `99.90%` top-k agreement).
+
+### Real-checkpoint M4.5 verification (`W15`, `C13`, `D11`)
+
+1. **100% `.amf` v0 backward compatibility (`W15`)**: All four existing real checkpoints (`qwen3-0.6b-bf16.amf`, `qwen3-14b-4bit.amf`, `qwen3-30b-a3b-3bit.amf`, `qwen3-30b-a3b-eagle3.amf`) pass `aminfer verify-amf` unchanged. Repacking real `qwen3-0.6b-bf16.amf` with `aminfer-tools repack-sme2 --targets all-linear` converts `196` linear tensors to `sme2_panel64` in `5.50 s` at the exact same file size (`1,193,885,696 B`, `1,195 MiB` wired, zero RAM duplication, `swapouts_delta = 0`). Full-model `M = 1` decode on CPU SME2 runs at `21.94 tok/s` (`26.26 GB/s`, `malloc_blocks_delta = 1`) vs Metal 4 GPU `68.67 tok/s` (`82.19 GB/s`) — matching the first 10 tokens verbatim before a 1-ULP `BFMOPA`/`BFDOT` vs GPU FP32-FMA reduction tie-break at token 11 across 196 BF16 projections — empirically confirming `C13`'s rule to keep full-model dense `M = 1` decode on GPU while steering L2-resident routers and cold-expert digestion to SME2.
+2. **Real `Qwen3-30B-A3B-3bit` + `EAGLE-3` GPU-router vs SME2 L2-router A/B (`C13`, C++20 SPSC ring buffer, `34 → 64` tokens, `T = 0`, `swapouts_delta = 0`)**:
+
+| Mode | Router backend | Wired (`MiB`) | `prefill_ms` | `prune_ms/round` | `decode tok/s` | Speedup vs base | `malloc_blocks_delta` | Exact `token_ids` | `swapouts` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| Baseline `decode` | — | 12,791 | 1,040.5 | — | 49.73 | 1.000× | 126 | baseline | 0 |
+| `EAGLE-3 + L1 + D7` (`--sme-router gpu`) | `gpu` | 13,876 | 287.9 | 0.396 | 52.49 | 1.055× | 320 | **64 / 64 (100%)** | 0 |
+| **`EAGLE-3 + L1 + D7` (`--sme-router auto`)** | **`sme2`** (`78.0` vs `975.5 us`, `12.51×`) | 13,880 (`+4`) | **266.3** | **0.217 (`-45.2%`)** | **52.97** | **1.065×** | **194 (`-39.4%`)** | **64 / 64 (100%)** | 0 |
+
+3. **Real `Qwen3-0.6B` BF16 `D11` Secure Enclave TRNG + bit-exact explicit replay (`T = 0.7`, `32` tokens, `swapouts_delta = 0`)**:
+
+| CLI mode | Run | `seed_source` | `seed_used` | `decode tok/s` | Verification |
+| --- | --- | --- | ---: | ---: | --- |
+| `decode` | Run 1 (no `--seed`) | `hardware_trng` | `15577856275329892283` | 61.85 | distinct 64-bit SEP TRNG seed |
+| `decode` | Run 2 (no `--seed`) | `hardware_trng` | `8891266525397946930` | 64.79 | distinct seed & diverse text vs Run 1 |
+| `decode` | Replay (`--seed <Run 1>`) | `explicit` | `15577856275329892283` | 66.23 | **32 / 32 (100%) bit-exact `token_ids` vs Run 1** |
+| `spec-decode` | Run 1 (no `--seed`) | `hardware_trng` | `4723189805597218849` | 62.64 | distinct 64-bit SEP TRNG seed |
+| `spec-decode` | Run 2 (no `--seed`) | `hardware_trng` | `3910625554483478406` | 65.49 | distinct seed & diverse text vs Run 1 |
+| `spec-decode` | Replay (`--seed <Run 1>`) | `explicit` | `4723189805597218849` | 66.18 | **32 / 32 (100%) bit-exact `token_ids` vs Run 1** |
+
+### Verbatim binary audit, `aminfer probe`, and `aminfer bench-m45` raw stdout (commit `b23f787`)
+
+```text
+=== 1. M1 BINARY COMPATIBILITY AUDIT (-Dcpu=apple_m1) ===
+m1_build.ami_sme2_symbols = 34
+m1_build.non_sme2_sme_instruction_leaks = 0
+=== 2. NATIVE RELEASEFAST BUILD & OTOOL SPILL AUDIT ===
+      cmd LC_BUILD_VERSION
+  cmdsize 32
+ platform 1
+    minos 26.0
+      sdk 27.0
+native_build.ami_sme2_symbols = 34
+  _ami_sme2_drain_1x4: insns=75 smstart=0 smstop=0 pre_saves=0 post_restores=0 streaming_sp=0
+  _ami_sme2_drain_2x2: insns=90 smstart=0 smstop=0 pre_saves=0 post_restores=0 streaming_sp=0
+  _ami_sme2_epilogue_store_vec: insns=65 smstart=0 smstop=0 pre_saves=0 post_restores=0 streaming_sp=0
+  _ami_sme2_m1_4_bf16_nt: insns=180 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_bf16_t: insns=180 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_f16_nt: insns=180 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_f16_t: insns=180 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_q2_nt: insns=392 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_q2_t: insns=392 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_q3_nt: insns=292 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_q3_t: insns=292 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_q4_nt: insns=400 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m1_4_q4_t: insns=400 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_bf16_nt: insns=100 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_bf16_t: insns=100 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_f16_nt: insns=100 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_f16_t: insns=100 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_q2_nt: insns=529 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_q2_t: insns=532 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_q3_nt: insns=524 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_q3_t: insns=524 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_q4_nt: insns=200 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m32_q4_t: insns=200 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_bf16_nt: insns=108 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_bf16_t: insns=108 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_f16_nt: insns=108 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_f16_t: insns=108 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_q2_nt: insns=652 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_q2_t: insns=652 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_q3_nt: insns=672 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_q3_t: insns=672 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_q4_nt: insns=248 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_m5_16_q4_t: insns=248 smstart=1 smstop=1 pre_saves=10 post_restores=10 streaming_sp=0
+  _ami_sme2_store_m1_4_panel: insns=49 smstart=0 smstop=0 pre_saves=0 post_restores=0 streaming_sp=0
+native_build.total_streaming_sp_accesses = 0
+
+=== 3. AMINFER PROBE ===
+sys.page_size                    16384
+sys.memory_mib                   24576
+cpu.performance_cores            4
+cpu.efficiency_cores             6
+cpu.pcore_clusters               1
+cpu.pcore_l2_kib                 16384
+cpu.sme2                         true
+cpu.sme_bf16f32                  true
+cpu.sme_f16f32                   true
+cpu.sme_svl_bytes                64
+wire.user_limit_bytes            19585050869
+wire.global_limit_bytes          19585050869
+wire.gpu_limit_mib               0
+gpu.name                         Apple M4
+gpu.apple_family                 9
+gpu.metal4                       true
+gpu.unified_memory               true
+gpu.recommended_working_set_mib  18186
+gpu.max_buffer_mib               13639
+ane.cores                        16
+budget.wired_limit_mib           18186
+budget.binding_limit             MTLDevice.recommendedMaxWorkingSetSize
+
+=== 4. AMINFER BENCH-M45 ===
+
+=== M4.5 Bare-Metal ARMv9 SME2 Engine & C13 Concurrent Bus Suite ===
+
+=== Spike S7 Standalone: ARMv9 SME2 vs Apple Accelerate (cblas_sgemm) ===
+host.sme2=true sme_b16f32=true sme_f16f32=true svl_bytes=64 pcore_clusters=1 cpus_per_l2=4 pcore_l2_kib=16384 swapouts_delta=0
+
+scenario         dtype hint    M     N     K  T |   sme2_us     GB/s   GFLOP/s |    acc_us    acc_GF |  vs_acc vs_dq+ac
+l2_router        bf16  ld1     1   128  2048  1 |      4.33   122.06    121.00 |      3.08    170.06 |   0.71x    0.71x
+l2_router        bf16  ld1    16   128  2048  1 |     11.58    51.63    724.22 |     24.33    344.74 |   2.10x    2.10x
+l2_router        q4    ld1     1   128  2048  1 |      4.17    40.42    125.82 |      3.67    143.01 |   0.88x   18.92x
+l2_router        q4    ld1    16   128  2048  1 |     16.63    14.29    504.58 |     22.42    374.21 |   1.35x    5.93x
+l2_proj          bf16  ld1     1  1024  2048  4 |     25.21   166.71    166.38 |     30.75    136.40 |   1.22x    1.22x
+l2_proj          bf16  ld1     4  1024  2048  4 |     92.13    45.88    182.11 |    180.42     92.99 |   1.96x    1.96x
+l2_proj          bf16  ld1     8  1024  2048  4 |     49.58    85.91    676.73 |    198.29    169.22 |   4.00x    4.00x
+l2_proj          bf16  ld1    16  1024  2048  4 |     46.13    93.78   1454.93 |    175.33    382.75 |   3.80x    3.80x
+l2_proj          bf16  ld1    32  1024  2048  4 |     90.75    49.11   1478.98 |    183.88    729.94 |   2.03x    2.03x
+l2_proj          bf16  ld1   128  1024  2048  4 |    345.71    15.17   1552.96 |    446.17   1203.30 |   1.29x    1.29x
+l2_proj          bf16  ld1   512  1024  2048  4 |   1447.96     5.79   1483.11 |   1453.88   1477.08 |   1.00x    1.00x
+l2_proj          f16   ld1     1  1024  2048  4 |     31.67   132.71    132.45 |     35.25    118.99 |   1.11x    1.11x
+l2_proj          f16   ld1    16  1024  2048  4 |     48.00    90.11   1398.10 |    182.21    368.31 |   3.80x    3.80x
+l2_proj          f16   ld1   128  1024  2048  4 |    341.75    15.34   1570.95 |    449.00   1195.70 |   1.31x    1.31x
+l2_proj          f16   ld1   512  1024  2048  4 |   1355.92     6.19   1583.79 |   1436.13   1495.33 |   1.06x    1.06x
+l2_proj          q4    ld1     1  1024  2048  4 |     31.25    42.21    134.22 |     31.63    132.63 |   1.01x   18.78x
+l2_proj          q4    ld1     4  1024  2048  4 |     98.79    13.60    169.83 |    179.79     93.31 |   1.82x    7.39x
+l2_proj          q4    ld1    16  1024  2048  4 |     80.92    17.82    829.35 |    170.67    393.22 |   2.11x    9.31x
+l2_proj          q4    ld1    32  1024  2048  4 |     87.96    17.88   1525.93 |    172.92    776.20 |   1.97x    8.38x
+l2_proj          q4    ld1   128  1024  2048  4 |    342.33     6.89   1568.27 |    437.25   1227.84 |   1.28x    2.98x
+l2_proj          q3    ld1     1  1024  2048  4 |     42.92    24.62     97.73 |     31.17    134.58 |   0.73x   14.06x
+l2_proj          q3    ld1    16  1024  2048  4 |     83.33    14.16    805.31 |    169.29    396.41 |   2.03x    8.78x
+l2_proj          q3    ld1   128  1024  2048  4 |    347.00     6.04   1547.18 |    443.21   1211.33 |   1.28x    2.86x
+l2_proj          q2    ld1     1  1024  2048  4 |     28.71    27.68    146.10 |     24.08    174.16 |   0.84x   20.43x
+l2_proj          q2    ld1    16  1024  2048  4 |     79.88    11.49    840.17 |    167.13    401.55 |   2.09x    9.09x
+l2_proj          q2    ld1   128  1024  2048  4 |    364.17     5.04   1474.24 |    426.21   1259.65 |   1.17x    2.72x
+dram_slc_bust    bf16  ld1     1  4096  4096  4 |    522.17    64.31     64.26 |   1016.96     32.99 |   1.95x    1.95x
+dram_slc_bust    bf16  ldnt    1  4096  4096  4 |    473.67    70.89     70.84 |   1036.92     32.36 |   2.19x    2.19x
+dram_slc_bust    bf16  ld1    16  4096  4096  4 |    488.92    69.43   1098.08 |   2188.63    245.30 |   4.48x    4.48x
+dram_slc_bust    bf16  ld1   128  4096  4096  4 |   2588.83    14.18   1659.04 |   3762.33   1141.57 |   1.45x    1.45x
+dram_slc_bust    q4    ld1     1  4096  4096  4 |    218.38    48.13    153.66 |   1003.46     33.44 |   4.60x   26.12x
+dram_slc_bust    q4    ldnt    1  4096  4096  4 |    219.54    47.87    152.84 |    997.83     33.63 |   4.55x   25.41x
+dram_slc_bust    q4    ld1    16  4096  4096  4 |    572.54    19.00    937.70 |   2167.33    247.71 |   3.79x   12.14x
+dram_slc_bust    q4    ldnt   16  4096  4096  4 |    571.21    19.05    939.89 |   2214.83    242.40 |   3.88x   12.17x
+dram_slc_bust    q3    ldnt    1  4096  4096  4 |    313.04    26.88    107.19 |    986.33     34.02 |   3.15x   17.81x
+dram_slc_bust    q2    ldnt    1  4096  4096  4 |    208.50    30.29    160.93 |    995.42     33.71 |   4.77x   26.56x
+
+--- P-Cluster Thread Scaling Sweep (1 / 2 / 4 threads) ---
+scenario         dtype    M     N     K  T |   sme2_us     GB/s   GFLOP/s |   scale
+sweep_l2_q4      q4       1  2048  2048  1 |     50.50    52.15    166.11 |   1.00x
+sweep_l2_q4      q4       1  2048  2048  2 |     49.54    53.16    169.32 |   1.02x
+sweep_l2_q4      q4       1  2048  2048  4 |     51.92    50.73    161.58 |   0.97x
+sweep_l2_bf16    bf16    16  2048  2048  1 |     82.33   104.27   1630.18 |   1.00x
+sweep_l2_bf16    bf16    16  2048  2048  2 |     80.79   106.26   1661.27 |   1.02x
+sweep_l2_bf16    bf16    16  2048  2048  4 |     78.67   109.13   1706.15 |   1.05x
+sweep_l2_bf16    bf16   128  2048  2048  1 |    641.71    15.52   1673.26 |   1.00x
+sweep_l2_bf16    bf16   128  2048  2048  2 |    625.46    15.93   1716.73 |   1.03x
+sweep_l2_bf16    bf16   128  2048  2048  4 |    706.54    14.10   1519.71 |   0.91x
+sweep_dram_q4    q4       1  4096  4096  1 |    192.88    54.49    173.97 |   1.00x
+sweep_dram_q4    q4       1  4096  4096  2 |    164.92    63.73    203.46 |   1.17x
+sweep_dram_q4    q4       1  4096  4096  4 |    155.17    67.74    216.25 |   1.24x
+
+--- C13 Concurrent Metal 4 GPU + CPU SME2 Unified-Bus Contention Gate (M4 120 GB/s) ---
+scenario              sme_shape         gpu_solo   gpu_conc  gpu_d% | sme_solo   sme_conc   agg_GB/s  net_spd  gate
+gpu+sme2_l2_router    bf16:16x1024x2048  78.04GB/s  79.62GB/s    2.0% |    44.4us    56.9us   155.57    1.80x  PASS
+gpu+sme2_dram_ld1     q4:1x4096x4096     78.04GB/s  68.29GB/s  -12.5% |   212.1us   470.1us    90.65    1.33x  PASS
+gpu+sme2_dram_ldnt1   q4:1x4096x4096     78.04GB/s  71.64GB/s   -8.2% |   198.0us   480.9us    93.49    1.33x  PASS
+
+--- C12/C13 ldnt1b Non-Temporal Cold-Expert L2 Cache Preservation ---
+ldnt_l2.hot_router_kib           4096.0
+ldnt_l2.cold_stream_mib          16.88 (6 q4 SwiGLU experts)
+ldnt_l2.hot_baseline_us          44.17
+ldnt_l2.hot_after_ld1_us         62.25 (40.9% vs baseline)
+ldnt_l2.hot_after_ldnt1_us       44.08 (-0.2% vs baseline)
+ldnt_l2.cold_swiglu_ld1_us       86.31 /expert
+ldnt_l2.cold_swiglu_ldnt1_us     81.51 /expert
+
+--- C13 L2-Resident SME2 vs Metal 4 GPU Speculative Tree Router Prediction ---
+router_cal.bank_kib              4096.0
+M    shape (L x E x H)       gpu_us    sme2_us   speedup   topk_agree
+1    8x128x2048              573.46      32.38    17.71x   100.00%
+8    8x128x2048              857.92      74.75    11.48x   100.00%
+16   8x128x2048              759.17     106.13     7.15x    99.90%
+
+M4.5 Swap Check
+m45.swap.status                  ok
+m45.swap.swapouts_delta          0
+m45.swap.pageouts_delta          0
+```
+
+### Verbatim real-checkpoint `verify-amf`, `repack-sme2`, `Qwen3-30B-A3B-3bit` + `EAGLE-3` C13 A/B, and `Qwen3-0.6B` D11 TRNG raw stdout (commit `b23f787`)
+
+```text
+=== 5. VERIFY-AMF ON ALL 4 EXISTING REAL CHECKPOINTS ===
+--- verify-amf /Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf ---
+amf.status       ok
+amf.model_id     qwen3-0.6b-bf16
+amf.tensors      310
+amf.file_bytes   1193885696
+amf.wired_bytes  1193820160
+amf.cold_bytes   0
+--- verify-amf /Volumes/Akari/models/amf/qwen3-14b-4bit.amf ---
+amf.status       ok
+amf.model_id     qwen3-14b-4bit
+amf.tensors      443
+amf.file_bytes   8309669888
+amf.wired_bytes  8309587968
+amf.cold_bytes   0
+--- verify-amf /Volumes/Akari/models/amf/qwen3-30b-a3b-3bit.amf ---
+amf.status       ok
+amf.model_id     qwen3-30b-a3b-3bit
+amf.tensors      18867
+amf.file_bytes   13363314688
+amf.wired_bytes  13360873472
+amf.cold_bytes   0
+--- verify-amf /Volumes/Akari/models/amf/qwen3-30b-a3b-eagle3.amf ---
+amf.status       ok
+amf.model_id     qwen3-30b-a3b-eagle3
+amf.tensors      15
+amf.file_bytes   1044217856
+amf.wired_bytes  1044185088
+amf.cold_bytes   0
+
+=== 6. REPACK-SME2 REAL QWEN3-0.6B-BF16 SINGLE-OWNER CHECK ===
+repacked /Volumes/Akari/.tmp/qwen3-0.6b-sme2.amf (1193885696 bytes, targets=all-linear): sme2_panel64=196, row_major=114 in 5.50 s
+amf.status       ok
+amf.model_id     qwen3-0.6b-bf16
+amf.tensors      310
+amf.file_bytes   1193885696
+amf.wired_bytes  1193820160
+amf.cold_bytes   0
+--- decode original row_major ---
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1195
+decode.prompt_tokens             10
+decode.generated_tokens          32
+decode.prefill_ms                164.506
+decode.decode_ms_per_tok         14.563
+decode.decode_tok_per_s          68.67
+decode.bytes_per_tok             1196918784
+decode.effective_gbs             82.19
+decode.malloc_blocks_delta       62
+decode.malloc_bytes_delta        3968
+decode.swapouts_delta            0
+decode.token_ids                 [8162, 37150, 72434, 13850, 374, 264, 3175, 4938, 3550, 429, 374, 1483, 369, 678, 279, 8357, 323, 11364, 4303, 389, 264, 7401, 13, 1084, 374, 264, 3175, 4938, 3550, 429, 374, 1483]
+decode.text                       Apple Silicon Unified Memory is a single memory space that is used for all the applications and processes running on a Mac. It is a single memory space that is used
+--- decode repacked sme2_panel64 ---
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1195
+decode.prompt_tokens             10
+decode.generated_tokens          32
+decode.prefill_ms                485.986
+decode.decode_ms_per_tok         45.572
+decode.decode_tok_per_s          21.94
+decode.bytes_per_tok             1196918784
+decode.effective_gbs             26.26
+decode.malloc_blocks_delta       1
+decode.malloc_bytes_delta        192
+decode.swapouts_delta            0
+decode.sme2_weights              yes
+decode.token_ids                 [8162, 37150, 72434, 13850, 374, 264, 3175, 4938, 3550, 429, 5610, 678, 279, 821, 323, 11221, 429, 264, 7401, 61594, 6366, 5711, 11, 2670, 279, 10350, 1849, 11, 8357, 11, 323, 1008]
+decode.text                       Apple Silicon Unified Memory is a single memory space that contains all the data and instructions that a Macintosh computer uses, including the operating system, applications, and other
+
+=== 7. REAL QWEN3-0.6B BF16 D11 TRNG + REPLAY (DECODE & SPEC-DECODE) ===
+--- decode TRNG run 1 (no --seed) ---
+decode.temperature               0.70
+decode.seed_used                 15577856275329892283
+decode.seed_source               hardware_trng
+decode.decode_tok_per_s          61.85
+decode.swapouts_delta            0
+decode.token_ids                 [279, 10085, 11, 12941, 6945, 11, 323, 30128, 24231, 13, 5443, 220, 20, 23992, 962, 4244, 13, 8886, 1555, 702, 311, 614, 220, 20, 4244, 2790, 13, 576, 6386, 38242, 1265, 387]
+--- decode TRNG run 2 (no --seed) ---
+decode.temperature               0.70
+decode.seed_used                 8891266525397946930
+decode.seed_source               hardware_trng
+decode.decode_tok_per_s          64.79
+decode.swapouts_delta            0
+decode.token_ids                 [220, 16, 13, 8162, 37150, 374, 264, 35821, 6200, 11, 220, 17, 13, 8162, 37150, 374, 264, 26917, 1849, 11, 220, 18, 13, 8162, 37150, 374, 264, 6200, 315, 279, 3853, 382]
+--- decode REPLAY run 3 (--seed 15577856275329892283) ---
+decode.temperature               0.70
+decode.seed_used                 15577856275329892283
+decode.seed_source               explicit
+decode.decode_tok_per_s          66.23
+decode.swapouts_delta            0
+decode.token_ids                 [279, 10085, 11, 12941, 6945, 11, 323, 30128, 24231, 13, 5443, 220, 20, 23992, 962, 4244, 13, 8886, 1555, 702, 311, 614, 220, 20, 4244, 2790, 13, 576, 6386, 38242, 1265, 387]
+VERIFY decode: seed1=15577856275329892283 seed2=8891266525397946930 distinct=YES diverse=YES replay_bit_exact=YES
+--- spec-decode TRNG run 1 (no --seed) ---
+spec.temperature                 0.70
+spec.seed_used                   4723189805597218849
+spec.seed_source                 hardware_trng
+spec.decode_tok_per_s            62.64
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [264, 3671, 429, 374, 7988, 323, 11050, 11, 7881, 553, 8162, 4848, 13, 304, 279, 2274, 11, 323, 429, 374, 1483, 304, 279, 8162, 24982, 13, 7281, 11, 2924, 279, 829, 315]
+--- spec-decode TRNG run 2 (no --seed) ---
+spec.temperature                 0.70
+spec.seed_used                   3910625554483478406
+spec.seed_source                 hardware_trng
+spec.decode_tok_per_s            65.49
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [264, 5662, 624, 32942, 38242, 374, 264, 75434, 1352, 429, 5711, 2326, 5128, 11, 1817, 448, 264, 47604, 480, 1760, 315, 220, 20, 624, 785, 1156, 1555, 1265, 614, 220, 20, 47604]
+--- spec-decode REPLAY run 3 (--seed 4723189805597218849) ---
+spec.temperature                 0.70
+spec.seed_used                   4723189805597218849
+spec.seed_source                 explicit
+spec.decode_tok_per_s            66.18
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [264, 3671, 429, 374, 7988, 323, 11050, 11, 7881, 553, 8162, 4848, 13, 304, 279, 2274, 11, 323, 429, 374, 1483, 304, 279, 8162, 24982, 13, 7281, 11, 2924, 279, 829, 315]
+VERIFY spec-decode: seed1=4723189805597218849 seed2=3910625554483478406 distinct=YES diverse=YES replay_bit_exact=YES
+
+=== 8. REAL QWEN3-30B-A3B-3BIT + EAGLE-3 GPU-ROUTER vs SME2-ROUTER A/B (T=0) ===
+--- 8A. Qwen3-30B-A3B-3bit baseline decode (T=0) ---
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 12791
+decode.prompt_tokens             34
+decode.generated_tokens          64
+decode.prefill_ms                1040.538
+decode.decode_ms_per_tok         20.110
+decode.decode_tok_per_s          49.73
+decode.bytes_per_tok             1340781440
+decode.effective_gbs             66.67
+decode.malloc_blocks_delta       126
+decode.malloc_bytes_delta        8064
+decode.swapouts_delta            0
+decode.token_ids                 [151667, 198, 32313, 11, 358, 1184, 311, 4211, 264, 5296, 12577, 3175, 45254, 3828, 3175, 14859, 11761, 10058, 4147, 304, 356, 1027, 17, 15, 1667, 1460, 486, 6618, 448, 21256, 88648, 21391, 13, 6771, 752, 1744, 911, 1246, 311, 5486, 419, 382, 5338, 11, 279, 10058, 4147, 374, 264, 8356, 7174, 1334, 13, 576, 1376, 374, 311, 990, 24510, 7525, 311, 5978, 4516, 7149]
+decode.text                      <think>
+Okay, I need to implement a lock-free single-producer single-consumer ring buffer in C++20 using std::atomic with acquire/release ordering. Let me think about how to approach this.
+
+First, the ring buffer is a fixed-size array. The key is to use atomic operations to ensure thread safety
+
+--- 8B. Qwen3-30B-A3B-3bit + EAGLE-3 spec-decode (--sme-router gpu, T=0) ---
+spec.arch                        qwen3_moe (q3)
+spec.mode                        eagle3
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       1383.6
+spec.placement_gate_gpu_us       292.2
+spec.router_pred_backend         gpu (requested=gpu)
+spec.router_pred_cal             sme2_us=0.0 gpu_us=0.0 bank_kib=0.0
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.seed_used                   0
+spec.seed_source                 greedy
+spec.layers                      48
+spec.shards                      1
+spec.wired_mib                   13876
+spec.prompt_tokens               34
+spec.generated_tokens            64
+spec.rounds                      26
+spec.mean_accept_len             2.423
+spec.accept_hist                 [1:7, 2:7, 3:6, 4:6]
+spec.drafted_nodes_per_round     10.69
+spec.verified_nodes_per_round    2.88
+spec.l1_seed_rounds              6
+spec.unique_experts_per_layer    15.31
+spec.prefill_ms                  287.852
+spec.decode_ms_per_tok           19.050
+spec.decode_tok_per_s            52.49
+spec.draft_ms_per_round          4.184
+spec.prune_ms_per_round          0.396
+spec.verify_ms_per_round         36.177
+spec.commit_sync_ms_per_round    5.402
+spec.bytes_per_accepted_tok      851223595
+spec.effective_gbs               44.68
+spec.malloc_blocks_delta         320
+spec.malloc_bytes_delta          20640
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [151667, 198, 32313, 11, 358, 1184, 311, 4211, 264, 5296, 12577, 3175, 45254, 3828, 3175, 14859, 11761, 10058, 4147, 304, 356, 1027, 17, 15, 1667, 1460, 486, 6618, 448, 21256, 88648, 21391, 13, 6771, 752, 1744, 911, 1246, 311, 5486, 419, 382, 5338, 11, 279, 10058, 4147, 374, 264, 8356, 7174, 1334, 13, 576, 1376, 374, 311, 990, 24510, 7525, 311, 5978, 4516, 7149]
+
+--- 8C. Qwen3-30B-A3B-3bit + EAGLE-3 spec-decode (--sme-router auto -> SME2 L2, T=0) ---
+spec.arch                        qwen3_moe (q3)
+spec.mode                        eagle3
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       1317.5
+spec.placement_gate_gpu_us       240.8
+spec.router_pred_backend         sme2 (requested=auto)
+spec.router_pred_cal             sme2_us=78.0 gpu_us=975.5 bank_kib=4096.0
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.seed_used                   0
+spec.seed_source                 greedy
+spec.layers                      48
+spec.shards                      1
+spec.wired_mib                   13880
+spec.prompt_tokens               34
+spec.generated_tokens            64
+spec.rounds                      26
+spec.mean_accept_len             2.423
+spec.accept_hist                 [1:6, 2:8, 3:7, 4:5]
+spec.drafted_nodes_per_round     10.04
+spec.verified_nodes_per_round    2.85
+spec.l1_seed_rounds              6
+spec.unique_experts_per_layer    15.20
+spec.prefill_ms                  266.302
+spec.decode_ms_per_tok           18.878
+spec.decode_tok_per_s            52.97
+spec.draft_ms_per_round          3.774
+spec.prune_ms_per_round          0.217
+spec.verify_ms_per_round         36.147
+spec.commit_sync_ms_per_round    5.604
+spec.bytes_per_accepted_tok      846664147
+spec.effective_gbs               44.85
+spec.malloc_blocks_delta         194
+spec.malloc_bytes_delta          12576
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [151667, 198, 32313, 11, 358, 1184, 311, 4211, 264, 5296, 12577, 3175, 45254, 3828, 3175, 14859, 11761, 10058, 4147, 304, 356, 1027, 17, 15, 1667, 1460, 486, 6618, 448, 21256, 88648, 21391, 13, 6771, 752, 1744, 911, 1246, 311, 5486, 419, 382, 5338, 11, 279, 10058, 4147, 374, 264, 8356, 7174, 1334, 13, 576, 1376, 374, 311, 990, 24510, 7525, 311, 5978, 4516, 7149]
+VERIFY 30B: base_eq_gpu=YES base_eq_sme2=YES gpu_eq_sme2=YES
+```

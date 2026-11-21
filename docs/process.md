@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M4 — Neural Engine and storage completed (2026-11-21); next: **M4.5 — bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine** (Spike `S7`, `W15`, `D11`, `C11`–`C13`, [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md)), followed by **M5 — serving and pipelining**.
+M4.5 — bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine completed (2026-11-21); next: **M5 — serving and pipelining** (`C6`–`C8`, `D8`, `W14`, `G13`), followed by **M6 — frontier hybrid sparse models (`Qwen3.8-Flash-Next`)**.
 
 ## Milestones
 
@@ -21,7 +21,7 @@ Status-row IDs refer to [status.md](status.md).
 | M2.5 | Standard FP16 / BF16 and multi-shard import | W12, W13, G12 | Multi-shard `aminfer-tools pack-amf` converts local `Qwen3-30B-A3B-3bit`, `Qwen3-14B-4bit`, and `Qwen3-0.6B` (`BF16`) with bounded RAM; native `FP16` and `BF16` GEMV / GEMM / MoE SwiGLU match CPU fp32 reference; real-checkpoint greedy decode verified end-to-end (incl. `Qwen3-0.6B` `BF16`) with bandwidth archived in [benchmarks/results.md](benchmarks/results.md) | Completed |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2/M2.5; speedup over the non-speculative baseline, acceptance-length and experts-per-pass statistics recorded | Completed |
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Completed |
-| M4.5 | Bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine | W15, D11, C11–C13 | Pre-`smstart` `d8–d15` canary & `fp32` parity tests pass; `sme2_panel64` single-owner layout preserves `.amf` v0 binary compatibility; Spike `S7` benchmarks 3-way `.s` kernels vs `Accelerate`/`BNNS`, P-cluster thread saturation, and GPU co-execution (`> 1.05×` gate, `0` swap); Secure Enclave TRNG `D11` seeding verified | Planned |
+| M4.5 | Bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine | W15, D11, C11–C13 | Pre-`smstart` `d8–d15` canary & `fp32` parity tests pass; `sme2_panel64` single-owner layout preserves `.amf` v0 binary compatibility; Spike `S7` benchmarks 3-way `.s` kernels vs `Accelerate`/`BNNS`, P-cluster thread saturation, and GPU co-execution (`> 1.05×` gate, `0` swap); Secure Enclave TRNG `D11` seeding verified | Completed |
 | M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Planned |
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`) | R6, W9, W10, G7–G9, G10 (GR), C10 (PLE) | Composable model operator graph; `Qwen3.8-Flash-Next` (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end (128 GB+ full wired residency; 24 GB M4 hot/cold + PLE async prefetch without swap) | Planned |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
@@ -39,7 +39,7 @@ Confirmed, or before an accepted design is tuned.
 | S4 | ANE handoff latency (GPU → CPU → ANE → CPU → GPU) and bandwidth contention of concurrent ANE weight streaming on GPU GEMV | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) | M3 | Closed |
 | S5 | Unique experts per layer versus draft-tree size for Qwen3-30B-A3B; effective bandwidth of deduplicated vs per-slot expert kernels | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) | M3 | Closed |
 | S6 | ANE attention block: CoreML compilation, static shapes for a growing KV length, fp16 numerics, throughput vs GPU | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), A3 | M4 | Closed |
-| S7 | Bare-metal M4+ SME2 throughput (`M=1..4` `ZT0-LUT+Dot`, `M=5..16` `1×4` `ZA`, `M>=32` `2×2` `ZA`) vs `Accelerate`/`BNNS`, P-cluster threads-per-cluster saturation, `otool` zero-spill check, and unified-memory bus contention gate vs Metal GPU | [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md), C13 | M4.5 | Open |
+| S7 | Bare-metal M4+ SME2 throughput (`M=1..4` `ZT0-LUT+Dot`, `M=5..16` `1×4` `ZA`, `M>=32` `2×2` `ZA`) vs `Accelerate`/`BNNS`, P-cluster threads-per-cluster saturation, `otool` zero-spill check, and unified-memory bus contention gate vs Metal GPU | [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md), C13 | M4.5 | Closed |
 
 ## M0 task list
 
@@ -279,6 +279,76 @@ Key M4 highlights on Apple M4 24 GiB (commits `176740c..8701fdb`, ReleaseFast,
     `12.48 tok/s` default tree) on B-tree + binary search, and `tau = 1.909–2.100`
     on zero-L1-seed Rust prose (`l1_seed_rounds = 0`).
 
+## M4.5 task list
+
+- [x] Runtime `FEAT_SME2` / `SME_B16F32` / `SME_F16F32` / `pcore_clusters` / `pcore_l2_kib` platform probe (`C11`, `src/platform/sysinfo.zig`, `aminfer probe`) and scoped `-march=armv9.2-a+sme2+sme-f16f16+sme-b16b16` build rule restricted exclusively to `src/cpu/sme2_kernels.s` (verified `0` SME/SVE leaks on `-Dcpu=apple_m1`)
+- [x] Hand-written ARMv9.2 `.s` SME2 3-way microkernels (`M=1..4` `ZT0-LUT + Dot`, `M=5..16` `1×4` `ZA`, `M>=32` `2×2` `ZA`) across `bf16`/`f16`/`q4`/`q3`/`q2`, pre-`smstart` `x19–x30`/`d8–d15` ABI canary, `ld1b`/`ldnt1b` cache steering, fused `ZA` epilogue (`add_residual`, `silu_mul_gate`), and P-cluster lock-free dispatcher (`C11`, `C12`, `src/cpu/{sme2_kernels.s,sme.zig}`)
+- [x] Binary-compatible `.amf` v0 `TensorEntry.reserved0` `sme2_panel64` layout tag (`W15`, 128-byte struct preserved, `reserved0 == 0` stays `row_major`), Python `aminfer-tools repack-sme2` & `pack-amf --sme2-targets` pre-packer (`tools/`), and `D11` two-tier Apple Silicon Secure Enclave TRNG (`getentropy`) → slot-local `Xoshiro256` `RequestRng` (`src/runtime/rng.zig`)
+- [x] Engine & CLI integration (`src/model/qwen3.zig`, `src/spec/engine.zig`, `src/bench/runner.zig`, `src/main.zig`): single-owner `sme2_panel64` loading (zero RAM duplication), L2-resident SME2 speculative tree router prediction (`C13`, `--sme-router auto|sme2|gpu`), `evalSwiGluExpertSme2` (`ldnt1b`), `D11` TRNG seeding in `decode`/`spec-decode` with `seed_used`/`seed_source`, and `aminfer bench-m45` (`Spike S7` + `C13` concurrent bus gate + `ldnt1b` L2 preservation)
+- [x] Real-hardware ReleaseFast audits & real-checkpoint M4.5 benchmarks archived in [benchmarks/results.md](benchmarks/results.md#m45-bare-metal-armv9-sme2-engine-spike-s7-c13-bus-contention-and-d11-trng): `otool` zero-spill check, 4-checkpoint `verify-amf` compatibility, real `Qwen3-0.6B` `repack-sme2` + `D11` TRNG/replay, and real `Qwen3-30B-A3B-3bit` + `EAGLE-3` GPU-router vs SME2 L2-router A/B (`0` swapouts)
+
+## M4.5 bare-metal SME2, C13 and D11 results
+
+Canonical methodology, full tables, and verbatim raw run outputs live in
+[benchmarks/results.md](benchmarks/results.md#m45-bare-metal-armv9-sme2-engine-spike-s7-c13-bus-contention-and-d11-trng).
+Key M4.5 highlights on Apple M4 24 GiB (commits `7de016d..b23f787`, ReleaseFast,
+`swapouts_delta = 0` across all archived runs):
+
+- **ABI safety & zero-spill binary audit (`C11`, `C12`)**:
+  - `-Dcpu=apple_m1` build contains **`0`** SME/SVE instructions outside the 34
+    `_ami_sme2_*` symbols (M1–M3 fallback safe without `SIGILL`).
+  - Native ReleaseFast `otool -tvV` audit confirms `minos 26.0`, all 30 entry
+    kernels save `x19–x30` & `d8–d15` before `smstart` and restore after
+    `smstop` (`pre_saves = 10`, `post_restores = 10`), and **`0`** stack-pointer
+    spills inside streaming regions (`total_streaming_sp_accesses = 0`).
+- **Spike S7 (`C12`, `aminfer bench-m45` vs Apple `Accelerate` `cblas_sgemm`)**:
+  - L2-hot `bf16` (`1024×2048`): peaks at **`1.553 TFLOP/s`** (`M = 128`),
+    beating `Accelerate` by **`4.00×`** at `M = 8` (`49.58 us`) and **`3.80×`**
+    at `M = 16` (`46.13 us`, `1.455 TFLOP/s`); `f16` peaks at **`1.584 TFLOP/s`**
+    (`M = 512`, `1.06×`).
+  - Quantized `ZT0-LUT` (`q4`/`q3`/`q2`): beats `dequant + Accelerate` by
+    **`14.06–20.43×`** in L2 (`M = 1`) and **`17.81–26.56×`** on DRAM SLC-bust
+    `4096×4096` (`bf16 ldnt` **`70.89 GB/s`**, `2.19×` `Accelerate`; `q4`/`q2`
+    `4.60–4.77×` `Accelerate`), sustaining **`1.474–1.568 TFLOP/s`** at `M = 128`.
+  - P-cluster thread sweep (`1/2/4` threads on M4's 1 P-cluster): 1 thread
+    saturates `95–100%` of L2-hot SME2 compute (`1.00–1.05×` at 2–4T, peaking at
+    `1.717 TFLOP/s` at 2T, dipping to `0.91×` at 4T), validating 1 worker per
+    P-cluster for compute-bound workloads; DRAM-bound `q4 M = 1` scales
+    `1.00× → 1.17× → 1.24×` (`54.49 → 67.74 GB/s`).
+- **`C13` concurrent Metal 4 GPU + CPU SME2 bus gate (`> 1.05×`) & `ldnt1b` L2 preservation**:
+  - **L2-resident SME2 router + GPU `gemv_q3`**: GPU `78.04 → 79.62 GB/s`
+    (`+2.0%`, zero bus penalty), aggregate **`155.57 GB/s`**, **`1.80×`** net
+    speedup (**PASS**).
+  - **DRAM SME2 `q4` + GPU `gemv_q3`**: `ld1b` trims GPU `-12.5%` (`90.65 GB/s`,
+    `1.33×` **PASS**); `ldnt1b` cuts GPU interference by a third to **`-8.2%`**
+    (`71.64 GB/s`, **`93.49 GB/s`** aggregate, **`1.33×` PASS**).
+  - **`ldnt1b` cold-expert L2 preservation**: sweeping `16.88 MiB` (`6` cold `q4`
+    SwiGLU experts) with `ld1b` slows the hot `4 MiB` router by **`+40.9%`**
+    (`44.17 → 62.25 us`), whereas **`ldnt1b`** keeps the hot router at
+    **`44.08 us` (`-0.2%`, zero L2 eviction)** and speeds cold experts by `-5.6%`
+    (`86.31 → 81.51 us/expert`).
+- **Real `Qwen3-30B-A3B-3bit` + `EAGLE-3` (`C13` L2-resident SME2 tree router, `T = 0`)**:
+  - Startup calibration on the `4 MiB` (`8×128×2048`) router bank selects `sme2`
+    at **`78.0 us` vs `975.5 us` GPU (`12.51×` faster)** (`17.71×`/`11.48×`/`7.15×`
+    across `M = 1/8/16` in `bench-m45`).
+  - End-to-end 48L `EAGLE-3 + L1 + D7` speculative decode improves
+    `prune_ms_per_round` **`0.396 → 0.217 ms` (`1.82×` faster, `-45.2%`)**,
+    cuts Metal CB submission `malloc_blocks_delta` **`320 → 194` (`-39.4%`)**,
+    and lifts decode throughput **`49.73` (base) → `52.49` (GPU router) →
+    `52.97 tok/s` (SME2 router, `1.065×` vs base)** with **64/64 (100%)
+    bit-exact `token_ids`** and `swapouts_delta = 0`.
+- **Real `Qwen3-0.6B` BF16 `D11` Secure Enclave TRNG + bit-exact replay & `W15` compatibility**:
+  - All 4 existing `.amf` checkpoints pass `aminfer verify-amf` unchanged (`100%`
+    v0 binary backward compatibility). `repack-sme2 --targets all-linear` repacks
+    196 projections in-place (`1,195 MiB` wired, zero RAM duplication, `0`
+    swapouts); full-model `M = 1` CPU SME2 (`21.94 tok/s`) vs GPU (`68.67 tok/s`)
+    re-confirms keeping full dense decode on GPU while steering L2 routers and
+    cold-expert digestion to SME2.
+  - Both `decode` and `spec-decode` at `--temperature 0.7` draw distinct 64-bit
+    Secure Enclave `hardware_trng` seeds with diverse outputs when `--seed` is
+    omitted, and reproduce **32/32 (100%) bit-exact `token_ids`** when replayed
+    with `--seed <seed_used>` (`seed_source = explicit`, `swapouts_delta = 0`).
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -314,6 +384,8 @@ Only checks that actually ran are listed.
 | 2026-11-21 | M3 final gate (`034492f`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 158/158 tests), direct Debug test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (156/156, API + GPU Validation enabled, 0 errors), `tools` unittest (28/28), ReleaseFast `aminfer bench-m3` (`S4` `d5_gate=gpu`, `S5` `beta_dedup=36.78 GB/s` / crossover `M=2`, `L1 SAM` `0.041 us`, `swapouts_delta = 0`), and real-checkpoint `T = 0` lossless `decode` vs `spec-decode` (100% bit-for-bit `token_ids` match, `swapouts_delta = 0`) on `Qwen3-0.6B` BF16 (`4.73×`, plus `T = 0.7` `D9`), `Qwen3-14B-4bit` (`1.71×`), and `Qwen3-30B-A3B-3bit` + real `EAGLE-3` (reasoning `48.38 tok/s` = `1.94×` vs unpruned / `1.05×` vs base; code-edit `L1 + D7` `59.24 tok/s` = `1.18×`) archived in [benchmarks/results.md](benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5) | Pass |
 | 2026-11-21 | M4 Phase 1 (`176740c`, `cf498b3`, `02d22a0`): `F_NOCACHE` `kqueue_aio`/`ecore_pread`/Spike `S3` & wired `ExpertSlotPool`/`ExpertCache` (`C3`–`C5`); W8 `expert-heat` + W7 pure-stdlib `export-coreml` (`tools` unittest: 40/40; real `qwen3-30b-a3b-heat.json` & `.mlpackage` exports validated); `WavefrontPrefill`, static KV-bucket ANE attention / Spike `S6` (`A1`, `A3`), and `AneExpertPredictor` (`A2`) | Pass |
 | 2026-11-21 | M4 Phase 2 & real-checkpoint gate (`6b6fb09`, `8701fdb`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 188/188 tests), `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` on M4/D4 tests (0 validation errors), ReleaseFast `aminfer bench-m4` (Spikes `S3` & `S6`, synthetic `A2`, `A1`/`G6` `1.76–1.87×`, synthetic cold-expert parity, synthetic `D4` lossless, `0` swapouts), real 48L `Qwen3-30B-A3B-3bit` `bench-a2` (`156.44 us` ANE `R@8/12/16 = 0.861/0.958/0.982` at `delta = 1`, `0` swapouts), real 48L `Qwen3-30B-A3B-3bit` cold-expert NVMe `decode` (`6,869–7,751 MiB` < `8,192 MiB` cap, `85.2%` hit rate / `3.02 tok/s` at 512 slots, 32/32 bit-exact, `0` swapouts), and real `Qwen3-14B-4bit` + `Qwen3-0.6B` BF16 `D4` `spec-decode` (`13.81–15.13 tok/s` = `1.27–1.40×`, `tau = 3.50–3.94`, 64/64 bit-exact across 3 prompts, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) | Pass |
+| 2026-11-21 | M4.5 Phase 1 (`7de016d`, `945cb4d`): ARMv9.2 `.s` SME2 3-way microkernels (`bf16`/`f16`/`q4`/`q3`/`q2`, `ld1b`/`ldnt1b`, fused `ZA` epilogue, pre-`smstart` `d8–d15` canary, P-cluster dispatcher) (`C11`, `C12`), `W15` `sme2_panel64` `.amf` v0 layout & `aminfer-tools repack-sme2`, and `D11` Secure Enclave TRNG `RequestRng` | Pass |
+| 2026-11-21 | M4.5 Phase 2 & real-checkpoint gate (`09de8e5`, `bd17c20`, `b23f787`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 209/209 tests), direct Debug test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (206/206, API + GPU Validation enabled, 0 errors), `tools` unittest (51/51, incl. Python `repack-sme2` → Zig `decode`/`spec-decode` parity & `D11` TRNG CLI), `-Dcpu=apple_m1` `otool` audit (`0` SME/SVE leaks outside 34 `_ami_sme2_*` symbols), native `otool -tvV` spill audit (`minos 26.0`, `0` streaming `sp` accesses), ReleaseFast `aminfer probe` + `aminfer bench-m45` (`Spike S7` up to `1.717 TFLOP/s` / `4.00×` Accelerate / `26.56×` dequant+Accelerate, `C13` concurrent bus `1.80×`/`1.33×` PASS, `ldnt1b` `-0.2%` vs `ld1b` `+40.9%` hot L2 penalty, `0` swapouts), `verify-amf` on all 4 real `.amf` checkpoints, real `Qwen3-0.6B` `repack-sme2` & `D11` TRNG + bit-exact replay (`decode` & `spec-decode`), and real `Qwen3-30B-A3B-3bit` + `EAGLE-3` GPU-router vs SME2 L2-router A/B (`prune 0.396 → 0.217 ms`, `52.49 → 52.97 tok/s`, 64/64 bit-exact, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m45-bare-metal-armv9-sme2-engine-spike-s7-c13-bus-contention-and-d11-trng) | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -400,7 +472,15 @@ Update this before the context window runs out or when handing off.
   - M4.5 / confirmed decisions docs: `f91fff9` `ADR-0018` bare-metal SME2
     engine, `D11` TRNG seeding & confirmed open-decision codification, plus
     M4.5 status/process roadmap sync
-- In flight: none (M4 completed; ready to begin M4.5 bare-metal ARMv9 SME2 engine)
+  - M4.5: `7de016d` ARMv9.2 `.s` SME2 3-way microkernels, `ZT0-LUT` panels &
+    P-cluster dispatcher (`C11`, `C12`), `945cb4d` `W15` `sme2_panel64` `.amf`
+    v0 layout tooling & `D11` Secure Enclave TRNG `RequestRng`, `09de8e5` root
+    module exports & test deduplication, `bd17c20` single-owner `sme2_panel64`
+    loading, L2-resident SME2 router prediction (`C13`) & `ldnt1b` cold-expert
+    eval in `Qwen3Model`/`SpecEngine`, `b23f787` `aminfer bench-m45` (`Spike S7`
+    + `C13` concurrent bus gate), `probe` SME2 facts, `D11` TRNG CLI &
+    Python-Zig numerical parity, plus M4.5 benchmark archive & close-out docs
+- In flight: none (M4.5 completed; ready to begin M5 serving and pipelining)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [benchmarks/results.md](benchmarks/results.md),
