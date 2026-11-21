@@ -496,7 +496,7 @@ selection ([architecture/open-decisions-research.md](architecture/open-decisions
 
 Update this before the context window runs out or when handing off.
 
-- Last updated: 2026-11-21
+- Last updated: 2026-11-22
 - Commits so far:
   - M0: `1ad0da8` AGENTS.md, `6d5053d` license, `3a573a5` docs baseline,
     `0518ea8` build graph and probe, `06e8656` wired regions, `e6c9221`
@@ -528,11 +528,12 @@ Update this before the context window runs out or when handing off.
     `S5`), `d240329` `.amf` `u32` dtype & EAGLE-3/EAGLE-2/MTP draft head packers,
     `034492f` end-to-end `DraftHead`/`SpecEngine`/`Qwen3Model.verifyTree`,
     `aminfer spec-decode` & `bench-m3` (`D2`, `D3`, `D5`–`D7`, `D9`, `G5`),
-    `e46b7f5` M3 benchmark archive & close-out docs
+    `e46b7f5` M3 benchmark archive & close-out docs, `33ab2a0` M3 verification note
   - Roadmap docs: `880d487` optional offline GSQ+RCO hybrid quantization
-    ([ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md)), plus
-    `W14`/`G13` status & process registration; `98c43c6` external research &
-    open-decision recommendations (`docs/architecture/open-decisions-research.md`)
+    ([ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md)),
+    `7a0005f` `W14`/`G13` status & process registration; `98c43c6` external
+    research & open-decision recommendations
+    ([architecture/open-decisions-research.md](architecture/open-decisions-research.md))
   - M4: `176740c` `F_NOCACHE` kqueue AIO, E-core pread pool, Spike `S3` & LFU
     expert cache (`C3`–`C5`, `S3`), `cf498b3` offline expert-heat profiler &
     pure-stdlib CoreML `.mlpackage` exporter (`W7`, `W8`), `02d22a0` hybrid
@@ -542,7 +543,7 @@ Update this before the context window runs out or when handing off.
     two-phase `bench-a2` weight release for zero-swap real-checkpoint eval,
     `bd93b09` M4 benchmark archive & close-out docs
   - M4.5 / confirmed decisions docs: `f91fff9` `ADR-0018` bare-metal SME2
-    engine, `D11` TRNG seeding & confirmed open-decision codification, plus
+    engine, `D11` TRNG seeding & confirmed open-decision codification, `5e75378`
     M4.5 status/process roadmap sync
   - M4.5: `7de016d` ARMv9.2 `.s` SME2 3-way microkernels, `ZT0-LUT` panels &
     P-cluster dispatcher (`C11`, `C12`), `945cb4d` `W15` `sme2_panel64` `.amf`
@@ -565,10 +566,39 @@ Update this before the context window runs out or when handing off.
     gate, `552b556` refreshed idle-GPU M5 docs & ADR-0007/path fixes,
     `137239e` HTTP JSON closing-brace fixes & strict JSON parser tests,
     `a599b6f` PEARL depth-1 root completion before early-stop & median
-    contention probe
-- In flight: none (M5 completed; ready to begin M6 frontier hybrid sparse models — `Qwen3.8-Flash-Next`)
+    contention probe, `106827b` Round-2 HTTP JSON & PEARL verification record
+- Current test & build baseline (`M0`–`M5` complete, `0` `catch {}`):
+  - Zig suite: `241/241` passing (`237` lib + `4` CLI) in `Debug`,
+    `ReleaseSafe`, and `ReleaseFast`, plus `241/241` under
+    `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`0` validation errors,
+    `minos 26.0`, `0` streaming register spills across 34 `_ami_sme2_*` symbols)
+  - Offline Python `tools/` suite: `64/64` passing (`uv run python -m unittest`)
+- On-disk checkpoints & artifacts (strict rule: keep all `.amf`/`.ang`/`.mlpackage`
+  and `TMPDIR` work on `/Volumes/Akari/models/` and `/Volumes/Akari/.tmp/`, never
+  on `/` or `/tmp`):
+  - Source checkpoints: `/Volumes/Akari/models/{Qwen3-0.6B,Qwen3-14B-4bit,Qwen3-30B-A3B-3bit,Qwen3-30B-A3B-Eagle3}`
+  - Verified `.amf` / `.ang` / heat artifacts in `/Volumes/Akari/models/amf/`:
+    `qwen3-0.6b-bf16.amf` (`1.11 GiB`), `qwen3-0.6b-gsq-rco.amf` (`311 MB`,
+    `4.348b`), `qwen3-0.6b-gsq-rco-sme2.amf` (`337 MB`, off-GPU `sme2_panel64`
+    small draft), `qwen3-14b-4bit.amf` (`7.74 GiB`), `qwen3-30b-a3b-3bit.amf`
+    (`12.45 GiB`), `qwen3-30b-a3b-eagle3.amf` (`996 MiB`),
+    `qwen3-30b-a3b-heat.json`, and `aminfer-repo.ang` (`128 MiB`, `879,949`
+    repo N-grams)
+  - Exported ANE `.mlpackage` bundles: `/Volumes/Akari/models/coreml/`
+- Session & `/swarm` operating conventions:
+  - Swarm models restricted per user instruction to `gemini-4-carbon-*` and
+    `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
+    (do not `git push` unless explicitly requested) and run `ikat sync` after
+    every commit
+- In flight: none (`M0`–`M5` completed; next milestone is **M6 — Frontier hybrid
+  sparse models (`Qwen3.8-Flash-Next`)** covering `R6`, `W9`, `W10`, `G7`–`G9`,
+  `G10` (`GR`), and `C10` (`PLE`) per
+  [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md) and
+  [architecture/model-roadmap.md](architecture/model-roadmap.md))
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
+  [architecture/model-roadmap.md](architecture/model-roadmap.md),
+  [architecture/open-decisions-research.md](architecture/open-decisions-research.md),
   [benchmarks/results.md](benchmarks/results.md),
   [decisions/0004-kv-cache-iosurface-texture-sharing.md](decisions/0004-kv-cache-iosurface-texture-sharing.md),
   [decisions/0006-amf-cold-experts-direct-io.md](decisions/0006-amf-cold-experts-direct-io.md),
@@ -577,6 +607,7 @@ Update this before the context window runs out or when handing off.
   [decisions/0010-hybrid-wavefront-prefill.md](decisions/0010-hybrid-wavefront-prefill.md),
   [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md),
   [decisions/0013-eagle-tree-and-head-formats.md](decisions/0013-eagle-tree-and-head-formats.md),
+  [decisions/0015-tiered-frontier-model-roadmap.md](decisions/0015-tiered-frontier-model-roadmap.md),
   [decisions/0016-native-fp16-bf16-and-multishard-import.md](decisions/0016-native-fp16-bf16-and-multishard-import.md),
   [decisions/0017-optional-gsq-rco-hybrid-quantization.md](decisions/0017-optional-gsq-rco-hybrid-quantization.md),
   [decisions/0018-bare-metal-armv9-sme2-engine.md](decisions/0018-bare-metal-armv9-sme2-engine.md)
