@@ -25,6 +25,9 @@ const sme = @import("../cpu/sme.zig");
 const qos = @import("../platform/qos.zig");
 const ngram_nvme = @import("../spec/ngram_nvme.zig");
 const server_mod = @import("../server/http_sse.zig");
+const hybrid = @import("../gpu/hybrid.zig");
+const ple = @import("../storage/ple.zig");
+const graph = @import("../model/graph.zig");
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -5868,6 +5871,2049 @@ pub fn runM5(allocator: std.mem.Allocator) M5Error!M5Report {
     return runM5WithConfig(allocator, .{});
 }
 
+// ===========================================================================
+// Milestone M6: GraphModel Decode Bench & `aminfer bench-m6` Suite
+// (W9/W10/W16, G7/G8/G9/G10, C10 PLE, D12 SelfSpecRecurrent, D13 cpu_sme2)
+// ===========================================================================
+
+pub const GraphDecodeBenchOptions = struct {
+    prefill_tokens: u32 = 511,
+    decode_steps: u32 = 16,
+    warmup_steps: u32 = 4,
+    max_seq_len: u32 = 576,
+    budget_override: ?budget_mod.Budget = null,
+    ple_paths: []const [:0]const u8 = &.{},
+    loop_adapter_amf_path: ?[:0]const u8 = null,
+    max_loops_override: ?u32 = null,
+    enable_loop_early_exit: bool = false,
+    cold_slot_count: u32 = 0,
+};
+
+pub const GraphDecodeBenchResult = struct {
+    attention_summary: []const u8,
+    ffn_label: []const u8,
+    residual_label: []const u8,
+    loop_label: []const u8,
+    measured_layers: u32,
+    effective_loops: u32,
+    seq_len: u32,
+    decode_steps: u32,
+    shard_count: usize,
+    wired_bytes: u64,
+    load_ms: f64,
+    prefill_ms: f64,
+    decode_ns: u64,
+    bytes_per_tok: u64,
+    loop_isolation: graph.LoopIsolationStats,
+    ple_stats: ?ple.Stats,
+    cold_stats: ?qwen3.ColdExpertStats,
+    heap_delta: vmstat.HeapDelta,
+    swapouts_delta: u64,
+    pageouts_delta: u64,
+
+    pub fn msPerToken(self: GraphDecodeBenchResult) f64 {
+        return (@as(f64, @floatFromInt(self.decode_ns)) / @as(f64, @floatFromInt(self.decode_steps))) / 1_000_000.0;
+    }
+
+    pub fn tokensPerSec(self: GraphDecodeBenchResult) f64 {
+        const ms = self.msPerToken();
+        return if (ms > 0.0) 1000.0 / ms else 0.0;
+    }
+
+    pub fn effectiveGbs(self: GraphDecodeBenchResult) f64 {
+        const ms = self.msPerToken();
+        return if (ms > 0.0) @as(f64, @floatFromInt(self.bytes_per_tok)) / (ms * 1_000_000.0) else 0.0;
+    }
+
+    pub fn write(self: GraphDecodeBenchResult, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\graph_bench.attention            {s}
+            \\graph_bench.ffn                  {s}
+            \\graph_bench.residual             {s}
+            \\graph_bench.loop                 {s} (R={d})
+            \\graph_bench.layers               {d}
+            \\graph_bench.shards               {d}
+            \\graph_bench.wired_mib            {d}
+            \\graph_bench.load_ms              {d:.2}
+            \\graph_bench.seq_len              {d}
+            \\graph_bench.prefill_ms           {d:.3}
+            \\graph_bench.decode_steps         {d}
+            \\graph_bench.ms_per_tok           {d:.3}
+            \\graph_bench.tok_per_s            {d:.2}
+            \\graph_bench.bytes_per_tok        {d}
+            \\graph_bench.effective_gbs        {d:.2}
+            \\graph_bench.gdn_scratch_evals    {d}
+            \\graph_bench.gdn_final_commits    {d}
+            \\graph_bench.ple_r0_fills         {d}
+            \\graph_bench.ple_r_ge1_nvme_reads {d}
+            \\graph_bench.qsa_index_reuses     {d}
+            \\graph_bench.moe_r_ge1_cold_stall {d}
+            \\graph_bench.malloc_blocks_delta  {d}
+            \\graph_bench.malloc_bytes_delta   {d}
+            \\graph_bench.swapouts_delta       {d}
+            \\graph_bench.pageouts_delta       {d}
+            \\
+        , .{
+            self.attention_summary,
+            self.ffn_label,
+            self.residual_label,
+            self.loop_label,
+            self.effective_loops,
+            self.measured_layers,
+            self.shard_count,
+            self.wired_bytes >> 20,
+            self.load_ms,
+            self.seq_len,
+            self.prefill_ms,
+            self.decode_steps,
+            self.msPerToken(),
+            self.tokensPerSec(),
+            self.bytes_per_tok,
+            self.effectiveGbs(),
+            self.loop_isolation.gdn_scratch_evals,
+            self.loop_isolation.gdn_final_commits,
+            self.loop_isolation.ple_r0_fills,
+            self.loop_isolation.ple_r_ge1_nvme_reads,
+            self.loop_isolation.qsa_index_reuses,
+            self.loop_isolation.moe_r_ge1_cold_stalls,
+            self.heap_delta.blocks_in_use,
+            self.heap_delta.size_in_use,
+            self.swapouts_delta,
+            self.pageouts_delta,
+        });
+    }
+};
+
+pub const GraphDecodeBenchError = graph.GraphLoadError || graph.GraphStepError || vmstat.Error || vmstat.SwapError || error{InvalidConfig};
+
+pub fn runGraphDecodeBenchFromFile(
+    allocator: std.mem.Allocator,
+    amf_path: [:0]const u8,
+    cfg: graph.GraphConfig,
+    opts: GraphDecodeBenchOptions,
+) GraphDecodeBenchError!GraphDecodeBenchResult {
+    if (opts.decode_steps == 0 or opts.prefill_tokens + 1 >= opts.max_seq_len) return error.InvalidConfig;
+
+    const load_t0 = try vmstat.nowNs();
+    var model = try graph.GraphModel.loadFromFile(allocator, amf_path, cfg, .{
+        .max_seq_len = opts.max_seq_len,
+        .max_tree_nodes = 16,
+        .wired_budget_override = opts.budget_override,
+        .ple_paths = opts.ple_paths,
+        .loop_adapter_amf_path = opts.loop_adapter_amf_path,
+        .max_loops_override = opts.max_loops_override,
+        .enable_loop_early_exit = opts.enable_loop_early_exit,
+        .cold_slot_count = opts.cold_slot_count,
+    });
+    defer model.deinit(allocator);
+    const load_t1 = try vmstat.nowNs();
+
+    const prompt_toks = try allocator.alloc(u32, opts.prefill_tokens);
+    defer allocator.free(prompt_toks);
+    for (0..opts.prefill_tokens) |p| {
+        prompt_toks[p] = @intCast((p * 17 + 5) % cfg.vocab_size);
+    }
+
+    const vm_before = try vmstat.Snapshot.capture();
+    const pre_t0 = try vmstat.nowNs();
+    var cur_tok = try model.prefillChunk(prompt_toks, 0, true);
+    const pre_t1 = try vmstat.nowNs();
+
+    const eval_pos: u32 = opts.prefill_tokens;
+    for (0..opts.warmup_steps) |_| {
+        cur_tok = try model.stepDecode(cur_tok, eval_pos);
+    }
+
+    model.resetLoopIsolationStats();
+    model.resetColdTelemetry();
+
+    const heap_before = try vmstat.Snapshot.capture();
+    const dec_t0 = try vmstat.nowNs();
+    for (0..opts.decode_steps) |_| {
+        cur_tok = try model.stepDecode(cur_tok, eval_pos);
+    }
+    const dec_t1 = try vmstat.nowNs();
+    const heap_after = try vmstat.Snapshot.capture();
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    const seq_len: u32 = eval_pos + 1;
+    return .{
+        .attention_summary = cfg.axes.attentionSummaryLabel(),
+        .ffn_label = cfg.axes.ffn_kind.label(),
+        .residual_label = cfg.axes.residual_kind.label(),
+        .loop_label = cfg.axes.loop_schedule.mode.label(),
+        .measured_layers = cfg.num_hidden_layers,
+        .effective_loops = model.effective_max_loops,
+        .seq_len = seq_len,
+        .decode_steps = opts.decode_steps,
+        .shard_count = model.shardCount(),
+        .wired_bytes = model.totalWiredBytes(),
+        .load_ms = @as(f64, @floatFromInt(load_t1 - load_t0)) / 1_000_000.0,
+        .prefill_ms = @as(f64, @floatFromInt(pre_t1 - pre_t0)) / 1_000_000.0,
+        .decode_ns = dec_t1 - dec_t0,
+        .bytes_per_tok = model.bytesPerDecodeToken(seq_len),
+        .loop_isolation = model.loopIsolationStats(),
+        .ple_stats = model.pleStats(),
+        .cold_stats = model.coldExpertStats(),
+        .heap_delta = vmstat.heapDelta(heap_before, heap_after),
+        .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+        .pageouts_delta = vmstat.Snapshot.pageoutDelta(vm_before, vm_after),
+    };
+}
+
+pub const M6Config = struct {
+    // Section 1: G8 GDN, G9 QSA, G10 GR, G7 512E MoE
+    gdn_k_heads: u32 = 16,
+    gdn_v_heads: u32 = 32,
+    gdn_head_k: u32 = 128,
+    gdn_head_v: u32 = 128,
+    gdn_prefill_seq: u32 = 256,
+    gdn_reps: u32 = 32,
+
+    qsa_q_heads: u32 = 16,
+    qsa_kv_heads: u32 = 4,
+    qsa_head_dim: u32 = 128,
+    qsa_block_size: u32 = 16,
+    qsa_top_k_blocks: u32 = 8,
+    qsa_full_kv_len: u32 = 512,
+    qsa_swa_kv_len: u32 = 128,
+    qsa_reps: u32 = 32,
+
+    gr_hidden: u32 = 2048,
+    gr_reps: u32 = 48,
+
+    moe512_num_experts: u32 = 512,
+    moe512_top_k: u32 = 10,
+    moe512_hidden: u32 = 1024,
+    moe512_inter: u32 = 256,
+    moe512_shared_inter: u32 = 512,
+    moe512_reps: u32 = 16,
+
+    // Section 2: C10 PLE F_NOCACHE + r>=1 zero-NVMe isolation
+    ple_num_shards: u32 = 4,
+    ple_rows_per_shard: u32 = 2048,
+    ple_embed_dim: u32 = 256,
+    ple_cache_pages: usize = 8,
+    ple_cold_queries: u32 = 48,
+    ple_hit_queries: u32 = 64,
+    ple_loop_steps: u32 = 16,
+
+    // Section 3: End-to-end scale-qwen4-512e + MTP spec-decode
+    qwen4_hidden: u32 = 128,
+    qwen4_vocab: u32 = 256,
+    qwen4_moe_inter: u32 = 128,
+    qwen4_shared_inter: u32 = 128,
+    qwen4_num_experts: u32 = 512,
+    qwen4_top_k: u32 = 10,
+    qwen4_cold_per_layer: u32 = 32,
+    qwen4_ple_shards: u32 = 4,
+    qwen4_ple_rows: u64 = 256,
+    qwen4_gen_tokens: u32 = 16,
+
+    // Section 4: D12 SelfSpecRecurrent sweep (R = 1, 2, 3, 4)
+    loop_hidden: u32 = 1024,
+    loop_inter: u32 = 3584,
+    loop_vocab: u32 = 1024,
+    loop_num_layers: u32 = 8, // 1 Prelude + 6 Core + 1 Coda (~50 MiB q4 Core > L2/SLC)
+    loop_num_heads: u32 = 8,
+    loop_num_kv_heads: u32 = 2,
+    loop_head_dim: u32 = 128,
+    loop_use_q4: bool = true,
+    loop_serial_steps: u32 = 12,
+    loop_batch_reps: u32 = 8,
+    loop_spec_tokens: u32 = 16,
+
+    // Section 5: D13 Placement.cpu_sme2 vs .gpu
+    d13_scale_down: u32 = 1, // 1 for production shapes; 8 for tiny unit test
+    d13_iters: u32 = 15,
+    d13_warmups: u32 = 3,
+
+    timeout_ms: u64 = 30_000,
+};
+
+pub const M6OpsReport = struct {
+    // G8 GDN
+    gdn_prefill_seq: u32,
+    gdn_prefill_us: f64,
+    gdn_prefill_tok_per_s: f64,
+    gdn_prefill_gbs: f64,
+    gdn_decode_us: f64,
+    gdn_decode_gbs: f64,
+    gdn_stmp_us: f64,
+    gdn_commit_us: f64,
+    gdn_stmp_isolated: bool,
+
+    // G9 QSA
+    qsa_mrope_us: f64,
+    qsa_full512_r0_us: f64,
+    qsa_full512_reuse_us: f64,
+    qsa_swa128_r0_us: f64,
+    qsa_swa128_reuse_us: f64,
+
+    // G10 4-branch GR
+    gr_hidden: u32,
+    gr_m1_us: f64,
+    gr_m1_gbs: f64,
+    gr_m16_us: f64,
+    gr_m16_gbs: f64,
+
+    // G7 512-expert top-10 + shared_expert MoE
+    moe512_num_experts: u32,
+    moe512_top_k: u32,
+    moe512_wired_mib: u64,
+    moe512_m1_us: f64,
+    moe512_m1_gbs: f64,
+    moe512_m1_unique: u32,
+    moe512_m16_us: f64,
+    moe512_m16_gbs: f64,
+    moe512_m16_unique: u32,
+    moe512_dedup_ratio: f64,
+};
+
+pub const M6PleReport = struct {
+    num_shards: u32,
+    total_rows: u64,
+    embed_dim: u32,
+    wired_kib: u64,
+    cold_p50_us: f64,
+    cold_p99_us: f64,
+    hit_p50_us: f64,
+    r0_nvme_reads: u64,
+    r_ge1_nvme_reads: u64,
+    r_ge1_scratch_reuses: u64,
+};
+
+pub const M6ScaleQwen4Report = struct {
+    num_experts: u32,
+    top_k: u32,
+    cold_per_layer: u32,
+    ple_shards: u32,
+    wired_mib: u64,
+    gen_tokens: u32,
+    serial_tok_per_s: f64,
+    mtp_tok_per_s: f64,
+    mtp_tau: f64,
+    mtp_placement: draft_mod.Placement,
+    bit_exact_mtp: bool,
+    cold_hits: u64,
+    cold_misses: u64,
+    ple_nvme_reads: u64,
+    ple_r_ge1_nvme_reads: u64,
+};
+
+pub const M6SelfSpecRow = struct {
+    loops: u32,
+    serial_ms_per_tok: f64,
+    serial_tok_per_s: f64,
+    ratio_vs_r1: f64,
+    verify_m4_ms: f64,
+    verify_m8_ms: f64,
+    verify_m12_ms: f64,
+    verify_m16_ms: f64,
+    breakeven_m: u32, // 0 if > 16
+    spec_m8_tok_per_s: f64,
+    spec_m8_tau: f64,
+    spec_m16_tok_per_s: f64,
+    spec_m16_tau: f64,
+    bit_exact: bool,
+};
+
+pub const M6SelfSpecReport = struct {
+    core_layers: u32,
+    core_weight_mib: f64,
+    total_wired_mib: u64,
+    rows: [4]M6SelfSpecRow,
+};
+
+pub const M6SmeDraftRow = struct {
+    label: []const u8,
+    dtype_label: []const u8,
+    n: u32,
+    k: u32,
+    m: u32,
+    weight_bytes: usize,
+    fits_l2: bool,
+    sme2_us: f64,
+    gpu_us: f64,
+    prefer_sme2: bool,
+};
+
+pub const M6Report = struct {
+    ops: M6OpsReport,
+    ple: M6PleReport,
+    scale_qwen4: M6ScaleQwen4Report,
+    self_spec: M6SelfSpecReport,
+    d13_rows: [12]M6SmeDraftRow,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn write(self: *const M6Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.writeAll("=== Milestone M6 Benchmark Suite (Qwen3.8-Flash-Next + LoopSchedule + D12/D13) ===\n\n");
+
+        // 1. Operators (G8, G9, G10, G7)
+        try out.writeAll("--- 1. Hybrid-Sparse Operators (G8 GDN, G9 QSA, G10 4-Branch GR, G7 512E MoE) ---\n");
+        try out.print(
+            \\g8.gdn.prefill_seq               {d}
+            \\g8.gdn.prefill_us                {d:.1}
+            \\g8.gdn.prefill_tok_per_s         {d:.1}
+            \\g8.gdn.prefill_gbs               {d:.2}
+            \\g8.gdn.decode_m1_us              {d:.1}
+            \\g8.gdn.decode_m1_gbs             {d:.2}
+            \\g8.gdn.stmp_eval_us              {d:.1}
+            \\g8.gdn.stmp_commit_us            {d:.1}
+            \\g8.gdn.stmp_isolated             {}
+            \\g9.qsa.mrope_yarn_us             {d:.1}
+            \\g9.qsa.full512_r0_us             {d:.1}
+            \\g9.qsa.full512_reuse_us          {d:.1}
+            \\g9.qsa.full512_reuse_speedup     {d:.2}x
+            \\g9.qsa.swa128_r0_us              {d:.1}
+            \\g9.qsa.swa128_reuse_us           {d:.1}
+            \\g9.qsa.swa128_reuse_speedup      {d:.2}x
+            \\g10.gr.hidden                    {d}
+            \\g10.gr.m1_us                     {d:.1}
+            \\g10.gr.m1_gbs                    {d:.2}
+            \\g10.gr.m16_us                    {d:.1}
+            \\g10.gr.m16_gbs                   {d:.2}
+            \\g7.moe512.experts                {d} (top-{d} + shared_expert)
+            \\g7.moe512.wired_mib              {d}
+            \\g7.moe512.m1_us                  {d:.1}
+            \\g7.moe512.m1_gbs                 {d:.2}
+            \\g7.moe512.m1_unique_experts      {d}
+            \\g7.moe512.m16_us                 {d:.1}
+            \\g7.moe512.m16_gbs                {d:.2}
+            \\g7.moe512.m16_unique_experts     {d}
+            \\g7.moe512.m16_dedup_ratio        {d:.2}x
+            \\
+        , .{
+            self.ops.gdn_prefill_seq,
+            self.ops.gdn_prefill_us,
+            self.ops.gdn_prefill_tok_per_s,
+            self.ops.gdn_prefill_gbs,
+            self.ops.gdn_decode_us,
+            self.ops.gdn_decode_gbs,
+            self.ops.gdn_stmp_us,
+            self.ops.gdn_commit_us,
+            self.ops.gdn_stmp_isolated,
+            self.ops.qsa_mrope_us,
+            self.ops.qsa_full512_r0_us,
+            self.ops.qsa_full512_reuse_us,
+            if (self.ops.qsa_full512_reuse_us > 0.0) self.ops.qsa_full512_r0_us / self.ops.qsa_full512_reuse_us else 0.0,
+            self.ops.qsa_swa128_r0_us,
+            self.ops.qsa_swa128_reuse_us,
+            if (self.ops.qsa_swa128_reuse_us > 0.0) self.ops.qsa_swa128_r0_us / self.ops.qsa_swa128_reuse_us else 0.0,
+            self.ops.gr_hidden,
+            self.ops.gr_m1_us,
+            self.ops.gr_m1_gbs,
+            self.ops.gr_m16_us,
+            self.ops.gr_m16_gbs,
+            self.ops.moe512_num_experts,
+            self.ops.moe512_top_k,
+            self.ops.moe512_wired_mib,
+            self.ops.moe512_m1_us,
+            self.ops.moe512_m1_gbs,
+            self.ops.moe512_m1_unique,
+            self.ops.moe512_m16_us,
+            self.ops.moe512_m16_gbs,
+            self.ops.moe512_m16_unique,
+            self.ops.moe512_dedup_ratio,
+        });
+
+        // 2. C10 PLE
+        try out.writeAll("\n--- 2. C10 F_NOCACHE NVMe PLE Store & Loop Isolation (r >= 1) ---\n");
+        try out.print(
+            \\c10.ple.shards                   {d}
+            \\c10.ple.total_rows               {d}
+            \\c10.ple.embed_dim                {d}
+            \\c10.ple.wired_kib                {d}
+            \\c10.ple.cold_nvme_p50_us         {d:.2}
+            \\c10.ple.cold_nvme_p99_us         {d:.2}
+            \\c10.ple.wired_lru_hit_p50_us     {d:.2}
+            \\c10.ple.loop_r0_nvme_reads       {d}
+            \\c10.ple.loop_r_ge1_nvme_reads    {d}
+            \\c10.ple.loop_r_ge1_reuses        {d}
+            \\
+        , .{
+            self.ple.num_shards,
+            self.ple.total_rows,
+            self.ple.embed_dim,
+            self.ple.wired_kib,
+            self.ple.cold_p50_us,
+            self.ple.cold_p99_us,
+            self.ple.hit_p50_us,
+            self.ple.r0_nvme_reads,
+            self.ple.r_ge1_nvme_reads,
+            self.ple.r_ge1_scratch_reuses,
+        });
+
+        // 3. scale-qwen4-512e + MTP
+        try out.writeAll("\n--- 3. End-to-End scale-qwen4-512e (3:1 GDN:QSA, 4-Branch GR, 512E+Shared, PLE, Cold, MTP) ---\n");
+        try out.print(
+            \\qwen4_512e.experts               {d} (top-{d} + shared, {d} cold/layer)
+            \\qwen4_512e.ple_shards            {d}
+            \\qwen4_512e.wired_mib             {d}
+            \\qwen4_512e.gen_tokens            {d}
+            \\qwen4_512e.serial_tok_per_s      {d:.2}
+            \\qwen4_512e.mtp_tok_per_s         {d:.2}
+            \\qwen4_512e.mtp_mean_accept_tau   {d:.3}
+            \\qwen4_512e.mtp_placement         {s}
+            \\qwen4_512e.mtp_bit_exact_t0      {}
+            \\qwen4_512e.cold_hits             {d}
+            \\qwen4_512e.cold_misses           {d}
+            \\qwen4_512e.ple_nvme_reads        {d}
+            \\qwen4_512e.ple_r_ge1_nvme_reads  {d}
+            \\
+        , .{
+            self.scale_qwen4.num_experts,
+            self.scale_qwen4.top_k,
+            self.scale_qwen4.cold_per_layer,
+            self.scale_qwen4.ple_shards,
+            self.scale_qwen4.wired_mib,
+            self.scale_qwen4.gen_tokens,
+            self.scale_qwen4.serial_tok_per_s,
+            self.scale_qwen4.mtp_tok_per_s,
+            self.scale_qwen4.mtp_tau,
+            self.scale_qwen4.mtp_placement.label(),
+            self.scale_qwen4.bit_exact_mtp,
+            self.scale_qwen4.cold_hits,
+            self.scale_qwen4.cold_misses,
+            self.scale_qwen4.ple_nvme_reads,
+            self.scale_qwen4.ple_r_ge1_nvme_reads,
+        });
+
+        // 4. D12 SelfSpecRecurrent sweep
+        try out.writeAll("\n--- 4. D12 SelfSpecRecurrent Sweep (R = 1, 2, 3, 4; Core > L2/SLC) ---\n");
+        try out.print(
+            \\d12.core_layers                  {d} ({d:.2} MiB q4 Core, {d} MiB total wired)
+            \\R   serial_ms   serial_tok/s  vs_R1   vM4_ms  vM8_ms  vM12_ms vM16_ms break_M  specM8_tok/s (tau)   specM16_tok/s (tau)  t0_exact
+            \\
+        , .{
+            self.self_spec.core_layers,
+            self.self_spec.core_weight_mib,
+            self.self_spec.total_wired_mib,
+        });
+        for (self.self_spec.rows) |row| {
+            try out.print(
+                "{d:<3} {d:>8.3}    {d:>10.2}  {d:>5.2}x  {d:>6.2}  {d:>6.2}  {d:>6.2}  {d:>6.2}  {d:>5}    {d:>9.2} ({d:.2})    {d:>9.2} ({d:.2})   {}\n",
+                .{
+                    row.loops,
+                    row.serial_ms_per_tok,
+                    row.serial_tok_per_s,
+                    row.ratio_vs_r1,
+                    row.verify_m4_ms,
+                    row.verify_m8_ms,
+                    row.verify_m12_ms,
+                    row.verify_m16_ms,
+                    row.breakeven_m,
+                    row.spec_m8_tok_per_s,
+                    row.spec_m8_tau,
+                    row.spec_m16_tok_per_s,
+                    row.spec_m16_tau,
+                    row.bit_exact,
+                },
+            );
+        }
+
+        // 5. D13 cpu_sme2 vs gpu
+        try out.writeAll("\n--- 5. D13 Placement.cpu_sme2 vs .gpu (L2-Resident Draft Projections) ---\n");
+        try out.writeAll("subgraph                    dtype  N     K     M   w_kib    l2    sme2_us   gpu_us  gpu/sme  winner\n");
+        for (self.d13_rows) |row| {
+            const ratio = if (row.sme2_us > 0.0) row.gpu_us / row.sme2_us else 0.0;
+            try out.print(
+                "{s:<27} {s:<5} {d:>5} {d:>5} {d:>2} {d:>7.1}  {s:<4}  {d:>8.1} {d:>8.1}  {d:>6.2}x  {s}\n",
+                .{
+                    row.label,
+                    row.dtype_label,
+                    row.n,
+                    row.k,
+                    row.m,
+                    @as(f64, @floatFromInt(row.weight_bytes)) / 1024.0,
+                    if (row.fits_l2) "yes" else "no",
+                    row.sme2_us,
+                    row.gpu_us,
+                    ratio,
+                    if (row.prefer_sme2) "cpu_sme2" else "gpu",
+                },
+            );
+        }
+
+        const sw_delta = vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after);
+        const pg_delta = vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after);
+        try out.print(
+            \\\nm6.swap.swapouts_delta           {d}
+            \\m6.swap.pageouts_delta           {d}
+            \\m6.swap.status                   {s}
+            \\
+        , .{
+            sw_delta,
+            pg_delta,
+            if (sw_delta == 0) "PASS (no swap)" else "FAIL (swap detected)",
+        });
+    }
+};
+
+fn removeDirRecursiveBestEffort(allocator: std.mem.Allocator, dir_path: []const u8) void {
+    const dir_z = std.fmt.allocPrintSentinel(allocator, "{s}", .{dir_path}, 0) catch return;
+    defer allocator.free(dir_z);
+    if (std.c.opendir(dir_z.ptr)) |dp| {
+        defer _ = std.c.closedir(dp);
+        while (std.c.readdir(dp)) |ent| {
+            const name = std.mem.sliceTo(&ent.name, 0);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const child = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0) catch continue;
+            defer allocator.free(child);
+            _ = std.c.unlink(child.ptr);
+        }
+    }
+    _ = std.c.rmdir(dir_z.ptr);
+}
+
+fn makeM6TempDir(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
+    const base_env = std.c.getenv("TMPDIR");
+    const root: []const u8 = if (base_env) |p| std.mem.span(p) else "/Volumes/Akari/.tmp";
+    const root_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{root}, 0);
+    defer allocator.free(root_z);
+    _ = std.c.mkdir(root_z.ptr, 0o755);
+    const dir = try std.fmt.allocPrint(allocator, "{s}/aminfer_m6_{s}_{d}", .{ root, tag, std.c.getpid() });
+    errdefer allocator.free(dir);
+    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{dir}, 0);
+    defer allocator.free(dir_z);
+    _ = std.c.mkdir(dir_z.ptr, 0o755);
+    return dir;
+}
+
+fn runM6OpsBench(allocator: std.mem.Allocator, cfg: M6Config) !M6OpsReport {
+    var device = try metal.Device.open();
+    defer device.close();
+    const facts = try sysinfo.Facts.read();
+    const dev_info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+    var library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+
+    var hp = try hybrid.HybridPipelines.init(device, library);
+    defer hp.close();
+    var mp = try moe.MoePipelines.init(device, library);
+    defer mp.close();
+
+    // --- 1A. G8 GDN: prefill (seq), decode (M=1), S_tmp isolation + commit ---
+    const gdn_spec: hybrid.GdnStateSpec = .{
+        .num_gdn_layers = 1,
+        .num_v_heads = cfg.gdn_v_heads,
+        .head_k_dim = cfg.gdn_head_k,
+        .head_v_dim = cfg.gdn_head_v,
+    };
+    const gdn_state_bytes = try hybrid.GdnStateArena.requiredBytes(gdn_spec);
+    const qk_dim: usize = @as(usize, cfg.gdn_k_heads) * cfg.gdn_head_k;
+    const v_dim: usize = @as(usize, cfg.gdn_v_heads) * cfg.gdn_head_v;
+    const seq_u: usize = cfg.gdn_prefill_seq;
+
+    var gdn_arena = try arena_mod.WiredArena.init(
+        try page.alignUp(
+            gdn_state_bytes +
+                amf.align64(seq_u * qk_dim * 2) * 2 +
+                amf.align64(seq_u * v_dim * 2) * 2 +
+                amf.align64(seq_u * cfg.gdn_v_heads * 4) * 2 +
+                65536,
+        ),
+        wired_budget,
+    );
+    defer gdn_arena.deinit();
+    var gdn_buf = try metal.Buffer.wrap(device, gdn_arena.bytes());
+    defer gdn_buf.close();
+    try compute.makeResident(&.{gdn_buf});
+    defer compute.removeResident(&.{gdn_buf}) catch |err| std.debug.panic("removeResident failed: {}", .{err});
+
+    var gdn_states = try hybrid.GdnStateArena.init(&gdn_arena, gdn_spec);
+    gdn_states.resetAll();
+    const gdn_q = try gdn_arena.allocAligned(seq_u * qk_dim * 2, 64);
+    const gdn_k = try gdn_arena.allocAligned(seq_u * qk_dim * 2, 64);
+    const gdn_v = try gdn_arena.allocAligned(seq_u * v_dim * 2, 64);
+    const gdn_y = try gdn_arena.allocAligned(seq_u * v_dim * 2, 64);
+    const gdn_g = try gdn_arena.allocAligned(seq_u * cfg.gdn_v_heads * 4, 64);
+    const gdn_beta = try gdn_arena.allocAligned(seq_u * cfg.gdn_v_heads * 4, 64);
+    fillDeterministicF16Slice(gdn_q, 1001, 0.15);
+    fillDeterministicF16Slice(gdn_k, 1002, 0.15);
+    fillDeterministicF16Slice(gdn_v, 1003, 0.15);
+    {
+        const gs = std.mem.bytesAsSlice(f32, gdn_g);
+        const bs = std.mem.bytesAsSlice(f32, gdn_beta);
+        for (gs) |*v| v.* = -0.05;
+        for (bs) |*v| v.* = -1.0;
+    }
+
+    const gdn_q_b: metal.BufferBinding = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(gdn_q.ptr) };
+    const gdn_k_b: metal.BufferBinding = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(gdn_k.ptr) };
+    const gdn_v_b: metal.BufferBinding = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(gdn_v.ptr) };
+    const gdn_y_b: metal.BufferBinding = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(gdn_y.ptr) };
+    const gdn_g_b: metal.BufferBinding = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(gdn_g.ptr) };
+    const gdn_beta_b: metal.BufferBinding = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(gdn_beta.ptr) };
+    const st_comm = try gdn_states.committedBinding(gdn_buf, 0);
+    const st_tmp = try gdn_states.scratchBinding(gdn_buf, 0);
+
+    // Warmup + timed GDN prefill
+    const prefill_reps: u32 = @max(@as(u32, 2), cfg.gdn_reps / 4);
+    for (0..2) |_| {
+        var frame = try compute.beginFrame(cfg.timeout_ms);
+        errdefer frame.abort();
+        try hp.encodeGdnPrefill(&frame, .{
+            .q = gdn_q_b,
+            .k = gdn_k_b,
+            .v = gdn_v_b,
+            .g = gdn_g_b,
+            .beta = gdn_beta_b,
+            .state_in = st_comm,
+            .state_out = st_comm,
+            .out = gdn_y_b,
+            .seq_len = cfg.gdn_prefill_seq,
+            .num_k_heads = cfg.gdn_k_heads,
+            .num_v_heads = cfg.gdn_v_heads,
+            .head_k_dim = cfg.gdn_head_k,
+            .head_v_dim = cfg.gdn_head_v,
+        }, false);
+        try compute.wait(try frame.commit(), cfg.timeout_ms);
+    }
+    const gdn_pre_t0 = try vmstat.nowNs();
+    for (0..prefill_reps) |_| {
+        var frame = try compute.beginFrame(cfg.timeout_ms);
+        errdefer frame.abort();
+        try hp.encodeGdnPrefill(&frame, .{
+            .q = gdn_q_b,
+            .k = gdn_k_b,
+            .v = gdn_v_b,
+            .g = gdn_g_b,
+            .beta = gdn_beta_b,
+            .state_in = st_comm,
+            .state_out = st_comm,
+            .out = gdn_y_b,
+            .seq_len = cfg.gdn_prefill_seq,
+            .num_k_heads = cfg.gdn_k_heads,
+            .num_v_heads = cfg.gdn_v_heads,
+            .head_k_dim = cfg.gdn_head_k,
+            .head_v_dim = cfg.gdn_head_v,
+        }, false);
+        try compute.wait(try frame.commit(), cfg.timeout_ms);
+    }
+    const gdn_pre_t1 = try vmstat.nowNs();
+    const gdn_prefill_us = @as(f64, @floatFromInt(gdn_pre_t1 - gdn_pre_t0)) / (@as(f64, @floatFromInt(prefill_reps)) * 1000.0);
+    const single_state_bytes: u64 = @as(u64, gdn_states.layer_state_elems) * 4;
+    const prefill_alg_bytes: u64 = 2 * single_state_bytes + @as(u64, seq_u) * (2 * qk_dim * 2 + 2 * v_dim * 2 + cfg.gdn_v_heads * 8);
+    const gdn_prefill_gbs = @as(f64, @floatFromInt(prefill_alg_bytes)) / (gdn_prefill_us * 1000.0);
+    const gdn_prefill_tok_per_s = @as(f64, @floatFromInt(cfg.gdn_prefill_seq)) * 1_000_000.0 / gdn_prefill_us;
+
+    // Timed GDN decode (M=1 in-place S_t -> S_t)
+    const gdn_dec_t0 = try vmstat.nowNs();
+    {
+        var frame = try compute.beginFrame(cfg.timeout_ms);
+        errdefer frame.abort();
+        for (0..cfg.gdn_reps) |rep| {
+            try hp.encodeGdnDecode(&frame, .{
+                .q = gdn_q_b,
+                .k = gdn_k_b,
+                .v = gdn_v_b,
+                .g = gdn_g_b,
+                .beta = gdn_beta_b,
+                .state_in = st_comm,
+                .state_out = st_comm,
+                .out = gdn_y_b,
+                .num_k_heads = cfg.gdn_k_heads,
+                .num_v_heads = cfg.gdn_v_heads,
+                .head_k_dim = cfg.gdn_head_k,
+                .head_v_dim = cfg.gdn_head_v,
+            }, rep > 0);
+        }
+        try compute.wait(try frame.commit(), cfg.timeout_ms);
+    }
+    const gdn_dec_t1 = try vmstat.nowNs();
+    const gdn_decode_us = @as(f64, @floatFromInt(gdn_dec_t1 - gdn_dec_t0)) / (@as(f64, @floatFromInt(cfg.gdn_reps)) * 1000.0);
+    const gdn_dec_bytes: u64 = 2 * single_state_bytes + (2 * qk_dim * 2 + 2 * v_dim * 2 + cfg.gdn_v_heads * 8);
+    const gdn_decode_gbs = @as(f64, @floatFromInt(gdn_dec_bytes)) / (gdn_decode_us * 1000.0);
+
+    // Loop-isolated S_tmp evaluation + verification + encodeCommitScratchState
+    const snap_before = try allocator.dupe(f32, try gdn_states.committedLayerSlice(0));
+    defer allocator.free(snap_before);
+    const gdn_stmp_t0 = try vmstat.nowNs();
+    {
+        var frame = try compute.beginFrame(cfg.timeout_ms);
+        errdefer frame.abort();
+        for (0..cfg.gdn_reps) |rep| {
+            try hp.encodeGdnDecode(&frame, .{
+                .q = gdn_q_b,
+                .k = gdn_k_b,
+                .v = gdn_v_b,
+                .g = gdn_g_b,
+                .beta = gdn_beta_b,
+                .state_in = st_comm,
+                .state_out = st_tmp,
+                .out = gdn_y_b,
+                .num_k_heads = cfg.gdn_k_heads,
+                .num_v_heads = cfg.gdn_v_heads,
+                .head_k_dim = cfg.gdn_head_k,
+                .head_v_dim = cfg.gdn_head_v,
+            }, rep > 0);
+        }
+        try compute.wait(try frame.commit(), cfg.timeout_ms);
+    }
+    const gdn_stmp_t1 = try vmstat.nowNs();
+    const gdn_stmp_us = @as(f64, @floatFromInt(gdn_stmp_t1 - gdn_stmp_t0)) / (@as(f64, @floatFromInt(cfg.gdn_reps)) * 1000.0);
+    const committed_after_stmp = try gdn_states.committedLayerSlice(0);
+    const gdn_stmp_isolated = std.mem.eql(u8, std.mem.sliceAsBytes(snap_before), std.mem.sliceAsBytes(committed_after_stmp));
+
+    const gdn_cm_t0 = try vmstat.nowNs();
+    {
+        var frame = try compute.beginFrame(cfg.timeout_ms);
+        errdefer frame.abort();
+        for (0..cfg.gdn_reps) |rep| {
+            try hp.encodeCommitScratchState(&frame, &gdn_states, gdn_buf, 0, rep > 0);
+        }
+        try compute.wait(try frame.commit(), cfg.timeout_ms);
+    }
+    const gdn_cm_t1 = try vmstat.nowNs();
+    const gdn_commit_us = @as(f64, @floatFromInt(gdn_cm_t1 - gdn_cm_t0)) / (@as(f64, @floatFromInt(cfg.gdn_reps)) * 1000.0);
+
+    // --- 1B. G9 QSA: [11,11,10] MRoPE + YaRN + 512/128 HybridKvRing + r>=1 index reuse ---
+    const qsa_qd: usize = @as(usize, cfg.qsa_q_heads) * cfg.qsa_head_dim;
+    const qsa_kvd: usize = @as(usize, cfg.qsa_kv_heads) * cfg.qsa_head_dim;
+    const full_blocks: u32 = (cfg.qsa_full_kv_len + cfg.qsa_block_size - 1) / cfg.qsa_block_size;
+    const swa_blocks: u32 = (cfg.qsa_swa_kv_len + cfg.qsa_block_size - 1) / cfg.qsa_block_size;
+    const full_tiles: u32 = (cfg.qsa_full_kv_len + hybrid.QSA_FULL_CHUNK_TOKENS - 1) / hybrid.QSA_FULL_CHUNK_TOKENS;
+
+    const full_idx_spec: hybrid.QsaIndexBufferSpec = .{
+        .max_nodes = 16,
+        .num_kv_heads = cfg.qsa_kv_heads,
+        .top_k_blocks = cfg.qsa_top_k_blocks,
+    };
+    const qsa_arena_bytes = try page.alignUp(
+        (try hybrid.HybridKvRing.tableRequiredBytes(full_tiles)) +
+            (try hybrid.HybridKvRing.tableRequiredBytes(1)) +
+            (try hybrid.QsaIndexBuffer.requiredBytes(full_idx_spec)) * 2 +
+            amf.align64(@as(usize, full_blocks) * qsa_kvd * 2) +
+            amf.align64(@as(usize, swa_blocks) * qsa_kvd * 2) +
+            amf.align64(16 * qsa_qd * 2) * 2 +
+            amf.align64(16 * qsa_kvd * 2) * 4 +
+            amf.align64(@as(usize, cfg.qsa_head_dim) * 2) * 2 +
+            65536,
+    );
+    var qsa_arena = try arena_mod.WiredArena.init(qsa_arena_bytes, wired_budget);
+    defer qsa_arena.deinit();
+    var qsa_buf = try metal.Buffer.wrap(device, qsa_arena.bytes());
+    defer qsa_buf.close();
+    try compute.makeResident(&.{qsa_buf});
+    defer compute.removeResident(&.{qsa_buf}) catch |err| std.debug.panic("removeResident failed: {}", .{err});
+
+    var full_ring = try hybrid.HybridKvRing.init(allocator, device, &qsa_arena, .{
+        .mode = .full_chunk_512,
+        .num_kv_heads = cfg.qsa_kv_heads,
+        .head_dim = cfg.qsa_head_dim,
+        .num_tiles = full_tiles,
+    });
+    defer full_ring.deinit(allocator);
+    try full_ring.makeResident(compute);
+    defer full_ring.removeResident(compute) catch |err| std.debug.panic("removeResident failed: {}", .{err});
+
+    var swa_ring = try hybrid.HybridKvRing.init(allocator, device, &qsa_arena, .{
+        .mode = .sliding_window_128,
+        .num_kv_heads = cfg.qsa_kv_heads,
+        .head_dim = cfg.qsa_head_dim,
+        .num_tiles = 1,
+    });
+    defer swa_ring.deinit(allocator);
+    try swa_ring.makeResident(compute);
+    defer swa_ring.removeResident(compute) catch |err| std.debug.panic("removeResident failed: {}", .{err});
+
+    const full_idx_buf = try hybrid.QsaIndexBuffer.init(&qsa_arena, full_idx_spec);
+    const swa_idx_buf = try hybrid.QsaIndexBuffer.init(&qsa_arena, full_idx_spec);
+    const full_bkeys = try qsa_arena.allocAligned(@as(usize, full_blocks) * qsa_kvd * 2, 64);
+    const swa_bkeys = try qsa_arena.allocAligned(@as(usize, swa_blocks) * qsa_kvd * 2, 64);
+    const qsa_q = try qsa_arena.allocAligned(16 * qsa_qd * 2, 64);
+    const qsa_out = try qsa_arena.allocAligned(16 * qsa_qd * 2, 64);
+    const qsa_k = try qsa_arena.allocAligned(16 * qsa_kvd * 2, 64);
+    const qsa_v = try qsa_arena.allocAligned(16 * qsa_kvd * 2, 64);
+    const qsa_tk = try qsa_arena.allocAligned(16 * qsa_kvd * 2, 64);
+    const qsa_tv = try qsa_arena.allocAligned(16 * qsa_kvd * 2, 64);
+    const qsa_qn = try qsa_arena.allocAligned(@as(usize, cfg.qsa_head_dim) * 2, 64);
+    const qsa_kn = try qsa_arena.allocAligned(@as(usize, cfg.qsa_head_dim) * 2, 64);
+    const qsa_pos3d = try qsa_arena.allocAligned(16 * @sizeOf(hybrid.Pos3D), 64);
+    const qsa_masks = try qsa_arena.allocAligned(16 * @sizeOf(u64), 64);
+    fillDeterministicF16Slice(full_bkeys, 2001, 0.2);
+    fillDeterministicF16Slice(swa_bkeys, 2002, 0.2);
+    fillDeterministicF16Slice(qsa_q, 2003, 0.2);
+    fillDeterministicF16Slice(qsa_k, 2004, 0.2);
+    fillDeterministicF16Slice(qsa_v, 2005, 0.2);
+    fillDeterministicF16Slice(qsa_tk, 2006, 0.2);
+    fillDeterministicF16Slice(qsa_tv, 2007, 0.2);
+    fillConstantF16Slice(qsa_qn, 1.0);
+    fillConstantF16Slice(qsa_kn, 1.0);
+    {
+        const p3 = std.mem.bytesAsSlice(hybrid.Pos3D, qsa_pos3d);
+        const ms = std.mem.bytesAsSlice(u64, qsa_masks);
+        for (0..16) |i| {
+            p3[i] = hybrid.Pos3D.text(cfg.qsa_full_kv_len + @as(u32, @intCast(i)));
+            ms[i] = (@as(u64, 1) << @intCast(i + 1)) - 1;
+        }
+    }
+
+    const qsa_q_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_q.ptr) };
+    const qsa_out_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_out.ptr) };
+    const qsa_k_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_k.ptr) };
+    const qsa_v_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_v.ptr) };
+    const qsa_tk_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_tk.ptr) };
+    const qsa_tv_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_tv.ptr) };
+    const qsa_qn_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_qn.ptr) };
+    const qsa_kn_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_kn.ptr) };
+    const qsa_p3_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_pos3d.ptr) };
+    const qsa_mk_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(qsa_masks.ptr) };
+    const full_bk_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(full_bkeys.ptr) };
+    const swa_bk_b: metal.BufferBinding = .{ .buffer = qsa_buf, .offset = qsa_arena.offsetOf(swa_bkeys.ptr) };
+
+    // Time [11,11,10] MRoPE + YaRN (`encodeQsaTreeRope`, M=1)
+    const mr_t0 = try vmstat.nowNs();
+    {
+        var frame = try compute.beginFrame(cfg.timeout_ms);
+        errdefer frame.abort();
+        for (0..cfg.qsa_reps) |rep| {
+            try hp.encodeQsaTreeRope(&frame, .{
+                .q = qsa_q_b,
+                .k = qsa_k_b,
+                .v = qsa_v_b,
+                .q_norm = qsa_qn_b,
+                .k_norm = qsa_kn_b,
+                .positions_3d = qsa_p3_b,
+                .k_tree_out = qsa_tk_b,
+                .v_tree_out = qsa_tv_b,
+                .num_nodes = 1,
+                .num_q_heads = cfg.qsa_q_heads,
+                .num_kv_heads = cfg.qsa_kv_heads,
+                .head_dim = cfg.qsa_head_dim,
+                .rotary_dim = cfg.qsa_head_dim,
+                .mrope = hybrid.MropeSection.QWEN38_DEFAULT,
+                .rms_eps = 1e-6,
+                .rope_theta = 1_000_000.0,
+                .yarn = .{ .factor = 4.0, .original_max_pos = 32768 },
+                .norm_dtype = .f16,
+            }, rep > 0);
+        }
+        try compute.wait(try frame.commit(), cfg.timeout_ms);
+    }
+    const mr_t1 = try vmstat.nowNs();
+    const qsa_mrope_us = @as(f64, @floatFromInt(mr_t1 - mr_t0)) / (@as(f64, @floatFromInt(cfg.qsa_reps)) * 1000.0);
+
+    // Time Full-512 ring r=0 vs r>=1 reuse
+    const timeQsaRing = struct {
+        fn call(
+            comp: *metal.Compute,
+            pipes: *const hybrid.HybridPipelines,
+            ring: *const hybrid.HybridKvRing,
+            idx_b: *const hybrid.QsaIndexBuffer,
+            buf: metal.Buffer,
+            q_b: metal.BufferBinding,
+            bk_b: metal.BufferBinding,
+            tk_b: metal.BufferBinding,
+            tv_b: metal.BufferBinding,
+            mk_b: metal.BufferBinding,
+            out_b: metal.BufferBinding,
+            c: M6Config,
+            kv_len: u32,
+            reuse: bool,
+        ) !f64 {
+            // Prime indices once before reuse benchmark so index buffer is valid.
+            if (reuse) {
+                var pf = try comp.beginFrame(c.timeout_ms);
+                errdefer pf.abort();
+                try pipes.encodeQsaAttention(&pf, .{
+                    .q = q_b,
+                    .kv_tiles = ring.tileTableBinding(buf),
+                    .block_keys = bk_b,
+                    .index_buf = idx_b,
+                    .index_metal_buf = buf,
+                    .k_tree = tk_b,
+                    .v_tree = tv_b,
+                    .ancestor_masks = mk_b,
+                    .out = out_b,
+                    .num_nodes = 1,
+                    .num_q_heads = c.qsa_q_heads,
+                    .num_kv_heads = c.qsa_kv_heads,
+                    .head_dim = c.qsa_head_dim,
+                    .kv_len = kv_len,
+                    .window_size = ring.window_size,
+                    .ring_capacity = ring.ring_capacity,
+                    .chunk_tokens = ring.chunk_tokens,
+                    .block_tokens = c.qsa_block_size,
+                    .top_k_blocks = c.qsa_top_k_blocks,
+                    .reuse_block_indices = false,
+                }, false);
+                try comp.wait(try pf.commit(), c.timeout_ms);
+            }
+            const t0 = try vmstat.nowNs();
+            var frame = try comp.beginFrame(c.timeout_ms);
+            errdefer frame.abort();
+            for (0..c.qsa_reps) |rep| {
+                try pipes.encodeQsaAttention(&frame, .{
+                    .q = q_b,
+                    .kv_tiles = ring.tileTableBinding(buf),
+                    .block_keys = bk_b,
+                    .index_buf = idx_b,
+                    .index_metal_buf = buf,
+                    .k_tree = tk_b,
+                    .v_tree = tv_b,
+                    .ancestor_masks = mk_b,
+                    .out = out_b,
+                    .num_nodes = 1,
+                    .num_q_heads = c.qsa_q_heads,
+                    .num_kv_heads = c.qsa_kv_heads,
+                    .head_dim = c.qsa_head_dim,
+                    .kv_len = kv_len,
+                    .window_size = ring.window_size,
+                    .ring_capacity = ring.ring_capacity,
+                    .chunk_tokens = ring.chunk_tokens,
+                    .block_tokens = c.qsa_block_size,
+                    .top_k_blocks = c.qsa_top_k_blocks,
+                    .reuse_block_indices = reuse,
+                }, rep > 0);
+            }
+            try comp.wait(try frame.commit(), c.timeout_ms);
+            const t1 = try vmstat.nowNs();
+            return @as(f64, @floatFromInt(t1 - t0)) / (@as(f64, @floatFromInt(c.qsa_reps)) * 1000.0);
+        }
+    }.call;
+
+    const qsa_full512_r0_us = try timeQsaRing(&compute, &hp, &full_ring, &full_idx_buf, qsa_buf, qsa_q_b, full_bk_b, qsa_tk_b, qsa_tv_b, qsa_mk_b, qsa_out_b, cfg, cfg.qsa_full_kv_len, false);
+    const qsa_full512_reuse_us = try timeQsaRing(&compute, &hp, &full_ring, &full_idx_buf, qsa_buf, qsa_q_b, full_bk_b, qsa_tk_b, qsa_tv_b, qsa_mk_b, qsa_out_b, cfg, cfg.qsa_full_kv_len, true);
+    const qsa_swa128_r0_us = try timeQsaRing(&compute, &hp, &swa_ring, &swa_idx_buf, qsa_buf, qsa_q_b, swa_bk_b, qsa_tk_b, qsa_tv_b, qsa_mk_b, qsa_out_b, cfg, cfg.qsa_swa_kv_len, false);
+    const qsa_swa128_reuse_us = try timeQsaRing(&compute, &hp, &swa_ring, &swa_idx_buf, qsa_buf, qsa_q_b, swa_bk_b, qsa_tk_b, qsa_tv_b, qsa_mk_b, qsa_out_b, cfg, cfg.qsa_swa_kv_len, true);
+
+    // --- 1C. G10 4-branch GR (M=1 and M=16) ---
+    const gr_spec: hybrid.GrStreamSpec = .{
+        .max_tokens = 16,
+        .hidden_dim = cfg.gr_hidden,
+        .dtype = .f16,
+    };
+    const gr_arena_bytes = try page.alignUp(
+        (try hybrid.GrStreamArena.requiredBytes(gr_spec)) +
+            amf.align64(16 * @as(usize, cfg.gr_hidden) * 2) * 3 +
+            amf.align64(4 * @as(usize, cfg.gr_hidden) * 2) * 3 +
+            amf.align64(16 * 16) * 3 +
+            65536,
+    );
+    var gr_arena = try arena_mod.WiredArena.init(gr_arena_bytes, wired_budget);
+    defer gr_arena.deinit();
+    var gr_buf = try metal.Buffer.wrap(device, gr_arena.bytes());
+    defer gr_buf.close();
+    try compute.makeResident(&.{gr_buf});
+    defer compute.removeResident(&.{gr_buf}) catch |err| std.debug.panic("removeResident failed: {}", .{err});
+
+    const gr_stream = try hybrid.GrStreamArena.init(&gr_arena, gr_spec);
+    const gr_x0 = try gr_arena.allocAligned(16 * @as(usize, cfg.gr_hidden) * 2, 64);
+    const gr_xin = try gr_arena.allocAligned(16 * @as(usize, cfg.gr_hidden) * 2, 64);
+    const gr_yd = try gr_arena.allocAligned(16 * @as(usize, cfg.gr_hidden) * 2, 64);
+    const gr_wr = try gr_arena.allocAligned(4 * @as(usize, cfg.gr_hidden) * 2, 64);
+    const gr_ww = try gr_arena.allocAligned(4 * @as(usize, cfg.gr_hidden) * 2, 64);
+    const gr_wd = try gr_arena.allocAligned(4 * @as(usize, cfg.gr_hidden) * 2, 64);
+    const gr_gr = try gr_arena.allocAligned(16 * 16, 64);
+    const gr_gw = try gr_arena.allocAligned(16 * 16, 64);
+    const gr_gd = try gr_arena.allocAligned(16 * 16, 64);
+    fillDeterministicF16Slice(gr_x0, 3001, 0.2);
+    fillDeterministicF16Slice(gr_yd, 3002, 0.2);
+    fillDeterministicF16Slice(gr_wr, 3003, 0.1);
+    fillDeterministicF16Slice(gr_ww, 3004, 0.1);
+    fillDeterministicF16Slice(gr_wd, 3005, 0.1);
+
+    const timeGr = struct {
+        fn call(
+            comp: *metal.Compute,
+            pipes: *const hybrid.HybridPipelines,
+            stream: *const hybrid.GrStreamArena,
+            buf: metal.Buffer,
+            arena_p: *const arena_mod.WiredArena,
+            x0: []u8,
+            xin: []u8,
+            yd: []u8,
+            wr: []u8,
+            ww: []u8,
+            wd: []u8,
+            gr: []u8,
+            gw: []u8,
+            gd: []u8,
+            m: u32,
+            c: M6Config,
+        ) !struct { us: f64, gbs: f64 } {
+            const x0_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(x0.ptr) };
+            const xin_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(xin.ptr) };
+            const yd_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(yd.ptr) };
+            const wr_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(wr.ptr) };
+            const ww_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(ww.ptr) };
+            const wd_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(wd.ptr) };
+            const gr_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(gr.ptr) };
+            const gw_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(gw.ptr) };
+            const gd_b: metal.BufferBinding = .{ .buffer = buf, .offset = arena_p.offsetOf(gd.ptr) };
+            const sb = stream.binding(buf);
+
+            const t0 = try vmstat.nowNs();
+            var frame = try comp.beginFrame(c.timeout_ms);
+            errdefer frame.abort();
+            for (0..c.gr_reps) |rep| {
+                try pipes.encodeGrComputeGates(&frame, .{
+                    .stream = sb,
+                    .w_read = wr_b,
+                    .w_write = ww_b,
+                    .w_decay = wd_b,
+                    .g_read_out = gr_b,
+                    .g_write_out = gw_b,
+                    .decay_out = gd_b,
+                    .m = m,
+                    .hidden_dim = c.gr_hidden,
+                    .branch_token_stride = 16,
+                    .weight_dtype = .f16,
+                }, rep > 0);
+                try pipes.encodeGrReadGate(&frame, .{
+                    .stream = sb,
+                    .g_read = gr_b,
+                    .x_in = xin_b,
+                    .m = m,
+                    .hidden_dim = c.gr_hidden,
+                    .branch_token_stride = 16,
+                }, true);
+                try pipes.encodeGrWriteGate(&frame, .{
+                    .stream = sb,
+                    .y_delta = yd_b,
+                    .decay = gd_b,
+                    .g_write = gw_b,
+                    .m = m,
+                    .hidden_dim = c.gr_hidden,
+                    .branch_token_stride = 16,
+                }, true);
+                try pipes.encodeGrCollapse(&frame, .{
+                    .stream = sb,
+                    .out = x0_b,
+                    .mode = .mean,
+                    .m = m,
+                    .hidden_dim = c.gr_hidden,
+                    .branch_token_stride = 16,
+                }, true);
+            }
+            try comp.wait(try frame.commit(), c.timeout_ms);
+            const t1 = try vmstat.nowNs();
+            const us = @as(f64, @floatFromInt(t1 - t0)) / (@as(f64, @floatFromInt(c.gr_reps)) * 1000.0);
+            // Stream traffic across compute_gates + read + write + collapse:
+            // read 4*m*H (gates) + read 4*m*H + write m*H (read_gate) + read/write 4*m*H + read m*H (write_gate) + read 4*m*H + write m*H (collapse) + 3*4*H weights
+            const bytes: u64 = (@as(u64, m) * c.gr_hidden * 2) * (4 + 5 + 9 + 5) + 3 * 4 * @as(u64, c.gr_hidden) * 2;
+            return .{ .us = us, .gbs = @as(f64, @floatFromInt(bytes)) / (us * 1000.0) };
+        }
+    }.call;
+
+    const gr_m1 = try timeGr(&compute, &hp, &gr_stream, gr_buf, &gr_arena, gr_x0, gr_xin, gr_yd, gr_wr, gr_ww, gr_wd, gr_gr, gr_gw, gr_gd, 1, cfg);
+    const gr_m16 = try timeGr(&compute, &hp, &gr_stream, gr_buf, &gr_arena, gr_x0, gr_xin, gr_yd, gr_wr, gr_ww, gr_wd, gr_gr, gr_gw, gr_gd, 16, cfg);
+
+    // --- 1D. G7 512-expert top-10 + shared_expert MoE (M=1 and M=16 CSR dedup) ---
+    const e_cnt = cfg.moe512_num_experts;
+    const h512 = cfg.moe512_hidden;
+    const inter512 = cfg.moe512_inter;
+    const sh_inter512 = cfg.moe512_shared_inter;
+    const q4_gu_qbytes: usize = @as(usize, inter512) * (h512 / 2);
+    const q4_gu_sbbytes: usize = @as(usize, inter512) * (h512 / 64) * 4;
+    const q4_dn_qbytes: usize = @as(usize, h512) * (inter512 / 2);
+    const q4_dn_sbbytes: usize = @as(usize, h512) * (inter512 / 64) * 4;
+    const single_exp_bytes: usize = amf.align64(q4_gu_qbytes) * 2 + amf.align64(q4_gu_sbbytes) * 2 + amf.align64(q4_dn_qbytes) + amf.align64(q4_dn_sbbytes);
+    const sh_gu_qbytes: usize = @as(usize, sh_inter512) * (h512 / 2);
+    const sh_gu_sbbytes: usize = @as(usize, sh_inter512) * (h512 / 64) * 4;
+    const sh_dn_qbytes: usize = @as(usize, h512) * (sh_inter512 / 2);
+    const sh_dn_sbbytes: usize = @as(usize, h512) * (sh_inter512 / 64) * 4;
+    const sh_total_bytes: usize = amf.align64(sh_gu_qbytes) * 2 + amf.align64(sh_gu_sbbytes) * 2 + amf.align64(sh_dn_qbytes) + amf.align64(sh_dn_sbbytes);
+
+    const ws_spec: moe.WorkspaceSpec = .{
+        .max_tokens = 16,
+        .num_experts = e_cnt,
+        .top_k = cfg.moe512_top_k,
+        .hidden_size = h512,
+        .intermediate_size = inter512,
+        .shared_intermediate_size = sh_inter512,
+    };
+    const ws_bytes = try moe.MoeWorkspace.requiredBytes(ws_spec);
+    const moe_arena_bytes = try page.alignUp(
+        @as(usize, e_cnt) * single_exp_bytes +
+            sh_total_bytes +
+            ws_bytes +
+            amf.align64(@as(usize, e_cnt) * @sizeOf(moe.ExpertWeights)) +
+            amf.align64(16 * @as(usize, e_cnt) * 4) +
+            amf.align64(16 * @as(usize, h512) * 2) * 2 +
+            amf.align64(@as(usize, h512) * 2) +
+            131072,
+    );
+    var moe_arena = try arena_mod.WiredArena.init(moe_arena_bytes, wired_budget);
+    defer moe_arena.deinit();
+    var moe_buf = try metal.Buffer.wrap(device, moe_arena.bytes());
+    defer moe_buf.close();
+    try compute.makeResident(&.{moe_buf});
+    defer compute.removeResident(&.{moe_buf}) catch |err| std.debug.panic("removeResident failed: {}", .{err});
+
+    const moe_ws = try moe.MoeWorkspace.init(&moe_arena, ws_spec);
+    const exp_tbl_bytes = try moe_arena.allocAligned(@as(usize, e_cnt) * @sizeOf(moe.ExpertWeights), 64);
+    const exp_tbl = std.mem.bytesAsSlice(moe.ExpertWeights, exp_tbl_bytes);
+    const weights_region = try moe_arena.allocAligned(@as(usize, e_cnt) * single_exp_bytes + sh_total_bytes, 64);
+    // Deterministic fast fill for q4 weights + valid scale/bias
+    @memset(weights_region, 0x37);
+    const weights_base: metal.BufferBinding = .{ .buffer = moe_buf, .offset = moe_arena.offsetOf(weights_region.ptr) };
+    const sb_s: u16 = @bitCast(@as(f16, 0.008));
+    const sb_b: u16 = @bitCast(@as(f16, -0.06));
+    const writeSb = struct {
+        fn call(slice: []u8, s: u16, b: u16) void {
+            var idx: usize = 0;
+            while (idx + 4 <= slice.len) : (idx += 4) {
+                std.mem.writeInt(u16, slice[idx..][0..2], s, .little);
+                std.mem.writeInt(u16, slice[idx + 2 ..][0..2], b, .little);
+            }
+        }
+    }.call;
+
+    var cur_off: usize = 0;
+    for (0..e_cnt) |e| {
+        const gq = cur_off;
+        cur_off += amf.align64(q4_gu_qbytes);
+        const gsb = cur_off;
+        writeSb(weights_region[gsb .. gsb + q4_gu_sbbytes], sb_s, sb_b);
+        cur_off += amf.align64(q4_gu_sbbytes);
+        const uq = cur_off;
+        cur_off += amf.align64(q4_gu_qbytes);
+        const usb = cur_off;
+        writeSb(weights_region[usb .. usb + q4_gu_sbbytes], sb_s, sb_b);
+        cur_off += amf.align64(q4_gu_sbbytes);
+        const dq = cur_off;
+        cur_off += amf.align64(q4_dn_qbytes);
+        const dsb = cur_off;
+        writeSb(weights_region[dsb .. dsb + q4_dn_sbbytes], sb_s, sb_b);
+        cur_off += amf.align64(q4_dn_sbbytes);
+        exp_tbl[e] = .{
+            .gate_qweight_offset = @intCast(gq),
+            .gate_sb_offset = @intCast(gsb),
+            .up_qweight_offset = @intCast(uq),
+            .up_sb_offset = @intCast(usb),
+            .down_qweight_offset = @intCast(dq),
+            .down_sb_offset = @intCast(dsb),
+        };
+    }
+    const sh_gq = cur_off;
+    cur_off += amf.align64(sh_gu_qbytes);
+    const sh_gsb = cur_off;
+    writeSb(weights_region[sh_gsb .. sh_gsb + sh_gu_sbbytes], sb_s, sb_b);
+    cur_off += amf.align64(sh_gu_sbbytes);
+    const sh_uq = cur_off;
+    cur_off += amf.align64(sh_gu_qbytes);
+    const sh_usb = cur_off;
+    writeSb(weights_region[sh_usb .. sh_usb + sh_gu_sbbytes], sb_s, sb_b);
+    cur_off += amf.align64(sh_gu_sbbytes);
+    const sh_dq = cur_off;
+    cur_off += amf.align64(sh_dn_qbytes);
+    const sh_dsb = cur_off;
+    writeSb(weights_region[sh_dsb .. sh_dsb + sh_dn_sbbytes], sb_s, sb_b);
+    const shared_ew: moe.ExpertWeights = .{
+        .gate_qweight_offset = @intCast(sh_gq),
+        .gate_sb_offset = @intCast(sh_gsb),
+        .up_qweight_offset = @intCast(sh_uq),
+        .up_sb_offset = @intCast(sh_usb),
+        .down_qweight_offset = @intCast(sh_dq),
+        .down_sb_offset = @intCast(sh_dsb),
+    };
+
+    const moe_x = try moe_arena.allocAligned(16 * @as(usize, h512) * 2, 64);
+    const moe_out = try moe_arena.allocAligned(16 * @as(usize, h512) * 2, 64);
+    const moe_sgate = try moe_arena.allocAligned(@as(usize, h512) * 2, 64);
+    const moe_logits = try moe_arena.allocAligned(16 * @as(usize, e_cnt) * 4, 64);
+    fillDeterministicF16Slice(moe_x, 4001, 0.2);
+    fillDeterministicF16Slice(moe_sgate, 4002, 0.1);
+    // Realistic Zipf-clustered routing logits for 16 tree nodes (shared hot core + per-node diversity).
+    {
+        const ls = std.mem.bytesAsSlice(f32, moe_logits);
+        var prng = std.Random.DefaultPrng.init(4042);
+        const rng = prng.random();
+        for (0..16) |node| {
+            for (0..e_cnt) |e| {
+                // First ~32 experts carry realistic hot-expert bias + per-node variation.
+                const hot_bias: f32 = if (e < 24) 3.5 - @as(f32, @floatFromInt(e)) * 0.08 else 0.0;
+                ls[node * e_cnt + e] = hot_bias + rng.float(f32) * 2.2 + @as(f32, @floatFromInt((node * 7 + e) % 13)) * 0.05;
+            }
+        }
+    }
+
+    const moe_x_b: metal.BufferBinding = .{ .buffer = moe_buf, .offset = moe_arena.offsetOf(moe_x.ptr) };
+    const moe_out_b: metal.BufferBinding = .{ .buffer = moe_buf, .offset = moe_arena.offsetOf(moe_out.ptr) };
+    const moe_sg_b: metal.BufferBinding = .{ .buffer = moe_buf, .offset = moe_arena.offsetOf(moe_sgate.ptr) };
+    const moe_lg_b: metal.BufferBinding = .{ .buffer = moe_buf, .offset = moe_arena.offsetOf(moe_logits.ptr) };
+    const moe_et_b: metal.BufferBinding = .{ .buffer = moe_buf, .offset = moe_arena.offsetOf(exp_tbl_bytes.ptr) };
+
+    const timeMoe512 = struct {
+        fn call(
+            comp: *metal.Compute,
+            pipes: *const moe.MoePipelines,
+            ws: *const moe.MoeWorkspace,
+            buf: metal.Buffer,
+            x_b: metal.BufferBinding,
+            out_b: metal.BufferBinding,
+            lg_b: metal.BufferBinding,
+            wb: metal.BufferBinding,
+            et_b: metal.BufferBinding,
+            sh: moe.ExpertWeights,
+            sg_b: metal.BufferBinding,
+            m: u32,
+            c: M6Config,
+            exp_b: usize,
+            sh_b: usize,
+        ) !struct { us: f64, gbs: f64, unique: u32 } {
+            const args: moe.MoELayerArgs = .{
+                .x = x_b,
+                .router = .{ .logits = .{ .binding = lg_b, .dtype = .f32 } },
+                .weights_base = wb,
+                .expert_table = et_b,
+                .workspace = ws,
+                .workspace_buf = buf,
+                .out = out_b,
+                .m = m,
+                .num_experts = c.moe512_num_experts,
+                .top_k = c.moe512_top_k,
+                .hidden_size = c.moe512_hidden,
+                .intermediate_size = c.moe512_inter,
+                .shared_expert = sh,
+                .shared_weights_base = wb,
+                .shared_expert_dtype = .q4_affine,
+                .shared_intermediate_size = c.moe512_shared_inter,
+                .shared_gate_weight = sg_b,
+                .shared_gate_dtype = .f16,
+            };
+            // Warmup
+            {
+                var wf = try comp.beginFrame(c.timeout_ms);
+                errdefer wf.abort();
+                try pipes.encodeMoELayer(&wf, .q4, args, false);
+                try comp.wait(try wf.commit(), c.timeout_ms);
+            }
+            const unique = ws.schedule_header.num_unique_experts;
+            const t0 = try vmstat.nowNs();
+            for (0..c.moe512_reps) |_| {
+                var frame = try comp.beginFrame(c.timeout_ms);
+                errdefer frame.abort();
+                try pipes.encodeMoELayer(&frame, .q4, args, false);
+                try comp.wait(try frame.commit(), c.timeout_ms);
+            }
+            const t1 = try vmstat.nowNs();
+            const us = @as(f64, @floatFromInt(t1 - t0)) / (@as(f64, @floatFromInt(c.moe512_reps)) * 1000.0);
+            const moved: u64 = @as(u64, unique) * exp_b + sh_b + @as(u64, m) * c.moe512_hidden * 4;
+            return .{
+                .us = us,
+                .gbs = @as(f64, @floatFromInt(moved)) / (us * 1000.0),
+                .unique = unique,
+            };
+        }
+    }.call;
+
+    const m512_1 = try timeMoe512(&compute, &mp, &moe_ws, moe_buf, moe_x_b, moe_out_b, moe_lg_b, weights_base, moe_et_b, shared_ew, moe_sg_b, 1, cfg, single_exp_bytes, sh_total_bytes);
+    const m512_16 = try timeMoe512(&compute, &mp, &moe_ws, moe_buf, moe_x_b, moe_out_b, moe_lg_b, weights_base, moe_et_b, shared_ew, moe_sg_b, 16, cfg, single_exp_bytes, sh_total_bytes);
+    const naive_16: f64 = @floatFromInt(@as(u32, 16) * cfg.moe512_top_k);
+    const dedup_ratio: f64 = if (m512_16.unique > 0) naive_16 / @as(f64, @floatFromInt(m512_16.unique)) else 1.0;
+
+    return .{
+        .gdn_prefill_seq = cfg.gdn_prefill_seq,
+        .gdn_prefill_us = gdn_prefill_us,
+        .gdn_prefill_tok_per_s = gdn_prefill_tok_per_s,
+        .gdn_prefill_gbs = gdn_prefill_gbs,
+        .gdn_decode_us = gdn_decode_us,
+        .gdn_decode_gbs = gdn_decode_gbs,
+        .gdn_stmp_us = gdn_stmp_us,
+        .gdn_commit_us = gdn_commit_us,
+        .gdn_stmp_isolated = gdn_stmp_isolated,
+        .qsa_mrope_us = qsa_mrope_us,
+        .qsa_full512_r0_us = qsa_full512_r0_us,
+        .qsa_full512_reuse_us = qsa_full512_reuse_us,
+        .qsa_swa128_r0_us = qsa_swa128_r0_us,
+        .qsa_swa128_reuse_us = qsa_swa128_reuse_us,
+        .gr_hidden = cfg.gr_hidden,
+        .gr_m1_us = gr_m1.us,
+        .gr_m1_gbs = gr_m1.gbs,
+        .gr_m16_us = gr_m16.us,
+        .gr_m16_gbs = gr_m16.gbs,
+        .moe512_num_experts = e_cnt,
+        .moe512_top_k = cfg.moe512_top_k,
+        .moe512_wired_mib = moe_arena.bytes().len >> 20,
+        .moe512_m1_us = m512_1.us,
+        .moe512_m1_gbs = m512_1.gbs,
+        .moe512_m1_unique = m512_1.unique,
+        .moe512_m16_us = m512_16.us,
+        .moe512_m16_gbs = m512_16.gbs,
+        .moe512_m16_unique = m512_16.unique,
+        .moe512_dedup_ratio = dedup_ratio,
+    };
+}
+
+fn fillDeterministicF16Slice(dst: []u8, seed: u64, amp: f32) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    const count = dst.len / 2;
+    for (0..count) |i| {
+        const v: f32 = (r.float(f32) * 2.0 - 1.0) * amp;
+        const bits: u16 = @bitCast(@as(f16, @floatCast(v)));
+        std.mem.writeInt(u16, dst[i * 2 ..][0..2], bits, .little);
+    }
+}
+
+fn fillConstantF16Slice(dst: []u8, val: f32) void {
+    const bits: u16 = @bitCast(@as(f16, @floatCast(val)));
+    const count = dst.len / 2;
+    for (0..count) |i| {
+        std.mem.writeInt(u16, dst[i * 2 ..][0..2], bits, .little);
+    }
+}
+
+fn runM6PleBench(allocator: std.mem.Allocator, cfg: M6Config) !M6PleReport {
+    const tmp_dir = try makeM6TempDir(allocator, "ple");
+    defer {
+        removeDirRecursiveBestEffort(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+
+    // Build 4-shard PLE `.amf` files via graph.buildSynthQwen4Bundle (using minimal experts for speed).
+    const total_rows: u64 = @as(u64, cfg.ple_num_shards) * cfg.ple_rows_per_shard;
+    var bundle = try graph.buildSynthQwen4Bundle(allocator, .{
+        .hidden_size = cfg.ple_embed_dim,
+        .vocab_size = 128,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .gdn_kh = 2,
+        .gdn_vh = 2,
+        .gdn_kd = 32,
+        .gdn_vd = 32,
+        .moe_inter = 64,
+        .shared_inter = 64,
+        .num_experts = 4,
+        .top_k = 2,
+        .ple_num_shards = cfg.ple_num_shards,
+        .ple_rows = total_rows,
+        .tmp_dir = tmp_dir,
+    });
+    defer bundle.deinit(allocator);
+
+    var store = try ple.PleStore.open(allocator, bundle.ple_paths, .{
+        .cache = .{ .cache_pages = cfg.ple_cache_pages },
+    });
+    defer store.deinit(allocator);
+
+    var scratch = try ple.LoopPleScratch.init(allocator, 4, 1, cfg.ple_embed_dim, null);
+    defer scratch.deinit(allocator);
+
+    const acc_buf = try allocator.alloc(f32, cfg.ple_embed_dim);
+    defer allocator.free(acc_buf);
+
+    // 1. Cold F_NOCACHE misses (clearCache before each distinct query to guarantee true SSD pread).
+    const cold_samples = try allocator.alloc(f64, cfg.ple_cold_queries);
+    defer allocator.free(cold_samples);
+    for (0..cfg.ple_cold_queries) |q| {
+        try store.clearCache();
+        @memset(acc_buf, 0.0);
+        const toks = [_]u32{ @intCast(q * 31 + 3), @intCast(q * 17 + 11) };
+        const loc = try store.mapNgram(0, &toks, 2);
+        const rows = [_]u64{loc.global_row};
+        const t0 = try vmstat.nowNs();
+        try store.lookupAndAccumulate(0, &rows, 1.0, acc_buf);
+        const t1 = try vmstat.nowNs();
+        cold_samples[q] = @as(f64, @floatFromInt(t1 - t0)) / 1000.0;
+    }
+
+    // 2. Wired LRU cache hits (same row repeated).
+    const hit_samples = try allocator.alloc(f64, cfg.ple_hit_queries);
+    defer allocator.free(hit_samples);
+    const hot_toks = [_]u32{ 7, 19 };
+    const hot_loc = try store.mapNgram(0, &hot_toks, 2);
+    const hot_rows = [_]u64{hot_loc.global_row};
+    @memset(acc_buf, 0.0);
+    try store.lookupAndAccumulate(0, &hot_rows, 1.0, acc_buf); // warm into LRU
+    for (0..cfg.ple_hit_queries) |q| {
+        @memset(acc_buf, 0.0);
+        const t0 = try vmstat.nowNs();
+        try store.lookupAndAccumulate(0, &hot_rows, 1.0, acc_buf);
+        const t1 = try vmstat.nowNs();
+        hit_samples[q] = @as(f64, @floatFromInt(t1 - t0)) / 1000.0;
+    }
+
+    // 3. ADR-0019 Loop Isolation #2: `lookupForLoopStep` across R=3 (`r = 0, 1, 2`).
+    try store.clearCache();
+    store.resetStats();
+    var r0_nvme: u64 = 0;
+    var r_ge1_nvme: u64 = 0;
+    var r_ge1_reuses: u64 = 0;
+    for (0..cfg.ple_loop_steps) |step| {
+        scratch.resetStep();
+        const toks = [_]u32{ @intCast(step * 23 + 5), @intCast(step * 41 + 9) };
+        const loc = try store.mapNgram(0, &toks, 2);
+        const rows = [_]u64{loc.global_row};
+        const before_r0 = store.stats().nvme_reads;
+        @memset(acc_buf, 0.0);
+        try store.lookupForLoopStep(0, &rows, 1.0, 0, &scratch, acc_buf);
+        r0_nvme += store.stats().nvme_reads - before_r0;
+        for ([_]u32{ 1, 2 }) |r| {
+            const before_r = store.stats().nvme_reads;
+            @memset(acc_buf, 0.0);
+            try store.lookupForLoopStep(0, &rows, 1.0, r, &scratch, acc_buf);
+            r_ge1_nvme += store.stats().nvme_reads - before_r;
+            r_ge1_reuses += 1;
+        }
+    }
+
+    return .{
+        .num_shards = cfg.ple_num_shards,
+        .total_rows = total_rows,
+        .embed_dim = cfg.ple_embed_dim,
+        .wired_kib = (store.totalWiredBytes() + scratch.totalWiredBytes()) >> 10,
+        .cold_p50_us = percentileF64(cold_samples, 0.50),
+        .cold_p99_us = percentileF64(cold_samples, 0.99),
+        .hit_p50_us = percentileF64(hit_samples, 0.50),
+        .r0_nvme_reads = r0_nvme,
+        .r_ge1_nvme_reads = r_ge1_nvme,
+        .r_ge1_scratch_reuses = r_ge1_reuses,
+    };
+}
+
+fn runM6ScaleQwen4Bench(allocator: std.mem.Allocator, cfg: M6Config) !M6ScaleQwen4Report {
+    const tmp_dir = try makeM6TempDir(allocator, "qwen4_512e");
+    defer {
+        removeDirRecursiveBestEffort(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+
+    var bundle = try graph.buildSynthQwen4Bundle(allocator, .{
+        .hidden_size = cfg.qwen4_hidden,
+        .vocab_size = cfg.qwen4_vocab,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .gdn_kh = 2,
+        .gdn_vh = 2,
+        .gdn_kd = 32,
+        .gdn_vd = 32,
+        .moe_inter = cfg.qwen4_moe_inter,
+        .shared_inter = cfg.qwen4_shared_inter,
+        .num_experts = cfg.qwen4_num_experts,
+        .top_k = cfg.qwen4_top_k,
+        .cold_experts_per_layer = cfg.qwen4_cold_per_layer,
+        .max_loops = 1,
+        .ple_num_shards = cfg.qwen4_ple_shards,
+        .ple_rows = cfg.qwen4_ple_rows,
+        .use_q4_experts = true,
+        .tmp_dir = tmp_dir,
+    });
+    defer bundle.deinit(allocator);
+
+    const mtp_cfg: draft_mod.DraftConfig = .{
+        .format = .mtp,
+        .vocab_size = cfg.qwen4_vocab,
+        .draft_vocab_size = cfg.qwen4_vocab,
+        .hidden_size = cfg.qwen4_hidden,
+        .target_hidden_size = cfg.qwen4_hidden,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = cfg.qwen4_hidden * 2,
+        .rope_theta = 10_000.0,
+        .share_embed_tokens = true,
+        .share_lm_head = true,
+    };
+    const mtp_img = try draft_mod.buildSyntheticDraftAmfImage(allocator, mtp_cfg, 91827);
+    defer allocator.free(mtp_img);
+
+    const prompt = [_]u32{ 5, 19, 43, 87 };
+    const gen_n: usize = cfg.qwen4_gen_tokens;
+    const expected = try allocator.alloc(u32, gen_n);
+    defer allocator.free(expected);
+    const got = try allocator.alloc(u32, gen_n);
+    defer allocator.free(got);
+
+    // 1. Serial baseline on GraphModel (with 4-shard PLE + 32 cold experts/layer)
+    var ref_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+        .ple_paths = bundle.ple_paths,
+        .cold_slot_count = 32,
+        .timeout_ms = cfg.timeout_ms,
+    });
+    defer ref_model.deinit(allocator);
+
+    expected[0] = try ref_model.prefillChunk(&prompt, 0, true);
+    var pos: u32 = prompt.len;
+    const ser_t0 = try vmstat.nowNs();
+    for (1..gen_n) |i| {
+        expected[i] = try ref_model.stepDecode(expected[i - 1], pos);
+        pos += 1;
+    }
+    const ser_t1 = try vmstat.nowNs();
+    const serial_tok_per_s: f64 = if (gen_n > 1 and ser_t1 > ser_t0)
+        @as(f64, @floatFromInt(gen_n - 1)) * 1_000_000_000.0 / @as(f64, @floatFromInt(ser_t1 - ser_t0))
+    else
+        0.0;
+
+    // 2. SpecEngine with MTP DraftHead (Placement.auto -> cpu_sme2 / gpu calibrated)
+    var spec_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+        .ple_paths = bundle.ple_paths,
+        .cold_slot_count = 32,
+        .timeout_ms = cfg.timeout_ms,
+    });
+    defer spec_model.deinit(allocator);
+
+    var dh = try draft_mod.DraftHead.loadFromBytesForGraph(allocator, &spec_model, mtp_img, mtp_cfg, .{
+        .placement = .auto,
+        .max_seq_len = 256,
+        .max_tree_slots = 16,
+    });
+    defer dh.deinitForGraph(allocator, &spec_model);
+
+    var eng = try engine_mod.SpecEngine.initWithGraph(allocator, &spec_model, &dh, .{
+        .mode = .mtp,
+        .placement = .auto,
+        .max_tree_nodes = 8,
+        .max_draft_depth = 3,
+        .branch_width = 2,
+        .top_k_per_node = 2,
+        .enable_pruning = false,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    got[0] = try eng.prefill(&prompt, null);
+    var p: usize = 1;
+    var rbuf: [engine_mod.MAX_TREE_NODES]u32 = undefined;
+    const spec_t0 = try vmstat.nowNs();
+    while (p < gen_n) {
+        const cap = @min(gen_n - p, rbuf.len);
+        const rs = try eng.stepRound(null, rbuf[0..cap]);
+        @memcpy(got[p .. p + rs.emitted_count], rbuf[0..rs.emitted_count]);
+        p += rs.emitted_count;
+    }
+    const spec_t1 = try vmstat.nowNs();
+    const mtp_tok_per_s: f64 = if (gen_n > 1 and spec_t1 > spec_t0)
+        @as(f64, @floatFromInt(gen_n - 1)) * 1_000_000_000.0 / @as(f64, @floatFromInt(spec_t1 - spec_t0))
+    else
+        0.0;
+
+    const cs = spec_model.coldExpertStats();
+    const ps = spec_model.pleStats();
+    const iso = spec_model.loopIsolationStats();
+
+    return .{
+        .num_experts = cfg.qwen4_num_experts,
+        .top_k = cfg.qwen4_top_k,
+        .cold_per_layer = cfg.qwen4_cold_per_layer,
+        .ple_shards = cfg.qwen4_ple_shards,
+        .wired_mib = eng.totalWiredBytes() >> 20,
+        .gen_tokens = cfg.qwen4_gen_tokens,
+        .serial_tok_per_s = serial_tok_per_s,
+        .mtp_tok_per_s = mtp_tok_per_s,
+        .mtp_tau = eng.stats.meanAcceptanceLength(),
+        .mtp_placement = dh.effective_placement,
+        .bit_exact_mtp = std.mem.eql(u32, expected, got),
+        .cold_hits = if (cs) |c| c.cache_telemetry.cache_hits + c.cache_telemetry.prefetch_hits else 0,
+        .cold_misses = if (cs) |c| c.cache_telemetry.sync_misses else 0,
+        .ple_nvme_reads = if (ps) |s| s.nvme_reads else 0,
+        .ple_r_ge1_nvme_reads = iso.ple_r_ge1_nvme_reads,
+    };
+}
+
+fn runM6SelfSpecBench(allocator: std.mem.Allocator, cfg: M6Config) !M6SelfSpecReport {
+    const start_l: u32 = 1;
+    const end_l: u32 = cfg.loop_num_layers - 1;
+    const core_layers: u32 = end_l - start_l;
+    var bundle = try graph.buildSynthLoopDenseBundle(allocator, .{
+        .hidden_size = cfg.loop_hidden,
+        .vocab_size = cfg.loop_vocab,
+        .num_layers = cfg.loop_num_layers,
+        .num_attention_heads = cfg.loop_num_heads,
+        .num_key_value_heads = cfg.loop_num_kv_heads,
+        .head_dim = cfg.loop_head_dim,
+        .intermediate_size = cfg.loop_inter,
+        .start_layer = start_l,
+        .end_layer = end_l,
+        .mode = .native_recurrent,
+        .max_loops = 4,
+        .use_q4 = cfg.loop_use_q4,
+    });
+    defer bundle.deinit(allocator);
+
+    var model = try graph.GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+        .max_loops_override = 4,
+        .timeout_ms = cfg.timeout_ms,
+    });
+    defer model.deinit(allocator);
+
+    // Estimate Core weight bytes directly from layer shapes.
+    const h64: f64 = @floatFromInt(cfg.loop_hidden);
+    const i64_f: f64 = @floatFromInt(cfg.loop_inter);
+    const qd64: f64 = @floatFromInt(cfg.loop_num_heads * cfg.loop_head_dim);
+    const kvd64: f64 = @floatFromInt(cfg.loop_num_kv_heads * cfg.loop_head_dim);
+    const bpe: f64 = if (cfg.loop_use_q4) 0.5625 else 2.0;
+    const per_layer_bytes = (qd64 * h64 + 2.0 * kvd64 * h64 + h64 * qd64 + 3.0 * i64_f * h64) * bpe;
+    const core_weight_mib = (per_layer_bytes * @as(f64, @floatFromInt(core_layers))) / (1024.0 * 1024.0);
+    const total_wired_mib = model.totalWiredBytes() >> 20;
+
+    const prompt = [_]u32{ 3, 17, 41, 63 };
+    const spec_n: usize = cfg.loop_spec_tokens;
+    const expected = try allocator.alloc(u32, spec_n);
+    defer allocator.free(expected);
+    const got8 = try allocator.alloc(u32, spec_n);
+    defer allocator.free(got8);
+    const got16 = try allocator.alloc(u32, spec_n);
+    defer allocator.free(got16);
+
+    var rows: [4]M6SelfSpecRow = undefined;
+    var r1_serial_ms: f64 = 0.0;
+
+    const tree_toks = [_]u32{ 11, 22, 33, 44, 55, 66, 77, 88, 12, 23, 34, 45, 56, 67, 78, 89 };
+    var tree_pos: [16]u32 = undefined;
+    var tree_masks: [16]u64 = undefined;
+    for (0..16) |i| {
+        tree_pos[i] = 16 + @as(u32, @intCast(i));
+        tree_masks[i] = (@as(u64, 1) << @intCast(i + 1)) - 1;
+    }
+
+    for ([_]u32{ 1, 2, 3, 4 }, 0..) |R, ri| {
+        model.effective_max_loops = R;
+        model.resetKvCache();
+        _ = try model.prefillChunk(&prompt, 0, true);
+        // Warmup
+        var cur: u32 = 17;
+        for (0..2) |w| cur = try model.stepDecode(cur, @intCast(prompt.len + w));
+
+        // 1. Serial M=1 decode latency
+        const st0 = try vmstat.nowNs();
+        for (0..cfg.loop_serial_steps) |s| {
+            cur = try model.stepDecode(cur, @intCast(prompt.len + 2 + s));
+        }
+        const st1 = try vmstat.nowNs();
+        const serial_ms = @as(f64, @floatFromInt(st1 - st0)) / (@as(f64, @floatFromInt(cfg.loop_serial_steps)) * 1_000_000.0);
+        const serial_tps = if (serial_ms > 0.0) 1000.0 / serial_ms else 0.0;
+        if (R == 1) r1_serial_ms = serial_ms;
+
+        // 2. Batched verifyTree latency across M in {4, 8, 12, 16} (fixed base_pos = 16)
+        model.resetKvCache();
+        var pre16: [16]u32 = undefined;
+        for (0..16) |i| pre16[i] = @intCast((i * 7 + 1) % cfg.loop_vocab);
+        _ = try model.prefillChunk(&pre16, 0, false);
+
+        var v_ms: [4]f64 = .{ 0.0, 0.0, 0.0, 0.0 };
+        const ms_list = [_]u32{ 4, 8, 12, 16 };
+        var breakeven_m: u32 = 0;
+        for (ms_list, 0..) |m_val, mi| {
+            _ = try model.verifyTree(tree_toks[0..m_val], tree_pos[0..m_val], tree_masks[0..m_val], 16);
+            const vt0 = try vmstat.nowNs();
+            for (0..cfg.loop_batch_reps) |_| {
+                _ = try model.verifyTree(tree_toks[0..m_val], tree_pos[0..m_val], tree_masks[0..m_val], 16);
+            }
+            const vt1 = try vmstat.nowNs();
+            v_ms[mi] = @as(f64, @floatFromInt(vt1 - vt0)) / (@as(f64, @floatFromInt(cfg.loop_batch_reps)) * 1_000_000.0);
+            if (breakeven_m == 0 and r1_serial_ms > 0.0 and (v_ms[mi] / @as(f64, @floatFromInt(m_val))) <= r1_serial_ms) {
+                breakeven_m = m_val;
+            }
+        }
+        if (R == 1) breakeven_m = 1;
+
+        // 3. End-to-end lossless SelfSpecRecurrent (T=0) at M=8 and M=16 vs serial stepDecode
+        model.resetKvCache();
+        expected[0] = try model.prefillChunk(&prompt, 0, true);
+        for (1..spec_n) |i| {
+            expected[i] = try model.stepDecode(expected[i - 1], @intCast(prompt.len + i - 1));
+        }
+
+        const runSpecM = struct {
+            fn call(
+                alloc: std.mem.Allocator,
+                gm: *graph.GraphModel,
+                pr: []const u32,
+                out_toks: []u32,
+                m_cap: u16,
+            ) !struct { tps: f64, tau: f64 } {
+                gm.resetKvCache();
+                var eng = try engine_mod.SpecEngine.initWithGraph(alloc, gm, null, .{
+                    .mode = .self_recurrent,
+                    .max_tree_nodes = m_cap,
+                    .max_draft_depth = if (m_cap >= 16) 5 else 4,
+                    .branch_width = 2,
+                    .top_k_per_node = 2,
+                    .enable_pruning = false,
+                    .temperature = 0.0,
+                });
+                defer eng.deinit(alloc);
+                out_toks[0] = try eng.prefill(pr, null);
+                var p: usize = 1;
+                var rb: [engine_mod.MAX_TREE_NODES]u32 = undefined;
+                const t0 = try vmstat.nowNs();
+                while (p < out_toks.len) {
+                    const cap = @min(out_toks.len - p, rb.len);
+                    const rs = try eng.stepRound(null, rb[0..cap]);
+                    @memcpy(out_toks[p .. p + rs.emitted_count], rb[0..rs.emitted_count]);
+                    p += rs.emitted_count;
+                }
+                const t1 = try vmstat.nowNs();
+                const tps: f64 = if (out_toks.len > 1 and t1 > t0)
+                    @as(f64, @floatFromInt(out_toks.len - 1)) * 1_000_000_000.0 / @as(f64, @floatFromInt(t1 - t0))
+                else
+                    0.0;
+                return .{ .tps = tps, .tau = eng.stats.meanAcceptanceLength() };
+            }
+        }.call;
+
+        const sp8 = try runSpecM(allocator, &model, &prompt, got8, 8);
+        const sp16 = try runSpecM(allocator, &model, &prompt, got16, 16);
+        const exact = std.mem.eql(u32, expected, got8) and std.mem.eql(u32, expected, got16);
+
+        rows[ri] = .{
+            .loops = R,
+            .serial_ms_per_tok = serial_ms,
+            .serial_tok_per_s = serial_tps,
+            .ratio_vs_r1 = if (r1_serial_ms > 0.0) r1_serial_ms / serial_ms else 1.0,
+            .verify_m4_ms = v_ms[0],
+            .verify_m8_ms = v_ms[1],
+            .verify_m12_ms = v_ms[2],
+            .verify_m16_ms = v_ms[3],
+            .breakeven_m = breakeven_m,
+            .spec_m8_tok_per_s = sp8.tps,
+            .spec_m8_tau = sp8.tau,
+            .spec_m16_tok_per_s = sp16.tps,
+            .spec_m16_tau = sp16.tau,
+            .bit_exact = exact,
+        };
+    }
+
+    return .{
+        .core_layers = core_layers,
+        .core_weight_mib = core_weight_mib,
+        .total_wired_mib = total_wired_mib,
+        .rows = rows,
+    };
+}
+
+fn runM6D13SmeDraftBench(allocator: std.mem.Allocator, cfg: M6Config) ![12]M6SmeDraftRow {
+    var device = try metal.Device.open();
+    defer device.close();
+    const facts = try sysinfo.Facts.read();
+    const dev_info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+    var library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+    var dp = try dequant.DequantPipelines.init(device, library);
+    defer dp.close();
+    var dispatcher = try sme.SmeDispatcher.init(allocator, .{});
+    defer dispatcher.deinit();
+
+    const ShapeSpec = struct {
+        label: []const u8,
+        is_q4: bool,
+        n: u32,
+        k: u32,
+    };
+    const sd = @max(@as(u32, 1), cfg.d13_scale_down);
+    const shapes = [4]ShapeSpec{
+        .{ .label = "eagle3_fc_q4_2048x6144", .is_q4 = true, .n = @max(@as(u32, 64), 2048 / sd), .k = @max(@as(u32, 64), 6144 / sd) },
+        .{ .label = "eagle3_fc_f16_1024x3072", .is_q4 = false, .n = @max(@as(u32, 64), 1024 / sd), .k = @max(@as(u32, 64), 3072 / sd) },
+        .{ .label = "mtp_eh_proj_q4_2048x4096", .is_q4 = true, .n = @max(@as(u32, 64), 2048 / sd), .k = @max(@as(u32, 64), 4096 / sd) },
+        .{ .label = "mtp_eh_proj_f16_1024x2048", .is_q4 = false, .n = @max(@as(u32, 64), 1024 / sd), .k = @max(@as(u32, 64), 2048 / sd) },
+    };
+    const ms = [3]u32{ 1, 4, 8 };
+
+    var rows: [12]M6SmeDraftRow = undefined;
+    var row_idx: usize = 0;
+
+    for (shapes) |sh| {
+        const n: usize = sh.n;
+        const k: usize = sh.k;
+        const pdt: sme.PanelDType = if (sh.is_q4) .q4_affine else .f16;
+        const sme_packed_bytes = try sme.packedBlobBytes(pdt, n, k);
+        const sme_w = try allocator.alignedAlloc(u8, .@"64", sme_packed_bytes);
+        defer allocator.free(sme_w);
+
+        const gpu_w_bytes: usize = if (sh.is_q4) n * (k / 2) else n * k * 2;
+        const gpu_sb_bytes: usize = if (sh.is_q4) n * (k / 64) * 4 else 64;
+        const arena_bytes = try page.alignUp(
+            amf.align64(gpu_w_bytes) +
+                amf.align64(gpu_sb_bytes) +
+                amf.align64(8 * k * 2) +
+                amf.align64(8 * n * 2) +
+                65536,
+        );
+        var arena = try arena_mod.WiredArena.init(arena_bytes, wired_budget);
+        defer arena.deinit();
+        var buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer buf.close();
+        try compute.makeResident(&.{buf});
+        defer compute.removeResident(&.{buf}) catch |err| std.debug.panic("removeResident failed: {}", .{err});
+
+        const gw = try arena.allocAligned(gpu_w_bytes, 64);
+        const gsb = try arena.allocAligned(gpu_sb_bytes, 64);
+        const gx = try arena.allocAligned(8 * k * 2, 64);
+        const gy = try arena.allocAligned(8 * n * 2, 64);
+        fillDeterministicF16Slice(gx, 6001 + row_idx, 0.2);
+
+        if (sh.is_q4) {
+            @memset(gw, 0x45);
+            const sb_aligned: []align(@alignOf(quant.ScaleBias)) u8 = @alignCast(gsb[0 .. n * (k / 64) * 4]);
+            const sb_slice = std.mem.bytesAsSlice(quant.ScaleBias, sb_aligned);
+            for (sb_slice) |*sb| sb.* = .{ .scale = 0.01, .bias = -0.07 };
+            try sme.packMlxQuantPanel64(.q4, gw, sb_slice, n, k, sme_w);
+        } else {
+            fillDeterministicF16Slice(gw, 6100 + row_idx, 0.1);
+            const gw_aligned: []align(2) u8 = @alignCast(gw);
+            const row_major = std.mem.bytesAsSlice(u16, gw_aligned);
+            try sme.packDensePanel64(.f16, row_major, n, k, sme_w);
+        }
+
+        const w_lin: sme.SmeLinearWeight = .{
+            .dtype = pdt,
+            .param_kind = .affine_scale_bias,
+            .cache_hint = .temporal,
+            .n = n,
+            .k = k,
+            .w_packed = sme_w,
+        };
+        var proj = try sme.SmeDraftProjection.init(w_lin, .{
+            .max_m = 8,
+        });
+        defer proj.deinit();
+
+        const out_sme = try allocator.alloc(u8, 8 * n * 2);
+        defer allocator.free(out_sme);
+
+        const GpuCtx = struct {
+            comp: *metal.Compute,
+            pipes: *const dequant.DequantPipelines,
+            is_q4: bool,
+            w_b: metal.BufferBinding,
+            sb_b: metal.BufferBinding,
+            x_b: metal.BufferBinding,
+            y_b: metal.BufferBinding,
+            n: u32,
+            k: u32,
+            m: u32,
+            timeout_ms: u64,
+        };
+        const gpuStep = struct {
+            fn call(raw: *anyopaque) anyerror!void {
+                const c: *const GpuCtx = @ptrCast(@alignCast(raw));
+                var frame = try c.comp.beginFrame(c.timeout_ms);
+                errdefer frame.abort();
+                if (c.is_q4) {
+                    if (c.m == 1) {
+                        try c.pipes.encodeGemv(&frame, .q4, .{
+                            .x = c.x_b,
+                            .qweight = c.w_b,
+                            .scale_bias = c.sb_b,
+                            .y = c.y_b,
+                            .n = c.n,
+                            .k = c.k,
+                        }, false);
+                    } else {
+                        try c.pipes.encodeGemm(&frame, .q4, .{
+                            .x = c.x_b,
+                            .qweight = c.w_b,
+                            .scale_bias = c.sb_b,
+                            .y = c.y_b,
+                            .m = c.m,
+                            .n = c.n,
+                            .k = c.k,
+                        }, false);
+                    }
+                } else {
+                    if (c.m == 1) {
+                        try c.pipes.encodeDenseGemv(&frame, .f16, .{
+                            .x = c.x_b,
+                            .weight = c.w_b,
+                            .y = c.y_b,
+                            .n = c.n,
+                            .k = c.k,
+                        }, false);
+                    } else {
+                        try c.pipes.encodeDenseGemm(&frame, .f16, .{
+                            .x = c.x_b,
+                            .weight = c.w_b,
+                            .y = c.y_b,
+                            .m = c.m,
+                            .n = c.n,
+                            .k = c.k,
+                        }, false);
+                    }
+                }
+                try c.comp.wait(try frame.commit(), c.timeout_ms);
+            }
+        }.call;
+
+        for (ms) |m_val| {
+            var gctx: GpuCtx = .{
+                .comp = &compute,
+                .pipes = &dp,
+                .is_q4 = sh.is_q4,
+                .w_b = .{ .buffer = buf, .offset = arena.offsetOf(gw.ptr) },
+                .sb_b = .{ .buffer = buf, .offset = arena.offsetOf(gsb.ptr) },
+                .x_b = .{ .buffer = buf, .offset = arena.offsetOf(gx.ptr) },
+                .y_b = .{ .buffer = buf, .offset = arena.offsetOf(gy.ptr) },
+                .n = sh.n,
+                .k = sh.k,
+                .m = m_val,
+                .timeout_ms = cfg.timeout_ms,
+            };
+            const cal = try sme.calibrateSmeVsGpuFn(
+                &dispatcher,
+                &proj,
+                m_val,
+                out_sme[0 .. @as(usize, m_val) * n * 2],
+                &gctx,
+                &gpuStep,
+                .{ .warmups = cfg.d13_warmups, .iters = cfg.d13_iters, .out_dtype = .f16 },
+            );
+            rows[row_idx] = .{
+                .label = sh.label,
+                .dtype_label = if (sh.is_q4) "q4" else "f16",
+                .n = sh.n,
+                .k = sh.k,
+                .m = m_val,
+                .weight_bytes = cal.weight_bytes,
+                .fits_l2 = cal.fits_l2,
+                .sme2_us = cal.sme_us,
+                .gpu_us = cal.gpu_us,
+                .prefer_sme2 = cal.prefer_sme2,
+            };
+            row_idx += 1;
+        }
+    }
+    return rows;
+}
+
+pub fn runM6WithConfig(allocator: std.mem.Allocator, config: M6Config) !M6Report {
+    const vm_before = try vmstat.Snapshot.capture();
+    const ops = try runM6OpsBench(allocator, config);
+    const ple_res = try runM6PleBench(allocator, config);
+    const qwen4_res = try runM6ScaleQwen4Bench(allocator, config);
+    const self_spec_res = try runM6SelfSpecBench(allocator, config);
+    const d13_rows = try runM6D13SmeDraftBench(allocator, config);
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .ops = ops,
+        .ple = ple_res,
+        .scale_qwen4 = qwen4_res,
+        .self_spec = self_spec_res,
+        .d13_rows = d13_rows,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM6(allocator: std.mem.Allocator) !M6Report {
+    return runM6WithConfig(allocator, .{});
+}
+
 test "bytesMovedPerDispatch matches exact algorithmic traffic and validates shapes" {
     // q4 (2048, 2048), M=1: w = 2048*1024 = 2097152, sb = 2048*32*4 = 262144, x = 4096, y = 4096
     const q4_gemv = try bytesMovedPerDispatch(.{ .kind = .gemv_q4, .m = 1, .n = 2048, .k = 2048 });
@@ -6412,4 +8458,94 @@ test "runM5WithConfig exercises G13 q2/hetero-MoE, C6 F_NOCACHE ngram, D8 PEARL 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "pearl_synth.bit_exact_on") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "server.steady_malloc_blocks") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "m5.swap.status") != null);
+}
+
+test "runM6WithConfig exercises G8/G9/G10/G7, C10 PLE, scale-qwen4-512e+MTP, D12 SelfSpecRecurrent and D13 cpu_sme2" {
+    const gpa = std.testing.allocator;
+    const report = try runM6WithConfig(gpa, .{
+        .gdn_k_heads = 2,
+        .gdn_v_heads = 4,
+        .gdn_head_k = 64,
+        .gdn_head_v = 64,
+        .gdn_prefill_seq = 32,
+        .gdn_reps = 4,
+        .qsa_q_heads = 4,
+        .qsa_kv_heads = 2,
+        .qsa_head_dim = 64,
+        .qsa_block_size = 16,
+        .qsa_top_k_blocks = 2,
+        .qsa_full_kv_len = 64,
+        .qsa_swa_kv_len = 64,
+        .qsa_reps = 4,
+        .gr_hidden = 128,
+        .gr_reps = 4,
+        .moe512_num_experts = 512,
+        .moe512_top_k = 10,
+        .moe512_hidden = 128,
+        .moe512_inter = 64,
+        .moe512_shared_inter = 64,
+        .moe512_reps = 2,
+        .ple_num_shards = 4,
+        .ple_rows_per_shard = 64,
+        .ple_embed_dim = 64,
+        .ple_cache_pages = 4,
+        .ple_cold_queries = 6,
+        .ple_hit_queries = 8,
+        .ple_loop_steps = 4,
+        .qwen4_hidden = 64,
+        .qwen4_vocab = 128,
+        .qwen4_moe_inter = 64,
+        .qwen4_shared_inter = 64,
+        .qwen4_num_experts = 512,
+        .qwen4_top_k = 10,
+        .qwen4_cold_per_layer = 16,
+        .qwen4_ple_shards = 4,
+        .qwen4_ple_rows = 64,
+        .qwen4_gen_tokens = 6,
+        .loop_hidden = 64,
+        .loop_inter = 128,
+        .loop_vocab = 128,
+        .loop_num_layers = 4,
+        .loop_num_heads = 2,
+        .loop_num_kv_heads = 1,
+        .loop_head_dim = 64,
+        .loop_use_q4 = true,
+        .loop_serial_steps = 3,
+        .loop_batch_reps = 2,
+        .loop_spec_tokens = 6,
+        .d13_scale_down = 8,
+        .d13_iters = 3,
+        .d13_warmups = 1,
+        .timeout_ms = 10_000,
+    });
+
+    try std.testing.expect(report.ops.gdn_stmp_isolated);
+    try std.testing.expect(report.ops.gdn_decode_us > 0.0);
+    try std.testing.expect(report.ops.qsa_full512_r0_us > 0.0);
+    try std.testing.expect(report.ops.qsa_full512_reuse_us > 0.0);
+    try std.testing.expect(report.ops.moe512_m1_unique == 10);
+    try std.testing.expect(report.ple.r0_nvme_reads > 0);
+    try std.testing.expectEqual(@as(u64, 0), report.ple.r_ge1_nvme_reads);
+    try std.testing.expect(report.scale_qwen4.bit_exact_mtp);
+    try std.testing.expectEqual(@as(u64, 0), report.scale_qwen4.ple_r_ge1_nvme_reads);
+    for (report.self_spec.rows) |row| {
+        try std.testing.expect(row.bit_exact);
+        try std.testing.expect(row.serial_tok_per_s > 0.0);
+    }
+    for (report.d13_rows) |row| {
+        try std.testing.expect(row.sme2_us > 0.0);
+        try std.testing.expect(row.gpu_us > 0.0);
+    }
+    try vmstat.checkNoSwap(report.vm_before, report.vm_after);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "g8.gdn.stmp_isolated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "c10.ple.loop_r_ge1_nvme_reads") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "qwen4_512e.mtp_bit_exact_t0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "D12 SelfSpecRecurrent Sweep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "D13 Placement.cpu_sme2 vs .gpu") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m6.swap.status") != null);
 }

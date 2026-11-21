@@ -1305,6 +1305,16 @@ pub const GraphModel = struct {
         return self.total_wired_bytes;
     }
 
+    pub fn shardCount(self: *const GraphModel) usize {
+        return self.weight_shards.len;
+    }
+
+    pub fn resetColdTelemetry(self: *GraphModel) void {
+        if (self.cold_rt) |crt| {
+            crt.expert_cache.resetTelemetry();
+        }
+    }
+
     pub fn singleExpertBytes(self: *const GraphModel) u64 {
         return self.single_expert_bytes;
     }
@@ -1369,9 +1379,11 @@ pub const GraphModel = struct {
     pub fn sampleFromLastLogits(
         self: *const GraphModel,
         temperature: f32,
-        rng: ?std.Random,
+        rng: std.Random,
+        p_res: []f32,
     ) accept_mod.VerifyError!u32 {
-        return accept_mod.sampleFromLogitsF16(self.readLastLogitsF16(), temperature, rng);
+        try accept_mod.softmaxRow(f16, self.readLastLogitsF16(), temperature, p_res);
+        return accept_mod.sampleCategorical(p_res[0..self.config.vocab_size], rng);
     }
 
     // -----------------------------------------------------------------------
@@ -4480,6 +4492,9 @@ const TestTensorBlob = struct {
     shape: [4]u32,
     ndim: u8,
     bytes: []u8,
+    data_bytes_override: u64 = 0,
+    params_offset: u64 = 0,
+    params_bytes: u64 = 0,
 };
 
 fn buildTestAmf(allocator: std.mem.Allocator, model_id: []const u8, blobs: []const TestTensorBlob) ![]u8 {
@@ -4492,7 +4507,7 @@ fn buildTestAmf(allocator: std.mem.Allocator, model_id: []const u8, blobs: []con
     defer allocator.free(entries);
 
     for (blobs, 0..) |b, i| {
-        const data_len: u64 = b.bytes.len;
+        const data_len: u64 = if (b.data_bytes_override > 0) b.data_bytes_override else b.bytes.len;
         const blob_len: u64 = try page.alignUp(@max(b.bytes.len, 1));
         var e = amf.TensorEntry.zeroed(b.name, b.kind, b.dtype);
         e.setLayoutAndParamKind(b.layout, .affine_scale_bias);
@@ -4510,8 +4525,8 @@ fn buildTestAmf(allocator: std.mem.Allocator, model_id: []const u8, blobs: []con
         e.blob_offset = offset;
         e.blob_bytes = blob_len;
         e.data_bytes = data_len;
-        e.params_offset = 0;
-        e.params_bytes = 0;
+        e.params_offset = b.params_offset;
+        e.params_bytes = b.params_bytes;
         entries[i] = e;
         offset += blob_len;
     }
@@ -4645,33 +4660,110 @@ fn cpuSigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
 }
 
-fn buildSynthQwen4TestBundle(
+fn fillDeterministicQ4(
     allocator: std.mem.Allocator,
-    num_experts: u32,
-    top_k: u32,
-    cold_experts_per_layer: u32,
-    max_loops: u32,
-    ple_num_shards: u32,
-    tmp_dir: ?[]const u8,
-) !struct {
+    seed: u64,
+    n: usize,
+    k: usize,
+    amp: f32,
+) !struct { bytes: []u8, data_bytes: u64, params_offset: u64, params_bytes: u64 } {
+    const groups_per_row = k / 64;
+    const q_bytes = n * (k / 2);
+    const p_off: usize = amf.align64(q_bytes);
+    const p_bytes = n * groups_per_row * 4;
+    const out = try allocator.alloc(u8, p_off + p_bytes);
+    @memset(out, 0);
+    // Fast deterministic SplitMix64 fill for nibbles so large `>= 50 MiB` bench tensors build in milliseconds.
+    var s: u64 = seed ^ 0x9e3779b97f4a7c15;
+    const words = std.mem.bytesAsSlice(u64, out[0 .. (q_bytes / 8) * 8]);
+    for (words) |*w| {
+        s +%= 0x9e3779b97f4a7c15;
+        var z = s;
+        z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+        z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+        w.* = z ^ (z >> 31);
+    }
+    const rem_start = words.len * 8;
+    for (rem_start..q_bytes) |i| {
+        s +%= 0x9e3779b97f4a7c15;
+        out[i] = @truncate(s >> 24);
+    }
+    const scale_f16: u16 = @bitCast(@as(f16, @floatCast(amp / 7.5)));
+    const bias_f16: u16 = @bitCast(@as(f16, @floatCast(-amp)));
+    var pi: usize = p_off;
+    for (0..n * groups_per_row) |_| {
+        std.mem.writeInt(u16, out[pi..][0..2], scale_f16, .little);
+        std.mem.writeInt(u16, out[pi + 2 ..][0..2], bias_f16, .little);
+        pi += 4;
+    }
+    return .{
+        .bytes = out,
+        .data_bytes = @intCast(q_bytes),
+        .params_offset = @intCast(p_off),
+        .params_bytes = @intCast(p_bytes),
+    };
+}
+
+pub const SynthQwen4BenchSpec = struct {
+    hidden_size: u32 = 64,
+    vocab_size: u32 = 128,
+    num_attention_heads: u32 = 2,
+    num_key_value_heads: u32 = 1,
+    head_dim: u32 = 64,
+    gdn_kh: u32 = 2,
+    gdn_vh: u32 = 2,
+    gdn_kd: u32 = 32,
+    gdn_vd: u32 = 32,
+    moe_inter: u32 = 64,
+    shared_inter: u32 = 64,
+    num_experts: u32 = 8,
+    top_k: u32 = 2,
+    cold_experts_per_layer: u32 = 0,
+    max_loops: u32 = 1,
+    ple_num_shards: u32 = 0,
+    ple_rows: u64 = 64,
+    use_q4_experts: bool = false,
+    tmp_dir: ?[]const u8 = null,
+};
+
+pub const SynthQwen4Bundle = struct {
     cfg: GraphConfig,
     amf_bytes: []u8,
     ple_paths: [][:0]u8,
     amf_file_path: ?[:0]u8,
-} {
-    const h: u32 = 64;
-    const vocab: u32 = 128;
+
+    pub fn deinit(self: *SynthQwen4Bundle, allocator: std.mem.Allocator) void {
+        self.cfg.deinit(allocator);
+        allocator.free(self.amf_bytes);
+        for (self.ple_paths) |p| allocator.free(p);
+        allocator.free(self.ple_paths);
+        if (self.amf_file_path) |p| allocator.free(p);
+    }
+};
+
+pub fn buildSynthQwen4Bundle(
+    allocator: std.mem.Allocator,
+    spec: SynthQwen4BenchSpec,
+) !SynthQwen4Bundle {
+    const h: u32 = spec.hidden_size;
+    const vocab: u32 = spec.vocab_size;
     const n_layers: u32 = 4; // 3:1 GDN:QSA (L0,L1,L2 = GDN, L3 = QSA)
-    const n_heads: u32 = 2;
-    const n_kv: u32 = 1;
-    const head_dim: u32 = 64;
-    const gdn_kh: u32 = 2;
-    const gdn_vh: u32 = 2;
-    const gdn_kd: u32 = 32;
-    const gdn_vd: u32 = 32;
-    const moe_inter: u32 = 64;
-    const sh_inter: u32 = 64;
-    const ple_rows: u64 = 64;
+    const n_heads: u32 = spec.num_attention_heads;
+    const n_kv: u32 = spec.num_key_value_heads;
+    const head_dim: u32 = spec.head_dim;
+    const gdn_kh: u32 = spec.gdn_kh;
+    const gdn_vh: u32 = spec.gdn_vh;
+    const gdn_kd: u32 = spec.gdn_kd;
+    const gdn_vd: u32 = spec.gdn_vd;
+    const moe_inter: u32 = spec.moe_inter;
+    const sh_inter: u32 = spec.shared_inter;
+    const ple_rows: u64 = spec.ple_rows;
+    const num_experts = spec.num_experts;
+    const top_k = spec.top_k;
+    const cold_experts_per_layer = spec.cold_experts_per_layer;
+    const max_loops = spec.max_loops;
+    const ple_num_shards = spec.ple_num_shards;
+    const tmp_dir = spec.tmp_dir;
 
     const layer_attns = try allocator.alloc(AttentionKind, n_layers);
     layer_attns[0] = .gated_deltanet;
@@ -4691,7 +4783,7 @@ fn buildSynthQwen4TestBundle(
             .loop_schedule = .{
                 .mode = if (max_loops > 1) .native_recurrent else .single_pass,
                 .start_layer = if (max_loops > 1) 1 else 0,
-                .end_layer = if (max_loops > 1) n_layers else n_layers,
+                .end_layer = n_layers,
                 .max_loops = max_loops,
                 .inject_x_init = (max_loops > 1),
             },
@@ -4745,6 +4837,8 @@ fn buildSynthQwen4TestBundle(
             shape: [4]u32,
             ndim: u8,
             data: []u8,
+            p_off: u64,
+            p_bytes: u64,
         ) !void {
             const dup = try alloc.dupe(u8, nm);
             try names.append(alloc, dup);
@@ -4757,71 +4851,83 @@ fn buildSynthQwen4TestBundle(
                 .shape = shape,
                 .ndim = ndim,
                 .bytes = data,
+                .data_bytes_override = if (p_bytes > 0) @as(u64, shape[0]) * (@as(u64, shape[1]) / 2) else 0,
+                .params_offset = p_off,
+                .params_bytes = p_bytes,
             });
         }
     }.call;
 
-    try addBlob(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 101, vocab * h, 0.2));
+    try addBlob(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 101, vocab * h, 0.2), 0, 0);
 
     var nbuf: [160]u8 = undefined;
     for (0..n_layers) |l| {
         const sbase: u64 = 1000 + l * 100;
         const ln_in = try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l});
-        try addBlob(allocator, &blobs, &owned_names, ln_in, .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+        try addBlob(allocator, &blobs, &owned_names, ln_in, .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0), 0, 0);
         const ln_po = try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l});
-        try addBlob(allocator, &blobs, &owned_names, ln_po, .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
+        try addBlob(allocator, &blobs, &owned_names, ln_po, .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0), 0, 0);
 
         const gr_r = try std.fmt.bufPrint(&nbuf, "layers.{d}.gr.read_gate.weight", .{l});
-        try addBlob(allocator, &blobs, &owned_names, gr_r, .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ 4, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 1, 4 * h, 0.1));
+        try addBlob(allocator, &blobs, &owned_names, gr_r, .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ 4, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 1, 4 * h, 0.1), 0, 0);
         const gr_w = try std.fmt.bufPrint(&nbuf, "layers.{d}.gr.write_gate.weight", .{l});
-        try addBlob(allocator, &blobs, &owned_names, gr_w, .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ 4, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 2, 4 * h, 0.1));
+        try addBlob(allocator, &blobs, &owned_names, gr_w, .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ 4, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 2, 4 * h, 0.1), 0, 0);
         const gr_d = try std.fmt.bufPrint(&nbuf, "layers.{d}.gr.decay_gate.weight", .{l});
-        try addBlob(allocator, &blobs, &owned_names, gr_d, .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ 4, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 3, 4 * h, 0.1));
+        try addBlob(allocator, &blobs, &owned_names, gr_d, .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ 4, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 3, 4 * h, 0.1), 0, 0);
 
         if (layer_attns[l] == .gated_deltanet) {
             const qk = gdn_kh * gdn_kd;
             const vd = gdn_vh * gdn_vd;
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.q_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qk, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 10, qk * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.k_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qk, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 11, qk * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.v_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ vd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 12, vd * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.g_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ vd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 13, vd * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.o_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, vd, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 14, h * vd, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.a_proj.weight", .{l}), .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ gdn_vh, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 15, gdn_vh * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.b_proj.weight", .{l}), .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ gdn_vh, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 16, gdn_vh * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.A_log", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ gdn_vh, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 17, gdn_vh, -1.0, 0.0));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.dt_bias", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ gdn_vh, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 18, gdn_vh, -0.2, 0.2));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.conv1d.weight", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ 2 * qk + vd, 4, 0, 0 }, 2, try fillDeterministicF32(allocator, sbase + 19, (2 * qk + vd) * 4, -0.25, 0.25));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ gdn_vd, 0, 0, 0 }, 1, try fillConstantBf16(allocator, gdn_vd, 1.0));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.q_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qk, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 10, qk * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.k_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qk, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 11, qk * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.v_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ vd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 12, vd * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.g_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ vd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 13, vd * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.o_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, vd, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 14, h * vd, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.a_proj.weight", .{l}), .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ gdn_vh, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 15, gdn_vh * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.b_proj.weight", .{l}), .dense, .bf16, @intCast(l), amf.NO_EXPERT, .{ gdn_vh, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 16, gdn_vh * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.A_log", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ gdn_vh, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 17, gdn_vh, -1.0, 0.0), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.dt_bias", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ gdn_vh, 0, 0, 0 }, 1, try fillDeterministicF32(allocator, sbase + 18, gdn_vh, -0.2, 0.2), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.conv1d.weight", .{l}), .dense, .f32, @intCast(l), amf.NO_EXPERT, .{ 2 * qk + vd, 4, 0, 0 }, 2, try fillDeterministicF32(allocator, sbase + 19, (2 * qk + vd) * 4, -0.25, 0.25), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.linear_attn.norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ gdn_vd, 0, 0, 0 }, 1, try fillConstantBf16(allocator, gdn_vd, 1.0), 0, 0);
         } else {
             const qd = n_heads * head_dim;
             const kvd = n_kv * head_dim;
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 20, qd * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ kvd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 21, kvd * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ kvd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 22, kvd * h, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, qd, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 23, h * qd, 0.08));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0));
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ qd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 20, qd * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ kvd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 21, kvd * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ kvd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 22, kvd * h, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}), .dense, .f16, @intCast(l), amf.NO_EXPERT, .{ h, qd, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 23, h * qd, 0.08), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0), 0, 0);
+            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_norm.weight", .{l}), .norm, .bf16, @intCast(l), amf.NO_EXPERT, .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0), 0, 0);
         }
 
         // Router + Shared Expert + E Routed Experts
-        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.weight", .{l}), .router, .bf16, @intCast(l), amf.NO_EXPERT, .{ num_experts, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 30, num_experts * h, 0.15));
-        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.gate_proj", .{l}), .shared_expert, .f16, @intCast(l), amf.NO_EXPERT, .{ sh_inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 31, sh_inter * h, 0.06));
-        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.up_proj", .{l}), .shared_expert, .f16, @intCast(l), amf.NO_EXPERT, .{ sh_inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 32, sh_inter * h, 0.06));
-        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.down_proj", .{l}), .shared_expert, .f16, @intCast(l), amf.NO_EXPERT, .{ h, sh_inter, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 33, h * sh_inter, 0.06));
-        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert_gate.weight", .{l}), .shared_expert, .bf16, @intCast(l), amf.NO_EXPERT, .{ 1, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 34, h, 0.1));
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.weight", .{l}), .router, .bf16, @intCast(l), amf.NO_EXPERT, .{ num_experts, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 30, num_experts * h, 0.15), 0, 0);
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.gate_proj", .{l}), .shared_expert, .f16, @intCast(l), amf.NO_EXPERT, .{ sh_inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 31, sh_inter * h, 0.06), 0, 0);
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.up_proj", .{l}), .shared_expert, .f16, @intCast(l), amf.NO_EXPERT, .{ sh_inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 32, sh_inter * h, 0.06), 0, 0);
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.down_proj", .{l}), .shared_expert, .f16, @intCast(l), amf.NO_EXPERT, .{ h, sh_inter, 0, 0 }, 2, try fillDeterministicF16(allocator, sbase + 33, h * sh_inter, 0.06), 0, 0);
+        try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert_gate.weight", .{l}), .shared_expert, .bf16, @intCast(l), amf.NO_EXPERT, .{ 1, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 34, h, 0.1), 0, 0);
 
         for (0..num_experts) |e| {
             const is_cold = (cold_experts_per_layer > 0 and e >= num_experts - cold_experts_per_layer);
             const ekind: amf.TensorKind = if (is_cold) .cold_expert else .hot_expert;
             const eseed = sbase * 1000 + e * 7;
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }), ekind, .f16, @intCast(l), @intCast(e), .{ moe_inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, eseed + 1, moe_inter * h, 0.05));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }), ekind, .f16, @intCast(l), @intCast(e), .{ moe_inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, eseed + 2, moe_inter * h, 0.05));
-            try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }), ekind, .f16, @intCast(l), @intCast(e), .{ h, moe_inter, 0, 0 }, 2, try fillDeterministicF16(allocator, eseed + 3, h * moe_inter, 0.05));
+            if (spec.use_q4_experts) {
+                const gq = try fillDeterministicQ4(allocator, eseed + 1, moe_inter, h, 0.05);
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }), ekind, .q4_affine, @intCast(l), @intCast(e), .{ moe_inter, h, 0, 0 }, 2, gq.bytes, gq.params_offset, gq.params_bytes);
+                const uq = try fillDeterministicQ4(allocator, eseed + 2, moe_inter, h, 0.05);
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }), ekind, .q4_affine, @intCast(l), @intCast(e), .{ moe_inter, h, 0, 0 }, 2, uq.bytes, uq.params_offset, uq.params_bytes);
+                const dq = try fillDeterministicQ4(allocator, eseed + 3, h, moe_inter, 0.05);
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }), ekind, .q4_affine, @intCast(l), @intCast(e), .{ h, moe_inter, 0, 0 }, 2, dq.bytes, dq.params_offset, dq.params_bytes);
+            } else {
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }), ekind, .f16, @intCast(l), @intCast(e), .{ moe_inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, eseed + 1, moe_inter * h, 0.05), 0, 0);
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }), ekind, .f16, @intCast(l), @intCast(e), .{ moe_inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, eseed + 2, moe_inter * h, 0.05), 0, 0);
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }), ekind, .f16, @intCast(l), @intCast(e), .{ h, moe_inter, 0, 0 }, 2, try fillDeterministicF16(allocator, eseed + 3, h * moe_inter, 0.05), 0, 0);
+            }
         }
     }
 
-    try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
-    try addBlob(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 999, vocab * h, 0.12));
+    try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0), 0, 0);
+    try addBlob(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 999, vocab * h, 0.12), 0, 0);
 
     const amf_bytes = try buildTestAmf(allocator, "test-qwen4-exp", blobs.items);
 
@@ -4850,7 +4956,7 @@ fn buildSynthQwen4TestBundle(
                     try std.fmt.bufPrint(&nbuf, "ple.layers.{d}.weight", .{l})
                 else
                     try std.fmt.bufPrint(&nbuf, "ple.layers.{d}.shard.{d}.weight", .{ l, s });
-                try addBlob(allocator, &pblobs, &pnames, pnm, .sparse_table, .bf16, @intCast(l), amf.NO_EXPERT, .{ @intCast(rows_per_shard), h, 0, 0 }, 2, try fillDeterministicBf16(allocator, 77700 + l * 17 + s, @intCast(rows_per_shard * h), 0.08));
+                try addBlob(allocator, &pblobs, &pnames, pnm, .sparse_table, .bf16, @intCast(l), amf.NO_EXPERT, .{ @intCast(rows_per_shard), h, 0, 0 }, 2, try fillDeterministicBf16(allocator, 77700 + l * 17 + s, @intCast(rows_per_shard * h), 0.08), 0, 0);
             }
             const pbytes = try buildTestAmf(allocator, "test-qwen4-ple", pblobs.items);
             defer allocator.free(pbytes);
@@ -4863,22 +4969,69 @@ fn buildSynthQwen4TestBundle(
     return .{ .cfg = cfg, .amf_bytes = amf_bytes, .ple_paths = ple_paths, .amf_file_path = amf_file_path };
 }
 
-fn buildSynthLoopDenseTestBundle(
+fn buildSynthQwen4TestBundle(
     allocator: std.mem.Allocator,
-    mode: LoopMode,
+    num_experts: u32,
+    top_k: u32,
+    cold_experts_per_layer: u32,
     max_loops: u32,
-    include_early_exit: bool,
-    include_steplora: bool,
-) !struct { cfg: GraphConfig, amf_bytes: []u8 } {
-    const h: u32 = 64;
-    const vocab: u32 = 128;
-    const n_layers: u32 = 4;
-    const n_heads: u32 = 2;
-    const n_kv: u32 = 1;
-    const head_dim: u32 = 64;
-    const inter: u32 = 128;
-    const start_l: u32 = 1;
-    const end_l: u32 = 3;
+    ple_num_shards: u32,
+    tmp_dir: ?[]const u8,
+) !SynthQwen4Bundle {
+    return buildSynthQwen4Bundle(allocator, .{
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .cold_experts_per_layer = cold_experts_per_layer,
+        .max_loops = max_loops,
+        .ple_num_shards = ple_num_shards,
+        .tmp_dir = tmp_dir,
+    });
+}
+
+pub const SynthLoopDenseBenchSpec = struct {
+    hidden_size: u32 = 64,
+    vocab_size: u32 = 128,
+    num_layers: u32 = 4,
+    num_attention_heads: u32 = 2,
+    num_key_value_heads: u32 = 1,
+    head_dim: u32 = 64,
+    intermediate_size: u32 = 128,
+    start_layer: u32 = 1,
+    end_layer: u32 = 3,
+    mode: LoopMode = .native_recurrent,
+    max_loops: u32 = 3,
+    use_q4: bool = false,
+    include_early_exit: bool = false,
+    include_steplora: bool = false,
+};
+
+pub const SynthLoopDenseBundle = struct {
+    cfg: GraphConfig,
+    amf_bytes: []u8,
+
+    pub fn deinit(self: *SynthLoopDenseBundle, allocator: std.mem.Allocator) void {
+        self.cfg.deinit(allocator);
+        allocator.free(self.amf_bytes);
+    }
+};
+
+pub fn buildSynthLoopDenseBundle(
+    allocator: std.mem.Allocator,
+    spec: SynthLoopDenseBenchSpec,
+) !SynthLoopDenseBundle {
+    const h: u32 = spec.hidden_size;
+    const vocab: u32 = spec.vocab_size;
+    const n_layers: u32 = spec.num_layers;
+    const n_heads: u32 = spec.num_attention_heads;
+    const n_kv: u32 = spec.num_key_value_heads;
+    const head_dim: u32 = spec.head_dim;
+    const inter: u32 = spec.intermediate_size;
+    const start_l: u32 = spec.start_layer;
+    const end_l: u32 = spec.end_layer;
+    const mode = spec.mode;
+    const max_loops = spec.max_loops;
+    const include_early_exit = spec.include_early_exit;
+    const include_steplora = spec.include_steplora;
 
     const layer_attns = try allocator.alloc(AttentionKind, n_layers);
     @memset(layer_attns, .gqa_full);
@@ -4938,6 +5091,8 @@ fn buildSynthLoopDenseTestBundle(
             shape: [4]u32,
             ndim: u8,
             data: []u8,
+            p_off: u64,
+            p_bytes: u64,
         ) !void {
             const dup = try alloc.dupe(u8, nm);
             try names.append(alloc, dup);
@@ -4951,36 +5106,61 @@ fn buildSynthLoopDenseTestBundle(
                 .shape = shape,
                 .ndim = ndim,
                 .bytes = data,
+                .data_bytes_override = if (p_bytes > 0) @as(u64, shape[0]) * (@as(u64, shape[1]) / 2) else 0,
+                .params_offset = p_off,
+                .params_bytes = p_bytes,
             });
         }
     }.call;
 
-    try addB(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, .row_major, amf.NO_LAYER, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 501, vocab * h, 0.25));
+    const addLin = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            kind: amf.TensorKind,
+            layer: u16,
+            n_out: u32,
+            k_in: u32,
+            seed: u64,
+            amp: f32,
+            use_q4: bool,
+        ) !void {
+            if (use_q4) {
+                const q = try fillDeterministicQ4(alloc, seed, n_out, k_in, amp);
+                try addB(alloc, list, names, nm, kind, .q4_affine, .row_major, layer, .{ n_out, k_in, 0, 0 }, 2, q.bytes, q.params_offset, q.params_bytes);
+            } else {
+                try addB(alloc, list, names, nm, kind, .f16, .row_major, layer, .{ n_out, k_in, 0, 0 }, 2, try fillDeterministicF16(alloc, seed, @as(usize, n_out) * k_in, amp), 0, 0);
+            }
+        }
+    }.call;
+
+    try addB(allocator, &blobs, &owned_names, "embed_tokens", .embedding, .f16, .row_major, amf.NO_LAYER, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 501, vocab * h, 0.25), 0, 0);
 
     var nbuf: [160]u8 = undefined;
     for (0..n_layers) |l| {
         const sb: u64 = 5000 + l * 50;
         const qd = n_heads * head_dim;
         const kvd = n_kv * head_dim;
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}), .norm, .bf16, .row_major, @intCast(l), .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj", .{l}), .dense, .f16, .row_major, @intCast(l), .{ qd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 1, qd * h, 0.08));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj", .{l}), .dense, .f16, .row_major, @intCast(l), .{ kvd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 2, kvd * h, 0.08));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj", .{l}), .dense, .f16, .row_major, @intCast(l), .{ kvd, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 3, kvd * h, 0.08));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}), .dense, .f16, .row_major, @intCast(l), .{ h, qd, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 4, h * qd, 0.08));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_norm.weight", .{l}), .norm, .bf16, .row_major, @intCast(l), .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_norm.weight", .{l}), .norm, .bf16, .row_major, @intCast(l), .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}), .norm, .bf16, .row_major, @intCast(l), .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj", .{l}), .dense, .f16, .row_major, @intCast(l), .{ inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 5, inter * h, 0.08));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj", .{l}), .dense, .f16, .row_major, @intCast(l), .{ inter, h, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 6, inter * h, 0.08));
-        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj", .{l}), .dense, .f16, .row_major, @intCast(l), .{ h, inter, 0, 0 }, 2, try fillDeterministicF16(allocator, sb + 7, h * inter, 0.08));
+        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}), .norm, .bf16, .row_major, @intCast(l), .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0), 0, 0);
+        try addLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj", .{l}), .dense, @intCast(l), qd, h, sb + 1, 0.08, spec.use_q4);
+        try addLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj", .{l}), .dense, @intCast(l), kvd, h, sb + 2, 0.08, spec.use_q4);
+        try addLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj", .{l}), .dense, @intCast(l), kvd, h, sb + 3, 0.08, spec.use_q4);
+        try addLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}), .dense, @intCast(l), h, qd, sb + 4, 0.08, spec.use_q4);
+        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_norm.weight", .{l}), .norm, .bf16, .row_major, @intCast(l), .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0), 0, 0);
+        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_norm.weight", .{l}), .norm, .bf16, .row_major, @intCast(l), .{ head_dim, 0, 0, 0 }, 1, try fillConstantBf16(allocator, head_dim, 1.0), 0, 0);
+        try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}), .norm, .bf16, .row_major, @intCast(l), .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0), 0, 0);
+        try addLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj", .{l}), .dense, @intCast(l), inter, h, sb + 5, 0.08, spec.use_q4);
+        try addLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj", .{l}), .dense, @intCast(l), inter, h, sb + 6, 0.08, spec.use_q4);
+        try addLin(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj", .{l}), .dense, @intCast(l), h, inter, sb + 7, 0.08, spec.use_q4);
     }
 
-    try addB(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, .row_major, amf.NO_LAYER, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0));
-    try addB(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, .row_major, amf.NO_LAYER, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 599, vocab * h, 0.15));
+    try addB(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, .row_major, amf.NO_LAYER, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0), 0, 0);
+    try addB(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, .row_major, amf.NO_LAYER, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 599, vocab * h, 0.15), 0, 0);
 
     if (include_early_exit) {
-        // Large positive gate weights aligned with typical hidden sign so early-exit test can trigger reliably.
-        try addB(allocator, &blobs, &owned_names, "loop.early_exit_gate.weight", .dense, .bf16, .row_major, amf.NO_LAYER, .{ 1, h, 0, 0 }, 2, try fillConstantBf16(allocator, h, 0.5));
+        try addB(allocator, &blobs, &owned_names, "loop.early_exit_gate.weight", .dense, .bf16, .row_major, amf.NO_LAYER, .{ 1, h, 0, 0 }, 2, try fillConstantBf16(allocator, h, 0.5), 0, 0);
     }
 
     if (include_steplora) {
@@ -4989,25 +5169,38 @@ fn buildSynthLoopDenseTestBundle(
             const alpha_val: f32 = if (step == 0) 0.0 else 0.15 * @as(f32, @floatFromInt(step));
             for (start_l..end_l) |l| {
                 const sd: u64 = 9000 + step * 300 + l * 30;
-                // q_proj: in=h, out=qd
-                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.lora_a", .{ step, l }), .loop_adapter, .f16, .sme2_panel64, @intCast(l), .{ 64, h, 0, 0 }, 2, try fillDeterministicStepLoraSme2F16(allocator, sd + 1, 64, h, 16, h, 0.08));
-                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.lora_b", .{ step, l }), .loop_adapter, .f16, .sme2_panel64, @intCast(l), .{ qd, 64, 0, 0 }, 2, try fillDeterministicStepLoraSme2F16(allocator, sd + 2, qd, 64, qd, 16, 0.08));
+                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.lora_a", .{ step, l }), .loop_adapter, .f16, .sme2_panel64, @intCast(l), .{ 64, h, 0, 0 }, 2, try fillDeterministicStepLoraSme2F16(allocator, sd + 1, 64, h, 16, h, 0.08), 0, 0);
+                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.lora_b", .{ step, l }), .loop_adapter, .f16, .sme2_panel64, @intCast(l), .{ qd, 64, 0, 0 }, 2, try fillDeterministicStepLoraSme2F16(allocator, sd + 2, qd, 64, qd, 16, 0.08), 0, 0);
                 const al_q = try allocator.alloc(u8, 4);
                 std.mem.writeInt(u32, al_q[0..4], @bitCast(alpha_val), .little);
-                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.alpha", .{ step, l }), .loop_adapter, .f32, .row_major, @intCast(l), .{ 1, 0, 0, 0 }, 1, al_q);
+                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.alpha", .{ step, l }), .loop_adapter, .f32, .row_major, @intCast(l), .{ 1, 0, 0, 0 }, 1, al_q, 0, 0);
 
-                // o_proj: in=qd, out=h
-                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.lora_a", .{ step, l }), .loop_adapter, .f16, .sme2_panel64, @intCast(l), .{ 64, qd, 0, 0 }, 2, try fillDeterministicStepLoraSme2F16(allocator, sd + 3, 64, qd, 16, qd, 0.08));
-                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.lora_b", .{ step, l }), .loop_adapter, .f16, .sme2_panel64, @intCast(l), .{ h, 64, 0, 0 }, 2, try fillDeterministicStepLoraSme2F16(allocator, sd + 4, h, 64, h, 16, 0.08));
+                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.lora_a", .{ step, l }), .loop_adapter, .f16, .sme2_panel64, @intCast(l), .{ 64, qd, 0, 0 }, 2, try fillDeterministicStepLoraSme2F16(allocator, sd + 3, 64, qd, 16, qd, 0.08), 0, 0);
+                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.lora_b", .{ step, l }), .loop_adapter, .f16, .sme2_panel64, @intCast(l), .{ h, 64, 0, 0 }, 2, try fillDeterministicStepLoraSme2F16(allocator, sd + 4, h, 64, h, 16, 0.08), 0, 0);
                 const al_o = try allocator.alloc(u8, 4);
                 std.mem.writeInt(u32, al_o[0..4], @bitCast(alpha_val), .little);
-                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.alpha", .{ step, l }), .loop_adapter, .f32, .row_major, @intCast(l), .{ 1, 0, 0, 0 }, 1, al_o);
+                try addB(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.alpha", .{ step, l }), .loop_adapter, .f32, .row_major, @intCast(l), .{ 1, 0, 0, 0 }, 1, al_o, 0, 0);
             }
         }
     }
 
     const amf_bytes = try buildTestAmf(allocator, "test-loop-dense", blobs.items);
     return .{ .cfg = cfg, .amf_bytes = amf_bytes };
+}
+
+fn buildSynthLoopDenseTestBundle(
+    allocator: std.mem.Allocator,
+    mode: LoopMode,
+    max_loops: u32,
+    include_early_exit: bool,
+    include_steplora: bool,
+) !SynthLoopDenseBundle {
+    return buildSynthLoopDenseBundle(allocator, .{
+        .mode = mode,
+        .max_loops = max_loops,
+        .include_early_exit = include_early_exit,
+        .include_steplora = include_steplora,
+    });
 }
 
 fn writeBytesFile(path: [:0]const u8, data: []const u8) !void {
