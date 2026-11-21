@@ -856,6 +856,39 @@ pub const AneModel = struct {
     }
 };
 
+/// Row-major FP32 GEMM via Apple Accelerate `cblas_sgemm` (Spike S7 baseline;
+/// ADR-0001 routes all Apple framework calls through `apple_bridge.m`).
+/// Computes `out_c[m, n] = alpha * a[m, k] * op(b) + beta * out_c[m, n]`,
+/// where `op(b)` is `b[n, k]^T` when `transpose_b` is true, or `b[k, n]` otherwise.
+pub fn accelerateSgemm(
+    m: u32,
+    n: u32,
+    k: u32,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    out_c: []f32,
+    transpose_b: bool,
+) Error!void {
+    if (m == 0 or n == 0 or k == 0) return error.InvalidArgument;
+    const mk = std.math.mul(usize, m, k) catch return error.InvalidArgument;
+    const nk = std.math.mul(usize, n, k) catch return error.InvalidArgument;
+    const mn = std.math.mul(usize, m, n) catch return error.InvalidArgument;
+    if (a.len < mk or b.len < nk or out_c.len < mn) return error.InvalidArgument;
+    try check(c.ami_accelerate_sgemm(
+        m,
+        n,
+        k,
+        alpha,
+        a.ptr,
+        b.ptr,
+        beta,
+        out_c.ptr,
+        if (transpose_b) 1 else 0,
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Pure-Zig minimal CoreML .mlmodel protobuf emitter (zero Python/coremltools)
 // ---------------------------------------------------------------------------
@@ -2842,4 +2875,38 @@ test "emitCoreMlQkvProjectionBlock, emitCoreMlRouterPredictor (linear & SiLU MLP
         }
         try yg.unlock();
     }
+}
+
+test "accelerateSgemm matches fp32 scalar reference for transposed and non-transposed B" {
+    const m: u32 = 5;
+    const n: u32 = 7;
+    const k: u32 = 13;
+    var a: [m * k]f32 = undefined;
+    var b_nk: [n * k]f32 = undefined;
+    var b_kn: [k * n]f32 = undefined;
+    for (&a, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.25;
+    for (0..n) |ni| {
+        for (0..k) |ki| {
+            const val = @as(f32, @floatFromInt(@as(i32, @intCast((ni * 7 + ki * 3) % 13)) - 6)) * 0.125;
+            b_nk[ni * k + ki] = val;
+            b_kn[ki * n + ni] = val;
+        }
+    }
+
+    var c_trans: [m * n]f32 = @splat(0.0);
+    var c_notrans: [m * n]f32 = @splat(0.0);
+    try accelerateSgemm(m, n, k, 1.0, &a, &b_nk, 0.0, &c_trans, true);
+    try accelerateSgemm(m, n, k, 1.0, &a, &b_kn, 0.0, &c_notrans, false);
+
+    for (0..m) |mi| {
+        for (0..n) |ni| {
+            var expected: f32 = 0.0;
+            for (0..k) |ki| expected += a[mi * k + ki] * b_nk[ni * k + ki];
+            try std.testing.expectApproxEqAbs(expected, c_trans[mi * n + ni], 1e-4);
+            try std.testing.expectApproxEqAbs(expected, c_notrans[mi * n + ni], 1e-4);
+        }
+    }
+
+    try std.testing.expectError(error.InvalidArgument, accelerateSgemm(0, n, k, 1.0, &a, &b_nk, 0.0, &c_trans, true));
+    try std.testing.expectError(error.InvalidArgument, accelerateSgemm(m, n, k, 1.0, a[0..1], &b_nk, 0.0, &c_trans, true));
 }

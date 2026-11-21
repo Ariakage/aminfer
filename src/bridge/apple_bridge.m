@@ -3,12 +3,15 @@
 // Handles own their Objective-C objects through __bridge_retained pointers and
 // release them in the matching *_destroy function.
 
+#define ACCELERATE_NEW_LAPACK 1
+#import <Accelerate/Accelerate.h>
 #import <CoreML/CoreML.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1699,4 +1702,29 @@ ami_status ami_ane_model_predict_oneshot(const ami_ane_model *model,
     st = ami_ane_model_predict(model, plan, out_info);
     ami_ane_plan_destroy(plan);
     return st;
+}
+
+ami_status ami_accelerate_sgemm(uint32_t m, uint32_t n, uint32_t k,
+                                float alpha, const float *a, const float *b,
+                                float beta, float *c, uint32_t transpose_b) {
+    if (a == NULL || b == NULL || c == NULL ||
+        m == 0 || n == 0 || k == 0 ||
+        m > (uint32_t)INT_MAX || n > (uint32_t)INT_MAX || k > (uint32_t)INT_MAX) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    cblas_sgemm(CblasRowMajor,
+                CblasNoTrans,
+                transpose_b != 0 ? CblasTrans : CblasNoTrans,
+                (int)m,
+                (int)n,
+                (int)k,
+                alpha,
+                a,
+                (int)k,
+                b,
+                transpose_b != 0 ? (int)k : (int)n,
+                beta,
+                c,
+                (int)n);
+    return AMI_OK;
 }

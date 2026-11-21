@@ -372,6 +372,21 @@ ami_status ami_ane_model_predict_oneshot(const ami_ane_model *model,
                                          const ami_ane_binding *outputs, size_t output_count,
                                          ami_ane_predict_info *out_info);
 
+/* -------------------------------------------------------------------------
+ * Apple Accelerate BLAS reference bridge (Spike S7 benchmark comparison,
+ * ADR-0001: only apple_bridge.m may call Apple frameworks).
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Row-major FP32 GEMM via Accelerate `cblas_sgemm`:
+ *   C[M, N] = alpha * A[M, K] * op(B) + beta * C[M, N]
+ * where `op(B)` is `B[N, K]^T` when `transpose_b != 0` (row-major, ldb = K)
+ * or `B[K, N]` when `transpose_b == 0` (row-major, ldb = N).
+ */
+ami_status ami_accelerate_sgemm(uint32_t m, uint32_t n, uint32_t k,
+                                float alpha, const float *a, const float *b,
+                                float beta, float *c, uint32_t transpose_b);
+
 #ifdef __cplusplus
 }
 #endif
