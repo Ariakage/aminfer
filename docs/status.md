@@ -55,8 +55,8 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | W4 | Import MLX community quantized safetensors (affine, group 64) as the conversion source | Implemented | M1 | [experts-and-storage.md](architecture/experts-and-storage.md#amf-format) |
 | W5 | Native Zig tokenizer (Qwen BPE) | Implemented | M2 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
 | W6 | Primary target Qwen3-30B-A3B (3-bit); secondary Qwen3-14B (4-bit, dense) | Implemented | M2 | [memory.md](architecture/memory.md#budget-estimates), [results.md](benchmarks/results.md) |
-| W7 | CoreML `.mlpackage` export for ANE graphs (draft model, attention blocks, expert predictor) | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
-| W8 | Offline expert heat statistics | Confirmed | M4 | [experts-and-storage.md](architecture/experts-and-storage.md) |
+| W7 | CoreML `.mlpackage` export for ANE graphs (draft model, attention blocks, expert predictor) | Implemented | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
+| W8 | Offline expert heat statistics | Implemented | M4 | [experts-and-storage.md](architecture/experts-and-storage.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
 | W9 | Composable model operator registry (`BackboneKind`, `AttentionKind`, `FfnKind`, `ResidualKind`, `MemoryLookupKind`) | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | W10 | Tier 2 target: **`Qwen3.8-Flash-Next`** (`qwen4_exp`, 125B/A6B + 51B PLE + 4B MTP) `.amf` converter (vision-tower strip, sharded PLE) and runtime | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | W11 | Tier 3 target: **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`, 552B CED MoE + 196B Engram) `.amf` converter and Causal Encoder-Decoder scheduler (512 GB Ultra / TB5 cluster) | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
@@ -73,7 +73,7 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | G3 | MoE gather / grouped GEMM with experts deduplicated across verified tokens | Implemented | M2 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md), [results.md](benchmarks/results.md) |
 | G4 | Decode attention over KV tiles | Implemented | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), [results.md](benchmarks/results.md) |
 | G5 | Tree-attention verification with ancestor mask and accepted-path KV commit | Implemented | M3 | [speculative-decoding.md](architecture/speculative-decoding.md), [results.md](benchmarks/results.md) |
-| G6 | GPU half of the hybrid prefill (FFN / MoE) | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
+| G6 | GPU half of the hybrid prefill (FFN / MoE) | Implemented | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
 | G7 | High-expert-count MoE (`>= 512` routed experts, top-10+) with unconditional `shared_expert` SwiGLU accumulation | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | G8 | Gated DeltaNet (GDN) chunked-prefill and recurrent decode Metal 4 kernels | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | G9 | Qwen Sparse Attention (QSA) micro-block indexer with YaRN and interleaved MRoPE (`[11, 11, 10]`) | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
@@ -89,7 +89,7 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | D1 | L1 suffix automaton, preallocated, zero allocation after startup | Implemented | M3 | [speculative-decoding.md](architecture/speculative-decoding.md#l1-suffix-automaton), [results.md](benchmarks/results.md) |
 | D2 | EAGLE-2 dynamic draft tree with EAGLE-3 and EAGLE-2 head formats | Implemented | M3 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md), [results.md](benchmarks/results.md) |
 | D3 | MTP heads | Implemented | M3 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md) |
-| D4 | Same-family small draft model (≈0.5B class, e.g. Qwen3-0.6B) for models without EAGLE / MTP | Confirmed | M4 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md) |
+| D4 | Same-family small draft model (≈0.5B class, e.g. Qwen3-0.6B) for models without EAGLE / MTP | Implemented | M4 | [ADR-0013](decisions/0013-eagle-tree-and-head-formats.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
 | D5 | Benchmark-gated placement of EAGLE / MTP heads (ANE vs GPU) | Implemented | M3 | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md), [results.md](benchmarks/results.md) |
 | D6 | Dual-source tree merging (L1 seed prefix ≥ 4 tokens → L2) | Implemented | M3 | [ADR-0005](decisions/0005-dual-source-tree-merging.md), [results.md](benchmarks/results.md) |
 | D7 | Expert-byte-budget tree pruning (dense models: node budget) | Implemented | M3 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md), [results.md](benchmarks/results.md) |
@@ -101,9 +101,9 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 
 | ID | Capability | Status | Target | References |
 | --- | --- | --- | --- | --- |
-| A1 | Hybrid wavefront prefill: ANE attention blocks write K/V into IOSurface tiles | Confirmed | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
-| A2 | ANE cross-layer MoE expert prediction feeding prefetch and pruning | Confirmed (predictor design Undecided) | M4 | [experts-and-storage.md](architecture/experts-and-storage.md#expert-prediction-and-prefetch) |
-| A3 | Static-shape strategy for growing KV length (buckets or multifunction models) | Undecided | M4 (spike S6) | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md) |
+| A1 | Hybrid wavefront prefill: ANE attention blocks write K/V into IOSurface tiles | Implemented | M4 | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
+| A2 | ANE cross-layer MoE expert prediction feeding prefetch and pruning | Implemented | M4 | [experts-and-storage.md](architecture/experts-and-storage.md#expert-prediction-and-prefetch), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
+| A3 | Static-shape strategy for growing KV length (`bucketed_full_ane`, power-of-two KV buckets `512..4096`) | Implemented | M4 (spike S6) | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
 
 ## CPU runtime, scheduling and storage
 
@@ -111,9 +111,9 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | --- | --- | --- | --- | --- |
 | C1 | Lock-free SPSC / MPSC rings with preallocated slots | Implemented | M2 | [runtime-pipeline.md](architecture/runtime-pipeline.md#threading-model) |
 | C2 | QoS-based core steering (no hard affinity on Apple Silicon) and I/O policy for prefetch threads | Implemented | M2 | [hardware.md](architecture/hardware.md#core-steering) |
-| C3 | Cold experts: `F_NOCACHE` + `aio_read` + `kqueue` (`EVFILT_AIO`) into 16 KiB slots | Confirmed | M4 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
-| C4 | E-core `pread` worker fallback when kernel AIO concurrency limits throughput | Draft | M4 (spike S3) | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md) |
-| C5 | Hot / cold expert cache policy | Draft | M4 | [experts-and-storage.md](architecture/experts-and-storage.md) |
+| C3 | Cold experts: `F_NOCACHE` + `aio_read` + `kqueue` (`EVFILT_AIO`) into 16 KiB slots | Implemented | M4 | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
+| C4 | E-core `pread` worker fallback when kernel AIO concurrency limits throughput | Implemented | M4 (spike S3) | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
+| C5 | Hot / cold expert cache policy (`ExpertSlotPool` + LFU-decay `ExpertCache` with pass pinning and async prefetch) | Implemented | M4 | [experts-and-storage.md](architecture/experts-and-storage.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
 | C6 | N-gram tables on NVMe for L1 | Draft | M5 | [experts-and-storage.md](architecture/experts-and-storage.md#n-gram-tables-on-nvme) |
 | C7 | kqueue SSE server | Confirmed | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
 | C8 | Server API shape (for example OpenAI-compatible streaming) | Undecided | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |

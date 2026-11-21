@@ -2092,3 +2092,859 @@ interface Team {
   updatedAt: string;
 }<|im_end|>
 ```
+
+## M4 Neural Engine, hybrid prefill, cold-expert NVMe streaming and D4 small draft
+
+Measured on 2026-11-21 on the Apple M4 24 GiB baseline at commits `6b6fb09`
+(`bench-m4`) and `8701fdb` (`bench-a2`, real-checkpoint cold-expert `decode` and
+`D4` `spec-decode`), ReleaseFast `./zig-out/bin/aminfer`, default kernel
+tunables (`kern.aiothreads = 4`, `kern.aioprocmax = 256`, host
+`wired_budget_mib = 18186`, `swapouts_delta = 0` across every archived run).
+
+Offline M4 artifacts produced by `tools/` (`W7`, `W8`, 40/40 Python unittests
+passing) and stored under `/Volumes/Akari/models/`:
+- **W8 expert heat profile (`qwen3-30b-a3b-heat.json`)**: `schema_version = 1`,
+  `48 × 128` experts (`hot = 3,072`, `cold = 3,072` at `64 cold/layer`),
+  `estimated_wired_bytes = 7,019,085,824 B` (`6,693.9 MiB`),
+  `estimated_cold_bytes = 6,341,787,648 B` (`6,048.0 MiB`).
+- **W7 pure-stdlib CoreML `.mlpackage` exports** (verified on macOS CoreML / ANE):
+  `qwen3-30b-a3b-expert-predictor-all48.mlpackage` (`hidden_in[32,2048] -> router_logits[32,6144]`),
+  `qwen3-30b-a3b-expert-predictor-la2.mlpackage`,
+  `qwen3-30b-a3b-attn-qkv-l0.mlpackage`, and `qwen3-0.6b-draft-ffn-l0.mlpackage`.
+
+### Spike S3: Cold-expert `F_NOCACHE` direct I/O (`kqueue_aio` vs `ecore_pread`, `C3`–`C4`)
+
+Measured on a 192 MiB `F_NOCACHE` file on `/Volumes/Akari/.tmp` (external SSD
+volume capped at `~0.64 GB/s` sustained throughput; internal Apple Silicon NVMe
+reaches 3–7 GB/s). Swept real Qwen3-30B-A3B 3-bit (`2,064,384 B`) and 4-bit
+(`2,654,208 B`) expert blobs across `QD = 1..16`, `1/2/4` E-core `pread`
+workers, and `IOPOL_IMPORTANT` vs `IOPOL_STANDARD` (`64` timed random reads/case):
+
+| Blob size | Backend | Workers | I/O Policy | Peak QD | Peak GB/s | QD=1 p50 (us) | Peak-QD p50 / p99 (us) | `swapouts` delta |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `2,064,384 B` (Q3) | **`kqueue_aio`** | 0 (kernel `4`) | `important` | 16 | **0.638** | 3,563.4 | 43,448.1 / 84,186.7 | 0 |
+| `2,064,384 B` (Q3) | `kqueue_aio` | 0 (kernel `4`) | `standard` | 16 | 0.637 | 3,562.4 | 43,944.3 / 82,428.1 | 0 |
+| `2,064,384 B` (Q3) | `ecore_pread` | 4 | `important` | 8 | 0.624 | 3,558.5 | 26,446.7 / 26,681.3 | 0 |
+| `2,064,384 B` (Q3) | `ecore_pread` | 4 | `standard` | 4 | 0.622 | 3,592.2 | 13,249.1 / 13,552.1 | 0 |
+| `2,654,208 B` (Q4) | **`kqueue_aio`** | 0 (kernel `4`) | `important` | 16 | **0.636** | 4,543.8 | 68,481.9 / 71,774.4 | 0 |
+| `2,654,208 B` (Q4) | `ecore_pread` | 4 | `important` | 4 | 0.626 | 4,488.6 | 16,930.0 / 17,220.3 | 0 |
+
+Takeaways (closing **Spike S3** and confirming **C3** + **C4**):
+- Both `F_NOCACHE` backends (`kqueue_aio` via `SIGEV_KEVENT` → `EVFILT_AIO`
+  auto-reap and `ecore_pread` via E-core `utility` + `IOPOL_IMPORTANT` workers)
+  saturate the `/Volumes/Akari` external SSD link with **`swapouts_delta = 0`**
+  and exact page-sentinel integrity verification.
+- `kqueue_aio` edges out 4-worker `ecore_pread` on peak throughput (`0.638` vs
+  `0.626 GB/s`, `+1.9%`), while `ecore_pread` exhibits tighter p99 tail latency
+  at high queue depth (`QD = 16`: `53.7 ms` vs `84.2 ms`) because `kern.aiothreads = 4`
+  queues bursts inside the kernel AIO pool. Both backends remain first-class
+  selectable via `--io-backend {auto,aio,pread}`.
+
+### Spike S6 & `A1`/`A3`/`G6`: Static KV buckets and hybrid ANE/GPU wavefront prefill
+
+Measured on `Qwen3-30B-A3B` attention geometry (`hidden = 2048, q_heads = 32,
+kv_heads = 4, head_dim = 128, chunk = 512`) plus synthetic end-to-end `A1`/`G6`
+`Qwen3Model.prefillHybridWavefront` vs GPU-only `prefillChunk`:
+
+| Static KV bucket (`kv_len`) | Compile (ms) | ANE layers | Zero-copy | `bucketed_full_ane` (ms) | `split_ane_qkv_gpu_attn` (ms) | `gpu_only` (ms) | ANE tok/s | GPU tok/s | Fastest |
+| ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 512 | 524.0 | 25 / 25 | `yes` | **5.130** | 8.232 | 11.392 | **99,805** | 44,946 | `bucketed_full_ane` (`2.22×`) |
+| 1024 | 391.5 | 27 / 27 | `yes` | **8.002** | 12.684 | 16.165 | **63,981** | 31,673 | `bucketed_full_ane` (`2.02×`) |
+| 2048 | 565.0 | 27 / 27 | `yes` | **13.589** | 21.482 | 24.834 | **37,677** | 20,617 | `bucketed_full_ane` (`1.83×`) |
+| 4096 | 431.7 | 27 / 27 | `yes` | **24.716** | 37.713 | 41.021 | **20,715** | 12,481 | `bucketed_full_ane` (`1.66×`) |
+
+FP16 numerical precision vs CPU FP64 reference at `kv_len = 1024` (`32` sampled
+query rows, exercising `k_past`/`v_past` concat and causal masking):
+- `attn_max_abs_err = 0.002404`, `attn_rmse = 0.000515`
+- `kv_max_abs_err = 0.000968`, `kv_rmse = 0.000212`
+
+Wavefront overlap (`A1` + `G6`, zero-copy IOSurface `KvTile`s, `USER_INITIATED` ANE driver thread):
+
+| Workload | Prompt / chunks | Hybrid wavefront (ms / tok/s) | GPU-only (ms / tok/s) | Overlap efficiency | Speedup vs GPU-only | ANE / Zero-copy | `swapouts` delta |
+| --- | --- | ---: | ---: | ---: | ---: | --- | ---: |
+| Spike S6 (`30B-A3B` attn + MoE FFN, 6L) | 2 × 512 | `289.818 ms/chunk` (**1,767 tok/s**) | `344.682 ms/chunk` (`1,485 tok/s`) | **1.198×** (`11/12` steps) | **1.189×** | `yes` / `yes` | 0 |
+| E2E `Qwen3Model` (`2L, H=512, E=16, q3`) | 1024 (2 × 512) | `14.892 ms` (**68,761.2 tok/s**) | `27.831 ms` (`36,792.9 tok/s`) | **1.35×** | **1.87×** | `yes` / `yes` | 0 |
+| E2E `Qwen3Model` (`2L, H=512, E=16, q3`) | 2048 (4 × 512) | `32.819 ms` (**62,401.9 tok/s**) | `57.603 ms` (`35,553.5 tok/s`) | **1.59×** | **1.76×** | `yes` / `yes` | 0 |
+
+Takeaways (closing **Spike S6** and settling **A3**):
+- **`bucketed_full_ane`** (`B ∈ {512, 1024, 2048, 4096}`) places 100% of graph
+  ops on the 16-core ANE (`25/25`–`27/27`), preserves zero-copy IOSurface
+  output backings (`zero_copy = yes`), stays within `0.0024` max abs error vs
+  FP64, and beats GPU-only chunked attention by **`1.66–2.22×`** across every
+  bucket length.
+- Overlapping ANE attention `A(l, c_next)` with Metal 4 GPU FFN/MoE `F(l, c_cur)`
+  via `WavefrontPrefill` (`G6` + `A1`) achieves **`1.189×`** on `Qwen3-30B-A3B`
+  6-layer geometry and **`1.76–1.87×`** on end-to-end 1024/2048-token `Qwen3Model`
+  prefill with `swapouts_delta = 0`.
+
+### Real-checkpoint `A2` ANE cross-layer MoE expert predictor (`Qwen3-30B-A3B-3bit`)
+
+Evaluated on real 48-layer `/Volumes/Akari/models/amf/qwen3-30b-a3b-3bit.amf`
+across `16` real decode steps (`752` layer transitions, `128` experts, `top_k = 8`,
+`hidden = 2048`), comparing:
+1. **In-memory folded ANE predictor** (`M = 1`, `post_attention_layernorm`
+   scales folded into router gate weights, 6 overlapped ANE blocks, compiled in
+   `214.6 ms`),
+2. **GPU router lookahead baseline** (`post_attention_layernorm` + `q3` router
+   GEMV on Metal 4), and
+3. **Offline W7 `.mlpackage`** (`qwen3-30b-a3b-expert-predictor-all48.mlpackage`,
+   `M = 32` static batch, raw unfolded router weights, loaded in `225.0 ms`).
+
+Measured real 48-layer GPU layer time: **`401.42 us/layer`**.
+Steady-state predictor latency: **in-memory ANE `156.44 us`** (`uses_ne = yes`,
+`zero_copy = yes`, **`17.85×` faster** than GPU 3-layer lookahead `2,792.99 us`),
+offline W7 `.mlpackage` `516.95 us` (`uses_ne = yes`, `zero_copy = yes`),
+`swapouts_delta = 0`:
+
+| Lookahead `delta` | Available lead time (`delta × 401.42 - 156.44 us`) | In-memory folded ANE `R@8 / R@12 / R@16` | GPU lookahead baseline `R@8 / R@12 / R@16` | Offline W7 `.mlpackage` (unfolded) `R@8 / R@12 / R@16` |
+| ---: | ---: | --- | --- | --- |
+| `1` layer | `245.0 us` | **0.861 / 0.958 / 0.982** | 0.860 / 0.958 / 0.982 | 0.705 / 0.826 / 0.882 |
+| `2` layers | **`646.4 us`** | **0.809 / 0.927 / 0.960** | 0.809 / 0.927 / 0.960 | 0.684 / 0.810 / 0.869 |
+| `3` layers | **`1,047.8 us`** | **0.774 / 0.891 / 0.933** | 0.774 / 0.890 / 0.933 | 0.664 / 0.789 / 0.851 |
+
+Key finding:
+- Folding each layer's `post_attention_layernorm` channel scales into the linear
+  ANE router bank raises real 48-layer `Recall@8` by **`+15.6 pp`** (`70.5% → 86.1%`)
+  and `Recall@12` by **`+13.2 pp`** (`82.6% → 95.8%`), matching exact GPU
+  RMSNorm + router lookahead to three decimal places (`0.861/0.958/0.982` vs
+  `0.860/0.958/0.982`) while executing asynchronously on ANE in `156.44 us` and
+  yielding **`646–1,048 us`** of cross-layer NVMe prefetch lead time at `delta = 2..3`.
+
+### Real-checkpoint `Qwen3-30B-A3B-3bit` cold-expert NVMe streaming decode (`C3`–`C5` + `A2` + `W8`)
+
+All runs execute greedy `T = 0` decode (`--max-tokens 32 --ignore-eos`) on real
+48-layer `qwen3-30b-a3b-3bit.amf` with the W8 heat profile
+`/Volumes/Akari/models/amf/qwen3-30b-a3b-heat.json`, marking `64` cold experts
+per layer (`3,072` cold experts = `6.05 GiB` kept on disk) under an explicit
+`--wired-cap-mib 8192` wired RAM cap (`5,922 MiB` / `-46.3%` lower wired RAM at
+`64` slots; `5,040 MiB` / `-39.4%` lower at `512` slots). Every cold configuration
+matched the all-hot `12.8 GiB` baseline on **32 / 32 `token_ids` (100% bit-for-bit)**
+with **`swapouts_delta = 0`**:
+
+| Configuration | Wired RAM (MiB) | `decode tok/s` | `ms/tok` | Hot / Cache / Prefetch / Sync-miss | Prefetch hit rate | Total cold hit rate | Disk bytes read | Unused prefetched | Exact `token_ids` | `swapouts` delta |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: |
+| **All-hot baseline** (`0` cold) | 12,791 | **48.47** | 20.633 | all hot | — | — | 0 B | 0 | baseline (32/32) | 0 |
+| `64 cold/L`, `64 slots`, `pread` + ANE | **6,869** (`-46.3%`) | 0.91 | 1,095.947 | `5992 / 681 / 2884 / 2347` | **48.8%** | 60.3% | 19.28 GB | 4,097 | **32 / 32 (100%)** | 0 |
+| `64 cold/L`, `64 slots`, `aio` + ANE | **6,869** (`-46.3%`) | 0.94 | 1,058.703 | `5992 / 663 / 2885 / 2364` | **48.8%** | 60.0% | 19.45 GB | 4,174 | **32 / 32 (100%)** | 0 |
+| `64 cold/L`, `64 slots`, `aio`, no ANE | 6,869 (`-46.3%`) | 1.18 | 844.948 | `5992 / 0 / 0 / 5912` | 0.0% | 0.0% | 12.20 GB | 0 | **32 / 32 (100%)** | 0 |
+| `64 cold/L`, `512 slots`, `aio`, no ANE | 7,751 (`-39.4%`) | 2.95 | 338.785 | `5992 / 4033 / 0 / 1879` | 0.0% | 68.2% | 3.88 GB | 0 | **32 / 32 (100%)** | 0 |
+| **`64 cold/L`, `512 slots`, `aio` + ANE** | **7,751** (`-39.4%`) | **3.02** | **331.076** | `5992 / 3779 / 1257 / 876` | **21.3%** | **85.2%** | 5.48 GB | 526 | **32 / 32 (100%)** | 0 |
+
+Key engineering findings from the 2×2 cold-expert ablation:
+1. **Budget reduction & lossless bit-parity**: Halving wired experts reduces
+   wired DRAM from `12,791 MiB` down to `6,869–7,751 MiB`, cleanly passing an
+   `8,192 MiB` wired cap with `swapouts_delta = 0` and 100% bit-for-bit exact
+   decode output.
+2. **Cache sizing vs speculative prefetch bandwidth**: Because `/Volumes/Akari`
+   is an external SSD capped at `~0.64 GB/s`, a tiny 64-slot cache (`~1.3` slots
+   per layer across 48 layers) thrashes under aggressive 12-candidate lookahead
+   prefetching (`4,174` unused prefetches = `8.6 GB` extra reads), making
+   on-demand `aio` slightly faster (`1.18` vs `0.94 tok/s`). Expanding the slot
+   pool to **`512` slots** (`7,751 MiB`, still `< 8,192 MiB`) eliminates slot
+   thrashing: LFU + ANE prefetch raises total cold hit rate to **`85.2%`**
+   (`+17.0 pp` over LFU-only `68.2%`), cuts synchronous disk misses by
+   **`-53.4%`** (`1,879 → 876`), reduces disk reads by `3.55×` (`19.45 → 5.48 GB`),
+   and beats both 64-slot modes and 512-slot no-ANE (**`3.02 tok/s`** even on
+   the `0.64 GB/s` external SSD).
+
+### Real-checkpoint `D4` same-family small draft (`Qwen3-14B-4bit` + `Qwen3-0.6B` BF16)
+
+All runs execute greedy `T = 0` (`--max-tokens 64 --ignore-eos`) on real 40-layer
+`qwen3-14b-4bit.amf` (`8,006 MiB`) paired with standalone 28-layer
+`qwen3-0.6b-bf16.amf` (combined wired `9,274–9,347 MiB`). Startup `D5`
+calibration selects `.gpu` (`gate_gpu_us = 52.4–145.9 us` vs `gate_ane_us = 482.4–990.9 us`).
+Every run matched baseline `aminfer decode` on **64 / 64 `token_ids` (100% bit-for-bit)**
+with **`swapouts_delta = 0`**:
+
+| Prompt & workload | Mode / Tree config | `decode tok/s` | Speedup vs base | Mean `tau` | Drafted → Verified nodes | L1 seed rounds | `draft / verify / sync` (ms/rnd) | Bytes / acc tok (vs base) | Exact `token_ids` | `swapouts` delta |
+| --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- | ---: |
+| **Python LRU cache** (20 → 64 tok) | Baseline `decode` | 10.82 | 1.00× | 1.000 | — | — | — | 7,884.0 MB | baseline | 0 |
+| **Python LRU cache** (20 → 64 tok) | **`D4 small` (`cap=8, d=5, w=1, k=2`)** | **15.13** | **1.40×** | **3.938** | 10.13 → 6.94 | 2 / 16 | `40.6 / 203.0 / 16.6` | **2,001.2 MB (`-74.6%`)** | **64 / 64 (100%)** | 0 |
+| **B-tree + binary search** (24 → 64 tok) | Baseline `decode` | 10.88 | 1.00× | 1.000 | — | — | — | 7,884.6 MB | baseline | 0 |
+| **B-tree + binary search** (24 → 64 tok) | `D4 small` default (`cap=16, d=4, w=2, k=3`) | **12.48** | **1.15×** | **3.706** | 17.76 → 8.71 | 1 / 17 | `34.5 / 246.2 / 16.2` | 2,126.4 MB (`-73.0%`) | **64 / 64 (100%)** | 0 |
+| **B-tree + binary search** (24 → 64 tok) | **`D4 small` tuned (`cap=8, d=5, w=1, k=2`)** | **13.81** | **1.27×** | **3.500** | 10.89 → 6.44 | 1 / 18 | `41.6 / 195.3 / 16.6` | 2,251.2 MB (`-71.4%`) | **64 / 64 (100%)** | 0 |
+| **Rust `Pin<P>` reasoning** (21 → 64 tok, **0 L1**) | Baseline `decode` | 10.83 | 1.00× | 1.000 | — | — | — | 7,884.1 MB | baseline | 0 |
+| **Rust `Pin<P>` reasoning** (21 → 64 tok, **0 L1**) | `D4 small` chain (`cap=6, d=5, w=1, k=1`) | 10.55 | 0.97× | 1.909 | 4.21 → 4.21 | **0 / 33** | `24.5 / 140.3 / 16.1` | 4,127.4 MB (`-47.6%`) | **64 / 64 (100%)** | 0 |
+| **Rust `Pin<P>` reasoning** (21 → 64 tok, **0 L1**) | `D4 small` tree (`cap=10, d=5, w=2, k=2`) | 9.55 | 0.88× | **2.100** | 9.57 → 6.10 | **0 / 30** | `19.0 / 185.0 / 15.9` | 3,752.2 MB (`-52.4%`) | **64 / 64 (100%)** | 0 |
+
+Takeaways:
+- `D4` (`Qwen3-0.6B` BF16) delivers **`tau = 3.50–3.94`**, **`-71%` to `-75%`
+  DRAM bytes per accepted token**, and **`13.81–15.13 tok/s` (`1.27–1.40×` over
+  the `10.8 tok/s` baseline; `1.35–1.48×` over M2.5's `10.2 tok/s`)** on general
+  coding/reasoning prompts where L1 alone triggers on only 1–2 rounds.
+- On zero-L1-seed Rust prose (`l1_seed_rounds = 0`), EAGLE-2 tree branching
+  raises pure-`D4` acceptance from `tau = 1.909` to `2.100`, while exposing the
+  remaining wall-clock bottleneck: unquantized BF16 drafting (`~35–42 ms/round`)
+  plus bit-exact `encodeGemvBatch` verification (`~185–203 ms/round`, ~`2.0×` of
+  `M = 1` `92 ms`), motivating quantized 4-bit small drafts and pipelined `D8`
+  drafting in M5.
+
+### Verbatim standalone `aminfer bench-m4` raw stdout (commit `6b6fb09`)
+
+```text
+=== M4 Hybrid ANE/GPU Wavefront, Cold-Expert NVMe Streaming, A2 & D4 Benchmarks ===
+
+spike_s3.file_mib                192
+spike_s3.kern_aiothreads         4
+spike_s3.kern_aioprocmax         256
+spike_s3.peak_aio_gbs            0.638
+spike_s3.peak_pread_gbs          0.626
+spike_s3.recommended_backend     kqueue_aio
+spike_s3.recommended_workers     0
+spike_s3.recommended_io_policy   important
+spike_s3.swapouts_delta          0
+spike_s3.pageouts_delta          0
+
+Spike S3 NVMe Direct-I/O Sweep (F_NOCACHE)
+blob_B     backend      wk  iopol      qd   reads   GB/s     p50(us)   p99(us)   cpu(us)
+2064384    kqueue_aio   0   important  1    64      0.575    3563.4    4722.0    6904
+2064384    kqueue_aio   0   important  2    64      0.607    6790.2    7032.5    6454
+2064384    kqueue_aio   0   important  4    64      0.622    13266.6   13462.1   8022
+2064384    kqueue_aio   0   important  8    64      0.631    26170.9   26346.7   8249
+2064384    kqueue_aio   0   important  16   64      0.638    43448.1   84186.7   7735
+2064384    ecore_pread  1   important  1    64      0.580    3544.9    3803.2    6257
+2064384    ecore_pread  1   important  2    64      0.579    7109.4    7585.3    6266
+2064384    ecore_pread  1   important  4    64      0.578    14251.8   14669.7   6273
+2064384    ecore_pread  1   important  8    64      0.572    28876.6   29289.7   7481
+2064384    ecore_pread  1   important  16   64      0.569    58035.7   58595.1   8292
+2064384    ecore_pread  2   important  1    64      0.575    3577.4    3919.8    6563
+2064384    ecore_pread  2   important  2    64      0.608    6786.5    6904.1    6215
+2064384    ecore_pread  2   important  4    64      0.604    13626.3   13950.3   6825
+2064384    ecore_pread  2   important  8    64      0.606    27224.5   27527.0   7393
+2064384    ecore_pread  2   important  16   64      0.608    54150.0   54699.4   7046
+2064384    ecore_pread  4   important  1    64      0.578    3558.5    3743.3    6837
+2064384    ecore_pread  4   important  2    64      0.607    6804.5    6963.7    7147
+2064384    ecore_pread  4   important  4    64      0.622    13265.8   13524.8   8222
+2064384    ecore_pread  4   important  8    64      0.624    26446.7   26681.3   8711
+2064384    ecore_pread  4   important  16   64      0.620    53013.5   53733.2   8820
+2064384    kqueue_aio   0   standard   1    64      0.574    3562.4    6073.6    7973
+2064384    kqueue_aio   0   standard   2    64      0.610    6762.5    6848.8    6369
+2064384    kqueue_aio   0   standard   4    64      0.622    13244.3   13550.0   7774
+2064384    kqueue_aio   0   standard   8    64      0.630    26233.5   29331.3   8260
+2064384    kqueue_aio   0   standard   16   64      0.637    43944.3   82428.1   8066
+2064384    ecore_pread  1   standard   1    64      0.578    3564.6    3829.1    6550
+2064384    ecore_pread  1   standard   2    64      0.580    7083.5    7488.8    6694
+2064384    ecore_pread  1   standard   4    64      0.581    14173.9   14641.7   6172
+2064384    ecore_pread  1   standard   8    64      0.576    28521.0   29302.8   6775
+2064384    ecore_pread  1   standard   16   64      0.582    56714.7   57013.8   6272
+2064384    ecore_pread  2   standard   1    64      0.581    3545.9    3732.7    6105
+2064384    ecore_pread  2   standard   2    64      0.609    6772.3    7015.2    6231
+2064384    ecore_pread  2   standard   4    64      0.608    13555.2   13928.5   6908
+2064384    ecore_pread  2   standard   8    64      0.607    27156.0   27384.2   6998
+2064384    ecore_pread  2   standard   16   64      0.609    54090.5   54624.8   6422
+2064384    ecore_pread  4   standard   1    64      0.572    3592.2    3898.7    6733
+2064384    ecore_pread  4   standard   2    64      0.608    6780.4    6952.1    6941
+2064384    ecore_pread  4   standard   4    64      0.622    13249.1   13552.1   7726
+2064384    ecore_pread  4   standard   8    64      0.620    26669.2   26971.5   8360
+2064384    ecore_pread  4   standard   16   64      0.618    53378.4   53755.5   9816
+2654208    kqueue_aio   0   important  1    64      0.574    4543.8    8684.6    9835
+2654208    kqueue_aio   0   important  2    64      0.608    8713.7    8935.0    10278
+2654208    kqueue_aio   0   important  4    64      0.624    17001.5   17329.4   11667
+2654208    kqueue_aio   0   important  8    64      0.629    33669.9   34444.7   10764
+2654208    kqueue_aio   0   important  16   64      0.636    68481.9   71774.4   9256
+2654208    ecore_pread  1   important  1    64      0.590    4481.7    4821.2    7181
+2654208    ecore_pread  1   important  2    64      0.589    8984.1    9320.4    7690
+2654208    ecore_pread  1   important  4    64      0.590    17952.4   18237.9   8134
+2654208    ecore_pread  1   important  8    64      0.589    36046.1   36482.6   8085
+2654208    ecore_pread  1   important  16   64      0.588    71916.5   73371.2   8403
+2654208    ecore_pread  2   important  1    64      0.590    4480.1    4752.8    7436
+2654208    ecore_pread  2   important  2    64      0.613    8644.5    8898.1    8628
+2654208    ecore_pread  2   important  4    64      0.614    17275.3   17482.0   9137
+2654208    ecore_pread  2   important  8    64      0.612    34623.3   35112.4   8859
+2654208    ecore_pread  2   important  16   64      0.611    69371.2   69911.1   10068
+2654208    ecore_pread  4   important  1    64      0.590    4488.6    4752.3    7237
+2654208    ecore_pread  4   important  2    64      0.613    8640.4    8994.5    8795
+2654208    ecore_pread  4   important  4    64      0.626    16930.0   17220.3   9572
+2654208    ecore_pread  4   important  8    64      0.625    33934.6   34449.3   11312
+2654208    ecore_pread  4   important  16   64      0.625    67742.9   68686.7   10168
+2654208    kqueue_aio   0   standard   1    64      0.590    4491.5    4786.3    7491
+2654208    kqueue_aio   0   standard   2    64      0.612    8640.1    13091.6   8515
+2654208    kqueue_aio   0   standard   4    64      0.626    16974.3   17121.6   9767
+2654208    kqueue_aio   0   standard   8    64      0.630    33714.2   34165.2   12582
+2654208    kqueue_aio   0   standard   16   64      0.636    67514.3   97771.9   8706
+2654208    ecore_pread  1   standard   1    64      0.584    4529.4    4826.3    8729
+2654208    ecore_pread  1   standard   2    64      0.584    9085.5    9423.4    9186
+2654208    ecore_pread  1   standard   4    64      0.590    17990.7   18186.2   8875
+2654208    ecore_pread  1   standard   8    64      0.591    35772.5   36530.5   7504
+2654208    ecore_pread  1   standard   16   64      0.586    72207.0   73878.0   8565
+2654208    ecore_pread  2   standard   1    64      0.588    4496.6    4865.8    7916
+2654208    ecore_pread  2   standard   2    64      0.612    8671.3    8838.0    8822
+2654208    ecore_pread  2   standard   4    64      0.613    17313.7   17515.4   9542
+2654208    ecore_pread  2   standard   8    64      0.611    34719.0   35054.6   10518
+2654208    ecore_pread  2   standard   16   64      0.612    69324.3   69964.1   9429
+2654208    ecore_pread  4   standard   1    64      0.589    4488.2    4755.2    7871
+2654208    ecore_pread  4   standard   2    64      0.613    8648.4    8881.0    8392
+2654208    ecore_pread  4   standard   4    64      0.624    16987.1   17451.5   10625
+2654208    ecore_pread  4   standard   8    64      0.624    33996.8   34372.5   10298
+2654208    ecore_pread  4   standard   16   64      0.625    67901.1   68393.4   11117
+
+Spike S6 Hybrid ANE/GPU Wavefront Prefill & Static KV Bucket Study (A1, A3, ADR-0010)
+s6.ane_cores                     16
+s6.geometry                      hidden=2048 q_heads=32 kv_heads=4 head_dim=128 chunk=512
+s6.qkv_only.compile_ms           254.4 (ane=11/11, uses_ane=yes, zero_copy=yes)
+
+Static KV Bucket Comparison (per 1 layer, 512-token chunk)
+kv_len  compile(ms)  ane_layers  zc   ane_bucket(ms)  split_qkv+gpu(ms)  gpu_only(ms)  ane_tok/s  gpu_tok/s  fastest
+   512        524.0    25/25     yes           5.130              8.232        11.392      99805      44946  bucketed_full_ane
+  1024        391.5    27/27     yes           8.002             12.684        16.165      63981      31673  bucketed_full_ane
+  2048        565.0    27/27     yes          13.589             21.482        24.834      37677      20617  bucketed_full_ane
+  4096        431.7    27/27     yes          24.716             37.713        41.021      20715      12481  bucketed_full_ane
+
+FP16 Numerical Precision vs CPU FP64 Reference (kv_len=1024, sampled_rows=32)
+s6.precision.attn_max_abs_err    0.002404
+s6.precision.attn_rmse           0.000515
+s6.precision.kv_max_abs_err      0.000968
+s6.precision.kv_rmse             0.000212
+
+2-Chunk Hybrid Wavefront Overlap (A1: 2 chunks x 6 layers, chunk=512 tokens)
+s6.wf.ane_thread_qos             user_initiated
+s6.wf.overlapped_steps           11/12
+s6.wf.zero_copy_backing          yes
+s6.wf.t_ane_layer_chunk_ms       10.311
+s6.wf.t_gpu_ffn_layer_chunk_ms   47.562
+s6.wf.t_gpu_attn_layer_chunk_ms  13.778
+s6.wf.sequential_ms_per_chunk    347.236 (1475 tok/s)
+s6.wf.wavefront_ms_per_chunk     289.818 (1767 tok/s)
+s6.wf.gpu_only_ms_per_chunk      344.682 (1485 tok/s)
+s6.wf.overlap_efficiency         1.198x
+s6.wf.speedup_vs_sequential      1.198x
+s6.wf.speedup_vs_gpu_only        1.189x
+s6.a3.recommended_strategy       bucketed_full_ane (max_bucket=4096)
+s6.swapouts_delta                0
+s6.pageouts_delta                0
+
+A2 ANE Cross-Layer MoE Expert Predictor Evaluation
+a2.ane_cores                     16
+a2.shape                         layers=16 experts=128 top_k=8 hidden=2048 lookahead=2 M=1
+a2.blocks_compiled               2 (compile_ms=227.2, uses_ane=yes, zero_copy=yes)
+a2.ane_thread_qos                user_initiated
+a2.ane_predict_us                169.25
+a2.cpu_baseline_us               364.42
+a2.lead_time_us                  750.75 (gpu_layer=460.0us x 2, nvme_target=400.0us, hides_nvme=yes)
+a2.ane_recall                    R@8=0.871  R@12=0.983  R@16=0.996
+a2.baseline_recall               R@8=0.871  R@12=0.983  R@16=0.996
+a2.unused_prefetch_ratio_k12     0.345
+a2.swapouts_delta                0
+a2.pageouts_delta                0
+
+Synthetic End-to-End A1/G6 Hybrid Wavefront Prefill vs GPU-Only Prefill
+hybrid_prefill.geometry          layers=2 hidden=512 experts=16 top_k=4 chunk=512
+prompt_toks   hybrid(ms)   hybrid(tok/s)   gpu_only(ms)   gpu(tok/s)   speedup   overlap   ane   zc
+       1024       14.892         68761.2         27.831      36792.9     1.87x     1.35x   yes   yes
+       2048       32.819         62401.9         57.603      35553.5     1.76x     1.59x   yes   yes
+hybrid_prefill.swapouts_delta    0
+
+Synthetic End-to-End Cold-Expert NVMe Streaming Decode (C3-C5 + A2)
+cold_synth.geometry              layers=4 experts=16 cold_per_layer=8 slots=16
+cold_synth.io_backend            ecore_pread (ane_predictor=on, uses_ne=yes)
+cold_synth.wired_bytes           all_hot=7536640 cold_mode=5963776
+cold_synth.bit_exact_vs_hot      yes (gen_tokens=12)
+cold_synth.hits                  hot=83 cache=77 prefetch=3 sync_miss=13
+cold_synth.hit_rates             prefetch=0.032 cold_total=0.860 bytes_read=1867776 evictions=18
+cold_synth.malloc_blocks_delta   143
+cold_synth.malloc_bytes_delta    9152
+cold_synth.swapouts_delta        0
+
+Synthetic End-to-End D4 Same-Family Small Draft Lossless Check
+d4_synth.placement               gpu (gate_ane_us=428.3, gate_gpu_us=38.6)
+d4_synth.lossless_match          yes
+d4_synth.generated_tokens        12
+d4_synth.rounds                  4
+d4_synth.mean_accept_len         2.750
+d4_synth.drafted_nodes           6.25
+d4_synth.verified_nodes          2.75
+d4_synth.malloc_blocks_delta     32
+d4_synth.malloc_bytes_delta      2048
+d4_synth.swapouts_delta          0
+
+M4 Swap Check
+m4.swap.status                   ok
+m4.swap.swapouts_delta           0
+m4.swap.pageouts_delta           0
+```
+
+### Verbatim real-checkpoint `bench-a2`, cold-expert NVMe `decode`, and `D4` `spec-decode` raw stdout (commit `8701fdb`)
+
+```text
+=== 1. Real Qwen3-30B-A3B-3bit A2 ANE Predictor Evaluation (bench-a2) ===
+Real-Checkpoint A2 ANE Cross-Layer MoE Expert Predictor Evaluation
+real_a2.shape                    layers=48 experts=128 top_k=8 hidden=2048 steps=16
+real_a2.gpu_layer_time_us        401.42
+real_a2.inmem_ane                compile_ms=214.6 latency_us=156.44 uses_ne=yes zero_copy=yes
+real_a2.gpu_lookahead_us         2792.99 (for 3 lookahead layers)
+real_a2.offline_mlpackage        compile_ms=225.0 latency_us=516.95 uses_ne=yes zero_copy=yes
+
+delta  lead_us   inmem_ANE(R@8/12/16)       gpu_base(R@8/12/16)        w7_mlpkg(R@8/12/16)
+    1    245.0   0.861 / 0.958 / 0.982      0.860 / 0.958 / 0.982      0.705 / 0.826 / 0.882
+    2    646.4   0.809 / 0.927 / 0.960      0.809 / 0.927 / 0.960      0.684 / 0.810 / 0.869
+    3   1047.8   0.774 / 0.891 / 0.933      0.774 / 0.890 / 0.933      0.664 / 0.789 / 0.851
+real_a2.swapouts_delta           0
+real_a2.pageouts_delta           27
+
+=== 2A. Qwen3-30B-A3B-3bit All-Hot Baseline (12.8 GiB wired) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 12791
+decode.prompt_tokens             24
+decode.generated_tokens          32
+decode.prefill_ms                742.274
+decode.decode_ms_per_tok         20.633
+decode.decode_tok_per_s          48.47
+decode.bytes_per_tok             1336652672
+decode.effective_gbs             64.78
+decode.malloc_blocks_delta       62
+decode.malloc_bytes_delta        3968
+decode.swapouts_delta            0
+decode.token_ids                 [220, 16, 13, 81917, 279, 1882, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 13, 220, 17, 13, 31075, 264, 13027, 7868, 2711, 729, 382, 32313, 11, 358, 1184]
+decode.text                       1. Explain the process of how B-trees maintain balance during insertion and deletion. 2. Implement a Python binary search function.
+
+Okay, I need
+
+=== 2B. Qwen3-30B-A3B-3bit Cold-Expert NVMe Streaming (64 cold/L, 64 slots, 8192 MiB cap, pread + ANE) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 6869
+decode.prompt_tokens             24
+decode.generated_tokens          32
+decode.prefill_ms                27695.749
+decode.decode_ms_per_tok         1095.947
+decode.decode_tok_per_s          0.91
+decode.bytes_per_tok             1336652672
+decode.effective_gbs             1.22
+decode.malloc_blocks_delta       -1
+decode.malloc_bytes_delta        -96
+decode.swapouts_delta            0
+decode.cold_experts              3072
+decode.cold_slots                64
+decode.cold_io_backend           ecore_pread
+decode.cold_ane_predictor        on (uses_ne=yes, compile_ms=198.4)
+decode.cold_hot_hits             5992
+decode.cold_cache_hits           681
+decode.cold_prefetch_hits        2884
+decode.cold_sync_misses          2347
+decode.cold_prefetch_hit_rate    0.488
+decode.cold_hit_rate             0.603
+decode.cold_bytes_read           19275153408
+decode.cold_evictions            9336
+decode.cold_unused_prefetched    4097
+decode.cold_prefetch_wait_us     7850881.4
+decode.cold_sync_miss_wait_us    22275016.0
+decode.token_ids                 [220, 16, 13, 81917, 279, 1882, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 13, 220, 17, 13, 31075, 264, 13027, 7868, 2711, 729, 382, 32313, 11, 358, 1184]
+decode.text                       1. Explain the process of how B-trees maintain balance during insertion and deletion. 2. Implement a Python binary search function.
+
+Okay, I need
+
+=== 2C. Qwen3-30B-A3B-3bit Cold-Expert NVMe Streaming (64 cold/L, 64 slots, 8192 MiB cap, aio + ANE) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 6869
+decode.prompt_tokens             24
+decode.generated_tokens          32
+decode.prefill_ms                26370.115
+decode.decode_ms_per_tok         1058.703
+decode.decode_tok_per_s          0.94
+decode.bytes_per_tok             1336652672
+decode.effective_gbs             1.26
+decode.malloc_blocks_delta       4500
+decode.malloc_bytes_delta        308160
+decode.swapouts_delta            0
+decode.cold_experts              3072
+decode.cold_slots                64
+decode.cold_io_backend           kqueue_aio
+decode.cold_ane_predictor        on (uses_ne=yes, compile_ms=184.1)
+decode.cold_hot_hits             5992
+decode.cold_cache_hits           663
+decode.cold_prefetch_hits        2885
+decode.cold_sync_misses          2364
+decode.cold_prefetch_hit_rate    0.488
+decode.cold_hit_rate             0.600
+decode.cold_bytes_read           19447185408
+decode.cold_evictions            9430
+decode.cold_unused_prefetched    4174
+decode.cold_prefetch_wait_us     9255550.3
+decode.cold_sync_miss_wait_us    19661013.2
+decode.token_ids                 [220, 16, 13, 81917, 279, 1882, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 13, 220, 17, 13, 31075, 264, 13027, 7868, 2711, 729, 382, 32313, 11, 358, 1184]
+decode.text                       1. Explain the process of how B-trees maintain balance during insertion and deletion. 2. Implement a Python binary search function.
+
+Okay, I need
+
+=== 2D. Qwen3-30B-A3B-3bit Cold-Expert Ablation (64 cold/L, 64 slots, 8192 MiB cap, aio, NO ANE) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 6869
+decode.prompt_tokens             24
+decode.generated_tokens          32
+decode.prefill_ms                21481.619
+decode.decode_ms_per_tok         844.948
+decode.decode_tok_per_s          1.18
+decode.bytes_per_tok             1336652672
+decode.effective_gbs             1.58
+decode.malloc_blocks_delta       2279
+decode.malloc_bytes_delta        145856
+decode.swapouts_delta            0
+decode.cold_experts              3072
+decode.cold_slots                64
+decode.cold_io_backend           kqueue_aio
+decode.cold_ane_predictor        off (uses_ne=no, compile_ms=0.0)
+decode.cold_hot_hits             5992
+decode.cold_cache_hits           0
+decode.cold_prefetch_hits        0
+decode.cold_sync_misses          5912
+decode.cold_prefetch_hit_rate    0.000
+decode.cold_hit_rate             0.000
+decode.cold_bytes_read           12204638208
+decode.cold_evictions            5912
+decode.cold_unused_prefetched    0
+decode.cold_prefetch_wait_us     0.0
+decode.cold_sync_miss_wait_us    22474541.4
+decode.token_ids                 [220, 16, 13, 81917, 279, 1882, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 13, 220, 17, 13, 31075, 264, 13027, 7868, 2711, 729, 382, 32313, 11, 358, 1184]
+decode.text                       1. Explain the process of how B-trees maintain balance during insertion and deletion. 2. Implement a Python binary search function.
+
+Okay, I need
+
+=== 2E. Qwen3-30B-A3B-3bit Cold-Expert 512-Slot Cache (64 cold/L, 512 slots, 8192 MiB cap, aio + ANE) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 7751
+decode.prompt_tokens             24
+decode.generated_tokens          32
+decode.prefill_ms                9606.303
+decode.decode_ms_per_tok         331.076
+decode.decode_tok_per_s          3.02
+decode.bytes_per_tok             1336652672
+decode.effective_gbs             4.04
+decode.malloc_blocks_delta       4494
+decode.malloc_bytes_delta        287488
+decode.swapouts_delta            0
+decode.cold_experts              3072
+decode.cold_slots                512
+decode.cold_io_backend           kqueue_aio
+decode.cold_ane_predictor        on (uses_ne=yes, compile_ms=189.7)
+decode.cold_hot_hits             5992
+decode.cold_cache_hits           3779
+decode.cold_prefetch_hits        1257
+decode.cold_sync_misses          876
+decode.cold_prefetch_hit_rate    0.213
+decode.cold_hit_rate             0.852
+decode.cold_bytes_read           5480939520
+decode.cold_evictions            2661
+decode.cold_unused_prefetched    526
+decode.cold_prefetch_wait_us     1816611.2
+decode.cold_sync_miss_wait_us    5306989.7
+decode.token_ids                 [220, 16, 13, 81917, 279, 1882, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 13, 220, 17, 13, 31075, 264, 13027, 7868, 2711, 729, 382, 32313, 11, 358, 1184]
+decode.text                       1. Explain the process of how B-trees maintain balance during insertion and deletion. 2. Implement a Python binary search function.
+
+Okay, I need
+
+=== 2F. Qwen3-30B-A3B-3bit Cold-Expert 512-Slot Ablation (64 cold/L, 512 slots, 8192 MiB cap, aio, NO ANE) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 7751
+decode.prompt_tokens             24
+decode.generated_tokens          32
+decode.prefill_ms                10262.628
+decode.decode_ms_per_tok         338.785
+decode.decode_tok_per_s          2.95
+decode.bytes_per_tok             1336652672
+decode.effective_gbs             3.95
+decode.malloc_blocks_delta       2411
+decode.malloc_bytes_delta        154304
+decode.swapouts_delta            0
+decode.cold_experts              3072
+decode.cold_slots                512
+decode.cold_io_backend           kqueue_aio
+decode.cold_ane_predictor        off (uses_ne=no, compile_ms=0.0)
+decode.cold_hot_hits             5992
+decode.cold_cache_hits           4033
+decode.cold_prefetch_hits        0
+decode.cold_sync_misses          1879
+decode.cold_prefetch_hit_rate    0.000
+decode.cold_hit_rate             0.682
+decode.cold_bytes_read           3878977536
+decode.cold_evictions            1879
+decode.cold_unused_prefetched    0
+decode.cold_prefetch_wait_us     0.0
+decode.cold_sync_miss_wait_us    7099237.8
+decode.token_ids                 [220, 16, 13, 81917, 279, 1882, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 13, 220, 17, 13, 31075, 264, 13027, 7868, 2711, 729, 382, 32313, 11, 358, 1184]
+decode.text                       1. Explain the process of how B-trees maintain balance during insertion and deletion. 2. Implement a Python binary search function.
+
+Okay, I need
+
+=== 3A. Qwen3-14B-4bit Baseline Decode (Python LRU cache, T=0, 64 tok) ===
+decode.arch                      qwen3 (q4)
+decode.prefill_mode              auto
+decode.layers                    40
+decode.shards                    1
+decode.wired_mib                 8006
+decode.prompt_tokens             20
+decode.generated_tokens          64
+decode.prefill_ms                1910.918
+decode.decode_ms_per_tok         92.446
+decode.decode_tok_per_s          10.82
+decode.bytes_per_tok             7883973440
+decode.effective_gbs             85.28
+decode.malloc_blocks_delta       128
+decode.malloc_bytes_delta        8608
+decode.swapouts_delta            0
+decode.token_ids                 [4710, 32313, 11, 358, 1184, 311, 4211, 264, 4516, 55119, 444, 36003, 6500, 304, 13027, 448, 633, 323, 2182, 7525, 304, 506, 7, 16, 8, 882, 13, 88190, 11, 1077, 594, 1744, 911, 1246, 311, 5486, 419, 382, 5338, 11, 358, 6099, 429, 458, 444, 36003, 6500, 11136, 5711, 264, 10601, 315, 264, 5175, 2415, 320, 1958, 506, 7, 16, 8, 1401, 8602, 8]
+decode.text                       
+
+Okay, I need to implement a thread-safe LRU cache in Python with get and put operations in O(1) time. Hmm, let's think about how to approach this.
+
+First, I remember that an LRU cache typically uses a combination of a hash map (for O(1) lookups)
+
+=== 3B. Qwen3-14B-4bit + Qwen3-0.6B BF16 D4 Small Draft (Python LRU cache, cap=8 d=5 w=1 k=2, T=0) ===
+spec.arch                        qwen3 (q4)
+spec.mode                        small
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       990.9
+spec.placement_gate_gpu_us       145.9
+spec.pruning                     enabled (cap=8, depth=5, width=1)
+spec.temperature                 0.00
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   9324
+spec.prompt_tokens               20
+spec.generated_tokens            64
+spec.rounds                      16
+spec.mean_accept_len             3.938
+spec.accept_hist                 [1:2, 2:2, 3:4, 4:2, 5:1, 6:4, 8:1]
+spec.drafted_nodes_per_round     10.13
+spec.verified_nodes_per_round    6.94
+spec.l1_seed_rounds              2
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  712.409
+spec.decode_ms_per_tok           66.080
+spec.decode_tok_per_s            15.13
+spec.draft_ms_per_round          40.600
+spec.prune_ms_per_round          0.001
+spec.verify_ms_per_round         203.027
+spec.commit_sync_ms_per_round    16.561
+spec.bytes_per_accepted_tok      2001224853
+spec.effective_gbs               30.28
+spec.malloc_blocks_delta         190
+spec.malloc_bytes_delta          14464
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [4710, 32313, 11, 358, 1184, 311, 4211, 264, 4516, 55119, 444, 36003, 6500, 304, 13027, 448, 633, 323, 2182, 7525, 304, 506, 7, 16, 8, 882, 13, 88190, 11, 1077, 594, 1744, 911, 1246, 311, 5486, 419, 382, 5338, 11, 358, 6099, 429, 458, 444, 36003, 6500, 11136, 5711, 264, 10601, 315, 264, 5175, 2415, 320, 1958, 506, 7, 16, 8, 1401, 8602, 8]
+spec.text                         
+
+Okay, I need to implement a thread-safe LRU cache in Python with get and put operations in O(1) time. Hmm, let's think about how to approach this.
+
+First, I remember that an LRU cache typically uses a combination of a hash map (for O(1) lookups)
+
+=== 3C. Qwen3-14B-4bit Baseline Decode (B-tree + binary search, T=0, 64 tok) ===
+decode.arch                      qwen3 (q4)
+decode.prefill_mode              auto
+decode.layers                    40
+decode.shards                    1
+decode.wired_mib                 8006
+decode.prompt_tokens             24
+decode.generated_tokens          64
+decode.prefill_ms                2264.177
+decode.decode_ms_per_tok         91.939
+decode.decode_tok_per_s          10.88
+decode.bytes_per_tok             7884628800
+decode.effective_gbs             85.76
+decode.malloc_blocks_delta       126
+decode.malloc_bytes_delta        8256
+decode.swapouts_delta            0
+decode.token_ids                 [4710, 750, 7868, 10716, 10939, 11, 2169, 982, 262, 671, 697, 2038, 1588, 271, 32313, 11, 1077, 594, 21403, 419, 3491, 13, 576, 1196, 6801, 1378, 2513, 25, 1156, 11, 458, 16148, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 11, 323, 2086, 11, 264, 13027, 8129, 315, 264, 7868, 2711, 729, 382, 24617, 448, 279, 425, 40438, 16148, 13, 358]
+decode.text                       
+
+def binary_search(arr, target):
+    # your code here
+
+Okay, let's tackle this problem. The user wants two things: first, an explanation of how B-trees maintain balance during insertion and deletion, and second, a Python implementation of a binary search function.
+
+Starting with the B-tree explanation. I
+
+=== 3D. Qwen3-14B-4bit + Qwen3-0.6B BF16 D4 Small Draft (B-tree + binary search, cap=16 d=4 w=2 k=3, T=0) ===
+spec.arch                        qwen3 (q4)
+spec.mode                        small
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       631.9
+spec.placement_gate_gpu_us       69.5
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   9347
+spec.prompt_tokens               24
+spec.generated_tokens            64
+spec.rounds                      17
+spec.mean_accept_len             3.706
+spec.accept_hist                 [1:1, 2:5, 3:2, 4:3, 5:5, 9:1]
+spec.drafted_nodes_per_round     17.76
+spec.verified_nodes_per_round    8.71
+spec.l1_seed_rounds              1
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  749.683
+spec.decode_ms_per_tok           80.141
+spec.decode_tok_per_s            12.48
+spec.draft_ms_per_round          34.508
+spec.prune_ms_per_round          0.003
+spec.verify_ms_per_round         246.239
+spec.commit_sync_ms_per_round    16.243
+spec.bytes_per_accepted_tok      2126420947
+spec.effective_gbs               26.53
+spec.malloc_blocks_delta         59
+spec.malloc_bytes_delta          2048
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [4710, 750, 7868, 10716, 10939, 11, 2169, 982, 262, 671, 697, 2038, 1588, 271, 32313, 11, 1077, 594, 21403, 419, 3491, 13, 576, 1196, 6801, 1378, 2513, 25, 1156, 11, 458, 16148, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 11, 323, 2086, 11, 264, 13027, 8129, 315, 264, 7868, 2711, 729, 382, 24617, 448, 279, 425, 40438, 16148, 13, 358]
+spec.text                         
+
+def binary_search(arr, target):
+    # your code here
+
+Okay, let's tackle this problem. The user wants two things: first, an explanation of how B-trees maintain balance during insertion and deletion, and second, a Python implementation of a binary search function.
+
+Starting with the B-tree explanation. I
+
+=== 3E. Qwen3-14B-4bit + Qwen3-0.6B BF16 D4 Small Draft (B-tree + binary search, cap=8 d=5 w=1 k=2, T=0) ===
+spec.arch                        qwen3 (q4)
+spec.mode                        small
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       549.1
+spec.placement_gate_gpu_us       88.2
+spec.pruning                     enabled (cap=8, depth=5, width=1)
+spec.temperature                 0.00
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   9324
+spec.prompt_tokens               24
+spec.generated_tokens            64
+spec.rounds                      18
+spec.mean_accept_len             3.500
+spec.accept_hist                 [1:4, 2:3, 3:3, 4:1, 5:4, 6:2, 8:1]
+spec.drafted_nodes_per_round     10.89
+spec.verified_nodes_per_round    6.44
+spec.l1_seed_rounds              1
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  752.305
+spec.decode_ms_per_tok           72.413
+spec.decode_tok_per_s            13.81
+spec.draft_ms_per_round          41.611
+spec.prune_ms_per_round          0.001
+spec.verify_ms_per_round         195.259
+spec.commit_sync_ms_per_round    16.574
+spec.bytes_per_accepted_tok      2251241996
+spec.effective_gbs               31.09
+spec.malloc_blocks_delta         67
+spec.malloc_bytes_delta          2480
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [4710, 750, 7868, 10716, 10939, 11, 2169, 982, 262, 671, 697, 2038, 1588, 271, 32313, 11, 1077, 594, 21403, 419, 3491, 13, 576, 1196, 6801, 1378, 2513, 25, 1156, 11, 458, 16148, 315, 1246, 425, 2385, 7858, 10306, 8172, 2337, 35927, 323, 36066, 11, 323, 2086, 11, 264, 13027, 8129, 315, 264, 7868, 2711, 729, 382, 24617, 448, 279, 425, 40438, 16148, 13, 358]
+spec.text                         
+
+def binary_search(arr, target):
+    # your code here
+
+Okay, let's tackle this problem. The user wants two things: first, an explanation of how B-trees maintain balance during insertion and deletion, and second, a Python implementation of a binary search function.
+
+Starting with the B-tree explanation. I
+
+=== 3F. Qwen3-14B-4bit Baseline Decode (Rust Pin<P>, T=0, 64 tok) ===
+decode.arch                      qwen3 (q4)
+decode.prefill_mode              auto
+decode.layers                    40
+decode.shards                    1
+decode.wired_mib                 8006
+decode.prompt_tokens             21
+decode.generated_tokens          64
+decode.prefill_ms                1999.143
+decode.decode_ms_per_tok         92.327
+decode.decode_tok_per_s          10.83
+decode.bytes_per_tok             7884137280
+decode.effective_gbs             85.39
+decode.malloc_blocks_delta       128
+decode.malloc_bytes_delta        8608
+decode.swapouts_delta            0
+decode.token_ids                 [279, 2874, 374, 429, 279, 3853, 1231, 387, 7726, 311, 264, 2155, 4938, 3728, 2337, 11320, 11, 323, 279, 5306, 27454, 315, 279, 3853, 1231, 3635, 8318, 13, 17471, 25351, 429, 279, 3853, 374, 537, 7726, 11, 773, 279, 5306, 27454, 7146, 2697, 13, 4354, 11, 979, 1667, 3312, 14, 11421, 11, 279, 19415, 9463, 28872, 8983, 1229, 369, 601, 13, 2055, 11, 979]
+decode.text                       the reason is that the future may be moved to a different memory location during execution, and the internal pointers of the future may become invalid. Pin ensures that the future is not moved, so the internal pointers remain valid. However, when using async/await, the compiler automatically manages pinning for us. So, when
+
+=== 3G. Qwen3-14B-4bit + Qwen3-0.6B BF16 D4 Small Draft (Rust Pin<P>, 0 L1 seeds, cap=6 d=5 w=1 k=1 no-prune, T=0) ===
+spec.arch                        qwen3 (q4)
+spec.mode                        small
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       482.4
+spec.placement_gate_gpu_us       80.3
+spec.pruning                     disabled (cap=6, depth=5, width=1)
+spec.temperature                 0.00
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   9274
+spec.prompt_tokens               21
+spec.generated_tokens            64
+spec.rounds                      33
+spec.mean_accept_len             1.909
+spec.accept_hist                 [1:17, 2:7, 3:4, 4:5]
+spec.drafted_nodes_per_round     4.21
+spec.verified_nodes_per_round    4.21
+spec.l1_seed_rounds              0
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  800.963
+spec.decode_ms_per_tok           94.767
+spec.decode_tok_per_s            10.55
+spec.draft_ms_per_round          24.516
+spec.prune_ms_per_round          0.000
+spec.verify_ms_per_round         140.278
+spec.commit_sync_ms_per_round    16.125
+spec.bytes_per_accepted_tok      4127432264
+spec.effective_gbs               43.55
+spec.malloc_blocks_delta         148
+spec.malloc_bytes_delta          7744
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [279, 2874, 374, 429, 279, 3853, 1231, 387, 7726, 311, 264, 2155, 4938, 3728, 2337, 11320, 11, 323, 279, 5306, 27454, 315, 279, 3853, 1231, 3635, 8318, 13, 17471, 25351, 429, 279, 3853, 374, 537, 7726, 11, 773, 279, 5306, 27454, 7146, 2697, 13, 4354, 11, 979, 1667, 3312, 14, 11421, 11, 279, 19415, 9463, 28872, 8983, 1229, 369, 601, 13, 2055, 11, 979]
+spec.text                         the reason is that the future may be moved to a different memory location during execution, and the internal pointers of the future may become invalid. Pin ensures that the future is not moved, so the internal pointers remain valid. However, when using async/await, the compiler automatically manages pinning for us. So, when
+
+=== 3H. Qwen3-14B-4bit + Qwen3-0.6B BF16 D4 Small Draft (Rust Pin<P>, 0 L1 seeds, cap=10 d=5 w=2 k=2, T=0) ===
+spec.arch                        qwen3 (q4)
+spec.mode                        small
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       769.5
+spec.placement_gate_gpu_us       52.4
+spec.pruning                     enabled (cap=10, depth=5, width=2)
+spec.temperature                 0.00
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   9324
+spec.prompt_tokens               21
+spec.generated_tokens            64
+spec.rounds                      30
+spec.mean_accept_len             2.100
+spec.accept_hist                 [1:12, 2:5, 3:11, 4:2]
+spec.drafted_nodes_per_round     9.57
+spec.verified_nodes_per_round    6.10
+spec.l1_seed_rounds              0
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  714.155
+spec.decode_ms_per_tok           104.748
+spec.decode_tok_per_s            9.55
+spec.draft_ms_per_round          19.031
+spec.prune_ms_per_round          0.001
+spec.verify_ms_per_round         184.994
+spec.commit_sync_ms_per_round    15.943
+spec.bytes_per_accepted_tok      3752202154
+spec.effective_gbs               35.82
+spec.malloc_blocks_delta         249
+spec.malloc_bytes_delta          18368
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.token_ids                   [279, 2874, 374, 429, 279, 3853, 1231, 387, 7726, 311, 264, 2155, 4938, 3728, 2337, 11320, 11, 323, 279, 5306, 27454, 315, 279, 3853, 1231, 3635, 8318, 13, 17471, 25351, 429, 279, 3853, 374, 537, 7726, 11, 773, 279, 5306, 27454, 7146, 2697, 13, 4354, 11, 979, 1667, 3312, 14, 11421, 11, 279, 19415, 9463, 28872, 8983, 1229, 369, 601, 13, 2055, 11, 979]
+spec.text                         the reason is that the future may be moved to a different memory location during execution, and the internal pointers of the future may become invalid. Pin ensures that the future is not moved, so the internal pointers remain valid. However, when using async/await, the compiler automatically manages pinning for us. So, when
+```

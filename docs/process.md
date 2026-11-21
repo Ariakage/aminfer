@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M3 — speculative decoding completed (2026-11-21); next: **M4 — Neural Engine and storage** (hybrid wavefront prefill `A1`/`A3`/`G6`/`S6`, ANE cross-layer MoE expert prediction `A2`, CoreML `.mlpackage` export `W7`, offline expert heat statistics `W8`, cold-expert direct I/O & cache policy `C3`–`C5`/`S3`, same-family small draft model `D4`).
+M4 — Neural Engine and storage completed (2026-11-21); next: **M5 — serving and pipelining** (kqueue SSE server `C7`–`C8`, NVMe N-gram L1 tables `C6`, PEARL-style pipelined drafting `D8`, optional GSQ+RCO hybrid quantization `W14`/`G13`).
 
 ## Milestones
 
@@ -20,7 +20,7 @@ Status-row IDs refer to [status.md](status.md).
 | M2 | Non-speculative decode | W5, W6, C1, C2, R3, R4, G3, G4 | Greedy end-to-end decode of the primary target from `.amf`; baseline tokens/s and bytes per token recorded | Completed |
 | M2.5 | Standard FP16 / BF16 and multi-shard import | W12, W13, G12 | Multi-shard `aminfer-tools pack-amf` converts local `Qwen3-30B-A3B-3bit`, `Qwen3-14B-4bit`, and `Qwen3-0.6B` (`BF16`) with bounded RAM; native `FP16` and `BF16` GEMV / GEMM / MoE SwiGLU match CPU fp32 reference; real-checkpoint greedy decode verified end-to-end (incl. `Qwen3-0.6B` `BF16`) with bandwidth archived in [benchmarks/results.md](benchmarks/results.md) | Completed |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2/M2.5; speedup over the non-speculative baseline, acceptance-length and experts-per-pass statistics recorded | Completed |
-| M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Not started |
+| M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Completed |
 | M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Not started |
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`) | R6, W9, W10, G7–G9, G10 (GR), C10 (PLE) | Composable model operator graph; `Qwen3.8-Flash-Next` (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end (128 GB+ full wired residency; 24 GB M4 hot/cold + PLE async prefetch without swap) | Not started |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
@@ -34,10 +34,10 @@ Confirmed, or before an accepted design is tuned.
 | --- | --- | --- | --- | --- |
 | S1 | KV tile read path: R16Float vs RGBA16Float texture vs aliasing `MTLBuffer`; token- vs channel-major rows; decode-attention bandwidth | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), R4 | M2 | Closed |
 | S2 | Metal 4 steady-state allocations and encode overhead per decode round (Instruments Allocations, signposts) | [ADR-0011](decisions/0011-metal4-zero-allocation-hot-path.md) | M1 | Closed |
-| S3 | Cold-expert reads: `aio_read` + `kqueue` vs E-core `pread` workers; queue depth 1–16; 2–3 MiB reads with `F_NOCACHE`; QoS and I/O-policy effects; p50 / p99 latency | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), C4 | M4 | Open |
+| S3 | Cold-expert reads: `aio_read` + `kqueue` vs E-core `pread` workers; queue depth 1–16; 2–3 MiB reads with `F_NOCACHE`; QoS and I/O-policy effects; p50 / p99 latency | [ADR-0006](decisions/0006-amf-cold-experts-direct-io.md), C4 | M4 | Closed |
 | S4 | ANE handoff latency (GPU → CPU → ANE → CPU → GPU) and bandwidth contention of concurrent ANE weight streaming on GPU GEMV | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) | M3 | Closed |
 | S5 | Unique experts per layer versus draft-tree size for Qwen3-30B-A3B; effective bandwidth of deduplicated vs per-slot expert kernels | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) | M3 | Closed |
-| S6 | ANE attention block: CoreML compilation, static shapes for a growing KV length, fp16 numerics, throughput vs GPU | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), A3 | M4 | Open |
+| S6 | ANE attention block: CoreML compilation, static shapes for a growing KV length, fp16 numerics, throughput vs GPU | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), A3 | M4 | Closed |
 
 ## M0 task list
 
@@ -225,6 +225,58 @@ default 18,186 MiB wired budget, `swapouts_delta = 0` across all runs):
       `996 MiB` unquantized BF16 draft-head sync cost (`8.31 ms/round`,
       `33.82 tok/s`) as an M4/M5 quantization target.
 
+## M4 task list
+
+- [x] `F_NOCACHE` direct NVMe async I/O (`KqueueAioEngine` `EVFILT_AIO` auto-reap `C3`, `EcorePreadPool` E-core worker fallback `C4`, `AsyncExpertReader`, Spike `S3`) and preallocated wired `ExpertSlotPool` + LFU-decay `ExpertCache` with pass pinning & prefetch coalescing (`C5`) in `src/storage/{aio,cache}.zig`
+- [x] Offline W8 expert heat profiler (`aminfer-tools expert-heat`, `schema_version = 1`, `pack-amf --heat-profile`) and pure-stdlib CoreML `.mlpackage` exporter (`W7`, `aminfer-tools export-coreml` for expert predictor, ANE attention QKV, and draft FFN) in `tools/` (40/40 unittests; real `qwen3-30b-a3b-heat.json` and `.mlpackage` artifacts verified)
+- [x] Hybrid 2-chunk ANE/GPU wavefront prefill scheduler (`WavefrontPrefill`, `A1`), static power-of-two KV-bucket ANE attention (`A3`, Spike `S6`), and zero-copy IOSurface ANE cross-layer MoE expert predictor (`AneExpertPredictor`, `A2`) in `src/ane/{wavefront,predictor}.zig`
+- [x] Engine integration in `src/model/qwen3.zig`, `src/spec/{draft,engine}.zig`, `src/bench/runner.zig`, and `src/main.zig`: `runLayerFfnChunk` (`G6`) + `prefillHybridWavefront` (`A1`), cold-expert NVMe streaming with overlapped ANE lookahead prefetch & `D7` cold-penalty residency bitmasks (`C3`–`C5`, `A2`, `W8`), `D4` standalone `SmallDraftModel` (`--draft-mode small`), and `aminfer bench-m4` / `aminfer bench-a2`
+- [x] Real-checkpoint M4 ReleaseFast benchmarks archived in [benchmarks/results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft): Spikes `S3` & `S6`, real 48L `Qwen3-30B-A3B-3bit` `A2` predictor recall & lead time, real 48L `Qwen3-30B-A3B-3bit` cold-expert NVMe decode (`6,869–7,751 MiB` < `8,192 MiB` cap, 100% bit-exact, `0` swapouts), and real `Qwen3-14B-4bit` + `Qwen3-0.6B` BF16 `D4` small draft (`1.27–1.40×`, 100% bit-exact, `0` swapouts)
+
+## M4 Neural Engine, storage and D4 small draft results
+
+Canonical methodology, full tables, and verbatim raw run outputs live in
+[benchmarks/results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft).
+Key M4 highlights on Apple M4 24 GiB (commits `176740c..8701fdb`, ReleaseFast,
+`swapouts_delta = 0` across all runs):
+
+- **Spike S3 (`C3` + `C4` settled)**: On `/Volumes/Akari` (external SSD capped
+  at `~0.64 GB/s`), `kqueue_aio` (`SIGEV_KEVENT` → `EVFILT_AIO`) peaks at
+  **`0.638 GB/s`** (Q3 `2,064,384 B`, QD=16, `IOPOL_IMPORTANT`) vs 4-worker
+  `ecore_pread` **`0.626 GB/s`** (tighter QD=16 p99 tail `53.7 ms` vs `84.2 ms`),
+  with `0` swapouts. Both remain first-class via `--io-backend {auto,aio,pread}`.
+- **Spike S6 (`A3` settled) & `A1`/`G6` hybrid wavefront prefill**:
+  - `bucketed_full_ane` (`B ∈ {512, 1024, 2048, 4096}`) maps 100% of attention
+    ops onto ANE (`25/25`–`27/27`, `zero_copy = yes`), stays within `0.0024`
+    max abs error vs CPU FP64 at `kv_len = 1024`, and beats GPU-only attention
+    by **`1.66–2.22×`** across every bucket.
+  - 2-chunk ANE/GPU wavefront overlap achieves **`1.189×`** (`1,767` vs `1,485 tok/s`,
+    `1.198×` overlap efficiency) on 6-layer `Qwen3-30B-A3B` geometry and
+    **`1.87×` / `1.76×`** (`68,761` / `62,402 tok/s`) on end-to-end synthetic
+    `1024`/`2048`-token `Qwen3Model` prefill.
+- **Real 48-layer `Qwen3-30B-A3B-3bit` `A2` cross-layer expert predictor**:
+  - In-memory `post_attention_layernorm`-folded ANE router bank executes in
+    **`156.44 us`** (`uses_ne = yes`, `zero_copy = yes`, **`17.85×` faster**
+    than GPU 3-layer lookahead `2,792.99 us`), matching exact GPU lookahead
+    recall (`R@8/12/16 = 0.861/0.958/0.982` at `delta = 1`, `0.809/0.927/0.960`
+    at `delta = 2`, `0.774/0.891/0.933` at `delta = 3`) with **`646–1,048 us`**
+    of async NVMe lead time (`+15.6 pp` `R@8` over unfolded offline `.mlpackage`).
+- **Real 48-layer `Qwen3-30B-A3B-3bit` cold-expert NVMe decode (`C3`–`C5` + `A2` + `W8`)**:
+  - Keeping `64` cold experts/layer (`3,072` experts = `6.05 GiB`) on disk cuts
+    wired RAM from `12,791 MiB` down to **`6,869 MiB` (`-46.3%`, 64 slots)** or
+    **`7,751 MiB` (`-39.4%`, 512 slots)** — cleanly passing `--wired-cap-mib 8192`
+    with **32/32 (100%) bit-for-bit identical `token_ids`** and `swapouts_delta = 0`.
+  - With `512` slots (`aio` + ANE predictor), total cold hit rate reaches
+    **`85.2%`** (`+17.0 pp` over LFU-only `68.2%`), synchronous misses drop
+    **`-53.4%`** (`1,879 → 876`), and decode reaches **`3.02 tok/s`** even on
+    the `0.64 GB/s` external SSD (vs `0.94 tok/s` at 64 slots).
+- **Real `Qwen3-14B-4bit` + `Qwen3-0.6B` BF16 `D4` same-family small draft**:
+  - 100% bit-for-bit lossless (`64/64` `token_ids` on all 3 prompts, `0` swapouts,
+    `D5` gate → `.gpu`): **`15.13 tok/s` (`1.40×`**, `tau = 3.938`, `-74.6%`
+    bytes) on Python LRU cache, **`13.81 tok/s` (`1.27×`**, `tau = 3.500`,
+    `12.48 tok/s` default tree) on B-tree + binary search, and `tau = 1.909–2.100`
+    on zero-L1-seed Rust prose (`l1_seed_rounds = 0`).
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -258,6 +310,8 @@ Only checks that actually ran are listed.
 | 2026-11-21 | M2.5 `W13` + `bench-m25` + real-checkpoint gate (`1893ab6`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build`, `zig build test` (Debug/ReleaseSafe/ReleaseFast: 121/121), direct Debug test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (120/120, API + GPU Validation enabled, 0 errors), `tools` unittest (23/23), ReleaseFast `aminfer bench-m25` (16 `FP16`/`BF16` GEMV/GEMM shapes up to `88.25 GB/s` / `2.690 TFLOP/s` + synthetic `BF16` decode), and real full-layer `verify-amf` + bilingual EN/ZH `decode` + `bench-decode` (`seq=512`, `swapouts_delta = 0`) on `Qwen3-0.6B` BF16 (`47.88 tok/s`, 32-tok `62.98–66.17 tok/s`), `Qwen3-14B-4bit` (`9.52 tok/s`), and `Qwen3-30B-A3B-3bit` (`51.86 tok/s`) archived in [benchmarks/results.md](benchmarks/results.md) | Pass |
 | 2026-11-21 | M3 Phase 1 (`cb6ad86`, `c8414eb`, `d240329`): L1 SAM (`D1`), dual-source trie (`D6`), D7 submodular pruner, D9 acceptance; Metal 4 tree-attention & KV commit (`G5`), CoreML ANE zero-copy bridge (`D5`), Spikes `S4` & `S5`; `.amf` `DType.u32 = 5` & EAGLE-3/EAGLE-2/MTP packers (`tools` unittest: 28/28, real `RedHatAI/Qwen3-30B-A3B-speculator.eagle3` packed & verified with `aminfer verify-amf`: 15 tensors, 996 MiB) | Pass |
 | 2026-11-21 | M3 final gate (`034492f`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 158/158 tests), direct Debug test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (156/156, API + GPU Validation enabled, 0 errors), `tools` unittest (28/28), ReleaseFast `aminfer bench-m3` (`S4` `d5_gate=gpu`, `S5` `beta_dedup=36.78 GB/s` / crossover `M=2`, `L1 SAM` `0.041 us`, `swapouts_delta = 0`), and real-checkpoint `T = 0` lossless `decode` vs `spec-decode` (100% bit-for-bit `token_ids` match, `swapouts_delta = 0`) on `Qwen3-0.6B` BF16 (`4.73×`, plus `T = 0.7` `D9`), `Qwen3-14B-4bit` (`1.71×`), and `Qwen3-30B-A3B-3bit` + real `EAGLE-3` (reasoning `48.38 tok/s` = `1.94×` vs unpruned / `1.05×` vs base; code-edit `L1 + D7` `59.24 tok/s` = `1.18×`) archived in [benchmarks/results.md](benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5) | Pass |
+| 2026-11-21 | M4 Phase 1 (`176740c`, `cf498b3`, `02d22a0`): `F_NOCACHE` `kqueue_aio`/`ecore_pread`/Spike `S3` & wired `ExpertSlotPool`/`ExpertCache` (`C3`–`C5`); W8 `expert-heat` + W7 pure-stdlib `export-coreml` (`tools` unittest: 40/40; real `qwen3-30b-a3b-heat.json` & `.mlpackage` exports validated); `WavefrontPrefill`, static KV-bucket ANE attention / Spike `S6` (`A1`, `A3`), and `AneExpertPredictor` (`A2`) | Pass |
+| 2026-11-21 | M4 Phase 2 & real-checkpoint gate (`6b6fb09`, `8701fdb`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 188/188 tests), `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` on M4/D4 tests (0 validation errors), ReleaseFast `aminfer bench-m4` (Spikes `S3` & `S6`, synthetic `A2`, `A1`/`G6` `1.76–1.87×`, synthetic cold-expert parity, synthetic `D4` lossless, `0` swapouts), real 48L `Qwen3-30B-A3B-3bit` `bench-a2` (`156.44 us` ANE `R@8/12/16 = 0.861/0.958/0.982` at `delta = 1`, `0` swapouts), real 48L `Qwen3-30B-A3B-3bit` cold-expert NVMe `decode` (`6,869–7,751 MiB` < `8,192 MiB` cap, `85.2%` hit rate / `3.02 tok/s` at 512 slots, 32/32 bit-exact, `0` swapouts), and real `Qwen3-14B-4bit` + `Qwen3-0.6B` BF16 `D4` `spec-decode` (`13.81–15.13 tok/s` = `1.27–1.40×`, `tau = 3.50–3.94`, 64/64 bit-exact across 3 prompts, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -323,14 +377,25 @@ Update this before the context window runs out or when handing off.
     `e46b7f5` M3 benchmark archive & close-out docs
   - Roadmap docs: `880d487` optional offline GSQ+RCO hybrid quantization
     ([ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md)), plus
-    `W14`/`G13` status & process registration
-- In flight: none (M3 completed; ready to begin M4 Neural Engine and storage)
+    `W14`/`G13` status & process registration; `98c43c6` external research &
+    open-decision recommendations (`docs/architecture/open-decisions-research.md`)
+  - M4: `176740c` `F_NOCACHE` kqueue AIO, E-core pread pool, Spike `S3` & LFU
+    expert cache (`C3`–`C5`, `S3`), `cf498b3` offline expert-heat profiler &
+    pure-stdlib CoreML `.mlpackage` exporter (`W7`, `W8`), `02d22a0` hybrid
+    wavefront prefill, Spike `S6` static-shape buckets & ANE expert predictor
+    (`A1`–`A3`, `S6`), `6b6fb09` M4 engine/CLI/benchmark integration (`G6`,
+    `D4`, cold-expert NVMe streaming, `bench-m4`, `bench-a2`), `8701fdb`
+    two-phase `bench-a2` weight release for zero-swap real-checkpoint eval,
+    plus M4 benchmark archive & close-out docs
+- In flight: none (M4 completed; ready for M5)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [benchmarks/results.md](benchmarks/results.md),
   [decisions/0004-kv-cache-iosurface-texture-sharing.md](decisions/0004-kv-cache-iosurface-texture-sharing.md),
+  [decisions/0006-amf-cold-experts-direct-io.md](decisions/0006-amf-cold-experts-direct-io.md),
   [decisions/0008-benchmark-gated-draft-placement.md](decisions/0008-benchmark-gated-draft-placement.md),
   [decisions/0009-expert-byte-budget-tree-pruning.md](decisions/0009-expert-byte-budget-tree-pruning.md),
+  [decisions/0010-hybrid-wavefront-prefill.md](decisions/0010-hybrid-wavefront-prefill.md),
   [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md),
   [decisions/0013-eagle-tree-and-head-formats.md](decisions/0013-eagle-tree-and-head-formats.md),
   [decisions/0016-native-fp16-bf16-and-multishard-import.md](decisions/0016-native-fp16-bf16-and-multishard-import.md),
