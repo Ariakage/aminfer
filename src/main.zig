@@ -10,13 +10,14 @@ const usage =
     \\commands:
     \\  probe             print the kernel, Metal and Neural Engine facts of this machine
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1, M2, M2.5, M3, M4 and M4.5 benchmark suites
+    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5 and M5 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
     \\  bench-m3          run M3 Spikes S4/S5, D5 gate, L1 SAM latency and synthetic spec decode
     \\  bench-m4          run M4 Spikes S3/S6, A2 predictor, A1/G6 hybrid prefill, cold NVMe & D4
     \\  bench-m45         run M4.5 Spike S7 SME2 microkernels, C13 GPU+SME2 bus gate & L2 router cal
+    \\  bench-m5          run M5 G13 q2/hetero-MoE, C6 F_NOCACHE ngram, D8 PEARL & C7/C8 kqueue server
     \\  bench-a2          evaluate real-checkpoint A2 ANE cross-layer expert predictor recall/lead-time
     \\                    --amf <path> --config <path> --tokenizer <path> [--prompt <text>]
     \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [--no-verify-crc]
@@ -34,17 +35,32 @@ const usage =
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--no-verify-crc]
-    \\  spec-decode       run speculative decoding (L1 SAM + EAGLE-3/EAGLE-2/MTP/Small + D7 pruning)
+    \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small + D8 PEARL + D7)
     \\                    --amf <path> --config <path> --tokenizer <path> --prompt <text>
     \\                    [--draft-amf <path> --draft-config <path>]
     \\                    [--draft-mode l1|eagle3|eagle2|mtp|small] [--placement auto|gpu|ane]
-    \\                    [--sme-router auto|sme2|gpu]
+    \\                    [--sme-router auto|sme2|gpu] [--pearl auto|on|off] [--pearl-min-target-ms F]
+    \\                    [--ngram-nvme <path>] [--ngram-cache-pages N]
     \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
     \\                    [--top-k N] [--no-prune] [--temperature T] [--seed N]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--max-tokens N] [--ignore-eos] [--no-verify-crc]
+    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8)
+    \\                    --amf <path> --config <path> --tokenizer <path>
+    \\                    [--host 127.0.0.1] [--port 8080] [--model-id <id>]
+    \\                    [--max-seq-len N] [--max-conns N] [--max-active-requests N]
+    \\                    [--draft-amf <path> --draft-config <path>]
+    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small] [--placement auto|gpu|ane]
+    \\                    [--sme-router auto|sme2|gpu] [--pearl auto|on|off] [--pearl-min-target-ms F]
+    \\                    [--ngram-nvme <path>] [--ngram-cache-pages N]
+    \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
+    \\                    [--top-k N] [--no-prune]
+    \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
+    \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
+    \\                    [--no-ane-predictor] [--no-verify-crc]
     \\
 ;
 
@@ -72,6 +88,8 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM4(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m45")) {
         try runBenchM45(arena, out);
+    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m5")) {
+        try runBenchM5(arena, out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-a2")) {
         try runBenchA2(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-decode")) {
@@ -80,6 +98,8 @@ pub fn main(init: std.process.Init) !void {
         try runDecode(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "spec-decode")) {
         try runSpecDecode(arena, args[2..], out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "serve")) {
+        try runServe(arena, args[2..], out);
     } else {
         try out.writeAll(usage);
     }
@@ -685,6 +705,9 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
     if (model.hasSme2Weights()) {
         try out.writeAll("decode.sme2_weights              yes\n");
     }
+    if (model.isHeterogeneousMoe()) {
+        try out.writeAll("decode.hetero_moe                yes\n");
+    }
     if (model.coldStats()) |cs| {
         try writeColdExpertStats("decode", cs, out);
     }
@@ -765,6 +788,12 @@ fn runBenchM45(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try report.write(out);
 }
 
+fn runBenchM5(allocator: std.mem.Allocator, out: *Io.Writer) !void {
+    var report = try aminfer.bench.runM5(allocator);
+    defer report.deinit(allocator);
+    try report.write(out);
+}
+
 fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM1(allocator, out);
     try out.flush();
@@ -777,6 +806,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM4(allocator, out);
     try out.flush();
     try runBenchM45(allocator, out);
+    try out.flush();
+    try runBenchM5(allocator, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -789,6 +820,10 @@ const SpecDecodeCliArgs = struct {
     draft_mode: ?aminfer.draft.DraftMode = null,
     placement: aminfer.draft.Placement = .auto,
     sme_router_mode: aminfer.qwen3.SmeRouterMode = .auto,
+    pearl_mode: aminfer.engine.PearlMode = .auto,
+    pearl_min_target_ms: f64 = 40.0,
+    ngram_nvme_path: ?[:0]const u8 = null,
+    ngram_cache_pages: usize = 32,
     max_tree_nodes: u16 = 16,
     max_draft_depth: u16 = 4,
     branch_width: u16 = 2,
@@ -819,6 +854,10 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var draft_mode: ?aminfer.draft.DraftMode = null;
     var placement: aminfer.draft.Placement = .auto;
     var sme_router_mode: aminfer.qwen3.SmeRouterMode = .auto;
+    var pearl_mode: aminfer.engine.PearlMode = .auto;
+    var pearl_min_target_ms: f64 = 40.0;
+    var ngram_nvme_path: ?[:0]const u8 = null;
+    var ngram_cache_pages: usize = 32;
     var max_tree_nodes: u16 = 16;
     var max_draft_depth: u16 = 4;
     var branch_width: u16 = 2;
@@ -877,6 +916,23 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             sme_router_mode = try aminfer.qwen3.SmeRouterMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--pearl")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            pearl_mode = try aminfer.engine.PearlMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--pearl-min-target-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            pearl_min_target_ms = try std.fmt.parseFloat(f64, args[i]);
+            if (!std.math.isFinite(pearl_min_target_ms) or pearl_min_target_ms < 0.0) return error.InvalidFlagValue;
+        } else if (std.mem.eql(u8, flag, "--ngram-nvme")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ngram_nvme_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--ngram-cache-pages")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ngram_cache_pages = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, flag, "--max-tree-nodes")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -957,6 +1013,10 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .draft_mode = draft_mode,
         .placement = placement,
         .sme_router_mode = sme_router_mode,
+        .pearl_mode = pearl_mode,
+        .pearl_min_target_ms = pearl_min_target_ms,
+        .ngram_nvme_path = ngram_nvme_path,
+        .ngram_cache_pages = ngram_cache_pages,
         .max_tree_nodes = max_tree_nodes,
         .max_draft_depth = max_draft_depth,
         .branch_width = branch_width,
@@ -1075,6 +1135,18 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
     var small_draft_ptr: ?*aminfer.draft.SmallDraftModel = null;
     defer if (small_draft_ptr) |sd| sd.deinit(allocator);
 
+    var ngram_tbl_storage: aminfer.ngram_nvme.NvmeNgramTable = undefined;
+    var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
+    defer if (ngram_tbl_ptr) |nt| nt.deinit(allocator);
+    if (cli.ngram_nvme_path) |ang_path| {
+        ngram_tbl_storage = try aminfer.ngram_nvme.NvmeNgramTable.open(allocator, ang_path, .{
+            .cache_pages = cli.ngram_cache_pages,
+            .io_backend = cli.io_backend,
+            .budget_override = budget_override,
+        });
+        ngram_tbl_ptr = &ngram_tbl_storage;
+    }
+
     if (mode == .small_draft) {
         small_draft_storage = try aminfer.draft.SmallDraftModel.loadFromFile(
             allocator,
@@ -1086,6 +1158,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
                 .max_seq_len = max_seq_len,
                 .max_tree_slots = target_tree_cap,
                 .verify_crcs = cli.verify_crcs,
+                .own_compute_queue = (cli.pearl_mode != .off),
             },
         );
         small_draft_ptr = &small_draft_storage;
@@ -1114,6 +1187,9 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         .top_k_per_node = cli.top_k,
         .temperature = cli.temperature,
         .enable_pruning = cli.enable_pruning,
+        .pearl_mode = cli.pearl_mode,
+        .pearl_min_target_us = cli.pearl_min_target_ms * 1000.0,
+        .ngram_table = ngram_tbl_ptr,
     };
     var eng = if (small_draft_ptr) |sd|
         try aminfer.engine.SpecEngine.initWithSmallDraft(allocator, &model, sd, spec_cfg)
@@ -1324,6 +1400,53 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, decode_vm_before),
         aminfer.vmstat.Snapshot.swapoutDelta(decode_vm_before, vm_after),
     });
+    if (model.isHeterogeneousMoe()) {
+        try out.writeAll("spec.hetero_moe                  yes\n");
+    }
+    if (ngram_tbl_ptr) |nt| {
+        try out.print(
+            \\spec.ngram_nvme                  on (buckets={d}, entries={d}, wired_kib={d})
+            \\spec.ngram_queries               {d}
+            \\spec.ngram_hits                  {d}
+            \\spec.ngram_seed_hits             {d}
+            \\spec.ngram_cache_hits            {d}
+            \\spec.ngram_nvme_reads            {d}
+            \\spec.ngram_mean_query_us         {d:.2}
+            \\
+        , .{
+            nt.header.num_buckets,
+            nt.header.total_entries,
+            nt.totalWiredBytes() >> 10,
+            eng.stats.ngram_queries,
+            eng.stats.ngram_hits,
+            eng.stats.ngram_seed_hits,
+            eng.stats.ngram_cache_hits,
+            eng.stats.ngram_nvme_reads,
+            nt.stats.meanQueryUs(),
+        });
+    }
+    if (mode == .small_draft or eng.stats.pearl_enabled or eng.stats.pearl_rounds > 0) {
+        try out.print(
+            \\spec.pearl_mode                  {s} (enabled={s}, own_queue={s})
+            \\spec.pearl_rounds                {d}
+            \\spec.pearl_hits                  {d}
+            \\spec.pearl_partial_prefix_hits   {d}
+            \\spec.pearl_rollbacks             {d}
+            \\spec.pearl_saved_ms              {d:.3}
+            \\spec.pearl_worker_ms             {d:.3}
+            \\
+        , .{
+            cli.pearl_mode.label(),
+            if (eng.stats.pearl_enabled) "yes" else "no",
+            if (small_draft_ptr) |sd| (if (sd.hasOwnComputeQueue()) "yes" else "no") else "no",
+            eng.stats.pearl_rounds,
+            eng.stats.pearl_hits,
+            eng.stats.pearl_partial_prefix_hits,
+            eng.stats.pearl_rollbacks,
+            @as(f64, @floatFromInt(eng.stats.pearl_saved_ns)) / 1_000_000.0,
+            @as(f64, @floatFromInt(eng.stats.pearl_worker_ns)) / 1_000_000.0,
+        });
+    }
     if (model.coldStats()) |cs| {
         try writeColdExpertStats("spec", cs, out);
     }
@@ -1333,6 +1456,746 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         try out.print("{d}", .{tid});
     }
     try out.print("]\nspec.text                        {s}\n", .{decoded_text});
+}
+
+// ---------------------------------------------------------------------------
+// C7 + C8 Zero-Allocation kqueue HTTP/SSE Inference Server (`aminfer serve`)
+// ---------------------------------------------------------------------------
+
+var g_active_serve_ptr: std.atomic.Value(usize) = .init(0);
+
+fn handleServeShutdownSignal(_: std.c.SIG) callconv(.c) void {
+    const ptr_val = g_active_serve_ptr.load(.acquire);
+    if (ptr_val != 0) {
+        const srv: *aminfer.server.Server = @ptrFromInt(ptr_val);
+        srv.stop_requested.store(true, .seq_cst);
+    }
+}
+
+const ServeCliArgs = struct {
+    amf_path: [:0]const u8,
+    config_path: [:0]const u8,
+    tokenizer_path: [:0]const u8,
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 8080,
+    model_id: ?[]const u8 = null,
+    max_seq_len: u32 = 4096,
+    max_conns: usize = aminfer.server.DEFAULT_MAX_CONNS,
+    max_active_requests: usize = aminfer.server.DEFAULT_MAX_ACTIVE_REQUESTS,
+    draft_amf_path: ?[:0]const u8 = null,
+    draft_config_path: ?[:0]const u8 = null,
+    draft_mode: ?aminfer.draft.DraftMode = null,
+    placement: aminfer.draft.Placement = .auto,
+    sme_router_mode: aminfer.qwen3.SmeRouterMode = .auto,
+    pearl_mode: aminfer.engine.PearlMode = .auto,
+    pearl_min_target_ms: f64 = 40.0,
+    ngram_nvme_path: ?[:0]const u8 = null,
+    ngram_cache_pages: usize = 32,
+    max_tree_nodes: u16 = 16,
+    max_draft_depth: u16 = 4,
+    branch_width: u16 = 2,
+    top_k: u32 = 3,
+    enable_pruning: bool = true,
+    verify_crcs: bool = true,
+    cold_experts_per_layer: u32 = 0,
+    heat_profile_path: ?[:0]const u8 = null,
+    cold_slots: u32 = 64,
+    wired_cap_mib: ?u64 = null,
+    io_backend: aminfer.aio.IoBackend = .auto,
+    prefill_mode: aminfer.qwen3.PrefillMode = .auto,
+    ane_predictor_path: ?[:0]const u8 = null,
+    enable_ane_predictor: bool = true,
+};
+
+fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
+    var amf_path: ?[:0]const u8 = null;
+    var config_path: ?[:0]const u8 = null;
+    var tokenizer_path: ?[:0]const u8 = null;
+    var host: []const u8 = "127.0.0.1";
+    var port: u16 = 8080;
+    var model_id: ?[]const u8 = null;
+    var max_seq_len: u32 = 4096;
+    var max_conns: usize = aminfer.server.DEFAULT_MAX_CONNS;
+    var max_active_requests: usize = aminfer.server.DEFAULT_MAX_ACTIVE_REQUESTS;
+    var draft_amf_path: ?[:0]const u8 = null;
+    var draft_config_path: ?[:0]const u8 = null;
+    var draft_mode: ?aminfer.draft.DraftMode = null;
+    var placement: aminfer.draft.Placement = .auto;
+    var sme_router_mode: aminfer.qwen3.SmeRouterMode = .auto;
+    var pearl_mode: aminfer.engine.PearlMode = .auto;
+    var pearl_min_target_ms: f64 = 40.0;
+    var ngram_nvme_path: ?[:0]const u8 = null;
+    var ngram_cache_pages: usize = 32;
+    var max_tree_nodes: u16 = 16;
+    var max_draft_depth: u16 = 4;
+    var branch_width: u16 = 2;
+    var top_k: u32 = 3;
+    var enable_pruning = true;
+    var verify_crcs = true;
+    var cold_experts_per_layer: u32 = 0;
+    var heat_profile_path: ?[:0]const u8 = null;
+    var cold_slots: u32 = 64;
+    var wired_cap_mib: ?u64 = null;
+    var io_backend: aminfer.aio.IoBackend = .auto;
+    var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
+    var ane_predictor_path: ?[:0]const u8 = null;
+    var enable_ane_predictor = true;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const flag = args[i];
+        if (std.mem.eql(u8, flag, "--amf")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            amf_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--config")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--tokenizer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            tokenizer_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--host")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            host = args[i];
+        } else if (std.mem.eql(u8, flag, "--port")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--model-id")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            model_id = args[i];
+        } else if (std.mem.eql(u8, flag, "--max-seq-len")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            max_seq_len = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--max-conns")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            max_conns = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--max-active-requests")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            max_active_requests = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--draft-amf")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            draft_amf_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--draft-config")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            draft_config_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--draft-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            draft_mode = try aminfer.draft.DraftMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--placement")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            placement = try aminfer.draft.Placement.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--sme-router")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            sme_router_mode = try aminfer.qwen3.SmeRouterMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--pearl")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            pearl_mode = try aminfer.engine.PearlMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--pearl-min-target-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            pearl_min_target_ms = try std.fmt.parseFloat(f64, args[i]);
+            if (!std.math.isFinite(pearl_min_target_ms) or pearl_min_target_ms < 0.0) return error.InvalidFlagValue;
+        } else if (std.mem.eql(u8, flag, "--ngram-nvme")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ngram_nvme_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--ngram-cache-pages")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ngram_cache_pages = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--max-tree-nodes")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            max_tree_nodes = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--max-draft-depth")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            max_draft_depth = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--branch-width")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            branch_width = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--top-k")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            top_k = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--no-prune")) {
+            enable_pruning = false;
+        } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
+            verify_crcs = false;
+        } else if (std.mem.eql(u8, flag, "--cold-experts-per-layer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_experts_per_layer = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--heat-profile")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            heat_profile_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--cold-slots")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--io-backend")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            io_backend = try parseIoBackend(args[i]);
+        } else if (std.mem.eql(u8, flag, "--prefill-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            prefill_mode = try aminfer.qwen3.PrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ane_predictor_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--no-ane-predictor")) {
+            enable_ane_predictor = false;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+
+    return .{
+        .amf_path = amf_path orelse return error.MissingRequiredFlag,
+        .config_path = config_path orelse return error.MissingRequiredFlag,
+        .tokenizer_path = tokenizer_path orelse return error.MissingRequiredFlag,
+        .host = host,
+        .port = port,
+        .model_id = model_id,
+        .max_seq_len = max_seq_len,
+        .max_conns = max_conns,
+        .max_active_requests = max_active_requests,
+        .draft_amf_path = draft_amf_path,
+        .draft_config_path = draft_config_path,
+        .draft_mode = draft_mode,
+        .placement = placement,
+        .sme_router_mode = sme_router_mode,
+        .pearl_mode = pearl_mode,
+        .pearl_min_target_ms = pearl_min_target_ms,
+        .ngram_nvme_path = ngram_nvme_path,
+        .ngram_cache_pages = ngram_cache_pages,
+        .max_tree_nodes = max_tree_nodes,
+        .max_draft_depth = max_draft_depth,
+        .branch_width = branch_width,
+        .top_k = top_k,
+        .enable_pruning = enable_pruning,
+        .verify_crcs = verify_crcs,
+        .cold_experts_per_layer = cold_experts_per_layer,
+        .heat_profile_path = heat_profile_path,
+        .cold_slots = cold_slots,
+        .wired_cap_mib = wired_cap_mib,
+        .io_backend = io_backend,
+        .prefill_mode = prefill_mode,
+        .ane_predictor_path = ane_predictor_path,
+        .enable_ane_predictor = enable_ane_predictor,
+    };
+}
+
+/// Zero-allocation inference runner bridging `Qwen3Model` / `SpecEngine` +
+/// `Tokenizer` into `server.Server`'s `EngineHandler` (`C7`, `C8`, `D11`).
+const ServeRunner = struct {
+    model: *aminfer.qwen3.Qwen3Model,
+    spec_engine: ?*aminfer.engine.SpecEngine,
+    tok: *const aminfer.tokenizer.Tokenizer,
+    cfg: aminfer.qwen3.ModelConfig,
+    max_seq_len: u32,
+    stop_tokens: [4]u32,
+    stop_token_count: usize,
+    encode_scratch: aminfer.tokenizer.EncodeScratch,
+    prompt_ids_buf: []u32,
+    p_res: []f32,
+    round_buf: [aminfer.engine.MAX_TREE_NODES]u32,
+
+    const EmitResult = enum { ok, stop, cancelled };
+
+    fn init(
+        allocator: std.mem.Allocator,
+        model: *aminfer.qwen3.Qwen3Model,
+        spec_engine: ?*aminfer.engine.SpecEngine,
+        tok: *const aminfer.tokenizer.Tokenizer,
+        cfg: aminfer.qwen3.ModelConfig,
+        max_seq_len: u32,
+    ) !ServeRunner {
+        var encode_scratch = try aminfer.tokenizer.EncodeScratch.init(allocator, 8192);
+        errdefer encode_scratch.deinit(allocator);
+        const prompt_ids_buf = try allocator.alloc(u32, max_seq_len);
+        errdefer allocator.free(prompt_ids_buf);
+        const p_res = try allocator.alloc(f32, cfg.vocab_size);
+        errdefer allocator.free(p_res);
+
+        var stop_tokens: [4]u32 = @splat(0);
+        var stop_cnt: usize = 0;
+        const candidates = [_]?u32{
+            cfg.eos_token_id,
+            tok.addedTokenId("<|im_end|>"),
+            tok.addedTokenId("<|endoftext|>"),
+        };
+        for (candidates) |maybe_id| {
+            const id = maybe_id orelse continue;
+            var dup = false;
+            for (stop_tokens[0..stop_cnt]) |existing| {
+                if (existing == id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup and stop_cnt < stop_tokens.len) {
+                stop_tokens[stop_cnt] = id;
+                stop_cnt += 1;
+            }
+        }
+
+        return .{
+            .model = model,
+            .spec_engine = spec_engine,
+            .tok = tok,
+            .cfg = cfg,
+            .max_seq_len = max_seq_len,
+            .stop_tokens = stop_tokens,
+            .stop_token_count = stop_cnt,
+            .encode_scratch = encode_scratch,
+            .prompt_ids_buf = prompt_ids_buf,
+            .p_res = p_res,
+            .round_buf = @splat(0),
+        };
+    }
+
+    fn deinit(self: *ServeRunner, allocator: std.mem.Allocator) void {
+        allocator.free(self.p_res);
+        allocator.free(self.prompt_ids_buf);
+        self.encode_scratch.deinit(allocator);
+    }
+
+    inline fn isStopToken(self: *const ServeRunner, tid: u32) bool {
+        for (self.stop_tokens[0..self.stop_token_count]) |st| {
+            if (tid == st) return true;
+        }
+        return false;
+    }
+
+    fn emitToken(
+        self: *const ServeRunner,
+        stream: *aminfer.server.TokenStream,
+        tid: u32,
+        ignore_eos: bool,
+    ) EmitResult {
+        if (!ignore_eos and self.isStopToken(tid)) return .stop;
+        if (self.tok.isSpecialToken(tid)) return .ok;
+        const piece = self.tok.tokenBytes(tid) catch return .ok;
+        if (!stream.emitTokenBytes(piece)) return .cancelled;
+        return .ok;
+    }
+
+    fn handler(self: *ServeRunner) aminfer.server.EngineHandler {
+        return .{
+            .ctx = self,
+            .generateFn = generateCallback,
+        };
+    }
+
+    fn generateCallback(
+        ctx: *anyopaque,
+        job: *const aminfer.server.InferenceJob,
+        stream: *aminfer.server.TokenStream,
+    ) void {
+        const self: *ServeRunner = @ptrCast(@alignCast(ctx));
+        self.generate(job, stream);
+    }
+
+    fn generate(
+        self: *ServeRunner,
+        job: *const aminfer.server.InferenceJob,
+        stream: *aminfer.server.TokenStream,
+    ) void {
+        var prompt_ids = self.tok.encodeWithScratch(
+            &self.encode_scratch,
+            job.prompt,
+            self.prompt_ids_buf,
+        ) catch {
+            stream.fail("prompt exceeds max_seq_len or tokenizer scratch");
+            return;
+        };
+        if (prompt_ids.len == 0) {
+            self.prompt_ids_buf[0] = self.cfg.bos_token_id orelse 0;
+            prompt_ids = self.prompt_ids_buf[0..1];
+        }
+        if (prompt_ids.len + 1 >= self.max_seq_len) {
+            stream.fail("prompt exceeds max_seq_len");
+            return;
+        }
+        const prompt_len_u32: u32 = @intCast(prompt_ids.len);
+        const room: u32 = self.max_seq_len - prompt_len_u32 - 1;
+        const max_gen: u32 = @min(job.max_tokens, room);
+        if (max_gen == 0) {
+            if (!stream.setPromptTokens(prompt_len_u32)) return;
+            stream.finish(.length, prompt_len_u32);
+            return;
+        }
+
+        if (self.spec_engine) |eng| {
+            eng.reset();
+            eng.config.temperature = job.temperature;
+            const rng_opt: ?std.Random = if (job.temperature > 0.0) job.rng.random() else null;
+            const first_tok = eng.prefill(prompt_ids, rng_opt) catch {
+                stream.fail("speculative prefill failed");
+                return;
+            };
+            if (!stream.setPromptTokens(prompt_len_u32)) return;
+
+            switch (self.emitToken(stream, first_tok, job.ignore_eos)) {
+                .stop => {
+                    stream.finish(.stop, prompt_len_u32);
+                    return;
+                },
+                .cancelled => return,
+                .ok => {},
+            }
+            var emitted: u32 = 1;
+            while (emitted < max_gen and !stream.isCancelled()) {
+                const rem: usize = max_gen - emitted;
+                const cap = @min(rem, self.round_buf.len);
+                const rs = eng.stepRound(rng_opt, self.round_buf[0..cap]) catch {
+                    stream.fail("speculative decode round failed");
+                    return;
+                };
+                for (self.round_buf[0..rs.emitted_count]) |tid| {
+                    switch (self.emitToken(stream, tid, job.ignore_eos)) {
+                        .stop => {
+                            stream.finish(.stop, prompt_len_u32);
+                            return;
+                        },
+                        .cancelled => return,
+                        .ok => {},
+                    }
+                    emitted += 1;
+                    if (emitted >= max_gen) break;
+                }
+            }
+            if (!stream.isCancelled()) {
+                stream.finish(.length, prompt_len_u32);
+            }
+            return;
+        }
+
+        // Direct non-speculative `Qwen3Model` decode path.
+        self.model.seq_len = 0;
+        var next_tok = self.model.prefillPrompt(prompt_ids, true) catch {
+            stream.fail("prefill failed");
+            return;
+        };
+        if (job.temperature > 0.0) {
+            next_tok = self.model.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                stream.fail("sampling failed");
+                return;
+            };
+        }
+        if (!stream.setPromptTokens(prompt_len_u32)) return;
+
+        switch (self.emitToken(stream, next_tok, job.ignore_eos)) {
+            .stop => {
+                stream.finish(.stop, prompt_len_u32);
+                return;
+            },
+            .cancelled => return,
+            .ok => {},
+        }
+        var pos: u32 = prompt_len_u32;
+        var emitted: u32 = 1;
+        while (emitted < max_gen and !stream.isCancelled()) {
+            next_tok = self.model.stepDecode(next_tok, pos) catch {
+                stream.fail("decode step failed");
+                return;
+            };
+            if (job.temperature > 0.0) {
+                next_tok = self.model.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                    stream.fail("sampling failed");
+                    return;
+                };
+            }
+            pos += 1;
+            switch (self.emitToken(stream, next_tok, job.ignore_eos)) {
+                .stop => {
+                    stream.finish(.stop, prompt_len_u32);
+                    return;
+                },
+                .cancelled => return,
+                .ok => {},
+            }
+            emitted += 1;
+        }
+        if (!stream.isCancelled()) {
+            stream.finish(.length, prompt_len_u32);
+        }
+    }
+};
+
+fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseServeArgs(raw_args);
+    const host_ipv4 = try aminfer.server.parseIpv4(cli.host);
+
+    const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
+    defer allocator.free(cfg_bytes);
+    const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
+
+    const heat_bytes: ?[]u8 = if (cli.heat_profile_path) |hp|
+        try readFileAllocPosix(allocator, hp, 16 * 1024 * 1024)
+    else
+        null;
+    defer if (heat_bytes) |hb| allocator.free(hb);
+
+    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
+    defer allocator.free(tok_bytes);
+    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
+    defer tok.deinit(allocator);
+
+    const use_spec = cli.draft_mode != null or cli.draft_amf_path != null or cli.ngram_nvme_path != null;
+    var draft_cfg_opt: ?aminfer.draft.DraftConfig = null;
+    var small_draft_cfg_opt: ?aminfer.qwen3.ModelConfig = null;
+    var mode: aminfer.draft.DraftMode = cli.draft_mode orelse .l1_only;
+
+    if (cli.draft_config_path) |dc_path| {
+        const dcfg_bytes = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
+        defer allocator.free(dcfg_bytes);
+        if (cli.draft_mode == .small_draft) {
+            small_draft_cfg_opt = try aminfer.qwen3.ModelConfig.fromJson(allocator, dcfg_bytes);
+            mode = .small_draft;
+        } else if (cli.draft_mode == null) {
+            if (aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes)) |dc| {
+                draft_cfg_opt = dc;
+                mode = dc.format;
+            } else |err| switch (err) {
+                error.UnsupportedFormat => {
+                    small_draft_cfg_opt = try aminfer.qwen3.ModelConfig.fromJson(allocator, dcfg_bytes);
+                    mode = .small_draft;
+                },
+                else => return err,
+            }
+        } else {
+            draft_cfg_opt = try aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes);
+            draft_cfg_opt.?.format = mode;
+        }
+    }
+
+    if (use_spec) {
+        if (mode == .small_draft) {
+            if (cli.draft_amf_path == null or small_draft_cfg_opt == null) return error.MissingRequiredFlag;
+        } else if (mode != .l1_only) {
+            if (cli.draft_amf_path == null or draft_cfg_opt == null) return error.MissingRequiredFlag;
+            draft_cfg_opt.?.format = mode;
+        }
+    }
+
+    const max_seq_len: u32 = @min(cfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
+    const target_tree_cap: u32 = if (!use_spec)
+        1
+    else if (cli.enable_pruning)
+        @min(@as(u32, aminfer.engine.MAX_TREE_NODES), @max(@as(u32, cli.max_tree_nodes) * 2, 24))
+    else
+        @as(u32, cli.max_tree_nodes);
+
+    const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
+    const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc| dc.aux_layer_ids else null;
+    const needs_taps = use_spec and mode != .l1_only and mode != .small_draft;
+
+    var model = try aminfer.qwen3.Qwen3Model.loadFromFile(allocator, cli.amf_path, cfg, .{
+        .max_seq_len = max_seq_len,
+        .max_tree_nodes = target_tree_cap,
+        .enable_feature_taps = needs_taps,
+        .aux_layer_ids = aux_ids,
+        .verify_crcs = cli.verify_crcs,
+        .budget_override = budget_override,
+        .cold_experts_per_layer = cli.cold_experts_per_layer,
+        .heat_profile_json = heat_bytes,
+        .cold_slot_count = cli.cold_slots,
+        .io_backend = cli.io_backend,
+        .enable_ane_predictor = cli.enable_ane_predictor,
+        .ane_predictor_path = cli.ane_predictor_path,
+        .prefill_mode = cli.prefill_mode,
+        .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
+        .sme_router_mode = cli.sme_router_mode,
+    });
+    defer model.deinit(allocator);
+
+    var draft_head_storage: aminfer.draft.DraftHead = undefined;
+    var draft_head_ptr: ?*aminfer.draft.DraftHead = null;
+    defer if (draft_head_ptr) |dh| dh.deinit(allocator, &model);
+
+    var small_draft_storage: aminfer.draft.SmallDraftModel = undefined;
+    var small_draft_ptr: ?*aminfer.draft.SmallDraftModel = null;
+    defer if (small_draft_ptr) |sd| sd.deinit(allocator);
+
+    var ngram_tbl_storage: aminfer.ngram_nvme.NvmeNgramTable = undefined;
+    var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
+    defer if (ngram_tbl_ptr) |nt| nt.deinit(allocator);
+    if (cli.ngram_nvme_path) |ang_path| {
+        ngram_tbl_storage = try aminfer.ngram_nvme.NvmeNgramTable.open(allocator, ang_path, .{
+            .cache_pages = cli.ngram_cache_pages,
+            .io_backend = cli.io_backend,
+            .budget_override = budget_override,
+        });
+        ngram_tbl_ptr = &ngram_tbl_storage;
+    }
+
+    var spec_eng_storage: aminfer.engine.SpecEngine = undefined;
+    var spec_eng_ptr: ?*aminfer.engine.SpecEngine = null;
+    defer if (spec_eng_ptr) |se| se.deinit(allocator);
+
+    if (use_spec) {
+        if (mode == .small_draft) {
+            small_draft_storage = try aminfer.draft.SmallDraftModel.loadFromFile(
+                allocator,
+                &model,
+                cli.draft_amf_path.?,
+                small_draft_cfg_opt.?,
+                .{
+                    .placement = cli.placement,
+                    .max_seq_len = max_seq_len,
+                    .max_tree_slots = target_tree_cap,
+                    .verify_crcs = cli.verify_crcs,
+                    .own_compute_queue = (cli.pearl_mode != .off),
+                },
+            );
+            small_draft_ptr = &small_draft_storage;
+        } else if (mode != .l1_only) {
+            draft_head_storage = try aminfer.draft.DraftHead.loadFromFile(
+                allocator,
+                &model,
+                cli.draft_amf_path.?,
+                draft_cfg_opt.?,
+                .{
+                    .placement = cli.placement,
+                    .max_seq_len = max_seq_len,
+                    .max_tree_slots = target_tree_cap,
+                    .verify_crcs = cli.verify_crcs,
+                },
+            );
+            draft_head_ptr = &draft_head_storage;
+        }
+
+        const spec_cfg: aminfer.engine.SpecConfig = .{
+            .mode = mode,
+            .placement = cli.placement,
+            .max_tree_nodes = cli.max_tree_nodes,
+            .max_draft_depth = cli.max_draft_depth,
+            .branch_width = cli.branch_width,
+            .top_k_per_node = cli.top_k,
+            .temperature = 0.0,
+            .enable_pruning = cli.enable_pruning,
+            .pearl_mode = cli.pearl_mode,
+            .pearl_min_target_us = cli.pearl_min_target_ms * 1000.0,
+            .ngram_table = ngram_tbl_ptr,
+        };
+        spec_eng_storage = if (small_draft_ptr) |sd|
+            try aminfer.engine.SpecEngine.initWithSmallDraft(allocator, &model, sd, spec_cfg)
+        else
+            try aminfer.engine.SpecEngine.init(allocator, &model, draft_head_ptr, spec_cfg);
+        spec_eng_ptr = &spec_eng_storage;
+    }
+
+    var runner = try ServeRunner.init(allocator, &model, spec_eng_ptr, &tok, cfg, max_seq_len);
+    defer runner.deinit(allocator);
+
+    const total_wired_bytes: u64 = (if (spec_eng_ptr) |se| se.totalWiredBytes() else model.totalWiredBytes()) +
+        (if (ngram_tbl_ptr) |nt| nt.totalWiredBytes() else 0);
+    const total_wired_mib: u64 = total_wired_bytes >> 20;
+    const model_id_str = cli.model_id orelse std.fs.path.stem(cli.amf_path);
+
+    const srv = try aminfer.server.Server.init(allocator, .{
+        .host = host_ipv4,
+        .port = cli.port,
+        .model_id = model_id_str,
+        .wired_mib = total_wired_mib,
+        .max_conns = cli.max_conns,
+        .max_active_requests = cli.max_active_requests,
+    });
+    defer srv.deinit(allocator);
+
+    g_active_serve_ptr.store(@intFromPtr(srv), .release);
+    defer g_active_serve_ptr.store(0, .release);
+
+    const sa = std.c.Sigaction{
+        .handler = .{ .handler = handleServeShutdownSignal },
+        .mask = std.mem.zeroes(std.c.sigset_t),
+        .flags = 0,
+    };
+    _ = std.c.sigaction(std.c.SIG.INT, &sa, null);
+    _ = std.c.sigaction(std.c.SIG.TERM, &sa, null);
+
+    const vm_before = try aminfer.vmstat.Snapshot.capture();
+    try srv.startNetworkThread();
+    defer srv.stop();
+
+    try out.print(
+        \\serve.status                     listening
+        \\serve.url                        http://{d}.{d}.{d}.{d}:{d}
+        \\serve.model_id                   {s}
+        \\serve.arch                       {s} ({s})
+        \\serve.spec_mode                  {s}
+        \\serve.pearl_mode                 {s} (enabled={s})
+        \\serve.ngram_nvme                 {s}
+        \\serve.wired_mib                  {d}
+        \\serve.max_conns                  {d}
+        \\serve.max_active_requests        {d}
+        \\serve.max_seq_len                {d}
+        \\
+    , .{
+        host_ipv4[0],
+        host_ipv4[1],
+        host_ipv4[2],
+        host_ipv4[3],
+        srv.boundPort(),
+        srv.modelId(),
+        cfg.arch.label(),
+        cfg.precisionLabel(),
+        if (use_spec) mode.label() else "none",
+        cli.pearl_mode.label(),
+        if (spec_eng_ptr) |se| (if (se.stats.pearl_enabled) "yes" else "no") else "no",
+        if (ngram_tbl_ptr != null) "on" else "off",
+        total_wired_mib,
+        cli.max_conns,
+        cli.max_active_requests,
+        max_seq_len,
+    });
+    try out.flush();
+
+    // Run inference worker loop on the main scheduler thread so Metal 4 / ANE
+    // contexts remain bound to a single deterministic thread.
+    srv.runWorkerLoop(runner.handler());
+    srv.stop();
+
+    const vm_after = try aminfer.vmstat.Snapshot.capture();
+    const st = srv.stats();
+    try out.print(
+        \\serve.status                     stopped
+        \\serve.total_requests             {d}
+        \\serve.rejected_503               {d}
+        \\serve.cancelled                  {d}
+        \\serve.swapouts_delta             {d}
+        \\
+    , .{
+        st.total_requests,
+        st.rejected_503_count,
+        st.cancelled_count,
+        aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+    });
+    try aminfer.vmstat.checkNoSwap(vm_before, vm_after);
 }
 
 fn verifyAmf(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) !void {
@@ -1617,4 +2480,55 @@ test "M4 CLI parsers handle cold-expert, prefill-mode, io-backend, bench-a2 and 
 
     try std.testing.expectError(error.InvalidIoBackend, parseIoBackend("uring"));
     try std.testing.expectError(error.InvalidPrefillMode, aminfer.qwen3.PrefillMode.parse("cpu"));
+}
+
+test "M5 CLI parsers handle --pearl, --ngram-nvme on spec-decode and aminfer serve flags" {
+    const spec = try parseSpecDecodeArgs(&.{
+        "--amf",                 "14b.amf",
+        "--config",              "14b.json",
+        "--tokenizer",           "tok.json",
+        "--draft-amf",           "0.6b.amf",
+        "--draft-config",        "0.6b.json",
+        "--draft-mode",          "small",
+        "--pearl",               "on",
+        "--pearl-min-target-ms", "35.5",
+        "--ngram-nvme",          "repo.ang",
+        "--ngram-cache-pages",   "64",
+    });
+    try std.testing.expectEqual(aminfer.engine.PearlMode.on, spec.pearl_mode);
+    try std.testing.expectApproxEqAbs(@as(f64, 35.5), spec.pearl_min_target_ms, 1e-6);
+    try std.testing.expectEqualStrings("repo.ang", spec.ngram_nvme_path.?);
+    try std.testing.expectEqual(@as(usize, 64), spec.ngram_cache_pages);
+
+    const srv = try parseServeArgs(&.{
+        "--amf",                 "0.6b.amf",
+        "--config",              "0.6b.json",
+        "--tokenizer",           "tok.json",
+        "--host",                "127.0.0.1",
+        "--port",                "0",
+        "--model-id",            "qwen3-0.6b",
+        "--max-seq-len",         "2048",
+        "--max-conns",           "16",
+        "--max-active-requests", "8",
+        "--draft-mode",          "l1",
+        "--pearl",               "auto",
+        "--ngram-nvme",          "repo.ang",
+    });
+    try std.testing.expectEqualStrings("0.6b.amf", srv.amf_path);
+    try std.testing.expectEqualStrings("127.0.0.1", srv.host);
+    try std.testing.expectEqual(@as(u16, 0), srv.port);
+    try std.testing.expectEqualStrings("qwen3-0.6b", srv.model_id.?);
+    try std.testing.expectEqual(@as(u32, 2048), srv.max_seq_len);
+    try std.testing.expectEqual(@as(usize, 16), srv.max_conns);
+    try std.testing.expectEqual(@as(usize, 8), srv.max_active_requests);
+    try std.testing.expectEqual(aminfer.draft.DraftMode.l1_only, srv.draft_mode.?);
+    try std.testing.expectEqual(aminfer.engine.PearlMode.auto, srv.pearl_mode);
+    try std.testing.expectEqualStrings("repo.ang", srv.ngram_nvme_path.?);
+
+    try std.testing.expectError(error.InvalidPearlMode, parseServeArgs(&.{
+        "--amf",       "0.6b.amf",
+        "--config",    "0.6b.json",
+        "--tokenizer", "tok.json",
+        "--pearl",     "always",
+    }));
 }

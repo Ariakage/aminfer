@@ -23,6 +23,8 @@ const wavefront = @import("../ane/wavefront.zig");
 const predictor_mod = @import("../ane/predictor.zig");
 const sme = @import("../cpu/sme.zig");
 const qos = @import("../platform/qos.zig");
+const ngram_nvme = @import("../spec/ngram_nvme.zig");
+const server_mod = @import("../server/http_sse.zig");
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -38,20 +40,23 @@ const Q2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
 pub const KernelKind = enum {
     gemv_q4,
     gemv_q3,
+    gemv_q2,
     gemm_q4,
     gemm_q3,
+    gemm_q2,
 
     pub fn bits(self: KernelKind) quant.QuantBits {
         return switch (self) {
             .gemv_q4, .gemm_q4 => .q4,
             .gemv_q3, .gemm_q3 => .q3,
+            .gemv_q2, .gemm_q2 => .q2,
         };
     }
 
     pub fn isGemv(self: KernelKind) bool {
         return switch (self) {
-            .gemv_q4, .gemv_q3 => true,
-            .gemm_q4, .gemm_q3 => false,
+            .gemv_q4, .gemv_q3, .gemv_q2 => true,
+            .gemm_q4, .gemm_q3, .gemm_q2 => false,
         };
     }
 
@@ -59,8 +64,10 @@ pub const KernelKind = enum {
         return switch (self) {
             .gemv_q4 => "gemv_q4",
             .gemv_q3 => "gemv_q3",
+            .gemv_q2 => "gemv_q2",
             .gemm_q4 => "gemm_q4",
             .gemm_q3 => "gemm_q3",
+            .gemm_q2 => "gemm_q2",
         };
     }
 };
@@ -4584,6 +4591,1283 @@ pub fn runM45(allocator: std.mem.Allocator) M45Error!M45Report {
     return runM45WithConfig(allocator, .{});
 }
 
+// ---------------------------------------------------------------------------
+// M5 Serving, Pipelining, C6 N-Gram & ADR-0017 GSQ+RCO Hybrid Quant Suite
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_M5_Q2_CASES = [_]Case{
+    .{ .kind = .gemv_q2, .m = 1, .n = 2048, .k = 2048 },
+    .{ .kind = .gemv_q2, .m = 1, .n = 6144, .k = 2048 },
+    .{ .kind = .gemv_q2, .m = 1, .n = 2048, .k = 768 },
+    .{ .kind = .gemv_q2, .m = 1, .n = 4096, .k = 4096 },
+    .{ .kind = .gemm_q2, .m = 16, .n = 2048, .k = 2048 },
+    .{ .kind = .gemm_q2, .m = 16, .n = 4096, .k = 4096 },
+    .{ .kind = .gemm_q2, .m = 64, .n = 2048, .k = 2048 },
+    .{ .kind = .gemm_q2, .m = 64, .n = 4096, .k = 4096 },
+};
+
+pub const M5Config = struct {
+    q2_cases: []const Case = &DEFAULT_M5_Q2_CASES,
+    q2_min_working_set_bytes: usize = 64 * 1024 * 1024,
+    q2_warmup_batches: u32 = 4,
+    q2_gemv_timed_batches: u32 = 8,
+    q2_gemv_dispatches_per_batch: u32 = 32,
+    q2_gemm_timed_batches: u32 = 4,
+    q2_gemm_dispatches_per_batch: u32 = 16,
+
+    hetero_moe_hidden: u32 = 2048,
+    hetero_moe_inter: u32 = 768,
+    hetero_moe_experts: u32 = 128,
+    hetero_moe_top_k: u32 = 8,
+    hetero_moe_shared_m8: u32 = 24,
+    hetero_moe_warmup_batches: u32 = 4,
+    hetero_moe_timed_batches: u32 = 8,
+    hetero_moe_dispatches_per_batch: u32 = 8,
+
+    ngram_temp_dir: []const u8 = "/Volumes/Akari/.tmp",
+    ngram_buckets: u32 = 256,
+    ngram_entries_per_bucket: u32 = 4,
+    ngram_cache_pages: usize = 32,
+    ngram_cold_queries: usize = 64,
+    ngram_cache_queries: usize = 256,
+
+    pearl_layers: u32 = 4,
+    pearl_hidden: u32 = 512,
+    pearl_inter: u32 = 1536,
+    pearl_vocab: u32 = 256,
+    pearl_gen_tokens: usize = 20,
+
+    server_health_iters: usize = 64,
+    server_steady_iters: usize = 16,
+    server_concurrent_clients: usize = 8,
+    server_tokens_per_req: u32 = 16,
+
+    timeout_ms: u64 = 30_000,
+};
+
+pub const HeteroMoeRow = struct {
+    label: []const u8,
+    m: u32,
+    num_experts: u32,
+    top_k: u32,
+    unique_experts: u32,
+    active_buckets: u32,
+    bytes_per_disp: u64,
+    latency_us: f64,
+    effective_gbs: f64,
+    bus_pct: f64,
+    vs_q4_bytes_pct: f64,
+};
+
+pub const NgramBenchResult = struct {
+    file_bytes: u64,
+    num_buckets: u32,
+    total_entries: u64,
+    wired_kib: u64,
+    cold_nvme_p50_us: f64,
+    cold_nvme_p99_us: f64,
+    cache_hit_p50_us: f64,
+    prefetch_hit_p50_us: f64,
+    queries: u64,
+    hits: u64,
+    seed_hits: u64,
+    nvme_reads: u64,
+};
+
+pub const PearlSynthBenchResult = struct {
+    has_own_queue: bool,
+    bit_exact_off: bool,
+    bit_exact_on: bool,
+    base_tok_per_s: f64,
+    off_tok_per_s: f64,
+    on_tok_per_s: f64,
+    mean_accept_len: f64,
+    pearl_rounds: u64,
+    pearl_hits: u64,
+    pearl_rollbacks: u64,
+    pearl_saved_ms: f64,
+};
+
+pub const ServerBenchResult = struct {
+    health_p50_us: f64,
+    single_ttft_p50_us: f64,
+    single_e2e_p50_us: f64,
+    concurrent_clients: u32,
+    concurrent_ttft_p50_us: f64,
+    concurrent_ttft_p99_us: f64,
+    concurrent_tok_per_s: f64,
+    steady_malloc_blocks_delta: i64,
+    steady_malloc_bytes_delta: i64,
+    all_ok: bool,
+};
+
+pub const M5Report = struct {
+    q2_cases: []CaseResult,
+    hetero_moe_rows: [8]HeteroMoeRow,
+    ngram: NgramBenchResult,
+    pearl: PearlSynthBenchResult,
+    server: ServerBenchResult,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn deinit(self: *M5Report, allocator: std.mem.Allocator) void {
+        allocator.free(self.q2_cases);
+        self.q2_cases = &.{};
+    }
+
+    pub fn write(self: *const M5Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\=== M5 Serving, Pipelining, C6 NVMe N-Gram & ADR-0017 GSQ+RCO Hybrid Quant Suite ===
+            \\
+            \\--- G13 Metal 4 q2_affine Kernel Bandwidth Calibration ---
+            \\kernel    shape              bytes/disp   slots   latency(us)   beta(GB/s)   bus(%)
+            \\
+        , .{});
+        for (self.q2_cases) |res| {
+            var shape_buf: [40]u8 = undefined;
+            const shape = std.fmt.bufPrint(&shape_buf, "{d}x{d}x{d}", .{
+                res.case.m,
+                res.case.n,
+                res.case.k,
+            }) catch unreachable;
+            try out.print(
+                \\{s: <9} {s: <18} {d: >10}   {d: >5}   {d: >11.2}   {d: >10.2}   {d: >6.1}
+                \\
+            , .{
+                res.case.kind.label(),
+                shape,
+                res.bytes_per_dispatch,
+                res.weight_slots,
+                res.latencyUs(),
+                res.effectiveBandwidthGbs(),
+                res.busUtilizationPct(),
+            });
+        }
+
+        try out.print(
+            \\
+            \\--- G13 Scheme-Bucketed Heterogeneous MoE ({{q2, q3, q4}}) vs Uniform CSR Gather ---
+            \\profile          m    E    k   U    bkts    bytes/disp   vs_q4(%)   latency(us)   beta(GB/s)   bus(%)
+            \\
+        , .{});
+        for (self.hetero_moe_rows) |row| {
+            try out.print(
+                \\{s: <16} {d: <4} {d: <4} {d: <3} {d: <4} {d: <7} {d: >10}   {d: >8.1}   {d: >11.2}   {d: >10.2}   {d: >6.1}
+                \\
+            , .{
+                row.label,
+                row.m,
+                row.num_experts,
+                row.top_k,
+                row.unique_experts,
+                row.active_buckets,
+                row.bytes_per_disp,
+                row.vs_q4_bytes_pct,
+                row.latency_us,
+                row.effective_gbs,
+                row.bus_pct,
+            });
+        }
+
+        try out.print(
+            \\
+            \\--- C6 F_NOCACHE NVMe .ang N-Gram Lookup Latency ---
+            \\ngram.file_bytes                 {d}
+            \\ngram.buckets                    {d}
+            \\ngram.total_entries              {d}
+            \\ngram.wired_cache_kib            {d}
+            \\ngram.cold_nvme_p50_us           {d:.2}
+            \\ngram.cold_nvme_p99_us           {d:.2}
+            \\ngram.cache_hit_p50_us           {d:.2}
+            \\ngram.prefetch_hit_p50_us        {d:.2}
+            \\ngram.queries                    {d}
+            \\ngram.hits                       {d}
+            \\ngram.seed_hits                  {d}
+            \\ngram.nvme_reads                 {d}
+            \\
+            \\--- D8 PEARL Async Pipelined Small-Draft Synthetic Parity & Overlap ---
+            \\pearl_synth.own_compute_queue    {s}
+            \\pearl_synth.bit_exact_off        {s}
+            \\pearl_synth.bit_exact_on         {s}
+            \\pearl_synth.base_tok_per_s       {d:.2}
+            \\pearl_synth.off_tok_per_s        {d:.2}
+            \\pearl_synth.on_tok_per_s         {d:.2}
+            \\pearl_synth.mean_accept_len      {d:.3}
+            \\pearl_synth.pearl_rounds         {d}
+            \\pearl_synth.pearl_hits           {d}
+            \\pearl_synth.pearl_rollbacks      {d}
+            \\pearl_synth.pearl_saved_ms       {d:.3}
+            \\
+        , .{
+            self.ngram.file_bytes,
+            self.ngram.num_buckets,
+            self.ngram.total_entries,
+            self.ngram.wired_kib,
+            self.ngram.cold_nvme_p50_us,
+            self.ngram.cold_nvme_p99_us,
+            self.ngram.cache_hit_p50_us,
+            self.ngram.prefetch_hit_p50_us,
+            self.ngram.queries,
+            self.ngram.hits,
+            self.ngram.seed_hits,
+            self.ngram.nvme_reads,
+            if (self.pearl.has_own_queue) "yes" else "no",
+            if (self.pearl.bit_exact_off) "yes" else "no",
+            if (self.pearl.bit_exact_on) "yes" else "no",
+            self.pearl.base_tok_per_s,
+            self.pearl.off_tok_per_s,
+            self.pearl.on_tok_per_s,
+            self.pearl.mean_accept_len,
+            self.pearl.pearl_rounds,
+            self.pearl.pearl_hits,
+            self.pearl.pearl_rollbacks,
+            self.pearl.pearl_saved_ms,
+        });
+        try out.print(
+            \\
+            \\--- C7 + C8 kqueue HTTP/1.1 + SSE Server Loopback Microbenchmark ---
+            \\server.health_p50_us             {d:.2}
+            \\server.single_ttft_p50_us        {d:.2}
+            \\server.single_e2e_p50_us         {d:.2}
+            \\server.concurrent_clients        {d}
+            \\server.concurrent_ttft_p50_us    {d:.2}
+            \\server.concurrent_ttft_p99_us    {d:.2}
+            \\server.concurrent_tok_per_s      {d:.1}
+            \\server.steady_malloc_blocks      {d}
+            \\server.steady_malloc_bytes       {d}
+            \\server.all_ok                    {s}
+            \\
+            \\M5 Swap Check
+            \\m5.swap.status                   ok
+            \\m5.swap.swapouts_delta           {d}
+            \\m5.swap.pageouts_delta           {d}
+            \\
+        , .{
+            self.server.health_p50_us,
+            self.server.single_ttft_p50_us,
+            self.server.single_e2e_p50_us,
+            self.server.concurrent_clients,
+            self.server.concurrent_ttft_p50_us,
+            self.server.concurrent_ttft_p99_us,
+            self.server.concurrent_tok_per_s,
+            self.server.steady_malloc_blocks_delta,
+            self.server.steady_malloc_bytes_delta,
+            if (self.server.all_ok) "yes" else "no",
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+pub const M5Error = Error || moe.WorkspaceError || moe.EncodeError ||
+    ngram_nvme.BuildError || ngram_nvme.OpenError || ngram_nvme.QueryError ||
+    qwen3.LoadError || qwen3.StepError || draft_mod.DraftLoadError ||
+    engine_mod.InitError || engine_mod.RunError || server_mod.Error ||
+    error{ LoopbackFailed, PathTooLong, BenchParityFailed };
+
+fn percentileF64(samples: []f64, pct: f64) f64 {
+    if (samples.len == 0) return 0.0;
+    std.sort.pdq(f64, samples, {}, std.sort.asc(f64));
+    const clamped = std.math.clamp(pct, 0.0, 1.0);
+    const idx: usize = @intFromFloat(@floor(clamped * @as(f64, @floatFromInt(samples.len - 1))));
+    return samples[@min(idx, samples.len - 1)];
+}
+
+fn runM5Q2Calibration(allocator: std.mem.Allocator, config: M5Config) M5Error![]CaseResult {
+    var max_w_stride: usize = 64;
+    var max_sb_stride: usize = 64;
+    var max_x_bytes: usize = 64;
+    var max_y_bytes: usize = 64;
+    for (config.q2_cases) |case| {
+        const layout = try computeCaseLayout(case);
+        max_w_stride = @max(max_w_stride, amf.align64(layout.w_bytes));
+        max_sb_stride = @max(max_sb_stride, amf.align64(layout.sb_bytes));
+        max_x_bytes = @max(max_x_bytes, amf.align64(layout.x_bytes));
+        max_y_bytes = @max(max_y_bytes, amf.align64(layout.y_bytes));
+    }
+
+    const qweight_pool_bytes = amf.align64(@max(max_w_stride, config.q2_min_working_set_bytes));
+    const sb_pool_bytes = amf.align64(@max(max_sb_stride, config.q2_min_working_set_bytes / 4));
+    const raw_arena_bytes = qweight_pool_bytes + sb_pool_bytes + max_x_bytes + max_y_bytes + 4 * page.APPLE_PAGE_SIZE;
+    const arena_bytes = try page.alignUp(raw_arena_bytes);
+
+    const facts = try sysinfo.Facts.read();
+    const device = try metal.Device.open();
+    defer device.close();
+    const info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, info, .{});
+
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try dequant.DequantPipelines.init(device, library);
+    defer pipes.close();
+
+    var arena = try arena_mod.WiredArena.init(arena_bytes, wired_budget);
+    defer arena.deinit();
+
+    const qweight_pool = try arena.allocAligned(qweight_pool_bytes, 64);
+    const sb_pool_raw = try arena.allocAligned(sb_pool_bytes, 64);
+    const x_raw = try arena.allocAligned(max_x_bytes, 64);
+    const y_raw = try arena.allocAligned(max_y_bytes, 64);
+    fillBenchBuffers(qweight_pool, sb_pool_raw, x_raw, y_raw);
+
+    const qweight_base_off: u64 = arena.offsetOf(qweight_pool.ptr);
+    const sb_base_off: u64 = arena.offsetOf(sb_pool_raw.ptr);
+    const x_off: u64 = arena.offsetOf(x_raw.ptr);
+    const y_off: u64 = arena.offsetOf(y_raw.ptr);
+    const y_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, y_raw));
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const results = try allocator.alloc(CaseResult, config.q2_cases.len);
+    errdefer allocator.free(results);
+
+    for (config.q2_cases, 0..) |case, case_idx| {
+        const layout = try computeCaseLayout(case);
+        const w_stride = amf.align64(layout.w_bytes);
+        const sb_stride = amf.align64(layout.sb_bytes);
+        const num_slots: usize = @max(
+            @as(usize, 1),
+            @min(qweight_pool_bytes / w_stride, sb_pool_bytes / sb_stride),
+        );
+        const timed_batches = if (case.kind.isGemv()) config.q2_gemv_timed_batches else config.q2_gemm_timed_batches;
+        const disps_per_batch = if (case.kind.isGemv()) config.q2_gemv_dispatches_per_batch else config.q2_gemm_dispatches_per_batch;
+
+        var slot_cursor: usize = 0;
+        var warmup_sig: u64 = 0;
+        for (0..config.q2_warmup_batches) |_| {
+            var frame = try compute.beginFrame(config.timeout_ms);
+            errdefer frame.abort();
+            for (0..disps_per_batch) |d| {
+                const slot = slot_cursor % num_slots;
+                slot_cursor += 1;
+                try encodeCase(
+                    pipes,
+                    &frame,
+                    case,
+                    gpu_buf,
+                    x_off,
+                    qweight_base_off + @as(u64, slot) * w_stride,
+                    sb_base_off + @as(u64, slot) * sb_stride,
+                    y_off,
+                    d > 0,
+                );
+            }
+            warmup_sig = try frame.commit();
+        }
+        try compute.wait(warmup_sig, config.timeout_ms);
+
+        var last_sig: u64 = 0;
+        const t0 = try vmstat.nowNs();
+        for (0..timed_batches) |_| {
+            var frame = try compute.beginFrame(config.timeout_ms);
+            errdefer frame.abort();
+            for (0..disps_per_batch) |d| {
+                const slot = slot_cursor % num_slots;
+                slot_cursor += 1;
+                try encodeCase(
+                    pipes,
+                    &frame,
+                    case,
+                    gpu_buf,
+                    x_off,
+                    qweight_base_off + @as(u64, slot) * w_stride,
+                    sb_base_off + @as(u64, slot) * sb_stride,
+                    y_off,
+                    d > 0,
+                );
+            }
+            last_sig = try frame.commit();
+        }
+        try compute.wait(last_sig, config.timeout_ms);
+        const t1 = try vmstat.nowNs();
+
+        const y_count: usize = @as(usize, case.m) * case.n;
+        if (!std.math.isFinite(y_f16[0]) or !std.math.isFinite(y_f16[y_count - 1])) {
+            return error.NonFiniteOutput;
+        }
+        results[case_idx] = .{
+            .case = case,
+            .bytes_per_dispatch = layout.bytes_per_dispatch,
+            .dispatches = @as(u64, timed_batches) * disps_per_batch,
+            .weight_slots = num_slots,
+            .elapsed_ns = t1 - t0,
+        };
+    }
+
+    return results;
+}
+
+fn runM5HeteroMoeBench(config: M5Config) M5Error![8]HeteroMoeRow {
+    const facts = try sysinfo.Facts.read();
+    const device = try metal.Device.open();
+    defer device.close();
+    const info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, info, .{});
+
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try moe.MoePipelines.init(device, library);
+    defer pipes.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+
+    const Profile = enum { uniform_q4, uniform_q3, uniform_q2, hetero_q2_q3_q4 };
+    const profiles = [_]Profile{ .uniform_q4, .uniform_q3, .uniform_q2, .hetero_q2_q3_q4 };
+    const m_vals = [_]u32{ 1, 8 };
+
+    const hidden = config.hetero_moe_hidden;
+    const inter = config.hetero_moe_inter;
+    const n_exp = config.hetero_moe_experts;
+    const top_k = config.hetero_moe_top_k;
+
+    var rows: [8]HeteroMoeRow = undefined;
+    var row_idx: usize = 0;
+
+    for (m_vals) |m| {
+        const shared_pool: u32 = if (m == 1) top_k else @min(n_exp, @max(top_k, config.hetero_moe_shared_m8));
+        var q4_ref_bytes: u64 = 1;
+
+        for (profiles) |prof| {
+            var schemes: [moe.MAX_EXPERTS]quant.WeightDType = @splat(.q4_affine);
+            var scheme_counts: [moe.NUM_SCHEME_BUCKETS]u32 = @splat(0);
+            for (0..n_exp) |e| {
+                const dt: quant.WeightDType = switch (prof) {
+                    .uniform_q4 => .q4_affine,
+                    .uniform_q3 => .q3_affine,
+                    .uniform_q2 => .q2_affine,
+                    // 25% q4_affine (hot), 25% q3_affine (mid), 50% q2_affine (cold/low-sens)
+                    .hetero_q2_q3_q4 => switch (e & 3) {
+                        0 => .q4_affine,
+                        1 => .q3_affine,
+                        else => .q2_affine,
+                    },
+                };
+                schemes[e] = dt;
+                scheme_counts[@backingInt(dt)] += 1;
+            }
+            var active_buckets: u32 = 0;
+            for (scheme_counts) |c| {
+                if (c > 0) active_buckets += 1;
+            }
+
+            // Compute exact arena layout per expert.
+            var all_experts_bytes: usize = 0;
+            for (0..n_exp) |e| {
+                const bits: quant.QuantBits = switch (schemes[e]) {
+                    .q4_affine => .q4,
+                    .q3_affine => .q3,
+                    .q2_affine => .q2,
+                    else => unreachable,
+                };
+                const gu_w, const gu_sb, const dn_w, const dn_sb = switch (bits) {
+                    .q4 => .{
+                        try Q4.packedWeightBytes(inter, hidden),
+                        try Q4.scaleBiasBytes(inter, hidden),
+                        try Q4.packedWeightBytes(hidden, inter),
+                        try Q4.scaleBiasBytes(hidden, inter),
+                    },
+                    .q3 => .{
+                        try Q3.packedWeightBytes(inter, hidden),
+                        try Q3.scaleBiasBytes(inter, hidden),
+                        try Q3.packedWeightBytes(hidden, inter),
+                        try Q3.scaleBiasBytes(hidden, inter),
+                    },
+                    .q2 => .{
+                        try Q2.packedWeightBytes(inter, hidden),
+                        try Q2.scaleBiasBytes(inter, hidden),
+                        try Q2.packedWeightBytes(hidden, inter),
+                        try Q2.scaleBiasBytes(hidden, inter),
+                    },
+                };
+                all_experts_bytes += 2 * (amf.align64(gu_w) + amf.align64(gu_sb)) +
+                    amf.align64(dn_w) + amf.align64(dn_sb);
+            }
+
+            const num_banks: usize = @max(@as(usize, 1), @as(usize, n_exp) / shared_pool);
+            const bank_logits_bytes = amf.align64(@as(usize, m) * n_exp * @sizeOf(f32));
+            const all_logits_bytes = num_banks * bank_logits_bytes;
+            const x_bytes = amf.align64(@as(usize, m) * hidden * @sizeOf(f16));
+            const out_bytes = x_bytes;
+            const tbl_bytes = amf.align64(@as(usize, n_exp) * @sizeOf(moe.ExpertWeights));
+            const schemes_bytes = amf.align64(n_exp);
+            const ws_bytes = try moe.MoeWorkspace.requiredBytes(.{
+                .max_tokens = m,
+                .num_experts = n_exp,
+                .top_k = top_k,
+                .hidden_size = hidden,
+                .intermediate_size = inter,
+            });
+            const arena_cap = try page.alignUp(
+                all_experts_bytes + all_logits_bytes + x_bytes + out_bytes + tbl_bytes + schemes_bytes + ws_bytes + 8 * page.APPLE_PAGE_SIZE,
+            );
+
+            var arena = try arena_mod.WiredArena.init(arena_cap, wired_budget);
+            defer arena.deinit();
+
+            const weights_raw = try arena.allocAligned(all_experts_bytes, 64);
+            const logits_raw = try arena.allocAligned(all_logits_bytes, 64);
+            const x_raw = try arena.allocAligned(x_bytes, 64);
+            const out_raw = try arena.allocAligned(out_bytes, 64);
+            const tbl_raw = try arena.allocAligned(tbl_bytes, 64);
+            const schemes_raw = try arena.allocAligned(schemes_bytes, 64);
+            const ws = try moe.MoeWorkspace.init(&arena, .{
+                .max_tokens = m,
+                .num_experts = n_exp,
+                .top_k = top_k,
+                .hidden_size = hidden,
+                .intermediate_size = inter,
+            });
+
+            for (0..n_exp) |e| {
+                schemes_raw[e] = @backingInt(schemes[e]);
+            }
+
+            const exp_tbl: []moe.ExpertWeights = @alignCast(std.mem.bytesAsSlice(moe.ExpertWeights, tbl_raw));
+            var rng: u64 = 0x517C_C1B7_2722_0A95 +% row_idx;
+            const sb_val: quant.ScaleBias = .{ .scale = @floatCast(0.015625), .bias = @floatCast(-0.0625) };
+            var cursor: usize = 0;
+            for (0..n_exp) |e| {
+                const bits: quant.QuantBits = switch (schemes[e]) {
+                    .q4_affine => .q4,
+                    .q3_affine => .q3,
+                    .q2_affine => .q2,
+                    else => unreachable,
+                };
+                const gu_w, const gu_sb, const dn_w, const dn_sb = switch (bits) {
+                    .q4 => .{
+                        try Q4.packedWeightBytes(inter, hidden),
+                        try Q4.scaleBiasBytes(inter, hidden),
+                        try Q4.packedWeightBytes(hidden, inter),
+                        try Q4.scaleBiasBytes(hidden, inter),
+                    },
+                    .q3 => .{
+                        try Q3.packedWeightBytes(inter, hidden),
+                        try Q3.scaleBiasBytes(inter, hidden),
+                        try Q3.packedWeightBytes(hidden, inter),
+                        try Q3.scaleBiasBytes(hidden, inter),
+                    },
+                    .q2 => .{
+                        try Q2.packedWeightBytes(inter, hidden),
+                        try Q2.scaleBiasBytes(inter, hidden),
+                        try Q2.packedWeightBytes(hidden, inter),
+                        try Q2.scaleBiasBytes(hidden, inter),
+                    },
+                };
+                const g_w = cursor;
+                cursor += amf.align64(gu_w);
+                const g_sb = cursor;
+                cursor += amf.align64(gu_sb);
+                const u_w = cursor;
+                cursor += amf.align64(gu_w);
+                const u_sb = cursor;
+                cursor += amf.align64(gu_sb);
+                const d_w = cursor;
+                cursor += amf.align64(dn_w);
+                const d_sb = cursor;
+                cursor += amf.align64(dn_sb);
+
+                for ([_]struct { off: usize, len: usize }{
+                    .{ .off = g_w, .len = gu_w },
+                    .{ .off = u_w, .len = gu_w },
+                    .{ .off = d_w, .len = dn_w },
+                }) |seg| {
+                    const words: []u64 = @alignCast(std.mem.bytesAsSlice(u64, weights_raw[seg.off .. seg.off + (seg.len & ~@as(usize, 7))]));
+                    for (words) |*w| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        w.* = rng;
+                    }
+                }
+                for ([_]struct { off: usize, len: usize }{
+                    .{ .off = g_sb, .len = gu_sb },
+                    .{ .off = u_sb, .len = gu_sb },
+                    .{ .off = d_sb, .len = dn_sb },
+                }) |seg| {
+                    const sbs: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, weights_raw[seg.off .. seg.off + seg.len]));
+                    for (sbs) |*sb| sb.* = sb_val;
+                }
+                exp_tbl[e] = .{
+                    .gate_qweight_offset = g_w,
+                    .gate_sb_offset = g_sb,
+                    .up_qweight_offset = u_w,
+                    .up_sb_offset = u_sb,
+                    .down_qweight_offset = d_w,
+                    .down_sb_offset = d_sb,
+                };
+            }
+
+            const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+            for (x_f16, 0..) |*v, i| {
+                const c: i32 = @as(i32, @intCast((i * 7 + 3) % 15)) - 7;
+                v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.03125);
+            }
+            @memset(out_raw, 0);
+
+            // Build rotating router-logit banks activating `shared_pool` unique experts per bank.
+            var bank0_unique_bytes: u64 = 0;
+            var bank0_unique_count: u32 = 0;
+            for (0..num_banks) |bank| {
+                const bank_slice = logits_raw[bank * bank_logits_bytes ..][0 .. @as(usize, m) * n_exp * @sizeOf(f32)];
+                const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, bank_slice));
+                for (logits_f32) |*v| v.* = -8.0;
+
+                const base_e: u32 = @intCast((bank * shared_pool) % n_exp);
+                const stride: u32 = if (m > 1 and shared_pool > top_k)
+                    @max(@as(u32, 1), (shared_pool - top_k + m - 2) / (m - 1))
+                else
+                    0;
+
+                var seen: [moe.MAX_EXPERTS]bool = @splat(false);
+                for (0..m) |tok| {
+                    const start = @min(@as(u32, @intCast(tok)) * stride, shared_pool - top_k);
+                    for (0..top_k) |j| {
+                        const e_id: usize = (base_e + start + @as(u32, @intCast(j))) % n_exp;
+                        logits_f32[tok * n_exp + e_id] = 4.0 - @as(f32, @floatFromInt(j)) * 0.1;
+                        seen[e_id] = true;
+                    }
+                }
+                if (bank == 0) {
+                    for (0..n_exp) |e| {
+                        if (seen[e]) {
+                            bank0_unique_count += 1;
+                            bank0_unique_bytes += try moe.singleExpertBytesForDType(schemes[e], hidden, inter);
+                        }
+                    }
+                }
+            }
+
+            const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+            defer gpu_buf.close();
+            try compute.makeResident(&.{gpu_buf});
+
+            const weights_base: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(weights_raw.ptr) };
+            const x_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) };
+            const out_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) };
+            const tbl_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(tbl_raw.ptr) };
+            const schemes_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(schemes_raw.ptr) };
+            const logits_base_off = arena.offsetOf(logits_raw.ptr);
+
+            var bank_cursor: usize = 0;
+            var warmup_sig: u64 = 0;
+            for (0..config.hetero_moe_warmup_batches) |_| {
+                var frame = try compute.beginFrame(config.timeout_ms);
+                errdefer frame.abort();
+                for (0..config.hetero_moe_dispatches_per_batch) |d| {
+                    const b = bank_cursor % num_banks;
+                    bank_cursor += 1;
+                    const base_args: moe.MoELayerArgs = .{
+                        .x = x_bind,
+                        .router = .{ .logits = .{ .binding = .{ .buffer = gpu_buf, .offset = logits_base_off + @as(u64, b) * bank_logits_bytes }, .dtype = .f32 } },
+                        .weights_base = weights_base,
+                        .expert_table = tbl_bind,
+                        .workspace = &ws,
+                        .workspace_buf = gpu_buf,
+                        .residual = null,
+                        .out = out_bind,
+                        .m = m,
+                        .num_experts = n_exp,
+                        .top_k = top_k,
+                        .hidden_size = hidden,
+                        .intermediate_size = inter,
+                        .norm_topk_prob = true,
+                    };
+                    switch (prof) {
+                        .uniform_q4 => try pipes.encodeMoELayer(&frame, .q4, base_args, d > 0),
+                        .uniform_q3 => try pipes.encodeMoELayer(&frame, .q3, base_args, d > 0),
+                        .uniform_q2 => try pipes.encodeMoELayer(&frame, .q2, base_args, d > 0),
+                        .hetero_q2_q3_q4 => try pipes.encodeMoELayerHetero(&frame, .{
+                            .base = base_args,
+                            .expert_schemes = schemes_bind,
+                            .scheme_counts = scheme_counts,
+                        }, d > 0),
+                    }
+                }
+                warmup_sig = try frame.commit();
+            }
+            try compute.wait(warmup_sig, config.timeout_ms);
+
+            var last_sig: u64 = 0;
+            const t0 = try vmstat.nowNs();
+            for (0..config.hetero_moe_timed_batches) |_| {
+                var frame = try compute.beginFrame(config.timeout_ms);
+                errdefer frame.abort();
+                for (0..config.hetero_moe_dispatches_per_batch) |d| {
+                    const b = bank_cursor % num_banks;
+                    bank_cursor += 1;
+                    const base_args: moe.MoELayerArgs = .{
+                        .x = x_bind,
+                        .router = .{ .logits = .{ .binding = .{ .buffer = gpu_buf, .offset = logits_base_off + @as(u64, b) * bank_logits_bytes }, .dtype = .f32 } },
+                        .weights_base = weights_base,
+                        .expert_table = tbl_bind,
+                        .workspace = &ws,
+                        .workspace_buf = gpu_buf,
+                        .residual = null,
+                        .out = out_bind,
+                        .m = m,
+                        .num_experts = n_exp,
+                        .top_k = top_k,
+                        .hidden_size = hidden,
+                        .intermediate_size = inter,
+                        .norm_topk_prob = true,
+                    };
+                    switch (prof) {
+                        .uniform_q4 => try pipes.encodeMoELayer(&frame, .q4, base_args, d > 0),
+                        .uniform_q3 => try pipes.encodeMoELayer(&frame, .q3, base_args, d > 0),
+                        .uniform_q2 => try pipes.encodeMoELayer(&frame, .q2, base_args, d > 0),
+                        .hetero_q2_q3_q4 => try pipes.encodeMoELayerHetero(&frame, .{
+                            .base = base_args,
+                            .expert_schemes = schemes_bind,
+                            .scheme_counts = scheme_counts,
+                        }, d > 0),
+                    }
+                }
+                last_sig = try frame.commit();
+            }
+            try compute.wait(last_sig, config.timeout_ms);
+            const t1 = try vmstat.nowNs();
+
+            const out_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw));
+            if (!std.math.isFinite(out_f16[0])) return error.NonFiniteOutput;
+
+            const act_bytes: u64 = @as(u64, m) * hidden * @sizeOf(f16) * 2 + @as(u64, m) * n_exp * @sizeOf(f32);
+            const bytes_per_disp: u64 = bank0_unique_bytes + act_bytes;
+            if (prof == .uniform_q4) q4_ref_bytes = bytes_per_disp;
+
+            const total_disps: u64 = @as(u64, config.hetero_moe_timed_batches) * config.hetero_moe_dispatches_per_batch;
+            const elapsed_ns: u64 = @max(t1 -| t0, 1);
+            const lat_us: f64 = (@as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(total_disps))) / 1000.0;
+            const eff_gbs: f64 = (@as(f64, @floatFromInt(bytes_per_disp)) * @as(f64, @floatFromInt(total_disps))) / @as(f64, @floatFromInt(elapsed_ns));
+
+            rows[row_idx] = .{
+                .label = switch (prof) {
+                    .uniform_q4 => "uniform_q4",
+                    .uniform_q3 => "uniform_q3",
+                    .uniform_q2 => "uniform_q2",
+                    .hetero_q2_q3_q4 => "hetero_q2_q3_q4",
+                },
+                .m = m,
+                .num_experts = n_exp,
+                .top_k = top_k,
+                .unique_experts = bank0_unique_count,
+                .active_buckets = active_buckets,
+                .bytes_per_disp = bytes_per_disp,
+                .latency_us = lat_us,
+                .effective_gbs = eff_gbs,
+                .bus_pct = (eff_gbs / M4_BUS_BANDWIDTH_GBS) * 100.0,
+                .vs_q4_bytes_pct = (@as(f64, @floatFromInt(bytes_per_disp)) / @as(f64, @floatFromInt(q4_ref_bytes)) - 1.0) * 100.0,
+            };
+            row_idx += 1;
+        }
+    }
+
+    return rows;
+}
+
+fn runM5NgramBench(allocator: std.mem.Allocator, config: M5Config) M5Error!NgramBenchResult {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const raw_path = std.fmt.bufPrint(
+        path_buf[0 .. path_buf.len - 1],
+        "{s}/aminfer_m5_ngram_bench_{d}.ang",
+        .{ config.ngram_temp_dir, @as(u64, @intCast(try vmstat.nowNs())) & 0xFFFF_FFFF },
+    ) catch return error.PathTooLong;
+    path_buf[raw_path.len] = 0;
+    const ang_path: [:0]const u8 = path_buf[0..raw_path.len :0];
+    defer _ = std.c.unlink(ang_path.ptr);
+
+    const total_n: usize = @as(usize, config.ngram_buckets) * config.ngram_entries_per_bucket;
+    const ctx_storage = try allocator.alloc([4]u32, total_n);
+    defer allocator.free(ctx_storage);
+    const cont_storage = try allocator.alloc([8]u32, total_n);
+    defer allocator.free(cont_storage);
+    const entries = try allocator.alloc(ngram_nvme.BuildEntry, total_n);
+    defer allocator.free(entries);
+
+    for (0..total_n) |i| {
+        const base: u32 = @intCast(1000 + i * 13);
+        ctx_storage[i] = .{ base, base + 1, base + 2, base + 3 };
+        cont_storage[i] = .{ base + 4, base + 5, base + 6, base + 7, base + 8, base + 9, base + 10, base + 11 };
+        entries[i] = .{
+            .ctx = &ctx_storage[i],
+            .cont = &cont_storage[i],
+            .hit_count = @intCast(100 - (i % 64)),
+            .step_prob = 0.92,
+        };
+    }
+
+    try ngram_nvme.writeTableFile(allocator, ang_path, entries, .{
+        .num_buckets = config.ngram_buckets,
+        .min_ngram = 2,
+        .max_ngram = 4,
+        .max_cont_len = 8,
+        .vocab_size = 151936,
+        .corpus_id = "m5-bench-ngram",
+        .include_table_crc = true,
+    });
+
+    const hdr = try ngram_nvme.verifyFile(allocator, ang_path);
+    var tbl = try ngram_nvme.NvmeNgramTable.open(allocator, ang_path, .{
+        .cache_pages = config.ngram_cache_pages,
+        .io_backend = .kqueue_aio,
+    });
+    defer tbl.deinit(allocator);
+
+    var out_cont: [ngram_nvme.MAX_CONT_LEN]u32 = undefined;
+
+    // 1. Cold F_NOCACHE NVMe queries (clearCache between bursts exceeding cache_pages).
+    const cold_n = @min(config.ngram_cold_queries, total_n);
+    const cold_samples = try allocator.alloc(f64, cold_n);
+    defer allocator.free(cold_samples);
+    try tbl.clearCache();
+    tbl.resetStats();
+
+    var cold_seen: usize = 0;
+    var scan_idx: usize = 0;
+    while (cold_seen < cold_n and scan_idx < total_n) : (scan_idx += 1) {
+        if ((cold_seen % @max(@as(usize, 1), config.ngram_cache_pages / 2)) == 0) {
+            try tbl.clearCache();
+        }
+        const t0 = try vmstat.nowNs();
+        const res = try tbl.query(&ctx_storage[scan_idx], &out_cont);
+        const t1 = try vmstat.nowNs();
+        if (!res.cache_hit and res.is_seed) {
+            cold_samples[cold_seen] = @as(f64, @floatFromInt(@max(t1 -| t0, 1))) / 1000.0;
+            cold_seen += 1;
+        }
+    }
+    const cold_p50 = percentileF64(cold_samples[0..cold_seen], 0.50);
+    const cold_p99 = percentileF64(cold_samples[0..cold_seen], 0.99);
+
+    // 2. Wired LRU cache-hit queries (warm 8 hot contexts, then query repeatedly).
+    const hot_n = @min(@as(usize, 8), total_n);
+    for (0..hot_n) |i| {
+        _ = try tbl.query(&ctx_storage[i], &out_cont);
+    }
+    const cache_samples = try allocator.alloc(f64, config.ngram_cache_queries);
+    defer allocator.free(cache_samples);
+    for (0..config.ngram_cache_queries) |i| {
+        const idx = i % hot_n;
+        const t0 = try vmstat.nowNs();
+        const res = try tbl.query(&ctx_storage[idx], &out_cont);
+        const t1 = try vmstat.nowNs();
+        if (!res.is_seed) return error.BenchParityFailed;
+        cache_samples[i] = @as(f64, @floatFromInt(@max(t1 -| t0, 1))) / 1000.0;
+    }
+    const cache_p50 = percentileF64(cache_samples, 0.50);
+
+    // 3. Async `prefetch()` followed by `query()`.
+    const pref_n = @min(@as(usize, 16), total_n);
+    const pref_samples = try allocator.alloc(f64, pref_n);
+    defer allocator.free(pref_samples);
+    try tbl.clearCache();
+    for (0..pref_n) |i| {
+        _ = try tbl.prefetch(&ctx_storage[i]);
+        // Brief poll so the background F_NOCACHE AIO finishes before foreground query.
+        var spin: usize = 0;
+        while (spin < 200) : (spin += 1) {
+            if ((try tbl.reapPrefetches()) > 0) break;
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 10_000 };
+            _ = std.c.nanosleep(&ts, null);
+        }
+        const t0 = try vmstat.nowNs();
+        const res = try tbl.query(&ctx_storage[i], &out_cont);
+        const t1 = try vmstat.nowNs();
+        if (!res.is_seed) return error.BenchParityFailed;
+        pref_samples[i] = @as(f64, @floatFromInt(@max(t1 -| t0, 1))) / 1000.0;
+    }
+    const pref_p50 = percentileF64(pref_samples, 0.50);
+
+    return .{
+        .file_bytes = hdr.table_offset + hdr.table_bytes,
+        .num_buckets = hdr.num_buckets,
+        .total_entries = hdr.total_entries,
+        .wired_kib = tbl.totalWiredBytes() >> 10,
+        .cold_nvme_p50_us = cold_p50,
+        .cold_nvme_p99_us = cold_p99,
+        .cache_hit_p50_us = cache_p50,
+        .prefetch_hit_p50_us = pref_p50,
+        .queries = tbl.stats.queries,
+        .hits = tbl.stats.hits,
+        .seed_hits = tbl.stats.seed_hits,
+        .nvme_reads = tbl.stats.nvme_reads,
+    };
+}
+
+fn runM5PearlSynthBench(allocator: std.mem.Allocator, config: M5Config) M5Error!PearlSynthBenchResult {
+    const dense_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q4,
+        .group_size = 64,
+        .vocab_size = config.pearl_vocab,
+        .hidden_size = config.pearl_hidden,
+        .num_hidden_layers = config.pearl_layers,
+        .num_attention_heads = @max(@as(u32, 2), config.pearl_hidden / 64),
+        .num_key_value_heads = @max(@as(u32, 1), (config.pearl_hidden / 64) / 2),
+        .head_dim = 64,
+        .intermediate_size = config.pearl_inter,
+        .tie_word_embeddings = true,
+    };
+    const tgt_bytes = try qwen3.buildSyntheticAmfImageWithSpec(allocator, dense_cfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+    }, 0xD8_B301);
+    defer allocator.free(tgt_bytes);
+
+    // Same-family small draft (shares same synthetic weights so PEARL gets high spec-hit rate).
+    const prompt = [_]u32{ 3, 11, 29, 47, 5, 13, 31, 53 };
+    const gen_len = config.pearl_gen_tokens;
+    const expected = try allocator.alloc(u32, gen_len);
+    defer allocator.free(expected);
+    const out_off = try allocator.alloc(u32, gen_len);
+    defer allocator.free(out_off);
+    const out_on = try allocator.alloc(u32, gen_len);
+    defer allocator.free(out_on);
+
+    // 1. Baseline non-speculative greedy decode.
+    var base_ns: u64 = 1;
+    {
+        var base_model = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_bytes, dense_cfg, .{
+            .max_seq_len = 128,
+            .chunk_tokens = 16,
+            .max_tree_nodes = 1,
+        });
+        defer base_model.deinit(allocator);
+
+        var tok = try base_model.prefillPrompt(&prompt, true);
+        expected[0] = tok;
+        var pos: u32 = @intCast(prompt.len);
+        const t0 = try vmstat.nowNs();
+        for (1..gen_len) |i| {
+            tok = try base_model.stepDecode(tok, pos);
+            expected[i] = tok;
+            pos += 1;
+        }
+        const t1 = try vmstat.nowNs();
+        base_ns = @max(t1 -| t0, 1);
+    }
+
+    // 2. Small draft PEARL `off` vs PEARL `on`.
+    var spec_tgt = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_bytes, dense_cfg, .{
+        .max_seq_len = 128,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 16,
+    });
+    defer spec_tgt.deinit(allocator);
+
+    var sd = try draft_mod.SmallDraftModel.loadFromBytes(allocator, &spec_tgt, tgt_bytes, dense_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 128,
+        .chunk_tokens = 16,
+        .max_tree_slots = 16,
+        .own_compute_queue = true,
+    });
+    defer sd.deinit(allocator);
+
+    var off_ns: u64 = 1;
+    {
+        var eng_off = try engine_mod.SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .branch_width = 2,
+            .top_k_per_node = 3,
+            .temperature = 0.0,
+            .enable_pruning = false,
+            .pearl_mode = .off,
+        });
+        defer eng_off.deinit(allocator);
+
+        out_off[0] = try eng_off.prefill(&prompt, null);
+        var p: usize = 1;
+        const t0 = try vmstat.nowNs();
+        while (p < gen_len) {
+            const rs = try eng_off.stepRound(null, out_off[p..]);
+            p += rs.emitted_count;
+        }
+        const t1 = try vmstat.nowNs();
+        off_ns = @max(t1 -| t0, 1);
+    }
+
+    var on_ns: u64 = 1;
+    var on_stats: engine_mod.SpecStats = .{};
+    {
+        var eng_on = try engine_mod.SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .branch_width = 2,
+            .top_k_per_node = 3,
+            .temperature = 0.0,
+            .enable_pruning = false,
+            .pearl_mode = .on,
+        });
+        defer eng_on.deinit(allocator);
+
+        out_on[0] = try eng_on.prefill(&prompt, null);
+        var p: usize = 1;
+        const t0 = try vmstat.nowNs();
+        while (p < gen_len) {
+            const rs = try eng_on.stepRound(null, out_on[p..]);
+            p += rs.emitted_count;
+        }
+        const t1 = try vmstat.nowNs();
+        on_ns = @max(t1 -| t0, 1);
+        on_stats = eng_on.stats;
+    }
+
+    const bit_exact_off = std.mem.eql(u32, expected, out_off);
+    const bit_exact_on = std.mem.eql(u32, expected, out_on);
+    if (!bit_exact_off or !bit_exact_on) return error.BenchParityFailed;
+
+    const dec_toks: f64 = @floatFromInt(@max(gen_len -| 1, 1));
+    return .{
+        .has_own_queue = sd.hasOwnComputeQueue(),
+        .bit_exact_off = bit_exact_off,
+        .bit_exact_on = bit_exact_on,
+        .base_tok_per_s = dec_toks * 1_000_000_000.0 / @as(f64, @floatFromInt(base_ns)),
+        .off_tok_per_s = dec_toks * 1_000_000_000.0 / @as(f64, @floatFromInt(off_ns)),
+        .on_tok_per_s = dec_toks * 1_000_000_000.0 / @as(f64, @floatFromInt(on_ns)),
+        .mean_accept_len = on_stats.meanAcceptanceLength(),
+        .pearl_rounds = on_stats.pearl_rounds,
+        .pearl_hits = on_stats.pearl_hits,
+        .pearl_rollbacks = on_stats.pearl_rollbacks,
+        .pearl_saved_ms = @as(f64, @floatFromInt(on_stats.pearl_saved_ns)) / 1_000_000.0,
+    };
+}
+
+fn loopbackHttpExchange(
+    port: u16,
+    req: []const u8,
+    rx_buf: []u8,
+) error{LoopbackFailed}!struct { total_bytes: usize, ttft_ns: u64, e2e_ns: u64 } {
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return error.LoopbackFailed;
+    defer _ = std.c.close(fd);
+
+    var one: c_int = 1;
+    _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.NOSIGPIPE, &one, @sizeOf(c_int));
+
+    var addr = std.c.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    const t0 = vmstat.nowNs() catch return error.LoopbackFailed;
+    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) {
+        return error.LoopbackFailed;
+    }
+
+    var sent: usize = 0;
+    while (sent < req.len) {
+        const n = std.c.send(fd, req.ptr + sent, req.len - sent, 0);
+        if (n > 0) {
+            sent += @intCast(n);
+        } else if (n < 0 and std.c.errno(n) == .INTR) {
+            continue;
+        } else {
+            return error.LoopbackFailed;
+        }
+    }
+
+    var got: usize = 0;
+    var first_data_ns: u64 = 0;
+    while (got < rx_buf.len) {
+        const n = std.c.recv(fd, rx_buf.ptr + got, rx_buf.len - got, 0);
+        if (n > 0) {
+            got += @intCast(n);
+            if (first_data_ns == 0 and std.mem.indexOf(u8, rx_buf[0..got], "data: ") != null) {
+                first_data_ns = vmstat.nowNs() catch t0;
+            }
+        } else if (n == 0) {
+            break;
+        } else if (std.c.errno(n) == .INTR) {
+            continue;
+        } else {
+            return error.LoopbackFailed;
+        }
+    }
+    const t1 = vmstat.nowNs() catch t0;
+    return .{
+        .total_bytes = got,
+        .ttft_ns = if (first_data_ns > t0) first_data_ns - t0 else (t1 -| t0),
+        .e2e_ns = @max(t1 -| t0, 1),
+    };
+}
+
+fn runM5ServerBench(allocator: std.mem.Allocator, config: M5Config) M5Error!ServerBenchResult {
+    const MockCtx = struct {
+        tokens_per_req: u32,
+        fn generate(ctx: *anyopaque, job: *const server_mod.InferenceJob, stream: *server_mod.TokenStream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!stream.setPromptTokens(12)) return;
+            const total = @min(job.max_tokens, self.tokens_per_req);
+            const prefix = [_][]const u8{ "<think>", "ok", "</think>" };
+            var emitted: u32 = 0;
+            for (prefix) |p| {
+                if (emitted >= total) break;
+                if (!stream.emitTokenBytes(p)) return;
+                emitted += 1;
+            }
+            while (emitted < total) : (emitted += 1) {
+                if (!stream.emitTokenBytes(" tok")) return;
+            }
+            stream.finish(.stop, 12);
+        }
+    };
+
+    var mock = MockCtx{ .tokens_per_req = config.server_tokens_per_req };
+    const srv = try server_mod.Server.init(allocator, .{
+        .host = .{ 127, 0, 0, 1 },
+        .port = 0,
+        .model_id = "m5-bench-model",
+        .wired_mib = 128,
+        .max_conns = 32,
+        .max_active_requests = 16,
+    });
+    defer srv.deinit(allocator);
+
+    try srv.start(.{ .ctx = &mock, .generateFn = MockCtx.generate });
+    defer srv.stop();
+    const port = srv.boundPort();
+
+    const health_req =
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    const chat_body =
+        "{\"model\":\"m5-bench-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"max_tokens\":16,\"temperature\":0.0}";
+    var chat_req_buf: [512]u8 = undefined;
+    const chat_req = std.fmt.bufPrint(
+        &chat_req_buf,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ chat_body.len, chat_body },
+    ) catch unreachable;
+
+    var rx_buf: [32 * 1024]u8 = undefined;
+    var all_ok = true;
+
+    // Warmup both endpoints before measuring allocations or latency.
+    for (0..4) |_| {
+        _ = try loopbackHttpExchange(port, health_req, &rx_buf);
+        _ = try loopbackHttpExchange(port, chat_req, &rx_buf);
+    }
+
+    // 1. GET /health latency.
+    const health_samples = try allocator.alloc(f64, config.server_health_iters);
+    defer allocator.free(health_samples);
+    for (0..config.server_health_iters) |i| {
+        const ex = try loopbackHttpExchange(port, health_req, &rx_buf);
+        if (std.mem.indexOf(u8, rx_buf[0..ex.total_bytes], "200 OK") == null) all_ok = false;
+        health_samples[i] = @as(f64, @floatFromInt(ex.e2e_ns)) / 1000.0;
+    }
+
+    // 2. Single-client steady-state SSE latency + zero-allocation check.
+    const single_ttft = try allocator.alloc(f64, config.server_steady_iters);
+    defer allocator.free(single_ttft);
+    const single_e2e = try allocator.alloc(f64, config.server_steady_iters);
+    defer allocator.free(single_e2e);
+
+    const heap_before = try vmstat.Snapshot.capture();
+    for (0..config.server_steady_iters) |i| {
+        const ex = try loopbackHttpExchange(port, chat_req, &rx_buf);
+        const body = rx_buf[0..ex.total_bytes];
+        if (std.mem.indexOf(u8, body, "200 OK") == null or
+            std.mem.indexOf(u8, body, "reasoning_content") == null or
+            std.mem.indexOf(u8, body, "data: [DONE]") == null)
+        {
+            all_ok = false;
+        }
+        single_ttft[i] = @as(f64, @floatFromInt(ex.ttft_ns)) / 1000.0;
+        single_e2e[i] = @as(f64, @floatFromInt(ex.e2e_ns)) / 1000.0;
+    }
+    const heap_after = try vmstat.Snapshot.capture();
+    const hdelta = vmstat.heapDelta(heap_before, heap_after);
+
+    // 3. Concurrent multi-client SSE fan-out (`server_concurrent_clients` simultaneous sockets).
+    const n_clients: usize = @min(@max(config.server_concurrent_clients, 1), 16);
+    const ClientTask = struct {
+        port: u16,
+        req: []const u8,
+        ttft_us: f64 = 0.0,
+        ok: bool = false,
+
+        fn run(self: *@This()) void {
+            var local_rx: [32 * 1024]u8 = undefined;
+            const ex = loopbackHttpExchange(self.port, self.req, &local_rx) catch {
+                self.ok = false;
+                return;
+            };
+            const body = local_rx[0..ex.total_bytes];
+            self.ok = std.mem.indexOf(u8, body, "200 OK") != null and
+                std.mem.indexOf(u8, body, "data: [DONE]") != null;
+            self.ttft_us = @as(f64, @floatFromInt(ex.ttft_ns)) / 1000.0;
+        }
+    };
+
+    var tasks: [16]ClientTask = undefined;
+    var threads: [16]std.Thread = undefined;
+    const conc_t0 = try vmstat.nowNs();
+    for (0..n_clients) |ci| {
+        tasks[ci] = .{ .port = port, .req = chat_req };
+        threads[ci] = std.Thread.spawn(.{}, ClientTask.run, .{&tasks[ci]}) catch return error.LoopbackFailed;
+    }
+    for (0..n_clients) |ci| {
+        threads[ci].join();
+        if (!tasks[ci].ok) all_ok = false;
+    }
+    const conc_t1 = try vmstat.nowNs();
+    const conc_ns = @max(conc_t1 -| conc_t0, 1);
+
+    var conc_ttft: [16]f64 = undefined;
+    for (0..n_clients) |ci| conc_ttft[ci] = tasks[ci].ttft_us;
+    const total_toks: f64 = @floatFromInt(n_clients * @as(usize, config.server_tokens_per_req));
+
+    return .{
+        .health_p50_us = percentileF64(health_samples, 0.50),
+        .single_ttft_p50_us = percentileF64(single_ttft, 0.50),
+        .single_e2e_p50_us = percentileF64(single_e2e, 0.50),
+        .concurrent_clients = @intCast(n_clients),
+        .concurrent_ttft_p50_us = percentileF64(conc_ttft[0..n_clients], 0.50),
+        .concurrent_ttft_p99_us = percentileF64(conc_ttft[0..n_clients], 0.99),
+        .concurrent_tok_per_s = total_toks * 1_000_000_000.0 / @as(f64, @floatFromInt(conc_ns)),
+        .steady_malloc_blocks_delta = hdelta.blocks_in_use,
+        .steady_malloc_bytes_delta = hdelta.size_in_use,
+        .all_ok = all_ok,
+    };
+}
+
+pub fn runM5WithConfig(allocator: std.mem.Allocator, config: M5Config) M5Error!M5Report {
+    const vm_before = try vmstat.Snapshot.capture();
+
+    const q2_cases = try runM5Q2Calibration(allocator, config);
+    errdefer allocator.free(q2_cases);
+
+    const hetero_rows = try runM5HeteroMoeBench(config);
+    const ngram_res = try runM5NgramBench(allocator, config);
+    const pearl_res = try runM5PearlSynthBench(allocator, config);
+    const srv_res = try runM5ServerBench(allocator, config);
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .q2_cases = q2_cases,
+        .hetero_moe_rows = hetero_rows,
+        .ngram = ngram_res,
+        .pearl = pearl_res,
+        .server = srv_res,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM5(allocator: std.mem.Allocator) M5Error!M5Report {
+    return runM5WithConfig(allocator, .{});
+}
+
 test "bytesMovedPerDispatch matches exact algorithmic traffic and validates shapes" {
     // q4 (2048, 2048), M=1: w = 2048*1024 = 2097152, sb = 2048*32*4 = 262144, x = 4096, y = 4096
     const q4_gemv = try bytesMovedPerDispatch(.{ .kind = .gemv_q4, .m = 1, .n = 2048, .k = 2048 });
@@ -5059,4 +6343,73 @@ test "runM45WithConfig exercises C13 concurrent GPU+SME2 bus gate, ldnt1b L2 pre
     try std.testing.expect(std.mem.indexOf(u8, rendered, "ldnt_l2.hot_after_ldnt1_us") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "router_cal.bank_kib") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "m45.swap.status") != null);
+}
+
+test "runM5WithConfig exercises G13 q2/hetero-MoE, C6 F_NOCACHE ngram, D8 PEARL and C7/C8 kqueue server" {
+    const gpa = std.testing.allocator;
+    const smoke_q2 = [_]Case{
+        .{ .kind = .gemv_q2, .m = 1, .n = 64, .k = 128 },
+        .{ .kind = .gemm_q2, .m = 16, .n = 64, .k = 128 },
+    };
+    var report = try runM5WithConfig(gpa, .{
+        .q2_cases = &smoke_q2,
+        .q2_min_working_set_bytes = 0,
+        .q2_warmup_batches = 1,
+        .q2_gemv_timed_batches = 1,
+        .q2_gemv_dispatches_per_batch = 4,
+        .q2_gemm_timed_batches = 1,
+        .q2_gemm_dispatches_per_batch = 2,
+        .hetero_moe_hidden = 128,
+        .hetero_moe_inter = 128,
+        .hetero_moe_experts = 16,
+        .hetero_moe_top_k = 4,
+        .hetero_moe_shared_m8 = 8,
+        .hetero_moe_warmup_batches = 1,
+        .hetero_moe_timed_batches = 2,
+        .hetero_moe_dispatches_per_batch = 2,
+        .ngram_temp_dir = "/Volumes/Akari/.tmp",
+        .ngram_buckets = 16,
+        .ngram_entries_per_bucket = 2,
+        .ngram_cache_pages = 4,
+        .ngram_cold_queries = 8,
+        .ngram_cache_queries = 16,
+        .pearl_layers = 2,
+        .pearl_hidden = 128,
+        .pearl_inter = 256,
+        .pearl_vocab = 64,
+        .pearl_gen_tokens = 10,
+        .server_health_iters = 8,
+        .server_steady_iters = 4,
+        .server_concurrent_clients = 4,
+        .server_tokens_per_req = 8,
+        .timeout_ms = 10_000,
+    });
+    defer report.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), report.q2_cases.len);
+    for (report.q2_cases) |c| try std.testing.expect(c.effectiveBandwidthGbs() > 0.0);
+    // Heterogeneous {q2,q3,q4} MoE uses strictly fewer bytes than uniform q4 at both M=1 and M=8.
+    try std.testing.expect(report.hetero_moe_rows[3].vs_q4_bytes_pct < -20.0);
+    try std.testing.expectEqual(@as(u32, 3), report.hetero_moe_rows[3].active_buckets);
+    try std.testing.expect(report.hetero_moe_rows[7].vs_q4_bytes_pct < -20.0);
+    try std.testing.expect(report.ngram.seed_hits > 0);
+    try std.testing.expect(report.ngram.nvme_reads > 0);
+    try std.testing.expect(report.pearl.has_own_queue);
+    try std.testing.expect(report.pearl.bit_exact_off);
+    try std.testing.expect(report.pearl.bit_exact_on);
+    try std.testing.expect(report.pearl.pearl_rounds > 0);
+    try std.testing.expect(report.server.all_ok);
+    try std.testing.expectEqual(@as(i64, 0), report.server.steady_malloc_blocks_delta);
+    try vmstat.checkNoSwap(report.vm_before, report.vm_after);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "gemv_q2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "hetero_q2_q3_q4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "ngram.cold_nvme_p50_us") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "pearl_synth.bit_exact_on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "server.steady_malloc_blocks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m5.swap.status") != null);
 }
