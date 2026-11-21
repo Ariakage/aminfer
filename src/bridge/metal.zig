@@ -747,12 +747,28 @@ pub const AnePlan = struct {
 pub const AneModel = struct {
     handle: *c.ami_ane_model,
 
+    pub const IoCounts = struct {
+        inputs: u32,
+        outputs: u32,
+    };
+
     /// Compiles (`.mlmodel` / `.mlpackage`) and loads, or directly loads
     /// (`.mlmodelc`), a CoreML model from disk. Startup only.
     pub fn loadPath(path: [:0]const u8, units: AneComputeUnits) Error!AneModel {
+        return loadPathWithFunction(path, null, units);
+    }
+
+    /// Like `loadPath`, optionally selecting a named function from a
+    /// multi-function CoreML `.mlpackage` / `.mlmodelc` bundle. Startup only.
+    pub fn loadPathWithFunction(
+        path: [:0]const u8,
+        function_name: ?[:0]const u8,
+        units: AneComputeUnits,
+    ) Error!AneModel {
         if (path.len == 0) return error.InvalidArgument;
+        const fn_ptr: ?[*:0]const u8 = if (function_name) |f| f.ptr else null;
         var handle: ?*c.ami_ane_model = null;
-        try check(c.ami_ane_model_load_path(path.ptr, units.toRaw(), &handle));
+        try check(c.ami_ane_model_load_path_ex(path.ptr, fn_ptr, units.toRaw(), &handle));
         return .{ .handle = handle orelse return error.NullHandle };
     }
 
@@ -773,6 +789,31 @@ pub const AneModel = struct {
         var raw: c.ami_ane_model_info = undefined;
         try check(c.ami_ane_model_query(self.handle, &raw));
         return .{ .raw = raw };
+    }
+
+    /// Returns the number of declared input and output features on this model.
+    pub fn ioCounts(self: AneModel) Error!IoCounts {
+        var ins: u32 = 0;
+        var outs: u32 = 0;
+        try check(c.ami_ane_model_io_counts(self.handle, &ins, &outs));
+        return .{ .inputs = ins, .outputs = outs };
+    }
+
+    /// Copies the `index`-th lexicographically sorted input (`is_output == false`)
+    /// or output (`is_output == true`) feature name into `buf` and returns it as
+    /// a NUL-terminated slice.
+    pub fn ioName(self: AneModel, is_output: bool, index: u32, buf: []u8) Error![:0]const u8 {
+        if (buf.len < 2) return error.InvalidArgument;
+        try check(c.ami_ane_model_io_name(
+            self.handle,
+            if (is_output) 1 else 0,
+            index,
+            buf.ptr,
+            buf.len,
+        ));
+        const slice = std.mem.sliceTo(buf, 0);
+        if (slice.len >= buf.len) return error.AneFailed;
+        return buf[0..slice.len :0];
     }
 
     /// Executes synchronous prediction using a preallocated `AnePlan` with
@@ -1028,6 +1069,616 @@ pub fn emitCoreMlLinearModel(
     var root: std.ArrayList(u8) = .empty;
     errdefer root.deinit(allocator);
     try pbAppendVarintField(allocator, &root, 1, spec.specification_version);
+    try pbAppendBytesField(allocator, &root, 2, model_desc.items);
+    try pbAppendBytesField(allocator, &root, 500, nn.items);
+    return root.toOwnedSlice(allocator);
+}
+
+fn pbAppendSignedVarintField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), field: u32, val: i64) !void {
+    try pbAppendTag(allocator, out, field, 0);
+    try pbAppendVarint(allocator, out, @bitCast(val));
+}
+
+fn pbAppendF32Field(allocator: std.mem.Allocator, out: *std.ArrayList(u8), field: u32, val: f32) !void {
+    try pbAppendTag(allocator, out, field, 5);
+    const bits: u32 = @bitCast(val);
+    var le: [4]u8 = undefined;
+    std.mem.writeInt(u32, &le, bits, .little);
+    try out.appendSlice(allocator, &le);
+}
+
+fn pbAppendLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    inputs: []const []const u8,
+    outputs: []const []const u8,
+    layer_field: u32,
+    layer_body: []const u8,
+) !void {
+    var layer_msg: std.ArrayList(u8) = .empty;
+    defer layer_msg.deinit(allocator);
+    try pbAppendBytesField(allocator, &layer_msg, 1, name);
+    for (inputs) |inp| try pbAppendBytesField(allocator, &layer_msg, 2, inp);
+    for (outputs) |out_name| try pbAppendBytesField(allocator, &layer_msg, 3, out_name);
+    try pbAppendBytesField(allocator, &layer_msg, layer_field, layer_body);
+    try pbAppendBytesField(allocator, nn, 1, layer_msg.items);
+}
+
+fn pbAppendConv1x1Layer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_blob: []const u8,
+    out_blob: []const u8,
+    c_in: u32,
+    c_out: u32,
+    weights_f16: []const f16,
+) !void {
+    var w_params: std.ArrayList(u8) = .empty;
+    defer w_params.deinit(allocator);
+    try pbAppendBytesField(allocator, &w_params, 2, std.mem.sliceAsBytes(weights_f16));
+
+    var conv: std.ArrayList(u8) = .empty;
+    defer conv.deinit(allocator);
+    try pbAppendVarintField(allocator, &conv, 1, c_out);
+    try pbAppendVarintField(allocator, &conv, 2, c_in);
+    try pbAppendVarintField(allocator, &conv, 10, 1);
+    try pbAppendVarintField(allocator, &conv, 20, 1);
+    try pbAppendVarintField(allocator, &conv, 20, 1);
+    try pbAppendVarintField(allocator, &conv, 30, 1);
+    try pbAppendVarintField(allocator, &conv, 30, 1);
+    try pbAppendBytesField(allocator, &conv, 50, &.{});
+    try pbAppendVarintField(allocator, &conv, 70, 0);
+    try pbAppendBytesField(allocator, &conv, 90, w_params.items);
+    try pbAppendLayer(allocator, nn, name, &.{in_blob}, &.{out_blob}, 100, conv.items);
+}
+
+/// Emits a CoreML `BatchedMatMulLayerParams` (field 1045) with constant fp16
+/// weights supplied in row-major `[n_out, k_in]` (standard `.amf` / PyTorch
+/// linear layout). CoreML stores `BatchedMatMulLayerParams.weights` in
+/// column-major `(weightMatrixFirstDimension=k_in, weightMatrixSecondDimension=n_out)`
+/// order, which is identical to row-major `[n_out, k_in]`.
+fn pbAppendBatchedMatmulConstLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_blob: []const u8,
+    out_blob: []const u8,
+    k_in: u32,
+    n_out: u32,
+    weights_nk: []const f16,
+) !void {
+    const total = std.math.mul(usize, k_in, n_out) catch return error.InvalidSpec;
+    if (weights_nk.len != total) return error.InvalidSpec;
+
+    var w_params: std.ArrayList(u8) = .empty;
+    defer w_params.deinit(allocator);
+    try pbAppendBytesField(allocator, &w_params, 2, std.mem.sliceAsBytes(weights_nk));
+
+    // BatchedMatMulLayerParams:
+    // weightMatrixFirstDimension(5), weightMatrixSecondDimension(6), hasBias(7), weights(8)
+    var bmm: std.ArrayList(u8) = .empty;
+    defer bmm.deinit(allocator);
+    try pbAppendVarintField(allocator, &bmm, 5, k_in);
+    try pbAppendVarintField(allocator, &bmm, 6, n_out);
+    try pbAppendVarintField(allocator, &bmm, 7, 0);
+    try pbAppendBytesField(allocator, &bmm, 8, w_params.items);
+    try pbAppendLayer(allocator, nn, name, &.{in_blob}, &.{out_blob}, 1045, bmm.items);
+}
+
+fn pbAppendBatchedMatmul2InLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_a: []const u8,
+    in_b: []const u8,
+    out_blob: []const u8,
+    transpose_a: bool,
+    transpose_b: bool,
+) !void {
+    var bmm: std.ArrayList(u8) = .empty;
+    defer bmm.deinit(allocator);
+    if (transpose_a) try pbAppendVarintField(allocator, &bmm, 1, 1);
+    if (transpose_b) try pbAppendVarintField(allocator, &bmm, 2, 1);
+    try pbAppendLayer(allocator, nn, name, &.{ in_a, in_b }, &.{out_blob}, 1045, bmm.items);
+}
+
+fn pbAppendReshapeStaticLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_blob: []const u8,
+    out_blob: []const u8,
+    target_shape: []const u32,
+) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    for (target_shape) |d| try pbAppendVarintField(allocator, &body, 1, d);
+    try pbAppendLayer(allocator, nn, name, &.{in_blob}, &.{out_blob}, 1140, body.items);
+}
+
+fn pbAppendTransposeLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_blob: []const u8,
+    out_blob: []const u8,
+    axes: []const u32,
+) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    for (axes) |a| try pbAppendVarintField(allocator, &body, 1, a);
+    try pbAppendLayer(allocator, nn, name, &.{in_blob}, &.{out_blob}, 985, body.items);
+}
+
+fn pbAppendConcatNdLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_a: []const u8,
+    in_b: []const u8,
+    out_blob: []const u8,
+    axis: i64,
+) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try pbAppendSignedVarintField(allocator, &body, 1, axis);
+    try pbAppendLayer(allocator, nn, name, &.{ in_a, in_b }, &.{out_blob}, 980, body.items);
+}
+
+fn pbAppendSoftmaxNdLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_blob: []const u8,
+    out_blob: []const u8,
+    axis: i64,
+) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try pbAppendSignedVarintField(allocator, &body, 1, axis);
+    try pbAppendLayer(allocator, nn, name, &.{in_blob}, &.{out_blob}, 950, body.items);
+}
+
+fn pbAppendActivationLinearLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_blob: []const u8,
+    out_blob: []const u8,
+    alpha: f32,
+) !void {
+    // ActivationParams (130) -> linear (5) -> alpha (1)
+    var lin: std.ArrayList(u8) = .empty;
+    defer lin.deinit(allocator);
+    try pbAppendF32Field(allocator, &lin, 1, alpha);
+
+    var act: std.ArrayList(u8) = .empty;
+    defer act.deinit(allocator);
+    try pbAppendBytesField(allocator, &act, 5, lin.items);
+    try pbAppendLayer(allocator, nn, name, &.{in_blob}, &.{out_blob}, 130, act.items);
+}
+
+fn pbAppendActivationReluLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_blob: []const u8,
+    out_blob: []const u8,
+) !void {
+    var act: std.ArrayList(u8) = .empty;
+    defer act.deinit(allocator);
+    try pbAppendBytesField(allocator, &act, 10, &.{});
+    try pbAppendLayer(allocator, nn, name, &.{in_blob}, &.{out_blob}, 130, act.items);
+}
+
+fn pbAppendActivationSigmoidLayer(
+    allocator: std.mem.Allocator,
+    nn: *std.ArrayList(u8),
+    name: []const u8,
+    in_blob: []const u8,
+    out_blob: []const u8,
+) !void {
+    var act: std.ArrayList(u8) = .empty;
+    defer act.deinit(allocator);
+    try pbAppendBytesField(allocator, &act, 40, &.{});
+    try pbAppendLayer(allocator, nn, name, &.{in_blob}, &.{out_blob}, 130, act.items);
+}
+
+/// Specification for a CoreML ANE chunked GQA attention block (A1, A3, S6).
+///
+/// Tensor contract (all `FLOAT16` / `OneComponent16Half` zero-copy `KvTile`s):
+/// - Inputs:
+///   - `"x_in"`:   `[1, chunk_tokens, hidden_size]`
+///   - `"k_past"`: `[1, num_kv_heads, kv_bucket_tokens - chunk_tokens, head_dim]` (omitted when `kv_bucket_tokens == chunk_tokens`)
+///   - `"v_past"`: `[1, num_kv_heads, kv_bucket_tokens - chunk_tokens, head_dim]` (omitted when `kv_bucket_tokens == chunk_tokens`)
+///   - `"mask"`:   `[1, 1, chunk_tokens, kv_bucket_tokens]` (0.0 for valid causal keys, `-10000.0` for masked keys)
+/// - Outputs (all backed zero-copy via `outputBackings`):
+///   - `"attn_out"`:   `[1, chunk_tokens, hidden_size]`
+///   - `"k_tile_out"`: `[1, num_kv_heads, chunk_tokens, head_dim]` (exact ADR-0004 token-major `KvTile`)
+///   - `"v_tile_out"`: `[1, num_kv_heads, chunk_tokens, head_dim]` (exact ADR-0004 token-major `KvTile`)
+///
+/// All linear weights are row-major `[out_dim, in_dim]` fp16.
+pub const CoreMlAttentionSpec = struct {
+    hidden_size: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32 = 512,
+    /// Total KV bucket length `B >= chunk_tokens` (e.g. `512, 1024, 2048, 4096`).
+    kv_bucket_tokens: u32 = 512,
+    /// Softmax scale; defaults to `1 / sqrt(head_dim)` when `null`.
+    scale: ?f32 = null,
+    /// Use ANE-native 1x1 convolutions for Q/K/V/O projections (recommended on M4).
+    use_conv_proj: bool = true,
+    /// `[num_q_heads * head_dim, hidden_size]` fp16.
+    w_q: []const f16,
+    /// `[num_kv_heads * head_dim, hidden_size]` fp16.
+    w_k: []const f16,
+    /// `[num_kv_heads * head_dim, hidden_size]` fp16.
+    w_v: []const f16,
+    /// `[hidden_size, num_q_heads * head_dim]` fp16.
+    w_o: []const f16,
+};
+
+/// Emits a pure-4D GQA chunked attention CoreML `.mlmodel` protobuf (`specVersion = 7`,
+/// `FLOAT16` zero-copy IOSurface I/O) that runs 100% on the Apple Neural Engine
+/// without K/V head duplication (`Q` folded as `[1, kv_heads, gqa_ratio * S, D]`
+/// and pre-scaled before `Q @ K^T` to avoid spilling a full scores tensor to DRAM).
+pub fn emitCoreMlAttentionBlock(
+    allocator: std.mem.Allocator,
+    spec: CoreMlAttentionSpec,
+) ProtoEmitError![]u8 {
+    if (spec.hidden_size == 0 or spec.num_q_heads == 0 or spec.num_kv_heads == 0 or
+        spec.head_dim == 0 or spec.chunk_tokens == 0 or
+        spec.kv_bucket_tokens < spec.chunk_tokens or
+        (spec.num_q_heads % spec.num_kv_heads) != 0 or
+        (spec.hidden_size % KV_TILE_ROW_ALIGN_F16) != 0 or
+        (spec.head_dim % KV_TILE_ROW_ALIGN_F16) != 0 or
+        (spec.kv_bucket_tokens % KV_TILE_ROW_ALIGN_F16) != 0)
+    {
+        return error.InvalidSpec;
+    }
+
+    const h = spec.hidden_size;
+    const qh = spec.num_q_heads;
+    const kvh = spec.num_kv_heads;
+    const d = spec.head_dim;
+    const s = spec.chunk_tokens;
+    const b = spec.kv_bucket_tokens;
+    const past = b - s;
+    const gqa = qh / kvh;
+    const q_dim = std.math.mul(u32, qh, d) catch return error.InvalidSpec;
+    const kv_dim = std.math.mul(u32, kvh, d) catch return error.InvalidSpec;
+    const gs = std.math.mul(u32, gqa, s) catch return error.InvalidSpec;
+
+    const exp_q = std.math.mul(usize, q_dim, h) catch return error.InvalidSpec;
+    const exp_kv = std.math.mul(usize, kv_dim, h) catch return error.InvalidSpec;
+    const exp_o = std.math.mul(usize, h, q_dim) catch return error.InvalidSpec;
+    if (spec.w_q.len != exp_q or spec.w_k.len != exp_kv or
+        spec.w_v.len != exp_kv or spec.w_o.len != exp_o)
+    {
+        return error.InvalidSpec;
+    }
+
+    const scale: f32 = spec.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(d))));
+    if (!std.math.isFinite(scale) or !(scale > 0.0)) return error.InvalidSpec;
+
+    // ModelDescription: inputs (1), outputs (10)
+    var model_desc: std.ArrayList(u8) = .empty;
+    defer model_desc.deinit(allocator);
+
+    {
+        const f_x = try pbBuildFeatureDesc(allocator, "x_in", &.{ 1, s, h }, true);
+        defer allocator.free(f_x);
+        try pbAppendBytesField(allocator, &model_desc, 1, f_x);
+    }
+    if (past > 0) {
+        const f_kp = try pbBuildFeatureDesc(allocator, "k_past", &.{ 1, kvh, past, d }, true);
+        defer allocator.free(f_kp);
+        try pbAppendBytesField(allocator, &model_desc, 1, f_kp);
+
+        const f_vp = try pbBuildFeatureDesc(allocator, "v_past", &.{ 1, kvh, past, d }, true);
+        defer allocator.free(f_vp);
+        try pbAppendBytesField(allocator, &model_desc, 1, f_vp);
+    }
+    {
+        const f_m = try pbBuildFeatureDesc(allocator, "mask", &.{ 1, 1, s, b }, true);
+        defer allocator.free(f_m);
+        try pbAppendBytesField(allocator, &model_desc, 1, f_m);
+
+        const f_out = try pbBuildFeatureDesc(allocator, "attn_out", &.{ 1, s, h }, true);
+        defer allocator.free(f_out);
+        try pbAppendBytesField(allocator, &model_desc, 10, f_out);
+
+        const f_ko = try pbBuildFeatureDesc(allocator, "k_tile_out", &.{ 1, kvh, s, d }, true);
+        defer allocator.free(f_ko);
+        try pbAppendBytesField(allocator, &model_desc, 10, f_ko);
+
+        const f_vo = try pbBuildFeatureDesc(allocator, "v_tile_out", &.{ 1, kvh, s, d }, true);
+        defer allocator.free(f_vo);
+        try pbAppendBytesField(allocator, &model_desc, 10, f_vo);
+    }
+
+    var nn: std.ArrayList(u8) = .empty;
+    defer nn.deinit(allocator);
+    try pbAppendVarintField(allocator, &nn, 5, 1); // EXACT_ARRAY_MAPPING
+
+    if (spec.use_conv_proj) {
+        try pbAppendTransposeLayer(allocator, &nn, "x_tr", "x_in", "x_hs", &.{ 0, 2, 1 });
+        try pbAppendReshapeStaticLayer(allocator, &nn, "x_4d", "x_hs", "x_nchw", &.{ 1, h, 1, s });
+        try pbAppendConv1x1Layer(allocator, &nn, "q_proj", "x_nchw", "q_nchw", h, q_dim, spec.w_q);
+        try pbAppendActivationLinearLayer(allocator, &nn, "q_scale", "q_nchw", "q_scaled", scale);
+        try pbAppendConv1x1Layer(allocator, &nn, "k_proj", "x_nchw", "k_nchw", h, kv_dim, spec.w_k);
+        try pbAppendConv1x1Layer(allocator, &nn, "v_proj", "x_nchw", "v_nchw", h, kv_dim, spec.w_v);
+
+        try pbAppendReshapeStaticLayer(allocator, &nn, "q_r4", "q_scaled", "q_hds", &.{ 1, qh, d, s });
+        try pbAppendTransposeLayer(allocator, &nn, "q_tr", "q_hds", "q_hsd", &.{ 0, 1, 3, 2 });
+        try pbAppendReshapeStaticLayer(allocator, &nn, "q_grp", "q_hsd", "q_g", &.{ 1, kvh, gs, d });
+
+        try pbAppendReshapeStaticLayer(allocator, &nn, "k_r4", "k_nchw", "k_hds", &.{ 1, kvh, d, s });
+        try pbAppendTransposeLayer(allocator, &nn, "k_tr", "k_hds", "k_tile_out", &.{ 0, 1, 3, 2 });
+
+        try pbAppendReshapeStaticLayer(allocator, &nn, "v_r4", "v_nchw", "v_hds", &.{ 1, kvh, d, s });
+        try pbAppendTransposeLayer(allocator, &nn, "v_tr", "v_hds", "v_tile_out", &.{ 0, 1, 3, 2 });
+    } else {
+        try pbAppendBatchedMatmulConstLayer(allocator, &nn, "q_proj", "x_in", "q_flat", h, q_dim, spec.w_q);
+        try pbAppendActivationLinearLayer(allocator, &nn, "q_scale", "q_flat", "q_scaled", scale);
+        try pbAppendBatchedMatmulConstLayer(allocator, &nn, "k_proj", "x_in", "k_flat", h, kv_dim, spec.w_k);
+        try pbAppendBatchedMatmulConstLayer(allocator, &nn, "v_proj", "x_in", "v_flat", h, kv_dim, spec.w_v);
+
+        try pbAppendReshapeStaticLayer(allocator, &nn, "q_rs", "q_scaled", "q_4d", &.{ 1, s, qh, d });
+        try pbAppendTransposeLayer(allocator, &nn, "q_tr", "q_4d", "q_h", &.{ 0, 2, 1, 3 });
+        try pbAppendReshapeStaticLayer(allocator, &nn, "q_grp", "q_h", "q_g", &.{ 1, kvh, gs, d });
+
+        try pbAppendReshapeStaticLayer(allocator, &nn, "k_rs", "k_flat", "k_4d", &.{ 1, s, kvh, d });
+        try pbAppendTransposeLayer(allocator, &nn, "k_tr", "k_4d", "k_tile_out", &.{ 0, 2, 1, 3 });
+
+        try pbAppendReshapeStaticLayer(allocator, &nn, "v_rs", "v_flat", "v_4d", &.{ 1, s, kvh, d });
+        try pbAppendTransposeLayer(allocator, &nn, "v_tr", "v_4d", "v_tile_out", &.{ 0, 2, 1, 3 });
+    }
+
+    const k_src: []const u8 = if (past > 0) blk: {
+        try pbAppendConcatNdLayer(allocator, &nn, "k_cat", "k_past", "k_tile_out", "k_all", 2);
+        try pbAppendConcatNdLayer(allocator, &nn, "v_cat", "v_past", "v_tile_out", "v_all", 2);
+        break :blk "k_all";
+    } else "k_tile_out";
+    const v_src: []const u8 = if (past > 0) "v_all" else "v_tile_out";
+
+    // Pure-4D GQA attention without repeating K/V heads.
+    try pbAppendBatchedMatmul2InLayer(allocator, &nn, "qk", "q_g", k_src, "scores_raw", false, true);
+    try pbAppendReshapeStaticLayer(allocator, &nn, "s_r4", "scores_raw", "scores_4d", &.{ kvh, gqa, s, b });
+    try pbAppendLayer(allocator, &nn, "add_mask", &.{ "scores_4d", "mask" }, &.{"scores_m"}, 880, &.{});
+    try pbAppendSoftmaxNdLayer(allocator, &nn, "sm", "scores_m", "probs_4d", -1);
+    try pbAppendReshapeStaticLayer(allocator, &nn, "p_r4", "probs_4d", "probs", &.{ 1, kvh, gs, b });
+    try pbAppendBatchedMatmul2InLayer(allocator, &nn, "pv", "probs", v_src, "ctx_g", false, false);
+
+    if (spec.use_conv_proj) {
+        try pbAppendReshapeStaticLayer(allocator, &nn, "ctx_r4", "ctx_g", "ctx_hsd", &.{ 1, qh, s, d });
+        try pbAppendTransposeLayer(allocator, &nn, "ctx_tr", "ctx_hsd", "ctx_hds", &.{ 0, 1, 3, 2 });
+        try pbAppendReshapeStaticLayer(allocator, &nn, "ctx_nchw", "ctx_hds", "ctx_4d", &.{ 1, q_dim, 1, s });
+        try pbAppendConv1x1Layer(allocator, &nn, "o_proj", "ctx_4d", "out_nchw", q_dim, h, spec.w_o);
+        try pbAppendReshapeStaticLayer(allocator, &nn, "out_r3", "out_nchw", "out_hs", &.{ 1, h, s });
+        try pbAppendTransposeLayer(allocator, &nn, "out_tr", "out_hs", "attn_out", &.{ 0, 2, 1 });
+    } else {
+        try pbAppendReshapeStaticLayer(allocator, &nn, "ctx_r4", "ctx_g", "ctx_h", &.{ 1, qh, s, d });
+        try pbAppendTransposeLayer(allocator, &nn, "ctx_tr", "ctx_h", "ctx_t", &.{ 0, 2, 1, 3 });
+        try pbAppendReshapeStaticLayer(allocator, &nn, "ctx_rs", "ctx_t", "ctx_flat", &.{ 1, s, q_dim });
+        try pbAppendBatchedMatmulConstLayer(allocator, &nn, "o_proj", "ctx_flat", "attn_out", q_dim, h, spec.w_o);
+    }
+
+    var root: std.ArrayList(u8) = .empty;
+    errdefer root.deinit(allocator);
+    try pbAppendVarintField(allocator, &root, 1, 7);
+    try pbAppendBytesField(allocator, &root, 2, model_desc.items);
+    try pbAppendBytesField(allocator, &root, 500, nn.items);
+    return root.toOwnedSlice(allocator);
+}
+
+/// Specification for a single fixed-shape ANE QKV projection & IOSurface KV-write
+/// block (`A3` split ANE QKV + GPU split-KV attention strategy).
+///
+/// Tensor contract (all zero-copy `OneComponent16Half` `KvTile`s):
+/// - Input: `"x_in"` `[1, chunk_tokens, hidden_size]`
+/// - Outputs:
+///   - `"q_out"`:      `[1, chunk_tokens, num_q_heads * head_dim]`
+///   - `"k_tile_out"`: `[1, num_kv_heads, chunk_tokens, head_dim]`
+///   - `"v_tile_out"`: `[1, num_kv_heads, chunk_tokens, head_dim]`
+pub const CoreMlQkvSpec = struct {
+    hidden_size: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32 = 512,
+    w_q: []const f16,
+    w_k: []const f16,
+    w_v: []const f16,
+};
+
+/// Emits a fixed-shape ANE QKV projection CoreML `.mlmodel` protobuf (`specVersion = 7`)
+/// writing `q_out`, `k_tile_out`, and `v_tile_out` zero-copy into IOSurface `KvTile`s.
+pub fn emitCoreMlQkvProjectionBlock(
+    allocator: std.mem.Allocator,
+    spec: CoreMlQkvSpec,
+) ProtoEmitError![]u8 {
+    if (spec.hidden_size == 0 or spec.num_q_heads == 0 or spec.num_kv_heads == 0 or
+        spec.head_dim == 0 or spec.chunk_tokens == 0 or
+        (spec.hidden_size % KV_TILE_ROW_ALIGN_F16) != 0 or
+        (spec.head_dim % KV_TILE_ROW_ALIGN_F16) != 0)
+    {
+        return error.InvalidSpec;
+    }
+
+    const h = spec.hidden_size;
+    const qh = spec.num_q_heads;
+    const kvh = spec.num_kv_heads;
+    const d = spec.head_dim;
+    const s = spec.chunk_tokens;
+    const q_dim = std.math.mul(u32, qh, d) catch return error.InvalidSpec;
+    const kv_dim = std.math.mul(u32, kvh, d) catch return error.InvalidSpec;
+
+    const exp_q = std.math.mul(usize, q_dim, h) catch return error.InvalidSpec;
+    const exp_kv = std.math.mul(usize, kv_dim, h) catch return error.InvalidSpec;
+    if (spec.w_q.len != exp_q or spec.w_k.len != exp_kv or spec.w_v.len != exp_kv) {
+        return error.InvalidSpec;
+    }
+
+    var model_desc: std.ArrayList(u8) = .empty;
+    defer model_desc.deinit(allocator);
+    {
+        const f_x = try pbBuildFeatureDesc(allocator, "x_in", &.{ 1, s, h }, true);
+        defer allocator.free(f_x);
+        try pbAppendBytesField(allocator, &model_desc, 1, f_x);
+
+        const f_q = try pbBuildFeatureDesc(allocator, "q_out", &.{ 1, s, q_dim }, true);
+        defer allocator.free(f_q);
+        try pbAppendBytesField(allocator, &model_desc, 10, f_q);
+
+        const f_k = try pbBuildFeatureDesc(allocator, "k_tile_out", &.{ 1, kvh, s, d }, true);
+        defer allocator.free(f_k);
+        try pbAppendBytesField(allocator, &model_desc, 10, f_k);
+
+        const f_v = try pbBuildFeatureDesc(allocator, "v_tile_out", &.{ 1, kvh, s, d }, true);
+        defer allocator.free(f_v);
+        try pbAppendBytesField(allocator, &model_desc, 10, f_v);
+    }
+
+    var nn: std.ArrayList(u8) = .empty;
+    defer nn.deinit(allocator);
+    try pbAppendVarintField(allocator, &nn, 5, 1);
+
+    try pbAppendTransposeLayer(allocator, &nn, "x_tr", "x_in", "x_hs", &.{ 0, 2, 1 });
+    try pbAppendReshapeStaticLayer(allocator, &nn, "x_4d", "x_hs", "x_nchw", &.{ 1, h, 1, s });
+    try pbAppendConv1x1Layer(allocator, &nn, "q_proj", "x_nchw", "q_nchw", h, q_dim, spec.w_q);
+    try pbAppendConv1x1Layer(allocator, &nn, "k_proj", "x_nchw", "k_nchw", h, kv_dim, spec.w_k);
+    try pbAppendConv1x1Layer(allocator, &nn, "v_proj", "x_nchw", "v_nchw", h, kv_dim, spec.w_v);
+
+    try pbAppendReshapeStaticLayer(allocator, &nn, "q_r3", "q_nchw", "q_qs", &.{ 1, q_dim, s });
+    try pbAppendTransposeLayer(allocator, &nn, "q_tr", "q_qs", "q_out", &.{ 0, 2, 1 });
+
+    try pbAppendReshapeStaticLayer(allocator, &nn, "k_r4", "k_nchw", "k_hds", &.{ 1, kvh, d, s });
+    try pbAppendTransposeLayer(allocator, &nn, "k_tr", "k_hds", "k_tile_out", &.{ 0, 1, 3, 2 });
+
+    try pbAppendReshapeStaticLayer(allocator, &nn, "v_r4", "v_nchw", "v_hds", &.{ 1, kvh, d, s });
+    try pbAppendTransposeLayer(allocator, &nn, "v_tr", "v_hds", "v_tile_out", &.{ 0, 1, 3, 2 });
+
+    var root: std.ArrayList(u8) = .empty;
+    errdefer root.deinit(allocator);
+    try pbAppendVarintField(allocator, &root, 1, 7);
+    try pbAppendBytesField(allocator, &root, 2, model_desc.items);
+    try pbAppendBytesField(allocator, &root, 500, nn.items);
+    return root.toOwnedSlice(allocator);
+}
+
+/// Activation for an optional 2-layer bottleneck MLP router predictor (A2).
+pub const CoreMlRouterActivation = enum {
+    none,
+    relu,
+    silu,
+};
+
+/// Specification for an ANE Multi-Head MoE Router Predictor (`[M, hidden_size]`
+/// -> `[M, out_experts]` fp16, where `out_experts = lookahead_layers * num_experts`
+/// is a multiple of 32 for zero-copy `KvTile` `outputBackings`).
+pub const CoreMlRouterPredictorSpec = struct {
+    /// Batch rows `M >= 1` (`1` for single-token decode, `32`/`64` for tree verification).
+    batch_size: u32,
+    hidden_size: u32,
+    /// Total output router logits per token (`lookahead_layers * num_experts`, multiple of 32).
+    out_experts: u32,
+    /// `0` for direct 1-layer multi-head linear (`[out_experts, hidden_size]`);
+    /// `> 0` for a 2-layer bottleneck MLP (`hidden_size -> bottleneck_dim -> out_experts`).
+    bottleneck_dim: u32 = 0,
+    activation: CoreMlRouterActivation = .silu,
+    input_name: []const u8 = "x",
+    output_name: []const u8 = "logits",
+    /// Row-major `[out_experts, hidden_size]` if `bottleneck_dim == 0`,
+    /// or `[bottleneck_dim, hidden_size]` if `bottleneck_dim > 0`.
+    weights_layer1: []const f16,
+    /// Row-major `[out_experts, bottleneck_dim]`, required iff `bottleneck_dim > 0`.
+    weights_layer2: ?[]const f16 = null,
+};
+
+/// Emits an ANE-native CoreML `.mlmodel` protobuf (`specVersion = 7`, `FLOAT16` I/O)
+/// for cross-layer MoE expert prediction (`A2`).
+pub fn emitCoreMlRouterPredictor(
+    allocator: std.mem.Allocator,
+    spec: CoreMlRouterPredictorSpec,
+) ProtoEmitError![]u8 {
+    if (spec.batch_size == 0 or spec.hidden_size == 0 or spec.out_experts == 0 or
+        (spec.hidden_size % KV_TILE_ROW_ALIGN_F16) != 0 or
+        (spec.out_experts % KV_TILE_ROW_ALIGN_F16) != 0 or
+        spec.input_name.len == 0 or spec.output_name.len == 0)
+    {
+        return error.InvalidSpec;
+    }
+
+    const in_feat = try pbBuildFeatureDesc(allocator, spec.input_name, &.{ spec.batch_size, spec.hidden_size }, true);
+    defer allocator.free(in_feat);
+    const out_feat = try pbBuildFeatureDesc(allocator, spec.output_name, &.{ spec.batch_size, spec.out_experts }, true);
+    defer allocator.free(out_feat);
+
+    var model_desc: std.ArrayList(u8) = .empty;
+    defer model_desc.deinit(allocator);
+    try pbAppendBytesField(allocator, &model_desc, 1, in_feat);
+    try pbAppendBytesField(allocator, &model_desc, 10, out_feat);
+
+    var nn: std.ArrayList(u8) = .empty;
+    defer nn.deinit(allocator);
+    try pbAppendVarintField(allocator, &nn, 5, 1);
+
+    if (spec.bottleneck_dim == 0) {
+        if (spec.weights_layer2 != null) return error.InvalidSpec;
+        try pbAppendBatchedMatmulConstLayer(
+            allocator,
+            &nn,
+            "router_head",
+            spec.input_name,
+            spec.output_name,
+            spec.hidden_size,
+            spec.out_experts,
+            spec.weights_layer1,
+        );
+    } else {
+        const w2 = spec.weights_layer2 orelse return error.InvalidSpec;
+        try pbAppendBatchedMatmulConstLayer(
+            allocator,
+            &nn,
+            "mlp_fc1",
+            spec.input_name,
+            "h_pre",
+            spec.hidden_size,
+            spec.bottleneck_dim,
+            spec.weights_layer1,
+        );
+        const h_act_name: []const u8 = switch (spec.activation) {
+            .none => "h_pre",
+            .relu => blk: {
+                try pbAppendActivationReluLayer(allocator, &nn, "mlp_relu", "h_pre", "h_act");
+                break :blk "h_act";
+            },
+            .silu => blk: {
+                try pbAppendActivationSigmoidLayer(allocator, &nn, "mlp_sig", "h_pre", "h_sig");
+                try pbAppendLayer(allocator, &nn, "mlp_silu", &.{ "h_pre", "h_sig" }, &.{"h_act"}, 900, &.{});
+                break :blk "h_act";
+            },
+        };
+        try pbAppendBatchedMatmulConstLayer(
+            allocator,
+            &nn,
+            "mlp_fc2",
+            h_act_name,
+            spec.output_name,
+            spec.bottleneck_dim,
+            spec.out_experts,
+            w2,
+        );
+    }
+
+    var root: std.ArrayList(u8) = .empty;
+    errdefer root.deinit(allocator);
+    try pbAppendVarintField(allocator, &root, 1, 7);
     try pbAppendBytesField(allocator, &root, 2, model_desc.items);
     try pbAppendBytesField(allocator, &root, 500, nn.items);
     return root.toOwnedSlice(allocator);
@@ -1587,5 +2238,608 @@ test "CoreML ANE zero-copy IOSurface conv1x1 and innerProduct match CPU referenc
             }
         }
         try og.unlock();
+    }
+}
+
+fn fillTestF16(dst: []f16, seed: usize, scale: f32) void {
+    for (dst, 0..) |*v, i| {
+        const val: i32 = @as(i32, @intCast((i * 13 + seed * 29 + 5) % 19)) - 9;
+        v.* = @floatCast(@as(f32, @floatFromInt(val)) * scale);
+    }
+}
+
+test "emitCoreMlAttentionBlock multi-input/multi-output GQA matches CPU fp32 reference with 3/3 zero-copy KvTiles on ANE" {
+    const gpa = std.testing.allocator;
+    const device = try Device.open();
+    defer device.close();
+    const dev_info = try device.info();
+
+    const h: u32 = 64;
+    const qh: u32 = 4;
+    const kvh: u32 = 2;
+    const d: u32 = 32;
+    const s: u32 = 32;
+    const q_dim: u32 = qh * d;
+    const kv_dim: u32 = kvh * d;
+    const gqa: u32 = qh / kvh;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+
+    const w_q = try gpa.alloc(f16, @as(usize, q_dim) * h);
+    defer gpa.free(w_q);
+    const w_k = try gpa.alloc(f16, @as(usize, kv_dim) * h);
+    defer gpa.free(w_k);
+    const w_v = try gpa.alloc(f16, @as(usize, kv_dim) * h);
+    defer gpa.free(w_v);
+    const w_o = try gpa.alloc(f16, @as(usize, h) * q_dim);
+    defer gpa.free(w_o);
+    fillTestF16(w_q, 1, 0.03125);
+    fillTestF16(w_k, 2, 0.03125);
+    fillTestF16(w_v, 3, 0.03125);
+    fillTestF16(w_o, 4, 0.03125);
+
+    for ([_]u32{ 32, 64 }) |b_len| {
+        const past = b_len - s;
+        const spec_bytes = try emitCoreMlAttentionBlock(gpa, .{
+            .hidden_size = h,
+            .num_q_heads = qh,
+            .num_kv_heads = kvh,
+            .head_dim = d,
+            .chunk_tokens = s,
+            .kv_bucket_tokens = b_len,
+            .scale = scale,
+            .use_conv_proj = true,
+            .w_q = w_q,
+            .w_k = w_k,
+            .w_v = w_v,
+            .w_o = w_o,
+        });
+        defer gpa.free(spec_bytes);
+
+        const model = try AneModel.loadSpecData(spec_bytes, .cpu_and_neural_engine);
+        defer model.close();
+        const minfo = try model.info();
+        try std.testing.expect(minfo.totalLayers() >= 15);
+        if (dev_info.aneCoreCount() > 0) {
+            try std.testing.expect(minfo.usesNeuralEngine());
+        }
+
+        const counts = try model.ioCounts();
+        try std.testing.expectEqual(if (past > 0) @as(u32, 4) else @as(u32, 2), counts.inputs);
+        try std.testing.expectEqual(@as(u32, 3), counts.outputs);
+        var name_buf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("attn_out", try model.ioName(true, 0, &name_buf));
+        try std.testing.expectEqualStrings("k_tile_out", try model.ioName(true, 1, &name_buf));
+        try std.testing.expectEqualStrings("v_tile_out", try model.ioName(true, 2, &name_buf));
+
+        const x_tile = try KvTile.init(device, h, s, .{ .alias_buffer = true });
+        defer x_tile.close();
+        const mask_tile = try KvTile.init(device, b_len, s, .{});
+        defer mask_tile.close();
+        const out_tile = try KvTile.init(device, h, s, .{ .alias_buffer = true });
+        defer out_tile.close();
+        const k_out_tile = try KvTile.init(device, d, kvh * s, .{});
+        defer k_out_tile.close();
+        const v_out_tile = try KvTile.init(device, d, kvh * s, .{});
+        defer v_out_tile.close();
+
+        const x_host = try gpa.alloc(f16, @as(usize, s) * h);
+        defer gpa.free(x_host);
+        fillTestF16(x_host, 10 + b_len, 0.0625);
+        {
+            var g = try x_tile.lock(false);
+            errdefer g.release();
+            @memcpy(g.f16Slice()[0..x_host.len], x_host);
+            try g.unlock();
+        }
+
+        const mask_host = try gpa.alloc(f16, @as(usize, s) * b_len);
+        defer gpa.free(mask_host);
+        const valid_past: u32 = if (past > 0) past - 5 else 0;
+        for (0..s) |row| {
+            for (0..b_len) |col| {
+                const allow = if (col < past)
+                    (col < valid_past)
+                else
+                    (col - past <= row);
+                mask_host[row * b_len + col] = if (allow) @as(f16, @floatCast(0.0)) else @as(f16, @floatCast(-10000.0));
+            }
+        }
+        {
+            var g = try mask_tile.lock(false);
+            errdefer g.release();
+            @memcpy(g.f16Slice()[0..mask_host.len], mask_host);
+            try g.unlock();
+        }
+
+        const x_t = try AneTensor.fromKvTile(x_tile, &.{ 1, s, h });
+        defer x_t.close();
+        const mask_t = try AneTensor.fromKvTile(mask_tile, &.{ 1, 1, s, b_len });
+        defer mask_t.close();
+        const out_t = try AneTensor.fromKvTile(out_tile, &.{ 1, s, h });
+        defer out_t.close();
+        const ko_t = try AneTensor.fromKvTile(k_out_tile, &.{ 1, kvh, s, d });
+        defer ko_t.close();
+        const vo_t = try AneTensor.fromKvTile(v_out_tile, &.{ 1, kvh, s, d });
+        defer vo_t.close();
+
+        var kp_tile_opt: ?KvTile = null;
+        var vp_tile_opt: ?KvTile = null;
+        var kp_t_opt: ?AneTensor = null;
+        var vp_t_opt: ?AneTensor = null;
+        defer if (vp_t_opt) |t| t.close();
+        defer if (kp_t_opt) |t| t.close();
+        defer if (vp_tile_opt) |t| t.close();
+        defer if (kp_tile_opt) |t| t.close();
+
+        const kp_host = try gpa.alloc(f16, @as(usize, kvh) * past * d);
+        defer gpa.free(kp_host);
+        const vp_host = try gpa.alloc(f16, @as(usize, kvh) * past * d);
+        defer gpa.free(vp_host);
+
+        var in_binds: [4]AneBinding = undefined;
+        var in_count: usize = 0;
+        in_binds[in_count] = .{ .name = "x_in", .tensor = x_t };
+        in_count += 1;
+        if (past > 0) {
+            fillTestF16(kp_host, 21, 0.0625);
+            fillTestF16(vp_host, 22, 0.0625);
+            kp_tile_opt = try KvTile.init(device, d, kvh * past, .{});
+            vp_tile_opt = try KvTile.init(device, d, kvh * past, .{});
+            {
+                var g = try kp_tile_opt.?.lock(false);
+                errdefer g.release();
+                @memcpy(g.f16Slice()[0..kp_host.len], kp_host);
+                try g.unlock();
+            }
+            {
+                var g = try vp_tile_opt.?.lock(false);
+                errdefer g.release();
+                @memcpy(g.f16Slice()[0..vp_host.len], vp_host);
+                try g.unlock();
+            }
+            kp_t_opt = try AneTensor.fromKvTile(kp_tile_opt.?, &.{ 1, kvh, past, d });
+            vp_t_opt = try AneTensor.fromKvTile(vp_tile_opt.?, &.{ 1, kvh, past, d });
+            in_binds[in_count] = .{ .name = "k_past", .tensor = kp_t_opt.? };
+            in_count += 1;
+            in_binds[in_count] = .{ .name = "v_past", .tensor = vp_t_opt.? };
+            in_count += 1;
+        }
+        in_binds[in_count] = .{ .name = "mask", .tensor = mask_t };
+        in_count += 1;
+
+        const out_binds = [_]AneBinding{
+            .{ .name = "attn_out", .tensor = out_t },
+            .{ .name = "k_tile_out", .tensor = ko_t },
+            .{ .name = "v_tile_out", .tensor = vo_t },
+        };
+        const plan = try AnePlan.init(in_binds[0..in_count], &out_binds);
+        defer plan.close();
+
+        const pinfo = try model.predict(plan);
+        try std.testing.expectEqual(@as(u32, 3), pinfo.outputsTotal());
+        try std.testing.expect(pinfo.allOutputsZeroCopy());
+
+        // CPU fp64 reference: Q, K_cur, V_cur, concat past, causal GQA attention, O_proj.
+        const q_ref = try gpa.alloc(f64, @as(usize, qh) * s * d);
+        defer gpa.free(q_ref);
+        const k_cur_ref = try gpa.alloc(f64, @as(usize, kvh) * s * d);
+        defer gpa.free(k_cur_ref);
+        const v_cur_ref = try gpa.alloc(f64, @as(usize, kvh) * s * d);
+        defer gpa.free(v_cur_ref);
+
+        for (0..s) |ti| {
+            for (0..qh) |head| {
+                for (0..d) |di| {
+                    var acc: f64 = 0.0;
+                    const row_w = head * d + di;
+                    for (0..h) |ci| {
+                        acc += @as(f64, @floatCast(x_host[ti * h + ci])) * @as(f64, @floatCast(w_q[row_w * h + ci]));
+                    }
+                    q_ref[(head * s + ti) * d + di] = acc;
+                }
+            }
+            for (0..kvh) |head| {
+                for (0..d) |di| {
+                    var ak: f64 = 0.0;
+                    var av: f64 = 0.0;
+                    const row_w = head * d + di;
+                    for (0..h) |ci| {
+                        const xv: f64 = @floatCast(x_host[ti * h + ci]);
+                        ak += xv * @as(f64, @floatCast(w_k[row_w * h + ci]));
+                        av += xv * @as(f64, @floatCast(w_v[row_w * h + ci]));
+                    }
+                    k_cur_ref[(head * s + ti) * d + di] = ak;
+                    v_cur_ref[(head * s + ti) * d + di] = av;
+                }
+            }
+        }
+
+        // Verify k_tile_out and v_tile_out directly on IOSurface pages.
+        {
+            var kg = try k_out_tile.lock(true);
+            errdefer kg.release();
+            var vg = try v_out_tile.lock(true);
+            errdefer vg.release();
+            for (k_cur_ref, kg.f16Slice()[0..k_cur_ref.len]) |exp, got_h| {
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(exp)), @as(f32, @floatCast(got_h)), 0.02);
+            }
+            for (v_cur_ref, vg.f16Slice()[0..v_cur_ref.len]) |exp, got_h| {
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(exp)), @as(f32, @floatCast(got_h)), 0.02);
+            }
+            try vg.unlock();
+            try kg.unlock();
+        }
+
+        // Compute CPU GQA context & O projection and compare with attn_out.
+        const ctx_ref = try gpa.alloc(f64, @as(usize, s) * q_dim);
+        defer gpa.free(ctx_ref);
+        const scores = try gpa.alloc(f64, b_len);
+        defer gpa.free(scores);
+
+        for (0..qh) |head| {
+            const kvh_i = head / gqa;
+            for (0..s) |ti| {
+                var max_s: f64 = -std.math.inf(f64);
+                for (0..b_len) |bi| {
+                    var dot_v: f64 = 0.0;
+                    for (0..d) |di| {
+                        const qv = q_ref[(head * s + ti) * d + di];
+                        const kv = if (bi < past)
+                            @as(f64, @floatCast(kp_host[(kvh_i * past + bi) * d + di]))
+                        else
+                            k_cur_ref[(kvh_i * s + (bi - past)) * d + di];
+                        dot_v += qv * kv;
+                    }
+                    const sc = dot_v * @as(f64, scale) + @as(f64, @floatCast(mask_host[ti * b_len + bi]));
+                    scores[bi] = sc;
+                    if (sc > max_s) max_s = sc;
+                }
+                var sum_e: f64 = 0.0;
+                for (0..b_len) |bi| {
+                    scores[bi] = @exp(scores[bi] - max_s);
+                    sum_e += scores[bi];
+                }
+                for (0..d) |di| {
+                    var acc: f64 = 0.0;
+                    for (0..b_len) |bi| {
+                        const vv = if (bi < past)
+                            @as(f64, @floatCast(vp_host[(kvh_i * past + bi) * d + di]))
+                        else
+                            v_cur_ref[(kvh_i * s + (bi - past)) * d + di];
+                        acc += (scores[bi] / sum_e) * vv;
+                    }
+                    ctx_ref[ti * q_dim + head * d + di] = acc;
+                }
+            }
+        }
+
+        var og = try out_tile.lock(true);
+        errdefer og.release();
+        const got_out = og.f16Slice();
+        for (0..s) |ti| {
+            for (0..h) |ci| {
+                var acc: f64 = 0.0;
+                for (0..q_dim) |qi| {
+                    acc += ctx_ref[ti * q_dim + qi] * @as(f64, @floatCast(w_o[ci * q_dim + qi]));
+                }
+                const got: f32 = @floatCast(got_out[ti * h + ci]);
+                const exp: f32 = @floatCast(acc);
+                try std.testing.expectApproxEqAbs(exp, got, @max(0.025, @abs(exp) * 0.03));
+            }
+        }
+        try og.unlock();
+    }
+}
+
+test "emitCoreMlQkvProjectionBlock, emitCoreMlRouterPredictor (linear & SiLU MLP), and .mlpackage loadPath work zero-copy on ANE" {
+    const gpa = std.testing.allocator;
+    const device = try Device.open();
+    defer device.close();
+    const dev_info = try device.info();
+
+    // 1. Fixed-shape QKV projection block
+    {
+        const h: u32 = 64;
+        const qh: u32 = 4;
+        const kvh: u32 = 2;
+        const d: u32 = 32;
+        const s: u32 = 32;
+        const q_dim: u32 = qh * d;
+        const kv_dim: u32 = kvh * d;
+
+        const w_q = try gpa.alloc(f16, @as(usize, q_dim) * h);
+        defer gpa.free(w_q);
+        const w_k = try gpa.alloc(f16, @as(usize, kv_dim) * h);
+        defer gpa.free(w_k);
+        const w_v = try gpa.alloc(f16, @as(usize, kv_dim) * h);
+        defer gpa.free(w_v);
+        fillTestF16(w_q, 5, 0.03125);
+        fillTestF16(w_k, 6, 0.03125);
+        fillTestF16(w_v, 7, 0.03125);
+
+        const spec_bytes = try emitCoreMlQkvProjectionBlock(gpa, .{
+            .hidden_size = h,
+            .num_q_heads = qh,
+            .num_kv_heads = kvh,
+            .head_dim = d,
+            .chunk_tokens = s,
+            .w_q = w_q,
+            .w_k = w_k,
+            .w_v = w_v,
+        });
+        defer gpa.free(spec_bytes);
+
+        const model = try AneModel.loadSpecData(spec_bytes, .cpu_and_neural_engine);
+        defer model.close();
+        if (dev_info.aneCoreCount() > 0) try std.testing.expect((try model.info()).usesNeuralEngine());
+
+        const x_tile = try KvTile.init(device, h, s, .{});
+        defer x_tile.close();
+        const q_tile = try KvTile.init(device, q_dim, s, .{});
+        defer q_tile.close();
+        const k_tile = try KvTile.init(device, d, kvh * s, .{});
+        defer k_tile.close();
+        const v_tile = try KvTile.init(device, d, kvh * s, .{});
+        defer v_tile.close();
+
+        const x_host = try gpa.alloc(f16, @as(usize, s) * h);
+        defer gpa.free(x_host);
+        fillTestF16(x_host, 8, 0.0625);
+        {
+            var g = try x_tile.lock(false);
+            errdefer g.release();
+            @memcpy(g.f16Slice()[0..x_host.len], x_host);
+            try g.unlock();
+        }
+
+        const x_t = try AneTensor.fromKvTile(x_tile, &.{ 1, s, h });
+        defer x_t.close();
+        const q_t = try AneTensor.fromKvTile(q_tile, &.{ 1, s, q_dim });
+        defer q_t.close();
+        const k_t = try AneTensor.fromKvTile(k_tile, &.{ 1, kvh, s, d });
+        defer k_t.close();
+        const v_t = try AneTensor.fromKvTile(v_tile, &.{ 1, kvh, s, d });
+        defer v_t.close();
+
+        const plan = try AnePlan.init(
+            &.{.{ .name = "x_in", .tensor = x_t }},
+            &.{
+                .{ .name = "q_out", .tensor = q_t },
+                .{ .name = "k_tile_out", .tensor = k_t },
+                .{ .name = "v_tile_out", .tensor = v_t },
+            },
+        );
+        defer plan.close();
+
+        const pinfo = try model.predict(plan);
+        try std.testing.expectEqual(@as(u32, 3), pinfo.outputsTotal());
+        try std.testing.expect(pinfo.allOutputsZeroCopy());
+
+        var qg = try q_tile.lock(true);
+        errdefer qg.release();
+        const q_got = qg.f16Slice();
+        for (0..s) |ti| {
+            for (0..q_dim) |qi| {
+                var acc: f32 = 0.0;
+                for (0..h) |ci| {
+                    acc += @as(f32, @floatCast(x_host[ti * h + ci])) * @as(f32, @floatCast(w_q[qi * h + ci]));
+                }
+                try std.testing.expectApproxEqAbs(acc, @as(f32, @floatCast(q_got[ti * q_dim + qi])), 0.02);
+            }
+        }
+        try qg.unlock();
+    }
+
+    // 2. Multi-head router predictor (1-layer linear + 2-layer SiLU bottleneck MLP) + real .mlpackage loadPath
+    {
+        // 2a. 1-layer linear predictor (in-memory)
+        {
+            const m: u32 = 4;
+            const h: u32 = 64;
+            const out_e: u32 = 64;
+            const w1 = try gpa.alloc(f16, @as(usize, out_e) * h);
+            defer gpa.free(w1);
+            fillTestF16(w1, 9, 0.0625);
+
+            const spec_lin = try emitCoreMlRouterPredictor(gpa, .{
+                .batch_size = m,
+                .hidden_size = h,
+                .out_experts = out_e,
+                .weights_layer1 = w1,
+            });
+            defer gpa.free(spec_lin);
+
+            const model = try AneModel.loadSpecData(spec_lin, .cpu_and_neural_engine);
+            defer model.close();
+            if (dev_info.aneCoreCount() > 0) try std.testing.expect((try model.info()).usesNeuralEngine());
+
+            const x_tile = try KvTile.init(device, h, m, .{});
+            defer x_tile.close();
+            const y_tile = try KvTile.init(device, out_e, m, .{});
+            defer y_tile.close();
+
+            const x_host = try gpa.alloc(f16, @as(usize, m) * h);
+            defer gpa.free(x_host);
+            fillTestF16(x_host, 10, 0.0625);
+            {
+                var g = try x_tile.lock(false);
+                errdefer g.release();
+                @memcpy(g.f16Slice()[0..x_host.len], x_host);
+                try g.unlock();
+            }
+
+            const x_t = try AneTensor.fromKvTile(x_tile, &.{ m, h });
+            defer x_t.close();
+            const y_t = try AneTensor.fromKvTile(y_tile, &.{ m, out_e });
+            defer y_t.close();
+            const plan = try AnePlan.init(&.{.{ .name = "x", .tensor = x_t }}, &.{.{ .name = "logits", .tensor = y_t }});
+            defer plan.close();
+
+            const pinfo = try model.predict(plan);
+            try std.testing.expect(pinfo.allOutputsZeroCopy());
+
+            var yg = try y_tile.lock(true);
+            errdefer yg.release();
+            const y_got = yg.f16Slice();
+            for (0..m) |mi| {
+                for (0..out_e) |ei| {
+                    var acc: f64 = 0.0;
+                    for (0..h) |ci| {
+                        acc += @as(f64, @floatCast(x_host[mi * h + ci])) * @as(f64, @floatCast(w1[ei * h + ci]));
+                    }
+                    const exp: f32 = @floatCast(acc);
+                    try std.testing.expectApproxEqAbs(exp, @as(f32, @floatCast(y_got[mi * out_e + ei])), @max(0.02, @abs(exp) * 0.02));
+                }
+            }
+            try yg.unlock();
+        }
+
+        // 2b. 2-layer SiLU bottleneck MLP loaded from real .mlpackage directory on disk
+        // (sized at realistic hidden=2048 so CoreML's planner places all 4 layers on ANE)
+        const m: u32 = 4;
+        const h: u32 = 2048;
+        const bn: u32 = 256;
+        const out_e: u32 = 256; // 2 lookahead layers * 128 experts
+
+        const w1 = try gpa.alloc(f16, @as(usize, bn) * h);
+        defer gpa.free(w1);
+        const w2 = try gpa.alloc(f16, @as(usize, out_e) * bn);
+        defer gpa.free(w2);
+        fillTestF16(w1, 11, 0.0078125);
+        fillTestF16(w2, 12, 0.015625);
+
+        const spec_bytes = try emitCoreMlRouterPredictor(gpa, .{
+            .batch_size = m,
+            .hidden_size = h,
+            .out_experts = out_e,
+            .bottleneck_dim = bn,
+            .activation = .silu,
+            .weights_layer1 = w1,
+            .weights_layer2 = w2,
+        });
+        defer gpa.free(spec_bytes);
+
+        // Write a real CoreML .mlpackage directory bundle in TMPDIR and load via AneModel.loadPath!
+        const tmp_root = std.mem.sliceTo(std.c.getenv("TMPDIR") orelse "/Volumes/Akari/.tmp", 0);
+        const pid = std.c.getpid();
+        var pkg_buf: [512]u8 = undefined;
+        var data_dir_buf: [512]u8 = undefined;
+        var coreml_dir_buf: [512]u8 = undefined;
+        var manifest_buf: [512]u8 = undefined;
+        var model_buf: [512]u8 = undefined;
+
+        const pkg_str = try std.fmt.bufPrint(pkg_buf[0 .. pkg_buf.len - 1], "{s}/aminfer_test_pred_{d}.mlpackage", .{ tmp_root, pid });
+        pkg_buf[pkg_str.len] = 0;
+        const pkg_z: [:0]const u8 = pkg_buf[0..pkg_str.len :0];
+
+        const data_dir = try std.fmt.bufPrint(data_dir_buf[0 .. data_dir_buf.len - 1], "{s}/Data", .{pkg_str});
+        data_dir_buf[data_dir.len] = 0;
+        const coreml_dir = try std.fmt.bufPrint(coreml_dir_buf[0 .. coreml_dir_buf.len - 1], "{s}/Data/com.apple.CoreML", .{pkg_str});
+        coreml_dir_buf[coreml_dir.len] = 0;
+        const manifest_path = try std.fmt.bufPrint(manifest_buf[0 .. manifest_buf.len - 1], "{s}/Manifest.json", .{pkg_str});
+        manifest_buf[manifest_path.len] = 0;
+        const model_path = try std.fmt.bufPrint(model_buf[0 .. model_buf.len - 1], "{s}/Data/com.apple.CoreML/model.mlmodel", .{pkg_str});
+        model_buf[model_path.len] = 0;
+
+        _ = std.c.mkdir(pkg_z.ptr, 0o755);
+        _ = std.c.mkdir(@ptrCast(data_dir_buf[0..data_dir.len :0].ptr), 0o755);
+        _ = std.c.mkdir(@ptrCast(coreml_dir_buf[0..coreml_dir.len :0].ptr), 0o755);
+        defer {
+            _ = std.c.unlink(@ptrCast(model_buf[0..model_path.len :0].ptr));
+            _ = std.c.unlink(@ptrCast(manifest_buf[0..manifest_path.len :0].ptr));
+            _ = std.c.rmdir(@ptrCast(coreml_dir_buf[0..coreml_dir.len :0].ptr));
+            _ = std.c.rmdir(@ptrCast(data_dir_buf[0..data_dir.len :0].ptr));
+            _ = std.c.rmdir(pkg_z.ptr);
+        }
+
+        const manifest_json =
+            \\{
+            \\  "fileFormatVersion": "1.0.0",
+            \\  "itemInfoEntries": {
+            \\    "00000000-0000-0000-0000-000000000001": {
+            \\      "author": "com.apple.CoreML",
+            \\      "description": "CoreML Model Specification",
+            \\      "name": "model.mlmodel",
+            \\      "path": "com.apple.CoreML/model.mlmodel"
+            \\    }
+            \\  },
+            \\  "rootModelIdentifier": "00000000-0000-0000-0000-000000000001"
+            \\}
+        ;
+        inline for (.{
+            .{ manifest_buf[0..manifest_path.len :0], manifest_json },
+            .{ model_buf[0..model_path.len :0], spec_bytes },
+        }) |pair| {
+            const fd = std.c.open(pair[0].ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+            try std.testing.expect(fd >= 0);
+            defer _ = std.c.close(fd);
+            var written: usize = 0;
+            while (written < pair[1].len) {
+                const n = std.c.write(fd, pair[1].ptr + written, pair[1].len - written);
+                try std.testing.expect(n > 0);
+                written += @intCast(n);
+            }
+        }
+
+        const model = try AneModel.loadPath(pkg_z, .cpu_and_neural_engine);
+        defer model.close();
+        if (dev_info.aneCoreCount() > 0) try std.testing.expect((try model.info()).usesNeuralEngine());
+
+        const counts = try model.ioCounts();
+        try std.testing.expectEqual(@as(u32, 1), counts.inputs);
+        try std.testing.expectEqual(@as(u32, 1), counts.outputs);
+        var nbuf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("x", try model.ioName(false, 0, &nbuf));
+        try std.testing.expectEqualStrings("logits", try model.ioName(true, 0, &nbuf));
+
+        const x_tile = try KvTile.init(device, h, m, .{});
+        defer x_tile.close();
+        const y_tile = try KvTile.init(device, out_e, m, .{});
+        defer y_tile.close();
+
+        const x_host = try gpa.alloc(f16, @as(usize, m) * h);
+        defer gpa.free(x_host);
+        fillTestF16(x_host, 13, 0.0625);
+        {
+            var g = try x_tile.lock(false);
+            errdefer g.release();
+            @memcpy(g.f16Slice()[0..x_host.len], x_host);
+            try g.unlock();
+        }
+
+        const x_t = try AneTensor.fromKvTile(x_tile, &.{ m, h });
+        defer x_t.close();
+        const y_t = try AneTensor.fromKvTile(y_tile, &.{ m, out_e });
+        defer y_t.close();
+        const plan = try AnePlan.init(&.{.{ .name = "x", .tensor = x_t }}, &.{.{ .name = "logits", .tensor = y_t }});
+        defer plan.close();
+
+        const pinfo = try model.predict(plan);
+        try std.testing.expectEqual(@as(u32, 1), pinfo.outputsTotal());
+        try std.testing.expect(pinfo.allOutputsZeroCopy());
+
+        var yg = try y_tile.lock(true);
+        errdefer yg.release();
+        const y_got = yg.f16Slice();
+        var hidden_tmp: [bn]f64 = undefined;
+        for (0..m) |mi| {
+            for (0..bn) |bi| {
+                var acc: f64 = 0.0;
+                for (0..h) |ci| {
+                    acc += @as(f64, @floatCast(x_host[mi * h + ci])) * @as(f64, @floatCast(w1[bi * h + ci]));
+                }
+                hidden_tmp[bi] = acc / (1.0 + @exp(-acc));
+            }
+            for (0..out_e) |ei| {
+                var acc: f64 = 0.0;
+                for (0..bn) |bi| {
+                    acc += hidden_tmp[bi] * @as(f64, @floatCast(w2[ei * bn + bi]));
+                }
+                const exp: f32 = @floatCast(acc);
+                const got: f32 = @floatCast(y_got[mi * out_e + ei]);
+                try std.testing.expectApproxEqAbs(exp, got, @max(0.02, @abs(exp) * 0.02));
+            }
+        }
+        try yg.unlock();
     }
 }

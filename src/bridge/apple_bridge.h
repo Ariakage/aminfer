@@ -310,6 +310,15 @@ ami_status ami_ane_model_load_path(const char *path, uint32_t compute_units,
                                    ami_ane_model **out_model);
 
 /*
+ * Like ami_ane_model_load_path, optionally selecting a named function from a
+ * multi-function CoreML model package/bundle (`function_name == NULL` or ""
+ * selects the default function). Startup only.
+ */
+ami_status ami_ane_model_load_path_ex(const char *path, const char *function_name,
+                                      uint32_t compute_units,
+                                      ami_ane_model **out_model);
+
+/*
  * Compiles and loads a CoreML .mlmodel protobuf directly from in-memory bytes
  * via MLModelAsset (zero temporary disk files). Startup only.
  */
@@ -319,6 +328,18 @@ ami_status ami_ane_model_load_spec_data(const void *spec_bytes, size_t spec_len,
 
 void ami_ane_model_destroy(ami_ane_model *model);
 ami_status ami_ane_model_query(const ami_ane_model *model, ami_ane_model_info *out_info);
+
+/* Queries the input and output feature counts declared by `model`. */
+ami_status ami_ane_model_io_counts(const ami_ane_model *model,
+                                   uint32_t *out_input_count,
+                                   uint32_t *out_output_count);
+
+/*
+ * Copies the NUL-terminated name of the `index`-th lexicographically sorted
+ * input (`is_output == 0`) or output (`is_output != 0`) feature into `out_buf`.
+ */
+ami_status ami_ane_model_io_name(const ami_ane_model *model, uint32_t is_output,
+                                 uint32_t index, char *out_buf, size_t out_cap);
 
 /*
  * Wraps an IOSurface-backed KvTile's CVPixelBuffer (OneComponent16Half) as a

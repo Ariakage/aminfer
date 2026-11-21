@@ -1214,6 +1214,12 @@ static void populate_compute_plan_info(MLComputePlan *plan, ami_ane_model_info *
 
 ami_status ami_ane_model_load_path(const char *path, uint32_t compute_units,
                                    ami_ane_model **out_model) {
+    return ami_ane_model_load_path_ex(path, NULL, compute_units, out_model);
+}
+
+ami_status ami_ane_model_load_path_ex(const char *path, const char *function_name,
+                                      uint32_t compute_units,
+                                      ami_ane_model **out_model) {
     if (out_model == NULL) {
         return AMI_ERR_INVALID_ARGUMENT;
     }
@@ -1228,14 +1234,22 @@ ami_status ami_ane_model_load_path(const char *path, uint32_t compute_units,
         if (ns_path == nil) {
             return AMI_ERR_INVALID_ARGUMENT;
         }
-        NSURL *src_url = [NSURL fileURLWithPath:ns_path];
+        NSURL *src_url = [[NSURL fileURLWithPath:ns_path] URLByStandardizingPath];
         if (src_url == nil) {
             return AMI_ERR_INVALID_ARGUMENT;
         }
 
+        NSString *ns_fn = nil;
+        if (function_name != NULL && function_name[0] != '\0') {
+            ns_fn = [NSString stringWithUTF8String:function_name];
+            if (ns_fn == nil) {
+                return AMI_ERR_INVALID_ARGUMENT;
+            }
+        }
+
         NSURL *compiled_url = src_url;
         bool owns_temp = false;
-        NSString *ext = ns_path.pathExtension.lowercaseString;
+        NSString *ext = src_url.pathExtension.lowercaseString;
         if (![ext isEqualToString:@"mlmodelc"]) {
             dispatch_semaphore_t compile_sem = dispatch_semaphore_create(0);
             if (compile_sem == NULL) {
@@ -1258,6 +1272,9 @@ ami_status ami_ane_model_load_path(const char *path, uint32_t compute_units,
 
         MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
         cfg.computeUnits = units;
+        if (ns_fn != nil) {
+            cfg.functionName = ns_fn;
+        }
 
         NSError *error = nil;
         MLModel *ml_model = [MLModel modelWithContentsOfURL:compiled_url
@@ -1396,6 +1413,60 @@ ami_status ami_ane_model_query(const ami_ane_model *model, ami_ane_model_info *o
         return AMI_ERR_INVALID_ARGUMENT;
     }
     *out_info = model->info;
+    return AMI_OK;
+}
+
+ami_status ami_ane_model_io_counts(const ami_ane_model *model,
+                                   uint32_t *out_input_count,
+                                   uint32_t *out_output_count) {
+    if (out_input_count != NULL) *out_input_count = 0;
+    if (out_output_count != NULL) *out_output_count = 0;
+    if (model == NULL || model->ml_model == NULL ||
+        out_input_count == NULL || out_output_count == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    @autoreleasepool {
+        MLModel *ml_model = (__bridge MLModel *)model->ml_model;
+        MLModelDescription *desc = ml_model.modelDescription;
+        if (desc == nil) {
+            return AMI_ERR_ANE;
+        }
+        *out_input_count = (uint32_t)desc.inputDescriptionsByName.count;
+        *out_output_count = (uint32_t)desc.outputDescriptionsByName.count;
+    }
+    return AMI_OK;
+}
+
+ami_status ami_ane_model_io_name(const ami_ane_model *model, uint32_t is_output,
+                                 uint32_t index, char *out_buf, size_t out_cap) {
+    if (out_buf != NULL && out_cap > 0) {
+        out_buf[0] = '\0';
+    }
+    if (model == NULL || model->ml_model == NULL || out_buf == NULL || out_cap == 0) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    @autoreleasepool {
+        MLModel *ml_model = (__bridge MLModel *)model->ml_model;
+        MLModelDescription *desc = ml_model.modelDescription;
+        if (desc == nil) {
+            return AMI_ERR_ANE;
+        }
+        NSDictionary<NSString *, MLFeatureDescription *> *dict =
+            (is_output != 0) ? desc.outputDescriptionsByName : desc.inputDescriptionsByName;
+        if (dict == nil || index >= (uint32_t)dict.count) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+        NSArray<NSString *> *keys =
+            [dict.allKeys sortedArrayUsingSelector:@selector(compare:)];
+        const char *utf8 = keys[index].UTF8String;
+        if (utf8 == NULL) {
+            return AMI_ERR_ANE;
+        }
+        if (strlcpy(out_buf, utf8, out_cap) >= out_cap) {
+            out_buf[0] = '\0';
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
     return AMI_OK;
 }
 
@@ -1594,8 +1665,13 @@ ami_status ami_ane_model_predict(const ami_ane_model *model, const ami_ane_plan 
             if (got_arr == nil) {
                 return AMI_ERR_ANE;
             }
+            IOSurfaceRef got_surface =
+                (got_arr.pixelBuffer != NULL) ? CVPixelBufferGetIOSurface(got_arr.pixelBuffer) : NULL;
+            IOSurfaceRef exp_surface =
+                (plan->output_pbs[i] != NULL) ? CVPixelBufferGetIOSurface(plan->output_pbs[i]) : NULL;
             if (got_arr == expected_arr ||
-                (got_arr.pixelBuffer != NULL && got_arr.pixelBuffer == plan->output_pbs[i])) {
+                (got_arr.pixelBuffer != NULL && got_arr.pixelBuffer == plan->output_pbs[i]) ||
+                (got_surface != NULL && got_surface == exp_surface)) {
                 matched++;
             } else {
                 // CoreML did not honor outputBacking (e.g. CPUOnly fallback); copy into destination

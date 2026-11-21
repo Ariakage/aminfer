@@ -25,6 +25,8 @@ pub const draft = @import("spec/draft.zig");
 pub const engine = @import("spec/engine.zig");
 pub const aio = @import("storage/aio.zig");
 pub const cache = @import("storage/cache.zig");
+pub const wavefront = @import("ane/wavefront.zig");
+pub const predictor = @import("ane/predictor.zig");
 
 test {
     _ = metal;
@@ -51,4 +53,6 @@ test {
     _ = engine;
     _ = aio;
     _ = cache;
+    _ = wavefront;
+    _ = predictor;
 }
