@@ -24,6 +24,7 @@ I/O and Metal 4 submission layers intact:
 | `FfnKind` | `dense_swiglu` · `moe_swiglu` (up to ≥512 routed experts, top-k + optional `shared_expert`) | Qwen3-14B · Qwen3-30B-A3B, Qwen3.8, DeepSeek-V4.1-Flash-1017 |
 | `ResidualKind` | `single_stream` · `gated_4branch` (GR) · `mhc_single_pass` (Mega-mHC) | Qwen3 · Qwen3.8 · DeepSeek-V4.1-Flash-1017 |
 | `MemoryLookupKind` | `none` · `ple_ngram` (51B) · `engram` (196B) | Qwen3 · Qwen3.8 · DeepSeek-V4.1-Flash-1017 |
+| `LoopSchedule` | `single_pass` (`max_loops = 1`) · `native_recurrent` (`Prelude → Core × R → Coda`) · `gated_loop_adapter` (L2-resident SME2 `Step-LoRA` + zero-init scalar gate `α_r`, [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)) | Standard models · Huginn / LoopLM · Adapter-extended Qwen3, Qwen3.8, DeepSeek-V4.1-Flash-1017 |
 
 ## Tiered hardware and model matrix
 
@@ -38,9 +39,11 @@ matching M1/M2 `.amf` packing).
 
 ### Optional GSQ-RCO footprint reduction across Tiers 1–3
 
-> **Confirmed / Optional Pipeline** ([ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md),
-> capabilities `W14` / `G13` in [../status.md](../status.md), not yet
-> implemented).
+> **Optional Pipeline** ([ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)
+> and [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md);
+> capabilities `W14`, `W17`, and `G13` in [../status.md](../status.md); M5
+> baseline measurements in
+> [../benchmarks/results.md](../benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization)).
 
 The uniform-precision sizes in the matrix above (`3-bit`, `4-bit`, `FP16` /
 `BF16`) remain the default export path and mandatory benchmark baseline. As an
@@ -102,9 +105,51 @@ DRAM footprint (`swapouts_delta = 0`), effective `bytes/token`, and `tok/s` in
    indexer top-k tile/block selection before reading `KvTile`s.
 4. **4-branch Gated Residual (GR)**: widen the inter-layer residual buffer to
    4 branches with fused elementwise read-gate and scalar write-gate kernels.
-5. **Offline `qwen4_exp` converter**: extend `tools/` to strip optional vision
-   towers for text/code serving, export the 125B backbone + 4B MTP head, and
-   emit sharded 16 KiB-aligned PLE `.amf` tables; reuse `Tokenizer.fromHuggingFaceJson`.
+5. **Offline `qwen4_exp` converter & synthetic-first validation**: extend
+   `tools/` to strip optional vision towers for text/code serving, export the
+   125B backbone + 4B MTP head, emit sharded 16 KiB-aligned PLE `.amf` tables,
+   and generate deterministic synthetic / scale-calibrated `qwen4_exp` bundles so
+   every M6 operator and 24 GB M4 wired budget is verified prior to drop-in real
+   checkpoint import; reuse `Tokenizer.fromHuggingFaceJson`.
+
+### Composable recurrent depth (`LoopSchedule`) and `SelfSpecRecurrent` (`ADR-0019`)
+
+Accepted in [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)
+(capabilities `W9`, `W16`, `D12`, `D13` in [../status.md](../status.md)):
+
+- **Unified schedule for native and adapter-extended models**: native looped
+  models (`Prelude → [Core] × R → Coda`) and frozen checkpoints augmented offline
+  with a non-destructive **Gated Loop Adapter** (`Step-LoRA` + zero-initialized
+  scalar gate `α_r` where `α_0 = 0` preserves bit-exact `r = 0` identity) both
+  execute through `LoopSchedule`. Compact `2–12 MiB` `Step-LoRA` adapters reside
+  in `sme2_panel64` inside M4's `16 MiB` P-cluster L2 (`ld1b`) and run on ARMv9
+  SME2 without Metal GPU contention (`D13`).
+- **Batch tree verification flips the `1/R` bandwidth penalty (`D12`)**:
+  `SelfSpecRecurrent` uses a shallow `r = 1` (or `r = 0` / `EAGLE-3` / `4B MTP`)
+  pass to draft an `M = 8..16` candidate tree and verifies all `M` nodes in one
+  compute-dense `Core × R` pass under lossless `D9` acceptance, skipping
+  full-vocabulary `lm_head` on intermediate iterations `r < R - 1` (with opt-in
+  `g = sigmoid(w · h)` early exit for approximate mode).
+- **Four mandatory hybrid-sparse isolations on `r < R - 1`**:
+  1. **Gated DeltaNet (`R6`, `G8`)**: evaluate intermediate loop steps into wired
+     scratch `S_tmp` and commit persistent `S_t` strictly once at `r = R - 1`.
+  2. **External tables (`C10` `51B PLE` / `196B Engram`)**: read NVMe `F_NOCACHE`
+     rows once at `r = 0` and hold them in a wired slot across `r >= 1`.
+  3. **Sparse indexers (`G9` `QSA` / `G11` `CSA2 Reuse`)**: reuse `r = 0` block
+     top-k indices across `r >= 1` when KV keys do not grow.
+  4. **MoE routing (`G3`/`G7`, `C5`)**: deduplicate active experts across the
+     `M = 8..16` batch and confine `r >= 1` routing to wired / pinned
+     `ExpertSlotPool` slots (`0` extra NVMe stalls).
+
+### M6.5 serving, long-context and multimodal bridge (`ADR-0019`)
+
+Between M6 (`Qwen3.8-Flash-Next` text/MoE/PLE core) and M7 (`deepseek41`
+cluster scale-out), Milestone **M6.5** lands four orthogonal systems multipliers
+tracked in [../status.md](../status.md): iteration-level continuous batching +
+domain `.ang` switching (`C14`), shared prefix `KvTile` / `GDN` state caching
+(`R8`), GPU-side group-64 `q8` retired 32K+ KV compression (`R5`), and zero-copy
+`VideoToolbox → IOSurface → MTLTexture / MLMultiArray` vision/video ingress into
+interleaved MRoPE (`G14`).
 
 ## Tier 3: `DeepSeek-V4.1-Flash-1017` (`deepseek41`) shared blocks and unique additions
 

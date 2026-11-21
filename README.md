@@ -2,24 +2,23 @@
 
 A bare-metal, ultra-low-latency LLM inference engine for Apple Silicon.
 
-> Active development — M0–M2 (wired memory budget, `.amf` toolchain, Metal 4
-> hot path, IOSurface KV tiles, and non-speculative greedy decode for Qwen3-MoE
-> / Qwen3-Dense) are complete. What works today is listed in
-> [docs/status.md](docs/status.md); progress and milestones live in
-> [docs/process.md](docs/process.md).
+> What works today is listed in [docs/status.md](docs/status.md); milestones,
+> verification history, and current focus live in
+> [docs/process.md](docs/process.md); measured benchmarks and raw outputs live
+> in [docs/benchmarks/results.md](docs/benchmarks/results.md).
 
 aminfer targets M4 / M5-class Apple Silicon. The baseline is a 24 GB M4, and
 the design scales to 128 GB+ Max / Ultra machines and, later, to Macs joined
-over Thunderbolt. Its core idea is to break through the unified-memory wall by
-running every engine of the SoC concurrently on one zero-copy memory pool:
+over Thunderbolt. It runs CPU P-cores (including ARMv9 SME2), CPU E-cores, the
+Neural Engine, and the Metal 4 GPU concurrently on one zero-copy memory pool:
 
 | Engine | Role |
 | --- | --- |
-| CPU P-cores | L1 zero-allocation suffix-automaton drafting, lock-free scheduling |
-| CPU E-cores | Cold-expert prefetch from NVMe (`F_NOCACHE`, `aio_read` + `kqueue`) |
-| Neural Engine | L2 drafting, attention half of the chunked prefill, MoE expert prediction |
-| GPU (Metal) | L3 fused 3/4-bit dequantization & native FP16 / BF16 compute, MoE gather and tree-attention verification |
-| Storage | 16 KiB-aligned wired hot experts; NVMe cold experts (`.amf`) and N-gram tables |
+| CPU P-cores + SME2 | L1 zero-allocation suffix-automaton drafting, lock-free scheduling, L2-resident routers / adapters & `ZT0`-LUT / `ZA` microkernels |
+| CPU E-cores | Cold-expert and N-gram prefetch from NVMe (`F_NOCACHE`, `aio_read` + `kqueue`) |
+| Neural Engine | Attention half of chunked wavefront prefill, cross-layer MoE expert prediction, gated L2 drafting |
+| GPU (Metal 4) | L3 fused `q2`/`q3`/`q4` dequantization & native FP16 / BF16 compute, CSR-dedup MoE gather and tree-attention verification |
+| Storage | 16 KiB-aligned wired hot experts; NVMe cold experts (`.amf`), `.ang` N-gram tables, and sparse PLE / Engram tables |
 
 Speculative decoding prioritizes EAGLE-2 draft trees (with EAGLE-3 or EAGLE-2
 heads) and MTP heads, falls back to a same-family small draft model, and
@@ -35,8 +34,9 @@ full design starts at
 
 ## Technology
 
-- **Engine core** — Zig 0.17.1: scheduler, memory pools, lock-free rings,
-  suffix automaton, async I/O, kqueue SSE server.
+- **Engine core** — Zig 0.17.1 + standalone ARMv9.2 SME2 `.s` microkernels:
+  scheduler, memory pools, lock-free rings, suffix automaton, async I/O, kqueue
+  SSE server.
 - **Hardware bridge** — pure Objective-C (ARC) behind the C header
   `apple_bridge.h`, used only to call Metal, CoreML, IOSurface and Foundation.
 - **GPU kernels** — Metal Shading Language, compiled with `xcrun metal`.

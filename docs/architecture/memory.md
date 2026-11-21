@@ -117,6 +117,13 @@ Settled tile layout (confirmed in Spike S1, raw measurements in
   any tensor or routed expert resides in memory in strictly one layout
   (`row_major` for Metal GPU OR `sme2_panel64` for CPU SME2), never duplicated
   in both formats inside the wired budget.
+- **Hybrid recurrent state arenas and shared prefix caches (`R6`, `R8`,
+  [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)):**
+  Gated DeltaNet layers allocate fixed-size recurrent state slabs in `WiredArena`
+  alongside a scratch slab `S_tmp` so intermediate `LoopSchedule` passes
+  (`r < R - 1`) do not overwrite committed `S_t` before final pass `R - 1`. In
+  M6.5 (`R8`), read-only prefix `KvTile`s (with copy-on-write tail tiles) and
+  snapshot-cloned `GDN` states are shared across concurrent server slots.
 
 ## Budget estimates
 

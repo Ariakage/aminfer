@@ -111,8 +111,17 @@ One round:
   with in-command-buffer EAGLE-3 (`~19 ms/step`) un-pipelined.
 - **Placement gate.** EAGLE / MTP heads on the GPU avoid extra
   synchronization; on the ANE they cost two GPU → CPU → ANE hand-offs per
-  round. The default is chosen per model and chip from measured round latency
+  round; compact L2-resident projection subgraphs and `Step-LoRA` adapters can
+  also target P-core SME2 (`Placement.cpu_sme2`, `D13`,
+  [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
+  The default is chosen per model and chip from measured round latency
   ([ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md)).
+- **Iteration-level continuous batching and prefix sharing (`C14`, `R8`, M6.5).**
+  M5 `aminfer serve` executes preallocated request slots without steady-state
+  heap allocation; M6.5 batches `M > 1` active slots into shared GPU GEMM /
+  CSR-MoE and SME2 `ZA` passes while sharing read-only prefix `KvTile`s and
+  snapshot-cloned `GDN` recurrent states across concurrent requests
+  ([ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
 
 ## Threading model
 

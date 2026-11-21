@@ -6,8 +6,8 @@
 
 | Layer | Engine | Source | Output |
 | --- | --- | --- | --- |
-| L1 | CPU P-core | Suffix automaton over the prompt and generated tokens (optionally a persistent N-gram store) | Continuations with their match length |
-| L2 | ANE or GPU ([ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md)) | EAGLE heads, MTP heads or a same-family small draft model ([ADR-0013](../decisions/0013-eagle-tree-and-head-formats.md)) | Draft tree with per-node draft probabilities |
+| L1 | CPU P-core | Suffix automaton over the prompt and generated tokens (plus optional `.ang` NVMe N-gram store, `C6`) | Continuations with their match length |
+| L2 | GPU, ANE, or P-core SME2 ([ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md), [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)) | EAGLE heads, MTP heads, same-family small draft ([ADR-0013](../decisions/0013-eagle-tree-and-head-formats.md)), or shallow `r = 1` / `r = 0` recurrent pass (`D12`) | Draft tree with per-node draft probabilities |
 | L3 | GPU | Target model with tree attention | Accepted path, bonus token, target features |
 
 Verification is lossless. At temperature 0 a node is accepted when it equals
@@ -46,8 +46,17 @@ Per [ADR-0013](../decisions/0013-eagle-tree-and-head-formats.md):
   beyond depth 1 like a small EAGLE head.
 - **Same-family small draft.** A ≈ 0.5B-class model sharing the target's
   tokenizer (for example Qwen3-0.6B for Qwen3 targets) for models without
-  EAGLE or MTP heads. It keeps its own KV cache, runs on the ANE, and does not
-  need target features, which allows pipelined drafting.
+  EAGLE or MTP heads. It keeps its own KV cache, runs on the GPU, ANE, or CPU
+  SME2 (`sme2_panel64`, [ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md)),
+  and does not need target features, which allows pipelined drafting (`D8`).
+- **Shallow recurrent pass (`SelfSpecRecurrent`, `D12`, [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).**
+  For models using `LoopSchedule`, a `r = 1` shallow pass on native looped
+  models (or `r = 0` base pass on adapter-extended checkpoints) drafts an
+  `M = 8..16` candidate tree with zero extra draft-model weights, verified in
+  one `Core × R` batch pass under `D9` acceptance. Compact L2-resident draft
+  projection subgraphs and `Step-LoRA` loop adapters can also be placed on
+  P-core SME2 (`Placement.cpu_sme2`, `D13`) when measured round latency beats
+  `.gpu`.
 
 EAGLE and MTP heads consume the target features of the accepted tokens, so
 their drafting is serial with verification

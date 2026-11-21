@@ -118,9 +118,12 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
   compile-time `group_size = 64`; `q6_affine` / `q8_affine` deferred unless
   benchmark-justified) and single-owner `TensorLayout` (`row_major` vs
   `sme2_panel64`, [ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md))
-  in its 128-byte `TensorEntry`, leaving 16 KiB page alignment, 64 B
-  `params_offset` alignment, CRC-32 IEEE validation, and existing `reserved0 == 0`
-  `.amf` v0 files 100% binary compatible.
+  in its 128-byte `TensorEntry` (plus optional `QuantParamKind = 1` non-uniform
+  16-centroid `ZT0` LUT tables for SME2 `q4`/`q2` in `W17`,
+  [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)),
+  leaving 16 KiB page alignment, 64 B `params_offset` alignment, CRC-32 IEEE
+  validation, and existing `reserved0 == 0` `.amf` v0 files 100% binary
+  compatible.
 - **Per-tensor / per-expert granularity only**: every linear projection matrix
   or routed MoE expert (`gate_proj` / `up_proj` / `down_proj`) has strictly one
   uniform `QuantScheme`. Intra-tensor / sub-matrix mixed-bit packing across
@@ -203,8 +206,13 @@ N-gram / suffix tables larger than the prompt context — for example built from
 a code repository via `aminfer-tools build-ngram` into a 16 KiB-aligned `.ang`
 v1 file — are stored on NVMe and queried by L1 (`src/spec/ngram_nvme.zig`) over
 `F_NOCACHE` direct I/O with a wired LRU slot cache and overlapped `kqueue_aio`
-prefetch (status row `C6` in [../status.md](../status.md); measurements in
+prefetch (status rows `C6` and `C14` in [../status.md](../status.md);
+measurements in
 [../benchmarks/results.md](../benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization)).
+Sparse per-layer embedding tables (`C10`: 51B PLE in M6 and 196B Engram in M7)
+follow the same `16 KiB` `F_NOCACHE` row-prefetch discipline, issuing disk reads
+once on pass `r = 0` when `LoopSchedule` iterates `R > 1` times
+([ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
 
 ## Thunderbolt peer
 

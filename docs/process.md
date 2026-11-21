@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M5 — serving and pipelining completed (2026-11-21); next: **M6 — frontier hybrid sparse models (`Qwen3.8-Flash-Next`)** (`R6`, `W9`, `W10`, `G7`–`G9`, `G10` GR, `C10` PLE).
+M5 — serving and pipelining completed (2026-11-21); next: **M6 — frontier hybrid sparse models (`Qwen3.8-Flash-Next`), composable recurrent depth (`LoopSchedule` / `SelfSpecRecurrent`), and large-MoE GSQ+RCO + off-GPU SME2 draft heads** (`R6`, `W9`, `W10`, `W16`, `W17`, `G7`–`G9`, `G10` GR, `D12`, `D13`, `C10` PLE; followed by **M6.5** `R5`, `R8`, `G14`, `C14`).
 
 ## Milestones
 
@@ -23,7 +23,8 @@ Status-row IDs refer to [status.md](status.md).
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Completed |
 | M4.5 | Bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine | W15, D11, C11–C13 | Pre-`smstart` `d8–d15` canary & `fp32` parity tests pass; `sme2_panel64` single-owner layout preserves `.amf` v0 binary compatibility; Spike `S7` benchmarks 3-way `.s` kernels vs `Accelerate`/`BNNS`, P-cluster thread saturation, and GPU co-execution (`> 1.05×` gate, `0` swap); Secure Enclave TRNG `D11` seeding verified | Completed |
 | M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Completed |
-| M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`) | R6, W9, W10, G7–G9, G10 (GR), C10 (PLE) | Composable model operator graph; `Qwen3.8-Flash-Next` (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end (128 GB+ full wired residency; 24 GB M4 hot/cold + PLE async prefetch without swap) | Planned |
+| M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`), recurrent depth & heterogeneous MoE scaling | R6, W9, W10, W16, W17, G7–G9, G10 (GR), D12, D13, C10 (PLE) | Composable operator graph + `LoopSchedule` (`GDN S_tmp` isolation, `SelfSpecRecurrent`, L2 SME2 `Step-LoRA`); synthetic + scale-calibrated `qwen4_exp` (GDN + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end without swap; `Qwen3-30B-A3B` & 512-expert GSQ+RCO + `ZT0` non-uniform LUTs and `Placement.cpu_sme2` draft heads benchmarked | Planned |
+| M6.5 | Continuous batching, long-context KV tiering & zero-copy multimodal ingress | R5, R8, G14, C14 | Server iteration-level continuous batching (`M > 1` slots per GPU/SME2 pass), shared prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang` packs, and `VideoToolbox → IOSurface → MTLTexture` zero-copy vision/video ingress verified without swap | Planned |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
 ## Spikes
@@ -493,6 +494,17 @@ two-tier Apple Silicon Secure Enclave TRNG (`getentropy`) → slot-local
 `Xoshiro256` per-request sampling RNG (`D11`), and resolving `R5`, `C8`, `D8`,
 `ADR-0005`, `ADR-0016` residual alignment, and `ADR-0017` `G13` initial scheme
 selection ([architecture/open-decisions-research.md](architecture/open-decisions-research.md)).
+After M5 close-out on 2026-11-22, the user confirmed
+[ADR-0019](decisions/0019-recurrent-depth-and-post-m5-accelerators.md):
+integrating composable recurrent depth (`LoopSchedule` under `W9`, `W16` native
+LoopLM & L2-resident SME2 `Step-LoRA` adapters, `D12` `SelfSpecRecurrent` batch
+tree verification, and `GDN S_tmp` / `PLE` / `QSA` loop isolations), large-MoE
+GSQ+RCO + `QuantParamKind = 1` `ZT0` non-uniform LUTs (`W17`), and off-GPU SME2
+draft-head placement (`D13`) into **M6** (validated synthetic-first with drop-in
+real checkpoint support), plus scheduling **M6.5** (`R5`, `R8`, `G14`, `C14`)
+for iteration-level continuous batching, shared prefix `KvTile`/`GDN` caching,
+32K+ GPU `q8` retired KV compression, domain `.ang` packs, and zero-copy
+`VideoToolbox → IOSurface → MTLTexture` multimodal ingress.
 
 ## Session handoff snapshot
 
@@ -592,11 +604,11 @@ Update this before the context window runs out or when handing off.
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: none (`M0`–`M5` completed; next milestone is **M6 — Frontier hybrid
-  sparse models (`Qwen3.8-Flash-Next`)** covering `R6`, `W9`, `W10`, `G7`–`G9`,
-  `G10` (`GR`), and `C10` (`PLE`) per
+- In flight: none (`M0`–`M5` completed; next milestone is **M6** covering `R6`,
+  `W9`, `W10`, `W16`, `W17`, `G7`–`G9`, `G10` (`GR`), `D12`, `D13`, and `C10`
+  (`PLE`), followed by **M6.5** covering `R5`, `R8`, `G14`, and `C14` per
   [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md) and
-  [architecture/model-roadmap.md](architecture/model-roadmap.md))
+  [ADR-0019](decisions/0019-recurrent-depth-and-post-m5-accelerators.md))
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [architecture/model-roadmap.md](architecture/model-roadmap.md),
@@ -612,4 +624,5 @@ Update this before the context window runs out or when handing off.
   [decisions/0015-tiered-frontier-model-roadmap.md](decisions/0015-tiered-frontier-model-roadmap.md),
   [decisions/0016-native-fp16-bf16-and-multishard-import.md](decisions/0016-native-fp16-bf16-and-multishard-import.md),
   [decisions/0017-optional-gsq-rco-hybrid-quantization.md](decisions/0017-optional-gsq-rco-hybrid-quantization.md),
-  [decisions/0018-bare-metal-armv9-sme2-engine.md](decisions/0018-bare-metal-armv9-sme2-engine.md)
+  [decisions/0018-bare-metal-armv9-sme2-engine.md](decisions/0018-bare-metal-armv9-sme2-engine.md),
+  [decisions/0019-recurrent-depth-and-post-m5-accelerators.md](decisions/0019-recurrent-depth-and-post-m5-accelerators.md)
