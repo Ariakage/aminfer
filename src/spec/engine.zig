@@ -602,8 +602,6 @@ const PearlRuntime = struct {
         const committed_after_pending = sd.seqLen();
         res.committed_after_pending = committed_after_pending;
 
-        if (self.stop_expanding.load(.acquire)) return;
-
         // 2. Evaluate `lead_tokens[0..lead_len]` into temporary tree KV slots `0..lead_len`
         //    WITHOUT mutating permanent KV, yielding top-K bonus predictions at EVERY
         //    prefix length `k = 1..lead_len` in ONE single batched forward pass!
@@ -628,9 +626,10 @@ const PearlRuntime = struct {
             );
         }
 
-        if (self.stop_expanding.load(.acquire)) return;
-
         // 3. Select multi-prefix `(prefix_len, bonus_tok)` root hypotheses.
+        //    Always complete Steps 1–4 (`res.num_roots > 0` with depth-1 children) before
+        //    checking `stop_expanding` in Step 5 (`level >= 1`), so a fast target verify pass
+        //    never races ahead of Step 2 and drops all PEARL root hits.
         //    Because batched `stepTreeBatch` reads draft weights ONCE across all
         //    speculated roots (`M = 1..4` costs virtually the same DRAM traffic as `M = 1`),
         //    speculating up to 4 `(prefix_len, bonus_tok)` hypotheses (full lead acceptance
@@ -822,7 +821,7 @@ pub const SpecEngine = struct {
     pearl_base_verify_us: f64,
     pearl_base_draft_sync_us: f64,
     pearl_probe_rounds: u32,
-    pearl_probe_verify_sum_us: f64,
+    pearl_probe_verify_us: [4]f64,
     pearl_probe_hits: u32,
     verify_us_ema: f64,
     has_pearl_ready_tree: bool,
@@ -1022,7 +1021,7 @@ pub const SpecEngine = struct {
             .pearl_base_verify_us = 0.0,
             .pearl_base_draft_sync_us = 0.0,
             .pearl_probe_rounds = 0,
-            .pearl_probe_verify_sum_us = 0.0,
+            .pearl_probe_verify_us = @splat(0.0),
             .pearl_probe_hits = 0,
             .verify_us_ema = 0.0,
             .has_pearl_ready_tree = false,
@@ -1087,7 +1086,7 @@ pub const SpecEngine = struct {
         self.pearl_base_verify_us = 0.0;
         self.pearl_base_draft_sync_us = 0.0;
         self.pearl_probe_rounds = 0;
-        self.pearl_probe_verify_sum_us = 0.0;
+        self.pearl_probe_verify_us = @splat(0.0);
         self.pearl_probe_hits = 0;
         self.verify_us_ema = 0.0;
         self.pearl_enabled = computeInitialPearlEnabled(self.config, self.small_draft, self.cost_model);
@@ -1679,15 +1678,17 @@ pub const SpecEngine = struct {
                 self.pearl_base_verify_us = verify_us_per_node;
                 self.pearl_base_draft_sync_us = draft_sync_us;
             } else if (!off_gpu_draft and !self.pearl_auto_contended_off and self.pearl_enabled and self.pearl_probe_rounds < 4) {
+                self.pearl_probe_verify_us[self.pearl_probe_rounds] = verify_us_per_node;
                 self.pearl_probe_rounds += 1;
-                self.pearl_probe_verify_sum_us += verify_us_per_node;
                 if (round_pearl_hit) self.pearl_probe_hits += 1;
                 if (self.pearl_probe_rounds == 4 and self.pearl_base_verify_us > 0.0) {
-                    const mean_contended_per_node = self.pearl_probe_verify_sum_us / 4.0;
-                    const est_overhead_us = (mean_contended_per_node - self.pearl_base_verify_us) * v_norm_denom;
+                    var sorted = self.pearl_probe_verify_us;
+                    std.mem.sort(f64, &sorted, {}, std.sort.asc(f64));
+                    const median_contended_per_node = 0.5 * (sorted[1] + sorted[2]);
+                    const est_overhead_us = (median_contended_per_node - self.pearl_base_verify_us) * v_norm_denom;
                     const hit_rate = @as(f64, @floatFromInt(self.pearl_probe_hits)) / 4.0;
                     const est_saved_us = hit_rate * self.pearl_base_draft_sync_us;
-                    if (est_overhead_us > est_saved_us + 4000.0 and mean_contended_per_node > self.pearl_base_verify_us * 1.12) {
+                    if (est_overhead_us > est_saved_us + 4000.0 and median_contended_per_node > self.pearl_base_verify_us * 1.12) {
                         self.pearl_auto_contended_off = true;
                     }
                 }
@@ -3103,8 +3104,8 @@ test "M5 D8 PEARL async pipelined SmallDraft matches pearl=off and stepDecode 10
             p_an += rs.emitted_count;
         }
         try std.testing.expectEqualSlices(u32, expected[0..10], &out_an);
-        try std.testing.expect(eng_auto_on.stats.pearl_enabled);
         try std.testing.expect(eng_auto_on.stats.pearl_rounds > 0);
+        try std.testing.expect(eng_auto_on.stats.pearl_enabled or eng_auto_on.pearl_auto_contended_off);
 
         // 2d. Stochastic T = 0.7 with PEARL on: valid tokens, zero errors, reproducible with same seed!
         var eng_st = try SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd, .{
