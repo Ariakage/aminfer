@@ -44,7 +44,25 @@ assert ENTRY_STRUCT.size == 128
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
-_SWITCH_MLP_RE = re.compile(r"^(?:model\.)?layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)$")
+_LOOP_STEP_RE = re.compile(r"(?:^|\.)loop\.step\.(\d+)\.")
+_SWITCH_MLP_RE = re.compile(
+    r"^(?:language_model\.)?(?:model\.)?layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)$"
+)
+VISION_TENSOR_PREFIXES = (
+    "visual.",
+    "vision_tower.",
+    "multi_modal_projector.",
+    "model.visual.",
+    "model.vision_tower.",
+    "model.multi_modal_projector.",
+    "vision_model.",
+    "model.vision_model.",
+)
+
+
+def is_vision_tensor(raw_name: str) -> bool:
+    """Return True if `raw_name` belongs to an offline-strippable vision tower (W10)."""
+    return raw_name.startswith(VISION_TENSOR_PREFIXES)
 
 # Streaming granularity: raw copies move 8 MiB at a time; dtype conversions
 # process 1 Mi elements at a time. Both bound Python RSS independent of model size.
@@ -80,6 +98,9 @@ class TensorKind(enum.IntEnum):
     NORM = 4
     ROUTER = 5
     LM_HEAD = 6
+    SHARED_EXPERT = 7
+    SPARSE_TABLE = 8
+    LOOP_ADAPTER = 9
 
 
 class DType(enum.IntEnum):
@@ -334,8 +355,18 @@ def pack_mlx_affine_2bit(codes: Sequence[int]) -> bytes:
     return bytes(out)
 
 
+def _strip_model_prefix(raw_name: str) -> str:
+    if raw_name.startswith("language_model.model."):
+        return raw_name[len("language_model.model.") :]
+    if raw_name.startswith("language_model."):
+        return raw_name[len("language_model.") :]
+    if raw_name.startswith("model."):
+        return raw_name[6:]
+    return raw_name
+
+
 def _normalize_name(raw_name: str) -> str:
-    name = raw_name[6:] if raw_name.startswith("model.") else raw_name
+    name = _strip_model_prefix(raw_name)
     encoded = name.encode("utf-8")
     if len(encoded) == 0 or len(encoded) > 47:
         raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(encoded)}: {name!r}")
@@ -352,10 +383,27 @@ def _classify_tensor(
     expert_match = _EXPERT_RE.search(name)
     expert = int(expert_match.group(1)) if expert_match else NO_EXPERT
 
+    lower = name.lower()
+    if _LOOP_STEP_RE.search(name) or ".loop_adapter." in lower:
+        return (TensorKind.LOOP_ADAPTER, layer, NO_EXPERT)
+    if (
+        lower.startswith("ple.")
+        or ".ple." in lower
+        or lower.startswith("engram.")
+        or ".engram." in lower
+        or lower.startswith("sparse_table.")
+    ):
+        return (TensorKind.SPARSE_TABLE, layer, NO_EXPERT)
     if expert != NO_EXPERT:
         is_cold = all_experts_cold or (layer, expert) in cold_experts
         return (TensorKind.COLD_EXPERT if is_cold else TensorKind.HOT_EXPERT, layer, expert)
-    lower = name.lower()
+    if (
+        ".shared_expert." in lower
+        or ".shared_experts." in lower
+        or lower.endswith(".shared_expert_gate")
+        or lower.endswith(".shared_expert_gate.weight")
+    ):
+        return (TensorKind.SHARED_EXPERT, layer, NO_EXPERT)
     if "norm" in lower:
         return (TensorKind.NORM, layer, expert)
     if "embed" in lower:
@@ -676,20 +724,31 @@ def _is_t2d_name(norm_name: str) -> bool:
     return norm_name == "t2d" or norm_name.endswith(".t2d")
 
 
+def _is_loop_r0_alpha(name: str) -> bool:
+    m = _LOOP_STEP_RE.search(name)
+    if m is None or int(m.group(1)) != 0:
+        return False
+    return name.endswith(".alpha") or name.endswith(".alpha.weight")
+
+
 def _should_sme2_pack(
     kind: TensorKind,
     dtype: DType,
     shape: tuple[int, ...],
     sme2_pack: str,
+    *,
+    sme2_pack_loop_adapters: bool = False,
 ) -> bool:
-    if sme2_pack == "none":
-        return False
-    if sme2_pack not in SME2_PACK_MODES:
-        raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
     if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0 or shape[1] % SME2_GROUP_K != 0:
         return False
     if dtype not in (DType.F16, DType.BF16, DType.Q4_AFFINE, DType.Q3_AFFINE, DType.Q2_AFFINE):
         return False
+    if sme2_pack_loop_adapters and kind == TensorKind.LOOP_ADAPTER:
+        return True
+    if sme2_pack == "none":
+        return False
+    if sme2_pack not in SME2_PACK_MODES:
+        raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
     if sme2_pack == "routers":
         return kind == TensorKind.ROUTER
     return kind in (
@@ -698,6 +757,8 @@ def _should_sme2_pack(
         TensorKind.HOT_EXPERT,
         TensorKind.COLD_EXPERT,
         TensorKind.LM_HEAD,
+        TensorKind.SHARED_EXPERT,
+        TensorKind.LOOP_ADAPTER,
     )
 
 
@@ -716,13 +777,20 @@ def _make_entry(
     biases: _ByteRange | None = None,
     *,
     sme2_pack: str = "none",
+    sme2_pack_loop_adapters: bool = True,
 ) -> _PlannedEntry:
     name_bytes = name.encode("utf-8")
     if len(name_bytes) == 0 or len(name_bytes) > 47:
         raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(name_bytes)}: {name!r}")
     if not (1 <= len(shape) <= 4):
         raise ValueError(f"tensor rank must be 1..4 for {name!r}, got {len(shape)}")
-    use_sme2 = _should_sme2_pack(kind, dtype, shape, sme2_pack)
+    use_sme2 = _should_sme2_pack(
+        kind,
+        dtype,
+        shape,
+        sme2_pack,
+        sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+    )
     if use_sme2:
         layout = TensorLayout.SME2_PANEL64
         param_kind = QuantParamKind.AFFINE_SCALE_BIAS
@@ -791,6 +859,9 @@ def plan_amf_entries(
     tie_word_embeddings: bool = False,
     exclude_tensors: Iterable[str] = (),
     sme2_pack: str = "none",
+    strip_vision: bool = True,
+    sme2_pack_loop_adapters: bool = True,
+    stats_out: dict[str, int] | None = None,
 ) -> list[_PlannedEntry]:
     """Pass 1: plan every output entry from shard headers alone."""
     if group_size != 64:
@@ -809,6 +880,17 @@ def plan_amf_entries(
 
     def is_excluded(raw_name: str) -> bool:
         return raw_name in excluded or _normalize_lenient(raw_name) in excluded
+
+    stripped_vision = 0
+    filtered_tensors: dict[str, _ShardTensor] = {}
+    for name, st in tensors.items():
+        if strip_vision and is_vision_tensor(name):
+            stripped_vision += 1
+            continue
+        filtered_tensors[name] = st
+    if stats_out is not None:
+        stats_out["stripped_vision_tensors"] = stripped_vision
+    tensors = filtered_tensors
 
     quant_prefixes: set[str] = set()
     for name in tensors:
@@ -903,6 +985,7 @@ def plan_amf_entries(
                 _full_range(s),
                 _full_range(b),
                 sme2_pack=sme2_pack,
+                sme2_pack_loop_adapters=sme2_pack_loop_adapters,
             )
         )
 
@@ -965,6 +1048,7 @@ def plan_amf_entries(
                 _full_range(t),
                 convert,
                 sme2_pack=sme2_pack,
+                sme2_pack_loop_adapters=sme2_pack_loop_adapters,
             )
         )
 
@@ -978,7 +1062,7 @@ def plan_amf_entries(
 
 
 def _normalize_lenient(raw_name: str) -> str:
-    return raw_name[6:] if raw_name.startswith("model.") else raw_name
+    return _strip_model_prefix(raw_name)
 
 
 class _ShardReaders:
@@ -1186,6 +1270,26 @@ def _load_tie_flag(config_path: pathlib.Path | None) -> bool:
     return bool(config.get("tie_word_embeddings", False)) if isinstance(config, dict) else False
 
 
+def _validate_r0_loop_alpha_zero(e: _PlannedEntry, readers: _ShardReaders) -> None:
+    """Enforce ADR-0019 `alpha = 0.0` at loop step `r = 0` for bit-exact identity."""
+    if e.kind != TensorKind.LOOP_ADAPTER or not _is_loop_r0_alpha(e.name):
+        return
+    fh = readers.get(e.data.path)
+    raw = _read_exact(fh, e.data.offset, e.data.length)
+    if e.data.dtype == "F32":
+        vals = f32_bytes_to_f32_list(raw)
+    elif e.data.dtype == "F16":
+        vals = f16_bytes_to_f32_list(raw)
+    elif e.data.dtype == "BF16":
+        vals = bf16_bytes_to_f32_list(raw)
+    else:
+        raise ValueError(f"loop adapter alpha tensor {e.name!r} has unsupported dtype {e.data.dtype}")
+    if any(v != 0.0 for v in vals):
+        raise ValueError(
+            f"ADR-0019 violation: loop adapter {e.name!r} at step r=0 must have alpha == 0.0, got {vals!r}"
+        )
+
+
 def pack_amf_from_safetensors(
     input_path: pathlib.Path,
     output_path: pathlib.Path,
@@ -1200,11 +1304,15 @@ def pack_amf_from_safetensors(
     heat_profile: pathlib.Path | None = None,
     cold_experts_per_layer: int | None = None,
     sme2_pack: str = "none",
+    lut16_sme2: bool = False,
     quant_profile: str = "uniform",
     target_bits: float | None = None,
     use_rco: bool = True,
     manifest_path: pathlib.Path | None = None,
     workers: int = 1,
+    strip_vision: bool = True,
+    sme2_pack_loop_adapters: bool = True,
+    stats_out: dict[str, int] | None = None,
 ) -> list[PackedTensorMeta]:
     """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
 
@@ -1234,9 +1342,12 @@ def pack_amf_from_safetensors(
             heat_profile=heat_profile,
             cold_experts_per_layer=cold_experts_per_layer,
             sme2_pack=sme2_pack,
+            lut16_sme2=lut16_sme2,
             use_rco=use_rco,
             manifest_path=manifest_path,
             workers=workers,
+            strip_vision=strip_vision,
+            stats_out=stats_out,
         )
         return report.metas
 
@@ -1255,6 +1366,7 @@ def pack_amf_from_safetensors(
     elif cold_experts_per_layer is not None:
         raise ValueError("cold_experts_per_layer requires heat_profile in pack_amf_from_safetensors")
 
+    eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
     resolved = resolve_checkpoint(pathlib.Path(input_path))
     tie = _load_tie_flag(resolved.config_path) if tie_word_embeddings is None else tie_word_embeddings
     tensors = _collect_tensors(resolved.shard_paths)
@@ -1266,7 +1378,10 @@ def pack_amf_from_safetensors(
         all_experts_cold=all_experts_cold,
         tie_word_embeddings=tie,
         exclude_tensors=exclude_tensors,
-        sme2_pack=sme2_pack,
+        sme2_pack=eff_sme2_pack,
+        strip_vision=strip_vision,
+        sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+        stats_out=stats_out,
     )
 
     tensor_count = len(plan)
@@ -1292,8 +1407,20 @@ def pack_amf_from_safetensors(
             for e, blob_offset in zip(plan, offsets):
                 if out.tell() != blob_offset:
                     raise AssertionError(f"planned offset {blob_offset} != file position {out.tell()} for {e.name}")
+                _validate_r0_loop_alpha_zero(e, readers)
                 w = _BlobWriter(out)
-                _stream_entry(e, readers, w)
+                eff_param_kind = e.quant_param_kind
+                if (
+                    lut16_sme2
+                    and e.layout == TensorLayout.SME2_PANEL64
+                    and e.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
+                ):
+                    from aminfer_tools.gsq_rco import stream_safetensors_entry_lut16_sme2
+
+                    stream_safetensors_entry_lut16_sme2(e, readers, w, workers=workers)
+                    eff_param_kind = QuantParamKind.LUT16_CODEBOOK
+                else:
+                    _stream_entry(e, readers, w)
                 if w.written != e.blob_bytes:
                     raise AssertionError(f"wrote {w.written} bytes for {e.name}, planned {e.blob_bytes}")
                 metas.append(
@@ -1313,7 +1440,7 @@ def pack_amf_from_safetensors(
                         params_bytes=e.params_bytes,
                         blob_crc32=w.crc & 0xFFFFFFFF,
                         layout=e.layout,
-                        quant_param_kind=e.quant_param_kind,
+                        quant_param_kind=eff_param_kind,
                     )
                 )
             if out.tell() != cursor:
@@ -2759,14 +2886,21 @@ def repack_amf_sme2(
     output_path: pathlib.Path,
     *,
     targets: str = "routers",
+    lut16: bool = False,
+    lloyd_iters: int = 10,
+    workers: int = 1,
     verify_source_crc: bool = True,
 ) -> list[PackedTensorMeta]:
     """Stream-convert selected 2D tensors in an `.amf` v0 file into single-owner `sme2_panel64`.
 
     Preserves single-owner layout (every tensor appears once — never duplicated in both
     `row_major` and `sme2_panel64`), 16 KiB page alignment, IEEE CRC-32 checksums, and
-    all metadata (`kind`, `dtype`, `layer`, `expert`, `shape`). Already-packed
-    `sme2_panel64` entries are copied verbatim so repacking is idempotent.
+    all metadata (`kind`, `dtype`, `layer`, `expert`, `shape`). When `lut16=True`,
+    eligible quantized (`q2`/`q3`/`q4`) tensors are fitted with per-`(panel, group)`
+    non-uniform Lloyd-Max `ZT0` codebooks + per-column `f16` RCO biases and tagged
+    with `QuantParamKind.LUT16_CODEBOOK` (`reserved0 == 0x0101`). Already-packed
+    entries matching the target `(layout, param_kind)` are copied verbatim so
+    repacking is idempotent.
     """
     if targets not in SME2_REPACK_TARGETS:
         raise ValueError(f"targets must be one of {SME2_REPACK_TARGETS}, got {targets!r}")
@@ -2783,10 +2917,15 @@ def repack_amf_sme2(
     planned: list[tuple[PackedTensorMeta, bool, int, int, int, int, int, TensorLayout, QuantParamKind]] = []
     cursor = dir_offset + dir_bytes
     for m in entries:
-        needs_repack = m.layout == TensorLayout.ROW_MAJOR and _should_sme2_pack(m.kind, m.dtype, m.shape, targets)
+        eligible = _should_sme2_pack(m.kind, m.dtype, m.shape, targets)
+        want_lut16 = lut16 and m.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
+        needs_repack = eligible and (
+            m.layout == TensorLayout.ROW_MAJOR
+            or (want_lut16 and m.quant_param_kind != QuantParamKind.LUT16_CODEBOOK)
+        )
         if needs_repack:
             new_layout = TensorLayout.SME2_PANEL64
-            new_param_kind = QuantParamKind.AFFINE_SCALE_BIAS
+            new_param_kind = QuantParamKind.LUT16_CODEBOOK if want_lut16 else QuantParamKind.AFFINE_SCALE_BIAS
             new_data_bytes = sme2_panel64_data_bytes(m.dtype, m.shape[0], m.shape[1], m.group_size)
             new_params_offset = 0
             new_params_bytes = 0
@@ -2840,7 +2979,19 @@ def repack_amf_sme2(
                 if needs_repack:
                     if verify_source_crc:
                         _verify_source_blob_crc(src_fh, m)
-                    _stream_repack_amf_entry(src_fh, m, new_blob_bytes, w)
+                    if new_param_kind == QuantParamKind.LUT16_CODEBOOK:
+                        from aminfer_tools.gsq_rco import repack_amf_entry_lut16_sme2
+
+                        repack_amf_entry_lut16_sme2(
+                            src_fh,
+                            m,
+                            new_blob_bytes,
+                            w,
+                            lloyd_iters=lloyd_iters,
+                            workers=workers,
+                        )
+                    else:
+                        _stream_repack_amf_entry(src_fh, m, new_blob_bytes, w)
                 else:
                     done = 0
                     while done < m.blob_bytes:

@@ -22,6 +22,7 @@ dependencies). Implements:
 
 from __future__ import annotations
 
+import bisect
 import concurrent.futures
 import heapq
 import json
@@ -29,6 +30,7 @@ import math
 import os
 import pathlib
 import struct
+from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 
@@ -41,6 +43,9 @@ from aminfer_tools.amf import (
     SME2_GROUP_K,
     SME2_PACK_MODES,
     SME2_PANEL_COLS,
+    SME2_Q2_GROUP_BYTES,
+    SME2_Q3_GROUP_BYTES,
+    SME2_Q4_GROUP_BYTES,
     AmfReader,
     DType,
     PackedTensorMeta,
@@ -65,12 +70,19 @@ from aminfer_tools.amf import (
     dequantize_q2_row_f32,
     dequantize_q3_row_f32,
     dequantize_q4_row_f32,
+    dequantize_sme2_panel64_q2_panel_f32,
+    dequantize_sme2_panel64_q3_panel_f32,
+    dequantize_sme2_panel64_q4_panel_f32,
     f16_bytes_to_bf16_bytes,
     f16_bytes_to_f32_list,
     f32_bytes_to_f32_list,
     load_cold_experts_from_heat_profile,
+    pack_mlx_affine_3bit,
+    pack_mlx_affine_4bit,
+    pack_sme2_lut16_header,
     pack_sme2_panel64_f16_panel,
     pack_sme2_panel64_q2_from_mlx_panel,
+    pack_sme2_panel64_q2_panel,
     pack_sme2_panel64_q3_panel,
     pack_sme2_panel64_q4_panel,
     plan_amf_entries,
@@ -80,6 +92,8 @@ from aminfer_tools.amf import (
 
 _F16_STRUCT = struct.Struct("<e")
 _F16_PAIR_STRUCT = struct.Struct("<2e")
+_F16_16_STRUCT = struct.Struct("<16e")
+_F16_32_STRUCT = struct.Struct("<32e")
 _F16_MAX = 65504.0
 _QUANT_DTYPES = (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
 _DTYPE_BITS_RANK = {
@@ -434,6 +448,841 @@ def _quantize_worker_task(args: tuple[list[list[float]], int, int, bool, int]) -
 
 
 # ---------------------------------------------------------------------------
+# Fast Exact SWAR 8-Bin OLS RCO `q3_affine -> q2_affine` Transcoder (W17)
+# ---------------------------------------------------------------------------
+
+_Q3_CAND_MAPS: tuple[tuple[int, ...], ...] = (
+    (0, 0, 1, 1, 2, 2, 3, 3),
+    (0, 0, 1, 1, 1, 2, 2, 3),
+    (0, 1, 1, 2, 2, 2, 3, 3),
+    (0, 0, 0, 1, 2, 2, 3, 3),
+    (0, 0, 1, 1, 2, 3, 3, 3),
+    (0, 1, 1, 1, 2, 2, 2, 3),
+    (0, 0, 1, 2, 2, 2, 3, 3),
+    (0, 0, 1, 1, 2, 2, 2, 3),
+    (0, 1, 1, 2, 2, 3, 3, 3),
+    (0, 0, 0, 1, 1, 2, 3, 3),
+    (0, 0, 1, 2, 2, 3, 3, 3),
+    (0, 1, 2, 2, 2, 2, 3, 3),
+    (0, 0, 0, 1, 2, 3, 3, 3),
+    (0, 0, 1, 1, 1, 2, 3, 3),
+    (0, 1, 1, 1, 1, 2, 2, 3),
+    (0, 1, 1, 2, 2, 2, 2, 3),
+)
+_Q3_TABLES_READY = False
+_Q3_LUT12_HIST: tuple[int, ...] = ()
+_Q3_CAND_Q: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+_Q3_MAP_POS: dict[tuple[int, ...], bytes] = {}
+_Q3_MAP_NEG: dict[tuple[int, ...], bytes] = {}
+
+
+def _ensure_q3_to_q2_tables() -> None:
+    global _Q3_TABLES_READY, _Q3_LUT12_HIST, _Q3_CAND_Q, _Q3_MAP_POS, _Q3_MAP_NEG
+    if _Q3_TABLES_READY:
+        return
+    lut12_codes = tuple((x & 7, (x >> 3) & 7, (x >> 6) & 7, (x >> 9) & 7) for x in range(4096))
+    _Q3_LUT12_HIST = tuple(
+        (1 << (8 * c0)) + (1 << (8 * c1)) + (1 << (8 * c2)) + (1 << (8 * c3))
+        for (c0, c1, c2, c3) in lut12_codes
+    )
+    _Q3_CAND_Q = [
+        (m, tuple(q * q for q in m), tuple(ki * q for ki, q in enumerate(m)))
+        for m in _Q3_CAND_MAPS
+    ]
+    _Q3_MAP_POS = {
+        m: bytes(m[c0] | (m[c1] << 2) | (m[c2] << 4) | (m[c3] << 6) for (c0, c1, c2, c3) in lut12_codes)
+        for m in _Q3_CAND_MAPS
+    }
+    _Q3_MAP_NEG = {
+        m: bytes(
+            (3 - m[c0]) | ((3 - m[c1]) << 2) | ((3 - m[c2]) << 4) | ((3 - m[c3]) << 6)
+            for (c0, c1, c2, c3) in lut12_codes
+        )
+        for m in _Q3_CAND_MAPS
+    }
+    _Q3_TABLES_READY = True
+
+
+def _decode_sf_float_tuple(raw: bytes | bytearray | memoryview, dtype_str: str) -> tuple[float, ...]:
+    if dtype_str == "F16":
+        n = len(raw) // 2
+        return struct.unpack(f"<{n}e", raw)
+    if dtype_str == "BF16":
+        n = len(raw) // 2
+        f32 = bytearray(n * 4)
+        f32[2::4] = raw[0::2]
+        f32[3::4] = raw[1::2]
+        return struct.unpack(f"<{n}f", f32)
+    if dtype_str == "F32":
+        n = len(raw) // 4
+        return struct.unpack(f"<{n}f", raw)
+    raise ValueError(f"unsupported float dtype {dtype_str}")
+
+
+def quantize_q3_blob_to_q2_rco(
+    q3_data: bytes | bytearray | memoryview,
+    s_vals: Sequence[float],
+    b_vals: Sequence[float],
+    n_rows: int,
+    k: int,
+    *,
+    group_size: int = 64,
+    compute_mse: bool = True,
+) -> tuple[bytes, bytes, float]:
+    """Exact 8-bin closed-form ridge-OLS RCO transcoding from MLX `q3_affine` to `q2_affine`.
+
+    Because every weight in a `q3_affine` group takes one of 8 exact levels
+    `w = b3 + u * s3` (`u in 0..7`), factoring OLS over the 8-bin histogram `h[0..7]`
+    (extracted via SWAR 12-bit lookup tables) is mathematically exact (handles both
+    positive and negative MLX `s3`) while running ~20x faster than 64-float dequant+RCO
+    with strictly bounded RAM.
+    """
+    if group_size != 64 or k <= 0 or k % 64 != 0 or n_rows <= 0:
+        raise ValueError(f"invalid q3->q2 geometry: n_rows={n_rows}, k={k}, group_size={group_size}")
+    _ensure_q3_to_q2_tables()
+    groups_per_row = k // 64
+    total_groups = n_rows * groups_per_row
+    if len(q3_data) != total_groups * 24:
+        raise ValueError(f"q3_data length {len(q3_data)} != expected {total_groups * 24}")
+    if len(s_vals) != total_groups or len(b_vals) != total_groups:
+        raise ValueError(f"scale/bias count mismatch: expected {total_groups}")
+
+    words = struct.unpack(f"<{total_groups * 6}I", q3_data)
+    out_q2 = bytearray(total_groups * 16)
+    out_sb = [0.0] * (total_groups * 2)
+    lhist = _Q3_LUT12_HIST
+    cand_q = _Q3_CAND_Q
+    map_pos = _Q3_MAP_POS
+    map_neg = _Q3_MAP_NEG
+    f16_max = _F16_MAX
+    mse_sum = 0.0
+
+    for g in range(total_groups):
+        wi = g * 6
+        w0 = words[wi]
+        w1 = words[wi + 1]
+        w2 = words[wi + 2]
+        w3 = words[wi + 3]
+        w4 = words[wi + 4]
+        w5 = words[wi + 5]
+        n0 = w0 & 0xFFF
+        n1 = (w0 >> 12) & 0xFFF
+        n2 = (w0 >> 24) | ((w1 & 0xF) << 8)
+        n3 = (w1 >> 4) & 0xFFF
+        n4 = (w1 >> 16) & 0xFFF
+        n5 = (w1 >> 28) | ((w2 & 0xFF) << 4)
+        n6 = (w2 >> 8) & 0xFFF
+        n7 = w2 >> 20
+        n8 = w3 & 0xFFF
+        n9 = (w3 >> 12) & 0xFFF
+        n10 = (w3 >> 24) | ((w4 & 0xF) << 8)
+        n11 = (w4 >> 4) & 0xFFF
+        n12 = (w4 >> 16) & 0xFFF
+        n13 = (w4 >> 28) | ((w5 & 0xFF) << 4)
+        n14 = (w5 >> 8) & 0xFFF
+        n15 = w5 >> 20
+
+        H = (
+            lhist[n0] + lhist[n1] + lhist[n2] + lhist[n3]
+            + lhist[n4] + lhist[n5] + lhist[n6] + lhist[n7]
+            + lhist[n8] + lhist[n9] + lhist[n10] + lhist[n11]
+            + lhist[n12] + lhist[n13] + lhist[n14] + lhist[n15]
+        )
+        h0 = H & 0xFF
+        h1 = (H >> 8) & 0xFF
+        h2 = (H >> 16) & 0xFF
+        h3 = (H >> 24) & 0xFF
+        h4 = (H >> 32) & 0xFF
+        h5 = (H >> 40) & 0xFF
+        h6 = (H >> 48) & 0xFF
+        h7 = (H >> 56) & 0xFF
+
+        s3 = s_vals[g]
+        b3 = b_vals[g]
+        if s3 == 0.0 or not math.isfinite(s3) or not math.isfinite(b3):
+            out_sb[2 * g] = 0.0
+            out_sb[2 * g + 1] = _clamp_f16(b3)
+            continue
+
+        sum_u = h1 + 2 * h2 + 3 * h3 + 4 * h4 + 5 * h5 + 6 * h6 + 7 * h7
+        best_score = -1.0
+        best_su = 0.0
+        best_bu = sum_u / 64.0
+        best_m = _Q3_CAND_MAPS[0]
+
+        for m, q2t, kqt in cand_q:
+            sq = h1 * m[1] + h2 * m[2] + h3 * m[3] + h4 * m[4] + h5 * m[5] + h6 * m[6] + h7 * m[7]
+            sq2 = h1 * q2t[1] + h2 * q2t[2] + h3 * q2t[3] + h4 * q2t[4] + h5 * q2t[5] + h6 * q2t[6] + h7 * q2t[7]
+            denom = 64 * sq2 - sq * sq
+            if denom <= 0:
+                continue
+            suq = h1 * kqt[1] + h2 * kqt[2] + h3 * kqt[3] + h4 * kqt[4] + h5 * kqt[5] + h6 * kqt[6] + h7 * kqt[7]
+            num = 64 * suq - sum_u * sq
+            if num <= 0:
+                continue
+            sc = (num * num) / denom
+            if sc > best_score:
+                best_score = sc
+                best_su = num / (denom + 1e-8)
+                best_bu = (sum_u - best_su * sq) / 64.0
+                best_m = m
+
+        if best_score < 0.0:
+            # Degenerate group (e.g. 1 or 2 occupied q3 bins): fall back to exact 64-float RCO.
+            grp_f32: list[float] = []
+            for nib in (n0, n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15):
+                grp_f32.append(b3 + (nib & 7) * s3)
+                grp_f32.append(b3 + ((nib >> 3) & 7) * s3)
+                grp_f32.append(b3 + ((nib >> 6) & 7) * s3)
+                grp_f32.append(b3 + ((nib >> 9) & 7) * s3)
+            sh, bh, codes_fb, mse_fb = quantize_group_rco(grp_f32, 2, iters=3)
+            out_sb[2 * g] = sh
+            out_sb[2 * g + 1] = bh
+            _pack_group_codes(codes_fb, 2, out_q2, g * 16)
+            if compute_mse:
+                mse_sum += mse_fb
+            continue
+
+        if s3 > 0.0:
+            s2_raw = best_su * s3
+            b2_raw = b3 + best_bu * s3
+            tbl = map_pos[best_m]
+            neg_scale = False
+        else:
+            s2_raw = -best_su * s3
+            b2_raw = b3 + (best_bu + 3.0 * best_su) * s3
+            tbl = map_neg[best_m]
+            neg_scale = True
+
+        if s2_raw > f16_max:
+            s2_raw = f16_max
+        elif s2_raw < 0.0:
+            s2_raw = 0.0
+        if b2_raw > f16_max:
+            b2_raw = f16_max
+        elif b2_raw < -f16_max:
+            b2_raw = -f16_max
+        out_sb[2 * g] = s2_raw
+        out_sb[2 * g + 1] = b2_raw
+
+        o2 = g * 16
+        out_q2[o2] = tbl[n0]
+        out_q2[o2 + 1] = tbl[n1]
+        out_q2[o2 + 2] = tbl[n2]
+        out_q2[o2 + 3] = tbl[n3]
+        out_q2[o2 + 4] = tbl[n4]
+        out_q2[o2 + 5] = tbl[n5]
+        out_q2[o2 + 6] = tbl[n6]
+        out_q2[o2 + 7] = tbl[n7]
+        out_q2[o2 + 8] = tbl[n8]
+        out_q2[o2 + 9] = tbl[n9]
+        out_q2[o2 + 10] = tbl[n10]
+        out_q2[o2 + 11] = tbl[n11]
+        out_q2[o2 + 12] = tbl[n12]
+        out_q2[o2 + 13] = tbl[n13]
+        out_q2[o2 + 14] = tbl[n14]
+        out_q2[o2 + 15] = tbl[n15]
+
+        if compute_mse:
+            s2_h, b2_h = _round_pair_f16(s2_raw, b2_raw)
+            hs = (h0, h1, h2, h3, h4, h5, h6, h7)
+            err2 = 0.0
+            if neg_scale:
+                for ki in range(8):
+                    hk = hs[ki]
+                    if hk:
+                        d = (b3 + ki * s3) - (b2_h + (3 - best_m[ki]) * s2_h)
+                        err2 += hk * d * d
+            else:
+                for ki in range(8):
+                    hk = hs[ki]
+                    if hk:
+                        d = (b3 + ki * s3) - (b2_h + best_m[ki] * s2_h)
+                        err2 += hk * d * d
+            mse_sum += err2 / 64.0
+
+    out_p = struct.pack(f"<{total_groups * 2}e", *out_sb)
+    return bytes(out_q2), out_p, (mse_sum / total_groups if compute_mse else 0.0)
+
+
+def _q3_to_q2_worker_task(
+    args: tuple[bytes, bytes, bytes | None, str, int, int, bool]
+) -> tuple[bytes, bytes, float]:
+    """Worker task for parallel streaming `q3_affine -> q2_affine` expert transcoding."""
+    q3_data, s_or_p_bytes, b_bytes, param_fmt, n_rows, k, compute_mse = args
+    if param_fmt == "amf_half2":
+        total_groups = n_rows * (k // 64)
+        pairs = struct.unpack(f"<{total_groups * 2}e", s_or_p_bytes)
+        s_vals = pairs[0::2]
+        b_vals = pairs[1::2]
+    else:
+        assert b_bytes is not None
+        s_vals = _decode_sf_float_tuple(s_or_p_bytes, param_fmt)
+        b_vals = _decode_sf_float_tuple(b_bytes, param_fmt)
+    return quantize_q3_blob_to_q2_rco(
+        q3_data, s_vals, b_vals, n_rows, k, group_size=64, compute_mse=compute_mse
+    )
+
+
+# ---------------------------------------------------------------------------
+# ARMv9 SME2 `LUT16` (`ZT0`, QuantParamKind = 1) Codebook Packer (ADR-0018, W17)
+# ---------------------------------------------------------------------------
+
+
+def _lloyd_1d_unweighted(
+    sv: list[float],
+    ps: list[float],
+    ps2: list[float],
+    init_centroids: list[float],
+    lloyd_iters: int,
+) -> tuple[list[float], float]:
+    L = len(init_centroids)
+    n = len(sv)
+    c_vec = sorted(init_centroids)
+    for _ in range(lloyd_iters):
+        bounds = [0.5 * (c_vec[j] + c_vec[j + 1]) for j in range(L - 1)]
+        prev = 0
+        moved = False
+        for j in range(L):
+            nxt = bisect.bisect_right(sv, bounds[j], prev) if j < L - 1 else n
+            if nxt > prev:
+                nc = (ps[nxt] - ps[prev]) / (nxt - prev)
+                if abs(nc - c_vec[j]) > 1e-8:
+                    moved = True
+                c_vec[j] = nc
+            prev = nxt
+        if not moved:
+            break
+    bounds = [0.5 * (c_vec[j] + c_vec[j + 1]) for j in range(L - 1)]
+    prev = 0
+    sse = 0.0
+    for j in range(L):
+        nxt = bisect.bisect_right(sv, bounds[j], prev) if j < L - 1 else n
+        if nxt > prev:
+            cj = c_vec[j]
+            cnt = nxt - prev
+            sse += max(0.0, (ps2[nxt] - ps2[prev]) - 2.0 * cj * (ps[nxt] - ps[prev]) + cnt * cj * cj)
+        prev = nxt
+    return c_vec, sse
+
+
+def _lloyd_1d_weighted(
+    sv: list[float],
+    pw: list[float],
+    pwx: list[float],
+    pwx2: list[float],
+    init_centroids: list[float],
+    lloyd_iters: int,
+) -> tuple[list[float], float]:
+    L = len(init_centroids)
+    n = len(sv)
+    c_vec = sorted(init_centroids)
+    for _ in range(lloyd_iters):
+        bounds = [0.5 * (c_vec[j] + c_vec[j + 1]) for j in range(L - 1)]
+        prev = 0
+        moved = False
+        for j in range(L):
+            nxt = bisect.bisect_right(sv, bounds[j], prev) if j < L - 1 else n
+            if nxt > prev:
+                w_seg = pw[nxt] - pw[prev]
+                if w_seg > 0.0:
+                    nc = (pwx[nxt] - pwx[prev]) / w_seg
+                    if abs(nc - c_vec[j]) > 1e-8:
+                        moved = True
+                    c_vec[j] = nc
+            prev = nxt
+        if not moved:
+            break
+    bounds = [0.5 * (c_vec[j] + c_vec[j + 1]) for j in range(L - 1)]
+    prev = 0
+    wsse = 0.0
+    for j in range(L):
+        nxt = bisect.bisect_right(sv, bounds[j], prev) if j < L - 1 else n
+        if nxt > prev:
+            cj = c_vec[j]
+            w_seg = pw[nxt] - pw[prev]
+            wsse += max(0.0, (pwx2[nxt] - pwx2[prev]) - 2.0 * cj * (pwx[nxt] - pwx[prev]) + w_seg * cj * cj)
+        prev = nxt
+    return c_vec, wsse
+
+
+def fit_lut16_panel_group(
+    tile_rows: Sequence[Sequence[float]],
+    bits: int,
+    *,
+    col_weights: Sequence[float] | None = None,
+    lloyd_iters: int = 10,
+    bias_iters: int = 2,
+) -> tuple[list[float], list[float], list[list[int]], float]:
+    """Fit a per-`(panel, group)` weighted Lloyd-Max `ZT0` codebook + per-column `f16` RCO biases.
+
+    Returns `(cb16_f16, biases16_f16, codes_2d, mse)` matching `src/cpu/sme.zig:packQuantLut16Panel64`:
+    - `cb16_f16` has 16 IEEE-`f16` floats (`q2` uses `cb[0..4]`, `q3` `cb[0..8]`, `q4` `cb[0..16]`;
+      unused entries are strictly `0.0`).
+    - `biases16_f16` has 16 IEEE-`f16` per-column biases (padded columns `>= n_active` are `0.0`).
+    - `codes_2d` has `n_active` rows of 64 integer codes in `0..(1 << bits) - 1`.
+    - Exact dequantization formula: `w_hat[c, k] = float(f16(cb[code])) + float(f16(bias[c]))`.
+    """
+    if bits not in (2, 3, 4):
+        raise ValueError(f"unsupported lut16 quant bits {bits} (expected 2, 3, or 4)")
+    n_active = len(tile_rows)
+    if not (1 <= n_active <= SME2_PANEL_COLS):
+        raise ValueError(f"tile_rows must contain 1..16 rows, got {n_active}")
+    L = 1 << bits
+    g_len = len(tile_rows[0])
+    if g_len != SME2_GROUP_K:
+        raise ValueError(f"each tile row must have length {SME2_GROUP_K}, got {g_len}")
+    if col_weights is not None and len(col_weights) != n_active:
+        raise ValueError(f"col_weights length {len(col_weights)} != n_active {n_active}")
+
+    biases = [_clamp_f16(math.fsum(r) / g_len) for r in tile_rows]
+    n_tot = n_active * g_len
+
+    if col_weights is None:
+        sv = sorted(x - biases[c] for c, r in enumerate(tile_rows) for x in r)
+        lo, hi = sv[0], sv[-1]
+        if hi <= lo:
+            cb16 = [0.0] * 16
+            b16 = biases + [0.0] * (SME2_PANEL_COLS - n_active)
+            codes = [[0] * g_len for _ in range(n_active)]
+            err2 = 0.0
+            for c, r in enumerate(tile_rows):
+                bc = biases[c]
+                for x in r:
+                    d = x - bc
+                    err2 += d * d
+            return cb16, b16, codes, err2 / n_tot
+
+        ps = [0.0] * (n_tot + 1)
+        ps2 = [0.0] * (n_tot + 1)
+        acc = 0.0
+        acc2 = 0.0
+        for i, x in enumerate(sv):
+            acc += x
+            acc2 += x * x
+            ps[i + 1] = acc
+            ps2[i + 1] = acc2
+
+        # Candidate 1: LBG variance-splitting init (automatically captures heavy tails / outliers).
+        cuts = [0, n_tot]
+        while len(cuts) - 1 < L:
+            best_i = -1
+            best_sse = -1.0
+            for i in range(len(cuts) - 1):
+                a, b = cuts[i], cuts[i + 1]
+                cnt = b - a
+                if cnt < 2:
+                    continue
+                m = (ps[b] - ps[a]) / cnt
+                seg_sse = (ps2[b] - ps2[a]) - cnt * m * m
+                if seg_sse > best_sse:
+                    best_sse = seg_sse
+                    best_i = i
+            if best_i < 0:
+                break
+            a, b = cuts[best_i], cuts[best_i + 1]
+            mean_seg = (ps[b] - ps[a]) / (b - a)
+            mid = bisect.bisect_right(sv, mean_seg, a, b)
+            if mid <= a:
+                mid = a + 1
+            elif mid >= b:
+                mid = b - 1
+            cuts.insert(best_i + 1, mid)
+        init_lbg = [(ps[cuts[i + 1]] - ps[cuts[i]]) / (cuts[i + 1] - cuts[i]) for i in range(len(cuts) - 1)]
+        while len(init_lbg) < L:
+            init_lbg.append(init_lbg[-1])
+        c_lbg, sse_lbg = _lloyd_1d_unweighted(sv, ps, ps2, init_lbg, lloyd_iters)
+
+        # Candidate 2: uniform-span centered init + Lloyd-Max.
+        init_unif = [lo + (hi - lo) * ((j + 0.5) / L) for j in range(L)]
+        c_unif, sse_unif = _lloyd_1d_unweighted(sv, ps, ps2, init_unif, lloyd_iters)
+        cb_l = c_lbg if sse_lbg <= sse_unif else c_unif
+    else:
+        pairs = sorted(
+            (x - biases[c], max(1e-6, float(col_weights[c])))
+            for c, r in enumerate(tile_rows)
+            for x in r
+        )
+        sv = [p[0] for p in pairs]
+        lo, hi = sv[0], sv[-1]
+        if hi <= lo:
+            cb16 = [0.0] * 16
+            b16 = biases + [0.0] * (SME2_PANEL_COLS - n_active)
+            codes = [[0] * g_len for _ in range(n_active)]
+            err2 = 0.0
+            for c, r in enumerate(tile_rows):
+                bc = biases[c]
+                for x in r:
+                    d = x - bc
+                    err2 += d * d
+            return cb16, b16, codes, err2 / n_tot
+
+        pw = [0.0] * (n_tot + 1)
+        pwx = [0.0] * (n_tot + 1)
+        pwx2 = [0.0] * (n_tot + 1)
+        aw = ax = ax2 = 0.0
+        for i, (x, wt) in enumerate(pairs):
+            aw += wt
+            ax += wt * x
+            ax2 += wt * x * x
+            pw[i + 1] = aw
+            pwx[i + 1] = ax
+            pwx2[i + 1] = ax2
+
+        cuts = [0, n_tot]
+        while len(cuts) - 1 < L:
+            best_i = -1
+            best_sse = -1.0
+            for i in range(len(cuts) - 1):
+                a, b = cuts[i], cuts[i + 1]
+                if b - a < 2:
+                    continue
+                w_seg = pw[b] - pw[a]
+                if w_seg <= 0.0:
+                    continue
+                m = (pwx[b] - pwx[a]) / w_seg
+                seg_sse = (pwx2[b] - pwx2[a]) - w_seg * m * m
+                if seg_sse > best_sse:
+                    best_sse = seg_sse
+                    best_i = i
+            if best_i < 0:
+                break
+            a, b = cuts[best_i], cuts[best_i + 1]
+            mean_seg = (pwx[b] - pwx[a]) / (pw[b] - pw[a])
+            mid = bisect.bisect_right(sv, mean_seg, a, b)
+            if mid <= a:
+                mid = a + 1
+            elif mid >= b:
+                mid = b - 1
+            cuts.insert(best_i + 1, mid)
+        init_lbg = [
+            (pwx[cuts[i + 1]] - pwx[cuts[i]]) / max(1e-12, pw[cuts[i + 1]] - pw[cuts[i]])
+            for i in range(len(cuts) - 1)
+        ]
+        while len(init_lbg) < L:
+            init_lbg.append(init_lbg[-1])
+        c_lbg, sse_lbg = _lloyd_1d_weighted(sv, pw, pwx, pwx2, init_lbg, lloyd_iters)
+        init_unif = [lo + (hi - lo) * ((j + 0.5) / L) for j in range(L)]
+        c_unif, sse_unif = _lloyd_1d_weighted(sv, pw, pwx, pwx2, init_unif, lloyd_iters)
+        cb_l = c_lbg if sse_lbg <= sse_unif else c_unif
+
+    def _eval_f16_state(
+        cb_cand: Sequence[float],
+        b_cand: Sequence[float],
+    ) -> tuple[list[float], list[float], list[list[int]], float]:
+        cb_h = sorted(_clamp_f16(v) for v in cb_cand)
+        b_h = [_clamp_f16(v) for v in b_cand]
+        bounds = [0.5 * (cb_h[j] + cb_h[j + 1]) for j in range(L - 1)]
+        codes_out: list[list[int]] = []
+        err2 = 0.0
+        for c, row in enumerate(tile_rows):
+            bc = b_h[c]
+            rc = [0] * g_len
+            for idx, x in enumerate(row):
+                j = bisect.bisect_right(bounds, x - bc)
+                rc[idx] = j
+                d = x - (cb_h[j] + bc)
+                err2 += d * d
+            codes_out.append(rc)
+        return cb_h, b_h, codes_out, err2 / n_tot
+
+    best_cb, best_b, best_codes, best_mse = _eval_f16_state(cb_l, biases)
+
+    # Alternating per-column RCO bias + codebook refinement in exact f16 space.
+    cur_cb = list(best_cb)
+    cur_b = list(best_b)
+    for _ in range(bias_iters):
+        bounds = [0.5 * (cur_cb[j] + cur_cb[j + 1]) for j in range(L - 1)]
+        new_b = [0.0] * n_active
+        c_sums = [0.0] * L
+        c_wsums = [0.0] * L
+        for c, row in enumerate(tile_rows):
+            bc = cur_b[c]
+            b_acc = 0.0
+            for x in row:
+                j = bisect.bisect_right(bounds, x - bc)
+                b_acc += x - cur_cb[j]
+            nb = _clamp_f16(b_acc / g_len)
+            new_b[c] = nb
+            wc = 1.0 if col_weights is None else max(1e-6, float(col_weights[c]))
+            for x in row:
+                res_val = x - nb
+                j = bisect.bisect_right(bounds, res_val)
+                c_sums[j] += wc * res_val
+                c_wsums[j] += wc
+        new_cb = [
+            (c_sums[j] / c_wsums[j]) if c_wsums[j] > 0.0 else cur_cb[j]
+            for j in range(L)
+        ]
+        cand_cb, cand_b, cand_codes, cand_mse = _eval_f16_state(new_cb, new_b)
+        if cand_mse < best_mse:
+            best_cb, best_b, best_codes, best_mse = cand_cb, cand_b, cand_codes, cand_mse
+        else:
+            break
+        cur_cb, cur_b = cand_cb, cand_b
+
+    cb16 = best_cb + [0.0] * (16 - L)
+    b16 = best_b + [0.0] * (SME2_PANEL_COLS - n_active)
+    return cb16, b16, best_codes, best_mse
+
+
+def pack_lut16_panel_sme2(
+    panel_rows: Sequence[Sequence[float]],
+    bits: int,
+    *,
+    group_size: int = 64,
+    col_weights: Sequence[float] | None = None,
+    lloyd_iters: int = 10,
+    bias_iters: int = 2,
+) -> tuple[bytes, float]:
+    """Fit and pack 1..16 fp32 rows into one `QuantParamKind.LUT16_CODEBOOK` `sme2_panel64` panel."""
+    if group_size != SME2_GROUP_K:
+        raise ValueError(f"LUT16 sme2_panel64 requires group_size=64, got {group_size}")
+    n_active = len(panel_rows)
+    if not (1 <= n_active <= SME2_PANEL_COLS):
+        raise ValueError(f"panel_rows must contain 1..16 rows, got {n_active}")
+    k = len(panel_rows[0])
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"LUT16 sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+
+    groups = k // SME2_GROUP_K
+    headers: list[bytes] = []
+    full_codes: list[list[int]] = [[0] * k for _ in range(n_active)]
+    mse_sum = 0.0
+    for g in range(groups):
+        k0 = g * SME2_GROUP_K
+        k1 = k0 + SME2_GROUP_K
+        tile = [row[k0:k1] for row in panel_rows]
+        cb16, b16, codes_g, mse_g = fit_lut16_panel_group(
+            tile,
+            bits,
+            col_weights=col_weights,
+            lloyd_iters=lloyd_iters,
+            bias_iters=bias_iters,
+        )
+        mse_sum += mse_g
+        cb_bytes = _F16_16_STRUCT.pack(*cb16)
+        bias_dup = _F16_32_STRUCT.pack(*(v for b in b16 for v in (b, b)))
+        headers.append(pack_sme2_lut16_header(cb_bytes, bias_dup))
+        for c in range(n_active):
+            full_codes[c][k0:k1] = codes_g[c]
+
+    if bits == 4:
+        d_rows = [pack_mlx_affine_4bit(rc) for rc in full_codes]
+        panel_bytes = pack_sme2_panel64_q4_panel(
+            d_rows, None, k, param_kind=QuantParamKind.LUT16_CODEBOOK, group_headers=headers
+        )
+    elif bits == 3:
+        d_rows = [pack_mlx_affine_3bit(rc) for rc in full_codes]
+        panel_bytes = pack_sme2_panel64_q3_panel(
+            d_rows, None, k, param_kind=QuantParamKind.LUT16_CODEBOOK, group_headers=headers
+        )
+    elif bits == 2:
+        panel_bytes = pack_sme2_panel64_q2_panel(
+            full_codes, None, k, param_kind=QuantParamKind.LUT16_CODEBOOK, group_headers=headers
+        )
+    else:
+        raise ValueError(f"unsupported lut16 quant bits {bits}")
+    return panel_bytes, mse_sum / groups
+
+
+def _lut16_batch_worker_task(
+    args: tuple[list[list[float]], int, int, int]
+) -> tuple[bytes, float]:
+    batch_rows, bits, lloyd_iters, bias_iters = args
+    parts: list[bytes] = []
+    mse_acc = 0.0
+    n_panels = 0
+    for p0 in range(0, len(batch_rows), SME2_PANEL_COLS):
+        pb, pmse = pack_lut16_panel_sme2(
+            batch_rows[p0 : p0 + SME2_PANEL_COLS],
+            bits,
+            lloyd_iters=lloyd_iters,
+            bias_iters=bias_iters,
+        )
+        parts.append(pb)
+        mse_acc += pmse
+        n_panels += 1
+    return b"".join(parts), mse_acc / max(1, n_panels)
+
+
+def repack_amf_entry_lut16_sme2(
+    src_fh,
+    entry: PackedTensorMeta,
+    new_blob_bytes: int,
+    w: _BlobWriter,
+    *,
+    lloyd_iters: int = 10,
+    bias_iters: int = 2,
+    workers: int = 1,
+) -> float:
+    """Stream-convert one quantized `.amf` entry into `QuantParamKind.LUT16_CODEBOOK` `sme2_panel64`."""
+    if entry.dtype not in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
+        raise ValueError(f"LUT16 repack requires q2/q3/q4 dtype, got {entry.dtype.name} for {entry.name!r}")
+    n_rows, k = entry.shape
+    bits = _DTYPE_BITS_RANK[entry.dtype]
+    groups = k // entry.group_size
+
+    def _iter_row_batches() -> Iterator[list[list[float]]]:
+        if entry.layout == TensorLayout.SME2_PANEL64:
+            if entry.dtype == DType.Q4_AFFINE:
+                panel_bytes = groups * SME2_Q4_GROUP_BYTES
+                deq_p = dequantize_sme2_panel64_q4_panel_f32
+            elif entry.dtype == DType.Q3_AFFINE:
+                panel_bytes = groups * SME2_Q3_GROUP_BYTES
+                deq_p = dequantize_sme2_panel64_q3_panel_f32
+            else:
+                panel_bytes = groups * SME2_Q2_GROUP_BYTES
+                deq_p = dequantize_sme2_panel64_q2_panel_f32
+            for r0 in range(0, n_rows, _ROW_BATCH_SIZE):
+                r1 = min(n_rows, r0 + _ROW_BATCH_SIZE)
+                batch: list[list[float]] = []
+                for p_start in range(r0, r1, SME2_PANEL_COLS):
+                    p_idx = p_start // SME2_PANEL_COLS
+                    cnt = min(SME2_PANEL_COLS, n_rows - p_start)
+                    raw_p = _read_exact(src_fh, entry.blob_offset + p_idx * panel_bytes, panel_bytes)
+                    batch.extend(deq_p(raw_p, k, num_rows=cnt, param_kind=entry.quant_param_kind))
+                yield batch
+            return
+
+        if entry.dtype == DType.Q4_AFFINE:
+            row_d = k // 2
+            deq = dequantize_q4_row_f32
+        elif entry.dtype == DType.Q3_AFFINE:
+            row_d = (k * 3) // 8
+            deq = dequantize_q3_row_f32
+        else:
+            row_d = k // 4
+            deq = dequantize_q2_row_f32
+        row_p = groups * 4
+        for r0 in range(0, n_rows, _ROW_BATCH_SIZE):
+            cnt = min(_ROW_BATCH_SIZE, n_rows - r0)
+            d_raw = _read_exact(src_fh, entry.blob_offset + r0 * row_d, cnt * row_d)
+            p_raw = _read_exact(src_fh, entry.blob_offset + entry.params_offset + r0 * row_p, cnt * row_p)
+            d_mv = memoryview(d_raw)
+            p_mv = memoryview(p_raw)
+            yield [
+                deq(d_mv[i * row_d : (i + 1) * row_d], p_mv[i * row_p : (i + 1) * row_p], k, group_size=entry.group_size)
+                for i in range(cnt)
+            ]
+
+    mse_acc = 0.0
+    n_batches = 0
+    if workers > 1 and n_rows >= _ROW_BATCH_SIZE * 2:
+        max_inflight = max(2, workers)
+        pending: deque[concurrent.futures.Future[tuple[bytes, float]]] = deque()
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            for batch in _iter_row_batches():
+                pending.append(pool.submit(_lut16_batch_worker_task, (batch, bits, lloyd_iters, bias_iters)))
+                if len(pending) >= max_inflight:
+                    chunk, mse_b = pending.popleft().result()
+                    w.write(chunk)
+                    mse_acc += mse_b
+                    n_batches += 1
+            while pending:
+                chunk, mse_b = pending.popleft().result()
+                w.write(chunk)
+                mse_acc += mse_b
+                n_batches += 1
+    else:
+        for batch in _iter_row_batches():
+            chunk, mse_b = _lut16_batch_worker_task((batch, bits, lloyd_iters, bias_iters))
+            w.write(chunk)
+            mse_acc += mse_b
+            n_batches += 1
+
+    expected_data = sme2_panel64_data_bytes(entry.dtype, n_rows, k, entry.group_size)
+    if w.written != expected_data:
+        raise AssertionError(f"LUT16 repacked {w.written} bytes for {entry.name!r}, expected {expected_data}")
+    w.zeros(new_blob_bytes - w.written)
+    return mse_acc / max(1, n_batches)
+
+
+def stream_safetensors_entry_lut16_sme2(
+    entry: _PlannedEntry,
+    readers: _ShardReaders,
+    w: _BlobWriter,
+    *,
+    lloyd_iters: int = 10,
+    bias_iters: int = 2,
+    workers: int = 1,
+) -> float:
+    """Stream one quantized safetensors entry into `QuantParamKind.LUT16_CODEBOOK` `sme2_panel64`."""
+    if entry.dtype not in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
+        raise ValueError(f"LUT16 pack requires q2/q3/q4 dtype, got {entry.dtype.name} for {entry.name!r}")
+    assert entry.scales is not None and entry.biases is not None
+    n_rows, k = entry.shape
+    bits = _DTYPE_BITS_RANK[entry.dtype]
+    gs = entry.group_size
+    groups = k // gs
+    if entry.dtype == DType.Q4_AFFINE:
+        row_d = k // 2
+        deq = dequantize_q4_row_f32
+    elif entry.dtype == DType.Q3_AFFINE:
+        row_d = (k * 3) // 8
+        deq = dequantize_q3_row_f32
+    else:
+        row_d = k // 4
+        deq = dequantize_q2_row_f32
+    sb_elem = 2 if entry.scales.dtype in ("F16", "BF16") else 4
+    row_sb = groups * sb_elem
+    d_fh = readers.get(entry.data.path)
+    s_fh = readers.get(entry.scales.path)
+    b_fh = readers.get(entry.biases.path)
+
+    def _iter_batches() -> Iterator[list[list[float]]]:
+        for r0 in range(0, n_rows, _ROW_BATCH_SIZE):
+            cnt = min(_ROW_BATCH_SIZE, n_rows - r0)
+            d_raw = _read_exact(d_fh, entry.data.offset + r0 * row_d, cnt * row_d)
+            s_raw = _read_exact(s_fh, entry.scales.offset + r0 * row_sb, cnt * row_sb)
+            b_raw = _read_exact(b_fh, entry.biases.offset + r0 * row_sb, cnt * row_sb)
+            s_vals = _decode_sf_float_tuple(s_raw, entry.scales.dtype)
+            b_vals = _decode_sf_float_tuple(b_raw, entry.biases.dtype)
+            d_mv = memoryview(d_raw)
+            rows_out: list[list[float]] = []
+            for i in range(cnt):
+                g0 = i * groups
+                p_buf = bytearray(groups * 4)
+                for g_i in range(groups):
+                    _F16_PAIR_STRUCT.pack_into(
+                        p_buf, g_i * 4, _clamp_f16(s_vals[g0 + g_i]), _clamp_f16(b_vals[g0 + g_i])
+                    )
+                rows_out.append(deq(d_mv[i * row_d : (i + 1) * row_d], p_buf, k, group_size=gs))
+            yield rows_out
+
+    mse_acc = 0.0
+    n_batches = 0
+    if workers > 1 and n_rows >= _ROW_BATCH_SIZE * 2:
+        max_inflight = max(2, workers)
+        pending: deque[concurrent.futures.Future[tuple[bytes, float]]] = deque()
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            for batch in _iter_batches():
+                pending.append(pool.submit(_lut16_batch_worker_task, (batch, bits, lloyd_iters, bias_iters)))
+                if len(pending) >= max_inflight:
+                    chunk, mse_b = pending.popleft().result()
+                    w.write(chunk)
+                    mse_acc += mse_b
+                    n_batches += 1
+            while pending:
+                chunk, mse_b = pending.popleft().result()
+                w.write(chunk)
+                mse_acc += mse_b
+                n_batches += 1
+    else:
+        for batch in _iter_batches():
+            chunk, mse_b = _lut16_batch_worker_task((batch, bits, lloyd_iters, bias_iters))
+            w.write(chunk)
+            mse_acc += mse_b
+            n_batches += 1
+
+    expected_data = sme2_panel64_data_bytes(entry.dtype, n_rows, k, entry.group_size)
+    if w.written != expected_data:
+        raise AssertionError(f"LUT16 packed {w.written} bytes for {entry.name!r}, expected {expected_data}")
+    w.zeros(entry.blob_bytes - w.written)
+    return mse_acc / max(1, n_batches)
+
+
+# ---------------------------------------------------------------------------
 # GSQ Sensitivity Scoring & Discrete Convex-Hull Knapsack Allocator
 # ---------------------------------------------------------------------------
 
@@ -473,12 +1322,18 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
         return "embedding"
     if kind == TensorKind.LM_HEAD:
         return "lm_head"
+    if kind == TensorKind.SHARED_EXPERT:
+        return "shared_expert"
+    if kind == TensorKind.SPARSE_TABLE:
+        return "sparse_table"
+    if kind == TensorKind.LOOP_ADAPTER:
+        return "loop_adapter"
     if kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT):
         return "moe_expert"
-    if ".self_attn." in name:
-        if ".v_proj" in name:
+    if ".self_attn." in name or ".linear_attn." in name:
+        if ".v_proj" in name or ".g_proj" in name:
             return "attn_v"
-        if ".o_proj" in name:
+        if ".o_proj" in name or ".out_proj" in name:
             return "attn_o"
         return "attn_qk"
     if ".mlp." in name:
@@ -490,8 +1345,10 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
 
 _ROLE_WEIGHT = {
     "router": 10.0,
+    "loop_adapter": 8.0,
     "embedding": 6.0,
     "lm_head": 6.0,
+    "shared_expert": 5.0,
     "attn_v": 3.2,
     "attn_o": 3.2,
     "attn_vo": 3.2,
@@ -500,6 +1357,7 @@ _ROLE_WEIGHT = {
     "dense_ffn": 1.0,
     "moe_expert": 1.0,
     "dense": 1.2,
+    "sparse_table": 1.0,
     "norm": 100.0,
 }
 
@@ -610,15 +1468,21 @@ def solve_gsq_allocation(
                 chosen_idx[idx] = top_j
                 cur_bytes += extra
 
-    # Protection pass 2: protect embedding / lm_head at >= q4_affine when budget allows
-    # while leaving room for remaining units at their base allocation.
+    def _best_floor_candidate_idx(u: QuantUnitInput, cur_j: int) -> int:
+        """Select highest quantized candidate `<= Q4_AFFINE` (i.e. Q4 if present, else Q3)."""
+        target_j = cur_j
+        for j, c in enumerate(u.candidates):
+            if c.dtype == DType.Q4_AFFINE:
+                return j
+            if c.dtype == DType.Q3_AFFINE and j > target_j:
+                target_j = j
+        return target_j
+
+    # Protection pass 2: protect embedding / lm_head / shared_expert at >= q4_affine
+    # (or lossless source q3_affine on 3-bit checkpoints) when budget allows.
     for idx, u in enumerate(units):
-        if u.role in ("embedding", "lm_head"):
-            target_j = chosen_idx[idx]
-            for j, c in enumerate(u.candidates):
-                if c.dtype == DType.Q4_AFFINE:
-                    target_j = j
-                    break
+        if u.role in ("embedding", "lm_head", "shared_expert"):
+            target_j = _best_floor_candidate_idx(u, chosen_idx[idx])
             if target_j > chosen_idx[idx]:
                 extra = u.candidates[target_j].alg_bytes - u.candidates[chosen_idx[idx]].alg_bytes
                 if cur_bytes + extra <= budget_bytes:
@@ -627,7 +1491,7 @@ def solve_gsq_allocation(
 
     # Protection pass 3: protect boundary layers (layer 0 and final layer, critical
     # for lexical/multilingual encoding and final logit projection) and attention
-    # projections at >= q4_affine when budget permits.
+    # projections at >= q4_affine (or source q3_affine) when budget permits.
     layer_indices = [u.layer for u in units if u.layer != NO_LAYER]
     max_unit_layer = max(layer_indices) if layer_indices else -1
     has_boundary_layers = max_unit_layer >= 3
@@ -643,11 +1507,7 @@ def solve_gsq_allocation(
         order.sort(key=lambda i: (-units[i].sensitivity, units[i].unit_id))
         for idx in order:
             u = units[idx]
-            target_j = chosen_idx[idx]
-            for j, c in enumerate(u.candidates):
-                if c.dtype == DType.Q4_AFFINE:
-                    target_j = j
-                    break
+            target_j = _best_floor_candidate_idx(u, chosen_idx[idx])
             if target_j > chosen_idx[idx]:
                 extra = u.candidates[target_j].alg_bytes - u.candidates[chosen_idx[idx]].alg_bytes
                 if cur_bytes + extra <= budget_bytes:
@@ -778,6 +1638,8 @@ class _UnifiedSource:
         tie_word_embeddings: bool | None = None,
         exclude_tensors: Iterable[str] = (),
         model_id_override: str | None = None,
+        strip_vision: bool = True,
+        stats_out: dict[str, int] | None = None,
     ) -> None:
         self.input_path = pathlib.Path(input_path)
         self.group_size = group_size
@@ -828,6 +1690,8 @@ class _UnifiedSource:
                 tie_word_embeddings=tie,
                 exclude_tensors=exclude_tensors,
                 sme2_pack="none",
+                strip_vision=strip_vision,
+                stats_out=stats_out,
             )
             self._sf_readers = _ShardReaders()
             self.model_id = model_id_override or self.input_path.stem
@@ -994,9 +1858,40 @@ class _UnifiedSource:
         e = t.sf_entry
         fh = self._sf_readers.get(e.data.path)
         if e.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
+            assert e.scales is not None and e.biases is not None
+            gs = e.group_size
+            groups = k // gs
+            if e.dtype == DType.Q2_AFFINE:
+                row_d = k // 4
+                deq = dequantize_q2_row_f32
+            elif e.dtype == DType.Q3_AFFINE:
+                row_d = (k * 3) // 8
+                deq = dequantize_q3_row_f32
+            else:
+                row_d = k // 2
+                deq = dequantize_q4_row_f32
+            sb_elem = 2 if e.scales.dtype in ("F16", "BF16") else 4
+            row_sb = groups * sb_elem
+            s_fh = self._sf_readers.get(e.scales.path)
+            b_fh = self._sf_readers.get(e.biases.path)
             for r0 in range(0, n_rows, batch_rows):
                 cnt = min(batch_rows, n_rows - r0)
-                yield self.read_rows_f32(t, range(r0, r0 + cnt))
+                d_raw = _read_exact(fh, e.data.offset + r0 * row_d, cnt * row_d)
+                s_raw = _read_exact(s_fh, e.scales.offset + r0 * row_sb, cnt * row_sb)
+                b_raw = _read_exact(b_fh, e.biases.offset + r0 * row_sb, cnt * row_sb)
+                s_vals = _decode_sf_float_tuple(s_raw, e.scales.dtype)
+                b_vals = _decode_sf_float_tuple(b_raw, e.biases.dtype)
+                d_mv = memoryview(d_raw)
+                batch_out: list[list[float]] = []
+                for i in range(cnt):
+                    g0 = i * groups
+                    p_buf = bytearray(groups * 4)
+                    for g_idx in range(groups):
+                        _F16_PAIR_STRUCT.pack_into(
+                            p_buf, g_idx * 4, _clamp_f16(s_vals[g0 + g_idx]), _clamp_f16(b_vals[g0 + g_idx])
+                        )
+                    batch_out.append(deq(d_mv[i * row_d : (i + 1) * row_d], p_buf, k, group_size=gs))
+                yield batch_out
             return
 
         elem_b = 2 if e.data.dtype in ("F16", "BF16") else 4
@@ -1006,6 +1901,28 @@ class _UnifiedSource:
             raw = _read_exact(fh, e.data.offset + r0 * row_b, cnt * row_b)
             mv = memoryview(raw)
             yield [_decode_sf_floats(mv[i * row_b : (i + 1) * row_b], e.data.dtype) for i in range(cnt)]
+
+    def read_q3_raw_slices(self, t: _SourceTensor) -> tuple[bytes, bytes, bytes | None, str] | None:
+        """Read contiguous raw `q3_affine` data & scales/biases in <=3 `pread`s when row-major."""
+        if t.dtype != DType.Q3_AFFINE or t.group_size != 64 or len(t.shape) != 2:
+            return None
+        if self._amf_reader is not None:
+            m = t.amf_meta
+            assert m is not None
+            if m.layout != TensorLayout.ROW_MAJOR:
+                return None
+            fh = self._amf_reader._fh
+            d_raw = _read_exact(fh, m.blob_offset, m.data_bytes)
+            p_raw = _read_exact(fh, m.blob_offset + m.params_offset, m.params_bytes)
+            return d_raw, p_raw, None, "amf_half2"
+        assert self._sf_readers is not None and t.sf_entry is not None
+        e = t.sf_entry
+        if e.scales is None or e.biases is None:
+            return None
+        d_raw = _read_exact(self._sf_readers.get(e.data.path), e.data.offset, e.data.length)
+        s_raw = _read_exact(self._sf_readers.get(e.scales.path), e.scales.offset, e.scales.length)
+        b_raw = _read_exact(self._sf_readers.get(e.biases.path), e.biases.offset, e.biases.length)
+        return d_raw, s_raw, b_raw, e.scales.dtype
 
     def stream_raw_passthrough(self, t: _SourceTensor, w: _BlobWriter, target_dtype: DType, target_layout: TensorLayout, blob_bytes: int) -> None:
         """Stream-copy an unchanged tensor (possibly converting float dtype or SME2-packing)."""
@@ -1132,7 +2049,7 @@ def _load_heat_routing_probs(heat_profile_path: pathlib.Path) -> dict[tuple[int,
     weights: dict[tuple[int, int], float] = {}
     for item in layers:
         l_idx = int(item["layer"])
-        probs = item.get("routing_prob")
+        probs = item.get("routing_prob") or item.get("frequencies")
         if isinstance(probs, list) and probs:
             vals = [max(0.0, float(x)) for x in probs]
             mean_v = sum(vals) / len(vals)
@@ -1165,6 +2082,144 @@ def _sample_row_indices(n_rows: int, max_samples: int) -> list[int]:
     return [min(n_rows - 1, int(i * step)) for i in range(max_samples)]
 
 
+def _analyze_q3_sample_fast(
+    src: _UnifiedSource,
+    t: _SourceTensor,
+    *,
+    sample_rows: int,
+    use_rco: bool,
+) -> tuple[float, float, dict[DType, float]] | None:
+    """Fast O(groups) sampling path for already-quantized `q3_affine` tensors (bounded syscalls)."""
+    if t.dtype != DType.Q3_AFFINE or t.group_size != 64 or len(t.shape) != 2 or not use_rco:
+        return None
+    n_rows, k = t.shape
+    row_ids = _sample_row_indices(n_rows, sample_rows)
+    groups_per_row = k // 64
+    row_d = (k * 3) // 8
+
+    # Collect only the sampled rows' packed bytes + scales/biases.
+    d_chunks: list[bytes] = []
+    s_vals: list[float] = []
+    b_vals: list[float] = []
+    if src._amf_reader is not None:
+        m = t.amf_meta
+        assert m is not None
+        if m.layout != TensorLayout.ROW_MAJOR:
+            return None
+        fh = src._amf_reader._fh
+        row_p = groups_per_row * 4
+        if m.data_bytes <= 2 * 1024 * 1024:
+            all_d = memoryview(_read_exact(fh, m.blob_offset, m.data_bytes))
+            all_p = memoryview(_read_exact(fh, m.blob_offset + m.params_offset, m.params_bytes))
+            for r in row_ids:
+                d_chunks.append(bytes(all_d[r * row_d : (r + 1) * row_d]))
+                pairs = struct.unpack_from(f"<{groups_per_row * 2}e", all_p, r * row_p)
+                s_vals.extend(pairs[0::2])
+                b_vals.extend(pairs[1::2])
+        else:
+            for r in row_ids:
+                d_chunks.append(_read_exact(fh, m.blob_offset + r * row_d, row_d))
+                p_raw = _read_exact(fh, m.blob_offset + m.params_offset + r * row_p, row_p)
+                pairs = struct.unpack(f"<{groups_per_row * 2}e", p_raw)
+                s_vals.extend(pairs[0::2])
+                b_vals.extend(pairs[1::2])
+    else:
+        assert src._sf_readers is not None and t.sf_entry is not None
+        e = t.sf_entry
+        if e.scales is None or e.biases is None:
+            return None
+        d_fh = src._sf_readers.get(e.data.path)
+        s_fh = src._sf_readers.get(e.scales.path)
+        b_fh = src._sf_readers.get(e.biases.path)
+        sb_elem = 2 if e.scales.dtype in ("F16", "BF16") else 4
+        row_sb = groups_per_row * sb_elem
+        if e.data.length <= 2 * 1024 * 1024:
+            all_d = memoryview(_read_exact(d_fh, e.data.offset, e.data.length))
+            all_s = _decode_sf_float_tuple(_read_exact(s_fh, e.scales.offset, e.scales.length), e.scales.dtype)
+            all_b = _decode_sf_float_tuple(_read_exact(b_fh, e.biases.offset, e.biases.length), e.biases.dtype)
+            for r in row_ids:
+                d_chunks.append(bytes(all_d[r * row_d : (r + 1) * row_d]))
+                g0 = r * groups_per_row
+                s_vals.extend(all_s[g0 : g0 + groups_per_row])
+                b_vals.extend(all_b[g0 : g0 + groups_per_row])
+        else:
+            for r in row_ids:
+                d_chunks.append(_read_exact(d_fh, e.data.offset + r * row_d, row_d))
+                s_vals.extend(_decode_sf_float_tuple(_read_exact(s_fh, e.scales.offset + r * row_sb, row_sb), e.scales.dtype))
+                b_vals.extend(_decode_sf_float_tuple(_read_exact(b_fh, e.biases.offset + r * row_sb, row_sb), e.biases.dtype))
+
+    # Pick up to 64 evenly-strided groups from the sampled rows.
+    n_sampled_rows = len(row_ids)
+    total_avail = n_sampled_rows * groups_per_row
+    max_groups = 64
+    stride = max(1, total_avail // max_groups)
+    sel_d = bytearray()
+    sel_s: list[float] = []
+    sel_b: list[float] = []
+    for g_idx in range(0, total_avail, stride):
+        if len(sel_s) >= max_groups:
+            break
+        r_i = g_idx // groups_per_row
+        g_in_r = g_idx % groups_per_row
+        sel_d.extend(d_chunks[r_i][g_in_r * 24 : (g_in_r + 1) * 24])
+        sel_s.append(s_vals[g_idx])
+        sel_b.append(b_vals[g_idx])
+
+    n_sel = len(sel_s)
+    if n_sel == 0:
+        return None
+
+    # Compute exact variance / outlier_ratio over the selected groups via 8-bin SWAR histograms!
+    _ensure_q3_to_q2_tables()
+    lhist = _Q3_LUT12_HIST
+    words = struct.unpack(f"<{n_sel * 6}I", sel_d)
+    sum_w = 0.0
+    sum_w2 = 0.0
+    max_abs = 0.0
+    for g in range(n_sel):
+        wi = g * 6
+        w0, w1, w2, w3, w4, w5 = words[wi], words[wi + 1], words[wi + 2], words[wi + 3], words[wi + 4], words[wi + 5]
+        H = (
+            lhist[w0 & 0xFFF]
+            + lhist[(w0 >> 12) & 0xFFF]
+            + lhist[(w0 >> 24) | ((w1 & 0xF) << 8)]
+            + lhist[(w1 >> 4) & 0xFFF]
+            + lhist[(w1 >> 16) & 0xFFF]
+            + lhist[(w1 >> 28) | ((w2 & 0xFF) << 4)]
+            + lhist[(w2 >> 8) & 0xFFF]
+            + lhist[w2 >> 20]
+            + lhist[w3 & 0xFFF]
+            + lhist[(w3 >> 12) & 0xFFF]
+            + lhist[(w3 >> 24) | ((w4 & 0xF) << 8)]
+            + lhist[(w4 >> 4) & 0xFFF]
+            + lhist[(w4 >> 16) & 0xFFF]
+            + lhist[(w4 >> 28) | ((w5 & 0xFF) << 4)]
+            + lhist[(w5 >> 8) & 0xFFF]
+            + lhist[w5 >> 20]
+        )
+        s3 = sel_s[g]
+        b3 = sel_b[g]
+        for ki in range(8):
+            hk = (H >> (8 * ki)) & 0xFF
+            if hk:
+                val = b3 + ki * s3
+                sum_w += hk * val
+                sum_w2 += hk * val * val
+                av = abs(val)
+                if av > max_abs:
+                    max_abs = av
+
+    n_vals = n_sel * 64
+    mean = sum_w / n_vals
+    var = max(1e-12, sum_w2 / n_vals - mean * mean)
+    rms = math.sqrt(sum_w2 / n_vals)
+    outlier_ratio = max_abs / max(1e-8, rms)
+    outlier_factor = 1.0 + 0.12 * max(0.0, outlier_ratio - 3.0)
+
+    _, _, mse_q2 = quantize_q3_blob_to_q2_rco(sel_d, sel_s, sel_b, n_sel, 64, group_size=64, compute_mse=True)
+    return var, outlier_factor, {DType.Q2_AFFINE: mse_q2, DType.Q3_AFFINE: 0.0}
+
+
 def _analyze_tensor_sample(
     src: _UnifiedSource,
     t: _SourceTensor,
@@ -1176,6 +2231,10 @@ def _analyze_tensor_sample(
     max_cand_bits: int,
 ) -> tuple[float, float, dict[DType, float]]:
     """Stream-sample a 2D tensor to estimate `(var, outlier_factor, mse_by_quant_dtype)`."""
+    if max_cand_bits == 3 and t.dtype == DType.Q3_AFFINE and group_size == 64:
+        fast = _analyze_q3_sample_fast(src, t, sample_rows=sample_rows, use_rco=use_rco)
+        if fast is not None:
+            return fast
     n_rows, k = t.shape
     row_ids = _sample_row_indices(n_rows, sample_rows)
     rows = src.read_rows_f32(t, row_ids)
@@ -1246,19 +2305,85 @@ def _stream_quantize_tensor(
     *,
     target_dtype: DType,
     target_layout: TensorLayout,
+    target_param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS,
     group_size: int,
     blob_bytes: int,
     use_rco: bool,
     rco_iters: int,
+    lloyd_iters: int = 10,
     w: _BlobWriter,
     pool: concurrent.futures.ProcessPoolExecutor | None,
 ) -> float:
-    """Stream-quantize a 2D tensor into `row_major` or `sme2_panel64` with bounded RAM."""
+    """Stream-quantize a 2D tensor into `row_major`, affine `sme2_panel64`, or `lut16_codebook` `sme2_panel64`."""
     n_rows, k = t.shape
     bits = _DTYPE_BITS_RANK[target_dtype]
     groups = k // group_size
     row_data_bytes = (k * bits) // 8
     row_param_bytes = groups * 4
+
+    # LUT16 ZT0 codebook path (`QuantParamKind.LUT16_CODEBOOK`, `reserved0 == 0x0101`).
+    if target_layout == TensorLayout.SME2_PANEL64 and target_param_kind == QuantParamKind.LUT16_CODEBOOK:
+        mse_acc = 0.0
+        n_batches = 0
+        if pool is None or n_rows < _ROW_BATCH_SIZE * 2:
+            for batch in src.iter_row_batches_f32(t, _ROW_BATCH_SIZE):
+                chunk, mse_b = _lut16_batch_worker_task((batch, bits, lloyd_iters, 2))
+                w.write(chunk)
+                mse_acc += mse_b
+                n_batches += 1
+        else:
+            max_inflight = max(2, (os.cpu_count() or 4))
+            pending_lut: deque[concurrent.futures.Future[tuple[bytes, float]]] = deque()
+            for batch in src.iter_row_batches_f32(t, _ROW_BATCH_SIZE):
+                pending_lut.append(pool.submit(_lut16_batch_worker_task, (batch, bits, lloyd_iters, 2)))
+                if len(pending_lut) >= max_inflight:
+                    chunk, mse_b = pending_lut.popleft().result()
+                    w.write(chunk)
+                    mse_acc += mse_b
+                    n_batches += 1
+            while pending_lut:
+                chunk, mse_b = pending_lut.popleft().result()
+                w.write(chunk)
+                mse_acc += mse_b
+                n_batches += 1
+        expected_data = sme2_panel64_data_bytes(target_dtype, n_rows, k, group_size)
+        if w.written != expected_data:
+            raise AssertionError(f"wrote {w.written} LUT16 bytes for {t.name}, expected {expected_data}")
+        w.zeros(blob_bytes - w.written)
+        return mse_acc / max(1, n_batches)
+
+    # Fast exact SWAR 8-bin OLS RCO path for `q3_affine -> q2_affine` when tensor is moderately sized.
+    if (
+        t.dtype == DType.Q3_AFFINE
+        and target_dtype == DType.Q2_AFFINE
+        and use_rco
+        and group_size == 64
+        and n_rows * k <= 8_000_000
+    ):
+        raw_slices = src.read_q3_raw_slices(t)
+        if raw_slices is not None:
+            d_raw, sp_raw, b_raw, fmt = raw_slices
+            qb, pb, mse_fast = _q3_to_q2_worker_task((d_raw, sp_raw, b_raw, fmt, n_rows, k, True))
+            if target_layout == TensorLayout.SME2_PANEL64:
+                d_mv = memoryview(qb)
+                p_mv = memoryview(pb)
+                for p0 in range(0, n_rows, SME2_PANEL_COLS):
+                    cnt = min(SME2_PANEL_COLS, n_rows - p0)
+                    d_rows = [d_mv[(p0 + c) * row_data_bytes : (p0 + c + 1) * row_data_bytes] for c in range(cnt)]
+                    p_rows = [p_mv[(p0 + c) * row_param_bytes : (p0 + c + 1) * row_param_bytes] for c in range(cnt)]
+                    w.write(pack_sme2_panel64_q2_from_mlx_panel(d_rows, p_rows, k))
+                w.zeros(blob_bytes - w.written)
+                return mse_fast
+            data_bytes, params_offset, params_bytes = _effective_payload_bytes(target_dtype, (n_rows, k), group_size)
+            w.write(qb)
+            if w.written != data_bytes:
+                raise AssertionError(f"wrote {w.written} qweight bytes for {t.name}, expected {data_bytes}")
+            w.zeros(params_offset - data_bytes)
+            w.write(pb)
+            if w.written != params_offset + params_bytes:
+                raise AssertionError(f"wrote {w.written} payload bytes for {t.name}, expected {params_offset + params_bytes}")
+            w.zeros(blob_bytes - w.written)
+            return mse_fast
 
     def _iter_quantized_batches() -> Iterator[tuple[bytes, bytes, float]]:
         if pool is None or n_rows < _ROW_BATCH_SIZE * 2:
@@ -1335,6 +2460,8 @@ class GsqConvertReport:
     allocation: GsqAllocationReport
     metas: list[PackedTensorMeta]
     mean_quant_mse: float
+    lut16_sme2: bool = False
+    lut16_tensor_count: int = 0
 
     def to_manifest_dict(self) -> dict[str, object]:
         return {
@@ -1343,6 +2470,8 @@ class GsqConvertReport:
             "output": str(self.output_path),
             "model_id": self.model_id,
             "quant_profile": "gsq-rco" if self.use_rco else "gsq-minmax",
+            "lut16_sme2": self.lut16_sme2,
+            "lut16_tensor_count": self.lut16_tensor_count,
             "target_bits": self.target_bits,
             "effective_bits": round(self.effective_bits, 4),
             "total_weights": self.allocation.total_weights,
@@ -1383,11 +2512,15 @@ def gsq_convert(
     tie_word_embeddings: bool | None = None,
     exclude_tensors: Iterable[str] = (),
     sme2_pack: str = "none",
+    lut16_sme2: bool = False,
     use_rco: bool = True,
     rco_iters: int = 3,
+    lloyd_iters: int = 10,
     sample_rows: int = 32,
     manifest_path: pathlib.Path | None = None,
     workers: int = 1,
+    strip_vision: bool = True,
+    stats_out: dict[str, int] | None = None,
 ) -> GsqConvertReport:
     """Convert a float/quantized safetensors checkpoint or `.amf` into a GSQ+RCO `.amf` v0.
 
@@ -1404,6 +2537,8 @@ def gsq_convert(
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
     if target_bits <= 0.0:
         raise ValueError(f"target_bits must be positive, got {target_bits}")
+
+    eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
 
     effective_cold: set[tuple[int, int]] = set(cold_experts)
     heat_probs: dict[tuple[int, int], float] = {}
@@ -1428,6 +2563,8 @@ def gsq_convert(
         tie_word_embeddings=tie_word_embeddings,
         exclude_tensors=exclude_tensors,
         model_id_override=model_id,
+        strip_vision=strip_vision,
+        stats_out=stats_out,
     )
     try:
         model_id_str = src.model_id
@@ -1476,7 +2613,7 @@ def gsq_convert(
         for t in src.tensors:
             is_quantizable = (
                 len(t.shape) == 2
-                and t.kind != TensorKind.NORM
+                and t.kind not in (TensorKind.NORM, TensorKind.SPARSE_TABLE, TensorKind.LOOP_ADAPTER)
                 and t.dtype in (DType.F16, DType.BF16, DType.F32, DType.Q4_AFFINE, DType.Q3_AFFINE, DType.Q2_AFFINE)
                 and t.shape[1] > 0
                 and t.shape[1] % group_size == 0
@@ -1521,7 +2658,7 @@ def gsq_convert(
             # `moe_expert`; NOT standalone `ffn_down`).
             if role in ("attn_qk", "attn_v") and layer in ln_in_peak and med_ln_in > 0.0:
                 return max(0.85, min(1.6, ln_in_peak[layer] / med_ln_in))
-            if role in ("dense_ffn", "moe_expert", "router") and layer in ln_post_peak and med_ln_post > 0.0:
+            if role in ("dense_ffn", "moe_expert", "router", "shared_expert") and layer in ln_post_peak and med_ln_post > 0.0:
                 return max(0.85, min(1.6, ln_post_peak[layer] / med_ln_post))
             return 1.0
 
@@ -1664,10 +2801,16 @@ def gsq_convert(
 
             q_bits = _DTYPE_BITS_RANK[target_dtype] if target_dtype in _QUANT_DTYPES else 0
             g_size = group_size if target_dtype in _QUANT_DTYPES else 0
-            use_sme2 = _should_sme2_pack(t.kind, target_dtype, t.shape, sme2_pack)
+            use_sme2 = _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack) or (
+                t.kind == TensorKind.LOOP_ADAPTER and t.layout == TensorLayout.SME2_PANEL64
+            )
             if use_sme2:
                 layout = TensorLayout.SME2_PANEL64
-                param_kind = QuantParamKind.AFFINE_SCALE_BIAS
+                param_kind = (
+                    QuantParamKind.LUT16_CODEBOOK
+                    if (lut16_sme2 and target_dtype in _QUANT_DTYPES)
+                    else QuantParamKind.AFFINE_SCALE_BIAS
+                )
                 data_bytes = sme2_panel64_data_bytes(target_dtype, t.shape[0], t.shape[1], g_size)
                 params_offset = 0
                 params_bytes = 0
@@ -1704,6 +2847,7 @@ def gsq_convert(
         metas: list[PackedTensorMeta] = []
         quant_mse_sum = 0.0
         quant_tensor_count = 0
+        lut16_tensor_count = 0
 
         pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
         try:
@@ -1712,7 +2856,44 @@ def gsq_convert(
                 prefix = _BlobWriter(out_fh)
                 prefix.zeros(dir_offset + dir_bytes)
 
-                for (
+                # Bounded sliding-window worker pipeline for fast parallel `q3 -> q2` MoE experts.
+                q3_futures: dict[int, concurrent.futures.Future[tuple[bytes, bytes, float]]] = {}
+                max_q3_inflight = max(2, workers * 2) if pool is not None else 0
+                next_scan = 0
+
+                def _is_fast_q3_to_q2(spec_idx: int) -> bool:
+                    t_s, _, t_dt, _, _, lay_s, pk_s, *_ = out_specs[spec_idx]
+                    return (
+                        pool is not None
+                        and t_s.dtype == DType.Q3_AFFINE
+                        and t_dt == DType.Q2_AFFINE
+                        and lay_s == TensorLayout.ROW_MAJOR
+                        and pk_s == QuantParamKind.AFFINE_SCALE_BIAS
+                        and use_rco
+                        and group_size == 64
+                        and len(t_s.shape) == 2
+                        and t_s.shape[0] * t_s.shape[1] <= 8_000_000
+                    )
+
+                def _refill_q3_window(cur_idx: int) -> None:
+                    nonlocal next_scan
+                    if pool is None:
+                        return
+                    if next_scan < cur_idx:
+                        next_scan = cur_idx
+                    while len(q3_futures) < max_q3_inflight and next_scan < len(out_specs):
+                        if _is_fast_q3_to_q2(next_scan):
+                            t_s = out_specs[next_scan][0]
+                            raw_slices = src.read_q3_raw_slices(t_s)
+                            if raw_slices is not None:
+                                d_raw, sp_raw, b_raw, fmt = raw_slices
+                                q3_futures[next_scan] = pool.submit(
+                                    _q3_to_q2_worker_task,
+                                    (d_raw, sp_raw, b_raw, fmt, t_s.shape[0], t_s.shape[1], True),
+                                )
+                        next_scan += 1
+
+                for spec_idx, (
                     t,
                     out_name,
                     target_dtype,
@@ -1725,25 +2906,46 @@ def gsq_convert(
                     data_bytes,
                     params_offset,
                     params_bytes,
-                ) in out_specs:
+                ) in enumerate(out_specs):
+                    _refill_q3_window(spec_idx)
                     if out_fh.tell() != blob_offset:
                         raise AssertionError(f"planned offset {blob_offset} != pos {out_fh.tell()} for {out_name}")
                     w = _BlobWriter(out_fh)
-                    if target_dtype in _QUANT_DTYPES and target_dtype != t.dtype:
+                    if spec_idx in q3_futures:
+                        qb, pb, mse_t = q3_futures.pop(spec_idx).result()
+                        w.write(qb)
+                        if w.written != data_bytes:
+                            raise AssertionError(f"wrote {w.written} qweight bytes for {out_name}, expected {data_bytes}")
+                        w.zeros(params_offset - data_bytes)
+                        w.write(pb)
+                        if w.written != params_offset + params_bytes:
+                            raise AssertionError(
+                                f"wrote {w.written} payload bytes for {out_name}, expected {params_offset + params_bytes}"
+                            )
+                        w.zeros(blob_bytes - w.written)
+                        quant_mse_sum += mse_t
+                        quant_tensor_count += 1
+                    elif target_dtype in _QUANT_DTYPES and (
+                        target_dtype != t.dtype or param_kind == QuantParamKind.LUT16_CODEBOOK
+                    ):
                         mse_t = _stream_quantize_tensor(
                             src,
                             t,
                             target_dtype=target_dtype,
                             target_layout=layout,
+                            target_param_kind=param_kind,
                             group_size=group_size,
                             blob_bytes=blob_bytes,
                             use_rco=use_rco,
                             rco_iters=rco_iters,
+                            lloyd_iters=lloyd_iters,
                             w=w,
                             pool=pool,
                         )
                         quant_mse_sum += mse_t
                         quant_tensor_count += 1
+                        if param_kind == QuantParamKind.LUT16_CODEBOOK:
+                            lut16_tensor_count += 1
                     else:
                         src.stream_raw_passthrough(t, w, target_dtype, layout, blob_bytes)
 
@@ -1801,6 +3003,8 @@ def gsq_convert(
             allocation=alloc,
             metas=metas,
             mean_quant_mse=mean_quant_mse,
+            lut16_sme2=lut16_sme2,
+            lut16_tensor_count=lut16_tensor_count,
         )
         if manifest_path is not None:
             m_path = pathlib.Path(manifest_path)
