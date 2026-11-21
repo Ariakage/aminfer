@@ -23,6 +23,7 @@ const quant = @import("../quant/spec.zig");
 const moe = @import("../gpu/moe.zig");
 const attention = @import("../gpu/attention.zig");
 const qwen3 = @import("../model/qwen3.zig");
+const graph = @import("../model/graph.zig");
 const sam_mod = @import("sam.zig");
 const tree_mod = @import("tree.zig");
 const accept_mod = @import("accept.zig");
@@ -140,6 +141,8 @@ pub const SpecStats = struct {
     pearl_rollbacks: u64 = 0,
     pearl_saved_ns: u64 = 0,
     pearl_worker_ns: u64 = 0,
+    // D12 SelfSpecRecurrent telemetry
+    self_recurrent_draft_steps: u64 = 0,
 
     pub fn meanAcceptanceLength(self: *const SpecStats) f64 {
         if (self.rounds == 0) return 0.0;
@@ -200,8 +203,164 @@ pub const RunError = error{
     OutputBufferTooSmall,
     TokenOutOfRange,
     MissingRng,
-} || qwen3.StepError || draft_mod.DraftStepError || tree_mod.PruneError ||
+} || qwen3.StepError || graph.GraphStepError || draft_mod.DraftStepError || tree_mod.PruneError ||
     accept_mod.VerifyError || ngram_nvme.QueryError;
+
+/// Unified speculative target handle supporting both Tier 1 `Qwen3Model` and
+/// Tier 2 composable `GraphModel` (`qwen4_exp`, native `LoopLM`, `Step-LoRA`).
+pub const TargetModel = union(enum) {
+    qwen3: *qwen3.Qwen3Model,
+    graph: *graph.GraphModel,
+
+    pub fn vocabSize(self: TargetModel) u32 {
+        return switch (self) {
+            .qwen3 => |m| m.config.vocab_size,
+            .graph => |g| g.config.vocab_size,
+        };
+    }
+
+    pub fn maxSeqLen(self: TargetModel) u32 {
+        return switch (self) {
+            .qwen3 => |m| m.max_seq_len,
+            .graph => |g| g.max_seq_len,
+        };
+    }
+
+    pub fn maxTreeNodes(self: TargetModel) u32 {
+        return switch (self) {
+            .qwen3 => |m| m.max_tree_nodes,
+            .graph => |g| g.max_tree_nodes,
+        };
+    }
+
+    pub fn totalWiredBytes(self: TargetModel) u64 {
+        return switch (self) {
+            .qwen3 => |m| m.total_wired_bytes,
+            .graph => |g| g.total_wired_bytes,
+        };
+    }
+
+    pub fn wiredBudgetBytes(self: TargetModel) u64 {
+        return switch (self) {
+            .qwen3 => |m| m.wired_budget_bytes,
+            .graph => |g| g.wired_budget_bytes,
+        };
+    }
+
+    pub fn enableFeatureTaps(self: TargetModel) bool {
+        return switch (self) {
+            .qwen3 => |m| m.enable_feature_taps,
+            .graph => |g| g.enable_feature_taps,
+        };
+    }
+
+    pub fn isMoe(self: TargetModel) bool {
+        return switch (self) {
+            .qwen3 => |m| m.config.arch == .qwen3_moe,
+            .graph => |g| g.config.axes.ffn_kind == .moe_swiglu,
+        };
+    }
+
+    pub fn numHiddenLayers(self: TargetModel) u32 {
+        return switch (self) {
+            .qwen3 => |m| m.config.num_hidden_layers,
+            .graph => |g| g.config.num_hidden_layers,
+        };
+    }
+
+    pub fn logitsHost(self: TargetModel) []const f16 {
+        return switch (self) {
+            .qwen3 => |m| m.logits_host,
+            .graph => |g| g.logits_host,
+        };
+    }
+
+    pub fn acceptedAuxBind(self: TargetModel) metal.BufferBinding {
+        return switch (self) {
+            .qwen3 => |m| m.accepted_aux_bind,
+            .graph => |g| g.accepted_aux_bind,
+        };
+    }
+
+    pub fn acceptedTopBind(self: TargetModel) metal.BufferBinding {
+        return switch (self) {
+            .qwen3 => |m| m.accepted_top_bind,
+            .graph => |g| g.accepted_top_bind,
+        };
+    }
+
+    pub fn resetState(self: TargetModel) void {
+        switch (self) {
+            .qwen3 => |m| m.seq_len = 0,
+            .graph => |g| g.resetKvCache(),
+        }
+    }
+
+    pub fn prefillChunk(self: TargetModel, tokens: []const u32, start_pos: u32, compute_logits: bool) RunError!u32 {
+        return switch (self) {
+            .qwen3 => |m| try m.prefillChunk(tokens, start_pos, compute_logits),
+            .graph => |g| try g.prefillChunk(tokens, start_pos, compute_logits),
+        };
+    }
+
+    pub fn verifyTree(
+        self: TargetModel,
+        tokens: []const u32,
+        positions: []const u32,
+        masks: []const u64,
+        base_pos: u32,
+    ) RunError!qwen3.VerifyTreeResult {
+        return switch (self) {
+            .qwen3 => |m| try m.verifyTree(tokens, positions, masks, base_pos, true),
+            .graph => |g| try g.verifyTree(tokens, positions, masks, base_pos),
+        };
+    }
+
+    pub fn commitTreeKv(self: TargetModel, base_pos: u32, accepted_nodes: []const u16) RunError!void {
+        return switch (self) {
+            .qwen3 => |m| try m.commitTreeKv(base_pos, accepted_nodes),
+            .graph => |g| try g.commitTreeKv(base_pos, accepted_nodes),
+        };
+    }
+
+    pub fn syncDraftHead(
+        self: TargetModel,
+        dh: *draft_mod.DraftHead,
+        tokens: []const u32,
+        feat_bind: metal.BufferBinding,
+        base_pos: u32,
+        top_k: u32,
+    ) draft_mod.DraftStepError!void {
+        return switch (self) {
+            .qwen3 => |m| dh.syncAccepted(m, tokens, feat_bind, base_pos, top_k),
+            .graph => |g| dh.syncAcceptedForGraph(g, tokens, feat_bind, base_pos, top_k),
+        };
+    }
+
+    pub fn stepDraftHeadTreeBatch(
+        self: TargetModel,
+        dh: *draft_mod.DraftHead,
+        tokens: []const u32,
+        parent_rows: []const u32,
+        positions: []const u32,
+        masks: []const u64,
+        slot_start: u32,
+        top_k: u32,
+        out_cands: ?[]moe.TopKCandidate,
+    ) draft_mod.DraftStepError!void {
+        return switch (self) {
+            .qwen3 => |m| dh.stepTreeBatch(m, tokens, parent_rows, positions, masks, slot_start, top_k, out_cands),
+            .graph => |g| dh.stepTreeBatchForGraph(g, tokens, parent_rows, positions, masks, slot_start, top_k, out_cands),
+        };
+    }
+};
+
+pub fn defaultCostModelForGraph(g: *const graph.GraphModel) tree_mod.PruneCostModel {
+    const decode_bytes: u64 = g.bytesPerDecodeToken(256);
+    const t_fixed_us: f32 = @floatCast(@as(f64, @floatFromInt(decode_bytes)) / (75.0 * 1000.0) + 800.0);
+    const c_tok_us: f32 = @max(120.0, t_fixed_us * 0.03);
+    return tree_mod.PruneCostModel.dense(t_fixed_us, c_tok_us);
+}
 
 /// Calibrated per-scheme effective MoE gather bandwidth `beta_s` (GB/s) for
 /// `ADR-0017` heterogeneous GSQ+RCO expert byte-budget tree pruning (`D7`).
@@ -800,7 +959,7 @@ const PearlRuntime = struct {
 };
 
 pub const SpecEngine = struct {
-    target: *qwen3.Qwen3Model,
+    target: TargetModel,
     draft_head: ?*draft_mod.DraftHead,
     small_draft: ?*draft_mod.SmallDraftModel,
     ngram_table: ?*ngram_nvme.NvmeNgramTable,
@@ -865,7 +1024,19 @@ pub const SpecEngine = struct {
         draft_head: ?*draft_mod.DraftHead,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, target, draft_head, null, config);
+        return initInternal(allocator, .{ .qwen3 = target }, draft_head, null, config);
+    }
+
+    /// Initializes `SpecEngine` backed by a composable `GraphModel` (`qwen4_exp`,
+    /// native `LoopLM`, or `Step-LoRA`), supporting `.l1_only`, `.self_recurrent` (`D12`,
+    /// `0` extra draft-model RAM), and `.mtp` / `.eagle2` / `.eagle3` draft heads.
+    pub fn initWithGraph(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        draft_head: ?*draft_mod.DraftHead,
+        config: SpecConfig,
+    ) InitError!SpecEngine {
+        return initInternal(allocator, .{ .graph = target }, draft_head, null, config);
     }
 
     /// Initializes `SpecEngine` paired with a standalone same-family small draft
@@ -877,7 +1048,7 @@ pub const SpecEngine = struct {
         small_draft: *draft_mod.SmallDraftModel,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, target, null, small_draft, config);
+        return initInternal(allocator, .{ .qwen3 = target }, null, small_draft, config);
     }
 
     fn computeInitialPearlEnabled(
@@ -896,14 +1067,14 @@ pub const SpecEngine = struct {
 
     fn initInternal(
         allocator: std.mem.Allocator,
-        target: *qwen3.Qwen3Model,
+        target: TargetModel,
         draft_head: ?*draft_mod.DraftHead,
         small_draft: ?*draft_mod.SmallDraftModel,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        if (target.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (target.maxTreeNodes() <= 1) return error.TreeNotEnabled;
         if (config.max_tree_nodes < 2 or config.max_tree_nodes > MAX_TREE_NODES) return error.InvalidConfig;
-        if (config.max_tree_nodes > target.max_tree_nodes) return error.InvalidConfig;
+        if (config.max_tree_nodes > target.maxTreeNodes()) return error.InvalidConfig;
         if (config.max_draft_depth == 0 or config.max_draft_depth >= MAX_TREE_NODES) return error.InvalidConfig;
         if (config.branch_width == 0 or config.branch_width > MAX_TREE_NODES) return error.InvalidConfig;
         if (config.top_k_per_node == 0 or config.top_k_per_node > draft_mod.MAX_DRAFT_TOP_K) return error.InvalidConfig;
@@ -913,7 +1084,12 @@ pub const SpecEngine = struct {
 
         switch (config.mode) {
             .l1_only => {},
+            .self_recurrent => {
+                if (target != .graph) return error.DraftModeMismatch;
+                if (draft_head != null or small_draft != null) return error.DraftModeMismatch;
+            },
             .small_draft => {
+                if (target != .qwen3) return error.DraftModeMismatch;
                 if (small_draft == null) return error.DraftHeadRequired;
                 if (draft_head != null) return error.DraftModeMismatch;
             },
@@ -921,14 +1097,14 @@ pub const SpecEngine = struct {
                 const dh = draft_head orelse return error.DraftHeadRequired;
                 if (small_draft != null) return error.DraftModeMismatch;
                 if (dh.config.format != config.mode) return error.DraftModeMismatch;
-                if (!target.enable_feature_taps) return error.FeatureTapsRequired;
+                if (!target.enableFeatureTaps()) return error.FeatureTapsRequired;
             },
         }
 
         const sam_cap: u32 = if (config.sam_capacity > 0)
             config.sam_capacity
         else
-            target.max_seq_len + MAX_TREE_NODES;
+            target.maxSeqLen() + MAX_TREE_NODES;
         const sam_bytes = try sam_mod.SuffixAutomaton.requiredBytes(sam_cap);
         const arena_bytes = try page.alignUp(sam_bytes);
         const draft_wired: u64 = if (draft_head) |dh|
@@ -937,13 +1113,13 @@ pub const SpecEngine = struct {
             sd.totalWiredBytes()
         else
             0;
-        const existing_wired: u64 = target.total_wired_bytes + draft_wired;
-        if (existing_wired + arena_bytes > target.wired_budget_bytes) {
+        const existing_wired: u64 = target.totalWiredBytes() + draft_wired;
+        if (existing_wired + arena_bytes > target.wiredBudgetBytes()) {
             return error.BudgetExceeded;
         }
-        const rem_limit = target.wired_budget_bytes - existing_wired;
+        const rem_limit = target.wiredBudgetBytes() - existing_wired;
         const sam_budget = budget_mod.Budget.compute(.{
-            .memory_bytes = target.wired_budget_bytes + 4 * page.APPLE_PAGE_SIZE,
+            .memory_bytes = target.wiredBudgetBytes() + 4 * page.APPLE_PAGE_SIZE,
             .user_wire_limit = rem_limit,
             .global_user_wire_limit = rem_limit,
             .gpu_working_set_bytes = rem_limit,
@@ -956,17 +1132,21 @@ pub const SpecEngine = struct {
         const sam_slice = try sam_arena.allocAligned(sam_bytes, sam_mod.SuffixAutomaton.backing_alignment);
         const sam = try sam_mod.SuffixAutomaton.initFromBuffer(sam_slice, sam_cap);
 
-        const p_res = try allocator.alloc(f32, target.config.vocab_size);
+        const p_res = try allocator.alloc(f32, target.vocabSize());
         errdefer allocator.free(p_res);
 
-        var cost = config.cost_model orelse defaultCostModelForTarget(target);
+        var cost = config.cost_model orelse switch (target) {
+            .qwen3 => |m| defaultCostModelForTarget(m),
+            .graph => |g| defaultCostModelForGraph(g),
+        };
 
         var expert_bytes_sampled: []u32 = &.{};
         var expert_bw_sampled: []f32 = &.{};
-        if (config.cost_model == null and target.config.arch == .qwen3_moe and target.isHeterogeneousMoe()) {
-            const n_layers = target.config.num_hidden_layers;
+        if (config.cost_model == null and target == .qwen3 and target.qwen3.config.arch == .qwen3_moe and target.qwen3.isHeterogeneousMoe()) {
+            const tm = target.qwen3;
+            const n_layers = tm.config.num_hidden_layers;
             const sampled = cost.num_layers;
-            const n_experts = target.config.num_experts;
+            const n_experts = tm.config.num_experts;
             const table_len: usize = @as(usize, sampled) * n_experts;
             expert_bytes_sampled = try allocator.alloc(u32, table_len);
             errdefer allocator.free(expert_bytes_sampled);
@@ -980,8 +1160,8 @@ pub const SpecEngine = struct {
                     (s * (n_layers - 1)) / (sampled - 1);
                 for (0..n_experts) |e| {
                     const flat = s * n_experts + e;
-                    expert_bytes_sampled[flat] = @intCast(target.expertBytes(l_idx, e));
-                    expert_bw_sampled[flat] = schemeEffectiveBwGbs(target.expertDType(l_idx, e));
+                    expert_bytes_sampled[flat] = @intCast(tm.expertBytes(l_idx, e));
+                    expert_bw_sampled[flat] = schemeEffectiveBwGbs(tm.expertDType(l_idx, e));
                 }
             }
             const layer_scale: f64 = @as(f64, @floatFromInt(n_layers)) / @as(f64, @floatFromInt(sampled));
@@ -1075,7 +1255,7 @@ pub const SpecEngine = struct {
 
     pub fn reset(self: *SpecEngine) void {
         if (self.pearl_rt) |prt| prt.waitIdle();
-        self.target.seq_len = 0;
+        self.target.resetState();
         if (self.draft_head) |dh| dh.reset();
         if (self.small_draft) |sd| sd.reset();
         self.sam.reset();
@@ -1105,7 +1285,7 @@ pub const SpecEngine = struct {
         else
             0;
         const ngram_bytes: u64 = if (self.ngram_table) |nt| nt.totalWiredBytes() else 0;
-        return self.target.total_wired_bytes + draft_bytes + self.sam_arena.bytes().len + ngram_bytes;
+        return self.target.totalWiredBytes() + draft_bytes + self.sam_arena.bytes().len + ngram_bytes;
     }
 
     pub fn effectivePlacement(self: *const SpecEngine) draft_mod.Placement {
@@ -1115,28 +1295,31 @@ pub const SpecEngine = struct {
     }
 
     pub fn routerPredCalibration(self: *const SpecEngine) qwen3.SmeRouterCalibration {
-        return self.target.routerPredCalibration();
+        return switch (self.target) {
+            .qwen3 => |m| m.routerPredCalibration(),
+            .graph => std.mem.zeroes(qwen3.SmeRouterCalibration),
+        };
     }
 
     fn effectiveMaxSeqLen(self: *const SpecEngine) u32 {
-        if (self.draft_head) |dh| return @min(self.target.max_seq_len, dh.max_seq_len);
-        if (self.small_draft) |sd| return @min(self.target.max_seq_len, sd.maxSeqLen() -| 1);
-        return self.target.max_seq_len;
+        if (self.draft_head) |dh| return @min(self.target.maxSeqLen(), dh.max_seq_len);
+        if (self.small_draft) |sd| return @min(self.target.maxSeqLen(), sd.maxSeqLen() -| 1);
+        return self.target.maxSeqLen();
     }
 
     fn targetFeatureBinding(self: *const SpecEngine, dh: *const draft_mod.DraftHead) metal.BufferBinding {
         return switch (dh.config.format) {
-            .eagle3 => self.target.accepted_aux_bind,
-            .eagle2, .mtp => self.target.accepted_top_bind,
-            .l1_only, .small_draft => unreachable,
+            .eagle3 => self.target.acceptedAuxBind(),
+            .eagle2, .mtp => self.target.acceptedTopBind(),
+            .l1_only, .small_draft, .self_recurrent => unreachable,
         };
     }
 
     fn sampleFirstToken(self: *SpecEngine, row_idx: usize, greedy_tok: u32, rng: ?std.Random) RunError!u32 {
         if (self.config.temperature == 0.0) return greedy_tok;
         const r = rng orelse return error.MissingRng;
-        const v: usize = self.target.config.vocab_size;
-        const logits_row = self.target.logits_host[row_idx * v .. (row_idx + 1) * v];
+        const v: usize = self.target.vocabSize();
+        const logits_row = self.target.logitsHost()[row_idx * v .. (row_idx + 1) * v];
         try accept_mod.softmaxRow(f16, logits_row, self.config.temperature, self.p_res);
         return accept_mod.sampleCategorical(self.p_res, r);
     }
@@ -1150,16 +1333,17 @@ pub const SpecEngine = struct {
         const max_seq = self.effectiveMaxSeqLen();
         if (prompt_tokens.len > max_seq) return error.PositionOutOfRange;
 
+        const vocab = self.target.vocabSize();
         for (prompt_tokens) |tid| {
-            if (tid >= self.target.config.vocab_size) return error.TokenOutOfRange;
+            if (tid >= vocab) return error.TokenOutOfRange;
         }
 
         self.reset();
 
         const max_chunk: usize = if (self.draft_head) |dh|
-            @min(@as(usize, self.target.max_tree_nodes), @as(usize, dh.max_tree_slots))
+            @min(@as(usize, self.target.maxTreeNodes()), @as(usize, dh.max_tree_slots))
         else
-            @as(usize, self.target.max_tree_nodes);
+            @as(usize, self.target.maxTreeNodes());
 
         var start: usize = 0;
         var first_tok: u32 = 0;
@@ -1195,8 +1379,8 @@ pub const SpecEngine = struct {
                         first_tok;
                 }
                 const top_k: u32 = if (is_last) self.config.top_k_per_node else 0;
-                try dh.syncAccepted(
-                    self.target,
+                try self.target.syncDraftHead(
+                    dh,
                     self.shifted_tokens[0..take],
                     self.targetFeatureBinding(dh),
                     @intCast(start),
@@ -1284,10 +1468,10 @@ pub const SpecEngine = struct {
         ));
         const hard_cap: u16 = @min(
             self.config.max_tree_nodes,
-            @as(u16, @intCast(@min(max_emit, @as(usize, self.target.max_tree_nodes)))),
+            @as(u16, @intCast(@min(max_emit, @as(usize, self.target.maxTreeNodes())))),
         );
         const candidate_cap: u16 = if (self.config.enable_pruning)
-            @min(@as(u16, @intCast(self.target.max_tree_nodes)), MAX_TREE_NODES)
+            @min(@as(u16, @intCast(self.target.maxTreeNodes())), MAX_TREE_NODES)
         else
             hard_cap;
 
@@ -1428,6 +1612,15 @@ pub const SpecEngine = struct {
                         t_draft_start,
                     );
                 }
+            } else if (self.config.mode == .self_recurrent) {
+                if (max_allowed_depth >= 1 and candidate_cap > 1) {
+                    try self.expandWithSelfRecurrent(
+                        self.target.graph,
+                        base_pos,
+                        max_allowed_depth,
+                        candidate_cap,
+                    );
+                }
             }
         }
 
@@ -1519,7 +1712,6 @@ pub const SpecEngine = struct {
             self.verify_positions[0..verified_nodes],
             self.verify_masks[0..verified_nodes],
             base_pos,
-            true,
         );
         const t_verify_end = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         const verify_ns: u64 = @intCast(@max(@as(i96, 0), t_verify_start.durationTo(t_verify_end).toNanoseconds()));
@@ -1542,7 +1734,7 @@ pub const SpecEngine = struct {
                 f16,
                 &self.draft_tree,
                 vr.logits_f16,
-                self.target.config.vocab_size,
+                self.target.vocabSize(),
                 null,
                 self.config.temperature,
                 rng.?,
@@ -1576,8 +1768,8 @@ pub const SpecEngine = struct {
                 self.config.top_k_per_node
             else
                 0;
-            try dh.syncAccepted(
-                self.target,
+            try self.target.syncDraftHead(
+                dh,
                 emitted,
                 self.targetFeatureBinding(dh),
                 base_pos,
@@ -1706,9 +1898,9 @@ pub const SpecEngine = struct {
         self.stats.drafted_nodes += drafted_nodes;
         self.stats.verified_nodes += verified_nodes;
         self.stats.total_bytes_moved += vr.actual_bytes_moved;
-        if (self.target.config.arch == .qwen3_moe) {
+        if (self.target.isMoe()) {
             self.stats.total_unique_experts += vr.total_unique_experts;
-            self.stats.total_moe_layer_passes += self.target.config.num_hidden_layers;
+            self.stats.total_moe_layer_passes += self.target.numHiddenLayers();
         }
         const hist_idx = @min(@as(usize, acc.emitted_token_count), MAX_TREE_NODES);
         self.stats.accept_hist[hist_idx] += 1;
@@ -1801,8 +1993,8 @@ pub const SpecEngine = struct {
 
                     const is_tail = (idx + 1 == path_len);
                     const step_k: u32 = if (is_tail and node.depth < target_depth) eff_top_k else 0;
-                    try dh.stepTreeBatch(
-                        self.target,
+                    try self.target.stepDraftHeadTreeBatch(
+                        dh,
                         self.batch_tokens[0..1],
                         self.batch_parent_rows[0..1],
                         self.batch_positions[0..1],
@@ -1865,8 +2057,8 @@ pub const SpecEngine = struct {
 
             const total_slots = slot_start + @as(u32, @intCast(frontier_count));
             const cand_len = frontier_count * @as(usize, eff_top_k);
-            try dh.stepTreeBatch(
-                self.target,
+            try self.target.stepDraftHeadTreeBatch(
+                dh,
                 self.batch_tokens[0..frontier_count],
                 self.batch_parent_rows[0..frontier_count],
                 self.batch_positions[0..frontier_count],
@@ -2135,6 +2327,90 @@ pub const SpecEngine = struct {
         return @as(f64, summary.expected_tokens) / total_us;
     }
 
+    /// `D12` `SelfSpecRecurrent` shallow tree expansion (`0` extra draft-model RAM,
+    /// `0` hot-path heap allocs): drafts an `M = 8..16` candidate tree using a shallow
+    /// `r = 1` / `r = 0` pass of `target` without mutating committed KV/GDN state,
+    /// ready for one batched `Core x R` verification pass under lossless `D9` acceptance.
+    fn expandWithSelfRecurrent(
+        self: *SpecEngine,
+        g: *graph.GraphModel,
+        base_pos: u32,
+        max_allowed_depth: u16,
+        candidate_cap: u16,
+    ) RunError!void {
+        const target_depth: u16 = @min(self.config.max_draft_depth, max_allowed_depth);
+        if (target_depth == 0 or candidate_cap <= 1) return;
+
+        const eff_top_k: u32 = @min(self.config.top_k_per_node, @min(g.config.vocab_size, draft_mod.MAX_DRAFT_TOP_K));
+        var expanded_mask: [MAX_TREE_NODES]bool = @splat(false);
+
+        var level: u16 = 0;
+        while (level < target_depth and self.draft_tree.count < candidate_cap) : (level += 1) {
+            const cur_n: u16 = self.draft_tree.count;
+            if (cur_n == 0 or cur_n > g.max_tree_nodes) break;
+
+            // Collect highest-probability unexpanded frontier nodes at depth == level.
+            var frontier: [MAX_TREE_NODES]u16 = undefined;
+            var f_count: usize = 0;
+            for (0..cur_n) |ni| {
+                const node = self.draft_tree.nodes[ni];
+                if (expanded_mask[ni] or node.depth != level) continue;
+                if (level > 0 and node.cum_prob < self.config.min_frontier_prob) continue;
+                frontier[f_count] = @intCast(ni);
+                f_count += 1;
+            }
+            if (f_count == 0) break;
+
+            // Sort frontier descending by `cum_prob` and take top `branch_width`.
+            const max_take = @min(f_count, @as(usize, self.config.branch_width));
+            var i: usize = 0;
+            while (i < max_take) : (i += 1) {
+                var best = i;
+                var j: usize = i + 1;
+                while (j < f_count) : (j += 1) {
+                    if (self.draft_tree.nodes[frontier[j]].cum_prob > self.draft_tree.nodes[frontier[best]].cum_prob) {
+                        best = j;
+                    }
+                }
+                const tmp = frontier[i];
+                frontier[i] = frontier[best];
+                frontier[best] = tmp;
+            }
+
+            // Evaluate the active tree prefix (`cur_n` nodes) with a single shallow `loops = 1` pass!
+            self.draft_tree.fillTokenIds(self.verify_tokens[0..cur_n]);
+            self.draft_tree.fillPositions(base_pos, self.verify_positions[0..cur_n]);
+            self.draft_tree.fillAncestorMasks(self.verify_masks[0..cur_n]);
+            const got_k = try g.draftShallowBatch(
+                self.verify_tokens[0..cur_n],
+                self.verify_positions[0..cur_n],
+                self.verify_masks[0..cur_n],
+                base_pos,
+                eff_top_k,
+                self.batch_cands[0 .. @as(usize, cur_n) * eff_top_k],
+            );
+            self.stats.self_recurrent_draft_steps += 1;
+
+            var added_any = false;
+            for (0..max_take) |fi| {
+                const parent_idx = frontier[fi];
+                expanded_mask[parent_idx] = true;
+                const row_cands = self.batch_cands[@as(usize, parent_idx) * got_k ..][0..got_k];
+                for (row_cands) |cand| {
+                    if (self.draft_tree.count >= candidate_cap and
+                        self.draft_tree.findChild(parent_idx, cand.token_id) == null)
+                    {
+                        break;
+                    }
+                    const before_cnt = self.draft_tree.count;
+                    _ = self.draft_tree.insertChild(parent_idx, cand.token_id, cand.prob, .l2);
+                    if (self.draft_tree.count > before_cnt) added_any = true;
+                }
+            }
+            if (!added_any) break;
+        }
+    }
+
     fn pruneTreeInPlace(
         self: *SpecEngine,
         t: *tree_mod.DraftTree(MAX_TREE_NODES),
@@ -2144,17 +2420,18 @@ pub const SpecEngine = struct {
         var cost = self.cost_model;
         cost.t_fixed_us += draft_us;
 
-        if (cost.isMoe()) {
+        if (cost.isMoe() and self.target == .qwen3) {
+            const tm = self.target.qwen3;
             const m = t.count;
             t.fillTokenIds(self.verify_tokens[0..m]);
-            const sampled = try self.target.predictMoEExpertsForTokens(
+            const sampled = try tm.predictMoEExpertsForTokens(
                 self.verify_tokens[0..m],
                 self.node_experts[0..],
             );
             cost.num_layers = sampled;
             const bitset_slice = self.node_experts[0 .. @as(usize, m) * sampled];
-            const cold_slice: ?[]const tree_mod.ExpertBitset = if (self.target.hasColdExperts()) blk: {
-                const cm_layers = self.target.fillSampledColdMasks(&self.cold_masks);
+            const cold_slice: ?[]const tree_mod.ExpertBitset = if (tm.hasColdExperts()) blk: {
+                const cm_layers = tm.fillSampledColdMasks(&self.cold_masks);
                 break :blk if (cm_layers == sampled) self.cold_masks[0..cm_layers] else null;
             } else null;
             return try t.pruneToOptimalSubtree(cost, bitset_slice, cold_slice, hard_cap);
@@ -3276,4 +3553,234 @@ test "SpecEngine wires ADR-0017 heterogeneous MoE per-expert byte tables into D7
         p += rs.emitted_count;
     }
     try std.testing.expectEqualSlices(u32, &expected, &got);
+}
+
+test "D12: SelfSpecRecurrent on native LoopLM (R=3) is T=0 bit-exact with stepDecode & valid at T>0" {
+    const allocator = std.testing.allocator;
+    const h: u32 = 64;
+    const vocab: u32 = 128;
+    const n_layers: u32 = 4;
+    const layer_attns = try allocator.alloc(graph.AttentionKind, n_layers);
+    @memset(layer_attns, .gqa_full);
+    var cfg: graph.GraphConfig = .{
+        .axes = .{
+            .backbone_kind = .decoder_only,
+            .layer_attention_kinds = layer_attns,
+            .ffn_kind = .dense_swiglu,
+            .has_shared_expert = false,
+            .residual_kind = .single_stream,
+            .residual_branches = 1,
+            .memory_lookup_kind = .none,
+            .loop_schedule = .{
+                .mode = .native_recurrent,
+                .start_layer = 1,
+                .end_layer = 3,
+                .max_loops = 3,
+                .inject_x_init = true,
+            },
+        },
+        .vocab_size = vocab,
+        .hidden_size = h,
+        .num_hidden_layers = n_layers,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rope_theta = 10_000.0,
+        .tie_word_embeddings = true,
+    };
+    defer cfg.deinit(allocator);
+
+    // Build deterministic dense AMF compatible with `GraphModel`.
+    const q3_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .vocab_size = vocab,
+        .hidden_size = h,
+        .num_hidden_layers = n_layers,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rope_theta = 10_000.0,
+        .tie_word_embeddings = true,
+    };
+    const img = try draft_mod.buildSyntheticTargetBf16ForTest(allocator, q3_cfg, 88811);
+    defer allocator.free(img);
+
+    const prompt = [_]u32{ 3, 14, 27, 45 };
+    var ref_model = try graph.GraphModel.loadFromBytes(allocator, img, cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+    });
+    defer ref_model.deinit(allocator);
+
+    var expected: [10]u32 = undefined;
+    expected[0] = try ref_model.prefillChunk(&prompt, 0, true);
+    var pos: u32 = prompt.len;
+    for (1..expected.len) |i| {
+        expected[i] = try ref_model.stepDecode(expected[i - 1], pos);
+        pos += 1;
+    }
+
+    var spec_model = try graph.GraphModel.loadFromBytes(allocator, img, cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+    });
+    defer spec_model.deinit(allocator);
+
+    var eng = try SpecEngine.initWithGraph(allocator, &spec_model, null, .{
+        .mode = .self_recurrent,
+        .max_tree_nodes = 12,
+        .max_draft_depth = 4,
+        .branch_width = 2,
+        .top_k_per_node = 2,
+        .enable_pruning = false,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    var got: [10]u32 = undefined;
+    got[0] = try eng.prefill(&prompt, null);
+    var p: usize = 1;
+    while (p < got.len) {
+        const rs = try eng.stepRound(null, got[p..]);
+        p += rs.emitted_count;
+    }
+    try std.testing.expectEqualSlices(u32, &expected, &got);
+    try std.testing.expect(eng.stats.self_recurrent_draft_steps > 0);
+    try std.testing.expect(eng.stats.verified_nodes > eng.stats.rounds);
+
+    // Also test stochastic `T > 0` lossless acceptance!
+    var eng_stoch = try SpecEngine.initWithGraph(allocator, &spec_model, null, .{
+        .mode = .self_recurrent,
+        .max_tree_nodes = 8,
+        .max_draft_depth = 3,
+        .branch_width = 2,
+        .top_k_per_node = 2,
+        .enable_pruning = false,
+        .temperature = 0.7,
+    });
+    defer eng_stoch.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(42);
+    var s_out: [8]u32 = undefined;
+    s_out[0] = try eng_stoch.prefill(&prompt, prng.random());
+    var sp: usize = 1;
+    while (sp < s_out.len) {
+        const rs = try eng_stoch.stepRound(prng.random(), s_out[sp..]);
+        sp += rs.emitted_count;
+    }
+    for (s_out) |tid| try std.testing.expect(tid < vocab);
+}
+
+test "D13+W9: GraphModel with MTP DraftHead under Placement.cpu_sme2 is T=0 bit-exact vs stepDecode" {
+    const allocator = std.testing.allocator;
+    const h: u32 = 64;
+    const vocab: u32 = 128;
+    const n_layers: u32 = 4;
+    const layer_attns = try allocator.alloc(graph.AttentionKind, n_layers);
+    @memset(layer_attns, .gqa_full);
+    var cfg: graph.GraphConfig = .{
+        .axes = .{
+            .backbone_kind = .decoder_only,
+            .layer_attention_kinds = layer_attns,
+            .ffn_kind = .dense_swiglu,
+            .has_shared_expert = false,
+            .residual_kind = .single_stream,
+            .residual_branches = 1,
+            .memory_lookup_kind = .none,
+            .loop_schedule = .{ .mode = .single_pass, .start_layer = 0, .end_layer = n_layers, .max_loops = 1 },
+        },
+        .vocab_size = vocab,
+        .hidden_size = h,
+        .num_hidden_layers = n_layers,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rope_theta = 10_000.0,
+        .tie_word_embeddings = true,
+    };
+    defer cfg.deinit(allocator);
+
+    const q3_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .vocab_size = vocab,
+        .hidden_size = h,
+        .num_hidden_layers = n_layers,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rope_theta = 10_000.0,
+        .tie_word_embeddings = true,
+    };
+    const img = try draft_mod.buildSyntheticTargetBf16ForTest(allocator, q3_cfg, 77722);
+    defer allocator.free(img);
+
+    const mtp_cfg: draft_mod.DraftConfig = .{
+        .format = .mtp,
+        .vocab_size = vocab,
+        .draft_vocab_size = vocab,
+        .hidden_size = h,
+        .target_hidden_size = h,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rope_theta = 10_000.0,
+        .share_embed_tokens = true,
+        .share_lm_head = true,
+    };
+    const mtp_img = try draft_mod.buildSyntheticDraftAmfImage(allocator, mtp_cfg, 77733);
+    defer allocator.free(mtp_img);
+
+    const prompt = [_]u32{ 8, 21, 55 };
+    var ref_model = try graph.GraphModel.loadFromBytes(allocator, img, cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+    });
+    defer ref_model.deinit(allocator);
+    var expected: [8]u32 = undefined;
+    expected[0] = try ref_model.prefillChunk(&prompt, 0, true);
+    var pos: u32 = prompt.len;
+    for (1..expected.len) |i| {
+        expected[i] = try ref_model.stepDecode(expected[i - 1], pos);
+        pos += 1;
+    }
+
+    var spec_model = try graph.GraphModel.loadFromBytes(allocator, img, cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+    });
+    defer spec_model.deinit(allocator);
+
+    var dh = try draft_mod.DraftHead.loadFromBytesForGraph(allocator, &spec_model, mtp_img, mtp_cfg, .{
+        .placement = .cpu_sme2,
+        .max_seq_len = 128,
+        .max_tree_slots = 16,
+    });
+    defer dh.deinitForGraph(allocator, &spec_model);
+    try std.testing.expectEqual(draft_mod.Placement.cpu_sme2, dh.effective_placement);
+
+    var eng = try SpecEngine.initWithGraph(allocator, &spec_model, &dh, .{
+        .mode = .mtp,
+        .placement = .cpu_sme2,
+        .max_tree_nodes = 8,
+        .max_draft_depth = 3,
+        .enable_pruning = false,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    var got: [8]u32 = undefined;
+    got[0] = try eng.prefill(&prompt, null);
+    var p: usize = 1;
+    while (p < got.len) {
+        const rs = try eng.stepRound(null, got[p..]);
+        p += rs.emitted_count;
+    }
+    try std.testing.expectEqualSlices(u32, &expected, &got);
+    try std.testing.expect(dh.sme2_eval_count > 0);
 }

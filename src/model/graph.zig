@@ -2418,13 +2418,21 @@ pub const GraphModel = struct {
         try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, qsa.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
         {
             const f = try self.ensureFrame(frame_opt);
-            try self.encodeLinearBatched(f, qsa.k_proj, self.x_norm_bind, self.k_bind, m, false);
-            try self.encodeLinearBatched(f, qsa.v_proj, self.x_norm_bind, self.v_bind, m, false);
-
             const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_k_off };
             const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_v_off };
 
-            // QK-Norm + YaRN + Interleaved 3D MRoPE into tree scratch (never pollutes KvRing on r < R-1).
+            // Shared r=0 KV across recurrent passes (`LoopLM` KV sharing, ADR-0019):
+            // compute `K, V` once at `r = 0` into `tree_k/tree_v` and reuse them on `r >= 1`
+            // so batched `verifyTree(M > 1)` matches serial `stepDecode(M = 1)` bit-for-bit
+            // and QSA `reuse_block_indices` sees identical KV keys across loops.
+            if (loop_step == 0) {
+                try self.encodeLinearBatched(f, qsa.k_proj, self.x_norm_bind, self.k_bind, m, false);
+                try self.encodeLinearBatched(f, qsa.v_proj, self.x_norm_bind, self.v_bind, m, false);
+            }
+
+            // QK-Norm + YaRN + Interleaved 3D MRoPE: at `r = 0` write into `tree_k/tree_v`;
+            // at `r >= 1` rotate `Q` in-place and route K/V output to scratch `k_bind/v_bind`
+            // so `tree_k/tree_v` preserve `r = 0` K/V untouched.
             try self.hybrid_pipes.encodeQsaTreeRope(f, .{
                 .q = self.q_bind,
                 .k = self.k_bind,
@@ -2432,8 +2440,8 @@ pub const GraphModel = struct {
                 .q_norm = qsa.q_norm,
                 .k_norm = qsa.k_norm,
                 .positions_3d = self.pos3d_bind,
-                .k_tree_out = tree_k,
-                .v_tree_out = tree_v,
+                .k_tree_out = if (loop_step == 0) tree_k else self.k_bind,
+                .v_tree_out = if (loop_step == 0) tree_v else self.v_bind,
                 .num_nodes = m,
                 .num_q_heads = self.config.num_attention_heads,
                 .num_kv_heads = self.config.num_key_value_heads,
@@ -2501,11 +2509,16 @@ pub const GraphModel = struct {
         try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, gqa.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
         {
             const f = try self.ensureFrame(frame_opt);
-            try self.encodeLinearBatched(f, gqa.k_proj, self.x_norm_bind, self.k_bind, m, false);
-            try self.encodeLinearBatched(f, gqa.v_proj, self.x_norm_bind, self.v_bind, m, false);
-
             const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_k_off };
             const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_v_off };
+
+            // Shared r=0 KV across recurrent passes (`LoopLM` KV sharing, ADR-0019):
+            // compute `K, V` once at `r = 0` into `tree_k/tree_v` and reuse on `r >= 1`
+            // so parallel `prefill` / `verifyTree(M > 1)` matches serial `stepDecode(M = 1)` bit-for-bit.
+            if (loop_step == 0) {
+                try self.encodeLinearBatched(f, gqa.k_proj, self.x_norm_bind, self.k_bind, m, false);
+                try self.encodeLinearBatched(f, gqa.v_proj, self.x_norm_bind, self.v_bind, m, false);
+            }
 
             try self.attn_pipes.encodeTreeQkNormRope(f, .{
                 .q = self.q_bind,
@@ -2514,8 +2527,8 @@ pub const GraphModel = struct {
                 .q_norm = gqa.q_norm,
                 .k_norm = gqa.k_norm,
                 .positions = self.positions_bind,
-                .k_tree_out = tree_k,
-                .v_tree_out = tree_v,
+                .k_tree_out = if (loop_step == 0) tree_k else self.k_bind,
+                .v_tree_out = if (loop_step == 0) tree_v else self.v_bind,
                 .num_nodes = m,
                 .num_q_heads = self.config.num_attention_heads,
                 .num_kv_heads = self.config.num_key_value_heads,
@@ -3306,7 +3319,11 @@ pub const GraphModel = struct {
                 expected_n: u32,
                 expected_k: u32,
             ) GraphLoadError!qwen3.LinearBinding {
-                const e = src.find(name) orelse return error.MissingTensor;
+                const e = src.find(name) orelse blk: {
+                    var alt_buf: [96]u8 = undefined;
+                    const alt = std.fmt.bufPrint(&alt_buf, "{s}.weight", .{name}) catch return error.MissingTensor;
+                    break :blk src.find(alt) orelse return error.MissingTensor;
+                };
                 const idx = entryIndexOf(base_ptr, e);
                 const si = e_shard[idx];
                 if (si == std.math.maxInt(u16)) return error.MissingTensor;
@@ -3346,7 +3363,11 @@ pub const GraphModel = struct {
                 name: []const u8,
                 expected_len: u32,
             ) GraphLoadError!qwen3.NormBinding {
-                const e = src.find(name) orelse return error.MissingTensor;
+                const e = src.find(name) orelse blk: {
+                    var alt_buf: [96]u8 = undefined;
+                    const alt = std.fmt.bufPrint(&alt_buf, "{s}.weight", .{name}) catch return error.MissingTensor;
+                    break :blk src.find(alt) orelse return error.MissingTensor;
+                };
                 const idx = entryIndexOf(base_ptr, e);
                 const si = e_shard[idx];
                 if (si == std.math.maxInt(u16)) return error.MissingTensor;
@@ -5119,8 +5140,10 @@ fn evalLoopDenseCpuRef(
 
                 cpuRmsNorm(xv, blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable), .bf16, c.rms_norm_eps, xnv);
                 cpuLinearF16(xnv, blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable), .f16, qdd, hh, qv);
-                cpuLinearF16(xnv, blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable), .f16, kvdd, hh, kv);
-                cpuLinearF16(xnv, blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable), .f16, kvdd, hh, vv);
+                if (commit_kv) {
+                    cpuLinearF16(xnv, blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable), .f16, kvdd, hh, kv);
+                    cpuLinearF16(xnv, blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable), .f16, kvdd, hh, vv);
+                }
 
                 const qnw = blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable);
                 const knw = blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable);
@@ -5140,23 +5163,27 @@ fn evalLoopDenseCpuRef(
                         seg[j + half_hd] = a * sn + b * cs;
                     }
                 }
-                for (0..nkvv) |hd_i| {
-                    const seg = kv[hd_i * hdd ..][0..hdd];
-                    var tmp: [256]f32 = undefined;
-                    cpuRmsNorm(seg, knw, .bf16, c.rms_norm_eps, tmp[0..hdd]);
-                    for (0..half_hd) |j| {
-                        const inv_f = std.math.pow(f32, c.rope_theta, -2.0 * @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(hdd)));
-                        const ang = @as(f32, @floatFromInt(pos_i)) * inv_f;
-                        const cs = @cos(ang);
-                        const sn = @sin(ang);
-                        const a = tmp[j];
-                        const b = tmp[j + half_hd];
-                        seg[j] = a * cs - b * sn;
-                        seg[j + half_hd] = a * sn + b * cs;
+                if (commit_kv) {
+                    for (0..nkvv) |hd_i| {
+                        const seg = kv[hd_i * hdd ..][0..hdd];
+                        var tmp: [256]f32 = undefined;
+                        cpuRmsNorm(seg, knw, .bf16, c.rms_norm_eps, tmp[0..hdd]);
+                        for (0..half_hd) |j| {
+                            const inv_f = std.math.pow(f32, c.rope_theta, -2.0 * @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(hdd)));
+                            const ang = @as(f32, @floatFromInt(pos_i)) * inv_f;
+                            const cs = @cos(ang);
+                            const sn = @sin(ang);
+                            const a = tmp[j];
+                            const b = tmp[j + half_hd];
+                            seg[j] = a * cs - b * sn;
+                            seg[j + half_hd] = a * sn + b * cs;
+                        }
                     }
+                    @memcpy(kc[(l * mt + pos_i) * kvdd ..][0..kvdd], kv);
+                    @memcpy(vc[(l * mt + pos_i) * kvdd ..][0..kvdd], vv);
                 }
 
-                // Causal GQA attending over committed `0..pos_i` + current `(kv, vv)`.
+                // Causal GQA attending over committed `0..=pos_i` (using r=0 shared KV at `pos_i`).
                 const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hdd)));
                 const group = nhh / nkvv;
                 for (0..nhh) |qh| {
@@ -5164,10 +5191,7 @@ fn evalLoopDenseCpuRef(
                     var max_s: f32 = -std.math.inf(f32);
                     var scores: [64]f32 = undefined;
                     for (0..pos_i + 1) |t| {
-                        const k_src = if (t < pos_i)
-                            kc[(l * mt + t) * kvdd + kvh * hdd ..][0..hdd]
-                        else
-                            kv[kvh * hdd ..][0..hdd];
+                        const k_src = kc[(l * mt + t) * kvdd + kvh * hdd ..][0..hdd];
                         var dot: f32 = 0.0;
                         for (0..hdd) |d| dot += qv[qh * hdd + d] * k_src[d];
                         scores[t] = dot * scale;
@@ -5181,18 +5205,11 @@ fn evalLoopDenseCpuRef(
                     for (0..hdd) |d| {
                         var acc: f32 = 0.0;
                         for (0..pos_i + 1) |t| {
-                            const v_src = if (t < pos_i)
-                                vc[(l * mt + t) * kvdd + kvh * hdd ..][0..hdd]
-                            else
-                                vv[kvh * hdd ..][0..hdd];
+                            const v_src = vc[(l * mt + t) * kvdd + kvh * hdd ..][0..hdd];
                             acc += (scores[t] / sum_e) * v_src[d];
                         }
                         aov[qh * hdd + d] = acc;
                     }
-                }
-                if (commit_kv) {
-                    @memcpy(kc[(l * mt + pos_i) * kvdd ..][0..kvdd], kv);
-                    @memcpy(vc[(l * mt + pos_i) * kvdd ..][0..kvdd], vv);
                 }
 
                 cpuLinearF16(aov, blobOf(p, raw, std.fmt.bufPrint(nb, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable), .f16, hh, qdd, pv);
@@ -5213,8 +5230,8 @@ fn evalLoopDenseCpuRef(
             if (r >= 1 and ls.inject_x_init) {
                 for (0..h) |d| x[d] = 0.5 * x[d] + 0.5 * x_init[d];
             }
-            const is_final = (r == num_loops - 1);
-            for (core_start..core_end) |l| runLayer(&parsed, amf_bytes, cfg, l, pos, is_final, k_cache, v_cache, x, xn, q, k, v, attn_out, proj, gbuf, ubuf, &nbuf);
+            const is_r0 = (r == 0);
+            for (core_start..core_end) |l| runLayer(&parsed, amf_bytes, cfg, l, pos, is_r0, k_cache, v_cache, x, xn, q, k, v, attn_out, proj, gbuf, ubuf, &nbuf);
         }
         for (core_end..n_layers) |l| runLayer(&parsed, amf_bytes, cfg, l, pos, true, k_cache, v_cache, x, xn, q, k, v, attn_out, proj, gbuf, ubuf, &nbuf);
 

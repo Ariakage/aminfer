@@ -19,6 +19,8 @@ const dequant = @import("../gpu/dequant.zig");
 const attention = @import("../gpu/attention.zig");
 const moe = @import("../gpu/moe.zig");
 const qwen3 = @import("../model/qwen3.zig");
+const graph = @import("../model/graph.zig");
+const sme = @import("../cpu/sme.zig");
 const vmstat = @import("../platform/vmstat.zig");
 
 /// Maximum top-K candidates extracted per draft node via `encodeTopKLogitsRows`.
@@ -27,13 +29,14 @@ pub const MAX_DRAFT_TOP_K: u32 = moe.MAX_TOP_K;
 /// Maximum rows batched through the optional CoreML ANE `innerProduct` projection.
 pub const ANE_MAX_BATCH_ROWS: u32 = 8;
 
-/// L1/L2 speculative draft source selection (`ADR-0013`).
+/// L1/L2 speculative draft source selection (`ADR-0013`, `ADR-0019`).
 pub const DraftMode = enum {
     l1_only,
     eagle3,
     eagle2,
     mtp,
     small_draft,
+    self_recurrent,
 
     pub fn label(self: DraftMode) []const u8 {
         return switch (self) {
@@ -42,6 +45,7 @@ pub const DraftMode = enum {
             .eagle2 => "eagle2",
             .mtp => "mtp",
             .small_draft => "small",
+            .self_recurrent => "self-recurrent",
         };
     }
 
@@ -51,21 +55,24 @@ pub const DraftMode = enum {
         if (std.mem.eql(u8, str, "eagle2")) return .eagle2;
         if (std.mem.eql(u8, str, "mtp")) return .mtp;
         if (std.mem.eql(u8, str, "small") or std.mem.eql(u8, str, "small_draft")) return .small_draft;
+        if (std.mem.eql(u8, str, "self-recurrent") or std.mem.eql(u8, str, "self_recurrent")) return .self_recurrent;
         return error.InvalidDraftMode;
     }
 };
 
-/// L2 draft head hardware placement policy (`D5`, ADR-0008).
+/// L2 draft head hardware placement policy (`D5`, `D13`, ADR-0008, ADR-0019).
 pub const Placement = enum {
     auto,
     gpu,
     ane,
+    cpu_sme2,
 
     pub fn label(self: Placement) []const u8 {
         return switch (self) {
             .auto => "auto",
             .gpu => "gpu",
             .ane => "ane",
+            .cpu_sme2 => "sme2",
         };
     }
 
@@ -73,6 +80,7 @@ pub const Placement = enum {
         if (std.mem.eql(u8, str, "auto")) return .auto;
         if (std.mem.eql(u8, str, "gpu")) return .gpu;
         if (std.mem.eql(u8, str, "ane")) return .ane;
+        if (std.mem.eql(u8, str, "sme2") or std.mem.eql(u8, str, "cpu_sme2")) return .cpu_sme2;
         return error.InvalidPlacement;
     }
 };
@@ -116,7 +124,7 @@ pub const DraftConfig = struct {
     }
 
     pub fn validate(self: DraftConfig) ConfigError!void {
-        if (self.format == .l1_only or self.format == .small_draft) return error.UnsupportedFormat;
+        if (self.format == .l1_only or self.format == .small_draft or self.format == .self_recurrent) return error.UnsupportedFormat;
         if (self.vocab_size == 0 or self.draft_vocab_size == 0 or self.draft_vocab_size > self.vocab_size) {
             return error.InvalidConfig;
         }
@@ -305,14 +313,14 @@ pub const DraftLoadError = error{
 } || DraftConfig.ConfigError || amf.AmfFile.OpenError || quant.ShapeError ||
     metal.WrapError || metal.ProtoEmitError || budget_mod.PlanError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError ||
-    vmstat.Error || moe.EncodeError;
+    vmstat.Error || moe.EncodeError || sme.WiredScratchError || std.Thread.SpawnError;
 
 pub const DraftStepError = error{
     TokenOutOfRange,
     PositionOutOfRange,
     SlotOutOfRange,
     BatchTooLarge,
-} || metal.Error || dequant.EncodeError || moe.EncodeError;
+} || metal.Error || dequant.EncodeError || moe.EncodeError || sme.Error;
 
 const DraftLayerWeights = struct {
     input_layernorm: qwen3.NormBinding,
@@ -483,12 +491,45 @@ const AmfSource = union(enum) {
     }
 };
 
+/// Heap-pinned L2-resident (`<= 16 MiB`) P-core SME2 runner for compact
+/// `DraftHead` projections (`D13`, ADR-0008 / ADR-0019): `EAGLE-3` `fc`,
+/// `4B MTP` dual-norm `eh_proj`, and `EAGLE-2` `fc` (`0` Metal CBs, `0` allocs).
+const SmeProjectionKind = enum {
+    eagle3_fc,
+    eagle2_fc,
+    mtp_eh_proj,
+};
+
+const SmeProjectionRuntime = struct {
+    weights_arena: ?arena_mod.WiredArena,
+    proj: sme.SmeDraftProjection,
+    dispatcher: sme.SmeDispatcher,
+    cal_out_f16: []f16,
+    weight_bytes: usize,
+    kind: SmeProjectionKind,
+
+    fn deinit(self: *SmeProjectionRuntime, allocator: std.mem.Allocator) void {
+        allocator.free(self.cal_out_f16);
+        self.dispatcher.deinit();
+        self.proj.deinit();
+        if (self.weights_arena) |*wa| wa.deinit();
+    }
+
+    fn totalWiredBytes(self: *const SmeProjectionRuntime) u64 {
+        const w_b: u64 = if (self.weights_arena) |*wa| wa.bytes().len else 0;
+        return w_b + self.proj.totalWiredBytes();
+    }
+};
+
 pub const DraftHead = struct {
     config: DraftConfig,
     requested_placement: Placement,
     effective_placement: Placement,
     placement_gate_ane_us: f64,
     placement_gate_gpu_us: f64,
+    placement_gate_sme2_us: f64,
+    sme2_proj_bytes: usize,
+    sme2_eval_count: u64,
     max_seq_len: u32,
     chunk_tokens: u32,
     num_chunks: u32,
@@ -518,6 +559,8 @@ pub const DraftHead = struct {
 
     // Optional zero-copy CoreML ANE projection for `layers[0].o_proj` (D5).
     ane_proj: ?AneProjection,
+    // Optional L2-resident P-core SME2 projection for `fc` / `eh_proj` (D13).
+    sme_proj: ?*SmeProjectionRuntime,
 
     // Preallocated scratch buffers & bindings (zero hot-path heap alloc)
     token_ids_host: []u32,
@@ -526,6 +569,9 @@ pub const DraftHead = struct {
     ancestor_masks_host: []u64,
     topk_host: []moe.TopKCandidate,
     hidden_pool_host: []f16,
+    h_in_host: []f16,
+    emb_host: []f16,
+    x_host: []f16,
 
     token_ids_bind: metal.BufferBinding,
     parent_slots_bind: metal.BufferBinding,
@@ -582,7 +628,44 @@ pub const DraftHead = struct {
         return loadInternal(allocator, target, .{ .file = &file }, config, options);
     }
 
+    pub fn loadFromBytesForGraph(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        amf_bytes: []const u8,
+        config: DraftConfig,
+        options: DraftLoadOptions,
+    ) DraftLoadError!DraftHead {
+        var parsed = try amf.Parsed.parseBytes(allocator, amf_bytes);
+        defer parsed.deinit(allocator);
+        return loadInternal(allocator, target, .{ .bytes = .{ .parsed = &parsed, .raw = amf_bytes } }, config, options);
+    }
+
+    pub fn loadFromFileForGraph(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        amf_path: [:0]const u8,
+        config: DraftConfig,
+        options: DraftLoadOptions,
+    ) DraftLoadError!DraftHead {
+        var file = try amf.AmfFile.open(allocator, amf_path);
+        defer file.close(allocator);
+        return loadInternal(allocator, target, .{ .file = &file }, config, options);
+    }
+
     pub fn deinit(self: *DraftHead, allocator: std.mem.Allocator, target: *qwen3.Qwen3Model) void {
+        self.deinitImpl(allocator, target);
+    }
+
+    pub fn deinitForGraph(self: *DraftHead, allocator: std.mem.Allocator, target: *graph.GraphModel) void {
+        self.deinitImpl(allocator, target);
+    }
+
+    fn deinitImpl(self: *DraftHead, allocator: std.mem.Allocator, target: anytype) void {
+        if (self.sme_proj) |sp| {
+            sp.deinit(allocator);
+            allocator.destroy(sp);
+            self.sme_proj = null;
+        }
         if (self.ane_proj) |*ap| {
             ap.close(&target.compute);
             self.ane_proj = null;
@@ -683,6 +766,28 @@ pub const DraftHead = struct {
         base_pos: u32,
         top_k: u32,
     ) DraftStepError!void {
+        return self.syncAcceptedImpl(target, tokens, target_features_bind, base_pos, top_k);
+    }
+
+    pub fn syncAcceptedForGraph(
+        self: *DraftHead,
+        target: *graph.GraphModel,
+        tokens: []const u32,
+        target_features_bind: metal.BufferBinding,
+        base_pos: u32,
+        top_k: u32,
+    ) DraftStepError!void {
+        return self.syncAcceptedImpl(target, tokens, target_features_bind, base_pos, top_k);
+    }
+
+    fn syncAcceptedImpl(
+        self: *DraftHead,
+        target: anytype,
+        tokens: []const u32,
+        target_features_bind: metal.BufferBinding,
+        base_pos: u32,
+        top_k: u32,
+    ) DraftStepError!void {
         if (tokens.len == 0) return error.InvalidArgument;
         if (tokens.len > self.max_tree_slots) return error.BatchTooLarge;
         const m: u32 = @intCast(tokens.len);
@@ -740,6 +845,34 @@ pub const DraftHead = struct {
         top_k: u32,
         out_candidates: ?[]moe.TopKCandidate,
     ) DraftStepError!void {
+        return self.stepTreeBatchImpl(target, tokens, parent_hidden_rows, positions, slot_ancestor_masks, slot_start, top_k, out_candidates);
+    }
+
+    pub fn stepTreeBatchForGraph(
+        self: *DraftHead,
+        target: *graph.GraphModel,
+        tokens: []const u32,
+        parent_hidden_rows: []const u32,
+        positions: []const u32,
+        slot_ancestor_masks: []const u64,
+        slot_start: u32,
+        top_k: u32,
+        out_candidates: ?[]moe.TopKCandidate,
+    ) DraftStepError!void {
+        return self.stepTreeBatchImpl(target, tokens, parent_hidden_rows, positions, slot_ancestor_masks, slot_start, top_k, out_candidates);
+    }
+
+    fn stepTreeBatchImpl(
+        self: *DraftHead,
+        target: anytype,
+        tokens: []const u32,
+        parent_hidden_rows: []const u32,
+        positions: []const u32,
+        slot_ancestor_masks: []const u64,
+        slot_start: u32,
+        top_k: u32,
+        out_candidates: ?[]moe.TopKCandidate,
+    ) DraftStepError!void {
         if (tokens.len == 0 or tokens.len != parent_hidden_rows.len or tokens.len != positions.len) {
             return error.InvalidArgument;
         }
@@ -788,7 +921,7 @@ pub const DraftHead = struct {
 
     fn runForwardInternal(
         self: *DraftHead,
-        target: *qwen3.Qwen3Model,
+        target: anytype,
         m: u32,
         slot_start: u32,
         base_pos: u32,
@@ -812,151 +945,257 @@ pub const DraftHead = struct {
 
         const use_ane_o_proj = (self.effective_placement == .ane and self.ane_proj != null and m <= self.ane_proj.?.batch_rows);
 
+        // D13 Placement (`Placement.cpu_sme2`): evaluate compact L2-resident (`<= 16 MiB`)
+        // `EAGLE-3` `fc` or `MTP` dual-norm `eh_proj` / `EAGLE-2` `fc` on P-core SME2
+        // BEFORE beginning the Metal 4 command buffer (`0` Metal CBs, `0` heap allocs)!
+        var sme_did_fc = false;
+        var sme_did_fusion = false;
+        if (self.effective_placement == .cpu_sme2) {
+            if (self.sme_proj) |sp| {
+                if (m <= sp.proj.max_m) {
+                    switch (sp.kind) {
+                        .eagle3_fc => {
+                            if (is_target_sync) {
+                                const k_fc: usize = sp.proj.weight.k;
+                                const mk = @as(usize, m) * k_fc;
+                                const src_aux = target.accepted_aux_host[0..mk];
+                                const out_bytes = std.mem.sliceAsBytes(self.h_in_host[0 .. @as(usize, m) * h]);
+                                if (sp.proj.weight.dtype.activationIsBf16()) {
+                                    for (0..mk) |i| {
+                                        sp.proj.x_act_u16[i] = quant.f32ToFloatBits(.bf16, @floatCast(src_aux[i]));
+                                    }
+                                    try sp.proj.evalU16(&sp.dispatcher, sp.proj.x_act_u16[0..mk], null, out_bytes, m, .{ .out_dtype = .f16 });
+                                } else {
+                                    const src_u16: []const u16 = @ptrCast(src_aux);
+                                    try sp.proj.evalU16(&sp.dispatcher, src_u16, null, out_bytes, m, .{ .out_dtype = .f16 });
+                                }
+                                sme_did_fc = true;
+                                self.sme2_eval_count += 1;
+                            }
+                        },
+                        .mtp_eh_proj => {
+                            if (self.embed.weight_host.len > 0) {
+                                cpuEmbedLookupRows(self.embed, self.token_ids_host[0..m], h, self.emb_host[0 .. @as(usize, m) * h]);
+                                const h_src: []const f16 = if (is_target_sync)
+                                    target.accepted_top_host[0 .. @as(usize, m) * h]
+                                else blk: {
+                                    for (0..m) |r| {
+                                        const prow = self.parent_slots_host[r];
+                                        @memcpy(
+                                            self.h_in_host[r * h ..][0..h],
+                                            self.hidden_pool_host[@as(usize, prow) * h ..][0..h],
+                                        );
+                                    }
+                                    break :blk self.h_in_host[0 .. @as(usize, m) * h];
+                                };
+                                const en_w: ?sme.NormWeightSlice = if (self.enorm) |en| normToSmeSlice(en, h) else null;
+                                const hn_w: ?sme.NormWeightSlice = if (self.hnorm) |hn| normToSmeSlice(hn, h) else null;
+                                try sp.proj.evalDualNormConcatLinear(
+                                    &sp.dispatcher,
+                                    .{ .f16 = self.emb_host[0 .. @as(usize, m) * h] },
+                                    en_w,
+                                    .{ .f16 = h_src },
+                                    hn_w,
+                                    self.config.rms_norm_eps,
+                                    null,
+                                    std.mem.sliceAsBytes(self.x_host[0 .. @as(usize, m) * h]),
+                                    m,
+                                    .{ .out_dtype = .f16 },
+                                );
+                                sme_did_fusion = true;
+                                self.sme2_eval_count += 1;
+                            }
+                        },
+                        .eagle2_fc => {
+                            if (self.embed.weight_host.len > 0) {
+                                cpuEmbedLookupRows(self.embed, self.token_ids_host[0..m], h, self.emb_host[0 .. @as(usize, m) * h]);
+                                const h_src: []const f16 = if (is_target_sync)
+                                    target.accepted_top_host[0 .. @as(usize, m) * h]
+                                else blk: {
+                                    for (0..m) |r| {
+                                        const prow = self.parent_slots_host[r];
+                                        @memcpy(
+                                            self.h_in_host[r * h ..][0..h],
+                                            self.hidden_pool_host[@as(usize, prow) * h ..][0..h],
+                                        );
+                                    }
+                                    break :blk self.h_in_host[0 .. @as(usize, m) * h];
+                                };
+                                const act_dt: quant.FloatDType = if (sp.proj.weight.dtype.activationIsBf16()) .bf16 else .f16;
+                                const k_fc = 2 * @as(usize, h);
+                                for (0..m) |r| {
+                                    const dst_row = sp.proj.x_act_u16[r * k_fc ..][0..k_fc];
+                                    for (0..h) |d| {
+                                        dst_row[d] = quant.f32ToFloatBits(act_dt, @floatCast(self.emb_host[r * h + d]));
+                                        dst_row[h + d] = quant.f32ToFloatBits(act_dt, @floatCast(h_src[r * h + d]));
+                                    }
+                                }
+                                try sp.proj.evalU16(
+                                    &sp.dispatcher,
+                                    sp.proj.x_act_u16[0 .. @as(usize, m) * k_fc],
+                                    null,
+                                    std.mem.sliceAsBytes(self.x_host[0 .. @as(usize, m) * h]),
+                                    m,
+                                    .{ .out_dtype = .f16 },
+                                );
+                                sme_did_fusion = true;
+                                self.sme2_eval_count += 1;
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
         var frame = try target.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
 
-        // 1. Prepare `h_in_bind [m, H]` (either from target verifier features or parent draft hidden pool).
-        var h_in_active = self.h_in_bind;
-        if (is_target_sync) {
-            if (self.config.format == .eagle3) {
-                try target.encodeLinearBatched(&frame, self.fc.?, target_features_bind, self.h_in_bind, m, false);
+        if (!sme_did_fusion) {
+            // 1. Prepare `h_in_bind [m, H]` (either from target verifier features or parent draft hidden pool).
+            var h_in_active = self.h_in_bind;
+            if (is_target_sync) {
+                if (self.config.format == .eagle3) {
+                    if (!sme_did_fc) {
+                        try target.encodeLinearBatched(&frame, self.fc.?, target_features_bind, self.h_in_bind, m, false);
+                    }
+                } else {
+                    h_in_active = target_features_bind;
+                }
             } else {
-                h_in_active = target_features_bind;
+                try target.moe_pipes.encodeGatherRows(&frame, .{
+                    .src = self.hidden_pool_bind,
+                    .indices = self.parent_slots_bind,
+                    .dst = self.h_in_bind,
+                    .count = m,
+                    .row_elems = h,
+                }, false);
             }
-        } else {
-            try target.moe_pipes.encodeGatherRows(&frame, .{
-                .src = self.hidden_pool_bind,
-                .indices = self.parent_slots_bind,
-                .dst = self.h_in_bind,
-                .count = m,
-                .row_elems = h,
+
+            // 2. Token embedding lookup `[m, H]`.
+            try target.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+                .weight = self.embed.weight,
+                .scale_bias = self.embed.scale_bias,
+                .tokens = .{ .token_ids = self.token_ids_bind },
+                .out = self.emb_bind,
+                .m = m,
+                .vocab_size = self.config.vocab_size,
+                .hidden_size = h,
             }, false);
-        }
 
-        // 2. Token embedding lookup `[m, H]`.
-        try target.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
-            .weight = self.embed.weight,
-            .scale_bias = self.embed.scale_bias,
-            .tokens = .{ .token_ids = self.token_ids_bind },
-            .out = self.emb_bind,
-            .m = m,
-            .vocab_size = self.config.vocab_size,
-            .hidden_size = h,
-        }, false);
+            // 3. Format-specific feature fusion before layer 0.
+            switch (self.config.format) {
+                .eagle3 => {
+                    const l0 = self.layers[0];
+                    try target.attn_pipes.encodeRmsNorm(&frame, .{
+                        .x = self.emb_bind,
+                        .w = l0.input_layernorm.binding,
+                        .y = self.e_norm_bind,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = l0.input_layernorm.dtype,
+                    }, true);
+                    try target.attn_pipes.encodeRmsNorm(&frame, .{
+                        .x = h_in_active,
+                        .w = l0.hidden_norm.?.binding,
+                        .y = self.h_norm_bind,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = l0.hidden_norm.?.dtype,
+                    }, false);
 
-        // 3. Format-specific feature fusion before layer 0.
-        switch (self.config.format) {
-            .eagle3 => {
-                const l0 = self.layers[0];
-                try target.attn_pipes.encodeRmsNorm(&frame, .{
-                    .x = self.emb_bind,
-                    .w = l0.input_layernorm.binding,
-                    .y = self.e_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = self.config.rms_norm_eps,
-                    .w_dtype = l0.input_layernorm.dtype,
-                }, true);
-                try target.attn_pipes.encodeRmsNorm(&frame, .{
-                    .x = h_in_active,
-                    .w = l0.hidden_norm.?.binding,
-                    .y = self.h_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = self.config.rms_norm_eps,
-                    .w_dtype = l0.hidden_norm.?.dtype,
-                }, false);
-
-                // Concatenate `[e_norm, h_norm]` -> `x_cat [m, 2*H]`, and set `x_bind = residual`.
-                try target.moe_pipes.encodeCopyStrided(&frame, .{
-                    .src = self.e_norm_bind,
-                    .dst = self.x_cat_bind,
-                    .num_rows = m,
-                    .copy_cols = h,
-                    .src_stride = h,
-                    .dst_stride = 2 * h,
-                    .dst_col_off = 0,
-                }, true);
-                try target.moe_pipes.encodeCopyStrided(&frame, .{
-                    .src = self.h_norm_bind,
-                    .dst = self.x_cat_bind,
-                    .num_rows = m,
-                    .copy_cols = h,
-                    .src_stride = h,
-                    .dst_stride = 2 * h,
-                    .dst_col_off = h,
-                }, false);
-                try target.moe_pipes.encodeCopyStrided(&frame, .{
-                    .src = if (self.config.norm_before_residual) self.h_norm_bind else h_in_active,
-                    .dst = self.x_bind,
-                    .num_rows = m,
-                    .copy_cols = h,
-                    .src_stride = h,
-                    .dst_stride = h,
-                    .dst_col_off = 0,
-                }, false);
-            },
-            .eagle2 => {
-                try target.moe_pipes.encodeCopyStrided(&frame, .{
-                    .src = self.emb_bind,
-                    .dst = self.x_cat_bind,
-                    .num_rows = m,
-                    .copy_cols = h,
-                    .src_stride = h,
-                    .dst_stride = 2 * h,
-                    .dst_col_off = 0,
-                }, true);
-                try target.moe_pipes.encodeCopyStrided(&frame, .{
-                    .src = h_in_active,
-                    .dst = self.x_cat_bind,
-                    .num_rows = m,
-                    .copy_cols = h,
-                    .src_stride = h,
-                    .dst_stride = 2 * h,
-                    .dst_col_off = h,
-                }, false);
-                try target.encodeLinearBatched(&frame, self.fc.?, self.x_cat_bind, self.x_bind, m, true);
-            },
-            .mtp => {
-                try target.attn_pipes.encodeRmsNorm(&frame, .{
-                    .x = self.emb_bind,
-                    .w = self.enorm.?.binding,
-                    .y = self.e_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = self.config.rms_norm_eps,
-                    .w_dtype = self.enorm.?.dtype,
-                }, true);
-                try target.attn_pipes.encodeRmsNorm(&frame, .{
-                    .x = h_in_active,
-                    .w = self.hnorm.?.binding,
-                    .y = self.h_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = self.config.rms_norm_eps,
-                    .w_dtype = self.hnorm.?.dtype,
-                }, false);
-                try target.moe_pipes.encodeCopyStrided(&frame, .{
-                    .src = self.e_norm_bind,
-                    .dst = self.x_cat_bind,
-                    .num_rows = m,
-                    .copy_cols = h,
-                    .src_stride = h,
-                    .dst_stride = 2 * h,
-                    .dst_col_off = 0,
-                }, true);
-                try target.moe_pipes.encodeCopyStrided(&frame, .{
-                    .src = self.h_norm_bind,
-                    .dst = self.x_cat_bind,
-                    .num_rows = m,
-                    .copy_cols = h,
-                    .src_stride = h,
-                    .dst_stride = 2 * h,
-                    .dst_col_off = h,
-                }, false);
-                try target.encodeLinearBatched(&frame, self.eh_proj.?, self.x_cat_bind, self.x_bind, m, true);
-            },
-            .l1_only, .small_draft => unreachable,
+                    // Concatenate `[e_norm, h_norm]` -> `x_cat [m, 2*H]`, and set `x_bind = residual`.
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = self.e_norm_bind,
+                        .dst = self.x_cat_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = 2 * h,
+                        .dst_col_off = 0,
+                    }, true);
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = self.h_norm_bind,
+                        .dst = self.x_cat_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = 2 * h,
+                        .dst_col_off = h,
+                    }, false);
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = if (self.config.norm_before_residual) self.h_norm_bind else h_in_active,
+                        .dst = self.x_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = h,
+                        .dst_col_off = 0,
+                    }, false);
+                },
+                .eagle2 => {
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = self.emb_bind,
+                        .dst = self.x_cat_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = 2 * h,
+                        .dst_col_off = 0,
+                    }, true);
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = h_in_active,
+                        .dst = self.x_cat_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = 2 * h,
+                        .dst_col_off = h,
+                    }, false);
+                    try target.encodeLinearBatched(&frame, self.fc.?, self.x_cat_bind, self.x_bind, m, true);
+                },
+                .mtp => {
+                    try target.attn_pipes.encodeRmsNorm(&frame, .{
+                        .x = self.emb_bind,
+                        .w = self.enorm.?.binding,
+                        .y = self.e_norm_bind,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = self.enorm.?.dtype,
+                    }, true);
+                    try target.attn_pipes.encodeRmsNorm(&frame, .{
+                        .x = h_in_active,
+                        .w = self.hnorm.?.binding,
+                        .y = self.h_norm_bind,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = self.hnorm.?.dtype,
+                    }, false);
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = self.e_norm_bind,
+                        .dst = self.x_cat_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = 2 * h,
+                        .dst_col_off = 0,
+                    }, true);
+                    try target.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = self.h_norm_bind,
+                        .dst = self.x_cat_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = 2 * h,
+                        .dst_col_off = h,
+                    }, false);
+                    try target.encodeLinearBatched(&frame, self.eh_proj.?, self.x_cat_bind, self.x_bind, m, true);
+                },
+                .l1_only, .small_draft, .self_recurrent => unreachable,
+            }
         }
 
         // 4. Draft transformer layer(s).
@@ -1623,13 +1862,21 @@ const LoadedBlob = struct {
     }
 
     fn asNormBinding(self: LoadedBlob, dtype: quant.FloatDType) qwen3.NormBinding {
-        return .{ .binding = self.asBinding(), .dtype = dtype };
+        return .{
+            .binding = self.asBinding(),
+            .dtype = dtype,
+            .host_bytes = self.slice[0..@intCast(self.entry.data_bytes)],
+        };
     }
 
     fn asLinearBinding(self: LoadedBlob, dtype: quant.WeightDType) qwen3.LinearBinding {
         const sb: ?metal.BufferBinding = switch (dtype) {
             .f16, .bf16 => null,
             .q4_affine, .q3_affine, .q2_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
+        };
+        const sb_host: ?[]const u8 = switch (dtype) {
+            .f16, .bf16 => null,
+            .q4_affine, .q3_affine, .q2_affine => self.slice[@intCast(self.entry.params_offset)..][0..@intCast(self.entry.params_bytes)],
         };
         return .{
             .weight = .{ .buffer = self.buffer, .offset = self.offset },
@@ -1638,9 +1885,220 @@ const LoadedBlob = struct {
             .k = self.entry.shape[1],
             .dtype = dtype,
             .alg_bytes = self.entry.data_bytes + self.entry.params_bytes,
+            .weight_host = self.slice[0..@intCast(self.entry.data_bytes)],
+            .scale_bias_host = sb_host,
         };
     }
 };
+
+fn normToSmeSlice(nb: qwen3.NormBinding, h: u32) sme.NormWeightSlice {
+    const u16_slice: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, nb.host_bytes[0 .. @as(usize, h) * 2]));
+    return switch (nb.dtype) {
+        .f16 => .{ .f16 = @ptrCast(u16_slice) },
+        .bf16 => .{ .bf16 = u16_slice },
+    };
+}
+
+/// Zero-allocation CPU embedding lookup for `m <= 64` rows when `Placement.cpu_sme2`
+/// executes `MTP` dual-norm `eh_proj` or `EAGLE-2` `fc` before opening the Metal frame.
+fn cpuEmbedLookupRows(embed: qwen3.LinearBinding, token_ids: []const u32, h: u32, out: []f16) void {
+    const dim: usize = h;
+    const raw = embed.weight_host;
+    switch (embed.dtype) {
+        .f16 => {
+            const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, raw));
+            for (token_ids, 0..) |tid, r| {
+                @memcpy(out[r * dim ..][0..dim], src[@as(usize, tid) * dim ..][0..dim]);
+            }
+        },
+        .bf16 => {
+            const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
+            for (token_ids, 0..) |tid, r| {
+                const row_s = src[@as(usize, tid) * dim ..][0..dim];
+                const row_d = out[r * dim ..][0..dim];
+                for (0..dim) |d| {
+                    row_d[d] = @floatCast(quant.bf16ToF32(row_s[d]));
+                }
+            }
+        },
+        .q4_affine, .q3_affine, .q2_affine => {
+            const sb_raw = embed.scale_bias_host orelse return;
+            const groups_per_row: usize = dim / 64;
+            const group_bytes: usize = switch (embed.dtype) {
+                .q4_affine => 32,
+                .q3_affine => 24,
+                .q2_affine => 16,
+                else => unreachable,
+            };
+            const row_q_bytes = groups_per_row * group_bytes;
+            const row_sb_bytes = groups_per_row * 4;
+            for (token_ids, 0..) |tid, r| {
+                const q_row = raw[@as(usize, tid) * row_q_bytes ..][0..row_q_bytes];
+                const sb_row = sb_raw[@as(usize, tid) * row_sb_bytes ..][0..row_sb_bytes];
+                const dst = out[r * dim ..][0..dim];
+                for (0..groups_per_row) |g| {
+                    const scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, sb_row[g * 4 ..][0..2], .little))));
+                    const bias: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, sb_row[g * 4 + 2 ..][0..2], .little))));
+                    const gq = q_row[g * group_bytes ..][0..group_bytes];
+                    switch (embed.dtype) {
+                        .q4_affine => {
+                            for (0..32) |bi| {
+                                const byte = gq[bi];
+                                dst[g * 64 + bi * 2] = @floatCast(@as(f32, @floatFromInt(byte & 0x0F)) * scale + bias);
+                                dst[g * 64 + bi * 2 + 1] = @floatCast(@as(f32, @floatFromInt(byte >> 4)) * scale + bias);
+                            }
+                        },
+                        .q3_affine => {
+                            for (0..8) |blk| {
+                                const b = gq[blk * 3 ..][0..3];
+                                const w: u32 = @as(u32, b[0]) | (@as(u32, b[1]) << 8) | (@as(u32, b[2]) << 16);
+                                for (0..8) |lane| {
+                                    const code: u32 = (w >> @intCast(lane * 3)) & 0x7;
+                                    dst[g * 64 + blk * 8 + lane] = @floatCast(@as(f32, @floatFromInt(code)) * scale + bias);
+                                }
+                            }
+                        },
+                        .q2_affine => {
+                            for (0..16) |bi| {
+                                const byte = gq[bi];
+                                for (0..4) |lane| {
+                                    const code: u32 = (byte >> @intCast(lane * 2)) & 0x3;
+                                    dst[g * 64 + bi * 4 + lane] = @floatCast(@as(f32, @floatFromInt(code)) * scale + bias);
+                                }
+                            }
+                        },
+                        else => unreachable,
+                    }
+                }
+            }
+        },
+    }
+}
+
+/// Packs a compact L2-resident (`<= 16 MiB`) `f16`/`bf16` projection (`fc` or `eh_proj`)
+/// into `sme2_panel64` once at startup and builds `SmeProjectionRuntime` (`D13`).
+fn tryInitSmeProjectionRuntime(
+    allocator: std.mem.Allocator,
+    blob: LoadedBlob,
+    dtype: quant.WeightDType,
+    kind: SmeProjectionKind,
+    max_m: u32,
+    draft_budget: budget_mod.Budget,
+) DraftLoadError!?*SmeProjectionRuntime {
+    const n: usize = blob.entry.shape[0];
+    const k: usize = blob.entry.shape[1];
+    if (k == 0 or (k % sme.GROUP_SIZE) != 0) return null;
+    const panel_dt: sme.PanelDType = switch (dtype) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        else => return null,
+    };
+    const packed_bytes = sme.packedBlobBytes(panel_dt, n, k) catch return null;
+    if (packed_bytes > sme.MAX_L2_DRAFT_PROJ_BYTES) return null;
+
+    const aligned_w = try page.alignUp(packed_bytes);
+    draft_budget.checkPlan(aligned_w) catch return null;
+    var w_arena = arena_mod.WiredArena.init(aligned_w, draft_budget) catch return null;
+    errdefer w_arena.deinit();
+
+    const w_raw = try w_arena.allocPages(packed_bytes);
+    const src_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, blob.slice[0 .. n * k * 2]));
+    try sme.packDensePanel64(panel_dt, src_u16, n, k, w_raw[0..packed_bytes]);
+
+    const weight: sme.SmeLinearWeight = .{
+        .w_packed = w_raw[0..packed_bytes],
+        .n = n,
+        .k = k,
+        .dtype = panel_dt,
+        .param_kind = .affine_scale_bias,
+        .cache_hint = .temporal,
+    };
+    var proj = try sme.SmeDraftProjection.init(weight, .{
+        .max_m = @min(@as(usize, max_m), sme.MAX_STEP_LORA_M),
+        .budget_override = draft_budget,
+    });
+    errdefer proj.deinit();
+
+    var disp = try sme.SmeDispatcher.init(allocator, .{});
+    errdefer disp.deinit();
+
+    const cal_m: usize = @min(@as(usize, max_m), 4);
+    const cal_out_f16 = try allocator.alloc(f16, cal_m * n);
+    errdefer allocator.free(cal_out_f16);
+    @memset(cal_out_f16, 0);
+
+    const rt = try allocator.create(SmeProjectionRuntime);
+    rt.* = .{
+        .weights_arena = w_arena,
+        .proj = proj,
+        .dispatcher = disp,
+        .cal_out_f16 = cal_out_f16,
+        .weight_bytes = packed_bytes,
+        .kind = kind,
+    };
+    return rt;
+}
+
+/// D13 startup benchmark gate (`ADR-0008`, `ADR-0019`): compares P-core SME2
+/// `SmeDraftProjection` against a Metal 4 GPU projection callback using
+/// `sme.calibrateSmeVsGpuFn` (median-of-N, zero hot-path allocations).
+fn calibrateD13SmeVsGpu(
+    target: anytype,
+    sp: *SmeProjectionRuntime,
+    gpu_lin: qwen3.LinearBinding,
+    in_bind: metal.BufferBinding,
+    out_bind: metal.BufferBinding,
+    cal_m: u32,
+    timeout_ms: u64,
+) DraftLoadError!sme.SmeVsGpuCalibration {
+    const TargetPtr = @TypeOf(target);
+    const GpuCtx = struct {
+        tgt: TargetPtr,
+        lin: qwen3.LinearBinding,
+        in_b: metal.BufferBinding,
+        out_b: metal.BufferBinding,
+        m: u32,
+        timeout: u64,
+    };
+    var ctx: GpuCtx = .{
+        .tgt = target,
+        .lin = gpu_lin,
+        .in_b = in_bind,
+        .out_b = out_bind,
+        .m = cal_m,
+        .timeout = timeout_ms,
+    };
+    const stepFn = struct {
+        fn run(raw_ctx: *anyopaque) anyerror!void {
+            const c: *GpuCtx = @ptrCast(@alignCast(raw_ctx));
+            var frame = try c.tgt.compute.beginFrame(c.timeout);
+            errdefer frame.abort();
+            try c.tgt.encodeLinearBatched(&frame, c.lin, c.in_b, c.out_b, c.m, false);
+            const sig = try frame.commit();
+            try c.tgt.compute.wait(sig, c.timeout);
+        }
+    }.run;
+
+    const out_bytes = std.mem.sliceAsBytes(sp.cal_out_f16[0 .. @as(usize, cal_m) * sp.proj.weight.n]);
+    return sme.calibrateSmeVsGpuFn(
+        &sp.dispatcher,
+        &sp.proj,
+        cal_m,
+        out_bytes,
+        &ctx,
+        &stepFn,
+        .{
+            .warmups = 4,
+            .iters = 12,
+            .out_dtype = .f16,
+        },
+    ) catch |err| switch (err) {
+        error.InvalidArgument => return error.InvalidConfig,
+        error.BufferTooSmall => return error.InvalidConfig,
+        error.Timeout => return error.Timeout,
+        else => return error.ComputeFailed,
+    };
+}
 
 fn loadBlobIntoArena(
     source: AmfSource,
@@ -1687,7 +2145,7 @@ fn convertWeightBlobToF16(
 /// `GPU -> IOSurface -> ANE -> IOSurface -> GPU` round-trip latency against
 /// in-command-buffer GPU `encodeLinearGemv` on `layers[0].o_proj`.
 fn calibrateD5Placement(
-    target: *qwen3.Qwen3Model,
+    target: anytype,
     ap: *AneProjection,
     o_proj: qwen3.LinearBinding,
     in_bind: metal.BufferBinding,
@@ -1787,7 +2245,7 @@ fn calibrateD5Placement(
 
 fn loadInternal(
     allocator: std.mem.Allocator,
-    target: *qwen3.Qwen3Model,
+    target: anytype,
     source: AmfSource,
     config: DraftConfig,
     options: DraftLoadOptions,
@@ -1852,7 +2310,7 @@ fn loadInternal(
             break :blk e;
         },
         .mtp => null,
-        .l1_only, .small_draft => unreachable,
+        .l1_only, .small_draft, .self_recurrent => unreachable,
     };
 
     const enorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp) blk: {
@@ -2070,9 +2528,15 @@ fn loadInternal(
     else
         target.lm_head;
 
+    var fc_blob_opt: ?LoadedBlob = null;
+    var fc_dt_opt: ?quant.WeightDType = null;
     const fc_lin: ?qwen3.LinearBinding = if (fc_entry) |fe| blk: {
         const expected_k: u32 = if (config.format == .eagle3) 3 * h_tgt else 2 * h;
-        break :blk (try loadBlobIntoArena(source, fe, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(fe, h, expected_k));
+        const fdt = try validateLinear2D(fe, h, expected_k);
+        const fblob = try loadBlobIntoArena(source, fe, &weights_arena, weights_buf, options.verify_crcs);
+        fc_blob_opt = fblob;
+        fc_dt_opt = fdt;
+        break :blk fblob.asLinearBinding(fdt);
     } else null;
 
     const enorm_b: ?qwen3.NormBinding = if (enorm_entry) |ee|
@@ -2083,10 +2547,15 @@ fn loadInternal(
         (try loadBlobIntoArena(source, he, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(try validateNorm1D(he, h))
     else
         null;
-    const eh_proj_b: ?qwen3.LinearBinding = if (eh_proj_entry) |pe|
-        (try loadBlobIntoArena(source, pe, &weights_arena, weights_buf, options.verify_crcs)).asLinearBinding(try validateLinear2D(pe, h, 2 * h))
-    else
-        null;
+    var eh_blob_opt: ?LoadedBlob = null;
+    var eh_dt_opt: ?quant.WeightDType = null;
+    const eh_proj_b: ?qwen3.LinearBinding = if (eh_proj_entry) |pe| blk: {
+        const edt = try validateLinear2D(pe, h, 2 * h);
+        const eblob = try loadBlobIntoArena(source, pe, &weights_arena, weights_buf, options.verify_crcs);
+        eh_blob_opt = eblob;
+        eh_dt_opt = edt;
+        break :blk eblob.asLinearBinding(edt);
+    } else null;
 
     const final_norm_b = (try loadBlobIntoArena(source, final_norm_entry, &weights_arena, weights_buf, options.verify_crcs)).asNormBinding(final_norm_dt);
 
@@ -2173,40 +2642,137 @@ fn loadInternal(
         };
     }
 
-    // --- 7. D5 Benchmark-Gated Placement (`auto` vs explicit `gpu` / `ane`, ADR-0008) ---
+    // --- 7. D5 + D13 Benchmark-Gated Placement (`auto`, `gpu`, `ane`, `sme2`, ADR-0008, ADR-0019) ---
     var effective_placement: Placement = .gpu;
     var ane_proj: ?AneProjection = null;
     errdefer if (ane_proj) |*ap| ap.close(&target.compute);
+    var sme_proj: ?*SmeProjectionRuntime = null;
+    errdefer if (sme_proj) |sp| {
+        sp.deinit(allocator);
+        allocator.destroy(sp);
+    };
     var gate_ane_us: f64 = 0.0;
     var gate_gpu_us: f64 = 0.0;
+    var gate_sme2_us: f64 = 0.0;
+    var sme2_proj_bytes: usize = 0;
+    var wired_total_out: u64 = total_wired_bytes;
 
     const can_ane = (l0_o_proj_dtype == .f16 or l0_o_proj_dtype == .bf16) and
         (q_dim % metal.KV_TILE_ROW_ALIGN_F16 == 0) and
         (h % metal.KV_TILE_ROW_ALIGN_F16 == 0);
-    if (options.placement == .ane and can_ane) {
+
+    // Prepare candidate D13 L2-resident (`<= 16 MiB`) SME2 projection for `fc` or `eh_proj`.
+    const want_sme_eval = (options.placement == .cpu_sme2 or options.placement == .auto);
+    var sme_gpu_lin_opt: ?qwen3.LinearBinding = null;
+    var sme_gpu_in_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(xcat_raw.ptr) };
+    var sme_gpu_out_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_raw.ptr) };
+    if (want_sme_eval) {
+        switch (config.format) {
+            .eagle3 => {
+                if (fc_blob_opt != null and fc_dt_opt != null and fc_lin != null) {
+                    sme_proj = try tryInitSmeProjectionRuntime(allocator, fc_blob_opt.?, fc_dt_opt.?, .eagle3_fc, options.max_tree_slots, draft_budget);
+                    sme_gpu_lin_opt = fc_lin;
+                    sme_gpu_in_bind = target.accepted_aux_bind;
+                    sme_gpu_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(hin_raw.ptr) };
+                }
+            },
+            .mtp => {
+                if (eh_blob_opt != null and eh_dt_opt != null and eh_proj_b != null) {
+                    sme_proj = try tryInitSmeProjectionRuntime(allocator, eh_blob_opt.?, eh_dt_opt.?, .mtp_eh_proj, options.max_tree_slots, draft_budget);
+                    sme_gpu_lin_opt = eh_proj_b;
+                    sme_gpu_in_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(xcat_raw.ptr) };
+                    sme_gpu_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_raw.ptr) };
+                }
+            },
+            .eagle2 => {
+                if (fc_blob_opt != null and fc_dt_opt != null and fc_lin != null) {
+                    sme_proj = try tryInitSmeProjectionRuntime(allocator, fc_blob_opt.?, fc_dt_opt.?, .eagle2_fc, options.max_tree_slots, draft_budget);
+                    sme_gpu_lin_opt = fc_lin;
+                    sme_gpu_in_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(xcat_raw.ptr) };
+                    sme_gpu_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_raw.ptr) };
+                }
+            },
+            .l1_only, .small_draft, .self_recurrent => {},
+        }
+    }
+
+    if (options.placement == .cpu_sme2) {
+        if (sme_proj) |sp| {
+            const cal_m: u32 = @min(options.max_tree_slots, 4);
+            const sme_cal = try calibrateD13SmeVsGpu(
+                target,
+                sp,
+                sme_gpu_lin_opt.?,
+                sme_gpu_in_bind,
+                sme_gpu_out_bind,
+                cal_m,
+                options.timeout_ms,
+            );
+            gate_sme2_us = sme_cal.sme_us;
+            gate_gpu_us = sme_cal.gpu_us;
+            sme2_proj_bytes = sme_cal.weight_bytes;
+            wired_total_out += sp.totalWiredBytes();
+            effective_placement = .cpu_sme2;
+        }
+    } else if (options.placement == .ane and can_ane) {
         const wf16 = try convertWeightBlobToF16(allocator, l0_o_proj_blob, l0_o_proj_dtype);
         defer allocator.free(wf16);
         ane_proj = try AneProjection.init(allocator, target.device, &target.compute, q_dim, h, ANE_MAX_BATCH_ROWS, wf16);
         effective_placement = .ane;
-    } else if (options.placement == .auto and can_ane) {
-        const wf16 = try convertWeightBlobToF16(allocator, l0_o_proj_blob, l0_o_proj_dtype);
-        defer allocator.free(wf16);
-        var probe_ap = try AneProjection.init(allocator, target.device, &target.compute, q_dim, h, 1, wf16);
-        const cal = try calibrateD5Placement(
-            target,
-            &probe_ap,
-            layers[0].o_proj,
-            .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(ap_raw.ptr) },
-            .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(po_raw.ptr) },
-            options.timeout_ms,
-        );
-        gate_ane_us = cal.ane_us;
-        gate_gpu_us = cal.gpu_us;
-        probe_ap.close(&target.compute);
-        effective_placement = cal.winner;
-        if (effective_placement == .ane) {
-            ane_proj = try AneProjection.init(allocator, target.device, &target.compute, q_dim, h, ANE_MAX_BATCH_ROWS, wf16);
+    } else if (options.placement == .auto) {
+        var best_us: f64 = std.math.inf(f64);
+        if (can_ane) {
+            const wf16 = try convertWeightBlobToF16(allocator, l0_o_proj_blob, l0_o_proj_dtype);
+            defer allocator.free(wf16);
+            var probe_ap = try AneProjection.init(allocator, target.device, &target.compute, q_dim, h, 1, wf16);
+            const cal = try calibrateD5Placement(
+                target,
+                &probe_ap,
+                layers[0].o_proj,
+                .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(ap_raw.ptr) },
+                .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(po_raw.ptr) },
+                options.timeout_ms,
+            );
+            gate_ane_us = cal.ane_us;
+            gate_gpu_us = cal.gpu_us;
+            probe_ap.close(&target.compute);
+            effective_placement = cal.winner;
+            best_us = @min(cal.ane_us, cal.gpu_us);
+            if (effective_placement == .ane) {
+                ane_proj = try AneProjection.init(allocator, target.device, &target.compute, q_dim, h, ANE_MAX_BATCH_ROWS, wf16);
+            }
         }
+        if (sme_proj) |sp| {
+            const cal_m: u32 = @min(options.max_tree_slots, 4);
+            const sme_cal = try calibrateD13SmeVsGpu(
+                target,
+                sp,
+                sme_gpu_lin_opt.?,
+                sme_gpu_in_bind,
+                sme_gpu_out_bind,
+                cal_m,
+                options.timeout_ms,
+            );
+            gate_sme2_us = sme_cal.sme_us;
+            if (gate_gpu_us == 0.0) gate_gpu_us = sme_cal.gpu_us;
+            sme2_proj_bytes = sme_cal.weight_bytes;
+            if (sme_cal.prefer_sme2 and (!can_ane or sme_cal.sme_us <= best_us)) {
+                if (ane_proj) |*ap| {
+                    ap.close(&target.compute);
+                    ane_proj = null;
+                }
+                wired_total_out += sp.totalWiredBytes();
+                effective_placement = .cpu_sme2;
+            } else {
+                sp.deinit(allocator);
+                allocator.destroy(sp);
+                sme_proj = null;
+            }
+        }
+    } else if (sme_proj) |sp| {
+        sp.deinit(allocator);
+        allocator.destroy(sp);
+        sme_proj = null;
     }
 
     return .{
@@ -2215,13 +2781,16 @@ fn loadInternal(
         .effective_placement = effective_placement,
         .placement_gate_ane_us = gate_ane_us,
         .placement_gate_gpu_us = gate_gpu_us,
+        .placement_gate_sme2_us = gate_sme2_us,
+        .sme2_proj_bytes = sme2_proj_bytes,
+        .sme2_eval_count = 0,
         .max_seq_len = max_seq_len,
         .chunk_tokens = options.chunk_tokens,
         .num_chunks = num_chunks,
         .max_tree_slots = options.max_tree_slots,
         .seq_len = 0,
         .timeout_ms = options.timeout_ms,
-        .total_wired_bytes = total_wired_bytes,
+        .total_wired_bytes = wired_total_out,
         .weights_arena = weights_arena,
         .weights_buf = weights_buf,
         .scratch_arena = scratch_arena,
@@ -2237,12 +2806,16 @@ fn loadInternal(
         .eh_proj = eh_proj_b,
         .final_norm = final_norm_b,
         .ane_proj = ane_proj,
+        .sme_proj = sme_proj,
         .token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, tok_raw)),
         .parent_slots_host = @alignCast(std.mem.bytesAsSlice(u32, par_raw)),
         .positions_host = @alignCast(std.mem.bytesAsSlice(u32, pos_raw)),
         .ancestor_masks_host = @alignCast(std.mem.bytesAsSlice(u64, msk_raw)),
         .topk_host = @alignCast(std.mem.bytesAsSlice(moe.TopKCandidate, tk_out_raw)),
         .hidden_pool_host = @alignCast(std.mem.bytesAsSlice(f16, hp_raw)),
+        .h_in_host = @alignCast(std.mem.bytesAsSlice(f16, hin_raw)),
+        .emb_host = @alignCast(std.mem.bytesAsSlice(f16, emb_raw)),
+        .x_host = @alignCast(std.mem.bytesAsSlice(f16, x_raw)),
         .token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tok_raw.ptr) },
         .parent_slots_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(par_raw.ptr) },
         .positions_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(pos_raw.ptr) },
@@ -2387,7 +2960,7 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
             try add2d(allocator, &recs, "eh_proj.weight", .dense, h, 2 * h, 0.5 / @sqrt(@as(f32, @floatFromInt(2 * h))), seed + tidx);
             tidx += 1;
         },
-        .l1_only, .small_draft => unreachable,
+        .l1_only, .small_draft, .self_recurrent => unreachable,
     }
 
     var nbuf: [64]u8 = undefined;
@@ -2841,7 +3414,7 @@ test "D4 SmallDraftModel loads standalone Qwen3 draft, prefills, seeds L1 chain,
     try std.testing.expectError(error.InvalidArgument, sd.rewindKvLen(8));
 }
 
-fn buildSyntheticTargetBf16ForTest(allocator: std.mem.Allocator, cfg: qwen3.ModelConfig, seed: u64) ![]u8 {
+pub fn buildSyntheticTargetBf16ForTest(allocator: std.mem.Allocator, cfg: qwen3.ModelConfig, seed: u64) ![]u8 {
     var recs: std.ArrayList(SynthRec) = .empty;
     defer {
         for (recs.items) |r| {
@@ -2960,4 +3533,115 @@ fn buildSyntheticTargetBf16ForTest(allocator: std.mem.Allocator, cfg: qwen3.Mode
     hdr.header_crc32 = amf.computeHeaderCrc32(&hdr);
     @memcpy(image[0..@sizeOf(amf.Header)], std.mem.asBytes(&hdr));
     return image;
+}
+
+test "D13: Placement.cpu_sme2 executes EAGLE-3 fc & MTP eh_proj on P-core SME2 with parity vs GPU" {
+    const allocator = std.testing.allocator;
+    const tgt_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .vocab_size = 128,
+        .hidden_size = 64,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .max_position_embeddings = 256,
+        .rope_theta = 10_000.0,
+        .rms_norm_eps = 1e-6,
+        .tie_word_embeddings = true,
+    };
+    const tgt_img = try buildSyntheticTargetBf16ForTest(allocator, tgt_cfg, 12345);
+    defer allocator.free(tgt_img);
+
+    var target = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_img, tgt_cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+    });
+    defer target.deinit(allocator);
+
+    const prompt = [_]u32{ 5, 19, 41 };
+    _ = try target.prefillChunk(&prompt, 0, true);
+
+    // 1. Test EAGLE-3 `fc` on `.gpu` vs `.cpu_sme2`!
+    const e3_cfg: DraftConfig = .{
+        .format = .eagle3,
+        .vocab_size = 128,
+        .draft_vocab_size = 64,
+        .hidden_size = 64,
+        .target_hidden_size = 64,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rope_theta = 10_000.0,
+    };
+    const e3_img = try buildSyntheticDraftAmfImage(allocator, e3_cfg, 54321);
+    defer allocator.free(e3_img);
+
+    var e3_gpu = try DraftHead.loadFromBytes(allocator, &target, e3_img, e3_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 128,
+        .max_tree_slots = 16,
+    });
+    defer e3_gpu.deinit(allocator, &target);
+
+    var e3_sme = try DraftHead.loadFromBytes(allocator, &target, e3_img, e3_cfg, .{
+        .placement = .cpu_sme2,
+        .max_seq_len = 128,
+        .max_tree_slots = 16,
+    });
+    defer e3_sme.deinit(allocator, &target);
+
+    try std.testing.expectEqual(Placement.cpu_sme2, e3_sme.effective_placement);
+    try std.testing.expect(e3_sme.placement_gate_sme2_us > 0.0);
+    try std.testing.expect(e3_sme.placement_gate_gpu_us > 0.0);
+    try std.testing.expect(e3_sme.sme2_proj_bytes > 0);
+    try std.testing.expect(e3_sme.sme2_proj_bytes <= sme.MAX_L2_DRAFT_PROJ_BYTES);
+
+    try e3_gpu.syncAccepted(&target, &prompt, target.accepted_aux_bind, 0, 4);
+    try e3_sme.syncAccepted(&target, &prompt, target.accepted_aux_bind, 0, 4);
+    try std.testing.expectEqual(@as(u64, 1), e3_sme.sme2_eval_count);
+    try std.testing.expectEqual(e3_gpu.rootCandidates()[0].token_id, e3_sme.rootCandidates()[0].token_id);
+
+    // 2. Test MTP dual-norm `eh_proj` on `.gpu` vs `.cpu_sme2`!
+    const mtp_cfg: DraftConfig = .{
+        .format = .mtp,
+        .vocab_size = 128,
+        .draft_vocab_size = 128,
+        .hidden_size = 64,
+        .target_hidden_size = 64,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .rope_theta = 10_000.0,
+        .share_embed_tokens = true,
+        .share_lm_head = true,
+    };
+    const mtp_img = try buildSyntheticDraftAmfImage(allocator, mtp_cfg, 67890);
+    defer allocator.free(mtp_img);
+
+    var mtp_gpu = try DraftHead.loadFromBytes(allocator, &target, mtp_img, mtp_cfg, .{
+        .placement = .gpu,
+        .max_seq_len = 128,
+        .max_tree_slots = 16,
+    });
+    defer mtp_gpu.deinit(allocator, &target);
+
+    var mtp_sme = try DraftHead.loadFromBytes(allocator, &target, mtp_img, mtp_cfg, .{
+        .placement = .cpu_sme2,
+        .max_seq_len = 128,
+        .max_tree_slots = 16,
+    });
+    defer mtp_sme.deinit(allocator, &target);
+
+    try std.testing.expectEqual(Placement.cpu_sme2, mtp_sme.effective_placement);
+    try mtp_gpu.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+    try mtp_sme.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
+    try std.testing.expectEqual(@as(u64, 1), mtp_sme.sme2_eval_count);
+    try std.testing.expectEqual(mtp_gpu.rootCandidates()[0].token_id, mtp_sme.rootCandidates()[0].token_id);
 }
