@@ -9,14 +9,12 @@
 //! `src/cpu/sme2_kernels.s`, entered once per macro-task (`smstart`..`smstop`).
 
 const std = @import("std");
-const aminfer = @import("aminfer");
-
-const sysinfo = aminfer.sysinfo;
-const qos = aminfer.qos;
-const vmstat = aminfer.vmstat;
-const page = aminfer.page;
-const quant = aminfer.quant;
-const metal = aminfer.metal;
+const sysinfo = @import("../platform/sysinfo.zig");
+const qos = @import("../platform/qos.zig");
+const vmstat = @import("../platform/vmstat.zig");
+const page = @import("../mem/page.zig");
+const quant = @import("../quant/spec.zig");
+const metal = @import("../bridge/metal.zig");
 
 /// Apple M4+ Streaming Vector Length in bytes (512 bits).
 pub const SVL_BYTES: usize = 64;

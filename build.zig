@@ -66,7 +66,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addImport("aminfer", mod);
     mod.addImport("apple_bridge", bridge_c.createModule());
     mod.addAnonymousImport("aminfer_metallib", .{ .root_source_file = metallib });
     mod.addIncludePath(b.path("src/bridge"));
@@ -91,31 +90,34 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     b.step("run", "Run the aminfer CLI").dependOn(&run_cmd.step);
 
-    // Standalone SME2 core test module so `zig build test` exercises all C11/C12/S7
-    // tests without requiring edits to `src/root.zig`.
-    const sme_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/cpu/sme.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    sme_test_mod.addImport("aminfer", mod);
-    sme_test_mod.addImport("apple_bridge", bridge_c.createModule());
-    addMacosSdkPaths(b, sme_test_mod);
-    for (frameworks) |name| sme_test_mod.linkFramework(name, .{});
+    const aux_wf = b.addWriteFiles();
 
-    const sme_test = b.addTest(.{ .root_module = sme_test_mod });
+    // Dedicated SME2-only test step (`zig build test-sme`); full `zig build test`
+    // already exercises `cpu/sme.zig` and `runtime/rng.zig` once via `src/root.zig`.
+    const sme_only_main = aux_wf.add("sme_only_test.zig",
+        \\test {
+        \\    _ = @import("aminfer").sme;
+        \\}
+        \\
+    );
+    const sme_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = sme_only_main,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "aminfer", .module = mod }},
+        }),
+    });
     const run_sme_test = b.addRunArtifact(sme_test);
     b.step("test-sme", "Run SME2 microkernel, canary, parity and fallback tests").dependOn(&run_sme_test.step);
 
-    const s7_wf = b.addWriteFiles();
-    const s7_main = s7_wf.add("s7_standalone_main.zig",
+    const s7_main = aux_wf.add("s7_standalone_main.zig",
         \\const std = @import("std");
-        \\const sme = @import("sme");
+        \\const aminfer = @import("aminfer");
         \\
         \\pub fn main() !void {
         \\    const gpa = std.heap.c_allocator;
-        \\    const report = try sme.runSpikeS7Standalone(gpa);
+        \\    const report = try aminfer.sme.runSpikeS7Standalone(gpa);
         \\    var aw: std.Io.Writer.Allocating = .init(gpa);
         \\    defer aw.deinit();
         \\    try report.write(&aw.writer);
@@ -135,7 +137,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = s7_main,
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "sme", .module = sme_test_mod }},
+            .imports = &.{.{ .name = "aminfer", .module = mod }},
         }),
     });
     const run_s7 = b.addRunArtifact(s7_exe);
@@ -144,7 +146,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
-    test_step.dependOn(&run_sme_test.step);
 }
 
 /// Overriding the minimum OS version makes the target non-native, and Zig then

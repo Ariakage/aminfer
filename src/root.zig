@@ -27,6 +27,8 @@ pub const aio = @import("storage/aio.zig");
 pub const cache = @import("storage/cache.zig");
 pub const wavefront = @import("ane/wavefront.zig");
 pub const predictor = @import("ane/predictor.zig");
+pub const sme = @import("cpu/sme.zig");
+pub const rng = @import("runtime/rng.zig");
 
 test {
     _ = metal;
@@ -55,4 +57,6 @@ test {
     _ = cache;
     _ = wavefront;
     _ = predictor;
+    _ = sme;
+    _ = rng;
 }
