@@ -32,13 +32,21 @@ class CliTests(unittest.TestCase):
         self.assertIn("expert-heat", text)
         self.assertIn("export-coreml", text)
 
-    def test_pack_amf_help_lists_m25_options(self) -> None:
+    def test_pack_amf_help_lists_m25_and_m4_options(self) -> None:
         out = io.StringIO()
         with redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
             main(["pack-amf", "--help"])
         self.assertEqual(ctx.exception.code, 0)
         text = out.getvalue()
-        for flag in ("--dtype", "--tie-word-embeddings", "--keep-tied-lm-head", "--exclude-tensors", "index.json"):
+        for flag in (
+            "--dtype",
+            "--tie-word-embeddings",
+            "--keep-tied-lm-head",
+            "--exclude-tensors",
+            "--heat-profile",
+            "--cold-experts-per-layer",
+            "index.json",
+        ):
             self.assertIn(flag, text)
         for mode in ("auto", "f16", "bf16"):
             self.assertIn(mode, text)
@@ -52,13 +60,28 @@ class CliTests(unittest.TestCase):
         for token in ("--format", "--preset", "eagle3", "eagle2", "mtp", "--output-dir"):
             self.assertIn(token, text)
 
-    def test_planned_subcommands_report_unimplemented(self) -> None:
-        for cmd in ("expert-heat", "export-coreml"):
-            err = io.StringIO()
-            with redirect_stderr(err):
-                code = main([cmd])
-            self.assertEqual(code, 2)
-            self.assertIn("docs/status.md", err.getvalue())
+    def test_m4_subcommands_help_exits_zero(self) -> None:
+        for cmd, expected_tokens in (
+            (
+                "expert-heat",
+                ("--input", "--calibration-jsonl", "--top-k", "--cold-experts-per-layer", "--wired-budget-mib"),
+            ),
+            (
+                "export-coreml",
+                ("--kind", "expert-predictor", "attention-qkv", "draft-head", "--amf", "--output", "--lookahead"),
+            ),
+            (
+                "retag-cold",
+                ("--input", "--output", "--heat-profile", "--cold-experts-per-layer", "--cold-experts"),
+            ),
+        ):
+            out = io.StringIO()
+            with redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+                main([cmd, "--help"])
+            self.assertEqual(ctx.exception.code, 0)
+            text = out.getvalue()
+            for tok in expected_tokens:
+                self.assertIn(tok, text)
 
 
 if __name__ == "__main__":

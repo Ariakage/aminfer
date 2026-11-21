@@ -3,13 +3,29 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import sys
 import time
 from collections.abc import Sequence
 
 from aminfer_tools import APPLE_PAGE_SIZE
-from aminfer_tools.amf import DTYPE_MODES, pack_amf_from_safetensors
+from aminfer_tools.amf import (
+    DTYPE_MODES,
+    load_cold_experts_from_heat_profile,
+    pack_amf_from_safetensors,
+    retag_amf_cold_experts,
+)
+from aminfer_tools.coreml import (
+    COREML_KINDS,
+    COREML_OPS,
+    DRAFT_STAGES,
+    compile_mlpackage,
+    export_attention_qkv,
+    export_draft_head,
+    export_expert_predictor,
+)
+from aminfer_tools.heat import DEFAULT_SAMPLE_TOKENS, compute_expert_heat, write_heat_profile
 from aminfer_tools.synth import (
     DRAFT_DTYPES,
     DRAFT_FORMATS,
@@ -116,6 +132,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated LAYER:EXPERT pairs to mark as cold_expert (e.g. 0:2,0:5)",
     )
     pack.add_argument(
+        "--heat-profile",
+        type=pathlib.Path,
+        default=None,
+        help="Schema-v1 JSON heat profile from `expert-heat` specifying cold experts",
+    )
+    pack.add_argument(
+        "--cold-experts-per-layer",
+        type=int,
+        default=None,
+        help="Override cold expert count per layer when using --heat-profile",
+    )
+    pack.add_argument(
         "--all-experts-cold",
         action="store_true",
         help="Mark every expert tensor as cold_expert",
@@ -124,6 +152,40 @@ def _build_parser() -> argparse.ArgumentParser:
         "--exclude-tensors",
         default=None,
         help="Comma-separated tensor names to omit from the output .amf (e.g. embed_tokens.weight)",
+    )
+
+    retag = sub.add_parser(
+        "retag-cold",
+        help="Retag HOT_EXPERT / COLD_EXPERT directory entries in an existing .amf without rewriting blobs",
+    )
+    retag.add_argument("--input", required=True, type=pathlib.Path, help="Input .amf path")
+    retag.add_argument(
+        "--output",
+        type=pathlib.Path,
+        default=None,
+        help="Optional output .amf path (default: update header and directory in place)",
+    )
+    retag.add_argument(
+        "--cold-experts",
+        default=None,
+        help="Comma-separated LAYER:EXPERT pairs to mark as cold_expert",
+    )
+    retag.add_argument(
+        "--heat-profile",
+        type=pathlib.Path,
+        default=None,
+        help="Schema-v1 JSON heat profile specifying cold experts",
+    )
+    retag.add_argument(
+        "--cold-experts-per-layer",
+        type=int,
+        default=None,
+        help="Override cold expert count per layer when using --heat-profile",
+    )
+    retag.add_argument(
+        "--all-experts-cold",
+        action="store_true",
+        help="Mark every expert tensor as cold_expert",
     )
 
     synth = sub.add_parser(
@@ -216,13 +278,174 @@ def _build_parser() -> argparse.ArgumentParser:
     draft_lm.add_argument("--include-lm-head", dest="include_lm_head", action="store_const", const=True, default=None)
     draft_lm.add_argument("--no-lm-head", dest="include_lm_head", action="store_const", const=False)
 
-    sub.add_parser(
+    heat = sub.add_parser(
         "expert-heat",
-        help="Compute offline MoE expert activation heat statistics (planned: M4)",
+        help="Compute offline MoE expert activation heat statistics and hot/cold split JSON (W8)",
     )
-    sub.add_parser(
+    heat.add_argument(
+        "--input",
+        required=True,
+        type=pathlib.Path,
+        help="Input .amf file, .safetensors file, model.safetensors.index.json, or checkpoint directory",
+    )
+    heat.add_argument(
+        "--output",
+        type=pathlib.Path,
+        default=None,
+        help="Output JSON path (default: print JSON to stdout)",
+    )
+    heat.add_argument(
+        "--calibration-jsonl",
+        type=pathlib.Path,
+        default=None,
+        help="Optional JSONL calibration file (router trace {'layer','experts'} or token IDs {'token_ids'})",
+    )
+    heat.add_argument(
+        "--top-k",
+        type=int,
+        default=8,
+        help="Number of active experts selected per token (default: 8)",
+    )
+    heat_budget = heat.add_mutually_exclusive_group()
+    heat_budget.add_argument(
+        "--cold-experts-per-layer",
+        type=int,
+        default=None,
+        help="Number of coldest experts per layer to designate as cold_expert",
+    )
+    heat_budget.add_argument(
+        "--wired-budget-mib",
+        type=float,
+        default=None,
+        help="Target wired model weight budget in MiB; experts exceeding the budget are marked cold",
+    )
+    heat.add_argument(
+        "--slot-reserve-mib",
+        type=float,
+        default=0.0,
+        help="Optional MiB reserved for cold-expert slots when computing --wired-budget-mib (default: 0)",
+    )
+    heat.add_argument(
+        "--sample-tokens",
+        type=int,
+        default=DEFAULT_SAMPLE_TOKENS,
+        help=f"Built-in representative token sample count when --calibration-jsonl is omitted (default: {DEFAULT_SAMPLE_TOKENS})",
+    )
+    heat.add_argument("--model-id", default=None, help="Override model_id recorded in the heat JSON")
+    heat.add_argument("--group-size", type=int, default=64, help="Quantization group size (default: 64)")
+
+    coreml = sub.add_parser(
         "export-coreml",
-        help="Export CoreML .mlpackage graphs for the Apple Neural Engine (planned: M4)",
+        help="Export pure-stdlib CoreML .mlpackage bundles for the Apple Neural Engine (W7)",
+    )
+    coreml.add_argument(
+        "--kind",
+        required=True,
+        choices=COREML_KINDS,
+        help="CoreML graph kind: expert-predictor (A2), attention-qkv (A1), or draft-head (D4/D5)",
+    )
+    coreml.add_argument(
+        "--output",
+        required=True,
+        type=pathlib.Path,
+        help="Output .mlpackage path (or directory for multi-window expert-predictor export)",
+    )
+    coreml.add_argument(
+        "--amf",
+        type=pathlib.Path,
+        default=None,
+        help="Optional .amf file to extract/dequantize real weights from (omit for synthetic weights)",
+    )
+    coreml.add_argument(
+        "--op",
+        choices=COREML_OPS,
+        default="inner-product",
+        help="Linear operator layout: inner-product ([M, C], default) or conv1x1 ([C, 1, M])",
+    )
+    coreml.add_argument("--model-id", default=None, help="Override model_id recorded in CoreML metadata")
+    coreml.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed for synthetic weights")
+    coreml.add_argument(
+        "--layers",
+        default=None,
+        help="Layer range/list for expert-predictor (e.g. 0..47, 1..2, 0,2,4)",
+    )
+    coreml.add_argument(
+        "--base-layer",
+        type=int,
+        default=None,
+        help="Base layer index for single-window expert-predictor (predicts base+1..base+lookahead)",
+    )
+    coreml.add_argument(
+        "--lookahead",
+        type=int,
+        default=2,
+        help="Number of upcoming layers predicted by expert-predictor (default: 2)",
+    )
+    coreml.add_argument(
+        "--pack-all-layers",
+        action="store_true",
+        help="Pack all selected --layers routers into one combined expert-predictor .mlpackage",
+    )
+    coreml.add_argument(
+        "--layer",
+        type=int,
+        default=0,
+        help="Transformer layer index for attention-qkv or draft-head (default: 0)",
+    )
+    coreml.add_argument(
+        "--seq-len",
+        type=int,
+        default=512,
+        help="Chunk token length for attention-qkv (default: 512, ADR-0010)",
+    )
+    coreml.add_argument(
+        "--include-o-proj",
+        action="store_true",
+        help="Include output projection (attn_in -> o_out) in attention-qkv bundle",
+    )
+    coreml.add_argument(
+        "--stage",
+        choices=DRAFT_STAGES,
+        default="ffn",
+        help="Graph stage for draft-head: ffn (SwiGLU, default), fc (EAGLE-3), or linear",
+    )
+    coreml.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch/token row count M for expert-predictor and draft-head (default: 32)",
+    )
+    coreml.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help="Hidden dimension for synthetic exports (default: 2048 for predictor/attn, 1024 for draft)",
+    )
+    coreml.add_argument(
+        "--num-experts",
+        type=int,
+        default=128,
+        help="Expert count per layer for synthetic expert-predictor (default: 128)",
+    )
+    coreml.add_argument("--q-dim", type=int, default=4096, help="Q projection width for synthetic attention-qkv")
+    coreml.add_argument("--kv-dim", type=int, default=512, help="K/V projection width for synthetic attention-qkv")
+    coreml.add_argument(
+        "--intermediate-size",
+        type=int,
+        default=3072,
+        help="FFN intermediate width for synthetic draft-head (default: 3072)",
+    )
+    coreml.add_argument(
+        "--out-dim",
+        type=int,
+        default=None,
+        help="Output width for synthetic draft-head linear/fc stage",
+    )
+    coreml.add_argument(
+        "--verify-compile",
+        type=pathlib.Path,
+        default=None,
+        help="Optional directory to verify exported .mlpackage via `xcrun coremlcompiler compile`",
     )
     return parser
 
@@ -244,6 +467,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             dtype_mode=args.dtype,
             tie_word_embeddings=args.tie_word_embeddings,
             exclude_tensors=excludes,
+            heat_profile=args.heat_profile,
+            cold_experts_per_layer=args.cold_experts_per_layer,
         )
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
@@ -254,6 +479,120 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"packed {len(metas)} tensors into {args.output} ({total_bytes} bytes) "
             f"in {elapsed:.1f} s [{dtype_summary}]"
+        )
+        return 0
+
+    if args.command == "retag-cold":
+        cold = _parse_cold_experts(args.cold_experts)
+        if args.heat_profile is not None:
+            cold.update(
+                load_cold_experts_from_heat_profile(
+                    args.heat_profile,
+                    cold_experts_per_layer=args.cold_experts_per_layer,
+                )
+            )
+        elif args.cold_experts_per_layer is not None:
+            parser.error("--cold-experts-per-layer requires --heat-profile")
+        started = time.monotonic()
+        hot_count, cold_count = retag_amf_cold_experts(
+            args.input,
+            cold,
+            output_path=args.output,
+            all_experts_cold=args.all_experts_cold,
+        )
+        elapsed = time.monotonic() - started
+        dst = args.output if args.output is not None else args.input
+        print(
+            f"retagged {dst}: hot_expert_tensors={hot_count}, cold_expert_tensors={cold_count} "
+            f"in {elapsed:.2f} s"
+        )
+        return 0
+
+    if args.command == "expert-heat":
+        started = time.monotonic()
+        profile = compute_expert_heat(
+            args.input,
+            calibration_jsonl=args.calibration_jsonl,
+            top_k=args.top_k,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            wired_budget_mib=args.wired_budget_mib,
+            slot_reserve_mib=args.slot_reserve_mib,
+            sample_tokens=args.sample_tokens,
+            model_id=args.model_id,
+            group_size=args.group_size,
+        )
+        elapsed = time.monotonic() - started
+        if args.output is not None:
+            write_heat_profile(profile, args.output)
+            print(
+                f"wrote heat profile for {profile.model_id} "
+                f"({profile.num_layers} layers x {profile.num_experts} experts, top_k={profile.top_k}, "
+                f"hot={profile.total_hot_experts}, cold={profile.total_cold_experts}, "
+                f"mode={profile.calibration_mode}) to {args.output} in {elapsed:.2f} s"
+            )
+        else:
+            print(json.dumps(profile.to_dict(), indent=2))
+        return 0
+
+    if args.command == "export-coreml":
+        started = time.monotonic()
+        if args.kind == "expert-predictor":
+            res = export_expert_predictor(
+                args.output,
+                amf_path=args.amf,
+                layers_spec=args.layers,
+                base_layer=args.base_layer,
+                lookahead=args.lookahead,
+                batch_size=args.batch_size,
+                op=args.op,
+                pack_all_layers=args.pack_all_layers,
+                hidden_size=args.hidden_size if args.hidden_size is not None else 2048,
+                num_experts=args.num_experts,
+                seed=args.seed,
+                model_id=args.model_id,
+            )
+        elif args.kind == "attention-qkv":
+            res = export_attention_qkv(
+                args.output,
+                amf_path=args.amf,
+                layer=args.layer,
+                seq_len=args.seq_len,
+                op=args.op,
+                include_o_proj=args.include_o_proj,
+                hidden_size=args.hidden_size if args.hidden_size is not None else 2048,
+                q_dim=args.q_dim,
+                kv_dim=args.kv_dim,
+                seed=args.seed,
+                model_id=args.model_id,
+            )
+        elif args.kind == "draft-head":
+            res = export_draft_head(
+                args.output,
+                amf_path=args.amf,
+                layer=args.layer,
+                stage=args.stage,
+                batch_size=args.batch_size,
+                op=args.op,
+                hidden_size=args.hidden_size if args.hidden_size is not None else 1024,
+                intermediate_size=args.intermediate_size,
+                out_dim=args.out_dim,
+                seed=args.seed,
+                model_id=args.model_id,
+            )
+        else:
+            parser.error(f"unsupported CoreML kind {args.kind!r}")
+
+        if args.verify_compile is not None:
+            for pkg in res.bundle_paths:
+                compile_mlpackage(pkg, args.verify_compile)
+
+        elapsed = time.monotonic() - started
+        in_desc = ", ".join(f"{t.name}{list(t.shape)}" for t in res.inputs)
+        out_desc = ", ".join(f"{t.name}{list(t.shape)}" for t in res.outputs)
+        print(
+            f"exported CoreML {res.kind} ({res.op}, {len(res.bundle_paths)} bundle(s), "
+            f"{res.weight_bytes} weight bytes) -> {res.output_path} "
+            f"[{in_desc} -> {out_desc}] in {elapsed:.2f} s"
         )
         return 0
 

@@ -1003,6 +1003,8 @@ def pack_amf_from_safetensors(
     dtype_mode: str = "auto",
     tie_word_embeddings: bool | None = None,
     exclude_tensors: Iterable[str] = (),
+    heat_profile: pathlib.Path | None = None,
+    cold_experts_per_layer: int | None = None,
 ) -> list[PackedTensorMeta]:
     """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
 
@@ -1015,11 +1017,24 @@ def pack_amf_from_safetensors(
     `.weight/.scales/.biases` triples always pack as `q3_affine` / `q4_affine`
     with `half2(scale, bias)` parameters. `tie_word_embeddings=None` reads
     `config.json` next to the input; when tied (and shapes match), a duplicate
-    `lm_head` is not emitted.
+    `lm_head` is not emitted. When `heat_profile` is given, its cold-expert set
+    (optionally overridden by `cold_experts_per_layer`) is unioned with
+    `cold_experts`.
     """
     model_id_bytes = model_id.encode("utf-8")
     if len(model_id_bytes) == 0 or len(model_id_bytes) > 63:
         raise ValueError(f"model_id must be 1..63 UTF-8 bytes: {model_id!r}")
+
+    effective_cold: set[tuple[int, int]] = set(cold_experts)
+    if heat_profile is not None:
+        effective_cold.update(
+            load_cold_experts_from_heat_profile(
+                pathlib.Path(heat_profile),
+                cold_experts_per_layer=cold_experts_per_layer,
+            )
+        )
+    elif cold_experts_per_layer is not None:
+        raise ValueError("cold_experts_per_layer requires heat_profile in pack_amf_from_safetensors")
 
     resolved = resolve_checkpoint(pathlib.Path(input_path))
     tie = _load_tie_flag(resolved.config_path) if tie_word_embeddings is None else tie_word_embeddings
@@ -1028,7 +1043,7 @@ def pack_amf_from_safetensors(
         tensors,
         group_size=group_size,
         dtype_mode=dtype_mode,
-        cold_experts=cold_experts,
+        cold_experts=effective_cold,
         all_experts_cold=all_experts_cold,
         tie_word_embeddings=tie,
         exclude_tensors=exclude_tensors,
@@ -1146,3 +1161,618 @@ def _pack_header(model_id_bytes: bytes, tensor_count: int, dir_offset: int, dir_
     ]
     fields[10] = _crc32(HEADER_STRUCT.pack(*fields))
     return HEADER_STRUCT.pack(*fields)
+
+
+# ---------------------------------------------------------------------------
+# Streaming .amf v0 reader, pure-stdlib dequantizers, and cold-expert retagging
+# ---------------------------------------------------------------------------
+
+# 12-bit lookup table mapping 4 packed 3-bit unsigned codes -> (c0, c1, c2, c3).
+_Q3_LUT12: tuple[tuple[int, int, int, int], ...] = tuple(
+    (v & 0x07, (v >> 3) & 0x07, (v >> 6) & 0x07, (v >> 9) & 0x07) for v in range(4096)
+)
+
+# 8-bit lookup table mapping 2 packed 4-bit unsigned codes -> (lo, hi).
+_Q4_LUT8: tuple[tuple[int, int], ...] = tuple((b & 0x0F, b >> 4) for b in range(256))
+
+
+@dataclass(frozen=True)
+class AmfHeader:
+    version: int
+    flags: int
+    page_size: int
+    checksum_algo: int
+    tensor_count: int
+    directory_offset: int
+    directory_bytes: int
+    directory_crc32: int
+    header_crc32: int
+    model_id: str
+
+
+def bf16_bytes_to_f32_list(raw: bytes | bytearray | memoryview) -> list[float]:
+    """Widen little-endian bfloat16 bytes to Python floats (exact)."""
+    if len(raw) % 2 != 0:
+        raise ValueError(f"bf16 byte length must be even, got {len(raw)}")
+    f32_bytes = _bf16_to_f32_bytes(raw)
+    return list(struct.unpack(f"<{len(raw) // 2}f", f32_bytes))
+
+
+def f16_bytes_to_f32_list(raw: bytes | bytearray | memoryview) -> list[float]:
+    """Widen little-endian IEEE float16 bytes to Python floats."""
+    if len(raw) % 2 != 0:
+        raise ValueError(f"f16 byte length must be even, got {len(raw)}")
+    return list(struct.unpack(f"<{len(raw) // 2}e", raw))
+
+
+def f32_bytes_to_f32_list(raw: bytes | bytearray | memoryview) -> list[float]:
+    """Unpack little-endian IEEE float32 bytes to Python floats."""
+    if len(raw) % 4 != 0:
+        raise ValueError(f"f32 byte length must be a multiple of 4, got {len(raw)}")
+    return list(struct.unpack(f"<{len(raw) // 4}f", raw))
+
+
+def f32_values_to_f16_bytes(values: Sequence[float], *, what: str = "tensor") -> bytes:
+    """Pack float values as little-endian IEEE float16 bytes."""
+    try:
+        return struct.pack(f"<{len(values)}e", *values)
+    except OverflowError as exc:
+        raise ValueError(f"{what}: value exceeds IEEE float16 range (|x| > 65504)") from exc
+
+
+def dequantize_q3_row_f32(
+    row_data: bytes | bytearray | memoryview,
+    row_params: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    group_size: int = 64,
+) -> list[float]:
+    """Dequantize one row of MLX-compatible 3-bit affine packed weights to floats."""
+    if k <= 0 or group_size <= 0 or group_size % 8 != 0 or k % group_size != 0:
+        raise ValueError(f"invalid q3 geometry: k={k}, group_size={group_size}")
+    groups = k // group_size
+    expected_data = (k * 3) // 8
+    expected_params = groups * 4
+    if len(row_data) != expected_data:
+        raise ValueError(f"q3 row_data length {len(row_data)} != expected {expected_data}")
+    if len(row_params) != expected_params:
+        raise ValueError(f"q3 row_params length {len(row_params)} != expected {expected_params}")
+
+    sbs = struct.unpack(f"<{groups * 2}e", row_params)
+    blocks_per_group = group_size // 8
+    lut12 = _Q3_LUT12
+    out = [0.0] * k
+    pos = 0
+    off = 0
+    sb_idx = 0
+    for _ in range(groups):
+        s = sbs[sb_idx]
+        b = sbs[sb_idx + 1]
+        sb_idx += 2
+        v = (b, b + s, b + 2.0 * s, b + 3.0 * s, b + 4.0 * s, b + 5.0 * s, b + 6.0 * s, b + 7.0 * s)
+        for _ in range(blocks_per_group):
+            word = row_data[off] | (row_data[off + 1] << 8) | (row_data[off + 2] << 16)
+            off += 3
+            a0, a1, a2, a3 = lut12[word & 0xFFF]
+            b0, b1, b2, b3 = lut12[word >> 12]
+            out[pos] = v[a0]
+            out[pos + 1] = v[a1]
+            out[pos + 2] = v[a2]
+            out[pos + 3] = v[a3]
+            out[pos + 4] = v[b0]
+            out[pos + 5] = v[b1]
+            out[pos + 6] = v[b2]
+            out[pos + 7] = v[b3]
+            pos += 8
+    return out
+
+
+def dequantize_q4_row_f32(
+    row_data: bytes | bytearray | memoryview,
+    row_params: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    group_size: int = 64,
+) -> list[float]:
+    """Dequantize one row of MLX-compatible 4-bit affine packed weights to floats."""
+    if k <= 0 or group_size <= 0 or group_size % 2 != 0 or k % group_size != 0:
+        raise ValueError(f"invalid q4 geometry: k={k}, group_size={group_size}")
+    groups = k // group_size
+    expected_data = k // 2
+    expected_params = groups * 4
+    if len(row_data) != expected_data:
+        raise ValueError(f"q4 row_data length {len(row_data)} != expected {expected_data}")
+    if len(row_params) != expected_params:
+        raise ValueError(f"q4 row_params length {len(row_params)} != expected {expected_params}")
+
+    sbs = struct.unpack(f"<{groups * 2}e", row_params)
+    bytes_per_group = group_size // 2
+    lut8 = _Q4_LUT8
+    out = [0.0] * k
+    pos = 0
+    off = 0
+    sb_idx = 0
+    for _ in range(groups):
+        s = sbs[sb_idx]
+        b = sbs[sb_idx + 1]
+        sb_idx += 2
+        v = tuple(b + q * s for q in range(16))
+        for _ in range(bytes_per_group):
+            lo, hi = lut8[row_data[off]]
+            off += 1
+            out[pos] = v[lo]
+            out[pos + 1] = v[hi]
+            pos += 2
+    return out
+
+
+def _unpack_header(raw_header: bytes, file_size: int, *, verify_crc: bool = True) -> AmfHeader:
+    if len(raw_header) != HEADER_STRUCT.size:
+        raise ValueError(f"expected {HEADER_STRUCT.size}-byte AMF header, got {len(raw_header)}")
+    (
+        magic,
+        version,
+        flags,
+        page_size,
+        checksum_algo,
+        tensor_count,
+        _reserved0,
+        dir_offset,
+        dir_bytes,
+        dir_crc,
+        header_crc,
+        model_id_raw,
+        _reserved1,
+    ) = HEADER_STRUCT.unpack(raw_header)
+    if magic != AMF_MAGIC:
+        raise ValueError(f"invalid AMF magic: {magic!r}")
+    if version != AMF_VERSION:
+        raise ValueError(f"unsupported AMF version: {version}")
+    if page_size != APPLE_PAGE_SIZE:
+        raise ValueError(f"unsupported AMF page_size: {page_size}")
+    if checksum_algo != CHECKSUM_CRC32_IEEE:
+        raise ValueError(f"unsupported AMF checksum_algo: {checksum_algo}")
+    if verify_crc:
+        zeroed = bytearray(raw_header)
+        struct.pack_into("<I", zeroed, 52, 0)
+        got_crc = _crc32(zeroed)
+        if got_crc != header_crc:
+            raise ValueError(f"AMF header CRC mismatch: expected {header_crc:#010x}, got {got_crc:#010x}")
+    if dir_offset != APPLE_PAGE_SIZE or dir_bytes % APPLE_PAGE_SIZE != 0:
+        raise ValueError(f"misaligned AMF directory: offset={dir_offset}, bytes={dir_bytes}")
+    dir_raw_len = tensor_count * ENTRY_STRUCT.size
+    if dir_raw_len > dir_bytes or dir_offset + dir_bytes > file_size:
+        raise ValueError(
+            f"AMF directory out of bounds: count={tensor_count}, dir_bytes={dir_bytes}, file_size={file_size}"
+        )
+    model_id = model_id_raw.split(b"\x00", 1)[0].decode("utf-8")
+    return AmfHeader(
+        version=version,
+        flags=flags,
+        page_size=page_size,
+        checksum_algo=checksum_algo,
+        tensor_count=tensor_count,
+        directory_offset=dir_offset,
+        directory_bytes=dir_bytes,
+        directory_crc32=dir_crc,
+        header_crc32=header_crc,
+        model_id=model_id,
+    )
+
+
+def _unpack_directory(
+    dir_raw: bytes,
+    header: AmfHeader,
+    file_size: int,
+    *,
+    verify_crc: bool = True,
+) -> list[PackedTensorMeta]:
+    if verify_crc:
+        got_crc = _crc32(dir_raw)
+        if got_crc != header.directory_crc32:
+            raise ValueError(
+                f"AMF directory CRC mismatch: expected {header.directory_crc32:#010x}, got {got_crc:#010x}"
+            )
+    entries: list[PackedTensorMeta] = []
+    for i in range(header.tensor_count):
+        (
+            name_raw,
+            kind_raw,
+            dtype_raw,
+            quant_bits,
+            rank,
+            group_size,
+            layer,
+            expert,
+            _reserved0,
+            blob_crc32,
+            s0,
+            s1,
+            s2,
+            s3,
+            blob_offset,
+            blob_bytes,
+            data_bytes,
+            params_offset,
+            params_bytes,
+            _reserved1,
+        ) = ENTRY_STRUCT.unpack_from(dir_raw, i * ENTRY_STRUCT.size)
+        name = name_raw.split(b"\x00", 1)[0].decode("utf-8")
+        if not name:
+            raise ValueError(f"empty AMF tensor name at directory index {i}")
+        if not (1 <= rank <= 4):
+            raise ValueError(f"invalid AMF rank {rank} for {name!r}")
+        if blob_offset % APPLE_PAGE_SIZE != 0 or blob_bytes % APPLE_PAGE_SIZE != 0:
+            raise ValueError(f"misaligned blob for {name!r}: offset={blob_offset}, bytes={blob_bytes}")
+        if blob_offset + blob_bytes > file_size:
+            raise ValueError(f"blob out of bounds for {name!r}")
+        shape = (s0, s1, s2, s3)[:rank]
+        entries.append(
+            PackedTensorMeta(
+                name=name,
+                kind=TensorKind(kind_raw),
+                dtype=DType(dtype_raw),
+                quant_bits=quant_bits,
+                group_size=group_size,
+                layer=layer,
+                expert=expert,
+                shape=shape,
+                blob_offset=blob_offset,
+                blob_bytes=blob_bytes,
+                data_bytes=data_bytes,
+                params_offset=params_offset,
+                params_bytes=params_bytes,
+                blob_crc32=blob_crc32,
+            )
+        )
+    return entries
+
+
+class AmfReader:
+    """Bounded-memory, F_NOCACHE random-access reader for `.amf` v0 files."""
+
+    def __init__(
+        self,
+        path: pathlib.Path,
+        *,
+        verify_header_crc: bool = True,
+        verify_dir_crc: bool = True,
+    ) -> None:
+        self.path = pathlib.Path(path)
+        if not self.path.is_file():
+            raise FileNotFoundError(f"AMF file not found: {self.path}")
+        self.file_size = self.path.stat().st_size
+        if self.file_size < APPLE_PAGE_SIZE or self.file_size % APPLE_PAGE_SIZE != 0:
+            raise ValueError(f"invalid AMF file size {self.file_size} for {self.path}")
+        self._fh = self.path.open("rb", buffering=0)
+        try:
+            _set_nocache(self._fh.fileno())
+            hdr_raw = _read_exact(self._fh, 0, HEADER_STRUCT.size)
+            self.header = _unpack_header(hdr_raw, self.file_size, verify_crc=verify_header_crc)
+            dir_raw_len = self.header.tensor_count * ENTRY_STRUCT.size
+            dir_raw = (
+                _read_exact(self._fh, self.header.directory_offset, dir_raw_len)
+                if dir_raw_len > 0
+                else b""
+            )
+            entries = _unpack_directory(dir_raw, self.header, self.file_size, verify_crc=verify_dir_crc)
+            self.entries: tuple[PackedTensorMeta, ...] = tuple(entries)
+            self.by_name: dict[str, PackedTensorMeta] = {e.name: e for e in self.entries}
+        except BaseException:
+            self._fh.close()
+            raise
+
+    def __enter__(self) -> AmfReader:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._fh is not None and not self._fh.closed:
+            self._fh.close()
+
+    def read_blob(self, entry: PackedTensorMeta, *, verify_crc: bool = False) -> bytes:
+        raw = _read_exact(self._fh, entry.blob_offset, entry.blob_bytes)
+        if verify_crc:
+            got = _crc32(raw)
+            if got != entry.blob_crc32:
+                raise ValueError(
+                    f"blob CRC mismatch for {entry.name!r}: expected {entry.blob_crc32:#010x}, got {got:#010x}"
+                )
+        return raw
+
+    def read_rows_f32(self, entry: PackedTensorMeta, row_indices: Sequence[int]) -> list[list[float]]:
+        """Stream only selected rows of a 2D tensor into fp32 lists via `os.pread`."""
+        if len(entry.shape) != 2:
+            raise ValueError(f"read_rows_f32 requires a 2D tensor, got {entry.name!r} {entry.shape}")
+        n_rows, k = entry.shape
+        out: list[list[float]] = []
+
+        if entry.dtype in (DType.Q3_AFFINE, DType.Q4_AFFINE):
+            gs = entry.group_size
+            groups = k // gs
+            row_data_bytes = (k * 3) // 8 if entry.dtype == DType.Q3_AFFINE else k // 2
+            row_param_bytes = groups * 4
+            deq = dequantize_q3_row_f32 if entry.dtype == DType.Q3_AFFINE else dequantize_q4_row_f32
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                d_raw = _read_exact(self._fh, entry.blob_offset + r * row_data_bytes, row_data_bytes)
+                p_raw = _read_exact(
+                    self._fh,
+                    entry.blob_offset + entry.params_offset + r * row_param_bytes,
+                    row_param_bytes,
+                )
+                out.append(deq(d_raw, p_raw, k, group_size=gs))
+            return out
+
+        if entry.dtype == DType.F16:
+            row_bytes = k * 2
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                raw = _read_exact(self._fh, entry.blob_offset + r * row_bytes, row_bytes)
+                out.append(f16_bytes_to_f32_list(raw))
+            return out
+
+        if entry.dtype == DType.BF16:
+            row_bytes = k * 2
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                raw = _read_exact(self._fh, entry.blob_offset + r * row_bytes, row_bytes)
+                out.append(bf16_bytes_to_f32_list(raw))
+            return out
+
+        if entry.dtype == DType.F32:
+            row_bytes = k * 4
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                raw = _read_exact(self._fh, entry.blob_offset + r * row_bytes, row_bytes)
+                out.append(f32_bytes_to_f32_list(raw))
+            return out
+
+        raise ValueError(f"unsupported dtype {entry.dtype.name} for float row read on {entry.name!r}")
+
+    def read_matrix_f32(self, entry: PackedTensorMeta) -> list[list[float]]:
+        """Read and dequantize an entire 2D tensor into `N` rows of `K` floats."""
+        if len(entry.shape) != 2:
+            raise ValueError(f"read_matrix_f32 requires a 2D tensor, got {entry.name!r} {entry.shape}")
+        n_rows, k = entry.shape
+        if entry.dtype in (DType.Q3_AFFINE, DType.Q4_AFFINE):
+            data_mv = memoryview(_read_exact(self._fh, entry.blob_offset, entry.data_bytes))
+            params_mv = memoryview(
+                _read_exact(self._fh, entry.blob_offset + entry.params_offset, entry.params_bytes)
+            )
+            gs = entry.group_size
+            row_data_bytes = (k * 3) // 8 if entry.dtype == DType.Q3_AFFINE else k // 2
+            row_param_bytes = (k // gs) * 4
+            deq = dequantize_q3_row_f32 if entry.dtype == DType.Q3_AFFINE else dequantize_q4_row_f32
+            return [
+                deq(
+                    data_mv[r * row_data_bytes : (r + 1) * row_data_bytes],
+                    params_mv[r * row_param_bytes : (r + 1) * row_param_bytes],
+                    k,
+                    group_size=gs,
+                )
+                for r in range(n_rows)
+            ]
+
+        raw_mv = memoryview(_read_exact(self._fh, entry.blob_offset, entry.data_bytes))
+        if entry.dtype == DType.F16:
+            row_bytes = k * 2
+            return [f16_bytes_to_f32_list(raw_mv[r * row_bytes : (r + 1) * row_bytes]) for r in range(n_rows)]
+        if entry.dtype == DType.BF16:
+            row_bytes = k * 2
+            return [bf16_bytes_to_f32_list(raw_mv[r * row_bytes : (r + 1) * row_bytes]) for r in range(n_rows)]
+        if entry.dtype == DType.F32:
+            row_bytes = k * 4
+            return [f32_bytes_to_f32_list(raw_mv[r * row_bytes : (r + 1) * row_bytes]) for r in range(n_rows)]
+        raise ValueError(f"unsupported dtype {entry.dtype.name} for matrix read on {entry.name!r}")
+
+    def read_tensor_f16_bytes(self, entry: PackedTensorMeta) -> bytes:
+        """Read and convert/dequantize any floating/quantized tensor to little-endian fp16 bytes."""
+        if entry.dtype == DType.F16:
+            return _read_exact(self._fh, entry.blob_offset, entry.data_bytes)
+        if entry.dtype == DType.BF16:
+            chunks: list[bytes] = []
+            step = _CONVERT_CHUNK_ELEMS * 2
+            done = 0
+            while done < entry.data_bytes:
+                take = min(step, entry.data_bytes - done)
+                raw = _read_exact(self._fh, entry.blob_offset + done, take)
+                chunks.append(bf16_bytes_to_f16_bytes(raw, what=entry.name))
+                done += take
+            return b"".join(chunks)
+        if entry.dtype == DType.F32:
+            chunks = []
+            step = _CONVERT_CHUNK_ELEMS * 4
+            done = 0
+            while done < entry.data_bytes:
+                take = min(step, entry.data_bytes - done)
+                raw = _read_exact(self._fh, entry.blob_offset + done, take)
+                chunks.append(_f32_bytes_to_f16_bytes(raw, entry.name))
+                done += take
+            return b"".join(chunks)
+        if entry.dtype in (DType.Q3_AFFINE, DType.Q4_AFFINE):
+            if len(entry.shape) != 2:
+                raise ValueError(f"quantized tensor {entry.name!r} must be 2D, got {entry.shape}")
+            n_rows, k = entry.shape
+            gs = entry.group_size
+            row_data_bytes = (k * 3) // 8 if entry.dtype == DType.Q3_AFFINE else k // 2
+            row_param_bytes = (k // gs) * 4
+            deq = dequantize_q3_row_f32 if entry.dtype == DType.Q3_AFFINE else dequantize_q4_row_f32
+            data_mv = memoryview(_read_exact(self._fh, entry.blob_offset, entry.data_bytes))
+            params_mv = memoryview(
+                _read_exact(self._fh, entry.blob_offset + entry.params_offset, entry.params_bytes)
+            )
+            out = bytearray(n_rows * k * 2)
+            row_packer = struct.Struct(f"<{k}e")
+            row_out_bytes = k * 2
+            for r in range(n_rows):
+                vals = deq(
+                    data_mv[r * row_data_bytes : (r + 1) * row_data_bytes],
+                    params_mv[r * row_param_bytes : (r + 1) * row_param_bytes],
+                    k,
+                    group_size=gs,
+                )
+                try:
+                    row_packer.pack_into(out, r * row_out_bytes, *vals)
+                except OverflowError as exc:
+                    raise ValueError(
+                        f"{entry.name}[{r}]: dequantized value exceeds IEEE float16 range"
+                    ) from exc
+            return bytes(out)
+        raise ValueError(f"cannot convert dtype {entry.dtype.name} to float16 for {entry.name!r}")
+
+
+def load_amf_metadata(path: pathlib.Path) -> tuple[AmfHeader, list[PackedTensorMeta]]:
+    """Read and validate only the header and directory of an `.amf` v0 file."""
+    with AmfReader(path) as reader:
+        return reader.header, list(reader.entries)
+
+
+def load_cold_experts_from_heat_profile(
+    heat_profile_path: pathlib.Path,
+    *,
+    cold_experts_per_layer: int | None = None,
+) -> set[tuple[int, int]]:
+    """Load `(layer, expert)` cold pairs from a schema v1 heat profile JSON."""
+    raw = json.loads(pathlib.Path(heat_profile_path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"heat profile {heat_profile_path} must be a JSON object")
+    schema_version = raw.get("schema_version")
+    if schema_version != 1:
+        raise ValueError(f"unsupported heat profile schema_version {schema_version!r} (expected 1)")
+    layers = raw.get("layers")
+    if not isinstance(layers, list):
+        raise ValueError(f"heat profile {heat_profile_path} is missing a 'layers' list")
+
+    cold: set[tuple[int, int]] = set()
+    for item in layers:
+        if not isinstance(item, dict) or "layer" not in item:
+            raise ValueError(f"malformed layer entry in heat profile {heat_profile_path}")
+        layer_idx = int(item["layer"])
+        if cold_experts_per_layer is not None:
+            ranked = item.get("ranked_hot_to_cold")
+            if not isinstance(ranked, list):
+                raise ValueError(
+                    f"layer {layer_idx} in {heat_profile_path} is missing 'ranked_hot_to_cold'"
+                )
+            if cold_experts_per_layer < 0 or cold_experts_per_layer > len(ranked):
+                raise ValueError(
+                    f"cold_experts_per_layer={cold_experts_per_layer} out of range 0..{len(ranked)} "
+                    f"for layer {layer_idx}"
+                )
+            selected = ranked[len(ranked) - cold_experts_per_layer :] if cold_experts_per_layer > 0 else []
+            for e in selected:
+                cold.add((layer_idx, int(e)))
+        else:
+            cold_list = item.get("cold_experts")
+            if not isinstance(cold_list, list):
+                raise ValueError(f"layer {layer_idx} in {heat_profile_path} is missing 'cold_experts'")
+            for e in cold_list:
+                cold.add((layer_idx, int(e)))
+    return cold
+
+
+def retag_amf_cold_experts(
+    amf_path: pathlib.Path,
+    cold_experts: Iterable[tuple[int, int]] = (),
+    *,
+    output_path: pathlib.Path | None = None,
+    all_experts_cold: bool = False,
+) -> tuple[int, int]:
+    """Retag `HOT_EXPERT` / `COLD_EXPERT` directory entries without touching tensor blobs.
+
+    If `output_path` is omitted or resolves to `amf_path`, updates Page 0 and
+    the directory in place (`O(directory_bytes)` I/O, zero blob writes).
+    Otherwise writes a complete validated copy to `output_path` atomically.
+
+    Returns `(hot_expert_tensor_count, cold_expert_tensor_count)`.
+    """
+    src_path = pathlib.Path(amf_path)
+    dst_path = src_path if output_path is None else pathlib.Path(output_path)
+    cold_set = {(int(l), int(e)) for l, e in cold_experts}
+
+    header, entries = load_amf_metadata(src_path)
+    updated: list[PackedTensorMeta] = []
+    hot_count = 0
+    cold_count = 0
+    for m in entries:
+        if m.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) or m.expert != NO_EXPERT:
+            is_cold = all_experts_cold or (m.layer, m.expert) in cold_set
+            new_kind = TensorKind.COLD_EXPERT if is_cold else TensorKind.HOT_EXPERT
+            if is_cold:
+                cold_count += 1
+            else:
+                hot_count += 1
+            if new_kind != m.kind:
+                m = PackedTensorMeta(
+                    name=m.name,
+                    kind=new_kind,
+                    dtype=m.dtype,
+                    quant_bits=m.quant_bits,
+                    group_size=m.group_size,
+                    layer=m.layer,
+                    expert=m.expert,
+                    shape=m.shape,
+                    blob_offset=m.blob_offset,
+                    blob_bytes=m.blob_bytes,
+                    data_bytes=m.data_bytes,
+                    params_offset=m.params_offset,
+                    params_bytes=m.params_bytes,
+                    blob_crc32=m.blob_crc32,
+                )
+        updated.append(m)
+
+    dir_raw = _pack_directory(updated)
+    new_header = _pack_header(
+        header.model_id.encode("utf-8"),
+        header.tensor_count,
+        header.directory_offset,
+        header.directory_bytes,
+        _crc32(dir_raw),
+    )
+
+    in_place = dst_path.exists() and dst_path.resolve() == src_path.resolve()
+    if in_place:
+        with src_path.open("r+b") as fh:
+            fh.seek(0)
+            fh.write(new_header)
+            if dir_raw:
+                fh.seek(header.directory_offset)
+                fh.write(dir_raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return hot_count, cold_count
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    partial = dst_path.with_name(dst_path.name + ".partial")
+    blobs_start = header.directory_offset + header.directory_bytes
+    file_size = src_path.stat().st_size
+    try:
+        with src_path.open("rb", buffering=0) as src_fh, partial.open("wb") as out_fh:
+            _set_nocache(src_fh.fileno())
+            _set_nocache(out_fh.fileno())
+            page0 = bytearray(APPLE_PAGE_SIZE)
+            page0[0 : len(new_header)] = new_header
+            out_fh.write(page0)
+            if header.directory_bytes > 0:
+                dir_page = bytearray(header.directory_bytes)
+                dir_page[0 : len(dir_raw)] = dir_raw
+                out_fh.write(dir_page)
+            pos = blobs_start
+            while pos < file_size:
+                take = min(_COPY_CHUNK_BYTES, file_size - pos)
+                out_fh.write(_read_exact(src_fh, pos, take))
+                pos += take
+            out_fh.flush()
+            os.fsync(out_fh.fileno())
+        os.replace(partial, dst_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return hot_count, cold_count
