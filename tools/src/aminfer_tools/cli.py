@@ -12,8 +12,12 @@ from collections.abc import Sequence
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
     DTYPE_MODES,
+    SME2_PACK_MODES,
+    SME2_REPACK_TARGETS,
+    TensorLayout,
     load_cold_experts_from_heat_profile,
     pack_amf_from_safetensors,
+    repack_amf_sme2,
     retag_amf_cold_experts,
 )
 from aminfer_tools.coreml import (
@@ -152,6 +156,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--exclude-tensors",
         default=None,
         help="Comma-separated tensor names to omit from the output .amf (e.g. embed_tokens.weight)",
+    )
+    pack.add_argument(
+        "--sme2-pack",
+        choices=SME2_PACK_MODES,
+        default="none",
+        help=(
+            "Pre-pack eligible 2D weights into single-owner ARMv9 SME2 sme2_panel64 layout "
+            "(ADR-0018, W15): none (default, row_major), routers, or all-linear"
+        ),
+    )
+
+    repack = sub.add_parser(
+        "repack-sme2",
+        help=(
+            "Convert selected 2D weights in an existing .amf into single-owner sme2_panel64 "
+            "layout while preserving 16 KiB alignment and IEEE CRC-32 (W15)"
+        ),
+    )
+    repack.add_argument("--input", required=True, type=pathlib.Path, help="Input .amf path")
+    repack.add_argument("--output", required=True, type=pathlib.Path, help="Output .amf path")
+    repack.add_argument(
+        "--targets",
+        choices=SME2_REPACK_TARGETS,
+        default="routers",
+        help="Which 2D weights to pack into sme2_panel64: routers (default) or all-linear",
     )
 
     retag = sub.add_parser(
@@ -469,16 +498,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             exclude_tensors=excludes,
             heat_profile=args.heat_profile,
             cold_experts_per_layer=args.cold_experts_per_layer,
+            sme2_pack=args.sme2_pack,
         )
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
         by_dtype: dict[str, int] = {}
+        sme2_count = 0
         for m in metas:
             by_dtype[m.dtype.name.lower()] = by_dtype.get(m.dtype.name.lower(), 0) + 1
+            if m.layout == TensorLayout.SME2_PANEL64:
+                sme2_count += 1
         dtype_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_dtype.items()))
+        sme2_note = f", sme2_panel64={sme2_count}" if sme2_count > 0 else ""
         print(
             f"packed {len(metas)} tensors into {args.output} ({total_bytes} bytes) "
-            f"in {elapsed:.1f} s [{dtype_summary}]"
+            f"in {elapsed:.1f} s [{dtype_summary}{sme2_note}]"
+        )
+        return 0
+
+    if args.command == "repack-sme2":
+        started = time.monotonic()
+        metas = repack_amf_sme2(
+            args.input,
+            args.output,
+            targets=args.targets,
+        )
+        elapsed = time.monotonic() - started
+        total_bytes = args.output.stat().st_size
+        sme2_count = sum(1 for m in metas if m.layout == TensorLayout.SME2_PANEL64)
+        row_major_count = len(metas) - sme2_count
+        print(
+            f"repacked {args.output} ({total_bytes} bytes, targets={args.targets}): "
+            f"sme2_panel64={sme2_count}, row_major={row_major_count} in {elapsed:.2f} s"
         )
         return 0
 

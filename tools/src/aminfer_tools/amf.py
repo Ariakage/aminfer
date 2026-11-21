@@ -91,6 +91,77 @@ class DType(enum.IntEnum):
     U32 = 5
 
 
+class TensorLayout(enum.IntEnum):
+    """Single-owner tensor byte layout in low byte of TensorEntry.reserved0 (ADR-0018, W15)."""
+
+    ROW_MAJOR = 0
+    SME2_PANEL64 = 1
+
+
+class QuantParamKind(enum.IntEnum):
+    """Quantization parameter encoding in high byte of TensorEntry.reserved0 (ADR-0017, ADR-0018)."""
+
+    AFFINE_SCALE_BIAS = 0
+    LUT16_CODEBOOK = 1
+
+
+SME2_PANEL_COLS = 16
+SME2_GROUP_K = 64
+SME2_QUANT_HEADER_BYTES = 128
+SME2_F16_GROUP_BYTES = 2048  # 32 kp chunks * 32 u16 lanes
+SME2_Q4_GROUP_BYTES = 640  # 128 B inline header + 512 B packed codes
+SME2_Q3_GROUP_BYTES = 512  # 128 B inline header + 384 B packed codes
+SME2_Q2_GROUP_BYTES = 384  # 128 B inline header + 256 B packed codes
+SME2_PACK_MODES = ("none", "routers", "all-linear")
+SME2_REPACK_TARGETS = ("routers", "all-linear")
+
+
+def encode_reserved0(
+    layout: TensorLayout = TensorLayout.ROW_MAJOR,
+    param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS,
+) -> int:
+    """Pack `(layout, param_kind)` into the 16-bit `TensorEntry.reserved0` field."""
+    return (int(layout) & 0xFF) | ((int(param_kind) & 0xFF) << 8)
+
+
+def decode_reserved0(reserved0: int) -> tuple[TensorLayout, QuantParamKind]:
+    """Decode `TensorEntry.reserved0` into `(TensorLayout, QuantParamKind)`."""
+    layout_raw = reserved0 & 0xFF
+    param_raw = (reserved0 >> 8) & 0xFF
+    try:
+        layout = TensorLayout(layout_raw)
+    except ValueError as exc:
+        raise ValueError(f"invalid AMF TensorLayout {layout_raw} in reserved0={reserved0:#06x}") from exc
+    try:
+        param_kind = QuantParamKind(param_raw)
+    except ValueError as exc:
+        raise ValueError(f"invalid AMF QuantParamKind {param_raw} in reserved0={reserved0:#06x}") from exc
+    return layout, param_kind
+
+
+def sme2_panel64_data_bytes(dtype: DType, n: int, k: int, group_size: int = 0) -> int:
+    """Return exact packed `data_bytes` for a 2D `[n, k]` `sme2_panel64` tensor (W15)."""
+    if n <= 0 or k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"invalid sme2_panel64 shape ({n}, {k}): require n>0, k>0, k%64==0")
+    if dtype in (DType.F16, DType.BF16):
+        if group_size != 0:
+            raise ValueError(f"unquantized sme2_panel64 {dtype.name} requires group_size=0, got {group_size}")
+        group_bytes = SME2_F16_GROUP_BYTES
+    elif dtype == DType.Q4_AFFINE:
+        if group_size != SME2_GROUP_K:
+            raise ValueError(f"q4_affine sme2_panel64 requires group_size=64, got {group_size}")
+        group_bytes = SME2_Q4_GROUP_BYTES
+    elif dtype == DType.Q3_AFFINE:
+        if group_size != SME2_GROUP_K:
+            raise ValueError(f"q3_affine sme2_panel64 requires group_size=64, got {group_size}")
+        group_bytes = SME2_Q3_GROUP_BYTES
+    else:
+        raise ValueError(f"dtype {dtype.name} is not supported in sme2_panel64 layout")
+    panels = (n + SME2_PANEL_COLS - 1) // SME2_PANEL_COLS
+    groups = k // SME2_GROUP_K
+    return panels * groups * group_bytes
+
+
 @dataclass(frozen=True)
 class PackedTensorMeta:
     name: str
@@ -107,6 +178,8 @@ class PackedTensorMeta:
     params_offset: int
     params_bytes: int
     blob_crc32: int
+    layout: TensorLayout = TensorLayout.ROW_MAJOR
+    quant_param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS
 
 
 def _align_up(length: int, alignment: int) -> int:
@@ -276,12 +349,13 @@ def _classify_tensor(
 def write_amf(
     output_path: pathlib.Path,
     model_id: str,
-    records: Sequence[tuple[str, TensorKind, DType, int, int, int, int, tuple[int, ...], bytes, bytes]],
+    records: Sequence[tuple],
 ) -> list[PackedTensorMeta]:
     """Write a validated, 16 KiB-aligned .amf v0 file.
 
-    Each record is:
+    Each record is either a 10-tuple:
       (name, kind, dtype, quant_bits, group_size, layer, expert, shape, data_bytes, params_bytes)
+    or a 12-tuple appending `(layout, quant_param_kind)`.
     """
     model_id_bytes = model_id.encode("utf-8")
     if len(model_id_bytes) > 63:
@@ -297,18 +371,15 @@ def write_amf(
     blobs: list[bytes] = []
     seen_names: set[str] = set()
 
-    for (
-        name,
-        kind,
-        dtype,
-        quant_bits,
-        group_size,
-        layer,
-        expert,
-        shape,
-        data,
-        params,
-    ) in records:
+    for rec in records:
+        if len(rec) == 10:
+            name, kind, dtype, quant_bits, group_size, layer, expert, shape, data, params = rec
+            layout = TensorLayout.ROW_MAJOR
+            param_kind = QuantParamKind.AFFINE_SCALE_BIAS
+        elif len(rec) == 12:
+            name, kind, dtype, quant_bits, group_size, layer, expert, shape, data, params, layout, param_kind = rec
+        else:
+            raise ValueError(f"write_amf record must have 10 or 12 fields, got {len(rec)}")
         if name in seen_names:
             raise ValueError(f"duplicate tensor name: {name!r}")
         seen_names.add(name)
@@ -348,38 +419,14 @@ def write_amf(
                 params_offset=params_offset,
                 params_bytes=len(params),
                 blob_crc32=blob_crc,
+                layout=layout,
+                quant_param_kind=param_kind,
             )
         )
         blobs.append(bytes(blob))
         cursor += blob_bytes
 
-    dir_raw = bytearray(dir_raw_len)
-    for i, m in enumerate(metas):
-        padded_shape = [m.shape[d] if d < len(m.shape) else 0 for d in range(4)]
-        ENTRY_STRUCT.pack_into(
-            dir_raw,
-            i * ENTRY_STRUCT.size,
-            m.name.encode("utf-8"),
-            int(m.kind),
-            int(m.dtype),
-            m.quant_bits,
-            len(m.shape),
-            m.group_size,
-            m.layer,
-            m.expert,
-            0,
-            m.blob_crc32,
-            padded_shape[0],
-            padded_shape[1],
-            padded_shape[2],
-            padded_shape[3],
-            m.blob_offset,
-            m.blob_bytes,
-            m.data_bytes,
-            m.params_offset,
-            m.params_bytes,
-            0,
-        )
+    dir_raw = _pack_directory(metas)
     dir_crc = _crc32(dir_raw)
 
     header_zero_crc = HEADER_STRUCT.pack(
@@ -475,6 +522,8 @@ class _PlannedEntry:
     params_offset: int
     params_bytes: int
     blob_bytes: int
+    layout: TensorLayout = TensorLayout.ROW_MAJOR
+    quant_param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS
 
 
 @dataclass(frozen=True)
@@ -603,6 +652,31 @@ def _is_t2d_name(norm_name: str) -> bool:
     return norm_name == "t2d" or norm_name.endswith(".t2d")
 
 
+def _should_sme2_pack(
+    kind: TensorKind,
+    dtype: DType,
+    shape: tuple[int, ...],
+    sme2_pack: str,
+) -> bool:
+    if sme2_pack == "none":
+        return False
+    if sme2_pack not in SME2_PACK_MODES:
+        raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
+    if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0 or shape[1] % SME2_GROUP_K != 0:
+        return False
+    if dtype not in (DType.F16, DType.BF16, DType.Q4_AFFINE, DType.Q3_AFFINE):
+        return False
+    if sme2_pack == "routers":
+        return kind == TensorKind.ROUTER
+    return kind in (
+        TensorKind.ROUTER,
+        TensorKind.DENSE,
+        TensorKind.HOT_EXPERT,
+        TensorKind.COLD_EXPERT,
+        TensorKind.LM_HEAD,
+    )
+
+
 def _make_entry(
     name: str,
     kind: TensorKind,
@@ -616,25 +690,38 @@ def _make_entry(
     data_convert: str | None,
     scales: _ByteRange | None = None,
     biases: _ByteRange | None = None,
+    *,
+    sme2_pack: str = "none",
 ) -> _PlannedEntry:
     name_bytes = name.encode("utf-8")
     if len(name_bytes) == 0 or len(name_bytes) > 47:
         raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(name_bytes)}: {name!r}")
     if not (1 <= len(shape) <= 4):
         raise ValueError(f"tensor rank must be 1..4 for {name!r}, got {len(shape)}")
-    if data_convert == "d2t_i64_to_u32":
-        data_bytes = (data.length // 8) * 4
-    else:
-        data_bytes = data.length  # f16<->bf16, i32->u32 and raw copies preserve byte length
-    if scales is not None:
-        params_offset = _align_up(data_bytes, 64)
-        groups = scales.length // _SAFETENSORS_DTYPE_BYTES[scales.dtype]
-        params_bytes = groups * 4  # half2(scale, bias)
-        content = params_offset + params_bytes
-    else:
+    use_sme2 = _should_sme2_pack(kind, dtype, shape, sme2_pack)
+    if use_sme2:
+        layout = TensorLayout.SME2_PANEL64
+        param_kind = QuantParamKind.AFFINE_SCALE_BIAS
+        data_bytes = sme2_panel64_data_bytes(dtype, shape[0], shape[1], group_size)
         params_offset = 0
         params_bytes = 0
         content = data_bytes
+    else:
+        layout = TensorLayout.ROW_MAJOR
+        param_kind = QuantParamKind.AFFINE_SCALE_BIAS
+        if data_convert == "d2t_i64_to_u32":
+            data_bytes = (data.length // 8) * 4
+        else:
+            data_bytes = data.length  # f16<->bf16, i32->u32 and raw copies preserve byte length
+        if scales is not None:
+            params_offset = _align_up(data_bytes, 64)
+            groups = scales.length // _SAFETENSORS_DTYPE_BYTES[scales.dtype]
+            params_bytes = groups * 4  # half2(scale, bias)
+            content = params_offset + params_bytes
+        else:
+            params_offset = 0
+            params_bytes = 0
+            content = data_bytes
     return _PlannedEntry(
         name=name,
         kind=kind,
@@ -652,6 +739,8 @@ def _make_entry(
         params_offset=params_offset,
         params_bytes=params_bytes,
         blob_bytes=_align_up(max(content, 1), APPLE_PAGE_SIZE),
+        layout=layout,
+        quant_param_kind=param_kind,
     )
 
 
@@ -677,12 +766,15 @@ def plan_amf_entries(
     all_experts_cold: bool = False,
     tie_word_embeddings: bool = False,
     exclude_tensors: Iterable[str] = (),
+    sme2_pack: str = "none",
 ) -> list[_PlannedEntry]:
     """Pass 1: plan every output entry from shard headers alone."""
     if group_size != 64:
         raise ValueError(f"aminfer v0 supports group_size=64 only, got {group_size}")
     if dtype_mode not in DTYPE_MODES:
         raise ValueError(f"dtype_mode must be one of {DTYPE_MODES}, got {dtype_mode!r}")
+    if sme2_pack not in SME2_PACK_MODES:
+        raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
     cold_set = set(cold_experts)
     excluded: set[str] = set()
     for item in exclude_tensors:
@@ -760,6 +852,7 @@ def plan_amf_entries(
                         None,
                         _slice_range(s, e, num_experts),
                         _slice_range(b, e, num_experts),
+                        sme2_pack=sme2_pack,
                     )
                 )
             continue
@@ -785,6 +878,7 @@ def plan_amf_entries(
                 None,
                 _full_range(s),
                 _full_range(b),
+                sme2_pack=sme2_pack,
             )
         )
 
@@ -828,13 +922,26 @@ def plan_amf_entries(
                         (n, k),
                         _slice_range(t, e, num_experts),
                         convert,
+                        sme2_pack=sme2_pack,
                     )
                 )
             continue
         norm_name = _normalize_name(name)
         kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
         entries.append(
-            _make_entry(norm_name, kind, amf_dtype, 0, 0, layer, expert, t.shape, _full_range(t), convert)
+            _make_entry(
+                norm_name,
+                kind,
+                amf_dtype,
+                0,
+                0,
+                layer,
+                expert,
+                t.shape,
+                _full_range(t),
+                convert,
+                sme2_pack=sme2_pack,
+            )
         )
 
     entries.sort(key=lambda e: _natural_key(e.name))
@@ -921,7 +1028,63 @@ def _to_f16_chunk(raw: bytes, dtype: str, what: str) -> bytes:
     raise ValueError(f"{what}: unsupported scale/bias dtype {dtype}")
 
 
+def _stream_sme2_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
+    """Stream 16 rows at a time from shard(s) and emit `sme2_panel64` panels."""
+    n_rows, k = entry.shape
+    panels = (n_rows + SME2_PANEL_COLS - 1) // SME2_PANEL_COLS
+    src = readers.get(entry.data.path)
+
+    if entry.dtype in (DType.F16, DType.BF16):
+        row_bytes = k * 2
+        for p in range(panels):
+            r0 = p * SME2_PANEL_COLS
+            count = min(SME2_PANEL_COLS, n_rows - r0)
+            raw = _read_exact(src, entry.data.offset + r0 * row_bytes, count * row_bytes)
+            if entry.data_convert == "bf16_to_f16":
+                raw = bf16_bytes_to_f16_bytes(raw, what=entry.name)
+            elif entry.data_convert == "f16_to_bf16":
+                raw = f16_bytes_to_bf16_bytes(raw)
+            elif entry.data_convert is not None:
+                raise ValueError(f"unknown conversion {entry.data_convert!r}")
+            mv = memoryview(raw)
+            rows = [mv[c * row_bytes : (c + 1) * row_bytes] for c in range(count)]
+            w.write(pack_sme2_panel64_f16_panel(rows, k))
+    elif entry.dtype in (DType.Q4_AFFINE, DType.Q3_AFFINE):
+        if entry.scales is None or entry.biases is None:
+            raise ValueError(f"quantized sme2_panel64 tensor {entry.name!r} is missing scales/biases")
+        groups = k // entry.group_size
+        row_data_bytes = k // 2 if entry.dtype == DType.Q4_AFFINE else (k * 3) // 8
+        sb_elem = _SAFETENSORS_DTYPE_BYTES[entry.scales.dtype]
+        row_sb_src_bytes = groups * sb_elem
+        row_param_bytes = groups * 4
+        s_fh = readers.get(entry.scales.path)
+        b_fh = readers.get(entry.biases.path)
+        packer = pack_sme2_panel64_q4_panel if entry.dtype == DType.Q4_AFFINE else pack_sme2_panel64_q3_panel
+        for p in range(panels):
+            r0 = p * SME2_PANEL_COLS
+            count = min(SME2_PANEL_COLS, n_rows - r0)
+            raw_d = _read_exact(src, entry.data.offset + r0 * row_data_bytes, count * row_data_bytes)
+            raw_s = _read_exact(s_fh, entry.scales.offset + r0 * row_sb_src_bytes, count * row_sb_src_bytes)
+            raw_b = _read_exact(b_fh, entry.biases.offset + r0 * row_sb_src_bytes, count * row_sb_src_bytes)
+            params_block = interleave_scale_bias_f16(
+                _to_f16_chunk(raw_s, entry.scales.dtype, f"{entry.name} scales"),
+                _to_f16_chunk(raw_b, entry.biases.dtype, f"{entry.name} biases"),
+            )
+            d_mv = memoryview(raw_d)
+            p_mv = memoryview(params_block)
+            d_rows = [d_mv[c * row_data_bytes : (c + 1) * row_data_bytes] for c in range(count)]
+            p_rows = [p_mv[c * row_param_bytes : (c + 1) * row_param_bytes] for c in range(count)]
+            w.write(packer(d_rows, p_rows, k))
+    else:
+        raise ValueError(f"unsupported sme2_panel64 dtype {entry.dtype.name} for {entry.name!r}")
+
+    w.zeros(entry.blob_bytes - entry.data_bytes)
+
+
 def _stream_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
+    if entry.layout == TensorLayout.SME2_PANEL64:
+        _stream_sme2_entry(entry, readers, w)
+        return
     src = readers.get(entry.data.path)
     if entry.data_convert is None:
         done = 0
@@ -1005,6 +1168,7 @@ def pack_amf_from_safetensors(
     exclude_tensors: Iterable[str] = (),
     heat_profile: pathlib.Path | None = None,
     cold_experts_per_layer: int | None = None,
+    sme2_pack: str = "none",
 ) -> list[PackedTensorMeta]:
     """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
 
@@ -1015,11 +1179,13 @@ def pack_amf_from_safetensors(
     tables (`I64` / `I32`, 1D) are converted to direct `u32` target token IDs
     (`i + d2t[i]`), and training-only `BOOL` `t2d` masks are skipped. MLX affine
     `.weight/.scales/.biases` triples always pack as `q3_affine` / `q4_affine`
-    with `half2(scale, bias)` parameters. `tie_word_embeddings=None` reads
+    with `half2(scale, bias)` parameters (or inline 128 B headers when packed
+    with `sme2_pack != 'none'`). `tie_word_embeddings=None` reads
     `config.json` next to the input; when tied (and shapes match), a duplicate
     `lm_head` is not emitted. When `heat_profile` is given, its cold-expert set
     (optionally overridden by `cold_experts_per_layer`) is unioned with
-    `cold_experts`.
+    `cold_experts`. `sme2_pack` selects single-owner `sme2_panel64` pre-packing
+    (`none`, `routers`, or `all-linear`; ADR-0018, W15).
     """
     model_id_bytes = model_id.encode("utf-8")
     if len(model_id_bytes) == 0 or len(model_id_bytes) > 63:
@@ -1047,6 +1213,7 @@ def pack_amf_from_safetensors(
         all_experts_cold=all_experts_cold,
         tie_word_embeddings=tie,
         exclude_tensors=exclude_tensors,
+        sme2_pack=sme2_pack,
     )
 
     tensor_count = len(plan)
@@ -1092,6 +1259,8 @@ def pack_amf_from_safetensors(
                         params_offset=e.params_offset,
                         params_bytes=e.params_bytes,
                         blob_crc32=w.crc & 0xFFFFFFFF,
+                        layout=e.layout,
+                        quant_param_kind=e.quant_param_kind,
                     )
                 )
             if out.tell() != cursor:
@@ -1130,7 +1299,7 @@ def _pack_directory(metas: Sequence[PackedTensorMeta]) -> bytes:
             m.group_size,
             m.layer,
             m.expert,
-            0,
+            encode_reserved0(m.layout, m.quant_param_kind),
             m.blob_crc32,
             *padded_shape,
             m.blob_offset,
@@ -1172,8 +1341,502 @@ _Q3_LUT12: tuple[tuple[int, int, int, int], ...] = tuple(
     (v & 0x07, (v >> 3) & 0x07, (v >> 6) & 0x07, (v >> 9) & 0x07) for v in range(4096)
 )
 
+# 12-bit lookup table mapping 4 packed 3-bit codes -> 2 q4-nibble bytes
+# `(c0 | (c1 << 4), c2 | (c3 << 4))` for direct sme2_panel64 q3 quad assembly.
+_Q3_12BIT_TO_Q4_PAIR: tuple[tuple[int, int], ...] = tuple(
+    (
+        (v & 0x07) | (((v >> 3) & 0x07) << 4),
+        ((v >> 6) & 0x07) | (((v >> 9) & 0x07) << 4),
+    )
+    for v in range(4096)
+)
+
 # 8-bit lookup table mapping 2 packed 4-bit unsigned codes -> (lo, hi).
 _Q4_LUT8: tuple[tuple[int, int], ...] = tuple((b & 0x0F, b >> 4) for b in range(256))
+
+
+# ---------------------------------------------------------------------------
+# ARMv9 SME2 `sme2_panel64` packers and reference unpackers (ADR-0018, W15)
+# ---------------------------------------------------------------------------
+
+
+def pack_sme2_lut16_header(
+    codebook_f16: bytes | bytearray | memoryview,
+    bias_dup_f16: bytes | bytearray | memoryview | None = None,
+) -> bytes:
+    """Build a 128 B `QuantParamKind.LUT16_CODEBOOK` inline `(panel, group)` header.
+
+    Hardware M4 `luti4 .h` / `luti2 .h` index `ZT0` at 32-bit stride (`zt0_u16[2*idx]`),
+    so 16 `f16` codebook entries (32 B) are duplicated into 64 B `[v0, v0, ..., v15, v15]`
+    at bytes `0..64`, followed by 64 B `bias_dup_f16` (zeros when omitted) at `64..128`.
+    """
+    cb = memoryview(codebook_f16)
+    if len(cb) != 32:
+        raise ValueError(f"lut16 codebook must be 32 bytes (16 f16 entries), got {len(cb)}")
+    out = bytearray(SME2_QUANT_HEADER_BYTES)
+    for i in range(16):
+        lo = cb[i * 2]
+        hi = cb[i * 2 + 1]
+        out[i * 4 + 0] = lo
+        out[i * 4 + 1] = hi
+        out[i * 4 + 2] = lo
+        out[i * 4 + 3] = hi
+    if bias_dup_f16 is not None:
+        b_mv = memoryview(bias_dup_f16)
+        if len(b_mv) != 64:
+            raise ValueError(f"bias_dup_f16 must be 64 bytes (32 f16 entries), got {len(b_mv)}")
+        out[64:128] = b_mv
+    return bytes(out)
+
+
+def _write_sme2_quant_group_header(
+    out: bytearray,
+    g_off: int,
+    g: int,
+    params_mvs: Sequence[memoryview] | None,
+    param_kind: QuantParamKind,
+    group_headers: Sequence[bytes | bytearray | memoryview] | None,
+) -> None:
+    if param_kind == QuantParamKind.LUT16_CODEBOOK:
+        if group_headers is None:
+            raise ValueError("group_headers is required when param_kind is LUT16_CODEBOOK")
+        hdr = memoryview(group_headers[g])
+        if len(hdr) != SME2_QUANT_HEADER_BYTES:
+            raise ValueError(f"expected 128 B inline header for group {g}, got {len(hdr)}")
+        out[g_off : g_off + SME2_QUANT_HEADER_BYTES] = hdr
+        return
+    if params_mvs is None:
+        raise ValueError("panel_params_rows is required when param_kind is AFFINE_SCALE_BIAS")
+    sb_off = g * 4
+    for c, p_row in enumerate(params_mvs):
+        s0 = p_row[sb_off]
+        s1 = p_row[sb_off + 1]
+        b0 = p_row[sb_off + 2]
+        b1 = p_row[sb_off + 3]
+        s_dst = g_off + c * 4
+        b_dst = g_off + 64 + c * 4
+        out[s_dst + 0] = s0
+        out[s_dst + 1] = s1
+        out[s_dst + 2] = s0
+        out[s_dst + 3] = s1
+        out[b_dst + 0] = b0
+        out[b_dst + 1] = b1
+        out[b_dst + 2] = b0
+        out[b_dst + 3] = b1
+
+
+def pack_sme2_panel64_f16_panel(
+    panel_rows: Sequence[bytes | bytearray | memoryview],
+    k: int,
+) -> bytes:
+    """Pack 1..16 rows of `[N_panel, K]` `bf16`/`f16` weights into one `sme2_panel64` panel.
+
+    Produces `(K // 64) * 2048` bytes: for each group and `kp in 0..32`, 32 `u16` lanes
+    `[W[col_0, k0], W[col_0, k1], ..., W[col_15, k0], W[col_15, k1]]`. Rows beyond
+    `len(panel_rows)` are zero-padded.
+    """
+    if not (1 <= len(panel_rows) <= SME2_PANEL_COLS):
+        raise ValueError(f"panel_rows must contain 1..16 rows, got {len(panel_rows)}")
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+    groups = k // SME2_GROUP_K
+    row_bytes = k * 2
+    out = bytearray(groups * SME2_F16_GROUP_BYTES)
+    out_u32 = memoryview(out).cast("I")
+    try:
+        for c, row in enumerate(panel_rows):
+            r_mv = memoryview(row)
+            if len(r_mv) != row_bytes:
+                raise ValueError(f"panel row {c} has {len(r_mv)} bytes, expected {row_bytes}")
+            out_u32[c::SME2_PANEL_COLS] = r_mv.cast("I")
+    finally:
+        out_u32.release()
+    return bytes(out)
+
+
+def pack_sme2_panel64_q4_panel(
+    panel_data_rows: Sequence[bytes | bytearray | memoryview],
+    panel_params_rows: Sequence[bytes | bytearray | memoryview] | None,
+    k: int,
+    *,
+    param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS,
+    group_headers: Sequence[bytes | bytearray | memoryview] | None = None,
+) -> bytes:
+    """Pack 1..16 MLX-format `q4_affine` rows into one `sme2_panel64` panel (`640 B`/group).
+
+    Per `(panel, group)`: 128 B inline header (`scale_dup_f16[32]` + `bias_dup_f16[32]`,
+    or `lut16_codebook` header) followed by 512 B codes where for `kp in 0..32`, `c in 0..16`:
+    `codes[kp*16 + c] = (code[col_c, k0] & 0xF) | ((code[col_c, k1] & 0xF) << 4)`.
+    """
+    n_active = len(panel_data_rows)
+    if not (1 <= n_active <= SME2_PANEL_COLS):
+        raise ValueError(f"panel_data_rows must contain 1..16 rows, got {n_active}")
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+    groups = k // SME2_GROUP_K
+    row_data_bytes = k // 2
+    row_param_bytes = groups * 4
+
+    data_mvs = [memoryview(r) for r in panel_data_rows]
+    for c, mv in enumerate(data_mvs):
+        if len(mv) != row_data_bytes:
+            raise ValueError(f"q4 panel row {c} has {len(mv)} data bytes, expected {row_data_bytes}")
+
+    params_mvs: list[memoryview] | None = None
+    if param_kind == QuantParamKind.AFFINE_SCALE_BIAS:
+        if panel_params_rows is None or len(panel_params_rows) != n_active:
+            raise ValueError("panel_params_rows must match panel_data_rows length")
+        params_mvs = [memoryview(r) for r in panel_params_rows]
+        for c, mv in enumerate(params_mvs):
+            if len(mv) != row_param_bytes:
+                raise ValueError(f"q4 panel row {c} has {len(mv)} param bytes, expected {row_param_bytes}")
+
+    out = bytearray(groups * SME2_Q4_GROUP_BYTES)
+    for g in range(groups):
+        g_off = g * SME2_Q4_GROUP_BYTES
+        _write_sme2_quant_group_header(out, g_off, g, params_mvs, param_kind, group_headers)
+        code_off = g_off + SME2_QUANT_HEADER_BYTES
+        src_start = g * 32
+        src_end = src_start + 32
+        for c, rd in enumerate(data_mvs):
+            out[code_off + c : code_off + 512 : SME2_PANEL_COLS] = rd[src_start:src_end]
+    return bytes(out)
+
+
+def pack_sme2_panel64_q3_panel(
+    panel_data_rows: Sequence[bytes | bytearray | memoryview],
+    panel_params_rows: Sequence[bytes | bytearray | memoryview] | None,
+    k: int,
+    *,
+    param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS,
+    group_headers: Sequence[bytes | bytearray | memoryview] | None = None,
+) -> bytes:
+    """Pack 1..16 MLX-format `q3_affine` rows into one `sme2_panel64` panel (`512 B`/group).
+
+    Per `(panel, group)`: 128 B inline header followed by 384 B codes (`2` halves × `3 × 64 B`).
+    In each half (`kp_base = h * 16`), 4 `q4`-format 64 B quads `Q[0..3]` (3-bit codes in
+    bits `0..2` and `4..6`) are packed into 3 × 64 B planes (`B0`, `B1`, `B2`) by embedding
+    `Q[3]`'s 6 payload bits into the spare bits `3` and `7` of `Q[0..2]`.
+    """
+    n_active = len(panel_data_rows)
+    if not (1 <= n_active <= SME2_PANEL_COLS):
+        raise ValueError(f"panel_data_rows must contain 1..16 rows, got {n_active}")
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+    groups = k // SME2_GROUP_K
+    row_data_bytes = (k * 3) // 8
+    row_param_bytes = groups * 4
+
+    data_mvs = [memoryview(r) for r in panel_data_rows]
+    for c, mv in enumerate(data_mvs):
+        if len(mv) != row_data_bytes:
+            raise ValueError(f"q3 panel row {c} has {len(mv)} data bytes, expected {row_data_bytes}")
+
+    params_mvs: list[memoryview] | None = None
+    if param_kind == QuantParamKind.AFFINE_SCALE_BIAS:
+        if panel_params_rows is None or len(panel_params_rows) != n_active:
+            raise ValueError("panel_params_rows must match panel_data_rows length")
+        params_mvs = [memoryview(r) for r in panel_params_rows]
+        for c, mv in enumerate(params_mvs):
+            if len(mv) != row_param_bytes:
+                raise ValueError(f"q3 panel row {c} has {len(mv)} param bytes, expected {row_param_bytes}")
+
+    out = bytearray(groups * SME2_Q3_GROUP_BYTES)
+    q3_lut = _Q3_12BIT_TO_Q4_PAIR
+    for g in range(groups):
+        g_off = g * SME2_Q3_GROUP_BYTES
+        _write_sme2_quant_group_header(out, g_off, g, params_mvs, param_kind, group_headers)
+        code_off = g_off + SME2_QUANT_HEADER_BYTES
+        g_src = g * 24
+        for h in range(2):
+            q0 = bytearray(64)
+            q1 = bytearray(64)
+            q2 = bytearray(64)
+            q3 = bytearray(64)
+            quads = (q0, q1, q2, q3)
+            h_blk = h * 4
+            for c, rd in enumerate(data_mvs):
+                for q_idx in range(4):
+                    off = g_src + (h_blk + q_idx) * 3
+                    word24 = rd[off] | (rd[off + 1] << 8) | (rd[off + 2] << 16)
+                    p0, p1 = q3_lut[word24 & 0xFFF]
+                    p2, p3 = q3_lut[word24 >> 12]
+                    dst = quads[q_idx]
+                    dst[c] = p0
+                    dst[16 + c] = p1
+                    dst[32 + c] = p2
+                    dst[48 + c] = p3
+            half_off = code_off + h * 192
+            for i in range(64):
+                v3 = q3[i]
+                out[half_off + i] = q0[i] | ((v3 & 0x01) << 3) | ((v3 & 0x10) << 3)
+                out[half_off + 64 + i] = q1[i] | ((v3 & 0x02) << 2) | ((v3 & 0x20) << 2)
+                out[half_off + 128 + i] = q2[i] | ((v3 & 0x04) << 1) | ((v3 & 0x40) << 1)
+    return bytes(out)
+
+
+def pack_sme2_panel64_q2_panel(
+    panel_codes_rows: Sequence[Sequence[int]],
+    panel_params_rows: Sequence[bytes | bytearray | memoryview] | None,
+    k: int,
+    *,
+    param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS,
+    group_headers: Sequence[bytes | bytearray | memoryview] | None = None,
+) -> bytes:
+    """Pack 1..16 rows of 2-bit codes (`0..3`) into one `sme2_panel64` `q2` panel (`384 B`/group).
+
+    Matches M4 `luti2 {z0.h-z3.h}, zt0, Zn[0..1]` lane order: for `kp in 0..32`, `b in 0..8`
+    (`c0 = 2*b`, `c1 = 2*b + 1`),
+    `codes[kp*8 + b] = c0_k0 | (c0_k1 << 2) | (c1_k0 << 4) | (c1_k1 << 6)`.
+    """
+    n_active = len(panel_codes_rows)
+    if not (1 <= n_active <= SME2_PANEL_COLS):
+        raise ValueError(f"panel_codes_rows must contain 1..16 rows, got {n_active}")
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+    for c, row in enumerate(panel_codes_rows):
+        if len(row) != k:
+            raise ValueError(f"q2 panel row {c} has {len(row)} codes, expected {k}")
+    groups = k // SME2_GROUP_K
+    row_param_bytes = groups * 4
+
+    params_mvs: list[memoryview] | None = None
+    if param_kind == QuantParamKind.AFFINE_SCALE_BIAS:
+        if panel_params_rows is None or len(panel_params_rows) != n_active:
+            raise ValueError("panel_params_rows must match panel_codes_rows length")
+        params_mvs = [memoryview(r) for r in panel_params_rows]
+        for c, mv in enumerate(params_mvs):
+            if len(mv) != row_param_bytes:
+                raise ValueError(f"q2 panel row {c} has {len(mv)} param bytes, expected {row_param_bytes}")
+
+    out = bytearray(groups * SME2_Q2_GROUP_BYTES)
+    for g in range(groups):
+        g_off = g * SME2_Q2_GROUP_BYTES
+        _write_sme2_quant_group_header(out, g_off, g, params_mvs, param_kind, group_headers)
+        code_off = g_off + SME2_QUANT_HEADER_BYTES
+        k_base = g * SME2_GROUP_K
+        for kp in range(32):
+            k0 = k_base + 2 * kp
+            k1 = k0 + 1
+            row_off = code_off + kp * 8
+            for b in range(8):
+                c0 = 2 * b
+                c1 = c0 + 1
+                v00 = (panel_codes_rows[c0][k0] & 0x03) if c0 < n_active else 0
+                v01 = (panel_codes_rows[c0][k1] & 0x03) if c0 < n_active else 0
+                v10 = (panel_codes_rows[c1][k0] & 0x03) if c1 < n_active else 0
+                v11 = (panel_codes_rows[c1][k1] & 0x03) if c1 < n_active else 0
+                out[row_off + b] = v00 | (v01 << 2) | (v10 << 4) | (v11 << 6)
+    return bytes(out)
+
+
+def unpack_sme2_panel64_f16_panel(
+    panel_bytes: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    num_rows: int = SME2_PANEL_COLS,
+) -> list[bytes]:
+    """Unpack one `sme2_panel64` `bf16`/`f16` panel back to `num_rows` contiguous rows."""
+    if not (1 <= num_rows <= SME2_PANEL_COLS):
+        raise ValueError(f"num_rows must be 1..16, got {num_rows}")
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+    groups = k // SME2_GROUP_K
+    expected = groups * SME2_F16_GROUP_BYTES
+    mv = memoryview(panel_bytes)
+    if len(mv) != expected:
+        raise ValueError(f"f16/bf16 panel length {len(mv)} != expected {expected}")
+    panel_u32 = mv.cast("I")
+    rows: list[bytes] = []
+    try:
+        for c in range(num_rows):
+            row_buf = bytearray(k * 2)
+            row_u32 = memoryview(row_buf).cast("I")
+            try:
+                row_u32[:] = panel_u32[c::SME2_PANEL_COLS]
+            finally:
+                row_u32.release()
+            rows.append(bytes(row_buf))
+    finally:
+        panel_u32.release()
+    return rows
+
+
+def _decode_sme2_header_tables(
+    hdr_mv: memoryview,
+    param_kind: QuantParamKind,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Return `(first_16, bias_16)` from a 128 B inline header.
+
+    For `AFFINE_SCALE_BIAS`, `first_16` is per-column scales `s[0..15]`;
+    for `LUT16_CODEBOOK`, `first_16` is the 16-entry codebook `lut[0..15]`.
+    `bias_16` is always per-column bias `b[0..15]`.
+    """
+    raw_first = struct.unpack_from("<32e", hdr_mv, 0)
+    raw_bias = struct.unpack_from("<32e", hdr_mv, 64)
+    first_16 = tuple(raw_first[2 * i] for i in range(16))
+    bias_16 = tuple(raw_bias[2 * i] for i in range(16))
+    if param_kind not in (QuantParamKind.AFFINE_SCALE_BIAS, QuantParamKind.LUT16_CODEBOOK):
+        raise ValueError(f"unsupported QuantParamKind {param_kind!r}")
+    return first_16, bias_16
+
+
+def dequantize_sme2_panel64_q4_panel_f32(
+    panel_bytes: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    num_rows: int = SME2_PANEL_COLS,
+    param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS,
+) -> list[list[float]]:
+    """Dequantize one `sme2_panel64` `q4_affine` panel into `num_rows` lists of `k` floats."""
+    if not (1 <= num_rows <= SME2_PANEL_COLS):
+        raise ValueError(f"num_rows must be 1..16, got {num_rows}")
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+    groups = k // SME2_GROUP_K
+    mv = memoryview(panel_bytes)
+    expected = groups * SME2_Q4_GROUP_BYTES
+    if len(mv) != expected:
+        raise ValueError(f"q4 panel length {len(mv)} != expected {expected}")
+
+    rows = [[0.0] * k for _ in range(num_rows)]
+    lut8 = _Q4_LUT8
+    for g in range(groups):
+        g_off = g * SME2_Q4_GROUP_BYTES
+        first_16, bias_16 = _decode_sme2_header_tables(mv[g_off : g_off + SME2_QUANT_HEADER_BYTES], param_kind)
+        code_off = g_off + SME2_QUANT_HEADER_BYTES
+        k_base = g * SME2_GROUP_K
+        if param_kind == QuantParamKind.AFFINE_SCALE_BIAS:
+            for c in range(num_rows):
+                s = first_16[c]
+                b = bias_16[c]
+                row = rows[c]
+                for kp in range(32):
+                    lo, hi = lut8[mv[code_off + kp * SME2_PANEL_COLS + c]]
+                    row[k_base + 2 * kp] = b + lo * s
+                    row[k_base + 2 * kp + 1] = b + hi * s
+        else:
+            for c in range(num_rows):
+                b = bias_16[c]
+                row = rows[c]
+                for kp in range(32):
+                    lo, hi = lut8[mv[code_off + kp * SME2_PANEL_COLS + c]]
+                    row[k_base + 2 * kp] = first_16[lo] + b
+                    row[k_base + 2 * kp + 1] = first_16[hi] + b
+    return rows
+
+
+def dequantize_sme2_panel64_q3_panel_f32(
+    panel_bytes: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    num_rows: int = SME2_PANEL_COLS,
+    param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS,
+) -> list[list[float]]:
+    """Dequantize one `sme2_panel64` `q3_affine` panel into `num_rows` lists of `k` floats."""
+    if not (1 <= num_rows <= SME2_PANEL_COLS):
+        raise ValueError(f"num_rows must be 1..16, got {num_rows}")
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+    groups = k // SME2_GROUP_K
+    mv = memoryview(panel_bytes)
+    expected = groups * SME2_Q3_GROUP_BYTES
+    if len(mv) != expected:
+        raise ValueError(f"q3 panel length {len(mv)} != expected {expected}")
+
+    rows = [[0.0] * k for _ in range(num_rows)]
+    for g in range(groups):
+        g_off = g * SME2_Q3_GROUP_BYTES
+        first_16, bias_16 = _decode_sme2_header_tables(mv[g_off : g_off + SME2_QUANT_HEADER_BYTES], param_kind)
+        code_off = g_off + SME2_QUANT_HEADER_BYTES
+        k_base = g * SME2_GROUP_K
+        for h in range(2):
+            half_off = code_off + h * 192
+            b0 = mv[half_off : half_off + 64]
+            b1 = mv[half_off + 64 : half_off + 128]
+            b2 = mv[half_off + 128 : half_off + 192]
+            q0 = [b0[i] & 0x77 for i in range(64)]
+            q1 = [b1[i] & 0x77 for i in range(64)]
+            q2 = [b2[i] & 0x77 for i in range(64)]
+            q3 = [
+                ((b0[i] & 0x88) >> 3) | ((b1[i] & 0x88) >> 2) | ((b2[i] & 0x88) >> 1)
+                for i in range(64)
+            ]
+            quads = (q0, q1, q2, q3)
+            kp_base = h * 16
+            for q_idx, quad in enumerate(quads):
+                for kp_local in range(4):
+                    kp = kp_base + q_idx * 4 + kp_local
+                    k0 = k_base + 2 * kp
+                    k1 = k0 + 1
+                    row_i = kp_local * SME2_PANEL_COLS
+                    if param_kind == QuantParamKind.AFFINE_SCALE_BIAS:
+                        for c in range(num_rows):
+                            byte = quad[row_i + c]
+                            s = first_16[c]
+                            b = bias_16[c]
+                            rows[c][k0] = b + (byte & 0x07) * s
+                            rows[c][k1] = b + ((byte >> 4) & 0x07) * s
+                    else:
+                        for c in range(num_rows):
+                            byte = quad[row_i + c]
+                            b = bias_16[c]
+                            rows[c][k0] = first_16[byte & 0x07] + b
+                            rows[c][k1] = first_16[(byte >> 4) & 0x07] + b
+    return rows
+
+
+def dequantize_sme2_panel64_q2_panel_f32(
+    panel_bytes: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    num_rows: int = SME2_PANEL_COLS,
+    param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS,
+) -> list[list[float]]:
+    """Dequantize one `sme2_panel64` `q2` panel into `num_rows` lists of `k` floats."""
+    if not (1 <= num_rows <= SME2_PANEL_COLS):
+        raise ValueError(f"num_rows must be 1..16, got {num_rows}")
+    if k <= 0 or k % SME2_GROUP_K != 0:
+        raise ValueError(f"sme2_panel64 requires k > 0 and k % 64 == 0, got {k}")
+    groups = k // SME2_GROUP_K
+    mv = memoryview(panel_bytes)
+    expected = groups * SME2_Q2_GROUP_BYTES
+    if len(mv) != expected:
+        raise ValueError(f"q2 panel length {len(mv)} != expected {expected}")
+
+    rows = [[0.0] * k for _ in range(num_rows)]
+    for g in range(groups):
+        g_off = g * SME2_Q2_GROUP_BYTES
+        first_16, bias_16 = _decode_sme2_header_tables(mv[g_off : g_off + SME2_QUANT_HEADER_BYTES], param_kind)
+        code_off = g_off + SME2_QUANT_HEADER_BYTES
+        k_base = g * SME2_GROUP_K
+        for kp in range(32):
+            k0 = k_base + 2 * kp
+            k1 = k0 + 1
+            row_off = code_off + kp * 8
+            for b_idx in range(8):
+                byte = mv[row_off + b_idx]
+                c0 = 2 * b_idx
+                c1 = c0 + 1
+                if c0 < num_rows:
+                    v0 = byte & 0x03
+                    v1 = (byte >> 2) & 0x03
+                    if param_kind == QuantParamKind.AFFINE_SCALE_BIAS:
+                        rows[c0][k0] = bias_16[c0] + v0 * first_16[c0]
+                        rows[c0][k1] = bias_16[c0] + v1 * first_16[c0]
+                    else:
+                        rows[c0][k0] = first_16[v0] + bias_16[c0]
+                        rows[c0][k1] = first_16[v1] + bias_16[c0]
+                if c1 < num_rows:
+                    v0 = (byte >> 4) & 0x03
+                    v1 = (byte >> 6) & 0x03
+                    if param_kind == QuantParamKind.AFFINE_SCALE_BIAS:
+                        rows[c1][k0] = bias_16[c1] + v0 * first_16[c1]
+                        rows[c1][k1] = bias_16[c1] + v1 * first_16[c1]
+                    else:
+                        rows[c1][k0] = first_16[v0] + bias_16[c1]
+                        rows[c1][k1] = first_16[v1] + bias_16[c1]
+    return rows
 
 
 @dataclass(frozen=True)
@@ -1384,7 +2047,7 @@ def _unpack_directory(
             group_size,
             layer,
             expert,
-            _reserved0,
+            reserved0,
             blob_crc32,
             s0,
             s1,
@@ -1406,6 +2069,7 @@ def _unpack_directory(
             raise ValueError(f"misaligned blob for {name!r}: offset={blob_offset}, bytes={blob_bytes}")
         if blob_offset + blob_bytes > file_size:
             raise ValueError(f"blob out of bounds for {name!r}")
+        layout, param_kind = decode_reserved0(reserved0)
         shape = (s0, s1, s2, s3)[:rank]
         entries.append(
             PackedTensorMeta(
@@ -1423,6 +2087,8 @@ def _unpack_directory(
                 params_offset=params_offset,
                 params_bytes=params_bytes,
                 blob_crc32=blob_crc32,
+                layout=layout,
+                quant_param_kind=param_kind,
             )
         )
     return entries
@@ -1482,11 +2148,52 @@ class AmfReader:
                 )
         return raw
 
+    def _read_sme2_panel_f32(
+        self,
+        entry: PackedTensorMeta,
+        panel_idx: int,
+        num_rows: int,
+    ) -> list[list[float]]:
+        _, k = entry.shape
+        groups = k // SME2_GROUP_K
+        if entry.dtype in (DType.F16, DType.BF16):
+            panel_bytes = groups * SME2_F16_GROUP_BYTES
+            raw = _read_exact(self._fh, entry.blob_offset + panel_idx * panel_bytes, panel_bytes)
+            row_raws = unpack_sme2_panel64_f16_panel(raw, k, num_rows=num_rows)
+            conv = f16_bytes_to_f32_list if entry.dtype == DType.F16 else bf16_bytes_to_f32_list
+            return [conv(r) for r in row_raws]
+        if entry.dtype == DType.Q4_AFFINE:
+            panel_bytes = groups * SME2_Q4_GROUP_BYTES
+            raw = _read_exact(self._fh, entry.blob_offset + panel_idx * panel_bytes, panel_bytes)
+            return dequantize_sme2_panel64_q4_panel_f32(
+                raw, k, num_rows=num_rows, param_kind=entry.quant_param_kind
+            )
+        if entry.dtype == DType.Q3_AFFINE:
+            panel_bytes = groups * SME2_Q3_GROUP_BYTES
+            raw = _read_exact(self._fh, entry.blob_offset + panel_idx * panel_bytes, panel_bytes)
+            return dequantize_sme2_panel64_q3_panel_f32(
+                raw, k, num_rows=num_rows, param_kind=entry.quant_param_kind
+            )
+        raise ValueError(f"unsupported sme2_panel64 dtype {entry.dtype.name} for {entry.name!r}")
+
     def read_rows_f32(self, entry: PackedTensorMeta, row_indices: Sequence[int]) -> list[list[float]]:
         """Stream only selected rows of a 2D tensor into fp32 lists via `os.pread`."""
         if len(entry.shape) != 2:
             raise ValueError(f"read_rows_f32 requires a 2D tensor, got {entry.name!r} {entry.shape}")
         n_rows, k = entry.shape
+        if entry.layout == TensorLayout.SME2_PANEL64:
+            panel_cache: dict[int, list[list[float]]] = {}
+            out_sme: list[list[float]] = []
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                p = r // SME2_PANEL_COLS
+                c = r % SME2_PANEL_COLS
+                if p not in panel_cache:
+                    valid_in_panel = min(SME2_PANEL_COLS, n_rows - p * SME2_PANEL_COLS)
+                    panel_cache[p] = self._read_sme2_panel_f32(entry, p, valid_in_panel)
+                out_sme.append(panel_cache[p][c])
+            return out_sme
         out: list[list[float]] = []
 
         if entry.dtype in (DType.Q3_AFFINE, DType.Q4_AFFINE):
@@ -1541,6 +2248,13 @@ class AmfReader:
         if len(entry.shape) != 2:
             raise ValueError(f"read_matrix_f32 requires a 2D tensor, got {entry.name!r} {entry.shape}")
         n_rows, k = entry.shape
+        if entry.layout == TensorLayout.SME2_PANEL64:
+            panels = (n_rows + SME2_PANEL_COLS - 1) // SME2_PANEL_COLS
+            rows_out: list[list[float]] = []
+            for p in range(panels):
+                valid = min(SME2_PANEL_COLS, n_rows - p * SME2_PANEL_COLS)
+                rows_out.extend(self._read_sme2_panel_f32(entry, p, valid))
+            return rows_out
         if entry.dtype in (DType.Q3_AFFINE, DType.Q4_AFFINE):
             data_mv = memoryview(_read_exact(self._fh, entry.blob_offset, entry.data_bytes))
             params_mv = memoryview(
@@ -1574,6 +2288,38 @@ class AmfReader:
 
     def read_tensor_f16_bytes(self, entry: PackedTensorMeta) -> bytes:
         """Read and convert/dequantize any floating/quantized tensor to little-endian fp16 bytes."""
+        if entry.layout == TensorLayout.SME2_PANEL64:
+            if len(entry.shape) != 2:
+                raise ValueError(f"sme2_panel64 tensor {entry.name!r} must be 2D, got {entry.shape}")
+            n_rows, k = entry.shape
+            panels = (n_rows + SME2_PANEL_COLS - 1) // SME2_PANEL_COLS
+            if entry.dtype in (DType.F16, DType.BF16):
+                groups = k // SME2_GROUP_K
+                panel_bytes = groups * SME2_F16_GROUP_BYTES
+                chunks_f16: list[bytes] = []
+                for p in range(panels):
+                    valid = min(SME2_PANEL_COLS, n_rows - p * SME2_PANEL_COLS)
+                    raw = _read_exact(self._fh, entry.blob_offset + p * panel_bytes, panel_bytes)
+                    for row_raw in unpack_sme2_panel64_f16_panel(raw, k, num_rows=valid):
+                        chunks_f16.append(
+                            row_raw if entry.dtype == DType.F16 else bf16_bytes_to_f16_bytes(row_raw, what=entry.name)
+                        )
+                return b"".join(chunks_f16)
+            out_f16 = bytearray(n_rows * k * 2)
+            row_packer = struct.Struct(f"<{k}e")
+            row_out_bytes = k * 2
+            row_cursor = 0
+            for p in range(panels):
+                valid = min(SME2_PANEL_COLS, n_rows - p * SME2_PANEL_COLS)
+                for vals in self._read_sme2_panel_f32(entry, p, valid):
+                    try:
+                        row_packer.pack_into(out_f16, row_cursor * row_out_bytes, *vals)
+                    except OverflowError as exc:
+                        raise ValueError(
+                            f"{entry.name}[{row_cursor}]: dequantized value exceeds IEEE float16 range"
+                        ) from exc
+                    row_cursor += 1
+            return bytes(out_f16)
         if entry.dtype == DType.F16:
             return _read_exact(self._fh, entry.blob_offset, entry.data_bytes)
         if entry.dtype == DType.BF16:
@@ -1725,6 +2471,8 @@ def retag_amf_cold_experts(
                     params_offset=m.params_offset,
                     params_bytes=m.params_bytes,
                     blob_crc32=m.blob_crc32,
+                    layout=m.layout,
+                    quant_param_kind=m.quant_param_kind,
                 )
         updated.append(m)
 
@@ -1776,3 +2524,205 @@ def retag_amf_cold_experts(
         partial.unlink(missing_ok=True)
         raise
     return hot_count, cold_count
+
+
+def _verify_source_blob_crc(src_fh, entry: PackedTensorMeta) -> None:
+    crc = 0
+    done = 0
+    while done < entry.blob_bytes:
+        take = min(_COPY_CHUNK_BYTES, entry.blob_bytes - done)
+        chunk = _read_exact(src_fh, entry.blob_offset + done, take)
+        crc = zlib.crc32(chunk, crc)
+        done += take
+    got = crc & 0xFFFFFFFF
+    if got != entry.blob_crc32:
+        raise ValueError(
+            f"source blob CRC mismatch for {entry.name!r}: expected {entry.blob_crc32:#010x}, got {got:#010x}"
+        )
+
+
+def _stream_repack_amf_entry(src_fh, entry: PackedTensorMeta, new_blob_bytes: int, w: _BlobWriter) -> None:
+    """Stream one `ROW_MAJOR` 2D `.amf` tensor 16 rows at a time into `SME2_PANEL64`."""
+    n_rows, k = entry.shape
+    panels = (n_rows + SME2_PANEL_COLS - 1) // SME2_PANEL_COLS
+    if entry.dtype in (DType.F16, DType.BF16):
+        row_bytes = k * 2
+        for p in range(panels):
+            r0 = p * SME2_PANEL_COLS
+            count = min(SME2_PANEL_COLS, n_rows - r0)
+            raw = _read_exact(src_fh, entry.blob_offset + r0 * row_bytes, count * row_bytes)
+            mv = memoryview(raw)
+            rows = [mv[c * row_bytes : (c + 1) * row_bytes] for c in range(count)]
+            w.write(pack_sme2_panel64_f16_panel(rows, k))
+    elif entry.dtype in (DType.Q4_AFFINE, DType.Q3_AFFINE):
+        groups = k // entry.group_size
+        row_data_bytes = k // 2 if entry.dtype == DType.Q4_AFFINE else (k * 3) // 8
+        row_param_bytes = groups * 4
+        packer = pack_sme2_panel64_q4_panel if entry.dtype == DType.Q4_AFFINE else pack_sme2_panel64_q3_panel
+        for p in range(panels):
+            r0 = p * SME2_PANEL_COLS
+            count = min(SME2_PANEL_COLS, n_rows - r0)
+            raw_d = _read_exact(src_fh, entry.blob_offset + r0 * row_data_bytes, count * row_data_bytes)
+            raw_p = _read_exact(
+                src_fh,
+                entry.blob_offset + entry.params_offset + r0 * row_param_bytes,
+                count * row_param_bytes,
+            )
+            d_mv = memoryview(raw_d)
+            p_mv = memoryview(raw_p)
+            d_rows = [d_mv[c * row_data_bytes : (c + 1) * row_data_bytes] for c in range(count)]
+            p_rows = [p_mv[c * row_param_bytes : (c + 1) * row_param_bytes] for c in range(count)]
+            w.write(packer(d_rows, p_rows, k))
+    else:
+        raise ValueError(f"cannot repack unsupported dtype {entry.dtype.name} for {entry.name!r}")
+
+    expected_data = sme2_panel64_data_bytes(entry.dtype, n_rows, k, entry.group_size)
+    if w.written != expected_data:
+        raise AssertionError(f"repacked {w.written} bytes for {entry.name!r}, expected {expected_data}")
+    w.zeros(new_blob_bytes - w.written)
+
+
+def repack_amf_sme2(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    *,
+    targets: str = "routers",
+    verify_source_crc: bool = True,
+) -> list[PackedTensorMeta]:
+    """Stream-convert selected 2D tensors in an `.amf` v0 file into single-owner `sme2_panel64`.
+
+    Preserves single-owner layout (every tensor appears once — never duplicated in both
+    `row_major` and `sme2_panel64`), 16 KiB page alignment, IEEE CRC-32 checksums, and
+    all metadata (`kind`, `dtype`, `layer`, `expert`, `shape`). Already-packed
+    `sme2_panel64` entries are copied verbatim so repacking is idempotent.
+    """
+    if targets not in SME2_REPACK_TARGETS:
+        raise ValueError(f"targets must be one of {SME2_REPACK_TARGETS}, got {targets!r}")
+
+    src_path = pathlib.Path(input_path)
+    dst_path = pathlib.Path(output_path)
+    header, entries = load_amf_metadata(src_path)
+
+    tensor_count = len(entries)
+    dir_offset = APPLE_PAGE_SIZE
+    dir_raw_len = tensor_count * ENTRY_STRUCT.size
+    dir_bytes = 0 if tensor_count == 0 else _align_up(dir_raw_len, APPLE_PAGE_SIZE)
+
+    planned: list[tuple[PackedTensorMeta, bool, int, int, int, int, int, TensorLayout, QuantParamKind]] = []
+    cursor = dir_offset + dir_bytes
+    for m in entries:
+        needs_repack = m.layout == TensorLayout.ROW_MAJOR and _should_sme2_pack(m.kind, m.dtype, m.shape, targets)
+        if needs_repack:
+            new_layout = TensorLayout.SME2_PANEL64
+            new_param_kind = QuantParamKind.AFFINE_SCALE_BIAS
+            new_data_bytes = sme2_panel64_data_bytes(m.dtype, m.shape[0], m.shape[1], m.group_size)
+            new_params_offset = 0
+            new_params_bytes = 0
+            new_blob_bytes = _align_up(max(new_data_bytes, 1), APPLE_PAGE_SIZE)
+        else:
+            new_layout = m.layout
+            new_param_kind = m.quant_param_kind
+            new_data_bytes = m.data_bytes
+            new_params_offset = m.params_offset
+            new_params_bytes = m.params_bytes
+            new_blob_bytes = m.blob_bytes
+        planned.append(
+            (
+                m,
+                needs_repack,
+                cursor,
+                new_blob_bytes,
+                new_data_bytes,
+                new_params_offset,
+                new_params_bytes,
+                new_layout,
+                new_param_kind,
+            )
+        )
+        cursor += new_blob_bytes
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    partial = dst_path.with_name(dst_path.name + ".partial")
+    new_metas: list[PackedTensorMeta] = []
+    try:
+        with src_path.open("rb", buffering=0) as src_fh, partial.open("wb") as out_fh:
+            _set_nocache(src_fh.fileno())
+            _set_nocache(out_fh.fileno())
+            prefix = _BlobWriter(out_fh)
+            prefix.zeros(dir_offset + dir_bytes)
+
+            for (
+                m,
+                needs_repack,
+                blob_offset,
+                new_blob_bytes,
+                new_data_bytes,
+                new_params_offset,
+                new_params_bytes,
+                new_layout,
+                new_param_kind,
+            ) in planned:
+                if out_fh.tell() != blob_offset:
+                    raise AssertionError(f"planned offset {blob_offset} != file pos {out_fh.tell()} for {m.name!r}")
+                w = _BlobWriter(out_fh)
+                if needs_repack:
+                    if verify_source_crc:
+                        _verify_source_blob_crc(src_fh, m)
+                    _stream_repack_amf_entry(src_fh, m, new_blob_bytes, w)
+                else:
+                    done = 0
+                    while done < m.blob_bytes:
+                        take = min(_COPY_CHUNK_BYTES, m.blob_bytes - done)
+                        w.write(_read_exact(src_fh, m.blob_offset + done, take))
+                        done += take
+                    if verify_source_crc and (w.crc & 0xFFFFFFFF) != m.blob_crc32:
+                        raise ValueError(
+                            f"source blob CRC mismatch for {m.name!r}: "
+                            f"expected {m.blob_crc32:#010x}, got {w.crc & 0xFFFFFFFF:#010x}"
+                        )
+                if w.written != new_blob_bytes:
+                    raise AssertionError(f"wrote {w.written} bytes for {m.name!r}, planned {new_blob_bytes}")
+                new_metas.append(
+                    PackedTensorMeta(
+                        name=m.name,
+                        kind=m.kind,
+                        dtype=m.dtype,
+                        quant_bits=m.quant_bits,
+                        group_size=m.group_size,
+                        layer=m.layer,
+                        expert=m.expert,
+                        shape=m.shape,
+                        blob_offset=blob_offset,
+                        blob_bytes=new_blob_bytes,
+                        data_bytes=new_data_bytes,
+                        params_offset=new_params_offset,
+                        params_bytes=new_params_bytes,
+                        blob_crc32=w.crc & 0xFFFFFFFF,
+                        layout=new_layout,
+                        quant_param_kind=new_param_kind,
+                    )
+                )
+
+            if out_fh.tell() != cursor:
+                raise AssertionError(f"final size {out_fh.tell()} != planned {cursor}")
+
+            dir_raw = _pack_directory(new_metas)
+            new_header = _pack_header(
+                header.model_id.encode("utf-8"),
+                tensor_count,
+                dir_offset,
+                dir_bytes,
+                _crc32(dir_raw),
+            )
+            out_fh.seek(0)
+            out_fh.write(new_header)
+            if dir_raw:
+                out_fh.seek(dir_offset)
+                out_fh.write(dir_raw)
+            out_fh.flush()
+            os.fsync(out_fh.fileno())
+        os.replace(partial, dst_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return new_metas

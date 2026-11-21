@@ -15,6 +15,28 @@ pub const CHECKSUM_CRC32_IEEE: u32 = 1;
 pub const NO_LAYER: u16 = 0xFFFF;
 pub const NO_EXPERT: u16 = 0xFFFF;
 
+/// ARMv9 SME2 `sme2_panel64` geometry constants (ADR-0018, W15).
+pub const SME2_PANEL_COLS: u64 = 16;
+pub const SME2_GROUP_K: u64 = 64;
+pub const SME2_QUANT_HEADER_BYTES: u64 = 128;
+pub const SME2_F16_GROUP_BYTES: u64 = 2048; // 32 kp chunks * 32 u16 lanes
+pub const SME2_Q4_GROUP_BYTES: u64 = 640; // 128 B inline header + 512 B packed codes
+pub const SME2_Q3_GROUP_BYTES: u64 = 512; // 128 B inline header + 384 B packed codes
+
+/// Single-owner tensor byte layout stored in the low byte of `TensorEntry.reserved0`
+/// (ADR-0018, W15). Existing `.amf` v0 files carry `reserved0 == 0` (`row_major`).
+pub const TensorLayout = enum(u8) {
+    row_major = 0,
+    sme2_panel64 = 1,
+};
+
+/// Quantization parameter encoding stored in the high byte of `TensorEntry.reserved0`
+/// (ADR-0017, ADR-0018). Existing `.amf` v0 files carry `reserved0 == 0` (`affine_scale_bias`).
+pub const QuantParamKind = enum(u8) {
+    affine_scale_bias = 0,
+    lut16_codebook = 1,
+};
+
 pub const TensorKind = enum(u8) {
     dense = 0,
     hot_expert = 1,
@@ -113,6 +135,20 @@ pub const TensorEntry = extern struct {
         return std.enums.fromInt(DType, self.dtype) orelse error.InvalidDType;
     }
 
+    pub fn tensorLayout(self: *const TensorEntry) ParseError!TensorLayout {
+        const raw: u8 = @truncate(self.reserved0 & 0x00FF);
+        return std.enums.fromInt(TensorLayout, raw) orelse error.InvalidTensorLayout;
+    }
+
+    pub fn quantParamKind(self: *const TensorEntry) ParseError!QuantParamKind {
+        const raw: u8 = @truncate(self.reserved0 >> 8);
+        return std.enums.fromInt(QuantParamKind, raw) orelse error.InvalidQuantParamKind;
+    }
+
+    pub fn setLayoutAndParamKind(self: *TensorEntry, layout: TensorLayout, param_kind: QuantParamKind) void {
+        self.reserved0 = @as(u16, @backingInt(layout)) | (@as(u16, @backingInt(param_kind)) << 8);
+    }
+
     /// Exposes a cold-expert directory record as an `ExpertSource.local_nvme_ssd`.
     pub fn asNvmeSource(self: *const TensorEntry, file_index: u16) expert.NvmeExpert.InitError!expert.ExpertSource {
         return .{ .local_nvme_ssd = try expert.NvmeExpert.init(file_index, self.blob_offset, self.blob_bytes) };
@@ -122,6 +158,37 @@ pub const TensorEntry = extern struct {
 comptime {
     if (@sizeOf(Header) != 128) @compileError("AMF Header must be 128 bytes");
     if (@sizeOf(TensorEntry) != 128) @compileError("AMF TensorEntry must be 128 bytes");
+    if (@offsetOf(TensorEntry, "reserved0") != 58) @compileError("AMF TensorEntry.reserved0 must remain at byte offset 58");
+}
+
+/// Returns the exact packed payload byte length (`data_bytes`) of a 2D `[n, k]`
+/// tensor in `TensorLayout.sme2_panel64` (ADR-0018, W15).
+///
+/// Rows `n .. ((n + 15) & ~15)` are zero-padded; `k` must be a non-zero multiple
+/// of `64`. Quantized dtypes embed their 128 B per-(panel, group) header inline
+/// inside `data_bytes` (`params_offset = 0`, `params_bytes = 0`).
+pub fn sme2Panel64BlobBytes(dtype: DType, n: u64, k: u64, group_size: u16) ParseError!u64 {
+    if (n == 0 or k == 0 or k % SME2_GROUP_K != 0) return error.InvalidShape;
+    const group_bytes: u64 = switch (dtype) {
+        .f16, .bf16 => blk: {
+            if (group_size != 0) return error.InvalidQuantization;
+            break :blk SME2_F16_GROUP_BYTES;
+        },
+        .q4_affine => blk: {
+            if (group_size != SME2_GROUP_K) return error.InvalidQuantization;
+            break :blk SME2_Q4_GROUP_BYTES;
+        },
+        .q3_affine => blk: {
+            if (group_size != SME2_GROUP_K) return error.InvalidQuantization;
+            break :blk SME2_Q3_GROUP_BYTES;
+        },
+        .f32, .u32 => return error.InvalidTensorLayout,
+    };
+    const n_plus_pad = std.math.add(u64, n, SME2_PANEL_COLS - 1) catch return error.InvalidShape;
+    const panels = n_plus_pad / SME2_PANEL_COLS;
+    const groups = k / SME2_GROUP_K;
+    const panel_groups = std.math.mul(u64, panels, groups) catch return error.InvalidShape;
+    return std.math.mul(u64, panel_groups, group_bytes) catch return error.InvalidShape;
 }
 
 pub inline fn align64(len: usize) usize {
@@ -149,6 +216,8 @@ pub const ParseError = error{
     EmptyTensorName,
     InvalidTensorKind,
     InvalidDType,
+    InvalidTensorLayout,
+    InvalidQuantParamKind,
     InvalidRank,
     InvalidQuantization,
     InvalidShape,
@@ -455,6 +524,8 @@ fn validateEntries(
         gop.value_ptr.* = @intCast(i);
         _ = try entry.tensorKind();
         const dtype = try entry.dataType();
+        const layout = try entry.tensorLayout();
+        const param_kind = try entry.quantParamKind();
         if (entry.rank == 0 or entry.rank > 4) return error.InvalidRank;
 
         if (entry.blob_offset < data_start or
@@ -467,40 +538,69 @@ fn validateEntries(
         const blob_end = std.math.add(u64, entry.blob_offset, entry.blob_bytes) catch return error.BlobOutOfBounds;
         if (blob_end > file_size) return error.BlobOutOfBounds;
 
-        switch (dtype) {
-            .f16, .bf16, .f32, .u32 => {
-                if (entry.quant_bits != 0 or entry.group_size != 0) return error.InvalidQuantization;
-                if (entry.params_offset != 0 or entry.params_bytes != 0) return error.MisalignedParams;
-                var elems: u64 = 1;
-                for (0..entry.rank) |d| {
-                    if (entry.shape[d] == 0) return error.InvalidShape;
-                    elems = std.math.mul(u64, elems, entry.shape[d]) catch return error.InvalidShape;
-                }
-                const elem_size: u64 = dtype.unquantizedElemSize() orelse unreachable;
-                const expected_bytes = std.math.mul(u64, elems, elem_size) catch return error.InvalidShape;
-                if (entry.data_bytes != expected_bytes or entry.data_bytes > entry.blob_bytes) {
-                    return error.InvalidShape;
+        switch (layout) {
+            .row_major => {
+                if (param_kind != .affine_scale_bias) return error.InvalidQuantParamKind;
+                switch (dtype) {
+                    .f16, .bf16, .f32, .u32 => {
+                        if (entry.quant_bits != 0 or entry.group_size != 0) return error.InvalidQuantization;
+                        if (entry.params_offset != 0 or entry.params_bytes != 0) return error.MisalignedParams;
+                        var elems: u64 = 1;
+                        for (0..entry.rank) |d| {
+                            if (entry.shape[d] == 0) return error.InvalidShape;
+                            elems = std.math.mul(u64, elems, entry.shape[d]) catch return error.InvalidShape;
+                        }
+                        const elem_size: u64 = dtype.unquantizedElemSize() orelse unreachable;
+                        const expected_bytes = std.math.mul(u64, elems, elem_size) catch return error.InvalidShape;
+                        if (entry.data_bytes != expected_bytes or entry.data_bytes > entry.blob_bytes) {
+                            return error.InvalidShape;
+                        }
+                    },
+                    .q4_affine, .q3_affine => {
+                        const expected_bits: u8 = if (dtype == .q4_affine) 4 else 3;
+                        if (entry.rank != 2) return error.InvalidRank;
+                        if (entry.quant_bits != expected_bits or entry.group_size != 64) {
+                            return error.InvalidQuantization;
+                        }
+                        const n: u64 = entry.shape[0];
+                        const k: u64 = entry.shape[1];
+                        if (n == 0 or k == 0 or k % entry.group_size != 0) return error.InvalidShape;
+                        const expected_data = n * ((k * expected_bits) / 8);
+                        const expected_params = n * (k / entry.group_size) * @sizeOf(quant.ScaleBias);
+                        if (entry.data_bytes != expected_data or entry.params_bytes != expected_params) {
+                            return error.InvalidShape;
+                        }
+                        if (entry.params_offset < entry.data_bytes or entry.params_offset % 64 != 0) {
+                            return error.MisalignedParams;
+                        }
+                        const end_in_blob = std.math.add(u64, entry.params_offset, entry.params_bytes) catch return error.BlobOutOfBounds;
+                        if (end_in_blob > entry.blob_bytes) return error.BlobOutOfBounds;
+                    },
                 }
             },
-            .q4_affine, .q3_affine => {
-                const expected_bits: u8 = if (dtype == .q4_affine) 4 else 3;
+            .sme2_panel64 => {
                 if (entry.rank != 2) return error.InvalidRank;
-                if (entry.quant_bits != expected_bits or entry.group_size != 64) {
-                    return error.InvalidQuantization;
+                if (entry.params_offset != 0 or entry.params_bytes != 0) return error.MisalignedParams;
+                switch (dtype) {
+                    .f16, .bf16 => {
+                        if (param_kind != .affine_scale_bias) return error.InvalidQuantParamKind;
+                        if (entry.quant_bits != 0 or entry.group_size != 0) return error.InvalidQuantization;
+                    },
+                    .q4_affine => {
+                        if (entry.quant_bits != 4 or entry.group_size != SME2_GROUP_K) {
+                            return error.InvalidQuantization;
+                        }
+                    },
+                    .q3_affine => {
+                        if (entry.quant_bits != 3 or entry.group_size != SME2_GROUP_K) {
+                            return error.InvalidQuantization;
+                        }
+                    },
+                    .f32, .u32 => return error.InvalidTensorLayout,
                 }
-                const n: u64 = entry.shape[0];
-                const k: u64 = entry.shape[1];
-                if (n == 0 or k == 0 or k % entry.group_size != 0) return error.InvalidShape;
-                const expected_data = n * ((k * expected_bits) / 8);
-                const expected_params = n * (k / entry.group_size) * @sizeOf(quant.ScaleBias);
-                if (entry.data_bytes != expected_data or entry.params_bytes != expected_params) {
-                    return error.InvalidShape;
-                }
-                if (entry.params_offset < entry.data_bytes or entry.params_offset % 64 != 0) {
-                    return error.MisalignedParams;
-                }
-                const end_in_blob = std.math.add(u64, entry.params_offset, entry.params_bytes) catch return error.BlobOutOfBounds;
-                if (end_in_blob > entry.blob_bytes) return error.BlobOutOfBounds;
+                const expected_data = try sme2Panel64BlobBytes(dtype, entry.shape[0], entry.shape[1], entry.group_size);
+                if (entry.data_bytes != expected_data) return error.InvalidShape;
+                if (entry.data_bytes > entry.blob_bytes) return error.BlobOutOfBounds;
             },
         }
         ranges[i] = .{ .start = entry.blob_offset, .end = blob_end };
@@ -1086,4 +1186,211 @@ test "validator rejects invalid u32 metadata" {
         defer gpa.free(image);
         try std.testing.expectError(c.err, Parsed.parseBytes(gpa, image));
     }
+}
+
+test "TensorEntry reserved0 encodes TensorLayout and QuantParamKind with 100% v0 compatibility" {
+    try std.testing.expectEqual(@as(usize, 58), @offsetOf(TensorEntry, "reserved0"));
+
+    // Existing v0 zero-initialized entries decode to row_major + affine_scale_bias.
+    var entry = TensorEntry.zeroed("layers.0.mlp.gate.weight", .router, .bf16);
+    try std.testing.expectEqual(@as(u16, 0), entry.reserved0);
+    try std.testing.expectEqual(TensorLayout.row_major, try entry.tensorLayout());
+    try std.testing.expectEqual(QuantParamKind.affine_scale_bias, try entry.quantParamKind());
+
+    entry.setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
+    try std.testing.expectEqual(@as(u16, 0x0001), entry.reserved0);
+    try std.testing.expectEqual(TensorLayout.sme2_panel64, try entry.tensorLayout());
+    try std.testing.expectEqual(QuantParamKind.affine_scale_bias, try entry.quantParamKind());
+
+    entry.setLayoutAndParamKind(.sme2_panel64, .lut16_codebook);
+    try std.testing.expectEqual(@as(u16, 0x0101), entry.reserved0);
+    try std.testing.expectEqual(TensorLayout.sme2_panel64, try entry.tensorLayout());
+    try std.testing.expectEqual(QuantParamKind.lut16_codebook, try entry.quantParamKind());
+
+    entry.reserved0 = 0x0002;
+    try std.testing.expectError(error.InvalidTensorLayout, entry.tensorLayout());
+
+    entry.reserved0 = 0x0201;
+    try std.testing.expectEqual(TensorLayout.sme2_panel64, try entry.tensorLayout());
+    try std.testing.expectError(error.InvalidQuantParamKind, entry.quantParamKind());
+}
+
+test "sme2Panel64BlobBytes computes exact panel sizes including N%16!=0 padding" {
+    // Unquantized f16 / bf16: 2048 B per (panel, group), group_size == 0.
+    try std.testing.expectEqual(@as(u64, 2048), try sme2Panel64BlobBytes(.bf16, 16, 64, 0));
+    try std.testing.expectEqual(@as(u64, 2048), try sme2Panel64BlobBytes(.f16, 1, 64, 0));
+    try std.testing.expectEqual(@as(u64, 2 * 2 * 2048), try sme2Panel64BlobBytes(.bf16, 17, 128, 0));
+    try std.testing.expectEqual(@as(u64, 3 * 2 * 2048), try sme2Panel64BlobBytes(.f16, 33, 128, 0));
+
+    // Quantized q4_affine: 640 B per (panel, group), group_size == 64.
+    try std.testing.expectEqual(@as(u64, 640), try sme2Panel64BlobBytes(.q4_affine, 16, 64, 64));
+    try std.testing.expectEqual(@as(u64, 2 * 3 * 640), try sme2Panel64BlobBytes(.q4_affine, 17, 192, 64));
+
+    // Quantized q3_affine: 512 B per (panel, group), group_size == 64.
+    try std.testing.expectEqual(@as(u64, 512), try sme2Panel64BlobBytes(.q3_affine, 16, 64, 64));
+    try std.testing.expectEqual(@as(u64, 3 * 2 * 512), try sme2Panel64BlobBytes(.q3_affine, 33, 128, 64));
+
+    // Reject invalid shapes, group sizes, and unsupported dtypes.
+    try std.testing.expectError(error.InvalidShape, sme2Panel64BlobBytes(.bf16, 0, 64, 0));
+    try std.testing.expectError(error.InvalidShape, sme2Panel64BlobBytes(.bf16, 16, 0, 0));
+    try std.testing.expectError(error.InvalidShape, sme2Panel64BlobBytes(.bf16, 16, 32, 0));
+    try std.testing.expectError(error.InvalidQuantization, sme2Panel64BlobBytes(.bf16, 16, 64, 64));
+    try std.testing.expectError(error.InvalidQuantization, sme2Panel64BlobBytes(.q4_affine, 16, 64, 0));
+    try std.testing.expectError(error.InvalidQuantization, sme2Panel64BlobBytes(.q3_affine, 16, 64, 32));
+    try std.testing.expectError(error.InvalidTensorLayout, sme2Panel64BlobBytes(.f32, 16, 64, 0));
+    try std.testing.expectError(error.InvalidTensorLayout, sme2Panel64BlobBytes(.u32, 16, 64, 0));
+}
+
+test "validator accepts valid sme2_panel64 blobs and rejects malformed reserved0 or metadata" {
+    const gpa = std.testing.allocator;
+
+    // 1. Valid bf16 sme2_panel64 with N = 17 (padded to 32 -> 2 panels), K = 128 (2 groups) => 8192 B.
+    const bf16_len = try sme2Panel64BlobBytes(.bf16, 17, 128, 0);
+    const bf16_buf = try gpa.alloc(u8, @intCast(bf16_len));
+    defer gpa.free(bf16_buf);
+    @memset(bf16_buf, 0x2A);
+
+    var bf16_entry = TensorEntry.zeroed("layers.0.mlp.gate.weight", .router, .bf16);
+    bf16_entry.rank = 2;
+    bf16_entry.layer = 0;
+    bf16_entry.shape = .{ 17, 128, 0, 0 };
+    bf16_entry.data_bytes = bf16_len;
+    bf16_entry.setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
+
+    const bf16_img = try buildTestAmf(gpa, bf16_entry, bf16_buf);
+    defer gpa.free(bf16_img);
+    var parsed_bf16 = try Parsed.parseBytes(gpa, bf16_img);
+    defer parsed_bf16.deinit(gpa);
+    try parsed_bf16.verifyAllBlobsFromBytes(bf16_img);
+    const found_bf16 = parsed_bf16.find("layers.0.mlp.gate.weight") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(TensorLayout.sme2_panel64, try found_bf16.tensorLayout());
+    try std.testing.expectEqual(QuantParamKind.affine_scale_bias, try found_bf16.quantParamKind());
+
+    // 2. Valid q4_affine sme2_panel64 (both affine_scale_bias and lut16_codebook) with N = 33, K = 128.
+    const q4_len = try sme2Panel64BlobBytes(.q4_affine, 33, 128, 64);
+    const q4_buf = try gpa.alloc(u8, @intCast(q4_len));
+    defer gpa.free(q4_buf);
+    @memset(q4_buf, 0x51);
+
+    for ([_]QuantParamKind{ .affine_scale_bias, .lut16_codebook }) |pk| {
+        var q4_entry = TensorEntry.zeroed("layers.0.self_attn.q_proj", .dense, .q4_affine);
+        q4_entry.quant_bits = 4;
+        q4_entry.rank = 2;
+        q4_entry.group_size = 64;
+        q4_entry.layer = 0;
+        q4_entry.shape = .{ 33, 128, 0, 0 };
+        q4_entry.data_bytes = q4_len;
+        q4_entry.params_offset = 0;
+        q4_entry.params_bytes = 0;
+        q4_entry.setLayoutAndParamKind(.sme2_panel64, pk);
+
+        const q4_img = try buildTestAmf(gpa, q4_entry, q4_buf);
+        defer gpa.free(q4_img);
+        var parsed_q4 = try Parsed.parseBytes(gpa, q4_img);
+        defer parsed_q4.deinit(gpa);
+        try parsed_q4.verifyAllBlobsFromBytes(q4_img);
+        const found_q4 = parsed_q4.find("layers.0.self_attn.q_proj") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(TensorLayout.sme2_panel64, try found_q4.tensorLayout());
+        try std.testing.expectEqual(pk, try found_q4.quantParamKind());
+    }
+
+    // 3. Valid q3_affine sme2_panel64 with N = 19, K = 64 (2 panels * 1 group * 512 B = 1024 B).
+    const q3_len = try sme2Panel64BlobBytes(.q3_affine, 19, 64, 64);
+    const q3_buf = try gpa.alloc(u8, @intCast(q3_len));
+    defer gpa.free(q3_buf);
+    @memset(q3_buf, 0x73);
+
+    var q3_entry = TensorEntry.zeroed("layers.0.mlp.experts.0.gate_proj", .cold_expert, .q3_affine);
+    q3_entry.quant_bits = 3;
+    q3_entry.rank = 2;
+    q3_entry.group_size = 64;
+    q3_entry.layer = 0;
+    q3_entry.expert = 0;
+    q3_entry.shape = .{ 19, 64, 0, 0 };
+    q3_entry.data_bytes = q3_len;
+    q3_entry.setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
+
+    const q3_img = try buildTestAmf(gpa, q3_entry, q3_buf);
+    defer gpa.free(q3_img);
+    var parsed_q3 = try Parsed.parseBytes(gpa, q3_img);
+    defer parsed_q3.deinit(gpa);
+    try parsed_q3.verifyAllBlobsFromBytes(q3_img);
+
+    // 4. Reject invalid reserved0 and invalid sme2_panel64 metadata combinations.
+    const Case = struct { err: ParseError, entry: TensorEntry };
+    var cases: [11]Case = undefined;
+    var n_cases: usize = 0;
+
+    var bad = bf16_entry;
+    bad.reserved0 = 0x0002; // unknown TensorLayout
+    cases[n_cases] = .{ .err = error.InvalidTensorLayout, .entry = bad };
+    n_cases += 1;
+
+    bad = bf16_entry;
+    bad.reserved0 = 0x0201; // unknown QuantParamKind
+    cases[n_cases] = .{ .err = error.InvalidQuantParamKind, .entry = bad };
+    n_cases += 1;
+
+    bad = bf16_entry;
+    bad.setLayoutAndParamKind(.sme2_panel64, .lut16_codebook); // lut16 invalid on unquantized bf16
+    cases[n_cases] = .{ .err = error.InvalidQuantParamKind, .entry = bad };
+    n_cases += 1;
+
+    bad = bf16TestEntry();
+    bad.setLayoutAndParamKind(.row_major, .lut16_codebook); // lut16 invalid on row_major
+    cases[n_cases] = .{ .err = error.InvalidQuantParamKind, .entry = bad };
+    n_cases += 1;
+
+    bad = bf16_entry;
+    bad.params_offset = 64; // sme2_panel64 requires inline metadata (params_offset == 0)
+    cases[n_cases] = .{ .err = error.MisalignedParams, .entry = bad };
+    n_cases += 1;
+
+    bad = bf16_entry;
+    bad.params_bytes = 64; // sme2_panel64 requires inline metadata (params_bytes == 0)
+    cases[n_cases] = .{ .err = error.MisalignedParams, .entry = bad };
+    n_cases += 1;
+
+    bad = bf16_entry;
+    bad.rank = 1;
+    cases[n_cases] = .{ .err = error.InvalidRank, .entry = bad };
+    n_cases += 1;
+
+    bad = bf16_entry;
+    bad.data_bytes = 17 * 128 * 2; // row-major unpadded byte size instead of panel-padded
+    cases[n_cases] = .{ .err = error.InvalidShape, .entry = bad };
+    n_cases += 1;
+
+    bad = bf16_entry;
+    bad.shape = .{ 17, 96, 0, 0 }; // K not multiple of 64
+    cases[n_cases] = .{ .err = error.InvalidShape, .entry = bad };
+    n_cases += 1;
+
+    bad = TensorEntry.zeroed("bad.f32.panel", .dense, .f32);
+    bad.rank = 2;
+    bad.shape = .{ 16, 64, 0, 0 };
+    bad.data_bytes = 4096;
+    bad.setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
+    cases[n_cases] = .{ .err = error.InvalidTensorLayout, .entry = bad };
+    n_cases += 1;
+
+    bad = q3_entry;
+    bad.quant_bits = 4; // mismatched quant_bits for q3_affine
+    cases[n_cases] = .{ .err = error.InvalidQuantization, .entry = bad };
+    n_cases += 1;
+
+    for (cases[0..n_cases]) |c| {
+        const img = try buildTestAmf(gpa, c.entry, bf16_buf);
+        defer gpa.free(img);
+        try std.testing.expectError(c.err, Parsed.parseBytes(gpa, img));
+    }
+
+    // 5. Reject sme2_panel64 whose valid data_bytes exceeds blob_bytes.
+    const big_len = try sme2Panel64BlobBytes(.bf16, 16, 1024, 0); // 16 * 2048 = 32768 B > 16384 B blob
+    var big_entry = bf16_entry;
+    big_entry.shape = .{ 16, 1024, 0, 0 };
+    big_entry.data_bytes = big_len;
+    const big_img = try buildTestAmf(gpa, big_entry, bf16_buf);
+    defer gpa.free(big_img);
+    try std.testing.expectError(error.BlobOutOfBounds, Parsed.parseBytes(gpa, big_img));
 }
