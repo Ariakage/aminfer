@@ -1478,7 +1478,7 @@ in steady state).
 Real EAGLE-3 draft checkpoint packed into `.amf` v0 (`W12`/`D2`) via
 `aminfer-tools pack-amf` and validated with `aminfer verify-amf`:
 - `RedHatAI/Qwen3-30B-A3B-speculator.eagle3` → `qwen3-30b-a3b-eagle3.amf`:
-  15 tensors (`bf16` weights + `u32` `d2t` 32,000-entry reduced-vocab map),
+  15 tensors (`bf16` weights + `u32` `d2t` 64,000-entry reduced-vocab map),
   `1,044,217,856 B` (`996 MiB`), `wired_bytes = 1,044,185,088 B`, `cold_bytes = 0`.
 
 ### Spike S4: CoreML ANE zero-copy handoff, D5 placement gate, and DRAM contention
