@@ -242,10 +242,12 @@ kernel void ami_moe_router_proj(const device half *x [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // Kernel 2: MoE Softmax + Top-K + Deduplicated Active-Expert CSR Schedule
 //
-// Single threadgroup of 256 threads (8 simdgroups). Supports num_experts <= 256
+// Single threadgroup of 256 threads (8 simdgroups). Supports num_experts <= 1024
 // and top_k <= 16. Each simdgroup handles one token fully in registers with
-// zero barriers for softmax and top-k selection, then all 256 threads compact
-// active experts into sorted unique_experts[0..U) and scatter CSR token slots.
+// zero barriers for softmax and top-k selection (E <= 256 fast path retains
+// 8-float register buffering; 256 < E <= 1024 streams with a 32-bit picked mask
+// to avoid dynamic register spills), then all 256 threads compact active experts
+// into sorted unique_experts[0..U) and scatter CSR token slots.
 // ---------------------------------------------------------------------------
 kernel void ami_moe_route_topk(const device uchar *logits_raw [[buffer(0)]],
                                device MoeScheduleHeader *sched_hdr [[buffer(1)]],
@@ -260,62 +262,66 @@ kernel void ami_moe_route_topk(const device uchar *logits_raw [[buffer(0)]],
                                uint tid [[thread_index_in_threadgroup]],
                                uint sg_id [[simdgroup_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup atomic_uint s_counts[256];
-    threadgroup atomic_uint s_cursors[256];
+    threadgroup atomic_uint s_counts[1024];
+    threadgroup atomic_uint s_cursors[1024];
     threadgroup uint s_prefix_tmp[8];
-    threadgroup uint s_total_unique;
+    threadgroup uint s_blk_unique;
+    threadgroup uint s_blk_toks;
 
     const uint top_k = (MOE_TOP_K > 0u) ? MOE_TOP_K : min(p.top_k, 16u);
 
     // Phase 0: clear per-expert token histograms.
-    atomic_store_explicit(&s_counts[tid], 0u, memory_order_relaxed);
+    for (uint e = tid; e < p.num_experts; e += 256u) {
+        atomic_store_explicit(&s_counts[e], 0u, memory_order_relaxed);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 1: parallel per-token fp32 softmax & top-k in registers (8 tokens/wave).
     for (uint tok = sg_id; tok < p.m; tok += 8u) {
-        float vals[8];
-        float local_max = -INFINITY;
-        for (uint r = 0u; r < 8u; r++) {
-            const uint e = lane + r * 32u;
-            if (e < p.num_experts) {
-                const float v = LOGITS_F16
-                    ? float(((const device half *)logits_raw)[ulong(tok) * p.num_experts + e])
-                    : ((const device float *)logits_raw)[ulong(tok) * p.num_experts + e];
-                vals[r] = v;
-                local_max = max(local_max, v);
-            } else {
-                vals[r] = -INFINITY;
-            }
-        }
-
-        const float max_v = simd_max(local_max);
-        float local_sum = 0.0f;
-        for (uint r = 0u; r < 8u; r++) {
-            const uint e = lane + r * 32u;
-            if (e < p.num_experts) {
-                const float ex = exp(vals[r] - max_v);
-                vals[r] = ex;
-                local_sum += ex;
-            } else {
-                vals[r] = -INFINITY;
-            }
-        }
-
-        const float sum_exp = simd_sum(local_sum);
-        const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
-        for (uint r = 0u; r < 8u; r++) {
-            const uint e = lane + r * 32u;
-            if (e < p.num_experts) {
-                vals[r] *= inv_sum;
-            }
-        }
-
         uint sel_e[16];
         float sel_w[16];
         float w_sum = 0.0f;
 
-        if (MOE_TOP_K > 0u) {
-            for (uint k = 0u; k < MOE_TOP_K; k++) {
+        if (p.num_experts <= 256u) {
+            float vals[8];
+            float local_max = -INFINITY;
+            for (uint r = 0u; r < 8u; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    const float v = LOGITS_F16
+                        ? float(((const device half *)logits_raw)[ulong(tok) * p.num_experts + e])
+                        : ((const device float *)logits_raw)[ulong(tok) * p.num_experts + e];
+                    vals[r] = v;
+                    local_max = max(local_max, v);
+                } else {
+                    vals[r] = -INFINITY;
+                }
+            }
+
+            const float max_v = simd_max(local_max);
+            float local_sum = 0.0f;
+            for (uint r = 0u; r < 8u; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    const float ex = exp(vals[r] - max_v);
+                    vals[r] = ex;
+                    local_sum += ex;
+                } else {
+                    vals[r] = -INFINITY;
+                }
+            }
+
+            const float sum_exp = simd_sum(local_sum);
+            const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+            for (uint r = 0u; r < 8u; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    vals[r] *= inv_sum;
+                }
+            }
+
+            const uint k_limit = (MOE_TOP_K > 0u) ? MOE_TOP_K : top_k;
+            for (uint k = 0u; k < k_limit; k++) {
                 float best_v = -INFINITY;
                 uint best_e = 0xFFFFFFFFu;
                 for (uint r = 0u; r < 8u; r++) {
@@ -349,13 +355,45 @@ kernel void ami_moe_route_topk(const device uchar *logits_raw [[buffer(0)]],
                 }
             }
         } else {
-            for (uint k = 0u; k < top_k; k++) {
+            const uint chunks = (p.num_experts + 31u) >> 5;
+            const ulong row_base = ulong(tok) * p.num_experts;
+            float local_max = -INFINITY;
+            for (uint r = 0u; r < chunks; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    const float v = LOGITS_F16
+                        ? float(((const device half *)logits_raw)[row_base + e])
+                        : ((const device float *)logits_raw)[row_base + e];
+                    local_max = max(local_max, v);
+                }
+            }
+            const float max_v = simd_max(local_max);
+
+            float local_sum = 0.0f;
+            for (uint r = 0u; r < chunks; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    const float v = LOGITS_F16
+                        ? float(((const device half *)logits_raw)[row_base + e])
+                        : ((const device float *)logits_raw)[row_base + e];
+                    local_sum += exp(v - max_v);
+                }
+            }
+            const float sum_exp = simd_sum(local_sum);
+            const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+
+            uint picked_mask = 0u;
+            const uint k_limit = (MOE_TOP_K > 0u) ? MOE_TOP_K : top_k;
+            for (uint k = 0u; k < k_limit; k++) {
                 float best_v = -INFINITY;
                 uint best_e = 0xFFFFFFFFu;
-                for (uint r = 0u; r < 8u; r++) {
+                for (uint r = 0u; r < chunks; r++) {
                     const uint e = lane + r * 32u;
-                    if (e < p.num_experts) {
-                        const float v = vals[r];
+                    if (e < p.num_experts && ((picked_mask >> r) & 1u) == 0u) {
+                        const float raw_v = LOGITS_F16
+                            ? float(((const device half *)logits_raw)[row_base + e])
+                            : ((const device float *)logits_raw)[row_base + e];
+                        const float v = exp(raw_v - max_v) * inv_sum;
                         if (v > best_v || (v == best_v && e < best_e)) {
                             best_v = v;
                             best_e = e;
@@ -374,7 +412,7 @@ kernel void ami_moe_route_topk(const device uchar *logits_raw [[buffer(0)]],
                 const uint win_e = (raw_win_e < p.num_experts) ? raw_win_e : 0u;
                 const float win_v = simd_broadcast_first(best_v);
                 if ((win_e & 31u) == lane) {
-                    vals[win_e >> 5] = -INFINITY;
+                    picked_mask |= (1u << (win_e >> 5));
                 }
                 if (lane == 0u) {
                     sel_e[k] = win_e;
@@ -398,57 +436,71 @@ kernel void ami_moe_route_topk(const device uchar *logits_raw [[buffer(0)]],
 
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
-    // Phase 2: compact active experts [0..U) and compute CSR token offsets.
-    const uint cnt = (tid < p.num_experts)
-        ? atomic_load_explicit(&s_counts[tid], memory_order_relaxed)
-        : 0u;
-    const uint is_active = (cnt > 0u) ? 1u : 0u;
+    // Phase 2: compact active experts [0..U) and compute CSR token offsets in 256-expert blocks.
+    uint u_base = 0u;
+    uint tok_base = 0u;
+    for (uint blk_base = 0u; blk_base < p.num_experts; blk_base += 256u) {
+        const uint e = blk_base + tid;
+        const uint cnt = (e < p.num_experts)
+            ? atomic_load_explicit(&s_counts[e], memory_order_relaxed)
+            : 0u;
+        const uint is_active = (cnt > 0u) ? 1u : 0u;
 
-    // 2a. Exclusive prefix sum of `is_active` -> compacted unique index `u_idx` and total `U`.
-    const uint sg_act_excl = simd_prefix_exclusive_sum(is_active);
-    if (lane == 31u) {
-        s_prefix_tmp[sg_id] = sg_act_excl + is_active;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg_id == 0u) {
-        const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
-        const uint ex = simd_prefix_exclusive_sum(v);
-        if (lane < 8u) {
-            s_prefix_tmp[lane] = ex;
+        // 2a. Exclusive prefix sum of `is_active`.
+        const uint sg_act_excl = simd_prefix_exclusive_sum(is_active);
+        if (lane == 31u) {
+            s_prefix_tmp[sg_id] = sg_act_excl + is_active;
         }
-        if (lane == 7u) {
-            s_total_unique = ex + v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0u) {
+            const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+            const uint ex = simd_prefix_exclusive_sum(v);
+            if (lane < 8u) {
+                s_prefix_tmp[lane] = ex;
+            }
+            if (lane == 7u) {
+                s_blk_unique = ex + v;
+            }
         }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint u_idx = s_prefix_tmp[sg_id] + sg_act_excl;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint u_idx = u_base + s_prefix_tmp[sg_id] + sg_act_excl;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 2b. Exclusive prefix sum of `cnt` -> CSR start offset `tok_off`.
-    const uint sg_cnt_excl = simd_prefix_exclusive_sum(cnt);
-    if (lane == 31u) {
-        s_prefix_tmp[sg_id] = sg_cnt_excl + cnt;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg_id == 0u) {
-        const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
-        const uint ex = simd_prefix_exclusive_sum(v);
-        if (lane < 8u) {
-            s_prefix_tmp[lane] = ex;
+        // 2b. Exclusive prefix sum of `cnt`.
+        const uint sg_cnt_excl = simd_prefix_exclusive_sum(cnt);
+        if (lane == 31u) {
+            s_prefix_tmp[sg_id] = sg_cnt_excl + cnt;
         }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint tok_off = s_prefix_tmp[sg_id] + sg_cnt_excl;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg_id == 0u) {
+            const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+            const uint ex = simd_prefix_exclusive_sum(v);
+            if (lane < 8u) {
+                s_prefix_tmp[lane] = ex;
+            }
+            if (lane == 7u) {
+                s_blk_toks = ex + v;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint tok_off = tok_base + s_prefix_tmp[sg_id] + sg_cnt_excl;
 
-    atomic_store_explicit(&s_cursors[tid], tok_off, memory_order_relaxed);
-    if (is_active != 0u) {
-        unique_experts[u_idx] = tid;
-        expert_token_offsets[u_idx] = tok_off;
+        if (e < p.num_experts) {
+            atomic_store_explicit(&s_cursors[e], tok_off, memory_order_relaxed);
+        }
+        if (is_active != 0u) {
+            unique_experts[u_idx] = e;
+            expert_token_offsets[u_idx] = tok_off;
+        }
+        u_base += s_blk_unique;
+        tok_base += s_blk_toks;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+
     if (tid == 0u) {
-        const uint u_total = s_total_unique;
         const uint total_assign = p.m * top_k;
-        expert_token_offsets[u_total] = total_assign;
-        sched_hdr->num_unique_experts = u_total;
+        expert_token_offsets[u_base] = total_assign;
+        sched_hdr->num_unique_experts = u_base;
         sched_hdr->total_assignments = total_assign;
         sched_hdr->m = p.m;
         sched_hdr->top_k = top_k;
@@ -2168,13 +2220,13 @@ kernel void ami_gather_rows_f16(const device half *src [[buffer(0)]],
 // Milestone M5 (G13, ADR-0017): Scheme-Bucketed Heterogeneous MoE CSR Routing
 //
 // Single 256-thread threadgroup computes FP32 softmax + top-K (identical to
-// `ami_moe_route_topk`), then partitions active unique experts by their static
-// `WeightDType` scheme (`0=f16, 1=bf16, 2=q4, 3=q3, 4=q2`) into 5 disjoint
-// preallocated CSR buckets sharing `token_indices`, `routing_weights`,
-// `slot_k_indices`, `inter` and `down_out` with zero CPU-GPU roundtrips and
-// zero dynamic allocation. Also fills the unified `sched_hdr`/`unique_experts`/
-// `expert_token_offsets` arrays so telemetry and cold-expert pinning work
-// transparently.
+// `ami_moe_route_topk`, supporting up to 1024 experts and top_k <= 16), then
+// partitions active unique experts by their static `WeightDType` scheme
+// (`0=f16, 1=bf16, 2=q4, 3=q3, 4=q2`) into 5 disjoint preallocated CSR buckets
+// sharing `token_indices`, `routing_weights`, `slot_k_indices`, `inter` and
+// `down_out` with zero CPU-GPU roundtrips and zero dynamic allocation. Also
+// fills the unified `sched_hdr`/`unique_experts`/`expert_token_offsets` arrays
+// so telemetry and cold-expert pinning work transparently.
 // ===========================================================================
 
 struct BucketRouteParams {
@@ -2208,8 +2260,8 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
                                         uint sg_id [[simdgroup_index_in_threadgroup]],
                                         uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint NUM_SCHEMES = 5u;
-    threadgroup atomic_uint s_counts[256];
-    threadgroup atomic_uint s_cursors[256];
+    threadgroup atomic_uint s_counts[1024];
+    threadgroup atomic_uint s_cursors[1024];
     threadgroup uint s_prefix_tmp[8];
     threadgroup uint s_u_cnt;
     threadgroup uint s_a_cnt;
@@ -2217,54 +2269,57 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
     const uint top_k = (MOE_TOP_K > 0u) ? MOE_TOP_K : min(p.top_k, 16u);
 
     // Phase 0: clear per-expert token histograms.
-    atomic_store_explicit(&s_counts[tid], 0u, memory_order_relaxed);
+    for (uint e = tid; e < p.num_experts; e += 256u) {
+        atomic_store_explicit(&s_counts[e], 0u, memory_order_relaxed);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 1: parallel per-token fp32 softmax & top-k in registers (8 tokens/wave).
     for (uint tok = sg_id; tok < p.m; tok += 8u) {
-        float vals[8];
-        float local_max = -INFINITY;
-        for (uint r = 0u; r < 8u; r++) {
-            const uint e = lane + r * 32u;
-            if (e < p.num_experts) {
-                const float v = LOGITS_F16
-                    ? float(((const device half *)logits_raw)[ulong(tok) * p.num_experts + e])
-                    : ((const device float *)logits_raw)[ulong(tok) * p.num_experts + e];
-                vals[r] = v;
-                local_max = max(local_max, v);
-            } else {
-                vals[r] = -INFINITY;
-            }
-        }
-
-        const float max_v = simd_max(local_max);
-        float local_sum = 0.0f;
-        for (uint r = 0u; r < 8u; r++) {
-            const uint e = lane + r * 32u;
-            if (e < p.num_experts) {
-                const float ex = exp(vals[r] - max_v);
-                vals[r] = ex;
-                local_sum += ex;
-            } else {
-                vals[r] = -INFINITY;
-            }
-        }
-
-        const float sum_exp = simd_sum(local_sum);
-        const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
-        for (uint r = 0u; r < 8u; r++) {
-            const uint e = lane + r * 32u;
-            if (e < p.num_experts) {
-                vals[r] *= inv_sum;
-            }
-        }
-
         uint sel_e[16];
         float sel_w[16];
         float w_sum = 0.0f;
 
-        if (MOE_TOP_K > 0u) {
-            for (uint k = 0u; k < MOE_TOP_K; k++) {
+        if (p.num_experts <= 256u) {
+            float vals[8];
+            float local_max = -INFINITY;
+            for (uint r = 0u; r < 8u; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    const float v = LOGITS_F16
+                        ? float(((const device half *)logits_raw)[ulong(tok) * p.num_experts + e])
+                        : ((const device float *)logits_raw)[ulong(tok) * p.num_experts + e];
+                    vals[r] = v;
+                    local_max = max(local_max, v);
+                } else {
+                    vals[r] = -INFINITY;
+                }
+            }
+
+            const float max_v = simd_max(local_max);
+            float local_sum = 0.0f;
+            for (uint r = 0u; r < 8u; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    const float ex = exp(vals[r] - max_v);
+                    vals[r] = ex;
+                    local_sum += ex;
+                } else {
+                    vals[r] = -INFINITY;
+                }
+            }
+
+            const float sum_exp = simd_sum(local_sum);
+            const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+            for (uint r = 0u; r < 8u; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    vals[r] *= inv_sum;
+                }
+            }
+
+            const uint k_limit = (MOE_TOP_K > 0u) ? MOE_TOP_K : top_k;
+            for (uint k = 0u; k < k_limit; k++) {
                 float best_v = -INFINITY;
                 uint best_e = 0xFFFFFFFFu;
                 for (uint r = 0u; r < 8u; r++) {
@@ -2298,13 +2353,45 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
                 }
             }
         } else {
-            for (uint k = 0u; k < top_k; k++) {
+            const uint chunks = (p.num_experts + 31u) >> 5;
+            const ulong row_base = ulong(tok) * p.num_experts;
+            float local_max = -INFINITY;
+            for (uint r = 0u; r < chunks; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    const float v = LOGITS_F16
+                        ? float(((const device half *)logits_raw)[row_base + e])
+                        : ((const device float *)logits_raw)[row_base + e];
+                    local_max = max(local_max, v);
+                }
+            }
+            const float max_v = simd_max(local_max);
+
+            float local_sum = 0.0f;
+            for (uint r = 0u; r < chunks; r++) {
+                const uint e = lane + r * 32u;
+                if (e < p.num_experts) {
+                    const float v = LOGITS_F16
+                        ? float(((const device half *)logits_raw)[row_base + e])
+                        : ((const device float *)logits_raw)[row_base + e];
+                    local_sum += exp(v - max_v);
+                }
+            }
+            const float sum_exp = simd_sum(local_sum);
+            const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+
+            uint picked_mask = 0u;
+            const uint k_limit = (MOE_TOP_K > 0u) ? MOE_TOP_K : top_k;
+            for (uint k = 0u; k < k_limit; k++) {
                 float best_v = -INFINITY;
                 uint best_e = 0xFFFFFFFFu;
-                for (uint r = 0u; r < 8u; r++) {
+                for (uint r = 0u; r < chunks; r++) {
                     const uint e = lane + r * 32u;
-                    if (e < p.num_experts) {
-                        const float v = vals[r];
+                    if (e < p.num_experts && ((picked_mask >> r) & 1u) == 0u) {
+                        const float raw_v = LOGITS_F16
+                            ? float(((const device half *)logits_raw)[row_base + e])
+                            : ((const device float *)logits_raw)[row_base + e];
+                        const float v = exp(raw_v - max_v) * inv_sum;
                         if (v > best_v || (v == best_v && e < best_e)) {
                             best_v = v;
                             best_e = e;
@@ -2323,7 +2410,7 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
                 const uint win_e = (raw_win_e < p.num_experts) ? raw_win_e : 0u;
                 const float win_v = simd_broadcast_first(best_v);
                 if ((win_e & 31u) == lane) {
-                    vals[win_e >> 5] = -INFINITY;
+                    picked_mask |= (1u << (win_e >> 5));
                 }
                 if (lane == 0u) {
                     sel_e[k] = win_e;
@@ -2348,71 +2435,79 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
     // Phase 2: partition active experts by static scheme into disjoint CSR slices.
-    const uint cnt = (tid < p.num_experts)
-        ? atomic_load_explicit(&s_counts[tid], memory_order_relaxed)
-        : 0u;
-    const uint is_active = (cnt > 0u) ? 1u : 0u;
-    const uint my_scheme = (tid < p.num_experts)
-        ? min(uint(expert_schemes[tid]), NUM_SCHEMES - 1u)
-        : NUM_SCHEMES;
-
     uint running_u_base = 0u;
     uint running_a_base = 0u;
     for (uint s = 0u; s < NUM_SCHEMES; s++) {
-        const uint in_s = (is_active != 0u && my_scheme == s) ? 1u : 0u;
-        const uint cnt_s = (my_scheme == s) ? cnt : 0u;
-
-        // 2a. Exclusive prefix sum of `in_s` -> bucket-local unique index `u_in_s` and total `u_cnt_s`.
-        const uint sg_act_excl = simd_prefix_exclusive_sum(in_s);
-        if (lane == 31u) {
-            s_prefix_tmp[sg_id] = sg_act_excl + in_s;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_id == 0u) {
-            const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
-            const uint ex = simd_prefix_exclusive_sum(v);
-            if (lane < 8u) {
-                s_prefix_tmp[lane] = ex;
-            }
-            if (lane == 7u) {
-                s_u_cnt = ex + v;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint u_in_s = s_prefix_tmp[sg_id] + sg_act_excl;
-        const uint u_cnt_s = s_u_cnt;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // 2b. Exclusive prefix sum of `cnt_s` -> bucket-local assignment offset `a_in_s` and total `a_cnt_s`.
-        const uint sg_cnt_excl = simd_prefix_exclusive_sum(cnt_s);
-        if (lane == 31u) {
-            s_prefix_tmp[sg_id] = sg_cnt_excl + cnt_s;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_id == 0u) {
-            const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
-            const uint ex = simd_prefix_exclusive_sum(v);
-            if (lane < 8u) {
-                s_prefix_tmp[lane] = ex;
-            }
-            if (lane == 7u) {
-                s_a_cnt = ex + v;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint a_in_s = s_prefix_tmp[sg_id] + sg_cnt_excl;
-        const uint a_cnt_s = s_a_cnt;
-
         const ulong u_base_off = ulong(s) * p.bucket_unique_stride;
         const ulong o_base_off = ulong(s) * p.bucket_offsets_stride;
-        if (in_s != 0u) {
-            const uint slot_off = running_a_base + a_in_s;
-            atomic_store_explicit(&s_cursors[tid], slot_off, memory_order_relaxed);
-            bucket_unique_experts[u_base_off + u_in_s] = tid;
-            bucket_expert_token_offsets[o_base_off + u_in_s] = slot_off;
-            unique_experts[running_u_base + u_in_s] = tid;
-            expert_token_offsets[running_u_base + u_in_s] = slot_off;
+        uint u_cnt_s = 0u;
+        uint a_cnt_s = 0u;
+
+        for (uint blk_base = 0u; blk_base < p.num_experts; blk_base += 256u) {
+            const uint e = blk_base + tid;
+            const uint cnt = (e < p.num_experts)
+                ? atomic_load_explicit(&s_counts[e], memory_order_relaxed)
+                : 0u;
+            const uint my_scheme = (e < p.num_experts)
+                ? min(uint(expert_schemes[e]), NUM_SCHEMES - 1u)
+                : NUM_SCHEMES;
+            const uint in_s = (cnt > 0u && my_scheme == s) ? 1u : 0u;
+            const uint cnt_s = (my_scheme == s) ? cnt : 0u;
+
+            // 2a. Exclusive prefix sum of `in_s` -> block-local unique index `u_in_blk` and count `s_u_cnt`.
+            const uint sg_act_excl = simd_prefix_exclusive_sum(in_s);
+            if (lane == 31u) {
+                s_prefix_tmp[sg_id] = sg_act_excl + in_s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_id == 0u) {
+                const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+                const uint ex = simd_prefix_exclusive_sum(v);
+                if (lane < 8u) {
+                    s_prefix_tmp[lane] = ex;
+                }
+                if (lane == 7u) {
+                    s_u_cnt = ex + v;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint u_in_blk = s_prefix_tmp[sg_id] + sg_act_excl;
+            const uint blk_u_cnt = s_u_cnt;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // 2b. Exclusive prefix sum of `cnt_s` -> block-local assignment offset `a_in_blk` and count `s_a_cnt`.
+            const uint sg_cnt_excl = simd_prefix_exclusive_sum(cnt_s);
+            if (lane == 31u) {
+                s_prefix_tmp[sg_id] = sg_cnt_excl + cnt_s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_id == 0u) {
+                const uint v = (lane < 8u) ? s_prefix_tmp[lane] : 0u;
+                const uint ex = simd_prefix_exclusive_sum(v);
+                if (lane < 8u) {
+                    s_prefix_tmp[lane] = ex;
+                }
+                if (lane == 7u) {
+                    s_a_cnt = ex + v;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint a_in_blk = s_prefix_tmp[sg_id] + sg_cnt_excl;
+            const uint blk_a_cnt = s_a_cnt;
+
+            if (in_s != 0u) {
+                const uint slot_off = running_a_base + a_cnt_s + a_in_blk;
+                atomic_store_explicit(&s_cursors[e], slot_off, memory_order_relaxed);
+                bucket_unique_experts[u_base_off + u_cnt_s + u_in_blk] = e;
+                bucket_expert_token_offsets[o_base_off + u_cnt_s + u_in_blk] = slot_off;
+                unique_experts[running_u_base + u_cnt_s + u_in_blk] = e;
+                expert_token_offsets[running_u_base + u_cnt_s + u_in_blk] = slot_off;
+            }
+            u_cnt_s += blk_u_cnt;
+            a_cnt_s += blk_a_cnt;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+
         if (tid == 0u) {
             bucket_expert_token_offsets[o_base_off + u_cnt_s] = running_a_base + a_cnt_s;
             device MoeScheduleHeader *bhdr = (device MoeScheduleHeader *)(bucket_headers + ulong(s) * 64ul);
@@ -2446,5 +2541,371 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
         token_indices[dst] = tok;
         routing_weights[dst] = w;
         slot_k_indices[dst] = k_idx;
+    }
+}
+
+// ===========================================================================
+// M6 G7: Unconditional Shared Expert SwiGLU + Optional Scalar Sigmoid Gate
+//
+// Accumulates an unconditional shared expert branch into the routed MoE output
+// on GPU with zero CPU-GPU syncs and zero heap allocations (ADR-0015).
+// Supports q2/q3/q4 affine group-64 and dense f16/bf16 weights, plus optional
+// per-token scalar sigmoid gate `g[m] = sigmoid(dot(x[m], w_gate))`.
+// ===========================================================================
+
+struct MoeSharedGateParams {
+    uint m;
+    uint hidden_size;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct MoeSharedGateUpParams {
+    ulong gate_qweight_offset;
+    ulong gate_sb_offset;
+    ulong up_qweight_offset;
+    ulong up_sb_offset;
+    uint m;
+    uint hidden_size;
+    uint intermediate_size;
+    uint num_groups;
+    uint row_bytes;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct MoeSharedDownParams {
+    ulong down_qweight_offset;
+    ulong down_sb_offset;
+    uint m;
+    uint hidden_size;
+    uint intermediate_size;
+    uint num_groups;
+    uint row_bytes;
+    uint use_gate;
+    uint _pad0;
+    uint _pad1;
+};
+
+static_assert(sizeof(MoeSharedGateParams) == 16, "MoeSharedGateParams must be 16 bytes");
+static_assert(sizeof(MoeSharedGateUpParams) == 64, "MoeSharedGateUpParams must be 64 bytes");
+static_assert(sizeof(MoeSharedDownParams) == 48, "MoeSharedDownParams must be 48 bytes");
+
+// Scalar sigmoid gate for shared expert: `gate_out[tok] = sigmoid(dot(x[tok], gate_w))`.
+// Specialized on ROUTER_W_F16 / ROUTER_W_BF16. Grid: (ceil(m / 4), 1, 1), 128 threads.
+kernel void ami_moe_shared_gate(const device half *x [[buffer(0)]],
+                                const device uchar *gate_w [[buffer(1)]],
+                                device float *gate_out [[buffer(2)]],
+                                constant MoeSharedGateParams &p [[buffer(3)]],
+                                uint tg_x [[threadgroup_position_in_grid]],
+                                uint sg_id [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    const uint tok = tg_x * 4u + sg_id;
+    if (tok >= p.m) {
+        return;
+    }
+
+    float acc = 0.0f;
+    if ((p.hidden_size & 3u) == 0u) {
+        const uint vec_k = p.hidden_size >> 2;
+        const device half4 *x_row = (const device half4 *)(x + ulong(tok) * p.hidden_size);
+        if (ROUTER_W_BF16) {
+            const device bfloat4 *w_row = (const device bfloat4 *)gate_w;
+            for (uint k = lane; k < vec_k; k += 32u) {
+                acc += dot(float4(x_row[k]), float4(w_row[k]));
+            }
+        } else if (ROUTER_W_F16) {
+            const device half4 *w_row = (const device half4 *)gate_w;
+            for (uint k = lane; k < vec_k; k += 32u) {
+                acc += dot(float4(x_row[k]), float4(w_row[k]));
+            }
+        } else {
+            const device float4 *w_row = (const device float4 *)gate_w;
+            for (uint k = lane; k < vec_k; k += 32u) {
+                acc += dot(float4(x_row[k]), w_row[k]);
+            }
+        }
+    } else {
+        const device half *x_row = x + ulong(tok) * p.hidden_size;
+        if (ROUTER_W_BF16) {
+            const device bfloat *w_row = (const device bfloat *)gate_w;
+            for (uint k = lane; k < p.hidden_size; k += 32u) {
+                acc = fma(float(x_row[k]), float(w_row[k]), acc);
+            }
+        } else if (ROUTER_W_F16) {
+            const device half *w_row = (const device half *)gate_w;
+            for (uint k = lane; k < p.hidden_size; k += 32u) {
+                acc = fma(float(x_row[k]), float(w_row[k]), acc);
+            }
+        } else {
+            const device float *w_row = (const device float *)gate_w;
+            for (uint k = lane; k < p.hidden_size; k += 32u) {
+                acc = fma(float(x_row[k]), w_row[k], acc);
+            }
+        }
+    }
+
+    const float total = simd_sum(acc);
+    if (lane == 0u) {
+        gate_out[tok] = 1.0f / (1.0f + exp(-total));
+    }
+}
+
+// Quantized (q2/q3/q4 group-64) unconditional shared expert Gate + Up + SwiGLU.
+// Weight-stationary across up to 4 tokens per TG.
+// Grid: (ceil(intermediate_size / 8), ceil(m / 4), 1), 128 threads (4 simdgroups).
+kernel void ami_moe_shared_gate_up_swiglu(const device half *x [[buffer(0)]],
+                                          const device uchar *weights_base [[buffer(1)]],
+                                          device half *shared_inter [[buffer(2)]],
+                                          constant MoeSharedGateUpParams &p [[buffer(3)]],
+                                          uint2 tg_pos [[threadgroup_position_in_grid]],
+                                          uint sg_id [[simdgroup_index_in_threadgroup]],
+                                          uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint ROWS_PER_SG = 2u;
+    const uint row0 = tg_pos.x * 8u + sg_id * ROWS_PER_SG;
+    const uint tok_base = tg_pos.y * 4u;
+    if (row0 >= p.intermediate_size || tok_base >= p.m) {
+        return;
+    }
+
+    const uint cnt = min(4u, p.m - tok_base);
+    const device uchar *gate_qw = weights_base + p.gate_qweight_offset;
+    const device half2 *gate_sb = (const device half2 *)(weights_base + p.gate_sb_offset);
+    const device uchar *up_qw = weights_base + p.up_qweight_offset;
+    const device half2 *up_sb = (const device half2 *)(weights_base + p.up_sb_offset);
+
+    const uint sub_group = lane >> 3;
+    const uint lane_in_grp = lane & 7u;
+
+    const device half *x0 = x + ulong(tok_base + 0u) * p.hidden_size;
+    const device half *x1 = x + ulong(tok_base + min(1u, cnt - 1u)) * p.hidden_size;
+    const device half *x2 = x + ulong(tok_base + min(2u, cnt - 1u)) * p.hidden_size;
+    const device half *x3 = x + ulong(tok_base + min(3u, cnt - 1u)) * p.hidden_size;
+
+    for (uint r = 0u; r < ROWS_PER_SG; r++) {
+        const uint row = row0 + r;
+        if (row >= p.intermediate_size) {
+            break;
+        }
+        float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
+        float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+        const ulong row_w_base = ulong(row) * p.row_bytes;
+        const ulong row_sb_base = ulong(row) * p.num_groups;
+
+        for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+            const uint g = g_base + sub_group;
+            if (g >= p.num_groups) {
+                continue;
+            }
+            const half2 gsb = gate_sb[row_sb_base + g];
+            const half2 usb = up_sb[row_sb_base + g];
+            float4 gw0, gw1, uw0, uw1;
+            if (Q_BITS == 4u) {
+                const uint w_off = g * 32u + lane_in_grp * 4u;
+                dequant8_q4(*(const device uint32_t *)(gate_qw + row_w_base + w_off), float(gsb.x), float(gsb.y), gw0, gw1);
+                dequant8_q4(*(const device uint32_t *)(up_qw + row_w_base + w_off), float(usb.x), float(usb.y), uw0, uw1);
+            } else if (Q_BITS == 3u) {
+                const uint w_off = g * 24u + lane_in_grp * 3u;
+                const device uchar *gwp = gate_qw + row_w_base + w_off;
+                const device uchar *uwp = up_qw + row_w_base + w_off;
+                dequant8_q3(gwp[0], gwp[1], gwp[2], float(gsb.x), float(gsb.y), gw0, gw1);
+                dequant8_q3(uwp[0], uwp[1], uwp[2], float(usb.x), float(usb.y), uw0, uw1);
+            } else {
+                const uint w_off = g * 16u + lane_in_grp * 2u;
+                dequant8_q2(*(const device uint16_t *)(gate_qw + row_w_base + w_off), float(gsb.x), float(gsb.y), gw0, gw1);
+                dequant8_q2(*(const device uint16_t *)(up_qw + row_w_base + w_off), float(usb.x), float(usb.y), uw0, uw1);
+            }
+
+            const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+            { const float4 a = float4(*(const device half4 *)(x0 + k_off)); const float4 b = float4(*(const device half4 *)(x0 + k_off + 4u)); g0 += dot(a, gw0) + dot(b, gw1); u0 += dot(a, uw0) + dot(b, uw1); }
+            if (cnt > 1u) { const float4 a = float4(*(const device half4 *)(x1 + k_off)); const float4 b = float4(*(const device half4 *)(x1 + k_off + 4u)); g1 += dot(a, gw0) + dot(b, gw1); u1 += dot(a, uw0) + dot(b, uw1); }
+            if (cnt > 2u) { const float4 a = float4(*(const device half4 *)(x2 + k_off)); const float4 b = float4(*(const device half4 *)(x2 + k_off + 4u)); g2 += dot(a, gw0) + dot(b, gw1); u2 += dot(a, uw0) + dot(b, uw1); }
+            if (cnt > 3u) { const float4 a = float4(*(const device half4 *)(x3 + k_off)); const float4 b = float4(*(const device half4 *)(x3 + k_off + 4u)); g3 += dot(a, gw0) + dot(b, gw1); u3 += dot(a, uw0) + dot(b, uw1); }
+        }
+
+        const float gt0 = simd_sum(g0), ut0 = simd_sum(u0);
+        const float gt1 = (cnt > 1u) ? simd_sum(g1) : 0.0f;
+        const float ut1 = (cnt > 1u) ? simd_sum(u1) : 0.0f;
+        const float gt2 = (cnt > 2u) ? simd_sum(g2) : 0.0f;
+        const float ut2 = (cnt > 2u) ? simd_sum(u2) : 0.0f;
+        const float gt3 = (cnt > 3u) ? simd_sum(g3) : 0.0f;
+        const float ut3 = (cnt > 3u) ? simd_sum(u3) : 0.0f;
+        if (lane == 0u) {
+            shared_inter[ulong(tok_base + 0u) * p.intermediate_size + row] = half(fast_silu(gt0) * ut0);
+            if (cnt > 1u) shared_inter[ulong(tok_base + 1u) * p.intermediate_size + row] = half(fast_silu(gt1) * ut1);
+            if (cnt > 2u) shared_inter[ulong(tok_base + 2u) * p.intermediate_size + row] = half(fast_silu(gt2) * ut2);
+            if (cnt > 3u) shared_inter[ulong(tok_base + 3u) * p.intermediate_size + row] = half(fast_silu(gt3) * ut3);
+        }
+    }
+}
+
+// Dense FP16 / BF16 unconditional shared expert Gate + Up + SwiGLU.
+// Grid: (ceil(intermediate_size / 4), m, 1), 128 threads (4 simdgroups).
+kernel void ami_moe_shared_gate_up_swiglu_float(const device half *x [[buffer(0)]],
+                                                const device uchar *weights_base [[buffer(1)]],
+                                                device half *shared_inter [[buffer(2)]],
+                                                constant MoeSharedGateUpParams &p [[buffer(3)]],
+                                                uint2 tg_pos [[threadgroup_position_in_grid]],
+                                                uint sg_id [[simdgroup_index_in_threadgroup]],
+                                                uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tg_pos.x * 4u + sg_id;
+    const uint tok = tg_pos.y;
+    if (row >= p.intermediate_size || tok >= p.m) {
+        return;
+    }
+
+    const uint vec_k = p.hidden_size >> 2;
+    const device half4 *x_row = (const device half4 *)(x + ulong(tok) * p.hidden_size);
+    float g_acc = 0.0f;
+    float u_acc = 0.0f;
+
+    if (MOE_W_BF16) {
+        const device bfloat4 *gw = (const device bfloat4 *)((const device bfloat *)(weights_base + p.gate_qweight_offset) + ulong(row) * p.hidden_size);
+        const device bfloat4 *uw = (const device bfloat4 *)((const device bfloat *)(weights_base + p.up_qweight_offset) + ulong(row) * p.hidden_size);
+        for (uint k = lane; k < vec_k; k += 32u) {
+            const float4 xv = float4(x_row[k]);
+            g_acc += dot(xv, float4(gw[k]));
+            u_acc += dot(xv, float4(uw[k]));
+        }
+    } else {
+        const device half4 *gw = (const device half4 *)((const device half *)(weights_base + p.gate_qweight_offset) + ulong(row) * p.hidden_size);
+        const device half4 *uw = (const device half4 *)((const device half *)(weights_base + p.up_qweight_offset) + ulong(row) * p.hidden_size);
+        for (uint k = lane; k < vec_k; k += 32u) {
+            const float4 xv = float4(x_row[k]);
+            g_acc += dot(xv, float4(gw[k]));
+            u_acc += dot(xv, float4(uw[k]));
+        }
+    }
+
+    const float gt = simd_sum(g_acc);
+    const float ut = simd_sum(u_acc);
+    if (lane == 0u) {
+        shared_inter[ulong(tok) * p.intermediate_size + row] = half(fast_silu(gt) * ut);
+    }
+}
+
+// Quantized (q2/q3/q4 group-64) shared expert DownProj with fused optional
+// scalar gate and in-place accumulation into `out` (`out += gate * down(inter)`).
+// Grid: (ceil(hidden_size / 8), ceil(m / 4), 1), 128 threads (4 simdgroups).
+kernel void ami_moe_shared_down_accum(const device half *shared_inter [[buffer(0)]],
+                                      const device uchar *weights_base [[buffer(1)]],
+                                      const device float *shared_gate_scores [[buffer(2)]],
+                                      device half *out [[buffer(3)]],
+                                      constant MoeSharedDownParams &p [[buffer(4)]],
+                                      uint2 tg_pos [[threadgroup_position_in_grid]],
+                                      uint sg_id [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint ROWS_PER_SG = 2u;
+    const uint row0 = tg_pos.x * 8u + sg_id * ROWS_PER_SG;
+    const uint tok_base = tg_pos.y * 4u;
+    if (row0 >= p.hidden_size || tok_base >= p.m) {
+        return;
+    }
+
+    const uint cnt = min(4u, p.m - tok_base);
+    const device uchar *down_qw = weights_base + p.down_qweight_offset;
+    const device half2 *down_sb = (const device half2 *)(weights_base + p.down_sb_offset);
+
+    const uint sub_group = lane >> 3;
+    const uint lane_in_grp = lane & 7u;
+
+    const device half *i0 = shared_inter + ulong(tok_base + 0u) * p.intermediate_size;
+    const device half *i1 = shared_inter + ulong(tok_base + min(1u, cnt - 1u)) * p.intermediate_size;
+    const device half *i2 = shared_inter + ulong(tok_base + min(2u, cnt - 1u)) * p.intermediate_size;
+    const device half *i3 = shared_inter + ulong(tok_base + min(3u, cnt - 1u)) * p.intermediate_size;
+
+    const float sc0 = (p.use_gate != 0u) ? shared_gate_scores[tok_base + 0u] : 1.0f;
+    const float sc1 = (p.use_gate != 0u && cnt > 1u) ? shared_gate_scores[tok_base + 1u] : 1.0f;
+    const float sc2 = (p.use_gate != 0u && cnt > 2u) ? shared_gate_scores[tok_base + 2u] : 1.0f;
+    const float sc3 = (p.use_gate != 0u && cnt > 3u) ? shared_gate_scores[tok_base + 3u] : 1.0f;
+
+    for (uint r = 0u; r < ROWS_PER_SG; r++) {
+        const uint row = row0 + r;
+        if (row >= p.hidden_size) {
+            break;
+        }
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        const ulong row_w_base = ulong(row) * p.row_bytes;
+        const ulong row_sb_base = ulong(row) * p.num_groups;
+
+        for (uint g_base = 0u; g_base < p.num_groups; g_base += 4u) {
+            const uint g = g_base + sub_group;
+            if (g >= p.num_groups) {
+                continue;
+            }
+            const half2 dsb = down_sb[row_sb_base + g];
+            float4 dw0, dw1;
+            if (Q_BITS == 4u) {
+                const uint w_off = g * 32u + lane_in_grp * 4u;
+                dequant8_q4(*(const device uint32_t *)(down_qw + row_w_base + w_off), float(dsb.x), float(dsb.y), dw0, dw1);
+            } else if (Q_BITS == 3u) {
+                const uint w_off = g * 24u + lane_in_grp * 3u;
+                const device uchar *dwp = down_qw + row_w_base + w_off;
+                dequant8_q3(dwp[0], dwp[1], dwp[2], float(dsb.x), float(dsb.y), dw0, dw1);
+            } else {
+                const uint w_off = g * 16u + lane_in_grp * 2u;
+                dequant8_q2(*(const device uint16_t *)(down_qw + row_w_base + w_off), float(dsb.x), float(dsb.y), dw0, dw1);
+            }
+
+            const uint k_off = g * Q_GROUP_SIZE + lane_in_grp * 8u;
+            { const float4 x0v = float4(*(const device half4 *)(i0 + k_off)); const float4 x1v = float4(*(const device half4 *)(i0 + k_off + 4u)); a0 += dot(x0v, dw0) + dot(x1v, dw1); }
+            if (cnt > 1u) { const float4 x0v = float4(*(const device half4 *)(i1 + k_off)); const float4 x1v = float4(*(const device half4 *)(i1 + k_off + 4u)); a1 += dot(x0v, dw0) + dot(x1v, dw1); }
+            if (cnt > 2u) { const float4 x0v = float4(*(const device half4 *)(i2 + k_off)); const float4 x1v = float4(*(const device half4 *)(i2 + k_off + 4u)); a2 += dot(x0v, dw0) + dot(x1v, dw1); }
+            if (cnt > 3u) { const float4 x0v = float4(*(const device half4 *)(i3 + k_off)); const float4 x1v = float4(*(const device half4 *)(i3 + k_off + 4u)); a3 += dot(x0v, dw0) + dot(x1v, dw1); }
+        }
+
+        const float y0 = simd_sum(a0) * sc0;
+        const float y1 = (cnt > 1u) ? simd_sum(a1) * sc1 : 0.0f;
+        const float y2 = (cnt > 2u) ? simd_sum(a2) * sc2 : 0.0f;
+        const float y3 = (cnt > 3u) ? simd_sum(a3) * sc3 : 0.0f;
+        if (lane == 0u) {
+            const ulong o0 = ulong(tok_base + 0u) * p.hidden_size + row;
+            out[o0] = half(float(out[o0]) + y0);
+            if (cnt > 1u) { const ulong o1 = ulong(tok_base + 1u) * p.hidden_size + row; out[o1] = half(float(out[o1]) + y1); }
+            if (cnt > 2u) { const ulong o2 = ulong(tok_base + 2u) * p.hidden_size + row; out[o2] = half(float(out[o2]) + y2); }
+            if (cnt > 3u) { const ulong o3 = ulong(tok_base + 3u) * p.hidden_size + row; out[o3] = half(float(out[o3]) + y3); }
+        }
+    }
+}
+
+// Dense FP16 / BF16 shared expert DownProj with fused optional scalar gate and
+// in-place accumulation into `out` (`out += gate * down(inter)`).
+// Grid: (ceil(hidden_size / 4), m, 1), 128 threads (4 simdgroups).
+kernel void ami_moe_shared_down_accum_float(const device half *shared_inter [[buffer(0)]],
+                                            const device uchar *weights_base [[buffer(1)]],
+                                            const device float *shared_gate_scores [[buffer(2)]],
+                                            device half *out [[buffer(3)]],
+                                            constant MoeSharedDownParams &p [[buffer(4)]],
+                                            uint2 tg_pos [[threadgroup_position_in_grid]],
+                                            uint sg_id [[simdgroup_index_in_threadgroup]],
+                                            uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tg_pos.x * 4u + sg_id;
+    const uint tok = tg_pos.y;
+    if (row >= p.hidden_size || tok >= p.m) {
+        return;
+    }
+
+    const uint vec_k = p.intermediate_size >> 2;
+    const device half4 *in_row = (const device half4 *)(shared_inter + ulong(tok) * p.intermediate_size);
+    float acc = 0.0f;
+
+    if (MOE_W_BF16) {
+        const device bfloat4 *dw = (const device bfloat4 *)((const device bfloat *)(weights_base + p.down_qweight_offset) + ulong(row) * p.intermediate_size);
+        for (uint k = lane; k < vec_k; k += 32u) {
+            acc += dot(float4(in_row[k]), float4(dw[k]));
+        }
+    } else {
+        const device half4 *dw = (const device half4 *)((const device half *)(weights_base + p.down_qweight_offset) + ulong(row) * p.intermediate_size);
+        for (uint k = lane; k < vec_k; k += 32u) {
+            acc += dot(float4(in_row[k]), float4(dw[k]));
+        }
+    }
+
+    const float sc = (p.use_gate != 0u) ? shared_gate_scores[tok] : 1.0f;
+    const float y = simd_sum(acc) * sc;
+    if (lane == 0u) {
+        const ulong o_idx = ulong(tok) * p.hidden_size + row;
+        out[o_idx] = half(float(out[o_idx]) + y);
     }
 }

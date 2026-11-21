@@ -19,8 +19,8 @@ const amf = @import("../format/amf.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const vmstat = @import("../platform/vmstat.zig");
 
-/// Maximum supported number of MoE experts per layer.
-pub const MAX_EXPERTS: u32 = 256;
+/// Maximum supported number of MoE experts per layer (G7, ADR-0015).
+pub const MAX_EXPERTS: u32 = 1024;
 /// Maximum supported number of active experts per token (`top_k`).
 pub const MAX_TOP_K: u32 = 16;
 /// Maximum batched rows for `encodeArgmaxRows` and `encodeTopKLogitsRows`.
@@ -193,6 +193,44 @@ pub const BucketRouteParams = extern struct {
     _pad1: u32 = 0,
 };
 
+/// Uniform payload matching `struct MoeSharedGateParams` in `moe_ffn.metal` (G7).
+pub const MoeSharedGateParams = extern struct {
+    m: u32,
+    hidden_size: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+/// Uniform payload matching `struct MoeSharedGateUpParams` in `moe_ffn.metal` (G7).
+pub const MoeSharedGateUpParams = extern struct {
+    gate_qweight_offset: u64,
+    gate_sb_offset: u64,
+    up_qweight_offset: u64,
+    up_sb_offset: u64,
+    m: u32,
+    hidden_size: u32,
+    intermediate_size: u32,
+    num_groups: u32,
+    row_bytes: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
+/// Uniform payload matching `struct MoeSharedDownParams` in `moe_ffn.metal` (G7).
+pub const MoeSharedDownParams = extern struct {
+    down_qweight_offset: u64,
+    down_sb_offset: u64,
+    m: u32,
+    hidden_size: u32,
+    intermediate_size: u32,
+    num_groups: u32,
+    row_bytes: u32,
+    use_gate: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(ExpertWeights) != 48) @compileError("ExpertWeights must be 48 bytes");
     if (@sizeOf(ScheduleHeader) != 16) @compileError("ScheduleHeader must be 16 bytes");
@@ -212,6 +250,9 @@ comptime {
     if (@sizeOf(CopyStridedParams) != 32) @compileError("CopyStridedParams must be 32 bytes");
     if (@sizeOf(GatherRowsParams) != 16) @compileError("GatherRowsParams must be 16 bytes");
     if (@sizeOf(BucketRouteParams) != 32) @compileError("BucketRouteParams must be 32 bytes");
+    if (@sizeOf(MoeSharedGateParams) != 16) @compileError("MoeSharedGateParams must be 16 bytes");
+    if (@sizeOf(MoeSharedGateUpParams) != 64) @compileError("MoeSharedGateUpParams must be 64 bytes");
+    if (@sizeOf(MoeSharedDownParams) != 48) @compileError("MoeSharedDownParams must be 48 bytes");
 }
 
 pub const LogitsDType = enum {
@@ -231,6 +272,10 @@ pub const WorkspaceSpec = struct {
     top_k: u32,
     hidden_size: u32,
     intermediate_size: u32,
+    /// Optional dedicated shared-expert SwiGLU intermediate width (G7).
+    /// When 0, shared-expert layers with `shared_intermediate_size <= top_k * intermediate_size`
+    /// reuse `workspace.inter` after routed `DownProj` completes (zero extra bytes).
+    shared_intermediate_size: u32 = 0,
 };
 
 pub const WorkspaceError = error{
@@ -272,12 +317,15 @@ pub const MoeWorkspace = struct {
     scratch_topk_weights_off: u64,
     inter_off: u64,
     down_out_off: u64,
-    // Preallocated G13 per-scheme CSR buckets (ADR-0017; < 11 KiB total, zero hot-path alloc).
+    // Preallocated G13 per-scheme CSR buckets (ADR-0017; zero hot-path alloc).
     bucket_headers_off: u64,
     bucket_unique_experts_off: u64,
     bucket_expert_token_offsets_off: u64,
     bucket_unique_stride_u32: u32,
     bucket_offsets_stride_u32: u32,
+    // Preallocated G7 shared-expert scalar gate & optional dedicated intermediate scratch.
+    shared_gate_scores_off: u64,
+    shared_inter_off: u64,
 
     router_logits: []f32,
     schedule_header: *ScheduleHeader,
@@ -293,6 +341,8 @@ pub const MoeWorkspace = struct {
     bucket_headers_raw: []u8,
     bucket_unique_experts: []u32,
     bucket_expert_token_offsets: []u32,
+    shared_gate_scores: []f32,
+    shared_inter: []f16,
 
     /// Tight upper bound on arena bytes needed to carve this workspace (including
     /// 64-byte alignment padding per sub-allocation).
@@ -303,6 +353,7 @@ pub const MoeWorkspace = struct {
         const k: usize = spec.top_k;
         const hidden: usize = spec.hidden_size;
         const inter_dim: usize = spec.intermediate_size;
+        const shared_inter_dim: usize = spec.shared_intermediate_size;
 
         const assignments = std.math.mul(usize, max_tok, k) catch return error.Overflow;
         const logits_elems = std.math.mul(usize, max_tok, n_exp) catch return error.Overflow;
@@ -310,6 +361,11 @@ pub const MoeWorkspace = struct {
         const down_elems = std.math.mul(usize, assignments, hidden) catch return error.Overflow;
         const bucket_u_stride = amf.align64(std.math.mul(usize, n_exp, @sizeOf(u32)) catch return error.Overflow);
         const bucket_o_stride = amf.align64(std.math.mul(usize, n_exp + 1, @sizeOf(u32)) catch return error.Overflow);
+        const shared_gate_bytes = std.math.mul(usize, max_tok, @sizeOf(f32)) catch return error.Overflow;
+        const shared_inter_bytes = if (shared_inter_dim > 0)
+            std.math.mul(usize, std.math.mul(usize, max_tok, shared_inter_dim) catch return error.Overflow, @sizeOf(f16)) catch return error.Overflow
+        else
+            0;
 
         const sizes = [_]usize{
             std.math.mul(usize, logits_elems, @sizeOf(f32)) catch return error.Overflow,
@@ -326,11 +382,14 @@ pub const MoeWorkspace = struct {
             NUM_SCHEME_BUCKETS * BUCKET_HEADER_STRIDE,
             NUM_SCHEME_BUCKETS * bucket_u_stride,
             NUM_SCHEME_BUCKETS * bucket_o_stride,
+            shared_gate_bytes,
+            shared_inter_bytes,
         };
 
         // Account for up to 64 bytes of initial arena alignment plus 64-byte rounding per slice.
         var total: usize = 64;
         for (sizes) |sz| {
+            if (sz == 0) continue;
             const aligned = amf.align64(sz);
             total = std.math.add(usize, total, aligned) catch return error.Overflow;
         }
@@ -344,6 +403,7 @@ pub const MoeWorkspace = struct {
         const k: usize = spec.top_k;
         const hidden: usize = spec.hidden_size;
         const inter_dim: usize = spec.intermediate_size;
+        const shared_inter_dim: usize = spec.shared_intermediate_size;
 
         const assignments = std.math.mul(usize, max_tok, k) catch return error.Overflow;
         const logits_bytes = std.math.mul(usize, std.math.mul(usize, max_tok, n_exp) catch return error.Overflow, @sizeOf(f32)) catch return error.Overflow;
@@ -361,6 +421,11 @@ pub const MoeWorkspace = struct {
         const bucket_hdrs_bytes = NUM_SCHEME_BUCKETS * BUCKET_HEADER_STRIDE;
         const bucket_uniq_bytes = NUM_SCHEME_BUCKETS * bucket_u_stride_bytes;
         const bucket_offs_bytes = NUM_SCHEME_BUCKETS * bucket_o_stride_bytes;
+        const shared_gate_bytes = std.math.mul(usize, max_tok, @sizeOf(f32)) catch return error.Overflow;
+        const shared_inter_bytes = if (shared_inter_dim > 0)
+            std.math.mul(usize, std.math.mul(usize, max_tok, shared_inter_dim) catch return error.Overflow, @sizeOf(f16)) catch return error.Overflow
+        else
+            0;
 
         const router_logits_raw = try arena.allocAligned(logits_bytes, 64);
         const sched_hdr_raw = try arena.allocAligned(@sizeOf(ScheduleHeader), 64);
@@ -376,9 +441,19 @@ pub const MoeWorkspace = struct {
         const bucket_hdrs_raw = try arena.allocAligned(bucket_hdrs_bytes, 64);
         const bucket_uniq_raw = try arena.allocAligned(bucket_uniq_bytes, 64);
         const bucket_offs_raw = try arena.allocAligned(bucket_offs_bytes, 64);
+        const shared_gate_raw = try arena.allocAligned(shared_gate_bytes, 64);
+        const shared_inter_raw: ?[]u8 = if (shared_inter_bytes > 0)
+            try arena.allocAligned(shared_inter_bytes, 64)
+        else
+            null;
 
         @memset(sched_hdr_raw, 0);
         @memset(bucket_hdrs_raw, 0);
+        @memset(shared_gate_raw, 0);
+
+        const inter_off = arena.offsetOf(inter_raw.ptr);
+        const shared_inter_off = if (shared_inter_raw) |sr| arena.offsetOf(sr.ptr) else inter_off;
+        const shared_inter_slice: []f16 = if (shared_inter_raw) |sr| @alignCast(std.mem.bytesAsSlice(f16, sr)) else &.{};
 
         return .{
             .spec = spec,
@@ -391,13 +466,15 @@ pub const MoeWorkspace = struct {
             .slot_k_indices_off = arena.offsetOf(slot_k_raw.ptr),
             .scratch_topk_experts_off = arena.offsetOf(scratch_e_raw.ptr),
             .scratch_topk_weights_off = arena.offsetOf(scratch_w_raw.ptr),
-            .inter_off = arena.offsetOf(inter_raw.ptr),
+            .inter_off = inter_off,
             .down_out_off = arena.offsetOf(down_raw.ptr),
             .bucket_headers_off = arena.offsetOf(bucket_hdrs_raw.ptr),
             .bucket_unique_experts_off = arena.offsetOf(bucket_uniq_raw.ptr),
             .bucket_expert_token_offsets_off = arena.offsetOf(bucket_offs_raw.ptr),
             .bucket_unique_stride_u32 = @intCast(bucket_u_stride_bytes / @sizeOf(u32)),
             .bucket_offsets_stride_u32 = @intCast(bucket_o_stride_bytes / @sizeOf(u32)),
+            .shared_gate_scores_off = arena.offsetOf(shared_gate_raw.ptr),
+            .shared_inter_off = shared_inter_off,
             .router_logits = @alignCast(std.mem.bytesAsSlice(f32, router_logits_raw)),
             .schedule_header = @ptrCast(@alignCast(sched_hdr_raw.ptr)),
             .unique_experts = @alignCast(std.mem.bytesAsSlice(u32, uniq_raw)),
@@ -412,6 +489,8 @@ pub const MoeWorkspace = struct {
             .bucket_headers_raw = bucket_hdrs_raw,
             .bucket_unique_experts = @alignCast(std.mem.bytesAsSlice(u32, bucket_uniq_raw)),
             .bucket_expert_token_offsets = @alignCast(std.mem.bytesAsSlice(u32, bucket_offs_raw)),
+            .shared_gate_scores = @alignCast(std.mem.bytesAsSlice(f32, shared_gate_raw)),
+            .shared_inter = shared_inter_slice,
         };
     }
 
@@ -629,6 +708,24 @@ pub const MoELayerArgs = struct {
     hidden_size: u32,
     intermediate_size: u32,
     norm_topk_prob: bool = true,
+    /// Optional unconditional shared expert (G7, ADR-0015). Offsets are
+    /// relative to `shared_weights_base orelse weights_base`.
+    shared_expert: ?ExpertWeights = null,
+    /// Optional separate buffer holding `shared_expert` weights (defaults to
+    /// `weights_base` when null).
+    shared_weights_base: ?metal.BufferBinding = null,
+    /// Storage dtype of `shared_expert` weights. When null, inherits the
+    /// layer's weight dtype (`encodeMoELayer` / `encodeMoELayerFloat`) or
+    /// defaults to `.q4_affine` in `encodeMoELayerHetero`.
+    shared_expert_dtype: ?quant.WeightDType = null,
+    /// Intermediate width of `shared_expert` SwiGLU. When 0, defaults to
+    /// `intermediate_size`.
+    shared_intermediate_size: u32 = 0,
+    /// Optional `[hidden_size]` scalar sigmoid gate weights (`sigmoid(x · w)`)
+    /// applied per token to the shared expert output before accumulating into `out`.
+    shared_gate_weight: ?metal.BufferBinding = null,
+    /// Storage dtype of `shared_gate_weight` (`.f16`, `.bf16`, or `.f32`).
+    shared_gate_dtype: RouterWeightDType = .f16,
 };
 
 /// Alias spelling used by M2.5 integration code.
@@ -777,6 +874,20 @@ pub const MoePipelines = struct {
     down_proj_perslot_q2: metal.Pipeline,
     copy_strided_f16: metal.Pipeline,
     gather_rows_f16: metal.Pipeline,
+    // G7 shared expert pipelines (scalar sigmoid gate + GateUpSwiGLU + DownAccum).
+    shared_gate_f16: metal.Pipeline,
+    shared_gate_f32: metal.Pipeline,
+    shared_gate_bf16: metal.Pipeline,
+    shared_gate_up_q4: metal.Pipeline,
+    shared_gate_up_q3: metal.Pipeline,
+    shared_gate_up_q2: metal.Pipeline,
+    shared_gate_up_f16: metal.Pipeline,
+    shared_gate_up_bf16: metal.Pipeline,
+    shared_down_accum_q4: metal.Pipeline,
+    shared_down_accum_q3: metal.Pipeline,
+    shared_down_accum_q2: metal.Pipeline,
+    shared_down_accum_f16: metal.Pipeline,
+    shared_down_accum_bf16: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!MoePipelines {
         const router_proj_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_router_proj", &.{
@@ -1030,6 +1141,80 @@ pub const MoePipelines = struct {
         const gather_rows_f16 = try metal.Pipeline.init(device, library, "ami_gather_rows_f16");
         errdefer gather_rows_f16.close();
 
+        const shared_gate_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_gate", &.{
+            .{ .index = 4, .value = .{ .bool = true } },
+            .{ .index = 5, .value = .{ .bool = false } },
+        });
+        errdefer shared_gate_f16.close();
+
+        const shared_gate_f32 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_gate", &.{
+            .{ .index = 4, .value = .{ .bool = false } },
+            .{ .index = 5, .value = .{ .bool = false } },
+        });
+        errdefer shared_gate_f32.close();
+
+        const shared_gate_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_gate", &.{
+            .{ .index = 4, .value = .{ .bool = false } },
+            .{ .index = 5, .value = .{ .bool = true } },
+        });
+        errdefer shared_gate_bf16.close();
+
+        const shared_gate_up_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_gate_up_swiglu", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer shared_gate_up_q4.close();
+
+        const shared_gate_up_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_gate_up_swiglu", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer shared_gate_up_q3.close();
+
+        const shared_gate_up_q2 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_gate_up_swiglu", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer shared_gate_up_q2.close();
+
+        const shared_gate_up_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_gate_up_swiglu_float", &.{
+            .{ .index = 6, .value = .{ .bool = false } },
+        });
+        errdefer shared_gate_up_f16.close();
+
+        const shared_gate_up_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_gate_up_swiglu_float", &.{
+            .{ .index = 6, .value = .{ .bool = true } },
+        });
+        errdefer shared_gate_up_bf16.close();
+
+        const shared_down_accum_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_down_accum", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer shared_down_accum_q4.close();
+
+        const shared_down_accum_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_down_accum", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer shared_down_accum_q3.close();
+
+        const shared_down_accum_q2 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_down_accum", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer shared_down_accum_q2.close();
+
+        const shared_down_accum_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_down_accum_float", &.{
+            .{ .index = 6, .value = .{ .bool = false } },
+        });
+        errdefer shared_down_accum_f16.close();
+
+        const shared_down_accum_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_moe_shared_down_accum_float", &.{
+            .{ .index = 6, .value = .{ .bool = true } },
+        });
+        errdefer shared_down_accum_bf16.close();
+
         return .{
             .router_proj_f16 = router_proj_f16,
             .router_proj_f32 = router_proj_f32,
@@ -1077,10 +1262,36 @@ pub const MoePipelines = struct {
             .down_proj_perslot_q2 = down_proj_perslot_q2,
             .copy_strided_f16 = copy_strided_f16,
             .gather_rows_f16 = gather_rows_f16,
+            .shared_gate_f16 = shared_gate_f16,
+            .shared_gate_f32 = shared_gate_f32,
+            .shared_gate_bf16 = shared_gate_bf16,
+            .shared_gate_up_q4 = shared_gate_up_q4,
+            .shared_gate_up_q3 = shared_gate_up_q3,
+            .shared_gate_up_q2 = shared_gate_up_q2,
+            .shared_gate_up_f16 = shared_gate_up_f16,
+            .shared_gate_up_bf16 = shared_gate_up_bf16,
+            .shared_down_accum_q4 = shared_down_accum_q4,
+            .shared_down_accum_q3 = shared_down_accum_q3,
+            .shared_down_accum_q2 = shared_down_accum_q2,
+            .shared_down_accum_f16 = shared_down_accum_f16,
+            .shared_down_accum_bf16 = shared_down_accum_bf16,
         };
     }
 
     pub fn close(self: MoePipelines) void {
+        self.shared_down_accum_bf16.close();
+        self.shared_down_accum_f16.close();
+        self.shared_down_accum_q2.close();
+        self.shared_down_accum_q3.close();
+        self.shared_down_accum_q4.close();
+        self.shared_gate_up_bf16.close();
+        self.shared_gate_up_f16.close();
+        self.shared_gate_up_q2.close();
+        self.shared_gate_up_q3.close();
+        self.shared_gate_up_q4.close();
+        self.shared_gate_bf16.close();
+        self.shared_gate_f32.close();
+        self.shared_gate_f16.close();
         self.gather_rows_f16.close();
         self.copy_strided_f16.close();
         self.down_proj_perslot_q2.close();
@@ -1455,7 +1666,8 @@ pub const MoePipelines = struct {
 
     /// Encodes a complete deduplicated MoE FFN layer into `frame`:
     /// optional router projection -> `ami_moe_route_topk` ->
-    /// `ami_moe_gate_up_swiglu` -> `ami_moe_down_proj` -> `ami_moe_reduce_f16`.
+    /// `ami_moe_gate_up_swiglu` -> `ami_moe_down_proj` -> optional shared expert
+    /// GateUp -> `ami_moe_reduce_f16` -> optional shared expert DownAccum.
     pub fn encodeMoELayer(
         self: MoePipelines,
         frame: *metal.Compute.Frame,
@@ -1490,15 +1702,267 @@ pub const MoePipelines = struct {
             .intermediate_size = args.intermediate_size,
         }, true);
 
-        try self.encodeReduce(frame, .{
-            .workspace = args.workspace,
-            .workspace_buf = args.workspace_buf,
-            .residual = args.residual,
-            .out = args.out,
-            .m = args.m,
-            .hidden_size = args.hidden_size,
-            .top_k = args.top_k,
-        }, true);
+        const default_shared_dt = quant.WeightDType.fromQuant(bits);
+        try self.encodeReduceAndOptionalShared(frame, args, default_shared_dt);
+    }
+
+    /// Encodes the optional shared-expert pre-reduce stages (`ami_moe_shared_gate`,
+    /// `ami_moe_shared_gate_up_swiglu*`), then `ami_moe_reduce_f16`, then
+    /// `ami_moe_shared_down_accum*` accumulating into `args.out`.
+    /// Running shared Gate/GateUp BEFORE `encodeReduce` keeps `args.x` untouched
+    /// even if `args.x` aliases `args.out`, and safely reuses `workspace.inter`
+    /// after routed `DownProj` when `workspace.spec.shared_intermediate_size == 0`.
+    fn encodeReduceAndOptionalShared(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        args: MoELayerArgs,
+        default_shared_dtype: quant.WeightDType,
+    ) EncodeError!void {
+        if (args.shared_expert) |se| {
+            const se_dtype = args.shared_expert_dtype orelse default_shared_dtype;
+            const se_inter = if (args.shared_intermediate_size > 0) args.shared_intermediate_size else args.intermediate_size;
+            const se_weights = args.shared_weights_base orelse args.weights_base;
+            try self.encodeSharedExpertPreReduce(frame, se_dtype, se, se_weights, args, se_inter, true);
+            try self.encodeReduce(frame, .{
+                .workspace = args.workspace,
+                .workspace_buf = args.workspace_buf,
+                .residual = args.residual,
+                .out = args.out,
+                .m = args.m,
+                .hidden_size = args.hidden_size,
+                .top_k = args.top_k,
+            }, true);
+            try self.encodeSharedExpertDownAccum(frame, se_dtype, se, se_weights, args, se_inter, true);
+        } else {
+            try self.encodeReduce(frame, .{
+                .workspace = args.workspace,
+                .workspace_buf = args.workspace_buf,
+                .residual = args.residual,
+                .out = args.out,
+                .m = args.m,
+                .hidden_size = args.hidden_size,
+                .top_k = args.top_k,
+            }, true);
+        }
+    }
+
+    fn resolveSharedInterOffset(workspace: *const MoeWorkspace, m: u32, se_inter: u32) EncodeError!u64 {
+        if (m == 0 or se_inter == 0) return error.ZeroDimension;
+        if (m > workspace.spec.max_tokens) return error.WorkspaceTooSmall;
+        if (workspace.spec.shared_intermediate_size > 0) {
+            if (se_inter > workspace.spec.shared_intermediate_size) return error.WorkspaceTooSmall;
+            return workspace.shared_inter_off;
+        }
+        // Fallback: reuse `workspace.inter` (capacity `max_tokens * top_k * intermediate_size` f16)
+        // after routed `DownProj` has completed.
+        const needed: usize = @as(usize, m) * @as(usize, se_inter);
+        if (needed > workspace.inter.len) return error.WorkspaceTooSmall;
+        return workspace.inter_off;
+    }
+
+    fn encodeSharedExpertPreReduce(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        se_dtype: quant.WeightDType,
+        se: ExpertWeights,
+        se_weights: metal.BufferBinding,
+        args: MoELayerArgs,
+        se_inter: u32,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hidden_size == 0 or se_inter == 0) return error.ZeroDimension;
+        const inter_off = try resolveSharedInterOffset(args.workspace, args.m, se_inter);
+        const wb = args.workspace_buf;
+
+        var gu_barrier = insert_barrier_before;
+        if (args.shared_gate_weight) |gw| {
+            const g_pipe = switch (args.shared_gate_dtype) {
+                .f16 => self.shared_gate_f16,
+                .f32 => self.shared_gate_f32,
+                .bf16 => self.shared_gate_bf16,
+            };
+            const g_params: MoeSharedGateParams = .{
+                .m = args.m,
+                .hidden_size = args.hidden_size,
+            };
+            const g_groups_x: u64 = (@as(u64, args.m) + 3) / 4;
+            try frame.encodeThreadgroups(
+                g_pipe,
+                &.{
+                    args.x,
+                    gw,
+                    .{ .buffer = wb, .offset = args.workspace.shared_gate_scores_off },
+                },
+                std.mem.asBytes(&g_params),
+                .{ g_groups_x, 1, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+            gu_barrier = false;
+        }
+
+        const inter_binding: metal.BufferBinding = .{ .buffer = wb, .offset = inter_off };
+        switch (se_dtype) {
+            .q4_affine, .q3_affine, .q2_affine => {
+                const num_groups, const row_bytes, const pipe = switch (se_dtype) {
+                    .q4_affine => blk: {
+                        const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                        break :blk .{ try Ops.groupsPerRow(args.hidden_size), try Ops.rowWeightBytes(args.hidden_size), self.shared_gate_up_q4 };
+                    },
+                    .q3_affine => blk: {
+                        const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                        break :blk .{ try Ops.groupsPerRow(args.hidden_size), try Ops.rowWeightBytes(args.hidden_size), self.shared_gate_up_q3 };
+                    },
+                    .q2_affine => blk: {
+                        const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                        break :blk .{ try Ops.groupsPerRow(args.hidden_size), try Ops.rowWeightBytes(args.hidden_size), self.shared_gate_up_q2 };
+                    },
+                    else => unreachable,
+                };
+                const params: MoeSharedGateUpParams = .{
+                    .gate_qweight_offset = se.gate_qweight_offset,
+                    .gate_sb_offset = se.gate_sb_offset,
+                    .up_qweight_offset = se.up_qweight_offset,
+                    .up_sb_offset = se.up_sb_offset,
+                    .m = args.m,
+                    .hidden_size = args.hidden_size,
+                    .intermediate_size = se_inter,
+                    .num_groups = @intCast(num_groups),
+                    .row_bytes = @intCast(row_bytes),
+                };
+                const groups_x: u64 = (@as(u64, se_inter) + 7) / 8;
+                const groups_y: u64 = (@as(u64, args.m) + 3) / 4;
+                try frame.encodeThreadgroups(
+                    pipe,
+                    &.{ args.x, se_weights, inter_binding },
+                    std.mem.asBytes(&params),
+                    .{ groups_x, groups_y, 1 },
+                    .{ 128, 1, 1 },
+                    gu_barrier,
+                );
+            },
+            .f16, .bf16 => {
+                if (args.hidden_size % 4 != 0) return error.UnalignedK;
+                const pipe = if (se_dtype == .bf16) self.shared_gate_up_bf16 else self.shared_gate_up_f16;
+                const params: MoeSharedGateUpParams = .{
+                    .gate_qweight_offset = se.gate_qweight_offset,
+                    .gate_sb_offset = 0,
+                    .up_qweight_offset = se.up_qweight_offset,
+                    .up_sb_offset = 0,
+                    .m = args.m,
+                    .hidden_size = args.hidden_size,
+                    .intermediate_size = se_inter,
+                    .num_groups = 0,
+                    .row_bytes = 0,
+                };
+                const groups_x: u64 = (@as(u64, se_inter) + 3) / 4;
+                try frame.encodeThreadgroups(
+                    pipe,
+                    &.{ args.x, se_weights, inter_binding },
+                    std.mem.asBytes(&params),
+                    .{ groups_x, args.m, 1 },
+                    .{ 128, 1, 1 },
+                    gu_barrier,
+                );
+            },
+        }
+    }
+
+    fn encodeSharedExpertDownAccum(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        se_dtype: quant.WeightDType,
+        se: ExpertWeights,
+        se_weights: metal.BufferBinding,
+        args: MoELayerArgs,
+        se_inter: u32,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        const inter_off = try resolveSharedInterOffset(args.workspace, args.m, se_inter);
+        const wb = args.workspace_buf;
+        const inter_binding: metal.BufferBinding = .{ .buffer = wb, .offset = inter_off };
+        const gate_scores_binding: metal.BufferBinding = .{ .buffer = wb, .offset = args.workspace.shared_gate_scores_off };
+        const use_gate: u32 = if (args.shared_gate_weight != null) 1 else 0;
+
+        switch (se_dtype) {
+            .q4_affine, .q3_affine, .q2_affine => {
+                const num_groups, const row_bytes, const pipe = switch (se_dtype) {
+                    .q4_affine => blk: {
+                        const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                        break :blk .{ try Ops.groupsPerRow(se_inter), try Ops.rowWeightBytes(se_inter), self.shared_down_accum_q4 };
+                    },
+                    .q3_affine => blk: {
+                        const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                        break :blk .{ try Ops.groupsPerRow(se_inter), try Ops.rowWeightBytes(se_inter), self.shared_down_accum_q3 };
+                    },
+                    .q2_affine => blk: {
+                        const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                        break :blk .{ try Ops.groupsPerRow(se_inter), try Ops.rowWeightBytes(se_inter), self.shared_down_accum_q2 };
+                    },
+                    else => unreachable,
+                };
+                const params: MoeSharedDownParams = .{
+                    .down_qweight_offset = se.down_qweight_offset,
+                    .down_sb_offset = se.down_sb_offset,
+                    .m = args.m,
+                    .hidden_size = args.hidden_size,
+                    .intermediate_size = se_inter,
+                    .num_groups = @intCast(num_groups),
+                    .row_bytes = @intCast(row_bytes),
+                    .use_gate = use_gate,
+                };
+                const groups_x: u64 = (@as(u64, args.hidden_size) + 7) / 8;
+                const groups_y: u64 = (@as(u64, args.m) + 3) / 4;
+                try frame.encodeThreadgroups(
+                    pipe,
+                    &.{ inter_binding, se_weights, gate_scores_binding, args.out },
+                    std.mem.asBytes(&params),
+                    .{ groups_x, groups_y, 1 },
+                    .{ 128, 1, 1 },
+                    insert_barrier_before,
+                );
+            },
+            .f16, .bf16 => {
+                if (se_inter % 4 != 0) return error.UnalignedK;
+                const pipe = if (se_dtype == .bf16) self.shared_down_accum_bf16 else self.shared_down_accum_f16;
+                const params: MoeSharedDownParams = .{
+                    .down_qweight_offset = se.down_qweight_offset,
+                    .down_sb_offset = 0,
+                    .m = args.m,
+                    .hidden_size = args.hidden_size,
+                    .intermediate_size = se_inter,
+                    .num_groups = 0,
+                    .row_bytes = 0,
+                    .use_gate = use_gate,
+                };
+                const groups_x: u64 = (@as(u64, args.hidden_size) + 3) / 4;
+                try frame.encodeThreadgroups(
+                    pipe,
+                    &.{ inter_binding, se_weights, gate_scores_binding, args.out },
+                    std.mem.asBytes(&params),
+                    .{ groups_x, args.m, 1 },
+                    .{ 128, 1, 1 },
+                    insert_barrier_before,
+                );
+            },
+        }
+    }
+
+    /// Standalone unconditional shared-expert SwiGLU accumulation into `out`
+    /// (`out += [sigmoid(x · gate_w)] * shared_expert(x)`), using `workspace`
+    /// scratch with zero CPU-GPU syncs and zero heap allocations (G7).
+    pub fn encodeSharedExpertAccum(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.WeightDType,
+        args: MoELayerArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        const se = args.shared_expert orelse return error.InvalidArgument;
+        const se_inter = if (args.shared_intermediate_size > 0) args.shared_intermediate_size else args.intermediate_size;
+        const se_weights = args.shared_weights_base orelse args.weights_base;
+        try self.encodeSharedExpertPreReduce(frame, dtype, se, se_weights, args, se_inter, insert_barrier_before);
+        try self.encodeSharedExpertDownAccum(frame, dtype, se, se_weights, args, se_inter, true);
     }
 
     /// Encodes the optional router projection (f32 / f16 / bf16 / quantized
@@ -1693,7 +2157,8 @@ pub const MoePipelines = struct {
     /// zero dynamic heap allocation and zero CPU-GPU synchronization:
     /// optional router projection -> `ami_moe_route_topk_bucketed` ->
     /// one specialized Gate+Up+SwiGLU & DownProj pipeline per present scheme
-    /// bucket -> `ami_moe_reduce_f16`.
+    /// bucket -> optional shared expert -> `ami_moe_reduce_f16` -> optional
+    /// shared expert accumulation into `out`.
     pub fn encodeMoELayerHetero(
         self: MoePipelines,
         frame: *metal.Compute.Frame,
@@ -1702,15 +2167,7 @@ pub const MoePipelines = struct {
     ) EncodeError!void {
         try self.encodeRoutingBucketed(frame, args, insert_barrier_before);
         try self.encodeGateUpDownHetero(frame, args.base, args.scheme_counts, false, true);
-        try self.encodeReduce(frame, .{
-            .workspace = args.base.workspace,
-            .workspace_buf = args.base.workspace_buf,
-            .residual = args.base.residual,
-            .out = args.base.out,
-            .m = args.base.m,
-            .hidden_size = args.base.hidden_size,
-            .top_k = args.base.top_k,
-        }, true);
+        try self.encodeReduceAndOptionalShared(frame, args.base, .q4_affine);
     }
 
     /// Encodes an MLX affine 2-bit / 3-bit / 4-bit group-64 router projection
@@ -1923,15 +2380,7 @@ pub const MoePipelines = struct {
             .intermediate_size = args.intermediate_size,
         }, true);
 
-        try self.encodeReduce(frame, .{
-            .workspace = args.workspace,
-            .workspace_buf = args.workspace_buf,
-            .residual = args.residual,
-            .out = args.out,
-            .m = args.m,
-            .hidden_size = args.hidden_size,
-            .top_k = args.top_k,
-        }, true);
+        try self.encodeReduceAndOptionalShared(frame, args, quant.WeightDType.fromFloat(dtype));
     }
 
     /// Encodes a GPU embedding lookup (`out[m, :] = table[token[m], :]`) for
@@ -3443,7 +3892,7 @@ test "ABI structs, workspace byte sizing, and expertLayerBytes validate invarian
     try std.testing.expect(ws_bytes > 0);
     try std.testing.expectError(error.UnsupportedExpertCount, MoeWorkspace.requiredBytes(.{
         .max_tokens = 1,
-        .num_experts = 257,
+        .num_experts = MAX_EXPERTS + 1,
         .top_k = 8,
         .hidden_size = 64,
         .intermediate_size = 64,
@@ -4554,7 +5003,7 @@ test "encode helpers validate dimensions, alignment, and workspace capacity" {
         .workspace = &ws,
         .workspace_buf = gpu_buf,
         .m = 1,
-        .num_experts = 257,
+        .num_experts = MAX_EXPERTS + 1,
         .top_k = 2,
     }, false));
     try std.testing.expectError(error.WorkspaceTooSmall, pipes.encodeRouteTopK(&frame, .f32, .{
@@ -5998,4 +6447,439 @@ test "G13 heterogeneous scheme-bucketed MoE mixes {q2,q3,q4,f16,bf16} experts ma
     }
     try verifyHeteroMoELayer(&gsq3, 1, 8, 256, 192, true);
     try verifyHeteroMoELayer(&gsq3, 8, 8, 192, 128, false);
+}
+
+fn evalSharedExpertCpuRef(
+    arena_bytes: []const u8,
+    x_f16: []const f16,
+    se: ExpertWeights,
+    se_dtype: quant.WeightDType,
+    gate_w_raw: ?[]const u8,
+    gate_dtype: RouterWeightDType,
+    m: u32,
+    hidden_size: u32,
+    shared_inter: u32,
+    out_accum: []f32,
+    gpa: std.mem.Allocator,
+) !void {
+    const g_out = try gpa.alloc(f32, shared_inter);
+    defer gpa.free(g_out);
+    const u_out = try gpa.alloc(f32, shared_inter);
+    defer gpa.free(u_out);
+    const inter_f16 = try gpa.alloc(f16, shared_inter);
+    defer gpa.free(inter_f16);
+    const d_out = try gpa.alloc(f32, hidden_size);
+    defer gpa.free(d_out);
+
+    for (0..m) |tok| {
+        const x_row = x_f16[tok * hidden_size ..][0..hidden_size];
+        const gate_scale: f32 = if (gate_w_raw) |gw| blk: {
+            var dot_acc: f32 = 0.0;
+            switch (gate_dtype) {
+                .f16 => {
+                    const w: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, gw));
+                    for (0..hidden_size) |k| dot_acc += @as(f32, @floatCast(x_row[k])) * @as(f32, @floatCast(w[k]));
+                },
+                .bf16 => {
+                    const w: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, gw));
+                    for (0..hidden_size) |k| dot_acc += @as(f32, @floatCast(x_row[k])) * quant.bf16ToF32(w[k]);
+                },
+                .f32 => {
+                    const w: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, gw));
+                    for (0..hidden_size) |k| dot_acc += @as(f32, @floatCast(x_row[k])) * w[k];
+                },
+            }
+            break :blk 1.0 / (1.0 + @exp(-dot_acc));
+        } else 1.0;
+
+        switch (se_dtype) {
+            .f16, .bf16 => {
+                const fdt: quant.FloatDType = if (se_dtype == .f16) .f16 else .bf16;
+                const gu_bytes = @as(usize, shared_inter) * hidden_size * 2;
+                const dn_bytes = @as(usize, hidden_size) * shared_inter * 2;
+                floatMatmulRowRef(fdt, x_row, arena_bytes[@intCast(se.gate_qweight_offset)..][0..gu_bytes], g_out, shared_inter, hidden_size);
+                floatMatmulRowRef(fdt, x_row, arena_bytes[@intCast(se.up_qweight_offset)..][0..gu_bytes], u_out, shared_inter, hidden_size);
+                for (0..shared_inter) |i| {
+                    inter_f16[i] = @floatCast((g_out[i] / (1.0 + @exp(-g_out[i]))) * u_out[i]);
+                }
+                floatMatmulRowRef(fdt, inter_f16, arena_bytes[@intCast(se.down_qweight_offset)..][0..dn_bytes], d_out, hidden_size, shared_inter);
+            },
+            inline .q4_affine, .q3_affine, .q2_affine => |q| {
+                const bits: quant.QuantBits = switch (q) {
+                    .q4_affine => .q4,
+                    .q3_affine => .q3,
+                    .q2_affine => .q2,
+                    else => unreachable,
+                };
+                const Ops = quant.QuantOps(.{ .bits = bits, .group_size = 64 });
+                const gu_w_bytes = try Ops.packedWeightBytes(shared_inter, hidden_size);
+                const gu_sb_bytes = try Ops.scaleBiasBytes(shared_inter, hidden_size);
+                const dn_w_bytes = try Ops.packedWeightBytes(hidden_size, shared_inter);
+                const dn_sb_bytes = try Ops.scaleBiasBytes(hidden_size, shared_inter);
+                const g_sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    arena_bytes[@intCast(se.gate_sb_offset)..][0..gu_sb_bytes],
+                ));
+                const u_sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    arena_bytes[@intCast(se.up_sb_offset)..][0..gu_sb_bytes],
+                ));
+                const d_sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    arena_bytes[@intCast(se.down_sb_offset)..][0..dn_sb_bytes],
+                ));
+                try Ops.matmulRef(x_row, arena_bytes[@intCast(se.gate_qweight_offset)..][0..gu_w_bytes], g_sb, g_out, 1, shared_inter, hidden_size);
+                try Ops.matmulRef(x_row, arena_bytes[@intCast(se.up_qweight_offset)..][0..gu_w_bytes], u_sb, u_out, 1, shared_inter, hidden_size);
+                for (0..shared_inter) |i| {
+                    inter_f16[i] = @floatCast((g_out[i] / (1.0 + @exp(-g_out[i]))) * u_out[i]);
+                }
+                try Ops.matmulRef(inter_f16, arena_bytes[@intCast(se.down_qweight_offset)..][0..dn_w_bytes], d_sb, d_out, 1, hidden_size, shared_inter);
+            },
+        }
+
+        for (0..hidden_size) |h| {
+            out_accum[tok * hidden_size + h] += d_out[h] * gate_scale;
+        }
+    }
+}
+
+fn fillSyntheticExpertForDType(
+    arena: *arena_mod.WiredArena,
+    dt: quant.WeightDType,
+    hidden_size: u32,
+    intermediate_size: u32,
+    seed: usize,
+) !ExpertWeights {
+    switch (dt) {
+        .f16, .bf16 => {
+            const fdt: quant.FloatDType = if (dt == .f16) .f16 else .bf16;
+            const gu_bytes: usize = @as(usize, intermediate_size) * hidden_size * 2;
+            const dn_bytes: usize = @as(usize, hidden_size) * intermediate_size * 2;
+            const g_blob = try arena.allocAligned(gu_bytes, 64);
+            const u_blob = try arena.allocAligned(gu_bytes, 64);
+            const d_blob = try arena.allocAligned(dn_bytes, 64);
+            fillSyntheticFloatMatrix(fdt, g_blob, intermediate_size, hidden_size, seed * 3 + 1);
+            fillSyntheticFloatMatrix(fdt, u_blob, intermediate_size, hidden_size, seed * 3 + 2);
+            fillSyntheticFloatMatrix(fdt, d_blob, hidden_size, intermediate_size, seed * 3 + 3);
+            return .{
+                .gate_qweight_offset = arena.offsetOf(g_blob.ptr),
+                .gate_sb_offset = 0,
+                .up_qweight_offset = arena.offsetOf(u_blob.ptr),
+                .up_sb_offset = 0,
+                .down_qweight_offset = arena.offsetOf(d_blob.ptr),
+                .down_sb_offset = 0,
+            };
+        },
+        inline .q4_affine, .q3_affine, .q2_affine => |q| {
+            const bits: quant.QuantBits = switch (q) {
+                .q4_affine => .q4,
+                .q3_affine => .q3,
+                .q2_affine => .q2,
+                else => unreachable,
+            };
+            const Ops = quant.QuantOps(.{ .bits = bits, .group_size = 64 });
+            const gu_w_bytes = try Ops.packedWeightBytes(intermediate_size, hidden_size);
+            const gu_sb_bytes = try Ops.scaleBiasBytes(intermediate_size, hidden_size);
+            const dn_w_bytes = try Ops.packedWeightBytes(hidden_size, intermediate_size);
+            const dn_sb_bytes = try Ops.scaleBiasBytes(hidden_size, intermediate_size);
+
+            const g_qw = try arena.allocAligned(gu_w_bytes, 64);
+            const g_sb_raw = try arena.allocAligned(gu_sb_bytes, 64);
+            const u_qw = try arena.allocAligned(gu_w_bytes, 64);
+            const u_sb_raw = try arena.allocAligned(gu_sb_bytes, 64);
+            const d_qw = try arena.allocAligned(dn_w_bytes, 64);
+            const d_sb_raw = try arena.allocAligned(dn_sb_bytes, 64);
+
+            const g_sb: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, g_sb_raw));
+            const u_sb: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, u_sb_raw));
+            const d_sb: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, d_sb_raw));
+
+            try fillSyntheticQuantMatrix(.{ .bits = bits, .group_size = 64 }, g_qw, g_sb, intermediate_size, hidden_size, seed * 3 + 1);
+            try fillSyntheticQuantMatrix(.{ .bits = bits, .group_size = 64 }, u_qw, u_sb, intermediate_size, hidden_size, seed * 3 + 2);
+            try fillSyntheticQuantMatrix(.{ .bits = bits, .group_size = 64 }, d_qw, d_sb, hidden_size, intermediate_size, seed * 3 + 3);
+
+            return .{
+                .gate_qweight_offset = arena.offsetOf(g_qw.ptr),
+                .gate_sb_offset = arena.offsetOf(g_sb_raw.ptr),
+                .up_qweight_offset = arena.offsetOf(u_qw.ptr),
+                .up_sb_offset = arena.offsetOf(u_sb_raw.ptr),
+                .down_qweight_offset = arena.offsetOf(d_qw.ptr),
+                .down_sb_offset = arena.offsetOf(d_sb_raw.ptr),
+            };
+        },
+    }
+}
+
+fn verifyHighExpertWithShared(
+    expert_dtypes: []const quant.WeightDType,
+    m: u32,
+    top_k: u32,
+    hidden_size: u32,
+    intermediate_size: u32,
+    shared_dtype: quant.WeightDType,
+    shared_inter: u32,
+    dedicated_shared_ws: bool,
+    with_shared_gate: bool,
+    shared_gate_dtype: RouterWeightDType,
+    with_residual: bool,
+    use_hetero: bool,
+) !void {
+    const gpa = std.testing.allocator;
+    const num_experts: u32 = @intCast(expert_dtypes.len);
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    var scheme_counts: [NUM_SCHEME_BUCKETS]u32 = @splat(0);
+    var total_weight_bytes: usize = 0;
+    for (expert_dtypes) |dt| {
+        scheme_counts[@backingInt(dt)] += 1;
+        const eb = try singleExpertBytesForDType(dt, hidden_size, intermediate_size);
+        total_weight_bytes += amf.align64(@intCast(eb)) + 512;
+    }
+    const shared_eb = try singleExpertBytesForDType(shared_dtype, hidden_size, shared_inter);
+    total_weight_bytes += amf.align64(@intCast(shared_eb)) + 1024;
+
+    const ws_spec: WorkspaceSpec = .{
+        .max_tokens = m,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+        .shared_intermediate_size = if (dedicated_shared_ws) shared_inter else 0,
+    };
+    const ws_bytes = try MoeWorkspace.requiredBytes(ws_spec);
+    const x_bytes: usize = @as(usize, m) * hidden_size * @sizeOf(f16);
+    const logits_bytes: usize = @as(usize, m) * num_experts * @sizeOf(f32);
+    const table_bytes: usize = @as(usize, num_experts) * @sizeOf(ExpertWeights);
+    const schemes_bytes: usize = amf.align64(num_experts);
+    const gate_w_bytes: usize = amf.align64(@as(usize, hidden_size) * @sizeOf(f32));
+
+    var arena = try makeTestArena(
+        total_weight_bytes + ws_bytes + x_bytes * 3 + logits_bytes + table_bytes + schemes_bytes + gate_w_bytes + 8 * page.APPLE_PAGE_SIZE,
+    );
+    defer arena.deinit();
+    _ = try arena.allocPages(page.APPLE_PAGE_SIZE);
+
+    const ws = try MoeWorkspace.init(&arena, ws_spec);
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const resid_raw = try arena.allocAligned(x_bytes, 64);
+    const out_raw = try arena.allocAligned(x_bytes, 64);
+    const logits_raw = try arena.allocAligned(logits_bytes, 64);
+    const table_raw = try arena.allocAligned(table_bytes, 64);
+    const schemes_raw = try arena.allocAligned(schemes_bytes, 64);
+    const gate_w_raw = try arena.allocAligned(gate_w_bytes, 64);
+    @memset(out_raw, 0);
+    @memset(schemes_raw, 0);
+    @memset(gate_w_raw, 0);
+    for (expert_dtypes, 0..) |dt, e| schemes_raw[e] = @backingInt(dt);
+
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    const resid_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, resid_raw));
+    for (x_f16, 0..) |*v, i| {
+        const c: i32 = @as(i32, @intCast((i * 13 + 7) % 25)) - 12;
+        v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.04);
+    }
+    for (resid_f16, 0..) |*v, i| {
+        const c: i32 = @as(i32, @intCast((i * 19 + 3) % 21)) - 10;
+        v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.05);
+    }
+    switch (shared_gate_dtype) {
+        .f16 => {
+            const w: []f16 = @alignCast(std.mem.bytesAsSlice(f16, gate_w_raw[0 .. @as(usize, hidden_size) * 2]));
+            for (w, 0..) |*v, i| {
+                const c: i32 = @as(i32, @intCast((i * 7 + 5) % 19)) - 9;
+                v.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.06);
+            }
+        },
+        .bf16 => {
+            const w: []u16 = @alignCast(std.mem.bytesAsSlice(u16, gate_w_raw[0 .. @as(usize, hidden_size) * 2]));
+            for (w, 0..) |*v, i| {
+                const c: i32 = @as(i32, @intCast((i * 7 + 5) % 19)) - 9;
+                v.* = quant.f32ToBf16(@as(f32, @floatFromInt(c)) * 0.06);
+            }
+        },
+        .f32 => {
+            const w: []f32 = @alignCast(std.mem.bytesAsSlice(f32, gate_w_raw[0 .. @as(usize, hidden_size) * 4]));
+            for (w, 0..) |*v, i| {
+                const c: i32 = @as(i32, @intCast((i * 7 + 5) % 19)) - 9;
+                v.* = @as(f32, @floatFromInt(c)) * 0.06;
+            }
+        },
+    }
+
+    // Spread logits across all 512..1024 experts so high indices (>= 256) are guaranteed active,
+    // while also forcing overlapping experts across tokens when m > 1.
+    const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+    for (0..m) |tok| {
+        for (0..num_experts) |e| {
+            const base_v: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((tok * 29 + e * 13 + 7) % 41)) - 20)) * 0.1;
+            const boost: f32 = if (e == num_experts - 1 or e == num_experts / 2 + (tok % 3) or e == 300 + tok) 4.5 else 0.0;
+            logits_f32[tok * num_experts + e] = base_v + boost;
+        }
+    }
+
+    const tbl: []ExpertWeights = @alignCast(std.mem.bytesAsSlice(ExpertWeights, table_raw));
+    for (expert_dtypes, 0..) |dt, e| {
+        tbl[e] = try fillSyntheticExpertForDType(&arena, dt, hidden_size, intermediate_size, e + 1);
+    }
+    const se_weights = try fillSyntheticExpertForDType(&arena, shared_dtype, hidden_size, shared_inter, num_experts + 77);
+
+    // CPU reference: routed MoE + optional residual + shared_expert.
+    var route_ref = try routeTopKRef(gpa, logits_f32, m, num_experts, top_k, true);
+    defer route_ref.deinit(gpa);
+
+    const ref_out = try gpa.alloc(f32, @as(usize, m) * hidden_size);
+    defer gpa.free(ref_out);
+    for (0..m) |tok| {
+        for (0..hidden_size) |h| {
+            ref_out[tok * hidden_size + h] = if (with_residual) @floatCast(resid_f16[tok * hidden_size + h]) else 0.0;
+        }
+    }
+    const g_tmp = try gpa.alloc(f32, intermediate_size);
+    defer gpa.free(g_tmp);
+    const u_tmp = try gpa.alloc(f32, intermediate_size);
+    defer gpa.free(u_tmp);
+    const inter_tmp = try gpa.alloc(f16, intermediate_size);
+    defer gpa.free(inter_tmp);
+    const d_tmp = try gpa.alloc(f32, hidden_size);
+    defer gpa.free(d_tmp);
+    for (0..m) |tok| {
+        const x_row = x_f16[tok * hidden_size ..][0..hidden_size];
+        for (0..top_k) |k_idx| {
+            const eid = route_ref.topk_experts[tok * top_k + k_idx];
+            const rw = route_ref.topk_weights[tok * top_k + k_idx];
+            const ew = tbl[eid];
+            switch (expert_dtypes[eid]) {
+                .f16, .bf16 => {
+                    const fdt: quant.FloatDType = if (expert_dtypes[eid] == .f16) .f16 else .bf16;
+                    const gu_bytes = @as(usize, intermediate_size) * hidden_size * 2;
+                    const dn_bytes = @as(usize, hidden_size) * intermediate_size * 2;
+                    floatMatmulRowRef(fdt, x_row, arena.bytes()[@intCast(ew.gate_qweight_offset)..][0..gu_bytes], g_tmp, intermediate_size, hidden_size);
+                    floatMatmulRowRef(fdt, x_row, arena.bytes()[@intCast(ew.up_qweight_offset)..][0..gu_bytes], u_tmp, intermediate_size, hidden_size);
+                    for (0..intermediate_size) |i| inter_tmp[i] = @floatCast((g_tmp[i] / (1.0 + @exp(-g_tmp[i]))) * u_tmp[i]);
+                    floatMatmulRowRef(fdt, inter_tmp, arena.bytes()[@intCast(ew.down_qweight_offset)..][0..dn_bytes], d_tmp, hidden_size, intermediate_size);
+                },
+                inline .q4_affine, .q3_affine, .q2_affine => |q| {
+                    const bits: quant.QuantBits = switch (q) {
+                        .q4_affine => .q4,
+                        .q3_affine => .q3,
+                        .q2_affine => .q2,
+                        else => unreachable,
+                    };
+                    const Ops = quant.QuantOps(.{ .bits = bits, .group_size = 64 });
+                    const gu_w_bytes = try Ops.packedWeightBytes(intermediate_size, hidden_size);
+                    const gu_sb_bytes = try Ops.scaleBiasBytes(intermediate_size, hidden_size);
+                    const dn_w_bytes = try Ops.packedWeightBytes(hidden_size, intermediate_size);
+                    const dn_sb_bytes = try Ops.scaleBiasBytes(hidden_size, intermediate_size);
+                    const g_sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, arena.bytes()[@intCast(ew.gate_sb_offset)..][0..gu_sb_bytes]));
+                    const u_sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, arena.bytes()[@intCast(ew.up_sb_offset)..][0..gu_sb_bytes]));
+                    const d_sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, arena.bytes()[@intCast(ew.down_sb_offset)..][0..dn_sb_bytes]));
+                    try Ops.matmulRef(x_row, arena.bytes()[@intCast(ew.gate_qweight_offset)..][0..gu_w_bytes], g_sb, g_tmp, 1, intermediate_size, hidden_size);
+                    try Ops.matmulRef(x_row, arena.bytes()[@intCast(ew.up_qweight_offset)..][0..gu_w_bytes], u_sb, u_tmp, 1, intermediate_size, hidden_size);
+                    for (0..intermediate_size) |i| inter_tmp[i] = @floatCast((g_tmp[i] / (1.0 + @exp(-g_tmp[i]))) * u_tmp[i]);
+                    try Ops.matmulRef(inter_tmp, arena.bytes()[@intCast(ew.down_qweight_offset)..][0..dn_w_bytes], d_sb, d_tmp, 1, hidden_size, intermediate_size);
+                },
+            }
+            for (0..hidden_size) |h| ref_out[tok * hidden_size + h] += rw * d_tmp[h];
+        }
+    }
+
+    const gate_slice_opt: ?[]const u8 = if (with_shared_gate)
+        gate_w_raw[0 .. @as(usize, hidden_size) * (if (shared_gate_dtype == .f32) @as(usize, 4) else @as(usize, 2))]
+    else
+        null;
+    try evalSharedExpertCpuRef(
+        arena.bytes(),
+        x_f16,
+        se_weights,
+        shared_dtype,
+        gate_slice_opt,
+        shared_gate_dtype,
+        m,
+        hidden_size,
+        shared_inter,
+        ref_out,
+        gpa,
+    );
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const base_args: MoELayerArgs = .{
+        .x = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) },
+        .router = .{ .logits = .{ .binding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(logits_raw.ptr) }, .dtype = .f32 } },
+        .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+        .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(table_raw.ptr) },
+        .workspace = &ws,
+        .workspace_buf = gpu_buf,
+        .residual = if (with_residual) .{ .buffer = gpu_buf, .offset = arena.offsetOf(resid_raw.ptr) } else null,
+        .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) },
+        .m = m,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+        .norm_topk_prob = true,
+        .shared_expert = se_weights,
+        .shared_expert_dtype = shared_dtype,
+        .shared_intermediate_size = shared_inter,
+        .shared_gate_weight = if (with_shared_gate) .{ .buffer = gpu_buf, .offset = arena.offsetOf(gate_w_raw.ptr) } else null,
+        .shared_gate_dtype = shared_gate_dtype,
+    };
+
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+    if (use_hetero) {
+        try pipes.encodeMoELayerHetero(&frame, .{
+            .base = base_args,
+            .expert_schemes = .{ .buffer = gpu_buf, .offset = arena.offsetOf(schemes_raw.ptr) },
+            .scheme_counts = scheme_counts,
+        }, false);
+    } else {
+        try pipes.encodeMoELayer(&frame, .q3, base_args, false);
+    }
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+
+    // Verify routing activated experts with IDs >= 256.
+    var saw_high_expert = false;
+    for (0..ws.schedule_header.num_unique_experts) |ui| {
+        if (ws.unique_experts[ui] >= 256) saw_high_expert = true;
+    }
+    try std.testing.expect(saw_high_expert);
+    try std.testing.expectEqual(route_ref.num_unique, ws.schedule_header.num_unique_experts);
+
+    const out_gpu: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw));
+    for (ref_out, 0..) |expected, idx| {
+        const g_val: f32 = @floatCast(out_gpu[idx]);
+        const tol: f32 = @max(0.025, @abs(expected) * 0.025);
+        try std.testing.expectApproxEqAbs(expected, g_val, tol);
+    }
+}
+
+test "G7 MoE E=512 top-10 + shared_expert (1-bucket, 3-bucket {q2,q3,q4}, gated/ungated) matches CPU fp32 ref" {
+    // 1) Pure routing parity for E=512 top-10 and E=1024 top-12 (f32 and f16 logits).
+    try verifyRouteTopK(.f32, 1, 512, 10, true, false);
+    try verifyRouteTopK(.f16, 8, 512, 10, true, true);
+    try verifyRouteTopK(.f32, 4, 1024, 12, true, true);
+
+    // 2) Uniform q3 E=512 top-10 + ungated q4 shared_expert (reusing workspace.inter).
+    var uniform_q3: [512]quant.WeightDType = @splat(.q3_affine);
+    try verifyHighExpertWithShared(&uniform_q3, 1, 10, 128, 64, .q4_affine, 64, false, false, .f16, true, false);
+    try verifyHighExpertWithShared(&uniform_q3, 4, 10, 128, 64, .q4_affine, 128, false, true, .bf16, true, false);
+
+    // 3) 3-bucket {q2, q3, q4} G13 E=512 top-10 + sigmoid-gated bf16 shared_expert (Qwen3.8 profile).
+    var hetero_512: [512]quant.WeightDType = undefined;
+    for (&hetero_512, 0..) |*dt, e| {
+        dt.* = if (e < 64) .q4_affine else if (e < 256) .q3_affine else .q2_affine;
+    }
+    try verifyHighExpertWithShared(&hetero_512, 1, 10, 128, 64, .bf16, 128, true, true, .f16, true, true);
+    try verifyHighExpertWithShared(&hetero_512, 8, 10, 128, 64, .q4_affine, 128, true, true, .f32, false, true);
 }
