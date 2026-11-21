@@ -22,6 +22,33 @@ const moe = @import("../gpu/moe.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const vmstat = @import("../platform/vmstat.zig");
 const tree_mod = @import("../spec/tree.zig");
+const expert_mod = @import("../expert/source.zig");
+const aio = @import("../storage/aio.zig");
+const cache_mod = @import("../storage/cache.zig");
+const wavefront = @import("../ane/wavefront.zig");
+const predictor_mod = @import("../ane/predictor.zig");
+
+/// Prompt prefill execution mode (`ADR-0010`, `A1`, `G6`).
+pub const PrefillMode = enum {
+    auto,
+    gpu,
+    hybrid,
+
+    pub fn label(self: PrefillMode) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .gpu => "gpu",
+            .hybrid => "hybrid",
+        };
+    }
+
+    pub fn parse(str: []const u8) error{InvalidPrefillMode}!PrefillMode {
+        if (std.mem.eql(u8, str, "auto")) return .auto;
+        if (std.mem.eql(u8, str, "gpu")) return .gpu;
+        if (std.mem.eql(u8, str, "hybrid")) return .hybrid;
+        return error.InvalidPrefillMode;
+    }
+};
 
 pub const ModelArch = enum {
     qwen3_moe,
@@ -303,6 +330,31 @@ pub const LoadOptions = struct {
     budget_override: ?budget_mod.Budget = null,
     verify_crcs: bool = true,
     timeout_ms: u64 = 30_000,
+
+    // M4 Cold-Expert NVMe Streaming + ANE Cross-Layer Prediction (C3-C5, A2, W8)
+    /// Number of cold experts per layer kept on NVMe instead of wired RAM (`0` = all hot,
+    /// unless `.amf` entries are already tagged `TensorKind.cold_expert` or `heat_profile_json` specifies cold experts).
+    cold_experts_per_layer: u32 = 0,
+    /// Optional W8 `schema_version = 1` expert heat profile JSON bytes (`aminfer-tools expert-heat`).
+    heat_profile_json: ?[]const u8 = null,
+    /// Preallocated 16 KiB-aligned cold-expert slot count in `ExpertSlotPool`.
+    cold_slot_count: u32 = 64,
+    /// Async direct I/O backend (`auto`, `kqueue_aio`, `ecore_pread`).
+    io_backend: aio.IoBackend = .auto,
+    /// Enables ANE cross-layer MoE expert prediction driving async NVMe cold-expert prefetch (`A2`).
+    enable_ane_predictor: bool = true,
+    /// Optional offline W7 `.mlpackage`/`.mlmodelc` path for all-layers ANE expert predictor.
+    ane_predictor_path: ?[:0]const u8 = null,
+
+    // M4 Hybrid ANE/GPU Wavefront Prefill (A1, A3, G6, ADR-0010)
+    /// Prompt prefill mode (`auto`, `gpu`, `hybrid`).
+    prefill_mode: PrefillMode = .auto,
+    /// Pre-compiles ANE attention blocks and 512-token GPU FFN chunk scratch at load time.
+    enable_hybrid_prefill: bool = false,
+    /// Static KV bucket strategy (`bucketed_full_ane` settled by Spike S6 / A3).
+    hybrid_strategy: wavefront.StaticShapeStrategy = .bucketed_full_ane,
+    /// Maximum static KV bucket length compiled for ANE hybrid prefill.
+    hybrid_max_bucket: u32 = 4096,
 };
 
 pub const LoadError = error{
@@ -311,18 +363,27 @@ pub const LoadError = error{
     UnexpectedTensorDType,
     TensorExceedsShardLimit,
     TooManyDispatchesForFrame,
+    ColdExpertsRequireFile,
+    InvalidHeatProfile,
+    HybridPrefillUnsupported,
     OutOfMemory,
 } || ModelConfig.ConfigError || amf.AmfFile.OpenError || quant.ShapeError ||
     sysinfo.Error || metal.WrapError || budget_mod.PlanError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError ||
-    moe.WorkspaceError;
+    moe.WorkspaceError || aio.EcorePoolError || cache_mod.PoolError ||
+    cache_mod.CacheError || expert_mod.NvmeExpert.InitError || page.ShareError ||
+    predictor_mod.AneExpertPredictor.Error || wavefront.WavefrontPrefill.InitError ||
+    wavefront.AneAttentionBucket.InitError;
 
 pub const StepError = error{
     TokenOutOfRange,
     PositionOutOfRange,
     TreeNotEnabled,
     TreeTooLarge,
-} || metal.Error || dequant.EncodeError || moe.EncodeError;
+    HybridPrefillNotEnabled,
+    WavefrontFailed,
+} || metal.Error || dequant.EncodeError || moe.EncodeError ||
+    cache_mod.CacheError || predictor_mod.AneExpertPredictor.Error;
 
 pub const VerifyTreeResult = struct {
     num_nodes: u32,
@@ -336,6 +397,44 @@ pub const VerifyTreeResult = struct {
     avg_unique_experts_per_layer: f64,
     /// Algorithmic bytes moved during this verification pass (using measured unique experts).
     actual_bytes_moved: u64,
+};
+
+/// Cold-expert streaming & ANE cross-layer prefetch statistics (`C3`-`C5`, `A2`).
+pub const ColdExpertStats = struct {
+    total_cold_experts: u32,
+    slot_count: u32,
+    io_backend: aio.IoBackend,
+    ane_predictor_active: bool,
+    ane_predictor_uses_ne: bool,
+    ane_predictor_compile_ms: f64,
+    cache_telemetry: cache_mod.Telemetry,
+};
+
+/// Configuration for `Qwen3Model.initHybridPrefill` (`A1`, `A3`, `G6`).
+pub const HybridPrefillOptions = struct {
+    strategy: wavefront.StaticShapeStrategy = .bucketed_full_ane,
+    max_bucket: u32 = 4096,
+};
+
+/// Telemetry returned by `Qwen3Model.prefillHybridWavefront` (`A1`, `G6`).
+pub const HybridPrefillResult = struct {
+    tokens_prefilled: u32,
+    argmax_token: u32,
+    wavefront_stats: wavefront.WavefrontStats,
+    all_outputs_zero_copy: bool,
+    all_buckets_use_ane: bool,
+};
+
+/// Optional ANE override for `layers[0].o_proj` during `stepDraftTreeBatch` (`D4`/`D5`).
+pub const AneOProjHook = struct {
+    model: metal.AneModel,
+    plan: metal.AnePlan,
+    in_bind: metal.BufferBinding,
+    out_bind: metal.BufferBinding,
+    max_batch_rows: u32,
+    c_in: u32,
+    c_out: u32,
+    last_zero_copy_ok: *bool,
 };
 
 pub const LinearBinding = struct {
@@ -358,6 +457,7 @@ const WeightShard = struct {
 };
 
 const LayerWeights = struct {
+    shard_idx: u16,
     input_layernorm: NormBinding,
     q_proj: LinearBinding,
     k_proj: LinearBinding,
@@ -373,6 +473,7 @@ const LayerWeights = struct {
     expert_dtype: quant.WeightDType,
     expert_weights_buf: metal.Buffer,
     expert_table: metal.BufferBinding,
+    expert_table_host: []moe.ExpertWeights,
 
     // Dense-specific (valid when config.arch == .qwen3_dense)
     dense_gate: LinearBinding,
@@ -383,17 +484,126 @@ const LayerWeights = struct {
     kv_tiles_binding: metal.BufferBinding,
 };
 
+/// Heap-pinned cold-expert NVMe streaming + ANE predictor state (allocated once
+/// at startup so `ExpertCache`'s internal pointers to `pool` and `reader` stay
+/// stable when `Qwen3Model` moves by value).
+const ColdRuntime = struct {
+    file: aio.DirectFile,
+    pool: cache_mod.ExpertSlotPool,
+    reader: aio.AsyncExpertReader,
+    expert_cache: cache_mod.ExpertCache,
+    ane_predictor: ?*predictor_mod.AneExpertPredictor,
+    cold_masks_by_layer: []tree_mod.ExpertBitset,
+    layer_has_cold: []bool,
+    total_cold_experts: u32,
+    pred_bitsets: [predictor_mod.MAX_LOOKAHEAD]tree_mod.ExpertBitset,
+    pred_cands: [predictor_mod.MAX_LOOKAHEAD * predictor_mod.MAX_EXPERTS]predictor_mod.PrefetchCandidate,
+    cold_bool_scratch: [moe.MAX_EXPERTS]bool,
+    ane_req_seq: u64,
+    ane_inflight: bool,
+
+    fn deinit(self: *ColdRuntime, allocator: std.mem.Allocator) void {
+        if (self.ane_predictor) |pred| {
+            if (self.ane_inflight) {
+                _ = pred.waitAsync(0, null, &self.pred_bitsets, &self.pred_cands) catch |err| {
+                    std.debug.panic("ColdRuntime.deinit waitAsync failed: {}", .{err});
+                };
+                self.ane_inflight = false;
+            }
+            pred.deinit(allocator);
+            self.ane_predictor = null;
+        }
+        self.expert_cache.deinit(allocator);
+        self.reader.deinit(allocator);
+        self.pool.deinit();
+        self.file.close();
+        allocator.free(self.layer_has_cold);
+        allocator.free(self.cold_masks_by_layer);
+        allocator.destroy(self);
+    }
+};
+
+/// Heap-pinned hybrid ANE/GPU wavefront prefill runtime (`A1`, `A3`, `G6`, `ADR-0010`).
+const HybridPrefillRuntime = struct {
+    strategy: wavefront.StaticShapeStrategy,
+    chunk_tokens: u32,
+    num_layers: u32,
+    num_chunks: u32,
+    num_buckets: usize,
+    buckets: [wavefront.MAX_STATIC_BUCKETS]u32,
+
+    wavefront_sched: *wavefront.WavefrontPrefill,
+    ane_buckets: []wavefront.AneAttentionBucket, // [num_layers * num_buckets]
+    bound_plans: []wavefront.AneAttentionBucket.BoundPlan, // [num_layers * num_chunks]
+    bound_bucket_idx: []usize, // [num_chunks]
+    bound_uses_direct_past: []bool, // [num_chunks]
+
+    // Double-buffered zero-copy IOSurface activation tiles (`slot = chunk & 1`)
+    x_tiles: [2]metal.KvTile,
+    x_norm_tiles: [2]metal.KvTile,
+    attn_out_tiles: [2]metal.KvTile,
+    mask_tiles: [2][wavefront.MAX_STATIC_BUCKETS]metal.KvTile,
+    k_past_tiles: [2][wavefront.MAX_STATIC_BUCKETS]?metal.KvTile,
+    v_past_tiles: [2][wavefront.MAX_STATIC_BUCKETS]?metal.KvTile,
+
+    // Preallocated 512-token GPU FFN chunk arena (`G6`)
+    ffn_arena: arena_mod.WiredArena,
+    ffn_buf: metal.Buffer,
+    chunk_token_ids_host: []u32,
+    chunk_token_ids_bind: metal.BufferBinding,
+    x_norm_chunk_bind: metal.BufferBinding,
+    proj_out_chunk_bind: metal.BufferBinding,
+    moe_ws_chunk: ?moe.MoeWorkspace,
+    dense_gate_chunk_bind: metal.BufferBinding,
+    dense_up_chunk_bind: metal.BufferBinding,
+    dense_act_chunk_bind: metal.BufferBinding,
+    total_wired_bytes: u64,
+
+    fn deinit(self: *HybridPrefillRuntime, allocator: std.mem.Allocator) void {
+        self.wavefront_sched.deinit(allocator);
+        for (self.bound_plans) |bp| bp.close();
+        allocator.free(self.bound_plans);
+        allocator.free(self.bound_bucket_idx);
+        allocator.free(self.bound_uses_direct_past);
+        for (self.ane_buckets) |ab| ab.close();
+        allocator.free(self.ane_buckets);
+        for (0..2) |s| {
+            for (0..self.num_buckets) |bi| {
+                if (self.v_past_tiles[s][bi]) |t| t.close();
+                if (self.k_past_tiles[s][bi]) |t| t.close();
+                self.mask_tiles[s][bi].close();
+            }
+            self.attn_out_tiles[s].close();
+            self.x_norm_tiles[s].close();
+            self.x_tiles[s].close();
+        }
+        self.ffn_buf.close();
+        self.ffn_arena.deinit();
+        allocator.destroy(self);
+    }
+};
+
 const AmfSource = union(enum) {
     bytes: struct {
         parsed: *const amf.Parsed,
         raw: []const u8,
     },
-    file: *const amf.AmfFile,
+    file: struct {
+        handle: *const amf.AmfFile,
+        path: [:0]const u8,
+    },
 
     fn parsed(self: AmfSource) *const amf.Parsed {
         return switch (self) {
             .bytes => |b| b.parsed,
-            .file => |f| &f.parsed,
+            .file => |f| &f.handle.parsed,
+        };
+    }
+
+    fn filePath(self: AmfSource) ?[:0]const u8 {
+        return switch (self) {
+            .bytes => null,
+            .file => |f| f.path,
         };
     }
 
@@ -417,13 +627,13 @@ const AmfSource = union(enum) {
             },
             .file => |f| {
                 if (verify_crc) {
-                    return f.loadBlob(entry, arena);
+                    return f.handle.loadBlob(entry, arena);
                 }
                 const len: usize = @intCast(entry.blob_bytes);
                 const dst = try arena.allocPages(len);
                 var done: usize = 0;
                 while (done < dst.len) {
-                    const rc = std.c.pread(f.fd, dst.ptr + done, dst.len - done, @intCast(entry.blob_offset + done));
+                    const rc = std.c.pread(f.handle.fd, dst.ptr + done, dst.len - done, @intCast(entry.blob_offset + done));
                     if (rc < 0) {
                         if (std.c.errno(rc) == .INTR) continue;
                         return error.ReadFailed;
@@ -449,6 +659,7 @@ pub const Qwen3Model = struct {
     wired_budget_bytes: u64,
     total_wired_bytes: u64,
     seq_len: u32,
+    prefill_mode: PrefillMode,
 
     device: metal.Device,
     library: metal.Library,
@@ -492,10 +703,12 @@ pub const Qwen3Model = struct {
     tree_positions_host: []u32,
     tree_ancestor_masks_host: []u64,
     tree_accepted_nodes_host: []u32,
+    topk_host: []moe.TopKCandidate,
     tree_token_ids_bind: metal.BufferBinding,
     tree_positions_bind: metal.BufferBinding,
     tree_ancestor_masks_bind: metal.BufferBinding,
     tree_accepted_nodes_bind: metal.BufferBinding,
+    topk_bind: metal.BufferBinding,
     tree_k_base_off: u64,
     tree_v_base_off: u64,
     tree_kv_layer_stride: u64,
@@ -526,6 +739,10 @@ pub const Qwen3Model = struct {
     embed_row_alg_bytes: u64,
     global_head_bytes: u64,
 
+    // M4 Cold-Expert NVMe Streaming + ANE Predictor & Hybrid Wavefront Prefill runtimes
+    cold_rt: ?*ColdRuntime,
+    hybrid_rt: ?*HybridPrefillRuntime,
+
     pub fn loadFromBytes(
         allocator: std.mem.Allocator,
         amf_bytes: []const u8,
@@ -545,11 +762,19 @@ pub const Qwen3Model = struct {
     ) LoadError!Qwen3Model {
         var file = try amf.AmfFile.open(allocator, amf_path);
         defer file.close(allocator);
-        return loadInternal(allocator, .{ .file = &file }, config, options);
+        return loadInternal(allocator, .{ .file = .{ .handle = &file, .path = amf_path } }, config, options);
     }
 
     pub fn deinit(self: *Qwen3Model, allocator: std.mem.Allocator) void {
         self.compute.close();
+        if (self.hybrid_rt) |hrt| {
+            hrt.deinit(allocator);
+            self.hybrid_rt = null;
+        }
+        if (self.cold_rt) |crt| {
+            crt.deinit(allocator);
+            self.cold_rt = null;
+        }
         self.moe_pipes.close();
         self.attn_pipes.close();
         self.dequant_pipes.close();
@@ -744,6 +969,109 @@ pub const Qwen3Model = struct {
         }
     }
 
+    pub fn hasColdExperts(self: *const Qwen3Model) bool {
+        return self.cold_rt != null;
+    }
+
+    pub fn hasHybridPrefill(self: *const Qwen3Model) bool {
+        return self.hybrid_rt != null;
+    }
+
+    pub fn coldStats(self: *const Qwen3Model) ?ColdExpertStats {
+        const crt = self.cold_rt orelse return null;
+        return .{
+            .total_cold_experts = crt.total_cold_experts,
+            .slot_count = crt.pool.numSlots(),
+            .io_backend = crt.reader.activeBackend(),
+            .ane_predictor_active = crt.ane_predictor != null,
+            .ane_predictor_uses_ne = if (crt.ane_predictor) |p| p.usesNeuralEngine() else false,
+            .ane_predictor_compile_ms = if (crt.ane_predictor) |p| p.totalCompileMs() else 0.0,
+            .cache_telemetry = crt.expert_cache.telemetry(),
+        };
+    }
+
+    pub fn resetColdTelemetry(self: *Qwen3Model) void {
+        if (self.cold_rt) |crt| crt.expert_cache.resetTelemetry();
+    }
+
+    /// Populates `out_cold_masks[0..sampled]` with bitsets of currently non-resident
+    /// cold experts at the exact `sampled` layers probed by `predictMoEExperts*` (`D7`).
+    /// Returns the number of sampled layers populated (`0` when no cold experts exist).
+    pub fn fillSampledColdMasks(self: *const Qwen3Model, out_cold_masks: []tree_mod.ExpertBitset) u32 {
+        const crt = self.cold_rt orelse return 0;
+        if (self.config.arch != .qwen3_moe) return 0;
+        const n_layers = self.config.num_hidden_layers;
+        const sampled: u32 = @min(n_layers, MAX_EXPERT_PRED_LAYERS);
+        if (out_cold_masks.len < sampled) return 0;
+        const n_exp = self.config.num_experts;
+        for (0..sampled) |s| {
+            const l_idx: u16 = @intCast(if (sampled == n_layers) s else (s * (n_layers - 1)) / (sampled - 1));
+            var mask = tree_mod.ExpertBitset.empty();
+            for (0..n_exp) |e| {
+                if (crt.cold_masks_by_layer[l_idx].contains(@intCast(e)) and
+                    !crt.expert_cache.isResident(l_idx, @intCast(e)))
+                {
+                    mask.set(@intCast(e));
+                }
+            }
+            out_cold_masks[s] = mask;
+        }
+        return sampled;
+    }
+
+    /// Encodes a linear projection for `m >= 1` rows, dispatching to GEMV (`m == 1`),
+    /// weight-stationary batched GEMV (`2 <= m < 16`), or tiled `simdgroup_float8x8`
+    /// GEMM (`m >= 16`, e.g. 512-token hybrid prefill FFN chunks, `G6`).
+    pub fn encodeLinearGemm(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        lin: LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        m: u32,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
+        if (m < 16) {
+            return self.encodeLinearBatched(frame, lin, x, y, m, insert_barrier_before);
+        }
+        switch (lin.dtype) {
+            .f16 => try self.dequant_pipes.encodeDenseGemm(frame, .f16, .{
+                .x = x,
+                .weight = lin.weight,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .bf16 => try self.dequant_pipes.encodeDenseGemm(frame, .bf16, .{
+                .x = x,
+                .weight = lin.weight,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .q4_affine => try self.dequant_pipes.encodeGemm(frame, .q4, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+            .q3_affine => try self.dequant_pipes.encodeGemm(frame, .q3, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+            }, insert_barrier_before),
+        }
+    }
+
     fn encodeAuxTapIfMatched(
         self: *const Qwen3Model,
         frame: *metal.Compute.Frame,
@@ -771,6 +1099,9 @@ pub const Qwen3Model = struct {
     }
 
     fn runStep(self: *Qwen3Model, token_id: u32, pos: u32, skip_lm_head: bool) StepError!u32 {
+        if (self.cold_rt != null) {
+            return self.runStepCold(token_id, pos, skip_lm_head);
+        }
         if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
         if (pos >= self.max_seq_len) return error.PositionOutOfRange;
 
@@ -946,6 +1277,9 @@ pub const Qwen3Model = struct {
         base_pos: u32,
         compute_logits: bool,
     ) StepError!VerifyTreeResult {
+        if (self.cold_rt != null) {
+            return self.verifyTreeCold(token_ids, positions, ancestor_masks, base_pos, compute_logits);
+        }
         if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
         if (token_ids.len == 0 or token_ids.len != positions.len or token_ids.len != ancestor_masks.len) {
             return error.InvalidArgument;
@@ -1413,6 +1747,1936 @@ pub const Qwen3Model = struct {
         self.unpackPredictedBitsets(m, sampled, out_bitsets);
         return sampled;
     }
+
+    // -----------------------------------------------------------------------
+    // M4 Cold-Expert NVMe Streaming + ANE Cross-Layer Prefetch (C3-C5, A2)
+    // -----------------------------------------------------------------------
+
+    fn encodeLayerAttentionDecode(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        l: usize,
+        pos: u32,
+        cur_seq_len: u32,
+        chunk_idx: usize,
+        barrier_before: bool,
+    ) StepError!void {
+        const layer = self.layers[l];
+        const h = self.config.hidden_size;
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = self.x_bind,
+            .w = layer.input_layernorm.binding,
+            .y = self.x_norm_bind,
+            .num_rows = 1,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = layer.input_layernorm.dtype,
+        }, barrier_before);
+        try self.encodeLinearGemv(frame, layer.q_proj, self.x_norm_bind, self.q_bind, true);
+        try self.encodeLinearGemv(frame, layer.k_proj, self.x_norm_bind, self.k_bind, false);
+        try self.encodeLinearGemv(frame, layer.v_proj, self.x_norm_bind, self.v_bind, false);
+
+        const kv_pair = self.kvTileAt(l, chunk_idx);
+        try self.attn_pipes.encodeQkNormRopeKvWrite(frame, .{
+            .q = self.q_bind,
+            .k = self.k_bind,
+            .v = self.v_bind,
+            .q_norm = layer.q_norm,
+            .k_norm = layer.k_norm,
+            .k_tile = kv_pair.k,
+            .v_tile = kv_pair.v,
+            .num_q_heads = self.config.num_attention_heads,
+            .num_kv_heads = self.config.num_key_value_heads,
+            .head_dim = self.config.head_dim,
+            .pos = pos,
+            .chunk_tokens = self.chunk_tokens,
+            .rms_eps = self.config.rms_norm_eps,
+            .rope_theta = self.config.rope_theta,
+            .norm_dtype = layer.qk_norm_dtype,
+        }, true);
+
+        try self.attn_pipes.encodeGqaDecodeAttn(frame, .{
+            .q = self.q_bind,
+            .kv_tiles = layer.kv_tiles_binding,
+            .out = self.attn_out_bind,
+            .scratch = self.gqa_scratch_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_q_heads = self.config.num_attention_heads,
+            .num_kv_heads = self.config.num_key_value_heads,
+            .head_dim = self.config.head_dim,
+            .seq_len = cur_seq_len,
+            .chunk_tokens = self.chunk_tokens,
+        }, true);
+
+        try self.encodeLinearGemv(frame, layer.o_proj, self.attn_out_bind, self.proj_out_bind, true);
+        try self.moe_pipes.encodeResidualAdd(frame, .{
+            .x = self.x_bind,
+            .delta = self.proj_out_bind,
+            .count = h,
+        }, true);
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = self.x_bind,
+            .w = layer.post_attention_layernorm.binding,
+            .y = self.x_norm_bind,
+            .num_rows = 1,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = layer.post_attention_layernorm.dtype,
+        }, true);
+    }
+
+    fn encodeLayerAttentionTree(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        l: usize,
+        m: u32,
+        base_pos: u32,
+        barrier_before: bool,
+    ) StepError!void {
+        const layer = self.layers[l];
+        const h = self.config.hidden_size;
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = self.x_bind,
+            .w = layer.input_layernorm.binding,
+            .y = self.x_norm_bind,
+            .num_rows = m,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = layer.input_layernorm.dtype,
+        }, barrier_before);
+
+        try self.encodeLinearBatched(frame, layer.q_proj, self.x_norm_bind, self.q_bind, m, true);
+        try self.encodeLinearBatched(frame, layer.k_proj, self.x_norm_bind, self.k_bind, m, false);
+        try self.encodeLinearBatched(frame, layer.v_proj, self.x_norm_bind, self.v_bind, m, false);
+
+        const k_tree_bind = self.treeKBinding(l);
+        const v_tree_bind = self.treeVBinding(l);
+        try self.attn_pipes.encodeTreeQkNormRope(frame, .{
+            .q = self.q_bind,
+            .k = self.k_bind,
+            .v = self.v_bind,
+            .q_norm = layer.q_norm,
+            .k_norm = layer.k_norm,
+            .positions = self.tree_positions_bind,
+            .k_tree_out = k_tree_bind,
+            .v_tree_out = v_tree_bind,
+            .num_nodes = m,
+            .num_q_heads = self.config.num_attention_heads,
+            .num_kv_heads = self.config.num_key_value_heads,
+            .head_dim = self.config.head_dim,
+            .rms_eps = self.config.rms_norm_eps,
+            .rope_theta = self.config.rope_theta,
+            .norm_dtype = layer.qk_norm_dtype,
+        }, true);
+
+        try self.attn_pipes.encodeGqaTreeVerifyAttn(frame, .{
+            .q = self.q_bind,
+            .kv_tiles = if (base_pos > 0) layer.kv_tiles_binding else null,
+            .base_pos = base_pos,
+            .k_tree = k_tree_bind,
+            .v_tree = v_tree_bind,
+            .ancestor_masks = self.tree_ancestor_masks_bind,
+            .out = self.attn_out_bind,
+            .scratch = self.gqa_tree_scratch_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_nodes = m,
+            .num_q_heads = self.config.num_attention_heads,
+            .num_kv_heads = self.config.num_key_value_heads,
+            .head_dim = self.config.head_dim,
+            .chunk_tokens = self.chunk_tokens,
+        }, true);
+
+        try self.encodeLinearBatched(frame, layer.o_proj, self.attn_out_bind, self.proj_out_bind, m, true);
+        try self.moe_pipes.encodeResidualAdd(frame, .{
+            .x = self.x_bind,
+            .delta = self.proj_out_bind,
+            .count = m * h,
+        }, true);
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = self.x_bind,
+            .w = layer.post_attention_layernorm.binding,
+            .y = self.x_norm_bind,
+            .num_rows = m,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = layer.post_attention_layernorm.dtype,
+        }, true);
+    }
+
+    fn encodeLayerRouter(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        l: usize,
+        ws: *const moe.MoeWorkspace,
+        ws_buf: metal.Buffer,
+        x_norm: metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) moe.EncodeError!void {
+        const layer = self.layers[l];
+        const logits_bind = ws.routerLogitsBinding(ws_buf);
+        switch (layer.router) {
+            .weights => |w| try self.moe_pipes.encodeRouterProj(frame, w.dtype, .{
+                .x = x_norm,
+                .router_weights = w.binding,
+                .logits = logits_bind,
+                .m = m,
+                .num_experts = self.config.num_experts,
+                .hidden_size = self.config.hidden_size,
+            }, barrier_before),
+            .quant_weights => |q| try self.moe_pipes.encodeRouterProjQuant(frame, q.bits, .{
+                .x = x_norm,
+                .qweight = q.qweight,
+                .scale_bias = q.scale_bias,
+                .logits = logits_bind,
+                .m = m,
+                .num_experts = self.config.num_experts,
+                .hidden_size = self.config.hidden_size,
+            }, barrier_before),
+            .logits => return error.InvalidArgument,
+        }
+        try self.moe_pipes.encodeRouteTopK(frame, .f32, .{
+            .logits = logits_bind,
+            .workspace = ws,
+            .workspace_buf = ws_buf,
+            .m = m,
+            .num_experts = self.config.num_experts,
+            .top_k = self.config.num_experts_per_tok,
+            .norm_topk_prob = self.config.norm_topk_prob,
+        }, true);
+    }
+
+    fn encodeMoEGateUpDown(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        l: usize,
+        weights_buf: metal.Buffer,
+        ws: *const moe.MoeWorkspace,
+        ws_buf: metal.Buffer,
+        x_norm: metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) moe.EncodeError!void {
+        const layer = self.layers[l];
+        const gu_args: moe.GateUpSwigluArgs = .{
+            .x = x_norm,
+            .weights_base = .{ .buffer = weights_buf, .offset = 0 },
+            .expert_table = layer.expert_table,
+            .workspace = ws,
+            .workspace_buf = ws_buf,
+            .m = m,
+            .num_experts = self.config.num_experts,
+            .top_k = self.config.num_experts_per_tok,
+            .hidden_size = self.config.hidden_size,
+            .intermediate_size = self.config.moe_intermediate_size,
+        };
+        const dp_args: moe.DownProjArgs = .{
+            .weights_base = .{ .buffer = weights_buf, .offset = 0 },
+            .expert_table = layer.expert_table,
+            .workspace = ws,
+            .workspace_buf = ws_buf,
+            .m = m,
+            .num_experts = self.config.num_experts,
+            .top_k = self.config.num_experts_per_tok,
+            .hidden_size = self.config.hidden_size,
+            .intermediate_size = self.config.moe_intermediate_size,
+        };
+        switch (layer.expert_dtype) {
+            .q3_affine => {
+                try self.moe_pipes.encodeGateUpSwiglu(frame, .q3, gu_args, barrier_before);
+                try self.moe_pipes.encodeDownProj(frame, .q3, dp_args, true);
+            },
+            .q4_affine => {
+                try self.moe_pipes.encodeGateUpSwiglu(frame, .q4, gu_args, barrier_before);
+                try self.moe_pipes.encodeDownProj(frame, .q4, dp_args, true);
+            },
+            .f16 => {
+                try self.moe_pipes.encodeGateUpSwigluFloat(frame, .f16, gu_args, barrier_before);
+                try self.moe_pipes.encodeDownProjFloat(frame, .f16, dp_args, true);
+            },
+            .bf16 => {
+                try self.moe_pipes.encodeGateUpSwigluFloat(frame, .bf16, gu_args, barrier_before);
+                try self.moe_pipes.encodeDownProjFloat(frame, .bf16, dp_args, true);
+            },
+        }
+    }
+
+    fn drainAnePrefetch(self: *Qwen3Model, crt: *ColdRuntime, cur_layer: usize, m: u32) StepError!void {
+        _ = self;
+        if (!crt.ane_inflight) return;
+        const pred = crt.ane_predictor orelse {
+            crt.ane_inflight = false;
+            return;
+        };
+        const top_m: u32 = if (m == 1)
+            @min(@as(u32, 8), @max(@as(u32, 1), crt.pool.numSlots() / 4))
+        else
+            @min(m * 4, @max(@as(u32, 1), crt.pool.numSlots() / 2));
+        const ares = try pred.waitAsync(top_m, crt.cold_masks_by_layer, &crt.pred_bitsets, &crt.pred_cands);
+        crt.ane_inflight = false;
+        for (crt.pred_cands[0..ares.result.prefetch_count]) |cand| {
+            if (cand.layer <= cur_layer) continue;
+            _ = crt.expert_cache.prefetch(cand.layer, cand.expert) catch |err| switch (err) {
+                error.QueueFull, error.NoEvictableSlot => break,
+                else => return err,
+            };
+        }
+    }
+
+    /// Resolves & pins all active experts in `ws` for `layer l`, running a
+    /// pre-pass on `layer.expert_weights_buf` ONLY when the slot pool lives in
+    /// a separate `MTLBuffer` (multi-shard cold edge case). In the normal
+    /// single-shard layout (`pool_buf == layer.expert_weights_buf`), all hot
+    /// and pinned cold experts run together in ONE zero-copy dispatch!
+    fn prepareColdLayerExperts(
+        self: *Qwen3Model,
+        crt: *ColdRuntime,
+        l: usize,
+        ws: *moe.MoeWorkspace,
+        ws_buf: metal.Buffer,
+        x_norm: metal.BufferBinding,
+        m: u32,
+    ) StepError!struct { weights_buf: metal.Buffer, num_unique: u32 } {
+        const layer = self.layers[l];
+        const num_unique: u32 = ws.schedule_header.num_unique_experts;
+        const active = ws.unique_experts[0..num_unique];
+
+        const pool_buf = crt.pool.metal_buffer.?;
+        var has_hot = false;
+        var has_cold = false;
+        for (active) |eid| {
+            const pin = try crt.expert_cache.acquirePinned(@intCast(l), @intCast(eid));
+            layer.expert_table_host[eid] = pin.weights;
+            if (pin.is_hot) {
+                has_hot = true;
+            } else {
+                has_cold = true;
+            }
+        }
+
+        // Fast path: hot weights and cold slot pool live in the same `MTLBuffer`,
+        // OR all active experts live in one buffer -> single zero-copy dispatch!
+        if (pool_buf.handle == layer.expert_weights_buf.handle or !has_cold) {
+            return .{ .weights_buf = layer.expert_weights_buf, .num_unique = num_unique };
+        }
+        if (!has_hot) {
+            return .{ .weights_buf = pool_buf, .num_unique = num_unique };
+        }
+
+        // Multi-shard mixed hot + cold fallback: split CSR into hot pass (writes
+        // hot `(tok, slot_k)` slots of `ws.down_out`) then leave cold-only CSR in
+        // `ws` for the caller's main frame (`pool_buf`) + `encodeReduce`.
+        var orig_u: [moe.MAX_EXPERTS]u32 = undefined;
+        var orig_off: [moe.MAX_EXPERTS + 1]u32 = undefined;
+        var orig_tok: [attention.MAX_TREE_NODES * moe.MAX_TOP_K]u32 = undefined;
+        var orig_rw: [attention.MAX_TREE_NODES * moe.MAX_TOP_K]f32 = undefined;
+        var orig_sk: [attention.MAX_TREE_NODES * moe.MAX_TOP_K]u32 = undefined;
+        const total_a: usize = ws.schedule_header.total_assignments;
+        @memcpy(orig_u[0..num_unique], ws.unique_experts[0..num_unique]);
+        @memcpy(orig_off[0 .. num_unique + 1], ws.expert_token_offsets[0 .. num_unique + 1]);
+        @memcpy(orig_tok[0..total_a], ws.token_indices[0..total_a]);
+        @memcpy(orig_rw[0..total_a], ws.routing_weights[0..total_a]);
+        @memcpy(orig_sk[0..total_a], ws.slot_k_indices[0..total_a]);
+
+        // Pass 1: hot-only CSR -> `layer.expert_weights_buf`
+        var hot_u: u32 = 0;
+        var hot_a: u32 = 0;
+        ws.expert_token_offsets[0] = 0;
+        for (0..num_unique) |ui| {
+            const eid = orig_u[ui];
+            if (crt.cold_masks_by_layer[l].contains(eid)) continue;
+            ws.unique_experts[hot_u] = eid;
+            const s0 = orig_off[ui];
+            const s1 = orig_off[ui + 1];
+            for (s0..s1) |ai| {
+                ws.token_indices[hot_a] = orig_tok[ai];
+                ws.routing_weights[hot_a] = orig_rw[ai];
+                ws.slot_k_indices[hot_a] = orig_sk[ai];
+                hot_a += 1;
+            }
+            hot_u += 1;
+            ws.expert_token_offsets[hot_u] = hot_a;
+        }
+        ws.schedule_header.num_unique_experts = hot_u;
+        ws.schedule_header.total_assignments = hot_a;
+
+        var hot_frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer hot_frame.abort();
+        try self.encodeMoEGateUpDown(&hot_frame, l, layer.expert_weights_buf, ws, ws_buf, x_norm, m, false);
+        const hot_sig = try hot_frame.commit();
+        try self.compute.wait(hot_sig, self.timeout_ms);
+
+        // Pass 2: cold-only CSR left in `ws` for caller's frame on `pool_buf`
+        var cold_u: u32 = 0;
+        var cold_a: u32 = 0;
+        ws.expert_token_offsets[0] = 0;
+        for (0..num_unique) |ui| {
+            const eid = orig_u[ui];
+            if (!crt.cold_masks_by_layer[l].contains(eid)) continue;
+            ws.unique_experts[cold_u] = eid;
+            const s0 = orig_off[ui];
+            const s1 = orig_off[ui + 1];
+            for (s0..s1) |ai| {
+                ws.token_indices[cold_a] = orig_tok[ai];
+                ws.routing_weights[cold_a] = orig_rw[ai];
+                ws.slot_k_indices[cold_a] = orig_sk[ai];
+                cold_a += 1;
+            }
+            cold_u += 1;
+            ws.expert_token_offsets[cold_u] = cold_a;
+        }
+        ws.schedule_header.num_unique_experts = cold_u;
+        ws.schedule_header.total_assignments = cold_a;
+        return .{ .weights_buf = pool_buf, .num_unique = num_unique };
+    }
+
+    fn runStepCold(self: *Qwen3Model, token_id: u32, pos: u32, skip_lm_head: bool) StepError!u32 {
+        if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
+        if (pos >= self.max_seq_len) return error.PositionOutOfRange;
+
+        const crt = self.cold_rt.?;
+        const ws = &(self.moe_ws.?);
+        const h = self.config.hidden_size;
+        const cur_seq_len: u32 = pos + 1;
+        const chunk_idx: usize = @intCast(pos / self.chunk_tokens);
+
+        defer {
+            if (crt.ane_inflight) {
+                if (crt.ane_predictor) |pred| {
+                    _ = pred.waitAsync(0, null, &crt.pred_bitsets, &crt.pred_cands) catch |err| {
+                        std.debug.panic("runStepCold unwind waitAsync failed: {}", .{err});
+                    };
+                }
+                crt.ane_inflight = false;
+            }
+            crt.expert_cache.releasePins();
+        }
+        var gpu_sig_pending: ?u64 = null;
+        errdefer if (gpu_sig_pending) |sig| {
+            self.compute.wait(sig, self.timeout_ms) catch |err| {
+                std.debug.panic("runStepCold unwind GPU wait failed: {}", .{err});
+            };
+        };
+
+        // Frame 0: embed + layer 0 attention + layer 0 router.
+        {
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+                .weight = self.embed.weight,
+                .scale_bias = self.embed.scale_bias,
+                .tokens = .{ .token_id = token_id },
+                .out = self.x_bind,
+                .m = 1,
+                .vocab_size = self.config.vocab_size,
+                .hidden_size = h,
+            }, false);
+            try self.encodeLayerAttentionDecode(&frame, 0, pos, cur_seq_len, chunk_idx, true);
+            try self.encodeLayerRouter(&frame, 0, ws, self.scratch_buf, self.x_norm_bind, 1, true);
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+        }
+
+        for (0..self.layers.len) |l| {
+            // Submit async ANE lookahead prediction for `l + 1 .. l + lookahead`
+            // from layer `l`'s post-attention residual `x_host[0..h]`.
+            if (crt.ane_predictor) |pred| {
+                if (l + 1 < self.layers.len) {
+                    try pred.writeInputHiddenF16(self.x_host[0..h], 1);
+                    const pushed = try pred.submitAsync(crt.ane_req_seq, @intCast(l), 1);
+                    if (pushed) {
+                        crt.ane_req_seq += 1;
+                        crt.ane_inflight = true;
+                    }
+                }
+            }
+
+            // Pin active experts for layer `l` and update `expert_table_host` offsets.
+            const prep = try self.prepareColdLayerExperts(crt, l, ws, self.scratch_buf, self.x_norm_bind, 1);
+
+            // Frame `l + 1`: layer `l` MoE FFN + aux tap + layer `l + 1` attn/router (or head).
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.encodeMoEGateUpDown(&frame, l, prep.weights_buf, ws, self.scratch_buf, self.x_norm_bind, 1, false);
+            try self.moe_pipes.encodeReduce(&frame, .{
+                .workspace = ws,
+                .workspace_buf = self.scratch_buf,
+                .residual = self.x_bind,
+                .out = self.x_bind,
+                .m = 1,
+                .hidden_size = h,
+                .top_k = self.config.num_experts_per_tok,
+            }, true);
+            try self.encodeAuxTapIfMatched(&frame, l, 1);
+
+            if (l + 1 < self.layers.len) {
+                try self.encodeLayerAttentionDecode(&frame, l + 1, pos, cur_seq_len, chunk_idx, true);
+                try self.encodeLayerRouter(&frame, l + 1, ws, self.scratch_buf, self.x_norm_bind, 1, true);
+            } else if (!skip_lm_head) {
+                try self.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = self.x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, true);
+                try self.encodeLinearGemv(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, true);
+                try self.moe_pipes.encodeArgmax(&frame, .{
+                    .logits = self.logits_bind,
+                    .out_token_id = self.out_token_id_bind,
+                    .vocab_size = self.config.vocab_size,
+                }, true);
+            }
+
+            const sig = try frame.commit();
+            gpu_sig_pending = sig;
+
+            // While GPU executes layer `l` FFN + layer `l + 1` attn/router, reap
+            // ANE's cross-layer prediction and kick off async NVMe prefetches for
+            // upcoming layers (`l + 1 .. l + lookahead`) into unpinned slots!
+            try self.drainAnePrefetch(crt, l, 1);
+
+            try self.compute.wait(sig, self.timeout_ms);
+            gpu_sig_pending = null;
+            crt.expert_cache.releasePins();
+        }
+
+        self.seq_len = cur_seq_len;
+        return if (skip_lm_head) 0 else self.out_token_id_host.*;
+    }
+
+    fn verifyTreeCold(
+        self: *Qwen3Model,
+        token_ids: []const u32,
+        positions: []const u32,
+        ancestor_masks: []const u64,
+        base_pos: u32,
+        compute_logits: bool,
+    ) StepError!VerifyTreeResult {
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (token_ids.len == 0 or token_ids.len != positions.len or token_ids.len != ancestor_masks.len) {
+            return error.InvalidArgument;
+        }
+        if (token_ids.len > self.max_tree_nodes) return error.TreeTooLarge;
+        if (base_pos > self.max_seq_len) return error.PositionOutOfRange;
+
+        const m: u32 = @intCast(token_ids.len);
+        for (0..m) |i| {
+            if (token_ids[i] >= self.config.vocab_size) return error.TokenOutOfRange;
+            if (positions[i] >= self.max_seq_len) return error.PositionOutOfRange;
+        }
+        @memcpy(self.tree_token_ids_host[0..m], token_ids);
+        @memcpy(self.tree_positions_host[0..m], positions);
+        @memcpy(self.tree_ancestor_masks_host[0..m], ancestor_masks);
+
+        const crt = self.cold_rt.?;
+        const ws = &(self.moe_ws.?);
+        const h = self.config.hidden_size;
+
+        defer {
+            if (crt.ane_inflight) {
+                if (crt.ane_predictor) |pred| {
+                    _ = pred.waitAsync(0, null, &crt.pred_bitsets, &crt.pred_cands) catch |err| {
+                        std.debug.panic("verifyTreeCold unwind waitAsync failed: {}", .{err});
+                    };
+                }
+                crt.ane_inflight = false;
+            }
+            crt.expert_cache.releasePins();
+        }
+        var gpu_sig_pending: ?u64 = null;
+        errdefer if (gpu_sig_pending) |sig| {
+            self.compute.wait(sig, self.timeout_ms) catch |err| {
+                std.debug.panic("verifyTreeCold unwind GPU wait failed: {}", .{err});
+            };
+        };
+
+        // Frame 0: embed + layer 0 tree attention + layer 0 router.
+        {
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+                .weight = self.embed.weight,
+                .scale_bias = self.embed.scale_bias,
+                .tokens = .{ .token_ids = self.tree_token_ids_bind },
+                .out = self.x_bind,
+                .m = m,
+                .vocab_size = self.config.vocab_size,
+                .hidden_size = h,
+            }, false);
+            try self.encodeLayerAttentionTree(&frame, 0, m, base_pos, true);
+            try self.encodeLayerRouter(&frame, 0, ws, self.scratch_buf, self.x_norm_bind, m, true);
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+        }
+
+        var total_unique: u64 = 0;
+        for (0..self.layers.len) |l| {
+            if (crt.ane_predictor) |pred| {
+                if (l + 1 < self.layers.len) {
+                    const pred_m: u32 = @min(m, pred.config.max_tokens);
+                    try pred.writeInputHiddenF16(self.x_host[0 .. @as(usize, pred_m) * h], pred_m);
+                    const pushed = try pred.submitAsync(crt.ane_req_seq, @intCast(l), pred_m);
+                    if (pushed) {
+                        crt.ane_req_seq += 1;
+                        crt.ane_inflight = true;
+                    }
+                }
+            }
+
+            const prep = try self.prepareColdLayerExperts(crt, l, ws, self.scratch_buf, self.x_norm_bind, m);
+            total_unique += prep.num_unique;
+
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.encodeMoEGateUpDown(&frame, l, prep.weights_buf, ws, self.scratch_buf, self.x_norm_bind, m, false);
+            try self.moe_pipes.encodeReduce(&frame, .{
+                .workspace = ws,
+                .workspace_buf = self.scratch_buf,
+                .residual = self.x_bind,
+                .out = self.x_bind,
+                .m = m,
+                .hidden_size = h,
+                .top_k = self.config.num_experts_per_tok,
+            }, true);
+            try self.encodeAuxTapIfMatched(&frame, l, m);
+
+            if (l + 1 < self.layers.len) {
+                try self.encodeLayerAttentionTree(&frame, l + 1, m, base_pos, true);
+                try self.encodeLayerRouter(&frame, l + 1, ws, self.scratch_buf, self.x_norm_bind, m, true);
+            } else if (compute_logits) {
+                try self.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = self.x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, true);
+                try self.encodeLinearBatched(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, m, true);
+                try self.moe_pipes.encodeArgmaxRows(&frame, .{
+                    .logits = self.logits_bind,
+                    .out_token_ids = self.out_token_id_bind,
+                    .num_rows = m,
+                    .vocab_size = self.config.vocab_size,
+                    .logits_dtype = .f16,
+                }, true);
+            }
+
+            const sig = try frame.commit();
+            gpu_sig_pending = sig;
+
+            try self.drainAnePrefetch(crt, l, m);
+
+            try self.compute.wait(sig, self.timeout_ms);
+            gpu_sig_pending = null;
+            crt.expert_cache.releasePins();
+        }
+
+        const avg_unique: f64 = @as(f64, @floatFromInt(total_unique)) / @as(f64, @floatFromInt(self.layers.len));
+        const kv_per_layer: u64 =
+            2 * @as(u64, self.config.num_key_value_heads) * (@as(u64, base_pos) + m) * self.config.head_dim * @sizeOf(f16);
+        const kv_total: u64 = @as(u64, self.config.num_hidden_layers) * kv_per_layer;
+        const head_bytes: u64 = if (compute_logits)
+            @as(u64, m) * self.embed_row_alg_bytes + (self.global_head_bytes - self.embed_row_alg_bytes)
+        else
+            @as(u64, m) * self.embed_row_alg_bytes;
+        const layer_weight_bytes: u64 = self.total_layers_non_expert_bytes + total_unique * self.single_expert_bytes;
+
+        return .{
+            .num_nodes = m,
+            .argmax_tokens = self.out_token_ids_host[0..m],
+            .logits_f16 = self.logits_host[0 .. @as(usize, m) * self.config.vocab_size],
+            .total_unique_experts = total_unique,
+            .avg_unique_experts_per_layer = avg_unique,
+            .actual_bytes_moved = layer_weight_bytes + kv_total + head_bytes,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // D4 Small Draft Model Batched Tree Expansion & KV Sync
+    // -----------------------------------------------------------------------
+
+    /// Executes a batched draft-tree forward pass for `m = token_ids.len` new
+    /// tokens placed at tree KV slots `slot_start .. slot_start + m`, attending
+    /// over committed prefix KV `0..kv_base_pos` and tree KV `0..slot_start + m`
+    /// via `slot_ancestor_masks`, and returning GPU-computed `[rows, top_k]`
+    /// softmax top-K token candidates (`encodeTopKLogitsRows`).
+    ///
+    /// When `commit_kv == true` (`slot_start == 0`), also commits slots `0..m`
+    /// straight into committed IOSurface `KvTile`s at `kv_base_pos .. +m` in
+    /// the same Metal 4 command buffer and updates `self.seq_len = kv_base_pos + m`.
+    /// Zero dynamic heap allocation.
+    pub fn stepDraftTreeBatch(
+        self: *Qwen3Model,
+        token_ids: []const u32,
+        positions: []const u32,
+        slot_start: u32,
+        slot_ancestor_masks: []const u64,
+        kv_base_pos: u32,
+        top_k: u32,
+        logits_last_row_only: bool,
+        commit_kv: bool,
+        ane_o_proj_hook: ?*const AneOProjHook,
+    ) StepError![]const moe.TopKCandidate {
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (token_ids.len == 0 or token_ids.len != positions.len) return error.InvalidArgument;
+        if (top_k == 0 or top_k > moe.MAX_TOP_K) return error.InvalidArgument;
+        const m: u32 = @intCast(token_ids.len);
+        const total_slots: u32 = slot_start + m;
+        if (total_slots > self.max_tree_nodes) return error.TreeTooLarge;
+        if (slot_ancestor_masks.len < total_slots) return error.InvalidArgument;
+        if (commit_kv and (slot_start != 0 or kv_base_pos + m > self.max_seq_len)) return error.PositionOutOfRange;
+        if (kv_base_pos > self.max_seq_len) return error.PositionOutOfRange;
+
+        for (0..m) |i| {
+            if (token_ids[i] >= self.config.vocab_size) return error.TokenOutOfRange;
+            if (positions[i] >= self.max_seq_len) return error.PositionOutOfRange;
+        }
+        @memcpy(self.tree_token_ids_host[0..m], token_ids);
+        @memcpy(self.tree_positions_host[0..m], positions);
+        @memcpy(self.tree_ancestor_masks_host[0..total_slots], slot_ancestor_masks[0..total_slots]);
+
+        const h = self.config.hidden_size;
+        const q_dim = self.config.qDim();
+        const kv_dim = self.config.kvDim();
+        const q_slot_off: u64 = @as(u64, slot_start) * q_dim * @sizeOf(f16);
+        const kv_slot_off: u64 = @as(u64, slot_start) * kv_dim * @sizeOf(f16);
+        const q_sub_bind: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = self.q_bind.offset + q_slot_off };
+        const attn_out_sub_bind: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = self.attn_out_bind.offset + q_slot_off };
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+
+        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            .weight = self.embed.weight,
+            .scale_bias = self.embed.scale_bias,
+            .tokens = .{ .token_ids = self.tree_token_ids_bind },
+            .out = self.x_bind,
+            .m = m,
+            .vocab_size = self.config.vocab_size,
+            .hidden_size = h,
+        }, false);
+
+        for (self.layers, 0..) |layer, l| {
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.x_bind,
+                .w = layer.input_layernorm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true);
+
+            try self.encodeLinearBatched(&frame, layer.q_proj, self.x_norm_bind, q_sub_bind, m, true);
+            try self.encodeLinearBatched(&frame, layer.k_proj, self.x_norm_bind, self.k_bind, m, false);
+            try self.encodeLinearBatched(&frame, layer.v_proj, self.x_norm_bind, self.v_bind, m, false);
+
+            const k_tree_base = self.treeKBinding(l);
+            const v_tree_base = self.treeVBinding(l);
+            const k_tree_sub: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = k_tree_base.offset + kv_slot_off };
+            const v_tree_sub: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = v_tree_base.offset + kv_slot_off };
+
+            try self.attn_pipes.encodeTreeQkNormRope(&frame, .{
+                .q = q_sub_bind,
+                .k = self.k_bind,
+                .v = self.v_bind,
+                .q_norm = layer.q_norm,
+                .k_norm = layer.k_norm,
+                .positions = self.tree_positions_bind,
+                .k_tree_out = k_tree_sub,
+                .v_tree_out = v_tree_sub,
+                .num_nodes = m,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .rms_eps = self.config.rms_norm_eps,
+                .rope_theta = self.config.rope_theta,
+                .norm_dtype = layer.qk_norm_dtype,
+            }, true);
+
+            try self.attn_pipes.encodeGqaTreeVerifyAttn(&frame, .{
+                .q = self.q_bind,
+                .kv_tiles = if (kv_base_pos > 0) layer.kv_tiles_binding else null,
+                .base_pos = kv_base_pos,
+                .k_tree = k_tree_base,
+                .v_tree = v_tree_base,
+                .ancestor_masks = self.tree_ancestor_masks_bind,
+                .out = self.attn_out_bind,
+                .scratch = self.gqa_tree_scratch_bind,
+                .max_splits = attention.MAX_SPLITS,
+                .num_nodes = total_slots,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .chunk_tokens = self.chunk_tokens,
+            }, true);
+
+            // Optional ANE placement override for layer 0 `o_proj` (D5).
+            if (ane_o_proj_hook) |hook| {
+                if (l == 0 and m <= hook.max_batch_rows and q_dim == hook.c_in and h == hook.c_out) {
+                    try self.moe_pipes.encodeCopyStrided(&frame, .{
+                        .src = attn_out_sub_bind,
+                        .dst = hook.in_bind,
+                        .num_rows = m,
+                        .copy_cols = q_dim,
+                        .src_stride = q_dim,
+                        .src_col_off = 0,
+                        .dst_stride = q_dim,
+                        .dst_col_off = 0,
+                    }, true);
+                    const sig0 = try frame.commit();
+                    try self.compute.wait(sig0, self.timeout_ms);
+
+                    const pinfo = try hook.model.predict(hook.plan);
+                    hook.last_zero_copy_ok.* = pinfo.allOutputsZeroCopy();
+
+                    frame = try self.compute.beginFrame(self.timeout_ms);
+                    try self.moe_pipes.encodeResidualAdd(&frame, .{
+                        .x = self.x_bind,
+                        .delta = hook.out_bind,
+                        .count = m * h,
+                    }, false);
+                } else {
+                    try self.encodeLinearBatched(&frame, layer.o_proj, attn_out_sub_bind, self.proj_out_bind, m, true);
+                    try self.moe_pipes.encodeResidualAdd(&frame, .{
+                        .x = self.x_bind,
+                        .delta = self.proj_out_bind,
+                        .count = m * h,
+                    }, true);
+                }
+            } else {
+                try self.encodeLinearBatched(&frame, layer.o_proj, attn_out_sub_bind, self.proj_out_bind, m, true);
+                try self.moe_pipes.encodeResidualAdd(&frame, .{
+                    .x = self.x_bind,
+                    .delta = self.proj_out_bind,
+                    .count = m * h,
+                }, true);
+            }
+
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.x_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, true);
+
+            switch (self.config.arch) {
+                .qwen3_dense => {
+                    try self.encodeLinearBatched(&frame, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, m, true);
+                    try self.encodeLinearBatched(&frame, layer.dense_up, self.x_norm_bind, self.dense_up_bind, m, false);
+                    try self.moe_pipes.encodeSiluMul(&frame, .{
+                        .gate = self.dense_gate_bind,
+                        .up = self.dense_up_bind,
+                        .out = self.dense_act_bind,
+                        .count = m * self.config.intermediate_size,
+                    }, true);
+                    try self.encodeLinearBatched(&frame, layer.dense_down, self.dense_act_bind, self.proj_out_bind, m, true);
+                    try self.moe_pipes.encodeResidualAdd(&frame, .{
+                        .x = self.x_bind,
+                        .delta = self.proj_out_bind,
+                        .count = m * h,
+                    }, true);
+                },
+                .qwen3_moe => {
+                    const ws = &(self.moe_ws.?);
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = self.x_norm_bind,
+                        .router = layer.router,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = ws,
+                        .workspace_buf = self.scratch_buf,
+                        .residual = self.x_bind,
+                        .out = self.x_bind,
+                        .m = m,
+                        .num_experts = self.config.num_experts,
+                        .top_k = self.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = self.config.moe_intermediate_size,
+                        .norm_topk_prob = self.config.norm_topk_prob,
+                    };
+                    switch (layer.expert_dtype) {
+                        .q3_affine => try self.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
+                        .q4_affine => try self.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
+                        .f16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
+                        .bf16 => try self.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
+                    }
+                },
+            }
+        }
+
+        // Optionally commit accepted KV rows straight into IOSurface `KvTile`s
+        // inside the same command buffer (eliminates a separate sync roundtrip).
+        if (commit_kv) {
+            var acc_nodes: [attention.MAX_TREE_NODES]u16 = undefined;
+            for (0..m) |i| acc_nodes[i] = @intCast(i);
+            var offset: u32 = 0;
+            while (offset < m) {
+                const cur_base = kv_base_pos + offset;
+                const chunk0: u32 = cur_base / self.chunk_tokens;
+                const max_end: u32 = (chunk0 + 2) * self.chunk_tokens;
+                const take: u32 = @min(m - offset, max_end - cur_base);
+                const crosses = ((cur_base + take - 1) / self.chunk_tokens) > chunk0;
+                for (0..self.layers.len) |l| {
+                    const t0 = self.kvTileAt(l, @intCast(chunk0));
+                    const t1 = if (crosses) self.kvTileAt(l, @intCast(chunk0 + 1)) else null;
+                    try self.attn_pipes.encodeKvTreeCommit(&frame, .{
+                        .k_tree = self.treeKBinding(l),
+                        .v_tree = self.treeVBinding(l),
+                        .accepted_nodes = .{ .inline_u16 = acc_nodes[offset .. offset + take] },
+                        .accepted_count = take,
+                        .k_tile0 = t0.k,
+                        .v_tile0 = t0.v,
+                        .k_tile1 = if (t1) |p| p.k else null,
+                        .v_tile1 = if (t1) |p| p.v else null,
+                        .num_kv_heads = self.config.num_key_value_heads,
+                        .head_dim = self.config.head_dim,
+                        .base_pos = cur_base,
+                        .chunk_tokens = self.chunk_tokens,
+                    }, false);
+                }
+                offset += take;
+            }
+        }
+
+        const out_rows: u32 = if (logits_last_row_only) 1 else m;
+        if (logits_last_row_only) {
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = self.scratch_buf,
+                .offset = self.x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = last_x_bind,
+                .w = self.final_norm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = 1,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = self.final_norm.dtype,
+            }, true);
+            try self.encodeLinearGemv(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, true);
+        } else {
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.x_bind,
+                .w = self.final_norm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = self.final_norm.dtype,
+            }, true);
+            try self.encodeLinearBatched(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, m, true);
+        }
+        try self.moe_pipes.encodeTopKLogitsRows(&frame, .{
+            .logits = self.logits_bind,
+            .out_candidates = self.topk_bind,
+            .num_rows = out_rows,
+            .vocab_size = self.config.vocab_size,
+            .top_k = top_k,
+            .logits_dtype = .f16,
+        }, true);
+
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+        if (commit_kv) {
+            self.seq_len = kv_base_pos + m;
+        }
+        return self.topk_host[0 .. @as(usize, out_rows) * top_k];
+    }
+
+    // -----------------------------------------------------------------------
+    // G6 + A1 Hybrid ANE/GPU Wavefront Prefill (ADR-0010)
+    // -----------------------------------------------------------------------
+
+    /// GPU FFN half of hybrid wavefront prefill (`G6`): optional attention residual
+    /// add (`x_in_out += attn_out`), `post_attention_layernorm`, and batched
+    /// `m`-token Dense SwiGLU (`encodeLinearGemm`) or CSR-deduplicated MoE FFN
+    /// + residual add directly over zero-copy IOSurface / `WiredArena` buffers.
+    /// Zero dynamic heap allocation.
+    pub fn runLayerFfnChunk(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        layer_idx: usize,
+        x_in_out: metal.BufferBinding,
+        attn_out: ?metal.BufferBinding,
+        m: u32,
+        insert_barrier_before: bool,
+    ) StepError!void {
+        if (layer_idx >= self.layers.len or m == 0) return error.InvalidArgument;
+        const layer = self.layers[layer_idx];
+        const h = self.config.hidden_size;
+
+        // Select preallocated 512-token chunk workspace when hybrid prefill is initialized,
+        // otherwise reuse the standard tree/decode scratch workspace for `m <= max_tree_nodes`.
+        const use_hybrid_ws = if (self.hybrid_rt) |hrt| m <= hrt.chunk_tokens else false;
+        if (!use_hybrid_ws and m > self.max_tree_nodes) return error.TreeTooLarge;
+
+        const x_norm_b = if (use_hybrid_ws) self.hybrid_rt.?.x_norm_chunk_bind else self.x_norm_bind;
+        const proj_out_b = if (use_hybrid_ws) self.hybrid_rt.?.proj_out_chunk_bind else self.proj_out_bind;
+        const ws_buf = if (use_hybrid_ws) self.hybrid_rt.?.ffn_buf else self.scratch_buf;
+
+        var need_barrier = insert_barrier_before;
+        if (attn_out) |ao| {
+            try self.moe_pipes.encodeResidualAdd(frame, .{
+                .x = x_in_out,
+                .delta = ao,
+                .count = m * h,
+            }, need_barrier);
+            need_barrier = true;
+        }
+
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = x_in_out,
+            .w = layer.post_attention_layernorm.binding,
+            .y = x_norm_b,
+            .num_rows = m,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = layer.post_attention_layernorm.dtype,
+        }, need_barrier);
+
+        switch (self.config.arch) {
+            .qwen3_dense => {
+                const dg_b = if (use_hybrid_ws) self.hybrid_rt.?.dense_gate_chunk_bind else self.dense_gate_bind;
+                const du_b = if (use_hybrid_ws) self.hybrid_rt.?.dense_up_chunk_bind else self.dense_up_bind;
+                const da_b = if (use_hybrid_ws) self.hybrid_rt.?.dense_act_chunk_bind else self.dense_act_bind;
+                try self.encodeLinearGemm(frame, layer.dense_gate, x_norm_b, dg_b, m, true);
+                try self.encodeLinearGemm(frame, layer.dense_up, x_norm_b, du_b, m, false);
+                try self.moe_pipes.encodeSiluMul(frame, .{
+                    .gate = dg_b,
+                    .up = du_b,
+                    .out = da_b,
+                    .count = m * self.config.intermediate_size,
+                }, true);
+                try self.encodeLinearGemm(frame, layer.dense_down, da_b, proj_out_b, m, true);
+                try self.moe_pipes.encodeResidualAdd(frame, .{
+                    .x = x_in_out,
+                    .delta = proj_out_b,
+                    .count = m * h,
+                }, true);
+            },
+            .qwen3_moe => {
+                const ws_ptr: *const moe.MoeWorkspace = if (use_hybrid_ws)
+                    &(self.hybrid_rt.?.moe_ws_chunk.?)
+                else
+                    &(self.moe_ws.?);
+                const moe_args: moe.MoELayerArgs = .{
+                    .x = x_norm_b,
+                    .router = layer.router,
+                    .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                    .expert_table = layer.expert_table,
+                    .workspace = ws_ptr,
+                    .workspace_buf = ws_buf,
+                    .residual = x_in_out,
+                    .out = x_in_out,
+                    .m = m,
+                    .num_experts = self.config.num_experts,
+                    .top_k = self.config.num_experts_per_tok,
+                    .hidden_size = h,
+                    .intermediate_size = self.config.moe_intermediate_size,
+                    .norm_topk_prob = self.config.norm_topk_prob,
+                };
+                switch (layer.expert_dtype) {
+                    .q3_affine => try self.moe_pipes.encodeMoELayer(frame, .q3, moe_args, true),
+                    .q4_affine => try self.moe_pipes.encodeMoELayer(frame, .q4, moe_args, true),
+                    .f16 => try self.moe_pipes.encodeMoELayerFloat(frame, .f16, moe_args, true),
+                    .bf16 => try self.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, true),
+                }
+            },
+        }
+    }
+
+    /// Initializes the reusable 2-chunk Hybrid ANE/GPU Wavefront Prefill runtime
+    /// (`A1`, `A3`, `G6`, `ADR-0010`), compiling static power-of-two KV-bucket ANE
+    /// attention graphs per layer and preallocating double-buffered IOSurface
+    /// activation tiles + 512-token GPU FFN chunk scratch.
+    pub fn initHybridPrefill(
+        self: *Qwen3Model,
+        allocator: std.mem.Allocator,
+        opts: HybridPrefillOptions,
+    ) LoadError!void {
+        if (self.hybrid_rt != null) return;
+        const c_tok = self.chunk_tokens;
+        const h = self.config.hidden_size;
+        const hd = self.config.head_dim;
+        if ((c_tok % metal.KV_TILE_ROW_ALIGN_F16) != 0 or
+            (h % metal.KV_TILE_ROW_ALIGN_F16) != 0 or
+            (hd % metal.KV_TILE_ROW_ALIGN_F16) != 0)
+        {
+            return error.HybridPrefillUnsupported;
+        }
+        const geom: wavefront.AneAttentionGeometry = .{
+            .hidden_size = h,
+            .num_q_heads = self.config.num_attention_heads,
+            .num_kv_heads = self.config.num_key_value_heads,
+            .head_dim = hd,
+            .chunk_tokens = c_tok,
+        };
+        if (!geom.validate()) return error.HybridPrefillUnsupported;
+
+        // Build ascending power-of-two static KV buckets starting at `chunk_tokens`.
+        const max_cap: u32 = @min(opts.max_bucket, self.num_chunks * c_tok);
+        var buckets: [wavefront.MAX_STATIC_BUCKETS]u32 = @splat(0);
+        var num_buckets: usize = 0;
+        var b_len: u32 = c_tok;
+        while (num_buckets < wavefront.MAX_STATIC_BUCKETS) {
+            buckets[num_buckets] = b_len;
+            num_buckets += 1;
+            if (b_len >= max_cap) break;
+            const next_b = std.math.mul(u32, b_len, 2) catch break;
+            if (next_b > opts.max_bucket * 2) break;
+            b_len = next_b;
+        }
+        if (num_buckets == 0) return error.HybridPrefillUnsupported;
+
+        const num_layers: usize = self.layers.len;
+        const num_chunks: usize = self.num_chunks;
+
+        // Compute GPU FFN chunk arena footprint (preallocated once for `chunk_tokens`).
+        const c_usize: usize = c_tok;
+        const moe_ws_bytes: usize = if (self.config.arch == .qwen3_moe)
+            try moe.MoeWorkspace.requiredBytes(.{
+                .max_tokens = c_tok,
+                .num_experts = self.config.num_experts,
+                .top_k = self.config.num_experts_per_tok,
+                .hidden_size = h,
+                .intermediate_size = self.config.moe_intermediate_size,
+            })
+        else
+            0;
+        const dense_bytes: usize = if (self.config.arch == .qwen3_dense)
+            3 * amf.align64(c_usize * @as(usize, self.config.intermediate_size) * @sizeOf(f16))
+        else
+            0;
+        const ffn_raw: usize =
+            amf.align64(c_usize * @sizeOf(u32)) + // chunk_token_ids
+            2 * amf.align64(c_usize * @as(usize, h) * @sizeOf(f16)) + // x_norm_chunk, proj_out_chunk
+            moe_ws_bytes +
+            dense_bytes +
+            4 * page.APPLE_PAGE_SIZE;
+        const ffn_arena_bytes = try page.alignUp(ffn_raw);
+
+        // Estimate IOSurface tile bytes and verify total wired budget.
+        var iosurface_bytes: u64 = 0;
+        iosurface_bytes += 6 * @as(u64, try page.alignUp(c_usize * @as(usize, h) * @sizeOf(f16)));
+        for (0..num_buckets) |bi| {
+            const bl: usize = buckets[bi];
+            iosurface_bytes += 2 * @as(u64, try page.alignUp(c_usize * bl * @sizeOf(f16)));
+            if (bl > c_tok) {
+                const past_rows: usize = @as(usize, self.config.num_key_value_heads) * (bl - c_usize);
+                iosurface_bytes += 4 * @as(u64, try page.alignUp(past_rows * @as(usize, hd) * @sizeOf(f16)));
+            }
+        }
+        const extra_wired: u64 = ffn_arena_bytes + iosurface_bytes;
+        const rem_limit = self.wired_budget_bytes -| self.total_wired_bytes;
+        const rem_budget: budget_mod.Budget = .{
+            .limit_bytes = rem_limit,
+            .binding_limit = .configured_cap,
+            .raw_limit_bytes = rem_limit,
+        };
+        try rem_budget.checkPlan(extra_wired);
+
+        var ffn_arena = try arena_mod.WiredArena.init(ffn_arena_bytes, rem_budget);
+        errdefer ffn_arena.deinit();
+        const ffn_buf = try metal.Buffer.wrap(self.device, ffn_arena.bytes());
+        errdefer ffn_buf.close();
+
+        const tok_raw = try ffn_arena.allocAligned(c_usize * @sizeOf(u32), 64);
+        const xn_raw = try ffn_arena.allocAligned(c_usize * @as(usize, h) * @sizeOf(f16), 64);
+        const po_raw = try ffn_arena.allocAligned(c_usize * @as(usize, h) * @sizeOf(f16), 64);
+        @memset(tok_raw, 0);
+        const moe_ws_chunk: ?moe.MoeWorkspace = if (self.config.arch == .qwen3_moe)
+            try moe.MoeWorkspace.init(&ffn_arena, .{
+                .max_tokens = c_tok,
+                .num_experts = self.config.num_experts,
+                .top_k = self.config.num_experts_per_tok,
+                .hidden_size = h,
+                .intermediate_size = self.config.moe_intermediate_size,
+            })
+        else
+            null;
+        var dg_b: metal.BufferBinding = .{ .buffer = ffn_buf, .offset = 0 };
+        var du_b: metal.BufferBinding = .{ .buffer = ffn_buf, .offset = 0 };
+        var da_b: metal.BufferBinding = .{ .buffer = ffn_buf, .offset = 0 };
+        if (self.config.arch == .qwen3_dense) {
+            const inter_b = c_usize * @as(usize, self.config.intermediate_size) * @sizeOf(f16);
+            const dg = try ffn_arena.allocAligned(inter_b, 64);
+            const du = try ffn_arena.allocAligned(inter_b, 64);
+            const da = try ffn_arena.allocAligned(inter_b, 64);
+            dg_b = .{ .buffer = ffn_buf, .offset = ffn_arena.offsetOf(dg.ptr) };
+            du_b = .{ .buffer = ffn_buf, .offset = ffn_arena.offsetOf(du.ptr) };
+            da_b = .{ .buffer = ffn_buf, .offset = ffn_arena.offsetOf(da.ptr) };
+        }
+
+        // Allocate double-buffered zero-copy IOSurface tiles.
+        var x_tiles: [2]metal.KvTile = undefined;
+        var x_norm_tiles: [2]metal.KvTile = undefined;
+        var attn_out_tiles: [2]metal.KvTile = undefined;
+        var mask_tiles: [2][wavefront.MAX_STATIC_BUCKETS]metal.KvTile = undefined;
+        var k_past_tiles: [2][wavefront.MAX_STATIC_BUCKETS]?metal.KvTile = @splat(@splat(null));
+        var v_past_tiles: [2][wavefront.MAX_STATIC_BUCKETS]?metal.KvTile = @splat(@splat(null));
+        var slots_inited: usize = 0;
+        errdefer {
+            for (0..slots_inited) |s| {
+                for (0..num_buckets) |bi| {
+                    if (v_past_tiles[s][bi]) |t| t.close();
+                    if (k_past_tiles[s][bi]) |t| t.close();
+                    mask_tiles[s][bi].close();
+                }
+                attn_out_tiles[s].close();
+                x_norm_tiles[s].close();
+                x_tiles[s].close();
+            }
+        }
+        for (0..2) |s| {
+            x_tiles[s] = try metal.KvTile.init(self.device, h, c_tok, .{ .alias_buffer = true });
+            errdefer x_tiles[s].close();
+            x_norm_tiles[s] = try metal.KvTile.init(self.device, h, c_tok, .{ .alias_buffer = true });
+            errdefer x_norm_tiles[s].close();
+            attn_out_tiles[s] = try metal.KvTile.init(self.device, h, c_tok, .{ .alias_buffer = true });
+            errdefer attn_out_tiles[s].close();
+            var b_done: usize = 0;
+            errdefer {
+                for (0..b_done) |bi| {
+                    if (v_past_tiles[s][bi]) |t| t.close();
+                    if (k_past_tiles[s][bi]) |t| t.close();
+                    mask_tiles[s][bi].close();
+                }
+            }
+            for (0..num_buckets) |bi| {
+                const bl = buckets[bi];
+                mask_tiles[s][bi] = try metal.KvTile.init(self.device, bl, c_tok, .{});
+                errdefer mask_tiles[s][bi].close();
+                if (bl > c_tok) {
+                    const past_rows = self.config.num_key_value_heads * (bl - c_tok);
+                    k_past_tiles[s][bi] = try metal.KvTile.init(self.device, hd, past_rows, .{});
+                    errdefer if (k_past_tiles[s][bi]) |t| t.close();
+                    v_past_tiles[s][bi] = try metal.KvTile.init(self.device, hd, past_rows, .{});
+                }
+                b_done += 1;
+            }
+            slots_inited += 1;
+        }
+
+        // Compile static-shape ANE attention buckets per layer from model weights.
+        const ane_buckets = try allocator.alloc(wavefront.AneAttentionBucket, num_layers * num_buckets);
+        var ab_done: usize = 0;
+        errdefer {
+            for (0..ab_done) |i| ane_buckets[i].close();
+            allocator.free(ane_buckets);
+        }
+        for (0..num_layers) |l| {
+            const layer = self.layers[l];
+            const w_q = try self.extractLinearWeightsF16(allocator, layer.shard_idx, layer.q_proj);
+            defer allocator.free(w_q);
+            const w_k = try self.extractLinearWeightsF16(allocator, layer.shard_idx, layer.k_proj);
+            defer allocator.free(w_k);
+            const w_v = try self.extractLinearWeightsF16(allocator, layer.shard_idx, layer.v_proj);
+            defer allocator.free(w_v);
+            const w_o = try self.extractLinearWeightsF16(allocator, layer.shard_idx, layer.o_proj);
+            defer allocator.free(w_o);
+
+            for (0..num_buckets) |bi| {
+                ane_buckets[l * num_buckets + bi] = try wavefront.AneAttentionBucket.initFromWeights(
+                    allocator,
+                    geom,
+                    buckets[bi],
+                    w_q,
+                    w_k,
+                    w_v,
+                    w_o,
+                    .cpu_and_neural_engine,
+                );
+                ab_done += 1;
+            }
+        }
+
+        // Pre-bind zero-copy `AnePlan`s for every `(layer, chunk)` writing K/V
+        // straight into committed IOSurface `self.kv_tiles`.
+        const bound_bucket_idx = try allocator.alloc(usize, num_chunks);
+        errdefer allocator.free(bound_bucket_idx);
+        const bound_uses_direct_past = try allocator.alloc(bool, num_chunks);
+        errdefer allocator.free(bound_uses_direct_past);
+        const bound_plans = try allocator.alloc(wavefront.AneAttentionBucket.BoundPlan, num_layers * num_chunks);
+        var bp_done: usize = 0;
+        errdefer {
+            for (0..bp_done) |i| bound_plans[i].close();
+            allocator.free(bound_plans);
+        }
+
+        for (0..num_chunks) |c_idx| {
+            const total_toks: u32 = @intCast((c_idx + 1) * c_usize);
+            const bi = wavefront.selectBucketIndex(total_toks, buckets[0..num_buckets]) orelse (num_buckets - 1);
+            bound_bucket_idx[c_idx] = bi;
+            bound_uses_direct_past[c_idx] = (c_idx == 1 and buckets[bi] == 2 * c_tok);
+        }
+
+        for (0..num_layers) |l| {
+            for (0..num_chunks) |c_idx| {
+                const bi = bound_bucket_idx[c_idx];
+                const slot: usize = c_idx & 1;
+                const ab = ane_buckets[l * num_buckets + bi];
+                const out_kv = self.kvTileAt(l, c_idx);
+                const k_past: ?metal.KvTile = if (buckets[bi] == c_tok)
+                    null
+                else if (bound_uses_direct_past[c_idx])
+                    self.kvTileAt(l, 0).k
+                else
+                    k_past_tiles[slot][bi];
+                const v_past: ?metal.KvTile = if (buckets[bi] == c_tok)
+                    null
+                else if (bound_uses_direct_past[c_idx])
+                    self.kvTileAt(l, 0).v
+                else
+                    v_past_tiles[slot][bi];
+
+                bound_plans[l * num_chunks + c_idx] = try ab.bindTiles(
+                    x_norm_tiles[slot],
+                    k_past,
+                    v_past,
+                    mask_tiles[slot][bi],
+                    attn_out_tiles[slot],
+                    out_kv.k,
+                    out_kv.v,
+                );
+                bp_done += 1;
+            }
+        }
+
+        // Register FFN chunk buffer and activation alias tiles in Metal 4 residency set.
+        try self.compute.makeResident(&.{ffn_buf});
+        try self.compute.makeTilesResident(&.{
+            x_tiles[0],        x_tiles[1],
+            x_norm_tiles[0],   x_norm_tiles[1],
+            attn_out_tiles[0], attn_out_tiles[1],
+        });
+
+        const wf_sched = try wavefront.WavefrontPrefill.init(allocator);
+        errdefer wf_sched.deinit(allocator);
+
+        const hrt = try allocator.create(HybridPrefillRuntime);
+        hrt.* = .{
+            .strategy = opts.strategy,
+            .chunk_tokens = c_tok,
+            .num_layers = @intCast(num_layers),
+            .num_chunks = @intCast(num_chunks),
+            .num_buckets = num_buckets,
+            .buckets = buckets,
+            .wavefront_sched = wf_sched,
+            .ane_buckets = ane_buckets,
+            .bound_plans = bound_plans,
+            .bound_bucket_idx = bound_bucket_idx,
+            .bound_uses_direct_past = bound_uses_direct_past,
+            .x_tiles = x_tiles,
+            .x_norm_tiles = x_norm_tiles,
+            .attn_out_tiles = attn_out_tiles,
+            .mask_tiles = mask_tiles,
+            .k_past_tiles = k_past_tiles,
+            .v_past_tiles = v_past_tiles,
+            .ffn_arena = ffn_arena,
+            .ffn_buf = ffn_buf,
+            .chunk_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, tok_raw)),
+            .chunk_token_ids_bind = .{ .buffer = ffn_buf, .offset = ffn_arena.offsetOf(tok_raw.ptr) },
+            .x_norm_chunk_bind = .{ .buffer = ffn_buf, .offset = ffn_arena.offsetOf(xn_raw.ptr) },
+            .proj_out_chunk_bind = .{ .buffer = ffn_buf, .offset = ffn_arena.offsetOf(po_raw.ptr) },
+            .moe_ws_chunk = moe_ws_chunk,
+            .dense_gate_chunk_bind = dg_b,
+            .dense_up_chunk_bind = du_b,
+            .dense_act_chunk_bind = da_b,
+            .total_wired_bytes = extra_wired,
+        };
+        self.hybrid_rt = hrt;
+        self.total_wired_bytes += extra_wired;
+    }
+
+    fn encodeEmbedChunkForHybrid(
+        self: *Qwen3Model,
+        hrt: *HybridPrefillRuntime,
+        frame: *metal.Compute.Frame,
+        tokens: []const u32,
+        chunk_idx: u32,
+        slot: u1,
+        barrier_before: bool,
+    ) StepError!void {
+        const c_tok: usize = hrt.chunk_tokens;
+        const start: usize = @as(usize, chunk_idx) * c_tok;
+        const valid: usize = @min(c_tok, tokens.len -| start);
+        for (0..c_tok) |i| {
+            hrt.chunk_token_ids_host[i] = if (i < valid) tokens[start + i] else 0;
+        }
+        const x_b: metal.BufferBinding = .{ .buffer = hrt.x_tiles[slot].aliasBuffer().?, .offset = 0 };
+        const xn_b: metal.BufferBinding = .{ .buffer = hrt.x_norm_tiles[slot].aliasBuffer().?, .offset = 0 };
+        try self.moe_pipes.encodeEmbedLookup(frame, self.embed.dtype, .{
+            .weight = self.embed.weight,
+            .scale_bias = self.embed.scale_bias,
+            .tokens = .{ .token_ids = hrt.chunk_token_ids_bind },
+            .out = x_b,
+            .m = hrt.chunk_tokens,
+            .vocab_size = self.config.vocab_size,
+            .hidden_size = self.config.hidden_size,
+        }, barrier_before);
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = x_b,
+            .w = self.layers[0].input_layernorm.binding,
+            .y = xn_b,
+            .num_rows = hrt.chunk_tokens,
+            .hidden_dim = self.config.hidden_size,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = self.layers[0].input_layernorm.dtype,
+        }, true);
+    }
+
+    /// Executes 2-chunk overlapping Hybrid ANE/GPU Wavefront Prefill (`A1`, `G6`,
+    /// `ADR-0010`) over `tokens`, overlapping ANE attention `A(l, c_next)` (writing
+    /// K/V directly into IOSurface `KvTile`s) with GPU FFN/MoE `F(l, c_cur)`
+    /// (`runLayerFfnChunk`). Zero dynamic heap allocation on the hot path.
+    pub fn prefillHybridWavefront(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        compute_logits: bool,
+    ) StepError!HybridPrefillResult {
+        const hrt = self.hybrid_rt orelse return error.HybridPrefillNotEnabled;
+        if (tokens.len == 0 or tokens.len > self.max_seq_len) return error.PositionOutOfRange;
+        for (tokens) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
+
+        const c_tok: u32 = hrt.chunk_tokens;
+        const num_chunks: u32 = @intCast((tokens.len + c_tok - 1) / c_tok);
+        if (num_chunks > hrt.num_chunks) return error.PositionOutOfRange;
+
+        // Embed chunk 0 (and chunk 1 if >= 2 chunks) into slots 0 & 1 before wavefront starts.
+        {
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.encodeEmbedChunkForHybrid(hrt, &frame, tokens, 0, 0, false);
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+        }
+        if (num_chunks >= 2) {
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.encodeEmbedChunkForHybrid(hrt, &frame, tokens, 1, 1, false);
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+        }
+
+        const Ctx = struct {
+            model: *Qwen3Model,
+            hrt: *HybridPrefillRuntime,
+            tokens: []const u32,
+            num_chunks: u32,
+            compute_logits: bool,
+            all_zero_copy: bool = true,
+            all_use_ane: bool = true,
+
+            fn copyPastKv(c: *@This(), layer_idx: usize, chunk_idx: u32, slot: u1, bi: usize) !void {
+                const c_u: usize = c.hrt.chunk_tokens;
+                const hd: usize = c.model.config.head_dim;
+                const n_kv: usize = c.model.config.num_key_value_heads;
+                const past_cap: usize = c.hrt.buckets[bi] - c_u;
+
+                var kg = try c.hrt.k_past_tiles[slot][bi].?.lock(false);
+                defer kg.release();
+                var vg = try c.hrt.v_past_tiles[slot][bi].?.lock(false);
+                defer vg.release();
+                const k_dst = kg.f16Slice();
+                const v_dst = vg.f16Slice();
+
+                for (0..chunk_idx) |pc| {
+                    const pair = c.model.kvTileAt(layer_idx, pc);
+                    var sk = try pair.k.lock(true);
+                    defer sk.release();
+                    var sv = try pair.v.lock(true);
+                    defer sv.release();
+                    const ks = sk.f16Slice();
+                    const vs = sv.f16Slice();
+                    for (0..n_kv) |h_idx| {
+                        const src_off = h_idx * c_u * hd;
+                        const dst_off = (h_idx * past_cap + pc * c_u) * hd;
+                        @memcpy(k_dst[dst_off .. dst_off + c_u * hd], ks[src_off .. src_off + c_u * hd]);
+                        @memcpy(v_dst[dst_off .. dst_off + c_u * hd], vs[src_off .. src_off + c_u * hd]);
+                    }
+                }
+            }
+
+            fn aneStep(c: *@This(), task: wavefront.StepTask) anyerror!void {
+                const bi = c.hrt.bound_bucket_idx[task.chunk];
+                const bucket_len = c.hrt.buckets[bi];
+                const valid_past: u32 = task.chunk * c.hrt.chunk_tokens;
+                const valid_chunk: u32 = @intCast(@min(@as(usize, c.hrt.chunk_tokens), c.tokens.len - valid_past));
+
+                {
+                    var mg = try c.hrt.mask_tiles[task.slot][bi].lock(false);
+                    errdefer mg.release();
+                    wavefront.fillCausalBucketMask(mg.f16Slice(), c.hrt.chunk_tokens, bucket_len, valid_past, valid_chunk);
+                    try mg.unlock();
+                }
+
+                if (task.chunk > 0 and !c.hrt.bound_uses_direct_past[task.chunk]) {
+                    try c.copyPastKv(task.layer, task.chunk, task.slot, bi);
+                }
+
+                const ab = c.hrt.ane_buckets[@as(usize, task.layer) * c.hrt.num_buckets + bi];
+                const bp = c.hrt.bound_plans[@as(usize, task.layer) * c.hrt.num_chunks + task.chunk];
+                const pinfo = try ab.run(bp);
+                if (!pinfo.allOutputsZeroCopy()) c.all_zero_copy = false;
+                if (!ab.model_info.usesNeuralEngine()) c.all_use_ane = false;
+            }
+
+            fn gpuStep(c: *@This(), task: wavefront.StepTask) anyerror!void {
+                const m = c.hrt.chunk_tokens;
+                const h = c.model.config.hidden_size;
+                const x_b: metal.BufferBinding = .{ .buffer = c.hrt.x_tiles[task.slot].aliasBuffer().?, .offset = 0 };
+                const xn_b: metal.BufferBinding = .{ .buffer = c.hrt.x_norm_tiles[task.slot].aliasBuffer().?, .offset = 0 };
+                const ao_b: metal.BufferBinding = .{ .buffer = c.hrt.attn_out_tiles[task.slot].aliasBuffer().?, .offset = 0 };
+
+                var frame = try c.model.compute.beginFrame(c.model.timeout_ms);
+                errdefer frame.abort();
+
+                try c.model.runLayerFfnChunk(&frame, task.layer, x_b, ao_b, m, false);
+
+                if (task.layer + 1 < c.hrt.num_layers) {
+                    try c.model.attn_pipes.encodeRmsNorm(&frame, .{
+                        .x = x_b,
+                        .w = c.model.layers[task.layer + 1].input_layernorm.binding,
+                        .y = xn_b,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = c.model.config.rms_norm_eps,
+                        .w_dtype = c.model.layers[task.layer + 1].input_layernorm.dtype,
+                    }, true);
+                } else {
+                    if (c.compute_logits and task.chunk + 1 == c.num_chunks) {
+                        const valid_past: usize = @as(usize, task.chunk) * m;
+                        const last_row: u64 = (c.tokens.len - valid_past) - 1;
+                        const last_x: metal.BufferBinding = .{
+                            .buffer = x_b.buffer,
+                            .offset = last_row * h * @sizeOf(f16),
+                        };
+                        try c.model.attn_pipes.encodeRmsNorm(&frame, .{
+                            .x = last_x,
+                            .w = c.model.final_norm.binding,
+                            .y = c.model.x_norm_bind,
+                            .num_rows = 1,
+                            .hidden_dim = h,
+                            .eps = c.model.config.rms_norm_eps,
+                            .w_dtype = c.model.final_norm.dtype,
+                        }, true);
+                        try c.model.encodeLinearGemv(&frame, c.model.lm_head, c.model.x_norm_bind, c.model.logits_bind, true);
+                        try c.model.moe_pipes.encodeArgmax(&frame, .{
+                            .logits = c.model.logits_bind,
+                            .out_token_id = c.model.out_token_id_bind,
+                            .vocab_size = c.model.config.vocab_size,
+                        }, true);
+                    }
+                    // Prepare chunk `task.chunk + 2` in `task.slot` (guaranteed free
+                    // before `A(0, task.chunk + 2)` by the 2-chunk wavefront schedule).
+                    if (task.chunk + 2 < c.num_chunks) {
+                        try c.model.encodeEmbedChunkForHybrid(c.hrt, &frame, c.tokens, task.chunk + 2, task.slot, true);
+                    }
+                }
+
+                const sig = try frame.commit();
+                try c.model.compute.wait(sig, c.model.timeout_ms);
+            }
+        };
+
+        var ctx: Ctx = .{
+            .model = self,
+            .hrt = hrt,
+            .tokens = tokens,
+            .num_chunks = num_chunks,
+            .compute_logits = compute_logits,
+        };
+        const wf_stats = hrt.wavefront_sched.runWavefrontTyped(
+            Ctx,
+            num_chunks,
+            hrt.num_layers,
+            &ctx,
+            Ctx.aneStep,
+            Ctx.gpuStep,
+        ) catch return error.WavefrontFailed;
+
+        self.seq_len = @intCast(tokens.len);
+        return .{
+            .tokens_prefilled = @intCast(tokens.len),
+            .argmax_token = if (compute_logits) self.out_token_id_host.* else 0,
+            .wavefront_stats = wf_stats,
+            .all_outputs_zero_copy = ctx.all_zero_copy,
+            .all_buckets_use_ane = ctx.all_use_ane,
+        };
+    }
+
+    /// Prefills `tokens[0..tokens.len]` using Hybrid ANE/GPU Wavefront Prefill
+    /// when `hybrid_rt != null` and `tokens.len > chunk_tokens` (and `prefill_mode != .gpu`),
+    /// otherwise using GPU causal chunked prefill (`prefillChunk` / `prefillToken`).
+    /// Returns the greedy argmax next token when `compute_logits == true`, else `0`.
+    pub fn prefillPrompt(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        compute_logits: bool,
+    ) StepError!u32 {
+        if (tokens.len == 0) return error.InvalidArgument;
+        if (self.prefill_mode != .gpu and self.hybrid_rt != null and tokens.len > self.chunk_tokens) {
+            const res = try self.prefillHybridWavefront(tokens, compute_logits);
+            return res.argmax_token;
+        }
+        if (self.max_tree_nodes > 1) {
+            var pos: usize = 0;
+            var last_tok: u32 = 0;
+            while (pos < tokens.len) {
+                const take = @min(@as(usize, self.max_tree_nodes), tokens.len - pos);
+                const is_last = (pos + take == tokens.len);
+                last_tok = try self.prefillChunk(tokens[pos .. pos + take], @intCast(pos), compute_logits and is_last);
+                pos += take;
+            }
+            return last_tok;
+        }
+        for (tokens[0 .. tokens.len - 1], 0..) |tid, i| {
+            try self.prefillToken(tid, @intCast(i));
+        }
+        if (compute_logits) {
+            return self.stepDecode(tokens[tokens.len - 1], @intCast(tokens.len - 1));
+        }
+        try self.prefillToken(tokens[tokens.len - 1], @intCast(tokens.len - 1));
+        return 0;
+    }
+
+    // -----------------------------------------------------------------------
+    // Weight Extraction Helpers (Startup Only) & Real-Checkpoint A2 Capture
+    // -----------------------------------------------------------------------
+
+    /// Extracts a row-major `[lin.n, lin.k]` fp16 copy of a linear weight from
+    /// wired shard memory (dequantizing Q3/Q4 or converting BF16 -> F16 at startup).
+    pub fn extractLinearWeightsF16(
+        self: *const Qwen3Model,
+        allocator: std.mem.Allocator,
+        shard_idx: u16,
+        lin: LinearBinding,
+    ) LoadError![]f16 {
+        const shard_bytes = self.shards[shard_idx].arena.bytes();
+        const n: usize = lin.n;
+        const k: usize = lin.k;
+        const out = try allocator.alloc(f16, n * k);
+        errdefer allocator.free(out);
+        const w_off: usize = @intCast(lin.weight.offset);
+
+        switch (lin.dtype) {
+            .f16 => {
+                const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, shard_bytes[w_off .. w_off + n * k * 2]));
+                @memcpy(out, src);
+            },
+            .bf16 => {
+                const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, shard_bytes[w_off .. w_off + n * k * 2]));
+                for (src, 0..) |bits, i| out[i] = @floatCast(quant.bf16ToF32(bits));
+            },
+            .q4_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                const groups = try Ops.groupsPerRow(k);
+                const rb = try Ops.rowWeightBytes(k);
+                const sb_off: usize = @intCast(lin.scale_bias.?.offset);
+                const sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    shard_bytes[sb_off .. sb_off + n * groups * @sizeOf(quant.ScaleBias)],
+                ));
+                var gbuf: [64]f32 = undefined;
+                for (0..n) |row| {
+                    for (0..groups) |g| {
+                        const goff = w_off + row * rb + g * Ops.groupWeightBytes();
+                        Ops.dequantizeGroup(shard_bytes[goff..][0..Ops.groupWeightBytes()], sb[row * groups + g], &gbuf);
+                        for (0..64) |j| out[row * k + g * 64 + j] = @floatCast(gbuf[j]);
+                    }
+                }
+            },
+            .q3_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                const groups = try Ops.groupsPerRow(k);
+                const rb = try Ops.rowWeightBytes(k);
+                const sb_off: usize = @intCast(lin.scale_bias.?.offset);
+                const sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    shard_bytes[sb_off .. sb_off + n * groups * @sizeOf(quant.ScaleBias)],
+                ));
+                var gbuf: [64]f32 = undefined;
+                for (0..n) |row| {
+                    for (0..groups) |g| {
+                        const goff = w_off + row * rb + g * Ops.groupWeightBytes();
+                        Ops.dequantizeGroup(shard_bytes[goff..][0..Ops.groupWeightBytes()], sb[row * groups + g], &gbuf);
+                        for (0..64) |j| out[row * k + g * 64 + j] = @floatCast(gbuf[j]);
+                    }
+                }
+            },
+        }
+        return out;
+    }
+
+    /// Extracts all layers' MoE router gate weights (`[num_experts, hidden_size]`
+    /// fp16 per layer), optionally folding each layer's `post_attention_layernorm`
+    /// channel scales (`W_eff[e, c] = W_router[e, c] * ln[c]`) so ANE cross-layer
+    /// prediction over unnormalized residual `x_l` preserves exact target channel scaling.
+    pub fn extractRouterWeightsF16(
+        self: *const Qwen3Model,
+        allocator: std.mem.Allocator,
+        fold_post_attn_norm: bool,
+    ) LoadError![][]f16 {
+        if (self.config.arch != .qwen3_moe) return error.InvalidConfig;
+        const num_layers: usize = self.layers.len;
+        const n_exp: usize = self.config.num_experts;
+        const h: usize = self.config.hidden_size;
+
+        const out = try allocator.alloc([]f16, num_layers);
+        var built: usize = 0;
+        errdefer {
+            for (0..built) |i| allocator.free(out[i]);
+            allocator.free(out);
+        }
+
+        const ln_f32 = try allocator.alloc(f32, h);
+        defer allocator.free(ln_f32);
+
+        for (0..num_layers) |l| {
+            const layer = self.layers[l];
+            const shard_bytes = self.shards[layer.shard_idx].arena.bytes();
+
+            if (fold_post_attn_norm) {
+                const ln_off: usize = @intCast(layer.post_attention_layernorm.binding.offset);
+                const raw_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, shard_bytes[ln_off .. ln_off + h * 2]));
+                for (0..h) |c| ln_f32[c] = quant.floatBitsToF32(layer.post_attention_layernorm.dtype, raw_u16[c]);
+            } else {
+                @memset(ln_f32, 1.0);
+            }
+
+            const w_f16 = try allocator.alloc(f16, n_exp * h);
+            errdefer allocator.free(w_f16);
+            switch (layer.router) {
+                .weights => |rw| {
+                    const r_off: usize = @intCast(rw.binding.offset);
+                    switch (rw.dtype) {
+                        .f16 => {
+                            const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, shard_bytes[r_off .. r_off + n_exp * h * 2]));
+                            for (0..n_exp) |e| {
+                                for (0..h) |c| w_f16[e * h + c] = @floatCast(@as(f32, @floatCast(src[e * h + c])) * ln_f32[c]);
+                            }
+                        },
+                        .bf16 => {
+                            const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, shard_bytes[r_off .. r_off + n_exp * h * 2]));
+                            for (0..n_exp) |e| {
+                                for (0..h) |c| w_f16[e * h + c] = @floatCast(quant.bf16ToF32(src[e * h + c]) * ln_f32[c]);
+                            }
+                        },
+                        .f32 => {
+                            const src: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, shard_bytes[r_off .. r_off + n_exp * h * 4]));
+                            for (0..n_exp) |e| {
+                                for (0..h) |c| w_f16[e * h + c] = @floatCast(src[e * h + c] * ln_f32[c]);
+                            }
+                        },
+                    }
+                },
+                .quant_weights => |rq| {
+                    const w_lin: LinearBinding = .{
+                        .weight = rq.qweight,
+                        .scale_bias = rq.scale_bias,
+                        .n = self.config.num_experts,
+                        .k = self.config.hidden_size,
+                        .dtype = quant.WeightDType.fromQuant(rq.bits),
+                        .alg_bytes = 0,
+                    };
+                    const raw_f16 = try self.extractLinearWeightsF16(allocator, layer.shard_idx, w_lin);
+                    defer allocator.free(raw_f16);
+                    for (0..n_exp) |e| {
+                        for (0..h) |c| w_f16[e * h + c] = @floatCast(@as(f32, @floatCast(raw_f16[e * h + c])) * ln_f32[c]);
+                    }
+                },
+                .logits => return error.InvalidConfig,
+            }
+            out[l] = w_f16;
+            built += 1;
+        }
+        return out;
+    }
+
+    /// Builds an `AneExpertPredictor` (`A2`) for this MoE model either from an
+    /// offline W7 `.mlpackage` (`path_opt`) or by compiling folded router weights
+    /// in memory onto ANE.
+    pub fn buildAnePredictor(
+        self: *const Qwen3Model,
+        allocator: std.mem.Allocator,
+        lookahead_layers: u32,
+        max_tokens: u32,
+        enable_async_thread: bool,
+        fold_post_attn_norm: bool,
+        path_opt: ?[:0]const u8,
+    ) LoadError!*predictor_mod.AneExpertPredictor {
+        if (self.config.arch != .qwen3_moe or self.config.num_hidden_layers < 2) {
+            return error.InvalidConfig;
+        }
+        const clamped_la: u32 = @min(lookahead_layers, self.config.num_hidden_layers - 1);
+        const pcfg: predictor_mod.PredictorConfig = .{
+            .num_layers = self.config.num_hidden_layers,
+            .num_experts = self.config.num_experts,
+            .hidden_size = self.config.hidden_size,
+            .lookahead_layers = clamped_la,
+            .max_tokens = max_tokens,
+            .top_k = self.config.num_experts_per_tok,
+            .compute_units = .cpu_and_neural_engine,
+            .enable_async_thread = enable_async_thread,
+        };
+        if (path_opt) |p| {
+            return predictor_mod.AneExpertPredictor.loadAllLayersFromPath(allocator, self.device, pcfg, p);
+        }
+        const routers = try self.extractRouterWeightsF16(allocator, fold_post_attn_norm);
+        defer {
+            for (routers) |r| allocator.free(r);
+            allocator.free(routers);
+        }
+        const ro_slices = try allocator.alloc([]const f16, routers.len);
+        defer allocator.free(ro_slices);
+        for (routers, 0..) |r, i| ro_slices[i] = r;
+        return predictor_mod.AneExpertPredictor.initFromRouterWeights(allocator, self.device, pcfg, ro_slices);
+    }
+
+    /// Runs one exact decode step while capturing every layer's post-attention
+    /// hidden state (`out_hidden_per_layer[l * H .. +H]`) and exact GPU-routed
+    /// top-K expert IDs (`out_topk_per_layer[l * top_k .. +top_k]`) for real-model
+    /// `A2` cross-layer recall evaluation (`aminfer bench-a2`).
+    pub fn stepDecodeCaptureLayerRouting(
+        self: *Qwen3Model,
+        token_id: u32,
+        pos: u32,
+        out_hidden_per_layer: []f16,
+        out_topk_per_layer: []u32,
+    ) StepError!u32 {
+        if (self.config.arch != .qwen3_moe) return error.InvalidArgument;
+        if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
+        if (pos >= self.max_seq_len) return error.PositionOutOfRange;
+        const h: usize = self.config.hidden_size;
+        const top_k: usize = self.config.num_experts_per_tok;
+        if (out_hidden_per_layer.len < self.layers.len * h or
+            out_topk_per_layer.len < self.layers.len * top_k)
+        {
+            return error.InvalidArgument;
+        }
+
+        const ws = &(self.moe_ws.?);
+        const cur_seq_len: u32 = pos + 1;
+        const chunk_idx: usize = @intCast(pos / self.chunk_tokens);
+
+        {
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+                .weight = self.embed.weight,
+                .scale_bias = self.embed.scale_bias,
+                .tokens = .{ .token_id = token_id },
+                .out = self.x_bind,
+                .m = 1,
+                .vocab_size = self.config.vocab_size,
+                .hidden_size = self.config.hidden_size,
+            }, false);
+            try self.encodeLayerAttentionDecode(&frame, 0, pos, cur_seq_len, chunk_idx, true);
+            try self.encodeLayerRouter(&frame, 0, ws, self.scratch_buf, self.x_norm_bind, 1, true);
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+        }
+
+        for (0..self.layers.len) |l| {
+            @memcpy(out_hidden_per_layer[l * h .. (l + 1) * h], self.x_host[0..h]);
+            @memcpy(out_topk_per_layer[l * top_k .. (l + 1) * top_k], ws.scratch_topk_experts[0..top_k]);
+
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.encodeMoEGateUpDown(&frame, l, self.layers[l].expert_weights_buf, ws, self.scratch_buf, self.x_norm_bind, 1, false);
+            try self.moe_pipes.encodeReduce(&frame, .{
+                .workspace = ws,
+                .workspace_buf = self.scratch_buf,
+                .residual = self.x_bind,
+                .out = self.x_bind,
+                .m = 1,
+                .hidden_size = self.config.hidden_size,
+                .top_k = self.config.num_experts_per_tok,
+            }, true);
+            if (l + 1 < self.layers.len) {
+                try self.encodeLayerAttentionDecode(&frame, l + 1, pos, cur_seq_len, chunk_idx, true);
+                try self.encodeLayerRouter(&frame, l + 1, ws, self.scratch_buf, self.x_norm_bind, 1, true);
+            } else {
+                try self.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = self.x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = self.config.hidden_size,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, true);
+                try self.encodeLinearGemv(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, true);
+                try self.moe_pipes.encodeArgmax(&frame, .{
+                    .logits = self.logits_bind,
+                    .out_token_id = self.out_token_id_bind,
+                    .vocab_size = self.config.vocab_size,
+                }, true);
+            }
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+        }
+
+        self.seq_len = cur_seq_len;
+        return self.out_token_id_host.*;
+    }
+
+    /// Benchmarks GPU single-token router gate lookahead (`post_attention_layernorm`
+    /// + quantized/fp16 router proj + top-K) for `delta` layers ahead (`l + 1 .. l + lookahead`)
+    /// from `hidden_f16[0..H]` (`A2` GPU baseline).
+    pub fn evalGpuRouterLookahead(
+        self: *Qwen3Model,
+        hidden_f16: []const f16,
+        current_layer: u32,
+        lookahead_layers: u32,
+        out_logits_per_delta: [][]f32,
+    ) StepError!u64 {
+        if (self.config.arch != .qwen3_moe) return error.InvalidArgument;
+        const h: usize = self.config.hidden_size;
+        const n_exp: usize = self.config.num_experts;
+        if (hidden_f16.len < h) return error.InvalidArgument;
+        const pred_layers: u32 = @min(lookahead_layers, self.config.num_hidden_layers -| (current_layer + 1));
+        if (pred_layers == 0 or out_logits_per_delta.len < pred_layers) return error.InvalidArgument;
+
+        @memcpy(self.x_host[0..h], hidden_f16[0..h]);
+        const ws = &(self.moe_ws.?);
+        var total_ns: u64 = 0;
+
+        for (0..pred_layers) |d| {
+            const target_l: usize = @as(usize, current_layer) + 1 + d;
+            const layer = self.layers[target_l];
+            const t0 = vmstat.nowNs() catch 0;
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.x_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = 1,
+                .hidden_dim = self.config.hidden_size,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, false);
+            try self.encodeLayerRouter(&frame, target_l, ws, self.scratch_buf, self.x_norm_bind, 1, true);
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+            const t1 = vmstat.nowNs() catch t0;
+            total_ns += t1 -| t0;
+            @memcpy(out_logits_per_delta[d][0..n_exp], ws.router_logits[0..n_exp]);
+        }
+        return total_ns;
+    }
 };
 
 fn findRequired(parsed: *const amf.Parsed, name: []const u8) LoadError!*const amf.TensorEntry {
@@ -1514,7 +3778,120 @@ fn loadBlobIntoShard(
     };
 }
 
+/// Parses a W8 `schema_version = 1` expert heat profile JSON (`aminfer-tools expert-heat`)
+/// into per-layer cold-expert bitsets (`cold_masks[l]`). When `override_cold_per_layer > 0`
+/// and `ranked_hot_to_cold` is present, selects the coldest `override_cold_per_layer` experts
+/// per layer; otherwise uses the profile's precomputed `cold_experts` array.
+fn parseHeatProfileColdMask(
+    allocator: std.mem.Allocator,
+    json_bytes: []const u8,
+    num_layers: usize,
+    num_experts: u32,
+    override_cold_per_layer: u32,
+    cold_masks: []tree_mod.ExpertBitset,
+) LoadError!void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidHeatProfile,
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.InvalidHeatProfile,
+    };
+    const ver = jsonOptU32(root, "schema_version") orelse return error.InvalidHeatProfile;
+    if (ver != 1) return error.InvalidHeatProfile;
+
+    const layers_val = root.get("layers") orelse return error.InvalidHeatProfile;
+    const layers_arr = switch (layers_val) {
+        .array => |a| a,
+        else => return error.InvalidHeatProfile,
+    };
+
+    for (layers_arr.items) |item| {
+        const lobj = switch (item) {
+            .object => |o| o,
+            else => return error.InvalidHeatProfile,
+        };
+        const l_u32 = jsonOptU32(lobj, "layer") orelse return error.InvalidHeatProfile;
+        if (l_u32 >= num_layers) continue;
+        const l_idx: usize = @intCast(l_u32);
+
+        if (override_cold_per_layer > 0) {
+            if (lobj.get("ranked_hot_to_cold")) |rv| {
+                const rarr = switch (rv) {
+                    .array => |a| a,
+                    else => return error.InvalidHeatProfile,
+                };
+                const cold_n: usize = @min(@as(usize, override_cold_per_layer), rarr.items.len);
+                const start = rarr.items.len - cold_n;
+                for (rarr.items[start..]) |ev| {
+                    const eid: u32 = switch (ev) {
+                        .integer => |i| if (i >= 0 and i < num_experts) @intCast(i) else return error.InvalidHeatProfile,
+                        else => return error.InvalidHeatProfile,
+                    };
+                    cold_masks[l_idx].set(eid);
+                }
+                continue;
+            }
+        }
+        if (lobj.get("cold_experts")) |cv| {
+            const carr = switch (cv) {
+                .array => |a| a,
+                else => return error.InvalidHeatProfile,
+            };
+            for (carr.items) |ev| {
+                const eid: u32 = switch (ev) {
+                    .integer => |i| if (i >= 0 and i < num_experts) @intCast(i) else return error.InvalidHeatProfile,
+                    else => return error.InvalidHeatProfile,
+                };
+                cold_masks[l_idx].set(eid);
+            }
+        }
+    }
+}
+
 fn loadInternal(
+    allocator: std.mem.Allocator,
+    source: AmfSource,
+    config: ModelConfig,
+    options: LoadOptions,
+) LoadError!Qwen3Model {
+    var model = try loadCore(allocator, source, config, options);
+    errdefer model.deinit(allocator);
+
+    if (model.cold_rt) |crt| {
+        if (options.enable_ane_predictor and config.num_hidden_layers >= 2) {
+            const pred_max_tok: u32 = if (options.ane_predictor_path != null)
+                32
+            else if (model.max_tree_nodes > 1)
+                @min(model.max_tree_nodes, 32)
+            else
+                1;
+            const lookahead: u32 = @min(@as(u32, 3), config.num_hidden_layers - 1);
+            crt.ane_predictor = try model.buildAnePredictor(
+                allocator,
+                lookahead,
+                pred_max_tok,
+                true,
+                true,
+                options.ane_predictor_path,
+            );
+        }
+    }
+
+    if (options.enable_hybrid_prefill or options.prefill_mode == .hybrid) {
+        try model.initHybridPrefill(allocator, .{
+            .strategy = options.hybrid_strategy,
+            .max_bucket = options.hybrid_max_bucket,
+        });
+    }
+
+    return model;
+}
+
+fn loadCore(
     allocator: std.mem.Allocator,
     source: AmfSource,
     config: ModelConfig,
@@ -1549,6 +3926,38 @@ fn loadInternal(
     const q_dim = config.qDim();
     const kv_dim = config.kvDim();
 
+    // --- 0. Resolve MoE cold-expert placement (W8 heat profile / CLI count / AMF tags) ---
+    var cold_masks = try allocator.alloc(tree_mod.ExpertBitset, num_layers);
+    var cold_masks_owned = true;
+    defer if (cold_masks_owned) allocator.free(cold_masks);
+    for (cold_masks) |*m| m.* = tree_mod.ExpertBitset.empty();
+
+    var layer_has_cold = try allocator.alloc(bool, num_layers);
+    var layer_has_cold_owned = true;
+    defer if (layer_has_cold_owned) allocator.free(layer_has_cold);
+    @memset(layer_has_cold, false);
+
+    if (config.arch == .qwen3_moe) {
+        if (options.heat_profile_json) |hp_json| {
+            try parseHeatProfileColdMask(
+                allocator,
+                hp_json,
+                num_layers,
+                config.num_experts,
+                options.cold_experts_per_layer,
+                cold_masks,
+            );
+        } else if (options.cold_experts_per_layer > 0) {
+            const cold_n: u32 = @min(options.cold_experts_per_layer, config.num_experts);
+            const first_cold: u32 = config.num_experts - cold_n;
+            for (0..num_layers) |l| {
+                for (first_cold..config.num_experts) |e_idx| {
+                    cold_masks[l].set(@intCast(e_idx));
+                }
+            }
+        }
+    }
+
     // --- 1. Resolve & validate all required directory entries up front ---
     const embed_entry = try findLinear(parsed, "embed_tokens");
     const embed_wdt = try validateLinear2D(embed_entry, config.vocab_size, h);
@@ -1569,6 +3978,11 @@ fn loadInternal(
 
     group_bytes[0] = embed_entry.blob_bytes + final_norm_entry.blob_bytes +
         if (config.tie_word_embeddings) @as(u64, 0) else lm_head_entry.blob_bytes;
+
+    var total_cold_experts: u32 = 0;
+    var max_cold_gate_bytes: usize = 0;
+    var max_cold_up_bytes: usize = 0;
+    var max_cold_down_bytes: usize = 0;
 
     var name_buf: [64]u8 = undefined;
     for (0..num_layers) |l| {
@@ -1626,15 +4040,30 @@ fn loadInternal(
                             if ((h % 4) != 0 or (config.moe_intermediate_size % 4) != 0) return error.UnalignedK;
                         }
                     }
-                    bytes_l += gp.blob_bytes;
 
                     const up = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
                     if ((try validateLinear2D(up, config.moe_intermediate_size, h)) != layer_exp_dt.?) return error.UnexpectedTensorDType;
-                    bytes_l += up.blob_bytes;
 
                     const dp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
                     if ((try validateLinear2D(dp, h, config.moe_intermediate_size)) != layer_exp_dt.?) return error.UnexpectedTensorDType;
-                    bytes_l += dp.blob_bytes;
+
+                    // Also honor experts explicitly tagged `TensorKind.cold_expert` in `.amf`.
+                    if ((try gp.tensorKind()) == .cold_expert or
+                        (try up.tensorKind()) == .cold_expert or
+                        (try dp.tensorKind()) == .cold_expert)
+                    {
+                        cold_masks[l].set(@intCast(e_idx));
+                    }
+
+                    if (cold_masks[l].contains(@intCast(e_idx))) {
+                        layer_has_cold[l] = true;
+                        total_cold_experts += 1;
+                        max_cold_gate_bytes = @max(max_cold_gate_bytes, @as(usize, @intCast(gp.blob_bytes)));
+                        max_cold_up_bytes = @max(max_cold_up_bytes, @as(usize, @intCast(up.blob_bytes)));
+                        max_cold_down_bytes = @max(max_cold_down_bytes, @as(usize, @intCast(dp.blob_bytes)));
+                    } else {
+                        bytes_l += gp.blob_bytes + up.blob_bytes + dp.blob_bytes;
+                    }
                 }
             },
             .qwen3_dense => {
@@ -1654,6 +4083,28 @@ fn loadInternal(
         group_bytes[1 + l] = bytes_l;
     }
 
+    const has_cold = total_cold_experts > 0;
+    var cold_pool_spec: cache_mod.PoolSpec = .{
+        .num_slots = 0,
+        .gate_blob_bytes = 0,
+        .up_blob_bytes = 0,
+        .down_blob_bytes = 0,
+    };
+    var cold_pool_bytes: u64 = 0;
+    if (has_cold) {
+        if (source.filePath() == null) return error.ColdExpertsRequireFile;
+        const min_slots: u32 = @max(config.num_experts_per_tok, @min(config.num_experts, max_tree_nodes * config.num_experts_per_tok));
+        const eff_slots: u32 = @max(options.cold_slot_count, min_slots);
+        cold_pool_spec = .{
+            .num_slots = eff_slots,
+            .gate_blob_bytes = max_cold_gate_bytes,
+            .up_blob_bytes = max_cold_up_bytes,
+            .down_blob_bytes = max_cold_down_bytes,
+        };
+        try cold_pool_spec.validate();
+        cold_pool_bytes = try cold_pool_spec.totalBytes();
+    }
+
     // --- 2. Query Metal device, compute shard plan & enforce wired budget ---
     const facts = try sysinfo.Facts.read();
     const device = try metal.Device.open();
@@ -1669,19 +4120,31 @@ fn loadInternal(
     if (shard_cap == 0) return error.TensorExceedsShardLimit;
 
     // Bin-pack atomic groups (global + per-layer) into `MTLBuffer`-sized shards.
+    // When cold experts are active and all hot weights + `ExpertSlotPool` fit in
+    // ONE shard, place them together in shard 0 so hot experts and pinned cold
+    // slots share one `MTLBuffer` and execute in a single zero-copy GPU dispatch!
     const group_shard = try allocator.alloc(usize, group_count);
     defer allocator.free(group_shard);
     var shard_sizes: std.ArrayList(u64) = .empty;
     defer shard_sizes.deinit(allocator);
 
-    for (group_bytes, 0..) |gb, g_idx| {
-        if (gb > shard_cap) return error.TensorExceedsShardLimit;
-        if (shard_sizes.items.len == 0 or shard_sizes.items[shard_sizes.items.len - 1] + gb > shard_cap) {
-            try shard_sizes.append(allocator, gb);
-        } else {
-            shard_sizes.items[shard_sizes.items.len - 1] += gb;
+    var all_groups_sum: u64 = 0;
+    for (group_bytes) |gb| all_groups_sum += gb;
+    const pool_in_shard0 = has_cold and (all_groups_sum + cold_pool_bytes <= shard_cap);
+
+    if (pool_in_shard0) {
+        try shard_sizes.append(allocator, all_groups_sum + cold_pool_bytes);
+        @memset(group_shard, 0);
+    } else {
+        for (group_bytes, 0..) |gb, g_idx| {
+            if (gb > shard_cap) return error.TensorExceedsShardLimit;
+            if (shard_sizes.items.len == 0 or shard_sizes.items[shard_sizes.items.len - 1] + gb > shard_cap) {
+                try shard_sizes.append(allocator, gb);
+            } else {
+                shard_sizes.items[shard_sizes.items.len - 1] += gb;
+            }
+            group_shard[g_idx] = shard_sizes.items.len - 1;
         }
-        group_shard[g_idx] = shard_sizes.items.len - 1;
     }
 
     // Compute scratch arena footprint (scaled by `max_tree_nodes` for zero hot-path alloc).
@@ -1728,9 +4191,14 @@ fn loadInternal(
         amf.align64(m_cap * @as(usize, kv_dim) * @sizeOf(f16))
     else
         0;
+    const topk_scratch_bytes: usize = if (tree_enabled)
+        amf.align64(m_cap * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate))
+    else
+        0;
     const tree_meta_bytes: usize = if (tree_enabled)
         amf.align64(m_cap * @sizeOf(u32)) * 3 + // token_ids, positions, accepted_nodes
             amf.align64(m_cap * @sizeOf(u64)) + // ancestor_masks
+            topk_scratch_bytes +
             2 * num_layers * tree_kv_layer_stride // per-layer tree K & V
     else
         0;
@@ -1768,7 +4236,8 @@ fn loadInternal(
 
     var total_weight_bytes: u64 = 0;
     for (shard_sizes.items) |sb| total_weight_bytes += sb;
-    const total_wired_bytes: u64 = total_weight_bytes + scratch_arena_bytes + total_kv_bytes;
+    const owned_pool_bytes: u64 = if (has_cold and !pool_in_shard0) cold_pool_bytes else 0;
+    const total_wired_bytes: u64 = total_weight_bytes + owned_pool_bytes + scratch_arena_bytes + total_kv_bytes;
 
     // Enforce ADR-0012 wired memory budget BEFORE allocating a single page.
     try wired_budget.checkPlan(total_wired_bytes);
@@ -1827,6 +4296,61 @@ fn loadInternal(
     try compute.makeResident(&.{scratch_buf});
     try compute.makeTilesResident(kv_tiles);
 
+    // --- 6b. Initialize heap-pinned ColdRuntime (`C3`-`C5`) when cold experts exist ---
+    var cold_rt: ?*ColdRuntime = null;
+    errdefer if (cold_rt) |crt| crt.deinit(allocator);
+    if (has_cold) {
+        const crt = try allocator.create(ColdRuntime);
+        errdefer allocator.destroy(crt);
+
+        var dfile = try aio.DirectFile.openReadOnly(source.filePath().?);
+        errdefer dfile.close();
+
+        var pool = if (pool_in_shard0)
+            try cache_mod.ExpertSlotPool.initFromArena(&shards[0].arena, shards[0].buffer, cold_pool_spec)
+        else
+            try cache_mod.ExpertSlotPool.initOwned(wired_budget, device, cold_pool_spec);
+        errdefer pool.deinit();
+
+        if (!pool_in_shard0) {
+            try compute.makeResident(&.{pool.metal_buffer.?});
+        }
+
+        const reader_inflight: usize = @min(aio.MAX_INFLIGHT, @max(@as(usize, 32), @as(usize, cold_pool_spec.num_slots) * 3));
+        var reader = try aio.AsyncExpertReader.init(allocator, .{
+            .backend = options.io_backend,
+            .max_inflight = reader_inflight,
+            .worker_count = 4,
+            .worker_qos = .utility,
+            .io_policy = .important,
+        });
+        errdefer reader.deinit(allocator);
+
+        crt.* = .{
+            .file = dfile,
+            .pool = pool,
+            .reader = reader,
+            .expert_cache = undefined,
+            .ane_predictor = null,
+            .cold_masks_by_layer = cold_masks,
+            .layer_has_cold = layer_has_cold,
+            .total_cold_experts = total_cold_experts,
+            .pred_bitsets = @splat(tree_mod.ExpertBitset.empty()),
+            .pred_cands = undefined,
+            .cold_bool_scratch = @splat(false),
+            .ane_req_seq = 1,
+            .ane_inflight = false,
+        };
+        crt.expert_cache = try cache_mod.ExpertCache.init(allocator, &crt.pool, &crt.reader, .{
+            .num_layers = @intCast(num_layers),
+            .num_experts = @intCast(config.num_experts),
+            .io_timeout_ms = options.timeout_ms,
+        });
+        cold_masks_owned = false;
+        layer_has_cold_owned = false;
+        cold_rt = crt;
+    }
+
     // --- 7. Carve hot-path scratch buffers & populate bindless KV tile tables ---
     const x_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
     const x_norm_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
@@ -1838,16 +4362,19 @@ fn loadInternal(
     const logits_raw = try scratch_arena.allocAligned(m_cap * @as(usize, config.vocab_size) * @sizeOf(f16), 64);
     const out_tok_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
     const gqa_scratch_raw = try scratch_arena.allocAligned(gqa_layout.total_bytes, 64);
+    @memset(q_raw, 0);
     @memset(out_tok_raw, 0);
 
     var tree_token_ids_host: []u32 = &.{};
     var tree_positions_host: []u32 = &.{};
     var tree_ancestor_masks_host: []u64 = &.{};
     var tree_accepted_nodes_host: []u32 = &.{};
+    var topk_host: []moe.TopKCandidate = &.{};
     var tree_token_ids_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var tree_positions_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var tree_ancestor_masks_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var tree_accepted_nodes_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var topk_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var tree_k_base_off: u64 = 0;
     var tree_v_base_off: u64 = 0;
     var gqa_tree_scratch_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
@@ -1856,6 +4383,7 @@ fn loadInternal(
         const tp_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
         const tm_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u64), 64);
         const ta_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
+        const topk_raw = try scratch_arena.allocAligned(m_cap * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate), 64);
         const tk_raw = try scratch_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
         const tv_raw = try scratch_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
         const gt_raw = try scratch_arena.allocAligned(gqa_tree_bytes, 64);
@@ -1863,14 +4391,17 @@ fn loadInternal(
         @memset(tp_raw, 0);
         @memset(tm_raw, 0);
         @memset(ta_raw, 0);
+        @memset(topk_raw, 0);
         tree_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, tt_raw));
         tree_positions_host = @alignCast(std.mem.bytesAsSlice(u32, tp_raw));
         tree_ancestor_masks_host = @alignCast(std.mem.bytesAsSlice(u64, tm_raw));
         tree_accepted_nodes_host = @alignCast(std.mem.bytesAsSlice(u32, ta_raw));
+        topk_host = @alignCast(std.mem.bytesAsSlice(moe.TopKCandidate, topk_raw));
         tree_token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tt_raw.ptr) };
         tree_positions_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tp_raw.ptr) };
         tree_ancestor_masks_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tm_raw.ptr) };
         tree_accepted_nodes_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(ta_raw.ptr) };
+        topk_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(topk_raw.ptr) };
         tree_k_base_off = scratch_arena.offsetOf(tk_raw.ptr);
         tree_v_base_off = scratch_arena.offsetOf(tv_raw.ptr);
         gqa_tree_scratch_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gt_raw.ptr) };
@@ -1976,7 +4507,8 @@ fn loadInternal(
     };
 
     for (0..num_layers) |l| {
-        const l_shard = &shards[group_shard[1 + l]];
+        const shard_idx: u16 = @intCast(group_shard[1 + l]);
+        const l_shard = &shards[shard_idx];
 
         // Bindless KV chunk table for layer `l`.
         const kv_tbl_raw = try scratch_arena.allocAligned(@as(usize, num_chunks) * @sizeOf(attention.KvTilePair), 64);
@@ -2021,6 +4553,7 @@ fn loadInternal(
         const post_ln_b = (try loadBlobIntoShard(source, post_ln_e, l_shard, options.verify_crcs)).asNormBinding(post_ln_dt);
 
         var layer_w: LayerWeights = .{
+            .shard_idx = shard_idx,
             .input_layernorm = in_ln_b,
             .q_proj = q_b,
             .k_proj = k_b,
@@ -2034,6 +4567,7 @@ fn loadInternal(
             .expert_dtype = .q3_affine,
             .expert_weights_buf = l_shard.buffer,
             .expert_table = .{ .buffer = scratch_buf, .offset = 0 },
+            .expert_table_host = &.{},
             .dense_gate = dummy_linear,
             .dense_up = dummy_linear,
             .dense_down = dummy_linear,
@@ -2070,22 +4604,31 @@ fn loadInternal(
                 const exp_tbl_raw = try scratch_arena.allocAligned(@as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights), 64);
                 const exp_tbl: []moe.ExpertWeights = @alignCast(std.mem.bytesAsSlice(moe.ExpertWeights, exp_tbl_raw));
                 layer_w.expert_table = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(exp_tbl_raw.ptr) };
+                layer_w.expert_table_host = exp_tbl;
 
                 var exp_dt: quant.WeightDType = .q3_affine;
                 for (0..config.num_experts) |e_idx| {
                     const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
                     const gp_dt = try validateLinear2D(gp_e, config.moe_intermediate_size, h);
                     if (e_idx == 0) exp_dt = gp_dt;
-                    const gp_b = try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs);
-
                     const up_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
-                    const up_b = try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs);
-
                     const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
+
+                    if (cold_rt) |crt| {
+                        if (crt.cold_masks_by_layer[l].contains(@intCast(e_idx))) {
+                            exp_tbl[e_idx] = std.mem.zeroes(moe.ExpertWeights);
+                            const cold_triple = try cache_mod.ColdExpertTriple.fromAmfEntries(crt.file.fd, 0, gp_e, up_e, dp_e);
+                            try crt.expert_cache.registerCold(@intCast(l), @intCast(e_idx), cold_triple);
+                            continue;
+                        }
+                    }
+
+                    const gp_b = try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs);
+                    const up_b = try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs);
                     const dp_b = try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs);
 
                     const is_float = (exp_dt == .f16 or exp_dt == .bf16);
-                    exp_tbl[e_idx] = .{
+                    const ew: moe.ExpertWeights = .{
                         .gate_qweight_offset = gp_b.offset,
                         .gate_sb_offset = if (is_float) 0 else gp_b.offset + gp_e.params_offset,
                         .up_qweight_offset = up_b.offset,
@@ -2093,6 +4636,17 @@ fn loadInternal(
                         .down_qweight_offset = dp_b.offset,
                         .down_sb_offset = if (is_float) 0 else dp_b.offset + dp_e.params_offset,
                     };
+                    exp_tbl[e_idx] = ew;
+
+                    if (cold_rt) |crt| {
+                        try crt.expert_cache.registerHot(@intCast(l), @intCast(e_idx), .{
+                            .gate = try expert_mod.WiredExpert.init(gp_b.slice),
+                            .up = try expert_mod.WiredExpert.init(up_b.slice),
+                            .down = try expert_mod.WiredExpert.init(dp_b.slice),
+                            .weights = ew,
+                            .metal_buffer = l_shard.buffer,
+                        });
+                    }
                 }
                 layer_w.expert_dtype = exp_dt;
 
@@ -2144,6 +4698,7 @@ fn loadInternal(
         .wired_budget_bytes = wired_budget.limit_bytes,
         .total_wired_bytes = total_wired_bytes,
         .seq_len = 0,
+        .prefill_mode = options.prefill_mode,
         .device = device,
         .library = library,
         .dequant_pipes = dequant_pipes,
@@ -2176,10 +4731,12 @@ fn loadInternal(
         .tree_positions_host = tree_positions_host,
         .tree_ancestor_masks_host = tree_ancestor_masks_host,
         .tree_accepted_nodes_host = tree_accepted_nodes_host,
+        .topk_host = topk_host,
         .tree_token_ids_bind = tree_token_ids_bind,
         .tree_positions_bind = tree_positions_bind,
         .tree_ancestor_masks_bind = tree_ancestor_masks_bind,
         .tree_accepted_nodes_bind = tree_accepted_nodes_bind,
+        .topk_bind = topk_bind,
         .tree_k_base_off = tree_k_base_off,
         .tree_v_base_off = tree_v_base_off,
         .tree_kv_layer_stride = tree_kv_layer_stride,
@@ -2204,6 +4761,8 @@ fn loadInternal(
         .single_expert_bytes = single_expert_bytes,
         .embed_row_alg_bytes = embed_row_alg_bytes,
         .global_head_bytes = global_head_bytes,
+        .cold_rt = cold_rt,
+        .hybrid_rt = null,
     };
 }
 
@@ -3588,6 +6147,232 @@ test "verifyTree + commitTreeKv + feature taps match stepDecode bit-for-bit acro
             for (0..tokens.len * sampled) |bi| {
                 try std.testing.expectEqual(tc.cfg.num_experts_per_tok, bitsets[bi].count());
             }
+        }
+    }
+}
+
+test "M4 W8 heat profile JSON parser selects per-layer cold experts" {
+    const gpa = std.testing.allocator;
+    const sample_json =
+        \\{
+        \\  "schema_version": 1,
+        \\  "num_layers": 2,
+        \\  "num_experts": 8,
+        \\  "layers": [
+        \\    { "layer": 0, "ranked_hot_to_cold": [5, 1, 2, 0, 7, 3, 6, 4], "cold_experts": [3, 6, 4] },
+        \\    { "layer": 1, "ranked_hot_to_cold": [0, 2, 4, 6, 1, 3, 5, 7], "cold_experts": [1, 3, 5, 7] }
+        \\  ]
+        \\}
+    ;
+    var masks = [_]tree_mod.ExpertBitset{ tree_mod.ExpertBitset.empty(), tree_mod.ExpertBitset.empty() };
+    try parseHeatProfileColdMask(gpa, sample_json, 2, 8, 0, &masks);
+    try std.testing.expectEqual(@as(u32, 3), masks[0].count());
+    try std.testing.expect(masks[0].contains(3) and masks[0].contains(6) and masks[0].contains(4));
+    try std.testing.expectEqual(@as(u32, 4), masks[1].count());
+    try std.testing.expect(masks[1].contains(1) and masks[1].contains(7));
+
+    // Override count uses tail of `ranked_hot_to_cold`
+    var masks2 = [_]tree_mod.ExpertBitset{ tree_mod.ExpertBitset.empty(), tree_mod.ExpertBitset.empty() };
+    try parseHeatProfileColdMask(gpa, sample_json, 2, 8, 2, &masks2);
+    try std.testing.expectEqual(@as(u32, 2), masks2[0].count());
+    try std.testing.expect(masks2[0].contains(6) and masks2[0].contains(4));
+    try std.testing.expectEqual(@as(u32, 2), masks2[1].count());
+    try std.testing.expect(masks2[1].contains(5) and masks2[1].contains(7));
+
+    try std.testing.expectError(error.InvalidHeatProfile, parseHeatProfileColdMask(gpa, "{\"schema_version\":2}", 2, 8, 0, &masks2));
+}
+
+test "M4 cold-expert NVMe streaming decode and verifyTree match all-hot bit-for-bit with ANE predictor" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .default_float_dtype = .bf16,
+        .vocab_size = 256,
+        .hidden_size = 128,
+        .num_hidden_layers = 3,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 16,
+        .num_experts_per_tok = 2,
+        .norm_topk_prob = true,
+    };
+    const image = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q3_affine,
+        .embed_dtype = .q3_affine,
+        .norm_dtype = .bf16,
+        .router_dtype = .q3_affine,
+        .expert_dtype = .q3_affine,
+    }, 4040);
+    defer gpa.free(image);
+
+    // Write temporary `.amf` under `/Volumes/Akari/.tmp` (never `/tmp` or repo!).
+    const tmp_path: [:0]const u8 = "/Volumes/Akari/.tmp/aminfer-test-m4-cold.amf";
+    {
+        const fd = std.c.open(tmp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        var written: usize = 0;
+        while (written < image.len) {
+            const rc = std.c.write(fd, image.ptr + written, image.len - written);
+            try std.testing.expect(rc > 0);
+            written += @intCast(rc);
+        }
+    }
+    defer _ = std.c.unlink(tmp_path.ptr);
+
+    var hot_model = try Qwen3Model.loadFromFile(gpa, tmp_path, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 32,
+        .max_tree_nodes = 8,
+    });
+    defer hot_model.deinit(gpa);
+
+    var hot_seq: [9]u32 = undefined;
+    hot_seq[0] = 17;
+    for (0..8) |s| {
+        hot_seq[s + 1] = try hot_model.stepDecode(hot_seq[s], @intCast(s));
+    }
+
+    const vm0 = try vmstat.Snapshot.capture();
+    const backends = [_]aio.IoBackend{ .ecore_pread, .kqueue_aio };
+    for (backends) |be| {
+        var cold_model = try Qwen3Model.loadFromFile(gpa, tmp_path, cfg, .{
+            .max_seq_len = 64,
+            .chunk_tokens = 32,
+            .max_tree_nodes = 8,
+            .cold_experts_per_layer = 8,
+            .cold_slot_count = 16,
+            .io_backend = be,
+            .enable_ane_predictor = true,
+        });
+        defer cold_model.deinit(gpa);
+
+        try std.testing.expect(cold_model.hasColdExperts());
+        try std.testing.expect(cold_model.totalWiredBytes() < hot_model.totalWiredBytes());
+
+        const st0 = cold_model.coldStats().?;
+        try std.testing.expectEqual(@as(u32, 24), st0.total_cold_experts);
+        try std.testing.expectEqual(be, st0.io_backend);
+        try std.testing.expect(st0.ane_predictor_active);
+        try std.testing.expect(st0.ane_predictor_uses_ne);
+
+        // 100% bit-for-bit decode parity vs all-hot baseline!
+        var cur: u32 = hot_seq[0];
+        for (0..8) |s| {
+            const got = try cold_model.stepDecode(cur, @intCast(s));
+            try std.testing.expectEqual(hot_seq[s + 1], got);
+            cur = got;
+        }
+
+        // 100% bit-for-bit verifyTree parity on cold-expert model!
+        cold_model.resetKvCache();
+        for (0..3) |s| try cold_model.prefillToken(hot_seq[s], @intCast(s));
+        const tree_toks = [_]u32{ hot_seq[3], hot_seq[4], hot_seq[5] };
+        const tree_pos = [_]u32{ 3, 4, 5 };
+        const tree_masks = [_]u64{ 0b001, 0b011, 0b111 };
+        const vr = try cold_model.verifyTree(&tree_toks, &tree_pos, &tree_masks, 3, true);
+        try std.testing.expectEqual(hot_seq[4], vr.argmax_tokens[0]);
+        try std.testing.expectEqual(hot_seq[5], vr.argmax_tokens[1]);
+        try std.testing.expectEqual(hot_seq[6], vr.argmax_tokens[2]);
+
+        const st1 = cold_model.coldStats().?;
+        try std.testing.expect(st1.cache_telemetry.hot_hits > 0);
+        try std.testing.expect(st1.cache_telemetry.totalColdAcquires() > 0);
+        try std.testing.expect(st1.cache_telemetry.bytes_read > 0);
+
+        // Verify D7 cold-mask export reports sampled layers.
+        var cm: [MAX_EXPERT_PRED_LAYERS]tree_mod.ExpertBitset = undefined;
+        try std.testing.expectEqual(cfg.num_hidden_layers, cold_model.fillSampledColdMasks(&cm));
+    }
+    const vm1 = try vmstat.Snapshot.capture();
+    try std.testing.expectEqual(@as(u64, 0), vmstat.Snapshot.swapoutDelta(vm0, vm1));
+}
+
+test "M4 G6 runLayerFfnChunk and A1 prefillHybridWavefront run zero-copy 2-chunk ANE/GPU prefill" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { cfg: ModelConfig, spec: SynthDTypeSpec }{
+        .{
+            .cfg = .{
+                .arch = .qwen3_dense,
+                .quant_bits = null,
+                .default_float_dtype = .bf16,
+                .vocab_size = 192,
+                .hidden_size = 128,
+                .num_hidden_layers = 2,
+                .num_attention_heads = 4,
+                .num_key_value_heads = 2,
+                .head_dim = 64,
+                .intermediate_size = 256,
+                .tie_word_embeddings = true,
+            },
+            .spec = .{
+                .linear_dtype = .bf16,
+                .embed_dtype = .bf16,
+                .norm_dtype = .bf16,
+                .use_weight_suffix = true,
+            },
+        },
+        .{
+            .cfg = .{
+                .arch = .qwen3_moe,
+                .quant_bits = .q3,
+                .default_float_dtype = .bf16,
+                .vocab_size = 192,
+                .hidden_size = 128,
+                .num_hidden_layers = 2,
+                .num_attention_heads = 4,
+                .num_key_value_heads = 2,
+                .head_dim = 64,
+                .moe_intermediate_size = 128,
+                .num_experts = 8,
+                .num_experts_per_tok = 2,
+                .norm_topk_prob = true,
+            },
+            .spec = .{
+                .linear_dtype = .q3_affine,
+                .embed_dtype = .q3_affine,
+                .norm_dtype = .bf16,
+                .router_dtype = .q3_affine,
+                .expert_dtype = .q3_affine,
+            },
+        },
+    };
+
+    for (cases, 0..) |tc, ci| {
+        const image = try buildSyntheticAmfImageWithSpec(gpa, tc.cfg, tc.spec, 5050 + ci);
+        defer gpa.free(image);
+
+        var model = try Qwen3Model.loadFromBytes(gpa, image, tc.cfg, .{
+            .max_seq_len = 192,
+            .chunk_tokens = 64,
+            .max_tree_nodes = 16,
+            .prefill_mode = .hybrid,
+            .enable_hybrid_prefill = true,
+            .hybrid_max_bucket = 128,
+        });
+        defer model.deinit(gpa);
+
+        try std.testing.expect(model.hasHybridPrefill());
+
+        var prompt: [128]u32 = undefined;
+        for (&prompt, 0..) |*p, i| p.* = @intCast((i * 7 + 5) % tc.cfg.vocab_size);
+
+        const res = try model.prefillHybridWavefront(&prompt, true);
+        try std.testing.expectEqual(@as(u32, 128), res.tokens_prefilled);
+        try std.testing.expectEqual(@as(u32, 128), model.seq_len);
+        try std.testing.expect(res.argmax_token < tc.cfg.vocab_size);
+        try std.testing.expectEqual(@as(u32, 3), res.wavefront_stats.overlapped_steps);
+        try std.testing.expect(res.all_outputs_zero_copy);
+        try std.testing.expect(res.all_buckets_use_ane);
+
+        // Decode seamlessly right after hybrid wavefront prefill over the ANE-written KV tiles!
+        const next_tok = try model.stepDecode(res.argmax_token, 128);
+        try std.testing.expect(next_tok < tc.cfg.vocab_size);
+        for (model.readLogitsF16()) |lv| {
+            try std.testing.expect(std.math.isFinite(@as(f32, @floatCast(lv))));
         }
     }
 }

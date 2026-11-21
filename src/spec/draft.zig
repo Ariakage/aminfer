@@ -33,6 +33,7 @@ pub const DraftMode = enum {
     eagle3,
     eagle2,
     mtp,
+    small_draft,
 
     pub fn label(self: DraftMode) []const u8 {
         return switch (self) {
@@ -40,6 +41,7 @@ pub const DraftMode = enum {
             .eagle3 => "eagle3",
             .eagle2 => "eagle2",
             .mtp => "mtp",
+            .small_draft => "small",
         };
     }
 
@@ -48,6 +50,7 @@ pub const DraftMode = enum {
         if (std.mem.eql(u8, str, "eagle3")) return .eagle3;
         if (std.mem.eql(u8, str, "eagle2")) return .eagle2;
         if (std.mem.eql(u8, str, "mtp")) return .mtp;
+        if (std.mem.eql(u8, str, "small") or std.mem.eql(u8, str, "small_draft")) return .small_draft;
         return error.InvalidDraftMode;
     }
 };
@@ -113,7 +116,7 @@ pub const DraftConfig = struct {
     }
 
     pub fn validate(self: DraftConfig) ConfigError!void {
-        if (self.format == .l1_only) return error.UnsupportedFormat;
+        if (self.format == .l1_only or self.format == .small_draft) return error.UnsupportedFormat;
         if (self.vocab_size == 0 or self.draft_vocab_size == 0 or self.draft_vocab_size > self.vocab_size) {
             return error.InvalidConfig;
         }
@@ -948,7 +951,7 @@ pub const DraftHead = struct {
                 }, false);
                 try target.encodeLinearBatched(&frame, self.eh_proj.?, self.x_cat_bind, self.x_bind, m, true);
             },
-            .l1_only => unreachable,
+            .l1_only, .small_draft => unreachable,
         }
 
         // 4. Draft transformer layer(s).
@@ -1160,6 +1163,344 @@ pub const DraftHead = struct {
 
         const sig = try frame.commit();
         try target.compute.wait(sig, self.timeout_ms);
+    }
+};
+
+pub const SmallDraftLoadError = error{
+    TargetIncompatible,
+    BudgetExceeded,
+    InvalidConfig,
+    OutOfMemory,
+} || qwen3.LoadError || DraftLoadError;
+
+/// Standalone same-family small draft model (`D4`, ADR-0005, ADR-0008, ADR-0013),
+/// e.g. `Qwen3-0.6B` BF16 pairing with `Qwen3-14B-4bit` or `Qwen3-30B-A3B`.
+///
+/// Shares the target tokenizer (`vocab_size == target.config.vocab_size`),
+/// maintains its own committed IOSurface KV cache with zero target hidden-state
+/// dependency, processes L1 `>= 4` seed chains in a single batched forward pass,
+/// and expands dynamic EAGLE-2 confidence-ranked draft trees via
+/// `Qwen3Model.stepDraftTreeBatch` (`encodeTopKLogitsRows`) with zero hot-path
+/// heap allocation.
+pub const SmallDraftModel = struct {
+    model: qwen3.Qwen3Model,
+    requested_placement: Placement,
+    effective_placement: Placement,
+    placement_gate_ane_us: f64,
+    placement_gate_gpu_us: f64,
+    ane_proj: ?AneProjection,
+    last_ane_zero_copy_ok: bool,
+    root_top_k_count: u32,
+    root_candidates: [MAX_DRAFT_TOP_K]moe.TopKCandidate,
+
+    pub fn loadFromBytes(
+        allocator: std.mem.Allocator,
+        target: *const qwen3.Qwen3Model,
+        amf_bytes: []const u8,
+        config: qwen3.ModelConfig,
+        options: DraftLoadOptions,
+    ) SmallDraftLoadError!SmallDraftModel {
+        const load_opts = try buildLoadOptions(target, config, options);
+        var model = try qwen3.Qwen3Model.loadFromBytes(allocator, amf_bytes, config, load_opts);
+        errdefer model.deinit(allocator);
+        return finalizeInit(allocator, model, options);
+    }
+
+    pub fn loadFromFile(
+        allocator: std.mem.Allocator,
+        target: *const qwen3.Qwen3Model,
+        amf_path: [:0]const u8,
+        config: qwen3.ModelConfig,
+        options: DraftLoadOptions,
+    ) SmallDraftLoadError!SmallDraftModel {
+        const load_opts = try buildLoadOptions(target, config, options);
+        var model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, config, load_opts);
+        errdefer model.deinit(allocator);
+        return finalizeInit(allocator, model, options);
+    }
+
+    fn buildLoadOptions(
+        target: *const qwen3.Qwen3Model,
+        config: qwen3.ModelConfig,
+        options: DraftLoadOptions,
+    ) SmallDraftLoadError!qwen3.LoadOptions {
+        try config.validate();
+        if (config.vocab_size != target.config.vocab_size) return error.TargetIncompatible;
+        if (options.max_seq_len == 0 or options.chunk_tokens == 0 or
+            options.max_tree_slots < 2 or options.max_tree_slots > attention.MAX_TREE_NODES)
+        {
+            return error.InvalidConfig;
+        }
+        if (target.total_wired_bytes >= target.wired_budget_bytes) return error.BudgetExceeded;
+        const rem_limit = target.wired_budget_bytes - target.total_wired_bytes;
+        const draft_budget = budget_mod.Budget.compute(.{
+            .memory_bytes = target.wired_budget_bytes + 4 * page.APPLE_PAGE_SIZE,
+            .user_wire_limit = rem_limit,
+            .global_user_wire_limit = rem_limit,
+            .gpu_working_set_bytes = rem_limit,
+            .configured_cap = rem_limit,
+            .headroom_bytes = 0,
+        });
+        return .{
+            .max_seq_len = @min(options.max_seq_len + 1, config.max_position_embeddings),
+            .chunk_tokens = options.chunk_tokens,
+            .max_tree_nodes = options.max_tree_slots,
+            .enable_feature_taps = false,
+            .budget_override = draft_budget,
+            .verify_crcs = options.verify_crcs,
+            .timeout_ms = options.timeout_ms,
+        };
+    }
+
+    fn finalizeInit(
+        allocator: std.mem.Allocator,
+        model_in: qwen3.Qwen3Model,
+        options: DraftLoadOptions,
+    ) SmallDraftLoadError!SmallDraftModel {
+        var model = model_in;
+        errdefer model.deinit(allocator);
+
+        var effective_placement: Placement = .gpu;
+        var ane_proj: ?AneProjection = null;
+        errdefer if (ane_proj) |*ap| ap.close(&model.compute);
+        var gate_ane_us: f64 = 0.0;
+        var gate_gpu_us: f64 = 0.0;
+
+        const q_dim = model.config.qDim();
+        const h = model.config.hidden_size;
+        const l0 = model.layers[0];
+        const can_ane = (q_dim % metal.KV_TILE_ROW_ALIGN_F16 == 0) and
+            (h % metal.KV_TILE_ROW_ALIGN_F16 == 0);
+        if (options.placement == .ane and can_ane) {
+            const wf16 = try model.extractLinearWeightsF16(allocator, l0.shard_idx, l0.o_proj);
+            defer allocator.free(wf16);
+            ane_proj = try AneProjection.init(allocator, model.device, &model.compute, q_dim, h, ANE_MAX_BATCH_ROWS, wf16);
+            effective_placement = .ane;
+        } else if (options.placement == .auto and can_ane) {
+            const wf16 = try model.extractLinearWeightsF16(allocator, l0.shard_idx, l0.o_proj);
+            defer allocator.free(wf16);
+            var probe_ap = try AneProjection.init(allocator, model.device, &model.compute, q_dim, h, 1, wf16);
+            const cal = try calibrateD5Placement(
+                &model,
+                &probe_ap,
+                l0.o_proj,
+                model.attn_out_bind,
+                model.proj_out_bind,
+                options.timeout_ms,
+            );
+            gate_ane_us = cal.ane_us;
+            gate_gpu_us = cal.gpu_us;
+            probe_ap.close(&model.compute);
+            effective_placement = cal.winner;
+            if (effective_placement == .ane) {
+                ane_proj = try AneProjection.init(allocator, model.device, &model.compute, q_dim, h, ANE_MAX_BATCH_ROWS, wf16);
+            }
+        }
+
+        const zc_ok = if (ane_proj) |ap| ap.zero_copy_ok else true;
+        return .{
+            .model = model,
+            .requested_placement = options.placement,
+            .effective_placement = effective_placement,
+            .placement_gate_ane_us = gate_ane_us,
+            .placement_gate_gpu_us = gate_gpu_us,
+            .ane_proj = ane_proj,
+            .last_ane_zero_copy_ok = zc_ok,
+            .root_top_k_count = 0,
+            .root_candidates = undefined,
+        };
+    }
+
+    pub fn deinit(self: *SmallDraftModel, allocator: std.mem.Allocator) void {
+        if (self.ane_proj) |*ap| {
+            ap.close(&self.model.compute);
+            self.ane_proj = null;
+        }
+        self.model.deinit(allocator);
+    }
+
+    pub fn reset(self: *SmallDraftModel) void {
+        self.model.resetKvCache();
+        self.root_top_k_count = 0;
+    }
+
+    pub fn totalWiredBytes(self: *const SmallDraftModel) u64 {
+        return self.model.totalWiredBytes();
+    }
+
+    pub fn maxSeqLen(self: *const SmallDraftModel) u32 {
+        return self.model.max_seq_len;
+    }
+
+    pub fn maxTreeSlots(self: *const SmallDraftModel) u32 {
+        return self.model.max_tree_nodes;
+    }
+
+    pub fn seqLen(self: *const SmallDraftModel) u32 {
+        return self.model.seq_len;
+    }
+
+    pub fn rootCandidates(self: *const SmallDraftModel) []const moe.TopKCandidate {
+        return self.root_candidates[0..self.root_top_k_count];
+    }
+
+    fn aneHook(self: *SmallDraftModel) ?qwen3.AneOProjHook {
+        if (self.effective_placement != .ane) return null;
+        const ap = &(self.ane_proj orelse return null);
+        return .{
+            .model = ap.model,
+            .plan = ap.plan,
+            .in_bind = ap.inBinding(),
+            .out_bind = ap.outBinding(),
+            .max_batch_rows = ap.batch_rows,
+            .c_in = ap.c_in,
+            .c_out = ap.c_out,
+            .last_zero_copy_ok = &self.last_ane_zero_copy_ok,
+        };
+    }
+
+    /// Prefills `prompt_tokens` into the small draft model's own KV cache and
+    /// commits `first_tok` at `pos = prompt_tokens.len` (`seq_len = prompt.len + 1`),
+    /// caching `rootCandidates()` for position `prompt_tokens.len + 1`. Zero heap alloc.
+    pub fn prefillAndSeedRoot(
+        self: *SmallDraftModel,
+        prompt_tokens: []const u32,
+        first_tok: u32,
+        top_k: u32,
+    ) qwen3.StepError!void {
+        if (prompt_tokens.len == 0) return error.InvalidArgument;
+        if (prompt_tokens.len + 1 > self.model.max_seq_len) return error.PositionOutOfRange;
+        self.reset();
+
+        const chunk_cap: usize = self.model.max_tree_nodes;
+        var pos: usize = 0;
+        while (pos < prompt_tokens.len) {
+            const take = @min(chunk_cap, prompt_tokens.len - pos);
+            _ = try self.model.prefillChunk(prompt_tokens[pos .. pos + take], @intCast(pos), false);
+            pos += take;
+        }
+        const first_slice = [_]u32{first_tok};
+        try self.syncAccepted(&first_slice, @intCast(prompt_tokens.len), top_k);
+    }
+
+    /// Commits newly emitted tokens (`[d_1..d_k, bonus]`) into the small draft
+    /// model's IOSurface KV cache at `base_pos .. base_pos + tokens.len` in ONE
+    /// Metal 4 command buffer and refreshes `rootCandidates()` from the final token.
+    /// Zero dynamic heap allocation.
+    pub fn syncAccepted(
+        self: *SmallDraftModel,
+        tokens: []const u32,
+        base_pos: u32,
+        top_k: u32,
+    ) qwen3.StepError!void {
+        if (tokens.len == 0) return error.InvalidArgument;
+        if (tokens.len > self.model.max_tree_nodes) return error.TreeTooLarge;
+        const m: u32 = @intCast(tokens.len);
+        if (base_pos + m > self.model.max_seq_len) return error.PositionOutOfRange;
+
+        if (top_k == 0) {
+            _ = try self.model.prefillChunk(tokens, base_pos, false);
+            self.root_top_k_count = 0;
+            return;
+        }
+
+        var positions: [attention.MAX_TREE_NODES]u32 = undefined;
+        var masks: [attention.MAX_TREE_NODES]u64 = undefined;
+        for (0..m) |i| {
+            positions[i] = base_pos + @as(u32, @intCast(i));
+            masks[i] = if (i == 63) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(i + 1))) - 1;
+        }
+        const eff_k: u32 = @min(top_k, @min(MAX_DRAFT_TOP_K, self.model.config.vocab_size));
+        const hook_opt = self.aneHook();
+        const hook_ptr: ?*const qwen3.AneOProjHook = if (hook_opt) |*hk| hk else null;
+        const cands = try self.model.stepDraftTreeBatch(
+            tokens,
+            positions[0..m],
+            0,
+            masks[0..m],
+            base_pos,
+            eff_k,
+            true, // logits_last_row_only
+            true, // commit_kv
+            hook_ptr,
+        );
+        @memcpy(self.root_candidates[0..eff_k], cands[0..eff_k]);
+        self.root_top_k_count = eff_k;
+    }
+
+    /// Runs an entire L1 `>= 4` seed chain `[s_1..s_c]` in ONE batched forward pass
+    /// (`ADR-0005`), placing its K/V into temporary tree slots `0..c` (without
+    /// mutating committed KV) and writing the tail's top-K continuation candidates
+    /// into `out_candidates[0..eff_k]`. Zero dynamic heap allocation.
+    pub fn stepSeedChain(
+        self: *SmallDraftModel,
+        seed_tokens: []const u32,
+        first_seed_pos: u32,
+        slot_ancestor_masks: []u64,
+        top_k: u32,
+        out_candidates: []moe.TopKCandidate,
+    ) qwen3.StepError!u32 {
+        if (seed_tokens.len == 0) return error.InvalidArgument;
+        if (seed_tokens.len > self.model.max_tree_nodes) return error.TreeTooLarge;
+        const m: u32 = @intCast(seed_tokens.len);
+        if (slot_ancestor_masks.len < m) return error.InvalidArgument;
+
+        var positions: [attention.MAX_TREE_NODES]u32 = undefined;
+        for (0..m) |i| {
+            positions[i] = first_seed_pos + @as(u32, @intCast(i));
+            slot_ancestor_masks[i] = if (i == 63) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(i + 1))) - 1;
+        }
+        const eff_k: u32 = @min(top_k, @min(MAX_DRAFT_TOP_K, self.model.config.vocab_size));
+        if (out_candidates.len < eff_k) return error.InvalidArgument;
+
+        const hook_opt = self.aneHook();
+        const hook_ptr: ?*const qwen3.AneOProjHook = if (hook_opt) |*hk| hk else null;
+        const cands = try self.model.stepDraftTreeBatch(
+            seed_tokens,
+            positions[0..m],
+            0,
+            slot_ancestor_masks[0..m],
+            self.model.seq_len,
+            eff_k,
+            true, // logits_last_row_only (only seed tail needs next-token candidates)
+            false, // commit_kv
+            hook_ptr,
+        );
+        @memcpy(out_candidates[0..eff_k], cands[0..eff_k]);
+        return eff_k;
+    }
+
+    /// Expands a batch of `m` draft frontier nodes placed into tree KV slots
+    /// `slot_start .. slot_start + m` (without mutating committed KV) and writes
+    /// `[m * eff_k]` top-K candidates into `out_candidates`. Zero dynamic heap alloc.
+    pub fn stepTreeBatch(
+        self: *SmallDraftModel,
+        tokens: []const u32,
+        positions: []const u32,
+        slot_ancestor_masks: []const u64,
+        slot_start: u32,
+        top_k: u32,
+        out_candidates: []moe.TopKCandidate,
+    ) qwen3.StepError!u32 {
+        const eff_k: u32 = @min(top_k, @min(MAX_DRAFT_TOP_K, self.model.config.vocab_size));
+        if (out_candidates.len < tokens.len * @as(usize, eff_k)) return error.InvalidArgument;
+
+        const hook_opt = self.aneHook();
+        const hook_ptr: ?*const qwen3.AneOProjHook = if (hook_opt) |*hk| hk else null;
+        const cands = try self.model.stepDraftTreeBatch(
+            tokens,
+            positions,
+            slot_start,
+            slot_ancestor_masks,
+            self.model.seq_len,
+            eff_k,
+            false, // logits_last_row_only
+            false, // commit_kv
+            hook_ptr,
+        );
+        const total = tokens.len * @as(usize, eff_k);
+        @memcpy(out_candidates[0..total], cands[0..total]);
+        return eff_k;
     }
 };
 
@@ -1446,7 +1787,7 @@ fn loadInternal(
             break :blk e;
         },
         .mtp => null,
-        .l1_only => unreachable,
+        .l1_only, .small_draft => unreachable,
     };
 
     const enorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp) blk: {
@@ -1981,7 +2322,7 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
             try add2d(allocator, &recs, "eh_proj.weight", .dense, h, 2 * h, 0.5 / @sqrt(@as(f32, @floatFromInt(2 * h))), seed + tidx);
             tidx += 1;
         },
-        .l1_only => unreachable,
+        .l1_only, .small_draft => unreachable,
     }
 
     var nbuf: [64]u8 = undefined;
@@ -2303,6 +2644,96 @@ test "DraftHead executes EAGLE-3, EAGLE-2, and MTP on GPU, ANE zero-copy, and D5
             try std.testing.expect(std.math.isFinite(c.prob) and c.prob > 0.0);
         }
     }
+}
+
+test "D4 SmallDraftModel loads standalone Qwen3 draft, prefills, seeds L1 chain, and expands tree" {
+    const gpa = std.testing.allocator;
+    const tgt_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .tie_word_embeddings = true,
+    };
+    const draft_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 128,
+        .hidden_size = 64,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .tie_word_embeddings = true,
+    };
+    const tgt_bytes = try buildSyntheticTargetBf16ForTest(gpa, tgt_cfg, 8100);
+    defer gpa.free(tgt_bytes);
+    const draft_bytes = try buildSyntheticTargetBf16ForTest(gpa, draft_cfg, 8200);
+    defer gpa.free(draft_bytes);
+
+    var target = try qwen3.Qwen3Model.loadFromBytes(gpa, tgt_bytes, tgt_cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 16,
+    });
+    defer target.deinit(gpa);
+
+    var sd = try SmallDraftModel.loadFromBytes(gpa, &target, draft_bytes, draft_cfg, .{
+        .placement = .auto,
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .max_tree_slots = 16,
+    });
+    defer sd.deinit(gpa);
+
+    try std.testing.expect(sd.totalWiredBytes() > 0);
+    try std.testing.expect(sd.placement_gate_ane_us > 0.0 and sd.placement_gate_gpu_us > 0.0);
+
+    // Prefill 4 prompt tokens + first_tok=11 -> seq_len = 5, rootCandidates populated.
+    const prompt = [_]u32{ 3, 5, 7, 9 };
+    try sd.prefillAndSeedRoot(&prompt, 11, 3);
+    try std.testing.expectEqual(@as(u32, 5), sd.seqLen());
+    const rc = sd.rootCandidates();
+    try std.testing.expectEqual(@as(usize, 3), rc.len);
+    for (rc) |c| {
+        try std.testing.expect(c.token_id < draft_cfg.vocab_size);
+        try std.testing.expect(std.math.isFinite(c.prob) and c.prob > 0.0);
+    }
+
+    // Batched L1 seed chain forward (3 tokens in ONE pass -> seq_len stays 5!).
+    const seed = [_]u32{ 13, 15, 17 };
+    var masks: [16]u64 = @splat(0);
+    var seed_cands: [3]moe.TopKCandidate = undefined;
+    const got_k = try sd.stepSeedChain(&seed, 5, &masks, 3, &seed_cands);
+    try std.testing.expectEqual(@as(u32, 3), got_k);
+    try std.testing.expectEqual(@as(u32, 5), sd.seqLen());
+
+    // Expand 2 children from seed tail (slot 2) at slots 3..4!
+    masks[3] = masks[2] | (@as(u64, 1) << 3);
+    masks[4] = masks[2] | (@as(u64, 1) << 4);
+    const next_toks = [_]u32{ seed_cands[0].token_id, seed_cands[1].token_id };
+    const next_pos = [_]u32{ 8, 8 };
+    var batch_cands: [2 * 3]moe.TopKCandidate = undefined;
+    _ = try sd.stepTreeBatch(&next_toks, &next_pos, masks[0..5], 3, 3, &batch_cands);
+    try std.testing.expectEqual(@as(u32, 5), sd.seqLen());
+    for (batch_cands) |c| {
+        try std.testing.expect(c.token_id < draft_cfg.vocab_size);
+        try std.testing.expect(std.math.isFinite(c.prob) and c.prob > 0.0);
+    }
+
+    // Sync accepted tokens [13, 19] -> seq_len = 7!
+    const acc = [_]u32{ 13, 19 };
+    try sd.syncAccepted(&acc, 5, 3);
+    try std.testing.expectEqual(@as(u32, 7), sd.seqLen());
+    try std.testing.expectEqual(@as(usize, 3), sd.rootCandidates().len);
 }
 
 fn buildSyntheticTargetBf16ForTest(allocator: std.mem.Allocator, cfg: qwen3.ModelConfig, seed: u64) ![]u8 {

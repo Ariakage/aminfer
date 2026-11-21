@@ -10,24 +10,38 @@ const usage =
     \\commands:
     \\  probe             print the kernel, Metal and Neural Engine facts of this machine
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1, M2, M2.5 and M3 benchmark suites
+    \\  bench             run full M1, M2, M2.5, M3 and M4 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
     \\  bench-m3          run M3 Spikes S4/S5, D5 gate, L1 SAM latency and synthetic spec decode
+    \\  bench-m4          run M4 Spikes S3/S6, A2 predictor, A1/G6 hybrid prefill, cold NVMe & D4
+    \\  bench-a2          evaluate real-checkpoint A2 ANE cross-layer expert predictor recall/lead-time
+    \\                    --amf <path> --config <path> --tokenizer <path> [--prompt <text>]
+    \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [--no-verify-crc]
     \\  bench-decode      benchmark end-to-end greedy decode on a specific .amf + config.json
     \\                    --amf <path> --config <path> [--scale-layers N] [--prefill-tokens N]
-    \\                    [--decode-steps N] [--no-verify-crc]
+    \\                    [--decode-steps N] [--cold-experts-per-layer N] [--heat-profile <path>]
+    \\                    [--cold-slots N] [--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
+    \\                    [--no-ane-predictor] [--no-verify-crc]
     \\  decode            run end-to-end native BPE encode -> greedy .amf decode -> BPE decode
     \\                    --amf <path> --config <path> --tokenizer <path>
-    \\                    --prompt <text> [--max-tokens N] [--ignore-eos] [--no-verify-crc]
-    \\  spec-decode       run speculative decoding (L1 SAM + EAGLE-3/EAGLE-2/MTP + D7 pruning)
+    \\                    --prompt <text> [--max-tokens N] [--ignore-eos]
+    \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
+    \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
+    \\                    [--no-ane-predictor] [--no-verify-crc]
+    \\  spec-decode       run speculative decoding (L1 SAM + EAGLE-3/EAGLE-2/MTP/Small + D7 pruning)
     \\                    --amf <path> --config <path> --tokenizer <path> --prompt <text>
     \\                    [--draft-amf <path> --draft-config <path>]
-    \\                    [--draft-mode l1|eagle3|eagle2|mtp] [--placement auto|gpu|ane]
+    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small] [--placement auto|gpu|ane]
     \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
     \\                    [--top-k N] [--no-prune] [--temperature T] [--seed N]
-    \\                    [--max-tokens N] [--ignore-eos] [--no-verify-crc]
+    \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
+    \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
+    \\                    [--no-ane-predictor] [--max-tokens N] [--ignore-eos] [--no-verify-crc]
     \\
 ;
 
@@ -51,6 +65,10 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM25(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m3")) {
         try runBenchM3(arena, out);
+    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m4")) {
+        try runBenchM4(arena, out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-a2")) {
+        try runBenchA2(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-decode")) {
         try runBenchDecode(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "decode")) {
@@ -61,6 +79,64 @@ pub fn main(init: std.process.Init) !void {
         try out.writeAll(usage);
     }
     try out.flush();
+}
+
+fn parseIoBackend(str: []const u8) error{InvalidIoBackend}!aminfer.aio.IoBackend {
+    if (std.mem.eql(u8, str, "auto")) return .auto;
+    if (std.mem.eql(u8, str, "aio") or std.mem.eql(u8, str, "kqueue_aio")) return .kqueue_aio;
+    if (std.mem.eql(u8, str, "pread") or std.mem.eql(u8, str, "ecore_pread")) return .ecore_pread;
+    return error.InvalidIoBackend;
+}
+
+fn buildBudgetOverride(wired_cap_mib: ?u64) !?aminfer.budget.Budget {
+    const cap_mib = wired_cap_mib orelse return null;
+    if (cap_mib == 0) return error.InvalidBudgetCap;
+    const facts = try aminfer.sysinfo.Facts.read();
+    const device = try aminfer.metal.Device.open();
+    defer device.close();
+    const info = try device.info();
+    return aminfer.budget.Budget.fromHost(facts, info, .{
+        .configured_cap = cap_mib << 20,
+    });
+}
+
+fn writeColdExpertStats(prefix: []const u8, stats: aminfer.qwen3.ColdExpertStats, out: *Io.Writer) !void {
+    const ct = stats.cache_telemetry;
+    try out.print(
+        \\{s}.cold_experts              {d}
+        \\{s}.cold_slots                {d}
+        \\{s}.cold_io_backend           {s}
+        \\{s}.cold_ane_predictor        {s} (uses_ne={s}, compile_ms={d:.1})
+        \\{s}.cold_hot_hits             {d}
+        \\{s}.cold_cache_hits           {d}
+        \\{s}.cold_prefetch_hits        {d}
+        \\{s}.cold_sync_misses          {d}
+        \\{s}.cold_prefetch_hit_rate    {d:.3}
+        \\{s}.cold_hit_rate             {d:.3}
+        \\{s}.cold_bytes_read           {d}
+        \\{s}.cold_evictions            {d}
+        \\{s}.cold_unused_prefetched    {d}
+        \\{s}.cold_prefetch_wait_us     {d:.1}
+        \\{s}.cold_sync_miss_wait_us    {d:.1}
+        \\
+    , .{
+        prefix,                                           stats.total_cold_experts,
+        prefix,                                           stats.slot_count,
+        prefix,                                           stats.io_backend.label(),
+        prefix,                                           if (stats.ane_predictor_active) "on" else "off",
+        if (stats.ane_predictor_uses_ne) "yes" else "no", stats.ane_predictor_compile_ms,
+        prefix,                                           ct.hot_hits,
+        prefix,                                           ct.cache_hits,
+        prefix,                                           ct.prefetch_hits,
+        prefix,                                           ct.sync_misses,
+        prefix,                                           ct.prefetchHitRate(),
+        prefix,                                           ct.coldHitRate(),
+        prefix,                                           ct.bytes_read,
+        prefix,                                           ct.evictions,
+        prefix,                                           ct.unused_prefetched_experts,
+        prefix,                                           ct.prefetchWaitUs(),
+        prefix,                                           ct.syncMissWaitUs(),
+    });
 }
 
 fn readFileAllocPosix(allocator: std.mem.Allocator, path: [:0]const u8, max_bytes: usize) ![]u8 {
@@ -98,6 +174,14 @@ const DecodeCliArgs = struct {
     max_tokens: u32 = 16,
     ignore_eos: bool = false,
     verify_crcs: bool = true,
+    cold_experts_per_layer: u32 = 0,
+    heat_profile_path: ?[:0]const u8 = null,
+    cold_slots: u32 = 64,
+    wired_cap_mib: ?u64 = null,
+    io_backend: aminfer.aio.IoBackend = .auto,
+    prefill_mode: aminfer.qwen3.PrefillMode = .auto,
+    ane_predictor_path: ?[:0]const u8 = null,
+    enable_ane_predictor: bool = true,
 };
 
 fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
@@ -108,6 +192,14 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var max_tokens: u32 = 16;
     var ignore_eos = false;
     var verify_crcs = true;
+    var cold_experts_per_layer: u32 = 0;
+    var heat_profile_path: ?[:0]const u8 = null;
+    var cold_slots: u32 = 64;
+    var wired_cap_mib: ?u64 = null;
+    var io_backend: aminfer.aio.IoBackend = .auto;
+    var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
+    var ane_predictor_path: ?[:0]const u8 = null;
+    var enable_ane_predictor = true;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -136,6 +228,36 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             ignore_eos = true;
         } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
             verify_crcs = false;
+        } else if (std.mem.eql(u8, flag, "--cold-experts-per-layer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_experts_per_layer = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--heat-profile")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            heat_profile_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--cold-slots")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--io-backend")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            io_backend = try parseIoBackend(args[i]);
+        } else if (std.mem.eql(u8, flag, "--prefill-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            prefill_mode = try aminfer.qwen3.PrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ane_predictor_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--no-ane-predictor")) {
+            enable_ane_predictor = false;
         } else {
             return error.UnknownFlag;
         }
@@ -149,6 +271,14 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .max_tokens = max_tokens,
         .ignore_eos = ignore_eos,
         .verify_crcs = verify_crcs,
+        .cold_experts_per_layer = cold_experts_per_layer,
+        .heat_profile_path = heat_profile_path,
+        .cold_slots = cold_slots,
+        .wired_cap_mib = wired_cap_mib,
+        .io_backend = io_backend,
+        .prefill_mode = prefill_mode,
+        .ane_predictor_path = ane_predictor_path,
+        .enable_ane_predictor = enable_ane_predictor,
     };
 }
 
@@ -159,6 +289,14 @@ const BenchDecodeCliArgs = struct {
     prefill_tokens: u32 = 511,
     decode_steps: u32 = 16,
     verify_crcs: bool = true,
+    cold_experts_per_layer: u32 = 0,
+    heat_profile_path: ?[:0]const u8 = null,
+    cold_slots: u32 = 64,
+    wired_cap_mib: ?u64 = null,
+    io_backend: aminfer.aio.IoBackend = .auto,
+    prefill_mode: aminfer.qwen3.PrefillMode = .auto,
+    ane_predictor_path: ?[:0]const u8 = null,
+    enable_ane_predictor: bool = true,
 };
 
 fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
@@ -168,6 +306,14 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
     var prefill_tokens: u32 = 511;
     var decode_steps: u32 = 16;
     var verify_crcs = true;
+    var cold_experts_per_layer: u32 = 0;
+    var heat_profile_path: ?[:0]const u8 = null;
+    var cold_slots: u32 = 64;
+    var wired_cap_mib: ?u64 = null;
+    var io_backend: aminfer.aio.IoBackend = .auto;
+    var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
+    var ane_predictor_path: ?[:0]const u8 = null;
+    var enable_ane_predictor = true;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -194,6 +340,36 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
             decode_steps = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
             verify_crcs = false;
+        } else if (std.mem.eql(u8, flag, "--cold-experts-per-layer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_experts_per_layer = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--heat-profile")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            heat_profile_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--cold-slots")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--io-backend")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            io_backend = try parseIoBackend(args[i]);
+        } else if (std.mem.eql(u8, flag, "--prefill-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            prefill_mode = try aminfer.qwen3.PrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ane_predictor_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--no-ane-predictor")) {
+            enable_ane_predictor = false;
         } else {
             return error.UnknownFlag;
         }
@@ -206,12 +382,90 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
         .prefill_tokens = prefill_tokens,
         .decode_steps = decode_steps,
         .verify_crcs = verify_crcs,
+        .cold_experts_per_layer = cold_experts_per_layer,
+        .heat_profile_path = heat_profile_path,
+        .cold_slots = cold_slots,
+        .wired_cap_mib = wired_cap_mib,
+        .io_backend = io_backend,
+        .prefill_mode = prefill_mode,
+        .ane_predictor_path = ane_predictor_path,
+        .enable_ane_predictor = enable_ane_predictor,
     };
 }
 
-fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
-    const cli = try parseDecodeArgs(raw_args);
+const BenchA2CliArgs = struct {
+    amf_path: [:0]const u8,
+    config_path: [:0]const u8,
+    tokenizer_path: [:0]const u8,
+    prompt: []const u8 = "Explain how B-trees keep search, insertion, and deletion logarithmic in height and provide a Python implementation:",
+    capture_steps: u32 = 16,
+    lookahead: u32 = 3,
+    ane_predictor_path: ?[:0]const u8 = null,
+    verify_crcs: bool = true,
+};
 
+fn parseBenchA2Args(args: []const [:0]const u8) !BenchA2CliArgs {
+    var amf_path: ?[:0]const u8 = null;
+    var config_path: ?[:0]const u8 = null;
+    var tokenizer_path: ?[:0]const u8 = null;
+    var prompt: []const u8 = "Explain how B-trees keep search, insertion, and deletion logarithmic in height and provide a Python implementation:";
+    var capture_steps: u32 = 16;
+    var lookahead: u32 = 3;
+    var ane_predictor_path: ?[:0]const u8 = null;
+    var verify_crcs = true;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const flag = args[i];
+        if (std.mem.eql(u8, flag, "--amf")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            amf_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--config")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--tokenizer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            tokenizer_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--prompt")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            prompt = args[i];
+        } else if (std.mem.eql(u8, flag, "--capture-steps")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            capture_steps = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--lookahead")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            lookahead = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ane_predictor_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
+            verify_crcs = false;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+
+    return .{
+        .amf_path = amf_path orelse return error.MissingRequiredFlag,
+        .config_path = config_path orelse return error.MissingRequiredFlag,
+        .tokenizer_path = tokenizer_path orelse return error.MissingRequiredFlag,
+        .prompt = prompt,
+        .capture_steps = capture_steps,
+        .lookahead = lookahead,
+        .ane_predictor_path = ane_predictor_path,
+        .verify_crcs = verify_crcs,
+    };
+}
+
+fn runBenchA2(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseBenchA2Args(raw_args);
     const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
     defer allocator.free(cfg_bytes);
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
@@ -229,12 +483,57 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         prompt_ids[0] = cfg.bos_token_id orelse 0;
     }
 
+    const report = try aminfer.bench.runRealA2Eval(allocator, cli.amf_path, cfg, prompt_ids, .{
+        .capture_steps = cli.capture_steps,
+        .max_lookahead = cli.lookahead,
+        .ane_predictor_path = cli.ane_predictor_path,
+        .verify_crcs = cli.verify_crcs,
+    });
+    try report.write(out);
+}
+
+fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseDecodeArgs(raw_args);
+
+    const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
+    defer allocator.free(cfg_bytes);
+    const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
+
+    const heat_bytes: ?[]u8 = if (cli.heat_profile_path) |hp|
+        try readFileAllocPosix(allocator, hp, 16 * 1024 * 1024)
+    else
+        null;
+    defer if (heat_bytes) |hb| allocator.free(hb);
+
+    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
+    defer allocator.free(tok_bytes);
+    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
+    defer tok.deinit(allocator);
+
+    var prompt_ids = try tok.encodeAlloc(allocator, cli.prompt);
+    defer allocator.free(prompt_ids);
+    if (prompt_ids.len == 0) {
+        allocator.free(prompt_ids);
+        prompt_ids = try allocator.alloc(u32, 1);
+        prompt_ids[0] = cfg.bos_token_id orelse 0;
+    }
+
     const needed_seq: u32 = @intCast(prompt_ids.len + cli.max_tokens + 16);
     const max_seq_len: u32 = @min(cfg.max_position_embeddings, @max(@as(u32, 512), needed_seq));
+    const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
 
     var model = try aminfer.qwen3.Qwen3Model.loadFromFile(allocator, cli.amf_path, cfg, .{
         .max_seq_len = max_seq_len,
         .verify_crcs = cli.verify_crcs,
+        .budget_override = budget_override,
+        .cold_experts_per_layer = cli.cold_experts_per_layer,
+        .heat_profile_json = heat_bytes,
+        .cold_slot_count = cli.cold_slots,
+        .io_backend = cli.io_backend,
+        .enable_ane_predictor = cli.enable_ane_predictor,
+        .ane_predictor_path = cli.ane_predictor_path,
+        .prefill_mode = cli.prefill_mode,
+        .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
     });
     defer model.deinit(allocator);
 
@@ -245,16 +544,8 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
     const vm_before = try aminfer.vmstat.Snapshot.capture();
     const prefill_t0 = try aminfer.vmstat.nowNs();
 
-    var pos: u32 = 0;
-    var next_tok: u32 = 0;
-    for (prompt_ids, 0..) |pid, idx| {
-        if (idx + 1 < prompt_ids.len) {
-            try model.prefillToken(pid, pos);
-        } else {
-            next_tok = try model.stepDecode(pid, pos);
-        }
-        pos += 1;
-    }
+    var next_tok: u32 = try model.prefillPrompt(prompt_ids, true);
+    var pos: u32 = @intCast(prompt_ids.len);
     const prefill_t1 = try aminfer.vmstat.nowNs();
 
     var decode_ns: u64 = 0;
@@ -264,7 +555,8 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         generated[0] = next_tok;
         gen_count = 1;
         const hit_eos = (!cli.ignore_eos and cfg.eos_token_id != null and next_tok == cfg.eos_token_id.?);
-        if (!hit_eos) {
+        if (!hit_eos and gen_count < cli.max_tokens) {
+            model.resetColdTelemetry();
             const heap_before = try aminfer.vmstat.Snapshot.capture();
             const dec_t0 = try aminfer.vmstat.nowNs();
             while (gen_count < cli.max_tokens) {
@@ -302,6 +594,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
 
     try out.print(
         \\decode.arch                      {s} ({s})
+        \\decode.prefill_mode              {s}
         \\decode.layers                    {d}
         \\decode.shards                    {d}
         \\decode.wired_mib                 {d}
@@ -315,10 +608,11 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         \\decode.malloc_blocks_delta       {d}
         \\decode.malloc_bytes_delta        {d}
         \\decode.swapouts_delta            {d}
-        \\decode.token_ids                 [
+        \\
     , .{
         cfg.arch.label(),
         cfg.precisionLabel(),
+        cli.prefill_mode.label(),
         cfg.num_hidden_layers,
         model.shardCount(),
         model.totalWiredBytes() >> 20,
@@ -333,6 +627,10 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         decode_heap_delta.size_in_use,
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
     });
+    if (model.coldStats()) |cs| {
+        try writeColdExpertStats("decode", cs, out);
+    }
+    try out.writeAll("decode.token_ids                 [");
     for (generated[0..gen_count], 0..) |tid, idx| {
         if (idx > 0) try out.writeAll(", ");
         try out.print("{d}", .{tid});
@@ -346,6 +644,13 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
     defer allocator.free(cfg_bytes);
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
 
+    const heat_bytes: ?[]u8 = if (cli.heat_profile_path) |hp|
+        try readFileAllocPosix(allocator, hp, 16 * 1024 * 1024)
+    else
+        null;
+    defer if (heat_bytes) |hb| allocator.free(hb);
+
+    const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
     const max_seq_len: u32 = @max(@as(u32, 576), cli.prefill_tokens + 64);
     const res = try aminfer.bench.runDecodeBenchFromFile(allocator, cli.amf_path, cfg, .{
         .label = cfg.arch.label(),
@@ -354,6 +659,15 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
         .decode_steps = cli.decode_steps,
         .max_seq_len = max_seq_len,
         .verify_crcs = cli.verify_crcs,
+        .budget_override = budget_override,
+        .cold_experts_per_layer = cli.cold_experts_per_layer,
+        .heat_profile_json = heat_bytes,
+        .cold_slot_count = cli.cold_slots,
+        .io_backend = cli.io_backend,
+        .enable_ane_predictor = cli.enable_ane_predictor,
+        .ane_predictor_path = cli.ane_predictor_path,
+        .prefill_mode = cli.prefill_mode,
+        .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
     });
     try res.write(out);
 }
@@ -382,6 +696,12 @@ fn runBenchM3(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try report.write(out);
 }
 
+fn runBenchM4(allocator: std.mem.Allocator, out: *Io.Writer) !void {
+    var report = try aminfer.bench.runM4(allocator);
+    defer report.deinit(allocator);
+    try report.write(out);
+}
+
 fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM1(allocator, out);
     try out.flush();
@@ -390,6 +710,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM25(allocator, out);
     try out.flush();
     try runBenchM3(allocator, out);
+    try out.flush();
+    try runBenchM4(allocator, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -411,6 +733,14 @@ const SpecDecodeCliArgs = struct {
     max_tokens: u32 = 64,
     ignore_eos: bool = false,
     verify_crcs: bool = true,
+    cold_experts_per_layer: u32 = 0,
+    heat_profile_path: ?[:0]const u8 = null,
+    cold_slots: u32 = 64,
+    wired_cap_mib: ?u64 = null,
+    io_backend: aminfer.aio.IoBackend = .auto,
+    prefill_mode: aminfer.qwen3.PrefillMode = .auto,
+    ane_predictor_path: ?[:0]const u8 = null,
+    enable_ane_predictor: bool = true,
 };
 
 fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
@@ -432,6 +762,14 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var max_tokens: u32 = 64;
     var ignore_eos = false;
     var verify_crcs = true;
+    var cold_experts_per_layer: u32 = 0;
+    var heat_profile_path: ?[:0]const u8 = null;
+    var cold_slots: u32 = 64;
+    var wired_cap_mib: ?u64 = null;
+    var io_backend: aminfer.aio.IoBackend = .auto;
+    var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
+    var ane_predictor_path: ?[:0]const u8 = null;
+    var enable_ane_predictor = true;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -502,6 +840,36 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             ignore_eos = true;
         } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
             verify_crcs = false;
+        } else if (std.mem.eql(u8, flag, "--cold-experts-per-layer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_experts_per_layer = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--heat-profile")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            heat_profile_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--cold-slots")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cold_slots = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--io-backend")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            io_backend = try parseIoBackend(args[i]);
+        } else if (std.mem.eql(u8, flag, "--prefill-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            prefill_mode = try aminfer.qwen3.PrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            ane_predictor_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--no-ane-predictor")) {
+            enable_ane_predictor = false;
         } else {
             return error.UnknownFlag;
         }
@@ -526,6 +894,14 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .max_tokens = max_tokens,
         .ignore_eos = ignore_eos,
         .verify_crcs = verify_crcs,
+        .cold_experts_per_layer = cold_experts_per_layer,
+        .heat_profile_path = heat_profile_path,
+        .cold_slots = cold_slots,
+        .wired_cap_mib = wired_cap_mib,
+        .io_backend = io_backend,
+        .prefill_mode = prefill_mode,
+        .ane_predictor_path = ane_predictor_path,
+        .enable_ane_predictor = enable_ane_predictor,
     };
 }
 
@@ -536,15 +912,42 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
     defer allocator.free(cfg_bytes);
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
 
+    const heat_bytes: ?[]u8 = if (cli.heat_profile_path) |hp|
+        try readFileAllocPosix(allocator, hp, 16 * 1024 * 1024)
+    else
+        null;
+    defer if (heat_bytes) |hb| allocator.free(hb);
+
     var draft_cfg_opt: ?aminfer.draft.DraftConfig = null;
+    var small_draft_cfg_opt: ?aminfer.qwen3.ModelConfig = null;
+    var mode: aminfer.draft.DraftMode = cli.draft_mode orelse .l1_only;
+
     if (cli.draft_config_path) |dc_path| {
         const dcfg_bytes = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
         defer allocator.free(dcfg_bytes);
-        draft_cfg_opt = try aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes);
+        if (cli.draft_mode == .small_draft) {
+            small_draft_cfg_opt = try aminfer.qwen3.ModelConfig.fromJson(allocator, dcfg_bytes);
+            mode = .small_draft;
+        } else if (cli.draft_mode == null) {
+            if (aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes)) |dc| {
+                draft_cfg_opt = dc;
+                mode = dc.format;
+            } else |err| switch (err) {
+                error.UnsupportedFormat => {
+                    small_draft_cfg_opt = try aminfer.qwen3.ModelConfig.fromJson(allocator, dcfg_bytes);
+                    mode = .small_draft;
+                },
+                else => return err,
+            }
+        } else {
+            draft_cfg_opt = try aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes);
+            draft_cfg_opt.?.format = mode;
+        }
     }
 
-    const mode: aminfer.draft.DraftMode = cli.draft_mode orelse if (draft_cfg_opt) |dc| dc.format else .l1_only;
-    if (mode != .l1_only) {
+    if (mode == .small_draft) {
+        if (cli.draft_amf_path == null or small_draft_cfg_opt == null) return error.MissingRequiredFlag;
+    } else if (mode != .l1_only) {
         if (cli.draft_amf_path == null or draft_cfg_opt == null) return error.MissingRequiredFlag;
         draft_cfg_opt.?.format = mode;
     }
@@ -569,13 +972,24 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
     else
         @as(u32, cli.max_tree_nodes);
 
+    const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
     const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc| dc.aux_layer_ids else null;
+    const needs_taps = (mode != .l1_only and mode != .small_draft);
     var model = try aminfer.qwen3.Qwen3Model.loadFromFile(allocator, cli.amf_path, cfg, .{
         .max_seq_len = max_seq_len,
         .max_tree_nodes = target_tree_cap,
-        .enable_feature_taps = (mode != .l1_only),
+        .enable_feature_taps = needs_taps,
         .aux_layer_ids = aux_ids,
         .verify_crcs = cli.verify_crcs,
+        .budget_override = budget_override,
+        .cold_experts_per_layer = cli.cold_experts_per_layer,
+        .heat_profile_json = heat_bytes,
+        .cold_slot_count = cli.cold_slots,
+        .io_backend = cli.io_backend,
+        .enable_ane_predictor = cli.enable_ane_predictor,
+        .ane_predictor_path = cli.ane_predictor_path,
+        .prefill_mode = cli.prefill_mode,
+        .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
     });
     defer model.deinit(allocator);
 
@@ -583,7 +997,25 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
     var draft_head_ptr: ?*aminfer.draft.DraftHead = null;
     defer if (draft_head_ptr) |dh| dh.deinit(allocator, &model);
 
-    if (mode != .l1_only) {
+    var small_draft_storage: aminfer.draft.SmallDraftModel = undefined;
+    var small_draft_ptr: ?*aminfer.draft.SmallDraftModel = null;
+    defer if (small_draft_ptr) |sd| sd.deinit(allocator);
+
+    if (mode == .small_draft) {
+        small_draft_storage = try aminfer.draft.SmallDraftModel.loadFromFile(
+            allocator,
+            &model,
+            cli.draft_amf_path.?,
+            small_draft_cfg_opt.?,
+            .{
+                .placement = cli.placement,
+                .max_seq_len = max_seq_len,
+                .max_tree_slots = target_tree_cap,
+                .verify_crcs = cli.verify_crcs,
+            },
+        );
+        small_draft_ptr = &small_draft_storage;
+    } else if (mode != .l1_only) {
         draft_head_storage = try aminfer.draft.DraftHead.loadFromFile(
             allocator,
             &model,
@@ -599,7 +1031,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         draft_head_ptr = &draft_head_storage;
     }
 
-    var eng = try aminfer.engine.SpecEngine.init(allocator, &model, draft_head_ptr, .{
+    const spec_cfg: aminfer.engine.SpecConfig = .{
         .mode = mode,
         .placement = cli.placement,
         .max_tree_nodes = cli.max_tree_nodes,
@@ -608,7 +1040,11 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         .top_k_per_node = cli.top_k,
         .temperature = cli.temperature,
         .enable_pruning = cli.enable_pruning,
-    });
+    };
+    var eng = if (small_draft_ptr) |sd|
+        try aminfer.engine.SpecEngine.initWithSmallDraft(allocator, &model, sd, spec_cfg)
+    else
+        try aminfer.engine.SpecEngine.init(allocator, &model, draft_head_ptr, spec_cfg);
     defer eng.deinit(allocator);
 
     const generated = try allocator.alloc(u32, cli.max_tokens);
@@ -635,6 +1071,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         gen_count = 1;
         const first_is_eos = (!cli.ignore_eos and cfg.eos_token_id != null and first_tok == cfg.eos_token_id.?);
         if (!first_is_eos and gen_count < cli.max_tokens) {
+            model.resetColdTelemetry();
             decode_vm_before = try aminfer.vmstat.Snapshot.capture();
             const dec_t0 = try aminfer.vmstat.nowNs();
 
@@ -686,6 +1123,33 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         \\spec.arch                        {s} ({s})
         \\spec.mode                        {s}
         \\spec.placement                   {s} (requested={s})
+        \\
+    , .{
+        cfg.arch.label(),
+        cfg.precisionLabel(),
+        mode.label(),
+        eng.effectivePlacement().label(),
+        cli.placement.label(),
+    });
+    if (small_draft_ptr) |sd| {
+        if (sd.placement_gate_ane_us > 0.0 or sd.placement_gate_gpu_us > 0.0) {
+            try out.print(
+                \\spec.placement_gate_ane_us       {d:.1}
+                \\spec.placement_gate_gpu_us       {d:.1}
+                \\
+            , .{ sd.placement_gate_ane_us, sd.placement_gate_gpu_us });
+        }
+    } else if (draft_head_ptr) |dh| {
+        if (dh.placement_gate_ane_us > 0.0 or dh.placement_gate_gpu_us > 0.0) {
+            try out.print(
+                \\spec.placement_gate_ane_us       {d:.1}
+                \\spec.placement_gate_gpu_us       {d:.1}
+                \\
+            , .{ dh.placement_gate_ane_us, dh.placement_gate_gpu_us });
+        }
+    }
+
+    try out.print(
         \\spec.pruning                     {s} (cap={d}, depth={d}, width={d})
         \\spec.temperature                 {d:.2}
         \\spec.layers                      {d}
@@ -697,11 +1161,6 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         \\spec.mean_accept_len             {d:.3}
         \\spec.accept_hist                 [
     , .{
-        cfg.arch.label(),
-        cfg.precisionLabel(),
-        mode.label(),
-        eng.effectivePlacement().label(),
-        cli.placement.label(),
         if (cli.enable_pruning) "enabled" else "disabled",
         cli.max_tree_nodes,
         cli.max_draft_depth,
@@ -744,7 +1203,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         \\spec.malloc_bytes_delta          {d}
         \\spec.prefill_swapouts_delta      {d}
         \\spec.swapouts_delta              {d}
-        \\spec.token_ids                   [
+        \\
     , .{
         eng.stats.meanDraftedNodes(),
         eng.stats.meanVerifiedNodes(),
@@ -764,7 +1223,10 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, decode_vm_before),
         aminfer.vmstat.Snapshot.swapoutDelta(decode_vm_before, vm_after),
     });
-
+    if (model.coldStats()) |cs| {
+        try writeColdExpertStats("spec", cs, out);
+    }
+    try out.writeAll("spec.token_ids                   [");
     for (generated[0..gen_count], 0..) |tid, idx| {
         if (idx > 0) try out.writeAll(", ");
         try out.print("{d}", .{tid});
@@ -929,4 +1391,73 @@ test "parseSpecDecodeArgs parses all speculative decoding flags and validates er
         "--tokenizer", "k.json",
         "--placement", "tpu",
     }));
+}
+
+test "M4 CLI parsers handle cold-expert, prefill-mode, io-backend, bench-a2 and D4 small draft flags" {
+    const dec = try parseDecodeArgs(&.{
+        "--amf",                    "30b.amf",
+        "--config",                 "config.json",
+        "--tokenizer",              "tok.json",
+        "--prompt",                 "test",
+        "--cold-experts-per-layer", "64",
+        "--heat-profile",           "heat.json",
+        "--cold-slots",             "96",
+        "--wired-cap-mib",          "8192",
+        "--io-backend",             "aio",
+        "--prefill-mode",           "hybrid",
+        "--ane-predictor",          "pred.mlpackage",
+        "--no-ane-predictor",
+    });
+    try std.testing.expectEqual(@as(u32, 64), dec.cold_experts_per_layer);
+    try std.testing.expectEqualStrings("heat.json", dec.heat_profile_path.?);
+    try std.testing.expectEqual(@as(u32, 96), dec.cold_slots);
+    try std.testing.expectEqual(@as(?u64, 8192), dec.wired_cap_mib);
+    try std.testing.expectEqual(aminfer.aio.IoBackend.kqueue_aio, dec.io_backend);
+    try std.testing.expectEqual(aminfer.qwen3.PrefillMode.hybrid, dec.prefill_mode);
+    try std.testing.expectEqualStrings("pred.mlpackage", dec.ane_predictor_path.?);
+    try std.testing.expect(!dec.enable_ane_predictor);
+
+    const bdec = try parseBenchDecodeArgs(&.{
+        "--amf",                    "30b.amf",
+        "--config",                 "config.json",
+        "--cold-experts-per-layer", "32",
+        "--io-backend",             "pread",
+        "--prefill-mode",           "gpu",
+        "--wired-cap-mib",          "8192",
+    });
+    try std.testing.expectEqual(@as(u32, 32), bdec.cold_experts_per_layer);
+    try std.testing.expectEqual(aminfer.aio.IoBackend.ecore_pread, bdec.io_backend);
+    try std.testing.expectEqual(aminfer.qwen3.PrefillMode.gpu, bdec.prefill_mode);
+    try std.testing.expectEqual(@as(?u64, 8192), bdec.wired_cap_mib);
+
+    const spec = try parseSpecDecodeArgs(&.{
+        "--amf",                    "14b.amf",
+        "--config",                 "14b.json",
+        "--tokenizer",              "tok.json",
+        "--draft-amf",              "0.6b.amf",
+        "--draft-config",           "0.6b.json",
+        "--draft-mode",             "small",
+        "--cold-experts-per-layer", "16",
+        "--io-backend",             "auto",
+        "--prefill-mode",           "auto",
+    });
+    try std.testing.expectEqual(aminfer.draft.DraftMode.small_draft, spec.draft_mode.?);
+    try std.testing.expectEqual(@as(u32, 16), spec.cold_experts_per_layer);
+
+    const a2 = try parseBenchA2Args(&.{
+        "--amf",           "30b.amf",
+        "--config",        "config.json",
+        "--tokenizer",     "tok.json",
+        "--capture-steps", "12",
+        "--lookahead",     "3",
+        "--ane-predictor", "all48.mlpackage",
+        "--no-verify-crc",
+    });
+    try std.testing.expectEqual(@as(u32, 12), a2.capture_steps);
+    try std.testing.expectEqual(@as(u32, 3), a2.lookahead);
+    try std.testing.expectEqualStrings("all48.mlpackage", a2.ane_predictor_path.?);
+    try std.testing.expect(!a2.verify_crcs);
+
+    try std.testing.expectError(error.InvalidIoBackend, parseIoBackend("uring"));
+    try std.testing.expectError(error.InvalidPrefillMode, aminfer.qwen3.PrefillMode.parse("cpu"));
 }

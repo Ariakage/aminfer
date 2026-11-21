@@ -18,6 +18,9 @@ const sam_mod = @import("../spec/sam.zig");
 const tree_mod = @import("../spec/tree.zig");
 const draft_mod = @import("../spec/draft.zig");
 const engine_mod = @import("../spec/engine.zig");
+const aio = @import("../storage/aio.zig");
+const wavefront = @import("../ane/wavefront.zig");
+const predictor_mod = @import("../ane/predictor.zig");
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -1385,6 +1388,15 @@ pub const DecodeBenchOptions = struct {
     decode_steps: u32 = 16,
     max_seq_len: u32 = 576,
     verify_crcs: bool = true,
+    budget_override: ?budget_mod.Budget = null,
+    cold_experts_per_layer: u32 = 0,
+    heat_profile_json: ?[]const u8 = null,
+    cold_slot_count: u32 = 64,
+    io_backend: aio.IoBackend = .auto,
+    enable_ane_predictor: bool = true,
+    ane_predictor_path: ?[:0]const u8 = null,
+    prefill_mode: qwen3.PrefillMode = .auto,
+    enable_hybrid_prefill: bool = false,
 };
 
 pub const DecodeBenchResult = struct {
@@ -1404,6 +1416,7 @@ pub const DecodeBenchResult = struct {
     layers_only_ns: u64,
     measured_bytes_per_tok: u64,
     extrapolated_bytes_per_tok: u64,
+    cold_stats: ?qwen3.ColdExpertStats = null,
     heap_delta: vmstat.HeapDelta,
     swapouts_delta: u64,
     pageouts_delta: u64,
@@ -1520,6 +1533,28 @@ pub const DecodeBenchResult = struct {
             self.swapouts_delta,
             self.pageouts_delta,
         });
+        if (self.cold_stats) |cs| {
+            const ct = cs.cache_telemetry;
+            try out.print(
+                \\decode_bench.cold_experts        {d} (slots={d}, backend={s}, ane_pred={s})
+                \\decode_bench.cold_hits           hot={d} cache={d} prefetch={d} sync_miss={d}
+                \\decode_bench.cold_hit_rates      prefetch={d:.3} cold_total={d:.3} bytes_read={d} evictions={d}
+                \\
+            , .{
+                cs.total_cold_experts,
+                cs.slot_count,
+                cs.io_backend.label(),
+                if (cs.ane_predictor_active) "on" else "off",
+                ct.hot_hits,
+                ct.cache_hits,
+                ct.prefetch_hits,
+                ct.sync_misses,
+                ct.prefetchHitRate(),
+                ct.coldHitRate(),
+                ct.bytes_read,
+                ct.evictions,
+            });
+        }
     }
 };
 
@@ -1537,6 +1572,15 @@ pub fn runDecodeBenchFromFile(
     var model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
         .max_seq_len = opts.max_seq_len,
         .verify_crcs = opts.verify_crcs,
+        .budget_override = opts.budget_override,
+        .cold_experts_per_layer = opts.cold_experts_per_layer,
+        .heat_profile_json = opts.heat_profile_json,
+        .cold_slot_count = opts.cold_slot_count,
+        .io_backend = opts.io_backend,
+        .enable_ane_predictor = opts.enable_ane_predictor,
+        .ane_predictor_path = opts.ane_predictor_path,
+        .prefill_mode = opts.prefill_mode,
+        .enable_hybrid_prefill = opts.enable_hybrid_prefill,
     });
     defer model.deinit(allocator);
     const load_t1 = try vmstat.nowNs();
@@ -1556,6 +1600,8 @@ pub fn runDecodeBenchFromFile(
         cur_tok = try model.stepDecode(cur_tok, eval_pos);
     }
 
+    model.resetColdTelemetry();
+
     // Timed steady-state full decode steps (`measured_layers` + final norm + lm_head + argmax).
     const heap_before = try vmstat.Snapshot.capture();
     const t_full_0 = try vmstat.nowNs();
@@ -1564,6 +1610,7 @@ pub fn runDecodeBenchFromFile(
     }
     const t_full_1 = try vmstat.nowNs();
     const heap_after = try vmstat.Snapshot.capture();
+    const timed_cold_stats = model.coldStats();
 
     // Timed transformer-body-only steps at identical `seq_len` to separate `T_layer` from `T_head`.
     const t_body_0 = try vmstat.nowNs();
@@ -1601,6 +1648,7 @@ pub fn runDecodeBenchFromFile(
         .layers_only_ns = t_body_1 - t_body_0,
         .measured_bytes_per_tok = measured_bytes,
         .extrapolated_bytes_per_tok = extrapolated_bytes,
+        .cold_stats = timed_cold_stats,
         .heap_delta = vmstat.heapDelta(heap_before, heap_after),
         .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
         .pageouts_delta = vmstat.Snapshot.pageoutDelta(vm_before, vm_after),
@@ -2629,6 +2677,997 @@ pub fn runM3(allocator: std.mem.Allocator) M3Error!M3Report {
     return runM3WithConfig(allocator, .{});
 }
 
+// ---------------------------------------------------------------------------
+// M4 Hybrid ANE/GPU Wavefront Prefill, Cold-Expert NVMe Streaming, A2 & D4
+// ---------------------------------------------------------------------------
+
+pub const DEFAULT_HYBRID_PROMPT_LENS = [_]u32{ 1024, 2048 };
+
+pub const HybridPrefillCaseResult = struct {
+    prompt_tokens: u32,
+    chunk_tokens: u32,
+    num_layers: u32,
+    hybrid_ms: f64,
+    gpu_ms: f64,
+    ane_total_ms: f64,
+    gpu_ffn_total_ms: f64,
+    overlap_efficiency: f64,
+    all_outputs_zero_copy: bool,
+    all_buckets_use_ane: bool,
+
+    pub fn hybridTokPerS(self: HybridPrefillCaseResult) f64 {
+        return if (self.hybrid_ms > 0.0)
+            (@as(f64, @floatFromInt(self.prompt_tokens)) * 1000.0) / self.hybrid_ms
+        else
+            0.0;
+    }
+
+    pub fn gpuTokPerS(self: HybridPrefillCaseResult) f64 {
+        return if (self.gpu_ms > 0.0)
+            (@as(f64, @floatFromInt(self.prompt_tokens)) * 1000.0) / self.gpu_ms
+        else
+            0.0;
+    }
+
+    pub fn speedupVsGpu(self: HybridPrefillCaseResult) f64 {
+        return if (self.hybrid_ms > 0.0) self.gpu_ms / self.hybrid_ms else 0.0;
+    }
+};
+
+pub const HybridPrefillBenchReport = struct {
+    hidden_size: u32,
+    num_layers: u32,
+    num_experts: u32,
+    top_k: u32,
+    chunk_tokens: u32,
+    results: []HybridPrefillCaseResult,
+    swapouts_delta: u64,
+
+    pub fn deinit(self: *HybridPrefillBenchReport, allocator: std.mem.Allocator) void {
+        allocator.free(self.results);
+        self.results = &.{};
+    }
+
+    pub fn write(self: *const HybridPrefillBenchReport, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\Synthetic End-to-End A1/G6 Hybrid Wavefront Prefill vs GPU-Only Prefill
+            \\hybrid_prefill.geometry          layers={d} hidden={d} experts={d} top_k={d} chunk={d}
+            \\prompt_toks   hybrid(ms)   hybrid(tok/s)   gpu_only(ms)   gpu(tok/s)   speedup   overlap   ane   zc
+            \\
+        , .{
+            self.num_layers,
+            self.hidden_size,
+            self.num_experts,
+            self.top_k,
+            self.chunk_tokens,
+        });
+        for (self.results) |r| {
+            try out.print(
+                \\{d: >11}   {d: >10.3}   {d: >13.1}   {d: >12.3}   {d: >10.1}   {d: >6.2}x   {d: >6.2}x   {s: <3}   {s}
+                \\
+            , .{
+                r.prompt_tokens,
+                r.hybrid_ms,
+                r.hybridTokPerS(),
+                r.gpu_ms,
+                r.gpuTokPerS(),
+                r.speedupVsGpu(),
+                r.overlap_efficiency,
+                if (r.all_buckets_use_ane) "yes" else "no",
+                if (r.all_outputs_zero_copy) "yes" else "no",
+            });
+        }
+        try out.print("hybrid_prefill.swapouts_delta    {d}\n", .{self.swapouts_delta});
+    }
+};
+
+pub const ColdSynthResult = struct {
+    num_layers: u32,
+    num_experts: u32,
+    cold_experts_per_layer: u32,
+    hot_wired_bytes: u64,
+    cold_wired_bytes: u64,
+    gen_tokens: u32,
+    bit_exact: bool,
+    cold_stats: qwen3.ColdExpertStats,
+    heap_delta: vmstat.HeapDelta,
+    swapouts_delta: u64,
+
+    pub fn write(self: *const ColdSynthResult, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        const ct = self.cold_stats.cache_telemetry;
+        try out.print(
+            \\Synthetic End-to-End Cold-Expert NVMe Streaming Decode (C3-C5 + A2)
+            \\cold_synth.geometry              layers={d} experts={d} cold_per_layer={d} slots={d}
+            \\cold_synth.io_backend            {s} (ane_predictor={s}, uses_ne={s})
+            \\cold_synth.wired_bytes           all_hot={d} cold_mode={d}
+            \\cold_synth.bit_exact_vs_hot      {s} (gen_tokens={d})
+            \\cold_synth.hits                  hot={d} cache={d} prefetch={d} sync_miss={d}
+            \\cold_synth.hit_rates             prefetch={d:.3} cold_total={d:.3} bytes_read={d} evictions={d}
+            \\cold_synth.malloc_blocks_delta   {d}
+            \\cold_synth.malloc_bytes_delta    {d}
+            \\cold_synth.swapouts_delta        {d}
+            \\
+        , .{
+            self.num_layers,
+            self.num_experts,
+            self.cold_experts_per_layer,
+            self.cold_stats.slot_count,
+            self.cold_stats.io_backend.label(),
+            if (self.cold_stats.ane_predictor_active) "on" else "off",
+            if (self.cold_stats.ane_predictor_uses_ne) "yes" else "no",
+            self.hot_wired_bytes,
+            self.cold_wired_bytes,
+            if (self.bit_exact) "yes" else "NO",
+            self.gen_tokens,
+            ct.hot_hits,
+            ct.cache_hits,
+            ct.prefetch_hits,
+            ct.sync_misses,
+            ct.prefetchHitRate(),
+            ct.coldHitRate(),
+            ct.bytes_read,
+            ct.evictions,
+            self.heap_delta.blocks_in_use,
+            self.heap_delta.size_in_use,
+            self.swapouts_delta,
+        });
+    }
+};
+
+pub const D4SynthResult = struct {
+    effective_placement: draft_mod.Placement,
+    placement_gate_ane_us: f64,
+    placement_gate_gpu_us: f64,
+    lossless_match: bool,
+    generated_tokens: u32,
+    rounds: u64,
+    mean_accept_len: f64,
+    mean_drafted_nodes: f64,
+    mean_verified_nodes: f64,
+    heap_delta: vmstat.HeapDelta,
+    swapouts_delta: u64,
+
+    pub fn write(self: *const D4SynthResult, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\Synthetic End-to-End D4 Same-Family Small Draft Lossless Check
+            \\d4_synth.placement               {s} (gate_ane_us={d:.1}, gate_gpu_us={d:.1})
+            \\d4_synth.lossless_match          {s}
+            \\d4_synth.generated_tokens        {d}
+            \\d4_synth.rounds                  {d}
+            \\d4_synth.mean_accept_len         {d:.3}
+            \\d4_synth.drafted_nodes           {d:.2}
+            \\d4_synth.verified_nodes          {d:.2}
+            \\d4_synth.malloc_blocks_delta     {d}
+            \\d4_synth.malloc_bytes_delta      {d}
+            \\d4_synth.swapouts_delta          {d}
+            \\
+        , .{
+            self.effective_placement.label(),
+            self.placement_gate_ane_us,
+            self.placement_gate_gpu_us,
+            if (self.lossless_match) "yes" else "NO",
+            self.generated_tokens,
+            self.rounds,
+            self.mean_accept_len,
+            self.mean_drafted_nodes,
+            self.mean_verified_nodes,
+            self.heap_delta.blocks_in_use,
+            self.heap_delta.size_in_use,
+            self.swapouts_delta,
+        });
+    }
+};
+
+pub const M4Config = struct {
+    s3: aio.SpikeS3Config = .{},
+    s6: wavefront.SpikeS6Config = .{},
+    a2: predictor_mod.PredictorEvalConfig = .{},
+    hybrid_prompt_lens: []const u32 = &DEFAULT_HYBRID_PROMPT_LENS,
+    hybrid_chunk_tokens: u32 = 512,
+    hybrid_hidden_size: u32 = 512,
+    hybrid_num_layers: u32 = 2,
+    hybrid_num_q_heads: u32 = 8,
+    hybrid_num_kv_heads: u32 = 4,
+    hybrid_head_dim: u32 = 64,
+    hybrid_moe_intermediate: u32 = 256,
+    hybrid_num_experts: u32 = 16,
+    hybrid_top_k: u32 = 4,
+    hybrid_timed_iters: u32 = 2,
+    cold_temp_dir: []const u8 = "/Volumes/Akari/.tmp",
+    cold_gen_tokens: u32 = 12,
+    d4_gen_tokens: u32 = 12,
+};
+
+pub const M4Report = struct {
+    s3: aio.SpikeS3Report,
+    s6: wavefront.SpikeS6Report,
+    a2: predictor_mod.PredictorEvalReport,
+    hybrid_prefill: HybridPrefillBenchReport,
+    cold_synth: ColdSynthResult,
+    d4_synth: D4SynthResult,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn deinit(self: *M4Report, allocator: std.mem.Allocator) void {
+        self.s3.deinit(allocator);
+        self.hybrid_prefill.deinit(allocator);
+    }
+
+    pub fn write(self: *const M4Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.writeAll("\n=== M4 Hybrid ANE/GPU Wavefront, Cold-Expert NVMe Streaming, A2 & D4 Benchmarks ===\n\n");
+        try self.s3.write(out);
+        try out.writeAll("\n");
+        try self.s6.write(out);
+        try out.writeAll("\n");
+        try self.a2.write(out);
+        try out.writeAll("\n");
+        try self.hybrid_prefill.write(out);
+        try out.writeAll("\n");
+        try self.cold_synth.write(out);
+        try out.writeAll("\n");
+        try self.d4_synth.write(out);
+        try out.print(
+            \\
+            \\M4 Swap Check
+            \\m4.swap.status                   ok
+            \\m4.swap.swapouts_delta           {d}
+            \\m4.swap.pageouts_delta           {d}
+            \\
+        , .{
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+pub const M4Error = error{
+    LosslessMismatch,
+    InvalidConfig,
+} || aio.SpikeS3Error || wavefront.SpikeS6Error || predictor_mod.AneExpertPredictor.Error ||
+    qwen3.LoadError || qwen3.StepError || draft_mod.SmallDraftLoadError ||
+    engine_mod.InitError || engine_mod.RunError || SynthWriteError || vmstat.Error || vmstat.SwapError;
+
+pub fn runHybridPrefillVsGpuBench(allocator: std.mem.Allocator, config: M4Config) M4Error!HybridPrefillBenchReport {
+    if (config.hybrid_prompt_lens.len == 0 or config.hybrid_timed_iters == 0) return error.InvalidConfig;
+    var max_prompt: u32 = config.hybrid_chunk_tokens * 2;
+    for (config.hybrid_prompt_lens) |pl| {
+        if (pl <= config.hybrid_chunk_tokens) return error.InvalidConfig;
+        if (pl > max_prompt) max_prompt = pl;
+    }
+
+    const cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .vocab_size = 256,
+        .hidden_size = config.hybrid_hidden_size,
+        .num_hidden_layers = config.hybrid_num_layers,
+        .num_attention_heads = config.hybrid_num_q_heads,
+        .num_key_value_heads = config.hybrid_num_kv_heads,
+        .head_dim = config.hybrid_head_dim,
+        .moe_intermediate_size = config.hybrid_moe_intermediate,
+        .num_experts = config.hybrid_num_experts,
+        .num_experts_per_tok = config.hybrid_top_k,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1_000_000.0,
+        .max_position_embeddings = max_prompt + 64,
+        .tie_word_embeddings = false,
+        .norm_topk_prob = true,
+    };
+
+    const image = try qwen3.buildSyntheticAmfImageWithSpec(allocator, cfg, .{
+        .linear_dtype = .q3_affine,
+        .embed_dtype = .f16,
+        .norm_dtype = .f16,
+        .router_dtype = .f16,
+        .expert_dtype = .q3_affine,
+    }, 0x0004_A166);
+    defer allocator.free(image);
+
+    var model = try qwen3.Qwen3Model.loadFromBytes(allocator, image, cfg, .{
+        .max_seq_len = max_prompt,
+        .chunk_tokens = config.hybrid_chunk_tokens,
+        .max_tree_nodes = 64,
+        .verify_crcs = true,
+        .prefill_mode = .hybrid,
+        .enable_hybrid_prefill = true,
+        .hybrid_max_bucket = max_prompt,
+    });
+    defer model.deinit(allocator);
+
+    const tokens = try allocator.alloc(u32, max_prompt);
+    defer allocator.free(tokens);
+    for (tokens, 0..) |*t, i| t.* = @intCast((i * 19 + 7) % cfg.vocab_size);
+
+    const results = try allocator.alloc(HybridPrefillCaseResult, config.hybrid_prompt_lens.len);
+    errdefer allocator.free(results);
+
+    const vm_before = try vmstat.Snapshot.capture();
+    for (config.hybrid_prompt_lens, 0..) |plen, ci| {
+        const prompt = tokens[0..plen];
+
+        // Warmup both paths once so ANE & Metal 4 caches are hot.
+        model.resetKvCache();
+        _ = try model.prefillHybridWavefront(prompt, true);
+        model.resetKvCache();
+        {
+            var pos: usize = 0;
+            while (pos < prompt.len) {
+                const take = @min(@as(usize, 64), prompt.len - pos);
+                _ = try model.prefillChunk(prompt[pos .. pos + take], @intCast(pos), pos + take == prompt.len);
+                pos += take;
+            }
+        }
+
+        // Timed A1/G6 Hybrid Wavefront Prefill.
+        var hybrid_ns_sum: u64 = 0;
+        var ane_ns_sum: u64 = 0;
+        var gpu_ffn_ns_sum: u64 = 0;
+        var all_zc = true;
+        var all_ane = true;
+        for (0..config.hybrid_timed_iters) |_| {
+            model.resetKvCache();
+            const t0 = try vmstat.nowNs();
+            const hres = try model.prefillHybridWavefront(prompt, true);
+            const t1 = try vmstat.nowNs();
+            hybrid_ns_sum += t1 -| t0;
+            ane_ns_sum += hres.wavefront_stats.ane_total_ns;
+            gpu_ffn_ns_sum += hres.wavefront_stats.gpu_total_ns;
+            all_zc = all_zc and hres.all_outputs_zero_copy;
+            all_ane = all_ane and hres.all_buckets_use_ane;
+        }
+
+        // Timed GPU-only batched chunked prefill (`prefillChunk`, 64 tokens/batch).
+        var gpu_ns_sum: u64 = 0;
+        for (0..config.hybrid_timed_iters) |_| {
+            model.resetKvCache();
+            const t0 = try vmstat.nowNs();
+            var pos: usize = 0;
+            while (pos < prompt.len) {
+                const take = @min(@as(usize, 64), prompt.len - pos);
+                _ = try model.prefillChunk(prompt[pos .. pos + take], @intCast(pos), pos + take == prompt.len);
+                pos += take;
+            }
+            const t1 = try vmstat.nowNs();
+            gpu_ns_sum += t1 -| t0;
+        }
+
+        const iters_f: f64 = @floatFromInt(config.hybrid_timed_iters);
+        const h_ms = (@as(f64, @floatFromInt(hybrid_ns_sum)) / iters_f) / 1_000_000.0;
+        const g_ms = (@as(f64, @floatFromInt(gpu_ns_sum)) / iters_f) / 1_000_000.0;
+        const ane_ms = (@as(f64, @floatFromInt(ane_ns_sum)) / iters_f) / 1_000_000.0;
+        const gffn_ms = (@as(f64, @floatFromInt(gpu_ffn_ns_sum)) / iters_f) / 1_000_000.0;
+
+        results[ci] = .{
+            .prompt_tokens = plen,
+            .chunk_tokens = config.hybrid_chunk_tokens,
+            .num_layers = config.hybrid_num_layers,
+            .hybrid_ms = h_ms,
+            .gpu_ms = g_ms,
+            .ane_total_ms = ane_ms,
+            .gpu_ffn_total_ms = gffn_ms,
+            .overlap_efficiency = if (h_ms > 0.0) (ane_ms + gffn_ms) / h_ms else 0.0,
+            .all_outputs_zero_copy = all_zc,
+            .all_buckets_use_ane = all_ane,
+        };
+    }
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .hidden_size = config.hybrid_hidden_size,
+        .num_layers = config.hybrid_num_layers,
+        .num_experts = config.hybrid_num_experts,
+        .top_k = config.hybrid_top_k,
+        .chunk_tokens = config.hybrid_chunk_tokens,
+        .results = results,
+        .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+    };
+}
+
+pub fn runColdSynthBench(
+    allocator: std.mem.Allocator,
+    temp_dir: []const u8,
+    gen_tokens: u32,
+) M4Error!ColdSynthResult {
+    const cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .vocab_size = 128,
+        .hidden_size = 256,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .moe_intermediate_size = 256,
+        .num_experts = 16,
+        .num_experts_per_tok = 4,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1_000_000.0,
+        .max_position_embeddings = 128,
+        .tie_word_embeddings = false,
+        .norm_topk_prob = true,
+    };
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pid = std.c.getpid();
+    const stamp = try vmstat.nowNs();
+    const path_slice = std.fmt.bufPrint(
+        path_buf[0 .. path_buf.len - 1],
+        "{s}/aminfer_m4_cold_{d}_{d}.amf",
+        .{ temp_dir, pid, stamp },
+    ) catch return error.InvalidConfig;
+    path_buf[path_slice.len] = 0;
+    const amf_path: [:0]const u8 = path_buf[0..path_slice.len :0];
+
+    try writeSyntheticQwen3AmfFile(allocator, amf_path, cfg, 0x0004_C01D);
+    defer _ = std.c.unlink(amf_path.ptr);
+
+    const prompt = [_]u32{ 5, 11, 23, 37, 41 };
+    const n_gen: usize = @min(@as(usize, @max(gen_tokens, 2)), 32);
+    var ref_out: [32]u32 = undefined;
+    var cold_out: [32]u32 = undefined;
+
+    const vm_before = try vmstat.Snapshot.capture();
+
+    var hot_wired_bytes: u64 = 0;
+    {
+        var hot_model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
+            .max_seq_len = 64,
+            .chunk_tokens = 32,
+            .verify_crcs = true,
+        });
+        defer hot_model.deinit(allocator);
+        hot_wired_bytes = hot_model.totalWiredBytes();
+
+        var cur = try hot_model.prefillPrompt(&prompt, true);
+        ref_out[0] = cur;
+        var pos: u32 = @intCast(prompt.len);
+        for (1..n_gen) |step| {
+            cur = try hot_model.stepDecode(cur, pos);
+            pos += 1;
+            ref_out[step] = cur;
+        }
+    }
+
+    var cold_model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 32,
+        .verify_crcs = true,
+        .cold_experts_per_layer = 8,
+        .cold_slot_count = 16,
+        .io_backend = .auto,
+        .enable_ane_predictor = true,
+    });
+    defer cold_model.deinit(allocator);
+
+    var cur = try cold_model.prefillPrompt(&prompt, true);
+    cold_out[0] = cur;
+    cold_model.resetColdTelemetry();
+
+    const heap_before = try vmstat.Snapshot.capture();
+    var pos: u32 = @intCast(prompt.len);
+    for (1..n_gen) |step| {
+        cur = try cold_model.stepDecode(cur, pos);
+        pos += 1;
+        cold_out[step] = cur;
+    }
+    const heap_after = try vmstat.Snapshot.capture();
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    const exact = std.mem.eql(u32, ref_out[0..n_gen], cold_out[0..n_gen]);
+    if (!exact) return error.LosslessMismatch;
+
+    return .{
+        .num_layers = cfg.num_hidden_layers,
+        .num_experts = cfg.num_experts,
+        .cold_experts_per_layer = 8,
+        .hot_wired_bytes = hot_wired_bytes,
+        .cold_wired_bytes = cold_model.totalWiredBytes(),
+        .gen_tokens = @intCast(n_gen),
+        .bit_exact = exact,
+        .cold_stats = cold_model.coldStats().?,
+        .heap_delta = vmstat.heapDelta(heap_before, heap_after),
+        .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+    };
+}
+
+pub fn runD4SynthBench(allocator: std.mem.Allocator, gen_tokens: u32) M4Error!D4SynthResult {
+    const target_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1_000_000.0,
+        .max_position_embeddings = 128,
+        .tie_word_embeddings = true,
+    };
+    const draft_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 1_000_000.0,
+        .max_position_embeddings = 128,
+        .tie_word_embeddings = true,
+    };
+
+    const target_bytes = try qwen3.buildSyntheticAmfImageWithSpec(allocator, target_cfg, .{
+        .linear_dtype = .bf16,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+        .use_weight_suffix = true,
+    }, 0x0004_D400);
+    defer allocator.free(target_bytes);
+
+    const draft_bytes = try qwen3.buildSyntheticAmfImageWithSpec(allocator, draft_cfg, .{
+        .linear_dtype = .bf16,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+        .use_weight_suffix = true,
+    }, 0x0004_D401);
+    defer allocator.free(draft_bytes);
+
+    const prompt = [_]u32{ 3, 9, 17, 25, 31, 43 };
+    const n_gen: usize = @min(@as(usize, @max(gen_tokens, 2)), 32);
+    var ref_out: [32]u32 = undefined;
+    var spec_out: [32]u32 = undefined;
+
+    const vm_before = try vmstat.Snapshot.capture();
+    {
+        var ref_model = try qwen3.Qwen3Model.loadFromBytes(allocator, target_bytes, target_cfg, .{
+            .max_seq_len = 64,
+            .chunk_tokens = 32,
+            .verify_crcs = true,
+        });
+        defer ref_model.deinit(allocator);
+        var cur = try ref_model.prefillPrompt(&prompt, true);
+        ref_out[0] = cur;
+        var pos: u32 = @intCast(prompt.len);
+        for (1..n_gen) |step| {
+            cur = try ref_model.stepDecode(cur, pos);
+            pos += 1;
+            ref_out[step] = cur;
+        }
+    }
+
+    var target_model = try qwen3.Qwen3Model.loadFromBytes(allocator, target_bytes, target_cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 32,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = false,
+        .verify_crcs = true,
+    });
+    defer target_model.deinit(allocator);
+
+    var sd = try draft_mod.SmallDraftModel.loadFromBytes(allocator, &target_model, draft_bytes, draft_cfg, .{
+        .placement = .auto,
+        .max_seq_len = 64,
+        .chunk_tokens = 32,
+        .max_tree_slots = 16,
+        .verify_crcs = true,
+    });
+    defer sd.deinit(allocator);
+
+    var eng = try engine_mod.SpecEngine.initWithSmallDraft(allocator, &target_model, &sd, .{
+        .mode = .small_draft,
+        .placement = .auto,
+        .max_tree_nodes = 12,
+        .max_draft_depth = 4,
+        .branch_width = 2,
+        .top_k_per_node = 3,
+        .temperature = 0.0,
+        .enable_pruning = true,
+    });
+    defer eng.deinit(allocator);
+
+    spec_out[0] = try eng.prefill(&prompt, null);
+    const heap_before = try vmstat.Snapshot.capture();
+    var produced: usize = 1;
+    while (produced < n_gen) {
+        const rs = try eng.stepRound(null, spec_out[produced..n_gen]);
+        produced += rs.emitted_count;
+    }
+    const heap_after = try vmstat.Snapshot.capture();
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    const exact = std.mem.eql(u32, ref_out[0..n_gen], spec_out[0..n_gen]);
+    if (!exact) return error.LosslessMismatch;
+
+    return .{
+        .effective_placement = eng.effectivePlacement(),
+        .placement_gate_ane_us = sd.placement_gate_ane_us,
+        .placement_gate_gpu_us = sd.placement_gate_gpu_us,
+        .lossless_match = exact,
+        .generated_tokens = @intCast(n_gen),
+        .rounds = eng.stats.rounds,
+        .mean_accept_len = eng.stats.meanAcceptanceLength(),
+        .mean_drafted_nodes = eng.stats.meanDraftedNodes(),
+        .mean_verified_nodes = eng.stats.meanVerifiedNodes(),
+        .heap_delta = vmstat.heapDelta(heap_before, heap_after),
+        .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+    };
+}
+
+pub fn runM4WithConfig(allocator: std.mem.Allocator, config: M4Config) M4Error!M4Report {
+    const vm_before = try vmstat.Snapshot.capture();
+    var s3 = try aio.runSpikeS3(allocator, config.s3);
+    errdefer s3.deinit(allocator);
+    const s6 = try wavefront.runSpikeS6(allocator, config.s6);
+    const a2 = try predictor_mod.runPredictorBenchmark(allocator, config.a2);
+    var hybrid_prefill = try runHybridPrefillVsGpuBench(allocator, config);
+    errdefer hybrid_prefill.deinit(allocator);
+    const cold_synth = try runColdSynthBench(allocator, config.cold_temp_dir, config.cold_gen_tokens);
+    const d4_synth = try runD4SynthBench(allocator, config.d4_gen_tokens);
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .s3 = s3,
+        .s6 = s6,
+        .a2 = a2,
+        .hybrid_prefill = hybrid_prefill,
+        .cold_synth = cold_synth,
+        .d4_synth = d4_synth,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM4(allocator: std.mem.Allocator) M4Error!M4Report {
+    return runM4WithConfig(allocator, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Real-Checkpoint A2 Cross-Layer MoE Expert Predictor Evaluation (`bench-a2`)
+// ---------------------------------------------------------------------------
+
+pub const RealA2DeltaMetrics = struct {
+    delta: u32 = 0,
+    samples: u64 = 0,
+    ane_inmem_r8: f64 = 0.0,
+    ane_inmem_r12: f64 = 0.0,
+    ane_inmem_r16: f64 = 0.0,
+    ane_offline_r8: f64 = 0.0,
+    ane_offline_r12: f64 = 0.0,
+    ane_offline_r16: f64 = 0.0,
+    gpu_baseline_r8: f64 = 0.0,
+    gpu_baseline_r12: f64 = 0.0,
+    gpu_baseline_r16: f64 = 0.0,
+};
+
+pub const RealA2Options = struct {
+    capture_steps: u32 = 16,
+    max_lookahead: u32 = 3,
+    timed_iters: u32 = 32,
+    ane_predictor_path: ?[:0]const u8 = null,
+    verify_crcs: bool = true,
+    max_seq_len: u32 = 512,
+};
+
+pub const RealA2Report = struct {
+    num_layers: u32,
+    num_experts: u32,
+    top_k: u32,
+    hidden_size: u32,
+    capture_steps: u32,
+    max_lookahead: u32,
+    measured_gpu_layer_us: f64,
+    inmem_compile_ms: f64,
+    inmem_ane_us: f64,
+    inmem_uses_ne: bool,
+    inmem_zero_copy: bool,
+    has_offline_mlpackage: bool,
+    offline_compile_ms: f64,
+    offline_ane_us: f64,
+    offline_uses_ne: bool,
+    offline_zero_copy: bool,
+    gpu_lookahead_us: f64,
+    deltas: [predictor_mod.MAX_LOOKAHEAD]RealA2DeltaMetrics,
+    swapouts_delta: u64,
+    pageouts_delta: u64,
+
+    pub fn write(self: *const RealA2Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\Real-Checkpoint A2 ANE Cross-Layer MoE Expert Predictor Evaluation
+            \\real_a2.shape                    layers={d} experts={d} top_k={d} hidden={d} steps={d}
+            \\real_a2.gpu_layer_time_us        {d:.2}
+            \\real_a2.inmem_ane                compile_ms={d:.1} latency_us={d:.2} uses_ne={s} zero_copy={s}
+            \\real_a2.gpu_lookahead_us         {d:.2} (for {d} lookahead layers)
+            \\
+        , .{
+            self.num_layers,
+            self.num_experts,
+            self.top_k,
+            self.hidden_size,
+            self.capture_steps,
+            self.measured_gpu_layer_us,
+            self.inmem_compile_ms,
+            self.inmem_ane_us,
+            if (self.inmem_uses_ne) "yes" else "no",
+            if (self.inmem_zero_copy) "yes" else "no",
+            self.gpu_lookahead_us,
+            self.max_lookahead,
+        });
+        if (self.has_offline_mlpackage) {
+            try out.print(
+                \\real_a2.offline_mlpackage        compile_ms={d:.1} latency_us={d:.2} uses_ne={s} zero_copy={s}
+                \\
+            , .{
+                self.offline_compile_ms,
+                self.offline_ane_us,
+                if (self.offline_uses_ne) "yes" else "no",
+                if (self.offline_zero_copy) "yes" else "no",
+            });
+        }
+
+        try out.writeAll(
+            \\
+            \\delta  lead_us   inmem_ANE(R@8/12/16)       gpu_base(R@8/12/16)        w7_mlpkg(R@8/12/16)
+            \\
+        );
+        for (0..self.max_lookahead) |di| {
+            const d = self.deltas[di];
+            const lead_us = @as(f64, @floatFromInt(d.delta)) * self.measured_gpu_layer_us - self.inmem_ane_us;
+            if (self.has_offline_mlpackage) {
+                try out.print(
+                    \\{d: >5}  {d: >7.1}   {d:.3} / {d:.3} / {d:.3}      {d:.3} / {d:.3} / {d:.3}      {d:.3} / {d:.3} / {d:.3}
+                    \\
+                , .{
+                    d.delta,
+                    lead_us,
+                    d.ane_inmem_r8,
+                    d.ane_inmem_r12,
+                    d.ane_inmem_r16,
+                    d.gpu_baseline_r8,
+                    d.gpu_baseline_r12,
+                    d.gpu_baseline_r16,
+                    d.ane_offline_r8,
+                    d.ane_offline_r12,
+                    d.ane_offline_r16,
+                });
+            } else {
+                try out.print(
+                    \\{d: >5}  {d: >7.1}   {d:.3} / {d:.3} / {d:.3}      {d:.3} / {d:.3} / {d:.3}      n/a
+                    \\
+                , .{
+                    d.delta,
+                    lead_us,
+                    d.ane_inmem_r8,
+                    d.ane_inmem_r12,
+                    d.ane_inmem_r16,
+                    d.gpu_baseline_r8,
+                    d.gpu_baseline_r12,
+                    d.gpu_baseline_r16,
+                });
+            }
+        }
+        try out.print(
+            \\real_a2.swapouts_delta           {d}
+            \\real_a2.pageouts_delta           {d}
+            \\
+        , .{ self.swapouts_delta, self.pageouts_delta });
+    }
+};
+
+pub const RealA2Error = error{
+    InvalidConfig,
+} || qwen3.LoadError || qwen3.StepError || predictor_mod.AneExpertPredictor.Error || vmstat.Error || vmstat.SwapError;
+
+pub fn runRealA2Eval(
+    allocator: std.mem.Allocator,
+    amf_path: [:0]const u8,
+    cfg: qwen3.ModelConfig,
+    prompt_ids: []const u32,
+    opts: RealA2Options,
+) RealA2Error!RealA2Report {
+    if (cfg.arch != .qwen3_moe or cfg.num_hidden_layers < 2 or prompt_ids.len == 0 or
+        opts.capture_steps == 0 or opts.max_lookahead == 0 or opts.max_lookahead > predictor_mod.MAX_LOOKAHEAD or
+        opts.timed_iters == 0)
+    {
+        return error.InvalidConfig;
+    }
+
+    const max_la: u32 = @min(opts.max_lookahead, cfg.num_hidden_layers - 1);
+    const needed_seq: u32 = @intCast(prompt_ids.len + opts.capture_steps + 32);
+    const max_seq_len: u32 = @min(cfg.max_position_embeddings, @max(opts.max_seq_len, needed_seq));
+
+    var model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
+        .max_seq_len = max_seq_len,
+        .verify_crcs = opts.verify_crcs,
+    });
+    defer model.deinit(allocator);
+
+    const vm_before = try vmstat.Snapshot.capture();
+
+    // Prefill prompt tokens `0..len-1`.
+    var pos: u32 = 0;
+    for (prompt_ids[0 .. prompt_ids.len - 1]) |pid| {
+        try model.prefillToken(pid, pos);
+        pos += 1;
+    }
+
+    // Measure true GPU per-layer decode latency at current KV position (`prefillToken` = body only).
+    for (0..2) |_| try model.prefillToken(prompt_ids[prompt_ids.len - 1], pos);
+    const gl_t0 = try vmstat.nowNs();
+    const body_iters: u32 = 6;
+    for (0..body_iters) |_| try model.prefillToken(prompt_ids[prompt_ids.len - 1], pos);
+    const gl_t1 = try vmstat.nowNs();
+    const measured_gpu_layer_us: f64 = (@as(f64, @floatFromInt(gl_t1 -| gl_t0)) /
+        (@as(f64, @floatFromInt(body_iters)) * @as(f64, @floatFromInt(cfg.num_hidden_layers)))) / 1000.0;
+
+    // Capture real post-attention residual hidden states and exact GPU top-K routing across `capture_steps`.
+    const n_layers: usize = cfg.num_hidden_layers;
+    const h: usize = cfg.hidden_size;
+    const top_k: usize = cfg.num_experts_per_tok;
+    const n_exp: usize = cfg.num_experts;
+    const steps: usize = opts.capture_steps;
+
+    const hidden_trace = try allocator.alloc(f16, steps * n_layers * h);
+    defer allocator.free(hidden_trace);
+    const topk_trace = try allocator.alloc(u32, steps * n_layers * top_k);
+    defer allocator.free(topk_trace);
+
+    var cur_tok = prompt_ids[prompt_ids.len - 1];
+    for (0..steps) |s_idx| {
+        const h_dst = hidden_trace[s_idx * n_layers * h .. (s_idx + 1) * n_layers * h];
+        const k_dst = topk_trace[s_idx * n_layers * top_k .. (s_idx + 1) * n_layers * top_k];
+        cur_tok = try model.stepDecodeCaptureLayerRouting(cur_tok, pos, h_dst, k_dst);
+        pos += 1;
+    }
+
+    // Build in-memory folded-LayerNorm ANE expert predictor (`M = 1` decode shape).
+    var inmem_pred = try model.buildAnePredictor(allocator, max_la, 1, false, true, null);
+    defer inmem_pred.deinit(allocator);
+
+    // Optional offline W7 `.mlpackage` predictor (`M = 32` exported batch shape).
+    var offline_pred: ?*predictor_mod.AneExpertPredictor = null;
+    defer if (offline_pred) |p| p.deinit(allocator);
+    if (opts.ane_predictor_path) |p| {
+        offline_pred = try model.buildAnePredictor(allocator, max_la, 32, false, false, p);
+    }
+
+    var deltas: [predictor_mod.MAX_LOOKAHEAD]RealA2DeltaMetrics = @splat(.{});
+    for (0..max_la) |di| deltas[di].delta = @intCast(di + 1);
+
+    var bitsets: [predictor_mod.MAX_LOOKAHEAD]tree_mod.ExpertBitset = undefined;
+    var prefetches: [32]predictor_mod.PrefetchCandidate = undefined;
+    var logits_buf: [predictor_mod.MAX_EXPERTS]f32 = undefined;
+
+    var gpu_logits_storage: [predictor_mod.MAX_LOOKAHEAD][predictor_mod.MAX_EXPERTS]f32 = undefined;
+    var gpu_logits_slices: [predictor_mod.MAX_LOOKAHEAD][]f32 = undefined;
+    for (0..max_la) |di| gpu_logits_slices[di] = gpu_logits_storage[di][0..n_exp];
+
+    var inmem_zc = true;
+    var offline_zc = true;
+    var gpu_lookahead_ns_sum: u64 = 0;
+    var gpu_lookahead_full_calls: u64 = 0;
+
+    for (0..steps) |s_idx| {
+        for (0..n_layers - 1) |cur_l| {
+            const x_cur = hidden_trace[(s_idx * n_layers + cur_l) * h ..][0..h];
+
+            // 1) In-memory folded ANE predictor.
+            try inmem_pred.writeInputHiddenF16(x_cur, 1);
+            const pr_in = try inmem_pred.predictAhead(@intCast(cur_l), 1, 16, null, &bitsets, &prefetches);
+            inmem_zc = inmem_zc and pr_in.all_outputs_zero_copy;
+
+            // 2) Optional offline W7 `.mlpackage` predictor.
+            if (offline_pred) |op| {
+                try op.writeInputHiddenF16(x_cur, 1);
+                const pr_off = try op.predictAhead(@intCast(cur_l), 1, 16, null, &bitsets, &prefetches);
+                offline_zc = offline_zc and pr_off.all_outputs_zero_copy;
+            }
+
+            // 3) GPU router lookahead baseline.
+            const gpu_ns = try model.evalGpuRouterLookahead(x_cur, @intCast(cur_l), max_la, gpu_logits_slices[0..pr_in.predicted_layers]);
+            if (pr_in.predicted_layers == max_la) {
+                gpu_lookahead_ns_sum += gpu_ns;
+                gpu_lookahead_full_calls += 1;
+            }
+
+            for (0..pr_in.predicted_layers) |di| {
+                const target_l = cur_l + 1 + di;
+                const gt_topk = topk_trace[(s_idx * n_layers + target_l) * top_k ..][0..top_k];
+
+                try inmem_pred.copyLastLogitsF32(@intCast(cur_l), @intCast(di), 0, logits_buf[0..n_exp]);
+                deltas[di].ane_inmem_r8 += predictor_mod.computeRecallAtK(logits_buf[0..n_exp], gt_topk, 8);
+                deltas[di].ane_inmem_r12 += predictor_mod.computeRecallAtK(logits_buf[0..n_exp], gt_topk, 12);
+                deltas[di].ane_inmem_r16 += predictor_mod.computeRecallAtK(logits_buf[0..n_exp], gt_topk, 16);
+
+                if (offline_pred) |op| {
+                    try op.copyLastLogitsF32(@intCast(cur_l), @intCast(di), 0, logits_buf[0..n_exp]);
+                    deltas[di].ane_offline_r8 += predictor_mod.computeRecallAtK(logits_buf[0..n_exp], gt_topk, 8);
+                    deltas[di].ane_offline_r12 += predictor_mod.computeRecallAtK(logits_buf[0..n_exp], gt_topk, 12);
+                    deltas[di].ane_offline_r16 += predictor_mod.computeRecallAtK(logits_buf[0..n_exp], gt_topk, 16);
+                }
+
+                deltas[di].gpu_baseline_r8 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 8);
+                deltas[di].gpu_baseline_r12 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 12);
+                deltas[di].gpu_baseline_r16 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 16);
+                deltas[di].samples += 1;
+            }
+        }
+    }
+
+    for (0..max_la) |di| {
+        const denom: f64 = @floatFromInt(@max(deltas[di].samples, 1));
+        deltas[di].ane_inmem_r8 /= denom;
+        deltas[di].ane_inmem_r12 /= denom;
+        deltas[di].ane_inmem_r16 /= denom;
+        deltas[di].ane_offline_r8 /= denom;
+        deltas[di].ane_offline_r12 /= denom;
+        deltas[di].ane_offline_r16 /= denom;
+        deltas[di].gpu_baseline_r8 /= denom;
+        deltas[di].gpu_baseline_r12 /= denom;
+        deltas[di].gpu_baseline_r16 /= denom;
+    }
+
+    // Time steady-state ANE prediction latency (`inmem` & optional `offline`).
+    try inmem_pred.writeInputHiddenF16(hidden_trace[0..h], 1);
+    for (0..4) |_| _ = try inmem_pred.predictAhead(0, 1, 16, null, &bitsets, &prefetches);
+    const it0 = try vmstat.nowNs();
+    for (0..opts.timed_iters) |_| _ = try inmem_pred.predictAhead(0, 1, 16, null, &bitsets, &prefetches);
+    const it1 = try vmstat.nowNs();
+    const inmem_ane_us = (@as(f64, @floatFromInt(it1 -| it0)) / @as(f64, @floatFromInt(opts.timed_iters))) / 1000.0;
+
+    var offline_ane_us: f64 = 0.0;
+    if (offline_pred) |op| {
+        try op.writeInputHiddenF16(hidden_trace[0..h], 1);
+        for (0..4) |_| _ = try op.predictAhead(0, 1, 16, null, &bitsets, &prefetches);
+        const ot0 = try vmstat.nowNs();
+        for (0..opts.timed_iters) |_| _ = try op.predictAhead(0, 1, 16, null, &bitsets, &prefetches);
+        const ot1 = try vmstat.nowNs();
+        offline_ane_us = (@as(f64, @floatFromInt(ot1 -| ot0)) / @as(f64, @floatFromInt(opts.timed_iters))) / 1000.0;
+    }
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    const gpu_la_us = if (gpu_lookahead_full_calls > 0)
+        (@as(f64, @floatFromInt(gpu_lookahead_ns_sum)) / @as(f64, @floatFromInt(gpu_lookahead_full_calls))) / 1000.0
+    else
+        0.0;
+
+    return .{
+        .num_layers = cfg.num_hidden_layers,
+        .num_experts = cfg.num_experts,
+        .top_k = cfg.num_experts_per_tok,
+        .hidden_size = cfg.hidden_size,
+        .capture_steps = opts.capture_steps,
+        .max_lookahead = max_la,
+        .measured_gpu_layer_us = measured_gpu_layer_us,
+        .inmem_compile_ms = inmem_pred.totalCompileMs(),
+        .inmem_ane_us = inmem_ane_us,
+        .inmem_uses_ne = inmem_pred.usesNeuralEngine(),
+        .inmem_zero_copy = inmem_zc,
+        .has_offline_mlpackage = offline_pred != null,
+        .offline_compile_ms = if (offline_pred) |op| op.totalCompileMs() else 0.0,
+        .offline_ane_us = offline_ane_us,
+        .offline_uses_ne = if (offline_pred) |op| op.usesNeuralEngine() else false,
+        .offline_zero_copy = offline_zc,
+        .gpu_lookahead_us = gpu_la_us,
+        .deltas = deltas,
+        .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+        .pageouts_delta = vmstat.Snapshot.pageoutDelta(vm_before, vm_after),
+    };
+}
+
 test "bytesMovedPerDispatch matches exact algorithmic traffic and validates shapes" {
     // q4 (2048, 2048), M=1: w = 2048*1024 = 2097152, sb = 2048*32*4 = 262144, x = 4096, y = 4096
     const q4_gemv = try bytesMovedPerDispatch(.{ .kind = .gemv_q4, .m = 1, .n = 2048, .k = 2048 });
@@ -2961,4 +4000,89 @@ test "runM3WithConfig exercises Spike S4, Spike S5, L1 SAM latency, and syntheti
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Spike S5 Unique Active Experts") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "L1 Suffix Automaton Latency") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "spec_synth.lossless_match") != null);
+}
+
+test "runM4WithConfig exercises Spike S3, Spike S6, A2, A1/G6 hybrid prefill, cold NVMe decode and D4 small draft" {
+    const gpa = std.testing.allocator;
+    const s3_blobs = [_]usize{64 * 1024};
+    const s3_qds = [_]usize{ 1, 2 };
+    const s3_workers = [_]usize{2};
+    const hyb_lens = [_]u32{128};
+
+    var report = try runM4WithConfig(gpa, .{
+        .s3 = .{
+            .temp_dir = "/Volumes/Akari/.tmp",
+            .file_bytes = 512 * 1024,
+            .blob_sizes = &s3_blobs,
+            .queue_depths = &s3_qds,
+            .pread_workers = &s3_workers,
+            .io_policies = &.{.important},
+            .warmup_reads = 2,
+            .timed_reads = 4,
+            .require_zero_swap = true,
+            .timeout_ms = 10_000,
+        },
+        .s6 = .{
+            .hidden_size = 128,
+            .num_q_heads = 4,
+            .num_kv_heads = 2,
+            .head_dim = 64,
+            .chunk_tokens = 64,
+            .buckets = .{ 64, 128, 256, 512 },
+            .moe_intermediate_size = 128,
+            .num_experts = 8,
+            .top_k = 2,
+            .moe_bits = .q3,
+            .wavefront_chunks = 2,
+            .wavefront_layers = 2,
+            .gpu_attn_tile = 32,
+            .precision_sample_rows = 4,
+            .warmup_iters = 1,
+            .timed_iters = 2,
+            .timeout_ms = 10_000,
+        },
+        .a2 = .{
+            .num_layers = 4,
+            .num_experts = 16,
+            .hidden_size = 128,
+            .top_k = 4,
+            .lookahead_layers = 2,
+            .batch_tokens = 1,
+            .warmup_iters = 1,
+            .timed_iters = 4,
+        },
+        .hybrid_prompt_lens = &hyb_lens,
+        .hybrid_chunk_tokens = 64,
+        .hybrid_hidden_size = 128,
+        .hybrid_num_layers = 2,
+        .hybrid_num_q_heads = 4,
+        .hybrid_num_kv_heads = 2,
+        .hybrid_head_dim = 64,
+        .hybrid_moe_intermediate = 128,
+        .hybrid_num_experts = 8,
+        .hybrid_top_k = 2,
+        .hybrid_timed_iters = 1,
+        .cold_temp_dir = "/Volumes/Akari/.tmp",
+        .cold_gen_tokens = 4,
+        .d4_gen_tokens = 4,
+    });
+    defer report.deinit(gpa);
+
+    try std.testing.expectEqual(@as(u64, 0), report.s3.swapouts_delta);
+    try std.testing.expect(report.cold_synth.bit_exact);
+    try std.testing.expect(report.cold_synth.cold_wired_bytes < report.cold_synth.hot_wired_bytes);
+    try std.testing.expect(report.d4_synth.lossless_match);
+    try std.testing.expectEqual(@as(usize, 1), report.hybrid_prefill.results.len);
+    try std.testing.expect(report.hybrid_prefill.results[0].all_outputs_zero_copy);
+    try vmstat.checkNoSwap(report.vm_before, report.vm_after);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Spike S3 NVMe Direct-I/O Sweep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Spike S6 Hybrid ANE/GPU Wavefront Prefill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "A2 ANE Cross-Layer MoE Expert Predictor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "cold_synth.bit_exact_vs_hot") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "d4_synth.lossless_match") != null);
 }
