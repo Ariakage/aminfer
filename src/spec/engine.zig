@@ -1288,6 +1288,9 @@ pub const SpecEngine = struct {
         if (self.config.enable_pruning and self.draft_tree.count > 1) {
             const draft_us: f32 = @floatCast(@as(f64, @floatFromInt(draft_ns)) / 1000.0);
             _ = try self.pruneTreeInPlace(&self.draft_tree, draft_us, hard_cap);
+        } else if (self.draft_tree.count > hard_cap) {
+            self.eval_tree.copyTruncatedFrom(&self.draft_tree, max_allowed_depth, hard_cap);
+            self.draft_tree = self.eval_tree;
         }
         const t_prune_end = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         const prune_ns: u64 = @intCast(@max(@as(i96, 0), t_prune_start.durationTo(t_prune_end).toNanoseconds()));
