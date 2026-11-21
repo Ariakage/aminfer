@@ -27,6 +27,54 @@ const aio = @import("../storage/aio.zig");
 const cache_mod = @import("../storage/cache.zig");
 const wavefront = @import("../ane/wavefront.zig");
 const predictor_mod = @import("../ane/predictor.zig");
+const sme = @import("../cpu/sme.zig");
+const accept_mod = @import("../spec/accept.zig");
+const rng_mod = @import("../runtime/rng.zig");
+
+/// Execution backend selection for D7 speculative MoE tree router prediction (`C13`, `ADR-0018`).
+pub const SmeRouterMode = enum {
+    auto,
+    sme2,
+    gpu,
+
+    pub fn label(self: SmeRouterMode) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .sme2 => "sme2",
+            .gpu => "gpu",
+        };
+    }
+
+    pub fn parse(str: []const u8) error{InvalidSmeRouterMode}!SmeRouterMode {
+        if (std.mem.eql(u8, str, "auto")) return .auto;
+        if (std.mem.eql(u8, str, "sme2")) return .sme2;
+        if (std.mem.eql(u8, str, "gpu")) return .gpu;
+        return error.InvalidSmeRouterMode;
+    }
+};
+
+/// Active backend chosen by startup `C13` router calibration.
+pub const RouterPredBackend = enum {
+    gpu,
+    sme2,
+    sme2_single_owner,
+
+    pub fn label(self: RouterPredBackend) []const u8 {
+        return switch (self) {
+            .gpu => "gpu",
+            .sme2 => "sme2",
+            .sme2_single_owner => "sme2_single_owner",
+        };
+    }
+};
+
+pub const SmeRouterCalibration = struct {
+    backend: RouterPredBackend = .gpu,
+    sme2_us: f64 = 0.0,
+    gpu_us: f64 = 0.0,
+    bank_bytes: u64 = 0,
+    sampled_layers: u32 = 0,
+};
 
 /// Prompt prefill execution mode (`ADR-0010`, `A1`, `G6`).
 pub const PrefillMode = enum {
@@ -355,6 +403,10 @@ pub const LoadOptions = struct {
     hybrid_strategy: wavefront.StaticShapeStrategy = .bucketed_full_ane,
     /// Maximum static KV bucket length compiled for ANE hybrid prefill.
     hybrid_max_bucket: u32 = 4096,
+
+    // M4.5 Bare-Metal ARMv9 SME2 Engine & L2-Resident Tree Router Prediction (W15, C11-C13, ADR-0018)
+    /// Backend policy for D7 speculative MoE tree router prediction (`auto`, `sme2`, `gpu`).
+    sme_router_mode: SmeRouterMode = .auto,
 };
 
 pub const LoadError = error{
@@ -366,6 +418,7 @@ pub const LoadError = error{
     ColdExpertsRequireFile,
     InvalidHeatProfile,
     HybridPrefillUnsupported,
+    SmeCalibrationFailed,
     OutOfMemory,
 } || ModelConfig.ConfigError || amf.AmfFile.OpenError || quant.ShapeError ||
     sysinfo.Error || metal.WrapError || budget_mod.PlanError ||
@@ -373,7 +426,7 @@ pub const LoadError = error{
     moe.WorkspaceError || aio.EcorePoolError || cache_mod.PoolError ||
     cache_mod.CacheError || expert_mod.NvmeExpert.InitError || page.ShareError ||
     predictor_mod.AneExpertPredictor.Error || wavefront.WavefrontPrefill.InitError ||
-    wavefront.AneAttentionBucket.InitError;
+    wavefront.AneAttentionBucket.InitError || sme.Error || std.Thread.SpawnError;
 
 pub const StepError = error{
     TokenOutOfRange,
@@ -383,7 +436,8 @@ pub const StepError = error{
     HybridPrefillNotEnabled,
     WavefrontFailed,
 } || metal.Error || dequant.EncodeError || moe.EncodeError ||
-    cache_mod.CacheError || predictor_mod.AneExpertPredictor.Error;
+    cache_mod.CacheError || predictor_mod.AneExpertPredictor.Error ||
+    sme.Error || accept_mod.VerifyError;
 
 pub const VerifyTreeResult = struct {
     num_nodes: u32,
@@ -444,6 +498,11 @@ pub const LinearBinding = struct {
     k: u32,
     dtype: quant.WeightDType,
     alg_bytes: u64,
+    layout: amf.TensorLayout = .row_major,
+    param_kind: amf.QuantParamKind = .affine_scale_bias,
+    /// Zero-copy slice into the owning `WiredArena` shard when `layout == .sme2_panel64`
+    /// (single-owner invariant, ADR-0018 Safeguard B.2).
+    sme_packed: ?[]const u8 = null,
 };
 
 pub const NormBinding = struct {
@@ -454,6 +513,13 @@ pub const NormBinding = struct {
 const WeightShard = struct {
     arena: arena_mod.WiredArena,
     buffer: metal.Buffer,
+};
+
+const SmeExpertTriple = struct {
+    gate: []const u8,
+    up: []const u8,
+    down: []const u8,
+    is_cold: bool = false,
 };
 
 const LayerWeights = struct {
@@ -470,10 +536,19 @@ const LayerWeights = struct {
 
     // MoE-specific (valid when config.arch == .qwen3_moe)
     router: moe.RouterSource,
+    router_layout: amf.TensorLayout = .row_major,
+    router_param_kind: amf.QuantParamKind = .affine_scale_bias,
+    router_panel_dtype: ?sme.PanelDType = null,
+    /// Zero-copy slice into the owning `WiredArena` shard when `router_layout == .sme2_panel64`.
+    router_sme_packed: ?[]const u8 = null,
     expert_dtype: quant.WeightDType,
+    expert_layout: amf.TensorLayout = .row_major,
+    expert_param_kind: amf.QuantParamKind = .affine_scale_bias,
     expert_weights_buf: metal.Buffer,
     expert_table: metal.BufferBinding,
     expert_table_host: []moe.ExpertWeights,
+    /// Allocated only when `expert_layout == .sme2_panel64` (slices point zero-copy into shard arena).
+    expert_sme_blobs: ?[]SmeExpertTriple = null,
 
     // Dense-specific (valid when config.arch == .qwen3_dense)
     dense_gate: LinearBinding,
@@ -482,6 +557,43 @@ const LayerWeights = struct {
 
     // Bindless KV chunk table for this layer (`[num_chunks]KvTilePair` in scratch buffer)
     kv_tiles_binding: metal.BufferBinding,
+};
+
+/// Heap-pinned ARMv9 SME2 runtime state for single-owner `sme2_panel64` execution,
+/// L2-resident speculative tree router prediction (`C13`), and non-temporal `ldnt1b`
+/// cold-expert evaluation (`C12`). Preallocated once at startup; zero hot-path mallocs.
+const SmeRuntime = struct {
+    dispatcher: sme.SmeDispatcher,
+    x_f32_scratch: []f32,
+    x_act_u16_scratch: []align(sme.SVL_BYTES) u16,
+    router_logits_f32: []align(sme.SVL_BYTES) f32,
+    expert_up_f32: []align(sme.SVL_BYTES) f32,
+    expert_inter_u16: []align(sme.SVL_BYTES) u16,
+    expert_down_f32: []align(sme.SVL_BYTES) f32,
+    expert_acc_f32: []align(sme.SVL_BYTES) f32,
+
+    // L2-resident D7 router predictor bank (`null` arena when using single-owner `sme2_panel64` routers).
+    router_bank_arena: ?arena_mod.WiredArena,
+    router_bank_packed: []const u8,
+    router_bank_dtype: sme.PanelDType,
+    router_bank_sampled: u32,
+    router_bank_single_owner: bool,
+    router_pred_backend: RouterPredBackend,
+    router_pred_sme2_us: f64,
+    router_pred_gpu_us: f64,
+
+    fn deinit(self: *SmeRuntime, allocator: std.mem.Allocator) void {
+        if (self.router_bank_arena) |*a| a.deinit();
+        if (self.expert_acc_f32.len > 0) allocator.free(self.expert_acc_f32);
+        if (self.expert_down_f32.len > 0) allocator.free(self.expert_down_f32);
+        if (self.expert_inter_u16.len > 0) allocator.free(self.expert_inter_u16);
+        if (self.expert_up_f32.len > 0) allocator.free(self.expert_up_f32);
+        if (self.router_logits_f32.len > 0) allocator.free(self.router_logits_f32);
+        if (self.x_act_u16_scratch.len > 0) allocator.free(self.x_act_u16_scratch);
+        if (self.x_f32_scratch.len > 0) allocator.free(self.x_f32_scratch);
+        self.dispatcher.deinit();
+        allocator.destroy(self);
+    }
 };
 
 /// Heap-pinned cold-expert NVMe streaming + ANE predictor state (allocated once
@@ -677,15 +789,24 @@ pub const Qwen3Model = struct {
     layers: []LayerWeights,
 
     // Global weights (`lm_head` aliases `embed` directly when `tie_word_embeddings` is true)
+    embed_shard_idx: u16,
     embed: LinearBinding,
     final_norm: NormBinding,
     lm_head: LinearBinding,
 
     // Preallocated hot-path activation slices & bindings inside `scratch_arena`/`scratch_buf`
     x_host: []f16,
+    x_norm_host: []f16,
+    q_host: []f16,
+    k_host: []f16,
+    v_host: []f16,
+    attn_out_host: []f16,
+    proj_out_host: []f16,
+    logits_mut_host: []f16,
     logits_host: []const f16,
     out_token_ids_host: []u32,
     out_token_id_host: *u32,
+    last_logits_row: usize,
 
     x_bind: metal.BufferBinding,
     x_norm_bind: metal.BufferBinding,
@@ -728,6 +849,9 @@ pub const Qwen3Model = struct {
     pred_topk_base_off: u64,
     pred_topk_layer_stride: u64,
     pred_topk_host: []u32,
+    dense_gate_host: []f16,
+    dense_up_host: []f16,
+    dense_act_host: []f16,
     dense_gate_bind: metal.BufferBinding,
     dense_up_bind: metal.BufferBinding,
     dense_act_bind: metal.BufferBinding,
@@ -742,6 +866,11 @@ pub const Qwen3Model = struct {
     // M4 Cold-Expert NVMe Streaming + ANE Predictor & Hybrid Wavefront Prefill runtimes
     cold_rt: ?*ColdRuntime,
     hybrid_rt: ?*HybridPrefillRuntime,
+
+    // M4.5 Single-Owner SME2 Weight Ownership & L2-Resident Tree Router Runtime (`W15`, `C11`-`C13`)
+    has_sme2_weights: bool,
+    sme_router_mode: SmeRouterMode,
+    sme_rt: ?*SmeRuntime,
 
     pub fn loadFromBytes(
         allocator: std.mem.Allocator,
@@ -767,6 +896,10 @@ pub const Qwen3Model = struct {
 
     pub fn deinit(self: *Qwen3Model, allocator: std.mem.Allocator) void {
         self.compute.close();
+        if (self.sme_rt) |srt| {
+            srt.deinit(allocator);
+            self.sme_rt = null;
+        }
         if (self.hybrid_rt) |hrt| {
             hrt.deinit(allocator);
             self.hybrid_rt = null;
@@ -774,6 +907,9 @@ pub const Qwen3Model = struct {
         if (self.cold_rt) |crt| {
             crt.deinit(allocator);
             self.cold_rt = null;
+        }
+        for (self.layers) |layer| {
+            if (layer.expert_sme_blobs) |esb| allocator.free(esb);
         }
         self.moe_pipes.close();
         self.attn_pipes.close();
@@ -832,6 +968,87 @@ pub const Qwen3Model = struct {
 
     pub fn readLogitsF16(self: *const Qwen3Model) []const f16 {
         return self.logits_host[0..self.config.vocab_size];
+    }
+
+    /// Returns the most recently computed token's logits row (`[vocab_size]f16`),
+    /// tracking `last_logits_row` across single-token `stepDecode`, `prefillChunk`,
+    /// `verifyTree`, and `prefillHybridWavefront`.
+    pub fn readLastLogitsF16(self: *const Qwen3Model) []const f16 {
+        const v: usize = self.config.vocab_size;
+        return self.logits_host[self.last_logits_row * v .. (self.last_logits_row + 1) * v];
+    }
+
+    /// Samples a token from `readLastLogitsF16()` at `temperature > 0` using
+    /// caller-preallocated `p_res` scratch (`len >= vocab_size`) and `rng` (`D11`).
+    /// Zero dynamic heap allocation.
+    pub fn sampleFromLastLogits(
+        self: *const Qwen3Model,
+        temperature: f32,
+        rng: std.Random,
+        p_res: []f32,
+    ) accept_mod.VerifyError!u32 {
+        try accept_mod.softmaxRow(f16, self.readLastLogitsF16(), temperature, p_res);
+        return accept_mod.sampleCategorical(p_res[0..self.config.vocab_size], rng);
+    }
+
+    pub fn hasSme2Weights(self: *const Qwen3Model) bool {
+        return self.has_sme2_weights;
+    }
+
+    pub fn routerPredCalibration(self: *const Qwen3Model) SmeRouterCalibration {
+        const srt = self.sme_rt orelse return .{};
+        return .{
+            .backend = srt.router_pred_backend,
+            .sme2_us = srt.router_pred_sme2_us,
+            .gpu_us = srt.router_pred_gpu_us,
+            .bank_bytes = if (srt.router_bank_arena) |*a| a.bytes().len else 0,
+            .sampled_layers = srt.router_bank_sampled,
+        };
+    }
+
+    /// Evaluates one `sme2_panel64` SwiGLU expert (`gate_proj`, `up_proj`, `down_proj`)
+    /// on CPU SME2 with explicit `cache_hint` (`.non_temporal` emits `ldnt1*` to avoid
+    /// evicting hot L2 routers/activations during one-shot cold-expert digestion, `C12`/`C13`)
+    /// and fused `EpilogueOp.swiglu_gate_up` + optional `add_residual`. Zero heap allocations.
+    pub fn evalSwiGluExpertSme2(
+        dispatcher: *sme.SmeDispatcher,
+        dtype: sme.PanelDType,
+        param_kind: sme.QuantParamKind,
+        cache_hint: sme.CacheHint,
+        gate_packed: []const u8,
+        up_packed: []const u8,
+        down_packed: []const u8,
+        x_u16: []const u16,
+        up_f32_scratch: []f32,
+        inter_u16_scratch: []u16,
+        out_f32: []f32,
+        residual_f32: ?[]const f32,
+        m: usize,
+        hidden_size: usize,
+        inter_size: usize,
+    ) sme.Error!void {
+        const inter_out_dt: sme.OutputDType = if (dtype.activationIsBf16()) .bf16 else .f16;
+        try dispatcher.gemmF32(.{
+            .dtype = dtype,
+            .param_kind = param_kind,
+            .cache_hint = cache_hint,
+            .epilogue = .none,
+        }, x_u16, up_packed, null, up_f32_scratch, m, inter_size, hidden_size);
+
+        try dispatcher.gemm(.{
+            .dtype = dtype,
+            .param_kind = param_kind,
+            .cache_hint = cache_hint,
+            .epilogue = .swiglu_gate_up,
+            .out_dtype = inter_out_dt,
+        }, x_u16, gate_packed, up_f32_scratch[0 .. m * inter_size], std.mem.sliceAsBytes(inter_u16_scratch[0 .. m * inter_size]), m, inter_size, hidden_size);
+
+        try dispatcher.gemmF32(.{
+            .dtype = dtype,
+            .param_kind = param_kind,
+            .cache_hint = cache_hint,
+            .epilogue = if (residual_f32 != null) .add_residual else .none,
+        }, inter_u16_scratch[0 .. m * inter_size], down_packed, residual_f32, out_f32, m, hidden_size, inter_size);
     }
 
     /// Returns the unnormalized top-layer hidden state `[num_nodes * hidden_size]`
@@ -1072,6 +1289,14 @@ pub const Qwen3Model = struct {
         }
     }
 
+    fn matchesAuxTap(self: *const Qwen3Model, layer_idx: usize) bool {
+        if (!self.enable_feature_taps) return false;
+        for (self.aux_layer_ids) |tap_l| {
+            if (layer_idx == tap_l) return true;
+        }
+        return false;
+    }
+
     fn encodeAuxTapIfMatched(
         self: *const Qwen3Model,
         frame: *metal.Compute.Frame,
@@ -1099,6 +1324,9 @@ pub const Qwen3Model = struct {
     }
 
     fn runStep(self: *Qwen3Model, token_id: u32, pos: u32, skip_lm_head: bool) StepError!u32 {
+        if (self.has_sme2_weights) {
+            return self.runStepHeterogeneous(token_id, pos, skip_lm_head);
+        }
         if (self.cold_rt != null) {
             return self.runStepCold(token_id, pos, skip_lm_head);
         }
@@ -1262,6 +1490,7 @@ pub const Qwen3Model = struct {
         const sig = try frame.commit();
         try self.compute.wait(sig, self.timeout_ms);
         self.seq_len = cur_seq_len;
+        if (!skip_lm_head) self.last_logits_row = 0;
         return if (skip_lm_head) 0 else self.out_token_id_host.*;
     }
 
@@ -1277,6 +1506,9 @@ pub const Qwen3Model = struct {
         base_pos: u32,
         compute_logits: bool,
     ) StepError!VerifyTreeResult {
+        if (self.has_sme2_weights) {
+            return self.verifyTreeHeterogeneous(token_ids, positions, ancestor_masks, base_pos, compute_logits);
+        }
         if (self.cold_rt != null) {
             return self.verifyTreeCold(token_ids, positions, ancestor_masks, base_pos, compute_logits);
         }
@@ -1452,6 +1684,7 @@ pub const Qwen3Model = struct {
 
         const sig = try frame.commit();
         try self.compute.wait(sig, self.timeout_ms);
+        if (compute_logits) self.last_logits_row = @as(usize, m) - 1;
 
         var total_unique: u64 = 0;
         if (self.config.arch == .qwen3_moe) {
@@ -1710,10 +1943,25 @@ pub const Qwen3Model = struct {
     }
 
     /// Embedding-based expert prediction for tree token IDs across up to
-    /// `MAX_EXPERT_PRED_LAYERS` evenly spaced target layers in a single Metal 4 frame.
-    /// Works uniformly for root, L1, L2 internal, and unexpanded leaf nodes with zero
-    /// dynamic heap allocation.
+    /// `MAX_EXPERT_PRED_LAYERS` evenly spaced target layers (`D7`, `C13`).
+    /// Dispatches to the L2-resident ARMv9 SME2 router bank (zero Metal 4
+    /// command-buffer round-trip) when calibrated/enabled, otherwise runs in a
+    /// single Metal 4 GPU frame. Zero dynamic heap allocation.
     pub fn predictMoEExpertsForTokens(
+        self: *Qwen3Model,
+        token_ids: []const u32,
+        out_bitsets: []tree_mod.ExpertBitset,
+    ) StepError!u32 {
+        if (self.sme_rt) |srt| {
+            if (srt.router_pred_backend != .gpu) {
+                return self.predictMoEExpertsForTokensSme2(token_ids, out_bitsets);
+            }
+        }
+        return self.predictMoEExpertsForTokensGpu(token_ids, out_bitsets);
+    }
+
+    /// Explicit GPU Metal 4 path for `predictMoEExpertsForTokens` (baseline & M1–M3 fallback).
+    pub fn predictMoEExpertsForTokensGpu(
         self: *Qwen3Model,
         token_ids: []const u32,
         out_bitsets: []tree_mod.ExpertBitset,
@@ -1746,6 +1994,929 @@ pub const Qwen3Model = struct {
 
         self.unpackPredictedBitsets(m, sampled, out_bitsets);
         return sampled;
+    }
+
+    fn lookupEmbeddingsCpuF32(self: *const Qwen3Model, token_ids: []const u32, out_f32: []f32) StepError!void {
+        const h: usize = self.config.hidden_size;
+        const shard_bytes = self.shards[self.embed_shard_idx].arena.bytes();
+        const w_off: usize = @intCast(self.embed.weight.offset);
+
+        switch (self.embed.dtype) {
+            .f16 => {
+                for (token_ids, 0..) |tid, r| {
+                    const row_off = w_off + @as(usize, tid) * h * @sizeOf(f16);
+                    const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, shard_bytes[row_off .. row_off + h * 2]));
+                    const dst = out_f32[r * h .. (r + 1) * h];
+                    for (0..h) |c| dst[c] = @floatCast(src[c]);
+                }
+            },
+            .bf16 => {
+                for (token_ids, 0..) |tid, r| {
+                    const row_off = w_off + @as(usize, tid) * h * @sizeOf(u16);
+                    const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, shard_bytes[row_off .. row_off + h * 2]));
+                    const dst = out_f32[r * h .. (r + 1) * h];
+                    for (0..h) |c| dst[c] = quant.bf16ToF32(src[c]);
+                }
+            },
+            .q4_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                const groups = h / 64;
+                const row_bytes = groups * Ops.groupWeightBytes();
+                const sb_off: usize = @intCast(self.embed.scale_bias.?.offset);
+                for (token_ids, 0..) |tid, r| {
+                    const row_w = w_off + @as(usize, tid) * row_bytes;
+                    const row_sb = sb_off + @as(usize, tid) * groups * @sizeOf(quant.ScaleBias);
+                    const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                        quant.ScaleBias,
+                        shard_bytes[row_sb .. row_sb + groups * @sizeOf(quant.ScaleBias)],
+                    ));
+                    const dst = out_f32[r * h .. (r + 1) * h];
+                    for (0..groups) |g| {
+                        const goff = row_w + g * Ops.groupWeightBytes();
+                        Ops.dequantizeGroup(shard_bytes[goff..][0..Ops.groupWeightBytes()], sbs[g], dst[g * 64 ..][0..64]);
+                    }
+                }
+            },
+            .q3_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                const groups = h / 64;
+                const row_bytes = groups * Ops.groupWeightBytes();
+                const sb_off: usize = @intCast(self.embed.scale_bias.?.offset);
+                for (token_ids, 0..) |tid, r| {
+                    const row_w = w_off + @as(usize, tid) * row_bytes;
+                    const row_sb = sb_off + @as(usize, tid) * groups * @sizeOf(quant.ScaleBias);
+                    const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                        quant.ScaleBias,
+                        shard_bytes[row_sb .. row_sb + groups * @sizeOf(quant.ScaleBias)],
+                    ));
+                    const dst = out_f32[r * h .. (r + 1) * h];
+                    for (0..groups) |g| {
+                        const goff = row_w + g * Ops.groupWeightBytes();
+                        Ops.dequantizeGroup(shard_bytes[goff..][0..Ops.groupWeightBytes()], sbs[g], dst[g * 64 ..][0..64]);
+                    }
+                }
+            },
+        }
+    }
+
+    fn selectTopKBitset(logits: []const f32, top_k: u32) tree_mod.ExpertBitset {
+        var best_idx: [moe.MAX_TOP_K]u32 = @splat(0);
+        var best_val: [moe.MAX_TOP_K]f32 = @splat(-std.math.inf(f32));
+        const k: usize = @intCast(@min(top_k, moe.MAX_TOP_K));
+        for (logits, 0..) |v, ei| {
+            if (v > best_val[k - 1]) {
+                var pos: usize = k - 1;
+                while (pos > 0 and v > best_val[pos - 1]) : (pos -= 1) {
+                    best_val[pos] = best_val[pos - 1];
+                    best_idx[pos] = best_idx[pos - 1];
+                }
+                best_val[pos] = v;
+                best_idx[pos] = @intCast(ei);
+            }
+        }
+        var bs = tree_mod.ExpertBitset.empty();
+        for (0..k) |j| {
+            if (best_idx[j] < tree_mod.ExpertBitset.MAX_EXPERTS) {
+                bs.set(best_idx[j]);
+            }
+        }
+        return bs;
+    }
+
+    /// L2-resident ARMv9 SME2 path for `predictMoEExpertsForTokens` (`C13`):
+    /// reads token embeddings directly from unified wired RAM, normalizes in registers,
+    /// and executes the sampled layers' router gates on P-core SME2 with ZERO Metal 4
+    /// command-buffer round-trip and ZERO dynamic heap allocation.
+    pub fn predictMoEExpertsForTokensSme2(
+        self: *Qwen3Model,
+        token_ids: []const u32,
+        out_bitsets: []tree_mod.ExpertBitset,
+    ) StepError!u32 {
+        if (self.config.arch != .qwen3_moe or token_ids.len == 0) return 0;
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (token_ids.len > self.max_tree_nodes) return error.TreeTooLarge;
+        const srt = self.sme_rt orelse return self.predictMoEExpertsForTokensGpu(token_ids, out_bitsets);
+        const m: usize = token_ids.len;
+        const sampled: u32 = @min(self.config.num_hidden_layers, MAX_EXPERT_PRED_LAYERS);
+        if (out_bitsets.len < m * sampled) return error.InvalidArgument;
+        for (token_ids) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
+
+        const h: usize = self.config.hidden_size;
+        const n_exp: usize = self.config.num_experts;
+        const top_k: u32 = self.config.num_experts_per_tok;
+        const n_layers: usize = self.layers.len;
+
+        const x_f32 = srt.x_f32_scratch[0 .. m * h];
+        try self.lookupEmbeddingsCpuF32(token_ids, x_f32);
+
+        var inv_rms_buf: [attention.MAX_TREE_NODES]f32 = undefined;
+        const inv_h: f32 = 1.0 / @as(f32, @floatFromInt(h));
+        for (0..m) |r| {
+            const row = x_f32[r * h .. (r + 1) * h];
+            var sum_sq: f32 = 0.0;
+            for (row) |v| sum_sq += v * v;
+            inv_rms_buf[r] = 1.0 / @sqrt(sum_sq * inv_h + self.config.rms_norm_eps);
+        }
+
+        if (!srt.router_bank_single_owner and srt.router_bank_packed.len > 0) {
+            // Single stacked `[sampled * num_experts, H]` f16/bf16 `sme2_panel64` GEMM across
+            // all sampled layers (post_attention_layernorm folded into weights).
+            const x_act = srt.x_act_u16_scratch[0 .. m * h];
+            const act_fdt: quant.FloatDType = if (srt.router_bank_dtype.activationIsBf16()) .bf16 else .f16;
+            for (0..m) |r| {
+                const row = x_f32[r * h .. (r + 1) * h];
+                const dst = x_act[r * h .. (r + 1) * h];
+                const scale = inv_rms_buf[r];
+                for (0..h) |c| dst[c] = quant.f32ToFloatBits(act_fdt, row[c] * scale);
+            }
+            const total_n: usize = @as(usize, sampled) * n_exp;
+            const logits_out = srt.router_logits_f32[0 .. m * total_n];
+            try srt.dispatcher.gemmF32(.{
+                .dtype = srt.router_bank_dtype,
+                .param_kind = .affine_scale_bias,
+                .cache_hint = .temporal,
+            }, x_act, srt.router_bank_packed, null, logits_out, m, total_n, h);
+
+            for (0..m) |r| {
+                for (0..sampled) |s| {
+                    const row_logits = logits_out[(r * sampled + s) * n_exp ..][0..n_exp];
+                    out_bitsets[r * sampled + s] = selectTopKBitset(row_logits, top_k);
+                }
+            }
+            return sampled;
+        }
+
+        // Single-owner `sme2_panel64` router path: read each sampled layer's `.amf` router
+        // blob directly from `WiredArena` with ZERO duplicate RAM copies!
+        const logits_out = srt.router_logits_f32[0 .. m * n_exp];
+        const x_act = srt.x_act_u16_scratch[0 .. m * h];
+        for (0..sampled) |s| {
+            const l_idx: usize = if (sampled == n_layers) s else (s * (n_layers - 1)) / (sampled - 1);
+            const layer = self.layers[l_idx];
+            const pdt = layer.router_panel_dtype orelse return error.InvalidDType;
+            const packed_w = layer.router_sme_packed orelse return error.InvalidArgument;
+            const act_fdt: quant.FloatDType = if (pdt.activationIsBf16()) .bf16 else .f16;
+
+            const shard_bytes = self.shards[layer.shard_idx].arena.bytes();
+            const ln_off: usize = @intCast(layer.post_attention_layernorm.binding.offset);
+            const ln_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, shard_bytes[ln_off .. ln_off + h * 2]));
+
+            for (0..m) |r| {
+                const row = x_f32[r * h .. (r + 1) * h];
+                const dst = x_act[r * h .. (r + 1) * h];
+                const scale = inv_rms_buf[r];
+                for (0..h) |c| {
+                    const w_ln = quant.floatBitsToF32(layer.post_attention_layernorm.dtype, ln_u16[c]);
+                    dst[c] = quant.f32ToFloatBits(act_fdt, row[c] * scale * w_ln);
+                }
+            }
+
+            try srt.dispatcher.gemmF32(.{
+                .dtype = pdt,
+                .param_kind = amfParamKindToSme(layer.router_param_kind),
+                .cache_hint = .temporal,
+            }, x_act, packed_w, null, logits_out, m, n_exp, h);
+
+            for (0..m) |r| {
+                out_bitsets[r * sampled + s] = selectTopKBitset(logits_out[r * n_exp ..][0..n_exp], top_k);
+            }
+        }
+        return sampled;
+    }
+
+    // -----------------------------------------------------------------------
+    // M4.5 Single-Owner Heterogeneous CPU SME2 + Metal GPU Execution (W15, C12-C13)
+    // -----------------------------------------------------------------------
+
+    fn runLinearSme2(
+        self: *Qwen3Model,
+        lin: LinearBinding,
+        x_f16: []const f16,
+        y_f16: []f16,
+        m: u32,
+        cache_hint: sme.CacheHint,
+    ) StepError!void {
+        const srt = self.sme_rt.?;
+        const pdt = weightDTypeToPanelDType(lin.dtype);
+        const packed_w = lin.sme_packed.?;
+        const m_u: usize = m;
+        const k_u: usize = lin.k;
+        const n_u: usize = lin.n;
+        const a_u16: []const u16 = if (pdt.activationIsBf16()) blk: {
+            const dst = srt.x_act_u16_scratch[0 .. m_u * k_u];
+            for (0..m_u * k_u) |i| {
+                dst[i] = quant.f32ToBf16(@floatCast(x_f16[i]));
+            }
+            break :blk dst;
+        } else @alignCast(std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(x_f16[0 .. m_u * k_u])));
+
+        try srt.dispatcher.gemm(.{
+            .dtype = pdt,
+            .param_kind = amfParamKindToSme(lin.param_kind),
+            .cache_hint = cache_hint,
+            .epilogue = .none,
+            .out_dtype = .f16,
+        }, a_u16, packed_w, null, std.mem.sliceAsBytes(y_f16[0 .. m_u * n_u]), m_u, n_u, k_u);
+    }
+
+    fn runRouterSme2(
+        self: *Qwen3Model,
+        layer: LayerWeights,
+        x_f16: []const f16,
+        out_logits_f32: []f32,
+        m: u32,
+    ) StepError!void {
+        const srt = self.sme_rt.?;
+        const pdt = layer.router_panel_dtype.?;
+        const packed_w = layer.router_sme_packed.?;
+        const m_u: usize = m;
+        const h: usize = self.config.hidden_size;
+        const n_exp: usize = self.config.num_experts;
+        const a_u16: []const u16 = if (pdt.activationIsBf16()) blk: {
+            const dst = srt.x_act_u16_scratch[0 .. m_u * h];
+            for (0..m_u * h) |i| {
+                dst[i] = quant.f32ToBf16(@floatCast(x_f16[i]));
+            }
+            break :blk dst;
+        } else @alignCast(std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(x_f16[0 .. m_u * h])));
+
+        try srt.dispatcher.gemmF32(.{
+            .dtype = pdt,
+            .param_kind = amfParamKindToSme(layer.router_param_kind),
+            .cache_hint = .temporal,
+        }, a_u16, packed_w, null, out_logits_f32[0 .. m_u * n_exp], m_u, n_exp, h);
+    }
+
+    /// Executes `sme2_panel64` MoE experts directly on CPU SME2 over unified shared
+    /// memory using `.temporal` (`ld1*`) for hot experts and `.non_temporal` (`ldnt1*`)
+    /// for cold experts (`C12`/`C13`), adding the weighted SwiGLU sum into `self.x_host`.
+    /// Returns the measured unique active expert count across the `m` tokens.
+    fn runMoeExpertsSme2(
+        self: *Qwen3Model,
+        layer: LayerWeights,
+        router_logits_f32: []const f32,
+        x_norm_f16: []const f16,
+        x_residual_io: []f16,
+        m: u32,
+    ) StepError!u32 {
+        const srt = self.sme_rt.?;
+        const experts = layer.expert_sme_blobs.?;
+        const pdt = weightDTypeToPanelDType(layer.expert_dtype);
+        const pkind = amfParamKindToSme(layer.expert_param_kind);
+        const m_u: usize = m;
+        const h: usize = self.config.hidden_size;
+        const inter: usize = self.config.moe_intermediate_size;
+        const n_exp: usize = self.config.num_experts;
+        const top_k: usize = self.config.num_experts_per_tok;
+
+        var used_mask = tree_mod.ExpertBitset.empty();
+        var tok_top_e: [attention.MAX_TREE_NODES][moe.MAX_TOP_K]u32 = undefined;
+        var tok_top_w: [attention.MAX_TREE_NODES][moe.MAX_TOP_K]f32 = undefined;
+
+        for (0..m_u) |r| {
+            const row = router_logits_f32[r * n_exp ..][0..n_exp];
+            var max_v: f32 = -std.math.inf(f32);
+            for (row) |v| {
+                if (v > max_v) max_v = v;
+            }
+            var sum_exp: f64 = 0.0;
+            var probs: [moe.MAX_EXPERTS]f32 = undefined;
+            for (row, 0..) |v, e| {
+                const p = @exp(@as(f64, v - max_v));
+                probs[e] = @floatCast(p);
+                sum_exp += p;
+            }
+            const inv_sum: f64 = if (sum_exp > 0.0) 1.0 / sum_exp else 0.0;
+            for (0..n_exp) |e| probs[e] = @floatCast(@as(f64, probs[e]) * inv_sum);
+
+            var best_e: [moe.MAX_TOP_K]u32 = @splat(0);
+            var best_p: [moe.MAX_TOP_K]f32 = @splat(-std.math.inf(f32));
+            for (0..n_exp) |e| {
+                const p = probs[e];
+                if (p > best_p[top_k - 1]) {
+                    var pos: usize = top_k - 1;
+                    while (pos > 0 and p > best_p[pos - 1]) : (pos -= 1) {
+                        best_p[pos] = best_p[pos - 1];
+                        best_e[pos] = best_e[pos - 1];
+                    }
+                    best_p[pos] = p;
+                    best_e[pos] = @intCast(e);
+                }
+            }
+            if (self.config.norm_topk_prob) {
+                var w_sum: f64 = 0.0;
+                for (0..top_k) |j| w_sum += @as(f64, best_p[j]);
+                const inv_w: f64 = if (w_sum > 0.0) 1.0 / w_sum else 0.0;
+                for (0..top_k) |j| best_p[j] = @floatCast(@as(f64, best_p[j]) * inv_w);
+            }
+            for (0..top_k) |j| {
+                tok_top_e[r][j] = best_e[j];
+                tok_top_w[r][j] = best_p[j];
+                used_mask.set(best_e[j]);
+            }
+        }
+
+        // Convert `x_norm_f16` once into the activation dtype expected by `pdt`,
+        // and initialize FP32 residual accumulator from `x_residual_io`.
+        const x_act_all = srt.x_act_u16_scratch[0 .. m_u * h];
+        const act_fdt: quant.FloatDType = if (pdt.activationIsBf16()) .bf16 else .f16;
+        for (0..m_u * h) |i| {
+            x_act_all[i] = quant.f32ToFloatBits(act_fdt, @floatCast(x_norm_f16[i]));
+            srt.expert_acc_f32[i] = @floatCast(x_residual_io[i]);
+        }
+
+        // Deduplicated per-expert evaluation: each unique active expert is streamed ONCE!
+        var active_rows: [attention.MAX_TREE_NODES]usize = undefined;
+        var active_weights: [attention.MAX_TREE_NODES]f32 = undefined;
+        for (0..n_exp) |eid| {
+            if (!used_mask.contains(@intCast(eid))) continue;
+            var cnt: usize = 0;
+            for (0..m_u) |r| {
+                for (0..top_k) |j| {
+                    if (tok_top_e[r][j] == eid) {
+                        active_rows[cnt] = r;
+                        active_weights[cnt] = tok_top_w[r][j];
+                        cnt += 1;
+                    }
+                }
+            }
+            if (cnt == 0) continue;
+
+            // Gather this expert's rows into contiguous `x_f32_scratch` (reinterpreted as u16)
+            // or slice directly when `cnt == 1` (`M = 1` decode zero-copy fast path!).
+            const e_triple = experts[eid];
+            const hint: sme.CacheHint = if (e_triple.is_cold) .non_temporal else .temporal;
+            if (cnt == 1) {
+                const r = active_rows[0];
+                try evalSwiGluExpertSme2(
+                    &srt.dispatcher,
+                    pdt,
+                    pkind,
+                    hint,
+                    e_triple.gate,
+                    e_triple.up,
+                    e_triple.down,
+                    x_act_all[r * h .. (r + 1) * h],
+                    srt.expert_up_f32[0..inter],
+                    srt.expert_inter_u16[0..inter],
+                    srt.expert_down_f32[0..h],
+                    null,
+                    1,
+                    h,
+                    inter,
+                );
+                const w = active_weights[0];
+                const acc_row = srt.expert_acc_f32[r * h .. (r + 1) * h];
+                for (0..h) |c| acc_row[c] += w * srt.expert_down_f32[c];
+            } else {
+                // Pack `cnt` active token rows into `srt.x_f32_scratch` raw bytes (`cnt * h * 2 <= m * h * 4`).
+                const x_gather: []u16 = @alignCast(std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(srt.x_f32_scratch))[0 .. cnt * h]);
+                for (0..cnt) |ci| {
+                    const r = active_rows[ci];
+                    @memcpy(x_gather[ci * h .. (ci + 1) * h], x_act_all[r * h .. (r + 1) * h]);
+                }
+                try evalSwiGluExpertSme2(
+                    &srt.dispatcher,
+                    pdt,
+                    pkind,
+                    hint,
+                    e_triple.gate,
+                    e_triple.up,
+                    e_triple.down,
+                    x_gather,
+                    srt.expert_up_f32[0 .. cnt * inter],
+                    srt.expert_inter_u16[0 .. cnt * inter],
+                    srt.expert_down_f32[0 .. cnt * h],
+                    null,
+                    cnt,
+                    h,
+                    inter,
+                );
+                for (0..cnt) |ci| {
+                    const r = active_rows[ci];
+                    const w = active_weights[ci];
+                    const acc_row = srt.expert_acc_f32[r * h .. (r + 1) * h];
+                    const dn_row = srt.expert_down_f32[ci * h .. (ci + 1) * h];
+                    for (0..h) |c| acc_row[c] += w * dn_row[c];
+                }
+            }
+        }
+
+        for (0..m_u * h) |i| {
+            x_residual_io[i] = @floatCast(srt.expert_acc_f32[i]);
+        }
+        return used_mask.count();
+    }
+
+    fn flushOptionalFrame(self: *Qwen3Model, frame_opt: *?metal.Compute.Frame) StepError!void {
+        if (frame_opt.*) |*f| {
+            const sig = try f.commit();
+            frame_opt.* = null;
+            try self.compute.wait(sig, self.timeout_ms);
+        }
+    }
+
+    fn ensureOptionalFrame(self: *Qwen3Model, frame_opt: *?metal.Compute.Frame) StepError!*metal.Compute.Frame {
+        if (frame_opt.* == null) {
+            frame_opt.* = try self.compute.beginFrame(self.timeout_ms);
+        }
+        return &(frame_opt.*.?);
+    }
+
+    fn execLinearHetero(
+        self: *Qwen3Model,
+        frame_opt: *?metal.Compute.Frame,
+        lin: LinearBinding,
+        x_bind: metal.BufferBinding,
+        x_host: []const f16,
+        y_bind: metal.BufferBinding,
+        y_host: []f16,
+        m: u32,
+        barrier_if_gpu: bool,
+    ) StepError!bool {
+        if (lin.layout == .sme2_panel64) {
+            try self.flushOptionalFrame(frame_opt);
+            try self.runLinearSme2(lin, x_host, y_host, m, .temporal);
+            return false;
+        }
+        const had_frame = (frame_opt.* != null);
+        const f = try self.ensureOptionalFrame(frame_opt);
+        try self.encodeLinearBatched(f, lin, x_bind, y_bind, m, had_frame and barrier_if_gpu);
+        return true;
+    }
+
+    fn runStepHeterogeneous(self: *Qwen3Model, token_id: u32, pos: u32, skip_lm_head: bool) StepError!u32 {
+        if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
+        if (pos >= self.max_seq_len) return error.PositionOutOfRange;
+
+        const cur_seq_len: u32 = pos + 1;
+        const chunk_idx: usize = @intCast(pos / self.chunk_tokens);
+        const h: u32 = self.config.hidden_size;
+
+        var frame_opt: ?metal.Compute.Frame = null;
+        errdefer if (frame_opt) |*f| f.abort();
+
+        {
+            const f = try self.ensureOptionalFrame(&frame_opt);
+            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+                .weight = self.embed.weight,
+                .scale_bias = self.embed.scale_bias,
+                .tokens = .{ .token_id = token_id },
+                .out = self.x_bind,
+                .m = 1,
+                .vocab_size = self.config.vocab_size,
+                .hidden_size = h,
+            }, false);
+        }
+
+        for (self.layers, 0..) |layer, l| {
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = layer.input_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.input_layernorm.dtype,
+                }, had);
+            }
+
+            _ = try self.execLinearHetero(&frame_opt, layer.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, 1, true);
+            _ = try self.execLinearHetero(&frame_opt, layer.k_proj, self.x_norm_bind, self.x_norm_host, self.k_bind, self.k_host, 1, false);
+            _ = try self.execLinearHetero(&frame_opt, layer.v_proj, self.x_norm_bind, self.x_norm_host, self.v_bind, self.v_host, 1, false);
+
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                const kv_pair = self.kvTileAt(l, chunk_idx);
+                try self.attn_pipes.encodeQkNormRopeKvWrite(f, .{
+                    .q = self.q_bind,
+                    .k = self.k_bind,
+                    .v = self.v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .k_tile = kv_pair.k,
+                    .v_tile = kv_pair.v,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .pos = pos,
+                    .chunk_tokens = self.chunk_tokens,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, had);
+                try self.attn_pipes.encodeGqaDecodeAttn(f, .{
+                    .q = self.q_bind,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .out = self.attn_out_bind,
+                    .scratch = self.gqa_scratch_bind,
+                    .max_splits = attention.MAX_SPLITS,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .seq_len = cur_seq_len,
+                    .chunk_tokens = self.chunk_tokens,
+                }, true);
+            }
+
+            _ = try self.execLinearHetero(&frame_opt, layer.o_proj, self.attn_out_bind, self.attn_out_host, self.proj_out_bind, self.proj_out_host, 1, true);
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.moe_pipes.encodeResidualAdd(f, .{
+                    .x = self.x_bind,
+                    .delta = self.proj_out_bind,
+                    .count = h,
+                }, had);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
+                }, true);
+            }
+
+            switch (self.config.arch) {
+                .qwen3_moe => {
+                    const ws = &(self.moe_ws.?);
+                    const router_src: moe.RouterSource = if (layer.router_layout == .sme2_panel64) blk: {
+                        try self.flushOptionalFrame(&frame_opt);
+                        try self.runRouterSme2(layer, self.x_norm_host, ws.router_logits, 1);
+                        break :blk .{ .logits = .{ .binding = ws.routerLogitsBinding(self.scratch_buf), .dtype = .f32 } };
+                    } else layer.router;
+
+                    if (layer.expert_layout == .sme2_panel64) {
+                        if (layer.router_layout == .row_major) {
+                            const had = (frame_opt != null);
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.encodeLayerRouter(f, l, ws, self.scratch_buf, self.x_norm_bind, 1, had);
+                            try self.flushOptionalFrame(&frame_opt);
+                        }
+                        _ = try self.runMoeExpertsSme2(layer, ws.router_logits, self.x_norm_host, self.x_host, 1);
+                    } else {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        const moe_args: moe.MoELayerArgs = .{
+                            .x = self.x_norm_bind,
+                            .router = router_src,
+                            .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                            .expert_table = layer.expert_table,
+                            .workspace = ws,
+                            .workspace_buf = self.scratch_buf,
+                            .residual = self.x_bind,
+                            .out = self.x_bind,
+                            .m = 1,
+                            .num_experts = self.config.num_experts,
+                            .top_k = self.config.num_experts_per_tok,
+                            .hidden_size = h,
+                            .intermediate_size = self.config.moe_intermediate_size,
+                            .norm_topk_prob = self.config.norm_topk_prob,
+                        };
+                        switch (layer.expert_dtype) {
+                            .q3_affine => try self.moe_pipes.encodeMoELayer(f, .q3, moe_args, had),
+                            .q4_affine => try self.moe_pipes.encodeMoELayer(f, .q4, moe_args, had),
+                            .f16 => try self.moe_pipes.encodeMoELayerFloat(f, .f16, moe_args, had),
+                            .bf16 => try self.moe_pipes.encodeMoELayerFloat(f, .bf16, moe_args, had),
+                        }
+                    }
+                },
+                .qwen3_dense => {
+                    _ = try self.execLinearHetero(&frame_opt, layer.dense_gate, self.x_norm_bind, self.x_norm_host, self.dense_gate_bind, self.dense_gate_host, 1, true);
+                    _ = try self.execLinearHetero(&frame_opt, layer.dense_up, self.x_norm_bind, self.x_norm_host, self.dense_up_bind, self.dense_up_host, 1, false);
+                    {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.moe_pipes.encodeSiluMul(f, .{
+                            .gate = self.dense_gate_bind,
+                            .up = self.dense_up_bind,
+                            .out = self.dense_act_bind,
+                            .count = self.config.intermediate_size,
+                        }, had);
+                    }
+                    _ = try self.execLinearHetero(&frame_opt, layer.dense_down, self.dense_act_bind, self.dense_act_host, self.proj_out_bind, self.proj_out_host, 1, true);
+                    {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.moe_pipes.encodeResidualAdd(f, .{
+                            .x = self.x_bind,
+                            .delta = self.proj_out_bind,
+                            .count = h,
+                        }, had);
+                    }
+                },
+            }
+
+            if (self.matchesAuxTap(l)) {
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.encodeAuxTapIfMatched(f, l, 1);
+            }
+        }
+
+        if (!skip_lm_head) {
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, had);
+            }
+            _ = try self.execLinearHetero(&frame_opt, self.lm_head, self.x_norm_bind, self.x_norm_host, self.logits_bind, self.logits_mut_host, 1, true);
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.moe_pipes.encodeArgmax(f, .{
+                    .logits = self.logits_bind,
+                    .out_token_id = self.out_token_id_bind,
+                    .vocab_size = self.config.vocab_size,
+                }, had);
+            }
+        }
+
+        try self.flushOptionalFrame(&frame_opt);
+        self.seq_len = cur_seq_len;
+        if (!skip_lm_head) self.last_logits_row = 0;
+        return if (skip_lm_head) 0 else self.out_token_id_host.*;
+    }
+
+    fn verifyTreeHeterogeneous(
+        self: *Qwen3Model,
+        token_ids: []const u32,
+        positions: []const u32,
+        ancestor_masks: []const u64,
+        base_pos: u32,
+        compute_logits: bool,
+    ) StepError!VerifyTreeResult {
+        if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
+        if (token_ids.len == 0 or token_ids.len != positions.len or token_ids.len != ancestor_masks.len) {
+            return error.InvalidArgument;
+        }
+        if (token_ids.len > self.max_tree_nodes) return error.TreeTooLarge;
+        if (base_pos > self.max_seq_len) return error.PositionOutOfRange;
+
+        const m: u32 = @intCast(token_ids.len);
+        for (0..m) |i| {
+            if (token_ids[i] >= self.config.vocab_size) return error.TokenOutOfRange;
+            if (positions[i] >= self.max_seq_len) return error.PositionOutOfRange;
+        }
+        @memcpy(self.tree_token_ids_host[0..m], token_ids);
+        @memcpy(self.tree_positions_host[0..m], positions);
+        @memcpy(self.tree_ancestor_masks_host[0..m], ancestor_masks);
+
+        const h = self.config.hidden_size;
+        var frame_opt: ?metal.Compute.Frame = null;
+        errdefer if (frame_opt) |*f| f.abort();
+
+        {
+            const f = try self.ensureOptionalFrame(&frame_opt);
+            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+                .weight = self.embed.weight,
+                .scale_bias = self.embed.scale_bias,
+                .tokens = .{ .token_ids = self.tree_token_ids_bind },
+                .out = self.x_bind,
+                .m = m,
+                .vocab_size = self.config.vocab_size,
+                .hidden_size = h,
+            }, false);
+        }
+
+        var total_unique: u64 = 0;
+        for (self.layers, 0..) |layer, l| {
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = layer.input_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.input_layernorm.dtype,
+                }, had);
+            }
+
+            _ = try self.execLinearHetero(&frame_opt, layer.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
+            _ = try self.execLinearHetero(&frame_opt, layer.k_proj, self.x_norm_bind, self.x_norm_host, self.k_bind, self.k_host, m, false);
+            _ = try self.execLinearHetero(&frame_opt, layer.v_proj, self.x_norm_bind, self.x_norm_host, self.v_bind, self.v_host, m, false);
+
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                const k_tree_bind = self.treeKBinding(l);
+                const v_tree_bind = self.treeVBinding(l);
+                try self.attn_pipes.encodeTreeQkNormRope(f, .{
+                    .q = self.q_bind,
+                    .k = self.k_bind,
+                    .v = self.v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .positions = self.tree_positions_bind,
+                    .k_tree_out = k_tree_bind,
+                    .v_tree_out = v_tree_bind,
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, had);
+                try self.attn_pipes.encodeGqaTreeVerifyAttn(f, .{
+                    .q = self.q_bind,
+                    .kv_tiles = if (base_pos > 0) layer.kv_tiles_binding else null,
+                    .base_pos = base_pos,
+                    .k_tree = k_tree_bind,
+                    .v_tree = v_tree_bind,
+                    .ancestor_masks = self.tree_ancestor_masks_bind,
+                    .out = self.attn_out_bind,
+                    .scratch = self.gqa_tree_scratch_bind,
+                    .max_splits = attention.MAX_SPLITS,
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .chunk_tokens = self.chunk_tokens,
+                }, true);
+            }
+
+            _ = try self.execLinearHetero(&frame_opt, layer.o_proj, self.attn_out_bind, self.attn_out_host, self.proj_out_bind, self.proj_out_host, m, true);
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.moe_pipes.encodeResidualAdd(f, .{
+                    .x = self.x_bind,
+                    .delta = self.proj_out_bind,
+                    .count = m * h,
+                }, had);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
+                }, true);
+            }
+
+            switch (self.config.arch) {
+                .qwen3_moe => {
+                    var layer_ws = self.moe_ws.?;
+                    layer_ws.schedule_header_off = self.layer_sched_hdr_base_off + @as(u64, l) * 64;
+                    const router_src: moe.RouterSource = if (layer.router_layout == .sme2_panel64) blk: {
+                        try self.flushOptionalFrame(&frame_opt);
+                        try self.runRouterSme2(layer, self.x_norm_host, layer_ws.router_logits, m);
+                        break :blk .{ .logits = .{ .binding = layer_ws.routerLogitsBinding(self.scratch_buf), .dtype = .f32 } };
+                    } else layer.router;
+
+                    if (layer.expert_layout == .sme2_panel64) {
+                        if (layer.router_layout == .row_major) {
+                            const had = (frame_opt != null);
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.encodeLayerRouter(f, l, &layer_ws, self.scratch_buf, self.x_norm_bind, m, had);
+                            try self.flushOptionalFrame(&frame_opt);
+                        }
+                        const uniq = try self.runMoeExpertsSme2(layer, layer_ws.router_logits, self.x_norm_host, self.x_host, m);
+                        const hdr: *moe.ScheduleHeader = @ptrCast(@alignCast(self.layer_sched_hdr_raw.ptr + l * 64));
+                        hdr.num_unique_experts = uniq;
+                        total_unique += uniq;
+                    } else {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        const moe_args: moe.MoELayerArgs = .{
+                            .x = self.x_norm_bind,
+                            .router = router_src,
+                            .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                            .expert_table = layer.expert_table,
+                            .workspace = &layer_ws,
+                            .workspace_buf = self.scratch_buf,
+                            .residual = self.x_bind,
+                            .out = self.x_bind,
+                            .m = m,
+                            .num_experts = self.config.num_experts,
+                            .top_k = self.config.num_experts_per_tok,
+                            .hidden_size = h,
+                            .intermediate_size = self.config.moe_intermediate_size,
+                            .norm_topk_prob = self.config.norm_topk_prob,
+                        };
+                        switch (layer.expert_dtype) {
+                            .q3_affine => try self.moe_pipes.encodeMoELayer(f, .q3, moe_args, had),
+                            .q4_affine => try self.moe_pipes.encodeMoELayer(f, .q4, moe_args, had),
+                            .f16 => try self.moe_pipes.encodeMoELayerFloat(f, .f16, moe_args, had),
+                            .bf16 => try self.moe_pipes.encodeMoELayerFloat(f, .bf16, moe_args, had),
+                        }
+                    }
+                },
+                .qwen3_dense => {
+                    _ = try self.execLinearHetero(&frame_opt, layer.dense_gate, self.x_norm_bind, self.x_norm_host, self.dense_gate_bind, self.dense_gate_host, m, true);
+                    _ = try self.execLinearHetero(&frame_opt, layer.dense_up, self.x_norm_bind, self.x_norm_host, self.dense_up_bind, self.dense_up_host, m, false);
+                    {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.moe_pipes.encodeSiluMul(f, .{
+                            .gate = self.dense_gate_bind,
+                            .up = self.dense_up_bind,
+                            .out = self.dense_act_bind,
+                            .count = m * self.config.intermediate_size,
+                        }, had);
+                    }
+                    _ = try self.execLinearHetero(&frame_opt, layer.dense_down, self.dense_act_bind, self.dense_act_host, self.proj_out_bind, self.proj_out_host, m, true);
+                    {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.moe_pipes.encodeResidualAdd(f, .{
+                            .x = self.x_bind,
+                            .delta = self.proj_out_bind,
+                            .count = m * h,
+                        }, had);
+                    }
+                },
+            }
+
+            if (self.matchesAuxTap(l)) {
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.encodeAuxTapIfMatched(f, l, m);
+            }
+        }
+
+        if (compute_logits) {
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, had);
+            }
+            _ = try self.execLinearHetero(&frame_opt, self.lm_head, self.x_norm_bind, self.x_norm_host, self.logits_bind, self.logits_mut_host, m, true);
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.moe_pipes.encodeArgmaxRows(f, .{
+                    .logits = self.logits_bind,
+                    .out_token_ids = self.out_token_id_bind,
+                    .num_rows = m,
+                    .vocab_size = self.config.vocab_size,
+                    .logits_dtype = .f16,
+                }, had);
+            }
+        }
+
+        try self.flushOptionalFrame(&frame_opt);
+        if (compute_logits) self.last_logits_row = @as(usize, m) - 1;
+
+        if (self.config.arch == .qwen3_moe) {
+            total_unique = 0;
+            for (0..self.layers.len) |l| {
+                const hdr: *const moe.ScheduleHeader = @ptrCast(@alignCast(self.layer_sched_hdr_raw.ptr + l * 64));
+                total_unique += hdr.num_unique_experts;
+            }
+        }
+        const avg_unique: f64 = if (self.config.arch == .qwen3_moe)
+            @as(f64, @floatFromInt(total_unique)) / @as(f64, @floatFromInt(self.layers.len))
+        else
+            0.0;
+
+        const kv_per_layer: u64 =
+            2 * @as(u64, self.config.num_key_value_heads) * (@as(u64, base_pos) + m) * self.config.head_dim * @sizeOf(f16);
+        const kv_total: u64 = @as(u64, self.config.num_hidden_layers) * kv_per_layer;
+        const head_bytes: u64 = if (compute_logits)
+            @as(u64, m) * self.embed_row_alg_bytes + (self.global_head_bytes - self.embed_row_alg_bytes)
+        else
+            @as(u64, m) * self.embed_row_alg_bytes;
+        const layer_weight_bytes: u64 = if (self.config.arch == .qwen3_moe)
+            self.total_layers_non_expert_bytes + total_unique * self.single_expert_bytes
+        else
+            self.total_layers_static_bytes;
+
+        return .{
+            .num_nodes = m,
+            .argmax_tokens = self.out_token_ids_host[0..m],
+            .logits_f16 = self.logits_host[0 .. @as(usize, m) * self.config.vocab_size],
+            .total_unique_experts = total_unique,
+            .avg_unique_experts_per_layer = avg_unique,
+            .actual_bytes_moved = layer_weight_bytes + kv_total + head_bytes,
+        };
     }
 
     // -----------------------------------------------------------------------
@@ -2244,6 +3415,7 @@ pub const Qwen3Model = struct {
         }
 
         self.seq_len = cur_seq_len;
+        if (!skip_lm_head) self.last_logits_row = 0;
         return if (skip_lm_head) 0 else self.out_token_id_host.*;
     }
 
@@ -2376,6 +3548,7 @@ pub const Qwen3Model = struct {
             crt.expert_cache.releasePins();
         }
 
+        if (compute_logits) self.last_logits_row = @as(usize, m) - 1;
         const avg_unique: f64 = @as(f64, @floatFromInt(total_unique)) / @as(f64, @floatFromInt(self.layers.len));
         const kv_per_layer: u64 =
             2 * @as(u64, self.config.num_key_value_heads) * (@as(u64, base_pos) + m) * self.config.head_dim * @sizeOf(f16);
@@ -3307,6 +4480,7 @@ pub const Qwen3Model = struct {
         ) catch return error.WavefrontFailed;
 
         self.seq_len = @intCast(tokens.len);
+        if (compute_logits) self.last_logits_row = 0;
         return .{
             .tokens_prefilled = @intCast(tokens.len),
             .argmax_token = if (compute_logits) self.out_token_id_host.* else 0,
@@ -3368,6 +4542,17 @@ pub const Qwen3Model = struct {
         const k: usize = lin.k;
         const out = try allocator.alloc(f16, n * k);
         errdefer allocator.free(out);
+        if (lin.layout == .sme2_panel64) {
+            try unpackPanel64ToF16(
+                weightDTypeToPanelDType(lin.dtype),
+                amfParamKindToSme(lin.param_kind),
+                lin.sme_packed.?,
+                n,
+                k,
+                out,
+            );
+            return out;
+        }
         const w_off: usize = @intCast(lin.weight.offset);
 
         switch (lin.dtype) {
@@ -3457,7 +4642,23 @@ pub const Qwen3Model = struct {
 
             const w_f16 = try allocator.alloc(f16, n_exp * h);
             errdefer allocator.free(w_f16);
-            switch (layer.router) {
+            if (layer.router_layout == .sme2_panel64) {
+                try unpackPanel64ToF16(
+                    layer.router_panel_dtype orelse return error.UnexpectedTensorDType,
+                    amfParamKindToSme(layer.router_param_kind),
+                    layer.router_sme_packed.?,
+                    n_exp,
+                    h,
+                    w_f16,
+                );
+                if (fold_post_attn_norm) {
+                    for (0..n_exp) |e| {
+                        for (0..h) |c| {
+                            w_f16[e * h + c] = @floatCast(@as(f32, @floatCast(w_f16[e * h + c])) * ln_f32[c]);
+                        }
+                    }
+                }
+            } else switch (layer.router) {
                 .weights => |rw| {
                     const r_off: usize = @intCast(rw.binding.offset);
                     switch (rw.dtype) {
@@ -3677,7 +4878,443 @@ pub const Qwen3Model = struct {
         }
         return total_ns;
     }
+
+    fn extractRouterLayerFoldedF32(
+        self: *const Qwen3Model,
+        allocator: std.mem.Allocator,
+        layer_idx: usize,
+        out_f32: []f32,
+    ) LoadError!void {
+        const layer = self.layers[layer_idx];
+        const shard_bytes = self.shards[layer.shard_idx].arena.bytes();
+        const n_exp: usize = self.config.num_experts;
+        const h: usize = self.config.hidden_size;
+
+        const ln_f32 = try allocator.alloc(f32, h);
+        defer allocator.free(ln_f32);
+        const ln_off: usize = @intCast(layer.post_attention_layernorm.binding.offset);
+        const raw_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, shard_bytes[ln_off .. ln_off + h * 2]));
+        for (0..h) |c| ln_f32[c] = quant.floatBitsToF32(layer.post_attention_layernorm.dtype, raw_u16[c]);
+
+        if (layer.router_layout == .sme2_panel64) {
+            const tmp = try allocator.alloc(f16, n_exp * h);
+            defer allocator.free(tmp);
+            try unpackPanel64ToF16(
+                layer.router_panel_dtype orelse return error.UnexpectedTensorDType,
+                amfParamKindToSme(layer.router_param_kind),
+                layer.router_sme_packed.?,
+                n_exp,
+                h,
+                tmp,
+            );
+            for (0..n_exp) |e| {
+                for (0..h) |c| out_f32[e * h + c] = @as(f32, @floatCast(tmp[e * h + c])) * ln_f32[c];
+            }
+            return;
+        }
+
+        switch (layer.router) {
+            .weights => |rw| {
+                const r_off: usize = @intCast(rw.binding.offset);
+                switch (rw.dtype) {
+                    .f16 => {
+                        const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, shard_bytes[r_off .. r_off + n_exp * h * 2]));
+                        for (0..n_exp) |e| {
+                            for (0..h) |c| out_f32[e * h + c] = @as(f32, @floatCast(src[e * h + c])) * ln_f32[c];
+                        }
+                    },
+                    .bf16 => {
+                        const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, shard_bytes[r_off .. r_off + n_exp * h * 2]));
+                        for (0..n_exp) |e| {
+                            for (0..h) |c| out_f32[e * h + c] = quant.bf16ToF32(src[e * h + c]) * ln_f32[c];
+                        }
+                    },
+                    .f32 => {
+                        const src: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, shard_bytes[r_off .. r_off + n_exp * h * 4]));
+                        for (0..n_exp) |e| {
+                            for (0..h) |c| out_f32[e * h + c] = src[e * h + c] * ln_f32[c];
+                        }
+                    },
+                }
+            },
+            .quant_weights => |rq| {
+                const w_lin: LinearBinding = .{
+                    .weight = rq.qweight,
+                    .scale_bias = rq.scale_bias,
+                    .n = self.config.num_experts,
+                    .k = self.config.hidden_size,
+                    .dtype = quant.WeightDType.fromQuant(rq.bits),
+                    .alg_bytes = 0,
+                };
+                const tmp = try self.extractLinearWeightsF16(allocator, layer.shard_idx, w_lin);
+                defer allocator.free(tmp);
+                for (0..n_exp) |e| {
+                    for (0..h) |c| out_f32[e * h + c] = @as(f32, @floatCast(tmp[e * h + c])) * ln_f32[c];
+                }
+            },
+            .logits => return error.InvalidConfig,
+        }
+    }
+
+    fn calibrateSmeRouter(self: *Qwen3Model, srt: *SmeRuntime, any_sampled_sme2: bool) StepError!void {
+        const cal_m: usize = @min(@as(usize, self.max_tree_nodes), 8);
+        var cal_tokens: [8]u32 = undefined;
+        for (0..cal_m) |i| {
+            cal_tokens[i] = @intCast((i * 13 + 1) % self.config.vocab_size);
+        }
+        var cal_bs: [8 * MAX_EXPERT_PRED_LAYERS]tree_mod.ExpertBitset = undefined;
+
+        // Warmup + 3 timed reps on L2-resident SME2 router bank.
+        _ = try self.predictMoEExpertsForTokensSme2(cal_tokens[0..cal_m], &cal_bs);
+        var sme_times: [3]u64 = undefined;
+        for (0..3) |rep| {
+            const t0 = vmstat.nowNs() catch 0;
+            _ = try self.predictMoEExpertsForTokensSme2(cal_tokens[0..cal_m], &cal_bs);
+            const t1 = vmstat.nowNs() catch t0;
+            sme_times[rep] = t1 -| t0;
+        }
+        std.mem.sort(u64, &sme_times, {}, comptime std.sort.asc(u64));
+        srt.router_pred_sme2_us = @as(f64, @floatFromInt(sme_times[1])) / 1_000.0;
+
+        if (srt.router_bank_single_owner) {
+            srt.router_pred_gpu_us = 0.0;
+            srt.router_pred_backend = .sme2_single_owner;
+            return;
+        }
+        if (any_sampled_sme2) {
+            srt.router_pred_gpu_us = 0.0;
+            srt.router_pred_backend = .sme2;
+            return;
+        }
+
+        // Measure GPU baseline for telemetry & `auto` startup gate (`C13`).
+        _ = try self.predictMoEExpertsForTokensGpu(cal_tokens[0..cal_m], &cal_bs);
+        var gpu_times: [3]u64 = undefined;
+        for (0..3) |rep| {
+            const t0 = vmstat.nowNs() catch 0;
+            _ = try self.predictMoEExpertsForTokensGpu(cal_tokens[0..cal_m], &cal_bs);
+            const t1 = vmstat.nowNs() catch t0;
+            gpu_times[rep] = t1 -| t0;
+        }
+        std.mem.sort(u64, &gpu_times, {}, comptime std.sort.asc(u64));
+        srt.router_pred_gpu_us = @as(f64, @floatFromInt(gpu_times[1])) / 1_000.0;
+
+        srt.router_pred_backend = switch (self.sme_router_mode) {
+            .sme2 => .sme2,
+            .gpu => .gpu,
+            .auto => if (srt.router_pred_sme2_us <= srt.router_pred_gpu_us) .sme2 else .gpu,
+        };
+    }
+
+    fn initSmeRuntime(self: *Qwen3Model, allocator: std.mem.Allocator) LoadError!void {
+        if (self.sme_rt != null) return;
+        const caps = try sme.SmeCaps.probe();
+        if (self.sme_router_mode == .sme2 and !caps.supportsSme2() and !self.has_sme2_weights) {
+            return error.Sme2Unsupported;
+        }
+
+        const is_moe = (self.config.arch == .qwen3_moe);
+        const sampled: u32 = if (is_moe) @min(self.config.num_hidden_layers, MAX_EXPERT_PRED_LAYERS) else 0;
+        const h: usize = self.config.hidden_size;
+        const can_sme_router_pred = is_moe and self.max_tree_nodes > 1 and (h % sme.GROUP_SIZE) == 0 and sampled > 0;
+
+        var all_sampled_sme2 = can_sme_router_pred;
+        var any_sampled_sme2 = false;
+        if (can_sme_router_pred) {
+            for (0..sampled) |s| {
+                const l_idx: usize = if (sampled == self.layers.len)
+                    s
+                else
+                    (s * (self.layers.len - 1)) / (sampled - 1);
+                if (self.layers[l_idx].router_layout == .sme2_panel64) {
+                    any_sampled_sme2 = true;
+                } else {
+                    all_sampled_sme2 = false;
+                }
+            }
+        }
+
+        const want_router_pred = can_sme_router_pred and
+            (all_sampled_sme2 or (self.sme_router_mode != .gpu and caps.supportsSme2()));
+        if (!self.has_sme2_weights and !want_router_pred) return;
+
+        const q_dim: usize = self.config.qDim();
+        const max_k: usize = @max(h, @max(q_dim, @max(self.config.intermediate_size, self.config.moe_intermediate_size)));
+        const m_cap: usize = self.max_tree_nodes;
+
+        const srt = try allocator.create(SmeRuntime);
+        errdefer allocator.destroy(srt);
+
+        var dispatcher = try sme.SmeDispatcher.init(allocator, .{
+            .a_pack_u16_cap = 32 * @max(max_k, sme.GROUP_SIZE),
+            .x_sums_f32_cap = @max(@as(usize, 64), 4 * (@max(max_k, sme.GROUP_SIZE) / sme.GROUP_SIZE)),
+        });
+        errdefer dispatcher.deinit();
+
+        const x_f32_scratch = try allocator.alloc(f32, m_cap * h);
+        errdefer allocator.free(x_f32_scratch);
+
+        const x_act_u16_scratch = try allocator.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), m_cap * max_k);
+        errdefer allocator.free(x_act_u16_scratch);
+
+        const router_logits_f32: []align(sme.SVL_BYTES) f32 = if (is_moe)
+            try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m_cap * @max(@as(usize, 1), @as(usize, sampled)) * self.config.num_experts)
+        else
+            &.{};
+        errdefer if (router_logits_f32.len > 0) allocator.free(router_logits_f32);
+
+        var any_sme2_experts = false;
+        for (self.layers) |layer| {
+            if (layer.expert_layout == .sme2_panel64) {
+                any_sme2_experts = true;
+                break;
+            }
+        }
+        const moe_inter: usize = self.config.moe_intermediate_size;
+        const expert_up_f32: []align(sme.SVL_BYTES) f32 = if (any_sme2_experts)
+            try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m_cap * moe_inter)
+        else
+            &.{};
+        errdefer if (expert_up_f32.len > 0) allocator.free(expert_up_f32);
+
+        const expert_inter_u16: []align(sme.SVL_BYTES) u16 = if (any_sme2_experts)
+            try allocator.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), m_cap * moe_inter)
+        else
+            &.{};
+        errdefer if (expert_inter_u16.len > 0) allocator.free(expert_inter_u16);
+
+        const expert_down_f32: []align(sme.SVL_BYTES) f32 = if (any_sme2_experts)
+            try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m_cap * h)
+        else
+            &.{};
+        errdefer if (expert_down_f32.len > 0) allocator.free(expert_down_f32);
+
+        const expert_acc_f32: []align(sme.SVL_BYTES) f32 = if (any_sme2_experts)
+            try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m_cap * h)
+        else
+            &.{};
+        errdefer if (expert_acc_f32.len > 0) allocator.free(expert_acc_f32);
+
+        // Optional L2-resident folded router bank (`<= 8 MiB`) when `.amf` routers are
+        // `row_major`. Single-owner `sme2_panel64` routers consume ZERO extra bytes.
+        var bank_arena: ?arena_mod.WiredArena = null;
+        errdefer if (bank_arena) |*a| a.deinit();
+        var bank_packed: []const u8 = &.{};
+        var bank_dtype: sme.PanelDType = .bf16;
+        var bank_arena_added: u64 = 0;
+
+        if (want_router_pred and !all_sampled_sme2) {
+            const total_n: usize = @as(usize, sampled) * self.config.num_experts;
+            const payload_bytes = try sme.packedBlobBytes(.bf16, total_n, h);
+            const l2_bank_cap: usize = 8 * 1024 * 1024;
+            if (payload_bytes <= l2_bank_cap) {
+                const arena_bytes = try page.alignUp(payload_bytes);
+                const rem_limit = self.wired_budget_bytes -| self.total_wired_bytes;
+                if (arena_bytes <= rem_limit) {
+                    const rem_budget: budget_mod.Budget = .{
+                        .limit_bytes = rem_limit,
+                        .binding_limit = .configured_cap,
+                        .raw_limit_bytes = rem_limit,
+                    };
+                    var ba = try arena_mod.WiredArena.init(arena_bytes, rem_budget);
+                    errdefer ba.deinit();
+
+                    const folded_f32 = try allocator.alloc(f32, total_n * h);
+                    defer allocator.free(folded_f32);
+                    const layer_elems = @as(usize, self.config.num_experts) * h;
+                    for (0..sampled) |s| {
+                        const l_idx: usize = if (sampled == self.layers.len)
+                            s
+                        else
+                            (s * (self.layers.len - 1)) / (sampled - 1);
+                        try self.extractRouterLayerFoldedF32(allocator, l_idx, folded_f32[s * layer_elems ..][0..layer_elems]);
+                    }
+
+                    var max_abs: f32 = 0.0;
+                    for (folded_f32) |v| {
+                        const av = @abs(v);
+                        if (av > max_abs) max_abs = av;
+                    }
+                    bank_dtype = if (caps.has_sme_f16f32 and max_abs <= 32768.0) .f16 else .bf16;
+
+                    const dst = try ba.allocAligned(payload_bytes, sme.SVL_BYTES);
+                    try sme.packDenseFromF32Panel64(bank_dtype, folded_f32, total_n, h, dst);
+                    bank_packed = dst;
+                    bank_arena = ba;
+                    bank_arena_added = arena_bytes;
+                }
+            }
+        }
+
+        srt.* = .{
+            .dispatcher = dispatcher,
+            .x_f32_scratch = x_f32_scratch,
+            .x_act_u16_scratch = x_act_u16_scratch,
+            .router_logits_f32 = router_logits_f32,
+            .expert_up_f32 = expert_up_f32,
+            .expert_inter_u16 = expert_inter_u16,
+            .expert_down_f32 = expert_down_f32,
+            .expert_acc_f32 = expert_acc_f32,
+            .router_bank_arena = bank_arena,
+            .router_bank_packed = bank_packed,
+            .router_bank_dtype = bank_dtype,
+            .router_bank_sampled = if (want_router_pred) sampled else 0,
+            .router_bank_single_owner = all_sampled_sme2,
+            .router_pred_backend = if (all_sampled_sme2) .sme2_single_owner else .gpu,
+            .router_pred_sme2_us = 0.0,
+            .router_pred_gpu_us = 0.0,
+        };
+        // Ownership transferred into `srt`; clear local errdefer handle.
+        bank_arena = null;
+        self.sme_rt = srt;
+        self.total_wired_bytes += bank_arena_added;
+
+        if (want_router_pred and (all_sampled_sme2 or srt.router_bank_packed.len > 0)) {
+            self.calibrateSmeRouter(srt, any_sampled_sme2) catch return error.SmeCalibrationFailed;
+            if (srt.router_pred_backend == .gpu) {
+                if (srt.router_bank_arena) |*a| {
+                    const reclaimed: u64 = a.bytes().len;
+                    a.deinit();
+                    srt.router_bank_arena = null;
+                    srt.router_bank_packed = &.{};
+                    self.total_wired_bytes -|= reclaimed;
+                }
+            }
+        }
+    }
 };
+
+fn weightDTypeToPanelDType(wdt: quant.WeightDType) sme.PanelDType {
+    return switch (wdt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .q4_affine => .q4_affine,
+        .q3_affine => .q3_affine,
+    };
+}
+
+fn amfDTypeToPanelDType(dt: amf.DType) LoadError!sme.PanelDType {
+    return switch (dt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .q4_affine => .q4_affine,
+        .q3_affine => .q3_affine,
+        .f32, .u32 => error.UnexpectedTensorDType,
+    };
+}
+
+fn amfParamKindToSme(pk: amf.QuantParamKind) sme.QuantParamKind {
+    return switch (pk) {
+        .affine_scale_bias => .affine_scale_bias,
+        .lut16_codebook => .lut16_codebook,
+    };
+}
+
+/// Startup-only unpacker from `sme2_panel64` `[n, k]` into row-major `[]f16`
+/// (used by optional ANE / hybrid prefill startup extractors).
+fn unpackPanel64ToF16(
+    dtype: sme.PanelDType,
+    param_kind: sme.QuantParamKind,
+    w_packed: []const u8,
+    n: usize,
+    k: usize,
+    out: []f16,
+) LoadError!void {
+    const need = try sme.packedBlobBytes(dtype, n, k);
+    if (w_packed.len < need or out.len < n * k) return error.UnexpectedTensorShape;
+    const panels = sme.panelCount(n);
+    const groups = k / sme.GROUP_SIZE;
+    const g_bytes = sme.groupBytes(dtype);
+    const ps = groups * g_bytes;
+
+    for (0..panels) |p| {
+        const col_base = p * sme.PANEL_COLS;
+        const valid_cols = @min(sme.PANEL_COLS, n -| col_base);
+        for (0..groups) |g| {
+            const grp = w_packed[p * ps + g * g_bytes ..][0..g_bytes];
+            const k_base = g * sme.GROUP_SIZE;
+            switch (dtype) {
+                .f16, .bf16 => {
+                    const w_dt: quant.FloatDType = if (dtype == .bf16) .bf16 else .f16;
+                    for (0..32) |kp| {
+                        const c_off = kp * 64;
+                        for (0..valid_cols) |c| {
+                            const row = col_base + c;
+                            const b0 = std.mem.readInt(u16, grp[c_off + c * 4 + 0 ..][0..2], .little);
+                            const b1 = std.mem.readInt(u16, grp[c_off + c * 4 + 2 ..][0..2], .little);
+                            out[row * k + k_base + 2 * kp] = @floatCast(quant.floatBitsToF32(w_dt, b0));
+                            out[row * k + k_base + 2 * kp + 1] = @floatCast(quant.floatBitsToF32(w_dt, b1));
+                        }
+                    }
+                },
+                .q4_affine, .q3_affine, .q2_affine => {
+                    var scales: [sme.PANEL_COLS]f32 = undefined;
+                    var biases: [sme.PANEL_COLS]f32 = undefined;
+                    var lut: [16]f32 = undefined;
+                    for (0..16) |idx| {
+                        const h_bits = std.mem.readInt(u16, grp[idx * 4 ..][0..2], .little);
+                        const v: f32 = @floatCast(@as(f16, @bitCast(h_bits)));
+                        scales[idx] = v;
+                        lut[idx] = v;
+                    }
+                    for (0..sme.PANEL_COLS) |c| {
+                        const b_bits = std.mem.readInt(u16, grp[64 + c * 4 ..][0..2], .little);
+                        biases[c] = @floatCast(@as(f16, @bitCast(b_bits)));
+                    }
+                    const codes = grp[sme.QUANT_HEADER_BYTES..];
+                    switch (dtype) {
+                        .q4_affine => {
+                            for (0..32) |kp| {
+                                for (0..valid_cols) |c| {
+                                    const row = col_base + c;
+                                    const byte = codes[kp * 16 + c];
+                                    const q0 = byte & 0x0F;
+                                    const q1 = byte >> 4;
+                                    const w0 = if (param_kind == .affine_scale_bias) @as(f32, @floatFromInt(q0)) * scales[c] + biases[c] else lut[q0] + biases[c];
+                                    const w1 = if (param_kind == .affine_scale_bias) @as(f32, @floatFromInt(q1)) * scales[c] + biases[c] else lut[q1] + biases[c];
+                                    out[row * k + k_base + 2 * kp] = @floatCast(w0);
+                                    out[row * k + k_base + 2 * kp + 1] = @floatCast(w1);
+                                }
+                            }
+                        },
+                        .q3_affine => {
+                            for (0..2) |half| {
+                                const h_off = half * 192;
+                                var quads: [4][64]u8 = undefined;
+                                for (0..64) |i| {
+                                    const b0 = codes[h_off + 0 + i];
+                                    const b1 = codes[h_off + 64 + i];
+                                    const b2 = codes[h_off + 128 + i];
+                                    quads[0][i] = b0 & 0x77;
+                                    quads[1][i] = b1 & 0x77;
+                                    quads[2][i] = b2 & 0x77;
+                                    quads[3][i] = ((b0 & 0x88) >> 3) | ((b1 & 0x88) >> 2) | ((b2 & 0x88) >> 1);
+                                }
+                                for (0..4) |q| {
+                                    for (0..4) |kp_sub| {
+                                        const kp = half * 16 + q * 4 + kp_sub;
+                                        for (0..valid_cols) |c| {
+                                            const row = col_base + c;
+                                            const byte = quads[q][kp_sub * 16 + c];
+                                            const q0 = byte & 0x07;
+                                            const q1 = (byte >> 4) & 0x07;
+                                            const w0 = if (param_kind == .affine_scale_bias) @as(f32, @floatFromInt(q0)) * scales[c] + biases[c] else lut[q0] + biases[c];
+                                            const w1 = if (param_kind == .affine_scale_bias) @as(f32, @floatFromInt(q1)) * scales[c] + biases[c] else lut[q1] + biases[c];
+                                            out[row * k + k_base + 2 * kp] = @floatCast(w0);
+                                            out[row * k + k_base + 2 * kp + 1] = @floatCast(w1);
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .q2_affine => return error.UnexpectedTensorDType,
+                        else => unreachable,
+                    }
+                },
+            }
+        }
+    }
+}
 
 fn findRequired(parsed: *const amf.Parsed, name: []const u8) LoadError!*const amf.TensorEntry {
     return parsed.find(name) orelse error.MissingTensor;
@@ -3693,6 +5330,7 @@ fn findLinear(parsed: *const amf.Parsed, base: []const u8) LoadError!*const amf.
 fn validateNorm1D(entry: *const amf.TensorEntry, dim: u32) LoadError!quant.FloatDType {
     const dt = try entry.dataType();
     if (entry.rank != 1 or entry.shape[0] != dim) return error.UnexpectedTensorShape;
+    if ((try entry.tensorLayout()) != .row_major) return error.InvalidTensorLayout;
     return switch (dt) {
         .f16 => .f16,
         .bf16 => .bf16,
@@ -3703,6 +5341,9 @@ fn validateNorm1D(entry: *const amf.TensorEntry, dim: u32) LoadError!quant.Float
 fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) LoadError!quant.WeightDType {
     const dt = try entry.dataType();
     if (entry.rank != 2 or entry.shape[0] != n or entry.shape[1] != k) return error.UnexpectedTensorShape;
+    const layout = try entry.tensorLayout();
+    _ = try entry.quantParamKind();
+    if (layout == .sme2_panel64 and (k % sme.GROUP_SIZE) != 0) return error.UnalignedK;
     return switch (dt) {
         .f16 => .f16,
         .bf16 => .bf16,
@@ -3722,6 +5363,12 @@ fn validateRouter2D(entry: *const amf.TensorEntry, num_experts: u32, hidden_size
     const dt = try entry.dataType();
     if (entry.rank != 2 or entry.shape[0] != num_experts or entry.shape[1] != hidden_size) {
         return error.UnexpectedTensorShape;
+    }
+    const layout = try entry.tensorLayout();
+    _ = try entry.quantParamKind();
+    if (layout == .sme2_panel64) {
+        if ((hidden_size % sme.GROUP_SIZE) != 0) return error.UnalignedK;
+        if (dt == .f32 or dt == .u32) return error.UnexpectedTensorDType;
     }
     switch (dt) {
         .f16, .bf16, .f32 => {},
@@ -3747,8 +5394,12 @@ const LoadedBlob = struct {
         return .{ .binding = self.asBinding(), .dtype = dtype };
     }
 
-    fn asLinearBinding(self: LoadedBlob, dtype: quant.WeightDType) LinearBinding {
-        const sb: ?metal.BufferBinding = switch (dtype) {
+    fn asLinearBinding(self: LoadedBlob, dtype: quant.WeightDType) LoadError!LinearBinding {
+        const layout = try self.entry.tensorLayout();
+        const param_kind = try self.entry.quantParamKind();
+        const sb: ?metal.BufferBinding = if (layout == .sme2_panel64)
+            null
+        else switch (dtype) {
             .f16, .bf16 => null,
             .q4_affine, .q3_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
         };
@@ -3759,6 +5410,9 @@ const LoadedBlob = struct {
             .k = self.entry.shape[1],
             .dtype = dtype,
             .alg_bytes = self.entry.data_bytes + self.entry.params_bytes,
+            .layout = layout,
+            .param_kind = param_kind,
+            .sme_packed = if (layout == .sme2_panel64) self.slice[0..@intCast(self.entry.data_bytes)] else null,
         };
     }
 };
@@ -3888,6 +5542,8 @@ fn loadInternal(
         });
     }
 
+    try model.initSmeRuntime(allocator);
+
     return model;
 }
 
@@ -3961,6 +5617,7 @@ fn loadCore(
     // --- 1. Resolve & validate all required directory entries up front ---
     const embed_entry = try findLinear(parsed, "embed_tokens");
     const embed_wdt = try validateLinear2D(embed_entry, config.vocab_size, h);
+    if ((try embed_entry.tensorLayout()) != .row_major) return error.InvalidTensorLayout;
 
     const final_norm_entry = try findRequired(parsed, "norm.weight");
     const final_norm_dt = try validateNorm1D(final_norm_entry, h);
@@ -4029,9 +5686,13 @@ fn loadCore(
                 bytes_l += router_e.blob_bytes;
 
                 var layer_exp_dt: ?quant.WeightDType = null;
+                var layer_exp_layout: ?amf.TensorLayout = null;
+                var layer_exp_pk: ?amf.QuantParamKind = null;
                 for (0..config.num_experts) |e_idx| {
                     const gp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
                     const gp_dt = try validateLinear2D(gp, config.moe_intermediate_size, h);
+                    const gp_layout = try gp.tensorLayout();
+                    const gp_pk = try gp.quantParamKind();
                     if (layer_exp_dt) |expected| {
                         if (gp_dt != expected) return error.UnexpectedTensorDType;
                     } else {
@@ -4040,29 +5701,49 @@ fn loadCore(
                             if ((h % 4) != 0 or (config.moe_intermediate_size % 4) != 0) return error.UnalignedK;
                         }
                     }
+                    if (layer_exp_layout) |exp_lay| {
+                        if (gp_layout != exp_lay) return error.InvalidTensorLayout;
+                    } else {
+                        layer_exp_layout = gp_layout;
+                    }
+                    if (layer_exp_pk) |exp_pk| {
+                        if (gp_pk != exp_pk) return error.InvalidQuantParamKind;
+                    } else {
+                        layer_exp_pk = gp_pk;
+                    }
 
                     const up = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
                     if ((try validateLinear2D(up, config.moe_intermediate_size, h)) != layer_exp_dt.?) return error.UnexpectedTensorDType;
+                    if ((try up.tensorLayout()) != layer_exp_layout.?) return error.InvalidTensorLayout;
+                    if ((try up.quantParamKind()) != layer_exp_pk.?) return error.InvalidQuantParamKind;
 
                     const dp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
                     if ((try validateLinear2D(dp, h, config.moe_intermediate_size)) != layer_exp_dt.?) return error.UnexpectedTensorDType;
+                    if ((try dp.tensorLayout()) != layer_exp_layout.?) return error.InvalidTensorLayout;
+                    if ((try dp.quantParamKind()) != layer_exp_pk.?) return error.InvalidQuantParamKind;
 
-                    // Also honor experts explicitly tagged `TensorKind.cold_expert` in `.amf`.
-                    if ((try gp.tensorKind()) == .cold_expert or
-                        (try up.tensorKind()) == .cold_expert or
-                        (try dp.tensorKind()) == .cold_expert)
-                    {
-                        cold_masks[l].set(@intCast(e_idx));
-                    }
-
-                    if (cold_masks[l].contains(@intCast(e_idx))) {
-                        layer_has_cold[l] = true;
-                        total_cold_experts += 1;
-                        max_cold_gate_bytes = @max(max_cold_gate_bytes, @as(usize, @intCast(gp.blob_bytes)));
-                        max_cold_up_bytes = @max(max_cold_up_bytes, @as(usize, @intCast(up.blob_bytes)));
-                        max_cold_down_bytes = @max(max_cold_down_bytes, @as(usize, @intCast(dp.blob_bytes)));
-                    } else {
+                    if (layer_exp_layout.? == .sme2_panel64) {
+                        // Single-owner SME2 experts live in wired shard RAM; cold-tagged ones
+                        // stream via `ldnt1b` (`CacheHint.non_temporal`) in `runMoeExpertsSme2`.
                         bytes_l += gp.blob_bytes + up.blob_bytes + dp.blob_bytes;
+                    } else {
+                        // Also honor experts explicitly tagged `TensorKind.cold_expert` in `.amf`.
+                        if ((try gp.tensorKind()) == .cold_expert or
+                            (try up.tensorKind()) == .cold_expert or
+                            (try dp.tensorKind()) == .cold_expert)
+                        {
+                            cold_masks[l].set(@intCast(e_idx));
+                        }
+
+                        if (cold_masks[l].contains(@intCast(e_idx))) {
+                            layer_has_cold[l] = true;
+                            total_cold_experts += 1;
+                            max_cold_gate_bytes = @max(max_cold_gate_bytes, @as(usize, @intCast(gp.blob_bytes)));
+                            max_cold_up_bytes = @max(max_cold_up_bytes, @as(usize, @intCast(up.blob_bytes)));
+                            max_cold_down_bytes = @max(max_cold_down_bytes, @as(usize, @intCast(dp.blob_bytes)));
+                        } else {
+                            bytes_l += gp.blob_bytes + up.blob_bytes + dp.blob_bytes;
+                        }
                     }
                 }
             },
@@ -4456,6 +6137,9 @@ fn loadCore(
         pred_topk_host = @alignCast(std.mem.bytesAsSlice(u32, pt_raw));
     }
 
+    var dense_gate_host: []f16 = &.{};
+    var dense_up_host: []f16 = &.{};
+    var dense_act_host: []f16 = &.{};
     var dense_gate_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var dense_up_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var dense_act_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
@@ -4464,13 +6148,17 @@ fn loadCore(
         const dg = try scratch_arena.allocAligned(inter_bytes, 64);
         const du = try scratch_arena.allocAligned(inter_bytes, 64);
         const da = try scratch_arena.allocAligned(inter_bytes, 64);
+        dense_gate_host = @alignCast(std.mem.bytesAsSlice(f16, dg));
+        dense_up_host = @alignCast(std.mem.bytesAsSlice(f16, du));
+        dense_act_host = @alignCast(std.mem.bytesAsSlice(f16, da));
         dense_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(dg.ptr) };
         dense_up_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(du.ptr) };
         dense_act_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(da.ptr) };
     }
 
     // --- 8. Load global weight blobs into shard 0 (zero-duplicate tied lm_head) ---
-    const g_shard = &shards[group_shard[0]];
+    const embed_shard_idx: u16 = @intCast(group_shard[0]);
+    const g_shard = &shards[embed_shard_idx];
     const embed_blob = try loadBlobIntoShard(source, embed_entry, g_shard, options.verify_crcs);
     const final_norm_blob = try loadBlobIntoShard(source, final_norm_entry, g_shard, options.verify_crcs);
     const lm_head_blob = if (config.tie_word_embeddings)
@@ -4478,8 +6166,9 @@ fn loadCore(
     else
         try loadBlobIntoShard(source, lm_head_entry, g_shard, options.verify_crcs);
 
-    const embed_lin = embed_blob.asLinearBinding(embed_wdt);
-    const lm_head_lin = lm_head_blob.asLinearBinding(lm_head_wdt);
+    const embed_lin = try embed_blob.asLinearBinding(embed_wdt);
+    const lm_head_lin = try lm_head_blob.asLinearBinding(lm_head_wdt);
+    var has_sme2_weights: bool = (lm_head_lin.layout == .sme2_panel64);
 
     const embed_row_alg_bytes: u64 = switch (embed_wdt) {
         .f16, .bf16 => @as(u64, h) * 2,
@@ -4492,7 +6181,13 @@ fn loadCore(
 
     // --- 9. Load per-layer weights into assigned shards & build device tables ---
     const layers = try allocator.alloc(LayerWeights, num_layers);
-    errdefer allocator.free(layers);
+    var layers_built: usize = 0;
+    errdefer {
+        for (0..layers_built) |li| {
+            if (layers[li].expert_sme_blobs) |esb| allocator.free(esb);
+        }
+        allocator.free(layers);
+    }
 
     var total_layers_static_bytes: u64 = 0;
     var total_layers_non_expert_bytes: u64 = 0;
@@ -4523,16 +6218,20 @@ fn loadCore(
         const in_ln_b = (try loadBlobIntoShard(source, in_ln_e, l_shard, options.verify_crcs)).asNormBinding(in_ln_dt);
 
         const q_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_proj", .{l}) catch unreachable);
-        const q_b = (try loadBlobIntoShard(source, q_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(q_e, q_dim, h));
+        const q_b = try (try loadBlobIntoShard(source, q_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(q_e, q_dim, h));
 
         const k_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_proj", .{l}) catch unreachable);
-        const k_b = (try loadBlobIntoShard(source, k_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(k_e, kv_dim, h));
+        const k_b = try (try loadBlobIntoShard(source, k_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(k_e, kv_dim, h));
 
         const v_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.v_proj", .{l}) catch unreachable);
-        const v_b = (try loadBlobIntoShard(source, v_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(v_e, kv_dim, h));
+        const v_b = try (try loadBlobIntoShard(source, v_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(v_e, kv_dim, h));
 
         const o_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable);
-        const o_b = (try loadBlobIntoShard(source, o_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(o_e, h, q_dim));
+        const o_b = try (try loadBlobIntoShard(source, o_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(o_e, h, q_dim));
+
+        if (q_b.layout == .sme2_panel64 or k_b.layout == .sme2_panel64 or v_b.layout == .sme2_panel64 or o_b.layout == .sme2_panel64) {
+            has_sme2_weights = true;
+        }
 
         var q_norm_bind: ?metal.BufferBinding = null;
         var k_norm_bind: ?metal.BufferBinding = null;
@@ -4573,6 +6272,7 @@ fn loadCore(
             .dense_down = dummy_linear,
             .kv_tiles_binding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(kv_tbl_raw.ptr) },
         };
+        errdefer if (layer_w.expert_sme_blobs) |esb| allocator.free(esb);
 
         const attn_static_bytes: u64 =
             in_ln_e.data_bytes + post_ln_e.data_bytes + qk_norm_bytes +
@@ -4583,23 +6283,34 @@ fn loadCore(
             .qwen3_moe => {
                 const router_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate", .{l}) catch unreachable);
                 const router_dt = try validateRouter2D(router_e, config.num_experts, h);
+                const router_layout = try router_e.tensorLayout();
+                const router_pk = try router_e.quantParamKind();
                 const router_b = try loadBlobIntoShard(source, router_e, l_shard, options.verify_crcs);
-                layer_w.router = switch (router_dt) {
-                    .f16 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .f16 } },
-                    .bf16 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .bf16 } },
-                    .f32 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .f32 } },
-                    .q4_affine => .{ .quant_weights = .{
-                        .qweight = router_b.asBinding(),
-                        .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
-                        .bits = .q4,
-                    } },
-                    .q3_affine => .{ .quant_weights = .{
-                        .qweight = router_b.asBinding(),
-                        .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
-                        .bits = .q3,
-                    } },
-                    .u32 => unreachable,
-                };
+                layer_w.router_layout = router_layout;
+                layer_w.router_param_kind = router_pk;
+                if (router_layout == .sme2_panel64) {
+                    has_sme2_weights = true;
+                    layer_w.router_panel_dtype = try amfDTypeToPanelDType(router_dt);
+                    layer_w.router_sme_packed = router_b.slice[0..@intCast(router_e.data_bytes)];
+                    layer_w.router = .{ .logits = .{ .binding = .{ .buffer = scratch_buf, .offset = 0 }, .dtype = .f32 } };
+                } else {
+                    layer_w.router = switch (router_dt) {
+                        .f16 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .f16 } },
+                        .bf16 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .bf16 } },
+                        .f32 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .f32 } },
+                        .q4_affine => .{ .quant_weights = .{
+                            .qweight = router_b.asBinding(),
+                            .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
+                            .bits = .q4,
+                        } },
+                        .q3_affine => .{ .quant_weights = .{
+                            .qweight = router_b.asBinding(),
+                            .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
+                            .bits = .q3,
+                        } },
+                        .u32 => unreachable,
+                    };
+                }
 
                 const exp_tbl_raw = try scratch_arena.allocAligned(@as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights), 64);
                 const exp_tbl: []moe.ExpertWeights = @alignCast(std.mem.bytesAsSlice(moe.ExpertWeights, exp_tbl_raw));
@@ -4607,12 +6318,39 @@ fn loadCore(
                 layer_w.expert_table_host = exp_tbl;
 
                 var exp_dt: quant.WeightDType = .q3_affine;
+                var exp_layout: amf.TensorLayout = .row_major;
+                var exp_pk: amf.QuantParamKind = .affine_scale_bias;
                 for (0..config.num_experts) |e_idx| {
                     const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
                     const gp_dt = try validateLinear2D(gp_e, config.moe_intermediate_size, h);
-                    if (e_idx == 0) exp_dt = gp_dt;
+                    if (e_idx == 0) {
+                        exp_dt = gp_dt;
+                        exp_layout = try gp_e.tensorLayout();
+                        exp_pk = try gp_e.quantParamKind();
+                        if (exp_layout == .sme2_panel64) {
+                            has_sme2_weights = true;
+                            layer_w.expert_sme_blobs = try allocator.alloc(SmeExpertTriple, config.num_experts);
+                        }
+                    }
                     const up_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
                     const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
+
+                    if (exp_layout == .sme2_panel64) {
+                        const gp_b = try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs);
+                        const up_b = try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs);
+                        const dp_b = try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs);
+                        const is_cold = ((try gp_e.tensorKind()) == .cold_expert or
+                            (try up_e.tensorKind()) == .cold_expert or
+                            (try dp_e.tensorKind()) == .cold_expert);
+                        layer_w.expert_sme_blobs.?[e_idx] = .{
+                            .gate = gp_b.slice[0..@intCast(gp_e.data_bytes)],
+                            .up = up_b.slice[0..@intCast(up_e.data_bytes)],
+                            .down = dp_b.slice[0..@intCast(dp_e.data_bytes)],
+                            .is_cold = is_cold,
+                        };
+                        exp_tbl[e_idx] = std.mem.zeroes(moe.ExpertWeights);
+                        continue;
+                    }
 
                     if (cold_rt) |crt| {
                         if (crt.cold_masks_by_layer[l].contains(@intCast(e_idx))) {
@@ -4649,6 +6387,8 @@ fn loadCore(
                     }
                 }
                 layer_w.expert_dtype = exp_dt;
+                layer_w.expert_layout = exp_layout;
+                layer_w.expert_param_kind = exp_pk;
 
                 const router_bytes: u64 = router_e.data_bytes + router_e.params_bytes;
                 const one_exp: u64 = switch (exp_dt) {
@@ -4663,13 +6403,17 @@ fn loadCore(
             },
             .qwen3_dense => {
                 const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.gate_proj", .{l}) catch unreachable);
-                const gp_b = (try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(gp_e, config.intermediate_size, h));
+                const gp_b = try (try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(gp_e, config.intermediate_size, h));
 
                 const up_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.up_proj", .{l}) catch unreachable);
-                const up_b = (try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(up_e, config.intermediate_size, h));
+                const up_b = try (try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(up_e, config.intermediate_size, h));
 
                 const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.down_proj", .{l}) catch unreachable);
-                const dp_b = (try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(dp_e, h, config.intermediate_size));
+                const dp_b = try (try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs)).asLinearBinding(try validateLinear2D(dp_e, h, config.intermediate_size));
+
+                if (gp_b.layout == .sme2_panel64 or up_b.layout == .sme2_panel64 or dp_b.layout == .sme2_panel64) {
+                    has_sme2_weights = true;
+                }
 
                 layer_w.dense_gate = gp_b;
                 layer_w.dense_up = up_b;
@@ -4682,9 +6426,11 @@ fn loadCore(
         total_layers_static_bytes += attn_static_bytes + ffn_active_bytes;
         total_layers_non_expert_bytes += layer_non_expert_bytes;
         layers[l] = layer_w;
+        layers_built += 1;
     }
 
     const out_tok_ids_slice: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_tok_raw));
+    const logits_mut_slice: []f16 = @alignCast(std.mem.bytesAsSlice(f16, logits_raw));
 
     return .{
         .config = config,
@@ -4710,13 +6456,22 @@ fn loadCore(
         .scratch_buf = scratch_buf,
         .kv_tiles = kv_tiles,
         .layers = layers,
+        .embed_shard_idx = embed_shard_idx,
         .embed = embed_lin,
         .final_norm = final_norm_blob.asNormBinding(final_norm_dt),
         .lm_head = lm_head_lin,
         .x_host = @alignCast(std.mem.bytesAsSlice(f16, x_raw)),
-        .logits_host = @alignCast(std.mem.bytesAsSlice(f16, logits_raw)),
+        .x_norm_host = @alignCast(std.mem.bytesAsSlice(f16, x_norm_raw)),
+        .q_host = @alignCast(std.mem.bytesAsSlice(f16, q_raw)),
+        .k_host = @alignCast(std.mem.bytesAsSlice(f16, k_raw)),
+        .v_host = @alignCast(std.mem.bytesAsSlice(f16, v_raw)),
+        .attn_out_host = @alignCast(std.mem.bytesAsSlice(f16, attn_out_raw)),
+        .proj_out_host = @alignCast(std.mem.bytesAsSlice(f16, proj_out_raw)),
+        .logits_mut_host = logits_mut_slice,
+        .logits_host = logits_mut_slice,
         .out_token_ids_host = out_tok_ids_slice,
         .out_token_id_host = &out_tok_ids_slice[0],
+        .last_logits_row = 0,
         .x_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_raw.ptr) },
         .x_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_norm_raw.ptr) },
         .q_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(q_raw.ptr) },
@@ -4753,6 +6508,9 @@ fn loadCore(
         .pred_topk_base_off = pred_topk_base_off,
         .pred_topk_layer_stride = pred_topk_layer_stride,
         .pred_topk_host = pred_topk_host,
+        .dense_gate_host = dense_gate_host,
+        .dense_up_host = dense_up_host,
+        .dense_act_host = dense_act_host,
         .dense_gate_bind = dense_gate_bind,
         .dense_up_bind = dense_up_bind,
         .dense_act_bind = dense_act_bind,
@@ -4763,6 +6521,9 @@ fn loadCore(
         .global_head_bytes = global_head_bytes,
         .cold_rt = cold_rt,
         .hybrid_rt = null,
+        .has_sme2_weights = has_sme2_weights,
+        .sme_router_mode = options.sme_router_mode,
+        .sme_rt = null,
     };
 }
 
@@ -6375,4 +8136,550 @@ test "M4 G6 runLayerFfnChunk and A1 prefillHybridWavefront run zero-copy 2-chunk
             try std.testing.expect(std.math.isFinite(@as(f32, @floatCast(lv))));
         }
     }
+}
+
+const RepackTargets = enum { routers, all_linear };
+
+fn repackAmfBytesToSme2(
+    allocator: std.mem.Allocator,
+    src_bytes: []const u8,
+    targets: RepackTargets,
+    mark_cold_expert_from: ?u16,
+) ![]u8 {
+    var parsed = try amf.Parsed.parseBytes(allocator, src_bytes);
+    defer parsed.deinit(allocator);
+
+    const n_entries = parsed.entries.len;
+    const new_entries = try allocator.alloc(amf.TensorEntry, n_entries);
+    defer allocator.free(new_entries);
+    const payloads = try allocator.alloc([]u8, n_entries);
+    var built: usize = 0;
+    defer {
+        for (0..built) |i| allocator.free(payloads[i]);
+        allocator.free(payloads);
+    }
+
+    for (parsed.entries, 0..) |e, i| {
+        var ne = e;
+        const kind = try e.tensorKind();
+        const dt = try e.dataType();
+        const should_pack: bool = switch (targets) {
+            .routers => kind == .router,
+            .all_linear => switch (kind) {
+                .router, .dense, .hot_expert, .cold_expert, .lm_head => true,
+                .embedding, .norm => false,
+            },
+        };
+        if (mark_cold_expert_from) |cold_from| {
+            if (kind == .hot_expert and e.expert != amf.NO_EXPERT and e.expert >= cold_from) {
+                ne.kind = @backingInt(amf.TensorKind.cold_expert);
+            }
+        }
+
+        const src_off: usize = @intCast(e.blob_offset);
+        const src_len: usize = @intCast(e.blob_bytes);
+        const src_blob = src_bytes[src_off .. src_off + src_len];
+
+        if (should_pack and e.rank == 2 and dt != .f32 and dt != .u32) {
+            const n: usize = e.shape[0];
+            const k: usize = e.shape[1];
+            const pdt = try amfDTypeToPanelDType(dt);
+            const packed_len = try sme.packedBlobBytes(pdt, n, k);
+            const aligned_len = try page.alignUp(packed_len);
+            const dst = try allocator.alloc(u8, aligned_len);
+            @memset(dst, 0);
+            switch (dt) {
+                .f16, .bf16 => {
+                    const src_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, src_blob[0 .. n * k * 2]));
+                    try sme.packDensePanel64(pdt, src_u16, n, k, dst[0..packed_len]);
+                },
+                .q4_affine => {
+                    const sb_off: usize = @intCast(e.params_offset);
+                    const sb_len: usize = @intCast(e.params_bytes);
+                    const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, src_blob[sb_off .. sb_off + sb_len]));
+                    try sme.packMlxQuantPanel64(.q4, src_blob[0..@intCast(e.data_bytes)], sbs, n, k, dst[0..packed_len]);
+                },
+                .q3_affine => {
+                    const sb_off: usize = @intCast(e.params_offset);
+                    const sb_len: usize = @intCast(e.params_bytes);
+                    const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, src_blob[sb_off .. sb_off + sb_len]));
+                    try sme.packMlxQuantPanel64(.q3, src_blob[0..@intCast(e.data_bytes)], sbs, n, k, dst[0..packed_len]);
+                },
+                else => unreachable,
+            }
+            ne.setLayoutAndParamKind(.sme2_panel64, .affine_scale_bias);
+            ne.data_bytes = packed_len;
+            ne.params_offset = 0;
+            ne.params_bytes = 0;
+            ne.blob_bytes = aligned_len;
+            ne.blob_crc32 = std.hash.Crc32.hash(dst);
+            payloads[i] = dst;
+        } else {
+            const dst = try allocator.dupe(u8, src_blob);
+            ne.blob_crc32 = std.hash.Crc32.hash(dst);
+            payloads[i] = dst;
+        }
+        new_entries[i] = ne;
+        built += 1;
+    }
+
+    const dir_raw_bytes: u64 = @as(u64, n_entries) * @sizeOf(amf.TensorEntry);
+    const dir_page_bytes: u64 = try page.alignUp(@intCast(dir_raw_bytes));
+    const dir_off: u64 = page.APPLE_PAGE_SIZE;
+    const blobs_start: u64 = dir_off + dir_page_bytes;
+
+    var cur_off: u64 = blobs_start;
+    for (new_entries, 0..) |*ne, i| {
+        ne.blob_offset = cur_off;
+        ne.blob_bytes = payloads[i].len;
+        cur_off += payloads[i].len;
+    }
+
+    const out = try allocator.alloc(u8, @intCast(cur_off));
+    @memset(out, 0);
+    for (new_entries, 0..) |ne, i| {
+        const off: usize = @intCast(ne.blob_offset);
+        @memcpy(out[off .. off + payloads[i].len], payloads[i]);
+    }
+    const dir_slice = std.mem.sliceAsBytes(new_entries);
+    @memcpy(out[@intCast(dir_off)..@intCast(dir_off + dir_raw_bytes)], dir_slice);
+
+    var hdr = parsed.header;
+    hdr.directory_offset = dir_off;
+    hdr.directory_bytes = dir_page_bytes;
+    hdr.directory_crc32 = std.hash.Crc32.hash(dir_slice);
+    hdr.header_crc32 = amf.computeHeaderCrc32(&hdr);
+    @memcpy(out[0..@sizeOf(amf.Header)], std.mem.asBytes(&hdr));
+    return out;
+}
+
+test "M4.5 W15 single-owner sme2_panel64 routers and all-linear match row_major GPU decode and verifyTree" {
+    const gpa = std.testing.allocator;
+
+    // 1. MoE q3_affine with single-owner `sme2_panel64` routers-only (`--targets routers`)
+    {
+        const cfg: ModelConfig = .{
+            .arch = .qwen3_moe,
+            .quant_bits = .q3,
+            .default_float_dtype = .bf16,
+            .vocab_size = 128,
+            .hidden_size = 128,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 2,
+            .num_key_value_heads = 1,
+            .head_dim = 64,
+            .moe_intermediate_size = 128,
+            .num_experts = 16,
+            .num_experts_per_tok = 2,
+            .norm_topk_prob = true,
+        };
+        const row_img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+            .linear_dtype = .q3_affine,
+            .embed_dtype = .q3_affine,
+            .norm_dtype = .bf16,
+            .router_dtype = .q3_affine,
+            .expert_dtype = .q3_affine,
+        }, 0x4501);
+        defer gpa.free(row_img);
+        const sme_img = try repackAmfBytesToSme2(gpa, row_img, .routers, null);
+        defer gpa.free(sme_img);
+
+        var gpu_model = try Qwen3Model.loadFromBytes(gpa, row_img, cfg, .{
+            .max_seq_len = 32,
+            .chunk_tokens = 16,
+            .max_tree_nodes = 8,
+            .sme_router_mode = .gpu,
+        });
+        defer gpu_model.deinit(gpa);
+        var sme_model = try Qwen3Model.loadFromBytes(gpa, sme_img, cfg, .{
+            .max_seq_len = 32,
+            .chunk_tokens = 16,
+            .max_tree_nodes = 8,
+            .sme_router_mode = .auto,
+        });
+        defer sme_model.deinit(gpa);
+
+        try std.testing.expect(!gpu_model.hasSme2Weights());
+        try std.testing.expect(sme_model.hasSme2Weights());
+        const cal = sme_model.routerPredCalibration();
+        try std.testing.expectEqual(RouterPredBackend.sme2_single_owner, cal.backend);
+        try std.testing.expectEqual(@as(u64, 0), cal.bank_bytes); // single-owner: ZERO duplicate RAM!
+
+        var cur_g: u32 = 11;
+        var cur_s: u32 = 11;
+        for (0..5) |step| {
+            cur_g = try gpu_model.stepDecode(cur_g, @intCast(step));
+            cur_s = try sme_model.stepDecode(cur_s, @intCast(step));
+            try std.testing.expectEqual(cur_g, cur_s);
+        }
+
+        // Verify tree parity as well.
+        gpu_model.resetKvCache();
+        sme_model.resetKvCache();
+        try gpu_model.prefillToken(11, 0);
+        try sme_model.prefillToken(11, 0);
+        const toks = [_]u32{ 5, 19, 37, 73 };
+        const pos = [_]u32{ 1, 2, 2, 3 };
+        const masks = [_]u64{ 0b0001, 0b0011, 0b0101, 0b1011 };
+        const vr_g = try gpu_model.verifyTree(&toks, &pos, &masks, 1, true);
+        const vr_s = try sme_model.verifyTree(&toks, &pos, &masks, 1, true);
+        try std.testing.expectEqualSlices(u32, vr_g.argmax_tokens, vr_s.argmax_tokens);
+    }
+
+    // 2. MoE q4_affine all-linear with cold-tagged `ldnt1b` experts (`--targets all-linear`)
+    {
+        const cfg: ModelConfig = .{
+            .arch = .qwen3_moe,
+            .quant_bits = .q4,
+            .default_float_dtype = .f16,
+            .vocab_size = 96,
+            .hidden_size = 128,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 2,
+            .num_key_value_heads = 1,
+            .head_dim = 64,
+            .moe_intermediate_size = 128,
+            .num_experts = 8,
+            .num_experts_per_tok = 2,
+            .norm_topk_prob = true,
+        };
+        const row_img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+            .linear_dtype = .q4_affine,
+            .embed_dtype = .f16,
+            .norm_dtype = .f16,
+            .router_dtype = .f16,
+            .expert_dtype = .q4_affine,
+        }, 0x4502);
+        defer gpa.free(row_img);
+        const sme_img = try repackAmfBytesToSme2(gpa, row_img, .all_linear, 4);
+        defer gpa.free(sme_img);
+
+        var gpu_model = try Qwen3Model.loadFromBytes(gpa, row_img, cfg, .{
+            .max_seq_len = 32,
+            .chunk_tokens = 16,
+            .max_tree_nodes = 8,
+            .sme_router_mode = .gpu,
+        });
+        defer gpu_model.deinit(gpa);
+        var sme_model = try Qwen3Model.loadFromBytes(gpa, sme_img, cfg, .{
+            .max_seq_len = 32,
+            .chunk_tokens = 16,
+            .max_tree_nodes = 8,
+            .sme_router_mode = .auto,
+        });
+        defer sme_model.deinit(gpa);
+
+        try std.testing.expect(sme_model.hasSme2Weights());
+        var cur: u32 = 7;
+        for (0..4) |step| {
+            const g_tok = try gpu_model.stepDecode(cur, @intCast(step));
+            const s_tok = try sme_model.stepDecode(cur, @intCast(step));
+            try std.testing.expectEqual(g_tok, s_tok);
+            var max_diff: f32 = 0.0;
+            for (gpu_model.readLogitsF16(), sme_model.readLogitsF16()) |a, b| {
+                const d = @abs(@as(f32, @floatCast(a)) - @as(f32, @floatCast(b)));
+                if (d > max_diff) max_diff = d;
+            }
+            try std.testing.expect(max_diff < 0.05);
+            cur = g_tok;
+        }
+    }
+
+    // 3. Dense bf16 all-linear (`--targets all-linear`)
+    {
+        const cfg: ModelConfig = .{
+            .arch = .qwen3_dense,
+            .quant_bits = null,
+            .default_float_dtype = .bf16,
+            .vocab_size = 96,
+            .hidden_size = 128,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 2,
+            .num_key_value_heads = 1,
+            .head_dim = 64,
+            .intermediate_size = 192,
+            .tie_word_embeddings = false,
+        };
+        const row_img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+            .linear_dtype = .bf16,
+            .embed_dtype = .bf16,
+            .norm_dtype = .bf16,
+            .use_weight_suffix = true,
+        }, 0x4503);
+        defer gpa.free(row_img);
+        const sme_img = try repackAmfBytesToSme2(gpa, row_img, .all_linear, null);
+        defer gpa.free(sme_img);
+
+        var gpu_model = try Qwen3Model.loadFromBytes(gpa, row_img, cfg, .{
+            .max_seq_len = 32,
+            .chunk_tokens = 16,
+            .max_tree_nodes = 8,
+        });
+        defer gpu_model.deinit(gpa);
+        var sme_model = try Qwen3Model.loadFromBytes(gpa, sme_img, cfg, .{
+            .max_seq_len = 32,
+            .chunk_tokens = 16,
+            .max_tree_nodes = 8,
+        });
+        defer sme_model.deinit(gpa);
+
+        const toks = [_]u32{ 3, 9, 15, 21 };
+        const pos = [_]u32{ 0, 1, 1, 2 };
+        const masks = [_]u64{ 0b0001, 0b0011, 0b0101, 0b1011 };
+        const vr_g = try gpu_model.verifyTree(&toks, &pos, &masks, 0, true);
+        const vr_s = try sme_model.verifyTree(&toks, &pos, &masks, 0, true);
+        try std.testing.expectEqualSlices(u32, vr_g.argmax_tokens, vr_s.argmax_tokens);
+    }
+}
+
+test "M4.5 C13 L2-resident SME2 router prediction matches GPU bitsets and calibrates automatically" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .default_float_dtype = .bf16,
+        .vocab_size = 128,
+        .hidden_size = 256,
+        .num_hidden_layers = 8,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 32,
+        .num_experts_per_tok = 4,
+        .norm_topk_prob = true,
+    };
+    const image = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q3_affine,
+        .embed_dtype = .q3_affine,
+        .norm_dtype = .bf16,
+        .router_dtype = .bf16,
+        .expert_dtype = .q3_affine,
+    }, 0x4513);
+    defer gpa.free(image);
+
+    var model = try Qwen3Model.loadFromBytes(gpa, image, cfg, .{
+        .max_seq_len = 32,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 16,
+        .sme_router_mode = .auto,
+    });
+    defer model.deinit(gpa);
+
+    const caps = try sme.SmeCaps.probe();
+    const cal = model.routerPredCalibration();
+    if (caps.supportsSme2()) {
+        try std.testing.expectEqual(RouterPredBackend.sme2, cal.backend);
+        try std.testing.expect(cal.sme2_us > 0.0 and cal.gpu_us > 0.0);
+        try std.testing.expect(cal.sme2_us < cal.gpu_us);
+        try std.testing.expect(cal.bank_bytes > 0);
+        try std.testing.expectEqual(@as(u32, 8), cal.sampled_layers);
+    }
+
+    const toks = [_]u32{ 1, 7, 19, 43, 61, 89, 103, 121 };
+    var gpu_bs: [8 * MAX_EXPERT_PRED_LAYERS]tree_mod.ExpertBitset = undefined;
+    var sme_bs: [8 * MAX_EXPERT_PRED_LAYERS]tree_mod.ExpertBitset = undefined;
+    const s_g = try model.predictMoEExpertsForTokensGpu(&toks, &gpu_bs);
+    const s_s = try model.predictMoEExpertsForTokensSme2(&toks, &sme_bs);
+    try std.testing.expectEqual(s_g, s_s);
+    try std.testing.expectEqual(@as(u32, 8), s_s);
+
+    var overlap: usize = 0;
+    const total = toks.len * @as(usize, s_s) * cfg.num_experts_per_tok;
+    for (0..toks.len * s_s) |i| {
+        try std.testing.expectEqual(cfg.num_experts_per_tok, sme_bs[i].count());
+        overlap += gpu_bs[i].intersectWith(sme_bs[i]).count();
+    }
+    // Folded f16 L2 router bank agrees >98% with GPU top-K expert sets.
+    try std.testing.expect(@as(f64, @floatFromInt(overlap)) / @as(f64, @floatFromInt(total)) >= 0.98);
+}
+
+test "M4.5 C12 evalSwiGluExpertSme2 non-temporal ldnt1b matches FP32 reference across bf16, q4 and q3" {
+    const gpa = std.testing.allocator;
+    var disp = try sme.SmeDispatcher.init(gpa, .{});
+    defer disp.deinit();
+
+    const m: usize = 6;
+    const h: usize = 128;
+    const inter: usize = 64;
+    const dtypes = [_]sme.PanelDType{ .bf16, .q4_affine, .q3_affine };
+
+    var rng_st: u64 = 0x51C1_0045;
+    for (dtypes) |dt| {
+        const act_fdt: quant.FloatDType = if (dt.activationIsBf16()) .bf16 else .f16;
+        const x_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), m * h);
+        defer gpa.free(x_u16);
+        const x_f32 = try gpa.alloc(f32, m * h);
+        defer gpa.free(x_f32);
+        const resid_f32 = try gpa.alloc(f32, m * h);
+        defer gpa.free(resid_f32);
+        for (0..m * h) |i| {
+            const v = (@as(f32, @floatFromInt(nextRng(&rng_st) & 0xFFFF)) / 32768.0 - 1.0) * 0.5;
+            x_u16[i] = quant.f32ToFloatBits(act_fdt, v);
+            x_f32[i] = quant.floatBitsToF32(act_fdt, x_u16[i]);
+            resid_f32[i] = (@as(f32, @floatFromInt(nextRng(&rng_st) & 0xFFFF)) / 32768.0 - 1.0) * 0.25;
+        }
+
+        const gate_bytes = try sme.packedBlobBytes(dt, inter, h);
+        const down_bytes = try sme.packedBlobBytes(dt, h, inter);
+        const gate_p = try gpa.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), gate_bytes);
+        defer gpa.free(gate_p);
+        const up_p = try gpa.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), gate_bytes);
+        defer gpa.free(up_p);
+        const down_p = try gpa.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), down_bytes);
+        defer gpa.free(down_p);
+
+        const gate_ref = try gpa.alloc(f32, inter * h);
+        defer gpa.free(gate_ref);
+        const up_ref = try gpa.alloc(f32, inter * h);
+        defer gpa.free(up_ref);
+        const down_ref = try gpa.alloc(f32, h * inter);
+        defer gpa.free(down_ref);
+
+        if (!dt.isQuantized()) {
+            const g_u16 = try gpa.alloc(u16, inter * h);
+            defer gpa.free(g_u16);
+            const u_u16 = try gpa.alloc(u16, inter * h);
+            defer gpa.free(u_u16);
+            const d_u16 = try gpa.alloc(u16, h * inter);
+            defer gpa.free(d_u16);
+            for (0..inter * h) |i| {
+                const gv = (@as(f32, @floatFromInt(nextRng(&rng_st) & 0xFFFF)) / 32768.0 - 1.0) * 0.2;
+                const uv = (@as(f32, @floatFromInt(nextRng(&rng_st) & 0xFFFF)) / 32768.0 - 1.0) * 0.2;
+                g_u16[i] = quant.f32ToFloatBits(act_fdt, gv);
+                u_u16[i] = quant.f32ToFloatBits(act_fdt, uv);
+                gate_ref[i] = quant.floatBitsToF32(act_fdt, g_u16[i]);
+                up_ref[i] = quant.floatBitsToF32(act_fdt, u_u16[i]);
+            }
+            for (0..h * inter) |i| {
+                const dv = (@as(f32, @floatFromInt(nextRng(&rng_st) & 0xFFFF)) / 32768.0 - 1.0) * 0.2;
+                d_u16[i] = quant.f32ToFloatBits(act_fdt, dv);
+                down_ref[i] = quant.floatBitsToF32(act_fdt, d_u16[i]);
+            }
+            try sme.packDensePanel64(dt, g_u16, inter, h, gate_p);
+            try sme.packDensePanel64(dt, u_u16, inter, h, up_p);
+            try sme.packDensePanel64(dt, d_u16, h, inter, down_p);
+        } else {
+            const mask: u8 = if (dt == .q4_affine) 0x0F else 0x07;
+            const g_codes = try gpa.alloc(u8, inter * h);
+            defer gpa.free(g_codes);
+            const u_codes = try gpa.alloc(u8, inter * h);
+            defer gpa.free(u_codes);
+            const d_codes = try gpa.alloc(u8, h * inter);
+            defer gpa.free(d_codes);
+            const g_sb = try gpa.alloc(quant.ScaleBias, inter * (h / 64));
+            defer gpa.free(g_sb);
+            const u_sb = try gpa.alloc(quant.ScaleBias, inter * (h / 64));
+            defer gpa.free(u_sb);
+            const d_sb = try gpa.alloc(quant.ScaleBias, h * (inter / 64));
+            defer gpa.free(d_sb);
+            for (g_sb) |*sb| sb.* = .{ .scale = 0.04, .bias = -0.15 };
+            for (u_sb) |*sb| sb.* = .{ .scale = 0.04, .bias = -0.15 };
+            for (d_sb) |*sb| sb.* = .{ .scale = 0.04, .bias = -0.15 };
+            for (0..inter) |r| {
+                for (0..h) |c| {
+                    g_codes[r * h + c] = @as(u8, @truncate(nextRng(&rng_st))) & mask;
+                    u_codes[r * h + c] = @as(u8, @truncate(nextRng(&rng_st))) & mask;
+                    const gsb = g_sb[r * (h / 64) + c / 64];
+                    const usb = u_sb[r * (h / 64) + c / 64];
+                    gate_ref[r * h + c] = @as(f32, @floatFromInt(g_codes[r * h + c])) * @as(f32, @floatCast(gsb.scale)) + @as(f32, @floatCast(gsb.bias));
+                    up_ref[r * h + c] = @as(f32, @floatFromInt(u_codes[r * h + c])) * @as(f32, @floatCast(usb.scale)) + @as(f32, @floatCast(usb.bias));
+                }
+            }
+            for (0..h) |r| {
+                for (0..inter) |c| {
+                    d_codes[r * inter + c] = @as(u8, @truncate(nextRng(&rng_st))) & mask;
+                    const dsb = d_sb[r * (inter / 64) + c / 64];
+                    down_ref[r * inter + c] = @as(f32, @floatFromInt(d_codes[r * inter + c])) * @as(f32, @floatCast(dsb.scale)) + @as(f32, @floatCast(dsb.bias));
+                }
+            }
+            try sme.packQuantAffinePanel64(dt, g_codes, g_sb, inter, h, gate_p);
+            try sme.packQuantAffinePanel64(dt, u_codes, u_sb, inter, h, up_p);
+            try sme.packQuantAffinePanel64(dt, d_codes, d_sb, h, inter, down_p);
+        }
+
+        const up_scratch = try gpa.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m * inter);
+        defer gpa.free(up_scratch);
+        const inter_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), m * inter);
+        defer gpa.free(inter_u16);
+        const out_f32 = try gpa.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m * h);
+        defer gpa.free(out_f32);
+
+        try Qwen3Model.evalSwiGluExpertSme2(
+            &disp,
+            dt,
+            .affine_scale_bias,
+            .non_temporal,
+            gate_p,
+            up_p,
+            down_p,
+            x_u16,
+            up_scratch,
+            inter_u16,
+            out_f32,
+            resid_f32,
+            m,
+            h,
+            inter,
+        );
+
+        const ref_up = try gpa.alloc(f32, m * inter);
+        defer gpa.free(ref_up);
+        const ref_act = try gpa.alloc(f32, m * inter);
+        defer gpa.free(ref_act);
+        const ref_out = try gpa.alloc(f32, m * h);
+        defer gpa.free(ref_out);
+        sme.matmulRowMajorRefF32(x_f32, up_ref, null, .none, ref_up, m, inter, h);
+        sme.matmulRowMajorRefF32(x_f32, gate_ref, ref_up, .swiglu_gate_up, ref_act, m, inter, h);
+        for (ref_act) |*v| v.* = quant.floatBitsToF32(act_fdt, quant.f32ToFloatBits(act_fdt, v.*));
+        sme.matmulRowMajorRefF32(ref_act, down_ref, resid_f32, .add_residual, ref_out, m, h, inter);
+
+        for (out_f32, ref_out) |got, exp| {
+            try std.testing.expectApproxEqAbs(exp, got, 1e-2);
+        }
+    }
+}
+
+test "M4.5 D11 sampleFromLastLogits uses Secure Enclave TRNG and replays bit-exact with explicit seed" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 128,
+        .hidden_size = 64,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .tie_word_embeddings = true,
+    };
+    const img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .bf16,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+    }, 0xD110);
+    defer gpa.free(img);
+
+    var model = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{ .max_seq_len = 16, .chunk_tokens = 16 });
+    defer model.deinit(gpa);
+
+    _ = try model.stepDecode(5, 0);
+    const p_res = try gpa.alloc(f32, cfg.vocab_size);
+    defer gpa.free(p_res);
+
+    var trng_a = try rng_mod.RequestRng.init(null);
+    const trng_b = try rng_mod.RequestRng.init(null);
+    try std.testing.expectEqual(rng_mod.SeedSource.hardware_trng, trng_a.seedSource());
+    try std.testing.expect(trng_a.seed_used != trng_b.seed_used);
+
+    var seq_a: [8]u32 = undefined;
+    for (&seq_a) |*t| t.* = try model.sampleFromLastLogits(0.8, trng_a.random(), p_res);
+
+    var replay = try rng_mod.RequestRng.init(trng_a.seed_used);
+    try std.testing.expectEqual(rng_mod.SeedSource.explicit, replay.seedSource());
+    var seq_replay: [8]u32 = undefined;
+    for (&seq_replay) |*t| t.* = try model.sampleFromLastLogits(0.8, replay.random(), p_res);
+    try std.testing.expectEqualSlices(u32, &seq_a, &seq_replay);
 }

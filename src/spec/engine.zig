@@ -23,6 +23,8 @@ const sam_mod = @import("sam.zig");
 const tree_mod = @import("tree.zig");
 const accept_mod = @import("accept.zig");
 const draft_mod = @import("draft.zig");
+const rng_mod = @import("../runtime/rng.zig");
+const sme = @import("../cpu/sme.zig");
 
 pub const MAX_TREE_NODES: u16 = tree_mod.MAX_SUPPORTED_NODES;
 const MAX_PRED_LAYERS: usize = qwen3.MAX_EXPERT_PRED_LAYERS;
@@ -377,6 +379,10 @@ pub const SpecEngine = struct {
         if (self.draft_head) |dh| return dh.effective_placement;
         if (self.small_draft) |sd| return sd.effective_placement;
         return .gpu;
+    }
+
+    pub fn routerPredCalibration(self: *const SpecEngine) qwen3.SmeRouterCalibration {
+        return self.target.routerPredCalibration();
     }
 
     fn effectiveMaxSeqLen(self: *const SpecEngine) u32 {
@@ -1588,4 +1594,149 @@ test "M4 SpecEngine on cold-expert NVMe MoE target applies D7 cold penalty and m
         prod += rs.emitted_count;
     }
     try std.testing.expectEqualSlices(u32, &expected, &actual);
+}
+
+test "M4.5 C13 SpecEngine SME2 L2-resident router matches GPU router bit-for-bit at T=0" {
+    const allocator = std.testing.allocator;
+    const cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .default_float_dtype = .bf16,
+        .vocab_size = 96,
+        .hidden_size = 128,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 16,
+        .num_experts_per_tok = 2,
+        .norm_topk_prob = true,
+    };
+    const image = try qwen3.buildSyntheticAmfImageWithSpec(allocator, cfg, .{
+        .linear_dtype = .q3_affine,
+        .embed_dtype = .q3_affine,
+        .norm_dtype = .bf16,
+        .router_dtype = .bf16,
+        .expert_dtype = .q3_affine,
+    }, 0x45C13);
+    defer allocator.free(image);
+
+    const prompt = [_]u32{ 2, 9, 17, 25, 2, 9, 17, 25 };
+
+    var tgt_gpu = try qwen3.Qwen3Model.loadFromBytes(allocator, image, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 12,
+        .sme_router_mode = .gpu,
+    });
+    defer tgt_gpu.deinit(allocator);
+
+    var eng_gpu = try SpecEngine.init(allocator, &tgt_gpu, null, .{
+        .mode = .l1_only,
+        .max_tree_nodes = 10,
+        .enable_pruning = true,
+        .temperature = 0.0,
+    });
+    defer eng_gpu.deinit(allocator);
+    try std.testing.expectEqual(qwen3.RouterPredBackend.gpu, eng_gpu.routerPredCalibration().backend);
+
+    var out_gpu: [12]u32 = undefined;
+    out_gpu[0] = try eng_gpu.prefill(&prompt, null);
+    var p_g: usize = 1;
+    while (p_g < out_gpu.len) {
+        const rs = try eng_gpu.stepRound(null, out_gpu[p_g..]);
+        p_g += rs.emitted_count;
+    }
+
+    var tgt_sme = try qwen3.Qwen3Model.loadFromBytes(allocator, image, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 12,
+        .sme_router_mode = .auto,
+    });
+    defer tgt_sme.deinit(allocator);
+
+    var eng_sme = try SpecEngine.init(allocator, &tgt_sme, null, .{
+        .mode = .l1_only,
+        .max_tree_nodes = 10,
+        .enable_pruning = true,
+        .temperature = 0.0,
+    });
+    defer eng_sme.deinit(allocator);
+
+    const caps = try sme.SmeCaps.probe();
+    if (caps.supportsSme2()) {
+        try std.testing.expectEqual(qwen3.RouterPredBackend.sme2, eng_sme.routerPredCalibration().backend);
+    }
+
+    var out_sme: [12]u32 = undefined;
+    out_sme[0] = try eng_sme.prefill(&prompt, null);
+    var p_s: usize = 1;
+    while (p_s < out_sme.len) {
+        const rs = try eng_sme.stepRound(null, out_sme[p_s..]);
+        p_s += rs.emitted_count;
+    }
+    try std.testing.expectEqualSlices(u32, &out_gpu, &out_sme);
+}
+
+test "M4.5 D11 SpecEngine Secure Enclave TRNG seeds replay bit-exact with explicit seed" {
+    const allocator = std.testing.allocator;
+    const cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = null,
+        .default_float_dtype = .bf16,
+        .vocab_size = 96,
+        .hidden_size = 64,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .tie_word_embeddings = true,
+    };
+    const image = try qwen3.buildSyntheticAmfImageWithSpec(allocator, cfg, .{
+        .linear_dtype = .bf16,
+        .embed_dtype = .bf16,
+        .norm_dtype = .bf16,
+    }, 0x45D11);
+    defer allocator.free(image);
+
+    var tgt = try qwen3.Qwen3Model.loadFromBytes(allocator, image, cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 8,
+    });
+    defer tgt.deinit(allocator);
+
+    var eng = try SpecEngine.init(allocator, &tgt, null, .{
+        .mode = .l1_only,
+        .max_tree_nodes = 8,
+        .enable_pruning = true,
+        .temperature = 0.7,
+    });
+    defer eng.deinit(allocator);
+
+    const prompt = [_]u32{ 3, 11, 23, 37 };
+
+    var rng_hw = try rng_mod.RequestRng.init(null);
+    try std.testing.expectEqual(rng_mod.SeedSource.hardware_trng, rng_hw.seedSource());
+    var out_hw: [10]u32 = undefined;
+    out_hw[0] = try eng.prefill(&prompt, rng_hw.random());
+    var p1: usize = 1;
+    while (p1 < out_hw.len) {
+        const rs = try eng.stepRound(rng_hw.random(), out_hw[p1..]);
+        p1 += rs.emitted_count;
+    }
+
+    var rng_replay = try rng_mod.RequestRng.init(rng_hw.seed_used);
+    try std.testing.expectEqual(rng_mod.SeedSource.explicit, rng_replay.seedSource());
+    var out_replay: [10]u32 = undefined;
+    out_replay[0] = try eng.prefill(&prompt, rng_replay.random());
+    var p2: usize = 1;
+    while (p2 < out_replay.len) {
+        const rs = try eng.stepRound(rng_replay.random(), out_replay[p2..]);
+        p2 += rs.emitted_count;
+    }
+    try std.testing.expectEqualSlices(u32, &out_hw, &out_replay);
 }
