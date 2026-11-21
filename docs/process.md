@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M4 — Neural Engine and storage completed (2026-11-21); next: **M5 — serving and pipelining** (kqueue SSE server `C7`–`C8`, NVMe N-gram L1 tables `C6`, PEARL-style pipelined drafting `D8`, optional GSQ+RCO hybrid quantization `W14`/`G13`).
+M4 — Neural Engine and storage completed (2026-11-21); next: **M4.5 — bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine** (Spike `S7`, `W15`, `D11`, `C11`–`C13`, [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md)), followed by **M5 — serving and pipelining**.
 
 ## Milestones
 
@@ -21,8 +21,9 @@ Status-row IDs refer to [status.md](status.md).
 | M2.5 | Standard FP16 / BF16 and multi-shard import | W12, W13, G12 | Multi-shard `aminfer-tools pack-amf` converts local `Qwen3-30B-A3B-3bit`, `Qwen3-14B-4bit`, and `Qwen3-0.6B` (`BF16`) with bounded RAM; native `FP16` and `BF16` GEMV / GEMM / MoE SwiGLU match CPU fp32 reference; real-checkpoint greedy decode verified end-to-end (incl. `Qwen3-0.6B` `BF16`) with bandwidth archived in [benchmarks/results.md](benchmarks/results.md) | Completed |
 | M3 | Speculative decoding | D1–D3, D5–D7, D9, G5 | Lossless output versus M2/M2.5; speedup over the non-speculative baseline, acceptance-length and experts-per-pass statistics recorded | Completed |
 | M4 | Neural Engine and storage | A1–A3, G6, W7, W8, C3–C5, D4 | Hybrid prefill throughput versus GPU-only prefill; expert-prediction recall and prefetch lead time; cold-expert decode without swap | Completed |
-| M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Not started |
-| M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`) | R6, W9, W10, G7–G9, G10 (GR), C10 (PLE) | Composable model operator graph; `Qwen3.8-Flash-Next` (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end (128 GB+ full wired residency; 24 GB M4 hot/cold + PLE async prefetch without swap) | Not started |
+| M4.5 | Bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine | W15, D11, C11–C13 | Pre-`smstart` `d8–d15` canary & `fp32` parity tests pass; `sme2_panel64` single-owner layout preserves `.amf` v0 binary compatibility; Spike `S7` benchmarks 3-way `.s` kernels vs `Accelerate`/`BNNS`, P-cluster thread saturation, and GPU co-execution (`> 1.05×` gate, `0` swap); Secure Enclave TRNG `D11` seeding verified | Planned |
+| M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Planned |
+| M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`) | R6, W9, W10, G7–G9, G10 (GR), C10 (PLE) | Composable model operator graph; `Qwen3.8-Flash-Next` (`qwen4_exp`: Gated DeltaNet + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end (128 GB+ full wired residency; 24 GB M4 hot/cold + PLE async prefetch without swap) | Planned |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
 ## Spikes
@@ -38,6 +39,7 @@ Confirmed, or before an accepted design is tuned.
 | S4 | ANE handoff latency (GPU → CPU → ANE → CPU → GPU) and bandwidth contention of concurrent ANE weight streaming on GPU GEMV | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) | M3 | Closed |
 | S5 | Unique experts per layer versus draft-tree size for Qwen3-30B-A3B; effective bandwidth of deduplicated vs per-slot expert kernels | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) | M3 | Closed |
 | S6 | ANE attention block: CoreML compilation, static shapes for a growing KV length, fp16 numerics, throughput vs GPU | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), A3 | M4 | Closed |
+| S7 | Bare-metal M4+ SME2 throughput (`M=1..4` `ZT0-LUT+Dot`, `M=5..16` `1×4` `ZA`, `M>=32` `2×2` `ZA`) vs `Accelerate`/`BNNS`, P-cluster threads-per-cluster saturation, `otool` zero-spill check, and unified-memory bus contention gate vs Metal GPU | [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md), C13 | M4.5 | Open |
 
 ## M0 task list
 
@@ -337,6 +339,14 @@ per-tensor / per-expert hybrid quantization pipeline (`W14`, `G13`, targeting
 M5 with strict per-block granularity and zero runtime Python or intra-tensor
 bit mixing) was accepted as
 [ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md).
+During M4 close-out on 2026-11-21, the user formally confirmed inserting
+Milestone **M4.5** for the bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine
+(`C11`–`C13`, `W15`, Spike `S7`,
+[ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md)), adopting
+two-tier Apple Silicon Secure Enclave TRNG (`getentropy`) → slot-local
+`Xoshiro256` per-request sampling RNG (`D11`), and resolving `R5`, `C8`, `D8`,
+`ADR-0005`, `ADR-0016` residual alignment, and `ADR-0017` `G13` initial scheme
+selection ([architecture/open-decisions-research.md](architecture/open-decisions-research.md)).
 
 ## Session handoff snapshot
 
@@ -386,8 +396,11 @@ Update this before the context window runs out or when handing off.
     (`A1`–`A3`, `S6`), `6b6fb09` M4 engine/CLI/benchmark integration (`G6`,
     `D4`, cold-expert NVMe streaming, `bench-m4`, `bench-a2`), `8701fdb`
     two-phase `bench-a2` weight release for zero-swap real-checkpoint eval,
-    plus M4 benchmark archive & close-out docs
-- In flight: none (M4 completed; ready for M5)
+    `bd93b09` M4 benchmark archive & close-out docs
+  - M4.5 / confirmed decisions docs: `f91fff9` `ADR-0018` bare-metal SME2
+    engine, `D11` TRNG seeding & confirmed open-decision codification, plus
+    M4.5 status/process roadmap sync
+- In flight: none (M4 completed; ready to begin M4.5 bare-metal ARMv9 SME2 engine)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [benchmarks/results.md](benchmarks/results.md),
@@ -399,4 +412,5 @@ Update this before the context window runs out or when handing off.
   [decisions/0011-metal4-zero-allocation-hot-path.md](decisions/0011-metal4-zero-allocation-hot-path.md),
   [decisions/0013-eagle-tree-and-head-formats.md](decisions/0013-eagle-tree-and-head-formats.md),
   [decisions/0016-native-fp16-bf16-and-multishard-import.md](decisions/0016-native-fp16-bf16-and-multishard-import.md),
-  [decisions/0017-optional-gsq-rco-hybrid-quantization.md](decisions/0017-optional-gsq-rco-hybrid-quantization.md)
+  [decisions/0017-optional-gsq-rco-hybrid-quantization.md](decisions/0017-optional-gsq-rco-hybrid-quantization.md),
+  [decisions/0018-bare-metal-armv9-sme2-engine.md](decisions/0018-bare-metal-armv9-sme2-engine.md)

@@ -17,7 +17,7 @@ Last updated: 2026-11-21.
 | **Undecided** | Open question; the options are listed in the referenced document. |
 | **Future** | Long-term plan; at most an interface is reserved. |
 
-Milestones (M0–M7) are defined in [process.md](process.md#milestones).
+Milestones (M0–M7, including M2.5 and M4.5) are defined in [process.md](process.md#milestones).
 
 ## Foundation
 
@@ -41,7 +41,7 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | R2 | GPU residency through `MTLResidencySet` | Implemented | M1 | [memory.md](architecture/memory.md) |
 | R3 | KV tiles: IOSurface (fp16 `OneComponent16Half`, 64 B row stride) viewed as `MTLTexture` | Implemented | M2 | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
 | R4 | KV tile granularity (one 512-token chunk per layer) and token-major `RGBA16Float` rows | Implemented | M2 (spike S1) | [memory.md](architecture/memory.md#kv-tiles), [results.md](benchmarks/results.md) |
-| R5 | int8 KV tiles (`OneComponent8`) | Undecided | — | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md) |
+| R5 | int8 KV tiles (`OneComponent8` declined for ANE↔GPU IOSurface; keep `OneComponent16Half` / `RGBA16Float`; optional GPU-side group-64 `q8` `MTLBuffer` tier for retired 32K+ chunks) | Confirmed (`GPU q8 tier: Future`) | — | [ADR-0004](decisions/0004-kv-cache-iosurface-texture-sharing.md), [memory.md](architecture/memory.md) |
 | R6 | Fixed-size recurrent state arenas in `WiredArena` for Gated DeltaNet layers (3:1 hybrid with `KvTile`s) | Confirmed | M6 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 | R7 | MLA + CSA2 (`Full` / `Reindex` / `Reuse`) cross-layer KV sharing, FP4 KV (`E2M1` + `E4M3` scale, 890 B/tok) and SWA bounded replay | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
 
@@ -63,6 +63,7 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | W12 | Multi-shard Hugging Face / MLX safetensors (`model.safetensors.index.json`) streaming import and `.amf` `bf16` (`DType.bf16 = 4`) weight support | Implemented | M2.5 | [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md), [experts-and-storage.md](architecture/experts-and-storage.md#amf-format), [results.md](benchmarks/results.md) |
 | W13 | Standard unquantized and mixed-precision `FP16` / `BF16` model execution (`tie_word_embeddings`, per-tensor dtype dispatch, `RGBA16Float` `KvTile` boundary; verified on `Qwen3-0.6B` BF16, `Qwen3-14B-4bit`, and `Qwen3-30B-A3B-3bit`) | Implemented | M2.5 | [ADR-0016](decisions/0016-native-fp16-bf16-and-multishard-import.md), [memory.md](architecture/memory.md#kv-tiles), [results.md](benchmarks/results.md) |
 | W14 | Optional offline Python GSQ + RCO sensitivity & residual-compensation `.amf` exporter with static per-tensor / per-expert `QuantScheme` tags (`q2`/`q3`/`q4`/`q6`/`q8` affine + `f16`/`bf16`) | Confirmed | M5 | [ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md), [experts-and-storage.md](architecture/experts-and-storage.md) |
+| W15 | `sme2_panel64` K-interleaved panel pre-packer with inline group metadata and binary-compatible `TensorEntry.reserved0` single-owner layout tag | Confirmed | M4.5 | [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md) |
 
 ## GPU (L3)
 
@@ -93,9 +94,10 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | D5 | Benchmark-gated placement of EAGLE / MTP heads (ANE vs GPU) | Implemented | M3 | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md), [results.md](benchmarks/results.md) |
 | D6 | Dual-source tree merging (L1 seed prefix ≥ 4 tokens → L2) | Implemented | M3 | [ADR-0005](decisions/0005-dual-source-tree-merging.md), [results.md](benchmarks/results.md) |
 | D7 | Expert-byte-budget tree pruning (dense models: node budget) | Implemented | M3 | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md), [results.md](benchmarks/results.md) |
-| D8 | PEARL-style pipelined drafting for the independent small draft | Confirmed (design Draft) | M5 | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) |
+| D8 | PEARL-style pipelined drafting for the independent small draft (target-latency-gated for high-latency targets such as `Qwen3-14B`) | Confirmed | M5 | [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) |
 | D9 | Lossless stochastic acceptance for temperature > 0 | Implemented | M3 | [speculative-decoding.md](architecture/speculative-decoding.md), [results.md](benchmarks/results.md) |
 | D10 | DSpark semi-autoregressive speculative decoding adapter under `DraftSource` | Future | M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| D11 | Two-tier per-request sampling RNG: Apple Silicon Secure Enclave TRNG (`getentropy`) initial 64-bit seed → slot-local `Xoshiro256` + `seed_used` echo | Confirmed | M4.5 | [speculative-decoding.md](architecture/speculative-decoding.md#sampling-rng-and-hardware-entropy-seeding), [runtime-pipeline.md](architecture/runtime-pipeline.md#request-lifecycle) |
 
 ## Neural Engine
 
@@ -116,9 +118,12 @@ Milestones (M0–M7) are defined in [process.md](process.md#milestones).
 | C5 | Hot / cold expert cache policy (`ExpertSlotPool` + LFU-decay `ExpertCache` with pass pinning and async prefetch) | Implemented | M4 | [experts-and-storage.md](architecture/experts-and-storage.md), [results.md](benchmarks/results.md#m4-neural-engine-hybrid-prefill-cold-expert-nvme-streaming-and-d4-small-draft) |
 | C6 | N-gram tables on NVMe for L1 | Draft | M5 | [experts-and-storage.md](architecture/experts-and-storage.md#n-gram-tables-on-nvme) |
 | C7 | kqueue SSE server | Confirmed | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
-| C8 | Server API shape (for example OpenAI-compatible streaming) | Undecided | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md) |
+| C8 | OpenAI-compatible stateless HTTP / SSE server API (`POST /v1/chat/completions` with `delta.reasoning_content` & `seed_used`, `GET /v1/models`, `GET /health`; optional stateless `/v1/responses` & `/v1/messages`) | Confirmed | M5 | [runtime-pipeline.md](architecture/runtime-pipeline.md#request-lifecycle) |
 | C9 | Benchmark harness with `powermetrics` and swap checks (`aminfer bench`, `just bench`) | Implemented | M1 | [system-tuning.md](guides/system-tuning.md) |
 | C10 | Sparse external lookup tables on NVMe (`F_NOCACHE` `.amf` row prefetch for 51B PLE and 196B Engram) | Confirmed (PLE: M6) / Future (Engram: M7) | M6–M7 | [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [model-roadmap.md](architecture/model-roadmap.md) |
+| C11 | Bare-metal SME2 `FEAT_SME2` runtime probe, pre-`smstart` `d8–d15`-safe `.s` harness & canary test, and P-cluster lock-free dispatcher (M1–M3 fallback without `SIGILL`) | Confirmed | M4.5 | [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md), [ADR-0001](decisions/0001-language-and-toolchain-boundaries.md) |
+| C12 | 3-way ARMv9.2 `.s` SME2 microkernels (`M=1..4` `ZT0-LUT + Dot`, `M=5..16` `1×4` `ZA`, `M>=32` `2×2` `ZA`), `ld1b` / `ldnt1b` cold-expert cache steering & fused `ZA` epilogue | Confirmed | M4.5 | [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md), [ADR-0001](decisions/0001-language-and-toolchain-boundaries.md) |
+| C13 | Spike `S7`-gated heterogeneous CPU SME2 + Metal GPU co-execution (`> 1.05×` net `tok/s` & `0` swap) | Confirmed | M4.5 (spike S7) | [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md), [ADR-0008](decisions/0008-benchmark-gated-draft-placement.md) |
 
 ## Scale-out
 
