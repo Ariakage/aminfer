@@ -353,62 +353,63 @@ Key M4.5 highlights on Apple M4 24 GiB (commits `7de016d..b23f787`, ReleaseFast,
 
 - [x] Zero-allocation `kqueue` HTTP/1.1 + SSE server (`C7`, `C8`, `src/server/http_sse.zig`) with preallocated connection slots, `SO_NOSIGPIPE`, `EVFILT_READ`/`EVFILT_WRITE`/`EVFILT_USER`, incremental UTF-8-safe `<think>...</think>` → `delta.reasoning_content` splitting, `D11` `seed_used` echo & replay, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (`stream: true|false`), and thin stateless `POST /v1/responses` & `POST /v1/messages` adapters
 - [x] `C6` 16 KiB-aligned `.ang` v1 NVMe N-gram table offline builder (`tools/src/aminfer_tools/ngram.py`, `aminfer-tools build-ngram`) and Zig `F_NOCACHE` reader with wired LRU slot cache & async `kqueue_aio` prefetch (`src/spec/ngram_nvme.zig`) integrated as L1 fallback into `SpecEngine`
-- [x] `D8` target-latency-gated PEARL async pipelined small-draft engine (`src/spec/{draft,engine,tree}.zig`, `--pearl auto|on|off`, dedicated Metal 4 compute queue for `SmallDraftModel`, lock-free worker overlapping round `r + 1` pre-drafting with `target.verifyTree(T_r)`, $O(1)$ KV rollback, and post-L1-merge `hard_cap` truncation)
-- [x] Optional offline Python GSQ + RCO sensitivity & residual-compensation `.amf` exporter (`W14`, `tools/src/aminfer_tools/gsq.py`, `aminfer-tools gsq-convert` & `pack-amf --quant-profile gsq-rco`) and Metal 4 `q2_affine` kernels + zero-sync 3-bucket `{q2, q3, q4}` scheme-bucketed MoE gather (`G13`, `src/kernels/moe_bucketed.metal`, `src/gpu/metal4.zig`, `src/model/qwen3.zig`) wired into `SpecEngine` `D7` `PruneCostModel` ([ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md))
+- [x] `D8` target-latency-gated & contention-gated multi-prefix PEARL async pipelined small-draft engine (`src/spec/{draft,engine,tree}.zig`, `src/cpu/sme.zig`, `src/model/qwen3.zig`, `--pearl auto|on|off`, off-GPU pure-CPU ARMv9 SME2 `ldnt1b` `stepDraftTreeBatch` + independent Metal 4 queue fallback, lock-free worker overlapping round `r + 1` pre-drafting with `target.verifyTree(T_r)`, zero-rewind multi-prefix speculation, early-stop on verify completion, and post-L1-merge `hard_cap` truncation)
+- [x] Optional offline Python GSQ + RCO sensitivity & residual-compensation `.amf` exporter (`W14`, `tools/src/aminfer_tools/gsq_rco.py`, `aminfer-tools gsq-convert` & `pack-amf --quant-profile gsq-rco`, scale-invariant LN peakiness proxy + boundary-layer protection) and Metal 4 `q2_affine` kernels + zero-sync 3-bucket `{q2, q3, q4}` scheme-bucketed MoE gather (`G13`, `src/kernels/{dequant_gemm,moe_ffn}.metal`, `src/gpu/{dequant,moe,attention}.zig`, `src/model/qwen3.zig`) wired into `SpecEngine` `D7` `PruneCostModel` ([ADR-0017](decisions/0017-optional-gsq-rco-hybrid-quantization.md))
 - [x] CLI & benchmark integration (`src/root.zig`, `src/main.zig`, `src/bench/runner.zig`): `aminfer serve`, `--ngram-nvme` & `--pearl` on `aminfer spec-decode`, and `aminfer bench-m5` (wired into `aminfer bench`)
-- [x] Real-hardware, real-checkpoint & live-server ReleaseFast benchmarks archived in [benchmarks/results.md](benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization): `bench-m5`, real `Qwen3-0.6B` GSQ+RCO vs MinMax vs BF16 (`qwen3-0.6b-gsq-rco.amf`), repo-scale `aminfer-repo.ang` `spec-decode`, real `Qwen3-14B-4bit + Qwen3-0.6B` PEARL A/B + `Qwen3-30B-A3B-3bit` `--pearl auto` gate check, and live `aminfer serve` HTTP/SSE + `1/4/8`-client load test (`swapouts_delta = 0`)
+- [x] Real-hardware, real-checkpoint & live-server ReleaseFast benchmarks archived in [benchmarks/results.md](benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization): idle-GPU `bench-m5`, real `Qwen3-0.6B` GSQ+RCO `4.35b` vs MinMax vs BF16 (`qwen3-0.6b-gsq-rco.amf`, fluent EN/ZH), repo-scale `aminfer-repo.ang` `spec-decode`, real `Qwen3-14B-4bit + Qwen3-0.6B` off-GPU SME2 (`qwen3-0.6b-gsq-rco-sme2.amf`) & same-GPU PEARL A/B + `Qwen3-30B-A3B-3bit` `--pearl auto` gate check, and live `aminfer serve` HTTP/SSE + `1/4/8`-client load test (`swapouts_delta = 0`)
 
 ## M5 serving, pipelining, C6 NVMe N-gram and GSQ+RCO results
 
-Canonical methodology, host contention context, full tables, and verbatim raw
-run outputs live in
+Canonical methodology, full tables, and verbatim raw run outputs live in
 [benchmarks/results.md](benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization).
-Key M5 highlights on Apple M4 24 GiB (commits `ca7e237..d5069a2`, ReleaseFast,
-`swapouts_delta = 0` across every archived run):
+Key M5 highlights on Apple M4 24 GiB (commits `ca7e237..f9d8c11`, ReleaseFast,
+idle-GPU M5 measurements, `swapouts_delta = 0` across every archived run):
 
 - **`W14` + `G13` optional GSQ + RCO hybrid quantization (`ADR-0017`)**:
-  - In `aminfer bench-m5`, Metal 4 `gemv_q2` reaches **`47.79 GB/s`** and
-    zero-sync 3-bucket `{q2, q3, q4}` scheme-bucketed MoE gather cuts active
-    expert weight bytes by **`-27.7%` to `-27.8%`** vs uniform `q4`.
-  - On real `Qwen3-0.6B` (`qwen3-0.6b-gsq-rco.amf`, `4.15` eff-bits,
-    `[bf16=113, q3=84, q4=113]`): offline RCO cuts reconstruction MSE by
-    **`-17.95%` (`1.22×` lower)** vs naive min-max (`-46.86%` / `1.88×` lower on
-    the `3.25` eff-bit stress sweep), shrinks wired RAM by **`-67.3%` to
-    `-70.5%`** (`1,251 → 409 MiB` / `1,195 → 353 MiB`), cuts `bytes/tok`
-    `-70.6%`, accelerates decode **`2.27×`–`2.74×`** (`89.49` at `seq=512`;
-    `101.32` EN / `92.19` ZH `tok/s`), and keeps coherent EN/ZH output (`0`
-    swapouts). The `3.25b` dense stress point (`58.4%` `q2_affine`) degrades
-    coherence, confirming `q2_affine` belongs on low-sensitivity / cold MoE
-    experts.
+  - In idle-GPU `aminfer bench-m5`, Metal 4 `gemv_q2` reaches **`72.15 GB/s`**
+    (`60.1%` bus) and zero-sync 3-bucket `{q2, q3, q4}` scheme-bucketed MoE
+    gather cuts active expert weight bytes **`-27.7%` to `-27.8%`** while
+    running **`1.03×` (`M=1`) to `1.11×` (`M=8`) faster** than uniform `q4`.
+  - On real `Qwen3-0.6B` (`qwen3-0.6b-gsq-rco.amf`, `4.35` eff-bits,
+    `[bf16=113, q3=29, q4=168]` with scale-invariant LN peakiness proxy &
+    boundary/attention protection): offline RCO cuts reconstruction MSE by
+    **`-16.82%` (`1.20×` lower)** vs naive min-max (`-46.86%` / `1.88×` lower on
+    the `3.25b` stress sweep), shrinks file size `-72.7%` and wired RAM
+    **`-66.2%` to `-69.3%`** (`1,251 → 423 MiB` / `1,195 → 367 MiB`), cuts
+    `bytes/tok` `-69.4%`, achieves **`171.05 tok/s` (`2.80×`)** at `seq=512` and
+    **`195.80–205.52 tok/s` (`2.90×`–`3.17×`)** on fluent bilingual EN/ZH chat
+    decode (`0` swapouts).
 - **`C6` repo-scale `F_NOCACHE` NVMe `.ang` N-gram table (`aminfer-repo.ang`)**:
   - Packed `/Volumes/Akari/models/amf/aminfer-repo.ang` (`128.02 MiB`, `8,192`
     buckets, `879,949` `2..4`-gram entries, `0` dropped, `512 KiB` wired LRU
-    cache). In `bench-m5`, `F_NOCACHE` lookup measures **`2.79 us`** cold p50
-    (`16.04 us` p99), **`0.08 us`** wired cache hit, and **`0.13 us`** async
-    prefetch hit.
+    cache). In idle-GPU `bench-m5`, `F_NOCACHE` lookup measures **`1.13 us`**
+    cold p50 (`1.63 us` p99), **`0.04 us` (`40 ns`)** wired cache hit, and
+    **`0.13 us`** async prefetch hit.
   - On real `Qwen3-0.6B` BF16 (`APPLE_PAGE_SIZE` Zig prompt, `T = 0`), `L1 + C6`
     maintains **32/32 (100%) bit-exact `token_ids`**, lifts `tau` `2.818 →`
     **`5.167`**, cuts `bytes/acc tok` **`-45.4%`**, and reaches **`216.28 tok/s`
     (`2.03×` vs L1 `106.33`, `5.21×` vs base `41.48`)**; on `Qwen3-14B-4bit`,
     `L1 + C6` matches **48/48 (100%) bit-exact**, hits `16/27` queries (`3`
     seed hits), raises `tau` `1.469 → 1.621`, and cuts `bytes/acc tok` `-9.4%`.
-- **`D8` target-latency-gated PEARL async pipelined small draft (`ADR-0008`)**:
-  - `--pearl auto` gates **`ON`** (`own_queue = yes`) for slow `Qwen3-14B-4bit`
-    and stays **`OFF`** for fast `Qwen3-30B-A3B-3bit + EAGLE-3` (`0` swapouts).
-  - On real `Qwen3-14B-4bit + Qwen3-0.6B` (`T = 0`, **64/64 (100%) bit-exact**
-    across all modes, `0` swapouts): `0.6B-GSQ-RCO --pearl off` (`6.13 tok/s`,
-    `1.08×`, `8,432 MiB`) and `0.6B-BF16 --pearl off` (`6.18 tok/s`, `1.10×`)
-    beat baseline (`5.65 tok/s`); enabling `--pearl on` / `auto` achieves
-    **`65.2%`–`75.0%`** exact+prefix hit rate, hides **`2.18–2.73 s`** of draft
-    time (`draft_ms` `-11.8%`), raises `tau` (`2.625 → 2.739` / `3.150`), and
-    cuts `bytes/acc tok` `-63.5%` to `-68.3%`, while single-GPU 10-core M4
-    contention adds `+116.9 ms/round` to `verify_ms` (`4.20–4.84 tok/s`),
-    empirically validating `--pearl {auto,on,off}` and motivating off-GPU draft
-    or Max/Ultra GPU capacity.
+- **`D8` off-GPU SME2 + multi-prefix PEARL async pipelined small draft (`ADR-0008`, `ADR-0018`)**:
+  - Running `SmallDraftModel` **100% off-GPU on ARMv9 SME2 (`qwen3-0.6b-gsq-rco-sme2.amf`,
+    `ldnt1b`, `0` Metal CBs)** completely eliminates single-GPU shader core
+    contention (`verify_ms` `247.3 → 225.2 ms`, `0%` contention!). On real
+    `Qwen3-14B-4bit` (`10.79 tok/s` base, **64/64 (100%) bit-exact**, `0`
+    swapouts), off-GPU SME2 multi-prefix PEARL achieves **`11.81 tok/s`
+    (`--pearl on`, `+10.7%` vs `--pearl off` `10.67`, `+9.5%` vs base)** and
+    **`12.10 tok/s` (`--pearl auto → ON`, `+13.4%` vs `--pearl off`, `+12.1%`
+    vs base)** with `7/19` full multi-prefix hits and `1.20–1.31 s` draft hidden.
+  - On same-GPU `0.6B-GSQ-RCO` (`13.55 tok/s` un-pipelined, `1.26×` vs base) and
+    `0.6B-BF16` (`12.27 tok/s`), the `ADR-0008` online contention gate in
+    `--pearl auto` detects single-GPU shader contention and disables overlap
+    when net gain is negative (`13.06` vs `11.83 tok/s` forced on; `13.33` vs
+    `11.07 tok/s` on BF16), while fast `Qwen3-30B-A3B-3bit + EAGLE-3` stays
+    `OFF` from startup (`0` PEARL rounds).
 - **`C7` + `C8` live `aminfer serve` HTTP/SSE & concurrency load test**:
-  - `bench-m5` loopback microbenchmark measures `/health` **`100.46 us`** p50,
-    single SSE TTFT **`131.21 us`** p50, 8-client SSE **`84,495.4 tok/s`**
-    (`896.13 us` TTFT p50), and **`0` steady-state `malloc` blocks/bytes**.
+  - Idle-GPU `bench-m5` loopback microbenchmark measures `/health` **`72.33 us`**
+    p50, single SSE TTFT **`106.21 us`** p50, 8-client SSE **`101,245.8 tok/s`**
+    (`806.08 us` TTFT p50), and **`0` steady-state `malloc` blocks/bytes**.
   - Live `aminfer serve` on real `Qwen3-0.6B` BF16 (`1,251 MiB` wired) passes
     `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (`stream=true`
     with 448-char `<think>` → `delta.reasoning_content` + `"\n\n4"` content at
@@ -456,7 +457,7 @@ Only checks that actually ran are listed.
 | 2026-11-21 | M4.5 Phase 1 (`7de016d`, `945cb4d`): ARMv9.2 `.s` SME2 3-way microkernels (`bf16`/`f16`/`q4`/`q3`/`q2`, `ld1b`/`ldnt1b`, fused `ZA` epilogue, pre-`smstart` `d8–d15` canary, P-cluster dispatcher) (`C11`, `C12`), `W15` `sme2_panel64` `.amf` v0 layout & `aminfer-tools repack-sme2`, and `D11` Secure Enclave TRNG `RequestRng` | Pass |
 | 2026-11-21 | M4.5 Phase 2 & real-checkpoint gate (`09de8e5`, `bd17c20`, `b23f787`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 209/209 tests), direct Debug test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (206/206, API + GPU Validation enabled, 0 errors), `tools` unittest (51/51, incl. Python `repack-sme2` → Zig `decode`/`spec-decode` parity & `D11` TRNG CLI), `-Dcpu=apple_m1` `otool` audit (`0` SME/SVE leaks outside 34 `_ami_sme2_*` symbols), native `otool -tvV` spill audit (`minos 26.0`, `0` streaming `sp` accesses), ReleaseFast `aminfer probe` + `aminfer bench-m45` (`Spike S7` up to `1.717 TFLOP/s` / `4.00×` Accelerate / `26.56×` dequant+Accelerate, `C13` concurrent bus `1.80×`/`1.33×` PASS, `ldnt1b` `-0.2%` vs `ld1b` `+40.9%` hot L2 penalty, `0` swapouts), `verify-amf` on all 4 real `.amf` checkpoints, real `Qwen3-0.6B` `repack-sme2` & `D11` TRNG + bit-exact replay (`decode` & `spec-decode`), and real `Qwen3-30B-A3B-3bit` + `EAGLE-3` GPU-router vs SME2 L2-router A/B (`prune 0.396 → 0.217 ms`, `52.49 → 52.97 tok/s`, 64/64 bit-exact, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m45-bare-metal-armv9-sme2-engine-spike-s7-c13-bus-contention-and-d11-trng) | Pass |
 | 2026-11-21 | M5 Phase 1 (`ca7e237`, `c697ef1`, `f2efddc`): zero-alloc `kqueue` HTTP/SSE server (`C7`, `C8`), `C6` `.ang` NVMe N-gram table + `D8` PEARL async pipelined small-draft engine, and `ADR-0017` `W14` GSQ+RCO offline exporter + `G13` `q2_affine` & 3-bucket scheme-bucketed MoE Metal 4 kernels | Pass |
-| 2026-11-21 | M5 Phase 2, real-checkpoint & live-server gate (`1f0db2a`, `b78fc8e`, `d5069a2`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast, `minos 26.0`), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 240/240 tests = 236 lib + 4 CLI), direct Debug lib test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (236/236 at `b78fc8e`, API + GPU Validation enabled, 0 errors), `tools` unittest (63/63), ReleaseFast `aminfer bench-m5` (`gemv_q2` `47.79 GB/s`, 3-bucket MoE `-27.8%` bytes, `C6` cold `2.79 us` / cache `0.08 us`, synthetic PEARL `6/6` hits bit-exact, loopback server `0` steady-state malloc & `84,495.4 tok/s`, `0` swapouts), real `Qwen3-0.6B` GSQ+RCO (`qwen3-0.6b-gsq-rco.amf`, `4.15b`, `verify-amf` OK, `-17.95%` MSE vs MinMax, `-67.3%` to `-70.5%` wired RAM, `2.27×`–`2.74×` coherent EN/ZH decode, plus `3.25b` stress sweep `-46.86%` MSE), real `aminfer-repo.ang` (`128.02 MiB`, `879,949` entries, `Qwen3-0.6B` `216.28 tok/s` = `2.03×` vs L1 / `5.21×` vs base 32/32 bit-exact & `Qwen3-14B` 48/48 bit-exact), real `Qwen3-14B-4bit + Qwen3-0.6B` PEARL A/B (64/64 bit-exact, `65.2%`–`75.0%` hit+prefix, `2.18–2.73 s` draft hidden, single-GPU contention documented) + `Qwen3-30B-A3B-3bit + EAGLE-3` `--pearl auto → OFF`, and live `aminfer serve` (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions` `stream=true|false` + `<think>` split + `D11` TRNG/replay, `POST /v1/responses`, `POST /v1/messages`, `1/4/8`-client SSE load `20/20` OK, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization) | Pass |
+| 2026-11-21 | M5 Phase 2, audit remediation & idle-GPU gate (`1f0db2a`, `b78fc8e`, `d5069a2`, `beded1b`, `19b7372`, `f9d8c11`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast, `minos 26.0`), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 241/241 tests = 237 lib + 4 CLI), direct Debug lib test binary under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (237/237, API + GPU Validation enabled, 0 errors), `tools` unittest (64/64), idle-GPU ReleaseFast `aminfer bench-m5` (`gemv_q2` `72.15 GB/s`, 3-bucket MoE `1.03×`–`1.11×` vs `q4` & `-27.8%` bytes, `C6` cold `1.13 us` / cache `0.04 us`, loopback server `0` steady-state malloc & `101,245.8 tok/s`, `0` swapouts), real `Qwen3-0.6B` GSQ+RCO `4.35b` (`qwen3-0.6b-gsq-rco.amf`, `verify-amf` OK, `-16.82%` MSE vs MinMax, `-66.2%` to `-69.3%` wired RAM, `171.05 tok/s` `seq=512` = `2.80×` & `195.80–205.52 tok/s` fluent EN/ZH decode), real `aminfer-repo.ang` (`128.02 MiB`, `879,949` entries, 32/32 & 48/48 bit-exact), real `Qwen3-14B-4bit + Qwen3-0.6B-GSQ-RCO-SME2` off-GPU SME2 multi-prefix PEARL (`11.81` on / `12.10` auto vs `10.67` off / `10.79` base, `0%` GPU contention, 64/64 bit-exact) + same-GPU `ADR-0008` contention gate + `Qwen3-30B-A3B-3bit + EAGLE-3` `--pearl auto → OFF`, and live `aminfer serve` (`20/20` OK, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization) | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -558,7 +559,10 @@ Update this before the context window runs out or when handing off.
     `1f0db2a` root module exports, `build-ngram` CLI & heterogeneous `D7`
     pruning wiring, `b78fc8e` `aminfer serve`, `C6`/`D8` `spec-decode` flags &
     `aminfer bench-m5`, `d5069a2` unpruned post-L1-merge `hard_cap` tree clamp,
-    plus M5 benchmark archive & close-out docs
+    `beded1b` initial M5 archive, `19b7372` scale-invariant LN peakiness proxy
+    & boundary protection in GSQ-RCO, `f9d8c11` off-GPU SME2 draft tree,
+    multi-prefix PEARL, `SmeDispatcher` barrier fix & `ADR-0008` contention
+    gate, plus refreshed idle-GPU M5 docs close-out
 - In flight: none (M5 completed; ready to begin M6 frontier hybrid sparse models — `Qwen3.8-Flash-Next`)
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),

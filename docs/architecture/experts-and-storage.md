@@ -90,7 +90,7 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
     (`model.safetensors.index.json` across shard files with bounded host RAM)
     plus native bit-exact `BF16` / `FP16` unquantized and mixed-precision tensor
     export.
-  - **Confirmed / Optional Pipeline** (M4/M5, capabilities `W14` / `G13` in
+  - **Optional GSQ + RCO Pipeline** (capabilities `W14` / `G13` in
     [../status.md](../status.md),
     [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)):
     opt-in offline GSQ + RCO per-tensor / per-expert hybrid quantization
@@ -99,10 +99,11 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
 
 ## Optional GSQ-RCO quantization
 
-> **Confirmed / Optional Pipeline** — accepted in
-> [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md), not yet
-> implemented; authoritative status lives in [../status.md](../status.md)
-> (capabilities `W14` and `G13`, targeting M4/M5).
+> **Optional Pipeline** — accepted in
+> [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md);
+> authoritative status lives in [../status.md](../status.md) (capabilities `W14`
+> and `G13`) and measured results live in
+> [../benchmarks/results.md](../benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization).
 
 - **100% offline in `tools/`**: sensitivity profiling (**GSQ** — group / layer /
   expert sensitivity-guided quantization, combining calibration sensitivity with
@@ -198,9 +199,12 @@ SSD health and admission guardrails (confirmed 2026-11-21):
 
 ## N-gram tables on NVMe
 
-Draft (status row C6): N-gram / suffix tables larger than the context — for
-example built from a code repository — stored on NVMe and queried by L1 with
-direct I/O. Format, build tooling and lookup path are designed in M5.
+N-gram / suffix tables larger than the prompt context — for example built from
+a code repository via `aminfer-tools build-ngram` into a 16 KiB-aligned `.ang`
+v1 file — are stored on NVMe and queried by L1 (`src/spec/ngram_nvme.zig`) over
+`F_NOCACHE` direct I/O with a wired LRU slot cache and overlapped `kqueue_aio`
+prefetch (status row `C6` in [../status.md](../status.md); measurements in
+[../benchmarks/results.md](../benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization)).
 
 ## Thunderbolt peer
 

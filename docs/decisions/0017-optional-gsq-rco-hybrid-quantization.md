@@ -52,10 +52,9 @@ core engineering invariants:
 
 ## Decision
 
-Adopt an **optional offline GSQ + RCO hybrid quantization pipeline** (Confirmed
-design targeting M4/M5 — capability IDs `W14` and `G13` in
-[../status.md](../status.md), not yet implemented) governed by five binding
-invariants:
+Adopt an **optional offline GSQ + RCO hybrid quantization pipeline** (capability
+IDs `W14` and `G13`; authoritative implementation status lives in
+[../status.md](../status.md)) governed by five binding invariants:
 
 1. **100% offline Python sensitivity analysis (GSQ) and error compensation (RCO)
    in `tools/` only ([ADR-0001](0001-language-and-toolchain-boundaries.md),
@@ -89,7 +88,7 @@ invariants:
 
    | `QuantScheme` | Bit-width | Group size | Packed bytes / group-64 | Effective bits / weight | Status (see [../status.md](../status.md)) |
    | --- | --- | --- | --- | --- | --- |
-   | `q2_affine` | 2-bit | 64 (compile-time) | 16 B + 4 B `half2` (or inline `ZT0` LUT) | 2.50 | Confirmed initial M5 tier (`W14` / `G13`) |
+   | `q2_affine` | 2-bit | 64 (compile-time) | 16 B + 4 B `half2` (or inline `ZT0` LUT) | 2.50 | See [../status.md](../status.md) (`W14` / `G13`) |
    | `q3_affine` | 3-bit | 64 (compile-time) | 24 B + 4 B `half2` | 3.50 | Implemented (`W1` / `G1`) |
    | `q4_affine` | 4-bit | 64 (compile-time) | 32 B + 4 B `half2` (or inline `ZT0` LUT) | 4.50 | Implemented (`W1` / `G1`) |
    | `q6_affine` | 6-bit | 64 (compile-time) | 48 B + 4 B `half2` | 6.50 | Deferred post-M5 unless benchmark-justified |
@@ -198,9 +197,12 @@ invariants:
 
 ## Evidence
 
-GSQ + RCO is an accepted design not yet implemented or benchmarked; the
-following verified M1–M2.5 foundations confirm the architecture requires no
-breaking format or runtime redesign:
+Authoritative status lives in [../status.md](../status.md), and side-by-side M5
+measurements (`aminfer bench-m5` + real `Qwen3-0.6B` GSQ+RCO vs MinMax vs BF16)
+live in
+[../benchmarks/results.md](../benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization).
+The following verified foundations confirm the architecture requires no breaking
+format or runtime redesign:
 
 - `.amf` v0 `TensorEntry` (`src/format/amf.zig`) already carries per-tensor
   `dtype`, `quant_bits`, `group_size`, `blob_bytes`, `data_bytes`,
