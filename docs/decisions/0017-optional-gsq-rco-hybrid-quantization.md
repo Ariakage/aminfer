@@ -207,7 +207,8 @@ breaking format or runtime redesign:
   (`q2_affine`, `q6_affine`, `q8_affine`) or whether `{q2_affine, q3_affine,
   q4_affine, f16, bf16}` already captures the quality/size Pareto frontier on
   `Qwen3-30B-A3B` and `Qwen3.8-Flash-Next` (decided by side-by-side baseline
-  benchmarks in [../benchmarks/results.md](../benchmarks/results.md)).
+  benchmarks in [../benchmarks/results.md](../benchmarks/results.md); see also
+  [open-decisions-research.md](../architecture/open-decisions-research.md#remaining-m3m5-open-tuning-items-adr-0017-d8-adr-0005)).
 - Measured decode (`M = 1`) and tree-verification (`M = 4..16`) dispatch
   overhead of 2-bucket vs 3-bucket `QuantScheme` CSR MoE execution and
   calibration of per-scheme effective bandwidth `β_s` for

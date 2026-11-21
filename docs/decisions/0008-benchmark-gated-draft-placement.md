@@ -56,4 +56,7 @@ GPU bandwidth alone. Two facts contradict that premise:
 
 - Spike S4: **closed in M3** (recorded in
   [../benchmarks/results.md](../benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5)).
-- Pipelined-drafting design for the small draft model (status row D8).
+- Pipelined-drafting design for the small draft model (status row D8; see
+  *PEARL* [arXiv:2408.11850](https://arxiv.org/abs/2408.11850), *P-EAGLE*
+  [arXiv:2602.01469](https://arxiv.org/abs/2602.01469), and Spike S4 contention
+  analysis in [open-decisions-research.md](../architecture/open-decisions-research.md#remaining-m3m5-open-tuning-items-adr-0017-d8-adr-0005)).

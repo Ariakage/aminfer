@@ -37,5 +37,8 @@ efficient dynamic per-token expert dispatch.
 ## Open items
 
 - Spike S6: CoreML compilation of attention blocks, static shapes for a
-  growing KV length (shape buckets or multifunction models), fp16 numerics,
-  throughput versus the GPU (status row A3).
+  growing KV length (`EnumeratedShapes` `<= 128` shape cap vs `Multifunction`
+  `mlprogram` guides vs split ANE `[512, hidden]` projection + GPU Split-KV),
+  fp16 numerics, throughput versus the GPU (status row A3; survey and
+  external references in
+  [open-decisions-research.md](../architecture/open-decisions-research.md#a3-coreml-static-shapes-for-growing-kv-length)).

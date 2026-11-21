@@ -137,4 +137,6 @@ the bridge through `b.addTranslateC` (Zig 0.17.1 removed `@cImport`), and
   cold-expert I/O, expert prediction, Thunderbolt peer
 - [model-roadmap.md](model-roadmap.md) — composable model axes and tiered
   roadmap (`Qwen3.8-Flash-Next`, `DeepSeek-V4.1-Flash-1017`)
+- [open-decisions-research.md](open-decisions-research.md) — external sources
+  and non-binding recommendations for undecided/open items
 - [../decisions/README.md](../decisions/README.md) — ADR index

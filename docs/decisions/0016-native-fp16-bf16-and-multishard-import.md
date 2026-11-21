@@ -165,4 +165,7 @@ Schedule **Milestone M2.5** immediately before M3 with the following design:
   `Qwen3-30B-A3B-3bit`), keeping the inter-layer residual stream in `f16` and
   `KvTile` in `RGBA16Float` was verified lossless and coherent end-to-end;
   revisit an optional `bf16` activation buffer mode in M6/M7 only if a future
-  architecture without QK-Norm exhibits hidden states exceeding `±65,504`.
+  architecture without QK-Norm exhibits massive activations approaching or
+  exceeding `±65,504` (cf. Sun et al., *Massive Activations in Large Language
+  Models*, `arXiv:2402.17762`, and the recommendation in
+  [open-decisions-research.md](../architecture/open-decisions-research.md#adr-0016-open-item-bf16-vs-f16-inter-layer-residual-stream)).

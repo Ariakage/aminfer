@@ -162,7 +162,12 @@ cost and the effect of QoS and I/O policy
   ([ADR-0009](../decisions/0009-expert-byte-budget-tree-pruning.md)) and the
   gather plan of the verification kernels.
 - **Undecided**: the predictor's architecture — a small learned model over
-  hidden states or embeddings, or the target's own gates applied ahead of time.
+  hidden states or embeddings, or the target's own gates applied ahead of time
+  (*Fate* [arXiv:2502.12224](https://arxiv.org/abs/2502.12224), *ProMoE*
+  [arXiv:2410.22134](https://arxiv.org/abs/2410.22134), *Pre-gated MoE*
+  [arXiv:2308.12066](https://arxiv.org/abs/2308.12066); recommendation under
+  Spike S4 SRAM/DRAM bounds in
+  [open-decisions-research.md](open-decisions-research.md#a2-ane-cross-layer-moe-expert-predictor-architecture)).
   A GPU-side cross-layer gate lookahead serves as the baseline it must beat.
 - **Metrics**: recall of predicted experts, prefetch lead time versus NVMe
   latency, bytes read but unused.

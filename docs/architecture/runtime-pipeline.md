@@ -6,7 +6,10 @@
 
 1. The kqueue-based server accepts a request and streams results back as
    Server-Sent Events. The external API shape (for example an
-   OpenAI-compatible endpoint) is undecided (status row C8).
+   OpenAI-compatible endpoint) is undecided (status row C8; comparison of
+   `/v1/chat/completions`, `reasoning_content`, stateless `/v1/responses`, and
+   `/v1/messages` in
+   [open-decisions-research.md](open-decisions-research.md#c8-kqueue-http--sse-server-api-shape)).
 2. A native Zig tokenizer turns text into token ids (status row W5, Draft).
    No Python runs at any point.
 3. Prefill builds the KV cache: the hybrid wavefront prefill for prompts longer

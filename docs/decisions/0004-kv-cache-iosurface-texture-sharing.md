@@ -75,3 +75,11 @@ full raw telemetry in [../benchmarks/results.md](../benchmarks/results.md)):
 ## Open items
 
 - int8 KV tiles (`OneComponent8`) — undecided (status row R5).
+  - External survey ([open-decisions-research.md](../architecture/open-decisions-research.md#r5-int8-kv-tiles-onecomponent8)):
+    Apple's [`init(pixelBuffer:shape:)`](https://developer.apple.com/documentation/coreml/mlmultiarray/init(pixelbuffer:shape:))
+    docs restrict fp16 IOSurface `MLMultiArray`s to `OneComponent16Half`, while
+    KIVI ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) and `mlx-lm`
+    `8-bit g=64` / `llama.cpp q8_0` rely on explicit per-block scales to handle
+    channel/token KV outliers; recommended direction is to keep
+    `OneComponent16Half` for ANE↔GPU sharing and use group-64 `q8` `MTLBuffer`
+    compression GPU-side only if needed.

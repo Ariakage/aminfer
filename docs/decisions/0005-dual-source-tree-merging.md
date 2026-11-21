@@ -32,4 +32,6 @@ is wasted on duplicate paths.
 
 ## Open items
 
-- Whether the 4-token threshold should adapt to recent acceptance.
+- Whether the 4-token threshold should adapt to recent acceptance (preliminary
+  recommendation to keep `>= 4` fixed until M5 NVMe N-gram ablation `C6` is in
+  [../architecture/open-decisions-research.md](../architecture/open-decisions-research.md#remaining-m3m5-open-tuning-items-adr-0017-d8-adr-0005)).
