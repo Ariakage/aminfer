@@ -3486,10 +3486,11 @@ archived run).
 Notes:
 - Zero-sync, zero-allocation 3-bucket CSR dispatch (`ami_moe_route_topk_bucketed`
   + per-scheme specialized Metal 4 pipelines) cuts MoE weight traffic by
-  **`-27.7%` to `-27.8%`** and runs **`1.03×`–`1.11×` faster** than uniform `q4`
-  with `0` hot-path heap allocations and `0` CPU-GPU syncs; `SpecEngine`
-  automatically wires `Qwen3Model`'s per-expert static byte & per-scheme
-  bandwidth tables into `D7` `PruneCostModel`
+  `-27.7%` to `-27.8%` while running within `1.00×`–`1.11×` of 1-bucket uniform
+  `q4` (`246.64–255.53 us` vs `253.81–256.46 us` at `M = 1`; `909.14–989.76 us`
+  vs `991.97–1,012.56 us` at `M = 8`) with `0` hot-path heap allocations and
+  `0` CPU-GPU syncs; `SpecEngine` wires `Qwen3Model`'s per-expert static byte
+  and per-scheme bandwidth tables into `D7` `PruneCostModel`
   ([ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)).
 
 ### W14 + G13 real `Qwen3-0.6B` GSQ + RCO vs naive min-max vs uniform BF16 (`ADR-0017`, idle GPU, `f9d8c11`)
@@ -3507,25 +3508,28 @@ Side-by-side comparison on real `Qwen/Qwen3-0.6B` (28 layers, tied embeddings,
 | `GSQ + RCO` (`3.25` eff-b, earlier stress sweep) | `bf16=113, q2=149, q3=24, q4=24` | 243.84 (`-79.6%`) | 345 (`-72.4%`) / 289 (`-75.8%`) | 300,884,544 (`-75.9%`) | **`6.7565e-5`** (`-46.86%` vs MinMax, `1.88×` lower) | 59.34 tok/s (`1.76×` vs `33.71`) | 69.72 / 96.64 (under load) | Degraded (58.4% 2-bit on 0.6B dense) |
 | `GSQ MinMax` (`3.25` eff-b, `--no-rco`) | `bf16=113, q2=146, q3=31, q4=20` | 243.84 | 345 / 289 | 300,884,544 | `1.2715e-4` (baseline) | 69.00 tok/s (`2.05×` vs `33.71`) | 96.55 / 98.61 (under load) | Collapsed (`tr tr`, `Aتم...`) |
 
-Key takeaways (directly validating [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)):
+Notes ([ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)):
 - Replacing raw depth-growing RMSNorm energy (`ln_in[26] / ln_in[0] > 10,000×`
-  on Qwen3, which previously starved `L0..L16` and caused multilingual/ZH
-  collapse) with a scale-invariant gamma channel-peakiness proxy (`max(|w|) /
-  rms(w)`) plus boundary-layer (`L0`/`L27`) and attention `>= q4_affine`
-  protection restores fluent Chinese and English output across every tested
-  prompt while cutting file size `-72.7%` and wired RAM `-66.2%` to `-69.3%`.
-- Offline RCO alternating ridge-OLS scale/bias refinement cuts reconstruction
-  MSE by **`-16.82%` (`1.20×` lower)** at `4.35` eff-bits (`-17.03%` on
-  matched-scheme tensors) and **`-46.86%` (`1.88×` lower)** at `3.25` eff-bits
-  with zero runtime overhead.
+  on Qwen3, which starved `L0..L16` and broke Chinese output) with a
+  scale-invariant gamma channel-peakiness proxy (`max(|w|) / rms(w)`) plus
+  boundary-layer (`L0`/`L27`) and attention `>= q4_affine` floors preserves
+  coherent Chinese and English output across the tested prompts while reducing
+  file size by `72.7%` and wired RAM by `66.2%–69.3%`.
+- Offline RCO alternating ridge-OLS scale/bias refinement reduces quantization
+  MSE by `16.82%` (`1.20×` lower) at `4.35` eff-bits (`17.03%` on matched-scheme
+  tensors) and `46.86%` (`1.88×` lower) at `3.25` eff-bits with no runtime
+  changes. Notice in the table above that `GSQ MinMax` (`179.33 tok/s` at
+  `seq=512`) and `GSQ + RCO` (`171.05–177.45 tok/s` across runs) execute the
+  same tensor bit-widths; small `tok/s` differences between them reflect normal
+  run-to-run clock variance rather than RCO runtime cost.
 - At `4.35` eff-bits (`/Volumes/Akari/models/amf/qwen3-0.6b-gsq-rco.amf`),
-  idle-GPU `Qwen3-0.6B` achieves **`171.05 tok/s` (`2.80×`)** at `seq=512` and
-  **`195.80–205.52 tok/s` (`2.90×`–`3.17×`)** on EN/ZH chat decode with
-  `swapouts_delta = 0`.
-- Pushing a tiny `0.6B` dense model down to `3.25` eff-bits forces `149/197`
-  matrices (`58.4%` weights) into `q2_affine`, degrading output quality and
-  confirming why `q2_affine` belongs on low-sensitivity / cold MoE experts and
-  why `ADR-0017` mandates uniform-baseline quality comparison.
+  idle-GPU `Qwen3-0.6B` runs at `171.05–177.45 tok/s` (`2.80–2.90×` vs BF16) at
+  `seq=512` and `195.80–205.52 tok/s` (`2.90–3.17×`) on short EN/ZH chat decode
+  with `swapouts_delta = 0`.
+- Compressing the `0.6B` dense model down to `3.25` eff-bits assigns `149/197`
+  matrices (`58.4%` weights) to `q2_affine` and degrades output coherence
+  (collapsing completely without RCO), showing that `q2_affine` should be
+  confined to low-sensitivity or cold MoE experts rather than tiny dense backbones.
 
 ### C6 repo-scale `F_NOCACHE` NVMe `.ang` N-gram table (`aminfer-repo.ang`)
 
@@ -3537,11 +3541,12 @@ Built `/Volumes/Akari/models/amf/aminfer-repo.ang` from
 `table_crc32 = 0xfe3a0eb2`, `header_crc32 = 0x4523e5c0`, `512 KiB` wired LRU
 slot cache (`32` × 16 KiB pages, `F_NOCACHE`).
 
-- **Idle-GPU `bench-m5` `F_NOCACHE` lookup latency** (`256` buckets / `4.02 MiB` `.ang`):
-  - Cold `F_NOCACHE` read p50: **`1.13 us`** (p99: **`1.63 us`**)
-  - Wired LRU cache hit p50: **`0.04 us` (`40 ns`)**
-  - Async `kqueue_aio` `prefetch()` + `query()` hit p50: **`0.13 us`**
+- **Idle-GPU `bench-m5` synthetic `.ang` lookup latency** (`256` buckets / `4.02 MiB` freshly written temp file in `$TMPDIR`):
+  - Fresh temp-file `F_NOCACHE` `pread` p50: `1.13–1.54 us` (p99: `1.63–1.96 us`; note: `F_NOCACHE` bypasses the macOS unified buffer cache, not SSD controller volatile DRAM on a newly written `4 MiB` file — true external-SSD flash latency is reflected in the `396–1,208 us` `128 MiB` runs below, consistent with Spike S3)
+  - Wired LRU cache hit p50: `0.04 us` (`40 ns`)
+  - Async `kqueue_aio` `prefetch()` + `query()` hit p50: `0.13 us`
 - **Real-checkpoint `T = 0` lossless `spec-decode` with vs without `--ngram-nvme aminfer-repo.ang`**:
+  - Note on workload sensitivity: the `APPLE_PAGE_SIZE` raw-completion prompt triggered a repetitive numeric continuation (`= 1024 + 1024 + ...`) during the earlier GPU-loaded window (`41.48 tok/s` base → `106.33` L1 → `216.28 tok/s` with `.ang` seed hits). On non-repetitive code prompts (`alignUp`, `page.zig`), `396–1,208 us` external-SSD `.ang` queries yield `0.95×`–`1.01×` of in-RAM L1 SAM on `0.6B` (and `3.72` vs `5.98 tok/s` on `14B` when wider trees execute under host GPU load) while maintaining bit-exact `token_ids`.
 
 | Model & Prompt | Mode | Bit-exact vs `decode` | `tau` (mean accept) | Rounds | `ngram` queries / hits / seed hits | Mean `.ang` query (us) | `bytes/acc tok` | Decode `tok/s` | `swapouts_delta` |
 | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
@@ -3556,16 +3561,14 @@ slot cache (`32` × 16 KiB pages, `F_NOCACHE`).
 | `Qwen3-14B-4bit` (`page.zig` Zig test) | `spec-decode l1` | `YES (48/48)` | `1.469` | 32 | — | — | 5,367.4 MB | 5.98 | 0 |
 | **`Qwen3-14B-4bit` (`page.zig` Zig test)** | **`spec-decode l1 + C6 .ang`** | **`YES (48/48)`** | **`1.621`** | **29** | **`27 / 16 / 3`** | **`1,207.78`** | **4,864.4 MB (`-9.4%` vs L1)** | 3.72 (larger tree `4.86` vs `3.16` nodes under host GPU load) | **0** |
 
-### D8 off-GPU SME2 + multi-prefix PEARL async pipelined small draft (`ADR-0008`, `ADR-0018`, idle GPU, `f9d8c11`)
+### D8 off-GPU SME2 + multi-prefix PEARL async pipelined small draft (`ADR-0008`, `ADR-0018`, idle GPU, `f9d8c11` / `a599b6f`)
 
-- **Gate verification (`--pearl auto`, default `pearl_min_target_us = 40 ms` + `ADR-0008` contention gate)**:
-  - Off-GPU ARMv9 SME2 `Qwen3-14B-4bit + Qwen3-0.6B-GSQ-RCO-SME2` (`ldnt1b`, `0` Metal CBs from draft): automatically stays **`enabled = yes`** (`0%` GPU shader core contention!).
-  - Fast `Qwen3-30B-A3B-3bit + EAGLE-3` (48L MoE, `--cold-experts-per-layer 64`): automatically stays **`enabled = no`** (`0` PEARL rounds, `swapouts_delta = 0`), obeying [ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md).
-  - Same-GPU `Qwen3-14B-4bit + Qwen3-0.6B` (`row_major`): probes 4 rounds against round-0 baseline `verify_us/node` and automatically disables PEARL on longer runs when single-GPU 10-core shader contention exceeds overlapped savings (`13.06 tok/s` vs `11.83` forced `--pearl on` on 96-token `0.6B-GSQ-RCO`; `13.33 tok/s` vs `11.07` forced `--pearl on` on `0.6B-BF16`).
-- **Idle-GPU `bench-m5` synthetic PEARL check**: `own_compute_queue = yes`,
-  `bit_exact_off = yes`, `bit_exact_on = yes`, `pearl_rounds = 7`,
-  `pearl_hits = 2`, `pearl_saved_ms = 1.029 ms`, `tau = 2.714`, `swapouts_delta = 0`.
-- **Real `Qwen3-14B-4bit + Qwen3-0.6B` (`T = 0`, 64 tokens, 100% bit-exact `token_ids`, idle M4 GPU, `swapouts_delta = 0`)**:
+- **Gate behavior (`--pearl auto`, default `pearl_min_target_us = 40 ms` + `ADR-0008` median contention probe)**:
+  - Off-GPU ARMv9 SME2 `Qwen3-14B-4bit + Qwen3-0.6B-GSQ-RCO-SME2` (`ldnt1b`, `0` Metal CBs from the draft worker): stays `enabled = yes` (`verify_ms` did not increase relative to `--pearl off`).
+  - Fast `Qwen3-30B-A3B-3bit + EAGLE-3` (48L MoE, `--cold-experts-per-layer 64`): stays `enabled = no` (`0` PEARL rounds, `swapouts_delta = 0`), per [ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md).
+  - Same-GPU `Qwen3-14B-4bit + Qwen3-0.6B` (`row_major`): probes 4 rounds against round-0 baseline `verify_us/node` and disables PEARL on longer runs when single-GPU 10-core shader contention exceeds overlapped draft savings (`13.06 tok/s` vs `11.83` forced `--pearl on` on 96-token `0.6B-GSQ-RCO`; `13.33 tok/s` vs `11.07` forced `--pearl on` on `0.6B-BF16`).
+- **Idle-GPU `bench-m5` synthetic PEARL check**: at `f9d8c11`, `pearl_rounds = 7`, `pearl_hits = 2`, `pearl_saved_ms = 1.029 ms`; after `a599b6f` (completing depth-1 root expansion before early-stop), `pearl_rounds = 8`, `pearl_hits = 7`, `pearl_rollbacks = 1`, `pearl_saved_ms = 5.552 ms`, `bit_exact_off = yes`, `bit_exact_on = yes`, `swapouts_delta = 0`. Note that on the tiny synthetic 2-layer model (`base_tok_per_s = 2,341.91`), verify time is `< 1 ms`, so worker synchronization lowers synthetic `tok/s` (`1,468.01` off / `1,261.78` on) as expected.
+- **Real `Qwen3-14B-4bit + Qwen3-0.6B` (`T = 0`, 64 tokens, M4 tuned small-draft tree `--max-tree-nodes 8 --max-draft-depth 5 --branch-width 1 --top-k 2`, bit-exact `token_ids`, idle M4 GPU, `swapouts_delta = 0`; default `cap=16, d=4, w=2` 32-token SME2 run at `a599b6f` also archived verbatim below at `10.22 tok/s`)**:
 
 | Run | Draft backend & `.amf` | PEARL mode | `wired_mib` | Bit-exact vs `decode` | `tau` | `pearl_hits` / `prefix` / `rollbacks` | `pearl_saved_ms` | `draft_ms` / `verify_ms` / `sync_ms` | `bytes/acc tok` | Decode `tok/s` |
 | --- | --- | --- | ---: | --- | ---: | --- | ---: | --- | ---: | ---: |
@@ -3580,28 +3583,28 @@ slot cache (`32` × 16 KiB pages, `F_NOCACHE`).
 | `D8-GPU-BF16-on` | Same-GPU `0.6B-BF16` (`1.2 GB`) | `on` | 9,347 | `YES (64/64)` | `3.706` | `6 / 4 / 11` | `1,474.1` | `27.8 / 288.7 / 16.0` | 2,126.8 MB (`-73.0%`) | 11.15 (`+44.8 ms` GPU contention) |
 | `D8-GPU-BF16-auto` | Same-GPU `0.6B-BF16` (`1.2 GB`) | `auto` | 9,347 | `YES (64/64)` | `3.938` | `5 / 5 / 10` | `1,150.5` | `31.6 / 287.5 / 14.6` | 2,001.7 MB (`-74.6%`) | 11.80 (`auto -> OFF` reaches **13.33** when probe triggers) |
 
-Architectural finding (`ADR-0008` + `ADR-0018`): Executing `SmallDraftModel`
-**100% off-GPU on ARMv9 SME2 (`sme2_panel64` + `ldnt1b`, `0` Metal GPU CBs)**
-completely eliminates the `+6`–`+45 ms/round` single-GPU shader contention
-(`verify_ms` `247.3 -> 225.2 ms`, `0%` GPU contention!), allowing multi-prefix
-PEARL (`--pearl on`: **`11.81 tok/s`**, `--pearl auto -> ON`: **`12.10 tok/s`**)
-to beat BOTH `--pearl off` (`10.67 tok/s`, **`+10.7%`–`+13.4%`**) and baseline
-`14B` `decode` (`10.79 tok/s`, **`+9.5%`–`+12.1%`**) with **64/64 (100%)
-bit-exact `T = 0` parity** and `0` swapouts. On single-GPU 10-core Apple M4,
-same-GPU `0.6B-GSQ-RCO` (`325 MB`) runs faster un-pipelined (`13.55 tok/s`,
-`1.26×` vs `14B` baseline) because M4's single GPU executes `0.6B` `q4`/`q3`
-drafting in `15 ms` sequentially without contending with `14B` `verifyTree`;
-the online `ADR-0008` contention gate in `--pearl auto` automatically disables
-same-GPU overlap when `verify_ms/node` contention exceeds saved draft+sync time
-while keeping off-GPU SME2 PEARL enabled.
+Measured trade-offs (`ADR-0008` + `ADR-0018`):
+- Running `SmallDraftModel` off-GPU on ARMv9 SME2 (`sme2_panel64` + `ldnt1b`, `0`
+  draft Metal CBs) avoids the `+6.0` to `+44.8 ms/round` single-GPU `verify_ms`
+  slowdown (`247.3 ms` off vs `225.2–225.7 ms` on/auto), lifting SME2-drafted
+  throughput from `10.67 tok/s` (`--pearl off`) to `11.81–12.10 tok/s` (`+10.7%`
+  to `+13.4%`, vs `10.79 tok/s` `14B` greedy baseline) with 64/64 bit-exact
+  `token_ids` and `0` swapouts.
+- On this single-GPU 10-core M4, however, **sequential same-GPU `0.6B-GSQ-RCO`
+  (`--pearl off`, `13.55 tok/s`, `1.26×` vs `14B` greedy)** remains the fastest
+  overall `14B + 0.6B` configuration because GPU `q4`/`q3` drafting (`15.0 ms` +
+  `7.7 ms` sync) is shorter than CPU SME2 full-model drafting (`29.4 ms` +
+  `19.4 ms` sync). The `--pearl auto` contention probe disables same-GPU overlap
+  when `verify_ms/node` growth outweighs overlapped draft time while keeping
+  off-GPU SME2 PEARL enabled.
 
 ### C7 + C8 live `aminfer serve` HTTP/1.1 + SSE & concurrency load test
 
-- **Idle-GPU `bench-m5` zero-allocation `kqueue` loopback microbenchmark (`f9d8c11`)**:
-  - `GET /health` p50: **`72.33 us`**
-  - Single-client `POST /v1/chat/completions` (`stream: true`) TTFT p50: **`106.21 us`**, E2E p50: **`184.88 us`**
-  - `8` concurrent SSE clients: TTFT p50 **`806.08 us`**, p99 **`1,022.25 us`**, aggregate **`101,245.8 tok/s`**
-  - Steady-state `malloc_zone_statistics` delta: **`0` blocks / `0` B** (`all_ok = yes`, `swapouts_delta = 0`)
+- **Idle-GPU `bench-m5` synthetic SSE framing loopback microbenchmark (in-memory token emitter stub, no LLM forward pass)**:
+  - `GET /health` p50: `72.33–77.33 us`
+  - Single-client `POST /v1/chat/completions` (`stream: true`) TTFT p50: `106.21–109.08 us`, E2E p50: `184.88–186.17 us`
+  - `8` concurrent SSE clients: TTFT p50 `791.21–806.08 us`, p99 `1,022.25–1,048.83 us`, framing-only emitter rate `100,277.5–101,245.8 tok/s`
+  - Steady-state `malloc_zone_statistics` delta: `0` blocks / `0` B (`all_ok = yes`, `swapouts_delta = 0`)
 - **Live `aminfer serve` backed by real `Qwen3-0.6B` BF16 (`1,251 MiB` wired, loopback ephemeral port)**:
   - `GET /health` -> `200 OK` (`{"status":"ok","model":"qwen3-0.6b-bf16","wired_mib":1251,"active_requests":0}`)
   - `GET /v1/models` -> `200 OK` (OpenAI `list` object with `qwen3-0.6b-bf16`)
@@ -3617,7 +3620,256 @@ while keeping off-GPU SME2 PEARL enabled.
 | 4 | `4/4` (`200 OK`) | 96 | 4.210 | 2,567.7 | 3,611.0 | 27.38 | 22.80 | `0 / 0` | 0 |
 | 8 | `8/8` (`200 OK`) | 192 | 8.239 | 4,526.5 | 7,644.8 | 26.46 | 23.30 | `0 / 0` | 0 |
 
-### Verbatim idle-GPU `aminfer bench-m5`, `W14/G13` `4.35b` GSQ+RCO, `C6`, and `D8` PEARL raw stdout (commit `f9d8c11`)
+### Verbatim M5 CLI raw stdout (`bench-m5`, `verify-amf`, `bench-decode`, `decode`, `spec-decode`, `build-ngram`)
+
+Full unedited CLI stdout at post-remediation code (`a599b6f` / `8497fb7`):
+
+```text
+=== M5 Serving, Pipelining, C6 NVMe N-Gram & ADR-0017 GSQ+RCO Hybrid Quant Suite ===
+
+--- G13 Metal 4 q2_affine Kernel Bandwidth Calibration ---
+kernel    shape              bytes/disp   slots   latency(us)   beta(GB/s)   bus(%)
+gemv_q2   1x2048x2048           1318912      64         87.11        15.14     12.6
+gemv_q2   1x6144x2048           3948544      21        109.32        36.12     30.1
+gemv_q2   1x2048x768             497152     170         16.56        30.02     25.0
+gemv_q2   1x4096x4096           5259264      16        112.78        46.63     38.9
+gemm_q2   16x2048x2048          1441792      64        146.24         9.86      8.2
+gemm_q2   16x4096x4096          5505024      16        504.82        10.90      9.1
+gemm_q2   64x2048x2048          1835008      64        230.45         7.96      6.6
+gemm_q2   64x4096x4096          6291456      16        882.31         7.13      5.9
+
+--- G13 Scheme-Bucketed Heterogeneous MoE ({q2, q3, q4}) vs Uniform CSR Gather ---
+profile          m    E    k   U    bkts    bytes/disp   vs_q4(%)   latency(us)   beta(GB/s)   bus(%)
+uniform_q4       1    128  8   8    1         21242368        0.0        256.46        82.83     69.0
+uniform_q3       1    128  8   8    1         16523776      -22.2        270.87        61.00     50.8
+uniform_q2       1    128  8   8    1         11805184      -44.4        241.66        48.85     40.7
+hetero_q2_q3_q4  1    128  8   8    3         15344128      -27.8        255.53        60.05     50.0
+uniform_q4       8    128  8   24   1         63770624        0.0        991.97        64.29     53.6
+uniform_q3       8    128  8   24   1         49614848      -22.2       1014.77        48.89     40.7
+uniform_q2       8    128  8   24   1         35459072      -44.4        938.16        37.80     31.5
+hetero_q2_q3_q4  8    128  8   24   3         46075904      -27.7        989.76        46.55     38.8
+
+--- C6 F_NOCACHE NVMe .ang N-Gram Lookup Latency ---
+ngram.file_bytes                 4210688
+ngram.buckets                    256
+ngram.total_entries              1024
+ngram.wired_cache_kib            512
+ngram.cold_nvme_p50_us           1.54
+ngram.cold_nvme_p99_us           1.96
+ngram.cache_hit_p50_us           0.04
+ngram.prefetch_hit_p50_us        0.13
+ngram.queries                    345
+ngram.hits                       345
+ngram.seed_hits                  345
+ngram.nvme_reads                 87
+
+--- D8 PEARL Async Pipelined Small-Draft Synthetic Parity & Overlap ---
+pearl_synth.own_compute_queue    yes
+pearl_synth.bit_exact_off        yes
+pearl_synth.bit_exact_on         yes
+pearl_synth.base_tok_per_s       2341.91
+pearl_synth.off_tok_per_s        1468.01
+pearl_synth.on_tok_per_s         1261.78
+pearl_synth.mean_accept_len      2.375
+pearl_synth.pearl_rounds         8
+pearl_synth.pearl_hits           7
+pearl_synth.pearl_rollbacks      1
+pearl_synth.pearl_saved_ms       5.552
+
+--- C7 + C8 kqueue HTTP/1.1 + SSE Server Loopback Microbenchmark ---
+server.health_p50_us             77.33
+server.single_ttft_p50_us        109.08
+server.single_e2e_p50_us         186.17
+server.concurrent_clients        8
+server.concurrent_ttft_p50_us    791.21
+server.concurrent_ttft_p99_us    1048.83
+server.concurrent_tok_per_s      100277.5
+server.steady_malloc_blocks      0
+server.steady_malloc_bytes       0
+server.all_ok                    yes
+
+M5 Swap Check
+m5.swap.status                   ok
+m5.swap.swapouts_delta           0
+m5.swap.pageouts_delta           0
+
+--- verify-amf qwen3-0.6b-gsq-rco.amf & qwen3-0.6b-gsq-rco-sme2.amf ---
+amf.status       ok
+amf.model_id     qwen3-0.6b-gsq-rco
+amf.tensors      310
+amf.file_bytes   325763072
+amf.wired_bytes  325697536
+amf.cold_bytes   0
+amf.status       ok
+amf.model_id     qwen3-0.6b-gsq-rco
+amf.tensors      310
+amf.file_bytes   353288192
+amf.wired_bytes  353222656
+amf.cold_bytes   0
+
+--- bench-decode qwen3-0.6b-gsq-rco.amf (prefill=512, steps=32) ---
+decode_bench.target              qwen3
+decode_bench.arch                qwen3 (bf16)
+decode_bench.seq_len             513
+decode_bench.shards              1
+decode_bench.wired_mib           423
+decode_bench.load_ms             1268.5
+decode_bench.measured_layers     28
+decode_bench.measured_ms_per_tok 5.635
+decode_bench.measured_tok_per_s  177.45
+decode_bench.measured_layer_ms   0.172
+decode_bench.measured_head_ms    0.833
+decode_bench.measured_bytes_tok  382919232
+decode_bench.measured_beta_gbs   67.95 (56.6% bus)
+decode_bench.scaled_layers       28 (linear: 28 * layer_ms + head_ms)
+decode_bench.scaled_ms_per_tok   5.635
+decode_bench.scaled_tok_per_s    177.45
+decode_bench.scaled_bytes_tok    382919216
+decode_bench.scaled_beta_gbs     67.95 (56.6% bus)
+decode_bench.malloc_blocks_delta 64
+decode_bench.malloc_bytes_delta  4096
+decode_bench.swapouts_delta      0
+decode_bench.pageouts_delta      0
+
+--- decode qwen3-0.6b-gsq-rco.amf (ZH ChatML) ---
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 367
+decode.prompt_tokens             26
+decode.generated_tokens          24
+decode.prefill_ms                107.584
+decode.decode_ms_per_tok         4.954
+decode.decode_tok_per_s          201.86
+decode.bytes_per_tok             329704000
+decode.effective_gbs             66.55
+decode.malloc_blocks_delta       48
+decode.malloc_bytes_delta        3296
+decode.swapouts_delta            0
+decode.token_ids                 [26567, 386, 19, 43589, 103967, 111390, 70500, 32555, 13940, 58143, 22670, 43589, 100768, 101991, 115350, 3837, 91572, 101940, 17404, 100293, 33108, 108976, 1773, 151645]
+decode.text                      Apple M4 的统一内存设计使 CPU 和 GPU 的计算效率大幅提升，同时减少功耗和发热。<|im_end|>
+
+--- spec-decode C6 aminfer-repo.ang on qwen3-0.6b-bf16.amf ---
+spec.arch                        qwen3 (bf16)
+spec.mode                        l1
+spec.placement                   gpu (requested=auto)
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.seed_used                   0
+spec.seed_source                 greedy
+spec.layers                      28
+spec.shards                      1
+spec.wired_mib                   1225
+spec.prompt_tokens               14
+spec.generated_tokens            32
+spec.rounds                      22
+spec.mean_accept_len             1.409
+spec.accept_hist                 [1:16, 2:4, 3:1, 4:1]
+spec.drafted_nodes_per_round     6.55
+spec.verified_nodes_per_round    3.55
+spec.l1_seed_rounds              2
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  66.885
+spec.decode_ms_per_tok           12.855
+spec.decode_tok_per_s            77.79
+spec.draft_ms_per_round          0.754
+spec.prune_ms_per_round          0.001
+spec.verify_ms_per_round         16.931
+spec.commit_sync_ms_per_round    0.421
+spec.bytes_per_accepted_tok      848623418
+spec.effective_gbs               66.01
+spec.malloc_blocks_delta         89
+spec.malloc_bytes_delta          5696
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.ngram_nvme                  on (buckets=8192, entries=879949, wired_kib=512)
+spec.ngram_queries               21
+spec.ngram_hits                  8
+spec.ngram_seed_hits             2
+spec.ngram_cache_hits            2
+spec.ngram_nvme_reads            58
+spec.ngram_mean_query_us         785.42
+spec.token_ids                   [198, 262, 1077, 5206, 897, 284, 897, 280, 262, 1077, 5206, 17189, 284, 17189, 280, 262, 1077, 5206, 1102, 284, 220, 15, 401, 262, 1393, 897, 861, 220, 15, 341, 286, 421]
+spec.text                        
+    let mut value = value;
+    let mut alignment = alignment;
+    let mut result = 0;
+
+    while value > 0 {
+        if
+
+--- spec-decode D8 off-GPU SME2 PEARL (default tree cap=16, d=4, w=2, 32 tokens) ---
+spec.arch                        qwen3 (q4)
+spec.mode                        small
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       842.1
+spec.placement_gate_gpu_us       66.7
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.seed_used                   0
+spec.seed_source                 greedy
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   8545
+spec.prompt_tokens               22
+spec.generated_tokens            32
+spec.rounds                      10
+spec.mean_accept_len             3.100
+spec.accept_hist                 [1:1, 2:3, 3:2, 4:2, 5:2]
+spec.drafted_nodes_per_round     15.10
+spec.verified_nodes_per_round    8.10
+spec.l1_seed_rounds              0
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  810.215
+spec.decode_ms_per_tok           97.851
+spec.decode_tok_per_s            10.22
+spec.draft_ms_per_round          33.718
+spec.prune_ms_per_round          0.001
+spec.verify_ms_per_round         243.986
+spec.commit_sync_ms_per_round    25.626
+spec.bytes_per_accepted_tok      2541173192
+spec.effective_gbs               25.97
+spec.malloc_blocks_delta         40
+spec.malloc_bytes_delta          2560
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.pearl_mode                  auto (enabled=yes, own_queue=yes)
+spec.pearl_rounds                10
+spec.pearl_hits                  2
+spec.pearl_partial_prefix_hits   5
+spec.pearl_rollbacks             8
+spec.pearl_saved_ms              382.805
+spec.pearl_worker_ms             1783.011
+spec.token_ids                   [8420, 594, 458, 8129, 315, 264, 3070, 81816, 40996, 12199, 320, 20117, 52, 8, 19479, 334, 304, 13027, 1667, 279, 5798, 3419, 1565, 51137, 19664, 291, 13448, 28587, 1096, 5486, 374, 14452]
+spec.text                        Here's an implementation of a **Least Recently Used (LRU) Cache** in Python using the built-in `collections.OrderedDict`. This approach is suitable
+
+--- aminfer-tools build-ngram JSON stdout (commit b78fc8e) ---
+{
+  "output": "/Volumes/Akari/models/amf/aminfer-repo.ang",
+  "file_bytes": 134234112,
+  "num_buckets": 8192,
+  "total_entries": 879949,
+  "dropped_entries": 0,
+  "source_files": 88,
+  "total_tokens": 1194964,
+  "min_ngram": 2,
+  "max_ngram": 4,
+  "max_cont_len": 8,
+  "vocab_size": 151669,
+  "table_crc32": "0xfe3a0eb2",
+  "header_crc32": "0x4523e5c0",
+  "corpus_id": "aminfer-repo-v1"
+}
+```
+
+### Archived M5 multi-run sweep logs and `aminfer serve` harness output (commits `b78fc8e`–`f9d8c11`)
+
+Preserved raw `gsq-convert` / `repack-sme2` stdout and multi-configuration
+harness logs from commits `b78fc8e`–`f9d8c11`:
 
 ```text
 === IDLE-GPU AMINFER BENCH-M5 (commit f9d8c11) ===
