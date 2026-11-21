@@ -29,6 +29,8 @@ pub const wavefront = @import("ane/wavefront.zig");
 pub const predictor = @import("ane/predictor.zig");
 pub const sme = @import("cpu/sme.zig");
 pub const rng = @import("runtime/rng.zig");
+pub const ngram_nvme = @import("spec/ngram_nvme.zig");
+pub const server = @import("server/http_sse.zig");
 
 test {
     _ = metal;
@@ -59,4 +61,6 @@ test {
     _ = predictor;
     _ = sme;
     _ = rng;
+    _ = ngram_nvme;
+    _ = server;
 }

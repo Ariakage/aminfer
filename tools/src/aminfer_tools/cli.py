@@ -22,6 +22,7 @@ from aminfer_tools.amf import (
     retag_amf_cold_experts,
 )
 from aminfer_tools.gsq_rco import gsq_convert
+from aminfer_tools import ngram as ngram_mod
 from aminfer_tools.coreml import (
     COREML_KINDS,
     COREML_OPS,
@@ -581,12 +582,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional directory to verify exported .mlpackage via `xcrun coremlcompiler compile`",
     )
+    ngram_mod.add_subparser(sub)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "build-ngram":
+        return ngram_mod.run_args(args)
+
     if args.command == "pack-amf":
         cold = _parse_cold_experts(args.cold_experts)
         excludes = _parse_csv(args.exclude_tensors)

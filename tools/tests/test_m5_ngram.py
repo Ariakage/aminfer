@@ -271,6 +271,34 @@ class M5NgramTests(unittest.TestCase):
         bits = f32_to_f16_bits(0.875)
         self.assertAlmostEqual(struct.unpack("<e", struct.pack("<H", bits))[0], 0.875, places=3)
 
+    def test_cli_build_ngram_subcommand(self) -> None:
+        from aminfer_tools.cli import main as cli_main
+
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            jsonl_path = root / "tokens.jsonl"
+            jsonl_path.write_text(
+                json.dumps({"token_ids": [10, 20, 30, 40, 50, 60, 70, 80]}) + "\n",
+                encoding="utf-8",
+            )
+            out_ang = root / "cli_repo.ang"
+            rc = cli_main(
+                [
+                    "build-ngram",
+                    "--token-ids-jsonl",
+                    str(jsonl_path),
+                    "--output",
+                    str(out_ang),
+                    "--corpus-id",
+                    "cli-delegate",
+                    "--num-buckets",
+                    "8",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertTrue(out_ang.exists())
+            self.assertEqual(out_ang.stat().st_size, 9 * APPLE_PAGE_SIZE)
+
 
 if __name__ == "__main__":
     unittest.main()

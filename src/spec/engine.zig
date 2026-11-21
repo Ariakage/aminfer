@@ -19,6 +19,7 @@ const page = @import("../mem/page.zig");
 const budget_mod = @import("../mem/budget.zig");
 const arena_mod = @import("../mem/arena.zig");
 const metal = @import("../bridge/metal.zig");
+const quant = @import("../quant/spec.zig");
 const moe = @import("../gpu/moe.zig");
 const attention = @import("../gpu/attention.zig");
 const qwen3 = @import("../model/qwen3.zig");
@@ -199,6 +200,17 @@ pub const RunError = error{
     MissingRng,
 } || qwen3.StepError || draft_mod.DraftStepError || tree_mod.PruneError ||
     accept_mod.VerifyError || ngram_nvme.QueryError;
+
+/// Calibrated per-scheme effective MoE gather bandwidth `beta_s` (GB/s) for
+/// `ADR-0017` heterogeneous GSQ+RCO expert byte-budget tree pruning (`D7`).
+pub fn schemeEffectiveBwGbs(dt: quant.WeightDType) f32 {
+    return switch (dt) {
+        .q2_affine => 60.0,
+        .q3_affine => 64.0,
+        .q4_affine => 68.0,
+        .f16, .bf16 => 78.0,
+    };
+}
 
 /// Derives a calibrated M4 hardware cost model for D7 submodular tree pruning
 /// (ADR-0009) from the loaded target model geometry and Spike S5 bandwidth curve.
@@ -660,6 +672,10 @@ pub const SpecEngine = struct {
     ngram_table: ?*ngram_nvme.NvmeNgramTable,
     config: SpecConfig,
     cost_model: tree_mod.PruneCostModel,
+    /// Startup-only sampled `[sampled_layers * num_experts]` static byte/BW tables
+    /// populated for heterogeneous GSQ+RCO MoE models (`ADR-0017`, empty for uniform).
+    expert_bytes_sampled: []u32,
+    expert_bw_sampled: []f32,
 
     sam_arena: arena_mod.WiredArena,
     sam: sam_mod.SuffixAutomaton,
@@ -803,7 +819,38 @@ pub const SpecEngine = struct {
         const p_res = try allocator.alloc(f32, target.config.vocab_size);
         errdefer allocator.free(p_res);
 
-        const cost = config.cost_model orelse defaultCostModelForTarget(target);
+        var cost = config.cost_model orelse defaultCostModelForTarget(target);
+
+        var expert_bytes_sampled: []u32 = &.{};
+        var expert_bw_sampled: []f32 = &.{};
+        if (config.cost_model == null and target.config.arch == .qwen3_moe and target.isHeterogeneousMoe()) {
+            const n_layers = target.config.num_hidden_layers;
+            const sampled = cost.num_layers;
+            const n_experts = target.config.num_experts;
+            const table_len: usize = @as(usize, sampled) * n_experts;
+            expert_bytes_sampled = try allocator.alloc(u32, table_len);
+            errdefer allocator.free(expert_bytes_sampled);
+            expert_bw_sampled = try allocator.alloc(f32, table_len);
+            errdefer allocator.free(expert_bw_sampled);
+
+            for (0..sampled) |s| {
+                const l_idx: usize = if (sampled == n_layers)
+                    s
+                else
+                    (s * (n_layers - 1)) / (sampled - 1);
+                for (0..n_experts) |e| {
+                    const flat = s * n_experts + e;
+                    expert_bytes_sampled[flat] = @intCast(target.expertBytes(l_idx, e));
+                    expert_bw_sampled[flat] = schemeEffectiveBwGbs(target.expertDType(l_idx, e));
+                }
+            }
+            const layer_scale: f64 = @as(f64, @floatFromInt(n_layers)) / @as(f64, @floatFromInt(sampled));
+            cost.expert_bytes_table = expert_bytes_sampled;
+            cost.expert_bw_gbs_table = expert_bw_sampled;
+            cost.expert_table_scale = @floatCast(layer_scale * 0.72);
+        }
+        errdefer if (expert_bytes_sampled.len > 0) allocator.free(expert_bytes_sampled);
+        errdefer if (expert_bw_sampled.len > 0) allocator.free(expert_bw_sampled);
 
         var pearl_rt: ?*PearlRuntime = null;
         if (small_draft) |sd| {
@@ -824,6 +871,8 @@ pub const SpecEngine = struct {
             .ngram_table = config.ngram_table,
             .config = config,
             .cost_model = cost,
+            .expert_bytes_sampled = expert_bytes_sampled,
+            .expert_bw_sampled = expert_bw_sampled,
             .sam_arena = sam_arena,
             .sam = sam,
             .pearl_rt = pearl_rt,
@@ -868,6 +917,8 @@ pub const SpecEngine = struct {
             prt.deinit(allocator);
             self.pearl_rt = null;
         }
+        if (self.expert_bytes_sampled.len > 0) allocator.free(self.expert_bytes_sampled);
+        if (self.expert_bw_sampled.len > 0) allocator.free(self.expert_bw_sampled);
         allocator.free(self.p_res);
         self.sam_arena.deinit();
     }
@@ -2920,4 +2971,92 @@ test "M5 D8 PEARL async pipelined SmallDraft matches pearl=off and stepDecode 10
         }
         try std.testing.expectEqualSlices(u32, &st_a, &st_b);
     }
+}
+
+test "SpecEngine wires ADR-0017 heterogeneous MoE per-expert byte tables into D7 pruning with T=0 bit-exact parity" {
+    const allocator = std.testing.allocator;
+    const moe_cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .group_size = 64,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 12,
+        .num_experts_per_tok = 4,
+        .norm_topk_prob = true,
+        .tie_word_embeddings = false,
+    };
+    const mix = [_]quant.WeightDType{ .q2_affine, .q3_affine, .q4_affine };
+    const img = try qwen3.buildSyntheticAmfImageWithSpec(allocator, moe_cfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .q4_affine,
+        .norm_dtype = .bf16,
+        .router_dtype = .q3_affine,
+        .expert_dtypes_cycle = &mix,
+    }, 0xAD17_D701);
+    defer allocator.free(img);
+
+    // Baseline non-speculative greedy tokens.
+    var base_model = try qwen3.Qwen3Model.loadFromBytes(allocator, img, moe_cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 8,
+        .max_tree_nodes = 1,
+    });
+    defer base_model.deinit(allocator);
+    try std.testing.expect(base_model.isHeterogeneousMoe());
+
+    const prompt = [_]u32{ 5, 19, 41, 77, 12, 5, 19, 41 };
+    var expected: [14]u32 = undefined;
+    var tok = try base_model.prefillPrompt(&prompt, true);
+    expected[0] = tok;
+    var pos: u32 = @intCast(prompt.len);
+    for (1..expected.len) |i| {
+        tok = try base_model.stepDecode(tok, pos);
+        expected[i] = tok;
+        pos += 1;
+    }
+
+    // SpecEngine with D7 pruning auto-wired to heterogeneous per-expert byte & BW tables.
+    var spec_model = try qwen3.Qwen3Model.loadFromBytes(allocator, img, moe_cfg, .{
+        .max_seq_len = 64,
+        .chunk_tokens = 8,
+        .max_tree_nodes = 16,
+    });
+    defer spec_model.deinit(allocator);
+
+    var eng = try SpecEngine.init(allocator, &spec_model, null, .{
+        .mode = .l1_only,
+        .max_tree_nodes = 12,
+        .max_draft_depth = 4,
+        .enable_pruning = true,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    try std.testing.expect(eng.cost_model.hasPerExpertTable());
+    const bytes_tbl = eng.cost_model.expert_bytes_table.?;
+    const bw_tbl = eng.cost_model.expert_bw_gbs_table.?;
+    try std.testing.expectEqual(@as(usize, 24), bytes_tbl.len);
+    try std.testing.expectEqual(@as(usize, 24), bw_tbl.len);
+    for (0..moe_cfg.num_hidden_layers) |l| {
+        for (0..moe_cfg.num_experts) |e| {
+            const idx = l * moe_cfg.num_experts + e;
+            try std.testing.expectEqual(@as(u32, @intCast(spec_model.expertBytes(l, e))), bytes_tbl[idx]);
+            try std.testing.expectApproxEqAbs(schemeEffectiveBwGbs(spec_model.expertDType(l, e)), bw_tbl[idx], 1e-6);
+        }
+    }
+
+    var got: [14]u32 = undefined;
+    got[0] = try eng.prefill(&prompt, null);
+    var p: usize = 1;
+    while (p < got.len) {
+        const rs = try eng.stepRound(null, got[p..]);
+        p += rs.emitted_count;
+    }
+    try std.testing.expectEqualSlices(u32, &expected, &got);
 }
