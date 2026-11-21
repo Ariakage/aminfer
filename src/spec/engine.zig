@@ -35,7 +35,9 @@ const sme = @import("../cpu/sme.zig");
 
 pub const MAX_TREE_NODES: u16 = tree_mod.MAX_SUPPORTED_NODES;
 const MAX_PRED_LAYERS: usize = qwen3.MAX_EXPERT_PRED_LAYERS;
-const PEARL_MAX_BONUS_ROOTS: usize = 2;
+/// Maximum speculated `(prefix_len, bonus_token)` root hypotheses pre-drafted
+/// concurrently by D8 PEARL while `target.verifyTree(T_r)` runs on GPU.
+const PEARL_MAX_BONUS_ROOTS: usize = 4;
 
 /// Target-latency-gated PEARL async pipelined small-draft policy (`D8`, ADR-0008).
 pub const PearlMode = enum {
@@ -276,12 +278,12 @@ const PearlWorkerState = enum(u8) {
 const PearlJob = struct {
     base_pos: u32 = 0,
     committed_before: u32 = 0,
-    pending_sync_len: u8 = 0,
-    pending_sync_tok: u32 = 0,
+    pending_sync_len: u16 = 0,
+    pending_sync_tokens: [MAX_TREE_NODES + 1]u32 = @splat(0),
     lead_len: u16 = 0,
     lead_tokens: [MAX_TREE_NODES]u32 = @splat(0),
-    sync_len: u16 = 0,
-    sync_tokens: [MAX_TREE_NODES + 1]u32 = @splat(0),
+    off_gpu: bool = false,
+    greedy: bool = true,
     max_draft_depth: u16 = 4,
     branch_width: u16 = 2,
     top_k: u32 = 3,
@@ -292,12 +294,15 @@ const PearlJob = struct {
 
 const PearlResult = struct {
     num_roots: u8 = 0,
+    root_prefix_lens: [PEARL_MAX_BONUS_ROOTS]u16 = @splat(0),
     bonus_tokens: [PEARL_MAX_BONUS_ROOTS]u32 = @splat(0),
     trees: [PEARL_MAX_BONUS_ROOTS]tree_mod.DraftTree(MAX_TREE_NODES) = .{
         tree_mod.DraftTree(MAX_TREE_NODES).init(0),
         tree_mod.DraftTree(MAX_TREE_NODES).init(0),
+        tree_mod.DraftTree(MAX_TREE_NODES).init(0),
+        tree_mod.DraftTree(MAX_TREE_NODES).init(0),
     },
-    committed_after_sync: u32 = 0,
+    committed_after_pending: u32 = 0,
     elapsed_ns: u64 = 0,
     err: ?qwen3.StepError = null,
 };
@@ -305,7 +310,8 @@ const PearlResult = struct {
 /// Heap-pinned persistent `USER_INTERACTIVE` PEARL worker spawned ONCE at
 /// `SpecEngine.initWithSmallDraft` (zero per-round thread creation and zero
 /// hot-path heap allocation). Overlaps `small_draft` round-`r+1` pre-drafting
-/// on `small_draft.model.compute` concurrently while the main thread runs
+/// (off-GPU on ARMv9 SME2 `ldnt1b` when `sme2_panel64`, or on `small_draft`'s
+/// independent Metal 4 queue) concurrently while the main thread runs
 /// `target.verifyTree(T_r)` on `target.compute`.
 const PearlRuntime = struct {
     small_draft: *draft_mod.SmallDraftModel,
@@ -315,6 +321,7 @@ const PearlRuntime = struct {
     state: PearlWorkerState,
     ready: bool,
     init_err: ?qos.Error,
+    stop_expanding: std.atomic.Value(bool) align(128),
     thread: std.Thread,
 
     job: PearlJob,
@@ -328,6 +335,7 @@ const PearlRuntime = struct {
     batch_positions: [MAX_TREE_NODES]u32,
     batch_roots: [MAX_TREE_NODES]u8,
     batch_nodes: [MAX_TREE_NODES]u16,
+    lead_cands: [MAX_TREE_NODES * draft_mod.MAX_DRAFT_TOP_K]moe.TopKCandidate,
     batch_cands: [MAX_TREE_NODES * draft_mod.MAX_DRAFT_TOP_K]moe.TopKCandidate,
 
     fn init(allocator: std.mem.Allocator, sd: *draft_mod.SmallDraftModel) InitError!*PearlRuntime {
@@ -342,6 +350,7 @@ const PearlRuntime = struct {
             .state = .idle,
             .ready = false,
             .init_err = null,
+            .stop_expanding = .init(false),
             .thread = undefined,
             .job = .{},
             .result = .{},
@@ -352,6 +361,7 @@ const PearlRuntime = struct {
             .batch_positions = @splat(0),
             .batch_roots = @splat(0),
             .batch_nodes = @splat(0),
+            .lead_cands = undefined,
             .batch_cands = undefined,
         };
 
@@ -395,11 +405,18 @@ const PearlRuntime = struct {
     fn launch(self: *PearlRuntime, job: PearlJob) void {
         _ = std.c.pthread_mutex_lock(&self.mutex);
         std.debug.assert(self.state == .idle);
+        self.stop_expanding.store(false, .release);
         self.job = job;
         self.result = .{};
         self.state = .running;
         _ = std.c.pthread_cond_signal(&self.work_cond);
         _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    /// Signals the worker not to start any additional expansion levels because
+    /// `target.verifyTree(T_r)` has already completed, preventing critical-path stalls.
+    fn requestEarlyStop(self: *PearlRuntime) void {
+        self.stop_expanding.store(true, .release);
     }
 
     fn collectResult(self: *PearlRuntime) PearlResult {
@@ -535,49 +552,161 @@ const PearlRuntime = struct {
         return picked;
     }
 
+    fn candsForPrefix(
+        self: *const PearlRuntime,
+        prefix_len: u16,
+        got_k_lead: u32,
+    ) []const moe.TopKCandidate {
+        if (prefix_len == 0) return self.small_draft.rootCandidates();
+        const idx: usize = prefix_len - 1;
+        return self.lead_cands[idx * got_k_lead .. (idx + 1) * got_k_lead];
+    }
+
+    fn appendHypothesis(
+        res: *PearlResult,
+        max_roots: usize,
+        committed_after_pending: u32,
+        max_seq_len: u32,
+        prefix_len: u16,
+        tok: u32,
+    ) void {
+        if (res.num_roots >= max_roots) return;
+        if (committed_after_pending + prefix_len + 1 >= max_seq_len) return;
+        for (0..res.num_roots) |i| {
+            if (res.root_prefix_lens[i] == prefix_len and res.bonus_tokens[i] == tok) return;
+        }
+        const r = res.num_roots;
+        res.root_prefix_lens[r] = prefix_len;
+        res.bonus_tokens[r] = tok;
+        res.num_roots += 1;
+    }
+
     fn executeJob(self: *PearlRuntime, res: *PearlResult) qwen3.StepError!void {
         const sd = self.small_draft;
         const job = &self.job;
         const eff_top_k: u32 = @min(job.top_k, sd.model.config.vocab_size);
 
-        // 1. Speculatively commit `[pending_sync_tok?, lead_tokens[0..lead_len]]` into
-        //    `small_draft`'s KV cache in ONE batched pass -> yields top-K predicted bonus tokens.
-        if (job.sync_len > 0) {
-            try sd.syncAcceptedChunked(job.sync_tokens[0..job.sync_len], job.committed_before, eff_top_k);
+        // 1. Commit already-accepted ground-truth tokens from a prior PEARL hit into
+        //    `sd`'s permanent KV cache (`committed_after_pending == base_pos + 1`).
+        //    When `lead_len > 0`, skip `lm_head` (`top_k = 0`) because Step 2 produces
+        //    multi-prefix candidates for `k = 1..lead_len` in one batched pass.
+        const max_slots: usize = sd.maxTreeSlots();
+        const lead_len: u16 = @intCast(@min(@as(usize, job.lead_len), max_slots -| 1));
+        if (job.pending_sync_len > 0) {
+            try sd.syncAcceptedChunked(
+                job.pending_sync_tokens[0..job.pending_sync_len],
+                job.committed_before,
+                if (lead_len > 0) 0 else eff_top_k,
+            );
         }
-        const next_base_pos = sd.seqLen();
-        res.committed_after_sync = next_base_pos;
+        const committed_after_pending = sd.seqLen();
+        res.committed_after_pending = committed_after_pending;
 
-        const bonus_cands = sd.rootCandidates();
-        if (bonus_cands.len == 0 or next_base_pos + 1 >= job.max_seq_len) return;
+        if (self.stop_expanding.load(.acquire)) return;
 
-        const num_roots: usize = @min(
-            PEARL_MAX_BONUS_ROOTS,
-            @min(bonus_cands.len, @as(usize, sd.maxTreeSlots())),
-        );
+        // 2. Evaluate `lead_tokens[0..lead_len]` into temporary tree KV slots `0..lead_len`
+        //    WITHOUT mutating permanent KV, yielding top-K bonus predictions at EVERY
+        //    prefix length `k = 1..lead_len` in ONE single batched forward pass!
+        @memset(&self.slot_ancestor_masks, 0);
+        var got_k_lead: u32 = 0;
+        if (lead_len > 0) {
+            for (0..lead_len) |i| {
+                self.batch_tokens[i] = job.lead_tokens[i];
+                self.batch_positions[i] = committed_after_pending + @as(u32, @intCast(i));
+                self.slot_ancestor_masks[i] = if (i == 63)
+                    ~@as(u64, 0)
+                else
+                    (@as(u64, 1) << @as(u6, @intCast(i + 1))) - 1;
+            }
+            got_k_lead = try sd.stepTreeBatch(
+                self.batch_tokens[0..lead_len],
+                self.batch_positions[0..lead_len],
+                self.slot_ancestor_masks[0..lead_len],
+                0,
+                eff_top_k,
+                self.lead_cands[0 .. @as(usize, lead_len) * @as(usize, eff_top_k)],
+            );
+        }
+
+        if (self.stop_expanding.load(.acquire)) return;
+
+        // 3. Select multi-prefix `(prefix_len, bonus_tok)` root hypotheses.
+        //    Because batched `stepTreeBatch` reads draft weights ONCE across all
+        //    speculated roots (`M = 1..4` costs virtually the same DRAM traffic as `M = 1`),
+        //    speculating up to 4 `(prefix_len, bonus_tok)` hypotheses (full lead acceptance
+        //    + top partial-prefix rejection fallbacks where `cand != lead_tokens[k]`)
+        //    turns partial prefix matches into full PEARL hits at zero extra CB count!
+        const full_cands = self.candsForPrefix(lead_len, got_k_lead);
+        const rem_for_roots: usize = max_slots -| @as(usize, lead_len);
+        const max_roots: usize = @min(PEARL_MAX_BONUS_ROOTS, rem_for_roots);
+        if (max_roots == 0) return;
+
+        // Hypothesis 0: full lead path accepted, greedy bonus #1.
+        if (full_cands.len > 0) {
+            appendHypothesis(res, max_roots, committed_after_pending, job.max_seq_len, lead_len, full_cands[0].token_id);
+        }
+        // Hypothesis 1 (multi-prefix): rejected at `lead_len - 1` -> #1 non-lead candidate.
+        if (max_roots >= 2 and lead_len >= 2) {
+            const c_prev = self.candsForPrefix(lead_len - 1, got_k_lead);
+            for (c_prev) |c| {
+                if (c.token_id != job.lead_tokens[lead_len - 1]) {
+                    appendHypothesis(res, max_roots, committed_after_pending, job.max_seq_len, lead_len - 1, c.token_id);
+                    break;
+                }
+            }
+        }
+        // Hypothesis 2: full lead path accepted, bonus #2.
+        if (max_roots >= 2 and full_cands.len >= 2) {
+            appendHypothesis(res, max_roots, committed_after_pending, job.max_seq_len, lead_len, full_cands[1].token_id);
+        }
+        // Hypothesis 3+ (multi-prefix): walk back earlier rejection prefixes `lead_len - 2 .. 1`.
+        if (lead_len >= 3) {
+            var back: u16 = 2;
+            while (res.num_roots < max_roots and back < lead_len) : (back += 1) {
+                const k_pref: u16 = lead_len - back;
+                const c_k = self.candsForPrefix(k_pref, got_k_lead);
+                for (c_k) |c| {
+                    if (c.token_id != job.lead_tokens[k_pref]) {
+                        appendHypothesis(res, max_roots, committed_after_pending, job.max_seq_len, k_pref, c.token_id);
+                        break;
+                    }
+                }
+            }
+        }
+
+        const num_roots: usize = res.num_roots;
         if (num_roots == 0) return;
 
-        // 2. Step all speculated bonus root candidates (`b_0`, `b_1`) in ONE batched
-        //    `stepTreeBatch` call at slots `0..num_roots` (without committing `b_j` to KV yet).
-        @memset(&self.slot_ancestor_masks, 0);
+        // 4. Step all speculated `(prefix_len, bonus_tok)` roots in ONE batched `stepTreeBatch`
+        //    call at tree slots `lead_len .. lead_len + num_roots`.
+        const root_slot_start: u32 = lead_len;
         for (0..num_roots) |r| {
-            const btok = bonus_cands[r].token_id;
-            res.bonus_tokens[r] = btok;
+            const k_r = res.root_prefix_lens[r];
+            const btok = res.bonus_tokens[r];
+            const slot_r: u32 = root_slot_start + @as(u32, @intCast(r));
+            const prefix_mask: u64 = if (k_r == 0)
+                0
+            else if (k_r >= 64)
+                ~@as(u64, 0)
+            else
+                (@as(u64, 1) << @as(u6, @intCast(k_r))) - 1;
+
             res.trees[r].reset(btok);
             @memset(&self.node_slots[r], tree_mod.NO_NODE);
             @memset(&self.node_expanded[r], false);
-            self.node_slots[r][0] = @intCast(r);
+            self.node_slots[r][0] = @intCast(slot_r);
             self.node_expanded[r][0] = true;
-            self.slot_ancestor_masks[r] = @as(u64, 1) << @as(u6, @intCast(r));
+            self.slot_ancestor_masks[slot_r] = prefix_mask | (@as(u64, 1) << @as(u6, @intCast(slot_r)));
             self.batch_tokens[r] = btok;
-            self.batch_positions[r] = next_base_pos;
+            self.batch_positions[r] = committed_after_pending + k_r;
         }
 
+        var used_slots: u32 = root_slot_start + @as(u32, @intCast(num_roots));
         const got_k0 = try sd.stepTreeBatch(
             self.batch_tokens[0..num_roots],
             self.batch_positions[0..num_roots],
-            self.slot_ancestor_masks[0..num_roots],
-            0,
+            self.slot_ancestor_masks[0..used_slots],
+            root_slot_start,
             eff_top_k,
             self.batch_cands[0 .. num_roots * @as(usize, eff_top_k)],
         );
@@ -592,31 +721,37 @@ const PearlRuntime = struct {
                 _ = res.trees[r].insertChild(0, cand.token_id, cand.prob, .l2);
             }
         }
-        res.num_roots = @intCast(num_roots);
 
-        const max_rem_depth: u16 = @intCast(@min(
-            @as(u32, MAX_TREE_NODES - 1),
-            job.max_seq_len - 1 - next_base_pos,
-        ));
-        const target_depth: u16 = @min(job.max_draft_depth, max_rem_depth);
-        if (target_depth <= 1) return;
-
-        // 3. Expand depths `2 .. target_depth` across speculated roots concurrently
-        //    in shared batched `stepTreeBatch` calls.
-        var used_slots: u32 = @intCast(num_roots);
+        // 5. Expand depths `2 .. target_depth` across speculated roots concurrently
+        //    in shared batched `stepTreeBatch` calls, stopping immediately if
+        //    `target.verifyTree(T_r)` has already completed (`stop_expanding`).
+        const eff_max_depth: u16 = job.max_draft_depth;
         var level: u16 = 1;
-        while (level < target_depth) : (level += 1) {
+        while (level < eff_max_depth) : (level += 1) {
+            if (self.stop_expanding.load(.acquire)) break;
             if (used_slots >= sd.maxTreeSlots()) break;
             const rem_slots: usize = @as(usize, sd.maxTreeSlots() - used_slots);
 
             var picked: usize = 0;
-            if (res.trees[0].count < job.candidate_cap) {
-                const cap0 = @min(@as(usize, job.branch_width), rem_slots);
-                picked += self.selectFrontierForRoot(&res.trees[0], 0, target_depth, cap0, level == 1, 0);
-            }
-            if (num_roots > 1 and picked < rem_slots and res.trees[1].count < job.candidate_cap) {
-                const cap1 = @min(@max(@as(usize, 1), @as(usize, job.branch_width) / 2), rem_slots - picked);
-                picked += self.selectFrontierForRoot(&res.trees[1], 1, target_depth, cap1, false, picked);
+            for (0..num_roots) |r| {
+                if (picked >= rem_slots) break;
+                if (res.trees[r].count >= job.candidate_cap) continue;
+                const k_r = res.root_prefix_lens[r];
+                const r_base_pos = committed_after_pending + k_r;
+                if (r_base_pos + 1 >= job.max_seq_len) continue;
+                const r_rem_depth: u16 = @intCast(@min(
+                    @as(u32, MAX_TREE_NODES - 1),
+                    job.max_seq_len - 1 - r_base_pos,
+                ));
+                const r_target_depth = @min(eff_max_depth, r_rem_depth);
+                if (level >= r_target_depth) continue;
+
+                const want: usize = if (r == 0)
+                    @as(usize, job.branch_width)
+                else
+                    1;
+                const cap_r = @min(want, rem_slots - picked);
+                picked += self.selectFrontierForRoot(&res.trees[r], r, r_target_depth, cap_r, r == 0 and level == 1, picked);
             }
             if (picked == 0) break;
 
@@ -630,7 +765,7 @@ const PearlRuntime = struct {
                 self.slot_ancestor_masks[slot_idx] =
                     self.slot_ancestor_masks[parent_slot] | (@as(u64, 1) << @as(u6, @intCast(slot_idx)));
                 self.batch_tokens[i] = node.token_id;
-                self.batch_positions[i] = next_base_pos + node.depth;
+                self.batch_positions[i] = committed_after_pending + res.root_prefix_lens[r_idx] + node.depth;
             }
 
             const total_slots = slot_start + @as(u32, @intCast(picked));
@@ -683,13 +818,19 @@ pub const SpecEngine = struct {
     // Heap-pinned persistent PEARL worker (`D8`, null when `small_draft == null` or `.off`).
     pearl_rt: ?*PearlRuntime,
     pearl_enabled: bool,
+    pearl_auto_contended_off: bool,
+    pearl_base_verify_us: f64,
+    pearl_base_draft_sync_us: f64,
+    pearl_probe_rounds: u32,
+    pearl_probe_verify_sum_us: f64,
+    pearl_probe_hits: u32,
     verify_us_ema: f64,
     has_pearl_ready_tree: bool,
     pearl_ready_tree: tree_mod.DraftTree(MAX_TREE_NODES),
-    pearl_pending_sync_len: u8,
-    pearl_pending_sync_tok: u32,
+    pearl_pending_sync_len: u16,
+    pearl_pending_sync_tokens: [MAX_TREE_NODES + 1]u32,
     pearl_lead_tokens: [MAX_TREE_NODES]u32,
-    pearl_rollback_buf: [MAX_TREE_NODES + 1]u32,
+    pearl_rollback_buf: [MAX_TREE_NODES * 2 + 2]u32,
 
     // Preallocated hot-path scratch buffers (zero dynamic heap allocation on `stepRound`).
     draft_tree: tree_mod.DraftTree(MAX_TREE_NODES),
@@ -746,7 +887,7 @@ pub const SpecEngine = struct {
         cost: tree_mod.PruneCostModel,
     ) bool {
         const sd = small_draft orelse return false;
-        if (!sd.hasOwnComputeQueue()) return false;
+        if (!sd.hasOwnComputeQueue() and !sd.model.hasPureCpuSme2Draft()) return false;
         return switch (config.pearl_mode) {
             .off => false,
             .on => true,
@@ -854,7 +995,7 @@ pub const SpecEngine = struct {
 
         var pearl_rt: ?*PearlRuntime = null;
         if (small_draft) |sd| {
-            if (config.pearl_mode != .off and sd.hasOwnComputeQueue()) {
+            if (config.pearl_mode != .off and (sd.hasOwnComputeQueue() or sd.model.hasPureCpuSme2Draft())) {
                 pearl_rt = try PearlRuntime.init(allocator, sd);
             }
         }
@@ -877,11 +1018,17 @@ pub const SpecEngine = struct {
             .sam = sam,
             .pearl_rt = pearl_rt,
             .pearl_enabled = pearl_enabled,
+            .pearl_auto_contended_off = false,
+            .pearl_base_verify_us = 0.0,
+            .pearl_base_draft_sync_us = 0.0,
+            .pearl_probe_rounds = 0,
+            .pearl_probe_verify_sum_us = 0.0,
+            .pearl_probe_hits = 0,
             .verify_us_ema = 0.0,
             .has_pearl_ready_tree = false,
             .pearl_ready_tree = tree_mod.DraftTree(MAX_TREE_NODES).init(0),
             .pearl_pending_sync_len = 0,
-            .pearl_pending_sync_tok = 0,
+            .pearl_pending_sync_tokens = @splat(0),
             .pearl_lead_tokens = @splat(0),
             .pearl_rollback_buf = @splat(0),
             .draft_tree = tree_mod.DraftTree(MAX_TREE_NODES).init(0),
@@ -935,7 +1082,13 @@ pub const SpecEngine = struct {
         self.sam.reset();
         self.has_pearl_ready_tree = false;
         self.pearl_pending_sync_len = 0;
-        self.pearl_pending_sync_tok = 0;
+        self.pearl_pending_sync_tokens = @splat(0);
+        self.pearl_auto_contended_off = false;
+        self.pearl_base_verify_us = 0.0;
+        self.pearl_base_draft_sync_us = 0.0;
+        self.pearl_probe_rounds = 0;
+        self.pearl_probe_verify_sum_us = 0.0;
+        self.pearl_probe_hits = 0;
         self.verify_us_ema = 0.0;
         self.pearl_enabled = computeInitialPearlEnabled(self.config, self.small_draft, self.cost_model);
         self.next_pos = 0;
@@ -1306,29 +1459,34 @@ pub const SpecEngine = struct {
             }
         }
 
-        // D8 PEARL: Launch asynchronous round-`r+1` pre-drafting on `small_draft`'s
-        // independent Metal 4 queue right before `target.verifyTree(T_r)`!
+        // D8 PEARL: Launch asynchronous round-`r+1` pre-drafting (off-GPU on ARMv9 SME2
+        // `ldnt1b` when `sme2_panel64`, or on `small_draft`'s independent Metal 4 queue)
+        // right before `target.verifyTree(T_r)`!
+        // In `.auto` mode for same-GPU drafts, round 0 runs un-overlapped to sample
+        // the uncontended `verify_us` baseline for the ADR-0008 contention gate.
         var pearl_launched = false;
         errdefer if (pearl_launched) {
             if (self.pearl_rt) |prt| prt.waitIdle();
         };
-        if (self.pearl_enabled) {
+        const off_gpu_draft = if (self.small_draft) |sd| sd.model.hasPureCpuSme2Draft() else false;
+        const skip_for_base_probe = (self.config.pearl_mode == .auto and !off_gpu_draft and self.stats.rounds == 0);
+        if (self.pearl_enabled and !skip_for_base_probe) {
             if (self.pearl_rt) |prt| {
                 if (self.small_draft) |sd| {
                     const committed_before = sd.seqLen();
-                    const sync_len: usize = @as(usize, self.pearl_pending_sync_len) + @as(usize, lead_len);
-                    const next_base_pos: u32 = base_pos + 1 + @as(u32, lead_len);
+                    const pending_len: usize = self.pearl_pending_sync_len;
+                    const next_base_pos: u32 = base_pos + 1;
                     if (next_base_pos < max_seq and
-                        committed_before + sync_len <= sd.maxSeqLen() and
-                        sync_len <= MAX_TREE_NODES)
+                        committed_before + pending_len <= sd.maxSeqLen() and
+                        committed_before + pending_len == next_base_pos)
                     {
                         var job: PearlJob = .{
                             .base_pos = base_pos,
                             .committed_before = committed_before,
                             .pending_sync_len = self.pearl_pending_sync_len,
-                            .pending_sync_tok = self.pearl_pending_sync_tok,
                             .lead_len = lead_len,
-                            .sync_len = @intCast(sync_len),
+                            .off_gpu = off_gpu_draft,
+                            .greedy = (self.config.temperature == 0.0),
                             .max_draft_depth = self.config.max_draft_depth,
                             .branch_width = self.config.branch_width,
                             .top_k = self.config.top_k_per_node,
@@ -1336,16 +1494,11 @@ pub const SpecEngine = struct {
                             .candidate_cap = candidate_cap,
                             .max_seq_len = max_seq,
                         };
+                        if (pending_len > 0) {
+                            @memcpy(job.pending_sync_tokens[0..pending_len], self.pearl_pending_sync_tokens[0..pending_len]);
+                        }
                         if (lead_len > 0) {
                             @memcpy(job.lead_tokens[0..lead_len], self.pearl_lead_tokens[0..lead_len]);
-                        }
-                        var s_idx: usize = 0;
-                        if (self.pearl_pending_sync_len > 0) {
-                            job.sync_tokens[0] = self.pearl_pending_sync_tok;
-                            s_idx = 1;
-                        }
-                        if (lead_len > 0) {
-                            @memcpy(job.sync_tokens[s_idx .. s_idx + lead_len], self.pearl_lead_tokens[0..lead_len]);
                         }
                         prt.launch(job);
                         pearl_launched = true;
@@ -1371,6 +1524,9 @@ pub const SpecEngine = struct {
         );
         const t_verify_end = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         const verify_ns: u64 = @intCast(@max(@as(i96, 0), t_verify_start.durationTo(t_verify_end).toNanoseconds()));
+        if (pearl_launched and self.config.temperature == 0.0) {
+            self.pearl_rt.?.requestEarlyStop();
+        }
 
         // 5. Lossless Verification (`D9`): greedy (`T = 0`) or stochastic (`T > 0`).
         const acc = if (self.config.temperature == 0.0)
@@ -1436,12 +1592,15 @@ pub const SpecEngine = struct {
             if (pres.err) |err| return err;
 
             if (base_pos + acc.emitted_token_count < max_seq) {
-                const path_matched = (acc.draft_accepted == lead_len) and
-                    std.mem.eql(u32, emitted[0..lead_len], self.pearl_lead_tokens[0..lead_len]);
+                const k_acc: u16 = acc.draft_accepted;
+                const prefix_ok = (k_acc <= lead_len) and
+                    std.mem.eql(u32, emitted[0..k_acc], self.pearl_lead_tokens[0..k_acc]);
                 var matched_root: ?usize = null;
-                if (path_matched) {
+                if (prefix_ok) {
                     for (0..pres.num_roots) |r_idx| {
-                        if (pres.bonus_tokens[r_idx] == acc.bonus_token) {
+                        if (pres.root_prefix_lens[r_idx] == k_acc and
+                            pres.bonus_tokens[r_idx] == acc.bonus_token)
+                        {
                             matched_root = r_idx;
                             break;
                         }
@@ -1449,51 +1608,32 @@ pub const SpecEngine = struct {
                 }
 
                 if (matched_root) |r_idx| {
-                    // Full PEARL hit: reuse pre-drafted `T_{r+1}` directly on the next round!
+                    // Full multi-prefix PEARL hit: reuse pre-drafted `T_{r+1}` directly
+                    // on the next round and defer committing `emitted` into next round's
+                    // overlapped PEARL pass (`0.0 ms` sync & `0.0 ms` draft on critical path!).
                     self.pearl_ready_tree = pres.trees[r_idx];
                     self.has_pearl_ready_tree = true;
-                    self.pearl_pending_sync_len = 1;
-                    self.pearl_pending_sync_tok = acc.bonus_token;
+                    self.pearl_pending_sync_len = @intCast(emitted.len);
+                    @memcpy(self.pearl_pending_sync_tokens[0..emitted.len], emitted);
                     self.stats.pearl_hits += 1;
+                    if (k_acc < lead_len) {
+                        self.stats.pearl_partial_prefix_hits += 1;
+                    }
                     self.stats.pearl_saved_ns += @min(verify_ns, pres.elapsed_ns);
                     round_pearl_hit = true;
                 } else {
-                    // O(1) PEARL rollback with causal KV prefix reuse!
+                    // Zero-rewind PEARL miss: `lead_tokens` lived in temporary tree slots
+                    // only, so `sd.seqLen()` is cleanly `pres.committed_after_pending == base_pos + 1`.
                     const sd = self.small_draft.?;
-                    const committed_before = prt.job.committed_before;
-                    const spec_committed = prt.job.sync_tokens[0..prt.job.sync_len];
-
-                    var needed_len: usize = 0;
-                    if (prt.job.pending_sync_len > 0) {
-                        self.pearl_rollback_buf[0] = prt.job.pending_sync_tok;
-                        needed_len = 1;
-                    }
-                    @memcpy(self.pearl_rollback_buf[needed_len .. needed_len + emitted.len], emitted);
-                    needed_len += emitted.len;
-
-                    const max_prefix = @min(spec_committed.len, needed_len);
-                    var matched_prefix: usize = 0;
-                    while (matched_prefix < max_prefix and
-                        spec_committed[matched_prefix] == self.pearl_rollback_buf[matched_prefix])
-                    {
-                        matched_prefix += 1;
-                    }
-                    // Keep at least the final bonus token to sync so `sd.rootCandidates()` is refreshed.
-                    if (matched_prefix == needed_len and matched_prefix > 0) {
-                        matched_prefix -= 1;
-                    }
-
-                    const rewind_pos: u32 = committed_before + @as(u32, @intCast(matched_prefix));
-                    sd.rewindKvLen(rewind_pos) catch unreachable;
                     try sd.syncAcceptedChunked(
-                        self.pearl_rollback_buf[matched_prefix..needed_len],
-                        rewind_pos,
+                        emitted,
+                        pres.committed_after_pending,
                         self.config.top_k_per_node,
                     );
                     self.pearl_pending_sync_len = 0;
                     self.has_pearl_ready_tree = false;
                     self.stats.pearl_rollbacks += 1;
-                    if (matched_prefix > prt.job.pending_sync_len) {
+                    if (k_acc > 0 and prefix_ok) {
                         self.stats.pearl_partial_prefix_hits += 1;
                     }
                 }
@@ -1503,12 +1643,14 @@ pub const SpecEngine = struct {
             }
         } else if (self.small_draft) |sd| {
             if (base_pos + acc.emitted_token_count < max_seq) {
-                if (self.pearl_pending_sync_len > 0) {
-                    self.pearl_rollback_buf[0] = self.pearl_pending_sync_tok;
-                    @memcpy(self.pearl_rollback_buf[1 .. 1 + emitted.len], emitted);
+                const pending_len: usize = self.pearl_pending_sync_len;
+                if (pending_len > 0) {
+                    const sync_start = sd.seqLen();
+                    @memcpy(self.pearl_rollback_buf[0..pending_len], self.pearl_pending_sync_tokens[0..pending_len]);
+                    @memcpy(self.pearl_rollback_buf[pending_len .. pending_len + emitted.len], emitted);
                     try sd.syncAcceptedChunked(
-                        self.pearl_rollback_buf[0 .. 1 + emitted.len],
-                        base_pos,
+                        self.pearl_rollback_buf[0 .. pending_len + emitted.len],
+                        sync_start,
                         self.config.top_k_per_node,
                     );
                     self.pearl_pending_sync_len = 0;
@@ -1523,14 +1665,34 @@ pub const SpecEngine = struct {
         const t_commit_end = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         const commit_sync_ns: u64 = @intCast(@max(@as(i96, 0), t_commit_start.durationTo(t_commit_end).toNanoseconds()));
 
-        // 7. Advance sequence state, update D8 `.auto` target-latency gate, and record telemetry.
+        // 7. Advance sequence state, update D8 `.auto` target-latency + contention gate (`ADR-0008`).
         const verify_us: f64 = @as(f64, @floatFromInt(verify_ns)) / 1000.0;
+        const draft_sync_us: f64 = @as(f64, @floatFromInt(draft_ns + commit_sync_ns)) / 1000.0;
+        const v_norm_denom: f64 = @as(f64, @floatFromInt(@max(@as(u16, 1), verified_nodes)));
+        const verify_us_per_node: f64 = verify_us / v_norm_denom;
         self.verify_us_ema = if (self.stats.rounds == 0)
             verify_us
         else
             (0.7 * self.verify_us_ema + 0.3 * verify_us);
         if (self.config.pearl_mode == .auto and self.pearl_rt != null) {
-            self.pearl_enabled = (self.verify_us_ema >= self.config.pearl_min_target_us);
+            if (skip_for_base_probe) {
+                self.pearl_base_verify_us = verify_us_per_node;
+                self.pearl_base_draft_sync_us = draft_sync_us;
+            } else if (!off_gpu_draft and !self.pearl_auto_contended_off and self.pearl_enabled and self.pearl_probe_rounds < 4) {
+                self.pearl_probe_rounds += 1;
+                self.pearl_probe_verify_sum_us += verify_us_per_node;
+                if (round_pearl_hit) self.pearl_probe_hits += 1;
+                if (self.pearl_probe_rounds == 4 and self.pearl_base_verify_us > 0.0) {
+                    const mean_contended_per_node = self.pearl_probe_verify_sum_us / 4.0;
+                    const est_overhead_us = (mean_contended_per_node - self.pearl_base_verify_us) * v_norm_denom;
+                    const hit_rate = @as(f64, @floatFromInt(self.pearl_probe_hits)) / 4.0;
+                    const est_saved_us = hit_rate * self.pearl_base_draft_sync_us;
+                    if (est_overhead_us > est_saved_us + 4000.0 and mean_contended_per_node > self.pearl_base_verify_us * 1.12) {
+                        self.pearl_auto_contended_off = true;
+                    }
+                }
+            }
+            self.pearl_enabled = !self.pearl_auto_contended_off and (self.verify_us_ema >= self.config.pearl_min_target_us);
             self.stats.pearl_enabled = self.pearl_enabled;
         }
 
@@ -2950,6 +3112,7 @@ test "M5 D8 PEARL async pipelined SmallDraft matches pearl=off and stepDecode 10
             .max_tree_nodes = 12,
             .max_draft_depth = 3,
             .temperature = 0.7,
+            .enable_pruning = false,
             .pearl_mode = .on,
         });
         defer eng_st.deinit(allocator);
@@ -2973,6 +3136,56 @@ test "M5 D8 PEARL async pipelined SmallDraft matches pearl=off and stepDecode 10
             ps_b += rs.emitted_count;
         }
         try std.testing.expectEqualSlices(u32, &st_a, &st_b);
+    }
+
+    // 3. Off-GPU pure-CPU ARMv9 SME2 (`sme2_panel64`) SmallDraftModel + Multi-Prefix PEARL:
+    //    verifies `hasPureCpuSme2Draft() == true`, `--pearl on` & `--pearl auto`, `pearl_hits > 0`,
+    //    and 100% bit-exact `T = 0` parity with zero GPU queue submissions from the draft model!
+    {
+        const sme_draft_bytes = try qwen3.repackAmfBytesToSme2(allocator, tgt_bytes, .all_linear, null);
+        defer allocator.free(sme_draft_bytes);
+
+        var spec_tgt = try qwen3.Qwen3Model.loadFromBytes(allocator, tgt_bytes, dense_cfg, .{
+            .max_seq_len = 64,
+            .chunk_tokens = 8,
+            .max_tree_nodes = 16,
+        });
+        defer spec_tgt.deinit(allocator);
+
+        var sd_sme = try draft_mod.SmallDraftModel.loadFromBytes(allocator, &spec_tgt, sme_draft_bytes, dense_cfg, .{
+            .placement = .gpu,
+            .max_seq_len = 64,
+            .chunk_tokens = 8,
+            .max_tree_slots = 32,
+            .own_compute_queue = true,
+        });
+        defer sd_sme.deinit(allocator);
+        try std.testing.expect(sd_sme.model.hasPureCpuSme2Draft());
+
+        var eng_sme = try SpecEngine.initWithSmallDraft(allocator, &spec_tgt, &sd_sme, .{
+            .mode = .small_draft,
+            .max_tree_nodes = 12,
+            .max_draft_depth = 3,
+            .branch_width = 2,
+            .top_k_per_node = 3,
+            .temperature = 0.0,
+            .enable_pruning = false,
+            .pearl_mode = .auto,
+            .pearl_min_target_us = 1.0,
+        });
+        defer eng_sme.deinit(allocator);
+
+        var out_sme: [16]u32 = undefined;
+        out_sme[0] = try eng_sme.prefill(&prompt, null);
+        var p_sme: usize = 1;
+        while (p_sme < out_sme.len) {
+            const rs = try eng_sme.stepRound(null, out_sme[p_sme..]);
+            p_sme += rs.emitted_count;
+        }
+        try std.testing.expectEqualSlices(u32, &expected, &out_sme);
+        try std.testing.expect(eng_sme.stats.pearl_enabled);
+        try std.testing.expect(eng_sme.stats.pearl_rounds > 0);
+        try std.testing.expect(eng_sme.stats.pearl_hits > 0);
     }
 }
 

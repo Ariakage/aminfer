@@ -1099,11 +1099,14 @@ const DispatchJob = struct {
     panels_per_tile: usize = 1,
     total_tiles: u32 = 0,
     active_workers: usize = 1,
+    custom_fn: ?*const fn (*anyopaque, u32) void = null,
+    custom_ctx: ?*anyopaque = null,
 };
 
 const SharedPoolState = struct {
     next_tile: std.atomic.Value(u32) align(CACHELINE_BYTES),
     completed_tiles: std.atomic.Value(u32) align(CACHELINE_BYTES),
+    workers_done: std.atomic.Value(u32) align(CACHELINE_BYTES),
     epoch: std.atomic.Value(u32) align(CACHELINE_BYTES),
     sleeping_workers: std.atomic.Value(u32) align(CACHELINE_BYTES),
     shutdown: std.atomic.Value(bool) align(CACHELINE_BYTES),
@@ -1157,6 +1160,7 @@ pub const SmeDispatcher = struct {
         state.* = .{
             .next_tile = .init(0),
             .completed_tiles = .init(0),
+            .workers_done = .init(0),
             .epoch = .init(0),
             .sleeping_workers = .init(0),
             .shutdown = .init(false),
@@ -1247,6 +1251,10 @@ pub const SmeDispatcher = struct {
     }
 
     fn executeTile(job: *const DispatchJob, tile_idx: u32) void {
+        if (job.custom_fn) |cf| {
+            cf(job.custom_ctx.?, tile_idx);
+            return;
+        }
         const p_start = @as(usize, tile_idx) * job.panels_per_tile;
         if (p_start >= job.total_panels) return;
         const p_count = @min(job.panels_per_tile, job.total_panels - p_start);
@@ -1337,11 +1345,11 @@ pub const SmeDispatcher = struct {
                     std.atomic.spinLoopHint();
                 } else {
                     _ = std.c.pthread_mutex_lock(&state.wake_mutex);
-                    _ = state.sleeping_workers.fetchAdd(1, .acq_rel);
-                    while (state.epoch.load(.acquire) == last_epoch and !state.shutdown.load(.acquire)) {
+                    _ = state.sleeping_workers.fetchAdd(1, .seq_cst);
+                    while (state.epoch.load(.seq_cst) == last_epoch and !state.shutdown.load(.seq_cst)) {
                         _ = std.c.pthread_cond_wait(&state.wake_cond, &state.wake_mutex);
                     }
-                    _ = state.sleeping_workers.fetchSub(1, .acq_rel);
+                    _ = state.sleeping_workers.fetchSub(1, .seq_cst);
                     _ = std.c.pthread_mutex_unlock(&state.wake_mutex);
                     if (state.shutdown.load(.acquire)) return;
                 }
@@ -1351,6 +1359,7 @@ pub const SmeDispatcher = struct {
             if (bg_idx + 1 < state.job.active_workers) {
                 runClaimLoop(state);
             }
+            _ = state.workers_done.fetchAdd(1, .release);
         }
     }
 
@@ -1468,9 +1477,10 @@ pub const SmeDispatcher = struct {
         state.job = job;
         state.next_tile.store(0, .monotonic);
         state.completed_tiles.store(0, .monotonic);
-        _ = state.epoch.fetchAdd(1, .release);
+        state.workers_done.store(0, .monotonic);
+        _ = state.epoch.fetchAdd(1, .seq_cst);
 
-        if (state.sleeping_workers.load(.acquire) > 0) {
+        if (state.sleeping_workers.load(.seq_cst) > 0) {
             _ = std.c.pthread_mutex_lock(&state.wake_mutex);
             _ = std.c.pthread_cond_broadcast(&state.wake_cond);
             _ = std.c.pthread_mutex_unlock(&state.wake_mutex);
@@ -1479,8 +1489,12 @@ pub const SmeDispatcher = struct {
         // Caller thread (worker 0) participates in claiming tiles lock-free.
         runClaimLoop(state);
 
-        // Wait until all in-flight macro-tiles have finished.
-        while (state.completed_tiles.load(.acquire) < total_tiles) {
+        // Wait until all in-flight macro-tiles and every background worker have exited
+        // this epoch before returning (prevents `state.job` overwrite race on next call).
+        const expected_bg: u32 = @intCast(state.bg_count);
+        while (state.completed_tiles.load(.acquire) < total_tiles or
+            state.workers_done.load(.acquire) < expected_bg)
+        {
             std.atomic.spinLoopHint();
         }
     }
@@ -1557,6 +1571,53 @@ pub const SmeDispatcher = struct {
         var c = cfg;
         c.out_dtype = .f32;
         return self.gemm(c, a_u16, w_packed, aux_f32, std.mem.sliceAsBytes(out_f32), m, n, k);
+    }
+
+    /// Runs `task_fn(ctx, tile_idx)` across `[0, total_tiles)` using the persistent
+    /// lock-free P-core worker pool with zero heap allocation on the hot path.
+    pub fn parallelFor(
+        self: *SmeDispatcher,
+        total_tiles: u32,
+        max_threads: ?usize,
+        ctx: *anyopaque,
+        task_fn: *const fn (*anyopaque, u32) void,
+    ) void {
+        if (total_tiles == 0) return;
+        const req_threads = @min(self.num_threads, max_threads orelse self.num_threads);
+        const active_workers = @max(@as(usize, 1), @min(req_threads, @as(usize, total_tiles)));
+        if (active_workers <= 1 or total_tiles <= 1) {
+            for (0..total_tiles) |t| {
+                task_fn(ctx, @intCast(t));
+            }
+            return;
+        }
+
+        const state = self.state;
+        state.job = .{
+            .total_tiles = total_tiles,
+            .active_workers = active_workers,
+            .custom_fn = task_fn,
+            .custom_ctx = ctx,
+        };
+        state.next_tile.store(0, .monotonic);
+        state.completed_tiles.store(0, .monotonic);
+        state.workers_done.store(0, .monotonic);
+        _ = state.epoch.fetchAdd(1, .seq_cst);
+
+        if (state.sleeping_workers.load(.seq_cst) > 0) {
+            _ = std.c.pthread_mutex_lock(&state.wake_mutex);
+            _ = std.c.pthread_cond_broadcast(&state.wake_cond);
+            _ = std.c.pthread_mutex_unlock(&state.wake_mutex);
+        }
+
+        runClaimLoop(state);
+
+        const expected_bg: u32 = @intCast(state.bg_count);
+        while (state.completed_tiles.load(.acquire) < total_tiles or
+            state.workers_done.load(.acquire) < expected_bg)
+        {
+            std.atomic.spinLoopHint();
+        }
     }
 };
 

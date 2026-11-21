@@ -1156,7 +1156,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
             .{
                 .placement = cli.placement,
                 .max_seq_len = max_seq_len,
-                .max_tree_slots = target_tree_cap,
+                .max_tree_slots = @min(aminfer.attention.MAX_TREE_NODES, @max(@as(u32, 32), target_tree_cap)),
                 .verify_crcs = cli.verify_crcs,
                 .own_compute_queue = (cli.pearl_mode != .off),
             },
@@ -1171,7 +1171,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
             .{
                 .placement = cli.placement,
                 .max_seq_len = max_seq_len,
-                .max_tree_slots = target_tree_cap,
+                .max_tree_slots = @min(aminfer.attention.MAX_TREE_NODES, @max(@as(u32, 32), target_tree_cap)),
                 .verify_crcs = cli.verify_crcs,
             },
         );

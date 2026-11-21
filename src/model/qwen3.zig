@@ -505,11 +505,15 @@ pub const LinearBinding = struct {
     /// Zero-copy slice into the owning `WiredArena` shard when `layout == .sme2_panel64`
     /// (single-owner invariant, ADR-0018 Safeguard B.2).
     sme_packed: ?[]const u8 = null,
+    /// Zero-copy CPU slices into the owning `WiredArena` shard for pure-CPU SME2 draft execution.
+    weight_host: []const u8 = &.{},
+    scale_bias_host: ?[]const u8 = null,
 };
 
 pub const NormBinding = struct {
     binding: metal.BufferBinding,
     dtype: quant.FloatDType,
+    host_bytes: []const u8 = &.{},
 };
 
 const WeightShard = struct {
@@ -535,6 +539,8 @@ const LayerWeights = struct {
     o_proj: LinearBinding,
     q_norm: ?metal.BufferBinding,
     k_norm: ?metal.BufferBinding,
+    q_norm_host: ?[]const u8 = null,
+    k_norm_host: ?[]const u8 = null,
     qk_norm_dtype: quant.FloatDType,
     post_attention_layernorm: NormBinding,
 
@@ -570,9 +576,19 @@ const LayerWeights = struct {
     kv_tiles_binding: metal.BufferBinding,
 };
 
+const LM_HEAD_MAX_TILES: usize = 64;
+
+const LmHeadTileState = struct {
+    max_val: f32 = -std.math.inf(f32),
+    sum_exp: f32 = 0.0,
+    count: u32 = 0,
+    top_ids: [moe.MAX_TOP_K]u32 = @splat(0),
+    top_vals: [moe.MAX_TOP_K]f32 = @splat(-std.math.inf(f32)),
+};
+
 /// Heap-pinned ARMv9 SME2 runtime state for single-owner `sme2_panel64` execution,
 /// L2-resident speculative tree router prediction (`C13`), and non-temporal `ldnt1b`
-/// cold-expert evaluation (`C12`). Preallocated once at startup; zero hot-path mallocs.
+/// cold-expert / off-GPU small-draft evaluation (`C12`, `D8`). Preallocated once at startup.
 const SmeRuntime = struct {
     dispatcher: sme.SmeDispatcher,
     x_f32_scratch: []f32,
@@ -582,6 +598,10 @@ const SmeRuntime = struct {
     expert_inter_u16: []align(sme.SVL_BYTES) u16,
     expert_down_f32: []align(sme.SVL_BYTES) f32,
     expert_acc_f32: []align(sme.SVL_BYTES) f32,
+    dense_up_f32: []align(sme.SVL_BYTES) f32,
+    x_res_f32: []align(sme.SVL_BYTES) f32,
+    rope_inv_freq: []f32,
+    lm_tile_stats: []LmHeadTileState,
 
     // L2-resident D7 router predictor bank (`null` arena when using single-owner `sme2_panel64` routers).
     router_bank_arena: ?arena_mod.WiredArena,
@@ -595,6 +615,10 @@ const SmeRuntime = struct {
 
     fn deinit(self: *SmeRuntime, allocator: std.mem.Allocator) void {
         if (self.router_bank_arena) |*a| a.deinit();
+        if (self.lm_tile_stats.len > 0) allocator.free(self.lm_tile_stats);
+        if (self.rope_inv_freq.len > 0) allocator.free(self.rope_inv_freq);
+        if (self.x_res_f32.len > 0) allocator.free(self.x_res_f32);
+        if (self.dense_up_f32.len > 0) allocator.free(self.dense_up_f32);
         if (self.expert_acc_f32.len > 0) allocator.free(self.expert_acc_f32);
         if (self.expert_down_f32.len > 0) allocator.free(self.expert_down_f32);
         if (self.expert_inter_u16.len > 0) allocator.free(self.expert_inter_u16);
@@ -889,6 +913,7 @@ pub const Qwen3Model = struct {
 
     // M4.5 Single-Owner SME2 Weight Ownership & L2-Resident Tree Router Runtime (`W15`, `C11`-`C13`)
     has_sme2_weights: bool,
+    has_pure_cpu_sme2_dense: bool,
     sme_router_mode: SmeRouterMode,
     sme_rt: ?*SmeRuntime,
 
@@ -1047,6 +1072,14 @@ pub const Qwen3Model = struct {
 
     pub fn hasSme2Weights(self: *const Qwen3Model) bool {
         return self.has_sme2_weights;
+    }
+
+    /// True when every transformer layer projection is `sme2_panel64` on a dense
+    /// model with tree drafting enabled, allowing `stepDraftTreeBatch` and
+    /// `prefillChunk` to execute 100% off-GPU on ARMv9 SME2 (`ldnt1b`) with zero
+    /// Metal GPU queue contention (`C12`, `C13`, `D8`).
+    pub fn hasPureCpuSme2Draft(self: *const Qwen3Model) bool {
+        return self.has_pure_cpu_sme2_dense;
     }
 
     pub fn routerPredCalibration(self: *const Qwen3Model) SmeRouterCalibration {
@@ -1915,6 +1948,19 @@ pub const Qwen3Model = struct {
             positions[i] = start_pos + @as(u32, @intCast(i));
             masks[i] = if (i == 63) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(i + 1))) - 1;
             accepted[i] = @intCast(i);
+        }
+        if (self.has_pure_cpu_sme2_dense) {
+            const cands = try self.stepDraftTreeBatchSme2(
+                tokens,
+                positions[0..m],
+                0,
+                masks[0..m],
+                start_pos,
+                if (compute_logits) 1 else 0,
+                true,
+                true,
+            );
+            return if (compute_logits) cands[0].token_id else 0;
         }
         const vr = try self.verifyTree(tokens, positions[0..m], masks[0..m], start_pos, compute_logits);
         try self.commitTreeKv(start_pos, accepted[0..m]);
@@ -3772,6 +3818,18 @@ pub const Qwen3Model = struct {
             if (token_ids[i] >= self.config.vocab_size) return error.TokenOutOfRange;
             if (positions[i] >= self.max_seq_len) return error.PositionOutOfRange;
         }
+        if (self.has_pure_cpu_sme2_dense and ane_o_proj_hook == null) {
+            return self.stepDraftTreeBatchSme2(
+                token_ids,
+                positions,
+                slot_start,
+                slot_ancestor_masks,
+                kv_base_pos,
+                top_k,
+                logits_last_row_only,
+                commit_kv,
+            );
+        }
         @memcpy(self.tree_token_ids_host[0..m], token_ids);
         @memcpy(self.tree_positions_host[0..m], positions);
         @memcpy(self.tree_ancestor_masks_host[0..total_slots], slot_ancestor_masks[0..total_slots]);
@@ -4021,6 +4079,1009 @@ pub const Qwen3Model = struct {
             self.seq_len = kv_base_pos + m;
         }
         return self.topk_host[0 .. @as(usize, out_rows) * top_k];
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure-CPU ARMv9 SME2 Off-GPU Draft Tree Execution (C12, C13, D8 PEARL)
+    // -----------------------------------------------------------------------
+
+    fn runLinearSme2Ex(
+        self: *Qwen3Model,
+        lin: LinearBinding,
+        x_f16: []const f16,
+        aux_f32: ?[]const f32,
+        out_bytes: []u8,
+        out_dtype: sme.OutputDType,
+        epilogue: sme.EpilogueOp,
+        m: u32,
+        cache_hint: sme.CacheHint,
+    ) StepError!void {
+        const srt = self.sme_rt.?;
+        const pdt = weightDTypeToPanelDType(lin.dtype);
+        const packed_w = lin.sme_packed.?;
+        const m_u: usize = m;
+        const k_u: usize = lin.k;
+        const n_u: usize = lin.n;
+        const a_u16: []const u16 = if (pdt.activationIsBf16()) blk: {
+            const dst = srt.x_act_u16_scratch[0 .. m_u * k_u];
+            for (0..m_u * k_u) |i| {
+                dst[i] = quant.f32ToBf16(@floatCast(x_f16[i]));
+            }
+            break :blk dst;
+        } else @alignCast(std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(x_f16[0 .. m_u * k_u])));
+
+        try srt.dispatcher.gemm(.{
+            .dtype = pdt,
+            .param_kind = amfParamKindToSme(lin.param_kind),
+            .cache_hint = cache_hint,
+            .epilogue = epilogue,
+            .out_dtype = out_dtype,
+        }, a_u16, packed_w, aux_f32, out_bytes, m_u, n_u, k_u);
+    }
+
+    fn cpuEmbedLookup(self: *Qwen3Model, token_ids: []const u32) void {
+        const h: usize = self.config.hidden_size;
+        const w_bytes = self.embed.weight_host;
+        switch (self.embed.dtype) {
+            .f16 => {
+                const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, w_bytes));
+                for (token_ids, 0..) |tid, r| {
+                    @memcpy(self.x_host[r * h ..][0..h], src[@as(usize, tid) * h ..][0..h]);
+                }
+            },
+            .bf16 => {
+                const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, w_bytes));
+                for (token_ids, 0..) |tid, r| {
+                    const row_src = src[@as(usize, tid) * h ..][0..h];
+                    const row_dst = self.x_host[r * h ..][0..h];
+                    for (0..h) |c| row_dst[c] = @floatCast(quant.bf16ToF32(row_src[c]));
+                }
+            },
+            .q4_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q4 });
+                const groups = h / 64;
+                const row_w_bytes = groups * Ops.groupWeightBytes();
+                const sb_all: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, self.embed.scale_bias_host.?));
+                var tmp: [64]f32 = undefined;
+                for (token_ids, 0..) |tid, r| {
+                    const row_w = w_bytes[@as(usize, tid) * row_w_bytes ..][0..row_w_bytes];
+                    const row_sb = sb_all[@as(usize, tid) * groups ..][0..groups];
+                    const row_dst = self.x_host[r * h ..][0..h];
+                    for (0..groups) |g| {
+                        Ops.dequantizeGroup(row_w[g * 32 ..][0..32], row_sb[g], &tmp);
+                        for (0..64) |j| row_dst[g * 64 + j] = @floatCast(tmp[j]);
+                    }
+                }
+            },
+            .q3_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q3 });
+                const groups = h / 64;
+                const row_w_bytes = groups * Ops.groupWeightBytes();
+                const sb_all: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, self.embed.scale_bias_host.?));
+                var tmp: [64]f32 = undefined;
+                for (token_ids, 0..) |tid, r| {
+                    const row_w = w_bytes[@as(usize, tid) * row_w_bytes ..][0..row_w_bytes];
+                    const row_sb = sb_all[@as(usize, tid) * groups ..][0..groups];
+                    const row_dst = self.x_host[r * h ..][0..h];
+                    for (0..groups) |g| {
+                        Ops.dequantizeGroup(row_w[g * 24 ..][0..24], row_sb[g], &tmp);
+                        for (0..64) |j| row_dst[g * 64 + j] = @floatCast(tmp[j]);
+                    }
+                }
+            },
+            .q2_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q2 });
+                const groups = h / 64;
+                const row_w_bytes = groups * Ops.groupWeightBytes();
+                const sb_all: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, self.embed.scale_bias_host.?));
+                var tmp: [64]f32 = undefined;
+                for (token_ids, 0..) |tid, r| {
+                    const row_w = w_bytes[@as(usize, tid) * row_w_bytes ..][0..row_w_bytes];
+                    const row_sb = sb_all[@as(usize, tid) * groups ..][0..groups];
+                    const row_dst = self.x_host[r * h ..][0..h];
+                    for (0..groups) |g| {
+                        Ops.dequantizeGroup(row_w[g * 16 ..][0..16], row_sb[g], &tmp);
+                        for (0..64) |j| row_dst[g * 64 + j] = @floatCast(tmp[j]);
+                    }
+                }
+            },
+        }
+    }
+
+    fn cpuRmsNorm(
+        x: []const f16,
+        norm: NormBinding,
+        y: []f16,
+        num_rows: usize,
+        hidden_dim: usize,
+        eps: f32,
+    ) void {
+        const w_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, norm.host_bytes));
+        const inv_dim: f32 = 1.0 / @as(f32, @floatFromInt(hidden_dim));
+        for (0..num_rows) |r| {
+            const x_row = x[r * hidden_dim ..][0..hidden_dim];
+            const y_row = y[r * hidden_dim ..][0..hidden_dim];
+            var ss: f32 = 0.0;
+            var i: usize = 0;
+            while (i + 8 <= hidden_dim) : (i += 8) {
+                const v: @Vector(8, f32) = .{
+                    @floatCast(x_row[i + 0]), @floatCast(x_row[i + 1]),
+                    @floatCast(x_row[i + 2]), @floatCast(x_row[i + 3]),
+                    @floatCast(x_row[i + 4]), @floatCast(x_row[i + 5]),
+                    @floatCast(x_row[i + 6]), @floatCast(x_row[i + 7]),
+                };
+                ss += @reduce(.Add, v * v);
+            }
+            while (i < hidden_dim) : (i += 1) {
+                const vf: f32 = @floatCast(x_row[i]);
+                ss += vf * vf;
+            }
+            const inv_rms: f32 = 1.0 / @sqrt(ss * inv_dim + eps);
+            switch (norm.dtype) {
+                .f16 => {
+                    for (0..hidden_dim) |c| {
+                        const xf: f32 = @floatCast(x_row[c]);
+                        const wf: f32 = @floatCast(@as(f16, @bitCast(w_u16[c])));
+                        y_row[c] = @floatCast(xf * inv_rms * wf);
+                    }
+                },
+                .bf16 => {
+                    for (0..hidden_dim) |c| {
+                        const xf: f32 = @floatCast(x_row[c]);
+                        const wf: f32 = quant.bf16ToF32(w_u16[c]);
+                        y_row[c] = @floatCast(xf * inv_rms * wf);
+                    }
+                },
+            }
+        }
+    }
+
+    fn cpuApplyHeadNormRope(
+        vec_io: []f16,
+        norm_opt: ?[]const u8,
+        norm_dtype: quant.FloatDType,
+        inv_freq: []const f32,
+        pos: u32,
+        rms_eps: f32,
+        out_opt: ?[]f16,
+    ) void {
+        const d_dim = vec_io.len;
+        const half_dim = d_dim / 2;
+        var buf: [256]f32 = undefined;
+        if (norm_opt) |nw_bytes| {
+            const w_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, nw_bytes));
+            var ss: f32 = 0.0;
+            for (0..d_dim) |d| {
+                const v: f32 = @floatCast(vec_io[d]);
+                buf[d] = v;
+                ss += v * v;
+            }
+            const inv_rms: f32 = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(d_dim)) + rms_eps);
+            switch (norm_dtype) {
+                .f16 => {
+                    for (0..d_dim) |d| {
+                        const wf: f32 = @floatCast(@as(f16, @bitCast(w_u16[d])));
+                        buf[d] = buf[d] * inv_rms * wf;
+                    }
+                },
+                .bf16 => {
+                    for (0..d_dim) |d| {
+                        buf[d] = buf[d] * inv_rms * quant.bf16ToF32(w_u16[d]);
+                    }
+                },
+            }
+        } else {
+            for (0..d_dim) |d| buf[d] = @floatCast(vec_io[d]);
+        }
+
+        const fpos: f32 = @floatFromInt(pos);
+        const dst = out_opt orelse vec_io;
+        for (0..half_dim) |j| {
+            const angle = fpos * inv_freq[j];
+            const c = @cos(angle);
+            const s = @sin(angle);
+            const x0 = buf[j];
+            const x1 = buf[j + half_dim];
+            dst[j] = @floatCast(x0 * c - x1 * s);
+            dst[j + half_dim] = @floatCast(x1 * c + x0 * s);
+        }
+    }
+
+    const CpuGqaChunkView = struct {
+        k_f16: []const f16,
+        v_f16: []const f16,
+        k_row_stride_f16: usize,
+        v_row_stride_f16: usize,
+    };
+
+    const CpuGqaAttnCtx = struct {
+        q_host: []const f16,
+        attn_out_host: []f16,
+        tree_k: []const f16,
+        tree_v: []const f16,
+        chunks: []const CpuGqaChunkView,
+        ancestor_masks: []const u64,
+        slot_start: u32,
+        total_slots: u32,
+        kv_base_pos: u32,
+        chunk_tokens: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+    };
+
+    fn cpuGqaAttnTask(ctx_ptr: *anyopaque, task_idx: u32) void {
+        const ctx: *const CpuGqaAttnCtx = @ptrCast(@alignCast(ctx_ptr));
+        const nqh: usize = ctx.num_q_heads;
+        const hd: usize = ctx.head_dim;
+        const q_dim: usize = nqh * hd;
+        const kv_dim: usize = @as(usize, ctx.num_kv_heads) * hd;
+        const q_groups: usize = ctx.num_q_heads / ctx.num_kv_heads;
+
+        const r: usize = @as(usize, task_idx) / nqh;
+        const qh: usize = @as(usize, task_idx) % nqh;
+        const kvh: usize = qh / q_groups;
+        const slot: usize = @as(usize, ctx.slot_start) + r;
+        const mask: u64 = ctx.ancestor_masks[slot];
+
+        const q_row = ctx.q_host[r * q_dim + qh * hd ..][0..hd];
+        var q_f32: [256]f32 = undefined;
+        var acc: [256]f32 = @splat(0.0);
+        for (0..hd) |d| q_f32[d] = @floatCast(q_row[d]);
+
+        var max_score: f32 = -std.math.inf(f32);
+        var sum_exp: f32 = 0.0;
+        const ct: usize = ctx.chunk_tokens;
+
+        // 1. Committed IOSurface KV chunks (`0 .. kv_base_pos`).
+        var rem_pos: usize = ctx.kv_base_pos;
+        var c_idx: usize = 0;
+        while (rem_pos > 0) : (c_idx += 1) {
+            const take = @min(ct, rem_pos);
+            const cv = ctx.chunks[c_idx];
+            const k_head_base = kvh * ct * cv.k_row_stride_f16;
+            const v_head_base = kvh * ct * cv.v_row_stride_f16;
+            for (0..take) |s_in_c| {
+                const k_row = cv.k_f16[k_head_base + s_in_c * cv.k_row_stride_f16 ..][0..hd];
+                const v_row = cv.v_f16[v_head_base + s_in_c * cv.v_row_stride_f16 ..][0..hd];
+                var dot: f32 = 0.0;
+                var d: usize = 0;
+                while (d + 8 <= hd) : (d += 8) {
+                    const qv: @Vector(8, f32) = q_f32[d..][0..8].*;
+                    const kv: @Vector(8, f32) = .{
+                        @floatCast(k_row[d + 0]), @floatCast(k_row[d + 1]),
+                        @floatCast(k_row[d + 2]), @floatCast(k_row[d + 3]),
+                        @floatCast(k_row[d + 4]), @floatCast(k_row[d + 5]),
+                        @floatCast(k_row[d + 6]), @floatCast(k_row[d + 7]),
+                    };
+                    dot += @reduce(.Add, qv * kv);
+                }
+                while (d < hd) : (d += 1) {
+                    dot += q_f32[d] * @as(f32, @floatCast(k_row[d]));
+                }
+                const score = dot * ctx.scale;
+                if (score > max_score) {
+                    const rescale = if (max_score == -std.math.inf(f32)) 0.0 else @exp(max_score - score);
+                    sum_exp = sum_exp * rescale + 1.0;
+                    d = 0;
+                    while (d + 8 <= hd) : (d += 8) {
+                        const av: @Vector(8, f32) = acc[d..][0..8].*;
+                        const vv: @Vector(8, f32) = .{
+                            @floatCast(v_row[d + 0]), @floatCast(v_row[d + 1]),
+                            @floatCast(v_row[d + 2]), @floatCast(v_row[d + 3]),
+                            @floatCast(v_row[d + 4]), @floatCast(v_row[d + 5]),
+                            @floatCast(v_row[d + 6]), @floatCast(v_row[d + 7]),
+                        };
+                        acc[d..][0..8].* = av * @as(@Vector(8, f32), @splat(rescale)) + vv;
+                    }
+                    while (d < hd) : (d += 1) {
+                        acc[d] = acc[d] * rescale + @as(f32, @floatCast(v_row[d]));
+                    }
+                    max_score = score;
+                } else {
+                    const w = @exp(score - max_score);
+                    sum_exp += w;
+                    d = 0;
+                    while (d + 8 <= hd) : (d += 8) {
+                        const av: @Vector(8, f32) = acc[d..][0..8].*;
+                        const vv: @Vector(8, f32) = .{
+                            @floatCast(v_row[d + 0]), @floatCast(v_row[d + 1]),
+                            @floatCast(v_row[d + 2]), @floatCast(v_row[d + 3]),
+                            @floatCast(v_row[d + 4]), @floatCast(v_row[d + 5]),
+                            @floatCast(v_row[d + 6]), @floatCast(v_row[d + 7]),
+                        };
+                        acc[d..][0..8].* = av + vv * @as(@Vector(8, f32), @splat(w));
+                    }
+                    while (d < hd) : (d += 1) {
+                        acc[d] += w * @as(f32, @floatCast(v_row[d]));
+                    }
+                }
+            }
+            rem_pos -= take;
+        }
+
+        // 2. Temporary tree slots (`0 .. total_slots`, masked by `ancestor_masks[slot]`).
+        for (0..ctx.total_slots) |s| {
+            if ((mask & (@as(u64, 1) << @as(u6, @intCast(s)))) == 0) continue;
+            const k_row = ctx.tree_k[s * kv_dim + kvh * hd ..][0..hd];
+            const v_row = ctx.tree_v[s * kv_dim + kvh * hd ..][0..hd];
+            var dot: f32 = 0.0;
+            var d: usize = 0;
+            while (d + 8 <= hd) : (d += 8) {
+                const qv: @Vector(8, f32) = q_f32[d..][0..8].*;
+                const kv: @Vector(8, f32) = .{
+                    @floatCast(k_row[d + 0]), @floatCast(k_row[d + 1]),
+                    @floatCast(k_row[d + 2]), @floatCast(k_row[d + 3]),
+                    @floatCast(k_row[d + 4]), @floatCast(k_row[d + 5]),
+                    @floatCast(k_row[d + 6]), @floatCast(k_row[d + 7]),
+                };
+                dot += @reduce(.Add, qv * kv);
+            }
+            while (d < hd) : (d += 1) {
+                dot += q_f32[d] * @as(f32, @floatCast(k_row[d]));
+            }
+            const score = dot * ctx.scale;
+            if (score > max_score) {
+                const rescale = if (max_score == -std.math.inf(f32)) 0.0 else @exp(max_score - score);
+                sum_exp = sum_exp * rescale + 1.0;
+                d = 0;
+                while (d + 8 <= hd) : (d += 8) {
+                    const av: @Vector(8, f32) = acc[d..][0..8].*;
+                    const vv: @Vector(8, f32) = .{
+                        @floatCast(v_row[d + 0]), @floatCast(v_row[d + 1]),
+                        @floatCast(v_row[d + 2]), @floatCast(v_row[d + 3]),
+                        @floatCast(v_row[d + 4]), @floatCast(v_row[d + 5]),
+                        @floatCast(v_row[d + 6]), @floatCast(v_row[d + 7]),
+                    };
+                    acc[d..][0..8].* = av * @as(@Vector(8, f32), @splat(rescale)) + vv;
+                }
+                while (d < hd) : (d += 1) {
+                    acc[d] = acc[d] * rescale + @as(f32, @floatCast(v_row[d]));
+                }
+                max_score = score;
+            } else {
+                const w = @exp(score - max_score);
+                sum_exp += w;
+                d = 0;
+                while (d + 8 <= hd) : (d += 8) {
+                    const av: @Vector(8, f32) = acc[d..][0..8].*;
+                    const vv: @Vector(8, f32) = .{
+                        @floatCast(v_row[d + 0]), @floatCast(v_row[d + 1]),
+                        @floatCast(v_row[d + 2]), @floatCast(v_row[d + 3]),
+                        @floatCast(v_row[d + 4]), @floatCast(v_row[d + 5]),
+                        @floatCast(v_row[d + 6]), @floatCast(v_row[d + 7]),
+                    };
+                    acc[d..][0..8].* = av + vv * @as(@Vector(8, f32), @splat(w));
+                }
+                while (d < hd) : (d += 1) {
+                    acc[d] += w * @as(f32, @floatCast(v_row[d]));
+                }
+            }
+        }
+
+        const inv_sum: f32 = if (sum_exp > 0.0) 1.0 / sum_exp else 0.0;
+        const out_row = ctx.attn_out_host[r * q_dim + qh * hd ..][0..hd];
+        for (0..hd) |d| out_row[d] = @floatCast(acc[d] * inv_sum);
+    }
+
+    const CpuLmHeadCtx = struct {
+        lm_head: LinearBinding,
+        x_f32: []const f32,
+        x_group_sums: []const f32,
+        tile_stats: []LmHeadTileState,
+        out_rows: usize,
+        vocab_size: usize,
+        hidden_dim: usize,
+        top_k: usize,
+        rows_per_tile: usize,
+        num_tiles: usize,
+    };
+
+    inline fn insertTopKLocal(st: *LmHeadTileState, top_k: usize, tok_id: u32, score: f32) void {
+        if (st.count < top_k) {
+            var pos: usize = st.count;
+            st.count += 1;
+            while (pos > 0 and score > st.top_vals[pos - 1]) : (pos -= 1) {
+                st.top_vals[pos] = st.top_vals[pos - 1];
+                st.top_ids[pos] = st.top_ids[pos - 1];
+            }
+            st.top_vals[pos] = score;
+            st.top_ids[pos] = tok_id;
+        } else if (score > st.top_vals[top_k - 1]) {
+            var pos: usize = top_k - 1;
+            while (pos > 0 and score > st.top_vals[pos - 1]) : (pos -= 1) {
+                st.top_vals[pos] = st.top_vals[pos - 1];
+                st.top_ids[pos] = st.top_ids[pos - 1];
+            }
+            st.top_vals[pos] = score;
+            st.top_ids[pos] = tok_id;
+        }
+    }
+
+    inline fn updateLmState(st: *LmHeadTileState, top_k: usize, tok_id: u32, score: f32) void {
+        if (score > st.max_val) {
+            const diff = st.max_val - score;
+            st.sum_exp = (if (diff > -20.0) st.sum_exp * @exp(diff) else 0.0) + 1.0;
+            st.max_val = score;
+            insertTopKLocal(st, top_k, tok_id, score);
+        } else {
+            const diff = score - st.max_val;
+            if (diff > -18.0) {
+                st.sum_exp += @exp(diff);
+            }
+            if (st.count < top_k or score > st.top_vals[top_k - 1]) {
+                insertTopKLocal(st, top_k, tok_id, score);
+            }
+        }
+    }
+
+    fn cpuLmHeadTask(ctx_ptr: *anyopaque, tile_idx: u32) void {
+        const ctx: *const CpuLmHeadCtx = @ptrCast(@alignCast(ctx_ptr));
+        const v_start = @as(usize, tile_idx) * ctx.rows_per_tile;
+        if (v_start >= ctx.vocab_size) return;
+        const v_end = @min(ctx.vocab_size, v_start + ctx.rows_per_tile);
+        const h = ctx.hidden_dim;
+        const groups = h / 64;
+        const out_rows = ctx.out_rows;
+        const top_k = ctx.top_k;
+
+        var local: [attention.MAX_TREE_NODES]LmHeadTileState = undefined;
+        for (0..out_rows) |r| local[r] = .{};
+
+        switch (ctx.lm_head.dtype) {
+            .q4_affine => {
+                const row_w_bytes = groups * 32;
+                const w_bytes = ctx.lm_head.weight_host;
+                const sb_all: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, ctx.lm_head.scale_bias_host.?));
+                const mask_lo: @Vector(8, u8) = @splat(0x0F);
+                const shift_hi: @Vector(8, u3) = @splat(4);
+                if (out_rows == 1) {
+                    const x0 = ctx.x_f32[0..h];
+                    const gs0 = ctx.x_group_sums[0..groups];
+                    var st0: LmHeadTileState = .{};
+                    for (v_start..v_end) |v| {
+                        const w_row = w_bytes[v * row_w_bytes ..][0..row_w_bytes];
+                        const sb_row = sb_all[v * groups ..][0..groups];
+                        var dot: f32 = 0.0;
+                        for (0..groups) |g| {
+                            const sb = sb_row[g];
+                            const scale: f32 = @floatCast(sb.scale);
+                            const bias: f32 = @floatCast(sb.bias);
+                            const gw = w_row[g * 32 ..][0..32];
+                            const xe_base = x0[g * 64 ..][0..32];
+                            const xo_base = x0[g * 64 + 32 ..][0..32];
+                            var gd: @Vector(8, f32) = @splat(0.0);
+                            inline for (0..4) |u| {
+                                const b8: @Vector(8, u8) = gw[u * 8 ..][0..8].*;
+                                const lo: @Vector(8, f32) = @floatFromInt(b8 & mask_lo);
+                                const hi: @Vector(8, f32) = @floatFromInt(b8 >> shift_hi);
+                                const xe: @Vector(8, f32) = xe_base[u * 8 ..][0..8].*;
+                                const xo: @Vector(8, f32) = xo_base[u * 8 ..][0..8].*;
+                                gd += lo * xe + hi * xo;
+                            }
+                            dot += scale * @reduce(.Add, gd) + bias * gs0[g];
+                        }
+                        updateLmState(&st0, top_k, @intCast(v), dot);
+                    }
+                    ctx.tile_stats[@as(usize, tile_idx)] = st0;
+                    return;
+                }
+                for (v_start..v_end) |v| {
+                    const w_row = w_bytes[v * row_w_bytes ..][0..row_w_bytes];
+                    const sb_row = sb_all[v * groups ..][0..groups];
+                    var dots: [attention.MAX_TREE_NODES]f32 = @splat(0.0);
+                    for (0..groups) |g| {
+                        const sb = sb_row[g];
+                        const scale: f32 = @floatCast(sb.scale);
+                        const bias: f32 = @floatCast(sb.bias);
+                        const gw = w_row[g * 32 ..][0..32];
+                        var lo_arr: [4]@Vector(8, f32) = undefined;
+                        var hi_arr: [4]@Vector(8, f32) = undefined;
+                        inline for (0..4) |u| {
+                            const b8: @Vector(8, u8) = gw[u * 8 ..][0..8].*;
+                            lo_arr[u] = @floatFromInt(b8 & mask_lo);
+                            hi_arr[u] = @floatFromInt(b8 >> shift_hi);
+                        }
+                        for (0..out_rows) |r| {
+                            const xe_base = ctx.x_f32[r * h + g * 64 ..][0..32];
+                            const xo_base = ctx.x_f32[r * h + g * 64 + 32 ..][0..32];
+                            var gd: @Vector(8, f32) = @splat(0.0);
+                            inline for (0..4) |u| {
+                                const xe: @Vector(8, f32) = xe_base[u * 8 ..][0..8].*;
+                                const xo: @Vector(8, f32) = xo_base[u * 8 ..][0..8].*;
+                                gd += lo_arr[u] * xe + hi_arr[u] * xo;
+                            }
+                            dots[r] += scale * @reduce(.Add, gd) + bias * ctx.x_group_sums[r * groups + g];
+                        }
+                    }
+                    for (0..out_rows) |r| {
+                        updateLmState(&local[r], top_k, @intCast(v), dots[r]);
+                    }
+                }
+            },
+            .q3_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q3 });
+                const row_w_bytes = groups * 24;
+                const w_bytes = ctx.lm_head.weight_host;
+                const sb_all: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, ctx.lm_head.scale_bias_host.?));
+                var w_f: [64]f32 = undefined;
+                for (v_start..v_end) |v| {
+                    const w_row = w_bytes[v * row_w_bytes ..][0..row_w_bytes];
+                    const sb_row = sb_all[v * groups ..][0..groups];
+                    var dots: [attention.MAX_TREE_NODES]f32 = @splat(0.0);
+                    for (0..groups) |g| {
+                        Ops.dequantizeGroup(w_row[g * 24 ..][0..24], sb_row[g], &w_f);
+                        for (0..out_rows) |r| {
+                            const x_g = ctx.x_f32[r * h + g * 64 ..][0..64];
+                            var gd: @Vector(8, f32) = @splat(0.0);
+                            inline for (0..8) |u| {
+                                const wv: @Vector(8, f32) = w_f[u * 8 ..][0..8].*;
+                                const xv: @Vector(8, f32) = x_g[u * 8 ..][0..8].*;
+                                gd += wv * xv;
+                            }
+                            dots[r] += @reduce(.Add, gd);
+                        }
+                    }
+                    for (0..out_rows) |r| {
+                        updateLmState(&local[r], top_k, @intCast(v), dots[r]);
+                    }
+                }
+            },
+            .q2_affine => {
+                const Ops = quant.QuantOps(.{ .bits = .q2 });
+                const row_w_bytes = groups * 16;
+                const w_bytes = ctx.lm_head.weight_host;
+                const sb_all: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, ctx.lm_head.scale_bias_host.?));
+                var w_f: [64]f32 = undefined;
+                for (v_start..v_end) |v| {
+                    const w_row = w_bytes[v * row_w_bytes ..][0..row_w_bytes];
+                    const sb_row = sb_all[v * groups ..][0..groups];
+                    var dots: [attention.MAX_TREE_NODES]f32 = @splat(0.0);
+                    for (0..groups) |g| {
+                        Ops.dequantizeGroup(w_row[g * 16 ..][0..16], sb_row[g], &w_f);
+                        for (0..out_rows) |r| {
+                            const x_g = ctx.x_f32[r * h + g * 64 ..][0..64];
+                            var gd: @Vector(8, f32) = @splat(0.0);
+                            inline for (0..8) |u| {
+                                const wv: @Vector(8, f32) = w_f[u * 8 ..][0..8].*;
+                                const xv: @Vector(8, f32) = x_g[u * 8 ..][0..8].*;
+                                gd += wv * xv;
+                            }
+                            dots[r] += @reduce(.Add, gd);
+                        }
+                    }
+                    for (0..out_rows) |r| {
+                        updateLmState(&local[r], top_k, @intCast(v), dots[r]);
+                    }
+                }
+            },
+            .bf16, .f16 => {
+                const w_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, ctx.lm_head.weight_host));
+                const is_bf16 = (ctx.lm_head.dtype == .bf16);
+                for (v_start..v_end) |v| {
+                    const w_row = w_u16[v * h ..][0..h];
+                    var dots: [attention.MAX_TREE_NODES]f32 = @splat(0.0);
+                    var c: usize = 0;
+                    while (c + 8 <= h) : (c += 8) {
+                        const wv: @Vector(8, f32) = if (is_bf16) .{
+                            quant.bf16ToF32(w_row[c + 0]), quant.bf16ToF32(w_row[c + 1]),
+                            quant.bf16ToF32(w_row[c + 2]), quant.bf16ToF32(w_row[c + 3]),
+                            quant.bf16ToF32(w_row[c + 4]), quant.bf16ToF32(w_row[c + 5]),
+                            quant.bf16ToF32(w_row[c + 6]), quant.bf16ToF32(w_row[c + 7]),
+                        } else .{
+                            @floatCast(@as(f16, @bitCast(w_row[c + 0]))), @floatCast(@as(f16, @bitCast(w_row[c + 1]))),
+                            @floatCast(@as(f16, @bitCast(w_row[c + 2]))), @floatCast(@as(f16, @bitCast(w_row[c + 3]))),
+                            @floatCast(@as(f16, @bitCast(w_row[c + 4]))), @floatCast(@as(f16, @bitCast(w_row[c + 5]))),
+                            @floatCast(@as(f16, @bitCast(w_row[c + 6]))), @floatCast(@as(f16, @bitCast(w_row[c + 7]))),
+                        };
+                        for (0..out_rows) |r| {
+                            const xv: @Vector(8, f32) = ctx.x_f32[r * h + c ..][0..8].*;
+                            dots[r] += @reduce(.Add, wv * xv);
+                        }
+                    }
+                    while (c < h) : (c += 1) {
+                        const wf: f32 = if (is_bf16) quant.bf16ToF32(w_row[c]) else @floatCast(@as(f16, @bitCast(w_row[c])));
+                        for (0..out_rows) |r| dots[r] += wf * ctx.x_f32[r * h + c];
+                    }
+                    for (0..out_rows) |r| {
+                        updateLmState(&local[r], top_k, @intCast(v), dots[r]);
+                    }
+                }
+            },
+        }
+
+        for (0..out_rows) |r| {
+            ctx.tile_stats[@as(usize, tile_idx) * out_rows + r] = local[r];
+        }
+    }
+
+    fn stepDraftTreeBatchSme2(
+        self: *Qwen3Model,
+        token_ids: []const u32,
+        positions: []const u32,
+        slot_start: u32,
+        slot_ancestor_masks: []const u64,
+        kv_base_pos: u32,
+        top_k: u32,
+        logits_last_row_only: bool,
+        commit_kv: bool,
+    ) StepError![]const moe.TopKCandidate {
+        const srt = self.sme_rt.?;
+        const m: u32 = @intCast(token_ids.len);
+        const m_u: usize = m;
+        const total_slots: u32 = slot_start + m;
+        const h: usize = self.config.hidden_size;
+        const q_dim: usize = self.config.qDim();
+        const kv_dim: usize = self.config.kvDim();
+        const hd: usize = self.config.head_dim;
+        const inter: usize = self.config.intermediate_size;
+        const ct: usize = self.chunk_tokens;
+        const active_chunks: usize = if (kv_base_pos > 0) (kv_base_pos + self.chunk_tokens - 1) / self.chunk_tokens else 0;
+        if (active_chunks > 64) return error.PositionOutOfRange;
+
+        self.cpuEmbedLookup(token_ids);
+
+        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const scratch_bytes = self.scratch_arena.bytes();
+
+        for (self.layers, 0..) |layer, l| {
+            cpuRmsNorm(self.x_host, layer.input_layernorm, self.x_norm_host, m_u, h, self.config.rms_norm_eps);
+
+            try self.runLinearSme2Ex(
+                layer.q_proj,
+                self.x_norm_host,
+                null,
+                std.mem.sliceAsBytes(self.q_host[0 .. m_u * q_dim]),
+                .f16,
+                .none,
+                m,
+                .non_temporal,
+            );
+            try self.runLinearSme2Ex(
+                layer.k_proj,
+                self.x_norm_host,
+                null,
+                std.mem.sliceAsBytes(self.k_host[0 .. m_u * kv_dim]),
+                .f16,
+                .none,
+                m,
+                .non_temporal,
+            );
+            try self.runLinearSme2Ex(
+                layer.v_proj,
+                self.x_norm_host,
+                null,
+                std.mem.sliceAsBytes(self.v_host[0 .. m_u * kv_dim]),
+                .f16,
+                .none,
+                m,
+                .non_temporal,
+            );
+
+            const tk_off: usize = @intCast(self.tree_k_base_off + @as(u64, l) * self.tree_kv_layer_stride);
+            const tv_off: usize = @intCast(self.tree_v_base_off + @as(u64, l) * self.tree_kv_layer_stride);
+            const tree_k: []f16 = @alignCast(std.mem.bytesAsSlice(f16, scratch_bytes[tk_off..][0 .. @as(usize, self.max_tree_nodes) * kv_dim * @sizeOf(f16)]));
+            const tree_v: []f16 = @alignCast(std.mem.bytesAsSlice(f16, scratch_bytes[tv_off..][0 .. @as(usize, self.max_tree_nodes) * kv_dim * @sizeOf(f16)]));
+
+            // QK-Norm + NeoX RoPE + write new tree_k / tree_v slots (`slot_start .. total_slots`).
+            for (0..m_u) |r| {
+                const pos = positions[r];
+                const slot = @as(usize, slot_start) + r;
+                for (0..self.config.num_attention_heads) |qh| {
+                    cpuApplyHeadNormRope(
+                        self.q_host[r * q_dim + qh * hd ..][0..hd],
+                        layer.q_norm_host,
+                        layer.qk_norm_dtype,
+                        srt.rope_inv_freq,
+                        pos,
+                        self.config.rms_norm_eps,
+                        null,
+                    );
+                }
+                for (0..self.config.num_key_value_heads) |kvh| {
+                    cpuApplyHeadNormRope(
+                        self.k_host[r * kv_dim + kvh * hd ..][0..hd],
+                        layer.k_norm_host,
+                        layer.qk_norm_dtype,
+                        srt.rope_inv_freq,
+                        pos,
+                        self.config.rms_norm_eps,
+                        tree_k[slot * kv_dim + kvh * hd ..][0..hd],
+                    );
+                }
+                @memcpy(tree_v[slot * kv_dim ..][0..kv_dim], self.v_host[r * kv_dim ..][0..kv_dim]);
+            }
+
+            // Lock active committed IOSurface KV chunks read-only and run parallel GQA tree attention.
+            var k_guards: [64]metal.KvTile.LockGuard = undefined;
+            var v_guards: [64]metal.KvTile.LockGuard = undefined;
+            var chunk_views: [64]CpuGqaChunkView = undefined;
+            var locked_chunks: usize = 0;
+            errdefer {
+                for (0..locked_chunks) |ci| {
+                    v_guards[ci].release();
+                    k_guards[ci].release();
+                }
+            }
+            for (0..active_chunks) |ci| {
+                const pair = self.kvTileAt(l, ci);
+                k_guards[ci] = try pair.k.lock(true);
+                errdefer k_guards[ci].release();
+                v_guards[ci] = try pair.v.lock(true);
+                chunk_views[ci] = .{
+                    .k_f16 = k_guards[ci].f16Slice(),
+                    .v_f16 = v_guards[ci].f16Slice(),
+                    .k_row_stride_f16 = k_guards[ci].bytes_per_row / @sizeOf(f16),
+                    .v_row_stride_f16 = v_guards[ci].bytes_per_row / @sizeOf(f16),
+                };
+                locked_chunks += 1;
+            }
+
+            var attn_ctx: CpuGqaAttnCtx = .{
+                .q_host = self.q_host,
+                .attn_out_host = self.attn_out_host,
+                .tree_k = tree_k,
+                .tree_v = tree_v,
+                .chunks = chunk_views[0..active_chunks],
+                .ancestor_masks = slot_ancestor_masks,
+                .slot_start = slot_start,
+                .total_slots = total_slots,
+                .kv_base_pos = kv_base_pos,
+                .chunk_tokens = self.chunk_tokens,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .scale = attn_scale,
+            };
+            const attn_tasks: u32 = m * self.config.num_attention_heads;
+            srt.dispatcher.parallelFor(attn_tasks, null, @ptrCast(&attn_ctx), cpuGqaAttnTask);
+
+            while (locked_chunks > 0) {
+                locked_chunks -= 1;
+                try v_guards[locked_chunks].unlock();
+                try k_guards[locked_chunks].unlock();
+            }
+
+            // If committing KV (`slot_start == 0`), write `tree_k[0..m]` & `tree_v[0..m]` directly
+            // into the zero-copy IOSurface `KvTile`s (`row = kvh * chunk_tokens + slot_in_chunk`).
+            if (commit_kv) {
+                var off: usize = 0;
+                while (off < m_u) {
+                    const pos0 = @as(usize, kv_base_pos) + off;
+                    const ci = pos0 / ct;
+                    const s_in_c = pos0 % ct;
+                    const take = @min(m_u - off, ct - s_in_c);
+                    const pair = self.kvTileAt(l, ci);
+                    var kg = try pair.k.lock(false);
+                    errdefer kg.release();
+                    var vg = try pair.v.lock(false);
+                    errdefer vg.release();
+                    const k_dst = kg.f16Slice();
+                    const v_dst = vg.f16Slice();
+                    const k_rs = kg.bytes_per_row / @sizeOf(f16);
+                    const v_rs = vg.bytes_per_row / @sizeOf(f16);
+                    for (0..take) |t_i| {
+                        const src_slot = off + t_i;
+                        for (0..self.config.num_key_value_heads) |kvh| {
+                            const row_idx = kvh * ct + s_in_c + t_i;
+                            @memcpy(k_dst[row_idx * k_rs ..][0..hd], tree_k[src_slot * kv_dim + kvh * hd ..][0..hd]);
+                            @memcpy(v_dst[row_idx * v_rs ..][0..hd], tree_v[src_slot * kv_dim + kvh * hd ..][0..hd]);
+                        }
+                    }
+                    try vg.unlock();
+                    try kg.unlock();
+                    off += take;
+                }
+            }
+
+            // O projection + fused residual add (`x += o_proj(attn_out)`).
+            for (0..m_u * h) |i| srt.x_res_f32[i] = @floatCast(self.x_host[i]);
+            try self.runLinearSme2Ex(
+                layer.o_proj,
+                self.attn_out_host,
+                srt.x_res_f32[0 .. m_u * h],
+                std.mem.sliceAsBytes(self.x_host[0 .. m_u * h]),
+                .f16,
+                .add_residual,
+                m,
+                .non_temporal,
+            );
+
+            // Post-attention RMSNorm + fused SwiGLU FFN (`up` -> `gate * silu` -> `down + residual`).
+            cpuRmsNorm(self.x_host, layer.post_attention_layernorm, self.x_norm_host, m_u, h, self.config.rms_norm_eps);
+
+            try self.runLinearSme2Ex(
+                layer.dense_up,
+                self.x_norm_host,
+                null,
+                std.mem.sliceAsBytes(srt.dense_up_f32[0 .. m_u * inter]),
+                .f32,
+                .none,
+                m,
+                .non_temporal,
+            );
+            try self.runLinearSme2Ex(
+                layer.dense_gate,
+                self.x_norm_host,
+                srt.dense_up_f32[0 .. m_u * inter],
+                std.mem.sliceAsBytes(self.dense_act_host[0 .. m_u * inter]),
+                .f16,
+                .swiglu_gate_up,
+                m,
+                .non_temporal,
+            );
+            for (0..m_u * h) |i| srt.x_res_f32[i] = @floatCast(self.x_host[i]);
+            try self.runLinearSme2Ex(
+                layer.dense_down,
+                self.dense_act_host,
+                srt.x_res_f32[0 .. m_u * h],
+                std.mem.sliceAsBytes(self.x_host[0 .. m_u * h]),
+                .f16,
+                .add_residual,
+                m,
+                .non_temporal,
+            );
+        }
+
+        if (commit_kv) {
+            self.seq_len = kv_base_pos + m;
+        }
+        if (top_k == 0) {
+            return self.topk_host[0..0];
+        }
+
+        const out_rows: usize = if (logits_last_row_only) 1 else m_u;
+        const row_off: usize = if (logits_last_row_only) m_u - 1 else 0;
+        cpuRmsNorm(
+            self.x_host[row_off * h ..],
+            self.final_norm,
+            self.x_norm_host,
+            out_rows,
+            h,
+            self.config.rms_norm_eps,
+        );
+
+        const vocab: usize = self.config.vocab_size;
+        const eff_k: usize = @min(@as(usize, top_k), moe.MAX_TOP_K);
+
+        if (self.lm_head.layout == .sme2_panel64) {
+            const pdt = weightDTypeToPanelDType(self.lm_head.dtype);
+            const packed_w = self.lm_head.sme_packed.?;
+            const ps = sme.panelStrideBytes(pdt, h) catch return error.InvalidArgument;
+            const a_u16: []const u16 = if (pdt.activationIsBf16()) blk: {
+                const dst = srt.x_act_u16_scratch[0 .. out_rows * h];
+                for (0..out_rows * h) |i| {
+                    dst[i] = quant.f32ToBf16(@floatCast(self.x_norm_host[i]));
+                }
+                break :blk dst;
+            } else @alignCast(std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(self.x_norm_host[0 .. out_rows * h])));
+
+            const chunk_panels: usize = 64; // 1024 vocab rows per SME2 strip
+            const chunk_rows_cap: usize = chunk_panels * sme.PANEL_COLS;
+            const total_panels = sme.panelCount(vocab);
+            var chunk_buf: [attention.MAX_TREE_NODES * 1024]f32 = undefined;
+
+            var row_states: [attention.MAX_TREE_NODES]LmHeadTileState = undefined;
+            for (0..out_rows) |r| row_states[r] = .{};
+
+            var p_off: usize = 0;
+            while (p_off < total_panels) : (p_off += chunk_panels) {
+                const p_cnt = @min(chunk_panels, total_panels - p_off);
+                const v_start = p_off * sme.PANEL_COLS;
+                const v_cnt = @min(p_cnt * sme.PANEL_COLS, vocab - v_start);
+                const w_slice = packed_w[p_off * ps .. (p_off + p_cnt) * ps];
+                const out_slice = chunk_buf[0 .. out_rows * v_cnt];
+                try srt.dispatcher.gemmF32(.{
+                    .dtype = pdt,
+                    .param_kind = amfParamKindToSme(self.lm_head.param_kind),
+                    .cache_hint = .non_temporal,
+                }, a_u16, w_slice, null, out_slice, out_rows, v_cnt, h);
+                for (0..out_rows) |r| {
+                    const logits_r = out_slice[r * v_cnt ..][0..v_cnt];
+                    for (0..v_cnt) |j| {
+                        updateLmState(&row_states[r], eff_k, @intCast(v_start + j), logits_r[j]);
+                    }
+                }
+            }
+            _ = chunk_rows_cap;
+
+            for (0..out_rows) |r| {
+                const st = &row_states[r];
+                const inv_sum: f32 = if (st.sum_exp > 0.0) 1.0 / st.sum_exp else 0.0;
+                const log_sum: f32 = if (st.sum_exp > 0.0) @log(st.sum_exp) else 0.0;
+                for (0..eff_k) |ki| {
+                    const logit = st.top_vals[ki];
+                    const valid = (ki < st.count and st.sum_exp > 0.0);
+                    const prob: f32 = if (valid) @exp(logit - st.max_val) * inv_sum else 0.0;
+                    const log_prob: f32 = if (valid) (logit - st.max_val - log_sum) else -std.math.inf(f32);
+                    self.topk_host[r * eff_k + ki] = .{
+                        .token_id = if (ki < st.count) st.top_ids[ki] else 0,
+                        .prob = prob,
+                        .log_prob = log_prob,
+                    };
+                }
+            }
+            return self.topk_host[0 .. out_rows * eff_k];
+        }
+
+        const groups = h / 64;
+        var x_group_sums: [attention.MAX_TREE_NODES * 128]f32 = undefined;
+        const split_even_odd = (self.lm_head.dtype == .q4_affine);
+        for (0..out_rows) |r| {
+            const x_row = self.x_norm_host[r * h ..][0..h];
+            const dst_row = srt.x_f32_scratch[r * h ..][0..h];
+            for (0..groups) |g| {
+                var gs: f32 = 0.0;
+                if (split_even_odd) {
+                    for (0..32) |j| {
+                        const ve: f32 = @floatCast(x_row[g * 64 + 2 * j]);
+                        const vo: f32 = @floatCast(x_row[g * 64 + 2 * j + 1]);
+                        dst_row[g * 64 + j] = ve;
+                        dst_row[g * 64 + 32 + j] = vo;
+                        gs += ve + vo;
+                    }
+                } else {
+                    for (0..64) |j| {
+                        const vf: f32 = @floatCast(x_row[g * 64 + j]);
+                        dst_row[g * 64 + j] = vf;
+                        gs += vf;
+                    }
+                }
+                x_group_sums[r * groups + g] = gs;
+            }
+        }
+
+        const num_tiles: usize = @min(LM_HEAD_MAX_TILES, @max(@as(usize, 1), (vocab + 2047) / 2048));
+        const rows_per_tile: usize = (vocab + num_tiles - 1) / num_tiles;
+
+        var lm_ctx: CpuLmHeadCtx = .{
+            .lm_head = self.lm_head,
+            .x_f32 = srt.x_f32_scratch[0 .. out_rows * h],
+            .x_group_sums = x_group_sums[0 .. out_rows * groups],
+            .tile_stats = srt.lm_tile_stats[0 .. num_tiles * out_rows],
+            .out_rows = out_rows,
+            .vocab_size = vocab,
+            .hidden_dim = h,
+            .top_k = eff_k,
+            .rows_per_tile = rows_per_tile,
+            .num_tiles = num_tiles,
+        };
+        srt.dispatcher.parallelFor(@intCast(num_tiles), null, @ptrCast(&lm_ctx), cpuLmHeadTask);
+
+        // Merge per-tile online softmax & local top-K into `self.topk_host[0 .. out_rows * eff_k]`.
+        for (0..out_rows) |r| {
+            var g_max: f32 = -std.math.inf(f32);
+            for (0..num_tiles) |ti| {
+                const st = &srt.lm_tile_stats[ti * out_rows + r];
+                if (st.max_val > g_max) g_max = st.max_val;
+            }
+            var g_sum: f32 = 0.0;
+            var merged: LmHeadTileState = .{};
+            for (0..num_tiles) |ti| {
+                const st = &srt.lm_tile_stats[ti * out_rows + r];
+                if (st.max_val > -std.math.inf(f32)) {
+                    g_sum += st.sum_exp * @exp(st.max_val - g_max);
+                }
+                for (0..st.count) |ki| {
+                    insertTopKLocal(&merged, eff_k, st.top_ids[ki], st.top_vals[ki]);
+                }
+            }
+            const inv_sum: f32 = if (g_sum > 0.0) 1.0 / g_sum else 0.0;
+            const log_sum: f32 = if (g_sum > 0.0) @log(g_sum) else 0.0;
+            for (0..eff_k) |ki| {
+                const logit = merged.top_vals[ki];
+                const valid = (ki < merged.count and g_sum > 0.0);
+                const prob: f32 = if (valid) @exp(logit - g_max) * inv_sum else 0.0;
+                const log_prob: f32 = if (valid) (logit - g_max - log_sum) else -std.math.inf(f32);
+                self.topk_host[r * eff_k + ki] = .{
+                    .token_id = if (ki < merged.count) merged.top_ids[ki] else 0,
+                    .prob = prob,
+                    .log_prob = log_prob,
+                };
+            }
+        }
+        return self.topk_host[0 .. out_rows * eff_k];
     }
 
     // -----------------------------------------------------------------------
@@ -5266,6 +6327,58 @@ pub const Qwen3Model = struct {
             &.{};
         errdefer if (expert_acc_f32.len > 0) allocator.free(expert_acc_f32);
 
+        var all_dense_sme2 = (self.config.arch == .qwen3_dense and
+            self.max_tree_nodes > 1 and
+            self.embed.layout == .row_major and
+            self.layers.len > 0 and
+            self.config.head_dim <= 256 and
+            (self.config.head_dim % 2) == 0);
+        if (all_dense_sme2) {
+            for (self.layers) |layer| {
+                if (layer.q_proj.layout != .sme2_panel64 or
+                    layer.k_proj.layout != .sme2_panel64 or
+                    layer.v_proj.layout != .sme2_panel64 or
+                    layer.o_proj.layout != .sme2_panel64 or
+                    layer.dense_gate.layout != .sme2_panel64 or
+                    layer.dense_up.layout != .sme2_panel64 or
+                    layer.dense_down.layout != .sme2_panel64)
+                {
+                    all_dense_sme2 = false;
+                    break;
+                }
+            }
+        }
+        const dense_inter: usize = self.config.intermediate_size;
+        const dense_up_f32: []align(sme.SVL_BYTES) f32 = if (all_dense_sme2)
+            try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m_cap * dense_inter)
+        else
+            &.{};
+        errdefer if (dense_up_f32.len > 0) allocator.free(dense_up_f32);
+
+        const x_res_f32: []align(sme.SVL_BYTES) f32 = if (all_dense_sme2)
+            try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m_cap * h)
+        else
+            &.{};
+        errdefer if (x_res_f32.len > 0) allocator.free(x_res_f32);
+
+        const rope_inv_freq: []f32 = if (all_dense_sme2) blk: {
+            const half_dim: usize = self.config.head_dim / 2;
+            const buf = try allocator.alloc(f32, half_dim);
+            const log_theta: f32 = @log(self.config.rope_theta);
+            const inv_d: f32 = 2.0 / @as(f32, @floatFromInt(self.config.head_dim));
+            for (0..half_dim) |j| {
+                buf[j] = @exp(-log_theta * (@as(f32, @floatFromInt(j)) * inv_d));
+            }
+            break :blk buf;
+        } else &.{};
+        errdefer if (rope_inv_freq.len > 0) allocator.free(rope_inv_freq);
+
+        const lm_tile_stats: []LmHeadTileState = if (all_dense_sme2)
+            try allocator.alloc(LmHeadTileState, LM_HEAD_MAX_TILES * m_cap)
+        else
+            &.{};
+        errdefer if (lm_tile_stats.len > 0) allocator.free(lm_tile_stats);
+
         // Optional L2-resident folded router bank (`<= 8 MiB`) when `.amf` routers are
         // `row_major`. Single-owner `sme2_panel64` routers consume ZERO extra bytes.
         var bank_arena: ?arena_mod.WiredArena = null;
@@ -5326,6 +6439,10 @@ pub const Qwen3Model = struct {
             .expert_inter_u16 = expert_inter_u16,
             .expert_down_f32 = expert_down_f32,
             .expert_acc_f32 = expert_acc_f32,
+            .dense_up_f32 = dense_up_f32,
+            .x_res_f32 = x_res_f32,
+            .rope_inv_freq = rope_inv_freq,
+            .lm_tile_stats = lm_tile_stats,
             .router_bank_arena = bank_arena,
             .router_bank_packed = bank_packed,
             .router_bank_dtype = bank_dtype,
@@ -5338,6 +6455,7 @@ pub const Qwen3Model = struct {
         // Ownership transferred into `srt`; clear local errdefer handle.
         bank_arena = null;
         self.sme_rt = srt;
+        self.has_pure_cpu_sme2_dense = all_dense_sme2;
         self.total_wired_bytes += bank_arena_added;
 
         if (want_router_pred and (all_sampled_sme2 or srt.router_bank_packed.len > 0)) {
@@ -5594,7 +6712,11 @@ const LoadedBlob = struct {
     }
 
     fn asNormBinding(self: LoadedBlob, dtype: quant.FloatDType) NormBinding {
-        return .{ .binding = self.asBinding(), .dtype = dtype };
+        return .{
+            .binding = self.asBinding(),
+            .dtype = dtype,
+            .host_bytes = self.slice[0..@intCast(self.entry.data_bytes)],
+        };
     }
 
     fn asLinearBinding(self: LoadedBlob, dtype: quant.WeightDType) LoadError!LinearBinding {
@@ -5606,6 +6728,12 @@ const LoadedBlob = struct {
             .f16, .bf16 => null,
             .q4_affine, .q3_affine, .q2_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
         };
+        const sb_host: ?[]const u8 = if (layout == .sme2_panel64)
+            null
+        else switch (dtype) {
+            .f16, .bf16 => null,
+            .q4_affine, .q3_affine, .q2_affine => self.slice[@intCast(self.entry.params_offset)..][0..@intCast(self.entry.params_bytes)],
+        };
         return .{
             .weight = .{ .buffer = self.buffer, .offset = self.offset },
             .scale_bias = sb,
@@ -5616,6 +6744,8 @@ const LoadedBlob = struct {
             .layout = layout,
             .param_kind = param_kind,
             .sme_packed = if (layout == .sme2_panel64) self.slice[0..@intCast(self.entry.data_bytes)] else null,
+            .weight_host = self.slice[0..@intCast(self.entry.data_bytes)],
+            .scale_bias_host = sb_host,
         };
     }
 };
@@ -6461,15 +7591,21 @@ fn loadCore(
 
         var q_norm_bind: ?metal.BufferBinding = null;
         var k_norm_bind: ?metal.BufferBinding = null;
+        var q_norm_host: ?[]const u8 = null;
+        var k_norm_host: ?[]const u8 = null;
         var qk_norm_dtype: quant.FloatDType = .f16;
         var qk_norm_bytes: u64 = 0;
         if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_norm.weight", .{l}) catch unreachable)) |qn_e| {
             qk_norm_dtype = try validateNorm1D(qn_e, config.head_dim);
-            q_norm_bind = (try loadBlobIntoShard(source, qn_e, l_shard, options.verify_crcs)).asBinding();
+            const qn_blob = try loadBlobIntoShard(source, qn_e, l_shard, options.verify_crcs);
+            q_norm_bind = qn_blob.asBinding();
+            q_norm_host = qn_blob.slice[0..@intCast(qn_e.data_bytes)];
             qk_norm_bytes += qn_e.data_bytes;
         }
         if (parsed.find(std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.k_norm.weight", .{l}) catch unreachable)) |kn_e| {
-            k_norm_bind = (try loadBlobIntoShard(source, kn_e, l_shard, options.verify_crcs)).asBinding();
+            const kn_blob = try loadBlobIntoShard(source, kn_e, l_shard, options.verify_crcs);
+            k_norm_bind = kn_blob.asBinding();
+            k_norm_host = kn_blob.slice[0..@intCast(kn_e.data_bytes)];
             qk_norm_bytes += kn_e.data_bytes;
         }
 
@@ -6486,6 +7622,8 @@ fn loadCore(
             .o_proj = o_b,
             .q_norm = q_norm_bind,
             .k_norm = k_norm_bind,
+            .q_norm_host = q_norm_host,
+            .k_norm_host = k_norm_host,
             .qk_norm_dtype = qk_norm_dtype,
             .post_attention_layernorm = post_ln_b,
             .router = .{ .weights = .{ .binding = .{ .buffer = scratch_buf, .offset = 0 }, .dtype = .f16 } },
@@ -6782,6 +7920,7 @@ fn loadCore(
         .cold_rt = cold_rt,
         .hybrid_rt = null,
         .has_sme2_weights = has_sme2_weights,
+        .has_pure_cpu_sme2_dense = false,
         .sme_router_mode = options.sme_router_mode,
         .sme_rt = null,
     };
@@ -8449,9 +9588,9 @@ test "M4 G6 runLayerFfnChunk and A1 prefillHybridWavefront run zero-copy 2-chunk
     }
 }
 
-const RepackTargets = enum { routers, all_linear };
+pub const RepackTargets = enum { routers, all_linear };
 
-fn repackAmfBytesToSme2(
+pub fn repackAmfBytesToSme2(
     allocator: std.mem.Allocator,
     src_bytes: []const u8,
     targets: RepackTargets,
@@ -9178,5 +10317,71 @@ test "M5 G13 mixed per-layer dense Qwen3 ({q2,q3,q4,bf16}) matches CPU fp32 ref"
             const got: f32 = @floatCast(gpu_logits[i]);
             try std.testing.expectApproxEqAbs(exp, got, @max(0.06, @abs(exp) * 0.04));
         }
+    }
+}
+
+test "M5 pure-CPU SME2 stepDraftTreeBatch and prefillChunk match GPU row_major parity" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q4,
+        .group_size = 64,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 192,
+        .tie_word_embeddings = true,
+    };
+    const layer_dts = [_]quant.WeightDType{ .q4_affine, .q3_affine };
+    const row_img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .q4_affine,
+        .norm_dtype = .bf16,
+        .layer_linear_dtypes_cycle = &layer_dts,
+    }, 0x5EE2_D801);
+    defer gpa.free(row_img);
+
+    const sme_img = try repackAmfBytesToSme2(gpa, row_img, .all_linear, null);
+    defer gpa.free(sme_img);
+
+    var gpu_m = try Qwen3Model.loadFromBytes(gpa, row_img, cfg, .{
+        .max_seq_len = 32,
+        .chunk_tokens = 8,
+        .max_tree_nodes = 16,
+    });
+    defer gpu_m.deinit(gpa);
+    try std.testing.expect(!gpu_m.hasPureCpuSme2Draft());
+
+    var sme_m = try Qwen3Model.loadFromBytes(gpa, sme_img, cfg, .{
+        .max_seq_len = 32,
+        .chunk_tokens = 8,
+        .max_tree_nodes = 16,
+    });
+    defer sme_m.deinit(gpa);
+    try std.testing.expect(sme_m.hasPureCpuSme2Draft());
+
+    // 1. Prefill chunk (across chunk boundary `chunk_tokens = 8`) must match top-1 token.
+    const prompt = [_]u32{ 3, 17, 42, 9, 61, 88, 12, 5, 77 };
+    const gpu_p0 = try gpu_m.prefillChunk(prompt[0..6], 0, false);
+    const sme_p0 = try sme_m.prefillChunk(prompt[0..6], 0, false);
+    try std.testing.expectEqual(gpu_p0, sme_p0);
+    const gpu_p1 = try gpu_m.prefillChunk(prompt[6..9], 6, true);
+    const sme_p1 = try sme_m.prefillChunk(prompt[6..9], 6, true);
+    try std.testing.expectEqual(gpu_p1, sme_p1);
+    try std.testing.expectEqual(gpu_m.seq_len, sme_m.seq_len);
+
+    // 2. Tree-draft batch (3 nodes across 2 branches, `logits_last_row_only = false`, `commit_kv = false`).
+    const toks = [_]u32{ gpu_p1, 21, 34 };
+    const pos = [_]u32{ 9, 10, 10 };
+    const masks = [_]u64{ 0b001, 0b011, 0b101 };
+    const gpu_cands = try gpu_m.stepDraftTreeBatch(&toks, &pos, 0, &masks, 9, 3, false, false, null);
+    const sme_cands = try sme_m.stepDraftTreeBatch(&toks, &pos, 0, &masks, 9, 3, false, false, null);
+    try std.testing.expectEqual(gpu_cands.len, sme_cands.len);
+    for (0..toks.len) |r| {
+        try std.testing.expectEqual(gpu_cands[r * 3].token_id, sme_cands[r * 3].token_id);
+        try std.testing.expectApproxEqAbs(gpu_cands[r * 3].prob, sme_cands[r * 3].prob, 0.03);
     }
 }
