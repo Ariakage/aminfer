@@ -2619,7 +2619,7 @@ pub const Server = struct {
             self.closeSlotSocketAndRelease(slot, false);
             return;
         };
-        w.print("\",\"type\":\"{s}\",\"code\":\"{s}\"}}", .{ err_type, err_code }) catch {
+        w.print("\",\"type\":\"{s}\",\"code\":\"{s}\"}}}}", .{ err_type, err_code }) catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
         };
@@ -3331,7 +3331,7 @@ pub const Server = struct {
                         .{slot.request_id},
                     ) catch break :blk false;
                     bw.writeJsonEscaped(content) catch break :blk false;
-                    bw.writeAll("\"}}]}],\"output_text\":\"") catch break :blk false;
+                    bw.writeAll("\"}]}],\"output_text\":\"") catch break :blk false;
                     bw.writeJsonEscaped(content) catch break :blk false;
                     bw.print(
                         "\",\"usage\":{{\"input_tokens\":{d},\"output_tokens\":{d},\"total_tokens\":{d}}}," ++
@@ -3552,6 +3552,27 @@ fn extractHttpBody(resp: []const u8) ?[]const u8 {
     return resp[sep + 4 ..];
 }
 
+fn expectValidJson(body: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+fn expectValidSseJsonFrames(sse: []const u8) !usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, sse, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (!std.mem.startsWith(u8, line, "data: ")) continue;
+        const payload = line["data: ".len..];
+        if (std.mem.eql(u8, payload, "[DONE]")) continue;
+        try expectValidJson(payload);
+        count += 1;
+    }
+    try std.testing.expect(count > 0);
+    return count;
+}
+
 test "ThinkSplitter separates fragmented <think>...</think> tags and handles false prefixes" {
     const Accum = struct {
         reasoning: [256]u8 = undefined,
@@ -3745,6 +3766,7 @@ test "loopback GET /health, GET /v1/models, error statuses (400/404/405), and ch
         const resp = try testHttpExchange(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
         const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(body);
         try std.testing.expectEqualStrings(
             "{\"status\":\"ok\",\"model\":\"qwen3-test-0.6b\",\"wired_mib\":1234,\"active_requests\":0}",
             body,
@@ -3756,6 +3778,7 @@ test "loopback GET /health, GET /v1/models, error statuses (400/404/405), and ch
     {
         const resp = try testHttpExchange(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
         const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(body);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"wired_mib\":2048") != null);
     }
 
@@ -3764,6 +3787,7 @@ test "loopback GET /health, GET /v1/models, error statuses (400/404/405), and ch
         const resp = try testHttpExchange(port, "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
         const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(body);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"object\":\"list\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":\"qwen3-test-0.6b\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"owned_by\":\"aminfer\"") != null);
@@ -3773,6 +3797,8 @@ test "loopback GET /health, GET /v1/models, error statuses (400/404/405), and ch
     {
         const resp = try testHttpExchange(port, "GET /v1/does-not-exist HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 404 Not Found\r\n"));
+        const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(body);
     }
 
     // 405 Method Not Allowed
@@ -3780,10 +3806,12 @@ test "loopback GET /health, GET /v1/models, error statuses (400/404/405), and ch
         const resp = try testHttpExchange(port, "POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n", &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 405 Method Not Allowed\r\n"));
         try std.testing.expectEqualStrings("GET", extractHeaderValue(resp, "Allow") orelse "");
+        try expectValidJson(extractHttpBody(resp) orelse return error.TestUnexpectedResult);
 
         const resp2 = try testHttpExchange(port, "GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, resp2, "HTTP/1.1 405 Method Not Allowed\r\n"));
         try std.testing.expectEqualStrings("POST", extractHeaderValue(resp2, "Allow") orelse "");
+        try expectValidJson(extractHttpBody(resp2) orelse return error.TestUnexpectedResult);
     }
 
     // 400 Bad Request
@@ -3791,6 +3819,7 @@ test "loopback GET /health, GET /v1/models, error statuses (400/404/405), and ch
         var req_buf: [1024]u8 = undefined;
         const resp = try testHttpPostJson(port, "/v1/chat/completions", "{bad json", &req_buf, &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400 Bad Request\r\n"));
+        try expectValidJson(extractHttpBody(resp) orelse return error.TestUnexpectedResult);
     }
 
     // Transfer-Encoding: chunked POST support
@@ -3806,6 +3835,7 @@ test "loopback GET /health, GET /v1/models, error statuses (400/404/405), and ch
         const resp = try testHttpExchange(port, chunked_req, &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
         const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(body);
         try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"ok\"") != null);
     }
 }
@@ -3900,6 +3930,7 @@ test "POST /v1/chat/completions streaming & non-streaming <think> split and D11 
         );
 
         const sse = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        _ = try expectValidSseJsonFrames(sse);
         try std.testing.expect(std.mem.indexOf(u8, sse, "\"seed_used\":0,\"seed_source\":\"greedy\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, sse, "\"reasoning_content\":\"step \\\"1\\\"\\n\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, sse, "\"reasoning_content\":\"step 2\"") != null);
@@ -3923,6 +3954,7 @@ test "POST /v1/chat/completions streaming & non-streaming <think> split and D11 
         const resp = try testHttpPostJson(port, "/v1/chat/completions", body, &req_buf, &resp_buf);
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
         const json = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"object\":\"chat.completion\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"content\":\"Ans: 你好\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"step \\\"1\\\"\\nstep 2\"") != null);
@@ -3948,6 +3980,7 @@ test "POST /v1/chat/completions streaming & non-streaming <think> split and D11 
         }
 
         const json = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(json);
         var expected_seed_json: [96]u8 = undefined;
         const needle = try std.fmt.bufPrint(&expected_seed_json, "\"seed_used\":{d},\"seed_source\":\"hardware_trng\"", .{seed_val});
         try std.testing.expect(std.mem.indexOf(u8, json, needle) != null);
@@ -3974,6 +4007,7 @@ test "POST /v1/chat/completions streaming & non-streaming <think> split and D11 
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
         try std.testing.expectEqualStrings("explicit", extractHeaderValue(resp, "X-Aminfer-Seed-Source") orelse "");
         const json = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(json);
         try std.testing.expect(std.mem.indexOf(u8, json, first_hw_content[0..first_hw_content_len]) != null);
         var exp_buf: [96]u8 = undefined;
         const exp_seed = try std.fmt.bufPrint(&exp_buf, "\"seed_used\":{d},\"seed_source\":\"explicit\"", .{hw_seeds[0]});
@@ -4018,6 +4052,7 @@ test "POST /v1/responses and POST /v1/messages stateless streaming & non-streami
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
         try std.testing.expectEqualStrings("77", extractHeaderValue(resp, "X-Aminfer-Seed-Used") orelse "");
         const sse = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        _ = try expectValidSseJsonFrames(sse);
         try std.testing.expect(std.mem.indexOf(u8, sse, "event: response.created\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, sse, "event: response.reasoning_summary_text.delta\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, sse, "\"delta\":\"reason A\"") != null);
@@ -4034,6 +4069,7 @@ test "POST /v1/responses and POST /v1/messages stateless streaming & non-streami
         ;
         const resp = try testHttpPostJson(port, "/v1/responses", body, &req_buf, &resp_buf);
         const json = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"object\":\"response\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"reasoning\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":\"reason A\"") != null);
@@ -4049,6 +4085,7 @@ test "POST /v1/responses and POST /v1/messages stateless streaming & non-streami
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
         try std.testing.expectEqualStrings("99", extractHeaderValue(resp, "X-Aminfer-Seed-Used") orelse "");
         const sse = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        _ = try expectValidSseJsonFrames(sse);
         try std.testing.expect(std.mem.indexOf(u8, sse, "event: message_start\n") != null);
         try std.testing.expect(std.mem.indexOf(u8, sse, "\"input_tokens\":7") != null);
         try std.testing.expect(std.mem.indexOf(u8, sse, "\"type\":\"thinking_delta\",\"thinking\":\"reason A\"") != null);
@@ -4067,6 +4104,7 @@ test "POST /v1/responses and POST /v1/messages stateless streaming & non-streami
         ;
         const resp = try testHttpPostJson(port, "/v1/messages", body, &req_buf, &resp_buf);
         const json = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"message\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "{\"type\":\"thinking\",\"thinking\":\"reason A\"}") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "{\"type\":\"text\",\"text\":\"Final B\"}") != null);
@@ -4329,6 +4367,7 @@ test "503 Service Unavailable backpressure when all preallocated active request 
             &resp_buf,
         );
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 503 Service Unavailable\r\n"));
+        try expectValidJson(extractHttpBody(resp) orelse return error.TestUnexpectedResult);
         try std.testing.expect(std.mem.indexOf(u8, resp, "server_overloaded") != null);
         try std.testing.expectEqual(@as(u64, 1), srv.stats().rejected_503_count);
     }
