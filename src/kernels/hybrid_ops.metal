@@ -1972,3 +1972,308 @@ kernel void ami_gr_collapse(const device uchar *stream [[buffer(0)]],
     }
     hybrid_store_f16_or_bf16(out, tok_off, acc, GR_ACT_BF16);
 }
+
+// ===========================================================================
+// Section D: Graph Executor Fused Gate, Conv1D, and Loop-Blend Helpers
+// ===========================================================================
+
+struct GrComputeGatesParams {
+    uint m;
+    uint hidden_dim;
+    uint branch_token_stride;
+    uint _pad0;
+};
+
+static_assert(sizeof(GrComputeGatesParams) == 16, "GrComputeGatesParams must be 16 bytes");
+
+// Computes 4-branch GR per-token gates from stream branch 0 (`f16` / `bf16` weights):
+//   g_read[m, b]  = sigmoid(dot(stream[0, m, :], w_read[b, :]))
+//   g_write[m, b] = sigmoid(dot(stream[0, m, :], w_write[b, :]))
+//   decay[m, b]   = sigmoid(dot(stream[0, m, :], w_decay[b, :]))
+// Dispatch: `m * 4` threadgroups of 32 threads (1 SIMD group per (tok, branch)).
+kernel void ami_gr_compute_gates(const device half *stream [[buffer(0)]],
+                                 const device uchar *w_read [[buffer(1)]],
+                                 const device uchar *w_write [[buffer(2)]],
+                                 const device uchar *w_decay [[buffer(3)]],
+                                 device float *g_read_out [[buffer(4)]],
+                                 device float *g_write_out [[buffer(5)]],
+                                 device float *decay_out [[buffer(6)]],
+                                 constant GrComputeGatesParams &p [[buffer(7)]],
+                                 uint tgid [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    const uint tok = tgid >> 2u;
+    const uint b = tgid & 3u;
+    if (tok >= p.m) {
+        return;
+    }
+
+    const device half *x_row = stream + ulong(tok) * p.hidden_dim;
+    const ulong w_off = ulong(b) * p.hidden_dim;
+    float acc_r = 0.0f;
+    float acc_w = 0.0f;
+    float acc_d = 0.0f;
+    for (uint d = lane; d < p.hidden_dim; d += 32u) {
+        const float xv = float(x_row[d]);
+        acc_r = fma(xv, hybrid_load_f16_or_bf16(w_read, w_off + d, HYBRID_NORM_W_BF16), acc_r);
+        acc_w = fma(xv, hybrid_load_f16_or_bf16(w_write, w_off + d, HYBRID_NORM_W_BF16), acc_w);
+        acc_d = fma(xv, hybrid_load_f16_or_bf16(w_decay, w_off + d, HYBRID_NORM_W_BF16), acc_d);
+    }
+    acc_r = simd_sum(acc_r);
+    acc_w = simd_sum(acc_w);
+    acc_d = simd_sum(acc_d);
+    if (lane == 0u) {
+        const uint out_idx = tok * 4u + b;
+        g_read_out[out_idx] = hybrid_sigmoid(acc_r);
+        g_write_out[out_idx] = hybrid_sigmoid(acc_w);
+        decay_out[out_idx] = hybrid_sigmoid(acc_d);
+    }
+}
+
+struct GdnComputeGatesParams {
+    uint m;
+    uint hidden_dim;
+    uint num_v_heads;
+    uint _pad0;
+};
+
+static_assert(sizeof(GdnComputeGatesParams) == 16, "GdnComputeGatesParams must be 16 bytes");
+
+// Computes Qwen3.8 Gated DeltaNet per-head log-decay `g` and pre-sigmoid `beta`:
+//   a = dot(x[tok, :], w_a[vh, :]) + dt_bias[vh]
+//   g[tok, vh] = -exp(a_log[vh]) * softplus(a)    (<= 0 so exp(g) in (0, 1])
+//   beta[tok, vh] = dot(x[tok, :], w_b[vh, :])
+// Dispatch: `m * num_v_heads` threadgroups of 32 threads.
+kernel void ami_gdn_compute_gates(const device half *x [[buffer(0)]],
+                                  const device uchar *w_a [[buffer(1)]],
+                                  const device uchar *w_b [[buffer(2)]],
+                                  const device float *a_log [[buffer(3)]],
+                                  const device float *dt_bias [[buffer(4)]],
+                                  device float *g_out [[buffer(5)]],
+                                  device float *beta_out [[buffer(6)]],
+                                  constant GdnComputeGatesParams &p [[buffer(7)]],
+                                  uint tgid [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    const uint tok = tgid / p.num_v_heads;
+    const uint vh = tgid - tok * p.num_v_heads;
+    if (tok >= p.m) {
+        return;
+    }
+
+    const device half *x_row = x + ulong(tok) * p.hidden_dim;
+    const ulong w_off = ulong(vh) * p.hidden_dim;
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+    for (uint d = lane; d < p.hidden_dim; d += 32u) {
+        const float xv = float(x_row[d]);
+        acc_a = fma(xv, hybrid_load_f16_or_bf16(w_a, w_off + d, HYBRID_NORM_W_BF16), acc_a);
+        acc_b = fma(xv, hybrid_load_f16_or_bf16(w_b, w_off + d, HYBRID_NORM_W_BF16), acc_b);
+    }
+    acc_a = simd_sum(acc_a);
+    acc_b = simd_sum(acc_b);
+    if (lane == 0u) {
+        const float a = acc_a + dt_bias[vh];
+        const float sp = (a > 20.0f) ? a : log(1.0f + exp(a));
+        const uint out_idx = tok * p.num_v_heads + vh;
+        g_out[out_idx] = -exp(a_log[vh]) * sp;
+        beta_out[out_idx] = acc_b;
+    }
+}
+
+struct GdnConv1dParams {
+    uint m;
+    uint gdn_qk;
+    uint gdn_v;
+    uint conv_k;
+    uint is_tree;
+    uint write_state;
+    uint _pad0;
+    uint _pad1;
+};
+
+static_assert(sizeof(GdnConv1dParams) == 32, "GdnConv1dParams must be 32 bytes");
+
+static inline float load_qkv_channel(const device half *q,
+                                     const device half *k,
+                                     const device half *v,
+                                     uint tok,
+                                     uint c,
+                                     uint gdn_qk,
+                                     uint gdn_v) {
+    if (c < gdn_qk) {
+        return float(q[ulong(tok) * gdn_qk + c]);
+    }
+    if (c < 2u * gdn_qk) {
+        return float(k[ulong(tok) * gdn_qk + (c - gdn_qk)]);
+    }
+    return float(v[ulong(tok) * gdn_v + (c - 2u * gdn_qk)]);
+}
+
+static inline void store_qkv_channel(device half *q,
+                                     device half *k,
+                                     device half *v,
+                                     uint tok,
+                                     uint c,
+                                     uint gdn_qk,
+                                     uint gdn_v,
+                                     float val) {
+    const half hval = half(val);
+    if (c < gdn_qk) {
+        q[ulong(tok) * gdn_qk + c] = hval;
+    } else if (c < 2u * gdn_qk) {
+        k[ulong(tok) * gdn_qk + (c - gdn_qk)] = hval;
+    } else {
+        v[ulong(tok) * gdn_v + (c - 2u * gdn_qk)] = hval;
+    }
+}
+
+// Causal depthwise Conv1D + SiLU over concatenated `(q, k, v)` channels
+// (`conv_dim = 2 * gdn_qk + gdn_v`, `conv_k in [1..8]`).
+// Supports decode (`m=1, is_tree=0`), prefill (`m>=1, is_tree=0`), and
+// tree-verify (`is_tree=1` with 64-bit `ancestor_masks` without mutating
+// committed `conv_state_in`).
+kernel void ami_gdn_conv1d_silu(const device half *q_in [[buffer(0)]],
+                                const device half *k_in [[buffer(1)]],
+                                const device half *v_in [[buffer(2)]],
+                                const device float *conv_w [[buffer(3)]],
+                                const device half *conv_state_in [[buffer(4)]],
+                                device half *conv_state_out [[buffer(5)]],
+                                const device ulong *ancestor_masks [[buffer(6)]],
+                                device half *q_out [[buffer(7)]],
+                                device half *k_out [[buffer(8)]],
+                                device half *v_out [[buffer(9)]],
+                                constant GdnConv1dParams &p [[buffer(10)]],
+                                uint gid [[thread_position_in_grid]]) {
+    const uint conv_dim = 2u * p.gdn_qk + p.gdn_v;
+    if (gid >= conv_dim) {
+        return;
+    }
+
+    const uint hist = (p.conv_k > 0u) ? (p.conv_k - 1u) : 0u;
+    const device float *w_row = conv_w + ulong(gid) * p.conv_k;
+
+    if (p.is_tree == 0u) {
+        for (uint tok = 0u; tok < p.m; ++tok) {
+            float acc = 0.0f;
+            for (uint tap = 0u; tap < p.conv_k; ++tap) {
+                const int rel = int(tok) - int(hist - tap);
+                float xv;
+                if (rel < 0) {
+                    const uint s_idx = uint(int(hist) + rel);
+                    xv = float(conv_state_in[ulong(s_idx) * conv_dim + gid]);
+                } else {
+                    xv = load_qkv_channel(q_in, k_in, v_in, uint(rel), gid, p.gdn_qk, p.gdn_v);
+                }
+                acc = fma(xv, w_row[tap], acc);
+            }
+            store_qkv_channel(q_out, k_out, v_out, tok, gid, p.gdn_qk, p.gdn_v, hybrid_fast_silu(acc));
+        }
+
+        if (p.write_state != 0u && hist > 0u) {
+            for (uint s = 0u; s < hist; ++s) {
+                const int rel = int(p.m) - int(hist - s);
+                float xv;
+                if (rel < 0) {
+                    const uint old_s = uint(int(hist) + rel);
+                    xv = float(conv_state_in[ulong(old_s) * conv_dim + gid]);
+                } else {
+                    xv = load_qkv_channel(q_in, k_in, v_in, uint(rel), gid, p.gdn_qk, p.gdn_v);
+                }
+                conv_state_out[ulong(s) * conv_dim + gid] = half(xv);
+            }
+        }
+    } else {
+        // Tree verification: for each node, walk up to `hist` strict ancestors
+        // from `ancestor_masks[node]` (most recent first), falling back to `conv_state_in`.
+        for (uint node = 0u; node < p.m; ++node) {
+            uint anc_nodes[8];
+            uint n_anc = 0u;
+            const ulong mask = ancestor_masks[node];
+            if (node > 0u && hist > 0u) {
+                for (int cand = int(node) - 1; cand >= 0 && n_anc < hist; --cand) {
+                    if (((mask >> uint(cand)) & 1ul) != 0ul) {
+                        anc_nodes[n_anc++] = uint(cand);
+                    }
+                }
+            }
+            float acc = 0.0f;
+            for (uint tap = 0u; tap < p.conv_k; ++tap) {
+                float xv;
+                if (tap == hist) {
+                    xv = load_qkv_channel(q_in, k_in, v_in, node, gid, p.gdn_qk, p.gdn_v);
+                } else {
+                    const uint back = hist - tap; // 1 = parent, 2 = grandparent, ...
+                    if (back <= n_anc) {
+                        xv = load_qkv_channel(q_in, k_in, v_in, anc_nodes[back - 1u], gid, p.gdn_qk, p.gdn_v);
+                    } else {
+                        const uint past_back = back - n_anc; // 1 = newest slot in conv_state_in
+                        const uint s_idx = hist - past_back;
+                        xv = float(conv_state_in[ulong(s_idx) * conv_dim + gid]);
+                    }
+                }
+                acc = fma(xv, w_row[tap], acc);
+            }
+            store_qkv_channel(q_out, k_out, v_out, node, gid, p.gdn_qk, p.gdn_v, hybrid_fast_silu(acc));
+        }
+    }
+}
+
+struct GdnConv1dCommitParams {
+    uint gdn_qk;
+    uint gdn_v;
+    uint conv_k;
+    uint accepted_count;
+    ushort inline_nodes[64];
+};
+
+static_assert(sizeof(GdnConv1dCommitParams) == 144, "GdnConv1dCommitParams must be 144 bytes");
+
+// Advances committed GDN Conv1D history along `accepted_nodes[0..accepted_count]`.
+kernel void ami_gdn_conv1d_commit(const device half *q_raw [[buffer(0)]],
+                                  const device half *k_raw [[buffer(1)]],
+                                  const device half *v_raw [[buffer(2)]],
+                                  const device half *conv_state_in [[buffer(3)]],
+                                  device half *conv_state_out [[buffer(4)]],
+                                  constant GdnConv1dCommitParams &p [[buffer(5)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    const uint conv_dim = 2u * p.gdn_qk + p.gdn_v;
+    const uint hist = (p.conv_k > 0u) ? (p.conv_k - 1u) : 0u;
+    if (gid >= conv_dim || hist == 0u || p.accepted_count == 0u) {
+        return;
+    }
+
+    float next_vals[8];
+    for (uint s = 0u; s < hist; ++s) {
+        const int rel = int(p.accepted_count) - int(hist - s);
+        if (rel < 0) {
+            const uint old_s = uint(int(hist) + rel);
+            next_vals[s] = float(conv_state_in[ulong(old_s) * conv_dim + gid]);
+        } else {
+            const uint node = uint(p.inline_nodes[uint(rel)]);
+            next_vals[s] = load_qkv_channel(q_raw, k_raw, v_raw, node, gid, p.gdn_qk, p.gdn_v);
+        }
+    }
+    for (uint s = 0u; s < hist; ++s) {
+        conv_state_out[ulong(s) * conv_dim + gid] = half(next_vals[s]);
+    }
+}
+
+struct BlendF16Params {
+    uint count;
+    float a;
+    float b;
+    uint _pad0;
+};
+
+static_assert(sizeof(BlendF16Params) == 16, "BlendF16Params must be 16 bytes");
+
+// Elementwise FP16 linear blend: `dst[i] = half(a * float(dst[i]) + b * float(src[i]))`.
+// Used for native LoopLM `inject_x_init` (`0.5 * h + 0.5 * x_init` on `r >= 1`).
+kernel void ami_blend_f16(device half *dst [[buffer(0)]],
+                          const device half *src [[buffer(1)]],
+                          constant BlendF16Params &p [[buffer(2)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) {
+        return;
+    }
+    dst[gid] = half(fma(p.a, float(dst[gid]), p.b * float(src[gid])));
+}

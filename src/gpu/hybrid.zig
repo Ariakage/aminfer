@@ -257,6 +257,46 @@ pub const GrParams = extern struct {
     _pad3: u32 = 0,
 };
 
+pub const GrComputeGatesParams = extern struct {
+    m: u32,
+    hidden_dim: u32,
+    branch_token_stride: u32,
+    _pad0: u32 = 0,
+};
+
+pub const GdnComputeGatesParams = extern struct {
+    m: u32,
+    hidden_dim: u32,
+    num_v_heads: u32,
+    _pad0: u32 = 0,
+};
+
+pub const GdnConv1dParams = extern struct {
+    m: u32,
+    gdn_qk: u32,
+    gdn_v: u32,
+    conv_k: u32,
+    is_tree: u32,
+    write_state: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+pub const GdnConv1dCommitParams = extern struct {
+    gdn_qk: u32,
+    gdn_v: u32,
+    conv_k: u32,
+    accepted_count: u32,
+    inline_nodes: [64]u16 = @splat(0),
+};
+
+pub const BlendF16Params = extern struct {
+    count: u32,
+    a: f32,
+    b: f32,
+    _pad0: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(GdnDecodeParams) != 48) @compileError("GdnDecodeParams must be 48 bytes");
     if (@sizeOf(GdnPrefillParams) != 48) @compileError("GdnPrefillParams must be 48 bytes");
@@ -271,8 +311,14 @@ comptime {
     if (@sizeOf(QsaIndexParams) != 48) @compileError("QsaIndexParams must be 48 bytes");
     if (@sizeOf(QsaSparseAttnParams) != 48) @compileError("QsaSparseAttnParams must be 48 bytes");
     if (@sizeOf(GrParams) != 48) @compileError("GrParams must be 48 bytes");
+    if (@sizeOf(GrComputeGatesParams) != 16) @compileError("GrComputeGatesParams must be 16 bytes");
+    if (@sizeOf(GdnComputeGatesParams) != 16) @compileError("GdnComputeGatesParams must be 16 bytes");
+    if (@sizeOf(GdnConv1dParams) != 32) @compileError("GdnConv1dParams must be 32 bytes");
+    if (@sizeOf(GdnConv1dCommitParams) != 144) @compileError("GdnConv1dCommitParams must be 144 bytes");
+    if (@sizeOf(BlendF16Params) != 16) @compileError("BlendF16Params must be 16 bytes");
     if (@sizeOf(GdnCommitTreeParams) > metal.MAX_UNIFORM_BYTES) @compileError("GdnCommitTreeParams exceeds uniform stride");
     if (@sizeOf(QsaKvTreeCommitParams) > metal.MAX_UNIFORM_BYTES) @compileError("QsaKvTreeCommitParams exceeds uniform stride");
+    if (@sizeOf(GdnConv1dCommitParams) > metal.MAX_UNIFORM_BYTES) @compileError("GdnConv1dCommitParams exceeds uniform stride");
 }
 
 // ===========================================================================
@@ -1076,6 +1122,73 @@ pub const GrCollapseArgs = struct {
     act_dtype: quant.FloatDType = .f16,
 };
 
+pub const GrComputeGatesArgs = struct {
+    stream: metal.BufferBinding,
+    w_read: metal.BufferBinding,
+    w_write: metal.BufferBinding,
+    w_decay: metal.BufferBinding,
+    g_read_out: metal.BufferBinding,
+    g_write_out: metal.BufferBinding,
+    decay_out: metal.BufferBinding,
+    m: u32,
+    hidden_dim: u32,
+    branch_token_stride: u32,
+    weight_dtype: quant.FloatDType = .bf16,
+};
+
+pub const GdnComputeGatesArgs = struct {
+    x: metal.BufferBinding,
+    w_a: metal.BufferBinding,
+    w_b: metal.BufferBinding,
+    a_log: metal.BufferBinding,
+    dt_bias: metal.BufferBinding,
+    g_out: metal.BufferBinding,
+    beta_out: metal.BufferBinding,
+    m: u32,
+    hidden_dim: u32,
+    num_v_heads: u32,
+    weight_dtype: quant.FloatDType = .bf16,
+};
+
+pub const GdnConv1dSiluArgs = struct {
+    q_in: metal.BufferBinding,
+    k_in: metal.BufferBinding,
+    v_in: metal.BufferBinding,
+    conv_w: metal.BufferBinding,
+    conv_state_in: metal.BufferBinding,
+    conv_state_out: metal.BufferBinding,
+    ancestor_masks: ?metal.BufferBinding = null,
+    q_out: metal.BufferBinding,
+    k_out: metal.BufferBinding,
+    v_out: metal.BufferBinding,
+    m: u32,
+    gdn_qk: u32,
+    gdn_v: u32,
+    conv_k: u32,
+    is_tree: bool = false,
+    write_state: bool = false,
+};
+
+pub const GdnConv1dCommitArgs = struct {
+    q_raw: metal.BufferBinding,
+    k_raw: metal.BufferBinding,
+    v_raw: metal.BufferBinding,
+    conv_state_in: metal.BufferBinding,
+    conv_state_out: metal.BufferBinding,
+    accepted_nodes: []const u16,
+    gdn_qk: u32,
+    gdn_v: u32,
+    conv_k: u32,
+};
+
+pub const BlendF16Args = struct {
+    dst: metal.BufferBinding,
+    src: metal.BufferBinding,
+    count: u32,
+    a: f32,
+    b: f32,
+};
+
 // ===========================================================================
 // HybridPipelines: Startup-Compiled Metal 4 Compute Pipelines
 // ===========================================================================
@@ -1116,6 +1229,15 @@ pub const HybridPipelines = struct {
     gr_read: [2][2]metal.Pipeline,
     gr_write: [2][2]metal.Pipeline,
     gr_collapse: [2][2]metal.Pipeline,
+
+    // Graph executor helpers
+    gr_compute_gates_f16: metal.Pipeline,
+    gr_compute_gates_bf16: metal.Pipeline,
+    gdn_compute_gates_f16: metal.Pipeline,
+    gdn_compute_gates_bf16: metal.Pipeline,
+    gdn_conv1d_silu: metal.Pipeline,
+    gdn_conv1d_commit: metal.Pipeline,
+    blend_f16: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!HybridPipelines {
         const gdn_decode_d64_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_decode", &.{
@@ -1292,6 +1414,31 @@ pub const HybridPipelines = struct {
             }
         }
 
+        const gr_compute_gates_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gr_compute_gates", &.{
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer gr_compute_gates_f16.close();
+        const gr_compute_gates_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_gr_compute_gates", &.{
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer gr_compute_gates_bf16.close();
+
+        const gdn_compute_gates_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_compute_gates", &.{
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer gdn_compute_gates_f16.close();
+        const gdn_compute_gates_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_compute_gates", &.{
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer gdn_compute_gates_bf16.close();
+
+        const gdn_conv1d_silu = try metal.Pipeline.init(device, library, "ami_gdn_conv1d_silu");
+        errdefer gdn_conv1d_silu.close();
+        const gdn_conv1d_commit = try metal.Pipeline.init(device, library, "ami_gdn_conv1d_commit");
+        errdefer gdn_conv1d_commit.close();
+        const blend_f16 = try metal.Pipeline.init(device, library, "ami_blend_f16");
+        errdefer blend_f16.close();
+
         return .{
             .gdn_decode_d64_f16 = gdn_decode_d64_f16,
             .gdn_decode_d64_bf16 = gdn_decode_d64_bf16,
@@ -1323,10 +1470,24 @@ pub const HybridPipelines = struct {
             .gr_read = gr_read,
             .gr_write = gr_write,
             .gr_collapse = gr_collapse,
+            .gr_compute_gates_f16 = gr_compute_gates_f16,
+            .gr_compute_gates_bf16 = gr_compute_gates_bf16,
+            .gdn_compute_gates_f16 = gdn_compute_gates_f16,
+            .gdn_compute_gates_bf16 = gdn_compute_gates_bf16,
+            .gdn_conv1d_silu = gdn_conv1d_silu,
+            .gdn_conv1d_commit = gdn_conv1d_commit,
+            .blend_f16 = blend_f16,
         };
     }
 
     pub fn close(self: HybridPipelines) void {
+        self.blend_f16.close();
+        self.gdn_conv1d_commit.close();
+        self.gdn_conv1d_silu.close();
+        self.gdn_compute_gates_bf16.close();
+        self.gdn_compute_gates_f16.close();
+        self.gr_compute_gates_bf16.close();
+        self.gr_compute_gates_f16.close();
         for (0..2) |sb| {
             for (0..2) |ab| {
                 self.gr_collapse[sb][ab].close();
@@ -2166,6 +2327,145 @@ pub const HybridPipelines = struct {
             std.mem.asBytes(&params),
             .{ total, 1, 1 },
             .{ @min(total, 256), 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeGrComputeGates(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: GrComputeGatesArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hidden_dim == 0 or args.branch_token_stride < args.m) return error.InvalidConfig;
+        const params: GrComputeGatesParams = .{
+            .m = args.m,
+            .hidden_dim = args.hidden_dim,
+            .branch_token_stride = args.branch_token_stride,
+        };
+        const pipe = if (args.weight_dtype == .bf16) self.gr_compute_gates_bf16 else self.gr_compute_gates_f16;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.stream, args.w_read, args.w_write, args.w_decay, args.g_read_out, args.g_write_out, args.decay_out },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.m) * GR_NUM_BRANCHES, 1, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeGdnComputeGates(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: GdnComputeGatesArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.hidden_dim == 0 or args.num_v_heads == 0) return error.ZeroDimension;
+        const params: GdnComputeGatesParams = .{
+            .m = args.m,
+            .hidden_dim = args.hidden_dim,
+            .num_v_heads = args.num_v_heads,
+        };
+        const pipe = if (args.weight_dtype == .bf16) self.gdn_compute_gates_bf16 else self.gdn_compute_gates_f16;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.w_a, args.w_b, args.a_log, args.dt_bias, args.g_out, args.beta_out },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.m) * args.num_v_heads, 1, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeGdnConv1dSilu(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: GdnConv1dSiluArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.gdn_qk == 0 or args.gdn_v == 0 or args.conv_k == 0 or args.conv_k > 8) {
+            return error.InvalidConfig;
+        }
+        if (args.is_tree and (args.ancestor_masks == null or args.m > MAX_TREE_NODES)) {
+            return error.InvalidConfig;
+        }
+        const conv_dim: u64 = 2 * @as(u64, args.gdn_qk) + args.gdn_v;
+        const params: GdnConv1dParams = .{
+            .m = args.m,
+            .gdn_qk = args.gdn_qk,
+            .gdn_v = args.gdn_v,
+            .conv_k = args.conv_k,
+            .is_tree = if (args.is_tree) 1 else 0,
+            .write_state = if (args.write_state) 1 else 0,
+        };
+        const masks_bind = args.ancestor_masks orelse args.conv_state_in;
+        try frame.encodeThreads(
+            self.gdn_conv1d_silu,
+            &.{
+                args.q_in,
+                args.k_in,
+                args.v_in,
+                args.conv_w,
+                args.conv_state_in,
+                args.conv_state_out,
+                masks_bind,
+                args.q_out,
+                args.k_out,
+                args.v_out,
+            },
+            std.mem.asBytes(&params),
+            .{ conv_dim, 1, 1 },
+            .{ @min(conv_dim, 256), 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeGdnConv1dCommit(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: GdnConv1dCommitArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.gdn_qk == 0 or args.gdn_v == 0 or args.conv_k <= 1 or args.conv_k > 8) return error.InvalidConfig;
+        if (args.accepted_nodes.len == 0 or args.accepted_nodes.len > MAX_TREE_NODES) return error.InvalidConfig;
+        const conv_dim: u64 = 2 * @as(u64, args.gdn_qk) + args.gdn_v;
+        var params: GdnConv1dCommitParams = .{
+            .gdn_qk = args.gdn_qk,
+            .gdn_v = args.gdn_v,
+            .conv_k = args.conv_k,
+            .accepted_count = @intCast(args.accepted_nodes.len),
+        };
+        for (args.accepted_nodes, 0..) |nid, i| {
+            params.inline_nodes[i] = nid;
+        }
+        try frame.encodeThreads(
+            self.gdn_conv1d_commit,
+            &.{ args.q_raw, args.k_raw, args.v_raw, args.conv_state_in, args.conv_state_out },
+            std.mem.asBytes(&params),
+            .{ conv_dim, 1, 1 },
+            .{ @min(conv_dim, 256), 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeBlendF16(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: BlendF16Args,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.count == 0) return error.ZeroDimension;
+        const params: BlendF16Params = .{
+            .count = args.count,
+            .a = args.a,
+            .b = args.b,
+        };
+        try frame.encodeThreads(
+            self.blend_f16,
+            &.{ args.dst, args.src },
+            std.mem.asBytes(&params),
+            .{ args.count, 1, 1 },
+            .{ @min(@as(u64, args.count), 256), 1, 1 },
             insert_barrier_before,
         );
     }

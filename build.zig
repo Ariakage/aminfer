@@ -112,30 +112,22 @@ pub fn build(b: *std.Build) void {
     const run_sme_test = b.addRunArtifact(sme_test);
     b.step("test-sme", "Run SME2 microkernel, canary, parity and fallback tests").dependOn(&run_sme_test.step);
 
-    // Dedicated M6 hybrid GPU test step (`zig build test-hybrid`) compiling
-    // `src/gpu/hybrid.zig` inside the standard `src/` layout without mutating `src/root.zig`.
-    const hybrid_wf = b.addWriteFiles();
-    _ = hybrid_wf.addCopyDirectory(b.path("src"), "src", .{ .include_extensions = &.{".zig"} });
-    const hybrid_only_main = hybrid_wf.add("src/hybrid_only_test.zig",
+    // Dedicated M6 hybrid GPU test step (`zig build test-hybrid`); full `zig build test`
+    // already runs `gpu/hybrid.zig` once via `src/root.zig`.
+    const hybrid_only_main = aux_wf.add("hybrid_only_test.zig",
         \\test {
-        \\    _ = @import("gpu/hybrid.zig");
+        \\    _ = @import("aminfer").hybrid;
         \\}
         \\
     );
-    const hybrid_test_mod = b.createModule(.{
-        .root_source_file = hybrid_only_main,
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
+    const hybrid_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = hybrid_only_main,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "aminfer", .module = mod }},
+        }),
     });
-    hybrid_test_mod.addImport("apple_bridge", bridge_c.createModule());
-    hybrid_test_mod.addAnonymousImport("aminfer_metallib", .{ .root_source_file = metallib });
-    hybrid_test_mod.addIncludePath(b.path("src/bridge"));
-    addMacosSdkPaths(b, hybrid_test_mod);
-    hybrid_test_mod.addCSourceFiles(.{ .files = &.{"src/bridge/apple_bridge.m"}, .flags = &objc_flags });
-    hybrid_test_mod.addCSourceFiles(.{ .files = &.{"src/cpu/sme2_kernels.s"}, .flags = &sme2_asm_flags });
-    for (frameworks) |name| hybrid_test_mod.linkFramework(name, .{});
-    const hybrid_test = b.addTest(.{ .root_module = hybrid_test_mod });
     const run_hybrid_test = b.addRunArtifact(hybrid_test);
     b.step("test-hybrid", "Run M6 hybrid GPU (GDN, QSA, 4-branch GR) parity tests").dependOn(&run_hybrid_test.step);
 
