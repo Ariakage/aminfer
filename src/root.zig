@@ -23,6 +23,8 @@ pub const tree = @import("spec/tree.zig");
 pub const accept = @import("spec/accept.zig");
 pub const draft = @import("spec/draft.zig");
 pub const engine = @import("spec/engine.zig");
+pub const aio = @import("storage/aio.zig");
+pub const cache = @import("storage/cache.zig");
 
 test {
     _ = metal;
@@ -47,4 +49,6 @@ test {
     _ = accept;
     _ = draft;
     _ = engine;
+    _ = aio;
+    _ = cache;
 }
