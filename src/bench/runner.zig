@@ -3487,31 +3487,6 @@ pub fn runRealA2Eval(
     const needed_seq: u32 = @intCast(prompt_ids.len + opts.capture_steps + 32);
     const max_seq_len: u32 = @min(cfg.max_position_embeddings, @max(opts.max_seq_len, needed_seq));
 
-    var model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
-        .max_seq_len = max_seq_len,
-        .verify_crcs = opts.verify_crcs,
-    });
-    defer model.deinit(allocator);
-
-    const vm_before = try vmstat.Snapshot.capture();
-
-    // Prefill prompt tokens `0..len-1`.
-    var pos: u32 = 0;
-    for (prompt_ids[0 .. prompt_ids.len - 1]) |pid| {
-        try model.prefillToken(pid, pos);
-        pos += 1;
-    }
-
-    // Measure true GPU per-layer decode latency at current KV position (`prefillToken` = body only).
-    for (0..2) |_| try model.prefillToken(prompt_ids[prompt_ids.len - 1], pos);
-    const gl_t0 = try vmstat.nowNs();
-    const body_iters: u32 = 6;
-    for (0..body_iters) |_| try model.prefillToken(prompt_ids[prompt_ids.len - 1], pos);
-    const gl_t1 = try vmstat.nowNs();
-    const measured_gpu_layer_us: f64 = (@as(f64, @floatFromInt(gl_t1 -| gl_t0)) /
-        (@as(f64, @floatFromInt(body_iters)) * @as(f64, @floatFromInt(cfg.num_hidden_layers)))) / 1000.0;
-
-    // Capture real post-attention residual hidden states and exact GPU top-K routing across `capture_steps`.
     const n_layers: usize = cfg.num_hidden_layers;
     const h: usize = cfg.hidden_size;
     const top_k: usize = cfg.num_experts_per_tok;
@@ -3523,62 +3498,147 @@ pub fn runRealA2Eval(
     const topk_trace = try allocator.alloc(u32, steps * n_layers * top_k);
     defer allocator.free(topk_trace);
 
-    var cur_tok = prompt_ids[prompt_ids.len - 1];
-    for (0..steps) |s_idx| {
-        const h_dst = hidden_trace[s_idx * n_layers * h .. (s_idx + 1) * n_layers * h];
-        const k_dst = topk_trace[s_idx * n_layers * top_k .. (s_idx + 1) * n_layers * top_k];
-        cur_tok = try model.stepDecodeCaptureLayerRouting(cur_tok, pos, h_dst, k_dst);
-        pos += 1;
-    }
-
-    // Build in-memory folded-LayerNorm ANE expert predictor (`M = 1` decode shape).
-    var inmem_pred = try model.buildAnePredictor(allocator, max_la, 1, false, true, null);
-    defer inmem_pred.deinit(allocator);
-
-    // Optional offline W7 `.mlpackage` predictor (`M = 32` exported batch shape).
-    var offline_pred: ?*predictor_mod.AneExpertPredictor = null;
-    defer if (offline_pred) |p| p.deinit(allocator);
-    if (opts.ane_predictor_path) |p| {
-        offline_pred = try model.buildAnePredictor(allocator, max_la, 32, false, false, p);
-    }
-
     var deltas: [predictor_mod.MAX_LOOKAHEAD]RealA2DeltaMetrics = @splat(.{});
     for (0..max_la) |di| deltas[di].delta = @intCast(di + 1);
-
-    var bitsets: [predictor_mod.MAX_LOOKAHEAD]tree_mod.ExpertBitset = undefined;
-    var prefetches: [32]predictor_mod.PrefetchCandidate = undefined;
-    var logits_buf: [predictor_mod.MAX_EXPERTS]f32 = undefined;
 
     var gpu_logits_storage: [predictor_mod.MAX_LOOKAHEAD][predictor_mod.MAX_EXPERTS]f32 = undefined;
     var gpu_logits_slices: [predictor_mod.MAX_LOOKAHEAD][]f32 = undefined;
     for (0..max_la) |di| gpu_logits_slices[di] = gpu_logits_storage[di][0..n_exp];
 
-    var inmem_zc = true;
-    var offline_zc = true;
+    var measured_gpu_layer_us: f64 = 0.0;
     var gpu_lookahead_ns_sum: u64 = 0;
     var gpu_lookahead_full_calls: u64 = 0;
+    var routers: [][]f16 = &.{};
+    defer {
+        for (routers) |r| allocator.free(r);
+        allocator.free(routers);
+    }
+
+    var swapouts_total: u64 = 0;
+    var pageouts_total: u64 = 0;
+
+    // Phase 1: load target checkpoint, capture real hidden states & top-K routing,
+    // benchmark GPU lookahead baseline, extract folded router weights (~24 MiB),
+    // then release the multi-GiB target weights before CoreML ANE compilation.
+    {
+        var model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
+            .max_seq_len = max_seq_len,
+            .verify_crcs = opts.verify_crcs,
+        });
+        defer model.deinit(allocator);
+
+        const vm_gpu_before = try vmstat.Snapshot.capture();
+
+        var pos: u32 = 0;
+        for (prompt_ids[0 .. prompt_ids.len - 1]) |pid| {
+            try model.prefillToken(pid, pos);
+            pos += 1;
+        }
+
+        // Measure true GPU per-layer decode latency at current KV position (`prefillToken` = body only).
+        for (0..2) |_| try model.prefillToken(prompt_ids[prompt_ids.len - 1], pos);
+        const gl_t0 = try vmstat.nowNs();
+        const body_iters: u32 = 6;
+        for (0..body_iters) |_| try model.prefillToken(prompt_ids[prompt_ids.len - 1], pos);
+        const gl_t1 = try vmstat.nowNs();
+        measured_gpu_layer_us = (@as(f64, @floatFromInt(gl_t1 -| gl_t0)) /
+            (@as(f64, @floatFromInt(body_iters)) * @as(f64, @floatFromInt(cfg.num_hidden_layers)))) / 1000.0;
+
+        var cur_tok = prompt_ids[prompt_ids.len - 1];
+        for (0..steps) |s_idx| {
+            const h_dst = hidden_trace[s_idx * n_layers * h .. (s_idx + 1) * n_layers * h];
+            const k_dst = topk_trace[s_idx * n_layers * top_k .. (s_idx + 1) * n_layers * top_k];
+            cur_tok = try model.stepDecodeCaptureLayerRouting(cur_tok, pos, h_dst, k_dst);
+            pos += 1;
+        }
+
+        for (0..steps) |s_idx| {
+            for (0..n_layers - 1) |cur_l| {
+                const x_cur = hidden_trace[(s_idx * n_layers + cur_l) * h ..][0..h];
+                const pred_layers: u32 = @min(max_la, @as(u32, @intCast(n_layers - 1 - cur_l)));
+                const gpu_ns = try model.evalGpuRouterLookahead(x_cur, @intCast(cur_l), max_la, gpu_logits_slices[0..pred_layers]);
+                if (pred_layers == max_la) {
+                    gpu_lookahead_ns_sum += gpu_ns;
+                    gpu_lookahead_full_calls += 1;
+                }
+                for (0..pred_layers) |di| {
+                    const target_l = cur_l + 1 + di;
+                    const gt_topk = topk_trace[(s_idx * n_layers + target_l) * top_k ..][0..top_k];
+                    deltas[di].gpu_baseline_r8 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 8);
+                    deltas[di].gpu_baseline_r12 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 12);
+                    deltas[di].gpu_baseline_r16 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 16);
+                    deltas[di].samples += 1;
+                }
+            }
+        }
+
+        routers = try model.extractRouterWeightsF16(allocator, true);
+
+        const vm_gpu_after = try vmstat.Snapshot.capture();
+        try vmstat.checkNoSwap(vm_gpu_before, vm_gpu_after);
+        swapouts_total += vmstat.Snapshot.swapoutDelta(vm_gpu_before, vm_gpu_after);
+        pageouts_total += vmstat.Snapshot.pageoutDelta(vm_gpu_before, vm_gpu_after);
+    }
+
+    // Phase 2: compile & evaluate in-memory folded ANE predictor + optional W7 `.mlpackage`
+    // with full host RAM headroom freed.
+    const device = try metal.Device.open();
+    defer device.close();
+
+    const ro_slices = try allocator.alloc([]const f16, routers.len);
+    defer allocator.free(ro_slices);
+    for (routers, 0..) |r, i| ro_slices[i] = r;
+
+    const inmem_pcfg: predictor_mod.PredictorConfig = .{
+        .num_layers = cfg.num_hidden_layers,
+        .num_experts = cfg.num_experts,
+        .hidden_size = cfg.hidden_size,
+        .lookahead_layers = max_la,
+        .max_tokens = 1,
+        .top_k = cfg.num_experts_per_tok,
+        .compute_units = .cpu_and_neural_engine,
+        .enable_async_thread = false,
+    };
+    var inmem_pred = try predictor_mod.AneExpertPredictor.initFromRouterWeights(allocator, device, inmem_pcfg, ro_slices);
+    defer inmem_pred.deinit(allocator);
+
+    var offline_pred: ?*predictor_mod.AneExpertPredictor = null;
+    defer if (offline_pred) |p| p.deinit(allocator);
+    if (opts.ane_predictor_path) |p| {
+        const off_pcfg: predictor_mod.PredictorConfig = .{
+            .num_layers = cfg.num_hidden_layers,
+            .num_experts = cfg.num_experts,
+            .hidden_size = cfg.hidden_size,
+            .lookahead_layers = max_la,
+            .max_tokens = 32,
+            .top_k = cfg.num_experts_per_tok,
+            .compute_units = .cpu_and_neural_engine,
+            .enable_async_thread = false,
+        };
+        offline_pred = try predictor_mod.AneExpertPredictor.loadAllLayersFromPath(allocator, device, off_pcfg, p);
+    }
+
+    const vm_ane_before = try vmstat.Snapshot.capture();
+
+    var bitsets: [predictor_mod.MAX_LOOKAHEAD]tree_mod.ExpertBitset = undefined;
+    var prefetches: [32]predictor_mod.PrefetchCandidate = undefined;
+    var logits_buf: [predictor_mod.MAX_EXPERTS]f32 = undefined;
+
+    var inmem_zc = true;
+    var offline_zc = true;
 
     for (0..steps) |s_idx| {
         for (0..n_layers - 1) |cur_l| {
             const x_cur = hidden_trace[(s_idx * n_layers + cur_l) * h ..][0..h];
 
-            // 1) In-memory folded ANE predictor.
             try inmem_pred.writeInputHiddenF16(x_cur, 1);
             const pr_in = try inmem_pred.predictAhead(@intCast(cur_l), 1, 16, null, &bitsets, &prefetches);
             inmem_zc = inmem_zc and pr_in.all_outputs_zero_copy;
 
-            // 2) Optional offline W7 `.mlpackage` predictor.
             if (offline_pred) |op| {
                 try op.writeInputHiddenF16(x_cur, 1);
                 const pr_off = try op.predictAhead(@intCast(cur_l), 1, 16, null, &bitsets, &prefetches);
                 offline_zc = offline_zc and pr_off.all_outputs_zero_copy;
-            }
-
-            // 3) GPU router lookahead baseline.
-            const gpu_ns = try model.evalGpuRouterLookahead(x_cur, @intCast(cur_l), max_la, gpu_logits_slices[0..pr_in.predicted_layers]);
-            if (pr_in.predicted_layers == max_la) {
-                gpu_lookahead_ns_sum += gpu_ns;
-                gpu_lookahead_full_calls += 1;
             }
 
             for (0..pr_in.predicted_layers) |di| {
@@ -3596,11 +3656,6 @@ pub fn runRealA2Eval(
                     deltas[di].ane_offline_r12 += predictor_mod.computeRecallAtK(logits_buf[0..n_exp], gt_topk, 12);
                     deltas[di].ane_offline_r16 += predictor_mod.computeRecallAtK(logits_buf[0..n_exp], gt_topk, 16);
                 }
-
-                deltas[di].gpu_baseline_r8 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 8);
-                deltas[di].gpu_baseline_r12 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 12);
-                deltas[di].gpu_baseline_r16 += predictor_mod.computeRecallAtK(gpu_logits_slices[di], gt_topk, 16);
-                deltas[di].samples += 1;
             }
         }
     }
@@ -3636,8 +3691,10 @@ pub fn runRealA2Eval(
         offline_ane_us = (@as(f64, @floatFromInt(ot1 -| ot0)) / @as(f64, @floatFromInt(opts.timed_iters))) / 1000.0;
     }
 
-    const vm_after = try vmstat.Snapshot.capture();
-    try vmstat.checkNoSwap(vm_before, vm_after);
+    const vm_ane_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_ane_before, vm_ane_after);
+    swapouts_total += vmstat.Snapshot.swapoutDelta(vm_ane_before, vm_ane_after);
+    pageouts_total += vmstat.Snapshot.pageoutDelta(vm_ane_before, vm_ane_after);
 
     const gpu_la_us = if (gpu_lookahead_full_calls > 0)
         (@as(f64, @floatFromInt(gpu_lookahead_ns_sum)) / @as(f64, @floatFromInt(gpu_lookahead_full_calls))) / 1000.0
@@ -3663,8 +3720,8 @@ pub fn runRealA2Eval(
         .offline_zero_copy = offline_zc,
         .gpu_lookahead_us = gpu_la_us,
         .deltas = deltas,
-        .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
-        .pageouts_delta = vmstat.Snapshot.pageoutDelta(vm_before, vm_after),
+        .swapouts_delta = swapouts_total,
+        .pageouts_delta = pageouts_total,
     };
 }
 
