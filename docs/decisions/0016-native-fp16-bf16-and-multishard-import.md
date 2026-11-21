@@ -161,11 +161,19 @@ Schedule **Milestone M2.5** immediately before M3 with the following design:
 
 ## Open items
 
-- For Qwen3 checkpoints (`Qwen3-0.6B` BF16, `Qwen3-14B-4bit`,
-  `Qwen3-30B-A3B-3bit`), keeping the inter-layer residual stream in `f16` and
-  `KvTile` in `RGBA16Float` was verified lossless and coherent end-to-end;
-  revisit an optional `bf16` activation buffer mode in M6/M7 only if a future
-  architecture without QK-Norm exhibits massive activations approaching or
-  exceeding `±65,504` (cf. Sun et al., *Massive Activations in Large Language
-  Models*, `arXiv:2402.17762`, and the recommendation in
-  [open-decisions-research.md](../architecture/open-decisions-research.md#adr-0016-open-item-bf16-vs-f16-inter-layer-residual-stream)).
+- **Confirmed inter-layer residual stream policy (resolved 2026-11-21):**
+  - Keep `f16` inter-layer residual buffers as the default for QK-Norm
+    architectures (`Qwen3` dense and MoE, verified lossless and coherent across
+    M2.5–M3).
+  - Support an **opt-in native `bf16` trunk residual stream mode** on Metal 4
+    (`bfloat4`) and M4.5 CPU SME2 (`bfmopa`,
+    [ADR-0018](0018-bare-metal-armv9-sme2-engine.md)) for architectures without
+    QK-Norm or with high RMSNorm gains susceptible to massive activations
+    exceeding `±65,504` (Sun et al., *Massive Activations in Large Language
+    Models*, `arXiv:2402.17762`; see
+    [open-decisions-research.md](../architecture/open-decisions-research.md#adr-0016-open-item-bf16-vs-f16-inter-layer-residual-stream)).
+  - **Zero-copy IOSurface precision boundary
+    ([ADR-0004](0004-kv-cache-iosurface-texture-sharing.md)):** even when trunk
+    residuals execute in `bf16`, `fp32` accumulators narrow zero-copy to `fp16`
+    (`half4`) strictly at `RGBA16Float` IOSurface `KvTile` and CoreML ANE
+    boundaries, where post-norm / post-RoPE vectors are magnitude-bounded.

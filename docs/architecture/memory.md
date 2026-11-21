@@ -95,13 +95,28 @@ Settled tile layout (confirmed in Spike S1, raw measurements in
 - Kernels reach arbitrarily many resident chunks (up to 32K+ context) through a
   bindless `KvTilePair` (`{k_tex_id, v_tex_id}`) buffer in `WiredArena` paired
   with `MTLResidencySet` registration (`makeTilesResident`).
-- Still undecided: int8 tiles (`OneComponent8`, status row R5).
-- Unquantized `BF16` models (confirmed for M2.5,
+- **Confirmed `R5` policy (2026-11-21):** `OneComponent8` `int8` IOSurface KV
+  tiles are declined for ANE↔GPU sharing (CoreML zero-copy pixel buffers require
+  `OneComponent16Half`, and unscaled 8-bit texels lose outlier fidelity; see
+  [ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md) and
+  [open-decisions-research.md](open-decisions-research.md#r5-int8-kv-tiles-onecomponent8)).
+  Active `KvTile`s stay in `OneComponent16Half` / `RGBA16Float` (including M6
+  hybrid pools pairing `512`-token full-attention tiles with `128`-token circular
+  sliding-window tiles), with retired history chunks compressed GPU-side into
+  group-64 `q8` `MTLBuffer` blocks only when 32K+ context budgets require it.
+- Unquantized `BF16` models (implemented in M2.5,
   [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)) keep
-  `KvTile` in `OneComponent16Half` / `RGBA16Float`: neither `MTLPixelFormat` nor
+  `KvTile` in `OneComponent16Half` / `RGBA16Float` (with `f16` trunk residuals
+  by default for QK-Norm models and an opt-in native `bf16` trunk residual mode
+  for non-QK-Norm architectures that narrows zero-copy `fp32 → fp16` strictly at
+  `RGBA16Float` IOSurface KV and ANE boundaries): neither `MTLPixelFormat` nor
   CoreML's zero-copy `MLMultiArray(pixelBuffer:shape:)` offers a `BF16`
   IOSurface format, and post-QK-Norm / post-RoPE K/V vectors fit comfortably in
   IEEE `fp16` range.
+- **Single-owner weight layout ([ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md)):**
+  any tensor or routed expert resides in memory in strictly one layout
+  (`row_major` for Metal GPU OR `sme2_panel64` for CPU SME2), never duplicated
+  in both formats inside the wired budget.
 
 ## Budget estimates
 

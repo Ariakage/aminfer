@@ -24,8 +24,18 @@ GPU bandwidth alone. Two facts contradict that premise:
    latency (draft + hand-offs + verification), and the measurement is recorded
    in `docs/process.md`.
 3. The independent same-family small draft model, PEARL-style pipelined
-   drafting and expert prediction are always placed on the ANE.
-4. The scheduler budgets DRAM bytes across ANE and GPU traffic.
+   drafting and expert prediction are placed according to measured round
+   latency and unified-DRAM contention:
+   - **Confirmed `D8` pipelined small-draft gate (2026-11-21):** Because Spike
+     `S4` measured `574.64 us` ANE round-trip handoff and `30.8%–32.5%` unified
+     DRAM bandwidth contention, PEARL-style ([arXiv:2408.11850](https://arxiv.org/abs/2408.11850))
+     overlapped round `r + 1` drafting with an independent small draft model
+     (`D4`, e.g. `Qwen3-0.6B`) is enabled selectively when target verification
+     latency is long enough to amortize handoff and contention (such as dense
+     `Qwen3-14B` at `~95 ms/step`), whereas fast MoE targets paired with
+     in-command-buffer EAGLE-3 (`~19 ms/step`) stay un-pipelined on the GPU.
+4. The scheduler budgets DRAM bytes across ANE, CPU SME2
+   ([ADR-0018](0018-bare-metal-armv9-sme2-engine.md)), and GPU traffic.
 
 ## Consequences
 
@@ -56,7 +66,7 @@ GPU bandwidth alone. Two facts contradict that premise:
 
 - Spike S4: **closed in M3** (recorded in
   [../benchmarks/results.md](../benchmarks/results.md#m3-speculative-decoding-and-spikes-s4--s5)).
-- Pipelined-drafting design for the small draft model (status row D8; see
-  *PEARL* [arXiv:2408.11850](https://arxiv.org/abs/2408.11850), *P-EAGLE*
-  [arXiv:2602.01469](https://arxiv.org/abs/2602.01469), and Spike S4 contention
-  analysis in [open-decisions-research.md](../architecture/open-decisions-research.md#remaining-m3m5-open-tuning-items-adr-0017-d8-adr-0005)).
+- `D8` pipelined small-draft latency gate **confirmed on 2026-11-21** for M5
+  implementation (measured end-to-end gain on `Qwen3-14B + Qwen3-0.6B` tracked
+  in [../status.md](../status.md) and
+  [open-decisions-research.md](../architecture/open-decisions-research.md#remaining-m3m5-open-tuning-items-adr-0017-d8-adr-0005)).

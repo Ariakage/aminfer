@@ -5,12 +5,24 @@
 ## Request lifecycle
 
 1. The kqueue-based server accepts a request and streams results back as
-   Server-Sent Events. The external API shape (for example an
-   OpenAI-compatible endpoint) is undecided (status row C8; comparison of
-   `/v1/chat/completions`, `reasoning_content`, stateless `/v1/responses`, and
-   `/v1/messages` in
-   [open-decisions-research.md](open-decisions-research.md#c8-kqueue-http--sse-server-api-shape)).
-2. A native Zig tokenizer turns text into token ids (status row W5, Draft).
+   Server-Sent Events (**confirmed `C8` API contract, 2026-11-21**, status
+   tracked in [../status.md](../status.md)):
+   - Core stateless endpoints: **`POST /v1/chat/completions`** (OpenAI-compatible
+     SSE `chat.completion.chunk`, `<think>...</think>` separated into
+     `choices[0].delta.reasoning_content` / `message.reasoning_content`, optional
+     `"seed"` u64 field with `seed_used` echoed in response metadata),
+     **`GET /v1/models`**, and **`GET /health`**.
+   - Optional thin stateless protocol adapters for `POST /v1/responses` and
+     `POST /v1/messages` share the same zero-allocation `kqueue` SSE token
+     emitter without server-side session storage, maximizing L1 suffix-automaton
+     prefix hits (`D1`; rationale in
+     [open-decisions-research.md](open-decisions-research.md#c8-kqueue-http--sse-server-api-shape)).
+   - On request admission, when `temperature > 0` and `"seed"` is omitted, one
+     64-bit seed is drawn from Apple Silicon's Secure Enclave TRNG-backed kernel
+     CSPRNG (`getentropy`) to initialize that request slot's dedicated 32-byte
+     `std.Random.Xoshiro256` PRNG (`D11`,
+     [speculative-decoding.md](speculative-decoding.md#sampling-rng-and-hardware-entropy-seeding)).
+2. A native Zig tokenizer turns text into token ids (status row W5).
    No Python runs at any point.
 3. Prefill builds the KV cache: the hybrid wavefront prefill for prompts longer
    than 512 tokens, the GPU-only prefill otherwise.
@@ -88,10 +100,15 @@ One round:
 - **Overlappable work.** L1 queries and updates, expert prediction for the next
   tree, NVMe prefetch, SSE emission and detokenization run alongside GPU
   verification.
-- **Pipelined drafting.** The independent small draft model does not need
-  target features, so the ANE can draft round r + 1 from the most likely
-  outcome of round r while the GPU verifies (PEARL-style); a wrong guess is
-  discarded (status row D8).
+- **Pipelined drafting (`D8`, confirmed 2026-11-21).** The independent small
+  draft model does not need target features, so round `r + 1` can be drafted
+  from the most likely outcome of round `r` while the GPU verifies (PEARL-style;
+  a wrong guess is discarded). Per
+  [ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md), overlapped
+  small-draft pipelining is enabled selectively when target verification latency
+  is long enough to amortize `~575 us` ANE handoff and unified-DRAM contention
+  (for example dense `Qwen3-14B` at `~95 ms/step`), leaving fast MoE targets
+  with in-command-buffer EAGLE-3 (`~19 ms/step`) un-pipelined.
 - **Placement gate.** EAGLE / MTP heads on the GPU avoid extra
   synchronization; on the ANE they cost two GPU → CPU → ANE hand-offs per
   round. The default is chosen per model and chip from measured round latency
@@ -102,9 +119,10 @@ One round:
 | Thread | Count | QoS | Role |
 | --- | --- | --- | --- |
 | Scheduler | 1 | `USER_INTERACTIVE` | Round orchestration, tree merging and pruning, GPU submission |
+| SME2 workers (M4.5) | 1–N (per P-cluster) | `USER_INTERACTIVE` | Lock-free P-cluster-aware ARMv9 SME2 pre-packed & `ZT0`-LUT microkernels ([ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md)) |
 | L1 | 1 | `USER_INTERACTIVE` | Suffix automaton queries and updates |
 | ANE driver | 1 | `USER_INITIATED` | CoreML predictions (draft, attention blocks, expert prediction) |
-| I/O | 1–N | `UTILITY` + `IOPOL_IMPORTANT` (Draft) | `aio_read` submission and `kqueue` completion; `pread` workers as fallback |
+| I/O | 1–N | `UTILITY` + `IOPOL_IMPORTANT` | `aio_read` submission and `kqueue` completion; `pread` workers as fallback |
 | Server | 1 | `USER_INITIATED` | kqueue HTTP / SSE |
 
 Threads exchange work through preallocated lock-free SPSC / MPSC rings (status

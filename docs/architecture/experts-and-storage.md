@@ -55,14 +55,20 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
   zero-padded to a 16 KiB multiple: 48-byte name, `TensorKind`, `DType`
   (implemented in M1: `f16`, `f32`, `q4_affine`, `q3_affine`; M2.5:
   `bf16 = 4` per [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md);
-  Confirmed / Optional Pipeline for M4/M5: additive `QuantScheme` variants
-  `q2_affine`, `q6_affine`, `q8_affine` per
+  Confirmed / Optional Pipeline for M5: locked initial `QuantScheme` tier
+  `{q2_affine, q3_affine, q4_affine, bf16, f16}` per
   [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md)),
   bit-width, rank, group size (`64` for affine quantized tensors, `0` for
-  unquantized tensors), layer and expert indices, blob CRC-32, 4-element shape,
-  16 KiB-aligned `blob_offset` and `blob_bytes`, `data_bytes`, 64 B-aligned
-  `params_offset`, and `params_bytes`. Together, `dtype`, `quant_bits`, and
-  `group_size` form each block's static, immutable `QuantScheme` tag.
+  unquantized tensors), layer and expert indices, `reserved0: u16` encoding
+  single-owner `TensorLayout` (`0 = row_major` for Metal GPU, `1 = sme2_panel64`
+  for M4.5 CPU SME2 per
+  [ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md)) in the low byte
+  and `QuantParamKind` (`0 = mlx_affine_scale_bias`, `1 = zt0_lut16_bf16`,
+  `2 = zt0_lut4_bf16`) in the high byte (preserving `reserved0 == 0` across all
+  existing `.amf` v0 files), blob CRC-32, 4-element shape, 16 KiB-aligned
+  `blob_offset` and `blob_bytes`, `data_bytes`, 64 B-aligned `params_offset`,
+  and `params_bytes`. Together, `dtype`, `quant_bits`, `group_size`, and
+  `reserved0` form each block's static, immutable `QuantScheme` and layout tag.
 - **Blobs** — each starts on a 16 KiB boundary and is zero-padded to a
   16 KiB multiple. For quantized 2D matrices (`[N, K]`, `K % 64 == 0`), bytes
   `[0..data_bytes)` hold MLX-compatible LSB-first packed weights (4-bit: 2
@@ -106,10 +112,14 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
   or dynamic sensitivity scoring enters the Zig runtime
   ([ADR-0001](../decisions/0001-language-and-toolchain-boundaries.md)).
 - **Immutable block-level `QuantScheme` in `.amf`**: each tensor or routed
-  expert blob carries its static `QuantScheme` (`q2_affine`, `q3_affine`,
-  `q4_affine`, `q6_affine`, `q8_affine`, `f16`, `bf16` with fixed compile-time
-  `group_size`) in its 128-byte `TensorEntry`, leaving 16 KiB page alignment,
-  64 B `params_offset` alignment, and CRC-32 IEEE validation unchanged.
+  expert blob carries its static `QuantScheme` (initial M5 `G13` set locked on
+  2026-11-21 to `{q2_affine, q3_affine, q4_affine, bf16, f16}` with fixed
+  compile-time `group_size = 64`; `q6_affine` / `q8_affine` deferred unless
+  benchmark-justified) and single-owner `TensorLayout` (`row_major` vs
+  `sme2_panel64`, [ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md))
+  in its 128-byte `TensorEntry`, leaving 16 KiB page alignment, 64 B
+  `params_offset` alignment, CRC-32 IEEE validation, and existing `reserved0 == 0`
+  `.amf` v0 files 100% binary compatible.
 - **Per-tensor / per-expert granularity only**: every linear projection matrix
   or routed MoE expert (`gate_proj` / `up_proj` / `down_proj`) has strictly one
   uniform `QuantScheme`. Intra-tensor / sub-matrix mixed-bit packing across
@@ -152,6 +162,20 @@ threads issuing blocking `pread` on the same `F_NOCACHE` descriptor (status row
 C4). Spike S3 decides, measuring queue depths 1–16, p50 / p99 latency, CPU
 cost and the effect of QoS and I/O policy
 ([../process.md](../process.md#spikes)).
+
+SSD health and admission guardrails (confirmed 2026-11-21):
+
+- Read-only `F_NOCACHE` cold-expert fetches perform zero NAND writes, and strict
+  wired-budget enforcement (`swapouts_delta == 0`,
+  [ADR-0012](../decisions/0012-wired-memory-budget-headroom.md)) prevents OS swap
+  writes.
+- Even so, sustained cold-expert streaming exposes explicit cumulative telemetry
+  (`cold_bytes_read`, `cold_io_ops`, cache hit rate, and projected read
+  bandwidth / churn) and enforces a configurable speculative-prefetch admission
+  throttle so low-confidence tree branches do not saturate NVMe queues or evict
+  pinned/warm cache slots unnecessarily. When CPU SME2 evaluates a streamed cold
+  expert directly ([ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md)),
+  streaming non-temporal loads (`ldnt1b`) prevent L2 cache pollution.
 
 ## Expert prediction and prefetch
 

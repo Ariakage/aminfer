@@ -83,7 +83,10 @@ t(T) = t_fixed + |T| · c_tok + Σ_layers Σ_{e ∈ U_l(T)} b_e / β
 U_l(T) = ∪_{v ∈ T} E_l(v)
 ```
 
-- E_l(v): predicted experts of node v at layer l (ANE expert prediction).
+- E_l(v): predicted experts of node v at layer l (ANE cross-layer prediction or,
+  for L1 seed/branch and independent `D4` small-draft nodes lacking target
+  hidden states, decoupled token-embedding + target router gate projection per
+  [ADR-0005](../decisions/0005-dual-source-tree-merging.md)).
 - b_e: bytes of expert e, plus an NVMe penalty when it is cold and not yet in a
   slot.
 - β: effective bandwidth of the expert kernel variant used for |T| tokens,
@@ -115,6 +118,32 @@ For dense models U is empty and the rule reduces to a node budget.
 - Tree-width caps are compile-time variants
   ([ADR-0014](../decisions/0014-compile-time-specialization.md)).
 
+## Sampling RNG and hardware entropy seeding
+
+Confirmed on 2026-11-21 (capability row `D11` in [../status.md](../status.md)):
+stochastic decoding (`temperature > 0`) separates hardware entropy acquisition at
+request admission from deterministic, zero-syscall pseudo-random generation on
+the per-token hot path:
+
+- **Request admission (cold path, once per request, `< 0.3 us`).** CLI commands
+  (`decode`, `spec-decode`) and M5 HTTP/SSE request payloads accept an optional
+  seed (`seed: ?u64 = null`):
+  - When `seed == null` and `temperature > 0`, the engine draws one 64-bit
+    initial seed from macOS's **Apple Silicon Secure Enclave Processor (SEP)
+    hardware TRNG-fed kernel CSPRNG** (`getentropy(&seed_bytes, 8)`, checking
+    return codes explicitly with zero `catch {}`).
+  - When `seed != null`, the caller-supplied 64-bit seed is used directly for
+    bit-exact reproducibility.
+  - Both CLI metrics and SSE response metadata echo `seed_used` so any
+    stochastic completion can be replayed identically. Greedy runs (`T = 0`),
+    `bench-*` suites, and unit tests always use explicit deterministic seeds.
+- **Per-token / per-round hot path (`~1.2 ns/step`).** The 64-bit seed
+  initializes a 32-byte `std.Random.Xoshiro256` (`DefaultPrng`) state
+  preallocated inside the owning request slot. Recursive rejection sampling
+  (`verifyStochastic`) and bonus-token categorical sampling advance only that
+  slot-local state—incurring **zero syscalls, zero global locks, zero
+  cross-request stream interference, and zero dynamic heap allocation**.
+
 ## Calibration and metrics
 
 - Calibrated per chip at startup or offline: β per expert-kernel variant,
@@ -125,8 +154,8 @@ For dense models U is empty and the rule reduces to a node budget.
 
 ## Open questions
 
-- Should the seed threshold adapt to recent acceptance instead of the fixed
-  4-token rule?
-- What tree shape suits MTP heads?
-- Is the target router applied to draft features accurate enough to stand in
-  for a learned ANE expert predictor?
+- Post-M5 ablation of adaptive L1 seed thresholds once persistent NVMe N-gram
+  tables (`C6`) land (`SEED_MIN_MATCH_LEN = 4` stays fixed through M4/M4.5 per
+  [ADR-0005](../decisions/0005-dual-source-tree-merging.md)).
+- Optimal tree shape for multi-depth MTP heads on Tier 2 models (`Qwen3.8-Flash-Next`
+  4B MTP in M6).

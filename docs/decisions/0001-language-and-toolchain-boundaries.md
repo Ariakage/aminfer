@@ -38,12 +38,23 @@ into the hot path.
    commands (`sysctl`, `uv`, `powermetrics`).
 8. **No third-party C or Zig dependencies without user approval**; prefer Zig
    `std` and native macOS APIs.
+9. **Scoped ARMv9.2 SME2 assembly microkernels (`src/cpu/*.s`,
+   [ADR-0018](0018-bare-metal-armv9-sme2-engine.md)).** Because `b.addTranslateC`
+   cannot translate `<arm_sme.h>` sizeless SVE types or `__arm_streaming` / `za` /
+   `zt0` ACLE attributes, innermost Apple M4+ SME2 matrix and `ZT0`-LUT loops
+   live in standalone `.s` files assembled directly by `build.zig`
+   (`mod.addAssemblyFile` with file-scoped `-march=armv9.2-a+sme2+...`) behind
+   plain C-ABI (`callconv(.c)`) signatures. All outer tiling, pre-packing,
+   cluster scheduling, and `sysctl` `FEAT_SME2` runtime fallback for M1–M3 stay
+   in pure Zig (`src/cpu/sme.zig`), guarded by mandatory `d8–d15` ABI canary and
+   `fp32` parity tests in `zig build test`.
 
 ## Consequences
 
 - Builds require Xcode with the Metal Toolchain component and Zig 0.17.1.
-- Every bridge function is callable from C, testable from Zig, and free of
-  Objective-C exceptions crossing the boundary.
+- Every bridge function and `.s` microkernel entrypoint is callable via plain C
+  ABI, testable from Zig, and free of Objective-C exceptions or ABI clobbers
+  crossing the boundary.
 - An embedded metallib keeps tests and the CLI independent of install paths.
 
 ## Evidence

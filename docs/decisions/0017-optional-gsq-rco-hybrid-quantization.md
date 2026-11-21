@@ -89,17 +89,35 @@ invariants:
 
    | `QuantScheme` | Bit-width | Group size | Packed bytes / group-64 | Effective bits / weight | Status (see [../status.md](../status.md)) |
    | --- | --- | --- | --- | --- | --- |
-   | `q2_affine` | 2-bit | 64 (compile-time) | 16 B + 4 B `half2` | 2.50 | Confirmed (`W14` / `G13`) |
+   | `q2_affine` | 2-bit | 64 (compile-time) | 16 B + 4 B `half2` (or inline `ZT0` LUT) | 2.50 | Confirmed initial M5 tier (`W14` / `G13`) |
    | `q3_affine` | 3-bit | 64 (compile-time) | 24 B + 4 B `half2` | 3.50 | Implemented (`W1` / `G1`) |
-   | `q4_affine` | 4-bit | 64 (compile-time) | 32 B + 4 B `half2` | 4.50 | Implemented (`W1` / `G1`) |
-   | `q6_affine` | 6-bit | 64 (compile-time) | 48 B + 4 B `half2` | 6.50 | Confirmed (`W14` / `G13`) |
-   | `q8_affine` | 8-bit | 64 (compile-time) | 64 B + 4 B `half2` | 8.50 | Confirmed (`W14` / `G13`) |
+   | `q4_affine` | 4-bit | 64 (compile-time) | 32 B + 4 B `half2` (or inline `ZT0` LUT) | 4.50 | Implemented (`W1` / `G1`) |
+   | `q6_affine` | 6-bit | 64 (compile-time) | 48 B + 4 B `half2` | 6.50 | Deferred post-M5 unless benchmark-justified |
+   | `q8_affine` | 8-bit | 64 (compile-time) | 64 B + 4 B `half2` | 8.50 | Deferred post-M5 unless benchmark-justified |
    | `f16` | 16-bit | 0 (unquantized) | — | 16.00 | Implemented (`W1` / `G12`) |
    | `bf16` | 16-bit | 0 (unquantized) | — | 16.00 | Implemented (`W12` / `G12`) |
 
-   - All affine schemes reuse the MLX-compatible LSB-first packed group layout
-     followed at `params_offset` by interleaved `half2(scale, bias)` (`w = q *
-     scale + bias`) so GPU kernels read blobs directly without repacking.
+   - **Confirmed initial M5 scheme tier (`2026-11-21`):** M5 `G13` locks the
+     active scheme set to **`{q2_affine, q3_affine, q4_affine, bf16, f16}`**,
+     bounding MoE CSR dispatch to `<= 3` quantized buckets per layer; `q6_affine`
+     and `q8_affine` stay deferred unless side-by-side benchmarks in
+     [../benchmarks/results.md](../benchmarks/results.md) show an accuracy gap.
+   - **100% binary-compatible `TensorEntry.reserved0` layout & codebook tags
+     ([ADR-0018](0018-bare-metal-armv9-sme2-engine.md)):** the zero-initialized
+     `reserved0: u16` field (byte offset 58 of the fixed 128-byte `TensorEntry`
+     in `src/format/amf.zig`) encodes:
+     - low byte (`reserved0 & 0xFF`): single-owner `TensorLayout` (`0 =
+       row_major` for Metal GPU, `1 = sme2_panel64` for M4.5 CPU SME2);
+     - high byte (`reserved0 >> 8`): `QuantParamKind` (`0 =
+       mlx_affine_scale_bias` `half2(scale, bias)`, `1 = zt0_lut16_bf16`
+       16-entry `ZT0` codebook for `luti4`, `2 = zt0_lut4_bf16` 4-entry `ZT0`
+       codebook for `luti2`).
+     Existing `.amf` v0 checkpoints already store `reserved0 == 0` (`row_major` +
+     `mlx_affine_scale_bias`) and remain 100% valid without repacking.
+   - All GPU `row_major` affine schemes reuse the MLX-compatible LSB-first
+     packed group layout followed at `params_offset` by interleaved
+     `half2(scale, bias)` (`w = q * scale + bias`) so GPU kernels read blobs
+     directly without repacking.
 
 3. **Strict per-tensor / per-layer-projection / per-MoE-expert granularity —
    intra-tensor mixing is forbidden (`G13`).**
@@ -202,12 +220,11 @@ breaking format or runtime redesign:
 
 - Calibration dataset selection, reproducibility metadata (written as an
   offline companion manifest outside the runtime hot path), and exact GSQ
-  sensitivity / RCO solver formulation in `tools/` (`W14`, M4/M5).
-- Whether the initial M4/M5 `G13` kernel set needs all three new affine widths
-  (`q2_affine`, `q6_affine`, `q8_affine`) or whether `{q2_affine, q3_affine,
-  q4_affine, f16, bf16}` already captures the quality/size Pareto frontier on
-  `Qwen3-30B-A3B` and `Qwen3.8-Flash-Next` (decided by side-by-side baseline
-  benchmarks in [../benchmarks/results.md](../benchmarks/results.md); see also
+  sensitivity / RCO solver formulation in `tools/` (`W14`, M5).
+- Initial M5 `G13` kernel set **locked on 2026-11-21** to
+  `{q2_affine, q3_affine, q4_affine, bf16, f16}` (`q6_affine` / `q8_affine`
+  deferred unless side-by-side baseline benchmarks in
+  [../benchmarks/results.md](../benchmarks/results.md) show a quality gap; see
   [open-decisions-research.md](../architecture/open-decisions-research.md#remaining-m3m5-open-tuning-items-adr-0017-d8-adr-0005)).
 - Measured decode (`M = 1`) and tree-verification (`M = 4..16`) dispatch
   overhead of 2-bucket vs 3-bucket `QuantScheme` CSR MoE execution and

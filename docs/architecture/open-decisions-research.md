@@ -1,36 +1,39 @@
 # Open-decision research and recommendations
 
-> Non-binding technical survey and engineering recommendations for capabilities
-> still marked **Undecided**, **Draft**, or **Open** in [../status.md](../status.md)
-> and the [ADRs](../decisions/README.md). No item listed here is binding until
-> confirmed by the user or closed by its corresponding spike in
+> Technical survey and engineering rationale behind open-question resolutions.
+> Items confirmed by the user on **2026-11-21** have been codified into their
+> governing [ADRs](../decisions/README.md); authoritative capability status
+> always lives in [../status.md](../status.md) and milestone/spike state in
 > [../process.md](../process.md#spikes).
 
 ## Summary matrix
 
-| ID | Open question | Current status | Recommended direction | Key external & local basis |
+| ID | Question | Resolution state | Settled / recommended direction | Governing ADR / reference |
 | --- | --- | --- | --- | --- |
-| `R5` | `int8` KV tiles (`OneComponent8`) | Undecided | Decline `OneComponent8` for ANE↔GPU; keep `OneComponent16Half`; optionally compress older GPU-resident KV in `MTLBuffer` (`q8` group-64 / per-head) | Apple `init(pixelBuffer:shape:)` requires `OneComponent16Half`; KIVI ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)); `mlx-lm` `8-bit g=64` |
-| `C8` | kqueue HTTP/SSE server API shape | Undecided | Required stateless `POST /v1/chat/completions` (with `delta.reasoning_content`) + `GET /v1/models` + `GET /health`; optional stateless wrappers for `/v1/responses` & `/v1/messages` | `vLLM` OpenAI server & `llama-server` (`reasoning_content`, stateless `/v1/responses`, `/v1/messages`) |
-| `A2` | ANE MoE expert predictor architecture | Undecided | Start with `lookahead = 2..3` cross-layer `mlp.gate` weights SRAM-resident (`< 2 MiB`); add tiny bottleneck MLP only if recall falls short | *Fate* ([arXiv:2502.12224](https://arxiv.org/abs/2502.12224)), *ProMoE* ([arXiv:2410.22134](https://arxiv.org/abs/2410.22134)), *Pre-gated MoE* ([arXiv:2308.12066](https://arxiv.org/abs/2308.12066)); Spike S4 (`-30.8%` DRAM contention) |
-| `A3` | Static CoreML ANE shapes for growing KV | Undecided (Spike S6) | Run static `[512, hidden]` QKV + output projections on ANE; run split-KV attention over full growing history on GPU (benchmark vs `EnumeratedShapes` buckets in S6) | `coremltools` `EnumeratedShapes` (`<= 128` shapes) & `Multifunction` guides; G4 GPU `RGBA16Float` at `85.6 GB/s` |
-| `ADR-0016` | Optional `bf16` inter-layer residual buffer | Open | Keep `f16` default for QK-Norm models (`Qwen3`); add opt-in `bf16` residual buffer before onboarding non-QK-Norm families (`Gemma`, `Llama`, `DeepSeek` variants) | *Massive Activations* ([arXiv:2402.17762](https://arxiv.org/abs/2402.17762)); `FP16` `±65,504` overflow; M2.5 `bfloat4` Metal 4 support |
-| `ADR-0017` | Initial `G13` GSQ+RCO affine bit-widths | Open | Launch with `{q2_affine, q3_affine, q4_affine, bf16, f16}` (defer `q6`/`q8` unless benchmarks demand them) | Keep `comptime` kernel variants & CSR bucket dispatch overhead small (`<= 3` active buckets) |
-| `D8` | PEARL-style pipelined small-draft execution | Draft | Enable only when pairing a small draft model (`D4`, `Qwen3-0.6B`) with slow dense targets (`Qwen3-14B` at `~95 ms/step`), not `Qwen3-30B-A3B` (`~19 ms/step`) | *PEARL* ([arXiv:2408.11850](https://arxiv.org/abs/2408.11850)), *P-EAGLE* ([arXiv:2602.01469](https://arxiv.org/abs/2602.01469)); Spike S4 (`574.6 us` ANE handoff) |
-| `ADR-0005` | Adaptive vs fixed 4-token L1 seed threshold | Open | Retain fixed `match_len >= 4` through M4; revisit after M5 NVMe N-gram store (`C6`) lands | Avoids false-positive 1–3 token branches crowding `D7` tree budgets |
+| `R5` | `int8` KV tiles (`OneComponent8`) | **Confirmed (2026-11-21)** | Decline `OneComponent8` for ANE↔GPU; keep `OneComponent16Half` / `RGBA16Float` (incl. M6 `512`+`128` hybrid ring pools); optional GPU-side `q8` `MTLBuffer` compression for retired 32K+ chunks | [ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md), KIVI ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) |
+| `C8` | kqueue HTTP/SSE server API shape | **Confirmed (2026-11-21)** | Stateless `POST /v1/chat/completions` (`delta.reasoning_content`, `seed`/`seed_used`) + `GET /v1/models` + `GET /health`; optional stateless `/v1/responses` & `/v1/messages` | [runtime-pipeline.md](runtime-pipeline.md#request-lifecycle), `vLLM`, `llama-server` |
+| `A2` | ANE MoE expert predictor architecture | Empirical in M4 | `lookahead = 2..3` cross-layer `mlp.gate` weights SRAM-resident (`< 2 MiB`); add bottleneck MLP only if recall falls short | [experts-and-storage.md](experts-and-storage.md#expert-prediction-and-prefetch), *Fate* ([arXiv:2502.12224](https://arxiv.org/abs/2502.12224)) |
+| `A3` | Static CoreML ANE shapes for growing KV | Empirical in M4 (Spike `S6`) | Benchmark static `[512, hidden]` ANE projections + GPU split-KV vs static KV buckets (`512..4096`) in Spike `S6` | [ADR-0010](../decisions/0010-hybrid-wavefront-prefill.md), [../process.md](../process.md#spikes) |
+| `ADR-0016` | Optional `bf16` inter-layer residual buffer | **Confirmed (2026-11-21)** | Keep `f16` default for QK-Norm models (`Qwen3`); add opt-in `bf16` trunk residual on GPU/SME2 for non-QK-Norm backbones, narrowing `fp32 → fp16` strictly at `RGBA16Float` IOSurface boundaries | [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md), [arXiv:2402.17762](https://arxiv.org/abs/2402.17762) |
+| `ADR-0017` | Initial `G13` GSQ+RCO affine bit-widths | **Confirmed (2026-11-21)** | Lock initial M5 `G13` set to `{q2_affine, q3_affine, q4_affine, bf16, f16}` (`<= 3` CSR buckets; `q6`/`q8` deferred); reuse `TensorEntry.reserved0` for binary compatibility | [ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md) |
+| `D8` | PEARL-style pipelined small-draft execution | **Confirmed (2026-11-21)** | Enable selectively on high-latency targets (`Qwen3-14B` at `~95 ms/step`), leaving fast MoE + in-CB EAGLE-3 (`~19 ms/step`) un-pipelined | [ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md), *PEARL* ([arXiv:2408.11850](https://arxiv.org/abs/2408.11850)) |
+| `ADR-0005` | Adaptive vs fixed 4-token L1 seed threshold | **Confirmed (2026-11-21)** | Keep fixed `match_len >= 4` through M4/M4.5; revisit adaptive thresholds after M5 NVMe N-gram store (`C6`) | [ADR-0005](../decisions/0005-dual-source-tree-merging.md) |
+| `ADR-0018` | Bare-metal M4+ ARMv9 SME2 matrix & `ZT0`-LUT engine | **Confirmed (2026-11-21)** | Insert Milestone **M4.5** (`C11`–`C13`, `W15`, Spike `S7`): 90% pure Zig (`src/cpu/sme.zig`) + ~10% 3-way `.s` microkernels (`src/cpu/sme2_kernels.s`), single-owner `sme2_panel64`, `d8–d15` canary & M1–M3 fallback | [ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md), [ADR-0001](../decisions/0001-language-and-toolchain-boundaries.md) |
+| `D11` | Hardware entropy seeding for `T > 0` sampling | **Confirmed (2026-11-21)** | Per-request 64-bit initial seed from Apple Silicon Secure Enclave TRNG (`getentropy` when `seed == null`) feeding slot-local `Xoshiro256` + `seed_used` echo | [speculative-decoding.md](speculative-decoding.md#sampling-rng-and-hardware-entropy-seeding) |
+| `M6.5` (opt.) | Zero-copy multimodal vision ingest | Future / Optional (post-M5) | `VideoToolbox` → `IOSurface` → `MTLTexture` → vision patch projector without CPU `memcpy` | [ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md), [ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md) |
 
 ## Detailed findings
 
 ### `R5`: `int8` KV tiles (`OneComponent8`)
 
-- **Context**: [ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md) tracks `OneComponent8` KV tiles as Undecided (`status.md` `R5`).
+- **Context**: [ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md) originally tracked `OneComponent8` KV tiles as an open question (`status.md` `R5`).
 - **Apple CoreML / CoreVideo / Metal constraints**:
   - Apple's documentation for [`MLMultiArray.init(pixelBuffer:shape:)`](https://developer.apple.com/documentation/coreml/mlmultiarray/init(pixelbuffer:shape:)) explicitly states that float16 zero-copy IOSurface-backed arrays require `kCVPixelFormatType_OneComponent16Half` (`MLMultiArrayDataType.float16`).
   - `kCVPixelFormatType_OneComponent8` stores unsigned 8-bit integer texels (`0..255`), mapped in Metal to `MTLPixelFormatR8Unorm` (`[0.0, 1.0]`) or `MTLPixelFormatR8Uint` / `MTLPixelFormatR8Sint`. Without per-group scales stored alongside the surface, raw 8-bit normalized/integer pixel buffers cannot represent heterogeneous channel outliers accurately on the ANE or GPU.
 - **KV quantization quality evidence**:
   - **KIVI** ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) established that LLM Keys concentrate extreme magnitude outliers along fixed *channel* dimensions while Values concentrate outliers per *token*, requiring separate scaling metadata.
   - **`mlx-lm`** ([ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm)) and **`llama.cpp`** ([ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)) achieve near-lossless 8-bit KV compression (`mlx-lm` `--kv-bits 8 --kv-group-size 64`: mean KL `~0.0002 nats`, `wikitext-2-raw` `ΔPPL ~ +0.005`; `llama.cpp` `q8_0`: `ΔPPL < +0.004`) specifically because both formats store explicit per-block `scale` (and optional `zero`/`bias`) metadata alongside 8-bit payloads rather than bare `OneComponent8` pixels.
-- **Recommendation**: Keep ANE↔GPU zero-copy `KvTile`s strictly on `OneComponent16Half` / `RGBA16Float` (already measured at `85.61 GB/s` in [results.md](../benchmarks/results.md)). If future 32K+ context workloads on 24 GB Macs require 50% KV compression for cold/older GPU-committed chunks, compress retired chunks GPU-side into a group-64 `q8` `MTLBuffer` layout rather than adding `OneComponent8` IOSurface views, reserving radical KV compression (`890 B/tok` FP4) for Tier 3 `R7` ([ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md)).
+- **Confirmed resolution (2026-11-21)**: Decline `OneComponent8` for ANE↔GPU sharing and keep zero-copy `KvTile`s strictly on `OneComponent16Half` / `RGBA16Float` (measured at `85.61 GB/s` in [results.md](../benchmarks/results.md), including M6 `512`-token full + `128`-token sliding-window circular ring pools). If future 32K+ context workloads on 24 GB Macs require 50% KV compression for retired chunks, compress retired chunks GPU-side into a group-64 `q8` `MTLBuffer` layout rather than `OneComponent8` IOSurfaces, reserving radical KV compression (`890 B/tok` FP4) for Tier 3 `R7` ([ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md)).
 
 ### `C8`: kqueue HTTP / SSE server API shape
 
@@ -38,7 +41,7 @@
   - [`vLLM` OpenAI-Compatible Server](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html) and [`llama-server`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) expose `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (Anthropic Messages compatibility), and `/v1/models`.
   - For reasoning models such as `Qwen3` (`<think>...</think>`) and `DeepSeek-R1`, both `vLLM` (`--reasoning-parser`) and `llama-server` (`--reasoning-format`) separate thinking tokens from final assistant text into `message.reasoning_content` (non-streaming) and `choices[0].delta.reasoning_content` (SSE streaming) on `/v1/chat/completions`, and into typed `reasoning` output items on `/v1/responses`.
   - Supporting stateful `previous_response_id` on `/v1/responses` requires server-side conversation persistence, whereas stateless `/v1/chat/completions` passes full message history per turn—directly maximizing prefix hits in aminfer's L1 suffix automaton (`D1`, `0.04 us` lookup).
-- **Recommendation**: Make stateless **`POST /v1/chat/completions`** (SSE `chat.completion.chunk`, tool calls, and `<think>` extraction into `delta.reasoning_content`), **`GET /v1/models`**, and **`GET /health`** the M5 core contract. Optionally expose **`POST /v1/responses`** (stateless request translation without a persistent session database, matching `llama-server`) and **`POST /v1/messages`** as thin parsers over the exact same `kqueue` SSE token emitter.
+- **Confirmed resolution (2026-11-21)**: Make stateless **`POST /v1/chat/completions`** (SSE `chat.completion.chunk`, tool calls, `<think>` extraction into `delta.reasoning_content`, and optional `"seed"` with `seed_used` echo), **`GET /v1/models`**, and **`GET /health`** the M5 core contract ([runtime-pipeline.md](runtime-pipeline.md#request-lifecycle)). Optionally expose **`POST /v1/responses`** (stateless request translation without a persistent session database, matching `llama-server`) and **`POST /v1/messages`** as thin parsers over the exact same `kqueue` SSE token emitter.
 
 ### `A2`: ANE cross-layer MoE expert predictor architecture
 
@@ -60,13 +63,32 @@
 - **Numerical evidence**:
   - *Massive Activations in Large Language Models* ([arXiv:2402.17762](https://arxiv.org/abs/2402.17762)) proved that sparse fixed feature channels emerge in FFN/GLU layers with magnitudes up to `100,000×` typical activations and persist through the residual stream across layers.
   - Because IEEE `FP16` maxes out at `±65,504` (5 exponent bits), architectures lacking per-head QK-Norm or employing high RMSNorm gains (such as `Gemma 2/3` and certain `Llama` / `Qwen2.5` configurations) can overflow to `Inf`/`NaN` when their residual stream runs in `FP16`, whereas `BF16` preserves `FP32`'s `~3.4e38` range (8 exponent bits).
-- **Recommendation**: Keep `f16` activations as the default for QK-Norm architectures (`Qwen3`, already verified end-to-end across M2–M3), and add an opt-in `bf16` residual buffer mode (`bfloat4` supported natively on Metal 4 per [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)) before M6/Tier 2–3 onboarding of architectures without QK-Norm, casting post-norm/RoPE K/V safely to `RGBA16Float` `KvTile`s.
+- **Confirmed resolution (2026-11-21)**: Keep `f16` activations as the default for QK-Norm architectures (`Qwen3`, verified end-to-end across M2–M3), and support an opt-in native `bf16` trunk residual buffer mode (`bfloat4` on Metal 4 per [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md) and `bfmopa` on CPU SME2 per [ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md)) for architectures without QK-Norm, narrowing `fp32 → fp16` zero-copy strictly at `RGBA16Float` IOSurface `KvTile` and CoreML ANE boundaries.
 
 ### Remaining M3–M5 open tuning items (`ADR-0017`, `D8`, `ADR-0005`)
 
-- **`ADR-0017` (`G13` initial scheme set)**: Restrict initial M4/M5 implementation to `{q2_affine, q3_affine, q4_affine, bf16, f16}` (≤ 3 active MoE CSR buckets per layer), matching our existing M1–M2.5 Metal 4 specialization suite while capturing the `Qwen3-30B-A3B` / `Qwen3.8-Flash-Next` size-accuracy frontier.
-- **`D8` (PEARL pipelined small drafting)**: *PEARL* ([arXiv:2408.11850](https://arxiv.org/abs/2408.11850)) and *P-EAGLE* ([arXiv:2602.01469](https://arxiv.org/abs/2602.01469)) reduce draft-target mutual waiting, but M3 Spike S4 measured `~575 us` ANE round-trip handoff and `30.8%` GPU bandwidth contention; therefore apply PEARL-style overlapped ANE small drafting (`D4`) selectively to slower large dense targets (`Qwen3-14B` at `~95 ms/step`), leaving fast MoE + in-CB EAGLE-3 (`~19 ms/step`) un-pipelined.
-- **`ADR-0005` (L1 seed threshold)**: Keep `SEED_MIN_MATCH_LEN = 4` fixed until M5 NVMe N-gram storage (`C6`) provides broader repository context for ablation.
+- **`ADR-0017` (`G13` initial scheme set, confirmed 2026-11-21)**: Lock initial M5 implementation to `{q2_affine, q3_affine, q4_affine, bf16, f16}` (≤ 3 active MoE CSR buckets per layer; `q6`/`q8` deferred unless benchmark-justified), storing single-owner `TensorLayout` and `QuantParamKind` in `TensorEntry.reserved0` so existing `.amf` v0 files stay 100% binary compatible.
+- **`D8` (PEARL pipelined small drafting, confirmed 2026-11-21)**: *PEARL* ([arXiv:2408.11850](https://arxiv.org/abs/2408.11850)) and *P-EAGLE* ([arXiv:2602.01469](https://arxiv.org/abs/2602.01469)) reduce draft-target mutual waiting, while M3 Spike S4 measured `~575 us` ANE round-trip handoff and `30.8%` GPU bandwidth contention; therefore apply PEARL-style overlapped small drafting (`D4`) selectively to slower high-latency targets (`Qwen3-14B` at `~95 ms/step`), leaving fast MoE + in-CB EAGLE-3 (`~19 ms/step`) un-pipelined ([ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md)).
+- **ADR-0005 (L1 seed threshold, confirmed 2026-11-21)**: Keep
+  `SEED_MIN_MATCH_LEN = 4` fixed until M5 NVMe N-gram storage (`C6`) provides
+  broader repository context for ablation.
+- **ADR-0018 & `D11` (confirmed 2026-11-21)**:
+  - Insert Milestone **M4.5** ([ADR-0018](../decisions/0018-bare-metal-armv9-sme2-engine.md))
+    implementing 90% pure Zig (`src/cpu/sme.zig`) + ~10% 3-way ARMv9.2 `.s`
+    microkernels (`src/cpu/sme2_kernels.s`: `M=1..4` multi-vector `ZT0-LUT + Dot`,
+    `M=5..16` `1×4` `ZA`, `M>=32` `2×2` `ZA`) with `ldnt1b` cold-expert streaming,
+    single-owner `sme2_panel64` layout in `TensorEntry.reserved0`, pre-`smstart`
+    `d8–d15` canary verification, and Spike `S7` placement gating.
+  - Adopt Apple Silicon Secure Enclave TRNG (`getentropy`) initial 64-bit
+    per-request seeding (`seed: ?u64 = null`) feeding slot-local `Xoshiro256`
+    PRNGs with `seed_used` echo (`D11`,
+    [speculative-decoding.md](speculative-decoding.md#sampling-rng-and-hardware-entropy-seeding)).
+- **Post-M5 optional multimodal blueprint (`M6.5`, future / non-binding)**:
+  extend the zero-copy `IOSurface` substrate
+  ([ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md)) from KV
+  tiles to `VideoToolbox` hardware decode → `CVPixelBuffer` (`IOSurface`) →
+  `MTLTexture` → Metal/ANE vision patch projection when onboarding multimodal
+  checkpoints in the `Qwen3.8` family ([ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md)).
 
 ## Sources
 

@@ -28,6 +28,22 @@ with zero bytes copied and no relayout.
    tiles are created with an explicit allocation size that is a multiple of
    16 KiB, base addresses are checked, and the reported IOSurface allocation
    size is never used as a Metal buffer length.
+5. **Confirmed `R5` and hybrid KV pool policy (2026-11-21).** `kCVPixelFormatType_OneComponent8`
+   is **declined** for ANE↔GPU `KvTile` sharing: CoreML's zero-copy
+   `MLMultiArray(pixelBuffer:shape:)` requires `OneComponent16Half`, and bare
+   8-bit texels without per-block scales degrade under K-channel / V-token
+   outliers (KIVI `arXiv:2402.02750`, `mlx-lm` `8-bit g=64`). Active ANE↔GPU
+   `KvTile`s stay strictly in `OneComponent16Half` / token-major `RGBA16Float`
+   (including M6 hybrid pools pairing `512`-token full-attention `KvTile`s with
+   `128`-token circular ring tiles for sliding-window layers); if 32K+ context
+   workloads on 24 GB Macs need 50% KV compression for retired chunks, retired
+   history is compressed GPU-side into group-64 `q8` (`half` scale) `MTLBuffer`
+   blocks rather than `OneComponent8` IOSurfaces.
+6. **Residual vs IOSurface precision boundary ([ADR-0016](0016-native-fp16-bf16-and-multishard-import.md),
+   [ADR-0018](0018-bare-metal-armv9-sme2-engine.md)).** When a non-QK-Norm
+   model opts into native `bf16` trunk residuals on Metal GPU or CPU SME2,
+   `fp32` accumulators narrow zero-copy to `fp16` (`half4`) strictly at
+   `RGBA16Float` IOSurface `KvTile` and CoreML ANE boundaries.
 
 ## Consequences
 
@@ -74,12 +90,6 @@ full raw telemetry in [../benchmarks/results.md](../benchmarks/results.md)):
 
 ## Open items
 
-- int8 KV tiles (`OneComponent8`) — undecided (status row R5).
-  - External survey ([open-decisions-research.md](../architecture/open-decisions-research.md#r5-int8-kv-tiles-onecomponent8)):
-    Apple's [`init(pixelBuffer:shape:)`](https://developer.apple.com/documentation/coreml/mlmultiarray/init(pixelbuffer:shape:))
-    docs restrict fp16 IOSurface `MLMultiArray`s to `OneComponent16Half`, while
-    KIVI ([arXiv:2402.02750](https://arxiv.org/abs/2402.02750)) and `mlx-lm`
-    `8-bit g=64` / `llama.cpp q8_0` rely on explicit per-block scales to handle
-    channel/token KV outliers; recommended direction is to keep
-    `OneComponent16Half` for ANE↔GPU sharing and use group-64 `q8` `MTLBuffer`
-    compression GPU-side only if needed.
+- None (`R5` resolved 2026-11-21: `OneComponent8` declined for ANE↔GPU `KvTile`s;
+  see [open-decisions-research.md](../architecture/open-decisions-research.md#r5-int8-kv-tiles-onecomponent8)
+  and [../status.md](../status.md)).
