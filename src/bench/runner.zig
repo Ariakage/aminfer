@@ -21,6 +21,8 @@ const engine_mod = @import("../spec/engine.zig");
 const aio = @import("../storage/aio.zig");
 const wavefront = @import("../ane/wavefront.zig");
 const predictor_mod = @import("../ane/predictor.zig");
+const sme = @import("../cpu/sme.zig");
+const qos = @import("../platform/qos.zig");
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -3725,6 +3727,840 @@ pub fn runRealA2Eval(
     };
 }
 
+// ============================================================================
+// M4.5 Bare-Metal ARMv9 SME2 Suite: Spike S7 + C13 Concurrent Bus Gate +
+// ldnt1b L2 Preservation + L2-Resident Tree Router Calibration (`bench-m45`)
+// ============================================================================
+
+pub const BusContentionRow = struct {
+    scenario: []const u8,
+    sme_dtype: sme.PanelDType,
+    sme_hint: sme.CacheHint,
+    sme_m: u32,
+    sme_n: u32,
+    sme_k: u32,
+    gpu_solo_gbs: f64,
+    gpu_solo_us: f64,
+    gpu_conc_gbs: f64,
+    gpu_conc_us: f64,
+    gpu_delta_pct: f64,
+    sme_solo_us: f64,
+    sme_solo_gbs: f64,
+    sme_solo_gflops: f64,
+    sme_conc_iters: u64,
+    sme_conc_us: f64,
+    sme_conc_gbs: f64,
+    sme_conc_gflops: f64,
+    aggregate_gbs: f64,
+    net_speedup: f64,
+    gate_pass: bool,
+};
+
+pub const LdntL2PreservationResult = struct {
+    hot_bytes: usize,
+    cold_total_bytes: usize,
+    cold_experts: u32,
+    hot_baseline_us: f64,
+    hot_after_ld1_us: f64,
+    hot_after_ldnt1_us: f64,
+    cold_swiglu_ld1_us: f64,
+    cold_swiglu_ldnt1_us: f64,
+    eviction_overhead_ld1_pct: f64,
+    eviction_overhead_ldnt1_pct: f64,
+};
+
+pub const RouterPredCalRow = struct {
+    m: u32,
+    sampled_layers: u32,
+    num_experts: u32,
+    hidden_size: u32,
+    gpu_us: f64,
+    sme2_us: f64,
+    speedup: f64,
+    topk_agreement: f64,
+};
+
+pub const M45Config = struct {
+    run_full_s7: bool = true,
+    // C13 Concurrent GPU + SME2 Bus Contention Sweep
+    gpu_n: u32 = 4096,
+    gpu_k: u32 = 4096,
+    gpu_min_working_bytes: usize = 64 * 1024 * 1024,
+    gpu_warmup_batches: u32 = 4,
+    gpu_timed_batches: u32 = 24,
+    gpu_dispatches_per_batch: u32 = 16,
+    sme_l2_m: u32 = 16,
+    sme_l2_n: u32 = 1024,
+    sme_l2_k: u32 = 2048,
+    sme_dram_m: u32 = 1,
+    sme_dram_n: u32 = 4096,
+    sme_dram_k: u32 = 4096,
+    sme_dram_min_working_bytes: usize = 48 * 1024 * 1024,
+    // C12/C13 ldnt1b L2 Preservation
+    l2_pres_hot_m: u32 = 16,
+    l2_pres_hot_n: u32 = 1024,
+    l2_pres_hot_k: u32 = 2048,
+    l2_pres_cold_h: u32 = 2048,
+    l2_pres_cold_inter: u32 = 768,
+    l2_pres_cold_experts: u32 = 6,
+    l2_pres_reps: u32 = 5,
+    // C13 L2-Resident Speculative Tree Router Calibration
+    router_layers: u32 = 8,
+    router_experts: u32 = 128,
+    router_top_k: u32 = 8,
+    router_hidden: u32 = 2048,
+    router_moe_inter: u32 = 64,
+    router_vocab: u32 = 256,
+    router_reps: u32 = 9,
+    timeout_ms: u64 = 30_000,
+};
+
+pub const M45Report = struct {
+    caps: sme.SmeCaps,
+    s7: ?sme.SpikeS7Report,
+    bus_rows: [3]BusContentionRow,
+    ldnt_l2: LdntL2PreservationResult,
+    router_cal: [3]RouterPredCalRow,
+    router_bank_bytes: u64,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn write(self: *const M45Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.writeAll("\n=== M4.5 Bare-Metal ARMv9 SME2 Engine & C13 Concurrent Bus Suite ===\n\n");
+        if (self.s7) |*s7| {
+            try s7.write(out);
+            try out.writeAll("\n");
+        }
+
+        try out.writeAll(
+            \\--- C13 Concurrent Metal 4 GPU + CPU SME2 Unified-Bus Contention Gate (M4 120 GB/s) ---
+            \\scenario              sme_shape         gpu_solo   gpu_conc  gpu_d% | sme_solo   sme_conc   agg_GB/s  net_spd  gate
+            \\
+        );
+        for (self.bus_rows) |r| {
+            var shp: [32]u8 = undefined;
+            const s_str = std.fmt.bufPrint(&shp, "{s}:{d}x{d}x{d}", .{
+                r.sme_dtype.label(),
+                r.sme_m,
+                r.sme_n,
+                r.sme_k,
+            }) catch unreachable;
+            try out.print(
+                \\{s: <21} {s: <17} {d: >6.2}GB/s {d: >6.2}GB/s {d: >6.1}% | {d: >7.1}us {d: >7.1}us {d: >8.2} {d: >7.2}x  {s}
+                \\
+            , .{
+                r.scenario,
+                s_str,
+                r.gpu_solo_gbs,
+                r.gpu_conc_gbs,
+                r.gpu_delta_pct,
+                r.sme_solo_us,
+                r.sme_conc_us,
+                r.aggregate_gbs,
+                r.net_speedup,
+                if (r.gate_pass) "PASS" else "FAIL",
+            });
+        }
+
+        try out.print(
+            \\
+            \\--- C12/C13 ldnt1b Non-Temporal Cold-Expert L2 Cache Preservation ---
+            \\ldnt_l2.hot_router_kib           {d:.1}
+            \\ldnt_l2.cold_stream_mib          {d:.2} ({d} q4 SwiGLU experts)
+            \\ldnt_l2.hot_baseline_us          {d:.2}
+            \\ldnt_l2.hot_after_ld1_us         {d:.2} ({d:.1}% vs baseline)
+            \\ldnt_l2.hot_after_ldnt1_us       {d:.2} ({d:.1}% vs baseline)
+            \\ldnt_l2.cold_swiglu_ld1_us       {d:.2} /expert
+            \\ldnt_l2.cold_swiglu_ldnt1_us     {d:.2} /expert
+            \\
+            \\--- C13 L2-Resident SME2 vs Metal 4 GPU Speculative Tree Router Prediction ---
+            \\router_cal.bank_kib              {d:.1}
+            \\M    shape (L x E x H)       gpu_us    sme2_us   speedup   topk_agree
+            \\
+        , .{
+            @as(f64, @floatFromInt(self.ldnt_l2.hot_bytes)) / 1024.0,
+            @as(f64, @floatFromInt(self.ldnt_l2.cold_total_bytes)) / (1024.0 * 1024.0),
+            self.ldnt_l2.cold_experts,
+            self.ldnt_l2.hot_baseline_us,
+            self.ldnt_l2.hot_after_ld1_us,
+            self.ldnt_l2.eviction_overhead_ld1_pct,
+            self.ldnt_l2.hot_after_ldnt1_us,
+            self.ldnt_l2.eviction_overhead_ldnt1_pct,
+            self.ldnt_l2.cold_swiglu_ld1_us,
+            self.ldnt_l2.cold_swiglu_ldnt1_us,
+            @as(f64, @floatFromInt(self.router_bank_bytes)) / 1024.0,
+        });
+        for (self.router_cal) |rc| {
+            var rshp: [28]u8 = undefined;
+            const rs = std.fmt.bufPrint(&rshp, "{d}x{d}x{d}", .{
+                rc.sampled_layers,
+                rc.num_experts,
+                rc.hidden_size,
+            }) catch unreachable;
+            try out.print(
+                \\{d: <4} {s: <22} {d: >7.2}    {d: >7.2}   {d: >6.2}x   {d: >6.2}%
+                \\
+            , .{
+                rc.m,
+                rs,
+                rc.gpu_us,
+                rc.sme2_us,
+                rc.speedup,
+                rc.topk_agreement * 100.0,
+            });
+        }
+
+        const swap_d = vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after);
+        const page_d = vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after);
+        try out.print(
+            \\
+            \\M4.5 Swap Check
+            \\m45.swap.status                  ok
+            \\m45.swap.swapouts_delta          {d}
+            \\m45.swap.pageouts_delta          {d}
+            \\
+        , .{ swap_d, page_d });
+    }
+};
+
+pub const M45Error = Error || sme.SpikeS7Error || qwen3.LoadError || qwen3.StepError || qos.Error;
+
+fn fillPackedBenchBlob(
+    allocator: std.mem.Allocator,
+    dtype: sme.PanelDType,
+    n: usize,
+    k: usize,
+    dst: []u8,
+    seed: u64,
+) M45Error!void {
+    var st = seed ^ 0xA076_1D64_78BD_642F;
+    if (!dtype.isQuantized()) {
+        const tmp = try allocator.alloc(u16, n * k);
+        defer allocator.free(tmp);
+        const fdt: quant.FloatDType = if (dtype == .bf16) .bf16 else .f16;
+        for (tmp) |*v| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            const f: f32 = (@as(f32, @floatFromInt(st & 0xFFFF)) / 32768.0 - 1.0) * 0.125;
+            v.* = quant.f32ToFloatBits(fdt, f);
+        }
+        try sme.packDensePanel64(dtype, tmp, n, k, dst);
+    } else {
+        const groups = k / sme.GROUP_SIZE;
+        const mask: u8 = switch (dtype) {
+            .q4_affine => 0x0F,
+            .q3_affine => 0x07,
+            .q2_affine => 0x03,
+            else => unreachable,
+        };
+        const codes = try allocator.alloc(u8, n * k);
+        defer allocator.free(codes);
+        const sbs = try allocator.alloc(quant.ScaleBias, n * groups);
+        defer allocator.free(sbs);
+        for (codes) |*c| {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            c.* = @as(u8, @truncate(st)) & mask;
+        }
+        for (sbs) |*sb| {
+            sb.* = .{ .scale = 0.03125, .bias = -0.125 };
+        }
+        try sme.packQuantAffinePanel64(dtype, codes, sbs, n, k, dst);
+    }
+}
+
+fn medianF64Slice(samples: []f64) f64 {
+    std.sort.pdq(f64, samples, {}, std.sort.asc(f64));
+    return samples[samples.len / 2];
+}
+
+fn runConcurrentBusSweep(
+    allocator: std.mem.Allocator,
+    config: M45Config,
+) M45Error![3]BusContentionRow {
+    const facts = try sysinfo.Facts.read();
+    const device = try metal.Device.open();
+    defer device.close();
+    const dev_info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try dequant.DequantPipelines.init(device, library);
+    defer pipes.close();
+
+    const gpu_case: Case = .{ .kind = .gemv_q3, .m = 1, .n = config.gpu_n, .k = config.gpu_k };
+    const gpu_layout = try computeCaseLayout(gpu_case);
+    const w_stride = amf.align64(gpu_layout.w_bytes);
+    const sb_stride = amf.align64(gpu_layout.sb_bytes);
+    const weight_pool_bytes = amf.align64(@max(w_stride, config.gpu_min_working_bytes));
+    const num_slots: usize = @max(@as(usize, 1), weight_pool_bytes / w_stride);
+    const sb_pool_bytes = num_slots * sb_stride;
+    const raw_arena = weight_pool_bytes + sb_pool_bytes + amf.align64(gpu_layout.x_bytes) + amf.align64(gpu_layout.y_bytes) + 4 * page.APPLE_PAGE_SIZE;
+    const arena_bytes = try page.alignUp(raw_arena);
+
+    var arena = try arena_mod.WiredArena.init(arena_bytes, wired_budget);
+    defer arena.deinit();
+    const w_pool = try arena.allocAligned(weight_pool_bytes, 64);
+    const sb_pool = try arena.allocAligned(sb_pool_bytes, 64);
+    const x_raw = try arena.allocAligned(gpu_layout.x_bytes, 64);
+    const y_raw = try arena.allocAligned(gpu_layout.y_bytes, 64);
+    fillBenchBuffers(w_pool, sb_pool, x_raw, y_raw);
+
+    const w_base_off = arena.offsetOf(w_pool.ptr);
+    const sb_base_off = arena.offsetOf(sb_pool.ptr);
+    const x_off = arena.offsetOf(x_raw.ptr);
+    const y_off = arena.offsetOf(y_raw.ptr);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const runGpuWindow = struct {
+        fn call(
+            comp: *metal.Compute,
+            dp: dequant.DequantPipelines,
+            buf: metal.Buffer,
+            wb: u64,
+            sbb: u64,
+            ws: usize,
+            sbs: usize,
+            ns: usize,
+            xo: u64,
+            yo: u64,
+            gn: u32,
+            gk: u32,
+            batches: u32,
+            disp_per: u32,
+            timeout_ms: u64,
+        ) M45Error!u64 {
+            var cur: usize = 0;
+            var last_sig: u64 = 0;
+            const t0 = try vmstat.nowNs();
+            for (0..batches) |_| {
+                var frame = try comp.beginFrame(timeout_ms);
+                errdefer frame.abort();
+                for (0..disp_per) |d| {
+                    const slot = cur % ns;
+                    cur += 1;
+                    try dp.encodeGemv(&frame, .q3, .{
+                        .x = .{ .buffer = buf, .offset = xo },
+                        .qweight = .{ .buffer = buf, .offset = wb + @as(u64, slot) * ws },
+                        .scale_bias = .{ .buffer = buf, .offset = sbb + @as(u64, slot) * sbs },
+                        .y = .{ .buffer = buf, .offset = yo },
+                        .n = gn,
+                        .k = gk,
+                    }, d > 0);
+                }
+                last_sig = try frame.commit();
+            }
+            if (last_sig != 0) try comp.wait(last_sig, timeout_ms);
+            const t1 = try vmstat.nowNs();
+            return t1 -| t0;
+        }
+    }.call;
+
+    // Warmup GPU DVFS
+    _ = try runGpuWindow(&compute, pipes, gpu_buf, w_base_off, sb_base_off, w_stride, sb_stride, num_slots, x_off, y_off, config.gpu_n, config.gpu_k, config.gpu_warmup_batches, config.gpu_dispatches_per_batch, config.timeout_ms);
+
+    const gpu_disps: u64 = @as(u64, config.gpu_timed_batches) * config.gpu_dispatches_per_batch;
+    const gpu_total_bytes: f64 = @as(f64, @floatFromInt(gpu_layout.bytes_per_dispatch)) * @as(f64, @floatFromInt(gpu_disps));
+
+    // Measure GPU solo baseline (median of 3 windows)
+    var gpu_solo_ns_arr: [3]f64 = undefined;
+    for (0..3) |rep| {
+        const ns = try runGpuWindow(&compute, pipes, gpu_buf, w_base_off, sb_base_off, w_stride, sb_stride, num_slots, x_off, y_off, config.gpu_n, config.gpu_k, config.gpu_timed_batches, config.gpu_dispatches_per_batch, config.timeout_ms);
+        gpu_solo_ns_arr[rep] = @floatFromInt(@max(ns, 1));
+    }
+    const gpu_solo_ns = medianF64Slice(&gpu_solo_ns_arr);
+    const gpu_solo_gbs = gpu_total_bytes / gpu_solo_ns;
+    const gpu_solo_us = (gpu_solo_ns / @as(f64, @floatFromInt(gpu_disps))) / 1000.0;
+
+    // Prepare persistent SME2 dispatcher
+    const max_sme_k: usize = @max(@as(usize, config.sme_l2_k), @as(usize, config.sme_dram_k));
+    var disp = try sme.SmeDispatcher.init(allocator, .{
+        .a_pack_u16_cap = 32 * @max(max_sme_k, sme.GROUP_SIZE),
+        .x_sums_f32_cap = @max(@as(usize, 64), 4 * (@max(max_sme_k, sme.GROUP_SIZE) / sme.GROUP_SIZE)),
+    });
+    defer disp.deinit();
+
+    const ScenarioSpec = struct {
+        name: []const u8,
+        dtype: sme.PanelDType,
+        hint: sme.CacheHint,
+        m: u32,
+        n: u32,
+        k: u32,
+        min_working_bytes: usize,
+    };
+    const scenarios = [_]ScenarioSpec{
+        .{
+            .name = "gpu+sme2_l2_router",
+            .dtype = .bf16,
+            .hint = .temporal,
+            .m = config.sme_l2_m,
+            .n = config.sme_l2_n,
+            .k = config.sme_l2_k,
+            .min_working_bytes = 0,
+        },
+        .{
+            .name = "gpu+sme2_dram_ld1",
+            .dtype = .q4_affine,
+            .hint = .temporal,
+            .m = config.sme_dram_m,
+            .n = config.sme_dram_n,
+            .k = config.sme_dram_k,
+            .min_working_bytes = config.sme_dram_min_working_bytes,
+        },
+        .{
+            .name = "gpu+sme2_dram_ldnt1",
+            .dtype = .q4_affine,
+            .hint = .non_temporal,
+            .m = config.sme_dram_m,
+            .n = config.sme_dram_n,
+            .k = config.sme_dram_k,
+            .min_working_bytes = config.sme_dram_min_working_bytes,
+        },
+    };
+
+    const WorkerCtx = struct {
+        disp: *sme.SmeDispatcher,
+        cfg: sme.GemmConfig,
+        a: []const u16,
+        w_ring: []const u8,
+        w_stride: usize,
+        slabs: usize,
+        out: []f32,
+        m: usize,
+        n: usize,
+        k: usize,
+        ready: std.atomic.Value(bool) = .init(false),
+        stop: std.atomic.Value(bool) = .init(false),
+        iters: std.atomic.Value(u64) = .init(0),
+        err: ?sme.Error = null,
+        qos_err: ?qos.Error = null,
+
+        fn mainFn(ctx: *@This()) void {
+            qos.steerPerformanceCore(.user_interactive) catch |e| {
+                ctx.qos_err = e;
+                ctx.ready.store(true, .release);
+                return;
+            };
+            // Warmup one call so thread is active on a P-core before signalling ready.
+            ctx.disp.gemmF32(ctx.cfg, ctx.a, ctx.w_ring[0..ctx.w_stride], null, ctx.out, ctx.m, ctx.n, ctx.k) catch |e| {
+                ctx.err = e;
+                ctx.ready.store(true, .release);
+                return;
+            };
+            ctx.ready.store(true, .release);
+
+            var idx: usize = 1;
+            var local_iters: u64 = 0;
+            while (!ctx.stop.load(.acquire)) {
+                const slab = idx % ctx.slabs;
+                ctx.disp.gemmF32(ctx.cfg, ctx.a, ctx.w_ring[slab * ctx.w_stride ..][0..ctx.w_stride], null, ctx.out, ctx.m, ctx.n, ctx.k) catch |e| {
+                    ctx.err = e;
+                    break;
+                };
+                idx += 1;
+                local_iters += 1;
+            }
+            ctx.iters.store(local_iters, .release);
+        }
+    };
+
+    var rows: [3]BusContentionRow = undefined;
+    for (scenarios, 0..) |sc, si| {
+        const m: usize = sc.m;
+        const n: usize = sc.n;
+        const k: usize = sc.k;
+        const w_bytes = try sme.packedBlobBytes(sc.dtype, n, k);
+        const slabs: usize = if (sc.min_working_bytes == 0)
+            1
+        else
+            @max(@as(usize, 2), (sc.min_working_bytes + w_bytes - 1) / w_bytes);
+        const w_ring = try allocator.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), slabs * w_bytes);
+        defer allocator.free(w_ring);
+        try fillPackedBenchBlob(allocator, sc.dtype, n, k, w_ring[0..w_bytes], 0x45B0 + si);
+        for (1..slabs) |s_idx| {
+            @memcpy(w_ring[s_idx * w_bytes ..][0..w_bytes], w_ring[0..w_bytes]);
+        }
+
+        const a_u16 = try allocator.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), m * k);
+        defer allocator.free(a_u16);
+        const act_dt: quant.FloatDType = if (sc.dtype.activationIsBf16()) .bf16 else .f16;
+        for (a_u16, 0..) |*v, i| {
+            v.* = quant.f32ToFloatBits(act_dt, (@as(f32, @floatFromInt(i % 13)) - 6.0) * 0.0625);
+        }
+        const out_f32 = try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m * n);
+        defer allocator.free(out_f32);
+
+        const gcfg: sme.GemmConfig = .{ .dtype = sc.dtype, .cache_hint = sc.hint };
+        // Measure SME2 solo baseline
+        for (0..3) |_| {
+            try disp.gemmF32(gcfg, a_u16, w_ring[0..w_bytes], null, out_f32, m, n, k);
+        }
+        const solo_reps: usize = if (slabs == 1) 15 else 7;
+        var solo_samples: [15]f64 = undefined;
+        for (0..solo_reps) |r| {
+            const slab = r % slabs;
+            const t0 = try vmstat.nowNs();
+            try disp.gemmF32(gcfg, a_u16, w_ring[slab * w_bytes ..][0..w_bytes], null, out_f32, m, n, k);
+            const t1 = try vmstat.nowNs();
+            solo_samples[r] = @as(f64, @floatFromInt(@max(t1 -| t0, 1))) / 1000.0;
+        }
+        const sme_solo_us = medianF64Slice(solo_samples[0..solo_reps]);
+        const sme_bytes: f64 = @floatFromInt(w_bytes + m * k * 2 + m * n * 4);
+        const sme_flops: f64 = 2.0 * @as(f64, @floatFromInt(m)) * @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(k));
+        const sme_solo_gbs = sme_bytes / (sme_solo_us * 1000.0);
+        const sme_solo_gflops = sme_flops / (sme_solo_us * 1000.0);
+
+        // Concurrent window: SME2 thread runs continuously while GPU executes timed window.
+        var wctx: WorkerCtx = .{
+            .disp = &disp,
+            .cfg = gcfg,
+            .a = a_u16,
+            .w_ring = w_ring,
+            .w_stride = w_bytes,
+            .slabs = slabs,
+            .out = out_f32,
+            .m = m,
+            .n = n,
+            .k = k,
+        };
+        const th = try std.Thread.spawn(.{}, WorkerCtx.mainFn, .{&wctx});
+        while (!wctx.ready.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
+        const conc_ns = runGpuWindow(&compute, pipes, gpu_buf, w_base_off, sb_base_off, w_stride, sb_stride, num_slots, x_off, y_off, config.gpu_n, config.gpu_k, config.gpu_timed_batches, config.gpu_dispatches_per_batch, config.timeout_ms) catch |e| {
+            wctx.stop.store(true, .release);
+            th.join();
+            return e;
+        };
+        wctx.stop.store(true, .release);
+        th.join();
+        if (wctx.qos_err) |qe| return qe;
+        if (wctx.err) |we| return we;
+
+        const conc_ns_f: f64 = @floatFromInt(@max(conc_ns, 1));
+        const gpu_conc_gbs = gpu_total_bytes / conc_ns_f;
+        const gpu_conc_us = (conc_ns_f / @as(f64, @floatFromInt(gpu_disps))) / 1000.0;
+        const gpu_delta_pct = (gpu_conc_gbs / gpu_solo_gbs - 1.0) * 100.0;
+
+        const sme_iters = wctx.iters.load(.acquire);
+        const sme_conc_us: f64 = if (sme_iters > 0) (conc_ns_f / @as(f64, @floatFromInt(sme_iters))) / 1000.0 else 0.0;
+        const sme_conc_gbs: f64 = if (sme_iters > 0) (sme_bytes * @as(f64, @floatFromInt(sme_iters))) / conc_ns_f else 0.0;
+        const sme_conc_gflops: f64 = if (sme_iters > 0) (sme_flops * @as(f64, @floatFromInt(sme_iters))) / conc_ns_f else 0.0;
+
+        // Combined heterogeneous work-rate speedup:
+        // (T_seq = T_gpu_solo + N_sme * T_sme_solo) / T_conc
+        // = (gpu_conc_gbs / gpu_solo_gbs) + (sme_conc_gflops / sme_solo_gflops)
+        const net_speedup = (gpu_conc_gbs / gpu_solo_gbs) +
+            (if (sme_solo_gflops > 0.0) sme_conc_gflops / sme_solo_gflops else 0.0);
+
+        rows[si] = .{
+            .scenario = sc.name,
+            .sme_dtype = sc.dtype,
+            .sme_hint = sc.hint,
+            .sme_m = sc.m,
+            .sme_n = sc.n,
+            .sme_k = sc.k,
+            .gpu_solo_gbs = gpu_solo_gbs,
+            .gpu_solo_us = gpu_solo_us,
+            .gpu_conc_gbs = gpu_conc_gbs,
+            .gpu_conc_us = gpu_conc_us,
+            .gpu_delta_pct = gpu_delta_pct,
+            .sme_solo_us = sme_solo_us,
+            .sme_solo_gbs = sme_solo_gbs,
+            .sme_solo_gflops = sme_solo_gflops,
+            .sme_conc_iters = sme_iters,
+            .sme_conc_us = sme_conc_us,
+            .sme_conc_gbs = sme_conc_gbs,
+            .sme_conc_gflops = sme_conc_gflops,
+            .aggregate_gbs = gpu_conc_gbs + sme_conc_gbs,
+            .net_speedup = net_speedup,
+            .gate_pass = (net_speedup > 1.05),
+        };
+    }
+
+    return rows;
+}
+
+fn runLdntL2PreservationBench(
+    allocator: std.mem.Allocator,
+    config: M45Config,
+) M45Error!LdntL2PreservationResult {
+    const hot_m: usize = config.l2_pres_hot_m;
+    const hot_n: usize = config.l2_pres_hot_n;
+    const hot_k: usize = config.l2_pres_hot_k;
+    const cold_h: usize = config.l2_pres_cold_h;
+    const cold_inter: usize = config.l2_pres_cold_inter;
+    const cold_cnt: usize = @max(@as(usize, 1), config.l2_pres_cold_experts);
+
+    const max_k = @max(hot_k, @max(cold_h, cold_inter));
+    var disp = try sme.SmeDispatcher.init(allocator, .{
+        .a_pack_u16_cap = 32 * @max(max_k, sme.GROUP_SIZE),
+        .x_sums_f32_cap = @max(@as(usize, 64), 4 * (@max(max_k, sme.GROUP_SIZE) / sme.GROUP_SIZE)),
+    });
+    defer disp.deinit();
+
+    const hot_w_bytes = try sme.packedBlobBytes(.bf16, hot_n, hot_k);
+    const hot_w = try allocator.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), hot_w_bytes);
+    defer allocator.free(hot_w);
+    try fillPackedBenchBlob(allocator, .bf16, hot_n, hot_k, hot_w, 0x4512);
+
+    const hot_a = try allocator.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), hot_m * hot_k);
+    defer allocator.free(hot_a);
+    for (hot_a, 0..) |*v, i| v.* = quant.f32ToBf16((@as(f32, @floatFromInt(i % 11)) - 5.0) * 0.0625);
+    const hot_out = try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), hot_m * hot_n);
+    defer allocator.free(hot_out);
+
+    const gu_bytes = try sme.packedBlobBytes(.q4_affine, cold_inter, cold_h);
+    const dn_bytes = try sme.packedBlobBytes(.q4_affine, cold_h, cold_inter);
+    const one_exp_bytes = 2 * gu_bytes + dn_bytes;
+    const cold_slab = try allocator.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), cold_cnt * one_exp_bytes);
+    defer allocator.free(cold_slab);
+    try fillPackedBenchBlob(allocator, .q4_affine, cold_inter, cold_h, cold_slab[0..gu_bytes], 0x4513);
+    try fillPackedBenchBlob(allocator, .q4_affine, cold_inter, cold_h, cold_slab[gu_bytes .. 2 * gu_bytes], 0x4514);
+    try fillPackedBenchBlob(allocator, .q4_affine, cold_h, cold_inter, cold_slab[2 * gu_bytes .. one_exp_bytes], 0x4515);
+    for (1..cold_cnt) |ei| {
+        @memcpy(cold_slab[ei * one_exp_bytes ..][0..one_exp_bytes], cold_slab[0..one_exp_bytes]);
+    }
+
+    const cold_x = try allocator.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), cold_h);
+    defer allocator.free(cold_x);
+    for (cold_x, 0..) |*v, i| v.* = quant.f32ToFloatBits(.f16, (@as(f32, @floatFromInt(i % 9)) - 4.0) * 0.0625);
+    const up_scr = try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), cold_inter);
+    defer allocator.free(up_scr);
+    const inter_scr = try allocator.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), cold_inter);
+    defer allocator.free(inter_scr);
+    const dn_out = try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), cold_h);
+    defer allocator.free(dn_out);
+
+    const reps: usize = @min(@max(@as(usize, 1), config.l2_pres_reps), 9);
+    var base_samples: [9]f64 = undefined;
+    var ld1_samples: [9]f64 = undefined;
+    var ldnt1_samples: [9]f64 = undefined;
+    var swiglu_ld1_samples: [9]f64 = undefined;
+    var swiglu_ldnt1_samples: [9]f64 = undefined;
+
+    const hot_cfg: sme.GemmConfig = .{ .dtype = .bf16, .cache_hint = .temporal };
+    for (0..3) |_| {
+        try disp.gemmF32(hot_cfg, hot_a, hot_w, null, hot_out, hot_m, hot_n, hot_k);
+    }
+
+    for (0..reps) |r| {
+        // Warm hot router into L2, measure L2-hot baseline.
+        try disp.gemmF32(hot_cfg, hot_a, hot_w, null, hot_out, hot_m, hot_n, hot_k);
+        const tb0 = try vmstat.nowNs();
+        try disp.gemmF32(hot_cfg, hot_a, hot_w, null, hot_out, hot_m, hot_n, hot_k);
+        const tb1 = try vmstat.nowNs();
+        base_samples[r] = @as(f64, @floatFromInt(@max(tb1 -| tb0, 1))) / 1000.0;
+
+        // Sweep cold experts with temporal `ld1b`, then immediately measure hot router.
+        const tc0 = try vmstat.nowNs();
+        for (0..cold_cnt) |ei| {
+            const base = ei * one_exp_bytes;
+            try qwen3.Qwen3Model.evalSwiGluExpertSme2(
+                &disp,
+                .q4_affine,
+                .affine_scale_bias,
+                .temporal,
+                cold_slab[base .. base + gu_bytes],
+                cold_slab[base + gu_bytes .. base + 2 * gu_bytes],
+                cold_slab[base + 2 * gu_bytes .. base + one_exp_bytes],
+                cold_x,
+                up_scr,
+                inter_scr,
+                dn_out,
+                null,
+                1,
+                cold_h,
+                cold_inter,
+            );
+        }
+        const tc1 = try vmstat.nowNs();
+        swiglu_ld1_samples[r] = (@as(f64, @floatFromInt(@max(tc1 -| tc0, 1))) / @as(f64, @floatFromInt(cold_cnt))) / 1000.0;
+
+        const ta0 = try vmstat.nowNs();
+        try disp.gemmF32(hot_cfg, hot_a, hot_w, null, hot_out, hot_m, hot_n, hot_k);
+        const ta1 = try vmstat.nowNs();
+        ld1_samples[r] = @as(f64, @floatFromInt(@max(ta1 -| ta0, 1))) / 1000.0;
+
+        // Re-warm hot router into L2, then sweep cold experts with non-temporal `ldnt1b`.
+        try disp.gemmF32(hot_cfg, hot_a, hot_w, null, hot_out, hot_m, hot_n, hot_k);
+        const tnt0 = try vmstat.nowNs();
+        for (0..cold_cnt) |ei| {
+            const base = ei * one_exp_bytes;
+            try qwen3.Qwen3Model.evalSwiGluExpertSme2(
+                &disp,
+                .q4_affine,
+                .affine_scale_bias,
+                .non_temporal,
+                cold_slab[base .. base + gu_bytes],
+                cold_slab[base + gu_bytes .. base + 2 * gu_bytes],
+                cold_slab[base + 2 * gu_bytes .. base + one_exp_bytes],
+                cold_x,
+                up_scr,
+                inter_scr,
+                dn_out,
+                null,
+                1,
+                cold_h,
+                cold_inter,
+            );
+        }
+        const tnt1 = try vmstat.nowNs();
+        swiglu_ldnt1_samples[r] = (@as(f64, @floatFromInt(@max(tnt1 -| tnt0, 1))) / @as(f64, @floatFromInt(cold_cnt))) / 1000.0;
+
+        const tn0 = try vmstat.nowNs();
+        try disp.gemmF32(hot_cfg, hot_a, hot_w, null, hot_out, hot_m, hot_n, hot_k);
+        const tn1 = try vmstat.nowNs();
+        ldnt1_samples[r] = @as(f64, @floatFromInt(@max(tn1 -| tn0, 1))) / 1000.0;
+    }
+
+    const base_us = medianF64Slice(base_samples[0..reps]);
+    const after_ld1 = medianF64Slice(ld1_samples[0..reps]);
+    const after_ldnt1 = medianF64Slice(ldnt1_samples[0..reps]);
+
+    return .{
+        .hot_bytes = hot_w_bytes,
+        .cold_total_bytes = cold_cnt * one_exp_bytes,
+        .cold_experts = @intCast(cold_cnt),
+        .hot_baseline_us = base_us,
+        .hot_after_ld1_us = after_ld1,
+        .hot_after_ldnt1_us = after_ldnt1,
+        .cold_swiglu_ld1_us = medianF64Slice(swiglu_ld1_samples[0..reps]),
+        .cold_swiglu_ldnt1_us = medianF64Slice(swiglu_ldnt1_samples[0..reps]),
+        .eviction_overhead_ld1_pct = (after_ld1 / base_us - 1.0) * 100.0,
+        .eviction_overhead_ldnt1_pct = (after_ldnt1 / base_us - 1.0) * 100.0,
+    };
+}
+
+fn runRouterPredCalibrationBench(
+    allocator: std.mem.Allocator,
+    config: M45Config,
+) M45Error!struct { rows: [3]RouterPredCalRow, bank_bytes: u64 } {
+    const cfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .default_float_dtype = .bf16,
+        .vocab_size = config.router_vocab,
+        .hidden_size = config.router_hidden,
+        .num_hidden_layers = config.router_layers,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .moe_intermediate_size = config.router_moe_inter,
+        .num_experts = config.router_experts,
+        .num_experts_per_tok = config.router_top_k,
+        .norm_topk_prob = true,
+    };
+    const img = try qwen3.buildSyntheticAmfImageWithSpec(allocator, cfg, .{
+        .linear_dtype = .q3_affine,
+        .embed_dtype = .q3_affine,
+        .norm_dtype = .bf16,
+        .router_dtype = .q3_affine,
+        .expert_dtype = .q3_affine,
+    }, 0x45C13A);
+    defer allocator.free(img);
+
+    var model = try qwen3.Qwen3Model.loadFromBytes(allocator, img, cfg, .{
+        .max_seq_len = 32,
+        .chunk_tokens = 16,
+        .max_tree_nodes = 16,
+        .verify_crcs = false,
+        .sme_router_mode = .auto,
+    });
+    defer model.deinit(allocator);
+
+    const cal = model.routerPredCalibration();
+    const ms = [_]u32{ 1, 8, 16 };
+    const reps: usize = @min(@max(@as(usize, 1), config.router_reps), 15);
+    var gpu_bs: [16 * qwen3.MAX_EXPERT_PRED_LAYERS]tree_mod.ExpertBitset = undefined;
+    var sme_bs: [16 * qwen3.MAX_EXPERT_PRED_LAYERS]tree_mod.ExpertBitset = undefined;
+    var rows: [3]RouterPredCalRow = undefined;
+
+    for (ms, 0..) |m_u32, mi| {
+        const m: usize = m_u32;
+        var toks: [16]u32 = undefined;
+        for (0..m) |i| toks[i] = @intCast((i * 17 + 3) % cfg.vocab_size);
+
+        // Warmup + correctness overlap check
+        const sg = try model.predictMoEExpertsForTokensGpu(toks[0..m], &gpu_bs);
+        const ss = try model.predictMoEExpertsForTokensSme2(toks[0..m], &sme_bs);
+        var overlap: usize = 0;
+        const total = m * @as(usize, ss) * cfg.num_experts_per_tok;
+        for (0..m * ss) |i| {
+            overlap += gpu_bs[i].intersectWith(sme_bs[i]).count();
+        }
+        const agree = if (total > 0) @as(f64, @floatFromInt(overlap)) / @as(f64, @floatFromInt(total)) else 1.0;
+
+        var gpu_samples: [15]f64 = undefined;
+        var sme_samples: [15]f64 = undefined;
+        for (0..reps) |r| {
+            const tg0 = try vmstat.nowNs();
+            _ = try model.predictMoEExpertsForTokensGpu(toks[0..m], &gpu_bs);
+            const tg1 = try vmstat.nowNs();
+            gpu_samples[r] = @as(f64, @floatFromInt(@max(tg1 -| tg0, 1))) / 1000.0;
+
+            const ts0 = try vmstat.nowNs();
+            _ = try model.predictMoEExpertsForTokensSme2(toks[0..m], &sme_bs);
+            const ts1 = try vmstat.nowNs();
+            sme_samples[r] = @as(f64, @floatFromInt(@max(ts1 -| ts0, 1))) / 1000.0;
+        }
+        const g_us = medianF64Slice(gpu_samples[0..reps]);
+        const s_us = medianF64Slice(sme_samples[0..reps]);
+        rows[mi] = .{
+            .m = m_u32,
+            .sampled_layers = sg,
+            .num_experts = cfg.num_experts,
+            .hidden_size = cfg.hidden_size,
+            .gpu_us = g_us,
+            .sme2_us = s_us,
+            .speedup = g_us / s_us,
+            .topk_agreement = agree,
+        };
+    }
+    return .{ .rows = rows, .bank_bytes = cal.bank_bytes };
+}
+
+pub fn runM45WithConfig(allocator: std.mem.Allocator, config: M45Config) M45Error!M45Report {
+    const caps = try sme.SmeCaps.probe();
+    const vm_before = try vmstat.Snapshot.capture();
+
+    const s7: ?sme.SpikeS7Report = if (config.run_full_s7)
+        try sme.runSpikeS7Standalone(allocator)
+    else
+        null;
+
+    const bus_rows = try runConcurrentBusSweep(allocator, config);
+    const ldnt_l2 = try runLdntL2PreservationBench(allocator, config);
+    const rcal = try runRouterPredCalibrationBench(allocator, config);
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .caps = caps,
+        .s7 = s7,
+        .bus_rows = bus_rows,
+        .ldnt_l2 = ldnt_l2,
+        .router_cal = rcal.rows,
+        .router_bank_bytes = rcal.bank_bytes,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM45(allocator: std.mem.Allocator) M45Error!M45Report {
+    return runM45WithConfig(allocator, .{});
+}
+
 test "bytesMovedPerDispatch matches exact algorithmic traffic and validates shapes" {
     // q4 (2048, 2048), M=1: w = 2048*1024 = 2097152, sb = 2048*32*4 = 262144, x = 4096, y = 4096
     const q4_gemv = try bytesMovedPerDispatch(.{ .kind = .gemv_q4, .m = 1, .n = 2048, .k = 2048 });
@@ -4142,4 +4978,62 @@ test "runM4WithConfig exercises Spike S3, Spike S6, A2, A1/G6 hybrid prefill, co
     try std.testing.expect(std.mem.indexOf(u8, rendered, "A2 ANE Cross-Layer MoE Expert Predictor") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "cold_synth.bit_exact_vs_hot") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "d4_synth.lossless_match") != null);
+}
+
+test "runM45WithConfig exercises C13 concurrent GPU+SME2 bus gate, ldnt1b L2 preservation and router calibration" {
+    const gpa = std.testing.allocator;
+    const report = try runM45WithConfig(gpa, .{
+        .run_full_s7 = false,
+        .gpu_n = 256,
+        .gpu_k = 256,
+        .gpu_min_working_bytes = 0,
+        .gpu_warmup_batches = 1,
+        .gpu_timed_batches = 3,
+        .gpu_dispatches_per_batch = 4,
+        .sme_l2_m = 8,
+        .sme_l2_n = 128,
+        .sme_l2_k = 128,
+        .sme_dram_m = 1,
+        .sme_dram_n = 128,
+        .sme_dram_k = 128,
+        .sme_dram_min_working_bytes = 0,
+        .l2_pres_hot_m = 8,
+        .l2_pres_hot_n = 64,
+        .l2_pres_hot_k = 128,
+        .l2_pres_cold_h = 128,
+        .l2_pres_cold_inter = 64,
+        .l2_pres_cold_experts = 2,
+        .l2_pres_reps = 2,
+        .router_layers = 4,
+        .router_experts = 16,
+        .router_top_k = 2,
+        .router_hidden = 128,
+        .router_moe_inter = 64,
+        .router_vocab = 64,
+        .router_reps = 3,
+        .timeout_ms = 10_000,
+    });
+
+    for (report.bus_rows) |row| {
+        try std.testing.expect(row.gpu_solo_gbs > 0.0);
+        try std.testing.expect(row.gpu_conc_gbs > 0.0);
+        try std.testing.expect(row.sme_solo_us > 0.0);
+    }
+    try std.testing.expect(report.ldnt_l2.hot_baseline_us > 0.0);
+    try std.testing.expect(report.ldnt_l2.cold_swiglu_ldnt1_us > 0.0);
+    for (report.router_cal) |rc| {
+        try std.testing.expect(rc.gpu_us > 0.0);
+        try std.testing.expect(rc.sme2_us > 0.0);
+        try std.testing.expect(rc.topk_agreement >= 0.90);
+    }
+    try vmstat.checkNoSwap(report.vm_before, report.vm_after);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "C13 Concurrent Metal 4 GPU + CPU SME2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "ldnt_l2.hot_after_ldnt1_us") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "router_cal.bank_kib") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m45.swap.status") != null);
 }

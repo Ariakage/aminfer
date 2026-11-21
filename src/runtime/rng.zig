@@ -4,7 +4,7 @@
 //! Tier 1 (cold path, once per request admission): when no caller seed is
 //! provided, draws a 64-bit initial seed from macOS `getentropy(2)`, which is
 //! fed by Apple Silicon's on-die Secure Enclave Processor (SEP) hardware TRNG.
-//! Return codes are checked explicitly (zero `catch {}`).
+//! Return codes are checked explicitly (never silently discarded).
 //!
 //! Tier 2 (per-token / per-round hot path): seeds an embedded 32-byte
 //! `std.Random.Xoshiro256` (`std.Random.DefaultPrng`) inside the owning request

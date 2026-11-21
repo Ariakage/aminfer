@@ -10,12 +10,13 @@ const usage =
     \\commands:
     \\  probe             print the kernel, Metal and Neural Engine facts of this machine
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1, M2, M2.5, M3 and M4 benchmark suites
+    \\  bench             run full M1, M2, M2.5, M3, M4 and M4.5 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
     \\  bench-m3          run M3 Spikes S4/S5, D5 gate, L1 SAM latency and synthetic spec decode
     \\  bench-m4          run M4 Spikes S3/S6, A2 predictor, A1/G6 hybrid prefill, cold NVMe & D4
+    \\  bench-m45         run M4.5 Spike S7 SME2 microkernels, C13 GPU+SME2 bus gate & L2 router cal
     \\  bench-a2          evaluate real-checkpoint A2 ANE cross-layer expert predictor recall/lead-time
     \\                    --amf <path> --config <path> --tokenizer <path> [--prompt <text>]
     \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [--no-verify-crc]
@@ -25,9 +26,10 @@ const usage =
     \\                    [--cold-slots N] [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--no-verify-crc]
-    \\  decode            run end-to-end native BPE encode -> greedy .amf decode -> BPE decode
+    \\  decode            run end-to-end native BPE encode -> greedy/stochastic .amf decode -> BPE decode
     \\                    --amf <path> --config <path> --tokenizer <path>
-    \\                    --prompt <text> [--max-tokens N] [--ignore-eos]
+    \\                    --prompt <text> [--max-tokens N] [--temperature T] [--seed N] [--ignore-eos]
+    \\                    [--sme-router auto|sme2|gpu]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
@@ -36,6 +38,7 @@ const usage =
     \\                    --amf <path> --config <path> --tokenizer <path> --prompt <text>
     \\                    [--draft-amf <path> --draft-config <path>]
     \\                    [--draft-mode l1|eagle3|eagle2|mtp|small] [--placement auto|gpu|ane]
+    \\                    [--sme-router auto|sme2|gpu]
     \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
     \\                    [--top-k N] [--no-prune] [--temperature T] [--seed N]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
@@ -67,6 +70,8 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM3(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m4")) {
         try runBenchM4(arena, out);
+    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m45")) {
+        try runBenchM45(arena, out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-a2")) {
         try runBenchA2(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-decode")) {
@@ -172,6 +177,9 @@ const DecodeCliArgs = struct {
     tokenizer_path: [:0]const u8,
     prompt: []const u8,
     max_tokens: u32 = 16,
+    temperature: f32 = 0.0,
+    seed: ?u64 = null,
+    sme_router_mode: aminfer.qwen3.SmeRouterMode = .auto,
     ignore_eos: bool = false,
     verify_crcs: bool = true,
     cold_experts_per_layer: u32 = 0,
@@ -190,6 +198,9 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var tokenizer_path: ?[:0]const u8 = null;
     var prompt: []const u8 = "";
     var max_tokens: u32 = 16;
+    var temperature: f32 = 0.0;
+    var seed: ?u64 = null;
+    var sme_router_mode: aminfer.qwen3.SmeRouterMode = .auto;
     var ignore_eos = false;
     var verify_crcs = true;
     var cold_experts_per_layer: u32 = 0;
@@ -224,6 +235,19 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             max_tokens = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--temperature")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            temperature = try std.fmt.parseFloat(f32, args[i]);
+            if (!std.math.isFinite(temperature) or temperature < 0.0) return error.InvalidTemperature;
+        } else if (std.mem.eql(u8, flag, "--seed")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            seed = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--sme-router")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            sme_router_mode = try aminfer.qwen3.SmeRouterMode.parse(args[i]);
         } else if (std.mem.eql(u8, flag, "--ignore-eos")) {
             ignore_eos = true;
         } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
@@ -269,6 +293,9 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .tokenizer_path = tokenizer_path orelse return error.MissingRequiredFlag,
         .prompt = prompt,
         .max_tokens = max_tokens,
+        .temperature = temperature,
+        .seed = seed,
+        .sme_router_mode = sme_router_mode,
         .ignore_eos = ignore_eos,
         .verify_crcs = verify_crcs,
         .cold_experts_per_layer = cold_experts_per_layer,
@@ -534,6 +561,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         .ane_predictor_path = cli.ane_predictor_path,
         .prefill_mode = cli.prefill_mode,
         .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
+        .sme_router_mode = cli.sme_router_mode,
     });
     defer model.deinit(allocator);
 
@@ -541,10 +569,25 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
     defer allocator.free(generated);
     var gen_count: usize = 0;
 
+    // Two-tier per-request sampling RNG (D11): hardware Secure Enclave TRNG via
+    // `getentropy(2)` when `T > 0` and `--seed` is omitted; zero hot-path mallocs.
+    var req_rng: ?aminfer.rng.RequestRng = if (cli.temperature > 0.0)
+        try aminfer.rng.RequestRng.init(cli.seed)
+    else
+        null;
+    const p_res: []f32 = if (cli.temperature > 0.0)
+        try allocator.alloc(f32, cfg.vocab_size)
+    else
+        &.{};
+    defer if (p_res.len > 0) allocator.free(p_res);
+
     const vm_before = try aminfer.vmstat.Snapshot.capture();
     const prefill_t0 = try aminfer.vmstat.nowNs();
 
     var next_tok: u32 = try model.prefillPrompt(prompt_ids, true);
+    if (cli.temperature > 0.0) {
+        next_tok = try model.sampleFromLastLogits(cli.temperature, req_rng.?.random(), p_res);
+    }
     var pos: u32 = @intCast(prompt_ids.len);
     const prefill_t1 = try aminfer.vmstat.nowNs();
 
@@ -561,6 +604,9 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
             const dec_t0 = try aminfer.vmstat.nowNs();
             while (gen_count < cli.max_tokens) {
                 next_tok = try model.stepDecode(next_tok, pos);
+                if (cli.temperature > 0.0) {
+                    next_tok = try model.sampleFromLastLogits(cli.temperature, req_rng.?.random(), p_res);
+                }
                 pos += 1;
                 generated[gen_count] = next_tok;
                 gen_count += 1;
@@ -592,9 +638,15 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
     else
         0.0;
 
+    const dec_seed_used: u64 = if (req_rng) |rr| rr.seed_used else (cli.seed orelse 0);
+    const dec_seed_source: []const u8 = if (req_rng) |rr| rr.seedSourceName() else "greedy";
+
     try out.print(
         \\decode.arch                      {s} ({s})
         \\decode.prefill_mode              {s}
+        \\decode.temperature               {d:.2}
+        \\decode.seed_used                 {d}
+        \\decode.seed_source               {s}
         \\decode.layers                    {d}
         \\decode.shards                    {d}
         \\decode.wired_mib                 {d}
@@ -613,6 +665,9 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         cfg.arch.label(),
         cfg.precisionLabel(),
         cli.prefill_mode.label(),
+        cli.temperature,
+        dec_seed_used,
+        dec_seed_source,
         cfg.num_hidden_layers,
         model.shardCount(),
         model.totalWiredBytes() >> 20,
@@ -627,6 +682,9 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         decode_heap_delta.size_in_use,
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
     });
+    if (model.hasSme2Weights()) {
+        try out.writeAll("decode.sme2_weights              yes\n");
+    }
     if (model.coldStats()) |cs| {
         try writeColdExpertStats("decode", cs, out);
     }
@@ -702,6 +760,11 @@ fn runBenchM4(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try report.write(out);
 }
 
+fn runBenchM45(allocator: std.mem.Allocator, out: *Io.Writer) !void {
+    const report = try aminfer.bench.runM45(allocator);
+    try report.write(out);
+}
+
 fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM1(allocator, out);
     try out.flush();
@@ -712,6 +775,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM3(allocator, out);
     try out.flush();
     try runBenchM4(allocator, out);
+    try out.flush();
+    try runBenchM45(allocator, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -723,13 +788,14 @@ const SpecDecodeCliArgs = struct {
     draft_config_path: ?[:0]const u8 = null,
     draft_mode: ?aminfer.draft.DraftMode = null,
     placement: aminfer.draft.Placement = .auto,
+    sme_router_mode: aminfer.qwen3.SmeRouterMode = .auto,
     max_tree_nodes: u16 = 16,
     max_draft_depth: u16 = 4,
     branch_width: u16 = 2,
     top_k: u32 = 3,
     enable_pruning: bool = true,
     temperature: f32 = 0.0,
-    seed: u64 = 42,
+    seed: ?u64 = null,
     max_tokens: u32 = 64,
     ignore_eos: bool = false,
     verify_crcs: bool = true,
@@ -752,13 +818,14 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var draft_config_path: ?[:0]const u8 = null;
     var draft_mode: ?aminfer.draft.DraftMode = null;
     var placement: aminfer.draft.Placement = .auto;
+    var sme_router_mode: aminfer.qwen3.SmeRouterMode = .auto;
     var max_tree_nodes: u16 = 16;
     var max_draft_depth: u16 = 4;
     var branch_width: u16 = 2;
     var top_k: u32 = 3;
     var enable_pruning = true;
     var temperature: f32 = 0.0;
-    var seed: u64 = 42;
+    var seed: ?u64 = null;
     var max_tokens: u32 = 64;
     var ignore_eos = false;
     var verify_crcs = true;
@@ -806,6 +873,10 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             placement = try aminfer.draft.Placement.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--sme-router")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            sme_router_mode = try aminfer.qwen3.SmeRouterMode.parse(args[i]);
         } else if (std.mem.eql(u8, flag, "--max-tree-nodes")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -828,6 +899,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             temperature = try std.fmt.parseFloat(f32, args[i]);
+            if (!std.math.isFinite(temperature) or temperature < 0.0) return error.InvalidTemperature;
         } else if (std.mem.eql(u8, flag, "--seed")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -884,6 +956,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .draft_config_path = draft_config_path,
         .draft_mode = draft_mode,
         .placement = placement,
+        .sme_router_mode = sme_router_mode,
         .max_tree_nodes = max_tree_nodes,
         .max_draft_depth = max_draft_depth,
         .branch_width = branch_width,
@@ -990,6 +1063,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         .ane_predictor_path = cli.ane_predictor_path,
         .prefill_mode = cli.prefill_mode,
         .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
+        .sme_router_mode = cli.sme_router_mode,
     });
     defer model.deinit(allocator);
 
@@ -1052,8 +1126,13 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
     var gen_count: usize = 0;
     var round_buf: [aminfer.engine.MAX_TREE_NODES]u32 = undefined;
 
-    var prng = std.Random.DefaultPrng.init(cli.seed);
-    const rng_opt: ?std.Random = if (cli.temperature > 0.0) prng.random() else null;
+    // Two-tier per-request sampling RNG (D11): hardware Secure Enclave TRNG via
+    // `getentropy(2)` when `T > 0` and `--seed` is omitted; deterministic replay when provided.
+    var req_rng: ?aminfer.rng.RequestRng = if (cli.temperature > 0.0)
+        try aminfer.rng.RequestRng.init(cli.seed)
+    else
+        null;
+    const rng_opt: ?std.Random = if (req_rng != null) req_rng.?.random() else null;
 
     const vm_before = try aminfer.vmstat.Snapshot.capture();
     const prefill_t0 = try aminfer.vmstat.nowNs();
@@ -1149,9 +1228,29 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         }
     }
 
+    if (cfg.arch == .qwen3_moe) {
+        const rcal = eng.routerPredCalibration();
+        try out.print(
+            \\spec.router_pred_backend         {s} (requested={s})
+            \\spec.router_pred_cal             sme2_us={d:.1} gpu_us={d:.1} bank_kib={d:.1}
+            \\
+        , .{
+            rcal.backend.label(),
+            cli.sme_router_mode.label(),
+            rcal.sme2_us,
+            rcal.gpu_us,
+            @as(f64, @floatFromInt(rcal.bank_bytes)) / 1024.0,
+        });
+    }
+
+    const spec_seed_used: u64 = if (req_rng) |rr| rr.seed_used else (cli.seed orelse 0);
+    const spec_seed_source: []const u8 = if (req_rng) |rr| rr.seedSourceName() else "greedy";
+
     try out.print(
         \\spec.pruning                     {s} (cap={d}, depth={d}, width={d})
         \\spec.temperature                 {d:.2}
+        \\spec.seed_used                   {d}
+        \\spec.seed_source                 {s}
         \\spec.layers                      {d}
         \\spec.shards                      {d}
         \\spec.wired_mib                   {d}
@@ -1166,6 +1265,8 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         cli.max_draft_depth,
         cli.branch_width,
         cli.temperature,
+        spec_seed_used,
+        spec_seed_source,
         cfg.num_hidden_layers,
         model.shardCount(),
         eng.totalWiredBytes() >> 20,
@@ -1281,6 +1382,12 @@ fn probe(out: *Io.Writer) !void {
         \\sys.memory_mib                   {d}
         \\cpu.performance_cores            {d}
         \\cpu.efficiency_cores             {d}
+        \\cpu.pcore_clusters               {d}
+        \\cpu.pcore_l2_kib                 {d}
+        \\cpu.sme2                         {}
+        \\cpu.sme_bf16f32                  {}
+        \\cpu.sme_f16f32                   {}
+        \\cpu.sme_svl_bytes                {d}
         \\wire.user_limit_bytes            {d}
         \\wire.global_limit_bytes          {d}
         \\wire.gpu_limit_mib               {d}
@@ -1290,6 +1397,12 @@ fn probe(out: *Io.Writer) !void {
         facts.memory_bytes >> 20,
         facts.performance_cores,
         facts.efficiency_cores,
+        facts.pcore_clusters,
+        facts.pcoreL2Kib(),
+        facts.has_sme2,
+        facts.has_sme_b16f32,
+        facts.has_sme_f16f32,
+        facts.sme_max_svl_bytes,
         facts.user_wire_limit,
         facts.global_user_wire_limit,
         facts.gpu_wired_limit_mib,
@@ -1374,10 +1487,54 @@ test "parseSpecDecodeArgs parses all speculative decoding flags and validates er
     try std.testing.expectEqual(@as(u32, 5), ok.top_k);
     try std.testing.expect(!ok.enable_pruning);
     try std.testing.expectApproxEqAbs(@as(f32, 0.7), ok.temperature, 1e-6);
-    try std.testing.expectEqual(@as(u64, 123), ok.seed);
+    try std.testing.expectEqual(@as(?u64, 123), ok.seed);
     try std.testing.expectEqual(@as(u32, 64), ok.max_tokens);
     try std.testing.expect(ok.ignore_eos);
     try std.testing.expect(!ok.verify_crcs);
+
+    // Default `--seed` is null (Secure Enclave TRNG D11) and `--sme-router` defaults to `auto`.
+    const defaults = try parseSpecDecodeArgs(&.{
+        "--amf",       "t.amf",
+        "--config",    "c.json",
+        "--tokenizer", "k.json",
+    });
+    try std.testing.expectEqual(@as(?u64, null), defaults.seed);
+    try std.testing.expectEqual(aminfer.qwen3.SmeRouterMode.auto, defaults.sme_router_mode);
+
+    const sme_cli = try parseSpecDecodeArgs(&.{
+        "--amf",        "t.amf",
+        "--config",     "c.json",
+        "--tokenizer",  "k.json",
+        "--sme-router", "sme2",
+    });
+    try std.testing.expectEqual(aminfer.qwen3.SmeRouterMode.sme2, sme_cli.sme_router_mode);
+
+    const dec_trng = try parseDecodeArgs(&.{
+        "--amf",         "m.amf",
+        "--config",      "c.json",
+        "--tokenizer",   "t.json",
+        "--temperature", "0.7",
+        "--sme-router",  "gpu",
+    });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), dec_trng.temperature, 1e-6);
+    try std.testing.expectEqual(@as(?u64, null), dec_trng.seed);
+    try std.testing.expectEqual(aminfer.qwen3.SmeRouterMode.gpu, dec_trng.sme_router_mode);
+
+    const dec_seeded = try parseDecodeArgs(&.{
+        "--amf",         "m.amf",
+        "--config",      "c.json",
+        "--tokenizer",   "t.json",
+        "--temperature", "0.7",
+        "--seed",        "9876543210",
+    });
+    try std.testing.expectEqual(@as(?u64, 9876543210), dec_seeded.seed);
+
+    try std.testing.expectError(error.InvalidSmeRouterMode, parseSpecDecodeArgs(&.{
+        "--amf",        "t.amf",
+        "--config",     "c.json",
+        "--tokenizer",  "k.json",
+        "--sme-router", "npu",
+    }));
 
     try std.testing.expectError(error.InvalidDraftMode, parseSpecDecodeArgs(&.{
         "--amf",        "t.amf",

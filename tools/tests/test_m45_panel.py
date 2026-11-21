@@ -699,6 +699,187 @@ class Sme2Panel64Tests(unittest.TestCase):
                 for r in range(n):
                     self.assertEqual(got[r], vals[r * k : (r + 1) * k])
 
+    def test_python_repack_sme2_zig_numerical_decode_spec_and_trng_parity(self) -> None:
+        """End-to-end cross-language Python repack-sme2 -> Zig SME2 decode/spec-decode numerical parity & D11 TRNG."""
+        if not AMINFER_BIN.exists():
+            raise AssertionError(f"missing {AMINFER_BIN}; run `zig build` first")
+
+        def parse_field(stdout: str, key: str) -> str:
+            for line in stdout.splitlines():
+                if line.startswith(key):
+                    return line[len(key) :].strip()
+            raise AssertionError(f"missing {key!r} in output:\n{stdout}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            for preset, target_modes in (("tiny-moe", ("routers", "all-linear")), ("tiny-dense", ("all-linear",))):
+                out_dir = tmp / preset
+                rc = main(["synth-qwen3", "--preset", preset, "--output-dir", str(out_dir)])
+                self.assertEqual(rc, 0)
+                amf_row = out_dir / "model.amf"
+                cfg_path = out_dir / "config.json"
+                tok_path = out_dir / "tokenizer.json"
+
+                base_dec = subprocess.run(
+                    [
+                        str(AMINFER_BIN),
+                        "decode",
+                        "--amf",
+                        str(amf_row),
+                        "--config",
+                        str(cfg_path),
+                        "--tokenizer",
+                        str(tok_path),
+                        "--prompt",
+                        "hello world",
+                        "--max-tokens",
+                        "6",
+                        "--ignore-eos",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(base_dec.returncode, 0, msg=f"{base_dec.stderr}\n{base_dec.stdout}")
+                base_toks = parse_field(base_dec.stdout, "decode.token_ids")
+                self.assertEqual(parse_field(base_dec.stdout, "decode.swapouts_delta"), "0")
+
+                for tmode in target_modes:
+                    amf_sme = out_dir / f"model_{tmode.replace('-', '_')}.amf"
+                    rc_rp = main(
+                        [
+                            "repack-sme2",
+                            "--input",
+                            str(amf_row),
+                            "--output",
+                            str(amf_sme),
+                            "--targets",
+                            tmode,
+                        ]
+                    )
+                    self.assertEqual(rc_rp, 0)
+
+                    sme_dec = subprocess.run(
+                        [
+                            str(AMINFER_BIN),
+                            "decode",
+                            "--amf",
+                            str(amf_sme),
+                            "--config",
+                            str(cfg_path),
+                            "--tokenizer",
+                            str(tok_path),
+                            "--prompt",
+                            "hello world",
+                            "--max-tokens",
+                            "6",
+                            "--ignore-eos",
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    self.assertEqual(sme_dec.returncode, 0, msg=f"{sme_dec.stderr}\n{sme_dec.stdout}")
+                    self.assertEqual(parse_field(sme_dec.stdout, "decode.token_ids"), base_toks)
+                    self.assertEqual(parse_field(sme_dec.stdout, "decode.sme2_weights"), "yes")
+                    self.assertEqual(parse_field(sme_dec.stdout, "decode.swapouts_delta"), "0")
+
+                    sme_spec = subprocess.run(
+                        [
+                            str(AMINFER_BIN),
+                            "spec-decode",
+                            "--amf",
+                            str(amf_sme),
+                            "--config",
+                            str(cfg_path),
+                            "--tokenizer",
+                            str(tok_path),
+                            "--prompt",
+                            "hello world",
+                            "--max-tokens",
+                            "6",
+                            "--ignore-eos",
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    self.assertEqual(sme_spec.returncode, 0, msg=f"{sme_spec.stderr}\n{sme_spec.stdout}")
+                    self.assertEqual(parse_field(sme_spec.stdout, "spec.token_ids"), base_toks)
+                    self.assertEqual(parse_field(sme_spec.stdout, "spec.swapouts_delta"), "0")
+                    if preset == "tiny-moe":
+                        self.assertIn("sme2_single_owner", parse_field(sme_spec.stdout, "spec.router_pred_backend"))
+
+            # Verify D11 Secure Enclave TRNG seeding & bit-exact explicit replay via CLI `decode`.
+            dense_dir = tmp / "tiny-dense"
+            trng_runs = []
+            for _ in range(2):
+                p = subprocess.run(
+                    [
+                        str(AMINFER_BIN),
+                        "decode",
+                        "--amf",
+                        str(dense_dir / "model.amf"),
+                        "--config",
+                        str(dense_dir / "config.json"),
+                        "--tokenizer",
+                        str(dense_dir / "tokenizer.json"),
+                        "--prompt",
+                        "hello world",
+                        "--max-tokens",
+                        "6",
+                        "--temperature",
+                        "0.8",
+                        "--ignore-eos",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(p.returncode, 0, msg=f"{p.stderr}\n{p.stdout}")
+                self.assertEqual(parse_field(p.stdout, "decode.seed_source"), "hardware_trng")
+                trng_runs.append((parse_field(p.stdout, "decode.seed_used"), parse_field(p.stdout, "decode.token_ids")))
+            self.assertNotEqual(trng_runs[0][0], trng_runs[1][0])
+
+            replay = subprocess.run(
+                [
+                    str(AMINFER_BIN),
+                    "decode",
+                    "--amf",
+                    str(dense_dir / "model.amf"),
+                    "--config",
+                    str(dense_dir / "config.json"),
+                    "--tokenizer",
+                    str(dense_dir / "tokenizer.json"),
+                    "--prompt",
+                    "hello world",
+                    "--max-tokens",
+                    "6",
+                    "--temperature",
+                    "0.8",
+                    "--seed",
+                    trng_runs[0][0],
+                    "--ignore-eos",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(replay.returncode, 0, msg=f"{replay.stderr}\n{replay.stdout}")
+            self.assertEqual(parse_field(replay.stdout, "decode.seed_source"), "explicit")
+            self.assertEqual(parse_field(replay.stdout, "decode.seed_used"), trng_runs[0][0])
+            self.assertEqual(parse_field(replay.stdout, "decode.token_ids"), trng_runs[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()
