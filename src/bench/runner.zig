@@ -26,6 +26,9 @@ const qos = @import("../platform/qos.zig");
 const ngram_nvme = @import("../spec/ngram_nvme.zig");
 const server_mod = @import("../server/http_sse.zig");
 const hybrid = @import("../gpu/hybrid.zig");
+const vision = @import("../gpu/vision.zig");
+const batch_sched = @import("../runtime/batch_scheduler.zig");
+const rng_mod = @import("../runtime/rng.zig");
 const ple = @import("../storage/ple.zig");
 const graph = @import("../model/graph.zig");
 
@@ -1431,6 +1434,7 @@ pub const DecodeBenchOptions = struct {
     ane_predictor_path: ?[:0]const u8 = null,
     prefill_mode: qwen3.PrefillMode = .auto,
     enable_hybrid_prefill: bool = false,
+    kv_retire_q8_after_chunks: u32 = 0,
 };
 
 pub const DecodeBenchResult = struct {
@@ -1451,6 +1455,10 @@ pub const DecodeBenchResult = struct {
     measured_bytes_per_tok: u64,
     extrapolated_bytes_per_tok: u64,
     cold_stats: ?qwen3.ColdExpertStats = null,
+    retired_kv_chunks: u32 = 0,
+    kv_retire_events: u64 = 0,
+    active_kv_wired_bytes: u64 = 0,
+    retired_kv_wired_bytes: u64 = 0,
     heap_delta: vmstat.HeapDelta,
     swapouts_delta: u64,
     pageouts_delta: u64,
@@ -1590,6 +1598,18 @@ pub const DecodeBenchResult = struct {
                 ct.evictions,
             });
         }
+        if (self.retired_kv_chunks > 0 or self.kv_retire_events > 0) {
+            try out.print(
+                \\decode_bench.retired_kv_chunks   {d} (events={d})
+                \\decode_bench.kv_wired_mib        active={d:.2} retired_q8={d:.2}
+                \\
+            , .{
+                self.retired_kv_chunks,
+                self.kv_retire_events,
+                @as(f64, @floatFromInt(self.active_kv_wired_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(self.retired_kv_wired_bytes)) / (1024.0 * 1024.0),
+            });
+        }
     }
 };
 
@@ -1616,6 +1636,7 @@ pub fn runDecodeBenchFromFile(
         .ane_predictor_path = opts.ane_predictor_path,
         .prefill_mode = opts.prefill_mode,
         .enable_hybrid_prefill = opts.enable_hybrid_prefill,
+        .kv_retire_q8_after_chunks = opts.kv_retire_q8_after_chunks,
     });
     defer model.deinit(allocator);
     const load_t1 = try vmstat.nowNs();
@@ -1684,6 +1705,10 @@ pub fn runDecodeBenchFromFile(
         .measured_bytes_per_tok = measured_bytes,
         .extrapolated_bytes_per_tok = extrapolated_bytes,
         .cold_stats = timed_cold_stats,
+        .retired_kv_chunks = model.retiredKvChunks(),
+        .kv_retire_events = model.kvRetireEvents(),
+        .active_kv_wired_bytes = model.activeKvWiredBytes(),
+        .retired_kv_wired_bytes = model.retiredKvWiredBytes(),
         .heap_delta = vmstat.heapDelta(heap_before, heap_after),
         .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
         .pageouts_delta = vmstat.Snapshot.pageoutDelta(vm_before, vm_after),
@@ -5887,6 +5912,7 @@ pub const GraphDecodeBenchOptions = struct {
     max_loops_override: ?u32 = null,
     enable_loop_early_exit: bool = false,
     cold_slot_count: u32 = 0,
+    kv_retire_q8_after_chunks: u32 = 0,
 };
 
 pub const GraphDecodeBenchResult = struct {
@@ -5907,6 +5933,10 @@ pub const GraphDecodeBenchResult = struct {
     loop_isolation: graph.LoopIsolationStats,
     ple_stats: ?ple.Stats,
     cold_stats: ?qwen3.ColdExpertStats,
+    retired_kv_chunks: u32 = 0,
+    kv_retire_events: u64 = 0,
+    active_kv_wired_bytes: u64 = 0,
+    retired_kv_wired_bytes: u64 = 0,
     heap_delta: vmstat.HeapDelta,
     swapouts_delta: u64,
     pageouts_delta: u64,
@@ -5981,6 +6011,18 @@ pub const GraphDecodeBenchResult = struct {
             self.swapouts_delta,
             self.pageouts_delta,
         });
+        if (self.retired_kv_chunks > 0 or self.kv_retire_events > 0) {
+            try out.print(
+                \\graph_bench.retired_kv_chunks    {d} (events={d})
+                \\graph_bench.kv_wired_mib         active={d:.2} retired_q8={d:.2}
+                \\
+            , .{
+                self.retired_kv_chunks,
+                self.kv_retire_events,
+                @as(f64, @floatFromInt(self.active_kv_wired_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(self.retired_kv_wired_bytes)) / (1024.0 * 1024.0),
+            });
+        }
     }
 };
 
@@ -6004,6 +6046,7 @@ pub fn runGraphDecodeBenchFromFile(
         .max_loops_override = opts.max_loops_override,
         .enable_loop_early_exit = opts.enable_loop_early_exit,
         .cold_slot_count = opts.cold_slot_count,
+        .kv_retire_q8_after_chunks = opts.kv_retire_q8_after_chunks,
     });
     defer model.deinit(allocator);
     const load_t1 = try vmstat.nowNs();
@@ -6056,6 +6099,10 @@ pub fn runGraphDecodeBenchFromFile(
         .loop_isolation = model.loopIsolationStats(),
         .ple_stats = model.pleStats(),
         .cold_stats = model.coldExpertStats(),
+        .retired_kv_chunks = model.retiredKvChunks(),
+        .kv_retire_events = model.kvRetireEvents(),
+        .active_kv_wired_bytes = model.activeKvWiredBytes(),
+        .retired_kv_wired_bytes = model.retiredKvWiredBytes(),
         .heap_delta = vmstat.heapDelta(heap_before, heap_after),
         .swapouts_delta = vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
         .pageouts_delta = vmstat.Snapshot.pageoutDelta(vm_before, vm_after),
@@ -7915,6 +7962,1751 @@ pub fn runM6(allocator: std.mem.Allocator) !M6Report {
     return runM6WithConfig(allocator, .{});
 }
 
+// ===========================================================================
+// M6.5 Comprehensive Benchmark Suite (`G14`, `R5`, `R8`, `C14`)
+// ===========================================================================
+
+pub const M65Config = struct {
+    // Section 1: G14 Hardware VideoToolbox -> Zero-Copy IOSurface -> Metal 4 Vision + 3D MRoPE
+    vision_width: u32 = 448,
+    vision_height: u32 = 448,
+    vision_patch_size: u32 = 14,
+    vision_spatial_merge: u32 = 2,
+    vision_hidden: u32 = 1024,
+    vision_frames: u32 = 8,
+    vision_reps: u32 = 16,
+
+    // Section 2: R5 32,768-tok Retired group-64 q8 KV Tier (Qwen3-30B-A3B geometry)
+    r5_q_heads: u32 = 32,
+    r5_kv_heads: u32 = 4,
+    r5_head_dim: u32 = 128,
+    r5_chunk_tokens: u32 = 512,
+    r5_total_chunks: u32 = 64,
+    r5_active_chunks: u32 = 4,
+    r5_tree_nodes: u32 = 16,
+    r5_reps: u32 = 16,
+
+    // Section 3: R8 PrefixCache (1,024-tok & 1,200-tok) + GPU CoW Tail + GDN Snapshot Clone
+    r8_layers: u32 = 4,
+    r8_hidden: u32 = 512,
+    r8_q_heads: u32 = 8,
+    r8_kv_heads: u32 = 4,
+    r8_head_dim: u32 = 64,
+    r8_inter: u32 = 1024,
+    r8_vocab: u32 = 256,
+    r8_chunk_tokens: u32 = 512,
+    r8_prefix_exact_tokens: u32 = 1024,
+    r8_prefix_partial_tokens: u32 = 1200,
+    r8_suffix_tokens: u32 = 16,
+    r8_max_slots: u32 = 8,
+    r8_gdn_layers: u32 = 36,
+    r8_gdn_k_heads: u32 = 16,
+    r8_gdn_v_heads: u32 = 32,
+    r8_gdn_head_k: u32 = 128,
+    r8_gdn_head_v: u32 = 128,
+    r8_gdn_reps: u32 = 16,
+
+    // Section 4: C14 Continuous Batching (B = 1, 2, 4, 8) + DomainNgramRegistry
+    c14_moe_layers: u32 = 4,
+    c14_moe_hidden: u32 = 512,
+    c14_moe_q_heads: u32 = 8,
+    c14_moe_kv_heads: u32 = 4,
+    c14_moe_head_dim: u32 = 64,
+    c14_moe_num_experts: u32 = 16,
+    c14_moe_top_k: u32 = 4,
+    c14_moe_inter: u32 = 256,
+    c14_moe_vocab: u32 = 256,
+    c14_hybrid_hidden: u32 = 256,
+    c14_hybrid_q_heads: u32 = 4,
+    c14_hybrid_kv_heads: u32 = 2,
+    c14_hybrid_head_dim: u32 = 64,
+    c14_hybrid_gdn_kh: u32 = 4,
+    c14_hybrid_gdn_vh: u32 = 8,
+    c14_hybrid_gdn_kd: u32 = 64,
+    c14_hybrid_gdn_vd: u32 = 64,
+    c14_hybrid_moe_inter: u32 = 256,
+    c14_hybrid_num_experts: u32 = 8,
+    c14_hybrid_top_k: u32 = 2,
+    c14_hybrid_vocab: u32 = 256,
+    c14_prefill_tokens: u32 = 32,
+    c14_decode_steps: u32 = 16,
+    c14_ngram_queries: u32 = 32,
+    use_synthetic_ngram_packs: bool = false,
+
+    timeout_ms: u32 = 30_000,
+};
+
+pub const M65VisionRow = struct {
+    label: []const u8,
+    width: u32,
+    height: u32,
+    vision_tokens: u32,
+    hw_decoder: bool,
+    all_zero_copy: bool,
+    all_page_aligned: bool,
+    vt_decode_us: f64,
+    gpu_vision_us: f64,
+    total_us: f64,
+    fps: f64,
+    gpu_gbs: f64,
+    steady_malloc_blocks: i64,
+};
+
+pub const M65R5Report = struct {
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32,
+    total_chunks: u32,
+    active_chunks: u32,
+    retired_chunks: u32,
+    seq_len: u32,
+    tree_nodes: u32,
+    pure_fp16_bytes_per_layer: u64,
+    tiered_q8_bytes_per_layer: u64,
+    active_iosurface_bytes_per_layer: u64,
+    retired_q8_bytes_per_layer: u64,
+    wired_bytes_saved_per_layer: u64,
+    wired_reduction_pct: f64,
+    retire_chunk_us: f64,
+    retire_total_us: f64,
+    fp16_decode_us: f64,
+    fp16_decode_gbs: f64,
+    tiered_decode_us: f64,
+    tiered_decode_gbs: f64,
+    fp16_tree_us: f64,
+    fp16_tree_gbs: f64,
+    tiered_tree_us: f64,
+    tiered_tree_gbs: f64,
+    decode_max_abs_err: f32,
+    tree_max_abs_err: f32,
+};
+
+pub const M65R8Report = struct {
+    exact_prefix_tokens: u32,
+    partial_prefix_tokens: u32,
+    suffix_tokens: u32,
+    chunk_tokens: u32,
+    uncached_exact_ms: f64,
+    cached_exact_ms: f64,
+    speedup_exact: f64,
+    matched_exact_tokens: u32,
+    exact_cow_copies: u64,
+    uncached_partial_ms: f64,
+    cached_partial_ms: f64,
+    speedup_partial: f64,
+    matched_partial_tokens: u32,
+    partial_cow_copies: u64,
+    partial_bit_exact: bool,
+    cow_tail_tokens: u32,
+    cow_tail_us: f64,
+    slots_shared_4_saved_mib: f64,
+    slots_shared_8_saved_mib: f64,
+    qwen30b_48l_8slot_saved_mib: f64,
+    gdn_layers: u32,
+    gdn_snapshot_bytes: u64,
+    gdn_clone_us: f64,
+    gdn_clone_gbs: f64,
+    gdn_clone_bit_exact: bool,
+};
+
+pub const M65BatchScalingRow = struct {
+    batch_size: u32,
+    step_ms: f64,
+    per_slot_tok_s: f64,
+    agg_tok_s: f64,
+    scaling_vs_b1: f64,
+    steady_malloc_blocks: i64,
+};
+
+pub const M65NgramReport = struct {
+    real_packs: bool,
+    pack_count: usize,
+    total_entries: u64,
+    wired_bytes: u64,
+    cold_p50_us: f64,
+    cold_p99_us: f64,
+    cache_hit_us: f64,
+    select_default_ns: f64,
+    swap_pack_us: f64,
+    hits_repo: u64,
+    hits_docs: u64,
+    steady_malloc_blocks: i64,
+};
+
+pub const M65Report = struct {
+    vision_rows: [4]M65VisionRow,
+    r5: M65R5Report,
+    r8: M65R8Report,
+    c14_moe_rows: [4]M65BatchScalingRow,
+    c14_hybrid_rows: [4]M65BatchScalingRow,
+    ngram: M65NgramReport,
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn write(self: *const M65Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.writeAll("=== M6.5 G14 Zero-Copy Hardware VideoToolbox + Metal 4 Vision Ingress ===\n");
+        try out.writeAll("path             res      tokens  hw_vt  zero_copy  page16k  vt_us     gpu_us    total_us  fps      gpu_gbs  malloc_blk\n");
+        for (self.vision_rows) |row| {
+            try out.print(
+                "{s:<16} {d}x{d:<4} {d:<7} {s:<6} {s:<10} {s:<8} {d:<9.1} {d:<9.1} {d:<9.1} {d:<8.1} {d:<8.2} {d}\n",
+                .{
+                    row.label,
+                    row.width,
+                    row.height,
+                    row.vision_tokens,
+                    if (row.hw_decoder) "yes" else "no",
+                    if (row.all_zero_copy) "yes" else "no",
+                    if (row.all_page_aligned) "yes" else "no",
+                    row.vt_decode_us,
+                    row.gpu_vision_us,
+                    row.total_us,
+                    row.fps,
+                    row.gpu_gbs,
+                    row.steady_malloc_blocks,
+                },
+            );
+        }
+
+        try out.print(
+            \\
+            \\=== M6.5 R5 32K Retired Group-64 q8 KV Tier (1 Layer) ===
+            \\r5.geometry                      q={d} kv={d} d={d} chunk={d} seq_len={d} ({d} retired q8 + {d} active fp16)
+            \\r5.pure_fp16_mib_per_layer       {d:.2} ({d} bytes)
+            \\r5.tiered_q8_mib_per_layer       {d:.2} (active={d:.2} MiB, retired_q8={d:.2} MiB, {d} bytes)
+            \\r5.wired_saved_per_layer         {d:.2} MiB (-{d:.2}%)
+            \\r5.retire_per_chunk_us           {d:.2} (total {d} chunks: {d:.1} us)
+            \\r5.decode_fp16_vs_tiered_us      fp16={d:.2} us ({d:.2} GB/s) vs tiered_q8={d:.2} us ({d:.2} GB/s)
+            \\r5.tree_m{d}_fp16_vs_tiered_us    fp16={d:.2} us ({d:.2} GB/s) vs tiered_q8={d:.2} us ({d:.2} GB/s)
+            \\r5.max_abs_err                   decode={d:.6} tree={d:.6}
+            \\
+        , .{
+            self.r5.q_heads,
+            self.r5.kv_heads,
+            self.r5.head_dim,
+            self.r5.chunk_tokens,
+            self.r5.seq_len,
+            self.r5.retired_chunks,
+            self.r5.active_chunks,
+            @as(f64, @floatFromInt(self.r5.pure_fp16_bytes_per_layer)) / (1024.0 * 1024.0),
+            self.r5.pure_fp16_bytes_per_layer,
+            @as(f64, @floatFromInt(self.r5.tiered_q8_bytes_per_layer)) / (1024.0 * 1024.0),
+            @as(f64, @floatFromInt(self.r5.active_iosurface_bytes_per_layer)) / (1024.0 * 1024.0),
+            @as(f64, @floatFromInt(self.r5.retired_q8_bytes_per_layer)) / (1024.0 * 1024.0),
+            self.r5.tiered_q8_bytes_per_layer,
+            @as(f64, @floatFromInt(self.r5.wired_bytes_saved_per_layer)) / (1024.0 * 1024.0),
+            self.r5.wired_reduction_pct,
+            self.r5.retire_chunk_us,
+            self.r5.retired_chunks,
+            self.r5.retire_total_us,
+            self.r5.fp16_decode_us,
+            self.r5.fp16_decode_gbs,
+            self.r5.tiered_decode_us,
+            self.r5.tiered_decode_gbs,
+            self.r5.tree_nodes,
+            self.r5.fp16_tree_us,
+            self.r5.fp16_tree_gbs,
+            self.r5.tiered_tree_us,
+            self.r5.tiered_tree_gbs,
+            self.r5.decode_max_abs_err,
+            self.r5.tree_max_abs_err,
+        });
+
+        try out.print(
+            \\
+            \\=== M6.5 R8 Shared PrefixCache + GPU CoW Tail + GDN Snapshot Clone ===
+            \\r8.exact_prefix_{d}tok           uncached={d:.3} ms vs cached={d:.3} ms ({d:.2}x, matched={d}, cow={d})
+            \\r8.partial_prefix_{d}tok         uncached={d:.3} ms vs cached={d:.3} ms ({d:.2}x, matched={d}, cow={d}, bit_exact={s})
+            \\r8.cow_tail_{d}tok_us             {d:.2} us
+            \\r8.kv_wired_saved_mib            4_slots={d:.2} MiB 8_slots={d:.2} MiB (Qwen3-30B-48L 8_slots={d:.1} MiB)
+            \\r8.gdn_snapshot_clone            layers={d} bytes={d} ({d:.2} MiB) clone_us={d:.2} ({d:.2} GB/s, bit_exact={s})
+            \\
+        , .{
+            self.r8.exact_prefix_tokens,
+            self.r8.uncached_exact_ms,
+            self.r8.cached_exact_ms,
+            self.r8.speedup_exact,
+            self.r8.matched_exact_tokens,
+            self.r8.exact_cow_copies,
+            self.r8.partial_prefix_tokens,
+            self.r8.uncached_partial_ms,
+            self.r8.cached_partial_ms,
+            self.r8.speedup_partial,
+            self.r8.matched_partial_tokens,
+            self.r8.partial_cow_copies,
+            if (self.r8.partial_bit_exact) "yes" else "no",
+            self.r8.cow_tail_tokens,
+            self.r8.cow_tail_us,
+            self.r8.slots_shared_4_saved_mib,
+            self.r8.slots_shared_8_saved_mib,
+            self.r8.qwen30b_48l_8slot_saved_mib,
+            self.r8.gdn_layers,
+            self.r8.gdn_snapshot_bytes,
+            @as(f64, @floatFromInt(self.r8.gdn_snapshot_bytes)) / (1024.0 * 1024.0),
+            self.r8.gdn_clone_us,
+            self.r8.gdn_clone_gbs,
+            if (self.r8.gdn_clone_bit_exact) "yes" else "no",
+        });
+
+        try out.writeAll("\n=== M6.5 C14 Continuous Batching Scaling (GQA + MoE q4) ===\n");
+        try out.writeAll("batch  step_ms   slot_tok_s  agg_tok_s   scaling_vs_b1  malloc_blk\n");
+        for (self.c14_moe_rows) |row| {
+            try out.print(
+                "B={d:<4} {d:<9.3} {d:<11.2} {d:<11.2} {d:<14.2} {d}\n",
+                .{
+                    row.batch_size,
+                    row.step_ms,
+                    row.per_slot_tok_s,
+                    row.agg_tok_s,
+                    row.scaling_vs_b1,
+                    row.steady_malloc_blocks,
+                },
+            );
+        }
+
+        try out.writeAll("\n=== M6.5 C14 Continuous Batching Scaling (Hybrid GDN + QSA + MoE q4) ===\n");
+        try out.writeAll("batch  step_ms   slot_tok_s  agg_tok_s   scaling_vs_b1  malloc_blk\n");
+        for (self.c14_hybrid_rows) |row| {
+            try out.print(
+                "B={d:<4} {d:<9.3} {d:<11.2} {d:<11.2} {d:<14.2} {d}\n",
+                .{
+                    row.batch_size,
+                    row.step_ms,
+                    row.per_slot_tok_s,
+                    row.agg_tok_s,
+                    row.scaling_vs_b1,
+                    row.steady_malloc_blocks,
+                },
+            );
+        }
+
+        try out.print(
+            \\
+            \\=== M6.5 C14 DomainNgramRegistry Multi-Pack Lookup & Atomic Hot-Swap ===
+            \\ngram.packs                      source={s} count={d} total_entries={d} wired_bytes={d}
+            \\ngram.cold_query_us              p50={d:.2} p99={d:.2}
+            \\ngram.cache_hit_us               {d:.2}
+            \\ngram.select_default_ns          {d:.1}
+            \\ngram.atomic_swap_pack_us        {d:.2}
+            \\ngram.domain_hits                repo={d} docs={d}
+            \\ngram.steady_malloc_blocks       {d}
+            \\
+            \\m65.swap.status                  ok (swapouts_delta={d}, pageouts_delta={d})
+            \\
+        , .{
+            if (self.ngram.real_packs) "real-ang" else "synthetic",
+            self.ngram.pack_count,
+            self.ngram.total_entries,
+            self.ngram.wired_bytes,
+            self.ngram.cold_p50_us,
+            self.ngram.cold_p99_us,
+            self.ngram.cache_hit_us,
+            self.ngram.select_default_ns,
+            self.ngram.swap_pack_us,
+            self.ngram.hits_repo,
+            self.ngram.hits_docs,
+            self.ngram.steady_malloc_blocks,
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+fn runM65VisionBench(allocator: std.mem.Allocator, cfg: M65Config) ![4]M65VisionRow {
+    const device = try metal.Device.open();
+    defer device.close();
+    const facts = try sysinfo.Facts.read();
+    const dev_info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+
+    const geom: vision.PatchGeometry = .{
+        .width = cfg.vision_width,
+        .height = cfg.vision_height,
+        .patch_size = cfg.vision_patch_size,
+        .t_patch = 1,
+        .spatial_merge = cfg.vision_spatial_merge,
+    };
+    const num_tokens = try geom.numTokens();
+    const token_in_dim = try geom.tokenInDim();
+    const grid: vision.VisionGridSpec = .{
+        .grid_t = 1,
+        .grid_h = geom.mergedH(),
+        .grid_w = geom.mergedW(),
+    };
+
+    var ingress = try vision.VisionIngress.init(device, library, wired_budget, .{
+        .max_tokens = num_tokens,
+        .max_patch_dim = token_in_dim,
+        .max_hidden_size = cfg.vision_hidden,
+        .max_mrope_tokens = num_tokens + 8,
+    });
+    defer ingress.deinit();
+    try compute.makeResident(&.{ingress.buffer()});
+    defer compute.removeResident(&.{ingress.buffer()}) catch |err| {
+        std.debug.panic("removeResident(m65 vision ingress) failed: {}", .{err});
+    };
+
+    const weight_bytes = amf.align64(@as(usize, cfg.vision_hidden) * token_in_dim * @sizeOf(f16));
+    const bias_bytes = amf.align64(@as(usize, cfg.vision_hidden) * @sizeOf(f16));
+    const w_arena_bytes = try page.alignUp(weight_bytes + bias_bytes + page.APPLE_PAGE_SIZE);
+    var w_arena = try arena_mod.WiredArena.init(w_arena_bytes, wired_budget);
+    defer w_arena.deinit();
+    const w_raw = try w_arena.allocAligned(weight_bytes, 64);
+    const b_raw = try w_arena.allocAligned(bias_bytes, 64);
+    const w_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, w_raw[0 .. @as(usize, cfg.vision_hidden) * token_in_dim * @sizeOf(f16)]));
+    const b_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, b_raw[0 .. @as(usize, cfg.vision_hidden) * @sizeOf(f16)]));
+    for (w_f16, 0..) |*dst, idx| {
+        const v: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(idx % 17)) - 8)) * 0.004;
+        dst.* = @floatCast(v);
+    }
+    @memset(b_f16, @as(f16, @floatCast(0.0)));
+    const w_buf = try metal.Buffer.wrap(device, w_arena.bytes());
+    defer w_buf.close();
+    try compute.makeResident(&.{w_buf});
+    defer compute.removeResident(&.{w_buf}) catch |err| {
+        std.debug.panic("removeResident(m65 vision weight) failed: {}", .{err});
+    };
+    const weight_bind: metal.BufferBinding = .{ .buffer = w_buf, .offset = w_arena.offsetOf(w_raw.ptr) };
+    const bias_bind: metal.BufferBinding = .{ .buffer = w_buf, .offset = w_arena.offsetOf(b_raw.ptr) };
+
+    const total_mrope_tokens: usize = 8 + num_tokens;
+    const planar_buf = try allocator.alloc(u32, total_mrope_tokens * 3);
+    defer allocator.free(planar_buf);
+    const pos3d_buf = try allocator.alloc(hybrid.Pos3D, total_mrope_tokens);
+    defer allocator.free(pos3d_buf);
+
+    const VisionCase = struct {
+        label: []const u8,
+        codec: metal.VtCodec,
+        fmt: metal.VisionFormat,
+    };
+    const cases = [_]VisionCase{
+        .{ .label = "vt_h264_nv12", .codec = .h264, .fmt = .nv12 },
+        .{ .label = "vt_hevc_nv12", .codec = .hevc, .fmt = .nv12 },
+        .{ .label = "vt_h264_bgra8", .codec = .h264, .fmt = .bgra8 },
+        .{ .label = "vt_hevc_bgra8", .codec = .hevc, .fmt = .bgra8 },
+    };
+
+    var rows: [4]M65VisionRow = undefined;
+    const n_frames = @max(cfg.vision_frames, 2);
+    const reps = @max(cfg.vision_reps, 2);
+
+    for (cases, 0..) |cs, ci| {
+        const clip = try metal.VtClip.encodeTestClip(cs.codec, cfg.vision_width, cfg.vision_height, n_frames, 30);
+        defer clip.close();
+        const sess = try metal.VtDecodeSession.init(device, clip, cs.fmt);
+        defer sess.close();
+        const sinfo = try sess.info();
+
+        // Warmup decode + GPU vision pass.
+        {
+            const wf = try sess.decodeFrame(clip, 0);
+            defer wf.close();
+            var frame = try compute.beginFrame(cfg.timeout_ms);
+            errdefer frame.abort();
+            if (cs.fmt == .nv12) {
+                try ingress.encodePatchifyEmbedNv12(&frame, wf, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, false, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
+            } else {
+                try ingress.encodePatchifyEmbedBgra8(&frame, wf, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
+            }
+            _ = try frame.commit();
+        }
+
+        // Timed VideoToolbox hardware decode -> zero-copy IOSurface.
+        var all_zc = true;
+        var all_aligned = true;
+        const vt_t0 = try vmstat.nowNs();
+        for (0..reps) |r| {
+            const f = try sess.decodeFrame(clip, @intCast(r % n_frames));
+            defer f.close();
+            const finfo = try f.info();
+            if (!finfo.zeroCopyVerified()) all_zc = false;
+            if ((finfo.baseAddress() % page.APPLE_PAGE_SIZE) != 0) all_aligned = false;
+        }
+        const vt_t1 = try vmstat.nowNs();
+        const vt_decode_us: f64 = @as(f64, @floatFromInt(vt_t1 - vt_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
+
+        // Hold one decoded zero-copy IOSurface frame for steady-state GPU vision + 3D MRoPE timing.
+        const active_frame = try sess.decodeFrame(clip, 0);
+        defer active_frame.close();
+        {
+            var wf = try compute.beginFrame(cfg.timeout_ms);
+            errdefer wf.abort();
+            if (cs.fmt == .nv12) {
+                try ingress.encodePatchifyEmbedNv12(&wf, active_frame, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, false, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
+            } else {
+                try ingress.encodePatchifyEmbedBgra8(&wf, active_frame, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
+            }
+            _ = try wf.commit();
+        }
+
+        const heap_before = try vmstat.Snapshot.capture();
+        const gpu_t0 = try vmstat.nowNs();
+        for (0..reps) |_| {
+            _ = try vision.buildMultimodalMropePositions(4, grid, 4, planar_buf);
+            try vision.packMropePlanarToPos3D(planar_buf, total_mrope_tokens, pos3d_buf);
+            var frame = try compute.beginFrame(cfg.timeout_ms);
+            errdefer frame.abort();
+            if (cs.fmt == .nv12) {
+                try ingress.encodePatchifyEmbedNv12(&frame, active_frame, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, false, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
+            } else {
+                try ingress.encodePatchifyEmbedBgra8(&frame, active_frame, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
+            }
+            _ = try frame.commit();
+        }
+        const gpu_t1 = try vmstat.nowNs();
+        const heap_after = try vmstat.Snapshot.capture();
+        const gpu_vision_us: f64 = @as(f64, @floatFromInt(gpu_t1 - gpu_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
+        const total_us = vt_decode_us + gpu_vision_us;
+        const fps: f64 = if (total_us > 0.0) 1_000_000.0 / total_us else 0.0;
+
+        const frame_bytes: u64 = if (cs.fmt == .nv12)
+            (@as(u64, cfg.vision_width) * cfg.vision_height * 3) / 2
+        else
+            @as(u64, cfg.vision_width) * cfg.vision_height * 4;
+        const embed_traffic_bytes: u64 = frame_bytes +
+            @as(u64, cfg.vision_hidden) * token_in_dim * @sizeOf(f16) +
+            @as(u64, cfg.vision_hidden) * @sizeOf(f16) +
+            @as(u64, num_tokens) * cfg.vision_hidden * @sizeOf(f16);
+        const gpu_gbs: f64 = if (gpu_vision_us > 0.0)
+            @as(f64, @floatFromInt(embed_traffic_bytes)) / (gpu_vision_us * 1_000.0)
+        else
+            0.0;
+
+        rows[ci] = .{
+            .label = cs.label,
+            .width = cfg.vision_width,
+            .height = cfg.vision_height,
+            .vision_tokens = num_tokens,
+            .hw_decoder = sinfo.usingHardwareDecoder(),
+            .all_zero_copy = all_zc,
+            .all_page_aligned = all_aligned,
+            .vt_decode_us = vt_decode_us,
+            .gpu_vision_us = gpu_vision_us,
+            .total_us = total_us,
+            .fps = fps,
+            .gpu_gbs = gpu_gbs,
+            .steady_malloc_blocks = vmstat.heapDelta(heap_before, heap_after).blocks_in_use,
+        };
+    }
+    return rows;
+}
+
+fn fillM65KvTile(tile: metal.KvTile, seed: u64) metal.Error!void {
+    var guard = try tile.lock(false);
+    errdefer guard.release();
+    const vals = guard.f16Slice();
+    var x: u64 = seed *% 0x9E3779B97F4A7C15 +% 0xD1B54A32D192ED03;
+    for (vals) |*dst| {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        const u: u32 = @truncate((x *% 0x2545F4914F6CDD1D) >> 48);
+        const f: f32 = (@as(f32, @floatFromInt(u)) / 65535.0 - 0.5) * 0.25;
+        dst.* = @floatCast(f);
+    }
+    try guard.unlock();
+}
+
+fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
+    const device = try metal.Device.open();
+    defer device.close();
+    const facts = try sysinfo.Facts.read();
+    const dev_info = try device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const attn_pipes = try attention.AttentionPipelines.init(device, library);
+    defer attn_pipes.close();
+    var compute = try metal.Compute.init(device);
+    defer compute.close();
+
+    const total_chunks = cfg.r5_total_chunks;
+    const active_chunks = cfg.r5_active_chunks;
+    const retired_chunks = total_chunks - active_chunks;
+    const seq_len: u32 = total_chunks * cfg.r5_chunk_tokens;
+    const tree_m: u32 = cfg.r5_tree_nodes;
+    const kv_rows: u32 = cfg.r5_kv_heads * cfg.r5_chunk_tokens;
+    const q_dim: usize = @as(usize, cfg.r5_q_heads) * cfg.r5_head_dim;
+    const kv_dim: usize = @as(usize, cfg.r5_kv_heads) * cfg.r5_head_dim;
+
+    const total_tiles: usize = @as(usize, total_chunks) * 2;
+    const tiles = try allocator.alloc(metal.KvTile, total_tiles);
+    defer allocator.free(tiles);
+    var created: usize = 0;
+    var resident = false;
+    defer {
+        if (resident) {
+            compute.removeTilesResident(tiles) catch |err| {
+                std.debug.panic("removeTilesResident(m65 r5) failed: {}", .{err});
+            };
+        }
+        for (0..created) |i| tiles[i].close();
+    }
+    for (0..total_tiles) |i| {
+        tiles[i] = try metal.KvTile.init(device, cfg.r5_head_dim, kv_rows, .{});
+        created += 1;
+        try fillM65KvTile(tiles[i], i + 101);
+    }
+    try compute.makeTilesResident(tiles);
+    resident = true;
+
+    const retired_spec: attention.RetiredKvQ8PoolSpec = .{
+        .num_kv_heads = cfg.r5_kv_heads,
+        .head_dim = cfg.r5_head_dim,
+        .chunk_tokens = cfg.r5_chunk_tokens,
+        .max_chunks = retired_chunks,
+    };
+    const retired_arena_bytes = try attention.RetiredKvQ8Pool.requiredArenaBytes(retired_spec);
+    const q_bytes = amf.align64(q_dim * @sizeOf(f16));
+    const out_bytes = amf.align64(q_dim * @sizeOf(f16));
+    const tree_q_bytes = amf.align64(@as(usize, tree_m) * q_dim * @sizeOf(f16));
+    const tree_kv_bytes = amf.align64(@as(usize, tree_m) * kv_dim * @sizeOf(f16));
+    const tree_out_bytes = amf.align64(@as(usize, tree_m) * q_dim * @sizeOf(f16));
+    const tree_mask_bytes = amf.align64(@as(usize, tree_m) * @sizeOf(u64));
+    const full_tbl_bytes = amf.align64(@as(usize, total_chunks) * @sizeOf(attention.KvTilePair));
+    const act_tbl_bytes = amf.align64(@as(usize, active_chunks) * @sizeOf(attention.KvTilePair));
+    const ret_ids_bytes = amf.align64(@as(usize, retired_chunks) * @sizeOf(u32));
+    const dec_scratch = attention.gqaScratchLayout(cfg.r5_q_heads, cfg.r5_head_dim, attention.MAX_SPLITS);
+    const tree_scratch = attention.gqaTreeScratchLayout(tree_m, cfg.r5_q_heads, cfg.r5_head_dim, attention.MAX_SPLITS);
+
+    const arena_bytes = try page.alignUp(
+        retired_arena_bytes + q_bytes + out_bytes + tree_q_bytes + tree_kv_bytes * 2 +
+            tree_out_bytes + tree_mask_bytes + full_tbl_bytes + act_tbl_bytes + ret_ids_bytes +
+            amf.align64(dec_scratch.total_bytes) + amf.align64(tree_scratch.total_bytes) + 8 * page.APPLE_PAGE_SIZE,
+    );
+    var arena = try arena_mod.WiredArena.init(arena_bytes, wired_budget);
+    defer arena.deinit();
+
+    var retired_pool = try attention.RetiredKvQ8Pool.init(&arena, retired_spec);
+    const q_raw = try arena.allocAligned(q_bytes, 64);
+    const out_raw = try arena.allocAligned(out_bytes, 64);
+    const tree_q_raw = try arena.allocAligned(tree_q_bytes, 64);
+    const tree_k_raw = try arena.allocAligned(tree_kv_bytes, 64);
+    const tree_v_raw = try arena.allocAligned(tree_kv_bytes, 64);
+    const tree_out_raw = try arena.allocAligned(tree_out_bytes, 64);
+    const tree_mask_raw = try arena.allocAligned(tree_mask_bytes, 64);
+    const full_tbl_raw = try arena.allocAligned(full_tbl_bytes, 64);
+    const act_tbl_raw = try arena.allocAligned(act_tbl_bytes, 64);
+    const ret_ids_raw = try arena.allocAligned(ret_ids_bytes, 64);
+    const dec_sc_raw = try arena.allocAligned(amf.align64(dec_scratch.total_bytes), 64);
+    const tree_sc_raw = try arena.allocAligned(amf.align64(tree_scratch.total_bytes), 64);
+
+    // Populate deterministic Q, tree K/V, causal tree masks, and tile tables.
+    const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw[0 .. q_dim * @sizeOf(f16)]));
+    for (q_f16, 0..) |*dst, idx| {
+        dst.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 19)) - 9)) * 0.04);
+    }
+    const tq_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, tree_q_raw[0 .. @as(usize, tree_m) * q_dim * @sizeOf(f16)]));
+    for (tq_f16, 0..) |*dst, idx| {
+        dst.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 17)) - 8)) * 0.04);
+    }
+    const tk_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, tree_k_raw[0 .. @as(usize, tree_m) * kv_dim * @sizeOf(f16)]));
+    const tv_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, tree_v_raw[0 .. @as(usize, tree_m) * kv_dim * @sizeOf(f16)]));
+    for (tk_f16, 0..) |*dst, idx| {
+        dst.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((idx * 3) % 15)) - 7)) * 0.03);
+        tv_f16[idx] = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 15)) - 7)) * 0.03);
+    }
+    const masks: []u64 = @alignCast(std.mem.bytesAsSlice(u64, tree_mask_raw[0 .. @as(usize, tree_m) * @sizeOf(u64)]));
+    for (masks, 0..) |*m, idx| {
+        m.* = (@as(u64, 1) << @intCast(idx + 1)) - 1;
+    }
+    const full_tbl: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(
+        attention.KvTilePair,
+        full_tbl_raw[0 .. @as(usize, total_chunks) * @sizeOf(attention.KvTilePair)],
+    ));
+    for (0..total_chunks) |c_idx| {
+        full_tbl[c_idx] = attention.KvTilePair.fromTiles(tiles[c_idx * 2], tiles[c_idx * 2 + 1], .rgba16f);
+    }
+    const act_tbl: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(
+        attention.KvTilePair,
+        act_tbl_raw[0 .. @as(usize, active_chunks) * @sizeOf(attention.KvTilePair)],
+    ));
+    for (0..active_chunks) |a_idx| {
+        const c_idx = retired_chunks + a_idx;
+        act_tbl[a_idx] = attention.KvTilePair.fromTiles(tiles[c_idx * 2], tiles[c_idx * 2 + 1], .rgba16f);
+    }
+    const ret_ids: []u32 = @alignCast(std.mem.bytesAsSlice(
+        u32,
+        ret_ids_raw[0 .. @as(usize, retired_chunks) * @sizeOf(u32)],
+    ));
+    for (0..retired_chunks) |r_idx| {
+        ret_ids[r_idx] = try retired_pool.acquireSlot();
+    }
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch |err| {
+        std.debug.panic("removeResident(m65 r5) failed: {}", .{err});
+    };
+
+    const q_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(q_raw.ptr) };
+    const out_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(out_raw.ptr) };
+    const tq_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(tree_q_raw.ptr) };
+    const tk_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(tree_k_raw.ptr) };
+    const tv_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(tree_v_raw.ptr) };
+    const tout_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(tree_out_raw.ptr) };
+    const tmask_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(tree_mask_raw.ptr) };
+    const full_tbl_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(full_tbl_raw.ptr) };
+    const act_tbl_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(act_tbl_raw.ptr) };
+    const ret_ids_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(ret_ids_raw.ptr) };
+    const dec_sc_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(dec_sc_raw.ptr) };
+    const tree_sc_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(tree_sc_raw.ptr) };
+
+    const reps = @max(cfg.r5_reps, 2);
+
+    // 1. Pure FP16 decode & tree verify baseline.
+    for (0..2) |_| {
+        var f = try compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try attn_pipes.encodeGqaDecodeAttn(&f, .{
+            .q = q_bind,
+            .kv_tiles = full_tbl_bind,
+            .out = out_bind,
+            .scratch = dec_sc_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_q_heads = cfg.r5_q_heads,
+            .num_kv_heads = cfg.r5_kv_heads,
+            .head_dim = cfg.r5_head_dim,
+            .seq_len = seq_len,
+            .chunk_tokens = cfg.r5_chunk_tokens,
+        }, false);
+        _ = try f.commit();
+    }
+    const dec_fp16_t0 = try vmstat.nowNs();
+    for (0..reps) |_| {
+        var f = try compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try attn_pipes.encodeGqaDecodeAttn(&f, .{
+            .q = q_bind,
+            .kv_tiles = full_tbl_bind,
+            .out = out_bind,
+            .scratch = dec_sc_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_q_heads = cfg.r5_q_heads,
+            .num_kv_heads = cfg.r5_kv_heads,
+            .head_dim = cfg.r5_head_dim,
+            .seq_len = seq_len,
+            .chunk_tokens = cfg.r5_chunk_tokens,
+        }, false);
+        _ = try f.commit();
+    }
+    const dec_fp16_t1 = try vmstat.nowNs();
+    const fp16_decode_us = @as(f64, @floatFromInt(dec_fp16_t1 - dec_fp16_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
+
+    const ref_dec = try allocator.alloc(f16, q_dim);
+    defer allocator.free(ref_dec);
+    @memcpy(ref_dec, @as([]const f16, @alignCast(std.mem.bytesAsSlice(f16, out_raw[0 .. q_dim * @sizeOf(f16)]))));
+
+    for (0..2) |_| {
+        var f = try compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try attn_pipes.encodeGqaTreeVerifyAttn(&f, .{
+            .q = tq_bind,
+            .kv_tiles = full_tbl_bind,
+            .k_tree = tk_bind,
+            .v_tree = tv_bind,
+            .ancestor_masks = tmask_bind,
+            .out = tout_bind,
+            .scratch = tree_sc_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_nodes = tree_m,
+            .num_q_heads = cfg.r5_q_heads,
+            .num_kv_heads = cfg.r5_kv_heads,
+            .head_dim = cfg.r5_head_dim,
+            .base_pos = seq_len,
+            .chunk_tokens = cfg.r5_chunk_tokens,
+        }, false);
+        _ = try f.commit();
+    }
+    const tree_fp16_t0 = try vmstat.nowNs();
+    for (0..reps) |_| {
+        var f = try compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try attn_pipes.encodeGqaTreeVerifyAttn(&f, .{
+            .q = tq_bind,
+            .kv_tiles = full_tbl_bind,
+            .k_tree = tk_bind,
+            .v_tree = tv_bind,
+            .ancestor_masks = tmask_bind,
+            .out = tout_bind,
+            .scratch = tree_sc_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_nodes = tree_m,
+            .num_q_heads = cfg.r5_q_heads,
+            .num_kv_heads = cfg.r5_kv_heads,
+            .head_dim = cfg.r5_head_dim,
+            .base_pos = seq_len,
+            .chunk_tokens = cfg.r5_chunk_tokens,
+        }, false);
+        _ = try f.commit();
+    }
+    const tree_fp16_t1 = try vmstat.nowNs();
+    const fp16_tree_us = @as(f64, @floatFromInt(tree_fp16_t1 - tree_fp16_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
+
+    const ref_tree = try allocator.alloc(f16, @as(usize, tree_m) * q_dim);
+    defer allocator.free(ref_tree);
+    @memcpy(ref_tree, @as([]const f16, @alignCast(std.mem.bytesAsSlice(f16, tree_out_raw[0 .. @as(usize, tree_m) * q_dim * @sizeOf(f16)]))));
+
+    // 2. Retire `retired_chunks` tiles from FP16 IOSurface -> group-64 q8 on GPU.
+    {
+        var wf = try compute.beginFrame(cfg.timeout_ms);
+        errdefer wf.abort();
+        try attn_pipes.encodeKvRetireTileToQ8(&wf, .{
+            .pool = &retired_pool,
+            .pool_buf = buf,
+            .k_tile = tiles[0],
+            .v_tile = tiles[1],
+            .dst_slot = ret_ids[0],
+        }, false);
+        _ = try wf.commit();
+    }
+    const ret_t0 = try vmstat.nowNs();
+    {
+        var rf = try compute.beginFrame(cfg.timeout_ms);
+        errdefer rf.abort();
+        for (0..retired_chunks) |c_idx| {
+            try attn_pipes.encodeKvRetireTileToQ8(&rf, .{
+                .pool = &retired_pool,
+                .pool_buf = buf,
+                .k_tile = tiles[c_idx * 2],
+                .v_tile = tiles[c_idx * 2 + 1],
+                .dst_slot = ret_ids[c_idx],
+            }, false);
+        }
+        _ = try rf.commit();
+    }
+    const ret_t1 = try vmstat.nowNs();
+    const retire_total_us = @as(f64, @floatFromInt(ret_t1 - ret_t0)) / 1000.0;
+    const retire_chunk_us = retire_total_us / @as(f64, @floatFromInt(retired_chunks));
+
+    // 3. Tiered q8 + active FP16 decode & tree verify attention.
+    for (0..2) |_| {
+        var f = try compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try attn_pipes.encodeGqaTieredDecodeAttn(&f, .{
+            .q = q_bind,
+            .kv_tiles = act_tbl_bind,
+            .retired_pool = retired_pool.binding(buf),
+            .retired_chunk_ids = ret_ids_bind,
+            .out = out_bind,
+            .scratch = dec_sc_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_q_heads = cfg.r5_q_heads,
+            .num_kv_heads = cfg.r5_kv_heads,
+            .head_dim = cfg.r5_head_dim,
+            .seq_len = seq_len,
+            .chunk_tokens = cfg.r5_chunk_tokens,
+            .num_retired_chunks = retired_chunks,
+            .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+            .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+        }, false);
+        _ = try f.commit();
+    }
+    const dec_q8_t0 = try vmstat.nowNs();
+    for (0..reps) |_| {
+        var f = try compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try attn_pipes.encodeGqaTieredDecodeAttn(&f, .{
+            .q = q_bind,
+            .kv_tiles = act_tbl_bind,
+            .retired_pool = retired_pool.binding(buf),
+            .retired_chunk_ids = ret_ids_bind,
+            .out = out_bind,
+            .scratch = dec_sc_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_q_heads = cfg.r5_q_heads,
+            .num_kv_heads = cfg.r5_kv_heads,
+            .head_dim = cfg.r5_head_dim,
+            .seq_len = seq_len,
+            .chunk_tokens = cfg.r5_chunk_tokens,
+            .num_retired_chunks = retired_chunks,
+            .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+            .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+        }, false);
+        _ = try f.commit();
+    }
+    const dec_q8_t1 = try vmstat.nowNs();
+    const tiered_decode_us = @as(f64, @floatFromInt(dec_q8_t1 - dec_q8_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
+
+    const tiered_dec: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw[0 .. q_dim * @sizeOf(f16)]));
+    var dec_max_err: f32 = 0.0;
+    for (ref_dec, tiered_dec) |a, b| {
+        dec_max_err = @max(dec_max_err, @abs(@as(f32, @floatCast(a)) - @as(f32, @floatCast(b))));
+    }
+
+    for (0..2) |_| {
+        var f = try compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try attn_pipes.encodeGqaTieredTreeVerifyAttn(&f, .{
+            .q = tq_bind,
+            .kv_tiles = act_tbl_bind,
+            .retired_pool = retired_pool.binding(buf),
+            .retired_chunk_ids = ret_ids_bind,
+            .k_tree = tk_bind,
+            .v_tree = tv_bind,
+            .ancestor_masks = tmask_bind,
+            .out = tout_bind,
+            .scratch = tree_sc_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_nodes = tree_m,
+            .num_q_heads = cfg.r5_q_heads,
+            .num_kv_heads = cfg.r5_kv_heads,
+            .head_dim = cfg.r5_head_dim,
+            .base_pos = seq_len,
+            .chunk_tokens = cfg.r5_chunk_tokens,
+            .num_retired_chunks = retired_chunks,
+            .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+            .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+        }, false);
+        _ = try f.commit();
+    }
+    const tree_q8_t0 = try vmstat.nowNs();
+    for (0..reps) |_| {
+        var f = try compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try attn_pipes.encodeGqaTieredTreeVerifyAttn(&f, .{
+            .q = tq_bind,
+            .kv_tiles = act_tbl_bind,
+            .retired_pool = retired_pool.binding(buf),
+            .retired_chunk_ids = ret_ids_bind,
+            .k_tree = tk_bind,
+            .v_tree = tv_bind,
+            .ancestor_masks = tmask_bind,
+            .out = tout_bind,
+            .scratch = tree_sc_bind,
+            .max_splits = attention.MAX_SPLITS,
+            .num_nodes = tree_m,
+            .num_q_heads = cfg.r5_q_heads,
+            .num_kv_heads = cfg.r5_kv_heads,
+            .head_dim = cfg.r5_head_dim,
+            .base_pos = seq_len,
+            .chunk_tokens = cfg.r5_chunk_tokens,
+            .num_retired_chunks = retired_chunks,
+            .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+            .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+        }, false);
+        _ = try f.commit();
+    }
+    const tree_q8_t1 = try vmstat.nowNs();
+    const tiered_tree_us = @as(f64, @floatFromInt(tree_q8_t1 - tree_q8_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
+
+    const tiered_tree: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, tree_out_raw[0 .. @as(usize, tree_m) * q_dim * @sizeOf(f16)]));
+    var tree_max_err: f32 = 0.0;
+    for (ref_tree, tiered_tree) |a, b| {
+        tree_max_err = @max(tree_max_err, @abs(@as(f32, @floatCast(a)) - @as(f32, @floatCast(b))));
+    }
+
+    const fp16_chunk_bytes: u64 = try attention.RetiredKvQ8Pool.fp16EquivalentChunkBytes(retired_spec);
+    const pure_fp16_bytes: u64 = @as(u64, total_chunks) * fp16_chunk_bytes;
+    const active_bytes: u64 = @as(u64, active_chunks) * fp16_chunk_bytes;
+    const retired_bytes: u64 = retired_pool.bytes().len;
+    const tiered_bytes: u64 = active_bytes + retired_bytes;
+    const saved_bytes: u64 = pure_fp16_bytes -| tiered_bytes;
+    const reduction_pct: f64 = if (pure_fp16_bytes > 0)
+        (@as(f64, @floatFromInt(saved_bytes)) / @as(f64, @floatFromInt(pure_fp16_bytes))) * 100.0
+    else
+        0.0;
+
+    const fp16_dec_gbs = @as(f64, @floatFromInt(pure_fp16_bytes)) / (fp16_decode_us * 1_000.0);
+    const tiered_dec_gbs = @as(f64, @floatFromInt(tiered_bytes)) / (tiered_decode_us * 1_000.0);
+    const fp16_tree_gbs = @as(f64, @floatFromInt(pure_fp16_bytes)) / (fp16_tree_us * 1_000.0);
+    const tiered_tree_gbs = @as(f64, @floatFromInt(tiered_bytes)) / (tiered_tree_us * 1_000.0);
+
+    return .{
+        .q_heads = cfg.r5_q_heads,
+        .kv_heads = cfg.r5_kv_heads,
+        .head_dim = cfg.r5_head_dim,
+        .chunk_tokens = cfg.r5_chunk_tokens,
+        .total_chunks = total_chunks,
+        .active_chunks = active_chunks,
+        .retired_chunks = retired_chunks,
+        .seq_len = seq_len,
+        .tree_nodes = tree_m,
+        .pure_fp16_bytes_per_layer = pure_fp16_bytes,
+        .tiered_q8_bytes_per_layer = tiered_bytes,
+        .active_iosurface_bytes_per_layer = active_bytes,
+        .retired_q8_bytes_per_layer = retired_bytes,
+        .wired_bytes_saved_per_layer = saved_bytes,
+        .wired_reduction_pct = reduction_pct,
+        .retire_chunk_us = retire_chunk_us,
+        .retire_total_us = retire_total_us,
+        .fp16_decode_us = fp16_decode_us,
+        .fp16_decode_gbs = fp16_dec_gbs,
+        .tiered_decode_us = tiered_decode_us,
+        .tiered_decode_gbs = tiered_dec_gbs,
+        .fp16_tree_us = fp16_tree_us,
+        .fp16_tree_gbs = fp16_tree_gbs,
+        .tiered_tree_us = tiered_tree_us,
+        .tiered_tree_gbs = tiered_tree_gbs,
+        .decode_max_abs_err = dec_max_err,
+        .tree_max_abs_err = tree_max_err,
+    };
+}
+
+fn runM65R8Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R8Report {
+    const tmp_dir = try makeM6TempDir(allocator, "m65_r8");
+    defer {
+        removeDirRecursiveBestEffort(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+    const amf_path = try std.fmt.allocPrintSentinel(allocator, "{s}/r8_dense.amf", .{tmp_dir}, 0);
+    defer allocator.free(amf_path);
+
+    const max_seq: u32 = ((cfg.r8_prefix_partial_tokens + cfg.r8_suffix_tokens + cfg.r8_chunk_tokens) / cfg.r8_chunk_tokens) * cfg.r8_chunk_tokens;
+    const mcfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .hidden_size = cfg.r8_hidden,
+        .num_hidden_layers = cfg.r8_layers,
+        .num_attention_heads = cfg.r8_q_heads,
+        .num_key_value_heads = cfg.r8_kv_heads,
+        .head_dim = cfg.r8_head_dim,
+        .intermediate_size = cfg.r8_inter,
+        .vocab_size = cfg.r8_vocab,
+        .max_position_embeddings = max_seq,
+        .quant_bits = .q4,
+        .tie_word_embeddings = false,
+    };
+    try writeSyntheticQwen3AmfFile(allocator, amf_path, mcfg, 0xA11CE65);
+
+    var model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, mcfg, .{
+        .max_seq_len = max_seq,
+        .chunk_tokens = cfg.r8_chunk_tokens,
+        .max_tree_nodes = 64,
+        .verify_crcs = false,
+        .enable_ane_predictor = false,
+    });
+    defer model.deinit(allocator);
+
+    var rt = try qwen3.Qwen3BatchRuntime.init(allocator, &model, .{
+        .max_slots = cfg.r8_max_slots,
+        .prefix_cache_chunks = 16,
+    });
+    defer rt.deinit(allocator);
+    const backend = rt.batchBackend();
+
+    const exact_len = cfg.r8_prefix_exact_tokens + cfg.r8_suffix_tokens;
+    const partial_len = cfg.r8_prefix_partial_tokens + cfg.r8_suffix_tokens;
+    const p_exact_a = try allocator.alloc(u32, exact_len);
+    defer allocator.free(p_exact_a);
+    const p_exact_b = try allocator.alloc(u32, exact_len);
+    defer allocator.free(p_exact_b);
+    const p_part_a = try allocator.alloc(u32, partial_len);
+    defer allocator.free(p_part_a);
+    const p_part_b = try allocator.alloc(u32, partial_len);
+    defer allocator.free(p_part_b);
+
+    for (0..partial_len) |i| {
+        const tok: u32 = @intCast((i * 19 + 7) % cfg.r8_vocab);
+        p_part_a[i] = tok;
+        p_part_b[i] = if (i < cfg.r8_prefix_partial_tokens) tok else @intCast((i * 29 + 13) % cfg.r8_vocab);
+        if (i < exact_len) {
+            p_exact_a[i] = tok;
+            p_exact_b[i] = if (i < cfg.r8_prefix_exact_tokens) tok else @intCast((i * 31 + 11) % cfg.r8_vocab);
+        }
+    }
+
+    var dummy_rng = try rng_mod.RequestRng.init(42);
+
+    // 1. Cold uncached prefill for `exact_len` (`1024 + 16`) -> populates PrefixCache!
+    const unc_ex_t0 = try vmstat.nowNs();
+    const lu_ex0 = backend.lookupPrefix(0, p_exact_a);
+    const pr_ex0 = try backend.prefillSlot(&.{
+        .slot_id = 0,
+        .request_id = 1,
+        .user_tag = 0,
+        .start_pos = lu_ex0.matched_tokens,
+        .total_prompt_len = @intCast(p_exact_a.len),
+        .tokens = p_exact_a[lu_ex0.matched_tokens..],
+        .is_final_chunk = true,
+        .prefix_handle = lu_ex0.prefix_handle,
+        .temperature = 0.0,
+        .rng = &dummy_rng,
+        .ngram_domain = "",
+    });
+    _ = pr_ex0;
+    const unc_ex_t1 = try vmstat.nowNs();
+    const uncached_exact_ms = @as(f64, @floatFromInt(unc_ex_t1 - unc_ex_t0)) / 1_000_000.0;
+
+    // 2. Warm cached prefill for `exact_prefix_tokens` (`1024`) + unique `16`-tok suffix (`0` lookup CoW!).
+    const cow_before_ex = rt.stats().prefix_cow_copies;
+    const c_ex_t0 = try vmstat.nowNs();
+    const lu_ex1 = backend.lookupPrefix(1, p_exact_b);
+    const exact_cow_copies = rt.stats().prefix_cow_copies - cow_before_ex;
+    _ = try backend.prefillSlot(&.{
+        .slot_id = 1,
+        .request_id = 2,
+        .user_tag = 0,
+        .start_pos = lu_ex1.matched_tokens,
+        .total_prompt_len = @intCast(p_exact_b.len),
+        .tokens = p_exact_b[lu_ex1.matched_tokens..],
+        .is_final_chunk = true,
+        .prefix_handle = lu_ex1.prefix_handle,
+        .temperature = 0.0,
+        .rng = &dummy_rng,
+        .ngram_domain = "",
+    });
+    const c_ex_t1 = try vmstat.nowNs();
+    const cached_exact_ms = @as(f64, @floatFromInt(c_ex_t1 - c_ex_t0)) / 1_000_000.0;
+    backend.releaseSlot(0, lu_ex0.prefix_handle);
+    backend.releaseSlot(1, lu_ex1.prefix_handle);
+
+    // 3. Cold uncached prefill for `partial_len` (`1200 + 16`) on a fresh runtime (or reference uncached pass)
+    //    to measure true uncached 1,216-tok latency & reference first token for `p_part_b`!
+    const ref_unc_t0 = try vmstat.nowNs();
+    const ref_tok_part_b = try model.prefillPrompt(p_part_b, true);
+    const ref_unc_t1 = try vmstat.nowNs();
+    const uncached_partial_ms = @as(f64, @floatFromInt(ref_unc_t1 - ref_unc_t0)) / 1_000_000.0;
+
+    // Populate `p_part_a` (`1200 + 16`) into `PrefixCache` (2 full blocks + 1 partial tail block).
+    const lu_pa0 = backend.lookupPrefix(0, p_part_a);
+    _ = try backend.prefillSlot(&.{
+        .slot_id = 0,
+        .request_id = 3,
+        .user_tag = 0,
+        .start_pos = lu_pa0.matched_tokens,
+        .total_prompt_len = @intCast(p_part_a.len),
+        .tokens = p_part_a[lu_pa0.matched_tokens..],
+        .is_final_chunk = true,
+        .prefix_handle = lu_pa0.prefix_handle,
+        .temperature = 0.0,
+        .rng = &dummy_rng,
+        .ngram_domain = "",
+    });
+
+    // Warm cached prefill for `p_part_b` (`1200`-tok shared prefix = 2 full 0-copy blocks + 176-tok GPU CoW tail + 16-tok suffix).
+    const cow_before_part = rt.stats().prefix_cow_copies;
+    const c_pa_t0 = try vmstat.nowNs();
+    const lu_pa1 = backend.lookupPrefix(1, p_part_b);
+    const partial_cow_copies = rt.stats().prefix_cow_copies - cow_before_part;
+    const pr_pa1 = try backend.prefillSlot(&.{
+        .slot_id = 1,
+        .request_id = 4,
+        .user_tag = 0,
+        .start_pos = lu_pa1.matched_tokens,
+        .total_prompt_len = @intCast(p_part_b.len),
+        .tokens = p_part_b[lu_pa1.matched_tokens..],
+        .is_final_chunk = true,
+        .prefix_handle = lu_pa1.prefix_handle,
+        .temperature = 0.0,
+        .rng = &dummy_rng,
+        .ngram_domain = "",
+    });
+    const c_pa_t1 = try vmstat.nowNs();
+    const cached_partial_ms = @as(f64, @floatFromInt(c_pa_t1 - c_pa_t0)) / 1_000_000.0;
+    const partial_bit_exact = (pr_pa1.first_token == ref_tok_part_b);
+    backend.releaseSlot(0, lu_pa0.prefix_handle);
+    backend.releaseSlot(1, lu_pa1.prefix_handle);
+
+    // 4. Direct GPU CoW tail micro-timing (`ami_kv_tile_cow_copy` for `partial_prefix % chunk_tokens` tokens across all layers).
+    const cow_tail_tokens: u32 = cfg.r8_prefix_partial_tokens % cfg.r8_chunk_tokens;
+    var cow_tail_us: f64 = 0.0;
+    if (cow_tail_tokens > 0) {
+        const kv_rows = cfg.r8_kv_heads * cfg.r8_chunk_tokens;
+        const src_k = try metal.KvTile.init(model.device, cfg.r8_head_dim, kv_rows, .{});
+        defer src_k.close();
+        const src_v = try metal.KvTile.init(model.device, cfg.r8_head_dim, kv_rows, .{});
+        defer src_v.close();
+        const dst_k = try metal.KvTile.init(model.device, cfg.r8_head_dim, kv_rows, .{});
+        defer dst_k.close();
+        const dst_v = try metal.KvTile.init(model.device, cfg.r8_head_dim, kv_rows, .{});
+        defer dst_v.close();
+        const cow_tiles = [_]metal.KvTile{ src_k, src_v, dst_k, dst_v };
+        try model.compute.makeTilesResident(&cow_tiles);
+        defer model.compute.removeTilesResident(&cow_tiles) catch |err| {
+            std.debug.panic("removeTilesResident(m65 r8 cow) failed: {}", .{err});
+        };
+        const cow_reps: u32 = 16;
+        for (0..2) |_| {
+            var f = try model.compute.beginFrame(cfg.timeout_ms);
+            errdefer f.abort();
+            for (0..cfg.r8_layers) |_| {
+                try model.attn_pipes.encodeKvTileCowCopy(&f, .{
+                    .src_k = src_k,
+                    .src_v = src_v,
+                    .dst_k = dst_k,
+                    .dst_v = dst_v,
+                    .num_kv_heads = cfg.r8_kv_heads,
+                    .head_dim = cfg.r8_head_dim,
+                    .chunk_tokens = cfg.r8_chunk_tokens,
+                    .valid_tokens = cow_tail_tokens,
+                }, false);
+            }
+            _ = try f.commit();
+        }
+        const ct0 = try vmstat.nowNs();
+        for (0..cow_reps) |_| {
+            var f = try model.compute.beginFrame(cfg.timeout_ms);
+            errdefer f.abort();
+            for (0..cfg.r8_layers) |_| {
+                try model.attn_pipes.encodeKvTileCowCopy(&f, .{
+                    .src_k = src_k,
+                    .src_v = src_v,
+                    .dst_k = dst_k,
+                    .dst_v = dst_v,
+                    .num_kv_heads = cfg.r8_kv_heads,
+                    .head_dim = cfg.r8_head_dim,
+                    .chunk_tokens = cfg.r8_chunk_tokens,
+                    .valid_tokens = cow_tail_tokens,
+                }, false);
+            }
+            _ = try f.commit();
+        }
+        const ct1 = try vmstat.nowNs();
+        cow_tail_us = @as(f64, @floatFromInt(ct1 - ct0)) / (@as(f64, @floatFromInt(cow_reps)) * 1000.0);
+    }
+
+    // Wired KV MiB saved when 4 or 8 concurrent slots share `exact_prefix_tokens` (e.g. 2 full chunks).
+    const full_prefix_chunks: u64 = cfg.r8_prefix_exact_tokens / cfg.r8_chunk_tokens;
+    const chunk_group_bytes: u64 = @as(u64, cfg.r8_layers) * 2 *
+        (try page.alignUp(@as(usize, cfg.r8_kv_heads) * cfg.r8_chunk_tokens * cfg.r8_head_dim * @sizeOf(f16)));
+    const slots_shared_4_saved_mib = @as(f64, @floatFromInt(3 * full_prefix_chunks * chunk_group_bytes)) / (1024.0 * 1024.0);
+    const slots_shared_8_saved_mib = @as(f64, @floatFromInt(7 * full_prefix_chunks * chunk_group_bytes)) / (1024.0 * 1024.0);
+    // Exact analytical 48-layer Qwen3-30B-A3B (`kv=4, d=128, chunk=512` = 1 MiB/layer/chunk) 8-slot saving for 2 shared full chunks:
+    const qwen30b_chunk_group_bytes: u64 = 48 * 2 * (512 * 4 * 128 * 2);
+    const qwen30b_48l_8slot_saved_mib = @as(f64, @floatFromInt(7 * full_prefix_chunks * qwen30b_chunk_group_bytes)) / (1024.0 * 1024.0);
+
+    // 5. GDN recurrent state snapshot clone (`ami_gdn_clone_state`) across `r8_gdn_layers` layers.
+    const hybrid_pipes = try hybrid.HybridPipelines.init(model.device, model.library);
+    defer hybrid_pipes.close();
+    const facts = try sysinfo.Facts.read();
+    const dev_info = try model.device.info();
+    const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+
+    const state_f32_per_layer: u32 = cfg.r8_gdn_v_heads * cfg.r8_gdn_head_k * cfg.r8_gdn_head_v;
+    const conv_dim: u32 = cfg.r8_gdn_k_heads * cfg.r8_gdn_head_k * 2 + cfg.r8_gdn_v_heads * cfg.r8_gdn_head_v;
+    const conv_f16_per_layer: u32 = 3 * conv_dim;
+    const state_layer_bytes: usize = amf.align64(@as(usize, state_f32_per_layer) * @sizeOf(f32));
+    const conv_layer_bytes: usize = amf.align64(@as(usize, conv_f16_per_layer) * @sizeOf(f16));
+    const single_snap_bytes: usize = @as(usize, cfg.r8_gdn_layers) * (state_layer_bytes + conv_layer_bytes);
+    const gdn_arena_bytes = try page.alignUp(single_snap_bytes * 2 + 4 * page.APPLE_PAGE_SIZE);
+    var gdn_arena = try arena_mod.WiredArena.init(gdn_arena_bytes, wired_budget);
+    defer gdn_arena.deinit();
+
+    const src_s_raw = try gdn_arena.allocAligned(@as(usize, cfg.r8_gdn_layers) * state_layer_bytes, 64);
+    const dst_s_raw = try gdn_arena.allocAligned(@as(usize, cfg.r8_gdn_layers) * state_layer_bytes, 64);
+    const src_c_raw = try gdn_arena.allocAligned(@as(usize, cfg.r8_gdn_layers) * conv_layer_bytes, 64);
+    const dst_c_raw = try gdn_arena.allocAligned(@as(usize, cfg.r8_gdn_layers) * conv_layer_bytes, 64);
+
+    const src_s_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, src_s_raw));
+    for (0..@min(src_s_f32.len, 4096)) |idx| {
+        src_s_f32[idx] = @as(f32, @floatFromInt(@as(i32, @intCast(idx % 23)) - 11)) * 0.125;
+    }
+    src_s_f32[src_s_f32.len - 1] = 1.625;
+    @memset(dst_s_raw, 0);
+    const src_c_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, src_c_raw));
+    for (0..@min(src_c_f16.len, 2048)) |idx| {
+        src_c_f16[idx] = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(idx % 13)) - 6)) * 0.25);
+    }
+    src_c_f16[src_c_f16.len - 1] = @floatCast(-0.75);
+    @memset(dst_c_raw, 0);
+
+    const gdn_buf = try metal.Buffer.wrap(model.device, gdn_arena.bytes());
+    defer gdn_buf.close();
+    try model.compute.makeResident(&.{gdn_buf});
+    defer model.compute.removeResident(&.{gdn_buf}) catch |err| {
+        std.debug.panic("removeResident(m65 r8 gdn) failed: {}", .{err});
+    };
+
+    const clone_args: hybrid.GdnCloneStateArgs = .{
+        .src_state = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(src_s_raw.ptr) },
+        .dst_state = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(dst_s_raw.ptr) },
+        .src_conv = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(src_c_raw.ptr) },
+        .dst_conv = .{ .buffer = gdn_buf, .offset = gdn_arena.offsetOf(dst_c_raw.ptr) },
+        .num_gdn_layers = cfg.r8_gdn_layers,
+        .state_f32_per_layer = state_f32_per_layer,
+        .src_state_layer_stride_f32 = @intCast(state_layer_bytes / @sizeOf(f32)),
+        .dst_state_layer_stride_f32 = @intCast(state_layer_bytes / @sizeOf(f32)),
+        .conv_f16_per_layer = conv_f16_per_layer,
+        .src_conv_layer_stride_f16 = @intCast(conv_layer_bytes / @sizeOf(f16)),
+        .dst_conv_layer_stride_f16 = @intCast(conv_layer_bytes / @sizeOf(f16)),
+    };
+    const gdn_reps = @max(cfg.r8_gdn_reps, 2);
+    for (0..2) |_| {
+        var f = try model.compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try hybrid_pipes.encodeGdnCloneState(&f, clone_args, false);
+        _ = try f.commit();
+    }
+    const gt0 = try vmstat.nowNs();
+    for (0..gdn_reps) |_| {
+        var f = try model.compute.beginFrame(cfg.timeout_ms);
+        errdefer f.abort();
+        try hybrid_pipes.encodeGdnCloneState(&f, clone_args, false);
+        _ = try f.commit();
+    }
+    const gt1 = try vmstat.nowNs();
+    const gdn_clone_us = @as(f64, @floatFromInt(gt1 - gt0)) / (@as(f64, @floatFromInt(gdn_reps)) * 1000.0);
+    // Read + Write = 2 * single_snap_bytes moved on unified memory bus.
+    const gdn_clone_gbs = if (gdn_clone_us > 0.0)
+        @as(f64, @floatFromInt(single_snap_bytes * 2)) / (gdn_clone_us * 1_000.0)
+    else
+        0.0;
+    const dst_s_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, dst_s_raw));
+    const dst_c_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, dst_c_raw));
+    const gdn_bit_exact = (dst_s_f32[0] == src_s_f32[0]) and
+        (dst_s_f32[dst_s_f32.len - 1] == src_s_f32[src_s_f32.len - 1]) and
+        (dst_c_f16[0] == src_c_f16[0]) and
+        (dst_c_f16[dst_c_f16.len - 1] == src_c_f16[src_c_f16.len - 1]);
+
+    return .{
+        .exact_prefix_tokens = cfg.r8_prefix_exact_tokens,
+        .partial_prefix_tokens = cfg.r8_prefix_partial_tokens,
+        .suffix_tokens = cfg.r8_suffix_tokens,
+        .chunk_tokens = cfg.r8_chunk_tokens,
+        .uncached_exact_ms = uncached_exact_ms,
+        .cached_exact_ms = cached_exact_ms,
+        .speedup_exact = if (cached_exact_ms > 0.0) uncached_exact_ms / cached_exact_ms else 0.0,
+        .matched_exact_tokens = lu_ex1.matched_tokens,
+        .exact_cow_copies = exact_cow_copies,
+        .uncached_partial_ms = uncached_partial_ms,
+        .cached_partial_ms = cached_partial_ms,
+        .speedup_partial = if (cached_partial_ms > 0.0) uncached_partial_ms / cached_partial_ms else 0.0,
+        .matched_partial_tokens = lu_pa1.matched_tokens,
+        .partial_cow_copies = partial_cow_copies,
+        .partial_bit_exact = partial_bit_exact,
+        .cow_tail_tokens = cow_tail_tokens,
+        .cow_tail_us = cow_tail_us,
+        .slots_shared_4_saved_mib = slots_shared_4_saved_mib,
+        .slots_shared_8_saved_mib = slots_shared_8_saved_mib,
+        .qwen30b_48l_8slot_saved_mib = qwen30b_48l_8slot_saved_mib,
+        .gdn_layers = cfg.r8_gdn_layers,
+        .gdn_snapshot_bytes = single_snap_bytes,
+        .gdn_clone_us = gdn_clone_us,
+        .gdn_clone_gbs = gdn_clone_gbs,
+        .gdn_clone_bit_exact = gdn_bit_exact,
+    };
+}
+
+fn runM65BatchSweep(
+    allocator: std.mem.Allocator,
+    backend: batch_sched.BatchBackend,
+    vocab: u32,
+    prefill_tokens: u32,
+    decode_steps: u32,
+) ![4]M65BatchScalingRow {
+    const batch_sizes = [_]u32{ 1, 2, 4, 8 };
+    const prompt = try allocator.alloc(u32, prefill_tokens);
+    defer allocator.free(prompt);
+
+    var rows: [4]M65BatchScalingRow = undefined;
+    var b1_agg: f64 = 0.0;
+
+    var slot_rng_storage: [8]rng_mod.RequestRng = undefined;
+    for (&slot_rng_storage, 0..) |*r, idx| {
+        r.* = try rng_mod.RequestRng.init(100 + idx);
+    }
+
+    for (batch_sizes, 0..) |b_size, bi| {
+        var slot_ids: [8]u16 = undefined;
+        var req_ids: [8]u64 = undefined;
+        var user_tags: [8]u64 = @splat(0);
+        var tokens: [8]u32 = undefined;
+        var positions: [8]u32 = undefined;
+        var temps: [8]f32 = @splat(0.0);
+        var rngs: [8]*rng_mod.RequestRng = undefined;
+        var domains: [8][]const u8 = @splat("");
+        var handles: [8]u64 = @splat(0);
+        var out_toks: [8]u32 = @splat(0);
+
+        for (0..b_size) |s| {
+            rngs[s] = &slot_rng_storage[s];
+            for (0..prefill_tokens) |p| {
+                prompt[p] = @intCast((p * 13 + s * 7 + 3) % vocab);
+            }
+            const lu = backend.lookupPrefix(@intCast(s), prompt);
+            const pr = try backend.prefillSlot(&.{
+                .slot_id = @intCast(s),
+                .request_id = @intCast(bi * 16 + s + 1),
+                .user_tag = s,
+                .start_pos = lu.matched_tokens,
+                .total_prompt_len = prefill_tokens,
+                .tokens = prompt[lu.matched_tokens..],
+                .is_final_chunk = true,
+                .prefix_handle = lu.prefix_handle,
+                .temperature = 0.0,
+                .rng = rngs[s],
+                .ngram_domain = "",
+            });
+            slot_ids[s] = @intCast(s);
+            req_ids[s] = @intCast(bi * 16 + s + 1);
+            handles[s] = lu.prefix_handle;
+            tokens[s] = pr.first_token;
+            positions[s] = prefill_tokens;
+        }
+        defer {
+            for (0..b_size) |s| backend.releaseSlot(@intCast(s), handles[s]);
+        }
+
+        // Warmup 2 batched decode steps so Metal 4 command-queue state is warmed.
+        for (0..2) |_| {
+            try backend.stepDecodeBatch(&.{
+                .slot_ids = slot_ids[0..b_size],
+                .request_ids = req_ids[0..b_size],
+                .user_tags = user_tags[0..b_size],
+                .input_tokens = tokens[0..b_size],
+                .seq_positions = positions[0..b_size],
+                .temperatures = temps[0..b_size],
+                .rngs = rngs[0..b_size],
+                .ngram_domains = domains[0..b_size],
+                .prefix_handles = handles[0..b_size],
+            }, out_toks[0..b_size]);
+            for (0..b_size) |s| {
+                tokens[s] = out_toks[s];
+                positions[s] += 1;
+            }
+        }
+
+        const steps = @max(decode_steps, 2);
+        const heap_before = try vmstat.Snapshot.capture();
+        const t0 = try vmstat.nowNs();
+        for (0..steps) |_| {
+            try backend.stepDecodeBatch(&.{
+                .slot_ids = slot_ids[0..b_size],
+                .request_ids = req_ids[0..b_size],
+                .user_tags = user_tags[0..b_size],
+                .input_tokens = tokens[0..b_size],
+                .seq_positions = positions[0..b_size],
+                .temperatures = temps[0..b_size],
+                .rngs = rngs[0..b_size],
+                .ngram_domains = domains[0..b_size],
+                .prefix_handles = handles[0..b_size],
+            }, out_toks[0..b_size]);
+            for (0..b_size) |s| {
+                tokens[s] = out_toks[s];
+                positions[s] += 1;
+            }
+        }
+        const t1 = try vmstat.nowNs();
+        const heap_after = try vmstat.Snapshot.capture();
+
+        const step_ms = (@as(f64, @floatFromInt(t1 - t0)) / @as(f64, @floatFromInt(steps))) / 1_000_000.0;
+        const per_slot_tok_s = if (step_ms > 0.0) 1000.0 / step_ms else 0.0;
+        const agg_tok_s = per_slot_tok_s * @as(f64, @floatFromInt(b_size));
+        if (bi == 0) b1_agg = agg_tok_s;
+
+        rows[bi] = .{
+            .batch_size = b_size,
+            .step_ms = step_ms,
+            .per_slot_tok_s = per_slot_tok_s,
+            .agg_tok_s = agg_tok_s,
+            .scaling_vs_b1 = if (b1_agg > 0.0) agg_tok_s / b1_agg else 0.0,
+            .steady_malloc_blocks = vmstat.heapDelta(heap_before, heap_after).blocks_in_use,
+        };
+    }
+    return rows;
+}
+
+fn extractAngSampleKeys(path: [:0]const u8, out_keys: [][4]u32) usize {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return 0;
+    defer _ = std.c.close(fd);
+
+    var hdr_buf: [page.APPLE_PAGE_SIZE]u8 align(page.APPLE_PAGE_SIZE) = undefined;
+    if (std.c.pread(fd, &hdr_buf, hdr_buf.len, 0) != @as(isize, @intCast(hdr_buf.len))) return 0;
+    const hdr: *const ngram_nvme.Header = @ptrCast(@alignCast(&hdr_buf));
+    if (hdr.num_buckets == 0) return 0;
+
+    var page_buf: [page.APPLE_PAGE_SIZE]u8 align(page.APPLE_PAGE_SIZE) = undefined;
+    var found: usize = 0;
+    const stride: u64 = @max(hdr.num_buckets / @as(u64, @max(out_keys.len, 1)), 1);
+    var b: u64 = 0;
+    while (b < hdr.num_buckets and found < out_keys.len) : (b += stride) {
+        const off: i64 = @intCast(page.APPLE_PAGE_SIZE * (1 + b));
+        if (std.c.pread(fd, &page_buf, page_buf.len, off) != @as(isize, @intCast(page_buf.len))) break;
+        const slots: []const ngram_nvme.NgramSlot = @alignCast(std.mem.bytesAsSlice(ngram_nvme.NgramSlot, &page_buf));
+        for (slots) |slot| {
+            if (slot.ctx_len == 4 and slot.cont_len > 0) {
+                out_keys[found] = slot.ctx_tail;
+                found += 1;
+                break; // One distinct bucket per key so cold F_NOCACHE queries miss LRU cache.
+            }
+        }
+    }
+    return found;
+}
+
+fn runM65NgramBench(allocator: std.mem.Allocator, cfg: M65Config) !M65NgramReport {
+    const real_repo_path: [:0]const u8 = "/Volumes/Akari/models/amf/aminfer-repo.ang";
+    const real_docs_path: [:0]const u8 = "/Volumes/Akari/models/amf/aminfer-docs.ang";
+
+    var use_real = false;
+    if (!cfg.use_synthetic_ngram_packs) {
+        const fd1 = std.c.open(real_repo_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd1 >= 0) {
+            _ = std.c.close(fd1);
+            const fd2 = std.c.open(real_docs_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+            if (fd2 >= 0) {
+                _ = std.c.close(fd2);
+                use_real = true;
+            }
+        }
+    }
+
+    var tmp_dir_opt: ?[]u8 = null;
+    defer if (tmp_dir_opt) |td| {
+        removeDirRecursiveBestEffort(allocator, td);
+        allocator.free(td);
+    };
+
+    var synth_repo_opt: ?[:0]u8 = null;
+    defer if (synth_repo_opt) |p| allocator.free(p);
+    var synth_docs_opt: ?[:0]u8 = null;
+    defer if (synth_docs_opt) |p| allocator.free(p);
+
+    var repo_keys: [32][4]u32 = undefined;
+    var docs_keys: [32][4]u32 = undefined;
+    var repo_key_cnt: usize = 0;
+    var docs_key_cnt: usize = 0;
+
+    const repo_path: [:0]const u8 = if (use_real) real_repo_path else blk: {
+        const td = try makeM6TempDir(allocator, "m65_ngram");
+        tmp_dir_opt = td;
+        const p_repo = try std.fmt.allocPrintSentinel(allocator, "{s}/repo.ang", .{td}, 0);
+        synth_repo_opt = p_repo;
+        const p_docs = try std.fmt.allocPrintSentinel(allocator, "{s}/docs.ang", .{td}, 0);
+        synth_docs_opt = p_docs;
+
+        var repo_conts: [32][4]u32 = undefined;
+        var docs_conts: [32][4]u32 = undefined;
+        var repo_entries: [32]ngram_nvme.BuildEntry = undefined;
+        var docs_entries: [32]ngram_nvme.BuildEntry = undefined;
+        for (0..32) |i| {
+            const base_r: u32 = @intCast(100 + i * 8);
+            const base_d: u32 = @intCast(500 + i * 8);
+            repo_keys[i] = .{ base_r, base_r + 1, base_r + 2, base_r + 3 };
+            docs_keys[i] = .{ base_d, base_d + 1, base_d + 2, base_d + 3 };
+            repo_conts[i] = .{ base_r + 4, base_r + 5, base_r + 6, base_r + 7 };
+            docs_conts[i] = .{ base_d + 4, base_d + 5, base_d + 6, base_d + 7 };
+            repo_entries[i] = .{
+                .ctx = &repo_keys[i],
+                .cont = &repo_conts[i],
+                .hit_count = 10,
+                .step_prob = 0.85,
+            };
+            docs_entries[i] = .{
+                .ctx = &docs_keys[i],
+                .cont = &docs_conts[i],
+                .hit_count = 10,
+                .step_prob = 0.85,
+            };
+        }
+        _ = try ngram_nvme.writeTableFile(allocator, p_repo, &repo_entries, .{ .corpus_id = "synth-repo", .num_buckets = 16 });
+        _ = try ngram_nvme.writeTableFile(allocator, p_docs, &docs_entries, .{ .corpus_id = "synth-docs", .num_buckets = 16 });
+        repo_key_cnt = 32;
+        docs_key_cnt = 32;
+        break :blk p_repo;
+    };
+    const docs_path: [:0]const u8 = if (use_real) real_docs_path else synth_docs_opt.?;
+
+    if (use_real) {
+        repo_key_cnt = extractAngSampleKeys(repo_path, &repo_keys);
+        docs_key_cnt = extractAngSampleKeys(docs_path, &docs_keys);
+    }
+
+    var reg = try ngram_nvme.DomainNgramRegistry.init(allocator, .{ .cache_pages = 32 });
+    defer reg.deinit(allocator);
+    _ = try reg.registerPack("repo", repo_path, null);
+    _ = try reg.registerPack("docs", docs_path, null);
+
+    const n_q: usize = @max(@min(cfg.c14_ngram_queries, 32), 4);
+    var cold_us_samples: [64]f64 = undefined;
+    var sample_cnt: usize = 0;
+    var out_cont: [ngram_nvme.MAX_CONT_LEN]u32 = undefined;
+    var hits_repo: u64 = 0;
+    var hits_docs: u64 = 0;
+
+    // Cold F_NOCACHE NVMe reads across both domains (clear cache before each pass).
+    try reg.clearCache();
+    for (0..n_q) |i| {
+        const rk = repo_keys[i % @max(repo_key_cnt, 1)];
+        const t0 = try vmstat.nowNs();
+        const r_res = try reg.queryDomain("repo", &rk, &out_cont);
+        const t1 = try vmstat.nowNs();
+        if (r_res.draft_len > 0) hits_repo += 1;
+        if (sample_cnt < cold_us_samples.len) {
+            cold_us_samples[sample_cnt] = @as(f64, @floatFromInt(t1 - t0)) / 1000.0;
+            sample_cnt += 1;
+        }
+
+        const dk = docs_keys[i % @max(docs_key_cnt, 1)];
+        const t2 = try vmstat.nowNs();
+        const d_res = try reg.queryDomain("docs", &dk, &out_cont);
+        const t3 = try vmstat.nowNs();
+        if (d_res.draft_len > 0) hits_docs += 1;
+        if (sample_cnt < cold_us_samples.len) {
+            cold_us_samples[sample_cnt] = @as(f64, @floatFromInt(t3 - t2)) / 1000.0;
+            sample_cnt += 1;
+        }
+    }
+    std.mem.sort(f64, cold_us_samples[0..sample_cnt], {}, std.sort.asc(f64));
+    const cold_p50_us = cold_us_samples[sample_cnt / 2];
+    const cold_p99_us = cold_us_samples[(sample_cnt * 99) / 100];
+
+    // Warmed LRU cache hit latency + selectDefaultDomain + steady-state malloc check.
+    const hot_rk = repo_keys[0];
+    const hot_dk = docs_keys[0];
+    _ = try reg.queryDomain("repo", &hot_rk, &out_cont);
+    _ = try reg.queryDomain("docs", &hot_dk, &out_cont);
+
+    const heap_before = try vmstat.Snapshot.capture();
+    const hit_iters: usize = 128;
+    const ht0 = try vmstat.nowNs();
+    for (0..hit_iters) |i| {
+        if ((i & 1) == 0) {
+            _ = try reg.queryDomain("repo", &hot_rk, &out_cont);
+        } else {
+            _ = try reg.queryDomain("docs", &hot_dk, &out_cont);
+        }
+    }
+    const ht1 = try vmstat.nowNs();
+    const st0 = try vmstat.nowNs();
+    for (0..hit_iters) |i| {
+        try reg.selectDefaultDomain(if ((i & 1) == 0) "docs" else "repo");
+    }
+    const st1 = try vmstat.nowNs();
+    const heap_after = try vmstat.Snapshot.capture();
+
+    // Live atomic `swapDomainPack` latency (zero-downtime double-buffered descriptor bank swap).
+    const sw0 = try vmstat.nowNs();
+    _ = try reg.swapDomainPack("docs", docs_path, false);
+    const sw1 = try vmstat.nowNs();
+
+    var infos: [ngram_nvme.MAX_DOMAIN_PACKS]ngram_nvme.DomainPackInfo = undefined;
+    const pcount = reg.snapshotPacks(&infos);
+    var total_entries: u64 = 0;
+    for (infos[0..pcount]) |inf| total_entries += inf.total_entries;
+
+    return .{
+        .real_packs = use_real,
+        .pack_count = pcount,
+        .total_entries = total_entries,
+        .wired_bytes = reg.totalWiredBytes(),
+        .cold_p50_us = cold_p50_us,
+        .cold_p99_us = cold_p99_us,
+        .cache_hit_us = @as(f64, @floatFromInt(ht1 - ht0)) / (@as(f64, @floatFromInt(hit_iters)) * 1000.0),
+        .select_default_ns = @as(f64, @floatFromInt(st1 - st0)) / @as(f64, @floatFromInt(hit_iters)),
+        .swap_pack_us = @as(f64, @floatFromInt(sw1 - sw0)) / 1000.0,
+        .hits_repo = hits_repo,
+        .hits_docs = hits_docs,
+        .steady_malloc_blocks = vmstat.heapDelta(heap_before, heap_after).blocks_in_use,
+    };
+}
+
+pub fn runM65WithConfig(allocator: std.mem.Allocator, cfg: M65Config) !M65Report {
+    const vm_before = try vmstat.Snapshot.capture();
+
+    // Section 1: G14 Hardware VideoToolbox + Metal 4 Vision Ingress
+    const vision_rows = try runM65VisionBench(allocator, cfg);
+
+    // Section 2: R5 32K Retired q8 KV Tier
+    const r5 = try runM65R5Bench(allocator, cfg);
+
+    // Section 3: R8 PrefixCache + GPU CoW Tail + GDN Snapshot Clone
+    const r8 = try runM65R8Bench(allocator, cfg);
+
+    // Section 4a: C14 Continuous Batching (GQA + MoE q4)
+    const c14_moe_rows = blk: {
+        const td = try makeM6TempDir(allocator, "m65_c14_moe");
+        defer {
+            removeDirRecursiveBestEffort(allocator, td);
+            allocator.free(td);
+        }
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/c14_moe.amf", .{td}, 0);
+        defer allocator.free(path);
+        const mcfg: qwen3.ModelConfig = .{
+            .arch = .qwen3_moe,
+            .hidden_size = cfg.c14_moe_hidden,
+            .num_hidden_layers = cfg.c14_moe_layers,
+            .num_attention_heads = cfg.c14_moe_q_heads,
+            .num_key_value_heads = cfg.c14_moe_kv_heads,
+            .head_dim = cfg.c14_moe_head_dim,
+            .intermediate_size = cfg.c14_moe_inter,
+            .moe_intermediate_size = cfg.c14_moe_inter,
+            .num_experts = cfg.c14_moe_num_experts,
+            .num_experts_per_tok = cfg.c14_moe_top_k,
+            .vocab_size = cfg.c14_moe_vocab,
+            .max_position_embeddings = 512,
+            .quant_bits = .q4,
+            .tie_word_embeddings = false,
+        };
+        try writeSyntheticQwen3AmfFile(allocator, path, mcfg, 0xC1400E);
+        var model = try qwen3.Qwen3Model.loadFromFile(allocator, path, mcfg, .{
+            .max_seq_len = 256,
+            .chunk_tokens = 256,
+            .max_tree_nodes = 32,
+            .verify_crcs = false,
+            .enable_ane_predictor = false,
+        });
+        defer model.deinit(allocator);
+        var rt = try qwen3.Qwen3BatchRuntime.init(allocator, &model, .{
+            .max_slots = 8,
+            .prefix_cache_chunks = 0,
+        });
+        defer rt.deinit(allocator);
+        break :blk try runM65BatchSweep(allocator, rt.batchBackend(), cfg.c14_moe_vocab, cfg.c14_prefill_tokens, cfg.c14_decode_steps);
+    };
+
+    // Section 4b: C14 Continuous Batching (Hybrid GDN + QSA + MoE q4)
+    const c14_hybrid_rows = blk: {
+        var bundle = try graph.buildSynthQwen4Bundle(allocator, .{
+            .hidden_size = cfg.c14_hybrid_hidden,
+            .vocab_size = cfg.c14_hybrid_vocab,
+            .num_attention_heads = cfg.c14_hybrid_q_heads,
+            .num_key_value_heads = cfg.c14_hybrid_kv_heads,
+            .head_dim = cfg.c14_hybrid_head_dim,
+            .gdn_kh = cfg.c14_hybrid_gdn_kh,
+            .gdn_vh = cfg.c14_hybrid_gdn_vh,
+            .gdn_kd = cfg.c14_hybrid_gdn_kd,
+            .gdn_vd = cfg.c14_hybrid_gdn_vd,
+            .moe_inter = cfg.c14_hybrid_moe_inter,
+            .shared_inter = cfg.c14_hybrid_moe_inter,
+            .num_experts = cfg.c14_hybrid_num_experts,
+            .top_k = cfg.c14_hybrid_top_k,
+            .use_q4_experts = true,
+        });
+        defer bundle.deinit(allocator);
+        var model = try graph.GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 256,
+            .chunk_tokens = 256,
+            .max_tree_nodes = 32,
+        });
+        defer model.deinit(allocator);
+        var rt = try graph.GraphBatchRuntime.init(allocator, &model, .{
+            .max_slots = 8,
+            .prefix_cache_chunks = 0,
+        });
+        defer rt.deinit(allocator);
+        break :blk try runM65BatchSweep(allocator, rt.batchBackend(), cfg.c14_hybrid_vocab, cfg.c14_prefill_tokens, cfg.c14_decode_steps);
+    };
+
+    // Section 4c: C14 DomainNgramRegistry Multi-Pack Lookup & Atomic Swap
+    const ngram = try runM65NgramBench(allocator, cfg);
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .vision_rows = vision_rows,
+        .r5 = r5,
+        .r8 = r8,
+        .c14_moe_rows = c14_moe_rows,
+        .c14_hybrid_rows = c14_hybrid_rows,
+        .ngram = ngram,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM65(allocator: std.mem.Allocator) !M65Report {
+    return runM65WithConfig(allocator, .{});
+}
+
 test "bytesMovedPerDispatch matches exact algorithmic traffic and validates shapes" {
     // q4 (2048, 2048), M=1: w = 2048*1024 = 2097152, sb = 2048*32*4 = 262144, x = 4096, y = 4096
     const q4_gemv = try bytesMovedPerDispatch(.{ .kind = .gemv_q4, .m = 1, .n = 2048, .k = 2048 });
@@ -8549,4 +10341,105 @@ test "runM6WithConfig exercises G8/G9/G10/G7, C10 PLE, scale-qwen4-512e+MTP, D12
     try std.testing.expect(std.mem.indexOf(u8, rendered, "D12 SelfSpecRecurrent Sweep") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "D13 Placement.cpu_sme2 vs .gpu") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "m6.swap.status") != null);
+}
+
+test "runM65WithConfig exercises G14 vision, R5 q8 KV, R8 PrefixCache+GDN clone, and C14 batch+ngram" {
+    const gpa = std.testing.allocator;
+    const report = try runM65WithConfig(gpa, .{
+        .vision_width = 112,
+        .vision_height = 112,
+        .vision_patch_size = 14,
+        .vision_spatial_merge = 2,
+        .vision_hidden = 128,
+        .vision_frames = 2,
+        .vision_reps = 2,
+        .r5_q_heads = 8,
+        .r5_kv_heads = 2,
+        .r5_head_dim = 64,
+        .r5_chunk_tokens = 64,
+        .r5_total_chunks = 6,
+        .r5_active_chunks = 2,
+        .r5_tree_nodes = 4,
+        .r5_reps = 2,
+        .r8_layers = 2,
+        .r8_hidden = 64,
+        .r8_q_heads = 4,
+        .r8_kv_heads = 2,
+        .r8_head_dim = 64,
+        .r8_inter = 128,
+        .r8_vocab = 64,
+        .r8_chunk_tokens = 64,
+        .r8_prefix_exact_tokens = 128,
+        .r8_prefix_partial_tokens = 150,
+        .r8_suffix_tokens = 8,
+        .r8_max_slots = 4,
+        .r8_gdn_layers = 4,
+        .r8_gdn_k_heads = 2,
+        .r8_gdn_v_heads = 4,
+        .r8_gdn_head_k = 64,
+        .r8_gdn_head_v = 64,
+        .r8_gdn_reps = 2,
+        .c14_moe_layers = 2,
+        .c14_moe_hidden = 64,
+        .c14_moe_q_heads = 4,
+        .c14_moe_kv_heads = 2,
+        .c14_moe_head_dim = 64,
+        .c14_moe_num_experts = 8,
+        .c14_moe_top_k = 2,
+        .c14_moe_inter = 64,
+        .c14_moe_vocab = 64,
+        .c14_hybrid_hidden = 64,
+        .c14_hybrid_q_heads = 2,
+        .c14_hybrid_kv_heads = 1,
+        .c14_hybrid_head_dim = 64,
+        .c14_hybrid_gdn_kh = 2,
+        .c14_hybrid_gdn_vh = 2,
+        .c14_hybrid_gdn_kd = 32,
+        .c14_hybrid_gdn_vd = 32,
+        .c14_hybrid_moe_inter = 64,
+        .c14_hybrid_num_experts = 8,
+        .c14_hybrid_top_k = 2,
+        .c14_hybrid_vocab = 64,
+        .c14_prefill_tokens = 8,
+        .c14_decode_steps = 3,
+        .c14_ngram_queries = 4,
+        .use_synthetic_ngram_packs = true,
+        .timeout_ms = 10_000,
+    });
+
+    for (report.vision_rows) |row| {
+        try std.testing.expect(row.all_zero_copy);
+        try std.testing.expect(row.all_page_aligned);
+        try std.testing.expect(row.fps > 0.0);
+    }
+    try std.testing.expect(report.r5.wired_bytes_saved_per_layer > 0);
+    try std.testing.expect(report.r5.decode_max_abs_err < 0.02);
+    try std.testing.expect(report.r5.tree_max_abs_err < 0.02);
+    try std.testing.expectEqual(@as(u32, 128), report.r8.matched_exact_tokens);
+    try std.testing.expectEqual(@as(u64, 0), report.r8.exact_cow_copies);
+    try std.testing.expectEqual(@as(u32, 150), report.r8.matched_partial_tokens);
+    try std.testing.expect(report.r8.partial_cow_copies > 0);
+    try std.testing.expect(report.r8.partial_bit_exact);
+    try std.testing.expect(report.r8.gdn_clone_bit_exact);
+    for (report.c14_moe_rows) |row| {
+        try std.testing.expect(row.agg_tok_s > 0.0);
+    }
+    for (report.c14_hybrid_rows) |row| {
+        try std.testing.expect(row.agg_tok_s > 0.0);
+    }
+    try std.testing.expectEqual(@as(usize, 2), report.ngram.pack_count);
+    try std.testing.expect(report.ngram.hits_repo > 0);
+    try std.testing.expect(report.ngram.hits_docs > 0);
+    try std.testing.expectEqual(@as(i64, 0), report.ngram.steady_malloc_blocks);
+    try vmstat.checkNoSwap(report.vm_before, report.vm_after);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "vt_hevc_nv12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "r5.wired_saved_per_layer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "r8.gdn_snapshot_clone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "ngram.atomic_swap_pack_us") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m65.swap.status") != null);
 }
