@@ -83,6 +83,9 @@ pub const DeviceInfo = struct {
     pub fn aneCoreCount(self: DeviceInfo) u32 {
         return self.raw.ane_core_count;
     }
+    pub fn supportsApple10(self: DeviceInfo) bool {
+        return self.raw.supports_apple10 != 0;
+    }
 };
 
 pub const Device = struct {
@@ -2221,6 +2224,7 @@ test "default device is a unified-memory Apple GPU with Metal 4" {
     try std.testing.expect(info.hasUnifiedMemory());
     try std.testing.expect(info.supportsMetal4());
     try std.testing.expect(info.appleGpuFamily() >= 7);
+    try std.testing.expectEqual(info.appleGpuFamily() >= 10, info.supportsApple10());
     try std.testing.expect(info.recommendedMaxWorkingSetSize() > 0);
     try std.testing.expect(info.maxBufferLength() > 0);
 }

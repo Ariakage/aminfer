@@ -32,6 +32,9 @@ pub const MAX_GDN_HEAD_DIM: u32 = 256;
 pub const MAX_QSA_HEAD_DIM: u32 = 256;
 /// Maximum speculative tree width (64-bit ancestor bitmask).
 pub const MAX_TREE_NODES: u32 = attention.MAX_TREE_NODES;
+
+/// Maximum wide-chunk GPU prefill width (`G15`, ADR-0020).
+pub const MAX_WIDE_PREFILL_TOKENS: u32 = attention.MAX_WIDE_PREFILL_TOKENS;
 /// Default full-attention IOSurface KvTile chunk length (tokens).
 pub const QSA_FULL_CHUNK_TOKENS: u32 = attention.DEFAULT_CHUNK_TOKENS;
 /// Circular sliding-window IOSurface KvTile length (tokens, R5).
@@ -94,8 +97,8 @@ pub const GdnPrefillParams = extern struct {
     apply_l2_norm: u32,
     apply_out_gate: u32,
     chunk_size: u32,
-    _pad0: u32 = 0,
-    _pad1: u32 = 0,
+    write_state_only: u32 = 0,
+    out_start_token: u32 = 0,
 };
 
 pub const GdnTreeVerifyParams = extern struct {
@@ -207,7 +210,7 @@ pub const QsaBlockSummaryParams = extern struct {
     block_tokens: u32,
     start_block: u32,
     num_blocks: u32,
-    _pad0: u32 = 0,
+    num_retired_chunks: u32 = 0,
     _pad1: u32 = 0,
     _pad2: u32 = 0,
 };
@@ -224,7 +227,7 @@ pub const QsaIndexParams = extern struct {
     top_k_blocks: u32,
     num_local_blocks: u32,
     scale: f32,
-    _pad0: u32 = 0,
+    causal_q_start_pos: u32 = 0xFFFF_FFFF,
 };
 
 pub const QsaSparseAttnParams = extern struct {
@@ -243,7 +246,7 @@ pub const QsaSparseAttnParams = extern struct {
     num_retired_chunks: u32 = 0,
     retired_plane_stride_bytes: u32 = 0,
     retired_chunk_stride_bytes: u32 = 0,
-    _pad0: u32 = 0,
+    causal_q_start_pos: u32 = 0xFFFF_FFFF,
 };
 
 pub const GrParams = extern struct {
@@ -291,6 +294,67 @@ pub const GdnConv1dQParams = extern struct {
     gdn_qk: u32,
     gdn_v: u32,
     conv_k: u32,
+    is_tree: u32 = 1,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
+pub const QsaPrefillRopeParams = extern struct {
+    num_tokens: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    start_pos: u32,
+    chunk_tokens: u32,
+    num_retired_chunks: u32,
+    ring_capacity: u32,
+    mrope_s0: u32,
+    mrope_s1: u32,
+    mrope_s2: u32,
+    use_positions_3d: u32,
+    apply_qk_norm: u32,
+    kv_only: u32,
+    write_to_tiles: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+    yarn_factor: f32,
+    yarn_mscale: f32,
+    yarn_beta_fast: f32,
+    yarn_beta_slow: f32,
+    original_max_pos: u32,
+    _pad0: u32 = 0,
+};
+
+pub const QsaPrefillKvCommitParams = extern struct {
+    num_tokens: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    chunk_tokens: u32,
+    num_retired_chunks: u32,
+    ring_capacity: u32,
+    _pad0: u32 = 0,
+};
+
+pub const QsaSwaPrefillAttnParams = extern struct {
+    num_q: u32,
+    q_start_pos: u32,
+    chunk_start_pos: u32,
+    kv_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    window_size: u32,
+    ring_capacity: u32,
+    chunk_tokens: u32,
+    scale: f32,
+    num_retired_chunks: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
 };
 
 pub const GdnConv1dCommitParams = extern struct {
@@ -355,7 +419,10 @@ comptime {
     if (@sizeOf(GrComputeGatesParams) != 16) @compileError("GrComputeGatesParams must be 16 bytes");
     if (@sizeOf(GdnComputeGatesParams) != 16) @compileError("GdnComputeGatesParams must be 16 bytes");
     if (@sizeOf(GdnConv1dParams) != 32) @compileError("GdnConv1dParams must be 32 bytes");
-    if (@sizeOf(GdnConv1dQParams) != 16) @compileError("GdnConv1dQParams must be 16 bytes");
+    if (@sizeOf(GdnConv1dQParams) != 32) @compileError("GdnConv1dQParams must be 32 bytes");
+    if (@sizeOf(QsaPrefillRopeParams) != 96) @compileError("QsaPrefillRopeParams must be 96 bytes");
+    if (@sizeOf(QsaPrefillKvCommitParams) != 32) @compileError("QsaPrefillKvCommitParams must be 32 bytes");
+    if (@sizeOf(QsaSwaPrefillAttnParams) != 64) @compileError("QsaSwaPrefillAttnParams must be 64 bytes");
     if (@sizeOf(GdnConv1dCommitParams) != 144) @compileError("GdnConv1dCommitParams must be 144 bytes");
     if (@sizeOf(BlendF16Params) != 16) @compileError("BlendF16Params must be 16 bytes");
     if (@sizeOf(GdnBatchDecodeParams) != 64) @compileError("GdnBatchDecodeParams must be 64 bytes");
@@ -748,6 +815,12 @@ pub const GdnPrefillArgs = struct {
     rms_eps: f32 = 1e-6,
     apply_l2_norm: bool = true,
     chunk_size: u32 = 64,
+    /// When `true` (`P0-B1` non-final `L - 1`), updates recurrent `state_out`
+    /// only and skips computing/writing `out` and post-norm.
+    write_state_only: bool = false,
+    /// Optional first token index emitted to `out` (e.g. `seq_len - 1` for
+    /// `P0-B1` final-chunk `M = 1` tail narrowing). Defaults to `0` (all rows).
+    out_start_token: u32 = 0,
 };
 
 pub const GdnTreeVerifyArgs = struct {
@@ -1040,7 +1113,7 @@ pub const QsaIndexBuffer = struct {
         if (spec.max_nodes == 0 or spec.num_kv_heads == 0 or spec.top_k_blocks == 0) {
             return error.ZeroDimension;
         }
-        if (spec.max_nodes > MAX_TREE_NODES or spec.top_k_blocks > QSA_MAX_TOP_K_BLOCKS) {
+        if (spec.max_nodes > MAX_WIDE_PREFILL_TOKENS or spec.top_k_blocks > QSA_MAX_TOP_K_BLOCKS) {
             return error.InvalidConfig;
         }
     }
@@ -1155,6 +1228,7 @@ pub const QsaBlockSummaryArgs = struct {
     block_tokens: u32 = QSA_DEFAULT_BLOCK_TOKENS,
     start_block: u32,
     num_blocks: u32,
+    num_retired_chunks: u32 = 0,
 };
 
 pub const QsaIndexBlocksArgs = struct {
@@ -1174,6 +1248,10 @@ pub const QsaIndexBlocksArgs = struct {
     /// Number of mandatory trailing local recent blocks (`>= 1`).
     num_local_blocks: u32 = 1,
     scale: ?f32 = null,
+    /// When set, runs causal prefill indexing where query `node` only considers
+    /// blocks up to `min(kv_len, causal_q_start_pos + node + 1)` (skipping
+    /// strictly upper-triangular blocks).
+    causal_q_start_pos: ?u32 = null,
 };
 
 pub const QsaSparseAttnArgs = struct {
@@ -1205,6 +1283,9 @@ pub const QsaSparseAttnArgs = struct {
     num_retired_chunks: u32 = 0,
     retired_plane_stride_bytes: u32 = 0,
     retired_chunk_stride_bytes: u32 = 0,
+    /// When set, enforces causal `kv_pos <= causal_q_start_pos + node` per query
+    /// row (strictly skipping upper-triangular KV positions).
+    causal_q_start_pos: ?u32 = null,
 };
 
 /// Combined QSA indexer + sparse attention dispatch supporting `ADR-0019`
@@ -1239,6 +1320,77 @@ pub const QsaAttentionArgs = struct {
     /// When `true` (`r >= 1` in `LoopSchedule`, ADR-0019), skips `ami_qsa_index_blocks`
     /// and reuses the selected block indices already stored in `index_buf`.
     reuse_block_indices: bool = false,
+    /// Optional causal prefill starting position for wide-chunk QSA prefill (`G15`).
+    causal_q_start_pos: ?u32 = null,
+};
+
+pub const QsaPrefillRopeArgs = struct {
+    q: metal.BufferBinding,
+    k: metal.BufferBinding,
+    v: metal.BufferBinding,
+    q_norm: ?metal.BufferBinding = null,
+    k_norm: ?metal.BufferBinding = null,
+    norm_dtype: quant.FloatDType = .f16,
+    /// Optional `[num_tokens]Pos3D` buffer; defaults to 1D `start_pos + tok` when null.
+    positions_3d: ?metal.BufferBinding = null,
+    /// Bindless `HybridKvRing` `KvTilePair` table (required when `write_to_tiles == true`).
+    kv_tiles: ?metal.BufferBinding = null,
+    num_tokens: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32 = 0,
+    start_pos: u32,
+    mrope: MropeSection,
+    yarn: YarnConfig = .{},
+    chunk_tokens: u32 = QSA_FULL_CHUNK_TOKENS,
+    num_retired_chunks: u32 = 0,
+    ring_capacity: u32 = 0,
+    /// When `true` (`P0-B1` non-final `L - 1`), skips Q updates and writes K/V only.
+    kv_only: bool = false,
+    /// When `true`, writes K and V directly into `kv_tiles`; when `false` (circular
+    /// SWA prefill), writes rotated K in-place to `k` so ring history stays intact
+    /// until `encodeQsaPrefillKvRingCommit` runs after attention.
+    write_to_tiles: bool = true,
+    rms_eps: f32 = 1e-6,
+    rope_theta: f32 = 1_000_000.0,
+};
+
+pub const QsaPrefillKvCommitArgs = struct {
+    k: metal.BufferBinding,
+    v: metal.BufferBinding,
+    kv_tiles: metal.BufferBinding,
+    num_tokens: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    chunk_tokens: u32 = QSA_FULL_CHUNK_TOKENS,
+    num_retired_chunks: u32 = 0,
+    ring_capacity: u32 = 0,
+};
+
+pub const QsaSwaPrefillAttnArgs = struct {
+    q: metal.BufferBinding,
+    kv_tiles: ?metal.BufferBinding = null,
+    k_chunk: metal.BufferBinding,
+    v_chunk: metal.BufferBinding,
+    out: metal.BufferBinding,
+    retired_pool: ?metal.BufferBinding = null,
+    retired_chunk_ids: ?metal.BufferBinding = null,
+    num_q: u32,
+    q_start_pos: u32,
+    chunk_start_pos: u32,
+    kv_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    window_size: u32 = QSA_SWA_WINDOW_TOKENS,
+    ring_capacity: u32 = QSA_SWA_WINDOW_TOKENS,
+    chunk_tokens: u32 = QSA_SWA_WINDOW_TOKENS,
+    scale: ?f32 = null,
+    num_retired_chunks: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
 };
 
 // ===========================================================================
@@ -1404,12 +1556,13 @@ pub const GdnConv1dQSiluArgs = struct {
     q_hist_r0: metal.BufferBinding,
     conv_w: metal.BufferBinding,
     conv_state_in: metal.BufferBinding,
-    ancestor_masks: metal.BufferBinding,
+    ancestor_masks: ?metal.BufferBinding = null,
     q_out: metal.BufferBinding,
     m: u32,
     gdn_qk: u32,
     gdn_v: u32,
     conv_k: u32,
+    is_tree: bool = true,
 };
 
 pub const GdnConv1dCommitArgs = struct {
@@ -1532,6 +1685,13 @@ pub const HybridPipelines = struct {
     qsa_sparse_attn_d64: metal.Pipeline,
     qsa_sparse_attn_d128: metal.Pipeline,
     qsa_sparse_attn_dyn: metal.Pipeline,
+    // M6.8 (G15, ADR-0020): wide-chunk QSA & 128-token SWA ring prefill
+    qsa_prefill_rope_f16: metal.Pipeline,
+    qsa_prefill_rope_bf16: metal.Pipeline,
+    qsa_prefill_kv_ring_commit: metal.Pipeline,
+    qsa_swa_prefill_attn_d64: metal.Pipeline,
+    qsa_swa_prefill_attn_d128: metal.Pipeline,
+    qsa_swa_prefill_attn_dyn: metal.Pipeline,
 
     // 4-Branch GR (G10): indexed as `[stream_bf16][act_bf16]` (`0=f16, 1=bf16`)
     gr_init: [2][2]metal.Pipeline,
@@ -1790,6 +1950,34 @@ pub const HybridPipelines = struct {
         const blend_f16 = try metal.Pipeline.init(device, library, "ami_blend_f16");
         errdefer blend_f16.close();
 
+        const qsa_prefill_rope_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_qsa_prefill_qknorm_mrope", &.{
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer qsa_prefill_rope_f16.close();
+
+        const qsa_prefill_rope_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_qsa_prefill_qknorm_mrope", &.{
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer qsa_prefill_rope_bf16.close();
+
+        const qsa_prefill_kv_ring_commit = try metal.Pipeline.init(device, library, "ami_qsa_prefill_kv_ring_commit");
+        errdefer qsa_prefill_kv_ring_commit.close();
+
+        const qsa_swa_prefill_attn_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_qsa_swa_prefill_attn", &.{
+            .{ .index = 2, .value = .{ .u32 = 64 } },
+        });
+        errdefer qsa_swa_prefill_attn_d64.close();
+
+        const qsa_swa_prefill_attn_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_qsa_swa_prefill_attn", &.{
+            .{ .index = 2, .value = .{ .u32 = 128 } },
+        });
+        errdefer qsa_swa_prefill_attn_d128.close();
+
+        const qsa_swa_prefill_attn_dyn = try metal.Pipeline.initSpecialized(device, library, "ami_qsa_swa_prefill_attn", &.{
+            .{ .index = 2, .value = .{ .u32 = 0 } },
+        });
+        errdefer qsa_swa_prefill_attn_dyn.close();
+
         return .{
             .gdn_decode_d64_f16 = gdn_decode_d64_f16,
             .gdn_decode_d64_bf16 = gdn_decode_d64_bf16,
@@ -1824,6 +2012,12 @@ pub const HybridPipelines = struct {
             .qsa_sparse_attn_d64 = qsa_sparse_attn_d64,
             .qsa_sparse_attn_d128 = qsa_sparse_attn_d128,
             .qsa_sparse_attn_dyn = qsa_sparse_attn_dyn,
+            .qsa_prefill_rope_f16 = qsa_prefill_rope_f16,
+            .qsa_prefill_rope_bf16 = qsa_prefill_rope_bf16,
+            .qsa_prefill_kv_ring_commit = qsa_prefill_kv_ring_commit,
+            .qsa_swa_prefill_attn_d64 = qsa_swa_prefill_attn_d64,
+            .qsa_swa_prefill_attn_d128 = qsa_swa_prefill_attn_d128,
+            .qsa_swa_prefill_attn_dyn = qsa_swa_prefill_attn_dyn,
             .gr_init = gr_init,
             .gr_read = gr_read,
             .gr_write = gr_write,
@@ -1840,6 +2034,12 @@ pub const HybridPipelines = struct {
     }
 
     pub fn close(self: HybridPipelines) void {
+        self.qsa_swa_prefill_attn_dyn.close();
+        self.qsa_swa_prefill_attn_d128.close();
+        self.qsa_swa_prefill_attn_d64.close();
+        self.qsa_prefill_kv_ring_commit.close();
+        self.qsa_prefill_rope_bf16.close();
+        self.qsa_prefill_rope_f16.close();
         self.blend_f16.close();
         self.gdn_conv1d_commit.close();
         self.gdn_conv1d_q_silu.close();
@@ -2071,9 +2271,10 @@ pub const HybridPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.seq_len == 0) return error.ZeroDimension;
+        if (!args.write_state_only and args.out_start_token >= args.seq_len) return error.InvalidConfig;
         try validateGdnDims(args.num_k_heads, args.num_v_heads, args.head_k_dim, args.head_v_dim);
         const q_scale = args.q_scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_k_dim))));
-        const need_post_norm = (args.norm_w != null);
+        const need_post_norm = (!args.write_state_only) and (args.norm_w != null);
         const params: GdnPrefillParams = .{
             .seq_len = args.seq_len,
             .num_k_heads = args.num_k_heads,
@@ -2083,8 +2284,10 @@ pub const HybridPipelines = struct {
             .q_scale = q_scale,
             .l2_eps = args.l2_eps,
             .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
-            .apply_out_gate = if (!need_post_norm and args.z != null) 1 else 0,
+            .apply_out_gate = if (!args.write_state_only and !need_post_norm and args.z != null) 1 else 0,
             .chunk_size = if (args.chunk_size > 0) args.chunk_size else 64,
+            .write_state_only = if (args.write_state_only) 1 else 0,
+            .out_start_token = if (args.write_state_only) 0 else args.out_start_token,
         };
         const pipe = switch (args.head_k_dim) {
             64 => self.gdn_prefill_d64,
@@ -2112,8 +2315,14 @@ pub const HybridPipelines = struct {
         );
 
         if (need_post_norm) {
+            const emitted_tokens = args.seq_len - args.out_start_token;
+            const z_row_bytes: u64 = @as(u64, args.num_v_heads) * args.head_v_dim * @sizeOf(f16);
+            const z_bind: metal.BufferBinding = if (args.z) |zb|
+                .{ .buffer = zb.buffer, .offset = zb.offset + @as(u64, args.out_start_token) * z_row_bytes }
+            else
+                args.out;
             const norm_params: GdnOutNormGateParams = .{
-                .num_tokens = args.seq_len,
+                .num_tokens = emitted_tokens,
                 .num_v_heads = args.num_v_heads,
                 .head_v_dim = args.head_v_dim,
                 .rms_eps = args.rms_eps,
@@ -2126,11 +2335,11 @@ pub const HybridPipelines = struct {
                 norm_pipe,
                 &.{
                     args.out,
-                    args.z orelse args.out,
+                    z_bind,
                     args.norm_w.?,
                 },
                 std.mem.asBytes(&norm_params),
-                .{ args.num_v_heads, args.seq_len, 1 },
+                .{ args.num_v_heads, emitted_tokens, 1 },
                 .{ 32, 1, 1 },
                 true,
             );
@@ -2502,6 +2711,7 @@ pub const HybridPipelines = struct {
             .block_tokens = args.block_tokens,
             .start_block = args.start_block,
             .num_blocks = args.num_blocks,
+            .num_retired_chunks = args.num_retired_chunks,
         };
         try frame.encodeThreadgroups(
             self.qsa_update_block_summary,
@@ -2519,7 +2729,7 @@ pub const HybridPipelines = struct {
         args: QsaIndexBlocksArgs,
         insert_barrier_before: bool,
     ) EncodeError!void {
-        if (args.num_nodes == 0 or args.num_nodes > MAX_TREE_NODES) return error.InvalidNodeCount;
+        if (args.num_nodes == 0 or args.num_nodes > MAX_WIDE_PREFILL_TOKENS) return error.InvalidNodeCount;
         if (args.num_q_heads == 0 or args.num_kv_heads == 0 or args.head_dim == 0 or args.block_tokens == 0) {
             return error.ZeroDimension;
         }
@@ -2547,6 +2757,7 @@ pub const HybridPipelines = struct {
             .top_k_blocks = args.top_k_blocks,
             .num_local_blocks = if (args.num_local_blocks > 0) args.num_local_blocks else 1,
             .scale = scale,
+            .causal_q_start_pos = args.causal_q_start_pos orelse 0xFFFF_FFFF,
         };
         try frame.encodeThreadgroups(
             self.qsa_index_blocks,
@@ -2569,7 +2780,9 @@ pub const HybridPipelines = struct {
         args: QsaSparseAttnArgs,
         insert_barrier_before: bool,
     ) EncodeError!void {
-        if (args.num_nodes == 0 or args.num_nodes > MAX_TREE_NODES) return error.InvalidNodeCount;
+        const has_any_tree = (args.k_tree != null or args.v_tree != null or args.ancestor_masks != null);
+        const max_nodes = if (has_any_tree) MAX_TREE_NODES else MAX_WIDE_PREFILL_TOKENS;
+        if (args.num_nodes == 0 or args.num_nodes > max_nodes) return error.InvalidNodeCount;
         if (args.num_q_heads == 0 or args.num_kv_heads == 0 or args.head_dim == 0 or
             args.chunk_tokens == 0 or args.block_tokens == 0)
         {
@@ -2592,7 +2805,6 @@ pub const HybridPipelines = struct {
         }
         if (@as(u64, args.kv_len) > retired_tokens and args.kv_tiles == null) return error.InvalidConfig;
 
-        const has_any_tree = (args.k_tree != null or args.v_tree != null or args.ancestor_masks != null);
         if (has_any_tree and (args.k_tree == null or args.v_tree == null or args.ancestor_masks == null)) {
             return error.MissingTreeInputs;
         }
@@ -2614,6 +2826,7 @@ pub const HybridPipelines = struct {
             .num_retired_chunks = args.num_retired_chunks,
             .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
             .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+            .causal_q_start_pos = args.causal_q_start_pos orelse 0xFFFF_FFFF,
         };
         const gqa_ratio = args.num_q_heads / args.num_kv_heads;
         const q_groups_per_kv: u64 = (@as(u64, gqa_ratio) + 7) / 8;
@@ -2673,6 +2886,7 @@ pub const HybridPipelines = struct {
                 .top_k_blocks = args.top_k_blocks,
                 .num_local_blocks = args.num_local_blocks,
                 .scale = args.scale,
+                .causal_q_start_pos = args.causal_q_start_pos,
             }, insert_barrier_before);
             attn_barrier = true;
         }
@@ -2701,7 +2915,202 @@ pub const HybridPipelines = struct {
             .num_retired_chunks = args.num_retired_chunks,
             .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
             .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+            .causal_q_start_pos = args.causal_q_start_pos,
         }, attn_barrier);
+    }
+
+    /// Encodes `ami_qsa_prefill_qknorm_mrope` (`G15`, ADR-0020): applies QK-Norm
+    /// + YaRN + interleaved 3D MRoPE across `num_tokens` (`1..1024+`) and either
+    /// writes K/V directly into bindless `HybridKvRing` tiles (`write_to_tiles = true`)
+    /// or rotates K in-place (`write_to_tiles = false`, preserving circular SWA
+    /// ring history until `encodeQsaPrefillKvRingCommit` runs after attention).
+    pub fn encodeQsaPrefillRope(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: QsaPrefillRopeArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            args.head_dim == 0 or args.chunk_tokens == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if (args.head_dim > MAX_QSA_HEAD_DIM or (args.head_dim % 4) != 0) return error.InvalidHeadDim;
+        const rotary_dim = if (args.rotary_dim == 0) args.head_dim else args.rotary_dim;
+        if (rotary_dim > args.head_dim) return error.InvalidRotaryDim;
+        try args.mrope.validate(rotary_dim);
+
+        const apply_norm = (args.q_norm != null or args.k_norm != null);
+        if (apply_norm and (args.q_norm == null or args.k_norm == null)) return error.MissingNormWeights;
+        if (args.write_to_tiles and args.kv_tiles == null) return error.InvalidConfig;
+        if (args.ring_capacity == 0) {
+            const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidConfig;
+            if (args.write_to_tiles and @as(u64, args.start_pos) < retired_tokens) return error.InvalidConfig;
+        } else if ((args.ring_capacity % args.chunk_tokens) != 0) {
+            return error.InvalidConfig;
+        }
+
+        const params: QsaPrefillRopeParams = .{
+            .num_tokens = args.num_tokens,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .head_dim = args.head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = args.start_pos,
+            .chunk_tokens = args.chunk_tokens,
+            .num_retired_chunks = args.num_retired_chunks,
+            .ring_capacity = args.ring_capacity,
+            .mrope_s0 = args.mrope.section[0],
+            .mrope_s1 = args.mrope.section[1],
+            .mrope_s2 = args.mrope.section[2],
+            .use_positions_3d = if (args.positions_3d != null) 1 else 0,
+            .apply_qk_norm = if (apply_norm) 1 else 0,
+            .kv_only = if (args.kv_only) 1 else 0,
+            .write_to_tiles = if (args.write_to_tiles) 1 else 0,
+            .rms_eps = args.rms_eps,
+            .rope_theta = args.rope_theta,
+            .yarn_factor = args.yarn.factor,
+            .yarn_mscale = args.yarn.effectiveMscale(),
+            .yarn_beta_fast = args.yarn.beta_fast,
+            .yarn_beta_slow = args.yarn.beta_slow,
+            .original_max_pos = args.yarn.original_max_pos,
+        };
+        const pipe = if (args.norm_dtype == .bf16) self.qsa_prefill_rope_bf16 else self.qsa_prefill_rope_f16;
+        const total_heads: u64 = if (args.kv_only)
+            args.num_kv_heads
+        else
+            @as(u64, args.num_q_heads) + args.num_kv_heads;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.q,
+                args.k,
+                args.v,
+                args.q_norm orelse args.q,
+                args.k_norm orelse args.k,
+                args.positions_3d orelse args.q,
+                args.kv_tiles orelse args.q,
+            },
+            std.mem.asBytes(&params),
+            .{ total_heads, args.num_tokens, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_qsa_prefill_kv_ring_commit` (`G15`, ADR-0020): commits the
+    /// trailing `min(num_tokens, ring_capacity)` rotated K and raw V rows into
+    /// bindless `HybridKvRing` `RGBA16Float` tiles with zero slot write races.
+    pub fn encodeQsaPrefillKvRingCommit(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: QsaPrefillKvCommitArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.num_kv_heads == 0 or args.head_dim == 0 or args.chunk_tokens == 0) {
+            return error.ZeroDimension;
+        }
+        if (args.head_dim > MAX_QSA_HEAD_DIM or (args.head_dim % 4) != 0) return error.InvalidHeadDim;
+        if (args.ring_capacity == 0) {
+            const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidConfig;
+            if (@as(u64, args.start_pos) < retired_tokens) return error.InvalidConfig;
+        } else if ((args.ring_capacity % args.chunk_tokens) != 0) {
+            return error.InvalidConfig;
+        }
+
+        const commit_cnt: u32 = if (args.ring_capacity > 0) @min(args.num_tokens, args.ring_capacity) else args.num_tokens;
+        const params: QsaPrefillKvCommitParams = .{
+            .num_tokens = args.num_tokens,
+            .num_kv_heads = args.num_kv_heads,
+            .head_dim = args.head_dim,
+            .start_pos = args.start_pos,
+            .chunk_tokens = args.chunk_tokens,
+            .num_retired_chunks = args.num_retired_chunks,
+            .ring_capacity = args.ring_capacity,
+        };
+        try frame.encodeThreadgroups(
+            self.qsa_prefill_kv_ring_commit,
+            &.{ args.k, args.v, args.kv_tiles },
+            std.mem.asBytes(&params),
+            .{ args.num_kv_heads, commit_cnt, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_qsa_swa_prefill_attn` (`G15`, ADR-0020): causal sliding-window
+    /// prefill attention across `num_q` (`1..1024+`) queries reading unmodified
+    /// `HybridKvRing` prefix (`t < chunk_start_pos`) plus in-flight chunk `k_chunk`/
+    /// `v_chunk` (`t >= chunk_start_pos`), strictly skipping upper-triangular
+    /// (`kv_pos > q_pos`) and out-of-window positions.
+    pub fn encodeQsaSwaPrefillAttn(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: QsaSwaPrefillAttnArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_q == 0 or args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            args.head_dim == 0 or args.chunk_tokens == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if ((args.num_q_heads % args.num_kv_heads) != 0) return error.InvalidConfig;
+        if (args.head_dim > MAX_QSA_HEAD_DIM or (args.head_dim % 4) != 0) return error.InvalidHeadDim;
+        if (args.ring_capacity > 0 and (args.ring_capacity % args.chunk_tokens) != 0) return error.InvalidConfig;
+        if (args.num_retired_chunks > 0) {
+            if (args.ring_capacity != 0) return error.InvalidConfig;
+            if ((args.head_dim % attention.KV_Q8_GROUP_SIZE) != 0) return error.InvalidHeadDim;
+            if (args.retired_pool == null or args.retired_chunk_ids == null or
+                args.retired_plane_stride_bytes == 0 or
+                args.retired_chunk_stride_bytes < args.retired_plane_stride_bytes * 2)
+            {
+                return error.InvalidConfig;
+            }
+        }
+        if (args.chunk_start_pos > 0 and args.kv_tiles == null and args.num_retired_chunks == 0) {
+            return error.InvalidConfig;
+        }
+
+        const scale = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_dim))));
+        const params: QsaSwaPrefillAttnParams = .{
+            .num_q = args.num_q,
+            .q_start_pos = args.q_start_pos,
+            .chunk_start_pos = args.chunk_start_pos,
+            .kv_len = args.kv_len,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .head_dim = args.head_dim,
+            .window_size = args.window_size,
+            .ring_capacity = args.ring_capacity,
+            .chunk_tokens = args.chunk_tokens,
+            .scale = scale,
+            .num_retired_chunks = args.num_retired_chunks,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+        };
+        const gqa_ratio = args.num_q_heads / args.num_kv_heads;
+        const q_groups_per_kv: u64 = (@as(u64, gqa_ratio) + 7) / 8;
+        const pipe = switch (args.head_dim) {
+            64 => self.qsa_swa_prefill_attn_d64,
+            128 => self.qsa_swa_prefill_attn_d128,
+            else => self.qsa_swa_prefill_attn_dyn,
+        };
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.q,
+                args.kv_tiles orelse args.q,
+                args.k_chunk,
+                args.v_chunk,
+                args.out,
+                args.retired_pool orelse args.q,
+                args.retired_chunk_ids orelse args.q,
+            },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, args.num_q, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2924,7 +3333,10 @@ pub const HybridPipelines = struct {
         args: GdnConv1dQSiluArgs,
         insert_barrier_before: bool,
     ) EncodeError!void {
-        if (args.m == 0 or args.m > MAX_TREE_NODES or args.gdn_qk == 0 or args.gdn_v == 0 or args.conv_k == 0 or args.conv_k > 8) {
+        if (args.m == 0 or args.gdn_qk == 0 or args.gdn_v == 0 or args.conv_k == 0 or args.conv_k > 8) {
+            return error.InvalidConfig;
+        }
+        if (args.is_tree and (args.ancestor_masks == null or args.m > MAX_TREE_NODES)) {
             return error.InvalidConfig;
         }
         const params: GdnConv1dQParams = .{
@@ -2932,6 +3344,7 @@ pub const HybridPipelines = struct {
             .gdn_qk = args.gdn_qk,
             .gdn_v = args.gdn_v,
             .conv_k = args.conv_k,
+            .is_tree = if (args.is_tree) 1 else 0,
         };
         try frame.encodeThreads(
             self.gdn_conv1d_q_silu,
@@ -2940,7 +3353,7 @@ pub const HybridPipelines = struct {
                 args.q_hist_r0,
                 args.conv_w,
                 args.conv_state_in,
-                args.ancestor_masks,
+                args.ancestor_masks orelse args.conv_state_in,
                 args.q_out,
             },
             std.mem.asBytes(&params),
@@ -5283,4 +5696,638 @@ test "R8 GdnSnapshotPool and ami_gdn_clone_state round-trip multi-layer state + 
     try std.testing.expectError(error.DoubleFree, snap_pool.releaseSlot(snap1));
     try snap_pool.releaseSlot(snap0);
     try std.testing.expectEqual(@as(u32, 0), snap_pool.activeCount());
+}
+
+test "G15: wide GDN prefill (M=128, M=256) matches CPU ref and supports write_state_only + P0-B1 tail" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    for ([_]u32{ 128, 256 }) |seq_len| {
+        const num_k_heads: u32 = 2;
+        const num_v_heads: u32 = 4;
+        const head_k_dim: u32 = 64;
+        const head_v_dim: u32 = 64;
+
+        const qk_bytes = @as(usize, seq_len) * num_k_heads * head_k_dim * @sizeOf(f16);
+        const v_bytes = @as(usize, seq_len) * num_v_heads * head_v_dim * @sizeOf(f16);
+        const gb_bytes = @as(usize, seq_len) * num_v_heads * @sizeOf(f32);
+        const state_spec: GdnStateSpec = .{
+            .num_gdn_layers = 1,
+            .num_v_heads = num_v_heads,
+            .head_k_dim = head_k_dim,
+            .head_v_dim = head_v_dim,
+        };
+        const state_bytes = try GdnStateArena.requiredBytes(state_spec);
+        const arena_cap = try page.alignUp(2 * state_bytes + 2 * qk_bytes + 5 * v_bytes + 2 * gb_bytes + 8192) + page.APPLE_PAGE_SIZE;
+        const budget = budget_mod.Budget.compute(.{
+            .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+            .user_wire_limit = arena_cap,
+            .global_user_wire_limit = arena_cap,
+            .gpu_working_set_bytes = arena_cap,
+            .configured_cap = null,
+            .headroom_bytes = page.APPLE_PAGE_SIZE,
+        });
+        var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+        defer arena.deinit();
+
+        var st_full = try GdnStateArena.init(&arena, state_spec);
+        var st_only = try GdnStateArena.init(&arena, state_spec);
+        const q_raw = try arena.allocAligned(qk_bytes, 64);
+        const k_raw = try arena.allocAligned(qk_bytes, 64);
+        const v_raw = try arena.allocAligned(v_bytes, 64);
+        const z_raw = try arena.allocAligned(v_bytes, 64);
+        const g_raw = try arena.allocAligned(gb_bytes, 64);
+        const beta_raw = try arena.allocAligned(gb_bytes, 64);
+        const out_full_raw = try arena.allocAligned(v_bytes, 64);
+        const out_only_raw = try arena.allocAligned(v_bytes, 64);
+        const out_tail_raw = try arena.allocAligned(@as(usize, num_v_heads) * head_v_dim * @sizeOf(f16), 64);
+
+        const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw));
+        const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw));
+        const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw));
+        const z_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, z_raw));
+        const g_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, g_raw));
+        const beta_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, beta_raw));
+        const out_full: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_full_raw));
+        const out_only: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_only_raw));
+        const out_tail: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_tail_raw));
+
+        for (q_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 13 + 7) % 23)) - 11)) * 0.0625);
+        for (k_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + 3) % 25)) - 12)) * 0.0625);
+        for (v_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 19 + 5) % 21)) - 10)) * 0.0625);
+        for (z_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 9) % 19)) - 9)) * 0.125);
+        for (g_f32, 0..) |*x, i| x.* = -0.05 - 0.02 * @as(f32, @floatFromInt(i % 7));
+        for (beta_f32, 0..) |*x, i| x.* = -0.5 + 0.2 * @as(f32, @floatFromInt(i % 6));
+        @memset(out_full, @floatCast(0.0));
+        @memset(out_only, @floatCast(-9.5)); // sentinel must remain untouched when write_state_only=true
+        @memset(out_tail, @floatCast(0.0));
+
+        // CPU fp32 reference across all seq_len steps.
+        const state_elems = try GdnStateArena.layerElems(state_spec);
+        const ref_state = try gpa.alloc(f32, state_elems);
+        defer gpa.free(ref_state);
+        @memset(ref_state, 0.0);
+        const ref_out = try gpa.alloc(f32, @as(usize, seq_len) * num_v_heads * head_v_dim);
+        defer gpa.free(ref_out);
+        const q_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_k_dim)));
+        for (0..seq_len) |t| {
+            const q_row = q_f16[t * num_k_heads * head_k_dim ..][0 .. num_k_heads * head_k_dim];
+            const k_row = k_f16[t * num_k_heads * head_k_dim ..][0 .. num_k_heads * head_k_dim];
+            const v_row = v_f16[t * num_v_heads * head_v_dim ..][0 .. num_v_heads * head_v_dim];
+            const z_row = z_f16[t * num_v_heads * head_v_dim ..][0 .. num_v_heads * head_v_dim];
+            const g_row = g_f32[t * num_v_heads ..][0..num_v_heads];
+            const b_row = beta_f32[t * num_v_heads ..][0..num_v_heads];
+            const o_row = ref_out[t * num_v_heads * head_v_dim ..][0 .. num_v_heads * head_v_dim];
+            gdnStepCpuRef(q_row, k_row, v_row, g_row, b_row, z_row, null, .f16, false, ref_state, ref_state, o_row, num_k_heads, num_v_heads, head_k_dim, head_v_dim, q_scale, 1e-6, 1e-6, true);
+        }
+
+        const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer gpu_buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+
+        const q_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) };
+        const k_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) };
+        const v_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) };
+        const z_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(z_raw.ptr) };
+        const g_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(g_raw.ptr) };
+        const beta_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(beta_raw.ptr) };
+
+        {
+            var f = try compute.beginFrame(5000);
+            errdefer f.abort();
+            // 1) Full wide prefill
+            try pipes.encodeGdnPrefill(&f, .{
+                .q = q_b,
+                .k = k_b,
+                .v = v_b,
+                .g = g_b,
+                .beta = beta_b,
+                .z = z_b,
+                .state_in = try st_full.committedBinding(gpu_buf, 0),
+                .state_out = try st_full.scratchBinding(gpu_buf, 0),
+                .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_full_raw.ptr) },
+                .seq_len = seq_len,
+                .num_k_heads = num_k_heads,
+                .num_v_heads = num_v_heads,
+                .head_k_dim = head_k_dim,
+                .head_v_dim = head_v_dim,
+            }, false);
+            // 2) State-only wide prefill (P0-B1 non-final chunk L-1)
+            try pipes.encodeGdnPrefill(&f, .{
+                .q = q_b,
+                .k = k_b,
+                .v = v_b,
+                .g = g_b,
+                .beta = beta_b,
+                .z = z_b,
+                .state_in = try st_only.committedBinding(gpu_buf, 0),
+                .state_out = try st_only.scratchBinding(gpu_buf, 0),
+                .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_only_raw.ptr) },
+                .seq_len = seq_len,
+                .num_k_heads = num_k_heads,
+                .num_v_heads = num_v_heads,
+                .head_k_dim = head_k_dim,
+                .head_v_dim = head_v_dim,
+                .write_state_only = true,
+            }, false);
+            // 3) Final-token-only tail wide prefill (P0-B1 final chunk L-1)
+            try pipes.encodeGdnPrefill(&f, .{
+                .q = q_b,
+                .k = k_b,
+                .v = v_b,
+                .g = g_b,
+                .beta = beta_b,
+                .z = z_b,
+                .state_in = try st_full.committedBinding(gpu_buf, 0),
+                .state_out = try st_only.committedBinding(gpu_buf, 0),
+                .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_tail_raw.ptr) },
+                .seq_len = seq_len,
+                .num_k_heads = num_k_heads,
+                .num_v_heads = num_v_heads,
+                .head_k_dim = head_k_dim,
+                .head_v_dim = head_v_dim,
+                .out_start_token = seq_len - 1,
+            }, true);
+            const sig = try f.commit();
+            try compute.wait(sig, 10_000);
+        }
+
+        // Verify full output vs CPU fp32 ref.
+        for (ref_out, 0..) |expected, idx| {
+            const got: f32 = @floatCast(out_full[idx]);
+            try std.testing.expect(std.math.isFinite(got));
+            try std.testing.expectApproxEqAbs(expected, got, 5e-3);
+        }
+        // Verify write_state_only produced identical final state and NEVER touched out_only.
+        const st_a = try st_full.scratchLayerSlice(0);
+        const st_b = try st_only.scratchLayerSlice(0);
+        for (ref_state, st_a, st_b) |r, a, b| {
+            try std.testing.expectApproxEqAbs(r, a, 2e-3);
+            try std.testing.expectEqual(a, b);
+        }
+        for (out_only) |v| try std.testing.expectEqual(@as(f16, @floatCast(-9.5)), v);
+        // Verify P0-B1 tail output matches last row of full output bit-for-bit.
+        const row_elems = @as(usize, num_v_heads) * head_v_dim;
+        try std.testing.expectEqualSlices(f16, out_full[(@as(usize, seq_len - 1) * row_elems)..][0..row_elems], out_tail);
+    }
+}
+
+test "G15: wide QSA sparse prefill + micro-block indexer (M=128, M=256) strictly skips upper-triangular positions" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    const num_q_heads: u32 = 8;
+    const num_kv_heads: u32 = 2;
+    const head_dim: u32 = 128;
+    const block_tokens: u32 = 32;
+    const top_k_blocks: u32 = 4;
+    const num_local_blocks: u32 = 1;
+    const seq_len: u32 = 256; // 8 micro-blocks > top_k_blocks = 4
+    const num_blocks: u32 = seq_len / block_tokens;
+
+    const q_bytes = @as(usize, seq_len) * num_q_heads * head_dim * @sizeOf(f16);
+    const kv_bytes = @as(usize, seq_len) * num_kv_heads * head_dim * @sizeOf(f16);
+    const bk_bytes = @as(usize, num_blocks) * num_kv_heads * head_dim * @sizeOf(f16);
+    const idx_spec: QsaIndexBufferSpec = .{
+        .max_nodes = seq_len,
+        .num_kv_heads = num_kv_heads,
+        .top_k_blocks = top_k_blocks,
+    };
+    const idx_bytes = try QsaIndexBuffer.requiredBytes(idx_spec);
+    const table_bytes = try HybridKvRing.tableRequiredBytes(1);
+
+    const arena_cap = try page.alignUp(2 * q_bytes + 2 * kv_bytes + bk_bytes + idx_bytes + table_bytes + 8192) + page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    var ring = try HybridKvRing.init(gpa, device, &arena, .{
+        .mode = .full_chunk_512,
+        .num_tiles = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    defer ring.deinit(gpa);
+
+    const index_buf = try QsaIndexBuffer.init(&arena, idx_spec);
+    const q_raw = try arena.allocAligned(q_bytes, 64);
+    const k_raw = try arena.allocAligned(kv_bytes, 64);
+    const v_raw = try arena.allocAligned(kv_bytes, 64);
+    const bk_raw = try arena.allocAligned(bk_bytes, 64);
+    const out_raw = try arena.allocAligned(q_bytes, 64);
+    @memset(out_raw, 0);
+
+    const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw));
+    const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw));
+    const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw));
+    const bk_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, bk_raw));
+    const out_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw));
+
+    for (q_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + 5) % 25)) - 12)) * 0.0625);
+    for (k_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 19 + 11) % 27)) - 13)) * 0.0625);
+    for (v_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 23 + 3) % 23)) - 11)) * 0.0625);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    try ring.makeResident(compute);
+
+    const q_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) };
+    const k_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) };
+    const v_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) };
+    const bk_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(bk_raw.ptr) };
+    const out_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) };
+
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeQsaPrefillRope(&f, .{
+            .q = q_b,
+            .k = k_b,
+            .v = v_b,
+            .kv_tiles = ring.tileTableBinding(gpu_buf),
+            .num_tokens = seq_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .start_pos = 0,
+            .mrope = MropeSection.text1d(head_dim),
+            .chunk_tokens = ring.chunk_tokens,
+            .write_to_tiles = true,
+        }, false);
+        try pipes.encodeQsaUpdateBlockSummary(&f, .{
+            .kv_tiles = ring.tileTableBinding(gpu_buf),
+            .block_keys = bk_b,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .kv_len = seq_len,
+            .chunk_tokens = ring.chunk_tokens,
+            .block_tokens = block_tokens,
+            .start_block = 0,
+            .num_blocks = num_blocks,
+        }, true);
+        try pipes.encodeQsaAttention(&f, .{
+            .q = q_b,
+            .kv_tiles = ring.tileTableBinding(gpu_buf),
+            .block_keys = bk_b,
+            .index_buf = &index_buf,
+            .index_metal_buf = gpu_buf,
+            .out = out_b,
+            .num_nodes = seq_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .kv_len = seq_len,
+            .chunk_tokens = ring.chunk_tokens,
+            .block_tokens = block_tokens,
+            .top_k_blocks = top_k_blocks,
+            .num_local_blocks = num_local_blocks,
+            .causal_q_start_pos = 0,
+        }, true);
+        const sig = try f.commit();
+        try compute.wait(sig, 10_000);
+    }
+
+    // Lock the written K/V tile to construct CPU ground truth and verify strict causality
+    // on sampled queries across all 8 micro-blocks (including M=128 and M=255).
+    var kg = try ring.k_tiles[0].lock(true);
+    errdefer kg.release();
+    var vg = try ring.v_tiles[0].lock(true);
+    errdefer vg.release();
+    const stride = kg.bytes_per_row / @sizeOf(f16);
+    const km: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, kg.bytes));
+    const vm: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, vg.bytes));
+
+    const k_hist = try gpa.alloc(f16, @as(usize, seq_len) * num_kv_heads * head_dim);
+    defer gpa.free(k_hist);
+    const v_hist = try gpa.alloc(f16, @as(usize, seq_len) * num_kv_heads * head_dim);
+    defer gpa.free(v_hist);
+    for (0..seq_len) |t| {
+        for (0..num_kv_heads) |kvh| {
+            const tile_off = (kvh * ring.chunk_tokens + t) * stride;
+            const hist_off = (t * num_kv_heads + kvh) * head_dim;
+            @memcpy(k_hist[hist_off .. hist_off + head_dim], km[tile_off .. tile_off + head_dim]);
+            @memcpy(v_hist[hist_off .. hist_off + head_dim], vm[tile_off .. tile_off + head_dim]);
+        }
+    }
+    try vg.unlock();
+    try kg.unlock();
+
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const ref_blocks = try gpa.alloc(u32, @as(usize, num_kv_heads) * top_k_blocks);
+    defer gpa.free(ref_blocks);
+    const ref_counts = try gpa.alloc(u32, num_kv_heads);
+    defer gpa.free(ref_counts);
+    const ref_out = try gpa.alloc(f32, @as(usize, num_q_heads) * head_dim);
+    defer gpa.free(ref_out);
+
+    for ([_]u32{ 0, 17, 63, 64, 127, 128, 195, 255 }) |q_pos| {
+        const eff_kv_len = q_pos + 1;
+        const max_allowed_block = q_pos / block_tokens;
+        // Every selected block for query q_pos MUST satisfy block <= q_pos / block_tokens!
+        for (0..num_kv_heads) |kvh| {
+            const cnt = index_buf.selected_counts[@as(usize, q_pos) * num_kv_heads + kvh];
+            try std.testing.expect(cnt >= 1 and cnt <= top_k_blocks);
+            const sb_off = (@as(usize, q_pos) * num_kv_heads + kvh) * top_k_blocks;
+            for (0..cnt) |bi| {
+                const blk = index_buf.selected_blocks[sb_off + bi];
+                try std.testing.expect(blk <= max_allowed_block);
+            }
+        }
+
+        const q_node = q_f16[@as(usize, q_pos) * num_q_heads * head_dim ..][0 .. num_q_heads * head_dim];
+        qsaIndexBlocksCpuRef(
+            q_node,
+            bk_f16,
+            ref_blocks,
+            ref_counts,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            eff_kv_len,
+            0,
+            0,
+            block_tokens,
+            top_k_blocks,
+            num_local_blocks,
+            scale,
+        );
+        qsaSparseAttnCpuRef(
+            q_node,
+            k_hist,
+            v_hist,
+            ref_blocks,
+            ref_counts,
+            null,
+            null,
+            null,
+            ref_out,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            eff_kv_len,
+            0,
+            block_tokens,
+            top_k_blocks,
+            scale,
+        );
+
+        const got_node = out_f16[@as(usize, q_pos) * num_q_heads * head_dim ..][0 .. num_q_heads * head_dim];
+        for (ref_out, got_node) |expected, got_h| {
+            const got: f32 = @floatCast(got_h);
+            try std.testing.expect(std.math.isFinite(got));
+            try std.testing.expectApproxEqAbs(expected, got, 5e-3);
+        }
+    }
+}
+
+test "G15: wide 128-token circular HybridKvRing SWA prefill (M=128, M=256) wraps cleanly with zero overwrite hazard" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    const num_q_heads: u32 = 8;
+    const num_kv_heads: u32 = 2;
+    const head_dim: u32 = 128;
+    const window_size: u32 = QSA_SWA_WINDOW_TOKENS; // 128
+    const prefix_len: u32 = 90;
+    const wide_m: u32 = 256; // 2x ring capacity -> wraps ring twice!
+    const total_len: u32 = prefix_len + wide_m;
+
+    const q_bytes = @as(usize, total_len) * num_q_heads * head_dim * @sizeOf(f16);
+    const kv_bytes = @as(usize, total_len) * num_kv_heads * head_dim * @sizeOf(f16);
+    const table_bytes = try HybridKvRing.tableRequiredBytes(1);
+
+    const arena_cap = try page.alignUp(2 * q_bytes + 2 * kv_bytes + table_bytes + 8192) + page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    var swa_ring = try HybridKvRing.init(gpa, device, &arena, .{
+        .mode = .sliding_window_128,
+        .num_tiles = 1,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+    });
+    defer swa_ring.deinit(gpa);
+
+    const q_raw = try arena.allocAligned(q_bytes, 64);
+    const k_raw = try arena.allocAligned(kv_bytes, 64);
+    const v_raw = try arena.allocAligned(kv_bytes, 64);
+    const out_raw = try arena.allocAligned(q_bytes, 64);
+    @memset(out_raw, 0);
+
+    const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw));
+    const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw));
+    const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw));
+    const out_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw));
+
+    for (q_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 13 + 7) % 25)) - 12)) * 0.0625);
+    for (k_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 29 + 3) % 27)) - 13)) * 0.0625);
+    for (v_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + 11) % 23)) - 11)) * 0.0625);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    try swa_ring.makeResident(compute);
+
+    const q_row_bytes: u64 = @as(u64, num_q_heads) * head_dim * @sizeOf(f16);
+    const kv_row_bytes: u64 = @as(u64, num_kv_heads) * head_dim * @sizeOf(f16);
+
+    // Step 1: Populate the 90-token prefix directly into the 128-token circular ring (state-only).
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeQsaPrefillRope(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) },
+            .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) },
+            .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) },
+            .kv_tiles = swa_ring.tileTableBinding(gpu_buf),
+            .num_tokens = prefix_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .start_pos = 0,
+            .mrope = MropeSection.text1d(head_dim),
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+            .kv_only = true,
+            .write_to_tiles = true,
+        }, false);
+        // Step 2: Rotate wide_m = 256 chunk Q & K in-place (leaving prefix ring untouched!),
+        // run causal SWA prefill attention across ALL 256 tokens, then commit trailing 128 tokens!
+        const q_wide_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) + @as(u64, prefix_len) * q_row_bytes };
+        const k_wide_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) + @as(u64, prefix_len) * kv_row_bytes };
+        const v_wide_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) + @as(u64, prefix_len) * kv_row_bytes };
+        const out_wide_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_raw.ptr) + @as(u64, prefix_len) * q_row_bytes };
+        try pipes.encodeQsaPrefillRope(&f, .{
+            .q = q_wide_b,
+            .k = k_wide_b,
+            .v = v_wide_b,
+            .num_tokens = wide_m,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .start_pos = prefix_len,
+            .mrope = MropeSection.text1d(head_dim),
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+            .write_to_tiles = false,
+        }, true);
+        try pipes.encodeQsaSwaPrefillAttn(&f, .{
+            .q = q_wide_b,
+            .kv_tiles = swa_ring.tileTableBinding(gpu_buf),
+            .k_chunk = k_wide_b,
+            .v_chunk = v_wide_b,
+            .out = out_wide_b,
+            .num_q = wide_m,
+            .q_start_pos = prefix_len,
+            .chunk_start_pos = prefix_len,
+            .kv_len = total_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .window_size = window_size,
+            .ring_capacity = swa_ring.ring_capacity,
+            .chunk_tokens = swa_ring.chunk_tokens,
+        }, true);
+        try pipes.encodeQsaPrefillKvRingCommit(&f, .{
+            .k = k_wide_b,
+            .v = v_wide_b,
+            .kv_tiles = swa_ring.tileTableBinding(gpu_buf),
+            .num_tokens = wide_m,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .start_pos = prefix_len,
+            .chunk_tokens = swa_ring.chunk_tokens,
+            .ring_capacity = swa_ring.ring_capacity,
+        }, true);
+        const sig = try f.commit();
+        try compute.wait(sig, 10_000);
+    }
+
+    // Build full rotated K history on CPU (prefix 0..89 via CPU RoPE + chunk 90..345 already rotated in k_f16).
+    const k_all = try gpa.alloc(f16, @as(usize, total_len) * num_kv_heads * head_dim);
+    defer gpa.free(k_all);
+    @memcpy(k_all, k_f16);
+    var rot_tmp: [128]f32 = undefined;
+    const mrope_1d = MropeSection.text1d(head_dim);
+    for (0..prefix_len) |pos| {
+        for (0..num_kv_heads) |kvh| {
+            const off = (pos * num_kv_heads + kvh) * head_dim;
+            qsaQkNormMropeHeadCpuRef(
+                k_f16[off .. off + head_dim],
+                null,
+                .f16,
+                &rot_tmp,
+                head_dim,
+                head_dim,
+                Pos3D.text(@intCast(pos)),
+                mrope_1d,
+                .{},
+                1e-6,
+                1_000_000.0,
+            );
+            for (0..head_dim) |d| k_all[off + d] = @floatCast(rot_tmp[d]);
+        }
+    }
+
+    // 1) Verify causal 128-token SWA attention output across sampled queries spanning prefix+chunk+wrap!
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const gqa_ratio = num_q_heads / num_kv_heads;
+    const scores = try gpa.alloc(f32, window_size);
+    defer gpa.free(scores);
+    for ([_]u32{ 0, 1, 37, 38, 127, 128, 200, wide_m - 1 }) |qi| {
+        const q_pos = prefix_len + qi;
+        const t_hi = q_pos + 1;
+        const t_lo = if (t_hi > window_size) t_hi - window_size else 0;
+        const win_len = t_hi - t_lo;
+        for (0..num_q_heads) |qh| {
+            const kvh = qh / gqa_ratio;
+            const q_vec = q_f16[(@as(usize, q_pos) * num_q_heads + qh) * head_dim ..][0..head_dim];
+            var max_s: f32 = -std.math.inf(f32);
+            for (0..win_len) |wi| {
+                const kv_pos = t_lo + @as(u32, @intCast(wi));
+                const k_vec = k_all[(@as(usize, kv_pos) * num_kv_heads + kvh) * head_dim ..][0..head_dim];
+                var dv: f32 = 0.0;
+                for (0..head_dim) |d| dv += @as(f32, @floatCast(q_vec[d])) * @as(f32, @floatCast(k_vec[d]));
+                const s = dv * scale;
+                scores[wi] = s;
+                if (s > max_s) max_s = s;
+            }
+            var sum_p: f32 = 0.0;
+            for (scores[0..win_len]) |*s| {
+                s.* = @exp(s.* - max_s);
+                sum_p += s.*;
+            }
+            const got_row = out_f16[(@as(usize, q_pos) * num_q_heads + qh) * head_dim ..][0..head_dim];
+            for (0..head_dim) |d| {
+                var acc: f32 = 0.0;
+                for (0..win_len) |wi| {
+                    const kv_pos = t_lo + @as(u32, @intCast(wi));
+                    acc += scores[wi] * @as(f32, @floatCast(v_f16[(@as(usize, kv_pos) * num_kv_heads + kvh) * head_dim + d]));
+                }
+                const expected = acc / sum_p;
+                const got: f32 = @floatCast(got_row[d]);
+                try std.testing.expect(std.math.isFinite(got));
+                try std.testing.expectApproxEqAbs(expected, got, 5e-3);
+            }
+        }
+    }
+
+    // 2) Verify final circular ring contents hold exact trailing 128 tokens [total_len - 128 .. total_len)!
+    var kg = try swa_ring.k_tiles[0].lock(true);
+    errdefer kg.release();
+    var vg = try swa_ring.v_tiles[0].lock(true);
+    errdefer vg.release();
+    const stride = kg.bytes_per_row / @sizeOf(f16);
+    const km: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, kg.bytes));
+    const vm: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, vg.bytes));
+    for ((total_len - window_size)..total_len) |pos| {
+        const slot = pos % window_size;
+        for (0..num_kv_heads) |kvh| {
+            const tile_off = (kvh * swa_ring.chunk_tokens + slot) * stride;
+            const buf_off = (pos * num_kv_heads + kvh) * head_dim;
+            try std.testing.expectEqualSlices(f16, k_all[buf_off .. buf_off + head_dim], km[tile_off .. tile_off + head_dim]);
+            try std.testing.expectEqualSlices(f16, v_f16[buf_off .. buf_off + head_dim], vm[tile_off .. tile_off + head_dim]);
+        }
+    }
+    try vg.unlock();
+    try kg.unlock();
 }

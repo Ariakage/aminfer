@@ -113,6 +113,8 @@ typedef struct ami_device_info {
     uint32_t supports_metal4;                  /* 0 or 1 */
     uint32_t apple_gpu_family;                 /* highest MTLGPUFamilyAppleN, 0 if none */
     uint32_t ane_core_count;                   /* 0 when CoreML reports no Neural Engine */
+    uint32_t supports_apple10;                 /* 0 or 1 (MTLGPUFamilyApple10 = 1010, M5+ NAX) */
+    uint32_t _pad0;
 } ami_device_info;
 
 /* Function constant entry for startup pipeline specialization (ADR-0014). */

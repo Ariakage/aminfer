@@ -1007,3 +1007,295 @@ kernel void ami_dense_gemv_batch(const device half *x [[buffer(0)]],
         }
     }
 }
+
+// ===========================================================================
+// Milestone M6.8 (G15, ADR-0020): Wide-Tile (BM = 64, BN = 64) Prefill GEMM
+//
+// Specialized on Q_BITS / Q_GROUP_SIZE (dequant) and DENSE_W_BF16 (dense).
+// Geometry: 8 simdgroups / threadgroup (256 threads) arranged 4x2 along (M, N);
+// each simdgroup computes a 16x32 output sub-tile via 2x4 hardware
+// `simdgroup_float8x8` accumulators (FP32 accumulation). Stages BK = 32 K-slices
+// (two half-groups per 64-element quant group, loading scale_bias once per
+// group) and unions A/B staging with per-simdgroup 8x32 Cs epilogue slices to
+// fit in 10,240 B (10 KiB) threadgroup memory — allowing >= 2 concurrent
+// threadgroups/core on M4 and passing MTL_SHADER_VALIDATION=1 (<= 32 KiB).
+// ===========================================================================
+constant constexpr uint DGW_BM = 64u;
+constant constexpr uint DGW_BN = 64u;
+constant constexpr uint DGW_BK = 32u;
+constant constexpr uint DGW_BK_PAD = 40u; // +8 elements avoids bank conflicts
+
+union WideGemmSmem {
+    struct {
+        half As[DGW_BM * DGW_BK_PAD]; // 64 * 40 * 2 = 5,120 B
+        half Bs[DGW_BN * DGW_BK_PAD]; // 64 * 40 * 2 = 5,120 B
+    } ab;                             // 10,240 B total
+    float Cs[8u][8u * 32u];           // 8 simdgroups x 8x32 float = 8,192 B
+};
+
+static inline void wide_gemm_store_epilogue(threadgroup WideGemmSmem &smem,
+                                            thread simdgroup_float8x8 (&acc)[2][4],
+                                            device half *y,
+                                            uint m,
+                                            uint n,
+                                            uint m_base,
+                                            uint n_base,
+                                            uint sg_id,
+                                            uint sg_m,
+                                            uint sg_n,
+                                            uint lane) {
+    threadgroup float *sg_cs = smem.Cs[sg_id];
+    const uint gn = n_base + sg_n + lane;
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 4u; j++) {
+            simdgroup_store(acc[i][j], sg_cs + j * 8u, 32u);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (gn < n) {
+            for (uint r = 0u; r < 8u; r++) {
+                const uint gm = m_base + sg_m + i * 8u + r;
+                if (gm < m) {
+                    y[ulong(gm) * n + gn] = half(sg_cs[r * 32u + lane]);
+                }
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void ami_dequant_gemm_wide(const device half *x [[buffer(0)]],
+                                  const device uchar *qweight [[buffer(1)]],
+                                  const device half2 *scale_bias [[buffer(2)]],
+                                  device half *y [[buffer(3)]],
+                                  constant DequantParams &p [[buffer(4)]],
+                                  uint2 tg_pos [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint sg_id [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    const uint n_base = tg_pos.x * DGW_BN;
+    const uint m_base = tg_pos.y * DGW_BM;
+    if (m_base >= p.m || n_base >= p.n) {
+        return;
+    }
+
+    threadgroup WideGemmSmem smem;
+
+    simdgroup_float8x8 acc[2][4];
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 4u; j++) {
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    const uint sg_m = (sg_id >> 1) * 16u;   // 0, 16, 32, 48
+    const uint sg_n = (sg_id & 1u) * 32u;   // 0, 32
+    const uint load_row = tid >> 2;         // 0..63
+    const uint load_chunk = tid & 3u;       // 0..3 (8 elements per thread)
+    const uint load_col = load_chunk * 8u;  // 0, 8, 16, 24
+    const uint gm_load = m_base + load_row;
+    const uint gn_load = n_base + load_row;
+
+    for (uint g = 0u; g < p.num_groups; g++) {
+        float scale = 0.0f;
+        float bias = 0.0f;
+        if (gn_load < p.n) {
+            const half2 sb = scale_bias[ulong(gn_load) * p.num_groups + g];
+            scale = float(sb.x);
+            bias = float(sb.y);
+        }
+
+        for (uint sub = 0u; sub < 2u; sub++) {
+            const uint k_base = g * 64u + sub * DGW_BK;
+
+            // 1. Cooperative load of X tile [64, 32] -> As
+            {
+                threadgroup half *a_dst = &smem.ab.As[load_row * DGW_BK_PAD + load_col];
+                if (gm_load < p.m) {
+                    const device half4 *x_src = (const device half4 *)(x + ulong(gm_load) * p.k + k_base + load_col);
+                    *(threadgroup half4 *)(a_dst + 0u) = x_src[0];
+                    *(threadgroup half4 *)(a_dst + 4u) = x_src[1];
+                } else {
+                    const half4 z = half4(0.0h);
+                    *(threadgroup half4 *)(a_dst + 0u) = z;
+                    *(threadgroup half4 *)(a_dst + 4u) = z;
+                }
+            }
+
+            // 2. Cooperative fused dequantization of W tile [64, 32] -> Bs
+            {
+                threadgroup half *b_dst = &smem.ab.Bs[load_row * DGW_BK_PAD + load_col];
+                if (gn_load < p.n) {
+                    if (Q_BITS == 4u) {
+                        const uint w = *(const device uint *)(qweight + ulong(gn_load) * p.row_bytes + g * 32u + sub * 16u + load_chunk * 4u);
+                        for (uint j = 0u; j < 8u; j++) {
+                            b_dst[j] = half(fma(float((w >> (j * 4u)) & 0xFu), scale, bias));
+                        }
+                    } else if (Q_BITS == 3u) {
+                        const device uchar *wp = qweight + ulong(gn_load) * p.row_bytes + g * 24u + sub * 12u + load_chunk * 3u;
+                        const uint word = uint(wp[0]) |
+                                          (uint(wp[1]) << 8) |
+                                          (uint(wp[2]) << 16);
+                        for (uint j = 0u; j < 8u; j++) {
+                            b_dst[j] = half(fma(float((word >> (j * 3u)) & 0x7u), scale, bias));
+                        }
+                    } else if (Q_BITS == 2u) {
+                        const ushort w = *(const device ushort *)(qweight + ulong(gn_load) * p.row_bytes + g * 16u + sub * 8u + load_chunk * 2u);
+                        for (uint j = 0u; j < 8u; j++) {
+                            b_dst[j] = half(fma(float((uint(w) >> (j * 2u)) & 0x3u), scale, bias));
+                        }
+                    }
+                } else {
+                    const half4 z = half4(0.0h);
+                    *(threadgroup half4 *)(b_dst + 0u) = z;
+                    *(threadgroup half4 *)(b_dst + 4u) = z;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // 3. Hardware 8x8 simdgroup MMA across BK = 32
+            for (uint kk = 0u; kk < DGW_BK; kk += 8u) {
+                simdgroup_half8x8 a_frag[2];
+                simdgroup_half8x8 b_frag[4];
+                simdgroup_load(a_frag[0], &smem.ab.As[(sg_m + 0u) * DGW_BK_PAD + kk], DGW_BK_PAD);
+                simdgroup_load(a_frag[1], &smem.ab.As[(sg_m + 8u) * DGW_BK_PAD + kk], DGW_BK_PAD);
+                simdgroup_load(b_frag[0], &smem.ab.Bs[(sg_n + 0u) * DGW_BK_PAD + kk], DGW_BK_PAD, ulong2(0, 0), true);
+                simdgroup_load(b_frag[1], &smem.ab.Bs[(sg_n + 8u) * DGW_BK_PAD + kk], DGW_BK_PAD, ulong2(0, 0), true);
+                simdgroup_load(b_frag[2], &smem.ab.Bs[(sg_n + 16u) * DGW_BK_PAD + kk], DGW_BK_PAD, ulong2(0, 0), true);
+                simdgroup_load(b_frag[3], &smem.ab.Bs[(sg_n + 24u) * DGW_BK_PAD + kk], DGW_BK_PAD, ulong2(0, 0), true);
+
+                for (uint i = 0u; i < 2u; i++) {
+                    for (uint j = 0u; j < 4u; j++) {
+                        simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // 4. Stage accumulators through per-simdgroup union Cs slices and write guarded [M, N] fp16 outputs
+    wide_gemm_store_epilogue(smem, acc, y, p.m, p.n, m_base, n_base, sg_id, sg_m, sg_n, lane);
+}
+
+template <typename T>
+static inline void dense_gemm_wide_stage(const device half *x,
+                                         const device uchar *w,
+                                         threadgroup T *As,
+                                         threadgroup T *Bs,
+                                         constant DenseParams &p,
+                                         uint m_base,
+                                         uint n_base,
+                                         uint k_base,
+                                         uint tid) {
+    const uint ld_row = tid >> 2;          // 0..63
+    const uint ld_col = (tid & 3u) * 8u;   // 0, 8, 16, 24
+    const uint gk = k_base + ld_col;
+    const bool vec_ok = ((p.k & 3u) == 0u) && (gk + 8u <= p.k);
+
+    // X tile [64, 32] -> As (converted to T)
+    {
+        threadgroup T *dst = As + ld_row * DGW_BK_PAD + ld_col;
+        const uint gm = m_base + ld_row;
+        if (gm < p.m && vec_ok) {
+            const device half4 *src = (const device half4 *)(x + ulong(gm) * p.k + gk);
+            const float4 a0 = float4(src[0]);
+            const float4 a1 = float4(src[1]);
+            dst[0] = T(a0.x); dst[1] = T(a0.y); dst[2] = T(a0.z); dst[3] = T(a0.w);
+            dst[4] = T(a1.x); dst[5] = T(a1.y); dst[6] = T(a1.z); dst[7] = T(a1.w);
+        } else {
+            for (uint j = 0u; j < 8u; j++) {
+                const uint kk = gk + j;
+                const float v = (gm < p.m && kk < p.k) ? float(x[ulong(gm) * p.k + kk]) : 0.0f;
+                dst[j] = T(v);
+            }
+        }
+    }
+
+    // W tile [64, 32] -> Bs (stored row-major by output column n)
+    {
+        threadgroup T *dst = Bs + ld_row * DGW_BK_PAD + ld_col;
+        const uint gn = n_base + ld_row;
+        if (gn < p.n && vec_ok) {
+            const ulong e = ulong(gn) * p.k + gk;
+            const float4 b0 = dense_load_w4(w, e);
+            const float4 b1 = dense_load_w4(w, e + 4ul);
+            dst[0] = T(b0.x); dst[1] = T(b0.y); dst[2] = T(b0.z); dst[3] = T(b0.w);
+            dst[4] = T(b1.x); dst[5] = T(b1.y); dst[6] = T(b1.z); dst[7] = T(b1.w);
+        } else {
+            for (uint j = 0u; j < 8u; j++) {
+                const uint kk = gk + j;
+                const float v = (gn < p.n && kk < p.k) ? dense_load_w1(w, ulong(gn) * p.k + kk) : 0.0f;
+                dst[j] = T(v);
+            }
+        }
+    }
+}
+
+template <typename T>
+static inline void dense_gemm_wide_mma(threadgroup T *As,
+                                       threadgroup T *Bs,
+                                       thread simdgroup_float8x8 (&acc)[2][4],
+                                       uint sg_m,
+                                       uint sg_n) {
+    for (uint kk = 0u; kk < DGW_BK; kk += 8u) {
+        simdgroup_matrix<T, 8, 8> a_frag[2];
+        simdgroup_matrix<T, 8, 8> b_frag[4];
+        simdgroup_load(a_frag[0], As + (sg_m + 0u) * DGW_BK_PAD + kk, DGW_BK_PAD);
+        simdgroup_load(a_frag[1], As + (sg_m + 8u) * DGW_BK_PAD + kk, DGW_BK_PAD);
+        simdgroup_load(b_frag[0], Bs + (sg_n + 0u) * DGW_BK_PAD + kk, DGW_BK_PAD, ulong2(0, 0), true);
+        simdgroup_load(b_frag[1], Bs + (sg_n + 8u) * DGW_BK_PAD + kk, DGW_BK_PAD, ulong2(0, 0), true);
+        simdgroup_load(b_frag[2], Bs + (sg_n + 16u) * DGW_BK_PAD + kk, DGW_BK_PAD, ulong2(0, 0), true);
+        simdgroup_load(b_frag[3], Bs + (sg_n + 24u) * DGW_BK_PAD + kk, DGW_BK_PAD, ulong2(0, 0), true);
+        for (uint i = 0u; i < 2u; i++) {
+            for (uint j = 0u; j < 4u; j++) {
+                simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+            }
+        }
+    }
+}
+
+kernel void ami_dense_gemm_wide(const device half *x [[buffer(0)]],
+                                const device uchar *w [[buffer(1)]],
+                                device half *y [[buffer(2)]],
+                                constant DenseParams &p [[buffer(3)]],
+                                uint2 tg_pos [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint sg_id [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    const uint n_base = tg_pos.x * DGW_BN;
+    const uint m_base = tg_pos.y * DGW_BM;
+    if (m_base >= p.m || n_base >= p.n) {
+        return;
+    }
+
+    threadgroup WideGemmSmem smem;
+
+    simdgroup_float8x8 acc[2][4];
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 4u; j++) {
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    const uint sg_m = (sg_id >> 1) * 16u;
+    const uint sg_n = (sg_id & 1u) * 32u;
+
+    for (uint k_base = 0u; k_base < p.k; k_base += DGW_BK) {
+        if (DENSE_W_BF16) {
+            threadgroup bfloat *As = (threadgroup bfloat *)smem.ab.As;
+            threadgroup bfloat *Bs = (threadgroup bfloat *)smem.ab.Bs;
+            dense_gemm_wide_stage<bfloat>(x, w, As, Bs, p, m_base, n_base, k_base, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            dense_gemm_wide_mma<bfloat>(As, Bs, acc, sg_m, sg_n);
+        } else {
+            dense_gemm_wide_stage<half>(x, w, smem.ab.As, smem.ab.Bs, p, m_base, n_base, k_base, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            dense_gemm_wide_mma<half>(smem.ab.As, smem.ab.Bs, acc, sg_m, sg_n);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    wide_gemm_store_epilogue(smem, acc, y, p.m, p.n, m_base, n_base, sg_id, sg_m, sg_n, lane);
+}

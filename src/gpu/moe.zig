@@ -24,7 +24,12 @@ pub const MAX_EXPERTS: u32 = 1024;
 /// Maximum supported number of active experts per token (`top_k`).
 pub const MAX_TOP_K: u32 = 16;
 /// Maximum batched rows for `encodeArgmaxRows` and `encodeTopKLogitsRows`.
-pub const MAX_LOGIT_ROWS: u32 = 64;
+/// Maximum rows in batched GPU argmax / top-K logits (`encodeArgmaxRows`,
+/// `encodeTopKLogitsRows`), supporting wide prefill chunks up to 1024 (`G15`).
+pub const MAX_LOGIT_ROWS: u32 = 1024;
+
+/// Maximum wide-chunk GPU prefill batch width (`G15`, ADR-0020).
+pub const MAX_WIDE_PREFILL_TOKENS: u32 = 1024;
 /// Number of distinct `WeightDType` scheme buckets supported by G13 heterogeneous MoE (ADR-0017).
 pub const NUM_SCHEME_BUCKETS: usize = quant.WeightDType.COUNT;
 /// Byte stride between adjacent `ScheduleHeader` records inside `bucket_headers`.
@@ -530,19 +535,40 @@ pub const MoeWorkspace = struct {
         const m_val: u32 = self.schedule_header.m;
         const top_k_val: u32 = self.schedule_header.top_k;
         std.debug.assert(num_u <= MAX_EXPERTS);
-        std.debug.assert(total_a <= MAX_LOGIT_ROWS * MAX_TOP_K);
+        std.debug.assert(total_a <= self.token_indices.len);
 
         var orig_u: [MAX_EXPERTS]u32 = undefined;
         var orig_off: [MAX_EXPERTS + 1]u32 = undefined;
-        var orig_tok: [MAX_LOGIT_ROWS * MAX_TOP_K]u32 = undefined;
-        var orig_rw: [MAX_LOGIT_ROWS * MAX_TOP_K]f32 = undefined;
-        var orig_sk: [MAX_LOGIT_ROWS * MAX_TOP_K]u32 = undefined;
-
         @memcpy(orig_u[0..num_u], self.unique_experts[0..num_u]);
         @memcpy(orig_off[0 .. num_u + 1], self.expert_token_offsets[0 .. num_u + 1]);
-        @memcpy(orig_tok[0..total_a], self.token_indices[0..total_a]);
-        @memcpy(orig_rw[0..total_a], self.routing_weights[0..total_a]);
-        @memcpy(orig_sk[0..total_a], self.slot_k_indices[0..total_a]);
+
+        // Stage the pre-partition CSR assignment arrays without heap allocation
+        // or large stack frames (macOS worker threads have 512 KiB stacks):
+        // reuse dead `self.down_out` scratch (populated only later by DownProj)
+        // whenever `down_out.len >= 3 * total_a`, falling back to small stack
+        // scratch only for tiny synthetic workspaces.
+        var stack_tok: [64 * MAX_TOP_K]u32 = undefined;
+        var stack_rw: [64 * MAX_TOP_K]f32 = undefined;
+        var stack_sk: [64 * MAX_TOP_K]u32 = undefined;
+
+        var orig_tok: []u32 = undefined;
+        var orig_rw: []f32 = undefined;
+        var orig_sk: []u32 = undefined;
+        if (self.down_out.len >= total_a * 3) {
+            const u32_pool: []u32 = @ptrCast(self.down_out);
+            orig_tok = u32_pool[0..total_a];
+            orig_rw = self.down_out[total_a .. 2 * total_a];
+            orig_sk = u32_pool[2 * total_a .. 3 * total_a];
+        } else {
+            std.debug.assert(total_a <= stack_tok.len);
+            orig_tok = stack_tok[0..total_a];
+            orig_rw = stack_rw[0..total_a];
+            orig_sk = stack_sk[0..total_a];
+        }
+
+        @memcpy(orig_tok, self.token_indices[0..total_a]);
+        @memcpy(orig_rw, self.routing_weights[0..total_a]);
+        @memcpy(orig_sk, self.slot_k_indices[0..total_a]);
 
         var run_u: u32 = 0;
         var run_a: u32 = 0;
@@ -2505,7 +2531,7 @@ pub const MoePipelines = struct {
     }
 
     /// Encodes batched `M`-row greedy argmax (`[num_rows, vocab_size]` f16/f32 ->
-    /// `[num_rows]u32`, `1 <= num_rows <= 64`) with deterministic smallest-index
+    /// `[num_rows]u32`, `1 <= num_rows <= MAX_LOGIT_ROWS`) with deterministic smallest-index
     /// tie breaking. Zero heap allocation on the hot path.
     pub fn encodeArgmaxRows(
         self: MoePipelines,
@@ -2541,7 +2567,7 @@ pub const MoePipelines = struct {
 
     /// Encodes single-dispatch fused FP32 softmax + top-K candidate extraction
     /// (`[num_rows, vocab_size]` -> `[num_rows, top_k]` `TopKCandidate`,
-    /// `1 <= num_rows <= 64`, `1 <= top_k <= 16`). One 256-thread threadgroup
+    /// `1 <= num_rows <= MAX_LOGIT_ROWS`, `1 <= top_k <= 16`). One 256-thread threadgroup
     /// per row; zero heap allocation on the hot path.
     pub fn encodeTopKLogitsRows(
         self: MoePipelines,
@@ -6882,4 +6908,206 @@ test "G7 MoE E=512 top-10 + shared_expert (1-bucket, 3-bucket {q2,q3,q4}, gated/
     }
     try verifyHighExpertWithShared(&hetero_512, 1, 10, 128, 64, .bf16, 128, true, true, .f16, true, true);
     try verifyHighExpertWithShared(&hetero_512, 8, 10, 128, 64, .q4_affine, 128, true, true, .f32, false, true);
+}
+
+test "G15: wide MoeWorkspace (M=512, M=1024), 3-bucket hetero + shared_expert, rebuildSchemeBucketsCpu, and wide argmax/topK rows" {
+    const gpa = std.testing.allocator;
+
+    // 1) Wide CSR routing parity at M = 512 (E=64, top-8) and M = 1024 (E=32, top-4).
+    try verifyRouteTopK(.f32, 512, 64, 8, true, false);
+    try verifyRouteTopK(.f16, 1024, 32, 4, true, true);
+
+    // 2) Full M = 512 heterogeneous 3-bucket {q2, q3, q4} MoE + gated bf16 shared_expert
+    //    (verifies zero u16 slot overflow and full GPU vs CPU fp32 parity at M = 512).
+    const m_wide: u32 = 512;
+    const num_experts: u32 = 32;
+    const top_k: u32 = 4;
+    const hidden_size: u32 = 128;
+    const intermediate_size: u32 = 64;
+    var expert_dtypes: [num_experts]quant.WeightDType = undefined;
+    var scheme_counts: [NUM_SCHEME_BUCKETS]u32 = @splat(0);
+    for (&expert_dtypes, 0..) |*dt, e| {
+        dt.* = if (e < 8) .q4_affine else if (e < 20) .q3_affine else .q2_affine;
+        scheme_counts[@backingInt(dt.*)] += 1;
+    }
+
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try MoePipelines.init(device, library);
+    defer pipes.close();
+
+    var total_weight_bytes: usize = 0;
+    for (expert_dtypes) |dt| {
+        total_weight_bytes += amf.align64(@intCast(try singleExpertBytesForDType(dt, hidden_size, intermediate_size))) + 512;
+    }
+    const shared_eb = try singleExpertBytesForDType(.bf16, hidden_size, intermediate_size);
+    total_weight_bytes += amf.align64(@intCast(shared_eb)) + 1024;
+
+    const ws_spec: WorkspaceSpec = .{
+        .max_tokens = m_wide,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+        .shared_intermediate_size = intermediate_size,
+    };
+    const ws_bytes = try MoeWorkspace.requiredBytes(ws_spec);
+    const x_bytes = @as(usize, m_wide) * hidden_size * @sizeOf(f16);
+    const logits_bytes = @as(usize, m_wide) * num_experts * @sizeOf(f32);
+    const vocab_wide: u32 = 256;
+    const vocab_logits_bytes = @as(usize, m_wide) * vocab_wide * @sizeOf(f16);
+    const argmax_out_bytes = @as(usize, m_wide) * @sizeOf(u32);
+    const topk_k: u32 = 4;
+    const topk_out_bytes = @as(usize, m_wide) * topk_k * @sizeOf(TopKCandidate);
+
+    const arena_cap = try page.alignUp(
+        total_weight_bytes + 2 * ws_bytes + 3 * x_bytes + logits_bytes +
+            vocab_logits_bytes + argmax_out_bytes + topk_out_bytes + 32768,
+    ) + page.APPLE_PAGE_SIZE;
+    var arena = try makeTestArena(arena_cap);
+    defer arena.deinit();
+
+    var ws_gpu = try MoeWorkspace.init(&arena, ws_spec);
+    var ws_cpu = try MoeWorkspace.init(&arena, ws_spec);
+    const table_raw = try arena.allocAligned(@as(usize, num_experts) * @sizeOf(ExpertWeights), 64);
+    const table: []ExpertWeights = @alignCast(std.mem.bytesAsSlice(ExpertWeights, table_raw));
+    for (0..num_experts) |e| {
+        table[e] = try fillSyntheticExpertForDType(&arena, expert_dtypes[e], hidden_size, intermediate_size, e + 1);
+    }
+    const shared_ew = try fillSyntheticExpertForDType(&arena, .bf16, hidden_size, intermediate_size, 999);
+    const shared_gate_raw = try arena.allocAligned(@as(usize, hidden_size) * @sizeOf(f16), 64);
+    const shared_gate_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, shared_gate_raw));
+    for (shared_gate_f16, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 3) % 15)) - 7)) * 0.03125);
+
+    const schemes_raw = try arena.allocAligned(num_experts, 64);
+    for (0..num_experts) |e| schemes_raw[e] = @backingInt(expert_dtypes[e]);
+
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const out_gpu_raw = try arena.allocAligned(x_bytes, 64);
+    const out_cpu_raw = try arena.allocAligned(x_bytes, 64);
+    const logits_raw = try arena.allocAligned(logits_bytes, 64);
+    const vlogits_raw = try arena.allocAligned(vocab_logits_bytes, 64);
+    const argmax_raw = try arena.allocAligned(argmax_out_bytes, 64);
+    const topk_raw = try arena.allocAligned(topk_out_bytes, 64);
+    @memset(out_gpu_raw, 0);
+    @memset(out_cpu_raw, 0);
+
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+    const vlogits_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, vlogits_raw));
+    for (x_f16, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + 5) % 23)) - 11)) * 0.03125);
+    for (logits_f32, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 29 + 13) % 41)) - 20)) * 0.125;
+    for (vlogits_f16, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 31 + 7) % 61)) - 30)) * 0.125);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const base_gpu: MoELayerArgs = .{
+        .x = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) },
+        .router = .{ .logits = .{ .binding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(logits_raw.ptr) }, .dtype = .f32 } },
+        .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+        .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(table_raw.ptr) },
+        .workspace = &ws_gpu,
+        .workspace_buf = gpu_buf,
+        .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_gpu_raw.ptr) },
+        .m = m_wide,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+        .norm_topk_prob = true,
+        .shared_expert = shared_ew,
+        .shared_expert_dtype = .bf16,
+        .shared_intermediate_size = intermediate_size,
+        .shared_gate_weight = .{ .buffer = gpu_buf, .offset = arena.offsetOf(shared_gate_raw.ptr) },
+        .shared_gate_dtype = .f16,
+    };
+
+    // Run Path 1: GPU bucketed hetero MoE + shared_expert + wide 512-row argmax & top-K logits.
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeMoELayerHetero(&f, .{
+            .base = base_gpu,
+            .expert_schemes = .{ .buffer = gpu_buf, .offset = arena.offsetOf(schemes_raw.ptr) },
+            .scheme_counts = scheme_counts,
+        }, false);
+        try pipes.encodeRouteTopK(&f, .f32, .{
+            .logits = .{ .buffer = gpu_buf, .offset = arena.offsetOf(logits_raw.ptr) },
+            .workspace = &ws_cpu,
+            .workspace_buf = gpu_buf,
+            .m = m_wide,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .norm_topk_prob = true,
+        }, false);
+        try pipes.encodeArgmaxRows(&f, .{
+            .logits = .{ .buffer = gpu_buf, .offset = arena.offsetOf(vlogits_raw.ptr) },
+            .out_token_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(argmax_raw.ptr) },
+            .num_rows = m_wide,
+            .vocab_size = vocab_wide,
+            .logits_dtype = .f16,
+        }, false);
+        try pipes.encodeTopKLogitsRows(&f, .{
+            .logits = .{ .buffer = gpu_buf, .offset = arena.offsetOf(vlogits_raw.ptr) },
+            .out_candidates = .{ .buffer = gpu_buf, .offset = arena.offsetOf(topk_raw.ptr) },
+            .num_rows = m_wide,
+            .vocab_size = vocab_wide,
+            .top_k = topk_k,
+            .logits_dtype = .f16,
+        }, false);
+        const sig = try f.commit();
+        try compute.wait(sig, 10_000);
+    }
+
+    // Run Path 2: CPU rebuildSchemeBucketsCpu at M = 512 (2048 assignments -> uses down_out staging!)
+    // and verify identical buckets & identical MoE output against Path 1!
+    ws_cpu.rebuildSchemeBucketsCpu(&expert_dtypes);
+    for (0..NUM_SCHEME_BUCKETS) |s_idx| {
+        const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
+        try std.testing.expectEqual(ws_gpu.bucketHeader(scheme).num_unique_experts, ws_cpu.bucketHeader(scheme).num_unique_experts);
+        try std.testing.expectEqual(ws_gpu.bucketHeader(scheme).total_assignments, ws_cpu.bucketHeader(scheme).total_assignments);
+    }
+
+    var base_cpu = base_gpu;
+    base_cpu.workspace = &ws_cpu;
+    base_cpu.out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_cpu_raw.ptr) };
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeGateUpDownHetero(&f, base_cpu, scheme_counts, true, false);
+        try pipes.encodeReduceAndOptionalShared(&f, base_cpu, .q4_affine);
+        const sig = try f.commit();
+        try compute.wait(sig, 10_000);
+    }
+
+    const out_gpu_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_gpu_raw));
+    const out_cpu_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_cpu_raw));
+    for (out_gpu_f16, out_cpu_f16) |a, b| {
+        const fa: f32 = @floatCast(a);
+        const fb: f32 = @floatCast(b);
+        try std.testing.expect(std.math.isFinite(fa));
+        try std.testing.expectApproxEqAbs(fa, fb, 1e-3);
+    }
+
+    // Verify M = 512 argmaxRows & topKLogitsRows against CPU references.
+    const argmax_gpu: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, argmax_raw));
+    const argmax_ref = try gpa.alloc(u32, m_wide);
+    defer gpa.free(argmax_ref);
+    argmaxRowsRef(.f16, vlogits_raw, argmax_ref, m_wide, vocab_wide);
+    try std.testing.expectEqualSlices(u32, argmax_ref, argmax_gpu);
+
+    const topk_gpu: []const TopKCandidate = @alignCast(std.mem.bytesAsSlice(TopKCandidate, topk_raw));
+    const topk_ref = try gpa.alloc(TopKCandidate, @as(usize, m_wide) * topk_k);
+    defer gpa.free(topk_ref);
+    topKLogitsRowsRef(.f16, vlogits_raw, topk_ref, m_wide, vocab_wide, topk_k);
+    for (topk_ref, topk_gpu) |r, g| {
+        try std.testing.expectEqual(r.token_id, g.token_id);
+        try std.testing.expectApproxEqAbs(r.prob, g.prob, 1e-4);
+    }
 }

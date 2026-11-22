@@ -2807,3 +2807,499 @@ kernel void ami_batch_gqa_decode_attn_reduce(const device float *partial_m [[buf
     const float inv_l = (l_tot > 0.0f) ? (1.0f / l_tot) : 0.0f;
     *(device half4 *)(out + (ulong(b) * p.num_q_heads + qh) * ATTN_HEAD_DIM + lane * 4u) = half4(o_tot * inv_l);
 }
+
+// ===========================================================================
+// Milestone M6.8 (G15, ADR-0020): Wide-Chunk Direct-KvTile Prefill Kernels
+//   - `ami_prefill_qknorm_rope_kv_write`: QK-Norm + RoPE/YaRN/3D-MRoPE +
+//     direct bindless RGBA16Float KvTile writes for `1 .. 1024+` tokens
+//     across 512-token tile boundaries (zero `tree_k`/`tree_v` staging).
+//   - `ami_gqa_causal_prefill_flash_attn`: Block-tiled (`BQ = 32, BK = 32`)
+//     hardware `simdgroup_matrix` causal FlashAttention-2 reading seamlessly
+//     across R5 retired group-64 `q8` chunks and active `RGBA16Float` KvTiles,
+//     strictly skipping upper-triangular KV blocks (`kv_block_start > max_q_pos`)
+//     and out-of-window blocks (`sliding_window > 0`).
+// ===========================================================================
+
+struct KvTileWritePair {
+    texture2d<half, access::write> k_tex;
+    texture2d<half, access::write> v_tex;
+};
+
+static_assert(sizeof(KvTileWritePair) == 16, "KvTileWritePair must match two u64 MTLResourceIDs");
+
+struct PrefillQkNormRopeKvParams {
+    uint num_tokens;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint rotary_dim;
+    uint start_pos;
+    uint chunk_tokens;
+    uint num_retired_chunks;
+    uint tile_table_offset;
+    uint ring_capacity;
+    uint apply_qk_norm;
+    uint kv_only;
+    uint use_mrope;
+    uint mrope_s0;
+    uint mrope_s1;
+    uint mrope_s2;
+    float rms_eps;
+    float rope_theta;
+    float rope_yarn_scale;
+    float yarn_mscale;
+    float yarn_beta_fast;
+    float yarn_beta_slow;
+    uint original_max_pos;
+    uint _pad0;
+};
+
+struct CausalPrefillAttnParams {
+    uint num_q;
+    uint q_start_pos;
+    uint kv_len;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint chunk_tokens;
+    uint sliding_window;
+    uint ring_capacity;
+    float scale;
+    uint num_retired_chunks;
+    uint tile_table_offset;
+    uint retired_offset;
+    uint retired_plane_stride_bytes;
+    uint retired_chunk_stride_bytes;
+    uint _pad0;
+};
+
+static_assert(sizeof(PrefillQkNormRopeKvParams) == 96, "PrefillQkNormRopeKvParams must be 96 bytes");
+static_assert(sizeof(CausalPrefillAttnParams) == 64, "CausalPrefillAttnParams must be 64 bytes");
+
+static inline uint prefill_mrope_axis(uint j, uint s0, uint s1, uint s2) {
+    const uint m1 = min(s0, min(s1, s2));
+    const uint three_m1 = m1 * 3u;
+    if (j < three_m1) {
+        return j % 3u;
+    }
+    const uint rem = j - three_m1;
+    const uint a0 = s0 - m1;
+    const uint a1 = s1 - m1;
+    const uint a2 = s2 - m1;
+    uint ax_a = 0u, cnt_a = 0u;
+    uint ax_b = 0u, cnt_b = 0u;
+    if (a0 == 0u) {
+        ax_a = 1u; cnt_a = a1;
+        ax_b = 2u; cnt_b = a2;
+    } else if (a1 == 0u) {
+        ax_a = 0u; cnt_a = a0;
+        ax_b = 2u; cnt_b = a2;
+    } else {
+        ax_a = 0u; cnt_a = a0;
+        ax_b = 1u; cnt_b = a1;
+    }
+    const uint m2 = min(cnt_a, cnt_b);
+    if (rem < m2 * 2u) {
+        return ((rem & 1u) == 0u) ? ax_a : ax_b;
+    }
+    return (cnt_a > cnt_b) ? ax_a : ax_b;
+}
+
+static inline float prefill_yarn_inv_freq(uint j,
+                                          uint rotary_dim,
+                                          float rope_theta,
+                                          float yarn_scale,
+                                          float beta_fast,
+                                          float beta_slow,
+                                          uint original_max_pos) {
+    const float log_theta = log(rope_theta);
+    const float inv_freq_extrap = exp(-log_theta * (2.0f * float(j) / float(rotary_dim)));
+    if (yarn_scale <= 1.0f || original_max_pos == 0u) {
+        return inv_freq_extrap;
+    }
+    constexpr float TWO_PI = 6.2831853071795864769f;
+    const float half_rot = float(rotary_dim >> 1);
+    const float f_orig = float(original_max_pos);
+    const float raw_low = (float(rotary_dim) * log(f_orig / (beta_fast * TWO_PI))) / (2.0f * log_theta);
+    const float raw_high = (float(rotary_dim) * log(f_orig / (beta_slow * TWO_PI))) / (2.0f * log_theta);
+    const float low = clamp(floor(raw_low), 0.0f, half_rot - 1.0f);
+    float high = clamp(ceil(raw_high), 0.0f, half_rot - 1.0f);
+    if (high <= low) {
+        high = low + 0.001f;
+    }
+    const float ramp = clamp((float(j) - low) / (high - low), 0.0f, 1.0f);
+    const float inv_freq_interp = inv_freq_extrap / yarn_scale;
+    return fma(inv_freq_extrap, 1.0f - ramp, inv_freq_interp * ramp);
+}
+
+// Direct-KvTile wide prefill QK-Norm + RoPE (with optional YaRN & 3D MRoPE).
+// Specialized on NORM_W_BF16 (`function_constant(2)`).
+// Grid: ((kv_only ? num_kv_heads : num_q_heads + num_kv_heads), num_tokens, 1), 32 threads.
+kernel void ami_prefill_qknorm_rope_kv_write(device half *q [[buffer(0)]],
+                                             const device half *k [[buffer(1)]],
+                                             const device half *v [[buffer(2)]],
+                                             const device uchar *q_norm [[buffer(3)]],
+                                             const device uchar *k_norm [[buffer(4)]],
+                                             const device KvTileWritePair *kv_tiles [[buffer(5)]],
+                                             const device uint *mrope_pos [[buffer(6)]],
+                                             constant PrefillQkNormRopeKvParams &p [[buffer(7)]],
+                                             uint2 tg_pos [[threadgroup_position_in_grid]],
+                                             uint lane [[thread_index_in_simdgroup]]) {
+    const uint total_heads = (p.kv_only != 0u) ? p.num_kv_heads : (p.num_q_heads + p.num_kv_heads);
+    const uint tok = tg_pos.y;
+    if (tg_pos.x >= total_heads || tok >= p.num_tokens) {
+        return;
+    }
+
+    const bool is_q = (p.kv_only == 0u) && (tg_pos.x < p.num_q_heads);
+    const uint head_idx = is_q ? tg_pos.x : (tg_pos.x - ((p.kv_only != 0u) ? 0u : p.num_q_heads));
+
+    // When writing into a circular ring smaller than num_tokens, skip earlier
+    // overwritten KV tokens so no two threadgroups race on the same ring slot.
+    if (!is_q && p.ring_capacity > 0u && (tok + p.ring_capacity < p.num_tokens)) {
+        return;
+    }
+
+    threadgroup float vec[256];
+    const uint d_dim = p.head_dim;
+    const uint rot_dim = (p.rotary_dim > 0u) ? p.rotary_dim : d_dim;
+    const uint half_rot = rot_dim >> 1;
+
+    const ulong q_off = (ulong(tok) * p.num_q_heads + head_idx) * d_dim;
+    const ulong kv_off = (ulong(tok) * p.num_kv_heads + head_idx) * d_dim;
+    const device half *src = is_q ? (q + q_off) : (k + kv_off);
+
+    float sum_sq = 0.0f;
+    for (uint d = lane; d < d_dim; d += 32u) {
+        const float val = float(src[d]);
+        vec[d] = val;
+        sum_sq = fma(val, val, sum_sq);
+    }
+
+    if (p.apply_qk_norm != 0u) {
+        const float total_sq = simd_sum(sum_sq);
+        const float inv_rms = rsqrt(total_sq / float(d_dim) + p.rms_eps);
+        const device uchar *nw = is_q ? q_norm : k_norm;
+        for (uint d = lane; d < d_dim; d += 32u) {
+            vec[d] = (vec[d] * inv_rms) * norm_w1(nw, d, NORM_W_BF16);
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint lin_pos = p.start_pos + tok;
+    const float mscale = (p.yarn_mscale > 0.0f) ? p.yarn_mscale : 1.0f;
+    for (uint j = lane; j < half_rot; j += 32u) {
+        uint axis_pos = lin_pos;
+        if (p.use_mrope != 0u) {
+            const uint axis = prefill_mrope_axis(j, p.mrope_s0, p.mrope_s1, p.mrope_s2);
+            axis_pos = mrope_pos[ulong(tok) * 3ul + axis];
+        }
+        const float inv_f = prefill_yarn_inv_freq(
+            j, rot_dim, p.rope_theta, p.rope_yarn_scale,
+            p.yarn_beta_fast, p.yarn_beta_slow, p.original_max_pos);
+        const float angle = float(axis_pos) * inv_f;
+        const float c = cos(angle) * mscale;
+        const float s = sin(angle) * mscale;
+        const float x0 = vec[j];
+        const float x1 = vec[j + half_rot];
+        vec[j] = fma(x0, c, -x1 * s);
+        vec[j + half_rot] = fma(x1, c, x0 * s);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (is_q) {
+        device half *dst = q + q_off;
+        for (uint d = lane; d < d_dim; d += 32u) {
+            dst[d] = half(vec[d]);
+        }
+    } else {
+        const uint phys_pos = (p.ring_capacity > 0u) ? (lin_pos % p.ring_capacity) : lin_pos;
+        const uint chunk = phys_pos / p.chunk_tokens;
+        const uint slot_in_chunk = phys_pos - chunk * p.chunk_tokens;
+        const uint tile_idx = p.tile_table_offset +
+            ((p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk);
+        const uint row = head_idx * p.chunk_tokens + slot_in_chunk;
+        const KvTileWritePair tile = kv_tiles[tile_idx];
+        const uint num_cols = d_dim >> 2;
+        const device half4 *v_src = (const device half4 *)(v + kv_off);
+        for (uint col = lane; col < num_cols; col += 32u) {
+            const uint base = col * 4u;
+            const half4 k4 = half4(half(vec[base + 0u]),
+                                   half(vec[base + 1u]),
+                                   half(vec[base + 2u]),
+                                   half(vec[base + 3u]));
+            tile.k_tex.write(k4, uint2(col, row));
+            tile.v_tex.write(v_src[col], uint2(col, row));
+        }
+    }
+}
+
+template <uint D, uint D_PAD, bool IS_V>
+static inline void flash_prefill_load_kv(threadgroup half4 *KVs4,
+                                         const device KvTilePair *kv_tiles,
+                                         const device uchar *retired_pool,
+                                         const device uint *retired_chunk_ids,
+                                         constant CausalPrefillAttnParams &p,
+                                         uint kv_head,
+                                         uint kv_block_start,
+                                         uint kv_block_end,
+                                         uint tid) {
+    constexpr uint D_VEC4 = D >> 2;
+    constexpr uint D_PAD4 = D_PAD >> 2;
+    constexpr uint ROW_STEP = 128u / D_VEC4;
+    constexpr uint GROUPS_PER_HEAD = D >> 6;
+
+    const uint load_row0 = tid / D_VEC4;
+    const uint load_col4 = tid & (D_VEC4 - 1u);
+
+    for (uint row = load_row0; row < 32u; row += ROW_STEP) {
+        const uint kv_pos = kv_block_start + row;
+        half4 val = half4(0.0h);
+        if (kv_pos < kv_block_end) {
+            const uint phys_pos = (p.ring_capacity > 0u) ? (kv_pos % p.ring_capacity) : kv_pos;
+            const uint chunk = phys_pos / p.chunk_tokens;
+            const uint slot = phys_pos - chunk * p.chunk_tokens;
+            const uint tex_row = kv_head * p.chunk_tokens + slot;
+            if (p.ring_capacity == 0u && chunk < p.num_retired_chunks) {
+                const uint phys_slot = retired_chunk_ids[p.retired_offset + chunk];
+                const device uchar *plane = retired_pool +
+                    ulong(phys_slot) * p.retired_chunk_stride_bytes +
+                    (IS_V ? p.retired_plane_stride_bytes : 0u);
+                val = load_q8_half4(plane, tex_row, GROUPS_PER_HEAD, load_col4);
+            } else {
+                const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+                const KvTilePair pair = kv_tiles[p.tile_table_offset + active_chunk];
+                val = IS_V ? pair.v_tex.read(uint2(load_col4, tex_row))
+                           : pair.k_tex.read(uint2(load_col4, tex_row));
+            }
+        }
+        KVs4[row * D_PAD4 + load_col4] = val;
+    }
+}
+
+template <uint D, uint D_PAD>
+static inline void flash_prefill_exec(const device half *q,
+                                      const device KvTilePair *kv_tiles,
+                                      const device uchar *retired_pool,
+                                      const device uint *retired_chunk_ids,
+                                      device half *out,
+                                      constant CausalPrefillAttnParams &p,
+                                      threadgroup half4 *KVs4,
+                                      threadgroup float *Ss,
+                                      threadgroup half *Ps,
+                                      uint2 tg_pos,
+                                      uint tid,
+                                      uint sg_id,
+                                      uint lane) {
+    constexpr uint BQ = 32u;
+    constexpr uint BK = 32u;
+    constexpr uint D_VEC4 = D >> 2;
+    constexpr uint D_PAD4 = D_PAD >> 2;
+    constexpr uint ROW_STEP = 128u / D_VEC4;
+    constexpr uint D_COLS32 = D >> 5;
+    constexpr uint D_TILES8 = D >> 3;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint kv_head = tg_pos.x;
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint total_q = p.num_q * gqa_ratio;
+    const uint flat_q_base = tg_pos.y * BQ;
+    if (kv_head >= p.num_kv_heads || flat_q_base >= total_q) {
+        return;
+    }
+
+    const uint q_cnt = min(BQ, total_q - flat_q_base);
+    const uint min_q_pos = p.q_start_pos + (flat_q_base / gqa_ratio);
+    const uint max_q_pos = p.q_start_pos + ((flat_q_base + q_cnt - 1u) / gqa_ratio);
+
+    // Strictly skip all KV blocks past max_q_pos (upper-triangular) and before
+    // min_q_pos's sliding window.
+    const uint kv_end = min(p.kv_len, max_q_pos + 1u);
+    const uint kv_begin = (p.sliding_window > 0u && (min_q_pos + 1u) > p.sliding_window)
+        ? (min_q_pos + 1u - p.sliding_window)
+        : 0u;
+
+    // 1. Cooperatively stage Q tile [BQ, D] into KVs4 once, hoist each
+    // simdgroup's 8xD Q slice into simdgroup_half8x8 register fragments, then
+    // release KVs4 for K/V streaming (15,360 B total SRAM -> 2x M4 occupancy
+    // and passes MTL_SHADER_VALIDATION=1 <= 32 KiB).
+    {
+        const uint load_row0 = tid / D_VEC4;
+        const uint load_col4 = tid & (D_VEC4 - 1u);
+        for (uint row = load_row0; row < BQ; row += ROW_STEP) {
+            const uint flat_q = flat_q_base + row;
+            if (flat_q < total_q) {
+                const uint qi = flat_q / gqa_ratio;
+                const uint qh = kv_head * gqa_ratio + (flat_q - qi * gqa_ratio);
+                const ulong q_off = (ulong(qi) * p.num_q_heads + qh) * D + load_col4 * 4u;
+                KVs4[row * D_PAD4 + load_col4] = *(const device half4 *)(q + q_off);
+            } else {
+                KVs4[row * D_PAD4 + load_col4] = half4(0.0h);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint r0 = sg_id * 8u;
+    const threadgroup half *KVs = (const threadgroup half *)KVs4;
+    simdgroup_half8x8 q_frag[D_TILES8];
+    for (uint kt = 0u; kt < D_TILES8; kt++) {
+        simdgroup_load(q_frag[kt], KVs + r0 * D_PAD + kt * 8u, D_PAD);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_val[8];
+    float l_val[8];
+    float o_reg[8][D_COLS32];
+
+    for (uint r = 0u; r < 8u; r++) {
+        m_val[r] = -INFINITY;
+        l_val[r] = 0.0f;
+        for (uint c = 0u; c < D_COLS32; c++) {
+            o_reg[r][c] = 0.0f;
+        }
+    }
+
+    const float scale_log2e = p.scale * LOG2E;
+
+    // 2. Stream BK = 32 KV blocks across [kv_begin, kv_end).
+    for (uint kv_block_start = kv_begin; kv_block_start < kv_end; kv_block_start += BK) {
+        const uint kv_block_end = min(kv_block_start + BK, kv_end);
+
+        // 2a. Cooperative load of K [32, D] into KVs4.
+        flash_prefill_load_kv<D, D_PAD, false>(
+            KVs4, kv_tiles, retired_pool, retired_chunk_ids, p,
+            kv_head, kv_block_start, kv_block_end, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2b. S = Q[8, D] @ K[32, D]^T via hardware simdgroup_matrix.
+        simdgroup_float8x8 s_frag[4];
+        for (uint bj = 0u; bj < 4u; bj++) {
+            s_frag[bj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        for (uint kt = 0u; kt < D_TILES8; kt++) {
+            const uint kk = kt * 8u;
+            for (uint bj = 0u; bj < 4u; bj++) {
+                simdgroup_half8x8 k_frag;
+                simdgroup_load(k_frag, KVs + (bj * 8u) * D_PAD + kk, D_PAD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s_frag[bj], q_frag[kt], k_frag, s_frag[bj]);
+            }
+        }
+        for (uint bj = 0u; bj < 4u; bj++) {
+            simdgroup_store(s_frag[bj], Ss + r0 * BK + bj * 8u, BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2c. Causal + sliding-window mask & FP32 base-2 online softmax.
+        float alpha[8];
+        const uint kv_pos = kv_block_start + lane;
+        const bool in_blk = (kv_pos < kv_block_end);
+        for (uint r = 0u; r < 8u; r++) {
+            const uint flat_q = flat_q_base + r0 + r;
+            const bool act = (flat_q < total_q);
+            const uint qp = p.q_start_pos + (act ? (flat_q / gqa_ratio) : 0u);
+            const float raw_s = Ss[(r0 + r) * BK + lane];
+            const bool valid = act && in_blk && (kv_pos <= qp) &&
+                               (p.sliding_window == 0u || (qp - kv_pos) < p.sliding_window);
+            const float score = valid ? (raw_s * scale_log2e) : -INFINITY;
+            const float row_m = simd_max(score);
+            float p_val = 0.0f;
+            if (row_m > -INFINITY) {
+                const float m_new = max(m_val[r], row_m);
+                const float a = (l_val[r] > 0.0f) ? exp2(m_val[r] - m_new) : 0.0f;
+                p_val = valid ? exp2(score - m_new) : 0.0f;
+                const float row_l = simd_sum(p_val);
+                l_val[r] = fma(l_val[r], a, row_l);
+                m_val[r] = m_new;
+                alpha[r] = a;
+            } else {
+                alpha[r] = 1.0f;
+            }
+            Ps[(r0 + r) * 40u + lane] = half(p_val);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2d. Cooperative load of V [32, D] into KVs4 (after all simdgroups finish reading K).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        flash_prefill_load_kv<D, D_PAD, true>(
+            KVs4, kv_tiles, retired_pool, retired_chunk_ids, p,
+            kv_head, kv_block_start, kv_block_end, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2e. dO = P[8, 32] @ V[32, D] via hardware simdgroup_matrix, 32 cols/pass,
+        // fused with exact FP32 online softmax rescaling into o_reg.
+        for (uint c = 0u; c < D_COLS32; c++) {
+            const uint d_blk = c * 32u;
+            simdgroup_float8x8 pv[4];
+            for (uint bj = 0u; bj < 4u; bj++) {
+                pv[bj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+            for (uint kk = 0u; kk < BK; kk += 8u) {
+                simdgroup_half8x8 p_frag;
+                simdgroup_load(p_frag, Ps + r0 * 40u + kk, 40u);
+                for (uint bj = 0u; bj < 4u; bj++) {
+                    simdgroup_half8x8 v_frag;
+                    simdgroup_load(v_frag, KVs + kk * D_PAD + d_blk + bj * 8u, D_PAD);
+                    simdgroup_multiply_accumulate(pv[bj], p_frag, v_frag, pv[bj]);
+                }
+            }
+            for (uint bj = 0u; bj < 4u; bj++) {
+                simdgroup_store(pv[bj], Ss + r0 * 32u + bj * 8u, 32u);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint r = 0u; r < 8u; r++) {
+                o_reg[r][c] = fma(o_reg[r][c], alpha[r], Ss[(r0 + r) * 32u + lane]);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Guard KVs4 before next KV block overwrites it with K.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 3. Finalize normalized FP16 output rows.
+    for (uint r = 0u; r < 8u; r++) {
+        const uint flat_q = flat_q_base + r0 + r;
+        if (flat_q >= total_q) {
+            continue;
+        }
+        const uint qi = flat_q / gqa_ratio;
+        const uint qh = kv_head * gqa_ratio + (flat_q - qi * gqa_ratio);
+        const float inv_l = (l_val[r] > 0.0f) ? (1.0f / l_val[r]) : 0.0f;
+        const ulong out_base = (ulong(qi) * p.num_q_heads + qh) * D;
+        for (uint c = 0u; c < D_COLS32; c++) {
+            out[out_base + c * 32u + lane] = half(o_reg[r][c] * inv_l);
+        }
+    }
+}
+
+// Block-tiled causal FlashAttention prefill (`BQ = 32, BK = 32`, 128 threads).
+// Specialized on ATTN_HEAD_DIM ({64, 128}).
+// Grid: (num_kv_heads, ceil(num_q * gqa_ratio / 32), 1) threadgroups, 128 threads.
+kernel void ami_gqa_causal_prefill_flash_attn(const device half *q [[buffer(0)]],
+                                              const device KvTilePair *kv_tiles [[buffer(1)]],
+                                              const device uchar *retired_pool [[buffer(2)]],
+                                              const device uint *retired_chunk_ids [[buffer(3)]],
+                                              device half *out [[buffer(4)]],
+                                              constant CausalPrefillAttnParams &p [[buffer(5)]],
+                                              uint2 tg_pos [[threadgroup_position_in_grid]],
+                                              uint tid [[thread_index_in_threadgroup]],
+                                              uint sg_id [[simdgroup_index_in_threadgroup]],
+                                              uint lane [[thread_index_in_simdgroup]]) {
+    // 15,360 B total threadgroup SRAM (fits <= 16 KiB for 2x M4 occupancy and
+    // passes MTL_SHADER_VALIDATION=1 which doubles threadgroup memory to <= 32 KiB).
+    threadgroup half4 KVs4[32u * 34u];  // 8,704 B (initial Q stage, then K & V)
+    threadgroup float Ss[32u * 32u];    // 4,096 B
+    threadgroup half Ps[32u * 40u];     // 2,560 B (+8 half padding for bank-conflict-free MMA)
+
+    if (ATTN_HEAD_DIM == 128u) {
+        flash_prefill_exec<128u, 136u>(
+            q, kv_tiles, retired_pool, retired_chunk_ids, out, p,
+            KVs4, Ss, Ps, tg_pos, tid, sg_id, lane);
+    } else {
+        flash_prefill_exec<64u, 72u>(
+            q, kv_tiles, retired_pool, retired_chunk_ids, out, p,
+            KVs4, Ss, Ps, tg_pos, tid, sg_id, lane);
+    }
+}

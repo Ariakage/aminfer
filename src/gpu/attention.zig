@@ -29,6 +29,9 @@ pub const MAX_BATCH_SLOTS: u32 = 16;
 /// Maximum speculative verification tree width (64-bit ancestor bitmask, ADR-0014).
 pub const MAX_TREE_NODES: u32 = 64;
 
+/// Default maximum chunk width for wide-chunk GPU prefill (`G15`, ADR-0020).
+pub const MAX_WIDE_PREFILL_TOKENS: u32 = 1024;
+
 /// Maximum FlashDecoding split-KV partitions supported per dispatch.
 pub const MAX_SPLITS: u32 = 64;
 
@@ -264,6 +267,54 @@ pub const BatchGqaDecodeParams = extern struct {
     _pad2: u32 = 0,
 };
 
+/// Uniform payload matching `struct PrefillQkNormRopeKvParams` in `kv_attention.metal`.
+pub const PrefillQkNormRopeKvParams = extern struct {
+    num_tokens: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    start_pos: u32,
+    chunk_tokens: u32,
+    num_retired_chunks: u32,
+    tile_table_offset: u32,
+    ring_capacity: u32,
+    apply_qk_norm: u32,
+    kv_only: u32,
+    use_mrope: u32,
+    mrope_s0: u32,
+    mrope_s1: u32,
+    mrope_s2: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+    rope_yarn_scale: f32,
+    yarn_mscale: f32,
+    yarn_beta_fast: f32,
+    yarn_beta_slow: f32,
+    original_max_pos: u32,
+    _pad0: u32 = 0,
+};
+
+/// Uniform payload matching `struct CausalPrefillAttnParams` in `kv_attention.metal`.
+pub const CausalPrefillAttnParams = extern struct {
+    num_q: u32,
+    q_start_pos: u32,
+    kv_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32,
+    sliding_window: u32,
+    ring_capacity: u32,
+    scale: f32,
+    num_retired_chunks: u32,
+    tile_table_offset: u32,
+    retired_offset: u32,
+    retired_plane_stride_bytes: u32,
+    retired_chunk_stride_bytes: u32,
+    _pad0: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(KvTilePair) != 16) @compileError("KvTilePair must be 16 bytes");
     if (@sizeOf(KvBufPair) != 16) @compileError("KvBufPair must be 16 bytes");
@@ -284,6 +335,8 @@ comptime {
     if (@sizeOf(BatchQkNormRopeKvParams) != 32) @compileError("BatchQkNormRopeKvParams must be 32 bytes");
     if (@sizeOf(BatchGqaSlotDesc) != 16) @compileError("BatchGqaSlotDesc must be 16 bytes");
     if (@sizeOf(BatchGqaDecodeParams) != 48) @compileError("BatchGqaDecodeParams must be 48 bytes");
+    if (@sizeOf(PrefillQkNormRopeKvParams) != 96) @compileError("PrefillQkNormRopeKvParams must be 96 bytes");
+    if (@sizeOf(CausalPrefillAttnParams) != 64) @compileError("CausalPrefillAttnParams must be 64 bytes");
 }
 
 pub const RetiredKvQ8PoolError = arena_mod.WiredArena.AllocError || error{
@@ -805,6 +858,86 @@ pub const BatchGqaDecodeArgs = struct {
     scale: ?f32 = null,
 };
 
+/// Arguments for `encodePrefillQkNormRopeKvWrite` (`G15`, ADR-0020):
+/// applies QK-Norm + RoPE (with optional YaRN & 3D MRoPE) to `num_tokens`
+/// contiguous tokens starting at `start_pos` and writes K/V directly into
+/// bindless `RGBA16Float` `KvTilePair` tiles with zero `tree_k`/`tree_v` copy.
+pub const PrefillQkNormRopeKvArgs = struct {
+    /// `[num_tokens, num_q_heads, head_dim]` fp16 queries (mutated in-place unless `kv_only`).
+    q: metal.BufferBinding,
+    /// `[num_tokens, num_kv_heads, head_dim]` fp16 keys.
+    k: metal.BufferBinding,
+    /// `[num_tokens, num_kv_heads, head_dim]` fp16 values.
+    v: metal.BufferBinding,
+    q_norm: ?metal.BufferBinding = null,
+    k_norm: ?metal.BufferBinding = null,
+    /// Resident `KvTilePair` table (active `RGBA16Float` IOSurface tiles).
+    kv_tiles: metal.BufferBinding,
+    /// Optional `[num_tokens, 3]` u32 3D MRoPE positions `(t, h, w)`.
+    mrope_pos: ?metal.BufferBinding = null,
+    /// Interleaved 3D MRoPE section `[s0, s1, s2]` summing to `rotary_dim / 2` (used when `mrope_pos != null`).
+    mrope_section: [3]u32 = .{ 0, 0, 0 },
+    num_tokens: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    /// Rotary dimension (`<= head_dim`, even); defaults to `head_dim` when 0.
+    rotary_dim: u32 = 0,
+    start_pos: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    /// Number of retired chunks preceding `kv_tiles[tile_table_offset]` (`0` when all active).
+    num_retired_chunks: u32 = 0,
+    tile_table_offset: u32 = 0,
+    /// `0` for linear tiles; `> 0` for circular SWA ring wrap capacity.
+    ring_capacity: u32 = 0,
+    /// When `true` (`P0-B1` non-final `L - 1`), skips Q updates and writes K/V only.
+    kv_only: bool = false,
+    rms_eps: f32 = 1e-6,
+    rope_theta: f32 = 1_000_000.0,
+    /// YaRN scale factor (`<= 1.0` reduces identically to standard NeoX RoPE).
+    rope_yarn_scale: f32 = 1.0,
+    yarn_mscale: ?f32 = null,
+    yarn_beta_fast: f32 = 32.0,
+    yarn_beta_slow: f32 = 1.0,
+    original_max_pos: u32 = 32768,
+    norm_dtype: quant.FloatDType = .f16,
+};
+
+/// Arguments for `encodeGqaCausalPrefillFlashAttn` (`G15`, ADR-0020):
+/// block-tiled causal FlashAttention-2 (`BQ = 32, BK = 32`) supporting both
+/// full-chunk wide prefill (`num_q = C, q_start_pos = start_pos`) and `P0-B1`
+/// final-chunk tail narrowing (`num_q = 1, q_start_pos = start_pos + C - 1`),
+/// seamlessly spanning `R5` retired group-64 `q8` chunks and active `KvTilePair`s.
+pub const CausalPrefillAttnArgs = struct {
+    /// `[num_q, num_q_heads, head_dim]` fp16 post-RoPE queries.
+    q: metal.BufferBinding,
+    /// Active `KvTilePair` table (may be null only when all read KV positions are retired).
+    kv_tiles: ?metal.BufferBinding = null,
+    /// Optional `R5` group-64 `q8` retired KV pool base binding.
+    retired_pool: ?metal.BufferBinding = null,
+    /// Optional `R5` `u32` logical->physical retired chunk slot table.
+    retired_chunk_ids: ?metal.BufferBinding = null,
+    /// `[num_q, num_q_heads, head_dim]` fp16 attention output.
+    out: metal.BufferBinding,
+    num_q: u32,
+    q_start_pos: u32,
+    kv_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    /// Optional causal sliding window (`0` = full causal attention; `> 0` attends `[q_pos + 1 - W, q_pos]`).
+    sliding_window: u32 = 0,
+    /// `0` for linear tiles; `> 0` for circular SWA ring wrap capacity.
+    ring_capacity: u32 = 0,
+    scale: ?f32 = null,
+    num_retired_chunks: u32 = 0,
+    tile_table_offset: u32 = 0,
+    retired_offset: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
+};
+
 /// Chooses the split-KV partition count for FlashDecoding on Apple Silicon.
 pub fn chooseNumSplits(num_kv_heads: u32, seq_len: u32, chunk_tokens: u32, max_splits: u32) u32 {
     if (max_splits <= 1 or seq_len <= 128 or num_kv_heads == 0 or chunk_tokens == 0) return 1;
@@ -876,6 +1009,11 @@ pub const AttentionPipelines = struct {
     batch_gqa_split_d128: metal.Pipeline,
     batch_gqa_reduce_d64: metal.Pipeline,
     batch_gqa_reduce_d128: metal.Pipeline,
+    // M6.8 (G15, ADR-0020): wide-chunk direct-KvTile prefill + causal FlashAttention-2
+    prefill_qknorm_rope_kv_write: metal.Pipeline,
+    prefill_qknorm_rope_kv_write_bf16: metal.Pipeline,
+    gqa_causal_prefill_flash_d64: metal.Pipeline,
+    gqa_causal_prefill_flash_d128: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!AttentionPipelines {
         const rmsnorm = try metal.Pipeline.initSpecialized(device, library, "ami_rmsnorm", &.{
@@ -1059,6 +1197,26 @@ pub const AttentionPipelines = struct {
         });
         errdefer batch_gqa_reduce_d128.close();
 
+        const prefill_qknorm_rope_kv_write = try metal.Pipeline.initSpecialized(device, library, "ami_prefill_qknorm_rope_kv_write", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
+        errdefer prefill_qknorm_rope_kv_write.close();
+
+        const prefill_qknorm_rope_kv_write_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_prefill_qknorm_rope_kv_write", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer prefill_qknorm_rope_kv_write_bf16.close();
+
+        const gqa_causal_prefill_flash_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_causal_prefill_flash_attn", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+        });
+        errdefer gqa_causal_prefill_flash_d64.close();
+
+        const gqa_causal_prefill_flash_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_causal_prefill_flash_attn", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+        });
+        errdefer gqa_causal_prefill_flash_d128.close();
+
         return .{
             .rmsnorm = rmsnorm,
             .qknorm_rope_kv_write = qknorm_rope_kv_write,
@@ -1095,10 +1253,18 @@ pub const AttentionPipelines = struct {
             .batch_gqa_split_d128 = batch_gqa_split_d128,
             .batch_gqa_reduce_d64 = batch_gqa_reduce_d64,
             .batch_gqa_reduce_d128 = batch_gqa_reduce_d128,
+            .prefill_qknorm_rope_kv_write = prefill_qknorm_rope_kv_write,
+            .prefill_qknorm_rope_kv_write_bf16 = prefill_qknorm_rope_kv_write_bf16,
+            .gqa_causal_prefill_flash_d64 = gqa_causal_prefill_flash_d64,
+            .gqa_causal_prefill_flash_d128 = gqa_causal_prefill_flash_d128,
         };
     }
 
     pub fn close(self: AttentionPipelines) void {
+        self.gqa_causal_prefill_flash_d128.close();
+        self.gqa_causal_prefill_flash_d64.close();
+        self.prefill_qknorm_rope_kv_write_bf16.close();
+        self.prefill_qknorm_rope_kv_write.close();
         self.batch_gqa_reduce_d128.close();
         self.batch_gqa_reduce_d64.close();
         self.batch_gqa_split_d128.close();
@@ -1960,6 +2126,165 @@ pub const AttentionPipelines = struct {
                 true,
             );
         }
+    }
+
+    /// Encodes `ami_prefill_qknorm_rope_kv_write` (`G15`, ADR-0020): applies
+    /// QK-Norm + RoPE (with optional YaRN & 3D MRoPE) to `num_tokens` (`1..1024+`)
+    /// contiguous tokens starting at `start_pos` and writes K/V directly into
+    /// bindless `RGBA16Float` `KvTilePair` tiles across 512-token boundaries.
+    pub fn encodePrefillQkNormRopeKvWrite(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: PrefillQkNormRopeKvArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.num_tokens == 0 or args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            args.head_dim == 0 or args.head_dim > 256 or (args.head_dim % 4) != 0 or
+            args.chunk_tokens == 0)
+        {
+            return error.InvalidArgument;
+        }
+        const rotary_dim = if (args.rotary_dim == 0) args.head_dim else args.rotary_dim;
+        if (rotary_dim > args.head_dim or (rotary_dim & 1) != 0) return error.InvalidArgument;
+        if (args.mrope_pos != null) {
+            const sec_sum: u64 = @as(u64, args.mrope_section[0]) + args.mrope_section[1] + args.mrope_section[2];
+            if (sec_sum != rotary_dim / 2) return error.InvalidArgument;
+        }
+        if (args.ring_capacity == 0) {
+            const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidArgument;
+            if (@as(u64, args.start_pos) < retired_tokens) return error.InvalidArgument;
+        } else if ((args.ring_capacity % args.chunk_tokens) != 0) {
+            return error.InvalidArgument;
+        }
+
+        const apply_norm = (args.q_norm != null or args.k_norm != null);
+        if (apply_norm and (args.q_norm == null or args.k_norm == null)) {
+            return error.InvalidArgument;
+        }
+        const q_norm = args.q_norm orelse args.q;
+        const k_norm = args.k_norm orelse args.k;
+        const mrope_bind = args.mrope_pos orelse args.q;
+
+        const eff_mscale: f32 = args.yarn_mscale orelse
+            (if (args.rope_yarn_scale <= 1.0) 1.0 else (0.1 * @log(args.rope_yarn_scale) + 1.0));
+
+        const params: PrefillQkNormRopeKvParams = .{
+            .num_tokens = args.num_tokens,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .head_dim = args.head_dim,
+            .rotary_dim = rotary_dim,
+            .start_pos = args.start_pos,
+            .chunk_tokens = args.chunk_tokens,
+            .num_retired_chunks = args.num_retired_chunks,
+            .tile_table_offset = args.tile_table_offset,
+            .ring_capacity = args.ring_capacity,
+            .apply_qk_norm = if (apply_norm) 1 else 0,
+            .kv_only = if (args.kv_only) 1 else 0,
+            .use_mrope = if (args.mrope_pos != null) 1 else 0,
+            .mrope_s0 = args.mrope_section[0],
+            .mrope_s1 = args.mrope_section[1],
+            .mrope_s2 = args.mrope_section[2],
+            .rms_eps = args.rms_eps,
+            .rope_theta = args.rope_theta,
+            .rope_yarn_scale = args.rope_yarn_scale,
+            .yarn_mscale = eff_mscale,
+            .yarn_beta_fast = args.yarn_beta_fast,
+            .yarn_beta_slow = args.yarn_beta_slow,
+            .original_max_pos = args.original_max_pos,
+        };
+        const pipe = switch (args.norm_dtype) {
+            .f16 => self.prefill_qknorm_rope_kv_write,
+            .bf16 => self.prefill_qknorm_rope_kv_write_bf16,
+        };
+        const total_heads: u64 = if (args.kv_only)
+            args.num_kv_heads
+        else
+            @as(u64, args.num_q_heads) + args.num_kv_heads;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.q, args.k, args.v, q_norm, k_norm, args.kv_tiles, mrope_bind },
+            std.mem.asBytes(&params),
+            .{ total_heads, args.num_tokens, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_gqa_causal_prefill_flash_attn` (`G15`, ADR-0020): block-tiled
+    /// (`BQ = 32, BK = 32`) hardware `simdgroup_matrix` causal FlashAttention-2
+    /// skipping upper-triangular KV blocks (`kv_block_start > max_q_pos_in_tile`),
+    /// enforcing exact causal `kv_pos <= q_pos` and optional `sliding_window > 0`,
+    /// reading across both `R5` retired group-64 `q8` chunks and active `KvTilePair`s.
+    pub fn encodeGqaCausalPrefillFlashAttn(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: CausalPrefillAttnArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.num_q == 0 or args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            (args.num_q_heads % args.num_kv_heads) != 0 or args.chunk_tokens == 0)
+        {
+            return error.InvalidArgument;
+        }
+        const pipe = switch (args.head_dim) {
+            64 => self.gqa_causal_prefill_flash_d64,
+            128 => self.gqa_causal_prefill_flash_d128,
+            else => return error.InvalidArgument,
+        };
+        const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidArgument;
+        if (args.num_retired_chunks > 0) {
+            if (args.ring_capacity != 0) return error.InvalidArgument;
+            if (args.retired_pool == null or args.retired_chunk_ids == null or
+                args.retired_plane_stride_bytes == 0 or
+                args.retired_chunk_stride_bytes < args.retired_plane_stride_bytes * 2)
+            {
+                return error.InvalidArgument;
+            }
+        }
+        if (args.ring_capacity > 0 and (args.ring_capacity % args.chunk_tokens) != 0) {
+            return error.InvalidArgument;
+        }
+        const max_q_pos: u64 = @as(u64, args.q_start_pos) + args.num_q - 1;
+        const max_kv_needed: u64 = @min(@as(u64, args.kv_len), max_q_pos + 1);
+        if (max_kv_needed > retired_tokens and args.kv_tiles == null) {
+            return error.InvalidArgument;
+        }
+
+        const scale: f32 = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_dim))));
+        const params: CausalPrefillAttnParams = .{
+            .num_q = args.num_q,
+            .q_start_pos = args.q_start_pos,
+            .kv_len = args.kv_len,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .head_dim = args.head_dim,
+            .chunk_tokens = args.chunk_tokens,
+            .sliding_window = args.sliding_window,
+            .ring_capacity = args.ring_capacity,
+            .scale = scale,
+            .num_retired_chunks = args.num_retired_chunks,
+            .tile_table_offset = args.tile_table_offset,
+            .retired_offset = args.retired_offset,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+        };
+        const gqa_ratio: u64 = args.num_q_heads / args.num_kv_heads;
+        const total_q: u64 = @as(u64, args.num_q) * gqa_ratio;
+        const q_tiles: u64 = (total_q + 31) / 32;
+
+        const kv_tiles_bind = args.kv_tiles orelse args.q;
+        const retired_pool_bind = args.retired_pool orelse args.q;
+        const retired_ids_bind = args.retired_chunk_ids orelse args.q;
+
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.q, kv_tiles_bind, retired_pool_bind, retired_ids_bind, args.out },
+            std.mem.asBytes(&params),
+            .{ args.num_kv_heads, q_tiles, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
     }
 };
 
@@ -6210,4 +6535,567 @@ test "R8 ami_kv_tile_cow_copy copies valid_tokens rows bit-for-bit on GPU withou
     try dkg.unlock();
     try svg.unlock();
     try skg.unlock();
+}
+
+fn verifyWidePrefillVsTree64(
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    prefix_len: u32,
+    chunk_len: u32,
+    chunk_tokens: u32,
+    use_bf16_norm: bool,
+) !void {
+    const gpa = std.testing.allocator;
+    const total_len: u32 = prefix_len + chunk_len;
+    const num_tiles: usize = (total_len + chunk_tokens - 1) / chunk_tokens;
+
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try AttentionPipelines.init(device, library);
+    defer pipes.close();
+
+    // Two identical sets of KV tiles: set A (wide direct write), set B (tree64 + commitTreeKv).
+    const k_tiles_w = try gpa.alloc(metal.KvTile, num_tiles);
+    defer gpa.free(k_tiles_w);
+    const v_tiles_w = try gpa.alloc(metal.KvTile, num_tiles);
+    defer gpa.free(v_tiles_w);
+    const k_tiles_t = try gpa.alloc(metal.KvTile, num_tiles);
+    defer gpa.free(k_tiles_t);
+    const v_tiles_t = try gpa.alloc(metal.KvTile, num_tiles);
+    defer gpa.free(v_tiles_t);
+
+    var created: usize = 0;
+    errdefer {
+        for (0..created) |i| {
+            v_tiles_t[i].close();
+            k_tiles_t[i].close();
+            v_tiles_w[i].close();
+            k_tiles_w[i].close();
+        }
+    }
+    const tile_rows = num_kv_heads * chunk_tokens;
+    for (0..num_tiles) |i| {
+        k_tiles_w[i] = try metal.KvTile.init(device, head_dim, tile_rows, .{});
+        errdefer k_tiles_w[i].close();
+        v_tiles_w[i] = try metal.KvTile.init(device, head_dim, tile_rows, .{});
+        errdefer v_tiles_w[i].close();
+        k_tiles_t[i] = try metal.KvTile.init(device, head_dim, tile_rows, .{});
+        errdefer k_tiles_t[i].close();
+        v_tiles_t[i] = try metal.KvTile.init(device, head_dim, tile_rows, .{});
+        created = i + 1;
+    }
+    defer {
+        for (0..num_tiles) |i| {
+            v_tiles_t[i].close();
+            k_tiles_t[i].close();
+            v_tiles_w[i].close();
+            k_tiles_w[i].close();
+        }
+    }
+
+    const q_bytes = @as(usize, total_len) * num_q_heads * head_dim * @sizeOf(f16);
+    const kv_bytes = @as(usize, total_len) * num_kv_heads * head_dim * @sizeOf(f16);
+    const norm_bytes = @as(usize, head_dim) * 2;
+    const table_bytes = num_tiles * @sizeOf(KvTilePair);
+    const tree_kv_bytes = @as(usize, MAX_TREE_NODES) * num_kv_heads * head_dim * @sizeOf(f16);
+    const tree_meta_bytes = @as(usize, MAX_TREE_NODES) * (@sizeOf(u32) + @sizeOf(u64));
+
+    const arena_cap = try page.alignUp(
+        4 * q_bytes + 2 * kv_bytes + 2 * norm_bytes + 2 * table_bytes + 2 * tree_kv_bytes + tree_meta_bytes + 4096,
+    ) + page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    const qw_raw = try arena.allocAligned(q_bytes, 64);
+    const qt_raw = try arena.allocAligned(q_bytes, 64);
+    const out_w_raw = try arena.allocAligned(q_bytes, 64);
+    const out_t_raw = try arena.allocAligned(q_bytes, 64);
+    const k_raw = try arena.allocAligned(kv_bytes, 64);
+    const v_raw = try arena.allocAligned(kv_bytes, 64);
+    const qn_raw = try arena.allocAligned(norm_bytes, 64);
+    const kn_raw = try arena.allocAligned(norm_bytes, 64);
+    const tab_w_raw = try arena.allocAligned(table_bytes, 64);
+    const tab_t_raw = try arena.allocAligned(table_bytes, 64);
+    const k_tree_raw = try arena.allocAligned(tree_kv_bytes, 64);
+    const v_tree_raw = try arena.allocAligned(tree_kv_bytes, 64);
+    const pos_raw = try arena.allocAligned(MAX_TREE_NODES * @sizeOf(u32), 64);
+    const mask_raw = try arena.allocAligned(MAX_TREE_NODES * @sizeOf(u64), 64);
+
+    @memset(out_w_raw, 0);
+    @memset(out_t_raw, 0);
+
+    const qw_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, qw_raw));
+    const qt_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, qt_raw));
+    const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw));
+    const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw));
+    const qn_u16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, qn_raw));
+    const kn_u16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, kn_raw));
+    const tab_w: []KvTilePair = @alignCast(std.mem.bytesAsSlice(KvTilePair, tab_w_raw));
+    const tab_t: []KvTilePair = @alignCast(std.mem.bytesAsSlice(KvTilePair, tab_t_raw));
+    const pos_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, pos_raw));
+    const mask_u64: []u64 = @alignCast(std.mem.bytesAsSlice(u64, mask_raw));
+
+    for (qw_f16, 0..) |*x, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 17 + 5) % 29)) - 14;
+        x.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.0625);
+    }
+    @memcpy(qt_f16, qw_f16);
+    for (k_f16, 0..) |*x, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 23 + 11) % 31)) - 15;
+        x.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.0625);
+    }
+    for (v_f16, 0..) |*x, idx| {
+        const c: i32 = @as(i32, @intCast((idx * 13 + 7) % 27)) - 13;
+        x.* = @floatCast(@as(f32, @floatFromInt(c)) * 0.0625);
+    }
+    const norm_dt: quant.FloatDType = if (use_bf16_norm) .bf16 else .f16;
+    for (0..head_dim) |d| {
+        qn_u16[d] = quant.f32ToFloatBits(norm_dt, 0.75 + 0.03125 * @as(f32, @floatFromInt(d % 9)));
+        kn_u16[d] = quant.f32ToFloatBits(norm_dt, 0.85 + 0.03125 * @as(f32, @floatFromInt((d * 3) % 7)));
+    }
+    for (0..num_tiles) |i| {
+        tab_w[i] = KvTilePair.fromTiles(k_tiles_w[i], v_tiles_w[i], .rgba16f);
+        tab_t[i] = KvTilePair.fromTiles(k_tiles_t[i], v_tiles_t[i], .rgba16f);
+    }
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    try compute.makeTilesResident(k_tiles_w);
+    try compute.makeTilesResident(v_tiles_w);
+    try compute.makeTilesResident(k_tiles_t);
+    try compute.makeTilesResident(v_tiles_t);
+
+    const q_row_bytes: u64 = @as(u64, num_q_heads) * head_dim * @sizeOf(f16);
+    const kv_row_bytes: u64 = @as(u64, num_kv_heads) * head_dim * @sizeOf(f16);
+    const qn_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(qn_raw.ptr) };
+    const kn_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(kn_raw.ptr) };
+    const tab_w_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(tab_w_raw.ptr) };
+    const tab_t_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(tab_t_raw.ptr) };
+
+    // 1. Wide prefill path (prefix if any, then wide chunk [prefix_len .. total_len)).
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        var barrier = false;
+        if (prefix_len > 0) {
+            try pipes.encodePrefillQkNormRopeKvWrite(&f, .{
+                .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(qw_raw.ptr) },
+                .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) },
+                .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) },
+                .q_norm = qn_b,
+                .k_norm = kn_b,
+                .kv_tiles = tab_w_b,
+                .num_tokens = prefix_len,
+                .num_q_heads = num_q_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .start_pos = 0,
+                .chunk_tokens = chunk_tokens,
+                .kv_only = true,
+                .norm_dtype = norm_dt,
+            }, false);
+            barrier = true;
+        }
+        try pipes.encodePrefillQkNormRopeKvWrite(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(qw_raw.ptr) + @as(u64, prefix_len) * q_row_bytes },
+            .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) + @as(u64, prefix_len) * kv_row_bytes },
+            .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) + @as(u64, prefix_len) * kv_row_bytes },
+            .q_norm = qn_b,
+            .k_norm = kn_b,
+            .kv_tiles = tab_w_b,
+            .num_tokens = chunk_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .start_pos = prefix_len,
+            .chunk_tokens = chunk_tokens,
+            .norm_dtype = norm_dt,
+        }, barrier);
+        try pipes.encodeGqaCausalPrefillFlashAttn(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(qw_raw.ptr) + @as(u64, prefix_len) * q_row_bytes },
+            .kv_tiles = tab_w_b,
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_w_raw.ptr) + @as(u64, prefix_len) * q_row_bytes },
+            .num_q = chunk_len,
+            .q_start_pos = prefix_len,
+            .kv_len = total_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .chunk_tokens = chunk_tokens,
+        }, true);
+        const sig = try f.commit();
+        try compute.wait(sig, 10_000);
+    }
+
+    // 2. Legacy tree64 baseline sliced in <= 64-token chunks (`verifyTree` + `commitTreeKv`).
+    var base: u32 = 0;
+    while (base < total_len) {
+        const m: u32 = @min(MAX_TREE_NODES, total_len - base);
+        for (0..m) |i| {
+            pos_u32[i] = base + @as(u32, @intCast(i));
+            mask_u64[i] = if (i == 63) std.math.maxInt(u64) else ((@as(u64, 1) << @intCast(i + 1)) - 1);
+        }
+        var chain: [MAX_TREE_NODES]u16 = undefined;
+        for (0..m) |i| chain[i] = @intCast(i);
+
+        const c0 = base / chunk_tokens;
+        const c1 = (base + m - 1) / chunk_tokens;
+
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeTreeQkNormRope(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(qt_raw.ptr) + @as(u64, base) * q_row_bytes },
+            .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) + @as(u64, base) * kv_row_bytes },
+            .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) + @as(u64, base) * kv_row_bytes },
+            .q_norm = qn_b,
+            .k_norm = kn_b,
+            .positions = .{ .buffer = gpu_buf, .offset = arena.offsetOf(pos_raw.ptr) },
+            .k_tree_out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_tree_raw.ptr) },
+            .v_tree_out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_tree_raw.ptr) },
+            .num_nodes = m,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .norm_dtype = norm_dt,
+        }, false);
+        if (base + m > prefix_len) {
+            try pipes.encodeGqaTreeVerifyAttn(&f, .{
+                .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(qt_raw.ptr) + @as(u64, base) * q_row_bytes },
+                .kv_tiles = tab_t_b,
+                .k_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_tree_raw.ptr) },
+                .v_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_tree_raw.ptr) },
+                .ancestor_masks = .{ .buffer = gpu_buf, .offset = arena.offsetOf(mask_raw.ptr) },
+                .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_t_raw.ptr) + @as(u64, base) * q_row_bytes },
+                .num_nodes = m,
+                .num_q_heads = num_q_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .base_pos = base,
+                .chunk_tokens = chunk_tokens,
+            }, true);
+        }
+        try pipes.encodeKvTreeCommit(&f, .{
+            .k_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_tree_raw.ptr) },
+            .v_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_tree_raw.ptr) },
+            .accepted_nodes = .{ .inline_u16 = chain[0..m] },
+            .accepted_count = m,
+            .k_tile0 = k_tiles_t[c0],
+            .v_tile0 = v_tiles_t[c0],
+            .k_tile1 = if (c1 != c0) k_tiles_t[c1] else null,
+            .v_tile1 = if (c1 != c0) v_tiles_t[c1] else null,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .base_pos = base,
+            .chunk_tokens = chunk_tokens,
+        }, true);
+        const sig = try f.commit();
+        try compute.wait(sig, 10_000);
+        base += m;
+    }
+
+    // Compare attention outputs across the entire wide chunk [prefix_len .. total_len).
+    const out_w: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_w_raw));
+    const out_t: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_t_raw));
+    const start_elem = @as(usize, prefix_len) * num_q_heads * head_dim;
+    const end_elem = @as(usize, total_len) * num_q_heads * head_dim;
+    for (start_elem..end_elem) |idx| {
+        const gw: f32 = @floatCast(out_w[idx]);
+        const gt: f32 = @floatCast(out_t[idx]);
+        try std.testing.expect(std.math.isFinite(gw));
+        try std.testing.expectApproxEqAbs(gt, gw, 5e-3);
+    }
+
+    // Also verify P0-B1 M=1 final-chunk tail (num_q=1, q_start_pos=total_len-1) matches last row!
+    const last_row_off = @as(u64, total_len - 1) * q_row_bytes;
+    {
+        // Reuse out_t_raw[0..q_row_bytes] for the M=1 tail output.
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeGqaCausalPrefillFlashAttn(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(qw_raw.ptr) + last_row_off },
+            .kv_tiles = tab_w_b,
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_t_raw.ptr) },
+            .num_q = 1,
+            .q_start_pos = total_len - 1,
+            .kv_len = total_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .chunk_tokens = chunk_tokens,
+        }, false);
+        const sig = try f.commit();
+        try compute.wait(sig, 10_000);
+    }
+    const row_elems = @as(usize, num_q_heads) * head_dim;
+    const last_full = out_w[(@as(usize, total_len - 1) * row_elems)..][0..row_elems];
+    const tail_one = out_t[0..row_elems];
+    for (last_full, tail_one) |a, b| {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(a)), @as(f32, @floatCast(b)), 1e-3);
+    }
+}
+
+test "G15: wide FlashAttention prefill + direct KvTile write matches tree64 across M=65,257,512,1024 and cross-tile boundary" {
+    // M = 65 (odd > 64), head_dim = 64, GQA 4x, bf16 QK-norm
+    try verifyWidePrefillVsTree64(8, 2, 64, 0, 65, DEFAULT_CHUNK_TOKENS, true);
+    // M = 257 (odd multi-tile), head_dim = 128, GQA 4x, f16 QK-norm
+    try verifyWidePrefillVsTree64(8, 2, 128, 0, 257, DEFAULT_CHUNK_TOKENS, false);
+    // Cross-512-tile boundary: start_pos = 300, M = 512 -> spans tile 0 [300..511] & tile 1 [512..811]
+    try verifyWidePrefillVsTree64(8, 2, 128, 300, 512, DEFAULT_CHUNK_TOKENS, false);
+    // Full wide M = 1024 across two 512-token tiles, head_dim = 64, GQA 8x
+    try verifyWidePrefillVsTree64(8, 1, 64, 0, 1024, DEFAULT_CHUNK_TOKENS, false);
+}
+
+test "G15: wide FlashAttention prefill supports sliding_window > 0 and R5 retired q8 + active tiles" {
+    const gpa = std.testing.allocator;
+    const num_q_heads: u32 = 8;
+    const num_kv_heads: u32 = 2;
+    const head_dim: u32 = 128;
+    const chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS;
+    const active_m: u32 = 137;
+    const total_len: u32 = chunk_tokens + active_m; // 512 retired + 137 active = 649
+
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try AttentionPipelines.init(device, library);
+    defer pipes.close();
+
+    var tile0_k = try metal.KvTile.init(device, head_dim, num_kv_heads * chunk_tokens, .{});
+    defer tile0_k.close();
+    var tile0_v = try metal.KvTile.init(device, head_dim, num_kv_heads * chunk_tokens, .{});
+    defer tile0_v.close();
+    var tile1_k = try metal.KvTile.init(device, head_dim, num_kv_heads * chunk_tokens, .{});
+    defer tile1_k.close();
+    var tile1_v = try metal.KvTile.init(device, head_dim, num_kv_heads * chunk_tokens, .{});
+    defer tile1_v.close();
+
+    const retired_spec: RetiredKvQ8PoolSpec = .{
+        .max_chunks = 2,
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .chunk_tokens = chunk_tokens,
+    };
+    const retired_bytes = try RetiredKvQ8Pool.requiredArenaBytes(retired_spec);
+    const q_bytes = @as(usize, total_len) * num_q_heads * head_dim * @sizeOf(f16);
+    const kv_bytes = @as(usize, total_len) * num_kv_heads * head_dim * @sizeOf(f16);
+    const arena_cap = try page.alignUp(retired_bytes + 4 * q_bytes + 2 * kv_bytes + 16384) + page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    var retired_pool = try RetiredKvQ8Pool.init(&arena, retired_spec);
+    const retired_slot = try retired_pool.acquireSlot();
+
+    const q_raw = try arena.allocAligned(q_bytes, 64);
+    const k_raw = try arena.allocAligned(kv_bytes, 64);
+    const v_raw = try arena.allocAligned(kv_bytes, 64);
+    const out_full_raw = try arena.allocAligned(q_bytes, 64);
+    const out_tiered_raw = try arena.allocAligned(q_bytes, 64);
+    const out_swa_raw = try arena.allocAligned(q_bytes, 64);
+    const tab_full_raw = try arena.allocAligned(2 * @sizeOf(KvTilePair), 64);
+    const tab_active_raw = try arena.allocAligned(@sizeOf(KvTilePair), 64);
+    const ret_ids_raw = try arena.allocAligned(64, 64);
+
+    const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw));
+    const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw));
+    const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw));
+    const tab_full: []KvTilePair = @alignCast(std.mem.bytesAsSlice(KvTilePair, tab_full_raw));
+    const tab_active: []KvTilePair = @alignCast(std.mem.bytesAsSlice(KvTilePair, tab_active_raw));
+    const ret_ids: []u32 = @alignCast(std.mem.bytesAsSlice(u32, ret_ids_raw));
+
+    for (q_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 19 + 3) % 25)) - 12)) * 0.0625);
+    for (k_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 7) % 23)) - 11)) * 0.0625);
+    for (v_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 29 + 5) % 27)) - 13)) * 0.0625);
+
+    tab_full[0] = KvTilePair.fromTiles(tile0_k, tile0_v, .rgba16f);
+    tab_full[1] = KvTilePair.fromTiles(tile1_k, tile1_v, .rgba16f);
+    tab_active[0] = KvTilePair.fromTiles(tile1_k, tile1_v, .rgba16f);
+    ret_ids[0] = retired_slot;
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    try compute.makeTilesResident(&.{ tile0_k, tile0_v, tile1_k, tile1_v });
+
+    const q_row_bytes: u64 = @as(u64, num_q_heads) * head_dim * @sizeOf(f16);
+    const kv_row_bytes: u64 = @as(u64, num_kv_heads) * head_dim * @sizeOf(f16);
+    const tab_full_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(tab_full_raw.ptr) };
+    const tab_active_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(tab_active_raw.ptr) };
+
+    // 1. Write chunk 0 (512 tokens) + chunk 1 (137 tokens) into tile0 & tile1,
+    //    retire tile0 -> R5 q8, then run full-fp16 vs tiered (retired q8 + active tile1)
+    //    AND sliding_window = 128 FlashAttention.
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodePrefillQkNormRopeKvWrite(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) },
+            .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) },
+            .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) },
+            .kv_tiles = tab_full_b,
+            .num_tokens = total_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .start_pos = 0,
+            .chunk_tokens = chunk_tokens,
+        }, false);
+        try pipes.encodeKvRetireTileToQ8(&f, .{
+            .pool = &retired_pool,
+            .pool_buf = gpu_buf,
+            .k_tile = tile0_k,
+            .v_tile = tile0_v,
+            .dst_slot = retired_slot,
+        }, true);
+        try pipes.encodeGqaCausalPrefillFlashAttn(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) + @as(u64, chunk_tokens) * q_row_bytes },
+            .kv_tiles = tab_full_b,
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_full_raw.ptr) },
+            .num_q = active_m,
+            .q_start_pos = chunk_tokens,
+            .kv_len = total_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .chunk_tokens = chunk_tokens,
+        }, true);
+        try pipes.encodeGqaCausalPrefillFlashAttn(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) + @as(u64, chunk_tokens) * q_row_bytes },
+            .kv_tiles = tab_active_b,
+            .retired_pool = retired_pool.binding(gpu_buf),
+            .retired_chunk_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(ret_ids_raw.ptr) },
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_tiered_raw.ptr) },
+            .num_q = active_m,
+            .q_start_pos = chunk_tokens,
+            .kv_len = total_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .chunk_tokens = chunk_tokens,
+            .num_retired_chunks = 1,
+            .retired_plane_stride_bytes = @intCast(retired_pool.plane_stride_bytes),
+            .retired_chunk_stride_bytes = @intCast(retired_pool.chunk_stride_bytes),
+        }, true);
+        try pipes.encodeGqaCausalPrefillFlashAttn(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) + @as(u64, chunk_tokens) * q_row_bytes },
+            .kv_tiles = tab_full_b,
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_swa_raw.ptr) },
+            .num_q = active_m,
+            .q_start_pos = chunk_tokens,
+            .kv_len = total_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .chunk_tokens = chunk_tokens,
+            .sliding_window = 128,
+        }, true);
+        const sig = try f.commit();
+        try compute.wait(sig, 10_000);
+    }
+    _ = kv_row_bytes;
+
+    // Tiered (R5 q8 + active tile1) vs all-fp16 tiles must agree tightly (q8 quantization noise <= 1.5e-2).
+    const out_full: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_full_raw));
+    const out_tiered: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_tiered_raw));
+    const out_swa: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_swa_raw));
+    const elems = @as(usize, active_m) * num_q_heads * head_dim;
+    for (0..elems) |idx| {
+        const gf: f32 = @floatCast(out_full[idx]);
+        const gt: f32 = @floatCast(out_tiered[idx]);
+        try std.testing.expect(std.math.isFinite(gt));
+        try std.testing.expectApproxEqAbs(gf, gt, 1.5e-2);
+    }
+
+    // Verify sliding_window = 128 against CPU fp32 reference on sampled queries
+    // spanning the chunk boundary (qi = 0 at pos 512, qi = 64 at pos 576, qi = 136 at pos 648).
+    var t0_kg = try tile0_k.lock(true);
+    errdefer t0_kg.release();
+    var t0_vg = try tile0_v.lock(true);
+    errdefer t0_vg.release();
+    var t1_kg = try tile1_k.lock(true);
+    errdefer t1_kg.release();
+    var t1_vg = try tile1_v.lock(true);
+    errdefer t1_vg.release();
+    const stride = t0_kg.bytes_per_row / @sizeOf(f16);
+    const k0m: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, t0_kg.bytes));
+    const v0m: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, t0_vg.bytes));
+    const k1m: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, t1_kg.bytes));
+    const v1m: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, t1_vg.bytes));
+
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const gqa_ratio = num_q_heads / num_kv_heads;
+    const scores = try gpa.alloc(f32, 128);
+    defer gpa.free(scores);
+
+    for ([_]u32{ 0, 1, 64, 127, active_m - 1 }) |qi| {
+        const q_pos = chunk_tokens + qi;
+        const win_lo = q_pos + 1 - 128;
+        for (0..num_q_heads) |qh| {
+            const kvh = qh / gqa_ratio;
+            const q_vec = q_f16[(@as(usize, q_pos) * num_q_heads + qh) * head_dim ..][0..head_dim];
+            var max_s: f32 = -std.math.inf(f32);
+            for (0..128) |wi| {
+                const kv_pos = win_lo + @as(u32, @intCast(wi));
+                const is_t1 = kv_pos >= chunk_tokens;
+                const slot = if (is_t1) kv_pos - chunk_tokens else kv_pos;
+                const km = if (is_t1) k1m else k0m;
+                const k_row = km[(kvh * chunk_tokens + slot) * stride ..][0..head_dim];
+                var dot_v: f32 = 0.0;
+                for (0..head_dim) |d| dot_v += @as(f32, @floatCast(q_vec[d])) * @as(f32, @floatCast(k_row[d]));
+                const s = dot_v * scale;
+                scores[wi] = s;
+                if (s > max_s) max_s = s;
+            }
+            var sum_p: f32 = 0.0;
+            for (scores) |*s| {
+                s.* = @exp(s.* - max_s);
+                sum_p += s.*;
+            }
+            const got_row = out_swa[(@as(usize, qi) * num_q_heads + qh) * head_dim ..][0..head_dim];
+            for (0..head_dim) |d| {
+                var acc: f32 = 0.0;
+                for (0..128) |wi| {
+                    const kv_pos = win_lo + @as(u32, @intCast(wi));
+                    const is_t1 = kv_pos >= chunk_tokens;
+                    const slot = if (is_t1) kv_pos - chunk_tokens else kv_pos;
+                    const vm = if (is_t1) v1m else v0m;
+                    acc += scores[wi] * @as(f32, @floatCast(vm[(kvh * chunk_tokens + slot) * stride + d]));
+                }
+                const expected = acc / sum_p;
+                const got: f32 = @floatCast(got_row[d]);
+                try std.testing.expect(std.math.isFinite(got));
+                try std.testing.expectApproxEqAbs(expected, got, 5e-3);
+            }
+        }
+    }
+
+    try t1_vg.unlock();
+    try t1_kg.unlock();
+    try t0_vg.unlock();
+    try t0_kg.unlock();
+    try retired_pool.releaseSlot(retired_slot);
 }

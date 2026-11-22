@@ -1008,15 +1008,15 @@ kernel void ami_moe_reduce_f16(const device float *down_out [[buffer(0)]],
                                device half *out [[buffer(2)]],
                                constant MoeReduceParams &p [[buffer(3)]],
                                uint gid [[thread_position_in_grid]]) {
-    const uint total = p.m * p.hidden_size;
-    if (gid >= total) {
+    const ulong total = ulong(p.m) * p.hidden_size;
+    if (ulong(gid) >= total) {
         return;
     }
 
-    const uint tok = gid / p.hidden_size;
-    const uint col = gid - tok * p.hidden_size;
+    const uint tok = uint(ulong(gid) / p.hidden_size);
+    const uint col = uint(ulong(gid) - ulong(tok) * p.hidden_size);
     const ulong base = ulong(tok) * p.top_k * p.hidden_size + col;
-    float acc = (p.add_residual != 0u) ? float(residual[gid]) : 0.0f;
+    float acc = (p.add_residual != 0u) ? float(residual[ulong(gid)]) : 0.0f;
 
     if (MOE_TOP_K > 0u) {
         for (uint k = 0u; k < MOE_TOP_K; k++) {
@@ -1028,7 +1028,7 @@ kernel void ami_moe_reduce_f16(const device float *down_out [[buffer(0)]],
         }
     }
 
-    out[gid] = half(acc);
+    out[ulong(gid)] = half(acc);
 }
 
 // ---------------------------------------------------------------------------

@@ -166,6 +166,8 @@ ami_status ami_device_query(const ami_device *device, ami_device_info *out_info)
             [mtl_device respondsToSelector:@selector(newMTL4CommandQueue)] ? 1 : 0;
         out_info->apple_gpu_family = highest_apple_family(mtl_device);
         out_info->ane_core_count = neural_engine_cores();
+        out_info->supports_apple10 =
+            [mtl_device supportsFamily:(MTLGPUFamily)1010] ? 1 : 0;
     }
     return AMI_OK;
 }
