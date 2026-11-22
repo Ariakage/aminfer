@@ -12,6 +12,7 @@ const amf = @import("../format/amf.zig");
 const quant = @import("../quant/spec.zig");
 const dequant = @import("dequant.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
+const chip_profile = @import("../platform/chip_profile.zig");
 const vmstat = @import("../platform/vmstat.zig");
 
 /// Default number of tokens stored per KV cache chunk tile (ADR-0004).
@@ -2341,6 +2342,10 @@ pub const SpikeS1Config = struct {
     timed_batches: u32 = 8,
     dispatches_per_batch: u32 = 8,
     timeout_ms: u64 = 30_000,
+    /// Host memory-bus specification in decimal GB/s (`C16`, `ADR-0021`).
+    /// Defaults to `M4_BUS_BANDWIDTH_GBS` (`120.0`) for backward compatibility;
+    /// pass `chip_profile.spec_bus_gbs` (or `0.0` to auto-resolve from host profile).
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
 };
 
 pub const SpikeS1CaseResult = struct {
@@ -2349,6 +2354,7 @@ pub const SpikeS1CaseResult = struct {
     bytes_per_dispatch: u64,
     dispatches: u64,
     elapsed_ns: u64,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
 
     pub fn latencyUs(self: SpikeS1CaseResult) f64 {
         if (self.dispatches == 0) return 0.0;
@@ -2362,13 +2368,24 @@ pub const SpikeS1CaseResult = struct {
         return total_bytes / @as(f64, @floatFromInt(self.elapsed_ns));
     }
 
+    /// Percentage of the supplied `bus_gbs` specification achieved by this case.
+    pub fn percentOfBus(self: SpikeS1CaseResult, bus_gbs: f64) f64 {
+        if (!(bus_gbs > 0.0) or !std.math.isFinite(bus_gbs)) return 0.0;
+        return (self.effectiveBandwidthGbs() / bus_gbs) * 100.0;
+    }
+
+    pub fn percentOfM4Bus(self: SpikeS1CaseResult) f64 {
+        return self.percentOfBus(self.spec_bus_gbs);
+    }
+
     pub fn busUtilizationPct(self: SpikeS1CaseResult) f64 {
-        return (self.effectiveBandwidthGbs() / M4_BUS_BANDWIDTH_GBS) * 100.0;
+        return self.percentOfBus(self.spec_bus_gbs);
     }
 };
 
 pub const SpikeS1Report = struct {
     config: SpikeS1Config,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
     tile_data_bytes: u64,
     tile_alloc_bytes: u64,
     tile_surface_alloc_size: u64,
@@ -2383,6 +2400,7 @@ pub const SpikeS1Report = struct {
         try out.print(
             \\Spike S1 IOSurface KV-Tile Read Bandwidth
             \\s1.geometry                      q={d},kv={d},d={d},chunk={d},chunks={d} (ctx={d}),banks={d}
+            \\s1.spec_bus_gbs                  {d:.2}
             \\s1.tile_bytes_per_row            {d}
             \\s1.tile_data_bytes               {d}
             \\s1.tile_alloc_bytes              {d}
@@ -2398,6 +2416,7 @@ pub const SpikeS1Report = struct {
             self.config.num_chunks,
             context_tokens,
             self.config.num_banks,
+            self.spec_bus_gbs,
             self.tile_bytes_per_row,
             self.tile_data_bytes,
             self.tile_alloc_bytes,
@@ -2415,7 +2434,7 @@ pub const SpikeS1Report = struct {
                 res.bytes_per_dispatch,
                 res.latencyUs(),
                 res.effectiveBandwidthGbs(),
-                res.busUtilizationPct(),
+                res.percentOfBus(self.spec_bus_gbs),
             });
         }
 
@@ -2468,7 +2487,8 @@ pub fn runSpikeS1(allocator: std.mem.Allocator, config: SpikeS1Config) BenchErro
         (config.num_q_heads / config.num_kv_heads) > 8 or
         config.num_chunks == 0 or config.num_banks == 0 or
         config.timed_batches == 0 or config.dispatches_per_batch == 0 or
-        config.dispatches_per_batch > metal.UNIFORM_SLOTS_PER_FRAME)
+        config.dispatches_per_batch > metal.UNIFORM_SLOTS_PER_FRAME or
+        !std.math.isFinite(config.spec_bus_gbs) or config.spec_bus_gbs < 0.0)
     {
         return error.InvalidConfig;
     }
@@ -2477,6 +2497,10 @@ pub fn runSpikeS1(allocator: std.mem.Allocator, config: SpikeS1Config) BenchErro
     const device = try metal.Device.open();
     defer device.close();
     const dev_info = try device.info();
+    const effective_bus_gbs: f64 = if (config.spec_bus_gbs > 0.0)
+        config.spec_bus_gbs
+    else
+        chip_profile.ChipProfile.resolve(facts, dev_info.name(), @intCast(dev_info.appleGpuFamily()), null).spec_bus_gbs;
     const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
 
     const library = try metal.Library.openEmbedded(device);
@@ -2723,6 +2747,7 @@ pub fn runSpikeS1(allocator: std.mem.Allocator, config: SpikeS1Config) BenchErro
                 .bytes_per_dispatch = kv_bytes_per_dispatch,
                 .dispatches = @as(u64, config.timed_batches) * config.dispatches_per_batch,
                 .elapsed_ns = t1 - t0,
+                .spec_bus_gbs = effective_bus_gbs,
             };
         }
     }
@@ -2732,6 +2757,7 @@ pub fn runSpikeS1(allocator: std.mem.Allocator, config: SpikeS1Config) BenchErro
 
     return .{
         .config = config,
+        .spec_bus_gbs = effective_bus_gbs,
         .tile_data_bytes = tile_data_bytes,
         .tile_alloc_bytes = tile_alloc_bytes,
         .tile_surface_alloc_size = tile_surface_alloc_size,
@@ -2769,6 +2795,10 @@ pub const GqaBenchConfig = struct {
     timed_batches: u32 = 8,
     dispatches_per_batch: u32 = 8,
     timeout_ms: u64 = 30_000,
+    /// Host memory-bus specification in decimal GB/s (`C16`, `ADR-0021`).
+    /// Defaults to `M4_BUS_BANDWIDTH_GBS` (`120.0`) for backward compatibility;
+    /// pass `chip_profile.spec_bus_gbs` (or `0.0` to auto-resolve from host profile).
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
 };
 
 pub const GqaBenchCaseResult = struct {
@@ -2779,6 +2809,7 @@ pub const GqaBenchCaseResult = struct {
     bytes_per_dispatch: u64,
     dispatches: u64,
     elapsed_ns: u64,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
 
     pub fn latencyUs(self: GqaBenchCaseResult) f64 {
         if (self.dispatches == 0) return 0.0;
@@ -2791,13 +2822,24 @@ pub const GqaBenchCaseResult = struct {
         return total_bytes / @as(f64, @floatFromInt(self.elapsed_ns));
     }
 
+    /// Percentage of the supplied `bus_gbs` specification achieved by this case.
+    pub fn percentOfBus(self: GqaBenchCaseResult, bus_gbs: f64) f64 {
+        if (!(bus_gbs > 0.0) or !std.math.isFinite(bus_gbs)) return 0.0;
+        return (self.effectiveBandwidthGbs() / bus_gbs) * 100.0;
+    }
+
+    pub fn percentOfM4Bus(self: GqaBenchCaseResult) f64 {
+        return self.percentOfBus(self.spec_bus_gbs);
+    }
+
     pub fn busUtilizationPct(self: GqaBenchCaseResult) f64 {
-        return (self.effectiveBandwidthGbs() / M4_BUS_BANDWIDTH_GBS) * 100.0;
+        return self.percentOfBus(self.spec_bus_gbs);
     }
 };
 
 pub const GqaBenchReport = struct {
     results: []GqaBenchCaseResult,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
     vm_before: vmstat.Snapshot,
     vm_after: vmstat.Snapshot,
 
@@ -2809,9 +2851,10 @@ pub const GqaBenchReport = struct {
     pub fn write(self: *const GqaBenchReport, out: *std.Io.Writer) std.Io.Writer.Error!void {
         try out.print(
             \\G4 GQA Decode Attention over RGBA16Float IOSurface KV Tiles
+            \\g4.spec_bus_gbs                  {d:.2}
             \\seq_len   chunks   splits   banks   bytes/disp   latency(us)   beta(GB/s)   bus(%)
             \\
-        , .{});
+        , .{self.spec_bus_gbs});
         for (self.results) |res| {
             try out.print(
                 \\{d: <9} {d: >6}   {d: >6}   {d: >5}   {d: >10}   {d: >11.2}   {d: >10.2}   {d: >6.1}
@@ -2824,7 +2867,7 @@ pub const GqaBenchReport = struct {
                 res.bytes_per_dispatch,
                 res.latencyUs(),
                 res.effectiveBandwidthGbs(),
-                res.busUtilizationPct(),
+                res.percentOfBus(self.spec_bus_gbs),
             });
         }
         try out.print(
@@ -2842,7 +2885,8 @@ pub const GqaBenchReport = struct {
 /// context lengths (`seq_len = 512, 4096, 16384`) over rotated IOSurface KV tiles.
 pub fn runGqaBench(allocator: std.mem.Allocator, config: GqaBenchConfig) BenchError!GqaBenchReport {
     if (config.timed_batches == 0 or config.dispatches_per_batch == 0 or
-        config.dispatches_per_batch * 2 > metal.UNIFORM_SLOTS_PER_FRAME)
+        config.dispatches_per_batch * 2 > metal.UNIFORM_SLOTS_PER_FRAME or
+        !std.math.isFinite(config.spec_bus_gbs) or config.spec_bus_gbs < 0.0)
     {
         return error.InvalidConfig;
     }
@@ -2851,6 +2895,10 @@ pub fn runGqaBench(allocator: std.mem.Allocator, config: GqaBenchConfig) BenchEr
     const device = try metal.Device.open();
     defer device.close();
     const dev_info = try device.info();
+    const effective_bus_gbs: f64 = if (config.spec_bus_gbs > 0.0)
+        config.spec_bus_gbs
+    else
+        chip_profile.ChipProfile.resolve(facts, dev_info.name(), @intCast(dev_info.appleGpuFamily()), null).spec_bus_gbs;
     const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
 
     const library = try metal.Library.openEmbedded(device);
@@ -3018,6 +3066,7 @@ pub fn runGqaBench(allocator: std.mem.Allocator, config: GqaBenchConfig) BenchEr
             .bytes_per_dispatch = kv_bytes_per_ctx,
             .dispatches = @as(u64, config.timed_batches) * config.dispatches_per_batch,
             .elapsed_ns = t1 - t0,
+            .spec_bus_gbs = effective_bus_gbs,
         };
     }
 
@@ -3026,6 +3075,7 @@ pub fn runGqaBench(allocator: std.mem.Allocator, config: GqaBenchConfig) BenchEr
 
     return .{
         .results = results,
+        .spec_bus_gbs = effective_bus_gbs,
         .vm_before = vm_before,
         .vm_after = vm_after,
     };
@@ -7098,4 +7148,62 @@ test "G15: wide FlashAttention prefill supports sliding_window > 0 and R5 retire
     try t0_vg.unlock();
     try t0_kg.unlock();
     try retired_pool.releaseSlot(retired_slot);
+}
+
+test "C16: Spike S1 and G4 percentOfBus scales accurately across M4, M4 Pro, and M4 Max profiles" {
+    // 273.0 GB/s effective rate: 273 bytes / 1 ns = 273 GB/s.
+    const s1_default: SpikeS1CaseResult = .{
+        .layout = .token_major,
+        .access = .rgba16f,
+        .bytes_per_dispatch = 273_000_000,
+        .dispatches = 1,
+        .elapsed_ns = 1_000_000,
+    };
+    try std.testing.expectApproxEqAbs(@as(f64, 273.0), s1_default.effectiveBandwidthGbs(), 1e-9);
+    // Default spec_bus_gbs remains M4_BUS_BANDWIDTH_GBS (120.0) for backward compatibility.
+    try std.testing.expectApproxEqAbs(@as(f64, 227.5), s1_default.percentOfM4Bus(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 227.5), s1_default.busUtilizationPct(), 1e-9);
+    // Explicit per-chip bus scaling: M4 Pro (273.0 GB/s) -> 100%, M4 Max (546.0 GB/s) -> 50%.
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0), s1_default.percentOfBus(273.0), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), s1_default.percentOfBus(546.0), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), s1_default.percentOfBus(0.0), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), s1_default.percentOfBus(std.math.nan(f64)), 1e-9);
+
+    var s1_m4_max = s1_default;
+    s1_m4_max.spec_bus_gbs = 546.0;
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), s1_m4_max.percentOfM4Bus(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), s1_m4_max.busUtilizationPct(), 1e-9);
+
+    const g4_pro: GqaBenchCaseResult = .{
+        .case = .{ .seq_len = 4096 },
+        .num_chunks = 8,
+        .num_splits = 2,
+        .banks = 2,
+        .bytes_per_dispatch = 136_500_000,
+        .dispatches = 1,
+        .elapsed_ns = 1_000_000,
+        .spec_bus_gbs = 273.0,
+    };
+    try std.testing.expectApproxEqAbs(@as(f64, 136.5), g4_pro.effectiveBandwidthGbs(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), g4_pro.percentOfBus(273.0), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 25.0), g4_pro.percentOfBus(546.0), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), g4_pro.percentOfM4Bus(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), g4_pro.busUtilizationPct(), 1e-9);
+
+    // Report rendering prints spec_bus_gbs and scaled bus(%).
+    const gpa = std.testing.allocator;
+    var g4_results = [_]GqaBenchCaseResult{g4_pro};
+    const rep: GqaBenchReport = .{
+        .results = &g4_results,
+        .spec_bus_gbs = 546.0,
+        .vm_before = std.mem.zeroes(vmstat.Snapshot),
+        .vm_after = std.mem.zeroes(vmstat.Snapshot),
+    };
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try rep.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "g4.spec_bus_gbs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "546.00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "25.0") != null);
 }

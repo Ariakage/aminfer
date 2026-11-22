@@ -27,6 +27,7 @@ const moe = @import("../gpu/moe.zig");
 const ring = @import("../runtime/ring.zig");
 const qos = @import("../platform/qos.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
+const chip_profile = @import("../platform/chip_profile.zig");
 const vmstat = @import("../platform/vmstat.zig");
 
 /// Default static prefill chunk size (ADR-0004, ADR-0010).
@@ -93,6 +94,25 @@ pub fn selectBucketIndex(total_tokens: u32, buckets: []const u32) ?usize {
 pub fn selectBucketLen(total_tokens: u32, buckets: []const u32) ?u32 {
     const idx = selectBucketIndex(total_tokens, buckets) orelse return null;
     return buckets[idx];
+}
+
+/// Per-chip hybrid ANE/GPU wavefront prefill crossover gate (`C16`, `A1`, `ADR-0021`).
+/// Delegates to `ChipProfile.selectPrefillRoute` so `Apple9` (`M1–M4`) and
+/// `Apple10+` (`M5+` GPU `NAX`) apply chip-appropriate thresholds and measured
+/// chunk-latency overrides without hardcoding M4 ratios.
+pub fn shouldUseWavefront(
+    profile: chip_profile.ChipProfile,
+    prompt_tokens: u32,
+    ane_ready: bool,
+    measured_gpu_ms: ?f64,
+    measured_ane_ms: ?f64,
+) bool {
+    return profile.selectPrefillRoute(
+        prompt_tokens,
+        ane_ready,
+        measured_gpu_ms,
+        measured_ane_ms,
+    ) == .ane_wavefront;
 }
 
 /// Populates a `[chunk_tokens, bucket_tokens]` fp16 causal + padding attention
@@ -2663,4 +2683,48 @@ test "Spike S6 smoke benchmark verifies ANE buckets, fp16 precision, 2-chunk wav
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Spike S6") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "s6.a3.recommended_strategy") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "s6.wf.overlap_efficiency") != null);
+}
+
+test {
+    _ = chip_profile;
+}
+
+test "C16: shouldUseWavefront delegates to ChipProfile across Apple9 vs Apple10+ and measured overrides" {
+    const base_facts: sysinfo.Facts = .{
+        .page_size = page.APPLE_PAGE_SIZE,
+        .memory_bytes = 24 * 1024 * 1024 * 1024,
+        .performance_cores = 4,
+        .efficiency_cores = 6,
+        .user_wire_limit = 16 * 1024 * 1024 * 1024,
+        .global_user_wire_limit = 16 * 1024 * 1024 * 1024,
+        .gpu_wired_limit_mib = 0,
+        .has_sme = true,
+        .has_sme2 = true,
+        .has_sme_b16f32 = true,
+        .has_sme_f16f32 = true,
+        .sme_max_svl_bytes = 64,
+    };
+
+    const m4 = chip_profile.ChipProfile.resolve(base_facts, "Apple M4", 9, null);
+    const m5 = chip_profile.ChipProfile.resolve(base_facts, "Apple M5", 10, null);
+
+    // Heuristic token cutoffs: Apple9 (513) vs Apple10+ NAX (2049).
+    try std.testing.expect(!shouldUseWavefront(m4, 512, true, null, null));
+    try std.testing.expect(shouldUseWavefront(m4, 513, true, null, null));
+    try std.testing.expect(shouldUseWavefront(m4, 1024, true, null, null));
+    try std.testing.expect(shouldUseWavefront(m4, 2048, true, null, null));
+
+    try std.testing.expect(!shouldUseWavefront(m5, 512, true, null, null));
+    try std.testing.expect(!shouldUseWavefront(m5, 1024, true, null, null));
+    try std.testing.expect(!shouldUseWavefront(m5, 2048, true, null, null));
+    try std.testing.expect(shouldUseWavefront(m5, 2049, true, null, null));
+
+    // ANE not ready always keeps prefill on GPU wide.
+    try std.testing.expect(!shouldUseWavefront(m4, 4096, false, 12.0, 4.0));
+    try std.testing.expect(!shouldUseWavefront(m5, 4096, false, 12.0, 4.0));
+
+    // Measured latency override (5% win margin required).
+    try std.testing.expect(shouldUseWavefront(m5, 512, true, 20.0, 18.5));
+    try std.testing.expect(!shouldUseWavefront(m4, 4096, true, 20.0, 19.0));
+    try std.testing.expect(!shouldUseWavefront(m4, 4096, true, 20.0, 21.0));
 }

@@ -52,6 +52,24 @@ fn readOptionalFlagAny(primary: [:0]const u8, fallback: [:0]const u8) Error!bool
     return false;
 }
 
+/// Reads an optional NUL-terminated string sysctl into a caller-provided stack
+/// buffer with zero heap allocations (`ADR-0021`, `C16`).
+/// Returns `""` when the kernel reports `ENOENT` (absent) or `ENOMEM`
+/// (truncated / buffer too small), or when `out` is empty; all other kernel
+/// errors propagate explicitly.
+pub fn readOptionalStringBuf(name: [:0]const u8, out: []u8) Error![]const u8 {
+    if (out.len == 0) return out[0..0];
+    var size: usize = out.len;
+    switch (std.c.errno(std.c.sysctlbyname(name.ptr, out.ptr, &size, null, 0))) {
+        .SUCCESS => {},
+        .NOENT, .NOMEM => return out[0..0],
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+    const filled = out[0..@min(size, out.len)];
+    const len = std.mem.indexOfScalar(u8, filled, 0) orelse filled.len;
+    return filled[0..len];
+}
+
 pub const Facts = struct {
     /// `hw.pagesize`
     page_size: u64,
@@ -89,9 +107,43 @@ pub const Facts = struct {
     has_sme_i16i64: bool = false,
     /// `hw.optional.arm.sme_max_svl_b`: maximum Streaming Vector Length in bytes (64 on M4).
     sme_max_svl_bytes: u64 = 0,
+    /// `machdep.cpu.brand_string` (e.g. `"Apple M4"`, `"Apple M4 Max"`).
+    cpu_brand: [96]u8 = @splat(0),
+    cpu_brand_len: u8 = 0,
+    /// `hw.model` (e.g. `"Mac16,12"`).
+    hw_model: [64]u8 = @splat(0),
+    hw_model_len: u8 = 0,
 
     pub fn pcoreL2Kib(self: Facts) u64 {
         return self.pcore_l2_cache_bytes / 1024;
+    }
+
+    /// Returns the host CPU brand string (`machdep.cpu.brand_string`), or `""` if absent.
+    pub fn cpuBrand(self: *const Facts) []const u8 {
+        const len: usize = @min(@as(usize, self.cpu_brand_len), self.cpu_brand.len);
+        return self.cpu_brand[0..len];
+    }
+
+    /// Returns the host hardware model identifier (`hw.model`), or `""` if absent.
+    pub fn hwModel(self: *const Facts) []const u8 {
+        const len: usize = @min(@as(usize, self.hw_model_len), self.hw_model.len);
+        return self.hw_model[0..len];
+    }
+
+    /// Returns a copy of `self` with `cpu_brand` and `hw_model` populated from slices
+    /// (truncated safely to buffer capacity). Useful for synthetic multi-chip tests.
+    pub fn withIdentity(self: Facts, brand: []const u8, model: []const u8) Facts {
+        var copy = self;
+        copy.cpu_brand = @splat(0);
+        const blen = @min(brand.len, copy.cpu_brand.len);
+        @memcpy(copy.cpu_brand[0..blen], brand[0..blen]);
+        copy.cpu_brand_len = @intCast(blen);
+
+        copy.hw_model = @splat(0);
+        const mlen = @min(model.len, copy.hw_model.len);
+        @memcpy(copy.hw_model[0..mlen], model[0..mlen]);
+        copy.hw_model_len = @intCast(mlen);
+        return copy;
     }
 
     /// True when the host exposes the full Apple M4+ ARMv9.2 SME2 engine ISA
@@ -104,6 +156,10 @@ pub const Facts = struct {
             self.sme_max_svl_bytes == 64;
     }
 
+    pub fn collect() Error!Facts {
+        return read();
+    }
+
     pub fn read() Error!Facts {
         const perf_logical = try readUnsigned("hw.perflevel0.logicalcpu");
         const pcore_phys = (try readOptionalUnsigned("hw.perflevel0.physicalcpu")) orelse perf_logical;
@@ -113,6 +169,10 @@ pub const Facts = struct {
             (pcore_phys + cpus_per_l2 - 1) / cpus_per_l2
         else
             1;
+        var cpu_brand: [96]u8 = @splat(0);
+        const brand_slice = try readOptionalStringBuf("machdep.cpu.brand_string", &cpu_brand);
+        var hw_model: [64]u8 = @splat(0);
+        const model_slice = try readOptionalStringBuf("hw.model", &hw_model);
 
         return .{
             .page_size = try readUnsigned("hw.pagesize"),
@@ -133,6 +193,10 @@ pub const Facts = struct {
             .has_sme_f32f32 = try readOptionalFlagAny("hw.optional.arm.SME_F32F32", "hw.optional.arm.FEAT_SME_F32F32"),
             .has_sme_i16i64 = try readOptionalFlag("hw.optional.arm.FEAT_SME_I16I64"),
             .sme_max_svl_bytes = (try readOptionalUnsigned("hw.optional.arm.sme_max_svl_b")) orelse 0,
+            .cpu_brand = cpu_brand,
+            .cpu_brand_len = @intCast(brand_slice.len),
+            .hw_model = hw_model,
+            .hw_model_len = @intCast(model_slice.len),
         };
     }
 };
@@ -173,4 +237,43 @@ test "P-core L2 cluster topology and SME/SME2 capability probes are consistent" 
         try std.testing.expect(facts.has_sme_b16f32 and facts.has_sme_f16f32);
         try std.testing.expectEqual(@as(u64, 64), facts.sme_max_svl_bytes);
     }
+}
+
+test "readOptionalStringBuf populates host brand and model with zero allocations and handles ENOENT/ENOMEM" {
+    var buf: [96]u8 = @splat(0);
+    const brand = try readOptionalStringBuf("machdep.cpu.brand_string", &buf);
+    try std.testing.expect(brand.len > 0);
+    try std.testing.expect(std.mem.indexOfScalar(u8, brand, 0) == null);
+    try std.testing.expect(std.mem.indexOf(u8, brand, "Apple") != null);
+
+    var model_buf: [64]u8 = @splat(0);
+    const model = try readOptionalStringBuf("hw.model", &model_buf);
+    try std.testing.expect(model.len > 0);
+    try std.testing.expect(std.mem.indexOfScalar(u8, model, 0) == null);
+
+    // ENOENT returns empty slice cleanly.
+    const missing = try readOptionalStringBuf("aminfer.no_such_string_sysctl", &buf);
+    try std.testing.expectEqualStrings("", missing);
+
+    // ENOMEM (buffer too small for string) returns empty slice cleanly.
+    var tiny: [2]u8 = @splat(0);
+    const truncated = try readOptionalStringBuf("machdep.cpu.brand_string", &tiny);
+    try std.testing.expectEqualStrings("", truncated);
+
+    // Empty slice returns empty slice cleanly.
+    const empty_out = try readOptionalStringBuf("machdep.cpu.brand_string", &.{});
+    try std.testing.expectEqualStrings("", empty_out);
+
+    // Facts.collect() / Facts.read() populate cpuBrand() and hwModel().
+    const facts = try Facts.collect();
+    try std.testing.expectEqualStrings(brand, facts.cpuBrand());
+    try std.testing.expectEqualStrings(model, facts.hwModel());
+    try std.testing.expectEqual(@as(u8, @intCast(brand.len)), facts.cpu_brand_len);
+    try std.testing.expectEqual(@as(u8, @intCast(model.len)), facts.hw_model_len);
+
+    // Synthetic identity override works without mutating original facts.
+    const synthetic = facts.withIdentity("Apple M4 Max", "Mac16,5");
+    try std.testing.expectEqualStrings("Apple M4 Max", synthetic.cpuBrand());
+    try std.testing.expectEqualStrings("Mac16,5", synthetic.hwModel());
+    try std.testing.expectEqualStrings(brand, facts.cpuBrand());
 }

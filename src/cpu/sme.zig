@@ -346,6 +346,17 @@ pub const SmeCaps = struct {
         const total = @as(usize, @intCast(self.pcore_clusters)) * tpc;
         return @max(@as(usize, 1), @min(total, MAX_WORKERS));
     }
+
+    /// Host P-cluster L2 budget for compact L2-resident draft projections (`D13`, `C16`).
+    /// Uses probed `hw.perflevel0.l2cachesize` (`16 MiB` on M4, `12 MiB` on M1/M2,
+    /// larger on higher-tier / post-M4 chips if present) and falls back to
+    /// `MAX_L2_DRAFT_PROJ_BYTES` only when the kernel reports `0`.
+    pub fn draftL2BudgetBytes(self: SmeCaps) usize {
+        if (self.pcore_l2_bytes > 0) {
+            return @intCast(@min(self.pcore_l2_bytes, std.math.maxInt(usize)));
+        }
+        return MAX_L2_DRAFT_PROJ_BYTES;
+    }
 };
 
 // ============================================================================
@@ -2437,6 +2448,7 @@ pub fn calibrateSmeVsGpuUs(
 ) (Error || vmstat.Error)!SmeVsGpuCalibration {
     if (m == 0 or m > proj.max_m) return error.InvalidArgument;
     if (config.iters == 0 or config.iters > MAX_CALIBRATE_ITERS) return error.InvalidArgument;
+    const effective_backend = try dispatcher.caps.resolveBackend(config.backend);
 
     const mk = std.math.mul(usize, m, proj.weight.k) catch return error.Overflow;
     const x_u16 = proj.x_act_u16[0..mk];
@@ -2444,7 +2456,7 @@ pub fn calibrateSmeVsGpuUs(
         .cache_hint = .temporal,
         .epilogue = .none,
         .out_dtype = config.out_dtype,
-        .backend = config.backend,
+        .backend = effective_backend,
         .max_threads = config.max_threads,
     };
 
@@ -2466,7 +2478,7 @@ pub fn calibrateSmeVsGpuUs(
     return .{
         .sme_us = sme_us,
         .gpu_us = gpu_us,
-        .prefer_sme2 = fits_l2 and (sme_us < gpu_us * config.sme_win_ratio),
+        .prefer_sme2 = (effective_backend == .sme2) and fits_l2 and (sme_us < gpu_us * config.sme_win_ratio),
         .weight_bytes = proj.weight.byteSize(),
         .fits_l2 = fits_l2,
         .iters = config.iters,
@@ -3025,8 +3037,9 @@ pub fn runSpikeS7Standalone(allocator: std.mem.Allocator) SpikeS7Error!SpikeS7Re
     for (dram_cases) |dc| {
         const m: usize = dc.m;
         const w_bytes = try packedBlobBytes(dc.dtype, dram_n, dram_k);
-        // Rotate across enough independent slabs to exceed M4's 16 MiB L2 + 8 MiB SLC (> 40 MiB).
-        const min_working_bytes: usize = 48 * 1024 * 1024;
+        // Rotate across enough independent slabs to exceed host P-cluster L2 + SLC
+        // (48 MiB on 16 MiB L2 M4, scaling with `draftL2BudgetBytes()` on larger chips).
+        const min_working_bytes: usize = @max(@as(usize, 48 * 1024 * 1024), caps.draftL2BudgetBytes() * 3);
         const slabs: usize = @max(@as(usize, 2), (min_working_bytes + w_bytes - 1) / w_bytes);
         const total_slab_bytes = slabs * w_bytes;
         const w_ring = try allocator.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), total_slab_bytes);
@@ -3231,6 +3244,54 @@ test "SmeCaps probes host SME2 features and supports simulated M1-M3 fallback cl
     try std.testing.expectEqual(ExecutionBackend.scalar_fallback, fake_m1.default_backend);
     try std.testing.expectEqual(ExecutionBackend.scalar_fallback, try fake_m1.resolveBackend(null));
     try std.testing.expectError(error.Sme2Unsupported, fake_m1.resolveBackend(.sme2));
+    try std.testing.expectEqual(@as(usize, 12 * 1024 * 1024), fake_m1.draftL2BudgetBytes());
+
+    // Simulate a multi-cluster M5+ Max host (2 clusters x 6 P-cores, 24 MiB L2, SVL = 64 B).
+    const fake_m5_max = SmeCaps.fromFacts(.{
+        .page_size = page.APPLE_PAGE_SIZE,
+        .memory_bytes = 128 * 1024 * 1024 * 1024,
+        .performance_cores = 12,
+        .efficiency_cores = 4,
+        .user_wire_limit = 96 * 1024 * 1024 * 1024,
+        .global_user_wire_limit = 96 * 1024 * 1024 * 1024,
+        .gpu_wired_limit_mib = 0,
+        .pcore_physical_cpu = 12,
+        .pcore_cpus_per_l2 = 6,
+        .pcore_l2_cache_bytes = 24 * 1024 * 1024,
+        .pcore_clusters = 2,
+        .has_sme = true,
+        .has_sme2 = true,
+        .has_sme_b16f32 = true,
+        .has_sme_f16f32 = true,
+        .sme_max_svl_bytes = 64,
+    });
+    try std.testing.expect(fake_m5_max.supportsSme2());
+    try std.testing.expectEqual(ExecutionBackend.sme2, fake_m5_max.default_backend);
+    try std.testing.expectEqual(@as(usize, 8), fake_m5_max.recommendedThreads(4));
+    try std.testing.expectEqual(@as(usize, 24 * 1024 * 1024), fake_m5_max.draftL2BudgetBytes());
+
+    // Future silicon with non-64 B SVL falls back safely rather than executing 64 B panel64 asm.
+    const fake_svl128 = SmeCaps.fromFacts(.{
+        .page_size = page.APPLE_PAGE_SIZE,
+        .memory_bytes = 64 * 1024 * 1024 * 1024,
+        .performance_cores = 8,
+        .efficiency_cores = 4,
+        .user_wire_limit = 48 * 1024 * 1024 * 1024,
+        .global_user_wire_limit = 48 * 1024 * 1024 * 1024,
+        .gpu_wired_limit_mib = 0,
+        .pcore_physical_cpu = 8,
+        .pcore_cpus_per_l2 = 4,
+        .pcore_l2_cache_bytes = 0,
+        .pcore_clusters = 2,
+        .has_sme = true,
+        .has_sme2 = true,
+        .has_sme_b16f32 = true,
+        .has_sme_f16f32 = true,
+        .sme_max_svl_bytes = 128,
+    });
+    try std.testing.expect(!fake_svl128.supportsSme2());
+    try std.testing.expectEqual(ExecutionBackend.scalar_fallback, fake_svl128.default_backend);
+    try std.testing.expectEqual(MAX_L2_DRAFT_PROJ_BYTES, fake_svl128.draftL2BudgetBytes());
 }
 
 test "register-clobber canary verifies 0-bit corruption of x19..x28 and d8..d15 across all 30 SME2 entrypoints" {
@@ -4137,7 +4198,24 @@ test "D13: SmeDraftProjection evalFusedNormLinear, evalDualNormConcatLinear, eva
             .warmups = 2,
             .iters = 6,
         });
-        try std.testing.expect(slow_gpu.prefer_sme2);
+        try std.testing.expectEqual(disp.caps.supportsSme2(), slow_gpu.prefer_sme2);
+
+        // Simulated M1–M3 (!has_sme2) must never claim `prefer_sme2 == true`.
+        var fake_m1_caps = disp.caps;
+        fake_m1_caps.has_sme = false;
+        fake_m1_caps.has_sme2 = false;
+        fake_m1_caps.svl_bytes = 0;
+        fake_m1_caps.default_backend = .scalar_fallback;
+        var m1_disp = try SmeDispatcher.init(gpa, .{
+            .total_threads = 1,
+            .caps_override = fake_m1_caps,
+        });
+        defer m1_disp.deinit();
+        const m1_cal = try calibrateSmeVsGpuUs(&m1_disp, &proj, 8, std.mem.sliceAsBytes(out_cal), 100_000.0, .{
+            .warmups = 1,
+            .iters = 3,
+        });
+        try std.testing.expect(!m1_cal.prefer_sme2);
 
         const DummyGpu = struct {
             acc: u64 = 0,

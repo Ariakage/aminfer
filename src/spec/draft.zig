@@ -1516,7 +1516,9 @@ pub const SmallDraftModel = struct {
         const q_dim = model.config.qDim();
         const h = model.config.hidden_size;
         const l0 = model.layers[0];
-        const can_ane = (q_dim % metal.KV_TILE_ROW_ALIGN_F16 == 0) and
+        const dev_info = try model.device.info();
+        const can_ane = (dev_info.aneCoreCount() > 0) and
+            (q_dim % metal.KV_TILE_ROW_ALIGN_F16 == 0) and
             (h % metal.KV_TILE_ROW_ALIGN_F16 == 0);
         if (options.placement == .ane and can_ane) {
             const wf16 = try model.extractLinearWeightsF16(allocator, l0.shard_idx, l0.o_proj);
@@ -1975,8 +1977,10 @@ fn cpuEmbedLookupRows(embed: qwen3.LinearBinding, token_ids: []const u32, h: u32
     }
 }
 
-/// Packs a compact L2-resident (`<= 16 MiB`) `f16`/`bf16` projection (`fc` or `eh_proj`)
-/// into `sme2_panel64` once at startup and builds `SmeProjectionRuntime` (`D13`).
+/// Packs a compact L2-resident (`<= host P-cluster L2`) `f16`/`bf16` projection
+/// (`fc` or `eh_proj`) into `sme2_panel64` once at startup and builds
+/// `SmeProjectionRuntime` (`D13`, `C16`). Returns `null` on `M1–M3` (`!has_sme2`)
+/// or when the packed projection exceeds the host P-cluster L2 budget.
 fn tryInitSmeProjectionRuntime(
     allocator: std.mem.Allocator,
     blob: LoadedBlob,
@@ -1985,6 +1989,9 @@ fn tryInitSmeProjectionRuntime(
     max_m: u32,
     draft_budget: budget_mod.Budget,
 ) DraftLoadError!?*SmeProjectionRuntime {
+    const caps = try sme.SmeCaps.probe();
+    if (!caps.supportsSme2()) return null;
+
     const n: usize = blob.entry.shape[0];
     const k: usize = blob.entry.shape[1];
     if (k == 0 or (k % sme.GROUP_SIZE) != 0) return null;
@@ -1994,7 +2001,8 @@ fn tryInitSmeProjectionRuntime(
         else => return null,
     };
     const packed_bytes = sme.packedBlobBytes(panel_dt, n, k) catch return null;
-    if (packed_bytes > sme.MAX_L2_DRAFT_PROJ_BYTES) return null;
+    const l2_limit = caps.draftL2BudgetBytes();
+    if (packed_bytes > l2_limit) return null;
 
     const aligned_w = try page.alignUp(packed_bytes);
     draft_budget.checkPlan(aligned_w) catch return null;
@@ -2015,11 +2023,12 @@ fn tryInitSmeProjectionRuntime(
     };
     var proj = try sme.SmeDraftProjection.init(weight, .{
         .max_m = @min(@as(usize, max_m), sme.MAX_STEP_LORA_M),
+        .l2_limit_bytes = l2_limit,
         .budget_override = draft_budget,
     });
     errdefer proj.deinit();
 
-    var disp = try sme.SmeDispatcher.init(allocator, .{});
+    var disp = try sme.SmeDispatcher.init(allocator, .{ .caps_override = caps });
     errdefer disp.deinit();
 
     const cal_m: usize = @min(@as(usize, max_m), 4);
@@ -2141,6 +2150,40 @@ fn convertWeightBlobToF16(
     return out;
 }
 
+/// Pure per-chip `D5` ANE-vs-GPU winner selector (`ADR-0008`, `C16`).
+/// Prefers `.ane` strictly when both timings are finite/positive and `ane_us < gpu_us`;
+/// otherwise stays on `.gpu` with zero chip-generation hardcoding.
+pub fn selectD5Winner(ane_us: f64, gpu_us: f64) Placement {
+    if (std.math.isFinite(ane_us) and ane_us > 0.0 and
+        std.math.isFinite(gpu_us) and gpu_us > 0.0 and
+        ane_us < gpu_us)
+    {
+        return .ane;
+    }
+    return .gpu;
+}
+
+/// Pure multi-generation `D5` + `D13` auto-placement selector (`ADR-0008`, `ADR-0019`, `C16`).
+/// Handles `M1–M3` (`!has_sme2`), `M4` (`has_sme2`, `!has_nax`), and `M5+`
+/// (`has_sme2`, `has_nax`) purely from host capabilities and measured latencies.
+pub fn selectAutoPlacement(
+    can_ane: bool,
+    d5_ane_us: f64,
+    d5_gpu_us: f64,
+    has_sme2: bool,
+    sme_prefer: bool,
+    sme_us: f64,
+) Placement {
+    const d5_winner: Placement = if (can_ane) selectD5Winner(d5_ane_us, d5_gpu_us) else .gpu;
+    const best_d5_us: f64 = if (can_ane) @min(d5_ane_us, d5_gpu_us) else std.math.inf(f64);
+    if (has_sme2 and sme_prefer and std.math.isFinite(sme_us) and sme_us > 0.0 and
+        (!can_ane or sme_us <= best_d5_us))
+    {
+        return .cpu_sme2;
+    }
+    return d5_winner;
+}
+
 /// Startup D5 placement micro-calibration (ADR-0008): compares zero-copy
 /// `GPU -> IOSurface -> ANE -> IOSurface -> GPU` round-trip latency against
 /// in-command-buffer GPU `encodeLinearGemv` on `layers[0].o_proj`.
@@ -2239,7 +2282,7 @@ fn calibrateD5Placement(
     const gt1 = try vmstat.nowNs();
     const gpu_us = (@as(f64, @floatFromInt(gt1 - gt0)) / @as(f64, @floatFromInt(@as(u64, iters) * dispatches_per_frame))) / 1000.0;
 
-    const winner: Placement = if (ane_us < gpu_us) .ane else .gpu;
+    const winner: Placement = selectD5Winner(ane_us, gpu_us);
     return .{ .ane_us = ane_us, .gpu_us = gpu_us, .winner = winner };
 }
 
@@ -2657,7 +2700,9 @@ fn loadInternal(
     var sme2_proj_bytes: usize = 0;
     var wired_total_out: u64 = total_wired_bytes;
 
-    const can_ane = (l0_o_proj_dtype == .f16 or l0_o_proj_dtype == .bf16) and
+    const dev_info = try target.device.info();
+    const can_ane = (dev_info.aneCoreCount() > 0) and
+        (l0_o_proj_dtype == .f16 or l0_o_proj_dtype == .bf16) and
         (q_dim % metal.KV_TILE_ROW_ALIGN_F16 == 0) and
         (h % metal.KV_TILE_ROW_ALIGN_F16 == 0);
 
@@ -2756,7 +2801,14 @@ fn loadInternal(
             gate_sme2_us = sme_cal.sme_us;
             if (gate_gpu_us == 0.0) gate_gpu_us = sme_cal.gpu_us;
             sme2_proj_bytes = sme_cal.weight_bytes;
-            if (sme_cal.prefer_sme2 and (!can_ane or sme_cal.sme_us <= best_us)) {
+            if (selectAutoPlacement(
+                can_ane,
+                gate_ane_us,
+                gate_gpu_us,
+                sp.dispatcher.caps.supportsSme2(),
+                sme_cal.prefer_sme2,
+                sme_cal.sme_us,
+            ) == .cpu_sme2 and (!can_ane or sme_cal.sme_us <= best_us)) {
                 if (ane_proj) |*ap| {
                     ap.close(&target.compute);
                     ane_proj = null;
@@ -3645,4 +3697,27 @@ test "D13: Placement.cpu_sme2 executes EAGLE-3 fc & MTP eh_proj on P-core SME2 w
     try mtp_sme.syncAccepted(&target, &prompt, target.accepted_top_bind, 0, 4);
     try std.testing.expectEqual(@as(u64, 1), mtp_sme.sme2_eval_count);
     try std.testing.expectEqual(mtp_gpu.rootCandidates()[0].token_id, mtp_sme.rootCandidates()[0].token_id);
+}
+
+test "C16: D5 and D13 placement selectors are generation-agnostic across M1-M3, M4, and M5+" {
+    // D5 ANE-vs-GPU winner strictly follows measured latency (and guards non-finite/zero inputs).
+    try std.testing.expectEqual(Placement.ane, selectD5Winner(18.0, 24.0));
+    try std.testing.expectEqual(Placement.gpu, selectD5Winner(24.0, 24.0));
+    try std.testing.expectEqual(Placement.gpu, selectD5Winner(30.0, 12.0));
+    try std.testing.expectEqual(Placement.gpu, selectD5Winner(0.0, 12.0));
+    try std.testing.expectEqual(Placement.gpu, selectD5Winner(std.math.nan(f64), 12.0));
+
+    // M1-M3 (!has_sme2): never selects .cpu_sme2 even if sme_prefer were passed.
+    try std.testing.expectEqual(Placement.ane, selectAutoPlacement(true, 18.0, 25.0, false, true, 5.0));
+    try std.testing.expectEqual(Placement.gpu, selectAutoPlacement(true, 35.0, 20.0, false, true, 5.0));
+    try std.testing.expectEqual(Placement.gpu, selectAutoPlacement(false, 0.0, 0.0, false, true, 5.0));
+
+    // M4 (has_sme2, !has_nax): prefers .cpu_sme2 when L2-resident SME2 beats both GPU and ANE.
+    try std.testing.expectEqual(Placement.cpu_sme2, selectAutoPlacement(true, 30.0, 22.0, true, true, 12.0));
+    try std.testing.expectEqual(Placement.ane, selectAutoPlacement(true, 10.0, 22.0, true, true, 12.0));
+    try std.testing.expectEqual(Placement.cpu_sme2, selectAutoPlacement(false, 0.0, 0.0, true, true, 12.0));
+
+    // M5+ (has_sme2, has_nax): when faster GPU beats both ANE and SME2, routes cleanly to .gpu.
+    try std.testing.expectEqual(Placement.gpu, selectAutoPlacement(true, 28.0, 9.0, true, false, 12.0));
+    try std.testing.expectEqual(Placement.cpu_sme2, selectAutoPlacement(true, 28.0, 14.0, true, true, 11.0));
 }
