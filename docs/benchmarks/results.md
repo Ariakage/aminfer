@@ -3955,10 +3955,11 @@ serve.status=stopped serve.total_requests=20 serve.rejected_503=0 serve.cancelle
 ## M6 frontier hybrid sparse models, recurrent depth, large-MoE GSQ+RCO and off-GPU SME2 draft heads
 
 Measured on 2026-11-22 on the Apple M4 24 GiB baseline (`Mac16,12`, macOS 27.2,
-`18,186 MiB` wired budget, ReleaseFast at commit `8a4bc68`, `swapouts_delta = 0`
+`18,186 MiB` wired budget, ReleaseFast at commit `8a4bc68`, re-verified after
+audit remediation commits `750b56c` and `f6b4705` with `swapouts_delta = 0`
 across all timed decode and benchmark runs). All M6 code, Python packers, and
 real-checkpoint `.amf` builds landed across commits `1c75816`, `be75050`,
-`5baa49e`, `c93a5fa`, `7651cad`, `1af0f8d`, and `8a4bc68`.
+`5baa49e`, `c93a5fa`, `7651cad`, `1af0f8d`, `8a4bc68`, `750b56c`, and `f6b4705`.
 
 ### 1. Hybrid-sparse operators (`G8` GDN, `G9` QSA, `G10` 4-branch GR, `G7` 512E MoE) and `C10` PLE
 
@@ -4026,15 +4027,21 @@ L2 cap), so `D13` rejects `cpu_sme2` and retains `.gpu` (`252.6 us` vs ANE
 1. **`Qwen3-30B-A3B` heat-guided `2.700b` GSQ + RCO (`qwen3-30b-a3b-gsq-rco.amf`) vs uniform `3-bit` baseline (`qwen3-30b-a3b-3bit.amf`)**:
    - **Footprint & validation**: `verify-amf` passes (`18,867` tensors, `9.599 GiB`
      wired vs `12.443 GiB` baseline, saving `2.844 GiB` / `-22.9%` wired RAM;
-     `q2_affine` cold experts + `q3_affine` warm experts + `q4_affine` hot
-     experts and dense projections).
+     built from `Qwen3-30B-A3B-3bit` with `--cold-experts-per-layer 0`, exact
+     composition `bf16 = 193` norms, `q3_affine = 3,140` covering `embed_tokens`,
+     `lm_head`, `192` attention projections, `48` routers, and the `966` hottest
+     experts / `2,898` expert tensors kept lossless at `q3_affine`, and
+     `q2_affine = 15,534` covering `5,178` low-heat wired experts transcoded
+     with RCO; `0` `q4_affine` tensors and `0` cold NVMe experts).
    - **`bench-decode` (`seq_len = 512`, `16` steps)**: `9,927 MiB` wired vs
      `12,839 MiB` (`-2,912 MiB`, `-22.7%`), `1,190.7 MB/tok` vs `1,381.6 MB/tok`
      (`-13.8%`), `49.59 tok/s` (`20.164 ms/tok`, `0.390 ms/layer`,
      `swapouts_delta = 0`) vs `51.86 tok/s` (`19.282 ms/tok`, `0.402 ms/layer`)
      on uniform 1-bucket `3-bit`. The `-4.4%` throughput delta comes from
-     3-bucket heterogeneous `{q2, q3, q4}` MoE dispatch overhead and `1.456 ms`
-     `lm_head` timing versus the single-bucket `q3` baseline.
+     scheme-bucketed MoE dispatch (`ami_moe_route_topk_bucketed` plus 2 active
+     `{q2, q3}` scheme buckets, since `scheme_counts[q4_affine] == 0` and
+     `encodeGateUpDownHetero` skips `q4`) and `1.456 ms` `lm_head` timing versus
+     the single-bucket `q3` baseline.
    - **Bilingual EN/ZH output quality & `EAGLE-3` `spec-decode`**: coherent
      outputs on EN capital (`53.06 tok/s`: `Paris is the capital of France.`),
      ZH capital (`49.25 tok/s`: `北京是中国的首都。`), and 38-token EN M4 explanation
@@ -4042,9 +4049,9 @@ L2 cap), so `D13` rejects `cpu_sme2` and retains `.gpu` (`252.6 us` vs ANE
      (`10,968 MiB` wired, L2 SME2 router `70.2 us` vs GPU `987.8 us`),
      `spec-decode` produces `38/38` bit-exact tokens at `tau = 1.682` and
      `38.66 tok/s` (slower than `48.93 tok/s` serial on this 38-token prompt
-     because 3-bucket `verify_ms = 31.736 ms` plus `draft_ms = 5.646 ms` and
-     `commit_sync = 5.794 ms` exceeds the `1.682x` acceptance factor;
-     `swapouts_delta = 0`).
+     because 2-bucket `{q2, q3}` `verify_ms = 31.736 ms` plus `draft_ms =
+     5.646 ms` and `commit_sync = 5.794 ms` exceeds the `1.682x` acceptance
+     factor; `swapouts_delta = 0`).
 
 2. **`Qwen3-0.6B` `0x0101` `ZT0` `LUT16` SME2 (`qwen3-0.6b-lut16-sme2.amf`) vs affine `qwen3-0.6b-gsq-rco-sme2.amf` and `D8` `14B` draft**:
    - **Offline quantization trade-off**: on clustered or bimodal synthetic
