@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M6.5 — continuous batching, long-context KV tiering, shared prefix caching, and zero-copy multimodal ingress (`R5`, `R8`, `G14`, `C14`) completed (2026-11-22); next: **M6.8 — configurable wide-chunk GPU prefill, lossless `prompt_tail` pruning, serving QoS, ChatML boundary prefix caching, live non-anonymous RAM admission, and startup `.metallib` canary (`R9`, `G15`, `G16`, `C15`; [ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md))**, followed by **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`)**.
+M6.8 — configurable wide-chunk GPU prefill, lossless `prompt_tail` pruning, serving QoS, ChatML message-boundary prefix caching, live non-anonymous RAM admission, and startup `.metallib` canary (`R9`, `G15`, `G16`, `C15`; [ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)) completed (2026-11-22); next: **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`)**.
 
 ## Milestones
 
@@ -25,7 +25,7 @@ Status-row IDs refer to [status.md](status.md).
 | M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Completed |
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`), recurrent depth & heterogeneous MoE scaling | R6, W9, W10, W16, W17, G7–G9, G10 (GR), D12, D13, C10 (PLE) | Composable operator graph + `LoopSchedule` (`GDN S_tmp` isolation, `SelfSpecRecurrent`, L2 SME2 `Step-LoRA`); synthetic + scale-calibrated `qwen4_exp` (GDN + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end without swap; `Qwen3-30B-A3B` & 512-expert GSQ+RCO + `ZT0` non-uniform LUTs and `Placement.cpu_sme2` draft heads benchmarked | Completed |
 | M6.5 | Continuous batching, long-context KV tiering & zero-copy multimodal ingress | R5, R8, G14, C14 | Server iteration-level continuous batching (`M > 1` slots per GPU/SME2 pass), shared prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang` packs, and `VideoToolbox → IOSurface → MTLTexture` zero-copy vision/video ingress verified without swap | Completed |
-| M6.8 | Wide-chunk GPU prefill, `prompt_tail` pruning, serving QoS & live-RAM / `.metallib` guards | R9, G15, G16, C15 | Default-on `--gpu-prefill-mode wide\|tree64` (`512+` FlashAttention + `BM=64, BN=64` GEMM, direct `KvTile` write) & lossless `prompt_tail` pruning verified bit-consistent vs `tree64`; single-request wide-prefill/`verifyTree` scratch aliasing; default-on `--decode-share`, `--adaptive-prefill-narrow`, and `--message-boundary-cache` `PrefixCache` checkpoints benchmarked under concurrent load; `HOST_VM_INFO64` non-anonymous live RAM soft cache scaling (`+ --strict-live-ram`) & `< 0.1 ms` startup `.metallib` canary + `Apple10` `NAX` hook verified without swap | Planned |
+| M6.8 | Wide-chunk GPU prefill, `prompt_tail` pruning, serving QoS & live-RAM / `.metallib` guards | R9, G15, G16, C15 | Default-on `--gpu-prefill-mode wide\|tree64` (`512+` FlashAttention + `BM=64, BN=64` GEMM, direct `KvTile` write) & lossless `prompt_tail` pruning verified bit-consistent vs `tree64`; single-request wide-prefill/`verifyTree` scratch aliasing; default-on `--decode-share`, `--adaptive-prefill-narrow`, and `--message-boundary-cache` `PrefixCache` checkpoints benchmarked under concurrent load; `HOST_VM_INFO64` non-anonymous live RAM soft cache scaling (`+ --strict-live-ram`) & `< 0.1 ms` startup `.metallib` canary + `Apple10` `NAX` hook verified without swap | Completed |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
 ## Spikes
@@ -488,6 +488,37 @@ Key M6.5 measurements on Apple M4 24 GiB (commits `9f1efa7..990d2a4`, ReleaseFas
     - `Qwen3-0.6B` GSQ+RCO (`32` tok/req): `C = 8` aggregate throughput increases `3.94x` (`131.68 -> 518.75 tok/s`) and TTFT p50/p99 drops from `1,035.62 / 1,786.04 ms` to `83.01 / 130.08 ms` (`12.5x–13.7x` lower), while per-slot TPOT rises from `4.95` to `13.72 ms`.
   - `DomainNgramRegistry` with real `aminfer-repo.ang` (`879,949` entries) and `aminfer-docs.ang` (`198,113` entries): `528 KiB` wired cache, `F_NOCACHE` lookup (`verify_table_crc = false`, `F_NOCACHE` key probe bypassing XNU UBC) `257.88 us` p50 / `418.92 us` p99 (external-SSD controller DRAM may still warm from the preceding key probe vs `396–1,208 us` cold NAND flash reads in M5), cache hit `0.05 us`, `selectDefaultDomain` `3.6 ns`, atomic `swapDomainPack` `305.75 us`, `steady_malloc_blocks = 0`; live `GET /v1/ngram-packs`, `POST /v1/ngram-packs/select`, and per-request `"ngram_domain"` (`200` / `400`) verified.
 
+## M6.8 task list
+
+- [x] `R9` live `HOST_VM_INFO64` non-anonymous RAM snapshot (`src/bench/vmstat.zig`), soft wired-cache auto-sizing + opt-in `--strict-live-ram` admission (`src/mem/budget.zig`), `WiredArena.allocAliasedPair` single-request wide-prefill / `verifyTree` scratch aliasing (`src/mem/arena.zig`), and `C15` continuous-batching `decode-share` wall-time QoS ledger, depth-scaled chunk narrowing (`512 -> 256 -> 128`), evict-first `PrefixCache` message-boundary checkpoints, and zero-alloc ChatML boundary extraction (`src/runtime/{batch_scheduler,prefix_cache}.zig`, `src/server/http_sse.zig`) (`ec1a3b7`)
+- [x] `G15` wide-chunk (`512–1024`) `BM=64, BN=64` GEMM (`src/kernels/dequant_gemm.metal`, `src/gpu/dequant.zig`), direct bindless `KvTile` QK-Norm/RoPE/KV-write + causal FlashAttention (`src/kernels/attention.metal`, `src/gpu/attention.zig`), wide hybrid `GDN` / `QSA` / `128`-token circular SWA (`src/kernels/hybrid_ops.metal`, `src/gpu/hybrid.zig`), and `G16` startup `.metallib` numerical canary (`f16`/`bf16`/`q4`) + `Apple10` (`NAX`) capability probe & dispatch hook reservation (`src/bridge/{apple_bridge.h,apple_bridge.m,metal.zig}`) (`356f654`)
+- [x] Real-model `Qwen3Model`/`Qwen3BatchRuntime`, `GraphModel`/`GraphBatchRuntime`, and `SpecEngine` integration (`src/root.zig`, `src/model/{qwen3,graph}.zig`, `src/spec/engine.zig`): default-on `--gpu-prefill-mode wide|tree64`, lossless `prompt_tail` final-layer compute pruning, single-request scratch aliasing (keeping `lm_head` 100% wired), startup canary gating, live-RAM soft cache sizing, and ChatML message-boundary `PrefixCache` checkpoints (`f70becf`)
+- [x] CLI, `aminfer probe`, `aminfer serve`, and `aminfer bench-m68` integration (`src/main.zig`, `src/bench/runner.zig`), plus Metal 4 `@autoreleasepool` destroy draining (`src/bridge/apple_bridge.m`) and explicit `WiredRegion` `munlock` (`src/mem/page.zig`) (`ad3ee7f`, `2063bc9`)
+- [x] ReleaseFast hardware verification (`aminfer probe`, `aminfer bench-m68`, standalone `aminfer bench-decode` `tree64` vs `wide` A/B on real `Qwen3-0.6B` GSQ+RCO, `Qwen3-14B-4bit`, and `Qwen3-30B-A3B` GSQ+RCO, and live `aminfer serve` multi-turn ChatML boundary cache + concurrent `~9.4K` QoS smoke check) archived in [benchmarks/results.md](benchmarks/results.md#m68-wide-chunk-gpu-prefill-prompt_tail-pruning-serving-qos-live-ram-admission-and-metallib-canary)
+
+## M6.8 wide-chunk GPU prefill, prompt_tail pruning, serving QoS and live-RAM results
+
+Canonical tables, honest trade-off notes, and unedited multi-line verbatim CLI
+and server outputs live in
+[benchmarks/results.md](benchmarks/results.md#m68-wide-chunk-gpu-prefill-prompt_tail-pruning-serving-qos-live-ram-admission-and-metallib-canary).
+Key M6.8 measurements on Apple M4 24 GiB (commits `ec1a3b7..2063bc9`,
+ReleaseFast, `18,186 MiB` static wired budget, `swapouts_delta = 0` across all
+runs):
+
+- **`G16` startup `.metallib` numerical canary & `Apple10` (`NAX`) probe**:
+  - `aminfer probe` and `bench-m68` report `gpu.supports_apple10 = no` and `gpu.prefill_matmul_backend = simdgroup_apple9` on M4 (`Apple9`, `Apple10` NAX hook reserved cleanly).
+  - Cold first-submit startup canary completes in `2,319.4–2,355.0 us` (`1,325.2–3,780.0 us` in `bench-decode`) with `max_abs_err`: `f16 = 0.000023`, `bf16 = 0.001953`, `q4 = 0.000028`; corrupted-slice negative check passes (`corrupted_slice_rejected = yes`).
+- **`G15` wide-chunk GPU prefill + `prompt_tail` pruning & `R9` scratch aliasing**:
+  - Single-load `bench-m68` A/B (`tree64` vs `wide` + pruning, `100%` `greedy = yes` across all 7 rows): `qwen3-0.6b-bf16` `1.84x` (`512`, `2,467.5 tok/s`) / `1.74x` (`2,048`, `1,981.1 tok/s`); `qwen3-0.6b-gsq-rco` `2.75x` (`512`, `2,596.2 tok/s`) / `2.29x` (`2,048`, `1,956.8 tok/s`); `qwen3-14b-4bit` `2.08x` (`512`, `7,401.37 ms`, `69.2 tok/s`, `alias = 78.02 MiB`); `qwen3-30b-a3b-gsq-rco` `1.29x` (`512`, `2,543.60 ms`, `201.3 tok/s`, `alias = 53.34 MiB`); synthetic `qwen4_exp-512e-R2` `2.05x` (`512`, `14,749.6 tok/s`, `alias = 2.06 MiB`).
+  - Real `EAGLE-3` wide prefill + aliased `verifyTree` transition (`qwen3-30b-a3b-gsq-rco`, `prompt = 480`, `gen = 16`): `wide_prefill_ms = 2,503.53`, `spec_tok_s = 84.74`, `mean_accept = 5.00`, `alias_mib = 53.34`, `greedy_match = yes`.
+  - Fresh-process standalone `bench-decode` (`512` tokens, `tree64` vs `wide`, `swapouts_delta = 0`): `qwen3-0.6b-gsq-rco` `541.84 -> 222.49 ms` (`2.44x`, `2,301.26 tok/s`, `-38 MiB` wired); `qwen3-14b-4bit` `12,537.84 -> 5,604.32 ms` (`2.24x`, `91.36 tok/s`, `-37 MiB` wired); `qwen3-30b-a3b-gsq-rco` `3,469.70 -> 2,729.46 ms` (`1.27x`, `187.58 tok/s`, `-39 MiB` wired), while keeping `lm_head` 100% wired.
+- **`C15` serving QoS, adaptive prefill narrowing & ChatML message-boundary `PrefixCache`**:
+  - `bench-m68` QoS (`qwen3-0.6b-gsq-rco`, `10,240`-tok background prefill + 2 foreground decode streams): `decode_tpot_p50` drops from `551.44` to `5.52 ms` (`99.9x`) and `p99` drops from `1,025.19` to `218.27 ms` (`4.70x` lower) at `+6.2%` background TTFT (`12,342.7 -> 13,111.3 ms`).
+  - `bench-m68` ChatML boundary cache (`boundary_pos = 359` below first `512`-tok tile): `0/383 -> 359/383` prefix hits, TTFT `189.73 -> 30.67 ms` (`6.19x` faster, `greedy_match = yes`), `evict_first = 1`, `canonical_512_survived = yes`.
+  - Live `aminfer serve` HTTP/SSE (`qwen3-0.6b-gsq-rco.amf`, `--max-seq-len 10240 --decode-share 0.50 --adaptive-prefill-narrow on --message-boundary-cache on`): multi-turn ChatML Turn 1 -> Turn 2 TTFT drops `335.38 -> 31.40 ms` (`10.68x`, `boundary_checkpoints = 1`, `boundary_hits = 1`, `evict_first_evictions = 1`); concurrent `~9.4K` background prefill + 8 back-to-back foreground streams achieve `fg_tpot_p50 = 5.06 ms`, `fg_tpot_p99 = 500.97 ms`, `qos_steps = decode=212 prefill=5 narrowed_chunks=2`, `swapouts_delta = 0`.
+- **`R9` live non-anonymous RAM admission & soft wired-cache auto-sizing**:
+  - `probe` / `bench-m68` live reclaimable RAM: `10,996–10,998 MiB` (`free + speculative + purgeable + external`, excluding `inactive`, `internal`, `compressor`, `wired`); soft cache auto-sizing scales `64 -> 16` chunks under tight headroom (`cache_scaled_down = yes`), `--strict-live-ram` refuses oversubscribed admissions (`strict_live_ram_rejected = yes`), and `infer_swapouts_delta = total_swapouts_delta = 0`.
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -532,6 +563,8 @@ Only checks that actually ran are listed.
 | 2026-11-22 | M6 audit remediation (`750b56c`, `f6b4705`): `r = 0` cross-token GDN state sharing (`ami_gdn_conv1d_q_silu` + `encodeGdnConv1dQSilu`), `ami_gdn_decode` `out_norm` `half`-staging alignment, per-token `r0_selected` cold-expert `r >= 1` masking, unaligned synthetic draft builder write fix, and 4-layer `qwen4_exp` (`R = 3`, `core = [0, 4)`) chunk-invariance + 16-token `self-recurrent` regression test; `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 268/268 = 263 lib + 5 CLI), direct Debug lib + CLI under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (268/268, 0 validation errors), ReleaseFast CLI bit-exact parity on both `synth-loop --preset tiny-steplora --base-arch qwen4_exp --max-loops 3` (`8/8`) and `synth-qwen4 --preset tiny-qwen4 --num-layers 4 --cold-experts-per-layer 2 --max-loops 3` (`24/24` across `decode`, `self-recurrent`, and `mtp`), and ReleaseFast `aminfer bench-m6` re-check (`0` swapouts) | Pass |
 | 2026-11-22 | M6.5 Phase 1 (`9f1efa7`, `1364da5`, `bb6dfcf`, `c004372`): `G14` `VideoToolbox`/`ImageIO` zero-copy `IOSurface` bridge & `vision_ingress.metal` (`src/gpu/vision.zig`), `C14` `BatchScheduler` + `Server.startBatched` + hot-swappable `DomainNgramRegistry` (`/v1/ngram-packs*`), `R5` `RetiredKvQ8Pool` + tiered `q8` GQA/QSA kernels, `R8` wired `PrefixCache` + GPU CoW + `GdnSnapshotPool`, and `C14` batched slot decode kernels | Pass |
 | 2026-11-22 | M6.5 Phase 2 & audit remediation (`abb552c`, `f0640ae`, `6a5869a`, `60dc7ec`, `8332ee8`, `37ecb74`, `ac5b4e3`, `c4c319f`, `990d2a4`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug, ReleaseSafe x2 uncached, ReleaseFast: `300/300` = `294` lib + `6` CLI), filtered `test-vision` (`11/11`), `test-hybrid` (`13/13`), and `test-sme` (`10/10`) in Debug and ReleaseSafe, direct Debug `test-vision` (`11/11`), `test-hybrid` (`13/13`), `test-sme` (`10/10`), lib (`294/294`), and CLI (`6/6`) binaries under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (API + GPU Validation enabled, `0` errors), `tools` unittest (`72/72`), built `aminfer-docs.ang` (`32.02 MiB`, `198,113` entries), ReleaseFast `aminfer bench-m65` (with `F_NOCACHE` key probe and `verify_table_crc = false`: `ngram.cold_query_us p50=257.88 / p99=418.92`), live `aminfer serve` serial vs continuous (`C = 1/4/8`, `Qwen3-0.6B` BF16 `7.60x` & GSQ+RCO `3.94x`, `D11` bit-exact), live `R8` `PrefixCache` (`8.87x` TTFT p50), live multi-pack `.ang` HTTP API, real `Qwen3-0.6B` BF16 `R5` >1,024-tok decode (`25/25` bit-exact, `-52 MiB`, `+3.8%` tok/s), and `G14` `qwen4_exp` HW HEVC multimodal decode (`0` swapouts across all runs) archived in [benchmarks/results.md](benchmarks/results.md#m65-continuous-batching-long-context-kv-tiering-shared-prefix-cache-and-zero-copy-multimodal-ingress) | Pass |
+| 2026-11-22 | M6.8 Phase 1 (`ec1a3b7`, `356f654`): `R9` live `HOST_VM_INFO64` non-anonymous RAM admission (`vmstat`, `budget`) & `WiredArena.allocAliasedPair`; `C15` `decode-share` QoS ledger, depth-scaled chunk narrowing, evict-first `PrefixCache` boundary checkpoints & ChatML boundary parser; `G15` wide-chunk `BM=64, BN=64` GEMM, direct bindless `KvTile` FlashAttention & wide hybrid `GDN`/`QSA`/SWA kernels; `G16` startup `.metallib` numerical canary (`f16`/`bf16`/`q4`) & `Apple10` (`NAX`) capability probe | Pass |
+| 2026-11-22 | M6.8 Phase 2 & final gate (`f70becf`, `ad3ee7f`, `2063bc9`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug, ReleaseSafe, ReleaseFast: `326/326` = `319` lib + `7` CLI), filtered `test-vision` (`11/11`), `test-hybrid` (`16/16`), and `test-sme` (`10/10`) in Debug and ReleaseSafe, direct Debug `test-vision` (`11/11`), `test-hybrid` (`16/16`), `test-sme` (`10/10`), lib (`319/319`), and CLI (`7/7`) binaries under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (Metal API + GPU Validation enabled, `0` errors), `tools` unittest (`72/72`), ReleaseFast `aminfer probe` (`supports_apple10=no`, `simdgroup_apple9`, `live_zero_swap_reclaimable_mib=10996`, `canary=pass`), ReleaseFast `aminfer bench-m68` (`1.29x–2.75x` wide+pruning across 6 real + 1 synth rows, `100%` greedy match, `EAGLE-3` `84.74 tok/s`, QoS `4.70x` p99 / `99.9x` p50 reduction, ChatML boundary `6.19x` TTFT, soft cache `64 -> 16`, `--strict-live-ram` rejection, `infer_swapouts_delta=0`, `total_swapouts_delta=0`), standalone `aminfer bench-decode` `tree64` vs `wide` A/B (`0.6B` `2.44x`, `14B` `2.24x`, `30B-A3B` `1.27x`, `-37..-39 MiB` wired, `0` swapouts), and live `aminfer serve` HTTP/SSE (`Turn 1 -> 2` `10.68x` TTFT, `boundary_hits=1`, `evict_first_evictions=1`, `qos_steps=decode=212 prefill=5 narrowed_chunks=2`, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m68-wide-chunk-gpu-prefill-prompt_tail-pruning-serving-qos-live-ram-admission-and-metallib-canary) | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -690,14 +723,25 @@ Update this before the context window runs out or when handing off.
     steady-state malloc check tolerance for async driver frees, `ac5b4e3` M6.5
     benchmark archive & close-out docs, `c4c319f` filtered real module tests
     for `test-vision`/`test-hybrid`/`test-sme`, `990d2a4` `F_NOCACHE` key probe
-    and skip pre-timing CRC scan in `bench-m65`
-- Current test & build baseline (`M0`–`M6.5` complete, `0` `catch {}`):
-  - Zig suite: `300/300` passing (`294` lib + `6` CLI) in `Debug`,
-    `ReleaseSafe` (2x uncached), and `ReleaseFast`; filtered `test-vision`
-    (`11/11`), `test-hybrid` (`13/13`), and `test-sme` (`10/10`) passing in
-    `Debug` and `ReleaseSafe`; direct Debug binaries under
+    and skip pre-timing CRC scan in `bench-m65`, `8d31ba2` M6.5 refreshed docs
+  - M6.8: `ca784d9` `ADR-0020` M6.8 roadmap codification, `ec1a3b7` `R9` live
+    non-anonymous RAM admission & `WiredArena.allocAliasedPair` + `C15` QoS
+    ledger, depth-scaled chunk narrowing & evict-first ChatML boundary
+    `PrefixCache`, `356f654` `G15` wide-chunk `BM=64, BN=64` GEMM, direct
+    bindless `KvTile` FlashAttention & wide hybrid kernels + `G16` startup
+    `.metallib` numerical canary & `Apple10` probe, `f70becf` `Qwen3Model` /
+    `GraphModel` / `SpecEngine` wide prefill, `prompt_tail` pruning, scratch
+    aliasing, canary & live-RAM wiring, `ad3ee7f` CLI/server M6.8 flags, `probe`
+    canary/live-RAM & `bench-m68` suite, `2063bc9` Metal 4 `@autoreleasepool`
+    destroy drain, explicit `WiredRegion` `munlock` & single-load `bench-m68`
+    polish
+- Current test & build baseline (`M0`–`M6.8` complete, `0` `catch {}`):
+  - Zig suite: `326/326` passing (`319` lib + `7` CLI) in `Debug`,
+    `ReleaseSafe`, and `ReleaseFast`; filtered `test-vision` (`11/11`),
+    `test-hybrid` (`16/16`), and `test-sme` (`10/10`) passing in `Debug` and
+    `ReleaseSafe`; direct Debug binaries under
     `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`test-vision` `11/11`,
-    `test-hybrid` `13/13`, `test-sme` `10/10`, lib `294/294`, CLI `6/6`,
+    `test-hybrid` `16/16`, `test-sme` `10/10`, lib `319/319`, CLI `7/7`,
     `0` validation errors)
   - Offline Python `tools/` suite: `72/72` passing (`cd tools && uv run python -m unittest discover -s tests`)
 - On-disk checkpoints & artifacts (strict rule: keep all `.amf`/`.ang`/`.mlpackage`
@@ -720,12 +764,9 @@ Update this before the context window runs out or when handing off.
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: none (`M0`–`M6.5` completed; next milestone is **M6.8** covering
-  `R9`, `G15`, `G16`, and `C15` per
-  [ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md),
-  followed by **M7** covering Ultra and cluster scale-out:
-  `DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10`
-  Engram, and `X1`–`X3` per
+- In flight: none (`M0`–`M6.8` completed; next milestone is **M7** covering
+  Ultra and cluster scale-out: `DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10`
+  mHC, `G11`, `D10`, `C10` Engram, and `X1`–`X3` per
   [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md))
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
