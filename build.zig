@@ -131,6 +131,15 @@ pub fn build(b: *std.Build) void {
     const run_vision_test = b.addRunArtifact(vision_test);
     b.step("test-vision", "Run M6.5 G14 zero-copy VideoToolbox/IOSurface vision ingress tests").dependOn(&run_vision_test.step);
 
+    // Dedicated M7 cluster transport & expert-parallel test step (`zig build test-cluster`),
+    // filtering `cluster.*` and `expert.source.*` tests from the root library module.
+    const cluster_test = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{ "cluster.", "expert.source." },
+    });
+    const run_cluster_test = b.addRunArtifact(cluster_test);
+    b.step("test-cluster", "Run M7 cluster transport (TB4 TCP / TB5 RDMA probe) and expert-parallel tests").dependOn(&run_cluster_test.step);
+
     const s7_main = aux_wf.add("s7_standalone_main.zig",
         \\const std = @import("std");
         \\const aminfer = @import("aminfer");
