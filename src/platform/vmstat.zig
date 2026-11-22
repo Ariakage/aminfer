@@ -4,6 +4,7 @@
 //! without spawning subprocesses or allocating on the heap.
 
 const std = @import("std");
+const page = @import("../mem/page.zig");
 
 const HOST_VM_INFO64: c_int = 4;
 
@@ -58,10 +59,17 @@ const MallocStatistics = extern struct {
 comptime {
     if (@sizeOf(VmStatistics64) != 152) @compileError("VmStatistics64 rev1 must be 152 bytes");
     if (@offsetOf(VmStatistics64, "pageouts") != 40) @compileError("VmStatistics64.pageouts offset mismatch");
+    if (@offsetOf(VmStatistics64, "purgeable_count") != 88) @compileError("VmStatistics64.purgeable_count offset mismatch");
+    if (@offsetOf(VmStatistics64, "speculative_count") != 92) @compileError("VmStatistics64.speculative_count offset mismatch");
     if (@offsetOf(VmStatistics64, "swapouts") != 120) @compileError("VmStatistics64.swapouts offset mismatch");
+    if (@offsetOf(VmStatistics64, "compressor_page_count") != 128) @compileError("VmStatistics64.compressor_page_count offset mismatch");
+    if (@offsetOf(VmStatistics64, "external_page_count") != 136) @compileError("VmStatistics64.external_page_count offset mismatch");
+    if (@offsetOf(VmStatistics64, "internal_page_count") != 140) @compileError("VmStatistics64.internal_page_count offset mismatch");
     if (@sizeOf(XswUsage) != 32) @compileError("XswUsage must be 32 bytes");
     if (@sizeOf(MallocStatistics) != 32) @compileError("MallocStatistics must be 32 bytes");
 }
+
+extern "c" var vm_kernel_page_size: usize;
 
 extern "c" fn host_statistics64(
     host_priv: std.c.mach_port_t,
@@ -106,6 +114,22 @@ pub const Snapshot = struct {
     swap_used_bytes: u64,
     swap_avail_bytes: u64,
     heap: HeapStats,
+    /// Kernel VM page size (`vm_kernel_page_size`, `16 KiB` on Apple Silicon).
+    page_size: u64 = page.APPLE_PAGE_SIZE,
+    /// Live Mach `HOST_VM_INFO64` page breakdown (ADR-0020 P1-B).
+    /// Note: XNU's `vm_statistics64.free_count` includes `speculative_count`, so
+    /// `capture()` normalizes `free_pages = vm.free_count -| vm.speculative_count`
+    /// (matching macOS `vm_stat`) so `free_pages + speculative_pages` never
+    /// double-counts speculative pages.
+    free_pages: u64 = 0,
+    speculative_pages: u64 = 0,
+    purgeable_pages: u64 = 0,
+    external_pages: u64 = 0,
+    inactive_pages: u64 = 0,
+    internal_pages: u64 = 0,
+    compressor_pages: u64 = 0,
+    wire_pages: u64 = 0,
+    active_pages: u64 = 0,
 
     pub fn capture() Error!Snapshot {
         const host = std.c.mach_host_self();
@@ -132,6 +156,11 @@ pub const Snapshot = struct {
         var mstats: MallocStatistics = std.mem.zeroes(MallocStatistics);
         malloc_zone_statistics(null, &mstats);
 
+        const kernel_page_size: u64 = if (vm_kernel_page_size > 0)
+            @intCast(vm_kernel_page_size)
+        else
+            page.APPLE_PAGE_SIZE;
+
         return .{
             .swapouts = vm.swapouts,
             .pageouts = vm.pageouts,
@@ -144,7 +173,30 @@ pub const Snapshot = struct {
                 .max_size_in_use = mstats.max_size_in_use,
                 .size_allocated = mstats.size_allocated,
             },
+            .page_size = kernel_page_size,
+            .free_pages = vm.free_count -| vm.speculative_count,
+            .speculative_pages = vm.speculative_count,
+            .purgeable_pages = vm.purgeable_count,
+            .external_pages = vm.external_page_count,
+            .inactive_pages = vm.inactive_count,
+            .internal_pages = vm.internal_page_count,
+            .compressor_pages = vm.compressor_page_count,
+            .wire_pages = vm.wire_count,
+            .active_pages = vm.active_count,
         };
+    }
+
+    /// Returns live RAM bytes that XNU can reclaim without compressing or
+    /// swapping anonymous memory (ADR-0020 P1-B):
+    /// strictly `(free_pages + speculative_pages + purgeable_pages + external_pages) * page_size`.
+    /// Explicitly excludes anonymous `inactive_pages` and `internal_pages`.
+    pub fn liveZeroSwapReclaimableBytes(self: Snapshot) u64 {
+        const ps: u64 = if (self.page_size > 0) self.page_size else page.APPLE_PAGE_SIZE;
+        const reclaimable_pages: u64 = self.free_pages +|
+            self.speculative_pages +|
+            self.purgeable_pages +|
+            self.external_pages;
+        return reclaimable_pages *| ps;
     }
 
     pub fn heapDelta(before: Snapshot, after: Snapshot) HeapDelta {
@@ -293,4 +345,52 @@ test "heapDelta computes positive and negative signed deltas and observes live m
 
     const shrink = heapDelta(during, after);
     try std.testing.expect(shrink.size_in_use <= -min_delta);
+}
+
+test "liveZeroSwapReclaimableBytes sums free+speculative+purgeable+external and excludes inactive/internal" {
+    const base = Snapshot{
+        .swapouts = 0,
+        .pageouts = 0,
+        .swap_total_bytes = 0,
+        .swap_used_bytes = 0,
+        .swap_avail_bytes = 0,
+        .heap = .{
+            .blocks_in_use = 0,
+            .size_in_use = 0,
+            .max_size_in_use = 0,
+            .size_allocated = 0,
+        },
+        .page_size = page.APPLE_PAGE_SIZE,
+        .free_pages = 100,
+        .speculative_pages = 25,
+        .purgeable_pages = 40,
+        .external_pages = 35,
+        .inactive_pages = 50_000,
+        .internal_pages = 80_000,
+        .compressor_pages = 12_000,
+        .wire_pages = 90_000,
+        .active_pages = 70_000,
+    };
+
+    const expected: u64 = (100 + 25 + 40 + 35) * @as(u64, page.APPLE_PAGE_SIZE);
+    try std.testing.expectEqual(expected, base.liveZeroSwapReclaimableBytes());
+
+    // Changing anonymous / non-reclaimable page buckets must not change the zero-swap pool.
+    var mutated = base;
+    mutated.inactive_pages = 999_999;
+    mutated.internal_pages = 999_999;
+    mutated.compressor_pages = 999_999;
+    mutated.wire_pages = 999_999;
+    mutated.active_pages = 999_999;
+    try std.testing.expectEqual(expected, mutated.liveZeroSwapReclaimableBytes());
+
+    // Live capture must report 16 KiB kernel page size and a consistent live page breakdown.
+    const live = try Snapshot.capture();
+    try std.testing.expectEqual(@as(u64, page.APPLE_PAGE_SIZE), live.page_size);
+    try std.testing.expect(live.wire_pages > 0);
+    try std.testing.expect(live.active_pages > 0);
+    try std.testing.expectEqual(
+        (live.free_pages + live.speculative_pages + live.purgeable_pages + live.external_pages) * live.page_size,
+        live.liveZeroSwapReclaimableBytes(),
+    );
 }

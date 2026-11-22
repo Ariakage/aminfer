@@ -193,6 +193,12 @@ pub const ServerConfig = struct {
     max_prefill_chunk_tokens: u32 = batch_sched.DEFAULT_MAX_PREFILL_CHUNK_TOKENS,
     /// Preallocated `u32` prompt token capacity per continuous-batching slot.
     max_prompt_tokens: usize = batch_sched.DEFAULT_MAX_PROMPT_TOKENS,
+    /// Enable ChatML pre-last-user message-boundary `PrefixCache` checkpoints (`C15`, ADR-0020).
+    message_boundary_cache: bool = true,
+    /// Target decode wall-time share (`0.0..=1.0`, `0.0` = off) under prefill/decode contention (`C15`, ADR-0020).
+    decode_share: f32 = batch_sched.DEFAULT_DECODE_SHARE,
+    /// Narrow background prefill chunks (`8K -> 256`, `16K -> 128`) while decode slots are active (`C15`, ADR-0020).
+    adaptive_prefill_narrow: bool = true,
     /// Optional hot-swappable multi-pack `.ang` NVMe domain registry exposed on `/v1/ngram-packs*`.
     ngram_registry: ?*ngram_nvme.DomainNgramRegistry = null,
 };
@@ -226,6 +232,10 @@ pub const ServerStats = struct {
     mean_batch_size: f64 = 0.0,
     prefix_hit_tokens: u64 = 0,
     prefix_hit_requests: u64 = 0,
+    qos_decode_steps: u64 = 0,
+    qos_prefill_steps: u64 = 0,
+    narrowed_prefill_chunks: u64 = 0,
+    message_boundary_checkpoints: u64 = 0,
 };
 
 /// Admitted inference job handed from the `kqueue` server thread to the inference
@@ -239,6 +249,10 @@ pub const InferenceJob = struct {
     /// Valid for the entire duration of `EngineHandler.generateFn` or until the
     /// slot finishes in `runBatchedWorkerLoop`.
     prompt: []const u8,
+    /// Exact byte offset in `prompt` immediately before the final ChatML `user`
+    /// turn (`<|im_start|>user\n`) on multi-turn requests (`>= 2` messages where
+    /// the final turn is `user`, `C15` ADR-0020); `null` otherwise.
+    last_user_msg_byte_offset: ?usize = null,
     /// Dedicated 32-byte `RequestRng` (`D11`) owned by this slot for this request.
     rng: *rng_mod.RequestRng,
     seed_used: u64,
@@ -261,8 +275,16 @@ pub const EngineHandler = struct {
 
 pub const InferenceBackend = EngineHandler;
 
-/// Iteration-level continuous-batching inference handler (`C14`) bridging HTTP ChatML
-/// requests and per-slot SSE `TokenStream`s with `batch_sched.BatchScheduler`.
+/// Zero-allocation tokenization result carrying both the total prompt token
+/// count and optional exact `message_boundary_token` mapped from
+/// `InferenceJob.last_user_msg_byte_offset` (`C15`, ADR-0020).
+pub const TokenizeResult = struct {
+    prompt_len: usize,
+    message_boundary_token: ?u32 = null,
+};
+
+/// Iteration-level continuous-batching inference handler (`C14` / `C15`) bridging
+/// HTTP ChatML requests and per-slot SSE `TokenStream`s with `batch_sched.BatchScheduler`.
 pub const BatchEngineHandler = struct {
     ctx: *anyopaque,
     /// Tokenizes `job.prompt` directly into the slot's preallocated `out_tokens` buffer,
@@ -272,6 +294,15 @@ pub const BatchEngineHandler = struct {
         job: *const InferenceJob,
         out_tokens: []u32,
     ) batch_sched.BackendError!usize,
+    /// Optional boundary-aware tokenizer (`C15`, ADR-0020): tokenizes `job.prompt`
+    /// into `out_tokens` and maps `job.last_user_msg_byte_offset` to an exact
+    /// token index (`message_boundary_token`) with zero heap allocation.
+    /// When `null`, `runBatchedWorkerLoop` invokes `tokenizeFn` with `message_boundary_token = null`.
+    tokenizeWithBoundaryFn: ?*const fn (
+        ctx: *anyopaque,
+        job: *const InferenceJob,
+        out_tokens: []u32,
+    ) batch_sched.BackendError!TokenizeResult = null,
     /// Detokenizes `token_id` into raw UTF-8 bytes in `out_bytes` (`0` heap allocs).
     detokenizeFn: *const fn (
         ctx: *anyopaque,
@@ -589,6 +620,9 @@ pub const ParsedRequest = struct {
     endpoint: Endpoint,
     model_len: u16,
     prompt_len: usize,
+    /// Exact byte offset in `prompt_buf` right before the final `<|im_start|>user\n`
+    /// turn on multi-turn chat requests (`>= 2` messages ending with a `user` turn).
+    last_user_msg_byte_offset: ?usize = null,
     max_tokens: u32,
     temperature: f32,
     seed: ?u64,
@@ -960,14 +994,20 @@ fn appendChatMlMessage(dst: *FixedWriter, role: []const u8, content_json: []cons
     try dst.writeAll("<|im_end|>\n");
 }
 
-fn appendMessagesArray(messages_json: []const u8, dst: *FixedWriter) ParseError!usize {
+const MessagesAppendResult = struct {
+    count: usize = 0,
+    last_msg_offset: usize = 0,
+    last_msg_is_user: bool = false,
+};
+
+fn appendMessagesArray(messages_json: []const u8, dst: *FixedWriter) ParseError!MessagesAppendResult {
     var r = JsonReader{ .src = messages_json };
     try r.expectByte('[');
     if (r.peek() == ']') {
         r.pos += 1;
-        return 0;
+        return .{};
     }
-    var count: usize = 0;
+    var result: MessagesAppendResult = .{};
     while (true) {
         try r.expectByte('{');
         var role_buf: [32]u8 = undefined;
@@ -1007,15 +1047,17 @@ fn appendMessagesArray(messages_json: []const u8, dst: *FixedWriter) ParseError!
         const role = role_slice orelse return error.MissingRequiredField;
         if (role.len == 0) return error.InvalidFieldValue;
         const content = content_slice orelse "\"\"";
+        result.last_msg_offset = dst.pos;
+        result.last_msg_is_user = std.mem.eql(u8, role, "user");
         try appendChatMlMessage(dst, role, content);
-        count += 1;
+        result.count += 1;
 
         const sep = r.peek() orelse return error.InvalidJson;
         if (sep == ',') {
             r.pos += 1;
         } else if (sep == ']') {
             r.pos += 1;
-            return count;
+            return result;
         } else {
             return error.InvalidJson;
         }
@@ -1208,27 +1250,42 @@ pub fn parseInferenceRequest(
     }
 
     var pw = FixedWriter.init(prompt_buf);
+    var total_messages: usize = 0;
+    var last_msg_offset: usize = 0;
+    var last_msg_is_user: bool = false;
 
     // Emit optional top-level system/instructions turn first (stateless `/v1/messages` & `/v1/responses`).
     if (system_slice) |sys_json| {
+        last_msg_offset = pw.pos;
+        last_msg_is_user = false;
         try appendChatMlMessage(&pw, "system", sys_json);
+        total_messages += 1;
     }
 
     switch (endpoint) {
         .chat_completions, .messages => {
             const msgs = messages_slice orelse return error.MissingRequiredField;
-            const n = try appendMessagesArray(msgs, &pw);
-            if (n == 0) return error.MissingRequiredField;
+            const res = try appendMessagesArray(msgs, &pw);
+            if (res.count == 0) return error.MissingRequiredField;
+            total_messages += res.count;
+            last_msg_offset = res.last_msg_offset;
+            last_msg_is_user = res.last_msg_is_user;
         },
         .responses => {
             const inp = input_slice orelse return error.MissingRequiredField;
             var ir = JsonReader{ .src = inp };
             const ch = ir.peek() orelse return error.InvalidJson;
             if (ch == '"') {
+                last_msg_offset = pw.pos;
+                last_msg_is_user = true;
                 try appendChatMlMessage(&pw, "user", inp);
+                total_messages += 1;
             } else if (ch == '[') {
-                const n = try appendMessagesArray(inp, &pw);
-                if (n == 0) return error.MissingRequiredField;
+                const res = try appendMessagesArray(inp, &pw);
+                if (res.count == 0) return error.MissingRequiredField;
+                total_messages += res.count;
+                last_msg_offset = res.last_msg_offset;
+                last_msg_is_user = res.last_msg_is_user;
             } else {
                 return error.InvalidFieldValue;
             }
@@ -1242,10 +1299,16 @@ pub fn parseInferenceRequest(
         try pw.writeAll("<|im_start|>assistant\n<think>\n\n</think>\n\n");
     }
 
+    const last_user_msg_byte_offset: ?usize = if (total_messages >= 2 and last_msg_is_user and last_msg_offset > 0)
+        last_msg_offset
+    else
+        null;
+
     return .{
         .endpoint = endpoint,
         .model_len = @intCast(model_len),
         .prompt_len = pw.pos,
+        .last_user_msg_byte_offset = last_user_msg_byte_offset,
         .max_tokens = max_tokens,
         .temperature = temperature,
         .seed = seed,
@@ -1909,6 +1972,10 @@ pub const Server = struct {
     total_slot_tokens: std.atomic.Value(u64),
     prefix_hit_tokens: std.atomic.Value(u64),
     prefix_hit_requests: std.atomic.Value(u64),
+    qos_decode_steps: std.atomic.Value(u64),
+    qos_prefill_steps: std.atomic.Value(u64),
+    narrowed_prefill_chunks: std.atomic.Value(u64),
+    message_boundary_checkpoints: std.atomic.Value(u64),
     next_request_id: u64,
 
     // Optional managed threads (when started via `start` / `startNetworkThread`).
@@ -1938,6 +2005,9 @@ pub const Server = struct {
             return error.InvalidConfig;
         }
         if (config.max_prefill_chunk_tokens == 0 or config.max_prompt_tokens == 0) {
+            return error.InvalidConfig;
+        }
+        if (std.math.isNan(config.decode_share) or config.decode_share < 0.0 or config.decode_share > 1.0) {
             return error.InvalidConfig;
         }
 
@@ -1979,6 +2049,9 @@ pub const Server = struct {
             .max_batch_size = eff_batch_size,
             .max_prefill_chunk_tokens = config.max_prefill_chunk_tokens,
             .max_prompt_tokens = config.max_prompt_tokens,
+            .decode_share = config.decode_share,
+            .adaptive_prefill_narrow = config.adaptive_prefill_narrow,
+            .message_boundary_cache = config.message_boundary_cache,
         }) catch |err| return switch (err) {
             error.InvalidConfig => error.InvalidConfig,
             error.OutOfMemory => error.OutOfMemory,
@@ -2139,6 +2212,10 @@ pub const Server = struct {
             .total_slot_tokens = .init(0),
             .prefix_hit_tokens = .init(0),
             .prefix_hit_requests = .init(0),
+            .qos_decode_steps = .init(0),
+            .qos_prefill_steps = .init(0),
+            .narrowed_prefill_chunks = .init(0),
+            .message_boundary_checkpoints = .init(0),
             .next_request_id = 1,
             .net_thread = null,
             .worker_thread = null,
@@ -2222,6 +2299,10 @@ pub const Server = struct {
             .mean_batch_size = mean_bs,
             .prefix_hit_tokens = self.prefix_hit_tokens.load(.acquire),
             .prefix_hit_requests = self.prefix_hit_requests.load(.acquire),
+            .qos_decode_steps = self.qos_decode_steps.load(.acquire),
+            .qos_prefill_steps = self.qos_prefill_steps.load(.acquire),
+            .narrowed_prefill_chunks = self.narrowed_prefill_chunks.load(.acquire),
+            .message_boundary_checkpoints = self.message_boundary_checkpoints.load(.acquire),
         };
     }
 
@@ -2331,6 +2412,10 @@ pub const Server = struct {
         self.total_slot_tokens.store(tel.total_slot_tokens, .release);
         self.prefix_hit_tokens.store(tel.prefix_hit_tokens, .release);
         self.prefix_hit_requests.store(tel.prefix_hit_requests, .release);
+        self.qos_decode_steps.store(tel.qos_decode_steps, .release);
+        self.qos_prefill_steps.store(tel.qos_prefill_steps, .release);
+        self.narrowed_prefill_chunks.store(tel.narrowed_prefill_chunks, .release);
+        self.message_boundary_checkpoints.store(tel.message_boundary_checkpoints, .release);
     }
 
     /// Single-slot inference worker loop (backward compatible with M5 `EngineHandler`):
@@ -2502,14 +2587,31 @@ pub const Server = struct {
                 };
 
                 const prompt_buf = self.batch_scheduler.slotPromptBuffer(free_bsid);
-                const prompt_len = handler.tokenizeFn(handler.ctx, &job, prompt_buf) catch {
-                    self.batch_slot_streams[free_bsid].fail("prompt tokenization failed");
-                    conn.worker_active.store(false, .release);
-                    self.wakeNetworkLoop();
-                    continue;
+                const tok_res: TokenizeResult = if (handler.tokenizeWithBoundaryFn) |f|
+                    f(handler.ctx, &job, prompt_buf) catch {
+                        self.batch_slot_streams[free_bsid].fail("prompt tokenization failed");
+                        conn.worker_active.store(false, .release);
+                        self.wakeNetworkLoop();
+                        continue;
+                    }
+                else blk: {
+                    const prompt_len = handler.tokenizeFn(handler.ctx, &job, prompt_buf) catch {
+                        self.batch_slot_streams[free_bsid].fail("prompt tokenization failed");
+                        conn.worker_active.store(false, .release);
+                        self.wakeNetworkLoop();
+                        continue;
+                    };
+                    break :blk .{ .prompt_len = prompt_len, .message_boundary_token = null };
                 };
 
-                self.batch_scheduler.enqueueInPlace(free_bsid, prompt_len, .{
+                const msg_boundary_tok: ?u32 = if (self.config.message_boundary_cache) blk: {
+                    if (tok_res.message_boundary_token) |b| {
+                        if (b > 0 and b < tok_res.prompt_len) break :blk b;
+                    }
+                    break :blk null;
+                } else null;
+
+                self.batch_scheduler.enqueueInPlace(free_bsid, tok_res.prompt_len, .{
                     .request_id = job.request_id,
                     .user_tag = job.slot_index,
                     .max_tokens = job.max_tokens,
@@ -2518,6 +2620,7 @@ pub const Server = struct {
                     .ignore_eos = job.ignore_eos,
                     .eos_token_ids = handler.eos_token_ids[0..handler.eos_token_count],
                     .ngram_domain = job.ngram_domain,
+                    .message_boundary_token = msg_boundary_tok,
                 }) catch {
                     self.batch_slot_streams[free_bsid].fail("failed to enqueue batch slot");
                     conn.worker_active.store(false, .release);
@@ -3399,6 +3502,7 @@ pub const Server = struct {
             .request_id = slot.request_id,
             .endpoint = endpoint,
             .prompt = slot.prompt_buf[0..parsed.prompt_len],
+            .last_user_msg_byte_offset = parsed.last_user_msg_byte_offset,
             .rng = &slot.rng,
             .seed_used = slot.seed_used,
             .seed_source = slot.seed_source,
@@ -5836,4 +5940,217 @@ test "C14 DomainNgramRegistry HTTP endpoints (GET /v1/ngram-packs, POST /v1/ngra
         try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
         try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
     }
+}
+
+test "C15 parseInferenceRequest extracts exact last_user_msg_byte_offset across chat/completions, responses, and messages" {
+    var prompt_buf: [2048]u8 = undefined;
+    var model_buf: [64]u8 = undefined;
+
+    // 1. /v1/chat/completions: 4-turn conversation ending in `user` -> offset right before final `<|im_start|>user\n`.
+    {
+        const body =
+            \\{"messages":[
+            \\  {"role":"system","content":"You are helpful."},
+            \\  {"role":"user","content":"First question"},
+            \\  {"role":"assistant","content":"First answer"},
+            \\  {"role":"user","content":"Edited second question"}
+            \\]}
+        ;
+        const p = try parseInferenceRequest(.chat_completions, body, "m", &prompt_buf, &model_buf);
+        const prompt = prompt_buf[0..p.prompt_len];
+        const off = p.last_user_msg_byte_offset orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(
+            "<|im_start|>user\nEdited second question<|im_end|>\n<|im_start|>assistant\n",
+            prompt[off..],
+        );
+        try std.testing.expectEqualStrings(
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nFirst question<|im_end|>\n<|im_start|>assistant\nFirst answer<|im_end|>\n",
+            prompt[0..off],
+        );
+    }
+
+    // 2. /v1/chat/completions: single user turn (< 2 messages) -> null.
+    {
+        const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Only turn\"}]}";
+        const p = try parseInferenceRequest(.chat_completions, body, "m", &prompt_buf, &model_buf);
+        try std.testing.expectEqual(@as(?usize, null), p.last_user_msg_byte_offset);
+    }
+
+    // 3. /v1/chat/completions: final turn is `assistant` (not `user`) -> null.
+    {
+        const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"},{\"role\":\"assistant\",\"content\":\"Hello\"}]}";
+        const p = try parseInferenceRequest(.chat_completions, body, "m", &prompt_buf, &model_buf);
+        try std.testing.expectEqual(@as(?usize, null), p.last_user_msg_byte_offset);
+    }
+
+    // 4. /v1/responses: top-level `instructions` + string `input` (>= 2 turns ending in user).
+    {
+        const body = "{\"instructions\":\"Be concise.\",\"input\":\"Compute 2+2\"}";
+        const p = try parseInferenceRequest(.responses, body, "m", &prompt_buf, &model_buf);
+        const prompt = prompt_buf[0..p.prompt_len];
+        const off = p.last_user_msg_byte_offset orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("<|im_start|>system\nBe concise.<|im_end|>\n", prompt[0..off]);
+        try std.testing.expect(std.mem.startsWith(u8, prompt[off..], "<|im_start|>user\nCompute 2+2<|im_end|>\n"));
+    }
+
+    // 5. /v1/responses: multi-turn `input` array without instructions.
+    {
+        const body = "{\"input\":[{\"role\":\"user\",\"content\":\"Turn 1\"},{\"role\":\"assistant\",\"content\":\"Ack\"},{\"role\":\"user\",\"content\":\"Turn 2\"}]}";
+        const p = try parseInferenceRequest(.responses, body, "m", &prompt_buf, &model_buf);
+        const prompt = prompt_buf[0..p.prompt_len];
+        const off = p.last_user_msg_byte_offset orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.startsWith(u8, prompt[off..], "<|im_start|>user\nTurn 2<|im_end|>\n"));
+    }
+
+    // 6. /v1/responses: bare single string `input` without `instructions` -> null.
+    {
+        const body = "{\"input\":\"Single turn\"}";
+        const p = try parseInferenceRequest(.responses, body, "m", &prompt_buf, &model_buf);
+        try std.testing.expectEqual(@as(?usize, null), p.last_user_msg_byte_offset);
+    }
+
+    // 7. /v1/messages: top-level `system` + `messages` ending in user, plus multi-turn messages.
+    {
+        const body = "{\"system\":\"System policy\",\"messages\":[{\"role\":\"user\",\"content\":\"Question A\"}]}";
+        const p = try parseInferenceRequest(.messages, body, "m", &prompt_buf, &model_buf);
+        const prompt = prompt_buf[0..p.prompt_len];
+        const off = p.last_user_msg_byte_offset orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("<|im_start|>system\nSystem policy<|im_end|>\n", prompt[0..off]);
+        try std.testing.expect(std.mem.startsWith(u8, prompt[off..], "<|im_start|>user\nQuestion A<|im_end|>\n"));
+    }
+    {
+        const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Q1\"},{\"role\":\"assistant\",\"content\":\"A1\"},{\"role\":\"user\",\"content\":\"Q2\"}]}";
+        const p = try parseInferenceRequest(.messages, body, "m", &prompt_buf, &model_buf);
+        const prompt = prompt_buf[0..p.prompt_len];
+        const off = p.last_user_msg_byte_offset orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.startsWith(u8, prompt[off..], "<|im_start|>user\nQ2<|im_end|>\n"));
+    }
+    {
+        const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Only user\"}]}";
+        const p = try parseInferenceRequest(.messages, body, "m", &prompt_buf, &model_buf);
+        try std.testing.expectEqual(@as(?usize, null), p.last_user_msg_byte_offset);
+    }
+}
+
+test "C15 Server forwards last_user_msg_byte_offset through BatchEngineHandler to BatchScheduler checkpoint split" {
+    const gpa = std.testing.allocator;
+
+    const BoundaryServerMock = struct {
+        saw_byte_offset: std.atomic.Value(usize) = .init(0),
+        saw_boundary_checkpoint: std.atomic.Value(u32) = .init(0),
+        checkpoint_end_pos: std.atomic.Value(u32) = .init(0),
+
+        fn tokenize(_: *anyopaque, job: *const InferenceJob, out_tokens: []u32) batch_sched.BackendError!usize {
+            const n = @min(job.prompt.len, out_tokens.len);
+            for (0..n) |i| out_tokens[i] = @as(u32, job.prompt[i]) + 1;
+            return n;
+        }
+
+        // Byte-level 1:1 tokenizer mapping `job.last_user_msg_byte_offset` directly to exact token index.
+        fn tokenizeWithBoundary(
+            ctx_raw: *anyopaque,
+            job: *const InferenceJob,
+            out_tokens: []u32,
+        ) batch_sched.BackendError!TokenizeResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            const n = @min(job.prompt.len, out_tokens.len);
+            for (0..n) |i| out_tokens[i] = @as(u32, job.prompt[i]) + 1;
+            var boundary: ?u32 = null;
+            if (job.last_user_msg_byte_offset) |off| {
+                self.saw_byte_offset.store(off, .release);
+                if (off > 0 and off < n) boundary = @intCast(off);
+            }
+            return .{
+                .prompt_len = n,
+                .message_boundary_token = boundary,
+            };
+        }
+
+        fn detokenize(_: *anyopaque, _: u32, out_bytes: []u8) []const u8 {
+            out_bytes[0] = 'X';
+            return out_bytes[0..1];
+        }
+
+        fn prefill(ctx_raw: *anyopaque, chunk: *const batch_sched.PrefillChunkView) batch_sched.BackendError!batch_sched.PrefillResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            if (chunk.is_message_boundary_checkpoint) {
+                _ = self.saw_boundary_checkpoint.fetchAdd(1, .acq_rel);
+                self.checkpoint_end_pos.store(chunk.start_pos + @as(u32, @intCast(chunk.tokens.len)), .release);
+            }
+            return .{ .first_token = if (chunk.is_final_chunk) 10 else 0 };
+        }
+
+        fn decode(_: *anyopaque, view: *const batch_sched.BatchStepView, out: []u32) batch_sched.BackendError!void {
+            for (0..view.batchSize()) |b| out[b] = 11;
+        }
+        fn release(_: *anyopaque, _: u16, _: u64) void {}
+
+        fn handler(self: *@This()) BatchEngineHandler {
+            return .{
+                .ctx = self,
+                .tokenizeFn = tokenize,
+                .tokenizeWithBoundaryFn = tokenizeWithBoundary,
+                .detokenizeFn = detokenize,
+                .backend = .{
+                    .ctx = self,
+                    .prefillSlotFn = prefill,
+                    .stepDecodeBatchFn = decode,
+                    .releaseSlotFn = release,
+                },
+            };
+        }
+    };
+
+    var mock = BoundaryServerMock{};
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "c15-boundary",
+        .max_conns = 4,
+        .max_active_requests = 4,
+        .max_batch_size = 4,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = 1024,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.startBatched(mock.handler());
+    defer srv.stop();
+
+    var req_buf: [1024]u8 = undefined;
+    var resp_buf: [4096]u8 = undefined;
+    const body = "{\"messages\":[{\"role\":\"system\",\"content\":\"System rules\"},{\"role\":\"user\",\"content\":\"Hello C15\"}],\"stream\":false,\"max_tokens\":2}";
+    const resp = try testHttpPostJson(srv.boundPort(), "/v1/chat/completions", body, &req_buf, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+
+    const expected_off: usize = "<|im_start|>system\nSystem rules<|im_end|>\n".len;
+    try std.testing.expectEqual(expected_off, mock.saw_byte_offset.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), mock.saw_boundary_checkpoint.load(.acquire));
+    try std.testing.expectEqual(@as(u32, @intCast(expected_off)), mock.checkpoint_end_pos.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), srv.stats().message_boundary_checkpoints);
+
+    // Turning `message_boundary_cache = false` must suppress boundary splitting.
+    var mock_off = BoundaryServerMock{};
+    const srv_off = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "c15-boundary-off",
+        .max_conns = 4,
+        .max_active_requests = 4,
+        .max_batch_size = 4,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = 1024,
+        .message_boundary_cache = false,
+        .apply_qos = false,
+    });
+    defer srv_off.deinit(gpa);
+    try srv_off.startBatched(mock_off.handler());
+    defer srv_off.stop();
+
+    const resp_off = try testHttpPostJson(srv_off.boundPort(), "/v1/chat/completions", body, &req_buf, &resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, resp_off, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expectEqual(@as(u32, 0), mock_off.saw_boundary_checkpoint.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), srv_off.stats().message_boundary_checkpoints);
+
+    // Invalid `decode_share` must fail `Server.init`.
+    try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{ .port = 0, .decode_share = -0.25 }));
+    try std.testing.expectError(error.InvalidConfig, Server.init(gpa, .{ .port = 0, .decode_share = 1.50 }));
 }

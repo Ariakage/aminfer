@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const page = @import("../mem/page.zig");
+const vmstat = @import("../platform/vmstat.zig");
 const rng_mod = @import("rng.zig");
 
 /// Maximum concurrent request slots managed by one `BatchScheduler`.
@@ -32,6 +33,19 @@ pub const MAX_STOP_TOKENS: usize = 4;
 pub const DEFAULT_MAX_PREFILL_CHUNK_TOKENS: u32 = 512;
 /// Default preallocated prompt token capacity per slot.
 pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 4096;
+/// Default target decode wall-time share under prefill/decode contention (`C15`, ADR-0020).
+pub const DEFAULT_DECODE_SHARE: f32 = 0.50;
+/// Prompt-depth threshold (`8,192` tokens) at which background prefill narrows to `256` tokens.
+pub const PREFILL_NARROW_DEPTH_MID: u32 = 8192;
+pub const PREFILL_NARROW_CHUNK_MID: u32 = 256;
+/// Prompt-depth threshold (`16,384` tokens) at which background prefill narrows to `128` tokens.
+pub const PREFILL_NARROW_DEPTH_DEEP: u32 = 16384;
+pub const PREFILL_NARROW_CHUNK_DEEP: u32 = 128;
+/// Rolling QoS wall-time window (`1 s`) before exponential halving decay.
+pub const DEFAULT_QOS_WINDOW_NS: u64 = 1_000_000_000;
+
+/// Optional monotonic nanosecond clock callback for deterministic QoS tests.
+pub const ClockFn = *const fn (ctx: ?*anyopaque) u64;
 
 pub const InitError = error{
     InvalidConfig,
@@ -84,6 +98,18 @@ pub const BatchConfig = struct {
     /// Default EOS/stop token IDs applied when a request omits explicit stop IDs.
     default_eos_token_ids: [MAX_STOP_TOKENS]u32 = @splat(0),
     default_eos_count: u8 = 0,
+    /// Target decode wall-time share (`0.0..=1.0`, `0.0` disables wall-time QoS)
+    /// when both decode and prefill slots are ready (`C15`, ADR-0020).
+    decode_share: f32 = DEFAULT_DECODE_SHARE,
+    /// Narrow background prefill chunks (`8K -> 256`, `16K -> 128`) whenever at
+    /// least one decode slot is active (`C15`, ADR-0020).
+    adaptive_prefill_narrow: bool = true,
+    /// Split prefill chunks at `SubmitOptions.message_boundary_token` so the
+    /// backend snapshots pre-last-user state into `PrefixCache` with `evict_first = true`.
+    message_boundary_cache: bool = true,
+    /// Optional monotonic nanosecond clock override (`null` uses `vmstat.nowNs()`).
+    clock_fn: ?ClockFn = null,
+    clock_ctx: ?*anyopaque = null,
 };
 
 /// Result returned by `PrefixLookupFn` (`R8` shared `KvTile` / `GDN` prefix cache).
@@ -117,6 +143,12 @@ pub const PrefillChunkView = struct {
     temperature: f32,
     rng: *rng_mod.RequestRng,
     ngram_domain: []const u8,
+    /// Optional ChatML pre-last-user message boundary token offset (`C15`).
+    message_boundary_token: ?u32 = null,
+    /// `true` when this chunk ends right at `message_boundary_token`, signaling
+    /// the backend to snapshot CoW tail `KvTile` + `GDN` state into `PrefixCache`
+    /// with `evict_first = true` before prefilling the final user turn.
+    is_message_boundary_checkpoint: bool = false,
 };
 
 /// Output returned by `BatchBackend.prefillSlot`.
@@ -248,6 +280,9 @@ pub const SubmitOptions = struct {
     eos_token_ids: []const u32 = &.{},
     /// Optional per-request `.ang` domain pack ID (empty slice selects active default).
     ngram_domain: []const u8 = "",
+    /// Optional ChatML message-boundary token index right before the final user
+    /// message turn (`1 .. prompt_len - 1`, `C15` ADR-0020).
+    message_boundary_token: ?u32 = null,
 };
 
 /// Cumulative iteration-level batching telemetry.
@@ -264,6 +299,18 @@ pub const BatchTelemetry = struct {
     active_slots: u32 = 0,
     prefix_hit_tokens: u64 = 0,
     prefix_hit_requests: u64 = 0,
+    /// Number of contention steps dispatched to batched decode by the QoS ledger (`C15`).
+    qos_decode_steps: u64 = 0,
+    /// Number of contention steps dispatched to a single prefill chunk by the QoS ledger (`C15`).
+    qos_prefill_steps: u64 = 0,
+    /// Cumulative monotonic wall time (ns) spent in QoS-arbitrated decode steps.
+    qos_decode_ns: u64 = 0,
+    /// Cumulative monotonic wall time (ns) spent in QoS-arbitrated prefill steps.
+    qos_prefill_ns: u64 = 0,
+    /// Number of background prefill chunks narrowed (`8K -> 256`, `16K -> 128`) while decode was active.
+    narrowed_prefill_chunks: u64 = 0,
+    /// Number of prefill chunks split at `message_boundary_token` for `evict_first` caching.
+    message_boundary_checkpoints: u64 = 0,
 
     pub fn meanBatchSize(self: BatchTelemetry) f64 {
         if (self.total_batch_steps == 0) return 0.0;
@@ -296,6 +343,7 @@ pub const BatchSlot = struct {
     prefill_pos: u32 = 0,
     prefix_handle: u64 = 0,
     prefix_hit_tokens: u32 = 0,
+    message_boundary_token: ?u32 = null,
 
     seq_pos: u32 = 0,
     last_token: u32 = 0,
@@ -341,6 +389,7 @@ pub const BatchSlot = struct {
         self.prefill_pos = 0;
         self.prefix_handle = 0;
         self.prefix_hit_tokens = 0;
+        self.message_boundary_token = null;
         self.seq_pos = 0;
         self.last_token = 0;
         self.generated_tokens = 0;
@@ -362,6 +411,9 @@ pub const BatchScheduler = struct {
     slots: [MAX_BATCH_SLOTS]BatchSlot,
     prefill_cursor: usize,
     stats: BatchTelemetry,
+    /// Rolling/decayed monotonic wall-time window (`C15` decode-share QoS ledger).
+    qos_window_decode_ns: u64,
+    qos_window_prefill_ns: u64,
 
     // Preallocated scratch arrays for `BatchStepView` (`0` heap allocs per step).
     view_slot_ids: [MAX_BATCH_SLOTS]u16,
@@ -380,6 +432,9 @@ pub const BatchScheduler = struct {
         if (config.max_prefill_chunk_tokens == 0) return error.InvalidConfig;
         if (config.max_prompt_tokens == 0) return error.InvalidConfig;
         if (config.default_eos_count > MAX_STOP_TOKENS) return error.InvalidConfig;
+        if (std.math.isNan(config.decode_share) or config.decode_share < 0.0 or config.decode_share > 1.0) {
+            return error.InvalidConfig;
+        }
 
         const per_slot_bytes = std.math.mul(usize, config.max_prompt_tokens, @sizeOf(u32)) catch return error.InvalidConfig;
         const raw_slab_bytes = std.math.mul(usize, per_slot_bytes, config.max_batch_size) catch return error.InvalidConfig;
@@ -406,6 +461,8 @@ pub const BatchScheduler = struct {
             .slots = slots,
             .prefill_cursor = 0,
             .stats = .{},
+            .qos_window_decode_ns = 0,
+            .qos_window_prefill_ns = 0,
             .view_slot_ids = undefined,
             .view_request_ids = undefined,
             .view_user_tags = undefined,
@@ -482,6 +539,70 @@ pub const BatchScheduler = struct {
         return n;
     }
 
+    pub fn prefillReadySlotCount(self: *const BatchScheduler) usize {
+        var n: usize = 0;
+        for (0..self.config.max_batch_size) |i| {
+            const st = self.slots[i].state;
+            if (st == .queued or st == .prefilling) n += 1;
+        }
+        return n;
+    }
+
+    /// Computes the depth-scaled prefill chunk cap (`C15`, ADR-0020):
+    /// when `adaptive_prefill_narrow` is enabled AND `active_decode_count > 0`,
+    /// caps chunks to `128` at `>= 16,384` tokens and `256` at `>= 8,192` tokens;
+    /// keeps full `max_prefill_chunk_tokens` whenever zero decode slots are active.
+    pub fn effectivePrefillChunkCap(
+        self: *const BatchScheduler,
+        prefill_pos: u32,
+        active_decode_count: usize,
+    ) struct { cap: u32, narrowed: bool } {
+        const base = self.config.max_prefill_chunk_tokens;
+        if (!self.config.adaptive_prefill_narrow or active_decode_count == 0) {
+            return .{ .cap = base, .narrowed = false };
+        }
+        if (prefill_pos >= PREFILL_NARROW_DEPTH_DEEP) {
+            const capped = @min(base, PREFILL_NARROW_CHUNK_DEEP);
+            return .{ .cap = capped, .narrowed = capped < base };
+        }
+        if (prefill_pos >= PREFILL_NARROW_DEPTH_MID) {
+            const capped = @min(base, PREFILL_NARROW_CHUNK_MID);
+            return .{ .cap = capped, .narrowed = capped < base };
+        }
+        return .{ .cap = base, .narrowed = false };
+    }
+
+    fn nowNs(self: *const BatchScheduler) u64 {
+        if (self.config.clock_fn) |f| return f(self.config.clock_ctx);
+        return vmstat.nowNs() catch |err| blk: {
+            std.debug.assert(err == error.ClockFailed);
+            break :blk 0;
+        };
+    }
+
+    fn shouldPrioritizeDecode(self: *const BatchScheduler) bool {
+        if (self.config.decode_share <= 0.0) return false;
+        if (self.config.decode_share >= 1.0) return true;
+        const total_ns = self.qos_window_decode_ns +| self.qos_window_prefill_ns;
+        if (total_ns == 0) return true;
+        const decode_ns_f: f64 = @floatFromInt(self.qos_window_decode_ns);
+        const total_ns_f: f64 = @floatFromInt(total_ns);
+        return decode_ns_f < @as(f64, self.config.decode_share) * total_ns_f;
+    }
+
+    fn recordQosWindowNs(self: *BatchScheduler, elapsed_ns: u64, is_decode: bool) void {
+        if (is_decode) {
+            self.qos_window_decode_ns +|= elapsed_ns;
+        } else {
+            self.qos_window_prefill_ns +|= elapsed_ns;
+        }
+        const total = self.qos_window_decode_ns +| self.qos_window_prefill_ns;
+        if (total >= DEFAULT_QOS_WINDOW_NS) {
+            self.qos_window_decode_ns >>= 1;
+            self.qos_window_prefill_ns >>= 1;
+        }
+    }
+
     pub fn telemetry(self: *const BatchScheduler) BatchTelemetry {
         var t = self.stats;
         t.active_slots = @intCast(self.activeSlotCount());
@@ -546,6 +667,10 @@ pub const BatchScheduler = struct {
         slot.prefill_pos = 0;
         slot.prefix_handle = 0;
         slot.prefix_hit_tokens = 0;
+        slot.message_boundary_token = if (opts.message_boundary_token) |b|
+            (if (b > 0 and b < prompt_len) b else null)
+        else
+            null;
         slot.seq_pos = 0;
         slot.last_token = 0;
         slot.generated_tokens = 0;
@@ -666,30 +791,22 @@ pub const BatchScheduler = struct {
         self.stats.active_batch_size = @intCast(self.decodingSlotCount());
     }
 
-    /// Executes one iteration-level continuous batching tick:
-    /// 1. Fair round-robin chunked prefill up to `config.max_prefill_chunk_tokens`,
-    ///    invoking optional `PrefixLookupFn` on `.queued -> .prefilling` admission
-    ///    to skip matched prefix tokens.
-    /// 2. Batched `M = B` decode step gathering all currently `.decoding` slots
-    ///    into one contiguous `BatchStepView` and calling `backend.stepDecodeBatch`.
-    ///
-    /// Performs zero dynamic heap allocations.
-    pub fn step(
+    fn runPrefillPhase(
         self: *BatchScheduler,
+        summary: *StepSummary,
         backend: BatchBackend,
         observer: ?StepObserver,
-    ) StepSummary {
-        var summary: StepSummary = .{};
+        initial_active_decode_count: usize,
+        max_chunks: usize,
+    ) void {
         const max_b = self.config.max_batch_size;
-
-        // -------------------------------------------------------------------
-        // Phase 1: Fair round-robin chunked prefill within `max_prefill_chunk_tokens`
-        // -------------------------------------------------------------------
         var prefill_budget: u32 = self.config.max_prefill_chunk_tokens;
         var visited: usize = 0;
+        var chunks_executed: usize = 0;
+        var cur_decode_count: usize = initial_active_decode_count;
         var cursor: usize = self.prefill_cursor % max_b;
 
-        while (prefill_budget > 0 and visited < max_b) : (visited += 1) {
+        while (prefill_budget > 0 and visited < max_b and chunks_executed < max_chunks) : (visited += 1) {
             const slot_id: u16 = @intCast(cursor);
             cursor = (cursor + 1) % max_b;
             const slot = &self.slots[slot_id];
@@ -713,17 +830,39 @@ pub const BatchScheduler = struct {
 
             if (slot.state != .prefilling) continue;
 
-            const remaining: u32 = slot.prompt_len - slot.prefill_pos;
-            std.debug.assert(remaining > 0);
-            const take: u32 = @min(remaining, prefill_budget);
             const start_pos: u32 = slot.prefill_pos;
-            const is_final: bool = (start_pos + take == slot.prompt_len);
+            const remaining: u32 = slot.prompt_len - start_pos;
+            std.debug.assert(remaining > 0);
+
+            // 1. Optional ChatML message-boundary checkpoint split (`C15`, ADR-0020).
+            const boundary_limit: u32 = if (self.config.message_boundary_cache) blk: {
+                if (slot.message_boundary_token) |b| {
+                    if (start_pos < b and b < slot.prompt_len) break :blk b - start_pos;
+                }
+                break :blk remaining;
+            } else remaining;
+
+            // 2. Depth-scaled background prefill chunk narrowing when decode slots are active.
+            const cap_info = self.effectivePrefillChunkCap(start_pos, cur_decode_count);
+            const pre_narrow_take: u32 = @min(@min(remaining, boundary_limit), prefill_budget);
+            const take: u32 = @min(pre_narrow_take, cap_info.cap);
+            std.debug.assert(take > 0);
+
+            const was_narrowed: bool = cap_info.narrowed and take < pre_narrow_take;
+            const chunk_end: u32 = start_pos + take;
+            const is_boundary_checkpoint: bool = if (self.config.message_boundary_cache) blk: {
+                if (slot.message_boundary_token) |b| {
+                    break :blk (start_pos < b and b < slot.prompt_len and chunk_end == b);
+                }
+                break :blk false;
+            } else false;
+            const is_final: bool = (chunk_end == slot.prompt_len);
 
             const chunk_view = PrefillChunkView{
                 .slot_id = slot_id,
                 .request_id = slot.request_id,
                 .user_tag = slot.user_tag,
-                .tokens = slot.prompt_buf[start_pos .. start_pos + take],
+                .tokens = slot.prompt_buf[start_pos..chunk_end],
                 .start_pos = start_pos,
                 .total_prompt_len = slot.prompt_len,
                 .is_final_chunk = is_final,
@@ -731,11 +870,14 @@ pub const BatchScheduler = struct {
                 .temperature = slot.temperature,
                 .rng = slot.rng(),
                 .ngram_domain = slot.ngramDomainSlice(),
+                .message_boundary_token = slot.message_boundary_token,
+                .is_message_boundary_checkpoint = is_boundary_checkpoint,
             };
 
             const res = backend.prefillSlot(&chunk_view) catch |err| {
                 self.failSlotInternal(slot_id, err, backend, observer);
                 summary.slots_failed += 1;
+                chunks_executed += 1;
                 self.prefill_cursor = cursor;
                 continue;
             };
@@ -743,12 +885,19 @@ pub const BatchScheduler = struct {
             if (res.update_prefix_handle) {
                 slot.prefix_handle = res.prefix_handle;
             }
-            slot.prefill_pos += take;
+            slot.prefill_pos = chunk_end;
             prefill_budget -= take;
+            chunks_executed += 1;
             summary.prefill_chunks_run += 1;
             summary.prefill_tokens_run += take;
             self.stats.total_prefill_chunks += 1;
             self.stats.total_prefill_tokens += take;
+            if (was_narrowed) {
+                self.stats.narrowed_prefill_chunks += 1;
+            }
+            if (is_boundary_checkpoint) {
+                self.stats.message_boundary_checkpoints += 1;
+            }
             self.prefill_cursor = cursor;
 
             if (!is_final) continue;
@@ -793,11 +942,17 @@ pub const BatchScheduler = struct {
             }
 
             slot.state = .decoding;
+            cur_decode_count += 1;
         }
+    }
 
-        // -------------------------------------------------------------------
-        // Phase 2: Gather all `.decoding` slots into ONE batched `M = B` step
-        // -------------------------------------------------------------------
+    fn runDecodeBatch(
+        self: *BatchScheduler,
+        summary: *StepSummary,
+        backend: BatchBackend,
+        observer: ?StepObserver,
+    ) void {
+        const max_b = self.config.max_batch_size;
         var batch_len: usize = 0;
         for (0..max_b) |i| {
             const slot = &self.slots[i];
@@ -814,70 +969,126 @@ pub const BatchScheduler = struct {
             batch_len += 1;
         }
 
-        if (batch_len > 0) {
-            const view = BatchStepView{
-                .slot_ids = self.view_slot_ids[0..batch_len],
-                .request_ids = self.view_request_ids[0..batch_len],
-                .user_tags = self.view_user_tags[0..batch_len],
-                .input_tokens = self.view_input_tokens[0..batch_len],
-                .seq_positions = self.view_seq_positions[0..batch_len],
-                .temperatures = self.view_temperatures[0..batch_len],
-                .rngs = self.view_rngs[0..batch_len],
-                .ngram_domains = self.view_ngram_domains[0..batch_len],
-                .prefix_handles = self.view_prefix_handles[0..batch_len],
-            };
+        if (batch_len == 0) return;
 
-            const out_slice = self.step_out_tokens[0..batch_len];
-            backend.stepDecodeBatch(&view, out_slice) catch |err| {
-                for (self.view_slot_ids[0..batch_len]) |sid| {
-                    self.failSlotInternal(sid, err, backend, observer);
-                    summary.slots_failed += 1;
-                }
-                self.refreshActiveCounts();
-                return summary;
-            };
+        const view = BatchStepView{
+            .slot_ids = self.view_slot_ids[0..batch_len],
+            .request_ids = self.view_request_ids[0..batch_len],
+            .user_tags = self.view_user_tags[0..batch_len],
+            .input_tokens = self.view_input_tokens[0..batch_len],
+            .seq_positions = self.view_seq_positions[0..batch_len],
+            .temperatures = self.view_temperatures[0..batch_len],
+            .rngs = self.view_rngs[0..batch_len],
+            .ngram_domains = self.view_ngram_domains[0..batch_len],
+            .prefix_handles = self.view_prefix_handles[0..batch_len],
+        };
 
-            const b_u32: u32 = @intCast(batch_len);
-            summary.decode_batch_size = b_u32;
-            self.stats.total_batch_steps += 1;
-            self.stats.total_slot_tokens += b_u32;
-            if (b_u32 > self.stats.max_observed_batch_size) {
-                self.stats.max_observed_batch_size = b_u32;
+        const out_slice = self.step_out_tokens[0..batch_len];
+        backend.stepDecodeBatch(&view, out_slice) catch |err| {
+            for (self.view_slot_ids[0..batch_len]) |sid| {
+                self.failSlotInternal(sid, err, backend, observer);
+                summary.slots_failed += 1;
             }
+            return;
+        };
 
-            for (0..batch_len) |b| {
-                const sid = self.view_slot_ids[b];
-                const slot = &self.slots[sid];
-                const next_tok = out_slice[b];
-
-                if (slot.isStopToken(next_tok)) {
-                    self.finishSlotInternal(sid, .stop, backend, observer);
-                    summary.slots_finished += 1;
-                    continue;
-                }
-
-                slot.generated_tokens += 1;
-                slot.last_token = next_tok;
-                slot.seq_pos += 1;
-                summary.tokens_emitted += 1;
-
-                if (observer) |obs| {
-                    if (obs.onTokenFn) |f| {
-                        if (!f(obs.ctx, sid, slot.user_tag, next_tok, slot.generated_tokens)) {
-                            self.finishSlotInternal(sid, .cancelled, backend, observer);
-                            summary.slots_cancelled += 1;
-                            continue;
-                        }
-                    }
-                }
-
-                if (slot.generated_tokens >= slot.max_tokens) {
-                    self.finishSlotInternal(sid, .length, backend, observer);
-                    summary.slots_finished += 1;
-                }
-            }
+        const b_u32: u32 = @intCast(batch_len);
+        summary.decode_batch_size = b_u32;
+        self.stats.total_batch_steps += 1;
+        self.stats.total_slot_tokens += b_u32;
+        if (b_u32 > self.stats.max_observed_batch_size) {
+            self.stats.max_observed_batch_size = b_u32;
         }
 
+        for (0..batch_len) |b| {
+            const sid = self.view_slot_ids[b];
+            const slot = &self.slots[sid];
+            const next_tok = out_slice[b];
+
+            if (slot.isStopToken(next_tok)) {
+                self.finishSlotInternal(sid, .stop, backend, observer);
+                summary.slots_finished += 1;
+                continue;
+            }
+
+            slot.generated_tokens += 1;
+            slot.last_token = next_tok;
+            slot.seq_pos += 1;
+            summary.tokens_emitted += 1;
+
+            if (observer) |obs| {
+                if (obs.onTokenFn) |f| {
+                    if (!f(obs.ctx, sid, slot.user_tag, next_tok, slot.generated_tokens)) {
+                        self.finishSlotInternal(sid, .cancelled, backend, observer);
+                        summary.slots_cancelled += 1;
+                        continue;
+                    }
+                }
+            }
+
+            if (slot.generated_tokens >= slot.max_tokens) {
+                self.finishSlotInternal(sid, .length, backend, observer);
+                summary.slots_finished += 1;
+            }
+        }
+    }
+
+    /// Executes one iteration-level continuous batching tick:
+    /// - When `config.decode_share > 0` AND BOTH ready decode slots and ready
+    ///   prefill slots exist, consults the monotonic wall-time `decode-share`
+    ///   QoS ledger (`C15`, ADR-0020): runs ONE batched decode step whenever the
+    ///   rolling decode wall-time share is `< decode_share`, otherwise runs ONE
+    ///   prefill chunk step (narrowed by depth when `adaptive_prefill_narrow` is on).
+    /// - Otherwise (`decode_share == 0`, prefill-only, or decode-only), runs fair
+    ///   round-robin chunked prefill up to `config.max_prefill_chunk_tokens`
+    ///   followed by ONE batched `M = B` decode step across all `.decoding` slots.
+    ///
+    /// Performs zero dynamic heap allocations.
+    pub fn step(
+        self: *BatchScheduler,
+        backend: BatchBackend,
+        observer: ?StepObserver,
+    ) StepSummary {
+        var summary: StepSummary = .{};
+        const max_b = self.config.max_batch_size;
+        const ready_decode = self.decodingSlotCount();
+        const ready_prefill = self.prefillReadySlotCount();
+
+        if (self.config.decode_share > 0.0 and ready_decode > 0 and ready_prefill > 0) {
+            if (self.shouldPrioritizeDecode()) {
+                const t0 = self.nowNs();
+                self.runDecodeBatch(&summary, backend, observer);
+                const t1 = self.nowNs();
+                const elapsed_ns: u64 = @max(@as(u64, 1), t1 -| t0);
+                self.stats.qos_decode_steps += 1;
+                self.stats.qos_decode_ns +|= elapsed_ns;
+                self.recordQosWindowNs(elapsed_ns, true);
+            } else {
+                const t0 = self.nowNs();
+                self.runPrefillPhase(&summary, backend, observer, ready_decode, 1);
+                const t1 = self.nowNs();
+                const elapsed_ns: u64 = @max(@as(u64, 1), t1 -| t0);
+                self.stats.qos_prefill_steps += 1;
+                self.stats.qos_prefill_ns +|= elapsed_ns;
+                self.recordQosWindowNs(elapsed_ns, false);
+            }
+            if (self.activeSlotCount() == 0) {
+                self.qos_window_decode_ns = 0;
+                self.qos_window_prefill_ns = 0;
+            }
+            self.refreshActiveCounts();
+            return summary;
+        }
+
+        if (ready_prefill > 0) {
+            self.runPrefillPhase(&summary, backend, observer, ready_decode, max_b);
+        }
+        self.runDecodeBatch(&summary, backend, observer);
+
+        if (self.activeSlotCount() == 0) {
+            self.qos_window_decode_ns = 0;
+            self.qos_window_prefill_ns = 0;
+        }
         self.refreshActiveCounts();
         return summary;
     }
@@ -1321,4 +1532,342 @@ test "BatchScheduler fair round-robin chunked prefill avoids head-of-line starva
     try std.testing.expectEqual(@as(u32, 3), st.releases);
     try std.testing.expectEqual(SlotState.free, sched.slotState(err_slot));
     try std.testing.expectEqual(@as(u64, 1), sched.telemetry().failed_requests);
+}
+
+test "C15 BatchScheduler decode_share=0.50 vs 0.0 wall-time QoS ledger prevents decode and prefill starvation" {
+    const gpa = std.testing.allocator;
+
+    const MockClockBackend = struct {
+        now_ns: u64 = 1_000_000,
+        decode_step_ns: u64 = 2_000_000, // 2 ms per decode step
+        prefill_chunk_ns: u64 = 10_000_000, // 10 ms per prefill chunk
+        decode_calls: u32 = 0,
+        prefill_calls: u32 = 0,
+
+        fn clock(ctx_raw: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw.?));
+            return self.now_ns;
+        }
+
+        fn prefill(ctx_raw: *anyopaque, chunk: *const PrefillChunkView) BackendError!PrefillResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            self.now_ns += self.prefill_chunk_ns;
+            self.prefill_calls += 1;
+            return .{ .first_token = if (chunk.is_final_chunk) 77 else 0 };
+        }
+
+        fn decode(ctx_raw: *anyopaque, view: *const BatchStepView, out: []u32) BackendError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            self.now_ns += self.decode_step_ns;
+            self.decode_calls += 1;
+            for (0..view.batchSize()) |b| out[b] = 88;
+        }
+
+        fn release(_: *anyopaque, _: u16, _: u64) void {}
+
+        fn backend(self: *@This()) BatchBackend {
+            return .{
+                .ctx = self,
+                .prefillSlotFn = prefill,
+                .stepDecodeBatchFn = decode,
+                .releaseSlotFn = release,
+            };
+        }
+    };
+
+    // Invalid decode_share values must be rejected.
+    try std.testing.expectError(error.InvalidConfig, BatchScheduler.init(gpa, .{ .decode_share = -0.1 }));
+    try std.testing.expectError(error.InvalidConfig, BatchScheduler.init(gpa, .{ .decode_share = 1.1 }));
+
+    const short_p = [_]u32{ 1, 2, 3, 4 };
+    var long_p: [4096]u32 = undefined;
+    for (&long_p, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // 1. QoS ON (`decode_share = 0.50`, 2ms decode vs 10ms prefill -> ~5 decode steps per 1 prefill chunk).
+    var clk_qos = MockClockBackend{};
+    var qos_sched = try BatchScheduler.init(gpa, .{
+        .max_batch_size = 4,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = 4096,
+        .decode_share = 0.50,
+        .adaptive_prefill_narrow = false,
+        .clock_fn = MockClockBackend.clock,
+        .clock_ctx = &clk_qos,
+    });
+    defer qos_sched.deinit(gpa);
+
+    // Put slot 0 into active `.decoding` state first.
+    _ = try qos_sched.enqueue(&short_p, .{ .request_id = 1, .max_tokens = 60 });
+    const warmup = qos_sched.step(clk_qos.backend(), null);
+    try std.testing.expectEqual(@as(u32, 1), warmup.decode_batch_size);
+    try std.testing.expectEqual(@as(usize, 1), qos_sched.decodingSlotCount());
+
+    // Now enqueue a 4096-token long prefill (8 chunks of 512 tokens) while slot 0 decodes.
+    _ = try qos_sched.enqueue(&long_p, .{ .request_id = 2, .max_tokens = 4 });
+
+    // Run 18 contention steps: expect 3 prefill chunks (30ms) and 15 decode steps (30ms) -> exact 50/50 wall share!
+    var both_in_same_step: u32 = 0;
+    for (0..18) |_| {
+        const s = qos_sched.step(clk_qos.backend(), null);
+        if (s.prefill_chunks_run > 0 and s.decode_batch_size > 0) both_in_same_step += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 0), both_in_same_step);
+    const qos_tel = qos_sched.telemetry();
+    try std.testing.expectEqual(@as(u64, 15), qos_tel.qos_decode_steps);
+    try std.testing.expectEqual(@as(u64, 3), qos_tel.qos_prefill_steps);
+    try std.testing.expectEqual(@as(u64, 30_000_000), qos_tel.qos_decode_ns);
+    try std.testing.expectEqual(@as(u64, 30_000_000), qos_tel.qos_prefill_ns);
+
+    // Drain to completion: neither decode nor prefill starves.
+    while (qos_sched.activeSlotCount() > 0) {
+        _ = qos_sched.step(clk_qos.backend(), null);
+    }
+    try std.testing.expectEqual(@as(u64, 2), qos_sched.telemetry().completed_requests);
+
+    // 2. QoS OFF (`decode_share = 0.0`): every step executes BOTH 1 prefill chunk AND 1 decode step.
+    var clk_off = MockClockBackend{};
+    var off_sched = try BatchScheduler.init(gpa, .{
+        .max_batch_size = 4,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = 4096,
+        .decode_share = 0.0,
+        .adaptive_prefill_narrow = false,
+        .clock_fn = MockClockBackend.clock,
+        .clock_ctx = &clk_off,
+    });
+    defer off_sched.deinit(gpa);
+
+    _ = try off_sched.enqueue(&short_p, .{ .request_id = 10, .max_tokens = 30 });
+    _ = off_sched.step(clk_off.backend(), null);
+    _ = try off_sched.enqueue(&long_p, .{ .request_id = 11, .max_tokens = 4 });
+
+    for (0..4) |_| {
+        const s = off_sched.step(clk_off.backend(), null);
+        try std.testing.expectEqual(@as(u32, 1), s.prefill_chunks_run);
+        try std.testing.expectEqual(@as(u32, 1), s.decode_batch_size);
+    }
+    try std.testing.expectEqual(@as(u64, 0), off_sched.telemetry().qos_decode_steps);
+    try std.testing.expectEqual(@as(u64, 0), off_sched.telemetry().qos_prefill_steps);
+}
+
+test "C15 BatchScheduler depth-scaled prefill narrowing (8K->256, 16K->128) applies ONLY when decode slots are active" {
+    const gpa = std.testing.allocator;
+
+    const CapRecorder = struct {
+        last_chunk_len: u32 = 0,
+        saw_512_at_mid: bool = false,
+        saw_256_at_mid: bool = false,
+        saw_512_at_deep: bool = false,
+        saw_128_at_deep: bool = false,
+        prefix_skip: u32 = 0,
+
+        fn lookupPrefix(ctx_raw: *anyopaque, _: u16, prompt: []const u32) PrefixLookupResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            if (prompt.len > 1000 and self.prefix_skip > 0) {
+                return .{ .matched_tokens = self.prefix_skip, .prefix_handle = 0 };
+            }
+            return .{};
+        }
+
+        fn prefill(ctx_raw: *anyopaque, chunk: *const PrefillChunkView) BackendError!PrefillResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            const n: u32 = @intCast(chunk.tokens.len);
+            self.last_chunk_len = n;
+            if (chunk.start_pos >= PREFILL_NARROW_DEPTH_DEEP) {
+                if (n == 512) self.saw_512_at_deep = true;
+                if (n == 128) self.saw_128_at_deep = true;
+            } else if (chunk.start_pos >= PREFILL_NARROW_DEPTH_MID) {
+                if (n == 512) self.saw_512_at_mid = true;
+                if (n == 256) self.saw_256_at_mid = true;
+            }
+            return .{ .first_token = if (chunk.is_final_chunk) 99 else 0 };
+        }
+
+        fn decode(_: *anyopaque, view: *const BatchStepView, out: []u32) BackendError!void {
+            for (0..view.batchSize()) |b| out[b] = 100;
+        }
+        fn release(_: *anyopaque, _: u16, _: u64) void {}
+
+        fn backend(self: *@This()) BatchBackend {
+            return .{
+                .ctx = self,
+                .lookupPrefixFn = lookupPrefix,
+                .prefillSlotFn = prefill,
+                .stepDecodeBatchFn = decode,
+                .releaseSlotFn = release,
+            };
+        }
+    };
+
+    const prompt_len: usize = 17_408; // > 16384 + 512
+    const long_p = try gpa.alloc(u32, prompt_len);
+    defer gpa.free(long_p);
+    for (long_p, 0..) |*t, i| t.* = @intCast(i + 1);
+    const short_p = [_]u32{ 1, 2, 3, 4 };
+
+    // 1. Active decode count == 0: even at 8K and 16K depth, full 512-token chunks must be preserved!
+    var rec_solo = CapRecorder{ .prefix_skip = 8192 };
+    var sched_solo = try BatchScheduler.init(gpa, .{
+        .max_batch_size = 2,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = prompt_len,
+        .decode_share = 0.0,
+        .adaptive_prefill_narrow = true,
+    });
+    defer sched_solo.deinit(gpa);
+
+    _ = try sched_solo.enqueue(long_p, .{ .request_id = 1, .max_tokens = 2 });
+    const s_mid_solo = sched_solo.step(rec_solo.backend(), null);
+    try std.testing.expectEqual(@as(u32, 512), s_mid_solo.prefill_tokens_run);
+    try std.testing.expect(rec_solo.saw_512_at_mid);
+    try std.testing.expect(!rec_solo.saw_256_at_mid);
+    try std.testing.expectEqual(@as(u64, 0), sched_solo.telemetry().narrowed_prefill_chunks);
+
+    // Drain solo prompt through 16K depth without any decode peer.
+    while (sched_solo.activeSlotCount() > 0) {
+        _ = sched_solo.step(rec_solo.backend(), null);
+    }
+    try std.testing.expect(rec_solo.saw_512_at_deep);
+    try std.testing.expect(!rec_solo.saw_128_at_deep);
+    try std.testing.expectEqual(@as(u64, 0), sched_solo.telemetry().narrowed_prefill_chunks);
+
+    // 2. Active decode count > 0: 8K depth narrows 512 -> 256, and 16K depth narrows 512 -> 128!
+    var rec_bg = CapRecorder{ .prefix_skip = 8192 };
+    var sched_bg = try BatchScheduler.init(gpa, .{
+        .max_batch_size = 2,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = prompt_len,
+        .decode_share = 0.0,
+        .adaptive_prefill_narrow = true,
+    });
+    defer sched_bg.deinit(gpa);
+
+    _ = try sched_bg.enqueue(&short_p, .{ .request_id = 10, .max_tokens = 64 });
+    _ = sched_bg.step(rec_bg.backend(), null);
+    try std.testing.expectEqual(@as(usize, 1), sched_bg.decodingSlotCount());
+
+    // Enqueue at 8192 depth -> must narrow to 256!
+    const mid_slot = try sched_bg.enqueue(long_p, .{ .request_id = 11, .max_tokens = 2 });
+    const s_mid_bg = sched_bg.step(rec_bg.backend(), null);
+    try std.testing.expectEqual(@as(u32, 256), s_mid_bg.prefill_tokens_run);
+    try std.testing.expect(rec_bg.saw_256_at_mid);
+    try std.testing.expectEqual(@as(u64, 1), sched_bg.telemetry().narrowed_prefill_chunks);
+
+    // Cancel mid_slot and test 16384 depth -> must narrow to 128!
+    try std.testing.expect(sched_bg.cancelSlot(mid_slot, rec_bg.backend(), null));
+    rec_bg.prefix_skip = 16384;
+    _ = try sched_bg.enqueue(long_p, .{ .request_id = 12, .max_tokens = 2 });
+    const s_deep_bg = sched_bg.step(rec_bg.backend(), null);
+    try std.testing.expectEqual(@as(u32, 128), s_deep_bg.prefill_tokens_run);
+    try std.testing.expect(rec_bg.saw_128_at_deep);
+    try std.testing.expectEqual(@as(u64, 2), sched_bg.telemetry().narrowed_prefill_chunks);
+}
+
+test "C15 BatchScheduler splits prefill chunk at message_boundary_token with checkpoint flag" {
+    const gpa = std.testing.allocator;
+
+    const BoundarySpy = struct {
+        chunk_starts: [8]u32 = @splat(0),
+        chunk_lens: [8]u32 = @splat(0),
+        chunk_flags: [8]bool = @splat(false),
+        count: usize = 0,
+        prefix_skip: u32 = 0,
+
+        fn lookupPrefix(ctx_raw: *anyopaque, _: u16, _: []const u32) PrefixLookupResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            return .{ .matched_tokens = self.prefix_skip, .prefix_handle = 0 };
+        }
+
+        fn prefill(ctx_raw: *anyopaque, chunk: *const PrefillChunkView) BackendError!PrefillResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_raw));
+            if (self.count < self.chunk_starts.len) {
+                self.chunk_starts[self.count] = chunk.start_pos;
+                self.chunk_lens[self.count] = @intCast(chunk.tokens.len);
+                self.chunk_flags[self.count] = chunk.is_message_boundary_checkpoint;
+                self.count += 1;
+            }
+            return .{ .first_token = if (chunk.is_final_chunk) 55 else 0 };
+        }
+
+        fn decode(_: *anyopaque, view: *const BatchStepView, out: []u32) BackendError!void {
+            for (0..view.batchSize()) |b| out[b] = 56;
+        }
+        fn release(_: *anyopaque, _: u16, _: u64) void {}
+
+        fn backend(self: *@This()) BatchBackend {
+            return .{
+                .ctx = self,
+                .lookupPrefixFn = lookupPrefix,
+                .prefillSlotFn = prefill,
+                .stepDecodeBatchFn = decode,
+                .releaseSlotFn = release,
+            };
+        }
+    };
+
+    var prompt: [1400]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // 1. message_boundary_cache = true with boundary at 1200 (= 2*512 + 176):
+    //    chunks must be [0..512], [512..1024], [1024..1200] (checkpoint=true!), [1200..1400] (final=true).
+    var spy = BoundarySpy{};
+    var sched = try BatchScheduler.init(gpa, .{
+        .max_batch_size = 2,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = 2048,
+        .message_boundary_cache = true,
+    });
+    defer sched.deinit(gpa);
+
+    _ = try sched.enqueue(&prompt, .{
+        .request_id = 1,
+        .max_tokens = 1,
+        .message_boundary_token = 1200,
+    });
+    while (sched.activeSlotCount() > 0) {
+        _ = sched.step(spy.backend(), null);
+    }
+    try std.testing.expectEqual(@as(usize, 4), spy.count);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 512, 1024, 1200 }, spy.chunk_starts[0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 512, 512, 176, 200 }, spy.chunk_lens[0..4]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, false }, spy.chunk_flags[0..4]);
+    try std.testing.expectEqual(@as(u64, 1), sched.telemetry().message_boundary_checkpoints);
+
+    // 2. When a PrefixCache hit already skipped to 1200, no redundant boundary split happens!
+    spy = .{ .prefix_skip = 1200 };
+    _ = try sched.enqueue(&prompt, .{
+        .request_id = 2,
+        .max_tokens = 1,
+        .message_boundary_token = 1200,
+    });
+    while (sched.activeSlotCount() > 0) {
+        _ = sched.step(spy.backend(), null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), spy.count);
+    try std.testing.expectEqual(@as(u32, 1200), spy.chunk_starts[0]);
+    try std.testing.expectEqual(@as(u32, 200), spy.chunk_lens[0]);
+    try std.testing.expect(!spy.chunk_flags[0]);
+
+    // 3. When message_boundary_cache = false, chunks stay unsplit: [0..512], [512..1024], [1024..1400].
+    var spy_off = BoundarySpy{};
+    var sched_off = try BatchScheduler.init(gpa, .{
+        .max_batch_size = 2,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = 2048,
+        .message_boundary_cache = false,
+    });
+    defer sched_off.deinit(gpa);
+
+    _ = try sched_off.enqueue(&prompt, .{
+        .request_id = 3,
+        .max_tokens = 1,
+        .message_boundary_token = 1200,
+    });
+    while (sched_off.activeSlotCount() > 0) {
+        _ = sched_off.step(spy_off.backend(), null);
+    }
+    try std.testing.expectEqual(@as(usize, 3), spy_off.count);
+    try std.testing.expectEqualSlices(u32, &.{ 512, 512, 376 }, spy_off.chunk_lens[0..3]);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false }, spy_off.chunk_flags[0..3]);
+    try std.testing.expectEqual(@as(u64, 0), sched_off.telemetry().message_boundary_checkpoints);
 }

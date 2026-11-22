@@ -10,6 +10,9 @@ const metal = @import("../bridge/metal.zig");
 
 /// Default physical memory reserved for macOS and other processes (ADR-0012).
 pub const DEFAULT_HEADROOM_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+/// Default safety margin held back from the live zero-swap reclaimable pool
+/// when sizing optional wired caches (`P1-B`, ADR-0020).
+pub const DEFAULT_LIVE_SAFETY_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 
 pub const BindingLimit = enum {
     configured_cap,
@@ -49,6 +52,30 @@ pub const PlanError = error{
     /// Requested wired bytes exceed `Budget.limit_bytes` (inspect
     /// `Budget.binding_limit` for the exact constraint).
     BudgetExceeded,
+    /// Under `LiveRamConfig.strict_live_ram = true`, required wired bytes exceed
+    /// live zero-swap reclaimable RAM minus `live_safety_margin_bytes` (ADR-0020).
+    ExceedsLiveZeroSwapRam,
+};
+
+pub const LiveRamConfig = struct {
+    /// Safety margin subtracted from `live_reclaimable_bytes` before sizing
+    /// optional caches or checking strict live RAM admission (default 512 MiB).
+    live_safety_margin_bytes: u64 = DEFAULT_LIVE_SAFETY_MARGIN_BYTES,
+    /// When `true`, reject startup with `error.ExceedsLiveZeroSwapRam` if
+    /// `required_wired_bytes > live_budget_bytes`. When `false`, required wired
+    /// plans stay governed deterministically by the static `ADR-0012` budget
+    /// while optional caches auto-scale down softly.
+    strict_live_ram: bool = false,
+};
+
+pub const LiveAdmissionPlan = struct {
+    required_wired_bytes: u64,
+    requested_optional_cache_bytes: u64,
+    granted_optional_cache_bytes: u64,
+    static_limit_bytes: u64,
+    live_reclaimable_bytes: u64,
+    live_budget_bytes: u64,
+    cache_scaled_down: bool,
 };
 
 pub const Budget = struct {
@@ -112,7 +139,82 @@ pub const Budget = struct {
     pub fn checkPlan(self: Budget, required_bytes: u64) PlanError!void {
         if (required_bytes > self.limit_bytes) return error.BudgetExceeded;
     }
+
+    /// Alias of `checkPlan` enforcing the static `ADR-0012` wired ceiling.
+    pub fn check(self: Budget, required_bytes: u64) PlanError!void {
+        return self.checkPlan(required_bytes);
+    }
+
+    /// Evaluates required wired bytes against the static `ADR-0012` budget and
+    /// auto-scales optional wired caches against the live zero-swap reclaimable
+    /// pool (`P1-B`, ADR-0020).
+    pub fn planWithLiveRam(
+        self: Budget,
+        required_wired_bytes: u64,
+        optional_cache_bytes: u64,
+        live_reclaimable_bytes: u64,
+        cfg: LiveRamConfig,
+    ) PlanError!LiveAdmissionPlan {
+        return planWithLiveRamImpl(self, required_wired_bytes, optional_cache_bytes, live_reclaimable_bytes, cfg);
+    }
 };
+
+fn planWithLiveRamImpl(
+    budget: Budget,
+    required_wired_bytes: u64,
+    optional_cache_bytes: u64,
+    live_reclaimable_bytes: u64,
+    cfg: LiveRamConfig,
+) PlanError!LiveAdmissionPlan {
+    try budget.check(required_wired_bytes);
+    const live_budget_bytes: u64 = live_reclaimable_bytes -| cfg.live_safety_margin_bytes;
+    if (cfg.strict_live_ram and required_wired_bytes > live_budget_bytes) {
+        return error.ExceedsLiveZeroSwapRam;
+    }
+    const static_headroom: u64 = budget.limit_bytes - required_wired_bytes;
+    const live_headroom: u64 = live_budget_bytes -| required_wired_bytes;
+    const granted_optional_cache_bytes: u64 = @min(optional_cache_bytes, @min(static_headroom, live_headroom));
+    return .{
+        .required_wired_bytes = required_wired_bytes,
+        .requested_optional_cache_bytes = optional_cache_bytes,
+        .granted_optional_cache_bytes = granted_optional_cache_bytes,
+        .static_limit_bytes = budget.limit_bytes,
+        .live_reclaimable_bytes = live_reclaimable_bytes,
+        .live_budget_bytes = live_budget_bytes,
+        .cache_scaled_down = granted_optional_cache_bytes < optional_cache_bytes,
+    };
+}
+
+/// Evaluates required wired bytes against the static `ADR-0012` `budget`,
+/// optionally enforces `--strict-live-ram`, and caps optional wired caches
+/// (`PrefixCache`, `PlePageCache`, `NgramCache`, extra `ExpertSlotPool` slots)
+/// within both static headroom and live zero-swap reclaimable headroom (`P1-B`, ADR-0020).
+pub fn planWithLiveRam(
+    budget: Budget,
+    required_wired_bytes: u64,
+    optional_cache_bytes: u64,
+    live_reclaimable_bytes: u64,
+    cfg: LiveRamConfig,
+) PlanError!LiveAdmissionPlan {
+    return planWithLiveRamImpl(budget, required_wired_bytes, optional_cache_bytes, live_reclaimable_bytes, cfg);
+}
+
+/// Scales an optional cache unit count (e.g., `PrefixCache` blocks, `PlePageCache`
+/// pages, `NgramCache` slots, or extra `ExpertSlotPool` slots) down to fit
+/// `available_bytes`, clamping to `[min(min_count, requested_count), requested_count]`.
+pub fn scaleOptionalCount(
+    requested_count: usize,
+    bytes_per_unit: usize,
+    available_bytes: u64,
+    min_count: usize,
+) usize {
+    if (requested_count == 0) return 0;
+    if (bytes_per_unit == 0) return requested_count;
+    const floor: usize = @min(min_count, requested_count);
+    const fit_u64: u64 = available_bytes / @as(u64, bytes_per_unit);
+    const fit: usize = @intCast(@min(fit_u64, @as(u64, requested_count)));
+    return @max(fit, floor);
+}
 
 test "compute selects the tightest limit and identifies it" {
     const gib: u64 = 1024 * 1024 * 1024;
@@ -204,4 +306,67 @@ test "host budget is positive, 16 KiB aligned and respects default headroom" {
     try std.testing.expect(budget.limit_bytes <= facts.user_wire_limit);
     try std.testing.expect(budget.limit_bytes <= facts.global_user_wire_limit);
     try std.testing.expect(budget.limit_bytes <= info.recommendedMaxWorkingSetSize());
+}
+
+test "planWithLiveRam scales optional caches softly and enforces strict_live_ram" {
+    const mib: u64 = 1024 * 1024;
+    const gib: u64 = 1024 * mib;
+    const budget = Budget.compute(.{
+        .memory_bytes = 24 * gib,
+        .user_wire_limit = 18 * gib,
+        .global_user_wire_limit = 18 * gib,
+        .gpu_working_set_bytes = 18 * gib,
+        .configured_cap = null,
+        .headroom_bytes = DEFAULT_HEADROOM_BYTES,
+    });
+
+    // 1. Ample static and live headroom: full optional cache granted without scaling.
+    const ample = try planWithLiveRam(budget, 10 * gib, 2 * gib, 16 * gib, .{});
+    try std.testing.expectEqual(@as(u64, 10 * gib), ample.required_wired_bytes);
+    try std.testing.expectEqual(@as(u64, 2 * gib), ample.requested_optional_cache_bytes);
+    try std.testing.expectEqual(@as(u64, 2 * gib), ample.granted_optional_cache_bytes);
+    try std.testing.expectEqual(@as(u64, 18 * gib), ample.static_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * gib), ample.live_reclaimable_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * gib - DEFAULT_LIVE_SAFETY_MARGIN_BYTES), ample.live_budget_bytes);
+    try std.testing.expect(!ample.cache_scaled_down);
+
+    // 2. Desktop processes occupy RAM: live_reclaimable = 11.5 GiB -> live_budget = 11 GiB ->
+    //    only 1 GiB optional cache headroom left, so 2 GiB optional cache softly scales to 1 GiB.
+    const scaled = try budget.planWithLiveRam(10 * gib, 2 * gib, 11 * gib + 512 * mib, .{});
+    try std.testing.expectEqual(@as(u64, 11 * gib), scaled.live_budget_bytes);
+    try std.testing.expectEqual(@as(u64, 1 * gib), scaled.granted_optional_cache_bytes);
+    try std.testing.expect(scaled.cache_scaled_down);
+
+    // 3. Required wired plan fits static budget (12 <= 18 GiB) but exceeds live budget (9.5 GiB):
+    //    default soft mode succeeds with 0 optional cache; strict_live_ram rejects immediately.
+    const soft_zero = try planWithLiveRam(budget, 12 * gib, 1 * gib, 10 * gib, .{ .strict_live_ram = false });
+    try std.testing.expectEqual(@as(u64, 0), soft_zero.granted_optional_cache_bytes);
+    try std.testing.expect(soft_zero.cache_scaled_down);
+
+    try std.testing.expectError(
+        error.ExceedsLiveZeroSwapRam,
+        planWithLiveRam(budget, 12 * gib, 1 * gib, 10 * gib, .{ .strict_live_ram = true }),
+    );
+
+    // 4. Static ADR-0012 limit still rejects excess required wired plans regardless of live RAM.
+    try std.testing.expectError(
+        error.BudgetExceeded,
+        planWithLiveRam(budget, 18 * gib + page.APPLE_PAGE_SIZE, 0, 22 * gib, .{ .strict_live_ram = false }),
+    );
+
+    // 5. Static headroom tighter than live headroom clamps optional cache to static headroom.
+    const static_clamped = try planWithLiveRam(budget, 17 * gib, 2 * gib, 22 * gib, .{ .strict_live_ram = true });
+    try std.testing.expectEqual(@as(u64, 1 * gib), static_clamped.granted_optional_cache_bytes);
+    try std.testing.expect(static_clamped.cache_scaled_down);
+}
+
+test "scaleOptionalCount clamps cleanly between min_count and requested_count" {
+    const unit: usize = 64 * 1024;
+    try std.testing.expectEqual(@as(usize, 16), scaleOptionalCount(16, unit, 2 * 1024 * 1024, 2));
+    try std.testing.expectEqual(@as(usize, 5), scaleOptionalCount(16, unit, 5 * unit + 1234, 2));
+    try std.testing.expectEqual(@as(usize, 2), scaleOptionalCount(16, unit, unit, 2));
+    try std.testing.expectEqual(@as(usize, 0), scaleOptionalCount(16, unit, 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), scaleOptionalCount(0, unit, 1024 * 1024, 4));
+    try std.testing.expectEqual(@as(usize, 3), scaleOptionalCount(3, unit, 0, 8));
+    try std.testing.expectEqual(@as(usize, 16), scaleOptionalCount(16, 0, 0, 2));
 }

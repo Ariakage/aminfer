@@ -127,6 +127,10 @@ pub const Entry = struct {
     in_evict_list: bool,
     in_hash_table: bool,
     is_root_tail: bool,
+    /// When `true` (e.g., ChatML intra-tile message-boundary checkpoints, ADR-0020),
+    /// this unreferenced leaf is always evicted (in LRU order) before any
+    /// canonical (`evict_first == false`) entry.
+    evict_first: bool = false,
 };
 
 /// Metadata returned when an unreferenced entry is evicted so the caller can
@@ -138,6 +142,7 @@ pub const EvictedEntry = struct {
     prefix_len: u32,
     gdn_snapshot_id: u32,
     num_kv_layers: u32,
+    evict_first: bool = false,
 };
 
 pub const InsertOptions = struct {
@@ -150,6 +155,9 @@ pub const InsertOptions = struct {
     evicted_handles_out: ?[]KvBlockHandle = null,
     /// Pin the newly inserted (or already-existing) entry immediately (`pin_count += 1`).
     pin_on_insert: bool = false,
+    /// Mark this entry in the lower-priority `evict_first` tier (`C15`, ADR-0020)
+    /// so it is evicted before canonical full-tile (`evict_first == false`) entries.
+    evict_first: bool = false,
 };
 
 pub const InsertResult = struct {
@@ -224,13 +232,19 @@ pub const PrefixCache = struct {
     hash_next: []u32,
     bucket_mask: u32,
     free_head: u32,
-    evict_head: u32, // MRU evictable leaf
-    evict_tail: u32, // LRU evictable leaf
+    evict_head: u32, // MRU evictable canonical leaf (`evict_first == false`)
+    evict_tail: u32, // LRU evictable canonical leaf (`evict_first == false`)
+    evict_first_head: u32, // MRU evictable priority-victim leaf (`evict_first == true`)
+    evict_first_tail: u32, // LRU evictable priority-victim leaf (`evict_first == true`)
     root_tail_head: u32, // Root-level partial tail entries (parent == NONE_ID, valid_tokens < block_tokens)
     live_count: u32,
     pinned_count: u32,
     evictable_count: u32,
     tick: u64,
+    /// Number of `matchAndPin` hits resolved at an `evict_first` message-boundary checkpoint (`C15`).
+    boundary_hits: u64 = 0,
+    /// Number of `evict_first == true` entries evicted ahead of canonical entries (`C15`).
+    evict_first_evictions: u64 = 0,
 
     pub fn validateSpec(spec: PrefixCacheSpec) Error!void {
         if (spec.max_entries == 0 or spec.block_tokens == 0 or spec.num_kv_layers == 0) {
@@ -303,11 +317,15 @@ pub const PrefixCache = struct {
             .free_head = 0,
             .evict_head = NONE_ID,
             .evict_tail = NONE_ID,
+            .evict_first_head = NONE_ID,
+            .evict_first_tail = NONE_ID,
             .root_tail_head = NONE_ID,
             .live_count = 0,
             .pinned_count = 0,
             .evictable_count = 0,
             .tick = 0,
+            .boundary_hits = 0,
+            .evict_first_evictions = 0,
         };
         cache.reset();
         return cache;
@@ -336,6 +354,7 @@ pub const PrefixCache = struct {
                 .in_evict_list = false,
                 .in_hash_table = false,
                 .is_root_tail = false,
+                .evict_first = false,
             };
             self.hash_next[i] = NONE_ID;
         }
@@ -345,11 +364,15 @@ pub const PrefixCache = struct {
         self.free_head = 0;
         self.evict_head = NONE_ID;
         self.evict_tail = NONE_ID;
+        self.evict_first_head = NONE_ID;
+        self.evict_first_tail = NONE_ID;
         self.root_tail_head = NONE_ID;
         self.live_count = 0;
         self.pinned_count = 0;
         self.evictable_count = 0;
         self.tick = 0;
+        self.boundary_hits = 0;
+        self.evict_first_evictions = 0;
     }
 
     /// Returns the stored token slice for live entry `entry_id`.
@@ -412,6 +435,9 @@ pub const PrefixCache = struct {
 
         const h = hashBlock(parent_hash, block_tokens);
         if (self.findFullBlockByHash(parent_id, h, block_tokens)) |existing| {
+            if (self.entries[existing].evict_first and !opts.evict_first) {
+                self.promoteToCanonical(existing);
+            }
             self.touchEntry(existing);
             if (opts.pin_on_insert) {
                 self.pinUnchecked(existing);
@@ -447,6 +473,7 @@ pub const PrefixCache = struct {
             .in_evict_list = false,
             .in_hash_table = false,
             .is_root_tail = false,
+            .evict_first = opts.evict_first,
         };
 
         const tok_start = @as(usize, id) * self.spec.block_tokens;
@@ -509,6 +536,9 @@ pub const PrefixCache = struct {
             if (e.valid_tokens == tail_tokens.len) {
                 const start = @as(usize, cur) * self.spec.block_tokens;
                 if (std.mem.eql(u32, self.tokens[start .. start + e.valid_tokens], tail_tokens)) {
+                    if (e.evict_first and !opts.evict_first) {
+                        self.promoteToCanonical(cur);
+                    }
                     self.touchEntry(cur);
                     if (opts.pin_on_insert) {
                         self.pinUnchecked(cur);
@@ -548,6 +578,7 @@ pub const PrefixCache = struct {
             .in_evict_list = false,
             .in_hash_table = false,
             .is_root_tail = (parent_id == NONE_ID),
+            .evict_first = opts.evict_first,
         };
 
         const tok_start = @as(usize, id) * self.spec.block_tokens;
@@ -572,6 +603,32 @@ pub const PrefixCache = struct {
             .already_existed = false,
             .evicted = alloc_res.evicted,
         };
+    }
+
+    /// Inserts a ChatML message-boundary checkpoint (`C15`, ADR-0020) for an
+    /// arbitrary boundary block (`1 <= boundary_block_tokens.len <= block_tokens`)
+    /// chained to `parent_id`:
+    /// - Full-tile boundaries (`len == block_tokens`) insert as a full block
+    ///   (retaining `opts.evict_first`).
+    /// - Intra-tile boundaries (`1 <= len < block_tokens`) insert as a CoW tail
+    ///   block marked `evict_first = true` so canonical full-tile blocks retain
+    ///   higher eviction priority.
+    pub fn insertBoundaryCheckpoint(
+        self: *PrefixCache,
+        parent_id: u32,
+        boundary_block_tokens: []const u32,
+        layer_handles: []const KvBlockHandle,
+        opts: InsertOptions,
+    ) Error!InsertResult {
+        if (boundary_block_tokens.len == 0 or boundary_block_tokens.len > self.spec.block_tokens) {
+            return error.InvalidTokenLength;
+        }
+        if (boundary_block_tokens.len == self.spec.block_tokens) {
+            return self.insertFullBlock(parent_id, boundary_block_tokens, layer_handles, opts);
+        }
+        var tail_opts = opts;
+        tail_opts.evict_first = true;
+        return self.insertTailBlock(parent_id, boundary_block_tokens, layer_handles, tail_opts);
     }
 
     /// Matches the longest cached prefix of `prompt_tokens` with exact token
@@ -618,6 +675,7 @@ pub const PrefixCache = struct {
         var tail_entry: u32 = NONE_ID;
         var tail_len: u32 = 0;
         var tail_snap: u32 = NO_SNAPSHOT;
+        var tail_exact_boundary: bool = false;
 
         const rem_len = limit_len - offset;
         if (opts.allow_partial_tail and rem_len > 0) {
@@ -638,6 +696,8 @@ pub const PrefixCache = struct {
                 if (lcp == 0) continue;
                 // A full block match would already have been caught above; cap tail strictly < block_tokens.
                 if (lcp >= bs) lcp = bs - 1;
+                // R8 invariant: exact token-slice verification with zero hash-only hits.
+                std.debug.assert(std.mem.eql(u32, cand_tokens[0..lcp], rem_slice[0..lcp]));
 
                 if (opts.require_gdn_snapshot) {
                     // For GDN models, a recurrent snapshot is exact only when the full
@@ -647,15 +707,21 @@ pub const PrefixCache = struct {
                             tail_len = @intCast(lcp);
                             tail_entry = cur;
                             tail_snap = e.gdn_snapshot_id;
+                            tail_exact_boundary = true;
                         }
                     }
                 } else {
-                    const cand_snap = if (lcp == e.valid_tokens) e.gdn_snapshot_id else NO_SNAPSHOT;
+                    const cand_exact = (lcp == e.valid_tokens);
+                    const cand_snap = if (cand_exact) e.gdn_snapshot_id else NO_SNAPSHOT;
                     const lcp_u32: u32 = @intCast(lcp);
-                    if (lcp_u32 > tail_len or (lcp_u32 == tail_len and tail_snap == NO_SNAPSHOT and cand_snap != NO_SNAPSHOT)) {
+                    const better_len = lcp_u32 > tail_len;
+                    const better_snap = (lcp_u32 == tail_len and tail_snap == NO_SNAPSHOT and cand_snap != NO_SNAPSHOT);
+                    const better_exact = (lcp_u32 == tail_len and (tail_snap == NO_SNAPSHOT) == (cand_snap == NO_SNAPSHOT) and !tail_exact_boundary and cand_exact);
+                    if (better_len or better_snap or better_exact) {
                         tail_len = lcp_u32;
                         tail_entry = cur;
                         tail_snap = cand_snap;
+                        tail_exact_boundary = cand_exact;
                     }
                 }
             }
@@ -680,6 +746,13 @@ pub const PrefixCache = struct {
                 }
                 matched_full -= 1;
             }
+        }
+
+        // Track message-boundary checkpoint hits (`evict_first == true`).
+        if (tail_entry != NONE_ID and self.entries[tail_entry].evict_first) {
+            self.boundary_hits += 1;
+        } else if (tail_entry == NONE_ID and matched_full > 0 and self.entries[full_ids_out[matched_full - 1]].evict_first) {
+            self.boundary_hits += 1;
         }
 
         // Pin all matched full blocks + tail source and bump LRU recency.
@@ -811,11 +884,13 @@ pub const PrefixCache = struct {
 
     /// Evicts the least-recently-used unreferenced leaf entry (`pin_count == 0`
     /// and `child_count == 0`) in strict O(1) time and `0` heap allocations.
+    /// Always drains `evict_first == true` leaves (LRU within tier) before any
+    /// canonical (`evict_first == false`) entry (`C15`, ADR-0020).
     /// Copies the evicted entry's per-layer `KvBlockHandle`s into
     /// `evicted_handles_out` when non-null. Returns `error.CacheFull` if all
     /// cached entries are pinned (or have pinned descendants).
     pub fn evictLru(self: *PrefixCache, evicted_handles_out: ?[]KvBlockHandle) Error!EvictedEntry {
-        const victim = self.evict_tail;
+        const victim = if (self.evict_first_tail != NONE_ID) self.evict_first_tail else self.evict_tail;
         if (victim == NONE_ID) return error.CacheFull;
         if (evicted_handles_out) |out_buf| {
             if (out_buf.len < self.spec.num_kv_layers) return error.BufferTooSmall;
@@ -827,6 +902,9 @@ pub const PrefixCache = struct {
         std.debug.assert(e.in_use and e.pin_count == 0 and e.child_count == 0);
 
         self.evictRemove(victim);
+        if (e.evict_first) {
+            self.evict_first_evictions += 1;
+        }
         if (e.in_hash_table) {
             self.hashRemove(victim, e.hash);
         }
@@ -842,11 +920,13 @@ pub const PrefixCache = struct {
             .prefix_len = e.prefix_len,
             .gdn_snapshot_id = e.gdn_snapshot_id,
             .num_kv_layers = self.spec.num_kv_layers,
+            .evict_first = e.evict_first,
         };
 
         self.entries[victim].in_use = false;
         self.entries[victim].in_hash_table = false;
         self.entries[victim].is_root_tail = false;
+        self.entries[victim].evict_first = false;
         self.entries[victim].parent_id = NONE_ID;
         self.entries[victim].gdn_snapshot_id = NO_SNAPSHOT;
         self.entries[victim].valid_tokens = 0;
@@ -1053,6 +1133,7 @@ pub const PrefixCache = struct {
 
     fn unlinkChild(self: *PrefixCache, parent_id: u32, child_id: u32) void {
         const p = &self.entries[parent_id];
+        const child_evict_first = self.entries[child_id].evict_first;
         const prev = self.entries[child_id].prev_sibling;
         const next = self.entries[child_id].next_sibling;
         if (prev != NONE_ID) {
@@ -1069,9 +1150,15 @@ pub const PrefixCache = struct {
         std.debug.assert(p.child_count > 0);
         p.child_count -= 1;
         if (p.child_count == 0 and p.pin_count == 0 and !p.in_evict_list) {
-            // Parent was exposed because its LRU child was evicted: place at LRU
-            // tail so the evicted prefix chain reclaims before fresher branches.
-            self.evictPushTail(parent_id);
+            if (child_evict_first and !p.evict_first) {
+                // Evicting a transient `evict_first` boundary child should not demote
+                // a fresh canonical parent behind older canonical entries.
+                self.evictPushHead(parent_id);
+            } else {
+                // Parent was exposed because its LRU child was evicted: place at LRU
+                // tail so the evicted prefix chain reclaims before fresher branches.
+                self.evictPushTail(parent_id);
+            }
         }
     }
 
@@ -1111,56 +1198,77 @@ pub const PrefixCache = struct {
         e.pin_count += 1;
     }
 
+    fn promoteToCanonical(self: *PrefixCache, id: u32) void {
+        if (!self.entries[id].evict_first) return;
+        const was_in_list = self.entries[id].in_evict_list;
+        if (was_in_list) {
+            self.evictRemove(id);
+        }
+        self.entries[id].evict_first = false;
+        if (was_in_list) {
+            self.evictPushHead(id);
+        }
+    }
+
     fn touchEntry(self: *PrefixCache, id: u32) void {
         self.tick += 1;
         self.entries[id].last_access_tick = self.tick;
-        if (self.entries[id].in_evict_list and self.evict_head != id) {
-            self.evictRemove(id);
-            self.evictPushHead(id);
+        if (self.entries[id].in_evict_list) {
+            const head = if (self.entries[id].evict_first) self.evict_first_head else self.evict_head;
+            if (head != id) {
+                self.evictRemove(id);
+                self.evictPushHead(id);
+            }
         }
     }
 
     fn evictPushHead(self: *PrefixCache, id: u32) void {
         std.debug.assert(!self.entries[id].in_evict_list);
+        const head_ptr: *u32 = if (self.entries[id].evict_first) &self.evict_first_head else &self.evict_head;
+        const tail_ptr: *u32 = if (self.entries[id].evict_first) &self.evict_first_tail else &self.evict_tail;
         self.entries[id].lru_prev = NONE_ID;
-        self.entries[id].lru_next = self.evict_head;
-        if (self.evict_head != NONE_ID) {
-            self.entries[self.evict_head].lru_prev = id;
+        self.entries[id].lru_next = head_ptr.*;
+        if (head_ptr.* != NONE_ID) {
+            self.entries[head_ptr.*].lru_prev = id;
         } else {
-            self.evict_tail = id;
+            tail_ptr.* = id;
         }
-        self.evict_head = id;
+        head_ptr.* = id;
         self.entries[id].in_evict_list = true;
         self.evictable_count += 1;
     }
 
     fn evictPushTail(self: *PrefixCache, id: u32) void {
         std.debug.assert(!self.entries[id].in_evict_list);
+        const head_ptr: *u32 = if (self.entries[id].evict_first) &self.evict_first_head else &self.evict_head;
+        const tail_ptr: *u32 = if (self.entries[id].evict_first) &self.evict_first_tail else &self.evict_tail;
         self.entries[id].lru_next = NONE_ID;
-        self.entries[id].lru_prev = self.evict_tail;
-        if (self.evict_tail != NONE_ID) {
-            self.entries[self.evict_tail].lru_next = id;
+        self.entries[id].lru_prev = tail_ptr.*;
+        if (tail_ptr.* != NONE_ID) {
+            self.entries[tail_ptr.*].lru_next = id;
         } else {
-            self.evict_head = id;
+            head_ptr.* = id;
         }
-        self.evict_tail = id;
+        tail_ptr.* = id;
         self.entries[id].in_evict_list = true;
         self.evictable_count += 1;
     }
 
     fn evictRemove(self: *PrefixCache, id: u32) void {
         std.debug.assert(self.entries[id].in_evict_list);
+        const head_ptr: *u32 = if (self.entries[id].evict_first) &self.evict_first_head else &self.evict_head;
+        const tail_ptr: *u32 = if (self.entries[id].evict_first) &self.evict_first_tail else &self.evict_tail;
         const prev = self.entries[id].lru_prev;
         const next = self.entries[id].lru_next;
         if (prev != NONE_ID) {
             self.entries[prev].lru_next = next;
         } else {
-            self.evict_head = next;
+            head_ptr.* = next;
         }
         if (next != NONE_ID) {
             self.entries[next].lru_prev = prev;
         } else {
-            self.evict_tail = prev;
+            tail_ptr.* = prev;
         }
         self.entries[id].lru_prev = NONE_ID;
         self.entries[id].lru_next = NONE_ID;
@@ -1890,4 +1998,153 @@ test "R8 PrefixCache GPU end-to-end: 4 concurrent requests share 1,200-token pre
 
     // Zero hot-path arena or heap allocations occurred in PrefixCache / GdnSnapshotPool!
     try std.testing.expectEqual(arena_rem_hot_start, arena.remaining());
+}
+
+test "C15 PrefixCache evict_first priority and intra-tile ChatML message-boundary CoW hits" {
+    const spec: PrefixCacheSpec = .{
+        .max_entries = 6,
+        .block_tokens = 16,
+        .num_kv_layers = 2,
+    };
+    const need = try PrefixCache.requiredBytes(spec);
+    var arena = try arena_mod.WiredArena.init(need, makeTestBudget(need));
+    defer arena.deinit();
+
+    var cache = try PrefixCache.init(&arena, spec);
+
+    const makeHandles = struct {
+        fn build(base: u32) [2]KvBlockHandle {
+            return .{
+                .{ .k_tex_id = base * 10 + 1, .v_tex_id = base * 10 + 2, .pool_slot_id = base, .storage = .active_tile },
+                .{ .k_tex_id = base * 10 + 3, .v_tex_id = base * 10 + 4, .pool_slot_id = base + 100, .storage = .active_tile },
+            };
+        }
+    }.build;
+
+    // 1. Insert two older canonical full-tile blocks (`evict_first = false`).
+    var blk_old_a: [16]u32 = undefined;
+    var blk_old_b: [16]u32 = undefined;
+    for (0..16) |i| {
+        blk_old_a[i] = @intCast(100 + i);
+        blk_old_b[i] = @intCast(200 + i);
+    }
+    const old_a = try cache.insertFullBlock(NONE_ID, &blk_old_a, &makeHandles(1), .{ .gdn_snapshot_id = 1 });
+    const old_b = try cache.insertFullBlock(NONE_ID, &blk_old_b, &makeHandles(2), .{ .gdn_snapshot_id = 2 });
+
+    // 2. Insert a multi-turn ChatML prefix: 2 canonical full blocks (32 tok) +
+    //    an intra-tile message-boundary checkpoint at token 39 (+7 tokens, `evict_first = true`).
+    var chat_b0: [16]u32 = undefined;
+    var chat_b1: [16]u32 = undefined;
+    for (0..16) |i| {
+        chat_b0[i] = @intCast(1000 + i);
+        chat_b1[i] = @intCast(1100 + i);
+    }
+    const boundary_tail = [_]u32{ 1200, 1201, 1202, 1203, 1204, 1205, 1206 };
+    const root_boundary = [_]u32{ 500, 501, 502, 503, 504 };
+
+    const cb0 = try cache.insertFullBlock(NONE_ID, &chat_b0, &makeHandles(3), .{ .gdn_snapshot_id = 3 });
+    const cb1 = try cache.insertFullBlock(cb0.entry_id, &chat_b1, &makeHandles(4), .{ .gdn_snapshot_id = 4 });
+    const msg_ckpt = try cache.insertBoundaryCheckpoint(cb1.entry_id, &boundary_tail, &makeHandles(5), .{
+        .gdn_snapshot_id = 55,
+    });
+    try std.testing.expect((try cache.entryInfo(msg_ckpt.entry_id)).evict_first);
+
+    // Also insert an arbitrary `< block_tokens` root message-boundary checkpoint (`evict_first = true`).
+    const root_ckpt = try cache.insertTailBlock(NONE_ID, &root_boundary, &makeHandles(6), .{
+        .gdn_snapshot_id = 66,
+        .evict_first = true,
+    });
+    try std.testing.expect((try cache.entryInfo(root_ckpt.entry_id)).evict_first);
+    try std.testing.expectEqual(@as(u32, 6), cache.liveEntries());
+
+    // 3. Edit the final user message after token 39: prompt shares [0..39] and diverges at [39..46].
+    var edited_prompt: [46]u32 = undefined;
+    @memcpy(edited_prompt[0..16], &chat_b0);
+    @memcpy(edited_prompt[16..32], &chat_b1);
+    @memcpy(edited_prompt[32..39], &boundary_tail);
+    for (39..46) |i| edited_prompt[i] = @intCast(9000 + i);
+
+    var full_ids: [4]u32 = undefined;
+    var m1 = try cache.matchAndPin(&edited_prompt, &full_ids, .{
+        .max_match_tokens = edited_prompt.len - 1,
+        .allow_partial_tail = true,
+        .require_gdn_snapshot = true,
+    });
+    try std.testing.expectEqual(@as(u32, 39), m1.matched_tokens);
+    try std.testing.expectEqual(@as(u32, 2), m1.full_block_count);
+    try std.testing.expectEqual(msg_ckpt.entry_id, m1.tail_entry_id);
+    try std.testing.expectEqual(@as(u32, 7), m1.tail_tokens);
+    try std.testing.expectEqual(@as(u32, 55), m1.gdn_snapshot_id);
+    try std.testing.expectEqual(@as(u64, 1), cache.boundary_hits);
+
+    // Verify pinning protects `msg_ckpt` while `m1` holds its ref, so `evictLru`
+    // evicts the OTHER unpinned `evict_first` entry (`root_ckpt`) BEFORE older canonical tiles!
+    var ev_buf: [2]KvBlockHandle = undefined;
+    const ev1 = try cache.evictLru(&ev_buf);
+    try std.testing.expectEqual(root_ckpt.entry_id, ev1.entry_id);
+    try std.testing.expect(ev1.evict_first);
+    try std.testing.expectEqual(@as(u64, 1), cache.evict_first_evictions);
+
+    // Re-insert `root_ckpt` and test exact token-slice verification on a 1-token pre-boundary mismatch.
+    const root_ckpt2 = try cache.insertTailBlock(NONE_ID, &root_boundary, &makeHandles(7), .{
+        .gdn_snapshot_id = 77,
+        .evict_first = true,
+    });
+    const mismatch_prompt = [_]u32{ 500, 501, 9999, 503, 504, 505 };
+    var m_mis = try cache.matchAndPin(&mismatch_prompt, &full_ids, .{
+        .max_match_tokens = mismatch_prompt.len - 1,
+        .allow_partial_tail = true,
+        .require_gdn_snapshot = true,
+    });
+    try std.testing.expectEqual(@as(u32, 0), m_mis.matched_tokens);
+    try cache.releaseMatch(&m_mis, &full_ids);
+
+    // Exact root boundary hit increments `boundary_hits` again and restores GDN snapshot 77.
+    const root_edited = [_]u32{ 500, 501, 502, 503, 504, 8888, 8889 };
+    var m_root = try cache.matchAndPin(&root_edited, &full_ids, .{
+        .max_match_tokens = root_edited.len - 1,
+        .allow_partial_tail = true,
+        .require_gdn_snapshot = true,
+    });
+    try std.testing.expectEqual(@as(u32, 5), m_root.matched_tokens);
+    try std.testing.expectEqual(root_ckpt2.entry_id, m_root.tail_entry_id);
+    try std.testing.expectEqual(@as(u32, 77), m_root.gdn_snapshot_id);
+    try std.testing.expectEqual(@as(u64, 2), cache.boundary_hits);
+
+    // Release `m1` first (becomes LRU in `evict_first` tier), then `m_root` (MRU in `evict_first` tier).
+    try cache.releaseMatch(&m1, &full_ids);
+    try cache.releaseMatch(&m_root, &full_ids);
+    try std.testing.expectEqual(@as(u32, 0), cache.pinnedEntries());
+
+    // Even though `old_a` and `old_b` are much older canonical entries, BOTH `evict_first`
+    // entries (`msg_ckpt` LRU, then `root_ckpt2` MRU) MUST evict BEFORE `old_a` / `old_b`!
+    const ev2 = try cache.evictLru(&ev_buf);
+    try std.testing.expectEqual(msg_ckpt.entry_id, ev2.entry_id);
+    try std.testing.expect(ev2.evict_first);
+
+    const ev3 = try cache.evictLru(&ev_buf);
+    try std.testing.expectEqual(root_ckpt2.entry_id, ev3.entry_id);
+    try std.testing.expect(ev3.evict_first);
+    try std.testing.expectEqual(@as(u64, 3), cache.evict_first_evictions);
+
+    // Now the `evict_first` tier is empty: canonical LRU evicts `old_a` first, NOT fresh `cb1`!
+    const ev4 = try cache.evictLru(&ev_buf);
+    try std.testing.expectEqual(old_a.entry_id, ev4.entry_id);
+    try std.testing.expect(!ev4.evict_first);
+
+    const ev5 = try cache.evictLru(&ev_buf);
+    try std.testing.expectEqual(old_b.entry_id, ev5.entry_id);
+    try std.testing.expect(!ev5.evict_first);
+
+    // Promoting an `evict_first` entry to canonical via re-insert with `evict_first = false`.
+    const promo = try cache.insertTailBlock(cb1.entry_id, &boundary_tail, &makeHandles(8), .{
+        .evict_first = true,
+    });
+    try std.testing.expect((try cache.entryInfo(promo.entry_id)).evict_first);
+    const promo2 = try cache.insertTailBlock(cb1.entry_id, &boundary_tail, &makeHandles(8), .{
+        .evict_first = false,
+    });
+    try std.testing.expect(promo2.already_existed);
+    try std.testing.expectEqual(promo.entry_id, promo2.entry_id);
+    try std.testing.expect(!(try cache.entryInfo(promo.entry_id)).evict_first);
 }
