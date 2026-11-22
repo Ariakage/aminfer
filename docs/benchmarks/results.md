@@ -4541,7 +4541,7 @@ def binary_search(arr, target):
 
 ## M6.5 continuous batching, long-context KV tiering, shared prefix cache, and zero-copy multimodal ingress
 
-Captured on 2026-11-22 on Apple M4 24 GiB (macOS 27.2, `ReleaseFast`, commits `9f1efa7..37ecb74`, `18,186 MiB` wired budget, `swapouts_delta = 0` across all runs). Capabilities verified: `R5`, `R8`, `G14`, and `C14` ([ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md), [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
+Captured on 2026-11-22 on Apple M4 24 GiB (macOS 27.2, `ReleaseFast`, commits `9f1efa7..990d2a4`, `18,186 MiB` wired budget, `swapouts_delta = 0` across all runs). Capabilities verified: `R5`, `R8`, `G14`, and `C14` ([ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md), [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
 
 ### Summary tables
 
@@ -4549,10 +4549,10 @@ Captured on 2026-11-22 on Apple M4 24 GiB (macOS 27.2, `ReleaseFast`, commits `9
 
 | Path | HW VT | Zero-copy | 16 KiB aligned | VT decode (`us`) | GPU vision + MRoPE (`us`) | Total (`us`) | Throughput (`fps`) | GPU traffic (`GB/s`) |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `vt_h264_nv12` | yes | yes | yes | 547.1 | 8,315.5 | 8,862.6 | 112.8 | 0.68 |
-| `vt_hevc_nv12` | yes | yes | yes | 628.0 | 6,824.3 | 7,452.2 | 134.2 | 0.83 |
-| `vt_h264_bgra8` | yes | yes | yes | 1,001.9 | 6,542.6 | 7,544.5 | 132.5 | 0.94 |
-| `vt_hevc_bgra8` | yes | yes | yes | 546.7 | 6,560.7 | 7,107.4 | 140.7 | 0.94 |
+| `vt_h264_nv12` | yes | yes | yes | 591.8 | 9,355.3 | 9,947.1 | 100.5 | 0.60 |
+| `vt_hevc_nv12` | yes | yes | yes | 461.3 | 6,816.3 | 7,277.6 | 137.4 | 0.83 |
+| `vt_h264_bgra8` | yes | yes | yes | 805.0 | 6,513.3 | 7,318.3 | 136.6 | 0.94 |
+| `vt_hevc_bgra8` | yes | yes | yes | 883.8 | 6,598.6 | 7,482.5 | 133.6 | 0.93 |
 
 End-to-end `qwen4_exp` (`synth-qwen4 --preset tiny-qwen4`) with `--vt-test-video hevc` decodes 2 `128x128` NV12 frames via hardware VideoToolbox (`zero_copy = yes`, `page16k = yes`), produces `32` merged visual tokens (`grid = 2x4x4`, `vision_encode_us = 2,400.38 us`), advances interleaved 3D MRoPE to `vision_next_mrope_pos = 25` (`21` prefix text tokens + `max(2, 4, 4)`), and decodes at `865.82 tok/s` (`swapouts_delta = 0`). The patch embedding linear projection (`2352 -> 1024`) over `256` tokens is compute-bound on the M4 GPU, which accounts for the sub-1 GB/s reported weight/activation memory traffic metric.
 
@@ -4560,9 +4560,9 @@ End-to-end `qwen4_exp` (`synth-qwen4 --preset tiny-qwen4`) with `--vt-test-video
 
 | Benchmark | Pure `fp16` IOSurface | Tiered `q8` retired + active `fp16` | Delta / Notes |
 | --- | --- | --- | --- |
-| 32K 1-layer wired KV (`q=32, kv=4, d=128`) | `64.00 MiB` (`64` tiles) | `35.88 MiB` (`4.00` active + `31.88` retired `q8`) | `-28.13 MiB/layer` (`-43.95%`), retire `20.09 us/chunk` |
-| 32K decode attention | `934.51 us` (`71.81 GB/s`) | `914.63 us` (`41.13 GB/s`) | `-2.1%` latency, `max_abs_err = 0.000006` |
-| 32K `M = 16` tree verify attention | `11,461.56 us` (`5.86 GB/s`) | `10,514.65 us` (`3.58 GB/s`) | `-8.3%` latency, `max_abs_err = 0.000006` |
+| 32K 1-layer wired KV (`q=32, kv=4, d=128`) | `64.00 MiB` (`64` tiles) | `35.88 MiB` (`4.00` active + `31.88` retired `q8`) | `-28.13 MiB/layer` (`-43.95%`), retire `22.04 us/chunk` |
+| 32K decode attention | `1,143.17 us` (`58.70 GB/s`) | `1,076.40 us` (`34.95 GB/s`) | `-5.8%` latency, `max_abs_err = 0.000006` |
+| 32K `M = 16` tree verify attention | `13,403.57 us` (`5.01 GB/s`) | `11,421.67 us` (`3.29 GB/s`) | `-14.8%` latency, `max_abs_err = 0.000006` |
 | Real `Qwen3-0.6B` BF16 (`1,358` prompt tok, `--kv-retire-q8-after-chunks 1`) | `1,307 MiB` wired, `62.74 tok/s`, `84.75 GB/s`, `0` malloc delta | `1,255 MiB` wired (`active=56.00`, `retired_q8=59.50`), `65.12 tok/s`, `84.38 GB/s`, `0` malloc delta | `-52 MiB` wired (`-31.25%` KV at 3 chunks), `+3.8%` tok/s, `25/25` identical `token_ids` |
 
 Trade-offs: `R5` lowers effective GB/s during attention because group-64 `q8` dequantization adds arithmetic per element and introduces a small numerical error (`max_abs_err = 0.000006`), while cutting per-layer wired KV bytes by `43.95%` at 32K tokens (`46.875%` per retired chunk) and preserving exact greedy output tokens on the 1,358-token `Qwen3-0.6B` test prompt.
@@ -4571,13 +4571,13 @@ Trade-offs: `R5` lowers effective GB/s during attention because group-64 `q8` de
 
 | Measurement | Uncached baseline | Cached (`PrefixCache`) | Speedup / Savings |
 | --- | --- | --- | --- |
-| `bench-m65` exact `1,024`-tok prefix + `16`-tok suffix | `25.507 ms` | `0.967 ms` (`matched=1024, cow=0`) | `26.38x` faster prefill |
-| `bench-m65` partial `1,200`-tok prefix + `16`-tok suffix | `41.835 ms` | `1.283 ms` (`matched=1200, cow=1`, `bit_exact=yes`) | `32.61x` faster prefill (`cow_tail_176tok = 121.79 us`) |
+| `bench-m65` exact `1,024`-tok prefix + `16`-tok suffix | `26.660 ms` | `3.500 ms` (`matched=1024, cow=0`) | `7.62x` faster prefill |
+| `bench-m65` partial `1,200`-tok prefix + `16`-tok suffix | `44.669 ms` | `1.407 ms` (`matched=1200, cow=1`, `bit_exact=yes`) | `31.76x` faster prefill (`cow_tail_176tok = 101.80 us`) |
 | `bench-m65` wired KV saved (`1,024`-tok shared prefix) | — | `4` slots: `12.00 MiB`, `8` slots: `28.00 MiB` (`4L` synth) | `Qwen3-30B-A3B` 48L, `8` slots: `672.0 MiB` saved |
-| `bench-m65` 36-layer `GDN` snapshot clone (`73.69 MiB`) | — | `1,761.19 us` (`87.74 GB/s`, `bit_exact=yes`) | Single GPU dispatch (`ami_gdn_clone_state`) |
+| `bench-m65` 36-layer `GDN` snapshot clone (`73.69 MiB`) | — | `2,100.15 us` (`73.58 GB/s`, `bit_exact=yes`) | Single GPU dispatch (`ami_gdn_clone_state`) |
 | Live `aminfer serve` (`qwen3-0.6b-gsq-rco.amf`, `~728`-tok prompt, `4` concurrent clients) | Cold 1-client TTFT `566.75 ms` | Warm 4-client TTFT p50 `63.93 ms`, p99 `83.91 ms`, `297.49 agg tok/s` | `8.87x` lower TTFT p50 (`2,849` prefix hit tokens across `4` clients, `0` swapouts) |
 
-Trade-offs: prefix caching reserves additional wired KV tiles for cached entries (raising `qwen3-0.6b-gsq-rco.amf` wired RAM from `2,361 MiB` to `3,257 MiB` with `--prefix-cache-chunks 16`) and incurs a GPU copy-on-write pass (`121.79 us` for 176 tokens across 4 layers) whenever a shared prefix does not end on a 512-token tile boundary.
+Trade-offs: prefix caching reserves additional wired KV tiles for cached entries (raising `qwen3-0.6b-gsq-rco.amf` wired RAM from `2,361 MiB` to `3,257 MiB` with `--prefix-cache-chunks 16`) and incurs a GPU copy-on-write pass (`101.80 us` for 176 tokens across 4 layers) whenever a shared prefix does not end on a 512-token tile boundary.
 
 #### 4. `C14` continuous batching (`B = 1..8`) and `DomainNgramRegistry` multi-pack `.ang` routing
 
@@ -4585,8 +4585,8 @@ Synthetic `bench-m65` scaling (`B = 1, 2, 4, 8`):
 
 | Backend | `B = 1` agg (`tok/s`) | `B = 2` agg (`tok/s`) | `B = 4` agg (`tok/s`) | `B = 8` agg (`tok/s`) | `B = 8` scaling |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| GQA + MoE `q4` (`Qwen3BatchRuntime`) | 1,096.56 | 2,354.53 (`2.15x`) | 5,427.10 (`4.95x`) | 7,916.91 | `7.22x` |
-| Hybrid `GDN + QSA + MoE q4` (`GraphBatchRuntime`) | 1,347.31 | 2,743.87 (`2.04x`) | 4,726.71 (`3.51x`) | 9,123.50 | `6.77x` |
+| GQA + MoE `q4` (`Qwen3BatchRuntime`) | 1,413.88 | 2,411.58 (`1.71x`) | 4,469.23 (`3.16x`) | 7,052.57 | `4.99x` |
+| Hybrid `GDN + QSA + MoE q4` (`GraphBatchRuntime`) | 1,297.61 | 2,376.49 (`1.83x`) | 3,723.90 (`2.87x`) | 8,752.01 | `6.74x` |
 
 Live `aminfer serve` (`--batch-mode serial` vs `--batch-mode continuous`, `--max-seq-len 2048 --max-active-requests 8`, `swapouts_delta = 0`, `D11` explicit `seed = 12345` at `T = 0.7` and `T = 0` greedy bit-exact across serial and continuous):
 
@@ -4602,55 +4602,55 @@ Live `aminfer serve` (`--batch-mode serial` vs `--batch-mode continuous`, `--max
 Trade-offs:
 - Continuous batching increases per-slot TPOT under load (`14.36 -> 22.64 ms` on BF16 and `4.95 -> 13.72 ms` on GSQ+RCO at `C = 8`) because each decode step computes `M = 8` projections and attention across 8 active KV sequences, and increases preallocated wired KV pool size (`1,363 -> 3,189 MiB` on BF16; `535 -> 2,361 MiB` on GSQ+RCO at `max_seq_len = 2048, max_active_requests = 8`). In exchange, aggregate token throughput rises `3.94x–7.60x` and queue-induced TTFT p50/p99 drops `12.5x–22.7x`.
 - Zig scheduler, HTTP/SSE, and `DomainNgramRegistry` hot paths perform `0` heap allocations (`ngram.steady_malloc_blocks = 0` in `bench-m65`, `0` net blocks in `http_sse.zig` continuous-batching and endpoint tests, and `decode.malloc_blocks_delta = 0` on `Qwen3-0.6B` after 1,358 prefill frames). During short Metal 4 serving bursts (`< ~1,000` GPU commits), macOS 26.0 Metal 4 driver-internal `64 B` tracking slabs grow by `~2` blocks/frame (`206–1,596` blocks in the `16`-request serve sweeps) until the driver pool stabilizes.
-- Multi-pack `DomainNgramRegistry` built with real `/Volumes/Akari/models/amf/aminfer-repo.ang` (`128.02 MiB`, `879,949` entries) and `/Volumes/Akari/models/amf/aminfer-docs.ang` (`32.02 MiB`, `198,113` entries, `table_crc32 = 0xc1f2f6ed`): `540,672 B` (`528 KiB`) wired LRU cache, cold `F_NOCACHE` lookup `p50 = 1.08 us` / `p99 = 1.79 us`, LRU cache hit `0.04 us`, `selectDefaultDomain` `3.6 ns`, live atomic `swapDomainPack` `12.46 us`, `steady_malloc_blocks = 0`. Live `aminfer serve` verified `GET /v1/ngram-packs`, per-request `"ngram_domain"` routing (`repo`, `docs`, and HTTP `400` on unknown `"nonexistent"`), and `POST /v1/ngram-packs/select`.
+- Multi-pack `DomainNgramRegistry` built with real `/Volumes/Akari/models/amf/aminfer-repo.ang` (`128.02 MiB`, `879,949` entries) and `/Volumes/Akari/models/amf/aminfer-docs.ang` (`32.02 MiB`, `198,113` entries, `table_crc32 = 0xc1f2f6ed`): `540,672 B` (`528 KiB`) wired LRU cache, uncached `F_NOCACHE` lookup (`verify_table_crc = false`, key probe also opened via `F_NOCACHE` to avoid warming XNU UBC) `p50 = 257.88 us` / `p99 = 418.92 us`, LRU cache hit `0.05 us`, `selectDefaultDomain` `3.6 ns`, live atomic `swapDomainPack` `305.75 us`, `steady_malloc_blocks = 0`. Note that because the benchmark extracts sample keys from the same 32 `.ang` buckets immediately prior to timing, `257.88–418.92 us` can hit external-SSD controller DRAM rather than unaccessed NAND flash (`396–1,208 us` in M5 cold external-SSD queries). Live `aminfer serve` verified `GET /v1/ngram-packs`, per-request `"ngram_domain"` routing (`repo`, `docs`, and HTTP `400` on unknown `"nonexistent"`), and `POST /v1/ngram-packs/select`.
 
 ### Verbatim `aminfer bench-m65` output (`ReleaseFast`)
 
 ```text
 === M6.5 G14 Zero-Copy Hardware VideoToolbox + Metal 4 Vision Ingress ===
 path             res      tokens  hw_vt  zero_copy  page16k  vt_us     gpu_us    total_us  fps      gpu_gbs  malloc_blk
-vt_h264_nv12     448x448  256     yes    yes        yes      547.1     8315.5    8862.6    112.8    0.68     34
-vt_hevc_nv12     448x448  256     yes    yes        yes      628.0     6824.3    7452.2    134.2    0.83     32
-vt_h264_bgra8    448x448  256     yes    yes        yes      1001.9    6542.6    7544.5    132.5    0.94     32
-vt_hevc_bgra8    448x448  256     yes    yes        yes      546.7     6560.7    7107.4    140.7    0.94     3
+vt_h264_nv12     448x448  256     yes    yes        yes      591.8     9355.3    9947.1    100.5    0.60     34
+vt_hevc_nv12     448x448  256     yes    yes        yes      461.3     6816.3    7277.6    137.4    0.83     32
+vt_h264_bgra8    448x448  256     yes    yes        yes      805.0     6513.3    7318.3    136.6    0.94     15
+vt_hevc_bgra8    448x448  256     yes    yes        yes      883.8     6598.6    7482.5    133.6    0.93     -19
 
 === M6.5 R5 32K Retired Group-64 q8 KV Tier (1 Layer) ===
 r5.geometry                      q=32 kv=4 d=128 chunk=512 seq_len=32768 (60 retired q8 + 4 active fp16)
 r5.pure_fp16_mib_per_layer       64.00 (67108864 bytes)
 r5.tiered_q8_mib_per_layer       35.88 (active=4.00 MiB, retired_q8=31.88 MiB, 37617664 bytes)
 r5.wired_saved_per_layer         28.13 MiB (-43.95%)
-r5.retire_per_chunk_us           20.09 (total 60 chunks: 1205.3 us)
-r5.decode_fp16_vs_tiered_us      fp16=934.51 us (71.81 GB/s) vs tiered_q8=914.63 us (41.13 GB/s)
-r5.tree_m16_fp16_vs_tiered_us    fp16=11461.56 us (5.86 GB/s) vs tiered_q8=10514.65 us (3.58 GB/s)
+r5.retire_per_chunk_us           22.04 (total 60 chunks: 1322.7 us)
+r5.decode_fp16_vs_tiered_us      fp16=1143.17 us (58.70 GB/s) vs tiered_q8=1076.40 us (34.95 GB/s)
+r5.tree_m16_fp16_vs_tiered_us    fp16=13403.57 us (5.01 GB/s) vs tiered_q8=11421.67 us (3.29 GB/s)
 r5.max_abs_err                   decode=0.000006 tree=0.000006
 
 === M6.5 R8 Shared PrefixCache + GPU CoW Tail + GDN Snapshot Clone ===
-r8.exact_prefix_1024tok           uncached=25.507 ms vs cached=0.967 ms (26.38x, matched=1024, cow=0)
-r8.partial_prefix_1200tok         uncached=41.835 ms vs cached=1.283 ms (32.61x, matched=1200, cow=1, bit_exact=yes)
-r8.cow_tail_176tok_us             121.79 us
+r8.exact_prefix_1024tok           uncached=26.660 ms vs cached=3.500 ms (7.62x, matched=1024, cow=0)
+r8.partial_prefix_1200tok         uncached=44.669 ms vs cached=1.407 ms (31.76x, matched=1200, cow=1, bit_exact=yes)
+r8.cow_tail_176tok_us             101.80 us
 r8.kv_wired_saved_mib            4_slots=12.00 MiB 8_slots=28.00 MiB (Qwen3-30B-48L 8_slots=672.0 MiB)
-r8.gdn_snapshot_clone            layers=36 bytes=77266944 (73.69 MiB) clone_us=1761.19 (87.74 GB/s, bit_exact=yes)
+r8.gdn_snapshot_clone            layers=36 bytes=77266944 (73.69 MiB) clone_us=2100.15 (73.58 GB/s, bit_exact=yes)
 
 === M6.5 C14 Continuous Batching Scaling (GQA + MoE q4) ===
 batch  step_ms   slot_tok_s  agg_tok_s   scaling_vs_b1  malloc_blk
-B=1    0.912     1096.56     1096.56     1.00           32
-B=2    0.849     1177.26     2354.53     2.15           32
-B=4    0.737     1356.78     5427.10     4.95           32
-B=8    1.010     989.61      7916.91     7.22           32
+B=1    0.707     1413.88     1413.88     1.00           16
+B=2    0.829     1205.79     2411.58     1.71           16
+B=4    0.895     1117.31     4469.23     3.16           272
+B=8    1.134     881.57      7052.57     4.99           16
 
 === M6.5 C14 Continuous Batching Scaling (Hybrid GDN + QSA + MoE q4) ===
 batch  step_ms   slot_tok_s  agg_tok_s   scaling_vs_b1  malloc_blk
-B=1    0.742     1347.31     1347.31     1.00           30
-B=2    0.729     1371.93     2743.87     2.04           34
-B=4    0.846     1181.68     4726.71     3.51           34
-B=8    0.877     1140.44     9123.50     6.77           32
+B=1    0.771     1297.61     1297.61     1.00           15
+B=2    0.842     1188.24     2376.49     1.83           16
+B=4    1.074     930.97      3723.90     2.87           14
+B=8    0.914     1094.00     8752.01     6.74           16
 
 === M6.5 C14 DomainNgramRegistry Multi-Pack Lookup & Atomic Hot-Swap ===
 ngram.packs                      source=real-ang count=2 total_entries=1078062 wired_bytes=540672
-ngram.cold_query_us              p50=1.08 p99=1.79
-ngram.cache_hit_us               0.04
+ngram.cold_query_us              p50=257.88 p99=418.92
+ngram.cache_hit_us               0.05
 ngram.select_default_ns          3.6
-ngram.atomic_swap_pack_us        12.46
+ngram.atomic_swap_pack_us        305.75
 ngram.domain_hits                repo=32 docs=32
 ngram.steady_malloc_blocks       0
 
