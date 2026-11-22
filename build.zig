@@ -36,6 +36,7 @@ const kernel_sources = [_][]const u8{
     "src/kernels/moe_ffn.metal",
     "src/kernels/hybrid_ops.metal",
     "src/kernels/vision_ingress.metal",
+    "src/kernels/nax_tensorops.metal",
 };
 
 pub fn build(b: *std.Build) void {
@@ -57,11 +58,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // All Metal kernels compiled into one library that the binary embeds.
+    // All Metal kernels compiled into one library that the binary embeds
+    // (including Apple10+ MetalPerformancePrimitives NAX TensorOps, ADR-0021).
+    const sdk = sdkPath(b);
     const metal = b.addSystemCommand(&.{
         "xcrun",         "-sdk",  "macosx",  "metal",
         "-std=metal4.0", "-Wall", "-Werror", "-mmacosx-version-min=26.0",
+        "-F",
     });
+    metal.addArg(b.fmt("{s}/System/Library/Frameworks", .{sdk}));
     for (kernel_sources) |src| metal.addFileArg(b.path(src));
     metal.addArg("-o");
     const metallib = metal.addOutputFileArg("aminfer.metallib");
@@ -76,7 +81,7 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("aminfer_metallib", .{ .root_source_file = metallib });
     mod.addImport("aminfer", mod);
     mod.addIncludePath(b.path("src/bridge"));
-    addMacosSdkPaths(b, mod);
+    addMacosSdkPaths(b, mod, sdk);
     mod.addCSourceFiles(.{ .files = &.{"src/bridge/apple_bridge.m"}, .flags = &objc_flags });
     mod.addCSourceFiles(.{ .files = &.{"src/cpu/sme2_kernels.s"}, .flags = &sme2_asm_flags });
     for (frameworks) |name| mod.linkFramework(name, .{});
@@ -163,10 +168,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
 }
 
+/// Resolves the active macOS SDK path once per build invocation.
+fn sdkPath(b: *std.Build) []const u8 {
+    return std.mem.trimEnd(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), "\r\n");
+}
+
 /// Overriding the minimum OS version makes the target non-native, and Zig then
 /// stops locating the macOS SDK on its own. Resolve it with `xcrun` instead.
-fn addMacosSdkPaths(b: *std.Build, mod: *std.Build.Module) void {
-    const sdk = std.mem.trimEnd(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), "\n");
+fn addMacosSdkPaths(b: *std.Build, mod: *std.Build.Module, sdk: []const u8) void {
     mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
     mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });

@@ -12,20 +12,115 @@ const quant = @import("../quant/spec.zig");
 const amf = @import("../format/amf.zig");
 const vmstat = @import("../platform/vmstat.zig");
 
-/// Prefill matmul backend selection hook (G16, ADR-0020).
-/// `.nax_apple10_reserved` reserves the dispatch interface for future M5+
-/// `Apple10` Neural Accelerator (`mpp::tensor_ops::matmul2d`) shaders while
-/// staying on verified `Apple9` `simdgroup_matrix` kernels until `Apple10`
-/// hardware validation completes.
+/// CLI / runtime policy for prefill matmul backend selection (`--prefill-matmul-backend`, ADR-0021).
+pub const PrefillBackendMode = enum(u8) {
+    auto = 0,
+    simdgroup = 1,
+    nax = 2,
+
+    pub fn parse(text: []const u8) ?PrefillBackendMode {
+        if (std.mem.eql(u8, text, "auto")) return .auto;
+        if (std.mem.eql(u8, text, "simdgroup")) return .simdgroup;
+        if (std.mem.eql(u8, text, "nax")) return .nax;
+        return null;
+    }
+
+    pub fn label(self: PrefillBackendMode) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .simdgroup => "simdgroup",
+            .nax => "nax",
+        };
+    }
+};
+
+/// Diagnostic reason why `NAX` TensorOps is inactive and prefill stays on
+/// `simdgroup_apple9` (`G16` + `G17`, ADR-0021).
+pub const NaxFallbackReason = enum(u8) {
+    none = 0,
+    forced_simdgroup = 1,
+    unsupported_gpu_family = 2,
+    nax_function_missing = 3,
+    nax_pso_compile_failed = 4,
+    nax_canary_failed = 5,
+
+    pub fn label(self: NaxFallbackReason) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .forced_simdgroup => "forced_simdgroup",
+            .unsupported_gpu_family => "unsupported_gpu_family",
+            .nax_function_missing => "nax_function_missing",
+            .nax_pso_compile_failed => "nax_pso_compile_failed",
+            .nax_canary_failed => "nax_canary_failed",
+        };
+    }
+};
+
+/// Active prefill matmul backend (`G16` / `G17`, ADR-0020, ADR-0021).
+/// Keeps `.nax_apple10_reserved` as the enum tag name so existing M6.8
+/// exhaustive `switch` sites compile unchanged, while exposing `nax_apple10`
+/// and `isNax()` for M6.9+ callers.
 pub const PrefillMatmulBackend = enum(u8) {
     simdgroup_apple9 = 0,
     nax_apple10_reserved = 1,
+
+    pub const nax_apple10: PrefillMatmulBackend = .nax_apple10_reserved;
+
+    pub fn isNax(self: PrefillMatmulBackend) bool {
+        return self == .nax_apple10_reserved;
+    }
+
+    pub fn label(self: PrefillMatmulBackend) []const u8 {
+        return switch (self) {
+            .simdgroup_apple9 => "simdgroup_apple9",
+            .nax_apple10_reserved => "nax_apple10",
+        };
+    }
 };
 
-pub fn selectPrefillMatmulBackend(info: metal.DeviceInfo) PrefillMatmulBackend {
-    _ = info.supportsApple10();
-    return .simdgroup_apple9;
+pub const BackendDecision = struct {
+    backend: PrefillMatmulBackend,
+    fallback_reason: NaxFallbackReason,
+};
+
+pub fn selectPrefillMatmulBackendWithMode(
+    info: metal.DeviceInfo,
+    mode: PrefillBackendMode,
+) BackendDecision {
+    return switch (mode) {
+        .simdgroup => .{
+            .backend = .simdgroup_apple9,
+            .fallback_reason = .forced_simdgroup,
+        },
+        .auto, .nax => if (info.supportsNaxTensorOps())
+            .{
+                .backend = PrefillMatmulBackend.nax_apple10,
+                .fallback_reason = .none,
+            }
+        else
+            .{
+                .backend = .simdgroup_apple9,
+                .fallback_reason = .unsupported_gpu_family,
+            },
+    };
 }
+
+pub fn selectPrefillMatmulBackend(info: metal.DeviceInfo) PrefillMatmulBackend {
+    return selectPrefillMatmulBackendWithMode(info, .auto).backend;
+}
+
+pub const DequantInitOptions = struct {
+    norm_bf16_also: bool = false,
+    backend_mode: PrefillBackendMode = .auto,
+    strict_nax: bool = false,
+    simulate_nax_canary_failure: bool = false,
+};
+
+pub const InitError = metal.Error || error{
+    NaxRequiresApple10Gpu,
+    NaxFunctionMissing,
+    NaxPipelineCompileFailed,
+};
 
 pub const CANARY_TOL_F16: f32 = 2e-3;
 pub const CANARY_TOL_BF16: f32 = 2e-2;
@@ -41,6 +136,48 @@ pub const CanaryResult = struct {
     max_abs_err_f16: f32,
     max_abs_err_bf16: f32,
     max_abs_err_q4: f32,
+    nax_tested: bool = false,
+    nax_demoted: bool = false,
+    active_backend: PrefillMatmulBackend = .simdgroup_apple9,
+    nax_fallback_reason: NaxFallbackReason = .none,
+};
+
+const NaxRuntimeState = struct {
+    active_backend: std.atomic.Value(u8),
+    fallback_reason: std.atomic.Value(u8),
+    canary_demoted: std.atomic.Value(u8),
+
+    fn init(backend: PrefillMatmulBackend, reason: NaxFallbackReason) NaxRuntimeState {
+        return .{
+            .active_backend = std.atomic.Value(u8).init(@backingInt(backend)),
+            .fallback_reason = std.atomic.Value(u8).init(@backingInt(reason)),
+            .canary_demoted = std.atomic.Value(u8).init(0),
+        };
+    }
+
+    fn getBackend(self: *const NaxRuntimeState) PrefillMatmulBackend {
+        return @fromBackingInt(@intCast(self.active_backend.load(.acquire)));
+    }
+
+    fn getFallbackReason(self: *const NaxRuntimeState) NaxFallbackReason {
+        return @fromBackingInt(@intCast(self.fallback_reason.load(.acquire)));
+    }
+
+    fn isCanaryDemoted(self: *const NaxRuntimeState) bool {
+        return self.canary_demoted.load(.acquire) != 0;
+    }
+
+    fn demoteCanaryFailed(self: *NaxRuntimeState) void {
+        self.active_backend.store(@backingInt(PrefillMatmulBackend.simdgroup_apple9), .release);
+        self.fallback_reason.store(@backingInt(NaxFallbackReason.nax_canary_failed), .release);
+        self.canary_demoted.store(1, .release);
+    }
+};
+
+pub const CanarySliceErrors = struct {
+    max_abs_err_f16: f32,
+    max_abs_err_bf16: f32,
+    max_abs_err_q4: f32,
 };
 
 /// Verifies `f16`, `bf16`, and `q4_affine` GPU canary outputs against `fp32`
@@ -52,11 +189,7 @@ pub fn verifyCanarySlices(
     ref_bf16: []const f32,
     got_q4: []const f16,
     ref_q4: []const f32,
-) error{MetallibNumericalCanaryFailed}!struct {
-    max_abs_err_f16: f32,
-    max_abs_err_bf16: f32,
-    max_abs_err_q4: f32,
-} {
+) error{MetallibNumericalCanaryFailed}!CanarySliceErrors {
     if (got_f16.len == 0 or got_f16.len != ref_f16.len or
         got_bf16.len == 0 or got_bf16.len != ref_bf16.len or
         got_q4.len == 0 or got_q4.len != ref_q4.len)
@@ -177,7 +310,9 @@ pub const DenseGemmArgs = struct {
 pub const EncodeError = metal.Error || quant.ShapeError;
 
 /// Startup-compiled specialized Metal 4 pipelines for 2-bit, 3-bit and 4-bit
-/// group-64 affine dequantization GEMV and GEMM (G1, G2, G13).
+/// group-64 affine dequantization GEMV and GEMM (G1, G2, G13), dense FP16/BF16
+/// GEMV/GEMM (G12, G15), and lazily instantiated Apple10+ NAX TensorOps GEMM
+/// pipelines (G17, ADR-0021).
 pub const DequantPipelines = struct {
     gemv_q4: metal.Pipeline,
     gemv_q3: metal.Pipeline,
@@ -199,8 +334,98 @@ pub const DequantPipelines = struct {
     gemm_wide_bf16: metal.Pipeline,
     gemv_batch_f16: metal.Pipeline,
     gemv_batch_bf16: metal.Pipeline,
+    /// Lazily instantiated Apple10+ NAX TensorOps pipelines (null on Apple9 / M4).
+    gemm_nax_q4: ?metal.Pipeline = null,
+    gemm_nax_q3: ?metal.Pipeline = null,
+    gemm_nax_q2: ?metal.Pipeline = null,
+    gemm_nax_f16: ?metal.Pipeline = null,
+    gemm_nax_bf16: ?metal.Pipeline = null,
+    nax_pipelines_compiled: bool = false,
+    active_backend: PrefillMatmulBackend = .simdgroup_apple9,
+    nax_fallback_reason: NaxFallbackReason = .unsupported_gpu_family,
+    strict_nax: bool = false,
+    simulate_nax_canary_failure: bool = false,
+    nax_state: ?*NaxRuntimeState = null,
+
+    const NaxCompiledSet = struct {
+        gemm_nax_q4: metal.Pipeline,
+        gemm_nax_q3: metal.Pipeline,
+        gemm_nax_q2: metal.Pipeline,
+        gemm_nax_f16: metal.Pipeline,
+        gemm_nax_bf16: metal.Pipeline,
+
+        fn close(self: NaxCompiledSet) void {
+            self.gemm_nax_bf16.close();
+            self.gemm_nax_f16.close();
+            self.gemm_nax_q2.close();
+            self.gemm_nax_q3.close();
+            self.gemm_nax_q4.close();
+        }
+    };
+
+    fn compileNaxPipelines(device: metal.Device, library: metal.Library) metal.Error!NaxCompiledSet {
+        const gemm_nax_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm_nax", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
+        errdefer gemm_nax_f16.close();
+
+        const gemm_nax_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm_nax", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer gemm_nax_bf16.close();
+
+        const gemm_nax_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gemm_nax_q4.close();
+
+        const gemm_nax_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gemm_nax_q3.close();
+
+        const gemm_nax_q2 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+        });
+        errdefer gemm_nax_q2.close();
+
+        return .{
+            .gemm_nax_q4 = gemm_nax_q4,
+            .gemm_nax_q3 = gemm_nax_q3,
+            .gemm_nax_q2 = gemm_nax_q2,
+            .gemm_nax_f16 = gemm_nax_f16,
+            .gemm_nax_bf16 = gemm_nax_bf16,
+        };
+    }
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!DequantPipelines {
+        return initWithOptions(device, library, .{}) catch |err| switch (err) {
+            error.NaxRequiresApple10Gpu,
+            error.NaxFunctionMissing,
+            error.NaxPipelineCompileFailed,
+            => unreachable,
+            else => |e| return e,
+        };
+    }
+
+    pub fn initWithOptions(
+        device: metal.Device,
+        library: metal.Library,
+        opts: DequantInitOptions,
+    ) InitError!DequantPipelines {
+        _ = opts.norm_bf16_also;
+        const dev_info = try device.info();
+        const supports_nax = dev_info.supportsNaxTensorOps();
+
+        // Fail fast before compiling 20 Metal PSOs when `--prefill-matmul-backend nax`
+        // is combined with `--strict-nax` on an Apple9 or older GPU.
+        if (!supports_nax and opts.backend_mode == .nax and opts.strict_nax) {
+            return error.NaxRequiresApple10Gpu;
+        }
+
         const gemv_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv", &.{
             .{ .index = 0, .value = .{ .u32 = 4 } },
             .{ .index = 1, .value = .{ .u32 = 64 } },
@@ -313,6 +538,54 @@ pub const DequantPipelines = struct {
         });
         errdefer gemv_batch_bf16.close();
 
+        // Lazy Apple10+ NAX PSO compilation (`G17`, ADR-0021): skipped completely
+        // when forced to `simdgroup` or on `Apple9` (M4) so M4 startup pays zero
+        // extra `MTL4Compiler` latency.
+        var nax_set: ?NaxCompiledSet = null;
+        errdefer if (nax_set) |ns| ns.close();
+        var active_backend: PrefillMatmulBackend = .simdgroup_apple9;
+        var fallback_reason: NaxFallbackReason = .unsupported_gpu_family;
+
+        switch (opts.backend_mode) {
+            .simdgroup => {
+                active_backend = .simdgroup_apple9;
+                fallback_reason = .forced_simdgroup;
+            },
+            .auto, .nax => {
+                if (!supports_nax) {
+                    active_backend = .simdgroup_apple9;
+                    fallback_reason = .unsupported_gpu_family;
+                } else {
+                    const has_dense = try library.hasFunction("ami_dense_gemm_nax");
+                    const has_dequant = try library.hasFunction("ami_dequant_gemm_nax");
+                    if (!has_dense or !has_dequant) {
+                        if (opts.strict_nax) return error.NaxFunctionMissing;
+                        active_backend = .simdgroup_apple9;
+                        fallback_reason = .nax_function_missing;
+                    } else if (compileNaxPipelines(device, library)) |compiled| {
+                        nax_set = compiled;
+                        active_backend = PrefillMatmulBackend.nax_apple10;
+                        fallback_reason = .none;
+                    } else |err| {
+                        // Explicitly classify PSO compilation failure vs OOM/invalid.
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        if (opts.strict_nax) return error.NaxPipelineCompileFailed;
+                        active_backend = .simdgroup_apple9;
+                        fallback_reason = .nax_pso_compile_failed;
+                    }
+                }
+            },
+        }
+
+        const nax_compiled = (nax_set != null);
+        var nax_state: ?*NaxRuntimeState = null;
+        errdefer if (nax_state) |st| std.heap.c_allocator.destroy(st);
+        if (nax_compiled or opts.simulate_nax_canary_failure) {
+            const st = try std.heap.c_allocator.create(NaxRuntimeState);
+            st.* = NaxRuntimeState.init(active_backend, fallback_reason);
+            nax_state = st;
+        }
+
         return .{
             .gemv_q4 = gemv_q4,
             .gemv_q3 = gemv_q3,
@@ -334,10 +607,48 @@ pub const DequantPipelines = struct {
             .gemm_wide_bf16 = gemm_wide_bf16,
             .gemv_batch_f16 = gemv_batch_f16,
             .gemv_batch_bf16 = gemv_batch_bf16,
+            .gemm_nax_q4 = if (nax_set) |ns| ns.gemm_nax_q4 else null,
+            .gemm_nax_q3 = if (nax_set) |ns| ns.gemm_nax_q3 else null,
+            .gemm_nax_q2 = if (nax_set) |ns| ns.gemm_nax_q2 else null,
+            .gemm_nax_f16 = if (nax_set) |ns| ns.gemm_nax_f16 else null,
+            .gemm_nax_bf16 = if (nax_set) |ns| ns.gemm_nax_bf16 else null,
+            .nax_pipelines_compiled = nax_compiled,
+            .active_backend = active_backend,
+            .nax_fallback_reason = fallback_reason,
+            .strict_nax = opts.strict_nax,
+            .simulate_nax_canary_failure = opts.simulate_nax_canary_failure,
+            .nax_state = nax_state,
         };
     }
 
+    pub fn activeBackend(self: DequantPipelines) PrefillMatmulBackend {
+        if (self.nax_state) |st| return st.getBackend();
+        return self.active_backend;
+    }
+
+    pub fn naxFallbackReason(self: DequantPipelines) NaxFallbackReason {
+        if (self.nax_state) |st| return st.getFallbackReason();
+        return self.nax_fallback_reason;
+    }
+
+    pub fn useNaxPrefill(self: DequantPipelines) bool {
+        return self.nax_pipelines_compiled and self.activeBackend().isNax();
+    }
+
+    /// Synchronizes the plain struct mirror fields (`active_backend`,
+    /// `nax_fallback_reason`) with the live atomic canary state.
+    pub fn syncNaxState(self: *DequantPipelines) void {
+        self.active_backend = self.activeBackend();
+        self.nax_fallback_reason = self.naxFallbackReason();
+    }
+
     pub fn close(self: DequantPipelines) void {
+        if (self.nax_state) |st| std.heap.c_allocator.destroy(st);
+        if (self.gemm_nax_bf16) |p| p.close();
+        if (self.gemm_nax_f16) |p| p.close();
+        if (self.gemm_nax_q2) |p| p.close();
+        if (self.gemm_nax_q3) |p| p.close();
+        if (self.gemm_nax_q4) |p| p.close();
         self.gemv_batch_bf16.close();
         self.gemv_batch_f16.close();
         self.gemm_wide_bf16.close();
@@ -454,9 +765,11 @@ pub const DequantPipelines = struct {
         );
     }
 
-    /// Encodes a wide-tile (`BM = 64, BN = 64`, 8 simdgroups / 256 threads)
-    /// quantized prefill GEMM (`q2`/`q3`/`q4` group-64 affine) for any `M >= 1`
-    /// (`G15`, ADR-0020). Set `args.wide_tile = false` to fall back to `32x32`.
+    /// Encodes a wide-tile (`BM = 64, BN = 64`) quantized prefill GEMM
+    /// (`q2`/`q3`/`q4` group-64 affine) for any `M >= 1` (`G15`/`G17`, ADR-0020,
+    /// ADR-0021). Dispatches `*_nax` (`128` threads / 4 simdgroups) whenever
+    /// `self.useNaxPrefill()` is active, otherwise `*_wide` (`256` threads / 8
+    /// simdgroups). Set `args.wide_tile = false` to fall back to `32x32`.
     pub fn encodePrefillGemm(
         self: DequantPipelines,
         frame: *metal.Compute.Frame,
@@ -467,6 +780,19 @@ pub const DequantPipelines = struct {
         if (!args.wide_tile) {
             return self.encodeGemm32(frame, bits, args, insert_barrier_before);
         }
+        if (self.useNaxPrefill()) {
+            return self.encodeNaxGemm(frame, bits, args, insert_barrier_before);
+        }
+        return self.encodeWideSimdgroupGemm(frame, bits, args, insert_barrier_before);
+    }
+
+    fn encodeWideSimdgroupGemm(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        bits: quant.QuantBits,
+        args: GemmArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
         if (args.m == 0 or args.n == 0) return error.ZeroDimension;
         const num_groups, const row_bytes, const pipe = switch (bits) {
             .q4 => blk: {
@@ -497,6 +823,47 @@ pub const DequantPipelines = struct {
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    fn encodeNaxGemm(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        bits: quant.QuantBits,
+        args: GemmArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.n == 0) return error.ZeroDimension;
+        const num_groups, const row_bytes, const pipe = switch (bits) {
+            .q4 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_nax_q4 orelse return error.Unsupported };
+            },
+            .q3 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_nax_q3 orelse return error.Unsupported };
+            },
+            .q2 => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_nax_q2 orelse return error.Unsupported };
+            },
+        };
+        const params: DequantParams = .{
+            .m = args.m,
+            .n = args.n,
+            .k = args.k,
+            .num_groups = @intCast(num_groups),
+            .row_bytes = @intCast(row_bytes),
+        };
+        const groups_x: u64 = (@as(u64, args.n) + 63) / 64;
+        const groups_y: u64 = (@as(u64, args.m) + 63) / 64;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.qweight, args.scale_bias, args.y },
+            std.mem.asBytes(&params),
+            .{ groups_x, groups_y, 1 },
+            .{ 128, 1, 1 },
             insert_barrier_before,
         );
     }
@@ -640,9 +1007,11 @@ pub const DequantPipelines = struct {
         );
     }
 
-    /// Encodes a wide-tile (`BM = 64, BN = 64`, 8 simdgroups / 256 threads)
-    /// dense FP16 / BF16 prefill GEMM for any `M >= 1` (`G15`, ADR-0020).
-    /// Set `args.wide_tile = false` to fall back to `32x32`.
+    /// Encodes a wide-tile (`BM = 64, BN = 64`) dense FP16 / BF16 prefill GEMM
+    /// for any `M >= 1` (`G15`/`G17`, ADR-0020, ADR-0021). Dispatches `*_nax`
+    /// (`128` threads / 4 simdgroups) whenever `self.useNaxPrefill()` is active,
+    /// otherwise `*_wide` (`256` threads / 8 simdgroups). Set `args.wide_tile = false`
+    /// to fall back to `32x32`.
     pub fn encodePrefillDenseGemm(
         self: DequantPipelines,
         frame: *metal.Compute.Frame,
@@ -653,6 +1022,19 @@ pub const DequantPipelines = struct {
         if (!args.wide_tile) {
             return self.encodeDenseGemm32(frame, dtype, args, insert_barrier_before);
         }
+        if (self.useNaxPrefill()) {
+            return self.encodeNaxDenseGemm(frame, dtype, args, insert_barrier_before);
+        }
+        return self.encodeWideSimdgroupDenseGemm(frame, dtype, args, insert_barrier_before);
+    }
+
+    fn encodeWideSimdgroupDenseGemm(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.FloatDType,
+        args: DenseGemmArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
         if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
         const pipe = switch (dtype) {
             .f16 => self.gemm_wide_f16,
@@ -671,14 +1053,39 @@ pub const DequantPipelines = struct {
         );
     }
 
-    /// Runs the startup `.metallib` GPU numerical canary (`G16`, ADR-0020) over
-    /// a temporary `16 KiB` wired page in one Metal 4 command buffer, verifying
-    /// `f16`, `bf16` (including exponent paths exceeding `f16` dynamic range),
-    /// and `q4_affine` across both `32x32` and `64x64` wide GEMM kernels.
-    /// Note: a fresh `MTL4CommandQueue` / `MTLResidencySet` first submit takes
-    /// ~1–4 ms cold wall time on Apple Silicon (including initial driver/AGX
-    /// wake); see `runStartupNumericalCanaryProfile` for both cold first-submit
-    /// and warm in-buffer GPU check latency.
+    fn encodeNaxDenseGemm(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        dtype: quant.FloatDType,
+        args: DenseGemmArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const pipe = switch (dtype) {
+            .f16 => self.gemm_nax_f16 orelse return error.Unsupported,
+            .bf16 => self.gemm_nax_bf16 orelse return error.Unsupported,
+        };
+        const params: DenseParams = .{ .m = args.m, .n = args.n, .k = args.k };
+        const groups_x: u64 = (@as(u64, args.n) + 63) / 64;
+        const groups_y: u64 = (@as(u64, args.m) + 63) / 64;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.weight, args.y },
+            std.mem.asBytes(&params),
+            .{ groups_x, groups_y, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Runs the startup `.metallib` GPU numerical canary (`G16`, ADR-0020,
+    /// ADR-0021) over a temporary `16 KiB` wired page in one Metal 4 command
+    /// buffer, verifying `f16`, `bf16` (including exponent paths exceeding `f16`
+    /// dynamic range), and `q4_affine` across `32x32`, `64x64` `simdgroup_matrix`,
+    /// and (when compiled on `Apple10+`) `64x64` `NAX` TensorOps kernels.
+    /// When `NAX` fails finiteness or tolerance checks in non-strict mode,
+    /// `self` automatically demotes to `.simdgroup_apple9` (`nax_canary_failed`)
+    /// and verifies the `simdgroup_apple9` fallback kernels pass.
     pub fn runStartupNumericalCanary(
         self: *const DequantPipelines,
         dev: *metal.Device,
@@ -694,6 +1101,17 @@ pub const DequantPipelines = struct {
         try compute.makeResident(&.{gpu_buf});
 
         return self.runStartupNumericalCanaryInBuffer(&compute, gpu_buf, scratch.bytes);
+    }
+
+    /// Mutable convenience wrapper over `runStartupNumericalCanary` that also
+    /// updates the plain `active_backend` and `nax_fallback_reason` struct fields.
+    pub fn runStartupNumericalCanaryMut(
+        self: *DequantPipelines,
+        dev: *metal.Device,
+    ) CanaryError!CanaryResult {
+        const res = try self.runStartupNumericalCanary(dev);
+        self.syncNaxState();
+        return res;
     }
 
     pub const CanaryProfile = struct {
@@ -727,6 +1145,30 @@ pub const DequantPipelines = struct {
         };
     }
 
+    /// Mutable convenience wrapper over `runStartupNumericalCanaryProfile` that
+    /// also synchronizes `active_backend` and `nax_fallback_reason`.
+    pub fn runStartupNumericalCanaryProfileMut(
+        self: *DequantPipelines,
+        dev: *metal.Device,
+    ) CanaryError!CanaryProfile {
+        const prof = try self.runStartupNumericalCanaryProfile(dev);
+        self.syncNaxState();
+        return prof;
+    }
+
+    /// Mutable convenience wrapper over `runStartupNumericalCanaryInBuffer`
+    /// that also synchronizes `active_backend` and `nax_fallback_reason`.
+    pub fn runStartupNumericalCanaryInBufferMut(
+        self: *DequantPipelines,
+        compute: *metal.Compute,
+        gpu_buf: metal.Buffer,
+        wired_bytes: []align(page.APPLE_PAGE_SIZE) u8,
+    ) CanaryError!CanaryResult {
+        const res = try self.runStartupNumericalCanaryInBuffer(compute, gpu_buf, wired_bytes);
+        self.syncNaxState();
+        return res;
+    }
+
     /// Runs the startup numerical canary reusing an existing `metal.Compute`
     /// context and a caller-supplied, already-resident `16 KiB`-aligned wired
     /// slice (minimum 16 KiB). Zero heap allocations.
@@ -754,11 +1196,19 @@ pub const DequantPipelines = struct {
         const y_f16_wide_off: usize = 8256; // 512 B
         const y_bf16_wide_off: usize = 8768; // 512 B
         const y_q4_wide_off: usize = 9280; // 512 B
+        const y_f16_nax_off: usize = 9792; // 512 B
+        const y_bf16_nax_off: usize = 10304; // 512 B
+        const y_q4_nax_off: usize = 10816; // 512 B
         comptime {
-            std.debug.assert(y_q4_wide_off + 512 <= page.APPLE_PAGE_SIZE);
+            std.debug.assert(y_q4_nax_off + 512 <= page.APPLE_PAGE_SIZE);
         }
 
-        @memset(wired_bytes[0 .. y_q4_wide_off + 512], 0);
+        const already_demoted = if (self.nax_state) |st| st.isCanaryDemoted() else false;
+        const run_real_nax = self.nax_pipelines_compiled and self.activeBackend().isNax();
+        const run_simulated_nax_fail = self.simulate_nax_canary_failure and !already_demoted;
+        const clear_end: usize = if (run_real_nax) y_q4_nax_off + 512 else y_q4_wide_off + 512;
+
+        @memset(wired_bytes[0..clear_end], 0);
 
         const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[x_off .. x_off + cm * ck * 2]));
         const w_f16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, wired_bytes[w_f16_off .. w_f16_off + cn * ck * 2]));
@@ -772,6 +1222,9 @@ pub const DequantPipelines = struct {
         const y_f16_wide: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_f16_wide_off .. y_f16_wide_off + cm * cn * 2]));
         const y_bf16_wide: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_bf16_wide_off .. y_bf16_wide_off + cm * cn * 2]));
         const y_q4_wide: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_q4_wide_off .. y_q4_wide_off + cm * cn * 2]));
+        const y_f16_nax: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_f16_nax_off .. y_f16_nax_off + cm * cn * 2]));
+        const y_bf16_nax: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_bf16_nax_off .. y_bf16_nax_off + cm * cn * 2]));
+        const y_q4_nax: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_q4_nax_off .. y_q4_nax_off + cm * cn * 2]));
 
         // Populate deterministic signed fractional inputs/weights exercising
         // f16, bf16 exponent+mantissa paths (including column-0 > f16 max paired
@@ -830,8 +1283,37 @@ pub const DequantPipelines = struct {
         var frame = try compute.beginFrame(5000);
         errdefer frame.abort();
 
-        // Dispatch all 6 micro-checks in ONE single Metal 4 command buffer
-        // with zero intra-buffer barriers (read-only inputs, disjoint outputs).
+        // Dispatch NAX (when compiled on Apple10+) plus all 6 verified Apple9
+        // simdgroup micro-checks in ONE single Metal 4 command buffer with zero
+        // intra-buffer barriers (read-only inputs, disjoint outputs).
+        if (run_real_nax) {
+            try self.encodeNaxDenseGemm(&frame, .f16, .{
+                .x = x_b,
+                .weight = w_f16_b,
+                .y = .{ .buffer = gpu_buf, .offset = y_f16_nax_off },
+                .m = cm,
+                .n = cn,
+                .k = ck,
+            }, false);
+            try self.encodeNaxDenseGemm(&frame, .bf16, .{
+                .x = x_b,
+                .weight = w_bf16_b,
+                .y = .{ .buffer = gpu_buf, .offset = y_bf16_nax_off },
+                .m = cm,
+                .n = cn,
+                .k = ck,
+            }, false);
+            try self.encodeNaxGemm(&frame, .q4, .{
+                .x = x_b,
+                .qweight = w_q4_b,
+                .scale_bias = sb_q4_b,
+                .y = .{ .buffer = gpu_buf, .offset = y_q4_nax_off },
+                .m = cm,
+                .n = cn,
+                .k = ck,
+            }, false);
+        }
+
         try self.encodeDenseGemm32(&frame, .f16, .{
             .x = x_b,
             .weight = w_f16_b,
@@ -857,7 +1339,7 @@ pub const DequantPipelines = struct {
             .n = cn,
             .k = ck,
         }, false);
-        try self.encodePrefillDenseGemm(&frame, .f16, .{
+        try self.encodeWideSimdgroupDenseGemm(&frame, .f16, .{
             .x = x_b,
             .weight = w_f16_b,
             .y = .{ .buffer = gpu_buf, .offset = y_f16_wide_off },
@@ -865,7 +1347,7 @@ pub const DequantPipelines = struct {
             .n = cn,
             .k = ck,
         }, false);
-        try self.encodePrefillDenseGemm(&frame, .bf16, .{
+        try self.encodeWideSimdgroupDenseGemm(&frame, .bf16, .{
             .x = x_b,
             .weight = w_bf16_b,
             .y = .{ .buffer = gpu_buf, .offset = y_bf16_wide_off },
@@ -873,7 +1355,7 @@ pub const DequantPipelines = struct {
             .n = cn,
             .k = ck,
         }, false);
-        try self.encodePrefillGemm(&frame, .q4, .{
+        try self.encodeWideSimdgroupGemm(&frame, .q4, .{
             .x = x_b,
             .qweight = w_q4_b,
             .scale_bias = sb_q4_b,
@@ -887,14 +1369,46 @@ pub const DequantPipelines = struct {
         try compute.wait(sig, 5000);
         const t1 = try vmstat.nowNs();
 
+        // 1. Validate NAX first when active or under test failure injection (`G16` + `G17`).
+        var nax_tested = false;
+        var nax_demoted = false;
+        var max_nax_f16: f32 = 0.0;
+        var max_nax_bf16: f32 = 0.0;
+        var max_nax_q4: f32 = 0.0;
+
+        if (run_real_nax or run_simulated_nax_fail) {
+            nax_tested = true;
+            const nax_ok: error{MetallibNumericalCanaryFailed}!CanarySliceErrors = if (run_simulated_nax_fail)
+                error.MetallibNumericalCanaryFailed
+            else
+                verifyCanarySlices(y_f16_nax, &ref_f16, y_bf16_nax, &ref_bf16, y_q4_nax, &ref_q4);
+
+            if (nax_ok) |err_nax| {
+                max_nax_f16 = err_nax.max_abs_err_f16;
+                max_nax_bf16 = err_nax.max_abs_err_bf16;
+                max_nax_q4 = err_nax.max_abs_err_q4;
+            } else |err| {
+                if (self.strict_nax) return err;
+                if (self.nax_state) |st| {
+                    st.demoteCanaryFailed();
+                }
+                nax_demoted = true;
+            }
+        }
+
+        // 2. Always verify the `simdgroup_apple9` baseline / fallback kernels pass.
         const err32 = try verifyCanarySlices(y_f16, &ref_f16, y_bf16, &ref_bf16, y_q4, &ref_q4);
         const err64 = try verifyCanarySlices(y_f16_wide, &ref_f16, y_bf16_wide, &ref_bf16, y_q4_wide, &ref_q4);
 
         return .{
             .elapsed_us = @as(f64, @floatFromInt(t1 - t0)) / 1000.0,
-            .max_abs_err_f16 = @max(err32.max_abs_err_f16, err64.max_abs_err_f16),
-            .max_abs_err_bf16 = @max(err32.max_abs_err_bf16, err64.max_abs_err_bf16),
-            .max_abs_err_q4 = @max(err32.max_abs_err_q4, err64.max_abs_err_q4),
+            .max_abs_err_f16 = @max(@max(err32.max_abs_err_f16, err64.max_abs_err_f16), max_nax_f16),
+            .max_abs_err_bf16 = @max(@max(err32.max_abs_err_bf16, err64.max_abs_err_bf16), max_nax_bf16),
+            .max_abs_err_q4 = @max(@max(err32.max_abs_err_q4, err64.max_abs_err_q4), max_nax_q4),
+            .nax_tested = nax_tested,
+            .nax_demoted = nax_demoted,
+            .active_backend = self.activeBackend(),
+            .nax_fallback_reason = self.naxFallbackReason(),
         };
     }
 };
@@ -1509,17 +2023,182 @@ test "batched GEMV matches M=1 GEMV bit-for-bit across q2, q3, q4, f16 and bf16"
     }
 }
 
-test "G16: Apple10 NAX hook reserves backend while staying on Apple9 simdgroup_matrix" {
+test "G17: Apple9/Apple10/Apple11 backend policy and PrefillBackendMode parsing" {
     const device = try metal.Device.open();
     defer device.close();
     const info = try device.info();
-    try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, selectPrefillMatmulBackend(info));
 
-    var fake_apple10 = info;
-    fake_apple10.raw.supports_apple10 = 1;
+    try std.testing.expectEqual(@as(?PrefillBackendMode, .auto), PrefillBackendMode.parse("auto"));
+    try std.testing.expectEqual(@as(?PrefillBackendMode, .simdgroup), PrefillBackendMode.parse("simdgroup"));
+    try std.testing.expectEqual(@as(?PrefillBackendMode, .nax), PrefillBackendMode.parse("nax"));
+    try std.testing.expectEqual(@as(?PrefillBackendMode, null), PrefillBackendMode.parse("invalid"));
+
+    if (!info.supportsNaxTensorOps()) {
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, selectPrefillMatmulBackend(info));
+        try std.testing.expect(!selectPrefillMatmulBackend(info).isNax());
+    }
+
+    var fake_apple9 = info;
+    fake_apple9.raw.gpu_apple_family = 9;
+    fake_apple9.raw.apple_gpu_family = 9;
+    fake_apple9.raw.supports_apple9 = 1;
+    fake_apple9.raw.supports_apple10 = 0;
+    fake_apple9.raw.supports_apple11 = 0;
+    try std.testing.expect(!fake_apple9.supportsNaxTensorOps());
+    try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, selectPrefillMatmulBackend(fake_apple9));
+    const d9_auto = selectPrefillMatmulBackendWithMode(fake_apple9, .auto);
+    try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, d9_auto.backend);
+    try std.testing.expectEqual(NaxFallbackReason.unsupported_gpu_family, d9_auto.fallback_reason);
+    const d9_sg = selectPrefillMatmulBackendWithMode(fake_apple9, .simdgroup);
+    try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, d9_sg.backend);
+    try std.testing.expectEqual(NaxFallbackReason.forced_simdgroup, d9_sg.fallback_reason);
+
+    var fake_apple10 = fake_apple9;
+    fake_apple10.raw.gpu_apple_family = 10;
     fake_apple10.raw.apple_gpu_family = 10;
+    fake_apple10.raw.supports_apple10 = 1;
     try std.testing.expect(fake_apple10.supportsApple10());
-    try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, selectPrefillMatmulBackend(fake_apple10));
+    try std.testing.expect(fake_apple10.supportsNaxTensorOps());
+    try std.testing.expectEqual(PrefillMatmulBackend.nax_apple10, selectPrefillMatmulBackend(fake_apple10));
+    try std.testing.expect(selectPrefillMatmulBackend(fake_apple10).isNax());
+    const d10_auto = selectPrefillMatmulBackendWithMode(fake_apple10, .auto);
+    try std.testing.expectEqual(PrefillMatmulBackend.nax_apple10, d10_auto.backend);
+    try std.testing.expectEqual(NaxFallbackReason.none, d10_auto.fallback_reason);
+    const d10_sg = selectPrefillMatmulBackendWithMode(fake_apple10, .simdgroup);
+    try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, d10_sg.backend);
+    try std.testing.expectEqual(NaxFallbackReason.forced_simdgroup, d10_sg.fallback_reason);
+
+    var fake_apple11 = fake_apple10;
+    fake_apple11.raw.gpu_apple_family = 11;
+    fake_apple11.raw.apple_gpu_family = 11;
+    fake_apple11.raw.supports_apple11 = 1;
+    try std.testing.expect(fake_apple11.supportsApple11());
+    try std.testing.expect(fake_apple11.supportsNaxTensorOps());
+    try std.testing.expectEqual(PrefillMatmulBackend.nax_apple10, selectPrefillMatmulBackend(fake_apple11));
+}
+
+test "G17+G16: lazy NAX PSO selection, Apple9 fallback, strict-nax rejection, and canary auto-demotion" {
+    var device = try metal.Device.open();
+    defer device.close();
+    const info = try device.info();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+
+    // 1. Unified `.metallib` embeds all three NAX entry points without PSO creation.
+    try std.testing.expect(try library.hasFunction("ami_dense_gemm_nax"));
+    try std.testing.expect(try library.hasFunction("ami_dequant_gemm_nax"));
+    try std.testing.expect(try library.hasFunction("ami_fp4_e2m1_gemm_nax"));
+    try std.testing.expect(!try library.hasFunction("ami_nonexistent_kernel"));
+
+    // 2. Forced `.simdgroup` mode always skips NAX PSO compilation.
+    {
+        const p_sg = try DequantPipelines.initWithOptions(device, library, .{
+            .backend_mode = .simdgroup,
+        });
+        defer p_sg.close();
+        try std.testing.expect(!p_sg.nax_pipelines_compiled);
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, p_sg.activeBackend());
+        try std.testing.expectEqual(NaxFallbackReason.forced_simdgroup, p_sg.naxFallbackReason());
+        try std.testing.expect(!p_sg.useNaxPrefill());
+    }
+
+    // 3. On Apple9 (M4): `.auto` skips NAX PSOs, `.nax` falls back when non-strict,
+    //    and `.nax` + `strict_nax` fails fast with `error.NaxRequiresApple10Gpu`.
+    if (!info.supportsNaxTensorOps()) {
+        if (std.mem.indexOf(u8, info.name(), "M4") != null) {
+            try std.testing.expectEqual(@as(u8, 9), info.appleGpuFamily());
+        }
+
+        const p_auto = try DequantPipelines.initWithOptions(device, library, .{
+            .backend_mode = .auto,
+        });
+        defer p_auto.close();
+        try std.testing.expect(!p_auto.nax_pipelines_compiled);
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, p_auto.active_backend);
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, p_auto.activeBackend());
+        try std.testing.expectEqual(NaxFallbackReason.unsupported_gpu_family, p_auto.nax_fallback_reason);
+        try std.testing.expectEqual(NaxFallbackReason.unsupported_gpu_family, p_auto.naxFallbackReason());
+        try std.testing.expect(!p_auto.useNaxPrefill());
+
+        const p_nax_fallback = try DequantPipelines.initWithOptions(device, library, .{
+            .backend_mode = .nax,
+            .strict_nax = false,
+        });
+        defer p_nax_fallback.close();
+        try std.testing.expect(!p_nax_fallback.nax_pipelines_compiled);
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, p_nax_fallback.activeBackend());
+        try std.testing.expectEqual(NaxFallbackReason.unsupported_gpu_family, p_nax_fallback.naxFallbackReason());
+
+        try std.testing.expectError(
+            error.NaxRequiresApple10Gpu,
+            DequantPipelines.initWithOptions(device, library, .{
+                .backend_mode = .nax,
+                .strict_nax = true,
+            }),
+        );
+    }
+
+    // 4. Simulated NAX canary failure in non-strict mode auto-demotes cleanly to
+    //    `simdgroup_apple9` (`nax_canary_failed`) and verifies the simdgroup canary passes.
+    {
+        var p_demote = try DequantPipelines.initWithOptions(device, library, .{
+            .backend_mode = .auto,
+            .strict_nax = false,
+            .simulate_nax_canary_failure = true,
+        });
+        defer p_demote.close();
+
+        const prof = try p_demote.runStartupNumericalCanaryProfileMut(&device);
+        try std.testing.expect(prof.cold.nax_tested);
+        try std.testing.expect(prof.cold.nax_demoted);
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, prof.cold.active_backend);
+        try std.testing.expectEqual(NaxFallbackReason.nax_canary_failed, prof.cold.nax_fallback_reason);
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, p_demote.activeBackend());
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, p_demote.active_backend);
+        try std.testing.expectEqual(NaxFallbackReason.nax_canary_failed, p_demote.naxFallbackReason());
+        try std.testing.expectEqual(NaxFallbackReason.nax_canary_failed, p_demote.nax_fallback_reason);
+        try std.testing.expect(!p_demote.useNaxPrefill());
+        try std.testing.expect(prof.cold.max_abs_err_f16 <= CANARY_TOL_F16);
+        try std.testing.expect(prof.cold.max_abs_err_bf16 <= CANARY_TOL_BF16);
+        try std.testing.expect(prof.cold.max_abs_err_q4 <= CANARY_TOL_Q4);
+        try std.testing.expect(std.math.isFinite(prof.warm_elapsed_us));
+    }
+
+    // 5. Also verify auto-demotion works through a `const DequantPipelines` binding
+    //    (matching existing M6.8 call sites in `qwen3.zig`, `graph.zig`, `main.zig`).
+    {
+        const p_const_demote = try DequantPipelines.initWithOptions(device, library, .{
+            .backend_mode = .auto,
+            .strict_nax = false,
+            .simulate_nax_canary_failure = true,
+        });
+        defer p_const_demote.close();
+
+        const res = try p_const_demote.runStartupNumericalCanary(&device);
+        try std.testing.expect(res.nax_tested);
+        try std.testing.expect(res.nax_demoted);
+        try std.testing.expectEqual(PrefillMatmulBackend.simdgroup_apple9, p_const_demote.activeBackend());
+        try std.testing.expectEqual(NaxFallbackReason.nax_canary_failed, p_const_demote.naxFallbackReason());
+    }
+
+    // 6. Simulated NAX canary failure under `strict_nax = true` returns a hard error.
+    {
+        const p_strict = try DequantPipelines.initWithOptions(device, library, .{
+            .backend_mode = .auto,
+            .strict_nax = true,
+            .simulate_nax_canary_failure = true,
+        });
+        defer p_strict.close();
+
+        try std.testing.expectError(
+            error.MetallibNumericalCanaryFailed,
+            p_strict.runStartupNumericalCanary(&device),
+        );
+        try std.testing.expectError(
+            error.MetallibNumericalCanaryFailed,
+            p_strict.runStartupNumericalCanaryProfile(&device),
+        );
+    }
 }
 
 test "G16: startup metallib numerical canary passes quickly and rejects NaN / corrupted bf16" {

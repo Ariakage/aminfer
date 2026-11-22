@@ -114,7 +114,10 @@ typedef struct ami_device_info {
     uint32_t apple_gpu_family;                 /* highest MTLGPUFamilyAppleN, 0 if none */
     uint32_t ane_core_count;                   /* 0 when CoreML reports no Neural Engine */
     uint32_t supports_apple10;                 /* 0 or 1 (MTLGPUFamilyApple10 = 1010, M5+ NAX) */
-    uint32_t _pad0;
+    uint8_t gpu_apple_family;                  /* highest probed Apple GPU family (7..11, 0 if none) */
+    uint8_t supports_apple9;                   /* 0 or 1 (MTLGPUFamilyApple9 = 1009, M3/M4) */
+    uint8_t supports_apple11;                  /* 0 or 1 (MTLGPUFamilyApple11 = 1011) */
+    uint8_t _pad0;
 } ami_device_info;
 
 /* Function constant entry for startup pipeline specialization (ADR-0014). */

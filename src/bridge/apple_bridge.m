@@ -103,10 +103,10 @@ static id<MTLComputePipelineState> pipeline_of(const ami_pipeline *pipeline) {
     return (__bridge id<MTLComputePipelineState>)pipeline->mtl_pipeline;
 }
 
-static uint32_t highest_apple_family(id<MTLDevice> device) {
-    for (NSInteger family = 1020; family >= 1001; family--) {
+static uint8_t highest_apple_family(id<MTLDevice> device) {
+    for (NSInteger family = 1011; family >= 1007; family--) {
         if ([device supportsFamily:(MTLGPUFamily)family]) {
-            return (uint32_t)(family - 1000);
+            return (uint8_t)(family - 1000);
         }
     }
     return 0;
@@ -166,10 +166,16 @@ ami_status ami_device_query(const ami_device *device, ami_device_info *out_info)
         out_info->has_unified_memory = mtl_device.hasUnifiedMemory ? 1 : 0;
         out_info->supports_metal4 =
             [mtl_device respondsToSelector:@selector(newMTL4CommandQueue)] ? 1 : 0;
-        out_info->apple_gpu_family = highest_apple_family(mtl_device);
+        const uint8_t family = highest_apple_family(mtl_device);
+        out_info->apple_gpu_family = (uint32_t)family;
+        out_info->gpu_apple_family = family;
         out_info->ane_core_count = neural_engine_cores();
+        out_info->supports_apple9 =
+            [mtl_device supportsFamily:(MTLGPUFamily)1009] ? 1 : 0;
         out_info->supports_apple10 =
             [mtl_device supportsFamily:(MTLGPUFamily)1010] ? 1 : 0;
+        out_info->supports_apple11 =
+            [mtl_device supportsFamily:(MTLGPUFamily)1011] ? 1 : 0;
     }
     return AMI_OK;
 }

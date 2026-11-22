@@ -77,14 +77,26 @@ pub const DeviceInfo = struct {
     pub fn supportsMetal4(self: DeviceInfo) bool {
         return self.raw.supports_metal4 != 0;
     }
-    pub fn appleGpuFamily(self: DeviceInfo) u32 {
-        return self.raw.apple_gpu_family;
+    pub fn appleGpuFamily(self: DeviceInfo) u8 {
+        if (self.raw.gpu_apple_family != 0) return self.raw.gpu_apple_family;
+        return @intCast(@min(self.raw.apple_gpu_family, 255));
     }
     pub fn aneCoreCount(self: DeviceInfo) u32 {
         return self.raw.ane_core_count;
     }
+    pub fn supportsApple9(self: DeviceInfo) bool {
+        return self.raw.supports_apple9 != 0 or self.appleGpuFamily() >= 9;
+    }
     pub fn supportsApple10(self: DeviceInfo) bool {
-        return self.raw.supports_apple10 != 0;
+        return self.raw.supports_apple10 != 0 or self.appleGpuFamily() >= 10;
+    }
+    pub fn supportsApple11(self: DeviceInfo) bool {
+        return self.raw.supports_apple11 != 0 or self.appleGpuFamily() >= 11;
+    }
+    /// Returns true on Apple10+ GPUs (M5+) that provide GPU Neural Accelerator
+    /// (`NAX`) hardware backing Metal 4 `mpp::tensor_ops::matmul2d` (`ADR-0021`).
+    pub fn supportsNaxTensorOps(self: DeviceInfo) bool {
+        return self.appleGpuFamily() >= 10 or self.raw.supports_apple10 != 0;
     }
 };
 
@@ -2224,18 +2236,56 @@ test "default device is a unified-memory Apple GPU with Metal 4" {
     try std.testing.expect(info.hasUnifiedMemory());
     try std.testing.expect(info.supportsMetal4());
     try std.testing.expect(info.appleGpuFamily() >= 7);
+    try std.testing.expect(info.appleGpuFamily() <= 11);
+    try std.testing.expectEqual(info.appleGpuFamily() >= 9, info.supportsApple9());
     try std.testing.expectEqual(info.appleGpuFamily() >= 10, info.supportsApple10());
+    try std.testing.expectEqual(info.appleGpuFamily() >= 11, info.supportsApple11());
+    try std.testing.expectEqual(info.appleGpuFamily() >= 10, info.supportsNaxTensorOps());
+    if (std.mem.indexOf(u8, info.name(), "M4") != null) {
+        try std.testing.expectEqual(@as(u8, 9), info.appleGpuFamily());
+        try std.testing.expect(info.supportsApple9());
+        try std.testing.expect(!info.supportsApple10());
+        try std.testing.expect(!info.supportsApple11());
+        try std.testing.expect(!info.supportsNaxTensorOps());
+    }
     try std.testing.expect(info.recommendedMaxWorkingSetSize() > 0);
     try std.testing.expect(info.maxBufferLength() > 0);
+
+    // Synthetic Apple7..Apple11 capability probe invariants.
+    var fake: DeviceInfo = .{ .raw = std.mem.zeroes(c.ami_device_info) };
+    fake.raw.gpu_apple_family = 9;
+    fake.raw.apple_gpu_family = 9;
+    fake.raw.supports_apple9 = 1;
+    try std.testing.expectEqual(@as(u8, 9), fake.appleGpuFamily());
+    try std.testing.expect(fake.supportsApple9());
+    try std.testing.expect(!fake.supportsNaxTensorOps());
+
+    fake.raw.gpu_apple_family = 10;
+    fake.raw.apple_gpu_family = 10;
+    fake.raw.supports_apple10 = 1;
+    try std.testing.expectEqual(@as(u8, 10), fake.appleGpuFamily());
+    try std.testing.expect(fake.supportsApple10());
+    try std.testing.expect(fake.supportsNaxTensorOps());
+
+    fake.raw.gpu_apple_family = 11;
+    fake.raw.apple_gpu_family = 11;
+    fake.raw.supports_apple11 = 1;
+    try std.testing.expectEqual(@as(u8, 11), fake.appleGpuFamily());
+    try std.testing.expect(fake.supportsApple11());
+    try std.testing.expect(fake.supportsNaxTensorOps());
 }
 
-test "embedded metallib exposes the smoke kernel" {
+test "embedded metallib exposes smoke and M6.9 NAX TensorOps kernels without compiling PSOs" {
     const device = try Device.open();
     defer device.close();
     const library = try Library.openEmbedded(device);
     defer library.close();
     try std.testing.expect(try library.hasFunction("ami_smoke_iota"));
+    try std.testing.expect(try library.hasFunction("ami_dense_gemm_nax"));
+    try std.testing.expect(try library.hasFunction("ami_dequant_gemm_nax"));
+    try std.testing.expect(try library.hasFunction("ami_fp4_e2m1_gemm_nax"));
     try std.testing.expect(!try library.hasFunction("ami_no_such_kernel"));
+    try std.testing.expect(!try library.hasFunction("ami_nonexistent_kernel"));
 }
 
 test "a wired region is shared with the GPU without copying" {
