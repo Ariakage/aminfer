@@ -8413,7 +8413,8 @@ fn runM65VisionBench(allocator: std.mem.Allocator, cfg: M65Config) ![4]M65Vision
             } else {
                 try ingress.encodePatchifyEmbedBgra8(&frame, wf, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
             }
-            _ = try frame.commit();
+            const sig = try frame.commit();
+            try compute.wait(sig, cfg.timeout_ms);
         }
 
         // Timed VideoToolbox hardware decode -> zero-copy IOSurface.
@@ -8441,7 +8442,8 @@ fn runM65VisionBench(allocator: std.mem.Allocator, cfg: M65Config) ![4]M65Vision
             } else {
                 try ingress.encodePatchifyEmbedBgra8(&wf, active_frame, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
             }
-            _ = try wf.commit();
+            const wsig = try wf.commit();
+            try compute.wait(wsig, cfg.timeout_ms);
         }
 
         const heap_before = try vmstat.Snapshot.capture();
@@ -8456,7 +8458,8 @@ fn runM65VisionBench(allocator: std.mem.Allocator, cfg: M65Config) ![4]M65Vision
             } else {
                 try ingress.encodePatchifyEmbedBgra8(&frame, active_frame, null, weight_bind, bias_bind, .f16, .f16, cfg.vision_hidden, geom, vision.NormParams.QWEN_VL_DEFAULT, 0, false);
             }
-            _ = try frame.commit();
+            const gsig = try frame.commit();
+            try compute.wait(gsig, cfg.timeout_ms);
         }
         const gpu_t1 = try vmstat.nowNs();
         const heap_after = try vmstat.Snapshot.capture();
@@ -8676,7 +8679,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .seq_len = seq_len,
             .chunk_tokens = cfg.r5_chunk_tokens,
         }, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try compute.wait(sig, cfg.timeout_ms);
     }
     const dec_fp16_t0 = try vmstat.nowNs();
     for (0..reps) |_| {
@@ -8694,7 +8698,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .seq_len = seq_len,
             .chunk_tokens = cfg.r5_chunk_tokens,
         }, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try compute.wait(sig, cfg.timeout_ms);
     }
     const dec_fp16_t1 = try vmstat.nowNs();
     const fp16_decode_us = @as(f64, @floatFromInt(dec_fp16_t1 - dec_fp16_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
@@ -8722,7 +8727,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .base_pos = seq_len,
             .chunk_tokens = cfg.r5_chunk_tokens,
         }, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try compute.wait(sig, cfg.timeout_ms);
     }
     const tree_fp16_t0 = try vmstat.nowNs();
     for (0..reps) |_| {
@@ -8744,7 +8750,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .base_pos = seq_len,
             .chunk_tokens = cfg.r5_chunk_tokens,
         }, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try compute.wait(sig, cfg.timeout_ms);
     }
     const tree_fp16_t1 = try vmstat.nowNs();
     const fp16_tree_us = @as(f64, @floatFromInt(tree_fp16_t1 - tree_fp16_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
@@ -8764,7 +8771,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .v_tile = tiles[1],
             .dst_slot = ret_ids[0],
         }, false);
-        _ = try wf.commit();
+        const wsig = try wf.commit();
+        try compute.wait(wsig, cfg.timeout_ms);
     }
     const ret_t0 = try vmstat.nowNs();
     {
@@ -8779,7 +8787,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
                 .dst_slot = ret_ids[c_idx],
             }, false);
         }
-        _ = try rf.commit();
+        const rsig = try rf.commit();
+        try compute.wait(rsig, cfg.timeout_ms);
     }
     const ret_t1 = try vmstat.nowNs();
     const retire_total_us = @as(f64, @floatFromInt(ret_t1 - ret_t0)) / 1000.0;
@@ -8806,7 +8815,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
             .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
         }, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try compute.wait(sig, cfg.timeout_ms);
     }
     const dec_q8_t0 = try vmstat.nowNs();
     for (0..reps) |_| {
@@ -8829,7 +8839,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
             .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
         }, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try compute.wait(sig, cfg.timeout_ms);
     }
     const dec_q8_t1 = try vmstat.nowNs();
     const tiered_decode_us = @as(f64, @floatFromInt(dec_q8_t1 - dec_q8_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
@@ -8864,7 +8875,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
             .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
         }, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try compute.wait(sig, cfg.timeout_ms);
     }
     const tree_q8_t0 = try vmstat.nowNs();
     for (0..reps) |_| {
@@ -8891,7 +8903,8 @@ fn runM65R5Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R5Report {
             .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
             .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
         }, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try compute.wait(sig, cfg.timeout_ms);
     }
     const tree_q8_t1 = try vmstat.nowNs();
     const tiered_tree_us = @as(f64, @floatFromInt(tree_q8_t1 - tree_q8_t0)) / (@as(f64, @floatFromInt(reps)) * 1000.0);
@@ -9137,7 +9150,8 @@ fn runM65R8Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R8Report {
                     .valid_tokens = cow_tail_tokens,
                 }, false);
             }
-            _ = try f.commit();
+            const sig = try f.commit();
+            try model.compute.wait(sig, cfg.timeout_ms);
         }
         const ct0 = try vmstat.nowNs();
         for (0..cow_reps) |_| {
@@ -9155,7 +9169,8 @@ fn runM65R8Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R8Report {
                     .valid_tokens = cow_tail_tokens,
                 }, false);
             }
-            _ = try f.commit();
+            const sig = try f.commit();
+            try model.compute.wait(sig, cfg.timeout_ms);
         }
         const ct1 = try vmstat.nowNs();
         cow_tail_us = @as(f64, @floatFromInt(ct1 - ct0)) / (@as(f64, @floatFromInt(cow_reps)) * 1000.0);
@@ -9231,14 +9246,16 @@ fn runM65R8Bench(allocator: std.mem.Allocator, cfg: M65Config) !M65R8Report {
         var f = try model.compute.beginFrame(cfg.timeout_ms);
         errdefer f.abort();
         try hybrid_pipes.encodeGdnCloneState(&f, clone_args, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try model.compute.wait(sig, cfg.timeout_ms);
     }
     const gt0 = try vmstat.nowNs();
     for (0..gdn_reps) |_| {
         var f = try model.compute.beginFrame(cfg.timeout_ms);
         errdefer f.abort();
         try hybrid_pipes.encodeGdnCloneState(&f, clone_args, false);
-        _ = try f.commit();
+        const sig = try f.commit();
+        try model.compute.wait(sig, cfg.timeout_ms);
     }
     const gt1 = try vmstat.nowNs();
     const gdn_clone_us = @as(f64, @floatFromInt(gt1 - gt0)) / (@as(f64, @floatFromInt(gdn_reps)) * 1000.0);
