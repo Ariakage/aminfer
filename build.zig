@@ -6,7 +6,7 @@ const std = @import("std");
 /// Platform floor: macOS 26.0 on Apple Silicon (ADR-0011).
 const macos_floor: std.SemanticVersion = .{ .major = 26, .minor = 0, .patch = 0 };
 
-/// Apple frameworks the bridge may call (ADR-0001, ADR-0004, ADR-0018).
+/// Apple frameworks the bridge may call (ADR-0001, ADR-0004, ADR-0018, ADR-0019).
 const frameworks = [_][]const u8{
     "Foundation",
     "Metal",
@@ -14,6 +14,10 @@ const frameworks = [_][]const u8{
     "IOSurface",
     "CoreVideo",
     "Accelerate",
+    "VideoToolbox",
+    "CoreMedia",
+    "CoreGraphics",
+    "ImageIO",
 };
 
 const objc_flags = [_][]const u8{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" };
@@ -31,6 +35,7 @@ const kernel_sources = [_][]const u8{
     "src/kernels/kv_attention.metal",
     "src/kernels/moe_ffn.metal",
     "src/kernels/hybrid_ops.metal",
+    "src/kernels/vision_ingress.metal",
 };
 
 pub fn build(b: *std.Build) void {
@@ -69,6 +74,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("apple_bridge", bridge_c.createModule());
     mod.addAnonymousImport("aminfer_metallib", .{ .root_source_file = metallib });
+    mod.addImport("aminfer", mod);
     mod.addIncludePath(b.path("src/bridge"));
     addMacosSdkPaths(b, mod);
     mod.addCSourceFiles(.{ .files = &.{"src/bridge/apple_bridge.m"}, .flags = &objc_flags });
@@ -130,6 +136,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_hybrid_test = b.addRunArtifact(hybrid_test);
     b.step("test-hybrid", "Run M6 hybrid GPU (GDN, QSA, 4-branch GR) parity tests").dependOn(&run_hybrid_test.step);
+
+    // Dedicated M6.5 G14 vision/video ingress test step (`zig build test-vision`);
+    // compiles `src/gpu/vision.zig` standalone without modifying `src/root.zig`.
+    const vision_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/gpu/vision.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "aminfer", .module = mod }},
+    });
+    const vision_test = b.addTest(.{ .root_module = vision_test_mod });
+    const run_vision_test = b.addRunArtifact(vision_test);
+    b.step("test-vision", "Run M6.5 G14 zero-copy VideoToolbox/IOSurface vision ingress tests").dependOn(&run_vision_test.step);
 
     const s7_main = aux_wf.add("s7_standalone_main.zig",
         \\const std = @import("std");

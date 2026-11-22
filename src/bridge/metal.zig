@@ -31,6 +31,7 @@ pub const Error = error{
     Unsupported,
     TileCreationFailed,
     AneFailed,
+    VisionFailed,
     /// The bridge returned a status this wrapper does not know.
     UnexpectedStatus,
     /// The bridge reported success but returned a null handle.
@@ -53,6 +54,7 @@ fn check(status: c.ami_status) Error!void {
         c.AMI_ERR_UNSUPPORTED => error.Unsupported,
         c.AMI_ERR_TILE => error.TileCreationFailed,
         c.AMI_ERR_ANE => error.AneFailed,
+        c.AMI_ERR_VISION => error.VisionFailed,
         else => error.UnexpectedStatus,
     };
 }
@@ -441,6 +443,81 @@ pub const Compute = struct {
             return self.encodeEx(pipeline, bindings, textures, uniform_bytes, grid_groups, threadgroup, c.AMI_DISPATCH_THREADGROUPS, insert_barrier_before);
         }
 
+        /// Encodes a threads-grid dispatch with explicit zero-copy vision plane texture bindings.
+        pub fn encodeThreadsWithVisionTextures(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            vision_textures: []const VisionTextureBinding,
+            uniform_bytes: ?[]const u8,
+            grid: [3]u64,
+            threadgroup: [3]u64,
+            insert_barrier_before: bool,
+        ) Error!void {
+            return self.encodeVisionEx(pipeline, bindings, vision_textures, uniform_bytes, grid, threadgroup, c.AMI_DISPATCH_THREADS, insert_barrier_before);
+        }
+
+        /// Encodes a threadgroups-grid dispatch with explicit zero-copy vision plane texture bindings.
+        pub fn encodeThreadgroupsWithVisionTextures(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            vision_textures: []const VisionTextureBinding,
+            uniform_bytes: ?[]const u8,
+            grid_groups: [3]u64,
+            threadgroup: [3]u64,
+            insert_barrier_before: bool,
+        ) Error!void {
+            return self.encodeVisionEx(pipeline, bindings, vision_textures, uniform_bytes, grid_groups, threadgroup, c.AMI_DISPATCH_THREADGROUPS, insert_barrier_before);
+        }
+
+        fn encodeVisionEx(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            vision_textures: []const VisionTextureBinding,
+            uniform_bytes: ?[]const u8,
+            grid: [3]u64,
+            threadgroup: [3]u64,
+            mode: u32,
+            insert_barrier_before: bool,
+        ) Error!void {
+            if (!self.open) return error.InvalidArgument;
+            if (bindings.len > MAX_BUFFER_BINDINGS or vision_textures.len > MAX_TEXTURE_BINDINGS) {
+                return error.InvalidArgument;
+            }
+            var raw_bufs: [MAX_BUFFER_BINDINGS]c.ami_buffer_binding = undefined;
+            for (bindings, 0..) |b, i| {
+                raw_bufs[i] = .{ .buffer = b.buffer.handle, .offset = b.offset };
+            }
+            var raw_texs: [MAX_TEXTURE_BINDINGS]c.ami_vision_texture_binding = undefined;
+            for (vision_textures, 0..) |t, i| {
+                raw_texs[i] = .{ .frame = t.frame.handle, .plane = t.plane, .reserved = 0 };
+            }
+            const b_ptr: ?[*]const c.ami_buffer_binding = if (bindings.len > 0) &raw_bufs else null;
+            const t_ptr: ?[*]const c.ami_vision_texture_binding = if (vision_textures.len > 0) &raw_texs else null;
+            const u_ptr: ?*const anyopaque = if (uniform_bytes) |u| u.ptr else null;
+            const u_len: usize = if (uniform_bytes) |u| u.len else 0;
+            try check(c.ami_compute_encode_dispatch_vision(
+                self.compute.handle,
+                pipeline.handle,
+                b_ptr,
+                bindings.len,
+                t_ptr,
+                vision_textures.len,
+                u_ptr,
+                u_len,
+                grid[0],
+                grid[1],
+                grid[2],
+                threadgroup[0],
+                threadgroup[1],
+                threadgroup[2],
+                mode,
+                if (insert_barrier_before) 1 else 0,
+            ));
+        }
+
         fn encodeEx(
             self: *Frame,
             pipeline: Pipeline,
@@ -581,6 +658,37 @@ pub const Compute = struct {
         }
     }
 
+    /// Adds zero-copy vision frames' plane textures to the user residency set
+    /// and commits residency. Zero heap allocation.
+    pub fn makeVisionFramesResident(self: Compute, frames: []const VisionFrame) Error!void {
+        const batch_cap = 64;
+        var offset: usize = 0;
+        while (offset < frames.len) {
+            const count = @min(batch_cap, frames.len - offset);
+            var handles: [batch_cap]?*c.ami_vision_frame = undefined;
+            for (frames[offset .. offset + count], 0..) |frame, i| {
+                handles[i] = frame.handle;
+            }
+            try check(c.ami_compute_make_vision_frames_resident(self.handle, &handles, count));
+            offset += count;
+        }
+    }
+
+    /// Removes zero-copy vision frames' plane textures from the user residency set.
+    pub fn removeVisionFramesResident(self: Compute, frames: []const VisionFrame) Error!void {
+        const batch_cap = 64;
+        var offset: usize = 0;
+        while (offset < frames.len) {
+            const count = @min(batch_cap, frames.len - offset);
+            var handles: [batch_cap]?*c.ami_vision_frame = undefined;
+            for (frames[offset .. offset + count], 0..) |frame, i| {
+                handles[i] = frame.handle;
+            }
+            try check(c.ami_compute_remove_vision_frames_resident(self.handle, &handles, count));
+            offset += count;
+        }
+    }
+
     /// Removes all caller allocations from this context's user residency set.
     pub fn clearResidency(self: Compute) Error!void {
         try check(c.ami_compute_clear_residency(self.handle));
@@ -699,6 +807,17 @@ pub const AneTensor = struct {
         }
         var handle: ?*c.ami_ane_tensor = null;
         try check(c.ami_ane_tensor_from_kv_tile(tile.handle, shape.ptr, shape.len, &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    /// Wraps an `F16` (`OneComponent16Half`) `VisionFrame`'s IOSurface
+    /// `CVPixelBuffer` as a zero-copy fp16 `MLMultiArray` (`ADR-0004`, `G14`).
+    pub fn fromVisionFrame(frame: VisionFrame, shape: []const u32) Error!AneTensor {
+        if (shape.len < 2 or shape.len > ANE_MAX_DIMS) {
+            return error.InvalidArgument;
+        }
+        var handle: ?*c.ami_ane_tensor = null;
+        try check(c.ami_ane_tensor_from_vision_frame(frame.handle, shape.ptr, shape.len, &handle));
         return .{ .handle = handle orelse return error.NullHandle };
     }
 
@@ -888,6 +1007,383 @@ pub fn accelerateSgemm(
         if (transpose_b) 1 else 0,
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Zero-copy multimodal vision/video ingress bridge (M6.5 G14, ADR-0002/0004/0019)
+// ---------------------------------------------------------------------------
+
+/// Pixel layout of an IOSurface-backed `VisionFrame`.
+pub const VisionFormat = enum {
+    /// 1-plane `kCVPixelFormatType_32BGRA` -> `MTLPixelFormatBGRA8Unorm`.
+    bgra8,
+    /// 2-plane `kCVPixelFormatType_420YpCbCr8BiPlanar{Full,Video}Range` -> `R8Unorm` + `RG8Unorm`.
+    nv12,
+    /// 1-plane `kCVPixelFormatType_OneComponent16Half` -> `R16Float` + zero-copy CoreML `MLMultiArray`.
+    f16,
+
+    fn toRaw(self: VisionFormat) u32 {
+        return switch (self) {
+            .bgra8 => c.AMI_VISION_FMT_BGRA8,
+            .nv12 => c.AMI_VISION_FMT_NV12,
+            .f16 => c.AMI_VISION_FMT_F16,
+        };
+    }
+
+    fn fromRaw(raw: u32) VisionFormat {
+        return switch (raw) {
+            c.AMI_VISION_FMT_NV12 => .nv12,
+            c.AMI_VISION_FMT_F16 => .f16,
+            else => .bgra8,
+        };
+    }
+};
+
+/// Hardware VideoToolbox codec selection for compressed video clips.
+pub const VtCodec = enum {
+    h264,
+    hevc,
+
+    fn toRaw(self: VtCodec) u32 {
+        return switch (self) {
+            .h264 => c.AMI_VT_CODEC_H264,
+            .hevc => c.AMI_VT_CODEC_HEVC,
+        };
+    }
+
+    fn fromRaw(raw: u32) VtCodec {
+        return switch (raw) {
+            c.AMI_VT_CODEC_HEVC => .hevc,
+            else => .h264,
+        };
+    }
+};
+
+/// Binding of one zero-copy IOSurface plane `MTLTexture` into `[[texture(i)]]`.
+pub const VisionTextureBinding = struct {
+    frame: VisionFrame,
+    plane: u32 = 0,
+};
+
+/// Physical-page and zero-copy Metal metadata for a `VisionFrame`.
+pub const VisionFrameInfo = struct {
+    raw: c.ami_vision_frame_info,
+
+    pub fn format(self: VisionFrameInfo) VisionFormat {
+        return VisionFormat.fromRaw(self.raw.format);
+    }
+    pub fn cvPixelFormat(self: VisionFrameInfo) u32 {
+        return self.raw.cv_pixel_format;
+    }
+    pub fn width(self: VisionFrameInfo) u32 {
+        return self.raw.width;
+    }
+    pub fn height(self: VisionFrameInfo) u32 {
+        return self.raw.height;
+    }
+    pub fn planeCount(self: VisionFrameInfo) u32 {
+        return self.raw.plane_count;
+    }
+    pub fn isFullRange(self: VisionFrameInfo) bool {
+        return self.raw.is_full_range != 0;
+    }
+    pub fn zeroCopyVerified(self: VisionFrameInfo) bool {
+        return self.raw.zero_copy_verified != 0;
+    }
+    pub fn isPageAligned(self: VisionFrameInfo) bool {
+        return self.raw.is_page_aligned != 0;
+    }
+    pub fn iosurfaceId(self: VisionFrameInfo) u32 {
+        return self.raw.iosurface_id;
+    }
+    pub fn isVtDecoded(self: VisionFrameInfo) bool {
+        return self.raw.vt_decoded != 0;
+    }
+    pub fn baseAddress(self: VisionFrameInfo) u64 {
+        return self.raw.base_address;
+    }
+    pub fn allocSize(self: VisionFrameInfo) u64 {
+        return self.raw.alloc_size;
+    }
+    pub fn surfaceAllocSize(self: VisionFrameInfo) u64 {
+        return self.raw.surface_alloc_size;
+    }
+    pub fn planeWidth(self: VisionFrameInfo, plane: u32) u32 {
+        return if (plane < 2) self.raw.plane_width[plane] else 0;
+    }
+    pub fn planeHeight(self: VisionFrameInfo, plane: u32) u32 {
+        return if (plane < 2) self.raw.plane_height[plane] else 0;
+    }
+    pub fn planeBytesPerRow(self: VisionFrameInfo, plane: u32) u32 {
+        return if (plane < 2) self.raw.plane_bytes_per_row[plane] else 0;
+    }
+    pub fn planeResourceId(self: VisionFrameInfo, plane: u32) u64 {
+        return if (plane < 2) self.raw.plane_resource_id[plane] else 0;
+    }
+    pub fn ptsValue(self: VisionFrameInfo) i64 {
+        return self.raw.pts_value;
+    }
+    pub fn ptsTimescale(self: VisionFrameInfo) i32 {
+        return self.raw.pts_timescale;
+    }
+};
+
+/// CoreML / ANE zero-copy compatibility probe result for a `VisionFrame`.
+pub const VisionAneProbe = struct {
+    raw: c.ami_vision_ane_probe,
+
+    pub fn pixelBufferFeatureOk(self: VisionAneProbe) bool {
+        return self.raw.pixel_buffer_feature_ok != 0;
+    }
+    pub fn multiArrayZeroCopyOk(self: VisionAneProbe) bool {
+        return self.raw.multi_array_zero_copy_ok != 0;
+    }
+    pub fn iosurfaceIdentityMatched(self: VisionAneProbe) bool {
+        return self.raw.iosurface_identity_matched != 0;
+    }
+};
+
+/// Zero-copy IOSurface-backed `CVPixelBuffer` (`BGRA8`, `NV12`, or `F16`) with
+/// per-plane `MTLTexture` views sharing the exact same physical pages (`G14`).
+pub const VisionFrame = struct {
+    handle: *c.ami_vision_frame,
+
+    /// Scoped CPU lock over one plane of the frame's IOSurface (tests/offline setup only).
+    pub const PlaneLockGuard = struct {
+        frame: VisionFrame,
+        read_only: bool,
+        locked: bool,
+        bytes: []u8,
+        bytes_per_row: usize,
+        height: u32,
+
+        pub fn rowBytes(self: PlaneLockGuard, y: u32) []u8 {
+            const start = @as(usize, y) * self.bytes_per_row;
+            return self.bytes[start .. start + self.bytes_per_row];
+        }
+
+        pub fn unlock(self: *PlaneLockGuard) Error!void {
+            if (!self.locked) return error.InvalidArgument;
+            self.locked = false;
+            try check(c.ami_vision_frame_unlock(self.frame.handle, if (self.read_only) 1 else 0));
+        }
+
+        /// Safe cleanup for `errdefer` when an error occurs before `unlock`.
+        pub fn release(self: *PlaneLockGuard) void {
+            if (!self.locked) return;
+            self.locked = false;
+            const st = c.ami_vision_frame_unlock(self.frame.handle, if (self.read_only) 1 else 0);
+            std.debug.assert(st == c.AMI_OK);
+        }
+    };
+
+    /// Creates a 16 KiB-aligned IOSurface-backed `VisionFrame` with zero-copy Metal views.
+    pub fn init(device: Device, fmt: VisionFormat, width: u32, height: u32) Error!VisionFrame {
+        if (width == 0 or height == 0 or width > MAX_TEXTURE_DIM or height > MAX_TEXTURE_DIM) {
+            return error.InvalidArgument;
+        }
+        var handle: ?*c.ami_vision_frame = null;
+        try check(c.ami_vision_frame_create(device.handle, fmt.toRaw(), width, height, &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    /// Loads a local `.png`/`.jpg` image via ImageIO directly into a 16 KiB-aligned `BGRA8` IOSurface.
+    pub fn loadImage(device: Device, path: [:0]const u8) Error!VisionFrame {
+        if (path.len == 0) return error.InvalidArgument;
+        var handle: ?*c.ami_vision_frame = null;
+        try check(c.ami_image_load_iosurface(device.handle, path.ptr, &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    /// Writes a `BGRA8` `VisionFrame` to a local `.png` file via ImageIO (test/offline helper).
+    pub fn writePng(self: VisionFrame, path: [:0]const u8) Error!void {
+        if (path.len == 0) return error.InvalidArgument;
+        try check(c.ami_image_write_png(self.handle, path.ptr));
+    }
+
+    pub fn close(self: VisionFrame) void {
+        c.ami_vision_frame_destroy(self.handle);
+    }
+
+    pub fn info(self: VisionFrame) Error!VisionFrameInfo {
+        var raw: c.ami_vision_frame_info = undefined;
+        try check(c.ami_vision_frame_query(self.handle, &raw));
+        return .{ .raw = raw };
+    }
+
+    pub fn planeResourceId(self: VisionFrame, plane: u32) u64 {
+        return c.ami_vision_frame_plane_resource_id(self.handle, plane);
+    }
+
+    pub fn probeAne(self: VisionFrame) Error!VisionAneProbe {
+        var raw: c.ami_vision_ane_probe = undefined;
+        try check(c.ami_vision_frame_probe_ane(self.handle, &raw));
+        return .{ .raw = raw };
+    }
+
+    pub fn toAneTensor(self: VisionFrame, shape: []const u32) Error!AneTensor {
+        return AneTensor.fromVisionFrame(self, shape);
+    }
+
+    pub fn lockPlane(self: VisionFrame, plane: u32, read_only: bool) Error!PlaneLockGuard {
+        var base_ptr: ?*anyopaque = null;
+        var bpr: usize = 0;
+        var h: u32 = 0;
+        try check(c.ami_vision_frame_lock_plane(
+            self.handle,
+            plane,
+            if (read_only) 1 else 0,
+            &base_ptr,
+            &bpr,
+            &h,
+        ));
+        const raw_ptr = base_ptr orelse {
+            _ = c.ami_vision_frame_unlock(self.handle, if (read_only) 1 else 0);
+            return error.NullHandle;
+        };
+        const total = std.math.mul(usize, bpr, h) catch {
+            _ = c.ami_vision_frame_unlock(self.handle, if (read_only) 1 else 0);
+            return error.VisionFailed;
+        };
+        const byte_ptr: [*]u8 = @ptrCast(raw_ptr);
+        return .{
+            .frame = self,
+            .read_only = read_only,
+            .locked = true,
+            .bytes = byte_ptr[0..total],
+            .bytes_per_row = bpr,
+            .height = h,
+        };
+    }
+};
+
+/// Metadata for a hardware-encoded VideoToolbox clip.
+pub const VtClipInfo = struct {
+    raw: c.ami_vt_clip_info,
+
+    pub fn codec(self: VtClipInfo) VtCodec {
+        return VtCodec.fromRaw(self.raw.codec);
+    }
+    pub fn width(self: VtClipInfo) u32 {
+        return self.raw.width;
+    }
+    pub fn height(self: VtClipInfo) u32 {
+        return self.raw.height;
+    }
+    pub fn frameCount(self: VtClipInfo) u32 {
+        return self.raw.frame_count;
+    }
+    pub fn fps(self: VtClipInfo) u32 {
+        return self.raw.fps;
+    }
+    pub fn usingHardwareEncoder(self: VtClipInfo) bool {
+        return self.raw.using_hardware_encoder != 0;
+    }
+    pub fn totalCompressedBytes(self: VtClipInfo) u64 {
+        return self.raw.total_compressed_bytes;
+    }
+};
+
+/// Hardware-compressed H.264 / HEVC clip of `CMSampleBuffer`s produced via VideoToolbox.
+pub const VtClip = struct {
+    handle: *c.ami_vt_clip,
+
+    pub fn encodeTestClip(
+        codec: VtCodec,
+        width: u32,
+        height: u32,
+        frame_count: u32,
+        fps: u32,
+    ) Error!VtClip {
+        var handle: ?*c.ami_vt_clip = null;
+        try check(c.ami_vt_encode_test_clip(codec.toRaw(), width, height, frame_count, fps, &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    pub fn encodeFrames(codec: VtCodec, frames: []const VisionFrame, fps: u32) Error!VtClip {
+        if (frames.len == 0 or frames.len > 128) return error.InvalidArgument;
+        var handles: [128]?*c.ami_vision_frame = undefined;
+        for (frames, 0..) |frame, i| {
+            handles[i] = frame.handle;
+        }
+        var handle: ?*c.ami_vt_clip = null;
+        try check(c.ami_vt_encode_frames(
+            codec.toRaw(),
+            &handles,
+            @intCast(frames.len),
+            fps,
+            &handle,
+        ));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    pub fn close(self: VtClip) void {
+        c.ami_vt_clip_destroy(self.handle);
+    }
+
+    pub fn info(self: VtClip) Error!VtClipInfo {
+        var raw: c.ami_vt_clip_info = undefined;
+        try check(c.ami_vt_clip_query(self.handle, &raw));
+        return .{ .raw = raw };
+    }
+};
+
+/// Metadata for a hardware VideoToolbox decompression session.
+pub const VtDecodeSessionInfo = struct {
+    raw: c.ami_vt_decode_session_info,
+
+    pub fn codec(self: VtDecodeSessionInfo) VtCodec {
+        return VtCodec.fromRaw(self.raw.codec);
+    }
+    pub fn outputFormat(self: VtDecodeSessionInfo) VisionFormat {
+        return VisionFormat.fromRaw(self.raw.output_format);
+    }
+    pub fn width(self: VtDecodeSessionInfo) u32 {
+        return self.raw.width;
+    }
+    pub fn height(self: VtDecodeSessionInfo) u32 {
+        return self.raw.height;
+    }
+    pub fn usingHardwareDecoder(self: VtDecodeSessionInfo) bool {
+        return self.raw.using_hardware_decoder != 0;
+    }
+};
+
+/// Hardware VideoToolbox `VTDecompressionSession` decoding compressed H.264/HEVC
+/// frames directly into zero-copy IOSurface-backed `VisionFrame`s (`G14`).
+pub const VtDecodeSession = struct {
+    handle: *c.ami_vt_decode_session,
+
+    pub fn init(device: Device, clip: VtClip, output_format: VisionFormat) Error!VtDecodeSession {
+        if (output_format != .nv12 and output_format != .bgra8) {
+            return error.InvalidArgument;
+        }
+        var handle: ?*c.ami_vt_decode_session = null;
+        try check(c.ami_vt_decode_session_create(
+            device.handle,
+            clip.handle,
+            output_format.toRaw(),
+            &handle,
+        ));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+
+    pub fn close(self: VtDecodeSession) void {
+        c.ami_vt_decode_session_destroy(self.handle);
+    }
+
+    pub fn info(self: VtDecodeSession) Error!VtDecodeSessionInfo {
+        var raw: c.ami_vt_decode_session_info = undefined;
+        try check(c.ami_vt_decode_session_query(self.handle, &raw));
+        return .{ .raw = raw };
+    }
+
+    /// Decodes `frame_index` from `clip` directly into a zero-copy IOSurface `VisionFrame`.
+    pub fn decodeFrame(self: VtDecodeSession, clip: VtClip, frame_index: u32) Error!VisionFrame {
+        var handle: ?*c.ami_vision_frame = null;
+        try check(c.ami_vt_decode_clip_frame(self.handle, clip.handle, frame_index, &handle));
+        return .{ .handle = handle orelse return error.NullHandle };
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Pure-Zig minimal CoreML .mlmodel protobuf emitter (zero Python/coremltools)

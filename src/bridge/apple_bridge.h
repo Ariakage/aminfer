@@ -41,6 +41,18 @@ enum {
     AMI_ERR_UNSUPPORTED = 9,
     AMI_ERR_TILE = 10,
     AMI_ERR_ANE = 11,
+    AMI_ERR_VISION = 12,
+};
+
+enum {
+    AMI_VISION_FMT_BGRA8 = 0,
+    AMI_VISION_FMT_NV12 = 1,
+    AMI_VISION_FMT_F16 = 2,
+};
+
+enum {
+    AMI_VT_CODEC_H264 = 0,
+    AMI_VT_CODEC_HEVC = 1,
 };
 
 enum {
@@ -386,6 +398,198 @@ ami_status ami_ane_model_predict_oneshot(const ami_ane_model *model,
 ami_status ami_accelerate_sgemm(uint32_t m, uint32_t n, uint32_t k,
                                 float alpha, const float *a, const float *b,
                                 float beta, float *c, uint32_t transpose_b);
+
+/* -------------------------------------------------------------------------
+ * Zero-copy multimodal vision/video ingress bridge (M6.5 G14, ADR-0002/0004/0019)
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Owns one IOSurface-backed CVPixelBuffer (BGRA8Unorm, bi-planar NV12, or
+ * OneComponent16Half) plus zero-copy per-plane MTLTexture views over the exact
+ * same physical IOSurface pages (`texture.iosurface == CVPixelBufferGetIOSurface`).
+ */
+typedef struct ami_vision_frame ami_vision_frame;
+
+/* Owns a hardware-encoded H.264 / HEVC clip of CMSampleBuffers for VT decode. */
+typedef struct ami_vt_clip ami_vt_clip;
+
+/* Owns one hardware-accelerated VideoToolbox VTDecompressionSession. */
+typedef struct ami_vt_decode_session ami_vt_decode_session;
+
+/* Binding of one zero-copy plane MTLTexture from a resident ami_vision_frame. */
+typedef struct ami_vision_texture_binding {
+    const ami_vision_frame *frame;
+    uint32_t plane; /* 0 for BGRA8/F16/NV12-Y, 1 for NV12-CbCr */
+    uint32_t reserved;
+} ami_vision_texture_binding;
+
+/* Physical-page and zero-copy texture metadata for an ami_vision_frame. */
+typedef struct ami_vision_frame_info {
+    uint32_t format;               /* AMI_VISION_FMT_BGRA8 / NV12 / F16 */
+    uint32_t cv_pixel_format;      /* raw CoreVideo FourCC (32BGRA, 420f, 420v, L00h) */
+    uint32_t width;                /* full frame width in pixels */
+    uint32_t height;               /* full frame height in pixels */
+    uint32_t plane_count;          /* 1 (BGRA8/F16) or 2 (NV12) */
+    uint32_t is_full_range;        /* 1 for BGRA8/F16/420f, 0 for 420v */
+    uint32_t zero_copy_verified;   /* 1 iff every plane texture.iosurface == pb IOSurface */
+    uint32_t is_page_aligned;      /* 1 iff base_address and surface_alloc_size % 16 KiB == 0 */
+    uint32_t iosurface_id;         /* IOSurfaceGetID(surface) */
+    uint32_t vt_decoded;           /* 1 if produced by VideoToolbox decode, else 0 */
+    uint64_t base_address;         /* (uintptr_t)IOSurfaceGetBaseAddress(surface) */
+    uint64_t alloc_size;           /* requested 16 KiB-aligned size or surface_alloc_size */
+    uint64_t surface_alloc_size;   /* raw IOSurfaceGetAllocSize(surface) */
+    uint32_t plane_width[2];       /* per-plane width in texels */
+    uint32_t plane_height[2];      /* per-plane height in texels */
+    uint32_t plane_bytes_per_row[2];
+    uint32_t plane_reserved[2];
+    uint64_t plane_resource_id[2]; /* MTLTexture.gpuResourceID._impl */
+    int64_t pts_value;             /* VideoToolbox presentation timestamp numerator */
+    int32_t pts_timescale;         /* VideoToolbox presentation timestamp timescale */
+    uint32_t reserved;
+} ami_vision_frame_info;
+
+/* CoreML / ANE zero-copy compatibility probe result for an ami_vision_frame. */
+typedef struct ami_vision_ane_probe {
+    uint32_t pixel_buffer_feature_ok;   /* 1 iff MLFeatureValue(pixelBuffer:) succeeds zero-copy */
+    uint32_t multi_array_zero_copy_ok;  /* 1 iff MLMultiArray(pixelBuffer:shape:) succeeds zero-copy */
+    uint32_t iosurface_identity_matched;/* 1 iff returned CVPixelBuffer shares identical IOSurfaceID */
+    uint32_t reserved;
+} ami_vision_ane_probe;
+
+/* Metadata for a hardware-encoded VideoToolbox test/offline clip. */
+typedef struct ami_vt_clip_info {
+    uint32_t codec;                  /* AMI_VT_CODEC_H264 or AMI_VT_CODEC_HEVC */
+    uint32_t width;
+    uint32_t height;
+    uint32_t frame_count;
+    uint32_t fps;
+    uint32_t using_hardware_encoder; /* 0 or 1 */
+    uint64_t total_compressed_bytes;
+} ami_vt_clip_info;
+
+/* Metadata for a VideoToolbox hardware decompression session. */
+typedef struct ami_vt_decode_session_info {
+    uint32_t codec;                  /* AMI_VT_CODEC_H264 or AMI_VT_CODEC_HEVC */
+    uint32_t output_format;          /* AMI_VISION_FMT_NV12 or AMI_VISION_FMT_BGRA8 */
+    uint32_t width;
+    uint32_t height;
+    uint32_t using_hardware_decoder; /* 0 or 1 */
+    uint32_t reserved;
+} ami_vt_decode_session_info;
+
+/*
+ * Creates an IOSurface-backed CVPixelBuffer of `format` (BGRA8, NV12, or F16)
+ * with explicit 16 KiB-multiple kIOSurfaceAllocSize and zero-copy per-plane
+ * MTLTexture views (`BGRA8Unorm`, `R8Unorm` + `RG8Unorm`, or `R16Float`).
+ */
+ami_status ami_vision_frame_create(ami_device *device, uint32_t format,
+                                   uint32_t width, uint32_t height,
+                                   ami_vision_frame **out_frame);
+void ami_vision_frame_destroy(ami_vision_frame *frame);
+ami_status ami_vision_frame_query(const ami_vision_frame *frame,
+                                  ami_vision_frame_info *out_info);
+uint64_t ami_vision_frame_plane_resource_id(const ami_vision_frame *frame, uint32_t plane);
+
+/* CPU lock/unlock for test setup and inspection; never used on the GPU hot path. */
+ami_status ami_vision_frame_lock_plane(ami_vision_frame *frame, uint32_t plane,
+                                       uint32_t read_only, void **out_base_ptr,
+                                       size_t *out_bytes_per_row, uint32_t *out_height);
+ami_status ami_vision_frame_unlock(ami_vision_frame *frame, uint32_t read_only);
+
+/*
+ * Probes zero-copy CoreML / ANE compatibility on `frame`'s IOSurface CVPixelBuffer:
+ * checks MLFeatureValue(pixelBuffer:) and (for F16) MLMultiArray(pixelBuffer:shape:).
+ */
+ami_status ami_vision_frame_probe_ane(const ami_vision_frame *frame,
+                                      ami_vision_ane_probe *out_probe);
+
+/*
+ * Wraps an F16 (`AMI_VISION_FMT_F16` / OneComponent16Half) vision frame's
+ * IOSurface CVPixelBuffer as a zero-copy fp16 MLMultiArray (`ami_ane_tensor`).
+ * Requires `shape[rank - 1] == frame.width` and `product(shape[0..rank-1]) == frame.height`
+ * and 64-byte tight rows (`frame.plane_bytes_per_row[0] == frame.width * 2`).
+ */
+ami_status ami_ane_tensor_from_vision_frame(const ami_vision_frame *frame,
+                                            const uint32_t *shape, size_t rank,
+                                            ami_ane_tensor **out_tensor);
+
+/* Manages vision frame zero-copy plane textures in a compute context's residency set. */
+ami_status ami_compute_make_vision_frames_resident(ami_compute *compute,
+                                                 ami_vision_frame *const *frames,
+                                                 size_t count);
+ami_status ami_compute_remove_vision_frames_resident(ami_compute *compute,
+                                                   ami_vision_frame *const *frames,
+                                                   size_t count);
+
+/*
+ * Metal 4 compute dispatch binding zero-copy vision plane textures
+ * `vision_textures[0..vision_texture_count)` to `[[texture(0..vision_texture_count-1)]]`.
+ */
+ami_status ami_compute_encode_dispatch_vision(ami_compute *compute,
+                                              const ami_pipeline *pipeline,
+                                              const ami_buffer_binding *bindings,
+                                              size_t binding_count,
+                                              const ami_vision_texture_binding *vision_textures,
+                                              size_t vision_texture_count,
+                                              const void *uniform_bytes, size_t uniform_len,
+                                              uint64_t grid_x, uint64_t grid_y, uint64_t grid_z,
+                                              uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
+                                              uint32_t dispatch_mode,
+                                              uint32_t insert_barrier_before);
+
+/*
+ * Loads a local image file (.png / .jpg / etc.) via ImageIO CGImageSource directly
+ * into a 16 KiB-aligned BGRA8 IOSurface-backed ami_vision_frame (zero intermediate copies
+ * beyond CGImageSource decode into the IOSurface pages).
+ */
+ami_status ami_image_load_iosurface(ami_device *device, const char *path,
+                                    ami_vision_frame **out_frame);
+
+/*
+ * Writes a BGRA8 ami_vision_frame to a local .png file via ImageIO CGImageDestination
+ * (offline / test helper so tests verify real ImageIO without committed media blobs).
+ */
+ami_status ami_image_write_png(ami_vision_frame *frame, const char *path);
+
+/*
+ * Encodes a synthetic moving test pattern into a real hardware-compressed H.264 or HEVC
+ * clip via VideoToolbox VTCompressionSession (zero committed media blobs).
+ */
+ami_status ami_vt_encode_test_clip(uint32_t codec, uint32_t width, uint32_t height,
+                                   uint32_t frame_count, uint32_t fps,
+                                   ami_vt_clip **out_clip);
+
+/*
+ * Encodes caller-provided ami_vision_frame(s) (BGRA8 or NV12, uniform width/height)
+ * into a real hardware-compressed H.264 or HEVC clip via VideoToolbox.
+ */
+ami_status ami_vt_encode_frames(uint32_t codec, ami_vision_frame *const *frames,
+                                uint32_t frame_count, uint32_t fps,
+                                ami_vt_clip **out_clip);
+
+void ami_vt_clip_destroy(ami_vt_clip *clip);
+ami_status ami_vt_clip_query(const ami_vt_clip *clip, ami_vt_clip_info *out_info);
+
+/*
+ * Creates a hardware-accelerated VideoToolbox VTDecompressionSession configured with
+ * kCVPixelBufferIOSurfacePropertiesKey + kCVPixelBufferMetalCompatibilityKey so decoded
+ * H.264 / HEVC frames land directly in zero-copy IOSurface-backed CVPixelBuffers.
+ * `output_format` must be AMI_VISION_FMT_NV12 or AMI_VISION_FMT_BGRA8.
+ */
+ami_status ami_vt_decode_session_create(ami_device *device, const ami_vt_clip *clip,
+                                        uint32_t output_format,
+                                        ami_vt_decode_session **out_session);
+void ami_vt_decode_session_destroy(ami_vt_decode_session *session);
+ami_status ami_vt_decode_session_query(const ami_vt_decode_session *session,
+                                       ami_vt_decode_session_info *out_info);
+
+/*
+ * Decodes compressed frame `frame_index` from `clip` via VideoToolbox directly into a
+ * zero-copy IOSurface-backed ami_vision_frame with Metal plane views (`0` host memcpy).
+ */
+ami_status ami_vt_decode_clip_frame(ami_vt_decode_session *session,
+                                    const ami_vt_clip *clip, uint32_t frame_index,
+                                    ami_vision_frame **out_frame);
 
 #ifdef __cplusplus
 }

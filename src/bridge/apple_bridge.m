@@ -5,11 +5,15 @@
 
 #define ACCELERATE_NEW_LAPACK 1
 #import <Accelerate/Accelerate.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <CoreML/CoreML.h>
+#import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
+#import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 #include <limits.h>
 #include <stdbool.h>
@@ -1727,4 +1731,1406 @@ ami_status ami_accelerate_sgemm(uint32_t m, uint32_t n, uint32_t k,
                 c,
                 (int)n);
     return AMI_OK;
+}
+
+/* -------------------------------------------------------------------------
+ * Zero-copy multimodal vision/video ingress bridge (M6.5 G14)
+ * ------------------------------------------------------------------------- */
+
+struct ami_vision_frame {
+    CVPixelBufferRef pixel_buffer; // retained via CoreVideo
+    IOSurfaceRef surface;          // borrowed from pixel_buffer
+    void *mtl_textures[2];         // id<MTLTexture>, retained
+    uint32_t format;
+    uint32_t cv_pixel_format;
+    uint32_t width;
+    uint32_t height;
+    uint32_t plane_count;
+    uint32_t is_full_range;
+    uint32_t zero_copy_verified;
+    uint32_t is_page_aligned;
+    uint32_t iosurface_id;
+    uint32_t vt_decoded;
+    uint64_t base_address;
+    uint64_t alloc_size;
+    uint64_t surface_alloc_size;
+    uint32_t plane_width[2];
+    uint32_t plane_height[2];
+    uint32_t plane_bytes_per_row[2];
+    int64_t pts_value;
+    int32_t pts_timescale;
+};
+
+struct ami_vt_clip {
+    CMVideoFormatDescriptionRef format_desc; // retained
+    CMSampleBufferRef *samples;              // owned array of retained CMSampleBuffers
+    uint32_t codec;
+    uint32_t width;
+    uint32_t height;
+    uint32_t frame_count;
+    uint32_t fps;
+    uint32_t using_hardware_encoder;
+    uint64_t total_compressed_bytes;
+};
+
+struct ami_vt_decode_session {
+    void *mtl_device;                        // id<MTLDevice>, retained
+    VTDecompressionSessionRef vt_session;    // retained
+    uint32_t codec;
+    uint32_t output_format;
+    uint32_t width;
+    uint32_t height;
+    uint32_t using_hardware_decoder;
+};
+
+static uint64_t align_up_u64(uint64_t val, uint64_t align) {
+    return ((val + align - 1u) / align) * align;
+}
+
+static id<MTLTexture> vision_plane_texture_of(const ami_vision_frame *frame, uint32_t plane) {
+    if (frame == NULL || plane >= frame->plane_count || frame->mtl_textures[plane] == NULL) {
+        return nil;
+    }
+    return (__bridge id<MTLTexture>)frame->mtl_textures[plane];
+}
+
+static ami_status vision_frame_init_from_mtl_device(id<MTLDevice> mtl_device,
+                                                    CVPixelBufferRef pixel_buffer,
+                                                    uint64_t requested_alloc_bytes,
+                                                    uint32_t vt_decoded,
+                                                    int64_t pts_value,
+                                                    int32_t pts_timescale,
+                                                    ami_vision_frame **out_frame) {
+    if (out_frame == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_frame = NULL;
+    if (mtl_device == nil || pixel_buffer == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    const OSType cv_fmt = CVPixelBufferGetPixelFormatType(pixel_buffer);
+    uint32_t format = 0;
+    uint32_t plane_count = 0;
+    uint32_t is_full_range = 1u;
+    MTLPixelFormat mtl_fmts[2] = { MTLPixelFormatInvalid, MTLPixelFormatInvalid };
+
+    if (cv_fmt == kCVPixelFormatType_32BGRA) {
+        format = AMI_VISION_FMT_BGRA8;
+        plane_count = 1u;
+        is_full_range = 1u;
+        mtl_fmts[0] = MTLPixelFormatBGRA8Unorm;
+    } else if (cv_fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        format = AMI_VISION_FMT_NV12;
+        plane_count = 2u;
+        is_full_range = 1u;
+        mtl_fmts[0] = MTLPixelFormatR8Unorm;
+        mtl_fmts[1] = MTLPixelFormatRG8Unorm;
+    } else if (cv_fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        format = AMI_VISION_FMT_NV12;
+        plane_count = 2u;
+        is_full_range = 0u;
+        mtl_fmts[0] = MTLPixelFormatR8Unorm;
+        mtl_fmts[1] = MTLPixelFormatRG8Unorm;
+    } else if (cv_fmt == kCVPixelFormatType_OneComponent16Half) {
+        format = AMI_VISION_FMT_F16;
+        plane_count = 1u;
+        is_full_range = 1u;
+        mtl_fmts[0] = MTLPixelFormatR16Float;
+    } else {
+        return AMI_ERR_UNSUPPORTED;
+    }
+
+    IOSurfaceRef surface = CVPixelBufferGetIOSurface(pixel_buffer);
+    if (surface == NULL) {
+        return AMI_ERR_VISION;
+    }
+
+    const size_t width = CVPixelBufferGetWidth(pixel_buffer);
+    const size_t height = CVPixelBufferGetHeight(pixel_buffer);
+    if (width == 0 || height == 0 || width > AMI_MAX_TEXTURE_DIM || height > AMI_MAX_TEXTURE_DIM) {
+        return AMI_ERR_VISION;
+    }
+
+    // Lock read-only briefly so freshly VideoToolbox-decoded IOSurfaces establish
+    // their CPU virtual address mapping before querying base address and plane strides.
+    CVReturn lock_ret = CVPixelBufferLockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly);
+    if (lock_ret != kCVReturnSuccess) {
+        return AMI_ERR_VISION;
+    }
+
+    void *base_addr = IOSurfaceGetBaseAddress(surface);
+    const size_t surface_alloc = IOSurfaceGetAllocSize(surface);
+    const IOSurfaceID sid = IOSurfaceGetID(surface);
+
+    uint32_t plane_w[2] = { 0, 0 };
+    uint32_t plane_h[2] = { 0, 0 };
+    uint32_t plane_bpr[2] = { 0, 0 };
+    bool planes_ok = true;
+
+    if (plane_count == 1u) {
+        plane_w[0] = (uint32_t)width;
+        plane_h[0] = (uint32_t)height;
+        plane_bpr[0] = (uint32_t)CVPixelBufferGetBytesPerRow(pixel_buffer);
+        if (plane_bpr[0] == 0) {
+            planes_ok = false;
+        }
+    } else {
+        if (CVPixelBufferGetPlaneCount(pixel_buffer) < 2u) {
+            planes_ok = false;
+        } else {
+            for (uint32_t p = 0; p < 2u; p++) {
+                size_t pw = CVPixelBufferGetWidthOfPlane(pixel_buffer, p);
+                size_t ph = CVPixelBufferGetHeightOfPlane(pixel_buffer, p);
+                size_t pbpr = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, p);
+                if (pw == 0 || ph == 0 || pbpr == 0 ||
+                    pw > AMI_MAX_TEXTURE_DIM || ph > AMI_MAX_TEXTURE_DIM) {
+                    planes_ok = false;
+                    break;
+                }
+                plane_w[p] = (uint32_t)pw;
+                plane_h[p] = (uint32_t)ph;
+                plane_bpr[p] = (uint32_t)pbpr;
+            }
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(pixel_buffer, kCVPixelBufferLock_ReadOnly);
+
+    if (!planes_ok || base_addr == NULL || surface_alloc == 0) {
+        return AMI_ERR_VISION;
+    }
+    const bool base_aligned = (((uintptr_t)base_addr % AMI_PAGE_SIZE) == 0);
+    const bool size_aligned = ((surface_alloc % AMI_PAGE_SIZE) == 0);
+    if (!base_aligned) {
+        return AMI_ERR_VISION;
+    }
+    if (requested_alloc_bytes > 0 &&
+        (surface_alloc < requested_alloc_bytes || !size_aligned)) {
+        return AMI_ERR_VISION;
+    }
+
+    @autoreleasepool {
+        id<MTLTexture> textures[2] = { nil, nil };
+        MTLTextureUsage usage =
+            (vt_decoded != 0 || format == AMI_VISION_FMT_NV12)
+                ? MTLTextureUsageShaderRead
+                : (MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+
+        for (uint32_t p = 0; p < plane_count; p++) {
+            MTLTextureDescriptor *desc =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mtl_fmts[p]
+                                                                   width:(NSUInteger)plane_w[p]
+                                                                  height:(NSUInteger)plane_h[p]
+                                                               mipmapped:NO];
+            desc.storageMode = MTLStorageModeShared;
+            desc.usage = usage;
+            id<MTLTexture> tex = [mtl_device newTextureWithDescriptor:desc
+                                                            iosurface:surface
+                                                                plane:(NSUInteger)p];
+            if (tex == nil) {
+                return AMI_ERR_VISION;
+            }
+            // Prove zero-copy IOSurface physical page identity at the Metal handle level.
+            IOSurfaceRef tex_surface = tex.iosurface;
+            if (tex_surface == NULL || tex_surface != surface ||
+                IOSurfaceGetID(tex_surface) != sid ||
+                tex.iosurfacePlane != (NSUInteger)p) {
+                return AMI_ERR_VISION;
+            }
+            textures[p] = tex;
+        }
+
+        ami_vision_frame *frame = calloc(1, sizeof *frame);
+        if (frame == NULL) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        CVPixelBufferRetain(pixel_buffer);
+        frame->pixel_buffer = pixel_buffer;
+        frame->surface = surface;
+        for (uint32_t p = 0; p < plane_count; p++) {
+            frame->mtl_textures[p] = (__bridge_retained void *)textures[p];
+        }
+        frame->format = format;
+        frame->cv_pixel_format = (uint32_t)cv_fmt;
+        frame->width = (uint32_t)width;
+        frame->height = (uint32_t)height;
+        frame->plane_count = plane_count;
+        frame->is_full_range = is_full_range;
+        frame->zero_copy_verified = 1u;
+        frame->is_page_aligned = (base_aligned && size_aligned) ? 1u : 0u;
+        frame->iosurface_id = (uint32_t)sid;
+        frame->vt_decoded = vt_decoded;
+        frame->base_address = (uint64_t)(uintptr_t)base_addr;
+        frame->alloc_size = (requested_alloc_bytes > 0) ? requested_alloc_bytes : (uint64_t)surface_alloc;
+        frame->surface_alloc_size = (uint64_t)surface_alloc;
+        for (uint32_t p = 0; p < 2u; p++) {
+            frame->plane_width[p] = plane_w[p];
+            frame->plane_height[p] = plane_h[p];
+            frame->plane_bytes_per_row[p] = plane_bpr[p];
+        }
+        frame->pts_value = pts_value;
+        frame->pts_timescale = pts_timescale;
+        *out_frame = frame;
+    }
+    return AMI_OK;
+}
+
+static ami_status create_iosurface_pixel_buffer(uint32_t format, uint32_t width, uint32_t height,
+                                                CVPixelBufferRef *out_pb,
+                                                uint64_t *out_alloc_bytes) {
+    if (out_pb == NULL || out_alloc_bytes == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_pb = NULL;
+    *out_alloc_bytes = 0;
+    if (width == 0 || height == 0 || width > AMI_MAX_TEXTURE_DIM || height > AMI_MAX_TEXTURE_DIM) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        NSDictionary *surface_props = nil;
+        uint64_t alloc_bytes = 0;
+
+        if (format == AMI_VISION_FMT_BGRA8) {
+            const uint64_t bpr = align_up_u64((uint64_t)width * 4u, 64u);
+            const uint64_t data_bytes = bpr * (uint64_t)height;
+            alloc_bytes = align_up_u64(data_bytes, AMI_PAGE_SIZE);
+            surface_props = @{
+                (__bridge id)kIOSurfaceWidth: @(width),
+                (__bridge id)kIOSurfaceHeight: @(height),
+                (__bridge id)kIOSurfaceBytesPerElement: @4,
+                (__bridge id)kIOSurfaceBytesPerRow: @(bpr),
+                (__bridge id)kIOSurfaceAllocSize: @(alloc_bytes),
+                (__bridge id)kIOSurfacePixelFormat: @(kCVPixelFormatType_32BGRA),
+            };
+        } else if (format == AMI_VISION_FMT_NV12) {
+            if ((width & 1u) != 0 || (height & 1u) != 0 || width < 2u || height < 2u) {
+                return AMI_ERR_INVALID_ARGUMENT;
+            }
+            const uint64_t w0 = width;
+            const uint64_t h0 = height;
+            const uint64_t bpr0 = align_up_u64(w0, 64u);
+            const uint64_t size0 = align_up_u64(bpr0 * h0, 64u);
+
+            const uint64_t w1 = width / 2u;
+            const uint64_t h1 = height / 2u;
+            const uint64_t bpr1 = align_up_u64(w1 * 2u, 64u);
+            const uint64_t size1 = align_up_u64(bpr1 * h1, 64u);
+
+            const uint64_t offset0 = 0u;
+            const uint64_t offset1 = size0;
+            alloc_bytes = align_up_u64(offset1 + size1, AMI_PAGE_SIZE);
+
+            NSDictionary *plane0 = @{
+                (__bridge id)kIOSurfacePlaneWidth: @(w0),
+                (__bridge id)kIOSurfacePlaneHeight: @(h0),
+                (__bridge id)kIOSurfacePlaneBytesPerElement: @1,
+                (__bridge id)kIOSurfacePlaneBytesPerRow: @(bpr0),
+                (__bridge id)kIOSurfacePlaneOffset: @(offset0),
+                (__bridge id)kIOSurfacePlaneSize: @(size0),
+            };
+            NSDictionary *plane1 = @{
+                (__bridge id)kIOSurfacePlaneWidth: @(w1),
+                (__bridge id)kIOSurfacePlaneHeight: @(h1),
+                (__bridge id)kIOSurfacePlaneBytesPerElement: @2,
+                (__bridge id)kIOSurfacePlaneBytesPerRow: @(bpr1),
+                (__bridge id)kIOSurfacePlaneOffset: @(offset1),
+                (__bridge id)kIOSurfacePlaneSize: @(size1),
+            };
+            surface_props = @{
+                (__bridge id)kIOSurfaceWidth: @(width),
+                (__bridge id)kIOSurfaceHeight: @(height),
+                (__bridge id)kIOSurfacePixelFormat: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+                (__bridge id)kIOSurfaceAllocSize: @(alloc_bytes),
+                (__bridge id)kIOSurfacePlaneInfo: @[plane0, plane1],
+            };
+        } else if (format == AMI_VISION_FMT_F16) {
+            const uint64_t bpr = align_up_u64((uint64_t)width * 2u, 64u);
+            const uint64_t data_bytes = bpr * (uint64_t)height;
+            alloc_bytes = align_up_u64(data_bytes, AMI_PAGE_SIZE);
+            surface_props = @{
+                (__bridge id)kIOSurfaceWidth: @(width),
+                (__bridge id)kIOSurfaceHeight: @(height),
+                (__bridge id)kIOSurfaceBytesPerElement: @2,
+                (__bridge id)kIOSurfaceBytesPerRow: @(bpr),
+                (__bridge id)kIOSurfaceAllocSize: @(alloc_bytes),
+                (__bridge id)kIOSurfacePixelFormat: @(kCVPixelFormatType_OneComponent16Half),
+            };
+        } else {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+
+        IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)surface_props);
+        if (surface == NULL) {
+            return AMI_ERR_VISION;
+        }
+        NSDictionary *pb_attrs = @{
+            (__bridge id)kCVPixelBufferMetalCompatibilityKey: @YES,
+        };
+        CVPixelBufferRef pb = NULL;
+        CVReturn cv_ret = CVPixelBufferCreateWithIOSurface(
+            kCFAllocatorDefault, surface, (__bridge CFDictionaryRef)pb_attrs, &pb);
+        CFRelease(surface);
+        if (cv_ret != kCVReturnSuccess || pb == NULL) {
+            return AMI_ERR_VISION;
+        }
+
+        if (format == AMI_VISION_FMT_NV12) {
+            CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                                  kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                                  kCVAttachmentMode_ShouldPropagate);
+            CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                                  kCVImageBufferColorPrimaries_ITU_R_709_2,
+                                  kCVAttachmentMode_ShouldPropagate);
+            CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                                  kCVImageBufferTransferFunction_ITU_R_709_2,
+                                  kCVAttachmentMode_ShouldPropagate);
+        }
+
+        *out_pb = pb;
+        *out_alloc_bytes = alloc_bytes;
+    }
+    return AMI_OK;
+}
+
+ami_status ami_vision_frame_create(ami_device *device, uint32_t format,
+                                   uint32_t width, uint32_t height,
+                                   ami_vision_frame **out_frame) {
+    if (out_frame == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_frame = NULL;
+    if (device == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    CVPixelBufferRef pb = NULL;
+    uint64_t alloc_bytes = 0;
+    ami_status st = create_iosurface_pixel_buffer(format, width, height, &pb, &alloc_bytes);
+    if (st != AMI_OK) {
+        return st;
+    }
+
+    st = vision_frame_init_from_mtl_device(device_of(device), pb, alloc_bytes, 0u, 0, 0, out_frame);
+    CVPixelBufferRelease(pb);
+    return st;
+}
+
+void ami_vision_frame_destroy(ami_vision_frame *frame) {
+    if (frame == NULL) {
+        return;
+    }
+    for (uint32_t p = 0; p < 2u; p++) {
+        if (frame->mtl_textures[p] != NULL) {
+            CFRelease(frame->mtl_textures[p]);
+            frame->mtl_textures[p] = NULL;
+        }
+    }
+    if (frame->pixel_buffer != NULL) {
+        CVPixelBufferRelease(frame->pixel_buffer);
+        frame->pixel_buffer = NULL;
+    }
+    free(frame);
+}
+
+ami_status ami_vision_frame_query(const ami_vision_frame *frame,
+                                  ami_vision_frame_info *out_info) {
+    if (frame == NULL || out_info == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_info, 0, sizeof *out_info);
+    out_info->format = frame->format;
+    out_info->cv_pixel_format = frame->cv_pixel_format;
+    out_info->width = frame->width;
+    out_info->height = frame->height;
+    out_info->plane_count = frame->plane_count;
+    out_info->is_full_range = frame->is_full_range;
+    out_info->zero_copy_verified = frame->zero_copy_verified;
+    out_info->is_page_aligned = frame->is_page_aligned;
+    out_info->iosurface_id = frame->iosurface_id;
+    out_info->vt_decoded = frame->vt_decoded;
+    out_info->base_address = frame->base_address;
+    out_info->alloc_size = frame->alloc_size;
+    out_info->surface_alloc_size = frame->surface_alloc_size;
+    for (uint32_t p = 0; p < 2u; p++) {
+        out_info->plane_width[p] = frame->plane_width[p];
+        out_info->plane_height[p] = frame->plane_height[p];
+        out_info->plane_bytes_per_row[p] = frame->plane_bytes_per_row[p];
+        out_info->plane_resource_id[p] = ami_vision_frame_plane_resource_id(frame, p);
+    }
+    out_info->pts_value = frame->pts_value;
+    out_info->pts_timescale = frame->pts_timescale;
+    return AMI_OK;
+}
+
+uint64_t ami_vision_frame_plane_resource_id(const ami_vision_frame *frame, uint32_t plane) {
+    id<MTLTexture> tex = vision_plane_texture_of(frame, plane);
+    if (tex == nil) {
+        return 0;
+    }
+    return tex.gpuResourceID._impl;
+}
+
+ami_status ami_vision_frame_lock_plane(ami_vision_frame *frame, uint32_t plane,
+                                       uint32_t read_only, void **out_base_ptr,
+                                       size_t *out_bytes_per_row, uint32_t *out_height) {
+    if (out_base_ptr != NULL) *out_base_ptr = NULL;
+    if (out_bytes_per_row != NULL) *out_bytes_per_row = 0;
+    if (out_height != NULL) *out_height = 0;
+    if (frame == NULL || plane >= frame->plane_count ||
+        out_base_ptr == NULL || out_bytes_per_row == NULL || out_height == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    CVPixelBufferLockFlags lock_flags = (read_only != 0) ? kCVPixelBufferLock_ReadOnly : 0;
+    CVReturn ret = CVPixelBufferLockBaseAddress(frame->pixel_buffer, lock_flags);
+    if (ret != kCVReturnSuccess) {
+        return AMI_ERR_VISION;
+    }
+    void *base = NULL;
+    size_t bpr = 0;
+    if (frame->plane_count == 1u) {
+        base = CVPixelBufferGetBaseAddress(frame->pixel_buffer);
+        bpr = CVPixelBufferGetBytesPerRow(frame->pixel_buffer);
+    } else {
+        base = CVPixelBufferGetBaseAddressOfPlane(frame->pixel_buffer, plane);
+        bpr = CVPixelBufferGetBytesPerRowOfPlane(frame->pixel_buffer, plane);
+    }
+    if (base == NULL || bpr == 0) {
+        CVPixelBufferUnlockBaseAddress(frame->pixel_buffer, lock_flags);
+        return AMI_ERR_VISION;
+    }
+    *out_base_ptr = base;
+    *out_bytes_per_row = bpr;
+    *out_height = frame->plane_height[plane];
+    return AMI_OK;
+}
+
+ami_status ami_vision_frame_unlock(ami_vision_frame *frame, uint32_t read_only) {
+    if (frame == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    CVPixelBufferLockFlags lock_flags = (read_only != 0) ? kCVPixelBufferLock_ReadOnly : 0;
+    CVReturn ret = CVPixelBufferUnlockBaseAddress(frame->pixel_buffer, lock_flags);
+    return (ret == kCVReturnSuccess) ? AMI_OK : AMI_ERR_VISION;
+}
+
+ami_status ami_vision_frame_probe_ane(const ami_vision_frame *frame,
+                                      ami_vision_ane_probe *out_probe) {
+    if (frame == NULL || frame->pixel_buffer == NULL || out_probe == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_probe, 0, sizeof *out_probe);
+
+    @autoreleasepool {
+        MLFeatureValue *fv = [MLFeatureValue featureValueWithPixelBuffer:frame->pixel_buffer];
+        if (fv != nil && fv.imageBufferValue != NULL) {
+            out_probe->pixel_buffer_feature_ok = 1u;
+            IOSurfaceRef fv_surface = CVPixelBufferGetIOSurface(fv.imageBufferValue);
+            if (fv.imageBufferValue == frame->pixel_buffer &&
+                fv_surface != NULL &&
+                IOSurfaceGetID(fv_surface) == frame->iosurface_id) {
+                out_probe->iosurface_identity_matched = 1u;
+            }
+        }
+
+        // CoreML MLMultiArray(pixelBuffer:shape:) accepts OneComponent16Half with tight rows (ADR-0004).
+        if (frame->format == AMI_VISION_FMT_F16 &&
+            frame->plane_bytes_per_row[0] == frame->width * 2u) {
+            NSArray<NSNumber *> *shape = @[ @(frame->height), @(frame->width) ];
+            CFIndex rc_before = CFGetRetainCount(frame->pixel_buffer);
+            MLMultiArray *arr = [[MLMultiArray alloc] initWithPixelBuffer:frame->pixel_buffer
+                                                                    shape:shape];
+            if (arr != nil) {
+                CFIndex rc_after = CFGetRetainCount(frame->pixel_buffer);
+                if (rc_after <= rc_before) {
+                    CVPixelBufferRetain(frame->pixel_buffer);
+                }
+                CVPixelBufferRef arr_pb = arr.pixelBuffer;
+                IOSurfaceRef arr_surface = (arr_pb != NULL) ? CVPixelBufferGetIOSurface(arr_pb) : NULL;
+                if (arr_pb == frame->pixel_buffer &&
+                    arr_surface != NULL &&
+                    IOSurfaceGetID(arr_surface) == frame->iosurface_id) {
+                    out_probe->multi_array_zero_copy_ok = 1u;
+                    out_probe->iosurface_identity_matched = 1u;
+                }
+            }
+        }
+    }
+    return AMI_OK;
+}
+
+ami_status ami_ane_tensor_from_vision_frame(const ami_vision_frame *frame,
+                                            const uint32_t *shape, size_t rank,
+                                            ami_ane_tensor **out_tensor) {
+    if (out_tensor == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_tensor = NULL;
+    if (frame == NULL || frame->pixel_buffer == NULL || shape == NULL ||
+        rank < 2 || rank > AMI_ANE_MAX_DIMS) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (frame->format != AMI_VISION_FMT_F16) {
+        return AMI_ERR_UNSUPPORTED;
+    }
+    if (frame->plane_bytes_per_row[0] != frame->width * 2u) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    uint64_t leading_rows = 1u;
+    for (size_t i = 0; i < rank; i++) {
+        if (shape[i] == 0u) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+        if (i + 1u < rank) {
+            if (leading_rows > UINT64_MAX / (uint64_t)shape[i]) {
+                return AMI_ERR_INVALID_ARGUMENT;
+            }
+            leading_rows *= (uint64_t)shape[i];
+        }
+    }
+    if (shape[rank - 1u] != frame->width || leading_rows != (uint64_t)frame->height) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        NSMutableArray<NSNumber *> *ns_shape = [NSMutableArray arrayWithCapacity:rank];
+        for (size_t i = 0; i < rank; i++) {
+            [ns_shape addObject:@(shape[i])];
+        }
+
+        CFIndex rc_before = CFGetRetainCount(frame->pixel_buffer);
+        MLMultiArray *arr = [[MLMultiArray alloc] initWithPixelBuffer:frame->pixel_buffer
+                                                                shape:ns_shape];
+        if (arr == nil) {
+            return AMI_ERR_ANE;
+        }
+        CFIndex rc_after = CFGetRetainCount(frame->pixel_buffer);
+        if (rc_after <= rc_before) {
+            CVPixelBufferRetain(frame->pixel_buffer);
+        }
+
+        ami_ane_tensor *tensor = calloc(1, sizeof *tensor);
+        if (tensor == NULL) {
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        tensor->ml_array = (__bridge_retained void *)arr;
+        tensor->pixel_buffer = frame->pixel_buffer;
+        tensor->rank = (uint32_t)rank;
+        for (size_t i = 0; i < rank; i++) {
+            tensor->shape[i] = shape[i];
+        }
+        *out_tensor = tensor;
+    }
+    return AMI_OK;
+}
+
+ami_status ami_compute_make_vision_frames_resident(ami_compute *compute,
+                                                 ami_vision_frame *const *frames,
+                                                 size_t count) {
+    if (compute == NULL || (count > 0 && frames == NULL)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (count == 0) {
+        return AMI_OK;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (frames[i] == NULL || frames[i]->plane_count == 0) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    @autoreleasepool {
+        id<MTLResidencySet> user_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
+        for (size_t i = 0; i < count; i++) {
+            for (uint32_t p = 0; p < frames[i]->plane_count; p++) {
+                id<MTLTexture> tex = vision_plane_texture_of(frames[i], p);
+                if (tex != nil) {
+                    [user_res addAllocation:tex];
+                }
+            }
+        }
+        [user_res commit];
+    }
+    return AMI_OK;
+}
+
+ami_status ami_compute_remove_vision_frames_resident(ami_compute *compute,
+                                                   ami_vision_frame *const *frames,
+                                                   size_t count) {
+    if (compute == NULL || (count > 0 && frames == NULL)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (count == 0) {
+        return AMI_OK;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (frames[i] == NULL || frames[i]->plane_count == 0) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    @autoreleasepool {
+        id<MTLResidencySet> user_res =
+            (__bridge id<MTLResidencySet>)compute->mtl_user_residency_set;
+        for (size_t i = 0; i < count; i++) {
+            for (uint32_t p = 0; p < frames[i]->plane_count; p++) {
+                id<MTLTexture> tex = vision_plane_texture_of(frames[i], p);
+                if (tex != nil) {
+                    [user_res removeAllocation:tex];
+                }
+            }
+        }
+        [user_res commit];
+    }
+    return AMI_OK;
+}
+
+ami_status ami_compute_encode_dispatch_vision(ami_compute *compute,
+                                              const ami_pipeline *pipeline,
+                                              const ami_buffer_binding *bindings,
+                                              size_t binding_count,
+                                              const ami_vision_texture_binding *vision_textures,
+                                              size_t vision_texture_count,
+                                              const void *uniform_bytes, size_t uniform_len,
+                                              uint64_t grid_x, uint64_t grid_y, uint64_t grid_z,
+                                              uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
+                                              uint32_t dispatch_mode,
+                                              uint32_t insert_barrier_before) {
+    if (compute == NULL || compute->active_slot < 0 || compute->active_encoder == NULL ||
+        pipeline == NULL || grid_x == 0 || grid_y == 0 || grid_z == 0 ||
+        tg_x == 0 || tg_y == 0 || tg_z == 0 ||
+        (binding_count > 0 && bindings == NULL) ||
+        (vision_texture_count > 0 && vision_textures == NULL) ||
+        vision_texture_count > AMI_MAX_TEXTURE_BINDINGS ||
+        (uniform_len > 0 && uniform_bytes == NULL) ||
+        uniform_len > AMI_UNIFORM_STRIDE ||
+        (dispatch_mode != AMI_DISPATCH_THREADS && dispatch_mode != AMI_DISPATCH_THREADGROUPS)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    size_t total_bindings = binding_count + (uniform_len > 0 ? 1u : 0u);
+    if (total_bindings > AMI_MAX_BUFFER_BINDINGS) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    for (size_t i = 0; i < binding_count; i++) {
+        if (bindings[i].buffer == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    for (size_t i = 0; i < vision_texture_count; i++) {
+        if (vision_textures[i].frame == NULL ||
+            vision_textures[i].plane >= vision_textures[i].frame->plane_count ||
+            vision_textures[i].frame->mtl_textures[vision_textures[i].plane] == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+
+    ami_frame_slot *slot = &compute->slots[compute->active_slot];
+    if (uniform_len > 0 && compute->uniform_cursor >= AMI_UNIFORM_SLOTS_PER_FRAME) {
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    @autoreleasepool {
+        id<MTL4ComputeCommandEncoder> encoder =
+            (__bridge id<MTL4ComputeCommandEncoder>)compute->active_encoder;
+        id<MTL4ArgumentTable> arg_table = (__bridge id<MTL4ArgumentTable>)slot->mtl_arg_table;
+        id<MTLComputePipelineState> state = pipeline_of(pipeline);
+
+        if (insert_barrier_before != 0) {
+            [encoder barrierAfterEncoderStages:MTLStageDispatch
+                           beforeEncoderStages:MTLStageDispatch
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+        }
+
+        for (size_t i = 0; i < binding_count; i++) {
+            MTLGPUAddress addr = buffer_of(bindings[i].buffer).gpuAddress + bindings[i].offset;
+            [arg_table setAddress:addr atIndex:(NSUInteger)i];
+        }
+
+        if (uniform_len > 0) {
+            size_t u_off = (size_t)compute->uniform_cursor * AMI_UNIFORM_STRIDE;
+            memcpy(slot->uniform_base + u_off, uniform_bytes, uniform_len);
+            [arg_table setAddress:(slot->uniform_gpu + u_off)
+                          atIndex:(NSUInteger)binding_count];
+            compute->uniform_cursor++;
+        }
+
+        for (size_t i = 0; i < vision_texture_count; i++) {
+            id<MTLTexture> tex = vision_plane_texture_of(vision_textures[i].frame,
+                                                         vision_textures[i].plane);
+            [arg_table setTexture:tex.gpuResourceID atIndex:(NSUInteger)i];
+        }
+
+        [encoder setComputePipelineState:state];
+        [encoder setArgumentTable:arg_table];
+
+        MTLSize grid = MTLSizeMake((NSUInteger)grid_x, (NSUInteger)grid_y, (NSUInteger)grid_z);
+        MTLSize tg = MTLSizeMake((NSUInteger)tg_x, (NSUInteger)tg_y, (NSUInteger)tg_z);
+        if (dispatch_mode == AMI_DISPATCH_THREADS) {
+            [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
+        } else {
+            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        }
+    }
+    return AMI_OK;
+}
+
+ami_status ami_image_load_iosurface(ami_device *device, const char *path,
+                                    ami_vision_frame **out_frame) {
+    if (out_frame == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_frame = NULL;
+    if (device == NULL || path == NULL || path[0] == '\0') {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        NSString *ns_path = [NSString stringWithUTF8String:path];
+        if (ns_path == nil) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+        NSURL *url = [NSURL fileURLWithPath:ns_path];
+        CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+        if (src == NULL) {
+            return AMI_ERR_VISION;
+        }
+        CGImageRef cg_img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+        CFRelease(src);
+        if (cg_img == NULL) {
+            return AMI_ERR_VISION;
+        }
+
+        const size_t width = CGImageGetWidth(cg_img);
+        const size_t height = CGImageGetHeight(cg_img);
+        if (width == 0 || height == 0 || width > AMI_MAX_TEXTURE_DIM || height > AMI_MAX_TEXTURE_DIM) {
+            CGImageRelease(cg_img);
+            return AMI_ERR_VISION;
+        }
+
+        ami_vision_frame *frame = NULL;
+        ami_status st = ami_vision_frame_create(device, AMI_VISION_FMT_BGRA8,
+                                                (uint32_t)width, (uint32_t)height, &frame);
+        if (st != AMI_OK) {
+            CGImageRelease(cg_img);
+            return st;
+        }
+
+        void *base = NULL;
+        size_t bpr = 0;
+        uint32_t locked_h = 0;
+        st = ami_vision_frame_lock_plane(frame, 0, 0, &base, &bpr, &locked_h);
+        if (st != AMI_OK) {
+            ami_vision_frame_destroy(frame);
+            CGImageRelease(cg_img);
+            return st;
+        }
+
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        if (cs == NULL) {
+            ami_vision_frame_unlock(frame, 0);
+            ami_vision_frame_destroy(frame);
+            CGImageRelease(cg_img);
+            return AMI_ERR_VISION;
+        }
+        // Little-endian 32-bit PremultipliedFirst yields [B, G, R, A] bytes matching BGRA8Unorm.
+        const CGBitmapInfo bmp_info =
+            (CGBitmapInfo)kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
+        CGContextRef ctx = CGBitmapContextCreate(base, width, height, 8, bpr, cs, bmp_info);
+        CGColorSpaceRelease(cs);
+        if (ctx == NULL) {
+            ami_vision_frame_unlock(frame, 0);
+            ami_vision_frame_destroy(frame);
+            CGImageRelease(cg_img);
+            return AMI_ERR_VISION;
+        }
+        CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+        CGContextDrawImage(ctx, CGRectMake(0.0, 0.0, (CGFloat)width, (CGFloat)height), cg_img);
+        CGContextRelease(ctx);
+        CGImageRelease(cg_img);
+
+        st = ami_vision_frame_unlock(frame, 0);
+        if (st != AMI_OK) {
+            ami_vision_frame_destroy(frame);
+            return st;
+        }
+        *out_frame = frame;
+    }
+    return AMI_OK;
+}
+
+ami_status ami_image_write_png(ami_vision_frame *frame, const char *path) {
+    if (frame == NULL || frame->format != AMI_VISION_FMT_BGRA8 ||
+        path == NULL || path[0] == '\0') {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    @autoreleasepool {
+        NSString *ns_path = [NSString stringWithUTF8String:path];
+        if (ns_path == nil) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+        NSURL *url = [NSURL fileURLWithPath:ns_path];
+
+        void *base = NULL;
+        size_t bpr = 0;
+        uint32_t locked_h = 0;
+        ami_status st = ami_vision_frame_lock_plane(frame, 0, 1u, &base, &bpr, &locked_h);
+        if (st != AMI_OK) {
+            return st;
+        }
+
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        if (cs == NULL) {
+            ami_vision_frame_unlock(frame, 1u);
+            return AMI_ERR_VISION;
+        }
+        const CGBitmapInfo bmp_info =
+            (CGBitmapInfo)kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst;
+        CGContextRef ctx = CGBitmapContextCreate(base, frame->width, frame->height, 8, bpr, cs, bmp_info);
+        CGColorSpaceRelease(cs);
+        if (ctx == NULL) {
+            ami_vision_frame_unlock(frame, 1u);
+            return AMI_ERR_VISION;
+        }
+        CGImageRef cg_img = CGBitmapContextCreateImage(ctx);
+        CGContextRelease(ctx);
+        ami_vision_frame_unlock(frame, 1u);
+        if (cg_img == NULL) {
+            return AMI_ERR_VISION;
+        }
+
+        CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
+            (__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
+        if (dst == NULL) {
+            CGImageRelease(cg_img);
+            return AMI_ERR_VISION;
+        }
+        CGImageDestinationAddImage(dst, cg_img, NULL);
+        bool ok = CGImageDestinationFinalize(dst);
+        CFRelease(dst);
+        CGImageRelease(cg_img);
+        return ok ? AMI_OK : AMI_ERR_VISION;
+    }
+}
+
+typedef struct ami_vt_encode_collector {
+    CMSampleBufferRef *samples;
+    uint32_t capacity;
+    uint32_t count;
+    OSStatus first_error;
+} ami_vt_encode_collector;
+
+static void vt_compress_output_callback(void *outputCallbackRefCon,
+                                        void *sourceFrameRefCon,
+                                        OSStatus status,
+                                        VTEncodeInfoFlags infoFlags,
+                                        CMSampleBufferRef sampleBuffer) {
+    (void)sourceFrameRefCon;
+    (void)infoFlags;
+    ami_vt_encode_collector *col = (ami_vt_encode_collector *)outputCallbackRefCon;
+    if (col == NULL) {
+        return;
+    }
+    if (status != noErr) {
+        if (col->first_error == noErr) {
+            col->first_error = status;
+        }
+        return;
+    }
+    if (sampleBuffer == NULL) {
+        return;
+    }
+    if (col->count >= col->capacity) {
+        uint32_t new_cap = (col->capacity == 0) ? 8u : col->capacity * 2u;
+        CMSampleBufferRef *grown =
+            realloc(col->samples, (size_t)new_cap * sizeof(CMSampleBufferRef));
+        if (grown == NULL) {
+            if (col->first_error == noErr) {
+                col->first_error = kVTAllocationFailedErr;
+            }
+            return;
+        }
+        col->samples = grown;
+        col->capacity = new_cap;
+    }
+    CFRetain(sampleBuffer);
+    col->samples[col->count++] = sampleBuffer;
+}
+
+static ami_status vt_encode_pixel_buffers(uint32_t codec,
+                                          CVPixelBufferRef const *pbs,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t frame_count, uint32_t fps,
+                                          ami_vt_clip **out_clip) {
+    if (out_clip == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_clip = NULL;
+    if ((codec != AMI_VT_CODEC_H264 && codec != AMI_VT_CODEC_HEVC) ||
+        pbs == NULL || frame_count == 0 || fps == 0 || fps > 240u ||
+        width < 16u || height < 16u || (width & 1u) != 0 || (height & 1u) != 0 ||
+        width > AMI_MAX_TEXTURE_DIM || height > AMI_MAX_TEXTURE_DIM) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    const CMVideoCodecType cm_codec =
+        (codec == AMI_VT_CODEC_HEVC) ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
+
+    ami_vt_encode_collector col = { 0 };
+    col.samples = calloc(frame_count, sizeof(CMSampleBufferRef));
+    if (col.samples == NULL) {
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+    col.capacity = frame_count;
+
+    uint32_t using_hw = 0;
+
+    @autoreleasepool {
+        NSDictionary *enc_spec = @{
+            (__bridge id)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        };
+        VTCompressionSessionRef session = NULL;
+        OSStatus os_st = VTCompressionSessionCreate(
+            kCFAllocatorDefault,
+            (int32_t)width,
+            (int32_t)height,
+            cm_codec,
+            (__bridge CFDictionaryRef)enc_spec,
+            NULL,
+            kCFAllocatorDefault,
+            vt_compress_output_callback,
+            &col,
+            &session);
+        if (os_st != noErr || session == NULL) {
+            free(col.samples);
+            return AMI_ERR_VISION;
+        }
+
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+        NSNumber *fps_num = @(fps);
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate,
+                             (__bridge CFTypeRef)fps_num);
+        NSNumber *bitrate_num = @(4000000);
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate,
+                             (__bridge CFTypeRef)bitrate_num);
+
+        os_st = VTCompressionSessionPrepareToEncodeFrames(session);
+        if (os_st != noErr) {
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            free(col.samples);
+            return AMI_ERR_VISION;
+        }
+
+        CFBooleanRef hw_val = NULL;
+        if (VTSessionCopyProperty(session,
+                                  kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                  kCFAllocatorDefault, &hw_val) == noErr &&
+            hw_val != NULL) {
+            using_hw = CFBooleanGetValue(hw_val) ? 1u : 0u;
+            CFRelease(hw_val);
+        }
+
+        for (uint32_t i = 0; i < frame_count; i++) {
+            CMTime pts = CMTimeMake((int64_t)i, (int32_t)fps);
+            CMTime dur = CMTimeMake(1, (int32_t)fps);
+            os_st = VTCompressionSessionEncodeFrame(session, pbs[i], pts, dur, NULL, NULL, NULL);
+            if (os_st != noErr) {
+                break;
+            }
+        }
+        if (os_st == noErr) {
+            os_st = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+        }
+        VTCompressionSessionInvalidate(session);
+        CFRelease(session);
+
+        if (os_st != noErr || col.first_error != noErr || col.count != frame_count) {
+            for (uint32_t i = 0; i < col.count; i++) {
+                CFRelease(col.samples[i]);
+            }
+            free(col.samples);
+            return AMI_ERR_VISION;
+        }
+    }
+
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(col.samples[0]);
+    if (fmt == NULL) {
+        for (uint32_t i = 0; i < col.count; i++) {
+            CFRelease(col.samples[i]);
+        }
+        free(col.samples);
+        return AMI_ERR_VISION;
+    }
+
+    uint64_t total_bytes = 0;
+    for (uint32_t i = 0; i < col.count; i++) {
+        CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(col.samples[i]);
+        if (bb != NULL) {
+            total_bytes += (uint64_t)CMBlockBufferGetDataLength(bb);
+        }
+    }
+    if (total_bytes == 0) {
+        for (uint32_t i = 0; i < col.count; i++) {
+            CFRelease(col.samples[i]);
+        }
+        free(col.samples);
+        return AMI_ERR_VISION;
+    }
+
+    ami_vt_clip *clip = calloc(1, sizeof *clip);
+    if (clip == NULL) {
+        for (uint32_t i = 0; i < col.count; i++) {
+            CFRelease(col.samples[i]);
+        }
+        free(col.samples);
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+    CFRetain(fmt);
+    clip->format_desc = fmt;
+    clip->samples = col.samples;
+    clip->codec = codec;
+    clip->width = width;
+    clip->height = height;
+    clip->frame_count = col.count;
+    clip->fps = fps;
+    clip->using_hardware_encoder = using_hw;
+    clip->total_compressed_bytes = total_bytes;
+    *out_clip = clip;
+    return AMI_OK;
+}
+
+ami_status ami_vt_encode_test_clip(uint32_t codec, uint32_t width, uint32_t height,
+                                   uint32_t frame_count, uint32_t fps,
+                                   ami_vt_clip **out_clip) {
+    if (out_clip == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_clip = NULL;
+    if ((codec != AMI_VT_CODEC_H264 && codec != AMI_VT_CODEC_HEVC) ||
+        frame_count == 0 || frame_count > 128u || fps == 0 || fps > 240u ||
+        width < 16u || height < 16u || (width & 1u) != 0 || (height & 1u) != 0 ||
+        width > AMI_MAX_TEXTURE_DIM || height > AMI_MAX_TEXTURE_DIM) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    CVPixelBufferRef *pbs = calloc(frame_count, sizeof(CVPixelBufferRef));
+    if (pbs == NULL) {
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    ami_status st = AMI_OK;
+    for (uint32_t f = 0; f < frame_count; f++) {
+        uint64_t alloc_bytes = 0;
+        st = create_iosurface_pixel_buffer(AMI_VISION_FMT_NV12, width, height,
+                                           &pbs[f], &alloc_bytes);
+        if (st != AMI_OK) {
+            break;
+        }
+        if (CVPixelBufferLockBaseAddress(pbs[f], 0) != kCVReturnSuccess) {
+            st = AMI_ERR_VISION;
+            break;
+        }
+        uint8_t *y_plane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pbs[f], 0);
+        size_t y_bpr = CVPixelBufferGetBytesPerRowOfPlane(pbs[f], 0);
+        uint8_t *uv_plane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pbs[f], 1);
+        size_t uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(pbs[f], 1);
+        if (y_plane == NULL || uv_plane == NULL) {
+            CVPixelBufferUnlockBaseAddress(pbs[f], 0);
+            st = AMI_ERR_VISION;
+            break;
+        }
+
+        // Deterministic spatiotemporal pattern (moving blocks + smooth gradients).
+        for (uint32_t y = 0; y < height; y++) {
+            uint8_t *row = y_plane + (size_t)y * y_bpr;
+            for (uint32_t x = 0; x < width; x++) {
+                uint32_t block = (((x + f * 8u) / 16u) ^ ((y + f * 4u) / 16u)) & 1u;
+                uint32_t grad = ((x * 160u) / width) + ((y * 64u) / height);
+                uint32_t luma = 24u + (grad + block * 28u + f * 11u) % 208u;
+                row[x] = (uint8_t)luma;
+            }
+        }
+        const uint32_t cw = width / 2u;
+        const uint32_t ch = height / 2u;
+        for (uint32_t y = 0; y < ch; y++) {
+            uint8_t *row = uv_plane + (size_t)y * uv_bpr;
+            for (uint32_t x = 0; x < cw; x++) {
+                uint8_t cb = (uint8_t)(64u + ((x * 128u) / cw + f * 13u) % 128u);
+                uint8_t cr = (uint8_t)(64u + ((y * 128u) / ch + f * 17u) % 128u);
+                row[x * 2u + 0u] = cb;
+                row[x * 2u + 1u] = cr;
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pbs[f], 0);
+    }
+
+    if (st == AMI_OK) {
+        st = vt_encode_pixel_buffers(codec, pbs, width, height, frame_count, fps, out_clip);
+    }
+
+    for (uint32_t f = 0; f < frame_count; f++) {
+        if (pbs[f] != NULL) {
+            CVPixelBufferRelease(pbs[f]);
+        }
+    }
+    free(pbs);
+    return st;
+}
+
+ami_status ami_vt_encode_frames(uint32_t codec, ami_vision_frame *const *frames,
+                                uint32_t frame_count, uint32_t fps,
+                                ami_vt_clip **out_clip) {
+    if (out_clip == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_clip = NULL;
+    if (frames == NULL || frame_count == 0 || frame_count > 128u) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (frames[0] == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    const uint32_t width = frames[0]->width;
+    const uint32_t height = frames[0]->height;
+    for (uint32_t i = 0; i < frame_count; i++) {
+        if (frames[i] == NULL || frames[i]->pixel_buffer == NULL ||
+            frames[i]->width != width || frames[i]->height != height ||
+            (frames[i]->format != AMI_VISION_FMT_BGRA8 &&
+             frames[i]->format != AMI_VISION_FMT_NV12)) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+
+    CVPixelBufferRef *pbs = calloc(frame_count, sizeof(CVPixelBufferRef));
+    if (pbs == NULL) {
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+    for (uint32_t i = 0; i < frame_count; i++) {
+        pbs[i] = frames[i]->pixel_buffer;
+    }
+    ami_status st = vt_encode_pixel_buffers(codec, pbs, width, height, frame_count, fps, out_clip);
+    free(pbs);
+    return st;
+}
+
+void ami_vt_clip_destroy(ami_vt_clip *clip) {
+    if (clip == NULL) {
+        return;
+    }
+    if (clip->samples != NULL) {
+        for (uint32_t i = 0; i < clip->frame_count; i++) {
+            if (clip->samples[i] != NULL) {
+                CFRelease(clip->samples[i]);
+            }
+        }
+        free(clip->samples);
+    }
+    if (clip->format_desc != NULL) {
+        CFRelease(clip->format_desc);
+    }
+    free(clip);
+}
+
+ami_status ami_vt_clip_query(const ami_vt_clip *clip, ami_vt_clip_info *out_info) {
+    if (clip == NULL || out_info == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_info, 0, sizeof *out_info);
+    out_info->codec = clip->codec;
+    out_info->width = clip->width;
+    out_info->height = clip->height;
+    out_info->frame_count = clip->frame_count;
+    out_info->fps = clip->fps;
+    out_info->using_hardware_encoder = clip->using_hardware_encoder;
+    out_info->total_compressed_bytes = clip->total_compressed_bytes;
+    return AMI_OK;
+}
+
+typedef struct ami_vt_decode_output {
+    CVPixelBufferRef pixel_buffer;
+    CMTime pts;
+    OSStatus status;
+    bool received;
+} ami_vt_decode_output;
+
+static void vt_decompress_output_callback(void *decompressionOutputRefCon,
+                                          void *sourceFrameRefCon,
+                                          OSStatus status,
+                                          VTDecodeInfoFlags infoFlags,
+                                          CVImageBufferRef imageBuffer,
+                                          CMTime presentationTimeStamp,
+                                          CMTime presentationDuration) {
+    (void)decompressionOutputRefCon;
+    (void)infoFlags;
+    (void)presentationDuration;
+    ami_vt_decode_output *out = (ami_vt_decode_output *)sourceFrameRefCon;
+    if (out == NULL) {
+        return;
+    }
+    out->status = status;
+    out->pts = presentationTimeStamp;
+    out->received = true;
+    if (status == noErr && imageBuffer != NULL) {
+        if (out->pixel_buffer != NULL) {
+            CVPixelBufferRelease(out->pixel_buffer);
+        }
+        CVPixelBufferRetain(imageBuffer);
+        out->pixel_buffer = imageBuffer;
+    }
+}
+
+ami_status ami_vt_decode_session_create(ami_device *device, const ami_vt_clip *clip,
+                                        uint32_t output_format,
+                                        ami_vt_decode_session **out_session) {
+    if (out_session == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_session = NULL;
+    if (device == NULL || clip == NULL || clip->format_desc == NULL ||
+        (output_format != AMI_VISION_FMT_NV12 && output_format != AMI_VISION_FMT_BGRA8)) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    const OSType cv_pix_fmt =
+        (output_format == AMI_VISION_FMT_BGRA8)
+            ? kCVPixelFormatType_32BGRA
+            : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+
+    @autoreleasepool {
+        NSDictionary *dec_spec = @{
+            (__bridge id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @YES,
+        };
+        NSDictionary *dst_attrs = @{
+            (__bridge id)kCVPixelBufferPixelFormatTypeKey: @(cv_pix_fmt),
+            (__bridge id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            (__bridge id)kCVPixelBufferMetalCompatibilityKey: @YES,
+            (__bridge id)kCVPixelBufferBytesPerRowAlignmentKey: @64,
+        };
+        VTDecompressionOutputCallbackRecord cb = {
+            .decompressionOutputCallback = vt_decompress_output_callback,
+            .decompressionOutputRefCon = NULL,
+        };
+
+        VTDecompressionSessionRef vt_session = NULL;
+        OSStatus os_st = VTDecompressionSessionCreate(
+            kCFAllocatorDefault,
+            clip->format_desc,
+            (__bridge CFDictionaryRef)dec_spec,
+            (__bridge CFDictionaryRef)dst_attrs,
+            &cb,
+            &vt_session);
+        if (os_st != noErr || vt_session == NULL) {
+            return AMI_ERR_VISION;
+        }
+
+        uint32_t using_hw = 0;
+        CFBooleanRef hw_val = NULL;
+        if (VTSessionCopyProperty(vt_session,
+                                  kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                                  kCFAllocatorDefault, &hw_val) == noErr &&
+            hw_val != NULL) {
+            using_hw = CFBooleanGetValue(hw_val) ? 1u : 0u;
+            CFRelease(hw_val);
+        }
+
+        ami_vt_decode_session *session = calloc(1, sizeof *session);
+        if (session == NULL) {
+            VTDecompressionSessionInvalidate(vt_session);
+            CFRelease(vt_session);
+            return AMI_ERR_OUT_OF_MEMORY;
+        }
+        id<MTLDevice> mtl_dev = device_of(device);
+        session->mtl_device = (__bridge_retained void *)mtl_dev;
+        session->vt_session = vt_session;
+        session->codec = clip->codec;
+        session->output_format = output_format;
+        session->width = clip->width;
+        session->height = clip->height;
+        session->using_hardware_decoder = using_hw;
+        *out_session = session;
+    }
+    return AMI_OK;
+}
+
+void ami_vt_decode_session_destroy(ami_vt_decode_session *session) {
+    if (session == NULL) {
+        return;
+    }
+    if (session->vt_session != NULL) {
+        VTDecompressionSessionWaitForAsynchronousFrames(session->vt_session);
+        VTDecompressionSessionInvalidate(session->vt_session);
+        CFRelease(session->vt_session);
+        session->vt_session = NULL;
+    }
+    if (session->mtl_device != NULL) {
+        CFRelease(session->mtl_device);
+        session->mtl_device = NULL;
+    }
+    free(session);
+}
+
+ami_status ami_vt_decode_session_query(const ami_vt_decode_session *session,
+                                       ami_vt_decode_session_info *out_info) {
+    if (session == NULL || out_info == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_info, 0, sizeof *out_info);
+    out_info->codec = session->codec;
+    out_info->output_format = session->output_format;
+    out_info->width = session->width;
+    out_info->height = session->height;
+    out_info->using_hardware_decoder = session->using_hardware_decoder;
+    return AMI_OK;
+}
+
+ami_status ami_vt_decode_clip_frame(ami_vt_decode_session *session,
+                                    const ami_vt_clip *clip, uint32_t frame_index,
+                                    ami_vision_frame **out_frame) {
+    if (out_frame == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_frame = NULL;
+    if (session == NULL || session->vt_session == NULL || clip == NULL ||
+        frame_index >= clip->frame_count || clip->samples[frame_index] == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+
+    ami_vt_decode_output out = { 0 };
+    out.pts = kCMTimeZero;
+
+    OSStatus os_st = VTDecompressionSessionDecodeFrame(
+        session->vt_session,
+        clip->samples[frame_index],
+        0,
+        &out,
+        NULL);
+    if (os_st != noErr) {
+        if (out.pixel_buffer != NULL) {
+            CVPixelBufferRelease(out.pixel_buffer);
+        }
+        return AMI_ERR_VISION;
+    }
+
+    os_st = VTDecompressionSessionWaitForAsynchronousFrames(session->vt_session);
+    if (os_st != noErr || !out.received || out.status != noErr || out.pixel_buffer == NULL) {
+        if (out.pixel_buffer != NULL) {
+            CVPixelBufferRelease(out.pixel_buffer);
+        }
+        return AMI_ERR_VISION;
+    }
+
+    id<MTLDevice> mtl_dev = (__bridge id<MTLDevice>)session->mtl_device;
+    ami_status st = vision_frame_init_from_mtl_device(
+        mtl_dev,
+        out.pixel_buffer,
+        0u,
+        1u,
+        out.pts.value,
+        out.pts.timescale,
+        out_frame);
+    CVPixelBufferRelease(out.pixel_buffer);
+    return st;
 }
