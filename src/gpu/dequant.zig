@@ -671,11 +671,14 @@ pub const DequantPipelines = struct {
         );
     }
 
-    /// Runs the `< 0.1 ms` startup `.metallib` GPU numerical canary (`G16`,
-    /// ADR-0020) over a temporary `16 KiB` wired page in one single Metal 4
-    /// command buffer, verifying `f16`, `bf16` (including exponent paths
-    /// exceeding the `f16` dynamic range), and `q4_affine` across both `32x32`
-    /// and `64x64` wide GEMM kernels.
+    /// Runs the startup `.metallib` GPU numerical canary (`G16`, ADR-0020) over
+    /// a temporary `16 KiB` wired page in one Metal 4 command buffer, verifying
+    /// `f16`, `bf16` (including exponent paths exceeding `f16` dynamic range),
+    /// and `q4_affine` across both `32x32` and `64x64` wide GEMM kernels.
+    /// Note: a fresh `MTL4CommandQueue` / `MTLResidencySet` first submit takes
+    /// ~1–4 ms cold wall time on Apple Silicon (including initial driver/AGX
+    /// wake); see `runStartupNumericalCanaryProfile` for both cold first-submit
+    /// and warm in-buffer GPU check latency.
     pub fn runStartupNumericalCanary(
         self: *const DequantPipelines,
         dev: *metal.Device,
@@ -691,6 +694,37 @@ pub const DequantPipelines = struct {
         try compute.makeResident(&.{gpu_buf});
 
         return self.runStartupNumericalCanaryInBuffer(&compute, gpu_buf, scratch.bytes);
+    }
+
+    pub const CanaryProfile = struct {
+        cold: CanaryResult,
+        warm_elapsed_us: f64,
+    };
+
+    /// Runs the startup `.metallib` numerical canary twice over the same
+    /// resident `16 KiB` wired buffer and `metal.Compute` queue, returning both
+    /// the cold first-submit result (including initial Metal 4 queue/residency
+    /// wake) and the warm in-buffer GPU check latency.
+    pub fn runStartupNumericalCanaryProfile(
+        self: *const DequantPipelines,
+        dev: *metal.Device,
+    ) CanaryError!CanaryProfile {
+        const scratch = try page.WiredRegion.init(page.APPLE_PAGE_SIZE);
+        defer scratch.deinit();
+
+        const gpu_buf = try metal.Buffer.wrap(dev.*, scratch.bytes);
+        defer gpu_buf.close();
+
+        var compute = try metal.Compute.initWithFrames(dev.*, 1);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+
+        const cold = try self.runStartupNumericalCanaryInBuffer(&compute, gpu_buf, scratch.bytes);
+        const warm = try self.runStartupNumericalCanaryInBuffer(&compute, gpu_buf, scratch.bytes);
+        return .{
+            .cold = cold,
+            .warm_elapsed_us = warm.elapsed_us,
+        };
     }
 
     /// Runs the startup numerical canary reusing an existing `metal.Compute`

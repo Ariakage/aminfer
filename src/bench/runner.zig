@@ -10549,7 +10549,8 @@ pub const M68Config = struct {
 pub const M68G16Report = struct {
     supports_apple10: bool,
     prefill_matmul_backend: []const u8,
-    canary_elapsed_us: f64,
+    canary_cold_elapsed_us: f64,
+    canary_warm_inbuf_elapsed_us: f64,
     max_abs_err_f16: f32,
     max_abs_err_bf16: f32,
     max_abs_err_q4: f32,
@@ -10593,6 +10594,8 @@ pub const M68Eagle3WideReport = struct {
     spec_tok_per_s: f64 = 0.0,
     mean_accept: f64 = 0.0,
     aliased_saved_bytes: usize = 0,
+    cold_experts_per_layer: u32 = 0,
+    wired_bytes: u64 = 0,
     greedy_match_vs_tree64: bool = false,
     steady_malloc_blocks: i64 = 0,
 };
@@ -10659,7 +10662,8 @@ pub const M68Report = struct {
             \\=== M6.8 G16 Startup .metallib Numerical Canary & Apple10 (NAX) Probe ===
             \\g16.supports_apple10             {s}
             \\g16.prefill_matmul_backend       {s}
-            \\g16.canary_elapsed_us            {d:.1}
+            \\g16.canary_cold_elapsed_us       {d:.1}
+            \\g16.canary_warm_inbuf_elapsed_us {d:.1}
             \\g16.canary_max_abs_err           f16={d:.6} bf16={d:.6} q4={d:.6}
             \\g16.corrupted_slice_rejected     {s}
             \\
@@ -10669,7 +10673,8 @@ pub const M68Report = struct {
         , .{
             if (self.g16.supports_apple10) "yes" else "no",
             self.g16.prefill_matmul_backend,
-            self.g16.canary_elapsed_us,
+            self.g16.canary_cold_elapsed_us,
+            self.g16.canary_warm_inbuf_elapsed_us,
             self.g16.max_abs_err_f16,
             self.g16.max_abs_err_bf16,
             self.g16.max_abs_err_q4,
@@ -10699,7 +10704,7 @@ pub const M68Report = struct {
 
         if (self.eagle3.present) {
             try out.print(
-                \\g15.eagle3_wide_spec             prompt={d} wide_prefill_ms={d:.2} spec_tokens={d} spec_tok_s={d:.2} mean_accept={d:.2} alias_mib={d:.2} greedy_match={s} malloc_blk={d}
+                \\g15.eagle3_wide_spec             prompt={d} wide_prefill_ms={d:.2} spec_tokens={d} spec_tok_s={d:.2} mean_accept={d:.2} alias_mib={d:.2} cold_exp={d} wired_mib={d} greedy_match={s} malloc_blk={d}
                 \\
             , .{
                 self.eagle3.prompt_tokens,
@@ -10708,6 +10713,8 @@ pub const M68Report = struct {
                 self.eagle3.spec_tok_per_s,
                 self.eagle3.mean_accept,
                 @as(f64, @floatFromInt(self.eagle3.aliased_saved_bytes)) / (1024.0 * 1024.0),
+                self.eagle3.cold_experts_per_layer,
+                self.eagle3.wired_bytes >> 20,
                 if (self.eagle3.greedy_match_vs_tree64) "yes" else "no",
                 self.eagle3.steady_malloc_blocks,
             });
@@ -10836,7 +10843,8 @@ fn runM68G16Bench() !M68G16Report {
     const dq_pipes = try dequant.DequantPipelines.init(device, lib);
     defer dq_pipes.close();
 
-    const canary = try dq_pipes.runStartupNumericalCanary(&device);
+    const prof = try dq_pipes.runStartupNumericalCanaryProfile(&device);
+    const canary = prof.cold;
 
     // Negative test: verify `verifyCanarySlices` rejects a corrupted `.metallib` output.
     const ok_h = [_]f16{ @as(f16, 1.0), @as(f16, -2.0) };
@@ -10852,7 +10860,8 @@ fn runM68G16Bench() !M68G16Report {
     return .{
         .supports_apple10 = info.supportsApple10(),
         .prefill_matmul_backend = backend_label,
-        .canary_elapsed_us = canary.elapsed_us,
+        .canary_cold_elapsed_us = canary.elapsed_us,
+        .canary_warm_inbuf_elapsed_us = prof.warm_elapsed_us,
         .max_abs_err_f16 = canary.max_abs_err_f16,
         .max_abs_err_bf16 = canary.max_abs_err_bf16,
         .max_abs_err_q4 = canary.max_abs_err_q4,
@@ -10872,13 +10881,7 @@ fn benchQwen3PrefillPair(
     out_rows: *[2]M68PrefillRow,
     infer_swap_acc: *u64,
     infer_page_acc: *u64,
-    eagle3_opts: ?struct {
-        eagle_amf: [:0]const u8,
-        eagle_cfg: draft_mod.DraftConfig,
-        tok_path: [:0]const u8,
-        gen_tokens: u32,
-        out_report: *M68Eagle3WideReport,
-    },
+    heat_path_opt: ?[:0]const u8,
 ) !usize {
     const max_p: u32 = if (tok_long) |tl| @max(tok_short, tl) else tok_short;
     // Keep `512`-token single-chunk checkpoints at exact `512` (`1` KV tile/layer) to minimize wired footprint.
@@ -10904,14 +10907,32 @@ fn benchQwen3PrefillPair(
     var saved_tree_logits: [2][]f16 = .{ &.{}, &.{} };
     defer for (saved_tree_logits) |s| if (s.len > 0) allocator.free(s);
 
+    // R9 zero-swap guard for 10 GiB MoE checkpoints when live host RAM is tight (< 10.6 GiB).
+    var cold_n: u32 = 0;
+    var heat_bytes: ?[]u8 = null;
+    defer if (heat_bytes) |hb| allocator.free(hb);
+    if (heat_path_opt) |hp| {
+        if (cfg.arch == .qwen3_moe and posixFileExists(hp)) {
+            const cur_live_mib: u64 = (try vmstat.Snapshot.capture()).liveZeroSwapReclaimableBytes() >> 20;
+            const safe_hot_mib: u64 = 10_600;
+            if (cur_live_mib < safe_hot_mib) {
+                const deficit_mib: u64 = safe_hot_mib - cur_live_mib;
+                cold_n = @intCast(@min(@as(u64, 64), @max(@as(u64, 16), (deficit_mib + 71) / 72)));
+                heat_bytes = try readPosixFileAlloc(allocator, hp, 16 * 1024 * 1024);
+            }
+        }
+    }
+
     // Load model ONCE (`wide` + `max_tree_nodes = 64` + `P0-B2` aliased scratch + `G16` canary)
     // to avoid multi-10-GiB `mlock`/`munlock` churn and ensure identical weight residency across A/B modes.
     var m = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
         .max_seq_len = max_seq,
         .chunk_tokens = 512,
         .max_tree_nodes = 64,
-        .enable_feature_taps = (eagle3_opts != null),
-        .aux_layer_ids = if (eagle3_opts) |eo| eo.eagle_cfg.aux_layer_ids else null,
+        .enable_feature_taps = false,
+        .cold_experts_per_layer = cold_n,
+        .heat_profile_json = heat_bytes,
+        .cold_slot_count = if (cold_n > 0) @max(@as(u32, 64), cold_n + 8) else 64,
         .gpu_prefill_mode = .wide,
         .wide_prefill_chunk_tokens = 512,
         .enable_prompt_tail_pruning = true,
@@ -10974,24 +10995,6 @@ fn benchQwen3PrefillPair(
     try vmstat.checkNoSwap(inf_vm_before, inf_vm_after);
     infer_swap_acc.* += vmstat.Snapshot.swapoutDelta(inf_vm_before, inf_vm_after);
     infer_page_acc.* += vmstat.Snapshot.pageoutDelta(inf_vm_before, inf_vm_after);
-
-    // Optional `EAGLE-3` wide-prefill -> `verifyTree` speculative check reusing the SAME resident target model!
-    // Uses `prompt = max_seq - gen_tokens` (`496 + 16 = 512`) so the target stays on 1 KV chunk/layer.
-    if (eagle3_opts) |eo| {
-        const e3_prompt: u32 = if (max_seq > eo.gen_tokens + 16) (max_seq - eo.gen_tokens - 16) else (max_seq / 2);
-        eo.out_report.* = try benchRealEagle3OnLoadedTarget(
-            allocator,
-            &m,
-            cfg,
-            eo.eagle_amf,
-            eo.eagle_cfg,
-            eo.tok_path,
-            e3_prompt,
-            eo.gen_tokens,
-            infer_swap_acc,
-            infer_page_acc,
-        );
-    }
 
     for (0..n_cases) |ci| {
         const lbl = M68PrefillRow.initLabel(names[ci]);
@@ -11115,18 +11118,22 @@ fn benchQwen4ExpWidePrefill(
     };
 }
 
-fn benchRealEagle3OnLoadedTarget(
+fn benchRealEagle3WideSpec(
     allocator: std.mem.Allocator,
-    m: *qwen3.Qwen3Model,
+    target_amf: [:0]const u8,
     target_cfg: qwen3.ModelConfig,
     eagle_amf: [:0]const u8,
     eagle_cfg: draft_mod.DraftConfig,
     tok_path: [:0]const u8,
-    prompt_tokens: u32,
+    heat_path: [:0]const u8,
+    max_seq: u32,
     gen_tokens: u32,
+    initial_live_mib: u64,
     infer_swap_acc: *u64,
     infer_page_acc: *u64,
 ) !M68Eagle3WideReport {
+    const prompt_tokens: u32 = if (max_seq > gen_tokens + 16) (max_seq - gen_tokens - 16) else (max_seq / 2);
+
     const tok_bytes = try readPosixFileAlloc(allocator, tok_path, 64 * 1024 * 1024);
     defer allocator.free(tok_bytes);
     var tok = try tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
@@ -11144,7 +11151,46 @@ fn benchRealEagle3OnLoadedTarget(
         prompt[i] = if (base_ids.len > 0) base_ids[i % base_ids.len] else @intCast((i * 13 + 7) % target_cfg.vocab_size);
     }
 
-    const max_seq: u32 = m.max_seq_len;
+    // R9 live zero-swap RAM gate: size `cold_experts_per_layer` via `qwen3-30b-a3b-heat.json`
+    // against `min(initial_live_mib, current_live_mib)` with a full 3.0 GiB zero-swap headroom
+    // margin (ADR-0012) so `30B` + `EAGLE-3` stays comfortably below ~8.2 GiB on 24 GiB M4.
+    const live_snap = try vmstat.Snapshot.capture();
+    const cur_live_mib: u64 = live_snap.liveZeroSwapReclaimableBytes() >> 20;
+    const eff_live_mib: u64 = @min(initial_live_mib, cur_live_mib);
+    const full_hot_combined_mib: u64 = 11_300;
+    const zero_swap_margin_mib: u64 = 3_072;
+    const needed_mib: u64 = full_hot_combined_mib + zero_swap_margin_mib;
+    var cold_n: u32 = 0;
+    var heat_bytes: ?[]u8 = null;
+    defer if (heat_bytes) |hb| allocator.free(hb);
+    if (eff_live_mib < needed_mib and posixFileExists(heat_path)) {
+        const deficit_mib: u64 = needed_mib - eff_live_mib;
+        // ~72 MiB reclaimed per cold expert/layer across 48 layers on `qwen3-30b-a3b-gsq-rco`.
+        const est_cold: u64 = (deficit_mib + 71) / 72;
+        cold_n = @intCast(@min(@as(u64, 96), @max(@as(u64, 24), est_cold)));
+        heat_bytes = try readPosixFileAlloc(allocator, heat_path, 16 * 1024 * 1024);
+    }
+
+    var target = try qwen3.Qwen3Model.loadFromFile(allocator, target_amf, target_cfg, .{
+        .max_seq_len = max_seq,
+        .chunk_tokens = 512,
+        .max_tree_nodes = 16,
+        .enable_feature_taps = true,
+        .aux_layer_ids = eagle_cfg.aux_layer_ids,
+        .cold_experts_per_layer = cold_n,
+        .heat_profile_json = heat_bytes,
+        .cold_slot_count = if (cold_n > 0) @max(@as(u32, 64), cold_n + 16) else 64,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 512,
+        .enable_prompt_tail_pruning = true,
+        .alias_prefill_tree_scratch = true,
+        .verify_crcs = false,
+        .enable_ane_predictor = false,
+        .startup_canary = true,
+    });
+    defer target.deinit(allocator);
+    const m = &target;
+
     const ref_gen = try allocator.alloc(u32, gen_tokens);
     defer allocator.free(ref_gen);
     const spec_gen = try allocator.alloc(u32, gen_tokens);
@@ -11227,6 +11273,8 @@ fn benchRealEagle3OnLoadedTarget(
         else
             0.0,
         .aliased_saved_bytes = m.aliased_scratch_saved_bytes,
+        .cold_experts_per_layer = cold_n,
+        .wired_bytes = eng.totalWiredBytes(),
         .greedy_match_vs_tree64 = std.mem.eql(u32, ref_gen[0..count], spec_gen[0..count]),
         .steady_malloc_blocks = vmstat.heapDelta(heap_b, heap_a).blocks_in_use,
     };
@@ -11306,7 +11354,7 @@ fn runM68QosPass(
         }
     };
 
-    const samples = try allocator.alloc(f64, @as(usize, decode_steps) * 4);
+    const samples = try allocator.alloc(f64, @as(usize, decode_steps) * 24);
     defer allocator.free(samples);
     var col: Collector = .{ .tpot_samples = samples };
     const obs: batch_sched.StepObserver = .{
@@ -11317,8 +11365,11 @@ fn runM68QosPass(
     const backend = rt.batchBackend();
 
     // Seed 2 short decode slots until both enter active `decoding` state.
-    _ = try sched.enqueue(&short_p, .{ .request_id = 1, .user_tag = 0, .max_tokens = decode_steps, .ignore_eos = true });
-    _ = try sched.enqueue(&short_p, .{ .request_id = 2, .user_tag = 1, .max_tokens = decode_steps, .ignore_eos = true });
+    var next_req_id: u64 = 1;
+    _ = try sched.enqueue(&short_p, .{ .request_id = next_req_id, .user_tag = 0, .max_tokens = decode_steps, .ignore_eos = true });
+    next_req_id += 1;
+    _ = try sched.enqueue(&short_p, .{ .request_id = next_req_id, .user_tag = 1, .max_tokens = decode_steps, .ignore_eos = true });
+    next_req_id += 1;
     while (sched.decodingSlotCount() < 2 and sched.activeSlotCount() > 0) {
         _ = sched.step(backend, obs);
     }
@@ -11328,10 +11379,29 @@ fn runM68QosPass(
     const t_reset = col.bg_start_ns;
     col.last_tok_ns[0] = t_reset;
     col.last_tok_ns[1] = t_reset;
-    _ = try sched.enqueue(long_p, .{ .request_id = 3, .user_tag = 2, .max_tokens = 2, .ignore_eos = true });
+    _ = try sched.enqueue(long_p, .{ .request_id = next_req_id, .user_tag = 2, .max_tokens = 2, .ignore_eos = true });
+    next_req_id += 1;
 
+    // Periodically re-seed 2-slot foreground decode bursts while the background prefill
+    // is in flight so foreground decode also overlaps past `seq_pos >= 8,192` and exercises
+    // depth-scaled adaptive chunk narrowing (`512 -> 256`) alongside `decode-share` QoS.
+    var fg_bursts: u32 = 1;
+    var idle_bg_steps: u32 = 0;
     while (sched.activeSlotCount() > 0) {
         _ = sched.step(backend, obs);
+        if (!col.bg_done_prefill and sched.decodingSlotCount() == 0 and sched.activeSlotCount() == 1 and fg_bursts < 10) {
+            idle_bg_steps += 1;
+            if (idle_bg_steps >= 2) {
+                idle_bg_steps = 0;
+                col.last_tok_ns[0] = 0;
+                col.last_tok_ns[1] = 0;
+                _ = try sched.enqueue(&short_p, .{ .request_id = next_req_id, .user_tag = 0, .max_tokens = decode_steps, .ignore_eos = true });
+                next_req_id += 1;
+                _ = try sched.enqueue(&short_p, .{ .request_id = next_req_id, .user_tag = 1, .max_tokens = decode_steps, .ignore_eos = true });
+                next_req_id += 1;
+                fg_bursts += 1;
+            }
+        }
     }
 
     const used = samples[0..col.sample_count];
@@ -11730,6 +11800,7 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
     const p30: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-30b-a3b-gsq-rco.amf";
     const c30: [:0]const u8 = "/Volumes/Akari/models/Qwen3-30B-A3B-3bit/config.json";
     const t30: [:0]const u8 = "/Volumes/Akari/models/Qwen3-30B-A3B-3bit/tokenizer.json";
+    const h30: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-30b-a3b-heat.json";
     const pe3: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-30b-a3b-eagle3.amf";
     const ce3: [:0]const u8 = "/Volumes/Akari/models/Qwen3-30B-A3B-Eagle3/config.json";
 
@@ -11755,18 +11826,12 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
             row_cnt += 1;
         }
     }
+    var cfg_30b_opt: ?qwen3.ModelConfig = null;
     if (cfg.use_real_checkpoints and posixFileExists(p30) and posixFileExists(c30)) {
         const cb = try readPosixFileAlloc(allocator, c30, 4 * 1024 * 1024);
         defer allocator.free(cb);
         const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
-        var ecfg_opt: ?draft_mod.DraftConfig = null;
-        if (posixFileExists(pe3) and posixFileExists(ce3) and posixFileExists(t30)) {
-            const ecb = try readPosixFileAlloc(allocator, ce3, 4 * 1024 * 1024);
-            defer allocator.free(ecb);
-            var ecfg = try draft_mod.DraftConfig.fromJson(allocator, ecb);
-            ecfg.format = .eagle3;
-            ecfg_opt = ecfg;
-        }
+        cfg_30b_opt = mcfg;
         var pair: [2]M68PrefillRow = @splat(.{});
         const n = try benchQwen3PrefillPair(
             allocator,
@@ -11780,13 +11845,7 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
             &pair,
             &infer_swap_acc,
             &infer_page_acc,
-            if (ecfg_opt) |ecfg| .{
-                .eagle_amf = pe3,
-                .eagle_cfg = ecfg,
-                .tok_path = t30,
-                .gen_tokens = cfg.eagle3_gen_tokens,
-                .out_report = &eagle3_rep,
-            } else null,
+            h30,
         );
         if (n > 0) row_30b = pair[0];
     }
@@ -11799,6 +11858,31 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
     infer_swap_acc += vmstat.Snapshot.swapoutDelta(q4_b, q4_a);
     infer_page_acc += vmstat.Snapshot.pageoutDelta(q4_b, q4_a);
 
+    // Run `30B + EAGLE-3` AFTER `30B` prefill A/B (`max_tree_nodes=64`) has released its wired pages,
+    // sizing `cold_experts_per_layer` via R9 live zero-swap RAM so total wired RAM never triggers swap.
+    if (cfg_30b_opt) |mcfg| {
+        if (posixFileExists(pe3) and posixFileExists(ce3) and posixFileExists(t30)) {
+            const ecb = try readPosixFileAlloc(allocator, ce3, 4 * 1024 * 1024);
+            defer allocator.free(ecb);
+            var ecfg = try draft_mod.DraftConfig.fromJson(allocator, ecb);
+            ecfg.format = .eagle3;
+            eagle3_rep = try benchRealEagle3WideSpec(
+                allocator,
+                p30,
+                mcfg,
+                pe3,
+                ecfg,
+                t30,
+                h30,
+                cfg.large_prompt_tokens,
+                cfg.eagle3_gen_tokens,
+                r9.live_reclaimable_mib,
+                &infer_swap_acc,
+                &infer_page_acc,
+            );
+        }
+    }
+
     // Section 3: C15 Concurrent Serving QoS & Multi-Turn ChatML Message-Boundary PrefixCache.
     const c15_b = try vmstat.Snapshot.capture();
     const c15 = try runM68C15Bench(allocator, cfg);
@@ -11807,7 +11891,7 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
     infer_swap_acc += vmstat.Snapshot.swapoutDelta(c15_b, c15_a);
     infer_page_acc += vmstat.Snapshot.pageoutDelta(c15_b, c15_a);
 
-    // Run `14B-4bit` (`8.2 GiB`) after `qwen4_exp` + `C15` so `30B` pages have fully returned to free pool.
+    // Run `14B-4bit` (`8.2 GiB`) after `C15` so `30B+EAGLE-3` pages have fully returned to free pool.
     if (cfg.use_real_checkpoints and posixFileExists(p14) and posixFileExists(c14)) {
         const cb = try readPosixFileAlloc(allocator, c14, 4 * 1024 * 1024);
         defer allocator.free(cb);
@@ -11900,6 +11984,8 @@ test "runM68WithConfig exercises G16 canary/Apple10, G15 wide prefill/tail-pruni
     });
 
     try std.testing.expect(report.g16.corrupted_slice_rejected);
+    try std.testing.expect(report.g16.canary_cold_elapsed_us > 0.0);
+    try std.testing.expect(report.g16.canary_warm_inbuf_elapsed_us > 0.0);
     try std.testing.expect(report.g16.max_abs_err_f16 < dequant.CANARY_TOL_F16);
     try std.testing.expect(report.prefill_row_count >= 2);
     for (report.prefill_rows[0..report.prefill_row_count]) |row| {

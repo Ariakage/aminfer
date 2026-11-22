@@ -2502,6 +2502,7 @@ const ServeCliArgs = struct {
     max_seq_len: u32 = 4096,
     max_conns: usize = aminfer.server.DEFAULT_MAX_CONNS,
     max_active_requests: usize = aminfer.server.DEFAULT_MAX_ACTIVE_REQUESTS,
+    max_active_requests_explicit: bool = false,
     batch_mode: ServeBatchMode = .auto,
     prefix_cache_chunks: u32 = 16,
     decode_share: f32 = aminfer.batch_scheduler.DEFAULT_DECODE_SHARE,
@@ -2548,6 +2549,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var max_seq_len: u32 = 4096;
     var max_conns: usize = aminfer.server.DEFAULT_MAX_CONNS;
     var max_active_requests: usize = aminfer.server.DEFAULT_MAX_ACTIVE_REQUESTS;
+    var max_active_requests_explicit = false;
     var batch_mode: ServeBatchMode = .auto;
     var prefix_cache_chunks: u32 = 16;
     var decode_share: f32 = aminfer.batch_scheduler.DEFAULT_DECODE_SHARE;
@@ -2623,6 +2625,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             max_active_requests = try std.fmt.parseInt(usize, args[i], 10);
+            max_active_requests_explicit = true;
         } else if (std.mem.eql(u8, flag, "--batch-mode")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -2764,6 +2767,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         .max_seq_len = max_seq_len,
         .max_conns = max_conns,
         .max_active_requests = max_active_requests,
+        .max_active_requests_explicit = max_active_requests_explicit,
         .batch_mode = batch_mode,
         .prefix_cache_chunks = prefix_cache_chunks,
         .decode_share = decode_share,
@@ -3382,8 +3386,24 @@ fn runServeGraph(
         },
         .auto => (!use_spec and cli.max_active_requests > 1),
     };
-    const batch_slots: usize = if (use_continuous)
+    const max_seq_len: u32 = @min(gcfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
+    var gcfg_kv_layers: u32 = 0;
+    for (gcfg.axes.layer_attention_kinds) |ak| {
+        if (ak != .gated_deltanet) gcfg_kv_layers += 1;
+    }
+    const raw_batch_slots: usize = if (use_continuous)
         @min(@max(cli.max_active_requests, 1), aminfer.batch_scheduler.MAX_BATCH_SLOTS)
+    else
+        1;
+    const batch_slots: usize = if (use_continuous)
+        autoClampServeBatchSlots(
+            raw_batch_slots,
+            cli.max_active_requests_explicit,
+            max_seq_len,
+            cli.kv_retire_q8_after_chunks,
+            cli.prefix_cache_chunks,
+            gcfg_kv_layers,
+        )
     else
         1;
     var draft_cfg_opt: ?aminfer.draft.DraftConfig = null;
@@ -3406,7 +3426,6 @@ fn runServeGraph(
     const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, &gcfg);
     defer freePlePaths(allocator, ple_paths);
 
-    const max_seq_len: u32 = @min(gcfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
     const target_tree_cap: u32 = if (use_continuous)
         @min(@as(u32, aminfer.engine.MAX_TREE_NODES), @max(@as(u32, @intCast(batch_slots)), 32))
     else if (!use_spec)
@@ -3433,6 +3452,7 @@ fn runServeGraph(
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .continuous_batch_only = use_continuous,
     });
     defer model.deinit(allocator);
 
@@ -3729,8 +3749,20 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         },
         .auto => (!use_spec and cli.max_active_requests > 1),
     };
-    const batch_slots: usize = if (use_continuous)
+    const max_seq_len: u32 = @min(cfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
+    const raw_batch_slots: usize = if (use_continuous)
         @min(@max(cli.max_active_requests, 1), aminfer.batch_scheduler.MAX_BATCH_SLOTS)
+    else
+        1;
+    const batch_slots: usize = if (use_continuous)
+        autoClampServeBatchSlots(
+            raw_batch_slots,
+            cli.max_active_requests_explicit,
+            max_seq_len,
+            cli.kv_retire_q8_after_chunks,
+            cli.prefix_cache_chunks,
+            cfg.num_hidden_layers,
+        )
     else
         1;
     var draft_cfg_opt: ?aminfer.draft.DraftConfig = null;
@@ -3769,7 +3801,6 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         }
     }
 
-    const max_seq_len: u32 = @min(cfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
     const target_tree_cap: u32 = if (use_continuous)
         @min(@as(u32, aminfer.engine.MAX_TREE_NODES), @max(@as(u32, @intCast(batch_slots)), 32))
     else if (!use_spec)
@@ -3802,6 +3833,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .continuous_batch_only = use_continuous,
     });
     defer model.deinit(allocator);
 
@@ -4154,6 +4186,34 @@ fn verifyAmf(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) 
     }
 }
 
+/// Auto-clamps default `batch_slots` (when `--max-active-requests` was not
+/// explicitly forced on the CLI) so `(batch_slots * active_chunks_per_slot +
+/// prefix_cache_chunks + 1) * num_kv_layers * 2` stays safely below macOS's
+/// per-process `IOSurface` ceiling (`4,096`).
+fn autoClampServeBatchSlots(
+    requested_slots: usize,
+    explicit: bool,
+    max_seq_len: u32,
+    kv_retire_q8_after_chunks: u32,
+    prefix_cache_chunks: u32,
+    num_kv_layers: u32,
+) usize {
+    if (explicit or requested_slots <= 1 or num_kv_layers == 0) return requested_slots;
+    const chunk_tokens: u32 = aminfer.attention.DEFAULT_CHUNK_TOKENS;
+    const total_chunks: u32 = @max(@as(u32, 1), (max_seq_len + chunk_tokens - 1) / chunk_tokens);
+    const active_per_slot: u32 = if (kv_retire_q8_after_chunks > 0 and total_chunks > kv_retire_q8_after_chunks)
+        @max(kv_retire_q8_after_chunks, 2)
+    else
+        total_chunks;
+    const max_iosurfaces: u64 = 4096;
+    const surf_per_group: u64 = @as(u64, num_kv_layers) * 2;
+    const max_groups: u64 = max_iosurfaces / surf_per_group;
+    const reserved: u64 = 1 + @as(u64, prefix_cache_chunks);
+    if (max_groups <= reserved) return 1;
+    const slots_fit: usize = @intCast(@max(@as(u64, 1), (max_groups - reserved) / @as(u64, active_per_slot)));
+    return @min(requested_slots, slots_fit);
+}
+
 fn probe(out: *Io.Writer) !void {
     const facts = try aminfer.sysinfo.Facts.read();
     try out.print(
@@ -4202,7 +4262,8 @@ fn probe(out: *Io.Writer) !void {
     defer lib.close();
     const dq_pipes = try aminfer.dequant.DequantPipelines.init(device, lib);
     defer dq_pipes.close();
-    const canary = try dq_pipes.runStartupNumericalCanary(&device);
+    const canary_prof = try dq_pipes.runStartupNumericalCanaryProfile(&device);
+    const canary = canary_prof.cold;
     try out.print(
         \\gpu.name                         {s}
         \\gpu.apple_family                 {d}
@@ -4217,7 +4278,8 @@ fn probe(out: *Io.Writer) !void {
         \\budget.binding_limit             {s}
         \\vm.live_zero_swap_reclaimable_mib {d} (free={d}, speculative={d}, purgeable={d}, external={d}; excluded: inactive={d}, internal={d}, compressor={d}, wired={d})
         \\canary.status                    pass
-        \\canary.elapsed_us                {d:.1}
+        \\canary.cold_elapsed_us           {d:.1}
+        \\canary.warm_inbuf_elapsed_us     {d:.1}
         \\canary.max_abs_err_f16           {d:.6}
         \\canary.max_abs_err_bf16          {d:.6}
         \\canary.max_abs_err_q4            {d:.6}
@@ -4244,6 +4306,7 @@ fn probe(out: *Io.Writer) !void {
         (vm_snap.compressor_pages *| ps) >> 20,
         (vm_snap.wire_pages *| ps) >> 20,
         canary.elapsed_us,
+        canary_prof.warm_elapsed_us,
         canary.max_abs_err_f16,
         canary.max_abs_err_bf16,
         canary.max_abs_err_q4,
@@ -4653,6 +4716,19 @@ test "M6.8 CLI parsers handle --gpu-prefill-mode, --strict-live-ram, --decode-sh
     try std.testing.expectApproxEqAbs(@as(f32, 0.50), srv_def.decode_share, 1e-6);
     try std.testing.expect(srv_def.adaptive_prefill_narrow);
     try std.testing.expect(srv_def.message_boundary_cache);
+    try std.testing.expect(!srv_def.max_active_requests_explicit);
+
+    const srv_exp = try parseServeArgs(&.{
+        "--amf",                 "m.amf",
+        "--config",              "c.json",
+        "--tokenizer",           "t.json",
+        "--max-active-requests", "3",
+    });
+    try std.testing.expect(srv_exp.max_active_requests_explicit);
+    try std.testing.expectEqual(@as(usize, 3), srv_exp.max_active_requests);
+    try std.testing.expectEqual(@as(usize, 2), autoClampServeBatchSlots(8, false, 10240, 0, 16, 28));
+    try std.testing.expectEqual(@as(usize, 8), autoClampServeBatchSlots(8, false, 2048, 0, 16, 28));
+    try std.testing.expectEqual(@as(usize, 3), autoClampServeBatchSlots(3, true, 10240, 0, 16, 28));
 
     try std.testing.expectError(error.InvalidGpuPrefillMode, parseDecodeArgs(&.{
         "--amf",              "m.amf",

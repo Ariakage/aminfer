@@ -456,8 +456,13 @@ pub const LoadOptions = struct {
     gpu_prefill_mode: GpuPrefillMode = .wide,
     /// Wide GPU prefill chunk capacity (`512` default; up to `attention.MAX_WIDE_PREFILL_TOKENS = 1024`).
     wide_prefill_chunk_tokens: u32 = 512,
-    /// Run `< 0.1 ms` startup `.metallib` numerical canary once during load (`G16`).
+    /// Run startup `.metallib` numerical canary once during load (`G16`).
     startup_canary: bool = true,
+    /// When `true` (used by continuous-batching `aminfer serve`), keep `max_seq_len`
+    /// intact for `Qwen3BatchRuntime` validation while allocating only `1` minimal
+    /// single-request `KvTile` chunk on the base model (saving unused IOSurfaces
+    /// and wired RAM when all serving traffic executes through `Qwen3BatchRuntime`).
+    continuous_batch_only: bool = false,
     /// Alias single-request wide-prefill rolling activation scratch with `verifyTree`
     /// activation scratch via `WiredArena.allocAliasedPair` (`P0-B2`, never unloading `lm_head`).
     alias_prefill_tree_scratch: bool = true,
@@ -715,6 +720,9 @@ const ColdRuntime = struct {
     pred_bitsets: [predictor_mod.MAX_LOOKAHEAD]tree_mod.ExpertBitset,
     pred_cands: [predictor_mod.MAX_LOOKAHEAD * predictor_mod.MAX_EXPERTS]predictor_mod.PrefetchCandidate,
     cold_bool_scratch: [moe.MAX_EXPERTS]bool,
+    csr_orig_tok: [attention.MAX_WIDE_PREFILL_TOKENS * moe.MAX_TOP_K]u32,
+    csr_orig_rw: [attention.MAX_WIDE_PREFILL_TOKENS * moe.MAX_TOP_K]f32,
+    csr_orig_sk: [attention.MAX_WIDE_PREFILL_TOKENS * moe.MAX_TOP_K]u32,
     ane_req_seq: u64,
     ane_inflight: bool,
 
@@ -2267,8 +2275,7 @@ pub const Qwen3Model = struct {
             self.wide_prefill_max_tokens > 0 and
             self.supports_wide_flash_attn and
             !self.has_sme2_weights and
-            !self.has_pure_cpu_sme2_dense and
-            self.cold_rt == null;
+            !self.has_pure_cpu_sme2_dense;
     }
 
     /// Maximum single-pass GPU prefill chunk length (`512–1024` in `.wide` mode,
@@ -2322,8 +2329,10 @@ pub const Qwen3Model = struct {
         const ret_chunk_stride: u32 = if (has_retired) self.retired_kv_pool.?.chunk_stride_bytes else 0;
         const kv_len_after: u32 = start_pos + m;
 
+        defer if (self.cold_rt) |crt| crt.expert_cache.releasePins();
         var frame = try self.compute.beginFrame(self.timeout_ms);
-        errdefer frame.abort();
+        var frame_active = true;
+        errdefer if (frame_active) frame.abort();
 
         try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
             .weight = self.embed.weight,
@@ -2524,23 +2533,64 @@ pub const Qwen3Model = struct {
             switch (self.config.arch) {
                 .qwen3_moe => {
                     const ws_ptr = &(self.wp_moe_ws.?);
-                    const moe_args: moe.MoELayerArgs = .{
-                        .x = self.wp_x_norm_bind,
-                        .router = layer.router,
-                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
-                        .expert_table = layer.expert_table,
-                        .workspace = ws_ptr,
-                        .workspace_buf = self.scratch_buf,
-                        .residual = eff_x_bind,
-                        .out = eff_x_bind,
-                        .m = eff_m,
-                        .num_experts = self.config.num_experts,
-                        .top_k = self.config.num_experts_per_tok,
-                        .hidden_size = h,
-                        .intermediate_size = self.config.moe_intermediate_size,
-                        .norm_topk_prob = self.config.norm_topk_prob,
-                    };
-                    try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
+                    if (self.cold_rt) |crt| {
+                        if (crt.layer_has_cold[l]) {
+                            try self.encodeLayerRouter(&frame, l, ws_ptr, self.scratch_buf, self.wp_x_norm_bind, eff_m, true);
+                            frame_active = false;
+                            const sig_r = try frame.commit();
+                            try self.compute.wait(sig_r, self.timeout_ms);
+                            crt.expert_cache.releasePins();
+                            const prep = try self.prepareColdLayerExperts(crt, l, ws_ptr, self.scratch_buf, self.wp_x_norm_bind, eff_m);
+                            frame = try self.compute.beginFrame(self.timeout_ms);
+                            frame_active = true;
+                            try self.encodeMoEGateUpDown(&frame, l, prep.weights_buf, ws_ptr, self.scratch_buf, self.wp_x_norm_bind, eff_m, false);
+                            try self.moe_pipes.encodeReduce(&frame, .{
+                                .workspace = ws_ptr,
+                                .workspace_buf = self.scratch_buf,
+                                .residual = eff_x_bind,
+                                .out = eff_x_bind,
+                                .m = eff_m,
+                                .hidden_size = h,
+                                .top_k = self.config.num_experts_per_tok,
+                            }, true);
+                        } else {
+                            const moe_args: moe.MoELayerArgs = .{
+                                .x = self.wp_x_norm_bind,
+                                .router = layer.router,
+                                .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                                .expert_table = layer.expert_table,
+                                .workspace = ws_ptr,
+                                .workspace_buf = self.scratch_buf,
+                                .residual = eff_x_bind,
+                                .out = eff_x_bind,
+                                .m = eff_m,
+                                .num_experts = self.config.num_experts,
+                                .top_k = self.config.num_experts_per_tok,
+                                .hidden_size = h,
+                                .intermediate_size = self.config.moe_intermediate_size,
+                                .norm_topk_prob = self.config.norm_topk_prob,
+                            };
+                            try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
+                        }
+                    } else {
+                        const moe_args: moe.MoELayerArgs = .{
+                            .x = self.wp_x_norm_bind,
+                            .router = layer.router,
+                            .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                            .expert_table = layer.expert_table,
+                            .workspace = ws_ptr,
+                            .workspace_buf = self.scratch_buf,
+                            .residual = eff_x_bind,
+                            .out = eff_x_bind,
+                            .m = eff_m,
+                            .num_experts = self.config.num_experts,
+                            .top_k = self.config.num_experts_per_tok,
+                            .hidden_size = h,
+                            .intermediate_size = self.config.moe_intermediate_size,
+                            .norm_topk_prob = self.config.norm_topk_prob,
+                        };
+                        try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
+                    }
                 },
                 .qwen3_dense => {
                     try self.encodeLinearGemmWithTile(&frame, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, eff_m, true, true);
@@ -2638,6 +2688,7 @@ pub const Qwen3Model = struct {
             }
         }
 
+        frame_active = false;
         const sig = try frame.commit();
         try self.compute.wait(sig, self.timeout_ms);
 
@@ -4142,9 +4193,9 @@ pub const Qwen3Model = struct {
         // `ws` for the caller's main frame (`pool_buf`) + `encodeReduce`.
         var orig_u: [moe.MAX_EXPERTS]u32 = undefined;
         var orig_off: [moe.MAX_EXPERTS + 1]u32 = undefined;
-        var orig_tok: [attention.MAX_TREE_NODES * moe.MAX_TOP_K]u32 = undefined;
-        var orig_rw: [attention.MAX_TREE_NODES * moe.MAX_TOP_K]f32 = undefined;
-        var orig_sk: [attention.MAX_TREE_NODES * moe.MAX_TOP_K]u32 = undefined;
+        const orig_tok = &crt.csr_orig_tok;
+        const orig_rw = &crt.csr_orig_rw;
+        const orig_sk = &crt.csr_orig_sk;
         const total_a: usize = ws.schedule_header.total_assignments;
         @memcpy(orig_u[0..num_unique], ws.unique_experts[0..num_unique]);
         @memcpy(orig_off[0 .. num_unique + 1], ws.expert_token_offsets[0 .. num_unique + 1]);
@@ -7850,12 +7901,14 @@ fn loadCore(
     const wide_enabled = (wide_prefill_max_tokens > 0);
     const w_cap: usize = wide_prefill_max_tokens;
 
-    const retire_after: u32 = options.kv_retire_q8_after_chunks;
+    const retire_after: u32 = if (options.continuous_batch_only) 0 else options.kv_retire_q8_after_chunks;
     const use_retired_q8 = (retire_after > 0 and num_chunks > retire_after);
     if (use_retired_q8 and (config.head_dim % attention.KV_Q8_GROUP_SIZE) != 0) {
         return error.InvalidConfig;
     }
-    const active_kv_chunks: u32 = if (use_retired_q8)
+    const active_kv_chunks: u32 = if (options.continuous_batch_only)
+        1
+    else if (use_retired_q8)
         @min(num_chunks, if (tree_enabled or wide_enabled) @max(retire_after, 2) else retire_after)
     else
         num_chunks;
@@ -8134,7 +8187,7 @@ fn loadCore(
     try compute.makeResident(&.{scratch_buf});
     try compute.makeTilesResident(kv_tiles);
 
-    // G16 (`P2`, ADR-0020): `< 0.1 ms` startup `.metallib` numerical canary over the
+    // G16 (`P2`, ADR-0020): startup `.metallib` numerical canary over the
     // already-resident `scratch_buf` BEFORE carving persistent scratch state.
     var canary_result: ?dequant.CanaryResult = null;
     if (options.startup_canary) {
@@ -8184,6 +8237,9 @@ fn loadCore(
             .pred_bitsets = @splat(tree_mod.ExpertBitset.empty()),
             .pred_cands = undefined,
             .cold_bool_scratch = @splat(false),
+            .csr_orig_tok = undefined,
+            .csr_orig_rw = undefined,
+            .csr_orig_sk = undefined,
             .ane_req_seq = 1,
             .ane_inflight = false,
         };
@@ -9208,9 +9264,19 @@ pub const Qwen3BatchRuntime = struct {
         if (base_used + @as(u64, cfg.max_slots) * bytes_per_group > wired_budget.limit_bytes) {
             return error.BudgetExceeded;
         }
+        // Bound default shared IOSurface pool below macOS's per-process IOSurface ceiling
+        // (~4,608 surfaces across model + batch pool) to avoid `TileCreationFailed`.
+        const max_total_iosurfaces: u64 = 4608;
+        const model_iosurfaces: u64 = @as(u64, model.kv_tiles.len);
+        const surf_per_group: u64 = @as(u64, num_layers) * 2;
+        const iosurface_cap_groups: u64 = if (max_total_iosurfaces > model_iosurfaces and surf_per_group > 0)
+            (max_total_iosurfaces - model_iosurfaces) / surf_per_group
+        else
+            cfg.max_slots;
+        const ram_cap_groups: u64 = (wired_budget.limit_bytes - base_used) / bytes_per_group;
         const headroom_groups: u32 = @intCast(@min(
             @as(u64, desired_groups),
-            (wired_budget.limit_bytes - base_used) / bytes_per_group,
+            @min(ram_cap_groups, if (cfg.kv_pool_chunk_groups > 0) @as(u64, desired_groups) else iosurface_cap_groups),
         ));
         const pool_chunk_groups: u32 = if (cfg.kv_pool_chunk_groups > 0) blk: {
             if (cfg.kv_pool_chunk_groups > headroom_groups) return error.BudgetExceeded;

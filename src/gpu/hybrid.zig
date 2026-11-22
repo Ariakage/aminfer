@@ -1152,6 +1152,31 @@ pub const QsaIndexBuffer = struct {
     pub fn countsBinding(self: *const QsaIndexBuffer, buf: metal.Buffer) metal.BufferBinding {
         return .{ .buffer = buf, .offset = self.selected_counts_off };
     }
+
+    /// Returns a zero-copy view covering `count` nodes starting at `start_node`,
+    /// reusing the same underlying wired `selected_blocks` / `selected_counts` storage.
+    pub fn nodeSlice(self: *const QsaIndexBuffer, start_node: u32, count: u32) ArenaError!QsaIndexBuffer {
+        if (count == 0 or @as(u64, start_node) + count > self.spec.max_nodes) {
+            return error.InvalidConfig;
+        }
+        const heads: usize = self.spec.num_kv_heads;
+        const top_k: usize = self.spec.top_k_blocks;
+        const cnt_start: usize = @as(usize, start_node) * heads;
+        const cnt_len: usize = @as(usize, count) * heads;
+        const blk_start: usize = cnt_start * top_k;
+        const blk_len: usize = cnt_len * top_k;
+        return .{
+            .spec = .{
+                .max_nodes = count,
+                .num_kv_heads = self.spec.num_kv_heads,
+                .top_k_blocks = self.spec.top_k_blocks,
+            },
+            .selected_blocks_off = self.selected_blocks_off + @as(u64, blk_start) * @sizeOf(u32),
+            .selected_counts_off = self.selected_counts_off + @as(u64, cnt_start) * @sizeOf(u32),
+            .selected_blocks = self.selected_blocks[blk_start .. blk_start + blk_len],
+            .selected_counts = self.selected_counts[cnt_start .. cnt_start + cnt_len],
+        };
+    }
 };
 
 pub const QsaRopeKvWriteArgs = struct {

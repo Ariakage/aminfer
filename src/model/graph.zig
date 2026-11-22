@@ -806,8 +806,13 @@ pub const GraphLoadOptions = struct {
     gpu_prefill_mode: qwen3.GpuPrefillMode = .wide,
     /// Wide GPU prefill chunk capacity (`512` default; up to `attention.MAX_WIDE_PREFILL_TOKENS = 1024`).
     wide_prefill_chunk_tokens: u32 = 512,
-    /// Run `< 0.1 ms` startup `.metallib` numerical canary once during load (`G16`).
+    /// Run startup `.metallib` numerical canary once during load (`G16`).
     startup_canary: bool = true,
+    /// When `true` (used by continuous-batching `aminfer serve`), keep `max_seq_len`
+    /// intact for `GraphBatchRuntime` validation while allocating only `1` minimal
+    /// single-request KV chunk per layer on the base model (saving unused IOSurfaces
+    /// and wired RAM when all serving traffic executes through `GraphBatchRuntime`).
+    continuous_batch_only: bool = false,
     /// Alias single-request wide-prefill scratch with `verifyTree` scratch via `WiredArena.allocAliasedPair` (`P0-B2`).
     alias_prefill_tree_scratch: bool = true,
     /// Opt-in strict live non-anonymous RAM admission (`--strict-live-ram`, `P1-B`).
@@ -1950,6 +1955,15 @@ pub const GraphModel = struct {
         m: u32,
         loop_step: u32,
     ) GraphStepError!void {
+        if (loop_step >= 1) {
+            // ADR-0019 Isolation #2: `wp_ple_f16_host[l * layer_stride ..]` was already
+            // populated on `loop_step == 0` for this layer and chunk (`tokens[0..m]`),
+            // and all `r = 0..R-1` passes encode into the same uncommitted `Compute.Frame`.
+            // Reusing the `r = 0` binding directly avoids overwriting host-mapped memory
+            // before `frame.commit()` and guarantees zero NVMe reads on `r >= 1`.
+            self.loop_stats.ple_r_ge1_reuses += 1;
+            return;
+        }
         const layer_rows = try prt.store.layerTotalRows(@intCast(l));
         const order = self.config.ple_ngram_order;
         const h: usize = self.config.hidden_size;
@@ -2895,12 +2909,17 @@ pub const GraphModel = struct {
 
                     if (skip_last_rest) return;
 
-                    const reuse_idx = (loop_step >= 1) and !tail_m1_last;
+                    const reuse_idx = (loop_step >= 1);
                     if (reuse_idx) {
                         self.loop_stats.qsa_index_reuses += 1;
                     } else {
                         self.loop_stats.qsa_index_computes += 1;
                     }
+                    var tail_idx_view: hybrid.QsaIndexBuffer = undefined;
+                    const idx_buf_ptr: *const hybrid.QsaIndexBuffer = if (reuse_idx and tail_m1_last) blk: {
+                        tail_idx_view = try qsa.wp_index_buf.?.nodeSlice(m - 1, 1);
+                        break :blk &tail_idx_view;
+                    } else &(qsa.wp_index_buf.?);
                     const qsa_kv_tiles_bind: metal.BufferBinding = if (use_qsa_tiered)
                         .{
                             .buffer = self.scratch_buf,
@@ -2916,7 +2935,7 @@ pub const GraphModel = struct {
                         .q = self.wp_q_bind,
                         .kv_tiles = qsa_kv_tiles_bind,
                         .block_keys = .{ .buffer = self.scratch_buf, .offset = qsa.block_keys_off },
-                        .index_buf = &(qsa.wp_index_buf.?),
+                        .index_buf = idx_buf_ptr,
                         .index_metal_buf = self.scratch_buf,
                         .out = self.wp_attn_out_bind,
                         .retired_pool = qsa_ret_pool_bind,
@@ -5717,7 +5736,7 @@ pub const GraphModel = struct {
             .full_chunk_512 => (options.max_seq_len + hybrid.QSA_FULL_CHUNK_TOKENS - 1) / hybrid.QSA_FULL_CHUNK_TOKENS,
         };
         const qsa_supports_retire = (num_qsa_layers > 0 and qsa_ring_mode == .full_chunk_512);
-        const retire_after: u32 = options.kv_retire_q8_after_chunks;
+        const retire_after: u32 = if (options.continuous_batch_only) 0 else options.kv_retire_q8_after_chunks;
         const retire_chunk_tokens: u32 = if (qsa_supports_retire) hybrid.QSA_FULL_CHUNK_TOKENS else options.chunk_tokens;
         const retire_total_chunks: u32 = if (qsa_supports_retire) qsa_full_chunks else num_chunks;
         const num_retirable_kv_layers: u32 = num_gqa_layers + (if (qsa_supports_retire) num_qsa_layers else 0);
@@ -5728,13 +5747,25 @@ pub const GraphModel = struct {
                 return error.InvalidConfig;
             }
         }
-        const active_kv_chunks: u32 = if (use_retired_q8)
+        const active_kv_chunks: u32 = if (options.continuous_batch_only)
+            1
+        else if (use_retired_q8)
             @min(retire_total_chunks, if (max_m > 1) @max(retire_after, 2) else retire_after)
         else
             retire_total_chunks;
         const max_retired_per_layer: u32 = if (use_retired_q8) retire_total_chunks - retire_after else 0;
-        const qsa_num_tiles: u32 = if (qsa_supports_retire and use_retired_q8) active_kv_chunks else qsa_full_chunks;
-        const gqa_num_tiles: u32 = if (use_retired_q8) active_kv_chunks else num_chunks;
+        const qsa_num_tiles: u32 = if (options.continuous_batch_only)
+            1
+        else if (qsa_supports_retire and use_retired_q8)
+            active_kv_chunks
+        else
+            qsa_full_chunks;
+        const gqa_num_tiles: u32 = if (options.continuous_batch_only)
+            1
+        else if (use_retired_q8)
+            active_kv_chunks
+        else
+            num_chunks;
         const retired_pool_spec: attention.RetiredKvQ8PoolSpec = .{
             .num_kv_heads = config.num_key_value_heads,
             .head_dim = config.head_dim,
@@ -6017,7 +6048,7 @@ pub const GraphModel = struct {
         try compute.makeResident(&.{scratch_buf});
         total_wired_bytes += scratch_bytes;
 
-        // G16 (`P2`, ADR-0020): `< 0.1 ms` startup `.metallib` numerical canary over
+        // G16 (`P2`, ADR-0020): startup `.metallib` numerical canary over
         // the resident `scratch_buf` BEFORE carving any sub-arena.
         var canary_result: ?dequant.CanaryResult = null;
         if (options.startup_canary) {
@@ -7373,9 +7404,22 @@ pub const GraphBatchRuntime = struct {
             if (base_used + @as(u64, cfg.max_slots) * bytes_per_group > wired_budget.limit_bytes) {
                 return error.BudgetExceeded;
             }
+            const max_total_iosurfaces: u64 = 4608;
+            var model_iosurfaces: u64 = @as(u64, model.gqa_kv_tiles.len);
+            for (model.layers) |layer| {
+                if (layer.attn == .qsa) {
+                    model_iosurfaces += @as(u64, layer.attn.qsa.kv_ring.k_tiles.len) + layer.attn.qsa.kv_ring.v_tiles.len;
+                }
+            }
+            const surf_per_group: u64 = @as(u64, num_kv_layers) * 2;
+            const iosurface_cap_groups: u64 = if (max_total_iosurfaces > model_iosurfaces and surf_per_group > 0)
+                (max_total_iosurfaces - model_iosurfaces) / surf_per_group
+            else
+                cfg.max_slots;
+            const ram_cap_groups: u64 = (wired_budget.limit_bytes - base_used) / bytes_per_group;
             const headroom_groups: u32 = @intCast(@min(
                 @as(u64, desired_groups),
-                (wired_budget.limit_bytes - base_used) / bytes_per_group,
+                @min(ram_cap_groups, if (cfg.kv_pool_chunk_groups > 0) @as(u64, desired_groups) else iosurface_cap_groups),
             ));
             pool_chunk_groups = if (cfg.kv_pool_chunk_groups > 0) blk: {
                 if (cfg.kv_pool_chunk_groups > headroom_groups) return error.BudgetExceeded;
@@ -12002,4 +12046,113 @@ test "M6.8 C15 GraphBatchRuntime wide prefill + ChatML message-boundary PrefixCa
     try std.testing.expect(st.boundary_hits >= 1);
     try std.testing.expect(st.gdn_snapshot_clones >= 2);
     try std.testing.expectEqual(@as(u32, 0), st.prefix_cache_pinned_entries);
+}
+
+test "M6.8 ADR-0019 Isolation #2 & #3: wide prefill R=3 QSA sparse tail_m1_last reuse and PLE zero-overwrite reuse" {
+    const allocator = std.testing.allocator;
+
+    // Part A: R = 3, qsa_window_size = 0, top_k_blocks = 2, m = 160 (> 128 so sparse top-k
+    // block indexing is active on the final QSA layer `L = 3`), verifying `tail_m1_last`
+    // reuses `r = 0`'s row `m - 1` selected blocks (`qsa_index_computes == 1`, `qsa_index_reuses == 2`).
+    {
+        var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 3, 0, null);
+        defer bundle.deinit(allocator);
+        bundle.cfg.qsa_window_size = 0;
+        bundle.cfg.qsa_top_k_blocks = 2;
+
+        var m_pruned = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 256,
+            .enable_prompt_tail_pruning = true,
+        });
+        defer m_pruned.deinit(allocator);
+
+        var m_unpruned = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 256,
+            .enable_prompt_tail_pruning = false,
+        });
+        defer m_unpruned.deinit(allocator);
+
+        var prompt: [160]u32 = undefined;
+        for (&prompt, 0..) |*t, i| t.* = @intCast((i * 13 + 7) % bundle.cfg.vocab_size);
+
+        m_pruned.resetLoopIsolationStats();
+        m_unpruned.resetLoopIsolationStats();
+        const tok_p = try m_pruned.prefillChunk(&prompt, 0, true);
+        const tok_u = try m_unpruned.prefillChunk(&prompt, 0, true);
+
+        const iso_p = m_pruned.loopIsolationStats();
+        const iso_u = m_unpruned.loopIsolationStats();
+        try std.testing.expectEqual(@as(u64, 1), iso_p.qsa_index_computes);
+        try std.testing.expectEqual(@as(u64, 2), iso_p.qsa_index_reuses);
+        try std.testing.expectEqual(@as(u64, 1), iso_u.qsa_index_computes);
+        try std.testing.expectEqual(@as(u64, 2), iso_u.qsa_index_reuses);
+        try std.testing.expectEqual(tok_u, tok_p);
+
+        var max_diff: f32 = 0.0;
+        for (m_pruned.readLastLogitsF16(), m_unpruned.readLastLogitsF16()) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > max_diff) max_diff = d;
+        }
+        try std.testing.expect(max_diff < 5.0e-3);
+    }
+
+    // Part B: R = 3 with NVMe PLE (`ple_num_shards = 1`): `preparePleLayerWide` populates
+    // host-mapped `wp_ple_f16_host` only at `loop_step == 0` and reuses it on `r >= 1`
+    // without overwriting before `frame.commit()` (`ple_r_ge1_reuses == 6`, `0` extra NVMe reads).
+    {
+        const tmp_dir = try makeTestTempDir(allocator, "m68_ple_r3_wide");
+        defer {
+            removeTestDir(allocator, tmp_dir);
+            allocator.free(tmp_dir);
+        }
+        var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 3, 1, tmp_dir);
+        defer bundle.deinit(allocator);
+        bundle.cfg.qsa_window_size = 0;
+
+        var m_wide = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 128,
+            .max_tree_nodes = 16,
+            .ple_paths = bundle.ple_paths,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 64,
+            .enable_prompt_tail_pruning = true,
+        });
+        defer m_wide.deinit(allocator);
+
+        var m_tree = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 128,
+            .max_tree_nodes = 32,
+            .ple_paths = bundle.ple_paths,
+            .gpu_prefill_mode = .tree64,
+        });
+        defer m_tree.deinit(allocator);
+
+        var prompt: [32]u32 = undefined;
+        for (&prompt, 0..) |*t, i| t.* = @intCast((i * 11 + 5) % bundle.cfg.vocab_size);
+
+        m_wide.resetLoopIsolationStats();
+        const tok_w = try m_wide.prefillChunk(&prompt, 0, true);
+        const tok_t = try m_tree.prefillChunk(&prompt, 0, true);
+
+        const iso_w = m_wide.loopIsolationStats();
+        try std.testing.expectEqual(@as(u64, 4), iso_w.ple_r0_fills);
+        try std.testing.expectEqual(@as(u64, 6), iso_w.ple_r_ge1_reuses);
+        try std.testing.expectEqual(@as(u64, 0), iso_w.ple_r_ge1_nvme_reads);
+        try std.testing.expectEqual(@as(u64, 1), iso_w.qsa_index_computes);
+        try std.testing.expectEqual(@as(u64, 2), iso_w.qsa_index_reuses);
+        try std.testing.expectEqual(tok_t, tok_w);
+
+        var max_diff: f32 = 0.0;
+        for (m_wide.readLastLogitsF16(), m_tree.readLastLogitsF16()) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > max_diff) max_diff = d;
+        }
+        try std.testing.expect(max_diff < 5.0e-2);
+    }
 }
