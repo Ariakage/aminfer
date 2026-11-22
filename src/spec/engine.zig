@@ -100,6 +100,8 @@ pub const SpecConfig = struct {
     pearl_min_target_us: f64 = 40_000.0,
     /// Optional C6 NVMe `F_NOCACHE` N-gram table queried when L1 SAM match `< 4`.
     ngram_table: ?*ngram_nvme.NvmeNgramTable = null,
+    /// Optional C14 hot-swappable multi-pack `.ang` domain registry.
+    ngram_registry: ?*ngram_nvme.DomainNgramRegistry = null,
 };
 
 pub const SpecStats = struct {
@@ -204,7 +206,7 @@ pub const RunError = error{
     TokenOutOfRange,
     MissingRng,
 } || qwen3.StepError || graph.GraphStepError || draft_mod.DraftStepError || tree_mod.PruneError ||
-    accept_mod.VerifyError || ngram_nvme.QueryError;
+    accept_mod.VerifyError || ngram_nvme.RegistryQueryError;
 
 /// Unified speculative target handle supporting both Tier 1 `Qwen3Model` and
 /// Tier 2 composable `GraphModel` (`qwen4_exp`, native `LoopLM`, `Step-LoRA`).
@@ -963,6 +965,8 @@ pub const SpecEngine = struct {
     draft_head: ?*draft_mod.DraftHead,
     small_draft: ?*draft_mod.SmallDraftModel,
     ngram_table: ?*ngram_nvme.NvmeNgramTable,
+    ngram_registry: ?*ngram_nvme.DomainNgramRegistry,
+    active_ngram_domain: ?[]const u8,
     config: SpecConfig,
     cost_model: tree_mod.PruneCostModel,
     /// Startup-only sampled `[sampled_layers * num_experts]` static byte/BW tables
@@ -1189,6 +1193,8 @@ pub const SpecEngine = struct {
             .draft_head = draft_head,
             .small_draft = small_draft,
             .ngram_table = config.ngram_table,
+            .ngram_registry = config.ngram_registry,
+            .active_ngram_domain = null,
             .config = config,
             .cost_model = cost,
             .expert_bytes_sampled = expert_bytes_sampled,
@@ -1253,6 +1259,10 @@ pub const SpecEngine = struct {
         self.ngram_table = tbl;
     }
 
+    pub fn setActiveNgramDomain(self: *SpecEngine, domain: ?[]const u8) void {
+        self.active_ngram_domain = if (domain) |d| (if (d.len > 0) d else null) else null;
+    }
+
     pub fn reset(self: *SpecEngine) void {
         if (self.pearl_rt) |prt| prt.waitIdle();
         self.target.resetState();
@@ -1284,7 +1294,8 @@ pub const SpecEngine = struct {
             sd.totalWiredBytes()
         else
             0;
-        const ngram_bytes: u64 = if (self.ngram_table) |nt| nt.totalWiredBytes() else 0;
+        const ngram_bytes: u64 = (if (self.ngram_table) |nt| nt.totalWiredBytes() else 0) +
+            (if (self.ngram_registry) |nr| nr.totalWiredBytes() else 0);
         return self.target.totalWiredBytes() + draft_bytes + self.sam_arena.bytes().len + ngram_bytes;
     }
 
@@ -1398,8 +1409,10 @@ pub const SpecEngine = struct {
             };
         }
 
-        // C6: Asynchronously prefetch the first round's `.ang` context bucket page.
-        if (self.ngram_table) |nt| {
+        // C6/C14: Asynchronously prefetch the first round's `.ang` context bucket page.
+        if (self.ngram_registry) |nr| {
+            _ = try nr.prefetchDomain(self.active_ngram_domain, self.sam.historySlice());
+        } else if (self.ngram_table) |nt| {
             _ = try nt.prefetch(self.sam.historySlice());
         }
 
@@ -1512,12 +1525,17 @@ pub const SpecEngine = struct {
             .is_seed = false,
         };
 
-        if (l1_cap > 0 and sam_q.match_len < sam_mod.SEED_MIN_MATCH_LEN and self.ngram_table != null) {
-            const nt = self.ngram_table.?;
-            const reads_before = nt.stats.nvme_reads;
-            const nq = try nt.query(self.sam.historySlice(), self.ngram_buf[0..l1_cap]);
+        if (l1_cap > 0 and sam_q.match_len < sam_mod.SEED_MIN_MATCH_LEN and (self.ngram_registry != null or self.ngram_table != null)) {
+            const nq: ngram_nvme.QueryResult = if (self.ngram_registry) |nr|
+                try nr.queryDomain(self.active_ngram_domain, self.sam.historySlice(), self.ngram_buf[0..l1_cap])
+            else blk: {
+                const nt = self.ngram_table.?;
+                const reads_before = nt.stats.nvme_reads;
+                const res = try nt.query(self.sam.historySlice(), self.ngram_buf[0..l1_cap]);
+                self.stats.ngram_nvme_reads += nt.stats.nvme_reads -| reads_before;
+                break :blk res;
+            };
             self.stats.ngram_queries += 1;
-            self.stats.ngram_nvme_reads += nt.stats.nvme_reads -| reads_before;
             if (nq.cache_hit) self.stats.ngram_cache_hits += 1;
 
             if (nq.draft_len > 0) {
@@ -1643,8 +1661,13 @@ pub const SpecEngine = struct {
         // Extract highest-probability lead path of pruned `T_r` for C6 prefetch and D8 PEARL.
         const lead_len: u16 = self.draft_tree.highestProbPath(null, &self.pearl_lead_tokens);
 
-        // C6: Overlapped background NVMe prefetch of the predicted next-round context page.
-        if (self.ngram_table) |nt| {
+        // C6/C14: Overlapped background NVMe prefetch of the predicted next-round context page.
+        if (self.ngram_registry) |nr| {
+            const pred_tail = self.buildPrefetchTail(self.pearl_lead_tokens[0..lead_len]);
+            if (pred_tail.len >= 2) {
+                _ = try nr.prefetchDomain(self.active_ngram_domain, pred_tail);
+            }
+        } else if (self.ngram_table) |nt| {
             const pred_tail = self.buildPrefetchTail(self.pearl_lead_tokens[0..lead_len]);
             if (pred_tail.len >= nt.header.min_ngram) {
                 _ = try nt.prefetch(pred_tail);
@@ -1757,8 +1780,10 @@ pub const SpecEngine = struct {
             }
         }
 
-        // C6: Prefetch actual committed context tail if it diverged from speculated tail.
-        if (self.ngram_table) |nt| {
+        // C6/C14: Prefetch actual committed context tail if it diverged from speculated tail.
+        if (self.ngram_registry) |nr| {
+            _ = try nr.prefetchDomain(self.active_ngram_domain, self.sam.historySlice());
+        } else if (self.ngram_table) |nt| {
             _ = try nt.prefetch(self.sam.historySlice());
         }
 
