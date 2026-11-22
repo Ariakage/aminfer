@@ -32,6 +32,23 @@ pub const DEFAULT_CACHE_PAGES: usize = 128; // 2 MiB wired LRU page cache
 pub const DEFAULT_MAX_INFLIGHT: usize = 16;
 pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
+/// Multi-head Engram conditional memory bounds (M7, ADR-0015).
+pub const ENGRAM_MIN_HEADS: u8 = 2;
+pub const ENGRAM_MAX_HEADS: u8 = 8;
+pub const ENGRAM_MIN_ORDER: u8 = 2;
+pub const ENGRAM_MAX_ORDER: u8 = 5;
+
+/// Sparse external memory table semantics stored in `.amf` `TensorKind.sparse_table`.
+///
+/// - `ple_ngram`: M6 Per-Layer Embedding (single `[embed_dim]` vector per row).
+/// - `engram_conditional`: M7 196B Engram conditional memory (each row packs
+///   contiguous `[key_vec[0..D], value_vec[0..D]]` of total width `2 * D` so one
+///   `F_NOCACHE` page fetch retrieves both key and value for context gating).
+pub const MemoryTableKind = enum(u8) {
+    ple_ngram = 0,
+    engram_conditional = 1,
+};
+
 const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
 const Q3 = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
 const Q2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
@@ -51,6 +68,10 @@ pub const Error = amf.ParseError || amf.IoError || aio.EcorePoolError ||
     LayerNotFound,
     RowOutOfBounds,
     InvalidNgramOrder,
+    InvalidEngramHeads,
+    InvalidEngramOrder,
+    InvalidEngramLayout,
+    TableKindMismatch,
     InvalidBatchSize,
     BufferTooSmall,
     LoopScratchMismatch,
@@ -126,6 +147,168 @@ pub fn mapNgramToShardRow(
     return error.RowOutOfBounds;
 }
 
+/// Multi-head deterministic hash for M7 196B Engram conditional memory (`C10`).
+///
+/// Maps the trailing `ngram_order` (`n in 2..5`, left-padded with BOS sentinels
+/// when `tokens.len < ngram_order`) and `head_idx` (`0..H-1`, `H in 2..8`) to a
+/// global row index in `[0, total_rows)` across sharded 16 KiB-aligned `.amf`
+/// `TensorKind.sparse_table` tables.
+pub fn hashEngramHead(tokens: []const u32, head_idx: u8, ngram_order: u8, total_rows: u64) u64 {
+    std.debug.assert(ngram_order >= 1);
+    std.debug.assert(total_rows > 0);
+    // Domain-separate Engram from PLE and separate every (head_idx, ngram_order) pair.
+    const head_mix: u64 = (@as(u64, head_idx) +% 1) *% 0x517cc1b727220a95;
+    const order_mix: u64 = @as(u64, ngram_order) *% 0x9e3779b97f4a7c15;
+    var h: u64 = 0x84222325cbf29ce4 ^ head_mix ^ std.math.rotl(u64, order_mix, 17);
+    const ord: usize = ngram_order;
+    const start: usize = if (tokens.len >= ord) tokens.len - ord else 0;
+    const pad: usize = ord - (tokens.len - start);
+    for (0..pad) |p| {
+        h ^= 0xFFFF_FFFE_0000_0000 | (@as(u64, head_idx) << 16) | @as(u64, @intCast(p));
+        h *%= 0x100000001b3;
+    }
+    for (tokens[start..]) |tok| {
+        h ^= @as(u64, tok) ^ head_mix;
+        h *%= 0x100000001b3;
+    }
+    // SplitMix64 avalanche finalizer for uniform distribution modulo `total_rows`.
+    h ^= h >> 30;
+    h *%= 0xbf58476d1ce4e5b9;
+    h ^= h >> 27;
+    h *%= 0x94d049bb133111eb;
+    h ^= h >> 31;
+    return h % total_rows;
+}
+
+/// Deterministically maps an Engram `(head_idx, ngram_order)` suffix lookup
+/// across sharded row counts into `(shard_index, local_row, global_row)`.
+pub fn mapEngramHeadToShardRow(
+    tokens: []const u32,
+    head_idx: u8,
+    ngram_order: u8,
+    shard_row_counts: []const u64,
+) error{ InvalidEngramHeads, InvalidEngramOrder, RowOutOfBounds, Overflow }!ShardRowLocation {
+    if (head_idx >= ENGRAM_MAX_HEADS) return error.InvalidEngramHeads;
+    if (ngram_order < ENGRAM_MIN_ORDER or ngram_order > ENGRAM_MAX_ORDER) {
+        return error.InvalidEngramOrder;
+    }
+    if (shard_row_counts.len == 0) return error.RowOutOfBounds;
+
+    var total_rows: u64 = 0;
+    for (shard_row_counts) |cnt| {
+        if (cnt == 0) return error.RowOutOfBounds;
+        total_rows = std.math.add(u64, total_rows, cnt) catch return error.Overflow;
+    }
+    const global_row = hashEngramHead(tokens, head_idx, ngram_order, total_rows);
+    var prefix: u64 = 0;
+    for (shard_row_counts, 0..) |cnt, s| {
+        if (global_row < prefix + cnt) {
+            return .{
+                .shard_index = @intCast(s),
+                .local_row = global_row - prefix,
+                .global_row = global_row,
+            };
+        }
+        prefix += cnt;
+    }
+    return error.RowOutOfBounds;
+}
+
+inline fn stableSigmoidF32(x: f32) f32 {
+    const clamped = std.math.clamp(x, -80.0, 80.0);
+    return 1.0 / (1.0 + @exp(-clamped));
+}
+
+/// Computes context-gated Engram conditional memory injection in FP16 with
+/// FP32 inner-product and multi-head accumulation (zero heap allocations):
+///   `out[d] = sum_{h=0..H-1} sigmoid(dot(hidden_norm, k_h) * inv_sqrt_d) * v_h[d]`
+///
+/// `kv_heads_f32` holds `num_heads` contiguous rows of width `2 * dim`, where
+/// head `h` occupies `[k_h[0..dim], v_h[0..dim]]`.
+pub fn applyEngramContextGateF16(
+    hidden_norm: []const f16,
+    kv_heads_f32: []const f32,
+    num_heads: u8,
+    dim: u32,
+    out: []f16,
+) Error!void {
+    if (num_heads < ENGRAM_MIN_HEADS or num_heads > ENGRAM_MAX_HEADS) {
+        return error.InvalidEngramHeads;
+    }
+    if (dim == 0) return error.InvalidEngramLayout;
+    const d_usize: usize = dim;
+    const row_stride = std.math.mul(usize, d_usize, 2) catch return error.Overflow;
+    const kv_need = std.math.mul(usize, @as(usize, num_heads), row_stride) catch return error.Overflow;
+    if (hidden_norm.len < d_usize or out.len < d_usize or kv_heads_f32.len < kv_need) {
+        return error.BufferTooSmall;
+    }
+
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+    var gates: [ENGRAM_MAX_HEADS]f32 = @splat(0.0);
+    const heads: usize = num_heads;
+
+    for (0..heads) |h| {
+        const k_h = kv_heads_f32[h * row_stride ..][0..d_usize];
+        var dot: f32 = 0.0;
+        for (0..d_usize) |d| {
+            dot += @as(f32, @floatCast(hidden_norm[d])) * k_h[d];
+        }
+        gates[h] = stableSigmoidF32(dot * inv_sqrt_d);
+    }
+
+    for (0..d_usize) |d| {
+        var acc: f32 = 0.0;
+        for (0..heads) |h| {
+            const v_h = kv_heads_f32[h * row_stride + d_usize ..][0..d_usize];
+            acc += gates[h] * v_h[d];
+        }
+        out[d] = @floatCast(acc);
+    }
+}
+
+/// FP32 counterpart of `applyEngramContextGateF16`:
+///   `out[d] = sum_{h=0..H-1} sigmoid(dot(hidden_norm, k_h) * inv_sqrt_d) * v_h[d]`
+pub fn applyEngramContextGateF32(
+    hidden_norm: []const f32,
+    kv_heads_f32: []const f32,
+    num_heads: u8,
+    dim: u32,
+    out: []f32,
+) Error!void {
+    if (num_heads < ENGRAM_MIN_HEADS or num_heads > ENGRAM_MAX_HEADS) {
+        return error.InvalidEngramHeads;
+    }
+    if (dim == 0) return error.InvalidEngramLayout;
+    const d_usize: usize = dim;
+    const row_stride = std.math.mul(usize, d_usize, 2) catch return error.Overflow;
+    const kv_need = std.math.mul(usize, @as(usize, num_heads), row_stride) catch return error.Overflow;
+    if (hidden_norm.len < d_usize or out.len < d_usize or kv_heads_f32.len < kv_need) {
+        return error.BufferTooSmall;
+    }
+
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
+    var gates: [ENGRAM_MAX_HEADS]f32 = @splat(0.0);
+    const heads: usize = num_heads;
+
+    for (0..heads) |h| {
+        const k_h = kv_heads_f32[h * row_stride ..][0..d_usize];
+        var dot: f32 = 0.0;
+        for (0..d_usize) |d| {
+            dot += hidden_norm[d] * k_h[d];
+        }
+        gates[h] = stableSigmoidF32(dot * inv_sqrt_d);
+    }
+
+    for (0..d_usize) |d| {
+        var acc: f32 = 0.0;
+        for (0..heads) |h| {
+            const v_h = kv_heads_f32[h * row_stride + d_usize ..][0..d_usize];
+            acc += gates[h] * v_h[d];
+        }
+        out[d] = acc;
+    }
+}
+
 /// Unique identifier for one 16 KiB page inside an opened `.amf` shard file.
 pub const PageKey = struct {
     file_idx: u16,
@@ -158,6 +341,7 @@ pub const Stats = struct {
     rows_decoded: u64 = 0,
     loop_scratch_fills: u64 = 0,
     loop_scratch_hits: u64 = 0,
+    engram_lookups: u64 = 0,
 };
 
 pub const PageCacheConfig = struct {
@@ -568,15 +752,20 @@ pub const PlePageCache = struct {
 };
 
 /// Preallocated 16 KiB-aligned wired RAM scratch holding `r = 0` dequantized
-/// PLE rows `[max_layers, max_tokens, embed_dim]f32` for mandatory `ADR-0019`
-/// `r = 0` single-lookup loop isolation (`nvme_reads_delta == 0` for `r >= 1`).
+/// PLE (`[max_layers, max_tokens, embed_dim]f32`) or multi-head Engram
+/// (`[max_layers, max_tokens, max_heads, 2 * value_dim]f32`) rows for mandatory
+/// `ADR-0019` `r = 0` single-lookup loop isolation (`nvme_reads_delta == 0` for
+/// `r >= 1`).
 pub const LoopPleScratch = struct {
     arena: arena_mod.WiredArena,
     data_f32: []f32,
     valid_tokens: []u16,
+    valid_heads: []u8,
     max_layers: u16,
     max_tokens: u16,
+    max_heads: u8,
     embed_dim: u32,
+    table_kind: MemoryTableKind,
     loop_reuse_hits: u64 = 0,
 
     pub fn init(
@@ -586,11 +775,42 @@ pub const LoopPleScratch = struct {
         embed_dim: u32,
         budget_override: ?budget_mod.Budget,
     ) Error!LoopPleScratch {
-        if (max_layers == 0 or max_tokens == 0 or max_tokens > MAX_BATCH_TOKENS or embed_dim == 0) {
+        return initInternal(allocator, max_layers, max_tokens, 1, embed_dim, .ple_ngram, budget_override);
+    }
+
+    /// Allocates wired scratch for multi-head Engram `(key_vec, value_vec)` rows
+    /// of dimension `value_dim` (`embed_dim == 2 * value_dim`, `max_heads in 2..8`).
+    pub fn initEngram(
+        allocator: std.mem.Allocator,
+        max_layers: u16,
+        max_tokens: u16,
+        max_heads: u8,
+        value_dim: u32,
+        budget_override: ?budget_mod.Budget,
+    ) Error!LoopPleScratch {
+        if (max_heads < ENGRAM_MIN_HEADS or max_heads > ENGRAM_MAX_HEADS) {
+            return error.InvalidEngramHeads;
+        }
+        if (value_dim == 0) return error.InvalidEngramLayout;
+        const packed_dim = std.math.mul(u32, value_dim, 2) catch return error.Overflow;
+        return initInternal(allocator, max_layers, max_tokens, max_heads, packed_dim, .engram_conditional, budget_override);
+    }
+
+    fn initInternal(
+        allocator: std.mem.Allocator,
+        max_layers: u16,
+        max_tokens: u16,
+        max_heads: u8,
+        embed_dim: u32,
+        table_kind: MemoryTableKind,
+        budget_override: ?budget_mod.Budget,
+    ) Error!LoopPleScratch {
+        if (max_layers == 0 or max_tokens == 0 or max_tokens > MAX_BATCH_TOKENS or max_heads == 0 or embed_dim == 0) {
             return error.InvalidBatchSize;
         }
         const lt = std.math.mul(usize, max_layers, max_tokens) catch return error.Overflow;
-        const elems = std.math.mul(usize, lt, embed_dim) catch return error.Overflow;
+        const lth = std.math.mul(usize, lt, max_heads) catch return error.Overflow;
+        const elems = std.math.mul(usize, lth, embed_dim) catch return error.Overflow;
         const raw_bytes = std.math.mul(usize, elems, @sizeOf(f32)) catch return error.Overflow;
         const aligned_bytes = page.alignUp(raw_bytes) catch return error.Overflow;
 
@@ -608,43 +828,90 @@ pub const LoopPleScratch = struct {
         errdefer allocator.free(valid_tokens);
         @memset(valid_tokens, 0);
 
+        const valid_heads = try allocator.alloc(u8, max_layers);
+        errdefer allocator.free(valid_heads);
+        @memset(valid_heads, 0);
+
         return .{
             .arena = mem_arena,
             .data_f32 = data_f32,
             .valid_tokens = valid_tokens,
+            .valid_heads = valid_heads,
             .max_layers = max_layers,
             .max_tokens = max_tokens,
+            .max_heads = max_heads,
             .embed_dim = embed_dim,
+            .table_kind = table_kind,
             .loop_reuse_hits = 0,
         };
     }
 
     pub fn deinit(self: *LoopPleScratch, allocator: std.mem.Allocator) void {
+        allocator.free(self.valid_heads);
         allocator.free(self.valid_tokens);
+        self.valid_heads = &.{};
         self.valid_tokens = &.{};
         self.data_f32 = &.{};
         self.arena.deinit();
     }
 
-    /// Resets per-layer valid-token markers at the beginning of a new decode step.
+    /// Resets per-layer valid-token/head markers at the beginning of a new decode step.
     pub fn resetStep(self: *LoopPleScratch) void {
         @memset(self.valid_tokens, 0);
+        @memset(self.valid_heads, 0);
     }
 
     pub fn totalWiredBytes(self: *const LoopPleScratch) u64 {
         return self.arena.bytes().len;
     }
 
+    pub inline fn engramValueDim(self: *const LoopPleScratch) u32 {
+        return self.embed_dim / 2;
+    }
+
     pub inline fn rowSliceMut(self: *LoopPleScratch, layer: u16, token_idx: usize) []f32 {
-        const stride_layer = @as(usize, self.max_tokens) * @as(usize, self.embed_dim);
-        const start = @as(usize, layer) * stride_layer + token_idx * @as(usize, self.embed_dim);
+        const stride_token = @as(usize, self.max_heads) * @as(usize, self.embed_dim);
+        const stride_layer = @as(usize, self.max_tokens) * stride_token;
+        const start = @as(usize, layer) * stride_layer + token_idx * stride_token;
         return self.data_f32[start .. start + self.embed_dim];
     }
 
     pub inline fn rowSliceConst(self: *const LoopPleScratch, layer: u16, token_idx: usize) []const f32 {
-        const stride_layer = @as(usize, self.max_tokens) * @as(usize, self.embed_dim);
-        const start = @as(usize, layer) * stride_layer + token_idx * @as(usize, self.embed_dim);
+        const stride_token = @as(usize, self.max_heads) * @as(usize, self.embed_dim);
+        const stride_layer = @as(usize, self.max_tokens) * stride_token;
+        const start = @as(usize, layer) * stride_layer + token_idx * stride_token;
         return self.data_f32[start .. start + self.embed_dim];
+    }
+
+    pub inline fn engramRowSliceMut(self: *LoopPleScratch, layer: u16, token_idx: usize, head_idx: usize) []f32 {
+        const stride_token = @as(usize, self.max_heads) * @as(usize, self.embed_dim);
+        const stride_layer = @as(usize, self.max_tokens) * stride_token;
+        const start = @as(usize, layer) * stride_layer + token_idx * stride_token + head_idx * @as(usize, self.embed_dim);
+        return self.data_f32[start .. start + self.embed_dim];
+    }
+
+    pub inline fn engramRowSliceConst(self: *const LoopPleScratch, layer: u16, token_idx: usize, head_idx: usize) []const f32 {
+        const stride_token = @as(usize, self.max_heads) * @as(usize, self.embed_dim);
+        const stride_layer = @as(usize, self.max_tokens) * stride_token;
+        const start = @as(usize, layer) * stride_layer + token_idx * stride_token + head_idx * @as(usize, self.embed_dim);
+        return self.data_f32[start .. start + self.embed_dim];
+    }
+
+    pub inline fn engramKeySliceConst(self: *const LoopPleScratch, layer: u16, token_idx: usize, head_idx: usize) []const f32 {
+        const d = self.engramValueDim();
+        return self.engramRowSliceConst(layer, token_idx, head_idx)[0..d];
+    }
+
+    pub inline fn engramValSliceConst(self: *const LoopPleScratch, layer: u16, token_idx: usize, head_idx: usize) []const f32 {
+        const d = self.engramValueDim();
+        return self.engramRowSliceConst(layer, token_idx, head_idx)[d .. d * 2];
+    }
+
+    pub inline fn engramTokenHeadsConst(self: *const LoopPleScratch, layer: u16, token_idx: usize, num_heads: usize) []const f32 {
+        const stride_token = @as(usize, self.max_heads) * @as(usize, self.embed_dim);
+        const stride_layer = @as(usize, self.max_tokens) * stride_token;
+        const start = @as(usize, layer) * stride_layer + token_idx * stride_token;
+        return self.data_f32[start .. start + num_heads * @as(usize, self.embed_dim)];
     }
 };
 
@@ -657,6 +924,9 @@ pub const Config = struct {
     cache: PageCacheConfig = .{},
     /// When `true`, verifies CRC-32 of every `.amf` blob at startup.
     verify_blob_crcs: bool = false,
+    /// Optional explicit table kind override (`null` auto-detects `.engram_conditional`
+    /// when any `sparse_table` tensor name contains `"engram."`, else `.ple_ngram`).
+    table_kind: ?MemoryTableKind = null,
 };
 
 const ShardDesc = struct {
@@ -685,12 +955,13 @@ const LayerTable = struct {
     total_rows: u64 = 0,
 };
 
-/// Single-file or multi-shard NVMe `F_NOCACHE` Per-Layer Embedding store (C10).
+/// Single-file or multi-shard NVMe `F_NOCACHE` Per-Layer Embedding / Engram store (C10).
 pub const PleStore = struct {
     files: []amf.AmfFile,
     shards: []ShardDesc,
     layers: []LayerTable,
     embed_dim: u32,
+    table_kind: MemoryTableKind,
     cache: PlePageCache,
     /// Preallocated scratch for page-straddling row assembly & FP32 dequantization
     /// (zero hot-path heap allocations).
@@ -738,6 +1009,7 @@ pub const PleStore = struct {
         var embed_dim: u32 = 0;
         var max_row_code_bytes: usize = 0;
         var max_row_param_bytes: usize = 0;
+        var saw_engram_name = false;
 
         for (files) |*f| {
             for (f.parsed.entries) |*entry| {
@@ -746,6 +1018,11 @@ pub const PleStore = struct {
                 const geom = try rowGeometry(dtype, entry.shape[1]);
                 const layer_idx = try resolveLayerIndex(entry);
                 if (layer_idx >= MAX_LAYERS) return error.LayerOutOfRange;
+
+                const name = entry.nameSlice();
+                if (std.mem.startsWith(u8, name, "engram.") or std.mem.indexOf(u8, name, ".engram.") != null) {
+                    saw_engram_name = true;
+                }
 
                 if (embed_dim == 0) {
                     embed_dim = entry.shape[1];
@@ -759,6 +1036,12 @@ pub const PleStore = struct {
             }
         }
         if (total_shards == 0) return error.NoSparseTablesFound;
+
+        const detected_kind: MemoryTableKind = config.table_kind orelse
+            (if (saw_engram_name) .engram_conditional else .ple_ngram);
+        if (detected_kind == .engram_conditional and (embed_dim < 2 or (embed_dim % 2) != 0)) {
+            return error.InvalidEngramLayout;
+        }
 
         const num_layers = max_layer + 1;
         const layers = try allocator.alloc(LayerTable, num_layers);
@@ -840,6 +1123,7 @@ pub const PleStore = struct {
             .shards = shards,
             .layers = layers,
             .embed_dim = embed_dim,
+            .table_kind = detected_kind,
             .cache = cache,
             .row_code_scratch = row_code_scratch,
             .row_param_scratch = row_param_scratch,
@@ -1206,6 +1490,206 @@ pub const PleStore = struct {
         }
         scratch.loop_reuse_hits += 1;
         self.cache.stats.loop_scratch_hits += 1;
+    }
+
+    /// Returns the logical Engram key/value vector dimension `D` (`embed_dim / 2`)
+    /// when this store is configured as `.engram_conditional`.
+    pub fn engramValueDim(self: *const PleStore) Error!u32 {
+        if (self.table_kind != .engram_conditional) return error.TableKindMismatch;
+        if (self.embed_dim < 2 or (self.embed_dim % 2) != 0) return error.InvalidEngramLayout;
+        return self.embed_dim / 2;
+    }
+
+    /// Deterministically maps an Engram `(head_idx, ngram_order)` suffix lookup
+    /// to `(shard_index, local_row, global_row)` for `layer`.
+    pub fn mapEngramHead(
+        self: *const PleStore,
+        layer: u16,
+        tokens: []const u32,
+        head_idx: u8,
+        ngram_order: u8,
+    ) Error!ShardRowLocation {
+        if (head_idx >= ENGRAM_MAX_HEADS) return error.InvalidEngramHeads;
+        if (ngram_order < ENGRAM_MIN_ORDER or ngram_order > ENGRAM_MAX_ORDER) {
+            return error.InvalidEngramOrder;
+        }
+        const lt = try self.layerTable(layer);
+        const global_row = hashEngramHead(tokens, head_idx, ngram_order, lt.total_rows);
+        const resolved = try self.resolveRowShard(layer, global_row);
+        return .{
+            .shard_index = resolved.shard_index,
+            .local_row = resolved.local_row,
+            .global_row = global_row,
+        };
+    }
+
+    /// Submits non-blocking asynchronous `F_NOCACHE` page prefetches for a batch
+    /// of multi-head Engram token windows (`orders.len` in `2..8`, each order in `2..5`).
+    pub fn prefetchEngramBatch(
+        self: *PleStore,
+        layer: u16,
+        token_windows: []const []const u32,
+        orders: []const u8,
+    ) Error!usize {
+        if (self.table_kind != .engram_conditional) return error.TableKindMismatch;
+        if (token_windows.len == 0 or token_windows.len > MAX_BATCH_TOKENS) {
+            return error.InvalidBatchSize;
+        }
+        if (orders.len < ENGRAM_MIN_HEADS or orders.len > ENGRAM_MAX_HEADS) {
+            return error.InvalidEngramHeads;
+        }
+        for (orders) |ord| {
+            if (ord < ENGRAM_MIN_ORDER or ord > ENGRAM_MAX_ORDER) return error.InvalidEngramOrder;
+        }
+        const lt = try self.layerTable(layer);
+        _ = try self.cache.reapPrefetches();
+        var total: usize = 0;
+        for (token_windows) |win| {
+            for (orders, 0..) |ord, h| {
+                if (self.cache.async_reader.availableSlots() == 0) return total;
+                const row_idx = hashEngramHead(win, @intCast(h), ord, lt.total_rows);
+                total += try self.prefetchRowPages(layer, row_idx);
+            }
+        }
+        return total;
+    }
+
+    /// Ensures `scratch` holds all `m * num_heads` packed `(k_h, v_h)` Engram
+    /// rows for `layer` under mandatory `ADR-0019` `r = 0` Single-Lookup Isolation:
+    /// - `loop_step == 0`: hashes all heads, submits async prefetches, decodes
+    ///   rows once via `F_NOCACHE` + `PlePageCache` into `scratch`.
+    /// - `loop_step >= 1`: validates `scratch` and reuses cached `(k_h, v_h)` rows
+    ///   with strictly `0` cache/NVMe reads.
+    fn ensureEngramScratchLoaded(
+        self: *PleStore,
+        layer: u16,
+        token_windows: []const []const u32,
+        orders: []const u8,
+        loop_step: u32,
+        scratch: *LoopPleScratch,
+    ) Error!u32 {
+        if (self.table_kind != .engram_conditional) return error.TableKindMismatch;
+        const dim = try self.engramValueDim();
+        if (token_windows.len == 0 or token_windows.len > MAX_BATCH_TOKENS) {
+            return error.InvalidBatchSize;
+        }
+        if (orders.len < ENGRAM_MIN_HEADS or orders.len > ENGRAM_MAX_HEADS) {
+            return error.InvalidEngramHeads;
+        }
+        for (orders) |ord| {
+            if (ord < ENGRAM_MIN_ORDER or ord > ENGRAM_MAX_ORDER) return error.InvalidEngramOrder;
+        }
+        if (scratch.table_kind != .engram_conditional or
+            scratch.embed_dim != self.embed_dim or
+            layer >= scratch.max_layers or
+            token_windows.len > scratch.max_tokens or
+            orders.len > scratch.max_heads)
+        {
+            return error.LoopScratchMismatch;
+        }
+
+        const m = token_windows.len;
+        const num_heads = orders.len;
+
+        if (loop_step == 0) {
+            scratch.valid_tokens[layer] = 0;
+            scratch.valid_heads[layer] = 0;
+            const lt = try self.layerTable(layer);
+
+            var row_ids: [MAX_BATCH_TOKENS * ENGRAM_MAX_HEADS]u64 = undefined;
+            for (token_windows, 0..) |win, m_i| {
+                for (orders, 0..) |ord, h| {
+                    row_ids[m_i * num_heads + h] = hashEngramHead(win, @intCast(h), ord, lt.total_rows);
+                }
+            }
+
+            // Pipeline async F_NOCACHE page prefetches across all token x head rows.
+            const total_lookups = m * num_heads;
+            if (total_lookups > 1) {
+                for (0..total_lookups) |idx| {
+                    if (self.cache.async_reader.availableSlots() == 0) break;
+                    _ = try self.prefetchRowPages(layer, row_ids[idx]);
+                }
+            }
+
+            for (0..m) |m_i| {
+                for (0..num_heads) |h| {
+                    const dst_kv = scratch.engramRowSliceMut(layer, m_i, h);
+                    try self.decodeRowF32(layer, row_ids[m_i * num_heads + h], dst_kv);
+                }
+            }
+            scratch.valid_tokens[layer] = @intCast(m);
+            scratch.valid_heads[layer] = @intCast(num_heads);
+            self.cache.stats.loop_scratch_fills += 1;
+            return dim;
+        }
+
+        // loop_step >= 1: strictly wired LoopPleScratch reuse (0 NVMe reads).
+        if (scratch.valid_tokens[layer] != m or scratch.valid_heads[layer] != num_heads) {
+            return error.LoopScratchUnpopulated;
+        }
+        scratch.loop_reuse_hits += 1;
+        self.cache.stats.loop_scratch_hits += 1;
+        return dim;
+    }
+
+    /// M7 `C10` 196B Engram conditional memory lookup + context-gated FP16 injection:
+    ///
+    /// - Fetches multi-head `(k_h, v_h)` rows via `F_NOCACHE` + `PlePageCache`
+    ///   strictly once at `loop_step == 0` into `scratch` (`ADR-0019` Isolation #2);
+    ///   `loop_step >= 1` reuses `scratch` with `0` extra SSD reads while re-gating
+    ///   against the current `hidden_norm_f16`.
+    /// - Writes `out_f16[m_i, d] = sum_h sigmoid(dot(hidden_norm_f16[m_i], k_h) * inv_sqrt_d) * v_h[d]`.
+    /// - Zero dynamic heap allocations on the hot path.
+    pub fn lookupEngramConditional(
+        self: *PleStore,
+        layer: u16,
+        token_windows: []const []const u32,
+        orders: []const u8,
+        hidden_norm_f16: []const f16,
+        loop_step: u32,
+        scratch: *LoopPleScratch,
+        out_f16: []f16,
+    ) Error!void {
+        const dim = try self.ensureEngramScratchLoaded(layer, token_windows, orders, loop_step, scratch);
+        const d_usize: usize = dim;
+        const need = std.math.mul(usize, token_windows.len, d_usize) catch return error.Overflow;
+        if (hidden_norm_f16.len < need or out_f16.len < need) return error.BufferTooSmall;
+
+        const num_heads: u8 = @intCast(orders.len);
+        for (0..token_windows.len) |m_i| {
+            const h_norm = hidden_norm_f16[m_i * d_usize ..][0..d_usize];
+            const kv_heads = scratch.engramTokenHeadsConst(layer, m_i, orders.len);
+            const out_row = out_f16[m_i * d_usize ..][0..d_usize];
+            try applyEngramContextGateF16(h_norm, kv_heads, num_heads, dim, out_row);
+        }
+        self.cache.stats.engram_lookups += token_windows.len;
+    }
+
+    /// FP32 variant of `lookupEngramConditional` for FP32 residual accumulators.
+    pub fn lookupEngramConditionalF32(
+        self: *PleStore,
+        layer: u16,
+        token_windows: []const []const u32,
+        orders: []const u8,
+        hidden_norm_f32: []const f32,
+        loop_step: u32,
+        scratch: *LoopPleScratch,
+        out_f32: []f32,
+    ) Error!void {
+        const dim = try self.ensureEngramScratchLoaded(layer, token_windows, orders, loop_step, scratch);
+        const d_usize: usize = dim;
+        const need = std.math.mul(usize, token_windows.len, d_usize) catch return error.Overflow;
+        if (hidden_norm_f32.len < need or out_f32.len < need) return error.BufferTooSmall;
+
+        const num_heads: u8 = @intCast(orders.len);
+        for (0..token_windows.len) |m_i| {
+            const h_norm = hidden_norm_f32[m_i * d_usize ..][0..d_usize];
+            const kv_heads = scratch.engramTokenHeadsConst(layer, m_i, orders.len);
+            const out_row = out_f32[m_i * d_usize ..][0..d_usize];
+            try applyEngramContextGateF32(h_norm, kv_heads, num_heads, dim, out_row);
+        }
+        self.cache.stats.engram_lookups += token_windows.len;
     }
 };
 
@@ -1725,4 +2209,214 @@ test "ADR-0019 r=0 Single-Lookup Loop Isolation: nvme_reads_delta == 0 across r 
         error.LoopScratchUnpopulated,
         store.lookupForLoopStep(0, &rows, 0.5, 1, &loop_scratch, &unpop_out),
     );
+}
+
+test "C10 Engram hashEngramHead determinism, multi-head independence and sharded mapping" {
+    const seq_a = [_]u32{ 11, 22, 33, 44, 55 };
+    const seq_b = [_]u32{ 99, 22, 33, 44, 55 };
+    const total_rows: u64 = 1_000_003;
+
+    // Order 4 depends only on the trailing 4 tokens (22, 33, 44, 55).
+    for (0..ENGRAM_MAX_HEADS) |h_usize| {
+        const h: u8 = @intCast(h_usize);
+        const r_a = hashEngramHead(&seq_a, h, 4, total_rows);
+        const r_b = hashEngramHead(&seq_b, h, 4, total_rows);
+        try std.testing.expectEqual(r_a, r_b);
+        try std.testing.expect(r_a < total_rows);
+        // Order 5 distinguishes prefix 11 vs 99.
+        const r5_a = hashEngramHead(&seq_a, h, 5, total_rows);
+        const r5_b = hashEngramHead(&seq_b, h, 5, total_rows);
+        try std.testing.expect(r5_a != r5_b);
+    }
+
+    // Different heads for the same (tokens, order) map to distinct rows.
+    const h0 = hashEngramHead(&seq_a, 0, 3, total_rows);
+    const h1 = hashEngramHead(&seq_a, 1, 3, total_rows);
+    const h2 = hashEngramHead(&seq_a, 2, 3, total_rows);
+    const h3 = hashEngramHead(&seq_a, 3, 3, total_rows);
+    try std.testing.expect(h0 != h1 and h1 != h2 and h2 != h3 and h0 != h3);
+
+    // BOS left-padding for short prefixes.
+    const short = [_]u32{42};
+    const r_short_2 = hashEngramHead(&short, 0, 2, total_rows);
+    const r_short_4 = hashEngramHead(&short, 0, 4, total_rows);
+    try std.testing.expect(r_short_2 != r_short_4);
+
+    // Sharded mapping across uneven shard counts.
+    const shards = [_]u64{ 100, 250, 150 };
+    const loc = try mapEngramHeadToShardRow(&seq_a, 3, 4, &shards);
+    try std.testing.expectEqual(hashEngramHead(&seq_a, 3, 4, 500), loc.global_row);
+    try std.testing.expect(loc.shard_index < shards.len);
+    try std.testing.expect(loc.local_row < shards[loc.shard_index]);
+
+    try std.testing.expectError(error.InvalidEngramOrder, mapEngramHeadToShardRow(&seq_a, 0, 1, &shards));
+    try std.testing.expectError(error.InvalidEngramOrder, mapEngramHeadToShardRow(&seq_a, 0, 6, &shards));
+    try std.testing.expectError(error.InvalidEngramHeads, mapEngramHeadToShardRow(&seq_a, ENGRAM_MAX_HEADS, 3, &shards));
+}
+
+test "C10 Engram multi-head context-gated lookup, multi-shard F_NOCACHE, and ADR-0019 r=0 loop isolation" {
+    const gpa = std.testing.allocator;
+    const val_dim: u32 = 64;
+    const packed_dim: u32 = val_dim * 2; // [k_h (64) || v_h (64)] per row
+
+    // Layer 0 spans two separate .amf shard files (q4_affine + f16) using engram.* naming.
+    const specs_s0 = [_]SyntheticTableSpec{
+        .{ .name = "engram.layers.0.shard.0.weight", .layer = 0, .dtype = .q4_affine, .num_rows = 64, .embed_dim = packed_dim, .seed = 701 },
+    };
+    const specs_s1 = [_]SyntheticTableSpec{
+        .{ .name = "engram.layers.0.shard.1.weight", .layer = 0, .dtype = .f16, .num_rows = 64, .embed_dim = packed_dim, .seed = 702 },
+    };
+
+    const ref_s0 = try gpa.alloc(f32, 64 * packed_dim);
+    defer gpa.free(ref_s0);
+    const ref_s1 = try gpa.alloc(f32, 64 * packed_dim);
+    defer gpa.free(ref_s1);
+    var refs_s0 = [_][]f32{ref_s0};
+    var refs_s1 = [_][]f32{ref_s1};
+
+    const img_s0 = try buildSyntheticPleAmf(gpa, &specs_s0, &refs_s0);
+    defer gpa.free(img_s0);
+    const img_s1 = try buildSyntheticPleAmf(gpa, &specs_s1, &refs_s1);
+    defer gpa.free(img_s1);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "engram-s0.amf", .data = img_s0 });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "engram-s1.amf", .data = img_s1 });
+
+    var p0_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var p1_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p0_raw = try std.fmt.bufPrint(p0_buf[0 .. p0_buf.len - 1], ".zig-cache/tmp/{s}/engram-s0.amf", .{tmp.sub_path});
+    p0_buf[p0_raw.len] = 0;
+    const p1_raw = try std.fmt.bufPrint(p1_buf[0 .. p1_buf.len - 1], ".zig-cache/tmp/{s}/engram-s1.amf", .{tmp.sub_path});
+    p1_buf[p1_raw.len] = 0;
+    const paths = [_][:0]const u8{ p0_buf[0..p0_raw.len :0], p1_buf[0..p1_raw.len :0] };
+
+    var store = try PleStore.open(gpa, &paths, .{
+        .cache = .{
+            .cache_pages = 8,
+            .max_inflight = 4,
+            .io_backend = .auto,
+            .budget_override = testBudget(8 * page.APPLE_PAGE_SIZE),
+        },
+        .verify_blob_crcs = true,
+    });
+    defer store.deinit(gpa);
+
+    try std.testing.expectEqual(MemoryTableKind.engram_conditional, store.table_kind);
+    try std.testing.expectEqual(val_dim, try store.engramValueDim());
+    try std.testing.expectEqual(@as(u64, 128), try store.layerTotalRows(0));
+    try std.testing.expectEqual(@as(usize, 2), try store.layerShardCount(0));
+
+    const orders = [_]u8{ 2, 3, 4, 5 }; // 4 Engram heads spanning orders 2..5
+    var scratch = try LoopPleScratch.initEngram(
+        gpa,
+        1,
+        8,
+        @intCast(orders.len),
+        val_dim,
+        testBudget(8 * page.APPLE_PAGE_SIZE),
+    );
+    defer scratch.deinit(gpa);
+
+    const tok0 = [_]u32{ 10, 20, 30, 40, 50 };
+    const tok1 = [_]u32{ 5, 15, 25, 35, 45 };
+    const tok2 = [_]u32{ 7, 14 };
+    const windows = [_][]const u32{ &tok0, &tok1, &tok2 };
+    const m = windows.len;
+
+    var hidden_r0: [m * val_dim]f16 = undefined;
+    var hidden_r2: [m * val_dim]f16 = undefined;
+    for (0..m) |mi| {
+        for (0..val_dim) |d| {
+            const v0: f32 = @sin(@as(f32, @floatFromInt(mi * 37 + d + 1))) * 0.5;
+            const v2: f32 = @cos(@as(f32, @floatFromInt(mi * 19 + d + 3))) * 0.5;
+            hidden_r0[mi * val_dim + d] = @floatCast(v0);
+            hidden_r2[mi * val_dim + d] = @floatCast(v2);
+        }
+    }
+
+    // Calling loop_step >= 1 before loop_step == 0 must fail cleanly without touching NVMe.
+    var out_unpop: [m * val_dim]f16 = @splat(0.0);
+    try std.testing.expectError(
+        error.LoopScratchUnpopulated,
+        store.lookupEngramConditional(0, &windows, &orders, &hidden_r0, 1, &scratch, &out_unpop),
+    );
+    try std.testing.expectEqual(@as(u64, 0), store.stats().nvme_reads);
+
+    // Optional async prefetch + r = 0 lookup.
+    _ = try store.prefetchEngramBatch(0, &windows, &orders);
+    var out_r0: [m * val_dim]f16 = @splat(0.0);
+    try store.lookupEngramConditional(0, &windows, &orders, &hidden_r0, 0, &scratch, &out_r0);
+
+    const nvme_reads_after_r0 = store.stats().nvme_reads;
+    try std.testing.expect(nvme_reads_after_r0 > 0);
+    try std.testing.expectEqual(@as(u64, m), store.stats().engram_lookups);
+
+    // Reference check for r = 0 directly against exact packed (k_h, v_h) rows.
+    const inv_sqrt_d: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(val_dim)));
+    for (0..m) |mi| {
+        var exp_row: [val_dim]f32 = @splat(0.0);
+        for (orders, 0..) |ord, h| {
+            const g_row = hashEngramHead(windows[mi], @intCast(h), ord, 128);
+            const row_ref: []const f32 = if (g_row < 64)
+                ref_s0[@as(usize, @intCast(g_row)) * packed_dim ..][0..packed_dim]
+            else
+                ref_s1[@as(usize, @intCast(g_row - 64)) * packed_dim ..][0..packed_dim];
+            const k_h = row_ref[0..val_dim];
+            const v_h = row_ref[val_dim..packed_dim];
+            var dot: f32 = 0.0;
+            for (0..val_dim) |d| {
+                dot += @as(f32, @floatCast(hidden_r0[mi * val_dim + d])) * k_h[d];
+            }
+            const gate = 1.0 / (1.0 + @exp(-(dot * inv_sqrt_d)));
+            for (0..val_dim) |d| {
+                exp_row[d] += gate * v_h[d];
+            }
+        }
+        for (0..val_dim) |d| {
+            const got: f32 = @floatCast(out_r0[mi * val_dim + d]);
+            try std.testing.expectApproxEqAbs(exp_row[d], got, 5e-3);
+        }
+    }
+
+    // Flush PlePageCache completely — loop_step >= 1 MUST issue 0 NVMe reads!
+    try store.clearCache();
+
+    // r = 1 with identical hidden_norm_f16 -> bit-exact parity with r = 0!
+    var out_r1: [m * val_dim]f16 = @splat(0.0);
+    try store.lookupEngramConditional(0, &windows, &orders, &hidden_r0, 1, &scratch, &out_r1);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&out_r0), std.mem.sliceAsBytes(&out_r1));
+
+    // r = 2 with updated hidden_norm_f16 -> dynamically re-gates cached (k_h, v_h) with 0 NVMe reads!
+    var out_r2: [m * val_dim]f16 = @splat(0.0);
+    try store.lookupEngramConditional(0, &windows, &orders, &hidden_r2, 2, &scratch, &out_r2);
+    for (0..m) |mi| {
+        var exp_row: [val_dim]f32 = @splat(0.0);
+        for (orders, 0..) |ord, h| {
+            const g_row = hashEngramHead(windows[mi], @intCast(h), ord, 128);
+            const row_ref: []const f32 = if (g_row < 64)
+                ref_s0[@as(usize, @intCast(g_row)) * packed_dim ..][0..packed_dim]
+            else
+                ref_s1[@as(usize, @intCast(g_row - 64)) * packed_dim ..][0..packed_dim];
+            const k_h = row_ref[0..val_dim];
+            const v_h = row_ref[val_dim..packed_dim];
+            var dot: f32 = 0.0;
+            for (0..val_dim) |d| {
+                dot += @as(f32, @floatCast(hidden_r2[mi * val_dim + d])) * k_h[d];
+            }
+            const gate = 1.0 / (1.0 + @exp(-(dot * inv_sqrt_d)));
+            for (0..val_dim) |d| {
+                exp_row[d] += gate * v_h[d];
+            }
+        }
+        for (0..val_dim) |d| {
+            const got: f32 = @floatCast(out_r2[mi * val_dim + d]);
+            try std.testing.expectApproxEqAbs(exp_row[d], got, 5e-3);
+        }
+    }
+
+    // ADR-0019 invariant: strictly ZERO NVMe reads across r = 1 and r = 2!
+    try std.testing.expectEqual(nvme_reads_after_r0, store.stats().nvme_reads);
+    try std.testing.expectEqual(@as(u64, 2), scratch.loop_reuse_hits);
 }

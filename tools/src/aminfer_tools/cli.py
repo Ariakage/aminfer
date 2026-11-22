@@ -24,6 +24,16 @@ from aminfer_tools.amf import (
 )
 from aminfer_tools.gsq_rco import gsq_convert
 from aminfer_tools.qwen4_exp import pack_qwen4_checkpoint
+from aminfer_tools.deepseek41 import (
+    DEEPSEEK41_PRESETS,
+    VALID_DEEPSEEK41_DTYPES,
+    VALID_PARTITION_STRATEGIES,
+    VALID_TARGET_TIERS,
+    HardwareTierError,
+    convert_deepseek41_checkpoint,
+    generate_synth_deepseek41_bundle,
+    partition_deepseek41_amf_shards,
+)
 from aminfer_tools import ngram as ngram_mod
 from aminfer_tools.coreml import (
     COREML_KINDS,
@@ -492,6 +502,142 @@ def _build_parser() -> argparse.ArgumentParser:
     sloop.add_argument("--rank", type=int, default=None, help="Override Step-LoRA rank (1..64)")
     sloop.add_argument("--model-id", default=None, help="Override model identifier stored in .amf header")
     sloop.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed (default: 42)")
+
+    sds41 = sub.add_parser(
+        "synth-deepseek41",
+        help=(
+            "Generate deterministic synthetic deepseek41 (DeepSeek-V4.1-Flash-1017) CED backbone .amf, "
+            "sharded Engram .amf, DSpark .amf, config.json and tokenizer.json (W11, ADR-0015)"
+        ),
+    )
+    sds41.add_argument(
+        "--preset",
+        default="tiny-deepseek41",
+        choices=sorted(DEEPSEEK41_PRESETS.keys()),
+        help="deepseek41 geometry preset (tiny-deepseek41, scale-deepseek41-512e, or full-deepseek41-552b)",
+    )
+    sds41.add_argument(
+        "--output-dir",
+        required=True,
+        type=pathlib.Path,
+        help="Directory where model.amf, engram*.amf, dspark.amf, config.json and tokenizer.json are written",
+    )
+    sds41.add_argument("--num-encoder-layers", type=int, default=None, help="Override causal encoder layer count")
+    sds41.add_argument("--num-decoder-layers", type=int, default=None, help="Override causal decoder layer count")
+    sds41.add_argument("--hidden-size", type=int, default=None, help="Override hidden_size (multiple of 64)")
+    sds41.add_argument("--num-experts", type=int, default=None, help="Override routed expert count (1..1024)")
+    sds41.add_argument("--encoder-top-k", type=int, default=None, help="Override encoder MoE top-k")
+    sds41.add_argument("--decoder-top-k", type=int, default=None, help="Override decoder MoE top-k")
+    sds41.add_argument("--vocab-size", type=int, default=None, help="Override vocab_size")
+    sds41.add_argument("--kv-lora-rank", type=int, default=None, help="Override MLA kv_lora_rank (multiple of 32)")
+    sds41.add_argument("--engram-heads", type=int, default=None, help="Override Engram head count (2..8)")
+    sds41.add_argument("--engram-shards", type=int, default=None, help="Override number of SPARSE_TABLE Engram shards")
+    sds41.add_argument("--engram-rows", type=int, default=None, help="Override total Engram table row count")
+    sds41.add_argument(
+        "--dtype",
+        choices=VALID_DEEPSEEK41_DTYPES,
+        default=None,
+        help="Override backbone weight dtype (q3_affine, q4_affine, bf16)",
+    )
+    sds41.add_argument("--no-dspark", action="store_true", help="Omit DSpark proposer head .amf")
+    sds41.add_argument(
+        "--world-size",
+        type=int,
+        default=1,
+        help="If > 1, also partition backbone experts across N peer rank shards (default: 1)",
+    )
+    sds41.add_argument(
+        "--partition-strategy",
+        choices=VALID_PARTITION_STRATEGIES,
+        default="contiguous_by_rank",
+        help="Expert partition strategy when --world-size > 1 (default: contiguous_by_rank)",
+    )
+    sds41.add_argument("--cold-experts", default=None, help="Comma-separated LAYER:EXPERT cold pairs")
+    sds41.add_argument("--cold-experts-per-layer", type=int, default=0, help="Mark last N experts per layer as cold")
+    sds41.add_argument("--model-id", default=None, help="Override model identifier stored in .amf header")
+    sds41.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed (default: 42)")
+
+    pds41 = sub.add_parser(
+        "pack-deepseek41",
+        help=(
+            "Stream a DeepSeek-V4.1-Flash-1017 multi-shard safetensors checkpoint into 16 KiB-aligned "
+            ".amf v0 backbone, sharded Engram SPARSE_TABLE, and optional DSpark / multi-rank shards (W11)"
+        ),
+    )
+    pds41.add_argument("--input", required=True, type=pathlib.Path, help="Input safetensors file, index.json, or directory")
+    pds41.add_argument("--output", required=True, type=pathlib.Path, help="Output backbone .amf path")
+    pds41.add_argument("--model-id", default="deepseek41", help="Model identifier stored in .amf header")
+    pds41.add_argument(
+        "--dtype",
+        choices=("auto",) + VALID_DEEPSEEK41_DTYPES,
+        default="auto",
+        help="Backbone weight target dtype: auto, q3_affine, q4_affine, or bf16 (default: auto)",
+    )
+    pds41.add_argument(
+        "--dtype-mode",
+        choices=DTYPE_MODES,
+        default="auto",
+        help="Unquantized float precision conversion mode (auto, f16, bf16)",
+    )
+    pds41.add_argument("--group-size", type=int, default=64, help="Quantization group size (default: 64)")
+    pds41.add_argument(
+        "--quant-profile",
+        choices=QUANT_PROFILES,
+        default="uniform",
+        help="Quantization profile: uniform (default) or gsq-rco (hybrid mixed-bit GSQ+RCO)",
+    )
+    pds41.add_argument("--target-bits", type=float, default=None, help="Average target bits for --quant-profile gsq-rco")
+    pds41.add_argument("--no-rco", action="store_true", help="Disable RCO refinement when using --quant-profile gsq-rco")
+    pds41.add_argument("--manifest", type=pathlib.Path, default=None, help="Optional JSON manifest path for gsq-rco")
+    pds41.add_argument("--cold-experts", default=None, help="Comma-separated LAYER:EXPERT cold pairs")
+    pds41.add_argument("--heat-profile", type=pathlib.Path, default=None, help="JSON expert heat profile path")
+    pds41.add_argument("--cold-experts-per-layer", type=int, default=None, help="Cold experts per layer from heat profile")
+    pds41.add_argument("--all-experts-cold", action="store_true", help="Mark every routed expert as cold_expert")
+    pds41.add_argument("--sme2-pack", choices=SME2_PACK_MODES, default="none", help="ARMv9 SME2 panel64 pre-packing mode")
+    pds41.add_argument("--lut16-sme2", action="store_true", help="Pack eligible SME2 weights with non-uniform ZT0 LUT16")
+    pds41.add_argument("--engram-output", type=pathlib.Path, default=None, help="Base output path for Engram SPARSE_TABLE .amf")
+    pds41.add_argument("--engram-shards", type=int, default=1, help="Number of Engram .amf shards (default: 1)")
+    pds41.add_argument("--dspark-output", type=pathlib.Path, default=None, help="Output path for extracted DSpark .amf head")
+    pds41.add_argument("--config-output", type=pathlib.Path, default=None, help="Optional output path for normalized config.json")
+    pds41.add_argument(
+        "--target-tier",
+        choices=VALID_TARGET_TIERS,
+        default="auto",
+        help="Target hardware tier for ADR-0015 wired memory validation (default: auto)",
+    )
+    pds41.add_argument("--host-ram-gib", type=float, default=None, help="Optional host RAM (GiB) override for tier check")
+    pds41.add_argument("--world-size", type=int, default=1, help="Export multi-rank expert shards for N peer nodes (default: 1)")
+    pds41.add_argument("--rank-dir", type=pathlib.Path, default=None, help="Directory for multi-rank shards when --world-size > 1")
+    pds41.add_argument(
+        "--partition-strategy",
+        choices=VALID_PARTITION_STRATEGIES,
+        default="contiguous_by_rank",
+        help="Expert partition strategy when --world-size > 1",
+    )
+    pds41.add_argument("--allow-tier-override", action="store_true", help="Bypass ADR-0015 hardware-tier rejection (expert use)")
+    pds41.add_argument("--workers", type=int, default=1, help="Worker threads for GSQ+RCO quantization")
+
+    part = sub.add_parser(
+        "partition-experts",
+        help=(
+            "Split routed MoE experts in a .amf file across world_size peer ranks and emit "
+            "cluster_manifest.json with ExpertSource.thunderbolt_peer metadata (W11, X1-X3)"
+        ),
+    )
+    part.add_argument("--input", required=True, type=pathlib.Path, help="Input .amf backbone file")
+    part.add_argument("--world-size", required=True, type=int, help="Number of peer ranks (1..16)")
+    part.add_argument("--output-dir", required=True, type=pathlib.Path, help="Output directory for rank shards and cluster_manifest.json")
+    part.add_argument(
+        "--strategy",
+        choices=VALID_PARTITION_STRATEGIES,
+        default="contiguous_by_rank",
+        help="Expert partitioning strategy (contiguous_by_rank or round_robin)",
+    )
+    part.add_argument(
+        "--replicate-backbone",
+        action="store_true",
+        help="Replicate non-expert backbone tensors onto every worker rank shard (default: rank 0 only)",
+    )
 
     draft = sub.add_parser(
         "synth-draft",
@@ -1131,6 +1277,129 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"synthesized {cfg.mode} loop bundle ({len(bundle.metas)} tensors, "
             f"core=[{cfg.start_layer},{cfg.end_layer})x{cfg.max_loops}, {bundle.total_bytes} bytes) "
             f"into {bundle.amf_path.parent}"
+        )
+        return 0
+
+    if args.command == "synth-deepseek41":
+        cfg = DEEPSEEK41_PRESETS[args.preset]
+        overrides = {}
+        if args.num_encoder_layers is not None:
+            overrides["num_encoder_layers"] = args.num_encoder_layers
+            overrides["csa2_modes"] = ()
+        if args.num_decoder_layers is not None:
+            overrides["num_decoder_layers"] = args.num_decoder_layers
+            overrides["csa2_modes"] = ()
+        if args.hidden_size is not None:
+            overrides["hidden_size"] = args.hidden_size
+        if args.num_experts is not None:
+            overrides["num_experts"] = args.num_experts
+        if args.encoder_top_k is not None:
+            overrides["encoder_moe_top_k"] = args.encoder_top_k
+        if args.decoder_top_k is not None:
+            overrides["decoder_moe_top_k"] = args.decoder_top_k
+        if args.vocab_size is not None:
+            overrides["vocab_size"] = args.vocab_size
+        if args.kv_lora_rank is not None:
+            overrides["kv_lora_rank"] = args.kv_lora_rank
+        if args.engram_heads is not None:
+            overrides["engram_num_heads"] = args.engram_heads
+            base_orders = (2, 3, 4, 5, 2, 3, 4, 5)
+            overrides["engram_orders"] = base_orders[: args.engram_heads]
+        if args.engram_shards is not None:
+            overrides["engram_shards"] = args.engram_shards
+        if args.engram_rows is not None:
+            overrides["engram_num_rows"] = args.engram_rows
+        if args.dtype is not None:
+            overrides["dtype"] = args.dtype
+        if args.no_dspark:
+            overrides["include_dspark"] = False
+        if args.model_id is not None:
+            overrides["model_id"] = args.model_id
+        if overrides:
+            cfg = cfg.with_overrides(**overrides)
+        cold = _parse_cold_experts(args.cold_experts)
+        try:
+            bundle = generate_synth_deepseek41_bundle(
+                args.output_dir,
+                preset=args.preset,
+                config=cfg,
+                seed=args.seed,
+                cold_experts=cold,
+                cold_experts_per_layer=args.cold_experts_per_layer,
+                world_size=args.world_size,
+                partition_strategy=args.partition_strategy,
+            )
+        except HardwareTierError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        shard_note = (
+            f", {len(bundle.rank_amf_paths)} peer rank shard(s)"
+            if bundle.rank_amf_paths
+            else ""
+        )
+        print(
+            f"synthesized deepseek41 ({len(bundle.metas)} backbone tensors, "
+            f"{len(bundle.engram_paths)} Engram shard(s), "
+            f"{len(bundle.dspark_metas)} DSpark tensors{shard_note}, "
+            f"{bundle.total_bytes} bytes) into {bundle.amf_path.parent}"
+        )
+        return 0
+
+    if args.command == "pack-deepseek41":
+        cold = _parse_cold_experts(args.cold_experts)
+        try:
+            rep = convert_deepseek41_checkpoint(
+                args.input,
+                args.output,
+                model_id=args.model_id,
+                target_dtype=args.dtype,
+                dtype_mode=args.dtype_mode,
+                group_size=args.group_size,
+                quant_profile=args.quant_profile,
+                target_bits=args.target_bits,
+                use_rco=not args.no_rco,
+                manifest_path=args.manifest,
+                cold_experts=cold,
+                all_experts_cold=args.all_experts_cold,
+                heat_profile=args.heat_profile,
+                cold_experts_per_layer=args.cold_experts_per_layer,
+                sme2_pack=args.sme2_pack,
+                lut16_sme2=args.lut16_sme2,
+                engram_output=args.engram_output,
+                engram_shards=args.engram_shards,
+                dspark_output=args.dspark_output,
+                config_output=args.config_output,
+                target_tier=args.target_tier,
+                host_ram_gib=args.host_ram_gib,
+                world_size=args.world_size,
+                rank_dir=args.rank_dir,
+                partition_strategy=args.partition_strategy,
+                allow_tier_override=args.allow_tier_override,
+                workers=args.workers,
+            )
+        except HardwareTierError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"packed deepseek41 ({len(rep.backbone_metas)} backbone tensors, "
+            f"{len(rep.engram_paths)} Engram shard(s), "
+            f"{len(rep.dspark_metas)} DSpark tensors, "
+            f"tier={rep.tier_check.target_tier} world_size={rep.tier_check.world_size}) "
+            f"into {rep.backbone_amf}"
+        )
+        return 0
+
+    if args.command == "partition-experts":
+        rep = partition_deepseek41_amf_shards(
+            args.input,
+            args.world_size,
+            args.output_dir,
+            strategy=args.strategy,
+            replicate_backbone=args.replicate_backbone,
+        )
+        print(
+            f"partitioned {rep.num_experts} experts across {rep.world_size} rank(s) "
+            f"({rep.strategy}) into {rep.output_dir} (manifest={rep.manifest_path.name})"
         )
         return 0
 
