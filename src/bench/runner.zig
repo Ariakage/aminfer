@@ -6440,7 +6440,8 @@ pub const M6Report = struct {
         const sw_delta = vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after);
         const pg_delta = vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after);
         try out.print(
-            \\\nm6.swap.swapouts_delta           {d}
+            \\
+            \\m6.swap.swapouts_delta           {d}
             \\m6.swap.pageouts_delta           {d}
             \\m6.swap.status                   {s}
             \\
@@ -6787,7 +6788,7 @@ fn runM6OpsBench(allocator: std.mem.Allocator, cfg: M6Config) !M6OpsReport {
                 .num_q_heads = cfg.qsa_q_heads,
                 .num_kv_heads = cfg.qsa_kv_heads,
                 .head_dim = cfg.qsa_head_dim,
-                .rotary_dim = cfg.qsa_head_dim,
+                .rotary_dim = 64,
                 .mrope = hybrid.MropeSection.QWEN38_DEFAULT,
                 .rms_eps = 1e-6,
                 .rope_theta = 1_000_000.0,

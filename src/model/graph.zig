@@ -2445,6 +2445,8 @@ pub const GraphModel = struct {
             // QK-Norm + YaRN + Interleaved 3D MRoPE: at `r = 0` write into `tree_k/tree_v`;
             // at `r >= 1` rotate `Q` in-place and route K/V output to scratch `k_bind/v_bind`
             // so `tree_k/tree_v` preserve `r = 0` K/V untouched.
+            const mrope_rot: u32 = (self.config.mrope_section.section[0] + self.config.mrope_section.section[1] + self.config.mrope_section.section[2]) * 2;
+            const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= self.config.head_dim) mrope_rot else self.config.head_dim;
             try self.hybrid_pipes.encodeQsaTreeRope(f, .{
                 .q = self.q_bind,
                 .k = self.k_bind,
@@ -2458,7 +2460,7 @@ pub const GraphModel = struct {
                 .num_q_heads = self.config.num_attention_heads,
                 .num_kv_heads = self.config.num_key_value_heads,
                 .head_dim = self.config.head_dim,
-                .rotary_dim = self.config.head_dim,
+                .rotary_dim = eff_rot_dim,
                 .mrope = self.config.mrope_section,
                 .rms_eps = self.config.rms_norm_eps,
                 .rope_theta = self.config.rope_theta,
