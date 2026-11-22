@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M6.8 — configurable wide-chunk GPU prefill, lossless `prompt_tail` pruning, serving QoS, ChatML message-boundary prefix caching, live non-anonymous RAM admission, and startup `.metallib` canary (`R9`, `G15`, `G16`, `C15`; [ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)) completed (2026-11-22); next: **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`)**.
+M6.8 — configurable wide-chunk GPU prefill, lossless `prompt_tail` pruning, serving QoS, ChatML message-boundary prefix caching, live non-anonymous RAM admission, and startup `.metallib` canary (`R9`, `G15`, `G16`, `C15`; [ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)) completed (2026-11-22); next: **M6.9 — single-binary multi-generation Apple Silicon adaptation (`Apple9` + `Apple10+` GPU `NAX` TensorOps, canary-guarded fallback, and chip-parameterized bandwidth/crossover profiles; `G17`, `C16`, Spike `S8`; [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))**, followed by **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`)**.
 
 ## Milestones
 
@@ -26,6 +26,7 @@ Status-row IDs refer to [status.md](status.md).
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`), recurrent depth & heterogeneous MoE scaling | R6, W9, W10, W16, W17, G7–G9, G10 (GR), D12, D13, C10 (PLE) | Composable operator graph + `LoopSchedule` (`GDN S_tmp` isolation, `SelfSpecRecurrent`, L2 SME2 `Step-LoRA`); synthetic + scale-calibrated `qwen4_exp` (GDN + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end without swap; `Qwen3-30B-A3B` & 512-expert GSQ+RCO + `ZT0` non-uniform LUTs and `Placement.cpu_sme2` draft heads benchmarked | Completed |
 | M6.5 | Continuous batching, long-context KV tiering & zero-copy multimodal ingress | R5, R8, G14, C14 | Server iteration-level continuous batching (`M > 1` slots per GPU/SME2 pass), shared prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang` packs, and `VideoToolbox → IOSurface → MTLTexture` zero-copy vision/video ingress verified without swap | Completed |
 | M6.8 | Wide-chunk GPU prefill, `prompt_tail` pruning, serving QoS & live-RAM / `.metallib` guards | R9, G15, G16, C15 | Default-on `--gpu-prefill-mode wide\|tree64` (`512+` FlashAttention + `BM=64, BN=64` GEMM, direct `KvTile` write) & lossless `prompt_tail` pruning verified bit-consistent vs `tree64`; single-request wide-prefill/`verifyTree` scratch aliasing; default-on `--decode-share`, `--adaptive-prefill-narrow`, and `--message-boundary-cache` `PrefixCache` checkpoints benchmarked under concurrent load; `HOST_VM_INFO64` non-anonymous live RAM soft cache scaling (`+ --strict-live-ram`) & startup `.metallib` numerical canary (`~0.19–0.24 ms` warm in-buffer / `~1.3–3.8 ms` cold first-submit) + `Apple10` `NAX` hook verified without swap | Completed |
+| M6.9 | Multi-generation Apple Silicon (`Apple9` + `Apple10+` GPU `NAX`) single-binary adaptation | G17, C16 | `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`) `f16`/`bf16` & staged group-64 `q2`/`q3`/`q4` kernels compiled into unified `aminfer.metallib` with lazy `MTL4Compiler` `Apple10`/`Apple11` selection (`--prefill-matmul-backend auto\|simdgroup\|nax`), `G16` canary auto-fallback to `simdgroup_apple9` (`+ --strict-nax`), chip-parameterized `spec_bus_gbs` (`--bus-bandwidth-gbs`), and runtime prefill/draft crossover calibration verified with zero M4 regression (`Apple10+` HW throughput gated on Spike `S8`) | Planned |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
 ## Spikes
@@ -42,6 +43,7 @@ Confirmed, or before an accepted design is tuned.
 | S5 | Unique experts per layer versus draft-tree size for Qwen3-30B-A3B; effective bandwidth of deduplicated vs per-slot expert kernels | [ADR-0009](decisions/0009-expert-byte-budget-tree-pruning.md) | M3 | Closed |
 | S6 | ANE attention block: CoreML compilation, static shapes for a growing KV length, fp16 numerics, throughput vs GPU | [ADR-0010](decisions/0010-hybrid-wavefront-prefill.md), A3 | M4 | Closed |
 | S7 | Bare-metal M4+ SME2 throughput (`M=1..4` `ZT0-LUT+Dot`, `M=5..16` `1×4` `ZA`, `M>=32` `2×2` `ZA`) vs `Accelerate`/`BNNS`, P-cluster threads-per-cluster saturation, `otool` zero-spill check, and unified-memory bus contention gate vs Metal GPU | [ADR-0018](decisions/0018-bare-metal-armv9-sme2-engine.md), C13 | M4.5 | Closed |
+| S8 | `Apple10+` (M5+) `NAX` `mpp::tensor_ops::matmul2d` (`f16`/`bf16`, staged group-64 `q2`/`q3`/`q4_affine`, `FP4` `e2m1`) TFLOP/s, numerical parity, `G16` canary margins vs offline `metalfe`, and GPU-only vs ANE wavefront prefill crossover on physical `Apple10+` silicon | [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md), G17, C16 | M6.9 | Open (requires Apple10+ host) |
 
 ## M0 task list
 
@@ -622,6 +624,17 @@ evict-first `PrefixCache` checkpoints (`P1-A`), live `HOST_VM_INFO64`
 non-anonymous RAM soft cache auto-sizing plus `--strict-live-ram` (`P1-B`), and
 a startup `.metallib` numerical canary (`~0.19–0.24 ms` warm in-buffer / `~1.3–3.8 ms`
 cold first-submit) plus `Apple10` (M5 `NAX`) capability/dispatch hook reservation (`P2`).
+After M6.8 close-out on 2026-11-22, the user confirmed
+[ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md),
+scheduling Milestone **M6.9** (`G17`, `C16`, Spike `S8`) before M7 for
+single-binary / single-`.metallib` multi-generation Apple Silicon adaptation:
+co-packaging `Apple9` (`simdgroup_matrix`) and `Apple10+`
+(`MetalPerformancePrimitives` `mpp::tensor_ops::matmul2d`) wide prefill /
+batched GEMM kernels with lazy `MTL4Compiler` `Apple10`/`Apple11` selection,
+`G16` canary-guarded automatic fallback to `simdgroup_apple9`, chip-parameterized
+`spec_bus_gbs` telemetry, and runtime ANE/GPU/SME2 crossover calibration
+(with `Apple9` AIR/dispatch/fallback verified on M4 and physical `Apple10+`
+hardware measurements gated on Spike `S8`).
 
 ## Session handoff snapshot
 
@@ -768,9 +781,12 @@ Update this before the context window runs out or when handing off.
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: none (`M0`–`M6.8` completed; next milestone is **M7** covering
-  Ultra and cluster scale-out: `DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10`
-  mHC, `G11`, `D10`, `C10` Engram, and `X1`–`X3` per
+- In flight: none (`M0`–`M6.8` completed; next milestone is **M6.9** covering
+  `G17`, `C16`, and Spike `S8` per
+  [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md),
+  followed by **M7** covering Ultra and cluster scale-out:
+  `DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10`
+  Engram, and `X1`–`X3` per
   [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md))
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
@@ -789,4 +805,5 @@ Update this before the context window runs out or when handing off.
   [decisions/0017-optional-gsq-rco-hybrid-quantization.md](decisions/0017-optional-gsq-rco-hybrid-quantization.md),
   [decisions/0018-bare-metal-armv9-sme2-engine.md](decisions/0018-bare-metal-armv9-sme2-engine.md),
   [decisions/0019-recurrent-depth-and-post-m5-accelerators.md](decisions/0019-recurrent-depth-and-post-m5-accelerators.md),
-  [decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)
+  [decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md),
+  [decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md)

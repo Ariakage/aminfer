@@ -38,6 +38,7 @@ items. ADRs record decisions, not capability status — that lives in
 | [0018](0018-bare-metal-armv9-sme2-engine.md) | Bare-metal ARMv9 SME2 pre-packed and ZT0-LUT engine (M4.5) | Accepted | 2026-11-21 |
 | [0019](0019-recurrent-depth-and-post-m5-accelerators.md) | Composable recurrent depth (`LoopSchedule`), `SelfSpecRecurrent`, and post-M5 heterogeneous accelerators | Accepted | 2026-11-22 |
 | [0020](0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md) | Configurable wide-chunk GPU prefill, lossless tail pruning, serving QoS, and live non-anonymous RAM admission | Accepted | 2026-11-22 |
+| [0021](0021-multi-generation-apple-silicon-and-nax-tensorops.md) | Single-binary multi-generation Apple Silicon adaptation (`Apple9` and `Apple10+` GPU `NAX`) | Accepted | 2026-11-22 |
 
 ## Template
 

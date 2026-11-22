@@ -65,7 +65,16 @@ re-measures these facts from the repository.
 ## Scaling notes
 
 - Larger chips raise memory bandwidth and the wired budget; the cost models
-  (tree pruning, placement gate) are calibrated per chip, not hard-coded.
+  (tree pruning, placement gate, and GPU-vs-ANE prefill crossover) and
+  `spec_bus_gbs` telemetry are calibrated per chip, not hard-coded to M4's
+  `120.0 GB/s` ([ADR-0021](../decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md)).
+- One `arm64` binary and one embedded `aminfer.metallib` target `M1–M3`
+  (NEON/Accelerate + `simdgroup_matrix`), `M4` (`SME2` + `Apple9`
+  `simdgroup_matrix`), and `M5+` (`SME2` + `Apple10+` GPU `NAX`
+  `MetalPerformancePrimitives` `mpp::tensor_ops::matmul2d`) concurrently via
+  runtime `SmeCaps.probe()`, lazy per-entry-point `MTL4Compiler` pipeline
+  specialization, and `G16` startup canary fallback
+  ([ADR-0021](../decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md)).
 - Thunderbolt 5 Macs on macOS 26.2+ support RDMA over Thunderbolt (Apple
   TN3205); the Thunderbolt 4 baseline is limited to IP over Thunderbolt Bridge.
   Both only matter for the future `thunderbolt_peer` expert source.
