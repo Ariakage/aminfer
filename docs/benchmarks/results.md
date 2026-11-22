@@ -5013,7 +5013,8 @@ serve.swapouts_delta             0
 ## M6.8: Wide-chunk GPU prefill, prompt_tail pruning, serving QoS, live-RAM admission and metallib canary
 
 Measured on Apple M4 24 GiB (`macOS 27.2`, `18,186 MiB` static wired budget,
-`ReleaseFast`, commit `2063bc9`, `swapouts_delta = 0` across every run) for
+`ReleaseFast`, `swapouts_delta = 0` across every run including 3/3 consecutive
+`bench-m68` runs) for
 [ADR-0020](../decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)
 (`R9`, `G15`, `G16`, `C15`). All real-checkpoint benchmarks ran against the
 converted `.amf` bundles under `/Volumes/Akari/models/amf/`.
@@ -5024,27 +5025,28 @@ converted `.amf` bundles under `/Volumes/Akari/models/amf/`.
 | --- | --- | --- | --- |
 | `gpu.supports_apple10` | `no` | `no` | M4 reports `Apple9`; `Apple10` (`NAX`) dispatch hook reserved for M5+ hardware |
 | `gpu.prefill_matmul_backend` | `simdgroup_apple9` | `simdgroup_apple9` | Dispatches `BM=64, BN=64` wide `simdgroup_matrix` kernels on M4 |
-| Startup canary wall time (`us`) | `2,355.0` | `2,319.4` | Cold first-submit wall time on fresh `MTLDevice` (`1,325.2–3,780.0 us` across `bench-decode`); runs once at load, never on hot path |
+| Startup canary cold first-submit (`us`) | `2,132.5` | `2,223.5` | Cold first-submit wall time on fresh `MTLDevice` including Metal 4 queue/residency/AGX wake (`1,325.2–3,780.0 us` across `bench-decode`); runs once at load, never on hot path |
+| Startup canary warm in-buffer (`us`) | `219.0` | `231.2` | Repeat `runStartupNumericalCanaryInBuffer` on same resident `16 KiB` buffer and warm `MTL4CommandQueue` (`187.0–237.3 us` across runs; covers 6 GPU GEMM dispatches + CPU fp32 verification) |
 | `max_abs_err_f16` / `bf16` / `q4` | `0.000023` / `0.001953` / `0.000028` | `0.000023` / `0.001953` / `0.000028` | All three dtypes pass tolerance against CPU FP32 reference |
 | Negative corrupted-slice rejection | n/a | `yes` | Corrupted output slice reliably triggers `error.MetallibNumericalCanaryFailed` |
 
 ### G15 and R9 wide-chunk GPU prefill, `prompt_tail` pruning and scratch aliasing A/B
 
-Single-load A/B comparison in `aminfer bench-m68` (`max_tree_nodes = 64`, `lm_head` remains 100% wired):
+Single-load A/B comparison in `aminfer bench-m68` (`max_tree_nodes = 64`, `lm_head` remains 100% wired; on this host snapshot `r9.live_reclaimable_mib = 9,624 MiB`, so the `R9` zero-swap guard automatically offloaded cold experts on the `30B-A3B` steps via `qwen3-30b-a3b-heat.json` while keeping `swapouts_delta = 0`):
 
 | Model | Prompt tokens | Real checkpoint | `tree64` (ms) | `wide` unpruned (ms) | `wide` + `prompt_tail` (ms) | Speedup (`tree64 / wide`) | `wide` throughput (tok/s) | Max logit diff | Greedy match | Aliased scratch saved (MiB) | Wired (MiB) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `qwen3-0.6b-bf16` | 512 | yes | 381.00 | 204.23 | 207.50 | 1.84x | 2,467.5 | 0.03516 | yes | 18.02 | 1,423 |
-| `qwen3-0.6b-bf16` | 2,048 | yes | 1,803.52 | 1,076.81 | 1,033.76 | 1.74x | 1,981.1 | 0.05859 | yes | 18.02 | 1,423 |
-| `qwen3-0.6b-gsq-rco` | 512 | yes | 541.41 | 213.88 | 197.21 | 2.75x | 2,596.2 | 0.02734 | yes | 18.02 | 595 |
-| `qwen3-0.6b-gsq-rco` | 2,048 | yes | 2,396.66 | 1,096.03 | 1,046.59 | 2.29x | 1,956.8 | 0.03125 | yes | 18.02 | 595 |
-| `qwen3-14b-4bit` | 512 | yes | 15,379.36 | 7,609.99 | 7,401.37 | 2.08x | 69.2 | 0.03125 | yes | 78.02 | 8,125 |
-| `qwen3-30b-a3b-gsq-rco` | 512 | yes | 3,273.15 | 2,559.85 | 2,543.60 | 1.29x | 201.3 | 1.64063 | yes | 53.34 | 9,987 |
-| `qwen4_exp-512e-R2` | 512 | no (synth) | 71.06 | 39.44 | 34.71 | 2.05x | 14,749.6 | 0.08008 | yes | 2.06 | 209 |
+| `qwen3-0.6b-bf16` | 512 | yes | 405.81 | 229.20 | 212.88 | 1.91x | 2,405.1 | 0.03516 | yes | 18.02 | 1,423 |
+| `qwen3-0.6b-bf16` | 2,048 | yes | 1,880.96 | 1,102.51 | 1,092.75 | 1.72x | 1,874.2 | 0.05859 | yes | 18.02 | 1,423 |
+| `qwen3-0.6b-gsq-rco` | 512 | yes | 556.59 | 216.66 | 206.86 | 2.69x | 2,475.2 | 0.02734 | yes | 18.02 | 595 |
+| `qwen3-0.6b-gsq-rco` | 2,048 | yes | 2,481.34 | 1,150.43 | 1,066.57 | 2.33x | 1,920.2 | 0.03125 | yes | 18.02 | 595 |
+| `qwen3-14b-4bit` | 512 | yes | 14,529.71 | 6,491.80 | 6,331.50 | 2.29x | 80.9 | 0.03125 | yes | 78.02 | 8,125 |
+| `qwen3-30b-a3b-gsq-rco` | 512 | yes | 18,020.11 | 4,588.77 | 4,603.94 | 3.91x | 111.2 | 1.64063 | yes | 53.34 | 8,809 |
+| `qwen4_exp-512e-R2` | 512 | no (synth) | 73.12 | 40.06 | 33.87 | 2.16x | 15,116.2 | 0.08008 | yes | 2.06 | 209 |
 
-- **`EAGLE-3` wide prefill + aliased `verifyTree` transition (`qwen3-30b-a3b-gsq-rco` + `qwen3-30b-a3b-eagle3`, `prompt = 480`, `gen = 16`)**: `wide_prefill_ms = 2,503.53`, `spec_tok_s = 84.74`, `mean_accept = 5.00`, `alias_mib = 53.34`, `greedy_match = yes`.
+- **`EAGLE-3` wide prefill + aliased `verifyTree` transition (`qwen3-30b-a3b-gsq-rco` + `qwen3-30b-a3b-eagle3`, `prompt = 480`, `gen = 16`, `R9` live-RAM gated)**: `wide_prefill_ms = 8,605.43`, `spec_tok_s = 2.22`, `mean_accept = 2.50`, `alias_mib = 19.63`, `cold_exp = 66`, `wired_mib = 6,770`, `greedy_match = yes`, `malloc_blk = 0` (`R9` scaled `cold_exp` dynamically across 3/3 consecutive runs: `66` at `9,624 MiB`, `41` at `11,466 MiB` with `4.35 tok/s` / `8,387 MiB` wired, and `96` at `3,848 MiB` with `4,702 MiB` wired — `100%` `greedy_match = yes`, `malloc_blk = 0`, `infer_swapouts_delta = total_swapouts_delta = 0`; on an unpressured host where all `128` experts remain hot, the same `EAGLE-3` path runs at `~84.7 tok/s` and `~2,504 ms` prefill).
 
-Fresh-process standalone `aminfer bench-decode` A/B (`--prefill-tokens 512 --decode-steps 8 --no-verify-crc`, default `max_tree_nodes = 16`, `swapouts_delta = 0` on all 6 runs):
+Fresh-process standalone `aminfer bench-decode` A/B (`--prefill-tokens 512 --decode-steps 8 --no-verify-crc`, default `max_tree_nodes = 16`, `100%` hot weights, `swapouts_delta = 0` on all 6 runs):
 
 | Model | Mode | Prefill (ms) | Prefill (tok/s) | Prefill speedup | Wired (MiB) | Wired delta (MiB) | Aliased scratch saved (MiB) | Decode (tok/s) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -5057,32 +5059,33 @@ Fresh-process standalone `aminfer bench-decode` A/B (`--prefill-tokens 512 --dec
 
 Honest trade-offs and observations:
 
-- **`qwen3-14b-4bit` thermal sensitivity**: inside single-process `bench-m68`, `wide` runs immediately after a `15.38 s` `tree64` GPU burn and settles at `7,401.37 ms` (`69.2 tok/s`), whereas a cold standalone `bench-decode` process reaches `5,604.32 ms` (`91.36 tok/s`, `2.24x` over `tree64`).
-- **`prompt_tail` pruning magnitude**: pruning eliminates the `O_proj` + FFN + `lm_head` work on layer `L - 1` (`~1/L` on a single 512-token chunk, plus skipped final-layer blocks on non-final chunks). On 28-to-48-layer checkpoints at `512` tokens, the theoretical gain is `2–4%` (`qwen3-0.6b-bf16` at `512` tokens sits within `1.6%` run-to-run jitter at `204.23` vs `207.50 ms`), while at `2,048` tokens (`4` chunks) or shallow recurrent/hybrid graphs (`qwen4_exp-512e-R2`) pruning saves `4.0–12.0%`.
-- **MoE routing sensitivity and decode variance**: on `qwen3-30b-a3b-gsq-rco`, wide prefill yields a smaller speedup (`1.27x–1.29x`) than dense models (`1.84x–2.75x`) because MoE routing and sparse expert gather dominate. Different fp16/bf16 accumulation order in `BM=64, BN=64` GEMM flips one close top-k router boundary across 48 layers (`max_diff = 1.64063`), while greedy argmax remains identical (`greedy = yes`) for both base prefill and `EAGLE-3` speculative decode. Minor standalone decode differences (`195.76` vs `189.11`, `11.53` vs `10.36`, `50.83` vs `48.73 tok/s`) reflect thermal state right after prefill; decode kernels did not change.
+- **Full-hot vs live-RAM-gated `30B-A3B` prefill & `EAGLE-3`**: when all `128` experts fit in wired RAM (`standalone bench-decode` and `bench-m68` Run 2 at `11,466 MiB` live reclaimable RAM), `qwen3-30b-a3b-gsq-rco` wide prefill speeds up `1.14x–1.28x` (`125.6–187.6 tok/s`, `9,979–9,988 MiB` wired) because sparse MoE gather dominates over dense GEMM. When desktop live reclaimable RAM dips below `10.6 GiB` (`bench-m68` Run 1 at `9,624 MiB`), the `R9` live-RAM guard offloads cold experts to NVMe (`8,809 MiB` wired); under cold-expert streaming, `wide` reduces NVMe passes by `8x` relative to `tree64` (`18,020.11 -> 4,603.94 ms`, `3.91x` faster), while `EAGLE-3` decode trades throughput (`2.22–4.35 tok/s` when `41–66` experts/layer stream over NVMe) to guarantee `0` XNU swapouts.
+- **`qwen3-14b-4bit` thermal sensitivity**: inside single-process `bench-m68`, `wide` runs immediately after a `14.5 s` `tree64` GPU burn and settles at `6,331.50 ms` (`80.9 tok/s`, `2.29x`), whereas a fresh standalone `bench-decode` process reaches `5,604.32 ms` (`91.36 tok/s`, `2.24x` over `12,537.84 ms` `tree64`).
+- **`prompt_tail` pruning magnitude**: pruning eliminates `O_proj` + FFN + `lm_head` work on layer `L - 1` (`~1/L` on a single 512-token chunk, plus skipped final-layer blocks on non-final chunks). Across the dense checkpoints (`28–40` layers), pruning saves `2.5–7.3%`; on `qwen4_exp-512e-R2` (4 layers, `R = 2`) it saves `15.5%` (`40.06 -> 33.87 ms`); on cold-expert `30B-A3B` (`48` layers) the `~2%` compute savings sits within NVMe I/O variance (`4,588.77` vs `4,603.94 ms`).
+- **MoE routing sensitivity and decode variance**: on `qwen3-30b-a3b-gsq-rco`, different fp16/bf16 accumulation order in `BM=64, BN=64` GEMM flips one close top-k router boundary across 48 layers (`max_diff = 1.64063`), while greedy argmax remains identical (`greedy = yes`) for both base prefill and `EAGLE-3` speculative decode. Minor standalone decode differences (`195.76` vs `189.11`, `11.53` vs `10.36`, `50.83` vs `48.73 tok/s`) reflect thermal state right after prefill; decode kernels did not change.
 - **Wired RAM savings without unloading `lm_head`**: in `wide` mode, eliminating per-node `tree_k`/`tree_v` copies and aliasing wide-prefill scratch with `verifyTree` scratch via `WiredArena.allocAliasedPair` reduces total wired memory by `37–39 MiB` on standalone `bench-decode` (`aliased_saved_mib = 10.45–25.27 MiB` at `max_tree_nodes = 16`; `18.02–78.02 MiB` at `max_tree_nodes = 64` in `bench-m68`).
 
 ### C15 serving QoS, adaptive prefill narrowing and ChatML message-boundary `PrefixCache`
 
 | Benchmark | Mode / Phase | Foreground decode TPOT p50 (ms) | Foreground decode TPOT p99 (ms) | Background prefill TTFT (ms) | Boundary / QoS telemetry |
 | --- | --- | --- | --- | --- | --- |
-| `bench-m68` QoS (`0.6b-gsq-rco`, `bg = 10,240` tok, 2 fg slots x 32 steps) | `qos_off` (`decode_share = 0.0`, narrow off) | 551.44 | 1,025.19 | 12,342.7 | `qos_steps = d:0/p:0`, `narrowed_chunks = 0`, `samples = 42` |
-| `bench-m68` QoS (`0.6b-gsq-rco`, `bg = 10,240` tok, 2 fg slots x 32 steps) | `qos_on` (`decode_share = 0.50`, narrow on) | 5.52 | 218.27 (`4.70x` lower) | 13,111.3 (`+6.2%`) | `qos_steps = d:30/p:1`, `narrowed_chunks = 0`, `samples = 64` |
-| `bench-m68` ChatML boundary (`0.6b-gsq-rco`, `boundary_pos = 359`) | `boundary_off` vs `boundary_on` | n/a | n/a | `189.73 -> 30.67` (`6.19x` faster) | `hit_tokens = 0/383 -> 359/383`, `boundary_hits = 1`, `greedy_match = yes`, `evict_first = 1`, `canonical_512_survived = yes` |
-| Live `aminfer serve` HTTP/SSE (`0.6b-gsq-rco`, `--max-seq-len 10240`) | Multi-turn ChatML Turn 1 -> Turn 2 | n/a | n/a | `335.38 -> 31.40` (`10.68x` lower TTFT) | `boundary_checkpoints = 1`, `boundary_hits = 1`, `evict_first_evictions = 1` |
-| Live `aminfer serve` HTTP/SSE (`0.6b-gsq-rco`, sustained `~9.4K` bg + 8 fg reqs) | `decode_share = 0.50`, narrow on | 5.06 | 500.97 | 12,195.63 | `qos_steps = decode=212 prefill=5 narrowed_chunks=2`, `fg_tokens = 248`, `swapouts_delta = 0` |
+| `bench-m68` QoS (`0.6b-gsq-rco`, `bg = 10,240` tok, periodic 2-slot fg bursts) | `qos_off` (`decode_share = 0.0`, narrow off) | 562.94 | 987.28 | 12,432.5 | `qos_steps = d:0/p:0`, `narrowed_chunks = 0`, `samples = 42` |
+| `bench-m68` QoS (`0.6b-gsq-rco`, `bg = 10,240` tok, periodic 2-slot fg bursts) | `qos_on` (`decode_share = 0.50`, narrow on) | 5.43 (`103.7x` lower) | 673.20 (`1.47x` lower) | 14,455.8 (`+16.3%`) | `qos_steps = d:270/p:6`, `narrowed_chunks = 3`, `samples = 576` |
+| `bench-m68` ChatML boundary (`0.6b-gsq-rco`, `boundary_pos = 359`) | `boundary_off` vs `boundary_on` | n/a | n/a | `183.05 -> 28.74` (`6.37x` faster) | `hit_tokens = 0/383 -> 359/383`, `boundary_hits = 1`, `greedy_match = yes`, `evict_first = 1`, `canonical_512_survived = yes` |
+| Live `aminfer serve` HTTP/SSE (`0.6b-gsq-rco`, default `--max-active-requests`, `--max-seq-len 10240 --prefix-cache-chunks 16`) | Multi-turn ChatML Turn 1 -> Turn 2 | n/a | n/a | `337.05 -> 30.48` (`11.06x` lower TTFT) | `boundary_checkpoints = 1`, `boundary_hits = 1`, `evict_first_evictions = 1` |
+| Live `aminfer serve` HTTP/SSE (`0.6b-gsq-rco`, sustained `~9.4K` bg + 8 fg reqs) | `decode_share = 0.50`, narrow on | 4.83 | 413.62 | 11,925.20 | `max_batch_size = 2` (auto-clamped), `qos_steps = decode=210 prefill=4 narrowed_chunks=1`, `wired_mib = 3,534`, `swapouts_delta = 0` |
 
 Honest trade-offs and scope notes:
 
-- **Why `bench-m68` reports `narrowed_chunks = 0` while live `serve` reports `narrowed_chunks = 2`**: adaptive narrowing (`512 -> 256` at `>= 8,192` tokens) deliberately triggers only when an active decode slot overlaps a deep prefill chunk so solo long-context prefills keep full throughput. In `bench-m68`, `qos_on` finishes both 32-token foreground decode streams after the first prefill chunk (`qos_steps = d:30/p:1`), leaving the remaining `9,728` background tokens solo; in the live `serve` harness, back-to-back foreground requests overlap the background prefill past `8,192` tokens and trigger `narrowed_chunks = 2`.
-- **Background TTFT cost under QoS**: protecting foreground decode p50/p99 (`551.44 -> 5.52 ms` p50, `1,025.19 -> 218.27 ms` p99 in `bench-m68`) adds `+6.2%` to background prefill TTFT (`12,342.7 -> 13,111.3 ms`) in that finite foreground burst; under continuous foreground saturation, background prefill receives up to `1 - decode_share` (`50%`) of GPU wall time.
-- **ChatML boundary cache scope vs M6.5 `R8`**: for pure-KV models (`require_gdn_snapshot = false`), `PrefixCache.matchAndPin` already performs partial-LCP CoW matching via `first_child` once a root `512`-token tile exists. `C15` message-boundary checkpoints specifically cover histories whose edit boundary sits below the first `512`-token tile (rescuing `0/383 -> 359/383` hits in `bench-m68` and `10.68x` Turn 2 TTFT in live `serve`), retired `q8` blocks, and hybrid `GDN + QSA` exact-snapshot boundaries (`require_gdn_snapshot = true`), while `evict_first = true` ensures canonical `512`-token tiles survive eviction under cache pressure.
+- **Deep-context p99 cap vs background TTFT cost under QoS**: in `bench-m68`, re-seeding foreground bursts across the entire `10,240`-token background prefill verifies both `decode-share` scheduling (`qos_steps = d:270/p:6`, slashing median TPOT `103.7x` from `562.94` to `5.43 ms`) and depth-scaled adaptive chunk narrowing at `>= 8,192` tokens (`narrowed_chunks = 3`, capping p99 TPOT across `576` samples at `673.20 ms` vs `987.28 ms`, `1.47x` lower), at a `+16.3%` background TTFT trade-off (`12,432.5 -> 14,455.8 ms`). Adaptive narrowing triggers only when an active decode slot overlaps a deep prefill chunk so solo long-context prefills keep full `512`-token chunks.
+- **Default `serve` IOSurface auto-clamping**: omitting `--max-active-requests` at `--max-seq-len 10240 --prefix-cache-chunks 16` skips unused single-request KV chunks on the base model (`continuous_batch_only = true`) and auto-clamps default `max_batch_size` to `2` (`3,192` IOSurfaces, `3,534 MiB` wired RAM, `max_active_requests = 16` HTTP queue slots), launching cleanly without hitting macOS's per-process `IOSurface` ceiling.
+- **ChatML boundary cache scope vs M6.5 `R8`**: for pure-KV models (`require_gdn_snapshot = false`), `PrefixCache.matchAndPin` already performs partial-LCP CoW matching via `first_child` once a root `512`-token tile exists. `C15` message-boundary checkpoints specifically cover histories whose edit boundary sits below the first `512`-token tile (rescuing `0/383 -> 359/383` hits in `bench-m68` and `11.06x` Turn 2 TTFT in live `serve`), retired `q8` blocks, and hybrid `GDN + QSA` exact-snapshot boundaries (`require_gdn_snapshot = true`), while `evict_first = true` ensures canonical `512`-token tiles survive eviction under cache pressure.
 
 ### R9 live non-anonymous RAM admission and soft cache auto-sizing
 
-- `HOST_VM_INFO64` live zero-swap reclaimable RAM reported by `probe` and `bench-m68`: `10,996–10,998 MiB` (`free = 4,939–4,941`, `speculative = 553`, `purgeable = 215`, `external = 5,287`), excluding `inactive` (`6,012`), `internal` (`7,098–7,100`), `compressor` (`3,368`), and `wired` (`3,275`).
+- `HOST_VM_INFO64` live zero-swap reclaimable RAM reported by `probe` and `bench-m68`: `10,053 MiB` (`probe`) and `9,624 MiB` (`bench-m68` Run 1: `free = 3,749`, `speculative = 729`, `purgeable = 543`, `external = 4,602`), explicitly excluding `inactive` (`6,333`), `internal` (`9,114`), `compressor` (`3,097`), and `wired` (`3,408`).
 - Soft cache auto-sizing under tight simulated live headroom cleanly scales optional `prefix_cache_chunks` from `64 -> 16` (`cache_scaled_down = yes`), while opt-in `--strict-live-ram` refuses oversubscribed admissions (`strict_live_ram_rejected = yes`).
-- Zero swapouts across every M6.8 benchmark (`bench-m68`: `infer_swapouts_delta = 0`, `total_swapouts_delta = 0`; all 6 standalone `bench-decode` runs: `swapouts_delta = 0`; live `serve`: `swapouts_delta = 0`).
+- Zero swapouts across every M6.8 benchmark (`bench-m68`: 3/3 consecutive runs with `infer_swapouts_delta = 0` and `total_swapouts_delta = 0`; all 6 standalone `bench-decode` runs: `swapouts_delta = 0`; live `serve`: `swapouts_delta = 0`).
 
 ### Verbatim `aminfer probe` output (`ReleaseFast`, M6.8)
 
@@ -5111,9 +5114,10 @@ gpu.max_buffer_mib               13639
 ane.cores                        16
 budget.wired_limit_mib           18186
 budget.binding_limit             MTLDevice.recommendedMaxWorkingSetSize
-vm.live_zero_swap_reclaimable_mib 10996 (free=4939, speculative=553, purgeable=215, external=5287; excluded: inactive=6012, internal=7100, compressor=3368, wired=3275)
+vm.live_zero_swap_reclaimable_mib 10053 (free=2023, speculative=367, purgeable=139, external=7522; excluded: inactive=7838, internal=8508, compressor=2482, wired=3434)
 canary.status                    pass
-canary.elapsed_us                2355.0
+canary.cold_elapsed_us           2132.5
+canary.warm_inbuf_elapsed_us     219.0
 canary.max_abs_err_f16           0.000023
 canary.max_abs_err_bf16          0.001953
 canary.max_abs_err_q4            0.000028
@@ -5125,35 +5129,36 @@ canary.max_abs_err_q4            0.000028
 === M6.8 G16 Startup .metallib Numerical Canary & Apple10 (NAX) Probe ===
 g16.supports_apple10             no
 g16.prefill_matmul_backend       simdgroup_apple9
-g16.canary_elapsed_us            2319.4
+g16.canary_cold_elapsed_us       2223.5
+g16.canary_warm_inbuf_elapsed_us 231.2
 g16.canary_max_abs_err           f16=0.000023 bf16=0.001953 q4=0.000028
 g16.corrupted_slice_rejected     yes
 
 === M6.8 G15+R9 Wide-Chunk GPU Prefill, prompt_tail Pruning & Scratch Aliasing A/B ===
 model                 toks  real  tree64_ms  wide_nop_ms  wide_ms    speedup  wide_tok_s  max_diff  greedy  alias_mib  wired_mib
-qwen3-0.6b-bf16       512   yes   381.00     204.23       207.50     1.84   x 2467.5      0.03516   yes     18.02      1423
-qwen3-0.6b-bf16       2048  yes   1803.52    1076.81      1033.76    1.74   x 1981.1      0.05859   yes     18.02      1423
-qwen3-0.6b-gsq-rco    512   yes   541.41     213.88       197.21     2.75   x 2596.2      0.02734   yes     18.02      595
-qwen3-0.6b-gsq-rco    2048  yes   2396.66    1096.03      1046.59    2.29   x 1956.8      0.03125   yes     18.02      595
-qwen3-14b-4bit        512   yes   15379.36   7609.99      7401.37    2.08   x 69.2        0.03125   yes     78.02      8125
-qwen3-30b-a3b-gsq     512   yes   3273.15    2559.85      2543.60    1.29   x 201.3       1.64063   yes     53.34      9987
-qwen4_exp-512e-R2     512   no    71.06      39.44        34.71      2.05   x 14749.6     0.08008   yes     2.06       209
-g15.eagle3_wide_spec             prompt=480 wide_prefill_ms=2503.53 spec_tokens=16 spec_tok_s=84.74 mean_accept=5.00 alias_mib=53.34 greedy_match=yes malloc_blk=23
+qwen3-0.6b-bf16       512   yes   405.81     229.20       212.88     1.91   x 2405.1      0.03516   yes     18.02      1423
+qwen3-0.6b-bf16       2048  yes   1880.96    1102.51      1092.75    1.72   x 1874.2      0.05859   yes     18.02      1423
+qwen3-0.6b-gsq-rco    512   yes   556.59     216.66       206.86     2.69   x 2475.2      0.02734   yes     18.02      595
+qwen3-0.6b-gsq-rco    2048  yes   2481.34    1150.43      1066.57    2.33   x 1920.2      0.03125   yes     18.02      595
+qwen3-14b-4bit        512   yes   14529.71   6491.80      6331.50    2.29   x 80.9        0.03125   yes     78.02      8125
+qwen3-30b-a3b-gsq     512   yes   18020.11   4588.77      4603.94    3.91   x 111.2       1.64063   yes     53.34      8809
+qwen4_exp-512e-R2     512   no    73.12      40.06        33.87      2.16   x 15116.2     0.08008   yes     2.06       209
+g15.eagle3_wide_spec             prompt=480 wide_prefill_ms=8605.43 spec_tokens=16 spec_tok_s=2.22 mean_accept=2.50 alias_mib=19.63 cold_exp=66 wired_mib=6770 greedy_match=yes malloc_blk=0
 
 === M6.8 C15 Concurrent Serving QoS & Multi-Turn ChatML Message-Boundary PrefixCache ===
 c15.workload                     real=yes bg_prefill_tokens=10240
-c15.qos_off                      decode_tpot_p50_ms=551.44 decode_tpot_p99_ms=1025.19 bg_prefill_ttft_ms=12342.7 narrowed_chunks=0 qos_steps=d:0/p:0 samples=42
-c15.qos_on                       decode_tpot_p50_ms=5.52 decode_tpot_p99_ms=218.27 bg_prefill_ttft_ms=13111.3 narrowed_chunks=0 qos_steps=d:30/p:1 samples=64 decode_share=0.50
-c15.qos_p99_ratio                4.70x (qos_off_p99 / qos_on_p99)
-c15.boundary_off                 hit_tokens=0/383 boundary_pos=359 ttft_ms=189.73
-c15.boundary_on                  hit_tokens=359/383 boundary_pos=359 ttft_ms=30.67 ttft_speedup=6.19x boundary_hits=1 greedy_match=yes
+c15.qos_off                      decode_tpot_p50_ms=562.94 decode_tpot_p99_ms=987.28 bg_prefill_ttft_ms=12432.5 narrowed_chunks=0 qos_steps=d:0/p:0 samples=42
+c15.qos_on                       decode_tpot_p50_ms=5.43 decode_tpot_p99_ms=673.20 bg_prefill_ttft_ms=14455.8 narrowed_chunks=3 qos_steps=d:270/p:6 samples=576 decode_share=0.50
+c15.qos_p99_ratio                1.47x (qos_off_p99 / qos_on_p99)
+c15.boundary_off                 hit_tokens=0/383 boundary_pos=359 ttft_ms=183.05
+c15.boundary_on                  hit_tokens=359/383 boundary_pos=359 ttft_ms=28.74 ttft_speedup=6.37x boundary_hits=1 greedy_match=yes
 c15.evict_first                  evictions=1 canonical_512_survived=yes
 
 === M6.8 R9 Live Non-Anonymous RAM Admission & Soft Cache Auto-Sizing ===
-r9.live_reclaimable_mib          10998 (free=4941, speculative=553, purgeable=215, external=5287; excluded: inactive=6012, internal=7098, compressor=3368, wired=3275)
+r9.live_reclaimable_mib          9624 (free=3749, speculative=729, purgeable=543, external=4602; excluded: inactive=6333, internal=9114, compressor=3097, wired=3408)
 r9.soft_cache_autosize           requested_chunks=64 -> granted_chunks=16 cache_scaled_down=yes
 r9.strict_live_ram_rejected      yes
-m68.swap.status                  infer_swapouts_delta=0 infer_pageouts_delta=179 total_swapouts_delta=0 total_pageouts_delta=223
+m68.swap.status                  infer_swapouts_delta=0 infer_pageouts_delta=8 total_swapouts_delta=0 total_pageouts_delta=27
 ```
 
 ### Verbatim standalone `aminfer bench-decode` `tree64` vs `wide` A/B (`ReleaseFast`)
@@ -5337,14 +5342,16 @@ decode_bench.pageouts_delta      1
 
 ### Verbatim live `aminfer serve` `C15` ChatML boundary cache and concurrent QoS output (`ReleaseFast`)
 
-Client harness output (`qwen3-0.6b-gsq-rco.amf`, `--max-seq-len 10240 --decode-share 0.50 --adaptive-prefill-narrow on --message-boundary-cache on --gpu-prefill-mode wide`):
+Command: `./zig-out/bin/aminfer serve --amf /Volumes/Akari/models/amf/qwen3-0.6b-gsq-rco.amf --config /Volumes/Akari/models/Qwen3-0.6B/config.json --tokenizer /Volumes/Akari/models/Qwen3-0.6B/tokenizer.json --port 0 --batch-mode continuous --prefix-cache-chunks 16 --max-seq-len 10240 --decode-share 0.50 --adaptive-prefill-narrow on --message-boundary-cache on --gpu-prefill-mode wide --no-verify-crc` (default `--max-active-requests` omitted; auto-clamps `max_batch_size=2`).
+
+Client harness output:
 
 ```text
-serve_test.health_initial status=200 body={"status":"ok","model":"qwen3-0.6b-gsq-rco","wired_mib":5719,"active_requests":0,"active_batch_size":0,"mean_batch_size":0.00,"prefix_hit_tokens":0}
-serve_test.chatml_turn1 ttft_ms=335.38 e2e_ms=421.59 chunks=15
-serve_test.chatml_turn2 ttft_ms=31.40 e2e_ms=113.36 chunks=15 ttft_speedup=10.68x
-serve_test.concurrent_qos bg_ttft_ms=12195.63 bg_e2e_ms=12233.62 fg_reqs=8 fg_tokens=248 fg_tpot_samples=240 fg_tpot_p50_ms=5.06 fg_tpot_p99_ms=500.97
-serve_test.health_final status=200 body={"status":"ok","model":"qwen3-0.6b-gsq-rco","wired_mib":5719,"active_requests":0,"active_batch_size":0,"mean_batch_size":1.00,"prefix_hit_tokens":515}
+serve_test.health_initial status=200 body={"status":"ok","model":"qwen3-0.6b-gsq-rco","wired_mib":3534,"active_requests":0,"active_batch_size":0,"mean_batch_size":0.00,"prefix_hit_tokens":0}
+serve_test.chatml_turn1 ttft_ms=337.05 e2e_ms=418.34 chunks=15
+serve_test.chatml_turn2 ttft_ms=30.48 e2e_ms=108.24 chunks=15 ttft_speedup=11.06x
+serve_test.concurrent_qos bg_ttft_ms=11925.20 bg_e2e_ms=11959.17 fg_reqs=8 fg_tokens=248 fg_tpot_samples=240 fg_tpot_p50_ms=4.83 fg_tpot_p99_ms=413.62
+serve_test.health_final status=200 body={"status":"ok","model":"qwen3-0.6b-gsq-rco","wired_mib":3534,"active_requests":0,"active_batch_size":0,"mean_batch_size":1.01,"prefix_hit_tokens":515}
 serve_test.exit_code=0
 ```
 
@@ -5352,10 +5359,10 @@ Server stdout:
 
 ```text
 serve.status                     listening
-serve.url                        http://127.0.0.1:56429
+serve.url                        http://127.0.0.1:51018
 serve.model_id                   qwen3-0.6b-gsq-rco
 serve.arch                       qwen3 (bf16)
-serve.batch_mode                 continuous (max_batch_size=3)
+serve.batch_mode                 continuous (max_batch_size=2)
 serve.gpu_prefill_mode           wide
 serve.decode_share               0.50 (adaptive_prefill_narrow=on, message_boundary_cache=on)
 serve.prefix_cache_chunks        16
@@ -5364,24 +5371,24 @@ serve.ngram_packs                0
 serve.spec_mode                  none
 serve.pearl_mode                 auto (enabled=no)
 serve.ngram_nvme                 off
-serve.wired_mib                  5719
+serve.wired_mib                  3534
 serve.max_conns                  32
-serve.max_active_requests        3
+serve.max_active_requests        16
 serve.max_seq_len                10240
 serve.status                     stopped
 serve.total_requests             11
 serve.rejected_503               0
 serve.cancelled                  0
-serve.max_observed_batch_size    1
-serve.mean_batch_size            1.00
-serve.total_batch_steps          281
+serve.max_observed_batch_size    2
+serve.mean_batch_size            1.01
+serve.total_batch_steps          278
 serve.prefix_hit_tokens          515
 serve.prefix_hit_requests        8
 serve.prefix_cow_copies          20
 serve.boundary_checkpoints       1 (boundary_hits=1, evict_first_evictions=1)
-serve.qos_steps                  decode=212 prefill=5 narrowed_chunks=2
+serve.qos_steps                  decode=210 prefill=4 narrowed_chunks=1
 serve.kv_retire_events           0
-serve.steady_malloc_blocks       586
-serve.steady_malloc_bytes        38336
+serve.steady_malloc_blocks       650
+serve.steady_malloc_bytes        42432
 serve.swapouts_delta             0
 ```

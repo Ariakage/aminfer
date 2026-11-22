@@ -67,12 +67,13 @@ and `P2`.
   (`Qwen3BatchRuntime.prefillSlot`, `GraphBatchRuntime.prefillSlot`) from
   `verifyTree`'s `MAX_TREE_NODES = 64` (`u64` mask) limit and `tree_k`/`tree_v`
   staging.
-- Add dedicated Metal 4 **FlashAttention prefill** kernels (`BQ = 64, BK = 32`
-  online softmax with `simdgroup` reductions, skipping strictly upper-triangular
-  KV blocks where `kv_block_start > q_block_end` for causal GQA, sliding-window
-  SWA, and `QSA` sparse attention) that write post-QK-Norm / post-RoPE K and V
-  vectors directly into target `KvTile`s (`RGBA16Float` IOSurface textures,
-  [ADR-0004](0004-kv-cache-iosurface-texture-sharing.md)).
+- Add dedicated Metal 4 **FlashAttention prefill** kernels (`BQ = 32, BK = 32`
+  online softmax with `15 KiB` threadgroup SRAM for `2x` occupancy and
+  `MTL_SHADER_VALIDATION=1` compliance, `simdgroup` reductions, skipping strictly
+  upper-triangular KV blocks where `kv_block_start > q_block_end` for causal GQA,
+  sliding-window SWA, and `QSA` sparse attention) that write post-QK-Norm /
+  post-RoPE K and V vectors directly into target `KvTile`s (`RGBA16Float`
+  IOSurface textures, [ADR-0004](0004-kv-cache-iosurface-texture-sharing.md)).
 - Pair FlashAttention prefill with wide-tile (`BM = 64, BN = 64`) prefill GEMM
   specialization (`f16`, `bf16`, `q2_affine`, `q3_affine`, `q4_affine`) and
   wide-batch (`512–1024` token) CSR-sorted MoE execution.
@@ -152,11 +153,14 @@ and `P2`.
 
 ### 6. Startup `.metallib` numerical canary and `Apple10` (`NAX`) hook reservation (`P2` -> `G16`)
 
-- Execute a `< 0.1 ms` **startup GPU numerical canary** once during pipeline
-  initialization over preallocated scratch (`16 × 16` deterministic `f16`,
-  `bf16`, and `q4_affine` reference probes checked for finiteness and tight
-  `fp32` tolerance), aborting startup with an explicit toolchain/driver error if
-  the compiled `.metallib` miscomputes ([ADR-0016](0016-native-fp16-bf16-and-multishard-import.md)).
+- Execute a sub-millisecond **startup GPU numerical canary** once during
+  pipeline initialization over preallocated scratch (`16 × 16` deterministic
+  `f16`, `bf16`, and `q4_affine` reference probes across `32x32` and `64x64`
+  kernels checked for finiteness and tight `fp32` tolerance; measured `~0.19–0.24 ms`
+  warm in-buffer GPU check and `~1.3–3.8 ms` cold first-submit including initial
+  Metal 4 queue/residency wake on M4), aborting startup with an explicit
+  toolchain/driver error if the compiled `.metallib` miscomputes
+  ([ADR-0016](0016-native-fp16-bf16-and-multishard-import.md)).
 - Expose `apple_gpu_family >= 10` (`Apple10`, M5 GPU Neural Accelerators / `NAX`
   `mpp::tensor_ops::matmul2d`) detection in `apple_bridge` / `aminfer probe` and
   reserve compile-time / function-constant dispatch hooks in `src/gpu/dequant.zig`
@@ -179,7 +183,8 @@ and `P2`.
     edits/retries (`P1-A`, both configurable and ON by default).
   - Desktop co-tenancy avoids silent XNU anonymous-page compression/swap when
     sizing optional wired caches (`P1-B`), and corrupted `.metallib` builds fail
-    at startup in `< 0.1 ms` (`P2`).
+    at startup (`~0.19–0.24 ms` warm in-buffer GPU check; `~1.3–3.8 ms` cold
+    first-submit including Metal 4 queue/residency wake, `P2`).
 - **Trade-offs and invariants**:
   - Adding `BM = 64, BN = 64` prefill GEMM and FlashAttention prefill kernels
     increases `.metallib` pipeline count modestly at startup while keeping hot

@@ -68,8 +68,9 @@ unavailable, and as the baseline the hybrid path must beat. Per
 [ADR-0020](../decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)
 (`G15`, M6.8), `--gpu-prefill-mode wide|tree64` (default `wide`) executes
 `512–1024`-token chunks through dedicated Metal 4 FlashAttention prefill kernels
-(`BQ = 64, BK = 32`, skipping upper-triangular KV blocks and writing K/V
-directly into `KvTile`s) plus `BM = 64, BN = 64` prefill GEMM tiles, and prunes
+(`BQ = 32, BK = 32`, `15 KiB` threadgroup SRAM for `2x` occupancy and
+`MTL_SHADER_VALIDATION=1` compliance, skipping upper-triangular KV blocks and
+writing K/V directly into `KvTile`s) plus `BM = 64, BN = 64` prefill GEMM tiles, and prunes
 unused final-layer (`L - 1`) `O_proj` / `MoE` / `lm_head` work on non-terminal
 prompt positions (`prompt_tail`); `tree64` retains the legacy `<= 64`-row
 `verifyTree` + `commitTreeKv` path for A/B comparison.
