@@ -37,6 +37,11 @@ const ple_mod = @import("../storage/ple.zig");
 const sme = @import("../cpu/sme.zig");
 const accept_mod = @import("../spec/accept.zig");
 const qwen3 = @import("qwen3.zig");
+const vision_mod = @import("../gpu/vision.zig");
+const prefix_cache_mod = @import("../mem/prefix_cache.zig");
+const batch_sched = @import("../runtime/batch_scheduler.zig");
+const vmstat = @import("../platform/vmstat.zig");
+const rng_mod = @import("../runtime/rng.zig");
 
 /// Maximum wired bytes per GPU weight shard (matches `qwen3.zig` to stay below
 /// macOS single-`MTLBuffer` maxBufferLength on 24 GiB–512 GiB Apple Silicon).
@@ -791,6 +796,10 @@ pub const GraphLoadOptions = struct {
     /// Cold-expert `ExpertSlotPool` slot count (`0` auto-sizes when cold experts exist).
     cold_slot_count: u32 = 0,
     ple_cache_pages: usize = ple_mod.DEFAULT_CACHE_PAGES,
+    /// M6.5 R5: When `> 0`, keep at most `N` active `RGBA16Float` IOSurface KV chunks
+    /// per full-context `GQA` / `QSA` layer and retire older completed chunks on GPU
+    /// into group-64 `q8` (`RetiredKvQ8Pool`, `-46.875%` retired KV RAM). `0` disables retirement.
+    kv_retire_q8_after_chunks: u32 = 0,
 };
 
 pub const LoopIsolationStats = struct {
@@ -829,6 +838,7 @@ pub const GraphLoadError = error{
 } || amf.ParseError || amf.IoError || metal.Error || sysinfo.Error ||
     page.ShareError || expert.NvmeExpert.InitError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError || hybrid.ArenaError || hybrid.HybridKvRing.InitError ||
+    attention.RetiredKvQ8PoolError ||
     moe.WorkspaceError || ple_mod.Error || sme.WiredScratchError ||
     cache_mod.PoolError || cache_mod.CacheError || aio.EcorePoolError;
 
@@ -842,6 +852,7 @@ pub const GraphStepError = error{
     Overflow,
 } || metal.Error || dequant.EncodeError || moe.EncodeError ||
     hybrid.EncodeError || hybrid.ArenaError || ple_mod.Error ||
+    attention.RetiredKvQ8PoolError ||
     sme.Error || cache_mod.CacheError || accept_mod.VerifyError;
 
 // ===========================================================================
@@ -903,6 +914,12 @@ const QsaLayerWeights = struct {
     max_blocks: u32,
     tree_k_off: u64,
     tree_v_off: u64,
+    // M6.5 R5 retired q8 KV tier (active when `supports_retire_q8 == true`)
+    supports_retire_q8: bool = false,
+    full_tile_table_off: u64 = 0,
+    full_tile_table_host: []attention.KvTilePair = &.{},
+    retired_ids_binding: metal.BufferBinding = undefined,
+    retired_ids_host: []u32 = &.{},
 };
 
 const GqaLayerWeights = struct {
@@ -915,6 +932,9 @@ const GqaLayerWeights = struct {
     k_norm: ?metal.BufferBinding,
     qk_norm_dtype: quant.FloatDType,
     kv_tiles_binding: metal.BufferBinding,
+    kv_tiles_host: []attention.KvTilePair = &.{},
+    retired_ids_binding: metal.BufferBinding = undefined,
+    retired_ids_host: []u32 = &.{},
     kv_tile_start: usize,
     tree_k_off: u64,
     tree_v_off: u64,
@@ -1131,6 +1151,19 @@ pub const GraphModel = struct {
     last_verified_masks: [hybrid.MAX_TREE_NODES]u64,
     loop_stats: LoopIsolationStats,
 
+    // M6.5 R5 retired group-64 `q8` KV tier + G14 3D MRoPE next text position
+    kv_retire_after_chunks: u32 = 0,
+    retire_chunk_tokens: u32 = attention.DEFAULT_CHUNK_TOKENS,
+    active_kv_chunks: u32 = 0,
+    num_retired_chunks: u32 = 0,
+    max_retired_per_layer: u32 = 0,
+    kv_retire_events: u64 = 0,
+    active_kv_wired_bytes: u64 = 0,
+    retired_kv_wired_bytes: u64 = 0,
+    retired_kv_pool: ?attention.RetiredKvQ8Pool = null,
+    active_tile_phys_ring: []u32 = &.{},
+    mrope_next_pos: u32 = 0,
+
     // -----------------------------------------------------------------------
     // Loading & Teardown
     // -----------------------------------------------------------------------
@@ -1241,6 +1274,7 @@ pub const GraphModel = struct {
         allocator.free(self.layers);
         allocator.free(self.token_history);
         allocator.free(self.ple_row_indices_host);
+        if (self.active_tile_phys_ring.len > 0) allocator.free(self.active_tile_phys_ring);
 
         self.hybrid_pipes.close();
         self.moe_pipes.close();
@@ -1253,8 +1287,16 @@ pub const GraphModel = struct {
 
     pub fn resetKvCache(self: *GraphModel) void {
         self.seq_len = 0;
+        self.mrope_next_pos = 0;
         self.last_logits_row = 0;
         self.last_verified_nodes = 0;
+        self.num_retired_chunks = 0;
+        self.kv_retire_events = 0;
+        if (self.retired_kv_pool) |*pool| pool.reset();
+        for (0..self.active_tile_phys_ring.len) |i| {
+            self.active_tile_phys_ring[i] = @intCast(i);
+        }
+        self.syncActiveKvTileTables();
         if (self.gdn_arena) |*ga| ga.resetAll();
         for (self.layers) |layer| {
             switch (layer.attn) {
@@ -1272,6 +1314,144 @@ pub const GraphModel = struct {
         }
         if (self.ple_rt) |prt| {
             prt.scratch.resetStep();
+        }
+    }
+
+    pub fn kvRetireEnabled(self: *const GraphModel) bool {
+        return self.retired_kv_pool != null;
+    }
+
+    pub fn retiredKvChunks(self: *const GraphModel) u32 {
+        return self.num_retired_chunks;
+    }
+
+    pub fn kvRetireEvents(self: *const GraphModel) u64 {
+        return self.kv_retire_events;
+    }
+
+    pub fn activeKvWiredBytes(self: *const GraphModel) u64 {
+        return self.active_kv_wired_bytes;
+    }
+
+    pub fn retiredKvWiredBytes(self: *const GraphModel) u64 {
+        return self.retired_kv_wired_bytes;
+    }
+
+    fn syncActiveKvTileTables(self: *GraphModel) void {
+        if (self.active_tile_phys_ring.len == 0) return;
+        const active_n: usize = self.active_kv_chunks;
+        for (self.layers) |*layer| {
+            switch (layer.attn) {
+                .gqa => |*gqa| {
+                    if (gqa.kv_tiles_host.len == 0) continue;
+                    for (0..active_n) |slot| {
+                        const phys: usize = self.active_tile_phys_ring[slot];
+                        const idx = gqa.kv_tile_start + phys * 2;
+                        gqa.kv_tiles_host[slot] = attention.KvTilePair.fromTiles(
+                            self.gqa_kv_tiles[idx],
+                            self.gqa_kv_tiles[idx + 1],
+                            .rgba16f,
+                        );
+                    }
+                },
+                .qsa => |*qsa| {
+                    if (!qsa.supports_retire_q8 or qsa.full_tile_table_host.len == 0) continue;
+                    for (0..active_n) |slot| {
+                        const c = self.num_retired_chunks + @as(u32, @intCast(slot));
+                        if (c >= qsa.full_tile_table_host.len) break;
+                        const phys: usize = self.active_tile_phys_ring[slot];
+                        qsa.full_tile_table_host[c] = attention.KvTilePair.fromTiles(
+                            qsa.kv_ring.k_tiles[phys],
+                            qsa.kv_ring.v_tiles[phys],
+                            .rgba16f,
+                        );
+                    }
+                },
+                .gdn => {},
+            }
+        }
+    }
+
+    fn retireOldestActiveChunk(self: *GraphModel) GraphStepError!void {
+        var pool = &(self.retired_kv_pool.?);
+        std.debug.assert(self.num_retired_chunks < self.max_retired_per_layer);
+        const retired_idx: usize = self.num_retired_chunks;
+        const phys_oldest: usize = self.active_tile_phys_ring[0];
+        const active_n: usize = self.active_kv_chunks;
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+        var dispatched = false;
+
+        for (self.layers) |*layer| {
+            switch (layer.attn) {
+                .gqa => |*gqa| {
+                    const dst_slot = try pool.acquireSlot();
+                    gqa.retired_ids_host[retired_idx] = dst_slot;
+                    const idx = gqa.kv_tile_start + phys_oldest * 2;
+                    try self.attn_pipes.encodeKvRetireTileToQ8(&frame, .{
+                        .k_tile = self.gqa_kv_tiles[idx],
+                        .v_tile = self.gqa_kv_tiles[idx + 1],
+                        .pool = pool,
+                        .pool_buf = self.scratch_buf,
+                        .dst_slot = dst_slot,
+                    }, false);
+                    dispatched = true;
+                },
+                .qsa => |*qsa| {
+                    if (!qsa.supports_retire_q8) continue;
+                    const dst_slot = try pool.acquireSlot();
+                    qsa.retired_ids_host[retired_idx] = dst_slot;
+                    try self.attn_pipes.encodeKvRetireTileToQ8(&frame, .{
+                        .k_tile = qsa.kv_ring.k_tiles[phys_oldest],
+                        .v_tile = qsa.kv_ring.v_tiles[phys_oldest],
+                        .pool = pool,
+                        .pool_buf = self.scratch_buf,
+                        .dst_slot = dst_slot,
+                    }, false);
+                    dispatched = true;
+                },
+                .gdn => {},
+            }
+        }
+
+        if (dispatched) {
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+        } else {
+            frame.abort();
+        }
+
+        if (active_n > 1) {
+            for (0..active_n - 1) |i| {
+                self.active_tile_phys_ring[i] = self.active_tile_phys_ring[i + 1];
+            }
+            self.active_tile_phys_ring[active_n - 1] = @intCast(phys_oldest);
+        }
+        self.num_retired_chunks += 1;
+        self.kv_retire_events += 1;
+        self.syncActiveKvTileTables();
+    }
+
+    fn retireBeforeCommitRange(self: *GraphModel, base_pos: u32, count: u32) GraphStepError!void {
+        if (self.retired_kv_pool == null or count == 0) return;
+        const last_chunk: u32 = (base_pos + count - 1) / self.retire_chunk_tokens;
+        while (last_chunk >= self.num_retired_chunks + self.active_kv_chunks and
+            self.num_retired_chunks < self.max_retired_per_layer and
+            base_pos >= (self.num_retired_chunks + 1) * self.retire_chunk_tokens)
+        {
+            try self.retireOldestActiveChunk();
+        }
+    }
+
+    fn retireExcessCompletedChunks(self: *GraphModel) GraphStepError!void {
+        if (self.retired_kv_pool == null or self.seq_len == 0) return;
+        const total_live_chunks: u32 = (self.seq_len + self.retire_chunk_tokens - 1) / self.retire_chunk_tokens;
+        while (total_live_chunks > self.num_retired_chunks + self.kv_retire_after_chunks and
+            self.num_retired_chunks < self.max_retired_per_layer and
+            self.seq_len >= (self.num_retired_chunks + 1) * self.retire_chunk_tokens)
+        {
+            try self.retireOldestActiveChunk();
         }
     }
 
@@ -1541,6 +1721,7 @@ pub const GraphModel = struct {
                 accept_nodes[i] = @intCast(i);
             }
 
+            try self.retireBeforeCommitRange(cur_base, @intCast(take));
             const vr = try self.runForwardInternal(
                 tokens[offset .. offset + take],
                 pos_buf[0..take],
@@ -1551,6 +1732,8 @@ pub const GraphModel = struct {
                 0,
                 null,
                 true, // commit state on final loop step
+                null,
+                null,
             );
             // Record committed token history for subsequent PLE N-gram lookups.
             for (0..take) |i| {
@@ -1560,6 +1743,8 @@ pub const GraphModel = struct {
                 try self.commitFeatureTaps(accept_nodes[0..take]);
             }
             self.seq_len = cur_base + @as(u32, @intCast(take));
+            self.mrope_next_pos = self.seq_len;
+            try self.retireExcessCompletedChunks();
             if (is_last_chunk and compute_logits) {
                 last_argmax = vr.argmax_tokens[take - 1];
             }
@@ -1579,9 +1764,12 @@ pub const GraphModel = struct {
         if (pos >= self.max_seq_len) return error.SequenceFull;
         if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
 
+        try self.retireBeforeCommitRange(pos, 1);
         const tok = [_]u32{token_id};
         const p = [_]u32{pos};
         const mask = [_]u64{1};
+        const use_custom_p3d = (self.mrope_next_pos > 0 and self.mrope_next_pos != pos);
+        const custom_p3d = [_]hybrid.Pos3D{hybrid.Pos3D.text(if (use_custom_p3d) self.mrope_next_pos else pos)};
         const vr = try self.runForwardInternal(
             &tok,
             &p,
@@ -1592,6 +1780,8 @@ pub const GraphModel = struct {
             0,
             null,
             true, // commit state on final pass `r == R - 1`
+            if (use_custom_p3d) &custom_p3d else null,
+            null,
         );
         self.token_history[pos] = token_id;
         if (self.enable_feature_taps) {
@@ -1599,6 +1789,8 @@ pub const GraphModel = struct {
             try self.commitFeatureTaps(&acc);
         }
         self.seq_len = pos + 1;
+        self.mrope_next_pos = if (use_custom_p3d) (custom_p3d[0].t + 1) else self.seq_len;
+        try self.retireExcessCompletedChunks();
         return vr.argmax_tokens[0];
     }
 
@@ -1640,6 +1832,8 @@ pub const GraphModel = struct {
             0,
             null,
             false, // NEVER mutate committed KV / GDN state during tree verification
+            null,
+            null,
         );
         self.last_verified_nodes = @intCast(token_ids.len);
         for (token_ids, 0..) |tid, i| {
@@ -1660,6 +1854,7 @@ pub const GraphModel = struct {
         if (accepted_nodes.len == 0) return;
         if (accepted_nodes.len > self.max_tree_nodes) return error.TreeTooLarge;
         if (base_pos + accepted_nodes.len > self.max_seq_len) return error.SequenceFull;
+        try self.retireBeforeCommitRange(base_pos, @intCast(accepted_nodes.len));
 
         var frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
@@ -1728,7 +1923,289 @@ pub const GraphModel = struct {
             }
         }
         self.seq_len = base_pos + @as(u32, @intCast(accepted_nodes.len));
+        self.mrope_next_pos = self.seq_len;
+        try self.retireExcessCompletedChunks();
     }
+
+    /// M6.5 G14 multimodal prefill options for zero-copy `IOSurface` vision/video ingress.
+    pub const MultimodalPrefillOptions = struct {
+        patch_size: u32 = 16,
+        t_patch: u32 = 1,
+        spatial_merge: u32 = 2,
+        norm: vision_mod.NormParams = vision_mod.NormParams.QWEN_VL_DEFAULT,
+        compute_logits: bool = true,
+        budget_override: ?budget_mod.Budget = null,
+    };
+
+    pub const MultimodalPrefillResult = struct {
+        first_token: u32,
+        prefix_tokens: u32,
+        vision_tokens: u32,
+        suffix_tokens: u32,
+        total_prompt_tokens: u32,
+        next_mrope_pos: u32,
+        grid: vision_mod.VisionGridSpec,
+        frame_width: u32,
+        frame_height: u32,
+        frame_count: u32,
+        all_frames_zero_copy: bool,
+        all_frames_page_aligned: bool,
+        vision_encode_us: f64,
+    };
+
+    pub const MultimodalPrefillError = GraphStepError || vision_mod.VisionIngress.InitError ||
+        vision_mod.EncodeError || vision_mod.MropeError || sysinfo.Error || vmstat.Error ||
+        budget_mod.PlanError || arena_mod.WiredArena.InitError ||
+        arena_mod.WiredArena.AllocError || metal.WrapError || error{
+        EmptyFrames,
+        FrameGeometryMismatch,
+        UnsupportedVisionFormat,
+        OutOfMemory,
+    };
+
+    /// Zero-copy multimodal prefill (`G14`): reads `IOSurface`-backed `VisionFrame`s
+    /// (`ImageIO` PNG or hardware `VideoToolbox` H.264/HEVC) directly as `MTLTexture`
+    /// planes (`0` host copies), runs Metal 4 patchify + `2x2` spatial-temporal merge +
+    /// linear embed into visual token positions, builds true 3D `[t, h, w]` interleaved
+    /// MRoPE (`[11, 11, 10]`) positions via `buildMultimodalMropePositions`, and prefills
+    /// `[prefix_tokens | vision_tokens | suffix_tokens]` through `GraphModel`.
+    pub fn prefillMultimodal(
+        self: *GraphModel,
+        allocator: std.mem.Allocator,
+        prefix_tokens: []const u32,
+        suffix_tokens: []const u32,
+        frames: []const metal.VisionFrame,
+        opts: MultimodalPrefillOptions,
+    ) MultimodalPrefillError!MultimodalPrefillResult {
+        if (frames.len == 0) return error.EmptyFrames;
+        const info0 = try frames[0].info();
+        const fmt0 = info0.format();
+        if (fmt0 != .bgra8 and fmt0 != .nv12) return error.UnsupportedVisionFormat;
+        const width = info0.width();
+        const height = info0.height();
+        const is_full_range = info0.isFullRange();
+
+        var all_zc = info0.zeroCopyVerified();
+        var all_aligned = (info0.baseAddress() % page.APPLE_PAGE_SIZE) == 0;
+        for (frames[1..]) |fr| {
+            const inf = try fr.info();
+            if (inf.width() != width or inf.height() != height or inf.format() != fmt0) {
+                return error.FrameGeometryMismatch;
+            }
+            all_zc = all_zc and inf.zeroCopyVerified();
+            all_aligned = all_aligned and ((inf.baseAddress() % page.APPLE_PAGE_SIZE) == 0);
+        }
+
+        const eff_t_patch: u32 = if (opts.t_patch == 2 and frames.len >= 2) 2 else 1;
+        const tube_count: u32 = @intCast((frames.len + eff_t_patch - 1) / eff_t_patch);
+        const geom: vision_mod.PatchGeometry = .{
+            .width = width,
+            .height = height,
+            .patch_size = opts.patch_size,
+            .t_patch = eff_t_patch,
+            .spatial_merge = opts.spatial_merge,
+        };
+        try geom.validate();
+        const tokens_per_tube = try geom.numTokens();
+        const total_vis_tokens = std.math.mul(u32, tube_count, tokens_per_tube) catch return error.Overflow;
+        const token_in_dim = try geom.tokenInDim();
+
+        const prefix_u32: u32 = @intCast(prefix_tokens.len);
+        const suffix_u32: u32 = @intCast(suffix_tokens.len);
+        const total_tokens = prefix_u32 + total_vis_tokens + suffix_u32;
+        if (total_tokens == 0) return error.InvalidBatchSize;
+        if (total_tokens > self.max_seq_len) return error.SequenceFull;
+
+        const grid: vision_mod.VisionGridSpec = .{
+            .grid_t = tube_count,
+            .grid_h = geom.mergedH(),
+            .grid_w = geom.mergedW(),
+        };
+
+        const facts = try sysinfo.Facts.read();
+        const dev_info = try self.device.info();
+        const wired_budget = opts.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
+
+        // Preallocate `VisionIngress` workspace + deterministic wired projection matrix `[H, token_in_dim] f16`.
+        var ingress = try vision_mod.VisionIngress.init(self.device, self.library, wired_budget, .{
+            .max_tokens = total_vis_tokens,
+            .max_patch_dim = token_in_dim,
+            .max_hidden_size = self.config.hidden_size,
+            .max_mrope_tokens = total_tokens,
+        });
+        defer ingress.deinit();
+
+        const proj_elems = std.math.mul(usize, self.config.hidden_size, token_in_dim) catch return error.Overflow;
+        const proj_bytes = try page.alignUp(proj_elems * @sizeOf(f16));
+        var proj_arena = try arena_mod.WiredArena.init(proj_bytes, wired_budget);
+        defer proj_arena.deinit();
+        const proj_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, proj_arena.bytes()[0 .. proj_elems * @sizeOf(f16)]));
+        const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(token_in_dim)));
+        for (proj_f16, 0..) |*w, idx| {
+            const h_mix = (@as(u64, idx) *% 0x9e3779b97f4a7c15) ^ 0x517cc1b727220a95;
+            const unit: f32 = (@as(f32, @floatFromInt(h_mix & 0xFFFF)) / 32767.5) - 1.0;
+            w.* = @floatCast(unit * inv_scale * 0.25);
+        }
+        const proj_buf = try metal.Buffer.wrap(self.device, proj_arena.bytes());
+        defer proj_buf.close();
+
+        try self.compute.makeResident(&.{ ingress.buffer(), proj_buf });
+        defer self.compute.removeResident(&.{ ingress.buffer(), proj_buf }) catch |err| {
+            std.debug.panic("removeResident(vision_ingress) failed: {}", .{err});
+        };
+        try self.compute.makeVisionFramesResident(frames);
+        defer self.compute.removeVisionFramesResident(frames) catch |err| {
+            std.debug.panic("removeVisionFramesResident failed: {}", .{err});
+        };
+
+        // 1. Run zero-copy Metal 4 patchify + 2x2 merge + linear embed directly from IOSurface textures.
+        const vis_t0 = try vmstat.nowNs();
+        {
+            var vframe = try self.compute.beginFrame(self.timeout_ms);
+            errdefer vframe.abort();
+            var tube: u32 = 0;
+            while (tube < tube_count) : (tube += 1) {
+                const f0_idx: usize = @as(usize, tube) * eff_t_patch;
+                const f1_opt: ?metal.VisionFrame = if (eff_t_patch == 2)
+                    frames[@min(f0_idx + 1, frames.len - 1)]
+                else
+                    null;
+                const tok_off: u32 = tube * tokens_per_tube;
+                const proj_bind: metal.BufferBinding = .{ .buffer = proj_buf, .offset = 0 };
+                switch (fmt0) {
+                    .bgra8 => try ingress.encodePatchifyEmbedBgra8(
+                        &vframe,
+                        frames[f0_idx],
+                        f1_opt,
+                        proj_bind,
+                        null,
+                        .f16,
+                        .f16,
+                        self.config.hidden_size,
+                        geom,
+                        opts.norm,
+                        tok_off,
+                        tube > 0,
+                    ),
+                    .nv12 => try ingress.encodePatchifyEmbedNv12(
+                        &vframe,
+                        frames[f0_idx],
+                        f1_opt,
+                        proj_bind,
+                        null,
+                        .f16,
+                        .f16,
+                        self.config.hidden_size,
+                        geom,
+                        is_full_range,
+                        opts.norm,
+                        tok_off,
+                        tube > 0,
+                    ),
+                    else => unreachable,
+                }
+            }
+            const vsig = try vframe.commit();
+            try self.compute.wait(vsig, self.timeout_ms);
+        }
+        const vis_t1 = try vmstat.nowNs();
+        const vision_encode_us: f64 = @as(f64, @floatFromInt(vis_t1 - vis_t0)) / 1000.0;
+
+        // 2. Build deterministic 3D interleaved MRoPE positions `[prefix | grid(t,h,w) | suffix]`.
+        const mrope_res = try ingress.buildMropePositions(prefix_u32, grid, suffix_u32);
+        const all_pos3d = ingress.mropePos3d()[0..total_tokens];
+
+        // Build contiguous token ID sequence (placeholder ID 0 for visual positions; replaced on GPU by embedOutBinding).
+        const full_toks = try allocator.alloc(u32, total_tokens);
+        defer allocator.free(full_toks);
+        @memcpy(full_toks[0..prefix_u32], prefix_tokens);
+        @memset(full_toks[prefix_u32 .. prefix_u32 + total_vis_tokens], 0);
+        @memcpy(full_toks[prefix_u32 + total_vis_tokens .. total_tokens], suffix_tokens);
+
+        // 3. Prefill `[prefix | vision | suffix]` in causal chunks with true 3D MRoPE + GPU visual embed injection.
+        self.resetKvCache();
+        const chunk_cap: usize = @max(@as(usize, 1), @as(usize, self.max_tree_nodes));
+        const vis_start: usize = prefix_u32;
+        const vis_end: usize = prefix_u32 + total_vis_tokens;
+        var offset: usize = 0;
+        var first_tok: u32 = 0;
+
+        while (offset < total_tokens) {
+            const take: usize = @min(chunk_cap, total_tokens - offset);
+            const cur_base: u32 = @intCast(offset);
+            const is_last_chunk = (offset + take == total_tokens);
+
+            var pos_buf: [hybrid.MAX_TREE_NODES]u32 = undefined;
+            var mask_buf: [hybrid.MAX_TREE_NODES]u64 = undefined;
+            var accept_nodes: [hybrid.MAX_TREE_NODES]u16 = undefined;
+            for (0..take) |i| {
+                pos_buf[i] = cur_base + @as(u32, @intCast(i));
+                mask_buf[i] = if (i == 63) std.math.maxInt(u64) else ((@as(u64, 1) << @intCast(i + 1)) - 1);
+                accept_nodes[i] = @intCast(i);
+            }
+
+            // Determine overlap of `[offset, offset + take)` with visual token range `[vis_start, vis_end)`.
+            const ov_lo = @max(offset, vis_start);
+            const ov_hi = @min(offset + take, vis_end);
+            const vis_ov: ?VisualEmbedOverride = if (ov_lo < ov_hi) .{
+                .local_start = @intCast(ov_lo - offset),
+                .count = @intCast(ov_hi - ov_lo),
+                .src_bind = ingress.embedOutBinding(),
+                .src_row_offset = @intCast(ov_lo - vis_start),
+            } else null;
+
+            try self.retireBeforeCommitRange(cur_base, @intCast(take));
+            const vr = try self.runForwardInternal(
+                full_toks[offset .. offset + take],
+                pos_buf[0..take],
+                mask_buf[0..take],
+                cur_base,
+                self.effective_max_loops,
+                is_last_chunk and opts.compute_logits,
+                0,
+                null,
+                true,
+                all_pos3d[offset .. offset + take],
+                vis_ov,
+            );
+            for (0..take) |i| {
+                self.token_history[cur_base + @as(u32, @intCast(i))] = full_toks[offset + i];
+            }
+            if (self.enable_feature_taps) {
+                try self.commitFeatureTaps(accept_nodes[0..take]);
+            }
+            self.seq_len = cur_base + @as(u32, @intCast(take));
+            try self.retireExcessCompletedChunks();
+            if (is_last_chunk and opts.compute_logits) {
+                first_tok = vr.argmax_tokens[take - 1];
+            }
+            offset += take;
+        }
+        self.mrope_next_pos = mrope_res.next_text_pos;
+
+        return .{
+            .first_token = first_tok,
+            .prefix_tokens = prefix_u32,
+            .vision_tokens = total_vis_tokens,
+            .suffix_tokens = suffix_u32,
+            .total_prompt_tokens = total_tokens,
+            .next_mrope_pos = mrope_res.next_text_pos,
+            .grid = grid,
+            .frame_width = width,
+            .frame_height = height,
+            .frame_count = @intCast(frames.len),
+            .all_frames_zero_copy = all_zc,
+            .all_frames_page_aligned = all_aligned,
+            .vision_encode_us = vision_encode_us,
+        };
+    }
+
+    const VisualEmbedOverride = struct {
+        local_start: u32,
+        count: u32,
+        src_bind: metal.BufferBinding,
+        src_row_offset: u32,
+    };
 
     /// `D12` `SelfSpecRecurrent` shallow drafting primitive (`0` extra draft-model RAM):
     /// evaluates `token_ids[0..m]` with `loops = 1` (`r = 0` only, without mutating
@@ -1763,6 +2240,8 @@ pub const GraphModel = struct {
             eff_k,
             out_candidates[0 .. token_ids.len * eff_k],
             false, // NEVER mutate committed state while drafting
+            null,
+            null,
         );
         return eff_k;
     }
@@ -1782,6 +2261,8 @@ pub const GraphModel = struct {
         topk_k: u32,
         topk_out: ?[]moe.TopKCandidate,
         commit_state_on_final: bool,
+        custom_pos3d: ?[]const hybrid.Pos3D,
+        vis_override: ?VisualEmbedOverride,
     ) GraphStepError!qwen3.VerifyTreeResult {
         const m: u32 = @intCast(token_ids.len);
         const h: u32 = self.config.hidden_size;
@@ -1797,7 +2278,7 @@ pub const GraphModel = struct {
         for (0..m) |i| {
             self.token_ids_host[i] = token_ids[i];
             self.positions_host[i] = positions[i];
-            self.pos3d_host[i] = hybrid.Pos3D.text(positions[i]);
+            self.pos3d_host[i] = if (custom_pos3d) |p3d| p3d[i] else hybrid.Pos3D.text(positions[i]);
             self.ancestor_masks_host[i] = ancestor_masks[i];
         }
 
@@ -1809,7 +2290,7 @@ pub const GraphModel = struct {
         var frame_opt: ?metal.Compute.Frame = null;
         errdefer if (frame_opt) |*f| f.abort();
 
-        // 1. Token embedding lookup `[m, H]`.
+        // 1. Token embedding lookup `[m, H]` + optional GPU visual token override (`G14`).
         {
             const f = try self.ensureFrame(&frame_opt);
             try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
@@ -1821,6 +2302,26 @@ pub const GraphModel = struct {
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = h,
             }, false);
+
+            if (vis_override) |vov| {
+                const row_bytes: u64 = @as(u64, h) * @sizeOf(f16);
+                const src_bind: metal.BufferBinding = .{
+                    .buffer = vov.src_bind.buffer,
+                    .offset = vov.src_bind.offset + @as(u64, vov.src_row_offset) * row_bytes,
+                };
+                const dst_bind: metal.BufferBinding = .{
+                    .buffer = self.x_bind.buffer,
+                    .offset = self.x_bind.offset + @as(u64, vov.local_start) * row_bytes,
+                };
+                try self.moe_pipes.encodeCopyStrided(f, .{
+                    .src = src_bind,
+                    .dst = dst_bind,
+                    .num_rows = vov.count,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+            }
 
             // Initialize 4-branch GR stream (`G10`) if active.
             if (self.gr_arena) |*gr| {
@@ -2509,9 +3010,24 @@ pub const GraphModel = struct {
                     self.loop_stats.qsa_index_computes += 1;
                 }
             }
+            const use_qsa_tiered = (qsa.supports_retire_q8 and self.retired_kv_pool != null);
+            const qsa_kv_tiles_bind: ?metal.BufferBinding = if (base_pos == 0)
+                null
+            else if (use_qsa_tiered) blk: {
+                const ret_toks: u64 = @as(u64, self.num_retired_chunks) * @as(u64, qsa.kv_ring.chunk_tokens);
+                if (@as(u64, base_pos) <= ret_toks) break :blk null;
+                break :blk metal.BufferBinding{
+                    .buffer = self.scratch_buf,
+                    .offset = qsa.full_tile_table_off + @as(u64, self.num_retired_chunks) * @sizeOf(attention.KvTilePair),
+                };
+            } else qsa.kv_ring.tileTableBinding(self.scratch_buf);
+            const qsa_ret_pool_bind: ?metal.BufferBinding = if (use_qsa_tiered and self.num_retired_chunks > 0)
+                self.retired_kv_pool.?.binding(self.scratch_buf)
+            else
+                null;
             try self.hybrid_pipes.encodeQsaAttention(f, .{
                 .q = self.q_bind,
-                .kv_tiles = if (base_pos > 0) qsa.kv_ring.tileTableBinding(self.scratch_buf) else null,
+                .kv_tiles = qsa_kv_tiles_bind,
                 .block_keys = .{ .buffer = self.scratch_buf, .offset = qsa.block_keys_off },
                 .index_buf = &qsa.index_buf,
                 .index_metal_buf = self.scratch_buf,
@@ -2519,6 +3035,8 @@ pub const GraphModel = struct {
                 .v_tree = tree_v,
                 .ancestor_masks = self.ancestor_masks_bind,
                 .out = self.attn_out_bind,
+                .retired_pool = qsa_ret_pool_bind,
+                .retired_chunk_ids = if (qsa_ret_pool_bind != null) qsa.retired_ids_binding else null,
                 .num_nodes = m,
                 .num_q_heads = self.config.num_attention_heads,
                 .num_kv_heads = self.config.num_key_value_heads,
@@ -2529,6 +3047,9 @@ pub const GraphModel = struct {
                 .chunk_tokens = qsa.kv_ring.chunk_tokens,
                 .block_tokens = self.config.qsa_block_size,
                 .top_k_blocks = self.config.qsa_top_k_blocks,
+                .num_retired_chunks = if (qsa_ret_pool_bind != null) self.num_retired_chunks else 0,
+                .retired_plane_stride_bytes = if (qsa_ret_pool_bind != null) self.retired_kv_pool.?.plane_stride_bytes else 0,
+                .retired_chunk_stride_bytes = if (qsa_ret_pool_bind != null) self.retired_kv_pool.?.chunk_stride_bytes else 0,
                 .reuse_block_indices = reuse_idx,
             }, true);
 
@@ -2584,22 +3105,48 @@ pub const GraphModel = struct {
                 .norm_dtype = gqa.qk_norm_dtype,
             }, true);
 
-            try self.attn_pipes.encodeGqaTreeVerifyAttn(f, .{
-                .q = self.q_bind,
-                .kv_tiles = if (base_pos > 0) gqa.kv_tiles_binding else null,
-                .base_pos = base_pos,
-                .k_tree = tree_k,
-                .v_tree = tree_v,
-                .ancestor_masks = self.ancestor_masks_bind,
-                .out = self.attn_out_bind,
-                .scratch = self.gqa_scratch_bind,
-                .max_splits = attention.MAX_SPLITS,
-                .num_nodes = m,
-                .num_q_heads = self.config.num_attention_heads,
-                .num_kv_heads = self.config.num_key_value_heads,
-                .head_dim = self.config.head_dim,
-                .chunk_tokens = self.chunk_tokens,
-            }, true);
+            if (self.num_retired_chunks > 0 and base_pos > 0 and self.retired_kv_pool != null) {
+                const rpool = self.retired_kv_pool.?;
+                const ret_toks: u64 = @as(u64, self.num_retired_chunks) * @as(u64, self.chunk_tokens);
+                try self.attn_pipes.encodeGqaTieredTreeVerifyAttn(f, .{
+                    .q = self.q_bind,
+                    .kv_tiles = if (@as(u64, base_pos) > ret_toks) gqa.kv_tiles_binding else null,
+                    .retired_pool = rpool.binding(self.scratch_buf),
+                    .retired_chunk_ids = gqa.retired_ids_binding,
+                    .base_pos = base_pos,
+                    .k_tree = tree_k,
+                    .v_tree = tree_v,
+                    .ancestor_masks = self.ancestor_masks_bind,
+                    .out = self.attn_out_bind,
+                    .scratch = self.gqa_scratch_bind,
+                    .max_splits = attention.MAX_SPLITS,
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = self.num_retired_chunks,
+                    .retired_plane_stride_bytes = rpool.plane_stride_bytes,
+                    .retired_chunk_stride_bytes = rpool.chunk_stride_bytes,
+                }, true);
+            } else {
+                try self.attn_pipes.encodeGqaTreeVerifyAttn(f, .{
+                    .q = self.q_bind,
+                    .kv_tiles = if (base_pos > 0) gqa.kv_tiles_binding else null,
+                    .base_pos = base_pos,
+                    .k_tree = tree_k,
+                    .v_tree = tree_v,
+                    .ancestor_masks = self.ancestor_masks_bind,
+                    .out = self.attn_out_bind,
+                    .scratch = self.gqa_scratch_bind,
+                    .max_splits = attention.MAX_SPLITS,
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .chunk_tokens = self.chunk_tokens,
+                }, true);
+            }
 
             if (commit_kv) {
                 var chain: [hybrid.MAX_TREE_NODES]u16 = undefined;
@@ -3099,16 +3646,37 @@ pub const GraphModel = struct {
             const cur_base = base_pos + @as(u32, @intCast(offset));
             const max_span = @min(accepted_nodes.len - offset, @as(usize, qsa.kv_ring.chunk_tokens));
             const take: u32 = @intCast(max_span);
-            const span = try qsa.kv_ring.commitTilesForSpan(cur_base, take);
+            var k_tile0: metal.KvTile = undefined;
+            var v_tile0: metal.KvTile = undefined;
+            var k_tile1: ?metal.KvTile = null;
+            var v_tile1: ?metal.KvTile = null;
+            if (qsa.supports_retire_q8 and self.retired_kv_pool != null) {
+                const c0: u32 = cur_base / qsa.kv_ring.chunk_tokens;
+                const c1: u32 = (cur_base + take - 1) / qsa.kv_ring.chunk_tokens;
+                const p0 = self.qsaTilePair(qsa, c0);
+                k_tile0 = p0.k;
+                v_tile0 = p0.v;
+                if (c1 != c0) {
+                    const p1 = self.qsaTilePair(qsa, c1);
+                    k_tile1 = p1.k;
+                    v_tile1 = p1.v;
+                }
+            } else {
+                const span = try qsa.kv_ring.commitTilesForSpan(cur_base, take);
+                k_tile0 = span.k_tile0;
+                v_tile0 = span.v_tile0;
+                k_tile1 = span.k_tile1;
+                v_tile1 = span.v_tile1;
+            }
             try self.hybrid_pipes.encodeQsaKvTreeCommit(frame, .{
                 .k_tree = tree_k,
                 .v_tree = tree_v,
                 .accepted_nodes = .{ .inline_u16 = accepted_nodes[offset .. offset + take] },
                 .accepted_count = take,
-                .k_tile0 = span.k_tile0,
-                .v_tile0 = span.v_tile0,
-                .k_tile1 = span.k_tile1,
-                .v_tile1 = span.v_tile1,
+                .k_tile0 = k_tile0,
+                .v_tile0 = v_tile0,
+                .k_tile1 = k_tile1,
+                .v_tile1 = v_tile1,
                 .num_kv_heads = self.config.num_key_value_heads,
                 .head_dim = self.config.head_dim,
                 .base_pos = cur_base,
@@ -3128,8 +3696,12 @@ pub const GraphModel = struct {
         else
             (new_kv_len + blk_tok - 1) / blk_tok;
         const num_blocks: u32 = if (total_blocks > start_block) (total_blocks - start_block) else 1;
+        const summary_kv_tiles: metal.BufferBinding = if (qsa.supports_retire_q8 and self.retired_kv_pool != null)
+            .{ .buffer = self.scratch_buf, .offset = qsa.full_tile_table_off }
+        else
+            qsa.kv_ring.tileTableBinding(self.scratch_buf);
         try self.hybrid_pipes.encodeQsaUpdateBlockSummary(frame, .{
-            .kv_tiles = qsa.kv_ring.tileTableBinding(self.scratch_buf),
+            .kv_tiles = summary_kv_tiles,
             .block_keys = .{ .buffer = self.scratch_buf, .offset = qsa.block_keys_off },
             .num_kv_heads = self.config.num_key_value_heads,
             .head_dim = self.config.head_dim,
@@ -3141,6 +3713,14 @@ pub const GraphModel = struct {
             .start_block = start_block,
             .num_blocks = num_blocks,
         }, true);
+    }
+
+    fn qsaTilePair(self: *const GraphModel, qsa: *const QsaLayerWeights, chunk: u32) struct { k: metal.KvTile, v: metal.KvTile } {
+        std.debug.assert(chunk >= self.num_retired_chunks);
+        const active_idx: usize = chunk - self.num_retired_chunks;
+        std.debug.assert(active_idx < self.active_tile_phys_ring.len);
+        const phys: usize = self.active_tile_phys_ring[active_idx];
+        return .{ .k = qsa.kv_ring.k_tiles[phys], .v = qsa.kv_ring.v_tiles[phys] };
     }
 
     fn encodeGqaCommitAccepted(
@@ -3183,6 +3763,13 @@ pub const GraphModel = struct {
     }
 
     fn gqaTilePair(self: *const GraphModel, gqa: GqaLayerWeights, chunk: u32) struct { k: metal.KvTile, v: metal.KvTile } {
+        if (self.retired_kv_pool != null) {
+            std.debug.assert(chunk >= self.num_retired_chunks);
+            const active_idx: usize = chunk - self.num_retired_chunks;
+            const phys: usize = self.active_tile_phys_ring[active_idx];
+            const idx = gqa.kv_tile_start + phys * 2;
+            return .{ .k = self.gqa_kv_tiles[idx], .v = self.gqa_kv_tiles[idx + 1] };
+        }
         const idx = gqa.kv_tile_start + @as(usize, chunk) * 2;
         return .{ .k = self.gqa_kv_tiles[idx], .v = self.gqa_kv_tiles[idx + 1] };
     }
@@ -3527,9 +4114,34 @@ pub const GraphModel = struct {
             .sliding_window_128
         else
             .full_chunk_512;
-        const qsa_num_tiles: u32 = switch (qsa_ring_mode) {
+        const qsa_full_chunks: u32 = switch (qsa_ring_mode) {
             .sliding_window_128 => 1,
             .full_chunk_512 => (options.max_seq_len + hybrid.QSA_FULL_CHUNK_TOKENS - 1) / hybrid.QSA_FULL_CHUNK_TOKENS,
+        };
+        const qsa_supports_retire = (num_qsa_layers > 0 and qsa_ring_mode == .full_chunk_512);
+        const retire_after: u32 = options.kv_retire_q8_after_chunks;
+        const retire_chunk_tokens: u32 = if (qsa_supports_retire) hybrid.QSA_FULL_CHUNK_TOKENS else options.chunk_tokens;
+        const retire_total_chunks: u32 = if (qsa_supports_retire) qsa_full_chunks else num_chunks;
+        const num_retirable_kv_layers: u32 = num_gqa_layers + (if (qsa_supports_retire) num_qsa_layers else 0);
+        const use_retired_q8 = (retire_after > 0 and num_retirable_kv_layers > 0 and retire_total_chunks > retire_after);
+        if (use_retired_q8) {
+            if ((config.head_dim % attention.KV_Q8_GROUP_SIZE) != 0) return error.InvalidConfig;
+            if (qsa_supports_retire and num_gqa_layers > 0 and options.chunk_tokens != hybrid.QSA_FULL_CHUNK_TOKENS) {
+                return error.InvalidConfig;
+            }
+        }
+        const active_kv_chunks: u32 = if (use_retired_q8)
+            @min(retire_total_chunks, if (max_m > 1) @max(retire_after, 2) else retire_after)
+        else
+            retire_total_chunks;
+        const max_retired_per_layer: u32 = if (use_retired_q8) retire_total_chunks - retire_after else 0;
+        const qsa_num_tiles: u32 = if (qsa_supports_retire and use_retired_q8) active_kv_chunks else qsa_full_chunks;
+        const gqa_num_tiles: u32 = if (use_retired_q8) active_kv_chunks else num_chunks;
+        const retired_pool_spec: attention.RetiredKvQ8PoolSpec = .{
+            .num_kv_heads = config.num_key_value_heads,
+            .head_dim = config.head_dim,
+            .chunk_tokens = retire_chunk_tokens,
+            .max_chunks = if (use_retired_q8) num_retirable_kv_layers * max_retired_per_layer else 1,
         };
         const qsa_max_blocks: u32 = switch (qsa_ring_mode) {
             .sliding_window_128 => (hybrid.QSA_SWA_WINDOW_TOKENS + config.qsa_block_size - 1) / config.qsa_block_size,
@@ -3575,9 +4187,16 @@ pub const GraphModel = struct {
             addAligned(&scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_g_write
             addAligned(&scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_decay
         }
+        if (use_retired_q8) {
+            scratch_bytes += try attention.RetiredKvQ8Pool.requiredArenaBytes(retired_pool_spec);
+        }
         if (num_qsa_layers > 0) {
             for (0..num_qsa_layers) |_| {
                 scratch_bytes += try hybrid.HybridKvRing.tableRequiredBytes(qsa_num_tiles) + 64;
+                if (qsa_supports_retire and use_retired_q8) {
+                    addAligned(&scratch_bytes, @as(usize, qsa_full_chunks) * @sizeOf(attention.KvTilePair));
+                    addAligned(&scratch_bytes, @as(usize, max_retired_per_layer) * @sizeOf(u32));
+                }
                 scratch_bytes += try hybrid.QsaIndexBuffer.requiredBytes(.{
                     .max_nodes = max_m,
                     .num_kv_heads = config.num_key_value_heads,
@@ -3590,7 +4209,10 @@ pub const GraphModel = struct {
         }
         if (num_gqa_layers > 0) {
             for (0..num_gqa_layers) |_| {
-                addAligned(&scratch_bytes, @as(usize, num_chunks) * @sizeOf(attention.KvTilePair));
+                addAligned(&scratch_bytes, @as(usize, gqa_num_tiles) * @sizeOf(attention.KvTilePair));
+                if (use_retired_q8) {
+                    addAligned(&scratch_bytes, @as(usize, max_retired_per_layer) * @sizeOf(u32));
+                }
                 addAligned(&scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
                 addAligned(&scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
             }
@@ -3661,6 +4283,15 @@ pub const GraphModel = struct {
         total_wired_bytes += scratch_bytes;
 
         // Allocate sub-arenas inside `scratch_arena`.
+        const retired_kv_pool: ?attention.RetiredKvQ8Pool = if (use_retired_q8)
+            try attention.RetiredKvQ8Pool.init(&scratch_arena, retired_pool_spec)
+        else
+            null;
+        const retired_kv_wired_bytes: u64 = if (use_retired_q8)
+            @as(u64, try attention.RetiredKvQ8Pool.dataRequiredBytes(retired_pool_spec))
+        else
+            0;
+
         const gdn_arena: ?hybrid.GdnStateArena = if (num_gdn_layers > 0)
             try hybrid.GdnStateArena.init(&scratch_arena, .{
                 .num_gdn_layers = num_gdn_layers,
@@ -3764,9 +4395,10 @@ pub const GraphModel = struct {
 
         // --- 5. Bind per-layer weights, KV tiles/rings, and MoE expert tables ---
         const gqa_kv_tiles = if (num_gqa_layers > 0)
-            try allocator.alloc(metal.KvTile, @as(usize, num_gqa_layers) * num_chunks * 2)
+            try allocator.alloc(metal.KvTile, @as(usize, num_gqa_layers) * gqa_num_tiles * 2)
         else
             try allocator.alloc(metal.KvTile, 0);
+        var active_kv_wired_bytes: u64 = 0;
         var gqa_tiles_built: usize = 0;
         errdefer {
             if (gqa_tiles_built > 0) {
@@ -3947,8 +4579,35 @@ pub const GraphModel = struct {
                     });
                     errdefer kv_ring.deinit(allocator);
                     try kv_ring.makeResident(compute);
-                    for (kv_ring.k_tiles) |kt| total_wired_bytes += (try kt.info()).allocBytes();
-                    for (kv_ring.v_tiles) |vt| total_wired_bytes += (try vt.info()).allocBytes();
+                    for (kv_ring.k_tiles) |kt| {
+                        const tb = (try kt.info()).allocBytes();
+                        total_wired_bytes += tb;
+                        active_kv_wired_bytes += tb;
+                    }
+                    for (kv_ring.v_tiles) |vt| {
+                        const tb = (try vt.info()).allocBytes();
+                        total_wired_bytes += tb;
+                        active_kv_wired_bytes += tb;
+                    }
+
+                    var qsa_full_tbl_off: u64 = 0;
+                    var qsa_full_tbl_host: []attention.KvTilePair = &.{};
+                    var qsa_ret_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+                    var qsa_ret_host: []u32 = &.{};
+                    const qsa_use_ret = (qsa_supports_retire and use_retired_q8);
+                    if (qsa_use_ret) {
+                        const ft_raw = try scratch_arena.allocAligned(@as(usize, qsa_full_chunks) * @sizeOf(attention.KvTilePair), 64);
+                        @memset(ft_raw, 0);
+                        qsa_full_tbl_off = scratch_arena.offsetOf(ft_raw.ptr);
+                        qsa_full_tbl_host = @alignCast(std.mem.bytesAsSlice(attention.KvTilePair, ft_raw[0 .. @as(usize, qsa_full_chunks) * @sizeOf(attention.KvTilePair)]));
+                        for (0..qsa_num_tiles) |ti| {
+                            qsa_full_tbl_host[ti] = attention.KvTilePair.fromTiles(kv_ring.k_tiles[ti], kv_ring.v_tiles[ti], .rgba16f);
+                        }
+                        const r_raw = try scratch_arena.allocAligned(@as(usize, max_retired_per_layer) * @sizeOf(u32), 64);
+                        @memset(r_raw, 0);
+                        qsa_ret_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(r_raw.ptr) };
+                        qsa_ret_host = @alignCast(std.mem.bytesAsSlice(u32, r_raw[0 .. @as(usize, max_retired_per_layer) * @sizeOf(u32)]));
+                    }
 
                     const idx_buf = try hybrid.QsaIndexBuffer.init(&scratch_arena, .{
                         .max_nodes = max_m,
@@ -3975,6 +4634,11 @@ pub const GraphModel = struct {
                         .max_blocks = qsa_max_blocks,
                         .tree_k_off = scratch_arena.offsetOf(tk_r.ptr),
                         .tree_v_off = scratch_arena.offsetOf(tv_r.ptr),
+                        .supports_retire_q8 = qsa_use_ret,
+                        .full_tile_table_off = qsa_full_tbl_off,
+                        .full_tile_table_host = qsa_full_tbl_host,
+                        .retired_ids_binding = qsa_ret_bind,
+                        .retired_ids_host = qsa_ret_host,
                     } };
                     qsa_cursor += 1;
                     layer_attn_bytes = q_p.alg_bytes + k_p.alg_bytes + v_p.alg_bytes + o_p.alg_bytes;
@@ -4001,19 +4665,31 @@ pub const GraphModel = struct {
                         null;
 
                     const tile_start = gqa_tiles_built;
-                    const tbl_raw = try scratch_arena.allocAligned(@as(usize, num_chunks) * @sizeOf(attention.KvTilePair), 64);
-                    const tbl: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(attention.KvTilePair, tbl_raw[0 .. @as(usize, num_chunks) * @sizeOf(attention.KvTilePair)]));
+                    const tbl_raw = try scratch_arena.allocAligned(@as(usize, gqa_num_tiles) * @sizeOf(attention.KvTilePair), 64);
+                    const tbl: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(attention.KvTilePair, tbl_raw[0 .. @as(usize, gqa_num_tiles) * @sizeOf(attention.KvTilePair)]));
                     const rows = config.num_key_value_heads * options.chunk_tokens;
-                    for (0..num_chunks) |c| {
+                    for (0..gqa_num_tiles) |c| {
                         gqa_kv_tiles[gqa_tiles_built] = try metal.KvTile.init(device, config.head_dim, rows, .{});
-                        total_wired_bytes += (try gqa_kv_tiles[gqa_tiles_built].info()).allocBytes();
+                        const tbk = (try gqa_kv_tiles[gqa_tiles_built].info()).allocBytes();
+                        total_wired_bytes += tbk;
+                        active_kv_wired_bytes += tbk;
                         gqa_tiles_built += 1;
                         gqa_kv_tiles[gqa_tiles_built] = try metal.KvTile.init(device, config.head_dim, rows, .{});
-                        total_wired_bytes += (try gqa_kv_tiles[gqa_tiles_built].info()).allocBytes();
+                        const tbv = (try gqa_kv_tiles[gqa_tiles_built].info()).allocBytes();
+                        total_wired_bytes += tbv;
+                        active_kv_wired_bytes += tbv;
                         gqa_tiles_built += 1;
                         tbl[c] = attention.KvTilePair.fromTiles(gqa_kv_tiles[gqa_tiles_built - 2], gqa_kv_tiles[gqa_tiles_built - 1], .rgba16f);
                     }
                     try compute.makeTilesResident(gqa_kv_tiles[tile_start..gqa_tiles_built]);
+                    const gqa_ret_bind: metal.BufferBinding, const gqa_ret_host: []u32 = if (use_retired_q8) blk: {
+                        const r_raw = try scratch_arena.allocAligned(@as(usize, max_retired_per_layer) * @sizeOf(u32), 64);
+                        @memset(r_raw, 0);
+                        break :blk .{
+                            .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(r_raw.ptr) },
+                            @alignCast(std.mem.bytesAsSlice(u32, r_raw[0 .. @as(usize, max_retired_per_layer) * @sizeOf(u32)])),
+                        };
+                    } else .{ .{ .buffer = scratch_buf, .offset = 0 }, &.{} };
                     const tk_r = try scratch_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
                     const tv_r = try scratch_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
 
@@ -4027,6 +4703,9 @@ pub const GraphModel = struct {
                         .k_norm = if (kn) |n| n.binding else null,
                         .qk_norm_dtype = if (qn) |n| n.dtype else .bf16,
                         .kv_tiles_binding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tbl_raw.ptr) },
+                        .kv_tiles_host = tbl,
+                        .retired_ids_binding = gqa_ret_bind,
+                        .retired_ids_host = gqa_ret_host,
                         .kv_tile_start = tile_start,
                         .tree_k_off = scratch_arena.offsetOf(tk_r.ptr),
                         .tree_v_off = scratch_arena.offsetOf(tv_r.ptr),
@@ -4250,6 +4929,13 @@ pub const GraphModel = struct {
         errdefer allocator.free(ple_row_indices_host);
         @memset(ple_row_indices_host, 0);
 
+        const active_tile_phys_ring: []u32 = if (use_retired_q8) blk: {
+            const ring = try allocator.alloc(u32, active_kv_chunks);
+            for (0..active_kv_chunks) |ri| ring[ri] = @intCast(ri);
+            break :blk ring;
+        } else &.{};
+        errdefer if (active_tile_phys_ring.len > 0) allocator.free(active_tile_phys_ring);
+
         const aux_ids = options.aux_layer_ids orelse qwen3.defaultEagle3AuxLayerIds(config.num_hidden_layers);
         const embed_row_alg_bytes = embed.alg_bytes / config.vocab_size;
         const global_head_bytes = embed_row_alg_bytes + lm_head.alg_bytes;
@@ -4358,7 +5044,2180 @@ pub const GraphModel = struct {
             .last_verified_tokens = @splat(0),
             .last_verified_masks = @splat(0),
             .loop_stats = .{},
+            .kv_retire_after_chunks = retire_after,
+            .retire_chunk_tokens = retire_chunk_tokens,
+            .active_kv_chunks = active_kv_chunks,
+            .num_retired_chunks = 0,
+            .max_retired_per_layer = max_retired_per_layer,
+            .kv_retire_events = 0,
+            .active_kv_wired_bytes = active_kv_wired_bytes,
+            .retired_kv_wired_bytes = retired_kv_wired_bytes,
+            .retired_kv_pool = retired_kv_pool,
+            .active_tile_phys_ring = active_tile_phys_ring,
+            .mrope_next_pos = 0,
         };
+    }
+};
+
+// ===========================================================================
+// Section 5b: M6.5 C14 + R8 Multi-Slot Continuous Batching & GDN PrefixCache
+// ===========================================================================
+
+pub const GraphBatchConfig = struct {
+    max_slots: u32 = 8,
+    prefix_cache_chunks: u32 = 0,
+    kv_pool_chunk_groups: u32 = 0,
+    budget_override: ?budget_mod.Budget = null,
+};
+
+pub const GraphBatchStats = struct {
+    max_slots: u32,
+    pool_chunk_groups: u32,
+    pool_free_groups: u32,
+    prefix_cache_capacity: u32,
+    prefix_cache_live_entries: u32,
+    prefix_cache_pinned_entries: u32,
+    gdn_snapshots_active: u32,
+    prefix_hits: u64,
+    prefix_hit_tokens: u64,
+    prefix_cow_copies: u64,
+    gdn_snapshot_clones: u64,
+    decode_batch_steps: u64,
+    decode_batch_tokens: u64,
+    total_wired_bytes: u64,
+};
+
+pub const GraphBatchError = error{
+    InvalidConfig,
+    TreeNotEnabled,
+    BudgetExceeded,
+    OutOfMemory,
+} || sysinfo.Error || budget_mod.PlanError || arena_mod.WiredArena.InitError ||
+    arena_mod.WiredArena.AllocError || metal.WrapError || metal.Error ||
+    hybrid.ArenaError || hybrid.GdnSnapshotPoolError || prefix_cache_mod.Error;
+
+const GRAPH_NONE_GROUP: u32 = std.math.maxInt(u32);
+
+const GraphBatchSlotState = struct {
+    in_use: bool = false,
+    seq_len: u32 = 0,
+    matched_prefix_tokens: u32 = 0,
+    prefix_cached_full_chunks: u32 = 0,
+    last_cached_parent_id: u32 = prefix_cache_mod.NONE_ID,
+    pinned_full_count: u32 = 0,
+    chunk_group_ids: []u32 = &.{},
+    chunk_is_shared: []bool = &.{},
+    pinned_full_ids: []u32 = &.{},
+    prompt_tokens: []u32 = &.{},
+};
+
+/// Preallocated zero-allocation continuous-batching (`C14`) & shared `PrefixCache` +
+/// `GdnSnapshotPool` (`R8`) runtime attached to a loaded hybrid `GraphModel`
+/// (`GDN + QSA/GQA + MoE/Dense + 4-branch GR`).
+pub const GraphBatchRuntime = struct {
+    model: *GraphModel,
+    max_slots: u32,
+    max_chunks: u32,
+    kv_chunk_tokens: u32,
+    num_kv_layers: u32,
+    num_gdn_layers: u32,
+    num_qsa_layers: u32,
+    num_gqa_layers: u32,
+    pool_chunk_groups: u32,
+    total_wired_bytes: u64,
+
+    /// Maps transformer layer index `l` -> compact KV layer index (`0..num_kv_layers-1` or `maxInt`).
+    layer_to_kv_idx: []u32,
+    kv_idx_to_layer: []u32,
+
+    batch_arena: arena_mod.WiredArena,
+    batch_buf: metal.Buffer,
+
+    // Multi-slot GDN recurrent state & conv1d history pools (`[num_gdn_layers, max_slots, ...]`)
+    gdn_pool_base_off: u64,
+    gdn_slot_stride_bytes: u64,
+    gdn_layer_stride_bytes: u64,
+    gdn_conv_pool_base_off: u64,
+    gdn_conv_slot_stride_bytes: u64,
+    gdn_conv_layer_stride_bytes: u64,
+    gdn_conv_f16_per_layer: u32,
+    gdn_slot_ids_off: u64,
+    gdn_slot_ids_host: []u32,
+    gdn_snapshot_pool: ?hybrid.GdnSnapshotPool,
+
+    // Shared IOSurface KV chunk pool (`[pool_chunk_groups * num_kv_layers * 2]`)
+    pool_tiles: []metal.KvTile,
+    pool_free_stack: []u32,
+    pool_free_top: u32,
+
+    // Per-KV-layer `[max_slots * max_chunks]` active KvTilePair tables
+    kv_tiles_base_off: u64,
+    kv_tiles_layer_stride_bytes: u64,
+    kv_tiles_host: []attention.KvTilePair,
+
+    // Per-GQA-layer batch write slots & slot descs + shared batch GQA scratch
+    write_slots_base_off: u64,
+    write_slots_layer_stride_bytes: u64,
+    write_slots_host: []attention.BatchKvWriteSlot,
+    gqa_descs_base_off: u64,
+    gqa_descs_layer_stride_bytes: u64,
+    gqa_descs_host: []attention.BatchGqaSlotDesc,
+    gqa_batch_scratch_bind: metal.BufferBinding,
+
+    // Per-QSA-layer per-slot `block_keys` (`[num_qsa_layers, max_slots, kv_heads * max_blocks * d]`)
+    qsa_block_keys_base_off: u64,
+    qsa_block_keys_slot_stride_bytes: u64,
+    qsa_block_keys_layer_stride_bytes: u64,
+    qsa_max_blocks: u32,
+
+    prefix_cache: ?prefix_cache_mod.PrefixCache,
+    slots: []GraphBatchSlotState,
+    scratch_handles: []prefix_cache_mod.KvBlockHandle,
+    scratch_evicted_handles: []prefix_cache_mod.KvBlockHandle,
+    p_res: []f32,
+
+    // Telemetry
+    prefix_hits: u64 = 0,
+    prefix_hit_tokens: u64 = 0,
+    prefix_cow_copies: u64 = 0,
+    gdn_snapshot_clones: u64 = 0,
+    decode_batch_steps: u64 = 0,
+    decode_batch_tokens: u64 = 0,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        model: *GraphModel,
+        cfg: GraphBatchConfig,
+    ) GraphBatchError!GraphBatchRuntime {
+        if (cfg.max_slots == 0 or cfg.max_slots > batch_sched.MAX_BATCH_SLOTS) {
+            return error.InvalidConfig;
+        }
+        const needed_tree: u32 = @max(cfg.max_slots, 2);
+        if (model.max_tree_nodes < needed_tree) {
+            return error.TreeNotEnabled;
+        }
+
+        const n_layers = model.layers.len;
+        const layer_to_kv_idx = try allocator.alloc(u32, n_layers);
+        errdefer allocator.free(layer_to_kv_idx);
+        @memset(layer_to_kv_idx, std.math.maxInt(u32));
+
+        var num_kv_layers: u32 = 0;
+        var num_gdn_layers: u32 = 0;
+        var num_qsa_layers: u32 = 0;
+        var num_gqa_layers: u32 = 0;
+        var qsa_chunk_tokens: u32 = 0;
+        var qsa_max_blocks: u32 = 0;
+        var max_conv_k: u32 = 0;
+        for (model.layers, 0..) |layer, l| {
+            switch (layer.attn) {
+                .gdn => |g| {
+                    num_gdn_layers += 1;
+                    if (g.conv1d_w != null and g.conv_k > max_conv_k) max_conv_k = g.conv_k;
+                },
+                .qsa => |qsa| {
+                    layer_to_kv_idx[l] = num_kv_layers;
+                    num_kv_layers += 1;
+                    num_qsa_layers += 1;
+                    qsa_chunk_tokens = qsa.kv_ring.chunk_tokens;
+                    qsa_max_blocks = @max(qsa_max_blocks, qsa.max_blocks);
+                },
+                .gqa => {
+                    layer_to_kv_idx[l] = num_kv_layers;
+                    num_kv_layers += 1;
+                    num_gqa_layers += 1;
+                },
+            }
+        }
+        const kv_idx_to_layer = try allocator.alloc(u32, num_kv_layers);
+        errdefer allocator.free(kv_idx_to_layer);
+        for (layer_to_kv_idx, 0..) |ki, l| {
+            if (ki != std.math.maxInt(u32)) kv_idx_to_layer[ki] = @intCast(l);
+        }
+
+        const kv_chunk_tokens: u32 = if (num_qsa_layers > 0) qsa_chunk_tokens else model.chunk_tokens;
+        const max_chunks: u32 = (model.max_seq_len + kv_chunk_tokens - 1) / kv_chunk_tokens;
+
+        const facts = try sysinfo.Facts.read();
+        const dev_info = try model.device.info();
+        const wired_budget = cfg.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
+
+        // Compute multi-slot GDN state & conv1d pool strides.
+        const gdn_state_elems: usize = if (num_gdn_layers > 0)
+            @as(usize, model.config.linear_num_value_heads) *
+                model.config.linear_key_head_dim * model.config.linear_value_head_dim
+        else
+            0;
+        const gdn_slot_stride_bytes: usize = if (num_gdn_layers > 0) amf.align64(gdn_state_elems * @sizeOf(f32)) else 0;
+        const gdn_layer_stride_bytes: usize = gdn_slot_stride_bytes * cfg.max_slots;
+        const gdn_pool_bytes: usize = @as(usize, num_gdn_layers) * gdn_layer_stride_bytes;
+
+        const conv_hist: u32 = if (max_conv_k > 1) max_conv_k - 1 else 0;
+        const conv_dim: u32 = if (num_gdn_layers > 0) 2 * model.config.gdnQkDim() + model.config.gdnVDim() else 0;
+        const gdn_conv_f16_per_layer: u32 = conv_hist * conv_dim;
+        const gdn_conv_slot_stride_bytes: usize = if (gdn_conv_f16_per_layer > 0)
+            amf.align64(@as(usize, gdn_conv_f16_per_layer) * @sizeOf(f16))
+        else
+            0;
+        const gdn_conv_layer_stride_bytes: usize = gdn_conv_slot_stride_bytes * cfg.max_slots;
+        const gdn_conv_pool_bytes: usize = @as(usize, num_gdn_layers) * gdn_conv_layer_stride_bytes;
+
+        const use_gdn_snap = (num_gdn_layers > 0 and cfg.prefix_cache_chunks > 0);
+        const gdn_snap_spec: hybrid.GdnSnapshotPoolSpec = .{
+            .state = .{
+                .num_gdn_layers = if (num_gdn_layers > 0) num_gdn_layers else 1,
+                .num_v_heads = if (num_gdn_layers > 0) model.config.linear_num_value_heads else 1,
+                .head_k_dim = if (num_gdn_layers > 0) model.config.linear_key_head_dim else 64,
+                .head_v_dim = if (num_gdn_layers > 0) model.config.linear_value_head_dim else 64,
+            },
+            .conv_f16_per_layer = gdn_conv_f16_per_layer,
+            .max_snapshots = if (use_gdn_snap) cfg.prefix_cache_chunks else 1,
+        };
+        const gdn_snap_bytes: usize = if (use_gdn_snap)
+            try hybrid.GdnSnapshotPool.requiredArenaBytes(gdn_snap_spec)
+        else
+            0;
+
+        const kv_tiles_layer_stride_bytes: usize = if (num_kv_layers > 0)
+            amf.align64(@as(usize, cfg.max_slots) * @as(usize, max_chunks) * @sizeOf(attention.KvTilePair))
+        else
+            0;
+        const write_slots_layer_stride_bytes: usize = if (num_gqa_layers > 0)
+            amf.align64(@as(usize, cfg.max_slots) * @sizeOf(attention.BatchKvWriteSlot))
+        else
+            0;
+        const gqa_descs_layer_stride_bytes: usize = if (num_gqa_layers > 0)
+            amf.align64(@as(usize, cfg.max_slots) * @sizeOf(attention.BatchGqaSlotDesc))
+        else
+            0;
+        const gqa_batch_layout = attention.gqaBatchScratchLayout(
+            cfg.max_slots,
+            model.config.num_attention_heads,
+            model.config.head_dim,
+            attention.MAX_SPLITS,
+        );
+        const gqa_batch_bytes: usize = if (num_gqa_layers > 0) amf.align64(gqa_batch_layout.total_bytes) else 0;
+        const qsa_block_keys_slot_stride_bytes: usize = if (num_qsa_layers > 0)
+            amf.align64(@as(usize, model.config.num_key_value_heads) * qsa_max_blocks * model.config.head_dim * @sizeOf(f16))
+        else
+            0;
+        const qsa_block_keys_layer_stride_bytes: usize = qsa_block_keys_slot_stride_bytes * cfg.max_slots;
+        const qsa_block_keys_total_bytes: usize = @as(usize, num_qsa_layers) * qsa_block_keys_layer_stride_bytes;
+
+        const pc_spec: prefix_cache_mod.PrefixCacheSpec = .{
+            .max_entries = if (cfg.prefix_cache_chunks > 0) cfg.prefix_cache_chunks else 1,
+            .block_tokens = kv_chunk_tokens,
+            .num_kv_layers = @max(num_kv_layers, 1),
+        };
+        const pc_bytes: usize = if (cfg.prefix_cache_chunks > 0)
+            try prefix_cache_mod.PrefixCache.requiredBytes(pc_spec)
+        else
+            0;
+        const prompt_hist_bytes: usize = amf.align64(@as(usize, cfg.max_slots) * model.max_seq_len * @sizeOf(u32));
+
+        const arena_raw: usize =
+            gdn_snap_bytes +
+            pc_bytes +
+            gdn_pool_bytes +
+            gdn_conv_pool_bytes +
+            amf.align64(@as(usize, cfg.max_slots) * @sizeOf(u32)) + // gdn_slot_ids
+            @as(usize, num_kv_layers) * kv_tiles_layer_stride_bytes +
+            @as(usize, num_gqa_layers) * write_slots_layer_stride_bytes +
+            @as(usize, num_gqa_layers) * gqa_descs_layer_stride_bytes +
+            gqa_batch_bytes +
+            qsa_block_keys_total_bytes +
+            prompt_hist_bytes +
+            16 * page.APPLE_PAGE_SIZE;
+        const batch_arena_bytes = try page.alignUp(arena_raw);
+
+        // Size shared IOSurface chunk group pool when KV layers exist.
+        var pool_chunk_groups: u32 = 0;
+        var pool_kv_bytes: u64 = 0;
+        const kv_tile_rows: u32 = model.config.num_key_value_heads * kv_chunk_tokens;
+        if (num_kv_layers > 0) {
+            const tile_bytes: u64 = try page.alignUp(@as(usize, kv_tile_rows) * model.config.head_dim * @sizeOf(f16));
+            const bytes_per_group: u64 = @as(u64, num_kv_layers) * 2 * tile_bytes;
+            const desired_groups: u32 = if (cfg.kv_pool_chunk_groups > 0)
+                cfg.kv_pool_chunk_groups
+            else
+                cfg.max_slots * max_chunks + cfg.prefix_cache_chunks;
+            const base_used: u64 = model.totalWiredBytes() + batch_arena_bytes;
+            if (base_used + @as(u64, cfg.max_slots) * bytes_per_group > wired_budget.limit_bytes) {
+                return error.BudgetExceeded;
+            }
+            const headroom_groups: u32 = @intCast(@min(
+                @as(u64, desired_groups),
+                (wired_budget.limit_bytes - base_used) / bytes_per_group,
+            ));
+            pool_chunk_groups = if (cfg.kv_pool_chunk_groups > 0) blk: {
+                if (cfg.kv_pool_chunk_groups > headroom_groups) return error.BudgetExceeded;
+                break :blk cfg.kv_pool_chunk_groups;
+            } else @max(cfg.max_slots, headroom_groups);
+            pool_kv_bytes = @as(u64, pool_chunk_groups) * bytes_per_group;
+        }
+
+        const total_wired_bytes: u64 = batch_arena_bytes + pool_kv_bytes;
+        try wired_budget.checkPlan(model.totalWiredBytes() + total_wired_bytes);
+
+        var batch_arena = try arena_mod.WiredArena.init(batch_arena_bytes, wired_budget);
+        errdefer batch_arena.deinit();
+        const batch_buf = try metal.Buffer.wrap(model.device, batch_arena.bytes());
+        errdefer batch_buf.close();
+
+        const gdn_snapshot_pool: ?hybrid.GdnSnapshotPool = if (use_gdn_snap)
+            try hybrid.GdnSnapshotPool.init(&batch_arena, gdn_snap_spec)
+        else
+            null;
+        const prefix_cache: ?prefix_cache_mod.PrefixCache = if (cfg.prefix_cache_chunks > 0)
+            try prefix_cache_mod.PrefixCache.init(&batch_arena, pc_spec)
+        else
+            null;
+
+        var gdn_pool_base_off: u64 = 0;
+        if (gdn_pool_bytes > 0) {
+            const raw = try batch_arena.allocAligned(gdn_pool_bytes, 64);
+            @memset(raw, 0);
+            gdn_pool_base_off = @intCast(batch_arena.offsetOf(raw.ptr));
+        }
+        var gdn_conv_pool_base_off: u64 = 0;
+        if (gdn_conv_pool_bytes > 0) {
+            const raw = try batch_arena.allocAligned(gdn_conv_pool_bytes, 64);
+            @memset(raw, 0);
+            gdn_conv_pool_base_off = @intCast(batch_arena.offsetOf(raw.ptr));
+        }
+
+        const slot_ids_raw = try batch_arena.allocAligned(@as(usize, cfg.max_slots) * @sizeOf(u32), 64);
+        @memset(slot_ids_raw, 0);
+        const gdn_slot_ids_off: u64 = @intCast(batch_arena.offsetOf(slot_ids_raw.ptr));
+        const gdn_slot_ids_host: []u32 = @alignCast(std.mem.bytesAsSlice(u32, slot_ids_raw[0 .. @as(usize, cfg.max_slots) * @sizeOf(u32)]));
+
+        var kv_tiles_base_off: u64 = 0;
+        var kv_tiles_host: []attention.KvTilePair = &.{};
+        if (num_kv_layers > 0) {
+            const raw = try batch_arena.allocAligned(@as(usize, num_kv_layers) * kv_tiles_layer_stride_bytes, 64);
+            @memset(raw, 0);
+            kv_tiles_base_off = @intCast(batch_arena.offsetOf(raw.ptr));
+            kv_tiles_host = @alignCast(std.mem.bytesAsSlice(attention.KvTilePair, raw));
+        }
+
+        var write_slots_base_off: u64 = 0;
+        var write_slots_host: []attention.BatchKvWriteSlot = &.{};
+        var gqa_descs_base_off: u64 = 0;
+        var gqa_descs_host: []attention.BatchGqaSlotDesc = &.{};
+        var gqa_batch_scratch_bind: metal.BufferBinding = .{ .buffer = batch_buf, .offset = 0 };
+        if (num_gqa_layers > 0) {
+            const ws_raw = try batch_arena.allocAligned(@as(usize, num_gqa_layers) * write_slots_layer_stride_bytes, 64);
+            @memset(ws_raw, 0);
+            write_slots_base_off = @intCast(batch_arena.offsetOf(ws_raw.ptr));
+            write_slots_host = @alignCast(std.mem.bytesAsSlice(attention.BatchKvWriteSlot, ws_raw));
+
+            const gd_raw = try batch_arena.allocAligned(@as(usize, num_gqa_layers) * gqa_descs_layer_stride_bytes, 64);
+            @memset(gd_raw, 0);
+            gqa_descs_base_off = @intCast(batch_arena.offsetOf(gd_raw.ptr));
+            gqa_descs_host = @alignCast(std.mem.bytesAsSlice(attention.BatchGqaSlotDesc, gd_raw));
+
+            const sc_raw = try batch_arena.allocAligned(gqa_batch_layout.total_bytes, 64);
+            gqa_batch_scratch_bind = .{ .buffer = batch_buf, .offset = @intCast(batch_arena.offsetOf(sc_raw.ptr)) };
+        }
+
+        var qsa_block_keys_base_off: u64 = 0;
+        if (qsa_block_keys_total_bytes > 0) {
+            const raw = try batch_arena.allocAligned(qsa_block_keys_total_bytes, 64);
+            @memset(raw, 0);
+            qsa_block_keys_base_off = @intCast(batch_arena.offsetOf(raw.ptr));
+        }
+
+        const prompt_hist_raw = try batch_arena.allocAligned(prompt_hist_bytes, 64);
+        const prompt_hist_all: []u32 = @alignCast(std.mem.bytesAsSlice(u32, prompt_hist_raw));
+
+        // Allocate shared IOSurface KV tiles.
+        const total_pool_tiles: usize = @as(usize, pool_chunk_groups) * num_kv_layers * 2;
+        const pool_tiles = try allocator.alloc(metal.KvTile, total_pool_tiles);
+        var tiles_built: usize = 0;
+        errdefer {
+            for (0..tiles_built) |ti| pool_tiles[ti].close();
+            allocator.free(pool_tiles);
+        }
+        for (0..total_pool_tiles) |ti| {
+            pool_tiles[ti] = try metal.KvTile.init(model.device, model.config.head_dim, kv_tile_rows, .{});
+            tiles_built += 1;
+        }
+
+        try model.compute.makeResident(&.{batch_buf});
+        if (pool_tiles.len > 0) try model.compute.makeTilesResident(pool_tiles);
+
+        const pool_free_stack = try allocator.alloc(u32, pool_chunk_groups);
+        errdefer allocator.free(pool_free_stack);
+        for (0..pool_chunk_groups) |i| {
+            pool_free_stack[i] = pool_chunk_groups - 1 - @as(u32, @intCast(i));
+        }
+
+        const slots = try allocator.alloc(GraphBatchSlotState, cfg.max_slots);
+        var slots_built: usize = 0;
+        errdefer {
+            for (0..slots_built) |si| {
+                allocator.free(slots[si].chunk_group_ids);
+                allocator.free(slots[si].chunk_is_shared);
+                allocator.free(slots[si].pinned_full_ids);
+            }
+            allocator.free(slots);
+        }
+        for (0..cfg.max_slots) |si| {
+            const gids = try allocator.alloc(u32, max_chunks);
+            errdefer allocator.free(gids);
+            @memset(gids, GRAPH_NONE_GROUP);
+
+            const shared = try allocator.alloc(bool, max_chunks);
+            errdefer allocator.free(shared);
+            @memset(shared, false);
+
+            const pids = try allocator.alloc(u32, max_chunks);
+            errdefer allocator.free(pids);
+            @memset(pids, prefix_cache_mod.NONE_ID);
+
+            const p_off = si * @as(usize, model.max_seq_len);
+            slots[si] = .{
+                .chunk_group_ids = gids,
+                .chunk_is_shared = shared,
+                .pinned_full_ids = pids,
+                .prompt_tokens = prompt_hist_all[p_off .. p_off + model.max_seq_len],
+            };
+            slots_built += 1;
+        }
+
+        const handle_len: usize = @max(num_kv_layers, 1);
+        const scratch_handles = try allocator.alloc(prefix_cache_mod.KvBlockHandle, handle_len);
+        errdefer allocator.free(scratch_handles);
+        const scratch_evicted_handles = try allocator.alloc(prefix_cache_mod.KvBlockHandle, handle_len);
+        errdefer allocator.free(scratch_evicted_handles);
+        const p_res = try allocator.alloc(f32, model.config.vocab_size);
+        errdefer allocator.free(p_res);
+
+        return .{
+            .model = model,
+            .max_slots = cfg.max_slots,
+            .max_chunks = max_chunks,
+            .kv_chunk_tokens = kv_chunk_tokens,
+            .num_kv_layers = num_kv_layers,
+            .num_gdn_layers = num_gdn_layers,
+            .num_qsa_layers = num_qsa_layers,
+            .num_gqa_layers = num_gqa_layers,
+            .pool_chunk_groups = pool_chunk_groups,
+            .total_wired_bytes = total_wired_bytes,
+            .layer_to_kv_idx = layer_to_kv_idx,
+            .kv_idx_to_layer = kv_idx_to_layer,
+            .batch_arena = batch_arena,
+            .batch_buf = batch_buf,
+            .gdn_pool_base_off = gdn_pool_base_off,
+            .gdn_slot_stride_bytes = gdn_slot_stride_bytes,
+            .gdn_layer_stride_bytes = gdn_layer_stride_bytes,
+            .gdn_conv_pool_base_off = gdn_conv_pool_base_off,
+            .gdn_conv_slot_stride_bytes = gdn_conv_slot_stride_bytes,
+            .gdn_conv_layer_stride_bytes = gdn_conv_layer_stride_bytes,
+            .gdn_conv_f16_per_layer = gdn_conv_f16_per_layer,
+            .gdn_slot_ids_off = gdn_slot_ids_off,
+            .gdn_slot_ids_host = gdn_slot_ids_host,
+            .gdn_snapshot_pool = gdn_snapshot_pool,
+            .pool_tiles = pool_tiles,
+            .pool_free_stack = pool_free_stack,
+            .pool_free_top = pool_chunk_groups,
+            .kv_tiles_base_off = kv_tiles_base_off,
+            .kv_tiles_layer_stride_bytes = kv_tiles_layer_stride_bytes,
+            .kv_tiles_host = kv_tiles_host,
+            .write_slots_base_off = write_slots_base_off,
+            .write_slots_layer_stride_bytes = write_slots_layer_stride_bytes,
+            .write_slots_host = write_slots_host,
+            .gqa_descs_base_off = gqa_descs_base_off,
+            .gqa_descs_layer_stride_bytes = gqa_descs_layer_stride_bytes,
+            .gqa_descs_host = gqa_descs_host,
+            .gqa_batch_scratch_bind = gqa_batch_scratch_bind,
+            .qsa_block_keys_base_off = qsa_block_keys_base_off,
+            .qsa_block_keys_slot_stride_bytes = qsa_block_keys_slot_stride_bytes,
+            .qsa_block_keys_layer_stride_bytes = qsa_block_keys_layer_stride_bytes,
+            .qsa_max_blocks = qsa_max_blocks,
+            .prefix_cache = prefix_cache,
+            .slots = slots,
+            .scratch_handles = scratch_handles,
+            .scratch_evicted_handles = scratch_evicted_handles,
+            .p_res = p_res,
+        };
+    }
+
+    pub fn deinit(self: *GraphBatchRuntime, allocator: std.mem.Allocator) void {
+        allocator.free(self.p_res);
+        allocator.free(self.scratch_evicted_handles);
+        allocator.free(self.scratch_handles);
+        for (self.slots) |slot| {
+            allocator.free(slot.chunk_group_ids);
+            allocator.free(slot.chunk_is_shared);
+            allocator.free(slot.pinned_full_ids);
+        }
+        allocator.free(self.slots);
+        allocator.free(self.pool_free_stack);
+        if (self.pool_tiles.len > 0) {
+            self.model.compute.removeTilesResident(self.pool_tiles) catch |err| {
+                std.debug.panic("GraphBatchRuntime removeTilesResident failed: {}", .{err});
+            };
+            for (self.pool_tiles) |tile| tile.close();
+        }
+        allocator.free(self.pool_tiles);
+        self.model.compute.removeResident(&.{self.batch_buf}) catch |err| {
+            std.debug.panic("GraphBatchRuntime removeResident failed: {}", .{err});
+        };
+        self.batch_buf.close();
+        self.batch_arena.deinit();
+        allocator.free(self.kv_idx_to_layer);
+        allocator.free(self.layer_to_kv_idx);
+    }
+
+    pub fn totalWiredBytes(self: *const GraphBatchRuntime) u64 {
+        return self.total_wired_bytes;
+    }
+
+    pub fn stats(self: *const GraphBatchRuntime) GraphBatchStats {
+        const pc_cap: u32 = if (self.prefix_cache) |pc| pc.spec.max_entries else 0;
+        const pc_live: u32 = if (self.prefix_cache) |pc| pc.liveEntries() else 0;
+        const pc_pinned: u32 = if (self.prefix_cache) |pc| pc.pinnedEntries() else 0;
+        const gdn_act: u32 = if (self.gdn_snapshot_pool) |sp| sp.activeCount() else 0;
+        return .{
+            .max_slots = self.max_slots,
+            .pool_chunk_groups = self.pool_chunk_groups,
+            .pool_free_groups = self.pool_free_top,
+            .prefix_cache_capacity = pc_cap,
+            .prefix_cache_live_entries = pc_live,
+            .prefix_cache_pinned_entries = pc_pinned,
+            .gdn_snapshots_active = gdn_act,
+            .prefix_hits = self.prefix_hits,
+            .prefix_hit_tokens = self.prefix_hit_tokens,
+            .prefix_cow_copies = self.prefix_cow_copies,
+            .gdn_snapshot_clones = self.gdn_snapshot_clones,
+            .decode_batch_steps = self.decode_batch_steps,
+            .decode_batch_tokens = self.decode_batch_tokens,
+            .total_wired_bytes = self.total_wired_bytes,
+        };
+    }
+
+    pub fn batchBackend(self: *GraphBatchRuntime) batch_sched.BatchBackend {
+        return .{
+            .ctx = self,
+            .lookupPrefixFn = if (self.prefix_cache != null) lookupPrefixCb else null,
+            .prefillSlotFn = prefillSlotCb,
+            .stepDecodeBatchFn = stepDecodeBatchCb,
+            .releaseSlotFn = releaseSlotCb,
+        };
+    }
+
+    fn poolTilePair(self: *const GraphBatchRuntime, group_id: u32, kv_idx: u32) struct { k: metal.KvTile, v: metal.KvTile } {
+        const base = (@as(usize, group_id) * self.num_kv_layers + kv_idx) * 2;
+        return .{ .k = self.pool_tiles[base], .v = self.pool_tiles[base + 1] };
+    }
+
+    fn slotKvTilesSlice(self: *const GraphBatchRuntime, kv_idx: u32, slot_id: u32) []attention.KvTilePair {
+        const stride_elems = self.kv_tiles_layer_stride_bytes / @sizeOf(attention.KvTilePair);
+        const start = @as(usize, kv_idx) * stride_elems + @as(usize, slot_id) * self.max_chunks;
+        return self.kv_tiles_host[start .. start + self.max_chunks];
+    }
+
+    fn slotKvTilesBinding(self: *const GraphBatchRuntime, kv_idx: u32, slot_id: u32) metal.BufferBinding {
+        const off = self.kv_tiles_base_off +
+            @as(u64, kv_idx) * self.kv_tiles_layer_stride_bytes +
+            @as(u64, slot_id) * @as(u64, self.max_chunks) * @sizeOf(attention.KvTilePair);
+        return .{ .buffer = self.batch_buf, .offset = off };
+    }
+
+    fn layerKvTilesBinding(self: *const GraphBatchRuntime, kv_idx: u32) metal.BufferBinding {
+        return .{
+            .buffer = self.batch_buf,
+            .offset = self.kv_tiles_base_off + @as(u64, kv_idx) * self.kv_tiles_layer_stride_bytes,
+        };
+    }
+
+    fn gdnLayerPoolBinding(self: *const GraphBatchRuntime, gdn_idx: u32) metal.BufferBinding {
+        return .{
+            .buffer = self.batch_buf,
+            .offset = self.gdn_pool_base_off + @as(u64, gdn_idx) * self.gdn_layer_stride_bytes,
+        };
+    }
+
+    fn gdnSlotStateBinding(self: *const GraphBatchRuntime, gdn_idx: u32, slot_id: u32) metal.BufferBinding {
+        return .{
+            .buffer = self.batch_buf,
+            .offset = self.gdn_pool_base_off +
+                @as(u64, gdn_idx) * self.gdn_layer_stride_bytes +
+                @as(u64, slot_id) * self.gdn_slot_stride_bytes,
+        };
+    }
+
+    fn gdnSlotConvBinding(self: *const GraphBatchRuntime, gdn_idx: u32, slot_id: u32) metal.BufferBinding {
+        return .{
+            .buffer = self.batch_buf,
+            .offset = self.gdn_conv_pool_base_off +
+                @as(u64, gdn_idx) * self.gdn_conv_layer_stride_bytes +
+                @as(u64, slot_id) * self.gdn_conv_slot_stride_bytes,
+        };
+    }
+
+    fn qsaSlotBlockKeysBinding(self: *const GraphBatchRuntime, qsa_idx: u32, slot_id: u32) metal.BufferBinding {
+        return .{
+            .buffer = self.batch_buf,
+            .offset = self.qsa_block_keys_base_off +
+                @as(u64, qsa_idx) * self.qsa_block_keys_layer_stride_bytes +
+                @as(u64, slot_id) * self.qsa_block_keys_slot_stride_bytes,
+        };
+    }
+
+    fn gqaWriteSlotsSlice(self: *const GraphBatchRuntime, gqa_idx: u32) []attention.BatchKvWriteSlot {
+        const stride_elems = self.write_slots_layer_stride_bytes / @sizeOf(attention.BatchKvWriteSlot);
+        const start = @as(usize, gqa_idx) * stride_elems;
+        return self.write_slots_host[start .. start + self.max_slots];
+    }
+
+    fn gqaWriteSlotsBinding(self: *const GraphBatchRuntime, gqa_idx: u32) metal.BufferBinding {
+        return .{
+            .buffer = self.batch_buf,
+            .offset = self.write_slots_base_off + @as(u64, gqa_idx) * self.write_slots_layer_stride_bytes,
+        };
+    }
+
+    fn gqaDescsSlice(self: *const GraphBatchRuntime, gqa_idx: u32) []attention.BatchGqaSlotDesc {
+        const stride_elems = self.gqa_descs_layer_stride_bytes / @sizeOf(attention.BatchGqaSlotDesc);
+        const start = @as(usize, gqa_idx) * stride_elems;
+        return self.gqa_descs_host[start .. start + self.max_slots];
+    }
+
+    fn gqaDescsBinding(self: *const GraphBatchRuntime, gqa_idx: u32) metal.BufferBinding {
+        return .{
+            .buffer = self.batch_buf,
+            .offset = self.gqa_descs_base_off + @as(u64, gqa_idx) * self.gqa_descs_layer_stride_bytes,
+        };
+    }
+
+    fn releaseChunkGroup(self: *GraphBatchRuntime, group_id: u32) void {
+        if (group_id == GRAPH_NONE_GROUP or self.num_kv_layers == 0) return;
+        std.debug.assert(group_id < self.pool_chunk_groups);
+        self.pool_free_stack[self.pool_free_top] = group_id;
+        self.pool_free_top += 1;
+    }
+
+    fn reclaimEvicted(self: *GraphBatchRuntime, ev: prefix_cache_mod.EvictedEntry, handles: []const prefix_cache_mod.KvBlockHandle) void {
+        if (self.num_kv_layers > 0 and handles.len > 0 and handles[0].storage == .active_tile and handles[0].pool_slot_id < self.pool_chunk_groups) {
+            self.releaseChunkGroup(handles[0].pool_slot_id);
+        }
+        if (ev.gdn_snapshot_id != prefix_cache_mod.NO_SNAPSHOT) {
+            if (self.gdn_snapshot_pool) |*sp| {
+                sp.releaseSlot(ev.gdn_snapshot_id) catch unreachable;
+            }
+        }
+    }
+
+    fn acquireChunkGroup(self: *GraphBatchRuntime) ?u32 {
+        if (self.num_kv_layers == 0) return GRAPH_NONE_GROUP;
+        if (self.pool_free_top == 0) {
+            if (self.prefix_cache) |*pc| {
+                while (self.pool_free_top == 0) {
+                    const ev = pc.evictLru(self.scratch_evicted_handles) catch break;
+                    self.reclaimEvicted(ev, self.scratch_evicted_handles);
+                }
+            }
+        }
+        if (self.pool_free_top == 0) return null;
+        self.pool_free_top -= 1;
+        return self.pool_free_stack[self.pool_free_top];
+    }
+
+    fn acquireGdnSnapshotSlot(self: *GraphBatchRuntime) ?u32 {
+        var sp = &(self.gdn_snapshot_pool orelse return null);
+        if (sp.freeCount() == 0) {
+            if (self.prefix_cache) |*pc| {
+                while (sp.freeCount() == 0) {
+                    const ev = pc.evictLru(self.scratch_evicted_handles) catch break;
+                    self.reclaimEvicted(ev, self.scratch_evicted_handles);
+                }
+            }
+        }
+        return sp.acquireSlot() catch null;
+    }
+
+    fn clearSlotGdnState(self: *GraphBatchRuntime, slot_id: u32) void {
+        if (self.num_gdn_layers == 0) return;
+        const base = self.batch_arena.bytes();
+        for (0..self.num_gdn_layers) |g| {
+            const s_off: usize = @intCast(self.gdn_pool_base_off + g * self.gdn_layer_stride_bytes + @as(usize, slot_id) * self.gdn_slot_stride_bytes);
+            @memset(base[s_off .. s_off + self.gdn_slot_stride_bytes], 0);
+            if (self.gdn_conv_slot_stride_bytes > 0) {
+                const c_off: usize = @intCast(self.gdn_conv_pool_base_off + g * self.gdn_conv_layer_stride_bytes + @as(usize, slot_id) * self.gdn_conv_slot_stride_bytes);
+                @memset(base[c_off .. c_off + self.gdn_conv_slot_stride_bytes], 0);
+            }
+        }
+    }
+
+    fn saveOrRestoreGdnSnapshotGpu(self: *GraphBatchRuntime, slot_id: u32, snap_id: u32, is_restore: bool) bool {
+        const sp = &(self.gdn_snapshot_pool orelse return false);
+        const snap_state = sp.stateBinding(self.batch_buf, snap_id) catch return false;
+        const snap_conv = sp.convBinding(self.batch_buf, snap_id) catch return false;
+        const slot_state: metal.BufferBinding = .{
+            .buffer = self.batch_buf,
+            .offset = self.gdn_pool_base_off + @as(u64, slot_id) * self.gdn_slot_stride_bytes,
+        };
+        const slot_conv: ?metal.BufferBinding = if (self.gdn_conv_f16_per_layer > 0) .{
+            .buffer = self.batch_buf,
+            .offset = self.gdn_conv_pool_base_off + @as(u64, slot_id) * self.gdn_conv_slot_stride_bytes,
+        } else null;
+        const slot_state_layer_stride_f32: u32 = @intCast(self.gdn_layer_stride_bytes / @sizeOf(f32));
+        const slot_conv_layer_stride_f16: u32 = @intCast(self.gdn_conv_layer_stride_bytes / @sizeOf(f16));
+
+        var frame = self.model.compute.beginFrame(self.model.timeout_ms) catch return false;
+        self.model.hybrid_pipes.encodeGdnCloneState(&frame, .{
+            .src_state = if (is_restore) snap_state else slot_state,
+            .dst_state = if (is_restore) slot_state else snap_state,
+            .src_conv = if (is_restore) snap_conv else slot_conv,
+            .dst_conv = if (is_restore) slot_conv else snap_conv,
+            .num_gdn_layers = self.num_gdn_layers,
+            .state_f32_per_layer = sp.layer_state_elems,
+            .src_state_layer_stride_f32 = if (is_restore) sp.stateLayerStrideF32() else slot_state_layer_stride_f32,
+            .dst_state_layer_stride_f32 = if (is_restore) slot_state_layer_stride_f32 else sp.stateLayerStrideF32(),
+            .conv_f16_per_layer = self.gdn_conv_f16_per_layer,
+            .src_conv_layer_stride_f16 = if (is_restore) sp.convLayerStrideF16() else slot_conv_layer_stride_f16,
+            .dst_conv_layer_stride_f16 = if (is_restore) slot_conv_layer_stride_f16 else sp.convLayerStrideF16(),
+        }, false) catch {
+            frame.abort();
+            return false;
+        };
+        const sig = frame.commit() catch return false;
+        self.model.compute.wait(sig, self.model.timeout_ms) catch return false;
+        self.gdn_snapshot_clones += 1;
+        return true;
+    }
+
+    fn copyTailGroupGpu(self: *GraphBatchRuntime, src_group: u32, dst_group: u32, valid_tokens: u32) bool {
+        if (self.num_kv_layers == 0) return true;
+        var frame = self.model.compute.beginFrame(self.model.timeout_ms) catch return false;
+        for (0..self.num_kv_layers) |ki| {
+            const src_pair = self.poolTilePair(src_group, @intCast(ki));
+            const dst_pair = self.poolTilePair(dst_group, @intCast(ki));
+            prefix_cache_mod.PrefixCache.encodeTailCowCopy(
+                self.model.attn_pipes,
+                &frame,
+                src_pair.k,
+                src_pair.v,
+                dst_pair.k,
+                dst_pair.v,
+                self.model.config.num_key_value_heads,
+                self.model.config.head_dim,
+                self.kv_chunk_tokens,
+                valid_tokens,
+                false,
+            ) catch {
+                frame.abort();
+                return false;
+            };
+        }
+        const sig = frame.commit() catch return false;
+        self.model.compute.wait(sig, self.model.timeout_ms) catch return false;
+        self.prefix_cow_copies += 1;
+        return true;
+    }
+
+    fn refreshSlotQsaBlockSummaries(self: *GraphBatchRuntime, slot_id: u32, start_pos: u32, new_kv_len: u32) bool {
+        if (self.num_qsa_layers == 0 or new_kv_len == 0) return true;
+        var frame = self.model.compute.beginFrame(self.model.timeout_ms) catch return false;
+        var had = false;
+        const blk_tok = self.model.config.qsa_block_size;
+        for (self.model.layers, 0..) |layer, l| {
+            switch (layer.attn) {
+                .qsa => |qsa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const start_block: u32 = start_pos / blk_tok;
+                    const total_blocks: u32 = (new_kv_len + blk_tok - 1) / blk_tok;
+                    const num_blocks: u32 = if (total_blocks > start_block) (total_blocks - start_block) else 1;
+                    self.model.hybrid_pipes.encodeQsaUpdateBlockSummary(&frame, .{
+                        .kv_tiles = self.slotKvTilesBinding(kv_idx, slot_id),
+                        .block_keys = self.qsaSlotBlockKeysBinding(qsa.qsa_idx, slot_id),
+                        .num_kv_heads = self.model.config.num_key_value_heads,
+                        .head_dim = self.model.config.head_dim,
+                        .kv_len = new_kv_len,
+                        .window_size = 0,
+                        .ring_capacity = 0,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .block_tokens = blk_tok,
+                        .start_block = start_block,
+                        .num_blocks = num_blocks,
+                    }, had) catch {
+                        frame.abort();
+                        return false;
+                    };
+                    had = true;
+                },
+                else => {},
+            }
+        }
+        if (had) {
+            const sig = frame.commit() catch return false;
+            self.model.compute.wait(sig, self.model.timeout_ms) catch return false;
+        } else {
+            frame.abort();
+        }
+        return true;
+    }
+
+    fn ensureSlotWritableChunk(self: *GraphBatchRuntime, slot_id: u32, chunk_idx: u32) bool {
+        if (self.num_kv_layers == 0) return true;
+        if (chunk_idx >= self.max_chunks) return false;
+        const slot = &self.slots[slot_id];
+        if (slot.chunk_group_ids[chunk_idx] != GRAPH_NONE_GROUP) {
+            return !slot.chunk_is_shared[chunk_idx];
+        }
+        const g = self.acquireChunkGroup() orelse return false;
+        slot.chunk_group_ids[chunk_idx] = g;
+        slot.chunk_is_shared[chunk_idx] = false;
+        for (0..self.num_kv_layers) |ki| {
+            const pair = self.poolTilePair(g, @intCast(ki));
+            self.slotKvTilesSlice(@intCast(ki), slot_id)[chunk_idx] = attention.KvTilePair.fromTiles(pair.k, pair.v, .rgba16f);
+        }
+        return true;
+    }
+
+    fn resetSlotState(self: *GraphBatchRuntime, slot_id: u32) void {
+        if (slot_id >= self.max_slots) return;
+        const slot = &self.slots[slot_id];
+        if (self.prefix_cache) |*pc| {
+            for (slot.pinned_full_ids[0..slot.pinned_full_count]) |eid| {
+                pc.unpin(eid) catch unreachable;
+            }
+        }
+        slot.pinned_full_count = 0;
+        for (0..self.max_chunks) |c| {
+            const g = slot.chunk_group_ids[c];
+            if (g != GRAPH_NONE_GROUP and !slot.chunk_is_shared[c]) {
+                self.releaseChunkGroup(g);
+            }
+            slot.chunk_group_ids[c] = GRAPH_NONE_GROUP;
+            slot.chunk_is_shared[c] = false;
+        }
+        slot.seq_len = 0;
+        slot.matched_prefix_tokens = 0;
+        slot.prefix_cached_full_chunks = 0;
+        slot.last_cached_parent_id = prefix_cache_mod.NONE_ID;
+        slot.in_use = false;
+        self.clearSlotGdnState(slot_id);
+        for (0..self.num_kv_layers) |ki| {
+            @memset(self.slotKvTilesSlice(@intCast(ki), slot_id), .{ .k_tex_id = 0, .v_tex_id = 0 });
+        }
+    }
+
+    fn lookupPrefixCb(ctx: *anyopaque, slot_id: u16, prompt_tokens: []const u32) batch_sched.PrefixLookupResult {
+        const self: *GraphBatchRuntime = @ptrCast(@alignCast(ctx));
+        return self.lookupPrefix(slot_id, prompt_tokens);
+    }
+
+    pub fn lookupPrefix(self: *GraphBatchRuntime, slot_id: u16, prompt_tokens: []const u32) batch_sched.PrefixLookupResult {
+        if (slot_id >= self.max_slots) return .{};
+        self.resetSlotState(slot_id);
+        const slot = &self.slots[slot_id];
+        slot.in_use = true;
+        const handle: u64 = @as(u64, slot_id) + 1;
+
+        var pc = &(self.prefix_cache orelse return .{ .matched_tokens = 0, .prefix_handle = handle });
+        if (prompt_tokens.len <= 1 or prompt_tokens.len > self.model.max_seq_len) {
+            return .{ .matched_tokens = 0, .prefix_handle = handle };
+        }
+
+        const require_gdn = (self.num_gdn_layers > 0);
+        var match = pc.matchAndPin(prompt_tokens, slot.pinned_full_ids[0..self.max_chunks], .{
+            .max_match_tokens = prompt_tokens.len - 1,
+            .allow_partial_tail = true,
+            .require_gdn_snapshot = require_gdn,
+        }) catch return .{ .matched_tokens = 0, .prefix_handle = handle };
+
+        if (match.matched_tokens == 0) {
+            return .{ .matched_tokens = 0, .prefix_handle = handle };
+        }
+
+        // Bind shared full KV chunks (`0` copy).
+        if (self.num_kv_layers > 0) {
+            for (0..match.full_block_count) |ci| {
+                const eid = slot.pinned_full_ids[ci];
+                const h0 = pc.entryHandle(eid, 0) catch {
+                    pc.releaseMatch(&match, slot.pinned_full_ids[0..match.full_block_count]) catch unreachable;
+                    self.resetSlotState(slot_id);
+                    slot.in_use = true;
+                    return .{ .matched_tokens = 0, .prefix_handle = handle };
+                };
+                slot.chunk_group_ids[ci] = h0.pool_slot_id;
+                slot.chunk_is_shared[ci] = true;
+                for (0..self.num_kv_layers) |ki| {
+                    const hl = pc.entryHandle(eid, @intCast(ki)) catch unreachable;
+                    self.slotKvTilesSlice(@intCast(ki), slot_id)[ci] = hl.toTilePair();
+                }
+            }
+        }
+        slot.pinned_full_count = match.full_block_count;
+        slot.prefix_cached_full_chunks = match.full_block_count;
+        slot.last_cached_parent_id = if (match.full_block_count > 0)
+            slot.pinned_full_ids[match.full_block_count - 1]
+        else
+            prefix_cache_mod.NONE_ID;
+
+        var final_matched = match.full_block_count * self.kv_chunk_tokens;
+        var effective_snap = if (match.full_block_count > 0)
+            (pc.entryInfo(slot.pinned_full_ids[match.full_block_count - 1]) catch unreachable).gdn_snapshot_id
+        else
+            prefix_cache_mod.NO_SNAPSHOT;
+
+        if (match.tail_tokens > 0 and match.tail_entry_id != prefix_cache_mod.NONE_ID) {
+            if (self.num_kv_layers == 0) {
+                final_matched += match.tail_tokens;
+                effective_snap = match.gdn_snapshot_id;
+            } else {
+                const tail_c = match.full_block_count;
+                const tail_h0 = pc.entryHandle(match.tail_entry_id, 0) catch null;
+                if (tail_h0 != null and tail_h0.?.storage == .active_tile and tail_c < self.max_chunks) {
+                    if (self.acquireChunkGroup()) |dst_g| {
+                        if (self.copyTailGroupGpu(tail_h0.?.pool_slot_id, dst_g, match.tail_tokens)) {
+                            slot.chunk_group_ids[tail_c] = dst_g;
+                            slot.chunk_is_shared[tail_c] = false;
+                            for (0..self.num_kv_layers) |ki| {
+                                const pair = self.poolTilePair(dst_g, @intCast(ki));
+                                self.slotKvTilesSlice(@intCast(ki), slot_id)[tail_c] = attention.KvTilePair.fromTiles(pair.k, pair.v, .rgba16f);
+                            }
+                            final_matched += match.tail_tokens;
+                            effective_snap = match.gdn_snapshot_id;
+                        } else {
+                            self.releaseChunkGroup(dst_g);
+                        }
+                    }
+                }
+            }
+            pc.releaseTailPin(&match) catch unreachable;
+        }
+
+        // Restore GDN recurrent state + conv1d history snapshot on GPU (`ami_gdn_clone_state`).
+        if (require_gdn and final_matched > 0) {
+            if (effective_snap == prefix_cache_mod.NO_SNAPSHOT or
+                !self.saveOrRestoreGdnSnapshotGpu(slot_id, effective_snap, true))
+            {
+                self.resetSlotState(slot_id);
+                slot.in_use = true;
+                return .{ .matched_tokens = 0, .prefix_handle = handle };
+            }
+        }
+
+        // Refresh QSA block key summaries for the matched prefix tokens.
+        if (final_matched > 0 and self.num_qsa_layers > 0) {
+            if (!self.refreshSlotQsaBlockSummaries(slot_id, 0, final_matched)) {
+                self.resetSlotState(slot_id);
+                slot.in_use = true;
+                return .{ .matched_tokens = 0, .prefix_handle = handle };
+            }
+        }
+
+        @memcpy(slot.prompt_tokens[0..final_matched], prompt_tokens[0..final_matched]);
+        slot.seq_len = final_matched;
+        slot.matched_prefix_tokens = final_matched;
+        if (final_matched > 0) {
+            self.prefix_hits += 1;
+            self.prefix_hit_tokens += final_matched;
+        }
+        return .{ .matched_tokens = final_matched, .prefix_handle = handle };
+    }
+
+    fn populatePrefixCache(self: *GraphBatchRuntime, slot_id: u32, is_final_chunk: bool) void {
+        var pc = &(self.prefix_cache orelse return);
+        const slot = &self.slots[slot_id];
+        const bs = self.kv_chunk_tokens;
+
+        while ((slot.prefix_cached_full_chunks + 1) * bs <= slot.seq_len) {
+            const c = slot.prefix_cached_full_chunks;
+            if (!slot.chunk_is_shared[c]) {
+                var snap_id: u32 = prefix_cache_mod.NO_SNAPSHOT;
+                if (self.num_gdn_layers > 0) {
+                    // Only exact when `slot.seq_len == (c + 1) * bs` (GDN state matches exact boundary).
+                    if (slot.seq_len == (c + 1) * bs) {
+                        if (self.acquireGdnSnapshotSlot()) |sid| {
+                            if (self.saveOrRestoreGdnSnapshotGpu(slot_id, sid, false)) {
+                                snap_id = sid;
+                            } else {
+                                self.gdn_snapshot_pool.?.releaseSlot(sid) catch unreachable;
+                            }
+                        }
+                    }
+                    if (snap_id == prefix_cache_mod.NO_SNAPSHOT) {
+                        slot.prefix_cached_full_chunks += 1;
+                        continue;
+                    }
+                }
+
+                const gid = slot.chunk_group_ids[c];
+                if (self.num_kv_layers > 0) {
+                    if (gid == GRAPH_NONE_GROUP) {
+                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        break;
+                    }
+                    for (0..self.num_kv_layers) |ki| {
+                        const pair = self.poolTilePair(gid, @intCast(ki));
+                        self.scratch_handles[ki] = prefix_cache_mod.KvBlockHandle.activeFromTiles(pair.k, pair.v, gid);
+                    }
+                } else {
+                    self.scratch_handles[0] = .{ .k_tex_id = 0, .v_tex_id = 0, .pool_slot_id = 0, .storage = .active_tile };
+                }
+
+                const tok_start: usize = @as(usize, c) * bs;
+                const ins = pc.insertFullBlock(
+                    slot.last_cached_parent_id,
+                    slot.prompt_tokens[tok_start .. tok_start + bs],
+                    self.scratch_handles,
+                    .{
+                        .gdn_snapshot_id = snap_id,
+                        .evict_if_full = true,
+                        .evicted_handles_out = self.scratch_evicted_handles,
+                        .pin_on_insert = true,
+                    },
+                ) catch {
+                    if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                    break;
+                };
+                if (ins.evicted) |ev| self.reclaimEvicted(ev, self.scratch_evicted_handles);
+                if (ins.already_existed) {
+                    if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                    if (self.num_kv_layers > 0) {
+                        const eh0 = pc.entryHandle(ins.entry_id, 0) catch break;
+                        self.releaseChunkGroup(gid);
+                        slot.chunk_group_ids[c] = eh0.pool_slot_id;
+                        for (0..self.num_kv_layers) |ki| {
+                            const hl = pc.entryHandle(ins.entry_id, @intCast(ki)) catch break;
+                            self.slotKvTilesSlice(@intCast(ki), slot_id)[c] = hl.toTilePair();
+                        }
+                    }
+                }
+                slot.chunk_is_shared[c] = true;
+                slot.pinned_full_ids[slot.pinned_full_count] = ins.entry_id;
+                slot.pinned_full_count += 1;
+                slot.last_cached_parent_id = ins.entry_id;
+            }
+            slot.prefix_cached_full_chunks += 1;
+        }
+
+        // Snapshot final prompt tail (`1..bs-1`) with optional GDN checkpoint for exact reuse!
+        if (is_final_chunk) {
+            const tail_len = slot.seq_len % bs;
+            const tail_c = slot.seq_len / bs;
+            if (tail_len > 0 and tail_c < self.max_chunks and !slot.chunk_is_shared[tail_c]) {
+                var snap_id: u32 = prefix_cache_mod.NO_SNAPSHOT;
+                if (self.num_gdn_layers > 0) {
+                    if (self.acquireGdnSnapshotSlot()) |sid| {
+                        if (self.saveOrRestoreGdnSnapshotGpu(slot_id, sid, false)) {
+                            snap_id = sid;
+                        } else {
+                            self.gdn_snapshot_pool.?.releaseSlot(sid) catch unreachable;
+                            return;
+                        }
+                    } else return;
+                }
+                var snap_g: u32 = GRAPH_NONE_GROUP;
+                if (self.num_kv_layers > 0) {
+                    const src_g = slot.chunk_group_ids[tail_c];
+                    if (src_g == GRAPH_NONE_GROUP) {
+                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        return;
+                    }
+                    snap_g = self.acquireChunkGroup() orelse {
+                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        return;
+                    };
+                    if (!self.copyTailGroupGpu(src_g, snap_g, tail_len)) {
+                        self.releaseChunkGroup(snap_g);
+                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                        return;
+                    }
+                    for (0..self.num_kv_layers) |ki| {
+                        const pair = self.poolTilePair(snap_g, @intCast(ki));
+                        self.scratch_handles[ki] = prefix_cache_mod.KvBlockHandle.activeFromTiles(pair.k, pair.v, snap_g);
+                    }
+                } else {
+                    self.scratch_handles[0] = .{ .k_tex_id = 0, .v_tex_id = 0, .pool_slot_id = 0, .storage = .active_tile };
+                }
+
+                const tok_start: usize = @as(usize, tail_c) * bs;
+                if (pc.insertTailBlock(
+                    slot.last_cached_parent_id,
+                    slot.prompt_tokens[tok_start .. tok_start + tail_len],
+                    self.scratch_handles,
+                    .{
+                        .gdn_snapshot_id = snap_id,
+                        .evict_if_full = true,
+                        .evicted_handles_out = self.scratch_evicted_handles,
+                        .pin_on_insert = false,
+                    },
+                )) |ins| {
+                    if (ins.evicted) |ev| self.reclaimEvicted(ev, self.scratch_evicted_handles);
+                    if (ins.already_existed) {
+                        self.releaseChunkGroup(snap_g);
+                        if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                    }
+                } else |_| {
+                    self.releaseChunkGroup(snap_g);
+                    if (snap_id != prefix_cache_mod.NO_SNAPSHOT) self.gdn_snapshot_pool.?.releaseSlot(snap_id) catch unreachable;
+                }
+            }
+        }
+    }
+
+    fn runSlotPrefillSubChunk(
+        self: *GraphBatchRuntime,
+        slot_id: u32,
+        tokens: []const u32,
+        base_pos: u32,
+        compute_logits: bool,
+    ) GraphStepError!u32 {
+        const model = self.model;
+        const slot = &self.slots[slot_id];
+        const m: u32 = @intCast(tokens.len);
+        const h = model.config.hidden_size;
+
+        var acc_nodes: [hybrid.MAX_TREE_NODES]u16 = undefined;
+        for (0..m) |i| {
+            const p = base_pos + @as(u32, @intCast(i));
+            model.token_ids_host[i] = tokens[i];
+            model.positions_host[i] = p;
+            model.pos3d_host[i] = hybrid.Pos3D.text(p);
+            model.ancestor_masks_host[i] = if (i == 63) std.math.maxInt(u64) else ((@as(u64, 1) << @intCast(i + 1)) - 1);
+            acc_nodes[i] = @intCast(i);
+        }
+
+        if (self.num_kv_layers > 0) {
+            const c0: u32 = base_pos / self.kv_chunk_tokens;
+            const c1: u32 = (base_pos + m - 1) / self.kv_chunk_tokens;
+            var ci: u32 = c0;
+            while (ci <= c1) : (ci += 1) {
+                if (!self.ensureSlotWritableChunk(slot_id, ci)) return error.SequenceFull;
+            }
+        }
+
+        var frame = try model.compute.beginFrame(model.timeout_ms);
+        errdefer frame.abort();
+
+        try model.moe_pipes.encodeEmbedLookup(&frame, model.embed.dtype, .{
+            .weight = model.embed.weight,
+            .scale_bias = model.embed.scale_bias,
+            .tokens = .{ .token_ids = model.token_ids_bind },
+            .out = model.x_bind,
+            .m = m,
+            .vocab_size = model.config.vocab_size,
+            .hidden_size = h,
+        }, false);
+
+        if (model.gr_arena) |*gr| {
+            try model.hybrid_pipes.encodeGrInitStream0(&frame, .{
+                .x0 = model.x_bind,
+                .stream = gr.binding(model.scratch_buf),
+                .m = m,
+                .hidden_dim = h,
+                .branch_token_stride = model.max_tree_nodes,
+            }, true);
+        }
+
+        for (model.layers, 0..) |*layer, l| {
+            // Optional 4-branch GR read gate
+            if (model.gr_arena) |*gr| {
+                const grw = layer.gr.?;
+                try model.hybrid_pipes.encodeGrComputeGates(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .w_read = grw.read_gate,
+                    .w_write = grw.write_gate,
+                    .w_decay = grw.decay_gate,
+                    .g_read_out = model.gr_g_read_bind,
+                    .g_write_out = model.gr_g_write_bind,
+                    .decay_out = model.gr_decay_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                    .weight_dtype = grw.dtype,
+                }, true);
+                try model.hybrid_pipes.encodeGrReadGate(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .g_read = model.gr_g_read_bind,
+                    .x_in = model.x_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                }, true);
+            }
+
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = model.x_bind,
+                .w = layer.input_layernorm.binding,
+                .y = model.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true);
+
+            switch (layer.attn) {
+                .gdn => |g| {
+                    try model.encodeLinearBatched(&frame, g.q_proj, model.x_norm_bind, model.q_bind, m, true);
+                    try model.encodeLinearBatched(&frame, g.k_proj, model.x_norm_bind, model.k_bind, m, false);
+                    try model.encodeLinearBatched(&frame, g.v_proj, model.x_norm_bind, model.v_bind, m, false);
+                    try model.encodeLinearBatched(&frame, g.g_proj, model.x_norm_bind, model.gdn_z_bind, m, false);
+                    try model.hybrid_pipes.encodeGdnComputeGates(&frame, .{
+                        .x = model.x_norm_bind,
+                        .w_a = g.a_proj,
+                        .w_b = g.b_proj,
+                        .a_log = g.a_log,
+                        .dt_bias = g.dt_bias,
+                        .g_out = .{ .buffer = model.scratch_buf, .offset = g.tree_g_off },
+                        .beta_out = .{ .buffer = model.scratch_buf, .offset = g.tree_beta_off },
+                        .m = m,
+                        .hidden_dim = h,
+                        .num_v_heads = model.config.linear_num_value_heads,
+                        .weight_dtype = g.ab_dtype,
+                    }, false);
+
+                    var q_eff = model.q_bind;
+                    var k_eff: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = g.tree_k_off };
+                    var v_eff: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = g.tree_v_off };
+                    if (g.conv1d_w) |cw| {
+                        const conv_bind = self.gdnSlotConvBinding(g.gdn_idx, slot_id);
+                        try model.hybrid_pipes.encodeGdnConv1dSilu(&frame, .{
+                            .q_in = model.q_bind,
+                            .k_in = model.k_bind,
+                            .v_in = model.v_bind,
+                            .conv_w = cw,
+                            .conv_state_in = conv_bind,
+                            .conv_state_out = conv_bind,
+                            .q_out = model.q_conv_bind,
+                            .k_out = k_eff,
+                            .v_out = v_eff,
+                            .m = m,
+                            .gdn_qk = model.config.gdnQkDim(),
+                            .gdn_v = model.config.gdnVDim(),
+                            .conv_k = g.conv_k,
+                            .is_tree = false,
+                            .write_state = true,
+                        }, true);
+                        q_eff = model.q_conv_bind;
+                    } else {
+                        k_eff = model.k_bind;
+                        v_eff = model.v_bind;
+                    }
+
+                    const slot_s = self.gdnSlotStateBinding(g.gdn_idx, slot_id);
+                    if (m == 1) {
+                        try model.hybrid_pipes.encodeGdnDecode(&frame, .{
+                            .q = q_eff,
+                            .k = k_eff,
+                            .v = v_eff,
+                            .g = .{ .buffer = model.scratch_buf, .offset = g.tree_g_off },
+                            .beta = .{ .buffer = model.scratch_buf, .offset = g.tree_beta_off },
+                            .z = model.gdn_z_bind,
+                            .norm_w = if (g.out_norm) |n| n.binding else null,
+                            .norm_dtype = if (g.out_norm) |n| n.dtype else .f16,
+                            .state_in = slot_s,
+                            .state_out = slot_s,
+                            .out = model.attn_out_bind,
+                            .num_k_heads = model.config.linear_num_key_heads,
+                            .num_v_heads = model.config.linear_num_value_heads,
+                            .head_k_dim = model.config.linear_key_head_dim,
+                            .head_v_dim = model.config.linear_value_head_dim,
+                            .rms_eps = model.config.rms_norm_eps,
+                        }, true);
+                    } else {
+                        try model.hybrid_pipes.encodeGdnPrefill(&frame, .{
+                            .q = q_eff,
+                            .k = k_eff,
+                            .v = v_eff,
+                            .g = .{ .buffer = model.scratch_buf, .offset = g.tree_g_off },
+                            .beta = .{ .buffer = model.scratch_buf, .offset = g.tree_beta_off },
+                            .z = model.gdn_z_bind,
+                            .norm_w = if (g.out_norm) |n| n.binding else null,
+                            .norm_dtype = if (g.out_norm) |n| n.dtype else .f16,
+                            .state_in = slot_s,
+                            .state_out = slot_s,
+                            .out = model.attn_out_bind,
+                            .seq_len = m,
+                            .num_k_heads = model.config.linear_num_key_heads,
+                            .num_v_heads = model.config.linear_num_value_heads,
+                            .head_k_dim = model.config.linear_key_head_dim,
+                            .head_v_dim = model.config.linear_value_head_dim,
+                            .rms_eps = model.config.rms_norm_eps,
+                        }, true);
+                    }
+                    try model.encodeLinearBatched(&frame, g.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
+                },
+                .qsa => |*qsa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const tree_k: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = qsa.tree_k_off };
+                    const tree_v: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = qsa.tree_v_off };
+                    try model.encodeLinearBatched(&frame, qsa.q_proj, model.x_norm_bind, model.q_bind, m, true);
+                    try model.encodeLinearBatched(&frame, qsa.k_proj, model.x_norm_bind, model.k_bind, m, false);
+                    try model.encodeLinearBatched(&frame, qsa.v_proj, model.x_norm_bind, model.v_bind, m, false);
+
+                    const mrope_rot: u32 = (model.config.mrope_section.section[0] + model.config.mrope_section.section[1] + model.config.mrope_section.section[2]) * 2;
+                    const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= model.config.head_dim) mrope_rot else model.config.head_dim;
+                    try model.hybrid_pipes.encodeQsaTreeRope(&frame, .{
+                        .q = model.q_bind,
+                        .k = model.k_bind,
+                        .v = model.v_bind,
+                        .q_norm = qsa.q_norm,
+                        .k_norm = qsa.k_norm,
+                        .positions_3d = model.pos3d_bind,
+                        .k_tree_out = tree_k,
+                        .v_tree_out = tree_v,
+                        .num_nodes = m,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .rotary_dim = eff_rot_dim,
+                        .mrope = model.config.mrope_section,
+                        .rms_eps = model.config.rms_norm_eps,
+                        .rope_theta = model.config.rope_theta,
+                        .yarn = model.config.yarn,
+                        .norm_dtype = qsa.qk_norm_dtype,
+                    }, true);
+
+                    const bk_bind = self.qsaSlotBlockKeysBinding(qsa.qsa_idx, slot_id);
+                    try model.hybrid_pipes.encodeQsaAttention(&frame, .{
+                        .q = model.q_bind,
+                        .kv_tiles = if (base_pos > 0) self.slotKvTilesBinding(kv_idx, slot_id) else null,
+                        .block_keys = bk_bind,
+                        .index_buf = &qsa.index_buf,
+                        .index_metal_buf = model.scratch_buf,
+                        .k_tree = tree_k,
+                        .v_tree = tree_v,
+                        .ancestor_masks = model.ancestor_masks_bind,
+                        .out = model.attn_out_bind,
+                        .num_nodes = m,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .kv_len = base_pos,
+                        .window_size = 0,
+                        .ring_capacity = 0,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .block_tokens = model.config.qsa_block_size,
+                        .top_k_blocks = model.config.qsa_top_k_blocks,
+                        .reuse_block_indices = false,
+                    }, true);
+
+                    // Commit KV rows into this slot's private tiles & refresh block summaries.
+                    const c0: u32 = base_pos / self.kv_chunk_tokens;
+                    const c1: u32 = (base_pos + m - 1) / self.kv_chunk_tokens;
+                    const p0 = self.poolTilePair(slot.chunk_group_ids[c0], kv_idx);
+                    const p1 = if (c1 != c0) self.poolTilePair(slot.chunk_group_ids[c1], kv_idx) else null;
+                    try model.hybrid_pipes.encodeQsaKvTreeCommit(&frame, .{
+                        .k_tree = tree_k,
+                        .v_tree = tree_v,
+                        .accepted_nodes = .{ .inline_u16 = acc_nodes[0..m] },
+                        .accepted_count = m,
+                        .k_tile0 = p0.k,
+                        .v_tile0 = p0.v,
+                        .k_tile1 = if (p1) |pp| pp.k else null,
+                        .v_tile1 = if (p1) |pp| pp.v else null,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .base_pos = base_pos,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .ring_capacity = 0,
+                    }, true);
+
+                    const new_kv_len = base_pos + m;
+                    const blk_tok = model.config.qsa_block_size;
+                    const start_blk = base_pos / blk_tok;
+                    const tot_blk = (new_kv_len + blk_tok - 1) / blk_tok;
+                    try model.hybrid_pipes.encodeQsaUpdateBlockSummary(&frame, .{
+                        .kv_tiles = self.slotKvTilesBinding(kv_idx, slot_id),
+                        .block_keys = bk_bind,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .kv_len = new_kv_len,
+                        .window_size = 0,
+                        .ring_capacity = 0,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .block_tokens = blk_tok,
+                        .start_block = start_blk,
+                        .num_blocks = if (tot_blk > start_blk) tot_blk - start_blk else 1,
+                    }, true);
+
+                    try model.encodeLinearBatched(&frame, qsa.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
+                },
+                .gqa => |gqa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const tree_k: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = gqa.tree_k_off };
+                    const tree_v: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = gqa.tree_v_off };
+                    try model.encodeLinearBatched(&frame, gqa.q_proj, model.x_norm_bind, model.q_bind, m, true);
+                    try model.encodeLinearBatched(&frame, gqa.k_proj, model.x_norm_bind, model.k_bind, m, false);
+                    try model.encodeLinearBatched(&frame, gqa.v_proj, model.x_norm_bind, model.v_bind, m, false);
+                    try model.attn_pipes.encodeTreeQkNormRope(&frame, .{
+                        .q = model.q_bind,
+                        .k = model.k_bind,
+                        .v = model.v_bind,
+                        .q_norm = gqa.q_norm,
+                        .k_norm = gqa.k_norm,
+                        .positions = model.positions_bind,
+                        .k_tree_out = tree_k,
+                        .v_tree_out = tree_v,
+                        .num_nodes = m,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .rms_eps = model.config.rms_norm_eps,
+                        .rope_theta = model.config.rope_theta,
+                        .norm_dtype = gqa.qk_norm_dtype,
+                    }, true);
+                    try model.attn_pipes.encodeGqaTreeVerifyAttn(&frame, .{
+                        .q = model.q_bind,
+                        .kv_tiles = if (base_pos > 0) self.slotKvTilesBinding(kv_idx, slot_id) else null,
+                        .base_pos = base_pos,
+                        .k_tree = tree_k,
+                        .v_tree = tree_v,
+                        .ancestor_masks = model.ancestor_masks_bind,
+                        .out = model.attn_out_bind,
+                        .scratch = model.gqa_scratch_bind,
+                        .max_splits = attention.MAX_SPLITS,
+                        .num_nodes = m,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                    }, true);
+
+                    const c0: u32 = base_pos / self.kv_chunk_tokens;
+                    const c1: u32 = (base_pos + m - 1) / self.kv_chunk_tokens;
+                    const p0 = self.poolTilePair(slot.chunk_group_ids[c0], kv_idx);
+                    const p1 = if (c1 != c0) self.poolTilePair(slot.chunk_group_ids[c1], kv_idx) else null;
+                    try model.attn_pipes.encodeKvTreeCommit(&frame, .{
+                        .k_tree = tree_k,
+                        .v_tree = tree_v,
+                        .accepted_nodes = .{ .inline_u16 = acc_nodes[0..m] },
+                        .accepted_count = m,
+                        .k_tile0 = p0.k,
+                        .v_tile0 = p0.v,
+                        .k_tile1 = if (p1) |pp| pp.k else null,
+                        .v_tile1 = if (p1) |pp| pp.v else null,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .base_pos = base_pos,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                    }, true);
+
+                    try model.encodeLinearBatched(&frame, gqa.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
+                },
+            }
+
+            // Residual add (4-branch GR or standard)
+            if (model.gr_arena) |*gr| {
+                try model.hybrid_pipes.encodeGrWriteGate(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .y_delta = model.proj_out_bind,
+                    .decay = model.gr_decay_bind,
+                    .g_write = model.gr_g_write_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                }, true);
+                const grw = layer.gr.?;
+                try model.hybrid_pipes.encodeGrComputeGates(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .w_read = grw.read_gate,
+                    .w_write = grw.write_gate,
+                    .w_decay = grw.decay_gate,
+                    .g_read_out = model.gr_g_read_bind,
+                    .g_write_out = model.gr_g_write_bind,
+                    .decay_out = model.gr_decay_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                    .weight_dtype = grw.dtype,
+                }, true);
+                try model.hybrid_pipes.encodeGrReadGate(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .g_read = model.gr_g_read_bind,
+                    .x_in = model.x_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                }, true);
+            } else {
+                try model.moe_pipes.encodeResidualAdd(&frame, .{
+                    .x = model.x_bind,
+                    .delta = model.proj_out_bind,
+                    .count = m * h,
+                }, true);
+            }
+
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = model.x_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = model.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, true);
+
+            try self.encodeLayerFfnBatched(&frame, l, layer, m);
+        }
+
+        if (model.gr_arena) |*gr| {
+            try model.hybrid_pipes.encodeGrCollapse(&frame, .{
+                .stream = gr.binding(model.scratch_buf),
+                .out = model.x_bind,
+                .mode = .mean,
+                .m = m,
+                .hidden_dim = h,
+                .branch_token_stride = model.max_tree_nodes,
+            }, true);
+        }
+
+        if (compute_logits) {
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = model.scratch_buf,
+                .offset = model.x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = last_x_bind,
+                .w = model.final_norm.binding,
+                .y = model.x_norm_bind,
+                .num_rows = 1,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = model.final_norm.dtype,
+            }, true);
+            try model.encodeLinearBatched(&frame, model.lm_head, model.x_norm_bind, model.logits_bind, 1, true);
+            try model.moe_pipes.encodeArgmaxRows(&frame, .{
+                .logits = model.logits_bind,
+                .out_token_ids = model.out_token_id_bind,
+                .num_rows = 1,
+                .vocab_size = model.config.vocab_size,
+                .logits_dtype = .f16,
+            }, true);
+        }
+
+        const sig = try frame.commit();
+        try model.compute.wait(sig, model.timeout_ms);
+        slot.seq_len = base_pos + m;
+        if (compute_logits) model.last_logits_row = 0;
+        return if (compute_logits) model.out_token_ids_host[0] else 0;
+    }
+
+    fn encodeLayerFfnBatched(
+        self: *GraphBatchRuntime,
+        frame: *metal.Compute.Frame,
+        l: usize,
+        layer: *GraphLayerWeights,
+        m: u32,
+    ) GraphStepError!void {
+        const model = self.model;
+        const h = model.config.hidden_size;
+        switch (model.config.axes.ffn_kind) {
+            .dense_swiglu => {
+                try model.encodeLinearBatched(frame, layer.dense_gate, model.x_norm_bind, model.dense_gate_bind, m, true);
+                try model.encodeLinearBatched(frame, layer.dense_up, model.x_norm_bind, model.dense_up_bind, m, false);
+                try model.moe_pipes.encodeSiluMul(frame, .{
+                    .gate = model.dense_gate_bind,
+                    .up = model.dense_up_bind,
+                    .out = model.dense_act_bind,
+                    .count = m * model.config.intermediate_size,
+                }, true);
+                try model.encodeLinearBatched(frame, layer.dense_down, model.dense_act_bind, model.proj_out_bind, m, true);
+                if (model.gr_arena) |*gr| {
+                    try model.hybrid_pipes.encodeGrWriteGate(frame, .{
+                        .stream = gr.binding(model.scratch_buf),
+                        .y_delta = model.proj_out_bind,
+                        .decay = model.gr_decay_bind,
+                        .g_write = model.gr_g_write_bind,
+                        .m = m,
+                        .hidden_dim = h,
+                        .branch_token_stride = model.max_tree_nodes,
+                    }, true);
+                } else {
+                    try model.moe_pipes.encodeResidualAdd(frame, .{
+                        .x = model.x_bind,
+                        .delta = model.proj_out_bind,
+                        .count = m * h,
+                    }, true);
+                }
+            },
+            .moe_swiglu => {
+                var layer_ws = model.moe_ws.?;
+                layer_ws.schedule_header_off = model.layer_sched_hdr_off + @as(u64, l) * 64;
+                const router_src: moe.RouterSource = if (layer.router_quant_dtype) |rqd| .{
+                    .quant_weights = .{
+                        .qweight = layer.router_binding,
+                        .scale_bias = layer.router_scale_bias.?,
+                        .bits = switch (rqd) {
+                            .q2_affine => .q2,
+                            .q3_affine => .q3,
+                            .q4_affine => .q4,
+                            else => return error.InvalidBatchSize,
+                        },
+                    },
+                } else .{
+                    .weights = .{
+                        .binding = layer.router_binding,
+                        .dtype = layer.router_dtype,
+                    },
+                };
+                const residual_bind: ?metal.BufferBinding = if (model.gr_arena != null) null else model.x_bind;
+                const out_bind: metal.BufferBinding = if (model.gr_arena != null) model.proj_out_bind else model.x_bind;
+                const moe_args: moe.MoELayerArgs = .{
+                    .x = model.x_norm_bind,
+                    .router = router_src,
+                    .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                    .expert_table = layer.expert_table,
+                    .workspace = &layer_ws,
+                    .workspace_buf = model.scratch_buf,
+                    .residual = residual_bind,
+                    .out = out_bind,
+                    .m = m,
+                    .num_experts = model.config.num_experts,
+                    .top_k = model.config.num_experts_per_tok,
+                    .hidden_size = h,
+                    .intermediate_size = model.config.moe_intermediate_size,
+                    .norm_topk_prob = model.config.norm_topk_prob,
+                    .shared_expert = layer.shared_expert,
+                    .shared_weights_base = if (layer.shared_expert_buf) |sb| .{ .buffer = sb, .offset = 0 } else null,
+                    .shared_expert_dtype = layer.shared_expert_dtype,
+                    .shared_intermediate_size = model.config.shared_expert_intermediate_size,
+                    .shared_gate_weight = layer.shared_gate_weight,
+                    .shared_gate_dtype = layer.shared_gate_dtype,
+                };
+                if (layer.is_hetero_moe) {
+                    try model.moe_pipes.encodeMoELayerHetero(frame, .{
+                        .base = moe_args,
+                        .expert_schemes = layer.expert_dtypes_binding.?,
+                        .scheme_counts = layer.expert_scheme_counts,
+                    }, true);
+                } else {
+                    switch (layer.expert_weight_dtype) {
+                        .q2_affine => try model.moe_pipes.encodeMoELayer(frame, .q2, moe_args, true),
+                        .q3_affine => try model.moe_pipes.encodeMoELayer(frame, .q3, moe_args, true),
+                        .q4_affine => try model.moe_pipes.encodeMoELayer(frame, .q4, moe_args, true),
+                        .f16 => try model.moe_pipes.encodeMoELayerFloat(frame, .f16, moe_args, true),
+                        .bf16 => try model.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, true),
+                    }
+                }
+                if (model.gr_arena) |*gr| {
+                    try model.hybrid_pipes.encodeGrWriteGate(frame, .{
+                        .stream = gr.binding(model.scratch_buf),
+                        .y_delta = model.proj_out_bind,
+                        .decay = model.gr_decay_bind,
+                        .g_write = model.gr_g_write_bind,
+                        .m = m,
+                        .hidden_dim = h,
+                        .branch_token_stride = model.max_tree_nodes,
+                    }, true);
+                }
+            },
+        }
+    }
+
+    fn prefillSlotCb(ctx: *anyopaque, chunk: *const batch_sched.PrefillChunkView) batch_sched.BackendError!batch_sched.PrefillResult {
+        const self: *GraphBatchRuntime = @ptrCast(@alignCast(ctx));
+        return self.prefillSlot(chunk);
+    }
+
+    pub fn prefillSlot(self: *GraphBatchRuntime, chunk: *const batch_sched.PrefillChunkView) batch_sched.BackendError!batch_sched.PrefillResult {
+        if (chunk.slot_id >= self.max_slots or chunk.tokens.len == 0) return error.InvalidState;
+        if (chunk.start_pos + chunk.tokens.len > self.model.max_seq_len) return error.PrefillFailed;
+        const slot = &self.slots[chunk.slot_id];
+        if (!slot.in_use) {
+            self.resetSlotState(chunk.slot_id);
+            slot.in_use = true;
+        }
+        @memcpy(slot.prompt_tokens[chunk.start_pos .. chunk.start_pos + chunk.tokens.len], chunk.tokens);
+
+        const sub_cap: usize = self.model.max_tree_nodes;
+        const bs: usize = self.kv_chunk_tokens;
+        var off: usize = 0;
+        var last_argmax: u32 = 0;
+        while (off < chunk.tokens.len) {
+            const sub_pos = chunk.start_pos + @as(u32, @intCast(off));
+            // Align sub-chunk end to full-block boundary so GDN snapshots land on exact block boundaries!
+            const to_boundary = bs - (@as(usize, sub_pos) % bs);
+            const take = @min(@min(sub_cap, chunk.tokens.len - off), to_boundary);
+            const is_last = (off + take == chunk.tokens.len) and chunk.is_final_chunk;
+            last_argmax = self.runSlotPrefillSubChunk(
+                chunk.slot_id,
+                chunk.tokens[off .. off + take],
+                sub_pos,
+                is_last,
+            ) catch return error.PrefillFailed;
+            self.populatePrefixCache(chunk.slot_id, is_last);
+            off += take;
+        }
+
+        if (chunk.is_final_chunk) {
+            const first_tok: u32 = if (chunk.temperature > 0.0)
+                self.model.sampleFromLastLogits(chunk.temperature, chunk.rng.random(), self.p_res) catch return error.PrefillFailed
+            else
+                last_argmax;
+            return .{ .first_token = first_tok };
+        }
+        return .{};
+    }
+
+    fn stepDecodeBatchCb(
+        ctx: *anyopaque,
+        view: *const batch_sched.BatchStepView,
+        out_next_tokens: []u32,
+    ) batch_sched.BackendError!void {
+        const self: *GraphBatchRuntime = @ptrCast(@alignCast(ctx));
+        return self.stepDecodeBatch(view, out_next_tokens);
+    }
+
+    /// Advances all `B = view.batchSize()` (`1 <= B <= max_slots`) active hybrid
+    /// `GDN + QSA/GQA + MoE/Dense + GR` decode slots in ONE batched `M = B` Metal 4 pass!
+    pub fn stepDecodeBatch(
+        self: *GraphBatchRuntime,
+        view: *const batch_sched.BatchStepView,
+        out_next_tokens: []u32,
+    ) batch_sched.BackendError!void {
+        const b_usize = view.batchSize();
+        if (b_usize == 0 or b_usize > self.max_slots or out_next_tokens.len < b_usize) {
+            return error.InvalidState;
+        }
+        const b_u32: u32 = @intCast(b_usize);
+        const model = self.model;
+        const h = model.config.hidden_size;
+        const v_size: usize = model.config.vocab_size;
+
+        var max_seq: u32 = 0;
+        for (0..b_usize) |bi| {
+            const sid: u32 = view.slot_ids[bi];
+            const tok = view.input_tokens[bi];
+            const pos = view.seq_positions[bi];
+            if (sid >= self.max_slots or tok >= model.config.vocab_size or pos >= model.max_seq_len) {
+                return error.DecodeFailed;
+            }
+            if (self.num_kv_layers > 0) {
+                if (!self.ensureSlotWritableChunk(sid, pos / self.kv_chunk_tokens)) return error.SlotUnavailable;
+            }
+            model.token_ids_host[bi] = tok;
+            model.positions_host[bi] = pos;
+            model.pos3d_host[bi] = hybrid.Pos3D.text(pos);
+            model.ancestor_masks_host[bi] = 1;
+            self.gdn_slot_ids_host[bi] = sid;
+            max_seq = @max(max_seq, pos + 1);
+        }
+
+        // Stage per-GQA-layer batch write slots & slot descriptors.
+        for (model.layers, 0..) |layer, l| {
+            switch (layer.attn) {
+                .gqa => |gqa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const w_slots = self.gqaWriteSlotsSlice(gqa.gqa_idx);
+                    const g_descs = self.gqaDescsSlice(gqa.gqa_idx);
+                    for (0..b_usize) |bi| {
+                        const sid: u32 = view.slot_ids[bi];
+                        const pos = view.seq_positions[bi];
+                        const c = pos / self.kv_chunk_tokens;
+                        const pair = self.poolTilePair(self.slots[sid].chunk_group_ids[c], kv_idx);
+                        w_slots[bi] = attention.BatchKvWriteSlot.fromTiles(pair.k, pair.v, pos, self.kv_chunk_tokens);
+                        g_descs[bi] = .{
+                            .seq_len = pos + 1,
+                            .tile_table_offset = sid * self.max_chunks,
+                            .retired_offset = 0,
+                            .num_retired_chunks = 0,
+                        };
+                    }
+                },
+                else => {},
+            }
+        }
+
+        var frame = model.compute.beginFrame(model.timeout_ms) catch return error.DecodeFailed;
+        errdefer frame.abort();
+
+        model.moe_pipes.encodeEmbedLookup(&frame, model.embed.dtype, .{
+            .weight = model.embed.weight,
+            .scale_bias = model.embed.scale_bias,
+            .tokens = .{ .token_ids = model.token_ids_bind },
+            .out = model.x_bind,
+            .m = b_u32,
+            .vocab_size = model.config.vocab_size,
+            .hidden_size = h,
+        }, false) catch return error.DecodeFailed;
+
+        if (model.gr_arena) |*gr| {
+            model.hybrid_pipes.encodeGrInitStream0(&frame, .{
+                .x0 = model.x_bind,
+                .stream = gr.binding(model.scratch_buf),
+                .m = b_u32,
+                .hidden_dim = h,
+                .branch_token_stride = model.max_tree_nodes,
+            }, true) catch return error.DecodeFailed;
+        }
+
+        const gdn_slot_ids_bind: metal.BufferBinding = .{ .buffer = self.batch_buf, .offset = self.gdn_slot_ids_off };
+        const gdn_slot_stride_f32: u32 = if (self.gdn_slot_stride_bytes > 0)
+            @intCast(self.gdn_slot_stride_bytes / @sizeOf(f32))
+        else
+            0;
+
+        for (model.layers, 0..) |*layer, l| {
+            if (model.gr_arena) |*gr| {
+                const grw = layer.gr.?;
+                model.hybrid_pipes.encodeGrComputeGates(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .w_read = grw.read_gate,
+                    .w_write = grw.write_gate,
+                    .w_decay = grw.decay_gate,
+                    .g_read_out = model.gr_g_read_bind,
+                    .g_write_out = model.gr_g_write_bind,
+                    .decay_out = model.gr_decay_bind,
+                    .m = b_u32,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                    .weight_dtype = grw.dtype,
+                }, true) catch return error.DecodeFailed;
+                model.hybrid_pipes.encodeGrReadGate(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .g_read = model.gr_g_read_bind,
+                    .x_in = model.x_bind,
+                    .m = b_u32,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                }, true) catch return error.DecodeFailed;
+            }
+
+            model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = model.x_bind,
+                .w = layer.input_layernorm.binding,
+                .y = model.x_norm_bind,
+                .num_rows = b_u32,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true) catch return error.DecodeFailed;
+
+            switch (layer.attn) {
+                .gdn => |g| {
+                    model.encodeLinearBatched(&frame, g.q_proj, model.x_norm_bind, model.q_bind, b_u32, true) catch return error.DecodeFailed;
+                    model.encodeLinearBatched(&frame, g.k_proj, model.x_norm_bind, model.k_bind, b_u32, false) catch return error.DecodeFailed;
+                    model.encodeLinearBatched(&frame, g.v_proj, model.x_norm_bind, model.v_bind, b_u32, false) catch return error.DecodeFailed;
+                    model.encodeLinearBatched(&frame, g.g_proj, model.x_norm_bind, model.gdn_z_bind, b_u32, false) catch return error.DecodeFailed;
+                    model.hybrid_pipes.encodeGdnComputeGates(&frame, .{
+                        .x = model.x_norm_bind,
+                        .w_a = g.a_proj,
+                        .w_b = g.b_proj,
+                        .a_log = g.a_log,
+                        .dt_bias = g.dt_bias,
+                        .g_out = .{ .buffer = model.scratch_buf, .offset = g.tree_g_off },
+                        .beta_out = .{ .buffer = model.scratch_buf, .offset = g.tree_beta_off },
+                        .m = b_u32,
+                        .hidden_dim = h,
+                        .num_v_heads = model.config.linear_num_value_heads,
+                        .weight_dtype = g.ab_dtype,
+                    }, false) catch return error.DecodeFailed;
+
+                    var q_eff = model.q_bind;
+                    var k_eff = model.k_bind;
+                    var v_eff = model.v_bind;
+                    if (g.conv1d_w) |cw| {
+                        const qk_d: u64 = model.config.gdnQkDim();
+                        const v_d: u64 = model.config.gdnVDim();
+                        for (0..b_usize) |bi| {
+                            const sid: u32 = view.slot_ids[bi];
+                            const conv_bind = self.gdnSlotConvBinding(g.gdn_idx, sid);
+                            model.hybrid_pipes.encodeGdnConv1dSilu(&frame, .{
+                                .q_in = .{ .buffer = model.q_bind.buffer, .offset = model.q_bind.offset + @as(u64, bi) * qk_d * 2 },
+                                .k_in = .{ .buffer = model.k_bind.buffer, .offset = model.k_bind.offset + @as(u64, bi) * qk_d * 2 },
+                                .v_in = .{ .buffer = model.v_bind.buffer, .offset = model.v_bind.offset + @as(u64, bi) * v_d * 2 },
+                                .conv_w = cw,
+                                .conv_state_in = conv_bind,
+                                .conv_state_out = conv_bind,
+                                .q_out = .{ .buffer = model.q_conv_bind.buffer, .offset = model.q_conv_bind.offset + @as(u64, bi) * qk_d * 2 },
+                                .k_out = .{ .buffer = model.scratch_buf, .offset = g.tree_k_off + @as(u64, bi) * qk_d * 2 },
+                                .v_out = .{ .buffer = model.scratch_buf, .offset = g.tree_v_off + @as(u64, bi) * v_d * 2 },
+                                .m = 1,
+                                .gdn_qk = model.config.gdnQkDim(),
+                                .gdn_v = model.config.gdnVDim(),
+                                .conv_k = g.conv_k,
+                                .is_tree = false,
+                                .write_state = true,
+                            }, bi == 0) catch return error.DecodeFailed;
+                        }
+                        q_eff = model.q_conv_bind;
+                        k_eff = .{ .buffer = model.scratch_buf, .offset = g.tree_k_off };
+                        v_eff = .{ .buffer = model.scratch_buf, .offset = g.tree_v_off };
+                    }
+
+                    // ONE batched `ami_gdn_batch_decode` dispatch updating all `B` slots concurrently!
+                    const pool_bind = self.gdnLayerPoolBinding(g.gdn_idx);
+                    model.hybrid_pipes.encodeGdnBatchDecode(&frame, .{
+                        .q = q_eff,
+                        .k = k_eff,
+                        .v = v_eff,
+                        .g = .{ .buffer = model.scratch_buf, .offset = g.tree_g_off },
+                        .beta = .{ .buffer = model.scratch_buf, .offset = g.tree_beta_off },
+                        .z = model.gdn_z_bind,
+                        .norm_w = if (g.out_norm) |n| n.binding else null,
+                        .norm_dtype = if (g.out_norm) |n| n.dtype else .f16,
+                        .state_in_pool = pool_bind,
+                        .state_out_pool = pool_bind,
+                        .out = model.attn_out_bind,
+                        .state_in_slots = gdn_slot_ids_bind,
+                        .batch_size = b_u32,
+                        .num_k_heads = model.config.linear_num_key_heads,
+                        .num_v_heads = model.config.linear_num_value_heads,
+                        .head_k_dim = model.config.linear_key_head_dim,
+                        .head_v_dim = model.config.linear_value_head_dim,
+                        .slot_stride_f32 = gdn_slot_stride_f32,
+                        .rms_eps = model.config.rms_norm_eps,
+                    }, true) catch return error.DecodeFailed;
+
+                    model.encodeLinearBatched(&frame, g.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+                },
+                .qsa => |*qsa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const tree_k: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = qsa.tree_k_off };
+                    const tree_v: metal.BufferBinding = .{ .buffer = model.scratch_buf, .offset = qsa.tree_v_off };
+                    model.encodeLinearBatched(&frame, qsa.q_proj, model.x_norm_bind, model.q_bind, b_u32, true) catch return error.DecodeFailed;
+                    model.encodeLinearBatched(&frame, qsa.k_proj, model.x_norm_bind, model.k_bind, b_u32, false) catch return error.DecodeFailed;
+                    model.encodeLinearBatched(&frame, qsa.v_proj, model.x_norm_bind, model.v_bind, b_u32, false) catch return error.DecodeFailed;
+
+                    const mrope_rot: u32 = (model.config.mrope_section.section[0] + model.config.mrope_section.section[1] + model.config.mrope_section.section[2]) * 2;
+                    const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= model.config.head_dim) mrope_rot else model.config.head_dim;
+                    model.hybrid_pipes.encodeQsaTreeRope(&frame, .{
+                        .q = model.q_bind,
+                        .k = model.k_bind,
+                        .v = model.v_bind,
+                        .q_norm = qsa.q_norm,
+                        .k_norm = qsa.k_norm,
+                        .positions_3d = model.pos3d_bind,
+                        .k_tree_out = tree_k,
+                        .v_tree_out = tree_v,
+                        .num_nodes = b_u32,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .rotary_dim = eff_rot_dim,
+                        .mrope = model.config.mrope_section,
+                        .rms_eps = model.config.rms_norm_eps,
+                        .rope_theta = model.config.rope_theta,
+                        .yarn = model.config.yarn,
+                        .norm_dtype = qsa.qk_norm_dtype,
+                    }, true) catch return error.DecodeFailed;
+
+                    const q_row_bytes: u64 = @as(u64, model.config.qDim()) * @sizeOf(f16);
+                    const kv_row_bytes: u64 = @as(u64, model.config.kvDim()) * @sizeOf(f16);
+                    const blk_tok = model.config.qsa_block_size;
+                    for (0..b_usize) |bi| {
+                        const sid: u32 = view.slot_ids[bi];
+                        const pos = view.seq_positions[bi];
+                        const bk_bind = self.qsaSlotBlockKeysBinding(qsa.qsa_idx, sid);
+                        const q_sub: metal.BufferBinding = .{ .buffer = model.q_bind.buffer, .offset = model.q_bind.offset + @as(u64, bi) * q_row_bytes };
+                        const out_sub: metal.BufferBinding = .{ .buffer = model.attn_out_bind.buffer, .offset = model.attn_out_bind.offset + @as(u64, bi) * q_row_bytes };
+                        const kt_sub: metal.BufferBinding = .{ .buffer = tree_k.buffer, .offset = tree_k.offset + @as(u64, bi) * kv_row_bytes };
+                        const vt_sub: metal.BufferBinding = .{ .buffer = tree_v.buffer, .offset = tree_v.offset + @as(u64, bi) * kv_row_bytes };
+                        model.hybrid_pipes.encodeQsaAttention(&frame, .{
+                            .q = q_sub,
+                            .kv_tiles = if (pos > 0) self.slotKvTilesBinding(kv_idx, sid) else null,
+                            .block_keys = bk_bind,
+                            .index_buf = &qsa.index_buf,
+                            .index_metal_buf = model.scratch_buf,
+                            .k_tree = kt_sub,
+                            .v_tree = vt_sub,
+                            .ancestor_masks = model.ancestor_masks_bind,
+                            .out = out_sub,
+                            .num_nodes = 1,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .kv_len = pos,
+                            .window_size = 0,
+                            .ring_capacity = 0,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .block_tokens = blk_tok,
+                            .top_k_blocks = model.config.qsa_top_k_blocks,
+                            .reuse_block_indices = false,
+                        }, true) catch return error.DecodeFailed;
+
+                        const c = pos / self.kv_chunk_tokens;
+                        const pair = self.poolTilePair(self.slots[sid].chunk_group_ids[c], kv_idx);
+                        const acc1 = [_]u16{0};
+                        model.hybrid_pipes.encodeQsaKvTreeCommit(&frame, .{
+                            .k_tree = kt_sub,
+                            .v_tree = vt_sub,
+                            .accepted_nodes = .{ .inline_u16 = &acc1 },
+                            .accepted_count = 1,
+                            .k_tile0 = pair.k,
+                            .v_tile0 = pair.v,
+                            .k_tile1 = null,
+                            .v_tile1 = null,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .base_pos = pos,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .ring_capacity = 0,
+                        }, true) catch return error.DecodeFailed;
+
+                        model.hybrid_pipes.encodeQsaUpdateBlockSummary(&frame, .{
+                            .kv_tiles = self.slotKvTilesBinding(kv_idx, sid),
+                            .block_keys = bk_bind,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .kv_len = pos + 1,
+                            .window_size = 0,
+                            .ring_capacity = 0,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .block_tokens = blk_tok,
+                            .start_block = pos / blk_tok,
+                            .num_blocks = 1,
+                        }, true) catch return error.DecodeFailed;
+                    }
+
+                    model.encodeLinearBatched(&frame, qsa.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+                },
+                .gqa => |gqa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    model.encodeLinearBatched(&frame, gqa.q_proj, model.x_norm_bind, model.q_bind, b_u32, true) catch return error.DecodeFailed;
+                    model.encodeLinearBatched(&frame, gqa.k_proj, model.x_norm_bind, model.k_bind, b_u32, false) catch return error.DecodeFailed;
+                    model.encodeLinearBatched(&frame, gqa.v_proj, model.x_norm_bind, model.v_bind, b_u32, false) catch return error.DecodeFailed;
+
+                    model.attn_pipes.encodeBatchQkNormRopeKvWrite(&frame, .{
+                        .q = model.q_bind,
+                        .k = model.k_bind,
+                        .v = model.v_bind,
+                        .q_norm = gqa.q_norm,
+                        .k_norm = gqa.k_norm,
+                        .slots = self.gqaWriteSlotsBinding(gqa.gqa_idx),
+                        .batch_size = b_u32,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .rms_eps = model.config.rms_norm_eps,
+                        .rope_theta = model.config.rope_theta,
+                        .norm_dtype = gqa.qk_norm_dtype,
+                    }, true) catch return error.DecodeFailed;
+
+                    model.attn_pipes.encodeBatchGqaDecodeAttn(&frame, .{
+                        .q = model.q_bind,
+                        .kv_tiles = self.layerKvTilesBinding(kv_idx),
+                        .slots = self.gqaDescsBinding(gqa.gqa_idx),
+                        .out = model.attn_out_bind,
+                        .scratch = self.gqa_batch_scratch_bind,
+                        .max_splits = attention.MAX_SPLITS,
+                        .batch_size = b_u32,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .max_seq_len = max_seq,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                    }, true) catch return error.DecodeFailed;
+
+                    model.encodeLinearBatched(&frame, gqa.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+                },
+            }
+
+            if (model.gr_arena) |*gr| {
+                model.hybrid_pipes.encodeGrWriteGate(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .y_delta = model.proj_out_bind,
+                    .decay = model.gr_decay_bind,
+                    .g_write = model.gr_g_write_bind,
+                    .m = b_u32,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                }, true) catch return error.DecodeFailed;
+                const grw = layer.gr.?;
+                model.hybrid_pipes.encodeGrComputeGates(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .w_read = grw.read_gate,
+                    .w_write = grw.write_gate,
+                    .w_decay = grw.decay_gate,
+                    .g_read_out = model.gr_g_read_bind,
+                    .g_write_out = model.gr_g_write_bind,
+                    .decay_out = model.gr_decay_bind,
+                    .m = b_u32,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                    .weight_dtype = grw.dtype,
+                }, true) catch return error.DecodeFailed;
+                model.hybrid_pipes.encodeGrReadGate(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .g_read = model.gr_g_read_bind,
+                    .x_in = model.x_bind,
+                    .m = b_u32,
+                    .hidden_dim = h,
+                    .branch_token_stride = model.max_tree_nodes,
+                }, true) catch return error.DecodeFailed;
+            } else {
+                model.moe_pipes.encodeResidualAdd(&frame, .{
+                    .x = model.x_bind,
+                    .delta = model.proj_out_bind,
+                    .count = b_u32 * h,
+                }, true) catch return error.DecodeFailed;
+            }
+
+            model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = model.x_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = model.x_norm_bind,
+                .num_rows = b_u32,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, true) catch return error.DecodeFailed;
+
+            self.encodeLayerFfnBatched(&frame, l, layer, b_u32) catch return error.DecodeFailed;
+        }
+
+        if (model.gr_arena) |*gr| {
+            model.hybrid_pipes.encodeGrCollapse(&frame, .{
+                .stream = gr.binding(model.scratch_buf),
+                .out = model.x_bind,
+                .mode = .mean,
+                .m = b_u32,
+                .hidden_dim = h,
+                .branch_token_stride = model.max_tree_nodes,
+            }, true) catch return error.DecodeFailed;
+        }
+
+        model.attn_pipes.encodeRmsNorm(&frame, .{
+            .x = model.x_bind,
+            .w = model.final_norm.binding,
+            .y = model.x_norm_bind,
+            .num_rows = b_u32,
+            .hidden_dim = h,
+            .eps = model.config.rms_norm_eps,
+            .w_dtype = model.final_norm.dtype,
+        }, true) catch return error.DecodeFailed;
+        model.encodeLinearBatched(&frame, model.lm_head, model.x_norm_bind, model.logits_bind, b_u32, true) catch return error.DecodeFailed;
+        model.moe_pipes.encodeArgmaxRows(&frame, .{
+            .logits = model.logits_bind,
+            .out_token_ids = model.out_token_id_bind,
+            .num_rows = b_u32,
+            .vocab_size = model.config.vocab_size,
+            .logits_dtype = .f16,
+        }, true) catch return error.DecodeFailed;
+
+        const sig = frame.commit() catch return error.DecodeFailed;
+        model.compute.wait(sig, model.timeout_ms) catch return error.DecodeFailed;
+
+        for (0..b_usize) |bi| {
+            const sid: u32 = view.slot_ids[bi];
+            const temp = view.temperatures[bi];
+            if (temp > 0.0) {
+                const row = model.logits_host[bi * v_size .. (bi + 1) * v_size];
+                accept_mod.softmaxRow(f16, row, temp, self.p_res) catch return error.DecodeFailed;
+                out_next_tokens[bi] = accept_mod.sampleCategorical(self.p_res[0..v_size], view.rngs[bi].random());
+            } else {
+                out_next_tokens[bi] = model.out_token_ids_host[bi];
+            }
+            self.slots[sid].seq_len = view.seq_positions[bi] + 1;
+        }
+
+        self.decode_batch_steps += 1;
+        self.decode_batch_tokens += b_usize;
+    }
+
+    fn releaseSlotCb(ctx: *anyopaque, slot_id: u16, prefix_handle: u64) void {
+        _ = prefix_handle;
+        const self: *GraphBatchRuntime = @ptrCast(@alignCast(ctx));
+        self.resetSlotState(slot_id);
     }
 };
 
@@ -5872,4 +8731,196 @@ test "W16: tiny-steplora alpha_0 == 0 bit-exact identity at R=1 & active SME2 St
     const vr = try lora_r3_tree.verifyTree(&.{ t0, sd1 }, &.{ 3, 4 }, &.{ 0b01, 0b11 }, 3);
     try std.testing.expectEqual(sd1, vr.argmax_tokens[0]);
     try std.testing.expectEqual(sd2, vr.argmax_tokens[1]);
+}
+
+test "M6.5 R5 GraphModel QSA tiered q8 retired KV recycles IOSurface tiles and matches fp16" {
+    const allocator = std.testing.allocator;
+    var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 1, 0, null);
+    defer bundle.deinit(allocator);
+    // Full-context QSA (`qsa_window_size = 0`, `chunk_tokens = 512`) enables R5 retired q8 tier!
+    bundle.cfg.qsa_window_size = 0;
+
+    var fp16_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 1536,
+        .max_tree_nodes = 32,
+        .kv_retire_q8_after_chunks = 0,
+    });
+    defer fp16_m.deinit(allocator);
+
+    var tiered_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 1536,
+        .max_tree_nodes = 32,
+        .kv_retire_q8_after_chunks = 1,
+    });
+    defer tiered_m.deinit(allocator);
+
+    try std.testing.expect(tiered_m.kvRetireEnabled());
+    try std.testing.expect(tiered_m.activeKvWiredBytes() < fp16_m.activeKvWiredBytes());
+    try std.testing.expect(tiered_m.retiredKvWiredBytes() > 0);
+
+    // Prefill 540 tokens (> 1 full 512-token chunk -> chunk 0 retires to group-64 q8!).
+    var prompt: [540]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast((i * 13 + 7) % bundle.cfg.vocab_size);
+
+    const fp16_first = try fp16_m.prefillChunk(&prompt, 0, true);
+    const tiered_first = try tiered_m.prefillChunk(&prompt, 0, true);
+    try std.testing.expectEqual(@as(u32, 1), tiered_m.retiredKvChunks());
+    try std.testing.expectEqual(@as(u64, 1), tiered_m.kvRetireEvents());
+    try std.testing.expectEqual(fp16_first, tiered_first);
+
+    var tf = fp16_first;
+    var tt = tiered_first;
+    for (0..4) |step| {
+        const pos: u32 = @intCast(prompt.len + step);
+        tf = try fp16_m.stepDecode(tf, pos);
+        tt = try tiered_m.stepDecode(tt, pos);
+        try std.testing.expectEqual(tf, tt);
+    }
+}
+
+test "M6.5 G14 GraphModel prefillMultimodal with HW VideoToolbox HEVC -> zero-copy IOSurface -> 3D MRoPE" {
+    const allocator = std.testing.allocator;
+    var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 1, 0, null);
+    defer bundle.deinit(allocator);
+    bundle.cfg.qsa_window_size = 0;
+
+    var model = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+    });
+    defer model.deinit(allocator);
+
+    // Real M4 hardware VideoToolbox HEVC clip -> zero-copy IOSurface NV12 VisionFrames.
+    const clip = try metal.VtClip.encodeTestClip(.hevc, 128, 128, 2, 30);
+    defer clip.close();
+    const dec = try metal.VtDecodeSession.init(model.device, clip, .nv12);
+    defer dec.close();
+    const f0 = try dec.decodeFrame(clip, 0);
+    defer f0.close();
+    const f1 = try dec.decodeFrame(clip, 1);
+    defer f1.close();
+
+    const prefix = [_]u32{ 1, 5, 9 };
+    const suffix = [_]u32{ 11, 14 };
+    const frames = [_]metal.VisionFrame{ f0, f1 };
+
+    const res = try model.prefillMultimodal(allocator, &prefix, &suffix, &frames, .{
+        .patch_size = 16,
+        .t_patch = 2,
+        .spatial_merge = 2,
+    });
+    try std.testing.expect(res.all_frames_zero_copy);
+    try std.testing.expect(res.all_frames_page_aligned);
+    // 128x128 with patch=16 -> 8x8 raw patches -> 2x2 merge -> 4x4 = 16 visual tokens, t_patch=2 -> grid_t=1.
+    try std.testing.expectEqual(@as(u32, 16), res.vision_tokens);
+    try std.testing.expectEqual(@as(u32, 21), res.total_prompt_tokens);
+    // MRoPE next_text_pos: prefix(3) + max(grid_t=1, grid_h=4, grid_w=4) + suffix(2) = 9!
+    try std.testing.expectEqual(@as(u32, 9), res.next_mrope_pos);
+    try std.testing.expect(res.first_token < bundle.cfg.vocab_size);
+    try std.testing.expect(res.vision_encode_us > 0.0);
+
+    // Subsequent text decode must advance seamlessly with 3D-aligned MRoPE position!
+    const next_tok = try model.stepDecode(res.first_token, res.total_prompt_tokens);
+    try std.testing.expect(next_tok < bundle.cfg.vocab_size);
+    try std.testing.expectEqual(@as(u32, 10), model.mrope_next_pos);
+}
+
+test "M6.5 C14+R8 GraphBatchRuntime hybrid GDN+QSA+MoE continuous batching + GdnSnapshotPool parity" {
+    const allocator = std.testing.allocator;
+    var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 1, 0, null);
+    defer bundle.deinit(allocator);
+    bundle.cfg.qsa_window_size = 0;
+
+    var serial_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+    });
+    defer serial_m.deinit(allocator);
+
+    var batch_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+    });
+    defer batch_m.deinit(allocator);
+
+    var rt = try GraphBatchRuntime.init(allocator, &batch_m, .{
+        .max_slots = 4,
+        .prefix_cache_chunks = 8,
+    });
+    defer rt.deinit(allocator);
+
+    const p_common = [_]u32{ 3, 17, 42, 9, 61, 88, 12, 5 };
+    const p0 = p_common;
+    const p1 = p_common ++ [_]u32{ 4, 5, 6 };
+    const p2 = p_common ++ [_]u32{ 7, 8, 9 };
+    const prompts = [_][]const u32{ &p0, &p1, &p2 };
+    const gen_len: usize = 5;
+
+    var ref_out: [3][gen_len]u32 = undefined;
+    for (prompts, 0..) |pr, idx| {
+        serial_m.resetKvCache();
+        var tok = try serial_m.prefillChunk(pr, 0, true);
+        ref_out[idx][0] = tok;
+        for (1..gen_len) |step| {
+            tok = try serial_m.stepDecode(tok, @intCast(pr.len + step - 1));
+            ref_out[idx][step] = tok;
+        }
+    }
+
+    var sched = try batch_sched.BatchScheduler.init(allocator, .{
+        .max_batch_size = 4,
+        .max_prefill_chunk_tokens = 32,
+        .max_prompt_tokens = 256,
+    });
+    defer sched.deinit(allocator);
+
+    const Collector = struct {
+        tokens: [3][gen_len]u32 = @splat(@splat(0)),
+        counts: [3]usize = @splat(0),
+        hits: [3]u32 = @splat(0),
+        fn onPrefillDone(ctx: *anyopaque, _: u16, tag: u64, _: u32, hit: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.hits[@intCast(tag)] = hit;
+            return true;
+        }
+        fn onToken(ctx: *anyopaque, _: u16, tag: u64, tid: u32, _: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const i: usize = @intCast(tag);
+            if (self.counts[i] < gen_len) {
+                self.tokens[i][self.counts[i]] = tid;
+                self.counts[i] += 1;
+            }
+            return true;
+        }
+    };
+    var col: Collector = .{};
+    const obs: batch_sched.StepObserver = .{
+        .ctx = &col,
+        .onPrefillDoneFn = Collector.onPrefillDone,
+        .onTokenFn = Collector.onToken,
+    };
+    const backend = rt.batchBackend();
+
+    // Warm prefix checkpoint `p0` (`8` tokens with exact GDN state snapshot!).
+    _ = try sched.enqueue(prompts[0], .{ .request_id = 1, .user_tag = 0, .max_tokens = gen_len, .ignore_eos = true });
+    while (sched.activeSlotCount() > 0) {
+        _ = sched.step(backend, obs);
+    }
+    try std.testing.expectEqualSlices(u32, &ref_out[0], &col.tokens[0]);
+
+    // Now run `p1` and `p2` concurrently: both hit the `8`-token GDN+QSA checkpoint!
+    _ = try sched.enqueue(prompts[1], .{ .request_id = 2, .user_tag = 1, .max_tokens = gen_len, .ignore_eos = true });
+    _ = try sched.enqueue(prompts[2], .{ .request_id = 3, .user_tag = 2, .max_tokens = gen_len, .ignore_eos = true });
+    while (sched.activeSlotCount() > 0) {
+        _ = sched.step(backend, obs);
+    }
+
+    try std.testing.expectEqual(@as(u32, 8), col.hits[1]);
+    try std.testing.expectEqual(@as(u32, 8), col.hits[2]);
+    try std.testing.expect(sched.telemetry().max_observed_batch_size >= 2);
+    try std.testing.expectEqualSlices(u32, &ref_out[1], &col.tokens[1]);
+    try std.testing.expectEqualSlices(u32, &ref_out[2], &col.tokens[2]);
+    const st = rt.stats();
+    try std.testing.expect(st.gdn_snapshot_clones >= 3);
+    try std.testing.expectEqual(@as(u32, 0), st.prefix_cache_pinned_entries);
 }
