@@ -282,6 +282,13 @@ pub const GdnConv1dParams = extern struct {
     _pad1: u32 = 0,
 };
 
+pub const GdnConv1dQParams = extern struct {
+    m: u32,
+    gdn_qk: u32,
+    gdn_v: u32,
+    conv_k: u32,
+};
+
 pub const GdnConv1dCommitParams = extern struct {
     gdn_qk: u32,
     gdn_v: u32,
@@ -314,6 +321,7 @@ comptime {
     if (@sizeOf(GrComputeGatesParams) != 16) @compileError("GrComputeGatesParams must be 16 bytes");
     if (@sizeOf(GdnComputeGatesParams) != 16) @compileError("GdnComputeGatesParams must be 16 bytes");
     if (@sizeOf(GdnConv1dParams) != 32) @compileError("GdnConv1dParams must be 32 bytes");
+    if (@sizeOf(GdnConv1dQParams) != 16) @compileError("GdnConv1dQParams must be 16 bytes");
     if (@sizeOf(GdnConv1dCommitParams) != 144) @compileError("GdnConv1dCommitParams must be 144 bytes");
     if (@sizeOf(BlendF16Params) != 16) @compileError("BlendF16Params must be 16 bytes");
     if (@sizeOf(GdnCommitTreeParams) > metal.MAX_UNIFORM_BYTES) @compileError("GdnCommitTreeParams exceeds uniform stride");
@@ -1169,6 +1177,19 @@ pub const GdnConv1dSiluArgs = struct {
     write_state: bool = false,
 };
 
+pub const GdnConv1dQSiluArgs = struct {
+    q_cur: metal.BufferBinding,
+    q_hist_r0: metal.BufferBinding,
+    conv_w: metal.BufferBinding,
+    conv_state_in: metal.BufferBinding,
+    ancestor_masks: metal.BufferBinding,
+    q_out: metal.BufferBinding,
+    m: u32,
+    gdn_qk: u32,
+    gdn_v: u32,
+    conv_k: u32,
+};
+
 pub const GdnConv1dCommitArgs = struct {
     q_raw: metal.BufferBinding,
     k_raw: metal.BufferBinding,
@@ -1236,6 +1257,7 @@ pub const HybridPipelines = struct {
     gdn_compute_gates_f16: metal.Pipeline,
     gdn_compute_gates_bf16: metal.Pipeline,
     gdn_conv1d_silu: metal.Pipeline,
+    gdn_conv1d_q_silu: metal.Pipeline,
     gdn_conv1d_commit: metal.Pipeline,
     blend_f16: metal.Pipeline,
 
@@ -1434,6 +1456,8 @@ pub const HybridPipelines = struct {
 
         const gdn_conv1d_silu = try metal.Pipeline.init(device, library, "ami_gdn_conv1d_silu");
         errdefer gdn_conv1d_silu.close();
+        const gdn_conv1d_q_silu = try metal.Pipeline.init(device, library, "ami_gdn_conv1d_q_silu");
+        errdefer gdn_conv1d_q_silu.close();
         const gdn_conv1d_commit = try metal.Pipeline.init(device, library, "ami_gdn_conv1d_commit");
         errdefer gdn_conv1d_commit.close();
         const blend_f16 = try metal.Pipeline.init(device, library, "ami_blend_f16");
@@ -1475,6 +1499,7 @@ pub const HybridPipelines = struct {
             .gdn_compute_gates_f16 = gdn_compute_gates_f16,
             .gdn_compute_gates_bf16 = gdn_compute_gates_bf16,
             .gdn_conv1d_silu = gdn_conv1d_silu,
+            .gdn_conv1d_q_silu = gdn_conv1d_q_silu,
             .gdn_conv1d_commit = gdn_conv1d_commit,
             .blend_f16 = blend_f16,
         };
@@ -1483,6 +1508,7 @@ pub const HybridPipelines = struct {
     pub fn close(self: HybridPipelines) void {
         self.blend_f16.close();
         self.gdn_conv1d_commit.close();
+        self.gdn_conv1d_q_silu.close();
         self.gdn_conv1d_silu.close();
         self.gdn_compute_gates_bf16.close();
         self.gdn_compute_gates_f16.close();
@@ -2416,6 +2442,38 @@ pub const HybridPipelines = struct {
             std.mem.asBytes(&params),
             .{ conv_dim, 1, 1 },
             .{ @min(conv_dim, 256), 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    pub fn encodeGdnConv1dQSilu(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: GdnConv1dQSiluArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.m > MAX_TREE_NODES or args.gdn_qk == 0 or args.gdn_v == 0 or args.conv_k == 0 or args.conv_k > 8) {
+            return error.InvalidConfig;
+        }
+        const params: GdnConv1dQParams = .{
+            .m = args.m,
+            .gdn_qk = args.gdn_qk,
+            .gdn_v = args.gdn_v,
+            .conv_k = args.conv_k,
+        };
+        try frame.encodeThreads(
+            self.gdn_conv1d_q_silu,
+            &.{
+                args.q_cur,
+                args.q_hist_r0,
+                args.conv_w,
+                args.conv_state_in,
+                args.ancestor_masks,
+                args.q_out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.gdn_qk, 1, 1 },
+            .{ @min(@as(u64, args.gdn_qk), 256), 1, 1 },
             insert_barrier_before,
         );
     }

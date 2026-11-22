@@ -3784,3 +3784,121 @@ test "D13+W9: GraphModel with MTP DraftHead under Placement.cpu_sme2 is T=0 bit-
     try std.testing.expectEqualSlices(u32, &expected, &got);
     try std.testing.expect(dh.sme2_eval_count > 0);
 }
+
+test "D12+W9+W16: 4-layer qwen4_exp (GDN+QSA+MoE+cold+4-branch GR+PLE+Step-LoRA, R=3) chunk-invariant prefill & 16-tok T=0 bit-exact self-recurrent" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = try graph.makeTestTempDir(allocator, "qwen4_steplora_r3");
+    defer {
+        graph.removeTestDir(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+
+    var b = try graph.buildSynthQwen4Bundle(allocator, .{
+        .num_experts = 8,
+        .top_k = 2,
+        .cold_experts_per_layer = 2,
+        .max_loops = 3,
+        .ple_num_shards = 1,
+        .include_steplora = true,
+        .core_start_layer = 0,
+        .tmp_dir = tmp_dir,
+    });
+    defer {
+        if (b.amf_file_path) |p| graph.removeTestFile(p);
+        for (b.ple_paths) |p| graph.removeTestFile(p);
+        b.deinit(allocator);
+    }
+
+    var ple_const = try allocator.alloc([:0]const u8, b.ple_paths.len);
+    defer allocator.free(ple_const);
+    for (b.ple_paths, 0..) |p, i| ple_const[i] = p;
+    const amf_path = b.amf_file_path.?;
+
+    // 21-token prompt forces multi-chunk prefill on chunk=4 (4+4+4+4+4+1) vs single-chunk on chunk=32.
+    const prompt = [_]u32{ 5, 19, 41, 7, 102, 13, 64, 28, 91, 3, 55, 118, 22, 77, 10, 48, 83, 14, 66, 39, 97 };
+
+    // 1. Chunk-size-invariant `prefillChunk` (chunk=4 vs chunk=32) + 16-token serial `stepDecode`.
+    var ref_chunk4 = try graph.GraphModel.loadFromFile(allocator, amf_path, b.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 4,
+        .ple_paths = ple_const,
+        .cold_slot_count = 32,
+        .max_loops_override = 3,
+    });
+    defer ref_chunk4.deinit(allocator);
+
+    var ref_chunk32 = try graph.GraphModel.loadFromFile(allocator, amf_path, b.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .ple_paths = ple_const,
+        .cold_slot_count = 32,
+        .max_loops_override = 3,
+    });
+    defer ref_chunk32.deinit(allocator);
+
+    var first_c4: u32 = 0;
+    var p_off: usize = 0;
+    while (p_off < prompt.len) {
+        const take: usize = @min(@as(usize, 4), prompt.len - p_off);
+        const is_last = (p_off + take == prompt.len);
+        first_c4 = try ref_chunk4.prefillChunk(prompt[p_off .. p_off + take], @intCast(p_off), is_last);
+        p_off += take;
+    }
+    const first_c32 = try ref_chunk32.prefillChunk(&prompt, 0, true);
+    try std.testing.expectEqual(first_c4, first_c32);
+    // Bit-exact f16 logits across chunk=4 vs chunk=32!
+    const logits_c4 = ref_chunk4.readLastLogitsF16();
+    const logits_c32 = ref_chunk32.readLastLogitsF16();
+    for (0..b.cfg.vocab_size) |v| {
+        try std.testing.expectEqual(@as(u16, @bitCast(logits_c4[v])), @as(u16, @bitCast(logits_c32[v])));
+    }
+
+    var expected: [16]u32 = undefined;
+    expected[0] = first_c4;
+    var pos: u32 = prompt.len;
+    for (1..expected.len) |i| {
+        expected[i] = try ref_chunk4.stepDecode(expected[i - 1], pos);
+        pos += 1;
+    }
+
+    // 2. `SpecEngine` `self_recurrent` (`max_tree_nodes = 32`, `T = 0`) must match 16/16 bit-exact!
+    var spec_model = try graph.GraphModel.loadFromFile(allocator, amf_path, b.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .ple_paths = ple_const,
+        .cold_slot_count = 32,
+        .max_loops_override = 3,
+    });
+    defer spec_model.deinit(allocator);
+
+    var eng = try SpecEngine.initWithGraph(allocator, &spec_model, null, .{
+        .mode = .self_recurrent,
+        .max_tree_nodes = 16,
+        .max_draft_depth = 4,
+        .enable_pruning = false,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    var got: [16]u32 = undefined;
+    got[0] = try eng.prefill(&prompt, null);
+    var p_out: usize = 1;
+    while (p_out < got.len) {
+        const rs = try eng.stepRound(null, got[p_out..]);
+        p_out += rs.emitted_count;
+    }
+    try std.testing.expectEqualSlices(u32, &expected, &got);
+
+    // 3. Verify all ADR-0019 loop isolations & active SME2 Step-LoRA held throughout!
+    const iso = spec_model.loopIsolationStats();
+    try std.testing.expect(iso.gdn_scratch_evals > 0);
+    try std.testing.expect(iso.ple_r0_fills > 0);
+    try std.testing.expect(iso.ple_r_ge1_reuses > 0);
+    try std.testing.expectEqual(@as(u64, 0), iso.ple_r_ge1_nvme_reads);
+    try std.testing.expect(iso.qsa_index_computes > 0);
+    try std.testing.expect(iso.qsa_index_reuses > 0);
+    try std.testing.expect(iso.moe_r_ge1_pinned_routes > 0);
+    try std.testing.expectEqual(@as(u64, 0), iso.moe_r_ge1_cold_stalls);
+    try std.testing.expect(iso.steplora_zero_alpha_skips > 0);
+    try std.testing.expect(iso.steplora_active_evals > 0);
+}

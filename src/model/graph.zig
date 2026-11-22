@@ -881,6 +881,7 @@ const GdnLayerWeights = struct {
     tree_g_off: u64,
     tree_beta_off: u64,
     tree_q_raw_off: u64,
+    tree_q_raw_host: []f16,
     tree_k_raw_off: u64,
     tree_v_raw_off: u64,
     conv_state_off: u64,
@@ -970,6 +971,10 @@ const ColdRuntime = struct {
     expert_cache: cache_mod.ExpertCache,
     amf_file: ?amf.AmfFile,
     slot_count: u32,
+    /// Per-layer, per-node `r = 0` selected top-k expert IDs:
+    /// flat `[num_layers * max_tree_nodes * top_k]`, preallocated at load time
+    /// so `r >= 1` routing never sees speculative sibling cold-cache entries.
+    r0_selected: []u16,
 };
 
 const LoopAdapterRuntime = struct {
@@ -1185,6 +1190,7 @@ pub const GraphModel = struct {
             self.adapter_rt = null;
         }
         if (self.cold_rt) |crt| {
+            allocator.free(crt.r0_selected);
             crt.expert_cache.deinit(allocator);
             crt.reader.deinit(allocator);
             crt.pool.deinit();
@@ -2259,73 +2265,99 @@ pub const GraphModel = struct {
         const qk_dim = self.config.gdnQkDim();
         const v_dim = self.config.gdnVDim();
 
-        // Linear projections: `q`, `k`, `v`, `z` (output gate), plus `g` & `beta`.
-        const q_raw_bind: metal.BufferBinding = if (g.conv1d_w != null)
+        // Shared r=0 cross-token GDN state transition inputs (`LoopLM`, ADR-0019):
+        // - At `loop_step == 0`: compute `q_raw^(0), k_raw^(0), v_raw^(0), g^(0), beta^(0)`,
+        //   run `conv1d + SiLU` with `is_tree = true, write_state = false` into
+        //   `(q_conv_bind, tree_k_off, tree_v_off)` while preserving raw `r = 0` inputs in
+        //   `tree_{q,k,v}_raw_off` (for `r >= 1` causal Q conv taps & final `conv_state` commit).
+        // - At `loop_step >= 1`: NEVER overwrite `tree_{q,k,v}_raw_off` or `tree_{k,v,g,beta}_off`.
+        //   Compute only `q_raw^(r) -> self.q_bind` (with optional Step-LoRA) and `z^(r) -> self.gdn_z_bind`,
+        //   and if `conv1d_w != null` run `ami_gdn_conv1d_q_silu` using `q_cur = self.q_bind` at `tap == hist`
+        //   and `r = 0` history `tree_q_raw_off` / `conv_state_off` at `tap < hist`, writing ONLY `q_conv_bind`.
+        const q_raw_r0_bind: metal.BufferBinding = if (g.conv1d_w != null)
             .{ .buffer = self.scratch_buf, .offset = g.tree_q_raw_off }
         else
             self.q_bind;
-        const k_raw_bind: metal.BufferBinding = if (g.conv1d_w != null)
+        const q_proj_out_bind: metal.BufferBinding = if (loop_step == 0) q_raw_r0_bind else self.q_bind;
+        const q_proj_out_host: []f16 = if (loop_step == 0 and g.conv1d_w != null) g.tree_q_raw_host else self.q_host;
+        const k_raw_r0_bind: metal.BufferBinding = if (g.conv1d_w != null)
             .{ .buffer = self.scratch_buf, .offset = g.tree_k_raw_off }
         else
             .{ .buffer = self.scratch_buf, .offset = g.tree_k_off };
-        const v_raw_bind: metal.BufferBinding = if (g.conv1d_w != null)
+        const v_raw_r0_bind: metal.BufferBinding = if (g.conv1d_w != null)
             .{ .buffer = self.scratch_buf, .offset = g.tree_v_raw_off }
         else
             .{ .buffer = self.scratch_buf, .offset = g.tree_v_off };
 
-        try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, g.q_proj, self.x_norm_bind, self.x_norm_host, q_raw_bind, self.q_host, m, true);
+        try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, g.q_proj, self.x_norm_bind, self.x_norm_host, q_proj_out_bind, q_proj_out_host, m, true);
         {
             const f = try self.ensureFrame(frame_opt);
-            try self.encodeLinearBatched(f, g.k_proj, self.x_norm_bind, k_raw_bind, m, false);
-            try self.encodeLinearBatched(f, g.v_proj, self.x_norm_bind, v_raw_bind, m, false);
+            if (loop_step == 0) {
+                try self.encodeLinearBatched(f, g.k_proj, self.x_norm_bind, k_raw_r0_bind, m, false);
+                try self.encodeLinearBatched(f, g.v_proj, self.x_norm_bind, v_raw_r0_bind, m, false);
+                try self.hybrid_pipes.encodeGdnComputeGates(f, .{
+                    .x = self.x_norm_bind,
+                    .w_a = g.a_proj,
+                    .w_b = g.b_proj,
+                    .a_log = g.a_log,
+                    .dt_bias = g.dt_bias,
+                    .g_out = .{ .buffer = self.scratch_buf, .offset = g.tree_g_off },
+                    .beta_out = .{ .buffer = self.scratch_buf, .offset = g.tree_beta_off },
+                    .m = m,
+                    .hidden_dim = self.config.hidden_size,
+                    .num_v_heads = self.config.linear_num_value_heads,
+                    .weight_dtype = g.ab_dtype,
+                }, false);
+            }
             try self.encodeLinearBatched(f, g.g_proj, self.x_norm_bind, self.gdn_z_bind, m, false);
-            try self.hybrid_pipes.encodeGdnComputeGates(f, .{
-                .x = self.x_norm_bind,
-                .w_a = g.a_proj,
-                .w_b = g.b_proj,
-                .a_log = g.a_log,
-                .dt_bias = g.dt_bias,
-                .g_out = .{ .buffer = self.scratch_buf, .offset = g.tree_g_off },
-                .beta_out = .{ .buffer = self.scratch_buf, .offset = g.tree_beta_off },
-                .m = m,
-                .hidden_dim = self.config.hidden_size,
-                .num_v_heads = self.config.linear_num_value_heads,
-                .weight_dtype = g.ab_dtype,
-            }, false);
 
-            // Optional depthwise causal Conv1D + SiLU with loop-isolated conv state.
-            const q_eff_bind: metal.BufferBinding = if (g.conv1d_w != null) self.q_conv_bind else q_raw_bind;
+            // Optional depthwise causal Conv1D + SiLU with loop-isolated `r = 0` history.
+            const q_eff_bind: metal.BufferBinding = if (g.conv1d_w != null) self.q_conv_bind else q_proj_out_bind;
             const k_eff_bind: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = g.tree_k_off };
             const v_eff_bind: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = g.tree_v_off };
             if (g.conv1d_w) |cw| {
-                const is_tree = !commit_state or m > 1;
-                const conv_out_off = if (commit_state) g.conv_state_off else g.conv_state_tmp_off;
-                try self.hybrid_pipes.encodeGdnConv1dSilu(f, .{
-                    .q_in = q_raw_bind,
-                    .k_in = k_raw_bind,
-                    .v_in = v_raw_bind,
-                    .conv_w = cw,
-                    .conv_state_in = .{ .buffer = self.scratch_buf, .offset = g.conv_state_off },
-                    .conv_state_out = .{ .buffer = self.scratch_buf, .offset = conv_out_off },
-                    .ancestor_masks = if (is_tree) self.ancestor_masks_bind else null,
-                    .q_out = q_eff_bind,
-                    .k_out = k_eff_bind,
-                    .v_out = v_eff_bind,
-                    .m = m,
-                    .gdn_qk = qk_dim,
-                    .gdn_v = v_dim,
-                    .conv_k = g.conv_k,
-                    .is_tree = is_tree,
-                    .write_state = commit_state and !is_tree,
-                }, true);
-                // When committing a multi-token prefill chunk (`m > 1`), advance conv state cleanly.
-                if (commit_state and is_tree and g.conv_k > 1) {
+                if (loop_step == 0) {
+                    try self.hybrid_pipes.encodeGdnConv1dSilu(f, .{
+                        .q_in = q_raw_r0_bind,
+                        .k_in = k_raw_r0_bind,
+                        .v_in = v_raw_r0_bind,
+                        .conv_w = cw,
+                        .conv_state_in = .{ .buffer = self.scratch_buf, .offset = g.conv_state_off },
+                        .conv_state_out = .{ .buffer = self.scratch_buf, .offset = g.conv_state_tmp_off },
+                        .ancestor_masks = self.ancestor_masks_bind,
+                        .q_out = q_eff_bind,
+                        .k_out = k_eff_bind,
+                        .v_out = v_eff_bind,
+                        .m = m,
+                        .gdn_qk = qk_dim,
+                        .gdn_v = v_dim,
+                        .conv_k = g.conv_k,
+                        .is_tree = true,
+                        .write_state = false,
+                    }, true);
+                } else {
+                    try self.hybrid_pipes.encodeGdnConv1dQSilu(f, .{
+                        .q_cur = self.q_bind,
+                        .q_hist_r0 = q_raw_r0_bind,
+                        .conv_w = cw,
+                        .conv_state_in = .{ .buffer = self.scratch_buf, .offset = g.conv_state_off },
+                        .ancestor_masks = self.ancestor_masks_bind,
+                        .q_out = q_eff_bind,
+                        .m = m,
+                        .gdn_qk = qk_dim,
+                        .gdn_v = v_dim,
+                        .conv_k = g.conv_k,
+                    }, true);
+                }
+                // Advance committed Conv1D history once on `commit_state` using `r = 0` raw QKV
+                // (unified for both `m = 1` and `m > 1` so chunk size never affects state).
+                if (commit_state and g.conv_k > 1) {
                     var chain: [hybrid.MAX_TREE_NODES]u16 = undefined;
                     for (0..m) |i| chain[i] = @intCast(i);
                     try self.hybrid_pipes.encodeGdnConv1dCommit(f, .{
-                        .q_raw = q_raw_bind,
-                        .k_raw = k_raw_bind,
-                        .v_raw = v_raw_bind,
+                        .q_raw = q_raw_r0_bind,
+                        .k_raw = k_raw_r0_bind,
+                        .v_raw = v_raw_r0_bind,
                         .conv_state_in = .{ .buffer = self.scratch_buf, .offset = g.conv_state_off },
                         .conv_state_out = .{ .buffer = self.scratch_buf, .offset = g.conv_state_off },
                         .accepted_nodes = chain[0..m],
@@ -2646,15 +2678,48 @@ pub const GraphModel = struct {
             try self.flushFrame(frame_opt);
 
             const n_exp: usize = self.config.num_experts;
+            const top_k: usize = self.config.num_experts_per_tok;
+            const max_m: usize = self.max_tree_nodes;
             const before_misses = crt.expert_cache.telemetry().sync_misses;
             if (loop_step >= 1) {
-                // ADR-0019 Isolation #4: restrict `r >= 1` routing strictly to already
-                // wired/resident `ExpertSlotPool` slots -> 0 cold-expert NVMe stalls!
+                // ADR-0019 Isolation #4: restrict `r >= 1` routing for `(l, tok)` strictly to
+                // wired `.hot` experts plus `(l, tok)`'s own `r = 0` selected cold experts (when
+                // still `.cached_ready`), preventing unaccepted speculative siblings (or prior
+                // tokens) from polluting `r >= 1` routing while guaranteeing 0 cold NVMe stalls.
                 for (0..m) |tok| {
                     const row = layer_ws.router_logits[tok * n_exp ..][0..n_exp];
+                    const r0_ids = crt.r0_selected[(l * max_m + tok) * top_k ..][0..top_k];
+                    var allowed_count: usize = 0;
                     for (0..n_exp) |eid| {
-                        if (!crt.expert_cache.isResident(@intCast(l), @intCast(eid))) {
+                        const allow = switch (crt.expert_cache.residencyState(@intCast(l), @intCast(eid))) {
+                            .hot => true,
+                            .cached_ready => blk: {
+                                var own = false;
+                                for (r0_ids) |rid| {
+                                    if (rid == eid) {
+                                        own = true;
+                                        break;
+                                    }
+                                }
+                                break :blk own;
+                            },
+                            else => false,
+                        };
+                        if (allow) {
+                            allowed_count += 1;
+                        } else {
                             row[eid] = -std.math.inf(f32);
+                        }
+                    }
+                    // Defensive guard only reachable if `num_hot < top_k` and a tiny slot pool
+                    // evicted `tok`'s own `r = 0` cold experts; keeps 0 cold stalls & finite softmax.
+                    if (allowed_count < top_k) {
+                        for (0..n_exp) |eid| {
+                            if (row[eid] == -std.math.inf(f32) and crt.expert_cache.isResident(@intCast(l), @intCast(eid))) {
+                                row[eid] = -1.0e30;
+                                allowed_count += 1;
+                                if (allowed_count >= top_k) break;
+                            }
                         }
                     }
                 }
@@ -2675,6 +2740,16 @@ pub const GraphModel = struct {
                 }, false);
             }
             try self.flushFrame(frame_opt);
+
+            if (loop_step == 0) {
+                for (0..m) |tok| {
+                    const dst = crt.r0_selected[(l * max_m + tok) * top_k ..][0..top_k];
+                    const src = layer_ws.scratch_topk_experts[tok * top_k ..][0..top_k];
+                    for (0..top_k) |k| {
+                        dst[k] = @intCast(src[k]);
+                    }
+                }
+            }
 
             const num_unique: usize = layer_ws.schedule_header.num_unique_experts;
             for (0..num_unique) |u| {
@@ -2969,7 +3044,20 @@ pub const GraphModel = struct {
             switch (self.layers[l].attn) {
                 .gdn => |g| {
                     const ga = &(self.gdn_arena.?);
-                    try self.hybrid_pipes.encodeCommitScratchState(f, ga, self.scratch_buf, g.gdn_idx, true);
+                    try self.hybrid_pipes.encodeCommitTreeState(f, .{
+                        .k_tree = .{ .buffer = self.scratch_buf, .offset = g.tree_k_off },
+                        .v_tree = .{ .buffer = self.scratch_buf, .offset = g.tree_v_off },
+                        .g_tree = .{ .buffer = self.scratch_buf, .offset = g.tree_g_off },
+                        .beta_tree = .{ .buffer = self.scratch_buf, .offset = g.tree_beta_off },
+                        .accepted_nodes = .{ .inline_u16 = chain[0..m] },
+                        .accepted_count = m,
+                        .state_in = try ga.committedBinding(self.scratch_buf, g.gdn_idx),
+                        .state_out = try ga.committedBinding(self.scratch_buf, g.gdn_idx),
+                        .num_k_heads = self.config.linear_num_key_heads,
+                        .num_v_heads = self.config.linear_num_value_heads,
+                        .head_k_dim = self.config.linear_key_head_dim,
+                        .head_v_dim = self.config.linear_value_head_dim,
+                    }, true);
                     self.loop_stats.gdn_final_commits += 1;
                     if (g.conv1d_w != null and g.conv_k > 1) {
                         try self.hybrid_pipes.encodeGdnConv1dCommit(f, .{
@@ -3639,6 +3727,7 @@ pub const GraphModel = struct {
         // --- 4. Initialize optional ColdRuntime (`C3`-`C5`) ---
         var cold_rt: ?*ColdRuntime = null;
         errdefer if (cold_rt) |crt| {
+            allocator.free(crt.r0_selected);
             crt.expert_cache.deinit(allocator);
             crt.reader.deinit(allocator);
             crt.pool.deinit();
@@ -3654,12 +3743,17 @@ pub const GraphModel = struct {
             errdefer reader.deinit(allocator);
             var cold_amf = try amf.AmfFile.open(allocator, source.file.path);
             errdefer cold_amf.close(allocator);
+            const r0_len: usize = @as(usize, config.num_hidden_layers) * max_m * config.num_experts_per_tok;
+            const r0_selected = try allocator.alloc(u16, r0_len);
+            errdefer allocator.free(r0_selected);
+            @memset(r0_selected, 0);
             crt.* = .{
                 .pool = pool,
                 .reader = reader,
                 .expert_cache = undefined,
                 .amf_file = cold_amf,
                 .slot_count = cold_slot_count,
+                .r0_selected = r0_selected,
             };
             crt.expert_cache = try cache_mod.ExpertCache.init(allocator, &crt.pool, &crt.reader, .{
                 .num_layers = @intCast(config.num_hidden_layers),
@@ -3814,6 +3908,7 @@ pub const GraphModel = struct {
                         .tree_g_off = scratch_arena.offsetOf(tg_r.ptr),
                         .tree_beta_off = scratch_arena.offsetOf(tb_r.ptr),
                         .tree_q_raw_off = scratch_arena.offsetOf(tqr_r.ptr),
+                        .tree_q_raw_host = std.mem.bytesAsSlice(f16, @as([]align(2) u8, @alignCast(tqr_r))),
                         .tree_k_raw_off = scratch_arena.offsetOf(tkr_r.ptr),
                         .tree_v_raw_off = scratch_arena.offsetOf(tvr_r.ptr),
                         .conv_state_off = scratch_arena.offsetOf(cs_r.ptr),
@@ -4725,6 +4820,8 @@ pub const SynthQwen4BenchSpec = struct {
     ple_num_shards: u32 = 0,
     ple_rows: u64 = 64,
     use_q4_experts: bool = false,
+    include_steplora: bool = false,
+    core_start_layer: ?u32 = null,
     tmp_dir: ?[]const u8 = null,
 };
 
@@ -4773,6 +4870,7 @@ pub fn buildSynthQwen4Bundle(
     layer_attns[2] = .gated_deltanet;
     layer_attns[3] = .qsa_sparse;
 
+    const core_start: u32 = spec.core_start_layer orelse (if (max_loops > 1) @as(u32, 1) else 0);
     const cfg: GraphConfig = .{
         .axes = .{
             .backbone_kind = .decoder_only,
@@ -4783,11 +4881,14 @@ pub fn buildSynthQwen4Bundle(
             .residual_branches = 4,
             .memory_lookup_kind = if (ple_num_shards > 0) .ple_ngram else .none,
             .loop_schedule = .{
-                .mode = if (max_loops > 1) .native_recurrent else .single_pass,
-                .start_layer = if (max_loops > 1) 1 else 0,
+                .mode = if (spec.include_steplora) .gated_loop_adapter else if (max_loops > 1) .native_recurrent else .single_pass,
+                .start_layer = core_start,
                 .end_layer = n_layers,
                 .max_loops = max_loops,
-                .inject_x_init = (max_loops > 1),
+                .inject_x_init = (max_loops > 1 and !spec.include_steplora),
+                .adapter_kind = if (spec.include_steplora) .sme2_step_lora else .none,
+                .adapter_rank = if (spec.include_steplora) 16 else 0,
+                .adapter_packed_rank = if (spec.include_steplora) 64 else 0,
             },
         },
         .vocab_size = vocab,
@@ -4930,6 +5031,45 @@ pub fn buildSynthQwen4Bundle(
 
     try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillConstantBf16(allocator, h, 1.0), 0, 0);
     try addBlob(allocator, &blobs, &owned_names, "lm_head", .lm_head, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 999, vocab * h, 0.12), 0, 0);
+
+    if (spec.include_steplora and max_loops > 0) {
+        const gdn_qk_dim = gdn_kh * gdn_kd;
+        const gdn_v_dim = gdn_vh * gdn_vd;
+        const qsa_q_dim = n_heads * head_dim;
+        for (0..max_loops) |step| {
+            const alpha_val: f32 = if (step == 0) 0.0 else 0.15 * @as(f32, @floatFromInt(step));
+            for (core_start..n_layers) |l| {
+                const is_gdn = (layer_attns[l] == .gated_deltanet);
+                const q_out_d: u32 = if (is_gdn) gdn_qk_dim else qsa_q_dim;
+                const o_in_d: u32 = if (is_gdn) gdn_v_dim else qsa_q_dim;
+                const sd: u64 = 12000 + step * 300 + l * 30;
+
+                const qa_nm = try allocator.dupe(u8, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.lora_a", .{ step, l }));
+                try owned_names.append(allocator, qa_nm);
+                try blobs.append(allocator, .{ .name = qa_nm, .kind = .loop_adapter, .dtype = .f16, .layout = .sme2_panel64, .layer = @intCast(l), .expert = amf.NO_EXPERT, .shape = .{ 64, h, 0, 0 }, .ndim = 2, .bytes = try fillDeterministicStepLoraSme2F16(allocator, sd + 1, 64, h, 16, h, 0.08) });
+
+                const qb_nm = try allocator.dupe(u8, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.lora_b", .{ step, l }));
+                try owned_names.append(allocator, qb_nm);
+                try blobs.append(allocator, .{ .name = qb_nm, .kind = .loop_adapter, .dtype = .f16, .layout = .sme2_panel64, .layer = @intCast(l), .expert = amf.NO_EXPERT, .shape = .{ q_out_d, 64, 0, 0 }, .ndim = 2, .bytes = try fillDeterministicStepLoraSme2F16(allocator, sd + 2, q_out_d, 64, q_out_d, 16, 0.08) });
+
+                const al_q = try allocator.alloc(u8, 4);
+                std.mem.writeInt(u32, al_q[0..4], @bitCast(alpha_val), .little);
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.q_proj.alpha", .{ step, l }), .loop_adapter, .f32, @intCast(l), amf.NO_EXPERT, .{ 1, 0, 0, 0 }, 1, al_q, 0, 0);
+
+                const oa_nm = try allocator.dupe(u8, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.lora_a", .{ step, l }));
+                try owned_names.append(allocator, oa_nm);
+                try blobs.append(allocator, .{ .name = oa_nm, .kind = .loop_adapter, .dtype = .f16, .layout = .sme2_panel64, .layer = @intCast(l), .expert = amf.NO_EXPERT, .shape = .{ 64, o_in_d, 0, 0 }, .ndim = 2, .bytes = try fillDeterministicStepLoraSme2F16(allocator, sd + 3, 64, o_in_d, 16, o_in_d, 0.08) });
+
+                const ob_nm = try allocator.dupe(u8, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.lora_b", .{ step, l }));
+                try owned_names.append(allocator, ob_nm);
+                try blobs.append(allocator, .{ .name = ob_nm, .kind = .loop_adapter, .dtype = .f16, .layout = .sme2_panel64, .layer = @intCast(l), .expert = amf.NO_EXPERT, .shape = .{ h, 64, 0, 0 }, .ndim = 2, .bytes = try fillDeterministicStepLoraSme2F16(allocator, sd + 4, h, 64, h, 16, 0.08) });
+
+                const al_o = try allocator.alloc(u8, 4);
+                std.mem.writeInt(u32, al_o[0..4], @bitCast(alpha_val), .little);
+                try addBlob(allocator, &blobs, &owned_names, try std.fmt.bufPrint(&nbuf, "loop.step.{d}.layers.{d}.o_proj.alpha", .{ step, l }), .loop_adapter, .f32, @intCast(l), amf.NO_EXPERT, .{ 1, 0, 0, 0 }, 1, al_o, 0, 0);
+            }
+        }
+    }
 
     const amf_bytes = try buildTestAmf(allocator, "test-qwen4-exp", blobs.items);
 
@@ -5217,9 +5357,9 @@ fn writeBytesFile(path: [:0]const u8, data: []const u8) !void {
     }
 }
 
-fn makeTestTempDir(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
+pub fn makeTestTempDir(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
     const base = std.c.getenv("TMPDIR");
-    const root_slice: []const u8 = if (base) |p| std.mem.span(p) else "/Volumes/Akari/.tmp/m6-engine";
+    const root_slice: []const u8 = if (base) |p| std.mem.span(p) else "/tmp";
     const dir_path = try std.fmt.allocPrint(allocator, "{s}/graph_test_{s}_{d}", .{ root_slice, tag, std.c.getpid() });
     errdefer allocator.free(dir_path);
     const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{dir_path}, 0);
@@ -5228,11 +5368,11 @@ fn makeTestTempDir(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
     return dir_path;
 }
 
-fn removeTestFile(path: [:0]const u8) void {
+pub fn removeTestFile(path: [:0]const u8) void {
     _ = std.c.unlink(path.ptr);
 }
 
-fn removeTestDir(allocator: std.mem.Allocator, path: []const u8) void {
+pub fn removeTestDir(allocator: std.mem.Allocator, path: []const u8) void {
     const z = std.fmt.allocPrintSentinel(allocator, "{s}", .{path}, 0) catch return;
     defer allocator.free(z);
     _ = std.c.rmdir(z.ptr);

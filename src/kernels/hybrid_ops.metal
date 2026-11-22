@@ -275,26 +275,22 @@ kernel void ami_gdn_decode(const device half *q [[buffer(0)]],
 
         const float o_val = simd_sum(o_acc);
         if (lane == 0u) {
-            tg_o[dv] = o_val;
+            tg_o[dv] = (p.apply_out_norm != 0u) ? float(half(o_val)) : o_val;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float inv_rms = 1.0f;
     if (p.apply_out_norm != 0u) {
-        float sq = 0.0f;
-        for (uint dv = tid; dv < d_v; dv += 256u) {
-            const float ov = tg_o[dv];
-            sq = fma(ov, ov, sq);
-        }
-        const float sg_sq = simd_sum(sq);
-        if (lane == 0u) {
-            tg_rms_partial[sg_id] = sg_sq;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Match `ami_gdn_out_norm_gate` bit-for-bit: single 32-lane `simd_sum` over
+        // `half`-staged `tg_o[dv]` so `m = 1` decode and `m > 1` prefill/tree match.
         if (sg_id == 0u) {
-            const float p_sq = (lane < 8u) ? tg_rms_partial[lane] : 0.0f;
-            const float total_sq = simd_sum(p_sq);
+            float sum_sq = 0.0f;
+            for (uint dv = lane; dv < d_v; dv += 32u) {
+                const float ov = tg_o[dv];
+                sum_sq = fma(ov, ov, sum_sq);
+            }
+            const float total_sq = simd_sum(sum_sq);
             if (lane == 0u) {
                 tg_rms_partial[0] = rsqrt(total_sq / float(d_v) + p.rms_eps);
             }
@@ -2214,6 +2210,67 @@ kernel void ami_gdn_conv1d_silu(const device half *q_in [[buffer(0)]],
             }
             store_qkv_channel(q_out, k_out, v_out, node, gid, p.gdn_qk, p.gdn_v, hybrid_fast_silu(acc));
         }
+    }
+}
+
+struct GdnConv1dQParams {
+    uint m;
+    uint gdn_qk;
+    uint gdn_v;
+    uint conv_k;
+};
+
+static_assert(sizeof(GdnConv1dQParams) == 16, "GdnConv1dQParams must be 16 bytes");
+
+// ADR-0019 `r >= 1` causal depthwise Conv1D + SiLU for GDN queries ONLY (`gid < gdn_qk`).
+// Reads current-pass `q_cur[node]` at `tap == hist`, and `r = 0` ancestor history
+// `q_hist_r0[anc]` (or committed `conv_state_in`) at `tap < hist`, writing ONLY `q_out`
+// without mutating `tree_{q,k,v}_raw`, `tree_{k,v}`, or `conv_state_in`.
+kernel void ami_gdn_conv1d_q_silu(const device half *q_cur [[buffer(0)]],
+                                  const device half *q_hist_r0 [[buffer(1)]],
+                                  const device float *conv_w [[buffer(2)]],
+                                  const device half *conv_state_in [[buffer(3)]],
+                                  const device ulong *ancestor_masks [[buffer(4)]],
+                                  device half *q_out [[buffer(5)]],
+                                  constant GdnConv1dQParams &p [[buffer(6)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.gdn_qk) {
+        return;
+    }
+
+    const uint conv_dim = 2u * p.gdn_qk + p.gdn_v;
+    const uint hist = (p.conv_k > 0u) ? (p.conv_k - 1u) : 0u;
+    const device float *w_row = conv_w + ulong(gid) * p.conv_k;
+
+    for (uint node = 0u; node < p.m; ++node) {
+        uint anc_nodes[8];
+        uint n_anc = 0u;
+        const ulong mask = ancestor_masks[node];
+        if (node > 0u && hist > 0u) {
+            for (int cand = int(node) - 1; cand >= 0 && n_anc < hist; --cand) {
+                if (((mask >> uint(cand)) & 1ul) != 0ul) {
+                    anc_nodes[n_anc++] = uint(cand);
+                }
+            }
+        }
+        float acc = 0.0f;
+        for (uint tap = 0u; tap < p.conv_k; ++tap) {
+            float xv;
+            if (tap == hist) {
+                xv = float(q_cur[ulong(node) * p.gdn_qk + gid]);
+            } else {
+                const uint back = hist - tap; // 1 = parent, 2 = grandparent, ...
+                if (back <= n_anc) {
+                    xv = float(q_hist_r0[ulong(anc_nodes[back - 1u]) * p.gdn_qk + gid]);
+                } else {
+                    const uint past_back = back - n_anc; // 1 = newest slot in conv_state_in
+                    const uint s_idx = hist - past_back;
+                    xv = float(conv_state_in[ulong(s_idx) * conv_dim + gid]);
+                }
+            }
+            acc = fma(xv, w_row[tap], acc);
+        }
+        q_out[ulong(node) * p.gdn_qk + gid] = half(hybrid_fast_silu(acc));
     }
 }
 
