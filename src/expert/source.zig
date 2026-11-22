@@ -59,11 +59,42 @@ pub const NvmeExpert = struct {
     }
 };
 
-/// Placeholder location on a Thunderbolt peer; no transport exists yet.
+/// Remote expert location on a Thunderbolt-connected Mac peer (ADR-0003,
+/// ADR-0015). Synchronous `residentBytes()` remains `error.TransportUnavailable`;
+/// remote evaluation and transport live in `src/cluster/`.
 pub const PeerExpert = struct {
+    /// Rank / peer identifier of the remote Mac owning this expert.
     peer: u16,
+    /// Byte offset of the expert weights in the peer's wired arena; a multiple
+    /// of `16 KiB` (`page.APPLE_PAGE_SIZE`).
     remote_offset: u64,
+    /// Byte length of the remote expert blob; a non-zero multiple of `16 KiB`.
     len: u64,
+    /// Transformer layer index owning this expert (defaulted for backward compatibility).
+    layer: u16 = 0,
+    /// Expert index within `layer` (defaulted for backward compatibility).
+    expert_id: u16 = 0,
+
+    pub const InitError = error{ ZeroLength, MisalignedOffset, MisalignedLength };
+
+    pub fn init(
+        peer: u16,
+        layer: u16,
+        expert_id: u16,
+        remote_offset: u64,
+        len: u64,
+    ) InitError!PeerExpert {
+        if (len == 0) return error.ZeroLength;
+        if (remote_offset % page.APPLE_PAGE_SIZE != 0) return error.MisalignedOffset;
+        if (len % page.APPLE_PAGE_SIZE != 0) return error.MisalignedLength;
+        return .{
+            .peer = peer,
+            .remote_offset = remote_offset,
+            .len = len,
+            .layer = layer,
+            .expert_id = expert_id,
+        };
+    }
 };
 
 test "ExpertSource has exactly the three charter variants" {
@@ -104,4 +135,20 @@ test "NVMe locations must be non-empty and 16 KiB aligned" {
 test "the Thunderbolt peer source is reserved" {
     const source: ExpertSource = .{ .thunderbolt_peer = .{ .peer = 1, .remote_offset = 0, .len = page.APPLE_PAGE_SIZE } };
     try std.testing.expectError(error.TransportUnavailable, source.residentBytes());
+}
+
+test "PeerExpert.init validates non-empty 16 KiB alignment and records layer and expert id" {
+    const peer = try PeerExpert.init(2, 7, 19, 3 * page.APPLE_PAGE_SIZE, 4 * page.APPLE_PAGE_SIZE);
+    try std.testing.expectEqual(@as(u16, 2), peer.peer);
+    try std.testing.expectEqual(@as(u16, 7), peer.layer);
+    try std.testing.expectEqual(@as(u16, 19), peer.expert_id);
+    try std.testing.expectEqual(@as(u64, 3 * page.APPLE_PAGE_SIZE), peer.remote_offset);
+    try std.testing.expectEqual(@as(u64, 4 * page.APPLE_PAGE_SIZE), peer.len);
+
+    const source: ExpertSource = .{ .thunderbolt_peer = peer };
+    try std.testing.expectError(error.TransportUnavailable, source.residentBytes());
+
+    try std.testing.expectError(error.ZeroLength, PeerExpert.init(1, 0, 0, 0, 0));
+    try std.testing.expectError(error.MisalignedOffset, PeerExpert.init(1, 0, 0, 128, page.APPLE_PAGE_SIZE));
+    try std.testing.expectError(error.MisalignedLength, PeerExpert.init(1, 0, 0, page.APPLE_PAGE_SIZE, 128));
 }
