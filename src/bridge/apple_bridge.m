@@ -144,7 +144,9 @@ void ami_device_destroy(ami_device *device) {
     if (device == NULL) {
         return;
     }
-    CFRelease(device->mtl_device);
+    @autoreleasepool {
+        CFRelease(device->mtl_device);
+    }
     free(device);
 }
 
@@ -207,7 +209,9 @@ void ami_library_destroy(ami_library *library) {
     if (library == NULL) {
         return;
     }
-    CFRelease(library->mtl_library);
+    @autoreleasepool {
+        CFRelease(library->mtl_library);
+    }
     free(library);
 }
 
@@ -265,7 +269,9 @@ void ami_buffer_destroy(ami_buffer *buffer) {
     if (buffer == NULL) {
         return;
     }
-    CFRelease(buffer->mtl_buffer);
+    @autoreleasepool {
+        CFRelease(buffer->mtl_buffer);
+    }
     free(buffer);
 }
 
@@ -429,20 +435,22 @@ void ami_kv_tile_destroy(ami_kv_tile *tile) {
     if (tile == NULL) {
         return;
     }
-    if (tile->alias_buffer != NULL) {
-        ami_buffer_destroy(tile->alias_buffer);
-    }
-    if (tile->mtl_r16_texture != NULL) {
-        CFRelease(tile->mtl_r16_texture);
-    }
-    if (tile->mtl_rgba_texture != NULL) {
-        CFRelease(tile->mtl_rgba_texture);
-    }
-    if (tile->is_mlocked != 0 && tile->base_addr != NULL && tile->alloc_bytes > 0) {
-        munlock(tile->base_addr, (size_t)tile->alloc_bytes);
-    }
-    if (tile->pixel_buffer != NULL) {
-        CVPixelBufferRelease(tile->pixel_buffer);
+    @autoreleasepool {
+        if (tile->alias_buffer != NULL) {
+            ami_buffer_destroy(tile->alias_buffer);
+        }
+        if (tile->mtl_r16_texture != NULL) {
+            CFRelease(tile->mtl_r16_texture);
+        }
+        if (tile->mtl_rgba_texture != NULL) {
+            CFRelease(tile->mtl_rgba_texture);
+        }
+        if (tile->is_mlocked != 0 && tile->base_addr != NULL && tile->alloc_bytes > 0) {
+            munlock(tile->base_addr, (size_t)tile->alloc_bytes);
+        }
+        if (tile->pixel_buffer != NULL) {
+            CVPixelBufferRelease(tile->pixel_buffer);
+        }
     }
     free(tile);
 }
@@ -614,7 +622,9 @@ void ami_pipeline_destroy(ami_pipeline *pipeline) {
     if (pipeline == NULL) {
         return;
     }
-    CFRelease(pipeline->mtl_pipeline);
+    @autoreleasepool {
+        CFRelease(pipeline->mtl_pipeline);
+    }
     free(pipeline);
 }
 
@@ -769,14 +779,14 @@ void ami_compute_destroy(ami_compute *compute) {
             [int_res commit];
             [int_res endResidency];
         }
+        for (uint32_t i = 0; i < AMI_MAX_FRAMES_IN_FLIGHT; i++) {
+            release_frame_slot(&compute->slots[i]);
+        }
+        if (compute->mtl_event != NULL) CFRelease(compute->mtl_event);
+        if (compute->mtl_internal_residency_set != NULL) CFRelease(compute->mtl_internal_residency_set);
+        if (compute->mtl_user_residency_set != NULL) CFRelease(compute->mtl_user_residency_set);
+        if (compute->mtl_queue != NULL) CFRelease(compute->mtl_queue);
     }
-    for (uint32_t i = 0; i < AMI_MAX_FRAMES_IN_FLIGHT; i++) {
-        release_frame_slot(&compute->slots[i]);
-    }
-    if (compute->mtl_event != NULL) CFRelease(compute->mtl_event);
-    if (compute->mtl_internal_residency_set != NULL) CFRelease(compute->mtl_internal_residency_set);
-    if (compute->mtl_user_residency_set != NULL) CFRelease(compute->mtl_user_residency_set);
-    if (compute->mtl_queue != NULL) CFRelease(compute->mtl_queue);
     free(compute);
 }
 

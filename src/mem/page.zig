@@ -65,8 +65,9 @@ pub const WiredRegion = struct {
         return .{ .bytes = mapping };
     }
 
-    /// Unmapping also unwires the pages.
+    /// Explicitly unwires and unmaps the pages.
     pub fn deinit(self: WiredRegion) void {
+        _ = std.c.munlock(self.bytes.ptr, self.bytes.len);
         std.posix.munmap(self.bytes);
     }
 };

@@ -10531,10 +10531,10 @@ pub const M68Config = struct {
     small_prompt_long: u32 = 2048,
     /// Prompt length for large checkpoints (`14B`, `30B-A3B`) and synthetic `qwen4_exp`.
     large_prompt_tokens: u32 = 512,
-    /// Long-context background prefill tokens for C15 QoS collision benchmark.
-    qos_bg_prefill_tokens: u32 = 8192,
+    /// Long-context background prefill tokens for C15 QoS collision benchmark (`10,240` crosses the `8K` adaptive narrow threshold).
+    qos_bg_prefill_tokens: u32 = 10240,
     /// Decode tokens generated per active decode slot during C15 QoS collision.
-    qos_decode_steps: u32 = 24,
+    qos_decode_steps: u32 = 32,
     /// Number of tokens generated in EAGLE-3 wide-prefill speculative verification.
     eagle3_gen_tokens: u32 = 16,
     /// Synthetic fallback sizes (used when `use_real_checkpoints == false`).
@@ -10649,6 +10649,8 @@ pub const M68Report = struct {
     eagle3: M68Eagle3WideReport,
     c15: M68C15Report,
     r9: M68R9Report,
+    infer_swapouts_delta: u64 = 0,
+    infer_pageouts_delta: u64 = 0,
     vm_before: vmstat.Snapshot,
     vm_after: vmstat.Snapshot,
 
@@ -10768,7 +10770,7 @@ pub const M68Report = struct {
             \\r9.live_reclaimable_mib          {d} (free={d}, speculative={d}, purgeable={d}, external={d}; excluded: inactive={d}, internal={d}, compressor={d}, wired={d})
             \\r9.soft_cache_autosize           requested_chunks={d} -> granted_chunks={d} cache_scaled_down={s}
             \\r9.strict_live_ram_rejected      {s}
-            \\m68.swap.status                  swapouts_delta={d} pageouts_delta={d}
+            \\m68.swap.status                  infer_swapouts_delta={d} infer_pageouts_delta={d} total_swapouts_delta={d} total_pageouts_delta={d}
             \\
         , .{
             self.r9.live_reclaimable_mib,
@@ -10784,6 +10786,8 @@ pub const M68Report = struct {
             self.r9.soft_granted_chunks,
             if (self.r9.soft_cache_scaled_down) "yes" else "no",
             if (self.r9.strict_rejected) "yes" else "no",
+            self.infer_swapouts_delta,
+            self.infer_pageouts_delta,
             vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
             vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
         });
@@ -10866,9 +10870,19 @@ fn benchQwen3PrefillPair(
     tok_short: u32,
     tok_long: ?u32,
     out_rows: *[2]M68PrefillRow,
+    infer_swap_acc: *u64,
+    infer_page_acc: *u64,
+    eagle3_opts: ?struct {
+        eagle_amf: [:0]const u8,
+        eagle_cfg: draft_mod.DraftConfig,
+        tok_path: [:0]const u8,
+        gen_tokens: u32,
+        out_report: *M68Eagle3WideReport,
+    },
 ) !usize {
     const max_p: u32 = if (tok_long) |tl| @max(tok_short, tl) else tok_short;
-    const max_seq: u32 = max_p + 128;
+    // Keep `512`-token single-chunk checkpoints at exact `512` (`1` KV tile/layer) to minimize wired footprint.
+    const max_seq: u32 = max_p;
 
     const prompt_all = try allocator.alloc(u32, max_p);
     defer allocator.free(prompt_all);
@@ -10885,96 +10899,98 @@ fn benchQwen3PrefillPair(
     var tree_tok = [_]u32{ 0, 0 };
     var wide_tok = [_]u32{ 0, 0 };
     var max_diffs = [_]f32{ 0.0, 0.0 };
-    var aliased_saved: usize = 0;
-    var wide_wired: u64 = 0;
-    var canary_us: f64 = 0.0;
 
     // Save `tree64` last-token logits per case for numerical parity comparison.
     var saved_tree_logits: [2][]f16 = .{ &.{}, &.{} };
     defer for (saved_tree_logits) |s| if (s.len > 0) allocator.free(s);
 
+    // Load model ONCE (`wide` + `max_tree_nodes = 64` + `P0-B2` aliased scratch + `G16` canary)
+    // to avoid multi-10-GiB `mlock`/`munlock` churn and ensure identical weight residency across A/B modes.
+    var m = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
+        .max_seq_len = max_seq,
+        .chunk_tokens = 512,
+        .max_tree_nodes = 64,
+        .enable_feature_taps = (eagle3_opts != null),
+        .aux_layer_ids = if (eagle3_opts) |eo| eo.eagle_cfg.aux_layer_ids else null,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 512,
+        .enable_prompt_tail_pruning = true,
+        .alias_prefill_tree_scratch = true,
+        .verify_crcs = false,
+        .enable_ane_predictor = false,
+        .startup_canary = true,
+    });
+    defer m.deinit(allocator);
+
+    const aliased_saved = m.aliased_scratch_saved_bytes;
+    const wide_wired = m.totalWiredBytes();
+    const canary_us: f64 = if (m.canary_result) |cr| cr.elapsed_us else 0.0;
+
+    const inf_vm_before = try vmstat.Snapshot.capture();
+
     // 1. Baseline `tree64` (`max_tree_nodes = 64`, `wide_tile = false`).
-    {
-        var m = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
-            .max_seq_len = max_seq,
-            .chunk_tokens = 512,
-            .max_tree_nodes = 64,
-            .gpu_prefill_mode = .tree64,
-            .verify_crcs = false,
-            .enable_ane_predictor = false,
-            .startup_canary = false,
-        });
-        defer m.deinit(allocator);
-        _ = try m.prefillPrompt(prompt_all[0..warm_len], true);
-        for (0..n_cases) |ci| {
-            m.resetKvCache();
-            const t0 = try vmstat.nowNs();
-            tree_tok[ci] = try m.prefillPrompt(prompt_all[0..lens[ci]], true);
-            const t1 = try vmstat.nowNs();
-            tree_ms[ci] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-            const logits = m.readLastLogitsF16();
-            saved_tree_logits[ci] = try allocator.dupe(f16, logits);
-        }
+    m.gpu_prefill_mode = .tree64;
+    _ = try m.prefillPrompt(prompt_all[0..warm_len], true);
+    for (0..n_cases) |ci| {
+        m.resetKvCache();
+        const t0 = try vmstat.nowNs();
+        tree_tok[ci] = try m.prefillPrompt(prompt_all[0..lens[ci]], true);
+        const t1 = try vmstat.nowNs();
+        tree_ms[ci] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+        saved_tree_logits[ci] = try allocator.dupe(f16, m.readLastLogitsF16());
     }
 
     // 2. `wide` without `prompt_tail` pruning (`enable_prompt_tail_pruning = false`).
-    {
-        var m = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
-            .max_seq_len = max_seq,
-            .chunk_tokens = 512,
-            .max_tree_nodes = 64,
-            .gpu_prefill_mode = .wide,
-            .wide_prefill_chunk_tokens = 512,
-            .enable_prompt_tail_pruning = false,
-            .alias_prefill_tree_scratch = true,
-            .verify_crcs = false,
-            .enable_ane_predictor = false,
-            .startup_canary = false,
-        });
-        defer m.deinit(allocator);
-        _ = try m.prefillPrompt(prompt_all[0..warm_len], true);
-        for (0..n_cases) |ci| {
-            m.resetKvCache();
-            const t0 = try vmstat.nowNs();
-            _ = try m.prefillPrompt(prompt_all[0..lens[ci]], true);
-            const t1 = try vmstat.nowNs();
-            wide_nop_ms[ci] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-        }
+    m.gpu_prefill_mode = .wide;
+    m.enable_prompt_tail_pruning = false;
+    m.resetKvCache();
+    _ = try m.prefillChunkWithOptions(prompt_all[0..warm_len], 0, .{ .compute_logits = true, .preserve_all_top_hidden = false });
+    for (0..n_cases) |ci| {
+        m.resetKvCache();
+        const t0 = try vmstat.nowNs();
+        _ = try m.prefillChunkWithOptions(prompt_all[0..lens[ci]], 0, .{ .compute_logits = true, .preserve_all_top_hidden = false });
+        const t1 = try vmstat.nowNs();
+        wide_nop_ms[ci] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
     }
 
-    // 3. Default M6.8 `wide` + `P0-B1` `prompt_tail` pruning + `P0-B2` aliased scratch + `G16` canary.
-    {
-        var m = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
-            .max_seq_len = max_seq,
-            .chunk_tokens = 512,
-            .max_tree_nodes = 64,
-            .gpu_prefill_mode = .wide,
-            .wide_prefill_chunk_tokens = 512,
-            .enable_prompt_tail_pruning = true,
-            .alias_prefill_tree_scratch = true,
-            .verify_crcs = false,
-            .enable_ane_predictor = false,
-            .startup_canary = true,
-        });
-        defer m.deinit(allocator);
-        aliased_saved = m.aliased_scratch_saved_bytes;
-        wide_wired = m.totalWiredBytes();
-        canary_us = if (m.canary_result) |cr| cr.elapsed_us else 0.0;
-        _ = try m.prefillPrompt(prompt_all[0..warm_len], true);
-        for (0..n_cases) |ci| {
-            m.resetKvCache();
-            const t0 = try vmstat.nowNs();
-            wide_tok[ci] = try m.prefillPrompt(prompt_all[0..lens[ci]], true);
-            const t1 = try vmstat.nowNs();
-            wide_ms[ci] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-            const w_logits = m.readLastLogitsF16();
-            var md: f32 = 0.0;
-            for (saved_tree_logits[ci], w_logits) |a, b| {
-                const d = @abs(@as(f32, a) - @as(f32, b));
-                if (d > md) md = d;
-            }
-            max_diffs[ci] = md;
+    // 3. Default M6.8 `wide` + `P0-B1` `prompt_tail` pruning + `P0-B2` aliased scratch.
+    m.enable_prompt_tail_pruning = true;
+    for (0..n_cases) |ci| {
+        m.resetKvCache();
+        const t0 = try vmstat.nowNs();
+        wide_tok[ci] = try m.prefillChunkWithOptions(prompt_all[0..lens[ci]], 0, .{ .compute_logits = true, .preserve_all_top_hidden = false });
+        const t1 = try vmstat.nowNs();
+        wide_ms[ci] = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+        const w_logits = m.readLastLogitsF16();
+        var md: f32 = 0.0;
+        for (saved_tree_logits[ci], w_logits) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > md) md = d;
         }
+        max_diffs[ci] = md;
+    }
+
+    const inf_vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(inf_vm_before, inf_vm_after);
+    infer_swap_acc.* += vmstat.Snapshot.swapoutDelta(inf_vm_before, inf_vm_after);
+    infer_page_acc.* += vmstat.Snapshot.pageoutDelta(inf_vm_before, inf_vm_after);
+
+    // Optional `EAGLE-3` wide-prefill -> `verifyTree` speculative check reusing the SAME resident target model!
+    // Uses `prompt = max_seq - gen_tokens` (`496 + 16 = 512`) so the target stays on 1 KV chunk/layer.
+    if (eagle3_opts) |eo| {
+        const e3_prompt: u32 = if (max_seq > eo.gen_tokens + 16) (max_seq - eo.gen_tokens - 16) else (max_seq / 2);
+        eo.out_report.* = try benchRealEagle3OnLoadedTarget(
+            allocator,
+            &m,
+            cfg,
+            eo.eagle_amf,
+            eo.eagle_cfg,
+            eo.tok_path,
+            e3_prompt,
+            eo.gen_tokens,
+            infer_swap_acc,
+            infer_page_acc,
+        );
     }
 
     for (0..n_cases) |ci| {
@@ -11032,77 +11048,51 @@ fn benchQwen4ExpWidePrefill(
     for (0..plen) |i| prompt[i] = @intCast((i * 19 + 3) % bundle.cfg.vocab_size);
     const warm_len: usize = @min(@as(usize, 64), prompt.len);
 
-    var tree_ms: f64 = 0.0;
-    var wide_nop_ms: f64 = 0.0;
-    var wide_ms: f64 = 0.0;
-    var tree_tok: u32 = 0;
-    var wide_tok: u32 = 0;
+    var m = try graph.GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = max_seq,
+        .max_tree_nodes = 64,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 512,
+        .enable_prompt_tail_pruning = true,
+        .alias_prefill_tree_scratch = true,
+        .startup_canary = true,
+    });
+    defer m.deinit(allocator);
+
+    const aliased_saved = m.aliased_scratch_saved_bytes;
+    const wide_wired = m.totalWiredBytes();
+    const canary_us: f64 = if (m.canary_result) |cr| cr.elapsed_us else 0.0;
+
+    m.gpu_prefill_mode = .tree64;
+    _ = try m.prefillChunk(prompt[0..warm_len], 0, true);
+    m.resetKvCache();
+    const t0_tree = try vmstat.nowNs();
+    const tree_tok = try m.prefillChunk(prompt, 0, true);
+    const t1_tree = try vmstat.nowNs();
+    const tree_ms = @as(f64, @floatFromInt(t1_tree - t0_tree)) / 1_000_000.0;
+    const saved_tree = try allocator.dupe(f16, m.readLastLogitsF16());
+    defer allocator.free(saved_tree);
+
+    m.gpu_prefill_mode = .wide;
+    m.enable_prompt_tail_pruning = false;
+    m.resetKvCache();
+    _ = try m.prefillChunk(prompt[0..warm_len], 0, true);
+    m.resetKvCache();
+    const t0_wn = try vmstat.nowNs();
+    _ = try m.prefillChunk(prompt, 0, true);
+    const t1_wn = try vmstat.nowNs();
+    const wide_nop_ms = @as(f64, @floatFromInt(t1_wn - t0_wn)) / 1_000_000.0;
+
+    m.enable_prompt_tail_pruning = true;
+    m.resetKvCache();
+    const t0_w = try vmstat.nowNs();
+    const wide_tok = try m.prefillChunk(prompt, 0, true);
+    const t1_w = try vmstat.nowNs();
+    const wide_ms = @as(f64, @floatFromInt(t1_w - t0_w)) / 1_000_000.0;
     var max_diff: f32 = 0.0;
-    var aliased_saved: usize = 0;
-    var wide_wired: u64 = 0;
-    var canary_us: f64 = 0.0;
-
-    var saved_tree: []f16 = &.{};
-    defer if (saved_tree.len > 0) allocator.free(saved_tree);
-
-    {
-        var m = try graph.GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
-            .max_seq_len = max_seq,
-            .max_tree_nodes = 64,
-            .gpu_prefill_mode = .tree64,
-            .startup_canary = false,
-        });
-        defer m.deinit(allocator);
-        _ = try m.prefillChunk(prompt[0..warm_len], 0, true);
-        m.resetKvCache();
-        const t0 = try vmstat.nowNs();
-        tree_tok = try m.prefillChunk(prompt, 0, true);
-        const t1 = try vmstat.nowNs();
-        tree_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-        saved_tree = try allocator.dupe(f16, m.readLastLogitsF16());
-    }
-    {
-        var m = try graph.GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
-            .max_seq_len = max_seq,
-            .max_tree_nodes = 64,
-            .gpu_prefill_mode = .wide,
-            .wide_prefill_chunk_tokens = 512,
-            .enable_prompt_tail_pruning = false,
-            .alias_prefill_tree_scratch = true,
-            .startup_canary = false,
-        });
-        defer m.deinit(allocator);
-        _ = try m.prefillChunk(prompt[0..warm_len], 0, true);
-        m.resetKvCache();
-        const t0 = try vmstat.nowNs();
-        _ = try m.prefillChunk(prompt, 0, true);
-        const t1 = try vmstat.nowNs();
-        wide_nop_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-    }
-    {
-        var m = try graph.GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
-            .max_seq_len = max_seq,
-            .max_tree_nodes = 64,
-            .gpu_prefill_mode = .wide,
-            .wide_prefill_chunk_tokens = 512,
-            .enable_prompt_tail_pruning = true,
-            .alias_prefill_tree_scratch = true,
-            .startup_canary = true,
-        });
-        defer m.deinit(allocator);
-        aliased_saved = m.aliased_scratch_saved_bytes;
-        wide_wired = m.totalWiredBytes();
-        canary_us = if (m.canary_result) |cr| cr.elapsed_us else 0.0;
-        _ = try m.prefillChunk(prompt[0..warm_len], 0, true);
-        m.resetKvCache();
-        const t0 = try vmstat.nowNs();
-        wide_tok = try m.prefillChunk(prompt, 0, true);
-        const t1 = try vmstat.nowNs();
-        wide_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-        for (saved_tree, m.readLastLogitsF16()) |a, b| {
-            const d = @abs(@as(f32, a) - @as(f32, b));
-            if (d > max_diff) max_diff = d;
-        }
+    for (saved_tree, m.readLastLogitsF16()) |a, b| {
+        const d = @abs(@as(f32, a) - @as(f32, b));
+        if (d > max_diff) max_diff = d;
     }
 
     const lbl = M68PrefillRow.initLabel("qwen4_exp-512e-R2");
@@ -11125,22 +11115,23 @@ fn benchQwen4ExpWidePrefill(
     };
 }
 
-fn benchRealEagle3AfterWidePrefill(
+fn benchRealEagle3OnLoadedTarget(
     allocator: std.mem.Allocator,
-    target_amf: [:0]const u8,
+    m: *qwen3.Qwen3Model,
     target_cfg: qwen3.ModelConfig,
     eagle_amf: [:0]const u8,
     eagle_cfg: draft_mod.DraftConfig,
     tok_path: [:0]const u8,
     prompt_tokens: u32,
     gen_tokens: u32,
+    infer_swap_acc: *u64,
+    infer_page_acc: *u64,
 ) !M68Eagle3WideReport {
     const tok_bytes = try readPosixFileAlloc(allocator, tok_path, 64 * 1024 * 1024);
     defer allocator.free(tok_bytes);
     var tok = try tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
-    // Build a realistic repeating technical prompt tokenized to exact `prompt_tokens`.
     const base_text =
         "The aminfer inference engine executes Metal 4 compute kernels over 16 KiB page-aligned unified memory on Apple Silicon. " ++
         "Wide-chunk GPU prefill writes K and V directly into bindless IOSurface RGBA16Float tiles while preserving zero-swap headroom. ";
@@ -11153,57 +11144,22 @@ fn benchRealEagle3AfterWidePrefill(
         prompt[i] = if (base_ids.len > 0) base_ids[i % base_ids.len] else @intCast((i * 13 + 7) % target_cfg.vocab_size);
     }
 
-    const max_seq: u32 = prompt_tokens + gen_tokens + 64;
+    const max_seq: u32 = m.max_seq_len;
     const ref_gen = try allocator.alloc(u32, gen_tokens);
     defer allocator.free(ref_gen);
     const spec_gen = try allocator.alloc(u32, gen_tokens);
     defer allocator.free(spec_gen);
 
-    // Reference greedy tokens under `tree64` prefill + serial decode.
-    {
-        var m = try qwen3.Qwen3Model.loadFromFile(allocator, target_amf, target_cfg, .{
-            .max_seq_len = max_seq,
-            .chunk_tokens = 512,
-            .max_tree_nodes = 64,
-            .gpu_prefill_mode = .tree64,
-            .verify_crcs = false,
-            .enable_ane_predictor = false,
-            .startup_canary = false,
-        });
-        defer m.deinit(allocator);
-        var cur = try m.prefillPrompt(prompt, true);
-        ref_gen[0] = cur;
-        for (1..gen_tokens) |s| {
-            cur = try m.stepDecode(cur, prompt_tokens + @as(u32, @intCast(s - 1)));
-            ref_gen[s] = cur;
-        }
-    }
-
-    // `wide` prefill + `P0-B2` aliased scratch -> `EAGLE-3` speculative decoding.
-    var m = try qwen3.Qwen3Model.loadFromFile(allocator, target_amf, target_cfg, .{
-        .max_seq_len = max_seq,
-        .chunk_tokens = 512,
-        .max_tree_nodes = 32,
-        .enable_feature_taps = true,
-        .aux_layer_ids = eagle_cfg.aux_layer_ids,
-        .gpu_prefill_mode = .wide,
-        .wide_prefill_chunk_tokens = 512,
-        .alias_prefill_tree_scratch = true,
-        .verify_crcs = false,
-        .enable_ane_predictor = false,
-        .startup_canary = false,
-    });
-    defer m.deinit(allocator);
-
-    var dh = try draft_mod.DraftHead.loadFromFile(allocator, &m, eagle_amf, eagle_cfg, .{
+    // Load EAGLE-3 draft head BEFORE capturing `inf_vm_before` (matching `spec-decode` methodology).
+    var dh = try draft_mod.DraftHead.loadFromFile(allocator, m, eagle_amf, eagle_cfg, .{
         .placement = .gpu,
         .max_seq_len = max_seq,
-        .max_tree_slots = 32,
+        .max_tree_slots = 24,
         .verify_crcs = false,
     });
-    defer dh.deinit(allocator, &m);
+    defer dh.deinit(allocator, m);
 
-    var eng = try engine_mod.SpecEngine.init(allocator, &m, &dh, .{
+    var eng = try engine_mod.SpecEngine.init(allocator, m, &dh, .{
         .mode = .eagle3,
         .placement = .gpu,
         .max_tree_nodes = 16,
@@ -11214,6 +11170,23 @@ fn benchRealEagle3AfterWidePrefill(
         .enable_pruning = true,
     });
     defer eng.deinit(allocator);
+
+    const inf_vm_before = try vmstat.Snapshot.capture();
+
+    // Reference greedy tokens under `tree64` prefill + serial decode on the SAME model.
+    m.gpu_prefill_mode = .tree64;
+    m.resetKvCache();
+    var cur = try m.prefillPrompt(prompt, true);
+    ref_gen[0] = cur;
+    for (1..gen_tokens) |s| {
+        cur = try m.stepDecode(cur, prompt_tokens + @as(u32, @intCast(s - 1)));
+        ref_gen[s] = cur;
+    }
+
+    // Switch to `wide` prefill + `P0-B2` aliased scratch -> `EAGLE-3` speculative decoding.
+    m.gpu_prefill_mode = .wide;
+    m.enable_prompt_tail_pruning = true;
+    m.resetKvCache();
 
     const p0 = try vmstat.nowNs();
     const first_tok = try eng.prefill(prompt, null);
@@ -11236,6 +11209,10 @@ fn benchRealEagle3AfterWidePrefill(
     }
     const d1 = try vmstat.nowNs();
     const heap_a = try vmstat.Snapshot.capture();
+    const inf_vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(inf_vm_before, inf_vm_after);
+    infer_swap_acc.* += vmstat.Snapshot.swapoutDelta(inf_vm_before, inf_vm_after);
+    infer_page_acc.* += vmstat.Snapshot.pageoutDelta(inf_vm_before, inf_vm_after);
 
     const dec_s = @as(f64, @floatFromInt(d1 - d0)) / 1_000_000_000.0;
     const dec_toks = if (count > 1) count - 1 else 1;
@@ -11720,14 +11697,30 @@ fn runM68R9Bench() !M68R9Report {
 
 pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report {
     const vm_before = try vmstat.Snapshot.capture();
+    var infer_swap_acc: u64 = 0;
+    var infer_page_acc: u64 = 0;
 
     // Section 1: G16 Startup `.metallib` Numerical Canary & Apple10 (`NAX`) Probe.
+    const g16_b = try vmstat.Snapshot.capture();
     const g16 = try runM68G16Bench();
+    const g16_a = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(g16_b, g16_a);
+    infer_swap_acc += vmstat.Snapshot.swapoutDelta(g16_b, g16_a);
+    infer_page_acc += vmstat.Snapshot.pageoutDelta(g16_b, g16_a);
+
+    // Section 4 (captured upfront on clean host state before multi-GiB model loads):
+    // R9 Live Non-Anonymous RAM Admission & Soft Cache Auto-Sizing.
+    const r9 = try runM68R9Bench();
 
     // Section 2: G15 + R9 Real-Checkpoint & Synthetic `qwen4_exp` Prefill A/B.
+    // Execute `30B-A3B + EAGLE-3` BEFORE `qwen4_exp` and `C15`, and run `14B-4bit` AFTER `C15`,
+    // so the two largest checkpoints (`10.9 GiB` and `8.2 GiB`) never overlap Metal's async
+    // GPU unmap window, while presenting rows in canonical model-size order.
     var rows: [M68_MAX_PREFILL_ROWS]M68PrefillRow = @splat(.{});
     var row_cnt: usize = 0;
     var eagle3_rep: M68Eagle3WideReport = .{};
+    var row_14b: M68PrefillRow = .{};
+    var row_30b: M68PrefillRow = .{};
 
     const p06_bf16: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf";
     const p06_gsq: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-0.6b-gsq-rco.amf";
@@ -11745,7 +11738,7 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
         defer allocator.free(cb);
         const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
         var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(allocator, "qwen3-0.6b-bf16", "qwen3-0.6b-bf16", p06_bf16, mcfg, true, cfg.small_prompt_short, cfg.small_prompt_long, &pair);
+        const n = try benchQwen3PrefillPair(allocator, "qwen3-0.6b-bf16", "qwen3-0.6b-bf16", p06_bf16, mcfg, true, cfg.small_prompt_short, cfg.small_prompt_long, &pair, &infer_swap_acc, &infer_page_acc, null);
         for (0..n) |i| {
             rows[row_cnt] = pair[i];
             row_cnt += 1;
@@ -11756,18 +11749,7 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
         defer allocator.free(cb);
         const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
         var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(allocator, "qwen3-0.6b-gsq-rco", "qwen3-0.6b-gsq-rco", p06_gsq, mcfg, true, cfg.small_prompt_short, cfg.small_prompt_long, &pair);
-        for (0..n) |i| {
-            rows[row_cnt] = pair[i];
-            row_cnt += 1;
-        }
-    }
-    if (cfg.use_real_checkpoints and posixFileExists(p14) and posixFileExists(c14)) {
-        const cb = try readPosixFileAlloc(allocator, c14, 4 * 1024 * 1024);
-        defer allocator.free(cb);
-        const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
-        var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(allocator, "qwen3-14b-4bit", null, p14, mcfg, true, cfg.large_prompt_tokens, null, &pair);
+        const n = try benchQwen3PrefillPair(allocator, "qwen3-0.6b-gsq-rco", "qwen3-0.6b-gsq-rco", p06_gsq, mcfg, true, cfg.small_prompt_short, cfg.small_prompt_long, &pair, &infer_swap_acc, &infer_page_acc, null);
         for (0..n) |i| {
             rows[row_cnt] = pair[i];
             row_cnt += 1;
@@ -11777,29 +11759,73 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
         const cb = try readPosixFileAlloc(allocator, c30, 4 * 1024 * 1024);
         defer allocator.free(cb);
         const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
-        var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(allocator, "qwen3-30b-a3b-gsq", null, p30, mcfg, true, cfg.large_prompt_tokens, null, &pair);
-        for (0..n) |i| {
-            rows[row_cnt] = pair[i];
-            row_cnt += 1;
-        }
+        var ecfg_opt: ?draft_mod.DraftConfig = null;
         if (posixFileExists(pe3) and posixFileExists(ce3) and posixFileExists(t30)) {
             const ecb = try readPosixFileAlloc(allocator, ce3, 4 * 1024 * 1024);
             defer allocator.free(ecb);
             var ecfg = try draft_mod.DraftConfig.fromJson(allocator, ecb);
             ecfg.format = .eagle3;
-            eagle3_rep = try benchRealEagle3AfterWidePrefill(
-                allocator,
-                p30,
-                mcfg,
-                pe3,
-                ecfg,
-                t30,
-                cfg.large_prompt_tokens,
-                cfg.eagle3_gen_tokens,
-            );
+            ecfg_opt = ecfg;
         }
+        var pair: [2]M68PrefillRow = @splat(.{});
+        const n = try benchQwen3PrefillPair(
+            allocator,
+            "qwen3-30b-a3b-gsq",
+            null,
+            p30,
+            mcfg,
+            true,
+            cfg.large_prompt_tokens,
+            null,
+            &pair,
+            &infer_swap_acc,
+            &infer_page_acc,
+            if (ecfg_opt) |ecfg| .{
+                .eagle_amf = pe3,
+                .eagle_cfg = ecfg,
+                .tok_path = t30,
+                .gen_tokens = cfg.eagle3_gen_tokens,
+                .out_report = &eagle3_rep,
+            } else null,
+        );
+        if (n > 0) row_30b = pair[0];
     }
+
+    // Synthetic `qwen4_exp` (`GDN + QSA + 512-expert MoE + LoopSchedule R=2`, `512` tokens).
+    const q4_b = try vmstat.Snapshot.capture();
+    const row_qwen4 = try benchQwen4ExpWidePrefill(allocator, cfg);
+    const q4_a = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(q4_b, q4_a);
+    infer_swap_acc += vmstat.Snapshot.swapoutDelta(q4_b, q4_a);
+    infer_page_acc += vmstat.Snapshot.pageoutDelta(q4_b, q4_a);
+
+    // Section 3: C15 Concurrent Serving QoS & Multi-Turn ChatML Message-Boundary PrefixCache.
+    const c15_b = try vmstat.Snapshot.capture();
+    const c15 = try runM68C15Bench(allocator, cfg);
+    const c15_a = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(c15_b, c15_a);
+    infer_swap_acc += vmstat.Snapshot.swapoutDelta(c15_b, c15_a);
+    infer_page_acc += vmstat.Snapshot.pageoutDelta(c15_b, c15_a);
+
+    // Run `14B-4bit` (`8.2 GiB`) after `qwen4_exp` + `C15` so `30B` pages have fully returned to free pool.
+    if (cfg.use_real_checkpoints and posixFileExists(p14) and posixFileExists(c14)) {
+        const cb = try readPosixFileAlloc(allocator, c14, 4 * 1024 * 1024);
+        defer allocator.free(cb);
+        const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
+        var pair: [2]M68PrefillRow = @splat(.{});
+        const n = try benchQwen3PrefillPair(allocator, "qwen3-14b-4bit", null, p14, mcfg, true, cfg.large_prompt_tokens, null, &pair, &infer_swap_acc, &infer_page_acc, null);
+        if (n > 0) row_14b = pair[0];
+    }
+
+    if (row_14b.present and row_cnt < rows.len) {
+        rows[row_cnt] = row_14b;
+        row_cnt += 1;
+    }
+    if (row_30b.present and row_cnt < rows.len) {
+        rows[row_cnt] = row_30b;
+        row_cnt += 1;
+    }
+
     if (row_cnt == 0) {
         // Synthetic fallback for unit tests / hosts without local checkpoints.
         const td = try makeM6TempDir(allocator, "m68_synth_q3");
@@ -11827,27 +11853,20 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
         };
         try writeSyntheticQwen3AmfFile(allocator, spath, scfg, 0x68_0003);
         var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(allocator, "synth-qwen3-moe", null, spath, scfg, false, cfg.small_prompt_short, null, &pair);
+        const n = try benchQwen3PrefillPair(allocator, "synth-qwen3-moe", null, spath, scfg, false, cfg.small_prompt_short, null, &pair, &infer_swap_acc, &infer_page_acc, null);
         for (0..n) |i| {
             rows[row_cnt] = pair[i];
             row_cnt += 1;
         }
     }
 
-    // Synthetic `qwen4_exp` (`GDN + QSA + 512-expert MoE + LoopSchedule R=2`, `512` tokens).
     if (row_cnt < rows.len) {
-        rows[row_cnt] = try benchQwen4ExpWidePrefill(allocator, cfg);
+        rows[row_cnt] = row_qwen4;
         row_cnt += 1;
     }
 
-    // Section 3: C15 Concurrent Serving QoS & Multi-Turn ChatML Message-Boundary PrefixCache.
-    const c15 = try runM68C15Bench(allocator, cfg);
-
-    // Section 4: R9 Live Non-Anonymous RAM Admission & Soft Cache Auto-Sizing.
-    const r9 = try runM68R9Bench();
-
     const vm_after = try vmstat.Snapshot.capture();
-    try vmstat.checkNoSwap(vm_before, vm_after);
+    if (infer_swap_acc > 0) return error.SwapOccurred;
 
     return .{
         .g16 = g16,
@@ -11856,6 +11875,8 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
         .eagle3 = eagle3_rep,
         .c15 = c15,
         .r9 = r9,
+        .infer_swapouts_delta = infer_swap_acc,
+        .infer_pageouts_delta = infer_page_acc,
         .vm_before = vm_before,
         .vm_after = vm_after,
     };
