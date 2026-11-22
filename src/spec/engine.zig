@@ -263,6 +263,13 @@ pub const TargetModel = union(enum) {
         };
     }
 
+    pub fn hiddenSize(self: TargetModel) u32 {
+        return switch (self) {
+            .qwen3 => |m| m.config.hidden_size,
+            .graph => |g| g.config.hidden_size,
+        };
+    }
+
     pub fn numHiddenLayers(self: TargetModel) u32 {
         return switch (self) {
             .qwen3 => |m| m.config.num_hidden_layers,
@@ -274,6 +281,20 @@ pub const TargetModel = union(enum) {
         return switch (self) {
             .qwen3 => |m| m.logits_host,
             .graph => |g| g.logits_host,
+        };
+    }
+
+    pub fn lastLogitsRow(self: TargetModel) usize {
+        return switch (self) {
+            .qwen3 => |m| m.last_logits_row,
+            .graph => |g| g.last_logits_row,
+        };
+    }
+
+    pub fn prefillChunkCap(self: TargetModel) u32 {
+        return switch (self) {
+            .qwen3 => |m| m.prefillChunkCap(),
+            .graph => |g| g.prefillChunkCap(),
         };
     }
 
@@ -302,6 +323,18 @@ pub const TargetModel = union(enum) {
         return switch (self) {
             .qwen3 => |m| try m.prefillChunk(tokens, start_pos, compute_logits),
             .graph => |g| try g.prefillChunk(tokens, start_pos, compute_logits),
+        };
+    }
+
+    pub fn prefillChunkWithOptions(
+        self: TargetModel,
+        tokens: []const u32,
+        start_pos: u32,
+        opts: qwen3.PrefillChunkOptions,
+    ) RunError!u32 {
+        return switch (self) {
+            .qwen3 => |m| try m.prefillChunkWithOptions(tokens, start_pos, opts),
+            .graph => |g| try g.prefillChunkWithOptions(tokens, start_pos, opts),
         };
     }
 
@@ -1351,10 +1384,17 @@ pub const SpecEngine = struct {
 
         self.reset();
 
-        const max_chunk: usize = if (self.draft_head) |dh|
-            @min(@as(usize, self.target.maxTreeNodes()), @as(usize, dh.max_tree_slots))
+        const need_top_hidden: bool = if (self.draft_head) |dh|
+            (dh.config.format != .eagle3)
         else
-            @as(usize, self.target.maxTreeNodes());
+            false;
+        const max_chunk: usize = if (self.draft_head) |dh|
+            if (dh.effective_placement == .cpu_sme2)
+                @min(@as(usize, self.target.maxTreeNodes()), @as(usize, dh.max_tree_slots))
+            else
+                @as(usize, self.target.prefillChunkCap())
+        else
+            @as(usize, self.target.prefillChunkCap());
 
         var start: usize = 0;
         var first_tok: u32 = 0;
@@ -1362,13 +1402,16 @@ pub const SpecEngine = struct {
             const take: usize = @min(max_chunk, prompt_tokens.len - start);
             const is_last = (start + take == prompt_tokens.len);
 
-            const greedy_tok = try self.target.prefillChunk(
+            const greedy_tok = try self.target.prefillChunkWithOptions(
                 prompt_tokens[start .. start + take],
                 @intCast(start),
-                is_last,
+                .{
+                    .compute_logits = is_last,
+                    .preserve_all_top_hidden = need_top_hidden,
+                },
             );
             if (is_last) {
-                first_tok = try self.sampleFirstToken(take - 1, greedy_tok, rng);
+                first_tok = try self.sampleFirstToken(self.target.lastLogitsRow(), greedy_tok, rng);
             }
 
             // Feed prompt tokens into L1 Suffix Automaton.
@@ -1380,23 +1423,38 @@ pub const SpecEngine = struct {
                 }
             }
 
-            // Synchronize L2 draft head with shifted `(token_{p+1}, target_feature_p)`.
+            // Synchronize L2 draft head with shifted `(token_{p+1}, target_feature_p)`,
+            // slicing across `dh.max_tree_slots` when target ran a wide (`> 64`) prefill chunk.
             if (self.draft_head) |dh| {
-                for (0..take) |j| {
-                    const idx = start + j;
-                    self.shifted_tokens[j] = if (idx + 1 < prompt_tokens.len)
-                        prompt_tokens[idx + 1]
-                    else
-                        first_tok;
+                const feat_base = self.targetFeatureBinding(dh);
+                const feat_row_bytes: u64 = @as(u64, self.target.hiddenSize()) *
+                    (if (dh.config.format == .eagle3) @as(u64, 3) else @as(u64, 1)) * @sizeOf(f16);
+                const dh_cap: usize = @min(@as(usize, dh.max_tree_slots), MAX_TREE_NODES);
+                var sub: usize = 0;
+                while (sub < take) {
+                    const sub_take: usize = @min(dh_cap, take - sub);
+                    for (0..sub_take) |j| {
+                        const idx = start + sub + j;
+                        self.shifted_tokens[j] = if (idx + 1 < prompt_tokens.len)
+                            prompt_tokens[idx + 1]
+                        else
+                            first_tok;
+                    }
+                    const is_final_sub = is_last and (sub + sub_take == take);
+                    const top_k: u32 = if (is_final_sub) self.config.top_k_per_node else 0;
+                    const sub_feat: metal.BufferBinding = .{
+                        .buffer = feat_base.buffer,
+                        .offset = feat_base.offset + @as(u64, sub) * feat_row_bytes,
+                    };
+                    try self.target.syncDraftHead(
+                        dh,
+                        self.shifted_tokens[0..sub_take],
+                        sub_feat,
+                        @intCast(start + sub),
+                        top_k,
+                    );
+                    sub += sub_take;
                 }
-                const top_k: u32 = if (is_last) self.config.top_k_per_node else 0;
-                try self.target.syncDraftHead(
-                    dh,
-                    self.shifted_tokens[0..take],
-                    self.targetFeatureBinding(dh),
-                    @intCast(start),
-                    top_k,
-                );
             }
 
             start += take;

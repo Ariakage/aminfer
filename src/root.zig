@@ -37,6 +37,7 @@ pub const sme = @import("cpu/sme.zig");
 pub const rng = @import("runtime/rng.zig");
 pub const ngram_nvme = @import("spec/ngram_nvme.zig");
 pub const server = @import("server/http_sse.zig");
+pub const http_sse = server;
 
 test {
     _ = metal;

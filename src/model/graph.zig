@@ -800,6 +800,26 @@ pub const GraphLoadOptions = struct {
     /// per full-context `GQA` / `QSA` layer and retire older completed chunks on GPU
     /// into group-64 `q8` (`RetiredKvQ8Pool`, `-46.875%` retired KV RAM). `0` disables retirement.
     kv_retire_q8_after_chunks: u32 = 0,
+
+    // M6.8 Wide GPU Prefill, Tail Pruning, Scratch Aliasing, Canary & Live RAM (`ADR-0020`)
+    /// GPU prefill backend (`wide` = 512–1024 tok wide prefill, default; `tree64` = legacy `<= 64` A/B baseline).
+    gpu_prefill_mode: qwen3.GpuPrefillMode = .wide,
+    /// Wide GPU prefill chunk capacity (`512` default; up to `attention.MAX_WIDE_PREFILL_TOKENS = 1024`).
+    wide_prefill_chunk_tokens: u32 = 512,
+    /// Run `< 0.1 ms` startup `.metallib` numerical canary once during load (`G16`).
+    startup_canary: bool = true,
+    /// Alias single-request wide-prefill scratch with `verifyTree` scratch via `WiredArena.allocAliasedPair` (`P0-B2`).
+    alias_prefill_tree_scratch: bool = true,
+    /// Opt-in strict live non-anonymous RAM admission (`--strict-live-ram`, `P1-B`).
+    strict_live_ram: bool = false,
+    /// Safety margin subtracted from live reclaimable RAM (`P1-B`, default 512 MiB).
+    live_safety_margin_bytes: u64 = budget_mod.DEFAULT_LIVE_SAFETY_MARGIN_BYTES,
+    /// Optional synthetic live zero-swap RAM override for deterministic tests.
+    live_reclaimable_override: ?u64 = null,
+    /// Disable `P0-B1` final-layer `prompt_tail` compute pruning when full-prompt logits are requested.
+    compute_all_logits: bool = false,
+    /// Enable lossless `P0-B1` final-layer `prompt_tail` compute pruning (default `true`).
+    enable_prompt_tail_pruning: bool = true,
 };
 
 pub const LoopIsolationStats = struct {
@@ -835,7 +855,8 @@ pub const GraphLoadError = error{
     TooManyWeightShards,
     Overflow,
     OutOfMemory,
-} || amf.ParseError || amf.IoError || metal.Error || sysinfo.Error ||
+} || amf.ParseError || amf.IoError || metal.Error || sysinfo.Error || vmstat.Error ||
+    budget_mod.PlanError || dequant.CanaryError ||
     page.ShareError || expert.NvmeExpert.InitError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError || hybrid.ArenaError || hybrid.HybridKvRing.InitError ||
     attention.RetiredKvQ8PoolError ||
@@ -897,6 +918,12 @@ const GdnLayerWeights = struct {
     tree_v_raw_off: u64,
     conv_state_off: u64,
     conv_state_tmp_off: u64,
+    // M6.8 wide-prefill per-layer `r = 0` loop-isolation scratch offsets (active when `wide_enabled and R > 1`).
+    wp_k_off: u64 = 0,
+    wp_v_off: u64 = 0,
+    wp_g_off: u64 = 0,
+    wp_beta_off: u64 = 0,
+    wp_q_raw_off: u64 = 0,
 };
 
 const QsaLayerWeights = struct {
@@ -910,10 +937,14 @@ const QsaLayerWeights = struct {
     qk_norm_dtype: quant.FloatDType,
     kv_ring: hybrid.HybridKvRing,
     index_buf: hybrid.QsaIndexBuffer,
+    wp_index_buf: ?hybrid.QsaIndexBuffer = null,
     block_keys_off: u64,
     max_blocks: u32,
     tree_k_off: u64,
     tree_v_off: u64,
+    // M6.8 wide-prefill circular-SWA `r = 0` K/V staging (active when `wide_enabled and ring_capacity > 0 and R > 1`).
+    wp_k_off: u64 = 0,
+    wp_v_off: u64 = 0,
     // M6.5 R5 retired q8 KV tier (active when `supports_retire_q8 == true`)
     supports_retire_q8: bool = false,
     full_tile_table_off: u64 = 0,
@@ -1163,6 +1194,45 @@ pub const GraphModel = struct {
     retired_kv_pool: ?attention.RetiredKvQ8Pool = null,
     active_tile_phys_ring: []u32 = &.{},
     mrope_next_pos: u32 = 0,
+
+    // M6.8 Wide GPU Prefill (`G15`), Tail Pruning (`P0-B1`), Aliased Scratch (`P0-B2`),
+    // Live RAM Admission (`P1-B`) & Startup `.metallib` Canary (`G16`)
+    gpu_prefill_mode: qwen3.GpuPrefillMode = .wide,
+    wide_prefill_max_tokens: u32 = 0,
+    supports_wide_prefill: bool = false,
+    compute_all_logits: bool = false,
+    enable_prompt_tail_pruning: bool = true,
+    canary_result: ?dequant.CanaryResult = null,
+    live_admission: budget_mod.LiveAdmissionPlan = std.mem.zeroes(budget_mod.LiveAdmissionPlan),
+    aliased_scratch_saved_bytes: usize = 0,
+    wp_token_ids_host: []u32 = &.{},
+    wp_pos3d_host: []hybrid.Pos3D = &.{},
+    wp_ple_f16_host: []f16 = &.{},
+    wp_token_ids_bind: metal.BufferBinding = undefined,
+    wp_pos3d_bind: metal.BufferBinding = undefined,
+    wp_ple_f16_base_off: u64 = 0,
+    wp_gr_arena: ?hybrid.GrStreamArena = null,
+    wp_gr_g_read_bind: metal.BufferBinding = undefined,
+    wp_gr_g_write_bind: metal.BufferBinding = undefined,
+    wp_gr_decay_bind: metal.BufferBinding = undefined,
+    wp_x_bind: metal.BufferBinding = undefined,
+    wp_x_init_bind: metal.BufferBinding = undefined,
+    wp_x_norm_bind: metal.BufferBinding = undefined,
+    wp_q_bind: metal.BufferBinding = undefined,
+    wp_k_bind: metal.BufferBinding = undefined,
+    wp_v_bind: metal.BufferBinding = undefined,
+    wp_q_conv_bind: metal.BufferBinding = undefined,
+    wp_k_conv_bind: metal.BufferBinding = undefined,
+    wp_v_conv_bind: metal.BufferBinding = undefined,
+    wp_gdn_z_bind: metal.BufferBinding = undefined,
+    wp_gdn_g_bind: metal.BufferBinding = undefined,
+    wp_gdn_beta_bind: metal.BufferBinding = undefined,
+    wp_attn_out_bind: metal.BufferBinding = undefined,
+    wp_proj_out_bind: metal.BufferBinding = undefined,
+    wp_dense_gate_bind: metal.BufferBinding = undefined,
+    wp_dense_up_bind: metal.BufferBinding = undefined,
+    wp_dense_act_bind: metal.BufferBinding = undefined,
+    wp_moe_ws: ?moe.MoeWorkspace = null,
 
     // -----------------------------------------------------------------------
     // Loading & Teardown
@@ -1685,22 +1755,140 @@ pub const GraphModel = struct {
         }
     }
 
+    pub fn encodeLinearGemmWithTile(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        lin: qwen3.LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        m: u32,
+        wide_tile: bool,
+        barrier_before: bool,
+    ) dequant.EncodeError!void {
+        if (m < 16) {
+            return self.encodeLinearBatched(frame, lin, x, y, m, barrier_before);
+        }
+        switch (lin.dtype) {
+            .q2_affine => try self.dequant_pipes.encodeGemm(frame, .q2, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+                .wide_tile = wide_tile,
+            }, barrier_before),
+            .q3_affine => try self.dequant_pipes.encodeGemm(frame, .q3, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+                .wide_tile = wide_tile,
+            }, barrier_before),
+            .q4_affine => try self.dequant_pipes.encodeGemm(frame, .q4, .{
+                .x = x,
+                .qweight = lin.weight,
+                .scale_bias = lin.scale_bias.?,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+                .wide_tile = wide_tile,
+            }, barrier_before),
+            .f16 => try self.dequant_pipes.encodeDenseGemm(frame, .f16, .{
+                .x = x,
+                .weight = lin.weight,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+                .wide_tile = wide_tile,
+            }, barrier_before),
+            .bf16 => try self.dequant_pipes.encodeDenseGemm(frame, .bf16, .{
+                .x = x,
+                .weight = lin.weight,
+                .y = y,
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+                .wide_tile = wide_tile,
+            }, barrier_before),
+        }
+    }
+
+    pub fn usesWideGpuPrefill(self: *const GraphModel) bool {
+        return self.gpu_prefill_mode == .wide and
+            self.wide_prefill_max_tokens > 0 and
+            self.supports_wide_prefill and
+            self.cold_rt == null and
+            self.adapter_rt == null and
+            !self.enable_loop_early_exit;
+    }
+
+    pub fn prefillChunkCap(self: *const GraphModel) u32 {
+        if (self.usesWideGpuPrefill()) {
+            return if (self.retired_kv_pool != null)
+                @min(self.wide_prefill_max_tokens, self.retire_chunk_tokens)
+            else
+                self.wide_prefill_max_tokens;
+        }
+        return @max(@as(u32, 1), self.max_tree_nodes);
+    }
+
     // -----------------------------------------------------------------------
     // Public Inference Entrypoints: Prefill, Decode, VerifyTree, CommitTree, DraftShallow
     // -----------------------------------------------------------------------
 
-    /// Batched prompt prefill across `tokens` starting at `start_pos` in chunks
-    /// of `<= max_tree_nodes` with full `LoopSchedule` & 4-isolation enforcement.
+    /// Batched prompt prefill across `tokens` starting at `start_pos`:
+    /// uses wide-chunk GPU prefill (`G15` + `P0-B1` tail pruning) when
+    /// `gpu_prefill_mode == .wide`, or legacy `<= max_tree_nodes` chunked
+    /// `verifyTree`-style prefill when `.tree64`.
     pub fn prefillChunk(
         self: *GraphModel,
         tokens: []const u32,
         start_pos: u32,
         compute_logits: bool,
     ) GraphStepError!u32 {
+        return self.prefillChunkWithOptions(tokens, start_pos, .{
+            .compute_logits = compute_logits,
+            .preserve_all_top_hidden = self.enable_feature_taps or self.compute_all_logits,
+        });
+    }
+
+    pub fn prefillChunkWithOptions(
+        self: *GraphModel,
+        tokens: []const u32,
+        start_pos: u32,
+        opts: qwen3.PrefillChunkOptions,
+    ) GraphStepError!u32 {
         if (tokens.len == 0) return error.InvalidBatchSize;
         if (start_pos + tokens.len > self.max_seq_len) return error.SequenceFull;
         for (tokens) |tid| {
             if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
+
+        if (self.usesWideGpuPrefill()) {
+            const cap: usize = self.prefillChunkCap();
+            var offset: usize = 0;
+            var last_argmax: u32 = 0;
+            while (offset < tokens.len) {
+                const take: usize = @min(cap, tokens.len - offset);
+                const cur_base: u32 = start_pos + @as(u32, @intCast(offset));
+                const is_last_chunk = (offset + take == tokens.len);
+                last_argmax = try self.prefillWideChunk(
+                    tokens[offset .. offset + take],
+                    cur_base,
+                    is_last_chunk,
+                    opts.compute_logits and is_last_chunk,
+                    opts.preserve_all_top_hidden,
+                );
+                offset += take;
+            }
+            return last_argmax;
         }
 
         const chunk_cap: usize = @max(@as(usize, 1), @as(usize, self.max_tree_nodes));
@@ -1728,7 +1916,7 @@ pub const GraphModel = struct {
                 mask_buf[0..take],
                 cur_base,
                 self.effective_max_loops,
-                is_last_chunk and compute_logits,
+                is_last_chunk and opts.compute_logits,
                 0,
                 null,
                 true, // commit state on final loop step
@@ -1745,12 +1933,1369 @@ pub const GraphModel = struct {
             self.seq_len = cur_base + @as(u32, @intCast(take));
             self.mrope_next_pos = self.seq_len;
             try self.retireExcessCompletedChunks();
-            if (is_last_chunk and compute_logits) {
+            if (is_last_chunk and opts.compute_logits) {
                 last_argmax = vr.argmax_tokens[take - 1];
             }
             offset += take;
         }
         return last_argmax;
+    }
+
+    fn preparePleLayerWide(
+        self: *GraphModel,
+        prt: *PleRuntime,
+        l: usize,
+        token_ids: []const u32,
+        base_pos: u32,
+        m: u32,
+        loop_step: u32,
+    ) GraphStepError!void {
+        const layer_rows = try prt.store.layerTotalRows(@intCast(l));
+        const order = self.config.ple_ngram_order;
+        const h: usize = self.config.hidden_size;
+
+        for (0..m) |node| {
+            var ngram_buf: [8]u32 = undefined;
+            var collected: usize = 0;
+            ngram_buf[0] = token_ids[node];
+            collected = 1;
+            if (order > 1) {
+                var back: usize = 1;
+                while (collected < order and back <= node) : (back += 1) {
+                    ngram_buf[collected] = token_ids[node - back];
+                    collected += 1;
+                }
+                var past_back: u32 = 1;
+                while (collected < order and base_pos >= past_back) : (past_back += 1) {
+                    ngram_buf[collected] = self.token_history[base_pos - past_back];
+                    collected += 1;
+                }
+            }
+            var chrono: [8]u32 = undefined;
+            for (0..collected) |k| {
+                chrono[k] = ngram_buf[collected - 1 - k];
+            }
+            self.ple_row_indices_host[node] = ple_mod.hashPleNgram(chrono[0..collected], order, layer_rows);
+        }
+
+        const f32_slice = prt.f32_tmp[0 .. @as(usize, m) * h];
+        @memset(f32_slice, 0.0);
+
+        const before_nvme = prt.store.stats().nvme_reads;
+        try prt.store.lookupForLoopStep(
+            @intCast(l),
+            self.ple_row_indices_host[0..m],
+            1.0,
+            loop_step,
+            &prt.scratch,
+            f32_slice,
+        );
+        const after_nvme = prt.store.stats().nvme_reads;
+        if (loop_step == 0) {
+            self.loop_stats.ple_r0_fills += 1;
+        } else {
+            self.loop_stats.ple_r_ge1_reuses += 1;
+            self.loop_stats.ple_r_ge1_nvme_reads += (after_nvme - before_nvme);
+        }
+
+        const layer_stride = @as(usize, self.wide_prefill_max_tokens) * h;
+        const dst_f16 = self.wp_ple_f16_host[l * layer_stride ..][0 .. @as(usize, m) * h];
+        for (0..@as(usize, m) * h) |i| {
+            dst_f16[i] = @floatCast(f32_slice[i]);
+        }
+    }
+
+    fn wpPleLayerBinding(self: *const GraphModel, l: usize) metal.BufferBinding {
+        const stride = @as(u64, self.wide_prefill_max_tokens) * self.config.hidden_size * 2;
+        return .{ .buffer = self.scratch_buf, .offset = self.wp_ple_f16_base_off + @as(u64, l) * stride };
+    }
+
+    fn prefillWideChunk(
+        self: *GraphModel,
+        tokens: []const u32,
+        base_pos: u32,
+        is_final_chunk: bool,
+        compute_logits: bool,
+        preserve_all_top_hidden: bool,
+    ) GraphStepError!u32 {
+        const m: u32 = @intCast(tokens.len);
+        if (m == 0 or m > self.wide_prefill_max_tokens) return error.InvalidBatchSize;
+        if (base_pos + m > self.max_seq_len) return error.SequenceFull;
+        try self.retireBeforeCommitRange(base_pos, m);
+
+        const h: u32 = self.config.hidden_size;
+        const w_stride: u32 = self.wide_prefill_max_tokens;
+        const ls = self.config.axes.loop_schedule;
+        const R: u32 = @max(@as(u32, 1), self.effective_max_loops);
+        const core_start: u32 = if (R > 1) ls.start_layer else 0;
+        const core_end: u32 = if (R > 1)
+            (if (ls.end_layer > ls.start_layer) ls.end_layer else self.config.num_hidden_layers)
+        else
+            self.config.num_hidden_layers;
+        const last_l: usize = self.config.num_hidden_layers - 1;
+        const aux_needs_last = self.enable_feature_taps and
+            (self.aux_layer_ids[0] == last_l or self.aux_layer_ids[1] == last_l or self.aux_layer_ids[2] == last_l);
+        const allow_tail_prune = self.enable_prompt_tail_pruning and !self.compute_all_logits and
+            !preserve_all_top_hidden and !aux_needs_last;
+        const prune_non_final_last = allow_tail_prune and (!is_final_chunk or !compute_logits);
+        const prune_final_last_to_m1 = allow_tail_prune and is_final_chunk and compute_logits and (m > 1);
+
+        for (0..m) |i| {
+            self.wp_token_ids_host[i] = tokens[i];
+            self.wp_pos3d_host[i] = hybrid.Pos3D.text(base_pos + @as(u32, @intCast(i)));
+        }
+        if (self.ple_rt) |prt| {
+            prt.scratch.resetStep();
+        }
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+
+        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            .weight = self.embed.weight,
+            .scale_bias = self.embed.scale_bias,
+            .tokens = .{ .token_ids = self.wp_token_ids_bind },
+            .out = self.wp_x_bind,
+            .m = m,
+            .vocab_size = self.config.vocab_size,
+            .hidden_size = h,
+        }, false);
+
+        if (self.wp_gr_arena) |*gr| {
+            try self.hybrid_pipes.encodeGrInitStream0(&frame, .{
+                .x0 = self.wp_x_bind,
+                .stream = gr.binding(self.scratch_buf),
+                .m = m,
+                .hidden_dim = h,
+                .branch_token_stride = w_stride,
+            }, true);
+        }
+
+        // Prelude layers `[0 .. core_start)`.
+        for (0..core_start) |l| {
+            try self.execLayerWide(&frame, l, tokens, base_pos, m, 0, R, true, false, false);
+        }
+
+        // Save `x_init` after Prelude when `R > 1 and ls.inject_x_init`.
+        if (R > 1 and ls.inject_x_init) {
+            if (self.wp_gr_arena) |*gr| {
+                try self.hybrid_pipes.encodeGrCollapse(&frame, .{
+                    .stream = gr.binding(self.scratch_buf),
+                    .out = self.wp_x_init_bind,
+                    .mode = .stream0,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                }, true);
+            } else {
+                try self.moe_pipes.encodeCopyStrided(&frame, .{
+                    .src = self.wp_x_bind,
+                    .dst = self.wp_x_init_bind,
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+            }
+        }
+
+        // Core recurrent block `[core_start .. core_end) x R`.
+        const has_coda = (core_end < self.config.num_hidden_layers);
+        var r: u32 = 0;
+        while (r < R) : (r += 1) {
+            self.loop_stats.total_loop_steps += 1;
+            if (r >= 1 and ls.inject_x_init) {
+                if (self.wp_gr_arena) |*gr| {
+                    try self.hybrid_pipes.encodeBlendF16(&frame, .{
+                        .dst = gr.binding(self.scratch_buf),
+                        .src = self.wp_x_init_bind,
+                        .count = m * h,
+                        .a = 0.5,
+                        .b = 0.5,
+                    }, true);
+                } else {
+                    try self.hybrid_pipes.encodeBlendF16(&frame, .{
+                        .dst = self.wp_x_bind,
+                        .src = self.wp_x_init_bind,
+                        .count = m * h,
+                        .a = 0.5,
+                        .b = 0.5,
+                    }, true);
+                }
+            }
+            const is_final_pass = (r == R - 1);
+            for (core_start..core_end) |l| {
+                const is_terminal_exec = (!has_coda) and is_final_pass and (l == last_l);
+                try self.execLayerWide(
+                    &frame,
+                    l,
+                    tokens,
+                    base_pos,
+                    m,
+                    r,
+                    R,
+                    is_final_pass,
+                    is_terminal_exec and prune_non_final_last,
+                    is_terminal_exec and prune_final_last_to_m1,
+                );
+            }
+        }
+
+        // Coda layers `[core_end .. num_hidden_layers)`.
+        for (core_end..self.config.num_hidden_layers) |l| {
+            const is_terminal_exec = (l == last_l);
+            try self.execLayerWide(
+                &frame,
+                l,
+                tokens,
+                base_pos,
+                m,
+                0,
+                1,
+                true,
+                is_terminal_exec and prune_non_final_last,
+                is_terminal_exec and prune_final_last_to_m1,
+            );
+        }
+
+        if (!prune_non_final_last) {
+            if (self.wp_gr_arena) |*gr| {
+                if (prune_final_last_to_m1) {
+                    const stream_last: metal.BufferBinding = .{
+                        .buffer = self.scratch_buf,
+                        .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16),
+                    };
+                    const last_x_bind: metal.BufferBinding = .{
+                        .buffer = self.scratch_buf,
+                        .offset = self.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+                    };
+                    try self.hybrid_pipes.encodeGrCollapse(&frame, .{
+                        .stream = stream_last,
+                        .out = last_x_bind,
+                        .mode = .mean,
+                        .m = 1,
+                        .hidden_dim = h,
+                        .branch_token_stride = w_stride,
+                    }, true);
+                } else {
+                    try self.hybrid_pipes.encodeGrCollapse(&frame, .{
+                        .stream = gr.binding(self.scratch_buf),
+                        .out = self.wp_x_bind,
+                        .mode = .mean,
+                        .m = m,
+                        .hidden_dim = h,
+                        .branch_token_stride = w_stride,
+                    }, true);
+                }
+            }
+            if (self.enable_feature_taps and preserve_all_top_hidden) {
+                try self.moe_pipes.encodeCopyStrided(&frame, .{
+                    .src = self.wp_x_bind,
+                    .dst = self.accepted_top_bind,
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+            }
+        }
+
+        var logits_rows_computed: u32 = 0;
+        if (compute_logits and (is_final_chunk or self.compute_all_logits)) {
+            if (self.compute_all_logits) {
+                try self.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = self.wp_x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.wp_x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, true);
+                try self.encodeLinearGemmWithTile(&frame, self.lm_head, self.wp_x_norm_bind, self.logits_bind, m, true, true);
+                try self.moe_pipes.encodeArgmaxRows(&frame, .{
+                    .logits = self.logits_bind,
+                    .out_token_ids = self.out_token_id_bind,
+                    .num_rows = m,
+                    .vocab_size = self.config.vocab_size,
+                    .logits_dtype = .f16,
+                }, true);
+                logits_rows_computed = m;
+            } else {
+                const last_x_bind: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+                };
+                try self.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = last_x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.wp_x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, true);
+                try self.encodeLinearGemv(&frame, self.lm_head, self.wp_x_norm_bind, self.logits_bind, true);
+                try self.moe_pipes.encodeArgmaxRows(&frame, .{
+                    .logits = self.logits_bind,
+                    .out_token_ids = self.out_token_id_bind,
+                    .num_rows = 1,
+                    .vocab_size = self.config.vocab_size,
+                    .logits_dtype = .f16,
+                }, true);
+                logits_rows_computed = 1;
+            }
+        }
+
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+
+        for (0..m) |i| {
+            self.token_history[base_pos + @as(u32, @intCast(i))] = tokens[i];
+        }
+        self.seq_len = base_pos + m;
+        self.mrope_next_pos = self.seq_len;
+        try self.retireExcessCompletedChunks();
+
+        if (logits_rows_computed > 0) {
+            self.last_logits_row = @as(usize, logits_rows_computed) - 1;
+            return self.out_token_ids_host[self.last_logits_row];
+        }
+        return 0;
+    }
+
+    fn execLayerWide(
+        self: *GraphModel,
+        frame: *metal.Compute.Frame,
+        l: usize,
+        tokens: []const u32,
+        base_pos: u32,
+        m: u32,
+        loop_step: u32,
+        total_loops: u32,
+        is_final_pass: bool,
+        skip_last_rest: bool,
+        tail_m1_last: bool,
+    ) GraphStepError!void {
+        const layer = &self.layers[l];
+        const h: u32 = self.config.hidden_size;
+        const w_stride: u32 = self.wide_prefill_max_tokens;
+        const multi_loop = (total_loops > 1);
+        const kv_len_after: u32 = base_pos + m;
+
+        if (self.ple_rt) |prt| {
+            try self.preparePleLayerWide(prt, l, tokens, base_pos, m, loop_step);
+        }
+
+        // Pre-attention 4-branch GR read gate.
+        if (self.wp_gr_arena) |*gr| {
+            const gr_w = layer.gr.?;
+            try self.hybrid_pipes.encodeGrComputeGates(frame, .{
+                .stream = gr.binding(self.scratch_buf),
+                .w_read = gr_w.read_gate,
+                .w_write = gr_w.write_gate,
+                .w_decay = gr_w.decay_gate,
+                .g_read_out = self.wp_gr_g_read_bind,
+                .g_write_out = self.wp_gr_g_write_bind,
+                .decay_out = self.wp_gr_decay_bind,
+                .m = m,
+                .hidden_dim = h,
+                .branch_token_stride = w_stride,
+                .weight_dtype = gr_w.dtype,
+            }, true);
+            try self.hybrid_pipes.encodeGrReadGate(frame, .{
+                .stream = gr.binding(self.scratch_buf),
+                .g_read = self.wp_gr_g_read_bind,
+                .x_in = self.wp_x_bind,
+                .m = m,
+                .hidden_dim = h,
+                .branch_token_stride = w_stride,
+            }, true);
+        }
+
+        if (self.ple_rt != null) {
+            try self.moe_pipes.encodeResidualAdd(frame, .{
+                .x = self.wp_x_bind,
+                .delta = self.wpPleLayerBinding(l),
+                .count = m * h,
+            }, true);
+        }
+
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = self.wp_x_bind,
+            .w = layer.input_layernorm.binding,
+            .y = self.wp_x_norm_bind,
+            .num_rows = m,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = layer.input_layernorm.dtype,
+        }, true);
+
+        const last_x_bind: metal.BufferBinding = .{
+            .buffer = self.scratch_buf,
+            .offset = self.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+        };
+        const last_x_norm_bind: metal.BufferBinding = .{
+            .buffer = self.scratch_buf,
+            .offset = self.wp_x_norm_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+        };
+        const eff_m: u32 = if (tail_m1_last) 1 else m;
+        const eff_x_bind: metal.BufferBinding = if (tail_m1_last) last_x_bind else self.wp_x_bind;
+
+        switch (layer.attn) {
+            .gdn => |g| {
+                const ga = &(self.gdn_arena.?);
+                const qk_dim = self.config.gdnQkDim();
+                const v_dim = self.config.gdnVDim();
+                const k_eff_bind: metal.BufferBinding = if (multi_loop)
+                    .{ .buffer = self.scratch_buf, .offset = g.wp_k_off }
+                else
+                    self.wp_k_conv_bind;
+                const v_eff_bind: metal.BufferBinding = if (multi_loop)
+                    .{ .buffer = self.scratch_buf, .offset = g.wp_v_off }
+                else
+                    self.wp_v_conv_bind;
+                const g_bind: metal.BufferBinding = if (multi_loop)
+                    .{ .buffer = self.scratch_buf, .offset = g.wp_g_off }
+                else
+                    self.wp_gdn_g_bind;
+                const beta_bind: metal.BufferBinding = if (multi_loop)
+                    .{ .buffer = self.scratch_buf, .offset = g.wp_beta_off }
+                else
+                    self.wp_gdn_beta_bind;
+                const q_raw_r0_bind: metal.BufferBinding = if (multi_loop and g.conv1d_w != null)
+                    .{ .buffer = self.scratch_buf, .offset = g.wp_q_raw_off }
+                else
+                    self.wp_q_bind;
+                const k_raw_r0_bind: metal.BufferBinding = if (g.conv1d_w != null) self.wp_k_bind else k_eff_bind;
+                const v_raw_r0_bind: metal.BufferBinding = if (g.conv1d_w != null) self.wp_v_bind else v_eff_bind;
+                const q_eff_bind: metal.BufferBinding = if (g.conv1d_w != null) self.wp_q_conv_bind else (if (loop_step == 0) q_raw_r0_bind else self.wp_q_bind);
+
+                if (loop_step == 0) {
+                    const need_q_r0 = (!skip_last_rest) or (g.conv1d_w != null);
+                    if (need_q_r0) {
+                        try self.encodeLinearGemmWithTile(frame, g.q_proj, self.wp_x_norm_bind, q_raw_r0_bind, m, true, true);
+                        try self.encodeLinearGemmWithTile(frame, g.k_proj, self.wp_x_norm_bind, k_raw_r0_bind, m, true, false);
+                    } else {
+                        try self.encodeLinearGemmWithTile(frame, g.k_proj, self.wp_x_norm_bind, k_raw_r0_bind, m, true, true);
+                    }
+                    try self.encodeLinearGemmWithTile(frame, g.v_proj, self.wp_x_norm_bind, v_raw_r0_bind, m, true, false);
+                    try self.hybrid_pipes.encodeGdnComputeGates(frame, .{
+                        .x = self.wp_x_norm_bind,
+                        .w_a = g.a_proj,
+                        .w_b = g.b_proj,
+                        .a_log = g.a_log,
+                        .dt_bias = g.dt_bias,
+                        .g_out = g_bind,
+                        .beta_out = beta_bind,
+                        .m = m,
+                        .hidden_dim = h,
+                        .num_v_heads = self.config.linear_num_value_heads,
+                        .weight_dtype = g.ab_dtype,
+                    }, false);
+                    if (!skip_last_rest) {
+                        if (tail_m1_last) {
+                            const last_z_bind: metal.BufferBinding = .{
+                                .buffer = self.scratch_buf,
+                                .offset = self.wp_gdn_z_bind.offset + @as(u64, m - 1) * v_dim * @sizeOf(f16),
+                            };
+                            try self.encodeLinearGemv(frame, g.g_proj, last_x_norm_bind, last_z_bind, false);
+                        } else {
+                            try self.encodeLinearGemmWithTile(frame, g.g_proj, self.wp_x_norm_bind, self.wp_gdn_z_bind, m, true, false);
+                        }
+                    }
+                    if (g.conv1d_w) |cw| {
+                        try self.hybrid_pipes.encodeGdnConv1dSilu(frame, .{
+                            .q_in = q_raw_r0_bind,
+                            .k_in = k_raw_r0_bind,
+                            .v_in = v_raw_r0_bind,
+                            .conv_w = cw,
+                            .conv_state_in = .{ .buffer = self.scratch_buf, .offset = g.conv_state_off },
+                            .conv_state_out = .{ .buffer = self.scratch_buf, .offset = g.conv_state_tmp_off },
+                            .q_out = q_eff_bind,
+                            .k_out = k_eff_bind,
+                            .v_out = v_eff_bind,
+                            .m = m,
+                            .gdn_qk = qk_dim,
+                            .gdn_v = v_dim,
+                            .conv_k = g.conv_k,
+                            .is_tree = false,
+                            .write_state = true,
+                        }, true);
+                    }
+                } else {
+                    if (!skip_last_rest) {
+                        try self.encodeLinearGemmWithTile(frame, g.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
+                        if (tail_m1_last) {
+                            const last_z_bind: metal.BufferBinding = .{
+                                .buffer = self.scratch_buf,
+                                .offset = self.wp_gdn_z_bind.offset + @as(u64, m - 1) * v_dim * @sizeOf(f16),
+                            };
+                            try self.encodeLinearGemv(frame, g.g_proj, last_x_norm_bind, last_z_bind, false);
+                        } else {
+                            try self.encodeLinearGemmWithTile(frame, g.g_proj, self.wp_x_norm_bind, self.wp_gdn_z_bind, m, true, false);
+                        }
+                        if (g.conv1d_w) |cw| {
+                            try self.hybrid_pipes.encodeGdnConv1dQSilu(frame, .{
+                                .q_cur = self.wp_q_bind,
+                                .q_hist_r0 = q_raw_r0_bind,
+                                .conv_w = cw,
+                                .conv_state_in = .{ .buffer = self.scratch_buf, .offset = g.conv_state_off },
+                                .q_out = q_eff_bind,
+                                .m = m,
+                                .gdn_qk = qk_dim,
+                                .gdn_v = v_dim,
+                                .conv_k = g.conv_k,
+                                .is_tree = false,
+                            }, true);
+                        }
+                    }
+                }
+                if (is_final_pass and g.conv1d_w != null and g.conv_k > 1) {
+                    const conv_hist = g.conv_k - 1;
+                    const conv_d = 2 * qk_dim + v_dim;
+                    try self.moe_pipes.encodeCopyStrided(frame, .{
+                        .src = .{ .buffer = self.scratch_buf, .offset = g.conv_state_tmp_off },
+                        .dst = .{ .buffer = self.scratch_buf, .offset = g.conv_state_off },
+                        .num_rows = conv_hist,
+                        .copy_cols = conv_d,
+                        .src_stride = conv_d,
+                        .dst_stride = conv_d,
+                    }, true);
+                }
+
+                const committed_s = try ga.committedBinding(self.scratch_buf, g.gdn_idx);
+                const scratch_s = try ga.scratchBinding(self.scratch_buf, g.gdn_idx);
+                try self.hybrid_pipes.encodeGdnPrefill(frame, .{
+                    .q = q_eff_bind,
+                    .k = k_eff_bind,
+                    .v = v_eff_bind,
+                    .g = g_bind,
+                    .beta = beta_bind,
+                    .z = self.wp_gdn_z_bind,
+                    .norm_w = if (g.out_norm) |n| n.binding else null,
+                    .norm_dtype = if (g.out_norm) |n| n.dtype else .f16,
+                    .state_in = committed_s,
+                    .state_out = scratch_s,
+                    .out = self.wp_attn_out_bind,
+                    .seq_len = m,
+                    .num_k_heads = self.config.linear_num_key_heads,
+                    .num_v_heads = self.config.linear_num_value_heads,
+                    .head_k_dim = self.config.linear_key_head_dim,
+                    .head_v_dim = self.config.linear_value_head_dim,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .write_state_only = skip_last_rest,
+                    .out_start_token = if (tail_m1_last) m - 1 else 0,
+                }, true);
+                if (is_final_pass) {
+                    try self.hybrid_pipes.encodeCommitScratchState(frame, ga, self.scratch_buf, g.gdn_idx, true);
+                    self.loop_stats.gdn_final_commits += 1;
+                } else {
+                    self.loop_stats.gdn_scratch_evals += 1;
+                }
+
+                if (skip_last_rest) return;
+                try self.encodeLinearGemmWithTile(frame, g.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+            },
+            .qsa => |*qsa| {
+                const mrope_rot: u32 = (self.config.mrope_section.section[0] + self.config.mrope_section.section[1] + self.config.mrope_section.section[2]) * 2;
+                const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= self.config.head_dim) mrope_rot else self.config.head_dim;
+                const is_circular_swa = (qsa.kv_ring.ring_capacity > 0);
+                const use_qsa_tiered = (qsa.supports_retire_q8 and self.retired_kv_pool != null);
+                const write_kv_tiles: metal.BufferBinding = if (use_qsa_tiered)
+                    .{ .buffer = self.scratch_buf, .offset = qsa.full_tile_table_off }
+                else
+                    qsa.kv_ring.tileTableBinding(self.scratch_buf);
+                const blk_tok = self.config.qsa_block_size;
+
+                if (is_circular_swa) {
+                    const k_chunk_bind: metal.BufferBinding = if (multi_loop)
+                        .{ .buffer = self.scratch_buf, .offset = qsa.wp_k_off }
+                    else
+                        self.wp_k_bind;
+                    const v_chunk_bind: metal.BufferBinding = if (multi_loop)
+                        .{ .buffer = self.scratch_buf, .offset = qsa.wp_v_off }
+                    else
+                        self.wp_v_bind;
+
+                    if (loop_step == 0) {
+                        if (skip_last_rest) {
+                            try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, k_chunk_bind, m, true, true);
+                            try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, v_chunk_bind, m, true, false);
+                            try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = k_chunk_bind,
+                                .v = v_chunk_bind,
+                                .q_norm = qsa.q_norm,
+                                .k_norm = qsa.k_norm,
+                                .norm_dtype = qsa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .num_tokens = m,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .rotary_dim = eff_rot_dim,
+                                .start_pos = base_pos,
+                                .mrope = self.config.mrope_section,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                                .ring_capacity = qsa.kv_ring.ring_capacity,
+                                .kv_only = true,
+                                .write_to_tiles = false,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                            }, true);
+                        } else if (tail_m1_last) {
+                            try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, k_chunk_bind, m, true, true);
+                            try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, v_chunk_bind, m, true, false);
+                            try self.encodeLinearGemv(frame, qsa.q_proj, last_x_norm_bind, self.wp_q_bind, false);
+                            try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = k_chunk_bind,
+                                .v = v_chunk_bind,
+                                .q_norm = qsa.q_norm,
+                                .k_norm = qsa.k_norm,
+                                .norm_dtype = qsa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .num_tokens = m - 1,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .rotary_dim = eff_rot_dim,
+                                .start_pos = base_pos,
+                                .mrope = self.config.mrope_section,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                                .ring_capacity = qsa.kv_ring.ring_capacity,
+                                .kv_only = true,
+                                .write_to_tiles = false,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                            }, true);
+                            const kv_d = self.config.kvDim();
+                            const last_k_bind: metal.BufferBinding = .{
+                                .buffer = self.scratch_buf,
+                                .offset = k_chunk_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16),
+                            };
+                            const last_v_bind: metal.BufferBinding = .{
+                                .buffer = self.scratch_buf,
+                                .offset = v_chunk_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16),
+                            };
+                            const last_p3d_bind: metal.BufferBinding = .{
+                                .buffer = self.scratch_buf,
+                                .offset = self.wp_pos3d_bind.offset + @as(u64, m - 1) * @sizeOf(hybrid.Pos3D),
+                            };
+                            try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = last_k_bind,
+                                .v = last_v_bind,
+                                .q_norm = qsa.q_norm,
+                                .k_norm = qsa.k_norm,
+                                .norm_dtype = qsa.qk_norm_dtype,
+                                .positions_3d = last_p3d_bind,
+                                .num_tokens = 1,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .rotary_dim = eff_rot_dim,
+                                .start_pos = base_pos + m - 1,
+                                .mrope = self.config.mrope_section,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                                .ring_capacity = qsa.kv_ring.ring_capacity,
+                                .kv_only = false,
+                                .write_to_tiles = false,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                            }, false);
+                        } else {
+                            try self.encodeLinearGemmWithTile(frame, qsa.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
+                            try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, k_chunk_bind, m, true, false);
+                            try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, v_chunk_bind, m, true, false);
+                            try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = k_chunk_bind,
+                                .v = v_chunk_bind,
+                                .q_norm = qsa.q_norm,
+                                .k_norm = qsa.k_norm,
+                                .norm_dtype = qsa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .num_tokens = m,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .rotary_dim = eff_rot_dim,
+                                .start_pos = base_pos,
+                                .mrope = self.config.mrope_section,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                                .ring_capacity = qsa.kv_ring.ring_capacity,
+                                .kv_only = false,
+                                .write_to_tiles = false,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                            }, true);
+                        }
+                    } else if (!skip_last_rest) {
+                        const q_src = if (tail_m1_last) last_x_norm_bind else self.wp_x_norm_bind;
+                        const p3d_src: metal.BufferBinding = if (tail_m1_last)
+                            .{ .buffer = self.scratch_buf, .offset = self.wp_pos3d_bind.offset + @as(u64, m - 1) * @sizeOf(hybrid.Pos3D) }
+                        else
+                            self.wp_pos3d_bind;
+                        try self.encodeLinearGemmWithTile(frame, qsa.q_proj, q_src, self.wp_q_bind, eff_m, true, true);
+                        try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = qsa.q_norm,
+                            .k_norm = qsa.k_norm,
+                            .norm_dtype = qsa.qk_norm_dtype,
+                            .positions_3d = p3d_src,
+                            .num_tokens = eff_m,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .rotary_dim = eff_rot_dim,
+                            .start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                            .mrope = self.config.mrope_section,
+                            .yarn = self.config.yarn,
+                            .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                            .ring_capacity = qsa.kv_ring.ring_capacity,
+                            .kv_only = false,
+                            .write_to_tiles = false,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = self.config.rope_theta,
+                        }, true);
+                    }
+
+                    if (!skip_last_rest) {
+                        try self.hybrid_pipes.encodeQsaSwaPrefillAttn(frame, .{
+                            .q = self.wp_q_bind,
+                            .kv_tiles = if (base_pos > 0) write_kv_tiles else null,
+                            .k_chunk = k_chunk_bind,
+                            .v_chunk = v_chunk_bind,
+                            .out = self.wp_attn_out_bind,
+                            .num_q = eff_m,
+                            .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                            .chunk_start_pos = base_pos,
+                            .kv_len = kv_len_after,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .window_size = qsa.kv_ring.window_size,
+                            .ring_capacity = qsa.kv_ring.ring_capacity,
+                            .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                        }, true);
+                    }
+
+                    if (is_final_pass) {
+                        try self.hybrid_pipes.encodeQsaPrefillKvRingCommit(frame, .{
+                            .k = k_chunk_bind,
+                            .v = v_chunk_bind,
+                            .kv_tiles = write_kv_tiles,
+                            .num_tokens = m,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .start_pos = base_pos,
+                            .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                            .ring_capacity = qsa.kv_ring.ring_capacity,
+                        }, true);
+                        const tot_blocks: u32 = (@min(kv_len_after, qsa.kv_ring.window_size) + blk_tok - 1) / blk_tok;
+                        try self.hybrid_pipes.encodeQsaUpdateBlockSummary(frame, .{
+                            .kv_tiles = write_kv_tiles,
+                            .block_keys = .{ .buffer = self.scratch_buf, .offset = qsa.block_keys_off },
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .kv_len = kv_len_after,
+                            .window_size = qsa.kv_ring.window_size,
+                            .ring_capacity = qsa.kv_ring.ring_capacity,
+                            .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                            .block_tokens = blk_tok,
+                            .start_block = 0,
+                            .num_blocks = @max(tot_blocks, 1),
+                        }, true);
+                    }
+                    if (skip_last_rest) return;
+                    try self.encodeLinearGemmWithTile(frame, qsa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+                } else {
+                    // Full-context QSA (`ring_capacity == 0`): write K/V directly to KvTiles at r == 0.
+                    if (loop_step == 0) {
+                        if (skip_last_rest) {
+                            try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
+                            try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                            try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = qsa.q_norm,
+                                .k_norm = qsa.k_norm,
+                                .norm_dtype = qsa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .kv_tiles = write_kv_tiles,
+                                .num_tokens = m,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .rotary_dim = eff_rot_dim,
+                                .start_pos = base_pos,
+                                .mrope = self.config.mrope_section,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                                .num_retired_chunks = 0,
+                                .ring_capacity = 0,
+                                .kv_only = true,
+                                .write_to_tiles = true,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                            }, true);
+                        } else if (tail_m1_last) {
+                            try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
+                            try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                            try self.encodeLinearGemv(frame, qsa.q_proj, last_x_norm_bind, self.wp_q_bind, false);
+                            try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = qsa.q_norm,
+                                .k_norm = qsa.k_norm,
+                                .norm_dtype = qsa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .kv_tiles = write_kv_tiles,
+                                .num_tokens = m - 1,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .rotary_dim = eff_rot_dim,
+                                .start_pos = base_pos,
+                                .mrope = self.config.mrope_section,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                                .num_retired_chunks = 0,
+                                .ring_capacity = 0,
+                                .kv_only = true,
+                                .write_to_tiles = true,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                            }, true);
+                            const kv_d = self.config.kvDim();
+                            const last_k_bind: metal.BufferBinding = .{
+                                .buffer = self.scratch_buf,
+                                .offset = self.wp_k_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16),
+                            };
+                            const last_v_bind: metal.BufferBinding = .{
+                                .buffer = self.scratch_buf,
+                                .offset = self.wp_v_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16),
+                            };
+                            const last_p3d_bind: metal.BufferBinding = .{
+                                .buffer = self.scratch_buf,
+                                .offset = self.wp_pos3d_bind.offset + @as(u64, m - 1) * @sizeOf(hybrid.Pos3D),
+                            };
+                            try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = last_k_bind,
+                                .v = last_v_bind,
+                                .q_norm = qsa.q_norm,
+                                .k_norm = qsa.k_norm,
+                                .norm_dtype = qsa.qk_norm_dtype,
+                                .positions_3d = last_p3d_bind,
+                                .kv_tiles = write_kv_tiles,
+                                .num_tokens = 1,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .rotary_dim = eff_rot_dim,
+                                .start_pos = base_pos + m - 1,
+                                .mrope = self.config.mrope_section,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                                .num_retired_chunks = 0,
+                                .ring_capacity = 0,
+                                .kv_only = false,
+                                .write_to_tiles = true,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                            }, false);
+                        } else {
+                            try self.encodeLinearGemmWithTile(frame, qsa.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
+                            try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
+                            try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                            try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                                .q = self.wp_q_bind,
+                                .k = self.wp_k_bind,
+                                .v = self.wp_v_bind,
+                                .q_norm = qsa.q_norm,
+                                .k_norm = qsa.k_norm,
+                                .norm_dtype = qsa.qk_norm_dtype,
+                                .positions_3d = self.wp_pos3d_bind,
+                                .kv_tiles = write_kv_tiles,
+                                .num_tokens = m,
+                                .num_q_heads = self.config.num_attention_heads,
+                                .num_kv_heads = self.config.num_key_value_heads,
+                                .head_dim = self.config.head_dim,
+                                .rotary_dim = eff_rot_dim,
+                                .start_pos = base_pos,
+                                .mrope = self.config.mrope_section,
+                                .yarn = self.config.yarn,
+                                .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                                .num_retired_chunks = 0,
+                                .ring_capacity = 0,
+                                .kv_only = false,
+                                .write_to_tiles = true,
+                                .rms_eps = self.config.rms_norm_eps,
+                                .rope_theta = self.config.rope_theta,
+                            }, true);
+                        }
+
+                        const start_block: u32 = base_pos / blk_tok;
+                        const total_blocks: u32 = (kv_len_after + blk_tok - 1) / blk_tok;
+                        try self.hybrid_pipes.encodeQsaUpdateBlockSummary(frame, .{
+                            .kv_tiles = write_kv_tiles,
+                            .block_keys = .{ .buffer = self.scratch_buf, .offset = qsa.block_keys_off },
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .kv_len = kv_len_after,
+                            .window_size = 0,
+                            .ring_capacity = 0,
+                            .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                            .block_tokens = blk_tok,
+                            .start_block = start_block,
+                            .num_blocks = if (total_blocks > start_block) (total_blocks - start_block) else 1,
+                        }, true);
+                    } else if (!skip_last_rest) {
+                        const q_src = if (tail_m1_last) last_x_norm_bind else self.wp_x_norm_bind;
+                        const p3d_src: metal.BufferBinding = if (tail_m1_last)
+                            .{ .buffer = self.scratch_buf, .offset = self.wp_pos3d_bind.offset + @as(u64, m - 1) * @sizeOf(hybrid.Pos3D) }
+                        else
+                            self.wp_pos3d_bind;
+                        try self.encodeLinearGemmWithTile(frame, qsa.q_proj, q_src, self.wp_q_bind, eff_m, true, true);
+                        try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = qsa.q_norm,
+                            .k_norm = qsa.k_norm,
+                            .norm_dtype = qsa.qk_norm_dtype,
+                            .positions_3d = p3d_src,
+                            .num_tokens = eff_m,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .rotary_dim = eff_rot_dim,
+                            .start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                            .mrope = self.config.mrope_section,
+                            .yarn = self.config.yarn,
+                            .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                            .ring_capacity = 0,
+                            .kv_only = false,
+                            .write_to_tiles = false,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = self.config.rope_theta,
+                        }, true);
+                    }
+
+                    if (skip_last_rest) return;
+
+                    const reuse_idx = (loop_step >= 1) and !tail_m1_last;
+                    if (reuse_idx) {
+                        self.loop_stats.qsa_index_reuses += 1;
+                    } else {
+                        self.loop_stats.qsa_index_computes += 1;
+                    }
+                    const qsa_kv_tiles_bind: metal.BufferBinding = if (use_qsa_tiered)
+                        .{
+                            .buffer = self.scratch_buf,
+                            .offset = qsa.full_tile_table_off + @as(u64, self.num_retired_chunks) * @sizeOf(attention.KvTilePair),
+                        }
+                    else
+                        qsa.kv_ring.tileTableBinding(self.scratch_buf);
+                    const qsa_ret_pool_bind: ?metal.BufferBinding = if (use_qsa_tiered and self.num_retired_chunks > 0)
+                        self.retired_kv_pool.?.binding(self.scratch_buf)
+                    else
+                        null;
+                    try self.hybrid_pipes.encodeQsaAttention(frame, .{
+                        .q = self.wp_q_bind,
+                        .kv_tiles = qsa_kv_tiles_bind,
+                        .block_keys = .{ .buffer = self.scratch_buf, .offset = qsa.block_keys_off },
+                        .index_buf = &(qsa.wp_index_buf.?),
+                        .index_metal_buf = self.scratch_buf,
+                        .out = self.wp_attn_out_bind,
+                        .retired_pool = qsa_ret_pool_bind,
+                        .retired_chunk_ids = if (qsa_ret_pool_bind != null) qsa.retired_ids_binding else null,
+                        .num_nodes = eff_m,
+                        .num_q_heads = self.config.num_attention_heads,
+                        .num_kv_heads = self.config.num_key_value_heads,
+                        .head_dim = self.config.head_dim,
+                        .kv_len = kv_len_after,
+                        .window_size = 0,
+                        .ring_capacity = 0,
+                        .chunk_tokens = qsa.kv_ring.chunk_tokens,
+                        .block_tokens = blk_tok,
+                        .top_k_blocks = self.config.qsa_top_k_blocks,
+                        .num_retired_chunks = if (qsa_ret_pool_bind != null) self.num_retired_chunks else 0,
+                        .retired_plane_stride_bytes = if (qsa_ret_pool_bind != null) self.retired_kv_pool.?.plane_stride_bytes else 0,
+                        .retired_chunk_stride_bytes = if (qsa_ret_pool_bind != null) self.retired_kv_pool.?.chunk_stride_bytes else 0,
+                        .reuse_block_indices = reuse_idx,
+                        .causal_q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                    }, true);
+                    try self.encodeLinearGemmWithTile(frame, qsa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+                }
+            },
+            .gqa => |gqa| {
+                const kv_d = self.config.kvDim();
+                const has_retired = (self.retired_kv_pool != null and self.num_retired_chunks > 0);
+                const rpool_bind: ?metal.BufferBinding = if (has_retired) self.retired_kv_pool.?.binding(self.scratch_buf) else null;
+                const ret_plane_stride: u32 = if (has_retired) self.retired_kv_pool.?.plane_stride_bytes else 0;
+                const ret_chunk_stride: u32 = if (has_retired) self.retired_kv_pool.?.chunk_stride_bytes else 0;
+
+                if (loop_step == 0) {
+                    if (skip_last_rest) {
+                        try self.encodeLinearGemmWithTile(frame, gqa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
+                        try self.encodeLinearGemmWithTile(frame, gqa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                        try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .kv_tiles = gqa.kv_tiles_binding,
+                            .num_tokens = m,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .start_pos = base_pos,
+                            .chunk_tokens = self.chunk_tokens,
+                            .num_retired_chunks = self.num_retired_chunks,
+                            .kv_only = true,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = self.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, true);
+                        return;
+                    } else if (tail_m1_last) {
+                        try self.encodeLinearGemmWithTile(frame, gqa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
+                        try self.encodeLinearGemmWithTile(frame, gqa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                        try self.encodeLinearGemv(frame, gqa.q_proj, last_x_norm_bind, self.wp_q_bind, false);
+                        try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .kv_tiles = gqa.kv_tiles_binding,
+                            .num_tokens = m - 1,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .start_pos = base_pos,
+                            .chunk_tokens = self.chunk_tokens,
+                            .num_retired_chunks = self.num_retired_chunks,
+                            .kv_only = true,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = self.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, true);
+                        const last_k_bind: metal.BufferBinding = .{
+                            .buffer = self.scratch_buf,
+                            .offset = self.wp_k_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16),
+                        };
+                        const last_v_bind: metal.BufferBinding = .{
+                            .buffer = self.scratch_buf,
+                            .offset = self.wp_v_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16),
+                        };
+                        try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = last_k_bind,
+                            .v = last_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .kv_tiles = gqa.kv_tiles_binding,
+                            .num_tokens = 1,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .start_pos = base_pos + m - 1,
+                            .chunk_tokens = self.chunk_tokens,
+                            .num_retired_chunks = self.num_retired_chunks,
+                            .kv_only = false,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = self.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, false);
+                    } else {
+                        try self.encodeLinearGemmWithTile(frame, gqa.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
+                        try self.encodeLinearGemmWithTile(frame, gqa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
+                        try self.encodeLinearGemmWithTile(frame, gqa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                        try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
+                            .q = self.wp_q_bind,
+                            .k = self.wp_k_bind,
+                            .v = self.wp_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .kv_tiles = gqa.kv_tiles_binding,
+                            .num_tokens = m,
+                            .num_q_heads = self.config.num_attention_heads,
+                            .num_kv_heads = self.config.num_key_value_heads,
+                            .head_dim = self.config.head_dim,
+                            .start_pos = base_pos,
+                            .chunk_tokens = self.chunk_tokens,
+                            .num_retired_chunks = self.num_retired_chunks,
+                            .kv_only = false,
+                            .rms_eps = self.config.rms_norm_eps,
+                            .rope_theta = self.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, true);
+                    }
+                } else {
+                    if (skip_last_rest) return;
+                    const q_src = if (tail_m1_last) last_x_norm_bind else self.wp_x_norm_bind;
+                    try self.encodeLinearGemmWithTile(frame, gqa.q_proj, q_src, self.wp_q_bind, eff_m, true, true);
+                    // Rotate Q in-place without overwriting committed r = 0 KvTiles using QsaPrefillRope (write_to_tiles = false, 1D RoPE).
+                    try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
+                        .q = self.wp_q_bind,
+                        .k = self.wp_k_bind,
+                        .v = self.wp_v_bind,
+                        .q_norm = gqa.q_norm,
+                        .k_norm = gqa.k_norm,
+                        .norm_dtype = gqa.qk_norm_dtype,
+                        .num_tokens = eff_m,
+                        .num_q_heads = self.config.num_attention_heads,
+                        .num_kv_heads = self.config.num_key_value_heads,
+                        .head_dim = self.config.head_dim,
+                        .start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                        .mrope = .{ .section = .{ self.config.head_dim / 2, 0, 0 } },
+                        .chunk_tokens = self.chunk_tokens,
+                        .kv_only = false,
+                        .write_to_tiles = false,
+                        .rms_eps = self.config.rms_norm_eps,
+                        .rope_theta = self.config.rope_theta,
+                    }, true);
+                }
+
+                try self.attn_pipes.encodeGqaCausalPrefillFlashAttn(frame, .{
+                    .q = self.wp_q_bind,
+                    .kv_tiles = gqa.kv_tiles_binding,
+                    .retired_pool = rpool_bind,
+                    .retired_chunk_ids = if (has_retired) gqa.retired_ids_binding else null,
+                    .out = self.wp_attn_out_bind,
+                    .num_q = eff_m,
+                    .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                    .kv_len = kv_len_after,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = if (has_retired) self.num_retired_chunks else 0,
+                    .retired_plane_stride_bytes = ret_plane_stride,
+                    .retired_chunk_stride_bytes = ret_chunk_stride,
+                }, true);
+                try self.encodeLinearGemmWithTile(frame, gqa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+            },
+        }
+
+        // Post-attention residual update (4-branch GR or standard residual add).
+        if (self.wp_gr_arena) |*gr| {
+            const stream_eff: metal.BufferBinding = if (tail_m1_last)
+                .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
+            else
+                gr.binding(self.scratch_buf);
+            const decay_eff: metal.BufferBinding = if (tail_m1_last)
+                .{ .buffer = self.scratch_buf, .offset = self.wp_gr_decay_bind.offset + @as(u64, m - 1) * 4 * 4 }
+            else
+                self.wp_gr_decay_bind;
+            const gwrite_eff: metal.BufferBinding = if (tail_m1_last)
+                .{ .buffer = self.scratch_buf, .offset = self.wp_gr_g_write_bind.offset + @as(u64, m - 1) * 4 * 4 }
+            else
+                self.wp_gr_g_write_bind;
+            const gread_eff: metal.BufferBinding = if (tail_m1_last)
+                .{ .buffer = self.scratch_buf, .offset = self.wp_gr_g_read_bind.offset + @as(u64, m - 1) * 4 * 4 }
+            else
+                self.wp_gr_g_read_bind;
+            try self.hybrid_pipes.encodeGrWriteGate(frame, .{
+                .stream = stream_eff,
+                .y_delta = self.wp_proj_out_bind,
+                .decay = decay_eff,
+                .g_write = gwrite_eff,
+                .m = eff_m,
+                .hidden_dim = h,
+                .branch_token_stride = w_stride,
+            }, true);
+            try self.hybrid_pipes.encodeGrReadGate(frame, .{
+                .stream = stream_eff,
+                .g_read = gread_eff,
+                .x_in = eff_x_bind,
+                .m = eff_m,
+                .hidden_dim = h,
+                .branch_token_stride = w_stride,
+            }, true);
+        } else {
+            try self.moe_pipes.encodeResidualAdd(frame, .{
+                .x = eff_x_bind,
+                .delta = self.wp_proj_out_bind,
+                .count = eff_m * h,
+            }, true);
+        }
+
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = eff_x_bind,
+            .w = layer.post_attention_layernorm.binding,
+            .y = self.wp_x_norm_bind,
+            .num_rows = eff_m,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = layer.post_attention_layernorm.dtype,
+        }, true);
+
+        switch (self.config.axes.ffn_kind) {
+            .dense_swiglu => {
+                try self.encodeLinearGemmWithTile(frame, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, eff_m, true, true);
+                try self.encodeLinearGemmWithTile(frame, layer.dense_up, self.wp_x_norm_bind, self.wp_dense_up_bind, eff_m, true, false);
+                try self.moe_pipes.encodeSiluMul(frame, .{
+                    .gate = self.wp_dense_gate_bind,
+                    .up = self.wp_dense_up_bind,
+                    .out = self.wp_dense_act_bind,
+                    .count = eff_m * self.config.intermediate_size,
+                }, true);
+                try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
+                if (self.wp_gr_arena) |*gr| {
+                    const stream_eff: metal.BufferBinding = if (tail_m1_last)
+                        .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
+                    else
+                        gr.binding(self.scratch_buf);
+                    const decay_eff: metal.BufferBinding = if (tail_m1_last)
+                        .{ .buffer = self.scratch_buf, .offset = self.wp_gr_decay_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                    else
+                        self.wp_gr_decay_bind;
+                    const gwrite_eff: metal.BufferBinding = if (tail_m1_last)
+                        .{ .buffer = self.scratch_buf, .offset = self.wp_gr_g_write_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                    else
+                        self.wp_gr_g_write_bind;
+                    try self.hybrid_pipes.encodeGrWriteGate(frame, .{
+                        .stream = stream_eff,
+                        .y_delta = self.wp_proj_out_bind,
+                        .decay = decay_eff,
+                        .g_write = gwrite_eff,
+                        .m = eff_m,
+                        .hidden_dim = h,
+                        .branch_token_stride = w_stride,
+                    }, true);
+                } else {
+                    try self.moe_pipes.encodeResidualAdd(frame, .{
+                        .x = eff_x_bind,
+                        .delta = self.wp_proj_out_bind,
+                        .count = eff_m * h,
+                    }, true);
+                }
+            },
+            .moe_swiglu => {
+                const ws_ptr = &(self.wp_moe_ws.?);
+                const router_src: moe.RouterSource = if (layer.router_quant_dtype) |rqd| .{
+                    .quant_weights = .{
+                        .qweight = layer.router_binding,
+                        .scale_bias = layer.router_scale_bias.?,
+                        .bits = switch (rqd) {
+                            .q2_affine => .q2,
+                            .q3_affine => .q3,
+                            .q4_affine => .q4,
+                            else => return error.InvalidBatchSize,
+                        },
+                    },
+                } else .{
+                    .weights = .{
+                        .binding = layer.router_binding,
+                        .dtype = layer.router_dtype,
+                    },
+                };
+                const residual_bind: ?metal.BufferBinding = if (self.wp_gr_arena != null) null else eff_x_bind;
+                const out_bind: metal.BufferBinding = if (self.wp_gr_arena != null) self.wp_proj_out_bind else eff_x_bind;
+                const moe_args: moe.MoELayerArgs = .{
+                    .x = self.wp_x_norm_bind,
+                    .router = router_src,
+                    .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                    .expert_table = layer.expert_table,
+                    .workspace = ws_ptr,
+                    .workspace_buf = self.scratch_buf,
+                    .residual = residual_bind,
+                    .out = out_bind,
+                    .m = eff_m,
+                    .num_experts = self.config.num_experts,
+                    .top_k = self.config.num_experts_per_tok,
+                    .hidden_size = h,
+                    .intermediate_size = self.config.moe_intermediate_size,
+                    .norm_topk_prob = self.config.norm_topk_prob,
+                    .shared_expert = layer.shared_expert,
+                    .shared_weights_base = if (layer.shared_expert_buf) |sb| .{ .buffer = sb, .offset = 0 } else null,
+                    .shared_expert_dtype = layer.shared_expert_dtype,
+                    .shared_intermediate_size = self.config.shared_expert_intermediate_size,
+                    .shared_gate_weight = layer.shared_gate_weight,
+                    .shared_gate_dtype = layer.shared_gate_dtype,
+                };
+                if (layer.is_hetero_moe) {
+                    try self.moe_pipes.encodeMoELayerHetero(frame, .{
+                        .base = moe_args,
+                        .expert_schemes = layer.expert_dtypes_binding.?,
+                        .scheme_counts = layer.expert_scheme_counts,
+                    }, true);
+                } else {
+                    switch (layer.expert_weight_dtype) {
+                        .q2_affine => try self.moe_pipes.encodeMoELayer(frame, .q2, moe_args, true),
+                        .q3_affine => try self.moe_pipes.encodeMoELayer(frame, .q3, moe_args, true),
+                        .q4_affine => try self.moe_pipes.encodeMoELayer(frame, .q4, moe_args, true),
+                        .f16 => try self.moe_pipes.encodeMoELayerFloat(frame, .f16, moe_args, true),
+                        .bf16 => try self.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, true),
+                    }
+                }
+                if (self.wp_gr_arena) |*gr| {
+                    const stream_eff: metal.BufferBinding = if (tail_m1_last)
+                        .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
+                    else
+                        gr.binding(self.scratch_buf);
+                    const decay_eff: metal.BufferBinding = if (tail_m1_last)
+                        .{ .buffer = self.scratch_buf, .offset = self.wp_gr_decay_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                    else
+                        self.wp_gr_decay_bind;
+                    const gwrite_eff: metal.BufferBinding = if (tail_m1_last)
+                        .{ .buffer = self.scratch_buf, .offset = self.wp_gr_g_write_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                    else
+                        self.wp_gr_g_write_bind;
+                    try self.hybrid_pipes.encodeGrWriteGate(frame, .{
+                        .stream = stream_eff,
+                        .y_delta = self.wp_proj_out_bind,
+                        .decay = decay_eff,
+                        .g_write = gwrite_eff,
+                        .m = eff_m,
+                        .hidden_dim = h,
+                        .branch_token_stride = w_stride,
+                    }, true);
+                }
+            },
+        }
+
+        // Capture EAGLE-3 aux taps on final loop pass if enabled.
+        if (self.enable_feature_taps and is_final_pass and !tail_m1_last) {
+            for (self.aux_layer_ids, 0..) |tap_l, slot| {
+                if (tap_l == @as(u32, @intCast(l))) {
+                    if (self.wp_gr_arena) |*gr| {
+                        try self.hybrid_pipes.encodeGrCollapse(frame, .{
+                            .stream = gr.binding(self.scratch_buf),
+                            .out = self.wp_x_bind,
+                            .mode = .mean,
+                            .m = m,
+                            .hidden_dim = h,
+                            .branch_token_stride = w_stride,
+                        }, true);
+                    }
+                    try self.moe_pipes.encodeCopyStrided(frame, .{
+                        .src = self.wp_x_bind,
+                        .dst = self.accepted_aux_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = 3 * h,
+                        .dst_col_off = @as(u32, @intCast(slot)) * h,
+                    }, true);
+                }
+            }
+        }
     }
 
     pub fn prefillToken(self: *GraphModel, token_id: u32, pos: u32) GraphStepError!void {
@@ -3846,7 +5391,7 @@ pub const GraphModel = struct {
         const dev_info = try device.info();
         const library = try metal.Library.openEmbedded(device);
         errdefer library.close();
-        const compute = try metal.Compute.init(device);
+        var compute = try metal.Compute.init(device);
         errdefer compute.close();
         const dequant_pipes = try dequant.DequantPipelines.init(device, library);
         errdefer dequant_pipes.close();
@@ -3921,15 +5466,21 @@ pub const GraphModel = struct {
 
         // If cold experts exist, reserve `ExpertSlotPool` space at the end of shard 0 so
         // hot experts and pinned cold experts share shard 0's `MTLBuffer` zero-copy!
+        // P1-B (`R9`, ADR-0020): auto-scale optional extra cold-expert slots and PLE
+        // page-cache pages against live non-anonymous Mach RAM minus safety margin.
         var cold_slot_count: u32 = 0;
+        var cold_min_slots: u32 = 0;
         var cold_pool_spec: cache_mod.PoolSpec = undefined;
         var cold_pool_bytes: usize = 0;
+        var cold_min_pool_bytes: u64 = 0;
+        var cold_slot_stride_bytes: usize = 0;
         if (has_any_cold) {
             if (source == .bytes) return error.InvalidConfig; // Cold experts require file fd
+            cold_min_slots = @max(config.num_experts_per_tok, @min(config.num_experts, options.max_tree_nodes * config.num_experts_per_tok));
             cold_slot_count = if (options.cold_slot_count > 0)
-                options.cold_slot_count
+                @max(options.cold_slot_count, cold_min_slots)
             else
-                @max(config.num_experts_per_tok * 2, 32);
+                @max(@max(config.num_experts_per_tok * 2, 32), cold_min_slots);
             cold_pool_spec = .{
                 .num_slots = cold_slot_count,
                 .gate_blob_bytes = max_cold_gate_bytes,
@@ -3937,6 +5488,53 @@ pub const GraphModel = struct {
                 .down_blob_bytes = max_cold_down_bytes,
             };
             cold_pool_bytes = try cold_pool_spec.totalBytes();
+            const min_spec: cache_mod.PoolSpec = .{
+                .num_slots = cold_min_slots,
+                .gate_blob_bytes = max_cold_gate_bytes,
+                .up_blob_bytes = max_cold_up_bytes,
+                .down_blob_bytes = max_cold_down_bytes,
+            };
+            cold_min_pool_bytes = try min_spec.totalBytes();
+            cold_slot_stride_bytes = try cold_pool_spec.slotBytes();
+        }
+
+        var hot_shards_bytes: u64 = 0;
+        for (shard_sizes.items) |sz| hot_shards_bytes += try page.alignUp(sz);
+        const ple_min_pages: usize = if (options.ple_paths.len > 0 and options.ple_cache_pages > 0) 1 else 0;
+        const ple_req_extra_pages: usize = if (options.ple_paths.len > 0 and options.ple_cache_pages > ple_min_pages)
+            options.ple_cache_pages - ple_min_pages
+        else
+            0;
+        const optional_cold_bytes: u64 = @as(u64, cold_pool_bytes) -| cold_min_pool_bytes;
+        const optional_ple_bytes: u64 = @as(u64, ple_req_extra_pages) * page.APPLE_PAGE_SIZE;
+        const live_reclaimable_bytes: u64 = options.live_reclaimable_override orelse
+            (try vmstat.Snapshot.capture()).liveZeroSwapReclaimableBytes();
+        var live_admission = try wired_budget.planWithLiveRam(
+            hot_shards_bytes + cold_min_pool_bytes + @as(u64, ple_min_pages) * page.APPLE_PAGE_SIZE,
+            optional_cold_bytes + optional_ple_bytes,
+            live_reclaimable_bytes,
+            .{
+                .live_safety_margin_bytes = options.live_safety_margin_bytes,
+                .strict_live_ram = options.strict_live_ram,
+            },
+        );
+        var eff_ple_cache_pages: usize = options.ple_cache_pages;
+        if (live_admission.cache_scaled_down) {
+            var rem_grant: u64 = live_admission.granted_optional_cache_bytes;
+            if (has_any_cold and cold_slot_count > cold_min_slots) {
+                const extra_req: usize = cold_slot_count - cold_min_slots;
+                const granted_extra: usize = budget_mod.scaleOptionalCount(extra_req, cold_slot_stride_bytes, rem_grant, 0);
+                cold_slot_count = cold_min_slots + @as(u32, @intCast(granted_extra));
+                cold_pool_spec.num_slots = cold_slot_count;
+                cold_pool_bytes = try cold_pool_spec.totalBytes();
+                rem_grant -|= @as(u64, granted_extra) * cold_slot_stride_bytes;
+            }
+            if (ple_req_extra_pages > 0) {
+                const granted_ple_extra: usize = budget_mod.scaleOptionalCount(ple_req_extra_pages, page.APPLE_PAGE_SIZE, rem_grant, 0);
+                eff_ple_cache_pages = ple_min_pages + granted_ple_extra;
+            }
+        }
+        if (has_any_cold) {
             shard_sizes.items[0] += cold_pool_bytes;
         }
 
@@ -4148,15 +5746,201 @@ pub const GraphModel = struct {
             .full_chunk_512 => (options.max_seq_len + config.qsa_block_size - 1) / config.qsa_block_size,
         };
 
-        var scratch_bytes: usize = 0;
+        const supports_wide_prefill = (num_gqa_layers == 0) or (config.head_dim == 64 or config.head_dim == 128);
+        const req_wide_cap: u32 = @min(attention.MAX_WIDE_PREFILL_TOKENS, @max(@as(u32, 1), options.wide_prefill_chunk_tokens));
+        const ple_limited_wide: u32 = if (options.ple_paths.len > 0)
+            @min(req_wide_cap, @as(u32, ple_mod.MAX_BATCH_TOKENS))
+        else
+            req_wide_cap;
+        const wide_prefill_max_tokens: u32 = if (options.gpu_prefill_mode == .wide and supports_wide_prefill)
+            @min(ple_limited_wide, options.max_seq_len)
+        else
+            0;
+        const wide_enabled = (wide_prefill_max_tokens > 0);
+        const w_cap: usize = wide_prefill_max_tokens;
+        const multi_loop = (effective_max_loops > 1);
+        const use_aliased_scratch = wide_enabled and options.alias_prefill_tree_scratch;
+        const logits_cap: usize = if (options.compute_all_logits and wide_enabled) @max(@as(usize, max_m), w_cap) else max_m;
+        const feat_cap: usize = if (wide_enabled and options.enable_feature_taps) @max(@as(usize, max_m), w_cap) else max_m;
+
         const addAligned = struct {
             fn call(total: *usize, n_bytes: usize) void {
                 total.* += amf.align64(n_bytes) + 64;
             }
         }.call;
 
+        const max_q_dim: u32 = @max(@max(config.qDim(), config.gdnQkDim()), h);
+        const max_kv_dim: u32 = @max(@max(config.kvDim(), config.gdnQkDim()), @max(config.gdnVDim(), h));
+        const max_attn_out: u32 = @max(@max(config.qDim(), config.gdnVDim()), h);
+        const max_inter: u32 = @max(@max(config.intermediate_size, config.moe_intermediate_size), @max(config.shared_expert_intermediate_size, h));
+
+        const moe_ws_spec: moe.WorkspaceSpec = .{
+            .max_tokens = max_m,
+            .num_experts = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts else 1,
+            .top_k = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts_per_tok else 1,
+            .hidden_size = h,
+            .intermediate_size = if (config.axes.ffn_kind == .moe_swiglu) config.moe_intermediate_size else h,
+            .shared_intermediate_size = config.shared_expert_intermediate_size,
+        };
+        const wp_moe_ws_spec: moe.WorkspaceSpec = .{
+            .max_tokens = if (wide_enabled) wide_prefill_max_tokens else 1,
+            .num_experts = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts else 1,
+            .top_k = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts_per_tok else 1,
+            .hidden_size = h,
+            .intermediate_size = if (config.axes.ffn_kind == .moe_swiglu) config.moe_intermediate_size else h,
+            .shared_intermediate_size = config.shared_expert_intermediate_size,
+        };
+
+        // Region B (`tree_scratch_bytes`): decode & `verifyTree` scratch (aliased with Region A under `P0-B2`).
+        var tree_scratch_bytes: usize = 0;
+        if (config.axes.residual_kind == .gated_4branch) {
+            tree_scratch_bytes += try hybrid.GrStreamArena.requiredBytes(.{
+                .max_tokens = max_m,
+                .hidden_dim = h,
+            });
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_g_read
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_g_write
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_decay
+        } else {
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
+        }
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4); // token_ids
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4); // positions
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * @sizeOf(hybrid.Pos3D)); // pos3d
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * 8); // ancestor_masks
+        addAligned(&tree_scratch_bytes, @as(usize, config.num_hidden_layers) * max_m * h * 2); // ple_f16
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * h * 2); // x
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * h * 2); // x_init
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * h * 2); // x_norm
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_q_dim * 2); // q
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // k
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // v
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_q_dim * 2); // q_conv
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // k_conv
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // v_conv
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_attn_out * 2); // gdn_z
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // gdn_g
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // gdn_beta
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_attn_out * 2); // attn_out
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * h * 2); // proj_out
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_gate
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_up
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_act
+        addAligned(&tree_scratch_bytes, @as(usize, max_m) * 3 * h * 2); // aux_tree
+        if (num_gqa_layers > 0) {
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (config.head_dim + 2) * 4);
+        } else {
+            addAligned(&tree_scratch_bytes, 64);
+        }
+        if (config.axes.ffn_kind == .moe_swiglu) {
+            addAligned(&tree_scratch_bytes, (try moe.MoeWorkspace.requiredBytes(moe_ws_spec)) + 4096);
+        }
         if (num_gdn_layers > 0) {
-            scratch_bytes += try hybrid.GdnStateArena.requiredBytes(.{
+            const qk_d = config.gdnQkDim();
+            const v_d = config.gdnVDim();
+            for (0..num_gdn_layers) |_| {
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * qk_d * 2); // tree_k
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * v_d * 2); // tree_v
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.linear_num_value_heads * 4); // tree_g
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.linear_num_value_heads * 4); // tree_beta
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * qk_d * 2); // tree_q_raw
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * qk_d * 2); // tree_k_raw
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * v_d * 2); // tree_v_raw
+            }
+        }
+        if (num_qsa_layers > 0) {
+            for (0..num_qsa_layers) |_| {
+                tree_scratch_bytes += (try hybrid.QsaIndexBuffer.requiredBytes(.{
+                    .max_nodes = max_m,
+                    .num_kv_heads = config.num_key_value_heads,
+                    .top_k_blocks = config.qsa_top_k_blocks,
+                })) + 128;
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kvDim() * 2); // tree_k
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kvDim() * 2); // tree_v
+            }
+        }
+        if (num_gqa_layers > 0) {
+            for (0..num_gqa_layers) |_| {
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
+            }
+        }
+        tree_scratch_bytes += 4 * page.APPLE_PAGE_SIZE;
+
+        // Region A (`wide_scratch_bytes`): wide-prefill (`512–1024`-token) rolling activation scratch + MoeWorkspace.
+        var wide_scratch_bytes: usize = 0;
+        if (wide_enabled) {
+            if (config.axes.residual_kind == .gated_4branch) {
+                wide_scratch_bytes += try hybrid.GrStreamArena.requiredBytes(.{
+                    .max_tokens = wide_prefill_max_tokens,
+                    .hidden_dim = h,
+                });
+                addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
+                addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
+                addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
+            }
+            addAligned(&wide_scratch_bytes, w_cap * 4); // wp_token_ids
+            addAligned(&wide_scratch_bytes, w_cap * @sizeOf(hybrid.Pos3D)); // wp_pos3d
+            if (options.ple_paths.len > 0) {
+                addAligned(&wide_scratch_bytes, @as(usize, config.num_hidden_layers) * w_cap * h * 2);
+            }
+            addAligned(&wide_scratch_bytes, w_cap * h * 2); // wp_x
+            if (multi_loop) addAligned(&wide_scratch_bytes, w_cap * h * 2); // wp_x_init
+            addAligned(&wide_scratch_bytes, w_cap * h * 2); // wp_x_norm
+            addAligned(&wide_scratch_bytes, w_cap * max_q_dim * 2); // wp_q
+            addAligned(&wide_scratch_bytes, w_cap * max_kv_dim * 2); // wp_k
+            addAligned(&wide_scratch_bytes, w_cap * max_kv_dim * 2); // wp_v
+            if (num_gdn_layers > 0) {
+                addAligned(&wide_scratch_bytes, w_cap * max_q_dim * 2); // wp_q_conv
+                addAligned(&wide_scratch_bytes, w_cap * max_kv_dim * 2); // wp_k_conv
+                addAligned(&wide_scratch_bytes, w_cap * max_kv_dim * 2); // wp_v_conv
+                addAligned(&wide_scratch_bytes, w_cap * max_attn_out * 2); // wp_gdn_z
+                addAligned(&wide_scratch_bytes, w_cap * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // wp_gdn_g
+                addAligned(&wide_scratch_bytes, w_cap * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // wp_gdn_beta
+                if (multi_loop) {
+                    const qk_d = config.gdnQkDim();
+                    const v_d = config.gdnVDim();
+                    for (0..num_gdn_layers) |_| {
+                        addAligned(&wide_scratch_bytes, w_cap * qk_d * 2); // wp_k
+                        addAligned(&wide_scratch_bytes, w_cap * v_d * 2); // wp_v
+                        addAligned(&wide_scratch_bytes, w_cap * config.linear_num_value_heads * 4); // wp_g
+                        addAligned(&wide_scratch_bytes, w_cap * config.linear_num_value_heads * 4); // wp_beta
+                        addAligned(&wide_scratch_bytes, w_cap * qk_d * 2); // wp_q_raw
+                    }
+                }
+            }
+            addAligned(&wide_scratch_bytes, w_cap * max_attn_out * 2); // wp_attn_out
+            addAligned(&wide_scratch_bytes, w_cap * h * 2); // wp_proj_out
+            if (config.axes.ffn_kind == .dense_swiglu) {
+                addAligned(&wide_scratch_bytes, w_cap * max_inter * 2); // wp_dense_gate
+                addAligned(&wide_scratch_bytes, w_cap * max_inter * 2); // wp_dense_up
+                addAligned(&wide_scratch_bytes, w_cap * max_inter * 2); // wp_dense_act
+            } else {
+                addAligned(&wide_scratch_bytes, (try moe.MoeWorkspace.requiredBytes(wp_moe_ws_spec)) + 4096);
+            }
+            if (num_qsa_layers > 0) {
+                for (0..num_qsa_layers) |_| {
+                    wide_scratch_bytes += (try hybrid.QsaIndexBuffer.requiredBytes(.{
+                        .max_nodes = wide_prefill_max_tokens,
+                        .num_kv_heads = config.num_key_value_heads,
+                        .top_k_blocks = config.qsa_top_k_blocks,
+                    })) + 128;
+                    if (qsa_ring_mode == .sliding_window_128 and multi_loop) {
+                        addAligned(&wide_scratch_bytes, w_cap * config.kvDim() * 2);
+                        addAligned(&wide_scratch_bytes, w_cap * config.kvDim() * 2);
+                    }
+                }
+            }
+            wide_scratch_bytes += 4 * page.APPLE_PAGE_SIZE;
+        }
+
+        // Persistent / non-aliased scratch bytes (GDN states, Conv1D states, KV tile tables,
+        // QSA block_keys, R5 retired pool, logits, out_token_ids, accepted taps, expert tables).
+        var persist_bytes: usize = 0;
+        if (num_gdn_layers > 0) {
+            persist_bytes += try hybrid.GdnStateArena.requiredBytes(.{
                 .num_gdn_layers = num_gdn_layers,
                 .num_v_heads = config.linear_num_value_heads,
                 .head_k_dim = config.linear_key_head_dim,
@@ -4167,112 +5951,63 @@ pub const GraphModel = struct {
             const conv_d = 2 * qk_d + v_d;
             const conv_hist = if (config.linear_conv_kernel_dim > 1) config.linear_conv_kernel_dim - 1 else 1;
             for (0..num_gdn_layers) |_| {
-                addAligned(&scratch_bytes, @as(usize, max_m) * qk_d * 2); // tree_k
-                addAligned(&scratch_bytes, @as(usize, max_m) * v_d * 2); // tree_v
-                addAligned(&scratch_bytes, @as(usize, max_m) * config.linear_num_value_heads * 4); // tree_g
-                addAligned(&scratch_bytes, @as(usize, max_m) * config.linear_num_value_heads * 4); // tree_beta
-                addAligned(&scratch_bytes, @as(usize, max_m) * qk_d * 2); // tree_q_raw
-                addAligned(&scratch_bytes, @as(usize, max_m) * qk_d * 2); // tree_k_raw
-                addAligned(&scratch_bytes, @as(usize, max_m) * v_d * 2); // tree_v_raw
-                addAligned(&scratch_bytes, @as(usize, conv_hist) * conv_d * 2); // conv_state
-                addAligned(&scratch_bytes, @as(usize, conv_hist) * conv_d * 2); // conv_state_tmp
+                addAligned(&persist_bytes, @as(usize, conv_hist) * conv_d * 2); // conv_state
+                addAligned(&persist_bytes, @as(usize, conv_hist) * conv_d * 2); // conv_state_tmp
             }
         }
-        if (config.axes.residual_kind == .gated_4branch) {
-            scratch_bytes += try hybrid.GrStreamArena.requiredBytes(.{
-                .max_tokens = max_m,
-                .hidden_dim = h,
-            });
-            addAligned(&scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_g_read
-            addAligned(&scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_g_write
-            addAligned(&scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_decay
-        }
         if (use_retired_q8) {
-            scratch_bytes += try attention.RetiredKvQ8Pool.requiredArenaBytes(retired_pool_spec);
+            persist_bytes += try attention.RetiredKvQ8Pool.requiredArenaBytes(retired_pool_spec);
         }
         if (num_qsa_layers > 0) {
             for (0..num_qsa_layers) |_| {
-                scratch_bytes += try hybrid.HybridKvRing.tableRequiredBytes(qsa_num_tiles) + 64;
+                persist_bytes += try hybrid.HybridKvRing.tableRequiredBytes(qsa_num_tiles) + 64;
                 if (qsa_supports_retire and use_retired_q8) {
-                    addAligned(&scratch_bytes, @as(usize, qsa_full_chunks) * @sizeOf(attention.KvTilePair));
-                    addAligned(&scratch_bytes, @as(usize, max_retired_per_layer) * @sizeOf(u32));
+                    addAligned(&persist_bytes, @as(usize, qsa_full_chunks) * @sizeOf(attention.KvTilePair));
+                    addAligned(&persist_bytes, @as(usize, max_retired_per_layer) * @sizeOf(u32));
                 }
-                scratch_bytes += try hybrid.QsaIndexBuffer.requiredBytes(.{
-                    .max_nodes = max_m,
-                    .num_kv_heads = config.num_key_value_heads,
-                    .top_k_blocks = config.qsa_top_k_blocks,
-                });
-                addAligned(&scratch_bytes, @as(usize, config.num_key_value_heads) * qsa_max_blocks * config.head_dim * 2); // block_keys
-                addAligned(&scratch_bytes, @as(usize, max_m) * config.kvDim() * 2); // tree_k
-                addAligned(&scratch_bytes, @as(usize, max_m) * config.kvDim() * 2); // tree_v
+                addAligned(&persist_bytes, @as(usize, config.num_key_value_heads) * qsa_max_blocks * config.head_dim * 2); // block_keys
             }
         }
         if (num_gqa_layers > 0) {
             for (0..num_gqa_layers) |_| {
-                addAligned(&scratch_bytes, @as(usize, gqa_num_tiles) * @sizeOf(attention.KvTilePair));
+                addAligned(&persist_bytes, @as(usize, gqa_num_tiles) * @sizeOf(attention.KvTilePair));
                 if (use_retired_q8) {
-                    addAligned(&scratch_bytes, @as(usize, max_retired_per_layer) * @sizeOf(u32));
+                    addAligned(&persist_bytes, @as(usize, max_retired_per_layer) * @sizeOf(u32));
                 }
-                addAligned(&scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
-                addAligned(&scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
             }
-            addAligned(&scratch_bytes, @as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (config.head_dim + 2) * 4);
         }
-
-        const max_q_dim: u32 = @max(@max(config.qDim(), config.gdnQkDim()), h);
-        const max_kv_dim: u32 = @max(@max(config.kvDim(), config.gdnQkDim()), @max(config.gdnVDim(), h));
-        const max_attn_out: u32 = @max(@max(config.qDim(), config.gdnVDim()), h);
-        const max_inter: u32 = @max(@max(config.intermediate_size, config.moe_intermediate_size), @max(config.shared_expert_intermediate_size, h));
-
-        addAligned(&scratch_bytes, @as(usize, max_m) * 4); // token_ids
-        addAligned(&scratch_bytes, @as(usize, max_m) * 4); // positions
-        addAligned(&scratch_bytes, @as(usize, max_m) * @sizeOf(hybrid.Pos3D)); // pos3d
-        addAligned(&scratch_bytes, @as(usize, max_m) * 8); // ancestor_masks
-        addAligned(&scratch_bytes, @as(usize, max_m) * 4); // out_token_ids
-        addAligned(&scratch_bytes, @as(usize, max_m) * config.vocab_size * 2); // logits
-        addAligned(&scratch_bytes, @as(usize, max_m) * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate)); // topk
-        addAligned(&scratch_bytes, @as(usize, config.num_hidden_layers) * max_m * h * 2); // ple_f16
-        addAligned(&scratch_bytes, @as(usize, max_m) * h * 2); // x
-        addAligned(&scratch_bytes, @as(usize, max_m) * h * 2); // x_init
-        addAligned(&scratch_bytes, @as(usize, max_m) * h * 2); // x_norm
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_q_dim * 2); // q
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // k
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // v
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_q_dim * 2); // q_conv
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // k_conv
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // v_conv
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_attn_out * 2); // gdn_z
-        addAligned(&scratch_bytes, @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // gdn_g
-        addAligned(&scratch_bytes, @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // gdn_beta
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_attn_out * 2); // attn_out
-        addAligned(&scratch_bytes, @as(usize, max_m) * h * 2); // proj_out
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_gate
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_up
-        addAligned(&scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_act
-        addAligned(&scratch_bytes, @as(usize, max_m) * h * 2); // accepted_top
-        addAligned(&scratch_bytes, @as(usize, max_m) * 3 * h * 2); // accepted_aux
-        addAligned(&scratch_bytes, @as(usize, max_m) * 3 * h * 2); // aux_tree
-
-        const moe_ws_spec: moe.WorkspaceSpec = .{
-            .max_tokens = max_m,
-            .num_experts = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts else 1,
-            .top_k = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts_per_tok else 1,
-            .hidden_size = h,
-            .intermediate_size = if (config.axes.ffn_kind == .moe_swiglu) config.moe_intermediate_size else h,
-            .shared_intermediate_size = config.shared_expert_intermediate_size,
-        };
+        addAligned(&persist_bytes, logits_cap * 4); // out_token_ids
+        addAligned(&persist_bytes, logits_cap * config.vocab_size * 2); // logits
+        addAligned(&persist_bytes, @as(usize, max_m) * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate)); // topk
+        addAligned(&persist_bytes, feat_cap * h * 2); // accepted_top
+        addAligned(&persist_bytes, feat_cap * 3 * h * 2); // accepted_aux
+        addAligned(&persist_bytes, @as(usize, config.num_hidden_layers) * 64); // per-layer sched headers
         if (config.axes.ffn_kind == .moe_swiglu) {
-            const ws_bytes = try moe.MoeWorkspace.requiredBytes(moe_ws_spec);
-            addAligned(&scratch_bytes, ws_bytes + 4096);
-            addAligned(&scratch_bytes, @as(usize, config.num_hidden_layers) * 64); // per-layer sched headers
             for (0..config.num_hidden_layers) |_| {
-                addAligned(&scratch_bytes, @as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights));
-                addAligned(&scratch_bytes, @as(usize, config.num_experts)); // hetero expert_dtypes
+                addAligned(&persist_bytes, @as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights));
+                addAligned(&persist_bytes, @as(usize, config.num_experts)); // hetero expert_dtypes
             }
         }
+
+        const aliased_block_bytes: usize = if (use_aliased_scratch)
+            @max(try page.alignUp(wide_scratch_bytes), try page.alignUp(tree_scratch_bytes))
+        else if (wide_enabled)
+            (try page.alignUp(wide_scratch_bytes)) + (try page.alignUp(tree_scratch_bytes))
+        else
+            try page.alignUp(tree_scratch_bytes);
 
         // Generous page margin for sub-arena page rounding.
-        scratch_bytes = try page.alignUp(scratch_bytes + 32 * page.APPLE_PAGE_SIZE);
+        const scratch_bytes = try page.alignUp(aliased_block_bytes + persist_bytes + 32 * page.APPLE_PAGE_SIZE);
+        // Update live admission with exact required wired footprint (enforcing `--strict-live-ram` before mlock).
+        live_admission = try wired_budget.planWithLiveRam(
+            total_wired_bytes + scratch_bytes,
+            optional_cold_bytes + optional_ple_bytes,
+            live_reclaimable_bytes,
+            .{
+                .live_safety_margin_bytes = options.live_safety_margin_bytes,
+                .strict_live_ram = options.strict_live_ram,
+            },
+        );
         try wired_budget.checkPlan(total_wired_bytes + scratch_bytes);
 
         var scratch_arena = try arena_mod.WiredArena.init(scratch_bytes, wired_budget);
@@ -4282,7 +6017,176 @@ pub const GraphModel = struct {
         try compute.makeResident(&.{scratch_buf});
         total_wired_bytes += scratch_bytes;
 
-        // Allocate sub-arenas inside `scratch_arena`.
+        // G16 (`P2`, ADR-0020): `< 0.1 ms` startup `.metallib` numerical canary over
+        // the resident `scratch_buf` BEFORE carving any sub-arena.
+        var canary_result: ?dequant.CanaryResult = null;
+        if (options.startup_canary) {
+            canary_result = try dequant_pipes.runStartupNumericalCanaryInBuffer(&compute, scratch_buf, scratch_arena.bytes());
+            @memset(scratch_arena.bytes()[0..page.APPLE_PAGE_SIZE], 0);
+        }
+
+        // P0-B2 (`R9`, ADR-0020): Allocate aliased wide-prefill / verifyTree pair FIRST
+        // (at offset 0 of `scratch_arena`) so `arena_a.offsetOf(p) == arena_b.offsetOf(p) ==
+        // scratch_arena.offsetOf(p)` for `GrStreamArena`, `QsaIndexBuffer`, `MoeWorkspace`,
+        // and all Metal buffer bindings while keeping `lm_head` 100% wired!
+        var aliased_scratch_saved_bytes: usize = 0;
+        var aliased_pair: ?arena_mod.AliasedScratchPair = null;
+        if (use_aliased_scratch) {
+            const pair = try scratch_arena.allocAliasedPair(wide_scratch_bytes, tree_scratch_bytes);
+            std.debug.assert(scratch_arena.offsetOf(pair.backing.ptr) == 0);
+            aliased_scratch_saved_bytes = pair.saved_bytes;
+            aliased_pair = pair;
+        }
+        const wp_arena: *arena_mod.WiredArena = if (aliased_pair != null) &aliased_pair.?.arena_a else &scratch_arena;
+        const tr_arena: *arena_mod.WiredArena = if (aliased_pair != null) &aliased_pair.?.arena_b else &scratch_arena;
+
+        // --- Carve Region A: wide-prefill scratch (`wp_arena`) ---
+        var wp_token_ids_host: []u32 = &.{};
+        var wp_pos3d_host: []hybrid.Pos3D = &.{};
+        var wp_ple_f16_host: []f16 = &.{};
+        var wp_token_ids_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_pos3d_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_ple_f16_base_off: u64 = 0;
+        var wp_gr_arena: ?hybrid.GrStreamArena = null;
+        var wp_gr_g_read_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_gr_g_write_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_gr_decay_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_x_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_x_init_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_x_norm_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_q_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_k_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_v_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_q_conv_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_k_conv_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_v_conv_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_gdn_z_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_gdn_g_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_gdn_beta_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_attn_out_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_proj_out_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_dense_gate_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_dense_up_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_dense_act_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var wp_moe_ws: ?moe.MoeWorkspace = null;
+        if (wide_enabled) {
+            if (config.axes.residual_kind == .gated_4branch) {
+                wp_gr_arena = try hybrid.GrStreamArena.init(wp_arena, .{
+                    .max_tokens = wide_prefill_max_tokens,
+                    .hidden_dim = h,
+                });
+                const gr_r = try wp_arena.allocAligned(w_cap * 4 * 4, 64);
+                const gr_w = try wp_arena.allocAligned(w_cap * 4 * 4, 64);
+                const gr_d = try wp_arena.allocAligned(w_cap * 4 * 4, 64);
+                wp_gr_g_read_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_r.ptr) };
+                wp_gr_g_write_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_w.ptr) };
+                wp_gr_decay_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_d.ptr) };
+            }
+            const wt_raw = try wp_arena.allocAligned(w_cap * 4, 64);
+            const wp3_raw = try wp_arena.allocAligned(w_cap * @sizeOf(hybrid.Pos3D), 64);
+            @memset(wt_raw, 0);
+            wp_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, wt_raw[0 .. w_cap * 4]));
+            wp_pos3d_host = @alignCast(std.mem.bytesAsSlice(hybrid.Pos3D, wp3_raw[0 .. w_cap * @sizeOf(hybrid.Pos3D)]));
+            wp_token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wt_raw.ptr) };
+            wp_pos3d_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp3_raw.ptr) };
+            if (options.ple_paths.len > 0) {
+                const wple_raw = try wp_arena.allocAligned(@as(usize, config.num_hidden_layers) * w_cap * h * 2, 64);
+                @memset(wple_raw, 0);
+                wp_ple_f16_host = @alignCast(std.mem.bytesAsSlice(f16, wple_raw[0 .. @as(usize, config.num_hidden_layers) * w_cap * h * 2]));
+                wp_ple_f16_base_off = scratch_arena.offsetOf(wple_raw.ptr);
+            }
+            const wx_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
+            wp_x_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wx_raw.ptr) };
+            if (multi_loop) {
+                const wxi_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
+                wp_x_init_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wxi_raw.ptr) };
+            }
+            const wxn_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
+            const wq_raw = try wp_arena.allocAligned(w_cap * max_q_dim * 2, 64);
+            const wk_raw = try wp_arena.allocAligned(w_cap * max_kv_dim * 2, 64);
+            const wv_raw = try wp_arena.allocAligned(w_cap * max_kv_dim * 2, 64);
+            wp_x_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wxn_raw.ptr) };
+            wp_q_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wq_raw.ptr) };
+            wp_k_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wk_raw.ptr) };
+            wp_v_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wv_raw.ptr) };
+            if (num_gdn_layers > 0) {
+                const wqc = try wp_arena.allocAligned(w_cap * max_q_dim * 2, 64);
+                const wkc = try wp_arena.allocAligned(w_cap * max_kv_dim * 2, 64);
+                const wvc = try wp_arena.allocAligned(w_cap * max_kv_dim * 2, 64);
+                const wgz = try wp_arena.allocAligned(w_cap * max_attn_out * 2, 64);
+                const wgg = try wp_arena.allocAligned(w_cap * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
+                const wgb = try wp_arena.allocAligned(w_cap * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
+                wp_q_conv_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wqc.ptr) };
+                wp_k_conv_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wkc.ptr) };
+                wp_v_conv_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wvc.ptr) };
+                wp_gdn_z_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgz.ptr) };
+                wp_gdn_g_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgg.ptr) };
+                wp_gdn_beta_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wgb.ptr) };
+            }
+            const wao_raw = try wp_arena.allocAligned(w_cap * max_attn_out * 2, 64);
+            const wpo_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
+            wp_attn_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wao_raw.ptr) };
+            wp_proj_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wpo_raw.ptr) };
+            if (config.axes.ffn_kind == .dense_swiglu) {
+                const wdg = try wp_arena.allocAligned(w_cap * max_inter * 2, 64);
+                const wdu = try wp_arena.allocAligned(w_cap * max_inter * 2, 64);
+                const wda = try wp_arena.allocAligned(w_cap * max_inter * 2, 64);
+                wp_dense_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wdg.ptr) };
+                wp_dense_up_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wdu.ptr) };
+                wp_dense_act_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wda.ptr) };
+            } else {
+                wp_moe_ws = try moe.MoeWorkspace.init(wp_arena, wp_moe_ws_spec);
+            }
+        }
+
+        // --- Carve Region B: decode & `verifyTree` scratch (`tr_arena`) ---
+        const gr_arena: ?hybrid.GrStreamArena = if (config.axes.residual_kind == .gated_4branch)
+            try hybrid.GrStreamArena.init(tr_arena, .{
+                .max_tokens = max_m,
+                .hidden_dim = h,
+            })
+        else
+            null;
+
+        const gr_g_read_raw = try tr_arena.allocAligned(@as(usize, max_m) * 4 * 4, 64);
+        const gr_g_write_raw = try tr_arena.allocAligned(@as(usize, max_m) * 4 * 4, 64);
+        const gr_decay_raw = try tr_arena.allocAligned(@as(usize, max_m) * 4 * 4, 64);
+
+        const tok_raw = try tr_arena.allocAligned(@as(usize, max_m) * 4, 64);
+        const pos_raw = try tr_arena.allocAligned(@as(usize, max_m) * 4, 64);
+        const pos3d_raw = try tr_arena.allocAligned(@as(usize, max_m) * @sizeOf(hybrid.Pos3D), 64);
+        const msk_raw = try tr_arena.allocAligned(@as(usize, max_m) * 8, 64);
+        const ple_f16_raw = try tr_arena.allocAligned(@as(usize, config.num_hidden_layers) * max_m * h * 2, 64);
+        @memset(ple_f16_raw, 0);
+        const x_raw = try tr_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
+        const x_init_raw = try tr_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
+        const x_norm_raw = try tr_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
+        const q_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_q_dim * 2, 64);
+        const k_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
+        const v_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
+        const q_conv_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_q_dim * 2, 64);
+        const k_conv_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
+        const v_conv_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
+        const gdn_z_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_attn_out * 2, 64);
+        const gdn_g_raw = try tr_arena.allocAligned(@as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
+        const gdn_beta_raw = try tr_arena.allocAligned(@as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
+        const attn_out_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_attn_out * 2, 64);
+        const proj_out_raw = try tr_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
+        const dgate_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
+        const dup_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
+        const dact_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
+        const aux_tree_raw = try tr_arena.allocAligned(@as(usize, max_m) * 3 * h * 2, 64);
+        const gqa_scratch_raw = if (num_gqa_layers > 0)
+            try tr_arena.allocAligned(@as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (config.head_dim + 2) * 4, 64)
+        else
+            try tr_arena.allocAligned(64, 64);
+
+        const moe_ws: ?moe.MoeWorkspace = if (config.axes.ffn_kind == .moe_swiglu)
+            try moe.MoeWorkspace.init(tr_arena, moe_ws_spec)
+        else
+            null;
+
+        // --- Carve persistent non-aliased sub-arenas inside `scratch_arena` ---
         const retired_kv_pool: ?attention.RetiredKvQ8Pool = if (use_retired_q8)
             try attention.RetiredKvQ8Pool.init(&scratch_arena, retired_pool_spec)
         else
@@ -4302,56 +6206,11 @@ pub const GraphModel = struct {
         else
             null;
 
-        const gr_arena: ?hybrid.GrStreamArena = if (config.axes.residual_kind == .gated_4branch)
-            try hybrid.GrStreamArena.init(&scratch_arena, .{
-                .max_tokens = max_m,
-                .hidden_dim = h,
-            })
-        else
-            null;
-
-        const gr_g_read_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 4 * 4, 64);
-        const gr_g_write_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 4 * 4, 64);
-        const gr_decay_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 4 * 4, 64);
-
-        const tok_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 4, 64);
-        const pos_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 4, 64);
-        const pos3d_raw = try scratch_arena.allocAligned(@as(usize, max_m) * @sizeOf(hybrid.Pos3D), 64);
-        const msk_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 8, 64);
-        const out_tok_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 4, 64);
-        const logits_raw = try scratch_arena.allocAligned(@as(usize, max_m) * config.vocab_size * 2, 64);
+        const out_tok_raw = try scratch_arena.allocAligned(logits_cap * 4, 64);
+        const logits_raw = try scratch_arena.allocAligned(logits_cap * config.vocab_size * 2, 64);
         const topk_raw = try scratch_arena.allocAligned(@as(usize, max_m) * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate), 64);
-        const ple_f16_raw = try scratch_arena.allocAligned(@as(usize, config.num_hidden_layers) * max_m * h * 2, 64);
-        @memset(ple_f16_raw, 0);
-        const x_raw = try scratch_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
-        const x_init_raw = try scratch_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
-        const x_norm_raw = try scratch_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
-        const q_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_q_dim * 2, 64);
-        const k_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
-        const v_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
-        const q_conv_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_q_dim * 2, 64);
-        const k_conv_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
-        const v_conv_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
-        const gdn_z_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_attn_out * 2, 64);
-        const gdn_g_raw = try scratch_arena.allocAligned(@as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
-        const gdn_beta_raw = try scratch_arena.allocAligned(@as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
-        const attn_out_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_attn_out * 2, 64);
-        const proj_out_raw = try scratch_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
-        const dgate_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
-        const dup_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
-        const dact_raw = try scratch_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
-        const acc_top_raw = try scratch_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
-        const acc_aux_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 3 * h * 2, 64);
-        const aux_tree_raw = try scratch_arena.allocAligned(@as(usize, max_m) * 3 * h * 2, 64);
-        const gqa_scratch_raw = if (num_gqa_layers > 0)
-            try scratch_arena.allocAligned(@as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (config.head_dim + 2) * 4, 64)
-        else
-            try scratch_arena.allocAligned(64, 64);
-
-        const moe_ws: ?moe.MoeWorkspace = if (config.axes.ffn_kind == .moe_swiglu)
-            try moe.MoeWorkspace.init(&scratch_arena, moe_ws_spec)
-        else
-            null;
+        const acc_top_raw = try scratch_arena.allocAligned(feat_cap * h * 2, 64);
+        const acc_aux_raw = try scratch_arena.allocAligned(feat_cap * 3 * h * 2, 64);
         const layer_sched_hdr_raw = try scratch_arena.allocAligned(@as(usize, config.num_hidden_layers) * 64, 64);
         @memset(layer_sched_hdr_raw, 0);
 
@@ -4506,13 +6365,30 @@ pub const GraphModel = struct {
                     else
                         null;
 
-                    const tk_r = try scratch_arena.allocAligned(@as(usize, max_m) * qk_d * 2, 64);
-                    const tv_r = try scratch_arena.allocAligned(@as(usize, max_m) * v_d * 2, 64);
-                    const tg_r = try scratch_arena.allocAligned(@as(usize, max_m) * config.linear_num_value_heads * 4, 64);
-                    const tb_r = try scratch_arena.allocAligned(@as(usize, max_m) * config.linear_num_value_heads * 4, 64);
-                    const tqr_r = try scratch_arena.allocAligned(@as(usize, max_m) * qk_d * 2, 64);
-                    const tkr_r = try scratch_arena.allocAligned(@as(usize, max_m) * qk_d * 2, 64);
-                    const tvr_r = try scratch_arena.allocAligned(@as(usize, max_m) * v_d * 2, 64);
+                    const tk_r = try tr_arena.allocAligned(@as(usize, max_m) * qk_d * 2, 64);
+                    const tv_r = try tr_arena.allocAligned(@as(usize, max_m) * v_d * 2, 64);
+                    const tg_r = try tr_arena.allocAligned(@as(usize, max_m) * config.linear_num_value_heads * 4, 64);
+                    const tb_r = try tr_arena.allocAligned(@as(usize, max_m) * config.linear_num_value_heads * 4, 64);
+                    const tqr_r = try tr_arena.allocAligned(@as(usize, max_m) * qk_d * 2, 64);
+                    const tkr_r = try tr_arena.allocAligned(@as(usize, max_m) * qk_d * 2, 64);
+                    const tvr_r = try tr_arena.allocAligned(@as(usize, max_m) * v_d * 2, 64);
+                    var wp_k_off: u64 = 0;
+                    var wp_v_off: u64 = 0;
+                    var wp_g_off: u64 = 0;
+                    var wp_beta_off: u64 = 0;
+                    var wp_q_raw_off: u64 = 0;
+                    if (wide_enabled and multi_loop) {
+                        const wk_r = try wp_arena.allocAligned(w_cap * qk_d * 2, 64);
+                        const wv_r = try wp_arena.allocAligned(w_cap * v_d * 2, 64);
+                        const wg_r = try wp_arena.allocAligned(w_cap * config.linear_num_value_heads * 4, 64);
+                        const wb_r = try wp_arena.allocAligned(w_cap * config.linear_num_value_heads * 4, 64);
+                        const wqr_r = try wp_arena.allocAligned(w_cap * qk_d * 2, 64);
+                        wp_k_off = scratch_arena.offsetOf(wk_r.ptr);
+                        wp_v_off = scratch_arena.offsetOf(wv_r.ptr);
+                        wp_g_off = scratch_arena.offsetOf(wg_r.ptr);
+                        wp_beta_off = scratch_arena.offsetOf(wb_r.ptr);
+                        wp_q_raw_off = scratch_arena.offsetOf(wqr_r.ptr);
+                    }
                     const conv_hist = if (conv_k > 1) conv_k - 1 else 1;
                     const conv_d = 2 * qk_d + v_d;
                     const cs_r = try scratch_arena.allocAligned(@as(usize, conv_hist) * conv_d * 2, 64);
@@ -4545,6 +6421,11 @@ pub const GraphModel = struct {
                         .tree_v_raw_off = scratch_arena.offsetOf(tvr_r.ptr),
                         .conv_state_off = scratch_arena.offsetOf(cs_r.ptr),
                         .conv_state_tmp_off = scratch_arena.offsetOf(cst_r.ptr),
+                        .wp_k_off = wp_k_off,
+                        .wp_v_off = wp_v_off,
+                        .wp_g_off = wp_g_off,
+                        .wp_beta_off = wp_beta_off,
+                        .wp_q_raw_off = wp_q_raw_off,
                     } };
                     gdn_cursor += 1;
                     layer_attn_bytes = q_p.alg_bytes + k_p.alg_bytes + v_p.alg_bytes + g_p.alg_bytes + o_p.alg_bytes;
@@ -4609,15 +6490,31 @@ pub const GraphModel = struct {
                         qsa_ret_host = @alignCast(std.mem.bytesAsSlice(u32, r_raw[0 .. @as(usize, max_retired_per_layer) * @sizeOf(u32)]));
                     }
 
-                    const idx_buf = try hybrid.QsaIndexBuffer.init(&scratch_arena, .{
+                    const idx_buf = try hybrid.QsaIndexBuffer.init(tr_arena, .{
                         .max_nodes = max_m,
                         .num_kv_heads = config.num_key_value_heads,
                         .top_k_blocks = config.qsa_top_k_blocks,
                     });
+                    const wp_idx_buf: ?hybrid.QsaIndexBuffer = if (wide_enabled)
+                        try hybrid.QsaIndexBuffer.init(wp_arena, .{
+                            .max_nodes = wide_prefill_max_tokens,
+                            .num_kv_heads = config.num_key_value_heads,
+                            .top_k_blocks = config.qsa_top_k_blocks,
+                        })
+                    else
+                        null;
+                    var qsa_wp_k_off: u64 = 0;
+                    var qsa_wp_v_off: u64 = 0;
+                    if (wide_enabled and qsa_ring_mode == .sliding_window_128 and multi_loop) {
+                        const qwk = try wp_arena.allocAligned(w_cap * config.kvDim() * 2, 64);
+                        const qwv = try wp_arena.allocAligned(w_cap * config.kvDim() * 2, 64);
+                        qsa_wp_k_off = scratch_arena.offsetOf(qwk.ptr);
+                        qsa_wp_v_off = scratch_arena.offsetOf(qwv.ptr);
+                    }
                     const bk_raw = try scratch_arena.allocAligned(@as(usize, config.num_key_value_heads) * qsa_max_blocks * config.head_dim * 2, 64);
                     @memset(bk_raw, 0);
-                    const tk_r = try scratch_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
-                    const tv_r = try scratch_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
+                    const tk_r = try tr_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
+                    const tv_r = try tr_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
 
                     attn_union = .{ .qsa = .{
                         .qsa_idx = qsa_cursor,
@@ -4630,10 +6527,13 @@ pub const GraphModel = struct {
                         .qk_norm_dtype = if (qn) |n| n.dtype else .bf16,
                         .kv_ring = kv_ring,
                         .index_buf = idx_buf,
+                        .wp_index_buf = wp_idx_buf,
                         .block_keys_off = scratch_arena.offsetOf(bk_raw.ptr),
                         .max_blocks = qsa_max_blocks,
                         .tree_k_off = scratch_arena.offsetOf(tk_r.ptr),
                         .tree_v_off = scratch_arena.offsetOf(tv_r.ptr),
+                        .wp_k_off = qsa_wp_k_off,
+                        .wp_v_off = qsa_wp_v_off,
                         .supports_retire_q8 = qsa_use_ret,
                         .full_tile_table_off = qsa_full_tbl_off,
                         .full_tile_table_host = qsa_full_tbl_host,
@@ -4690,8 +6590,8 @@ pub const GraphModel = struct {
                             @alignCast(std.mem.bytesAsSlice(u32, r_raw[0 .. @as(usize, max_retired_per_layer) * @sizeOf(u32)])),
                         };
                     } else .{ .{ .buffer = scratch_buf, .offset = 0 }, &.{} };
-                    const tk_r = try scratch_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
-                    const tv_r = try scratch_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
+                    const tk_r = try tr_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
+                    const tv_r = try tr_arena.allocAligned(@as(usize, max_m) * config.kvDim() * 2, 64);
 
                     attn_union = .{ .gqa = .{
                         .gqa_idx = gqa_cursor,
@@ -4875,12 +6775,13 @@ pub const GraphModel = struct {
             prt.store.deinit(allocator);
             allocator.destroy(prt);
         };
+        const ple_max_m: u32 = @max(max_m, wide_prefill_max_tokens);
         if (options.ple_paths.len > 0) {
             const prt = try allocator.create(PleRuntime);
             errdefer allocator.destroy(prt);
             var store = try ple_mod.PleStore.open(allocator, options.ple_paths, .{
                 .cache = .{
-                    .cache_pages = options.ple_cache_pages,
+                    .cache_pages = eff_ple_cache_pages,
                     .budget_override = wired_budget,
                 },
             });
@@ -4888,12 +6789,12 @@ pub const GraphModel = struct {
             var ple_scratch = try ple_mod.LoopPleScratch.init(
                 allocator,
                 @intCast(config.num_hidden_layers),
-                @intCast(max_m),
+                @intCast(ple_max_m),
                 h,
                 wired_budget,
             );
             errdefer ple_scratch.deinit(allocator);
-            const f32_tmp = try allocator.alloc(f32, @as(usize, max_m) * h);
+            const f32_tmp = try allocator.alloc(f32, @as(usize, ple_max_m) * h);
             errdefer allocator.free(f32_tmp);
             total_wired_bytes += store.totalWiredBytes() + ple_scratch.totalWiredBytes();
             prt.* = .{ .store = store, .scratch = ple_scratch, .f32_tmp = f32_tmp };
@@ -4921,11 +6822,11 @@ pub const GraphModel = struct {
             );
         }
 
-        const token_history = try allocator.alloc(u32, options.max_seq_len + max_m);
+        const token_history = try allocator.alloc(u32, options.max_seq_len + @max(max_m, wide_prefill_max_tokens));
         errdefer allocator.free(token_history);
         @memset(token_history, 0);
 
-        const ple_row_indices_host = try allocator.alloc(u64, max_m);
+        const ple_row_indices_host = try allocator.alloc(u64, ple_max_m);
         errdefer allocator.free(ple_row_indices_host);
         @memset(ple_row_indices_host, 0);
 
@@ -4982,8 +6883,8 @@ pub const GraphModel = struct {
             .positions_host = @alignCast(std.mem.bytesAsSlice(u32, pos_raw[0 .. @as(usize, max_m) * 4])),
             .pos3d_host = @alignCast(std.mem.bytesAsSlice(hybrid.Pos3D, pos3d_raw[0 .. @as(usize, max_m) * @sizeOf(hybrid.Pos3D)])),
             .ancestor_masks_host = @alignCast(std.mem.bytesAsSlice(u64, msk_raw[0 .. @as(usize, max_m) * 8])),
-            .out_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, out_tok_raw[0 .. @as(usize, max_m) * 4])),
-            .logits_host = @alignCast(std.mem.bytesAsSlice(f16, logits_raw[0 .. @as(usize, max_m) * config.vocab_size * 2])),
+            .out_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, out_tok_raw[0 .. logits_cap * 4])),
+            .logits_host = @alignCast(std.mem.bytesAsSlice(f16, logits_raw[0 .. logits_cap * config.vocab_size * 2])),
             .topk_host = @alignCast(std.mem.bytesAsSlice(moe.TopKCandidate, topk_raw[0 .. @as(usize, max_m) * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate)])),
             .ple_row_indices_host = ple_row_indices_host,
             .ple_f16_host = @alignCast(std.mem.bytesAsSlice(f16, ple_f16_raw[0 .. @as(usize, config.num_hidden_layers) * max_m * h * 2])),
@@ -4997,8 +6898,8 @@ pub const GraphModel = struct {
             .dense_gate_host = @alignCast(std.mem.bytesAsSlice(f16, dgate_raw[0 .. @as(usize, max_m) * max_inter * 2])),
             .dense_up_host = @alignCast(std.mem.bytesAsSlice(f16, dup_raw[0 .. @as(usize, max_m) * max_inter * 2])),
             .dense_act_host = @alignCast(std.mem.bytesAsSlice(f16, dact_raw[0 .. @as(usize, max_m) * max_inter * 2])),
-            .accepted_top_host = @alignCast(std.mem.bytesAsSlice(f16, acc_top_raw[0 .. @as(usize, max_m) * h * 2])),
-            .accepted_aux_host = @alignCast(std.mem.bytesAsSlice(f16, acc_aux_raw[0 .. @as(usize, max_m) * 3 * h * 2])),
+            .accepted_top_host = @alignCast(std.mem.bytesAsSlice(f16, acc_top_raw[0 .. feat_cap * h * 2])),
+            .accepted_aux_host = @alignCast(std.mem.bytesAsSlice(f16, acc_aux_raw[0 .. feat_cap * 3 * h * 2])),
             .token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tok_raw.ptr) },
             .positions_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(pos_raw.ptr) },
             .pos3d_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(pos3d_raw.ptr) },
@@ -5055,6 +6956,42 @@ pub const GraphModel = struct {
             .retired_kv_pool = retired_kv_pool,
             .active_tile_phys_ring = active_tile_phys_ring,
             .mrope_next_pos = 0,
+            .gpu_prefill_mode = options.gpu_prefill_mode,
+            .wide_prefill_max_tokens = wide_prefill_max_tokens,
+            .supports_wide_prefill = supports_wide_prefill,
+            .compute_all_logits = options.compute_all_logits,
+            .enable_prompt_tail_pruning = options.enable_prompt_tail_pruning,
+            .canary_result = canary_result,
+            .live_admission = live_admission,
+            .aliased_scratch_saved_bytes = aliased_scratch_saved_bytes,
+            .wp_token_ids_host = wp_token_ids_host,
+            .wp_pos3d_host = wp_pos3d_host,
+            .wp_ple_f16_host = wp_ple_f16_host,
+            .wp_token_ids_bind = wp_token_ids_bind,
+            .wp_pos3d_bind = wp_pos3d_bind,
+            .wp_ple_f16_base_off = wp_ple_f16_base_off,
+            .wp_gr_arena = wp_gr_arena,
+            .wp_gr_g_read_bind = wp_gr_g_read_bind,
+            .wp_gr_g_write_bind = wp_gr_g_write_bind,
+            .wp_gr_decay_bind = wp_gr_decay_bind,
+            .wp_x_bind = wp_x_bind,
+            .wp_x_init_bind = wp_x_init_bind,
+            .wp_x_norm_bind = wp_x_norm_bind,
+            .wp_q_bind = wp_q_bind,
+            .wp_k_bind = wp_k_bind,
+            .wp_v_bind = wp_v_bind,
+            .wp_q_conv_bind = wp_q_conv_bind,
+            .wp_k_conv_bind = wp_k_conv_bind,
+            .wp_v_conv_bind = wp_v_conv_bind,
+            .wp_gdn_z_bind = wp_gdn_z_bind,
+            .wp_gdn_g_bind = wp_gdn_g_bind,
+            .wp_gdn_beta_bind = wp_gdn_beta_bind,
+            .wp_attn_out_bind = wp_attn_out_bind,
+            .wp_proj_out_bind = wp_proj_out_bind,
+            .wp_dense_gate_bind = wp_dense_gate_bind,
+            .wp_dense_up_bind = wp_dense_up_bind,
+            .wp_dense_act_bind = wp_dense_act_bind,
+            .wp_moe_ws = wp_moe_ws,
         };
     }
 };
@@ -5068,6 +7005,14 @@ pub const GraphBatchConfig = struct {
     prefix_cache_chunks: u32 = 0,
     kv_pool_chunk_groups: u32 = 0,
     budget_override: ?budget_mod.Budget = null,
+    /// M6.8 (`G15`): GPU prefill mode (`null` inherits `model.gpu_prefill_mode`, default `.wide`).
+    gpu_prefill_mode: ?qwen3.GpuPrefillMode = null,
+    /// M6.8 (`P1-B`): Reject startup if required wired bytes exceed live zero-swap RAM minus margin.
+    strict_live_ram: bool = false,
+    /// M6.8 (`P1-B`): Safety margin held back from live zero-swap reclaimable RAM (default 512 MiB).
+    live_safety_margin_bytes: u64 = budget_mod.DEFAULT_LIVE_SAFETY_MARGIN_BYTES,
+    /// Optional synthetic live zero-swap RAM override for deterministic tests.
+    live_reclaimable_override: ?u64 = null,
 };
 
 pub const GraphBatchStats = struct {
@@ -5081,10 +7026,13 @@ pub const GraphBatchStats = struct {
     prefix_hits: u64,
     prefix_hit_tokens: u64,
     prefix_cow_copies: u64,
+    boundary_hits: u64,
+    evict_first_evictions: u64,
     gdn_snapshot_clones: u64,
     decode_batch_steps: u64,
     decode_batch_tokens: u64,
     total_wired_bytes: u64,
+    live_admission: budget_mod.LiveAdmissionPlan,
 };
 
 pub const GraphBatchError = error{
@@ -5092,7 +7040,7 @@ pub const GraphBatchError = error{
     TreeNotEnabled,
     BudgetExceeded,
     OutOfMemory,
-} || sysinfo.Error || budget_mod.PlanError || arena_mod.WiredArena.InitError ||
+} || sysinfo.Error || vmstat.Error || budget_mod.PlanError || arena_mod.WiredArena.InitError ||
     arena_mod.WiredArena.AllocError || metal.WrapError || metal.Error ||
     hybrid.ArenaError || hybrid.GdnSnapshotPoolError || prefix_cache_mod.Error;
 
@@ -5176,7 +7124,9 @@ pub const GraphBatchRuntime = struct {
     scratch_evicted_handles: []prefix_cache_mod.KvBlockHandle,
     p_res: []f32,
 
-    // Telemetry
+    // Telemetry & M6.8 state
+    gpu_prefill_mode: qwen3.GpuPrefillMode,
+    live_admission: budget_mod.LiveAdmissionPlan,
     prefix_hits: u64 = 0,
     prefix_hit_tokens: u64 = 0,
     prefix_cow_copies: u64 = 0,
@@ -5196,6 +7146,7 @@ pub const GraphBatchRuntime = struct {
         if (model.max_tree_nodes < needed_tree) {
             return error.TreeNotEnabled;
         }
+        const eff_gpu_prefill_mode: qwen3.GpuPrefillMode = cfg.gpu_prefill_mode orelse model.gpu_prefill_mode;
 
         const n_layers = model.layers.len;
         const layer_to_kv_idx = try allocator.alloc(u32, n_layers);
@@ -5262,22 +7213,6 @@ pub const GraphBatchRuntime = struct {
         const gdn_conv_layer_stride_bytes: usize = gdn_conv_slot_stride_bytes * cfg.max_slots;
         const gdn_conv_pool_bytes: usize = @as(usize, num_gdn_layers) * gdn_conv_layer_stride_bytes;
 
-        const use_gdn_snap = (num_gdn_layers > 0 and cfg.prefix_cache_chunks > 0);
-        const gdn_snap_spec: hybrid.GdnSnapshotPoolSpec = .{
-            .state = .{
-                .num_gdn_layers = if (num_gdn_layers > 0) num_gdn_layers else 1,
-                .num_v_heads = if (num_gdn_layers > 0) model.config.linear_num_value_heads else 1,
-                .head_k_dim = if (num_gdn_layers > 0) model.config.linear_key_head_dim else 64,
-                .head_v_dim = if (num_gdn_layers > 0) model.config.linear_value_head_dim else 64,
-            },
-            .conv_f16_per_layer = gdn_conv_f16_per_layer,
-            .max_snapshots = if (use_gdn_snap) cfg.prefix_cache_chunks else 1,
-        };
-        const gdn_snap_bytes: usize = if (use_gdn_snap)
-            try hybrid.GdnSnapshotPool.requiredArenaBytes(gdn_snap_spec)
-        else
-            0;
-
         const kv_tiles_layer_stride_bytes: usize = if (num_kv_layers > 0)
             amf.align64(@as(usize, cfg.max_slots) * @as(usize, max_chunks) * @sizeOf(attention.KvTilePair))
         else
@@ -5303,17 +7238,113 @@ pub const GraphBatchRuntime = struct {
             0;
         const qsa_block_keys_layer_stride_bytes: usize = qsa_block_keys_slot_stride_bytes * cfg.max_slots;
         const qsa_block_keys_total_bytes: usize = @as(usize, num_qsa_layers) * qsa_block_keys_layer_stride_bytes;
+        const prompt_hist_bytes: usize = amf.align64(@as(usize, cfg.max_slots) * model.max_seq_len * @sizeOf(u32));
+
+        // P1-B (`R9`, ADR-0020): Evaluate required runtime bytes vs live non-anonymous Mach RAM
+        // and softly auto-scale optional `PrefixCache` + `GdnSnapshotPool` entries if tighter.
+        const kv_tile_rows: u32 = model.config.num_key_value_heads * kv_chunk_tokens;
+        const bytes_per_group: u64 = if (num_kv_layers > 0) blk: {
+            const tile_bytes: u64 = try page.alignUp(@as(usize, kv_tile_rows) * model.config.head_dim * @sizeOf(f16));
+            break :blk @as(u64, num_kv_layers) * 2 * tile_bytes;
+        } else 0;
+        const base_arena_raw: usize =
+            gdn_pool_bytes +
+            gdn_conv_pool_bytes +
+            amf.align64(@as(usize, cfg.max_slots) * @sizeOf(u32)) +
+            @as(usize, num_kv_layers) * kv_tiles_layer_stride_bytes +
+            @as(usize, num_gqa_layers) * write_slots_layer_stride_bytes +
+            @as(usize, num_gqa_layers) * gqa_descs_layer_stride_bytes +
+            gqa_batch_bytes +
+            qsa_block_keys_total_bytes +
+            prompt_hist_bytes +
+            16 * page.APPLE_PAGE_SIZE;
+        const base_arena_bytes: u64 = try page.alignUp(base_arena_raw);
+        const min_req_groups: u32 = if (num_kv_layers > 0)
+            (if (cfg.kv_pool_chunk_groups > 0) cfg.kv_pool_chunk_groups else cfg.max_slots)
+        else
+            0;
+        const required_runtime_bytes: u64 = base_arena_bytes + @as(u64, min_req_groups) * bytes_per_group;
+
+        const req_use_gdn_snap = (num_gdn_layers > 0 and cfg.prefix_cache_chunks > 0);
+        const req_gdn_snap_bytes: u64 = if (req_use_gdn_snap)
+            try hybrid.GdnSnapshotPool.requiredArenaBytes(.{
+                .state = .{
+                    .num_gdn_layers = num_gdn_layers,
+                    .num_v_heads = model.config.linear_num_value_heads,
+                    .head_k_dim = model.config.linear_key_head_dim,
+                    .head_v_dim = model.config.linear_value_head_dim,
+                },
+                .conv_f16_per_layer = gdn_conv_f16_per_layer,
+                .max_snapshots = cfg.prefix_cache_chunks,
+            })
+        else
+            0;
+        const req_pc_meta_bytes: u64 = if (cfg.prefix_cache_chunks > 0)
+            try prefix_cache_mod.PrefixCache.requiredBytes(.{
+                .max_entries = cfg.prefix_cache_chunks,
+                .block_tokens = kv_chunk_tokens,
+                .num_kv_layers = @max(num_kv_layers, 1),
+            })
+        else
+            0;
+        const optional_pc_bytes: u64 = if (cfg.prefix_cache_chunks > 0)
+            req_gdn_snap_bytes + req_pc_meta_bytes + @as(u64, cfg.prefix_cache_chunks) * bytes_per_group
+        else
+            0;
+
+        if (model.totalWiredBytes() > wired_budget.limit_bytes) return error.BudgetExceeded;
+        const rem_limit_raw: u64 = wired_budget.limit_bytes - model.totalWiredBytes();
+        const rem_budget: budget_mod.Budget = .{
+            .limit_bytes = rem_limit_raw - (rem_limit_raw % page.APPLE_PAGE_SIZE),
+            .binding_limit = wired_budget.binding_limit,
+            .raw_limit_bytes = rem_limit_raw,
+        };
+        const live_reclaimable_bytes: u64 = cfg.live_reclaimable_override orelse
+            (try vmstat.Snapshot.capture()).liveZeroSwapReclaimableBytes();
+        const live_admission = try rem_budget.planWithLiveRam(
+            required_runtime_bytes,
+            optional_pc_bytes,
+            live_reclaimable_bytes,
+            .{
+                .live_safety_margin_bytes = cfg.live_safety_margin_bytes,
+                .strict_live_ram = cfg.strict_live_ram,
+            },
+        );
+        const eff_prefix_cache_chunks: u32 = if (cfg.prefix_cache_chunks > 0 and live_admission.cache_scaled_down) blk: {
+            const unit_bytes: usize = @intCast(@max(@as(u64, 1), optional_pc_bytes / cfg.prefix_cache_chunks));
+            break :blk @intCast(budget_mod.scaleOptionalCount(
+                cfg.prefix_cache_chunks,
+                unit_bytes,
+                live_admission.granted_optional_cache_bytes,
+                0,
+            ));
+        } else cfg.prefix_cache_chunks;
+
+        const use_gdn_snap = (num_gdn_layers > 0 and eff_prefix_cache_chunks > 0);
+        const gdn_snap_spec: hybrid.GdnSnapshotPoolSpec = .{
+            .state = .{
+                .num_gdn_layers = if (num_gdn_layers > 0) num_gdn_layers else 1,
+                .num_v_heads = if (num_gdn_layers > 0) model.config.linear_num_value_heads else 1,
+                .head_k_dim = if (num_gdn_layers > 0) model.config.linear_key_head_dim else 64,
+                .head_v_dim = if (num_gdn_layers > 0) model.config.linear_value_head_dim else 64,
+            },
+            .conv_f16_per_layer = gdn_conv_f16_per_layer,
+            .max_snapshots = if (use_gdn_snap) eff_prefix_cache_chunks else 1,
+        };
+        const gdn_snap_bytes: usize = if (use_gdn_snap)
+            try hybrid.GdnSnapshotPool.requiredArenaBytes(gdn_snap_spec)
+        else
+            0;
 
         const pc_spec: prefix_cache_mod.PrefixCacheSpec = .{
-            .max_entries = if (cfg.prefix_cache_chunks > 0) cfg.prefix_cache_chunks else 1,
+            .max_entries = if (eff_prefix_cache_chunks > 0) eff_prefix_cache_chunks else 1,
             .block_tokens = kv_chunk_tokens,
             .num_kv_layers = @max(num_kv_layers, 1),
         };
-        const pc_bytes: usize = if (cfg.prefix_cache_chunks > 0)
+        const pc_bytes: usize = if (eff_prefix_cache_chunks > 0)
             try prefix_cache_mod.PrefixCache.requiredBytes(pc_spec)
         else
             0;
-        const prompt_hist_bytes: usize = amf.align64(@as(usize, cfg.max_slots) * model.max_seq_len * @sizeOf(u32));
 
         const arena_raw: usize =
             gdn_snap_bytes +
@@ -5333,14 +7364,11 @@ pub const GraphBatchRuntime = struct {
         // Size shared IOSurface chunk group pool when KV layers exist.
         var pool_chunk_groups: u32 = 0;
         var pool_kv_bytes: u64 = 0;
-        const kv_tile_rows: u32 = model.config.num_key_value_heads * kv_chunk_tokens;
         if (num_kv_layers > 0) {
-            const tile_bytes: u64 = try page.alignUp(@as(usize, kv_tile_rows) * model.config.head_dim * @sizeOf(f16));
-            const bytes_per_group: u64 = @as(u64, num_kv_layers) * 2 * tile_bytes;
             const desired_groups: u32 = if (cfg.kv_pool_chunk_groups > 0)
                 cfg.kv_pool_chunk_groups
             else
-                cfg.max_slots * max_chunks + cfg.prefix_cache_chunks;
+                cfg.max_slots * max_chunks + eff_prefix_cache_chunks;
             const base_used: u64 = model.totalWiredBytes() + batch_arena_bytes;
             if (base_used + @as(u64, cfg.max_slots) * bytes_per_group > wired_budget.limit_bytes) {
                 return error.BudgetExceeded;
@@ -5368,7 +7396,7 @@ pub const GraphBatchRuntime = struct {
             try hybrid.GdnSnapshotPool.init(&batch_arena, gdn_snap_spec)
         else
             null;
-        const prefix_cache: ?prefix_cache_mod.PrefixCache = if (cfg.prefix_cache_chunks > 0)
+        const prefix_cache: ?prefix_cache_mod.PrefixCache = if (eff_prefix_cache_chunks > 0)
             try prefix_cache_mod.PrefixCache.init(&batch_arena, pc_spec)
         else
             null;
@@ -5540,6 +7568,8 @@ pub const GraphBatchRuntime = struct {
             .scratch_handles = scratch_handles,
             .scratch_evicted_handles = scratch_evicted_handles,
             .p_res = p_res,
+            .gpu_prefill_mode = eff_gpu_prefill_mode,
+            .live_admission = live_admission,
         };
     }
 
@@ -5578,6 +7608,8 @@ pub const GraphBatchRuntime = struct {
         const pc_cap: u32 = if (self.prefix_cache) |pc| pc.spec.max_entries else 0;
         const pc_live: u32 = if (self.prefix_cache) |pc| pc.liveEntries() else 0;
         const pc_pinned: u32 = if (self.prefix_cache) |pc| pc.pinnedEntries() else 0;
+        const b_hits: u64 = if (self.prefix_cache) |pc| pc.boundary_hits else 0;
+        const ef_evicts: u64 = if (self.prefix_cache) |pc| pc.evict_first_evictions else 0;
         const gdn_act: u32 = if (self.gdn_snapshot_pool) |sp| sp.activeCount() else 0;
         return .{
             .max_slots = self.max_slots,
@@ -5590,10 +7622,13 @@ pub const GraphBatchRuntime = struct {
             .prefix_hits = self.prefix_hits,
             .prefix_hit_tokens = self.prefix_hit_tokens,
             .prefix_cow_copies = self.prefix_cow_copies,
+            .boundary_hits = b_hits,
+            .evict_first_evictions = ef_evicts,
             .gdn_snapshot_clones = self.gdn_snapshot_clones,
             .decode_batch_steps = self.decode_batch_steps,
             .decode_batch_tokens = self.decode_batch_tokens,
             .total_wired_bytes = self.total_wired_bytes,
+            .live_admission = self.live_admission,
         };
     }
 
@@ -6021,7 +8056,12 @@ pub const GraphBatchRuntime = struct {
         return .{ .matched_tokens = final_matched, .prefix_handle = handle };
     }
 
-    fn populatePrefixCache(self: *GraphBatchRuntime, slot_id: u32, is_final_chunk: bool) void {
+    fn populatePrefixCache(
+        self: *GraphBatchRuntime,
+        slot_id: u32,
+        is_final_chunk: bool,
+        is_boundary_checkpoint: bool,
+    ) void {
         var pc = &(self.prefix_cache orelse return);
         const slot = &self.slots[slot_id];
         const bs = self.kv_chunk_tokens;
@@ -6097,8 +8137,10 @@ pub const GraphBatchRuntime = struct {
             slot.prefix_cached_full_chunks += 1;
         }
 
-        // Snapshot final prompt tail (`1..bs-1`) with optional GDN checkpoint for exact reuse!
-        if (is_final_chunk) {
+        // Snapshot partial tail (`1..bs-1`) with optional GDN checkpoint when either
+        // the prompt completes OR a ChatML message-boundary checkpoint (`C15`, ADR-0020)
+        // lands mid-tile (`insertBoundaryCheckpoint` marks intra-tile checkpoints `evict_first = true`).
+        if (is_final_chunk or is_boundary_checkpoint) {
             const tail_len = slot.seq_len % bs;
             const tail_c = slot.seq_len / bs;
             if (tail_len > 0 and tail_c < self.max_chunks and !slot.chunk_is_shared[tail_c]) {
@@ -6138,17 +8180,32 @@ pub const GraphBatchRuntime = struct {
                 }
 
                 const tok_start: usize = @as(usize, tail_c) * bs;
-                if (pc.insertTailBlock(
-                    slot.last_cached_parent_id,
-                    slot.prompt_tokens[tok_start .. tok_start + tail_len],
-                    self.scratch_handles,
-                    .{
-                        .gdn_snapshot_id = snap_id,
-                        .evict_if_full = true,
-                        .evicted_handles_out = self.scratch_evicted_handles,
-                        .pin_on_insert = false,
-                    },
-                )) |ins| {
+                const ins_res = if (is_boundary_checkpoint)
+                    pc.insertBoundaryCheckpoint(
+                        slot.last_cached_parent_id,
+                        slot.prompt_tokens[tok_start .. tok_start + tail_len],
+                        self.scratch_handles,
+                        .{
+                            .gdn_snapshot_id = snap_id,
+                            .evict_if_full = true,
+                            .evicted_handles_out = self.scratch_evicted_handles,
+                            .pin_on_insert = false,
+                            .evict_first = true,
+                        },
+                    )
+                else
+                    pc.insertTailBlock(
+                        slot.last_cached_parent_id,
+                        slot.prompt_tokens[tok_start .. tok_start + tail_len],
+                        self.scratch_handles,
+                        .{
+                            .gdn_snapshot_id = snap_id,
+                            .evict_if_full = true,
+                            .evicted_handles_out = self.scratch_evicted_handles,
+                            .pin_on_insert = false,
+                        },
+                    );
+                if (ins_res) |ins| {
                     if (ins.evicted) |ev| self.reclaimEvicted(ev, self.scratch_evicted_handles);
                     if (ins.already_existed) {
                         self.releaseChunkGroup(snap_g);
@@ -6160,6 +8217,692 @@ pub const GraphBatchRuntime = struct {
                 }
             }
         }
+    }
+
+    fn runSlotPrefillWideChunk(
+        self: *GraphBatchRuntime,
+        slot_id: u32,
+        tokens: []const u32,
+        base_pos: u32,
+        is_final_chunk: bool,
+        compute_logits: bool,
+    ) GraphStepError!u32 {
+        const model = self.model;
+        const slot = &self.slots[slot_id];
+        const m: u32 = @intCast(tokens.len);
+        const h = model.config.hidden_size;
+        const w_stride = model.wide_prefill_max_tokens;
+        const kv_len_after: u32 = base_pos + m;
+
+        for (0..m) |i| {
+            model.wp_token_ids_host[i] = tokens[i];
+            model.wp_pos3d_host[i] = hybrid.Pos3D.text(base_pos + @as(u32, @intCast(i)));
+        }
+        if (self.num_kv_layers > 0) {
+            const c0: u32 = base_pos / self.kv_chunk_tokens;
+            const c1: u32 = (base_pos + m - 1) / self.kv_chunk_tokens;
+            var ci: u32 = c0;
+            while (ci <= c1) : (ci += 1) {
+                if (!self.ensureSlotWritableChunk(slot_id, ci)) return error.SequenceFull;
+            }
+        }
+
+        const last_l: usize = model.layers.len - 1;
+        const allow_tail_prune = model.enable_prompt_tail_pruning and !model.compute_all_logits;
+        const prune_non_final_last = allow_tail_prune and (!is_final_chunk or !compute_logits);
+        const prune_final_last_to_m1 = allow_tail_prune and is_final_chunk and compute_logits and (m > 1);
+
+        var frame = try model.compute.beginFrame(model.timeout_ms);
+        errdefer frame.abort();
+
+        try model.moe_pipes.encodeEmbedLookup(&frame, model.embed.dtype, .{
+            .weight = model.embed.weight,
+            .scale_bias = model.embed.scale_bias,
+            .tokens = .{ .token_ids = model.wp_token_ids_bind },
+            .out = model.wp_x_bind,
+            .m = m,
+            .vocab_size = model.config.vocab_size,
+            .hidden_size = h,
+        }, false);
+
+        if (model.wp_gr_arena) |*gr| {
+            try model.hybrid_pipes.encodeGrInitStream0(&frame, .{
+                .x0 = model.wp_x_bind,
+                .stream = gr.binding(model.scratch_buf),
+                .m = m,
+                .hidden_dim = h,
+                .branch_token_stride = w_stride,
+            }, true);
+        }
+
+        for (model.layers, 0..) |*layer, l| {
+            const is_last_layer = (l == last_l);
+            const skip_last_rest = is_last_layer and prune_non_final_last;
+            const tail_m1_last = is_last_layer and prune_final_last_to_m1;
+            const eff_m: u32 = if (tail_m1_last) 1 else m;
+
+            if (model.wp_gr_arena) |*gr| {
+                const grw = layer.gr.?;
+                try model.hybrid_pipes.encodeGrComputeGates(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .w_read = grw.read_gate,
+                    .w_write = grw.write_gate,
+                    .w_decay = grw.decay_gate,
+                    .g_read_out = model.wp_gr_g_read_bind,
+                    .g_write_out = model.wp_gr_g_write_bind,
+                    .decay_out = model.wp_gr_decay_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                    .weight_dtype = grw.dtype,
+                }, true);
+                try model.hybrid_pipes.encodeGrReadGate(&frame, .{
+                    .stream = gr.binding(model.scratch_buf),
+                    .g_read = model.wp_gr_g_read_bind,
+                    .x_in = model.wp_x_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                }, true);
+            }
+
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = model.wp_x_bind,
+                .w = layer.input_layernorm.binding,
+                .y = model.wp_x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true);
+
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = model.scratch_buf,
+                .offset = model.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            const last_x_norm_bind: metal.BufferBinding = .{
+                .buffer = model.scratch_buf,
+                .offset = model.wp_x_norm_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            const eff_x_bind: metal.BufferBinding = if (tail_m1_last) last_x_bind else model.wp_x_bind;
+
+            switch (layer.attn) {
+                .gdn => |g| {
+                    const qk_dim = model.config.gdnQkDim();
+                    const v_dim = model.config.gdnVDim();
+                    const need_q = (!skip_last_rest) or (g.conv1d_w != null);
+                    const q_eff_bind = if (g.conv1d_w != null) model.wp_q_conv_bind else model.wp_q_bind;
+                    const k_eff_bind = if (g.conv1d_w != null) model.wp_k_conv_bind else model.wp_k_bind;
+                    const v_eff_bind = if (g.conv1d_w != null) model.wp_v_conv_bind else model.wp_v_bind;
+
+                    if (need_q) {
+                        try model.encodeLinearGemmWithTile(&frame, g.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, g.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
+                    } else {
+                        try model.encodeLinearGemmWithTile(&frame, g.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                    }
+                    try model.encodeLinearGemmWithTile(&frame, g.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                    try model.hybrid_pipes.encodeGdnComputeGates(&frame, .{
+                        .x = model.wp_x_norm_bind,
+                        .w_a = g.a_proj,
+                        .w_b = g.b_proj,
+                        .a_log = g.a_log,
+                        .dt_bias = g.dt_bias,
+                        .g_out = model.wp_gdn_g_bind,
+                        .beta_out = model.wp_gdn_beta_bind,
+                        .m = m,
+                        .hidden_dim = h,
+                        .num_v_heads = model.config.linear_num_value_heads,
+                        .weight_dtype = g.ab_dtype,
+                    }, false);
+                    if (!skip_last_rest) {
+                        if (tail_m1_last) {
+                            const last_z: metal.BufferBinding = .{
+                                .buffer = model.scratch_buf,
+                                .offset = model.wp_gdn_z_bind.offset + @as(u64, m - 1) * v_dim * @sizeOf(f16),
+                            };
+                            try model.encodeLinearGemv(&frame, g.g_proj, last_x_norm_bind, last_z, false);
+                        } else {
+                            try model.encodeLinearGemmWithTile(&frame, g.g_proj, model.wp_x_norm_bind, model.wp_gdn_z_bind, m, true, false);
+                        }
+                    }
+
+                    if (g.conv1d_w) |cw| {
+                        const conv_bind = self.gdnSlotConvBinding(g.gdn_idx, slot_id);
+                        try model.hybrid_pipes.encodeGdnConv1dSilu(&frame, .{
+                            .q_in = model.wp_q_bind,
+                            .k_in = model.wp_k_bind,
+                            .v_in = model.wp_v_bind,
+                            .conv_w = cw,
+                            .conv_state_in = conv_bind,
+                            .conv_state_out = conv_bind,
+                            .q_out = q_eff_bind,
+                            .k_out = k_eff_bind,
+                            .v_out = v_eff_bind,
+                            .m = m,
+                            .gdn_qk = qk_dim,
+                            .gdn_v = v_dim,
+                            .conv_k = g.conv_k,
+                            .is_tree = false,
+                            .write_state = true,
+                        }, true);
+                    }
+
+                    const slot_s = self.gdnSlotStateBinding(g.gdn_idx, slot_id);
+                    try model.hybrid_pipes.encodeGdnPrefill(&frame, .{
+                        .q = q_eff_bind,
+                        .k = k_eff_bind,
+                        .v = v_eff_bind,
+                        .g = model.wp_gdn_g_bind,
+                        .beta = model.wp_gdn_beta_bind,
+                        .z = model.wp_gdn_z_bind,
+                        .norm_w = if (g.out_norm) |n| n.binding else null,
+                        .norm_dtype = if (g.out_norm) |n| n.dtype else .f16,
+                        .state_in = slot_s,
+                        .state_out = slot_s,
+                        .out = model.wp_attn_out_bind,
+                        .seq_len = m,
+                        .num_k_heads = model.config.linear_num_key_heads,
+                        .num_v_heads = model.config.linear_num_value_heads,
+                        .head_k_dim = model.config.linear_key_head_dim,
+                        .head_v_dim = model.config.linear_value_head_dim,
+                        .rms_eps = model.config.rms_norm_eps,
+                        .write_state_only = skip_last_rest,
+                        .out_start_token = if (tail_m1_last) m - 1 else 0,
+                    }, true);
+                    if (skip_last_rest) break;
+                    try model.encodeLinearGemmWithTile(&frame, g.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
+                },
+                .qsa => |*qsa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const kv_d = model.config.kvDim();
+                    const slot_kv_bind = self.slotKvTilesBinding(kv_idx, slot_id);
+                    const bk_bind = self.qsaSlotBlockKeysBinding(qsa.qsa_idx, slot_id);
+                    const mrope_rot: u32 = (model.config.mrope_section.section[0] + model.config.mrope_section.section[1] + model.config.mrope_section.section[2]) * 2;
+                    const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= model.config.head_dim) mrope_rot else model.config.head_dim;
+                    const blk_tok = model.config.qsa_block_size;
+
+                    if (skip_last_rest) {
+                        try model.encodeLinearGemmWithTile(&frame, qsa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, qsa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        try model.hybrid_pipes.encodeQsaPrefillRope(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = qsa.q_norm,
+                            .k_norm = qsa.k_norm,
+                            .norm_dtype = qsa.qk_norm_dtype,
+                            .positions_3d = model.wp_pos3d_bind,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .rotary_dim = eff_rot_dim,
+                            .start_pos = base_pos,
+                            .mrope = model.config.mrope_section,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = true,
+                            .write_to_tiles = true,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                        }, true);
+                        const start_blk = base_pos / blk_tok;
+                        const tot_blk = (kv_len_after + blk_tok - 1) / blk_tok;
+                        try model.hybrid_pipes.encodeQsaUpdateBlockSummary(&frame, .{
+                            .kv_tiles = slot_kv_bind,
+                            .block_keys = bk_bind,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .kv_len = kv_len_after,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .block_tokens = blk_tok,
+                            .start_block = start_blk,
+                            .num_blocks = if (tot_blk > start_blk) tot_blk - start_blk else 1,
+                        }, true);
+                        break;
+                    }
+
+                    if (tail_m1_last) {
+                        try model.encodeLinearGemmWithTile(&frame, qsa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, qsa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        try model.encodeLinearGemv(&frame, qsa.q_proj, last_x_norm_bind, model.wp_q_bind, false);
+                        try model.hybrid_pipes.encodeQsaPrefillRope(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = qsa.q_norm,
+                            .k_norm = qsa.k_norm,
+                            .norm_dtype = qsa.qk_norm_dtype,
+                            .positions_3d = model.wp_pos3d_bind,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m - 1,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .rotary_dim = eff_rot_dim,
+                            .start_pos = base_pos,
+                            .mrope = model.config.mrope_section,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = true,
+                            .write_to_tiles = true,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                        }, true);
+                        try model.hybrid_pipes.encodeQsaPrefillRope(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = .{ .buffer = model.scratch_buf, .offset = model.wp_k_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16) },
+                            .v = .{ .buffer = model.scratch_buf, .offset = model.wp_v_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16) },
+                            .q_norm = qsa.q_norm,
+                            .k_norm = qsa.k_norm,
+                            .norm_dtype = qsa.qk_norm_dtype,
+                            .positions_3d = .{ .buffer = model.scratch_buf, .offset = model.wp_pos3d_bind.offset + @as(u64, m - 1) * @sizeOf(hybrid.Pos3D) },
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = 1,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .rotary_dim = eff_rot_dim,
+                            .start_pos = base_pos + m - 1,
+                            .mrope = model.config.mrope_section,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = false,
+                            .write_to_tiles = true,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                        }, false);
+                    } else {
+                        try model.encodeLinearGemmWithTile(&frame, qsa.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, qsa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
+                        try model.encodeLinearGemmWithTile(&frame, qsa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        try model.hybrid_pipes.encodeQsaPrefillRope(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = qsa.q_norm,
+                            .k_norm = qsa.k_norm,
+                            .norm_dtype = qsa.qk_norm_dtype,
+                            .positions_3d = model.wp_pos3d_bind,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .rotary_dim = eff_rot_dim,
+                            .start_pos = base_pos,
+                            .mrope = model.config.mrope_section,
+                            .yarn = model.config.yarn,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = false,
+                            .write_to_tiles = true,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                        }, true);
+                    }
+
+                    const start_blk = base_pos / blk_tok;
+                    const tot_blk = (kv_len_after + blk_tok - 1) / blk_tok;
+                    try model.hybrid_pipes.encodeQsaUpdateBlockSummary(&frame, .{
+                        .kv_tiles = slot_kv_bind,
+                        .block_keys = bk_bind,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .kv_len = kv_len_after,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .block_tokens = blk_tok,
+                        .start_block = start_blk,
+                        .num_blocks = if (tot_blk > start_blk) tot_blk - start_blk else 1,
+                    }, true);
+                    try model.hybrid_pipes.encodeQsaAttention(&frame, .{
+                        .q = model.wp_q_bind,
+                        .kv_tiles = slot_kv_bind,
+                        .block_keys = bk_bind,
+                        .index_buf = &(qsa.wp_index_buf.?),
+                        .index_metal_buf = model.scratch_buf,
+                        .out = model.wp_attn_out_bind,
+                        .num_nodes = eff_m,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .kv_len = kv_len_after,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                        .block_tokens = blk_tok,
+                        .top_k_blocks = model.config.qsa_top_k_blocks,
+                        .reuse_block_indices = false,
+                        .causal_q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                    }, true);
+                    try model.encodeLinearGemmWithTile(&frame, qsa.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
+                },
+                .gqa => |gqa| {
+                    const kv_idx = self.layer_to_kv_idx[l];
+                    const kv_d = model.config.kvDim();
+                    const slot_kv_bind = self.slotKvTilesBinding(kv_idx, slot_id);
+                    if (skip_last_rest) {
+                        try model.encodeLinearGemmWithTile(&frame, gqa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, gqa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .start_pos = base_pos,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = true,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, true);
+                        break;
+                    }
+                    if (tail_m1_last) {
+                        try model.encodeLinearGemmWithTile(&frame, gqa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, gqa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        try model.encodeLinearGemv(&frame, gqa.q_proj, last_x_norm_bind, model.wp_q_bind, false);
+                        try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m - 1,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .start_pos = base_pos,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = true,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, true);
+                        try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = .{ .buffer = model.scratch_buf, .offset = model.wp_k_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16) },
+                            .v = .{ .buffer = model.scratch_buf, .offset = model.wp_v_bind.offset + @as(u64, m - 1) * kv_d * @sizeOf(f16) },
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = 1,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .start_pos = base_pos + m - 1,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = false,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, false);
+                    } else {
+                        try model.encodeLinearGemmWithTile(&frame, gqa.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(&frame, gqa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
+                        try model.encodeLinearGemmWithTile(&frame, gqa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                            .q = model.wp_q_bind,
+                            .k = model.wp_k_bind,
+                            .v = model.wp_v_bind,
+                            .q_norm = gqa.q_norm,
+                            .k_norm = gqa.k_norm,
+                            .kv_tiles = slot_kv_bind,
+                            .num_tokens = m,
+                            .num_q_heads = model.config.num_attention_heads,
+                            .num_kv_heads = model.config.num_key_value_heads,
+                            .head_dim = model.config.head_dim,
+                            .start_pos = base_pos,
+                            .chunk_tokens = self.kv_chunk_tokens,
+                            .kv_only = false,
+                            .rms_eps = model.config.rms_norm_eps,
+                            .rope_theta = model.config.rope_theta,
+                            .norm_dtype = gqa.qk_norm_dtype,
+                        }, true);
+                    }
+                    try model.attn_pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
+                        .q = model.wp_q_bind,
+                        .kv_tiles = slot_kv_bind,
+                        .out = model.wp_attn_out_bind,
+                        .num_q = eff_m,
+                        .q_start_pos = if (tail_m1_last) base_pos + m - 1 else base_pos,
+                        .kv_len = kv_len_after,
+                        .num_q_heads = model.config.num_attention_heads,
+                        .num_kv_heads = model.config.num_key_value_heads,
+                        .head_dim = model.config.head_dim,
+                        .chunk_tokens = self.kv_chunk_tokens,
+                    }, true);
+                    try model.encodeLinearGemmWithTile(&frame, gqa.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
+                },
+            }
+
+            if (model.wp_gr_arena) |*gr| {
+                const stream_eff: metal.BufferBinding = if (tail_m1_last)
+                    .{ .buffer = model.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
+                else
+                    gr.binding(model.scratch_buf);
+                const decay_eff: metal.BufferBinding = if (tail_m1_last)
+                    .{ .buffer = model.scratch_buf, .offset = model.wp_gr_decay_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                else
+                    model.wp_gr_decay_bind;
+                const gwrite_eff: metal.BufferBinding = if (tail_m1_last)
+                    .{ .buffer = model.scratch_buf, .offset = model.wp_gr_g_write_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                else
+                    model.wp_gr_g_write_bind;
+                const gread_eff: metal.BufferBinding = if (tail_m1_last)
+                    .{ .buffer = model.scratch_buf, .offset = model.wp_gr_g_read_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                else
+                    model.wp_gr_g_read_bind;
+                try model.hybrid_pipes.encodeGrWriteGate(&frame, .{
+                    .stream = stream_eff,
+                    .y_delta = model.wp_proj_out_bind,
+                    .decay = decay_eff,
+                    .g_write = gwrite_eff,
+                    .m = eff_m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                }, true);
+                try model.hybrid_pipes.encodeGrReadGate(&frame, .{
+                    .stream = stream_eff,
+                    .g_read = gread_eff,
+                    .x_in = eff_x_bind,
+                    .m = eff_m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                }, true);
+            } else {
+                try model.moe_pipes.encodeResidualAdd(&frame, .{
+                    .x = eff_x_bind,
+                    .delta = model.wp_proj_out_bind,
+                    .count = eff_m * h,
+                }, true);
+            }
+
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = eff_x_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = model.wp_x_norm_bind,
+                .num_rows = eff_m,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, true);
+
+            switch (model.config.axes.ffn_kind) {
+                .dense_swiglu => {
+                    try model.encodeLinearGemmWithTile(&frame, layer.dense_gate, model.wp_x_norm_bind, model.wp_dense_gate_bind, eff_m, true, true);
+                    try model.encodeLinearGemmWithTile(&frame, layer.dense_up, model.wp_x_norm_bind, model.wp_dense_up_bind, eff_m, true, false);
+                    try model.moe_pipes.encodeSiluMul(&frame, .{
+                        .gate = model.wp_dense_gate_bind,
+                        .up = model.wp_dense_up_bind,
+                        .out = model.wp_dense_act_bind,
+                        .count = eff_m * model.config.intermediate_size,
+                    }, true);
+                    try model.encodeLinearGemmWithTile(&frame, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, true, true);
+                    if (model.wp_gr_arena) |*gr| {
+                        const stream_eff: metal.BufferBinding = if (tail_m1_last)
+                            .{ .buffer = model.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
+                        else
+                            gr.binding(model.scratch_buf);
+                        const decay_eff: metal.BufferBinding = if (tail_m1_last)
+                            .{ .buffer = model.scratch_buf, .offset = model.wp_gr_decay_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                        else
+                            model.wp_gr_decay_bind;
+                        const gwrite_eff: metal.BufferBinding = if (tail_m1_last)
+                            .{ .buffer = model.scratch_buf, .offset = model.wp_gr_g_write_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                        else
+                            model.wp_gr_g_write_bind;
+                        try model.hybrid_pipes.encodeGrWriteGate(&frame, .{
+                            .stream = stream_eff,
+                            .y_delta = model.wp_proj_out_bind,
+                            .decay = decay_eff,
+                            .g_write = gwrite_eff,
+                            .m = eff_m,
+                            .hidden_dim = h,
+                            .branch_token_stride = w_stride,
+                        }, true);
+                    } else {
+                        try model.moe_pipes.encodeResidualAdd(&frame, .{
+                            .x = eff_x_bind,
+                            .delta = model.wp_proj_out_bind,
+                            .count = eff_m * h,
+                        }, true);
+                    }
+                },
+                .moe_swiglu => {
+                    const ws_ptr = &(model.wp_moe_ws.?);
+                    const router_src: moe.RouterSource = if (layer.router_quant_dtype) |rqd| .{
+                        .quant_weights = .{
+                            .qweight = layer.router_binding,
+                            .scale_bias = layer.router_scale_bias.?,
+                            .bits = switch (rqd) {
+                                .q2_affine => .q2,
+                                .q3_affine => .q3,
+                                .q4_affine => .q4,
+                                else => return error.InvalidBatchSize,
+                            },
+                        },
+                    } else .{
+                        .weights = .{
+                            .binding = layer.router_binding,
+                            .dtype = layer.router_dtype,
+                        },
+                    };
+                    const residual_bind: ?metal.BufferBinding = if (model.wp_gr_arena != null) null else eff_x_bind;
+                    const out_bind: metal.BufferBinding = if (model.wp_gr_arena != null) model.wp_proj_out_bind else eff_x_bind;
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = model.wp_x_norm_bind,
+                        .router = router_src,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = ws_ptr,
+                        .workspace_buf = model.scratch_buf,
+                        .residual = residual_bind,
+                        .out = out_bind,
+                        .m = eff_m,
+                        .num_experts = model.config.num_experts,
+                        .top_k = model.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = model.config.moe_intermediate_size,
+                        .norm_topk_prob = model.config.norm_topk_prob,
+                        .shared_expert = layer.shared_expert,
+                        .shared_weights_base = if (layer.shared_expert_buf) |sb| .{ .buffer = sb, .offset = 0 } else null,
+                        .shared_expert_dtype = layer.shared_expert_dtype,
+                        .shared_intermediate_size = model.config.shared_expert_intermediate_size,
+                        .shared_gate_weight = layer.shared_gate_weight,
+                        .shared_gate_dtype = layer.shared_gate_dtype,
+                    };
+                    if (layer.is_hetero_moe) {
+                        try model.moe_pipes.encodeMoELayerHetero(&frame, .{
+                            .base = moe_args,
+                            .expert_schemes = layer.expert_dtypes_binding.?,
+                            .scheme_counts = layer.expert_scheme_counts,
+                        }, true);
+                    } else {
+                        switch (layer.expert_weight_dtype) {
+                            .q2_affine => try model.moe_pipes.encodeMoELayer(&frame, .q2, moe_args, true),
+                            .q3_affine => try model.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
+                            .q4_affine => try model.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
+                            .f16 => try model.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
+                            .bf16 => try model.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
+                        }
+                    }
+                    if (model.wp_gr_arena) |*gr| {
+                        const stream_eff: metal.BufferBinding = if (tail_m1_last)
+                            .{ .buffer = model.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
+                        else
+                            gr.binding(model.scratch_buf);
+                        const decay_eff: metal.BufferBinding = if (tail_m1_last)
+                            .{ .buffer = model.scratch_buf, .offset = model.wp_gr_decay_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                        else
+                            model.wp_gr_decay_bind;
+                        const gwrite_eff: metal.BufferBinding = if (tail_m1_last)
+                            .{ .buffer = model.scratch_buf, .offset = model.wp_gr_g_write_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                        else
+                            model.wp_gr_g_write_bind;
+                        try model.hybrid_pipes.encodeGrWriteGate(&frame, .{
+                            .stream = stream_eff,
+                            .y_delta = model.wp_proj_out_bind,
+                            .decay = decay_eff,
+                            .g_write = gwrite_eff,
+                            .m = eff_m,
+                            .hidden_dim = h,
+                            .branch_token_stride = w_stride,
+                        }, true);
+                    }
+                },
+            }
+        }
+
+        if (compute_logits) {
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = model.scratch_buf,
+                .offset = model.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            if (model.wp_gr_arena) |*gr| {
+                const stream_last: metal.BufferBinding = .{
+                    .buffer = model.scratch_buf,
+                    .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16),
+                };
+                try model.hybrid_pipes.encodeGrCollapse(&frame, .{
+                    .stream = stream_last,
+                    .out = last_x_bind,
+                    .mode = .mean,
+                    .m = 1,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                }, true);
+            }
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = last_x_bind,
+                .w = model.final_norm.binding,
+                .y = model.wp_x_norm_bind,
+                .num_rows = 1,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = model.final_norm.dtype,
+            }, true);
+            try model.encodeLinearGemv(&frame, model.lm_head, model.wp_x_norm_bind, model.logits_bind, true);
+            try model.moe_pipes.encodeArgmaxRows(&frame, .{
+                .logits = model.logits_bind,
+                .out_token_ids = model.out_token_id_bind,
+                .num_rows = 1,
+                .vocab_size = model.config.vocab_size,
+                .logits_dtype = .f16,
+            }, true);
+        }
+
+        const sig = try frame.commit();
+        try model.compute.wait(sig, model.timeout_ms);
+        slot.seq_len = kv_len_after;
+        if (compute_logits) model.last_logits_row = 0;
+        return if (compute_logits) model.out_token_ids_host[0] else 0;
     }
 
     fn runSlotPrefillSubChunk(
@@ -6727,23 +9470,38 @@ pub const GraphBatchRuntime = struct {
         }
         @memcpy(slot.prompt_tokens[chunk.start_pos .. chunk.start_pos + chunk.tokens.len], chunk.tokens);
 
-        const sub_cap: usize = self.model.max_tree_nodes;
+        const use_wide = (self.gpu_prefill_mode == .wide and self.model.usesWideGpuPrefill() and self.model.effective_max_loops == 1);
+        const sub_cap: usize = if (use_wide) self.model.wide_prefill_max_tokens else self.model.max_tree_nodes;
         const bs: usize = self.kv_chunk_tokens;
         var off: usize = 0;
         var last_argmax: u32 = 0;
         while (off < chunk.tokens.len) {
             const sub_pos = chunk.start_pos + @as(u32, @intCast(off));
-            // Align sub-chunk end to full-block boundary so GDN snapshots land on exact block boundaries!
+            // Align sub-chunk end to full-block boundary when GDN + PrefixCache are active so GDN snapshots land on exact block boundaries!
             const to_boundary = bs - (@as(usize, sub_pos) % bs);
-            const take = @min(@min(sub_cap, chunk.tokens.len - off), to_boundary);
-            const is_last = (off + take == chunk.tokens.len) and chunk.is_final_chunk;
-            last_argmax = self.runSlotPrefillSubChunk(
-                chunk.slot_id,
-                chunk.tokens[off .. off + take],
-                sub_pos,
-                is_last,
-            ) catch return error.PrefillFailed;
-            self.populatePrefixCache(chunk.slot_id, is_last);
+            const take = if (self.num_gdn_layers > 0 and self.prefix_cache != null)
+                @min(@min(sub_cap, chunk.tokens.len - off), to_boundary)
+            else
+                @min(sub_cap, chunk.tokens.len - off);
+            const at_chunk_end = (off + take == chunk.tokens.len);
+            const is_last = at_chunk_end and chunk.is_final_chunk;
+            const is_boundary = at_chunk_end and chunk.is_message_boundary_checkpoint;
+            last_argmax = if (use_wide)
+                self.runSlotPrefillWideChunk(
+                    chunk.slot_id,
+                    chunk.tokens[off .. off + take],
+                    sub_pos,
+                    is_last,
+                    is_last,
+                ) catch return error.PrefillFailed
+            else
+                self.runSlotPrefillSubChunk(
+                    chunk.slot_id,
+                    chunk.tokens[off .. off + take],
+                    sub_pos,
+                    is_last,
+                ) catch return error.PrefillFailed;
+            self.populatePrefixCache(chunk.slot_id, is_last, is_boundary);
             off += take;
         }
 
@@ -8922,5 +11680,326 @@ test "M6.5 C14+R8 GraphBatchRuntime hybrid GDN+QSA+MoE continuous batching + Gdn
     try std.testing.expectEqualSlices(u32, &ref_out[2], &col.tokens[2]);
     const st = rt.stats();
     try std.testing.expect(st.gdn_snapshot_clones >= 3);
+    try std.testing.expectEqual(@as(u32, 0), st.prefix_cache_pinned_entries);
+}
+
+test "M6.8 G15+G16+R9 GraphModel wide prefill + tail pruning + 128-tok SWA wrap + LoopLM R=2 + aliasing + canary + live-RAM" {
+    const allocator = std.testing.allocator;
+
+    // 1a. Full-context hybrid 3:1 GDN+QSA+GR+MoE (`qsa_window_size = 0`, 150 tokens across 128+22 chunks):
+    // verifies `wide` + `P0-B1` pruning vs legacy `tree64` parity, `G16` canary, `P0-B2` scratch aliasing,
+    // `verifyTree` transition over aliased pages, and `P1-B` live RAM guard.
+    {
+        var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 1, 0, null);
+        defer bundle.deinit(allocator);
+        bundle.cfg.qsa_window_size = 0;
+        bundle.cfg.qsa_top_k_blocks = 8;
+
+        var tree_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .tree64,
+            .startup_canary = true,
+        });
+        defer tree_m.deinit(allocator);
+        try std.testing.expect(!tree_m.usesWideGpuPrefill());
+
+        var wide_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 128,
+            .alias_prefill_tree_scratch = true,
+            .enable_prompt_tail_pruning = true,
+            .startup_canary = true,
+        });
+        defer wide_m.deinit(allocator);
+        try std.testing.expect(wide_m.usesWideGpuPrefill());
+        try std.testing.expect(wide_m.canary_result != null);
+        try std.testing.expect(wide_m.canary_result.?.max_abs_err_f16 < 1.0e-2);
+        try std.testing.expect(wide_m.aliased_scratch_saved_bytes > 0);
+
+        var prompt: [150]u32 = undefined;
+        for (&prompt, 0..) |*t, i| t.* = @intCast((i * 13 + 7) % bundle.cfg.vocab_size);
+
+        const t0_tree = try tree_m.prefillChunk(&prompt, 0, true);
+        const t0_wide = try wide_m.prefillChunk(&prompt, 0, true);
+        const tl0 = tree_m.readLastLogitsF16();
+        const wl0 = wide_m.readLastLogitsF16();
+        var max_diff: f32 = 0.0;
+        for (tl0, wl0) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > max_diff) max_diff = d;
+        }
+        try std.testing.expect(max_diff < 5.0e-2);
+        try std.testing.expect(@abs(@as(f32, wl0[t0_wide]) - @as(f32, wl0[t0_tree])) <= max_diff * 2.0 + 1.0e-3);
+
+        // Also prove `P0-B1` tail pruning vs unpruned `wide` is tight (`< 5e-3`), and
+        // `P0-B2` aliased scratch (`alias_prefill_tree_scratch = true`) is bit-exact vs unaliased!
+        var wide_unaliased = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 128,
+            .alias_prefill_tree_scratch = false,
+            .enable_prompt_tail_pruning = false,
+            .startup_canary = false,
+        });
+        defer wide_unaliased.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), wide_unaliased.aliased_scratch_saved_bytes);
+        _ = try wide_unaliased.prefillChunk(&prompt, 0, true);
+        var prune_diff: f32 = 0.0;
+        for (wide_unaliased.readLastLogitsF16(), wl0) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > prune_diff) prune_diff = d;
+        }
+        try std.testing.expect(prune_diff < 5.0e-3);
+
+        // 3 decode steps fed identical tokens after wide prefill + `verifyTree` over `P0-B2` aliased scratch.
+        var cur = t0_wide;
+        for (0..3) |s| {
+            const pos: u32 = @intCast(prompt.len + s);
+            _ = try tree_m.stepDecode(cur, pos);
+            _ = try wide_unaliased.stepDecode(cur, pos);
+            cur = try wide_m.stepDecode(cur, pos);
+            var step_diff: f32 = 0.0;
+            for (tree_m.readLastLogitsF16(), wide_m.readLastLogitsF16()) |a, b| {
+                const d = @abs(@as(f32, a) - @as(f32, b));
+                if (d > step_diff) step_diff = d;
+            }
+            try std.testing.expect(step_diff < 5.0e-2);
+        }
+        const bp: u32 = @intCast(prompt.len + 3);
+        const ctoks = [_]u32{ cur, 5, 9 };
+        const cpos = [_]u32{ bp, bp + 1, bp + 2 };
+        const cmasks = [_]u64{ 0b001, 0b011, 0b111 };
+        const vru = try wide_unaliased.verifyTree(&ctoks, &cpos, &cmasks, bp);
+        const vrw = try wide_m.verifyTree(&ctoks, &cpos, &cmasks, bp);
+        var tree_diff: f32 = 0.0;
+        for (vru.logits_f16, vrw.logits_f16) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > tree_diff) tree_diff = d;
+        }
+        try std.testing.expect(tree_diff < 5.0e-3);
+        try std.testing.expectEqualSlices(u32, vru.argmax_tokens, vrw.argmax_tokens);
+
+        // `P1-B` live RAM guard check.
+        try std.testing.expectError(
+            error.ExceedsLiveZeroSwapRam,
+            GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+                .max_seq_len = 64,
+                .strict_live_ram = true,
+                .live_reclaimable_override = 16384,
+            }),
+        );
+    }
+
+    // 1b. Circular 128-tok SWA wrap (`150` tokens > `128` ring capacity):
+    // proves 2-chunk (`128 + 22`) pruned wide prefill matches single-shot unpruned `150`-tok wide SWA
+    // with zero ring overwrite and identical post-wrap decode continuation!
+    {
+        var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 1, 0, null);
+        defer bundle.deinit(allocator);
+        bundle.cfg.qsa_window_size = hybrid.QSA_SWA_WINDOW_TOKENS;
+
+        var single_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 256,
+            .enable_prompt_tail_pruning = false,
+            .startup_canary = false,
+        });
+        defer single_m.deinit(allocator);
+
+        var chunked_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 128,
+            .enable_prompt_tail_pruning = true,
+            .startup_canary = false,
+        });
+        defer chunked_m.deinit(allocator);
+
+        var prompt: [150]u32 = undefined;
+        for (&prompt, 0..) |*t, i| t.* = @intCast((i * 13 + 7) % bundle.cfg.vocab_size);
+        const t0_single = try single_m.prefillChunk(&prompt, 0, true);
+        const t0_chunked = try chunked_m.prefillChunk(&prompt, 0, true);
+        var max_diff: f32 = 0.0;
+        for (single_m.readLastLogitsF16(), chunked_m.readLastLogitsF16()) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > max_diff) max_diff = d;
+        }
+        try std.testing.expect(max_diff < 5.0e-2);
+        try std.testing.expectEqual(t0_single, t0_chunked);
+
+        var cur_s = t0_single;
+        var cur_c = t0_chunked;
+        for (0..3) |s| {
+            const pos: u32 = @intCast(prompt.len + s);
+            cur_s = try single_m.stepDecode(cur_s, pos);
+            cur_c = try chunked_m.stepDecode(cur_c, pos);
+            try std.testing.expectEqual(cur_s, cur_c);
+        }
+    }
+
+    // 2. Hybrid `LoopSchedule R = 2` wide prefill parity (`r = 0` write, `r = 1` read-only + `P0-B1` final-pass pruning).
+    {
+        var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 2, 0, null);
+        defer bundle.deinit(allocator);
+        bundle.cfg.qsa_window_size = 0;
+
+        var tree_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 128,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .tree64,
+            .startup_canary = false,
+        });
+        defer tree_m.deinit(allocator);
+
+        var wide_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+            .max_seq_len = 128,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 32,
+            .enable_prompt_tail_pruning = true,
+            .startup_canary = false,
+        });
+        defer wide_m.deinit(allocator);
+
+        var prompt: [44]u32 = undefined;
+        for (&prompt, 0..) |*t, i| t.* = @intCast((i * 19 + 1) % bundle.cfg.vocab_size);
+        const t0_tree = try tree_m.prefillChunk(&prompt, 0, true);
+        const t0_wide = try wide_m.prefillChunk(&prompt, 0, true);
+        const tl0 = tree_m.readLastLogitsF16();
+        const wl0 = wide_m.readLastLogitsF16();
+        var max_diff: f32 = 0.0;
+        for (tl0, wl0) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > max_diff) max_diff = d;
+        }
+        try std.testing.expect(max_diff < 5.0e-2);
+        try std.testing.expect(@abs(@as(f32, wl0[t0_wide]) - @as(f32, wl0[t0_tree])) <= max_diff * 2.0 + 1.0e-3);
+        _ = try tree_m.stepDecode(t0_wide, @intCast(prompt.len));
+        _ = try wide_m.stepDecode(t0_wide, @intCast(prompt.len));
+        var d1: f32 = 0.0;
+        for (tree_m.readLastLogitsF16(), wide_m.readLastLogitsF16()) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > d1) d1 = d;
+        }
+        try std.testing.expect(d1 < 5.0e-2);
+    }
+}
+
+test "M6.8 C15 GraphBatchRuntime wide prefill + ChatML message-boundary PrefixCache checkpoint with GDN snapshot" {
+    const allocator = std.testing.allocator;
+    var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 1, 0, null);
+    defer bundle.deinit(allocator);
+    bundle.cfg.qsa_window_size = 0;
+
+    var serial_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 128,
+    });
+    defer serial_m.deinit(allocator);
+
+    var batch_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 16,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 128,
+    });
+    defer batch_m.deinit(allocator);
+
+    var rt = try GraphBatchRuntime.init(allocator, &batch_m, .{
+        .max_slots = 4,
+        .prefix_cache_chunks = 8,
+        .gpu_prefill_mode = .wide,
+    });
+    defer rt.deinit(allocator);
+
+    // 18-token shared multi-turn prefix (strictly intra-tile `< 512`!), followed by edited final user turn.
+    var p0: [26]u32 = undefined;
+    var p1: [28]u32 = undefined;
+    for (0..18) |i| {
+        const tok: u32 = @intCast((i * 7 + 3) % bundle.cfg.vocab_size);
+        p0[i] = tok;
+        p1[i] = tok;
+    }
+    for (18..26) |i| p0[i] = @intCast((i * 3 + 11) % bundle.cfg.vocab_size);
+    for (18..28) |i| p1[i] = @intCast((i * 5 + 23) % bundle.cfg.vocab_size);
+
+    const gen_len: usize = 4;
+    var ref_p1: [gen_len]u32 = undefined;
+    serial_m.resetKvCache();
+    var tok = try serial_m.prefillChunk(&p1, 0, true);
+    ref_p1[0] = tok;
+    for (1..gen_len) |s| {
+        tok = try serial_m.stepDecode(tok, @intCast(p1.len + s - 1));
+        ref_p1[s] = tok;
+    }
+
+    var sched = try batch_sched.BatchScheduler.init(allocator, .{
+        .max_batch_size = 4,
+        .max_prefill_chunk_tokens = 128,
+        .max_prompt_tokens = 256,
+        .message_boundary_cache = true,
+    });
+    defer sched.deinit(allocator);
+
+    const Collector = struct {
+        tokens: [2][gen_len]u32 = @splat(@splat(0)),
+        counts: [2]usize = @splat(0),
+        hits: [2]u32 = @splat(0),
+        fn onPrefillDone(ctx: *anyopaque, _: u16, tag: u64, _: u32, hit: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.hits[@intCast(tag)] = hit;
+            return true;
+        }
+        fn onToken(ctx: *anyopaque, _: u16, tag: u64, tid: u32, _: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const idx: usize = @intCast(tag);
+            if (self.counts[idx] < gen_len) {
+                self.tokens[idx][self.counts[idx]] = tid;
+                self.counts[idx] += 1;
+            }
+            return true;
+        }
+    };
+    var col: Collector = .{};
+    const obs: batch_sched.StepObserver = .{
+        .ctx = &col,
+        .onPrefillDoneFn = Collector.onPrefillDone,
+        .onTokenFn = Collector.onToken,
+    };
+    const backend = rt.batchBackend();
+
+    _ = try sched.enqueue(&p0, .{
+        .request_id = 1,
+        .user_tag = 0,
+        .max_tokens = gen_len,
+        .ignore_eos = true,
+        .message_boundary_token = 18,
+    });
+    while (sched.activeSlotCount() > 0) _ = sched.step(backend, obs);
+    try std.testing.expectEqual(@as(u32, 0), col.hits[0]);
+
+    _ = try sched.enqueue(&p1, .{
+        .request_id = 2,
+        .user_tag = 1,
+        .max_tokens = gen_len,
+        .ignore_eos = true,
+        .message_boundary_token = 18,
+    });
+    while (sched.activeSlotCount() > 0) _ = sched.step(backend, obs);
+
+    try std.testing.expectEqual(@as(u32, 18), col.hits[1]);
+    try std.testing.expectEqualSlices(u32, &ref_p1, &col.tokens[1]);
+    const st = rt.stats();
+    try std.testing.expect(st.boundary_hits >= 1);
+    try std.testing.expect(st.gdn_snapshot_clones >= 2);
     try std.testing.expectEqual(@as(u32, 0), st.prefix_cache_pinned_entries);
 }

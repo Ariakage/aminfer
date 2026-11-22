@@ -100,6 +100,37 @@ pub const PrefillMode = enum {
     }
 };
 
+/// Pure-GPU prefill execution mode (`G15`, ADR-0020):
+/// - `.wide` (default): `512–1024`-token block-tiled FlashAttention + `64x64` wide
+///   GEMM writing K/V directly into bindless `KvTile`s with `P0-B1` tail pruning.
+/// - `.tree64`: legacy `<= 64`-token `verifyTree` (`wide_tile = false`) +
+///   `commitTreeKv` loop retained as an exact runtime A/B baseline.
+pub const GpuPrefillMode = enum(u8) {
+    wide = 0,
+    tree64 = 1,
+
+    pub fn label(self: GpuPrefillMode) []const u8 {
+        return switch (self) {
+            .wide => "wide",
+            .tree64 => "tree64",
+        };
+    }
+
+    pub fn parse(str: []const u8) error{InvalidGpuPrefillMode}!GpuPrefillMode {
+        if (std.mem.eql(u8, str, "wide")) return .wide;
+        if (std.mem.eql(u8, str, "tree64")) return .tree64;
+        return error.InvalidGpuPrefillMode;
+    }
+};
+
+pub const PrefillChunkOptions = struct {
+    /// Emit next-token logits and argmax for the final token of this chunk.
+    compute_logits: bool = false,
+    /// When `true`, skip `P0-B1` final-layer `L - 1` pruning so all tokens' top-layer
+    /// hidden states are materialized (e.g. for EAGLE-2 / MTP feature taps).
+    preserve_all_top_hidden: bool = false,
+};
+
 pub const ModelArch = enum {
     qwen3_moe,
     qwen3_dense,
@@ -418,6 +449,28 @@ pub const LoadOptions = struct {
     /// group-64 `q8` (`RetiredKvQ8Pool`, `-46.875%` retired KV RAM), recycling active
     /// IOSurface tiles back to the active window. `0` disables retirement (default).
     kv_retire_q8_after_chunks: u32 = 0,
+
+    // M6.8 Wide GPU Prefill, Tail Pruning, Scratch Aliasing, Canary & Live RAM (`ADR-0020`)
+    /// GPU prefill backend (`wide` = 512–1024 tok FlashAttention + 64x64 GEMM, default;
+    /// `tree64` = legacy `<= 64` `verifyTree` + `commitTreeKv` A/B baseline).
+    gpu_prefill_mode: GpuPrefillMode = .wide,
+    /// Wide GPU prefill chunk capacity (`512` default; up to `attention.MAX_WIDE_PREFILL_TOKENS = 1024`).
+    wide_prefill_chunk_tokens: u32 = 512,
+    /// Run `< 0.1 ms` startup `.metallib` numerical canary once during load (`G16`).
+    startup_canary: bool = true,
+    /// Alias single-request wide-prefill rolling activation scratch with `verifyTree`
+    /// activation scratch via `WiredArena.allocAliasedPair` (`P0-B2`, never unloading `lm_head`).
+    alias_prefill_tree_scratch: bool = true,
+    /// Opt-in strict live non-anonymous RAM admission (`--strict-live-ram`, `P1-B`).
+    strict_live_ram: bool = false,
+    /// Safety margin held back from live zero-swap reclaimable RAM (`P1-B`, default 512 MiB).
+    live_safety_margin_bytes: u64 = budget_mod.DEFAULT_LIVE_SAFETY_MARGIN_BYTES,
+    /// Optional synthetic live zero-swap RAM override for deterministic tests (`null` reads Mach `HOST_VM_INFO64`).
+    live_reclaimable_override: ?u64 = null,
+    /// Disable `P0-B1` final-layer `prompt_tail` compute pruning when full-prompt logits are requested.
+    compute_all_logits: bool = false,
+    /// Enable lossless `P0-B1` final-layer `prompt_tail` compute pruning (default `true`).
+    enable_prompt_tail_pruning: bool = true,
 };
 
 pub const LoadError = error{
@@ -432,7 +485,8 @@ pub const LoadError = error{
     SmeCalibrationFailed,
     OutOfMemory,
 } || ModelConfig.ConfigError || amf.AmfFile.OpenError || quant.ShapeError ||
-    sysinfo.Error || metal.WrapError || budget_mod.PlanError ||
+    sysinfo.Error || vmstat.Error || metal.WrapError || budget_mod.PlanError ||
+    dequant.CanaryError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError ||
     attention.RetiredKvQ8PoolError ||
     moe.WorkspaceError || aio.EcorePoolError || cache_mod.PoolError ||
@@ -942,6 +996,30 @@ pub const Qwen3Model = struct {
     retired_kv_wired_bytes: u64,
     retired_kv_pool: ?attention.RetiredKvQ8Pool,
     active_tile_phys_ring: []u32,
+
+    // M6.8 Wide GPU Prefill (`G15`), Tail Pruning (`P0-B1`), Aliased Scratch (`P0-B2`),
+    // Live RAM Admission (`P1-B`) & Startup `.metallib` Canary (`G16`)
+    gpu_prefill_mode: GpuPrefillMode,
+    wide_prefill_max_tokens: u32,
+    supports_wide_flash_attn: bool,
+    compute_all_logits: bool,
+    enable_prompt_tail_pruning: bool,
+    canary_result: ?dequant.CanaryResult,
+    live_admission: budget_mod.LiveAdmissionPlan,
+    aliased_scratch_saved_bytes: usize,
+    wp_token_ids_host: []u32,
+    wp_token_ids_bind: metal.BufferBinding,
+    wp_x_bind: metal.BufferBinding,
+    wp_x_norm_bind: metal.BufferBinding,
+    wp_q_bind: metal.BufferBinding,
+    wp_k_bind: metal.BufferBinding,
+    wp_v_bind: metal.BufferBinding,
+    wp_attn_out_bind: metal.BufferBinding,
+    wp_proj_out_bind: metal.BufferBinding,
+    wp_moe_ws: ?moe.MoeWorkspace,
+    wp_dense_gate_bind: metal.BufferBinding,
+    wp_dense_up_bind: metal.BufferBinding,
+    wp_dense_act_bind: metal.BufferBinding,
 
     pub fn loadFromBytes(
         allocator: std.mem.Allocator,
@@ -1599,7 +1677,7 @@ pub const Qwen3Model = struct {
 
     /// Encodes a linear projection for `m >= 1` rows, dispatching to GEMV (`m == 1`),
     /// weight-stationary batched GEMV (`2 <= m < 16`), or tiled `simdgroup_float8x8`
-    /// GEMM (`m >= 16`, e.g. 512-token hybrid prefill FFN chunks, `G6`).
+    /// GEMM (`m >= 16`, e.g. 512-token prefill chunks, `G6` / `G15`).
     pub fn encodeLinearGemm(
         self: *const Qwen3Model,
         frame: *metal.Compute.Frame,
@@ -1607,6 +1685,19 @@ pub const Qwen3Model = struct {
         x: metal.BufferBinding,
         y: metal.BufferBinding,
         m: u32,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
+        return self.encodeLinearGemmWithTile(frame, lin, x, y, m, true, insert_barrier_before);
+    }
+
+    pub fn encodeLinearGemmWithTile(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        lin: LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        m: u32,
+        wide_tile: bool,
         insert_barrier_before: bool,
     ) dequant.EncodeError!void {
         if (m < 16) {
@@ -1620,6 +1711,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .wide_tile = wide_tile,
             }, insert_barrier_before),
             .bf16 => try self.dequant_pipes.encodeDenseGemm(frame, .bf16, .{
                 .x = x,
@@ -1628,6 +1720,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .wide_tile = wide_tile,
             }, insert_barrier_before),
             .q4_affine => try self.dequant_pipes.encodeGemm(frame, .q4, .{
                 .x = x,
@@ -1637,6 +1730,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .wide_tile = wide_tile,
             }, insert_barrier_before),
             .q3_affine => try self.dequant_pipes.encodeGemm(frame, .q3, .{
                 .x = x,
@@ -1646,6 +1740,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .wide_tile = wide_tile,
             }, insert_barrier_before),
             .q2_affine => try self.dequant_pipes.encodeGemm(frame, .q2, .{
                 .x = x,
@@ -1655,6 +1750,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .wide_tile = wide_tile,
             }, insert_barrier_before),
         }
     }
@@ -2164,16 +2260,439 @@ pub const Qwen3Model = struct {
         try self.retireExcessCompletedChunks();
     }
 
-    /// Batched causal prompt prefill chunk (`1 <= tokens.len <= max_tree_nodes`)
-    /// reusing `verifyTree` + `commitTreeKv` with zero heap allocation.
+    /// True when wide-chunk (`512–1024`-token) GPU FlashAttention + `64x64` GEMM
+    /// prefill (`G15`, ADR-0020) is active on this model.
+    pub fn usesWideGpuPrefill(self: *const Qwen3Model) bool {
+        return self.gpu_prefill_mode == .wide and
+            self.wide_prefill_max_tokens > 0 and
+            self.supports_wide_flash_attn and
+            !self.has_sme2_weights and
+            !self.has_pure_cpu_sme2_dense and
+            self.cold_rt == null;
+    }
+
+    /// Maximum single-pass GPU prefill chunk length (`512–1024` in `.wide` mode,
+    /// `max_tree_nodes` in `.tree64` mode).
+    pub fn prefillChunkCap(self: *const Qwen3Model) u32 {
+        if (self.usesWideGpuPrefill()) {
+            return if (self.retired_kv_pool != null)
+                @min(self.wide_prefill_max_tokens, self.chunk_tokens)
+            else
+                self.wide_prefill_max_tokens;
+        }
+        return self.max_tree_nodes;
+    }
+
+    /// Executes one wide-chunk (`1 <= tokens.len <= wide_prefill_max_tokens`) GPU
+    /// causal prefill pass (`G15` + `P0-B1`, ADR-0020): `64x64` wide GEMM, direct
+    /// bindless `KvTilePair` write (`0` `tree_k`/`tree_v -> commitTreeKv` copy),
+    /// block-tiled causal FlashAttention-2 skipping upper-triangular KV blocks,
+    /// wide `MoeWorkspace`, and lossless `prompt_tail` final-layer compute pruning.
+    fn prefillWideChunk(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        start_pos: u32,
+        is_final_chunk: bool,
+        compute_logits: bool,
+        preserve_all_top_hidden: bool,
+    ) StepError!u32 {
+        const m: u32 = @intCast(tokens.len);
+        if (m == 0 or m > self.wide_prefill_max_tokens) return error.InvalidArgument;
+        if (start_pos + m > self.max_seq_len) return error.PositionOutOfRange;
+        for (tokens) |tid| {
+            if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+        }
+        try self.retireBeforeCommitRange(start_pos, m);
+
+        @memcpy(self.wp_token_ids_host[0..m], tokens);
+        const h = self.config.hidden_size;
+        const q_dim = self.config.num_attention_heads * self.config.head_dim;
+        const kv_dim = self.config.num_key_value_heads * self.config.head_dim;
+        const last_l: usize = self.layers.len - 1;
+        const aux_needs_last_layer = self.enable_feature_taps and
+            (self.aux_layer_ids[0] == last_l or self.aux_layer_ids[1] == last_l or self.aux_layer_ids[2] == last_l);
+        const allow_tail_prune = self.enable_prompt_tail_pruning and !self.compute_all_logits and
+            !preserve_all_top_hidden and !aux_needs_last_layer;
+        const prune_non_final_last = allow_tail_prune and (!is_final_chunk or !compute_logits);
+        const prune_final_last_to_m1 = allow_tail_prune and is_final_chunk and compute_logits and (m > 1);
+
+        const has_retired = (self.retired_kv_pool != null and self.num_retired_chunks > 0);
+        const rpool_bind: ?metal.BufferBinding = if (has_retired) self.retired_kv_pool.?.binding(self.scratch_buf) else null;
+        const ret_plane_stride: u32 = if (has_retired) self.retired_kv_pool.?.plane_stride_bytes else 0;
+        const ret_chunk_stride: u32 = if (has_retired) self.retired_kv_pool.?.chunk_stride_bytes else 0;
+        const kv_len_after: u32 = start_pos + m;
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+
+        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            .weight = self.embed.weight,
+            .scale_bias = self.embed.scale_bias,
+            .tokens = .{ .token_ids = self.wp_token_ids_bind },
+            .out = self.wp_x_bind,
+            .m = m,
+            .vocab_size = self.config.vocab_size,
+            .hidden_size = h,
+        }, false);
+
+        for (self.layers, 0..) |layer, l| {
+            const is_last_layer = (l == last_l);
+            const skip_last_rest = is_last_layer and prune_non_final_last;
+            const tail_m1_last = is_last_layer and prune_final_last_to_m1;
+
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = self.wp_x_bind,
+                .w = layer.input_layernorm.binding,
+                .y = self.wp_x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true);
+
+            if (skip_last_rest) {
+                // P0-B1 non-final chunk at L-1: project K/V only, write KvTiles, and stop!
+                try self.encodeLinearGemmWithTile(&frame, layer.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
+                try self.encodeLinearGemmWithTile(&frame, layer.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                try self.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                    .q = self.wp_q_bind,
+                    .k = self.wp_k_bind,
+                    .v = self.wp_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .num_tokens = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .start_pos = start_pos,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = self.num_retired_chunks,
+                    .kv_only = true,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, true);
+                break;
+            }
+
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = self.scratch_buf,
+                .offset = self.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            const last_x_norm_bind: metal.BufferBinding = .{
+                .buffer = self.scratch_buf,
+                .offset = self.wp_x_norm_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+
+            if (tail_m1_last) {
+                // P0-B1 final chunk at L-1: write all `m` tokens' K/V, project Q for M=1 (last token),
+                // and run FlashAttn + O_proj + FFN as M=1 GEMV.
+                try self.encodeLinearGemmWithTile(&frame, layer.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, true);
+                try self.encodeLinearGemmWithTile(&frame, layer.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                try self.encodeLinearGemv(&frame, layer.q_proj, last_x_norm_bind, self.wp_q_bind, false);
+
+                try self.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                    .q = self.wp_q_bind,
+                    .k = self.wp_k_bind,
+                    .v = self.wp_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .num_tokens = m - 1,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .start_pos = start_pos,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = self.num_retired_chunks,
+                    .kv_only = true,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, true);
+                const last_k_bind: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.wp_k_bind.offset + @as(u64, m - 1) * kv_dim * @sizeOf(f16),
+                };
+                const last_v_bind: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.wp_v_bind.offset + @as(u64, m - 1) * kv_dim * @sizeOf(f16),
+                };
+                try self.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                    .q = self.wp_q_bind,
+                    .k = last_k_bind,
+                    .v = last_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .num_tokens = 1,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .start_pos = start_pos + m - 1,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = self.num_retired_chunks,
+                    .kv_only = false,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, false);
+
+                try self.attn_pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
+                    .q = self.wp_q_bind,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .retired_pool = rpool_bind,
+                    .retired_chunk_ids = if (has_retired) layer.retired_ids_binding else null,
+                    .out = self.wp_attn_out_bind,
+                    .num_q = 1,
+                    .q_start_pos = start_pos + m - 1,
+                    .kv_len = kv_len_after,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = if (has_retired) self.num_retired_chunks else 0,
+                    .retired_plane_stride_bytes = ret_plane_stride,
+                    .retired_chunk_stride_bytes = ret_chunk_stride,
+                }, true);
+            } else {
+                try self.encodeLinearGemmWithTile(&frame, layer.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
+                try self.encodeLinearGemmWithTile(&frame, layer.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
+                try self.encodeLinearGemmWithTile(&frame, layer.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+
+                try self.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                    .q = self.wp_q_bind,
+                    .k = self.wp_k_bind,
+                    .v = self.wp_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .num_tokens = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .start_pos = start_pos,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = self.num_retired_chunks,
+                    .kv_only = false,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, true);
+
+                try self.attn_pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
+                    .q = self.wp_q_bind,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .retired_pool = rpool_bind,
+                    .retired_chunk_ids = if (has_retired) layer.retired_ids_binding else null,
+                    .out = self.wp_attn_out_bind,
+                    .num_q = m,
+                    .q_start_pos = start_pos,
+                    .kv_len = kv_len_after,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = if (has_retired) self.num_retired_chunks else 0,
+                    .retired_plane_stride_bytes = ret_plane_stride,
+                    .retired_chunk_stride_bytes = ret_chunk_stride,
+                }, true);
+            }
+
+            const eff_m: u32 = if (tail_m1_last) 1 else m;
+            const eff_x_bind: metal.BufferBinding = if (tail_m1_last) last_x_bind else self.wp_x_bind;
+            _ = q_dim;
+
+            try self.encodeLinearGemmWithTile(&frame, layer.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
+            try self.moe_pipes.encodeResidualAdd(&frame, .{
+                .x = eff_x_bind,
+                .delta = self.wp_proj_out_bind,
+                .count = eff_m * h,
+            }, true);
+
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = eff_x_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = self.wp_x_norm_bind,
+                .num_rows = eff_m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, true);
+
+            switch (self.config.arch) {
+                .qwen3_moe => {
+                    const ws_ptr = &(self.wp_moe_ws.?);
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = self.wp_x_norm_bind,
+                        .router = layer.router,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = ws_ptr,
+                        .workspace_buf = self.scratch_buf,
+                        .residual = eff_x_bind,
+                        .out = eff_x_bind,
+                        .m = eff_m,
+                        .num_experts = self.config.num_experts,
+                        .top_k = self.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = self.config.moe_intermediate_size,
+                        .norm_topk_prob = self.config.norm_topk_prob,
+                    };
+                    try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
+                },
+                .qwen3_dense => {
+                    try self.encodeLinearGemmWithTile(&frame, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, eff_m, true, true);
+                    try self.encodeLinearGemmWithTile(&frame, layer.dense_up, self.wp_x_norm_bind, self.wp_dense_up_bind, eff_m, true, false);
+                    try self.moe_pipes.encodeSiluMul(&frame, .{
+                        .gate = self.wp_dense_gate_bind,
+                        .up = self.wp_dense_up_bind,
+                        .out = self.wp_dense_act_bind,
+                        .count = eff_m * self.config.intermediate_size,
+                    }, true);
+                    try self.encodeLinearGemmWithTile(&frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
+                    try self.moe_pipes.encodeResidualAdd(&frame, .{
+                        .x = eff_x_bind,
+                        .delta = self.wp_proj_out_bind,
+                        .count = eff_m * h,
+                    }, true);
+                },
+            }
+
+            if (self.enable_feature_taps and !tail_m1_last) {
+                var tap_barrier = true;
+                for (self.aux_layer_ids, 0..) |tap_l, slot| {
+                    if (l == tap_l) {
+                        try self.moe_pipes.encodeCopyStrided(&frame, .{
+                            .src = self.wp_x_bind,
+                            .dst = self.accepted_aux_bind,
+                            .num_rows = m,
+                            .copy_cols = h,
+                            .src_stride = h,
+                            .src_col_off = 0,
+                            .dst_stride = 3 * h,
+                            .dst_col_off = @as(u32, @intCast(slot)) * h,
+                        }, tap_barrier);
+                        tap_barrier = false;
+                    }
+                }
+            }
+        }
+
+        if (self.enable_feature_taps and preserve_all_top_hidden) {
+            try self.moe_pipes.encodeCopyStrided(&frame, .{
+                .src = self.wp_x_bind,
+                .dst = self.accepted_top_bind,
+                .num_rows = m,
+                .copy_cols = h,
+                .src_stride = h,
+                .dst_stride = h,
+            }, true);
+        }
+
+        var logits_rows_computed: u32 = 0;
+        if (compute_logits and (is_final_chunk or self.compute_all_logits)) {
+            if (self.compute_all_logits) {
+                try self.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = self.wp_x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.wp_x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, true);
+                try self.encodeLinearGemmWithTile(&frame, self.lm_head, self.wp_x_norm_bind, self.logits_bind, m, true, true);
+                try self.moe_pipes.encodeArgmaxRows(&frame, .{
+                    .logits = self.logits_bind,
+                    .out_token_ids = self.out_token_id_bind,
+                    .num_rows = m,
+                    .vocab_size = self.config.vocab_size,
+                    .logits_dtype = .f16,
+                }, true);
+                logits_rows_computed = m;
+            } else {
+                const last_x_bind: metal.BufferBinding = .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+                };
+                try self.attn_pipes.encodeRmsNorm(&frame, .{
+                    .x = last_x_bind,
+                    .w = self.final_norm.binding,
+                    .y = self.wp_x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = self.final_norm.dtype,
+                }, true);
+                try self.encodeLinearGemv(&frame, self.lm_head, self.wp_x_norm_bind, self.logits_bind, true);
+                try self.moe_pipes.encodeArgmaxRows(&frame, .{
+                    .logits = self.logits_bind,
+                    .out_token_ids = self.out_token_id_bind,
+                    .num_rows = 1,
+                    .vocab_size = self.config.vocab_size,
+                    .logits_dtype = .f16,
+                }, true);
+                logits_rows_computed = 1;
+            }
+        }
+
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+
+        if (kv_len_after > self.seq_len) self.seq_len = kv_len_after;
+        try self.retireExcessCompletedChunks();
+
+        if (logits_rows_computed > 0) {
+            self.last_logits_row = @as(usize, logits_rows_computed) - 1;
+            return self.out_token_ids_host[self.last_logits_row];
+        }
+        return 0;
+    }
+
+    /// Batched causal prompt prefill chunk: uses wide-chunk FlashAttention + `64x64`
+    /// GEMM + `P0-B1` tail pruning when `gpu_prefill_mode == .wide`, or legacy
+    /// `<= 64` `verifyTree` + `commitTreeKv` when `.tree64` (or SME2/cold-expert).
     pub fn prefillChunk(
         self: *Qwen3Model,
         tokens: []const u32,
         start_pos: u32,
         compute_logits: bool,
     ) StepError!u32 {
+        return self.prefillChunkWithOptions(tokens, start_pos, .{
+            .compute_logits = compute_logits,
+            .preserve_all_top_hidden = self.enable_feature_taps or self.compute_all_logits,
+        });
+    }
+
+    pub fn prefillChunkWithOptions(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        start_pos: u32,
+        opts: PrefillChunkOptions,
+    ) StepError!u32 {
+        if (tokens.len == 0) return error.TreeTooLarge;
+        if (self.usesWideGpuPrefill()) {
+            const cap: usize = self.prefillChunkCap();
+            var off: usize = 0;
+            var last_tok: u32 = 0;
+            while (off < tokens.len) {
+                const take: usize = @min(cap, tokens.len - off);
+                const is_last = (off + take == tokens.len);
+                last_tok = try self.prefillWideChunk(
+                    tokens[off .. off + take],
+                    start_pos + @as(u32, @intCast(off)),
+                    is_last,
+                    opts.compute_logits and is_last,
+                    opts.preserve_all_top_hidden,
+                );
+                off += take;
+            }
+            return last_tok;
+        }
         if (self.max_tree_nodes <= 1) return error.TreeNotEnabled;
-        if (tokens.len == 0 or tokens.len > self.max_tree_nodes) return error.TreeTooLarge;
+        if (tokens.len > self.max_tree_nodes) return error.TreeTooLarge;
         const m: usize = tokens.len;
         var positions: [attention.MAX_TREE_NODES]u32 = undefined;
         var masks: [attention.MAX_TREE_NODES]u64 = undefined;
@@ -2190,15 +2709,15 @@ pub const Qwen3Model = struct {
                 0,
                 masks[0..m],
                 start_pos,
-                if (compute_logits) 1 else 0,
+                if (opts.compute_logits) 1 else 0,
                 true,
                 true,
             );
-            return if (compute_logits) cands[0].token_id else 0;
+            return if (opts.compute_logits) cands[0].token_id else 0;
         }
-        const vr = try self.verifyTree(tokens, positions[0..m], masks[0..m], start_pos, compute_logits);
+        const vr = try self.verifyTree(tokens, positions[0..m], masks[0..m], start_pos, opts.compute_logits);
         try self.commitTreeKv(start_pos, accepted[0..m]);
-        return if (compute_logits) vr.argmax_tokens[m - 1] else 0;
+        return if (opts.compute_logits) vr.argmax_tokens[m - 1] else 0;
     }
 
     fn runPredictMoEExpertsFrame(
@@ -5890,6 +6409,12 @@ pub const Qwen3Model = struct {
             const res = try self.prefillHybridWavefront(tokens, compute_logits);
             return res.argmax_token;
         }
+        if (self.usesWideGpuPrefill()) {
+            return self.prefillChunkWithOptions(tokens, 0, .{
+                .compute_logits = compute_logits,
+                .preserve_all_top_hidden = false,
+            });
+        }
         if (self.max_tree_nodes > 1) {
             var pos: usize = 0;
             var last_tok: u32 = 0;
@@ -7271,21 +7796,33 @@ fn loadCore(
         .down_blob_bytes = 0,
     };
     var cold_pool_bytes: u64 = 0;
+    var cold_min_slots: u32 = 0;
+    var cold_req_slots: u32 = 0;
+    var cold_min_pool_bytes: u64 = 0;
+    var cold_slot_stride_bytes: usize = 0;
     if (has_cold) {
         if (source.filePath() == null) return error.ColdExpertsRequireFile;
-        const min_slots: u32 = @max(config.num_experts_per_tok, @min(config.num_experts, max_tree_nodes * config.num_experts_per_tok));
-        const eff_slots: u32 = @max(options.cold_slot_count, min_slots);
+        cold_min_slots = @max(config.num_experts_per_tok, @min(config.num_experts, max_tree_nodes * config.num_experts_per_tok));
+        cold_req_slots = @max(options.cold_slot_count, cold_min_slots);
         cold_pool_spec = .{
-            .num_slots = eff_slots,
+            .num_slots = cold_req_slots,
             .gate_blob_bytes = max_cold_gate_bytes,
             .up_blob_bytes = max_cold_up_bytes,
             .down_blob_bytes = max_cold_down_bytes,
         };
         try cold_pool_spec.validate();
         cold_pool_bytes = try cold_pool_spec.totalBytes();
+        const min_spec: cache_mod.PoolSpec = .{
+            .num_slots = cold_min_slots,
+            .gate_blob_bytes = max_cold_gate_bytes,
+            .up_blob_bytes = max_cold_up_bytes,
+            .down_blob_bytes = max_cold_down_bytes,
+        };
+        cold_min_pool_bytes = try min_spec.totalBytes();
+        cold_slot_stride_bytes = try cold_pool_spec.slotBytes();
     }
 
-    // --- 2. Query Metal device, compute shard plan & enforce wired budget ---
+    // --- 2. Query Metal device, compute scratch & live-RAM admission plan ---
     const facts = try sysinfo.Facts.read();
     const device = try metal.Device.open();
     errdefer device.close();
@@ -7299,44 +7836,27 @@ fn loadCore(
     const shard_cap: u64 = (raw_shard_cap / page.APPLE_PAGE_SIZE) * page.APPLE_PAGE_SIZE;
     if (shard_cap == 0) return error.TensorExceedsShardLimit;
 
-    // Bin-pack atomic groups (global + per-layer) into `MTLBuffer`-sized shards.
-    // When cold experts are active and all hot weights + `ExpertSlotPool` fit in
-    // ONE shard, place them together in shard 0 so hot experts and pinned cold
-    // slots share one `MTLBuffer` and execute in a single zero-copy GPU dispatch!
-    const group_shard = try allocator.alloc(usize, group_count);
-    defer allocator.free(group_shard);
-    var shard_sizes: std.ArrayList(u64) = .empty;
-    defer shard_sizes.deinit(allocator);
-
-    var all_groups_sum: u64 = 0;
-    for (group_bytes) |gb| all_groups_sum += gb;
-    const pool_in_shard0 = has_cold and (all_groups_sum + cold_pool_bytes <= shard_cap);
-
-    if (pool_in_shard0) {
-        try shard_sizes.append(allocator, all_groups_sum + cold_pool_bytes);
-        @memset(group_shard, 0);
-    } else {
-        for (group_bytes, 0..) |gb, g_idx| {
-            if (gb > shard_cap) return error.TensorExceedsShardLimit;
-            if (shard_sizes.items.len == 0 or shard_sizes.items[shard_sizes.items.len - 1] + gb > shard_cap) {
-                try shard_sizes.append(allocator, gb);
-            } else {
-                shard_sizes.items[shard_sizes.items.len - 1] += gb;
-            }
-            group_shard[g_idx] = shard_sizes.items.len - 1;
-        }
-    }
-
-    // Compute scratch arena footprint (scaled by `max_tree_nodes` for zero hot-path alloc).
+    // Compute scratch arena footprint: wide-prefill rolling activation scratch (Region A)
+    // aliased with `verifyTree`/decode activation scratch (Region B) via `allocAliasedPair`
+    // (`P0-B2`, ADR-0020) so `lm_head` weights are NEVER unloaded!
     const m_cap: usize = max_tree_nodes;
     const tree_enabled = max_tree_nodes > 1;
+    const supports_wide_flash_attn = (config.head_dim == 64 or config.head_dim == 128);
+    const req_wide_cap: u32 = @min(attention.MAX_WIDE_PREFILL_TOKENS, @max(@as(u32, 1), options.wide_prefill_chunk_tokens));
+    const wide_prefill_max_tokens: u32 = if (options.gpu_prefill_mode == .wide and supports_wide_flash_attn)
+        @min(req_wide_cap, options.max_seq_len)
+    else
+        0;
+    const wide_enabled = (wide_prefill_max_tokens > 0);
+    const w_cap: usize = wide_prefill_max_tokens;
+
     const retire_after: u32 = options.kv_retire_q8_after_chunks;
     const use_retired_q8 = (retire_after > 0 and num_chunks > retire_after);
     if (use_retired_q8 and (config.head_dim % attention.KV_Q8_GROUP_SIZE) != 0) {
         return error.InvalidConfig;
     }
     const active_kv_chunks: u32 = if (use_retired_q8)
-        @min(num_chunks, if (tree_enabled) @max(retire_after, 2) else retire_after)
+        @min(num_chunks, if (tree_enabled or wide_enabled) @max(retire_after, 2) else retire_after)
     else
         num_chunks;
     const max_retired_per_layer: u32 = if (use_retired_q8) num_chunks - retire_after else 0;
@@ -7378,6 +7898,16 @@ fn loadCore(
         })
     else
         0;
+    const wp_moe_ws_bytes: usize = if (wide_enabled and config.arch == .qwen3_moe)
+        try moe.MoeWorkspace.requiredBytes(.{
+            .max_tokens = wide_prefill_max_tokens,
+            .num_experts = config.num_experts,
+            .top_k = config.num_experts_per_tok,
+            .hidden_size = h,
+            .intermediate_size = config.moe_intermediate_size,
+        })
+    else
+        0;
     const layer_sched_hdr_bytes: usize = if (config.arch == .qwen3_moe and tree_enabled)
         num_layers * 64
     else
@@ -7395,6 +7925,10 @@ fn loadCore(
         3 * amf.align64(m_cap * @as(usize, config.intermediate_size) * @sizeOf(f16))
     else
         0;
+    const wp_dense_ffn_scratch: usize = if (wide_enabled and config.arch == .qwen3_dense)
+        3 * amf.align64(w_cap * @as(usize, config.intermediate_size) * @sizeOf(f16))
+    else
+        0;
     const tree_kv_layer_stride: usize = if (tree_enabled)
         amf.align64(m_cap * @as(usize, kv_dim) * @sizeOf(f16))
     else
@@ -7403,41 +7937,69 @@ fn loadCore(
         amf.align64(m_cap * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate))
     else
         0;
-    const tree_meta_bytes: usize = if (tree_enabled)
+    const tree_only_scratch_bytes: usize = if (tree_enabled)
         amf.align64(m_cap * @sizeOf(u32)) * 3 + // token_ids, positions, accepted_nodes
             amf.align64(m_cap * @sizeOf(u64)) + // ancestor_masks
-            topk_scratch_bytes +
             2 * num_layers * tree_kv_layer_stride // per-layer tree K & V
     else
         0;
-    const feature_tap_bytes: usize = if (options.enable_feature_taps)
-        2 * amf.align64(m_cap * 3 * @as(usize, h) * @sizeOf(f16)) + // aux_concat, accepted_aux
-            amf.align64(m_cap * @as(usize, h) * @sizeOf(f16)) // accepted_top
+    const aux_concat_bytes: usize = if (options.enable_feature_taps)
+        amf.align64(m_cap * 3 * @as(usize, h) * @sizeOf(f16))
     else
         0;
+    const feat_cap: usize = if (wide_enabled) @max(m_cap, w_cap) else m_cap;
+    const accepted_feat_bytes: usize = if (options.enable_feature_taps)
+        amf.align64(feat_cap * 3 * @as(usize, h) * @sizeOf(f16)) + // accepted_aux
+            amf.align64(feat_cap * @as(usize, h) * @sizeOf(f16)) // accepted_top
+    else
+        0;
+    const logits_cap: usize = if (options.compute_all_logits and wide_enabled) @max(m_cap, w_cap) else m_cap;
 
-    const scratch_raw: usize =
+    const tree_scratch_raw: usize =
         2 * amf.align64(m_cap * @as(usize, h) * @sizeOf(f16)) + // x, x_norm
         2 * amf.align64(m_cap * @as(usize, q_dim) * @sizeOf(f16)) + // q, attn_out
         2 * amf.align64(m_cap * @as(usize, kv_dim) * @sizeOf(f16)) + // k, v
         amf.align64(m_cap * @as(usize, h) * @sizeOf(f16)) + // proj_out
-        amf.align64(m_cap * @as(usize, config.vocab_size) * @sizeOf(f16)) + // logits
-        amf.align64(m_cap * @sizeOf(u32)) + // out_token_ids
-        amf.align64(gqa_layout.total_bytes) +
         gqa_tree_bytes +
-        tree_meta_bytes +
-        feature_tap_bytes +
+        tree_only_scratch_bytes +
+        aux_concat_bytes +
+        moe_ws_bytes +
+        pred_topk_total_bytes +
+        dense_ffn_scratch +
+        16 * 64;
+    const wide_scratch_raw: usize = if (wide_enabled)
+        amf.align64(w_cap * @sizeOf(u32)) + // wp_token_ids
+            2 * amf.align64(w_cap * @as(usize, h) * @sizeOf(f16)) + // wp_x, wp_x_norm
+            2 * amf.align64(w_cap * @as(usize, q_dim) * @sizeOf(f16)) + // wp_q, wp_attn_out
+            2 * amf.align64(w_cap * @as(usize, kv_dim) * @sizeOf(f16)) + // wp_k, wp_v
+            amf.align64(w_cap * @as(usize, h) * @sizeOf(f16)) + // wp_proj_out
+            wp_moe_ws_bytes +
+            wp_dense_ffn_scratch +
+            16 * 64
+    else
+        0;
+    const use_aliased_scratch = wide_enabled and options.alias_prefill_tree_scratch;
+    const aliased_block_bytes: usize = if (use_aliased_scratch)
+        @max(try page.alignUp(wide_scratch_raw), try page.alignUp(tree_scratch_raw))
+    else if (wide_enabled)
+        (try page.alignUp(wide_scratch_raw)) + (try page.alignUp(tree_scratch_raw))
+    else
+        try page.alignUp(tree_scratch_raw);
+
+    const non_aliased_raw: usize =
+        amf.align64(logits_cap * @as(usize, config.vocab_size) * @sizeOf(f16)) + // logits
+        amf.align64(logits_cap * @sizeOf(u32)) + // out_token_ids
+        amf.align64(gqa_layout.total_bytes) +
+        topk_scratch_bytes +
+        accepted_feat_bytes +
         num_layers * kv_tbl_per_layer +
         num_layers * retired_ids_per_layer +
         retired_pool_bytes +
         num_layers * expert_tbl_per_layer +
         num_layers * expert_schemes_per_layer +
-        moe_ws_bytes +
         layer_sched_hdr_bytes +
-        pred_topk_total_bytes +
-        dense_ffn_scratch +
         8 * page.APPLE_PAGE_SIZE;
-    const scratch_arena_bytes = try page.alignUp(scratch_raw);
+    const scratch_arena_bytes = try page.alignUp(aliased_block_bytes + non_aliased_raw);
 
     // Compute total KV tile bytes (exact 16 KiB multiple per tile).
     const kv_tile_rows: u32 = config.num_key_value_heads * options.chunk_tokens;
@@ -7448,6 +8010,64 @@ fn loadCore(
         @as(u64, try attention.RetiredKvQ8Pool.dataRequiredBytes(retired_pool_spec))
     else
         0;
+
+    var all_groups_sum: u64 = 0;
+    for (group_bytes) |gb| all_groups_sum += gb;
+
+    // P1-B (`R9`, ADR-0020): Evaluate required wired bytes against static ADR-0012
+    // budget and live non-anonymous Mach RAM, softly auto-scaling optional extra
+    // cold-expert slots above single-pass minimum when live headroom is tighter.
+    const required_wired_bytes: u64 = all_groups_sum + cold_min_pool_bytes + scratch_arena_bytes + total_kv_bytes;
+    const optional_cold_bytes: u64 = cold_pool_bytes -| cold_min_pool_bytes;
+    const live_reclaimable_bytes: u64 = options.live_reclaimable_override orelse
+        (try vmstat.Snapshot.capture()).liveZeroSwapReclaimableBytes();
+    const live_admission = try wired_budget.planWithLiveRam(
+        required_wired_bytes,
+        optional_cold_bytes,
+        live_reclaimable_bytes,
+        .{
+            .live_safety_margin_bytes = options.live_safety_margin_bytes,
+            .strict_live_ram = options.strict_live_ram,
+        },
+    );
+    if (has_cold and cold_req_slots > cold_min_slots and live_admission.cache_scaled_down) {
+        const extra_req: usize = cold_req_slots - cold_min_slots;
+        const granted_extra: usize = budget_mod.scaleOptionalCount(
+            extra_req,
+            cold_slot_stride_bytes,
+            live_admission.granted_optional_cache_bytes,
+            0,
+        );
+        cold_pool_spec.num_slots = cold_min_slots + @as(u32, @intCast(granted_extra));
+        try cold_pool_spec.validate();
+        cold_pool_bytes = try cold_pool_spec.totalBytes();
+    }
+
+    // Bin-pack atomic groups (global + per-layer) into `MTLBuffer`-sized shards.
+    // When cold experts are active and all hot weights + `ExpertSlotPool` fit in
+    // ONE shard, place them together in shard 0 so hot experts and pinned cold
+    // slots share one `MTLBuffer` and execute in a single zero-copy GPU dispatch!
+    const group_shard = try allocator.alloc(usize, group_count);
+    defer allocator.free(group_shard);
+    var shard_sizes: std.ArrayList(u64) = .empty;
+    defer shard_sizes.deinit(allocator);
+
+    const pool_in_shard0 = has_cold and (all_groups_sum + cold_pool_bytes <= shard_cap);
+
+    if (pool_in_shard0) {
+        try shard_sizes.append(allocator, all_groups_sum + cold_pool_bytes);
+        @memset(group_shard, 0);
+    } else {
+        for (group_bytes, 0..) |gb, g_idx| {
+            if (gb > shard_cap) return error.TensorExceedsShardLimit;
+            if (shard_sizes.items.len == 0 or shard_sizes.items[shard_sizes.items.len - 1] + gb > shard_cap) {
+                try shard_sizes.append(allocator, gb);
+            } else {
+                shard_sizes.items[shard_sizes.items.len - 1] += gb;
+            }
+            group_shard[g_idx] = shard_sizes.items.len - 1;
+        }
+    }
 
     var total_weight_bytes: u64 = 0;
     for (shard_sizes.items) |sb| total_weight_bytes += sb;
@@ -7481,12 +8101,6 @@ fn loadCore(
     const scratch_buf = try metal.Buffer.wrap(device, scratch_arena.bytes());
     errdefer scratch_buf.close();
 
-    // Allocate R5 retired `q8` KV pool inside `scratch_arena` when enabled (page-aligned first!).
-    const retired_kv_pool: ?attention.RetiredKvQ8Pool = if (use_retired_q8)
-        try attention.RetiredKvQ8Pool.init(&scratch_arena, retired_pool_spec)
-    else
-        null;
-
     // --- 5. Allocate IOSurface RGBA16Float KV tiles per layer & active chunk ---
     const kv_tiles = try allocator.alloc(metal.KvTile, total_kv_tiles);
     var tiles_inited: usize = 0;
@@ -7519,6 +8133,14 @@ fn loadCore(
     for (shards) |shard| try compute.makeResident(&.{shard.buffer});
     try compute.makeResident(&.{scratch_buf});
     try compute.makeTilesResident(kv_tiles);
+
+    // G16 (`P2`, ADR-0020): `< 0.1 ms` startup `.metallib` numerical canary over the
+    // already-resident `scratch_buf` BEFORE carving persistent scratch state.
+    var canary_result: ?dequant.CanaryResult = null;
+    if (options.startup_canary) {
+        canary_result = try dequant_pipes.runStartupNumericalCanaryInBuffer(&compute, scratch_buf, scratch_arena.bytes());
+        @memset(scratch_arena.bytes()[0..page.APPLE_PAGE_SIZE], 0);
+    }
 
     // --- 6b. Initialize heap-pinned ColdRuntime (`C3`-`C5`) when cold experts exist ---
     var cold_rt: ?*ColdRuntime = null;
@@ -7575,57 +8197,114 @@ fn loadCore(
         cold_rt = crt;
     }
 
-    // --- 7. Carve hot-path scratch buffers & populate bindless KV tile tables ---
-    const x_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
-    const x_norm_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
-    const q_raw = try scratch_arena.allocAligned(m_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
-    const k_raw = try scratch_arena.allocAligned(m_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
-    const v_raw = try scratch_arena.allocAligned(m_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
-    const attn_out_raw = try scratch_arena.allocAligned(m_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
-    const proj_out_raw = try scratch_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
-    const logits_raw = try scratch_arena.allocAligned(m_cap * @as(usize, config.vocab_size) * @sizeOf(f16), 64);
-    const out_tok_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
-    const gqa_scratch_raw = try scratch_arena.allocAligned(gqa_layout.total_bytes, 64);
+    // --- 7. Carve aliased wide-prefill / tree-verify scratch at offset 0 (`P0-B2`) ---
+    // Placing `allocAliasedPair` first (offset 0) guarantees `arena_a.offsetOf(p) ==
+    // arena_b.offsetOf(p) == scratch_arena.offsetOf(p)` for `MoeWorkspace` and all
+    // Metal buffer bindings, while keeping `lm_head` and `embed_tokens` 100% wired.
+    var aliased_scratch_saved_bytes: usize = 0;
+    var aliased_pair: ?arena_mod.AliasedScratchPair = null;
+    if (use_aliased_scratch) {
+        const pair = try scratch_arena.allocAliasedPair(wide_scratch_raw, tree_scratch_raw);
+        std.debug.assert(scratch_arena.offsetOf(pair.backing.ptr) == 0);
+        aliased_scratch_saved_bytes = pair.saved_bytes;
+        aliased_pair = pair;
+    }
+    const wp_arena: *arena_mod.WiredArena = if (aliased_pair != null) &aliased_pair.?.arena_a else &scratch_arena;
+    const tr_arena: *arena_mod.WiredArena = if (aliased_pair != null) &aliased_pair.?.arena_b else &scratch_arena;
+
+    // Region A: wide-prefill rolling activation scratch + wide MoeWorkspace / Dense FFN.
+    var wp_token_ids_host: []u32 = &.{};
+    var wp_token_ids_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_x_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_x_norm_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_q_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_k_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_v_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_attn_out_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_proj_out_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_moe_ws: ?moe.MoeWorkspace = null;
+    var wp_dense_gate_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_dense_up_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_dense_act_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    if (wide_enabled) {
+        const wp_tok_raw = try wp_arena.allocAligned(w_cap * @sizeOf(u32), 64);
+        const wp_x_raw = try wp_arena.allocAligned(w_cap * @as(usize, h) * @sizeOf(f16), 64);
+        const wp_xn_raw = try wp_arena.allocAligned(w_cap * @as(usize, h) * @sizeOf(f16), 64);
+        const wp_q_raw = try wp_arena.allocAligned(w_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
+        const wp_k_raw = try wp_arena.allocAligned(w_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
+        const wp_v_raw = try wp_arena.allocAligned(w_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
+        const wp_ao_raw = try wp_arena.allocAligned(w_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
+        const wp_po_raw = try wp_arena.allocAligned(w_cap * @as(usize, h) * @sizeOf(f16), 64);
+        @memset(wp_tok_raw, 0);
+        wp_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, wp_tok_raw));
+        wp_token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_tok_raw.ptr) };
+        wp_x_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_x_raw.ptr) };
+        wp_x_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_xn_raw.ptr) };
+        wp_q_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_q_raw.ptr) };
+        wp_k_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_k_raw.ptr) };
+        wp_v_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_v_raw.ptr) };
+        wp_attn_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_ao_raw.ptr) };
+        wp_proj_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_po_raw.ptr) };
+        if (config.arch == .qwen3_moe) {
+            wp_moe_ws = try moe.MoeWorkspace.init(wp_arena, .{
+                .max_tokens = wide_prefill_max_tokens,
+                .num_experts = config.num_experts,
+                .top_k = config.num_experts_per_tok,
+                .hidden_size = h,
+                .intermediate_size = config.moe_intermediate_size,
+            });
+        } else {
+            const wp_inter_bytes = w_cap * @as(usize, config.intermediate_size) * @sizeOf(f16);
+            const wp_dg = try wp_arena.allocAligned(wp_inter_bytes, 64);
+            const wp_du = try wp_arena.allocAligned(wp_inter_bytes, 64);
+            const wp_da = try wp_arena.allocAligned(wp_inter_bytes, 64);
+            wp_dense_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_dg.ptr) };
+            wp_dense_up_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_du.ptr) };
+            wp_dense_act_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_da.ptr) };
+        }
+    }
+
+    // Region B: single-step decode + `verifyTree` activation scratch & MoeWorkspace / Dense FFN.
+    const x_raw = try tr_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
+    const x_norm_raw = try tr_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
+    const q_raw = try tr_arena.allocAligned(m_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
+    const k_raw = try tr_arena.allocAligned(m_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
+    const v_raw = try tr_arena.allocAligned(m_cap * @as(usize, kv_dim) * @sizeOf(f16), 64);
+    const attn_out_raw = try tr_arena.allocAligned(m_cap * @as(usize, q_dim) * @sizeOf(f16), 64);
+    const proj_out_raw = try tr_arena.allocAligned(m_cap * @as(usize, h) * @sizeOf(f16), 64);
     @memset(q_raw, 0);
-    @memset(out_tok_raw, 0);
 
     var tree_token_ids_host: []u32 = &.{};
     var tree_positions_host: []u32 = &.{};
     var tree_ancestor_masks_host: []u64 = &.{};
     var tree_accepted_nodes_host: []u32 = &.{};
-    var topk_host: []moe.TopKCandidate = &.{};
     var tree_token_ids_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var tree_positions_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var tree_ancestor_masks_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var tree_accepted_nodes_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
-    var topk_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var tree_k_base_off: u64 = 0;
     var tree_v_base_off: u64 = 0;
     var gqa_tree_scratch_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     if (tree_enabled) {
-        const tt_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
-        const tp_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
-        const tm_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u64), 64);
-        const ta_raw = try scratch_arena.allocAligned(m_cap * @sizeOf(u32), 64);
-        const topk_raw = try scratch_arena.allocAligned(m_cap * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate), 64);
-        const tk_raw = try scratch_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
-        const tv_raw = try scratch_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
-        const gt_raw = try scratch_arena.allocAligned(gqa_tree_bytes, 64);
+        const tt_raw = try tr_arena.allocAligned(m_cap * @sizeOf(u32), 64);
+        const tp_raw = try tr_arena.allocAligned(m_cap * @sizeOf(u32), 64);
+        const tm_raw = try tr_arena.allocAligned(m_cap * @sizeOf(u64), 64);
+        const ta_raw = try tr_arena.allocAligned(m_cap * @sizeOf(u32), 64);
+        const tk_raw = try tr_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
+        const tv_raw = try tr_arena.allocAligned(num_layers * tree_kv_layer_stride, 64);
+        const gt_raw = try tr_arena.allocAligned(gqa_tree_bytes, 64);
         @memset(tt_raw, 0);
         @memset(tp_raw, 0);
         @memset(tm_raw, 0);
         @memset(ta_raw, 0);
-        @memset(topk_raw, 0);
         tree_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, tt_raw));
         tree_positions_host = @alignCast(std.mem.bytesAsSlice(u32, tp_raw));
         tree_ancestor_masks_host = @alignCast(std.mem.bytesAsSlice(u64, tm_raw));
         tree_accepted_nodes_host = @alignCast(std.mem.bytesAsSlice(u32, ta_raw));
-        topk_host = @alignCast(std.mem.bytesAsSlice(moe.TopKCandidate, topk_raw));
         tree_token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tt_raw.ptr) };
         tree_positions_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tp_raw.ptr) };
         tree_ancestor_masks_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tm_raw.ptr) };
         tree_accepted_nodes_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(ta_raw.ptr) };
-        topk_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(topk_raw.ptr) };
         tree_k_base_off = scratch_arena.offsetOf(tk_raw.ptr);
         tree_v_base_off = scratch_arena.offsetOf(tv_raw.ptr);
         gqa_tree_scratch_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gt_raw.ptr) };
@@ -7633,29 +8312,15 @@ fn loadCore(
 
     var aux_concat_host: []f16 = &.{};
     var aux_concat_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
-    var accepted_aux_host: []f16 = &.{};
-    var accepted_aux_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
-    var accepted_top_host: []f16 = &.{};
-    var accepted_top_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     if (options.enable_feature_taps) {
-        const aux_bytes = m_cap * 3 * @as(usize, h) * @sizeOf(f16);
-        const top_bytes = m_cap * @as(usize, h) * @sizeOf(f16);
-        const ac_raw = try scratch_arena.allocAligned(aux_bytes, 64);
-        const aa_raw = try scratch_arena.allocAligned(aux_bytes, 64);
-        const at_raw = try scratch_arena.allocAligned(top_bytes, 64);
+        const ac_raw = try tr_arena.allocAligned(m_cap * 3 * @as(usize, h) * @sizeOf(f16), 64);
         @memset(ac_raw, 0);
-        @memset(aa_raw, 0);
-        @memset(at_raw, 0);
         aux_concat_host = @alignCast(std.mem.bytesAsSlice(f16, ac_raw));
         aux_concat_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(ac_raw.ptr) };
-        accepted_aux_host = @alignCast(std.mem.bytesAsSlice(f16, aa_raw));
-        accepted_aux_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(aa_raw.ptr) };
-        accepted_top_host = @alignCast(std.mem.bytesAsSlice(f16, at_raw));
-        accepted_top_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(at_raw.ptr) };
     }
 
     const moe_ws: ?moe.MoeWorkspace = if (config.arch == .qwen3_moe)
-        try moe.MoeWorkspace.init(&scratch_arena, .{
+        try moe.MoeWorkspace.init(tr_arena, .{
             .max_tokens = max_tree_nodes,
             .num_experts = config.num_experts,
             .top_k = config.num_experts_per_tok,
@@ -7665,16 +8330,10 @@ fn loadCore(
     else
         null;
 
-    var layer_sched_hdr_base_off: u64 = 0;
-    var layer_sched_hdr_raw: []u8 = &.{};
     var pred_topk_base_off: u64 = 0;
     var pred_topk_host: []u32 = &.{};
     if (config.arch == .qwen3_moe and tree_enabled) {
-        layer_sched_hdr_raw = try scratch_arena.allocAligned(layer_sched_hdr_bytes, 64);
-        @memset(layer_sched_hdr_raw, 0);
-        layer_sched_hdr_base_off = scratch_arena.offsetOf(layer_sched_hdr_raw.ptr);
-
-        const pt_raw = try scratch_arena.allocAligned(pred_topk_total_bytes, 64);
+        const pt_raw = try tr_arena.allocAligned(pred_topk_total_bytes, 64);
         @memset(pt_raw, 0);
         pred_topk_base_off = scratch_arena.offsetOf(pt_raw.ptr);
         pred_topk_host = @alignCast(std.mem.bytesAsSlice(u32, pt_raw));
@@ -7688,15 +8347,60 @@ fn loadCore(
     var dense_act_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     if (config.arch == .qwen3_dense) {
         const inter_bytes = m_cap * @as(usize, config.intermediate_size) * @sizeOf(f16);
-        const dg = try scratch_arena.allocAligned(inter_bytes, 64);
-        const du = try scratch_arena.allocAligned(inter_bytes, 64);
-        const da = try scratch_arena.allocAligned(inter_bytes, 64);
+        const dg = try tr_arena.allocAligned(inter_bytes, 64);
+        const du = try tr_arena.allocAligned(inter_bytes, 64);
+        const da = try tr_arena.allocAligned(inter_bytes, 64);
         dense_gate_host = @alignCast(std.mem.bytesAsSlice(f16, dg));
         dense_up_host = @alignCast(std.mem.bytesAsSlice(f16, du));
         dense_act_host = @alignCast(std.mem.bytesAsSlice(f16, da));
         dense_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(dg.ptr) };
         dense_up_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(du.ptr) };
         dense_act_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(da.ptr) };
+    }
+
+    // Non-aliased persistent & cross-step scratch carved from `scratch_arena`:
+    // R5 retired `q8` KV pool (16 KiB page aligned), logits, out_token_ids, accepted taps,
+    // gqa_scratch, topk, and layer_sched_hdr.
+    const retired_kv_pool: ?attention.RetiredKvQ8Pool = if (use_retired_q8)
+        try attention.RetiredKvQ8Pool.init(&scratch_arena, retired_pool_spec)
+    else
+        null;
+
+    const logits_raw = try scratch_arena.allocAligned(logits_cap * @as(usize, config.vocab_size) * @sizeOf(f16), 64);
+    const out_tok_raw = try scratch_arena.allocAligned(logits_cap * @sizeOf(u32), 64);
+    const gqa_scratch_raw = try scratch_arena.allocAligned(gqa_layout.total_bytes, 64);
+    @memset(out_tok_raw, 0);
+
+    var topk_host: []moe.TopKCandidate = &.{};
+    var topk_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    if (tree_enabled) {
+        const topk_raw = try scratch_arena.allocAligned(m_cap * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate), 64);
+        @memset(topk_raw, 0);
+        topk_host = @alignCast(std.mem.bytesAsSlice(moe.TopKCandidate, topk_raw));
+        topk_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(topk_raw.ptr) };
+    }
+
+    var accepted_aux_host: []f16 = &.{};
+    var accepted_aux_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var accepted_top_host: []f16 = &.{};
+    var accepted_top_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    if (options.enable_feature_taps) {
+        const aa_raw = try scratch_arena.allocAligned(feat_cap * 3 * @as(usize, h) * @sizeOf(f16), 64);
+        const at_raw = try scratch_arena.allocAligned(feat_cap * @as(usize, h) * @sizeOf(f16), 64);
+        @memset(aa_raw, 0);
+        @memset(at_raw, 0);
+        accepted_aux_host = @alignCast(std.mem.bytesAsSlice(f16, aa_raw));
+        accepted_aux_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(aa_raw.ptr) };
+        accepted_top_host = @alignCast(std.mem.bytesAsSlice(f16, at_raw));
+        accepted_top_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(at_raw.ptr) };
+    }
+
+    var layer_sched_hdr_base_off: u64 = 0;
+    var layer_sched_hdr_raw: []u8 = &.{};
+    if (config.arch == .qwen3_moe and tree_enabled) {
+        layer_sched_hdr_raw = try scratch_arena.allocAligned(layer_sched_hdr_bytes, 64);
+        @memset(layer_sched_hdr_raw, 0);
+        layer_sched_hdr_base_off = scratch_arena.offsetOf(layer_sched_hdr_raw.ptr);
     }
 
     // --- 8. Load global weight blobs into shard 0 (zero-duplicate tied lm_head) ---
@@ -8154,6 +8858,27 @@ fn loadCore(
         .retired_kv_wired_bytes = retired_kv_wired_bytes,
         .retired_kv_pool = retired_kv_pool,
         .active_tile_phys_ring = active_tile_phys_ring,
+        .gpu_prefill_mode = options.gpu_prefill_mode,
+        .wide_prefill_max_tokens = wide_prefill_max_tokens,
+        .supports_wide_flash_attn = supports_wide_flash_attn,
+        .compute_all_logits = options.compute_all_logits,
+        .enable_prompt_tail_pruning = options.enable_prompt_tail_pruning,
+        .canary_result = canary_result,
+        .live_admission = live_admission,
+        .aliased_scratch_saved_bytes = aliased_scratch_saved_bytes,
+        .wp_token_ids_host = wp_token_ids_host,
+        .wp_token_ids_bind = wp_token_ids_bind,
+        .wp_x_bind = wp_x_bind,
+        .wp_x_norm_bind = wp_x_norm_bind,
+        .wp_q_bind = wp_q_bind,
+        .wp_k_bind = wp_k_bind,
+        .wp_v_bind = wp_v_bind,
+        .wp_attn_out_bind = wp_attn_out_bind,
+        .wp_proj_out_bind = wp_proj_out_bind,
+        .wp_moe_ws = wp_moe_ws,
+        .wp_dense_gate_bind = wp_dense_gate_bind,
+        .wp_dense_up_bind = wp_dense_up_bind,
+        .wp_dense_act_bind = wp_dense_act_bind,
     };
 }
 
@@ -8174,6 +8899,15 @@ pub const BatchRuntimeConfig = struct {
     kv_pool_chunk_groups: u32 = 0,
     /// Optional explicit wired budget override (defaults to `Budget.fromHost`).
     budget_override: ?budget_mod.Budget = null,
+    /// M6.8 (`G15`): GPU prefill mode (`null` inherits `model.gpu_prefill_mode`, default `.wide`).
+    gpu_prefill_mode: ?GpuPrefillMode = null,
+    /// M6.8 (`P1-B`): Reject startup with `error.ExceedsLiveZeroSwapRam` if required runtime
+    /// wired bytes exceed live zero-swap reclaimable RAM minus `live_safety_margin_bytes`.
+    strict_live_ram: bool = false,
+    /// M6.8 (`P1-B`): Safety margin subtracted from live reclaimable RAM (default 512 MiB).
+    live_safety_margin_bytes: u64 = budget_mod.DEFAULT_LIVE_SAFETY_MARGIN_BYTES,
+    /// Optional synthetic live zero-swap RAM override for deterministic tests.
+    live_reclaimable_override: ?u64 = null,
 };
 
 pub const BatchRuntimeStats = struct {
@@ -8186,10 +8920,13 @@ pub const BatchRuntimeStats = struct {
     prefix_hits: u64,
     prefix_hit_tokens: u64,
     prefix_cow_copies: u64,
+    boundary_hits: u64,
+    evict_first_evictions: u64,
     kv_retire_events: u64,
     decode_batch_steps: u64,
     decode_batch_tokens: u64,
     total_wired_bytes: u64,
+    live_admission: budget_mod.LiveAdmissionPlan,
 };
 
 pub const BatchRuntimeError = error{
@@ -8197,7 +8934,7 @@ pub const BatchRuntimeError = error{
     TreeNotEnabled,
     BudgetExceeded,
     OutOfMemory,
-} || sysinfo.Error || budget_mod.PlanError || arena_mod.WiredArena.InitError ||
+} || sysinfo.Error || vmstat.Error || budget_mod.PlanError || arena_mod.WiredArena.InitError ||
     arena_mod.WiredArena.AllocError || metal.WrapError || metal.Error ||
     attention.RetiredKvQ8PoolError || prefix_cache_mod.Error;
 
@@ -8278,7 +9015,9 @@ pub const Qwen3BatchRuntime = struct {
     scratch_evicted_handles: []prefix_cache_mod.KvBlockHandle,
     p_res: []f32,
 
-    // Telemetry
+    // Telemetry & M6.8 state
+    gpu_prefill_mode: GpuPrefillMode,
+    live_admission: budget_mod.LiveAdmissionPlan,
     prefix_hits: u64 = 0,
     prefix_hit_tokens: u64 = 0,
     prefix_cow_copies: u64 = 0,
@@ -8298,6 +9037,7 @@ pub const Qwen3BatchRuntime = struct {
         if (model.max_tree_nodes < needed_tree) {
             return error.TreeNotEnabled;
         }
+        const eff_gpu_prefill_mode: GpuPrefillMode = cfg.gpu_prefill_mode orelse model.gpu_prefill_mode;
 
         const num_layers: usize = model.layers.len;
         const max_chunks: u32 = model.num_chunks;
@@ -8317,7 +9057,9 @@ pub const Qwen3BatchRuntime = struct {
         const dev_info = try model.device.info();
         const wired_budget = cfg.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
 
-        // Compute `batch_arena` size first so remaining wired budget determines safe KV pool capacity.
+        // Compute core (non-prefix-cache) `batch_arena` bytes and per-chunk-group KV bytes first
+        // so `P1-B` live non-anonymous RAM admission can softly auto-scale optional `PrefixCache`
+        // chunks when live zero-swap headroom is tighter than static headroom.
         const layer_kv_tiles_stride_bytes: usize = amf.align64(
             @as(usize, cfg.max_slots) * @as(usize, active_per_slot) * @sizeOf(attention.KvTilePair),
         );
@@ -8337,8 +9079,91 @@ pub const Qwen3BatchRuntime = struct {
             model.config.head_dim,
             attention.MAX_SPLITS,
         );
+        const prompt_hist_bytes: usize = amf.align64(
+            @as(usize, cfg.max_slots) * @as(usize, model.max_seq_len) * @sizeOf(u32),
+        );
+        const kv_tile_rows: u32 = model.config.num_key_value_heads * model.chunk_tokens;
+        const kv_tile_alloc_bytes: u64 = try page.alignUp(
+            @as(usize, kv_tile_rows) * model.config.head_dim * @sizeOf(f16),
+        );
+        const bytes_per_group: u64 = @as(u64, num_layers) * 2 * kv_tile_alloc_bytes;
+
+        const base_retired_spec: attention.RetiredKvQ8PoolSpec = .{
+            .num_kv_heads = model.config.num_key_value_heads,
+            .head_dim = model.config.head_dim,
+            .chunk_tokens = model.chunk_tokens,
+            .max_chunks = if (use_retired_q8) @as(u32, @intCast(num_layers)) * (cfg.max_slots * max_retired_per_slot) else 1,
+        };
+        const base_retired_bytes: usize = if (use_retired_q8)
+            try attention.RetiredKvQ8Pool.requiredArenaBytes(base_retired_spec)
+        else
+            0;
+        const base_arena_raw: usize =
+            base_retired_bytes +
+            num_layers * layer_kv_tiles_stride_bytes +
+            num_layers * layer_retired_ids_stride_bytes +
+            num_layers * layer_write_slots_stride_bytes +
+            num_layers * layer_gqa_descs_stride_bytes +
+            amf.align64(gqa_batch_layout.total_bytes) +
+            prompt_hist_bytes +
+            8 * page.APPLE_PAGE_SIZE;
+        const base_arena_bytes: u64 = try page.alignUp(base_arena_raw);
+        const min_req_groups: u32 = if (cfg.kv_pool_chunk_groups > 0) cfg.kv_pool_chunk_groups else cfg.max_slots;
+        const required_runtime_bytes: u64 = base_arena_bytes + @as(u64, min_req_groups) * bytes_per_group;
+
+        const req_pc_spec: prefix_cache_mod.PrefixCacheSpec = .{
+            .max_entries = if (cfg.prefix_cache_chunks > 0) cfg.prefix_cache_chunks else 1,
+            .block_tokens = model.chunk_tokens,
+            .num_kv_layers = @intCast(num_layers),
+        };
+        const req_pc_meta_bytes: u64 = if (cfg.prefix_cache_chunks > 0)
+            try prefix_cache_mod.PrefixCache.requiredBytes(req_pc_spec)
+        else
+            0;
+        const req_pc_retired_bytes: u64 = if (use_retired_q8 and cfg.prefix_cache_chunks > 0) blk: {
+            const full_spec: attention.RetiredKvQ8PoolSpec = .{
+                .num_kv_heads = model.config.num_key_value_heads,
+                .head_dim = model.config.head_dim,
+                .chunk_tokens = model.chunk_tokens,
+                .max_chunks = @as(u32, @intCast(num_layers)) * (cfg.max_slots * max_retired_per_slot + cfg.prefix_cache_chunks),
+            };
+            break :blk (try attention.RetiredKvQ8Pool.requiredArenaBytes(full_spec)) -| base_retired_bytes;
+        } else 0;
+        const optional_pc_bytes: u64 = if (cfg.prefix_cache_chunks > 0)
+            req_pc_meta_bytes + req_pc_retired_bytes + @as(u64, cfg.prefix_cache_chunks) * bytes_per_group
+        else
+            0;
+
+        if (model.totalWiredBytes() > wired_budget.limit_bytes) return error.BudgetExceeded;
+        const rem_limit_raw: u64 = wired_budget.limit_bytes - model.totalWiredBytes();
+        const rem_budget: budget_mod.Budget = .{
+            .limit_bytes = rem_limit_raw - (rem_limit_raw % page.APPLE_PAGE_SIZE),
+            .binding_limit = wired_budget.binding_limit,
+            .raw_limit_bytes = rem_limit_raw,
+        };
+        const live_reclaimable_bytes: u64 = cfg.live_reclaimable_override orelse
+            (try vmstat.Snapshot.capture()).liveZeroSwapReclaimableBytes();
+        const live_admission = try rem_budget.planWithLiveRam(
+            required_runtime_bytes,
+            optional_pc_bytes,
+            live_reclaimable_bytes,
+            .{
+                .live_safety_margin_bytes = cfg.live_safety_margin_bytes,
+                .strict_live_ram = cfg.strict_live_ram,
+            },
+        );
+        const eff_prefix_cache_chunks: u32 = if (cfg.prefix_cache_chunks > 0 and live_admission.cache_scaled_down) blk: {
+            const unit_bytes: usize = @intCast(@max(@as(u64, 1), optional_pc_bytes / cfg.prefix_cache_chunks));
+            break :blk @intCast(budget_mod.scaleOptionalCount(
+                cfg.prefix_cache_chunks,
+                unit_bytes,
+                live_admission.granted_optional_cache_bytes,
+                0,
+            ));
+        } else cfg.prefix_cache_chunks;
+
         const retired_pool_chunks: u32 = if (use_retired_q8)
-            @as(u32, @intCast(num_layers)) * (cfg.max_slots * max_retired_per_slot + cfg.prefix_cache_chunks)
+            @as(u32, @intCast(num_layers)) * (cfg.max_slots * max_retired_per_slot + eff_prefix_cache_chunks)
         else
             1;
         const retired_pool_spec: attention.RetiredKvQ8PoolSpec = .{
@@ -8352,17 +9177,14 @@ pub const Qwen3BatchRuntime = struct {
         else
             0;
         const pc_spec: prefix_cache_mod.PrefixCacheSpec = .{
-            .max_entries = if (cfg.prefix_cache_chunks > 0) cfg.prefix_cache_chunks else 1,
+            .max_entries = if (eff_prefix_cache_chunks > 0) eff_prefix_cache_chunks else 1,
             .block_tokens = model.chunk_tokens,
             .num_kv_layers = @intCast(num_layers),
         };
-        const pc_bytes: usize = if (cfg.prefix_cache_chunks > 0)
+        const pc_bytes: usize = if (eff_prefix_cache_chunks > 0)
             try prefix_cache_mod.PrefixCache.requiredBytes(pc_spec)
         else
             0;
-        const prompt_hist_bytes: usize = amf.align64(
-            @as(usize, cfg.max_slots) * @as(usize, model.max_seq_len) * @sizeOf(u32),
-        );
 
         const arena_raw: usize =
             retired_pool_bytes +
@@ -8377,15 +9199,10 @@ pub const Qwen3BatchRuntime = struct {
         const batch_arena_bytes = try page.alignUp(arena_raw);
 
         // Size shared IOSurface chunk group pool within remaining wired budget.
-        const kv_tile_rows: u32 = model.config.num_key_value_heads * model.chunk_tokens;
-        const kv_tile_alloc_bytes: u64 = try page.alignUp(
-            @as(usize, kv_tile_rows) * model.config.head_dim * @sizeOf(f16),
-        );
-        const bytes_per_group: u64 = @as(u64, num_layers) * 2 * kv_tile_alloc_bytes;
         const desired_groups: u32 = if (cfg.kv_pool_chunk_groups > 0)
             cfg.kv_pool_chunk_groups
         else
-            cfg.max_slots * active_per_slot + cfg.prefix_cache_chunks;
+            cfg.max_slots * active_per_slot + eff_prefix_cache_chunks;
 
         const base_used: u64 = model.totalWiredBytes() + batch_arena_bytes;
         if (base_used + @as(u64, cfg.max_slots) * bytes_per_group > wired_budget.limit_bytes) {
@@ -8414,7 +9231,7 @@ pub const Qwen3BatchRuntime = struct {
             try attention.RetiredKvQ8Pool.init(&batch_arena, retired_pool_spec)
         else
             null;
-        const prefix_cache: ?prefix_cache_mod.PrefixCache = if (cfg.prefix_cache_chunks > 0)
+        const prefix_cache: ?prefix_cache_mod.PrefixCache = if (eff_prefix_cache_chunks > 0)
             try prefix_cache_mod.PrefixCache.init(&batch_arena, pc_spec)
         else
             null;
@@ -8559,6 +9376,8 @@ pub const Qwen3BatchRuntime = struct {
             .scratch_handles = scratch_handles,
             .scratch_evicted_handles = scratch_evicted_handles,
             .p_res = p_res,
+            .gpu_prefill_mode = eff_gpu_prefill_mode,
+            .live_admission = live_admission,
         };
     }
 
@@ -8588,6 +9407,8 @@ pub const Qwen3BatchRuntime = struct {
         const pc_cap: u32 = if (self.prefix_cache) |pc| pc.spec.max_entries else 0;
         const pc_live: u32 = if (self.prefix_cache) |pc| pc.liveEntries() else 0;
         const pc_pinned: u32 = if (self.prefix_cache) |pc| pc.pinnedEntries() else 0;
+        const b_hits: u64 = if (self.prefix_cache) |pc| pc.boundary_hits else 0;
+        const ef_evicts: u64 = if (self.prefix_cache) |pc| pc.evict_first_evictions else 0;
         return .{
             .max_slots = self.max_slots,
             .pool_chunk_groups = self.pool_chunk_groups,
@@ -8598,10 +9419,13 @@ pub const Qwen3BatchRuntime = struct {
             .prefix_hits = self.prefix_hits,
             .prefix_hit_tokens = self.prefix_hit_tokens,
             .prefix_cow_copies = self.prefix_cow_copies,
+            .boundary_hits = b_hits,
+            .evict_first_evictions = ef_evicts,
             .kv_retire_events = self.kv_retire_events,
             .decode_batch_steps = self.decode_batch_steps,
             .decode_batch_tokens = self.decode_batch_tokens,
             .total_wired_bytes = self.total_wired_bytes,
+            .live_admission = self.live_admission,
         };
     }
 
@@ -9013,7 +9837,12 @@ pub const Qwen3BatchRuntime = struct {
         return .{ .matched_tokens = final_matched, .prefix_handle = handle };
     }
 
-    fn populatePrefixCacheAfterPrefill(self: *Qwen3BatchRuntime, slot_id: u32, is_final_chunk: bool) void {
+    fn populatePrefixCacheAfterPrefill(
+        self: *Qwen3BatchRuntime,
+        slot_id: u32,
+        is_final_chunk: bool,
+        is_boundary_checkpoint: bool,
+    ) void {
         var pc = &(self.prefix_cache orelse return);
         const slot = &self.slots[slot_id];
         const bs: u32 = self.model.chunk_tokens;
@@ -9067,8 +9896,10 @@ pub const Qwen3BatchRuntime = struct {
             slot.prefix_cached_full_chunks += 1;
         }
 
-        // Snapshot partial tail (`1..bs-1`) via GPU CoW into `PrefixCache` when prompt finishes.
-        if (is_final_chunk) {
+        // Snapshot partial tail (`1..bs-1`) via GPU CoW into `PrefixCache` when either
+        // the prompt completes OR a ChatML message-boundary checkpoint (`C15`, ADR-0020)
+        // lands mid-tile (`insertBoundaryCheckpoint` marks intra-tile checkpoints `evict_first = true`).
+        if (is_final_chunk or is_boundary_checkpoint) {
             const tail_len = slot.seq_len % bs;
             const tail_c = slot.seq_len / bs;
             if (tail_len > 0 and tail_c < self.max_chunks and
@@ -9081,16 +9912,30 @@ pub const Qwen3BatchRuntime = struct {
                             self.scratch_handles[l] = prefix_cache_mod.KvBlockHandle.activeFromTiles(pair.k, pair.v, snap_g);
                         }
                         const tok_start: usize = @as(usize, tail_c) * bs;
-                        if (pc.insertTailBlock(
-                            slot.last_cached_parent_id,
-                            slot.prompt_tokens[tok_start .. tok_start + tail_len],
-                            self.scratch_handles,
-                            .{
-                                .evict_if_full = true,
-                                .evicted_handles_out = self.scratch_evicted_handles,
-                                .pin_on_insert = false,
-                            },
-                        )) |ins| {
+                        const ins_res = if (is_boundary_checkpoint)
+                            pc.insertBoundaryCheckpoint(
+                                slot.last_cached_parent_id,
+                                slot.prompt_tokens[tok_start .. tok_start + tail_len],
+                                self.scratch_handles,
+                                .{
+                                    .evict_if_full = true,
+                                    .evicted_handles_out = self.scratch_evicted_handles,
+                                    .pin_on_insert = false,
+                                    .evict_first = true,
+                                },
+                            )
+                        else
+                            pc.insertTailBlock(
+                                slot.last_cached_parent_id,
+                                slot.prompt_tokens[tok_start .. tok_start + tail_len],
+                                self.scratch_handles,
+                                .{
+                                    .evict_if_full = true,
+                                    .evicted_handles_out = self.scratch_evicted_handles,
+                                    .pin_on_insert = false,
+                                },
+                            );
+                        if (ins_res) |ins| {
                             if (ins.evicted != null) {
                                 self.reclaimEvictedHandles(self.scratch_evicted_handles);
                             }
@@ -9106,6 +9951,309 @@ pub const Qwen3BatchRuntime = struct {
                 }
             }
         }
+    }
+
+    fn runPrefillWideChunk(
+        self: *Qwen3BatchRuntime,
+        slot_id: u32,
+        tokens: []const u32,
+        base_pos: u32,
+        is_final_chunk: bool,
+        compute_logits: bool,
+    ) StepError!u32 {
+        const m: u32 = @intCast(tokens.len);
+        const model = self.model;
+        const slot = &self.slots[slot_id];
+        const h = model.config.hidden_size;
+        const kv_dim = model.config.num_key_value_heads * model.config.head_dim;
+
+        const first_c: u32 = base_pos / model.chunk_tokens;
+        const last_c: u32 = (base_pos + m - 1) / model.chunk_tokens;
+        var ci: u32 = first_c;
+        while (ci <= last_c) : (ci += 1) {
+            if (!self.ensureSlotWritableChunk(slot_id, ci)) return error.PositionOutOfRange;
+        }
+
+        @memcpy(model.wp_token_ids_host[0..m], tokens);
+        const last_l: usize = model.layers.len - 1;
+        const allow_tail_prune = model.enable_prompt_tail_pruning and !model.compute_all_logits;
+        const prune_non_final_last = allow_tail_prune and (!is_final_chunk or !compute_logits);
+        const prune_final_last_to_m1 = allow_tail_prune and is_final_chunk and compute_logits and (m > 1);
+
+        const has_retired = (self.retired_pool != null and slot.num_retired_chunks > 0);
+        const rpool_bind: ?metal.BufferBinding = if (has_retired) self.retired_pool.?.binding(self.batch_buf) else null;
+        const ret_plane_stride: u32 = if (has_retired) self.retired_pool.?.plane_stride_bytes else 0;
+        const ret_chunk_stride: u32 = if (has_retired) self.retired_pool.?.chunk_stride_bytes else 0;
+        const kv_len_after: u32 = base_pos + m;
+
+        var frame = try model.compute.beginFrame(model.timeout_ms);
+        errdefer frame.abort();
+
+        try model.moe_pipes.encodeEmbedLookup(&frame, model.embed.dtype, .{
+            .weight = model.embed.weight,
+            .scale_bias = model.embed.scale_bias,
+            .tokens = .{ .token_ids = model.wp_token_ids_bind },
+            .out = model.wp_x_bind,
+            .m = m,
+            .vocab_size = model.config.vocab_size,
+            .hidden_size = h,
+        }, false);
+
+        for (model.layers, 0..) |layer, l| {
+            const is_last_layer = (l == last_l);
+            const skip_last_rest = is_last_layer and prune_non_final_last;
+            const tail_m1_last = is_last_layer and prune_final_last_to_m1;
+            const slot_kv_bind = self.slotKvTilesBinding(l, slot_id);
+            const slot_ret_ids_bind: ?metal.BufferBinding = if (has_retired) self.slotRetiredIdsBinding(l, slot_id) else null;
+
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = model.wp_x_bind,
+                .w = layer.input_layernorm.binding,
+                .y = model.wp_x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
+            }, true);
+
+            if (skip_last_rest) {
+                // P0-B1 non-final chunk at L-1: write complete L-1 KvTiles so PrefixCache
+                // & boundary checkpoints stay 100% intact across all layers, then stop!
+                try model.encodeLinearGemmWithTile(&frame, layer.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                try model.encodeLinearGemmWithTile(&frame, layer.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                    .q = model.wp_q_bind,
+                    .k = model.wp_k_bind,
+                    .v = model.wp_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = slot_kv_bind,
+                    .num_tokens = m,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .start_pos = base_pos,
+                    .chunk_tokens = model.chunk_tokens,
+                    .num_retired_chunks = slot.num_retired_chunks,
+                    .kv_only = true,
+                    .rms_eps = model.config.rms_norm_eps,
+                    .rope_theta = model.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, true);
+                break;
+            }
+
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = model.scratch_buf,
+                .offset = model.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            const last_x_norm_bind: metal.BufferBinding = .{
+                .buffer = model.scratch_buf,
+                .offset = model.wp_x_norm_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+
+            if (tail_m1_last) {
+                try model.encodeLinearGemmWithTile(&frame, layer.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, true);
+                try model.encodeLinearGemmWithTile(&frame, layer.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                try model.encodeLinearGemv(&frame, layer.q_proj, last_x_norm_bind, model.wp_q_bind, false);
+
+                try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                    .q = model.wp_q_bind,
+                    .k = model.wp_k_bind,
+                    .v = model.wp_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = slot_kv_bind,
+                    .num_tokens = m - 1,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .start_pos = base_pos,
+                    .chunk_tokens = model.chunk_tokens,
+                    .num_retired_chunks = slot.num_retired_chunks,
+                    .kv_only = true,
+                    .rms_eps = model.config.rms_norm_eps,
+                    .rope_theta = model.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, true);
+                const last_k_bind: metal.BufferBinding = .{
+                    .buffer = model.scratch_buf,
+                    .offset = model.wp_k_bind.offset + @as(u64, m - 1) * kv_dim * @sizeOf(f16),
+                };
+                const last_v_bind: metal.BufferBinding = .{
+                    .buffer = model.scratch_buf,
+                    .offset = model.wp_v_bind.offset + @as(u64, m - 1) * kv_dim * @sizeOf(f16),
+                };
+                try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                    .q = model.wp_q_bind,
+                    .k = last_k_bind,
+                    .v = last_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = slot_kv_bind,
+                    .num_tokens = 1,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .start_pos = base_pos + m - 1,
+                    .chunk_tokens = model.chunk_tokens,
+                    .num_retired_chunks = slot.num_retired_chunks,
+                    .kv_only = false,
+                    .rms_eps = model.config.rms_norm_eps,
+                    .rope_theta = model.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, false);
+
+                try model.attn_pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
+                    .q = model.wp_q_bind,
+                    .kv_tiles = slot_kv_bind,
+                    .retired_pool = rpool_bind,
+                    .retired_chunk_ids = slot_ret_ids_bind,
+                    .out = model.wp_attn_out_bind,
+                    .num_q = 1,
+                    .q_start_pos = base_pos + m - 1,
+                    .kv_len = kv_len_after,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .chunk_tokens = model.chunk_tokens,
+                    .num_retired_chunks = if (has_retired) slot.num_retired_chunks else 0,
+                    .retired_plane_stride_bytes = ret_plane_stride,
+                    .retired_chunk_stride_bytes = ret_chunk_stride,
+                }, true);
+            } else {
+                try model.encodeLinearGemmWithTile(&frame, layer.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
+                try model.encodeLinearGemmWithTile(&frame, layer.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
+                try model.encodeLinearGemmWithTile(&frame, layer.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+
+                try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+                    .q = model.wp_q_bind,
+                    .k = model.wp_k_bind,
+                    .v = model.wp_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = slot_kv_bind,
+                    .num_tokens = m,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .start_pos = base_pos,
+                    .chunk_tokens = model.chunk_tokens,
+                    .num_retired_chunks = slot.num_retired_chunks,
+                    .kv_only = false,
+                    .rms_eps = model.config.rms_norm_eps,
+                    .rope_theta = model.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, true);
+
+                try model.attn_pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
+                    .q = model.wp_q_bind,
+                    .kv_tiles = slot_kv_bind,
+                    .retired_pool = rpool_bind,
+                    .retired_chunk_ids = slot_ret_ids_bind,
+                    .out = model.wp_attn_out_bind,
+                    .num_q = m,
+                    .q_start_pos = base_pos,
+                    .kv_len = kv_len_after,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .chunk_tokens = model.chunk_tokens,
+                    .num_retired_chunks = if (has_retired) slot.num_retired_chunks else 0,
+                    .retired_plane_stride_bytes = ret_plane_stride,
+                    .retired_chunk_stride_bytes = ret_chunk_stride,
+                }, true);
+            }
+
+            const eff_m: u32 = if (tail_m1_last) 1 else m;
+            const eff_x_bind: metal.BufferBinding = if (tail_m1_last) last_x_bind else model.wp_x_bind;
+
+            try model.encodeLinearGemmWithTile(&frame, layer.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
+            try model.moe_pipes.encodeResidualAdd(&frame, .{
+                .x = eff_x_bind,
+                .delta = model.wp_proj_out_bind,
+                .count = eff_m * h,
+            }, true);
+
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = eff_x_bind,
+                .w = layer.post_attention_layernorm.binding,
+                .y = model.wp_x_norm_bind,
+                .num_rows = eff_m,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, true);
+
+            switch (model.config.arch) {
+                .qwen3_moe => {
+                    const ws_ptr = &(model.wp_moe_ws.?);
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = model.wp_x_norm_bind,
+                        .router = layer.router,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = ws_ptr,
+                        .workspace_buf = model.scratch_buf,
+                        .residual = eff_x_bind,
+                        .out = eff_x_bind,
+                        .m = eff_m,
+                        .num_experts = model.config.num_experts,
+                        .top_k = model.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = model.config.moe_intermediate_size,
+                        .norm_topk_prob = model.config.norm_topk_prob,
+                    };
+                    try model.encodeMoELayerDispatch(&frame, layer, moe_args, true);
+                },
+                .qwen3_dense => {
+                    try model.encodeLinearGemmWithTile(&frame, layer.dense_gate, model.wp_x_norm_bind, model.wp_dense_gate_bind, eff_m, true, true);
+                    try model.encodeLinearGemmWithTile(&frame, layer.dense_up, model.wp_x_norm_bind, model.wp_dense_up_bind, eff_m, true, false);
+                    try model.moe_pipes.encodeSiluMul(&frame, .{
+                        .gate = model.wp_dense_gate_bind,
+                        .up = model.wp_dense_up_bind,
+                        .out = model.wp_dense_act_bind,
+                        .count = eff_m * model.config.intermediate_size,
+                    }, true);
+                    try model.encodeLinearGemmWithTile(&frame, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, true, true);
+                    try model.moe_pipes.encodeResidualAdd(&frame, .{
+                        .x = eff_x_bind,
+                        .delta = model.wp_proj_out_bind,
+                        .count = eff_m * h,
+                    }, true);
+                },
+            }
+        }
+
+        if (compute_logits) {
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = model.scratch_buf,
+                .offset = model.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            try model.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = last_x_bind,
+                .w = model.final_norm.binding,
+                .y = model.wp_x_norm_bind,
+                .num_rows = 1,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = model.final_norm.dtype,
+            }, true);
+            try model.encodeLinearGemv(&frame, model.lm_head, model.wp_x_norm_bind, model.logits_bind, true);
+            try model.moe_pipes.encodeArgmaxRows(&frame, .{
+                .logits = model.logits_bind,
+                .out_token_ids = model.out_token_id_bind,
+                .num_rows = 1,
+                .vocab_size = model.config.vocab_size,
+                .logits_dtype = .f16,
+            }, true);
+        }
+
+        const sig = try frame.commit();
+        try model.compute.wait(sig, model.timeout_ms);
+        slot.seq_len = kv_len_after;
+        if (compute_logits) model.last_logits_row = 0;
+        return if (compute_logits) model.out_token_ids_host[0] else 0;
     }
 
     fn runPrefillSubChunk(
@@ -9172,9 +10320,9 @@ pub const Qwen3BatchRuntime = struct {
                 _ = try model.execLinearHetero(&frame_opt, layer.v_proj, model.x_norm_bind, model.x_norm_host, model.v_bind, model.v_host, m, false);
             } else {
                 const f = try model.ensureOptionalFrame(&frame_opt);
-                try model.encodeLinearGemm(f, layer.q_proj, model.x_norm_bind, model.q_bind, m, true);
-                try model.encodeLinearGemm(f, layer.k_proj, model.x_norm_bind, model.k_bind, m, false);
-                try model.encodeLinearGemm(f, layer.v_proj, model.x_norm_bind, model.v_bind, m, false);
+                try model.encodeLinearGemmWithTile(f, layer.q_proj, model.x_norm_bind, model.q_bind, m, false, true);
+                try model.encodeLinearGemmWithTile(f, layer.k_proj, model.x_norm_bind, model.k_bind, m, false, false);
+                try model.encodeLinearGemmWithTile(f, layer.v_proj, model.x_norm_bind, model.v_bind, m, false, false);
             }
 
             {
@@ -9248,7 +10396,7 @@ pub const Qwen3BatchRuntime = struct {
                 _ = try model.execLinearHetero(&frame_opt, layer.o_proj, model.attn_out_bind, model.attn_out_host, model.proj_out_bind, model.proj_out_host, m, true);
             } else {
                 const f = try model.ensureOptionalFrame(&frame_opt);
-                try model.encodeLinearGemm(f, layer.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
+                try model.encodeLinearGemmWithTile(f, layer.o_proj, model.attn_out_bind, model.proj_out_bind, m, false, true);
             }
 
             {
@@ -9319,15 +10467,15 @@ pub const Qwen3BatchRuntime = struct {
                         }
                     } else {
                         const f = try model.ensureOptionalFrame(&frame_opt);
-                        try model.encodeLinearGemm(f, layer.dense_gate, model.x_norm_bind, model.dense_gate_bind, m, true);
-                        try model.encodeLinearGemm(f, layer.dense_up, model.x_norm_bind, model.dense_up_bind, m, false);
+                        try model.encodeLinearGemmWithTile(f, layer.dense_gate, model.x_norm_bind, model.dense_gate_bind, m, false, true);
+                        try model.encodeLinearGemmWithTile(f, layer.dense_up, model.x_norm_bind, model.dense_up_bind, m, false, false);
                         try model.moe_pipes.encodeSiluMul(f, .{
                             .gate = model.dense_gate_bind,
                             .up = model.dense_up_bind,
                             .out = model.dense_act_bind,
                             .count = m * model.config.intermediate_size,
                         }, true);
-                        try model.encodeLinearGemm(f, layer.dense_down, model.dense_act_bind, model.proj_out_bind, m, true);
+                        try model.encodeLinearGemmWithTile(f, layer.dense_down, model.dense_act_bind, model.proj_out_bind, m, false, true);
                         try model.moe_pipes.encodeResidualAdd(f, .{
                             .x = model.x_bind,
                             .delta = model.proj_out_bind,
@@ -9437,20 +10585,35 @@ pub const Qwen3BatchRuntime = struct {
             chunk.tokens,
         );
 
-        const sub_cap: usize = self.model.max_tree_nodes;
+        const use_wide = (self.gpu_prefill_mode == .wide and self.model.usesWideGpuPrefill());
+        const sub_cap: usize = if (use_wide) blk: {
+            const wcap = self.model.wide_prefill_max_tokens;
+            break :blk if (self.retired_pool != null) @min(wcap, self.model.chunk_tokens) else wcap;
+        } else self.model.max_tree_nodes;
         var off: usize = 0;
         var last_argmax: u32 = 0;
         while (off < chunk.tokens.len) {
             const take = @min(sub_cap, chunk.tokens.len - off);
             const sub_pos = chunk.start_pos + @as(u32, @intCast(off));
-            const is_last = (off + take == chunk.tokens.len) and chunk.is_final_chunk;
-            last_argmax = self.runPrefillSubChunk(
-                chunk.slot_id,
-                chunk.tokens[off .. off + take],
-                sub_pos,
-                is_last,
-            ) catch return error.PrefillFailed;
-            self.populatePrefixCacheAfterPrefill(chunk.slot_id, is_last);
+            const at_chunk_end = (off + take == chunk.tokens.len);
+            const is_last = at_chunk_end and chunk.is_final_chunk;
+            const is_boundary = at_chunk_end and chunk.is_message_boundary_checkpoint;
+            last_argmax = if (use_wide)
+                self.runPrefillWideChunk(
+                    chunk.slot_id,
+                    chunk.tokens[off .. off + take],
+                    sub_pos,
+                    is_last,
+                    is_last,
+                ) catch return error.PrefillFailed
+            else
+                self.runPrefillSubChunk(
+                    chunk.slot_id,
+                    chunk.tokens[off .. off + take],
+                    sub_pos,
+                    is_last,
+                ) catch return error.PrefillFailed;
+            self.populatePrefixCacheAfterPrefill(chunk.slot_id, is_last, is_boundary);
             self.maybeRetireSlotExcess(chunk.slot_id);
             off += take;
         }
@@ -12492,4 +13655,295 @@ test "M6.5 C14+R8 Qwen3BatchRuntime continuous batching + PrefixCache CoW + D11 
     try std.testing.expectEqual(@as(u32, 0), st.prefix_cache_pinned_entries);
     try std.testing.expect(st.prefix_hits >= 3);
     try std.testing.expect(st.prefix_cow_copies >= 3);
+}
+
+test "M6.8 G15+G16+R9 Qwen3Model wide GPU prefill + prompt_tail pruning + scratch aliasing + canary + live-RAM" {
+    const gpa = std.testing.allocator;
+
+    const specs = [_]struct {
+        cfg: ModelConfig,
+        linear_dtype: quant.WeightDType,
+        embed_dtype: quant.WeightDType,
+        norm_dtype: quant.FloatDType,
+        seed: u64,
+    }{
+        .{
+            .cfg = .{
+                .arch = .qwen3_moe,
+                .quant_bits = .q4,
+                .group_size = 64,
+                .vocab_size = 128,
+                .hidden_size = 128,
+                .num_hidden_layers = 2,
+                .num_attention_heads = 2,
+                .num_key_value_heads = 1,
+                .head_dim = 64,
+                .moe_intermediate_size = 128,
+                .num_experts = 4,
+                .num_experts_per_tok = 2,
+                .norm_topk_prob = true,
+                .tie_word_embeddings = false,
+            },
+            .linear_dtype = .q4_affine,
+            .embed_dtype = .f16,
+            .norm_dtype = .f16,
+            .seed = 0x68_A001,
+        },
+        .{
+            .cfg = .{
+                .arch = .qwen3_dense,
+                .quant_bits = .q4,
+                .group_size = 64,
+                .vocab_size = 128,
+                .hidden_size = 128,
+                .num_hidden_layers = 2,
+                .num_attention_heads = 2,
+                .num_key_value_heads = 1,
+                .head_dim = 64,
+                .intermediate_size = 256,
+                .tie_word_embeddings = true,
+            },
+            .linear_dtype = .bf16,
+            .embed_dtype = .bf16,
+            .norm_dtype = .bf16,
+            .seed = 0x68_A002,
+        },
+    };
+
+    var prompt: [150]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast((i * 17 + 5) % 120);
+
+    for (specs) |sp| {
+        const img = try buildSyntheticAmfImageWithSpec(gpa, sp.cfg, .{
+            .linear_dtype = sp.linear_dtype,
+            .embed_dtype = sp.embed_dtype,
+            .norm_dtype = sp.norm_dtype,
+        }, sp.seed);
+        defer gpa.free(img);
+
+        // Baseline legacy `tree64` mode (`max_tree_nodes = 16`, wide prefill off).
+        var tree_m = try Qwen3Model.loadFromBytes(gpa, img, sp.cfg, .{
+            .max_seq_len = 256,
+            .chunk_tokens = 128,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .tree64,
+            .startup_canary = true,
+        });
+        defer tree_m.deinit(gpa);
+        try std.testing.expect(!tree_m.usesWideGpuPrefill());
+        try std.testing.expect(tree_m.canary_result != null);
+        try std.testing.expect(tree_m.canary_result.?.max_abs_err_q4 < 5.0e-2);
+
+        // M6.8 `wide` mode (`wide_prefill_chunk_tokens = 128`, `P0-B1` pruning on, `P0-B2` aliased scratch on).
+        var wide_m = try Qwen3Model.loadFromBytes(gpa, img, sp.cfg, .{
+            .max_seq_len = 256,
+            .chunk_tokens = 128,
+            .max_tree_nodes = 16,
+            .gpu_prefill_mode = .wide,
+            .wide_prefill_chunk_tokens = 128,
+            .alias_prefill_tree_scratch = true,
+            .enable_prompt_tail_pruning = true,
+            .startup_canary = true,
+        });
+        defer wide_m.deinit(gpa);
+        try std.testing.expect(wide_m.usesWideGpuPrefill());
+        try std.testing.expect(wide_m.canary_result != null);
+        try std.testing.expect(wide_m.canary_result.?.max_abs_err_f16 < 1.0e-2);
+        try std.testing.expect(wide_m.aliased_scratch_saved_bytes > 0);
+
+        // Multi-chunk prefill (`150` tokens = `128` non-final pruned + `22` final `M=1` pruned).
+        const t0_tree = try tree_m.prefillPrompt(&prompt, true);
+        const t0_wide = try wide_m.prefillPrompt(&prompt, true);
+
+        const tree_logits = tree_m.readLastLogitsF16();
+        const wide_logits = wide_m.readLastLogitsF16();
+        try std.testing.expectEqual(tree_logits.len, wide_logits.len);
+        var max_diff: f32 = 0.0;
+        for (tree_logits, wide_logits) |a, b| {
+            const d = @abs(@as(f32, a) - @as(f32, b));
+            if (d > max_diff) max_diff = d;
+        }
+        try std.testing.expect(max_diff < 5.0e-2);
+        try std.testing.expectEqual(t0_tree, t0_wide);
+
+        // 3 decode steps after wide prefill verify `L-1` KV cache parity across both chunks.
+        var cur_tree = t0_tree;
+        var cur_wide = t0_wide;
+        for (0..3) |s| {
+            const pos: u32 = @intCast(prompt.len + s);
+            cur_tree = try tree_m.stepDecode(cur_tree, pos);
+            cur_wide = try wide_m.stepDecode(cur_wide, pos);
+            try std.testing.expectEqual(cur_tree, cur_wide);
+        }
+
+        // Seamless wide-prefill -> `verifyTree` + `commitTreeKv` transition over `P0-B2` aliased scratch!
+        const base_pos: u32 = @intCast(prompt.len + 3);
+        const cand_toks = [_]u32{ cur_wide, 7, 13 };
+        const cand_pos = [_]u32{ base_pos, base_pos + 1, base_pos + 2 };
+        const cand_masks = [_]u64{ 0b001, 0b011, 0b111 };
+        const vr_wide = try wide_m.verifyTree(&cand_toks, &cand_pos, &cand_masks, base_pos, true);
+        const vr_tree = try tree_m.verifyTree(&cand_toks, &cand_pos, &cand_masks, base_pos, true);
+        try std.testing.expectEqualSlices(u32, vr_tree.argmax_tokens, vr_wide.argmax_tokens);
+        const accepted = [_]u16{ 0, 1 };
+        try wide_m.commitTreeKv(base_pos, &accepted);
+        try tree_m.commitTreeKv(base_pos, &accepted);
+        const post_wide = try wide_m.stepDecode(vr_wide.argmax_tokens[1], base_pos + 2);
+        const post_tree = try tree_m.stepDecode(vr_tree.argmax_tokens[1], base_pos + 2);
+        try std.testing.expectEqual(post_tree, post_wide);
+
+        // `P1-B` live RAM admission guard: strict rejects, soft succeeds and records warning.
+        try std.testing.expectError(
+            error.ExceedsLiveZeroSwapRam,
+            Qwen3Model.loadFromBytes(gpa, img, sp.cfg, .{
+                .max_seq_len = 64,
+                .chunk_tokens = 64,
+                .strict_live_ram = true,
+                .live_reclaimable_override = 16384,
+            }),
+        );
+        var soft_m = try Qwen3Model.loadFromBytes(gpa, img, sp.cfg, .{
+            .max_seq_len = 64,
+            .chunk_tokens = 64,
+            .strict_live_ram = false,
+            .live_reclaimable_override = 16384,
+            .startup_canary = false,
+        });
+        defer soft_m.deinit(gpa);
+        try std.testing.expect(soft_m.live_admission.required_wired_bytes > soft_m.live_admission.live_budget_bytes);
+    }
+}
+
+test "M6.8 C15 Qwen3BatchRuntime wide prefill + ChatML message-boundary PrefixCache checkpoint" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q4,
+        .group_size = 64,
+        .vocab_size = 128,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 4,
+        .num_experts_per_tok = 2,
+        .norm_topk_prob = true,
+        .tie_word_embeddings = false,
+    };
+    const img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .f16,
+        .norm_dtype = .f16,
+    }, 0x68_C150);
+    defer gpa.free(img);
+
+    var serial_m = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+        .max_seq_len = 192,
+        .chunk_tokens = 64,
+        .max_tree_nodes = 16,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 128,
+    });
+    defer serial_m.deinit(gpa);
+
+    var batch_m = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+        .max_seq_len = 192,
+        .chunk_tokens = 64,
+        .max_tree_nodes = 16,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 128,
+    });
+    defer batch_m.deinit(gpa);
+
+    var rt = try Qwen3BatchRuntime.init(gpa, &batch_m, .{
+        .max_slots = 4,
+        .prefix_cache_chunks = 8,
+        .gpu_prefill_mode = .wide,
+    });
+    defer rt.deinit(gpa);
+
+    // 70-token shared ChatML history (`64` full chunk + `6` intra-tile tokens),
+    // followed by different final user turns!
+    var p0: [82]u32 = undefined;
+    var p1: [84]u32 = undefined;
+    for (0..70) |i| {
+        const tok: u32 = @intCast((i * 11 + 3) % 100);
+        p0[i] = tok;
+        p1[i] = tok;
+    }
+    for (70..82) |i| p0[i] = @intCast(100 + (i - 70));
+    for (70..84) |i| p1[i] = @intCast(112 + (i - 70));
+
+    const gen_len: usize = 4;
+    var ref_p1: [gen_len]u32 = undefined;
+    serial_m.resetKvCache();
+    var tok = try serial_m.prefillPrompt(&p1, true);
+    ref_p1[0] = tok;
+    for (1..gen_len) |step| {
+        tok = try serial_m.stepDecode(tok, @intCast(p1.len + step - 1));
+        ref_p1[step] = tok;
+    }
+
+    var sched = try batch_sched.BatchScheduler.init(gpa, .{
+        .max_batch_size = 4,
+        .max_prefill_chunk_tokens = 128,
+        .max_prompt_tokens = 192,
+        .message_boundary_cache = true,
+    });
+    defer sched.deinit(gpa);
+
+    const Collector = struct {
+        tokens: [2][gen_len]u32 = @splat(@splat(0)),
+        counts: [2]usize = @splat(0),
+        hits: [2]u32 = @splat(0),
+        fn onPrefillDone(ctx: *anyopaque, _: u16, tag: u64, _: u32, hit: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.hits[@intCast(tag)] = hit;
+            return true;
+        }
+        fn onToken(ctx: *anyopaque, _: u16, tag: u64, tid: u32, _: u32) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const idx: usize = @intCast(tag);
+            if (self.counts[idx] < gen_len) {
+                self.tokens[idx][self.counts[idx]] = tid;
+                self.counts[idx] += 1;
+            }
+            return true;
+        }
+    };
+    var col: Collector = .{};
+    const obs: batch_sched.StepObserver = .{
+        .ctx = &col,
+        .onPrefillDoneFn = Collector.onPrefillDone,
+        .onTokenFn = Collector.onToken,
+    };
+    const backend = rt.batchBackend();
+
+    // Turn 1: caches canonical chunk `[0..64)` and `evict_first` boundary checkpoint at `70`.
+    _ = try sched.enqueue(&p0, .{
+        .request_id = 1,
+        .user_tag = 0,
+        .max_tokens = gen_len,
+        .ignore_eos = true,
+        .message_boundary_token = 70,
+    });
+    while (sched.activeSlotCount() > 0) _ = sched.step(backend, obs);
+    try std.testing.expectEqual(@as(u32, 0), col.hits[0]);
+
+    // Turn 2 (edited final user message): hits exact `70`-token message-boundary checkpoint!
+    _ = try sched.enqueue(&p1, .{
+        .request_id = 2,
+        .user_tag = 1,
+        .max_tokens = gen_len,
+        .ignore_eos = true,
+        .message_boundary_token = 70,
+    });
+    while (sched.activeSlotCount() > 0) _ = sched.step(backend, obs);
+
+    try std.testing.expectEqual(@as(u32, 70), col.hits[1]);
+    try std.testing.expectEqualSlices(u32, &ref_p1, &col.tokens[1]);
+    const st = rt.stats();
+    try std.testing.expect(st.boundary_hits >= 1);
+    try std.testing.expectEqual(@as(u32, 0), st.prefix_cache_pinned_entries);
 }
