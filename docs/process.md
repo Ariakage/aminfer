@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M6.8 — configurable wide-chunk GPU prefill, lossless `prompt_tail` pruning, serving QoS, ChatML message-boundary prefix caching, live non-anonymous RAM admission, and startup `.metallib` canary (`R9`, `G15`, `G16`, `C15`; [ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)) completed (2026-11-22); next: **M6.9 — single-binary multi-generation Apple Silicon adaptation (`Apple9` + `Apple10+` GPU `NAX` TensorOps, canary-guarded fallback, and chip-parameterized bandwidth/crossover profiles; `G17`, `C16`, Spike `S8`; [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))**, followed by **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`)**.
+**M6.9 — single-binary multi-generation Apple Silicon adaptation (`Apple9` + `Apple10+` GPU `NAX` TensorOps, canary-guarded fallback, and chip-parameterized bandwidth/crossover profiles; `G17`, `C16`, Spike `S8`; [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))**: **In progress (code complete; awaiting Apple10+ HW acceptance & Spike S8 bench)** — all host/AIR/`.metallib`/fallback/`ChipProfile`/CLI/`bench-m69` code and M4 (`Apple9`) verification gates are implemented (`3bf7cc4..320791e`), while physical `Apple10+` (M5+) hardware acceptance and `Spike S8` benchmark archiving in [benchmarks/results.md](benchmarks/results.md) remain deferred until an `Apple10+` host is available; next milestone after `Spike S8` is **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`)**.
 
 ## Milestones
 
@@ -26,7 +26,7 @@ Status-row IDs refer to [status.md](status.md).
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`), recurrent depth & heterogeneous MoE scaling | R6, W9, W10, W16, W17, G7–G9, G10 (GR), D12, D13, C10 (PLE) | Composable operator graph + `LoopSchedule` (`GDN S_tmp` isolation, `SelfSpecRecurrent`, L2 SME2 `Step-LoRA`); synthetic + scale-calibrated `qwen4_exp` (GDN + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end without swap; `Qwen3-30B-A3B` & 512-expert GSQ+RCO + `ZT0` non-uniform LUTs and `Placement.cpu_sme2` draft heads benchmarked | Completed |
 | M6.5 | Continuous batching, long-context KV tiering & zero-copy multimodal ingress | R5, R8, G14, C14 | Server iteration-level continuous batching (`M > 1` slots per GPU/SME2 pass), shared prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang` packs, and `VideoToolbox → IOSurface → MTLTexture` zero-copy vision/video ingress verified without swap | Completed |
 | M6.8 | Wide-chunk GPU prefill, `prompt_tail` pruning, serving QoS & live-RAM / `.metallib` guards | R9, G15, G16, C15 | Default-on `--gpu-prefill-mode wide\|tree64` (`512+` FlashAttention + `BM=64, BN=64` GEMM, direct `KvTile` write) & lossless `prompt_tail` pruning verified bit-consistent vs `tree64`; single-request wide-prefill/`verifyTree` scratch aliasing; default-on `--decode-share`, `--adaptive-prefill-narrow`, and `--message-boundary-cache` `PrefixCache` checkpoints benchmarked under concurrent load; `HOST_VM_INFO64` non-anonymous live RAM soft cache scaling (`+ --strict-live-ram`) & startup `.metallib` numerical canary (`~0.19–0.24 ms` warm in-buffer / `~1.3–3.8 ms` cold first-submit) + `Apple10` `NAX` hook verified without swap | Completed |
-| M6.9 | Multi-generation Apple Silicon (`Apple9` + `Apple10+` GPU `NAX`) single-binary adaptation | G17, C16 | `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`) `f16`/`bf16` & staged group-64 `q2`/`q3`/`q4` kernels compiled into unified `aminfer.metallib` with lazy `MTL4Compiler` `Apple10`/`Apple11` selection (`--prefill-matmul-backend auto\|simdgroup\|nax`), `G16` canary auto-fallback to `simdgroup_apple9` (`+ --strict-nax`), chip-parameterized `spec_bus_gbs` (`--bus-bandwidth-gbs`), and runtime prefill/draft crossover calibration verified with zero M4 regression (`Apple10+` HW throughput gated on Spike `S8`) | Planned |
+| M6.9 | Multi-generation Apple Silicon (`Apple9` + `Apple10+` GPU `NAX`) single-binary adaptation | G17, C16 | `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`) `f16`/`bf16` & staged group-64 `q2`/`q3`/`q4` kernels compiled into unified `aminfer.metallib` with lazy `MTL4Compiler` `Apple10`/`Apple11` selection (`--prefill-matmul-backend auto\|simdgroup\|nax`), `G16` canary auto-fallback to `simdgroup_apple9` (`+ --strict-nax`), chip-parameterized `spec_bus_gbs` (`--bus-bandwidth-gbs`), and runtime prefill/draft crossover calibration verified with zero M4 regression (`Apple10+` HW throughput gated on Spike `S8`) | In progress (code complete; awaiting Apple10+ HW acceptance & Spike S8 bench) |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
 ## Spikes
@@ -521,6 +521,15 @@ runs including 3/3 consecutive `bench-m68` executions):
 - **`R9` live non-anonymous RAM admission & soft wired-cache auto-sizing**:
   - `probe` / `bench-m68` live reclaimable RAM: `10,053 MiB` / `9,624 MiB` (`free + speculative + purgeable + external`, excluding `inactive`, `internal`, `compressor`, `wired`); soft cache auto-sizing scales `64 -> 16` chunks under tight headroom (`cache_scaled_down = yes`), `--strict-live-ram` refuses oversubscribed admissions (`strict_live_ram_rejected = yes`), and `infer_swapouts_delta = total_swapouts_delta = 0` across 3/3 consecutive `bench-m68` runs.
 
+## M6.9 task list
+
+- [x] `C16` multi-generation Apple Silicon chip profile (`src/platform/sysinfo.zig` `cpuBrand`/`hwModel`, `src/platform/chip_profile.zig` `ChipProfile.resolve`/`spec_bus_gbs`/`selectPrefillRoute`/`passesC13CoexecGate`), `spec_bus_gbs` parameterization in `src/gpu/attention.zig`, `wavefront.shouldUseWavefront` in `src/ane/wavefront.zig`, and `SmeCaps.draftL2BudgetBytes()` / `D5` placement gating in `src/cpu/sme.zig` and `src/spec/draft.zig` (`3bf7cc4`)
+- [x] `G17` + `G16` unified-`.metallib` Metal 4 `NAX` TensorOps (`src/kernels/nax_tensorops.metal`: `ami_dense_gemm_nax`, `ami_dequant_gemm_nax`, `ami_fp4_e2m1_gemm_nax` compiled via `build.zig` under `-std=metal4.0 -Wall -Werror -mmacosx-version-min=26.0`), `Apple7..11` GPU family probe & `Library.hasFunction` (`src/bridge/{apple_bridge.h,apple_bridge.m,metal.zig}`), and lazy `MTL4Compiler` `*_nax` PSOs + canary-guarded `nax -> simdgroup_apple9` atomic demotion & `--strict-nax` enforcement (`src/gpu/dequant.zig`) (`76e08c7`)
+- [x] Engine root and real-model integration (`src/root.zig`, `src/model/{qwen3,graph}.zig`): `chip_profile` export & tests, `LoadOptions` (`prefill_backend_mode`, `strict_nax`, `bus_bandwidth_gbs_override`), resolved `ChipProfile` stored on `Qwen3Model`/`GraphModel`, `DequantPipelines.initWithOptions` + `runStartupNumericalCanaryInBufferMut` startup canary demotion wiring, and `wavefront.shouldUseWavefront` routing with zero M4 behavior change (`4fcfc0c`)
+- [x] CLI, `aminfer probe`, `spec_bus_gbs` benchmark telemetry, and `aminfer bench-m69` harness (`src/main.zig`, `src/bench/runner.zig`): `--prefill-matmul-backend auto|simdgroup|nax`, `--strict-nax`, and `--bus-bandwidth-gbs <f64>` across `decode`, `spec-decode`, `bench-decode`, `serve`, `probe`, and `bench-m69`; enhanced `probe` chip/GPU/metallib/NAX reporting; `runM69WithConfig` Section 1 gates (`.metallib` symbols, `ChipProfile`, fallback & simulated canary demotion) and Section 2 `Spike S8` hardware parity/TFLOP/s sweep (honestly reporting `spike_s8.nax_hw_status=skipped_requires_apple10` on `Apple9` M4) (`320791e`)
+- [x] M4 (`Apple9`) build, cross-generation `-Dcpu=apple_m1`, `Debug`/`ReleaseSafe`/`ReleaseFast` full & filtered unit tests, Metal API/Shader validation (`0` errors), CLI `probe`/`--help` smoke checks, offline `tools/` tests, and markdown verification (`340/340` Zig tests, `72/72` Python tests)
+- [ ] Physical `Apple10+` (M5+) hardware acceptance and `Spike S8` benchmark run (`aminfer bench-m69` TFLOP/s, `fp32` parity, `G16` canary margins vs offline `metalfe`, and GPU-vs-ANE wavefront prefill crossover) archived in [benchmarks/results.md](benchmarks/results.md)
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -567,6 +576,8 @@ Only checks that actually ran are listed.
 | 2026-11-22 | M6.5 Phase 2 & audit remediation (`abb552c`, `f0640ae`, `6a5869a`, `60dc7ec`, `8332ee8`, `37ecb74`, `ac5b4e3`, `c4c319f`, `990d2a4`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug, ReleaseSafe x2 uncached, ReleaseFast: `300/300` = `294` lib + `6` CLI), filtered `test-vision` (`11/11`), `test-hybrid` (`13/13`), and `test-sme` (`10/10`) in Debug and ReleaseSafe, direct Debug `test-vision` (`11/11`), `test-hybrid` (`13/13`), `test-sme` (`10/10`), lib (`294/294`), and CLI (`6/6`) binaries under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (API + GPU Validation enabled, `0` errors), `tools` unittest (`72/72`), built `aminfer-docs.ang` (`32.02 MiB`, `198,113` entries), ReleaseFast `aminfer bench-m65` (with `F_NOCACHE` key probe and `verify_table_crc = false`: `ngram.cold_query_us p50=257.88 / p99=418.92`), live `aminfer serve` serial vs continuous (`C = 1/4/8`, `Qwen3-0.6B` BF16 `7.60x` & GSQ+RCO `3.94x`, `D11` bit-exact), live `R8` `PrefixCache` (`8.87x` TTFT p50), live multi-pack `.ang` HTTP API, real `Qwen3-0.6B` BF16 `R5` >1,024-tok decode (`25/25` bit-exact, `-52 MiB`, `+3.8%` tok/s), and `G14` `qwen4_exp` HW HEVC multimodal decode (`0` swapouts across all runs) archived in [benchmarks/results.md](benchmarks/results.md#m65-continuous-batching-long-context-kv-tiering-shared-prefix-cache-and-zero-copy-multimodal-ingress) | Pass |
 | 2026-11-22 | M6.8 Phase 1 (`ec1a3b7`, `356f654`): `R9` live `HOST_VM_INFO64` non-anonymous RAM admission (`vmstat`, `budget`) & `WiredArena.allocAliasedPair`; `C15` `decode-share` QoS ledger, depth-scaled chunk narrowing, evict-first `PrefixCache` boundary checkpoints & ChatML boundary parser; `G15` wide-chunk `BM=64, BN=64` GEMM, direct bindless `KvTile` FlashAttention & wide hybrid `GDN`/`QSA`/SWA kernels; `G16` startup `.metallib` numerical canary (`f16`/`bf16`/`q4`) & `Apple10` (`NAX`) capability probe | Pass |
 | 2026-11-22 | M6.8 Phase 2, audit remediation & final gate (`f70becf`, `ad3ee7f`, `2063bc9`, `2b9312d`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug, ReleaseSafe, ReleaseFast: `327/327` = `320` lib + `7` CLI, incl. `R = 3` QSA sparse `tail_m1_last` + PLE Isolation #2/#3 regression test and `autoClampServeBatchSlots` tests), filtered `test-vision` (`11/11`), `test-hybrid` (`16/16`), and `test-sme` (`10/10`) in Debug and ReleaseSafe, direct Debug `test-vision` (`11/11`), `test-hybrid` (`16/16`), `test-sme` (`10/10`), lib (`320/320`), and CLI (`7/7`) binaries under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (Metal API + GPU Validation enabled, `0` errors), `tools` unittest (`72/72`), ReleaseFast `aminfer probe` (`supports_apple10=no`, `simdgroup_apple9`, `live_zero_swap_reclaimable_mib=10053`, `canary.cold_elapsed_us=2132.5`, `canary.warm_inbuf_elapsed_us=219.0`), 3/3 consecutive ReleaseFast `aminfer bench-m68` runs (`1.72x–3.91x` wide+pruning across 6 real + 1 synth rows, `100%` greedy match, `R9`-gated `EAGLE-3` `cold_exp=66/41/96` with `greedy_match=yes` & `malloc_blk=0`, QoS `p50` `103.7x` / `p99` `1.47x` with `narrowed_chunks=3`, ChatML boundary `6.37x` TTFT, soft cache `64 -> 16`, `--strict-live-ram` rejection, `infer_swapouts_delta=0`, `total_swapouts_delta=0` on 3/3 runs), standalone `aminfer bench-decode` `tree64` vs `wide` A/B (`0.6B` `2.44x`, `14B` `2.24x`, `30B-A3B` `1.27x`, `-37..-39 MiB` wired, `0` swapouts), and live `aminfer serve` HTTP/SSE with default `--max-active-requests` at `--max-seq-len 10240 --prefix-cache-chunks 16` (`max_batch_size=2`, `3,534 MiB` wired, `Turn 1 -> 2` `11.06x` TTFT, `boundary_hits=1`, `evict_first_evictions=1`, `qos_steps=decode=210 prefill=4 narrowed_chunks=1`, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m68-wide-chunk-gpu-prefill-prompt_tail-pruning-serving-qos-live-ram-admission-and-metallib-canary) | Pass |
+| 2026-11-22 | M6.9 Phase 1 (`3bf7cc4`, `76e08c7`): `C16` `ChipProfile` (`sysinfo`, `chip_profile`, `attention`, `wavefront`, `sme`, `draft`) and `G17` Metal 4 `NAX` TensorOps (`nax_tensorops.metal` compiled into unified `aminfer.metallib` with `-std=metal4.0 -Wall -Werror`, `Apple7..11` probe + `Library.hasFunction`, lazy `*_nax` PSOs & canary auto-demotion in `dequant.zig`) | Pass |
+| 2026-11-22 | M6.9 Phase 2 code & M4 (`Apple9`) verification gate (`4fcfc0c`, `320791e`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug) & `zig build -Dcpu=apple_m1`, `zig build test` (Debug, ReleaseSafe, ReleaseFast: `340/340` = `332` lib + `8` CLI), filtered `test-vision` (`12/12`), `test-hybrid` (`17/17`), and `test-sme` (`11/11`) in Debug and ReleaseSafe, direct Debug binaries (`lib` `332/332`, `CLI` `8/8`, `test-vision` `12/12`, `test-hybrid` `17/17`, `test-sme` `11/11`) under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (Metal API + GPU Validation enabled, `0` errors), `./zig-out/bin/aminfer --help` & `./zig-out/bin/aminfer probe` (`chip.generation=m4`, `chip.spec_bus_gbs=120.00`, `gpu.apple_family=9`, `gpu.supports_nax=no`, `metallib.has_*_nax=yes`, `gpu.nax_fallback_reason=unsupported_gpu_family`, plus `--bus-bandwidth-gbs 546 --prefill-matmul-backend simdgroup` override check), `tools` unittest (`72/72`), and markdown link/anchor/hygiene audit across all 38 `.md` files (`Spike S8` physical `Apple10+` hardware bench deferred) | Pass (M4 code/unit gate; Apple10+ Spike S8 pending) |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -751,14 +762,23 @@ Update this before the context window runs out or when handing off.
     remediation (`R9`-gated `bench-m68` + `cold_rt` wide prefill, `ADR-0019`
     QSA/PLE `R = 3` wide-prefill isolations, cold + warm in-buffer canary
     profiling, `serve` default-slot IOSurface auto-clamping & `narrowed_chunks`
-    `bench-m68` coverage)
-- Current test & build baseline (`M0`–`M6.8` complete, `0` `catch {}`):
-  - Zig suite: `327/327` passing (`320` lib + `7` CLI) in `Debug`,
-    `ReleaseSafe`, and `ReleaseFast`; filtered `test-vision` (`11/11`),
-    `test-hybrid` (`16/16`), and `test-sme` (`10/10`) passing in `Debug` and
-    `ReleaseSafe`; direct Debug binaries under
-    `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`test-vision` `11/11`,
-    `test-hybrid` `16/16`, `test-sme` `10/10`, lib `320/320`, CLI `7/7`,
+    `bench-m68` coverage), `365cccd` M6.8 refreshed docs
+  - M6.9 (code complete; `Spike S8` awaiting `Apple10+` HW): `7c22f0d`
+    `ADR-0021` M6.9 roadmap codification, `3bf7cc4` `C16` multi-generation
+    `ChipProfile` & parameterized bandwidth/crossover gates, `76e08c7` `G17`
+    Metal 4 `NAX` TensorOps (`nax_tensorops.metal`) compiled into unified
+    `aminfer.metallib` with `Apple7..11` probe & canary auto-fallback,
+    `4fcfc0c` `root` / `Qwen3Model` / `GraphModel` `ChipProfile`, `NAX`
+    backend options, canary demotion & wavefront routing, `320791e` CLI flags,
+    enhanced `probe` telemetry, `spec_bus_gbs` benchmark wiring & `bench-m69`
+    harness
+- Current test & build baseline (`M0`–`M6.8` complete, `M6.9` code complete, `0` `catch {}`):
+  - Zig suite: `340/340` passing (`332` lib + `8` CLI) in `Debug`,
+    `ReleaseSafe`, and `ReleaseFast`; `-Dcpu=apple_m1` build passing; filtered
+    `test-vision` (`12/12`), `test-hybrid` (`17/17`), and `test-sme` (`11/11`)
+    passing in `Debug` and `ReleaseSafe`; direct Debug binaries under
+    `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`test-vision` `12/12`,
+    `test-hybrid` `17/17`, `test-sme` `11/11`, lib `332/332`, CLI `8/8`,
     `0` validation errors)
   - Offline Python `tools/` suite: `72/72` passing (`cd tools && uv run python -m unittest discover -s tests`)
 - On-disk checkpoints & artifacts (strict rule: keep all `.amf`/`.ang`/`.mlpackage`
@@ -781,12 +801,14 @@ Update this before the context window runs out or when handing off.
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: none (`M0`–`M6.8` completed; next milestone is **M6.9** covering
-  `G17`, `C16`, and Spike `S8` per
-  [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md),
-  followed by **M7** covering Ultra and cluster scale-out:
-  `DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10`
-  Engram, and `X1`–`X3` per
+- In flight: **M6.9** (`G17`, `C16`, Spike `S8` per
+  [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))
+  code & M4 (`Apple9`) verification gates complete; physical `Apple10+` (M5+)
+  hardware acceptance and `Spike S8` (`aminfer bench-m69`) benchmark archive in
+  [benchmarks/results.md](benchmarks/results.md) deferred until an `Apple10+`
+  host is available. Next milestone after `Spike S8` is **M7** covering Ultra
+  and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC,
+  `G11`, `D10`, `C10` Engram, and `X1`–`X3` per
   [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md))
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
