@@ -10,7 +10,7 @@ const usage =
     \\commands:
     \\  probe             print the kernel, Metal and Neural Engine facts of this machine
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6 and M6.5 benchmark suites
+    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5 and M6.8 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
@@ -20,6 +20,7 @@ const usage =
     \\  bench-m5          run M5 G13 q2/hetero-MoE, C6 F_NOCACHE ngram, D8 PEARL & C7/C8 kqueue server
     \\  bench-m6          run M6 G7/G8/G9/G10, C10 PLE, scale-qwen4-512e+MTP, D12 & D13 cpu_sme2
     \\  bench-m65         run M6.5 G14 HW VideoToolbox vision, R5 32K q8 KV, R8 PrefixCache & C14 batch/ngram
+    \\  bench-m68         run M6.8 G16 canary/Apple10, G15 wide prefill/tail-pruning A/B, C15 QoS/boundary & R9 live-RAM
     \\  bench-a2          evaluate real-checkpoint A2 ANE cross-layer expert predictor recall/lead-time
     \\                    --amf <path> --config <path> --tokenizer <path> [--prompt <text>]
     \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [--no-verify-crc]
@@ -27,7 +28,8 @@ const usage =
     \\                    --amf <path> --config <path> [--scale-layers N] [--prefill-tokens N]
     \\                    [--decode-steps N] [--cold-experts-per-layer N] [--heat-profile <path>]
     \\                    [--cold-slots N] [--wired-cap-mib N] [--io-backend auto|aio|pread]
-    \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
+    \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
+    \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--kv-retire-q8-after-chunks N]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
     \\                    [--loop-early-exit] [--no-ane-predictor] [--no-verify-crc]
@@ -40,7 +42,8 @@ const usage =
     \\                    [--loop-early-exit]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
-    \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
+    \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
+    \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--no-verify-crc]
     \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent)
     \\                    --amf <path> --config <path> --tokenizer <path> --prompt <text>
@@ -55,13 +58,16 @@ const usage =
     \\                    [--top-k N] [--no-prune] [--temperature T] [--seed N]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
-    \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
+    \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
+    \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--max-tokens N] [--ignore-eos] [--no-verify-crc]
-    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14)
+    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15)
     \\                    --amf <path> --config <path> --tokenizer <path>
     \\                    [--host 127.0.0.1] [--port 8080] [--model-id <id>]
     \\                    [--max-seq-len N] [--max-conns N] [--max-active-requests N]
     \\                    [--batch-mode auto|continuous|serial] [--prefix-cache-chunks N]
+    \\                    [--decode-share F] [--adaptive-prefill-narrow on|off]
+    \\                    [--message-boundary-cache on|off]
     \\                    [--kv-retire-q8-after-chunks N] [--ngram-pack <domain>=<path.ang>]
     \\                    [--draft-amf <path> --draft-config <path>]
     \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent]
@@ -74,7 +80,8 @@ const usage =
     \\                    [--top-k N] [--no-prune]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
-    \\                    [--prefill-mode auto|gpu|hybrid] [--ane-predictor <path>]
+    \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
+    \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--no-verify-crc]
     \\
 ;
@@ -109,6 +116,8 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM6(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m65")) {
         try runBenchM65(arena, out);
+    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m68")) {
+        try runBenchM68(arena, out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-a2")) {
         try runBenchA2(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-decode")) {
@@ -136,6 +145,57 @@ fn parseVtCodec(str: []const u8) error{InvalidVtCodec}!aminfer.metal.VtCodec {
     if (std.mem.eql(u8, str, "hevc") or std.mem.eql(u8, str, "h265")) return .hevc;
     if (std.mem.eql(u8, str, "h264") or std.mem.eql(u8, str, "avc")) return .h264;
     return error.InvalidVtCodec;
+}
+
+fn parseOnOff(str: []const u8) error{InvalidOnOff}!bool {
+    if (std.mem.eql(u8, str, "on") or std.mem.eql(u8, str, "true") or std.mem.eql(u8, str, "1")) return true;
+    if (std.mem.eql(u8, str, "off") or std.mem.eql(u8, str, "false") or std.mem.eql(u8, str, "0")) return false;
+    return error.InvalidOnOff;
+}
+
+/// Auto-sizes optional `.ang` N-gram LRU cache pages (`P1-B`, ADR-0020) against
+/// live `HOST_VM_INFO64` non-anonymous reclaimable RAM minus safety margin while
+/// preserving the single-page operational minimum.
+fn scaleOptionalNgramCachePages(
+    requested_pages: usize,
+    budget_override: ?aminfer.budget.Budget,
+    already_wired_bytes: u64,
+    strict_live_ram: bool,
+) !usize {
+    if (requested_pages <= 1) return requested_pages;
+    const base_budget = budget_override orelse blk: {
+        const facts = try aminfer.sysinfo.Facts.read();
+        const dev = try aminfer.metal.Device.open();
+        defer dev.close();
+        const info = try dev.info();
+        break :blk aminfer.budget.Budget.fromHost(facts, info, .{});
+    };
+    const rem_limit: u64 = if (base_budget.limit_bytes > already_wired_bytes)
+        base_budget.limit_bytes - already_wired_bytes
+    else
+        0;
+    const rem_budget: aminfer.budget.Budget = .{
+        .limit_bytes = rem_limit,
+        .binding_limit = base_budget.binding_limit,
+        .raw_limit_bytes = rem_limit,
+    };
+    const snap = try aminfer.vmstat.Snapshot.capture();
+    const min_bytes: u64 = aminfer.page.APPLE_PAGE_SIZE;
+    const extra_pages: usize = requested_pages - 1;
+    const extra_bytes: u64 = @as(u64, extra_pages) * aminfer.page.APPLE_PAGE_SIZE;
+    const plan = try rem_budget.planWithLiveRam(
+        min_bytes,
+        extra_bytes,
+        snap.liveZeroSwapReclaimableBytes(),
+        .{ .strict_live_ram = strict_live_ram },
+    );
+    const granted_extra: usize = aminfer.budget.scaleOptionalCount(
+        extra_pages,
+        aminfer.page.APPLE_PAGE_SIZE,
+        plan.granted_optional_cache_bytes,
+        0,
+    );
+    return 1 + granted_extra;
 }
 
 const ServeBatchMode = enum {
@@ -455,6 +515,8 @@ const DecodeCliArgs = struct {
     wired_cap_mib: ?u64 = null,
     io_backend: aminfer.aio.IoBackend = .auto,
     prefill_mode: aminfer.qwen3.PrefillMode = .auto,
+    gpu_prefill_mode: aminfer.qwen3.GpuPrefillMode = .wide,
+    strict_live_ram: bool = false,
     ane_predictor_path: ?[:0]const u8 = null,
     enable_ane_predictor: bool = true,
     kv_retire_q8_after_chunks: u32 = 0,
@@ -480,6 +542,8 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var wired_cap_mib: ?u64 = null;
     var io_backend: aminfer.aio.IoBackend = .auto;
     var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
+    var gpu_prefill_mode: aminfer.qwen3.GpuPrefillMode = .wide;
+    var strict_live_ram = false;
     var ane_predictor_path: ?[:0]const u8 = null;
     var enable_ane_predictor = true;
     var kv_retire_q8_after_chunks: u32 = 0;
@@ -552,6 +616,12 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             prefill_mode = try aminfer.qwen3.PrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--gpu-prefill-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            gpu_prefill_mode = try aminfer.qwen3.GpuPrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--strict-live-ram")) {
+            strict_live_ram = true;
         } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -592,6 +662,8 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .wired_cap_mib = wired_cap_mib,
         .io_backend = io_backend,
         .prefill_mode = prefill_mode,
+        .gpu_prefill_mode = gpu_prefill_mode,
+        .strict_live_ram = strict_live_ram,
         .ane_predictor_path = ane_predictor_path,
         .enable_ane_predictor = enable_ane_predictor,
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
@@ -614,6 +686,8 @@ const BenchDecodeCliArgs = struct {
     wired_cap_mib: ?u64 = null,
     io_backend: aminfer.aio.IoBackend = .auto,
     prefill_mode: aminfer.qwen3.PrefillMode = .auto,
+    gpu_prefill_mode: aminfer.qwen3.GpuPrefillMode = .wide,
+    strict_live_ram: bool = false,
     ane_predictor_path: ?[:0]const u8 = null,
     enable_ane_predictor: bool = true,
     kv_retire_q8_after_chunks: u32 = 0,
@@ -633,6 +707,8 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
     var wired_cap_mib: ?u64 = null;
     var io_backend: aminfer.aio.IoBackend = .auto;
     var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
+    var gpu_prefill_mode: aminfer.qwen3.GpuPrefillMode = .wide;
+    var strict_live_ram = false;
     var ane_predictor_path: ?[:0]const u8 = null;
     var enable_ane_predictor = true;
     var kv_retire_q8_after_chunks: u32 = 0;
@@ -688,6 +764,12 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             prefill_mode = try aminfer.qwen3.PrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--gpu-prefill-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            gpu_prefill_mode = try aminfer.qwen3.GpuPrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--strict-live-ram")) {
+            strict_live_ram = true;
         } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -716,6 +798,8 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
         .wired_cap_mib = wired_cap_mib,
         .io_backend = io_backend,
         .prefill_mode = prefill_mode,
+        .gpu_prefill_mode = gpu_prefill_mode,
+        .strict_live_ram = strict_live_ram,
         .ane_predictor_path = ane_predictor_path,
         .enable_ane_predictor = enable_ane_predictor,
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
@@ -854,7 +938,7 @@ fn runDecodeGraph(
 
     var model = try aminfer.graph.GraphModel.loadFromFile(allocator, cli.amf_path, gcfg, .{
         .max_seq_len = max_seq_len,
-        .max_tree_nodes = 16,
+        .max_tree_nodes = if (cli.gpu_prefill_mode == .tree64) 64 else 16,
         .wired_budget_override = budget_override,
         .ple_paths = ple_paths,
         .loop_adapter_amf_path = cli.m6.loop_adapter_amf_path,
@@ -862,6 +946,8 @@ fn runDecodeGraph(
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+        .gpu_prefill_mode = cli.gpu_prefill_mode,
+        .strict_live_ram = cli.strict_live_ram,
     });
     defer model.deinit(allocator);
 
@@ -1105,6 +1191,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
 
     var model = try aminfer.qwen3.Qwen3Model.loadFromFile(allocator, cli.amf_path, cfg, .{
         .max_seq_len = max_seq_len,
+        .max_tree_nodes = if (cli.gpu_prefill_mode == .tree64) 64 else 1,
         .verify_crcs = cli.verify_crcs,
         .budget_override = budget_override,
         .cold_experts_per_layer = cli.cold_experts_per_layer,
@@ -1117,6 +1204,8 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
         .sme_router_mode = cli.sme_router_mode,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+        .gpu_prefill_mode = cli.gpu_prefill_mode,
+        .strict_live_ram = cli.strict_live_ram,
     });
     defer model.deinit(allocator);
 
@@ -1198,7 +1287,8 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
 
     try out.print(
         \\decode.arch                      {s} ({s})
-        \\decode.prefill_mode              {s}
+        \\decode.prefill_mode              {s} (gpu={s})
+        \\decode.aliased_scratch_saved_mib {d:.2}
         \\decode.temperature               {d:.2}
         \\decode.seed_used                 {d}
         \\decode.seed_source               {s}
@@ -1220,6 +1310,8 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         cfg.arch.label(),
         cfg.precisionLabel(),
         cli.prefill_mode.label(),
+        cli.gpu_prefill_mode.label(),
+        @as(f64, @floatFromInt(model.aliased_scratch_saved_bytes)) / (1024.0 * 1024.0),
         cli.temperature,
         dec_seed_used,
         dec_seed_source,
@@ -1286,6 +1378,8 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
             .enable_loop_early_exit = cli.m6.loop_early_exit,
             .cold_slot_count = cli.cold_slots,
             .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+            .gpu_prefill_mode = cli.gpu_prefill_mode,
+            .strict_live_ram = cli.strict_live_ram,
         });
         try res.write(out);
         return;
@@ -1315,6 +1409,8 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
         .prefill_mode = cli.prefill_mode,
         .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+        .gpu_prefill_mode = cli.gpu_prefill_mode,
+        .strict_live_ram = cli.strict_live_ram,
     });
     try res.write(out);
 }
@@ -1370,6 +1466,11 @@ fn runBenchM65(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try report.write(out);
 }
 
+fn runBenchM68(allocator: std.mem.Allocator, out: *Io.Writer) !void {
+    const report = try aminfer.bench.runM68(allocator);
+    try report.write(out);
+}
+
 fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM1(allocator, out);
     try out.flush();
@@ -1388,6 +1489,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM6(allocator, out);
     try out.flush();
     try runBenchM65(allocator, out);
+    try out.flush();
+    try runBenchM68(allocator, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -1420,6 +1523,8 @@ const SpecDecodeCliArgs = struct {
     wired_cap_mib: ?u64 = null,
     io_backend: aminfer.aio.IoBackend = .auto,
     prefill_mode: aminfer.qwen3.PrefillMode = .auto,
+    gpu_prefill_mode: aminfer.qwen3.GpuPrefillMode = .wide,
+    strict_live_ram: bool = false,
     ane_predictor_path: ?[:0]const u8 = null,
     enable_ane_predictor: bool = true,
     kv_retire_q8_after_chunks: u32 = 0,
@@ -1456,6 +1561,8 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var wired_cap_mib: ?u64 = null;
     var io_backend: aminfer.aio.IoBackend = .auto;
     var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
+    var gpu_prefill_mode: aminfer.qwen3.GpuPrefillMode = .wide;
+    var strict_live_ram = false;
     var ane_predictor_path: ?[:0]const u8 = null;
     var enable_ane_predictor = true;
     var kv_retire_q8_after_chunks: u32 = 0;
@@ -1577,6 +1684,12 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             prefill_mode = try aminfer.qwen3.PrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--gpu-prefill-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            gpu_prefill_mode = try aminfer.qwen3.GpuPrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--strict-live-ram")) {
+            strict_live_ram = true;
         } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -1622,6 +1735,8 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .wired_cap_mib = wired_cap_mib,
         .io_backend = io_backend,
         .prefill_mode = prefill_mode,
+        .gpu_prefill_mode = gpu_prefill_mode,
+        .strict_live_ram = strict_live_ram,
         .ane_predictor_path = ane_predictor_path,
         .enable_ane_predictor = enable_ane_predictor,
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
@@ -1697,6 +1812,8 @@ fn runSpecDecodeGraph(
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+        .gpu_prefill_mode = cli.gpu_prefill_mode,
+        .strict_live_ram = cli.strict_live_ram,
     });
     defer model.deinit(allocator);
 
@@ -1723,8 +1840,14 @@ fn runSpecDecodeGraph(
     var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
     defer if (ngram_tbl_ptr) |nt| nt.deinit(allocator);
     if (cli.ngram_nvme_path) |ang_path| {
+        const eff_ngram_pages = try scaleOptionalNgramCachePages(
+            cli.ngram_cache_pages,
+            budget_override,
+            model.totalWiredBytes(),
+            cli.strict_live_ram,
+        );
         ngram_tbl_storage = try aminfer.ngram_nvme.NvmeNgramTable.open(allocator, ang_path, .{
-            .cache_pages = cli.ngram_cache_pages,
+            .cache_pages = eff_ngram_pages,
             .io_backend = cli.io_backend,
             .budget_override = budget_override,
         });
@@ -1995,6 +2118,8 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
         .sme_router_mode = cli.sme_router_mode,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+        .gpu_prefill_mode = cli.gpu_prefill_mode,
+        .strict_live_ram = cli.strict_live_ram,
     });
     defer model.deinit(allocator);
 
@@ -2010,8 +2135,14 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
     var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
     defer if (ngram_tbl_ptr) |nt| nt.deinit(allocator);
     if (cli.ngram_nvme_path) |ang_path| {
+        const eff_ngram_pages = try scaleOptionalNgramCachePages(
+            cli.ngram_cache_pages,
+            budget_override,
+            model.totalWiredBytes(),
+            cli.strict_live_ram,
+        );
         ngram_tbl_storage = try aminfer.ngram_nvme.NvmeNgramTable.open(allocator, ang_path, .{
-            .cache_pages = cli.ngram_cache_pages,
+            .cache_pages = eff_ngram_pages,
             .io_backend = cli.io_backend,
             .budget_override = budget_override,
         });
@@ -2373,6 +2504,9 @@ const ServeCliArgs = struct {
     max_active_requests: usize = aminfer.server.DEFAULT_MAX_ACTIVE_REQUESTS,
     batch_mode: ServeBatchMode = .auto,
     prefix_cache_chunks: u32 = 16,
+    decode_share: f32 = aminfer.batch_scheduler.DEFAULT_DECODE_SHARE,
+    adaptive_prefill_narrow: bool = true,
+    message_boundary_cache: bool = true,
     kv_retire_q8_after_chunks: u32 = 0,
     ngram_packs: [aminfer.ngram_nvme.MAX_DOMAIN_PACKS]NgramPackArg = undefined,
     ngram_pack_count: usize = 0,
@@ -2397,6 +2531,8 @@ const ServeCliArgs = struct {
     wired_cap_mib: ?u64 = null,
     io_backend: aminfer.aio.IoBackend = .auto,
     prefill_mode: aminfer.qwen3.PrefillMode = .auto,
+    gpu_prefill_mode: aminfer.qwen3.GpuPrefillMode = .wide,
+    strict_live_ram: bool = false,
     ane_predictor_path: ?[:0]const u8 = null,
     enable_ane_predictor: bool = true,
     m6: M6GraphCliFlags = .{},
@@ -2414,6 +2550,9 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var max_active_requests: usize = aminfer.server.DEFAULT_MAX_ACTIVE_REQUESTS;
     var batch_mode: ServeBatchMode = .auto;
     var prefix_cache_chunks: u32 = 16;
+    var decode_share: f32 = aminfer.batch_scheduler.DEFAULT_DECODE_SHARE;
+    var adaptive_prefill_narrow = true;
+    var message_boundary_cache = true;
     var kv_retire_q8_after_chunks: u32 = 0;
     var ngram_packs: [aminfer.ngram_nvme.MAX_DOMAIN_PACKS]NgramPackArg = undefined;
     var ngram_pack_count: usize = 0;
@@ -2438,6 +2577,8 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var wired_cap_mib: ?u64 = null;
     var io_backend: aminfer.aio.IoBackend = .auto;
     var prefill_mode: aminfer.qwen3.PrefillMode = .auto;
+    var gpu_prefill_mode: aminfer.qwen3.GpuPrefillMode = .wide;
+    var strict_live_ram = false;
     var ane_predictor_path: ?[:0]const u8 = null;
     var enable_ane_predictor = true;
     var m6: M6GraphCliFlags = .{};
@@ -2490,6 +2631,21 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             prefix_cache_chunks = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--decode-share")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            decode_share = try std.fmt.parseFloat(f32, args[i]);
+            if (!std.math.isFinite(decode_share) or decode_share < 0.0 or decode_share > 1.0) {
+                return error.InvalidDecodeShare;
+            }
+        } else if (std.mem.eql(u8, flag, "--adaptive-prefill-narrow")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            adaptive_prefill_narrow = try parseOnOff(args[i]);
+        } else if (std.mem.eql(u8, flag, "--message-boundary-cache")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            message_boundary_cache = try parseOnOff(args[i]);
         } else if (std.mem.eql(u8, flag, "--kv-retire-q8-after-chunks")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -2581,6 +2737,12 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             prefill_mode = try aminfer.qwen3.PrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--gpu-prefill-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            gpu_prefill_mode = try aminfer.qwen3.GpuPrefillMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--strict-live-ram")) {
+            strict_live_ram = true;
         } else if (std.mem.eql(u8, flag, "--ane-predictor")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -2604,6 +2766,9 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         .max_active_requests = max_active_requests,
         .batch_mode = batch_mode,
         .prefix_cache_chunks = prefix_cache_chunks,
+        .decode_share = decode_share,
+        .adaptive_prefill_narrow = adaptive_prefill_narrow,
+        .message_boundary_cache = message_boundary_cache,
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
         .ngram_packs = ngram_packs,
         .ngram_pack_count = ngram_pack_count,
@@ -2628,6 +2793,8 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         .wired_cap_mib = wired_cap_mib,
         .io_backend = io_backend,
         .prefill_mode = prefill_mode,
+        .gpu_prefill_mode = gpu_prefill_mode,
+        .strict_live_ram = strict_live_ram,
         .ane_predictor_path = ane_predictor_path,
         .enable_ane_predictor = enable_ane_predictor,
         .m6 = m6,
@@ -2972,6 +3139,8 @@ const BatchServeRunner = struct {
     stop_tokens: [aminfer.batch_scheduler.MAX_STOP_TOKENS]u32,
     stop_token_count: u8,
     encode_scratch: aminfer.tokenizer.EncodeScratch,
+    boundary_verify_buf: []u32,
+    boundary_fallback_count: u64 = 0,
     steady_steps: u64 = 0,
     steady_heap_start: ?aminfer.vmstat.Snapshot = null,
     steady_heap_end: ?aminfer.vmstat.Snapshot = null,
@@ -2987,10 +3156,13 @@ const BatchServeRunner = struct {
         eos_token_id: ?u32,
         max_seq_len: u32,
     ) !BatchServeRunner {
-        const encode_scratch = try aminfer.tokenizer.EncodeScratch.init(
+        var encode_scratch = try aminfer.tokenizer.EncodeScratch.init(
             allocator,
             @max(@as(usize, 8192), @as(usize, max_seq_len) * 2),
         );
+        errdefer encode_scratch.deinit(allocator);
+        const boundary_verify_buf = try allocator.alloc(u32, @max(@as(usize, 1), @as(usize, max_seq_len)));
+        errdefer allocator.free(boundary_verify_buf);
 
         var stop_tokens: [aminfer.batch_scheduler.MAX_STOP_TOKENS]u32 = @splat(0);
         var stop_cnt: u8 = 0;
@@ -3023,10 +3195,12 @@ const BatchServeRunner = struct {
             .stop_tokens = stop_tokens,
             .stop_token_count = stop_cnt,
             .encode_scratch = encode_scratch,
+            .boundary_verify_buf = boundary_verify_buf,
         };
     }
 
     fn deinit(self: *BatchServeRunner, allocator: std.mem.Allocator) void {
+        allocator.free(self.boundary_verify_buf);
         self.encode_scratch.deinit(allocator);
     }
 
@@ -3043,6 +3217,7 @@ const BatchServeRunner = struct {
         return .{
             .ctx = self,
             .tokenizeFn = tokenizeCallback,
+            .tokenizeWithBoundaryFn = tokenizeWithBoundaryCallback,
             .detokenizeFn = detokenizeCallback,
             .backend = .{
                 .ctx = self,
@@ -3061,6 +3236,20 @@ const BatchServeRunner = struct {
         job: *const aminfer.server.InferenceJob,
         out_tokens: []u32,
     ) aminfer.batch_scheduler.BackendError!usize {
+        const res = try tokenizeWithBoundaryCallback(ctx, job, out_tokens);
+        return res.prompt_len;
+    }
+
+    /// Zero-allocation multi-turn ChatML boundary-aware tokenizer (`C15`, ADR-0020):
+    /// tokenizes the full prompt into `out_tokens`, then verifies that splitting at
+    /// `job.last_user_msg_byte_offset` produces the exact same token sequence before
+    /// returning `message_boundary_token`. Any cross-boundary BPE merge falls back
+    /// gracefully to `message_boundary_token = null`.
+    fn tokenizeWithBoundaryCallback(
+        ctx: *anyopaque,
+        job: *const aminfer.server.InferenceJob,
+        out_tokens: []u32,
+    ) aminfer.batch_scheduler.BackendError!aminfer.server.TokenizeResult {
         const self: *BatchServeRunner = @ptrCast(@alignCast(ctx));
         var prompt_ids = self.tok.encodeWithScratch(
             &self.encode_scratch,
@@ -3076,7 +3265,37 @@ const BatchServeRunner = struct {
         if (self.ngram_registry) |reg| {
             queryNgramPromptTail(reg, self.tok, job.ngram_domain, prompt_ids, &self.ngram_query_errors);
         }
-        return prompt_ids.len;
+
+        var boundary_tok: ?u32 = null;
+        if (job.last_user_msg_byte_offset) |b_off| {
+            if (b_off > 0 and b_off < job.prompt.len and prompt_ids.len <= self.boundary_verify_buf.len) {
+                if (self.tok.encodeWithScratch(&self.encode_scratch, job.prompt[0..b_off], self.boundary_verify_buf)) |prefix_ids| {
+                    if (prefix_ids.len > 0 and prefix_ids.len < prompt_ids.len) {
+                        if (self.tok.encodeWithScratch(
+                            &self.encode_scratch,
+                            job.prompt[b_off..],
+                            self.boundary_verify_buf[prefix_ids.len..],
+                        )) |suffix_ids| {
+                            if (prefix_ids.len + suffix_ids.len == prompt_ids.len and
+                                std.mem.eql(u32, self.boundary_verify_buf[0..prompt_ids.len], prompt_ids))
+                            {
+                                boundary_tok = @intCast(prefix_ids.len);
+                            } else {
+                                self.boundary_fallback_count += 1;
+                            }
+                        } else |_| {
+                            self.boundary_fallback_count += 1;
+                        }
+                    }
+                } else |_| {
+                    self.boundary_fallback_count += 1;
+                }
+            }
+        }
+        return .{
+            .prompt_len = prompt_ids.len,
+            .message_boundary_token = boundary_tok,
+        };
     }
 
     fn detokenizeCallback(
@@ -3212,6 +3431,8 @@ fn runServeGraph(
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+        .gpu_prefill_mode = cli.gpu_prefill_mode,
+        .strict_live_ram = cli.strict_live_ram,
     });
     defer model.deinit(allocator);
 
@@ -3223,8 +3444,14 @@ fn runServeGraph(
     var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
     defer if (ngram_tbl_ptr) |nt| nt.deinit(allocator);
     if (cli.ngram_nvme_path) |ang_path| {
+        const eff_ngram_pages = try scaleOptionalNgramCachePages(
+            cli.ngram_cache_pages,
+            budget_override,
+            model.totalWiredBytes(),
+            cli.strict_live_ram,
+        );
         ngram_tbl_storage = try aminfer.ngram_nvme.NvmeNgramTable.open(allocator, ang_path, .{
-            .cache_pages = cli.ngram_cache_pages,
+            .cache_pages = eff_ngram_pages,
             .io_backend = cli.io_backend,
             .budget_override = budget_override,
         });
@@ -3235,8 +3462,14 @@ fn runServeGraph(
     var ngram_reg_ptr: ?*aminfer.ngram_nvme.DomainNgramRegistry = null;
     defer if (ngram_reg_ptr) |nr| nr.deinit(allocator);
     if (cli.ngram_pack_count > 0) {
+        const eff_reg_pages = try scaleOptionalNgramCachePages(
+            cli.ngram_cache_pages,
+            budget_override,
+            model.totalWiredBytes(),
+            cli.strict_live_ram,
+        );
         ngram_reg_storage = try aminfer.ngram_nvme.DomainNgramRegistry.init(allocator, .{
-            .cache_pages = cli.ngram_cache_pages,
+            .cache_pages = eff_reg_pages,
             .io_backend = cli.io_backend,
             .budget_override = budget_override,
         });
@@ -3302,6 +3535,8 @@ fn runServeGraph(
             .max_slots = @intCast(batch_slots),
             .prefix_cache_chunks = cli.prefix_cache_chunks,
             .budget_override = budget_override,
+            .gpu_prefill_mode = cli.gpu_prefill_mode,
+            .strict_live_ram = cli.strict_live_ram,
         });
         batch_rt_ptr = &batch_rt_storage;
         batch_runner_storage = try BatchServeRunner.init(
@@ -3345,6 +3580,9 @@ fn runServeGraph(
         .max_active_requests = cli.max_active_requests,
         .max_batch_size = batch_slots,
         .max_prompt_tokens = max_seq_len,
+        .message_boundary_cache = cli.message_boundary_cache,
+        .decode_share = cli.decode_share,
+        .adaptive_prefill_narrow = cli.adaptive_prefill_narrow,
         .ngram_registry = ngram_reg_ptr,
     });
     defer srv.deinit(allocator);
@@ -3370,6 +3608,8 @@ fn runServeGraph(
         \\serve.model_id                   {s}
         \\serve.arch                       graph ({s}, {s}, loop={s} R={d})
         \\serve.batch_mode                 {s} (max_batch_size={d})
+        \\serve.gpu_prefill_mode           {s}
+        \\serve.decode_share               {d:.2} (adaptive_prefill_narrow={s}, message_boundary_cache={s})
         \\serve.prefix_cache_chunks        {d}
         \\serve.kv_retire_q8_after_chunks  {d}
         \\serve.ngram_packs                {d}
@@ -3392,6 +3632,10 @@ fn runServeGraph(
         model.effective_max_loops,
         if (use_continuous) "continuous" else "serial",
         batch_slots,
+        cli.gpu_prefill_mode.label(),
+        cli.decode_share,
+        if (cli.adaptive_prefill_narrow) "on" else "off",
+        if (cli.message_boundary_cache) "on" else "off",
         if (use_continuous) cli.prefix_cache_chunks else 0,
         cli.kv_retire_q8_after_chunks,
         cli.ngram_pack_count,
@@ -3425,6 +3669,8 @@ fn runServeGraph(
         \\serve.prefix_hit_tokens          {d}
         \\serve.prefix_hit_requests        {d}
         \\serve.prefix_cow_copies          {d}
+        \\serve.boundary_checkpoints       {d} (boundary_hits={d}, evict_first_evictions={d})
+        \\serve.qos_steps                  decode={d} prefill={d} narrowed_chunks={d}
         \\serve.steady_malloc_blocks       {d}
         \\serve.steady_malloc_bytes        {d}
         \\serve.swapouts_delta             {d}
@@ -3439,6 +3685,12 @@ fn runServeGraph(
         st.prefix_hit_tokens,
         st.prefix_hit_requests,
         if (batch_stats_opt) |bs| bs.prefix_cow_copies else 0,
+        st.message_boundary_checkpoints,
+        if (batch_stats_opt) |bs| bs.boundary_hits else 0,
+        if (batch_stats_opt) |bs| bs.evict_first_evictions else 0,
+        st.qos_decode_steps,
+        st.qos_prefill_steps,
+        st.narrowed_prefill_chunks,
         steady_hd.blocks_in_use,
         steady_hd.size_in_use,
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
@@ -3548,6 +3800,8 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .enable_hybrid_prefill = (cli.prefill_mode == .hybrid),
         .sme_router_mode = cli.sme_router_mode,
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+        .gpu_prefill_mode = cli.gpu_prefill_mode,
+        .strict_live_ram = cli.strict_live_ram,
     });
     defer model.deinit(allocator);
 
@@ -3563,8 +3817,14 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
     var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
     defer if (ngram_tbl_ptr) |nt| nt.deinit(allocator);
     if (cli.ngram_nvme_path) |ang_path| {
+        const eff_ngram_pages = try scaleOptionalNgramCachePages(
+            cli.ngram_cache_pages,
+            budget_override,
+            model.totalWiredBytes(),
+            cli.strict_live_ram,
+        );
         ngram_tbl_storage = try aminfer.ngram_nvme.NvmeNgramTable.open(allocator, ang_path, .{
-            .cache_pages = cli.ngram_cache_pages,
+            .cache_pages = eff_ngram_pages,
             .io_backend = cli.io_backend,
             .budget_override = budget_override,
         });
@@ -3575,8 +3835,14 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
     var ngram_reg_ptr: ?*aminfer.ngram_nvme.DomainNgramRegistry = null;
     defer if (ngram_reg_ptr) |nr| nr.deinit(allocator);
     if (cli.ngram_pack_count > 0) {
+        const eff_reg_pages = try scaleOptionalNgramCachePages(
+            cli.ngram_cache_pages,
+            budget_override,
+            model.totalWiredBytes(),
+            cli.strict_live_ram,
+        );
         ngram_reg_storage = try aminfer.ngram_nvme.DomainNgramRegistry.init(allocator, .{
-            .cache_pages = cli.ngram_cache_pages,
+            .cache_pages = eff_reg_pages,
             .io_backend = cli.io_backend,
             .budget_override = budget_override,
         });
@@ -3661,6 +3927,8 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
             .prefix_cache_chunks = cli.prefix_cache_chunks,
             .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
             .budget_override = budget_override,
+            .gpu_prefill_mode = cli.gpu_prefill_mode,
+            .strict_live_ram = cli.strict_live_ram,
         });
         batch_rt_ptr = &batch_rt_storage;
         batch_runner_storage = try BatchServeRunner.init(
@@ -3704,6 +3972,9 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .max_active_requests = cli.max_active_requests,
         .max_batch_size = batch_slots,
         .max_prompt_tokens = max_seq_len,
+        .message_boundary_cache = cli.message_boundary_cache,
+        .decode_share = cli.decode_share,
+        .adaptive_prefill_narrow = cli.adaptive_prefill_narrow,
         .ngram_registry = ngram_reg_ptr,
     });
     defer srv.deinit(allocator);
@@ -3729,6 +4000,8 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         \\serve.model_id                   {s}
         \\serve.arch                       {s} ({s})
         \\serve.batch_mode                 {s} (max_batch_size={d})
+        \\serve.gpu_prefill_mode           {s}
+        \\serve.decode_share               {d:.2} (adaptive_prefill_narrow={s}, message_boundary_cache={s})
         \\serve.prefix_cache_chunks        {d}
         \\serve.kv_retire_q8_after_chunks  {d}
         \\serve.ngram_packs                {d}
@@ -3751,6 +4024,10 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         cfg.precisionLabel(),
         if (use_continuous) "continuous" else "serial",
         batch_slots,
+        cli.gpu_prefill_mode.label(),
+        cli.decode_share,
+        if (cli.adaptive_prefill_narrow) "on" else "off",
+        if (cli.message_boundary_cache) "on" else "off",
         if (use_continuous) cli.prefix_cache_chunks else 0,
         cli.kv_retire_q8_after_chunks,
         cli.ngram_pack_count,
@@ -3789,6 +4066,8 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         \\serve.prefix_hit_tokens          {d}
         \\serve.prefix_hit_requests        {d}
         \\serve.prefix_cow_copies          {d}
+        \\serve.boundary_checkpoints       {d} (boundary_hits={d}, evict_first_evictions={d})
+        \\serve.qos_steps                  decode={d} prefill={d} narrowed_chunks={d}
         \\serve.kv_retire_events           {d}
         \\serve.steady_malloc_blocks       {d}
         \\serve.steady_malloc_bytes        {d}
@@ -3804,6 +4083,12 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         st.prefix_hit_tokens,
         st.prefix_hit_requests,
         if (batch_stats_opt) |bs| bs.prefix_cow_copies else 0,
+        st.message_boundary_checkpoints,
+        if (batch_stats_opt) |bs| bs.boundary_hits else 0,
+        if (batch_stats_opt) |bs| bs.evict_first_evictions else 0,
+        st.qos_decode_steps,
+        st.qos_prefill_steps,
+        st.narrowed_prefill_chunks,
         if (batch_stats_opt) |bs| bs.kv_retire_events else model.kvRetireEvents(),
         steady_hd.blocks_in_use,
         steady_hd.size_in_use,
@@ -3902,13 +4187,27 @@ fn probe(out: *Io.Writer) !void {
         facts.gpu_wired_limit_mib,
     });
 
-    const device = try aminfer.metal.Device.open();
+    var device = try aminfer.metal.Device.open();
     defer device.close();
     const info = try device.info();
     const wired_budget = aminfer.budget.Budget.fromHost(facts, info, .{});
+    const matmul_backend = aminfer.dequant.selectPrefillMatmulBackend(info);
+    const matmul_backend_label: []const u8 = switch (matmul_backend) {
+        .simdgroup_apple9 => "simdgroup_apple9",
+        .nax_apple10_reserved => "nax_apple10_reserved",
+    };
+    const vm_snap = try aminfer.vmstat.Snapshot.capture();
+    const ps: u64 = if (vm_snap.page_size > 0) vm_snap.page_size else aminfer.page.APPLE_PAGE_SIZE;
+    const lib = try aminfer.metal.Library.openEmbedded(device);
+    defer lib.close();
+    const dq_pipes = try aminfer.dequant.DequantPipelines.init(device, lib);
+    defer dq_pipes.close();
+    const canary = try dq_pipes.runStartupNumericalCanary(&device);
     try out.print(
         \\gpu.name                         {s}
         \\gpu.apple_family                 {d}
+        \\gpu.supports_apple10             {s}
+        \\gpu.prefill_matmul_backend       {s}
         \\gpu.metal4                       {}
         \\gpu.unified_memory               {}
         \\gpu.recommended_working_set_mib  {d}
@@ -3916,10 +4215,18 @@ fn probe(out: *Io.Writer) !void {
         \\ane.cores                        {d}
         \\budget.wired_limit_mib           {d}
         \\budget.binding_limit             {s}
+        \\vm.live_zero_swap_reclaimable_mib {d} (free={d}, speculative={d}, purgeable={d}, external={d}; excluded: inactive={d}, internal={d}, compressor={d}, wired={d})
+        \\canary.status                    pass
+        \\canary.elapsed_us                {d:.1}
+        \\canary.max_abs_err_f16           {d:.6}
+        \\canary.max_abs_err_bf16          {d:.6}
+        \\canary.max_abs_err_q4            {d:.6}
         \\
     , .{
         info.name(),
         info.appleGpuFamily(),
+        if (info.supportsApple10()) "yes" else "no",
+        matmul_backend_label,
         info.supportsMetal4(),
         info.hasUnifiedMemory(),
         info.recommendedMaxWorkingSetSize() >> 20,
@@ -3927,6 +4234,19 @@ fn probe(out: *Io.Writer) !void {
         info.aneCoreCount(),
         wired_budget.limit_bytes >> 20,
         wired_budget.binding_limit.label(),
+        vm_snap.liveZeroSwapReclaimableBytes() >> 20,
+        (vm_snap.free_pages *| ps) >> 20,
+        (vm_snap.speculative_pages *| ps) >> 20,
+        (vm_snap.purgeable_pages *| ps) >> 20,
+        (vm_snap.external_pages *| ps) >> 20,
+        (vm_snap.inactive_pages *| ps) >> 20,
+        (vm_snap.internal_pages *| ps) >> 20,
+        (vm_snap.compressor_pages *| ps) >> 20,
+        (vm_snap.wire_pages *| ps) >> 20,
+        canary.elapsed_us,
+        canary.max_abs_err_f16,
+        canary.max_abs_err_bf16,
+        canary.max_abs_err_q4,
     });
 }
 
@@ -4275,5 +4595,81 @@ test "M6.5 CLI parsers handle --batch-mode, --prefix-cache-chunks, --kv-retire-q
         "--config",        "qwen4.json",
         "--tokenizer",     "tok.json",
         "--vt-test-video", "vp9",
+    }));
+}
+
+test "M6.8 CLI parsers handle --gpu-prefill-mode, --strict-live-ram, --decode-share, --adaptive-prefill-narrow and --message-boundary-cache" {
+    const dec = try parseDecodeArgs(&.{
+        "--amf",              "m.amf",
+        "--config",           "c.json",
+        "--tokenizer",        "t.json",
+        "--gpu-prefill-mode", "tree64",
+        "--strict-live-ram",
+    });
+    try std.testing.expectEqual(aminfer.qwen3.GpuPrefillMode.tree64, dec.gpu_prefill_mode);
+    try std.testing.expect(dec.strict_live_ram);
+
+    const dec_def = try parseDecodeArgs(&.{ "--amf", "m.amf", "--config", "c.json", "--tokenizer", "t.json" });
+    try std.testing.expectEqual(aminfer.qwen3.GpuPrefillMode.wide, dec_def.gpu_prefill_mode);
+    try std.testing.expect(!dec_def.strict_live_ram);
+
+    const bdec = try parseBenchDecodeArgs(&.{
+        "--amf",              "m.amf",
+        "--config",           "c.json",
+        "--gpu-prefill-mode", "wide",
+        "--strict-live-ram",
+    });
+    try std.testing.expectEqual(aminfer.qwen3.GpuPrefillMode.wide, bdec.gpu_prefill_mode);
+    try std.testing.expect(bdec.strict_live_ram);
+
+    const spec = try parseSpecDecodeArgs(&.{
+        "--amf",              "m.amf",
+        "--config",           "c.json",
+        "--tokenizer",        "t.json",
+        "--gpu-prefill-mode", "tree64",
+        "--strict-live-ram",
+    });
+    try std.testing.expectEqual(aminfer.qwen3.GpuPrefillMode.tree64, spec.gpu_prefill_mode);
+    try std.testing.expect(spec.strict_live_ram);
+
+    const srv = try parseServeArgs(&.{
+        "--amf",              "m.amf",
+        "--config",           "c.json",
+        "--tokenizer",        "t.json",
+        "--gpu-prefill-mode", "wide",
+        "--strict-live-ram",  "--decode-share",
+        "0.65",               "--adaptive-prefill-narrow",
+        "off",                "--message-boundary-cache",
+        "off",
+    });
+    try std.testing.expectEqual(aminfer.qwen3.GpuPrefillMode.wide, srv.gpu_prefill_mode);
+    try std.testing.expect(srv.strict_live_ram);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), srv.decode_share, 1e-6);
+    try std.testing.expect(!srv.adaptive_prefill_narrow);
+    try std.testing.expect(!srv.message_boundary_cache);
+
+    const srv_def = try parseServeArgs(&.{ "--amf", "m.amf", "--config", "c.json", "--tokenizer", "t.json" });
+    try std.testing.expectEqual(aminfer.qwen3.GpuPrefillMode.wide, srv_def.gpu_prefill_mode);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.50), srv_def.decode_share, 1e-6);
+    try std.testing.expect(srv_def.adaptive_prefill_narrow);
+    try std.testing.expect(srv_def.message_boundary_cache);
+
+    try std.testing.expectError(error.InvalidGpuPrefillMode, parseDecodeArgs(&.{
+        "--amf",              "m.amf",
+        "--config",           "c.json",
+        "--tokenizer",        "t.json",
+        "--gpu-prefill-mode", "chunk128",
+    }));
+    try std.testing.expectError(error.InvalidDecodeShare, parseServeArgs(&.{
+        "--amf",          "m.amf",
+        "--config",       "c.json",
+        "--tokenizer",    "t.json",
+        "--decode-share", "1.25",
+    }));
+    try std.testing.expectError(error.InvalidOnOff, parseServeArgs(&.{
+        "--amf",                     "m.amf",
+        "--config",                  "c.json",
+        "--tokenizer",               "t.json",
+        "--adaptive-prefill-narrow", "maybe",
     }));
 }
