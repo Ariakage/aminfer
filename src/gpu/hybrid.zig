@@ -45,6 +45,30 @@ pub const QSA_DEFAULT_BLOCK_TOKENS: u32 = 32;
 pub const QSA_MAX_TOP_K_BLOCKS: u32 = 64;
 /// Number of parallel residual branches in 4-Branch Gated Residual (`G10`).
 pub const GR_NUM_BRANCHES: u32 = 4;
+/// Maximum MLA compressed latent dimension (`kv_lora_rank`, multiples of 32; `1536` for `deepseek41`).
+pub const MAX_MLA_LATENT_DIM: u32 = 2048;
+/// Maximum MLA decoupled RoPE key dimension (`qk_rope_dim`, even).
+pub const MAX_MLA_ROPE_DIM: u32 = 256;
+/// Channels per `E4M3` FP8 scale in MLA `FP4` (`E2M1` + `E4M3`) latent KV (`R7`, `G11`).
+pub const MLA_FP4_GROUP_SIZE: u32 = 16;
+/// Maximum selected sparse blocks per query token in `ami_csa2_index_blocks`.
+pub const CSA2_MAX_TOP_K_BLOCKS: u32 = 64;
+/// Default fine micro-block length in tokens for CSA2 (`G11`).
+pub const CSA2_DEFAULT_BLOCK_TOKENS: u32 = 32;
+/// Default fine blocks per coarse super-block in CSA2 hierarchical indexing (`G11`).
+pub const CSA2_DEFAULT_COARSE_GROUP_BLOCKS: u32 = 8;
+/// Full `DeepSeek-V4.1-Flash-1017` (`deepseek41`) MLA latent rank (`768 B` E2M1 + `96 B` E4M3 = `864 B`).
+pub const DEEPSEEK41_KV_LORA_RANK: u32 = 1536;
+/// Full `DeepSeek-V4.1-Flash-1017` compressed `E4M3` RoPE tail (`26 B` -> `864 + 26 = 890 B/tok`).
+pub const DEEPSEEK41_QK_ROPE_DIM: u32 = 26;
+/// Exact `deepseek41` main FP4 KV footprint per token (`R7`, ADR-0015).
+pub const DEEPSEEK41_BYTES_PER_TOKEN: u32 = 890;
+/// Supported hyper-stream counts for Single-Pass Mega-mHC (`G10`).
+pub const MIN_MHC_STREAMS: u32 = 2;
+pub const DEFAULT_MHC_STREAMS: u32 = 4;
+pub const MAX_MHC_STREAMS: u32 = 8;
+/// Maximum batched decode slots for `ami_mla_csa2_attend` / `ami_csa2_index_blocks`.
+pub const MAX_MLA_BATCH_DECODE_SLOTS: u32 = 16;
 
 pub const ArenaError = error{
     ZeroDimension,
@@ -402,6 +426,93 @@ pub const GdnCloneStateParams = extern struct {
     _pad0: u32 = 0,
 };
 
+pub const MlaFp4KvWriteParams = extern struct {
+    num_tokens: u32,
+    start_pos: u32,
+    kv_lora_rank: u32,
+    qk_rope_dim: u32,
+    rope_tail_format: u32,
+    max_tokens: u32,
+    swa_ring_capacity: u32,
+    flags: u32 = 0,
+    e2m1_plane_offset: u64,
+    scale_plane_offset: u64,
+    rope_plane_offset: u64,
+    swa_rope_plane_offset: u64 = 0,
+};
+
+pub const Csa2SummaryParams = extern struct {
+    kv_len: u32,
+    kv_lora_rank: u32,
+    index_dim: u32,
+    block_tokens: u32,
+    coarse_group_blocks: u32,
+    start_coarse_block: u32,
+    num_coarse_blocks: u32,
+    _pad0: u32 = 0,
+    e2m1_plane_offset: u64,
+    scale_plane_offset: u64,
+    fine_plane_offset: u64,
+    coarse_plane_offset: u64,
+};
+
+pub const Csa2IndexParams = extern struct {
+    num_nodes: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    index_dim: u32,
+    kv_len: u32,
+    encoder_prefix_len: u32,
+    causal_q_start_pos: u32,
+    swa_window: u32,
+    block_tokens: u32,
+    coarse_group_blocks: u32,
+    top_k_coarse: u32,
+    top_k_blocks: u32,
+    num_local_blocks: u32,
+    has_batch_slots: u32,
+    scale: f32,
+    _pad0: u32 = 0,
+    fine_batch_stride_bytes: u64 = 0,
+    coarse_batch_stride_bytes: u64 = 0,
+};
+
+pub const MlaCsa2AttnParams = extern struct {
+    num_nodes: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    qk_rope_dim: u32,
+    rope_tail_format: u32,
+    kv_len: u32,
+    encoder_prefix_len: u32,
+    causal_q_start_pos: u32,
+    swa_window: u32,
+    swa_ring_capacity: u32,
+    block_tokens: u32,
+    top_k_blocks: u32,
+    has_tree: u32,
+    has_batch_slots: u32,
+    scale: f32,
+    _pad0: u32 = 0,
+    e2m1_plane_offset: u64,
+    scale_plane_offset: u64,
+    rope_plane_offset: u64,
+    swa_rope_plane_offset: u64 = 0,
+    kv_batch_stride_bytes: u64 = 0,
+    swa_batch_stride_bytes: u64 = 0,
+};
+
+pub const MhcParams = extern struct {
+    m: u32,
+    num_streams: u32,
+    hidden_size: u32,
+    flags: u32,
+    sinkhorn_iters: u32,
+    rms_eps: f32,
+    post_scale: f32,
+    _pad0: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(GdnDecodeParams) != 48) @compileError("GdnDecodeParams must be 48 bytes");
     if (@sizeOf(GdnPrefillParams) != 48) @compileError("GdnPrefillParams must be 48 bytes");
@@ -427,9 +538,15 @@ comptime {
     if (@sizeOf(BlendF16Params) != 16) @compileError("BlendF16Params must be 16 bytes");
     if (@sizeOf(GdnBatchDecodeParams) != 64) @compileError("GdnBatchDecodeParams must be 64 bytes");
     if (@sizeOf(GdnCloneStateParams) != 32) @compileError("GdnCloneStateParams must be 32 bytes");
+    if (@sizeOf(MlaFp4KvWriteParams) != 64) @compileError("MlaFp4KvWriteParams must be 64 bytes");
+    if (@sizeOf(Csa2SummaryParams) != 64) @compileError("Csa2SummaryParams must be 64 bytes");
+    if (@sizeOf(Csa2IndexParams) != 80) @compileError("Csa2IndexParams must be 80 bytes");
+    if (@sizeOf(MlaCsa2AttnParams) != 112) @compileError("MlaCsa2AttnParams must be 112 bytes");
+    if (@sizeOf(MhcParams) != 32) @compileError("MhcParams must be 32 bytes");
     if (@sizeOf(GdnCommitTreeParams) > metal.MAX_UNIFORM_BYTES) @compileError("GdnCommitTreeParams exceeds uniform stride");
     if (@sizeOf(QsaKvTreeCommitParams) > metal.MAX_UNIFORM_BYTES) @compileError("QsaKvTreeCommitParams exceeds uniform stride");
     if (@sizeOf(GdnConv1dCommitParams) > metal.MAX_UNIFORM_BYTES) @compileError("GdnConv1dCommitParams exceeds uniform stride");
+    if (@sizeOf(MlaCsa2AttnParams) > metal.MAX_UNIFORM_BYTES) @compileError("MlaCsa2AttnParams exceeds uniform stride");
 }
 
 // ===========================================================================
@@ -1670,6 +1787,889 @@ pub const GdnCloneStateArgs = struct {
 };
 
 // ===========================================================================
+// Section E: M7 (R7 + G11) — MLA + CSA2 (Full / Reindex / Reuse), FP4 KV
+// (`E2M1` + `E4M3` per-16-channel scale, 890 B/tok) & SWA Bounded Replay
+// ===========================================================================
+
+/// Static per-layer CSA2 KV & sparse-index sharing mode (`R7`, ADR-0015).
+pub const Csa2Mode = enum(u8) {
+    /// Owns its own physical FP4 latent KV slab & runs hierarchical indexer (`r = 0`).
+    full = 0,
+    /// Aliases a `shared_kv_owner` `Full` layer's FP4 KV slab (0 extra KV bytes),
+    /// but runs its own hierarchical indexer over its own query projections (`r = 0`).
+    reindex = 1,
+    /// Aliases both a `shared_kv_owner` `Full` layer's FP4 KV slab (0 extra KV bytes)
+    /// AND a `shared_index_owner` layer's `Csa2IndexBuffer` (0 indexer dispatches).
+    reuse = 2,
+};
+
+/// Storage encoding for the decoupled MLA RoPE key tail (`qk_rope_dim`).
+pub const MlaRopeTailFormat = enum(u8) {
+    /// IEEE `f16` (`2 * qk_rope_dim` bytes/token).
+    f16 = 0,
+    /// OCP FP8 `E4M3FN` (`1 * qk_rope_dim` bytes/token; `26 B` in `deepseek41` full geometry).
+    e4m3 = 1,
+};
+
+fn alignUp16(val: usize) ArenaError!usize {
+    const added = std.math.add(usize, val, 15) catch return error.Overflow;
+    return added & ~@as(usize, 15);
+}
+
+/// Decodes a signed 4-bit `E2M1` nibble (`1` sign, `2` exp, `1` mantissa) to `f32`.
+/// Representable magnitudes: `{0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}`.
+pub fn e2m1NibbleToF32(nib: u4) f32 {
+    const lut = [8]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 };
+    const mag = nib & 0x7;
+    const v = lut[mag];
+    return if ((nib & 0x8) != 0 and mag != 0) -v else v;
+}
+
+/// Encodes `f32` to signed 4-bit `E2M1` with round-to-nearest-even (bit-exact with GPU).
+pub fn f32ToE2m1Nibble(x: f32) u4 {
+    if (std.math.isNan(x)) return 0;
+    const neg = x < 0.0;
+    const a = @abs(x);
+    const mag: u4 = if (a <= 0.25)
+        0
+    else if (a < 0.75)
+        1
+    else if (a <= 1.25)
+        2
+    else if (a < 1.75)
+        3
+    else if (a <= 2.50)
+        4
+    else if (a < 3.50)
+        5
+    else if (a <= 5.00)
+        6
+    else
+        7;
+    if (mag == 0) return 0;
+    return if (neg) (mag | 0x8) else mag;
+}
+
+/// Decodes OCP FP8 `E4M3FN` (`1` sign, `4` exp bias 7, `3` mantissa, max `448.0`) to `f32`.
+pub fn e4m3ToF32(b: u8) f32 {
+    const s = (b >> 7) & 1;
+    const e: u32 = (b >> 3) & 0xF;
+    const m: u32 = b & 0x7;
+    const val: f32 = if (e == 0)
+        @as(f32, @floatFromInt(m)) * (1.0 / 512.0)
+    else if (e == 15 and m == 7)
+        0.0
+    else
+        std.math.ldexp(@as(f32, @floatFromInt(8 + m)), @as(i32, @intCast(e)) - 10);
+    return if (s != 0) -val else val;
+}
+
+/// Encodes `f32` to OCP FP8 `E4M3FN` with round-to-nearest-even and saturation at `+-448.0`
+/// (bit-exact with `mla_f32_to_e4m3` in `hybrid_ops.metal`).
+pub fn f32ToE4m3(x: f32) u8 {
+    if (std.math.isNan(x)) return 0;
+    const bits: u32 = @bitCast(x);
+    const sign_bit: u8 = @intCast((bits >> 31) & 1);
+    const a = @abs(x);
+    if (a == 0.0) return 0;
+    if (a >= 448.0) return (sign_bit << 7) | 0x7E;
+    if (a < (1.0 / 64.0)) {
+        const scaled = a * 512.0;
+        const q_floor: u32 = @intFromFloat(@floor(scaled));
+        const frac = scaled - @as(f32, @floatFromInt(q_floor));
+        var q = q_floor;
+        if (frac > 0.5 or (frac == 0.5 and (q_floor & 1) != 0)) {
+            q += 1;
+        }
+        if (q == 0) return 0;
+        if (q >= 8) return (sign_bit << 7) | (1 << 3);
+        return (sign_bit << 7) | @as(u8, @intCast(q));
+    }
+    const abs_bits: u32 = @bitCast(a);
+    const f_exp: i32 = @as(i32, @intCast((abs_bits >> 23) & 0xFF)) - 127;
+    const f_mant: u32 = abs_bits & 0x7FFFFF;
+    var m3: u32 = f_mant >> 20;
+    const rem: u32 = f_mant & 0xFFFFF;
+    var e4: u32 = @intCast(f_exp + 7);
+    if (rem > 0x80000 or (rem == 0x80000 and (m3 & 1) != 0)) {
+        m3 += 1;
+        if (m3 == 8) {
+            m3 = 0;
+            e4 += 1;
+        }
+    }
+    if (e4 > 15 or (e4 == 15 and m3 >= 7)) {
+        e4 = 15;
+        m3 = 6;
+    }
+    return (sign_bit << 7) | @as(u8, @intCast(e4 << 3)) | @as(u8, @intCast(m3));
+}
+
+/// Host reference encoder for one MLA latent row (`kv_lora_rank` multiple of 32)
+/// into packed `E2M1` nibbles (`kv_lora_rank / 2` B) + per-16 `E4M3` scales (`kv_lora_rank / 16` B).
+pub fn encodeMlaFp4LatentRowCpu(src_f32: []const f32, dst_e2m1: []u8, dst_scales: []u8) void {
+    std.debug.assert(src_f32.len > 0 and (src_f32.len % 32) == 0);
+    const num_groups = src_f32.len / MLA_FP4_GROUP_SIZE;
+    std.debug.assert(dst_e2m1.len == src_f32.len / 2);
+    std.debug.assert(dst_scales.len == num_groups);
+
+    for (0..num_groups) |g| {
+        const ch0 = g * MLA_FP4_GROUP_SIZE;
+        var amax: f32 = 0.0;
+        for (0..MLA_FP4_GROUP_SIZE) |i| {
+            amax = @max(amax, @abs(src_f32[ch0 + i]));
+        }
+        var s_byte: u8 = 0;
+        var inv_s: f32 = 0.0;
+        if (amax > 0.0) {
+            s_byte = f32ToE4m3(amax * (1.0 / 6.0));
+            if (s_byte == 0) s_byte = 1;
+            inv_s = 1.0 / e4m3ToF32(s_byte);
+        }
+        dst_scales[g] = s_byte;
+
+        const byte0 = g * 8;
+        for (0..8) |b| {
+            const q0: u8 = if (s_byte != 0) @as(u8, f32ToE2m1Nibble(src_f32[ch0 + b * 2] * inv_s)) else 0;
+            const q1: u8 = if (s_byte != 0) @as(u8, f32ToE2m1Nibble(src_f32[ch0 + b * 2 + 1] * inv_s)) else 0;
+            dst_e2m1[byte0 + b] = (q1 << 4) | (q0 & 0xF);
+        }
+    }
+}
+
+/// Host reference decoder for one FP4 (`E2M1` + per-16 `E4M3` scale) MLA latent row.
+pub fn decodeMlaFp4LatentRowCpu(src_e2m1: []const u8, src_scales: []const u8, dst_f32: []f32) void {
+    std.debug.assert(dst_f32.len > 0 and (dst_f32.len % 32) == 0);
+    const num_groups = dst_f32.len / MLA_FP4_GROUP_SIZE;
+    std.debug.assert(src_e2m1.len == dst_f32.len / 2);
+    std.debug.assert(src_scales.len == num_groups);
+
+    for (0..num_groups) |g| {
+        const sc = e4m3ToF32(src_scales[g]);
+        const ch0 = g * MLA_FP4_GROUP_SIZE;
+        const byte0 = g * 8;
+        for (0..8) |b| {
+            const packed_byte = src_e2m1[byte0 + b];
+            dst_f32[ch0 + b * 2] = e2m1NibbleToF32(@truncate(packed_byte & 0xF)) * sc;
+            dst_f32[ch0 + b * 2 + 1] = e2m1NibbleToF32(@truncate((packed_byte >> 4) & 0xF)) * sc;
+        }
+    }
+}
+
+/// Host reference encoder for one decoupled MLA RoPE key row (`f16` or `E4M3`).
+pub fn encodeMlaRopeRowCpu(src_f32: []const f32, format: MlaRopeTailFormat, dst_bytes: []u8) void {
+    switch (format) {
+        .f16 => {
+            std.debug.assert(dst_bytes.len == src_f32.len * 2);
+            const dst_f16: []align(1) f16 = std.mem.bytesAsSlice(f16, dst_bytes);
+            for (src_f32, 0..) |v, i| dst_f16[i] = @floatCast(v);
+        },
+        .e4m3 => {
+            std.debug.assert(dst_bytes.len == src_f32.len);
+            for (src_f32, 0..) |v, i| dst_bytes[i] = f32ToE4m3(v);
+        },
+    }
+}
+
+/// Host reference decoder for one decoupled MLA RoPE key row (`f16` or `E4M3`).
+pub fn decodeMlaRopeRowCpu(src_bytes: []const u8, format: MlaRopeTailFormat, dst_f32: []f32) void {
+    switch (format) {
+        .f16 => {
+            std.debug.assert(src_bytes.len == dst_f32.len * 2);
+            const src_f16: []align(1) const f16 = std.mem.bytesAsSlice(f16, src_bytes);
+            for (src_f16, 0..) |v, i| dst_f32[i] = @floatCast(v);
+        },
+        .e4m3 => {
+            std.debug.assert(src_bytes.len == dst_f32.len);
+            for (src_bytes, 0..) |b, i| dst_f32[i] = e4m3ToF32(b);
+        },
+    }
+}
+
+/// Geometry descriptor for wired FP4 (`E2M1` + per-16 `E4M3`) MLA latent KV slabs.
+pub const MlaFp4KvSpec = struct {
+    /// Number of physical `Full` CSA2 layers owning KV slabs (`Reindex`/`Reuse` allocate 0).
+    num_kv_layers: u32,
+    /// Maximum tokens per physical KV layer slab.
+    max_tokens: u32,
+    /// Compressed MLA latent rank (multiple of 32, `<= MAX_MLA_LATENT_DIM`).
+    kv_lora_rank: u32,
+    /// Decoupled RoPE key tail dimension (even, `<= MAX_MLA_ROPE_DIM`).
+    qk_rope_dim: u32,
+    /// RoPE tail storage format (`f16` or compressed `e4m3`).
+    rope_tail_format: MlaRopeTailFormat = .f16,
+
+    /// Canonical `DeepSeek-V4.1-Flash-1017` (`deepseek41`) full geometry:
+    /// `kv_lora_rank = 1536` (`768 B` E2M1 + `96 B` E4M3 = `864 B`) +
+    /// `26 B` compressed `E4M3` RoPE tail = **exact `890 B/token`** (`R7`, ADR-0015).
+    pub fn deepseek41Full(max_tokens: u32, num_kv_layers: u32) MlaFp4KvSpec {
+        return .{
+            .num_kv_layers = num_kv_layers,
+            .max_tokens = max_tokens,
+            .kv_lora_rank = DEEPSEEK41_KV_LORA_RANK,
+            .qk_rope_dim = DEEPSEEK41_QK_ROPE_DIM,
+            .rope_tail_format = .e4m3,
+        };
+    }
+
+    pub fn validate(self: MlaFp4KvSpec) ArenaError!void {
+        if (self.num_kv_layers == 0 or self.max_tokens == 0 or self.kv_lora_rank == 0) {
+            return error.ZeroDimension;
+        }
+        if ((self.kv_lora_rank % 32) != 0 or self.kv_lora_rank > MAX_MLA_LATENT_DIM) {
+            return error.InvalidConfig;
+        }
+        if ((self.qk_rope_dim % 2) != 0 or self.qk_rope_dim > MAX_MLA_ROPE_DIM) {
+            return error.InvalidConfig;
+        }
+    }
+
+    pub fn latentDataBytesPerToken(self: MlaFp4KvSpec) u32 {
+        return self.kv_lora_rank / 2;
+    }
+
+    pub fn latentScaleBytesPerToken(self: MlaFp4KvSpec) u32 {
+        return self.kv_lora_rank / MLA_FP4_GROUP_SIZE;
+    }
+
+    pub fn ropeTailBytesPerToken(self: MlaFp4KvSpec) u32 {
+        return switch (self.rope_tail_format) {
+            .f16 => self.qk_rope_dim * 2,
+            .e4m3 => self.qk_rope_dim,
+        };
+    }
+
+    /// Exact logical compressed KV footprint per token (`890 B/tok` for `deepseek41Full`).
+    pub fn bytesPerToken(self: MlaFp4KvSpec) u32 {
+        return self.latentDataBytesPerToken() + self.latentScaleBytesPerToken() + self.ropeTailBytesPerToken();
+    }
+};
+
+/// 16 KiB-aligned wired `MTLBuffer` arena holding `num_kv_layers` physical `Full`
+/// MLA FP4 (`E2M1` + per-16 `E4M3` scale) latent KV slabs (`R7`, `G11`).
+///
+/// Each physical layer occupies a `16 KiB`-aligned planar slab:
+///   - Plane 0 (`e2m1_plane_offset = 0`): `[max_tokens, kv_lora_rank / 2]` `u8`
+///   - Plane 1 (`scale_plane_offset`):    `[max_tokens, kv_lora_rank / 16]` `u8`
+///   - Plane 2 (`rope_plane_offset`):     `[max_tokens, ropeTailBytesPerToken()]` `u8`
+///
+/// `Reindex` and `Reuse` layers allocate **0** bytes here and alias their
+/// `shared_kv_owner` `Full` layer's slab via `sharedLayerBinding`.
+pub const MlaFp4KvArena = struct {
+    spec: MlaFp4KvSpec,
+    backing: []align(page.APPLE_PAGE_SIZE) u8,
+    base_offset: u64,
+    layer_stride_bytes: u64,
+    e2m1_plane_offset: u64,
+    scale_plane_offset: u64,
+    rope_plane_offset: u64,
+    e2m1_plane_bytes: usize,
+    scale_plane_bytes: usize,
+    rope_plane_bytes: usize,
+
+    const PlaneLayout = struct {
+        e2m1_bytes: usize,
+        scale_off: usize,
+        scale_bytes: usize,
+        rope_off: usize,
+        rope_bytes: usize,
+        layer_stride: usize,
+    };
+
+    fn computeLayout(spec: MlaFp4KvSpec) ArenaError!PlaneLayout {
+        try spec.validate();
+        const e2m1_bytes = std.math.mul(usize, spec.max_tokens, spec.latentDataBytesPerToken()) catch return error.Overflow;
+        const scale_off = try alignUp16(e2m1_bytes);
+        const scale_bytes = std.math.mul(usize, spec.max_tokens, spec.latentScaleBytesPerToken()) catch return error.Overflow;
+        const rope_off = try alignUp16(std.math.add(usize, scale_off, scale_bytes) catch return error.Overflow);
+        const rope_bytes = std.math.mul(usize, spec.max_tokens, spec.ropeTailBytesPerToken()) catch return error.Overflow;
+        const raw_layer = std.math.add(usize, rope_off, rope_bytes) catch return error.Overflow;
+        const layer_stride = page.alignUp(raw_layer) catch return error.Overflow;
+        return .{
+            .e2m1_bytes = e2m1_bytes,
+            .scale_off = scale_off,
+            .scale_bytes = scale_bytes,
+            .rope_off = rope_off,
+            .rope_bytes = rope_bytes,
+            .layer_stride = layer_stride,
+        };
+    }
+
+    pub fn requiredBytes(spec: MlaFp4KvSpec) ArenaError!usize {
+        const l = try computeLayout(spec);
+        return std.math.mul(usize, l.layer_stride, spec.num_kv_layers) catch return error.Overflow;
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: MlaFp4KvSpec) ArenaError!MlaFp4KvArena {
+        const l = try computeLayout(spec);
+        const total = std.math.mul(usize, l.layer_stride, spec.num_kv_layers) catch return error.Overflow;
+        const backing = try arena.allocPages(total);
+        @memset(backing, 0);
+        return .{
+            .spec = spec,
+            .backing = backing,
+            .base_offset = @intCast(arena.offsetOf(backing.ptr)),
+            .layer_stride_bytes = @intCast(l.layer_stride),
+            .e2m1_plane_offset = 0,
+            .scale_plane_offset = @intCast(l.scale_off),
+            .rope_plane_offset = @intCast(l.rope_off),
+            .e2m1_plane_bytes = l.e2m1_bytes,
+            .scale_plane_bytes = l.scale_bytes,
+            .rope_plane_bytes = l.rope_bytes,
+        };
+    }
+
+    pub fn bytes(self: *const MlaFp4KvArena) []align(page.APPLE_PAGE_SIZE) u8 {
+        return self.backing;
+    }
+
+    pub fn layerBinding(self: *const MlaFp4KvArena, kv_slot: u32, buf: metal.Buffer) ArenaError!metal.BufferBinding {
+        if (kv_slot >= self.spec.num_kv_layers) return error.InvalidLayerIndex;
+        return .{
+            .buffer = buf,
+            .offset = self.base_offset + @as(u64, kv_slot) * self.layer_stride_bytes,
+        };
+    }
+
+    /// Resolves the physical KV slab binding for any CSA2 layer mode:
+    /// `Full` binds its own physical slot, while `Reindex`/`Reuse` alias
+    /// `shared_kv_owner` with zero extra KV bytes.
+    pub fn sharedLayerBinding(
+        self: *const MlaFp4KvArena,
+        mode: Csa2Mode,
+        shared_kv_owner: u32,
+        buf: metal.Buffer,
+    ) ArenaError!metal.BufferBinding {
+        _ = mode;
+        return self.layerBinding(shared_kv_owner, buf);
+    }
+
+    pub fn layerE2m1Slice(self: *const MlaFp4KvArena, kv_slot: u32) ArenaError![]u8 {
+        if (kv_slot >= self.spec.num_kv_layers) return error.InvalidLayerIndex;
+        const base = @as(usize, kv_slot) * @as(usize, @intCast(self.layer_stride_bytes));
+        return self.backing[base .. base + self.e2m1_plane_bytes];
+    }
+
+    pub fn layerScaleSlice(self: *const MlaFp4KvArena, kv_slot: u32) ArenaError![]u8 {
+        if (kv_slot >= self.spec.num_kv_layers) return error.InvalidLayerIndex;
+        const base = @as(usize, kv_slot) * @as(usize, @intCast(self.layer_stride_bytes)) +
+            @as(usize, @intCast(self.scale_plane_offset));
+        return self.backing[base .. base + self.scale_plane_bytes];
+    }
+
+    pub fn layerRopeSlice(self: *const MlaFp4KvArena, kv_slot: u32) ArenaError![]u8 {
+        if (kv_slot >= self.spec.num_kv_layers) return error.InvalidLayerIndex;
+        const base = @as(usize, kv_slot) * @as(usize, @intCast(self.layer_stride_bytes)) +
+            @as(usize, @intCast(self.rope_plane_offset));
+        return self.backing[base .. base + self.rope_plane_bytes];
+    }
+};
+
+/// Descriptor for circular `f16` local SWA bounded replay rings paired with `MlaFp4KvArena`.
+pub const MlaSwaRingSpec = struct {
+    num_kv_layers: u32,
+    swa_window: u32,
+    kv_lora_rank: u32,
+    qk_rope_dim: u32,
+
+    pub fn validate(self: MlaSwaRingSpec) ArenaError!void {
+        if (self.num_kv_layers == 0 or self.swa_window == 0 or self.kv_lora_rank == 0) {
+            return error.ZeroDimension;
+        }
+        if ((self.kv_lora_rank % 32) != 0 or self.kv_lora_rank > MAX_MLA_LATENT_DIM) {
+            return error.InvalidConfig;
+        }
+        if ((self.qk_rope_dim % 2) != 0 or self.qk_rope_dim > MAX_MLA_ROPE_DIM) {
+            return error.InvalidConfig;
+        }
+    }
+};
+
+/// 16 KiB-aligned wired circular `f16` SWA replay ring (`[num_kv_layers, swa_window, ...]`).
+pub const MlaSwaRingArena = struct {
+    spec: MlaSwaRingSpec,
+    backing: []align(page.APPLE_PAGE_SIZE) u8,
+    base_offset: u64,
+    layer_stride_bytes: u64,
+    rope_plane_offset: u64,
+    latent_plane_bytes: usize,
+    rope_plane_bytes: usize,
+
+    fn computeLayout(spec: MlaSwaRingSpec) ArenaError!struct {
+        lat_bytes: usize,
+        rope_off: usize,
+        rope_bytes: usize,
+        layer_stride: usize,
+    } {
+        try spec.validate();
+        const lat_elems = std.math.mul(usize, spec.swa_window, spec.kv_lora_rank) catch return error.Overflow;
+        const lat_bytes = std.math.mul(usize, lat_elems, @sizeOf(f16)) catch return error.Overflow;
+        const rope_off = try alignUp16(lat_bytes);
+        const rope_elems = std.math.mul(usize, spec.swa_window, spec.qk_rope_dim) catch return error.Overflow;
+        const rope_bytes = std.math.mul(usize, rope_elems, @sizeOf(f16)) catch return error.Overflow;
+        const raw_layer = std.math.add(usize, rope_off, rope_bytes) catch return error.Overflow;
+        const layer_stride = page.alignUp(raw_layer) catch return error.Overflow;
+        return .{
+            .lat_bytes = lat_bytes,
+            .rope_off = rope_off,
+            .rope_bytes = rope_bytes,
+            .layer_stride = layer_stride,
+        };
+    }
+
+    pub fn requiredBytes(spec: MlaSwaRingSpec) ArenaError!usize {
+        const l = try computeLayout(spec);
+        return std.math.mul(usize, l.layer_stride, spec.num_kv_layers) catch return error.Overflow;
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: MlaSwaRingSpec) ArenaError!MlaSwaRingArena {
+        const l = try computeLayout(spec);
+        const total = std.math.mul(usize, l.layer_stride, spec.num_kv_layers) catch return error.Overflow;
+        const backing = try arena.allocPages(total);
+        @memset(backing, 0);
+        return .{
+            .spec = spec,
+            .backing = backing,
+            .base_offset = @intCast(arena.offsetOf(backing.ptr)),
+            .layer_stride_bytes = @intCast(l.layer_stride),
+            .rope_plane_offset = @intCast(l.rope_off),
+            .latent_plane_bytes = l.lat_bytes,
+            .rope_plane_bytes = l.rope_bytes,
+        };
+    }
+
+    pub fn layerBinding(self: *const MlaSwaRingArena, kv_slot: u32, buf: metal.Buffer) ArenaError!metal.BufferBinding {
+        if (kv_slot >= self.spec.num_kv_layers) return error.InvalidLayerIndex;
+        return .{
+            .buffer = buf,
+            .offset = self.base_offset + @as(u64, kv_slot) * self.layer_stride_bytes,
+        };
+    }
+};
+
+/// Descriptor for two-stage CSA2 hierarchical block summaries (fine + coarse).
+pub const Csa2SummarySpec = struct {
+    num_kv_layers: u32,
+    max_tokens: u32,
+    index_dim: u32,
+    block_tokens: u32 = CSA2_DEFAULT_BLOCK_TOKENS,
+    coarse_group_blocks: u32 = CSA2_DEFAULT_COARSE_GROUP_BLOCKS,
+
+    pub fn validate(self: Csa2SummarySpec) ArenaError!void {
+        if (self.num_kv_layers == 0 or self.max_tokens == 0 or self.index_dim == 0 or
+            self.block_tokens == 0 or self.coarse_group_blocks == 0)
+        {
+            return error.ZeroDimension;
+        }
+        if ((self.index_dim % MLA_FP4_GROUP_SIZE) != 0 or self.index_dim > MAX_MLA_LATENT_DIM) {
+            return error.InvalidConfig;
+        }
+    }
+
+    pub fn maxFineBlocks(self: Csa2SummarySpec) u32 {
+        return (self.max_tokens + self.block_tokens - 1) / self.block_tokens;
+    }
+
+    pub fn maxCoarseBlocks(self: Csa2SummarySpec) u32 {
+        const fine = self.maxFineBlocks();
+        return (fine + self.coarse_group_blocks - 1) / self.coarse_group_blocks;
+    }
+};
+
+/// 16 KiB-aligned wired arena holding CSA2 fine & coarse `f16` block summaries per physical `Full` KV layer.
+pub const Csa2SummaryArena = struct {
+    spec: Csa2SummarySpec,
+    backing: []align(page.APPLE_PAGE_SIZE) u8,
+    base_offset: u64,
+    layer_stride_bytes: u64,
+    fine_plane_offset: u64,
+    coarse_plane_offset: u64,
+    fine_plane_bytes: usize,
+    coarse_plane_bytes: usize,
+
+    fn computeLayout(spec: Csa2SummarySpec) ArenaError!struct {
+        fine_bytes: usize,
+        coarse_off: usize,
+        coarse_bytes: usize,
+        layer_stride: usize,
+    } {
+        try spec.validate();
+        const fine_elems = std.math.mul(usize, spec.maxFineBlocks(), spec.index_dim) catch return error.Overflow;
+        const fine_bytes = std.math.mul(usize, fine_elems, @sizeOf(f16)) catch return error.Overflow;
+        const coarse_off = try alignUp16(fine_bytes);
+        const coarse_elems = std.math.mul(usize, spec.maxCoarseBlocks(), spec.index_dim) catch return error.Overflow;
+        const coarse_bytes = std.math.mul(usize, coarse_elems, @sizeOf(f16)) catch return error.Overflow;
+        const raw_layer = std.math.add(usize, coarse_off, coarse_bytes) catch return error.Overflow;
+        const layer_stride = page.alignUp(raw_layer) catch return error.Overflow;
+        return .{
+            .fine_bytes = fine_bytes,
+            .coarse_off = coarse_off,
+            .coarse_bytes = coarse_bytes,
+            .layer_stride = layer_stride,
+        };
+    }
+
+    pub fn requiredBytes(spec: Csa2SummarySpec) ArenaError!usize {
+        const l = try computeLayout(spec);
+        return std.math.mul(usize, l.layer_stride, spec.num_kv_layers) catch return error.Overflow;
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: Csa2SummarySpec) ArenaError!Csa2SummaryArena {
+        const l = try computeLayout(spec);
+        const total = std.math.mul(usize, l.layer_stride, spec.num_kv_layers) catch return error.Overflow;
+        const backing = try arena.allocPages(total);
+        @memset(backing, 0);
+        return .{
+            .spec = spec,
+            .backing = backing,
+            .base_offset = @intCast(arena.offsetOf(backing.ptr)),
+            .layer_stride_bytes = @intCast(l.layer_stride),
+            .fine_plane_offset = 0,
+            .coarse_plane_offset = @intCast(l.coarse_off),
+            .fine_plane_bytes = l.fine_bytes,
+            .coarse_plane_bytes = l.coarse_bytes,
+        };
+    }
+
+    pub fn layerBinding(self: *const Csa2SummaryArena, kv_slot: u32, buf: metal.Buffer) ArenaError!metal.BufferBinding {
+        if (kv_slot >= self.spec.num_kv_layers) return error.InvalidLayerIndex;
+        return .{
+            .buffer = buf,
+            .offset = self.base_offset + @as(u64, kv_slot) * self.layer_stride_bytes,
+        };
+    }
+
+    pub fn fineBinding(self: *const Csa2SummaryArena, kv_slot: u32, buf: metal.Buffer) ArenaError!metal.BufferBinding {
+        if (kv_slot >= self.spec.num_kv_layers) return error.InvalidLayerIndex;
+        return .{
+            .buffer = buf,
+            .offset = self.base_offset + @as(u64, kv_slot) * self.layer_stride_bytes + self.fine_plane_offset,
+        };
+    }
+
+    pub fn coarseBinding(self: *const Csa2SummaryArena, kv_slot: u32, buf: metal.Buffer) ArenaError!metal.BufferBinding {
+        if (kv_slot >= self.spec.num_kv_layers) return error.InvalidLayerIndex;
+        return .{
+            .buffer = buf,
+            .offset = self.base_offset + @as(u64, kv_slot) * self.layer_stride_bytes + self.coarse_plane_offset,
+        };
+    }
+};
+
+/// Descriptor for `Csa2IndexBuffer` (shared across heads, reusable across `Reuse` layers and `r >= 1` loops).
+pub const Csa2IndexBufferSpec = struct {
+    max_nodes: u32 = MAX_WIDE_PREFILL_TOKENS,
+    top_k_blocks: u32 = 16,
+};
+
+/// 16 KiB-aligned wired CSA2 sparse block index buffer (`selected_blocks` + `selected_counts`).
+pub const Csa2IndexBuffer = struct {
+    spec: Csa2IndexBufferSpec,
+    backing: []align(page.APPLE_PAGE_SIZE) u8,
+    blocks_offset: u64,
+    counts_offset: u64,
+    blocks: []u32,
+    counts: []u32,
+
+    pub fn validateSpec(spec: Csa2IndexBufferSpec) ArenaError!void {
+        if (spec.max_nodes == 0 or spec.top_k_blocks == 0) return error.ZeroDimension;
+        if (spec.max_nodes > MAX_WIDE_PREFILL_TOKENS or spec.top_k_blocks > CSA2_MAX_TOP_K_BLOCKS) {
+            return error.InvalidConfig;
+        }
+    }
+
+    pub fn requiredBytes(spec: Csa2IndexBufferSpec) ArenaError!usize {
+        try validateSpec(spec);
+        const blocks_elems = std.math.mul(usize, spec.max_nodes, spec.top_k_blocks) catch return error.Overflow;
+        const blocks_bytes = std.math.mul(usize, blocks_elems, @sizeOf(u32)) catch return error.Overflow;
+        const counts_off = try alignUp16(blocks_bytes);
+        const counts_bytes = std.math.mul(usize, spec.max_nodes, @sizeOf(u32)) catch return error.Overflow;
+        const raw = std.math.add(usize, counts_off, counts_bytes) catch return error.Overflow;
+        return page.alignUp(raw) catch return error.Overflow;
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: Csa2IndexBufferSpec) ArenaError!Csa2IndexBuffer {
+        try validateSpec(spec);
+        const blocks_elems = std.math.mul(usize, spec.max_nodes, spec.top_k_blocks) catch return error.Overflow;
+        const blocks_bytes = std.math.mul(usize, blocks_elems, @sizeOf(u32)) catch return error.Overflow;
+        const counts_off = try alignUp16(blocks_bytes);
+        const counts_bytes = std.math.mul(usize, spec.max_nodes, @sizeOf(u32)) catch return error.Overflow;
+        const total = try requiredBytes(spec);
+
+        const backing = try arena.allocPages(total);
+        @memset(backing, 0);
+        const base_off: u64 = @intCast(arena.offsetOf(backing.ptr));
+        return .{
+            .spec = spec,
+            .backing = backing,
+            .blocks_offset = base_off,
+            .counts_offset = base_off + @as(u64, @intCast(counts_off)),
+            .blocks = @alignCast(std.mem.bytesAsSlice(u32, backing[0..blocks_bytes])),
+            .counts = @alignCast(std.mem.bytesAsSlice(u32, backing[counts_off .. counts_off + counts_bytes])),
+        };
+    }
+
+    pub fn blocksBinding(self: *const Csa2IndexBuffer, buf: metal.Buffer) metal.BufferBinding {
+        return .{ .buffer = buf, .offset = self.blocks_offset };
+    }
+
+    pub fn countsBinding(self: *const Csa2IndexBuffer, buf: metal.Buffer) metal.BufferBinding {
+        return .{ .buffer = buf, .offset = self.counts_offset };
+    }
+};
+
+pub const MlaFp4KvWriteArgs = struct {
+    /// `[num_tokens, kv_lora_rank]` `f16` latent vectors.
+    latent_in: metal.BufferBinding,
+    /// `[num_tokens, qk_rope_dim]` `f16` RoPE key vectors (optional if `qk_rope_dim == 0`).
+    rope_in: ?metal.BufferBinding = null,
+    /// Destination `MlaFp4KvArena` and owning physical `kv_slot`.
+    kv_arena: *const MlaFp4KvArena,
+    kv_metal_buf: metal.Buffer,
+    kv_slot: u32,
+    /// Optional circular `f16` SWA replay ring for exact recent-window replay.
+    swa_ring: ?*const MlaSwaRingArena = null,
+    swa_metal_buf: ?metal.Buffer = null,
+    num_tokens: u32,
+    /// Logical token position of token 0 (`0` for CED encoder->decoder global KV projection,
+    /// or current `kv_len` for causal prefill/decode append).
+    start_pos: u32,
+    /// Set `true` when projecting encoder final hidden states into global decoder KV (CED).
+    is_encoder_projection: bool = false,
+};
+
+pub const Csa2UpdateSummariesArgs = struct {
+    kv_arena: *const MlaFp4KvArena,
+    kv_metal_buf: metal.Buffer,
+    summary_arena: *const Csa2SummaryArena,
+    summary_metal_buf: metal.Buffer,
+    kv_slot: u32,
+    kv_len: u32,
+    /// First coarse super-block to update (`0` for full rebuild; `(start_pos / (block_tokens * coarse_group_blocks))` for incremental append).
+    start_coarse_block: u32 = 0,
+    /// Optional explicit coarse block count; defaults to updating through the end of `kv_len`.
+    num_coarse_blocks: ?u32 = null,
+};
+
+pub const Csa2IndexBlocksArgs = struct {
+    /// `[num_nodes, num_q_heads, kv_lora_rank]` `f16` absorbed query vectors.
+    q_nope: metal.BufferBinding,
+    summary_arena: *const Csa2SummaryArena,
+    summary_metal_buf: metal.Buffer,
+    kv_slot: u32,
+    index_buf: *const Csa2IndexBuffer,
+    index_metal_buf: metal.Buffer,
+    num_nodes: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    kv_len: u32,
+    /// CED encoder prefix length `[0, encoder_prefix_len)` always visible in decoder mode (`0` for causal decoder-only).
+    encoder_prefix_len: u32 = 0,
+    /// Causal query start position (`null` = full non-causal visibility up to `kv_len`).
+    causal_q_start_pos: ?u32 = null,
+    /// SWA bounded window size `W` (`0` = disabled; `> 0` = exclude `[eff_kv_len - W, eff_kv_len)` from sparse budget).
+    swa_window: u32 = 0,
+    top_k_blocks: u32 = 16,
+    /// Stage-1 coarse super-block shortlist size (`0` = auto `ceil(top_k_blocks / coarse_group_blocks) + 1`).
+    top_k_coarse: u32 = 0,
+    /// Mandatory local recent blocks when `swa_window == 0`.
+    num_local_blocks: u32 = 1,
+    /// Optional per-slot `kv_len[num_nodes]` (`u32`) for batched decode (`M = 1..16`).
+    batch_kv_lens: ?metal.BufferBinding = null,
+    scale: ?f32 = null,
+};
+
+pub const MlaCsa2AttendArgs = struct {
+    /// `[num_nodes, num_q_heads, kv_lora_rank]` `f16` absorbed query vectors.
+    q_nope: metal.BufferBinding,
+    /// `[num_nodes, num_q_heads, qk_rope_dim]` `f16` RoPE query vectors (optional if `qk_rope_dim == 0`).
+    q_pe: ?metal.BufferBinding = null,
+    kv_arena: *const MlaFp4KvArena,
+    kv_metal_buf: metal.Buffer,
+    kv_slot: u32,
+    /// Optional circular `f16` SWA replay ring for exact recent-window replay (`swa_window > 0`).
+    swa_ring: ?*const MlaSwaRingArena = null,
+    swa_metal_buf: ?metal.Buffer = null,
+    index_buf: *const Csa2IndexBuffer,
+    index_metal_buf: metal.Buffer,
+    /// Optional speculative tree latent keys `[num_nodes, kv_lora_rank]` `f16`.
+    kv_tree_latent: ?metal.BufferBinding = null,
+    /// Optional speculative tree RoPE keys `[num_nodes, qk_rope_dim]` `f16`.
+    kv_tree_rope: ?metal.BufferBinding = null,
+    /// Optional speculative tree 64-bit ancestor masks `[num_nodes]` `u64`.
+    ancestor_masks: ?metal.BufferBinding = null,
+    /// Optional per-slot `kv_len[num_nodes]` (`u32`) for batched decode (`M = 1..16`).
+    batch_kv_lens: ?metal.BufferBinding = null,
+    /// `[num_nodes, num_q_heads, kv_lora_rank]` `f16` absorbed attention output.
+    out: metal.BufferBinding,
+    num_nodes: u32,
+    num_q_heads: u32,
+    kv_len: u32,
+    encoder_prefix_len: u32 = 0,
+    causal_q_start_pos: ?u32 = null,
+    swa_window: u32 = 0,
+    block_tokens: u32 = CSA2_DEFAULT_BLOCK_TOKENS,
+    top_k_blocks: u32 = 16,
+    scale: ?f32 = null,
+};
+
+/// Dispatch telemetry returned by `encodeMlaCsa2Layer` verifying zero duplicate KV
+/// writes on `Reindex`/`Reuse` and zero indexer dispatches on `Reuse` / `r >= 1`.
+pub const MlaCsa2StepDispatches = struct {
+    kv_writes: u32 = 0,
+    summary_updates: u32 = 0,
+    index_dispatches: u32 = 0,
+    attn_dispatches: u32 = 0,
+};
+
+pub const MlaCsa2LayerArgs = struct {
+    mode: Csa2Mode,
+    /// Physical `MlaFp4KvArena` slot of this layer (`Full`) or its `shared_kv_owner` (`Reindex`/`Reuse`).
+    shared_kv_owner: u32,
+    /// Recurrent-depth loop step (`ADR-0019`): `0` writes KV & computes sparse indices;
+    /// `r >= 1` reuses KV & `index_buf` with zero duplicate writes/index dispatches.
+    loop_step: u32 = 0,
+    /// Optional new KV tokens to write on `Full` layers when `loop_step == 0`
+    /// (ignored with `0` KV writes on `Reindex`/`Reuse` and `loop_step >= 1`).
+    write_latent_in: ?metal.BufferBinding = null,
+    write_rope_in: ?metal.BufferBinding = null,
+    write_start_pos: u32 = 0,
+    write_num_tokens: u32 = 0,
+    is_encoder_projection: bool = false,
+    /// Attention & indexer inputs.
+    q_nope: metal.BufferBinding,
+    q_pe: ?metal.BufferBinding = null,
+    kv_arena: *const MlaFp4KvArena,
+    kv_metal_buf: metal.Buffer,
+    swa_ring: ?*const MlaSwaRingArena = null,
+    swa_metal_buf: ?metal.Buffer = null,
+    summary_arena: ?*const Csa2SummaryArena = null,
+    summary_metal_buf: ?metal.Buffer = null,
+    index_buf: *const Csa2IndexBuffer,
+    index_metal_buf: metal.Buffer,
+    kv_tree_latent: ?metal.BufferBinding = null,
+    kv_tree_rope: ?metal.BufferBinding = null,
+    ancestor_masks: ?metal.BufferBinding = null,
+    batch_kv_lens: ?metal.BufferBinding = null,
+    out: metal.BufferBinding,
+    num_nodes: u32,
+    num_q_heads: u32,
+    kv_len: u32,
+    encoder_prefix_len: u32 = 0,
+    causal_q_start_pos: ?u32 = null,
+    swa_window: u32 = 0,
+    block_tokens: u32 = CSA2_DEFAULT_BLOCK_TOKENS,
+    top_k_blocks: u32 = 16,
+    top_k_coarse: u32 = 0,
+    num_local_blocks: u32 = 1,
+    scale: ?f32 = null,
+};
+
+// ===========================================================================
+// Section F: M7 (G10) — Single-Pass Mega-mHC (`mhc_single_pass`)
+// ===========================================================================
+
+/// Configuration for Single-Pass Mega-mHC (`G10`, `2..8` hyper-streams, default `4`).
+pub const MhcConfig = struct {
+    num_streams: u32 = DEFAULT_MHC_STREAMS,
+    hidden_size: u32,
+    stream_dtype: quant.FloatDType = .f16,
+    act_dtype: quant.FloatDType = .f16,
+    norm_dtype: quant.FloatDType = .f16,
+    rms_eps: f32 = 1e-6,
+    /// `0` uses `h_res` weights directly; `> 0` projects `exp(h_res)` onto the Birkhoff
+    /// doubly-stochastic manifold via `sinkhorn_iters` Sinkhorn-Knopp iterations in-kernel.
+    sinkhorn_iters: u32 = 0,
+    /// When `true`, applies `sigmoid(h_pre)` / `post_scale * sigmoid(h_post)` in-kernel.
+    activate_coeffs: bool = false,
+    /// When `true`, broadcasts `[1, num_streams]` / `[1, num_streams, num_streams]` across all `M` tokens.
+    shared_coeffs: bool = false,
+    /// Apply `H_res` stream-to-stream mixing in-place during `encodeMegaMhc`.
+    apply_h_res_pre: bool = false,
+    /// Apply `H_res` stream-to-stream mixing in-place during `encodeMegaMhcPostMix`.
+    apply_h_res_post: bool = true,
+    /// Post-mixing scale multiplier (`1.0` default; `2.0` for `2 * sigmoid` DeepSeek mHC).
+    post_scale: f32 = 1.0,
+
+    pub fn validate(self: MhcConfig) EncodeError!void {
+        if (self.hidden_size == 0) return error.ZeroDimension;
+        if (self.num_streams < MIN_MHC_STREAMS or self.num_streams > MAX_MHC_STREAMS) {
+            return error.InvalidConfig;
+        }
+        if (self.rms_eps < 0.0 or !std.math.isFinite(self.rms_eps)) return error.InvalidConfig;
+        if (!std.math.isFinite(self.post_scale)) return error.InvalidConfig;
+    }
+};
+
+pub const MhcStreamSpec = struct {
+    max_tokens: u32,
+    num_streams: u32 = DEFAULT_MHC_STREAMS,
+    hidden_size: u32,
+    dtype: quant.FloatDType = .f16,
+};
+
+/// 16 KiB-aligned wired `[max_tokens, num_streams, hidden_size]` Mega-mHC stream state buffer.
+pub const MhcStreamArena = struct {
+    spec: MhcStreamSpec,
+    backing: []align(page.APPLE_PAGE_SIZE) u8,
+    base_offset: u64,
+
+    pub fn requiredBytes(spec: MhcStreamSpec) ArenaError!usize {
+        if (spec.max_tokens == 0 or spec.hidden_size == 0) return error.ZeroDimension;
+        if (spec.num_streams < MIN_MHC_STREAMS or spec.num_streams > MAX_MHC_STREAMS) {
+            return error.InvalidConfig;
+        }
+        const per_tok = std.math.mul(usize, spec.num_streams, spec.hidden_size) catch return error.Overflow;
+        const total_elems = std.math.mul(usize, per_tok, spec.max_tokens) catch return error.Overflow;
+        const total_bytes = std.math.mul(usize, total_elems, 2) catch return error.Overflow;
+        return page.alignUp(total_bytes) catch return error.Overflow;
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: MhcStreamSpec) ArenaError!MhcStreamArena {
+        const total = try requiredBytes(spec);
+        const backing = try arena.allocPages(total);
+        @memset(backing, 0);
+        return .{
+            .spec = spec,
+            .backing = backing,
+            .base_offset = @intCast(arena.offsetOf(backing.ptr)),
+        };
+    }
+
+    pub fn binding(self: *const MhcStreamArena, buf: metal.Buffer) metal.BufferBinding {
+        return .{ .buffer = buf, .offset = self.base_offset };
+    }
+};
+
+pub const MegaMhcArgs = struct {
+    config: MhcConfig,
+    /// `[m, num_streams, hidden_size]` (`stream_dtype`), read and optionally mixed in-place.
+    streams: metal.BufferBinding,
+    /// `[m, num_streams]` (or `[1, num_streams]` if `shared_coeffs`) `f32` pre-mix weights.
+    h_pre: metal.BufferBinding,
+    /// Optional `[m, num_streams, num_streams]` `f32` residual mixing matrix (required if `apply_h_res_pre`).
+    h_res: ?metal.BufferBinding = null,
+    /// Optional `[hidden_size]` (`norm_dtype`) RMSNorm weights fused into branch output.
+    norm_w: ?metal.BufferBinding = null,
+    /// `[m, hidden_size]` (`act_dtype`) mixed (and optionally RMS-normalized) sublayer input.
+    branch_out: metal.BufferBinding,
+    m: u32,
+};
+
+pub const MegaMhcPostMixArgs = struct {
+    config: MhcConfig,
+    /// `[m, num_streams, hidden_size]` (`stream_dtype`), updated in-place with zero extra intermediates.
+    streams: metal.BufferBinding,
+    /// `[m, hidden_size]` (`act_dtype`) Attention/FFN sublayer output.
+    sublayer_out: metal.BufferBinding,
+    /// `[m, num_streams]` (or `[1, num_streams]` if `shared_coeffs`) `f32` post-mix weights.
+    h_post: metal.BufferBinding,
+    /// Optional `[m, num_streams, num_streams]` `f32` residual mixing matrix (required if `apply_h_res_post`).
+    h_res: ?metal.BufferBinding = null,
+    m: u32,
+};
+
+// ===========================================================================
 // HybridPipelines: Startup-Compiled Metal 4 Compute Pipelines
 // ===========================================================================
 
@@ -1733,6 +2733,16 @@ pub const HybridPipelines = struct {
     gdn_conv1d_q_silu: metal.Pipeline,
     gdn_conv1d_commit: metal.Pipeline,
     blend_f16: metal.Pipeline,
+
+    // M7 (R7 + G11): MLA + CSA2 + FP4 KV + SWA bounded replay
+    mla_fp4_kv_write: metal.Pipeline,
+    csa2_update_summaries: metal.Pipeline,
+    csa2_index_blocks: metal.Pipeline,
+    mla_csa2_attend: metal.Pipeline,
+
+    // M7 (G10): Single-Pass Mega-mHC (`[stream_bf16][act_bf16]`)
+    mhc_single_pass: [2][2]metal.Pipeline,
+    mhc_post_mix: [2][2]metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!HybridPipelines {
         const gdn_decode_d64_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_decode", &.{
@@ -2003,6 +3013,56 @@ pub const HybridPipelines = struct {
         });
         errdefer qsa_swa_prefill_attn_dyn.close();
 
+        const mla_fp4_kv_write = try metal.Pipeline.init(device, library, "ami_mla_fp4_kv_write");
+        errdefer mla_fp4_kv_write.close();
+
+        const csa2_update_summaries = try metal.Pipeline.init(device, library, "ami_csa2_update_summaries");
+        errdefer csa2_update_summaries.close();
+
+        const csa2_index_blocks = try metal.Pipeline.init(device, library, "ami_csa2_index_blocks");
+        errdefer csa2_index_blocks.close();
+
+        const mla_csa2_attend = try metal.Pipeline.init(device, library, "ami_mla_csa2_attend");
+        errdefer mla_csa2_attend.close();
+
+        var mhc_single_pass: [2][2]metal.Pipeline = undefined;
+        var mhc_post_mix: [2][2]metal.Pipeline = undefined;
+        var mhc_built: usize = 0;
+        errdefer {
+            var idx: usize = 0;
+            while (idx < mhc_built) : (idx += 1) {
+                const kind = idx / 4;
+                const pair = idx % 4;
+                const sb = pair / 2;
+                const ab = pair % 2;
+                switch (kind) {
+                    0 => mhc_single_pass[sb][ab].close(),
+                    1 => mhc_post_mix[sb][ab].close(),
+                    else => {},
+                }
+            }
+        }
+        const mhc_names = [2][:0]const u8{
+            "ami_mhc_single_pass",
+            "ami_mhc_post_mix",
+        };
+        for (mhc_names, 0..) |fn_name, kind| {
+            for (0..2) |sb| {
+                for (0..2) |ab| {
+                    const p = try metal.Pipeline.initSpecialized(device, library, fn_name, &.{
+                        .{ .index = 3, .value = .{ .bool = sb == 1 } },
+                        .{ .index = 4, .value = .{ .bool = ab == 1 } },
+                    });
+                    switch (kind) {
+                        0 => mhc_single_pass[sb][ab] = p,
+                        1 => mhc_post_mix[sb][ab] = p,
+                        else => unreachable,
+                    }
+                    mhc_built += 1;
+                }
+            }
+        }
+
         return .{
             .gdn_decode_d64_f16 = gdn_decode_d64_f16,
             .gdn_decode_d64_bf16 = gdn_decode_d64_bf16,
@@ -2055,10 +3115,26 @@ pub const HybridPipelines = struct {
             .gdn_conv1d_q_silu = gdn_conv1d_q_silu,
             .gdn_conv1d_commit = gdn_conv1d_commit,
             .blend_f16 = blend_f16,
+            .mla_fp4_kv_write = mla_fp4_kv_write,
+            .csa2_update_summaries = csa2_update_summaries,
+            .csa2_index_blocks = csa2_index_blocks,
+            .mla_csa2_attend = mla_csa2_attend,
+            .mhc_single_pass = mhc_single_pass,
+            .mhc_post_mix = mhc_post_mix,
         };
     }
 
     pub fn close(self: HybridPipelines) void {
+        for (0..2) |sb| {
+            for (0..2) |ab| {
+                self.mhc_post_mix[sb][ab].close();
+                self.mhc_single_pass[sb][ab].close();
+            }
+        }
+        self.mla_csa2_attend.close();
+        self.csa2_index_blocks.close();
+        self.csa2_update_summaries.close();
+        self.mla_fp4_kv_write.close();
         self.qsa_swa_prefill_attn_dyn.close();
         self.qsa_swa_prefill_attn_d128.close();
         self.qsa_swa_prefill_attn_d64.close();
@@ -3437,6 +4513,499 @@ pub const HybridPipelines = struct {
             insert_barrier_before,
         );
     }
+
+    // -----------------------------------------------------------------------
+    // M7 (R7 + G11): MLA + CSA2 + FP4 KV + SWA Bounded Replay Encoders
+    // -----------------------------------------------------------------------
+
+    /// Quantizes `[num_tokens, kv_lora_rank]` latent rows to FP4 (`E2M1` +
+    /// per-16 `E4M3` scale) and writes `[num_tokens, qk_rope_dim]` RoPE keys
+    /// into a physical `Full` slot of `MlaFp4KvArena` (optionally mirroring
+    /// exact `f16` rows into a circular `MlaSwaRingArena`).
+    pub fn encodeMlaFp4KvWrite(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: MlaFp4KvWriteArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_tokens == 0 or args.num_tokens > MAX_WIDE_PREFILL_TOKENS) return error.InvalidNodeCount;
+        const spec = args.kv_arena.spec;
+        if (args.kv_slot >= spec.num_kv_layers) return error.InvalidLayerIndex;
+        const end_pos = std.math.add(u32, args.start_pos, args.num_tokens) catch return error.InvalidConfig;
+        if (end_pos > spec.max_tokens) return error.InvalidConfig;
+        if (spec.qk_rope_dim > 0 and args.rope_in == null) return error.InvalidConfig;
+
+        var swa_capacity: u32 = 0;
+        var swa_rope_off: u64 = 0;
+        var swa_binding: metal.BufferBinding = args.latent_in;
+        if (args.swa_ring) |ring| {
+            const swa_buf = args.swa_metal_buf orelse return error.InvalidConfig;
+            if (ring.spec.kv_lora_rank != spec.kv_lora_rank or ring.spec.qk_rope_dim != spec.qk_rope_dim) {
+                return error.InvalidConfig;
+            }
+            swa_binding = ring.layerBinding(args.kv_slot, swa_buf) catch return error.InvalidLayerIndex;
+            swa_capacity = ring.spec.swa_window;
+            swa_rope_off = ring.rope_plane_offset;
+        }
+
+        const kv_binding = args.kv_arena.layerBinding(args.kv_slot, args.kv_metal_buf) catch return error.InvalidLayerIndex;
+        const params: MlaFp4KvWriteParams = .{
+            .num_tokens = args.num_tokens,
+            .start_pos = args.start_pos,
+            .kv_lora_rank = spec.kv_lora_rank,
+            .qk_rope_dim = spec.qk_rope_dim,
+            .rope_tail_format = @backingInt(spec.rope_tail_format),
+            .max_tokens = spec.max_tokens,
+            .swa_ring_capacity = swa_capacity,
+            .flags = if (args.is_encoder_projection) 1 else 0,
+            .e2m1_plane_offset = args.kv_arena.e2m1_plane_offset,
+            .scale_plane_offset = args.kv_arena.scale_plane_offset,
+            .rope_plane_offset = args.kv_arena.rope_plane_offset,
+            .swa_rope_plane_offset = swa_rope_off,
+        };
+        try frame.encodeThreadgroups(
+            self.mla_fp4_kv_write,
+            &.{
+                args.latent_in,
+                args.rope_in orelse args.latent_in,
+                kv_binding,
+                swa_binding,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_tokens, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Stage-1 hierarchical summary updater: builds fine (`[num_fine, index_dim]`)
+    /// and coarse (`[num_coarse, index_dim]`) `f16` block summaries directly from
+    /// FP4 (`E2M1` + `E4M3`) latent KV slabs.
+    pub fn encodeCsa2UpdateSummaries(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: Csa2UpdateSummariesArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.kv_len == 0) return error.ZeroDimension;
+        const kv_spec = args.kv_arena.spec;
+        const sum_spec = args.summary_arena.spec;
+        if (args.kv_len > kv_spec.max_tokens or args.kv_len > sum_spec.max_tokens) return error.InvalidConfig;
+        if (sum_spec.index_dim > kv_spec.kv_lora_rank) return error.InvalidConfig;
+        if (args.kv_slot >= kv_spec.num_kv_layers or args.kv_slot >= sum_spec.num_kv_layers) {
+            return error.InvalidLayerIndex;
+        }
+
+        const total_fine = (args.kv_len + sum_spec.block_tokens - 1) / sum_spec.block_tokens;
+        const total_coarse = (total_fine + sum_spec.coarse_group_blocks - 1) / sum_spec.coarse_group_blocks;
+        if (args.start_coarse_block >= total_coarse) return error.InvalidConfig;
+        const max_rem = total_coarse - args.start_coarse_block;
+        const num_coarse = args.num_coarse_blocks orelse max_rem;
+        if (num_coarse == 0 or num_coarse > max_rem) return error.InvalidConfig;
+
+        const kv_binding = args.kv_arena.layerBinding(args.kv_slot, args.kv_metal_buf) catch return error.InvalidLayerIndex;
+        const sum_binding = args.summary_arena.layerBinding(args.kv_slot, args.summary_metal_buf) catch return error.InvalidLayerIndex;
+        const params: Csa2SummaryParams = .{
+            .kv_len = args.kv_len,
+            .kv_lora_rank = kv_spec.kv_lora_rank,
+            .index_dim = sum_spec.index_dim,
+            .block_tokens = sum_spec.block_tokens,
+            .coarse_group_blocks = sum_spec.coarse_group_blocks,
+            .start_coarse_block = args.start_coarse_block,
+            .num_coarse_blocks = num_coarse,
+            .e2m1_plane_offset = args.kv_arena.e2m1_plane_offset,
+            .scale_plane_offset = args.kv_arena.scale_plane_offset,
+            .fine_plane_offset = args.summary_arena.fine_plane_offset,
+            .coarse_plane_offset = args.summary_arena.coarse_plane_offset,
+        };
+        try frame.encodeThreadgroups(
+            self.csa2_update_summaries,
+            &.{ kv_binding, sum_binding },
+            std.mem.asBytes(&params),
+            .{ num_coarse, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Stage-2 hierarchical CSA2 sparse block indexer (`Full` and `Reindex` modes).
+    pub fn encodeCsa2IndexBlocks(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: Csa2IndexBlocksArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        const has_batch = args.batch_kv_lens != null;
+        const max_nodes = if (has_batch) MAX_MLA_BATCH_DECODE_SLOTS else MAX_WIDE_PREFILL_TOKENS;
+        if (args.num_nodes == 0 or args.num_nodes > max_nodes) return error.InvalidNodeCount;
+        if (args.num_q_heads == 0 or args.kv_lora_rank == 0) return error.ZeroDimension;
+        if ((args.kv_lora_rank % 32) != 0 or args.kv_lora_rank > MAX_MLA_LATENT_DIM) return error.InvalidHeadDim;
+        if (args.top_k_blocks == 0 or args.top_k_blocks > CSA2_MAX_TOP_K_BLOCKS) return error.UnsupportedTopKBlocks;
+        if (args.num_nodes > args.index_buf.spec.max_nodes or args.top_k_blocks > args.index_buf.spec.top_k_blocks) {
+            return error.InvalidConfig;
+        }
+        const sum_spec = args.summary_arena.spec;
+        if (sum_spec.index_dim > args.kv_lora_rank) return error.InvalidConfig;
+        if (has_batch) {
+            const end_slot = std.math.add(u32, args.kv_slot, args.num_nodes) catch return error.InvalidLayerIndex;
+            if (end_slot > sum_spec.num_kv_layers) return error.InvalidLayerIndex;
+        } else {
+            if (args.kv_slot >= sum_spec.num_kv_layers) return error.InvalidLayerIndex;
+        }
+
+        const g_blocks = sum_spec.coarse_group_blocks;
+        const auto_coarse = @min(CSA2_MAX_TOP_K_BLOCKS, ((args.top_k_blocks + g_blocks - 1) / g_blocks) + 1);
+        const top_k_coarse = if (args.top_k_coarse > 0) @min(args.top_k_coarse, CSA2_MAX_TOP_K_BLOCKS) else auto_coarse;
+        const scale = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(sum_spec.index_dim))));
+
+        const fine_binding = args.summary_arena.fineBinding(args.kv_slot, args.summary_metal_buf) catch return error.InvalidLayerIndex;
+        const coarse_binding = args.summary_arena.coarseBinding(args.kv_slot, args.summary_metal_buf) catch return error.InvalidLayerIndex;
+        const params: Csa2IndexParams = .{
+            .num_nodes = args.num_nodes,
+            .num_q_heads = args.num_q_heads,
+            .kv_lora_rank = args.kv_lora_rank,
+            .index_dim = sum_spec.index_dim,
+            .kv_len = args.kv_len,
+            .encoder_prefix_len = args.encoder_prefix_len,
+            .causal_q_start_pos = args.causal_q_start_pos orelse 0xFFFF_FFFF,
+            .swa_window = args.swa_window,
+            .block_tokens = sum_spec.block_tokens,
+            .coarse_group_blocks = g_blocks,
+            .top_k_coarse = top_k_coarse,
+            .top_k_blocks = args.top_k_blocks,
+            .num_local_blocks = if (args.num_local_blocks > 0) args.num_local_blocks else 1,
+            .has_batch_slots = if (has_batch) 1 else 0,
+            .scale = scale,
+            .fine_batch_stride_bytes = if (has_batch) args.summary_arena.layer_stride_bytes else 0,
+            .coarse_batch_stride_bytes = if (has_batch) args.summary_arena.layer_stride_bytes else 0,
+        };
+        try frame.encodeThreadgroups(
+            self.csa2_index_blocks,
+            &.{
+                args.q_nope,
+                fine_binding,
+                coarse_binding,
+                args.batch_kv_lens orelse args.q_nope,
+                args.index_buf.blocksBinding(args.index_metal_buf),
+                args.index_buf.countsBinding(args.index_metal_buf),
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_nodes, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Online-softmax absorbed MLA + CSA2 attention over selected FP4 (`E2M1` +
+    /// `E4M3`) latent KV blocks + deduplicated SWA bounded window replay +
+    /// optional 64-bit ancestor-masked speculative tree tokens.
+    pub fn encodeMlaCsa2Attend(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: MlaCsa2AttendArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        const has_any_tree = (args.kv_tree_latent != null or args.kv_tree_rope != null or args.ancestor_masks != null);
+        const has_batch = args.batch_kv_lens != null;
+        if (has_any_tree and has_batch) return error.InvalidConfig;
+        const max_nodes: u32 = if (has_any_tree)
+            MAX_TREE_NODES
+        else if (has_batch)
+            MAX_MLA_BATCH_DECODE_SLOTS
+        else
+            MAX_WIDE_PREFILL_TOKENS;
+        if (args.num_nodes == 0 or args.num_nodes > max_nodes) return error.InvalidNodeCount;
+        if (args.num_q_heads == 0 or args.block_tokens == 0) return error.ZeroDimension;
+        if (args.top_k_blocks == 0 or args.top_k_blocks > CSA2_MAX_TOP_K_BLOCKS) return error.UnsupportedTopKBlocks;
+        if (args.num_nodes > args.index_buf.spec.max_nodes or args.top_k_blocks > args.index_buf.spec.top_k_blocks) {
+            return error.InvalidConfig;
+        }
+        const spec = args.kv_arena.spec;
+        if (spec.qk_rope_dim > 0 and args.q_pe == null) return error.InvalidConfig;
+        if (has_any_tree) {
+            if (args.kv_tree_latent == null or args.ancestor_masks == null) return error.MissingTreeInputs;
+            if (spec.qk_rope_dim > 0 and args.kv_tree_rope == null) return error.MissingTreeInputs;
+        }
+        if (has_batch) {
+            const end_slot = std.math.add(u32, args.kv_slot, args.num_nodes) catch return error.InvalidLayerIndex;
+            if (end_slot > spec.num_kv_layers) return error.InvalidLayerIndex;
+        } else {
+            if (args.kv_slot >= spec.num_kv_layers) return error.InvalidLayerIndex;
+        }
+
+        var swa_capacity: u32 = 0;
+        var swa_rope_off: u64 = 0;
+        var swa_batch_stride: u64 = 0;
+        var swa_binding: metal.BufferBinding = args.q_nope;
+        if (args.swa_ring) |ring| {
+            const swa_buf = args.swa_metal_buf orelse return error.InvalidConfig;
+            if (ring.spec.kv_lora_rank != spec.kv_lora_rank or ring.spec.qk_rope_dim != spec.qk_rope_dim) {
+                return error.InvalidConfig;
+            }
+            if (has_batch) {
+                const end_slot = std.math.add(u32, args.kv_slot, args.num_nodes) catch return error.InvalidLayerIndex;
+                if (end_slot > ring.spec.num_kv_layers) return error.InvalidLayerIndex;
+            }
+            swa_binding = ring.layerBinding(args.kv_slot, swa_buf) catch return error.InvalidLayerIndex;
+            swa_capacity = ring.spec.swa_window;
+            swa_rope_off = ring.rope_plane_offset;
+            swa_batch_stride = if (has_batch) ring.layer_stride_bytes else 0;
+        }
+
+        const kv_binding = args.kv_arena.layerBinding(args.kv_slot, args.kv_metal_buf) catch return error.InvalidLayerIndex;
+        const scale = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(spec.kv_lora_rank + spec.qk_rope_dim))));
+        const params: MlaCsa2AttnParams = .{
+            .num_nodes = args.num_nodes,
+            .num_q_heads = args.num_q_heads,
+            .kv_lora_rank = spec.kv_lora_rank,
+            .qk_rope_dim = spec.qk_rope_dim,
+            .rope_tail_format = @backingInt(spec.rope_tail_format),
+            .kv_len = args.kv_len,
+            .encoder_prefix_len = args.encoder_prefix_len,
+            .causal_q_start_pos = args.causal_q_start_pos orelse 0xFFFF_FFFF,
+            .swa_window = args.swa_window,
+            .swa_ring_capacity = swa_capacity,
+            .block_tokens = args.block_tokens,
+            .top_k_blocks = args.top_k_blocks,
+            .has_tree = if (has_any_tree) 1 else 0,
+            .has_batch_slots = if (has_batch) 1 else 0,
+            .scale = scale,
+            .e2m1_plane_offset = args.kv_arena.e2m1_plane_offset,
+            .scale_plane_offset = args.kv_arena.scale_plane_offset,
+            .rope_plane_offset = args.kv_arena.rope_plane_offset,
+            .swa_rope_plane_offset = swa_rope_off,
+            .kv_batch_stride_bytes = if (has_batch) args.kv_arena.layer_stride_bytes else 0,
+            .swa_batch_stride_bytes = swa_batch_stride,
+        };
+        try frame.encodeThreadgroups(
+            self.mla_csa2_attend,
+            &.{
+                args.q_nope,
+                args.q_pe orelse args.q_nope,
+                kv_binding,
+                swa_binding,
+                args.index_buf.blocksBinding(args.index_metal_buf),
+                args.index_buf.countsBinding(args.index_metal_buf),
+                args.kv_tree_latent orelse args.q_nope,
+                args.kv_tree_rope orelse args.q_nope,
+                args.ancestor_masks orelse args.q_nope,
+                args.batch_kv_lens orelse args.q_nope,
+                args.out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_q_heads, args.num_nodes, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Unified CSA2 (`Full` / `Reindex` / `Reuse`) + `LoopSchedule` (`r >= 1`
+    /// index reuse) layer dispatcher:
+    /// - `Full`: writes KV + updates summaries + runs hierarchical indexer only
+    ///   when `loop_step == 0`, then attends.
+    /// - `Reindex`: `0` KV writes (aliases `shared_kv_owner`), runs indexer only
+    ///   when `loop_step == 0`, then attends.
+    /// - `Reuse`: `0` KV writes and `0` indexer dispatches (aliases both
+    ///   `shared_kv_owner` and owner `index_buf`), runs attend only.
+    pub fn encodeMlaCsa2Layer(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: MlaCsa2LayerArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!MlaCsa2StepDispatches {
+        var counts: MlaCsa2StepDispatches = .{};
+        var next_barrier = insert_barrier_before;
+
+        // 1. FP4 KV write + summary update: `Full` layers only, `loop_step == 0` only.
+        if (args.mode == .full and args.loop_step == 0) {
+            if (args.write_latent_in) |lat_in| {
+                if (args.write_num_tokens > 0) {
+                    try self.encodeMlaFp4KvWrite(frame, .{
+                        .latent_in = lat_in,
+                        .rope_in = args.write_rope_in,
+                        .kv_arena = args.kv_arena,
+                        .kv_metal_buf = args.kv_metal_buf,
+                        .kv_slot = args.shared_kv_owner,
+                        .swa_ring = args.swa_ring,
+                        .swa_metal_buf = args.swa_metal_buf,
+                        .num_tokens = args.write_num_tokens,
+                        .start_pos = args.write_start_pos,
+                        .is_encoder_projection = args.is_encoder_projection,
+                    }, next_barrier);
+                    counts.kv_writes += 1;
+                    next_barrier = true;
+
+                    if (args.summary_arena) |sum_arena| {
+                        const sum_buf = args.summary_metal_buf orelse return error.InvalidConfig;
+                        const coarse_span = sum_arena.spec.block_tokens * sum_arena.spec.coarse_group_blocks;
+                        const start_coarse = args.write_start_pos / coarse_span;
+                        try self.encodeCsa2UpdateSummaries(frame, .{
+                            .kv_arena = args.kv_arena,
+                            .kv_metal_buf = args.kv_metal_buf,
+                            .summary_arena = sum_arena,
+                            .summary_metal_buf = sum_buf,
+                            .kv_slot = args.shared_kv_owner,
+                            .kv_len = args.kv_len,
+                            .start_coarse_block = start_coarse,
+                        }, next_barrier);
+                        counts.summary_updates += 1;
+                        next_barrier = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Hierarchical CSA2 indexing: `Full` and `Reindex` on `loop_step == 0` only
+        //    (strictly skipped in `Reuse` mode and on `loop_step >= 1`).
+        if (args.mode != .reuse and args.loop_step == 0) {
+            const sum_arena = args.summary_arena orelse return error.InvalidConfig;
+            const sum_buf = args.summary_metal_buf orelse return error.InvalidConfig;
+            try self.encodeCsa2IndexBlocks(frame, .{
+                .q_nope = args.q_nope,
+                .summary_arena = sum_arena,
+                .summary_metal_buf = sum_buf,
+                .kv_slot = args.shared_kv_owner,
+                .index_buf = args.index_buf,
+                .index_metal_buf = args.index_metal_buf,
+                .num_nodes = args.num_nodes,
+                .num_q_heads = args.num_q_heads,
+                .kv_lora_rank = args.kv_arena.spec.kv_lora_rank,
+                .kv_len = args.kv_len,
+                .encoder_prefix_len = args.encoder_prefix_len,
+                .causal_q_start_pos = args.causal_q_start_pos,
+                .swa_window = args.swa_window,
+                .top_k_blocks = args.top_k_blocks,
+                .top_k_coarse = args.top_k_coarse,
+                .num_local_blocks = args.num_local_blocks,
+                .batch_kv_lens = args.batch_kv_lens,
+                .scale = args.scale,
+            }, next_barrier);
+            counts.index_dispatches += 1;
+            next_barrier = true;
+        }
+
+        // 3. Online-softmax absorbed MLA + CSA2 + SWA bounded replay attention.
+        try self.encodeMlaCsa2Attend(frame, .{
+            .q_nope = args.q_nope,
+            .q_pe = args.q_pe,
+            .kv_arena = args.kv_arena,
+            .kv_metal_buf = args.kv_metal_buf,
+            .kv_slot = args.shared_kv_owner,
+            .swa_ring = args.swa_ring,
+            .swa_metal_buf = args.swa_metal_buf,
+            .index_buf = args.index_buf,
+            .index_metal_buf = args.index_metal_buf,
+            .kv_tree_latent = args.kv_tree_latent,
+            .kv_tree_rope = args.kv_tree_rope,
+            .ancestor_masks = args.ancestor_masks,
+            .batch_kv_lens = args.batch_kv_lens,
+            .out = args.out,
+            .num_nodes = args.num_nodes,
+            .num_q_heads = args.num_q_heads,
+            .kv_len = args.kv_len,
+            .encoder_prefix_len = args.encoder_prefix_len,
+            .causal_q_start_pos = args.causal_q_start_pos,
+            .swa_window = args.swa_window,
+            .block_tokens = args.block_tokens,
+            .top_k_blocks = args.top_k_blocks,
+            .scale = args.scale,
+        }, next_barrier);
+        counts.attn_dispatches += 1;
+        return counts;
+    }
+
+    // -----------------------------------------------------------------------
+    // M7 (G10): Single-Pass Mega-mHC Encoders (`mhc_single_pass`)
+    // -----------------------------------------------------------------------
+
+    /// Single-pass Mega-mHC pre-sublayer kernel (`ami_mhc_single_pass`): fuses
+    /// `2..8` hyper-stream mixing, optional RMSNorm, and optional in-place
+    /// Birkhoff-projected `H_res` stream mixing with zero extra global buffers.
+    pub fn encodeMegaMhc(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: MegaMhcArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0) return error.ZeroDimension;
+        try args.config.validate();
+        if (args.config.apply_h_res_pre and args.h_res == null) return error.InvalidConfig;
+
+        var flags: u32 = 0;
+        if (args.norm_w != null) flags |= 1;
+        if (args.config.norm_dtype == .bf16) flags |= 2;
+        if (args.config.apply_h_res_pre) flags |= 4;
+        if (args.config.activate_coeffs) flags |= 8;
+        if (args.config.shared_coeffs) flags |= 16;
+
+        const params: MhcParams = .{
+            .m = args.m,
+            .num_streams = args.config.num_streams,
+            .hidden_size = args.config.hidden_size,
+            .flags = flags,
+            .sinkhorn_iters = args.config.sinkhorn_iters,
+            .rms_eps = args.config.rms_eps,
+            .post_scale = args.config.post_scale,
+        };
+        const pipe = self.mhc_single_pass[grIndex(args.config.stream_dtype)][grIndex(args.config.act_dtype)];
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.streams,
+                args.h_pre,
+                args.h_res orelse args.h_pre,
+                args.norm_w orelse args.streams,
+                args.branch_out,
+            },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Single-pass Mega-mHC post-sublayer residual update (`ami_mhc_post_mix`):
+    /// fuses optional Sinkhorn-Knopp Birkhoff `H_res` mixing + `H_post * y`
+    /// back across all `num_streams` hyper-streams in-place (0 intermediates).
+    pub fn encodeMegaMhcPostMix(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: MegaMhcPostMixArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0) return error.ZeroDimension;
+        try args.config.validate();
+        if (args.config.apply_h_res_post and args.h_res == null) return error.InvalidConfig;
+
+        var flags: u32 = 0;
+        if (args.config.apply_h_res_post) flags |= 4;
+        if (args.config.activate_coeffs) flags |= 8;
+        if (args.config.shared_coeffs) flags |= 16;
+
+        const params: MhcParams = .{
+            .m = args.m,
+            .num_streams = args.config.num_streams,
+            .hidden_size = args.config.hidden_size,
+            .flags = flags,
+            .sinkhorn_iters = args.config.sinkhorn_iters,
+            .rms_eps = args.config.rms_eps,
+            .post_scale = args.config.post_scale,
+        };
+        const pipe = self.mhc_post_mix[grIndex(args.config.stream_dtype)][grIndex(args.config.act_dtype)];
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.streams,
+                args.sublayer_out,
+                args.h_post,
+                args.h_res orelse args.h_post,
+            },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
 };
 
 // ===========================================================================
@@ -3802,6 +5371,491 @@ pub fn qsaSparseAttnCpuRef(
 
             if (l_val > 0.0) {
                 for (0..head_dim) |d| out_row[d] /= l_val;
+            }
+        }
+    }
+}
+
+/// CPU `fp32` reference for Stage-1 hierarchical CSA2 block summaries (fine + coarse).
+pub fn csa2UpdateSummariesCpuRef(
+    e2m1_plane: []const u8,
+    scale_plane: []const u8,
+    kv_len: u32,
+    kv_lora_rank: u32,
+    index_dim: u32,
+    block_tokens: u32,
+    coarse_group_blocks: u32,
+    fine_out: []f16,
+    coarse_out: []f16,
+) void {
+    if (kv_len == 0) return;
+    const total_fine = (kv_len + block_tokens - 1) / block_tokens;
+    const g_blocks = @max(coarse_group_blocks, 1);
+    const total_coarse = (total_fine + g_blocks - 1) / g_blocks;
+    const e2m1_row_bytes: usize = kv_lora_rank / 2;
+    const num_groups: usize = kv_lora_rank / MLA_FP4_GROUP_SIZE;
+
+    for (0..total_coarse) |sb| {
+        const first_fine = sb * g_blocks;
+        const end_fine = @min(first_fine + g_blocks, total_fine);
+        const valid_sub: f32 = @floatFromInt(end_fine - first_fine);
+        for (0..index_dim) |d| {
+            const byte_idx = d >> 1;
+            const hi_nib = (d & 1) != 0;
+            const grp_idx = d >> 4;
+            var coarse_acc: f32 = 0.0;
+            for (first_fine..end_fine) |fb| {
+                const t0 = fb * block_tokens;
+                const t1 = @min(t0 + block_tokens, kv_len);
+                var fine_acc: f32 = 0.0;
+                for (t0..t1) |t| {
+                    const packed_b = e2m1_plane[t * e2m1_row_bytes + byte_idx];
+                    const nib: u4 = @truncate(if (hi_nib) (packed_b >> 4) else (packed_b & 0xF));
+                    const sc = e4m3ToF32(scale_plane[t * num_groups + grp_idx]);
+                    fine_acc += e2m1NibbleToF32(nib) * sc;
+                }
+                const fine_mean = fine_acc / @as(f32, @floatFromInt(t1 - t0));
+                fine_out[fb * index_dim + d] = @floatCast(fine_mean);
+                coarse_acc += fine_mean;
+            }
+            coarse_out[sb * index_dim + d] = @floatCast(coarse_acc / valid_sub);
+        }
+    }
+}
+
+/// CPU `fp32` reference for Stage-2 hierarchical CSA2 sparse block selection.
+pub fn csa2IndexBlocksCpuRef(
+    q_nope: []const f16,
+    fine_keys: []const f16,
+    coarse_keys: []const f16,
+    num_nodes: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    index_dim: u32,
+    kv_len: u32,
+    encoder_prefix_len: u32,
+    causal_q_start_pos: ?u32,
+    swa_window: u32,
+    block_tokens: u32,
+    coarse_group_blocks: u32,
+    top_k_coarse: u32,
+    top_k_blocks: u32,
+    num_local_blocks: u32,
+    scale: f32,
+    selected_blocks_out: []u32,
+    selected_counts_out: []u32,
+) void {
+    const k_cap = @min(top_k_blocks, CSA2_MAX_TOP_K_BLOCKS);
+    const g_blocks = @max(coarse_group_blocks, 1);
+
+    for (0..num_nodes) |node| {
+        const sel_base = node * top_k_blocks;
+        @memset(selected_blocks_out[sel_base .. sel_base + top_k_blocks], 0xFFFF_FFFF);
+        const eff_kv_len: u32 = if (causal_q_start_pos) |q0|
+            @min(kv_len, @max(encoder_prefix_len, q0 + @as(u32, @intCast(node)) + 1))
+        else
+            kv_len;
+        if (eff_kv_len == 0 or k_cap == 0) {
+            selected_counts_out[node] = 0;
+            continue;
+        }
+        const swa_lo: u32 = if (swa_window > 0 and eff_kv_len > swa_window) eff_kv_len - swa_window else 0;
+        if (swa_window > 0 and swa_lo == 0) {
+            selected_counts_out[node] = 0;
+            continue;
+        }
+        const num_valid = (eff_kv_len + block_tokens - 1) / block_tokens;
+        const num_cand = if (swa_window > 0) ((swa_lo + block_tokens - 1) / block_tokens) else num_valid;
+        if (num_cand <= k_cap) {
+            for (0..num_cand) |i| selected_blocks_out[sel_base + i] = @intCast(i);
+            selected_counts_out[node] = num_cand;
+            continue;
+        }
+
+        const local_cnt: u32 = if (swa_window > 0) 0 else @min(@max(num_local_blocks, 1), k_cap);
+        const search_end = num_cand - local_cnt;
+        const k_sel = k_cap - local_cnt;
+        const num_coarse = (search_end + g_blocks - 1) / g_blocks;
+        const k_coarse = @min(top_k_coarse, CSA2_MAX_TOP_K_BLOCKS);
+        const use_coarse = (g_blocks > 1 and k_coarse > 0 and num_coarse > k_coarse);
+
+        var coarse_sel: [CSA2_MAX_TOP_K_BLOCKS]u32 = undefined;
+        var coarse_cnt: u32 = 0;
+        if (use_coarse and k_sel > 0) {
+            var used_c: [1024]bool = @splat(false);
+            std.debug.assert(num_coarse <= used_c.len);
+            for (0..k_coarse) |_| {
+                var best_s: f32 = -std.math.inf(f32);
+                var best_b: u32 = 0xFFFF_FFFF;
+                for (0..num_coarse) |sb| {
+                    if (used_c[sb]) continue;
+                    var best_h: f32 = -std.math.inf(f32);
+                    for (0..num_q_heads) |h| {
+                        const q_row = q_nope[(node * num_q_heads + h) * kv_lora_rank ..][0..index_dim];
+                        const ck_row = coarse_keys[sb * index_dim ..][0..index_dim];
+                        var dot_acc: f32 = 0.0;
+                        for (0..index_dim) |d| dot_acc += @as(f32, @floatCast(q_row[d])) * @as(f32, @floatCast(ck_row[d]));
+                        best_h = @max(best_h, dot_acc * scale);
+                    }
+                    const sb_u32: u32 = @intCast(sb);
+                    if (best_h > best_s or (best_h == best_s and sb_u32 < best_b)) {
+                        best_s = best_h;
+                        best_b = sb_u32;
+                    }
+                }
+                if (best_b == 0xFFFF_FFFF) break;
+                used_c[best_b] = true;
+                coarse_sel[coarse_cnt] = best_b;
+                coarse_cnt += 1;
+            }
+        }
+
+        var win_cnt: u32 = 0;
+        if (k_sel > 0) {
+            var cand_ids: [4096]u32 = undefined;
+            var cand_scores: [4096]f32 = undefined;
+            var n_cands: usize = 0;
+            if (use_coarse) {
+                for (0..coarse_cnt) |ci| {
+                    for (0..g_blocks) |sub| {
+                        const b = coarse_sel[ci] * g_blocks + @as(u32, @intCast(sub));
+                        if (b >= search_end) continue;
+                        cand_ids[n_cands] = b;
+                        n_cands += 1;
+                    }
+                }
+            } else {
+                for (0..search_end) |b| {
+                    cand_ids[n_cands] = @intCast(b);
+                    n_cands += 1;
+                }
+            }
+            for (0..n_cands) |i| {
+                const b = cand_ids[i];
+                var best_h: f32 = -std.math.inf(f32);
+                for (0..num_q_heads) |h| {
+                    const q_row = q_nope[(node * num_q_heads + h) * kv_lora_rank ..][0..index_dim];
+                    const fk_row = fine_keys[@as(usize, b) * index_dim ..][0..index_dim];
+                    var dot_acc: f32 = 0.0;
+                    for (0..index_dim) |d| dot_acc += @as(f32, @floatCast(q_row[d])) * @as(f32, @floatCast(fk_row[d]));
+                    best_h = @max(best_h, dot_acc * scale);
+                }
+                cand_scores[i] = best_h;
+            }
+            var used_f: [4096]bool = @splat(false);
+            for (0..k_sel) |_| {
+                var best_s: f32 = -std.math.inf(f32);
+                var best_b: u32 = 0xFFFF_FFFF;
+                var best_i: usize = 0;
+                for (0..n_cands) |i| {
+                    if (used_f[i]) continue;
+                    const s = cand_scores[i];
+                    const b = cand_ids[i];
+                    if (s > best_s or (s == best_s and b < best_b)) {
+                        best_s = s;
+                        best_b = b;
+                        best_i = i;
+                    }
+                }
+                if (best_b == 0xFFFF_FFFF) break;
+                used_f[best_i] = true;
+                selected_blocks_out[sel_base + win_cnt] = best_b;
+                win_cnt += 1;
+            }
+        }
+        for (0..local_cnt) |i| {
+            selected_blocks_out[sel_base + win_cnt + i] = search_end + @as(u32, @intCast(i));
+        }
+        selected_counts_out[node] = win_cnt + local_cnt;
+    }
+}
+
+/// CPU `fp32` reference for absorbed MLA + CSA2 + SWA bounded window replay + optional tree attention.
+pub fn mlaCsa2AttendCpuRef(
+    q_nope: []const f16,
+    q_pe: ?[]const f16,
+    e2m1_plane: []const u8,
+    scale_plane: []const u8,
+    rope_plane: []const u8,
+    rope_format: MlaRopeTailFormat,
+    swa_lat_ring: ?[]const f16,
+    swa_rope_ring: ?[]const f16,
+    swa_ring_capacity: u32,
+    selected_blocks: []const u32,
+    selected_counts: []const u32,
+    kv_tree_latent: ?[]const f16,
+    kv_tree_rope: ?[]const f16,
+    ancestor_masks: ?[]const u64,
+    out_f32: []f32,
+    num_nodes: u32,
+    num_q_heads: u32,
+    kv_lora_rank: u32,
+    qk_rope_dim: u32,
+    kv_len: u32,
+    encoder_prefix_len: u32,
+    causal_q_start_pos: ?u32,
+    swa_window: u32,
+    block_tokens: u32,
+    top_k_blocks: u32,
+    scale: f32,
+) void {
+    const e2m1_row_bytes: usize = kv_lora_rank / 2;
+    const num_groups: usize = kv_lora_rank / MLA_FP4_GROUP_SIZE;
+    const rope_row_bytes: usize = switch (rope_format) {
+        .f16 => @as(usize, qk_rope_dim) * 2,
+        .e4m3 => qk_rope_dim,
+    };
+    const ring_valid_lo: u32 = if (swa_ring_capacity > 0 and kv_len > swa_ring_capacity)
+        kv_len - swa_ring_capacity
+    else
+        0;
+
+    var kv_lat_tmp: [MAX_MLA_LATENT_DIM]f32 = undefined;
+    var kv_rope_tmp: [MAX_MLA_ROPE_DIM]f32 = undefined;
+
+    for (0..num_nodes) |node| {
+        const eff_kv_len: u32 = if (causal_q_start_pos) |q0|
+            @min(kv_len, @max(encoder_prefix_len, q0 + @as(u32, @intCast(node)) + 1))
+        else
+            kv_len;
+        const swa_hi: u32 = eff_kv_len;
+        const swa_lo: u32 = if (swa_window > 0)
+            (if (eff_kv_len > swa_window) eff_kv_len - swa_window else 0)
+        else
+            eff_kv_len;
+        const sel_cnt = @min(selected_counts[node], top_k_blocks);
+        const sel_base = node * top_k_blocks;
+
+        for (0..num_q_heads) |h| {
+            const q_nope_row = q_nope[(node * num_q_heads + h) * kv_lora_rank ..][0..kv_lora_rank];
+            const q_pe_row: ?[]const f16 = if (qk_rope_dim > 0)
+                q_pe.?[(node * num_q_heads + h) * qk_rope_dim ..][0..qk_rope_dim]
+            else
+                null;
+            const out_row = out_f32[(node * num_q_heads + h) * kv_lora_rank ..][0..kv_lora_rank];
+            @memset(out_row, 0.0);
+
+            var m_val: f32 = -std.math.inf(f32);
+            var l_val: f32 = 0.0;
+
+            // Pass 1: selected sparse FP4 blocks (deduplicated against SWA window)
+            for (0..sel_cnt) |sb| {
+                const block_id = selected_blocks[sel_base + sb];
+                if (block_id == 0xFFFF_FFFF) continue;
+                const t_start = block_id * block_tokens;
+                if (t_start >= eff_kv_len) continue;
+                const t_end = @min(t_start + block_tokens, eff_kv_len);
+                for (t_start..t_end) |t| {
+                    if (t >= swa_lo and t < swa_hi) continue;
+                    decodeMlaFp4LatentRowCpu(
+                        e2m1_plane[t * e2m1_row_bytes ..][0..e2m1_row_bytes],
+                        scale_plane[t * num_groups ..][0..num_groups],
+                        kv_lat_tmp[0..kv_lora_rank],
+                    );
+                    var dot_acc: f32 = 0.0;
+                    for (0..kv_lora_rank) |d| dot_acc += @as(f32, @floatCast(q_nope_row[d])) * kv_lat_tmp[d];
+                    if (qk_rope_dim > 0) {
+                        decodeMlaRopeRowCpu(rope_plane[t * rope_row_bytes ..][0..rope_row_bytes], rope_format, kv_rope_tmp[0..qk_rope_dim]);
+                        for (0..qk_rope_dim) |d| dot_acc += @as(f32, @floatCast(q_pe_row.?[d])) * kv_rope_tmp[d];
+                    }
+                    const s = dot_acc * scale;
+                    const new_m = @max(m_val, s);
+                    const corr: f32 = if (l_val > 0.0) @exp(m_val - new_m) else 0.0;
+                    const p_w = @exp(s - new_m);
+                    l_val = l_val * corr + p_w;
+                    for (0..kv_lora_rank) |d| out_row[d] = out_row[d] * corr + kv_lat_tmp[d] * p_w;
+                    m_val = new_m;
+                }
+            }
+
+            // Pass 2: SWA bounded replay `[swa_lo, swa_hi)`
+            for (swa_lo..swa_hi) |t| {
+                const use_ring = (swa_ring_capacity > 0 and t >= ring_valid_lo and swa_lat_ring != null);
+                var dot_acc: f32 = 0.0;
+                if (use_ring) {
+                    const slot = t % swa_ring_capacity;
+                    const r_lat = swa_lat_ring.?[slot * kv_lora_rank ..][0..kv_lora_rank];
+                    for (0..kv_lora_rank) |d| {
+                        kv_lat_tmp[d] = @floatCast(r_lat[d]);
+                        dot_acc += @as(f32, @floatCast(q_nope_row[d])) * kv_lat_tmp[d];
+                    }
+                    if (qk_rope_dim > 0) {
+                        const r_rope = swa_rope_ring.?[slot * qk_rope_dim ..][0..qk_rope_dim];
+                        for (0..qk_rope_dim) |d| {
+                            dot_acc += @as(f32, @floatCast(q_pe_row.?[d])) * @as(f32, @floatCast(r_rope[d]));
+                        }
+                    }
+                } else {
+                    decodeMlaFp4LatentRowCpu(
+                        e2m1_plane[t * e2m1_row_bytes ..][0..e2m1_row_bytes],
+                        scale_plane[t * num_groups ..][0..num_groups],
+                        kv_lat_tmp[0..kv_lora_rank],
+                    );
+                    for (0..kv_lora_rank) |d| dot_acc += @as(f32, @floatCast(q_nope_row[d])) * kv_lat_tmp[d];
+                    if (qk_rope_dim > 0) {
+                        decodeMlaRopeRowCpu(rope_plane[t * rope_row_bytes ..][0..rope_row_bytes], rope_format, kv_rope_tmp[0..qk_rope_dim]);
+                        for (0..qk_rope_dim) |d| dot_acc += @as(f32, @floatCast(q_pe_row.?[d])) * kv_rope_tmp[d];
+                    }
+                }
+                const s = dot_acc * scale;
+                const new_m = @max(m_val, s);
+                const corr: f32 = if (l_val > 0.0) @exp(m_val - new_m) else 0.0;
+                const p_w = @exp(s - new_m);
+                l_val = l_val * corr + p_w;
+                for (0..kv_lora_rank) |d| out_row[d] = out_row[d] * corr + kv_lat_tmp[d] * p_w;
+                m_val = new_m;
+            }
+
+            // Pass 3: Optional tree ancestors
+            if (kv_tree_latent != null and ancestor_masks != null) {
+                const mask = ancestor_masks.?[node];
+                for (0..num_nodes) |j| {
+                    if ((mask & (@as(u64, 1) << @intCast(j))) == 0) continue;
+                    const t_lat = kv_tree_latent.?[j * kv_lora_rank ..][0..kv_lora_rank];
+                    var dot_acc: f32 = 0.0;
+                    for (0..kv_lora_rank) |d| {
+                        kv_lat_tmp[d] = @floatCast(t_lat[d]);
+                        dot_acc += @as(f32, @floatCast(q_nope_row[d])) * kv_lat_tmp[d];
+                    }
+                    if (qk_rope_dim > 0) {
+                        const t_rope = kv_tree_rope.?[j * qk_rope_dim ..][0..qk_rope_dim];
+                        for (0..qk_rope_dim) |d| {
+                            dot_acc += @as(f32, @floatCast(q_pe_row.?[d])) * @as(f32, @floatCast(t_rope[d]));
+                        }
+                    }
+                    const s = dot_acc * scale;
+                    const new_m = @max(m_val, s);
+                    const corr: f32 = if (l_val > 0.0) @exp(m_val - new_m) else 0.0;
+                    const p_w = @exp(s - new_m);
+                    l_val = l_val * corr + p_w;
+                    for (0..kv_lora_rank) |d| out_row[d] = out_row[d] * corr + kv_lat_tmp[d] * p_w;
+                    m_val = new_m;
+                }
+            }
+
+            if (l_val > 0.0) {
+                for (0..kv_lora_rank) |d| out_row[d] /= l_val;
+            }
+        }
+    }
+}
+
+/// CPU `fp32` reference for Sinkhorn-Knopp Birkhoff doubly-stochastic projection of `H_res`.
+pub fn mhcSinkhornCpuRef(raw: []const f32, num_streams: u32, iters: u32, out: []f32) void {
+    const n: usize = num_streams;
+    var max_v: f32 = -std.math.inf(f32);
+    for (0..n * n) |idx| {
+        out[idx] = raw[idx];
+        max_v = @max(max_v, raw[idx]);
+    }
+    if (iters == 0) return;
+    for (0..n * n) |idx| out[idx] = @exp(out[idx] - max_v);
+    for (0..iters) |_| {
+        for (0..n) |o| {
+            var rsum: f32 = 0.0;
+            for (0..n) |i| rsum += out[o * n + i];
+            const inv_r = 1.0 / @max(rsum, 1e-12);
+            for (0..n) |i| out[o * n + i] *= inv_r;
+        }
+        for (0..n) |i| {
+            var csum: f32 = 0.0;
+            for (0..n) |o| csum += out[o * n + i];
+            const inv_c = 1.0 / @max(csum, 1e-12);
+            for (0..n) |o| out[o * n + i] *= inv_c;
+        }
+    }
+}
+
+/// CPU `fp32` reference for `ami_mhc_single_pass` (pre-sublayer stream mix + optional RMSNorm + optional in-place `H_res`).
+pub fn mhcSinglePassCpuRef(
+    cfg: MhcConfig,
+    streams_f32: []f32,
+    h_pre: []const f32,
+    h_res: ?[]const f32,
+    norm_w_bits: ?[]const u16,
+    branch_out_f32: []f32,
+    m: u32,
+) void {
+    const n: usize = cfg.num_streams;
+    const d_dim: usize = cfg.hidden_size;
+    var hp: [MAX_MHC_STREAMS]f32 = undefined;
+    var hr: [MAX_MHC_STREAMS * MAX_MHC_STREAMS]f32 = undefined;
+
+    for (0..m) |tok| {
+        const coeff_tok = if (cfg.shared_coeffs) 0 else tok;
+        for (0..n) |i| {
+            const raw = h_pre[coeff_tok * n + i];
+            hp[i] = if (cfg.activate_coeffs) sigmoidF32(raw) else raw;
+        }
+        if (cfg.apply_h_res_pre) {
+            mhcSinkhornCpuRef(h_res.?[coeff_tok * n * n ..][0 .. n * n], cfg.num_streams, cfg.sinkhorn_iters, hr[0 .. n * n]);
+        }
+
+        const tok_s = tok * n * d_dim;
+        const tok_o = tok * d_dim;
+        var sq_sum: f32 = 0.0;
+        for (0..d_dim) |d| {
+            var mix: f32 = 0.0;
+            for (0..n) |i| mix += hp[i] * streams_f32[tok_s + i * d_dim + d];
+            branch_out_f32[tok_o + d] = mix;
+            sq_sum += mix * mix;
+        }
+        if (norm_w_bits) |nw| {
+            const inv_rms = 1.0 / @sqrt(sq_sum / @as(f32, @floatFromInt(d_dim)) + cfg.rms_eps);
+            for (0..d_dim) |d| {
+                branch_out_f32[tok_o + d] = (branch_out_f32[tok_o + d] * inv_rms) * quant.floatBitsToF32(cfg.norm_dtype, nw[d]);
+            }
+        }
+        if (cfg.apply_h_res_pre) {
+            var s_old: [MAX_MHC_STREAMS]f32 = undefined;
+            for (0..d_dim) |d| {
+                for (0..n) |i| s_old[i] = streams_f32[tok_s + i * d_dim + d];
+                for (0..n) |o| {
+                    var acc: f32 = 0.0;
+                    for (0..n) |i| acc += hr[o * n + i] * s_old[i];
+                    streams_f32[tok_s + o * d_dim + d] = acc;
+                }
+            }
+        }
+    }
+}
+
+/// CPU `fp32` reference for `ami_mhc_post_mix` (fused in-place `H_res` stream mix + `H_post * sublayer_out`).
+pub fn mhcPostMixCpuRef(
+    cfg: MhcConfig,
+    streams_f32: []f32,
+    sublayer_out_f32: []const f32,
+    h_post: []const f32,
+    h_res: ?[]const f32,
+    m: u32,
+) void {
+    const n: usize = cfg.num_streams;
+    const d_dim: usize = cfg.hidden_size;
+    var hp: [MAX_MHC_STREAMS]f32 = undefined;
+    var hr: [MAX_MHC_STREAMS * MAX_MHC_STREAMS]f32 = undefined;
+
+    for (0..m) |tok| {
+        const coeff_tok = if (cfg.shared_coeffs) 0 else tok;
+        for (0..n) |i| {
+            const raw = h_post[coeff_tok * n + i];
+            hp[i] = if (cfg.activate_coeffs) (cfg.post_scale * sigmoidF32(raw)) else (cfg.post_scale * raw);
+        }
+        if (cfg.apply_h_res_post) {
+            mhcSinkhornCpuRef(h_res.?[coeff_tok * n * n ..][0 .. n * n], cfg.num_streams, cfg.sinkhorn_iters, hr[0 .. n * n]);
+        }
+        const tok_s = tok * n * d_dim;
+        const tok_y = tok * d_dim;
+        var s_old: [MAX_MHC_STREAMS]f32 = undefined;
+        for (0..d_dim) |d| {
+            const y_val = sublayer_out_f32[tok_y + d];
+            for (0..n) |i| s_old[i] = streams_f32[tok_s + i * d_dim + d];
+            for (0..n) |o| {
+                var base_val: f32 = s_old[o];
+                if (cfg.apply_h_res_post) {
+                    base_val = 0.0;
+                    for (0..n) |i| base_val += hr[o * n + i] * s_old[i];
+                }
+                streams_f32[tok_s + o * d_dim + d] = base_val + hp[o] * y_val;
             }
         }
     }
@@ -6355,4 +8409,1121 @@ test "G15: wide 128-token circular HybridKvRing SWA prefill (M=128, M=256) wraps
     }
     try vg.unlock();
     try kg.unlock();
+}
+
+test "R7 + G11: MlaFp4KvSpec deepseek41 890 B/tok geometry, 16 KiB alignment, and FP4 E2M1+E4M3 GPU/CPU codec parity" {
+    const gpa = std.testing.allocator;
+
+    // 1. Verify exact `890 B/tok` deepseek41 full geometry (`768 B E2M1 + 96 B E4M3 + 26 B RoPE tail`).
+    const ds41_spec = MlaFp4KvSpec.deepseek41Full(1024, 10);
+    try ds41_spec.validate();
+    try std.testing.expectEqual(@as(u32, 1536), ds41_spec.kv_lora_rank);
+    try std.testing.expectEqual(@as(u32, 26), ds41_spec.qk_rope_dim);
+    try std.testing.expectEqual(MlaRopeTailFormat.e4m3, ds41_spec.rope_tail_format);
+    try std.testing.expectEqual(@as(u32, 768), ds41_spec.latentDataBytesPerToken());
+    try std.testing.expectEqual(@as(u32, 96), ds41_spec.latentScaleBytesPerToken());
+    try std.testing.expectEqual(@as(u32, 26), ds41_spec.ropeTailBytesPerToken());
+    try std.testing.expectEqual(@as(u32, DEEPSEEK41_BYTES_PER_TOKEN), ds41_spec.bytesPerToken());
+    try std.testing.expectEqual(@as(u32, 890), ds41_spec.bytesPerToken());
+
+    // 2. Verify E2M1 table & E4M3 boundaries.
+    const e2m1_vals = [8]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 };
+    for (e2m1_vals, 0..) |v, idx| {
+        const nib: u4 = @intCast(idx);
+        try std.testing.expectEqual(v, e2m1NibbleToF32(nib));
+        try std.testing.expectEqual(nib, f32ToE2m1Nibble(v));
+        if (idx > 0) {
+            const neg_nib: u4 = nib | 0x8;
+            try std.testing.expectEqual(-v, e2m1NibbleToF32(neg_nib));
+            try std.testing.expectEqual(neg_nib, f32ToE2m1Nibble(-v));
+        }
+    }
+    try std.testing.expectEqual(@as(f32, 0.0), e4m3ToF32(0x00));
+    try std.testing.expectEqual(@as(f32, 1.0 / 512.0), e4m3ToF32(0x01));
+    try std.testing.expectEqual(@as(f32, 1.0 / 64.0), e4m3ToF32(0x08));
+    try std.testing.expectEqual(@as(f32, 1.0), e4m3ToF32(f32ToE4m3(1.0)));
+    try std.testing.expectEqual(@as(f32, 1.5), e4m3ToF32(f32ToE4m3(1.5)));
+    try std.testing.expectEqual(@as(f32, 448.0), e4m3ToF32(f32ToE4m3(448.0)));
+    try std.testing.expectEqual(@as(f32, 448.0), e4m3ToF32(f32ToE4m3(1000.0)));
+    try std.testing.expectEqual(@as(f32, -448.0), e4m3ToF32(f32ToE4m3(-900.0)));
+
+    // 3. Verify 16 KiB alignment across all M7 arenas + GPU vs CPU bit-exact FP4 encode on deepseek41 (1536 + 26 E4M3) & synthetic (128 + 32 f16).
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+
+    const ds41_small = MlaFp4KvSpec.deepseek41Full(8, 2);
+    const synth_spec: MlaFp4KvSpec = .{
+        .num_kv_layers = 2,
+        .max_tokens = 16,
+        .kv_lora_rank = 128,
+        .qk_rope_dim = 32,
+        .rope_tail_format = .f16,
+    };
+    try std.testing.expectEqual(@as(u32, 128 / 2 + 128 / 16 + 32 * 2), synth_spec.bytesPerToken());
+
+    const ds41_bytes = try MlaFp4KvArena.requiredBytes(ds41_small);
+    const synth_bytes = try MlaFp4KvArena.requiredBytes(synth_spec);
+    const swa_bytes = try MlaSwaRingArena.requiredBytes(.{
+        .num_kv_layers = 2,
+        .swa_window = 8,
+        .kv_lora_rank = 128,
+        .qk_rope_dim = 32,
+    });
+    const sum_bytes = try Csa2SummaryArena.requiredBytes(.{
+        .num_kv_layers = 2,
+        .max_tokens = 16,
+        .index_dim = 64,
+        .block_tokens = 4,
+        .coarse_group_blocks = 2,
+    });
+    const idx_bytes = try Csa2IndexBuffer.requiredBytes(.{ .max_nodes = 16, .top_k_blocks = 4 });
+    const mhc_bytes = try MhcStreamArena.requiredBytes(.{ .max_tokens = 8, .num_streams = 4, .hidden_size = 256 });
+
+    const total_arena = ds41_bytes + synth_bytes + swa_bytes + sum_bytes + idx_bytes + mhc_bytes + 4 * page.APPLE_PAGE_SIZE;
+    var arena = try makeTestArena(total_arena);
+    defer arena.deinit();
+
+    const ds41_arena = try MlaFp4KvArena.init(&arena, ds41_small);
+    const synth_arena = try MlaFp4KvArena.init(&arena, synth_spec);
+    const swa_ring = try MlaSwaRingArena.init(&arena, .{
+        .num_kv_layers = 2,
+        .swa_window = 8,
+        .kv_lora_rank = 128,
+        .qk_rope_dim = 32,
+    });
+    const sum_arena = try Csa2SummaryArena.init(&arena, .{
+        .num_kv_layers = 2,
+        .max_tokens = 16,
+        .index_dim = 64,
+        .block_tokens = 4,
+        .coarse_group_blocks = 2,
+    });
+    const idx_buf = try Csa2IndexBuffer.init(&arena, .{ .max_nodes = 16, .top_k_blocks = 4 });
+    const mhc_arena = try MhcStreamArena.init(&arena, .{ .max_tokens = 8, .num_streams = 4, .hidden_size = 256 });
+
+    try page.checkShareable(ds41_arena.bytes().ptr, ds41_arena.bytes().len);
+    try page.checkShareable(synth_arena.bytes().ptr, synth_arena.bytes().len);
+    try page.checkShareable(swa_ring.backing.ptr, swa_ring.backing.len);
+    try page.checkShareable(sum_arena.backing.ptr, sum_arena.backing.len);
+    try page.checkShareable(idx_buf.backing.ptr, idx_buf.backing.len);
+    try page.checkShareable(mhc_arena.backing.ptr, mhc_arena.backing.len);
+
+    const num_toks: u32 = 4;
+    const in_lat_bytes = try page.alignUp(@as(usize, num_toks) * 1536 * @sizeOf(f16));
+    const in_rope_bytes = try page.alignUp(@as(usize, num_toks) * 32 * @sizeOf(f16));
+    const in_lat_raw = try arena.allocPages(in_lat_bytes);
+    const in_rope_raw = try arena.allocPages(in_rope_bytes);
+    const in_lat_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, in_lat_raw));
+    const in_rope_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, in_rope_raw));
+    for (0..@as(usize, num_toks) * 1536) |i| in_lat_f16[i] = @floatCast(synthF32(i + 17, 0.17));
+    for (0..@as(usize, num_toks) * 26) |i| in_rope_f16[i] = @floatCast(synthF32(i + 91, 0.21));
+
+    const arena_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer arena_buf.close();
+    try compute.makeResident(&.{arena_buf});
+
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeMlaFp4KvWrite(&frame, .{
+            .latent_in = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(in_lat_raw.ptr)) },
+            .rope_in = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(in_rope_raw.ptr)) },
+            .kv_arena = &ds41_arena,
+            .kv_metal_buf = arena_buf,
+            .kv_slot = 0,
+            .num_tokens = num_toks,
+            .start_pos = 0,
+            .is_encoder_projection = true,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // Compare GPU-written FP4 bytes bit-for-bit vs host reference AND verify reconstruction error bounds.
+    const ref_e2m1 = try gpa.alloc(u8, 1536 / 2);
+    defer gpa.free(ref_e2m1);
+    const ref_scales = try gpa.alloc(u8, 1536 / 16);
+    defer gpa.free(ref_scales);
+    const ref_rope = try gpa.alloc(u8, 26);
+    defer gpa.free(ref_rope);
+    const src_f32 = try gpa.alloc(f32, 1536);
+    defer gpa.free(src_f32);
+    const dec_f32 = try gpa.alloc(f32, 1536);
+    defer gpa.free(dec_f32);
+    var src_rope_f32: [26]f32 = undefined;
+    var dec_rope_f32: [26]f32 = undefined;
+
+    const gpu_e2m1 = try ds41_arena.layerE2m1Slice(0);
+    const gpu_scales = try ds41_arena.layerScaleSlice(0);
+    const gpu_rope = try ds41_arena.layerRopeSlice(0);
+
+    var sq_err: f64 = 0.0;
+    var sq_sig: f64 = 0.0;
+    var max_rel_rope_err: f32 = 0.0;
+
+    for (0..num_toks) |t| {
+        for (0..1536) |d| src_f32[d] = @floatCast(in_lat_f16[t * 1536 + d]);
+        for (0..26) |d| src_rope_f32[d] = @floatCast(in_rope_f16[t * 26 + d]);
+        encodeMlaFp4LatentRowCpu(src_f32, ref_e2m1, ref_scales);
+        encodeMlaRopeRowCpu(&src_rope_f32, .e4m3, ref_rope);
+
+        try std.testing.expectEqualSlices(u8, ref_e2m1, gpu_e2m1[t * 768 .. (t + 1) * 768]);
+        try std.testing.expectEqualSlices(u8, ref_scales, gpu_scales[t * 96 .. (t + 1) * 96]);
+        try std.testing.expectEqualSlices(u8, ref_rope, gpu_rope[t * 26 .. (t + 1) * 26]);
+
+        decodeMlaFp4LatentRowCpu(ref_e2m1, ref_scales, dec_f32);
+        for (0..1536) |d| {
+            const diff: f64 = @as(f64, dec_f32[d]) - @as(f64, src_f32[d]);
+            sq_err += diff * diff;
+            sq_sig += @as(f64, src_f32[d]) * @as(f64, src_f32[d]);
+        }
+        decodeMlaRopeRowCpu(ref_rope, .e4m3, &dec_rope_f32);
+        for (0..26) |d| {
+            const denom = @max(@abs(src_rope_f32[d]), 0.1);
+            max_rel_rope_err = @max(max_rel_rope_err, @abs(dec_rope_f32[d] - src_rope_f32[d]) / denom);
+        }
+    }
+    const rel_rmse = @sqrt(sq_err / sq_sig);
+    // FP4 E2M1 + per-16 E4M3 typically achieves ~7-10% relative RMSE; enforce strict < 14% bound.
+    try std.testing.expect(rel_rmse < 0.14);
+    // E4M3 has 3 mantissa bits (max relative step 1/16 = 6.25%); enforce < 8%.
+    try std.testing.expect(max_rel_rope_err < 0.08);
+}
+
+test "R7 + G11: MLA + CSA2 Full/Reindex/Reuse, SWA bounded replay, causal prefill M=64, CED prefix, decode M=1,4 & tree verify vs CPU fp32 ref" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+
+    const kv_lora_rank: u32 = 128;
+    const qk_rope_dim: u32 = 32;
+    const index_dim: u32 = 64;
+    const num_q_heads: u32 = 4;
+    const block_tokens: u32 = 8;
+    const coarse_group_blocks: u32 = 2;
+    const top_k_blocks: u32 = 3;
+    const top_k_coarse: u32 = 2;
+    const swa_window: u32 = 16;
+    const max_tokens: u32 = 128;
+    const prefill_m: u32 = 64;
+
+    // Only 1 physical KV slot is allocated for the 3 logical layers (`Full`, `Reindex`, `Reuse`),
+    // plus 4 slots in a second arena for M=4 batched decode!
+    const kv_spec: MlaFp4KvSpec = .{
+        .num_kv_layers = 4,
+        .max_tokens = max_tokens,
+        .kv_lora_rank = kv_lora_rank,
+        .qk_rope_dim = qk_rope_dim,
+        .rope_tail_format = .f16,
+    };
+    const swa_spec: MlaSwaRingSpec = .{
+        .num_kv_layers = 4,
+        .swa_window = swa_window,
+        .kv_lora_rank = kv_lora_rank,
+        .qk_rope_dim = qk_rope_dim,
+    };
+    const sum_spec: Csa2SummarySpec = .{
+        .num_kv_layers = 4,
+        .max_tokens = max_tokens,
+        .index_dim = index_dim,
+        .block_tokens = block_tokens,
+        .coarse_group_blocks = coarse_group_blocks,
+    };
+    const idx_spec: Csa2IndexBufferSpec = .{
+        .max_nodes = prefill_m,
+        .top_k_blocks = top_k_blocks,
+    };
+
+    const kv_bytes = try MlaFp4KvArena.requiredBytes(kv_spec);
+    const swa_bytes = try MlaSwaRingArena.requiredBytes(swa_spec);
+    const sum_bytes = try Csa2SummaryArena.requiredBytes(sum_spec);
+    const idx_bytes = try Csa2IndexBuffer.requiredBytes(idx_spec);
+    const io_lat_bytes = try page.alignUp(@as(usize, prefill_m) * kv_lora_rank * @sizeOf(f16));
+    const io_rope_bytes = try page.alignUp(@as(usize, prefill_m) * qk_rope_dim * @sizeOf(f16));
+    const q_nope_bytes = try page.alignUp(@as(usize, prefill_m) * num_q_heads * kv_lora_rank * @sizeOf(f16));
+    const q_pe_bytes = try page.alignUp(@as(usize, prefill_m) * num_q_heads * qk_rope_dim * @sizeOf(f16));
+    const out_bytes = q_nope_bytes;
+    const misc_bytes = page.APPLE_PAGE_SIZE;
+
+    var arena = try makeTestArena(
+        kv_bytes + swa_bytes + sum_bytes + 2 * idx_bytes +
+            io_lat_bytes + io_rope_bytes + 2 * q_nope_bytes + q_pe_bytes + 3 * out_bytes + 4 * misc_bytes,
+    );
+    defer arena.deinit();
+
+    const kv_arena = try MlaFp4KvArena.init(&arena, kv_spec);
+    const swa_ring = try MlaSwaRingArena.init(&arena, swa_spec);
+    const sum_arena = try Csa2SummaryArena.init(&arena, sum_spec);
+    const idx_full = try Csa2IndexBuffer.init(&arena, idx_spec);
+    const idx_reindex = try Csa2IndexBuffer.init(&arena, idx_spec);
+
+    const lat_raw = try arena.allocPages(io_lat_bytes);
+    const rope_raw = try arena.allocPages(io_rope_bytes);
+    const q_nope_0_raw = try arena.allocPages(q_nope_bytes);
+    const q_nope_1_raw = try arena.allocPages(q_nope_bytes);
+    const q_pe_raw = try arena.allocPages(q_pe_bytes);
+    const out_full_raw = try arena.allocPages(out_bytes);
+    const out_reindex_raw = try arena.allocPages(out_bytes);
+    const out_reuse_raw = try arena.allocPages(out_bytes);
+    const batch_lens_raw = try arena.allocPages(misc_bytes);
+    const tree_lat_raw = try arena.allocPages(misc_bytes);
+    const tree_rope_raw = try arena.allocPages(misc_bytes);
+    const tree_masks_raw = try arena.allocPages(misc_bytes);
+
+    const lat_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, lat_raw));
+    const rope_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, rope_raw));
+    const q_nope_0: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_nope_0_raw));
+    const q_nope_1: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_nope_1_raw));
+    const q_pe: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_pe_raw));
+    const out_full: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_full_raw));
+    const out_reindex: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_reindex_raw));
+    const out_reuse: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_reuse_raw));
+    const batch_lens: []u32 = @alignCast(std.mem.bytesAsSlice(u32, batch_lens_raw));
+    const tree_lat_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, tree_lat_raw));
+    const tree_rope_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, tree_rope_raw));
+    const tree_masks: []u64 = @alignCast(std.mem.bytesAsSlice(u64, tree_masks_raw));
+
+    for (0..@as(usize, prefill_m) * kv_lora_rank) |i| lat_f16[i] = @floatCast(synthF32(i + 11, 0.09));
+    for (0..@as(usize, prefill_m) * qk_rope_dim) |i| rope_f16[i] = @floatCast(synthF32(i + 73, 0.11));
+    for (0..@as(usize, prefill_m) * num_q_heads * kv_lora_rank) |i| {
+        q_nope_0[i] = @floatCast(synthF32(i + 131, 0.08));
+        q_nope_1[i] = @floatCast(synthF32(i + 509, 0.08));
+    }
+    for (0..@as(usize, prefill_m) * num_q_heads * qk_rope_dim) |i| q_pe[i] = @floatCast(synthF32(i + 257, 0.09));
+
+    const arena_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer arena_buf.close();
+    try compute.makeResident(&.{arena_buf});
+
+    const lat_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(lat_raw.ptr)) };
+    const rope_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(rope_raw.ptr)) };
+    const q0_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(q_nope_0_raw.ptr)) };
+    const q1_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(q_nope_1_raw.ptr)) };
+    const qpe_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(q_pe_raw.ptr)) };
+    const ofull_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(out_full_raw.ptr)) };
+    const oreidx_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(out_reindex_raw.ptr)) };
+    const oreuse_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(out_reuse_raw.ptr)) };
+    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_lora_rank + qk_rope_dim)));
+    const idx_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(index_dim)));
+
+    // --- Part A: Causal Prefill (M = 64) across Full -> Reindex -> Reuse + r=1 loop reuse ---
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        const d_full = try pipes.encodeMlaCsa2Layer(&frame, .{
+            .mode = .full,
+            .shared_kv_owner = 0,
+            .loop_step = 0,
+            .write_latent_in = lat_bind,
+            .write_rope_in = rope_bind,
+            .write_start_pos = 0,
+            .write_num_tokens = prefill_m,
+            .q_nope = q0_bind,
+            .q_pe = qpe_bind,
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = arena_buf,
+            .summary_arena = &sum_arena,
+            .summary_metal_buf = arena_buf,
+            .index_buf = &idx_full,
+            .index_metal_buf = arena_buf,
+            .out = ofull_bind,
+            .num_nodes = prefill_m,
+            .num_q_heads = num_q_heads,
+            .kv_len = prefill_m,
+            .causal_q_start_pos = 0,
+            .swa_window = swa_window,
+            .block_tokens = block_tokens,
+            .top_k_blocks = top_k_blocks,
+            .top_k_coarse = top_k_coarse,
+            .scale = attn_scale,
+        }, false);
+        try std.testing.expectEqual(@as(u32, 1), d_full.kv_writes);
+        try std.testing.expectEqual(@as(u32, 1), d_full.summary_updates);
+        try std.testing.expectEqual(@as(u32, 1), d_full.index_dispatches);
+        try std.testing.expectEqual(@as(u32, 1), d_full.attn_dispatches);
+
+        // Reindex: 0 KV writes (aliases slot 0), own indexer over q_nope_1.
+        const d_reindex = try pipes.encodeMlaCsa2Layer(&frame, .{
+            .mode = .reindex,
+            .shared_kv_owner = 0,
+            .loop_step = 0,
+            .write_latent_in = lat_bind, // deliberately passed: Reindex MUST execute 0 KV writes!
+            .write_rope_in = rope_bind,
+            .write_start_pos = 0,
+            .write_num_tokens = prefill_m,
+            .q_nope = q1_bind,
+            .q_pe = qpe_bind,
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = arena_buf,
+            .summary_arena = &sum_arena,
+            .summary_metal_buf = arena_buf,
+            .index_buf = &idx_reindex,
+            .index_metal_buf = arena_buf,
+            .out = oreidx_bind,
+            .num_nodes = prefill_m,
+            .num_q_heads = num_q_heads,
+            .kv_len = prefill_m,
+            .causal_q_start_pos = 0,
+            .swa_window = swa_window,
+            .block_tokens = block_tokens,
+            .top_k_blocks = top_k_blocks,
+            .top_k_coarse = top_k_coarse,
+            .scale = attn_scale,
+        }, true);
+        try std.testing.expectEqual(@as(u32, 0), d_reindex.kv_writes);
+        try std.testing.expectEqual(@as(u32, 0), d_reindex.summary_updates);
+        try std.testing.expectEqual(@as(u32, 1), d_reindex.index_dispatches);
+        try std.testing.expectEqual(@as(u32, 1), d_reindex.attn_dispatches);
+
+        // Reuse: 0 KV writes AND 0 index dispatches (aliases slot 0 + idx_reindex).
+        const d_reuse = try pipes.encodeMlaCsa2Layer(&frame, .{
+            .mode = .reuse,
+            .shared_kv_owner = 0,
+            .loop_step = 0,
+            .write_latent_in = lat_bind,
+            .write_rope_in = rope_bind,
+            .write_start_pos = 0,
+            .write_num_tokens = prefill_m,
+            .q_nope = q1_bind,
+            .q_pe = qpe_bind,
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = arena_buf,
+            .index_buf = &idx_reindex,
+            .index_metal_buf = arena_buf,
+            .out = oreuse_bind,
+            .num_nodes = prefill_m,
+            .num_q_heads = num_q_heads,
+            .kv_len = prefill_m,
+            .causal_q_start_pos = 0,
+            .swa_window = swa_window,
+            .block_tokens = block_tokens,
+            .top_k_blocks = top_k_blocks,
+            .scale = attn_scale,
+        }, true);
+        try std.testing.expectEqual(@as(u32, 0), d_reuse.kv_writes);
+        try std.testing.expectEqual(@as(u32, 0), d_reuse.summary_updates);
+        try std.testing.expectEqual(@as(u32, 0), d_reuse.index_dispatches);
+        try std.testing.expectEqual(@as(u32, 1), d_reuse.attn_dispatches);
+
+        // LoopSchedule r = 1 pass on a Full layer MUST execute 0 KV writes and 0 index dispatches.
+        const d_loop1 = try pipes.encodeMlaCsa2Layer(&frame, .{
+            .mode = .full,
+            .shared_kv_owner = 0,
+            .loop_step = 1,
+            .write_latent_in = lat_bind,
+            .write_rope_in = rope_bind,
+            .write_start_pos = 0,
+            .write_num_tokens = prefill_m,
+            .q_nope = q0_bind,
+            .q_pe = qpe_bind,
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = arena_buf,
+            .index_buf = &idx_full,
+            .index_metal_buf = arena_buf,
+            .out = ofull_bind,
+            .num_nodes = prefill_m,
+            .num_q_heads = num_q_heads,
+            .kv_len = prefill_m,
+            .causal_q_start_pos = 0,
+            .swa_window = swa_window,
+            .block_tokens = block_tokens,
+            .top_k_blocks = top_k_blocks,
+            .scale = attn_scale,
+        }, true);
+        try std.testing.expectEqual(@as(u32, 0), d_loop1.kv_writes);
+        try std.testing.expectEqual(@as(u32, 0), d_loop1.summary_updates);
+        try std.testing.expectEqual(@as(u32, 0), d_loop1.index_dispatches);
+        try std.testing.expectEqual(@as(u32, 1), d_loop1.attn_dispatches);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // Verify strictly causal indexing (no upper-triangular blocks selected).
+    for (0..prefill_m) |node| {
+        const cnt = idx_full.counts[node];
+        for (0..cnt) |k| {
+            const b = idx_full.blocks[node * top_k_blocks + k];
+            try std.testing.expect(b * block_tokens <= node);
+        }
+    }
+    // Reuse output with same query & aliased index MUST be bit-identical to Reindex output.
+    const total_out_elems: usize = @as(usize, prefill_m) * num_q_heads * kv_lora_rank;
+    try std.testing.expectEqualSlices(f16, out_reindex[0..total_out_elems], out_reuse[0..total_out_elems]);
+
+    // Verify CPU fp32 reference parity for Full & Reindex prefill (M = 64).
+    const cpu_fine = try gpa.alloc(f16, sum_spec.maxFineBlocks() * index_dim);
+    defer gpa.free(cpu_fine);
+    const cpu_coarse = try gpa.alloc(f16, sum_spec.maxCoarseBlocks() * index_dim);
+    defer gpa.free(cpu_coarse);
+    const cpu_sel_blocks = try gpa.alloc(u32, @as(usize, prefill_m) * top_k_blocks);
+    defer gpa.free(cpu_sel_blocks);
+    const cpu_sel_counts = try gpa.alloc(u32, prefill_m);
+    defer gpa.free(cpu_sel_counts);
+    const cpu_out = try gpa.alloc(f32, total_out_elems);
+    defer gpa.free(cpu_out);
+
+    const e2m1_s0 = try kv_arena.layerE2m1Slice(0);
+    const scale_s0 = try kv_arena.layerScaleSlice(0);
+    const rope_s0 = try kv_arena.layerRopeSlice(0);
+    const swa_lat_s0: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, swa_ring.backing[0..swa_ring.latent_plane_bytes]));
+    const swa_rope_s0: []const f16 = @alignCast(std.mem.bytesAsSlice(
+        f16,
+        swa_ring.backing[@intCast(swa_ring.rope_plane_offset) .. @as(usize, @intCast(swa_ring.rope_plane_offset)) + swa_ring.rope_plane_bytes],
+    ));
+
+    csa2UpdateSummariesCpuRef(e2m1_s0, scale_s0, prefill_m, kv_lora_rank, index_dim, block_tokens, coarse_group_blocks, cpu_fine, cpu_coarse);
+    csa2IndexBlocksCpuRef(
+        q_nope_0,
+        cpu_fine,
+        cpu_coarse,
+        prefill_m,
+        num_q_heads,
+        kv_lora_rank,
+        index_dim,
+        prefill_m,
+        0,
+        0,
+        swa_window,
+        block_tokens,
+        coarse_group_blocks,
+        top_k_coarse,
+        top_k_blocks,
+        1,
+        attn_scale,
+        cpu_sel_blocks,
+        cpu_sel_counts,
+    );
+    try std.testing.expectEqualSlices(u32, cpu_sel_counts, idx_full.counts[0..prefill_m]);
+    try std.testing.expectEqualSlices(u32, cpu_sel_blocks, idx_full.blocks[0 .. @as(usize, prefill_m) * top_k_blocks]);
+
+    mlaCsa2AttendCpuRef(
+        q_nope_0,
+        q_pe,
+        e2m1_s0,
+        scale_s0,
+        rope_s0,
+        .f16,
+        swa_lat_s0,
+        swa_rope_s0,
+        swa_window,
+        cpu_sel_blocks,
+        cpu_sel_counts,
+        null,
+        null,
+        null,
+        cpu_out,
+        prefill_m,
+        num_q_heads,
+        kv_lora_rank,
+        qk_rope_dim,
+        prefill_m,
+        0,
+        0,
+        swa_window,
+        block_tokens,
+        top_k_blocks,
+        attn_scale,
+    );
+    var max_err_prefill: f32 = 0.0;
+    for (0..total_out_elems) |i| {
+        max_err_prefill = @max(max_err_prefill, @abs(@as(f32, @floatCast(out_full[i])) - cpu_out[i]));
+    }
+    try std.testing.expect(max_err_prefill < 2e-3);
+
+    // --- Part B: Single-token decode (M = 1) append at pos 64 (kv_len = 65) + SWA bounded replay ---
+    for (0..kv_lora_rank) |d| lat_f16[d] = @floatCast(synthF32(d + 901, 0.12));
+    for (0..qk_rope_dim) |d| rope_f16[d] = @floatCast(synthF32(d + 977, 0.12));
+    for (0..@as(usize, num_q_heads) * kv_lora_rank) |i| q_nope_0[i] = @floatCast(synthF32(i + 1021, 0.09));
+    for (0..@as(usize, num_q_heads) * qk_rope_dim) |i| q_pe[i] = @floatCast(synthF32(i + 1103, 0.09));
+
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        const d_dec1 = try pipes.encodeMlaCsa2Layer(&frame, .{
+            .mode = .full,
+            .shared_kv_owner = 0,
+            .loop_step = 0,
+            .write_latent_in = lat_bind,
+            .write_rope_in = rope_bind,
+            .write_start_pos = 64,
+            .write_num_tokens = 1,
+            .q_nope = q0_bind,
+            .q_pe = qpe_bind,
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = arena_buf,
+            .summary_arena = &sum_arena,
+            .summary_metal_buf = arena_buf,
+            .index_buf = &idx_full,
+            .index_metal_buf = arena_buf,
+            .out = ofull_bind,
+            .num_nodes = 1,
+            .num_q_heads = num_q_heads,
+            .kv_len = 65,
+            .causal_q_start_pos = 64,
+            .swa_window = swa_window,
+            .block_tokens = block_tokens,
+            .top_k_blocks = top_k_blocks,
+            .top_k_coarse = top_k_coarse,
+            .scale = attn_scale,
+        }, false);
+        try std.testing.expectEqual(@as(u32, 1), d_dec1.kv_writes);
+        try std.testing.expectEqual(@as(u32, 1), d_dec1.summary_updates);
+        try std.testing.expectEqual(@as(u32, 1), d_dec1.index_dispatches);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    csa2UpdateSummariesCpuRef(e2m1_s0, scale_s0, 65, kv_lora_rank, index_dim, block_tokens, coarse_group_blocks, cpu_fine, cpu_coarse);
+    csa2IndexBlocksCpuRef(
+        q_nope_0,
+        cpu_fine,
+        cpu_coarse,
+        1,
+        num_q_heads,
+        kv_lora_rank,
+        index_dim,
+        65,
+        0,
+        64,
+        swa_window,
+        block_tokens,
+        coarse_group_blocks,
+        top_k_coarse,
+        top_k_blocks,
+        1,
+        attn_scale,
+        cpu_sel_blocks,
+        cpu_sel_counts,
+    );
+    try std.testing.expectEqual(cpu_sel_counts[0], idx_full.counts[0]);
+    try std.testing.expectEqualSlices(u32, cpu_sel_blocks[0..top_k_blocks], idx_full.blocks[0..top_k_blocks]);
+
+    mlaCsa2AttendCpuRef(
+        q_nope_0,
+        q_pe,
+        e2m1_s0,
+        scale_s0,
+        rope_s0,
+        .f16,
+        swa_lat_s0,
+        swa_rope_s0,
+        swa_window,
+        cpu_sel_blocks,
+        cpu_sel_counts,
+        null,
+        null,
+        null,
+        cpu_out,
+        1,
+        num_q_heads,
+        kv_lora_rank,
+        qk_rope_dim,
+        65,
+        0,
+        64,
+        swa_window,
+        block_tokens,
+        top_k_blocks,
+        attn_scale,
+    );
+    var max_err_dec1: f32 = 0.0;
+    for (0..@as(usize, num_q_heads) * kv_lora_rank) |i| {
+        max_err_dec1 = @max(max_err_dec1, @abs(@as(f32, @floatCast(out_full[i])) - cpu_out[i]));
+    }
+    try std.testing.expect(max_err_dec1 < 2e-3);
+
+    // --- Part C: Speculative tree verify (M = 4, u64 branching ancestor masks) + CED encoder prefix visibility ---
+    const tree_m: u32 = 4;
+    for (0..@as(usize, tree_m) * kv_lora_rank) |i| tree_lat_f16[i] = @floatCast(synthF32(i + 1501, 0.10));
+    for (0..@as(usize, tree_m) * qk_rope_dim) |i| tree_rope_f16[i] = @floatCast(synthF32(i + 1701, 0.10));
+    tree_masks[0] = 0b0001;
+    tree_masks[1] = 0b0011;
+    tree_masks[2] = 0b0111;
+    tree_masks[3] = 0b1011;
+
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeCsa2IndexBlocks(&frame, .{
+            .q_nope = q0_bind,
+            .summary_arena = &sum_arena,
+            .summary_metal_buf = arena_buf,
+            .kv_slot = 0,
+            .index_buf = &idx_full,
+            .index_metal_buf = arena_buf,
+            .num_nodes = tree_m,
+            .num_q_heads = num_q_heads,
+            .kv_lora_rank = kv_lora_rank,
+            .kv_len = 65,
+            .encoder_prefix_len = 32,
+            .causal_q_start_pos = null,
+            .swa_window = swa_window,
+            .top_k_blocks = top_k_blocks,
+            .top_k_coarse = top_k_coarse,
+            .scale = idx_scale,
+        }, false);
+        try pipes.encodeMlaCsa2Attend(&frame, .{
+            .q_nope = q0_bind,
+            .q_pe = qpe_bind,
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .kv_slot = 0,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = arena_buf,
+            .index_buf = &idx_full,
+            .index_metal_buf = arena_buf,
+            .kv_tree_latent = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(tree_lat_raw.ptr)) },
+            .kv_tree_rope = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(tree_rope_raw.ptr)) },
+            .ancestor_masks = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(tree_masks_raw.ptr)) },
+            .out = ofull_bind,
+            .num_nodes = tree_m,
+            .num_q_heads = num_q_heads,
+            .kv_len = 65,
+            .encoder_prefix_len = 32,
+            .causal_q_start_pos = null,
+            .swa_window = swa_window,
+            .block_tokens = block_tokens,
+            .top_k_blocks = top_k_blocks,
+            .scale = attn_scale,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    csa2IndexBlocksCpuRef(
+        q_nope_0,
+        cpu_fine,
+        cpu_coarse,
+        tree_m,
+        num_q_heads,
+        kv_lora_rank,
+        index_dim,
+        65,
+        32,
+        null,
+        swa_window,
+        block_tokens,
+        coarse_group_blocks,
+        top_k_coarse,
+        top_k_blocks,
+        1,
+        idx_scale,
+        cpu_sel_blocks,
+        cpu_sel_counts,
+    );
+    mlaCsa2AttendCpuRef(
+        q_nope_0,
+        q_pe,
+        e2m1_s0,
+        scale_s0,
+        rope_s0,
+        .f16,
+        swa_lat_s0,
+        swa_rope_s0,
+        swa_window,
+        cpu_sel_blocks,
+        cpu_sel_counts,
+        tree_lat_f16,
+        tree_rope_f16,
+        tree_masks,
+        cpu_out,
+        tree_m,
+        num_q_heads,
+        kv_lora_rank,
+        qk_rope_dim,
+        65,
+        32,
+        null,
+        swa_window,
+        block_tokens,
+        top_k_blocks,
+        attn_scale,
+    );
+    var max_err_tree: f32 = 0.0;
+    for (0..@as(usize, tree_m) * num_q_heads * kv_lora_rank) |i| {
+        max_err_tree = @max(max_err_tree, @abs(@as(f32, @floatCast(out_full[i])) - cpu_out[i]));
+    }
+    try std.testing.expect(max_err_tree < 2e-3);
+
+    // --- Part D: Batched decode (M = 4 independent slots with distinct kv_lens) ---
+    const batch_m: u32 = 4;
+    batch_lens[0] = 19;
+    batch_lens[1] = 37;
+    batch_lens[2] = 52;
+    batch_lens[3] = 64;
+
+    // Populate slots 0..3 with distinct lengths & summaries.
+    for (0..batch_m) |slot| {
+        const slen = batch_lens[slot];
+        for (0..@as(usize, slen) * kv_lora_rank) |i| lat_f16[i] = @floatCast(synthF32(i + slot * 313 + 7, 0.09));
+        for (0..@as(usize, slen) * qk_rope_dim) |i| rope_f16[i] = @floatCast(synthF32(i + slot * 211 + 13, 0.09));
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeMlaFp4KvWrite(&frame, .{
+            .latent_in = lat_bind,
+            .rope_in = rope_bind,
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .kv_slot = @intCast(slot),
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = arena_buf,
+            .num_tokens = slen,
+            .start_pos = 0,
+        }, false);
+        try pipes.encodeCsa2UpdateSummaries(&frame, .{
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .summary_arena = &sum_arena,
+            .summary_metal_buf = arena_buf,
+            .kv_slot = @intCast(slot),
+            .kv_len = slen,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    const batch_lens_bind: metal.BufferBinding = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(batch_lens_raw.ptr)) };
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeCsa2IndexBlocks(&frame, .{
+            .q_nope = q0_bind,
+            .summary_arena = &sum_arena,
+            .summary_metal_buf = arena_buf,
+            .kv_slot = 0,
+            .index_buf = &idx_full,
+            .index_metal_buf = arena_buf,
+            .num_nodes = batch_m,
+            .num_q_heads = num_q_heads,
+            .kv_lora_rank = kv_lora_rank,
+            .kv_len = 0, // driven per-slot by batch_kv_lens
+            .swa_window = swa_window,
+            .top_k_blocks = top_k_blocks,
+            .top_k_coarse = top_k_coarse,
+            .batch_kv_lens = batch_lens_bind,
+            .scale = idx_scale,
+        }, false);
+        try pipes.encodeMlaCsa2Attend(&frame, .{
+            .q_nope = q0_bind,
+            .q_pe = qpe_bind,
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = arena_buf,
+            .kv_slot = 0,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = arena_buf,
+            .index_buf = &idx_full,
+            .index_metal_buf = arena_buf,
+            .batch_kv_lens = batch_lens_bind,
+            .out = ofull_bind,
+            .num_nodes = batch_m,
+            .num_q_heads = num_q_heads,
+            .kv_len = 0,
+            .swa_window = swa_window,
+            .block_tokens = block_tokens,
+            .top_k_blocks = top_k_blocks,
+            .scale = attn_scale,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    var max_err_batch: f32 = 0.0;
+    const slot_out_elems = @as(usize, num_q_heads) * kv_lora_rank;
+    for (0..batch_m) |slot| {
+        const slen = batch_lens[slot];
+        const e2m1_s = try kv_arena.layerE2m1Slice(@intCast(slot));
+        const scale_s = try kv_arena.layerScaleSlice(@intCast(slot));
+        const rope_s = try kv_arena.layerRopeSlice(@intCast(slot));
+        const swa_off = slot * @as(usize, @intCast(swa_ring.layer_stride_bytes));
+        const swa_lat_s: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, swa_ring.backing[swa_off .. swa_off + swa_ring.latent_plane_bytes]));
+        const swa_rope_off = swa_off + @as(usize, @intCast(swa_ring.rope_plane_offset));
+        const swa_rope_s: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, swa_ring.backing[swa_rope_off .. swa_rope_off + swa_ring.rope_plane_bytes]));
+
+        csa2UpdateSummariesCpuRef(e2m1_s, scale_s, slen, kv_lora_rank, index_dim, block_tokens, coarse_group_blocks, cpu_fine, cpu_coarse);
+        csa2IndexBlocksCpuRef(
+            q_nope_0[slot * slot_out_elems ..][0..slot_out_elems],
+            cpu_fine,
+            cpu_coarse,
+            1,
+            num_q_heads,
+            kv_lora_rank,
+            index_dim,
+            slen,
+            0,
+            null,
+            swa_window,
+            block_tokens,
+            coarse_group_blocks,
+            top_k_coarse,
+            top_k_blocks,
+            1,
+            idx_scale,
+            cpu_sel_blocks,
+            cpu_sel_counts,
+        );
+        try std.testing.expectEqual(cpu_sel_counts[0], idx_full.counts[slot]);
+        try std.testing.expectEqualSlices(u32, cpu_sel_blocks[0..top_k_blocks], idx_full.blocks[slot * top_k_blocks .. (slot + 1) * top_k_blocks]);
+
+        mlaCsa2AttendCpuRef(
+            q_nope_0[slot * slot_out_elems ..][0..slot_out_elems],
+            q_pe[slot * num_q_heads * qk_rope_dim ..][0 .. num_q_heads * qk_rope_dim],
+            e2m1_s,
+            scale_s,
+            rope_s,
+            .f16,
+            swa_lat_s,
+            swa_rope_s,
+            swa_window,
+            cpu_sel_blocks,
+            cpu_sel_counts,
+            null,
+            null,
+            null,
+            cpu_out[0..slot_out_elems],
+            1,
+            num_q_heads,
+            kv_lora_rank,
+            qk_rope_dim,
+            slen,
+            0,
+            null,
+            swa_window,
+            block_tokens,
+            top_k_blocks,
+            attn_scale,
+        );
+        for (0..slot_out_elems) |i| {
+            max_err_batch = @max(max_err_batch, @abs(@as(f32, @floatCast(out_full[slot * slot_out_elems + i])) - cpu_out[i]));
+        }
+    }
+    try std.testing.expect(max_err_batch < 2e-3);
+}
+
+test "G10: Single-Pass Mega-mHC (4-stream f16 & 6-stream bf16, fused RMSNorm, Sinkhorn Birkhoff H_res & post-mix) vs CPU fp32 ref" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    // Verify Birkhoff doubly-stochastic manifold property on Sinkhorn-Knopp projection.
+    const raw_mat = [_]f32{
+        1.2,  -0.4, 0.3,  0.8,
+        -0.5, 0.9,  1.1,  -0.2,
+        0.4,  0.7,  -0.8, 1.3,
+        -0.1, 0.2,  0.6,  0.5,
+    };
+    var ds_mat: [16]f32 = undefined;
+    mhcSinkhornCpuRef(&raw_mat, 4, 16, &ds_mat);
+    for (0..4) |o| {
+        var rsum: f32 = 0.0;
+        var csum: f32 = 0.0;
+        for (0..4) |i| {
+            try std.testing.expect(ds_mat[o * 4 + i] >= 0.0);
+            rsum += ds_mat[o * 4 + i];
+            csum += ds_mat[i * 4 + o];
+        }
+        try std.testing.expect(@abs(rsum - 1.0) < 1e-4);
+        try std.testing.expect(@abs(csum - 1.0) < 1e-4);
+    }
+
+    const Case = struct {
+        m: u32,
+        num_streams: u32,
+        hidden_size: u32,
+        stream_dt: quant.FloatDType,
+        act_dt: quant.FloatDType,
+        norm_dt: quant.FloatDType,
+        apply_h_res_pre: bool,
+        apply_h_res_post: bool,
+        sinkhorn_iters: u32,
+        activate_coeffs: bool,
+        post_scale: f32,
+        tol: f32,
+    };
+    const cases = [_]Case{
+        // Canonical DeepSeek-V4.1 4-stream f16 Mega-mHC: pre-mix + fused RMSNorm -> post-mix with Birkhoff H_res + 2*sigmoid H_post.
+        .{
+            .m = 8,
+            .num_streams = 4,
+            .hidden_size = 384,
+            .stream_dt = .f16,
+            .act_dt = .f16,
+            .norm_dt = .f16,
+            .apply_h_res_pre = false,
+            .apply_h_res_post = true,
+            .sinkhorn_iters = 12,
+            .activate_coeffs = true,
+            .post_scale = 2.0,
+            .tol = 3e-3,
+        },
+        // Generalized 6-stream bf16 Mega-mHC with in-place pre-mix H_res and bf16 fused RMSNorm.
+        .{
+            .m = 4,
+            .num_streams = 6,
+            .hidden_size = 256,
+            .stream_dt = .bf16,
+            .act_dt = .bf16,
+            .norm_dt = .bf16,
+            .apply_h_res_pre = true,
+            .apply_h_res_post = false,
+            .sinkhorn_iters = 10,
+            .activate_coeffs = false,
+            .post_scale = 1.0,
+            .tol = 2e-2,
+        },
+    };
+
+    for (cases, 0..) |tc, ci| {
+        const cfg: MhcConfig = .{
+            .num_streams = tc.num_streams,
+            .hidden_size = tc.hidden_size,
+            .stream_dtype = tc.stream_dt,
+            .act_dtype = tc.act_dt,
+            .norm_dtype = tc.norm_dt,
+            .rms_eps = 1e-6,
+            .sinkhorn_iters = tc.sinkhorn_iters,
+            .activate_coeffs = tc.activate_coeffs,
+            .shared_coeffs = false,
+            .apply_h_res_pre = tc.apply_h_res_pre,
+            .apply_h_res_post = tc.apply_h_res_post,
+            .post_scale = tc.post_scale,
+        };
+        const stream_spec: MhcStreamSpec = .{
+            .max_tokens = tc.m,
+            .num_streams = tc.num_streams,
+            .hidden_size = tc.hidden_size,
+            .dtype = tc.stream_dt,
+        };
+        const stream_bytes = try MhcStreamArena.requiredBytes(stream_spec);
+        const act_bytes = try page.alignUp(@as(usize, tc.m) * tc.hidden_size * 2);
+        const norm_bytes = try page.alignUp(@as(usize, tc.hidden_size) * 2);
+        const coeff_bytes = page.APPLE_PAGE_SIZE;
+
+        var arena = try makeTestArena(stream_bytes + 2 * act_bytes + norm_bytes + 3 * coeff_bytes);
+        defer arena.deinit();
+
+        const mhc_arena = try MhcStreamArena.init(&arena, stream_spec);
+        const branch_out_raw = try arena.allocPages(act_bytes);
+        const sublayer_raw = try arena.allocPages(act_bytes);
+        const norm_w_raw = try arena.allocPages(norm_bytes);
+        const h_pre_raw = try arena.allocPages(coeff_bytes);
+        const h_post_raw = try arena.allocPages(coeff_bytes);
+        const h_res_raw = try arena.allocPages(coeff_bytes);
+
+        const stream_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, mhc_arena.backing));
+        const branch_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, branch_out_raw));
+        const sublayer_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, sublayer_raw));
+        const norm_w_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, norm_w_raw));
+        const h_pre: []f32 = @alignCast(std.mem.bytesAsSlice(f32, h_pre_raw));
+        const h_post: []f32 = @alignCast(std.mem.bytesAsSlice(f32, h_post_raw));
+        const h_res: []f32 = @alignCast(std.mem.bytesAsSlice(f32, h_res_raw));
+
+        const total_stream_elems: usize = @as(usize, tc.m) * tc.num_streams * tc.hidden_size;
+        const total_act_elems: usize = @as(usize, tc.m) * tc.hidden_size;
+
+        const cpu_streams = try gpa.alloc(f32, total_stream_elems);
+        defer gpa.free(cpu_streams);
+        const cpu_branch = try gpa.alloc(f32, total_act_elems);
+        defer gpa.free(cpu_branch);
+        const cpu_sublayer = try gpa.alloc(f32, total_act_elems);
+        defer gpa.free(cpu_sublayer);
+
+        for (0..total_stream_elems) |i| {
+            const bits = quant.f32ToFloatBits(tc.stream_dt, synthF32(i + ci * 997 + 19, 0.08));
+            stream_bits[i] = bits;
+            cpu_streams[i] = quant.floatBitsToF32(tc.stream_dt, bits);
+        }
+        for (0..total_act_elems) |i| {
+            const bits = quant.f32ToFloatBits(tc.act_dt, synthF32(i + ci * 613 + 41, 0.07));
+            sublayer_bits[i] = bits;
+            cpu_sublayer[i] = quant.floatBitsToF32(tc.act_dt, bits);
+        }
+        for (0..tc.hidden_size) |d| {
+            norm_w_bits[d] = quant.f32ToFloatBits(tc.norm_dt, 0.8 + synthF32(d + 5, 0.02));
+        }
+        for (0..@as(usize, tc.m) * tc.num_streams) |i| {
+            h_pre[i] = if (tc.activate_coeffs) synthF32(i + 201, 0.15) else (0.25 + synthF32(i + 201, 0.01));
+            h_post[i] = if (tc.activate_coeffs) synthF32(i + 307, 0.15) else (0.30 + synthF32(i + 307, 0.01));
+        }
+        for (0..@as(usize, tc.m) * tc.num_streams * tc.num_streams) |i| {
+            h_res[i] = synthF32(i + 409, 0.12);
+        }
+
+        const arena_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer arena_buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{arena_buf});
+
+        {
+            var frame = try compute.beginFrame(5000);
+            errdefer frame.abort();
+            try pipes.encodeMegaMhc(&frame, .{
+                .config = cfg,
+                .streams = mhc_arena.binding(arena_buf),
+                .h_pre = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(h_pre_raw.ptr)) },
+                .h_res = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(h_res_raw.ptr)) },
+                .norm_w = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(norm_w_raw.ptr)) },
+                .branch_out = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(branch_out_raw.ptr)) },
+                .m = tc.m,
+            }, false);
+            try pipes.encodeMegaMhcPostMix(&frame, .{
+                .config = cfg,
+                .streams = mhc_arena.binding(arena_buf),
+                .sublayer_out = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(sublayer_raw.ptr)) },
+                .h_post = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(h_post_raw.ptr)) },
+                .h_res = .{ .buffer = arena_buf, .offset = @intCast(arena.offsetOf(h_res_raw.ptr)) },
+                .m = tc.m,
+            }, true);
+            const sig = try frame.commit();
+            try compute.wait(sig, 5000);
+        }
+
+        mhcSinglePassCpuRef(cfg, cpu_streams, h_pre, h_res, norm_w_bits[0..tc.hidden_size], cpu_branch, tc.m);
+        // Quantize intermediate streams if apply_h_res_pre wrote back in stream_dt before post-mix read.
+        if (tc.apply_h_res_pre) {
+            for (0..total_stream_elems) |i| {
+                cpu_streams[i] = quant.floatBitsToF32(tc.stream_dt, quant.f32ToFloatBits(tc.stream_dt, cpu_streams[i]));
+            }
+        }
+        mhcPostMixCpuRef(cfg, cpu_streams, cpu_sublayer, h_post, h_res, tc.m);
+
+        var max_branch_err: f32 = 0.0;
+        for (0..total_act_elems) |i| {
+            const got = quant.floatBitsToF32(tc.act_dt, branch_bits[i]);
+            max_branch_err = @max(max_branch_err, @abs(got - cpu_branch[i]));
+        }
+        var max_stream_err: f32 = 0.0;
+        for (0..total_stream_elems) |i| {
+            const got = quant.floatBitsToF32(tc.stream_dt, stream_bits[i]);
+            max_stream_err = @max(max_stream_err, @abs(got - cpu_streams[i]));
+        }
+        try std.testing.expect(max_branch_err < tc.tol);
+        try std.testing.expect(max_stream_err < tc.tol);
+    }
 }

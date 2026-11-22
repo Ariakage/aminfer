@@ -1,4 +1,4 @@
-// M6 hybrid frontier model Metal 4 kernels:
+// M6 + M7 hybrid frontier model Metal 4 kernels:
 //   - R6 + G8: Gated DeltaNet (GDN) recurrent decode, chunked prefill, M-node
 //              tree verification with 64-bit ancestor masks, fused RMSNorm +
 //              SiLU output gate, and ADR-0019 loop-isolation state commit.
@@ -8,8 +8,12 @@
 //              mandatory local recent block(s) and ADR-0019 cross-loop index
 //              reuse, plus sparse GQA decode & tree-verify attention.
 //   - G10:     4-Branch Gated Residual (GR) stream init, fused read-gate,
-//              fused write-gate, and stream collapse (`f16` / `bf16` storage
-//              with `fp32` internal math).
+//              fused write-gate, stream collapse, and Single-Pass Mega-mHC
+//              (`mhc_single_pass` pre-mix + fused post-mix, `2..8` streams).
+//   - R7 + G11: DeepSeek-V4.1 MLA + CSA2 (`Full` / `Reindex` / `Reuse`)
+//              two-stage hierarchical sparse indexer, FP4 (`E2M1` + `E4M3`
+//              per-16-channel scale, 890 B/tok) latent KV encode/decode, and
+//              deduplicated SWA bounded window replay.
 //
 // Compiled with `-std=metal4.0 -Wall -Werror -mmacosx-version-min=26.0`.
 #include <metal_stdlib>
@@ -3183,6 +3187,1180 @@ kernel void ami_qsa_swa_prefill_attn(const device half *q [[buffer(0)]],
         }
         if (lane + 32u < num_cols) {
             *(device half4 *)(out + q_row_off + (lane + 32u) * 4u) = half4(acc_reg[1] * inv_l);
+        }
+    }
+}
+
+// ===========================================================================
+// Section E: M7 (R7 + G11) — MLA + CSA2 (Full / Reindex / Reuse) + FP4 KV
+// (`E2M1` + `E4M3` per-16-channel scale, 890 B/tok geometry) + SWA Replay
+// ===========================================================================
+
+static inline float mla_e2m1_to_f32(uint nib) {
+    const uint mag = nib & 0x7u;
+    float v;
+    switch (mag) {
+        case 0u: v = 0.0f; break;
+        case 1u: v = 0.5f; break;
+        case 2u: v = 1.0f; break;
+        case 3u: v = 1.5f; break;
+        case 4u: v = 2.0f; break;
+        case 5u: v = 3.0f; break;
+        case 6u: v = 4.0f; break;
+        default: v = 6.0f; break;
+    }
+    return ((nib & 0x8u) != 0u && mag != 0u) ? -v : v;
+}
+
+static inline uchar mla_f32_to_e2m1(float x) {
+    if (isnan(x)) {
+        return 0u;
+    }
+    const bool neg = (x < 0.0f);
+    const float a = fabs(x);
+    uchar mag;
+    if (a <= 0.25f) {
+        mag = 0u;
+    } else if (a < 0.75f) {
+        mag = 1u;
+    } else if (a <= 1.25f) {
+        mag = 2u;
+    } else if (a < 1.75f) {
+        mag = 3u;
+    } else if (a <= 2.50f) {
+        mag = 4u;
+    } else if (a < 3.50f) {
+        mag = 5u;
+    } else if (a <= 5.00f) {
+        mag = 6u;
+    } else {
+        mag = 7u;
+    }
+    if (mag == 0u) {
+        return 0u;
+    }
+    return neg ? uchar(mag | 0x8u) : mag;
+}
+
+// OCP FP8 E4M3FN: 1 sign, 4 exponent (bias 7), 3 mantissa, max finite 448.0.
+static inline float mla_e4m3_to_f32(uchar b) {
+    const uint s = (uint(b) >> 7) & 1u;
+    const uint e = (uint(b) >> 3) & 0xFu;
+    const uint m = uint(b) & 0x7u;
+    float val;
+    if (e == 0u) {
+        val = float(m) * (1.0f / 512.0f);
+    } else if (e == 15u && m == 7u) {
+        val = 0.0f;
+    } else {
+        val = ldexp(float(8u + m), int(e) - 10);
+    }
+    return (s != 0u) ? -val : val;
+}
+
+static inline uchar mla_f32_to_e4m3(float x) {
+    if (isnan(x)) {
+        return 0u;
+    }
+    const uint bits = as_type<uint>(x);
+    const uint sign_bit = (bits >> 31) & 1u;
+    const float a = fabs(x);
+    if (a == 0.0f) {
+        return 0u;
+    }
+    if (a >= 448.0f) {
+        return uchar((sign_bit << 7) | 0x7Eu);
+    }
+    if (a < (1.0f / 64.0f)) {
+        const float scaled = a * 512.0f;
+        const uint q_floor = uint(floor(scaled));
+        const float frac = scaled - float(q_floor);
+        uint q = q_floor;
+        if (frac > 0.5f || (frac == 0.5f && (q_floor & 1u) != 0u)) {
+            q += 1u;
+        }
+        if (q == 0u) {
+            return 0u;
+        }
+        if (q >= 8u) {
+            return uchar((sign_bit << 7) | (1u << 3));
+        }
+        return uchar((sign_bit << 7) | q);
+    }
+    const uint abs_bits = as_type<uint>(a);
+    const int f_exp = int((abs_bits >> 23) & 0xFFu) - 127;
+    const uint f_mant = abs_bits & 0x7FFFFFu;
+    uint m3 = f_mant >> 20;
+    const uint rem = f_mant & 0xFFFFFu;
+    uint e4 = uint(f_exp + 7);
+    if (rem > 0x80000u || (rem == 0x80000u && (m3 & 1u) != 0u)) {
+        m3 += 1u;
+        if (m3 == 8u) {
+            m3 = 0u;
+            e4 += 1u;
+        }
+    }
+    if (e4 > 15u || (e4 == 15u && m3 >= 7u)) {
+        e4 = 15u;
+        m3 = 6u;
+    }
+    return uchar((sign_bit << 7) | (e4 << 3) | m3);
+}
+
+struct MlaFp4KvWriteParams {
+    uint num_tokens;
+    uint start_pos;
+    uint kv_lora_rank;
+    uint qk_rope_dim;
+    uint rope_tail_format; // 0 = f16, 1 = e4m3
+    uint max_tokens;
+    uint swa_ring_capacity; // 0 = disabled
+    uint flags;             // bit 0: CED encoder->decoder projection
+    ulong e2m1_plane_offset;
+    ulong scale_plane_offset;
+    ulong rope_plane_offset;
+    ulong swa_rope_plane_offset;
+};
+
+static_assert(sizeof(MlaFp4KvWriteParams) == 64, "MlaFp4KvWriteParams must be 64 bytes");
+
+struct Csa2SummaryParams {
+    uint kv_len;
+    uint kv_lora_rank;
+    uint index_dim;
+    uint block_tokens;
+    uint coarse_group_blocks;
+    uint start_coarse_block;
+    uint num_coarse_blocks;
+    uint _pad0;
+    ulong e2m1_plane_offset;
+    ulong scale_plane_offset;
+    ulong fine_plane_offset;
+    ulong coarse_plane_offset;
+};
+
+static_assert(sizeof(Csa2SummaryParams) == 64, "Csa2SummaryParams must be 64 bytes");
+
+struct Csa2IndexParams {
+    uint num_nodes;
+    uint num_q_heads;
+    uint kv_lora_rank;
+    uint index_dim;
+    uint kv_len;
+    uint encoder_prefix_len;
+    uint causal_q_start_pos; // 0xFFFFFFFF = non-causal / full visibility
+    uint swa_window;
+    uint block_tokens;
+    uint coarse_group_blocks;
+    uint top_k_coarse;
+    uint top_k_blocks;
+    uint num_local_blocks;
+    uint has_batch_slots;
+    float scale;
+    uint _pad0;
+    ulong fine_batch_stride_bytes;
+    ulong coarse_batch_stride_bytes;
+};
+
+static_assert(sizeof(Csa2IndexParams) == 80, "Csa2IndexParams must be 80 bytes");
+
+struct MlaCsa2AttnParams {
+    uint num_nodes;
+    uint num_q_heads;
+    uint kv_lora_rank;
+    uint qk_rope_dim;
+    uint rope_tail_format; // 0 = f16, 1 = e4m3
+    uint kv_len;
+    uint encoder_prefix_len;
+    uint causal_q_start_pos; // 0xFFFFFFFF = non-causal / full visibility
+    uint swa_window;
+    uint swa_ring_capacity;
+    uint block_tokens;
+    uint top_k_blocks;
+    uint has_tree;
+    uint has_batch_slots;
+    float scale;
+    uint _pad0;
+    ulong e2m1_plane_offset;
+    ulong scale_plane_offset;
+    ulong rope_plane_offset;
+    ulong swa_rope_plane_offset;
+    ulong kv_batch_stride_bytes;
+    ulong swa_batch_stride_bytes;
+};
+
+static_assert(sizeof(MlaCsa2AttnParams) == 112, "MlaCsa2AttnParams must be 112 bytes");
+
+// Quantizes `[M, kv_lora_rank]` latent rows to FP4 (`E2M1` + per-16 `E4M3`
+// scale) and writes `[M, qk_rope_dim]` RoPE keys (`f16` or `E4M3`) into a
+// 16 KiB-aligned `MlaFp4KvArena` layer slab, optionally mirroring exact `f16`
+// rows into a circular SWA replay ring (`swa_ring_capacity > 0`).
+//
+// Grid: (num_tokens, 1, 1) threadgroups, 256 threads.
+kernel void ami_mla_fp4_kv_write(const device half *latent_in [[buffer(0)]],
+                                 const device half *rope_in [[buffer(1)]],
+                                 device uchar *kv_slab [[buffer(2)]],
+                                 device uchar *swa_ring [[buffer(3)]],
+                                 constant MlaFp4KvWriteParams &p [[buffer(4)]],
+                                 uint tg_x [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.num_tokens) {
+        return;
+    }
+    const uint dst_pos = p.start_pos + tok;
+    if (dst_pos >= p.max_tokens) {
+        return;
+    }
+
+    const uint num_groups = p.kv_lora_rank >> 4; // per-16 channels
+    const uint e2m1_row_bytes = p.kv_lora_rank >> 1;
+    const ulong in_lat_base = ulong(tok) * p.kv_lora_rank;
+    device uchar *e2m1_row = kv_slab + p.e2m1_plane_offset + ulong(dst_pos) * e2m1_row_bytes;
+    device uchar *scale_row = kv_slab + p.scale_plane_offset + ulong(dst_pos) * num_groups;
+
+    const bool write_swa = (p.swa_ring_capacity > 0u);
+    const uint swa_slot = write_swa ? (dst_pos % p.swa_ring_capacity) : 0u;
+    device half *swa_lat_row = write_swa
+        ? ((device half *)swa_ring + ulong(swa_slot) * p.kv_lora_rank)
+        : nullptr;
+
+    // Each thread quantizes one or more 16-channel groups.
+    for (uint g = tid; g < num_groups; g += 256u) {
+        const uint ch0 = g << 4;
+        float vals[16];
+        float amax = 0.0f;
+        for (uint i = 0u; i < 16u; i++) {
+            const half h_val = latent_in[in_lat_base + ch0 + i];
+            if (write_swa) {
+                swa_lat_row[ch0 + i] = h_val;
+            }
+            const float fv = float(h_val);
+            vals[i] = fv;
+            amax = max(amax, fabs(fv));
+        }
+        uchar s_byte = 0u;
+        float inv_s = 0.0f;
+        if (amax > 0.0f) {
+            s_byte = mla_f32_to_e4m3(amax * (1.0f / 6.0f));
+            if (s_byte == 0u) {
+                s_byte = 1u; // min positive E4M3 subnormal (1/512)
+            }
+            inv_s = 1.0f / mla_e4m3_to_f32(s_byte);
+        }
+        scale_row[g] = s_byte;
+
+        const uint byte0 = g << 3;
+        for (uint b = 0u; b < 8u; b++) {
+            const uchar q0 = (s_byte != 0u) ? mla_f32_to_e2m1(vals[b * 2u] * inv_s) : 0u;
+            const uchar q1 = (s_byte != 0u) ? mla_f32_to_e2m1(vals[b * 2u + 1u] * inv_s) : 0u;
+            e2m1_row[byte0 + b] = uchar((q1 << 4) | (q0 & 0xFu));
+        }
+    }
+
+    // Write RoPE key tail (`f16` or `E4M3`), plus optional SWA `f16` mirror.
+    if (p.qk_rope_dim > 0u) {
+        const ulong in_rope_base = ulong(tok) * p.qk_rope_dim;
+        const ulong rope_row_bytes = (p.rope_tail_format == 1u)
+            ? ulong(p.qk_rope_dim)
+            : (ulong(p.qk_rope_dim) * 2ul);
+        device uchar *rope_row = kv_slab + p.rope_plane_offset + ulong(dst_pos) * rope_row_bytes;
+        device half *swa_rope_row = write_swa
+            ? ((device half *)(swa_ring + p.swa_rope_plane_offset) + ulong(swa_slot) * p.qk_rope_dim)
+            : nullptr;
+
+        for (uint d = tid; d < p.qk_rope_dim; d += 256u) {
+            const half hv = rope_in[in_rope_base + d];
+            if (write_swa) {
+                swa_rope_row[d] = hv;
+            }
+            if (p.rope_tail_format == 1u) {
+                rope_row[d] = mla_f32_to_e4m3(float(hv));
+            } else {
+                ((device half *)rope_row)[d] = hv;
+            }
+        }
+    }
+}
+
+// Stage-1 hierarchical summary updater: dequantizes FP4 (`E2M1` + `E4M3`)
+// latent KV blocks into mean-pooled fine block summaries (`[num_fine, index_dim]`)
+// AND coarse super-block summaries (`[num_coarse, index_dim]`) in one pass.
+//
+// Grid: (num_coarse_blocks, 1, 1) threadgroups, 256 threads.
+kernel void ami_csa2_update_summaries(const device uchar *kv_slab [[buffer(0)]],
+                                      device uchar *summary_slab [[buffer(1)]],
+                                      constant Csa2SummaryParams &p [[buffer(2)]],
+                                      uint tg_x [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]]) {
+    if (tg_x >= p.num_coarse_blocks || p.kv_len == 0u) {
+        return;
+    }
+    const uint sb = p.start_coarse_block + tg_x;
+    const uint g_blocks = max(p.coarse_group_blocks, 1u);
+    const uint first_fine = sb * g_blocks;
+    const uint total_fine = (p.kv_len + p.block_tokens - 1u) / p.block_tokens;
+    if (first_fine >= total_fine) {
+        return;
+    }
+    const uint end_fine = min(first_fine + g_blocks, total_fine);
+    const uint valid_sub = end_fine - first_fine;
+
+    const uint e2m1_row_bytes = p.kv_lora_rank >> 1;
+    const uint num_groups = p.kv_lora_rank >> 4;
+    const device uchar *e2m1_base = kv_slab + p.e2m1_plane_offset;
+    const device uchar *scale_base = kv_slab + p.scale_plane_offset;
+    device half *fine_keys = (device half *)(summary_slab + p.fine_plane_offset);
+    device half *coarse_keys = (device half *)(summary_slab + p.coarse_plane_offset);
+
+    for (uint d = tid; d < p.index_dim; d += 256u) {
+        const uint byte_idx = d >> 1;
+        const bool hi_nib = ((d & 1u) != 0u);
+        const uint grp_idx = d >> 4;
+        float coarse_acc = 0.0f;
+
+        for (uint fb = first_fine; fb < end_fine; fb++) {
+            const uint t0 = fb * p.block_tokens;
+            const uint t1 = min(t0 + p.block_tokens, p.kv_len);
+            float fine_acc = 0.0f;
+            for (uint t = t0; t < t1; t++) {
+                const uchar packed = e2m1_base[ulong(t) * e2m1_row_bytes + byte_idx];
+                const uint nib = hi_nib ? ((uint(packed) >> 4) & 0xFu) : (uint(packed) & 0xFu);
+                const float sc = mla_e4m3_to_f32(scale_base[ulong(t) * num_groups + grp_idx]);
+                fine_acc += mla_e2m1_to_f32(nib) * sc;
+            }
+            const float fine_mean = fine_acc / float(t1 - t0);
+            fine_keys[ulong(fb) * p.index_dim + d] = half(fine_mean);
+            coarse_acc += fine_mean;
+        }
+        coarse_keys[ulong(sb) * p.index_dim + d] = half(coarse_acc / float(valid_sub));
+    }
+}
+
+// Stage-2 hierarchical CSA2 sparse block selector (`Full` and `Reindex` modes;
+// skipped in `Reuse` mode and on `LoopSchedule` `r >= 1` passes).
+// Strictly skips upper-triangular blocks (`kv_pos > q_pos`) in causal mode,
+// while keeping the full encoder prefix `[0, encoder_prefix_len)` visible in
+// CED decoder cross/hybrid mode.
+//
+// Grid: (num_nodes, 1, 1) threadgroups, 256 threads (8 simdgroups).
+kernel void ami_csa2_index_blocks(const device half *q_nope [[buffer(0)]],
+                                  const device uchar *fine_keys_raw [[buffer(1)]],
+                                  const device uchar *coarse_keys_raw [[buffer(2)]],
+                                  const device uint *batch_kv_lens [[buffer(3)]],
+                                  device uint *selected_blocks [[buffer(4)]],
+                                  device uint *selected_counts [[buffer(5)]],
+                                  constant Csa2IndexParams &p [[buffer(6)]],
+                                  uint tg_x [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint sg_id [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    const uint node = tg_x;
+    if (node >= p.num_nodes) {
+        return;
+    }
+
+    const uint k_cap = min(p.top_k_blocks, 64u);
+    const ulong sel_base = ulong(node) * p.top_k_blocks;
+    const uint raw_kv_len = (p.has_batch_slots != 0u) ? batch_kv_lens[node] : p.kv_len;
+    const uint eff_kv_len = (p.causal_q_start_pos != 0xFFFFFFFFu)
+        ? min(raw_kv_len, max(p.encoder_prefix_len, p.causal_q_start_pos + node + 1u))
+        : raw_kv_len;
+
+    if (eff_kv_len == 0u || k_cap == 0u) {
+        for (uint i = tid; i < p.top_k_blocks; i += 256u) {
+            selected_blocks[sel_base + i] = 0xFFFFFFFFu;
+        }
+        if (tid == 0u) {
+            selected_counts[node] = 0u;
+        }
+        return;
+    }
+
+    const uint swa_lo = (p.swa_window > 0u && eff_kv_len > p.swa_window)
+        ? (eff_kv_len - p.swa_window)
+        : 0u;
+    const uint num_valid = (eff_kv_len + p.block_tokens - 1u) / p.block_tokens;
+
+    // When SWA covers the entire visible prefix, no extra sparse blocks are needed.
+    if (p.swa_window > 0u && swa_lo == 0u) {
+        for (uint i = tid; i < p.top_k_blocks; i += 256u) {
+            selected_blocks[sel_base + i] = 0xFFFFFFFFu;
+        }
+        if (tid == 0u) {
+            selected_counts[node] = 0u;
+        }
+        return;
+    }
+
+    const uint num_cand = (p.swa_window > 0u)
+        ? ((swa_lo + p.block_tokens - 1u) / p.block_tokens)
+        : num_valid;
+
+    // Fast path: all candidate blocks fit inside top_k_blocks.
+    if (num_cand <= k_cap) {
+        for (uint i = tid; i < p.top_k_blocks; i += 256u) {
+            selected_blocks[sel_base + i] = (i < num_cand) ? i : 0xFFFFFFFFu;
+        }
+        if (tid == 0u) {
+            selected_counts[node] = num_cand;
+        }
+        return;
+    }
+
+    const uint local_cnt = (p.swa_window > 0u)
+        ? 0u
+        : min(max(p.num_local_blocks, 1u), k_cap);
+    const uint search_end = num_cand - local_cnt;
+    const uint k_sel = k_cap - local_cnt;
+
+    const device half *fine_keys = (const device half *)(fine_keys_raw +
+        ((p.has_batch_slots != 0u) ? (ulong(node) * p.fine_batch_stride_bytes) : 0ul));
+    const device half *coarse_keys = (const device half *)(coarse_keys_raw +
+        ((p.has_batch_slots != 0u) ? (ulong(node) * p.coarse_batch_stride_bytes) : 0ul));
+    const ulong q_node_base = ulong(node) * p.num_q_heads * p.kv_lora_rank;
+    const uint vec_d = p.index_dim >> 2;
+
+    threadgroup float tg_scores[8][64];
+    threadgroup uint tg_blocks[8][64];
+    threadgroup uint tg_coarse[64];
+    threadgroup uint tg_coarse_cnt;
+    threadgroup uint tg_win_cnt;
+
+    const uint g_blocks = max(p.coarse_group_blocks, 1u);
+    const uint num_coarse = (search_end + g_blocks - 1u) / g_blocks;
+    const uint k_coarse = min(p.top_k_coarse, 64u);
+    const bool use_coarse = (g_blocks > 1u && k_coarse > 0u && num_coarse > k_coarse);
+
+    if (tid == 0u) {
+        tg_coarse_cnt = 0u;
+        tg_win_cnt = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 2a: Coarse super-block shortlist (when context exceeds coarse budget).
+    if (use_coarse && k_sel > 0u) {
+        if (lane == 0u) {
+            for (uint i = 0u; i < k_coarse; i++) {
+                tg_scores[sg_id][i] = -INFINITY;
+                tg_blocks[sg_id][i] = 0xFFFFFFFFu;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint worst_slot = 0u;
+        float worst_score = -INFINITY;
+        uint worst_block = 0xFFFFFFFFu;
+
+        for (uint sb = sg_id; sb < num_coarse; sb += 8u) {
+            const device half4 *ck_vec = (const device half4 *)(coarse_keys + ulong(sb) * p.index_dim);
+            float best_h = -INFINITY;
+            for (uint h = 0u; h < p.num_q_heads; h++) {
+                const device half4 *q_vec = (const device half4 *)(q_nope + q_node_base + ulong(h) * p.kv_lora_rank);
+                float dot_acc = 0.0f;
+                for (uint c = lane; c < vec_d; c += 32u) {
+                    dot_acc += dot(float4(q_vec[c]), float4(ck_vec[c]));
+                }
+                best_h = max(best_h, simd_sum(dot_acc) * p.scale);
+            }
+            if (lane == 0u) {
+                if (best_h > worst_score || (best_h == worst_score && sb < worst_block)) {
+                    tg_scores[sg_id][worst_slot] = best_h;
+                    tg_blocks[sg_id][worst_slot] = sb;
+                    uint new_w = 0u;
+                    float min_s = tg_scores[sg_id][0];
+                    uint max_b = tg_blocks[sg_id][0];
+                    for (uint i = 1u; i < k_coarse; i++) {
+                        const float si = tg_scores[sg_id][i];
+                        const uint bi = tg_blocks[sg_id][i];
+                        if (si < min_s || (si == min_s && bi > max_b)) {
+                            min_s = si;
+                            max_b = bi;
+                            new_w = i;
+                        }
+                    }
+                    worst_slot = new_w;
+                    worst_score = min_s;
+                    worst_block = max_b;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_id == 0u) {
+            const uint total_cands = 8u * k_coarse;
+            uint out_c = 0u;
+            for (uint k = 0u; k < k_coarse; k++) {
+                float best_s = -INFINITY;
+                uint best_b = 0xFFFFFFFFu;
+                uint best_c = 0xFFFFFFFFu;
+                for (uint c = lane; c < total_cands; c += 32u) {
+                    const uint sg = c / k_coarse;
+                    const uint slot = c - sg * k_coarse;
+                    const uint cb = tg_blocks[sg][slot];
+                    if (cb != 0xFFFFFFFFu) {
+                        const float cs = tg_scores[sg][slot];
+                        if (cs > best_s || (cs == best_s && cb < best_b)) {
+                            best_s = cs;
+                            best_b = cb;
+                            best_c = c;
+                        }
+                    }
+                }
+                for (ushort off = 16u; off > 0u; off >>= 1u) {
+                    const float os = simd_shuffle_down(best_s, off);
+                    const uint ob = simd_shuffle_down(best_b, off);
+                    const uint oc = simd_shuffle_down(best_c, off);
+                    if (os > best_s || (os == best_s && ob < best_b)) {
+                        best_s = os;
+                        best_b = ob;
+                        best_c = oc;
+                    }
+                }
+                const uint win_b = simd_broadcast_first(best_b);
+                const uint win_c = simd_broadcast_first(best_c);
+                if (lane == 0u && win_b != 0xFFFFFFFFu) {
+                    tg_coarse[out_c] = win_b;
+                    out_c += 1u;
+                    if (win_c < total_cands) {
+                        const uint w_sg = win_c / k_coarse;
+                        const uint w_slot = win_c - w_sg * k_coarse;
+                        tg_scores[w_sg][w_slot] = -INFINITY;
+                        tg_blocks[w_sg][w_slot] = 0xFFFFFFFFu;
+                    }
+                }
+            }
+            if (lane == 0u) {
+                tg_coarse_cnt = out_c;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Stage 2b: Fine block top-k selection (either within coarse shortlist or flat).
+    if (k_sel > 0u) {
+        if (lane == 0u) {
+            for (uint i = 0u; i < k_sel; i++) {
+                tg_scores[sg_id][i] = -INFINITY;
+                tg_blocks[sg_id][i] = 0xFFFFFFFFu;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint worst_slot = 0u;
+        float worst_score = -INFINITY;
+        uint worst_block = 0xFFFFFFFFu;
+        const uint fine_iters = use_coarse ? (tg_coarse_cnt * g_blocks) : search_end;
+
+        for (uint idx = sg_id; idx < fine_iters; idx += 8u) {
+            uint b;
+            if (use_coarse) {
+                const uint ci = idx / g_blocks;
+                const uint sub = idx - ci * g_blocks;
+                b = tg_coarse[ci] * g_blocks + sub;
+                if (b >= search_end) {
+                    continue;
+                }
+            } else {
+                b = idx;
+            }
+
+            const device half4 *fk_vec = (const device half4 *)(fine_keys + ulong(b) * p.index_dim);
+            float best_h = -INFINITY;
+            for (uint h = 0u; h < p.num_q_heads; h++) {
+                const device half4 *q_vec = (const device half4 *)(q_nope + q_node_base + ulong(h) * p.kv_lora_rank);
+                float dot_acc = 0.0f;
+                for (uint c = lane; c < vec_d; c += 32u) {
+                    dot_acc += dot(float4(q_vec[c]), float4(fk_vec[c]));
+                }
+                best_h = max(best_h, simd_sum(dot_acc) * p.scale);
+            }
+            if (lane == 0u) {
+                if (best_h > worst_score || (best_h == worst_score && b < worst_block)) {
+                    tg_scores[sg_id][worst_slot] = best_h;
+                    tg_blocks[sg_id][worst_slot] = b;
+                    uint new_w = 0u;
+                    float min_s = tg_scores[sg_id][0];
+                    uint max_b = tg_blocks[sg_id][0];
+                    for (uint i = 1u; i < k_sel; i++) {
+                        const float si = tg_scores[sg_id][i];
+                        const uint bi = tg_blocks[sg_id][i];
+                        if (si < min_s || (si == min_s && bi > max_b)) {
+                            min_s = si;
+                            max_b = bi;
+                            new_w = i;
+                        }
+                    }
+                    worst_slot = new_w;
+                    worst_score = min_s;
+                    worst_block = max_b;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_id == 0u) {
+            const uint total_cands = 8u * k_sel;
+            uint out_w = 0u;
+            for (uint k = 0u; k < k_sel; k++) {
+                float best_s = -INFINITY;
+                uint best_b = 0xFFFFFFFFu;
+                uint best_c = 0xFFFFFFFFu;
+                for (uint c = lane; c < total_cands; c += 32u) {
+                    const uint sg = c / k_sel;
+                    const uint slot = c - sg * k_sel;
+                    const uint cb = tg_blocks[sg][slot];
+                    if (cb != 0xFFFFFFFFu) {
+                        const float cs = tg_scores[sg][slot];
+                        if (cs > best_s || (cs == best_s && cb < best_b)) {
+                            best_s = cs;
+                            best_b = cb;
+                            best_c = c;
+                        }
+                    }
+                }
+                for (ushort off = 16u; off > 0u; off >>= 1u) {
+                    const float os = simd_shuffle_down(best_s, off);
+                    const uint ob = simd_shuffle_down(best_b, off);
+                    const uint oc = simd_shuffle_down(best_c, off);
+                    if (os > best_s || (os == best_s && ob < best_b)) {
+                        best_s = os;
+                        best_b = ob;
+                        best_c = oc;
+                    }
+                }
+                const uint win_b = simd_broadcast_first(best_b);
+                const uint win_c = simd_broadcast_first(best_c);
+                if (lane == 0u && win_b != 0xFFFFFFFFu) {
+                    selected_blocks[sel_base + out_w] = win_b;
+                    out_w += 1u;
+                    if (win_c < total_cands) {
+                        const uint w_sg = win_c / k_sel;
+                        const uint w_slot = win_c - w_sg * k_sel;
+                        tg_scores[w_sg][w_slot] = -INFINITY;
+                        tg_blocks[w_sg][w_slot] = 0xFFFFFFFFu;
+                    }
+                }
+            }
+            if (lane == 0u) {
+                tg_win_cnt = out_w;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint base_cnt = tg_win_cnt;
+    if (tid < local_cnt) {
+        selected_blocks[sel_base + base_cnt + tid] = search_end + tid;
+    }
+    const uint final_cnt = base_cnt + local_cnt;
+    for (uint i = final_cnt + tid; i < p.top_k_blocks; i += 256u) {
+        selected_blocks[sel_base + i] = 0xFFFFFFFFu;
+    }
+    if (tid == 0u) {
+        selected_counts[node] = final_cnt;
+    }
+}
+
+// Online-softmax absorbed MLA + CSA2 attention over selected FP4 (`E2M1` +
+// `E4M3`) latent KV blocks + deduplicated SWA bounded window replay + optional
+// 64-bit ancestor-masked speculative tree tokens.
+//
+// Supports:
+//   - wide causal prefill (`M = 1..1024`),
+//   - CED encoder->decoder cross/hybrid prefix (`encoder_prefix_len > 0`),
+//   - batched decode (`M = 1..16`, `has_batch_slots = 1`),
+//   - tree verification (`M = 1..64`, `has_tree = 1`, `u64` ancestor masks),
+//   - `kv_lora_rank` multiples of 32 up to `2048` (`1536` for `deepseek41`).
+//
+// Grid: (num_q_heads, num_nodes, 1) threadgroups, 256 threads (8 simdgroups).
+kernel void ami_mla_csa2_attend(const device half *q_nope [[buffer(0)]],
+                                const device half *q_pe [[buffer(1)]],
+                                const device uchar *kv_slab_base [[buffer(2)]],
+                                const device uchar *swa_ring_base [[buffer(3)]],
+                                const device uint *selected_blocks [[buffer(4)]],
+                                const device uint *selected_counts [[buffer(5)]],
+                                const device half *kv_tree_latent [[buffer(6)]],
+                                const device half *kv_tree_rope [[buffer(7)]],
+                                const device ulong *ancestor_masks [[buffer(8)]],
+                                const device uint *batch_kv_lens [[buffer(9)]],
+                                device half *out [[buffer(10)]],
+                                constant MlaCsa2AttnParams &p [[buffer(11)]],
+                                uint2 tg_pos [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint sg_id [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    const uint q_head = tg_pos.x;
+    const uint node = tg_pos.y;
+    if (q_head >= p.num_q_heads || node >= p.num_nodes) {
+        return;
+    }
+
+    const uint num_bytes = p.kv_lora_rank >> 1; // <= 1024 (at most 4 pairs/thread)
+    const uint num_groups = p.kv_lora_rank >> 4;
+    const uint num_iters = (num_bytes + 255u) >> 8;
+
+    const ulong q_nope_off = (ulong(node) * p.num_q_heads + q_head) * p.kv_lora_rank;
+    const ulong q_pe_off = (ulong(node) * p.num_q_heads + q_head) * p.qk_rope_dim;
+
+    float2 q_nope_reg[4] = {float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f)};
+    float2 acc_reg[4] = {float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f)};
+    for (uint u = 0u; u < num_iters; u++) {
+        const uint b_idx = tid + u * 256u;
+        if (b_idx < num_bytes) {
+            const ulong ch = q_nope_off + ulong(b_idx) * 2ul;
+            q_nope_reg[u] = float2(float(q_nope[ch]), float(q_nope[ch + 1ul]));
+        }
+    }
+    const float q_pe_reg = (tid < p.qk_rope_dim) ? float(q_pe[q_pe_off + tid]) : 0.0f;
+
+    const device uchar *kv_slab = kv_slab_base +
+        ((p.has_batch_slots != 0u) ? (ulong(node) * p.kv_batch_stride_bytes) : 0ul);
+    const device uchar *e2m1_base = kv_slab + p.e2m1_plane_offset;
+    const device uchar *scale_base = kv_slab + p.scale_plane_offset;
+    const device uchar *rope_base = kv_slab + p.rope_plane_offset;
+    const ulong rope_row_bytes = (p.rope_tail_format == 1u)
+        ? ulong(p.qk_rope_dim)
+        : (ulong(p.qk_rope_dim) * 2ul);
+
+    const device uchar *swa_ring = swa_ring_base +
+        ((p.has_batch_slots != 0u) ? (ulong(node) * p.swa_batch_stride_bytes) : 0ul);
+    const device half *swa_lat_base = (const device half *)swa_ring;
+    const device half *swa_rope_base = (const device half *)(swa_ring + p.swa_rope_plane_offset);
+
+    const uint raw_kv_len = (p.has_batch_slots != 0u) ? batch_kv_lens[node] : p.kv_len;
+    const uint eff_kv_len = (p.causal_q_start_pos != 0xFFFFFFFFu)
+        ? min(raw_kv_len, max(p.encoder_prefix_len, p.causal_q_start_pos + node + 1u))
+        : raw_kv_len;
+    const uint swa_hi = eff_kv_len;
+    const uint swa_lo = (p.swa_window > 0u)
+        ? ((eff_kv_len > p.swa_window) ? (eff_kv_len - p.swa_window) : 0u)
+        : eff_kv_len;
+    const uint ring_valid_lo = (p.swa_ring_capacity > 0u && raw_kv_len > p.swa_ring_capacity)
+        ? (raw_kv_len - p.swa_ring_capacity)
+        : 0u;
+
+    const float scale_log2e = p.scale * 1.4426950408889634f;
+    float m_val = -INFINITY;
+    float l_val = 0.0f;
+    threadgroup float tg_reduce[8];
+
+    // Pass 1: Selected CSA2 sparse FP4 blocks (deduplicated against [swa_lo, swa_hi)).
+    const uint sel_count = min(selected_counts[node], p.top_k_blocks);
+    const ulong sel_base = ulong(node) * p.top_k_blocks;
+    for (uint sb = 0u; sb < sel_count; sb++) {
+        const uint block_id = selected_blocks[sel_base + sb];
+        if (block_id == 0xFFFFFFFFu) {
+            continue;
+        }
+        const uint t_start = block_id * p.block_tokens;
+        if (t_start >= eff_kv_len) {
+            continue;
+        }
+        const uint t_end = min(t_start + p.block_tokens, eff_kv_len);
+        for (uint t = t_start; t < t_end; t++) {
+            if (t >= swa_lo && t < swa_hi) {
+                continue;
+            }
+            const device uchar *e2m1_row = e2m1_base + ulong(t) * num_bytes;
+            const device uchar *scale_row = scale_base + ulong(t) * num_groups;
+            float2 kv_reg[4];
+            float dot_partial = 0.0f;
+            for (uint u = 0u; u < num_iters; u++) {
+                const uint b_idx = tid + u * 256u;
+                if (b_idx < num_bytes) {
+                    const uchar packed = e2m1_row[b_idx];
+                    const float sc = mla_e4m3_to_f32(scale_row[b_idx >> 3]);
+                    const float2 kv = float2(
+                        mla_e2m1_to_f32(uint(packed) & 0xFu),
+                        mla_e2m1_to_f32((uint(packed) >> 4) & 0xFu)) * sc;
+                    kv_reg[u] = kv;
+                    dot_partial += dot(q_nope_reg[u], kv);
+                } else {
+                    kv_reg[u] = float2(0.0f);
+                }
+            }
+            if (tid < p.qk_rope_dim) {
+                const device uchar *rope_row = rope_base + ulong(t) * rope_row_bytes;
+                const float k_pe_val = (p.rope_tail_format == 1u)
+                    ? mla_e4m3_to_f32(rope_row[tid])
+                    : float(((const device half *)rope_row)[tid]);
+                dot_partial += q_pe_reg * k_pe_val;
+            }
+            const float sg_sum = simd_sum(dot_partial);
+            if (lane == 0u) {
+                tg_reduce[sg_id] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float total_dot = ((tg_reduce[0] + tg_reduce[1]) + (tg_reduce[2] + tg_reduce[3])) +
+                ((tg_reduce[4] + tg_reduce[5]) + (tg_reduce[6] + tg_reduce[7]));
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float score = total_dot * scale_log2e;
+            const float new_m = max(m_val, score);
+            const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
+            const float p_w = exp2(score - new_m);
+            l_val = fma(l_val, corr, p_w);
+            for (uint u = 0u; u < num_iters; u++) {
+                acc_reg[u] = fma(acc_reg[u], float2(corr), kv_reg[u] * p_w);
+            }
+            m_val = new_m;
+        }
+    }
+
+    // Pass 2: SWA bounded window replay `[swa_lo, swa_hi)`. Reads exact `f16`
+    // from circular SWA ring when resident (`t >= ring_valid_lo`), else falls
+    // back seamlessly to the non-destructive FP4 `MlaFp4KvArena`.
+    for (uint t = swa_lo; t < swa_hi; t++) {
+        const bool use_swa_ring = (p.swa_ring_capacity > 0u && t >= ring_valid_lo);
+        float2 kv_reg[4];
+        float dot_partial = 0.0f;
+        if (use_swa_ring) {
+            const uint slot = t % p.swa_ring_capacity;
+            const device half *s_lat = swa_lat_base + ulong(slot) * p.kv_lora_rank;
+            for (uint u = 0u; u < num_iters; u++) {
+                const uint b_idx = tid + u * 256u;
+                if (b_idx < num_bytes) {
+                    const uint ch = b_idx * 2u;
+                    const float2 kv = float2(float(s_lat[ch]), float(s_lat[ch + 1u]));
+                    kv_reg[u] = kv;
+                    dot_partial += dot(q_nope_reg[u], kv);
+                } else {
+                    kv_reg[u] = float2(0.0f);
+                }
+            }
+            if (tid < p.qk_rope_dim) {
+                const device half *s_rope = swa_rope_base + ulong(slot) * p.qk_rope_dim;
+                dot_partial += q_pe_reg * float(s_rope[tid]);
+            }
+        } else {
+            const device uchar *e2m1_row = e2m1_base + ulong(t) * num_bytes;
+            const device uchar *scale_row = scale_base + ulong(t) * num_groups;
+            for (uint u = 0u; u < num_iters; u++) {
+                const uint b_idx = tid + u * 256u;
+                if (b_idx < num_bytes) {
+                    const uchar packed = e2m1_row[b_idx];
+                    const float sc = mla_e4m3_to_f32(scale_row[b_idx >> 3]);
+                    const float2 kv = float2(
+                        mla_e2m1_to_f32(uint(packed) & 0xFu),
+                        mla_e2m1_to_f32((uint(packed) >> 4) & 0xFu)) * sc;
+                    kv_reg[u] = kv;
+                    dot_partial += dot(q_nope_reg[u], kv);
+                } else {
+                    kv_reg[u] = float2(0.0f);
+                }
+            }
+            if (tid < p.qk_rope_dim) {
+                const device uchar *rope_row = rope_base + ulong(t) * rope_row_bytes;
+                const float k_pe_val = (p.rope_tail_format == 1u)
+                    ? mla_e4m3_to_f32(rope_row[tid])
+                    : float(((const device half *)rope_row)[tid]);
+                dot_partial += q_pe_reg * k_pe_val;
+            }
+        }
+        const float sg_sum = simd_sum(dot_partial);
+        if (lane == 0u) {
+            tg_reduce[sg_id] = sg_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float total_dot = ((tg_reduce[0] + tg_reduce[1]) + (tg_reduce[2] + tg_reduce[3])) +
+            ((tg_reduce[4] + tg_reduce[5]) + (tg_reduce[6] + tg_reduce[7]));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float score = total_dot * scale_log2e;
+        const float new_m = max(m_val, score);
+        const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
+        const float p_w = exp2(score - new_m);
+        l_val = fma(l_val, corr, p_w);
+        for (uint u = 0u; u < num_iters; u++) {
+            acc_reg[u] = fma(acc_reg[u], float2(corr), kv_reg[u] * p_w);
+        }
+        m_val = new_m;
+    }
+
+    // Pass 3: Optional speculative tree ancestors (`u64` ancestor bitmask).
+    if (p.has_tree != 0u) {
+        const ulong mask = ancestor_masks[node];
+        for (uint j = 0u; j < p.num_nodes; j++) {
+            if (((mask >> j) & 1ul) == 0ul) {
+                continue;
+            }
+            const device half *t_lat = kv_tree_latent + ulong(j) * p.kv_lora_rank;
+            float2 kv_reg[4];
+            float dot_partial = 0.0f;
+            for (uint u = 0u; u < num_iters; u++) {
+                const uint b_idx = tid + u * 256u;
+                if (b_idx < num_bytes) {
+                    const uint ch = b_idx * 2u;
+                    const float2 kv = float2(float(t_lat[ch]), float(t_lat[ch + 1u]));
+                    kv_reg[u] = kv;
+                    dot_partial += dot(q_nope_reg[u], kv);
+                } else {
+                    kv_reg[u] = float2(0.0f);
+                }
+            }
+            if (tid < p.qk_rope_dim) {
+                const device half *t_rope = kv_tree_rope + ulong(j) * p.qk_rope_dim;
+                dot_partial += q_pe_reg * float(t_rope[tid]);
+            }
+            const float sg_sum = simd_sum(dot_partial);
+            if (lane == 0u) {
+                tg_reduce[sg_id] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float total_dot = ((tg_reduce[0] + tg_reduce[1]) + (tg_reduce[2] + tg_reduce[3])) +
+                ((tg_reduce[4] + tg_reduce[5]) + (tg_reduce[6] + tg_reduce[7]));
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float score = total_dot * scale_log2e;
+            const float new_m = max(m_val, score);
+            const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
+            const float p_w = exp2(score - new_m);
+            l_val = fma(l_val, corr, p_w);
+            for (uint u = 0u; u < num_iters; u++) {
+                acc_reg[u] = fma(acc_reg[u], float2(corr), kv_reg[u] * p_w);
+            }
+            m_val = new_m;
+        }
+    }
+
+    const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+    for (uint u = 0u; u < num_iters; u++) {
+        const uint b_idx = tid + u * 256u;
+        if (b_idx < num_bytes) {
+            const ulong ch = q_nope_off + ulong(b_idx) * 2ul;
+            out[ch] = half(acc_reg[u].x * inv_l);
+            out[ch + 1ul] = half(acc_reg[u].y * inv_l);
+        }
+    }
+}
+
+// ===========================================================================
+// Section F: M7 (G10) — Single-Pass Mega-mHC (`mhc_single_pass`)
+// ===========================================================================
+
+struct MhcParams {
+    uint m;
+    uint num_streams; // 2..8 (default 4)
+    uint hidden_size;
+    uint flags;          // bit0=has_norm_w, bit1=norm_w_bf16, bit2=apply_h_res, bit3=activate_coeffs, bit4=shared_coeffs
+    uint sinkhorn_iters; // 0 = direct H_res, >0 = exp + Sinkhorn-Knopp Birkhoff projection
+    float rms_eps;
+    float post_scale;
+    uint _pad0;
+};
+
+static_assert(sizeof(MhcParams) == 32, "MhcParams must be 32 bytes");
+
+static inline void mhc_load_h_res(const device float *h_res_ptr,
+                                  uint n,
+                                  uint sinkhorn_iters,
+                                  threadgroup float *tg_hres) {
+    float max_v = -INFINITY;
+    for (uint o = 0u; o < n; o++) {
+        for (uint i = 0u; i < n; i++) {
+            const float v = h_res_ptr[o * n + i];
+            tg_hres[o * 8u + i] = v;
+            max_v = max(max_v, v);
+        }
+    }
+    if (sinkhorn_iters == 0u) {
+        return;
+    }
+    for (uint o = 0u; o < n; o++) {
+        for (uint i = 0u; i < n; i++) {
+            tg_hres[o * 8u + i] = exp(tg_hres[o * 8u + i] - max_v);
+        }
+    }
+    for (uint it = 0u; it < sinkhorn_iters; it++) {
+        for (uint o = 0u; o < n; o++) {
+            float rsum = 0.0f;
+            for (uint i = 0u; i < n; i++) {
+                rsum += tg_hres[o * 8u + i];
+            }
+            const float inv_r = 1.0f / max(rsum, 1e-12f);
+            for (uint i = 0u; i < n; i++) {
+                tg_hres[o * 8u + i] *= inv_r;
+            }
+        }
+        for (uint i = 0u; i < n; i++) {
+            float csum = 0.0f;
+            for (uint o = 0u; o < n; o++) {
+                csum += tg_hres[o * 8u + i];
+            }
+            const float inv_c = 1.0f / max(csum, 1e-12f);
+            for (uint o = 0u; o < n; o++) {
+                tg_hres[o * 8u + i] *= inv_c;
+            }
+        }
+    }
+}
+
+// Single-Pass Mega-mHC pre-sublayer kernel:
+// Fuses multi-stream mixing across `num_streams` (`2..8`) hyper-streams
+// (`streams [M, num_streams, hidden_size]`), optional RMSNorm (`norm_w`), and
+// optional in-place Birkhoff-projected `H_res` stream mixing with 0 extra
+// global intermediate buffers.
+//
+// Grid: (M, 1, 1) threadgroups, 256 threads (8 simdgroups).
+kernel void ami_mhc_single_pass(device uchar *streams [[buffer(0)]],
+                                const device float *h_pre [[buffer(1)]],
+                                const device float *h_res [[buffer(2)]],
+                                const device uchar *norm_w [[buffer(3)]],
+                                device uchar *branch_out [[buffer(4)]],
+                                constant MhcParams &p [[buffer(5)]],
+                                uint tg_x [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]],
+                                uint sg_id [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.m) {
+        return;
+    }
+
+    const uint n = p.num_streams;
+    const bool has_norm_w = ((p.flags & 1u) != 0u);
+    const bool norm_w_bf16 = ((p.flags & 2u) != 0u);
+    const bool apply_h_res = ((p.flags & 4u) != 0u);
+    const bool activate_coeffs = ((p.flags & 8u) != 0u);
+    const bool shared_coeffs = ((p.flags & 16u) != 0u);
+    const uint coeff_tok = shared_coeffs ? 0u : tok;
+
+    threadgroup float tg_hpre[8];
+    threadgroup float tg_hres[64];
+    threadgroup float tg_reduce[8];
+
+    if (tid == 0u) {
+        const device float *hp_row = h_pre + ulong(coeff_tok) * n;
+        for (uint i = 0u; i < n; i++) {
+            const float raw = hp_row[i];
+            tg_hpre[i] = activate_coeffs ? hybrid_sigmoid(raw) : raw;
+        }
+        if (apply_h_res) {
+            const device float *hr_row = h_res + ulong(coeff_tok) * n * n;
+            mhc_load_h_res(hr_row, n, p.sinkhorn_iters, tg_hres);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong tok_stream_base = ulong(tok) * n * p.hidden_size;
+    const ulong tok_out_base = ulong(tok) * p.hidden_size;
+
+    float inv_rms = 1.0f;
+    if (has_norm_w) {
+        float sq_partial = 0.0f;
+        for (uint d = tid; d < p.hidden_size; d += 256u) {
+            float mix = 0.0f;
+            for (uint i = 0u; i < n; i++) {
+                const float s_val = hybrid_load_f16_or_bf16(
+                    streams, tok_stream_base + ulong(i) * p.hidden_size + d, GR_STREAM_BF16);
+                mix = fma(tg_hpre[i], s_val, mix);
+            }
+            sq_partial = fma(mix, mix, sq_partial);
+        }
+        const float sg_sq = simd_sum(sq_partial);
+        if (lane == 0u) {
+            tg_reduce[sg_id] = sg_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float total_sq = ((tg_reduce[0] + tg_reduce[1]) + (tg_reduce[2] + tg_reduce[3])) +
+            ((tg_reduce[4] + tg_reduce[5]) + (tg_reduce[6] + tg_reduce[7]));
+        inv_rms = rsqrt(total_sq / float(p.hidden_size) + p.rms_eps);
+    }
+
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        float s_reg[8];
+        float mix = 0.0f;
+        for (uint i = 0u; i < n; i++) {
+            const float s_val = hybrid_load_f16_or_bf16(
+                streams, tok_stream_base + ulong(i) * p.hidden_size + d, GR_STREAM_BF16);
+            s_reg[i] = s_val;
+            mix = fma(tg_hpre[i], s_val, mix);
+        }
+        if (has_norm_w) {
+            const float nw = hybrid_load_norm_w(norm_w, d, norm_w_bf16);
+            mix = (mix * inv_rms) * nw;
+        }
+        hybrid_store_f16_or_bf16(branch_out, tok_out_base + d, mix, GR_ACT_BF16);
+
+        if (apply_h_res) {
+            for (uint o = 0u; o < n; o++) {
+                float acc = 0.0f;
+                for (uint i = 0u; i < n; i++) {
+                    acc = fma(tg_hres[o * 8u + i], s_reg[i], acc);
+                }
+                hybrid_store_f16_or_bf16(
+                    streams, tok_stream_base + ulong(o) * p.hidden_size + d, acc, GR_STREAM_BF16);
+            }
+        }
+    }
+}
+
+// Single-Pass Mega-mHC post-sublayer fused residual update:
+// Updates `streams [M, num_streams, hidden_size]` in-place:
+//   `streams[m, o, d] = (apply_h_res ? sum_i H_res[m, o, i] * streams[m, i, d] : streams[m, o, d])`
+//                     `+ H_post[m, o] * sublayer_out[m, d]`
+// with optional in-kernel Sinkhorn-Knopp doubly-stochastic projection and 0
+// extra global intermediate buffers.
+//
+// Grid: (M, 1, 1) threadgroups, 256 threads.
+kernel void ami_mhc_post_mix(device uchar *streams [[buffer(0)]],
+                             const device uchar *sublayer_out [[buffer(1)]],
+                             const device float *h_post [[buffer(2)]],
+                             const device float *h_res [[buffer(3)]],
+                             constant MhcParams &p [[buffer(4)]],
+                             uint tg_x [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    const uint tok = tg_x;
+    if (tok >= p.m) {
+        return;
+    }
+
+    const uint n = p.num_streams;
+    const bool apply_h_res = ((p.flags & 4u) != 0u);
+    const bool activate_coeffs = ((p.flags & 8u) != 0u);
+    const bool shared_coeffs = ((p.flags & 16u) != 0u);
+    const uint coeff_tok = shared_coeffs ? 0u : tok;
+
+    threadgroup float tg_hpost[8];
+    threadgroup float tg_hres[64];
+
+    if (tid == 0u) {
+        const device float *hp_row = h_post + ulong(coeff_tok) * n;
+        for (uint i = 0u; i < n; i++) {
+            const float raw = hp_row[i];
+            tg_hpost[i] = activate_coeffs ? (p.post_scale * hybrid_sigmoid(raw)) : (p.post_scale * raw);
+        }
+        if (apply_h_res) {
+            const device float *hr_row = h_res + ulong(coeff_tok) * n * n;
+            mhc_load_h_res(hr_row, n, p.sinkhorn_iters, tg_hres);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong tok_stream_base = ulong(tok) * n * p.hidden_size;
+    const ulong tok_in_base = ulong(tok) * p.hidden_size;
+
+    for (uint d = tid; d < p.hidden_size; d += 256u) {
+        const float y_val = hybrid_load_f16_or_bf16(sublayer_out, tok_in_base + d, GR_ACT_BF16);
+        float s_reg[8];
+        for (uint i = 0u; i < n; i++) {
+            s_reg[i] = hybrid_load_f16_or_bf16(
+                streams, tok_stream_base + ulong(i) * p.hidden_size + d, GR_STREAM_BF16);
+        }
+        for (uint o = 0u; o < n; o++) {
+            float base_val;
+            if (apply_h_res) {
+                base_val = 0.0f;
+                for (uint i = 0u; i < n; i++) {
+                    base_val = fma(tg_hres[o * 8u + i], s_reg[i], base_val);
+                }
+            } else {
+                base_val = s_reg[o];
+            }
+            const float out_val = fma(tg_hpost[o], y_val, base_val);
+            hybrid_store_f16_or_bf16(
+                streams, tok_stream_base + ulong(o) * p.hidden_size + d, out_val, GR_STREAM_BF16);
         }
     }
 }
