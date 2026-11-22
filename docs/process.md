@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M6 — frontier hybrid sparse models (`Qwen3.8-Flash-Next`), composable recurrent depth (`LoopSchedule` / `SelfSpecRecurrent`), and large-MoE GSQ+RCO + off-GPU SME2 draft heads completed (2026-11-22); next: **M6.5 — continuous batching, long-context KV tiering, and zero-copy multimodal ingress** (`R5`, `R8`, `G14`, `C14`).
+M6.5 — continuous batching, long-context KV tiering, shared prefix caching, and zero-copy multimodal ingress (`R5`, `R8`, `G14`, `C14`) completed (2026-11-22); next: **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X2`)**.
 
 ## Milestones
 
@@ -24,7 +24,7 @@ Status-row IDs refer to [status.md](status.md).
 | M4.5 | Bare-metal ARMv9 SME2 pre-packed & `ZT0`-LUT engine | W15, D11, C11–C13 | Pre-`smstart` `d8–d15` canary & `fp32` parity tests pass; `sme2_panel64` single-owner layout preserves `.amf` v0 binary compatibility; Spike `S7` benchmarks 3-way `.s` kernels vs `Accelerate`/`BNNS`, P-cluster thread saturation, and GPU co-execution (`> 1.05×` gate, `0` swap); Secure Enclave TRNG `D11` seeding verified | Completed |
 | M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Completed |
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`), recurrent depth & heterogeneous MoE scaling | R6, W9, W10, W16, W17, G7–G9, G10 (GR), D12, D13, C10 (PLE) | Composable operator graph + `LoopSchedule` (`GDN S_tmp` isolation, `SelfSpecRecurrent`, L2 SME2 `Step-LoRA`); synthetic + scale-calibrated `qwen4_exp` (GDN + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end without swap; `Qwen3-30B-A3B` & 512-expert GSQ+RCO + `ZT0` non-uniform LUTs and `Placement.cpu_sme2` draft heads benchmarked | Completed |
-| M6.5 | Continuous batching, long-context KV tiering & zero-copy multimodal ingress | R5, R8, G14, C14 | Server iteration-level continuous batching (`M > 1` slots per GPU/SME2 pass), shared prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang` packs, and `VideoToolbox → IOSurface → MTLTexture` zero-copy vision/video ingress verified without swap | Planned |
+| M6.5 | Continuous batching, long-context KV tiering & zero-copy multimodal ingress | R5, R8, G14, C14 | Server iteration-level continuous batching (`M > 1` slots per GPU/SME2 pass), shared prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang` packs, and `VideoToolbox → IOSurface → MTLTexture` zero-copy vision/video ingress verified without swap | Completed |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
 ## Spikes
@@ -454,6 +454,39 @@ Key M6 measurements on Apple M4 24 GiB (commits `1c75816..f6b4705`, ReleaseFast,
   - `qwen3-30b-a3b-gsq-rco.amf` (`2.700b`, `9.599 GiB` wired; `bf16 = 193`, `q3_affine = 3,140`, `q2_affine = 15,534`, `0` `q4_affine`, `0` cold NVMe experts): reduces wired footprint by `-22.9%` (`-2,912 MiB` at `seq = 512`: `9,927` vs `12,839 MiB`) and traffic by `-13.8%` (`1,190.7` vs `1,381.6 MB/tok`), runs `49.59 tok/s` at `seq = 512` (`-4.4%` vs uniform 1-bucket `3-bit` `51.86 tok/s` due to scheme-bucketed `{q2, q3}` MoE dispatch with `ami_moe_route_topk_bucketed` and 2 active buckets) and `48.93-53.06 tok/s` on coherent bilingual EN/ZH decode, and matches `qwen3-30b-a3b-eagle3.amf` `spec-decode` `38/38` bit-exact (`10,968 MiB` wired, `tau = 1.682`, `38.66 tok/s`).
   - `qwen3-0.6b-lut16-sme2.amf` (`0x0101`, `196` `LUT16` tensors, `336.9 MiB`): CPU SME2 decode runs `26.01-26.09 tok/s` (`0` malloc delta, `0` swapouts) vs `26.38-26.62 tok/s` affine `gsq-rco-sme2` (with candid row-variance MSE trade-off `1.325x` on `0.6B` vs `-44%..-62.5%` on bimodal weights), and as an off-GPU `D8` PEARL draft for `Qwen3-14B-4bit` (`8,545 MiB` wired) improves throughput from `11.89 tok/s` (`--pearl off`) to `14.12 tok/s` (`--pearl on`, `tau = 3.917`, `48/48` bit-exact, `1.32x` vs `14B` serial `10.67 tok/s`).
 
+## M6.5 task list
+
+- [x] `G14` zero-copy `VideoToolbox` / `ImageIO` `CVPixelBuffer` → `16 KiB` `IOSurface` → `MTLTexture` (`BGRA8`, bi-planar `NV12`) bridge (`src/bridge/{apple_bridge.h,apple_bridge.m,metal.zig}`), Metal 4 patchify + `2x2` spatial-temporal merge + linear embed kernels (`src/kernels/vision_ingress.metal`), `VisionIngress` wired workspace, and 3D MRoPE builder (`src/gpu/vision.zig`) (`9f1efa7`, `c004372`)
+- [x] `C14` iteration-level `BatchScheduler` (`src/runtime/batch_scheduler.zig`), `Server.startBatched` / `runBatchedWorkerLoop` (`src/server/http_sse.zig`), and hot-swappable `DomainNgramRegistry` (`src/spec/ngram_nvme.zig`) with `GET /v1/ngram-packs`, `POST /v1/ngram-packs/select`, and per-request `"ngram_domain"` routing (`1364da5`, `c004372`)
+- [x] `R5` 32K+ GPU group-64 `q8` retired KV tier (`RetiredKvQ8Pool`, `ami_kv_retire_tile_to_q8`, `ami_gqa_tiered_decode_attn_split`, `ami_gqa_tiered_tree_verify_attn_split`, QSA tiered `q8` blocks), `R8` wired `PrefixCache` + GPU CoW tail (`ami_kv_tile_cow_copy`) + `GdnSnapshotPool` (`ami_gdn_clone_state`), and `C14` batched slot decode kernels (`ami_batch_qknorm_rope_kv_write`, `ami_batch_gqa_decode_attn_split`, `ami_gdn_batch_decode`) (`bb6dfcf`, `c004372`)
+- [x] Real-model continuous batching, `PrefixCache`, `R5` tiered `q8` KV retirement, and `G14` multimodal ingress in `Qwen3Model`/`Qwen3BatchRuntime` (`src/model/qwen3.zig`, `abb552c`) and `GraphModel`/`GraphBatchRuntime` (`src/model/graph.zig`, `f0640ae`)
+- [x] `aminfer bench-m65` (`src/bench/runner.zig`, `6a5869a`, `8332ee8`), `SpecEngine` `DomainNgramRegistry` routing (`src/spec/engine.zig`), and CLI/server integration (`--batch-mode`, `--prefix-cache-chunks`, `--kv-retire-q8-after-chunks`, repeatable `--ngram-pack`, `--image`, `--vt-test-video` in `src/main.zig`, `60dc7ec`, `37ecb74`)
+- [x] Offline second domain `.ang` corpus pack (`/Volumes/Akari/models/amf/aminfer-docs.ang`, `32.02 MiB`, `198,113` entries) and ReleaseFast hardware verification (`bench-m65`, live `aminfer serve` serial vs continuous on `Qwen3-0.6B` BF16 and GSQ+RCO, `R8` prefix cache, multi-pack `.ang` HTTP endpoints, real `R5` >1,024-tok decode, and `G14` `qwen4_exp` HW HEVC multimodal decode) archived in [benchmarks/results.md](benchmarks/results.md#m65-continuous-batching-long-context-kv-tiering-shared-prefix-cache-and-zero-copy-multimodal-ingress)
+
+## M6.5 continuous batching, long-context KV tiering and multimodal ingress results
+
+Canonical tables, trade-off analysis, and unedited multi-line verbatim CLI/server
+outputs live in
+[benchmarks/results.md](benchmarks/results.md#m65-continuous-batching-long-context-kv-tiering-shared-prefix-cache-and-zero-copy-multimodal-ingress).
+Key M6.5 measurements on Apple M4 24 GiB (commits `9f1efa7..37ecb74`, ReleaseFast,
+`18,186 MiB` wired budget, `swapouts_delta = 0` across all runs):
+
+- **`G14` hardware `VideoToolbox` → zero-copy `IOSurface` → Metal 4 vision + 3D MRoPE**:
+  - `bench-m65` (`448x448`, `256` merged visual tokens, `hw_vt = yes`, `zero_copy = yes`, `page16k = yes`): `112.8–140.7 fps` end-to-end (`546.7–1,001.9 us` HW decode + `6,542.6–8,315.5 us` GPU patchify/merge/embed/MRoPE across H.264/HEVC `NV12`/`BGRA8`).
+  - End-to-end `qwen4_exp` (`tiny-qwen4`, `--vt-test-video hevc`): 2 `128x128` NV12 frames (`32` merged visual tokens, `grid = 2x4x4`, `vision_next_mrope_pos = 25`, `vision_encode_us = 2,400.38 us`), decoding at `865.82 tok/s` (`0` swapouts).
+- **`R5` 32K+ retired group-64 `q8` KV tier**:
+  - `bench-m65` (`32,768` tokens, `Qwen3-30B-A3B` 1-layer geometry, `60` retired `q8` + `4` active `fp16` tiles): reduces wired KV from `64.00` to `35.88 MiB/layer` (`-28.13 MiB`, `-43.95%`), retires at `20.09 us/chunk`, runs decode attention in `914.63 us` vs `934.51 us` pure `fp16` (`max_abs_err = 0.000006`, `41.13` vs `71.81 GB/s`), and `M = 16` tree verify in `10,514.65 us` vs `11,461.56 us`.
+  - Real `Qwen3-0.6B` BF16 at `1,358` prompt tokens (`--kv-retire-q8-after-chunks 1`): lowers total wired RAM from `1,307` to `1,255 MiB` (`active=56.00`, `retired_q8=59.50` vs `168.00 MiB` pure fp16), increases decode throughput from `62.74` to `65.12 tok/s` (`0` malloc delta, `0` swapouts), and matches `25/25` greedy `token_ids` bit-for-bit.
+- **`R8` shared `PrefixCache`, GPU CoW partial tail, and `GDN` snapshot clone**:
+  - `bench-m65`: `1,024`-tok exact prefix hit (`cow = 0`) speeds prefill `26.38x` (`25.507 -> 0.967 ms`); `1,200`-tok partial prefix hit (`cow = 1`, `cow_tail_176tok = 121.79 us`, `bit_exact = yes`) speeds prefill `32.61x` (`41.835 -> 1.283 ms`); 36-layer `73.69 MiB` `GDN` snapshot clone runs in `1,761.19 us` (`87.74 GB/s`, `bit_exact = yes`).
+  - Live `aminfer serve` (`qwen3-0.6b-gsq-rco.amf`, `~728`-tok shared system prompt): warm 4-client concurrent TTFT p50 drops from `566.75 ms` (cold miss) to `63.93 ms` (`8.87x` lower TTFT, `2,849` prefix hit tokens across `4` clients, `297.49 agg tok/s`, `0` swapouts).
+- **`C14` continuous batching & `DomainNgramRegistry` multi-pack `.ang` routing**:
+  - `bench-m65` scaling (`B = 1 -> 8`): `7.22x` on GQA+MoE `q4` (`1,096.56 -> 7,916.91 agg tok/s`) and `6.77x` on hybrid `GDN + QSA + MoE q4` (`1,347.31 -> 9,123.50 agg tok/s`).
+  - Live `aminfer serve` (`C = 1 / 4 / 8` concurrent SSE clients, `D11` explicit `seed = 12345` at `T = 0.7` and `T = 0` greedy bit-exact across serial and continuous, `0` swapouts):
+    - `Qwen3-0.6B` BF16 (`24` tok/req): `C = 8` aggregate throughput increases `7.60x` (`40.07 -> 304.35 tok/s`) and TTFT p50/p99 drops from `2,632.84 / 4,460.87 ms` to `131.30 / 196.59 ms` (`20.1x–22.7x` lower), while per-slot TPOT rises from `14.36` to `22.64 ms`.
+    - `Qwen3-0.6B` GSQ+RCO (`32` tok/req): `C = 8` aggregate throughput increases `3.94x` (`131.68 -> 518.75 tok/s`) and TTFT p50/p99 drops from `1,035.62 / 1,786.04 ms` to `83.01 / 130.08 ms` (`12.5x–13.7x` lower), while per-slot TPOT rises from `4.95` to `13.72 ms`.
+  - `DomainNgramRegistry` with real `aminfer-repo.ang` (`879,949` entries) and `aminfer-docs.ang` (`198,113` entries): `528 KiB` wired cache, cold `F_NOCACHE` lookup `1.08 us` p50 / `1.79 us` p99, cache hit `0.04 us`, `selectDefaultDomain` `3.6 ns`, atomic `swapDomainPack` `12.46 us`, `steady_malloc_blocks = 0`; live `GET /v1/ngram-packs`, `POST /v1/ngram-packs/select`, and per-request `"ngram_domain"` (`200` / `400`) verified.
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -496,6 +529,8 @@ Only checks that actually ran are listed.
 | 2026-11-22 | M6 Phase 1 (`1c75816`, `be75050`, `5baa49e`): `C10` sharded `F_NOCACHE` NVMe PLE store & `LoopPleScratch`, `W16` L2 SME2 `SmeStepLoraAdapter`, `W17` `0x0101` `LUT16` dispatch, `D13` `SmeDraftProjection`; Metal 4 `G8` GDN, `G9` QSA (`[11,11,10]` MRoPE + YaRN + `512`/`128` `HybridKvRing`), `G10` 4-branch GR, and `G7` 512-expert `top-10 + shared_expert` MoE kernels; Python `qwen4_exp` / `synth-qwen4` / `synth-loop` / large-MoE GSQ+RCO & `LUT16` packers (`tools` unittest: 72/72; built `qwen3-30b-a3b-gsq-rco.amf` `9.599 GiB` & `qwen3-0.6b-lut16-sme2.amf` `336.9 MiB`) | Pass |
 | 2026-11-22 | M6 Phase 2 & final gate (`c93a5fa`, `7651cad`, `1af0f8d`, `8a4bc68`): `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 267/267 tests = 262 lib + 5 CLI), direct Debug lib + CLI test binaries under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (267/267 = 262 lib + 5 CLI, API + GPU Validation enabled, 0 errors), `tools` unittest (72/72), Python `synth-qwen4`/`synth-loop` -> Zig `verify-amf`/`decode`/`spec-decode`/`bench-decode` end-to-end parity (100% bit-exact), ReleaseFast `aminfer bench-m6` (`G8` `30.1 us` / `140.30 GB/s`, `G9` `1.55x`/`3.04x` reuse, `G10` `67.44 GB/s`, `G7` `6.67x` CSR dedup, `C10` `0` `r>=1` NVMe reads, `scale-qwen4-512e+MTP` bit-exact, `D12` `R=1..4` bit-exact / `M=4` raw break-even, `D13` `11/12` L2 wins up to `10.81x`, `0` swapouts), and real `W17` hardware verification (`qwen3-30b-a3b-gsq-rco.amf` `9,927 MiB` / `49.59 tok/s` `seq=512` / `38/38` `EAGLE-3` bit-exact; `qwen3-0.6b-lut16-sme2.amf` `26.01-26.09 tok/s` SME2 & `D8` `14B` `14.12 tok/s` PEARL `48/48` bit-exact, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m6-frontier-hybrid-sparse-models-recurrent-depth-large-moe-gsqrco-and-off-gpu-sme2-draft-heads) | Pass |
 | 2026-11-22 | M6 audit remediation (`750b56c`, `f6b4705`): `r = 0` cross-token GDN state sharing (`ami_gdn_conv1d_q_silu` + `encodeGdnConv1dQSilu`), `ami_gdn_decode` `out_norm` `half`-staging alignment, per-token `r0_selected` cold-expert `r >= 1` masking, unaligned synthetic draft builder write fix, and 4-layer `qwen4_exp` (`R = 3`, `core = [0, 4)`) chunk-invariance + 16-token `self-recurrent` regression test; `zig fmt --check build.zig src`, zero `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug/ReleaseSafe/ReleaseFast: 268/268 = 263 lib + 5 CLI), direct Debug lib + CLI under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (268/268, 0 validation errors), ReleaseFast CLI bit-exact parity on both `synth-loop --preset tiny-steplora --base-arch qwen4_exp --max-loops 3` (`8/8`) and `synth-qwen4 --preset tiny-qwen4 --num-layers 4 --cold-experts-per-layer 2 --max-loops 3` (`24/24` across `decode`, `self-recurrent`, and `mtp`), and ReleaseFast `aminfer bench-m6` re-check (`0` swapouts) | Pass |
+| 2026-11-22 | M6.5 Phase 1 (`9f1efa7`, `1364da5`, `bb6dfcf`, `c004372`): `G14` `VideoToolbox`/`ImageIO` zero-copy `IOSurface` bridge & `vision_ingress.metal` (`src/gpu/vision.zig`), `C14` `BatchScheduler` + `Server.startBatched` + hot-swappable `DomainNgramRegistry` (`/v1/ngram-packs*`), `R5` `RetiredKvQ8Pool` + tiered `q8` GQA/QSA kernels, `R8` wired `PrefixCache` + GPU CoW + `GdnSnapshotPool`, and `C14` batched slot decode kernels | Pass |
+| 2026-11-22 | M6.5 Phase 2 & final gate (`abb552c`, `f0640ae`, `6a5869a`, `60dc7ec`, `8332ee8`, `37ecb74`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug, ReleaseSafe x2 uncached, ReleaseFast: `300/300` = `294` lib + `6` CLI) plus `test-vision` & `test-hybrid`, direct Debug lib + CLI + `test-vision` + `test-hybrid` under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`300/300` + `2`, API + GPU Validation enabled, `0` errors), `tools` unittest (`72/72`), built `aminfer-docs.ang` (`32.02 MiB`, `198,113` entries), ReleaseFast `aminfer bench-m65`, live `aminfer serve` serial vs continuous (`C = 1/4/8`, `Qwen3-0.6B` BF16 `7.60x` & GSQ+RCO `3.94x`, `D11` bit-exact), live `R8` `PrefixCache` (`8.87x` TTFT p50), live multi-pack `.ang` HTTP API, real `Qwen3-0.6B` BF16 `R5` >1,024-tok decode (`25/25` bit-exact, `-52 MiB`, `+3.8%` tok/s), and `G14` `qwen4_exp` HW HEVC multimodal decode (`0` swapouts across all runs) archived in [benchmarks/results.md](benchmarks/results.md#m65-continuous-batching-long-context-kv-tiering-shared-prefix-cache-and-zero-copy-multimodal-ingress) | Pass |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -630,11 +665,21 @@ Update this before the context window runs out or when handing off.
     archive & docs, `750b56c` `r = 0` GDN/cold-expert loop sharing, `ami_gdn_decode`
     `out_norm` alignment & 4-layer `qwen4_exp` `R = 3` regression test, `f6b4705`
     unaligned synthetic draft builder write fix
-- Current test & build baseline (`M0`–`M6` complete, `0` `catch {}`):
-  - Zig suite: `268/268` passing (`263` lib + `5` CLI) in `Debug`,
-    `ReleaseSafe`, and `ReleaseFast`, plus `268/268` under
+  - M6.5: `9f1efa7` `G14` zero-copy `VideoToolbox`/`IOSurface` vision ingress &
+    3D MRoPE, `1364da5` `C14` continuous batching `BatchScheduler`/`Server` &
+    hot-swappable `DomainNgramRegistry`, `bb6dfcf` `R5` 32K `q8` retired KV tier,
+    `R8` CoW `PrefixCache`/`GdnSnapshotPool` & batched slot kernels, `c004372`
+    root/build module exports, `abb552c` `Qwen3Model` `R5`/`R8`/`C14` runtime,
+    `f0640ae` `GraphModel` `R5`/`G14`/`C14`/`R8` runtime, `6a5869a` `bench-m65`
+    suite, `60dc7ec` CLI/server M6.5 integration & `SpecEngine` domain ngram
+    routing, `8332ee8` `bench-m65` GPU signal wait fix, `37ecb74` non-positive
+    steady-state malloc check tolerance for async driver frees
+- Current test & build baseline (`M0`–`M6.5` complete, `0` `catch {}`):
+  - Zig suite: `300/300` passing (`294` lib + `6` CLI) in `Debug`,
+    `ReleaseSafe` (2x uncached), and `ReleaseFast`, plus `test-vision` &
+    `test-hybrid`, and `300/300` (+ `test-vision`/`test-hybrid`) under
     `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`0` validation errors)
-  - Offline Python `tools/` suite: `72/72` passing (`uv run python -m unittest`)
+  - Offline Python `tools/` suite: `72/72` passing (`cd tools && uv run python -m unittest discover -s tests`)
 - On-disk checkpoints & artifacts (strict rule: keep all `.amf`/`.ang`/`.mlpackage`
   and `TMPDIR` work on `/Volumes/Akari/models/` and `/Volumes/Akari/.tmp/`, never
   on `/` or `/tmp`):
@@ -646,19 +691,19 @@ Update this before the context window runs out or when handing off.
     `LUT16` tensors), `qwen3-14b-4bit.amf` (`7.74 GiB`),
     `qwen3-30b-a3b-3bit.amf` (`12.45 GiB`), `qwen3-30b-a3b-gsq-rco.amf`
     (`9.599 GiB` wired, `2.700b` heat-guided GSQ+RCO),
-    `qwen3-30b-a3b-eagle3.amf` (`996 MiB`), `qwen3-30b-a3b-heat.json`, and
-    `aminfer-repo.ang` (`128 MiB`, `879,949` repo N-grams)
+    `qwen3-30b-a3b-eagle3.amf` (`996 MiB`), `qwen3-30b-a3b-heat.json`,
+    `aminfer-repo.ang` (`128.02 MiB`, `879,949` repo N-grams), and
+    `aminfer-docs.ang` (`32.02 MiB`, `198,113` docs N-grams, `table_crc32=0xc1f2f6ed`)
   - Exported ANE `.mlpackage` bundles: `/Volumes/Akari/models/coreml/`
 - Session & `/swarm` operating conventions:
   - Swarm models restricted per user instruction to `gemini-4-carbon-*` and
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: none (`M0`–`M6` completed; next milestone is **M6.5** covering
-  `R5`, `R8`, `G14`, and `C14` — iteration-level continuous batching, shared
-  prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang`
-  packs, and zero-copy `VideoToolbox → IOSurface → MTLTexture` multimodal
-  ingress per [ADR-0019](decisions/0019-recurrent-depth-and-post-m5-accelerators.md))
+- In flight: none (`M0`–`M6.5` completed; next milestone is **M7** covering
+  Ultra and cluster scale-out: `DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10`
+  mHC, `G11`, `D10`, `C10` Engram, and `X1`–`X2` per
+  [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md))
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [architecture/model-roadmap.md](architecture/model-roadmap.md),

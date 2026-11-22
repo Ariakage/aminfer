@@ -4536,3 +4536,476 @@ def binary_search(arr, target):
     left, right = 0, len(arr) - 1
     while left <=
 ```
+
+---
+
+## M6.5 continuous batching, long-context KV tiering, shared prefix cache, and zero-copy multimodal ingress
+
+Captured on 2026-11-22 on Apple M4 24 GiB (macOS 27.2, `ReleaseFast`, commits `9f1efa7..37ecb74`, `18,186 MiB` wired budget, `swapouts_delta = 0` across all runs). Capabilities verified: `R5`, `R8`, `G14`, and `C14` ([ADR-0004](../decisions/0004-kv-cache-iosurface-texture-sharing.md), [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
+
+### Summary tables
+
+#### 1. `G14` hardware VideoToolbox to zero-copy IOSurface and Metal 4 vision ingress (`448x448`, `256` merged tokens)
+
+| Path | HW VT | Zero-copy | 16 KiB aligned | VT decode (`us`) | GPU vision + MRoPE (`us`) | Total (`us`) | Throughput (`fps`) | GPU traffic (`GB/s`) |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `vt_h264_nv12` | yes | yes | yes | 547.1 | 8,315.5 | 8,862.6 | 112.8 | 0.68 |
+| `vt_hevc_nv12` | yes | yes | yes | 628.0 | 6,824.3 | 7,452.2 | 134.2 | 0.83 |
+| `vt_h264_bgra8` | yes | yes | yes | 1,001.9 | 6,542.6 | 7,544.5 | 132.5 | 0.94 |
+| `vt_hevc_bgra8` | yes | yes | yes | 546.7 | 6,560.7 | 7,107.4 | 140.7 | 0.94 |
+
+End-to-end `qwen4_exp` (`synth-qwen4 --preset tiny-qwen4`) with `--vt-test-video hevc` decodes 2 `128x128` NV12 frames via hardware VideoToolbox (`zero_copy = yes`, `page16k = yes`), produces `32` merged visual tokens (`grid = 2x4x4`, `vision_encode_us = 2,400.38 us`), advances interleaved 3D MRoPE to `vision_next_mrope_pos = 25` (`21` prefix text tokens + `max(2, 4, 4)`), and decodes at `865.82 tok/s` (`swapouts_delta = 0`). The patch embedding linear projection (`2352 -> 1024`) over `256` tokens is compute-bound on the M4 GPU, which accounts for the sub-1 GB/s reported weight/activation memory traffic metric.
+
+#### 2. `R5` 32,768-token retired group-64 `q8` KV tier (`Qwen3-30B-A3B` geometry, 1 layer) and real `Qwen3-0.6B` BF16 decode
+
+| Benchmark | Pure `fp16` IOSurface | Tiered `q8` retired + active `fp16` | Delta / Notes |
+| --- | --- | --- | --- |
+| 32K 1-layer wired KV (`q=32, kv=4, d=128`) | `64.00 MiB` (`64` tiles) | `35.88 MiB` (`4.00` active + `31.88` retired `q8`) | `-28.13 MiB/layer` (`-43.95%`), retire `20.09 us/chunk` |
+| 32K decode attention | `934.51 us` (`71.81 GB/s`) | `914.63 us` (`41.13 GB/s`) | `-2.1%` latency, `max_abs_err = 0.000006` |
+| 32K `M = 16` tree verify attention | `11,461.56 us` (`5.86 GB/s`) | `10,514.65 us` (`3.58 GB/s`) | `-8.3%` latency, `max_abs_err = 0.000006` |
+| Real `Qwen3-0.6B` BF16 (`1,358` prompt tok, `--kv-retire-q8-after-chunks 1`) | `1,307 MiB` wired, `62.74 tok/s`, `84.75 GB/s`, `0` malloc delta | `1,255 MiB` wired (`active=56.00`, `retired_q8=59.50`), `65.12 tok/s`, `84.38 GB/s`, `0` malloc delta | `-52 MiB` wired (`-31.25%` KV at 3 chunks), `+3.8%` tok/s, `25/25` identical `token_ids` |
+
+Trade-offs: `R5` lowers effective GB/s during attention because group-64 `q8` dequantization adds arithmetic per element and introduces a small numerical error (`max_abs_err = 0.000006`), while cutting per-layer wired KV bytes by `43.95%` at 32K tokens (`46.875%` per retired chunk) and preserving exact greedy output tokens on the 1,358-token `Qwen3-0.6B` test prompt.
+
+#### 3. `R8` shared `PrefixCache`, GPU CoW partial tail, and `GDN` snapshot clone
+
+| Measurement | Uncached baseline | Cached (`PrefixCache`) | Speedup / Savings |
+| --- | --- | --- | --- |
+| `bench-m65` exact `1,024`-tok prefix + `16`-tok suffix | `25.507 ms` | `0.967 ms` (`matched=1024, cow=0`) | `26.38x` faster prefill |
+| `bench-m65` partial `1,200`-tok prefix + `16`-tok suffix | `41.835 ms` | `1.283 ms` (`matched=1200, cow=1`, `bit_exact=yes`) | `32.61x` faster prefill (`cow_tail_176tok = 121.79 us`) |
+| `bench-m65` wired KV saved (`1,024`-tok shared prefix) | — | `4` slots: `12.00 MiB`, `8` slots: `28.00 MiB` (`4L` synth) | `Qwen3-30B-A3B` 48L, `8` slots: `672.0 MiB` saved |
+| `bench-m65` 36-layer `GDN` snapshot clone (`73.69 MiB`) | — | `1,761.19 us` (`87.74 GB/s`, `bit_exact=yes`) | Single GPU dispatch (`ami_gdn_clone_state`) |
+| Live `aminfer serve` (`qwen3-0.6b-gsq-rco.amf`, `~728`-tok prompt, `4` concurrent clients) | Cold 1-client TTFT `566.75 ms` | Warm 4-client TTFT p50 `63.93 ms`, p99 `83.91 ms`, `297.49 agg tok/s` | `8.87x` lower TTFT p50 (`2,849` prefix hit tokens across `4` clients, `0` swapouts) |
+
+Trade-offs: prefix caching reserves additional wired KV tiles for cached entries (raising `qwen3-0.6b-gsq-rco.amf` wired RAM from `2,361 MiB` to `3,257 MiB` with `--prefix-cache-chunks 16`) and incurs a GPU copy-on-write pass (`121.79 us` for 176 tokens across 4 layers) whenever a shared prefix does not end on a 512-token tile boundary.
+
+#### 4. `C14` continuous batching (`B = 1..8`) and `DomainNgramRegistry` multi-pack `.ang` routing
+
+Synthetic `bench-m65` scaling (`B = 1, 2, 4, 8`):
+
+| Backend | `B = 1` agg (`tok/s`) | `B = 2` agg (`tok/s`) | `B = 4` agg (`tok/s`) | `B = 8` agg (`tok/s`) | `B = 8` scaling |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GQA + MoE `q4` (`Qwen3BatchRuntime`) | 1,096.56 | 2,354.53 (`2.15x`) | 5,427.10 (`4.95x`) | 7,916.91 | `7.22x` |
+| Hybrid `GDN + QSA + MoE q4` (`GraphBatchRuntime`) | 1,347.31 | 2,743.87 (`2.04x`) | 4,726.71 (`3.51x`) | 9,123.50 | `6.77x` |
+
+Live `aminfer serve` (`--batch-mode serial` vs `--batch-mode continuous`, `--max-seq-len 2048 --max-active-requests 8`, `swapouts_delta = 0`, `D11` explicit `seed = 12345` at `T = 0.7` and `T = 0` greedy bit-exact across serial and continuous):
+
+| Model | Concurrency | Serial agg (`tok/s`) | Continuous agg (`tok/s`) | Agg speedup | Serial TTFT p50 / p99 (`ms`) | Continuous TTFT p50 / p99 (`ms`) | Serial TPOT p50 (`ms`) | Continuous TPOT p50 (`ms`) | Max batch |
+| --- | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |
+| `Qwen3-0.6B` BF16 (`24` tok/req) | 1 | 38.92 | 50.60 | `1.30x` | 264.15 / 264.15 | 25.22 / 25.22 | 14.53 | 19.50 | 1 |
+| `Qwen3-0.6B` BF16 (`24` tok/req) | 4 | 38.56 | 201.76 | `5.23x` | 1,410.36 / 2,126.75 | 83.18 / 104.62 | 15.75 | 17.94 | 4 |
+| `Qwen3-0.6B` BF16 (`24` tok/req) | 8 | 40.07 | 304.35 | `7.60x` | 2,632.84 / 4,460.87 | 131.30 / 196.59 | 14.36 | 22.64 | 8 |
+| `Qwen3-0.6B` GSQ+RCO (`32` tok/req) | 1 | 132.45 | 181.64 | `1.37x` | 90.80 / 90.80 | 16.64 / 16.64 | 4.72 | 5.14 | 1 |
+| `Qwen3-0.6B` GSQ+RCO (`32` tok/req) | 4 | 139.06 | 426.39 | `3.07x` | 536.90 / 765.71 | 47.33 / 69.60 | 4.64 | 8.45 | 4 |
+| `Qwen3-0.6B` GSQ+RCO (`32` tok/req) | 8 | 131.68 | 518.75 | `3.94x` | 1,035.62 / 1,786.04 | 83.01 / 130.08 | 4.95 | 13.72 | 8 |
+
+Trade-offs:
+- Continuous batching increases per-slot TPOT under load (`14.36 -> 22.64 ms` on BF16 and `4.95 -> 13.72 ms` on GSQ+RCO at `C = 8`) because each decode step computes `M = 8` projections and attention across 8 active KV sequences, and increases preallocated wired KV pool size (`1,363 -> 3,189 MiB` on BF16; `535 -> 2,361 MiB` on GSQ+RCO at `max_seq_len = 2048, max_active_requests = 8`). In exchange, aggregate token throughput rises `3.94x–7.60x` and queue-induced TTFT p50/p99 drops `12.5x–22.7x`.
+- Zig scheduler, HTTP/SSE, and `DomainNgramRegistry` hot paths perform `0` heap allocations (`ngram.steady_malloc_blocks = 0` in `bench-m65`, `0` net blocks in `http_sse.zig` continuous-batching and endpoint tests, and `decode.malloc_blocks_delta = 0` on `Qwen3-0.6B` after 1,358 prefill frames). During short Metal 4 serving bursts (`< ~1,000` GPU commits), macOS 26.0 Metal 4 driver-internal `64 B` tracking slabs grow by `~2` blocks/frame (`206–1,596` blocks in the `16`-request serve sweeps) until the driver pool stabilizes.
+- Multi-pack `DomainNgramRegistry` built with real `/Volumes/Akari/models/amf/aminfer-repo.ang` (`128.02 MiB`, `879,949` entries) and `/Volumes/Akari/models/amf/aminfer-docs.ang` (`32.02 MiB`, `198,113` entries, `table_crc32 = 0xc1f2f6ed`): `540,672 B` (`528 KiB`) wired LRU cache, cold `F_NOCACHE` lookup `p50 = 1.08 us` / `p99 = 1.79 us`, LRU cache hit `0.04 us`, `selectDefaultDomain` `3.6 ns`, live atomic `swapDomainPack` `12.46 us`, `steady_malloc_blocks = 0`. Live `aminfer serve` verified `GET /v1/ngram-packs`, per-request `"ngram_domain"` routing (`repo`, `docs`, and HTTP `400` on unknown `"nonexistent"`), and `POST /v1/ngram-packs/select`.
+
+### Verbatim `aminfer bench-m65` output (`ReleaseFast`)
+
+```text
+=== M6.5 G14 Zero-Copy Hardware VideoToolbox + Metal 4 Vision Ingress ===
+path             res      tokens  hw_vt  zero_copy  page16k  vt_us     gpu_us    total_us  fps      gpu_gbs  malloc_blk
+vt_h264_nv12     448x448  256     yes    yes        yes      547.1     8315.5    8862.6    112.8    0.68     34
+vt_hevc_nv12     448x448  256     yes    yes        yes      628.0     6824.3    7452.2    134.2    0.83     32
+vt_h264_bgra8    448x448  256     yes    yes        yes      1001.9    6542.6    7544.5    132.5    0.94     32
+vt_hevc_bgra8    448x448  256     yes    yes        yes      546.7     6560.7    7107.4    140.7    0.94     3
+
+=== M6.5 R5 32K Retired Group-64 q8 KV Tier (1 Layer) ===
+r5.geometry                      q=32 kv=4 d=128 chunk=512 seq_len=32768 (60 retired q8 + 4 active fp16)
+r5.pure_fp16_mib_per_layer       64.00 (67108864 bytes)
+r5.tiered_q8_mib_per_layer       35.88 (active=4.00 MiB, retired_q8=31.88 MiB, 37617664 bytes)
+r5.wired_saved_per_layer         28.13 MiB (-43.95%)
+r5.retire_per_chunk_us           20.09 (total 60 chunks: 1205.3 us)
+r5.decode_fp16_vs_tiered_us      fp16=934.51 us (71.81 GB/s) vs tiered_q8=914.63 us (41.13 GB/s)
+r5.tree_m16_fp16_vs_tiered_us    fp16=11461.56 us (5.86 GB/s) vs tiered_q8=10514.65 us (3.58 GB/s)
+r5.max_abs_err                   decode=0.000006 tree=0.000006
+
+=== M6.5 R8 Shared PrefixCache + GPU CoW Tail + GDN Snapshot Clone ===
+r8.exact_prefix_1024tok           uncached=25.507 ms vs cached=0.967 ms (26.38x, matched=1024, cow=0)
+r8.partial_prefix_1200tok         uncached=41.835 ms vs cached=1.283 ms (32.61x, matched=1200, cow=1, bit_exact=yes)
+r8.cow_tail_176tok_us             121.79 us
+r8.kv_wired_saved_mib            4_slots=12.00 MiB 8_slots=28.00 MiB (Qwen3-30B-48L 8_slots=672.0 MiB)
+r8.gdn_snapshot_clone            layers=36 bytes=77266944 (73.69 MiB) clone_us=1761.19 (87.74 GB/s, bit_exact=yes)
+
+=== M6.5 C14 Continuous Batching Scaling (GQA + MoE q4) ===
+batch  step_ms   slot_tok_s  agg_tok_s   scaling_vs_b1  malloc_blk
+B=1    0.912     1096.56     1096.56     1.00           32
+B=2    0.849     1177.26     2354.53     2.15           32
+B=4    0.737     1356.78     5427.10     4.95           32
+B=8    1.010     989.61      7916.91     7.22           32
+
+=== M6.5 C14 Continuous Batching Scaling (Hybrid GDN + QSA + MoE q4) ===
+batch  step_ms   slot_tok_s  agg_tok_s   scaling_vs_b1  malloc_blk
+B=1    0.742     1347.31     1347.31     1.00           30
+B=2    0.729     1371.93     2743.87     2.04           34
+B=4    0.846     1181.68     4726.71     3.51           34
+B=8    0.877     1140.44     9123.50     6.77           32
+
+=== M6.5 C14 DomainNgramRegistry Multi-Pack Lookup & Atomic Hot-Swap ===
+ngram.packs                      source=real-ang count=2 total_entries=1078062 wired_bytes=540672
+ngram.cold_query_us              p50=1.08 p99=1.79
+ngram.cache_hit_us               0.04
+ngram.select_default_ns          3.6
+ngram.atomic_swap_pack_us        12.46
+ngram.domain_hits                repo=32 docs=32
+ngram.steady_malloc_blocks       0
+
+m65.swap.status                  ok (swapouts_delta=0, pageouts_delta=0)
+```
+
+### Verbatim `G14` end-to-end `qwen4_exp` hardware VideoToolbox HEVC decode (`ReleaseFast`)
+
+```text
+decode.arch                      graph (hybrid_gdn_qsa, moe_swiglu, gated_4branch, loop=single_pass R=1)
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    4
+decode.shards                    1
+decode.wired_mib                 7
+decode.prompt_tokens             21
+decode.generated_tokens          16
+decode.prefill_ms                132.151
+decode.decode_ms_per_tok         1.155
+decode.decode_tok_per_s          865.82
+decode.bytes_per_tok             1472576
+decode.effective_gbs             1.27
+decode.malloc_blocks_delta       -34
+decode.malloc_bytes_delta        -2832
+decode.swapouts_delta            0
+decode.loop_total_steps             15
+decode.loop_early_exit_tokens       0
+decode.loop_gdn_scratch_evals       0
+decode.loop_gdn_final_commits       45
+decode.loop_ple_r0_fills            60
+decode.loop_ple_r_ge1_reuses        0
+decode.loop_ple_r_ge1_nvme_reads    0
+decode.loop_qsa_index_computes      15
+decode.loop_qsa_index_reuses        0
+decode.loop_moe_r_ge1_pinned_routes 0
+decode.loop_moe_r_ge1_cold_stalls   0
+decode.loop_steplora_zero_skips     0
+decode.loop_steplora_active_evals   0
+decode.ple_nvme_reads            16
+decode.ple_cache_hits            272
+decode.vision_source             vt-hevc-nv12
+decode.vision_frames             2 (128x128)
+decode.vision_zero_copy          yes (page16k=yes)
+decode.vision_tokens             32 (grid=2x4x4, total_prompt=53)
+decode.vision_next_mrope_pos     25
+decode.vision_encode_us          2400.38
+decode.token_ids                 [170, 297, 421, 405, 493, 288, 472, 278, 157, 489, 114, 401, 493, 171, 444, 210]
+decode.text                      � v000297 v000421 v000405 v000493� v000472en� v000489r v000401 v000493� v000444�
+```
+
+### Verbatim real `Qwen3-0.6B` BF16 `R5` pure `fp16` vs tiered `q8` decode (`1,358` prompt tokens, `ReleaseFast`)
+
+Pure `fp16` baseline (`--max-tokens 32 --no-verify-crc`):
+
+```text
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1307
+decode.prompt_tokens             1358
+decode.generated_tokens          25
+decode.prefill_ms                15793.902
+decode.decode_ms_per_tok         15.938
+decode.decode_tok_per_s          62.74
+decode.bytes_per_tok             1350715392
+decode.effective_gbs             84.75
+decode.malloc_blocks_delta       0
+decode.malloc_bytes_delta        0
+decode.swapouts_delta            0
+decode.token_ids                 [271, 785, 8162, 37150, 2150, 1379, 264, 1065, 802, 662, 48796, 369, 19206, 323, 64080, 10509, 27389, 374, 220, 16, 21, 29458, 33, 13, 151645]
+decode.text                      
+
+The Apple Silicon page size aminfer enforces for Metal and IOSurface buffers is 16 KiB.<|im_end|>
+```
+
+Tiered `q8` retired KV (`--kv-retire-q8-after-chunks 1 --max-tokens 32 --no-verify-crc`):
+
+```text
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1255
+decode.prompt_tokens             1358
+decode.generated_tokens          25
+decode.prefill_ms                15356.153
+decode.decode_ms_per_tok         15.355
+decode.decode_tok_per_s          65.12
+decode.bytes_per_tok             1295665152
+decode.effective_gbs             84.38
+decode.malloc_blocks_delta       0
+decode.malloc_bytes_delta        0
+decode.swapouts_delta            0
+decode.retired_kv_chunks         2 (events=2)
+decode.kv_wired_mib              active=56.00 retired_q8=59.50
+decode.token_ids                 [271, 785, 8162, 37150, 2150, 1379, 264, 1065, 802, 662, 48796, 369, 19206, 323, 64080, 10509, 27389, 374, 220, 16, 21, 29458, 33, 13, 151645]
+decode.text                      
+
+The Apple Silicon page size aminfer enforces for Metal and IOSurface buffers is 16 KiB.<|im_end|>
+```
+
+### Verbatim live `aminfer serve` concurrency sweeps (`ReleaseFast`)
+
+`Qwen3-0.6B` BF16 client harness (`1/4/8` concurrent SSE clients, `24` tokens/client, `D11` explicit `seed = 12345`):
+
+```text
+qwen3-0.6b-bf16 mode=serial C=1 max_tok=24 wall_s=0.617 agg_tok_s=38.92 ttft_p50_ms=264.15 ttft_p99_ms=264.15 tpot_p50_ms=14.53 ok=1/1
+qwen3-0.6b-bf16 mode=serial C=4 max_tok=24 wall_s=2.490 agg_tok_s=38.56 ttft_p50_ms=1410.36 ttft_p99_ms=2126.75 tpot_p50_ms=15.75 ok=4/4
+qwen3-0.6b-bf16 mode=serial C=8 max_tok=24 wall_s=4.792 agg_tok_s=40.07 ttft_p50_ms=2632.84 ttft_p99_ms=4460.87 tpot_p50_ms=14.36 ok=8/8
+qwen3-0.6b-bf16 mode=serial d11_seed=12345 T=0.7 seed_used=(12345,12345) exact_match=True
+qwen3-0.6b-bf16 mode=continuous C=1 max_tok=24 wall_s=0.474 agg_tok_s=50.60 ttft_p50_ms=25.22 ttft_p99_ms=25.22 tpot_p50_ms=19.50 ok=1/1
+qwen3-0.6b-bf16 mode=continuous C=4 max_tok=24 wall_s=0.476 agg_tok_s=201.76 ttft_p50_ms=83.18 ttft_p99_ms=104.62 tpot_p50_ms=17.94 ok=4/4
+qwen3-0.6b-bf16 mode=continuous C=8 max_tok=24 wall_s=0.631 agg_tok_s=304.35 ttft_p50_ms=131.30 ttft_p99_ms=196.59 tpot_p50_ms=22.64 ok=8/8
+qwen3-0.6b-bf16 mode=continuous d11_seed=12345 T=0.7 seed_used=(12345,12345) exact_match=True
+qwen3-0.6b-bf16 serial_vs_continuous_t0_match=True d11_cross_mode_match=True
+```
+
+`Qwen3-0.6B` BF16 server stdout (`--batch-mode serial`):
+
+```text
+serve.status                     listening
+serve.url                        http://127.0.0.1:50402
+serve.model_id                   qwen3-0.6b-bf16
+serve.arch                       qwen3 (bf16)
+serve.batch_mode                 serial (max_batch_size=1)
+serve.prefix_cache_chunks        0
+serve.kv_retire_q8_after_chunks  0
+serve.ngram_packs                0
+serve.spec_mode                  none
+serve.pearl_mode                 auto (enabled=no)
+serve.ngram_nvme                 off
+serve.wired_mib                  1363
+serve.max_conns                  32
+serve.max_active_requests        8
+serve.max_seq_len                2048
+serve.status                     stopped
+serve.total_requests             16
+serve.rejected_503               0
+serve.cancelled                  0
+serve.max_observed_batch_size    0
+serve.mean_batch_size            0.00
+serve.total_batch_steps          0
+serve.prefix_hit_tokens          0
+serve.prefix_hit_requests        0
+serve.prefix_cow_copies          0
+serve.kv_retire_events           0
+serve.steady_malloc_blocks       1388
+serve.steady_malloc_bytes        88608
+serve.swapouts_delta             0
+```
+
+`Qwen3-0.6B` BF16 server stdout (`--batch-mode continuous`):
+
+```text
+serve.status                     listening
+serve.url                        http://127.0.0.1:51066
+serve.model_id                   qwen3-0.6b-bf16
+serve.arch                       qwen3 (bf16)
+serve.batch_mode                 continuous (max_batch_size=8)
+serve.prefix_cache_chunks        0
+serve.kv_retire_q8_after_chunks  0
+serve.ngram_packs                0
+serve.spec_mode                  none
+serve.pearl_mode                 auto (enabled=no)
+serve.ngram_nvme                 off
+serve.wired_mib                  3189
+serve.max_conns                  32
+serve.max_active_requests        8
+serve.max_seq_len                2048
+serve.status                     stopped
+serve.total_requests             16
+serve.rejected_503               0
+serve.cancelled                  0
+serve.max_observed_batch_size    8
+serve.mean_batch_size            3.69
+serve.total_batch_steps          90
+serve.prefix_hit_tokens          0
+serve.prefix_hit_requests        0
+serve.prefix_cow_copies          0
+serve.kv_retire_events           0
+serve.steady_malloc_blocks       206
+serve.steady_malloc_bytes        13376
+serve.swapouts_delta             0
+```
+
+`Qwen3-0.6B` GSQ+RCO client harness (`1/4/8` concurrent SSE clients, `32` tokens/client, `D11` explicit `seed = 12345`):
+
+```text
+qwen3-0.6b-gsq-rco mode=serial C=1 max_tok=32 wall_s=0.242 agg_tok_s=132.45 ttft_p50_ms=90.80 ttft_p99_ms=90.80 tpot_p50_ms=4.72 ok=1/1
+qwen3-0.6b-gsq-rco mode=serial C=4 max_tok=32 wall_s=0.920 agg_tok_s=139.06 ttft_p50_ms=536.90 ttft_p99_ms=765.71 tpot_p50_ms=4.64 ok=4/4
+qwen3-0.6b-gsq-rco mode=serial C=8 max_tok=32 wall_s=1.944 agg_tok_s=131.68 ttft_p50_ms=1035.62 ttft_p99_ms=1786.04 tpot_p50_ms=4.95 ok=8/8
+qwen3-0.6b-gsq-rco mode=serial d11_seed=12345 T=0.7 seed_used=(12345,12345) exact_match=True
+qwen3-0.6b-gsq-rco mode=continuous C=1 max_tok=32 wall_s=0.176 agg_tok_s=181.64 ttft_p50_ms=16.64 ttft_p99_ms=16.64 tpot_p50_ms=5.14 ok=1/1
+qwen3-0.6b-gsq-rco mode=continuous C=4 max_tok=32 wall_s=0.300 agg_tok_s=426.39 ttft_p50_ms=47.33 ttft_p99_ms=69.60 tpot_p50_ms=8.45 ok=4/4
+qwen3-0.6b-gsq-rco mode=continuous C=8 max_tok=32 wall_s=0.493 agg_tok_s=518.75 ttft_p50_ms=83.01 ttft_p99_ms=130.08 tpot_p50_ms=13.72 ok=8/8
+qwen3-0.6b-gsq-rco mode=continuous d11_seed=12345 T=0.7 seed_used=(12345,12345) exact_match=True
+qwen3-0.6b-gsq-rco serial_vs_continuous_t0_match=True d11_cross_mode_match=True
+```
+
+`Qwen3-0.6B` GSQ+RCO server stdout (`--batch-mode serial`):
+
+```text
+serve.status                     listening
+serve.url                        http://127.0.0.1:51632
+serve.model_id                   qwen3-0.6b-gsq-rco
+serve.arch                       qwen3 (bf16)
+serve.batch_mode                 serial (max_batch_size=1)
+serve.prefix_cache_chunks        0
+serve.kv_retire_q8_after_chunks  0
+serve.ngram_packs                0
+serve.spec_mode                  none
+serve.pearl_mode                 auto (enabled=no)
+serve.ngram_nvme                 off
+serve.wired_mib                  535
+serve.max_conns                  32
+serve.max_active_requests        8
+serve.max_seq_len                2048
+serve.status                     stopped
+serve.total_requests             16
+serve.rejected_503               0
+serve.cancelled                  0
+serve.max_observed_batch_size    0
+serve.mean_batch_size            0.00
+serve.total_batch_steps          0
+serve.prefix_hit_tokens          0
+serve.prefix_hit_requests        0
+serve.prefix_cow_copies          0
+serve.kv_retire_events           0
+serve.steady_malloc_blocks       1596
+serve.steady_malloc_bytes        101920
+serve.swapouts_delta             0
+```
+
+`Qwen3-0.6B` GSQ+RCO server stdout (`--batch-mode continuous`):
+
+```text
+serve.status                     listening
+serve.url                        http://127.0.0.1:51734
+serve.model_id                   qwen3-0.6b-gsq-rco
+serve.arch                       qwen3 (bf16)
+serve.batch_mode                 continuous (max_batch_size=8)
+serve.prefix_cache_chunks        0
+serve.kv_retire_q8_after_chunks  0
+serve.ngram_packs                0
+serve.spec_mode                  none
+serve.pearl_mode                 auto (enabled=no)
+serve.ngram_nvme                 off
+serve.wired_mib                  2361
+serve.max_conns                  32
+serve.max_active_requests        8
+serve.max_seq_len                2048
+serve.status                     stopped
+serve.total_requests             16
+serve.rejected_503               0
+serve.cancelled                  0
+serve.max_observed_batch_size    8
+serve.mean_batch_size            3.86
+serve.total_batch_steps          113
+serve.prefix_hit_tokens          0
+serve.prefix_hit_requests        0
+serve.prefix_cow_copies          0
+serve.kv_retire_events           0
+serve.steady_malloc_blocks       252
+serve.steady_malloc_bytes        16320
+serve.swapouts_delta             0
+```
+
+### Verbatim live `aminfer serve` `R8` `PrefixCache` and multi-pack `.ang` verification (`ReleaseFast`)
+
+Client harness output (`~728`-tok shared system prompt cold miss vs warm 4-client hit, plus `/v1/ngram-packs`, `/v1/ngram-packs/select`, and per-request `"ngram_domain"`):
+
+```text
+r8.cold_miss prompt_tokens=728 ttft_ms=566.75 e2e_ms=699.96 tpot_ms=5.79
+r8.warm_4_clients prompt_tokens=[731, 731, 729, 728] ttft_p50_ms=63.93 ttft_p99_ms=83.91 ttft_speedup=8.87x agg_tok_s=297.49
+ngram.get_initial status=200 body={"object":"list","default_domain":"repo","pack_count":2,"cache_pages":32,"wired_bytes":540672,"data":[{"domain":"repo","corpus_id":"aminfer-repo-v1","is_default":true,"entries":879949,"buckets":8192,"min_ngram":2,"max_ngram":4,"generation":1,"swaps":0,"stats":{"queries":0,"hits":0,"seed_hits":0,"branch_hits":0,"cache_hits":0,"prefetch_submitted":0,"prefetch_hits":0,"nvme_reads":0,"hit_rate":0.0000}},{"domain":"docs","corpus_id":"aminfer-docs-v1","is_default":false,"entries":198113,"buckets":2048,"min_ngram":2,"max_ngram":4,"generation":2,"swaps":0,"stats":{"queries":0,"hits":0,"seed_hits":0,"branch_hits":0,"cache_hits":0,"prefetch_submitted":0,"prefetch_hits":0,"nvme_reads":0,"hit_rate":0.0000}}]}
+ngram.req_default_repo status=200 tokens=8
+ngram.req_explicit_docs status=200 tokens=8
+ngram.req_unknown status=400 body={"error":{"message":"unknown ngram_domain","type":"invalid_request_error","code":"domain_not_found"}}
+ngram.select_docs status=200 body={"status":"ok","default_domain":"docs"}
+ngram.req_after_select_docs status=200 tokens=8
+ngram.get_final status=200 body={"object":"list","default_domain":"docs","pack_count":2,"cache_pages":32,"wired_bytes":540672,"data":[{"domain":"repo","corpus_id":"aminfer-repo-v1","is_default":false,"entries":879949,"buckets":8192,"min_ngram":2,"max_ngram":4,"generation":1,"swaps":0,"stats":{"queries":1,"hits":0,"seed_hits":0,"branch_hits":0,"cache_hits":0,"prefetch_submitted":0,"prefetch_hits":0,"nvme_reads":3,"hit_rate":0.0000}},{"domain":"docs","corpus_id":"aminfer-docs-v1","is_default":true,"entries":198113,"buckets":2048,"min_ngram":2,"max_ngram":4,"generation":2,"swaps":0,"stats":{"queries":2,"hits":1,"seed_hits":0,"branch_hits":1,"cache_hits":0,"prefetch_submitted":0,"prefetch_hits":0,"nvme_reads":6,"hit_rate":0.5000}}]}
+```
+
+Server stdout (`R8` `PrefixCache`, `--prefix-cache-chunks 16`):
+
+```text
+serve.status                     listening
+serve.url                        http://127.0.0.1:52283
+serve.model_id                   qwen3-0.6b-gsq-rco
+serve.arch                       qwen3 (bf16)
+serve.batch_mode                 continuous (max_batch_size=8)
+serve.prefix_cache_chunks        16
+serve.kv_retire_q8_after_chunks  0
+serve.ngram_packs                0
+serve.spec_mode                  none
+serve.pearl_mode                 auto (enabled=no)
+serve.ngram_nvme                 off
+serve.wired_mib                  3257
+serve.max_conns                  32
+serve.max_active_requests        8
+serve.max_seq_len                2048
+serve.status                     stopped
+serve.total_requests             5
+serve.rejected_503               0
+serve.cancelled                  0
+serve.max_observed_batch_size    4
+serve.mean_batch_size            2.50
+serve.total_batch_steps          46
+serve.prefix_hit_tokens          2849
+serve.prefix_hit_requests        4
+serve.prefix_cow_copies          9
+serve.kv_retire_events           0
+serve.steady_malloc_blocks       116
+serve.steady_malloc_bytes        8256
+serve.swapouts_delta             0
+```
+
+Server stdout (multi-pack `.ang`, `--ngram-pack repo=... --ngram-pack docs=...`):
+
+```text
+serve.status                     listening
+serve.url                        http://127.0.0.1:52340
+serve.model_id                   qwen3-0.6b-gsq-rco
+serve.arch                       qwen3 (bf16)
+serve.batch_mode                 continuous (max_batch_size=4)
+serve.prefix_cache_chunks        8
+serve.kv_retire_q8_after_chunks  0
+serve.ngram_packs                2
+serve.spec_mode                  none
+serve.pearl_mode                 auto (enabled=no)
+serve.ngram_nvme                 on
+serve.wired_mib                  1352
+serve.max_conns                  16
+serve.max_active_requests        4
+serve.max_seq_len                1024
+serve.status                     stopped
+serve.total_requests             3
+serve.rejected_503               0
+serve.cancelled                  0
+serve.max_observed_batch_size    1
+serve.mean_batch_size            1.00
+serve.total_batch_steps          21
+serve.prefix_hit_tokens          7
+serve.prefix_hit_requests        2
+serve.prefix_cow_copies          5
+serve.kv_retire_events           0
+serve.steady_malloc_blocks       64
+serve.steady_malloc_bytes        4512
+serve.swapouts_delta             0
+```
