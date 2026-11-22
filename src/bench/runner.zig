@@ -9420,12 +9420,11 @@ fn runM65BatchSweep(
 }
 
 fn extractAngSampleKeys(path: [:0]const u8, out_keys: [][4]u32) usize {
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return 0;
-    defer _ = std.c.close(fd);
+    var df = aio.DirectFile.openReadOnly(path) catch return 0;
+    defer df.close();
 
     var hdr_buf: [page.APPLE_PAGE_SIZE]u8 align(page.APPLE_PAGE_SIZE) = undefined;
-    if (std.c.pread(fd, &hdr_buf, hdr_buf.len, 0) != @as(isize, @intCast(hdr_buf.len))) return 0;
+    if (std.c.pread(df.fd, &hdr_buf, hdr_buf.len, 0) != @as(isize, @intCast(hdr_buf.len))) return 0;
     const hdr: *const ngram_nvme.Header = @ptrCast(@alignCast(&hdr_buf));
     if (hdr.num_buckets == 0) return 0;
 
@@ -9435,7 +9434,7 @@ fn extractAngSampleKeys(path: [:0]const u8, out_keys: [][4]u32) usize {
     var b: u64 = 0;
     while (b < hdr.num_buckets and found < out_keys.len) : (b += stride) {
         const off: i64 = @intCast(page.APPLE_PAGE_SIZE * (1 + b));
-        if (std.c.pread(fd, &page_buf, page_buf.len, off) != @as(isize, @intCast(page_buf.len))) break;
+        if (std.c.pread(df.fd, &page_buf, page_buf.len, off) != @as(isize, @intCast(page_buf.len))) break;
         const slots: []const ngram_nvme.NgramSlot = @alignCast(std.mem.bytesAsSlice(ngram_nvme.NgramSlot, &page_buf));
         for (slots) |slot| {
             if (slot.ctx_len == 4 and slot.cont_len > 0) {
@@ -9528,8 +9527,8 @@ fn runM65NgramBench(allocator: std.mem.Allocator, cfg: M65Config) !M65NgramRepor
 
     var reg = try ngram_nvme.DomainNgramRegistry.init(allocator, .{ .cache_pages = 32 });
     defer reg.deinit(allocator);
-    _ = try reg.registerPack("repo", repo_path, null);
-    _ = try reg.registerPack("docs", docs_path, null);
+    _ = try reg.registerPack("repo", repo_path, false);
+    _ = try reg.registerPack("docs", docs_path, false);
 
     const n_q: usize = @max(@min(cfg.c14_ngram_queries, 32), 4);
     var cold_us_samples: [64]f64 = undefined;
