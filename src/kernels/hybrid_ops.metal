@@ -1004,6 +1004,10 @@ struct QsaSparseAttnParams {
     uint top_k_blocks;
     uint has_tree;
     float scale;
+    uint num_retired_chunks;
+    uint retired_plane_stride_bytes;
+    uint retired_chunk_stride_bytes;
+    uint _pad0;
 };
 
 static_assert(sizeof(QsaRopeKvParams) == 80, "QsaRopeKvParams must be 80 bytes");
@@ -1011,7 +1015,7 @@ static_assert(sizeof(QsaTreeRopeParams) == 64, "QsaTreeRopeParams must be 64 byt
 static_assert(sizeof(QsaKvTreeCommitParams) == 160, "QsaKvTreeCommitParams must be 160 bytes");
 static_assert(sizeof(QsaBlockSummaryParams) == 48, "QsaBlockSummaryParams must be 48 bytes");
 static_assert(sizeof(QsaIndexParams) == 48, "QsaIndexParams must be 48 bytes");
-static_assert(sizeof(QsaSparseAttnParams) == 48, "QsaSparseAttnParams must be 48 bytes");
+static_assert(sizeof(QsaSparseAttnParams) == 64, "QsaSparseAttnParams must be 64 bytes");
 
 // Round-robin interleaved 3D MRoPE axis selector (`0 = T, 1 = H, 2 = W`).
 // For `[11, 11, 10]` across `half_rot = 32`, yields `T,H,W,...,T,H,W,T,H`,
@@ -1512,7 +1516,20 @@ kernel void ami_qsa_index_blocks(const device half *q [[buffer(0)]],
 // Sparse GQA decode (`num_nodes = 1, has_tree = 0`) & speculative tree-verify
 // (`num_nodes = 1..64, has_tree = 1` with 64-bit ancestor masks) over selected
 // micro-blocks in resident RGBA16Float IOSurface KvTiles (supporting both
-// 512-tok full chunks and 128-tok circular SWA tiles).
+// Group-64 q8 retired KV dequant helper matching `RetiredKvQ8Pool` (`68 B / 64 dims`).
+static inline half4 hybrid_load_q8_half4(const device uchar *plane_base,
+                                         uint row,
+                                         uint groups_per_head,
+                                         uint col) {
+    const uint grp = col >> 4;
+    const uint col_in_grp = col & 15u;
+    const ulong off = (ulong(row) * groups_per_head + grp) * 68ul;
+    const char4 q4 = *(const device char4 *)(plane_base + off + col_in_grp * 4u);
+    const half2 sb = *(const device half2 *)(plane_base + off + 64u);
+    return half4(fma(float4(q4), float4(float(sb.x)), float4(float(sb.y))));
+}
+
+// 512-tok full chunks, R5 retired group-64 q8 chunks, and 128-tok circular SWA tiles).
 //
 // Specialized on QSA_HEAD_DIM (`64`, `128`, or `0` dynamic <= 256 multiple of 4).
 // Grid: (num_kv_heads * q_groups_per_kv, num_nodes, 1) threadgroups, 256 threads.
@@ -1524,7 +1541,9 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
                                 const device half *v_tree [[buffer(5)]],
                                 const device ulong *ancestor_masks [[buffer(6)]],
                                 device half *out [[buffer(7)]],
-                                constant QsaSparseAttnParams &p [[buffer(8)]],
+                                const device uchar *retired_pool [[buffer(8)]],
+                                const device uint *retired_chunk_ids [[buffer(9)]],
+                                constant QsaSparseAttnParams &p [[buffer(10)]],
                                 uint2 tg_pos [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]],
                                 uint sg_id [[simdgroup_index_in_threadgroup]],
@@ -1589,8 +1608,17 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
                     const uint chunk = phys_t / p.chunk_tokens;
                     const uint slot = phys_t - chunk * p.chunk_tokens;
                     const uint row = kv_head * p.chunk_tokens + slot;
-                    tg_k[tid] = kv_tiles[chunk].k_tex.read(uint2(load_col, row));
-                    tg_v[tid] = kv_tiles[chunk].v_tex.read(uint2(load_col, row));
+                    if (p.ring_capacity == 0u && chunk < p.num_retired_chunks) {
+                        const uint phys_slot = retired_chunk_ids[chunk];
+                        const device uchar *k_plane = retired_pool + ulong(phys_slot) * p.retired_chunk_stride_bytes;
+                        const device uchar *v_plane = k_plane + p.retired_plane_stride_bytes;
+                        tg_k[tid] = hybrid_load_q8_half4(k_plane, row, 2u, load_col);
+                        tg_v[tid] = hybrid_load_q8_half4(v_plane, row, 2u, load_col);
+                    } else {
+                        const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+                        tg_k[tid] = kv_tiles[active_chunk].k_tex.read(uint2(load_col, row));
+                        tg_v[tid] = kv_tiles[active_chunk].v_tex.read(uint2(load_col, row));
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1599,7 +1627,7 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
                         const uint idx = dt * 32u + lane;
                         const float score = simd_sum(dot(q_vec, float4(tg_k[idx]))) * scale_log2e;
                         const float new_m = max(m_val, score);
-                        const float corr = exp2(m_val - new_m);
+                        const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
                         const float p_w = exp2(score - new_m);
                         l_val = fma(l_val, corr, p_w);
                         acc = fma(acc, float4(corr), float4(tg_v[idx]) * p_w);
@@ -1621,7 +1649,7 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
                     const float4 vv = float4(*(const device half4 *)(v_tree + kv_off));
                     const float score = simd_sum(dot(q_vec, kv)) * scale_log2e;
                     const float new_m = max(m_val, score);
-                    const float corr = exp2(m_val - new_m);
+                    const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
                     const float p_w = exp2(score - new_m);
                     l_val = fma(l_val, corr, p_w);
                     acc = fma(acc, float4(corr), vv * p_w);
@@ -1664,8 +1692,17 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
                     const uint chunk = phys_t / p.chunk_tokens;
                     const uint slot = phys_t - chunk * p.chunk_tokens;
                     const uint row = kv_head * p.chunk_tokens + slot;
-                    tg_k[tid] = kv_tiles[chunk].k_tex.read(uint2(load_col, row));
-                    tg_v[tid] = kv_tiles[chunk].v_tex.read(uint2(load_col, row));
+                    if (p.ring_capacity == 0u && chunk < p.num_retired_chunks) {
+                        const uint phys_slot = retired_chunk_ids[chunk];
+                        const device uchar *k_plane = retired_pool + ulong(phys_slot) * p.retired_chunk_stride_bytes;
+                        const device uchar *v_plane = k_plane + p.retired_plane_stride_bytes;
+                        tg_k[tid] = hybrid_load_q8_half4(k_plane, row, 1u, load_col);
+                        tg_v[tid] = hybrid_load_q8_half4(v_plane, row, 1u, load_col);
+                    } else {
+                        const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+                        tg_k[tid] = kv_tiles[active_chunk].k_tex.read(uint2(load_col, row));
+                        tg_v[tid] = kv_tiles[active_chunk].v_tex.read(uint2(load_col, row));
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1675,7 +1712,7 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
                         const float partial = active_lane ? dot(q_vec, float4(tg_k[idx])) : 0.0f;
                         const float score = simd_sum(partial) * scale_log2e;
                         const float new_m = max(m_val, score);
-                        const float corr = exp2(m_val - new_m);
+                        const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
                         const float p_w = exp2(score - new_m);
                         l_val = fma(l_val, corr, p_w);
                         if (active_lane) {
@@ -1700,7 +1737,7 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
                     const float partial = active_lane ? dot(q_vec, kv) : 0.0f;
                     const float score = simd_sum(partial) * scale_log2e;
                     const float new_m = max(m_val, score);
-                    const float corr = exp2(m_val - new_m);
+                    const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
                     const float p_w = exp2(score - new_m);
                     l_val = fma(l_val, corr, p_w);
                     if (active_lane) {
@@ -1718,7 +1755,9 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
         return;
     }
 
-    // Dynamic head_dim <= 256 (multiple of 4): 2 float4 registers per lane (up to 64 cols = 256 dims).
+    // Dynamic head_dim <= 256 (multiple of 4; multiple of 64 when retired chunks are active):
+    // 2 float4 registers per lane (up to 64 cols = 256 dims).
+    const uint groups_per_head = d_dim >> 6;
     float4 q_reg[2] = {float4(0.0f), float4(0.0f)};
     float4 acc_reg[2] = {float4(0.0f), float4(0.0f)};
     if (active_q) {
@@ -1748,19 +1787,36 @@ kernel void ami_qsa_sparse_attn(const device half *q [[buffer(0)]],
                 float4 k0 = float4(0.0f), k1 = float4(0.0f);
                 float4 v0 = float4(0.0f), v1 = float4(0.0f);
                 float partial = 0.0f;
-                if (lane < num_cols) {
-                    k0 = float4(kv_tiles[chunk].k_tex.read(uint2(lane, row)));
-                    v0 = float4(kv_tiles[chunk].v_tex.read(uint2(lane, row)));
-                    partial += dot(q_reg[0], k0);
-                }
-                if (lane + 32u < num_cols) {
-                    k1 = float4(kv_tiles[chunk].k_tex.read(uint2(lane + 32u, row)));
-                    v1 = float4(kv_tiles[chunk].v_tex.read(uint2(lane + 32u, row)));
-                    partial += dot(q_reg[1], k1);
+                if (p.ring_capacity == 0u && chunk < p.num_retired_chunks) {
+                    const uint phys_slot = retired_chunk_ids[chunk];
+                    const device uchar *k_plane = retired_pool + ulong(phys_slot) * p.retired_chunk_stride_bytes;
+                    const device uchar *v_plane = k_plane + p.retired_plane_stride_bytes;
+                    if (lane < num_cols) {
+                        k0 = float4(hybrid_load_q8_half4(k_plane, row, groups_per_head, lane));
+                        v0 = float4(hybrid_load_q8_half4(v_plane, row, groups_per_head, lane));
+                        partial += dot(q_reg[0], k0);
+                    }
+                    if (lane + 32u < num_cols) {
+                        k1 = float4(hybrid_load_q8_half4(k_plane, row, groups_per_head, lane + 32u));
+                        v1 = float4(hybrid_load_q8_half4(v_plane, row, groups_per_head, lane + 32u));
+                        partial += dot(q_reg[1], k1);
+                    }
+                } else {
+                    const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+                    if (lane < num_cols) {
+                        k0 = float4(kv_tiles[active_chunk].k_tex.read(uint2(lane, row)));
+                        v0 = float4(kv_tiles[active_chunk].v_tex.read(uint2(lane, row)));
+                        partial += dot(q_reg[0], k0);
+                    }
+                    if (lane + 32u < num_cols) {
+                        k1 = float4(kv_tiles[active_chunk].k_tex.read(uint2(lane + 32u, row)));
+                        v1 = float4(kv_tiles[active_chunk].v_tex.read(uint2(lane + 32u, row)));
+                        partial += dot(q_reg[1], k1);
+                    }
                 }
                 const float score = simd_sum(partial) * scale_log2e;
                 const float new_m = max(m_val, score);
-                const float corr = exp2(m_val - new_m);
+                const float corr = (l_val > 0.0f) ? exp2(m_val - new_m) : 0.0f;
                 const float p_w = exp2(score - new_m);
                 l_val = fma(l_val, corr, p_w);
                 acc_reg[0] = fma(acc_reg[0], float4(corr), v0 * p_w);
@@ -2333,4 +2389,262 @@ kernel void ami_blend_f16(device half *dst [[buffer(0)]],
         return;
     }
     dst[gid] = half(fma(p.a, float(dst[gid]), p.b * float(src[gid])));
+}
+
+// ===========================================================================
+// Milestone M6.5: C14 Multi-Slot Batched GDN Decode & R8 GDN Snapshot Clone
+// ===========================================================================
+
+struct GdnBatchDecodeParams {
+    uint batch_size;
+    uint num_k_heads;
+    uint num_v_heads;
+    uint head_k_dim;
+    uint head_v_dim;
+    uint slot_stride_f32;
+    float q_scale;
+    float l2_eps;
+    float rms_eps;
+    uint apply_l2_norm;
+    uint apply_out_norm;
+    uint apply_out_gate;
+    uint per_head_norm;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct GdnCloneStateParams {
+    uint num_gdn_layers;
+    uint state_f32_per_layer;
+    uint src_state_layer_stride_f32;
+    uint dst_state_layer_stride_f32;
+    uint conv_f16_per_layer;
+    uint src_conv_layer_stride_f16;
+    uint dst_conv_layer_stride_f16;
+    uint _pad0;
+};
+
+static_assert(sizeof(GdnBatchDecodeParams) == 64, "GdnBatchDecodeParams must be 64 bytes");
+static_assert(sizeof(GdnCloneStateParams) == 32, "GdnCloneStateParams must be 32 bytes");
+
+// Multi-request batched Gated DeltaNet decode (`M_batch = 1..16+`) executing
+// `batch_size` independent slots in ONE GPU pass using per-slot `state_in_slots[b]`
+// and `state_out_slots[b]`. Bit-for-bit identical recurrence and RMSNorm + SiLU
+// gate math to `ami_gdn_decode`.
+//
+// Specialized on GDN_HEAD_K_DIM ({64, 128, 0}) and HYBRID_NORM_W_BF16 ({false, true}).
+// Grid: (num_v_heads, batch_size, 1) threadgroups, 256 threads (8 simdgroups).
+kernel void ami_gdn_batch_decode(const device half *q [[buffer(0)]],
+                                 const device half *k [[buffer(1)]],
+                                 const device half *v [[buffer(2)]],
+                                 const device float *g [[buffer(3)]],
+                                 const device float *beta [[buffer(4)]],
+                                 const device half *z [[buffer(5)]],
+                                 const device uchar *norm_w [[buffer(6)]],
+                                 const device float *state_in_pool [[buffer(7)]],
+                                 device float *state_out_pool [[buffer(8)]],
+                                 device half *out [[buffer(9)]],
+                                 const device uint *state_in_slots [[buffer(10)]],
+                                 const device uint *state_out_slots [[buffer(11)]],
+                                 constant GdnBatchDecodeParams &p [[buffer(12)]],
+                                 uint2 tg_pos [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]],
+                                 uint sg_id [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    const uint vh = tg_pos.x;
+    const uint b = tg_pos.y;
+    if (vh >= p.num_v_heads || b >= p.batch_size) {
+        return;
+    }
+
+    const uint d_k = (GDN_HEAD_K_DIM > 0u) ? GDN_HEAD_K_DIM : p.head_k_dim;
+    const uint d_v = p.head_v_dim;
+    const uint v_per_k = p.num_v_heads / p.num_k_heads;
+    const uint kh = vh / v_per_k;
+
+    threadgroup float tg_q[256];
+    threadgroup float tg_k[256];
+    threadgroup float tg_o[256];
+    threadgroup float tg_rms_partial[8];
+
+    if (sg_id == 0u) {
+        const ulong qk_base = (ulong(b) * p.num_k_heads + kh) * d_k;
+        const device half *q_src = q + qk_base;
+        const device half *k_src = k + qk_base;
+        float q_sq = 0.0f;
+        float k_sq = 0.0f;
+        for (uint dk = lane; dk < d_k; dk += 32u) {
+            const float qv = float(q_src[dk]);
+            const float kv = float(k_src[dk]);
+            tg_q[dk] = qv;
+            tg_k[dk] = kv;
+            q_sq = fma(qv, qv, q_sq);
+            k_sq = fma(kv, kv, k_sq);
+        }
+        const float q_sum = simd_sum(q_sq);
+        const float k_sum = simd_sum(k_sq);
+        const float q_fac = (p.apply_l2_norm != 0u) ? (rsqrt(q_sum + p.l2_eps) * p.q_scale) : p.q_scale;
+        const float k_fac = (p.apply_l2_norm != 0u) ? rsqrt(k_sum + p.l2_eps) : 1.0f;
+        for (uint dk = lane; dk < d_k; dk += 32u) {
+            tg_q[dk] *= q_fac;
+            tg_k[dk] *= k_fac;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong gb_idx = ulong(b) * p.num_v_heads + vh;
+    const float alpha = exp(g[gb_idx]);
+    const float beta_sig = hybrid_sigmoid(beta[gb_idx]);
+    const uint in_slot = state_in_slots[b];
+    const uint out_slot = state_out_slots[b];
+    const ulong in_state_base = ulong(in_slot) * p.slot_stride_f32 + ulong(vh) * d_k * d_v;
+    const ulong out_state_base = ulong(out_slot) * p.slot_stride_f32 + ulong(vh) * d_k * d_v;
+    const ulong v_head_base = gb_idx * d_v;
+
+    for (uint dv = sg_id; dv < d_v; dv += 8u) {
+        float pred_acc = 0.0f;
+        float s_col[8];
+        if (GDN_HEAD_K_DIM == 64u) {
+            for (uint r = 0u; r < 2u; r++) {
+                const uint dk = lane + r * 32u;
+                const float s_dec = state_in_pool[in_state_base + ulong(dk) * d_v + dv] * alpha;
+                s_col[r] = s_dec;
+                pred_acc = fma(s_dec, tg_k[dk], pred_acc);
+            }
+        } else if (GDN_HEAD_K_DIM == 128u) {
+            for (uint r = 0u; r < 4u; r++) {
+                const uint dk = lane + r * 32u;
+                const float s_dec = state_in_pool[in_state_base + ulong(dk) * d_v + dv] * alpha;
+                s_col[r] = s_dec;
+                pred_acc = fma(s_dec, tg_k[dk], pred_acc);
+            }
+        } else {
+            for (uint r = 0u; r < 8u; r++) {
+                const uint dk = lane + r * 32u;
+                if (dk < d_k) {
+                    const float s_dec = state_in_pool[in_state_base + ulong(dk) * d_v + dv] * alpha;
+                    s_col[r] = s_dec;
+                    pred_acc = fma(s_dec, tg_k[dk], pred_acc);
+                } else {
+                    s_col[r] = 0.0f;
+                }
+            }
+        }
+
+        const float pred_v = simd_sum(pred_acc);
+        const float v_val = float(v[v_head_base + dv]);
+        const float delta = beta_sig * (v_val - pred_v);
+
+        float o_acc = 0.0f;
+        if (GDN_HEAD_K_DIM == 64u) {
+            for (uint r = 0u; r < 2u; r++) {
+                const uint dk = lane + r * 32u;
+                const float s_new = fma(tg_k[dk], delta, s_col[r]);
+                state_out_pool[out_state_base + ulong(dk) * d_v + dv] = s_new;
+                o_acc = fma(s_new, tg_q[dk], o_acc);
+            }
+        } else if (GDN_HEAD_K_DIM == 128u) {
+            for (uint r = 0u; r < 4u; r++) {
+                const uint dk = lane + r * 32u;
+                const float s_new = fma(tg_k[dk], delta, s_col[r]);
+                state_out_pool[out_state_base + ulong(dk) * d_v + dv] = s_new;
+                o_acc = fma(s_new, tg_q[dk], o_acc);
+            }
+        } else {
+            for (uint r = 0u; r < 8u; r++) {
+                const uint dk = lane + r * 32u;
+                if (dk < d_k) {
+                    const float s_new = fma(tg_k[dk], delta, s_col[r]);
+                    state_out_pool[out_state_base + ulong(dk) * d_v + dv] = s_new;
+                    o_acc = fma(s_new, tg_q[dk], o_acc);
+                }
+            }
+        }
+
+        const float o_val = simd_sum(o_acc);
+        if (lane == 0u) {
+            tg_o[dv] = (p.apply_out_norm != 0u) ? float(half(o_val)) : o_val;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_rms = 1.0f;
+    if (p.apply_out_norm != 0u) {
+        if (sg_id == 0u) {
+            float sum_sq = 0.0f;
+            for (uint dv = lane; dv < d_v; dv += 32u) {
+                const float ov = tg_o[dv];
+                sum_sq = fma(ov, ov, sum_sq);
+            }
+            const float total_sq = simd_sum(sum_sq);
+            if (lane == 0u) {
+                tg_rms_partial[0] = rsqrt(total_sq / float(d_v) + p.rms_eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        inv_rms = tg_rms_partial[0];
+    }
+
+    const uint nw_base = (p.per_head_norm != 0u) ? (vh * d_v) : 0u;
+    for (uint dv = tid; dv < d_v; dv += 256u) {
+        float val = tg_o[dv];
+        if (p.apply_out_norm != 0u) {
+            val = (val * inv_rms) * hybrid_load_norm_w(norm_w, nw_base + dv, HYBRID_NORM_W_BF16);
+        }
+        if (p.apply_out_gate != 0u) {
+            val *= hybrid_fast_silu(float(z[v_head_base + dv]));
+        }
+        out[v_head_base + dv] = half(val);
+    }
+}
+
+// GPU-side snapshot clone (`R8`): copies a full multi-layer GDN recurrent state
+// `[num_gdn_layers, num_v_heads, head_k_dim, head_v_dim]` (`f32`) AND optional
+// `conv1d` history `[num_gdn_layers, conv_f16_per_layer]` (`f16`) between a
+// request slot's `GdnStateArena` slab and a `PrefixCache` snapshot slab in ONE
+// dispatch with zero CPU `memcpy`.
+//
+// Grid: (ceil(max(state_f32_per_layer, conv_f16_per_layer) / 1024), num_gdn_layers, 1)
+//       threadgroups, 256 threads (each thread copies up to 4 elements).
+kernel void ami_gdn_clone_state(const device float *src_state [[buffer(0)]],
+                                device float *dst_state [[buffer(1)]],
+                                const device half *src_conv [[buffer(2)]],
+                                device half *dst_conv [[buffer(3)]],
+                                constant GdnCloneStateParams &p [[buffer(4)]],
+                                uint2 tg_pos [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]]) {
+    const uint layer = tg_pos.y;
+    if (layer >= p.num_gdn_layers) {
+        return;
+    }
+
+    const uint base = (tg_pos.x * 256u + tid) * 4u;
+    if (base < p.state_f32_per_layer) {
+        const ulong s_off = ulong(layer) * p.src_state_layer_stride_f32 + base;
+        const ulong d_off = ulong(layer) * p.dst_state_layer_stride_f32 + base;
+        if (base + 4u <= p.state_f32_per_layer &&
+            ((p.src_state_layer_stride_f32 | p.dst_state_layer_stride_f32) & 3u) == 0u) {
+            *(device float4 *)(dst_state + d_off) = *(const device float4 *)(src_state + s_off);
+        } else {
+            const uint n = min(4u, p.state_f32_per_layer - base);
+            for (uint i = 0u; i < n; ++i) {
+                dst_state[d_off + i] = src_state[s_off + i];
+            }
+        }
+    }
+
+    if (base < p.conv_f16_per_layer) {
+        const ulong s_off = ulong(layer) * p.src_conv_layer_stride_f16 + base;
+        const ulong d_off = ulong(layer) * p.dst_conv_layer_stride_f16 + base;
+        if (base + 4u <= p.conv_f16_per_layer &&
+            ((p.src_conv_layer_stride_f16 | p.dst_conv_layer_stride_f16) & 3u) == 0u) {
+            *(device half4 *)(dst_conv + d_off) = *(const device half4 *)(src_conv + s_off);
+        } else {
+            const uint n = min(4u, p.conv_f16_per_layer - base);
+            for (uint i = 0u; i < n; ++i) {
+                dst_conv[d_off + i] = src_conv[s_off + i];
+            }
+        }
+    }
 }

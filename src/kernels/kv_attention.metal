@@ -95,6 +95,24 @@ static inline float half_simd_sum(float v) {
     return v;
 }
 
+// Min across each 16-lane half-simdgroup (0..15 and 16..31 independently).
+static inline float half_simd_min(float v) {
+    v = min(v, simd_shuffle_xor(v, 8u));
+    v = min(v, simd_shuffle_xor(v, 4u));
+    v = min(v, simd_shuffle_xor(v, 2u));
+    v = min(v, simd_shuffle_xor(v, 1u));
+    return v;
+}
+
+// Max across each 16-lane half-simdgroup (0..15 and 16..31 independently).
+static inline float half_simd_max(float v) {
+    v = max(v, simd_shuffle_xor(v, 8u));
+    v = max(v, simd_shuffle_xor(v, 4u));
+    v = max(v, simd_shuffle_xor(v, 2u));
+    v = max(v, simd_shuffle_xor(v, 1u));
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // Kernel 1: RMSNorm (fp16 -> fp16 with `half` or `bfloat` weights selected by
 // NORM_W_BF16, fp32 accumulation; supports in-place y == x)
@@ -1585,4 +1603,1207 @@ kernel void ami_kv_tree_commit(const device half *k_tree [[buffer(0)]],
             v_tile0.write(v_src[col], uint2(col, row));
         }
     }
+}
+
+// ===========================================================================
+// Milestone M6.5: R5 Group-64 q8 Retired KV Tier, R8 CoW Prefix Tail Copy,
+// and C14 Multi-Request Batched Decode (ADR-0004, ADR-0019)
+//
+// Group-64 q8 layout per 64-element group (`68 B`, 4-byte aligned):
+//   bytes [0..63]: 64 signed int8 codes (`char`)
+//   bytes [64..67]: `half2(scale, bias)` -> dequant: `float(q) * scale + bias`
+// ===========================================================================
+
+struct KvRetireQ8Params {
+    uint num_kv_heads;
+    uint head_dim;
+    uint chunk_tokens;
+    uint dst_slot;
+    uint plane_stride_bytes;
+    uint chunk_stride_bytes;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct KvTileCowCopyParams {
+    uint num_kv_heads;
+    uint head_dim;
+    uint chunk_tokens;
+    uint valid_tokens;
+};
+
+struct TieredGqaDecodeParams {
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint seq_len;
+    uint chunk_tokens;
+    uint num_splits;
+    uint q_groups_per_kv;
+    float scale;
+    uint num_retired_chunks;
+    uint retired_plane_stride_bytes;
+    uint retired_chunk_stride_bytes;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct TieredGqaTreeVerifyParams {
+    uint num_nodes;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint base_pos;
+    uint chunk_tokens;
+    uint num_splits;
+    uint q_groups_per_kv;
+    float scale;
+    uint num_retired_chunks;
+    uint retired_plane_stride_bytes;
+    uint retired_chunk_stride_bytes;
+    uint _pad0;
+};
+
+struct BatchKvWriteSlot {
+    texture2d<half, access::write> k_tex;
+    texture2d<half, access::write> v_tex;
+    uint pos;
+    uint slot_in_chunk;
+    uint _pad0;
+    uint _pad1;
+};
+
+struct BatchQkNormRopeKvParams {
+    uint batch_size;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint chunk_tokens;
+    float rms_eps;
+    float rope_theta;
+    uint apply_qk_norm;
+};
+
+struct BatchGqaSlotDesc {
+    uint seq_len;
+    uint tile_table_offset;
+    uint retired_offset;
+    uint num_retired_chunks;
+};
+
+struct BatchGqaDecodeParams {
+    uint batch_size;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint chunk_tokens;
+    uint num_splits;
+    uint q_groups_per_kv;
+    float scale;
+    uint retired_plane_stride_bytes;
+    uint retired_chunk_stride_bytes;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+static_assert(sizeof(KvRetireQ8Params) == 32, "KvRetireQ8Params must be 32 bytes");
+static_assert(sizeof(KvTileCowCopyParams) == 16, "KvTileCowCopyParams must be 16 bytes");
+static_assert(sizeof(TieredGqaDecodeParams) == 48, "TieredGqaDecodeParams must be 48 bytes");
+static_assert(sizeof(TieredGqaTreeVerifyParams) == 48, "TieredGqaTreeVerifyParams must be 48 bytes");
+static_assert(sizeof(BatchKvWriteSlot) == 32, "BatchKvWriteSlot must be 32 bytes");
+static_assert(sizeof(BatchQkNormRopeKvParams) == 32, "BatchQkNormRopeKvParams must be 32 bytes");
+static_assert(sizeof(BatchGqaSlotDesc) == 16, "BatchGqaSlotDesc must be 16 bytes");
+static_assert(sizeof(BatchGqaDecodeParams) == 48, "BatchGqaDecodeParams must be 48 bytes");
+
+static inline half4 load_q8_half4(const device uchar *plane_base,
+                                  uint row,
+                                  uint groups_per_head,
+                                  uint col) {
+    const uint grp = col >> 4;
+    const uint col_in_grp = col & 15u;
+    const ulong off = (ulong(row) * groups_per_head + grp) * 68ul;
+    const char4 q4 = *(const device char4 *)(plane_base + off + col_in_grp * 4u);
+    const half2 sb = *(const device half2 *)(plane_base + off + 64u);
+    return half4(fma(float4(q4), float4(float(sb.x)), float4(float(sb.y))));
+}
+
+static inline void gqa_tile_update_d128(const threadgroup half4 *tg_k_buf,
+                                        const threadgroup half4 *tg_v_buf,
+                                        uint n_tok,
+                                        float4 q_vec,
+                                        float scale_log2e,
+                                        uint lane,
+                                        thread float &m_val,
+                                        thread float &l_val,
+                                        thread float4 &acc) {
+    if (n_tok == 8u) {
+        const float s0 = simd_sum(dot(q_vec, float4(tg_k_buf[0u * 32u + lane]))) * scale_log2e;
+        const float s1 = simd_sum(dot(q_vec, float4(tg_k_buf[1u * 32u + lane]))) * scale_log2e;
+        const float s2 = simd_sum(dot(q_vec, float4(tg_k_buf[2u * 32u + lane]))) * scale_log2e;
+        const float s3 = simd_sum(dot(q_vec, float4(tg_k_buf[3u * 32u + lane]))) * scale_log2e;
+        const float s4 = simd_sum(dot(q_vec, float4(tg_k_buf[4u * 32u + lane]))) * scale_log2e;
+        const float s5 = simd_sum(dot(q_vec, float4(tg_k_buf[5u * 32u + lane]))) * scale_log2e;
+        const float s6 = simd_sum(dot(q_vec, float4(tg_k_buf[6u * 32u + lane]))) * scale_log2e;
+        const float s7 = simd_sum(dot(q_vec, float4(tg_k_buf[7u * 32u + lane]))) * scale_log2e;
+
+        const float tile_m = max(max(max(s0, s1), max(s2, s3)),
+                                 max(max(s4, s5), max(s6, s7)));
+        const float m_new = max(m_val, tile_m);
+        const float alpha = (l_val > 0.0f) ? exp2(m_val - m_new) : 0.0f;
+        const float p0 = exp2(s0 - m_new);
+        const float p1 = exp2(s1 - m_new);
+        const float p2 = exp2(s2 - m_new);
+        const float p3 = exp2(s3 - m_new);
+        const float p4 = exp2(s4 - m_new);
+        const float p5 = exp2(s5 - m_new);
+        const float p6 = exp2(s6 - m_new);
+        const float p7 = exp2(s7 - m_new);
+
+        l_val = fma(l_val, alpha, ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)));
+        acc = acc * alpha;
+        acc = fma(float4(p0), float4(tg_v_buf[0u * 32u + lane]), acc);
+        acc = fma(float4(p1), float4(tg_v_buf[1u * 32u + lane]), acc);
+        acc = fma(float4(p2), float4(tg_v_buf[2u * 32u + lane]), acc);
+        acc = fma(float4(p3), float4(tg_v_buf[3u * 32u + lane]), acc);
+        acc = fma(float4(p4), float4(tg_v_buf[4u * 32u + lane]), acc);
+        acc = fma(float4(p5), float4(tg_v_buf[5u * 32u + lane]), acc);
+        acc = fma(float4(p6), float4(tg_v_buf[6u * 32u + lane]), acc);
+        acc = fma(float4(p7), float4(tg_v_buf[7u * 32u + lane]), acc);
+        m_val = m_new;
+    } else {
+        for (uint k = 0u; k < n_tok; k++) {
+            const float score = simd_sum(dot(q_vec, float4(tg_k_buf[k * 32u + lane]))) * scale_log2e;
+            const float m_new = max(m_val, score);
+            const float alpha = (l_val > 0.0f) ? exp2(m_val - m_new) : 0.0f;
+            const float prob = exp2(score - m_new);
+            l_val = fma(l_val, alpha, prob);
+            acc = fma(acc, float4(alpha), prob * float4(tg_v_buf[k * 32u + lane]));
+            m_val = m_new;
+        }
+    }
+}
+
+static inline void gqa_tile_update_d64(const threadgroup half4 *tg_k_buf,
+                                       const threadgroup half4 *tg_v_buf,
+                                       uint n_tok,
+                                       float4 q_vec,
+                                       float scale_log2e,
+                                       uint col,
+                                       uint half_id,
+                                       thread float &m_val,
+                                       thread float &l_val,
+                                       thread float4 &acc) {
+    if (n_tok == 16u) {
+        const uint k_off = half_id * 8u;
+        const float s0 = half_simd_sum(dot(q_vec, float4(tg_k_buf[(k_off + 0u) * 16u + col]))) * scale_log2e;
+        const float s1 = half_simd_sum(dot(q_vec, float4(tg_k_buf[(k_off + 1u) * 16u + col]))) * scale_log2e;
+        const float s2 = half_simd_sum(dot(q_vec, float4(tg_k_buf[(k_off + 2u) * 16u + col]))) * scale_log2e;
+        const float s3 = half_simd_sum(dot(q_vec, float4(tg_k_buf[(k_off + 3u) * 16u + col]))) * scale_log2e;
+        const float s4 = half_simd_sum(dot(q_vec, float4(tg_k_buf[(k_off + 4u) * 16u + col]))) * scale_log2e;
+        const float s5 = half_simd_sum(dot(q_vec, float4(tg_k_buf[(k_off + 5u) * 16u + col]))) * scale_log2e;
+        const float s6 = half_simd_sum(dot(q_vec, float4(tg_k_buf[(k_off + 6u) * 16u + col]))) * scale_log2e;
+        const float s7 = half_simd_sum(dot(q_vec, float4(tg_k_buf[(k_off + 7u) * 16u + col]))) * scale_log2e;
+
+        const float tile_m = max(max(max(s0, s1), max(s2, s3)),
+                                 max(max(s4, s5), max(s6, s7)));
+        const float m_new = max(m_val, tile_m);
+        const float alpha = (l_val > 0.0f) ? exp2(m_val - m_new) : 0.0f;
+        const float p0 = exp2(s0 - m_new);
+        const float p1 = exp2(s1 - m_new);
+        const float p2 = exp2(s2 - m_new);
+        const float p3 = exp2(s3 - m_new);
+        const float p4 = exp2(s4 - m_new);
+        const float p5 = exp2(s5 - m_new);
+        const float p6 = exp2(s6 - m_new);
+        const float p7 = exp2(s7 - m_new);
+
+        l_val = fma(l_val, alpha, ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)));
+        acc = acc * alpha;
+        acc = fma(float4(p0), float4(tg_v_buf[(k_off + 0u) * 16u + col]), acc);
+        acc = fma(float4(p1), float4(tg_v_buf[(k_off + 1u) * 16u + col]), acc);
+        acc = fma(float4(p2), float4(tg_v_buf[(k_off + 2u) * 16u + col]), acc);
+        acc = fma(float4(p3), float4(tg_v_buf[(k_off + 3u) * 16u + col]), acc);
+        acc = fma(float4(p4), float4(tg_v_buf[(k_off + 4u) * 16u + col]), acc);
+        acc = fma(float4(p5), float4(tg_v_buf[(k_off + 5u) * 16u + col]), acc);
+        acc = fma(float4(p6), float4(tg_v_buf[(k_off + 6u) * 16u + col]), acc);
+        acc = fma(float4(p7), float4(tg_v_buf[(k_off + 7u) * 16u + col]), acc);
+        m_val = m_new;
+    } else {
+        for (uint k_base = 0u; k_base < n_tok; k_base += 2u) {
+            const uint k = k_base + half_id;
+            const bool valid = (k < n_tok);
+            const float4 k4 = valid ? float4(tg_k_buf[k * 16u + col]) : float4(0.0f);
+            const float score = half_simd_sum(dot(q_vec, k4)) * scale_log2e;
+            if (valid) {
+                const float m_new = max(m_val, score);
+                const float alpha = (l_val > 0.0f) ? exp2(m_val - m_new) : 0.0f;
+                const float prob = exp2(score - m_new);
+                l_val = fma(l_val, alpha, prob);
+                acc = fma(acc, float4(alpha), prob * float4(tg_v_buf[k * 16u + col]));
+                m_val = m_new;
+            }
+        }
+    }
+}
+
+static inline void gqa_tiered_attend_range_d128(uint t_start,
+                                                uint t_end,
+                                                uint chunk_tokens,
+                                                uint head_row_base,
+                                                uint num_retired_chunks,
+                                                uint tile_table_offset,
+                                                uint retired_offset,
+                                                uint retired_plane_stride_bytes,
+                                                uint retired_chunk_stride_bytes,
+                                                float scale_log2e,
+                                                const device KvTilePair *kv_tiles,
+                                                const device uchar *retired_pool,
+                                                const device uint *retired_chunk_ids,
+                                                float4 q_vec,
+                                                bool active_q,
+                                                uint tid,
+                                                uint lane,
+                                                threadgroup half4 *tg_k0,
+                                                threadgroup half4 *tg_k1,
+                                                threadgroup half4 *tg_v0,
+                                                threadgroup half4 *tg_v1,
+                                                thread float &m_val,
+                                                thread float &l_val,
+                                                thread float4 &acc) {
+    const uint load_tok = tid >> 5;  // 0..7
+    const uint load_col = tid & 31u; // 0..31
+    const uint first_chunk = t_start / chunk_tokens;
+    const uint last_chunk = (t_end - 1u) / chunk_tokens;
+
+    for (uint chunk = first_chunk; chunk <= last_chunk; chunk++) {
+        const uint chunk_base = chunk * chunk_tokens;
+        const uint slot_lo = (t_start > chunk_base) ? (t_start - chunk_base) : 0u;
+        const uint slot_hi = min(t_end - chunk_base, chunk_tokens);
+
+        if (chunk < num_retired_chunks) {
+            const uint phys_slot = retired_chunk_ids[retired_offset + chunk];
+            const device uchar *k_plane = retired_pool + ulong(phys_slot) * retired_chunk_stride_bytes;
+            const device uchar *v_plane = k_plane + retired_plane_stride_bytes;
+
+            uint buf = 0u;
+            if (slot_lo + load_tok < slot_hi) {
+                const uint row = head_row_base + slot_lo + load_tok;
+                tg_k0[tid] = load_q8_half4(k_plane, row, 2u, load_col);
+                tg_v0[tid] = load_q8_half4(v_plane, row, 2u, load_col);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint base_slot = slot_lo; base_slot < slot_hi; base_slot += 8u) {
+                const uint n_tok = min(8u, slot_hi - base_slot);
+                const uint next_base = base_slot + 8u;
+                const uint next_buf = buf ^ 1u;
+
+                half4 next_k = half4(0.0h);
+                half4 next_v = half4(0.0h);
+                const bool has_next = (next_base + load_tok < slot_hi);
+                if (has_next) {
+                    const uint next_row = head_row_base + next_base + load_tok;
+                    next_k = load_q8_half4(k_plane, next_row, 2u, load_col);
+                    next_v = load_q8_half4(v_plane, next_row, 2u, load_col);
+                }
+
+                if (active_q) {
+                    const threadgroup half4 *cur_k = (buf == 0u) ? tg_k0 : tg_k1;
+                    const threadgroup half4 *cur_v = (buf == 0u) ? tg_v0 : tg_v1;
+                    gqa_tile_update_d128(cur_k, cur_v, n_tok, q_vec, scale_log2e, lane, m_val, l_val, acc);
+                }
+
+                if (has_next) {
+                    threadgroup half4 *dst_k = (next_buf == 0u) ? tg_k0 : tg_k1;
+                    threadgroup half4 *dst_v = (next_buf == 0u) ? tg_v0 : tg_v1;
+                    dst_k[tid] = next_k;
+                    dst_v[tid] = next_v;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                buf = next_buf;
+            }
+        } else {
+            const uint active_idx = tile_table_offset + (chunk - num_retired_chunks);
+            const texture2d<half, access::read> k_tex = kv_tiles[active_idx].k_tex;
+            const texture2d<half, access::read> v_tex = kv_tiles[active_idx].v_tex;
+
+            uint buf = 0u;
+            if (slot_lo + load_tok < slot_hi) {
+                const uint row = head_row_base + slot_lo + load_tok;
+                tg_k0[tid] = k_tex.read(uint2(load_col, row));
+                tg_v0[tid] = v_tex.read(uint2(load_col, row));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint base_slot = slot_lo; base_slot < slot_hi; base_slot += 8u) {
+                const uint n_tok = min(8u, slot_hi - base_slot);
+                const uint next_base = base_slot + 8u;
+                const uint next_buf = buf ^ 1u;
+
+                half4 next_k = half4(0.0h);
+                half4 next_v = half4(0.0h);
+                const bool has_next = (next_base + load_tok < slot_hi);
+                if (has_next) {
+                    const uint next_row = head_row_base + next_base + load_tok;
+                    next_k = k_tex.read(uint2(load_col, next_row));
+                    next_v = v_tex.read(uint2(load_col, next_row));
+                }
+
+                if (active_q) {
+                    const threadgroup half4 *cur_k = (buf == 0u) ? tg_k0 : tg_k1;
+                    const threadgroup half4 *cur_v = (buf == 0u) ? tg_v0 : tg_v1;
+                    gqa_tile_update_d128(cur_k, cur_v, n_tok, q_vec, scale_log2e, lane, m_val, l_val, acc);
+                }
+
+                if (has_next) {
+                    threadgroup half4 *dst_k = (next_buf == 0u) ? tg_k0 : tg_k1;
+                    threadgroup half4 *dst_v = (next_buf == 0u) ? tg_v0 : tg_v1;
+                    dst_k[tid] = next_k;
+                    dst_v[tid] = next_v;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                buf = next_buf;
+            }
+        }
+    }
+}
+
+static inline void gqa_tiered_attend_range_d64(uint t_start,
+                                               uint t_end,
+                                               uint chunk_tokens,
+                                               uint head_row_base,
+                                               uint num_retired_chunks,
+                                               uint tile_table_offset,
+                                               uint retired_offset,
+                                               uint retired_plane_stride_bytes,
+                                               uint retired_chunk_stride_bytes,
+                                               float scale_log2e,
+                                               const device KvTilePair *kv_tiles,
+                                               const device uchar *retired_pool,
+                                               const device uint *retired_chunk_ids,
+                                               float4 q_vec,
+                                               bool active_q,
+                                               uint tid,
+                                               uint col,
+                                               uint half_id,
+                                               threadgroup half4 *tg_k0,
+                                               threadgroup half4 *tg_k1,
+                                               threadgroup half4 *tg_v0,
+                                               threadgroup half4 *tg_v1,
+                                               thread float &m_val,
+                                               thread float &l_val,
+                                               thread float4 &acc) {
+    const uint load_tok = tid >> 4;  // 0..15
+    const uint load_col = tid & 15u; // 0..15
+    const uint first_chunk = t_start / chunk_tokens;
+    const uint last_chunk = (t_end - 1u) / chunk_tokens;
+
+    for (uint chunk = first_chunk; chunk <= last_chunk; chunk++) {
+        const uint chunk_base = chunk * chunk_tokens;
+        const uint slot_lo = (t_start > chunk_base) ? (t_start - chunk_base) : 0u;
+        const uint slot_hi = min(t_end - chunk_base, chunk_tokens);
+
+        if (chunk < num_retired_chunks) {
+            const uint phys_slot = retired_chunk_ids[retired_offset + chunk];
+            const device uchar *k_plane = retired_pool + ulong(phys_slot) * retired_chunk_stride_bytes;
+            const device uchar *v_plane = k_plane + retired_plane_stride_bytes;
+
+            uint buf = 0u;
+            if (slot_lo + load_tok < slot_hi) {
+                const uint row = head_row_base + slot_lo + load_tok;
+                tg_k0[tid] = load_q8_half4(k_plane, row, 1u, load_col);
+                tg_v0[tid] = load_q8_half4(v_plane, row, 1u, load_col);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint base_slot = slot_lo; base_slot < slot_hi; base_slot += 16u) {
+                const uint n_tok = min(16u, slot_hi - base_slot);
+                const uint next_base = base_slot + 16u;
+                const uint next_buf = buf ^ 1u;
+
+                half4 next_k = half4(0.0h);
+                half4 next_v = half4(0.0h);
+                const bool has_next = (next_base + load_tok < slot_hi);
+                if (has_next) {
+                    const uint next_row = head_row_base + next_base + load_tok;
+                    next_k = load_q8_half4(k_plane, next_row, 1u, load_col);
+                    next_v = load_q8_half4(v_plane, next_row, 1u, load_col);
+                }
+
+                if (active_q) {
+                    const threadgroup half4 *cur_k = (buf == 0u) ? tg_k0 : tg_k1;
+                    const threadgroup half4 *cur_v = (buf == 0u) ? tg_v0 : tg_v1;
+                    gqa_tile_update_d64(cur_k, cur_v, n_tok, q_vec, scale_log2e, col, half_id, m_val, l_val, acc);
+                }
+
+                if (has_next) {
+                    threadgroup half4 *dst_k = (next_buf == 0u) ? tg_k0 : tg_k1;
+                    threadgroup half4 *dst_v = (next_buf == 0u) ? tg_v0 : tg_v1;
+                    dst_k[tid] = next_k;
+                    dst_v[tid] = next_v;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                buf = next_buf;
+            }
+        } else {
+            const uint active_idx = tile_table_offset + (chunk - num_retired_chunks);
+            const texture2d<half, access::read> k_tex = kv_tiles[active_idx].k_tex;
+            const texture2d<half, access::read> v_tex = kv_tiles[active_idx].v_tex;
+
+            uint buf = 0u;
+            if (slot_lo + load_tok < slot_hi) {
+                const uint row = head_row_base + slot_lo + load_tok;
+                tg_k0[tid] = k_tex.read(uint2(load_col, row));
+                tg_v0[tid] = v_tex.read(uint2(load_col, row));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint base_slot = slot_lo; base_slot < slot_hi; base_slot += 16u) {
+                const uint n_tok = min(16u, slot_hi - base_slot);
+                const uint next_base = base_slot + 16u;
+                const uint next_buf = buf ^ 1u;
+
+                half4 next_k = half4(0.0h);
+                half4 next_v = half4(0.0h);
+                const bool has_next = (next_base + load_tok < slot_hi);
+                if (has_next) {
+                    const uint next_row = head_row_base + next_base + load_tok;
+                    next_k = k_tex.read(uint2(load_col, next_row));
+                    next_v = v_tex.read(uint2(load_col, next_row));
+                }
+
+                if (active_q) {
+                    const threadgroup half4 *cur_k = (buf == 0u) ? tg_k0 : tg_k1;
+                    const threadgroup half4 *cur_v = (buf == 0u) ? tg_v0 : tg_v1;
+                    gqa_tile_update_d64(cur_k, cur_v, n_tok, q_vec, scale_log2e, col, half_id, m_val, l_val, acc);
+                }
+
+                if (has_next) {
+                    threadgroup half4 *dst_k = (next_buf == 0u) ? tg_k0 : tg_k1;
+                    threadgroup half4 *dst_v = (next_buf == 0u) ? tg_v0 : tg_v1;
+                    dst_k[tid] = next_k;
+                    dst_v[tid] = next_v;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                buf = next_buf;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 7 (R5): Retire a completed 512-token RGBA16Float IOSurface KvTilePair
+// into a group-64 q8 slot (`64 int8 + f16 scale + f16 bias = 68 B / 64 dims`)
+// inside `RetiredKvQ8Pool`.
+//
+// Grid: (num_kv_heads * chunk_tokens, head_dim / 64, 1) threadgroups, 32 threads.
+// Lanes 0..15 quantize K; lanes 16..31 quantize V independently with zero TG mem.
+// ---------------------------------------------------------------------------
+kernel void ami_kv_retire_tile_to_q8(device uchar *retired_pool [[buffer(0)]],
+                                     constant KvRetireQ8Params &p [[buffer(1)]],
+                                     texture2d<half, access::read> k_tex [[texture(0)]],
+                                     texture2d<half, access::read> v_tex [[texture(1)]],
+                                     uint2 tg_pos [[threadgroup_position_in_grid]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+    const uint total_rows = p.num_kv_heads * p.chunk_tokens;
+    const uint groups_per_head = p.head_dim >> 6;
+    const uint row = tg_pos.x;
+    const uint group_idx = tg_pos.y;
+    if (row >= total_rows || group_idx >= groups_per_head) {
+        return;
+    }
+
+    const uint is_v = lane >> 4;        // 0 = K, 1 = V
+    const uint col_in_grp = lane & 15u; // 0..15 (4 dims per lane = 64 dims)
+    const uint tex_col = group_idx * 16u + col_in_grp;
+
+    const half4 h4 = (is_v == 0u) ? k_tex.read(uint2(tex_col, row))
+                                  : v_tex.read(uint2(tex_col, row));
+    const float4 x = float4(h4);
+
+    const float lo = half_simd_min(min(min(x.x, x.y), min(x.z, x.w)));
+    const float hi = half_simd_max(max(max(x.x, x.y), max(x.z, x.w)));
+
+    const float range = hi - lo;
+    const half scale_h = half(range / 255.0f);
+    const float scale_f = float(scale_h);
+    const float mid = 0.5f * (lo + hi);
+    const half bias_h = (scale_f > 0.0f) ? half(fma(0.5f, scale_f, mid)) : half(mid);
+    const float bias_f = float(bias_h);
+    const float inv_scale = (scale_f > 0.0f) ? (1.0f / scale_f) : 0.0f;
+
+    const int4 qi = clamp(int4(rint((x - bias_f) * inv_scale)), int4(-128), int4(127));
+    const char4 q4 = char4(qi);
+
+    const ulong chunk_base = ulong(p.dst_slot) * p.chunk_stride_bytes;
+    const ulong plane_base = chunk_base + ((is_v != 0u) ? ulong(p.plane_stride_bytes) : 0ul);
+    const ulong grp_off = (ulong(row) * groups_per_head + group_idx) * 68ul;
+    device uchar *dst = retired_pool + plane_base + grp_off;
+
+    *(device char4 *)(dst + col_in_grp * 4u) = q4;
+    if (col_in_grp == 0u) {
+        *(device half2 *)(dst + 64u) = half2(scale_h, bias_h);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 8 (R8): Copy-on-Write partial tail KvTile copy on GPU (0 CPU memcpy).
+// Copies `valid_tokens` (`1..chunk_tokens`) token-major RGBA16Float rows across
+// `num_kv_heads` from cached `(src_k, src_v)` into private `(dst_k, dst_v)`.
+//
+// Grid: (num_kv_heads, valid_tokens, 1) threadgroups, 32 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_kv_tile_cow_copy(constant KvTileCowCopyParams &p [[buffer(0)]],
+                                 texture2d<half, access::read> src_k [[texture(0)]],
+                                 texture2d<half, access::read> src_v [[texture(1)]],
+                                 texture2d<half, access::write> dst_k [[texture(2)]],
+                                 texture2d<half, access::write> dst_v [[texture(3)]],
+                                 uint2 tg_pos [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    const uint kvh = tg_pos.x;
+    const uint tok = tg_pos.y;
+    if (kvh >= p.num_kv_heads || tok >= p.valid_tokens) {
+        return;
+    }
+    const uint row = kvh * p.chunk_tokens + tok;
+    const uint num_cols = p.head_dim >> 2;
+    for (uint col = lane; col < num_cols; col += 32u) {
+        dst_k.write(src_k.read(uint2(col, row)), uint2(col, row));
+        dst_v.write(src_v.read(uint2(col, row)), uint2(col, row));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 9 (R5): Tiered GQA Decode Attention (M = 1) seamlessly spanning
+// `num_retired_chunks` group-64 q8 chunks in `RetiredKvQ8Pool` AND active
+// `RGBA16Float` IOSurface `KvTilePair`s in ONE split-KV online-softmax pass.
+//
+// Specialized on ATTN_HEAD_DIM ({64, 128}).
+// Grid: (num_kv_heads * q_groups_per_kv, num_splits, 1) threadgroups, 256 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_gqa_tiered_decode_attn_split(const device half *q [[buffer(0)]],
+                                             const device KvTilePair *kv_tiles [[buffer(1)]],
+                                             const device uchar *retired_pool [[buffer(2)]],
+                                             const device uint *retired_chunk_ids [[buffer(3)]],
+                                             device half *out [[buffer(4)]],
+                                             device float *partial_m [[buffer(5)]],
+                                             device float *partial_l [[buffer(6)]],
+                                             device float *partial_o [[buffer(7)]],
+                                             constant TieredGqaDecodeParams &p [[buffer(8)]],
+                                             uint2 tg_pos [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint sg_id [[simdgroup_index_in_threadgroup]],
+                                             uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint Q_TILE = 8u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint kv_head = tg_pos.x / p.q_groups_per_kv;
+    const uint q_grp = tg_pos.x % p.q_groups_per_kv;
+    const uint split_idx = tg_pos.y;
+    if (kv_head >= p.num_kv_heads || split_idx >= p.num_splits) {
+        return;
+    }
+
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint q_start = kv_head * gqa_ratio + q_grp * Q_TILE;
+    const uint q_end = min(q_start + Q_TILE, (kv_head + 1u) * gqa_ratio);
+    const uint q_cnt = q_end - q_start;
+
+    const uint tokens_per_split = (p.seq_len + p.num_splits - 1u) / p.num_splits;
+    const uint t_start = split_idx * tokens_per_split;
+    const uint t_end = min(t_start + tokens_per_split, p.seq_len);
+
+    if (t_start >= t_end) {
+        if (p.num_splits > 1u && tid < q_cnt) {
+            const ulong ps = ulong(q_start + tid) * p.num_splits + split_idx;
+            partial_m[ps] = -INFINITY;
+            partial_l[ps] = 0.0f;
+        }
+        return;
+    }
+
+    const bool active_q = (sg_id < q_cnt);
+    const uint qh = q_start + min(sg_id, q_cnt - 1u);
+    const float scale_log2e = p.scale * LOG2E;
+    const uint head_row_base = kv_head * p.chunk_tokens;
+
+    threadgroup half4 tg_k0[256];
+    threadgroup half4 tg_k1[256];
+    threadgroup half4 tg_v0[256];
+    threadgroup half4 tg_v1[256];
+
+    if (ATTN_HEAD_DIM == 128u) {
+        const float4 q_vec = active_q
+            ? float4(*(const device half4 *)(q + ulong(qh) * 128u + lane * 4u))
+            : float4(0.0f);
+        float m_val = -INFINITY;
+        float l_val = 0.0f;
+        float4 acc = float4(0.0f);
+
+        gqa_tiered_attend_range_d128(t_start, t_end, p.chunk_tokens, head_row_base,
+                                     p.num_retired_chunks, 0u, 0u,
+                                     p.retired_plane_stride_bytes, p.retired_chunk_stride_bytes,
+                                     scale_log2e, kv_tiles, retired_pool, retired_chunk_ids,
+                                     q_vec, active_q, tid, lane,
+                                     tg_k0, tg_k1, tg_v0, tg_v1, m_val, l_val, acc);
+
+        if (active_q) {
+            if (p.num_splits == 1u) {
+                const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+                *(device half4 *)(out + ulong(qh) * 128u + lane * 4u) = half4(acc * inv_l);
+            } else {
+                const ulong ps = ulong(qh) * p.num_splits + split_idx;
+                if (lane == 0u) {
+                    partial_m[ps] = m_val;
+                    partial_l[ps] = l_val;
+                }
+                *(device float4 *)(partial_o + ps * 128u + lane * 4u) = acc;
+            }
+        }
+    } else {
+        const uint col = lane & 15u;
+        const uint half_id = lane >> 4;
+        const float4 q_vec = active_q
+            ? float4(*(const device half4 *)(q + ulong(qh) * 64u + col * 4u))
+            : float4(0.0f);
+        float m_val = -INFINITY;
+        float l_val = 0.0f;
+        float4 acc = float4(0.0f);
+
+        gqa_tiered_attend_range_d64(t_start, t_end, p.chunk_tokens, head_row_base,
+                                    p.num_retired_chunks, 0u, 0u,
+                                    p.retired_plane_stride_bytes, p.retired_chunk_stride_bytes,
+                                    scale_log2e, kv_tiles, retired_pool, retired_chunk_ids,
+                                    q_vec, active_q, tid, col, half_id,
+                                    tg_k0, tg_k1, tg_v0, tg_v1, m_val, l_val, acc);
+
+        if (active_q) {
+            const float other_m = simd_shuffle_xor(m_val, 16u);
+            const float other_l = simd_shuffle_xor(l_val, 16u);
+            const float4 other_acc = float4(simd_shuffle_xor(acc.x, 16u),
+                                            simd_shuffle_xor(acc.y, 16u),
+                                            simd_shuffle_xor(acc.z, 16u),
+                                            simd_shuffle_xor(acc.w, 16u));
+            const float m_final = max(m_val, other_m);
+            const float w_self = (l_val > 0.0f) ? exp2(m_val - m_final) : 0.0f;
+            const float w_other = (other_l > 0.0f) ? exp2(other_m - m_final) : 0.0f;
+            const float l_final = fma(w_self, l_val, w_other * other_l);
+            const float4 acc_final = fma(float4(w_self), acc, float4(w_other) * other_acc);
+
+            if (lane < 16u) {
+                if (p.num_splits == 1u) {
+                    const float inv_l = (l_final > 0.0f) ? (1.0f / l_final) : 0.0f;
+                    *(device half4 *)(out + ulong(qh) * 64u + col * 4u) = half4(acc_final * inv_l);
+                } else {
+                    const ulong ps = ulong(qh) * p.num_splits + split_idx;
+                    if (lane == 0u) {
+                        partial_m[ps] = m_final;
+                        partial_l[ps] = l_final;
+                    }
+                    *(device float4 *)(partial_o + ps * 64u + col * 4u) = acc_final;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 10 (R5 + G5): Tiered Speculative Tree-Attention Verification
+// spanning retired group-64 q8 chunks, active RGBA16Float KvTiles, AND
+// 64-bit ancestor-masked tree KV in ONE split-KV pass.
+//
+// Specialized on ATTN_HEAD_DIM ({64, 128}) and TREE_MAX_NODES ({16, 32, 64}).
+// Grid: (num_kv_heads * q_groups_per_kv, num_splits, 1) threadgroups, 256 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_gqa_tiered_tree_verify_attn_split(const device half *q [[buffer(0)]],
+                                                  const device KvTilePair *kv_tiles [[buffer(1)]],
+                                                  const device uchar *retired_pool [[buffer(2)]],
+                                                  const device uint *retired_chunk_ids [[buffer(3)]],
+                                                  const device half *k_tree [[buffer(4)]],
+                                                  const device half *v_tree [[buffer(5)]],
+                                                  const device ulong *ancestor_masks [[buffer(6)]],
+                                                  device half *out [[buffer(7)]],
+                                                  device float *partial_m [[buffer(8)]],
+                                                  device float *partial_l [[buffer(9)]],
+                                                  device float *partial_o [[buffer(10)]],
+                                                  constant TieredGqaTreeVerifyParams &p [[buffer(11)]],
+                                                  uint2 tg_pos [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint sg_id [[simdgroup_index_in_threadgroup]],
+                                                  uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint Q_TILE = 8u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint kv_head = tg_pos.x / p.q_groups_per_kv;
+    const uint q_grp = tg_pos.x % p.q_groups_per_kv;
+    const uint split_idx = tg_pos.y;
+    if (kv_head >= p.num_kv_heads || split_idx >= p.num_splits) {
+        return;
+    }
+
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint total_q = p.num_nodes * gqa_ratio;
+    const uint q_start_flat = q_grp * Q_TILE;
+    if (q_start_flat >= total_q) {
+        return;
+    }
+    const uint q_cnt = min(Q_TILE, total_q - q_start_flat);
+
+    uint t_start = 0u;
+    uint t_end = 0u;
+    if (p.base_pos > 0u) {
+        const uint tokens_per_split = (p.base_pos + p.num_splits - 1u) / p.num_splits;
+        t_start = split_idx * tokens_per_split;
+        t_end = min(t_start + tokens_per_split, p.base_pos);
+    }
+
+    const bool do_prefix = (t_start < t_end);
+    const bool do_tree = (split_idx == 0u);
+    if (!do_prefix && !do_tree) {
+        if (p.num_splits > 1u && tid < q_cnt) {
+            const uint flat_q = q_start_flat + tid;
+            const uint node = flat_q / gqa_ratio;
+            const uint qh = kv_head * gqa_ratio + (flat_q - node * gqa_ratio);
+            const ulong ps = (ulong(node) * p.num_q_heads + qh) * p.num_splits + split_idx;
+            partial_m[ps] = -INFINITY;
+            partial_l[ps] = 0.0f;
+        }
+        return;
+    }
+
+    const bool active_q = (sg_id < q_cnt);
+    const uint safe_flat = q_start_flat + min(sg_id, q_cnt - 1u);
+    const uint node = safe_flat / gqa_ratio;
+    const uint qh = kv_head * gqa_ratio + (safe_flat - node * gqa_ratio);
+    const ulong mask = active_q ? ancestor_masks[node] : 0ul;
+    const float scale_log2e = p.scale * LOG2E;
+    const uint head_row_base = kv_head * p.chunk_tokens;
+
+    threadgroup half4 tg_k0[256];
+    threadgroup half4 tg_k1[256];
+    threadgroup half4 tg_v0[256];
+    threadgroup half4 tg_v1[256];
+
+    if (ATTN_HEAD_DIM == 128u) {
+        const ulong q_off = (ulong(node) * p.num_q_heads + qh) * 128u + lane * 4u;
+        const float4 q_vec = active_q ? float4(*(const device half4 *)(q + q_off)) : float4(0.0f);
+        float m_val = -INFINITY;
+        float l_val = 0.0f;
+        float4 acc = float4(0.0f);
+
+        if (do_prefix) {
+            gqa_tiered_attend_range_d128(t_start, t_end, p.chunk_tokens, head_row_base,
+                                         p.num_retired_chunks, 0u, 0u,
+                                         p.retired_plane_stride_bytes, p.retired_chunk_stride_bytes,
+                                         scale_log2e, kv_tiles, retired_pool, retired_chunk_ids,
+                                         q_vec, active_q, tid, lane,
+                                         tg_k0, tg_k1, tg_v0, tg_v1, m_val, l_val, acc);
+        }
+
+        if (do_tree) {
+            const uint load_tok = tid >> 5;
+            const uint load_col = tid & 31u;
+            for (uint t_base = 0u; t_base < TREE_MAX_NODES; t_base += 8u) {
+                if (t_base >= p.num_nodes) {
+                    break;
+                }
+                const uint n_tok = min(8u, p.num_nodes - t_base);
+                if (load_tok < n_tok) {
+                    const uint node_j = t_base + load_tok;
+                    const ulong kv_off = (ulong(node_j) * p.num_kv_heads + kv_head) * 128u + load_col * 4u;
+                    tg_k0[tid] = *(const device half4 *)(k_tree + kv_off);
+                    tg_v0[tid] = *(const device half4 *)(v_tree + kv_off);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (active_q) {
+                    const uint tile_mask = uint((mask >> t_base) & 0xFFul);
+                    if (tile_mask != 0u) {
+                        for (uint k = 0u; k < n_tok; k++) {
+                            if (((tile_mask >> k) & 1u) != 0u) {
+                                const float score = simd_sum(dot(q_vec, float4(tg_k0[k * 32u + lane]))) * scale_log2e;
+                                const float m_new = max(m_val, score);
+                                const float alpha = (l_val > 0.0f) ? exp2(m_val - m_new) : 0.0f;
+                                const float prob = exp2(score - m_new);
+                                l_val = fma(l_val, alpha, prob);
+                                acc = fma(acc, float4(alpha), prob * float4(tg_v0[k * 32u + lane]));
+                                m_val = m_new;
+                            }
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        if (active_q) {
+            if (p.num_splits == 1u) {
+                const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+                *(device half4 *)(out + (ulong(node) * p.num_q_heads + qh) * 128u + lane * 4u) = half4(acc * inv_l);
+            } else {
+                const ulong ps = (ulong(node) * p.num_q_heads + qh) * p.num_splits + split_idx;
+                if (lane == 0u) {
+                    partial_m[ps] = m_val;
+                    partial_l[ps] = l_val;
+                }
+                *(device float4 *)(partial_o + ps * 128u + lane * 4u) = acc;
+            }
+        }
+    } else {
+        const uint col = lane & 15u;
+        const uint half_id = lane >> 4;
+        const ulong q_off = (ulong(node) * p.num_q_heads + qh) * 64u + col * 4u;
+        const float4 q_vec = active_q ? float4(*(const device half4 *)(q + q_off)) : float4(0.0f);
+        float m_val = -INFINITY;
+        float l_val = 0.0f;
+        float4 acc = float4(0.0f);
+
+        if (do_prefix) {
+            gqa_tiered_attend_range_d64(t_start, t_end, p.chunk_tokens, head_row_base,
+                                        p.num_retired_chunks, 0u, 0u,
+                                        p.retired_plane_stride_bytes, p.retired_chunk_stride_bytes,
+                                        scale_log2e, kv_tiles, retired_pool, retired_chunk_ids,
+                                        q_vec, active_q, tid, col, half_id,
+                                        tg_k0, tg_k1, tg_v0, tg_v1, m_val, l_val, acc);
+        }
+
+        if (do_tree) {
+            const uint load_tok = tid >> 4;
+            const uint load_col = tid & 15u;
+            for (uint t_base = 0u; t_base < TREE_MAX_NODES; t_base += 16u) {
+                if (t_base >= p.num_nodes) {
+                    break;
+                }
+                const uint n_tok = min(16u, p.num_nodes - t_base);
+                if (load_tok < n_tok) {
+                    const uint node_j = t_base + load_tok;
+                    const ulong kv_off = (ulong(node_j) * p.num_kv_heads + kv_head) * 64u + load_col * 4u;
+                    tg_k0[tid] = *(const device half4 *)(k_tree + kv_off);
+                    tg_v0[tid] = *(const device half4 *)(v_tree + kv_off);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (active_q) {
+                    const uint tile_mask = uint((mask >> t_base) & 0xFFFFul);
+                    if (tile_mask != 0u) {
+                        for (uint k_base = 0u; k_base < n_tok; k_base += 2u) {
+                            const uint k = k_base + half_id;
+                            const bool valid = (k < n_tok) && (((tile_mask >> k) & 1u) != 0u);
+                            const float4 k4 = valid ? float4(tg_k0[k * 16u + col]) : float4(0.0f);
+                            const float score = half_simd_sum(dot(q_vec, k4)) * scale_log2e;
+                            if (valid) {
+                                const float m_new = max(m_val, score);
+                                const float alpha = (l_val > 0.0f) ? exp2(m_val - m_new) : 0.0f;
+                                const float prob = exp2(score - m_new);
+                                l_val = fma(l_val, alpha, prob);
+                                acc = fma(acc, float4(alpha), prob * float4(tg_v0[k * 16u + col]));
+                                m_val = m_new;
+                            }
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        if (active_q) {
+            const float other_m = simd_shuffle_xor(m_val, 16u);
+            const float other_l = simd_shuffle_xor(l_val, 16u);
+            const float4 other_acc = float4(simd_shuffle_xor(acc.x, 16u),
+                                            simd_shuffle_xor(acc.y, 16u),
+                                            simd_shuffle_xor(acc.z, 16u),
+                                            simd_shuffle_xor(acc.w, 16u));
+            const float m_final = max(m_val, other_m);
+            const float w_self = (l_val > 0.0f) ? exp2(m_val - m_final) : 0.0f;
+            const float w_other = (other_l > 0.0f) ? exp2(other_m - m_final) : 0.0f;
+            const float l_final = fma(w_self, l_val, w_other * other_l);
+            const float4 acc_final = fma(float4(w_self), acc, float4(w_other) * other_acc);
+
+            if (lane < 16u) {
+                if (p.num_splits == 1u) {
+                    const float inv_l = (l_final > 0.0f) ? (1.0f / l_final) : 0.0f;
+                    *(device half4 *)(out + (ulong(node) * p.num_q_heads + qh) * 64u + col * 4u) = half4(acc_final * inv_l);
+                } else {
+                    const ulong ps = (ulong(node) * p.num_q_heads + qh) * p.num_splits + split_idx;
+                    if (lane == 0u) {
+                        partial_m[ps] = m_final;
+                        partial_l[ps] = l_final;
+                    }
+                    *(device float4 *)(partial_o + ps * 64u + col * 4u) = acc_final;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 11 (C14): Multi-Request Batched QK-Norm + NeoX RoPE + Bindless KV Write
+// Executes `batch_size` (`1..16+`) independent decode slots in ONE GPU pass.
+//
+// Specialized on NORM_W_BF16 (function_constant(2)).
+// Grid: (num_q_heads + num_kv_heads, batch_size, 1) threadgroups, 32 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_batch_qknorm_rope_kv_write(device half *q [[buffer(0)]],
+                                           const device half *k [[buffer(1)]],
+                                           const device half *v [[buffer(2)]],
+                                           const device uchar *q_norm [[buffer(3)]],
+                                           const device uchar *k_norm [[buffer(4)]],
+                                           const device BatchKvWriteSlot *slots [[buffer(5)]],
+                                           constant BatchQkNormRopeKvParams &p [[buffer(6)]],
+                                           uint2 tg_pos [[threadgroup_position_in_grid]],
+                                           uint lane [[thread_index_in_simdgroup]]) {
+    const uint total_heads = p.num_q_heads + p.num_kv_heads;
+    const uint b = tg_pos.y;
+    if (tg_pos.x >= total_heads || b >= p.batch_size) {
+        return;
+    }
+
+    threadgroup float vec[256];
+    const bool is_q = (tg_pos.x < p.num_q_heads);
+    const uint head_idx = is_q ? tg_pos.x : (tg_pos.x - p.num_q_heads);
+    const uint d_dim = p.head_dim;
+    const uint half_dim = d_dim >> 1;
+
+    const ulong q_off = (ulong(b) * p.num_q_heads + head_idx) * d_dim;
+    const ulong kv_off = (ulong(b) * p.num_kv_heads + head_idx) * d_dim;
+    const device half *src = is_q ? (q + q_off) : (k + kv_off);
+
+    float sum_sq = 0.0f;
+    for (uint d = lane; d < d_dim; d += 32u) {
+        const float val = float(src[d]);
+        vec[d] = val;
+        sum_sq = fma(val, val, sum_sq);
+    }
+
+    if (p.apply_qk_norm != 0u) {
+        const float total_sq = simd_sum(sum_sq);
+        const float inv_rms = rsqrt(total_sq / float(d_dim) + p.rms_eps);
+        const device uchar *nw = is_q ? q_norm : k_norm;
+        for (uint d = lane; d < d_dim; d += 32u) {
+            vec[d] = (vec[d] * inv_rms) * norm_w1(nw, d, NORM_W_BF16);
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const BatchKvWriteSlot slot = slots[b];
+    const float log_theta = log(p.rope_theta);
+    const float inv_d = 2.0f / float(d_dim);
+    const float fpos = float(slot.pos);
+    for (uint j = lane; j < half_dim; j += 32u) {
+        const float inv_freq = exp(-log_theta * (float(j) * inv_d));
+        const float angle = fpos * inv_freq;
+        const float c = cos(angle);
+        const float s = sin(angle);
+        const float x0 = vec[j];
+        const float x1 = vec[j + half_dim];
+        vec[j] = fma(x0, c, -x1 * s);
+        vec[j + half_dim] = fma(x1, c, x0 * s);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (is_q) {
+        device half *dst = q + q_off;
+        for (uint d = lane; d < d_dim; d += 32u) {
+            dst[d] = half(vec[d]);
+        }
+    } else {
+        const uint row = head_idx * p.chunk_tokens + slot.slot_in_chunk;
+        const uint num_cols = d_dim >> 2;
+        const device half4 *v_src = (const device half4 *)(v + kv_off);
+        for (uint col = lane; col < num_cols; col += 32u) {
+            const uint base = col * 4u;
+            const half4 k4 = half4(half(vec[base + 0u]),
+                                   half(vec[base + 1u]),
+                                   half(vec[base + 2u]),
+                                   half(vec[base + 3u]));
+            slot.k_tex.write(k4, uint2(col, row));
+            slot.v_tex.write(v_src[col], uint2(col, row));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 12a (C14 + R5): Multi-Request Batched Tiered GQA Decode Split-KV
+// Executes `batch_size` (`1..16+`) independent decode requests with per-slot
+// `(seq_len[b], tile_table_offset[b], retired_offset[b], num_retired_chunks[b])`
+// in ONE GPU dispatch.
+//
+// Specialized on ATTN_HEAD_DIM ({64, 128}).
+// Grid: (num_kv_heads * q_groups_per_kv, num_splits, batch_size) threadgroups,
+//       256 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_batch_gqa_decode_attn_split(const device half *q [[buffer(0)]],
+                                            const device KvTilePair *kv_tiles [[buffer(1)]],
+                                            const device uchar *retired_pool [[buffer(2)]],
+                                            const device uint *retired_chunk_ids [[buffer(3)]],
+                                            const device BatchGqaSlotDesc *slots [[buffer(4)]],
+                                            device half *out [[buffer(5)]],
+                                            device float *partial_m [[buffer(6)]],
+                                            device float *partial_l [[buffer(7)]],
+                                            device float *partial_o [[buffer(8)]],
+                                            constant BatchGqaDecodeParams &p [[buffer(9)]],
+                                            uint3 tg_pos [[threadgroup_position_in_grid]],
+                                            uint tid [[thread_index_in_threadgroup]],
+                                            uint sg_id [[simdgroup_index_in_threadgroup]],
+                                            uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint Q_TILE = 8u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint kv_head = tg_pos.x / p.q_groups_per_kv;
+    const uint q_grp = tg_pos.x % p.q_groups_per_kv;
+    const uint split_idx = tg_pos.y;
+    const uint b = tg_pos.z;
+    if (kv_head >= p.num_kv_heads || split_idx >= p.num_splits || b >= p.batch_size) {
+        return;
+    }
+
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint q_start = kv_head * gqa_ratio + q_grp * Q_TILE;
+    const uint q_end = min(q_start + Q_TILE, (kv_head + 1u) * gqa_ratio);
+    const uint q_cnt = q_end - q_start;
+
+    const BatchGqaSlotDesc slot = slots[b];
+    const uint seq_len = slot.seq_len;
+    const uint tokens_per_split = (seq_len > 0u) ? ((seq_len + p.num_splits - 1u) / p.num_splits) : 0u;
+    const uint t_start = split_idx * tokens_per_split;
+    const uint t_end = min(t_start + tokens_per_split, seq_len);
+
+    if (t_start >= t_end) {
+        if (p.num_splits > 1u && tid < q_cnt) {
+            const ulong ps = (ulong(b) * p.num_q_heads + (q_start + tid)) * p.num_splits + split_idx;
+            partial_m[ps] = -INFINITY;
+            partial_l[ps] = 0.0f;
+        } else if (p.num_splits == 1u && sg_id < q_cnt) {
+            const uint qh = q_start + sg_id;
+            const uint num_texels = ATTN_HEAD_DIM >> 2;
+            if (lane < num_texels) {
+                *(device half4 *)(out + (ulong(b) * p.num_q_heads + qh) * ATTN_HEAD_DIM + lane * 4u) = half4(0.0h);
+            }
+        }
+        return;
+    }
+
+    const bool active_q = (sg_id < q_cnt);
+    const uint qh = q_start + min(sg_id, q_cnt - 1u);
+    const float scale_log2e = p.scale * LOG2E;
+    const uint head_row_base = kv_head * p.chunk_tokens;
+
+    threadgroup half4 tg_k0[256];
+    threadgroup half4 tg_k1[256];
+    threadgroup half4 tg_v0[256];
+    threadgroup half4 tg_v1[256];
+
+    if (ATTN_HEAD_DIM == 128u) {
+        const ulong q_off = (ulong(b) * p.num_q_heads + qh) * 128u + lane * 4u;
+        const float4 q_vec = active_q ? float4(*(const device half4 *)(q + q_off)) : float4(0.0f);
+        float m_val = -INFINITY;
+        float l_val = 0.0f;
+        float4 acc = float4(0.0f);
+
+        gqa_tiered_attend_range_d128(t_start, t_end, p.chunk_tokens, head_row_base,
+                                     slot.num_retired_chunks, slot.tile_table_offset, slot.retired_offset,
+                                     p.retired_plane_stride_bytes, p.retired_chunk_stride_bytes,
+                                     scale_log2e, kv_tiles, retired_pool, retired_chunk_ids,
+                                     q_vec, active_q, tid, lane,
+                                     tg_k0, tg_k1, tg_v0, tg_v1, m_val, l_val, acc);
+
+        if (active_q) {
+            if (p.num_splits == 1u) {
+                const float inv_l = (l_val > 0.0f) ? (1.0f / l_val) : 0.0f;
+                *(device half4 *)(out + (ulong(b) * p.num_q_heads + qh) * 128u + lane * 4u) = half4(acc * inv_l);
+            } else {
+                const ulong ps = (ulong(b) * p.num_q_heads + qh) * p.num_splits + split_idx;
+                if (lane == 0u) {
+                    partial_m[ps] = m_val;
+                    partial_l[ps] = l_val;
+                }
+                *(device float4 *)(partial_o + ps * 128u + lane * 4u) = acc;
+            }
+        }
+    } else {
+        const uint col = lane & 15u;
+        const uint half_id = lane >> 4;
+        const ulong q_off = (ulong(b) * p.num_q_heads + qh) * 64u + col * 4u;
+        const float4 q_vec = active_q ? float4(*(const device half4 *)(q + q_off)) : float4(0.0f);
+        float m_val = -INFINITY;
+        float l_val = 0.0f;
+        float4 acc = float4(0.0f);
+
+        gqa_tiered_attend_range_d64(t_start, t_end, p.chunk_tokens, head_row_base,
+                                    slot.num_retired_chunks, slot.tile_table_offset, slot.retired_offset,
+                                    p.retired_plane_stride_bytes, p.retired_chunk_stride_bytes,
+                                    scale_log2e, kv_tiles, retired_pool, retired_chunk_ids,
+                                    q_vec, active_q, tid, col, half_id,
+                                    tg_k0, tg_k1, tg_v0, tg_v1, m_val, l_val, acc);
+
+        if (active_q) {
+            const float other_m = simd_shuffle_xor(m_val, 16u);
+            const float other_l = simd_shuffle_xor(l_val, 16u);
+            const float4 other_acc = float4(simd_shuffle_xor(acc.x, 16u),
+                                            simd_shuffle_xor(acc.y, 16u),
+                                            simd_shuffle_xor(acc.z, 16u),
+                                            simd_shuffle_xor(acc.w, 16u));
+            const float m_final = max(m_val, other_m);
+            const float w_self = (l_val > 0.0f) ? exp2(m_val - m_final) : 0.0f;
+            const float w_other = (other_l > 0.0f) ? exp2(other_m - m_final) : 0.0f;
+            const float l_final = fma(w_self, l_val, w_other * other_l);
+            const float4 acc_final = fma(float4(w_self), acc, float4(w_other) * other_acc);
+
+            if (lane < 16u) {
+                if (p.num_splits == 1u) {
+                    const float inv_l = (l_final > 0.0f) ? (1.0f / l_final) : 0.0f;
+                    *(device half4 *)(out + (ulong(b) * p.num_q_heads + qh) * 64u + col * 4u) = half4(acc_final * inv_l);
+                } else {
+                    const ulong ps = (ulong(b) * p.num_q_heads + qh) * p.num_splits + split_idx;
+                    if (lane == 0u) {
+                        partial_m[ps] = m_final;
+                        partial_l[ps] = l_final;
+                    }
+                    *(device float4 *)(partial_o + ps * 64u + col * 4u) = acc_final;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 12b (C14): Multi-Request Batched Split-KV Reduction
+//
+// Specialized on ATTN_HEAD_DIM ({64, 128}).
+// Grid: (num_q_heads, batch_size, 1) threadgroups, 32 threads.
+// ---------------------------------------------------------------------------
+kernel void ami_batch_gqa_decode_attn_reduce(const device float *partial_m [[buffer(0)]],
+                                             const device float *partial_l [[buffer(1)]],
+                                             const device float *partial_o [[buffer(2)]],
+                                             device half *out [[buffer(3)]],
+                                             constant BatchGqaDecodeParams &p [[buffer(4)]],
+                                             uint2 tg_pos [[threadgroup_position_in_grid]],
+                                             uint lane [[thread_index_in_simdgroup]]) {
+    const uint qh = tg_pos.x;
+    const uint b = tg_pos.y;
+    const uint num_texels = ATTN_HEAD_DIM >> 2;
+    if (qh >= p.num_q_heads || b >= p.batch_size || lane >= num_texels) {
+        return;
+    }
+
+    const ulong head_base = (ulong(b) * p.num_q_heads + qh) * p.num_splits;
+    float m_max = -INFINITY;
+    for (uint s = 0u; s < p.num_splits; s++) {
+        if (partial_l[head_base + s] > 0.0f) {
+            m_max = max(m_max, partial_m[head_base + s]);
+        }
+    }
+
+    float l_tot = 0.0f;
+    float4 o_tot = float4(0.0f);
+    for (uint s = 0u; s < p.num_splits; s++) {
+        const float ls = partial_l[head_base + s];
+        if (ls > 0.0f) {
+            const float w = exp2(partial_m[head_base + s] - m_max);
+            l_tot = fma(ls, w, l_tot);
+            const float4 po = *(const device float4 *)(partial_o + (head_base + s) * ATTN_HEAD_DIM + lane * 4u);
+            o_tot = fma(po, float4(w), o_tot);
+        }
+    }
+
+    const float inv_l = (l_tot > 0.0f) ? (1.0f / l_tot) : 0.0f;
+    *(device half4 *)(out + (ulong(b) * p.num_q_heads + qh) * ATTN_HEAD_DIM + lane * 4u) = half4(o_tot * inv_l);
 }

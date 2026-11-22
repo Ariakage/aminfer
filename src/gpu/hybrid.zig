@@ -240,6 +240,10 @@ pub const QsaSparseAttnParams = extern struct {
     top_k_blocks: u32,
     has_tree: u32,
     scale: f32,
+    num_retired_chunks: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
+    _pad0: u32 = 0,
 };
 
 pub const GrParams = extern struct {
@@ -304,6 +308,36 @@ pub const BlendF16Params = extern struct {
     _pad0: u32 = 0,
 };
 
+pub const GdnBatchDecodeParams = extern struct {
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    slot_stride_f32: u32,
+    q_scale: f32,
+    l2_eps: f32,
+    rms_eps: f32,
+    apply_l2_norm: u32,
+    apply_out_norm: u32,
+    apply_out_gate: u32,
+    per_head_norm: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
+pub const GdnCloneStateParams = extern struct {
+    num_gdn_layers: u32,
+    state_f32_per_layer: u32,
+    src_state_layer_stride_f32: u32,
+    dst_state_layer_stride_f32: u32,
+    conv_f16_per_layer: u32,
+    src_conv_layer_stride_f16: u32,
+    dst_conv_layer_stride_f16: u32,
+    _pad0: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(GdnDecodeParams) != 48) @compileError("GdnDecodeParams must be 48 bytes");
     if (@sizeOf(GdnPrefillParams) != 48) @compileError("GdnPrefillParams must be 48 bytes");
@@ -316,7 +350,7 @@ comptime {
     if (@sizeOf(QsaKvTreeCommitParams) != 160) @compileError("QsaKvTreeCommitParams must be 160 bytes");
     if (@sizeOf(QsaBlockSummaryParams) != 48) @compileError("QsaBlockSummaryParams must be 48 bytes");
     if (@sizeOf(QsaIndexParams) != 48) @compileError("QsaIndexParams must be 48 bytes");
-    if (@sizeOf(QsaSparseAttnParams) != 48) @compileError("QsaSparseAttnParams must be 48 bytes");
+    if (@sizeOf(QsaSparseAttnParams) != 64) @compileError("QsaSparseAttnParams must be 64 bytes");
     if (@sizeOf(GrParams) != 48) @compileError("GrParams must be 48 bytes");
     if (@sizeOf(GrComputeGatesParams) != 16) @compileError("GrComputeGatesParams must be 16 bytes");
     if (@sizeOf(GdnComputeGatesParams) != 16) @compileError("GdnComputeGatesParams must be 16 bytes");
@@ -324,6 +358,8 @@ comptime {
     if (@sizeOf(GdnConv1dQParams) != 16) @compileError("GdnConv1dQParams must be 16 bytes");
     if (@sizeOf(GdnConv1dCommitParams) != 144) @compileError("GdnConv1dCommitParams must be 144 bytes");
     if (@sizeOf(BlendF16Params) != 16) @compileError("BlendF16Params must be 16 bytes");
+    if (@sizeOf(GdnBatchDecodeParams) != 64) @compileError("GdnBatchDecodeParams must be 64 bytes");
+    if (@sizeOf(GdnCloneStateParams) != 32) @compileError("GdnCloneStateParams must be 32 bytes");
     if (@sizeOf(GdnCommitTreeParams) > metal.MAX_UNIFORM_BYTES) @compileError("GdnCommitTreeParams exceeds uniform stride");
     if (@sizeOf(QsaKvTreeCommitParams) > metal.MAX_UNIFORM_BYTES) @compileError("QsaKvTreeCommitParams exceeds uniform stride");
     if (@sizeOf(GdnConv1dCommitParams) > metal.MAX_UNIFORM_BYTES) @compileError("GdnConv1dCommitParams exceeds uniform stride");
@@ -470,6 +506,180 @@ pub const GdnStateArena = struct {
         const start = half_bytes + @as(usize, layer_idx) * self.layer_stride_bytes;
         const len_bytes = self.layer_state_elems * @sizeOf(f32);
         return @alignCast(std.mem.bytesAsSlice(f32, self.backing[start .. start + len_bytes]));
+    }
+};
+
+pub const GdnSnapshotPoolError = ArenaError || error{
+    PoolExhausted,
+    InvalidSlot,
+    DoubleFree,
+};
+
+pub const GdnSnapshotPoolSpec = struct {
+    state: GdnStateSpec,
+    /// Optional `conv1d` history elements (`(conv_k - 1) * (2 * gdn_qk + gdn_v)`)
+    /// per GDN layer stored as `f16` alongside the recurrent state (`0` disables conv1d storage).
+    conv_f16_per_layer: u32 = 0,
+    max_snapshots: u32,
+};
+
+/// Preallocated `16 KiB` page-aligned `WiredArena` pool storing `max_snapshots`
+/// `GDN` recurrent state + optional `conv1d` history slabs for `R8` shared
+/// prefix checkpointing (`0` heap allocations at init and on the hot path, O(1)
+/// free-list acquire/release).
+pub const GdnSnapshotPool = struct {
+    spec: GdnSnapshotPoolSpec,
+    backing: []align(page.APPLE_PAGE_SIZE) u8,
+    base_offset: u64,
+    layer_state_elems: u32,
+    state_layer_stride_bytes: usize,
+    state_slab_bytes: usize,
+    conv_layer_stride_bytes: usize,
+    conv_slab_bytes: usize,
+    conv_base_offset: u64,
+    free_stack: []u32,
+    in_use: []u8,
+    free_top: u32,
+
+    pub fn validateSpec(spec: GdnSnapshotPoolSpec) GdnSnapshotPoolError!void {
+        try GdnStateArena.validateSpec(spec.state);
+        if (spec.max_snapshots == 0) return error.ZeroDimension;
+    }
+
+    pub fn dataRequiredBytes(spec: GdnSnapshotPoolSpec) GdnSnapshotPoolError!usize {
+        try validateSpec(spec);
+        const state_elems = try GdnStateArena.layerElems(spec.state);
+        const state_layer_stride = amf.align64(std.math.mul(usize, state_elems, @sizeOf(f32)) catch return error.Overflow);
+        const state_slab = std.math.mul(usize, state_layer_stride, spec.state.num_gdn_layers) catch return error.Overflow;
+        const all_states = std.math.mul(usize, state_slab, spec.max_snapshots) catch return error.Overflow;
+
+        const conv_layer_stride = if (spec.conv_f16_per_layer > 0)
+            amf.align64(std.math.mul(usize, spec.conv_f16_per_layer, @sizeOf(f16)) catch return error.Overflow)
+        else
+            0;
+        const conv_slab = std.math.mul(usize, conv_layer_stride, spec.state.num_gdn_layers) catch return error.Overflow;
+        const all_convs = std.math.mul(usize, conv_slab, spec.max_snapshots) catch return error.Overflow;
+
+        const total = std.math.add(usize, all_states, all_convs) catch return error.Overflow;
+        return page.alignUp(total) catch return error.Overflow;
+    }
+
+    pub fn requiredArenaBytes(spec: GdnSnapshotPoolSpec) GdnSnapshotPoolError!usize {
+        const data_bytes = try dataRequiredBytes(spec);
+        const stack_bytes = amf.align64(std.math.mul(usize, spec.max_snapshots, @sizeOf(u32)) catch return error.Overflow);
+        const flags_bytes = amf.align64(spec.max_snapshots);
+        const meta = std.math.add(usize, stack_bytes, flags_bytes) catch return error.Overflow;
+        const total = std.math.add(usize, data_bytes, meta) catch return error.Overflow;
+        return page.alignUp(total) catch return error.Overflow;
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: GdnSnapshotPoolSpec) GdnSnapshotPoolError!GdnSnapshotPool {
+        try validateSpec(spec);
+        const state_elems_usize = try GdnStateArena.layerElems(spec.state);
+        const state_elems = std.math.cast(u32, state_elems_usize) orelse return error.Overflow;
+        const state_layer_stride = amf.align64(state_elems_usize * @sizeOf(f32));
+        const state_slab = state_layer_stride * spec.state.num_gdn_layers;
+        const all_states = state_slab * spec.max_snapshots;
+
+        const conv_layer_stride = if (spec.conv_f16_per_layer > 0)
+            amf.align64(@as(usize, spec.conv_f16_per_layer) * @sizeOf(f16))
+        else
+            0;
+        const conv_slab = conv_layer_stride * spec.state.num_gdn_layers;
+        const data_bytes = try dataRequiredBytes(spec);
+
+        const backing = try arena.allocPages(data_bytes);
+        @memset(backing, 0);
+        const base_off: u64 = @intCast(arena.offsetOf(backing.ptr));
+
+        const stack_raw = try arena.allocAligned(amf.align64(@as(usize, spec.max_snapshots) * @sizeOf(u32)), 64);
+        const free_stack: []u32 = @alignCast(std.mem.bytesAsSlice(
+            u32,
+            stack_raw[0 .. @as(usize, spec.max_snapshots) * @sizeOf(u32)],
+        ));
+        const flags_raw = try arena.allocAligned(amf.align64(spec.max_snapshots), 64);
+        const in_use = flags_raw[0..spec.max_snapshots];
+
+        var pool: GdnSnapshotPool = .{
+            .spec = spec,
+            .backing = backing,
+            .base_offset = base_off,
+            .layer_state_elems = state_elems,
+            .state_layer_stride_bytes = state_layer_stride,
+            .state_slab_bytes = state_slab,
+            .conv_layer_stride_bytes = conv_layer_stride,
+            .conv_slab_bytes = conv_slab,
+            .conv_base_offset = base_off + @as(u64, @intCast(all_states)),
+            .free_stack = free_stack,
+            .in_use = in_use,
+            .free_top = spec.max_snapshots,
+        };
+        pool.reset();
+        return pool;
+    }
+
+    pub fn reset(self: *GdnSnapshotPool) void {
+        @memset(self.in_use, 0);
+        const n = self.spec.max_snapshots;
+        for (0..n) |i| {
+            self.free_stack[i] = n - 1 - @as(u32, @intCast(i));
+        }
+        self.free_top = n;
+    }
+
+    pub fn bytes(self: *const GdnSnapshotPool) []align(page.APPLE_PAGE_SIZE) u8 {
+        return self.backing;
+    }
+
+    pub fn acquireSlot(self: *GdnSnapshotPool) GdnSnapshotPoolError!u32 {
+        if (self.free_top == 0) return error.PoolExhausted;
+        self.free_top -= 1;
+        const slot = self.free_stack[self.free_top];
+        std.debug.assert(slot < self.spec.max_snapshots);
+        std.debug.assert(self.in_use[slot] == 0);
+        self.in_use[slot] = 1;
+        return slot;
+    }
+
+    pub fn releaseSlot(self: *GdnSnapshotPool, slot_id: u32) GdnSnapshotPoolError!void {
+        if (slot_id >= self.spec.max_snapshots) return error.InvalidSlot;
+        if (self.in_use[slot_id] == 0) return error.DoubleFree;
+        self.in_use[slot_id] = 0;
+        self.free_stack[self.free_top] = slot_id;
+        self.free_top += 1;
+    }
+
+    pub fn stateBinding(self: *const GdnSnapshotPool, buf: metal.Buffer, slot_id: u32) GdnSnapshotPoolError!metal.BufferBinding {
+        if (slot_id >= self.spec.max_snapshots) return error.InvalidSlot;
+        return .{
+            .buffer = buf,
+            .offset = self.base_offset + @as(u64, slot_id) * @as(u64, @intCast(self.state_slab_bytes)),
+        };
+    }
+
+    pub fn convBinding(self: *const GdnSnapshotPool, buf: metal.Buffer, slot_id: u32) GdnSnapshotPoolError!?metal.BufferBinding {
+        if (slot_id >= self.spec.max_snapshots) return error.InvalidSlot;
+        if (self.spec.conv_f16_per_layer == 0) return null;
+        return .{
+            .buffer = buf,
+            .offset = self.conv_base_offset + @as(u64, slot_id) * @as(u64, @intCast(self.conv_slab_bytes)),
+        };
+    }
+
+    pub fn stateLayerStrideF32(self: *const GdnSnapshotPool) u32 {
+        return @intCast(self.state_layer_stride_bytes / @sizeOf(f32));
+    }
+
+    pub fn convLayerStrideF16(self: *const GdnSnapshotPool) u32 {
+        return @intCast(self.conv_layer_stride_bytes / @sizeOf(f16));
+    }
+
+    pub fn freeCount(self: *const GdnSnapshotPool) u32 {
+        return self.free_top;
+    }
+
+    pub fn activeCount(self: *const GdnSnapshotPool) u32 {
+        return self.spec.max_snapshots - self.free_top;
     }
 };
 
@@ -968,7 +1178,7 @@ pub const QsaIndexBlocksArgs = struct {
 
 pub const QsaSparseAttnArgs = struct {
     q: metal.BufferBinding,
-    /// Resident `KvTilePair` table (may be null only when `kv_len == 0`).
+    /// Resident `KvTilePair` table (may be null only when `kv_len <= num_retired_chunks * chunk_tokens`).
     kv_tiles: ?metal.BufferBinding = null,
     index_buf: *const QsaIndexBuffer,
     index_metal_buf: metal.Buffer,
@@ -977,6 +1187,10 @@ pub const QsaSparseAttnArgs = struct {
     v_tree: ?metal.BufferBinding = null,
     ancestor_masks: ?metal.BufferBinding = null,
     out: metal.BufferBinding,
+    /// Optional `R5` group-64 `q8` retired KV tier (`num_retired_chunks > 0` requires
+    /// `retired_pool`, `retired_chunk_ids`, `ring_capacity == 0`, and `head_dim % 64 == 0`).
+    retired_pool: ?metal.BufferBinding = null,
+    retired_chunk_ids: ?metal.BufferBinding = null,
     num_nodes: u32 = 1,
     num_q_heads: u32,
     num_kv_heads: u32,
@@ -988,6 +1202,9 @@ pub const QsaSparseAttnArgs = struct {
     block_tokens: u32 = QSA_DEFAULT_BLOCK_TOKENS,
     top_k_blocks: u32,
     scale: ?f32 = null,
+    num_retired_chunks: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
 };
 
 /// Combined QSA indexer + sparse attention dispatch supporting `ADR-0019`
@@ -1002,6 +1219,8 @@ pub const QsaAttentionArgs = struct {
     v_tree: ?metal.BufferBinding = null,
     ancestor_masks: ?metal.BufferBinding = null,
     out: metal.BufferBinding,
+    retired_pool: ?metal.BufferBinding = null,
+    retired_chunk_ids: ?metal.BufferBinding = null,
     num_nodes: u32 = 1,
     num_q_heads: u32,
     num_kv_heads: u32,
@@ -1014,6 +1233,9 @@ pub const QsaAttentionArgs = struct {
     top_k_blocks: u32,
     num_local_blocks: u32 = 1,
     scale: ?f32 = null,
+    num_retired_chunks: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
     /// When `true` (`r >= 1` in `LoopSchedule`, ADR-0019), skips `ami_qsa_index_blocks`
     /// and reuses the selected block indices already stored in `index_buf`.
     reuse_block_indices: bool = false,
@@ -1210,6 +1432,65 @@ pub const BlendF16Args = struct {
     b: f32,
 };
 
+pub const GdnBatchDecodeArgs = struct {
+    /// `[batch_size, num_k_heads, head_k_dim]` f16 queries.
+    q: metal.BufferBinding,
+    /// `[batch_size, num_k_heads, head_k_dim]` f16 keys.
+    k: metal.BufferBinding,
+    /// `[batch_size, num_v_heads, head_v_dim]` f16 values.
+    v: metal.BufferBinding,
+    /// `[batch_size, num_v_heads]` f32 log-decay gates.
+    g: metal.BufferBinding,
+    /// `[batch_size, num_v_heads]` f32 raw write gates (passed through sigmoid).
+    beta: metal.BufferBinding,
+    /// Optional `[batch_size, num_v_heads, head_v_dim]` f16 SiLU output gate.
+    z: ?metal.BufferBinding = null,
+    /// Optional `[head_v_dim]` (or `[num_v_heads, head_v_dim]`) RMSNorm weights.
+    norm_w: ?metal.BufferBinding = null,
+    /// Base of pooled per-slot `f32` recurrent states (read).
+    state_in_pool: metal.BufferBinding,
+    /// Base of pooled per-slot `f32` recurrent states (write; may alias `state_in_pool`).
+    state_out_pool: metal.BufferBinding,
+    /// `[batch_size, num_v_heads, head_v_dim]` f16 output.
+    out: metal.BufferBinding,
+    /// `[batch_size]` `u32` slot indices into `state_in_pool`.
+    state_in_slots: metal.BufferBinding,
+    /// `[batch_size]` `u32` slot indices into `state_out_pool` (defaults to `state_in_slots`).
+    state_out_slots: ?metal.BufferBinding = null,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    head_k_dim: u32,
+    head_v_dim: u32,
+    /// Stride between consecutive slots in `state_{in,out}_pool` in `f32` elements
+    /// (`>= num_v_heads * head_k_dim * head_v_dim`).
+    slot_stride_f32: u32,
+    q_scale: ?f32 = null,
+    l2_eps: f32 = 1e-6,
+    rms_eps: f32 = 1e-6,
+    apply_l2_norm: bool = true,
+    per_head_norm: bool = false,
+    norm_dtype: quant.FloatDType = .f16,
+};
+
+pub const GdnCloneStateArgs = struct {
+    /// Source multi-layer GDN recurrent state slab (`[num_gdn_layers, ...]` `f32`).
+    src_state: metal.BufferBinding,
+    /// Destination multi-layer GDN recurrent state slab (`[num_gdn_layers, ...]` `f32`).
+    dst_state: metal.BufferBinding,
+    /// Optional source multi-layer `conv1d` history slab (`f16`; required iff `conv_f16_per_layer > 0`).
+    src_conv: ?metal.BufferBinding = null,
+    /// Optional destination multi-layer `conv1d` history slab (`f16`; required iff `conv_f16_per_layer > 0`).
+    dst_conv: ?metal.BufferBinding = null,
+    num_gdn_layers: u32,
+    state_f32_per_layer: u32,
+    src_state_layer_stride_f32: u32,
+    dst_state_layer_stride_f32: u32,
+    conv_f16_per_layer: u32 = 0,
+    src_conv_layer_stride_f16: u32 = 0,
+    dst_conv_layer_stride_f16: u32 = 0,
+};
+
 // ===========================================================================
 // HybridPipelines: Startup-Compiled Metal 4 Compute Pipelines
 // ===========================================================================
@@ -1222,6 +1503,13 @@ pub const HybridPipelines = struct {
     gdn_decode_d128_bf16: metal.Pipeline,
     gdn_decode_dyn_f16: metal.Pipeline,
     gdn_decode_dyn_bf16: metal.Pipeline,
+    gdn_batch_decode_d64_f16: metal.Pipeline,
+    gdn_batch_decode_d64_bf16: metal.Pipeline,
+    gdn_batch_decode_d128_f16: metal.Pipeline,
+    gdn_batch_decode_d128_bf16: metal.Pipeline,
+    gdn_batch_decode_dyn_f16: metal.Pipeline,
+    gdn_batch_decode_dyn_bf16: metal.Pipeline,
+    gdn_clone_state: metal.Pipeline,
     gdn_prefill_d64: metal.Pipeline,
     gdn_prefill_d128: metal.Pipeline,
     gdn_prefill_dyn: metal.Pipeline,
@@ -1297,6 +1585,45 @@ pub const HybridPipelines = struct {
             .{ .index = 1, .value = .{ .bool = true } },
         });
         errdefer gdn_decode_dyn_bf16.close();
+
+        const gdn_batch_decode_d64_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_batch_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer gdn_batch_decode_d64_f16.close();
+
+        const gdn_batch_decode_d64_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_batch_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer gdn_batch_decode_d64_bf16.close();
+
+        const gdn_batch_decode_d128_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_batch_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer gdn_batch_decode_d128_f16.close();
+
+        const gdn_batch_decode_d128_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_batch_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer gdn_batch_decode_d128_bf16.close();
+
+        const gdn_batch_decode_dyn_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_batch_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 0 } },
+            .{ .index = 1, .value = .{ .bool = false } },
+        });
+        errdefer gdn_batch_decode_dyn_f16.close();
+
+        const gdn_batch_decode_dyn_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_batch_decode", &.{
+            .{ .index = 0, .value = .{ .u32 = 0 } },
+            .{ .index = 1, .value = .{ .bool = true } },
+        });
+        errdefer gdn_batch_decode_dyn_bf16.close();
+
+        const gdn_clone_state = try metal.Pipeline.init(device, library, "ami_gdn_clone_state");
+        errdefer gdn_clone_state.close();
 
         const gdn_prefill_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_gdn_prefill", &.{
             .{ .index = 0, .value = .{ .u32 = 64 } },
@@ -1470,6 +1797,13 @@ pub const HybridPipelines = struct {
             .gdn_decode_d128_bf16 = gdn_decode_d128_bf16,
             .gdn_decode_dyn_f16 = gdn_decode_dyn_f16,
             .gdn_decode_dyn_bf16 = gdn_decode_dyn_bf16,
+            .gdn_batch_decode_d64_f16 = gdn_batch_decode_d64_f16,
+            .gdn_batch_decode_d64_bf16 = gdn_batch_decode_d64_bf16,
+            .gdn_batch_decode_d128_f16 = gdn_batch_decode_d128_f16,
+            .gdn_batch_decode_d128_bf16 = gdn_batch_decode_d128_bf16,
+            .gdn_batch_decode_dyn_f16 = gdn_batch_decode_dyn_f16,
+            .gdn_batch_decode_dyn_bf16 = gdn_batch_decode_dyn_bf16,
+            .gdn_clone_state = gdn_clone_state,
             .gdn_prefill_d64 = gdn_prefill_d64,
             .gdn_prefill_d128 = gdn_prefill_d128,
             .gdn_prefill_dyn = gdn_prefill_dyn,
@@ -1542,6 +1876,13 @@ pub const HybridPipelines = struct {
         self.gdn_prefill_dyn.close();
         self.gdn_prefill_d128.close();
         self.gdn_prefill_d64.close();
+        self.gdn_clone_state.close();
+        self.gdn_batch_decode_dyn_bf16.close();
+        self.gdn_batch_decode_dyn_f16.close();
+        self.gdn_batch_decode_d128_bf16.close();
+        self.gdn_batch_decode_d128_f16.close();
+        self.gdn_batch_decode_d64_bf16.close();
+        self.gdn_batch_decode_d64_f16.close();
         self.gdn_decode_dyn_bf16.close();
         self.gdn_decode_dyn_f16.close();
         self.gdn_decode_d128_bf16.close();
@@ -1606,6 +1947,115 @@ pub const HybridPipelines = struct {
             },
             std.mem.asBytes(&params),
             .{ args.num_v_heads, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes multi-request batched Gated DeltaNet decode (`ami_gdn_batch_decode`, `C14`)
+    /// executing `batch_size` (`1..16+`) independent slots in ONE GPU pass using
+    /// per-slot `state_in_slots[b]` and `state_out_slots[b]`.
+    pub fn encodeGdnBatchDecode(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: GdnBatchDecodeArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.batch_size == 0) return error.ZeroDimension;
+        try validateGdnDims(args.num_k_heads, args.num_v_heads, args.head_k_dim, args.head_v_dim);
+        const min_stride = std.math.mul(u32, args.num_v_heads, args.head_k_dim * args.head_v_dim) catch return error.InvalidConfig;
+        if (args.slot_stride_f32 < min_stride) return error.InvalidConfig;
+
+        const q_scale = args.q_scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_k_dim))));
+        const params: GdnBatchDecodeParams = .{
+            .batch_size = args.batch_size,
+            .num_k_heads = args.num_k_heads,
+            .num_v_heads = args.num_v_heads,
+            .head_k_dim = args.head_k_dim,
+            .head_v_dim = args.head_v_dim,
+            .slot_stride_f32 = args.slot_stride_f32,
+            .q_scale = q_scale,
+            .l2_eps = args.l2_eps,
+            .rms_eps = args.rms_eps,
+            .apply_l2_norm = if (args.apply_l2_norm) 1 else 0,
+            .apply_out_norm = if (args.norm_w != null) 1 else 0,
+            .apply_out_gate = if (args.z != null) 1 else 0,
+            .per_head_norm = if (args.per_head_norm) 1 else 0,
+        };
+        const pipe = switch (args.head_k_dim) {
+            64 => if (args.norm_dtype == .bf16) self.gdn_batch_decode_d64_bf16 else self.gdn_batch_decode_d64_f16,
+            128 => if (args.norm_dtype == .bf16) self.gdn_batch_decode_d128_bf16 else self.gdn_batch_decode_d128_f16,
+            else => if (args.norm_dtype == .bf16) self.gdn_batch_decode_dyn_bf16 else self.gdn_batch_decode_dyn_f16,
+        };
+        const out_slots = args.state_out_slots orelse args.state_in_slots;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.q,
+                args.k,
+                args.v,
+                args.g,
+                args.beta,
+                args.z orelse args.v,
+                args.norm_w orelse args.v,
+                args.state_in_pool,
+                args.state_out_pool,
+                args.out,
+                args.state_in_slots,
+                out_slots,
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_v_heads, args.batch_size, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_gdn_clone_state` (`R8`), copying a full multi-layer `GDN`
+    /// recurrent state `[num_gdn_layers, num_v_heads, head_k_dim, head_v_dim]`
+    /// plus optional `conv1d` history between a slot's `GdnStateArena` slab and
+    /// a `PrefixCache` / `GdnSnapshotPool` slab in ONE GPU dispatch (`0` CPU `memcpy`).
+    pub fn encodeGdnCloneState(
+        self: HybridPipelines,
+        frame: *metal.Compute.Frame,
+        args: GdnCloneStateArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.num_gdn_layers == 0 or args.state_f32_per_layer == 0) return error.ZeroDimension;
+        if (args.src_state_layer_stride_f32 < args.state_f32_per_layer or
+            args.dst_state_layer_stride_f32 < args.state_f32_per_layer)
+        {
+            return error.InvalidConfig;
+        }
+        if (args.conv_f16_per_layer > 0) {
+            if (args.src_conv == null or args.dst_conv == null) return error.InvalidConfig;
+            if (args.src_conv_layer_stride_f16 < args.conv_f16_per_layer or
+                args.dst_conv_layer_stride_f16 < args.conv_f16_per_layer)
+            {
+                return error.InvalidConfig;
+            }
+        }
+        const params: GdnCloneStateParams = .{
+            .num_gdn_layers = args.num_gdn_layers,
+            .state_f32_per_layer = args.state_f32_per_layer,
+            .src_state_layer_stride_f32 = args.src_state_layer_stride_f32,
+            .dst_state_layer_stride_f32 = args.dst_state_layer_stride_f32,
+            .conv_f16_per_layer = args.conv_f16_per_layer,
+            .src_conv_layer_stride_f16 = args.src_conv_layer_stride_f16,
+            .dst_conv_layer_stride_f16 = args.dst_conv_layer_stride_f16,
+        };
+        const max_elems: u64 = @max(args.state_f32_per_layer, args.conv_f16_per_layer);
+        const groups_x: u64 = (max_elems + 1023) / 1024;
+        try frame.encodeThreadgroups(
+            self.gdn_clone_state,
+            &.{
+                args.src_state,
+                args.dst_state,
+                args.src_conv orelse args.src_state,
+                args.dst_conv orelse args.dst_state,
+            },
+            std.mem.asBytes(&params),
+            .{ groups_x, args.num_gdn_layers, 1 },
             .{ 256, 1, 1 },
             insert_barrier_before,
         );
@@ -2128,7 +2578,19 @@ pub const HybridPipelines = struct {
         if ((args.num_q_heads % args.num_kv_heads) != 0) return error.InvalidConfig;
         if (args.head_dim > MAX_QSA_HEAD_DIM or (args.head_dim % 4) != 0) return error.InvalidHeadDim;
         if (args.top_k_blocks == 0 or args.top_k_blocks > QSA_MAX_TOP_K_BLOCKS) return error.UnsupportedTopKBlocks;
-        if (args.kv_len > 0 and args.kv_tiles == null) return error.InvalidConfig;
+
+        const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidConfig;
+        if (args.num_retired_chunks > 0) {
+            if (args.ring_capacity != 0) return error.InvalidConfig;
+            if ((args.head_dim % attention.KV_Q8_GROUP_SIZE) != 0) return error.InvalidHeadDim;
+            if (args.retired_pool == null or args.retired_chunk_ids == null or
+                args.retired_plane_stride_bytes == 0 or
+                args.retired_chunk_stride_bytes < args.retired_plane_stride_bytes * 2)
+            {
+                return error.InvalidConfig;
+            }
+        }
+        if (@as(u64, args.kv_len) > retired_tokens and args.kv_tiles == null) return error.InvalidConfig;
 
         const has_any_tree = (args.k_tree != null or args.v_tree != null or args.ancestor_masks != null);
         if (has_any_tree and (args.k_tree == null or args.v_tree == null or args.ancestor_masks == null)) {
@@ -2149,6 +2611,9 @@ pub const HybridPipelines = struct {
             .top_k_blocks = args.top_k_blocks,
             .has_tree = if (has_any_tree) 1 else 0,
             .scale = scale,
+            .num_retired_chunks = args.num_retired_chunks,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
         };
         const gqa_ratio = args.num_q_heads / args.num_kv_heads;
         const q_groups_per_kv: u64 = (@as(u64, gqa_ratio) + 7) / 8;
@@ -2168,6 +2633,8 @@ pub const HybridPipelines = struct {
                 args.v_tree orelse args.q,
                 args.ancestor_masks orelse args.q,
                 args.out,
+                args.retired_pool orelse args.q,
+                args.retired_chunk_ids orelse args.q,
             },
             std.mem.asBytes(&params),
             .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, args.num_nodes, 1 },
@@ -2218,6 +2685,8 @@ pub const HybridPipelines = struct {
             .v_tree = args.v_tree,
             .ancestor_masks = args.ancestor_masks,
             .out = args.out,
+            .retired_pool = args.retired_pool,
+            .retired_chunk_ids = args.retired_chunk_ids,
             .num_nodes = args.num_nodes,
             .num_q_heads = args.num_q_heads,
             .num_kv_heads = args.num_kv_heads,
@@ -2229,6 +2698,9 @@ pub const HybridPipelines = struct {
             .block_tokens = args.block_tokens,
             .top_k_blocks = args.top_k_blocks,
             .scale = args.scale,
+            .num_retired_chunks = args.num_retired_chunks,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
         }, attn_barrier);
     }
 
@@ -4343,4 +4815,472 @@ test "M6 hybrid edge cases: circular 128-tok SWA tree commit wrap, GrCollapseMod
         try std.testing.expectApproxEqAbs(xv, @as(f32, @floatCast(out_mean[i])), 1e-3);
         try std.testing.expectApproxEqAbs(xv, @as(f32, @floatCast(out_w[i])), 2e-3);
     }
+}
+
+fn makeM65HybridBudget(bytes: usize) budget_mod.Budget {
+    return budget_mod.Budget.compute(.{
+        .memory_bytes = bytes * 8,
+        .user_wire_limit = bytes * 4,
+        .global_user_wire_limit = bytes * 4,
+        .gpu_working_set_bytes = bytes * 4,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+}
+
+test "R5 QSA tiered q8 retired + active sparse attention parity vs pure fp16 active tiles (d=128 and d=64 with tree masks)" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const hybrid_pipes = try HybridPipelines.init(device, library);
+    defer hybrid_pipes.close();
+    const attn_pipes = try attention.AttentionPipelines.init(device, library);
+    defer attn_pipes.close();
+
+    const head_dims = [_]u32{ 128, 64 };
+    for (head_dims) |head_dim| {
+        const num_q_heads: u32 = 8;
+        const num_kv_heads: u32 = 2;
+        const chunk_tokens: u32 = QSA_FULL_CHUNK_TOKENS; // 512
+        const total_chunks: u32 = 3;
+        const num_retired: u32 = 2;
+        const kv_len: u32 = 2 * chunk_tokens + 200; // 1,224 tokens (2 retired + 1 active partial)
+        const block_tokens: u32 = QSA_DEFAULT_BLOCK_TOKENS; // 32
+        const num_blocks: u32 = (kv_len + block_tokens - 1) / block_tokens;
+        const top_k_blocks: u32 = 12;
+        const num_nodes: u32 = 4;
+
+        const pool_spec: attention.RetiredKvQ8PoolSpec = .{
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .chunk_tokens = chunk_tokens,
+            .max_chunks = num_retired,
+        };
+        const idx_spec: QsaIndexBufferSpec = .{
+            .max_nodes = num_nodes,
+            .num_kv_heads = num_kv_heads,
+            .top_k_blocks = top_k_blocks,
+        };
+        const block_keys_bytes = amf.align64(@as(usize, num_blocks) * num_kv_heads * head_dim * @sizeOf(f16));
+        const arena_bytes: usize =
+            (try attention.RetiredKvQ8Pool.requiredArenaBytes(pool_spec)) +
+            (try HybridKvRing.tableRequiredBytes(total_chunks)) +
+            (try QsaIndexBuffer.requiredBytes(idx_spec)) +
+            block_keys_bytes +
+            page.APPLE_PAGE_SIZE * 16;
+        var arena = try arena_mod.WiredArena.init(arena_bytes, makeM65HybridBudget(arena_bytes));
+        defer arena.deinit();
+
+        var full_ring = try HybridKvRing.init(gpa, device, &arena, .{
+            .mode = .full_chunk_512,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .num_tiles = total_chunks,
+        });
+        defer full_ring.deinit(gpa);
+
+        var retired_pool = try attention.RetiredKvQ8Pool.init(&arena, pool_spec);
+        const retired_ids_raw = try arena.allocAligned(amf.align64(@as(usize, num_retired) * @sizeOf(u32)), 64);
+        const active_tail_tbl_raw = try arena.allocAligned(amf.align64(@sizeOf(attention.KvTilePair)), 64);
+        const idx_buf = try QsaIndexBuffer.init(&arena, idx_spec);
+        const block_keys_raw = try arena.allocAligned(block_keys_bytes, 64);
+        const q_raw = try arena.allocAligned(amf.align64(@as(usize, num_nodes) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+        const kt_raw = try arena.allocAligned(amf.align64(@as(usize, num_nodes) * num_kv_heads * head_dim * @sizeOf(f16)), 64);
+        const vt_raw = try arena.allocAligned(amf.align64(@as(usize, num_nodes) * num_kv_heads * head_dim * @sizeOf(f16)), 64);
+        const masks_raw = try arena.allocAligned(amf.align64(@as(usize, num_nodes) * @sizeOf(u64)), 64);
+        const out_fp16_raw = try arena.allocAligned(amf.align64(@as(usize, num_nodes) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+        const out_tiered_raw = try arena.allocAligned(amf.align64(@as(usize, num_nodes) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+
+        var rng = std.Random.DefaultPrng.init(0xA5A_0000 + head_dim);
+        const rand = rng.random();
+        for (0..total_chunks) |c| {
+            var kg = try full_ring.k_tiles[c].lock(false);
+            errdefer kg.release();
+            var vg = try full_ring.v_tiles[c].lock(false);
+            errdefer vg.release();
+            const km: []f16 = @alignCast(std.mem.bytesAsSlice(f16, kg.bytes));
+            const vm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, vg.bytes));
+            for (km, vm) |*kx, *vx| {
+                kx.* = @floatCast((rand.float(f32) - 0.5) * 0.9);
+                vx.* = @floatCast((rand.float(f32) - 0.5) * 0.8);
+            }
+            try vg.unlock();
+            try kg.unlock();
+        }
+        const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw[0 .. @as(usize, num_nodes) * num_q_heads * head_dim * @sizeOf(f16)]));
+        const kt_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, kt_raw[0 .. @as(usize, num_nodes) * num_kv_heads * head_dim * @sizeOf(f16)]));
+        const vt_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, vt_raw[0 .. @as(usize, num_nodes) * num_kv_heads * head_dim * @sizeOf(f16)]));
+        const masks: []u64 = @alignCast(std.mem.bytesAsSlice(u64, masks_raw[0 .. @as(usize, num_nodes) * @sizeOf(u64)]));
+        for (q_f16) |*x| x.* = @floatCast((rand.float(f32) - 0.5) * 0.9);
+        for (kt_f16, vt_f16) |*kx, *vx| {
+            kx.* = @floatCast((rand.float(f32) - 0.5) * 0.9);
+            vx.* = @floatCast((rand.float(f32) - 0.5) * 0.8);
+        }
+        masks[0] = 0b0001;
+        masks[1] = 0b0011;
+        masks[2] = 0b0101;
+        masks[3] = 0b1011;
+
+        // Place chunk 2 (active) in `active_tail_tbl`, and retire chunks 0 & 1 into `retired_pool` (swapped slot order 1, 0).
+        const active_tail_tbl: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(
+            attention.KvTilePair,
+            active_tail_tbl_raw[0..@sizeOf(attention.KvTilePair)],
+        ));
+        active_tail_tbl[0] = attention.KvTilePair.fromTiles(full_ring.k_tiles[2], full_ring.v_tiles[2], .rgba16f);
+
+        const s0 = try retired_pool.acquireSlot();
+        const s1 = try retired_pool.acquireSlot();
+        const retired_ids: []u32 = @alignCast(std.mem.bytesAsSlice(u32, retired_ids_raw[0 .. @as(usize, num_retired) * @sizeOf(u32)]));
+        retired_ids[0] = s1;
+        retired_ids[1] = s0;
+
+        const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer gpu_buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+        try full_ring.makeResident(compute);
+
+        {
+            var f = try compute.beginFrame(5000);
+            errdefer f.abort();
+            // Compute block summaries while all 3 tiles are active.
+            try hybrid_pipes.encodeQsaUpdateBlockSummary(&f, .{
+                .kv_tiles = full_ring.tileTableBinding(gpu_buf),
+                .block_keys = .{ .buffer = gpu_buf, .offset = arena.offsetOf(block_keys_raw.ptr) },
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .kv_len = kv_len,
+                .chunk_tokens = chunk_tokens,
+                .block_tokens = block_tokens,
+                .start_block = 0,
+                .num_blocks = num_blocks,
+            }, false);
+            // Retire chunks 0 and 1 into `retired_pool` on GPU.
+            try attn_pipes.encodeKvRetireTileToQ8(&f, .{
+                .k_tile = full_ring.k_tiles[0],
+                .v_tile = full_ring.v_tiles[0],
+                .pool = &retired_pool,
+                .pool_buf = gpu_buf,
+                .dst_slot = retired_ids[0],
+            }, true);
+            try attn_pipes.encodeKvRetireTileToQ8(&f, .{
+                .k_tile = full_ring.k_tiles[1],
+                .v_tile = full_ring.v_tiles[1],
+                .pool = &retired_pool,
+                .pool_buf = gpu_buf,
+                .dst_slot = retired_ids[1],
+            }, false);
+            // Run pure fp16 QSA (r=0: indexes blocks + attends all 3 active tiles).
+            try hybrid_pipes.encodeQsaAttention(&f, .{
+                .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) },
+                .kv_tiles = full_ring.tileTableBinding(gpu_buf),
+                .block_keys = .{ .buffer = gpu_buf, .offset = arena.offsetOf(block_keys_raw.ptr) },
+                .index_buf = &idx_buf,
+                .index_metal_buf = gpu_buf,
+                .k_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(kt_raw.ptr) },
+                .v_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(vt_raw.ptr) },
+                .ancestor_masks = .{ .buffer = gpu_buf, .offset = arena.offsetOf(masks_raw.ptr) },
+                .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_fp16_raw.ptr) },
+                .num_nodes = num_nodes,
+                .num_q_heads = num_q_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .kv_len = kv_len,
+                .chunk_tokens = chunk_tokens,
+                .block_tokens = block_tokens,
+                .top_k_blocks = top_k_blocks,
+                .reuse_block_indices = false,
+            }, true);
+            // Run tiered QSA (reuses exact same block indices, reads chunks 0..1 from q8 retired_pool + chunk 2 from active_tail_tbl!).
+            try hybrid_pipes.encodeQsaAttention(&f, .{
+                .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) },
+                .kv_tiles = .{ .buffer = gpu_buf, .offset = arena.offsetOf(active_tail_tbl_raw.ptr) },
+                .block_keys = .{ .buffer = gpu_buf, .offset = arena.offsetOf(block_keys_raw.ptr) },
+                .index_buf = &idx_buf,
+                .index_metal_buf = gpu_buf,
+                .k_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(kt_raw.ptr) },
+                .v_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(vt_raw.ptr) },
+                .ancestor_masks = .{ .buffer = gpu_buf, .offset = arena.offsetOf(masks_raw.ptr) },
+                .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_tiered_raw.ptr) },
+                .retired_pool = retired_pool.binding(gpu_buf),
+                .retired_chunk_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(retired_ids_raw.ptr) },
+                .num_nodes = num_nodes,
+                .num_q_heads = num_q_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .kv_len = kv_len,
+                .chunk_tokens = chunk_tokens,
+                .block_tokens = block_tokens,
+                .top_k_blocks = top_k_blocks,
+                .num_retired_chunks = num_retired,
+                .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+                .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+                .reuse_block_indices = true,
+            }, true);
+            const sig = try f.commit();
+            try compute.wait(sig, 5000);
+        }
+
+        const out_fp16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_fp16_raw[0 .. q_f16.len * @sizeOf(f16)]));
+        const out_tiered: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_tiered_raw[0 .. q_f16.len * @sizeOf(f16)]));
+        var max_err: f32 = 0.0;
+        for (out_fp16, out_tiered) |e_h, g_h| {
+            const err = @abs(@as(f32, @floatCast(e_h)) - @as(f32, @floatCast(g_h)));
+            if (err > max_err) max_err = err;
+        }
+        try std.testing.expect(max_err < 3e-3);
+    }
+}
+
+test "C14 multi-slot M_batch=6 ami_gdn_batch_decode bit-exact parity vs single-slot ami_gdn_decode (d=64 & d=128, f16 & bf16)" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    const batch_size: u32 = 6;
+    const pool_slots: u32 = 8; // larger than batch_size to test non-contiguous permuted slot IDs!
+    const cases = [_]struct { dk: u32, dv: u32, norm_dt: quant.FloatDType }{
+        .{ .dk = 64, .dv = 64, .norm_dt = .f16 },
+        .{ .dk = 128, .dv = 128, .norm_dt = .bf16 },
+    };
+
+    for (cases) |tc| {
+        const num_k_heads: u32 = 2;
+        const num_v_heads: u32 = 4;
+        const state_elems: usize = @as(usize, num_v_heads) * tc.dk * tc.dv;
+        const slot_stride_bytes: usize = amf.align64(state_elems * @sizeOf(f32));
+        const slot_stride_f32: u32 = @intCast(slot_stride_bytes / @sizeOf(f32));
+
+        const arena_bytes: usize = slot_stride_bytes * pool_slots * 4 + page.APPLE_PAGE_SIZE * 16;
+        var arena = try arena_mod.WiredArena.init(arena_bytes, makeM65HybridBudget(arena_bytes));
+        defer arena.deinit();
+
+        const state_in_raw = try arena.allocAligned(slot_stride_bytes * pool_slots, 64);
+        const state_out_batch_raw = try arena.allocAligned(slot_stride_bytes * pool_slots, 64);
+        const state_out_single_raw = try arena.allocAligned(slot_stride_bytes * pool_slots, 64);
+        @memset(state_out_batch_raw, 0);
+        @memset(state_out_single_raw, 0);
+
+        const q_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_k_heads * tc.dk * @sizeOf(f16)), 64);
+        const k_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_k_heads * tc.dk * @sizeOf(f16)), 64);
+        const v_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_v_heads * tc.dv * @sizeOf(f16)), 64);
+        const g_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_v_heads * @sizeOf(f32)), 64);
+        const beta_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_v_heads * @sizeOf(f32)), 64);
+        const z_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_v_heads * tc.dv * @sizeOf(f16)), 64);
+        const norm_w_raw = try arena.allocAligned(amf.align64(@as(usize, num_v_heads) * tc.dv * 2), 64);
+        const out_batch_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_v_heads * tc.dv * @sizeOf(f16)), 64);
+        const out_single_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_v_heads * tc.dv * @sizeOf(f16)), 64);
+        const in_slots_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * @sizeOf(u32)), 64);
+        const out_slots_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * @sizeOf(u32)), 64);
+
+        var rng = std.Random.DefaultPrng.init(0x6D0_0000 + tc.dk);
+        const rand = rng.random();
+        const s_in_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, state_in_raw));
+        for (s_in_f32) |*x| x.* = (rand.float(f32) - 0.5) * 0.4;
+
+        const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw[0 .. @as(usize, batch_size) * num_k_heads * tc.dk * @sizeOf(f16)]));
+        const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw[0 .. @as(usize, batch_size) * num_k_heads * tc.dk * @sizeOf(f16)]));
+        const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw[0 .. @as(usize, batch_size) * num_v_heads * tc.dv * @sizeOf(f16)]));
+        const z_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, z_raw[0 .. @as(usize, batch_size) * num_v_heads * tc.dv * @sizeOf(f16)]));
+        const g_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, g_raw[0 .. @as(usize, batch_size) * num_v_heads * @sizeOf(f32)]));
+        const beta_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, beta_raw[0 .. @as(usize, batch_size) * num_v_heads * @sizeOf(f32)]));
+        for (q_f16, k_f16) |*qp, *kp| {
+            qp.* = @floatCast((rand.float(f32) - 0.5) * 1.2);
+            kp.* = @floatCast((rand.float(f32) - 0.5) * 1.2);
+        }
+        for (v_f16, z_f16) |*vp, *zp| {
+            vp.* = @floatCast((rand.float(f32) - 0.5) * 1.0);
+            zp.* = @floatCast((rand.float(f32) - 0.5) * 1.5);
+        }
+        for (g_f32, beta_f32) |*gp, *bp| {
+            gp.* = -0.05 - rand.float(f32) * 0.4;
+            bp.* = (rand.float(f32) - 0.5) * 2.0;
+        }
+        const nw_u16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, norm_w_raw[0 .. @as(usize, num_v_heads) * tc.dv * 2]));
+        for (nw_u16) |*w| {
+            const val: f32 = 0.7 + rand.float(f32) * 0.6;
+            w.* = switch (tc.norm_dt) {
+                .f16 => @bitCast(@as(f16, @floatCast(val))),
+                .bf16 => @truncate(@as(u32, @bitCast(val)) >> 16),
+            };
+        }
+
+        // Permuted non-contiguous slot mappings (`in_slots != out_slots` -> also verifies scratch/slot isolation!).
+        const in_slots_perm = [batch_size]u32{ 7, 2, 5, 0, 4, 1 };
+        const out_slots_perm = [batch_size]u32{ 1, 6, 3, 7, 2, 4 };
+        const in_slots: []u32 = @alignCast(std.mem.bytesAsSlice(u32, in_slots_raw[0 .. @as(usize, batch_size) * @sizeOf(u32)]));
+        const out_slots: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_slots_raw[0 .. @as(usize, batch_size) * @sizeOf(u32)]));
+        @memcpy(in_slots, &in_slots_perm);
+        @memcpy(out_slots, &out_slots_perm);
+
+        const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer gpu_buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+
+        {
+            var f = try compute.beginFrame(5000);
+            errdefer f.abort();
+            try pipes.encodeGdnBatchDecode(&f, .{
+                .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) },
+                .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) },
+                .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) },
+                .g = .{ .buffer = gpu_buf, .offset = arena.offsetOf(g_raw.ptr) },
+                .beta = .{ .buffer = gpu_buf, .offset = arena.offsetOf(beta_raw.ptr) },
+                .z = .{ .buffer = gpu_buf, .offset = arena.offsetOf(z_raw.ptr) },
+                .norm_w = .{ .buffer = gpu_buf, .offset = arena.offsetOf(norm_w_raw.ptr) },
+                .state_in_pool = .{ .buffer = gpu_buf, .offset = arena.offsetOf(state_in_raw.ptr) },
+                .state_out_pool = .{ .buffer = gpu_buf, .offset = arena.offsetOf(state_out_batch_raw.ptr) },
+                .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_batch_raw.ptr) },
+                .state_in_slots = .{ .buffer = gpu_buf, .offset = arena.offsetOf(in_slots_raw.ptr) },
+                .state_out_slots = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_slots_raw.ptr) },
+                .batch_size = batch_size,
+                .num_k_heads = num_k_heads,
+                .num_v_heads = num_v_heads,
+                .head_k_dim = tc.dk,
+                .head_v_dim = tc.dv,
+                .slot_stride_f32 = slot_stride_f32,
+                .per_head_norm = true,
+                .norm_dtype = tc.norm_dt,
+            }, false);
+
+            const qk_bytes: u64 = @as(u64, num_k_heads) * tc.dk * @sizeOf(f16);
+            const v_bytes: u64 = @as(u64, num_v_heads) * tc.dv * @sizeOf(f16);
+            const gb_bytes: u64 = @as(u64, num_v_heads) * @sizeOf(f32);
+            for (0..batch_size) |b| {
+                try pipes.encodeGdnDecode(&f, .{
+                    .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) + @as(u64, b) * qk_bytes },
+                    .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) + @as(u64, b) * qk_bytes },
+                    .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) + @as(u64, b) * v_bytes },
+                    .g = .{ .buffer = gpu_buf, .offset = arena.offsetOf(g_raw.ptr) + @as(u64, b) * gb_bytes },
+                    .beta = .{ .buffer = gpu_buf, .offset = arena.offsetOf(beta_raw.ptr) + @as(u64, b) * gb_bytes },
+                    .z = .{ .buffer = gpu_buf, .offset = arena.offsetOf(z_raw.ptr) + @as(u64, b) * v_bytes },
+                    .norm_w = .{ .buffer = gpu_buf, .offset = arena.offsetOf(norm_w_raw.ptr) },
+                    .state_in = .{ .buffer = gpu_buf, .offset = arena.offsetOf(state_in_raw.ptr) + @as(u64, in_slots_perm[b]) * slot_stride_bytes },
+                    .state_out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(state_out_single_raw.ptr) + @as(u64, out_slots_perm[b]) * slot_stride_bytes },
+                    .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_single_raw.ptr) + @as(u64, b) * v_bytes },
+                    .num_k_heads = num_k_heads,
+                    .num_v_heads = num_v_heads,
+                    .head_k_dim = tc.dk,
+                    .head_v_dim = tc.dv,
+                    .per_head_norm = true,
+                    .norm_dtype = tc.norm_dt,
+                }, true);
+            }
+            const sig = try f.commit();
+            try compute.wait(sig, 5000);
+        }
+
+        // Exact bit-for-bit equality for BOTH outputs AND updated recurrent states (including untouched slots 0 and 5)!
+        try std.testing.expectEqualSlices(u8, out_single_raw, out_batch_raw);
+        try std.testing.expectEqualSlices(u8, state_out_single_raw, state_out_batch_raw);
+    }
+}
+
+test "R8 GdnSnapshotPool and ami_gdn_clone_state round-trip multi-layer state + conv1d with mutation isolation" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    const state_spec: GdnStateSpec = .{
+        .num_gdn_layers = 3,
+        .num_v_heads = 4,
+        .head_k_dim = 64,
+        .head_v_dim = 64,
+    };
+    const conv_f16_per_layer: u32 = 3 * 512; // conv_k=4, conv_dim=512
+    const conv_stride_bytes: usize = amf.align64(@as(usize, conv_f16_per_layer) * @sizeOf(f16));
+    const conv_stride_f16: u32 = @intCast(conv_stride_bytes / @sizeOf(f16));
+
+    const snap_spec: GdnSnapshotPoolSpec = .{
+        .state = state_spec,
+        .conv_f16_per_layer = conv_f16_per_layer,
+        .max_snapshots = 2,
+    };
+    const arena_bytes: usize =
+        (try GdnSnapshotPool.requiredArenaBytes(snap_spec)) +
+        (try GdnStateArena.requiredBytes(state_spec)) * 2 +
+        conv_stride_bytes * state_spec.num_gdn_layers * 2 +
+        page.APPLE_PAGE_SIZE * 4;
+    var arena = try arena_mod.WiredArena.init(arena_bytes, makeM65HybridBudget(arena_bytes));
+    defer arena.deinit();
+
+    var snap_pool = try GdnSnapshotPool.init(&arena, snap_spec);
+    var src_arena = try GdnStateArena.init(&arena, state_spec);
+    var dst_arena = try GdnStateArena.init(&arena, state_spec);
+    const src_conv_raw = try arena.allocAligned(conv_stride_bytes * state_spec.num_gdn_layers, 64);
+    const dst_conv_raw = try arena.allocAligned(conv_stride_bytes * state_spec.num_gdn_layers, 64);
+    @memset(dst_conv_raw, 0);
+
+    for (0..state_spec.num_gdn_layers) |l| {
+        const s = try src_arena.committedLayerSlice(@intCast(l));
+        for (s, 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast((i + l * 41) % 37)) - 18)) * 0.125;
+        const c_off = l * conv_stride_bytes;
+        const c: []f16 = @alignCast(std.mem.bytesAsSlice(f16, src_conv_raw[c_off .. c_off + @as(usize, conv_f16_per_layer) * @sizeOf(f16)]));
+        for (c, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i + l * 19) % 29)) - 14)) * 0.25);
+    }
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const snap0 = try snap_pool.acquireSlot();
+    const snap1 = try snap_pool.acquireSlot();
+    try std.testing.expectError(error.PoolExhausted, snap_pool.acquireSlot());
+
+    // Save src -> snap0, then restore snap0 -> dst on GPU in one frame.
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeGdnCloneState(&f, .{
+            .src_state = try src_arena.committedBinding(gpu_buf, 0),
+            .dst_state = try snap_pool.stateBinding(gpu_buf, snap0),
+            .src_conv = .{ .buffer = gpu_buf, .offset = arena.offsetOf(src_conv_raw.ptr) },
+            .dst_conv = try snap_pool.convBinding(gpu_buf, snap0),
+            .num_gdn_layers = state_spec.num_gdn_layers,
+            .state_f32_per_layer = snap_pool.layer_state_elems,
+            .src_state_layer_stride_f32 = @intCast(src_arena.layer_stride_bytes / @sizeOf(f32)),
+            .dst_state_layer_stride_f32 = snap_pool.stateLayerStrideF32(),
+            .conv_f16_per_layer = conv_f16_per_layer,
+            .src_conv_layer_stride_f16 = conv_stride_f16,
+            .dst_conv_layer_stride_f16 = snap_pool.convLayerStrideF16(),
+        }, false);
+        try pipes.encodeGdnCloneState(&f, .{
+            .src_state = try snap_pool.stateBinding(gpu_buf, snap0),
+            .dst_state = try dst_arena.committedBinding(gpu_buf, 0),
+            .src_conv = try snap_pool.convBinding(gpu_buf, snap0),
+            .dst_conv = .{ .buffer = gpu_buf, .offset = arena.offsetOf(dst_conv_raw.ptr) },
+            .num_gdn_layers = state_spec.num_gdn_layers,
+            .state_f32_per_layer = snap_pool.layer_state_elems,
+            .src_state_layer_stride_f32 = snap_pool.stateLayerStrideF32(),
+            .dst_state_layer_stride_f32 = @intCast(dst_arena.layer_stride_bytes / @sizeOf(f32)),
+            .conv_f16_per_layer = conv_f16_per_layer,
+            .src_conv_layer_stride_f16 = snap_pool.convLayerStrideF16(),
+            .dst_conv_layer_stride_f16 = conv_stride_f16,
+        }, true);
+        const sig = try f.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    for (0..state_spec.num_gdn_layers) |l| {
+        try std.testing.expectEqualSlices(f32, try src_arena.committedLayerSlice(@intCast(l)), try dst_arena.committedLayerSlice(@intCast(l)));
+    }
+    try std.testing.expectEqualSlices(u8, src_conv_raw, dst_conv_raw);
+
+    try snap_pool.releaseSlot(snap1);
+    try std.testing.expectError(error.DoubleFree, snap_pool.releaseSlot(snap1));
+    try snap_pool.releaseSlot(snap0);
+    try std.testing.expectEqual(@as(u32, 0), snap_pool.activeCount());
 }

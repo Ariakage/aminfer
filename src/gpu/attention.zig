@@ -17,6 +17,15 @@ const vmstat = @import("../platform/vmstat.zig");
 /// Default number of tokens stored per KV cache chunk tile (ADR-0004).
 pub const DEFAULT_CHUNK_TOKENS: u32 = 512;
 
+/// Group size for R5 retired GPU `q8` KV compression (`64` int8 codes + `f16` scale + `f16` bias = `68 B`).
+pub const KV_Q8_GROUP_SIZE: u32 = 64;
+
+/// Byte footprint per group-64 `q8` KV block (`64 * 1 + 2 + 2 = 68 B`, 4-byte aligned).
+pub const KV_Q8_GROUP_BYTES: u32 = 68;
+
+/// Recommended maximum concurrent continuous-batching decode slots (`C14`).
+pub const MAX_BATCH_SLOTS: u32 = 16;
+
 /// Maximum speculative verification tree width (64-bit ancestor bitmask, ADR-0014).
 pub const MAX_TREE_NODES: u32 = 64;
 
@@ -138,6 +147,123 @@ pub const KvTreeCommitParams = extern struct {
     inline_nodes: [MAX_TREE_NODES]u16 = @splat(0),
 };
 
+/// Group-64 `q8` retired KV block (`64` int8 codes + `f16` scale + `f16` bias = `68 B`).
+/// Dequantization: `x[i] = float(codes[i]) * float(scale) + float(bias)`.
+pub const KvQ8Group = extern struct {
+    codes: [KV_Q8_GROUP_SIZE]i8,
+    scale: f16,
+    bias: f16,
+};
+
+/// Uniform payload matching `struct KvRetireQ8Params` in `kv_attention.metal`.
+pub const KvRetireQ8Params = extern struct {
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32,
+    dst_slot: u32,
+    plane_stride_bytes: u32,
+    chunk_stride_bytes: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+/// Uniform payload matching `struct KvTileCowCopyParams` in `kv_attention.metal`.
+pub const KvTileCowCopyParams = extern struct {
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32,
+    valid_tokens: u32,
+};
+
+/// Uniform payload matching `struct TieredGqaDecodeParams` in `kv_attention.metal`.
+pub const TieredGqaDecodeParams = extern struct {
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    seq_len: u32,
+    chunk_tokens: u32,
+    num_splits: u32,
+    q_groups_per_kv: u32,
+    scale: f32,
+    num_retired_chunks: u32,
+    retired_plane_stride_bytes: u32,
+    retired_chunk_stride_bytes: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+/// Uniform payload matching `struct TieredGqaTreeVerifyParams` in `kv_attention.metal`.
+pub const TieredGqaTreeVerifyParams = extern struct {
+    num_nodes: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    base_pos: u32,
+    chunk_tokens: u32,
+    num_splits: u32,
+    q_groups_per_kv: u32,
+    scale: f32,
+    num_retired_chunks: u32,
+    retired_plane_stride_bytes: u32,
+    retired_chunk_stride_bytes: u32,
+    _pad0: u32 = 0,
+};
+
+/// Per-slot bindless KV write descriptor matching `struct BatchKvWriteSlot`
+/// in `kv_attention.metal` (`C14` continuous batching).
+pub const BatchKvWriteSlot = extern struct {
+    k_tex_id: u64,
+    v_tex_id: u64,
+    pos: u32,
+    slot_in_chunk: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+
+    pub fn fromTiles(k: metal.KvTile, v: metal.KvTile, pos: u32, chunk_tokens: u32) BatchKvWriteSlot {
+        return .{
+            .k_tex_id = k.rgbaResourceId(),
+            .v_tex_id = v.rgbaResourceId(),
+            .pos = pos,
+            .slot_in_chunk = pos % chunk_tokens,
+        };
+    }
+};
+
+/// Uniform payload matching `struct BatchQkNormRopeKvParams` in `kv_attention.metal`.
+pub const BatchQkNormRopeKvParams = extern struct {
+    batch_size: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+    apply_qk_norm: u32,
+};
+
+/// Per-slot tiered KV descriptor matching `struct BatchGqaSlotDesc` in
+/// `kv_attention.metal` (`C14` continuous batching + `R5` retired tier).
+pub const BatchGqaSlotDesc = extern struct {
+    seq_len: u32,
+    tile_table_offset: u32,
+    retired_offset: u32,
+    num_retired_chunks: u32,
+};
+
+/// Uniform payload matching `struct BatchGqaDecodeParams` in `kv_attention.metal`.
+pub const BatchGqaDecodeParams = extern struct {
+    batch_size: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    chunk_tokens: u32,
+    num_splits: u32,
+    q_groups_per_kv: u32,
+    scale: f32,
+    retired_plane_stride_bytes: u32,
+    retired_chunk_stride_bytes: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(KvTilePair) != 16) @compileError("KvTilePair must be 16 bytes");
     if (@sizeOf(KvBufPair) != 16) @compileError("KvBufPair must be 16 bytes");
@@ -149,7 +275,201 @@ comptime {
     if (@sizeOf(GqaTreeVerifyParams) != 32) @compileError("GqaTreeVerifyParams must be 32 bytes");
     if (@sizeOf(KvTreeCommitParams) != 160) @compileError("KvTreeCommitParams must be 160 bytes");
     if (@sizeOf(KvTreeCommitParams) > metal.MAX_UNIFORM_BYTES) @compileError("KvTreeCommitParams exceeds uniform stride");
+    if (@sizeOf(KvQ8Group) != KV_Q8_GROUP_BYTES) @compileError("KvQ8Group must be 68 bytes");
+    if (@sizeOf(KvRetireQ8Params) != 32) @compileError("KvRetireQ8Params must be 32 bytes");
+    if (@sizeOf(KvTileCowCopyParams) != 16) @compileError("KvTileCowCopyParams must be 16 bytes");
+    if (@sizeOf(TieredGqaDecodeParams) != 48) @compileError("TieredGqaDecodeParams must be 48 bytes");
+    if (@sizeOf(TieredGqaTreeVerifyParams) != 48) @compileError("TieredGqaTreeVerifyParams must be 48 bytes");
+    if (@sizeOf(BatchKvWriteSlot) != 32) @compileError("BatchKvWriteSlot must be 32 bytes");
+    if (@sizeOf(BatchQkNormRopeKvParams) != 32) @compileError("BatchQkNormRopeKvParams must be 32 bytes");
+    if (@sizeOf(BatchGqaSlotDesc) != 16) @compileError("BatchGqaSlotDesc must be 16 bytes");
+    if (@sizeOf(BatchGqaDecodeParams) != 48) @compileError("BatchGqaDecodeParams must be 48 bytes");
 }
+
+pub const RetiredKvQ8PoolError = arena_mod.WiredArena.AllocError || error{
+    InvalidConfig,
+    PoolExhausted,
+    InvalidSlot,
+    DoubleFree,
+};
+
+pub const RetiredKvQ8PoolSpec = struct {
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    max_chunks: u32,
+};
+
+/// Preallocated `WiredArena` pool storing retired `chunk_tokens` (`512`-tok)
+/// `(K, V)` KV chunks in group-64 `q8` (`68 B / 64 dims`, cutting retired KV
+/// wired RAM by `46.875%` vs `fp16` `KvTilePair`s; ADR-0004, ADR-0019).
+///
+/// Strictly `16 KiB` page-aligned for GPU `MTLBuffer` sharing with `0` heap
+/// allocations at init and on the hot path, and O(1) free-list acquire/release.
+pub const RetiredKvQ8Pool = struct {
+    spec: RetiredKvQ8PoolSpec,
+    data_backing: []align(page.APPLE_PAGE_SIZE) u8,
+    data_offset: u64,
+    plane_stride_bytes: u32,
+    chunk_stride_bytes: u32,
+    free_stack: []u32,
+    in_use: []u8,
+    free_top: u32,
+
+    pub fn validateSpec(spec: RetiredKvQ8PoolSpec) RetiredKvQ8PoolError!void {
+        if (spec.num_kv_heads == 0 or spec.head_dim == 0 or
+            spec.chunk_tokens == 0 or spec.max_chunks == 0)
+        {
+            return error.InvalidConfig;
+        }
+        if ((spec.head_dim % KV_Q8_GROUP_SIZE) != 0 or spec.head_dim > 256) {
+            return error.InvalidConfig;
+        }
+    }
+
+    pub fn planeStrideBytes(spec: RetiredKvQ8PoolSpec) RetiredKvQ8PoolError!u32 {
+        try validateSpec(spec);
+        const groups = spec.head_dim / KV_Q8_GROUP_SIZE;
+        const row_bytes = std.math.mul(usize, groups, KV_Q8_GROUP_BYTES) catch return error.Overflow;
+        const total_rows = std.math.mul(usize, spec.num_kv_heads, spec.chunk_tokens) catch return error.Overflow;
+        const raw = std.math.mul(usize, total_rows, row_bytes) catch return error.Overflow;
+        const aligned = amf.align64(raw);
+        return std.math.cast(u32, aligned) orelse return error.Overflow;
+    }
+
+    pub fn chunkStrideBytes(spec: RetiredKvQ8PoolSpec) RetiredKvQ8PoolError!u32 {
+        const plane = try planeStrideBytes(spec);
+        return std.math.mul(u32, plane, 2) catch return error.Overflow;
+    }
+
+    /// Exact `16 KiB` page-aligned GPU buffer bytes required for `max_chunks` retired slots.
+    pub fn dataRequiredBytes(spec: RetiredKvQ8PoolSpec) RetiredKvQ8PoolError!usize {
+        const c_stride = try chunkStrideBytes(spec);
+        const raw = std.math.mul(usize, c_stride, spec.max_chunks) catch return error.Overflow;
+        return page.alignUp(raw) catch return error.Overflow;
+    }
+
+    /// Total `WiredArena` bytes required for both GPU data pages and O(1) free-list metadata.
+    pub fn requiredArenaBytes(spec: RetiredKvQ8PoolSpec) RetiredKvQ8PoolError!usize {
+        const data_bytes = try dataRequiredBytes(spec);
+        const stack_raw = std.math.mul(usize, spec.max_chunks, @sizeOf(u32)) catch return error.Overflow;
+        const stack_bytes = amf.align64(stack_raw);
+        const flags_bytes = amf.align64(spec.max_chunks);
+        const meta = std.math.add(usize, stack_bytes, flags_bytes) catch return error.Overflow;
+        const total = std.math.add(usize, data_bytes, meta) catch return error.Overflow;
+        return page.alignUp(total) catch return error.Overflow;
+    }
+
+    /// Equivalent `fp16` `KvTilePair` (`K + V`) byte footprint for one chunk.
+    pub fn fp16EquivalentChunkBytes(spec: RetiredKvQ8PoolSpec) RetiredKvQ8PoolError!usize {
+        try validateSpec(spec);
+        const elems_per_plane = std.math.mul(usize, @as(usize, spec.num_kv_heads) * spec.chunk_tokens, spec.head_dim) catch return error.Overflow;
+        const plane_f16 = std.math.mul(usize, elems_per_plane, @sizeOf(f16)) catch return error.Overflow;
+        return std.math.mul(usize, plane_f16, 2) catch return error.Overflow;
+    }
+
+    /// Fractional wired RAM reduction of group-64 `q8` vs `fp16` (`~0.46875` = `46.875%`).
+    pub fn compressionSavingsRatio(spec: RetiredKvQ8PoolSpec) RetiredKvQ8PoolError!f64 {
+        const q8_bytes: f64 = @floatFromInt(try chunkStrideBytes(spec));
+        const fp16_bytes: f64 = @floatFromInt(try fp16EquivalentChunkBytes(spec));
+        return 1.0 - (q8_bytes / fp16_bytes);
+    }
+
+    pub fn init(arena: *arena_mod.WiredArena, spec: RetiredKvQ8PoolSpec) RetiredKvQ8PoolError!RetiredKvQ8Pool {
+        const plane_stride = try planeStrideBytes(spec);
+        const chunk_stride = try chunkStrideBytes(spec);
+        const data_bytes = try dataRequiredBytes(spec);
+
+        const data_backing = try arena.allocPages(data_bytes);
+        @memset(data_backing, 0);
+        const data_offset: u64 = @intCast(arena.offsetOf(data_backing.ptr));
+
+        const stack_bytes = amf.align64(@as(usize, spec.max_chunks) * @sizeOf(u32));
+        const stack_raw = try arena.allocAligned(stack_bytes, 64);
+        const free_stack: []u32 = @alignCast(std.mem.bytesAsSlice(
+            u32,
+            stack_raw[0 .. @as(usize, spec.max_chunks) * @sizeOf(u32)],
+        ));
+
+        const flags_bytes = amf.align64(spec.max_chunks);
+        const flags_raw = try arena.allocAligned(flags_bytes, 64);
+        const in_use = flags_raw[0..spec.max_chunks];
+
+        var pool: RetiredKvQ8Pool = .{
+            .spec = spec,
+            .data_backing = data_backing,
+            .data_offset = data_offset,
+            .plane_stride_bytes = plane_stride,
+            .chunk_stride_bytes = chunk_stride,
+            .free_stack = free_stack,
+            .in_use = in_use,
+            .free_top = spec.max_chunks,
+        };
+        pool.reset();
+        return pool;
+    }
+
+    /// Resets all slots to free in O(max_chunks) without reallocating.
+    pub fn reset(self: *RetiredKvQ8Pool) void {
+        @memset(self.in_use, 0);
+        const n = self.spec.max_chunks;
+        for (0..n) |i| {
+            // LIFO order so slot 0 is acquired first.
+            self.free_stack[i] = n - 1 - @as(u32, @intCast(i));
+        }
+        self.free_top = n;
+    }
+
+    /// `16 KiB` page-aligned GPU buffer slice (suitable for standalone `metal.Buffer.wrap`).
+    pub fn bytes(self: *const RetiredKvQ8Pool) []align(page.APPLE_PAGE_SIZE) u8 {
+        return self.data_backing;
+    }
+
+    pub fn binding(self: *const RetiredKvQ8Pool, buf: metal.Buffer) metal.BufferBinding {
+        return .{ .buffer = buf, .offset = self.data_offset };
+    }
+
+    pub fn chunkOffsetBytes(self: *const RetiredKvQ8Pool, slot_id: u32) RetiredKvQ8PoolError!u64 {
+        if (slot_id >= self.spec.max_chunks) return error.InvalidSlot;
+        return @as(u64, slot_id) * @as(u64, self.chunk_stride_bytes);
+    }
+
+    pub fn chunkBinding(self: *const RetiredKvQ8Pool, buf: metal.Buffer, slot_id: u32) RetiredKvQ8PoolError!metal.BufferBinding {
+        return .{ .buffer = buf, .offset = self.data_offset + try self.chunkOffsetBytes(slot_id) };
+    }
+
+    /// Acquires a free retired chunk slot in O(1) with `0` heap allocation.
+    pub fn acquireSlot(self: *RetiredKvQ8Pool) RetiredKvQ8PoolError!u32 {
+        if (self.free_top == 0) return error.PoolExhausted;
+        self.free_top -= 1;
+        const slot = self.free_stack[self.free_top];
+        std.debug.assert(slot < self.spec.max_chunks);
+        std.debug.assert(self.in_use[slot] == 0);
+        self.in_use[slot] = 1;
+        return slot;
+    }
+
+    /// Releases a retired chunk slot back to the free pool in O(1).
+    pub fn releaseSlot(self: *RetiredKvQ8Pool, slot_id: u32) RetiredKvQ8PoolError!void {
+        if (slot_id >= self.spec.max_chunks) return error.InvalidSlot;
+        if (self.in_use[slot_id] == 0) return error.DoubleFree;
+        self.in_use[slot_id] = 0;
+        self.free_stack[self.free_top] = slot_id;
+        self.free_top += 1;
+    }
+
+    pub fn capacity(self: *const RetiredKvQ8Pool) u32 {
+        return self.spec.max_chunks;
+    }
+
+    pub fn freeCount(self: *const RetiredKvQ8Pool) u32 {
+        return self.free_top;
+    }
+
+    pub fn activeCount(self: *const RetiredKvQ8Pool) u32 {
+        return self.spec.max_chunks - self.free_top;
+    }
+};
 
 pub const RmsNormArgs = struct {
     x: metal.BufferBinding,
@@ -341,6 +661,150 @@ pub fn gqaTreeScratchLayout(max_nodes: u32, num_q_heads: u32, head_dim: u32, max
     };
 }
 
+/// Computes 64-byte-aligned scratch offsets for multi-request batched split-KV
+/// GQA decode attention (`[batch_size, num_q_heads, max_splits]` partials).
+pub fn gqaBatchScratchLayout(batch_size: u32, num_q_heads: u32, head_dim: u32, max_splits: u32) GqaScratchLayout {
+    return gqaTreeScratchLayout(batch_size, num_q_heads, head_dim, max_splits);
+}
+
+pub const KvRetireQ8Args = struct {
+    /// Completed `chunk_tokens` `RGBA16Float` K tile to compress.
+    k_tile: metal.KvTile,
+    /// Completed `chunk_tokens` `RGBA16Float` V tile to compress.
+    v_tile: metal.KvTile,
+    /// Target `RetiredKvQ8Pool` metadata.
+    pool: *const RetiredKvQ8Pool,
+    /// Backing `MTLBuffer` wrapping the `WiredArena` containing `pool`.
+    pool_buf: metal.Buffer,
+    /// Pre-acquired destination slot index in `pool` (`0 .. pool.capacity()`).
+    dst_slot: u32,
+};
+
+pub const KvTileCowCopyArgs = struct {
+    /// Cached shared prefix K tile (`RGBA16Float`, read-only).
+    src_k: metal.KvTile,
+    /// Cached shared prefix V tile (`RGBA16Float`, read-only).
+    src_v: metal.KvTile,
+    /// Private per-slot tail K tile (`RGBA16Float`, written on GPU).
+    dst_k: metal.KvTile,
+    /// Private per-slot tail V tile (`RGBA16Float`, written on GPU).
+    dst_v: metal.KvTile,
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    /// Number of valid prefix tokens in the partial tail tile (`1..chunk_tokens`).
+    valid_tokens: u32,
+};
+
+pub const TieredGqaDecodeArgs = struct {
+    /// `[num_q_heads, head_dim]` fp16 query vector.
+    q: metal.BufferBinding,
+    /// `[num_active_chunks]` active `KvTilePair` table covering `[num_retired_chunks * chunk_tokens .. seq_len)`.
+    /// May be null only when all `seq_len` tokens live inside retired chunks.
+    kv_tiles: ?metal.BufferBinding = null,
+    /// Optional `RetiredKvQ8Pool` base binding (required when `num_retired_chunks > 0`).
+    retired_pool: ?metal.BufferBinding = null,
+    /// Optional `[num_retired_chunks]` `u32` physical slot IDs in `retired_pool`.
+    retired_chunk_ids: ?metal.BufferBinding = null,
+    /// `[num_q_heads, head_dim]` fp16 output vector.
+    out: metal.BufferBinding,
+    /// Optional preallocated split-KV scratch buffer sized by `gqaScratchLayout`.
+    scratch: ?metal.BufferBinding = null,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    num_retired_chunks: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
+    max_splits: u32 = MAX_SPLITS,
+    scale: ?f32 = null,
+};
+
+pub const TieredGqaTreeVerifyArgs = struct {
+    /// `[num_nodes, num_q_heads, head_dim]` fp16 tree queries.
+    q: metal.BufferBinding,
+    /// Active `KvTilePair` table covering `[num_retired_chunks * chunk_tokens .. base_pos)`.
+    kv_tiles: ?metal.BufferBinding = null,
+    /// Optional `RetiredKvQ8Pool` base binding (required when `num_retired_chunks > 0`).
+    retired_pool: ?metal.BufferBinding = null,
+    /// Optional `[num_retired_chunks]` `u32` physical slot IDs in `retired_pool`.
+    retired_chunk_ids: ?metal.BufferBinding = null,
+    /// `[num_nodes, num_kv_heads, head_dim]` fp16 rotated tree K.
+    k_tree: metal.BufferBinding,
+    /// `[num_nodes, num_kv_heads, head_dim]` fp16 raw tree V.
+    v_tree: metal.BufferBinding,
+    /// `[num_nodes]` `u64` 64-bit tree ancestor masks.
+    ancestor_masks: metal.BufferBinding,
+    /// `[num_nodes, num_q_heads, head_dim]` fp16 output.
+    out: metal.BufferBinding,
+    /// Optional preallocated split-KV scratch buffer sized by `gqaTreeScratchLayout`.
+    scratch: ?metal.BufferBinding = null,
+    num_nodes: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    base_pos: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    num_retired_chunks: u32 = 0,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
+    max_splits: u32 = MAX_SPLITS,
+    scale: ?f32 = null,
+};
+
+pub const BatchQkNormRopeKvArgs = struct {
+    /// `[batch_size, num_q_heads, head_dim]` fp16, updated in-place.
+    q: metal.BufferBinding,
+    /// `[batch_size, num_kv_heads, head_dim]` fp16, read-only.
+    k: metal.BufferBinding,
+    /// `[batch_size, num_kv_heads, head_dim]` fp16, read-only.
+    v: metal.BufferBinding,
+    /// Optional `[head_dim]` Q-norm weights in `norm_dtype`.
+    q_norm: ?metal.BufferBinding = null,
+    /// Optional `[head_dim]` K-norm weights in `norm_dtype`.
+    k_norm: ?metal.BufferBinding = null,
+    /// `[batch_size]` `BatchKvWriteSlot` descriptors (bindless writable `KvTile` handles + pos).
+    slots: metal.BufferBinding,
+    batch_size: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    rms_eps: f32 = 1e-6,
+    rope_theta: f32 = 1_000_000.0,
+    norm_dtype: quant.FloatDType = .f16,
+};
+
+pub const BatchGqaDecodeArgs = struct {
+    /// `[batch_size, num_q_heads, head_dim]` fp16 queries.
+    q: metal.BufferBinding,
+    /// Shared active `KvTilePair` table indexed via `slots[b].tile_table_offset`.
+    kv_tiles: ?metal.BufferBinding = null,
+    /// Optional `RetiredKvQ8Pool` base binding (required when any slot has `num_retired_chunks > 0`).
+    retired_pool: ?metal.BufferBinding = null,
+    /// Optional shared `u32` retired chunk IDs table indexed via `slots[b].retired_offset`.
+    retired_chunk_ids: ?metal.BufferBinding = null,
+    /// `[batch_size]` `BatchGqaSlotDesc` entries.
+    slots: metal.BufferBinding,
+    /// `[batch_size, num_q_heads, head_dim]` fp16 output.
+    out: metal.BufferBinding,
+    /// Optional preallocated split-KV scratch buffer sized by `gqaBatchScratchLayout`.
+    scratch: ?metal.BufferBinding = null,
+    batch_size: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    /// Maximum `seq_len` across all slots in this batch (used to select `num_splits`).
+    max_seq_len: u32,
+    chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS,
+    retired_plane_stride_bytes: u32 = 0,
+    retired_chunk_stride_bytes: u32 = 0,
+    max_splits: u32 = MAX_SPLITS,
+    scale: ?f32 = null,
+};
+
 /// Chooses the split-KV partition count for FlashDecoding on Apple Silicon.
 pub fn chooseNumSplits(num_kv_heads: u32, seq_len: u32, chunk_tokens: u32, max_splits: u32) u32 {
     if (max_splits <= 1 or seq_len <= 128 or num_kv_heads == 0 or chunk_tokens == 0) return 1;
@@ -395,6 +859,23 @@ pub const AttentionPipelines = struct {
     gqa_tree_reduce_d64: metal.Pipeline,
     gqa_tree_reduce_d128: metal.Pipeline,
     kv_tree_commit: metal.Pipeline,
+    // M6.5: R5 retired q8 tier, R8 CoW tail copy, C14 multi-slot batched decode
+    kv_retire_tile_to_q8: metal.Pipeline,
+    kv_tile_cow_copy: metal.Pipeline,
+    gqa_tiered_split_d64: metal.Pipeline,
+    gqa_tiered_split_d128: metal.Pipeline,
+    gqa_tiered_tree_split_d64_n16: metal.Pipeline,
+    gqa_tiered_tree_split_d64_n32: metal.Pipeline,
+    gqa_tiered_tree_split_d64_n64: metal.Pipeline,
+    gqa_tiered_tree_split_d128_n16: metal.Pipeline,
+    gqa_tiered_tree_split_d128_n32: metal.Pipeline,
+    gqa_tiered_tree_split_d128_n64: metal.Pipeline,
+    batch_qknorm_rope_kv_write: metal.Pipeline,
+    batch_qknorm_rope_kv_write_bf16: metal.Pipeline,
+    batch_gqa_split_d64: metal.Pipeline,
+    batch_gqa_split_d128: metal.Pipeline,
+    batch_gqa_reduce_d64: metal.Pipeline,
+    batch_gqa_reduce_d128: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!AttentionPipelines {
         const rmsnorm = try metal.Pipeline.initSpecialized(device, library, "ami_rmsnorm", &.{
@@ -496,6 +977,88 @@ pub const AttentionPipelines = struct {
         const kv_tree_commit = try metal.Pipeline.init(device, library, "ami_kv_tree_commit");
         errdefer kv_tree_commit.close();
 
+        const kv_retire_tile_to_q8 = try metal.Pipeline.init(device, library, "ami_kv_retire_tile_to_q8");
+        errdefer kv_retire_tile_to_q8.close();
+
+        const kv_tile_cow_copy = try metal.Pipeline.init(device, library, "ami_kv_tile_cow_copy");
+        errdefer kv_tile_cow_copy.close();
+
+        const gqa_tiered_split_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_tiered_decode_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+        });
+        errdefer gqa_tiered_split_d64.close();
+
+        const gqa_tiered_split_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_tiered_decode_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+        });
+        errdefer gqa_tiered_split_d128.close();
+
+        const gqa_tiered_tree_split_d64_n16 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_tiered_tree_verify_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .u32 = 16 } },
+        });
+        errdefer gqa_tiered_tree_split_d64_n16.close();
+
+        const gqa_tiered_tree_split_d64_n32 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_tiered_tree_verify_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .u32 = 32 } },
+        });
+        errdefer gqa_tiered_tree_split_d64_n32.close();
+
+        const gqa_tiered_tree_split_d64_n64 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_tiered_tree_verify_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .u32 = 64 } },
+        });
+        errdefer gqa_tiered_tree_split_d64_n64.close();
+
+        const gqa_tiered_tree_split_d128_n16 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_tiered_tree_verify_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+            .{ .index = 3, .value = .{ .u32 = 16 } },
+        });
+        errdefer gqa_tiered_tree_split_d128_n16.close();
+
+        const gqa_tiered_tree_split_d128_n32 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_tiered_tree_verify_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+            .{ .index = 3, .value = .{ .u32 = 32 } },
+        });
+        errdefer gqa_tiered_tree_split_d128_n32.close();
+
+        const gqa_tiered_tree_split_d128_n64 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_tiered_tree_verify_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+            .{ .index = 3, .value = .{ .u32 = 64 } },
+        });
+        errdefer gqa_tiered_tree_split_d128_n64.close();
+
+        const batch_qknorm_rope_kv_write = try metal.Pipeline.initSpecialized(device, library, "ami_batch_qknorm_rope_kv_write", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
+        errdefer batch_qknorm_rope_kv_write.close();
+
+        const batch_qknorm_rope_kv_write_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_batch_qknorm_rope_kv_write", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer batch_qknorm_rope_kv_write_bf16.close();
+
+        const batch_gqa_split_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_batch_gqa_decode_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+        });
+        errdefer batch_gqa_split_d64.close();
+
+        const batch_gqa_split_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_batch_gqa_decode_attn_split", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+        });
+        errdefer batch_gqa_split_d128.close();
+
+        const batch_gqa_reduce_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_batch_gqa_decode_attn_reduce", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+        });
+        errdefer batch_gqa_reduce_d64.close();
+
+        const batch_gqa_reduce_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_batch_gqa_decode_attn_reduce", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+        });
+        errdefer batch_gqa_reduce_d128.close();
+
         return .{
             .rmsnorm = rmsnorm,
             .qknorm_rope_kv_write = qknorm_rope_kv_write,
@@ -516,10 +1079,42 @@ pub const AttentionPipelines = struct {
             .gqa_tree_reduce_d64 = gqa_tree_reduce_d64,
             .gqa_tree_reduce_d128 = gqa_tree_reduce_d128,
             .kv_tree_commit = kv_tree_commit,
+            .kv_retire_tile_to_q8 = kv_retire_tile_to_q8,
+            .kv_tile_cow_copy = kv_tile_cow_copy,
+            .gqa_tiered_split_d64 = gqa_tiered_split_d64,
+            .gqa_tiered_split_d128 = gqa_tiered_split_d128,
+            .gqa_tiered_tree_split_d64_n16 = gqa_tiered_tree_split_d64_n16,
+            .gqa_tiered_tree_split_d64_n32 = gqa_tiered_tree_split_d64_n32,
+            .gqa_tiered_tree_split_d64_n64 = gqa_tiered_tree_split_d64_n64,
+            .gqa_tiered_tree_split_d128_n16 = gqa_tiered_tree_split_d128_n16,
+            .gqa_tiered_tree_split_d128_n32 = gqa_tiered_tree_split_d128_n32,
+            .gqa_tiered_tree_split_d128_n64 = gqa_tiered_tree_split_d128_n64,
+            .batch_qknorm_rope_kv_write = batch_qknorm_rope_kv_write,
+            .batch_qknorm_rope_kv_write_bf16 = batch_qknorm_rope_kv_write_bf16,
+            .batch_gqa_split_d64 = batch_gqa_split_d64,
+            .batch_gqa_split_d128 = batch_gqa_split_d128,
+            .batch_gqa_reduce_d64 = batch_gqa_reduce_d64,
+            .batch_gqa_reduce_d128 = batch_gqa_reduce_d128,
         };
     }
 
     pub fn close(self: AttentionPipelines) void {
+        self.batch_gqa_reduce_d128.close();
+        self.batch_gqa_reduce_d64.close();
+        self.batch_gqa_split_d128.close();
+        self.batch_gqa_split_d64.close();
+        self.batch_qknorm_rope_kv_write_bf16.close();
+        self.batch_qknorm_rope_kv_write.close();
+        self.gqa_tiered_tree_split_d128_n64.close();
+        self.gqa_tiered_tree_split_d128_n32.close();
+        self.gqa_tiered_tree_split_d128_n16.close();
+        self.gqa_tiered_tree_split_d64_n64.close();
+        self.gqa_tiered_tree_split_d64_n32.close();
+        self.gqa_tiered_tree_split_d64_n16.close();
+        self.gqa_tiered_split_d128.close();
+        self.gqa_tiered_split_d64.close();
+        self.kv_tile_cow_copy.close();
+        self.kv_retire_tile_to_q8.close();
         self.kv_tree_commit.close();
         self.gqa_tree_reduce_d128.close();
         self.gqa_tree_reduce_d64.close();
@@ -912,6 +1507,459 @@ pub const AttentionPipelines = struct {
             .{ 32, 1, 1 },
             insert_barrier_before,
         );
+    }
+
+    /// Encodes `ami_kv_retire_tile_to_q8` (`R5`), compressing a completed
+    /// `chunk_tokens` `RGBA16Float` IOSurface `KvTilePair` into a pre-acquired
+    /// group-64 `q8` slot inside `RetiredKvQ8Pool` on GPU (`0` CPU syncs).
+    pub fn encodeKvRetireTileToQ8(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: KvRetireQ8Args,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        const spec = args.pool.spec;
+        if (args.dst_slot >= spec.max_chunks or
+            spec.num_kv_heads == 0 or spec.chunk_tokens == 0 or
+            spec.head_dim == 0 or (spec.head_dim % KV_Q8_GROUP_SIZE) != 0)
+        {
+            return error.InvalidArgument;
+        }
+        const params: KvRetireQ8Params = .{
+            .num_kv_heads = spec.num_kv_heads,
+            .head_dim = spec.head_dim,
+            .chunk_tokens = spec.chunk_tokens,
+            .dst_slot = args.dst_slot,
+            .plane_stride_bytes = args.pool.plane_stride_bytes,
+            .chunk_stride_bytes = args.pool.chunk_stride_bytes,
+        };
+        const total_rows: u64 = @as(u64, spec.num_kv_heads) * @as(u64, spec.chunk_tokens);
+        const groups_per_head: u64 = spec.head_dim / KV_Q8_GROUP_SIZE;
+        try frame.encodeThreadgroupsWithTextures(
+            self.kv_retire_tile_to_q8,
+            &.{args.pool.binding(args.pool_buf)},
+            &.{
+                .{ .tile = args.k_tile, .view = .rgba16f },
+                .{ .tile = args.v_tile, .view = .rgba16f },
+            },
+            std.mem.asBytes(&params),
+            .{ total_rows, groups_per_head, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_kv_tile_cow_copy` (`R8`), copying `valid_tokens`
+    /// (`1..chunk_tokens`) token-major `RGBA16Float` rows across `num_kv_heads`
+    /// from a shared cached `KvTilePair` into a request slot's private tail
+    /// `KvTilePair` on GPU (`0` CPU `memcpy`, `0` `CVPixelBufferLockBaseAddress`).
+    pub fn encodeKvTileCowCopy(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: KvTileCowCopyArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.num_kv_heads == 0 or args.head_dim == 0 or (args.head_dim % 4) != 0 or
+            args.chunk_tokens == 0 or args.valid_tokens == 0 or args.valid_tokens > args.chunk_tokens)
+        {
+            return error.InvalidArgument;
+        }
+        const params: KvTileCowCopyParams = .{
+            .num_kv_heads = args.num_kv_heads,
+            .head_dim = args.head_dim,
+            .chunk_tokens = args.chunk_tokens,
+            .valid_tokens = args.valid_tokens,
+        };
+        try frame.encodeThreadgroupsWithTextures(
+            self.kv_tile_cow_copy,
+            &.{},
+            &.{
+                .{ .tile = args.src_k, .view = .rgba16f },
+                .{ .tile = args.src_v, .view = .rgba16f },
+                .{ .tile = args.dst_k, .view = .rgba16f },
+                .{ .tile = args.dst_v, .view = .rgba16f },
+            },
+            std.mem.asBytes(&params),
+            .{ args.num_kv_heads, args.valid_tokens, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_gqa_tiered_decode_attn_split` (plus `ami_gqa_decode_attn_reduce`
+    /// when split-KV is active), attending seamlessly across `num_retired_chunks`
+    /// group-64 `q8` chunks AND active `RGBA16Float` `KvTilePair`s (`R5`).
+    pub fn encodeGqaTieredDecodeAttn(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: TieredGqaDecodeArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            (args.num_q_heads % args.num_kv_heads) != 0 or
+            args.seq_len == 0 or args.chunk_tokens == 0 or args.max_splits == 0)
+        {
+            return error.InvalidArgument;
+        }
+        const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidArgument;
+        if (args.num_retired_chunks > 0) {
+            if (args.retired_pool == null or args.retired_chunk_ids == null or
+                args.retired_plane_stride_bytes == 0 or
+                args.retired_chunk_stride_bytes < args.retired_plane_stride_bytes * 2)
+            {
+                return error.InvalidArgument;
+            }
+        }
+        if (@as(u64, args.seq_len) > retired_tokens and args.kv_tiles == null) {
+            return error.InvalidArgument;
+        }
+
+        const split_pipe, const reduce_pipe = switch (args.head_dim) {
+            64 => .{ self.gqa_tiered_split_d64, self.gqa_reduce_d64 },
+            128 => .{ self.gqa_tiered_split_d128, self.gqa_reduce_d128 },
+            else => return error.InvalidArgument,
+        };
+
+        const gqa_ratio = args.num_q_heads / args.num_kv_heads;
+        const q_groups_per_kv = (gqa_ratio + 7) / 8;
+        const num_splits: u32 = if (args.scratch != null)
+            chooseNumSplits(args.num_kv_heads, args.seq_len, args.chunk_tokens, @min(args.max_splits, MAX_SPLITS))
+        else
+            1;
+        const scale: f32 = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_dim))));
+
+        const params: TieredGqaDecodeParams = .{
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .seq_len = args.seq_len,
+            .chunk_tokens = args.chunk_tokens,
+            .num_splits = num_splits,
+            .q_groups_per_kv = q_groups_per_kv,
+            .scale = scale,
+            .num_retired_chunks = args.num_retired_chunks,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+        };
+
+        const kv_tiles_bind = args.kv_tiles orelse args.q;
+        const retired_pool_bind = args.retired_pool orelse args.q;
+        const retired_ids_bind = args.retired_chunk_ids orelse args.q;
+        const m_bind, const l_bind, const o_bind = if (args.scratch) |sc| blk: {
+            const layout = gqaScratchLayout(args.num_q_heads, args.head_dim, num_splits);
+            break :blk .{
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_m_offset },
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_l_offset },
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_o_offset },
+            };
+        } else .{ args.out, args.out, args.out };
+
+        try frame.encodeThreadgroups(
+            split_pipe,
+            &.{ args.q, kv_tiles_bind, retired_pool_bind, retired_ids_bind, args.out, m_bind, l_bind, o_bind },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, num_splits, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+
+        if (num_splits > 1) {
+            const reduce_params: GqaDecodeParams = .{
+                .num_q_heads = args.num_q_heads,
+                .num_kv_heads = args.num_kv_heads,
+                .seq_len = args.seq_len,
+                .chunk_tokens = args.chunk_tokens,
+                .num_splits = num_splits,
+                .q_groups_per_kv = q_groups_per_kv,
+                .scale = scale,
+            };
+            try frame.encodeThreadgroups(
+                reduce_pipe,
+                &.{ m_bind, l_bind, o_bind, args.out },
+                std.mem.asBytes(&reduce_params),
+                .{ args.num_q_heads, 1, 1 },
+                .{ 32, 1, 1 },
+                true,
+            );
+        }
+    }
+
+    /// Encodes `ami_gqa_tiered_tree_verify_attn_split` (plus
+    /// `ami_gqa_tree_verify_attn_reduce` when split-KV is active), combining
+    /// retired group-64 `q8` prefix chunks, active `RGBA16Float` `KvTilePair`s,
+    /// and 64-bit ancestor-masked speculative tree KV (`R5 + G5`).
+    pub fn encodeGqaTieredTreeVerifyAttn(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: TieredGqaTreeVerifyArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.num_nodes == 0 or args.num_nodes > MAX_TREE_NODES or
+            args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            (args.num_q_heads % args.num_kv_heads) != 0 or
+            args.chunk_tokens == 0 or args.max_splits == 0)
+        {
+            return error.InvalidArgument;
+        }
+        const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidArgument;
+        if (args.num_retired_chunks > 0) {
+            if (args.retired_pool == null or args.retired_chunk_ids == null or
+                args.retired_plane_stride_bytes == 0 or
+                args.retired_chunk_stride_bytes < args.retired_plane_stride_bytes * 2)
+            {
+                return error.InvalidArgument;
+            }
+        }
+        if (@as(u64, args.base_pos) > retired_tokens and args.kv_tiles == null) {
+            return error.InvalidArgument;
+        }
+
+        const split_pipe, const reduce_pipe = switch (args.head_dim) {
+            64 => .{
+                if (args.num_nodes <= 16)
+                    self.gqa_tiered_tree_split_d64_n16
+                else if (args.num_nodes <= 32)
+                    self.gqa_tiered_tree_split_d64_n32
+                else
+                    self.gqa_tiered_tree_split_d64_n64,
+                self.gqa_tree_reduce_d64,
+            },
+            128 => .{
+                if (args.num_nodes <= 16)
+                    self.gqa_tiered_tree_split_d128_n16
+                else if (args.num_nodes <= 32)
+                    self.gqa_tiered_tree_split_d128_n32
+                else
+                    self.gqa_tiered_tree_split_d128_n64,
+                self.gqa_tree_reduce_d128,
+            },
+            else => return error.InvalidArgument,
+        };
+
+        const gqa_ratio = args.num_q_heads / args.num_kv_heads;
+        const q_groups_per_kv = (args.num_nodes * gqa_ratio + 7) / 8;
+        const num_splits: u32 = if (args.scratch != null and args.base_pos > 0)
+            chooseTreeNumSplits(
+                args.num_nodes,
+                args.num_q_heads,
+                args.num_kv_heads,
+                args.base_pos,
+                args.chunk_tokens,
+                @min(args.max_splits, MAX_SPLITS),
+            )
+        else
+            1;
+        const scale: f32 = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_dim))));
+
+        const params: TieredGqaTreeVerifyParams = .{
+            .num_nodes = args.num_nodes,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .base_pos = args.base_pos,
+            .chunk_tokens = args.chunk_tokens,
+            .num_splits = num_splits,
+            .q_groups_per_kv = q_groups_per_kv,
+            .scale = scale,
+            .num_retired_chunks = args.num_retired_chunks,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+        };
+
+        const kv_tiles_bind = args.kv_tiles orelse args.q;
+        const retired_pool_bind = args.retired_pool orelse args.q;
+        const retired_ids_bind = args.retired_chunk_ids orelse args.q;
+        const m_bind, const l_bind, const o_bind = if (args.scratch) |sc| blk: {
+            const layout = gqaTreeScratchLayout(args.num_nodes, args.num_q_heads, args.head_dim, num_splits);
+            break :blk .{
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_m_offset },
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_l_offset },
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_o_offset },
+            };
+        } else .{ args.out, args.out, args.out };
+
+        try frame.encodeThreadgroups(
+            split_pipe,
+            &.{
+                args.q,
+                kv_tiles_bind,
+                retired_pool_bind,
+                retired_ids_bind,
+                args.k_tree,
+                args.v_tree,
+                args.ancestor_masks,
+                args.out,
+                m_bind,
+                l_bind,
+                o_bind,
+            },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, num_splits, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+
+        if (num_splits > 1) {
+            const reduce_params: GqaTreeVerifyParams = .{
+                .num_nodes = args.num_nodes,
+                .num_q_heads = args.num_q_heads,
+                .num_kv_heads = args.num_kv_heads,
+                .base_pos = args.base_pos,
+                .chunk_tokens = args.chunk_tokens,
+                .num_splits = num_splits,
+                .q_groups_per_kv = q_groups_per_kv,
+                .scale = scale,
+            };
+            try frame.encodeThreadgroups(
+                reduce_pipe,
+                &.{ m_bind, l_bind, o_bind, args.out },
+                std.mem.asBytes(&reduce_params),
+                .{ args.num_q_heads, args.num_nodes, 1 },
+                .{ 32, 1, 1 },
+                true,
+            );
+        }
+    }
+
+    /// Encodes `ami_batch_qknorm_rope_kv_write` (`C14`), applying QK-Norm +
+    /// NeoX RoPE and bindless `RGBA16Float` KV writes for `batch_size`
+    /// independent request slots in ONE GPU dispatch.
+    pub fn encodeBatchQkNormRopeKvWrite(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: BatchQkNormRopeKvArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.batch_size == 0 or
+            args.num_q_heads == 0 or args.num_kv_heads == 0 or args.chunk_tokens == 0 or
+            args.head_dim == 0 or args.head_dim > 256 or (args.head_dim % 8) != 0 or
+            args.rope_theta <= 0.0 or args.rms_eps < 0.0)
+        {
+            return error.InvalidArgument;
+        }
+        const has_qn = args.q_norm != null;
+        const has_kn = args.k_norm != null;
+        if (has_qn != has_kn) return error.InvalidArgument;
+
+        const qn_binding = args.q_norm orelse args.q;
+        const kn_binding = args.k_norm orelse args.q;
+        const params: BatchQkNormRopeKvParams = .{
+            .batch_size = args.batch_size,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .head_dim = args.head_dim,
+            .chunk_tokens = args.chunk_tokens,
+            .rms_eps = args.rms_eps,
+            .rope_theta = args.rope_theta,
+            .apply_qk_norm = if (has_qn) 1 else 0,
+        };
+        const total_heads: u64 = @as(u64, args.num_q_heads) + @as(u64, args.num_kv_heads);
+        const pipe = switch (args.norm_dtype) {
+            .f16 => self.batch_qknorm_rope_kv_write,
+            .bf16 => self.batch_qknorm_rope_kv_write_bf16,
+        };
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.q, args.k, args.v, qn_binding, kn_binding, args.slots },
+            std.mem.asBytes(&params),
+            .{ total_heads, args.batch_size, 1 },
+            .{ 32, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_batch_gqa_decode_attn_split` (plus
+    /// `ami_batch_gqa_decode_attn_reduce` when split-KV is active), executing
+    /// `batch_size` independent tiered (retired `q8` + active `RGBA16Float`)
+    /// decode requests in ONE GPU pass (`C14 + R5`).
+    pub fn encodeBatchGqaDecodeAttn(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: BatchGqaDecodeArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.batch_size == 0 or
+            args.num_q_heads == 0 or args.num_kv_heads == 0 or
+            (args.num_q_heads % args.num_kv_heads) != 0 or
+            args.max_seq_len == 0 or args.chunk_tokens == 0 or args.max_splits == 0)
+        {
+            return error.InvalidArgument;
+        }
+        if (args.kv_tiles == null and args.retired_pool == null) {
+            return error.InvalidArgument;
+        }
+        if (args.retired_pool != null and (args.retired_chunk_ids == null or
+            args.retired_plane_stride_bytes == 0 or
+            args.retired_chunk_stride_bytes < args.retired_plane_stride_bytes * 2))
+        {
+            return error.InvalidArgument;
+        }
+
+        const split_pipe, const reduce_pipe = switch (args.head_dim) {
+            64 => .{ self.batch_gqa_split_d64, self.batch_gqa_reduce_d64 },
+            128 => .{ self.batch_gqa_split_d128, self.batch_gqa_reduce_d128 },
+            else => return error.InvalidArgument,
+        };
+
+        const gqa_ratio = args.num_q_heads / args.num_kv_heads;
+        const q_groups_per_kv = (gqa_ratio + 7) / 8;
+        const num_splits: u32 = if (args.scratch != null)
+            chooseNumSplits(args.num_kv_heads, args.max_seq_len, args.chunk_tokens, @min(args.max_splits, MAX_SPLITS))
+        else
+            1;
+        const scale: f32 = args.scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(args.head_dim))));
+
+        const params: BatchGqaDecodeParams = .{
+            .batch_size = args.batch_size,
+            .num_q_heads = args.num_q_heads,
+            .num_kv_heads = args.num_kv_heads,
+            .chunk_tokens = args.chunk_tokens,
+            .num_splits = num_splits,
+            .q_groups_per_kv = q_groups_per_kv,
+            .scale = scale,
+            .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
+            .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
+        };
+
+        const kv_tiles_bind = args.kv_tiles orelse args.q;
+        const retired_pool_bind = args.retired_pool orelse args.q;
+        const retired_ids_bind = args.retired_chunk_ids orelse args.q;
+        const m_bind, const l_bind, const o_bind = if (args.scratch) |sc| blk: {
+            const layout = gqaBatchScratchLayout(args.batch_size, args.num_q_heads, args.head_dim, num_splits);
+            break :blk .{
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_m_offset },
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_l_offset },
+                metal.BufferBinding{ .buffer = sc.buffer, .offset = sc.offset + layout.partial_o_offset },
+            };
+        } else .{ args.out, args.out, args.out };
+
+        try frame.encodeThreadgroups(
+            split_pipe,
+            &.{
+                args.q,
+                kv_tiles_bind,
+                retired_pool_bind,
+                retired_ids_bind,
+                args.slots,
+                args.out,
+                m_bind,
+                l_bind,
+                o_bind,
+            },
+            std.mem.asBytes(&params),
+            .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, num_splits, args.batch_size },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+
+        if (num_splits > 1) {
+            try frame.encodeThreadgroups(
+                reduce_pipe,
+                &.{ m_bind, l_bind, o_bind, args.out },
+                std.mem.asBytes(&params),
+                .{ args.num_q_heads, args.batch_size, 1 },
+                .{ 32, 1, 1 },
+                true,
+            );
+        }
     }
 };
 
@@ -4201,4 +5249,965 @@ test "Spike S4 benchmark smoke test exercises GPU<->ANE handoff, D5 gate, and co
     try std.testing.expect(std.mem.indexOf(u8, rendered, "s4.handoff.roundtrip_us") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "s4.draft.m1.d5_gate") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "s4.contention.gemv_q3") != null);
+}
+
+fn makeM65TestBudget(bytes: usize) budget_mod.Budget {
+    return budget_mod.Budget.compute(.{
+        .memory_bytes = bytes * 8,
+        .user_wire_limit = bytes * 4,
+        .global_user_wire_limit = bytes * 4,
+        .gpu_working_set_bytes = bytes * 4,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+}
+
+fn fastSimdGqaDecodeRef(
+    allocator: std.mem.Allocator,
+    q: []const f16,
+    k_cache: []const f16,
+    v_cache: []const f16,
+    out: []f32,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    scale: f32,
+) !void {
+    const Vec4 = @Vector(4, f32);
+    const gqa_ratio = num_q_heads / num_kv_heads;
+    const vecs = head_dim / 4;
+    const q_f32 = try allocator.alloc(Vec4, vecs);
+    defer allocator.free(q_f32);
+    const acc = try allocator.alloc(Vec4, vecs);
+    defer allocator.free(acc);
+    const scores = try allocator.alloc(f32, seq_len);
+    defer allocator.free(scores);
+
+    for (0..num_q_heads) |qh| {
+        const kvh = qh / gqa_ratio;
+        const q_off = qh * head_dim;
+        for (0..vecs) |vi| {
+            q_f32[vi] = .{
+                @floatCast(q[q_off + vi * 4 + 0]),
+                @floatCast(q[q_off + vi * 4 + 1]),
+                @floatCast(q[q_off + vi * 4 + 2]),
+                @floatCast(q[q_off + vi * 4 + 3]),
+            };
+            acc[vi] = @splat(0.0);
+        }
+
+        var max_s: f32 = -std.math.inf(f32);
+        for (0..seq_len) |t| {
+            const kv_off = (t * num_kv_heads + kvh) * head_dim;
+            var dot_v: Vec4 = @splat(0.0);
+            for (0..vecs) |vi| {
+                const kv: Vec4 = .{
+                    @floatCast(k_cache[kv_off + vi * 4 + 0]),
+                    @floatCast(k_cache[kv_off + vi * 4 + 1]),
+                    @floatCast(k_cache[kv_off + vi * 4 + 2]),
+                    @floatCast(k_cache[kv_off + vi * 4 + 3]),
+                };
+                dot_v += q_f32[vi] * kv;
+            }
+            const s = @reduce(.Add, dot_v) * scale;
+            scores[t] = s;
+            if (s > max_s) max_s = s;
+        }
+
+        var sum_exp: f64 = 0.0;
+        for (0..seq_len) |t| {
+            const p: f32 = @exp(scores[t] - max_s);
+            scores[t] = p;
+            sum_exp += p;
+            const pv: Vec4 = @splat(p);
+            const kv_off = (t * num_kv_heads + kvh) * head_dim;
+            for (0..vecs) |vi| {
+                const vv: Vec4 = .{
+                    @floatCast(v_cache[kv_off + vi * 4 + 0]),
+                    @floatCast(v_cache[kv_off + vi * 4 + 1]),
+                    @floatCast(v_cache[kv_off + vi * 4 + 2]),
+                    @floatCast(v_cache[kv_off + vi * 4 + 3]),
+                };
+                acc[vi] += pv * vv;
+            }
+        }
+        const inv_l: f32 = @floatCast(1.0 / sum_exp);
+        for (0..vecs) |vi| {
+            const r = acc[vi] * @as(Vec4, @splat(inv_l));
+            out[q_off + vi * 4 + 0] = r[0];
+            out[q_off + vi * 4 + 1] = r[1];
+            out[q_off + vi * 4 + 2] = r[2];
+            out[q_off + vi * 4 + 3] = r[3];
+        }
+    }
+}
+
+fn fastSimdGqaTreeVerifyRef(
+    allocator: std.mem.Allocator,
+    q: []const f16,
+    k_prefix: []const f16,
+    v_prefix: []const f16,
+    k_tree: []const f16,
+    v_tree: []const f16,
+    ancestor_masks: []const u64,
+    out: []f32,
+    num_nodes: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    base_pos: usize,
+    scale: f32,
+) !void {
+    const Vec4 = @Vector(4, f32);
+    const gqa_ratio = num_q_heads / num_kv_heads;
+    const vecs = head_dim / 4;
+    const q_f32 = try allocator.alloc(Vec4, vecs);
+    defer allocator.free(q_f32);
+    const acc = try allocator.alloc(Vec4, vecs);
+    defer allocator.free(acc);
+    const scores = try allocator.alloc(f32, base_pos + num_nodes);
+    defer allocator.free(scores);
+
+    for (0..num_nodes) |node| {
+        const mask = ancestor_masks[node];
+        for (0..num_q_heads) |qh| {
+            const kvh = qh / gqa_ratio;
+            const q_off = (node * num_q_heads + qh) * head_dim;
+            for (0..vecs) |vi| {
+                q_f32[vi] = .{
+                    @floatCast(q[q_off + vi * 4 + 0]),
+                    @floatCast(q[q_off + vi * 4 + 1]),
+                    @floatCast(q[q_off + vi * 4 + 2]),
+                    @floatCast(q[q_off + vi * 4 + 3]),
+                };
+                acc[vi] = @splat(0.0);
+            }
+
+            var max_s: f32 = -std.math.inf(f32);
+            for (0..base_pos) |t| {
+                const kv_off = (t * num_kv_heads + kvh) * head_dim;
+                var dot_v: Vec4 = @splat(0.0);
+                for (0..vecs) |vi| {
+                    const kv: Vec4 = .{
+                        @floatCast(k_prefix[kv_off + vi * 4 + 0]),
+                        @floatCast(k_prefix[kv_off + vi * 4 + 1]),
+                        @floatCast(k_prefix[kv_off + vi * 4 + 2]),
+                        @floatCast(k_prefix[kv_off + vi * 4 + 3]),
+                    };
+                    dot_v += q_f32[vi] * kv;
+                }
+                const s = @reduce(.Add, dot_v) * scale;
+                scores[t] = s;
+                if (s > max_s) max_s = s;
+            }
+            for (0..num_nodes) |j| {
+                if (((mask >> @intCast(j)) & 1) != 0) {
+                    const kv_off = (j * num_kv_heads + kvh) * head_dim;
+                    var dot_v: Vec4 = @splat(0.0);
+                    for (0..vecs) |vi| {
+                        const kv: Vec4 = .{
+                            @floatCast(k_tree[kv_off + vi * 4 + 0]),
+                            @floatCast(k_tree[kv_off + vi * 4 + 1]),
+                            @floatCast(k_tree[kv_off + vi * 4 + 2]),
+                            @floatCast(k_tree[kv_off + vi * 4 + 3]),
+                        };
+                        dot_v += q_f32[vi] * kv;
+                    }
+                    const s = @reduce(.Add, dot_v) * scale;
+                    scores[base_pos + j] = s;
+                    if (s > max_s) max_s = s;
+                } else {
+                    scores[base_pos + j] = -std.math.inf(f32);
+                }
+            }
+
+            var sum_exp: f64 = 0.0;
+            for (0..base_pos) |t| {
+                const p: f32 = @exp(scores[t] - max_s);
+                sum_exp += p;
+                const pv: Vec4 = @splat(p);
+                const kv_off = (t * num_kv_heads + kvh) * head_dim;
+                for (0..vecs) |vi| {
+                    const vv: Vec4 = .{
+                        @floatCast(v_prefix[kv_off + vi * 4 + 0]),
+                        @floatCast(v_prefix[kv_off + vi * 4 + 1]),
+                        @floatCast(v_prefix[kv_off + vi * 4 + 2]),
+                        @floatCast(v_prefix[kv_off + vi * 4 + 3]),
+                    };
+                    acc[vi] += pv * vv;
+                }
+            }
+            for (0..num_nodes) |j| {
+                if (((mask >> @intCast(j)) & 1) != 0) {
+                    const p: f32 = @exp(scores[base_pos + j] - max_s);
+                    sum_exp += p;
+                    const pv: Vec4 = @splat(p);
+                    const kv_off = (j * num_kv_heads + kvh) * head_dim;
+                    for (0..vecs) |vi| {
+                        const vv: Vec4 = .{
+                            @floatCast(v_tree[kv_off + vi * 4 + 0]),
+                            @floatCast(v_tree[kv_off + vi * 4 + 1]),
+                            @floatCast(v_tree[kv_off + vi * 4 + 2]),
+                            @floatCast(v_tree[kv_off + vi * 4 + 3]),
+                        };
+                        acc[vi] += pv * vv;
+                    }
+                }
+            }
+            const inv_l: f32 = @floatCast(1.0 / sum_exp);
+            for (0..vecs) |vi| {
+                const r = acc[vi] * @as(Vec4, @splat(inv_l));
+                out[q_off + vi * 4 + 0] = r[0];
+                out[q_off + vi * 4 + 1] = r[1];
+                out[q_off + vi * 4 + 2] = r[2];
+                out[q_off + vi * 4 + 3] = r[3];
+            }
+        }
+    }
+}
+
+test "R5 RetiredKvQ8Pool enforces 16 KiB alignment, O(1) free-list recycling, and 46.9% byte reduction" {
+    const spec: RetiredKvQ8PoolSpec = .{
+        .num_kv_heads = 4,
+        .head_dim = 128,
+        .chunk_tokens = DEFAULT_CHUNK_TOKENS,
+        .max_chunks = 8,
+    };
+    const q8_chunk = try RetiredKvQ8Pool.chunkStrideBytes(spec);
+    const fp16_chunk = try RetiredKvQ8Pool.fp16EquivalentChunkBytes(spec);
+    const savings = try RetiredKvQ8Pool.compressionSavingsRatio(spec);
+    // 136 B vs 256 B per head-row -> exact 46.875% wired RAM reduction.
+    try std.testing.expectEqual(@as(u32, 557_056), q8_chunk);
+    try std.testing.expectEqual(@as(usize, 1_048_576), fp16_chunk);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.46875), savings, 1e-6);
+
+    const need = try RetiredKvQ8Pool.requiredArenaBytes(spec);
+    var arena = try arena_mod.WiredArena.init(need, makeM65TestBudget(need));
+    defer arena.deinit();
+
+    var pool = try RetiredKvQ8Pool.init(&arena, spec);
+    try std.testing.expect(std.mem.isAligned(@intFromPtr(pool.bytes().ptr), page.APPLE_PAGE_SIZE));
+    try std.testing.expect(std.mem.isAligned(pool.bytes().len, page.APPLE_PAGE_SIZE));
+
+    var acquired: [8]u32 = undefined;
+    for (0..8) |i| {
+        acquired[i] = try pool.acquireSlot();
+        try std.testing.expectEqual(@as(u32, @intCast(i)), acquired[i]);
+    }
+    try std.testing.expectEqual(@as(u32, 0), pool.freeCount());
+    try std.testing.expectError(error.PoolExhausted, pool.acquireSlot());
+
+    try pool.releaseSlot(3);
+    try std.testing.expectError(error.DoubleFree, pool.releaseSlot(3));
+    try std.testing.expectError(error.InvalidSlot, pool.releaseSlot(99));
+    try std.testing.expectEqual(@as(u32, 3), try pool.acquireSlot());
+}
+
+test "R5 32,768-token tiered q8 + RGBA16Float decode & tree-verify parity with active KvTile recycling" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try AttentionPipelines.init(device, library);
+    defer pipes.close();
+
+    // 32,768 tokens = 64 x 512-tok chunks: 62 retired into group-64 q8 + 2 active RGBA16Float,
+    // using ONLY 4 active IOSurface KvTilePairs recycled across all 64 chunks!
+    const num_q_heads: u32 = 4;
+    const num_kv_heads: u32 = 2;
+    const head_dim: u32 = 128;
+    const chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS;
+    const total_chunks: u32 = 64;
+    const num_retired: u32 = 62;
+    const num_active_tail: u32 = total_chunks - num_retired; // 2
+    const active_tile_cap: u32 = 4;
+    const seq_len: u32 = total_chunks * chunk_tokens; // 32,768
+    const tree_nodes: u32 = 8;
+    const tree_base_pos: u32 = seq_len - 16; // 32,752 (straddles retired + partial last active chunk)
+    const rows: u32 = num_kv_heads * chunk_tokens;
+
+    const pool_spec: RetiredKvQ8PoolSpec = .{
+        .num_kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .chunk_tokens = chunk_tokens,
+        .max_chunks = num_retired,
+    };
+    const savings = try RetiredKvQ8Pool.compressionSavingsRatio(pool_spec);
+    try std.testing.expect(savings > 0.468 and savings < 0.470);
+
+    const decode_scratch = gqaScratchLayout(num_q_heads, head_dim, MAX_SPLITS);
+    const tree_scratch = gqaTreeScratchLayout(tree_nodes, num_q_heads, head_dim, MAX_SPLITS);
+    const arena_bytes: usize =
+        (try RetiredKvQ8Pool.requiredArenaBytes(pool_spec)) +
+        amf.align64(decode_scratch.total_bytes) +
+        amf.align64(tree_scratch.total_bytes) +
+        page.APPLE_PAGE_SIZE * 16;
+    var arena = try arena_mod.WiredArena.init(arena_bytes, makeM65TestBudget(arena_bytes));
+    defer arena.deinit();
+
+    var retired_pool = try RetiredKvQ8Pool.init(&arena, pool_spec);
+    const retired_ids_raw = try arena.allocAligned(amf.align64(@as(usize, num_retired) * @sizeOf(u32)), 64);
+    const active_tbl_raw = try arena.allocAligned(amf.align64(@as(usize, num_active_tail) * @sizeOf(KvTilePair)), 64);
+    const q_dec_raw = try arena.allocAligned(amf.align64(@as(usize, num_q_heads) * head_dim * @sizeOf(f16)), 64);
+    const out_dec_raw = try arena.allocAligned(amf.align64(@as(usize, num_q_heads) * head_dim * @sizeOf(f16)), 64);
+    const dec_scratch_raw = try arena.allocAligned(decode_scratch.total_bytes, 64);
+
+    const q_tree_raw = try arena.allocAligned(amf.align64(@as(usize, tree_nodes) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+    const k_tree_raw = try arena.allocAligned(amf.align64(@as(usize, tree_nodes) * num_kv_heads * head_dim * @sizeOf(f16)), 64);
+    const v_tree_raw = try arena.allocAligned(amf.align64(@as(usize, tree_nodes) * num_kv_heads * head_dim * @sizeOf(f16)), 64);
+    const masks_raw = try arena.allocAligned(amf.align64(@as(usize, tree_nodes) * @sizeOf(u64)), 64);
+    const out_tree_raw = try arena.allocAligned(amf.align64(@as(usize, tree_nodes) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+    const tree_scratch_raw = try arena.allocAligned(tree_scratch.total_bytes, 64);
+
+    // Only `active_tile_cap = 4` active IOSurface KvTilePairs exist for the entire 32,768-token context!
+    var active_k: [active_tile_cap]metal.KvTile = undefined;
+    var active_v: [active_tile_cap]metal.KvTile = undefined;
+    var created: usize = 0;
+    defer {
+        for (0..created) |i| {
+            active_v[i].close();
+            active_k[i].close();
+        }
+    }
+    for (0..active_tile_cap) |i| {
+        active_k[i] = try metal.KvTile.init(device, head_dim, rows, .{});
+        errdefer active_k[i].close();
+        active_v[i] = try metal.KvTile.init(device, head_dim, rows, .{});
+        created += 1;
+    }
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+    try compute.makeTilesResident(&active_k);
+    try compute.makeTilesResident(&active_v);
+
+    // Generate full 32,768-token KV history on CPU for ground-truth reference,
+    // planting salient high-dot keys in both retired (chunks 0, 20, 48, 61) and active (62, 63) chunks.
+    const k_all = try gpa.alloc(f16, @as(usize, seq_len) * num_kv_heads * head_dim);
+    defer gpa.free(k_all);
+    const v_all = try gpa.alloc(f16, @as(usize, seq_len) * num_kv_heads * head_dim);
+    defer gpa.free(v_all);
+
+    var rng = std.Random.DefaultPrng.init(0x32768_05);
+    const rand = rng.random();
+    for (k_all, v_all) |*kp, *vp| {
+        kp.* = @floatCast((rand.float(f32) - 0.5) * 0.9);
+        vp.* = @floatCast((rand.float(f32) - 0.5) * 0.8);
+    }
+
+    const q_dec: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_dec_raw[0 .. @as(usize, num_q_heads) * head_dim * @sizeOf(f16)]));
+    for (q_dec) |*qp| qp.* = @floatCast((rand.float(f32) - 0.5) * 0.9);
+
+    // Plant salient keys correlated with q_dec[0] across retired and active chunks so both tiers strongly shape softmax.
+    const salient_positions = [_]usize{ 17, 10_243, 24_900, 31_743, 31_744, 32_600, 32_767 };
+    for (salient_positions, 0..) |pos, idx| {
+        for (0..num_kv_heads) |kvh| {
+            const dst = (pos * num_kv_heads + kvh) * head_dim;
+            const q_src = (kvh * (num_q_heads / num_kv_heads)) * head_dim;
+            for (0..head_dim) |d| {
+                k_all[dst + d] = q_dec[q_src + d];
+                v_all[dst + d] = @floatCast(0.25 * @sin(@as(f32, @floatFromInt(d + idx * 7 + kvh * 13))));
+            }
+        }
+    }
+
+    // Stream all 64 chunks through the 4-tile active ring, retiring chunks 0..61 on GPU
+    // and recycling each active tile immediately after GPU retirement!
+    const retired_ids: []u32 = @alignCast(std.mem.bytesAsSlice(u32, retired_ids_raw[0 .. @as(usize, num_retired) * @sizeOf(u32)]));
+    var recycled_count: u32 = 0;
+
+    for (0..num_retired) |chunk| {
+        const ring_slot = chunk % active_tile_cap;
+        {
+            var kg = try active_k[ring_slot].lock(false);
+            errdefer kg.release();
+            var vg = try active_v[ring_slot].lock(false);
+            errdefer vg.release();
+            const stride = kg.bytes_per_row / @sizeOf(f16);
+            const km: []f16 = @alignCast(std.mem.bytesAsSlice(f16, kg.bytes));
+            const vm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, vg.bytes));
+            for (0..chunk_tokens) |s| {
+                const pos = chunk * chunk_tokens + s;
+                for (0..num_kv_heads) |kvh| {
+                    const src = (pos * num_kv_heads + kvh) * head_dim;
+                    const dst = (kvh * chunk_tokens + s) * stride;
+                    @memcpy(km[dst .. dst + head_dim], k_all[src .. src + head_dim]);
+                    @memcpy(vm[dst .. dst + head_dim], v_all[src .. src + head_dim]);
+                }
+            }
+            try vg.unlock();
+            try kg.unlock();
+        }
+        // Acquire retired slot in non-trivial reverse/interleaved order to exercise indirection!
+        const dst_slot = try retired_pool.acquireSlot();
+        retired_ids[chunk] = dst_slot;
+
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeKvRetireTileToQ8(&f, .{
+            .k_tile = active_k[ring_slot],
+            .v_tile = active_v[ring_slot],
+            .pool = &retired_pool,
+            .pool_buf = gpu_buf,
+            .dst_slot = dst_slot,
+        }, false);
+        const sig = try f.commit();
+        try compute.wait(sig, 5000);
+        recycled_count += 1;
+    }
+    try std.testing.expectEqual(num_retired, recycled_count);
+    try std.testing.expectEqual(num_retired, retired_pool.activeCount());
+
+    // Populate the final 2 active chunks (chunks 62 & 63) into recycled active tiles 0 and 1.
+    const active_tbl: []KvTilePair = @alignCast(std.mem.bytesAsSlice(
+        KvTilePair,
+        active_tbl_raw[0 .. @as(usize, num_active_tail) * @sizeOf(KvTilePair)],
+    ));
+    for (0..num_active_tail) |a_idx| {
+        const chunk = num_retired + a_idx;
+        var kg = try active_k[a_idx].lock(false);
+        errdefer kg.release();
+        var vg = try active_v[a_idx].lock(false);
+        errdefer vg.release();
+        const stride = kg.bytes_per_row / @sizeOf(f16);
+        const km: []f16 = @alignCast(std.mem.bytesAsSlice(f16, kg.bytes));
+        const vm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, vg.bytes));
+        for (0..chunk_tokens) |s| {
+            const pos = chunk * chunk_tokens + s;
+            for (0..num_kv_heads) |kvh| {
+                const src = (pos * num_kv_heads + kvh) * head_dim;
+                const dst = (kvh * chunk_tokens + s) * stride;
+                @memcpy(km[dst .. dst + head_dim], k_all[src .. src + head_dim]);
+                @memcpy(vm[dst .. dst + head_dim], v_all[src .. src + head_dim]);
+            }
+        }
+        try vg.unlock();
+        try kg.unlock();
+        active_tbl[a_idx] = KvTilePair.fromTiles(active_k[a_idx], active_v[a_idx], .rgba16f);
+    }
+
+    // Prepare 8-node speculative tree inputs with branching 64-bit ancestor masks.
+    const q_tree: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_tree_raw[0 .. @as(usize, tree_nodes) * num_q_heads * head_dim * @sizeOf(f16)]));
+    const k_tree: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_tree_raw[0 .. @as(usize, tree_nodes) * num_kv_heads * head_dim * @sizeOf(f16)]));
+    const v_tree: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_tree_raw[0 .. @as(usize, tree_nodes) * num_kv_heads * head_dim * @sizeOf(f16)]));
+    const masks: []u64 = @alignCast(std.mem.bytesAsSlice(u64, masks_raw[0 .. @as(usize, tree_nodes) * @sizeOf(u64)]));
+    for (q_tree) |*x| x.* = @floatCast((rand.float(f32) - 0.5) * 0.9);
+    for (k_tree, v_tree) |*kp, *vp| {
+        kp.* = @floatCast((rand.float(f32) - 0.5) * 0.9);
+        vp.* = @floatCast((rand.float(f32) - 0.5) * 0.8);
+    }
+    // Branching tree: 0 -> {1 -> {3, 4}, 2 -> {5 -> 7, 6}}.
+    masks[0] = 0b0000_0001;
+    masks[1] = 0b0000_0011;
+    masks[2] = 0b0000_0101;
+    masks[3] = 0b0000_1011;
+    masks[4] = 0b0001_0011;
+    masks[5] = 0b0010_0101;
+    masks[6] = 0b0100_0101;
+    masks[7] = 0b1010_0101;
+
+    // Dispatch BOTH 32,768-token tiered decode AND 32,752-prefix tiered tree-verify in ONE frame!
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeGqaTieredDecodeAttn(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_dec_raw.ptr) },
+            .kv_tiles = .{ .buffer = gpu_buf, .offset = arena.offsetOf(active_tbl_raw.ptr) },
+            .retired_pool = retired_pool.binding(gpu_buf),
+            .retired_chunk_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(retired_ids_raw.ptr) },
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_dec_raw.ptr) },
+            .scratch = .{ .buffer = gpu_buf, .offset = arena.offsetOf(dec_scratch_raw.ptr) },
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .seq_len = seq_len,
+            .chunk_tokens = chunk_tokens,
+            .num_retired_chunks = num_retired,
+            .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+            .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+        }, false);
+
+        try pipes.encodeGqaTieredTreeVerifyAttn(&f, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_tree_raw.ptr) },
+            .kv_tiles = .{ .buffer = gpu_buf, .offset = arena.offsetOf(active_tbl_raw.ptr) },
+            .retired_pool = retired_pool.binding(gpu_buf),
+            .retired_chunk_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(retired_ids_raw.ptr) },
+            .k_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_tree_raw.ptr) },
+            .v_tree = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_tree_raw.ptr) },
+            .ancestor_masks = .{ .buffer = gpu_buf, .offset = arena.offsetOf(masks_raw.ptr) },
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_tree_raw.ptr) },
+            .scratch = .{ .buffer = gpu_buf, .offset = arena.offsetOf(tree_scratch_raw.ptr) },
+            .num_nodes = tree_nodes,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .base_pos = tree_base_pos,
+            .chunk_tokens = chunk_tokens,
+            .num_retired_chunks = num_retired,
+            .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+            .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+        }, true);
+
+        const sig = try f.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // Verify 32,768-token decode against CPU fp32 reference (`max_abs_err < 3e-3`).
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const out_dec_ref = try gpa.alloc(f32, q_dec.len);
+    defer gpa.free(out_dec_ref);
+    try fastSimdGqaDecodeRef(gpa, q_dec, k_all, v_all, out_dec_ref, num_q_heads, num_kv_heads, head_dim, seq_len, scale);
+    const out_dec_gpu: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_dec_raw[0 .. q_dec.len * @sizeOf(f16)]));
+    var dec_max_err: f32 = 0.0;
+    for (out_dec_ref, 0..) |exp, i| {
+        const got: f32 = @floatCast(out_dec_gpu[i]);
+        const err = @abs(exp - got);
+        if (err > dec_max_err) dec_max_err = err;
+    }
+    try std.testing.expect(dec_max_err < 3e-3);
+
+    // Verify 32,752-prefix + 8-node tree verify against CPU fp32 reference (`max_abs_err < 3e-3`).
+    const out_tree_ref = try gpa.alloc(f32, q_tree.len);
+    defer gpa.free(out_tree_ref);
+    try fastSimdGqaTreeVerifyRef(
+        gpa,
+        q_tree,
+        k_all[0 .. @as(usize, tree_base_pos) * num_kv_heads * head_dim],
+        v_all[0 .. @as(usize, tree_base_pos) * num_kv_heads * head_dim],
+        k_tree,
+        v_tree,
+        masks,
+        out_tree_ref,
+        tree_nodes,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        tree_base_pos,
+        scale,
+    );
+    const out_tree_gpu: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_tree_raw[0 .. q_tree.len * @sizeOf(f16)]));
+    var tree_max_err: f32 = 0.0;
+    for (out_tree_ref, 0..) |exp, i| {
+        const got: f32 = @floatCast(out_tree_gpu[i]);
+        const err = @abs(exp - got);
+        if (err > tree_max_err) tree_max_err = err;
+    }
+    try std.testing.expect(tree_max_err < 3e-3);
+}
+
+test "C14 multi-slot M_batch=8 batched QK-Norm+RoPE+KV-Write and tiered GQA decode match single-slot execution (d=128 and d=64)" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try AttentionPipelines.init(device, library);
+    defer pipes.close();
+
+    const batch_size: u32 = 8;
+    const chunk_tokens: u32 = 64; // compact chunks to mix 0..3 retired + 1..2 active per slot fast
+    const head_dims = [_]u32{ 128, 64 };
+
+    for (head_dims) |head_dim| {
+        const num_q_heads: u32 = 8;
+        const num_kv_heads: u32 = 2;
+        const rows: u32 = num_kv_heads * chunk_tokens;
+
+        // Per-slot context lengths BEFORE appending 1 new token:
+        // mixes retired-only boundary, active-only, and straddling retired+active!
+        const pre_lens = [batch_size]u32{ 5, 63, 64, 95, 128, 175, 192, 230 };
+        const ret_chunks = [batch_size]u32{ 0, 0, 1, 1, 2, 2, 3, 3 };
+        var total_retired_slots: u32 = 0;
+        var total_active_tiles: u32 = 0;
+        for (0..batch_size) |b| {
+            total_retired_slots += ret_chunks[b];
+            const final_len = pre_lens[b] + 1;
+            const total_c = (final_len + chunk_tokens - 1) / chunk_tokens;
+            total_active_tiles += total_c - ret_chunks[b];
+        }
+
+        const pool_spec: RetiredKvQ8PoolSpec = .{
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .chunk_tokens = chunk_tokens,
+            .max_chunks = total_retired_slots,
+        };
+        const batch_scratch = gqaBatchScratchLayout(batch_size, num_q_heads, head_dim, MAX_SPLITS);
+        const single_scratch = gqaScratchLayout(num_q_heads, head_dim, MAX_SPLITS);
+        const arena_bytes: usize =
+            (try RetiredKvQ8Pool.requiredArenaBytes(pool_spec)) +
+            batch_scratch.total_bytes +
+            single_scratch.total_bytes +
+            page.APPLE_PAGE_SIZE * 16;
+        var arena = try arena_mod.WiredArena.init(arena_bytes, makeM65TestBudget(arena_bytes));
+        defer arena.deinit();
+
+        var retired_pool = try RetiredKvQ8Pool.init(&arena, pool_spec);
+        const retired_ids_raw = try arena.allocAligned(amf.align64(@as(usize, total_retired_slots) * @sizeOf(u32)), 64);
+        const active_tbl_raw = try arena.allocAligned(amf.align64(@as(usize, total_active_tiles) * @sizeOf(KvTilePair)), 64);
+        const single_tbl_raw = try arena.allocAligned(amf.align64(@as(usize, total_active_tiles) * @sizeOf(KvTilePair)), 64);
+
+        const q_batch_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+        const q_single_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+        const k_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_kv_heads * head_dim * @sizeOf(f16)), 64);
+        const v_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_kv_heads * head_dim * @sizeOf(f16)), 64);
+        const q_norm_raw = try arena.allocAligned(amf.align64(@as(usize, head_dim) * @sizeOf(f16)), 64);
+        const k_norm_raw = try arena.allocAligned(amf.align64(@as(usize, head_dim) * @sizeOf(f16)), 64);
+        const out_batch_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+        const out_single_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * num_q_heads * head_dim * @sizeOf(f16)), 64);
+        const write_slots_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * @sizeOf(BatchKvWriteSlot)), 64);
+        const attn_slots_raw = try arena.allocAligned(amf.align64(@as(usize, batch_size) * @sizeOf(BatchGqaSlotDesc)), 64);
+        const batch_scratch_raw = try arena.allocAligned(batch_scratch.total_bytes, 64);
+        const single_scratch_raw = try arena.allocAligned(single_scratch.total_bytes, 64);
+
+        // Create two identical sets of active tiles (`batch_*` and `single_*`) + 1 staging tile for retiring.
+        const gpa = std.testing.allocator;
+        const batch_k = try gpa.alloc(metal.KvTile, total_active_tiles);
+        defer gpa.free(batch_k);
+        const batch_v = try gpa.alloc(metal.KvTile, total_active_tiles);
+        defer gpa.free(batch_v);
+        const single_k = try gpa.alloc(metal.KvTile, total_active_tiles);
+        defer gpa.free(single_k);
+        const single_v = try gpa.alloc(metal.KvTile, total_active_tiles);
+        defer gpa.free(single_v);
+
+        var created: usize = 0;
+        defer {
+            for (0..created) |i| {
+                single_v[i].close();
+                single_k[i].close();
+                batch_v[i].close();
+                batch_k[i].close();
+            }
+        }
+        for (0..total_active_tiles) |i| {
+            batch_k[i] = try metal.KvTile.init(device, head_dim, rows, .{});
+            errdefer batch_k[i].close();
+            batch_v[i] = try metal.KvTile.init(device, head_dim, rows, .{});
+            errdefer batch_v[i].close();
+            single_k[i] = try metal.KvTile.init(device, head_dim, rows, .{});
+            errdefer single_k[i].close();
+            single_v[i] = try metal.KvTile.init(device, head_dim, rows, .{});
+            created += 1;
+        }
+        const stage_k = try metal.KvTile.init(device, head_dim, rows, .{});
+        defer stage_k.close();
+        const stage_v = try metal.KvTile.init(device, head_dim, rows, .{});
+        defer stage_v.close();
+
+        const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer gpu_buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+        try compute.makeTilesResident(batch_k);
+        try compute.makeTilesResident(batch_v);
+        try compute.makeTilesResident(single_k);
+        try compute.makeTilesResident(single_v);
+        try compute.makeTilesResident(&.{ stage_k, stage_v });
+
+        var rng = std.Random.DefaultPrng.init(0xC14_0000 + head_dim);
+        const rand = rng.random();
+
+        const q_batch: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_batch_raw[0 .. @as(usize, batch_size) * num_q_heads * head_dim * @sizeOf(f16)]));
+        const q_single: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_single_raw[0 .. @as(usize, batch_size) * num_q_heads * head_dim * @sizeOf(f16)]));
+        const k_in: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw[0 .. @as(usize, batch_size) * num_kv_heads * head_dim * @sizeOf(f16)]));
+        const v_in: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw[0 .. @as(usize, batch_size) * num_kv_heads * head_dim * @sizeOf(f16)]));
+        const q_norm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_norm_raw[0 .. @as(usize, head_dim) * @sizeOf(f16)]));
+        const k_norm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_norm_raw[0 .. @as(usize, head_dim) * @sizeOf(f16)]));
+        for (q_batch, q_single) |*qb, *qs| {
+            const val: f16 = @floatCast((rand.float(f32) - 0.5) * 1.4);
+            qb.* = val;
+            qs.* = val;
+        }
+        for (k_in, v_in) |*kp, *vp| {
+            kp.* = @floatCast((rand.float(f32) - 0.5) * 1.4);
+            vp.* = @floatCast((rand.float(f32) - 0.5) * 1.0);
+        }
+        for (q_norm, k_norm) |*qn, *kn| {
+            qn.* = @floatCast(0.8 + rand.float(f32) * 0.4);
+            kn.* = @floatCast(0.8 + rand.float(f32) * 0.4);
+        }
+
+        const retired_ids: []u32 = @alignCast(std.mem.bytesAsSlice(u32, retired_ids_raw[0 .. @as(usize, total_retired_slots) * @sizeOf(u32)]));
+        const active_tbl: []KvTilePair = @alignCast(std.mem.bytesAsSlice(KvTilePair, active_tbl_raw[0 .. @as(usize, total_active_tiles) * @sizeOf(KvTilePair)]));
+        const single_tbl: []KvTilePair = @alignCast(std.mem.bytesAsSlice(KvTilePair, single_tbl_raw[0 .. @as(usize, total_active_tiles) * @sizeOf(KvTilePair)]));
+        const write_slots: []BatchKvWriteSlot = @alignCast(std.mem.bytesAsSlice(BatchKvWriteSlot, write_slots_raw[0 .. @as(usize, batch_size) * @sizeOf(BatchKvWriteSlot)]));
+        const attn_slots: []BatchGqaSlotDesc = @alignCast(std.mem.bytesAsSlice(BatchGqaSlotDesc, attn_slots_raw[0 .. @as(usize, batch_size) * @sizeOf(BatchGqaSlotDesc)]));
+
+        var ret_cursor: u32 = 0;
+        var act_cursor: u32 = 0;
+        var single_write_tile_idx: [batch_size]u32 = undefined;
+        var max_seq: u32 = 0;
+
+        for (0..batch_size) |b| {
+            const r_off = ret_cursor;
+            for (0..ret_chunks[b]) |_| {
+                {
+                    var kg = try stage_k.lock(false);
+                    errdefer kg.release();
+                    var vg = try stage_v.lock(false);
+                    errdefer vg.release();
+                    const km: []f16 = @alignCast(std.mem.bytesAsSlice(f16, kg.bytes));
+                    const vm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, vg.bytes));
+                    for (km, vm) |*kx, *vx| {
+                        kx.* = @floatCast((rand.float(f32) - 0.5) * 1.0);
+                        vx.* = @floatCast((rand.float(f32) - 0.5) * 1.0);
+                    }
+                    try vg.unlock();
+                    try kg.unlock();
+                }
+                const phys_slot = try retired_pool.acquireSlot();
+                retired_ids[ret_cursor] = phys_slot;
+                ret_cursor += 1;
+
+                var f = try compute.beginFrame(5000);
+                errdefer f.abort();
+                try pipes.encodeKvRetireTileToQ8(&f, .{
+                    .k_tile = stage_k,
+                    .v_tile = stage_v,
+                    .pool = &retired_pool,
+                    .pool_buf = gpu_buf,
+                    .dst_slot = phys_slot,
+                }, false);
+                const sig = try f.commit();
+                try compute.wait(sig, 5000);
+            }
+
+            const a_off = act_cursor;
+            const final_len = pre_lens[b] + 1;
+            if (final_len > max_seq) max_seq = final_len;
+            const n_act = (final_len + chunk_tokens - 1) / chunk_tokens - ret_chunks[b];
+            for (0..n_act) |_| {
+                var bkg = try batch_k[act_cursor].lock(false);
+                errdefer bkg.release();
+                var bvg = try batch_v[act_cursor].lock(false);
+                errdefer bvg.release();
+                var skg = try single_k[act_cursor].lock(false);
+                errdefer skg.release();
+                var svg = try single_v[act_cursor].lock(false);
+                errdefer svg.release();
+                const bkm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, bkg.bytes));
+                const bvm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, bvg.bytes));
+                const skm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, skg.bytes));
+                const svm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, svg.bytes));
+                for (bkm, bvm, skm, svm) |*bkx, *bvx, *skx, *svx| {
+                    const kv_val: f16 = @floatCast((rand.float(f32) - 0.5) * 1.0);
+                    const vv_val: f16 = @floatCast((rand.float(f32) - 0.5) * 1.0);
+                    bkx.* = kv_val;
+                    skx.* = kv_val;
+                    bvx.* = vv_val;
+                    svx.* = vv_val;
+                }
+                try svg.unlock();
+                try skg.unlock();
+                try bvg.unlock();
+                try bkg.unlock();
+
+                active_tbl[act_cursor] = KvTilePair.fromTiles(batch_k[act_cursor], batch_v[act_cursor], .rgba16f);
+                single_tbl[act_cursor] = KvTilePair.fromTiles(single_k[act_cursor], single_v[act_cursor], .rgba16f);
+                act_cursor += 1;
+            }
+            const write_tile = a_off + (pre_lens[b] / chunk_tokens - ret_chunks[b]);
+            single_write_tile_idx[b] = write_tile;
+            write_slots[b] = BatchKvWriteSlot.fromTiles(batch_k[write_tile], batch_v[write_tile], pre_lens[b], chunk_tokens);
+            attn_slots[b] = .{
+                .seq_len = final_len,
+                .tile_table_offset = a_off,
+                .retired_offset = r_off,
+                .num_retired_chunks = ret_chunks[b],
+            };
+        }
+
+        // Run ONE batched GPU pass for all 8 slots, then 8 single-slot dispatches for exact parity check!
+        {
+            var f = try compute.beginFrame(5000);
+            errdefer f.abort();
+            try pipes.encodeBatchQkNormRopeKvWrite(&f, .{
+                .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_batch_raw.ptr) },
+                .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) },
+                .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) },
+                .q_norm = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_norm_raw.ptr) },
+                .k_norm = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_norm_raw.ptr) },
+                .slots = .{ .buffer = gpu_buf, .offset = arena.offsetOf(write_slots_raw.ptr) },
+                .batch_size = batch_size,
+                .num_q_heads = num_q_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .chunk_tokens = chunk_tokens,
+            }, false);
+            try pipes.encodeBatchGqaDecodeAttn(&f, .{
+                .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_batch_raw.ptr) },
+                .kv_tiles = .{ .buffer = gpu_buf, .offset = arena.offsetOf(active_tbl_raw.ptr) },
+                .retired_pool = retired_pool.binding(gpu_buf),
+                .retired_chunk_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(retired_ids_raw.ptr) },
+                .slots = .{ .buffer = gpu_buf, .offset = arena.offsetOf(attn_slots_raw.ptr) },
+                .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_batch_raw.ptr) },
+                .scratch = .{ .buffer = gpu_buf, .offset = arena.offsetOf(batch_scratch_raw.ptr) },
+                .batch_size = batch_size,
+                .num_q_heads = num_q_heads,
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+                .max_seq_len = max_seq,
+                .chunk_tokens = chunk_tokens,
+                .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+                .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+            }, true);
+
+            const q_slot_bytes: u64 = @as(u64, num_q_heads) * head_dim * @sizeOf(f16);
+            const kv_slot_bytes: u64 = @as(u64, num_kv_heads) * head_dim * @sizeOf(f16);
+            for (0..batch_size) |b| {
+                const wt = single_write_tile_idx[b];
+                try pipes.encodeQkNormRopeKvWrite(&f, .{
+                    .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_single_raw.ptr) + @as(u64, b) * q_slot_bytes },
+                    .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) + @as(u64, b) * kv_slot_bytes },
+                    .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) + @as(u64, b) * kv_slot_bytes },
+                    .q_norm = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_norm_raw.ptr) },
+                    .k_norm = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_norm_raw.ptr) },
+                    .k_tile = single_k[wt],
+                    .v_tile = single_v[wt],
+                    .num_q_heads = num_q_heads,
+                    .num_kv_heads = num_kv_heads,
+                    .head_dim = head_dim,
+                    .pos = pre_lens[b],
+                    .chunk_tokens = chunk_tokens,
+                }, true);
+                const desc = attn_slots[b];
+                try pipes.encodeGqaTieredDecodeAttn(&f, .{
+                    .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_single_raw.ptr) + @as(u64, b) * q_slot_bytes },
+                    .kv_tiles = .{ .buffer = gpu_buf, .offset = arena.offsetOf(single_tbl_raw.ptr) + @as(u64, desc.tile_table_offset) * @sizeOf(KvTilePair) },
+                    .retired_pool = retired_pool.binding(gpu_buf),
+                    .retired_chunk_ids = .{ .buffer = gpu_buf, .offset = arena.offsetOf(retired_ids_raw.ptr) + @as(u64, desc.retired_offset) * @sizeOf(u32) },
+                    .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_single_raw.ptr) + @as(u64, b) * q_slot_bytes },
+                    .scratch = .{ .buffer = gpu_buf, .offset = arena.offsetOf(single_scratch_raw.ptr) },
+                    .num_q_heads = num_q_heads,
+                    .num_kv_heads = num_kv_heads,
+                    .head_dim = head_dim,
+                    .seq_len = desc.seq_len,
+                    .chunk_tokens = chunk_tokens,
+                    .num_retired_chunks = desc.num_retired_chunks,
+                    .retired_plane_stride_bytes = retired_pool.plane_stride_bytes,
+                    .retired_chunk_stride_bytes = retired_pool.chunk_stride_bytes,
+                }, true);
+            }
+            const sig = try f.commit();
+            try compute.wait(sig, 5000);
+        }
+
+        // Batched rotated Q must match single-slot bit-for-bit; attention outputs must match within FP16 split-reduction ULP.
+        try std.testing.expectEqualSlices(f16, q_single, q_batch);
+        const out_batch: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_batch_raw[0 .. q_batch.len * @sizeOf(f16)]));
+        const out_single: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, out_single_raw[0 .. q_single.len * @sizeOf(f16)]));
+        for (out_single, out_batch) |exp_h, got_h| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(exp_h)), @as(f32, @floatCast(got_h)), 1e-3);
+        }
+    }
+}
+
+test "R8 ami_kv_tile_cow_copy copies valid_tokens rows bit-for-bit on GPU without touching tail suffix" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try AttentionPipelines.init(device, library);
+    defer pipes.close();
+
+    const num_kv_heads: u32 = 4;
+    const head_dim: u32 = 128;
+    const chunk_tokens: u32 = 512;
+    const valid_tokens: u32 = 176;
+    const rows: u32 = num_kv_heads * chunk_tokens;
+
+    const src_k = try metal.KvTile.init(device, head_dim, rows, .{});
+    defer src_k.close();
+    const src_v = try metal.KvTile.init(device, head_dim, rows, .{});
+    defer src_v.close();
+    const dst_k = try metal.KvTile.init(device, head_dim, rows, .{});
+    defer dst_k.close();
+    const dst_v = try metal.KvTile.init(device, head_dim, rows, .{});
+    defer dst_v.close();
+
+    {
+        var skg = try src_k.lock(false);
+        errdefer skg.release();
+        var svg = try src_v.lock(false);
+        errdefer svg.release();
+        var dkg = try dst_k.lock(false);
+        errdefer dkg.release();
+        var dvg = try dst_v.lock(false);
+        errdefer dvg.release();
+        const stride = skg.bytes_per_row / @sizeOf(f16);
+        const skm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, skg.bytes));
+        const svm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, svg.bytes));
+        const dkm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, dkg.bytes));
+        const dvm: []f16 = @alignCast(std.mem.bytesAsSlice(f16, dvg.bytes));
+        @memset(dkm, @floatCast(-7.5));
+        @memset(dvm, @floatCast(-7.5));
+        for (0..num_kv_heads) |kvh| {
+            for (0..chunk_tokens) |t| {
+                const row_off = (kvh * chunk_tokens + t) * stride;
+                for (0..head_dim) |d| {
+                    skm[row_off + d] = @floatCast(@as(f32, @floatFromInt((kvh * 31 + t * 7 + d) % 61)) * 0.125);
+                    svm[row_off + d] = @floatCast(@as(f32, @floatFromInt((kvh * 17 + t * 11 + d) % 59)) * -0.125);
+                }
+            }
+        }
+        try dvg.unlock();
+        try dkg.unlock();
+        try svg.unlock();
+        try skg.unlock();
+    }
+
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeTilesResident(&.{ src_k, src_v, dst_k, dst_v });
+    {
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try pipes.encodeKvTileCowCopy(&f, .{
+            .src_k = src_k,
+            .src_v = src_v,
+            .dst_k = dst_k,
+            .dst_v = dst_v,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .chunk_tokens = chunk_tokens,
+            .valid_tokens = valid_tokens,
+        }, false);
+        const sig = try f.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    var skg = try src_k.lock(true);
+    errdefer skg.release();
+    var svg = try src_v.lock(true);
+    errdefer svg.release();
+    var dkg = try dst_k.lock(true);
+    errdefer dkg.release();
+    var dvg = try dst_v.lock(true);
+    errdefer dvg.release();
+    const stride = skg.bytes_per_row / @sizeOf(f16);
+    const skm: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, skg.bytes));
+    const svm: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, svg.bytes));
+    const dkm: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, dkg.bytes));
+    const dvm: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, dvg.bytes));
+    for (0..num_kv_heads) |kvh| {
+        for (0..valid_tokens) |t| {
+            const off = (kvh * chunk_tokens + t) * stride;
+            try std.testing.expectEqualSlices(f16, skm[off .. off + head_dim], dkm[off .. off + head_dim]);
+            try std.testing.expectEqualSlices(f16, svm[off .. off + head_dim], dvm[off .. off + head_dim]);
+        }
+        // Rows >= valid_tokens in dst MUST remain untouched (-7.5)!
+        const untouched_off = (kvh * chunk_tokens + valid_tokens) * stride;
+        for (dkm[untouched_off .. untouched_off + head_dim]) |x| try std.testing.expectEqual(@as(f16, @floatCast(-7.5)), x);
+        for (dvm[untouched_off .. untouched_off + head_dim]) |x| try std.testing.expectEqual(@as(f16, @floatCast(-7.5)), x);
+    }
+    try dvg.unlock();
+    try dkg.unlock();
+    try svg.unlock();
+    try skg.unlock();
 }
