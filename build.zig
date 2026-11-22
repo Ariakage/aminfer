@@ -99,59 +99,29 @@ pub fn build(b: *std.Build) void {
 
     const aux_wf = b.addWriteFiles();
 
-    // Dedicated SME2-only test step (`zig build test-sme`); full `zig build test`
-    // already exercises `cpu/sme.zig` and `runtime/rng.zig` once via `src/root.zig`.
-    const sme_only_main = aux_wf.add("sme_only_test.zig",
-        \\test {
-        \\    _ = @import("aminfer").sme;
-        \\}
-        \\
-    );
+    // Dedicated SME2-only test step (`zig build test-sme`), filtering the real
+    // `cpu.sme.*` tests from the root library module without recompiling duplicates.
     const sme_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = sme_only_main,
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "aminfer", .module = mod }},
-        }),
+        .root_module = mod,
+        .filters = &.{"cpu.sme."},
     });
     const run_sme_test = b.addRunArtifact(sme_test);
     b.step("test-sme", "Run SME2 microkernel, canary, parity and fallback tests").dependOn(&run_sme_test.step);
 
-    // Dedicated M6 hybrid GPU test step (`zig build test-hybrid`); full `zig build test`
-    // already runs `gpu/hybrid.zig` once via `src/root.zig`.
-    const hybrid_only_main = aux_wf.add("hybrid_only_test.zig",
-        \\test {
-        \\    _ = @import("aminfer").hybrid;
-        \\}
-        \\
-    );
+    // Dedicated M6 hybrid GPU test step (`zig build test-hybrid`), filtering the
+    // real `gpu.hybrid.*` tests from the root library module.
     const hybrid_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = hybrid_only_main,
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "aminfer", .module = mod }},
-        }),
+        .root_module = mod,
+        .filters = &.{"gpu.hybrid."},
     });
     const run_hybrid_test = b.addRunArtifact(hybrid_test);
     b.step("test-hybrid", "Run M6 hybrid GPU (GDN, QSA, 4-branch GR) parity tests").dependOn(&run_hybrid_test.step);
 
-    // Dedicated M6.5 G14 vision/video ingress test step (`zig build test-vision`);
-    // full `zig build test` already runs `gpu/vision.zig` once via `src/root.zig`.
-    const vision_only_main = aux_wf.add("vision_only_test.zig",
-        \\test {
-        \\    _ = @import("aminfer").vision;
-        \\}
-        \\
-    );
+    // Dedicated M6.5 G14 vision/video ingress test step (`zig build test-vision`),
+    // filtering the real `gpu.vision.*` tests from the root library module.
     const vision_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = vision_only_main,
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "aminfer", .module = mod }},
-        }),
+        .root_module = mod,
+        .filters = &.{"gpu.vision."},
     });
     const run_vision_test = b.addRunArtifact(vision_test);
     b.step("test-vision", "Run M6.5 G14 zero-copy VideoToolbox/IOSurface vision ingress tests").dependOn(&run_vision_test.step);
