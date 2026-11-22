@@ -30,7 +30,14 @@ pub const MAX_CTX_LEN: usize = 4;
 pub const MAX_CONT_LEN: usize = 8;
 pub const SLOTS_PER_BUCKET: usize = page.APPLE_PAGE_SIZE / @sizeOf(NgramSlot);
 
+/// Maximum simultaneously registered domain `.ang` corpus packs (`C14`).
+pub const MAX_DOMAIN_PACKS: usize = 8;
+/// Maximum byte length of a domain pack identifier (`domain_id`).
+pub const MAX_DOMAIN_ID_BYTES: usize = 64;
+
 const INVALID_BUCKET: u32 = std.math.maxInt(u32);
+const INVALID_BANK: u8 = 0xFF;
+const INVALID_PACK_SLOT: u8 = 0xFF;
 const DEFAULT_VERIFY_CHUNK_BYTES: usize = 256 * 1024; // 16 * 16 KiB
 
 /// 128-byte `.ang` v1 header at byte 0 of page 0 (little-endian, zero implicit padding).
@@ -721,6 +728,1023 @@ pub const NvmeNgramTable = struct {
 };
 
 // ---------------------------------------------------------------------------
+// C14 Hot-Swappable Multi-Pack Domain `.ang` Registry
+// ---------------------------------------------------------------------------
+
+pub const RegistryError = OpenError || error{
+    InvalidDomainId,
+    RegistryFull,
+    DomainAlreadyExists,
+    DomainNotFound,
+};
+
+pub const RegistryQueryError = QueryError || error{
+    DomainNotFound,
+};
+
+pub const DomainSelectError = error{
+    InvalidDomainId,
+    DomainNotFound,
+};
+
+pub const RegistryConfig = struct {
+    /// Number of 16 KiB wired LRU cache pages shared across all registered domain packs (`1..=1024`).
+    /// One additional internal 16 KiB wired scratch page is reserved for zero-allocation header/CRC
+    /// validation during `registerPack` and `swapDomainPack`.
+    cache_pages: usize = 64,
+    /// Maximum concurrent async prefetch reads (`1..=16`; default `4`).
+    max_inflight: usize = 4,
+    /// Async I/O backend for background `prefetchDomain()`.
+    io_backend: aio.IoBackend = .kqueue_aio,
+    /// Default setting for verifying full-table CRC-32 when registering or swapping packs.
+    verify_table_crc: bool = false,
+    /// Timeout waiting for an in-flight prefetch page during `queryDomain()`.
+    timeout_ms: u64 = 5_000,
+    /// Optional explicit wired budget (`null` computes from host sysctl facts).
+    budget_override: ?budget_mod.Budget = null,
+};
+
+/// Stack-allocated immutable snapshot of a registered domain `.ang` pack for HTTP/CLI telemetry.
+pub const DomainPackInfo = struct {
+    domain_id: [MAX_DOMAIN_ID_BYTES]u8 = @splat(0),
+    domain_id_len: u8 = 0,
+    corpus_id: [48]u8 = @splat(0),
+    corpus_id_len: u8 = 0,
+    num_buckets: u32 = 0,
+    total_entries: u64 = 0,
+    min_ngram: u8 = 0,
+    max_ngram: u8 = 0,
+    max_cont_len: u8 = 0,
+    generation: u64 = 0,
+    swaps: u64 = 0,
+    is_default: bool = false,
+    stats: Stats = .{},
+
+    pub fn domainIdSlice(self: *const DomainPackInfo) []const u8 {
+        return self.domain_id[0..self.domain_id_len];
+    }
+
+    pub fn corpusIdSlice(self: *const DomainPackInfo) []const u8 {
+        return self.corpus_id[0..self.corpus_id_len];
+    }
+};
+
+pub fn isValidDomainId(id: []const u8) bool {
+    if (id.len == 0 or id.len > MAX_DOMAIN_ID_BYTES) return false;
+    for (id) |c| {
+        if (c < 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
+/// Multi-pack hot-swappable `.ang` v1 NVMe N-gram registry (`C14`).
+///
+/// Hosts up to `MAX_DOMAIN_PACKS` (`8`) independent `.ang` files keyed by
+/// `domain_id` (`[64]u8`, defaulting to the `.ang` header's `corpus_id` or a
+/// caller-provided alias such as `"repo"` / `"docs"`), backed by a single
+/// preallocated 16 KiB-aligned `WiredArena` LRU page pool.
+///
+/// Hot-swapping (`swapDomainPack`) uses double-buffered descriptors guarded by
+/// atomic generation counters (`swap_gen`) and per-bank active reader/AIO pin
+/// counters (`pins`), ensuring in-flight `queryDomain` and `prefetchDomain`
+/// calls never race against file descriptor closure or stale cache pages, with
+/// zero steady-state heap allocations.
+pub const DomainNgramRegistry = struct {
+    const PackDescriptor = struct {
+        file: aio.DirectFile = .{ .fd = -1, .size = 0 },
+        header: Header = std.mem.zeroes(Header),
+        bucket_mask: u64 = 0,
+        generation: u64 = 0,
+        pins: std.atomic.Value(u32) = .init(0),
+    };
+
+    const AtomicStats = struct {
+        queries: std.atomic.Value(u64) = .init(0),
+        hits: std.atomic.Value(u64) = .init(0),
+        seed_hits: std.atomic.Value(u64) = .init(0),
+        branch_hits: std.atomic.Value(u64) = .init(0),
+        cache_hits: std.atomic.Value(u64) = .init(0),
+        prefetch_submitted: std.atomic.Value(u64) = .init(0),
+        prefetch_hits: std.atomic.Value(u64) = .init(0),
+        nvme_reads: std.atomic.Value(u64) = .init(0),
+        bytes_read: std.atomic.Value(u64) = .init(0),
+        total_query_ns: std.atomic.Value(u64) = .init(0),
+        swaps: std.atomic.Value(u64) = .init(0),
+
+        fn snapshot(self: *const AtomicStats) Stats {
+            return .{
+                .queries = self.queries.load(.monotonic),
+                .hits = self.hits.load(.monotonic),
+                .seed_hits = self.seed_hits.load(.monotonic),
+                .branch_hits = self.branch_hits.load(.monotonic),
+                .cache_hits = self.cache_hits.load(.monotonic),
+                .prefetch_submitted = self.prefetch_submitted.load(.monotonic),
+                .prefetch_hits = self.prefetch_hits.load(.monotonic),
+                .nvme_reads = self.nvme_reads.load(.monotonic),
+                .bytes_read = self.bytes_read.load(.monotonic),
+                .total_query_ns = self.total_query_ns.load(.monotonic),
+            };
+        }
+    };
+
+    const PackSlot = struct {
+        occupied: std.atomic.Value(bool) = .init(false),
+        domain_id: [MAX_DOMAIN_ID_BYTES]u8 = @splat(0),
+        domain_id_len: u8 = 0,
+        active_bank: std.atomic.Value(u8) = .init(INVALID_BANK),
+        /// Even = stable; odd = active_bank flip in progress.
+        swap_gen: std.atomic.Value(u64) = .init(0),
+        banks: [2]PackDescriptor = .{ .{}, .{} },
+        stats: AtomicStats = .{},
+
+        fn domainIdSlice(self: *const PackSlot) []const u8 {
+            return self.domain_id[0..self.domain_id_len];
+        }
+    };
+
+    const SharedSlotState = enum(u8) {
+        empty = 0,
+        inflight = 1,
+        loading = 2,
+        ready = 3,
+    };
+
+    const SharedCacheSlot = struct {
+        state: SharedSlotState = .empty,
+        pack_idx: u8 = INVALID_PACK_SLOT,
+        bank_idx: u8 = INVALID_BANK,
+        desc_gen: u64 = 0,
+        bucket_idx: u32 = INVALID_BUCKET,
+        last_used_tick: u64 = 0,
+        readers: u32 = 0,
+    };
+
+    const PinnedBank = struct {
+        pack_idx: u8,
+        bank_idx: u8,
+        desc: *const PackDescriptor,
+    };
+
+    arena: arena_mod.WiredArena,
+    cache_pages: usize,
+    cache_slots: []SharedCacheSlot,
+    async_reader: aio.AsyncExpertReader,
+    verify_table_crc_default: bool,
+    timeout_ms: u64,
+    tick: u64,
+
+    packs: [MAX_DOMAIN_PACKS]PackSlot,
+    pack_count: std.atomic.Value(usize),
+    default_slot: std.atomic.Value(u8),
+    next_generation: std.atomic.Value(u64),
+
+    // Lightweight atomic locks: `cache_lock` guards LRU slot metadata and `async_reader`
+    // (never held across synchronous `preadExact`); `writer_lock` serializes cold-path
+    // `registerPack` / `swapDomainPack` operations.
+    cache_lock: std.atomic.Value(bool),
+    writer_lock: std.atomic.Value(bool),
+
+    pub fn init(allocator: std.mem.Allocator, config: RegistryConfig) OpenError!DomainNgramRegistry {
+        if (config.cache_pages == 0 or config.cache_pages > 1024) return error.InvalidCacheConfig;
+        if (config.max_inflight == 0 or config.max_inflight > 16) return error.InvalidCacheConfig;
+
+        // Allocate `cache_pages` LRU pages + 1 dedicated 16 KiB writer scratch page.
+        const arena_bytes = (config.cache_pages + 1) * page.APPLE_PAGE_SIZE;
+        const wired_budget = config.budget_override orelse blk: {
+            const facts = try sysinfo.Facts.read();
+            break :blk budget_mod.Budget.compute(.{
+                .memory_bytes = facts.memory_bytes,
+                .user_wire_limit = facts.user_wire_limit,
+                .global_user_wire_limit = facts.global_user_wire_limit,
+                .gpu_working_set_bytes = facts.memory_bytes,
+                .configured_cap = null,
+                .headroom_bytes = budget_mod.DEFAULT_HEADROOM_BYTES,
+            });
+        };
+        try wired_budget.checkPlan(arena_bytes);
+
+        var arena = try arena_mod.WiredArena.init(arena_bytes, wired_budget);
+        errdefer arena.deinit();
+
+        const cache_slots = try allocator.alloc(SharedCacheSlot, config.cache_pages);
+        errdefer allocator.free(cache_slots);
+        @memset(cache_slots, .{});
+
+        const eff_inflight: usize = if (config.cache_pages >= 2)
+            @min(config.max_inflight, config.cache_pages / 2)
+        else
+            1;
+        var reader = try aio.AsyncExpertReader.init(allocator, .{
+            .backend = config.io_backend,
+            .max_inflight = eff_inflight,
+            .worker_count = 1,
+            .worker_qos = .utility,
+            .io_policy = .important,
+        });
+        errdefer reader.deinit(allocator);
+
+        var packs: [MAX_DOMAIN_PACKS]PackSlot = undefined;
+        for (&packs) |*p| p.* = .{};
+
+        return .{
+            .arena = arena,
+            .cache_pages = config.cache_pages,
+            .cache_slots = cache_slots,
+            .async_reader = reader,
+            .verify_table_crc_default = config.verify_table_crc,
+            .timeout_ms = config.timeout_ms,
+            .tick = 0,
+            .packs = packs,
+            .pack_count = .init(0),
+            .default_slot = .init(INVALID_PACK_SLOT),
+            .next_generation = .init(1),
+            .cache_lock = .init(false),
+            .writer_lock = .init(false),
+        };
+    }
+
+    pub fn deinit(self: *DomainNgramRegistry, allocator: std.mem.Allocator) void {
+        // Drain all in-flight kernel AIO / E-core pread requests BEFORE releasing
+        // the wired arena or closing any F_NOCACHE file descriptors.
+        self.async_reader.deinit(allocator);
+        for (&self.packs) |*p| {
+            for (&p.banks) |*b| {
+                if (b.file.fd >= 0) {
+                    b.file.close();
+                }
+            }
+            p.occupied.store(false, .release);
+            p.active_bank.store(INVALID_BANK, .release);
+        }
+        allocator.free(self.cache_slots);
+        self.cache_slots = &.{};
+        self.arena.deinit();
+    }
+
+    pub fn totalWiredBytes(self: *const DomainNgramRegistry) u64 {
+        return self.arena.bytes().len;
+    }
+
+    pub fn cachePageCount(self: *const DomainNgramRegistry) usize {
+        return self.cache_pages;
+    }
+
+    pub fn packCount(self: *const DomainNgramRegistry) usize {
+        return self.pack_count.load(.acquire);
+    }
+
+    inline fn acquireCacheLock(self: *DomainNgramRegistry) void {
+        while (self.cache_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    inline fn releaseCacheLock(self: *DomainNgramRegistry) void {
+        self.cache_lock.store(false, .release);
+    }
+
+    inline fn acquireWriterLock(self: *DomainNgramRegistry) void {
+        while (self.writer_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    inline fn releaseWriterLock(self: *DomainNgramRegistry) void {
+        self.writer_lock.store(false, .release);
+    }
+
+    inline fn nextTickLocked(self: *DomainNgramRegistry) u64 {
+        self.tick +%= 1;
+        if (self.tick == 0) self.tick = 1;
+        return self.tick;
+    }
+
+    inline fn pageSlice(self: *DomainNgramRegistry, slot_idx: usize) []align(page.APPLE_PAGE_SIZE) u8 {
+        const start = slot_idx * page.APPLE_PAGE_SIZE;
+        return @alignCast(self.arena.bytes()[start .. start + page.APPLE_PAGE_SIZE]);
+    }
+
+    inline fn writerScratchPage(self: *DomainNgramRegistry) []align(page.APPLE_PAGE_SIZE) u8 {
+        const start = self.cache_pages * page.APPLE_PAGE_SIZE;
+        return @alignCast(self.arena.bytes()[start .. start + page.APPLE_PAGE_SIZE]);
+    }
+
+    inline fn pageSlotsConst(self: *const DomainNgramRegistry, slot_idx: usize) []const NgramSlot {
+        const start = slot_idx * page.APPLE_PAGE_SIZE;
+        const raw = self.arena.bytes()[start .. start + page.APPLE_PAGE_SIZE];
+        return @alignCast(std.mem.bytesAsSlice(NgramSlot, raw));
+    }
+
+    fn findPackIndex(self: *const DomainNgramRegistry, domain_id: []const u8) ?u8 {
+        for (&self.packs, 0..) |*p, i| {
+            if (p.occupied.load(.acquire) and std.mem.eql(u8, p.domainIdSlice(), domain_id)) {
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    /// Lock-free check for whether `domain_id` is currently registered.
+    pub fn hasDomain(self: *const DomainNgramRegistry, domain_id: []const u8) bool {
+        if (!isValidDomainId(domain_id)) return false;
+        return self.findPackIndex(domain_id) != null;
+    }
+
+    fn pinPackBank(self: *DomainNgramRegistry, pack_idx: u8) ?PinnedBank {
+        const pack = &self.packs[pack_idx];
+        while (true) {
+            if (!pack.occupied.load(.acquire)) return null;
+            const gen_before = pack.swap_gen.load(.acquire);
+            if ((gen_before & 1) != 0) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            const bank_idx = pack.active_bank.load(.acquire);
+            if (bank_idx >= 2) return null;
+            const desc = &pack.banks[bank_idx];
+            _ = desc.pins.fetchAdd(1, .acq_rel);
+            const gen_after = pack.swap_gen.load(.acquire);
+            if (gen_after == gen_before and pack.active_bank.load(.acquire) == bank_idx) {
+                return .{
+                    .pack_idx = pack_idx,
+                    .bank_idx = bank_idx,
+                    .desc = desc,
+                };
+            }
+            _ = desc.pins.fetchSub(1, .acq_rel);
+        }
+    }
+
+    inline fn unpinPackBank(self: *DomainNgramRegistry, pack_idx: u8, bank_idx: u8) void {
+        _ = self.packs[pack_idx].banks[bank_idx].pins.fetchSub(1, .acq_rel);
+    }
+
+    fn openAndValidateFileLocked(
+        self: *DomainNgramRegistry,
+        path: [:0]const u8,
+        verify_table_crc: bool,
+    ) OpenError!struct { file: aio.DirectFile, header: Header } {
+        var file = try aio.DirectFile.openReadOnly(path);
+        errdefer file.close();
+
+        const scratch = self.writerScratchPage();
+        try preadExact(file.fd, scratch, 0);
+        var hdr: Header = undefined;
+        @memcpy(std.mem.asBytes(&hdr), scratch[0..@sizeOf(Header)]);
+        try validateHeader(&hdr, file.size);
+
+        if (verify_table_crc and hdr.hasTableCrc()) {
+            var crc = std.hash.Crc32.init();
+            var off: u64 = hdr.table_offset;
+            const end_off: u64 = hdr.table_offset + hdr.table_bytes;
+            while (off < end_off) {
+                try preadExact(file.fd, scratch, off);
+                crc.update(scratch);
+                off += page.APPLE_PAGE_SIZE;
+            }
+            if (crc.final() != hdr.table_crc32) return error.TableChecksumMismatch;
+        }
+        @memset(scratch, 0);
+        return .{ .file = file, .header = hdr };
+    }
+
+    /// Registers a new `.ang` v1 NVMe corpus pack under `domain_id_alias`
+    /// (defaulting to the `.ang` header's `corpus_id` when `null`).
+    /// Performs zero heap allocations after `DomainNgramRegistry.init`.
+    pub fn registerPack(
+        self: *DomainNgramRegistry,
+        domain_id_alias: ?[]const u8,
+        path: [:0]const u8,
+        verify_table_crc: ?bool,
+    ) RegistryError!usize {
+        if (domain_id_alias) |alias| {
+            if (!isValidDomainId(alias)) return error.InvalidDomainId;
+        }
+
+        self.acquireWriterLock();
+        defer self.releaseWriterLock();
+
+        const verify_crc = verify_table_crc orelse self.verify_table_crc_default;
+        var opened = try self.openAndValidateFileLocked(path, verify_crc);
+        errdefer opened.file.close();
+
+        const resolved_id: []const u8 = domain_id_alias orelse opened.header.corpusIdSlice();
+        if (!isValidDomainId(resolved_id)) return error.InvalidDomainId;
+
+        if (self.findPackIndex(resolved_id) != null) return error.DomainAlreadyExists;
+
+        var free_idx: ?usize = null;
+        for (&self.packs, 0..) |*p, i| {
+            if (!p.occupied.load(.acquire)) {
+                free_idx = i;
+                break;
+            }
+        }
+        const slot_idx = free_idx orelse return error.RegistryFull;
+        const pack = &self.packs[slot_idx];
+
+        const gen = self.next_generation.fetchAdd(1, .acq_rel);
+        @memset(&pack.domain_id, 0);
+        @memcpy(pack.domain_id[0..resolved_id.len], resolved_id);
+        pack.domain_id_len = @intCast(resolved_id.len);
+        pack.banks[0] = .{
+            .file = opened.file,
+            .header = opened.header,
+            .bucket_mask = @as(u64, opened.header.num_buckets - 1),
+            .generation = gen,
+            .pins = .init(0),
+        };
+        pack.banks[1] = .{};
+        pack.stats = .{};
+        pack.active_bank.store(0, .seq_cst);
+        pack.swap_gen.store(0, .seq_cst);
+        pack.occupied.store(true, .seq_cst);
+        _ = self.pack_count.fetchAdd(1, .acq_rel);
+
+        // If no default pack was active yet, atomically select this pack as default.
+        _ = self.default_slot.cmpxchgStrong(INVALID_PACK_SLOT, @intCast(slot_idx), .seq_cst, .acquire);
+        return slot_idx;
+    }
+
+    /// Atomically hot-swaps the `.ang` file backing an existing `domain_id`.
+    ///
+    /// Opens and validates `new_path` into the inactive descriptor bank with
+    /// zero heap allocation, flips `active_bank` under `swap_gen`, waits for
+    /// all pinned in-flight queries and async prefetches on the old bank to
+    /// drain, and then closes the old `F_NOCACHE` descriptor. Returns the new
+    /// monotonic descriptor generation number.
+    pub fn swapDomainPack(
+        self: *DomainNgramRegistry,
+        domain_id: []const u8,
+        new_path: [:0]const u8,
+        verify_table_crc: ?bool,
+    ) RegistryError!u64 {
+        if (!isValidDomainId(domain_id)) return error.InvalidDomainId;
+
+        self.acquireWriterLock();
+        defer self.releaseWriterLock();
+
+        const pack_idx = self.findPackIndex(domain_id) orelse return error.DomainNotFound;
+        const pack = &self.packs[pack_idx];
+        const old_bank = pack.active_bank.load(.acquire);
+        if (old_bank >= 2) return error.DomainNotFound;
+        const new_bank: u8 = 1 - old_bank;
+
+        // Ensure the target inactive bank has zero residual pins before reuse.
+        while (pack.banks[new_bank].pins.load(.acquire) > 0) {
+            try self.reapPendingForDrain();
+            std.atomic.spinLoopHint();
+        }
+        if (pack.banks[new_bank].file.fd >= 0) {
+            pack.banks[new_bank].file.close();
+            pack.banks[new_bank] = .{};
+        }
+
+        const verify_crc = verify_table_crc orelse self.verify_table_crc_default;
+        var opened = try self.openAndValidateFileLocked(new_path, verify_crc);
+        errdefer opened.file.close();
+
+        const new_gen = self.next_generation.fetchAdd(1, .acq_rel);
+        pack.banks[new_bank] = .{
+            .file = opened.file,
+            .header = opened.header,
+            .bucket_mask = @as(u64, opened.header.num_buckets - 1),
+            .generation = new_gen,
+            .pins = .init(0),
+        };
+
+        // Atomic generation-guarded descriptor bank publication.
+        const prev_swap = pack.swap_gen.load(.acquire);
+        pack.swap_gen.store(prev_swap +% 1, .seq_cst);
+        pack.active_bank.store(new_bank, .seq_cst);
+        pack.swap_gen.store(prev_swap +% 2, .seq_cst);
+        _ = pack.stats.swaps.fetchAdd(1, .monotonic);
+
+        // Drain all in-flight queries and async prefetches pinned to `old_bank`
+        // BEFORE closing `old_bank.file`.
+        while (pack.banks[old_bank].pins.load(.acquire) > 0) {
+            try self.reapPendingForDrain();
+            std.atomic.spinLoopHint();
+        }
+        if (pack.banks[old_bank].file.fd >= 0) {
+            pack.banks[old_bank].file.close();
+        }
+        pack.banks[old_bank] = .{};
+
+        return new_gen;
+    }
+
+    fn reapPendingForDrain(self: *DomainNgramRegistry) QueryError!void {
+        self.acquireCacheLock();
+        defer self.releaseCacheLock();
+        if (self.async_reader.inflightCount() == 0) return;
+        const reaped = try self.reapPrefetchesLocked();
+        if (reaped == 0 and self.async_reader.inflightCount() > 0) {
+            var comps: [16]aio.Completion = undefined;
+            const got = try self.async_reader.wait(&comps, 2);
+            var first_err: ?QueryError = null;
+            for (comps[0..got]) |c| {
+                self.applyCompletionLocked(c) catch |err| {
+                    if (first_err == null) first_err = err;
+                };
+            }
+            if (first_err) |err| return err;
+        }
+    }
+
+    /// Atomically switches the active default domain pack (`0` heap allocs).
+    pub fn selectDefaultDomain(self: *DomainNgramRegistry, domain_id: []const u8) DomainSelectError!void {
+        if (!isValidDomainId(domain_id)) return error.InvalidDomainId;
+        const idx = self.findPackIndex(domain_id) orelse return error.DomainNotFound;
+        self.default_slot.store(idx, .seq_cst);
+    }
+
+    /// Copies the active default domain ID into `out` and returns the populated slice
+    /// (empty when no domain packs are registered). Lock-free, zero heap allocations.
+    pub fn defaultDomainId(self: *const DomainNgramRegistry, out: *[MAX_DOMAIN_ID_BYTES]u8) []const u8 {
+        const idx = self.default_slot.load(.acquire);
+        if (idx >= MAX_DOMAIN_PACKS) return out[0..0];
+        const pack = &self.packs[idx];
+        if (!pack.occupied.load(.acquire)) return out[0..0];
+        const s = pack.domainIdSlice();
+        @memcpy(out[0..s.len], s);
+        return out[0..s.len];
+    }
+
+    /// Captures a consistent lock-free snapshot of all registered domain packs into `out`.
+    /// Returns the number of entries written (`0..=MAX_DOMAIN_PACKS`). Zero heap allocations.
+    pub fn snapshotPacks(self: *DomainNgramRegistry, out: *[MAX_DOMAIN_PACKS]DomainPackInfo) usize {
+        const def_idx = self.default_slot.load(.acquire);
+        var count: usize = 0;
+        for (0..MAX_DOMAIN_PACKS) |i| {
+            const pinned = self.pinPackBank(@intCast(i)) orelse continue;
+            defer self.unpinPackBank(pinned.pack_idx, pinned.bank_idx);
+
+            const pack = &self.packs[i];
+            var info: DomainPackInfo = .{};
+            const dom = pack.domainIdSlice();
+            @memcpy(info.domain_id[0..dom.len], dom);
+            info.domain_id_len = @intCast(dom.len);
+
+            const cid = pinned.desc.header.corpusIdSlice();
+            @memcpy(info.corpus_id[0..cid.len], cid);
+            info.corpus_id_len = @intCast(cid.len);
+
+            info.num_buckets = pinned.desc.header.num_buckets;
+            info.total_entries = pinned.desc.header.total_entries;
+            info.min_ngram = pinned.desc.header.min_ngram;
+            info.max_ngram = pinned.desc.header.max_ngram;
+            info.max_cont_len = pinned.desc.header.max_cont_len;
+            info.generation = pinned.desc.generation;
+            info.swaps = pack.stats.swaps.load(.monotonic);
+            info.is_default = (def_idx == @as(u8, @intCast(i)));
+            info.stats = pack.stats.snapshot();
+
+            out[count] = info;
+            count += 1;
+        }
+        return count;
+    }
+
+    fn resolveTargetPack(self: *DomainNgramRegistry, domain_id: ?[]const u8) error{DomainNotFound}!?u8 {
+        if (domain_id) |id| {
+            if (id.len > 0) {
+                return self.findPackIndex(id) orelse return error.DomainNotFound;
+            }
+        }
+        const def_idx = self.default_slot.load(.acquire);
+        if (def_idx >= MAX_DOMAIN_PACKS) return null;
+        if (!self.packs[def_idx].occupied.load(.acquire)) return null;
+        return def_idx;
+    }
+
+    fn findCacheSlotLocked(
+        self: *const DomainNgramRegistry,
+        pack_idx: u8,
+        desc_gen: u64,
+        bucket_idx: u32,
+    ) ?usize {
+        for (self.cache_slots, 0..) |s, i| {
+            if (s.state != .empty and
+                s.pack_idx == pack_idx and
+                s.desc_gen == desc_gen and
+                s.bucket_idx == bucket_idx)
+            {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    fn pickVictimSlotLocked(self: *const DomainNgramRegistry) ?usize {
+        var best_lru: ?usize = null;
+        var best_tick: u64 = std.math.maxInt(u64);
+        for (self.cache_slots, 0..) |s, i| {
+            switch (s.state) {
+                .empty => return i,
+                .inflight, .loading => continue,
+                .ready => {
+                    if (s.readers > 0) continue;
+                    if (s.last_used_tick < best_tick) {
+                        best_tick = s.last_used_tick;
+                        best_lru = i;
+                    }
+                },
+            }
+        }
+        return best_lru;
+    }
+
+    fn applyCompletionLocked(self: *DomainNgramRegistry, comp: aio.Completion) QueryError!void {
+        const slot_idx: usize = @intCast(comp.user_data);
+        std.debug.assert(slot_idx < self.cache_slots.len);
+        const slot = &self.cache_slots[slot_idx];
+        const p_idx = slot.pack_idx;
+        const b_idx = slot.bank_idx;
+        // Always release the bank pin acquired for this async prefetch!
+        defer {
+            if (p_idx < MAX_DOMAIN_PACKS and b_idx < 2) {
+                self.unpinPackBank(p_idx, b_idx);
+            }
+        }
+
+        const bytes_read = comp.check() catch |err| {
+            slot.* = .{};
+            return err;
+        };
+        if (bytes_read != page.APPLE_PAGE_SIZE) {
+            slot.* = .{};
+            return error.ShortRead;
+        }
+        slot.state = .ready;
+        slot.last_used_tick = self.nextTickLocked();
+        if (p_idx < MAX_DOMAIN_PACKS) {
+            _ = self.packs[p_idx].stats.nvme_reads.fetchAdd(1, .monotonic);
+            _ = self.packs[p_idx].stats.bytes_read.fetchAdd(bytes_read, .monotonic);
+        }
+    }
+
+    fn reapPrefetchesLocked(self: *DomainNgramRegistry) QueryError!usize {
+        if (self.async_reader.inflightCount() == 0) return 0;
+        var comps: [16]aio.Completion = undefined;
+        var total: usize = 0;
+        var first_err: ?QueryError = null;
+        while (self.async_reader.inflightCount() > 0) {
+            const got = try self.async_reader.poll(&comps);
+            if (got == 0) break;
+            for (comps[0..got]) |c| {
+                self.applyCompletionLocked(c) catch |err| {
+                    if (first_err == null) first_err = err;
+                };
+            }
+            total += got;
+        }
+        if (first_err) |err| return err;
+        return total;
+    }
+
+    /// Reaps any already-completed background prefetches across all packs.
+    pub fn reapPrefetches(self: *DomainNgramRegistry) QueryError!usize {
+        self.acquireCacheLock();
+        defer self.releaseCacheLock();
+        return self.reapPrefetchesLocked();
+    }
+
+    /// Clears the shared wired LRU cache once all in-flight prefetches and active
+    /// page scans complete.
+    pub fn clearCache(self: *DomainNgramRegistry) QueryError!void {
+        while (true) {
+            self.acquireCacheLock();
+            if (self.async_reader.inflightCount() > 0) {
+                var comps: [16]aio.Completion = undefined;
+                const got = self.async_reader.wait(&comps, self.timeout_ms) catch |err| {
+                    self.releaseCacheLock();
+                    return err;
+                };
+                if (got == 0) {
+                    self.releaseCacheLock();
+                    return error.Timeout;
+                }
+                var first_err: ?QueryError = null;
+                for (comps[0..got]) |c| {
+                    self.applyCompletionLocked(c) catch |err| {
+                        if (first_err == null) first_err = err;
+                    };
+                }
+                self.releaseCacheLock();
+                if (first_err) |err| return err;
+                continue;
+            }
+            var busy = false;
+            for (self.cache_slots) |s| {
+                if (s.state == .loading or s.readers > 0) {
+                    busy = true;
+                    break;
+                }
+            }
+            if (busy) {
+                self.releaseCacheLock();
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            for (self.cache_slots) |*s| s.* = .{};
+            self.releaseCacheLock();
+            return;
+        }
+    }
+
+    inline fn releaseCacheSlotReader(self: *DomainNgramRegistry, slot_idx: usize) void {
+        self.acquireCacheLock();
+        std.debug.assert(self.cache_slots[slot_idx].readers > 0);
+        self.cache_slots[slot_idx].readers -= 1;
+        self.releaseCacheLock();
+    }
+
+    /// Submits an asynchronous `F_NOCACHE` 16 KiB bucket page prefetch for the
+    /// resolved domain (`domain_id` or active default when `null`/empty).
+    /// Zero heap allocation; safely pins the active descriptor bank across the AIO.
+    pub fn prefetchDomain(
+        self: *DomainNgramRegistry,
+        domain_id: ?[]const u8,
+        tail_tokens: []const u32,
+    ) RegistryQueryError!bool {
+        const pack_idx = (try self.resolveTargetPack(domain_id)) orelse return false;
+        const pinned = self.pinPackBank(pack_idx) orelse return false;
+        defer self.unpinPackBank(pinned.pack_idx, pinned.bank_idx);
+
+        if (tail_tokens.len < pinned.desc.header.min_ngram) return false;
+
+        const ctx_len: usize = @min(tail_tokens.len, @as(usize, pinned.desc.header.max_ngram));
+        const ctx = tail_tokens[tail_tokens.len - ctx_len .. tail_tokens.len];
+        const h = hashContext(ctx);
+        const bucket_idx: u32 = @intCast(h & pinned.desc.bucket_mask);
+
+        self.acquireCacheLock();
+        defer self.releaseCacheLock();
+
+        _ = try self.reapPrefetchesLocked();
+        if (self.async_reader.availableSlots() == 0) return false;
+
+        if (self.findCacheSlotLocked(pinned.pack_idx, pinned.desc.generation, bucket_idx)) |existing| {
+            if (self.cache_slots[existing].state == .ready) {
+                self.cache_slots[existing].last_used_tick = self.nextTickLocked();
+            }
+            return false;
+        }
+
+        const victim = self.pickVictimSlotLocked() orelse return false;
+        const file_off: u64 = pinned.desc.header.table_offset + @as(u64, bucket_idx) * page.APPLE_PAGE_SIZE;
+
+        // Transfer an independent pin on `pinned.desc` to the in-flight AIO request
+        // (released unconditionally in `applyCompletionLocked` or on submit error).
+        _ = self.packs[pinned.pack_idx].banks[pinned.bank_idx].pins.fetchAdd(1, .acq_rel);
+        self.cache_slots[victim] = .{
+            .state = .inflight,
+            .pack_idx = pinned.pack_idx,
+            .bank_idx = pinned.bank_idx,
+            .desc_gen = pinned.desc.generation,
+            .bucket_idx = bucket_idx,
+            .last_used_tick = self.nextTickLocked(),
+            .readers = 0,
+        };
+        self.async_reader.submit(.{
+            .fd = pinned.desc.file.fd,
+            .offset = file_off,
+            .dst = self.pageSlice(victim),
+            .user_data = victim,
+        }) catch |err| {
+            self.cache_slots[victim] = .{};
+            self.unpinPackBank(pinned.pack_idx, pinned.bank_idx);
+            if (err == error.QueueFull) return false;
+            return err;
+        };
+        _ = self.packs[pinned.pack_idx].stats.prefetch_submitted.fetchAdd(1, .monotonic);
+        return true;
+    }
+
+    fn fetchBucketSlot(
+        self: *DomainNgramRegistry,
+        pinned: PinnedBank,
+        bucket_idx: u32,
+    ) QueryError!struct { slot_idx: usize, cache_hit: bool } {
+        while (true) {
+            self.acquireCacheLock();
+            _ = self.reapPrefetchesLocked() catch |err| {
+                self.releaseCacheLock();
+                return err;
+            };
+
+            if (self.findCacheSlotLocked(pinned.pack_idx, pinned.desc.generation, bucket_idx)) |idx| {
+                switch (self.cache_slots[idx].state) {
+                    .ready => {
+                        self.cache_slots[idx].readers += 1;
+                        self.cache_slots[idx].last_used_tick = self.nextTickLocked();
+                        self.releaseCacheLock();
+                        _ = self.packs[pinned.pack_idx].stats.cache_hits.fetchAdd(1, .monotonic);
+                        return .{ .slot_idx = idx, .cache_hit = true };
+                    },
+                    .inflight => {
+                        var comps: [16]aio.Completion = undefined;
+                        const got = self.async_reader.wait(&comps, self.timeout_ms) catch |err| {
+                            self.releaseCacheLock();
+                            return err;
+                        };
+                        if (got == 0) {
+                            self.releaseCacheLock();
+                            return error.Timeout;
+                        }
+                        var first_err: ?QueryError = null;
+                        for (comps[0..got]) |c| {
+                            self.applyCompletionLocked(c) catch |err| {
+                                if (first_err == null) first_err = err;
+                            };
+                        }
+                        if (self.cache_slots[idx].state == .ready and
+                            self.cache_slots[idx].pack_idx == pinned.pack_idx and
+                            self.cache_slots[idx].desc_gen == pinned.desc.generation and
+                            self.cache_slots[idx].bucket_idx == bucket_idx)
+                        {
+                            self.cache_slots[idx].readers += 1;
+                            self.cache_slots[idx].last_used_tick = self.nextTickLocked();
+                            self.releaseCacheLock();
+                            _ = self.packs[pinned.pack_idx].stats.prefetch_hits.fetchAdd(1, .monotonic);
+                            _ = self.packs[pinned.pack_idx].stats.cache_hits.fetchAdd(1, .monotonic);
+                            return .{ .slot_idx = idx, .cache_hit = true };
+                        }
+                        self.releaseCacheLock();
+                        if (first_err) |err| return err;
+                        continue;
+                    },
+                    .loading => {
+                        self.releaseCacheLock();
+                        std.atomic.spinLoopHint();
+                        continue;
+                    },
+                    .empty => {},
+                }
+            }
+
+            const victim_opt = self.pickVictimSlotLocked();
+            if (victim_opt == null) {
+                if (self.async_reader.inflightCount() > 0) {
+                    var comps: [16]aio.Completion = undefined;
+                    const got = self.async_reader.wait(&comps, self.timeout_ms) catch |err| {
+                        self.releaseCacheLock();
+                        return err;
+                    };
+                    if (got == 0) {
+                        self.releaseCacheLock();
+                        return error.Timeout;
+                    }
+                    var first_err: ?QueryError = null;
+                    for (comps[0..got]) |c| {
+                        self.applyCompletionLocked(c) catch |err| {
+                            if (first_err == null) first_err = err;
+                        };
+                    }
+                    self.releaseCacheLock();
+                    if (first_err) |err| return err;
+                } else {
+                    self.releaseCacheLock();
+                    std.atomic.spinLoopHint();
+                }
+                continue;
+            }
+
+            const victim = victim_opt.?;
+            self.cache_slots[victim] = .{
+                .state = .loading,
+                .pack_idx = pinned.pack_idx,
+                .bank_idx = pinned.bank_idx,
+                .desc_gen = pinned.desc.generation,
+                .bucket_idx = bucket_idx,
+                .last_used_tick = self.nextTickLocked(),
+                .readers = 1,
+            };
+            self.releaseCacheLock();
+
+            const file_off: u64 = pinned.desc.header.table_offset + @as(u64, bucket_idx) * page.APPLE_PAGE_SIZE;
+            preadExact(pinned.desc.file.fd, self.pageSlice(victim), file_off) catch |err| {
+                self.acquireCacheLock();
+                self.cache_slots[victim] = .{};
+                self.releaseCacheLock();
+                return err;
+            };
+
+            self.acquireCacheLock();
+            self.cache_slots[victim].state = .ready;
+            self.cache_slots[victim].last_used_tick = self.nextTickLocked();
+            self.releaseCacheLock();
+
+            _ = self.packs[pinned.pack_idx].stats.nvme_reads.fetchAdd(1, .monotonic);
+            _ = self.packs[pinned.pack_idx].stats.bytes_read.fetchAdd(page.APPLE_PAGE_SIZE, .monotonic);
+            return .{ .slot_idx = victim, .cache_hit = false };
+        }
+    }
+
+    /// Queries the resolved domain pack (`domain_id` or active default when `null`/empty)
+    /// for the longest matching suffix of `tail_tokens`. Zero steady-state heap allocations;
+    /// safe concurrently with `selectDefaultDomain` and `swapDomainPack`.
+    pub fn queryDomain(
+        self: *DomainNgramRegistry,
+        domain_id: ?[]const u8,
+        tail_tokens: []const u32,
+        out_cont: []u32,
+    ) RegistryQueryError!QueryResult {
+        const pack_idx = (try self.resolveTargetPack(domain_id)) orelse {
+            return .{
+                .match_len = 0,
+                .draft_len = 0,
+                .hit_count = 0,
+                .step_prob = 0.0,
+                .is_seed = false,
+                .cache_hit = false,
+            };
+        };
+        const pinned = self.pinPackBank(pack_idx) orelse {
+            return .{
+                .match_len = 0,
+                .draft_len = 0,
+                .hit_count = 0,
+                .step_prob = 0.0,
+                .is_seed = false,
+                .cache_hit = false,
+            };
+        };
+        defer self.unpinPackBank(pinned.pack_idx, pinned.bank_idx);
+
+        const t0 = vmstat.nowNs() catch 0;
+        defer {
+            const t1 = vmstat.nowNs() catch t0;
+            _ = self.packs[pinned.pack_idx].stats.total_query_ns.fetchAdd(t1 -| t0, .monotonic);
+        }
+
+        _ = self.packs[pinned.pack_idx].stats.queries.fetchAdd(1, .monotonic);
+
+        if (tail_tokens.len < pinned.desc.header.min_ngram or out_cont.len == 0) {
+            return .{
+                .match_len = 0,
+                .draft_len = 0,
+                .hit_count = 0,
+                .step_prob = 0.0,
+                .is_seed = false,
+                .cache_hit = false,
+            };
+        }
+
+        const start_len: usize = @min(tail_tokens.len, @as(usize, pinned.desc.header.max_ngram));
+        const min_len: usize = pinned.desc.header.min_ngram;
+        var ctx_len: usize = start_len;
+        while (ctx_len >= min_len) {
+            const ctx = tail_tokens[tail_tokens.len - ctx_len .. tail_tokens.len];
+            const h = hashContext(ctx);
+            const bucket_idx: u32 = @intCast(h & pinned.desc.bucket_mask);
+            const fetched = try self.fetchBucketSlot(pinned, bucket_idx);
+            const page_slots = self.pageSlotsConst(fetched.slot_idx);
+
+            var matched: ?QueryResult = null;
+            for (page_slots) |*slot| {
+                if (slot.isEmpty()) break;
+                if (slot.matchesContext(h, ctx)) {
+                    const n: usize = @min(@as(usize, slot.cont_len), out_cont.len);
+                    @memcpy(out_cont[0..n], slot.cont_tokens[0..n]);
+                    const is_seed = ctx_len >= sam_mod.SEED_MIN_MATCH_LEN;
+                    _ = self.packs[pinned.pack_idx].stats.hits.fetchAdd(1, .monotonic);
+                    if (is_seed) {
+                        _ = self.packs[pinned.pack_idx].stats.seed_hits.fetchAdd(1, .monotonic);
+                    } else {
+                        _ = self.packs[pinned.pack_idx].stats.branch_hits.fetchAdd(1, .monotonic);
+                    }
+                    matched = .{
+                        .match_len = @intCast(ctx_len),
+                        .draft_len = @intCast(n),
+                        .hit_count = slot.hit_count,
+                        .step_prob = slot.stepProb(),
+                        .is_seed = is_seed,
+                        .cache_hit = fetched.cache_hit,
+                    };
+                    break;
+                }
+            }
+            self.releaseCacheSlotReader(fetched.slot_idx);
+            if (matched) |res| return res;
+
+            if (ctx_len == min_len) break;
+            ctx_len -= 1;
+        }
+
+        return .{
+            .match_len = 0,
+            .draft_len = 0,
+            .hit_count = 0,
+            .step_prob = 0.0,
+            .is_seed = false,
+            .cache_hit = false,
+        };
+    }
+};
+
+// ---------------------------------------------------------------------------
 // In-Zig `.ang` v1 Table Builder (for tests and synthetic benchmarks)
 // ---------------------------------------------------------------------------
 
@@ -1041,4 +2065,254 @@ test "NvmeNgramTable rejects corrupted header CRC and corrupted table CRC" {
         .cache_pages = 4,
         .verify_table_crc = false,
     }));
+}
+
+const TestMallocStatistics = extern struct {
+    blocks_in_use: c_uint,
+    size_in_use: usize,
+    max_size_in_use: usize,
+    size_allocated: usize,
+};
+
+extern "c" fn malloc_zone_statistics(zone: ?*anyopaque, stats: *TestMallocStatistics) void;
+
+fn testTmpAngPath(buf: *[256]u8, name: []const u8) ![:0]const u8 {
+    const dir_slice: []const u8 = if (std.c.getenv("TMPDIR")) |raw|
+        std.mem.sliceTo(raw, 0)
+    else
+        "/Volumes/Akari/.tmp";
+    const trimmed = std.mem.trimEnd(u8, dir_slice, "/");
+    const s = try std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/{s}", .{ trimmed, name });
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
+}
+
+test "DomainNgramRegistry multi-pack F_NOCACHE routing, default switching, async prefetch, and zero steady-state malloc" {
+    const gpa = std.testing.allocator;
+    var p_repo_buf: [256]u8 = undefined;
+    var p_docs_buf: [256]u8 = undefined;
+    const p_repo = try testTmpAngPath(&p_repo_buf, "aminfer-test-c14-repo.ang");
+    const p_docs = try testTmpAngPath(&p_docs_buf, "aminfer-test-c14-docs.ang");
+    defer _ = std.c.unlink(p_repo.ptr);
+    defer _ = std.c.unlink(p_docs.ptr);
+
+    const repo_entries = [_]BuildEntry{
+        .{ .ctx = &[_]u32{ 10, 20, 30, 40 }, .cont = &[_]u32{ 101, 102, 103, 104 }, .hit_count = 50, .step_prob = 0.94 },
+        .{ .ctx = &[_]u32{ 30, 40 }, .cont = &[_]u32{ 105, 106 }, .hit_count = 12, .step_prob = 0.60 },
+        .{ .ctx = &[_]u32{ 500, 501, 502, 503 }, .cont = &[_]u32{ 504, 505, 506 }, .hit_count = 80, .step_prob = 0.91 },
+    };
+    const docs_entries = [_]BuildEntry{
+        .{ .ctx = &[_]u32{ 10, 20, 30, 40 }, .cont = &[_]u32{ 201, 202, 203 }, .hit_count = 75, .step_prob = 0.88 },
+        .{ .ctx = &[_]u32{ 70, 80, 90, 100 }, .cont = &[_]u32{ 210, 211, 212, 213 }, .hit_count = 40, .step_prob = 0.85 },
+    };
+
+    try writeTableFile(gpa, p_repo, &repo_entries, .{
+        .num_buckets = 8,
+        .vocab_size = 4096,
+        .corpus_id = "aminfer-repo-src",
+        .include_table_crc = true,
+    });
+    try writeTableFile(gpa, p_docs, &docs_entries, .{
+        .num_buckets = 8,
+        .vocab_size = 4096,
+        .corpus_id = "docs",
+        .include_table_crc = true,
+    });
+
+    var reg = try DomainNgramRegistry.init(gpa, .{
+        .cache_pages = 8,
+        .max_inflight = 2,
+        .io_backend = .kqueue_aio,
+        .verify_table_crc = true,
+    });
+    defer reg.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 9 * page.APPLE_PAGE_SIZE), reg.totalWiredBytes());
+
+    // Register "repo" via caller alias, and "docs" defaulting to header corpus_id.
+    const idx_repo = try reg.registerPack("repo", p_repo, true);
+    const idx_docs = try reg.registerPack(null, p_docs, true);
+    try std.testing.expectEqual(@as(usize, 0), idx_repo);
+    try std.testing.expectEqual(@as(usize, 1), idx_docs);
+    try std.testing.expectEqual(@as(usize, 2), reg.packCount());
+    try std.testing.expect(reg.hasDomain("repo"));
+    try std.testing.expect(reg.hasDomain("docs"));
+    try std.testing.expect(!reg.hasDomain("unknown"));
+
+    // Duplicate domain and invalid IDs rejected explicitly.
+    try std.testing.expectError(error.DomainAlreadyExists, reg.registerPack("repo", p_repo, false));
+    try std.testing.expectError(error.InvalidDomainId, reg.registerPack("", p_repo, false));
+    try std.testing.expectError(error.DomainNotFound, reg.selectDefaultDomain("missing"));
+
+    // Default domain starts as first registered ("repo").
+    var def_buf: [MAX_DOMAIN_ID_BYTES]u8 = undefined;
+    try std.testing.expectEqualStrings("repo", reg.defaultDomainId(&def_buf));
+
+    var out: [8]u32 = undefined;
+    const q_def_repo = try reg.queryDomain(null, &[_]u32{ 10, 20, 30, 40 }, &out);
+    try std.testing.expectEqual(@as(u32, 4), q_def_repo.match_len);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 101, 102, 103, 104 }, out[0..q_def_repo.draft_len]);
+
+    // Explicit per-request routing to "docs" hits the other pack on the exact same context!
+    const q_docs = try reg.queryDomain("docs", &[_]u32{ 10, 20, 30, 40 }, &out);
+    try std.testing.expectEqual(@as(u32, 4), q_docs.match_len);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 201, 202, 203 }, out[0..q_docs.draft_len]);
+
+    // Async prefetch + query hit on "repo".
+    const pref_ok = try reg.prefetchDomain("repo", &[_]u32{ 500, 501, 502, 503 });
+    try std.testing.expect(pref_ok);
+    const q_pref = try reg.queryDomain("repo", &[_]u32{ 500, 501, 502, 503 }, &out);
+    try std.testing.expect(q_pref.cache_hit);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 504, 505, 506 }, out[0..q_pref.draft_len]);
+
+    // Switch default domain live to "docs" and query with `null`.
+    try reg.selectDefaultDomain("docs");
+    try std.testing.expectEqualStrings("docs", reg.defaultDomainId(&def_buf));
+    const q_def_docs = try reg.queryDomain(null, &[_]u32{ 10, 20, 30, 40 }, &out);
+    try std.testing.expect(q_def_docs.cache_hit);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 201, 202, 203 }, out[0..q_def_docs.draft_len]);
+
+    // Unknown explicit domain returns DomainNotFound.
+    try std.testing.expectError(error.DomainNotFound, reg.queryDomain("missing", &[_]u32{ 10, 20, 30, 40 }, &out));
+
+    // Snapshot packs metadata and stats cleanly.
+    var infos: [MAX_DOMAIN_PACKS]DomainPackInfo = undefined;
+    const n_infos = reg.snapshotPacks(&infos);
+    try std.testing.expectEqual(@as(usize, 2), n_infos);
+    try std.testing.expectEqualStrings("repo", infos[0].domainIdSlice());
+    try std.testing.expectEqualStrings("aminfer-repo-src", infos[0].corpusIdSlice());
+    try std.testing.expect(!infos[0].is_default);
+    try std.testing.expectEqual(@as(u64, 3), infos[0].total_entries);
+    try std.testing.expectEqualStrings("docs", infos[1].domainIdSlice());
+    try std.testing.expect(infos[1].is_default);
+    try std.testing.expect(infos[1].stats.hits >= 2);
+
+    // Steady-state zero-malloc verification across query, prefetch, select, snapshot.
+    var m_warm: TestMallocStatistics = std.mem.zeroes(TestMallocStatistics);
+    malloc_zone_statistics(null, &m_warm);
+    var m_before: TestMallocStatistics = std.mem.zeroes(TestMallocStatistics);
+    malloc_zone_statistics(null, &m_before);
+
+    for (0..32) |iter| {
+        const dom = if ((iter & 1) == 0) "repo" else "docs";
+        try reg.selectDefaultDomain(dom);
+        _ = try reg.queryDomain(null, &[_]u32{ 10, 20, 30, 40 }, &out);
+        _ = try reg.prefetchDomain("docs", &[_]u32{ 70, 80, 90, 100 });
+        _ = try reg.queryDomain("docs", &[_]u32{ 70, 80, 90, 100 }, &out);
+        _ = reg.snapshotPacks(&infos);
+    }
+
+    var m_after: TestMallocStatistics = std.mem.zeroes(TestMallocStatistics);
+    malloc_zone_statistics(null, &m_after);
+    try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
+    try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+}
+
+test "DomainNgramRegistry atomic hot-swap (swapDomainPack) under concurrent multi-threaded queries has zero races and zero malloc" {
+    const gpa = std.testing.allocator;
+    var p_v1_buf: [256]u8 = undefined;
+    var p_v2_buf: [256]u8 = undefined;
+    const p_v1 = try testTmpAngPath(&p_v1_buf, "aminfer-test-c14-swap-v1.ang");
+    const p_v2 = try testTmpAngPath(&p_v2_buf, "aminfer-test-c14-swap-v2.ang");
+    defer _ = std.c.unlink(p_v1.ptr);
+    defer _ = std.c.unlink(p_v2.ptr);
+
+    const v1_entries = [_]BuildEntry{
+        .{ .ctx = &[_]u32{ 1, 2, 3, 4 }, .cont = &[_]u32{ 111, 112, 113, 114 }, .hit_count = 30, .step_prob = 0.90 },
+    };
+    const v2_entries = [_]BuildEntry{
+        .{ .ctx = &[_]u32{ 1, 2, 3, 4 }, .cont = &[_]u32{ 221, 222, 223, 224 }, .hit_count = 90, .step_prob = 0.95 },
+    };
+    try writeTableFile(gpa, p_v1, &v1_entries, .{ .num_buckets = 4, .corpus_id = "hot-v1", .include_table_crc = true });
+    try writeTableFile(gpa, p_v2, &v2_entries, .{ .num_buckets = 4, .corpus_id = "hot-v2", .include_table_crc = true });
+
+    var reg = try DomainNgramRegistry.init(gpa, .{
+        .cache_pages = 4,
+        .max_inflight = 2,
+        .io_backend = .kqueue_aio,
+        .verify_table_crc = true,
+    });
+    defer reg.deinit(gpa);
+    _ = try reg.registerPack("live", p_v1, true);
+
+    // Warm up once before concurrent swap stress.
+    var warm_out: [8]u32 = undefined;
+    const warm_q = try reg.queryDomain("live", &[_]u32{ 1, 2, 3, 4 }, &warm_out);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 111, 112, 113, 114 }, warm_out[0..warm_q.draft_len]);
+
+    const ReaderState = struct {
+        reg: *DomainNgramRegistry,
+        stop: std.atomic.Value(bool) = .init(false),
+        v1_seen: std.atomic.Value(u64) = .init(0),
+        v2_seen: std.atomic.Value(u64) = .init(0),
+        errors: std.atomic.Value(u64) = .init(0),
+        bad_payloads: std.atomic.Value(u64) = .init(0),
+
+        fn run(st: *@This()) void {
+            var out: [8]u32 = undefined;
+            var iters: u64 = 0;
+            while (!st.stop.load(.acquire)) : (iters += 1) {
+                if ((iters & 7) == 0) {
+                    _ = st.reg.prefetchDomain("live", &[_]u32{ 1, 2, 3, 4 }) catch {
+                        _ = st.errors.fetchAdd(1, .monotonic);
+                        continue;
+                    };
+                }
+                const res = st.reg.queryDomain("live", &[_]u32{ 1, 2, 3, 4 }, &out) catch {
+                    _ = st.errors.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                if (res.draft_len == 4 and std.mem.eql(u32, out[0..4], &[_]u32{ 111, 112, 113, 114 })) {
+                    _ = st.v1_seen.fetchAdd(1, .monotonic);
+                } else if (res.draft_len == 4 and std.mem.eql(u32, out[0..4], &[_]u32{ 221, 222, 223, 224 })) {
+                    _ = st.v2_seen.fetchAdd(1, .monotonic);
+                } else {
+                    _ = st.bad_payloads.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    var st = ReaderState{ .reg = &reg };
+    const t1 = try std.Thread.spawn(.{}, ReaderState.run, .{&st});
+    const t2 = try std.Thread.spawn(.{}, ReaderState.run, .{&st});
+
+    var last_gen: u64 = 1;
+    for (0..16) |round| {
+        const target = if ((round & 1) == 0) p_v2 else p_v1;
+        const gen = try reg.swapDomainPack("live", target, true);
+        try std.testing.expect(gen > last_gen);
+        last_gen = gen;
+    }
+
+    st.stop.store(true, .release);
+    t1.join();
+    t2.join();
+
+    try std.testing.expectEqual(@as(u64, 0), st.errors.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), st.bad_payloads.load(.acquire));
+    try std.testing.expect(st.v1_seen.load(.acquire) > 0);
+    try std.testing.expect(st.v2_seen.load(.acquire) > 0);
+
+    // After final swap (round 15 = odd -> p_v1), swap once more to p_v2 and confirm
+    // stale v1 cache entries are immediately bypassed with zero heap allocations!
+    var m_warm: TestMallocStatistics = std.mem.zeroes(TestMallocStatistics);
+    malloc_zone_statistics(null, &m_warm);
+    var m_before: TestMallocStatistics = std.mem.zeroes(TestMallocStatistics);
+    malloc_zone_statistics(null, &m_before);
+
+    _ = try reg.swapDomainPack("live", p_v2, true);
+    const after_q = try reg.queryDomain("live", &[_]u32{ 1, 2, 3, 4 }, &warm_out);
+    try std.testing.expectEqual(@as(u32, 4), after_q.draft_len);
+    try std.testing.expect(!after_q.cache_hit);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 221, 222, 223, 224 }, warm_out[0..4]);
+
+    var m_after: TestMallocStatistics = std.mem.zeroes(TestMallocStatistics);
+    malloc_zone_statistics(null, &m_after);
+    try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
+    try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+
+    var infos: [MAX_DOMAIN_PACKS]DomainPackInfo = undefined;
+    try std.testing.expectEqual(@as(usize, 1), reg.snapshotPacks(&infos));
+    try std.testing.expectEqual(@as(u64, 17), infos[0].swaps);
+    try std.testing.expectEqualStrings("hot-v2", infos[0].corpusIdSlice());
 }

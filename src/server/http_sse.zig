@@ -14,19 +14,25 @@
 //!   SSE / JSON response emission perform zero dynamic heap allocations and zero
 //!   swallowed errors.
 //! - Stateless API contract:
-//!   - `GET /health`
+//!   - `GET /health` (includes `active_batch_size`, `mean_batch_size`, `prefix_hit_tokens`)
 //!   - `GET /v1/models`
-//!   - `POST /v1/chat/completions` (OpenAI streaming SSE & JSON, `reasoning_content`, `seed_used`)
+//!   - `GET /v1/ngram-packs` (loaded `.ang` NVMe domain packs & hit stats)
+//!   - `POST /v1/ngram-packs/select` (atomic runtime default domain switch)
+//!   - `POST /v1/chat/completions` (OpenAI streaming SSE & JSON, `reasoning_content`, `seed_used`, optional `ngram_domain`)
 //!   - `POST /v1/responses` (stateless OpenAI Responses adapter)
 //!   - `POST /v1/messages` (stateless Anthropic Messages adapter)
 
 const std = @import("std");
 const ring = @import("../runtime/ring.zig");
 const rng_mod = @import("../runtime/rng.zig");
+const batch_sched = @import("../runtime/batch_scheduler.zig");
+const ngram_nvme = @import("../spec/ngram_nvme.zig");
 const qos = @import("../platform/qos.zig");
 
 /// Apple Silicon page size for backing slab alignment.
 pub const APPLE_PAGE_SIZE: usize = 16384;
+/// Maximum byte length of a per-request `"ngram_domain"` identifier.
+pub const MAX_NGRAM_DOMAIN_BYTES: usize = ngram_nvme.MAX_DOMAIN_ID_BYTES;
 
 pub const DEFAULT_MAX_CONNS: usize = 32;
 pub const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 16;
@@ -181,6 +187,14 @@ pub const ServerConfig = struct {
     backlog: u32 = 128,
     /// Steer the kqueue network thread to `QOS_CLASS_USER_INITIATED` (`runtime-pipeline.md`).
     apply_qos: bool = true,
+    /// Maximum concurrent decode batch size in `BatchScheduler` (`0` = `min(max_active_requests, MAX_BATCH_SLOTS)`).
+    max_batch_size: usize = 0,
+    /// Chunked prefill token budget per continuous-batching iteration (`C14`).
+    max_prefill_chunk_tokens: u32 = batch_sched.DEFAULT_MAX_PREFILL_CHUNK_TOKENS,
+    /// Preallocated `u32` prompt token capacity per continuous-batching slot.
+    max_prompt_tokens: usize = batch_sched.DEFAULT_MAX_PROMPT_TOKENS,
+    /// Optional hot-swappable multi-pack `.ang` NVMe domain registry exposed on `/v1/ngram-packs*`.
+    ngram_registry: ?*ngram_nvme.DomainNgramRegistry = null,
 };
 
 /// Parses a dotted-quad IPv4 address string (e.g. `"127.0.0.1"`, `"0.0.0.0"`).
@@ -205,6 +219,13 @@ pub const ServerStats = struct {
     rejected_503_count: u64,
     cancelled_count: u64,
     wired_mib: u64,
+    active_batch_size: u32 = 0,
+    max_observed_batch_size: u32 = 0,
+    total_batch_steps: u64 = 0,
+    total_slot_tokens: u64 = 0,
+    mean_batch_size: f64 = 0.0,
+    prefix_hit_tokens: u64 = 0,
+    prefix_hit_requests: u64 = 0,
 };
 
 /// Admitted inference job handed from the `kqueue` server thread to the inference
@@ -215,7 +236,8 @@ pub const InferenceJob = struct {
     request_id: u64,
     endpoint: Endpoint,
     /// Preformatted Qwen3 ChatML prompt stored in the slot's preallocated buffer.
-    /// Valid for the entire duration of `EngineHandler.generateFn`.
+    /// Valid for the entire duration of `EngineHandler.generateFn` or until the
+    /// slot finishes in `runBatchedWorkerLoop`.
     prompt: []const u8,
     /// Dedicated 32-byte `RequestRng` (`D11`) owned by this slot for this request.
     rng: *rng_mod.RequestRng,
@@ -226,14 +248,44 @@ pub const InferenceJob = struct {
     stream: bool,
     ignore_eos: bool,
     enable_thinking: bool,
+    /// Optional per-request `.ang` domain pack ID (`""` selects active default pack).
+    ngram_domain: []const u8 = "",
 };
 
-/// Decoupled inference callback interface implemented by real `Qwen3Model` /
+/// Decoupled single-slot inference callback interface implemented by real `Qwen3Model` /
 /// `SpecEngine` runners or deterministic mock generators in tests.
 pub const EngineHandler = struct {
     ctx: *anyopaque,
     generateFn: *const fn (ctx: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void,
 };
+
+pub const InferenceBackend = EngineHandler;
+
+/// Iteration-level continuous-batching inference handler (`C14`) bridging HTTP ChatML
+/// requests and per-slot SSE `TokenStream`s with `batch_sched.BatchScheduler`.
+pub const BatchEngineHandler = struct {
+    ctx: *anyopaque,
+    /// Tokenizes `job.prompt` directly into the slot's preallocated `out_tokens` buffer,
+    /// returning the number of prompt tokens written (`>= 1`).
+    tokenizeFn: *const fn (
+        ctx: *anyopaque,
+        job: *const InferenceJob,
+        out_tokens: []u32,
+    ) batch_sched.BackendError!usize,
+    /// Detokenizes `token_id` into raw UTF-8 bytes in `out_bytes` (`0` heap allocs).
+    detokenizeFn: *const fn (
+        ctx: *anyopaque,
+        token_id: u32,
+        out_bytes: []u8,
+    ) []const u8,
+    /// Continuous-batching backend (`lookupPrefix`, `prefillSlot`, `stepDecodeBatch`, `releaseSlot`).
+    backend: batch_sched.BatchBackend,
+    /// Optional default EOS/stop token IDs for this model.
+    eos_token_ids: [batch_sched.MAX_STOP_TOKENS]u32 = @splat(0),
+    eos_token_count: u8 = 0,
+};
+
+pub const BatchInferenceBackend = BatchEngineHandler;
 
 // ---------------------------------------------------------------------------
 // Zero-allocation fixed-slice writer & JSON escaping
@@ -543,6 +595,12 @@ pub const ParsedRequest = struct {
     stream: bool,
     ignore_eos: bool,
     enable_thinking: bool,
+    ngram_domain_buf: [MAX_NGRAM_DOMAIN_BYTES]u8 = @splat(0),
+    ngram_domain_len: u8 = 0,
+
+    pub fn ngramDomainSlice(self: *const ParsedRequest) []const u8 {
+        return self.ngram_domain_buf[0..self.ngram_domain_len];
+    }
 };
 
 const JsonReader = struct {
@@ -985,6 +1043,8 @@ pub fn parseInferenceRequest(
     var stream: bool = false;
     var ignore_eos: bool = false;
     var enable_thinking: bool = true;
+    var ngram_domain_buf: [MAX_NGRAM_DOMAIN_BYTES]u8 = @splat(0);
+    var ngram_domain_len: u8 = 0;
 
     var system_slice: ?[]const u8 = null;
     var messages_slice: ?[]const u8 = null;
@@ -1109,6 +1169,17 @@ pub fn parseInferenceRequest(
                 if (!r.consumeKeyword("null")) {
                     return error.UnsupportedFeature;
                 }
+            } else if (std.mem.eql(u8, maybe_key.?, "ngram_domain")) {
+                if (r.consumeKeyword("null")) {
+                    ngram_domain_len = 0;
+                } else {
+                    const dom = r.readSmallString(&ngram_domain_buf) catch |err| switch (err) {
+                        error.BufferTooSmall => return error.InvalidFieldValue,
+                        else => return err,
+                    };
+                    if (!ngram_nvme.isValidDomainId(dom)) return error.InvalidFieldValue;
+                    ngram_domain_len = @intCast(dom.len);
+                }
             } else {
                 try r.skipValue(1);
             }
@@ -1181,7 +1252,55 @@ pub fn parseInferenceRequest(
         .stream = stream,
         .ignore_eos = ignore_eos,
         .enable_thinking = enable_thinking,
+        .ngram_domain_buf = ngram_domain_buf,
+        .ngram_domain_len = ngram_domain_len,
     };
+}
+
+/// Zero-allocation parser for `POST /v1/ngram-packs/select` (`{"domain":"<id>"}`).
+pub fn parseSelectNgramDomainRequest(
+    body: []const u8,
+    out_buf: *[MAX_NGRAM_DOMAIN_BYTES]u8,
+) ParseError![]const u8 {
+    var r = JsonReader{ .src = body };
+    try r.expectByte('{');
+    var domain_len: usize = 0;
+    var saw_domain = false;
+
+    if (r.peek() != '}') {
+        while (true) {
+            var key_buf: [64]u8 = undefined;
+            const maybe_key = try r.readKeyOrSkip(&key_buf);
+            try r.expectByte(':');
+            if (maybe_key != null and std.mem.eql(u8, maybe_key.?, "domain")) {
+                const dom = r.readSmallString(out_buf) catch |err| switch (err) {
+                    error.BufferTooSmall => return error.InvalidFieldValue,
+                    else => return err,
+                };
+                if (!ngram_nvme.isValidDomainId(dom)) return error.InvalidFieldValue;
+                domain_len = dom.len;
+                saw_domain = true;
+            } else {
+                try r.skipValue(1);
+            }
+
+            const sep = r.peek() orelse return error.InvalidJson;
+            if (sep == ',') {
+                r.pos += 1;
+            } else if (sep == '}') {
+                r.pos += 1;
+                break;
+            } else {
+                return error.InvalidJson;
+            }
+        }
+    } else {
+        r.pos += 1;
+    }
+
+    if (r.peek() != null) return error.InvalidJson;
+    if (!saw_domain) return error.MissingRequiredField;
+    return out_buf[0..domain_len];
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,6 +1605,8 @@ const ConnectionSlot = struct {
     stream: bool,
     model_buf: [MAX_MODEL_ID_BYTES]u8,
     model_len: u16,
+    ngram_domain_buf: [MAX_NGRAM_DOMAIN_BYTES]u8,
+    ngram_domain_len: u8,
     rng: rng_mod.RequestRng,
     seed_used: u64,
     seed_source: EffectiveSeedSource,
@@ -1504,6 +1625,10 @@ const ConnectionSlot = struct {
 
     fn modelSlice(self: *const ConnectionSlot) []const u8 {
         return self.model_buf[0..self.model_len];
+    }
+
+    fn ngramDomainSlice(self: *const ConnectionSlot) []const u8 {
+        return self.ngram_domain_buf[0..self.ngram_domain_len];
     }
 
     fn pendingTxLen(self: *const ConnectionSlot) usize {
@@ -1549,6 +1674,7 @@ const ConnectionSlot = struct {
         self.tx_write_pos = 0;
         self.nonstream_reasoning_len = 0;
         self.nonstream_content_len = 0;
+        self.ngram_domain_len = 0;
         self.cancelled.store(false, .release);
         self.admit_ns = 0;
         self.first_token_ns = 0;
@@ -1759,6 +1885,14 @@ pub const Server = struct {
     // Lock-free server->worker inference job queue (`C1`).
     job_ring: ring.SpscRing(InferenceJob),
 
+    // Preallocated C14 iteration-level continuous batch scheduler & slot stream state.
+    batch_scheduler: batch_sched.BatchScheduler,
+    batch_slot_conns: [batch_sched.MAX_BATCH_SLOTS]?u16,
+    batch_slot_streams: [batch_sched.MAX_BATCH_SLOTS]TokenStream,
+
+    // Optional hot-swappable multi-pack `.ang` NVMe domain registry (`0` = none).
+    ngram_registry_ptr: std.atomic.Value(usize),
+
     // Shared atomic counters & wakeup coalescing flags.
     stop_requested: std.atomic.Value(bool) align(ring.CACHE_LINE_BYTES),
     wakeup_pending: std.atomic.Value(bool) align(ring.CACHE_LINE_BYTES),
@@ -1769,6 +1903,12 @@ pub const Server = struct {
     total_requests: std.atomic.Value(u64),
     rejected_503_count: std.atomic.Value(u64),
     cancelled_count: std.atomic.Value(u64),
+    active_batch_size: std.atomic.Value(u32),
+    max_observed_batch_size: std.atomic.Value(u32),
+    total_batch_steps: std.atomic.Value(u64),
+    total_slot_tokens: std.atomic.Value(u64),
+    prefix_hit_tokens: std.atomic.Value(u64),
+    prefix_hit_requests: std.atomic.Value(u64),
     next_request_id: u64,
 
     // Optional managed threads (when started via `start` / `startNetworkThread`).
@@ -1789,6 +1929,17 @@ pub const Server = struct {
             return error.InvalidConfig;
         }
         if (config.job_ring_cap < config.max_active_requests) return error.InvalidConfig;
+
+        const eff_batch_size: usize = if (config.max_batch_size == 0)
+            @min(config.max_active_requests, batch_sched.MAX_BATCH_SLOTS)
+        else
+            config.max_batch_size;
+        if (eff_batch_size == 0 or eff_batch_size > batch_sched.MAX_BATCH_SLOTS or eff_batch_size > config.max_active_requests) {
+            return error.InvalidConfig;
+        }
+        if (config.max_prefill_chunk_tokens == 0 or config.max_prompt_tokens == 0) {
+            return error.InvalidConfig;
+        }
 
         const self = allocator.create(Server) catch return error.OutOfMemory;
         errdefer allocator.destroy(self);
@@ -1823,6 +1974,16 @@ pub const Server = struct {
         const event_cap = config.max_conns * 2 + 4;
         const events = allocator.alloc(std.c.kevent64_s, event_cap) catch return error.OutOfMemory;
         errdefer allocator.free(events);
+
+        var batch_scheduler = batch_sched.BatchScheduler.init(allocator, .{
+            .max_batch_size = eff_batch_size,
+            .max_prefill_chunk_tokens = config.max_prefill_chunk_tokens,
+            .max_prompt_tokens = config.max_prompt_tokens,
+        }) catch |err| return switch (err) {
+            error.InvalidConfig => error.InvalidConfig,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        errdefer batch_scheduler.deinit(allocator);
 
         const job_ring = ring.SpscRing(InferenceJob).init(job_ring_storage) catch return error.RingInitFailed;
 
@@ -1871,6 +2032,8 @@ pub const Server = struct {
                 .stream = false,
                 .model_buf = undefined,
                 .model_len = 0,
+                .ngram_domain_buf = @splat(0),
+                .ngram_domain_len = 0,
                 .rng = rng_mod.RequestRng.initDeterministic(0),
                 .seed_used = 0,
                 .seed_source = .greedy,
@@ -1957,6 +2120,10 @@ pub const Server = struct {
             .job_ring_storage = job_ring_storage,
             .events = events,
             .job_ring = job_ring,
+            .batch_scheduler = batch_scheduler,
+            .batch_slot_conns = @splat(null),
+            .batch_slot_streams = undefined,
+            .ngram_registry_ptr = .init(if (config.ngram_registry) |r| @intFromPtr(r) else 0),
             .stop_requested = .init(false),
             .wakeup_pending = .init(false),
             .worker_wakeup_pending = .init(false),
@@ -1966,6 +2133,12 @@ pub const Server = struct {
             .total_requests = .init(0),
             .rejected_503_count = .init(0),
             .cancelled_count = .init(0),
+            .active_batch_size = .init(0),
+            .max_observed_batch_size = .init(0),
+            .total_batch_steps = .init(0),
+            .total_slot_tokens = .init(0),
+            .prefix_hit_tokens = .init(0),
+            .prefix_hit_requests = .init(0),
             .next_request_id = 1,
             .net_thread = null,
             .worker_thread = null,
@@ -1997,6 +2170,7 @@ pub const Server = struct {
             self.worker_kq_fd = -1;
         }
 
+        self.batch_scheduler.deinit(allocator);
         allocator.free(self.events);
         allocator.free(self.job_ring_storage);
         allocator.free(self.token_ring_storage);
@@ -2017,7 +2191,23 @@ pub const Server = struct {
         self.wired_mib.store(mib, .release);
     }
 
+    pub fn setNgramRegistry(self: *Server, registry: ?*ngram_nvme.DomainNgramRegistry) void {
+        self.ngram_registry_ptr.store(if (registry) |r| @intFromPtr(r) else 0, .release);
+    }
+
+    pub fn ngramRegistry(self: *const Server) ?*ngram_nvme.DomainNgramRegistry {
+        const ptr_val = self.ngram_registry_ptr.load(.acquire);
+        if (ptr_val == 0) return null;
+        return @ptrFromInt(ptr_val);
+    }
+
     pub fn stats(self: *const Server) ServerStats {
+        const steps = self.total_batch_steps.load(.acquire);
+        const slot_tokens = self.total_slot_tokens.load(.acquire);
+        const mean_bs: f64 = if (steps == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(slot_tokens)) / @as(f64, @floatFromInt(steps));
         return .{
             .active_conns = self.active_conns.load(.acquire),
             .active_requests = self.active_requests.load(.acquire),
@@ -2025,6 +2215,13 @@ pub const Server = struct {
             .rejected_503_count = self.rejected_503_count.load(.acquire),
             .cancelled_count = self.cancelled_count.load(.acquire),
             .wired_mib = self.wired_mib.load(.acquire),
+            .active_batch_size = self.active_batch_size.load(.acquire),
+            .max_observed_batch_size = self.max_observed_batch_size.load(.acquire),
+            .total_batch_steps = steps,
+            .total_slot_tokens = slot_tokens,
+            .mean_batch_size = mean_bs,
+            .prefix_hit_tokens = self.prefix_hit_tokens.load(.acquire),
+            .prefix_hit_requests = self.prefix_hit_requests.load(.acquire),
         };
     }
 
@@ -2063,7 +2260,7 @@ pub const Server = struct {
     }
 
     /// Spawns both the `kqueue` network thread (`QOS_CLASS_USER_INITIATED`) and
-    /// an inference worker thread executing `handler`.
+    /// an inference worker thread executing single-slot `handler`.
     pub fn start(self: *Server, handler: EngineHandler) Error!void {
         if (self.net_thread != null or self.worker_thread != null) return error.AlreadyStarted;
         try self.startNetworkThread();
@@ -2085,6 +2282,30 @@ pub const Server = struct {
         };
     }
 
+    /// Spawns both the `kqueue` network thread (`QOS_CLASS_USER_INITIATED`) and
+    /// a `C14` iteration-level continuous-batching worker thread executing up to
+    /// `max_batch_size` concurrent requests simultaneously via `BatchScheduler`.
+    pub fn startBatched(self: *Server, handler: BatchEngineHandler) Error!void {
+        if (self.net_thread != null or self.worker_thread != null) return error.AlreadyStarted;
+        try self.startNetworkThread();
+        errdefer {
+            self.requestStop();
+            if (self.net_thread) |t| {
+                t.join();
+                self.net_thread = null;
+            }
+        }
+
+        const BatchWorkerRunner = struct {
+            fn entry(s: *Server, h: BatchEngineHandler) void {
+                s.runBatchedWorkerLoop(h);
+            }
+        };
+        self.worker_thread = std.Thread.spawn(.{}, BatchWorkerRunner.entry, .{ self, handler }) catch {
+            return error.ThreadSpawnFailed;
+        };
+    }
+
     /// Requests shutdown and joins any managed worker & network threads.
     pub fn stop(self: *Server) void {
         if (self.net_thread == null and self.worker_thread == null) {
@@ -2102,9 +2323,20 @@ pub const Server = struct {
         }
     }
 
-    /// Inference worker loop: blocks with 0% idle CPU in `worker_kq_fd`
-    /// (`EVFILT_USER`), drains admitted `InferenceJob`s from the lock-free
-    /// `job_ring`, and executes `handler.generateFn` with zero heap allocation.
+    fn publishBatchTelemetry(self: *Server) void {
+        const tel = self.batch_scheduler.telemetry();
+        self.active_batch_size.store(tel.active_batch_size, .release);
+        self.max_observed_batch_size.store(tel.max_observed_batch_size, .release);
+        self.total_batch_steps.store(tel.total_batch_steps, .release);
+        self.total_slot_tokens.store(tel.total_slot_tokens, .release);
+        self.prefix_hit_tokens.store(tel.prefix_hit_tokens, .release);
+        self.prefix_hit_requests.store(tel.prefix_hit_requests, .release);
+    }
+
+    /// Single-slot inference worker loop (backward compatible with M5 `EngineHandler`):
+    /// blocks with 0% idle CPU in `worker_kq_fd` (`EVFILT_USER`), drains admitted
+    /// `InferenceJob`s from the lock-free `job_ring`, and executes `handler.generateFn`
+    /// with zero heap allocation.
     pub fn runWorkerLoop(self: *Server, handler: EngineHandler) void {
         var empty_changes: [1]std.c.kevent64_s = .{std.mem.zeroes(std.c.kevent64_s)};
         var ev_out: [4]std.c.kevent64_s = undefined;
@@ -2117,6 +2349,7 @@ pub const Server = struct {
             while (self.job_ring.tryPop()) |job| {
                 const slot = &self.slots[job.slot_index];
                 if (!self.stop_requested.load(.acquire) and !slot.cancelled.load(.acquire)) {
+                    self.active_batch_size.store(1, .release);
                     var stream = TokenStream{
                         .server = self,
                         .slot = slot,
@@ -2126,6 +2359,7 @@ pub const Server = struct {
                     if (!stream.finished and !stream.isCancelled()) {
                         stream.finish(.stop, stream.prompt_tokens);
                     }
+                    self.active_batch_size.store(0, .release);
                 }
                 // Release worker ownership of the slot and wake kqueue so cancelled
                 // slots recycle immediately.
@@ -2133,6 +2367,187 @@ pub const Server = struct {
                 self.wakeNetworkLoop();
             }
 
+            if (self.stop_requested.load(.acquire)) return;
+
+            var timeout = nsToTimespec(50 * std.time.ns_per_ms);
+            const rc = std.c.kevent64(
+                self.worker_kq_fd,
+                &empty_changes,
+                0,
+                &ev_out,
+                @intCast(ev_out.len),
+                std.c.KEVENT.FLAG.NONE,
+                &timeout,
+            );
+            if (rc < 0 and std.c.errno(rc) != .INTR) return;
+        }
+    }
+
+    /// `C14` iteration-level continuous-batching worker loop:
+    /// drains admitted `InferenceJob`s into preallocated `BatchScheduler` slots,
+    /// executes fair chunked prefill (`max_prefill_chunk_tokens` + `R8` prefix skip)
+    /// and batched `M = B` decode steps advancing all `B` active requests together
+    /// per iteration, interleaving SSE chunks to all open client sockets via `kqueue`
+    /// `EVFILT_USER` + `EVFILT_WRITE` with zero steady-state heap allocations.
+    pub fn runBatchedWorkerLoop(self: *Server, handler: BatchEngineHandler) void {
+        var empty_changes: [1]std.c.kevent64_s = .{std.mem.zeroes(std.c.kevent64_s)};
+        var ev_out: [4]std.c.kevent64_s = undefined;
+
+        for (0..batch_sched.MAX_BATCH_SLOTS) |i| {
+            self.batch_slot_conns[i] = null;
+        }
+
+        const BatchObserverCtx = struct {
+            server: *Server,
+            handler: *const BatchEngineHandler,
+
+            fn onPrefillDone(ctx_ptr: *anyopaque, slot_id: u16, _: u64, prompt_tokens: u32, _: u32) bool {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                return ctx.server.batch_slot_streams[slot_id].setPromptTokens(prompt_tokens);
+            }
+
+            fn onToken(ctx_ptr: *anyopaque, slot_id: u16, _: u64, token_id: u32, _: u32) bool {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                var tok_buf: [MAX_CHUNK_TEXT_BYTES]u8 = undefined;
+                const bytes = ctx.handler.detokenizeFn(ctx.handler.ctx, token_id, &tok_buf);
+                return ctx.server.batch_slot_streams[slot_id].emitTokenBytes(bytes);
+            }
+
+            fn onFinish(
+                ctx_ptr: *anyopaque,
+                slot_id: u16,
+                _: u64,
+                reason: batch_sched.FinishReason,
+                prompt_tokens: u32,
+                _: u32,
+            ) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                const stream = &ctx.server.batch_slot_streams[slot_id];
+                const mapped_reason: FinishReason = switch (reason) {
+                    .stop, .none => .stop,
+                    .length => .length,
+                    .cancelled => .cancelled,
+                    .err => .err,
+                };
+                if (mapped_reason != .cancelled and !stream.finished and !stream.isCancelled()) {
+                    stream.finish(mapped_reason, prompt_tokens);
+                }
+                if (ctx.server.batch_slot_conns[slot_id]) |conn_idx| {
+                    ctx.server.batch_slot_conns[slot_id] = null;
+                    ctx.server.slots[conn_idx].worker_active.store(false, .release);
+                    ctx.server.wakeNetworkLoop();
+                }
+            }
+
+            fn onError(ctx_ptr: *anyopaque, slot_id: u16, _: u64, _: batch_sched.BackendError) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                const stream = &ctx.server.batch_slot_streams[slot_id];
+                if (!stream.finished and !stream.isCancelled()) {
+                    stream.fail("batched inference step failed");
+                }
+                if (ctx.server.batch_slot_conns[slot_id]) |conn_idx| {
+                    ctx.server.batch_slot_conns[slot_id] = null;
+                    ctx.server.slots[conn_idx].worker_active.store(false, .release);
+                    ctx.server.wakeNetworkLoop();
+                }
+            }
+        };
+
+        var obs_ctx = BatchObserverCtx{
+            .server = self,
+            .handler = &handler,
+        };
+        const observer = batch_sched.StepObserver{
+            .ctx = &obs_ctx,
+            .onPrefillDoneFn = BatchObserverCtx.onPrefillDone,
+            .onTokenFn = BatchObserverCtx.onToken,
+            .onFinishFn = BatchObserverCtx.onFinish,
+            .onErrorFn = BatchObserverCtx.onError,
+        };
+
+        const max_b = self.batch_scheduler.maxBatchSize();
+
+        while (true) {
+            self.worker_wakeup_pending.store(false, .seq_cst);
+
+            // 1. Cancel any active batch slots whose TCP client disconnected or on shutdown.
+            const stopping = self.stop_requested.load(.acquire);
+            for (0..max_b) |i| {
+                const conn_idx = self.batch_slot_conns[i] orelse continue;
+                const conn = &self.slots[conn_idx];
+                if (stopping or conn.cancelled.load(.acquire)) {
+                    _ = self.batch_scheduler.cancelSlot(@intCast(i), handler.backend, observer);
+                    if (self.batch_slot_conns[i] != null) {
+                        self.batch_slot_conns[i] = null;
+                        conn.worker_active.store(false, .release);
+                        self.wakeNetworkLoop();
+                    }
+                }
+            }
+
+            // 2. Drain newly admitted jobs into all available preallocated batch slots.
+            while (self.batch_scheduler.findFreeSlot()) |free_bsid| {
+                const job = self.job_ring.tryPop() orelse break;
+                const conn = &self.slots[job.slot_index];
+                if (self.stop_requested.load(.acquire) or conn.cancelled.load(.acquire)) {
+                    conn.worker_active.store(false, .release);
+                    self.wakeNetworkLoop();
+                    continue;
+                }
+
+                self.batch_slot_streams[free_bsid] = .{
+                    .server = self,
+                    .slot = conn,
+                    .generation = job.generation,
+                };
+
+                const prompt_buf = self.batch_scheduler.slotPromptBuffer(free_bsid);
+                const prompt_len = handler.tokenizeFn(handler.ctx, &job, prompt_buf) catch {
+                    self.batch_slot_streams[free_bsid].fail("prompt tokenization failed");
+                    conn.worker_active.store(false, .release);
+                    self.wakeNetworkLoop();
+                    continue;
+                };
+
+                self.batch_scheduler.enqueueInPlace(free_bsid, prompt_len, .{
+                    .request_id = job.request_id,
+                    .user_tag = job.slot_index,
+                    .max_tokens = job.max_tokens,
+                    .temperature = job.temperature,
+                    .external_rng = job.rng,
+                    .ignore_eos = job.ignore_eos,
+                    .eos_token_ids = handler.eos_token_ids[0..handler.eos_token_count],
+                    .ngram_domain = job.ngram_domain,
+                }) catch {
+                    self.batch_slot_streams[free_bsid].fail("failed to enqueue batch slot");
+                    conn.worker_active.store(false, .release);
+                    self.wakeNetworkLoop();
+                    continue;
+                };
+
+                self.batch_slot_conns[free_bsid] = job.slot_index;
+            }
+
+            // 3. On shutdown, release any remaining queued jobs cleanly before returning.
+            if (self.stop_requested.load(.acquire)) {
+                while (self.job_ring.tryPop()) |job| {
+                    self.slots[job.slot_index].worker_active.store(false, .release);
+                    self.wakeNetworkLoop();
+                }
+                self.publishBatchTelemetry();
+                return;
+            }
+
+            // 4. Advance all active slots together in ONE iteration-level batch step!
+            if (self.batch_scheduler.activeSlotCount() > 0) {
+                self.publishBatchTelemetry();
+                _ = self.batch_scheduler.step(handler.backend, observer);
+                self.publishBatchTelemetry();
+                continue;
+            }
+
+            // 5. Idle: publish 0 active batch size and wait with 0% CPU in `worker_kq_fd`.
+            self.publishBatchTelemetry();
             if (self.stop_requested.load(.acquire)) return;
 
             var timeout = nsToTimespec(50 * std.time.ns_per_ms);
@@ -2343,6 +2758,7 @@ pub const Server = struct {
         if (slot.worker_active.load(.acquire)) {
             slot.cancelled.store(true, .release);
             slot.state = .waiting_worker_cancel;
+            self.wakeWorkerLoop();
             return;
         }
 
@@ -2522,6 +2938,22 @@ pub const Server = struct {
             self.handleModels(slot);
             return;
         }
+        if (std.mem.eql(u8, hdr.path, "/v1/ngram-packs")) {
+            if (hdr.method != .get) {
+                self.sendErrorResponse(slot, 405, "Method Not Allowed", "GET", "method not allowed", "invalid_request_error", "method_not_allowed");
+                return;
+            }
+            self.handleNgramPacks(slot);
+            return;
+        }
+        if (std.mem.eql(u8, hdr.path, "/v1/ngram-packs/select")) {
+            if (hdr.method != .post) {
+                self.sendErrorResponse(slot, 405, "Method Not Allowed", "POST", "method not allowed", "invalid_request_error", "method_not_allowed");
+                return;
+            }
+            self.handleNgramPacksSelect(slot, body);
+            return;
+        }
 
         const endpoint: Endpoint = if (std.mem.eql(u8, hdr.path, "/v1/chat/completions"))
             .chat_completions
@@ -2629,6 +3061,12 @@ pub const Server = struct {
     fn handleHealth(self: *Server, slot: *ConnectionSlot) void {
         var body_buf: [512]u8 = undefined;
         var w = FixedWriter.init(&body_buf);
+        const steps = self.total_batch_steps.load(.acquire);
+        const slot_tokens = self.total_slot_tokens.load(.acquire);
+        const mean_bs: f64 = if (steps == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(slot_tokens)) / @as(f64, @floatFromInt(steps));
         w.writeAll("{\"status\":\"ok\",\"model\":\"") catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -2637,10 +3075,169 @@ pub const Server = struct {
             self.closeSlotSocketAndRelease(slot, false);
             return;
         };
-        w.print("\",\"wired_mib\":{d},\"active_requests\":{d}}}", .{
-            self.wired_mib.load(.acquire),
-            self.active_requests.load(.acquire),
+        w.print(
+            "\",\"wired_mib\":{d},\"active_requests\":{d},\"active_batch_size\":{d},\"mean_batch_size\":{d:.2},\"prefix_hit_tokens\":{d}}}",
+            .{
+                self.wired_mib.load(.acquire),
+                self.active_requests.load(.acquire),
+                self.active_batch_size.load(.acquire),
+                mean_bs,
+                self.prefix_hit_tokens.load(.acquire),
+            },
+        ) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        self.sendJsonResponse(slot, 200, "OK", null, null, null, w.written());
+    }
+
+    fn handleNgramPacks(self: *Server, slot: *ConnectionSlot) void {
+        var body_buf: [4096]u8 = undefined;
+        var w = FixedWriter.init(&body_buf);
+        const reg = self.ngramRegistry() orelse {
+            w.writeAll("{\"object\":\"list\",\"default_domain\":null,\"pack_count\":0,\"cache_pages\":0,\"wired_bytes\":0,\"data\":[]}") catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            self.sendJsonResponse(slot, 200, "OK", null, null, null, w.written());
+            return;
+        };
+
+        var infos: [ngram_nvme.MAX_DOMAIN_PACKS]ngram_nvme.DomainPackInfo = undefined;
+        const count = reg.snapshotPacks(&infos);
+        var def_buf: [MAX_NGRAM_DOMAIN_BYTES]u8 = undefined;
+        const def_dom = reg.defaultDomainId(&def_buf);
+
+        w.writeAll("{\"object\":\"list\",\"default_domain\":") catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        if (def_dom.len == 0) {
+            w.writeAll("null") catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+        } else {
+            w.writeByte('"') catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            w.writeJsonEscaped(def_dom) catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            w.writeByte('"') catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+        }
+        w.print(",\"pack_count\":{d},\"cache_pages\":{d},\"wired_bytes\":{d},\"data\":[", .{
+            count,
+            reg.cachePageCount(),
+            reg.totalWiredBytes(),
         }) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+
+        for (infos[0..count], 0..) |*info, idx| {
+            if (idx > 0) {
+                w.writeByte(',') catch {
+                    self.closeSlotSocketAndRelease(slot, false);
+                    return;
+                };
+            }
+            w.writeAll("{\"domain\":\"") catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            w.writeJsonEscaped(info.domainIdSlice()) catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            w.writeAll("\",\"corpus_id\":\"") catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            w.writeJsonEscaped(info.corpusIdSlice()) catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+            w.print(
+                "\",\"is_default\":{s},\"entries\":{d},\"buckets\":{d},\"min_ngram\":{d},\"max_ngram\":{d},\"generation\":{d},\"swaps\":{d},\"stats\":{{\"queries\":{d},\"hits\":{d},\"seed_hits\":{d},\"branch_hits\":{d},\"cache_hits\":{d},\"prefetch_submitted\":{d},\"prefetch_hits\":{d},\"nvme_reads\":{d},\"hit_rate\":{d:.4}}}}}",
+                .{
+                    if (info.is_default) "true" else "false",
+                    info.total_entries,
+                    info.num_buckets,
+                    info.min_ngram,
+                    info.max_ngram,
+                    info.generation,
+                    info.swaps,
+                    info.stats.queries,
+                    info.stats.hits,
+                    info.stats.seed_hits,
+                    info.stats.branch_hits,
+                    info.stats.cache_hits,
+                    info.stats.prefetch_submitted,
+                    info.stats.prefetch_hits,
+                    info.stats.nvme_reads,
+                    info.stats.hitRate(),
+                },
+            ) catch {
+                self.closeSlotSocketAndRelease(slot, false);
+                return;
+            };
+        }
+
+        w.writeAll("]}") catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        self.sendJsonResponse(slot, 200, "OK", null, null, null, w.written());
+    }
+
+    fn handleNgramPacksSelect(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
+        var dom_buf: [MAX_NGRAM_DOMAIN_BYTES]u8 = undefined;
+        const domain = parseSelectNgramDomainRequest(body, &dom_buf) catch |err| {
+            const msg = switch (err) {
+                error.InvalidJson => "invalid JSON request body",
+                error.MissingRequiredField => "missing required field 'domain'",
+                error.InvalidFieldValue => "invalid 'domain' value",
+                error.BufferTooSmall => "domain identifier too long",
+                error.DepthExceeded => "JSON nesting depth exceeded",
+                error.UnsupportedFeature => "unsupported request feature",
+            };
+            self.sendErrorResponse(slot, 400, "Bad Request", null, msg, "invalid_request_error", "bad_request");
+            return;
+        };
+
+        const reg = self.ngramRegistry() orelse {
+            self.sendErrorResponse(slot, 404, "Not Found", null, "no ngram pack registry configured", "invalid_request_error", "ngram_registry_unavailable");
+            return;
+        };
+
+        reg.selectDefaultDomain(domain) catch |err| switch (err) {
+            error.InvalidDomainId => {
+                self.sendErrorResponse(slot, 400, "Bad Request", null, "invalid domain identifier", "invalid_request_error", "invalid_domain");
+                return;
+            },
+            error.DomainNotFound => {
+                self.sendErrorResponse(slot, 404, "Not Found", null, "domain pack not found", "invalid_request_error", "domain_not_found");
+                return;
+            },
+        };
+
+        var resp_buf: [256]u8 = undefined;
+        var w = FixedWriter.init(&resp_buf);
+        w.writeAll("{\"status\":\"ok\",\"default_domain\":\"") catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        w.writeJsonEscaped(domain) catch {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        };
+        w.writeAll("\"}") catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
         };
@@ -2689,6 +3286,24 @@ pub const Server = struct {
             return;
         };
 
+        // Validate requested `"ngram_domain"` against attached DomainNgramRegistry when present.
+        if (parsed.ngram_domain_len > 0) {
+            if (self.ngramRegistry()) |reg| {
+                if (!reg.hasDomain(parsed.ngramDomainSlice())) {
+                    self.sendErrorResponse(
+                        slot,
+                        400,
+                        "Bad Request",
+                        null,
+                        "unknown ngram_domain",
+                        "invalid_request_error",
+                        "domain_not_found",
+                    );
+                    return;
+                }
+            }
+        }
+
         // Graceful 503 backpressure when all active inference slots or job ring entries are busy.
         const current_active = self.active_requests.load(.acquire);
         if (current_active >= self.config.max_active_requests or self.job_ring.isFull()) {
@@ -2732,6 +3347,8 @@ pub const Server = struct {
         slot.endpoint = endpoint;
         slot.stream = parsed.stream;
         slot.model_len = parsed.model_len;
+        slot.ngram_domain_buf = parsed.ngram_domain_buf;
+        slot.ngram_domain_len = parsed.ngram_domain_len;
         slot.admit_ns = monotonicNowNs();
         slot.first_token_ns = 0;
         slot.created_unix = unixTimestampSec();
@@ -2790,6 +3407,7 @@ pub const Server = struct {
             .stream = parsed.stream,
             .ignore_eos = parsed.ignore_eos,
             .enable_thinking = parsed.enable_thinking,
+            .ngram_domain = slot.ngramDomainSlice(),
         };
 
         if (!self.job_ring.tryPush(job)) {
@@ -3768,7 +4386,7 @@ test "loopback GET /health, GET /v1/models, error statuses (400/404/405), and ch
         const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
         try expectValidJson(body);
         try std.testing.expectEqualStrings(
-            "{\"status\":\"ok\",\"model\":\"qwen3-test-0.6b\",\"wired_mib\":1234,\"active_requests\":0}",
+            "{\"status\":\"ok\",\"model\":\"qwen3-test-0.6b\",\"wired_mib\":1234,\"active_requests\":0,\"active_batch_size\":0,\"mean_batch_size\":0.00,\"prefix_hit_tokens\":0}",
             body,
         );
     }
@@ -4566,4 +5184,656 @@ test "parseIpv4, QoS USER_INITIATED startup, finish_reason length, and connectio
     try std.testing.expect(std.mem.startsWith(u8, overflow_resp, "HTTP/1.1 503 Service Unavailable\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, overflow_resp, "server_overloaded") != null);
     try std.testing.expect(srv.stats().rejected_503_count >= 1);
+}
+
+fn testTmpAngPathServer(buf: *[256]u8, name: []const u8) ![:0]const u8 {
+    const dir_slice: []const u8 = if (std.c.getenv("TMPDIR")) |raw|
+        std.mem.sliceTo(raw, 0)
+    else
+        "/Volumes/Akari/.tmp";
+    const trimmed = std.mem.trimEnd(u8, dir_slice, "/");
+    const s = try std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/{s}", .{ trimmed, name });
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
+}
+
+/// Extracts concatenated `delta.content` strings from an OpenAI SSE response into `out`.
+fn extractOpenAiSseContent(sse: []const u8, out: []u8) []const u8 {
+    var pos: usize = 0;
+    var lines = std.mem.splitScalar(u8, sse, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (!std.mem.startsWith(u8, line, "data: ")) continue;
+        const payload = line[6..];
+        if (std.mem.eql(u8, payload, "[DONE]")) continue;
+        const needle = "\"content\":\"";
+        const idx = std.mem.indexOf(u8, payload, needle) orelse continue;
+        const start = idx + needle.len;
+        const end = std.mem.indexOfScalarPos(u8, payload, start, '"') orelse continue;
+        const chunk = payload[start..end];
+        if (pos + chunk.len <= out.len) {
+            @memcpy(out[pos .. pos + chunk.len], chunk);
+            pos += chunk.len;
+        }
+    }
+    return out[0..pos];
+}
+
+test "C14 8 concurrent batched SSE clients: M>=4..8, interleaved delivery, p50/p99 TTFT << serial, D11 seed parity, disconnect cleanup, and zero steady-state malloc" {
+    const gpa = std.testing.allocator;
+
+    const BatchMock = struct {
+        step_delay_ns: u64 = 2 * std.time.ns_per_ms,
+        prefix_hit_len: u32 = 8,
+        released_count: std.atomic.Value(u32) = .init(0),
+        unpinned_count: std.atomic.Value(u32) = .init(0),
+        pinned_handles: [batch_sched.MAX_BATCH_SLOTS]u64 = @splat(0),
+        next_handle: u64 = 1,
+
+        fn tokenize(_: *anyopaque, job: *const InferenceJob, out_tokens: []u32) batch_sched.BackendError!usize {
+            const n = @min(@max(job.prompt.len / 4, 12), out_tokens.len);
+            for (0..n) |i| {
+                out_tokens[i] = if (i == 0 and std.mem.indexOf(u8, job.prompt, "SHARED_SYS") != null)
+                    7777
+                else
+                    @intCast((job.prompt[i % job.prompt.len]) + 1);
+            }
+            return n;
+        }
+
+        fn detokenize(_: *anyopaque, tok: u32, out_bytes: []u8) []const u8 {
+            const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+            const c = alphabet[tok % alphabet.len];
+            out_bytes[0] = c;
+            return out_bytes[0..1];
+        }
+
+        fn lookupPrefix(ctx_ptr: *anyopaque, slot_id: u16, prompt_tokens: []const u32) batch_sched.PrefixLookupResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            if (prompt_tokens.len > self.prefix_hit_len and prompt_tokens[0] == 7777) {
+                const h = self.next_handle;
+                self.next_handle += 1;
+                self.pinned_handles[slot_id] = h;
+                return .{ .matched_tokens = self.prefix_hit_len, .prefix_handle = h };
+            }
+            return .{};
+        }
+
+        fn sampleToken(rng_ptr: *rng_mod.RequestRng, temp: f32, pos: u32, prev: u32) u32 {
+            if (temp > 0.0) {
+                return @intCast((rng_ptr.nextU64() ^ (@as(u64, pos) *% 131) ^ prev) % 36);
+            }
+            return (pos * 7 + prev) % 36;
+        }
+
+        fn prefillSlot(ctx_ptr: *anyopaque, chunk: *const batch_sched.PrefillChunkView) batch_sched.BackendError!batch_sched.PrefillResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            if (!chunk.is_final_chunk) return .{};
+            if (self.step_delay_ns > 0) sleepNs(self.step_delay_ns / 4);
+            const tok = sampleToken(chunk.rng, chunk.temperature, chunk.total_prompt_len, chunk.tokens[chunk.tokens.len - 1]);
+            return .{ .first_token = tok };
+        }
+
+        fn stepDecodeBatch(ctx_ptr: *anyopaque, view: *const batch_sched.BatchStepView, out: []u32) batch_sched.BackendError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            if (self.step_delay_ns > 0) sleepNs(self.step_delay_ns);
+            for (0..view.batchSize()) |b| {
+                out[b] = sampleToken(view.rngs[b], view.temperatures[b], view.seq_positions[b], view.input_tokens[b]);
+            }
+        }
+
+        fn releaseSlot(ctx_ptr: *anyopaque, slot_id: u16, prefix_handle: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            _ = self.released_count.fetchAdd(1, .acq_rel);
+            if (prefix_handle != 0) {
+                std.debug.assert(self.pinned_handles[slot_id] == prefix_handle);
+                self.pinned_handles[slot_id] = 0;
+                _ = self.unpinned_count.fetchAdd(1, .acq_rel);
+            }
+        }
+
+        fn batchHandler(self: *@This()) BatchEngineHandler {
+            return .{
+                .ctx = self,
+                .tokenizeFn = tokenize,
+                .detokenizeFn = detokenize,
+                .backend = .{
+                    .ctx = self,
+                    .lookupPrefixFn = lookupPrefix,
+                    .prefillSlotFn = prefillSlot,
+                    .stepDecodeBatchFn = stepDecodeBatch,
+                    .releaseSlotFn = releaseSlot,
+                },
+            };
+        }
+
+        // Matching single-slot serial generator with identical per-token delay for TTFT comparison.
+        fn serialGenerate(ctx_ptr: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            _ = stream.setPromptTokens(12);
+            if (self.step_delay_ns > 0) sleepNs(self.step_delay_ns / 4);
+            for (0..job.max_tokens) |step_i| {
+                if (stream.isCancelled()) return;
+                if (step_i > 0 and self.step_delay_ns > 0) sleepNs(self.step_delay_ns);
+                var b: [1]u8 = .{'a'};
+                if (!stream.emitTokenBytes(&b)) return;
+            }
+            stream.finish(.length, 12);
+        }
+    };
+
+    const ClientJob = struct {
+        port: u16,
+        path: []const u8,
+        body: []const u8,
+        resp_buf: [16384]u8 = undefined,
+        resp_len: usize = 0,
+        ttft_ns: u64 = 0,
+        ok: bool = false,
+
+        fn run(c: *@This()) void {
+            var req_buf: [1024]u8 = undefined;
+            const req = std.fmt.bufPrint(
+                &req_buf,
+                "POST {s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ c.path, c.body.len, c.body },
+            ) catch return;
+            const t0 = monotonicNowNs();
+            const fd = testConnectLoopback(c.port) catch return;
+            defer _ = std.c.close(fd);
+            testSendAll(fd, req) catch return;
+
+            var total: usize = 0;
+            var saw_data = false;
+            while (total < c.resp_buf.len) {
+                const n = std.c.recv(fd, &c.resp_buf[total], c.resp_buf.len - total, 0);
+                if (n > 0) {
+                    total += @intCast(n);
+                    if (!saw_data and std.mem.indexOf(u8, c.resp_buf[0..total], "data: ") != null) {
+                        c.ttft_ns = monotonicNowNs() -| t0;
+                        saw_data = true;
+                    }
+                } else if (n == 0) {
+                    break;
+                } else {
+                    if (std.c.errno(n) == .INTR) continue;
+                    return;
+                }
+            }
+            c.resp_len = total;
+            c.ok = saw_data and total > 0;
+        }
+    };
+
+    // 1. Measure 8-client serial queueing TTFT baseline (`start(EngineHandler)`).
+    var serial_mock = BatchMock{ .step_delay_ns = 2 * std.time.ns_per_ms };
+    const serial_srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "c14-serial",
+        .max_conns = 16,
+        .max_active_requests = 16,
+        .apply_qos = false,
+    });
+    defer serial_srv.deinit(gpa);
+    try serial_srv.start(.{ .ctx = &serial_mock, .generateFn = BatchMock.serialGenerate });
+    defer serial_srv.stop();
+
+    var serial_clients: [8]ClientJob = undefined;
+    var serial_threads: [8]std.Thread = undefined;
+    const serial_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"stream\":true,\"max_tokens\":12,\"temperature\":0.0}";
+    for (&serial_clients, 0..) |*c, i| {
+        c.* = .{ .port = serial_srv.boundPort(), .path = "/v1/chat/completions", .body = serial_body };
+        serial_threads[i] = try std.Thread.spawn(.{}, ClientJob.run, .{c});
+    }
+    for (&serial_threads) |t| t.join();
+    var serial_ttfts: [8]u64 = undefined;
+    for (serial_clients, 0..) |c, i| {
+        try std.testing.expect(c.ok);
+        serial_ttfts[i] = c.ttft_ns;
+    }
+    std.mem.sort(u64, &serial_ttfts, {}, std.sort.asc(u64));
+    const serial_p50 = serial_ttfts[4];
+    const serial_p99 = serial_ttfts[7];
+
+    // 2. Now run the continuous-batching server (`startBatched`)!
+    var batch_mock = BatchMock{ .step_delay_ns = 2 * std.time.ns_per_ms };
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "c14-batched",
+        .max_conns = 16,
+        .max_active_requests = 16,
+        .max_batch_size = 8,
+        .max_prefill_chunk_tokens = 512,
+        .max_prompt_tokens = 256,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.startBatched(batch_mock.batchHandler());
+    defer srv.stop();
+
+    const port = srv.boundPort();
+
+    // 2a. Solo reference run with explicit D11 seed (`B = 1`).
+    var solo_req_buf: [1024]u8 = undefined;
+    var solo_resp_buf: [16384]u8 = undefined;
+    const seeded_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"SHARED_SYS deterministic replay\"}],\"stream\":true,\"max_tokens\":12,\"temperature\":0.8,\"seed\":123456789012345}";
+    const solo_resp = try testHttpPostJson(port, "/v1/chat/completions", seeded_body, &solo_req_buf, &solo_resp_buf);
+    try std.testing.expect(std.mem.startsWith(u8, solo_resp, "HTTP/1.1 200 OK\r\n"));
+    _ = try expectValidSseJsonFrames(extractHttpBody(solo_resp) orelse return error.TestUnexpectedResult);
+    var solo_text_buf: [128]u8 = undefined;
+    const solo_text = extractOpenAiSseContent(extractHttpBody(solo_resp).?, &solo_text_buf);
+    try std.testing.expectEqual(@as(usize, 12), solo_text.len);
+
+    // 2b. Launch 8 simultaneous SSE clients (including /v1/chat/completions, /v1/responses,
+    //     /v1/messages, shared prefix hits, and two identical explicit-seed requests!).
+    const body_trng = "{\"messages\":[{\"role\":\"user\",\"content\":\"SHARED_SYS concurrent batch\"}],\"stream\":true,\"max_tokens\":12,\"temperature\":0.8}";
+    const body_resp_ep = "{\"input\":\"SHARED_SYS responses stream\",\"stream\":true,\"max_tokens\":12,\"temperature\":0.7}";
+    const body_msg_ep = "{\"messages\":[{\"role\":\"user\",\"content\":\"SHARED_SYS messages stream\"}],\"stream\":true,\"max_tokens\":12,\"temperature\":0.7}";
+
+    var clients: [8]ClientJob = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&clients, 0..) |*c, i| {
+        if (i == 0 or i == 4) {
+            c.* = .{ .port = port, .path = "/v1/chat/completions", .body = seeded_body };
+        } else if (i == 5) {
+            c.* = .{ .port = port, .path = "/v1/responses", .body = body_resp_ep };
+        } else if (i == 6) {
+            c.* = .{ .port = port, .path = "/v1/messages", .body = body_msg_ep };
+        } else {
+            c.* = .{ .port = port, .path = "/v1/chat/completions", .body = body_trng };
+        }
+        threads[i] = try std.Thread.spawn(.{}, ClientJob.run, .{c});
+    }
+    for (&threads) |t| t.join();
+
+    var batched_ttfts: [8]u64 = undefined;
+    for (&clients, 0..) |*c, i| {
+        try std.testing.expect(c.ok);
+        const resp = c.resp_buf[0..c.resp_len];
+        try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+        const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        const frames = try expectValidSseJsonFrames(body);
+        try std.testing.expect(frames >= 12);
+        batched_ttfts[i] = c.ttft_ns;
+    }
+
+    // Verify D11 explicit seed bit-exactness under concurrent B=8 batching!
+    var c0_buf: [128]u8 = undefined;
+    var c4_buf: [128]u8 = undefined;
+    const c0_text = extractOpenAiSseContent(extractHttpBody(clients[0].resp_buf[0..clients[0].resp_len]).?, &c0_buf);
+    const c4_text = extractOpenAiSseContent(extractHttpBody(clients[4].resp_buf[0..clients[4].resp_len]).?, &c4_buf);
+    try std.testing.expectEqualStrings(solo_text, c0_text);
+    try std.testing.expectEqualStrings(solo_text, c4_text);
+
+    // Verify continuous batching actually batched M >= 4..8 and beat serial p50/p99 TTFT!
+    std.mem.sort(u64, &batched_ttfts, {}, std.sort.asc(u64));
+    const batched_p50 = batched_ttfts[4];
+    const batched_p99 = batched_ttfts[7];
+    try std.testing.expect(batched_p50 * 2 < serial_p50);
+    try std.testing.expect(batched_p99 * 3 < serial_p99);
+
+    const st_after_8 = srv.stats();
+    try std.testing.expect(st_after_8.max_observed_batch_size >= 4);
+    try std.testing.expect(st_after_8.mean_batch_size > 2.0);
+    try std.testing.expect(st_after_8.prefix_hit_tokens >= 8 * 8);
+    try std.testing.expect(st_after_8.prefix_hit_requests >= 8);
+
+    // Verify GET /health reflects batch telemetry and parses as valid JSON!
+    {
+        var h_buf: [2048]u8 = undefined;
+        const h_resp = try testHttpExchange(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n", &h_buf);
+        try std.testing.expect(std.mem.startsWith(u8, h_resp, "HTTP/1.1 200 OK\r\n"));
+        const h_body = extractHttpBody(h_resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(h_body);
+        try std.testing.expect(std.mem.indexOf(u8, h_body, "\"active_batch_size\":0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, h_body, "\"mean_batch_size\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, h_body, "\"prefix_hit_tokens\":") != null);
+    }
+
+    // 2c. Also test non-streaming (`stream: false`) across all 3 endpoints under `startBatched`!
+    {
+        const r_chat = try testHttpPostJson(port, "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"SHARED_SYS ns\"}],\"stream\":false,\"max_tokens\":6}", &solo_req_buf, &solo_resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_chat, "HTTP/1.1 200 OK\r\n"));
+        try expectValidJson(extractHttpBody(r_chat) orelse return error.TestUnexpectedResult);
+
+        const r_resp = try testHttpPostJson(port, "/v1/responses", "{\"input\":\"SHARED_SYS ns\",\"stream\":false,\"max_tokens\":6}", &solo_req_buf, &solo_resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_resp, "HTTP/1.1 200 OK\r\n"));
+        try expectValidJson(extractHttpBody(r_resp) orelse return error.TestUnexpectedResult);
+
+        const r_msg = try testHttpPostJson(port, "/v1/messages", "{\"messages\":[{\"role\":\"user\",\"content\":\"SHARED_SYS ns\"}],\"stream\":false,\"max_tokens\":6}", &solo_req_buf, &solo_resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_msg, "HTTP/1.1 200 OK\r\n"));
+        try expectValidJson(extractHttpBody(r_msg) orelse return error.TestUnexpectedResult);
+    }
+
+    // 2d. Mid-stream client disconnect during concurrent batching:
+    //     open 4 clients, abort client 0 after its first SSE bytes; verify immediate
+    //     releaseSlot + prefix unpin while clients 1..3 complete losslessly.
+    {
+        const before_unpins = batch_mock.unpinned_count.load(.acquire);
+        const before_cancels = srv.stats().cancelled_count;
+        const long_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"SHARED_SYS mid-cancel\"}],\"stream\":true,\"max_tokens\":24,\"temperature\":0.7}";
+        var req_str_buf: [1024]u8 = undefined;
+        const req_str = try std.fmt.bufPrint(
+            &req_str_buf,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ long_body.len, long_body },
+        );
+
+        var fds: [4]std.c.fd_t = .{ -1, -1, -1, -1 };
+        defer for (&fds) |*fd| {
+            if (fd.* >= 0) {
+                _ = std.c.close(fd.*);
+                fd.* = -1;
+            }
+        };
+        for (&fds) |*fd| {
+            fd.* = try testConnectLoopback(port);
+            try testSendAll(fd.*, req_str);
+        }
+
+        // Read first bytes on client 0, then abort it immediately mid-stream!
+        var first_buf: [512]u8 = undefined;
+        const first_n = std.c.recv(fds[0], &first_buf, first_buf.len, 0);
+        try std.testing.expect(first_n > 0);
+        _ = std.c.close(fds[0]);
+        fds[0] = -1;
+
+        // Remaining 3 concurrent clients MUST complete losslessly!
+        for (fds[1..4]) |fd| {
+            const resp = try testRecvAll(fd, &solo_resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+            try std.testing.expect(std.mem.indexOf(u8, resp, "data: [DONE]\n\n") != null);
+        }
+
+        const deadline = monotonicNowNs() + 2 * std.time.ns_per_s;
+        while ((srv.stats().active_requests > 0 or srv.stats().active_conns > 0) and monotonicNowNs() < deadline) {
+            sleepNs(1 * std.time.ns_per_ms);
+        }
+        try std.testing.expectEqual(@as(usize, 0), srv.stats().active_requests);
+        try std.testing.expectEqual(@as(usize, 0), srv.stats().active_conns);
+        try std.testing.expect(srv.stats().cancelled_count >= before_cancels + 1);
+        try std.testing.expect(batch_mock.unpinned_count.load(.acquire) >= before_unpins + 4);
+    }
+
+    // 2e. Zero steady-state `malloc_zone_statistics` delta under 8-client simultaneous batched SSE load!
+    //     Drive 8 non-blocking loopback sockets simultaneously from this thread (0 pthread spawns).
+    {
+        batch_mock.step_delay_ns = 1 * std.time.ns_per_ms;
+        var req_bytes_buf: [1024]u8 = undefined;
+        const req_bytes = try std.fmt.bufPrint(
+            &req_bytes_buf,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ body_trng.len, body_trng },
+        );
+
+        // Wait until all prior slots are completely idle.
+        while (srv.stats().active_conns > 0 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+
+        var m_warm: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_warm);
+        var m_before: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_before);
+
+        var sock_fds: [8]std.c.fd_t = .{ -1, -1, -1, -1, -1, -1, -1, -1 };
+        var done_flags: [8]bool = @splat(false);
+        var recv_totals: [8]usize = @splat(0);
+        var scratch: [2048]u8 = undefined;
+
+        for (&sock_fds) |*fd| {
+            fd.* = try testConnectLoopback(port);
+            try testSendAll(fd.*, req_bytes);
+            try setNonBlocking(fd.*);
+        }
+
+        var remaining: usize = 8;
+        const deadline = monotonicNowNs() + 5 * std.time.ns_per_s;
+        while (remaining > 0 and monotonicNowNs() < deadline) {
+            var progressed = false;
+            for (&sock_fds, 0..) |*fd, i| {
+                if (done_flags[i]) continue;
+                while (true) {
+                    const n = std.c.recv(fd.*, &scratch, scratch.len, 0);
+                    if (n > 0) {
+                        recv_totals[i] += @intCast(n);
+                        progressed = true;
+                    } else if (n == 0) {
+                        _ = std.c.close(fd.*);
+                        fd.* = -1;
+                        done_flags[i] = true;
+                        remaining -= 1;
+                        progressed = true;
+                        break;
+                    } else {
+                        const err = std.c.errno(n);
+                        if (err == .INTR) continue;
+                        if (err == .AGAIN) break;
+                        return error.TestUnexpectedResult;
+                    }
+                }
+            }
+            if (!progressed) sleepNs(200_000);
+        }
+        try std.testing.expectEqual(@as(usize, 0), remaining);
+        for (recv_totals) |n| try std.testing.expect(n > 100);
+
+        while (srv.stats().active_conns > 0 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+
+        var m_after: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_after);
+        try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
+        try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+    }
+}
+
+test "C14 DomainNgramRegistry HTTP endpoints (GET /v1/ngram-packs, POST /v1/ngram-packs/select), per-request ngram_domain routing, and live hot-swap" {
+    const gpa = std.testing.allocator;
+
+    var p_repo1_buf: [256]u8 = undefined;
+    var p_repo2_buf: [256]u8 = undefined;
+    var p_docs_buf: [256]u8 = undefined;
+    const p_repo1 = try testTmpAngPathServer(&p_repo1_buf, "aminfer-test-http-repo-v1.ang");
+    const p_repo2 = try testTmpAngPathServer(&p_repo2_buf, "aminfer-test-http-repo-v2.ang");
+    const p_docs = try testTmpAngPathServer(&p_docs_buf, "aminfer-test-http-docs.ang");
+    defer _ = std.c.unlink(p_repo1.ptr);
+    defer _ = std.c.unlink(p_repo2.ptr);
+    defer _ = std.c.unlink(p_docs.ptr);
+
+    const ctx_4 = [_]u32{ 10, 20, 30, 40 };
+    try ngram_nvme.writeTableFile(gpa, p_repo1, &[_]ngram_nvme.BuildEntry{
+        .{ .ctx = &ctx_4, .cont = &[_]u32{ 'R', '1' }, .hit_count = 50, .step_prob = 0.92 },
+    }, .{ .num_buckets = 4, .corpus_id = "repo-v1", .include_table_crc = true });
+    try ngram_nvme.writeTableFile(gpa, p_repo2, &[_]ngram_nvme.BuildEntry{
+        .{ .ctx = &ctx_4, .cont = &[_]u32{ 'R', '2' }, .hit_count = 99, .step_prob = 0.96 },
+    }, .{ .num_buckets = 4, .corpus_id = "repo-v2", .include_table_crc = true });
+    try ngram_nvme.writeTableFile(gpa, p_docs, &[_]ngram_nvme.BuildEntry{
+        .{ .ctx = &ctx_4, .cont = &[_]u32{ 'D', '1' }, .hit_count = 40, .step_prob = 0.88 },
+    }, .{ .num_buckets = 4, .corpus_id = "docs-v1", .include_table_crc = true });
+
+    var reg = try ngram_nvme.DomainNgramRegistry.init(gpa, .{
+        .cache_pages = 8,
+        .max_inflight = 2,
+        .io_backend = .kqueue_aio,
+        .verify_table_crc = true,
+    });
+    defer reg.deinit(gpa);
+    _ = try reg.registerPack("repo", p_repo1, true);
+    _ = try reg.registerPack("docs", p_docs, true);
+
+    const NgramBatchBackend = struct {
+        reg: *ngram_nvme.DomainNgramRegistry,
+
+        fn tokenize(_: *anyopaque, _: *const InferenceJob, out: []u32) batch_sched.BackendError!usize {
+            out[0] = 10;
+            out[1] = 20;
+            out[2] = 30;
+            out[3] = 40;
+            return 4;
+        }
+
+        fn detokenize(_: *anyopaque, tok: u32, out: []u8) []const u8 {
+            out[0] = @intCast(tok & 0x7F);
+            return out[0..1];
+        }
+
+        fn prefill(ctx_ptr: *anyopaque, chunk: *const batch_sched.PrefillChunkView) batch_sched.BackendError!batch_sched.PrefillResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            var cont: [8]u32 = undefined;
+            const dom: ?[]const u8 = if (chunk.ngram_domain.len > 0) chunk.ngram_domain else null;
+            const res = self.reg.queryDomain(dom, chunk.tokens, &cont) catch return error.PrefillFailed;
+            return .{ .first_token = if (res.draft_len >= 1) cont[0] else '?' };
+        }
+
+        fn decode(ctx_ptr: *anyopaque, view: *const batch_sched.BatchStepView, out: []u32) batch_sched.BackendError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const fixed_ctx = [_]u32{ 10, 20, 30, 40 };
+            for (0..view.batchSize()) |b| {
+                var cont: [8]u32 = undefined;
+                const dom: ?[]const u8 = if (view.ngram_domains[b].len > 0) view.ngram_domains[b] else null;
+                const res = self.reg.queryDomain(dom, &fixed_ctx, &cont) catch return error.DecodeFailed;
+                out[b] = if (res.draft_len >= 2) cont[1] else '!';
+            }
+        }
+
+        fn release(_: *anyopaque, _: u16, _: u64) void {}
+    };
+
+    var nb = NgramBatchBackend{ .reg = &reg };
+    const srv = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "c14-ngram-srv",
+        .max_conns = 8,
+        .max_active_requests = 8,
+        .max_batch_size = 8,
+        .ngram_registry = &reg,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    try srv.startBatched(.{
+        .ctx = &nb,
+        .tokenizeFn = NgramBatchBackend.tokenize,
+        .detokenizeFn = NgramBatchBackend.detokenize,
+        .backend = .{
+            .ctx = &nb,
+            .prefillSlotFn = NgramBatchBackend.prefill,
+            .stepDecodeBatchFn = NgramBatchBackend.decode,
+            .releaseSlotFn = NgramBatchBackend.release,
+        },
+    });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var req_buf: [1024]u8 = undefined;
+    var resp_buf: [8192]u8 = undefined;
+
+    // 1. GET /v1/ngram-packs lists both loaded packs with active default "repo".
+    {
+        const resp = try testHttpExchange(port, "GET /v1/ngram-packs HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+        const body = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
+        try expectValidJson(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"default_domain\":\"repo\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"pack_count\":2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"domain\":\"repo\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "\"domain\":\"docs\"") != null);
+    }
+
+    // 2. Per-request `"ngram_domain"` routing: default -> "R1", explicit "docs" -> "D1", unknown -> 400 JSON.
+    {
+        const r_def = try testHttpPostJson(port, "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}],\"stream\":false,\"max_tokens\":2}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_def, "HTTP/1.1 200 OK\r\n"));
+        const b_def = extractHttpBody(r_def) orelse return error.TestUnexpectedResult;
+        try expectValidJson(b_def);
+        try std.testing.expect(std.mem.indexOf(u8, b_def, "\"content\":\"R1\"") != null);
+
+        const r_docs = try testHttpPostJson(port, "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}],\"stream\":false,\"max_tokens\":2,\"ngram_domain\":\"docs\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_docs, "HTTP/1.1 200 OK\r\n"));
+        const b_docs = extractHttpBody(r_docs) orelse return error.TestUnexpectedResult;
+        try expectValidJson(b_docs);
+        try std.testing.expect(std.mem.indexOf(u8, b_docs, "\"content\":\"D1\"") != null);
+
+        const r_bad = try testHttpPostJson(port, "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}],\"stream\":false,\"max_tokens\":2,\"ngram_domain\":\"nope\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_bad, "HTTP/1.1 400 Bad Request\r\n"));
+        try expectValidJson(extractHttpBody(r_bad) orelse return error.TestUnexpectedResult);
+    }
+
+    // 3. POST /v1/ngram-packs/select switches active default live to "docs" (+ validates error paths).
+    {
+        const r_sel = try testHttpPostJson(port, "/v1/ngram-packs/select", "{\"domain\":\"docs\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_sel, "HTTP/1.1 200 OK\r\n"));
+        const b_sel = extractHttpBody(r_sel) orelse return error.TestUnexpectedResult;
+        try expectValidJson(b_sel);
+        try std.testing.expect(std.mem.indexOf(u8, b_sel, "\"default_domain\":\"docs\"") != null);
+
+        // Request omitting `"ngram_domain"` now resolves to "docs" -> "D1"!
+        const r_now_docs = try testHttpPostJson(port, "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}],\"stream\":false,\"max_tokens\":2}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_now_docs, "HTTP/1.1 200 OK\r\n"));
+        const b_now_docs = extractHttpBody(r_now_docs) orelse return error.TestUnexpectedResult;
+        try expectValidJson(b_now_docs);
+        try std.testing.expect(std.mem.indexOf(u8, b_now_docs, "\"content\":\"D1\"") != null);
+
+        // Error paths all return valid JSON!
+        const r_405a = try testHttpPostJson(port, "/v1/ngram-packs", "{}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_405a, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try expectValidJson(extractHttpBody(r_405a) orelse return error.TestUnexpectedResult);
+
+        const r_405b = try testHttpExchange(port, "GET /v1/ngram-packs/select HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_405b, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try expectValidJson(extractHttpBody(r_405b) orelse return error.TestUnexpectedResult);
+
+        const r_404 = try testHttpPostJson(port, "/v1/ngram-packs/select", "{\"domain\":\"unknown\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_404, "HTTP/1.1 404 Not Found\r\n"));
+        try expectValidJson(extractHttpBody(r_404) orelse return error.TestUnexpectedResult);
+
+        const r_400 = try testHttpPostJson(port, "/v1/ngram-packs/select", "{\"wrong\":1}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_400, "HTTP/1.1 400 Bad Request\r\n"));
+        try expectValidJson(extractHttpBody(r_400) orelse return error.TestUnexpectedResult);
+    }
+
+    // 4. Live hot-swap `swapDomainPack("repo", p_repo2)` reflected immediately on explicit "repo" & GET /v1/ngram-packs!
+    {
+        _ = try reg.swapDomainPack("repo", p_repo2, true);
+        const r_v2 = try testHttpPostJson(port, "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"}],\"stream\":false,\"max_tokens\":2,\"ngram_domain\":\"repo\"}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_v2, "HTTP/1.1 200 OK\r\n"));
+        const b_v2 = extractHttpBody(r_v2) orelse return error.TestUnexpectedResult;
+        try expectValidJson(b_v2);
+        try std.testing.expect(std.mem.indexOf(u8, b_v2, "\"content\":\"R2\"") != null);
+
+        const r_list = try testHttpExchange(port, "GET /v1/ngram-packs HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+        const b_list = extractHttpBody(r_list) orelse return error.TestUnexpectedResult;
+        try expectValidJson(b_list);
+        try std.testing.expect(std.mem.indexOf(u8, b_list, "\"corpus_id\":\"repo-v2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, b_list, "\"swaps\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, b_list, "\"default_domain\":\"docs\"") != null);
+    }
+
+    // 5. Verify zero steady-state malloc allocations on GET /v1/ngram-packs and POST /v1/ngram-packs/select!
+    {
+        while (srv.stats().active_conns > 0 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+        var m_warm: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_warm);
+        var m_before: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_before);
+
+        for (0..4) |k| {
+            const sel_json = if ((k & 1) == 0) "{\"domain\":\"repo\"}" else "{\"domain\":\"docs\"}";
+            const rs = try testHttpPostJson(port, "/v1/ngram-packs/select", sel_json, &req_buf, &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rs, "HTTP/1.1 200 OK\r\n"));
+            const rl = try testHttpExchange(port, "GET /v1/ngram-packs HTTP/1.1\r\nHost: localhost\r\n\r\n", &resp_buf);
+            try std.testing.expect(std.mem.startsWith(u8, rl, "HTTP/1.1 200 OK\r\n"));
+        }
+
+        while (srv.stats().active_conns > 0 or srv.stats().active_requests > 0) {
+            sleepNs(500_000);
+        }
+        var m_after: MallocStatistics = std.mem.zeroes(MallocStatistics);
+        malloc_zone_statistics(null, &m_after);
+        try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
+        try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+    }
 }
