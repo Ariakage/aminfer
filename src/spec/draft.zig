@@ -2872,11 +2872,10 @@ fn nextRng(state: *u64) u64 {
 fn fillBf16(allocator: std.mem.Allocator, elems: usize, amp: f32, centered_one: bool, seed: u64) ![]u8 {
     var rng = seed ^ 0xA076_1D64_78BD_642F;
     const raw = try allocator.alloc(u8, elems * 2);
-    const words: []u16 = @alignCast(std.mem.bytesAsSlice(u16, raw));
-    for (words) |*w| {
+    for (0..elems) |i| {
         const u = @as(f32, @floatFromInt(nextRng(&rng) & 0xFFFF)) / 65535.0;
         const f = if (centered_one) (0.95 + 0.1 * u) else ((u * 2.0 - 1.0) * amp);
-        w.* = quant.f32ToFloatBits(.bf16, f);
+        std.mem.writeInt(u16, raw[i * 2 ..][0..2], quant.f32ToFloatBits(.bf16, f), .little);
     }
     return raw;
 }
@@ -2926,8 +2925,10 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
     if (cfg.format == .eagle3) {
         const d2t_bytes = try allocator.alloc(u8, @as(usize, cfg.draft_vocab_size) * @sizeOf(u32));
         errdefer allocator.free(d2t_bytes);
-        const ids: []u32 = @alignCast(std.mem.bytesAsSlice(u32, d2t_bytes));
-        for (ids, 0..) |*id, i| id.* = @intCast((i * cfg.vocab_size) / cfg.draft_vocab_size);
+        for (0..cfg.draft_vocab_size) |i| {
+            const id: u32 = @intCast((i * cfg.vocab_size) / cfg.draft_vocab_size);
+            std.mem.writeInt(u32, d2t_bytes[i * 4 ..][0..4], id, .little);
+        }
         try recs.append(allocator, .{
             .name = try allocator.dupe(u8, "d2t"),
             .kind = .dense,
