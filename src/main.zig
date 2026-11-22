@@ -8,9 +8,10 @@ const usage =
     \\usage: aminfer <command> [options]
     \\
     \\commands:
-    \\  probe             print the kernel, Metal and Neural Engine facts of this machine
+    \\  probe             print the kernel, chip profile, Metal, NAX and Neural Engine facts of this machine
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5 and M6.8 benchmark suites
+    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5, M6.8 and M6.9 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
@@ -21,6 +22,8 @@ const usage =
     \\  bench-m6          run M6 G7/G8/G9/G10, C10 PLE, scale-qwen4-512e+MTP, D12 & D13 cpu_sme2
     \\  bench-m65         run M6.5 G14 HW VideoToolbox vision, R5 32K q8 KV, R8 PrefixCache & C14 batch/ngram
     \\  bench-m68         run M6.8 G16 canary/Apple10, G15 wide prefill/tail-pruning A/B, C15 QoS/boundary & R9 live-RAM
+    \\  bench-m69         run M6.9 C16 ChipProfile, G17 NAX metallib/fallback/demotion gates & Apple10+ Spike S8 sweep
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\  bench-a2          evaluate real-checkpoint A2 ANE cross-layer expert predictor recall/lead-time
     \\                    --amf <path> --config <path> --tokenizer <path> [--prompt <text>]
     \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [--no-verify-crc]
@@ -29,6 +32,7 @@ const usage =
     \\                    [--decode-steps N] [--cold-experts-per-layer N] [--heat-profile <path>]
     \\                    [--cold-slots N] [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--kv-retire-q8-after-chunks N]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
@@ -43,6 +47,7 @@ const usage =
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--no-verify-crc]
     \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent)
@@ -59,6 +64,7 @@ const usage =
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--max-tokens N] [--ignore-eos] [--no-verify-crc]
     \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15)
@@ -81,6 +87,7 @@ const usage =
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--no-verify-crc]
     \\
@@ -92,8 +99,8 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [8192]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), init.io, &buffer);
     const out = &stdout.interface;
-    if (args.len == 2 and std.mem.eql(u8, args[1], "probe")) {
-        try probe(out);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "probe")) {
+        try probe(args[2..], out);
     } else if (args.len == 3 and std.mem.eql(u8, args[1], "verify-amf")) {
         try verifyAmf(arena, args[2], out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
@@ -118,6 +125,8 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM65(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m68")) {
         try runBenchM68(arena, out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m69")) {
+        try runBenchM69(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-a2")) {
         try runBenchA2(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-decode")) {
@@ -414,6 +423,44 @@ const M6GraphCliFlags = struct {
     }
 };
 
+const M69CliFlags = struct {
+    prefill_backend_mode: aminfer.dequant.PrefillBackendMode = .auto,
+    strict_nax: bool = false,
+    bus_bandwidth_gbs: ?f64 = null,
+
+    fn tryParseFlag(self: *M69CliFlags, args: []const [:0]const u8, i: *usize) !bool {
+        const flag = args[i.*];
+        if (std.mem.eql(u8, flag, "--prefill-matmul-backend")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            self.prefill_backend_mode = aminfer.dequant.PrefillBackendMode.parse(args[i.*]) orelse
+                return error.InvalidPrefillMatmulBackend;
+            return true;
+        } else if (std.mem.eql(u8, flag, "--strict-nax")) {
+            self.strict_nax = true;
+            return true;
+        } else if (std.mem.eql(u8, flag, "--bus-bandwidth-gbs")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            const v = try std.fmt.parseFloat(f64, args[i.*]);
+            if (!std.math.isFinite(v) or v <= 0.0) return error.InvalidBusBandwidthGbs;
+            self.bus_bandwidth_gbs = v;
+            return true;
+        }
+        return false;
+    }
+};
+
+fn parseM69Args(args: []const [:0]const u8) !M69CliFlags {
+    var m69: M69CliFlags = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (try m69.tryParseFlag(args, &i)) continue;
+        return error.UnknownFlag;
+    }
+    return m69;
+}
+
 fn shouldUseGraphModel(
     cfg_bytes: []const u8,
     m6: M6GraphCliFlags,
@@ -523,6 +570,7 @@ const DecodeCliArgs = struct {
     image_path: ?[:0]const u8 = null,
     vt_test_video: ?aminfer.metal.VtCodec = null,
     m6: M6GraphCliFlags = .{},
+    m69: M69CliFlags = .{},
 };
 
 fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
@@ -550,10 +598,12 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var image_path: ?[:0]const u8 = null;
     var vt_test_video: ?aminfer.metal.VtCodec = null;
     var m6: M6GraphCliFlags = .{};
+    var m69: M69CliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
+        if (try m69.tryParseFlag(args, &i)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf")) {
             i += 1;
@@ -670,6 +720,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .image_path = image_path,
         .vt_test_video = vt_test_video,
         .m6 = m6,
+        .m69 = m69,
     };
 }
 
@@ -692,6 +743,7 @@ const BenchDecodeCliArgs = struct {
     enable_ane_predictor: bool = true,
     kv_retire_q8_after_chunks: u32 = 0,
     m6: M6GraphCliFlags = .{},
+    m69: M69CliFlags = .{},
 };
 
 fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
@@ -713,10 +765,12 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
     var enable_ane_predictor = true;
     var kv_retire_q8_after_chunks: u32 = 0;
     var m6: M6GraphCliFlags = .{};
+    var m69: M69CliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
+        if (try m69.tryParseFlag(args, &i)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf")) {
             i += 1;
@@ -804,6 +858,7 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
         .enable_ane_predictor = enable_ane_predictor,
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
         .m6 = m6,
+        .m69 = m69,
     };
 }
 
@@ -948,6 +1003,9 @@ fn runDecodeGraph(
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .prefill_backend_mode = cli.m69.prefill_backend_mode,
+        .strict_nax = cli.m69.strict_nax,
+        .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
     });
     defer model.deinit(allocator);
 
@@ -1206,6 +1264,9 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .prefill_backend_mode = cli.m69.prefill_backend_mode,
+        .strict_nax = cli.m69.strict_nax,
+        .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
     });
     defer model.deinit(allocator);
 
@@ -1380,6 +1441,9 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
             .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
             .gpu_prefill_mode = cli.gpu_prefill_mode,
             .strict_live_ram = cli.strict_live_ram,
+            .prefill_backend_mode = cli.m69.prefill_backend_mode,
+            .strict_nax = cli.m69.strict_nax,
+            .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
         });
         try res.write(out);
         return;
@@ -1411,6 +1475,9 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .prefill_backend_mode = cli.m69.prefill_backend_mode,
+        .strict_nax = cli.m69.strict_nax,
+        .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
     });
     try res.write(out);
 }
@@ -1471,6 +1538,16 @@ fn runBenchM68(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try report.write(out);
 }
 
+fn runBenchM69(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseM69Args(raw_args);
+    const report = try aminfer.bench.runM69WithConfig(allocator, .{
+        .prefill_backend_mode = cli.prefill_backend_mode,
+        .strict_nax = cli.strict_nax,
+        .bus_bandwidth_gbs_override = cli.bus_bandwidth_gbs,
+    });
+    try report.write(out);
+}
+
 fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM1(allocator, out);
     try out.flush();
@@ -1491,6 +1568,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM65(allocator, out);
     try out.flush();
     try runBenchM68(allocator, out);
+    try out.flush();
+    try runBenchM69(allocator, &.{}, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -1529,6 +1608,7 @@ const SpecDecodeCliArgs = struct {
     enable_ane_predictor: bool = true,
     kv_retire_q8_after_chunks: u32 = 0,
     m6: M6GraphCliFlags = .{},
+    m69: M69CliFlags = .{},
 };
 
 fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
@@ -1567,10 +1647,12 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var enable_ane_predictor = true;
     var kv_retire_q8_after_chunks: u32 = 0;
     var m6: M6GraphCliFlags = .{};
+    var m69: M69CliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
+        if (try m69.tryParseFlag(args, &i)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf")) {
             i += 1;
@@ -1741,6 +1823,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .enable_ane_predictor = enable_ane_predictor,
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
         .m6 = m6,
+        .m69 = m69,
     };
 }
 
@@ -1814,6 +1897,9 @@ fn runSpecDecodeGraph(
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .prefill_backend_mode = cli.m69.prefill_backend_mode,
+        .strict_nax = cli.m69.strict_nax,
+        .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
     });
     defer model.deinit(allocator);
 
@@ -2120,6 +2206,9 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .prefill_backend_mode = cli.m69.prefill_backend_mode,
+        .strict_nax = cli.m69.strict_nax,
+        .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
     });
     defer model.deinit(allocator);
 
@@ -2537,6 +2626,7 @@ const ServeCliArgs = struct {
     ane_predictor_path: ?[:0]const u8 = null,
     enable_ane_predictor: bool = true,
     m6: M6GraphCliFlags = .{},
+    m69: M69CliFlags = .{},
 };
 
 fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
@@ -2584,10 +2674,12 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var ane_predictor_path: ?[:0]const u8 = null;
     var enable_ane_predictor = true;
     var m6: M6GraphCliFlags = .{};
+    var m69: M69CliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
+        if (try m69.tryParseFlag(args, &i)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf")) {
             i += 1;
@@ -2802,6 +2894,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         .ane_predictor_path = ane_predictor_path,
         .enable_ane_predictor = enable_ane_predictor,
         .m6 = m6,
+        .m69 = m69,
     };
 }
 
@@ -3452,6 +3545,9 @@ fn runServeGraph(
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .prefill_backend_mode = cli.m69.prefill_backend_mode,
+        .strict_nax = cli.m69.strict_nax,
+        .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
         .continuous_batch_only = use_continuous,
     });
     defer model.deinit(allocator);
@@ -3833,6 +3929,9 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = cli.gpu_prefill_mode,
         .strict_live_ram = cli.strict_live_ram,
+        .prefill_backend_mode = cli.m69.prefill_backend_mode,
+        .strict_nax = cli.m69.strict_nax,
+        .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
         .continuous_batch_only = use_continuous,
     });
     defer model.deinit(allocator);
@@ -4214,7 +4313,8 @@ fn autoClampServeBatchSlots(
     return @min(requested_slots, slots_fit);
 }
 
-fn probe(out: *Io.Writer) !void {
+fn probe(raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseM69Args(raw_args);
     const facts = try aminfer.sysinfo.Facts.read();
     try out.print(
         \\sys.page_size                    {d}
@@ -4250,29 +4350,72 @@ fn probe(out: *Io.Writer) !void {
     var device = try aminfer.metal.Device.open();
     defer device.close();
     const info = try device.info();
+    const chip = aminfer.chip_profile.ChipProfile.resolve(
+        facts,
+        info.name(),
+        info.appleGpuFamily(),
+        cli.bus_bandwidth_gbs,
+    );
     const wired_budget = aminfer.budget.Budget.fromHost(facts, info, .{});
-    const matmul_backend = aminfer.dequant.selectPrefillMatmulBackend(info);
-    const matmul_backend_label: []const u8 = switch (matmul_backend) {
-        .simdgroup_apple9 => "simdgroup_apple9",
-        .nax_apple10_reserved => "nax_apple10_reserved",
-    };
     const vm_snap = try aminfer.vmstat.Snapshot.capture();
     const ps: u64 = if (vm_snap.page_size > 0) vm_snap.page_size else aminfer.page.APPLE_PAGE_SIZE;
     const lib = try aminfer.metal.Library.openEmbedded(device);
     defer lib.close();
-    const dq_pipes = try aminfer.dequant.DequantPipelines.init(device, lib);
+    const has_dense_nax = try lib.hasFunction("ami_dense_gemm_nax");
+    const has_dequant_nax = try lib.hasFunction("ami_dequant_gemm_nax");
+    const has_fp4_nax = try lib.hasFunction("ami_fp4_e2m1_gemm_nax");
+    var dq_pipes = try aminfer.dequant.DequantPipelines.initWithOptions(device, lib, .{
+        .backend_mode = cli.prefill_backend_mode,
+        .strict_nax = cli.strict_nax,
+    });
     defer dq_pipes.close();
-    const canary_prof = try dq_pipes.runStartupNumericalCanaryProfile(&device);
+    const canary_prof = try dq_pipes.runStartupNumericalCanaryProfileMut(&device);
     const canary = canary_prof.cold;
     try out.print(
+        \\chip.generation                  {s}
+        \\chip.tier                        {s}
+        \\chip.cpu_brand                   {s}
+        \\chip.hw_model                    {s}
+        \\chip.spec_bus_gbs                {d:.2}
+        \\chip.bandwidth_source            {s}
         \\gpu.name                         {s}
         \\gpu.apple_family                 {d}
         \\gpu.supports_apple10             {s}
+        \\gpu.supports_apple11             {s}
+        \\gpu.supports_nax                 {s}
         \\gpu.prefill_matmul_backend       {s}
+        \\gpu.nax_fallback_reason          {s}
         \\gpu.metal4                       {}
         \\gpu.unified_memory               {}
         \\gpu.recommended_working_set_mib  {d}
         \\gpu.max_buffer_mib               {d}
+        \\metallib.has_dense_gemm_nax      {s}
+        \\metallib.has_dequant_gemm_nax    {s}
+        \\metallib.has_fp4_e2m1_gemm_nax   {s}
+        \\
+    , .{
+        chip.generation.label(),
+        chip.tier.label(),
+        facts.cpuBrand(),
+        facts.hwModel(),
+        chip.spec_bus_gbs,
+        chip.bandwidth_source.label(),
+        info.name(),
+        info.appleGpuFamily(),
+        if (info.supportsApple10()) "yes" else "no",
+        if (info.supportsApple11()) "yes" else "no",
+        if (info.supportsNaxTensorOps()) "yes" else "no",
+        dq_pipes.activeBackend().label(),
+        dq_pipes.naxFallbackReason().label(),
+        info.supportsMetal4(),
+        info.hasUnifiedMemory(),
+        info.recommendedMaxWorkingSetSize() >> 20,
+        info.maxBufferLength() >> 20,
+        if (has_dense_nax) "yes" else "no",
+        if (has_dequant_nax) "yes" else "no",
+        if (has_fp4_nax) "yes" else "no",
+    });
+    try out.print(
         \\ane.cores                        {d}
         \\budget.wired_limit_mib           {d}
         \\budget.binding_limit             {s}
@@ -4285,14 +4428,6 @@ fn probe(out: *Io.Writer) !void {
         \\canary.max_abs_err_q4            {d:.6}
         \\
     , .{
-        info.name(),
-        info.appleGpuFamily(),
-        if (info.supportsApple10()) "yes" else "no",
-        matmul_backend_label,
-        info.supportsMetal4(),
-        info.hasUnifiedMemory(),
-        info.recommendedMaxWorkingSetSize() >> 20,
-        info.maxBufferLength() >> 20,
         info.aneCoreCount(),
         wired_budget.limit_bytes >> 20,
         wired_budget.binding_limit.label(),
@@ -4748,4 +4883,78 @@ test "M6.8 CLI parsers handle --gpu-prefill-mode, --strict-live-ram, --decode-sh
         "--tokenizer",               "t.json",
         "--adaptive-prefill-narrow", "maybe",
     }));
+}
+
+test "M6.9 CLI parsers handle --prefill-matmul-backend, --strict-nax, and --bus-bandwidth-gbs across all subcommands" {
+    // Default M6.9 flags (`probe` / `bench-m69`).
+    const m69_def = try parseM69Args(&.{});
+    try std.testing.expectEqual(aminfer.dequant.PrefillBackendMode.auto, m69_def.prefill_backend_mode);
+    try std.testing.expect(!m69_def.strict_nax);
+    try std.testing.expectEqual(@as(?f64, null), m69_def.bus_bandwidth_gbs);
+
+    const m69_exp = try parseM69Args(&.{
+        "--prefill-matmul-backend", "nax",
+        "--strict-nax",             "--bus-bandwidth-gbs",
+        "546.5",
+    });
+    try std.testing.expectEqual(aminfer.dequant.PrefillBackendMode.nax, m69_exp.prefill_backend_mode);
+    try std.testing.expect(m69_exp.strict_nax);
+    try std.testing.expectApproxEqAbs(@as(f64, 546.5), m69_exp.bus_bandwidth_gbs.?, 1e-6);
+
+    const dec = try parseDecodeArgs(&.{
+        "--amf",                    "m.amf",
+        "--config",                 "c.json",
+        "--tokenizer",              "t.json",
+        "--prefill-matmul-backend", "simdgroup",
+        "--bus-bandwidth-gbs",      "273.0",
+    });
+    try std.testing.expectEqual(aminfer.dequant.PrefillBackendMode.simdgroup, dec.m69.prefill_backend_mode);
+    try std.testing.expect(!dec.m69.strict_nax);
+    try std.testing.expectApproxEqAbs(@as(f64, 273.0), dec.m69.bus_bandwidth_gbs.?, 1e-6);
+
+    const bdec = try parseBenchDecodeArgs(&.{
+        "--amf",                    "m.amf",
+        "--config",                 "c.json",
+        "--prefill-matmul-backend", "nax",
+        "--strict-nax",             "--bus-bandwidth-gbs",
+        "800",
+    });
+    try std.testing.expectEqual(aminfer.dequant.PrefillBackendMode.nax, bdec.m69.prefill_backend_mode);
+    try std.testing.expect(bdec.m69.strict_nax);
+    try std.testing.expectApproxEqAbs(@as(f64, 800.0), bdec.m69.bus_bandwidth_gbs.?, 1e-6);
+
+    const spec = try parseSpecDecodeArgs(&.{
+        "--amf",                    "m.amf",
+        "--config",                 "c.json",
+        "--tokenizer",              "t.json",
+        "--prefill-matmul-backend", "auto",
+        "--strict-nax",             "--bus-bandwidth-gbs",
+        "153.6",
+    });
+    try std.testing.expectEqual(aminfer.dequant.PrefillBackendMode.auto, spec.m69.prefill_backend_mode);
+    try std.testing.expect(spec.m69.strict_nax);
+    try std.testing.expectApproxEqAbs(@as(f64, 153.6), spec.m69.bus_bandwidth_gbs.?, 1e-6);
+
+    const srv = try parseServeArgs(&.{
+        "--amf",                    "m.amf",
+        "--config",                 "c.json",
+        "--tokenizer",              "t.json",
+        "--prefill-matmul-backend", "simdgroup",
+        "--strict-nax",             "--bus-bandwidth-gbs",
+        "400.0",
+    });
+    try std.testing.expectEqual(aminfer.dequant.PrefillBackendMode.simdgroup, srv.m69.prefill_backend_mode);
+    try std.testing.expect(srv.m69.strict_nax);
+    try std.testing.expectApproxEqAbs(@as(f64, 400.0), srv.m69.bus_bandwidth_gbs.?, 1e-6);
+
+    try std.testing.expectError(error.InvalidPrefillMatmulBackend, parseM69Args(&.{
+        "--prefill-matmul-backend", "amx",
+    }));
+    try std.testing.expectError(error.InvalidBusBandwidthGbs, parseM69Args(&.{
+        "--bus-bandwidth-gbs", "0",
+    }));
+    try std.testing.expectError(error.InvalidBusBandwidthGbs, parseM69Args(&.{
+        "--bus-bandwidth-gbs", "-120.0",
+    }));
+    try std.testing.expectError(error.UnknownFlag, parseM69Args(&.{"--unknown"}));
 }

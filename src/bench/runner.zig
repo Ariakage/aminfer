@@ -6,6 +6,7 @@ const quant = @import("../quant/spec.zig");
 const amf = @import("../format/amf.zig");
 const vmstat = @import("../platform/vmstat.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
+const chip_profile_mod = @import("../platform/chip_profile.zig");
 const metal = @import("../bridge/metal.zig");
 const page = @import("../mem/page.zig");
 const arena_mod = @import("../mem/arena.zig");
@@ -137,6 +138,7 @@ pub const CaseResult = struct {
     dispatches: u64,
     weight_slots: usize,
     elapsed_ns: u64,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
 
     pub fn latencyUs(self: CaseResult) f64 {
         if (self.dispatches == 0) return 0.0;
@@ -151,7 +153,11 @@ pub const CaseResult = struct {
     }
 
     pub fn busUtilizationPct(self: CaseResult) f64 {
-        return (self.effectiveBandwidthGbs() / M4_BUS_BANDWIDTH_GBS) * 100.0;
+        const bus = if (std.math.isFinite(self.spec_bus_gbs) and self.spec_bus_gbs > 0.0)
+            self.spec_bus_gbs
+        else
+            M4_BUS_BANDWIDTH_GBS;
+        return (self.effectiveBandwidthGbs() / bus) * 100.0;
     }
 };
 
@@ -186,6 +192,7 @@ pub const Report = struct {
     gpu_name_len: usize,
     wired_budget_bytes: u64,
     arena_bytes: u64,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
     results: []CaseResult,
     s2: S2Result,
     vm_before: vmstat.Snapshot,
@@ -214,7 +221,7 @@ pub const Report = struct {
             self.gpuName(),
             self.wired_budget_bytes >> 20,
             self.arena_bytes >> 20,
-            M4_BUS_BANDWIDTH_GBS,
+            self.spec_bus_gbs,
         });
 
         for (self.results) |res| {
@@ -447,6 +454,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) Error!Report {
     const device = try metal.Device.open();
     defer device.close();
     const info = try device.info();
+    const host_profile = chip_profile_mod.ChipProfile.resolve(facts, info.name(), info.appleGpuFamily(), null);
     const wired_budget = budget_mod.Budget.fromHost(facts, info, .{});
 
     const library = try metal.Library.openEmbedded(device);
@@ -555,6 +563,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) Error!Report {
             .dispatches = @as(u64, timed_batches) * dispatches_per_batch,
             .weight_slots = num_slots,
             .elapsed_ns = t1 - t0,
+            .spec_bus_gbs = host_profile.spec_bus_gbs,
         };
     }
 
@@ -626,6 +635,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) Error!Report {
         .gpu_name_len = copy_len,
         .wired_budget_bytes = wired_budget.limit_bytes,
         .arena_bytes = arena.capacity(),
+        .spec_bus_gbs = host_profile.spec_bus_gbs,
         .results = results,
         .s2 = .{
             .rounds = config.s2_rounds,
@@ -682,6 +692,7 @@ pub const MoeBenchCaseResult = struct {
     naive_bytes: u64,
     dispatches: u64,
     elapsed_ns: u64,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
 
     pub fn latencyUs(self: MoeBenchCaseResult) f64 {
         if (self.dispatches == 0) return 0.0;
@@ -701,7 +712,11 @@ pub const MoeBenchCaseResult = struct {
     }
 
     pub fn busUtilizationPct(self: MoeBenchCaseResult) f64 {
-        return (self.effectiveBandwidthGbs() / M4_BUS_BANDWIDTH_GBS) * 100.0;
+        const bus = if (std.math.isFinite(self.spec_bus_gbs) and self.spec_bus_gbs > 0.0)
+            self.spec_bus_gbs
+        else
+            M4_BUS_BANDWIDTH_GBS;
+        return (self.effectiveBandwidthGbs() / bus) * 100.0;
     }
 
     pub fn byteSavingsPct(self: MoeBenchCaseResult) f64 {
@@ -770,6 +785,7 @@ pub fn runMoeBench(allocator: std.mem.Allocator, config: MoeBenchConfig) MoeBenc
     const device = try metal.Device.open();
     defer device.close();
     const dev_info = try device.info();
+    const host_profile = chip_profile_mod.ChipProfile.resolve(facts, dev_info.name(), dev_info.appleGpuFamily(), null);
     const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
 
     const library = try metal.Library.openEmbedded(device);
@@ -1021,6 +1037,7 @@ pub fn runMoeBench(allocator: std.mem.Allocator, config: MoeBenchConfig) MoeBenc
             .naive_bytes = try moe.expertLayerBytes(case.bits, naive_slots, case.hidden_size, case.intermediate_size),
             .dispatches = @as(u64, config.timed_batches) * config.dispatches_per_batch,
             .elapsed_ns = t1 - t0,
+            .spec_bus_gbs = host_profile.spec_bus_gbs,
         };
     }
 
@@ -1439,6 +1456,9 @@ pub const DecodeBenchOptions = struct {
     kv_retire_q8_after_chunks: u32 = 0,
     gpu_prefill_mode: qwen3.GpuPrefillMode = .wide,
     strict_live_ram: bool = false,
+    prefill_backend_mode: dequant.PrefillBackendMode = .auto,
+    strict_nax: bool = false,
+    bus_bandwidth_gbs_override: ?f64 = null,
 };
 
 pub const DecodeBenchResult = struct {
@@ -1448,6 +1468,7 @@ pub const DecodeBenchResult = struct {
     quant_bits: ?quant.QuantBits,
     default_float_dtype: quant.FloatDType = .bf16,
     gpu_prefill_mode: qwen3.GpuPrefillMode = .wide,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
     measured_layers: u32,
     scale_layers: u32,
     prefill_tokens: u32 = 0,
@@ -1584,14 +1605,14 @@ pub const DecodeBenchResult = struct {
             self.measuredHeadMs(),
             self.measured_bytes_per_tok,
             self.measuredEffectiveGbs(),
-            (self.measuredEffectiveGbs() / M4_BUS_BANDWIDTH_GBS) * 100.0,
+            (self.measuredEffectiveGbs() / (if (std.math.isFinite(self.spec_bus_gbs) and self.spec_bus_gbs > 0.0) self.spec_bus_gbs else M4_BUS_BANDWIDTH_GBS)) * 100.0,
             self.scale_layers,
             self.scale_layers,
             self.extrapolatedMsPerTok(),
             self.extrapolatedTokPerS(),
             self.extrapolated_bytes_per_tok,
             self.extrapolatedEffectiveGbs(),
-            (self.extrapolatedEffectiveGbs() / M4_BUS_BANDWIDTH_GBS) * 100.0,
+            (self.extrapolatedEffectiveGbs() / (if (std.math.isFinite(self.spec_bus_gbs) and self.spec_bus_gbs > 0.0) self.spec_bus_gbs else M4_BUS_BANDWIDTH_GBS)) * 100.0,
             self.heap_delta.blocks_in_use,
             self.heap_delta.size_in_use,
             self.swapouts_delta,
@@ -1661,6 +1682,9 @@ pub fn runDecodeBenchFromFile(
         .kv_retire_q8_after_chunks = opts.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = opts.gpu_prefill_mode,
         .strict_live_ram = opts.strict_live_ram,
+        .prefill_backend_mode = opts.prefill_backend_mode,
+        .strict_nax = opts.strict_nax,
+        .bus_bandwidth_gbs_override = opts.bus_bandwidth_gbs_override,
     });
     defer model.deinit(allocator);
     const load_t1 = try vmstat.nowNs();
@@ -1725,6 +1749,7 @@ pub fn runDecodeBenchFromFile(
         .quant_bits = cfg.quant_bits,
         .default_float_dtype = cfg.default_float_dtype,
         .gpu_prefill_mode = opts.gpu_prefill_mode,
+        .spec_bus_gbs = model.chip_profile.spec_bus_gbs,
         .measured_layers = cfg.num_hidden_layers,
         .scale_layers = opts.scale_layers,
         .prefill_tokens = opts.prefill_tokens,
@@ -1976,6 +2001,7 @@ pub const DenseCaseResult = struct {
     dispatches: u64,
     weight_slots: usize,
     elapsed_ns: u64,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
 
     pub fn latencyUs(self: DenseCaseResult) f64 {
         if (self.dispatches == 0) return 0.0;
@@ -1989,7 +2015,11 @@ pub const DenseCaseResult = struct {
     }
 
     pub fn busUtilizationPct(self: DenseCaseResult) f64 {
-        return (self.effectiveBandwidthGbs() / M4_BUS_BANDWIDTH_GBS) * 100.0;
+        const bus = if (std.math.isFinite(self.spec_bus_gbs) and self.spec_bus_gbs > 0.0)
+            self.spec_bus_gbs
+        else
+            M4_BUS_BANDWIDTH_GBS;
+        return (self.effectiveBandwidthGbs() / bus) * 100.0;
     }
 
     pub fn effectiveTflops(self: DenseCaseResult) f64 {
@@ -2006,6 +2036,7 @@ pub const DenseCaseResult = struct {
 pub const DenseBenchReport = struct {
     wired_budget_bytes: u64,
     arena_bytes: u64,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
     results: []DenseCaseResult,
     vm_before: vmstat.Snapshot,
     vm_after: vmstat.Snapshot,
@@ -2143,6 +2174,7 @@ pub fn runDenseBench(allocator: std.mem.Allocator, config: DenseBenchConfig) Err
     const device = try metal.Device.open();
     defer device.close();
     const info = try device.info();
+    const host_profile = chip_profile_mod.ChipProfile.resolve(facts, info.name(), info.appleGpuFamily(), null);
     const wired_budget = budget_mod.Budget.fromHost(facts, info, .{});
 
     const library = try metal.Library.openEmbedded(device);
@@ -2279,6 +2311,7 @@ pub fn runDenseBench(allocator: std.mem.Allocator, config: DenseBenchConfig) Err
             .dispatches = @as(u64, timed_batches) * dispatches_per_batch,
             .weight_slots = num_slots,
             .elapsed_ns = t1 - t0,
+            .spec_bus_gbs = host_profile.spec_bus_gbs,
         };
     }
 
@@ -2288,6 +2321,7 @@ pub fn runDenseBench(allocator: std.mem.Allocator, config: DenseBenchConfig) Err
     return .{
         .wired_budget_bytes = wired_budget.limit_bytes,
         .arena_bytes = arena.capacity(),
+        .spec_bus_gbs = host_profile.spec_bus_gbs,
         .results = results,
         .vm_before = vm_before,
         .vm_after = vm_after,
@@ -4078,6 +4112,7 @@ fn runConcurrentBusSweep(
     const device = try metal.Device.open();
     defer device.close();
     const dev_info = try device.info();
+    const host_profile = chip_profile_mod.ChipProfile.resolve(facts, dev_info.name(), dev_info.appleGpuFamily(), null);
     const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
 
     const library = try metal.Library.openEmbedded(device);
@@ -4377,7 +4412,7 @@ fn runConcurrentBusSweep(
             .sme_conc_gflops = sme_conc_gflops,
             .aggregate_gbs = gpu_conc_gbs + sme_conc_gbs,
             .net_speedup = net_speedup,
-            .gate_pass = (net_speedup > 1.05),
+            .gate_pass = host_profile.passesC13CoexecGate(net_speedup),
         };
     }
 
@@ -4959,6 +4994,7 @@ fn runM5Q2Calibration(allocator: std.mem.Allocator, config: M5Config) M5Error![]
     const device = try metal.Device.open();
     defer device.close();
     const info = try device.info();
+    const host_profile = chip_profile_mod.ChipProfile.resolve(facts, info.name(), info.appleGpuFamily(), null);
     const wired_budget = budget_mod.Budget.fromHost(facts, info, .{});
 
     const library = try metal.Library.openEmbedded(device);
@@ -5060,6 +5096,7 @@ fn runM5Q2Calibration(allocator: std.mem.Allocator, config: M5Config) M5Error![]
             .dispatches = @as(u64, timed_batches) * disps_per_batch,
             .weight_slots = num_slots,
             .elapsed_ns = t1 - t0,
+            .spec_bus_gbs = host_profile.spec_bus_gbs,
         };
     }
 
@@ -5071,6 +5108,7 @@ fn runM5HeteroMoeBench(config: M5Config) M5Error![8]HeteroMoeRow {
     const device = try metal.Device.open();
     defer device.close();
     const info = try device.info();
+    const host_profile = chip_profile_mod.ChipProfile.resolve(facts, info.name(), info.appleGpuFamily(), null);
     const wired_budget = budget_mod.Budget.fromHost(facts, info, .{});
 
     const library = try metal.Library.openEmbedded(device);
@@ -5423,7 +5461,7 @@ fn runM5HeteroMoeBench(config: M5Config) M5Error![8]HeteroMoeRow {
                 .bytes_per_disp = bytes_per_disp,
                 .latency_us = lat_us,
                 .effective_gbs = eff_gbs,
-                .bus_pct = (eff_gbs / M4_BUS_BANDWIDTH_GBS) * 100.0,
+                .bus_pct = host_profile.percentOfBus(eff_gbs),
                 .vs_q4_bytes_pct = (@as(f64, @floatFromInt(bytes_per_disp)) / @as(f64, @floatFromInt(q4_ref_bytes)) - 1.0) * 100.0,
             };
             row_idx += 1;
@@ -5951,6 +5989,9 @@ pub const GraphDecodeBenchOptions = struct {
     kv_retire_q8_after_chunks: u32 = 0,
     gpu_prefill_mode: qwen3.GpuPrefillMode = .wide,
     strict_live_ram: bool = false,
+    prefill_backend_mode: dequant.PrefillBackendMode = .auto,
+    strict_nax: bool = false,
+    bus_bandwidth_gbs_override: ?f64 = null,
 };
 
 pub const GraphDecodeBenchResult = struct {
@@ -5959,6 +6000,7 @@ pub const GraphDecodeBenchResult = struct {
     residual_label: []const u8,
     loop_label: []const u8,
     gpu_prefill_mode: qwen3.GpuPrefillMode = .wide,
+    spec_bus_gbs: f64 = M4_BUS_BANDWIDTH_GBS,
     measured_layers: u32,
     effective_loops: u32,
     prefill_tokens: u32 = 0,
@@ -6017,7 +6059,7 @@ pub const GraphDecodeBenchResult = struct {
             \\graph_bench.ms_per_tok           {d:.3}
             \\graph_bench.tok_per_s            {d:.2}
             \\graph_bench.bytes_per_tok        {d}
-            \\graph_bench.effective_gbs        {d:.2}
+            \\graph_bench.effective_gbs        {d:.2} ({d:.1}% bus)
             \\graph_bench.gdn_scratch_evals    {d}
             \\graph_bench.gdn_final_commits    {d}
             \\graph_bench.ple_r0_fills         {d}
@@ -6050,6 +6092,7 @@ pub const GraphDecodeBenchResult = struct {
             self.tokensPerSec(),
             self.bytes_per_tok,
             self.effectiveGbs(),
+            (self.effectiveGbs() / (if (std.math.isFinite(self.spec_bus_gbs) and self.spec_bus_gbs > 0.0) self.spec_bus_gbs else M4_BUS_BANDWIDTH_GBS)) * 100.0,
             self.loop_isolation.gdn_scratch_evals,
             self.loop_isolation.gdn_final_commits,
             self.loop_isolation.ple_r0_fills,
@@ -6099,6 +6142,9 @@ pub fn runGraphDecodeBenchFromFile(
         .kv_retire_q8_after_chunks = opts.kv_retire_q8_after_chunks,
         .gpu_prefill_mode = opts.gpu_prefill_mode,
         .strict_live_ram = opts.strict_live_ram,
+        .prefill_backend_mode = opts.prefill_backend_mode,
+        .strict_nax = opts.strict_nax,
+        .bus_bandwidth_gbs_override = opts.bus_bandwidth_gbs_override,
     });
     defer model.deinit(allocator);
     const load_t1 = try vmstat.nowNs();
@@ -6139,6 +6185,7 @@ pub fn runGraphDecodeBenchFromFile(
         .residual_label = cfg.axes.residual_kind.label(),
         .loop_label = cfg.axes.loop_schedule.mode.label(),
         .gpu_prefill_mode = opts.gpu_prefill_mode,
+        .spec_bus_gbs = model.chip_profile.spec_bus_gbs,
         .measured_layers = cfg.num_hidden_layers,
         .effective_loops = model.effective_max_loops,
         .prefill_tokens = opts.prefill_tokens,
@@ -12013,4 +12060,965 @@ test "runM68WithConfig exercises G16 canary/Apple10, G15 wide prefill/tail-pruni
     try std.testing.expect(std.mem.indexOf(u8, rendered, "c15.boundary_on") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "r9.strict_live_ram_rejected") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "m68.swap.status") != null);
+}
+
+// ---------------------------------------------------------------------------
+// M6.9 Multi-Generation Apple Silicon & NAX TensorOps Harness (`C16`, `G17`, Spike `S8`, ADR-0021)
+// ---------------------------------------------------------------------------
+
+pub const M69Config = struct {
+    prefill_backend_mode: dequant.PrefillBackendMode = .auto,
+    strict_nax: bool = false,
+    bus_bandwidth_gbs_override: ?f64 = null,
+    warmup_batches: u32 = 4,
+    timed_batches: u32 = 4,
+    dispatches_per_batch: u32 = 8,
+    timeout_ms: u64 = 30_000,
+    /// When `true` on `Apple10+` (`Spike S8`), sweeps `M = 64, 128, 512, 1024`
+    /// across `N,K = 2048/4096`. Unit tests can pass `false` for compact shapes.
+    full_s8_shapes: bool = true,
+};
+
+pub const M69NaxKernelKind = enum(u8) {
+    dense_f16 = 0,
+    dense_bf16 = 1,
+    dequant_q2 = 2,
+    dequant_q3 = 3,
+    dequant_q4 = 4,
+    fp4_e2m1 = 5,
+
+    pub fn label(self: M69NaxKernelKind) []const u8 {
+        return switch (self) {
+            .dense_f16 => "dense_f16",
+            .dense_bf16 => "dense_bf16",
+            .dequant_q2 => "dequant_q2",
+            .dequant_q3 => "dequant_q3",
+            .dequant_q4 => "dequant_q4",
+            .fp4_e2m1 => "fp4_e2m1",
+        };
+    }
+
+    pub fn hasSimdgroupBaseline(self: M69NaxKernelKind) bool {
+        return self != .fp4_e2m1;
+    }
+};
+
+pub const M69NaxSweepRow = struct {
+    kind: M69NaxKernelKind = .dense_f16,
+    m: u32 = 0,
+    n: u32 = 0,
+    k: u32 = 0,
+    nax_us: f64 = 0.0,
+    nax_tflops: f64 = 0.0,
+    nax_gbs: f64 = 0.0,
+    nax_bus_pct: f64 = 0.0,
+    simdgroup_us: f64 = 0.0,
+    simdgroup_tflops: f64 = 0.0,
+    speedup_vs_simdgroup: f64 = 0.0,
+    max_abs_err_vs_cpu: f32 = 0.0,
+    max_abs_err_vs_simdgroup: f32 = 0.0,
+};
+
+pub const M69_MAX_S8_ROWS: usize = 48;
+
+pub const M69Report = struct {
+    chip_profile: chip_profile_mod.ChipProfile,
+    gpu_name_buf: [64]u8,
+    gpu_name_len: usize,
+    cpu_brand_buf: [128]u8,
+    cpu_brand_len: usize,
+    hw_model_buf: [128]u8,
+    hw_model_len: usize,
+    supports_apple9: bool,
+    supports_apple10: bool,
+    supports_apple11: bool,
+    supports_nax: bool,
+
+    has_dense_gemm_nax: bool,
+    has_dequant_gemm_nax: bool,
+    has_fp4_e2m1_gemm_nax: bool,
+
+    requested_mode: dequant.PrefillBackendMode,
+    requested_strict_nax: bool,
+    requested_active_backend: dequant.PrefillMatmulBackend,
+    requested_fallback_reason: dequant.NaxFallbackReason,
+    canary_cold_elapsed_us: f64,
+    canary_warm_inbuf_elapsed_us: f64,
+    canary_max_abs_err_f16: f32,
+    canary_max_abs_err_bf16: f32,
+    canary_max_abs_err_q4: f32,
+    canary_nax_tested: bool,
+    canary_nax_demoted: bool,
+
+    auto_gate_ok: bool,
+    simdgroup_gate_ok: bool,
+    nax_soft_gate_ok: bool,
+    nax_strict_gate_ok: bool,
+    sim_canary_demotion_ok: bool,
+    sim_canary_strict_reject_ok: bool,
+
+    s8_executed: bool,
+    s8_rows: [M69_MAX_S8_ROWS]M69NaxSweepRow,
+    s8_row_count: usize,
+
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn gpuName(self: *const M69Report) []const u8 {
+        return self.gpu_name_buf[0..self.gpu_name_len];
+    }
+
+    pub fn cpuBrand(self: *const M69Report) []const u8 {
+        return self.cpu_brand_buf[0..self.cpu_brand_len];
+    }
+
+    pub fn hwModel(self: *const M69Report) []const u8 {
+        return self.hw_model_buf[0..self.hw_model_len];
+    }
+
+    pub fn write(self: *const M69Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.print(
+            \\M6.9 Multi-Generation ChipProfile & Metal 4 NAX TensorOps Gates (ADR-0021)
+            \\m69.chip.generation              {s}
+            \\m69.chip.tier                    {s}
+            \\m69.chip.cpu_brand               {s}
+            \\m69.chip.hw_model                {s}
+            \\m69.chip.spec_bus_gbs            {d:.2}
+            \\m69.chip.bandwidth_source        {s}
+            \\m69.gpu.name                     {s}
+            \\m69.gpu.apple_family             {d}
+            \\m69.gpu.supports_apple9          {s}
+            \\m69.gpu.supports_apple10         {s}
+            \\m69.gpu.supports_apple11         {s}
+            \\m69.gpu.supports_nax             {s}
+            \\m69.metallib.has_dense_gemm_nax  {s}
+            \\m69.metallib.has_dequant_gemm_nax {s}
+            \\m69.metallib.has_fp4_e2m1_gemm_nax {s}
+            \\
+        , .{
+            self.chip_profile.generation.label(),
+            self.chip_profile.tier.label(),
+            self.cpuBrand(),
+            self.hwModel(),
+            self.chip_profile.spec_bus_gbs,
+            self.chip_profile.bandwidth_source.label(),
+            self.gpuName(),
+            self.chip_profile.gpu_apple_family,
+            if (self.supports_apple9) "yes" else "no",
+            if (self.supports_apple10) "yes" else "no",
+            if (self.supports_apple11) "yes" else "no",
+            if (self.supports_nax) "yes" else "no",
+            if (self.has_dense_gemm_nax) "yes" else "no",
+            if (self.has_dequant_gemm_nax) "yes" else "no",
+            if (self.has_fp4_e2m1_gemm_nax) "yes" else "no",
+        });
+        try out.print(
+            \\m69.requested.backend_mode       {s}
+            \\m69.requested.strict_nax         {s}
+            \\m69.requested.active_backend     {s}
+            \\m69.requested.fallback_reason    {s}
+            \\m69.canary.cold_elapsed_us       {d:.1}
+            \\m69.canary.warm_inbuf_elapsed_us {d:.1}
+            \\m69.canary.max_abs_err_f16       {d:.6}
+            \\m69.canary.max_abs_err_bf16      {d:.6}
+            \\m69.canary.max_abs_err_q4        {d:.6}
+            \\m69.canary.nax_tested            {s}
+            \\m69.canary.nax_demoted           {s}
+            \\m69.gate.auto                    {s}
+            \\m69.gate.simdgroup               {s}
+            \\m69.gate.nax_soft_fallback       {s}
+            \\m69.gate.nax_strict              {s}
+            \\m69.gate.sim_canary_demotion     {s}
+            \\m69.gate.sim_canary_strict_rej   {s}
+            \\
+        , .{
+            self.requested_mode.label(),
+            if (self.requested_strict_nax) "yes" else "no",
+            self.requested_active_backend.label(),
+            self.requested_fallback_reason.label(),
+            self.canary_cold_elapsed_us,
+            self.canary_warm_inbuf_elapsed_us,
+            self.canary_max_abs_err_f16,
+            self.canary_max_abs_err_bf16,
+            self.canary_max_abs_err_q4,
+            if (self.canary_nax_tested) "yes" else "no",
+            if (self.canary_nax_demoted) "yes" else "no",
+            if (self.auto_gate_ok) "pass" else "fail",
+            if (self.simdgroup_gate_ok) "pass" else "fail",
+            if (self.nax_soft_gate_ok) "pass" else "fail",
+            if (self.nax_strict_gate_ok) "pass" else "fail",
+            if (self.sim_canary_demotion_ok) "pass" else "fail",
+            if (self.sim_canary_strict_reject_ok) "pass" else "fail",
+        });
+
+        try out.writeAll("\nSpike S8 Apple10+ NAX Hardware Parity & TFLOP/s Sweep\n");
+        if (!self.s8_executed) {
+            try out.writeAll("spike_s8.nax_hw_status=skipped_requires_apple10\n");
+        } else {
+            try out.writeAll(
+                \\spike_s8.nax_hw_status=executed
+                \\kernel       shape              nax(us)   nax(TF/s)   nax(GB/s)   bus(%)    sg(us)    sg(TF/s)   speedup   max_err_cpu   max_err_sg
+                \\
+            );
+            for (self.s8_rows[0..self.s8_row_count]) |row| {
+                var sbuf: [40]u8 = undefined;
+                const shape = std.fmt.bufPrint(&sbuf, "{d}x{d}x{d}", .{ row.m, row.n, row.k }) catch unreachable;
+                try out.print(
+                    \\{s: <12} {s: <18} {d: >7.1}   {d: >9.3}   {d: >9.2}   {d: >6.1}   {d: >7.1}   {d: >9.3}   {d: >7.2}x   {d: >11.6}   {d: >10.6}
+                    \\
+                , .{
+                    row.kind.label(),
+                    shape,
+                    row.nax_us,
+                    row.nax_tflops,
+                    row.nax_gbs,
+                    row.nax_bus_pct,
+                    row.simdgroup_us,
+                    row.simdgroup_tflops,
+                    row.speedup_vs_simdgroup,
+                    row.max_abs_err_vs_cpu,
+                    row.max_abs_err_vs_simdgroup,
+                });
+            }
+        }
+
+        try out.print(
+            \\
+            \\M6.9 Overall Swap Check
+            \\m69.swap.status                  ok
+            \\m69.swap.swapouts_delta          {d}
+            \\m69.swap.pageouts_delta          {d}
+            \\
+        , .{
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+const NaxFp4Params = extern struct {
+    m: u32,
+    n: u32,
+    k: u32,
+    num_groups: u32,
+    row_bytes: u32,
+    group_size: u32,
+};
+
+const M69_FP4_E2M1_LUT = [8]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 };
+
+fn decodeM69Fp4E2m1Nibble(nibble: u8) f32 {
+    const mag = M69_FP4_E2M1_LUT[nibble & 7];
+    return if ((nibble & 8) != 0) -mag else mag;
+}
+
+fn runM69SpikeS8Case(
+    device: metal.Device,
+    wired_budget: budget_mod.Budget,
+    chip_profile: chip_profile_mod.ChipProfile,
+    nax_pipes: dequant.DequantPipelines,
+    sg_pipes: dequant.DequantPipelines,
+    fp4_pipe: metal.Pipeline,
+    compute: *metal.Compute,
+    kind: M69NaxKernelKind,
+    m: u32,
+    n: u32,
+    k: u32,
+    cfg: M69Config,
+) !M69NaxSweepRow {
+    const m_sz: usize = m;
+    const n_sz: usize = n;
+    const k_sz: usize = k;
+    const x_bytes: usize = amf.align64(m_sz * k_sz * @sizeOf(f16));
+    const y_bytes: usize = amf.align64(m_sz * n_sz * @sizeOf(f16));
+
+    const w_bytes_exact, const aux_bytes_exact, const bytes_per_dispatch = switch (kind) {
+        .dense_f16, .dense_bf16 => blk: {
+            const wb = n_sz * k_sz * @sizeOf(u16);
+            break :blk .{ wb, @as(usize, 0), @as(u64, wb + m_sz * k_sz * 2 + m_sz * n_sz * 2) };
+        },
+        .dequant_q2 => blk: {
+            const wb = try Q2.packedWeightBytes(n, k);
+            const sb = try Q2.scaleBiasBytes(n, k);
+            break :blk .{ wb, sb, @as(u64, wb + sb + m_sz * k_sz * 2 + m_sz * n_sz * 2) };
+        },
+        .dequant_q3 => blk: {
+            const wb = try Q3.packedWeightBytes(n, k);
+            const sb = try Q3.scaleBiasBytes(n, k);
+            break :blk .{ wb, sb, @as(u64, wb + sb + m_sz * k_sz * 2 + m_sz * n_sz * 2) };
+        },
+        .dequant_q4 => blk: {
+            const wb = try Q4.packedWeightBytes(n, k);
+            const sb = try Q4.scaleBiasBytes(n, k);
+            break :blk .{ wb, sb, @as(u64, wb + sb + m_sz * k_sz * 2 + m_sz * n_sz * 2) };
+        },
+        .fp4_e2m1 => blk: {
+            const row_b = k_sz / 2;
+            const num_g = k_sz / 64;
+            const wb = n_sz * row_b;
+            const sc = n_sz * num_g * @sizeOf(f16);
+            break :blk .{ wb, sc, @as(u64, wb + sc + m_sz * k_sz * 2 + m_sz * n_sz * 2) };
+        },
+    };
+
+    const w_bytes = amf.align64(w_bytes_exact);
+    const aux_bytes = amf.align64(@max(aux_bytes_exact, 64));
+    const arena_bytes = try page.alignUp(x_bytes + w_bytes + aux_bytes + 2 * y_bytes + 4 * page.APPLE_PAGE_SIZE);
+
+    var arena = try arena_mod.WiredArena.init(arena_bytes, wired_budget);
+    defer arena.deinit();
+
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const w_raw = try arena.allocAligned(w_bytes, 64);
+    const aux_raw = try arena.allocAligned(aux_bytes, 64);
+    const y_nax_raw = try arena.allocAligned(y_bytes, 64);
+    const y_sg_raw = try arena.allocAligned(y_bytes, 64);
+    @memset(y_nax_raw, 0);
+    @memset(y_sg_raw, 0);
+
+    // Deterministic bounded signed activations in [-0.25, +0.25].
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw[0 .. m_sz * k_sz * 2]));
+    for (0..m_sz) |mi| {
+        for (0..k_sz) |ki| {
+            const c: i32 = @as(i32, @intCast((mi * 17 + ki * 13 + 3) % 9)) - 4;
+            x_f16[mi * k_sz + ki] = @floatCast(@as(f32, @floatFromInt(c)) * 0.0625);
+        }
+    }
+
+    // Populate deterministic weights per kernel kind.
+    switch (kind) {
+        .dense_f16 => {
+            const w_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, w_raw[0..w_bytes_exact]));
+            for (0..n_sz) |ni| {
+                for (0..k_sz) |ki| {
+                    const c: i32 = @as(i32, @intCast((ni * 11 + ki * 7 + 5) % 9)) - 4;
+                    w_f16[ni * k_sz + ki] = @floatCast(@as(f32, @floatFromInt(c)) * 0.03125);
+                }
+            }
+        },
+        .dense_bf16 => {
+            const w_bf16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_raw[0..w_bytes_exact]));
+            for (0..n_sz) |ni| {
+                for (0..k_sz) |ki| {
+                    const c: i32 = @as(i32, @intCast((ni * 11 + ki * 7 + 5) % 9)) - 4;
+                    w_bf16[ni * k_sz + ki] = quant.f32ToBf16(@as(f32, @floatFromInt(c)) * 0.03125);
+                }
+            }
+        },
+        .dequant_q2, .dequant_q3, .dequant_q4 => {
+            const num_g = k_sz / 64;
+            const sbs: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, aux_raw[0..aux_bytes_exact]));
+            var codes: [64]u8 = undefined;
+            const mask: usize = switch (kind) {
+                .dequant_q2 => 3,
+                .dequant_q3 => 7,
+                .dequant_q4 => 15,
+                else => unreachable,
+            };
+            const bias_f: f32 = switch (kind) {
+                .dequant_q2 => -0.046875,
+                .dequant_q3 => -0.109375,
+                .dequant_q4 => -0.1171875,
+                else => unreachable,
+            };
+            const scale_f: f32 = if (kind == .dequant_q4) 0.015625 else 0.03125;
+            const row_b = w_bytes_exact / n_sz;
+            const grp_b = row_b / num_g;
+            for (0..n_sz) |ni| {
+                for (0..num_g) |gi| {
+                    for (0..64) |i| {
+                        codes[i] = @intCast((ni * 7 + gi * 5 + i * 3 + 1) & mask);
+                    }
+                    const dst = w_raw[ni * row_b + gi * grp_b ..][0..grp_b];
+                    switch (kind) {
+                        .dequant_q2 => Q2.packGroup(&codes, dst[0..comptime Q2.groupWeightBytes()]),
+                        .dequant_q3 => Q3.packGroup(&codes, dst[0..comptime Q3.groupWeightBytes()]),
+                        .dequant_q4 => Q4.packGroup(&codes, dst[0..comptime Q4.groupWeightBytes()]),
+                        else => unreachable,
+                    }
+                    sbs[ni * num_g + gi] = .{
+                        .scale = @floatCast(scale_f),
+                        .bias = @floatCast(bias_f),
+                    };
+                }
+            }
+        },
+        .fp4_e2m1 => {
+            const row_b = k_sz / 2;
+            const num_g = k_sz / 64;
+            const scales: []f16 = @alignCast(std.mem.bytesAsSlice(f16, aux_raw[0..aux_bytes_exact]));
+            for (0..n_sz) |ni| {
+                for (0..row_b) |bi| {
+                    const lo: u8 = @intCast((ni * 5 + bi * 3 + 1) & 0xF);
+                    const hi: u8 = @intCast((ni * 7 + bi * 5 + 2) & 0xF);
+                    w_raw[ni * row_b + bi] = lo | (hi << 4);
+                }
+                for (0..num_g) |gi| {
+                    scales[ni * num_g + gi] = @floatCast(@as(f32, 0.015625));
+                }
+            }
+        },
+    }
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    try compute.makeResident(&.{gpu_buf});
+    defer compute.removeResident(&.{gpu_buf}) catch |err| {
+        std.debug.panic("removeResident failed during M6.9 S8 case cleanup: {}", .{err});
+    };
+
+    const x_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) };
+    const w_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w_raw.ptr) };
+    const aux_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(aux_raw.ptr) };
+    const y_nax_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_nax_raw.ptr) };
+    const y_sg_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_sg_raw.ptr) };
+
+    const encodeKernel = struct {
+        fn run(
+            pipes: dequant.DequantPipelines,
+            fp4_p: metal.Pipeline,
+            frame: *metal.Compute.Frame,
+            k_kind: M69NaxKernelKind,
+            xb: metal.BufferBinding,
+            wb: metal.BufferBinding,
+            ab: metal.BufferBinding,
+            yb: metal.BufferBinding,
+            mm: u32,
+            nn: u32,
+            kk: u32,
+            barrier: bool,
+        ) !void {
+            switch (k_kind) {
+                .dense_f16 => try pipes.encodePrefillDenseGemm(frame, .f16, .{
+                    .x = xb,
+                    .weight = wb,
+                    .y = yb,
+                    .m = mm,
+                    .n = nn,
+                    .k = kk,
+                    .wide_tile = true,
+                }, barrier),
+                .dense_bf16 => try pipes.encodePrefillDenseGemm(frame, .bf16, .{
+                    .x = xb,
+                    .weight = wb,
+                    .y = yb,
+                    .m = mm,
+                    .n = nn,
+                    .k = kk,
+                    .wide_tile = true,
+                }, barrier),
+                .dequant_q2 => try pipes.encodePrefillGemm(frame, .q2, .{
+                    .x = xb,
+                    .qweight = wb,
+                    .scale_bias = ab,
+                    .y = yb,
+                    .m = mm,
+                    .n = nn,
+                    .k = kk,
+                    .wide_tile = true,
+                }, barrier),
+                .dequant_q3 => try pipes.encodePrefillGemm(frame, .q3, .{
+                    .x = xb,
+                    .qweight = wb,
+                    .scale_bias = ab,
+                    .y = yb,
+                    .m = mm,
+                    .n = nn,
+                    .k = kk,
+                    .wide_tile = true,
+                }, barrier),
+                .dequant_q4 => try pipes.encodePrefillGemm(frame, .q4, .{
+                    .x = xb,
+                    .qweight = wb,
+                    .scale_bias = ab,
+                    .y = yb,
+                    .m = mm,
+                    .n = nn,
+                    .k = kk,
+                    .wide_tile = true,
+                }, barrier),
+                .fp4_e2m1 => {
+                    const params: NaxFp4Params = .{
+                        .m = mm,
+                        .n = nn,
+                        .k = kk,
+                        .num_groups = kk / 64,
+                        .row_bytes = kk / 2,
+                        .group_size = 64,
+                    };
+                    const gx: u64 = (@as(u64, nn) + 63) / 64;
+                    const gy: u64 = (@as(u64, mm) + 63) / 64;
+                    try frame.encodeThreadgroups(
+                        fp4_p,
+                        &.{ xb, wb, ab, yb },
+                        std.mem.asBytes(&params),
+                        .{ gx, gy, 1 },
+                        .{ 128, 1, 1 },
+                        barrier,
+                    );
+                },
+            }
+        }
+    }.run;
+
+    const total_disps: u64 = @as(u64, cfg.timed_batches) * cfg.dispatches_per_batch;
+    const flops_per_disp: f64 = 2.0 * @as(f64, @floatFromInt(m)) * @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(k));
+
+    // Warmup & time NAX kernel.
+    var wsig: u64 = 0;
+    for (0..cfg.warmup_batches) |_| {
+        var frame = try compute.beginFrame(cfg.timeout_ms);
+        errdefer frame.abort();
+        for (0..cfg.dispatches_per_batch) |d| {
+            try encodeKernel(nax_pipes, fp4_pipe, &frame, kind, x_bind, w_bind, aux_bind, y_nax_bind, m, n, k, d > 0);
+        }
+        wsig = try frame.commit();
+    }
+    try compute.wait(wsig, cfg.timeout_ms);
+
+    var nax_sig: u64 = 0;
+    const t_nax_0 = try vmstat.nowNs();
+    for (0..cfg.timed_batches) |_| {
+        var frame = try compute.beginFrame(cfg.timeout_ms);
+        errdefer frame.abort();
+        for (0..cfg.dispatches_per_batch) |d| {
+            try encodeKernel(nax_pipes, fp4_pipe, &frame, kind, x_bind, w_bind, aux_bind, y_nax_bind, m, n, k, d > 0);
+        }
+        nax_sig = try frame.commit();
+    }
+    try compute.wait(nax_sig, cfg.timeout_ms);
+    const t_nax_1 = try vmstat.nowNs();
+    const nax_ns: u64 = @max(t_nax_1 -| t_nax_0, 1);
+    const nax_us: f64 = (@as(f64, @floatFromInt(nax_ns)) / @as(f64, @floatFromInt(total_disps))) / 1000.0;
+    const nax_tflops: f64 = (flops_per_disp * @as(f64, @floatFromInt(total_disps)) / @as(f64, @floatFromInt(nax_ns))) / 1000.0;
+    const nax_gbs: f64 = (@as(f64, @floatFromInt(bytes_per_dispatch)) * @as(f64, @floatFromInt(total_disps))) / @as(f64, @floatFromInt(nax_ns));
+    const nax_bus_pct: f64 = chip_profile.percentOfBus(nax_gbs);
+
+    // Warmup & time `simdgroup_matrix` (`*_wide`) baseline when available.
+    var sg_us: f64 = 0.0;
+    var sg_tflops: f64 = 0.0;
+    var speedup: f64 = 0.0;
+    if (kind.hasSimdgroupBaseline()) {
+        for (0..cfg.warmup_batches) |_| {
+            var frame = try compute.beginFrame(cfg.timeout_ms);
+            errdefer frame.abort();
+            for (0..cfg.dispatches_per_batch) |d| {
+                try encodeKernel(sg_pipes, fp4_pipe, &frame, kind, x_bind, w_bind, aux_bind, y_sg_bind, m, n, k, d > 0);
+            }
+            wsig = try frame.commit();
+        }
+        try compute.wait(wsig, cfg.timeout_ms);
+
+        var sg_sig: u64 = 0;
+        const t_sg_0 = try vmstat.nowNs();
+        for (0..cfg.timed_batches) |_| {
+            var frame = try compute.beginFrame(cfg.timeout_ms);
+            errdefer frame.abort();
+            for (0..cfg.dispatches_per_batch) |d| {
+                try encodeKernel(sg_pipes, fp4_pipe, &frame, kind, x_bind, w_bind, aux_bind, y_sg_bind, m, n, k, d > 0);
+            }
+            sg_sig = try frame.commit();
+        }
+        try compute.wait(sg_sig, cfg.timeout_ms);
+        const t_sg_1 = try vmstat.nowNs();
+        const sg_ns: u64 = @max(t_sg_1 -| t_sg_0, 1);
+        sg_us = (@as(f64, @floatFromInt(sg_ns)) / @as(f64, @floatFromInt(total_disps))) / 1000.0;
+        sg_tflops = (flops_per_disp * @as(f64, @floatFromInt(total_disps)) / @as(f64, @floatFromInt(sg_ns))) / 1000.0;
+        speedup = if (sg_tflops > 0.0) nax_tflops / sg_tflops else 0.0;
+    }
+
+    // Full-tensor finiteness & `NAX vs simdgroup` parity check + sampled exact CPU fp32 reference check.
+    const y_nax: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, y_nax_raw[0 .. m_sz * n_sz * 2]));
+    const y_sg: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, y_sg_raw[0 .. m_sz * n_sz * 2]));
+    var max_err_sg: f32 = 0.0;
+    for (0..m_sz * n_sz) |idx| {
+        const gn: f32 = @floatCast(y_nax[idx]);
+        if (!std.math.isFinite(gn)) return error.NonFiniteOutput;
+        if (kind.hasSimdgroupBaseline()) {
+            const gs: f32 = @floatCast(y_sg[idx]);
+            if (!std.math.isFinite(gs)) return error.NonFiniteOutput;
+            const d = @abs(gn - gs);
+            if (d > max_err_sg) max_err_sg = d;
+        }
+    }
+
+    const row_samples: usize = @min(m_sz, 16);
+    const col_samples: usize = @min(n_sz, 32);
+    const row_step: usize = @max(@as(usize, 1), m_sz / row_samples);
+    const col_step: usize = @max(@as(usize, 1), n_sz / col_samples);
+    var max_err_cpu: f32 = 0.0;
+    var deq_grp: [64]f32 = undefined;
+    var ri: usize = 0;
+    while (ri < m_sz) : (ri += row_step) {
+        const x_row = x_f16[ri * k_sz ..][0..k_sz];
+        var ci: usize = 0;
+        while (ci < n_sz) : (ci += col_step) {
+            var acc: f32 = 0.0;
+            switch (kind) {
+                .dense_f16 => {
+                    const w_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, w_raw[0..w_bytes_exact]));
+                    const w_row = w_f16[ci * k_sz ..][0..k_sz];
+                    for (0..k_sz) |ki| acc += @as(f32, @floatCast(x_row[ki])) * @as(f32, @floatCast(w_row[ki]));
+                },
+                .dense_bf16 => {
+                    const w_bf16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, w_raw[0..w_bytes_exact]));
+                    const w_row = w_bf16[ci * k_sz ..][0..k_sz];
+                    for (0..k_sz) |ki| acc += @as(f32, @floatCast(x_row[ki])) * quant.bf16ToF32(w_row[ki]);
+                },
+                .dequant_q2, .dequant_q3, .dequant_q4 => {
+                    const num_g = k_sz / 64;
+                    const row_b = w_bytes_exact / n_sz;
+                    const grp_b = row_b / num_g;
+                    const sbs: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, aux_raw[0..aux_bytes_exact]));
+                    for (0..num_g) |gi| {
+                        const src = w_raw[ci * row_b + gi * grp_b ..][0..grp_b];
+                        const sb = sbs[ci * num_g + gi];
+                        switch (kind) {
+                            .dequant_q2 => Q2.dequantizeGroup(src[0..comptime Q2.groupWeightBytes()], sb, &deq_grp),
+                            .dequant_q3 => Q3.dequantizeGroup(src[0..comptime Q3.groupWeightBytes()], sb, &deq_grp),
+                            .dequant_q4 => Q4.dequantizeGroup(src[0..comptime Q4.groupWeightBytes()], sb, &deq_grp),
+                            else => unreachable,
+                        }
+                        for (0..64) |i| {
+                            acc += @as(f32, @floatCast(x_row[gi * 64 + i])) * deq_grp[i];
+                        }
+                    }
+                },
+                .fp4_e2m1 => {
+                    const row_b = k_sz / 2;
+                    const num_g = k_sz / 64;
+                    const scales: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, aux_raw[0..aux_bytes_exact]));
+                    for (0..num_g) |gi| {
+                        const s: f32 = @floatCast(scales[ci * num_g + gi]);
+                        for (0..32) |bi| {
+                            const packed_byte = w_raw[ci * row_b + gi * 32 + bi];
+                            const w0: f32 = @floatCast(@as(f16, @floatCast(decodeM69Fp4E2m1Nibble(packed_byte & 0xF) * s)));
+                            const w1: f32 = @floatCast(@as(f16, @floatCast(decodeM69Fp4E2m1Nibble(packed_byte >> 4) * s)));
+                            acc += @as(f32, @floatCast(x_row[gi * 64 + bi * 2])) * w0;
+                            acc += @as(f32, @floatCast(x_row[gi * 64 + bi * 2 + 1])) * w1;
+                        }
+                    }
+                },
+            }
+            const got: f32 = @floatCast(y_nax[ri * n_sz + ci]);
+            const d = @abs(got - acc);
+            if (d > max_err_cpu) max_err_cpu = d;
+        }
+    }
+
+    return .{
+        .kind = kind,
+        .m = m,
+        .n = n,
+        .k = k,
+        .nax_us = nax_us,
+        .nax_tflops = nax_tflops,
+        .nax_gbs = nax_gbs,
+        .nax_bus_pct = nax_bus_pct,
+        .simdgroup_us = sg_us,
+        .simdgroup_tflops = sg_tflops,
+        .speedup_vs_simdgroup = speedup,
+        .max_abs_err_vs_cpu = max_err_cpu,
+        .max_abs_err_vs_simdgroup = max_err_sg,
+    };
+}
+
+/// Runs Milestone M6.9 (`C16` + `G17` + `Spike S8`, `ADR-0021`):
+/// - Section 1 (any Apple Silicon host): validates unified `.metallib` `*_nax`
+///   symbols, `ChipProfile` resolution, `.auto`/`.simdgroup`/`.nax` fallback &
+///   strict-mode rejection, and simulated canary demotion.
+/// - Section 2 (`Spike S8` on `Apple10+` GPUs only): sweeps `ami_dense_gemm_nax`
+///   (`f16`, `bf16`), `ami_dequant_gemm_nax` (`q2`, `q3`, `q4` group-64), and
+///   `ami_fp4_e2m1_gemm_nax` against `simdgroup_matrix` (`*_wide`) and CPU `fp32`
+///   references. On `Apple9` (M4) and earlier, records `s8_executed = false` and
+///   emits `spike_s8.nax_hw_status=skipped_requires_apple10` without fabricating
+///   `NAX` hardware numbers.
+pub fn runM69WithConfig(allocator: std.mem.Allocator, cfg: M69Config) !M69Report {
+    _ = allocator;
+    if (cfg.timed_batches == 0 or cfg.dispatches_per_batch == 0 or cfg.dispatches_per_batch > MAX_DISPATCHES_PER_FRAME) {
+        return error.InvalidConfig;
+    }
+
+    const vm_before = try vmstat.Snapshot.capture();
+    const facts = try sysinfo.Facts.read();
+    var dev = try metal.Device.open();
+    defer dev.close();
+    const dev_info = try dev.info();
+    const lib = try metal.Library.openEmbedded(dev);
+    defer lib.close();
+
+    const profile = chip_profile_mod.ChipProfile.resolve(
+        facts,
+        dev_info.name(),
+        dev_info.appleGpuFamily(),
+        cfg.bus_bandwidth_gbs_override,
+    );
+
+    const has_dense_nax = try lib.hasFunction("ami_dense_gemm_nax");
+    const has_dequant_nax = try lib.hasFunction("ami_dequant_gemm_nax");
+    const has_fp4_nax = try lib.hasFunction("ami_fp4_e2m1_gemm_nax");
+
+    // Requested backend mode & startup canary check.
+    var req_pipes = try dequant.DequantPipelines.initWithOptions(dev, lib, .{
+        .backend_mode = cfg.prefill_backend_mode,
+        .strict_nax = cfg.strict_nax,
+    });
+    defer req_pipes.close();
+    const req_canary = try req_pipes.runStartupNumericalCanaryProfileMut(&dev);
+
+    // Gate 1: `.auto` mode.
+    var auto_gate_ok = false;
+    {
+        var p = try dequant.DequantPipelines.initWithOptions(dev, lib, .{ .backend_mode = .auto, .strict_nax = false });
+        defer p.close();
+        _ = try p.runStartupNumericalCanaryMut(&dev);
+        auto_gate_ok = if (dev_info.supportsNaxTensorOps())
+            (p.activeBackend().isNax() and p.naxFallbackReason() == .none)
+        else
+            (p.activeBackend() == .simdgroup_apple9 and p.naxFallbackReason() == .unsupported_gpu_family);
+    }
+
+    // Gate 2: `.simdgroup` forced mode.
+    var simdgroup_gate_ok = false;
+    {
+        var p = try dequant.DequantPipelines.initWithOptions(dev, lib, .{ .backend_mode = .simdgroup, .strict_nax = false });
+        defer p.close();
+        _ = try p.runStartupNumericalCanaryMut(&dev);
+        simdgroup_gate_ok = (p.activeBackend() == .simdgroup_apple9 and p.naxFallbackReason() == .forced_simdgroup);
+    }
+
+    // Gate 3: `.nax` soft mode (`strict_nax = false`).
+    var nax_soft_gate_ok = false;
+    {
+        var p = try dequant.DequantPipelines.initWithOptions(dev, lib, .{ .backend_mode = .nax, .strict_nax = false });
+        defer p.close();
+        _ = try p.runStartupNumericalCanaryMut(&dev);
+        nax_soft_gate_ok = if (dev_info.supportsNaxTensorOps())
+            p.activeBackend().isNax()
+        else
+            (p.activeBackend() == .simdgroup_apple9 and p.naxFallbackReason() == .unsupported_gpu_family);
+    }
+
+    // Gate 4: `.nax` strict mode (`strict_nax = true`).
+    var nax_strict_gate_ok = false;
+    if (!dev_info.supportsNaxTensorOps()) {
+        if (dequant.DequantPipelines.initWithOptions(dev, lib, .{ .backend_mode = .nax, .strict_nax = true })) |p| {
+            p.close();
+            nax_strict_gate_ok = false;
+        } else |err| {
+            nax_strict_gate_ok = (err == error.NaxRequiresApple10Gpu);
+        }
+    } else {
+        var p = try dequant.DequantPipelines.initWithOptions(dev, lib, .{ .backend_mode = .nax, .strict_nax = true });
+        defer p.close();
+        _ = try p.runStartupNumericalCanaryMut(&dev);
+        nax_strict_gate_ok = p.activeBackend().isNax();
+    }
+
+    // Gate 5: Simulated NAX canary failure -> automatic atomic demotion to `simdgroup_apple9`.
+    var sim_canary_demotion_ok = false;
+    {
+        var p = try dequant.DequantPipelines.initWithOptions(dev, lib, .{
+            .backend_mode = .auto,
+            .strict_nax = false,
+            .simulate_nax_canary_failure = true,
+        });
+        defer p.close();
+        const prof = try p.runStartupNumericalCanaryProfileMut(&dev);
+        sim_canary_demotion_ok = prof.cold.nax_tested and prof.cold.nax_demoted and
+            p.activeBackend() == .simdgroup_apple9 and
+            p.naxFallbackReason() == .nax_canary_failed;
+    }
+
+    // Gate 6: Simulated NAX canary failure under `strict_nax = true` -> hard error.
+    var sim_canary_strict_reject_ok = false;
+    {
+        const p = try dequant.DequantPipelines.initWithOptions(dev, lib, .{
+            .backend_mode = .auto,
+            .strict_nax = true,
+            .simulate_nax_canary_failure = true,
+        });
+        defer p.close();
+        if (p.runStartupNumericalCanary(&dev)) |_| {
+            sim_canary_strict_reject_ok = false;
+        } else |err| {
+            sim_canary_strict_reject_ok = (err == error.MetallibNumericalCanaryFailed);
+        }
+    }
+
+    // Section 2: `Spike S8` hardware parity & TFLOP/s sweep (ONLY on `Apple10+`).
+    var s8_rows: [M69_MAX_S8_ROWS]M69NaxSweepRow = @splat(.{});
+    var s8_row_count: usize = 0;
+    var s8_executed = false;
+
+    if (dev_info.supportsNaxTensorOps()) {
+        const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+        var nax_pipes = try dequant.DequantPipelines.initWithOptions(dev, lib, .{
+            .backend_mode = .nax,
+            .strict_nax = cfg.strict_nax,
+        });
+        defer nax_pipes.close();
+        _ = try nax_pipes.runStartupNumericalCanaryMut(&dev);
+
+        if (nax_pipes.useNaxPrefill()) {
+            const sg_pipes = try dequant.DequantPipelines.initWithOptions(dev, lib, .{
+                .backend_mode = .simdgroup,
+                .strict_nax = false,
+            });
+            defer sg_pipes.close();
+
+            const fp4_pipe = try metal.Pipeline.initSpecialized(dev, lib, "ami_fp4_e2m1_gemm_nax", &.{
+                .{ .index = 1, .value = .{ .u32 = 64 } },
+            });
+            defer fp4_pipe.close();
+
+            var compute = try metal.Compute.initWithFrames(dev, 2);
+            defer compute.close();
+
+            const kinds = [_]M69NaxKernelKind{
+                .dense_f16,
+                .dense_bf16,
+                .dequant_q2,
+                .dequant_q3,
+                .dequant_q4,
+                .fp4_e2m1,
+            };
+            const full_ms = [_]u32{ 64, 128, 512, 1024 };
+            const full_nks = [_][2]u32{ .{ 2048, 2048 }, .{ 4096, 4096 } };
+            const test_ms = [_]u32{64};
+            const test_nks = [_][2]u32{.{ 128, 128 }};
+
+            const ms: []const u32 = if (cfg.full_s8_shapes) &full_ms else &test_ms;
+            const nks: []const [2]u32 = if (cfg.full_s8_shapes) &full_nks else &test_nks;
+
+            for (kinds) |kind| {
+                for (nks) |nk| {
+                    for (ms) |m| {
+                        if (s8_row_count >= M69_MAX_S8_ROWS) break;
+                        s8_rows[s8_row_count] = try runM69SpikeS8Case(
+                            dev,
+                            wired_budget,
+                            profile,
+                            nax_pipes,
+                            sg_pipes,
+                            fp4_pipe,
+                            &compute,
+                            kind,
+                            m,
+                            nk[0],
+                            nk[1],
+                            cfg,
+                        );
+                        s8_row_count += 1;
+                    }
+                }
+            }
+            s8_executed = (s8_row_count > 0);
+        }
+    }
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    var gpu_name_buf: [64]u8 = @splat(0);
+    const gpu_s = dev_info.name();
+    const gpu_len = @min(gpu_s.len, gpu_name_buf.len);
+    @memcpy(gpu_name_buf[0..gpu_len], gpu_s[0..gpu_len]);
+
+    var cpu_brand_buf: [128]u8 = @splat(0);
+    const brand_s = facts.cpuBrand();
+    const brand_len = @min(brand_s.len, cpu_brand_buf.len);
+    @memcpy(cpu_brand_buf[0..brand_len], brand_s[0..brand_len]);
+
+    var hw_model_buf: [128]u8 = @splat(0);
+    const model_s = facts.hwModel();
+    const model_len = @min(model_s.len, hw_model_buf.len);
+    @memcpy(hw_model_buf[0..model_len], model_s[0..model_len]);
+
+    return .{
+        .chip_profile = profile,
+        .gpu_name_buf = gpu_name_buf,
+        .gpu_name_len = gpu_len,
+        .cpu_brand_buf = cpu_brand_buf,
+        .cpu_brand_len = brand_len,
+        .hw_model_buf = hw_model_buf,
+        .hw_model_len = model_len,
+        .supports_apple9 = dev_info.supportsApple9(),
+        .supports_apple10 = dev_info.supportsApple10(),
+        .supports_apple11 = dev_info.supportsApple11(),
+        .supports_nax = dev_info.supportsNaxTensorOps(),
+        .has_dense_gemm_nax = has_dense_nax,
+        .has_dequant_gemm_nax = has_dequant_nax,
+        .has_fp4_e2m1_gemm_nax = has_fp4_nax,
+        .requested_mode = cfg.prefill_backend_mode,
+        .requested_strict_nax = cfg.strict_nax,
+        .requested_active_backend = req_pipes.activeBackend(),
+        .requested_fallback_reason = req_pipes.naxFallbackReason(),
+        .canary_cold_elapsed_us = req_canary.cold.elapsed_us,
+        .canary_warm_inbuf_elapsed_us = req_canary.warm_elapsed_us,
+        .canary_max_abs_err_f16 = req_canary.cold.max_abs_err_f16,
+        .canary_max_abs_err_bf16 = req_canary.cold.max_abs_err_bf16,
+        .canary_max_abs_err_q4 = req_canary.cold.max_abs_err_q4,
+        .canary_nax_tested = req_canary.cold.nax_tested,
+        .canary_nax_demoted = req_canary.cold.nax_demoted,
+        .auto_gate_ok = auto_gate_ok,
+        .simdgroup_gate_ok = simdgroup_gate_ok,
+        .nax_soft_gate_ok = nax_soft_gate_ok,
+        .nax_strict_gate_ok = nax_strict_gate_ok,
+        .sim_canary_demotion_ok = sim_canary_demotion_ok,
+        .sim_canary_strict_reject_ok = sim_canary_strict_reject_ok,
+        .s8_executed = s8_executed,
+        .s8_rows = s8_rows,
+        .s8_row_count = s8_row_count,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM69(allocator: std.mem.Allocator) !M69Report {
+    return runM69WithConfig(allocator, .{});
+}
+
+test "runM69WithConfig verifies metallib NAX symbols, ChipProfile, fallback/demotion gates, and Apple9 S8 skip" {
+    const gpa = std.testing.allocator;
+    const report = try runM69WithConfig(gpa, .{
+        .prefill_backend_mode = .auto,
+        .strict_nax = false,
+        .bus_bandwidth_gbs_override = 546.0,
+        .warmup_batches = 1,
+        .timed_batches = 1,
+        .dispatches_per_batch = 2,
+        .full_s8_shapes = false,
+    });
+
+    try std.testing.expectApproxEqAbs(@as(f64, 546.0), report.chip_profile.spec_bus_gbs, 1e-6);
+    try std.testing.expectEqual(chip_profile_mod.BandwidthSource.user_override, report.chip_profile.bandwidth_source);
+    try std.testing.expect(report.has_dense_gemm_nax);
+    try std.testing.expect(report.has_dequant_gemm_nax);
+    try std.testing.expect(report.has_fp4_e2m1_gemm_nax);
+    try std.testing.expect(report.auto_gate_ok);
+    try std.testing.expect(report.simdgroup_gate_ok);
+    try std.testing.expect(report.nax_soft_gate_ok);
+    try std.testing.expect(report.nax_strict_gate_ok);
+    try std.testing.expect(report.sim_canary_demotion_ok);
+    try std.testing.expect(report.sim_canary_strict_reject_ok);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m69.metallib.has_dense_gemm_nax  yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m69.metallib.has_dequant_gemm_nax yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m69.metallib.has_fp4_e2m1_gemm_nax yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m69.gate.sim_canary_demotion     pass") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "m69.gate.sim_canary_strict_rej   pass") != null);
+    if (!report.supports_nax) {
+        try std.testing.expect(!report.s8_executed);
+        try std.testing.expectEqual(@as(usize, 0), report.s8_row_count);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "spike_s8.nax_hw_status=skipped_requires_apple10") != null);
+    } else {
+        try std.testing.expect(report.s8_executed);
+        try std.testing.expect(report.s8_row_count >= 6);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "spike_s8.nax_hw_status=executed") != null);
+    }
 }
