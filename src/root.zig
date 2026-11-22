@@ -18,6 +18,7 @@ pub const ring = @import("runtime/ring.zig");
 pub const batch_scheduler = @import("runtime/batch_scheduler.zig");
 pub const qos = @import("platform/qos.zig");
 pub const sysinfo = @import("platform/sysinfo.zig");
+pub const chip_profile = @import("platform/chip_profile.zig");
 pub const vmstat = @import("platform/vmstat.zig");
 pub const tokenizer = @import("model/tokenizer.zig");
 pub const qwen3 = @import("model/qwen3.zig");
@@ -57,6 +58,7 @@ test {
     _ = batch_scheduler;
     _ = qos;
     _ = sysinfo;
+    _ = chip_profile;
     _ = vmstat;
     _ = tokenizer;
     _ = qwen3;

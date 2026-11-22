@@ -20,6 +20,7 @@ const dequant = @import("../gpu/dequant.zig");
 const attention = @import("../gpu/attention.zig");
 const moe = @import("../gpu/moe.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
+const chip_profile_mod = @import("../platform/chip_profile.zig");
 const vmstat = @import("../platform/vmstat.zig");
 const tree_mod = @import("../spec/tree.zig");
 const expert_mod = @import("../expert/source.zig");
@@ -476,6 +477,14 @@ pub const LoadOptions = struct {
     compute_all_logits: bool = false,
     /// Enable lossless `P0-B1` final-layer `prompt_tail` compute pruning (default `true`).
     enable_prompt_tail_pruning: bool = true,
+
+    // M6.9 Multi-Generation Apple Silicon & NAX TensorOps (`C16`, `G17`, ADR-0021)
+    /// Prefill matmul backend policy (`auto`, `simdgroup`, `nax`).
+    prefill_backend_mode: dequant.PrefillBackendMode = .auto,
+    /// Turn `NAX` unavailability or startup canary failure into a hard load error (`--strict-nax`).
+    strict_nax: bool = false,
+    /// Optional explicit memory-bus bandwidth override in GB/s (`--bus-bandwidth-gbs`).
+    bus_bandwidth_gbs_override: ?f64 = null,
 };
 
 pub const LoadError = error{
@@ -491,7 +500,7 @@ pub const LoadError = error{
     OutOfMemory,
 } || ModelConfig.ConfigError || amf.AmfFile.OpenError || quant.ShapeError ||
     sysinfo.Error || vmstat.Error || metal.WrapError || budget_mod.PlanError ||
-    dequant.CanaryError ||
+    dequant.InitError || dequant.CanaryError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError ||
     attention.RetiredKvQ8PoolError ||
     moe.WorkspaceError || aio.EcorePoolError || cache_mod.PoolError ||
@@ -1028,6 +1037,9 @@ pub const Qwen3Model = struct {
     wp_dense_gate_bind: metal.BufferBinding,
     wp_dense_up_bind: metal.BufferBinding,
     wp_dense_act_bind: metal.BufferBinding,
+
+    // M6.9 Multi-Generation Apple Silicon & NAX TensorOps (`C16`, `G17`, ADR-0021)
+    chip_profile: chip_profile_mod.ChipProfile,
 
     pub fn loadFromBytes(
         allocator: std.mem.Allocator,
@@ -6446,8 +6458,32 @@ pub const Qwen3Model = struct {
         };
     }
 
+    /// Evaluates whether ANE hybrid wavefront prefill should handle a prompt of
+    /// `prompt_tokens` tokens under this model's `prefill_mode`, compiled
+    /// `hybrid_rt`, and resolved `chip_profile` (`C16`, `ADR-0021`).
+    pub fn shouldUseHybridWavefront(
+        self: *const Qwen3Model,
+        prompt_tokens: u32,
+        measured_gpu_chunk_ms: ?f64,
+        measured_ane_wavefront_chunk_ms: ?f64,
+    ) bool {
+        if (self.prefill_mode == .gpu or self.hybrid_rt == null or prompt_tokens <= self.chunk_tokens) {
+            return false;
+        }
+        if (self.prefill_mode == .hybrid) {
+            return true;
+        }
+        return wavefront.shouldUseWavefront(
+            self.chip_profile,
+            prompt_tokens,
+            true,
+            measured_gpu_chunk_ms,
+            measured_ane_wavefront_chunk_ms,
+        );
+    }
+
     /// Prefills `tokens[0..tokens.len]` using Hybrid ANE/GPU Wavefront Prefill
-    /// when `hybrid_rt != null` and `tokens.len > chunk_tokens` (and `prefill_mode != .gpu`),
+    /// when `shouldUseHybridWavefront` selects ANE wavefront (`A1`, `C16`),
     /// otherwise using GPU causal chunked prefill (`prefillChunk` / `prefillToken`).
     /// Returns the greedy argmax next token when `compute_logits == true`, else `0`.
     pub fn prefillPrompt(
@@ -6456,7 +6492,8 @@ pub const Qwen3Model = struct {
         compute_logits: bool,
     ) StepError!u32 {
         if (tokens.len == 0) return error.InvalidArgument;
-        if (self.prefill_mode != .gpu and self.hybrid_rt != null and tokens.len > self.chunk_tokens) {
+        const prompt_len_u32: u32 = @intCast(@min(tokens.len, std.math.maxInt(u32)));
+        if (self.shouldUseHybridWavefront(prompt_len_u32, null, null)) {
             const res = try self.prefillHybridWavefront(tokens, compute_logits);
             return res.argmax_token;
         }
@@ -7878,6 +7915,15 @@ fn loadCore(
     const device = try metal.Device.open();
     errdefer device.close();
     const dev_info = try device.info();
+    if (!dev_info.supportsNaxTensorOps() and options.prefill_backend_mode == .nax and options.strict_nax) {
+        return error.NaxRequiresApple10Gpu;
+    }
+    const resolved_chip_profile = chip_profile_mod.ChipProfile.resolve(
+        facts,
+        dev_info.name(),
+        dev_info.appleGpuFamily(),
+        options.bus_bandwidth_gbs_override,
+    );
     const wired_budget = options.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
 
     const raw_shard_cap: u64 = if (options.max_shard_bytes) |cap|
@@ -8172,7 +8218,10 @@ fn loadCore(
     // --- 6. Compile pipelines and create Metal 4 compute context + residency ---
     const library = try metal.Library.openEmbedded(device);
     errdefer library.close();
-    const dequant_pipes = try dequant.DequantPipelines.init(device, library);
+    var dequant_pipes = try dequant.DequantPipelines.initWithOptions(device, library, .{
+        .backend_mode = options.prefill_backend_mode,
+        .strict_nax = options.strict_nax,
+    });
     errdefer dequant_pipes.close();
     const attn_pipes = try attention.AttentionPipelines.init(device, library);
     errdefer attn_pipes.close();
@@ -8187,11 +8236,12 @@ fn loadCore(
     try compute.makeResident(&.{scratch_buf});
     try compute.makeTilesResident(kv_tiles);
 
-    // G16 (`P2`, ADR-0020): startup `.metallib` numerical canary over the
-    // already-resident `scratch_buf` BEFORE carving persistent scratch state.
+    // G16 + G17 (`P2`, ADR-0020, ADR-0021): startup `.metallib` numerical canary
+    // over the already-resident `scratch_buf` BEFORE carving persistent scratch state,
+    // atomically demoting `nax -> simdgroup_apple9` on canary failure unless `strict_nax`.
     var canary_result: ?dequant.CanaryResult = null;
     if (options.startup_canary) {
-        canary_result = try dequant_pipes.runStartupNumericalCanaryInBuffer(&compute, scratch_buf, scratch_arena.bytes());
+        canary_result = try dequant_pipes.runStartupNumericalCanaryInBufferMut(&compute, scratch_buf, scratch_arena.bytes());
         @memset(scratch_arena.bytes()[0..page.APPLE_PAGE_SIZE], 0);
     }
 
@@ -8935,6 +8985,7 @@ fn loadCore(
         .wp_dense_gate_bind = wp_dense_gate_bind,
         .wp_dense_up_bind = wp_dense_up_bind,
         .wp_dense_act_bind = wp_dense_act_bind,
+        .chip_profile = resolved_chip_profile,
     };
 }
 
@@ -14012,4 +14063,119 @@ test "M6.8 C15 Qwen3BatchRuntime wide prefill + ChatML message-boundary PrefixCa
     const st = rt.stats();
     try std.testing.expect(st.boundary_hits >= 1);
     try std.testing.expectEqual(@as(u32, 0), st.prefix_cache_pinned_entries);
+}
+
+test "M6.9 C16+G17 Qwen3Model ChipProfile, NAX backend modes, strict-nax rejection, and bus override" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q4,
+        .group_size = 64,
+        .vocab_size = 64,
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .tie_word_embeddings = false,
+    };
+    const img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .f16,
+        .norm_dtype = .f16,
+    }, 0x69_0001);
+    defer gpa.free(img);
+
+    const dev = try metal.Device.open();
+    defer dev.close();
+    const dev_info = try dev.info();
+
+    // 1. `.auto` resolves host ChipProfile and wires startup canary.
+    {
+        var m_auto = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+            .max_seq_len = 128,
+            .chunk_tokens = 64,
+            .max_tree_nodes = 16,
+            .prefill_backend_mode = .auto,
+            .strict_nax = false,
+            .startup_canary = true,
+        });
+        defer m_auto.deinit(gpa);
+        try std.testing.expect(m_auto.chip_profile.spec_bus_gbs > 0.0);
+        try std.testing.expectEqual(dev_info.appleGpuFamily(), m_auto.chip_profile.gpu_apple_family);
+        try std.testing.expect(m_auto.canary_result != null);
+        if (!dev_info.supportsNaxTensorOps()) {
+            try std.testing.expectEqual(dequant.PrefillMatmulBackend.simdgroup_apple9, m_auto.dequant_pipes.activeBackend());
+            try std.testing.expectEqual(dequant.NaxFallbackReason.unsupported_gpu_family, m_auto.dequant_pipes.naxFallbackReason());
+        } else {
+            try std.testing.expect(m_auto.dequant_pipes.activeBackend().isNax());
+            try std.testing.expectEqual(dequant.NaxFallbackReason.none, m_auto.dequant_pipes.naxFallbackReason());
+        }
+        // Without hybrid_rt, wavefront gate stays false (GPU wide prefill).
+        try std.testing.expect(!m_auto.shouldUseHybridWavefront(1024, null, null));
+    }
+
+    // 2. `.simdgroup` forces `simdgroup_apple9` + `--bus-bandwidth-gbs` override.
+    {
+        var m_sg = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+            .max_seq_len = 128,
+            .chunk_tokens = 64,
+            .max_tree_nodes = 16,
+            .prefill_backend_mode = .simdgroup,
+            .strict_nax = false,
+            .bus_bandwidth_gbs_override = 546.0,
+            .startup_canary = true,
+        });
+        defer m_sg.deinit(gpa);
+        try std.testing.expectEqual(dequant.PrefillMatmulBackend.simdgroup_apple9, m_sg.dequant_pipes.activeBackend());
+        try std.testing.expectEqual(dequant.NaxFallbackReason.forced_simdgroup, m_sg.dequant_pipes.naxFallbackReason());
+        try std.testing.expectApproxEqAbs(@as(f64, 546.0), m_sg.chip_profile.spec_bus_gbs, 1e-6);
+        try std.testing.expectEqual(chip_profile_mod.BandwidthSource.user_override, m_sg.chip_profile.bandwidth_source);
+    }
+
+    // 3. `.nax` with `strict_nax = false` falls back cleanly on M4 (`Apple9`).
+    {
+        var m_nax_soft = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+            .max_seq_len = 128,
+            .chunk_tokens = 64,
+            .max_tree_nodes = 16,
+            .prefill_backend_mode = .nax,
+            .strict_nax = false,
+            .startup_canary = true,
+        });
+        defer m_nax_soft.deinit(gpa);
+        if (!dev_info.supportsNaxTensorOps()) {
+            try std.testing.expectEqual(dequant.PrefillMatmulBackend.simdgroup_apple9, m_nax_soft.dequant_pipes.activeBackend());
+            try std.testing.expectEqual(dequant.NaxFallbackReason.unsupported_gpu_family, m_nax_soft.dequant_pipes.naxFallbackReason());
+        } else {
+            try std.testing.expect(m_nax_soft.dequant_pipes.activeBackend().isNax());
+        }
+    }
+
+    // 4. `.nax` with `strict_nax = true` rejects `Apple9` with `error.NaxRequiresApple10Gpu`.
+    if (!dev_info.supportsNaxTensorOps()) {
+        try std.testing.expectError(
+            error.NaxRequiresApple10Gpu,
+            Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+                .max_seq_len = 128,
+                .chunk_tokens = 64,
+                .max_tree_nodes = 16,
+                .prefill_backend_mode = .nax,
+                .strict_nax = true,
+                .startup_canary = true,
+            }),
+        );
+    } else {
+        var m_nax_strict = try Qwen3Model.loadFromBytes(gpa, img, cfg, .{
+            .max_seq_len = 128,
+            .chunk_tokens = 64,
+            .max_tree_nodes = 16,
+            .prefill_backend_mode = .nax,
+            .strict_nax = true,
+            .startup_canary = true,
+        });
+        defer m_nax_strict.deinit(gpa);
+        try std.testing.expect(m_nax_strict.dequant_pipes.activeBackend().isNax());
+    }
 }
