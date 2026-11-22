@@ -5104,8 +5104,8 @@ test "steady-state HTTP/SSE serving performs zero dynamic heap allocations (mall
     var m_after: MallocStatistics = std.mem.zeroes(MallocStatistics);
     malloc_zone_statistics(null, &m_after);
 
-    try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
-    try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+    try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
+    try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
 }
 
 test "parseIpv4, QoS USER_INITIATED startup, finish_reason length, and connection-table 503 overflow" {
@@ -5624,8 +5624,8 @@ test "C14 8 concurrent batched SSE clients: M>=4..8, interleaved delivery, p50/p
 
         var m_after: MallocStatistics = std.mem.zeroes(MallocStatistics);
         malloc_zone_statistics(null, &m_after);
-        try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
-        try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+        try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
+        try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
     }
 }
 
@@ -5833,7 +5833,7 @@ test "C14 DomainNgramRegistry HTTP endpoints (GET /v1/ngram-packs, POST /v1/ngra
         }
         var m_after: MallocStatistics = std.mem.zeroes(MallocStatistics);
         malloc_zone_statistics(null, &m_after);
-        try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
-        try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+        try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
+        try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
     }
 }

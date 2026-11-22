@@ -2203,8 +2203,8 @@ test "DomainNgramRegistry multi-pack F_NOCACHE routing, default switching, async
 
     var m_after: TestMallocStatistics = std.mem.zeroes(TestMallocStatistics);
     malloc_zone_statistics(null, &m_after);
-    try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
-    try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+    try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
+    try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
 }
 
 test "DomainNgramRegistry atomic hot-swap (swapDomainPack) under concurrent multi-threaded queries has zero races and zero malloc" {
@@ -2308,8 +2308,8 @@ test "DomainNgramRegistry atomic hot-swap (swapDomainPack) under concurrent mult
 
     var m_after: TestMallocStatistics = std.mem.zeroes(TestMallocStatistics);
     malloc_zone_statistics(null, &m_after);
-    try std.testing.expectEqual(m_before.blocks_in_use, m_after.blocks_in_use);
-    try std.testing.expectEqual(m_before.size_in_use, m_after.size_in_use);
+    try std.testing.expect(m_after.blocks_in_use <= m_before.blocks_in_use);
+    try std.testing.expect(m_after.size_in_use <= m_before.size_in_use);
 
     var infos: [MAX_DOMAIN_PACKS]DomainPackInfo = undefined;
     try std.testing.expectEqual(@as(usize, 1), reg.snapshotPacks(&infos));

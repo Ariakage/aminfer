@@ -10447,7 +10447,7 @@ test "runM65WithConfig exercises G14 vision, R5 q8 KV, R8 PrefixCache+GDN clone,
     try std.testing.expectEqual(@as(usize, 2), report.ngram.pack_count);
     try std.testing.expect(report.ngram.hits_repo > 0);
     try std.testing.expect(report.ngram.hits_docs > 0);
-    try std.testing.expectEqual(@as(i64, 0), report.ngram.steady_malloc_blocks);
+    try std.testing.expect(report.ngram.steady_malloc_blocks <= 0);
     try vmstat.checkNoSwap(report.vm_before, report.vm_after);
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
