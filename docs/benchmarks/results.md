@@ -3951,3 +3951,581 @@ LOAD conc=4: ok=True total_toks=96  wall_s=4.210 ttft_p50_ms=2567.7 ttft_p99_ms=
 LOAD conc=8: ok=True total_toks=192 wall_s=8.239 ttft_p50_ms=4526.5 ttft_p99_ms=7644.8 tpot_ms=26.46 agg_tok_per_s=23.30
 serve.status=stopped serve.total_requests=20 serve.rejected_503=0 serve.cancelled=0 serve.swapouts_delta=0
 ```
+
+## M6 frontier hybrid sparse models, recurrent depth, large-MoE GSQ+RCO and off-GPU SME2 draft heads
+
+Measured on 2026-11-22 on the Apple M4 24 GiB baseline (`Mac16,12`, macOS 27.2,
+`18,186 MiB` wired budget, ReleaseFast at commit `8a4bc68`, `swapouts_delta = 0`
+across all timed decode and benchmark runs). All M6 code, Python packers, and
+real-checkpoint `.amf` builds landed across commits `1c75816`, `be75050`,
+`5baa49e`, `c93a5fa`, `7651cad`, `1af0f8d`, and `8a4bc68`.
+
+### 1. Hybrid-sparse operators (`G8` GDN, `G9` QSA, `G10` 4-branch GR, `G7` 512E MoE) and `C10` PLE
+
+| Operator / subsystem | Measurement | Latency | Throughput / metric | Notes |
+| --- | --- | ---: | ---: | --- |
+| `G8` Gated DeltaNet (`16K/32V x 128`) | Prefill (`seq = 256`) | `3,269.5 us` | `78,300.2 tok/s` (`3.23 GB/s`) | Chunked Metal 4 kernel |
+| `G8` Gated DeltaNet (`16K/32V x 128`) | Decode (`M = 1`, `S_t -> S_t`) | `30.1 us` | `140.30 GB/s` | SLC-resident single-layer state |
+| `G8` Gated DeltaNet loop isolation | `S_t -> S_tmp` eval / `S_tmp -> S_t` commit | `76.5 us` / `27.2 us` | `stmp_isolated = true` | `S_t` byte-identical before commit |
+| `G9` QSA (`16Q/4KV x 128`, `rot = 64`) | `[11,11,10]` MRoPE + YaRN (`M = 1`) | `16.8 us` | — | Interleaved 3D MRoPE |
+| `G9` QSA `full_chunk_512` (`kv = 512`) | `r = 0` index+attn vs `r >= 1` reuse | `38.7 us` -> `25.0 us` | `1.55x` speedup | Skips `ami_qsa_index_blocks` on `r >= 1` |
+| `G9` QSA `sliding_window_128` (`kv = 128`) | `r = 0` index+attn vs `r >= 1` reuse | `77.7 us` -> `25.6 us` | `3.04x` speedup | Circular 128-token `HybridKvRing` |
+| `G10` 4-branch GR (`H = 2048`) | `M = 1` vs `M = 16` full cycle | `31.5 us` / `23.1 us` | `4.56` / `67.44 GB/s` | Launch-bound at `M = 1`; amortized at `M = 16` |
+| `G7` 512-expert MoE (`top-10 + shared`, `217 MiB`) | `M = 1` vs `M = 16` (Zipf CSR) | `239.1 us` / `850.7 us` | `22.22` / `13.60 GB/s` | `10` / `24` unique experts (`6.67x` CSR dedup) |
+| `C10` 4-shard NVMe PLE (`8,192 x 256`, `144 KiB`) | Cold `F_NOCACHE` p50/p99 vs wired LRU hit | `1.54 / 2.04 us` vs `0.17 us` | `r >= 1` NVMe reads: `0` / `32` reuses | Fresh small file hits drive DRAM cache; multi-GiB uncached SSD reads remain in the `0.4-1.2 ms` range observed in M5 `C6` |
+| End-to-end `scale-qwen4-512e` (`98 MiB` wired) | Serial vs `MTP` (`Placement.cpu_sme2`) | `193.66` vs `285.32 tok/s` | `tau = 1.000`, `T = 0` bit-exact | `3:1` GDN:QSA, 4-branch GR, `512E+shared`, `32` cold/L (`50` hits / `129` misses), 4-shard PLE (`0` `r >= 1` NVMe reads) |
+
+### 2. `D12` `SelfSpecRecurrent` sweep (`R = 1..4`, `43.88 MiB q4 Core` exceeding L2/SLC)
+
+| Loops `R` | Serial `M = 1` (`ms/tok`) | Serial (`tok/s`) | vs `R = 1` | `verifyTree` `M = 4` / `8` / `12` / `16` (`ms`) | Raw verify break-even `M` | `SelfSpecRecurrent` `M = 8` (`tok/s`, `tau`) | `SelfSpecRecurrent` `M = 16` (`tok/s`, `tau`) | `T = 0` exact |
+| ---: | ---: | ---: | ---: | --- | ---: | --- | --- | --- |
+| `1` | `1.449` | `690.15` | `1.00x` | `1.55 / 2.44 / 3.45 / 4.34` | `1` | `588.98` (`2.50`) | `588.78` (`2.50`) | `true` |
+| `2` | `1.900` | `526.39` | `0.76x` | `2.71 / 4.13 / 5.90 / 7.40` | `4` | `392.96` (`2.14`) | `386.34` (`2.14`) | `true` |
+| `3` | `2.644` | `378.23` | `0.55x` | `3.54 / 5.50 / 8.23 / 10.11` | `4` | `190.45` (`1.25`) | `182.04` (`1.25`) | `true` |
+| `4` | `3.322` | `301.00` | `0.44x` | `4.55 / 7.09 / 10.58 / 12.70` | `4` | `141.59` (`1.00`) | `132.88` (`1.00`) | `true` |
+
+Trade-offs observed on M4 (`120 GB/s`):
+
+- With a `43.88 MiB` `q4` Core exceeding M4's `16 MiB` P-core L2 + `8 MiB` SLC,
+  serial `M = 1` decode slows down roughly linearly with `R` (`1.00x -> 0.76x ->
+  0.55x -> 0.44x`), confirming the bandwidth-bound `~1/R` scaling noted in
+  [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md).
+- Batched `verifyTree` amortizes the `R` Core weight reads across candidate
+  nodes: at `R = 4`, per-node verify time drops from `3.322 ms` (`M = 1`) to
+  `1.138 ms` (`M = 4`, below the `1.449 ms` `R = 1` serial baseline) and
+  `0.794 ms` (`M = 16`, `4.18x` higher raw node throughput than `M = 1` `R = 4`).
+- End-to-end `SelfSpecRecurrent` matches serial `R`-loop `stepDecode`
+  bit-for-bit at `T = 0` for all `R = 1..4` via `r = 0` shared KV across loop
+  steps, with zero extra draft-model RAM. On untrained random weights, shallow
+  `r = 1` predictions diverge from deep `Core x R` outputs as `R` increases
+  (`tau = 2.50` at `R = 1`, `2.14` at `R = 2`, `1.25` at `R = 3`, `1.00` at
+  `R = 4`), making end-to-end `SelfSpecRecurrent` slower than serial decode on
+  random weights (`141.59` vs `301.00 tok/s` at `R = 4`). Real end-to-end gains
+  require trained `LoopLM` checkpoints whose `r = 1` pass achieves `tau >= 3-4`
+  against `Core x R`.
+
+### 3. `D13` `Placement.cpu_sme2` vs `.gpu` on L2-resident draft projections
+
+| Subgraph | Dtype | Shape (`N x K`) | Size (`KiB`) | Fits L2 | `M = 1` SME2 / GPU (`us`) | `M = 4` SME2 / GPU (`us`) | `M = 8` SME2 / GPU (`us`) | Winners (`M = 1 / 4 / 8`) |
+| --- | --- | --- | ---: | --- | --- | --- | --- | --- |
+| `eagle3_fc_q4_2048x6144` | `q4` | `2048 x 6144` | `7,680.0` | `yes` | `117.2 / 203.4` (`1.74x`) | `475.2 / 524.5` (`1.10x`) | `429.5 / 533.5` (`1.24x`) | `cpu_sme2 / cpu_sme2 / cpu_sme2` |
+| `eagle3_fc_f16_1024x3072` | `f16` | `1024 x 3072` | `6,144.0` | `yes` | `40.1 / 215.8` (`5.38x`) | `83.8 / 267.4` (`3.19x`) | `62.3 / 268.5` (`4.31x`) | `cpu_sme2 / cpu_sme2 / cpu_sme2` |
+| `mtp_eh_proj_q4_2048x4096` | `q4` | `2048 x 4096` | `5,120.0` | `yes` | `79.0 / 240.4` (`3.04x`) | `401.4 / 386.1` (`0.96x`) | `219.4 / 384.0` (`1.75x`) | `cpu_sme2 / gpu / cpu_sme2` |
+| `mtp_eh_proj_f16_1024x2048` | `f16` | `1024 x 2048` | `4,096.0` | `yes` | `21.0 / 226.5` (`10.81x`) | `70.9 / 231.5` (`3.27x`) | `44.8 / 225.6` (`5.04x`) | `cpu_sme2 / cpu_sme2 / cpu_sme2` |
+
+`Placement.cpu_sme2` wins `11/12` L2-resident configurations (`1.10x` to `10.81x`
+lower latency, `0` Metal command buffers), while `.gpu` wins
+`mtp_eh_proj_q4_2048x4096` at `M = 4` (`386.1 us` vs `401.4 us`, `0.96x`),
+confirming the need for runtime `ADR-0008` median calibration. For real
+`qwen3-30b-a3b-eagle3.amf`, `fc` is `24 MiB` BF16 (above the `16 MiB` P-cluster
+L2 cap), so `D13` rejects `cpu_sme2` and retains `.gpu` (`252.6 us` vs ANE
+`1,222.5 us`).
+
+### 4. Real-checkpoint `W17` hardware verification (24 GiB M4, `swapouts_delta = 0`)
+
+1. **`Qwen3-30B-A3B` heat-guided `2.700b` GSQ + RCO (`qwen3-30b-a3b-gsq-rco.amf`) vs uniform `3-bit` baseline (`qwen3-30b-a3b-3bit.amf`)**:
+   - **Footprint & validation**: `verify-amf` passes (`18,867` tensors, `9.599 GiB`
+     wired vs `12.443 GiB` baseline, saving `2.844 GiB` / `-22.9%` wired RAM;
+     `q2_affine` cold experts + `q3_affine` warm experts + `q4_affine` hot
+     experts and dense projections).
+   - **`bench-decode` (`seq_len = 512`, `16` steps)**: `9,927 MiB` wired vs
+     `12,839 MiB` (`-2,912 MiB`, `-22.7%`), `1,190.7 MB/tok` vs `1,381.6 MB/tok`
+     (`-13.8%`), `49.59 tok/s` (`20.164 ms/tok`, `0.390 ms/layer`,
+     `swapouts_delta = 0`) vs `51.86 tok/s` (`19.282 ms/tok`, `0.402 ms/layer`)
+     on uniform 1-bucket `3-bit`. The `-4.4%` throughput delta comes from
+     3-bucket heterogeneous `{q2, q3, q4}` MoE dispatch overhead and `1.456 ms`
+     `lm_head` timing versus the single-bucket `q3` baseline.
+   - **Bilingual EN/ZH output quality & `EAGLE-3` `spec-decode`**: coherent
+     outputs on EN capital (`53.06 tok/s`: `Paris is the capital of France.`),
+     ZH capital (`49.25 tok/s`: `北京是中国的首都。`), and 38-token EN M4 explanation
+     (`48.93 tok/s`, `9,879 MiB` wired). Paired with `qwen3-30b-a3b-eagle3.amf`
+     (`10,968 MiB` wired, L2 SME2 router `70.2 us` vs GPU `987.8 us`),
+     `spec-decode` produces `38/38` bit-exact tokens at `tau = 1.682` and
+     `38.66 tok/s` (slower than `48.93 tok/s` serial on this 38-token prompt
+     because 3-bucket `verify_ms = 31.736 ms` plus `draft_ms = 5.646 ms` and
+     `commit_sync = 5.794 ms` exceeds the `1.682x` acceptance factor;
+     `swapouts_delta = 0`).
+
+2. **`Qwen3-0.6B` `0x0101` `ZT0` `LUT16` SME2 (`qwen3-0.6b-lut16-sme2.amf`) vs affine `qwen3-0.6b-gsq-rco-sme2.amf` and `D8` `14B` draft**:
+   - **Offline quantization trade-off**: on clustered or bimodal synthetic
+     weights, `LUT16` reduces quantization MSE by `-44%` to `-62.5%` versus
+     affine. On real `Qwen3-0.6B`, sampled MSE is `1.325x` higher than
+     per-column RCO affine (`9.770e-06` vs `7.374e-06`) because `QuantParamKind
+     = 1` (`0x0101`) shares one unscaled 16-entry `ZT0` codebook across 16 panel
+     rows whose weight standard deviations span `1.5x` to `8.6x`.
+   - **Hardware CPU SME2 decode & `D8` PEARL**: `verify-amf` reports
+     `amf.lut16_count = 196` (`336.9 MiB`, `393 MiB` wired). CPU SME2 decode
+     runs at `26.01-26.09 tok/s` (`38.33-38.44 ms/tok`, `0` malloc delta, `0`
+     swapouts) versus `26.38-26.62 tok/s` for affine `qwen3-0.6b-gsq-rco-sme2.amf`
+     (`-1.1%` to `-2.3%`), producing identical `8/8` EN capital token IDs and
+     fluent ZH output. As an off-GPU CPU SME2 small draft for `Qwen3-14B-4bit`
+     (`8,545 MiB` total wired, `swapouts_delta = 0`), `--pearl on` hides
+     `1,879.5 ms` of CPU drafting (`draft_ms` `46.843 -> 13.246 ms`) without GPU
+     contention (`verify_ms` `256.673 -> 238.194 ms`), reaching `14.12 tok/s`
+     (`tau = 3.917`, `10/12` PEARL hits, `48/48` bit-exact) versus `11.89 tok/s`
+     with `--pearl off` (`+18.8%`) and `10.67 tok/s` `14B` serial (`1.32x`).
+
+### Verbatim raw outputs (`aminfer bench-m6`, ReleaseFast)
+
+```text
+=== Milestone M6 Benchmark Suite (Qwen3.8-Flash-Next + LoopSchedule + D12/D13) ===
+
+--- 1. Hybrid-Sparse Operators (G8 GDN, G9 QSA, G10 4-Branch GR, G7 512E MoE) ---
+g8.gdn.prefill_seq               256
+g8.gdn.prefill_us                3269.5
+g8.gdn.prefill_tok_per_s         78300.2
+g8.gdn.prefill_gbs               3.23
+g8.gdn.decode_m1_us              30.1
+g8.gdn.decode_m1_gbs             140.30
+g8.gdn.stmp_eval_us              76.5
+g8.gdn.stmp_commit_us            27.2
+g8.gdn.stmp_isolated             true
+g9.qsa.mrope_yarn_us             16.8
+g9.qsa.full512_r0_us             38.7
+g9.qsa.full512_reuse_us          25.0
+g9.qsa.full512_reuse_speedup     1.55x
+g9.qsa.swa128_r0_us              77.7
+g9.qsa.swa128_reuse_us           25.6
+g9.qsa.swa128_reuse_speedup      3.04x
+g10.gr.hidden                    2048
+g10.gr.m1_us                     31.5
+g10.gr.m1_gbs                    4.56
+g10.gr.m16_us                    23.1
+g10.gr.m16_gbs                   67.44
+g7.moe512.experts                512 (top-10 + shared_expert)
+g7.moe512.wired_mib              217
+g7.moe512.m1_us                  239.1
+g7.moe512.m1_gbs                 22.22
+g7.moe512.m1_unique_experts      10
+g7.moe512.m16_us                 850.7
+g7.moe512.m16_gbs                13.60
+g7.moe512.m16_unique_experts     24
+g7.moe512.m16_dedup_ratio        6.67x
+
+--- 2. C10 F_NOCACHE NVMe PLE Store & Loop Isolation (r >= 1) ---
+c10.ple.shards                   4
+c10.ple.total_rows               8192
+c10.ple.embed_dim                256
+c10.ple.wired_kib                144
+c10.ple.cold_nvme_p50_us         1.54
+c10.ple.cold_nvme_p99_us         2.04
+c10.ple.wired_lru_hit_p50_us     0.17
+c10.ple.loop_r0_nvme_reads       16
+c10.ple.loop_r_ge1_nvme_reads    0
+c10.ple.loop_r_ge1_reuses        32
+
+--- 3. End-to-End scale-qwen4-512e (3:1 GDN:QSA, 4-Branch GR, 512E+Shared, PLE, Cold, MTP) ---
+qwen4_512e.experts               512 (top-10 + shared, 32 cold/layer)
+qwen4_512e.ple_shards            4
+qwen4_512e.wired_mib             98
+qwen4_512e.gen_tokens            16
+qwen4_512e.serial_tok_per_s      193.66
+qwen4_512e.mtp_tok_per_s         285.32
+qwen4_512e.mtp_mean_accept_tau   1.000
+qwen4_512e.mtp_placement         sme2
+qwen4_512e.mtp_bit_exact_t0      true
+qwen4_512e.cold_hits             50
+qwen4_512e.cold_misses           129
+qwen4_512e.ple_nvme_reads        16
+qwen4_512e.ple_r_ge1_nvme_reads  0
+
+--- 4. D12 SelfSpecRecurrent Sweep (R = 1, 2, 3, 4; Core > L2/SLC) ---
+d12.core_layers                  6 (43.88 MiB q4 Core, 72 MiB total wired)
+R   serial_ms   serial_tok/s  vs_R1   vM4_ms  vM8_ms  vM12_ms vM16_ms break_M  specM8_tok/s (tau)   specM16_tok/s (tau)  t0_exact
+1      1.449        690.15   1.00x    1.55    2.44    3.45    4.34      1       588.98 (2.50)       588.78 (2.50)   true
+2      1.900        526.39   0.76x    2.71    4.13    5.90    7.40      4       392.96 (2.14)       386.34 (2.14)   true
+3      2.644        378.23   0.55x    3.54    5.50    8.23   10.11      4       190.45 (1.25)       182.04 (1.25)   true
+4      3.322        301.00   0.44x    4.55    7.09   10.58   12.70      4       141.59 (1.00)       132.88 (1.00)   true
+
+--- 5. D13 Placement.cpu_sme2 vs .gpu (L2-Resident Draft Projections) ---
+subgraph                    dtype  N     K     M   w_kib    l2    sme2_us   gpu_us  gpu/sme  winner
+eagle3_fc_q4_2048x6144      q4     2048  6144  1  7680.0  yes      117.2    203.4    1.74x  cpu_sme2
+eagle3_fc_q4_2048x6144      q4     2048  6144  4  7680.0  yes      475.2    524.5    1.10x  cpu_sme2
+eagle3_fc_q4_2048x6144      q4     2048  6144  8  7680.0  yes      429.5    533.5    1.24x  cpu_sme2
+eagle3_fc_f16_1024x3072     f16    1024  3072  1  6144.0  yes       40.1    215.8    5.38x  cpu_sme2
+eagle3_fc_f16_1024x3072     f16    1024  3072  4  6144.0  yes       83.8    267.4    3.19x  cpu_sme2
+eagle3_fc_f16_1024x3072     f16    1024  3072  8  6144.0  yes       62.3    268.5    4.31x  cpu_sme2
+mtp_eh_proj_q4_2048x4096    q4     2048  4096  1  5120.0  yes       79.0    240.4    3.04x  cpu_sme2
+mtp_eh_proj_q4_2048x4096    q4     2048  4096  4  5120.0  yes      401.4    386.1    0.96x  gpu
+mtp_eh_proj_q4_2048x4096    q4     2048  4096  8  5120.0  yes      219.4    384.0    1.75x  cpu_sme2
+mtp_eh_proj_f16_1024x2048   f16    1024  2048  1  4096.0  yes       21.0    226.5   10.81x  cpu_sme2
+mtp_eh_proj_f16_1024x2048   f16    1024  2048  4  4096.0  yes       70.9    231.5    3.27x  cpu_sme2
+mtp_eh_proj_f16_1024x2048   f16    1024  2048  8  4096.0  yes       44.8    225.6    5.04x  cpu_sme2
+
+m6.swap.swapouts_delta           0
+m6.swap.pageouts_delta           0
+m6.swap.status                   PASS (no swap)
+```
+
+### Verbatim raw outputs (`qwen3-30b-a3b-gsq-rco.amf`, ReleaseFast)
+
+```text
+=== 1. verify-amf qwen3-30b-a3b-gsq-rco.amf ===
+amf.status       ok
+amf.model_id     qwen3-30b-a3b-gsq-rco
+amf.tensors      18867
+amf.file_bytes   10309206016
+amf.wired_bytes  10306764800
+amf.cold_bytes   0
+
+=== 2. bench-decode qwen3-30b-a3b-gsq-rco.amf (seq=512, steps=16) ===
+decode_bench.target              qwen3_moe
+decode_bench.arch                qwen3_moe (q3)
+decode_bench.seq_len             512
+decode_bench.shards              1
+decode_bench.wired_mib           9927
+decode_bench.load_ms             26629.8
+decode_bench.measured_layers     48
+decode_bench.measured_ms_per_tok 20.164
+decode_bench.measured_tok_per_s  49.59
+decode_bench.measured_layer_ms   0.390
+decode_bench.measured_head_ms    1.456
+decode_bench.measured_bytes_tok  1190695808
+decode_bench.measured_beta_gbs   59.05 (49.2% bus)
+decode_bench.scaled_layers       48 (linear: 48 * layer_ms + head_ms)
+decode_bench.scaled_ms_per_tok   20.164
+decode_bench.scaled_tok_per_s    49.59
+decode_bench.scaled_bytes_tok    1190695808
+decode_bench.scaled_beta_gbs     59.05 (49.2% bus)
+decode_bench.malloc_blocks_delta 34
+decode_bench.malloc_bytes_delta  2400
+decode_bench.swapouts_delta      0
+decode_bench.pageouts_delta      12
+
+=== 3. decode qwen3-30b-a3b-gsq-rco.amf (EN ChatML) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 9879
+decode.prompt_tokens             25
+decode.generated_tokens          8
+decode.prefill_ms                658.443
+decode.decode_ms_per_tok         18.846
+decode.decode_tok_per_s          53.06
+decode.bytes_per_tok             1143509888
+decode.effective_gbs             60.68
+decode.malloc_blocks_delta       12
+decode.malloc_bytes_delta        544
+decode.swapouts_delta            0
+decode.hetero_moe                yes
+decode.token_ids                 [59604, 374, 279, 6722, 315, 9625, 13, 151645]
+decode.text                      Paris is the capital of France.<|im_end|>
+
+=== 4. decode qwen3-30b-a3b-gsq-rco.amf (ZH ChatML) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 9879
+decode.prompt_tokens             22
+decode.generated_tokens          6
+decode.prefill_ms                727.423
+decode.decode_ms_per_tok         20.303
+decode.decode_tok_per_s          49.25
+decode.bytes_per_tok             1143018368
+decode.effective_gbs             56.30
+decode.malloc_blocks_delta       8
+decode.malloc_bytes_delta        288
+decode.swapouts_delta            0
+decode.hetero_moe                yes
+decode.token_ids                 [68990, 105196, 9370, 106114, 1773, 151645]
+decode.text                      北京是中国的首都。<|im_end|>
+
+=== 5. decode qwen3-30b-a3b-gsq-rco.amf (EN longer 48-tok) ===
+decode.arch                      qwen3_moe (q3)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    48
+decode.shards                    1
+decode.wired_mib                 9879
+decode.prompt_tokens             29
+decode.generated_tokens          38
+decode.prefill_ms                729.307
+decode.decode_ms_per_tok         20.438
+decode.decode_tok_per_s          48.93
+decode.bytes_per_tok             1146852224
+decode.effective_gbs             56.11
+decode.malloc_blocks_delta       72
+decode.malloc_bytes_delta        4384
+decode.swapouts_delta            0
+decode.hetero_moe                yes
+decode.token_ids                 [26567, 386, 19, 42690, 4938, 7567, 444, 10994, 44378, 553, 8241, 11050, 11, 3347, 98414, 2251, 2615, 311, 279, 2567, 54480, 4963, 13, 576, 42690, 4938, 17646, 25351, 46870, 17590, 323, 22823, 5068, 369, 44378, 9079, 13, 151645]
+decode.text                      Apple M4 unified memory benefits LLM inference by providing efficient, low-latency access to the required computational resources. The unified memory architecture ensures seamless integration and optimal performance for inference tasks.<|im_end|>
+
+=== 6. spec-decode qwen3-30b-a3b-gsq-rco.amf + qwen3-30b-a3b-eagle3.amf ===
+spec.arch                        qwen3_moe (q3)
+spec.mode                        eagle3
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       1222.5
+spec.placement_gate_gpu_us       252.6
+spec.router_pred_backend         sme2 (requested=auto)
+spec.router_pred_cal             sme2_us=70.2 gpu_us=987.8 bank_kib=4096.0
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.seed_used                   0
+spec.seed_source                 greedy
+spec.layers                      48
+spec.shards                      1
+spec.wired_mib                   10968
+spec.prompt_tokens               29
+spec.generated_tokens            38
+spec.rounds                      22
+spec.mean_accept_len             1.682
+spec.accept_hist                 [1:11, 2:7, 3:4]
+spec.drafted_nodes_per_round     10.59
+spec.verified_nodes_per_round    2.36
+spec.l1_seed_rounds              1
+spec.unique_experts_per_layer    13.64
+spec.prefill_ms                  249.893
+spec.decode_ms_per_tok           25.868
+spec.decode_tok_per_s            38.66
+spec.draft_ms_per_round          5.646
+spec.prune_ms_per_round          0.327
+spec.verify_ms_per_round         31.736
+spec.commit_sync_ms_per_round    5.794
+spec.bytes_per_accepted_tok      933317462
+spec.effective_gbs               36.08
+spec.malloc_blocks_delta         201
+spec.malloc_bytes_delta          22880
+spec.prefill_swapouts_delta      1148
+spec.swapouts_delta              0
+spec.hetero_moe                  yes
+spec.token_ids                   [26567, 386, 19, 42690, 4938, 7567, 444, 10994, 44378, 553, 8241, 11050, 11, 3347, 98414, 2251, 2615, 311, 279, 2567, 54480, 4963, 13, 576, 42690, 4938, 17646, 25351, 46870, 17590, 323, 22823, 5068, 369, 44378, 9079, 13, 151645]
+spec.text                        Apple M4 unified memory benefits LLM inference by providing efficient, low-latency access to the required computational resources. The unified memory architecture ensures seamless integration and optimal performance for inference tasks.<|im_end|>
+```
+
+### Verbatim raw outputs (`qwen3-0.6b-lut16-sme2.amf` & `D8` `14B`, ReleaseFast)
+
+```text
+=== 1. verify-amf qwen3-0.6b-lut16-sme2.amf ===
+amf.status       ok
+amf.model_id     qwen3-0.6b-lut16-sme2
+amf.tensors      310
+amf.file_bytes   353288192
+amf.wired_bytes  353222656
+amf.cold_bytes   0
+amf.lut16_count  196
+
+=== 2. decode qwen3-0.6b-lut16-sme2.amf (EN ChatML, CPU SME2) ===
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 393
+decode.prompt_tokens             25
+decode.generated_tokens          8
+decode.prefill_ms                869.118
+decode.decode_ms_per_tok         38.441
+decode.decode_tok_per_s          26.01
+decode.bytes_per_tok             355279424
+decode.effective_gbs             9.24
+decode.malloc_blocks_delta       0
+decode.malloc_bytes_delta        0
+decode.swapouts_delta            0
+decode.sme2_weights              yes
+decode.token_ids                 [785, 6722, 315, 9625, 374, 12095, 13, 151645]
+decode.text                      The capital of France is Paris.<|im_end|>
+
+=== 3. decode qwen3-0.6b-lut16-sme2.amf (ZH ChatML, CPU SME2) ===
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 393
+decode.prompt_tokens             26
+decode.generated_tokens          23
+decode.prefill_ms                881.424
+decode.decode_ms_per_tok         38.330
+decode.decode_tok_per_s          26.09
+decode.bytes_per_tok             357114432
+decode.effective_gbs             9.32
+decode.malloc_blocks_delta       0
+decode.malloc_bytes_delta        0
+decode.swapouts_delta            0
+decode.sme2_weights              yes
+decode.token_ids                 [26567, 386, 19, 43589, 103967, 111390, 70500, 17714, 102202, 5373, 99464, 33108, 30440, 106375, 9370, 42140, 43268, 38507, 75117, 104257, 100143, 1773, 151645]
+decode.text                      Apple M4 的统一内存设计为高效、安全和可扩展的多线程执行提供了支持。<|im_end|>
+
+=== 4. decode qwen3-0.6b-gsq-rco-sme2.amf (EN ChatML, CPU SME2 affine baseline) ===
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 393
+decode.prompt_tokens             25
+decode.generated_tokens          8
+decode.prefill_ms                877.373
+decode.decode_ms_per_tok         37.568
+decode.decode_tok_per_s          26.62
+decode.bytes_per_tok             355279424
+decode.effective_gbs             9.46
+decode.malloc_blocks_delta       0
+decode.malloc_bytes_delta        0
+decode.swapouts_delta            0
+decode.sme2_weights              yes
+decode.token_ids                 [785, 6722, 315, 9625, 374, 12095, 13, 151645]
+decode.text                      The capital of France is Paris.<|im_end|>
+
+=== 5. decode qwen3-0.6b-gsq-rco-sme2.amf (ZH ChatML, CPU SME2 affine baseline) ===
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 393
+decode.prompt_tokens             26
+decode.generated_tokens          32
+decode.prefill_ms                890.987
+decode.decode_ms_per_tok         37.903
+decode.decode_tok_per_s          26.38
+decode.bytes_per_tok             358146624
+decode.effective_gbs             9.45
+decode.malloc_blocks_delta       -1
+decode.malloc_bytes_delta        -96
+decode.swapouts_delta            0
+decode.sme2_weights              yes
+decode.token_ids                 [26567, 386, 19, 9370, 103967, 111390, 70500, 100661, 101321, 41146, 101910, 42140, 43268, 38507, 106379, 3837, 67338, 44063, 20074, 105653, 18493, 106215, 9370, 111390, 99922, 15946, 3837, 101982, 104656, 100341, 100768, 101991]
+decode.text                      Apple M4的统一内存设计优势在于其采用多线程架构，通过将数据存储在单一的内存块中，从而显著提升计算效率
+
+=== 6. decode qwen3-0.6b-bf16.amf (ZH ChatML, GPU BF16 reference) ===
+decode.arch                      qwen3 (bf16)
+decode.prefill_mode              auto
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    28
+decode.shards                    1
+decode.wired_mib                 1195
+decode.prompt_tokens             26
+decode.generated_tokens          26
+decode.prefill_ms                325.632
+decode.decode_ms_per_tok         16.069
+decode.decode_tok_per_s          62.23
+decode.bytes_per_tok             1198065664
+decode.effective_gbs             74.56
+decode.malloc_blocks_delta       50
+decode.malloc_bytes_delta        3200
+decode.swapouts_delta            0
+decode.token_ids                 [26567, 386, 19, 9370, 103967, 111390, 70500, 67338, 44063, 35568, 111390, 33108, 100519, 24360, 106201, 3837, 108456, 20074, 54542, 101991, 33108, 72448, 102808, 101149, 1773, 151645]
+decode.text                      Apple M4的统一内存设计通过将主内存和辅存分离，提升了数据处理效率和系统响应速度。<|im_end|>
+
+=== 7. D8 spec-decode Qwen3-14B-4bit + qwen3-0.6b-lut16-sme2.amf (PEARL off) ===
+spec.arch                        qwen3 (q4)
+spec.mode                        small
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       664.8
+spec.placement_gate_gpu_us       62.7
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.seed_used                   0
+spec.seed_source                 greedy
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   8545
+spec.prompt_tokens               25
+spec.generated_tokens            48
+spec.rounds                      12
+spec.mean_accept_len             3.917
+spec.accept_hist                 [2:3, 3:2, 5:7]
+spec.drafted_nodes_per_round     19.25
+spec.verified_nodes_per_round    9.00
+spec.l1_seed_rounds              1
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  848.059
+spec.decode_ms_per_tok           84.114
+spec.decode_tok_per_s            11.89
+spec.draft_ms_per_round          46.843
+spec.prune_ms_per_round          0.002
+spec.verify_ms_per_round         256.673
+spec.commit_sync_ms_per_round    25.929
+spec.bytes_per_accepted_tok      2011729130
+spec.effective_gbs               23.92
+spec.malloc_blocks_delta         48
+spec.malloc_bytes_delta          3072
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.pearl_mode                  off (enabled=no, own_queue=no)
+spec.pearl_rounds                0
+spec.pearl_hits                  0
+spec.pearl_partial_prefix_hits   0
+spec.pearl_rollbacks             0
+spec.pearl_saved_ms              0.000
+spec.pearl_worker_ms             0.000
+spec.token_ids                   [8420, 594, 264, 63594, 13027, 729, 429, 5169, 3070, 25891, 2711, 334, 389, 264, 3070, 28298, 1140, 334, 1447, 73594, 12669, 198, 750, 7868, 10716, 10939, 11, 2169, 982, 262, 2115, 11, 1290, 284, 220, 15, 11, 2422, 10939, 8, 481, 220, 16, 198, 262, 1393, 2115, 2651]
+spec.text                        Here's a concise Python function that implements **binary search** on a **sorted list**:
+
+```python
+def binary_search(arr, target):
+    left, right = 0, len(arr) - 1
+    while left <=
+
+=== 8. D8 spec-decode Qwen3-14B-4bit + qwen3-0.6b-lut16-sme2.amf (PEARL on) ===
+spec.arch                        qwen3 (q4)
+spec.mode                        small
+spec.placement                   gpu (requested=auto)
+spec.placement_gate_ane_us       691.1
+spec.placement_gate_gpu_us       31.0
+spec.pruning                     enabled (cap=16, depth=4, width=2)
+spec.temperature                 0.00
+spec.seed_used                   0
+spec.seed_source                 greedy
+spec.layers                      40
+spec.shards                      1
+spec.wired_mib                   8545
+spec.prompt_tokens               25
+spec.generated_tokens            48
+spec.rounds                      12
+spec.mean_accept_len             3.917
+spec.accept_hist                 [1:1, 2:1, 3:2, 4:2, 5:6]
+spec.drafted_nodes_per_round     15.83
+spec.verified_nodes_per_round    6.75
+spec.l1_seed_rounds              1
+spec.unique_experts_per_layer    0.00
+spec.prefill_ms                  919.325
+spec.decode_ms_per_tok           70.837
+spec.decode_tok_per_s            14.12
+spec.draft_ms_per_round          13.246
+spec.prune_ms_per_round          0.001
+spec.verify_ms_per_round         238.194
+spec.commit_sync_ms_per_round    25.998
+spec.bytes_per_accepted_tok      2011737934
+spec.effective_gbs               28.40
+spec.malloc_blocks_delta         48
+spec.malloc_bytes_delta          3072
+spec.prefill_swapouts_delta      0
+spec.swapouts_delta              0
+spec.pearl_mode                  on (enabled=yes, own_queue=yes)
+spec.pearl_rounds                12
+spec.pearl_hits                  10
+spec.pearl_partial_prefix_hits   1
+spec.pearl_rollbacks             2
+spec.pearl_saved_ms              1879.548
+spec.pearl_worker_ms             2635.331
+spec.token_ids                   [8420, 594, 264, 63594, 13027, 729, 429, 5169, 3070, 25891, 2711, 334, 389, 264, 3070, 28298, 1140, 334, 1447, 73594, 12669, 198, 750, 7868, 10716, 10939, 11, 2169, 982, 262, 2115, 11, 1290, 284, 220, 15, 11, 2422, 10939, 8, 481, 220, 16, 198, 262, 1393, 2115, 2651]
+spec.text                        Here's a concise Python function that implements **binary search** on a **sorted list**:
+
+```python
+def binary_search(arr, target):
+    left, right = 0, len(arr) - 1
+    while left <=
+```
