@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-M6.5 — continuous batching, long-context KV tiering, shared prefix caching, and zero-copy multimodal ingress (`R5`, `R8`, `G14`, `C14`) completed (2026-11-22); next: **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X2`)**.
+M6.5 — continuous batching, long-context KV tiering, shared prefix caching, and zero-copy multimodal ingress (`R5`, `R8`, `G14`, `C14`) completed (2026-11-22); next: **M6.8 — configurable wide-chunk GPU prefill, lossless `prompt_tail` pruning, serving QoS, ChatML boundary prefix caching, live non-anonymous RAM admission, and startup `.metallib` canary (`R9`, `G15`, `G16`, `C15`; [ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md))**, followed by **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`)**.
 
 ## Milestones
 
@@ -25,6 +25,7 @@ Status-row IDs refer to [status.md](status.md).
 | M5 | Serving and pipelining | C6–C8, D8, W14, G13 | Streaming server under load; pipelined-drafting gain measured; optional GSQ+RCO per-block `QuantScheme` pipeline verified | Completed |
 | M6 | Frontier hybrid sparse models (`Qwen3.8-Flash-Next`), recurrent depth & heterogeneous MoE scaling | R6, W9, W10, W16, W17, G7–G9, G10 (GR), D12, D13, C10 (PLE) | Composable operator graph + `LoopSchedule` (`GDN S_tmp` isolation, `SelfSpecRecurrent`, L2 SME2 `Step-LoRA`); synthetic + scale-calibrated `qwen4_exp` (GDN + QSA + 512-expert MoE + 51B NVMe PLE + 4B MTP) verified end-to-end without swap; `Qwen3-30B-A3B` & 512-expert GSQ+RCO + `ZT0` non-uniform LUTs and `Placement.cpu_sme2` draft heads benchmarked | Completed |
 | M6.5 | Continuous batching, long-context KV tiering & zero-copy multimodal ingress | R5, R8, G14, C14 | Server iteration-level continuous batching (`M > 1` slots per GPU/SME2 pass), shared prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang` packs, and `VideoToolbox → IOSurface → MTLTexture` zero-copy vision/video ingress verified without swap | Completed |
+| M6.8 | Wide-chunk GPU prefill, `prompt_tail` pruning, serving QoS & live-RAM / `.metallib` guards | R9, G15, G16, C15 | Default-on `--gpu-prefill-mode wide\|tree64` (`512+` FlashAttention + `BM=64, BN=64` GEMM, direct `KvTile` write) & lossless `prompt_tail` pruning verified bit-consistent vs `tree64`; single-request wide-prefill/`verifyTree` scratch aliasing; default-on `--decode-share`, `--adaptive-prefill-narrow`, and `--message-boundary-cache` `PrefixCache` checkpoints benchmarked under concurrent load; `HOST_VM_INFO64` non-anonymous live RAM soft cache scaling (`+ --strict-live-ram`) & `< 0.1 ms` startup `.metallib` canary + `Apple10` `NAX` hook verified without swap | Planned |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
 
 ## Spikes
@@ -575,6 +576,19 @@ real checkpoint support), plus scheduling **M6.5** (`R5`, `R8`, `G14`, `C14`)
 for iteration-level continuous batching, shared prefix `KvTile`/`GDN` caching,
 32K+ GPU `q8` retired KV compression, domain `.ang` packs, and zero-copy
 `VideoToolbox → IOSurface → MTLTexture` multimodal ingress.
+After M6.5 close-out on 2026-11-22, the user confirmed
+[ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md),
+inserting Milestone **M6.8** (`R9`, `G15`, `G16`, `C15`) before M7:
+configurable wide-chunk (`512–1024`) FlashAttention / `BM=64, BN=64` GEMM GPU
+prefill (`P0-A`, `--gpu-prefill-mode wide|tree64`, default `wide`), lossless
+`prompt_tail` final-layer compute pruning (`P0-B1`), single-request
+wide-prefill / `verifyTree` activation scratch aliasing without unloading
+`lm_head` weights (`P0-B2`), default-on continuous-batching `decode-share`
+wall-time QoS, depth-scaled chunk narrowing, and ChatML message-boundary
+evict-first `PrefixCache` checkpoints (`P1-A`), live `HOST_VM_INFO64`
+non-anonymous RAM soft cache auto-sizing plus `--strict-live-ram` (`P1-B`), and
+a `< 0.1 ms` startup `.metallib` numerical canary plus `Apple10` (M5 `NAX`)
+capability/dispatch hook reservation (`P2`).
 
 ## Session handoff snapshot
 
@@ -706,9 +720,12 @@ Update this before the context window runs out or when handing off.
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: none (`M0`–`M6.5` completed; next milestone is **M7** covering
-  Ultra and cluster scale-out: `DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10`
-  mHC, `G11`, `D10`, `C10` Engram, and `X1`–`X2` per
+- In flight: none (`M0`–`M6.5` completed; next milestone is **M6.8** covering
+  `R9`, `G15`, `G16`, and `C15` per
+  [ADR-0020](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md),
+  followed by **M7** covering Ultra and cluster scale-out:
+  `DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10`
+  Engram, and `X1`–`X3` per
   [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md))
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
@@ -726,4 +743,5 @@ Update this before the context window runs out or when handing off.
   [decisions/0016-native-fp16-bf16-and-multishard-import.md](decisions/0016-native-fp16-bf16-and-multishard-import.md),
   [decisions/0017-optional-gsq-rco-hybrid-quantization.md](decisions/0017-optional-gsq-rco-hybrid-quantization.md),
   [decisions/0018-bare-metal-armv9-sme2-engine.md](decisions/0018-bare-metal-armv9-sme2-engine.md),
-  [decisions/0019-recurrent-depth-and-post-m5-accelerators.md](decisions/0019-recurrent-depth-and-post-m5-accelerators.md)
+  [decisions/0019-recurrent-depth-and-post-m5-accelerators.md](decisions/0019-recurrent-depth-and-post-m5-accelerators.md),
+  [decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)

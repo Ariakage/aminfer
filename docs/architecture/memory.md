@@ -40,7 +40,15 @@ The same bytes count against both limits. The wired budget
 startup as the minimum of the configured cap, physical memory minus the
 headroom (default 3 GiB) and both limits; a model plan larger than the budget
 is rejected with a clear error. Raising the limits is described in
-[../guides/system-tuning.md](../guides/system-tuning.md).
+[../guides/system-tuning.md](../guides/system-tuning.md). Per
+[ADR-0020](../decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)
+(`R9`, M6.8), startup also queries `HOST_VM_INFO64` non-anonymous live RAM
+(`free + speculative + purgeable + external`, excluding anonymous `inactive`
+pages) to auto-size optional wired caches (`PrefixCache`, `PlePageCache`,
+`NgramCache`, extra `ExpertSlotPool` slots) without swap, with opt-in
+`--strict-live-ram` hard admission and single-request wide-prefill /
+`verifyTree` activation scratch aliasing inside `WiredArena` (never unloading
+`lm_head` weights).
 
 ## Residency
 

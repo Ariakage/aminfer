@@ -64,7 +64,15 @@ second copy of the model — see [memory.md](memory.md#budget-estimates).
 ### GPU-only prefill
 
 Used for prompts of at most 512 tokens, as the fallback when the ANE path is
-unavailable, and as the baseline the hybrid path must beat.
+unavailable, and as the baseline the hybrid path must beat. Per
+[ADR-0020](../decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md)
+(`G15`, M6.8), `--gpu-prefill-mode wide|tree64` (default `wide`) executes
+`512–1024`-token chunks through dedicated Metal 4 FlashAttention prefill kernels
+(`BQ = 64, BK = 32`, skipping upper-triangular KV blocks and writing K/V
+directly into `KvTile`s) plus `BM = 64, BN = 64` prefill GEMM tiles, and prunes
+unused final-layer (`L - 1`) `O_proj` / `MoE` / `lm_head` work on non-terminal
+prompt positions (`prompt_tail`); `tree64` retains the legacy `<= 64`-row
+`verifyTree` + `commitTreeKv` path for A/B comparison.
 
 ## Speculative decode loop
 
@@ -116,12 +124,18 @@ One round:
   [ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
   The default is chosen per model and chip from measured round latency
   ([ADR-0008](../decisions/0008-benchmark-gated-draft-placement.md)).
-- **Iteration-level continuous batching and prefix sharing (`C14`, `R8`, M6.5).**
-  M5 `aminfer serve` executes preallocated request slots without steady-state
-  heap allocation; M6.5 batches `M > 1` active slots into shared GPU GEMM /
-  CSR-MoE and SME2 `ZA` passes while sharing read-only prefix `KvTile`s and
-  snapshot-cloned `GDN` recurrent states across concurrent requests
-  ([ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
+- **Iteration-level continuous batching, QoS, and prefix sharing (`C14`, `C15`,
+  `R8`, M6.5–M6.8).** M5 `aminfer serve` executes preallocated request slots
+  without steady-state heap allocation; M6.5 batches `M > 1` active slots into
+  shared GPU GEMM / CSR-MoE and SME2 `ZA` passes while sharing read-only prefix
+  `KvTile`s and snapshot-cloned `GDN` recurrent states across concurrent
+  requests ([ADR-0019](../decisions/0019-recurrent-depth-and-post-m5-accelerators.md)).
+  M6.8 (`C15`,
+  [ADR-0020](../decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md))
+  adds default-on toggles for a wall-time `--decode-share` QoS ledger,
+  `--adaptive-prefill-narrow` depth-scaled chunk narrowing (`256` at `8K+`,
+  `128` at `16K+` while decode slots are active), and `--message-boundary-cache`
+  evict-first ChatML pre-last-user `PrefixCache` checkpoints.
 
 ## Threading model
 
