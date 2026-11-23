@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const sysinfo = @import("../platform/sysinfo.zig");
+const chip_profile = @import("../platform/chip_profile.zig");
 const qos = @import("../platform/qos.zig");
 const vmstat = @import("../platform/vmstat.zig");
 const page = @import("../mem/page.zig");
@@ -46,6 +47,25 @@ pub const ZT0_AFFINE_TABLE: [32]f16 align(64) = blk: {
     break :blk tbl;
 };
 
+/// Constant 64-byte `ZT0` register codebook for `2-bit` `luti2` (`0..3`) affine
+/// expansion (`[0, 0, 1, 1, 2, 2, 3, 3]` replicated at 32-bit stride).
+pub const ZT0_LUT4_IDENTITY_TABLE: [32]f16 align(64) = blk: {
+    var tbl: [32]f16 = @splat(0.0);
+    for (0..4) |i| {
+        const v: f16 = @floatFromInt(i);
+        tbl[2 * i] = v;
+        tbl[2 * i + 1] = v;
+    }
+    break :blk tbl;
+};
+
+/// Hard `<= 4 MiB` L2-residency ceiling for hot SME2 `Step-LoRA` / `W19`
+/// multi-LoRA adapters (`25%` of M4's `16 MiB` P-core L2, ADR-0023 C24).
+pub const MAX_HOT_LORA_L2_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum number of batched projections staged per hoisted `smstart`..`smstop`
+/// call (`0` dynamic heap allocations on the hot path).
+pub const MAX_HOISTED_BATCH_OPS: usize = 64;
+
 /// Weight storage format inside an `sme2_panel64` matrix blob (ADR-0018, W15).
 pub const PanelDType = enum(u8) {
     f16 = 0,
@@ -77,10 +97,12 @@ pub const PanelDType = enum(u8) {
 };
 
 /// Inline metadata interpretation in bytes `0..64` of each quantized group header
-/// (high byte of `TensorEntry.reserved0` in `.amf`, ADR-0017 / ADR-0018).
+/// (high byte of `TensorEntry.reserved0` in `.amf`, ADR-0017 / ADR-0018 / ADR-0023 C24).
 pub const QuantParamKind = enum(u8) {
     affine_scale_bias = 0,
     lut16_codebook = 1,
+    /// Native 2-bit 4-entry `ZT0` `LUT4` codebook (`luti2`, 4× packed weights/byte).
+    lut4_codebook = 2,
 };
 
 /// Cache locality hint selecting `ld1*` (L2-hot temporal) vs `ldnt1*`
@@ -188,6 +210,25 @@ comptime {
 
 pub const KernelFn = *const fn (*const KernelArgs) callconv(.c) void;
 
+/// Fixed 16-byte C-ABI task descriptor for hoisted `ami_sme2_exec_batch`
+/// (`smstart` entered ONCE, `smstop` exited ONCE across all tasks in the batch).
+pub const BatchKernelTask = extern struct {
+    args: *const KernelArgs,
+    kernel_id: u32,
+    _pad: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(BatchKernelTask) != 16) @compileError("BatchKernelTask must be 16 bytes");
+    if (@offsetOf(BatchKernelTask, "args") != 0) @compileError("BatchKernelTask.args offset mismatch");
+    if (@offsetOf(BatchKernelTask, "kernel_id") != 8) @compileError("BatchKernelTask.kernel_id offset mismatch");
+}
+
+/// Hoisted Streaming-SVE batch executor (`src/cpu/sme2_kernels.s`, ADR-0023 C24):
+/// saves AAPCS64 `x19..x30` & `d8..d15` once, executes `smstart` once, dispatches
+/// all `count` tasks with zero `[sp` spills, and executes `smstop` once.
+extern fn ami_sme2_exec_batch(tasks: [*]const BatchKernelTask, count: usize) callconv(.c) void;
+
 // All 30 bare-metal ARMv9.2 SME2 assembly entrypoints from `src/cpu/sme2_kernels.s`.
 extern fn ami_sme2_m1_4_bf16_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m1_4_bf16_nt(args: *const KernelArgs) callconv(.c) void;
@@ -266,29 +307,34 @@ pub const ALL_KERNEL_ENTRIES = [_]KernelEntry{
 };
 
 pub fn selectKernelFn(regime: KernelRegime, dtype: PanelDType, hint: CacheHint) KernelFn {
-    return switch (regime) {
-        .m1_4 => switch (dtype) {
-            .bf16 => if (hint == .temporal) &ami_sme2_m1_4_bf16_t else &ami_sme2_m1_4_bf16_nt,
-            .f16 => if (hint == .temporal) &ami_sme2_m1_4_f16_t else &ami_sme2_m1_4_f16_nt,
-            .q4_affine => if (hint == .temporal) &ami_sme2_m1_4_q4_t else &ami_sme2_m1_4_q4_nt,
-            .q3_affine => if (hint == .temporal) &ami_sme2_m1_4_q3_t else &ami_sme2_m1_4_q3_nt,
-            .q2_affine => if (hint == .temporal) &ami_sme2_m1_4_q2_t else &ami_sme2_m1_4_q2_nt,
-        },
-        .m5_16 => switch (dtype) {
-            .bf16 => if (hint == .temporal) &ami_sme2_m5_16_bf16_t else &ami_sme2_m5_16_bf16_nt,
-            .f16 => if (hint == .temporal) &ami_sme2_m5_16_f16_t else &ami_sme2_m5_16_f16_nt,
-            .q4_affine => if (hint == .temporal) &ami_sme2_m5_16_q4_t else &ami_sme2_m5_16_q4_nt,
-            .q3_affine => if (hint == .temporal) &ami_sme2_m5_16_q3_t else &ami_sme2_m5_16_q3_nt,
-            .q2_affine => if (hint == .temporal) &ami_sme2_m5_16_q2_t else &ami_sme2_m5_16_q2_nt,
-        },
-        .m32 => switch (dtype) {
-            .bf16 => if (hint == .temporal) &ami_sme2_m32_bf16_t else &ami_sme2_m32_bf16_nt,
-            .f16 => if (hint == .temporal) &ami_sme2_m32_f16_t else &ami_sme2_m32_f16_nt,
-            .q4_affine => if (hint == .temporal) &ami_sme2_m32_q4_t else &ami_sme2_m32_q4_nt,
-            .q3_affine => if (hint == .temporal) &ami_sme2_m32_q3_t else &ami_sme2_m32_q3_nt,
-            .q2_affine => if (hint == .temporal) &ami_sme2_m32_q2_t else &ami_sme2_m32_q2_nt,
-        },
+    return ALL_KERNEL_ENTRIES[kernelId(regime, dtype, hint)].func;
+}
+
+/// Maps `(regime, dtype, hint)` to its exact `0..29` index in `ALL_KERNEL_ENTRIES`
+/// and `_ami_sme2_exec_batch`'s `L_ami_sme2_branch_table` (`src/cpu/sme2_kernels.s`).
+pub fn kernelId(regime: KernelRegime, dtype: PanelDType, hint: CacheHint) u32 {
+    const r_off: u32 = switch (regime) {
+        .m1_4 => 0,
+        .m5_16 => 10,
+        .m32 => 20,
     };
+    const d_off: u32 = switch (dtype) {
+        .bf16 => 0,
+        .f16 => 2,
+        .q4_affine => 4,
+        .q3_affine => 6,
+        .q2_affine => 8,
+    };
+    const h_off: u32 = if (hint == .temporal) 0 else 1;
+    return r_off + d_off + h_off;
+}
+
+comptime {
+    for (ALL_KERNEL_ENTRIES, 0..) |entry, idx| {
+        if (kernelId(entry.regime, entry.dtype, entry.hint) != idx) {
+            @compileError("kernelId table mismatch with ALL_KERNEL_ENTRIES / sme2_kernels.s");
+        }
+    }
 }
 
 // ============================================================================
@@ -357,7 +403,66 @@ pub const SmeCaps = struct {
         }
         return MAX_L2_DRAFT_PROJ_BYTES;
     }
+
+    /// Strict `<= 4 MiB` L2-residency cap for hot SME2 `Step-LoRA` / `W19`
+    /// multi-LoRA adapters (`min(4 MiB, 25% of P-core L2)`, ADR-0023 C24).
+    pub fn hotAdapterL2BudgetBytes(self: SmeCaps) usize {
+        return @min(MAX_HOT_LORA_L2_BYTES, self.draftL2BudgetBytes() / 4);
+    }
 };
+
+/// `C13` / `C16` / `C24` unified-memory bus-contention & L2-residency placement
+/// decision (ADR-0018 Safeguard B.3, ADR-0023 Section 5).
+pub const PlacementDecision = enum {
+    /// Working set fits hot L2 cap (`<= 4 MiB` / `<= 25%` P-core L2) or GPU bus
+    /// is idle and fits P-cluster L2: use `ld1*` + `prfm pldl1keep`.
+    sme2_l2_temporal,
+    /// Large streaming working set allowed to run with non-temporal L2 bypass
+    /// (`ldnt1*` + `prfm pldl1strm`), either because GPU bus is idle or because
+    /// measured co-execution passed the `C13` (`> 1.05×`, `swapouts_delta == 0`) gate.
+    sme2_streaming_nt,
+    /// Working set exceeds the `<= 4 MiB` hot L2 cap while GPU pass is saturating
+    /// the unified memory bus and `C13` co-execution gate did not pass: defer SME2
+    /// DRAM traffic so P-cores never steal bandwidth or thermal headroom from GPU.
+    defer_gpu_bus_saturated,
+    /// Host lacks `FEAT_SME2` (`M1–M3`) or SVL != 64 B: clean pure-Zig fallback.
+    scalar_fallback,
+};
+
+/// Evaluates the combined `C24` `<= 4 MiB` L2-residency cap and `C13` / `C16`
+/// unified-memory bandwidth gate (ADR-0018, ADR-0021, ADR-0023).
+pub fn evaluateC13BusGate(
+    caps: SmeCaps,
+    chip: chip_profile.ChipProfile,
+    working_set_bytes: usize,
+    gpu_bus_saturated: bool,
+    measured_coexec_speedup: ?f64,
+    swapouts_delta: u64,
+) PlacementDecision {
+    if (!caps.supportsSme2()) return .scalar_fallback;
+
+    // Hot L2-resident working sets (`<= 4 MiB`, `<= 25%` of P-core L2) never
+    // saturate DRAM bandwidth and may overlap freely with active GPU passes.
+    if (working_set_bytes <= caps.hotAdapterL2BudgetBytes()) {
+        return .sme2_l2_temporal;
+    }
+
+    if (gpu_bus_saturated) {
+        if (swapouts_delta == 0) {
+            if (measured_coexec_speedup) |sp| {
+                if (chip.passesC13CoexecGate(sp)) {
+                    return .sme2_streaming_nt;
+                }
+            }
+        }
+        return .defer_gpu_bus_saturated;
+    }
+
+    return if (working_set_bytes <= caps.draftL2BudgetBytes())
+        .sme2_l2_temporal
+    else
+        .sme2_streaming_nt;
+}
 
 // ============================================================================
 // `sme2_panel64` geometry & pre-packing helpers (W15 binary contract)
@@ -771,6 +876,62 @@ pub fn packQuantLut16Panel64(
                 std.mem.writeInt(u16, grp_slice[64 + c * 4 + 2 ..][0..2], b_bits, .little);
             }
             writeQuantCodesForGroup(dtype, codes_nk, n, k, p, g * GROUP_SIZE, grp_slice[QUANT_HEADER_BYTES..]);
+            out_off += g_bytes;
+        }
+    }
+}
+
+/// Packs 2-bit `q2_affine` codes (`0..3`, 4× packed weights per byte) with
+/// per-`(panel, group)` 4-entry `ZT0` `LUT4` codebooks (`QuantParamKind.lut4_codebook`,
+/// ADR-0023 C24) for `luti2` expansion (`W14`, `W17`, `W19` multi-LoRA, `D8` draft).
+/// `codebooks_f16` has shape `[panelCount(n) * (k / 64)][4]f16`.
+/// Optional `biases_f16` has shape `[n * (k / 64)]f16` (zeros when null).
+pub fn packQuantLut4Panel64(
+    codes_nk: []const u8,
+    codebooks_f16: []const [4]f16,
+    biases_f16: ?[]const f16,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    const total_bytes = try packedBlobBytes(.q2_affine, n, k);
+    const nk = std.math.mul(usize, n, k) catch return error.Overflow;
+    const panels = panelCount(n);
+    const groups = k / GROUP_SIZE;
+    const pg = std.math.mul(usize, panels, groups) catch return error.Overflow;
+    const ng = std.math.mul(usize, n, groups) catch return error.Overflow;
+    if (codes_nk.len < nk or codebooks_f16.len < pg or dst.len < total_bytes) {
+        return error.BufferTooSmall;
+    }
+    if (biases_f16) |bf| {
+        if (bf.len < ng) return error.BufferTooSmall;
+    }
+
+    const g_bytes = groupBytes(.q2_affine);
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        for (0..groups) |g| {
+            const grp_slice = dst[out_off .. out_off + g_bytes];
+            const cb = codebooks_f16[p * groups + g];
+            // Store [v0, v0, v1, v1, v2, v2, v3, v3] at 32-bit stride in bytes 0..16
+            // for Apple M4 `ldr zt0` + `luti2`, zero-filling bytes 16..64 cleanly.
+            @memset(grp_slice[0..64], 0);
+            for (0..4) |idx| {
+                const bits: u16 = @bitCast(cb[idx]);
+                std.mem.writeInt(u16, grp_slice[idx * 4 + 0 ..][0..2], bits, .little);
+                std.mem.writeInt(u16, grp_slice[idx * 4 + 2 ..][0..2], bits, .little);
+            }
+            for (0..PANEL_COLS) |c| {
+                const col = p * PANEL_COLS + c;
+                const b_val: f16 = if (col < n and biases_f16 != null)
+                    biases_f16.?[col * groups + g]
+                else
+                    0.0;
+                const b_bits: u16 = @bitCast(b_val);
+                std.mem.writeInt(u16, grp_slice[64 + c * 4 + 0 ..][0..2], b_bits, .little);
+                std.mem.writeInt(u16, grp_slice[64 + c * 4 + 2 ..][0..2], b_bits, .little);
+            }
+            writeQuantCodesForGroup(.q2_affine, codes_nk, n, k, p, g * GROUP_SIZE, grp_slice[QUANT_HEADER_BYTES..]);
             out_off += g_bytes;
         }
     }
@@ -1587,6 +1748,282 @@ pub const SmeDispatcher = struct {
         return self.gemm(c, a_u16, w_packed, aux_f32, std.mem.sliceAsBytes(out_f32), m, n, k);
     }
 
+    /// Executes a batch of heterogeneous linear projections (`ops`) under a hoisted
+    /// `smstart`..`smstop` Streaming-SVE residency window (`ami_sme2_exec_batch`,
+    /// ADR-0023 C24) so Streaming SVE is never toggled per row or per projection.
+    /// Reuses packed activation strips / group activation sums across consecutive
+    /// projections sharing the same input tensor (e.g., QKV or `W19` multi-LoRA).
+    /// Zero dynamic heap allocations on the hot path; clean M1–M3 scalar fallback.
+    pub fn evalLinearBatchHoisted(
+        self: *SmeDispatcher,
+        ops: []const BatchLinearOp,
+        backend_override: ?ExecutionBackend,
+    ) Error!void {
+        if (ops.len == 0) return;
+        const backend = try self.caps.resolveBackend(backend_override);
+
+        // Validate every operation upfront before touching outputs or entering SME2.
+        for (ops) |op| {
+            const w = op.weight;
+            if (op.m == 0 or w.n == 0 or w.k == 0) return error.ZeroDimension;
+            if ((w.k % GROUP_SIZE) != 0) return error.UnalignedK;
+            const w_need = try packedBlobBytes(w.dtype, w.n, w.k);
+            const mk = std.math.mul(usize, op.m, w.k) catch return error.Overflow;
+            const mn = std.math.mul(usize, op.m, w.n) catch return error.Overflow;
+            const out_need = std.math.mul(usize, mn, op.out_dtype.elemBytes()) catch return error.Overflow;
+            if (op.a_u16.len < mk or w.w_packed.len < w_need or op.out_bytes.len < out_need) {
+                return error.BufferTooSmall;
+            }
+            if (op.epilogue != .none) {
+                const aux = op.aux_f32 orelse return error.MissingAuxBuffer;
+                if (aux.len < mn) return error.BufferTooSmall;
+            }
+        }
+
+        if (backend == .scalar_fallback) {
+            for (ops) |op| {
+                const w = op.weight;
+                matmulPanel64ScalarRange(
+                    w.dtype,
+                    w.param_kind,
+                    op.epilogue,
+                    op.out_dtype,
+                    op.a_u16,
+                    w.w_packed,
+                    op.aux_f32,
+                    op.out_bytes,
+                    0,
+                    op.m,
+                    0,
+                    panelCount(w.n),
+                    w.n,
+                    w.k,
+                );
+            }
+            return;
+        }
+
+        var args_buf: [MAX_HOISTED_BATCH_OPS]KernelArgs = undefined;
+        var task_buf: [MAX_HOISTED_BATCH_OPS]BatchKernelTask = undefined;
+        var task_count: usize = 0;
+        var a_pack_used: usize = 0;
+        var x_sums_used: usize = 0;
+
+        const PackKey = struct {
+            a_ptr: [*]const u16,
+            m_start: usize,
+            m_rows: usize,
+            k: usize,
+            regime: KernelRegime,
+            packed_ptr: [*]const u8,
+            a_stride: usize,
+        };
+        const SumsKey = struct {
+            a_ptr: [*]const u16,
+            m_start: usize,
+            m_rows: usize,
+            k: usize,
+            sums_ptr: [*]const f32,
+        };
+        var last_pack: ?PackKey = null;
+        var last_sums: ?SumsKey = null;
+
+        for (ops) |op| {
+            const w = op.weight;
+            const hint = op.cache_hint orelse w.cache_hint;
+            const ps = try panelStrideBytes(w.dtype, w.k);
+            const groups = w.k / GROUP_SIZE;
+            const elem_bytes = op.out_dtype.elemBytes();
+            const out_row_stride = w.n * elem_bytes;
+            const zt0_ptr: [*]const u8 = if (w.dtype == .q2_affine)
+                std.mem.sliceAsBytes(&ZT0_LUT4_IDENTITY_TABLE).ptr
+            else
+                std.mem.sliceAsBytes(&ZT0_AFFINE_TABLE).ptr;
+
+            var m_cur: usize = 0;
+            while (m_cur < op.m) {
+                const rem = op.m - m_cur;
+                const regime: KernelRegime = if (rem <= 4)
+                    .m1_4
+                else if (rem <= 16)
+                    .m5_16
+                else
+                    .m32;
+                const strip_rows: usize = switch (regime) {
+                    .m1_4 => rem,
+                    .m5_16 => rem,
+                    .m32 => @min(rem, 32),
+                };
+
+                if (task_count == MAX_HOISTED_BATCH_OPS) {
+                    ami_sme2_exec_batch(&task_buf, task_count);
+                    task_count = 0;
+                    a_pack_used = 0;
+                    x_sums_used = 0;
+                    last_pack = null;
+                    last_sums = null;
+                }
+
+                var a_packed_ptr: [*]const u8 = undefined;
+                var a_row_stride_bytes: usize = 0;
+                var x_sums_ptr: ?[*]const f32 = null;
+
+                switch (regime) {
+                    .m1_4 => {
+                        a_packed_ptr = std.mem.sliceAsBytes(op.a_u16[m_cur * w.k ..]).ptr;
+                        a_row_stride_bytes = w.k * @sizeOf(u16);
+                        if (w.dtype.isQuantized()) {
+                            if (last_sums != null and
+                                last_sums.?.a_ptr == op.a_u16.ptr and
+                                last_sums.?.m_start == m_cur and
+                                last_sums.?.m_rows == strip_rows and
+                                last_sums.?.k == w.k)
+                            {
+                                x_sums_ptr = last_sums.?.sums_ptr;
+                            } else {
+                                const need_sums = strip_rows * groups;
+                                if (need_sums > self.x_sums_scratch.len) return error.BufferTooSmall;
+                                if (x_sums_used + need_sums > self.x_sums_scratch.len) {
+                                    if (task_count > 0) {
+                                        ami_sme2_exec_batch(&task_buf, task_count);
+                                        task_count = 0;
+                                    }
+                                    a_pack_used = 0;
+                                    x_sums_used = 0;
+                                    last_pack = null;
+                                    last_sums = null;
+                                }
+                                const dst_sums = self.x_sums_scratch[x_sums_used .. x_sums_used + need_sums];
+                                computeGroupActivationSums(op.a_u16, m_cur, strip_rows, w.k, dst_sums);
+                                x_sums_ptr = dst_sums.ptr;
+                                last_sums = .{
+                                    .a_ptr = op.a_u16.ptr,
+                                    .m_start = m_cur,
+                                    .m_rows = strip_rows,
+                                    .k = w.k,
+                                    .sums_ptr = dst_sums.ptr,
+                                };
+                                x_sums_used += need_sums;
+                            }
+                        }
+                    },
+                    .m5_16 => {
+                        if (last_pack != null and
+                            last_pack.?.a_ptr == op.a_u16.ptr and
+                            last_pack.?.m_start == m_cur and
+                            last_pack.?.m_rows == strip_rows and
+                            last_pack.?.k == w.k and
+                            last_pack.?.regime == .m5_16)
+                        {
+                            a_packed_ptr = last_pack.?.packed_ptr;
+                            a_row_stride_bytes = last_pack.?.a_stride;
+                        } else {
+                            const need_u16 = PANEL_COLS * w.k;
+                            if (need_u16 > self.a_pack_scratch.len) return error.BufferTooSmall;
+                            if (a_pack_used + need_u16 > self.a_pack_scratch.len) {
+                                if (task_count > 0) {
+                                    ami_sme2_exec_batch(&task_buf, task_count);
+                                    task_count = 0;
+                                }
+                                a_pack_used = 0;
+                                x_sums_used = 0;
+                                last_pack = null;
+                                last_sums = null;
+                            }
+                            const dst_u16 = self.a_pack_scratch[a_pack_used .. a_pack_used + need_u16];
+                            packActivationStrip(op.a_u16, m_cur, strip_rows, w.k, dst_u16);
+                            a_packed_ptr = std.mem.sliceAsBytes(dst_u16).ptr;
+                            a_row_stride_bytes = need_u16 * @sizeOf(u16);
+                            last_pack = .{
+                                .a_ptr = op.a_u16.ptr,
+                                .m_start = m_cur,
+                                .m_rows = strip_rows,
+                                .k = w.k,
+                                .regime = .m5_16,
+                                .packed_ptr = a_packed_ptr,
+                                .a_stride = a_row_stride_bytes,
+                            };
+                            a_pack_used += need_u16;
+                        }
+                    },
+                    .m32 => {
+                        if (last_pack != null and
+                            last_pack.?.a_ptr == op.a_u16.ptr and
+                            last_pack.?.m_start == m_cur and
+                            last_pack.?.m_rows == strip_rows and
+                            last_pack.?.k == w.k and
+                            last_pack.?.regime == .m32)
+                        {
+                            a_packed_ptr = last_pack.?.packed_ptr;
+                            a_row_stride_bytes = last_pack.?.a_stride;
+                        } else {
+                            const strip_u16 = PANEL_COLS * w.k;
+                            const need_u16 = 2 * strip_u16;
+                            if (need_u16 > self.a_pack_scratch.len) return error.BufferTooSmall;
+                            if (a_pack_used + need_u16 > self.a_pack_scratch.len) {
+                                if (task_count > 0) {
+                                    ami_sme2_exec_batch(&task_buf, task_count);
+                                    task_count = 0;
+                                }
+                                a_pack_used = 0;
+                                x_sums_used = 0;
+                                last_pack = null;
+                                last_sums = null;
+                            }
+                            const top_rows = @min(strip_rows, PANEL_COLS);
+                            const bot_rows = strip_rows - top_rows;
+                            const dst_u16 = self.a_pack_scratch[a_pack_used .. a_pack_used + need_u16];
+                            packActivationStrip(op.a_u16, m_cur, top_rows, w.k, dst_u16[0..strip_u16]);
+                            packActivationStrip(op.a_u16, m_cur + top_rows, bot_rows, w.k, dst_u16[strip_u16..need_u16]);
+                            a_packed_ptr = std.mem.sliceAsBytes(dst_u16).ptr;
+                            a_row_stride_bytes = strip_u16 * @sizeOf(u16);
+                            last_pack = .{
+                                .a_ptr = op.a_u16.ptr,
+                                .m_start = m_cur,
+                                .m_rows = strip_rows,
+                                .k = w.k,
+                                .regime = .m32,
+                                .packed_ptr = a_packed_ptr,
+                                .a_stride = a_row_stride_bytes,
+                            };
+                            a_pack_used += need_u16;
+                        }
+                    },
+                }
+
+                args_buf[task_count] = .{
+                    .a_ptr = a_packed_ptr,
+                    .w_ptr = w.w_packed.ptr,
+                    .out_ptr = op.out_bytes.ptr + m_cur * out_row_stride,
+                    .aux_ptr = if (op.aux_f32) |aux| aux.ptr + m_cur * w.n else null,
+                    .x_group_sums_ptr = x_sums_ptr,
+                    .zt0_table_ptr = zt0_ptr,
+                    .a_row_stride_bytes = a_row_stride_bytes,
+                    .panel_stride_bytes = ps,
+                    .out_row_stride_bytes = out_row_stride,
+                    .aux_row_stride_elems = w.n,
+                    .m_rows = @intCast(strip_rows),
+                    .n_valid_cols = @intCast(w.n),
+                    .panel_count = @intCast(panelCount(w.n)),
+                    .groups = @intCast(groups),
+                    .epilogue_op = @backingInt(op.epilogue),
+                    .out_dtype = @backingInt(op.out_dtype),
+                    .param_kind = @backingInt(w.param_kind),
+                };
+                task_buf[task_count] = .{
+                    .args = &args_buf[task_count],
+                    .kernel_id = kernelId(regime, w.dtype, hint),
+                };
+                task_count += 1;
+                m_cur += strip_rows;
+            }
+        }
+
+        if (task_count > 0) {
+            ami_sme2_exec_batch(&task_buf, task_count);
+        }
+    }
+
     /// Runs `task_fn(ctx, tile_idx)` across `[0, total_tiles)` using the persistent
     /// lock-free P-core worker pool with zero heap allocation on the hot path.
     pub fn parallelFor(
@@ -1713,6 +2150,19 @@ pub const LinearEvalOptions = struct {
     out_dtype: OutputDType = .f32,
     backend: ?ExecutionBackend = null,
     max_threads: ?usize = null,
+};
+
+/// Single projection descriptor for `SmeDispatcher.evalLinearBatchHoisted`
+/// (hoisted `smstart`..`smstop` layer / multi-LoRA execution, ADR-0023 C24).
+pub const BatchLinearOp = struct {
+    weight: SmeLinearWeight,
+    a_u16: []const u16,
+    aux_f32: ?[]const f32 = null,
+    out_bytes: []u8,
+    m: usize,
+    epilogue: EpilogueOp = .none,
+    out_dtype: OutputDType = .f32,
+    cache_hint: ?CacheHint = null,
 };
 
 /// Executes `Out[M, N] = epilogue(A[M, K] @ W^T, aux)` over a validated
@@ -1935,6 +2385,121 @@ pub fn packStepLoraBDenseFromF32Panel64(
     }
 }
 
+/// Packs a logical `[n, rank]` (`1 <= rank <= 64`) 2-bit `q2_affine` Step-LoRA /
+/// `W19` multi-LoRA `B_r` matrix into a valid `[n, 64]` `sme2_panel64` blob.
+/// Columns `rank..64` are padded with code `0`; because `z_act_u16[rank..64]` is
+/// zeroed on evaluation, padded columns contribute exact `0.0` even when `bias != 0`.
+pub fn packStepLoraBQ2AffinePanel64(
+    codes_n_rank: []const u8,
+    scale_bias: []const quant.ScaleBias,
+    n: usize,
+    rank: usize,
+    dst: []u8,
+) Error!void {
+    if (n == 0 or rank == 0) return error.ZeroDimension;
+    if (rank > MAX_STEP_LORA_RANK) return error.InvalidArgument;
+    const total_bytes = try packedBlobBytes(.q2_affine, n, GROUP_SIZE);
+    const nr = std.math.mul(usize, n, rank) catch return error.Overflow;
+    if (codes_n_rank.len < nr or scale_bias.len < n or dst.len < total_bytes) {
+        return error.BufferTooSmall;
+    }
+
+    const panels = panelCount(n);
+    const g_bytes = groupBytes(.q2_affine);
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        const grp_slice = dst[out_off .. out_off + g_bytes];
+        for (0..PANEL_COLS) |c| {
+            const col = p * PANEL_COLS + c;
+            const sb: quant.ScaleBias = if (col < n) scale_bias[col] else .{ .scale = 0.0, .bias = 0.0 };
+            const s_bits: u16 = @bitCast(sb.scale);
+            const b_bits: u16 = @bitCast(sb.bias);
+            std.mem.writeInt(u16, grp_slice[c * 4 + 0 ..][0..2], s_bits, .little);
+            std.mem.writeInt(u16, grp_slice[c * 4 + 2 ..][0..2], s_bits, .little);
+            std.mem.writeInt(u16, grp_slice[64 + c * 4 + 0 ..][0..2], b_bits, .little);
+            std.mem.writeInt(u16, grp_slice[64 + c * 4 + 2 ..][0..2], b_bits, .little);
+        }
+        const code_dst = grp_slice[QUANT_HEADER_BYTES..];
+        for (0..32) |kp| {
+            const k0 = 2 * kp;
+            const k1 = k0 + 1;
+            for (0..8) |b| {
+                const c0 = 2 * b;
+                const c1 = c0 + 1;
+                const col0 = p * PANEL_COLS + c0;
+                const col1 = p * PANEL_COLS + c1;
+                const q00: u8 = if (col0 < n and k0 < rank) codes_n_rank[col0 * rank + k0] & 0x03 else 0;
+                const q01: u8 = if (col0 < n and k1 < rank) codes_n_rank[col0 * rank + k1] & 0x03 else 0;
+                const q10: u8 = if (col1 < n and k0 < rank) codes_n_rank[col1 * rank + k0] & 0x03 else 0;
+                const q11: u8 = if (col1 < n and k1 < rank) codes_n_rank[col1 * rank + k1] & 0x03 else 0;
+                code_dst[kp * 8 + b] = q00 | (q01 << 2) | (q10 << 4) | (q11 << 6);
+            }
+        }
+        out_off += g_bytes;
+    }
+}
+
+/// Packs a logical `[n, rank]` (`1 <= rank <= 64`) 2-bit `LUT4` Step-LoRA /
+/// `W19` multi-LoRA `B_r` matrix (`QuantParamKind.lut4_codebook`, 4-entry `ZT0`
+/// table per panel) into a valid `[n, 64]` `sme2_panel64` blob (ADR-0023 C24).
+pub fn packStepLoraBQ2Lut4Panel64(
+    codes_n_rank: []const u8,
+    codebooks_f16: []const [4]f16,
+    biases_f16: ?[]const f16,
+    n: usize,
+    rank: usize,
+    dst: []u8,
+) Error!void {
+    if (n == 0 or rank == 0) return error.ZeroDimension;
+    if (rank > MAX_STEP_LORA_RANK) return error.InvalidArgument;
+    const total_bytes = try packedBlobBytes(.q2_affine, n, GROUP_SIZE);
+    const nr = std.math.mul(usize, n, rank) catch return error.Overflow;
+    const panels = panelCount(n);
+    if (codes_n_rank.len < nr or codebooks_f16.len < panels or dst.len < total_bytes) {
+        return error.BufferTooSmall;
+    }
+    if (biases_f16) |bf| {
+        if (bf.len < n) return error.BufferTooSmall;
+    }
+
+    const g_bytes = groupBytes(.q2_affine);
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        const grp_slice = dst[out_off .. out_off + g_bytes];
+        @memset(grp_slice[0..64], 0);
+        const cb = codebooks_f16[p];
+        for (0..4) |idx| {
+            const bits: u16 = @bitCast(cb[idx]);
+            std.mem.writeInt(u16, grp_slice[idx * 4 + 0 ..][0..2], bits, .little);
+            std.mem.writeInt(u16, grp_slice[idx * 4 + 2 ..][0..2], bits, .little);
+        }
+        for (0..PANEL_COLS) |c| {
+            const col = p * PANEL_COLS + c;
+            const b_val: f16 = if (col < n and biases_f16 != null) biases_f16.?[col] else 0.0;
+            const b_bits: u16 = @bitCast(b_val);
+            std.mem.writeInt(u16, grp_slice[64 + c * 4 + 0 ..][0..2], b_bits, .little);
+            std.mem.writeInt(u16, grp_slice[64 + c * 4 + 2 ..][0..2], b_bits, .little);
+        }
+        const code_dst = grp_slice[QUANT_HEADER_BYTES..];
+        for (0..32) |kp| {
+            const k0 = 2 * kp;
+            const k1 = k0 + 1;
+            for (0..8) |b| {
+                const c0 = 2 * b;
+                const c1 = c0 + 1;
+                const col0 = p * PANEL_COLS + c0;
+                const col1 = p * PANEL_COLS + c1;
+                const q00: u8 = if (col0 < n and k0 < rank) codes_n_rank[col0 * rank + k0] & 0x03 else 0;
+                const q01: u8 = if (col0 < n and k1 < rank) codes_n_rank[col0 * rank + k1] & 0x03 else 0;
+                const q10: u8 = if (col1 < n and k0 < rank) codes_n_rank[col1 * rank + k0] & 0x03 else 0;
+                const q11: u8 = if (col1 < n and k1 < rank) codes_n_rank[col1 * rank + k1] & 0x03 else 0;
+                code_dst[kp * 8 + b] = q00 | (q01 << 2) | (q10 << 4) | (q11 << 6);
+            }
+        }
+        out_off += g_bytes;
+    }
+}
+
 /// Reads scalar or per-step vector `alpha_r` from a wired `.amf` `loop_adapter`
 /// 1D tensor (`f32`, `f16`, or `bf16`, `shape = [1]` or `[max_loops]`).
 pub fn readLoopAlphaFromAmf(
@@ -2032,6 +2597,162 @@ pub const SmeStepLoraAdapter = struct {
 
     pub fn totalWeightBytes(self: SmeStepLoraAdapter) usize {
         return self.a_weight.byteSize() + self.b_weight.byteSize();
+    }
+
+    /// Returns true iff this adapter fits inside the strict `<= 4 MiB` (`25%` of
+    /// M4 `16 MiB` P-core L2) hot-adapter residency cap (ADR-0023 C24).
+    pub fn fitsHotAdapterL2(self: SmeStepLoraAdapter, caps: SmeCaps) bool {
+        return self.totalWeightBytes() <= caps.hotAdapterL2BudgetBytes();
+    }
+
+    /// Evaluates a slice of active `Step-LoRA` / `W19` multi-LoRA adapters
+    /// (`f16`, `bf16`, `q2_affine`, or `LUT4`) onto `y_f32` under hoisted
+    /// `smstart`..`smstop` waves (`evalLinearBatchHoisted`), enforcing:
+    ///   - `<= 4 MiB` (`25%` P-core L2) hot-adapter residency cap (`prfm pldl1keep`
+    ///     when within cap; automatic `prfm pldl1strm` / `ldnt1b` demotion or
+    ///     `error.BusContentionDeferred` under `C13`/`C16` when GPU bus is saturated),
+    ///   - bit-exact `alpha == 0.0` skip,
+    ///   - zero hot-path heap allocations, and clean M1–M3 fallback.
+    pub fn evalMultiAdapterHoisted(
+        adapters: []const SmeStepLoraAdapter,
+        dispatcher: *SmeDispatcher,
+        scratch: *StepLoraScratch,
+        x_u16: []const u16,
+        y_f32: []f32,
+        m: usize,
+        chip: ?chip_profile.ChipProfile,
+        gpu_bus_saturated: bool,
+        measured_coexec_speedup: ?f64,
+        swapouts_delta: u64,
+        backend_override: ?ExecutionBackend,
+    ) (Error || error{BusContentionDeferred})!void {
+        if (adapters.len == 0) return;
+        if (m == 0 or m > MAX_STEP_LORA_M or m > scratch.max_m) return error.InvalidArgument;
+
+        // 1. Validate dimensions and compute combined active adapter L2 footprint.
+        var total_active_bytes: usize = 0;
+        var active_count: usize = 0;
+        for (adapters) |adp| {
+            if (adp.rank > scratch.max_rank) return error.InvalidArgument;
+            const mk = std.math.mul(usize, m, adp.k) catch return error.Overflow;
+            const mn = std.math.mul(usize, m, adp.n) catch return error.Overflow;
+            if (x_u16.len < mk or y_f32.len < mn) return error.BufferTooSmall;
+            if (adp.alpha == 0.0) continue;
+            total_active_bytes = std.math.add(usize, total_active_bytes, adp.totalWeightBytes()) catch return error.Overflow;
+            active_count += 1;
+        }
+        if (active_count == 0) return;
+
+        // 2. Enforce `<= 4 MiB` hot-adapter L2 residency cap & `C13`/`C16` bus gate.
+        var resolved_hint: CacheHint = if (total_active_bytes <= dispatcher.caps.hotAdapterL2BudgetBytes())
+            .temporal
+        else
+            .non_temporal;
+        var resolved_backend: ?ExecutionBackend = backend_override;
+
+        if (chip) |cp| {
+            const decision = evaluateC13BusGate(
+                dispatcher.caps,
+                cp,
+                total_active_bytes,
+                gpu_bus_saturated,
+                measured_coexec_speedup,
+                swapouts_delta,
+            );
+            switch (decision) {
+                .defer_gpu_bus_saturated => return error.BusContentionDeferred,
+                .sme2_l2_temporal => resolved_hint = .temporal,
+                .sme2_streaming_nt => resolved_hint = .non_temporal,
+                .scalar_fallback => {
+                    if (resolved_backend == null) resolved_backend = .scalar_fallback;
+                },
+            }
+        }
+
+        // 3. Process active adapters in scratch-bounded hoisted waves (`0` heap alloc).
+        var idx: usize = 0;
+        while (idx < adapters.len) {
+            var a_ops: [MAX_HOISTED_BATCH_OPS]BatchLinearOp = undefined;
+            var b_ops: [MAX_HOISTED_BATCH_OPS]BatchLinearOp = undefined;
+            var wave_adp_indices: [MAX_HOISTED_BATCH_OPS]usize = undefined;
+            var wave_z_f32_offs: [MAX_HOISTED_BATCH_OPS]usize = undefined;
+            var wave_z_u16_offs: [MAX_HOISTED_BATCH_OPS]usize = undefined;
+
+            var wave_count: usize = 0;
+            var z_f32_used: usize = 0;
+            var z_u16_used: usize = 0;
+
+            while (idx < adapters.len and wave_count < MAX_HOISTED_BATCH_OPS) {
+                const adp = adapters[idx];
+                if (adp.alpha == 0.0) {
+                    idx += 1;
+                    continue;
+                }
+                const need_f32 = m * adp.rank;
+                const need_u16 = m * GROUP_SIZE;
+                if (wave_count > 0 and
+                    (z_f32_used + need_f32 > scratch.z_f32.len or
+                        z_u16_used + need_u16 > scratch.z_act_u16.len))
+                {
+                    break;
+                }
+                if (need_f32 > scratch.z_f32.len or need_u16 > scratch.z_act_u16.len) {
+                    return error.BufferTooSmall;
+                }
+                const z_f32_slice = scratch.z_f32[z_f32_used .. z_f32_used + need_f32];
+                const z_u16_slice = scratch.z_act_u16[z_u16_used .. z_u16_used + need_u16];
+                a_ops[wave_count] = .{
+                    .weight = adp.a_weight,
+                    .a_u16 = x_u16[0 .. m * adp.k],
+                    .aux_f32 = null,
+                    .out_bytes = std.mem.sliceAsBytes(z_f32_slice),
+                    .m = m,
+                    .epilogue = .none,
+                    .out_dtype = .f32,
+                    .cache_hint = resolved_hint,
+                };
+                b_ops[wave_count] = .{
+                    .weight = adp.b_weight,
+                    .a_u16 = z_u16_slice,
+                    .aux_f32 = y_f32[0 .. m * adp.n],
+                    .out_bytes = std.mem.sliceAsBytes(y_f32[0 .. m * adp.n]),
+                    .m = m,
+                    .epilogue = .add_residual,
+                    .out_dtype = .f32,
+                    .cache_hint = resolved_hint,
+                };
+                wave_adp_indices[wave_count] = idx;
+                wave_z_f32_offs[wave_count] = z_f32_used;
+                wave_z_u16_offs[wave_count] = z_u16_used;
+                z_f32_used += need_f32;
+                z_u16_used += need_u16;
+                wave_count += 1;
+                idx += 1;
+            }
+            if (wave_count == 0) break;
+
+            // Wave A: ONE hoisted `smstart`..`smstop` across all `A_r` projections (sharing packed `x`).
+            try dispatcher.evalLinearBatchHoisted(a_ops[0..wave_count], resolved_backend);
+
+            // Scale by `alpha_r`, convert to `B_r`'s activation dtype, and zero-pad `[rank..64]`.
+            for (0..wave_count) |wi| {
+                const adp = adapters[wave_adp_indices[wi]];
+                const b_act_dt: quant.FloatDType = if (adp.b_weight.dtype.activationIsBf16()) .bf16 else .f16;
+                const z_f32 = scratch.z_f32[wave_z_f32_offs[wi] .. wave_z_f32_offs[wi] + m * adp.rank];
+                const z_u16 = scratch.z_act_u16[wave_z_u16_offs[wi] .. wave_z_u16_offs[wi] + m * GROUP_SIZE];
+                for (0..m) |row| {
+                    const src_row = z_f32[row * adp.rank ..][0..adp.rank];
+                    const dst_row = z_u16[row * GROUP_SIZE ..][0..GROUP_SIZE];
+                    for (0..adp.rank) |j| {
+                        dst_row[j] = quant.f32ToFloatBits(b_act_dt, src_row[j] * adp.alpha);
+                    }
+                    @memset(dst_row[adp.rank..GROUP_SIZE], 0);
+                }
+            }
+
+            // Wave B: ONE hoisted `smstart`..`smstop` sequentially accumulating `y += z_r @ B_r^T`.
+            try dispatcher.evalLinearBatchHoisted(b_ops[0..wave_count], resolved_backend);
+        }
     }
 
     /// Evaluates `y_f32[m, :] += alpha * ((x_u16[m, :] @ A^T) @ B^T)` in-place
@@ -2624,6 +3345,126 @@ pub noinline fn invokeWithRegisterCanary(
           .x6 = true,
           .x7 = true,
           .x12 = true,
+          .x13 = true,
+          .x14 = true,
+          .x15 = true,
+          .x16 = true,
+          .x17 = true,
+          .x30 = true,
+          .v0 = true,
+          .v1 = true,
+          .v2 = true,
+          .v3 = true,
+          .v4 = true,
+          .v5 = true,
+          .v6 = true,
+          .v7 = true,
+          .v8 = true,
+          .v9 = true,
+          .v10 = true,
+          .v11 = true,
+          .v12 = true,
+          .v13 = true,
+          .v14 = true,
+          .v15 = true,
+          .v16 = true,
+          .v17 = true,
+          .v18 = true,
+          .v19 = true,
+          .v20 = true,
+          .v21 = true,
+          .v22 = true,
+          .v23 = true,
+          .v24 = true,
+          .v25 = true,
+          .v26 = true,
+          .v27 = true,
+          .v28 = true,
+          .v29 = true,
+          .v30 = true,
+          .v31 = true,
+          .nzcv = true,
+          .memory = true,
+        });
+
+    for (CANARY_SENTINELS, after) |exp, got| {
+        if (exp != got) return error.RegisterClobbered;
+    }
+}
+
+/// Invokes hoisted `ami_sme2_exec_batch(tasks.ptr, tasks.len)` under the exact
+/// same 18-register AAPCS64 sentinel frame (`x19..x28`, `d8..d15`) as
+/// `invokeWithRegisterCanary`, verifying 0-bit corruption across batched execution.
+pub noinline fn invokeBatchWithRegisterCanary(
+    tasks: []const BatchKernelTask,
+) error{RegisterClobbered}!void {
+    var after: [18]u64 = @splat(0);
+    var f_reg: usize = @intFromPtr(&ami_sme2_exec_batch);
+    var p_reg: usize = @intFromPtr(tasks.ptr);
+    var c_reg: usize = tasks.len;
+    var s_reg: usize = @intFromPtr(&CANARY_SENTINELS);
+    var o_reg: usize = @intFromPtr(&after);
+    asm volatile (
+        \\sub sp, sp, #176
+        \\stp x19, x20, [sp, #0]
+        \\stp x21, x22, [sp, #16]
+        \\stp x23, x24, [sp, #32]
+        \\stp x25, x26, [sp, #48]
+        \\stp x27, x28, [sp, #64]
+        \\stp d8,  d9,  [sp, #80]
+        \\stp d10, d11, [sp, #96]
+        \\stp d12, d13, [sp, #112]
+        \\stp d14, d15, [sp, #128]
+        \\stp x29, x30, [sp, #144]
+        \\str x12, [sp, #160]
+        \\ldp x19, x20, [x11, #0]
+        \\ldp x21, x22, [x11, #16]
+        \\ldp x23, x24, [x11, #32]
+        \\ldp x25, x26, [x11, #48]
+        \\ldp x27, x28, [x11, #64]
+        \\ldp d8,  d9,  [x11, #80]
+        \\ldp d10, d11, [x11, #96]
+        \\ldp d12, d13, [x11, #112]
+        \\ldp d14, d15, [x11, #128]
+        \\mov x0, x9
+        \\mov x1, x10
+        \\blr x8
+        \\ldr x12, [sp, #160]
+        \\stp x19, x20, [x12, #0]
+        \\stp x21, x22, [x12, #16]
+        \\stp x23, x24, [x12, #32]
+        \\stp x25, x26, [x12, #48]
+        \\stp x27, x28, [x12, #64]
+        \\stp d8,  d9,  [x12, #80]
+        \\stp d10, d11, [x12, #96]
+        \\stp d12, d13, [x12, #112]
+        \\stp d14, d15, [x12, #128]
+        \\ldp x29, x30, [sp, #144]
+        \\ldp d14, d15, [sp, #128]
+        \\ldp d12, d13, [sp, #112]
+        \\ldp d10, d11, [sp, #96]
+        \\ldp d8,  d9,  [sp, #80]
+        \\ldp x27, x28, [sp, #64]
+        \\ldp x25, x26, [sp, #48]
+        \\ldp x23, x24, [sp, #32]
+        \\ldp x21, x22, [sp, #16]
+        \\ldp x19, x20, [sp, #0]
+        \\add sp, sp, #176
+        : [func] "+{x8}" (f_reg),
+          [ptr] "+{x9}" (p_reg),
+          [cnt] "+{x10}" (c_reg),
+          [sent] "+{x11}" (s_reg),
+          [out] "+{x12}" (o_reg),
+        :
+        : .{
+          .x0 = true,
+          .x1 = true,
+          .x2 = true,
+          .x3 = true,
+          .x4 = true,
+          .x5 = true,
+          .x6 = true,
+          .x7 = true,
           .x13 = true,
           .x14 = true,
           .x15 = true,
@@ -4420,4 +5261,591 @@ test "D13: SmeDraftProjection evalFusedNormLinear, evalDualNormConcatLinear, eva
             }
         }
     }
+}
+
+test "C24: luti2 2-bit q2_affine and LUT4 codebook fp32 parity across M=1..35, odd N/K, temporal/non_temporal, epilogues, and fallback" {
+    const gpa = std.testing.allocator;
+    const caps = try SmeCaps.probe();
+    var disp = try SmeDispatcher.init(gpa, .{
+        .caps_override = caps,
+        .total_threads = 2,
+    });
+    defer disp.deinit();
+
+    const backends: []const ExecutionBackend = if (caps.supportsSme2())
+        &.{ .sme2, .scalar_fallback }
+    else
+        &.{.scalar_fallback};
+
+    const shapes = [_]struct { m: usize, n: usize, k: usize }{
+        .{ .m = 1, .n = 17, .k = 64 },   // M==1 branch-free luti2 fast path, odd N
+        .{ .m = 1, .n = 65, .k = 256 },  // M==1 multi-group & multi-panel prefetch
+        .{ .m = 3, .n = 33, .k = 192 },  // M=2..4 streaming burst dot
+        .{ .m = 5, .n = 37, .k = 128 },  // M=5..16 1x4 ZA
+        .{ .m = 16, .n = 64, .k = 256 }, // full 1x4 ZA with 4-group prefetch
+        .{ .m = 17, .n = 35, .k = 128 }, // M=17..31 2x2 ZA odd rows
+        .{ .m = 35, .n = 51, .k = 192 }, // hybrid 32-row 2x2 + 3-row m1_4 tail
+    };
+
+    for (shapes) |sh| {
+        const groups = sh.k / GROUP_SIZE;
+        const panels = panelCount(sh.n);
+
+        const a_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), sh.m * sh.k);
+        defer gpa.free(a_u16);
+        const a_f32 = try gpa.alloc(f32, sh.m * sh.k);
+        defer gpa.free(a_f32);
+        for (0..sh.m * sh.k) |i| {
+            const v: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 13 + 5) % 15)) - 7)) * 0.0625;
+            a_u16[i] = quant.f32ToFloatBits(.f16, v);
+            a_f32[i] = quant.floatBitsToF32(.f16, a_u16[i]);
+        }
+
+        const codes = try gpa.alloc(u8, sh.n * sh.k);
+        defer gpa.free(codes);
+        for (0..sh.n) |ni| {
+            for (0..sh.k) |ki| {
+                codes[ni * sh.k + ki] = @intCast((ni * 7 + ki * 11 + 1) & 0x03);
+            }
+        }
+
+        const aux_f32 = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), sh.m * sh.n);
+        defer gpa.free(aux_f32);
+        for (aux_f32, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4)) * 0.125;
+
+        const w_bytes = try packedBlobBytes(.q2_affine, sh.n, sh.k);
+        const w_packed = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), w_bytes);
+        defer gpa.free(w_packed);
+        const w_f32 = try gpa.alloc(f32, sh.n * sh.k);
+        defer gpa.free(w_f32);
+        const ref_f32 = try gpa.alloc(f32, sh.m * sh.n);
+        defer gpa.free(ref_f32);
+        const got_f32 = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), sh.m * sh.n);
+        defer gpa.free(got_f32);
+
+        // A) Native 2-bit `LUT4` 4-entry `ZT0` codebook (`QuantParamKind.lut4_codebook`).
+        {
+            const codebooks = try gpa.alloc([4]f16, panels * groups);
+            defer gpa.free(codebooks);
+            const biases = try gpa.alloc(f16, sh.n * groups);
+            defer gpa.free(biases);
+            for (0..panels * groups) |pg_i| {
+                const base = @as(f32, @floatFromInt(pg_i % 3)) * 0.0625;
+                codebooks[pg_i] = .{
+                    @floatCast(-0.75 + base),
+                    @floatCast(-0.25 + base),
+                    @floatCast(0.25 + base),
+                    @floatCast(0.75 + base),
+                };
+            }
+            for (0..sh.n * groups) |ng_i| {
+                biases[ng_i] = @floatCast(-0.125 + 0.0625 * @as(f32, @floatFromInt(ng_i % 5)));
+            }
+            try packQuantLut4Panel64(codes, codebooks, biases, sh.n, sh.k, w_packed);
+
+            for (0..sh.n) |ni| {
+                const p = ni / PANEL_COLS;
+                for (0..sh.k) |ki| {
+                    const g = ki / GROUP_SIZE;
+                    const q = codes[ni * sh.k + ki];
+                    w_f32[ni * sh.k + ki] = @as(f32, @floatCast(codebooks[p * groups + g][q])) +
+                        @as(f32, @floatCast(biases[ni * groups + g]));
+                }
+            }
+
+            for ([_]CacheHint{ .temporal, .non_temporal }) |hint| {
+                for ([_]EpilogueOp{ .none, .add_residual, .swiglu_gate_up }) |epi| {
+                    matmulRowMajorRefF32(a_f32, w_f32, if (epi == .none) null else aux_f32, epi, ref_f32, sh.m, sh.n, sh.k);
+                    for (backends) |be| {
+                        try disp.gemmF32(.{
+                            .dtype = .q2_affine,
+                            .param_kind = .lut4_codebook,
+                            .cache_hint = hint,
+                            .epilogue = epi,
+                            .backend = be,
+                        }, a_u16, w_packed, if (epi == .none) null else aux_f32, got_f32, sh.m, sh.n, sh.k);
+                        for (0..sh.m * sh.n) |idx| {
+                            const tol: f32 = @max(1.5e-2, @abs(ref_f32[idx]) * 2.5e-2);
+                            try std.testing.expectApproxEqAbs(ref_f32[idx], got_f32[idx], tol);
+                        }
+                    }
+                }
+            }
+        }
+
+        // B) Native 2-bit `q2_affine` (`QuantParamKind.affine_scale_bias`), including M==1 fast path & f16/bf16 outputs.
+        {
+            const sbs = try gpa.alloc(quant.ScaleBias, sh.n * groups);
+            defer gpa.free(sbs);
+            for (0..sh.n * groups) |gi| {
+                sbs[gi] = .{
+                    .scale = @floatCast(0.125 * @as(f32, @floatFromInt((gi % 4) + 1))),
+                    .bias = @floatCast(-0.375 + 0.125 * @as(f32, @floatFromInt(gi % 5))),
+                };
+            }
+            try packQuantAffinePanel64(.q2_affine, codes, sbs, sh.n, sh.k, w_packed);
+            for (0..sh.n) |ni| {
+                for (0..sh.k) |ki| {
+                    const sb = sbs[ni * groups + (ki / GROUP_SIZE)];
+                    w_f32[ni * sh.k + ki] = @as(f32, @floatFromInt(codes[ni * sh.k + ki])) * @as(f32, @floatCast(sb.scale)) +
+                        @as(f32, @floatCast(sb.bias));
+                }
+            }
+            matmulRowMajorRefF32(a_f32, w_f32, null, .none, ref_f32, sh.m, sh.n, sh.k);
+            for ([_]CacheHint{ .temporal, .non_temporal }) |hint| {
+                for (backends) |be| {
+                    try disp.gemmF32(.{
+                        .dtype = .q2_affine,
+                        .param_kind = .affine_scale_bias,
+                        .cache_hint = hint,
+                        .epilogue = .none,
+                        .backend = be,
+                    }, a_u16, w_packed, null, got_f32, sh.m, sh.n, sh.k);
+                    for (0..sh.m * sh.n) |idx| {
+                        const tol: f32 = @max(1.5e-2, @abs(ref_f32[idx]) * 2.5e-2);
+                        try std.testing.expectApproxEqAbs(ref_f32[idx], got_f32[idx], tol);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "C24: hoisted smstart/smstop batch executor register-clobber canary and heterogeneous multi-layer / W19 multi-LoRA parity" {
+    const gpa = std.testing.allocator;
+    const caps = try SmeCaps.probe();
+    var disp = try SmeDispatcher.init(gpa, .{
+        .caps_override = caps,
+        .total_threads = 2,
+    });
+    defer disp.deinit();
+
+    // 1. Direct AAPCS64 register-clobber canary on `ami_sme2_exec_batch` mixing
+    //    m1_4 (M=1 and M=4), m5_16, m32, q2_affine, LUT4, f16, bf16, temporal & non_temporal.
+    if (caps.supportsSme2()) {
+        const k: usize = 128;
+        const n: usize = 64;
+        const m_max: usize = 32;
+
+        const a_raw = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), m_max * k);
+        defer gpa.free(a_raw);
+        for (a_raw, 0..) |*v, i| v.* = @bitCast(@as(f16, @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25)));
+
+        const a_packed = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), 32 * k);
+        defer gpa.free(a_packed);
+        packActivationStrip(a_raw, 0, 16, k, a_packed[0 .. 16 * k]);
+        packActivationStrip(a_raw, 16, 16, k, a_packed[16 * k .. 32 * k]);
+
+        const x_sums = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), 4 * (k / GROUP_SIZE));
+        defer gpa.free(x_sums);
+        computeGroupActivationSums(a_raw, 0, 4, k, x_sums);
+
+        const out_buf = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), m_max * n);
+        defer gpa.free(out_buf);
+        const aux_buf = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), m_max * n);
+        defer gpa.free(aux_buf);
+        @memset(aux_buf, 0.25);
+
+        const w_f16 = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.f16, n, k));
+        defer gpa.free(w_f16);
+        @memset(w_f16, 0x11);
+        const w_q2 = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.q2_affine, n, k));
+        defer gpa.free(w_q2);
+        @memset(w_q2, 0x22);
+
+        const specs = [_]struct {
+            regime: KernelRegime,
+            dtype: PanelDType,
+            hint: CacheHint,
+            m_rows: u32,
+            param_kind: QuantParamKind,
+            epi: EpilogueOp,
+        }{
+            .{ .regime = .m1_4, .dtype = .q2_affine, .hint = .temporal, .m_rows = 1, .param_kind = .affine_scale_bias, .epi = .none },
+            .{ .regime = .m1_4, .dtype = .q2_affine, .hint = .non_temporal, .m_rows = 1, .param_kind = .lut4_codebook, .epi = .add_residual },
+            .{ .regime = .m1_4, .dtype = .q2_affine, .hint = .temporal, .m_rows = 4, .param_kind = .lut4_codebook, .epi = .swiglu_gate_up },
+            .{ .regime = .m1_4, .dtype = .f16, .hint = .temporal, .m_rows = 1, .param_kind = .affine_scale_bias, .epi = .none },
+            .{ .regime = .m5_16, .dtype = .q2_affine, .hint = .temporal, .m_rows = 8, .param_kind = .affine_scale_bias, .epi = .add_residual },
+            .{ .regime = .m5_16, .dtype = .q2_affine, .hint = .non_temporal, .m_rows = 16, .param_kind = .lut4_codebook, .epi = .none },
+            .{ .regime = .m5_16, .dtype = .f16, .hint = .temporal, .m_rows = 12, .param_kind = .affine_scale_bias, .epi = .none },
+            .{ .regime = .m32, .dtype = .q2_affine, .hint = .temporal, .m_rows = 32, .param_kind = .affine_scale_bias, .epi = .none },
+            .{ .regime = .m32, .dtype = .q2_affine, .hint = .non_temporal, .m_rows = 32, .param_kind = .lut4_codebook, .epi = .swiglu_gate_up },
+            .{ .regime = .m32, .dtype = .f16, .hint = .non_temporal, .m_rows = 32, .param_kind = .affine_scale_bias, .epi = .add_residual },
+        };
+        var k_args: [specs.len]KernelArgs = undefined;
+        var b_tasks: [specs.len]BatchKernelTask = undefined;
+        for (specs, 0..) |sp, i| {
+            const w_ptr: [*]const u8 = if (sp.dtype == .q2_affine) w_q2.ptr else w_f16.ptr;
+            const a_ptr: [*]const u8 = if (sp.regime == .m1_4) std.mem.sliceAsBytes(a_raw).ptr else std.mem.sliceAsBytes(a_packed).ptr;
+            const a_stride: usize = if (sp.regime == .m1_4) k * 2 else 16 * k * 2;
+            k_args[i] = .{
+                .a_ptr = a_ptr,
+                .w_ptr = w_ptr,
+                .out_ptr = std.mem.sliceAsBytes(out_buf).ptr,
+                .aux_ptr = aux_buf.ptr,
+                .x_group_sums_ptr = x_sums.ptr,
+                .zt0_table_ptr = std.mem.sliceAsBytes(&ZT0_LUT4_IDENTITY_TABLE).ptr,
+                .a_row_stride_bytes = a_stride,
+                .panel_stride_bytes = try panelStrideBytes(sp.dtype, k),
+                .out_row_stride_bytes = n * 4,
+                .aux_row_stride_elems = n,
+                .m_rows = sp.m_rows,
+                .n_valid_cols = n,
+                .panel_count = @intCast(panelCount(n)),
+                .groups = @intCast(k / GROUP_SIZE),
+                .epilogue_op = @backingInt(sp.epi),
+                .out_dtype = @backingInt(OutputDType.f32),
+                .param_kind = @backingInt(sp.param_kind),
+            };
+            b_tasks[i] = .{
+                .args = &k_args[i],
+                .kernel_id = kernelId(sp.regime, sp.dtype, sp.hint),
+            };
+        }
+        try invokeBatchWithRegisterCanary(&b_tasks);
+        // Empty batch must also preserve all 18 callee-saved registers cleanly.
+        try invokeBatchWithRegisterCanary(b_tasks[0..0]);
+    }
+
+    // 2. End-to-end hoisted `SmeStepLoraAdapter.evalMultiAdapterHoisted` across
+    //    4 W19 adapters: f16 dense + q2_affine + LUT4 + alpha=0 identity skip!
+    const k: usize = 128;
+    const n: usize = 48;
+    const rank: usize = 16;
+    const groups_k = k / GROUP_SIZE;
+
+    // Adapter 0: f16 dense
+    const a0_f32 = try gpa.alloc(f32, rank * k);
+    defer gpa.free(a0_f32);
+    const b0_f32 = try gpa.alloc(f32, n * rank);
+    defer gpa.free(b0_f32);
+    for (a0_f32, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5 + 3) % 11)) - 5)) * 0.0625;
+    for (b0_f32, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + 1) % 9)) - 4)) * 0.0625;
+    const a0_blob = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.f16, rank, k));
+    defer gpa.free(a0_blob);
+    const b0_blob = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.f16, n, GROUP_SIZE));
+    defer gpa.free(b0_blob);
+    try packDenseFromF32Panel64(.f16, a0_f32, rank, k, a0_blob);
+    try packStepLoraBDenseFromF32Panel64(.f16, b0_f32, n, rank, b0_blob);
+
+    // Adapter 1: 2-bit q2_affine (`luti2` affine)
+    const a1_codes = try gpa.alloc(u8, rank * k);
+    defer gpa.free(a1_codes);
+    const a1_sbs = try gpa.alloc(quant.ScaleBias, rank * groups_k);
+    defer gpa.free(a1_sbs);
+    const a1_f32 = try gpa.alloc(f32, rank * k);
+    defer gpa.free(a1_f32);
+    for (0..rank * groups_k) |gi| a1_sbs[gi] = .{ .scale = @floatCast(0.0625 * @as(f32, @floatFromInt((gi % 3) + 1))), .bias = @floatCast(-0.125) };
+    for (0..rank) |r| {
+        for (0..k) |ki| {
+            const q: u8 = @intCast((r * 5 + ki * 3 + 1) & 0x03);
+            a1_codes[r * k + ki] = q;
+            const sb = a1_sbs[r * groups_k + (ki / GROUP_SIZE)];
+            a1_f32[r * k + ki] = @as(f32, @floatFromInt(q)) * @as(f32, @floatCast(sb.scale)) + @as(f32, @floatCast(sb.bias));
+        }
+    }
+    const b1_codes = try gpa.alloc(u8, n * rank);
+    defer gpa.free(b1_codes);
+    const b1_sbs = try gpa.alloc(quant.ScaleBias, n);
+    defer gpa.free(b1_sbs);
+    const b1_f32 = try gpa.alloc(f32, n * rank);
+    defer gpa.free(b1_f32);
+    for (0..n) |ni| {
+        b1_sbs[ni] = .{ .scale = @floatCast(0.125), .bias = @floatCast(-0.1875 + 0.0625 * @as(f32, @floatFromInt(ni % 4))) };
+        for (0..rank) |r| {
+            const q: u8 = @intCast((ni * 3 + r * 7 + 2) & 0x03);
+            b1_codes[ni * rank + r] = q;
+            b1_f32[ni * rank + r] = @as(f32, @floatFromInt(q)) * @as(f32, @floatCast(b1_sbs[ni].scale)) + @as(f32, @floatCast(b1_sbs[ni].bias));
+        }
+    }
+    const a1_blob = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.q2_affine, rank, k));
+    defer gpa.free(a1_blob);
+    const b1_blob = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.q2_affine, n, GROUP_SIZE));
+    defer gpa.free(b1_blob);
+    try packQuantAffinePanel64(.q2_affine, a1_codes, a1_sbs, rank, k, a1_blob);
+    try packStepLoraBQ2AffinePanel64(b1_codes, b1_sbs, n, rank, b1_blob);
+
+    // Adapter 2: 2-bit LUT4 (`luti2` 4-entry `ZT0` codebook)
+    const a2_cbs = try gpa.alloc([4]f16, panelCount(rank) * groups_k);
+    defer gpa.free(a2_cbs);
+    for (a2_cbs, 0..) |*cb, i| {
+        const s = @as(f32, @floatFromInt(i % 2)) * 0.0625;
+        cb.* = .{ @floatCast(-0.375 + s), @floatCast(-0.125 + s), @floatCast(0.125 + s), @floatCast(0.375 + s) };
+    }
+    const a2_f32 = try gpa.alloc(f32, rank * k);
+    defer gpa.free(a2_f32);
+    for (0..rank) |r| {
+        for (0..k) |ki| {
+            const q = a1_codes[r * k + ki];
+            a2_f32[r * k + ki] = @floatCast(a2_cbs[(r / PANEL_COLS) * groups_k + (ki / GROUP_SIZE)][q]);
+        }
+    }
+    const b2_cbs = try gpa.alloc([4]f16, panelCount(n));
+    defer gpa.free(b2_cbs);
+    for (b2_cbs, 0..) |*cb, p| {
+        const s = @as(f32, @floatFromInt(p % 3)) * 0.03125;
+        cb.* = .{ @floatCast(-0.5 + s), @floatCast(-0.125 + s), @floatCast(0.125 + s), @floatCast(0.5 + s) };
+    }
+    const b2_f32 = try gpa.alloc(f32, n * rank);
+    defer gpa.free(b2_f32);
+    for (0..n) |ni| {
+        for (0..rank) |r| {
+            b2_f32[ni * rank + r] = @floatCast(b2_cbs[ni / PANEL_COLS][b1_codes[ni * rank + r]]);
+        }
+    }
+    const a2_blob = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.q2_affine, rank, k));
+    defer gpa.free(a2_blob);
+    const b2_blob = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.q2_affine, n, GROUP_SIZE));
+    defer gpa.free(b2_blob);
+    try packQuantLut4Panel64(a1_codes, a2_cbs, null, rank, k, a2_blob);
+    try packStepLoraBQ2Lut4Panel64(b1_codes, b2_cbs, null, n, rank, b2_blob);
+
+    const adp0 = try SmeStepLoraAdapter.fromWeights(
+        .{ .dtype = .f16, .param_kind = .affine_scale_bias, .cache_hint = .temporal, .n = rank, .k = k, .w_packed = a0_blob },
+        .{ .dtype = .f16, .param_kind = .affine_scale_bias, .cache_hint = .temporal, .n = n, .k = GROUP_SIZE, .w_packed = b0_blob },
+        0.5,
+    );
+    const adp1 = try SmeStepLoraAdapter.fromWeights(
+        .{ .dtype = .q2_affine, .param_kind = .affine_scale_bias, .cache_hint = .temporal, .n = rank, .k = k, .w_packed = a1_blob },
+        .{ .dtype = .q2_affine, .param_kind = .affine_scale_bias, .cache_hint = .temporal, .n = n, .k = GROUP_SIZE, .w_packed = b1_blob },
+        0.25,
+    );
+    const adp2 = try SmeStepLoraAdapter.fromWeights(
+        .{ .dtype = .q2_affine, .param_kind = .lut4_codebook, .cache_hint = .temporal, .n = rank, .k = k, .w_packed = a2_blob },
+        .{ .dtype = .q2_affine, .param_kind = .lut4_codebook, .cache_hint = .temporal, .n = n, .k = GROUP_SIZE, .w_packed = b2_blob },
+        0.75,
+    );
+    const adp_zero = adp0.withAlpha(0.0);
+    const adapters = [_]SmeStepLoraAdapter{ adp0, adp1, adp_zero, adp2 };
+
+    // All compact adapters must easily satisfy the <= 4 MiB hot-adapter L2 cap.
+    for (adapters) |adp| try std.testing.expect(adp.fitsHotAdapterL2(caps));
+
+    var scratch = try StepLoraScratch.init(64, 64, 0, smeTestBudget(128 * 1024));
+    defer scratch.deinit();
+
+    const backends: []const ExecutionBackend = if (caps.supportsSme2())
+        &.{ .sme2, .scalar_fallback }
+    else
+        &.{.scalar_fallback};
+
+    const m4_profile = chip_profile.ChipProfile.resolve(
+        .{
+            .memory_bytes = 24 * 1024 * 1024 * 1024,
+            .page_size = page.APPLE_PAGE_SIZE,
+            .performance_cores = 4,
+            .efficiency_cores = 6,
+            .pcore_physical_cpu = 4,
+            .pcore_cpus_per_l2 = 4,
+            .pcore_clusters = 1,
+            .pcore_l2_cache_bytes = 16 * 1024 * 1024,
+            .user_wire_limit = 0,
+            .global_user_wire_limit = 0,
+            .gpu_wired_limit_mib = 0,
+            .has_sme = true,
+            .has_sme2 = true,
+            .has_sme_b16f32 = true,
+            .has_sme_f16f32 = true,
+            .has_sme_i16i64 = true,
+            .sme_max_svl_bytes = 64,
+        },
+        "Apple M4",
+        9,
+        null,
+    );
+
+    for ([_]usize{ 1, 7, 33 }) |m| {
+        const x_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), m * k);
+        defer gpa.free(x_u16);
+        const x_f32 = try gpa.alloc(f32, m * k);
+        defer gpa.free(x_f32);
+        for (0..m * k) |i| {
+            const v: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 3) % 13)) - 6)) * 0.0625;
+            x_u16[i] = quant.f32ToFloatBits(.f16, v);
+            x_f32[i] = quant.floatBitsToF32(.f16, x_u16[i]);
+        }
+
+        const y_base = try gpa.alloc(f32, m * n);
+        defer gpa.free(y_base);
+        for (y_base, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
+
+        // Pure FP32 reference: y_ref = y_base + sum_{r in {0,1,2}} alpha_r * ((x @ A_r^T) @ B_r^T)
+        const y_ref = try gpa.dupe(f32, y_base);
+        defer gpa.free(y_ref);
+        const z_tmp = try gpa.alloc(f32, m * rank);
+        defer gpa.free(z_tmp);
+        const ref_specs = [_]struct { a: []const f32, b: []const f32, alpha: f32 }{
+            .{ .a = a0_f32, .b = b0_f32, .alpha = 0.5 },
+            .{ .a = a1_f32, .b = b1_f32, .alpha = 0.25 },
+            .{ .a = a2_f32, .b = b2_f32, .alpha = 0.75 },
+        };
+        for (ref_specs) |rs| {
+            matmulRowMajorRefF32(x_f32, rs.a, null, .none, z_tmp, m, rank, k);
+            for (z_tmp) |*zv| zv.* *= rs.alpha;
+            matmulRowMajorRefF32(z_tmp, rs.b, y_ref, .add_residual, y_ref, m, n, rank);
+        }
+
+        const y_got = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), m * n);
+        defer gpa.free(y_got);
+
+        for (backends) |be| {
+            @memcpy(y_got, y_base);
+            try SmeStepLoraAdapter.evalMultiAdapterHoisted(
+                &adapters,
+                &disp,
+                &scratch,
+                x_u16,
+                y_got,
+                m,
+                m4_profile,
+                true, // GPU bus saturated: allowed because combined adapters <= 4 MiB hot L2 cap!
+                null,
+                0,
+                be,
+            );
+            for (0..m * n) |idx| {
+                const tol: f32 = @max(3.0e-2, @abs(y_ref[idx]) * 4.0e-2);
+                try std.testing.expectApproxEqAbs(y_ref[idx], y_got[idx], tol);
+            }
+        }
+    }
+}
+
+test "C24: 4 MiB hot-adapter L2 residency cap, C13/C16 unified-bus contention gate, and M1-M3 fallback without SIGILL" {
+    const gpa = std.testing.allocator;
+
+    const m4_facts: sysinfo.Facts = .{
+        .memory_bytes = 24 * 1024 * 1024 * 1024,
+        .page_size = page.APPLE_PAGE_SIZE,
+        .performance_cores = 4,
+        .efficiency_cores = 6,
+        .pcore_physical_cpu = 4,
+        .pcore_cpus_per_l2 = 4,
+        .pcore_clusters = 1,
+        .pcore_l2_cache_bytes = 16 * 1024 * 1024,
+        .user_wire_limit = 0,
+        .global_user_wire_limit = 0,
+        .gpu_wired_limit_mib = 0,
+        .has_sme = true,
+        .has_sme2 = true,
+        .has_sme_b16f32 = true,
+        .has_sme_f16f32 = true,
+        .has_sme_i16i64 = true,
+        .sme_max_svl_bytes = 64,
+    };
+    const m4_caps = SmeCaps.fromFacts(m4_facts);
+    const m4_chip = chip_profile.ChipProfile.resolve(m4_facts, "Apple M4", 9, null);
+
+    // M4 16 MiB P-core L2 -> 25% = 4 MiB hot adapter cap.
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), m4_caps.hotAdapterL2BudgetBytes());
+
+    // M1/M2 12 MiB P-core L2 -> 25% = 3 MiB cap, and has_sme2 = false -> scalar_fallback.
+    var m1_facts = m4_facts;
+    m1_facts.pcore_l2_cache_bytes = 12 * 1024 * 1024;
+    m1_facts.has_sme = false;
+    m1_facts.has_sme2 = false;
+    const m1_caps = SmeCaps.fromFacts(m1_facts);
+    const m1_chip = chip_profile.ChipProfile.resolve(m1_facts, "Apple M1", 7, null);
+    try std.testing.expectEqual(@as(usize, 3 * 1024 * 1024), m1_caps.hotAdapterL2BudgetBytes());
+    try std.testing.expectEqual(PlacementDecision.scalar_fallback, evaluateC13BusGate(m1_caps, m1_chip, 1024, false, 1.5, 0));
+
+    // Hypothetical 32 MiB P-core L2 chip is still hard-capped at <= 4 MiB (MAX_HOT_LORA_L2_BYTES).
+    var big_l2_facts = m4_facts;
+    big_l2_facts.pcore_l2_cache_bytes = 32 * 1024 * 1024;
+    try std.testing.expectEqual(MAX_HOT_LORA_L2_BYTES, SmeCaps.fromFacts(big_l2_facts).hotAdapterL2BudgetBytes());
+
+    // C13 / C16 bus-contention gate matrix on M4:
+    // 1. Working set <= 4 MiB -> L2-resident temporal overlap even when GPU bus is saturated.
+    try std.testing.expectEqual(
+        PlacementDecision.sme2_l2_temporal,
+        evaluateC13BusGate(m4_caps, m4_chip, 4 * 1024 * 1024, true, null, 0),
+    );
+    // 2. Working set > 4 MiB + GPU bus saturated + no speedup / speedup <= 1.05x -> deferred!
+    try std.testing.expectEqual(
+        PlacementDecision.defer_gpu_bus_saturated,
+        evaluateC13BusGate(m4_caps, m4_chip, 4 * 1024 * 1024 + 1, true, null, 0),
+    );
+    try std.testing.expectEqual(
+        PlacementDecision.defer_gpu_bus_saturated,
+        evaluateC13BusGate(m4_caps, m4_chip, 6 * 1024 * 1024, true, 1.05, 0),
+    );
+    // 3. Working set > 4 MiB + GPU bus saturated + speedup > 1.05x + swapouts > 0 -> deferred!
+    try std.testing.expectEqual(
+        PlacementDecision.defer_gpu_bus_saturated,
+        evaluateC13BusGate(m4_caps, m4_chip, 6 * 1024 * 1024, true, 1.20, 1),
+    );
+    // 4. Working set > 4 MiB + GPU bus saturated + speedup > 1.05x + swapouts == 0 -> streaming non-temporal!
+    try std.testing.expectEqual(
+        PlacementDecision.sme2_streaming_nt,
+        evaluateC13BusGate(m4_caps, m4_chip, 6 * 1024 * 1024, true, 1.12, 0),
+    );
+    // 5. GPU bus idle: <= 16 MiB uses temporal, > 16 MiB uses non-temporal streaming.
+    try std.testing.expectEqual(
+        PlacementDecision.sme2_l2_temporal,
+        evaluateC13BusGate(m4_caps, m4_chip, 8 * 1024 * 1024, false, null, 0),
+    );
+    try std.testing.expectEqual(
+        PlacementDecision.sme2_streaming_nt,
+        evaluateC13BusGate(m4_caps, m4_chip, 20 * 1024 * 1024, false, null, 0),
+    );
+
+    // 6. Simulated M1-M3 dispatcher executes hoisted batch cleanly via scalar_fallback without SIGILL,
+    //    and explicitly rejects forced `.sme2` with `error.Sme2Unsupported`.
+    var m1_disp = try SmeDispatcher.init(gpa, .{
+        .caps_override = m1_caps,
+        .total_threads = 1,
+    });
+    defer m1_disp.deinit();
+    const k: usize = 64;
+    const n: usize = 16;
+    const a_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), k);
+    defer gpa.free(a_u16);
+    @memset(a_u16, @bitCast(@as(f16, 1.0)));
+    const w_q2 = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.q2_affine, n, k));
+    defer gpa.free(w_q2);
+    const codes: [n * k]u8 = @splat(2);
+    const cbs: [1][4]f16 = .{.{ 0.0, 0.25, 0.5, 1.0 }};
+    try packQuantLut4Panel64(&codes, &cbs, null, n, k, w_q2);
+    var out_f32: [n]f32 = @splat(0.0);
+    const op = [_]BatchLinearOp{.{
+        .weight = .{
+            .dtype = .q2_affine,
+            .param_kind = .lut4_codebook,
+            .cache_hint = .temporal,
+            .n = n,
+            .k = k,
+            .w_packed = w_q2,
+        },
+        .a_u16 = a_u16,
+        .out_bytes = std.mem.sliceAsBytes(&out_f32),
+        .m = 1,
+    }};
+    try m1_disp.evalLinearBatchHoisted(&op, null);
+    for (out_f32) |v| try std.testing.expectApproxEqAbs(@as(f32, 32.0), v, 1e-4);
+    try std.testing.expectError(error.Sme2Unsupported, m1_disp.evalLinearBatchHoisted(&op, .sme2));
+
+    // 7. `SmeStepLoraAdapter.evalMultiAdapterHoisted` enforces `<= 4 MiB` / `25%` P-core L2 cap
+    //    and returns `error.BusContentionDeferred` when working set exceeds cap on a saturated GPU bus.
+    var tight_l2_facts = m4_facts;
+    tight_l2_facts.pcore_l2_cache_bytes = 2 * 1024; // 25% cap = 512 B (< w_q2 + b_q2 = 768 B)
+    const tight_caps = SmeCaps.fromFacts(tight_l2_facts);
+    var tight_disp = try SmeDispatcher.init(gpa, .{
+        .caps_override = tight_caps,
+        .total_threads = 1,
+    });
+    defer tight_disp.deinit();
+    const tight_adp = try SmeStepLoraAdapter.fromWeights(
+        .{ .dtype = .q2_affine, .param_kind = .lut4_codebook, .cache_hint = .temporal, .n = n, .k = k, .w_packed = w_q2 },
+        .{ .dtype = .q2_affine, .param_kind = .lut4_codebook, .cache_hint = .temporal, .n = n, .k = k, .w_packed = w_q2 },
+        1.0,
+    );
+    try std.testing.expect(!tight_adp.fitsHotAdapterL2(tight_caps));
+    var tight_scratch = try StepLoraScratch.init(4, 64, 0, smeTestBudget(64 * 1024));
+    defer tight_scratch.deinit();
+    const adps = [_]SmeStepLoraAdapter{tight_adp};
+    var y_tight: [n]f32 = @splat(0.0);
+    try std.testing.expectError(
+        error.BusContentionDeferred,
+        SmeStepLoraAdapter.evalMultiAdapterHoisted(&adps, &tight_disp, &tight_scratch, a_u16, &y_tight, 1, m4_chip, true, 1.02, 0, null),
+    );
 }

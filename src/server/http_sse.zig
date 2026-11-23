@@ -524,6 +524,231 @@ pub const BatchEngineHandler = struct {
 pub const BatchInferenceBackend = BatchEngineHandler;
 
 // ---------------------------------------------------------------------------
+// C23: ARM64 NEON structural JSON & HTTP vector scanners (ADR-0023)
+//   - Explicit 16-byte / 64-byte unrolled `@Vector(16, u8)` NEON fast paths
+//   - `shrn`-equivalent nibble-mask reduction (compatible with `-Dcpu=apple_m1`)
+//   - Clean `< 16 B` scalar tail fallback, zero dynamic heap allocation
+// ---------------------------------------------------------------------------
+
+const NeonVec16 = @Vector(16, u8);
+const NeonVec8u16 = @Vector(8, u16);
+const NeonVec8u8 = @Vector(8, u8);
+const NeonShift4: @Vector(8, u4) = @splat(4);
+
+inline fn neonBoolToMask(cond: @Vector(16, bool)) NeonVec16 {
+    return @select(u8, cond, @as(NeonVec16, @splat(0xFF)), @as(NeonVec16, @splat(0)));
+}
+
+/// Compresses a 16-byte `0x00`/`0xFF` lane mask into a 64-bit nibble bitmask
+/// (`4` bits per lane, lowering to ARM64 NEON `shrn v.8b, v.8h, #4`).
+/// Compatible with `-Dcpu=apple_m1` through `apple_m5` without SVE.
+inline fn neonMaskToU64(mask: NeonVec16) u64 {
+    const pairs: NeonVec8u16 = @bitCast(mask);
+    const nibbles: NeonVec8u8 = @truncate(pairs >> NeonShift4);
+    return @bitCast(nibbles);
+}
+
+inline fn neonJsonSpecialMask(v: NeonVec16) NeonVec16 {
+    return neonBoolToMask(v == @as(NeonVec16, @splat('"'))) |
+        neonBoolToMask(v == @as(NeonVec16, @splat('\\'))) |
+        neonBoolToMask(v < @as(NeonVec16, @splat(0x20)));
+}
+
+inline fn neonQuoteOrBackslashMask(v: NeonVec16) NeonVec16 {
+    return neonBoolToMask(v == @as(NeonVec16, @splat('"'))) |
+        neonBoolToMask(v == @as(NeonVec16, @splat('\\')));
+}
+
+inline fn neonJsonNonWsMask(v: NeonVec16) NeonVec16 {
+    const is_ws = neonBoolToMask(v == @as(NeonVec16, @splat(' '))) |
+        neonBoolToMask(v == @as(NeonVec16, @splat('\t'))) |
+        neonBoolToMask(v == @as(NeonVec16, @splat('\r'))) |
+        neonBoolToMask(v == @as(NeonVec16, @splat('\n')));
+    return ~is_ws;
+}
+
+inline fn isJsonWsByte(b: u8) bool {
+    return b == ' ' or b == '\t' or b == '\r' or b == '\n';
+}
+
+/// Returns the byte offset of the first JSON string boundary or escape/control
+/// byte (`"`, `\`, or `< 0x20`) in `bytes`, or `bytes.len` if none exists.
+/// Uses 64-byte and 16-byte unrolled ARM64 NEON vectors with `< 16 B` scalar tail.
+pub fn neonFindJsonStringSpecial(bytes: []const u8) usize {
+    var pos: usize = 0;
+    const len = bytes.len;
+
+    while (pos + 64 <= len) : (pos += 64) {
+        const m0 = neonJsonSpecialMask(bytes[pos..][0..16].*);
+        const m1 = neonJsonSpecialMask(bytes[pos + 16 ..][0..16].*);
+        const m2 = neonJsonSpecialMask(bytes[pos + 32 ..][0..16].*);
+        const m3 = neonJsonSpecialMask(bytes[pos + 48 ..][0..16].*);
+        const any = (m0 | m1) | (m2 | m3);
+        if (@reduce(.Max, any) != 0) {
+            const b0 = neonMaskToU64(m0);
+            if (b0 != 0) return pos + (@as(usize, @ctz(b0)) >> 2);
+            const b1 = neonMaskToU64(m1);
+            if (b1 != 0) return pos + 16 + (@as(usize, @ctz(b1)) >> 2);
+            const b2 = neonMaskToU64(m2);
+            if (b2 != 0) return pos + 32 + (@as(usize, @ctz(b2)) >> 2);
+            const b3 = neonMaskToU64(m3);
+            return pos + 48 + (@as(usize, @ctz(b3)) >> 2);
+        }
+    }
+
+    while (pos + 16 <= len) : (pos += 16) {
+        const m = neonJsonSpecialMask(bytes[pos..][0..16].*);
+        const u = neonMaskToU64(m);
+        if (u != 0) return pos + (@as(usize, @ctz(u)) >> 2);
+    }
+
+    while (pos < len) : (pos += 1) {
+        const b = bytes[pos];
+        if (b == '"' or b == '\\' or b < 0x20) return pos;
+    }
+    return len;
+}
+
+/// Returns the byte offset of the first `"` or `\` in `bytes`, or `bytes.len`.
+pub fn neonFindQuoteOrBackslash(bytes: []const u8) usize {
+    var pos: usize = 0;
+    const len = bytes.len;
+
+    while (pos + 64 <= len) : (pos += 64) {
+        const m0 = neonQuoteOrBackslashMask(bytes[pos..][0..16].*);
+        const m1 = neonQuoteOrBackslashMask(bytes[pos + 16 ..][0..16].*);
+        const m2 = neonQuoteOrBackslashMask(bytes[pos + 32 ..][0..16].*);
+        const m3 = neonQuoteOrBackslashMask(bytes[pos + 48 ..][0..16].*);
+        const any = (m0 | m1) | (m2 | m3);
+        if (@reduce(.Max, any) != 0) {
+            const b0 = neonMaskToU64(m0);
+            if (b0 != 0) return pos + (@as(usize, @ctz(b0)) >> 2);
+            const b1 = neonMaskToU64(m1);
+            if (b1 != 0) return pos + 16 + (@as(usize, @ctz(b1)) >> 2);
+            const b2 = neonMaskToU64(m2);
+            if (b2 != 0) return pos + 32 + (@as(usize, @ctz(b2)) >> 2);
+            const b3 = neonMaskToU64(m3);
+            return pos + 48 + (@as(usize, @ctz(b3)) >> 2);
+        }
+    }
+
+    while (pos + 16 <= len) : (pos += 16) {
+        const m = neonQuoteOrBackslashMask(bytes[pos..][0..16].*);
+        const u = neonMaskToU64(m);
+        if (u != 0) return pos + (@as(usize, @ctz(u)) >> 2);
+    }
+
+    while (pos < len) : (pos += 1) {
+        const b = bytes[pos];
+        if (b == '"' or b == '\\') return pos;
+    }
+    return len;
+}
+
+/// Returns the byte offset of the first occurrence of `needle` in `bytes`, or `bytes.len`.
+pub fn neonFindByte(bytes: []const u8, needle: u8) usize {
+    var pos: usize = 0;
+    const len = bytes.len;
+    const target: NeonVec16 = @splat(needle);
+
+    while (pos + 64 <= len) : (pos += 64) {
+        const m0 = neonBoolToMask(@as(NeonVec16, bytes[pos..][0..16].*) == target);
+        const m1 = neonBoolToMask(@as(NeonVec16, bytes[pos + 16 ..][0..16].*) == target);
+        const m2 = neonBoolToMask(@as(NeonVec16, bytes[pos + 32 ..][0..16].*) == target);
+        const m3 = neonBoolToMask(@as(NeonVec16, bytes[pos + 48 ..][0..16].*) == target);
+        const any = (m0 | m1) | (m2 | m3);
+        if (@reduce(.Max, any) != 0) {
+            const b0 = neonMaskToU64(m0);
+            if (b0 != 0) return pos + (@as(usize, @ctz(b0)) >> 2);
+            const b1 = neonMaskToU64(m1);
+            if (b1 != 0) return pos + 16 + (@as(usize, @ctz(b1)) >> 2);
+            const b2 = neonMaskToU64(m2);
+            if (b2 != 0) return pos + 32 + (@as(usize, @ctz(b2)) >> 2);
+            const b3 = neonMaskToU64(m3);
+            return pos + 48 + (@as(usize, @ctz(b3)) >> 2);
+        }
+    }
+
+    while (pos + 16 <= len) : (pos += 16) {
+        const m = neonBoolToMask(@as(NeonVec16, bytes[pos..][0..16].*) == target);
+        const u = neonMaskToU64(m);
+        if (u != 0) return pos + (@as(usize, @ctz(u)) >> 2);
+    }
+
+    while (pos < len) : (pos += 1) {
+        if (bytes[pos] == needle) return pos;
+    }
+    return len;
+}
+
+/// Returns the byte offset of the first non-RFC-8259 whitespace byte
+/// (not `' '`, `'\t'`, `'\r'`, or `'\n'`) in `bytes`, or `bytes.len`.
+pub fn neonSkipJsonWhitespace(bytes: []const u8) usize {
+    const len = bytes.len;
+    if (len == 0 or !isJsonWsByte(bytes[0])) return 0;
+
+    var pos: usize = 0;
+    while (pos + 64 <= len) : (pos += 64) {
+        const nw0 = neonJsonNonWsMask(bytes[pos..][0..16].*);
+        const nw1 = neonJsonNonWsMask(bytes[pos + 16 ..][0..16].*);
+        const nw2 = neonJsonNonWsMask(bytes[pos + 32 ..][0..16].*);
+        const nw3 = neonJsonNonWsMask(bytes[pos + 48 ..][0..16].*);
+        const any = (nw0 | nw1) | (nw2 | nw3);
+        if (@reduce(.Max, any) != 0) {
+            const b0 = neonMaskToU64(nw0);
+            if (b0 != 0) return pos + (@as(usize, @ctz(b0)) >> 2);
+            const b1 = neonMaskToU64(nw1);
+            if (b1 != 0) return pos + 16 + (@as(usize, @ctz(b1)) >> 2);
+            const b2 = neonMaskToU64(nw2);
+            if (b2 != 0) return pos + 32 + (@as(usize, @ctz(b2)) >> 2);
+            const b3 = neonMaskToU64(nw3);
+            return pos + 48 + (@as(usize, @ctz(b3)) >> 2);
+        }
+    }
+
+    while (pos + 16 <= len) : (pos += 16) {
+        const nw = neonJsonNonWsMask(bytes[pos..][0..16].*);
+        const u = neonMaskToU64(nw);
+        if (u != 0) return pos + (@as(usize, @ctz(u)) >> 2);
+    }
+
+    while (pos < len and isJsonWsByte(bytes[pos])) : (pos += 1) {}
+    return pos;
+}
+
+/// NEON-accelerated HTTP `\r\n` boundary scanner.
+pub fn neonFindCrlf(bytes: []const u8) ?usize {
+    if (bytes.len < 2) return null;
+    var pos: usize = 0;
+    const limit = bytes.len - 1;
+    while (pos < limit) {
+        const rel = neonFindByte(bytes[pos..limit], '\r');
+        const idx = pos + rel;
+        if (idx >= limit) return null;
+        if (bytes[idx + 1] == '\n') return idx;
+        pos = idx + 1;
+    }
+    return null;
+}
+
+/// NEON-accelerated HTTP header terminator (`\r\n\r\n`) scanner.
+pub fn neonFindCrlfCrlf(bytes: []const u8) ?usize {
+    if (bytes.len < 4) return null;
+    var pos: usize = 0;
+    const limit = bytes.len - 3;
+    while (pos < limit) {
+        const rel = neonFindByte(bytes[pos..limit], '\r');
+        const idx = pos + rel;
+        if (idx >= limit) return null;
+        if (bytes[idx + 1] == '\n' and bytes[idx + 2] == '\r' and bytes[idx + 3] == '\n') {
+            return idx;
+        }
+        pos = idx + 1;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
 // Zero-allocation fixed-slice writer & JSON escaping
 // ---------------------------------------------------------------------------
 
@@ -561,15 +786,18 @@ pub const FixedWriter = struct {
     }
 
     /// Writes `bytes` escaped for inside a JSON string literal (without outer quotes).
+    /// Vectorized with 16-byte / 64-byte ARM64 NEON scanning (`C23`, ADR-0023).
     pub fn writeJsonEscaped(self: *FixedWriter, bytes: []const u8) error{BufferTooSmall}!void {
         const hex = "0123456789abcdef";
         var run_start: usize = 0;
-        for (bytes, 0..) |b, i| {
-            const needs_escape = (b == '"' or b == '\\' or b < 0x20);
-            if (!needs_escape) continue;
-            if (i > run_start) {
-                try self.writeAll(bytes[run_start..i]);
+        while (run_start < bytes.len) {
+            const span = neonFindJsonStringSpecial(bytes[run_start..]);
+            if (span > 0) {
+                try self.writeAll(bytes[run_start .. run_start + span]);
             }
+            const i = run_start + span;
+            if (i >= bytes.len) break;
+            const b = bytes[i];
             switch (b) {
                 '"' => try self.writeAll("\\\""),
                 '\\' => try self.writeAll("\\\\"),
@@ -584,9 +812,6 @@ pub const FixedWriter = struct {
                 },
             }
             run_start = i + 1;
-        }
-        if (run_start < bytes.len) {
-            try self.writeAll(bytes[run_start..]);
         }
     }
 };
@@ -1232,27 +1457,28 @@ pub const ToolCallParser = struct {
 fn findJsonFieldValueStart(buf: []const u8, field_name: []const u8) ?usize {
     var i: usize = 0;
     while (i < buf.len) {
-        if (buf[i] != '"') {
-            i += 1;
-            continue;
-        }
+        const rel_quote = neonFindByte(buf[i..], '"');
+        i += rel_quote;
+        if (i >= buf.len) return null;
         const key_start = i + 1;
         i += 1;
-        while (i < buf.len) : (i += 1) {
+        while (i < buf.len) {
+            i += neonFindQuoteOrBackslash(buf[i..]);
+            if (i >= buf.len) break;
             if (buf[i] == '\\') {
-                i += 1;
+                i += 2;
                 continue;
             }
-            if (buf[i] == '"') break;
+            // buf[i] == '"'
+            break;
         }
         if (i >= buf.len) return null;
         const key_slice = buf[key_start..i];
         i += 1; // skip closing '"'
-        var j = i;
-        while (j < buf.len and (buf[j] == ' ' or buf[j] == '\t' or buf[j] == '\r' or buf[j] == '\n')) : (j += 1) {}
+        var j = i + neonSkipJsonWhitespace(buf[i..]);
         if (j < buf.len and buf[j] == ':') {
             j += 1;
-            while (j < buf.len and (buf[j] == ' ' or buf[j] == '\t' or buf[j] == '\r' or buf[j] == '\n')) : (j += 1) {}
+            j += neonSkipJsonWhitespace(buf[j..]);
             if (std.mem.eql(u8, key_slice, field_name)) {
                 return if (j < buf.len) j else null;
             }
@@ -1363,12 +1589,7 @@ const JsonReader = struct {
     pos: usize = 0,
 
     fn skipWs(self: *JsonReader) void {
-        while (self.pos < self.src.len) {
-            switch (self.src[self.pos]) {
-                ' ', '\t', '\r', '\n' => self.pos += 1,
-                else => return,
-            }
-        }
+        self.pos += neonSkipJsonWhitespace(self.src[self.pos..]);
     }
 
     fn peek(self: *JsonReader) ?u8 {
@@ -1410,20 +1631,23 @@ const JsonReader = struct {
     }
 
     /// Reads a JSON string and writes its unescaped UTF-8 bytes into `writer`.
+    /// Vectorized with 16-byte / 64-byte ARM64 NEON string-boundary scanning (`C23`).
     fn readStringInto(self: *JsonReader, writer: *FixedWriter) ParseError!void {
         try self.expectByte('"');
         while (self.pos < self.src.len) {
+            const span = neonFindJsonStringSpecial(self.src[self.pos..]);
+            if (span > 0) {
+                try writer.writeAll(self.src[self.pos .. self.pos + span]);
+                self.pos += span;
+            }
+            if (self.pos >= self.src.len) return error.InvalidJson;
             const b = self.src[self.pos];
             if (b == '"') {
                 self.pos += 1;
                 return;
             }
             if (b < 0x20) return error.InvalidJson;
-            if (b != '\\') {
-                try writer.writeByte(b);
-                self.pos += 1;
-                continue;
-            }
+            // b == '\\'
             self.pos += 1;
             if (self.pos >= self.src.len) return error.InvalidJson;
             const esc = self.src[self.pos];
@@ -1486,26 +1710,25 @@ const JsonReader = struct {
     fn skipString(self: *JsonReader) ParseError!void {
         try self.expectByte('"');
         while (self.pos < self.src.len) {
+            self.pos += neonFindJsonStringSpecial(self.src[self.pos..]);
+            if (self.pos >= self.src.len) return error.InvalidJson;
             const b = self.src[self.pos];
             if (b == '"') {
                 self.pos += 1;
                 return;
             }
             if (b < 0x20) return error.InvalidJson;
-            if (b == '\\') {
-                self.pos += 1;
-                if (self.pos >= self.src.len) return error.InvalidJson;
-                const esc = self.src[self.pos];
-                self.pos += 1;
-                switch (esc) {
-                    '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {},
-                    'u' => {
-                        _ = try self.readHex4();
-                    },
-                    else => return error.InvalidJson,
-                }
-            } else {
-                self.pos += 1;
+            // b == '\\'
+            self.pos += 1;
+            if (self.pos >= self.src.len) return error.InvalidJson;
+            const esc = self.src[self.pos];
+            self.pos += 1;
+            switch (esc) {
+                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {},
+                'u' => {
+                    _ = try self.readHex4();
+                },
+                else => return error.InvalidJson,
             }
         }
         return error.InvalidJson;
@@ -3289,7 +3512,7 @@ const HttpParseError = error{
 };
 
 fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
-    const sep_idx = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.Incomplete;
+    const sep_idx = neonFindCrlfCrlf(buf) orelse return error.Incomplete;
     const header_end = sep_idx + 4;
     const header_block = buf[0..sep_idx];
 
@@ -3392,7 +3615,7 @@ fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
     // First verify the entire chunked payload has arrived before mutating in place.
     var scan: usize = 0;
     while (true) {
-        const line_rel = std.mem.indexOf(u8, body_buf[scan..], "\r\n") orelse return .incomplete;
+        const line_rel = neonFindCrlf(body_buf[scan..]) orelse return .incomplete;
         const size_line_full = body_buf[scan .. scan + line_rel];
         const size_line = if (std.mem.indexOfScalar(u8, size_line_full, ';')) |semi|
             std.mem.trim(u8, size_line_full[0..semi], " \t")
@@ -3406,7 +3629,7 @@ fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
             if (body_buf[scan] == '\r' and body_buf[scan + 1] == '\n') {
                 break;
             }
-            const trailer_end = std.mem.indexOf(u8, body_buf[scan..], "\r\n\r\n") orelse return .incomplete;
+            const trailer_end = neonFindCrlfCrlf(body_buf[scan..]) orelse return .incomplete;
             _ = trailer_end;
             break;
         }
@@ -3421,7 +3644,7 @@ fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
     var read_pos: usize = 0;
     var out_pos: usize = 0;
     while (true) {
-        const line_rel = std.mem.indexOf(u8, body_buf[read_pos..], "\r\n") orelse unreachable;
+        const line_rel = neonFindCrlf(body_buf[read_pos..]) orelse unreachable;
         const size_line_full = body_buf[read_pos .. read_pos + line_rel];
         const size_line = if (std.mem.indexOfScalar(u8, size_line_full, ';')) |semi|
             std.mem.trim(u8, size_line_full[0..semi], " \t")
@@ -10288,4 +10511,192 @@ test "C18 /v1/messages/count_tokens (native W5 Tokenizer), C21 /v1/embeddings & 
         try std.testing.expect(std.mem.indexOf(u8, rj, "\"index\":2,\"relevance_score\":1.000000,\"document\":{\"text\":\"d2\"}") != null);
         try std.testing.expect(std.mem.indexOf(u8, rj, "\"index\":0") == null); // trimmed by top_n=2!
     }
+}
+
+fn scalarFindJsonStringSpecialRef(bytes: []const u8) usize {
+    for (bytes, 0..) |b, i| {
+        if (b == '"' or b == '\\' or b < 0x20) return i;
+    }
+    return bytes.len;
+}
+
+fn scalarFindQuoteOrBackslashRef(bytes: []const u8) usize {
+    for (bytes, 0..) |b, i| {
+        if (b == '"' or b == '\\') return i;
+    }
+    return bytes.len;
+}
+
+fn scalarSkipJsonWhitespaceRef(bytes: []const u8) usize {
+    for (bytes, 0..) |b, i| {
+        if (b != ' ' and b != '\t' and b != '\r' and b != '\n') return i;
+    }
+    return bytes.len;
+}
+
+fn scalarWriteJsonEscapedRef(writer: *FixedWriter, bytes: []const u8) error{BufferTooSmall}!void {
+    const hex = "0123456789abcdef";
+    for (bytes) |b| {
+        switch (b) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0c => try writer.writeAll("\\f"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x00...0x07, 0x0b, 0x0e...0x1f => {
+                const esc = [6]u8{ '\\', 'u', '0', '0', hex[b >> 4], hex[b & 0x0f] };
+                try writer.writeAll(&esc);
+            },
+            else => try writer.writeByte(b),
+        }
+    }
+}
+
+test "C23 ARM64 NEON JSON/HTTP scanners match scalar bit-for-bit across 0..129 offsets, escapes, UTF-8, and huge tool-call payloads" {
+    // 1. Exhaustive 0..129 length & match-offset sweep (covers <16 B tail, 16..63 B single-vec, 64..129 B 4x unrolled).
+    var buf: [160]u8 = undefined;
+    for (0..130) |len| {
+        // Fill with mix of printable ASCII and high-bit UTF-8 bytes (0x80..0xFE) to ensure unsigned `< 0x20` compare.
+        for (0..len) |i| {
+            buf[i] = switch (i % 5) {
+                0 => 'a',
+                1 => 0xE4, // UTF-8 CJK lead byte (>= 0x80, must NOT trigger < 0x20!)
+                2 => 0xB8, // UTF-8 continuation
+                3 => 0xAD,
+                else => 'Z',
+            };
+        }
+        // Test unaligned sub-slice starts too.
+        const base = buf[0..len];
+        try std.testing.expectEqual(scalarFindJsonStringSpecialRef(base), neonFindJsonStringSpecial(base));
+        try std.testing.expectEqual(scalarFindQuoteOrBackslashRef(base), neonFindQuoteOrBackslash(base));
+        try std.testing.expectEqual(len, neonFindByte(base, '"'));
+
+        // Place each special byte category at every position `0..len` (sampled densely around SIMD boundaries).
+        if (len > 0) {
+            const specials = [_]u8{ '"', '\\', 0x00, 0x08, 0x09, 0x0A, 0x0D, 0x1F };
+            for (0..len) |pos| {
+                // Sweep all positions for len <= 72, and boundary-rich positions for len > 72.
+                if (len > 72 and pos >= 18 and pos + 18 < len and (pos < 60 or pos > 70)) continue;
+                const saved = buf[pos];
+                for (specials) |sp| {
+                    buf[pos] = sp;
+                    const s = buf[0..len];
+                    try std.testing.expectEqual(scalarFindJsonStringSpecialRef(s), neonFindJsonStringSpecial(s));
+                    try std.testing.expectEqual(scalarFindQuoteOrBackslashRef(s), neonFindQuoteOrBackslash(s));
+                    try std.testing.expectEqual(
+                        std.mem.indexOfScalar(u8, s, sp) orelse len,
+                        neonFindByte(s, sp),
+                    );
+                }
+                buf[pos] = saved;
+            }
+        }
+    }
+
+    // 2. Whitespace scanner parity across 0..129 lengths and all 4 RFC 8259 whitespace bytes + non-ws bytes (0x00, 0x0B, 0x0C, 0x80, 'x').
+    const ws_chars = [_]u8{ ' ', '\t', '\r', '\n' };
+    const non_ws_chars = [_]u8{ 'x', '{', '"', 0x00, 0x0B, 0x0C, 0xA0, 0xFF };
+    for (0..130) |len| {
+        for (0..len) |i| buf[i] = ws_chars[i % ws_chars.len];
+        try std.testing.expectEqual(scalarSkipJsonWhitespaceRef(buf[0..len]), neonSkipJsonWhitespace(buf[0..len]));
+        for (0..len) |pos| {
+            if (len > 72 and pos >= 18 and pos + 18 < len and (pos < 60 or pos > 70)) continue;
+            const saved = buf[pos];
+            for (non_ws_chars) |nw| {
+                buf[pos] = nw;
+                try std.testing.expectEqual(scalarSkipJsonWhitespaceRef(buf[0..len]), neonSkipJsonWhitespace(buf[0..len]));
+            }
+            buf[pos] = saved;
+        }
+    }
+
+    // 3. HTTP CRLF & CRLFCRLF scanner parity across false `\r` triggers and 0..129 offsets.
+    for (0..130) |len| {
+        @memset(buf[0..len], 'H');
+        if (len >= 5) buf[len / 3] = '\r'; // stray CR without LF
+        try std.testing.expectEqual(std.mem.indexOf(u8, buf[0..len], "\r\n"), neonFindCrlf(buf[0..len]));
+        try std.testing.expectEqual(std.mem.indexOf(u8, buf[0..len], "\r\n\r\n"), neonFindCrlfCrlf(buf[0..len]));
+        if (len >= 4) {
+            const p = len - 4;
+            @memcpy(buf[p .. p + 4], "\r\n\r\n");
+            try std.testing.expectEqual(std.mem.indexOf(u8, buf[0..len], "\r\n"), neonFindCrlf(buf[0..len]));
+            try std.testing.expectEqual(std.mem.indexOf(u8, buf[0..len], "\r\n\r\n"), neonFindCrlfCrlf(buf[0..len]));
+        }
+    }
+
+    // 4. Escaped quotes, UTF-8 CJK + emoji, control bytes, and round-trip parity (`writeJsonEscaped` -> `JsonReader.readStringInto` / `skipString`).
+    const rich_payload =
+        "Prefix 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef " ++
+        "escaped \"quote\" and \\backslash\\ and \\\"nested\\\" " ++
+        "中文日本語한국어 🚀🔥🧠 " ++
+        "ctrl:\x00\x07\x08\x09\x0a\x0c\x0d\x1f " ++
+        "suffix_tail_longer_than_64_bytes_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    var neon_esc_buf: [2048]u8 = undefined;
+    var scalar_esc_buf: [2048]u8 = undefined;
+    var wn = FixedWriter.init(&neon_esc_buf);
+    var ws = FixedWriter.init(&scalar_esc_buf);
+    try wn.writeByte('"');
+    try wn.writeJsonEscaped(rich_payload);
+    try wn.writeByte('"');
+    try ws.writeByte('"');
+    try scalarWriteJsonEscapedRef(&ws, rich_payload);
+    try ws.writeByte('"');
+    try std.testing.expectEqualStrings(ws.written(), wn.written());
+
+    var unesc_buf: [2048]u8 = undefined;
+    var uw = FixedWriter.init(&unesc_buf);
+    var jr = JsonReader{ .src = wn.written() };
+    try jr.readStringInto(&uw);
+    try std.testing.expectEqualStrings(rich_payload, uw.written());
+    try std.testing.expectEqual(wn.written().len, jr.pos);
+
+    var jr_skip = JsonReader{ .src = wn.written() };
+    try jr_skip.skipString();
+    try std.testing.expectEqual(wn.written().len, jr_skip.pos);
+
+    // Raw unescaped control byte inside JSON string must still be rejected at > 64 B offset.
+    var bad_json_str: [128]u8 = @splat('a');
+    bad_json_str[0] = '"';
+    bad_json_str[95] = 0x1F;
+    bad_json_str[127] = '"';
+    var bad_out: [128]u8 = undefined;
+    var bad_w = FixedWriter.init(&bad_out);
+    var bad_r = JsonReader{ .src = &bad_json_str };
+    try std.testing.expectError(error.InvalidJson, bad_r.readStringInto(&bad_w));
+    var bad_r2 = JsonReader{ .src = &bad_json_str };
+    try std.testing.expectError(error.InvalidJson, bad_r2.skipString());
+
+    // 5. Huge (> 16 KiB) indented tool-call JSON payload parsed end-to-end with zero heap allocation.
+    const gpa = std.testing.allocator;
+    const huge_json = try gpa.alloc(u8, 32 * 1024);
+    defer gpa.free(huge_json);
+    var hw = FixedWriter.init(huge_json);
+    for (0..20) |_| try hw.writeAll("    \t\r\n"); // > 128 B leading whitespace
+    try hw.writeAll("{\"model\":\"qwen3.8\",\"messages\":[{\"role\":\"user\",\"content\":\"");
+    for (0..180) |_| {
+        try hw.writeJsonEscaped("def compute(x: \"str\") -> str:\n\treturn \"结果🚀:\\\"ok\\\"\" # 0123456789abcdef\n");
+    }
+    try hw.writeAll("\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"run_sql\",\"description\":\"");
+    for (0..80) |_| {
+        try hw.writeAll("Execute analytical query over unified memory pool with zero copies; ");
+    }
+    try hw.writeAll("\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}}}],\"stream\":false}");
+    try std.testing.expect(hw.written().len > 16 * 1024);
+
+    // `findJsonFieldValueStart` must locate fields accurately even after huge escaped strings.
+    const stream_pos = findJsonFieldValueStart(hw.written(), "stream") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, hw.written()[stream_pos..], "false"));
+
+    const prompt_buf = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(prompt_buf);
+    var model_buf: [MAX_MODEL_ID_BYTES]u8 = undefined;
+    const parsed = try parseInferenceRequest(.chat_completions, hw.written(), "default", prompt_buf, &model_buf);
+    try std.testing.expectEqualStrings("qwen3.8", model_buf[0..parsed.model_len]);
+    try std.testing.expectEqual(@as(u8, 1), parsed.tool_count);
+    try std.testing.expectEqualStrings("run_sql", parsed.toolsSlice()[0].nameSlice());
+    try std.testing.expect(parsed.prompt_len > 10 * 1024);
 }

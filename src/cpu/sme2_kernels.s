@@ -30,8 +30,13 @@
 //   +92  groups               (u32)
 //   +96  epilogue_op          (u32: 0=none, 1=add_residual, 2=swiglu_gate_up)
 //   +100 out_dtype            (u32: 0=f32, 1=f16, 2=bf16)
-//   +104 param_kind           (u32: 0=affine_scale_bias, 1=lut16_codebook)
+//   +104 param_kind           (u32: 0=affine_scale_bias, 1=lut16_codebook, 2=lut4_codebook)
 //   +108 _pad                 (u32)
+//
+// BatchKernelTask C-ABI layout (16 bytes, for hoisted `_ami_sme2_exec_batch`):
+//   +0   args                 (*const KernelArgs)
+//   +8   kernel_id            (u32: 0..29 matching ALL_KERNEL_ENTRIES)
+//   +12  _pad                 (u32)
 
 .arch armv9.2-a+sme+sme2+sme-i16i64+sme-f64f64
 
@@ -93,6 +98,7 @@ _ami_sme2_exp_consts:
     .cfi_offset d15, -8
     mov     x19, x0
     smstart
+    mov     x17, #0                      // 0 = standalone call; >0 = hoisted batch loop
 .endm
 
 .macro SME2_EPILOGUE
@@ -131,6 +137,28 @@ _ami_sme2_exp_consts:
     .cfi_restore d15
     ret
     .cfi_endproc
+.endm
+
+// Exit path shared by standalone kernels (`x17 == 0` -> `smstop` + restore)
+// and hoisted `_ami_sme2_exec_batch` (`x17 > 0` -> stay in Streaming SVE).
+.macro SME2_EPILOGUE_OR_BATCH
+    cbnz    x17, L_ami_sme2_batch_next
+    SME2_EPILOGUE
+.endm
+
+// Tuned multi-row ZA software prefetch helpers (C24, ADR-0023):
+//   nt == 0 (L2-hot Step-LoRA / W19 adapters, routers, D8 draft): `prfm pldl1keep`
+//   nt == 1 (cold streaming slices paired with `ldnt1*`):         `prfm pldl1strm`
+.macro PRFM_WEIGHT nt, base, imm
+    .if \nt
+        prfm    pldl1strm, [\base, #\imm]
+    .else
+        prfm    pldl1keep, [\base, #\imm]
+    .endif
+.endm
+
+.macro PRFM_ACT base, imm
+    prfm    pldl1keep, [\base, #\imm]
 .endm
 
 // Load common macro-task invariants from KernelArgs (x19):
@@ -782,6 +810,7 @@ _ami_sme2_store_m1_4_panel:
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -802,8 +831,10 @@ _ami_sme2_store_m1_4_panel:
     cmp     w28, #1
     b.ne    2f
 
-    // Fast branch-free M == 1 inner K-loop (256 B burst ping-pong, zero branches)
+    // Fast branch-free M == 1 inner K-loop (256 B burst ping-pong + prefetch, zero branches)
 10:
+    PRFM_WEIGHT \nt, x3, 1024
+    PRFM_ACT    x0, 256
     LD1H_4  \nt, z16, z19, pn9, x3, 0
     LD1H_4  \nt, z20, z23, pn9, x3, 4
     add     x3, x3, #512
@@ -823,6 +854,8 @@ _ami_sme2_store_m1_4_panel:
     b       3f
 
 2:  // inner K-loop (M = 2..4): 8 kp steps (16 K elements = 512 B weights) per iter
+    PRFM_WEIGHT \nt, x3, 1024
+    PRFM_ACT    x0, 256
     LD1H_4  \nt, z16, z19, pn9, x3, 0
     LD1H_4  \nt, z20, z23, pn9, x3, 4
     add     x3, x3, #512
@@ -877,7 +910,7 @@ _ami_sme2_store_m1_4_panel:
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M1_4_DENSE _ami_sme2_m1_4_bf16_t,  bfdot, 0
@@ -891,6 +924,7 @@ DEFINE_M1_4_DENSE _ami_sme2_m1_4_f16_nt,  fdot,  1
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -918,6 +952,9 @@ DEFINE_M1_4_DENSE _ami_sme2_m1_4_f16_nt,  fdot,  1
     mov     x13, x27                     // group counter
 
 2:  // group loop (640 B = 128 B header + 512 B codes = 32 kp steps)
+    PRFM_WEIGHT \nt, x3, 640
+    PRFM_WEIGHT \nt, x3, 768
+    PRFM_ACT    x0, 256
     zero    {za}
     ldr     w15, [x19, #104]
     cbnz    w15, 20f
@@ -995,7 +1032,7 @@ DEFINE_M1_4_DENSE _ami_sme2_m1_4_f16_nt,  fdot,  1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M1_4_Q4 _ami_sme2_m1_4_q4_t,  0
@@ -1022,6 +1059,7 @@ DEFINE_M1_4_Q4 _ami_sme2_m1_4_q4_nt, 1
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -1051,6 +1089,9 @@ DEFINE_M1_4_Q4 _ami_sme2_m1_4_q4_nt, 1
     mov     x13, x27
 
 2:  // group loop (512 B = 128 B header + 384 B codes = 2 halves x 192 B)
+    PRFM_WEIGHT \nt, x3, 512
+    PRFM_WEIGHT \nt, x3, 640
+    PRFM_ACT    x0, 256
     zero    {za}
     ldr     w15, [x19, #104]
     cbnz    w15, 20f
@@ -1114,18 +1155,19 @@ DEFINE_M1_4_Q4 _ami_sme2_m1_4_q4_nt, 1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M1_4_Q3 _ami_sme2_m1_4_q3_t,  0
 DEFINE_M1_4_Q3 _ami_sme2_m1_4_q3_nt, 1
 
-// --- 1D. Quantized q2 (ONE 4-vec burst load + 4-vec luti2, M = 1..4) ---
+// --- 1D. Quantized q2 / LUT4 (ONE 4-vec burst load + 4-vec luti2 + ZA prefetch, M = 1..4) ---
 .macro DEFINE_M1_4_Q2 sym, nt
 .p2align 4
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -1152,7 +1194,83 @@ DEFINE_M1_4_Q3 _ami_sme2_m1_4_q3_nt, 1
     ldr     x14, [x19, #32]
     mov     x13, x27
 
-2:  // group loop (384 B = 128 B header + 256 B codes = ONE 4-vec burst!)
+    cmp     w28, #1
+    b.ne    2f
+
+    // Fast branch-free M == 1 luti2 group loop (D8 draft / W19 LoRA / decode):
+    // ONE 4-vector burst load + 8x 4-vector luti2 (4 packed 2-bit weights/byte) + 3-line prefetch.
+10:
+    PRFM_WEIGHT \nt, x3, 384             // next group header (128 B)
+    PRFM_WEIGHT \nt, x3, 512             // next group codes low 128 B
+    PRFM_WEIGHT \nt, x3, 640             // next group codes high 128 B
+    PRFM_ACT    x0, 256
+    zero    {za}
+    ldr     w15, [x19, #104]
+    cbnz    w15, 11f
+    LD1H_1  \nt, z12, p0, x3, 0
+    fcvt    z12.s, p1/m, z12.h
+    b       12f
+11:
+    ldr     zt0, [x3]
+12:
+    LD1H_1  \nt, z13, p0, x3, 1
+    fcvt    z13.s, p1/m, z13.h
+    add     x3, x3, #128
+
+    LD1B_4  \nt, z24, z27, pn8, x3, 0
+    add     x3, x3, #256
+
+    luti2   {z16.h - z19.h}, zt0, z24[0]
+    luti2   {z20.h - z23.h}, zt0, z24[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z25[0]
+    luti2   {z20.h - z23.h}, zt0, z25[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z26[0]
+    luti2   {z20.h - z23.h}, zt0, z26[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z27[0]
+    luti2   {z20.h - z23.h}, zt0, z27[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    // Single-row algebraic FP32 group fold into z0.s
+    mova    {z4.s - z7.s}, za.s[w8, 0, vgx4]
+    fadd    z4.s, z4.s, z5.s
+    fadd    z6.s, z6.s, z7.s
+    fadd    z4.s, z4.s, z6.s
+    cbnz    w15, 13f
+    fmla    z0.s, p1/m, z4.s, z12.s
+    b       14f
+13:
+    fadd    z0.s, z0.s, z4.s
+14:
+    ld1rw   {z14.s}, p1/z, [x14]
+    fmla    z0.s, p1/m, z13.s, z14.s
+    add     x14, x14, #4
+    subs    x13, x13, #1
+    b.ne    10b
+    b       3f
+
+2:  // group loop for M = 2..4 (384 B = 128 B header + 256 B codes = ONE 4-vec burst!)
+    PRFM_WEIGHT \nt, x3, 384
+    PRFM_WEIGHT \nt, x3, 512
+    PRFM_WEIGHT \nt, x3, 640
+    PRFM_ACT    x0, 256
     zero    {za}
     ldr     w15, [x19, #104]
     cbnz    w15, 20f
@@ -1207,6 +1325,7 @@ DEFINE_M1_4_Q3 _ami_sme2_m1_4_q3_nt, 1
     subs    x13, x13, #1
     b.ne    2b
 
+3:
     bl      _ami_sme2_store_m1_4_panel
     mov     w8, #0
     mov     w9, #4
@@ -1221,7 +1340,7 @@ DEFINE_M1_4_Q3 _ami_sme2_m1_4_q3_nt, 1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M1_4_Q2 _ami_sme2_m1_4_q2_t,  0
@@ -1306,12 +1425,13 @@ DEFINE_M1_4_Q2 _ami_sme2_m1_4_q2_nt, 1
     fmopa   \za_tile\().s, p0/m, p0/m, z3.h, z19.h
 .endm
 
-// --- 2A. Dense bf16 / f16 (1x4, M = 5..16) ---
+// --- 2A. Dense bf16 / f16 (1x4, M = 5..16, multi-row ZA prefetch for L2-hot Step-LoRA / W19) ---
 .macro DEFINE_M5_16_DENSE sym, mopa_op, nt
 .p2align 4
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -1330,7 +1450,12 @@ DEFINE_M1_4_Q2 _ami_sme2_m1_4_q2_nt, 1
     LD1H_1  \nt, z18, p0, x3, 0
     LD1H_1  \nt, z19, p0, x4, 0
 
-2:  // Ping-pong K-loop: 2 kp steps (4 K elems, 8192 FLOPs) per iter
+2:  // Ping-pong K-loop: 2 kp steps (4 K elems, 8192 FLOPs) + 4-cacheline-ahead prefetch per iter
+    PRFM_ACT    x0, 512
+    PRFM_WEIGHT \nt, x1, 512
+    PRFM_WEIGHT \nt, x2, 512
+    PRFM_WEIGHT \nt, x3, 512
+    PRFM_WEIGHT \nt, x4, 512
     ld1h    {z1.h}, p0/z, [x0, #1, mul vl]
     LD1H_1  \nt, z20, p0, x1, 1
     LD1H_1  \nt, z21, p0, x2, 1
@@ -1374,7 +1499,7 @@ DEFINE_M1_4_Q2 _ami_sme2_m1_4_q2_nt, 1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M5_16_DENSE _ami_sme2_m5_16_bf16_t,  bfmopa, 0
@@ -1388,6 +1513,7 @@ DEFINE_M5_16_DENSE _ami_sme2_m5_16_f16_nt,  fmopa,  1
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -1407,6 +1533,11 @@ DEFINE_M5_16_DENSE _ami_sme2_m5_16_f16_nt,  fmopa,  1
     ldr     w15, [x19, #104]             // param_kind
 
 2:  // group loop
+    PRFM_WEIGHT \nt, x1, 640
+    PRFM_WEIGHT \nt, x2, 640
+    PRFM_WEIGHT \nt, x3, 640
+    PRFM_WEIGHT \nt, x4, 640
+    PRFM_ACT    x0, 512
     cbnz    w15, 40f
 
     // --- Affine path (4-tile interleaved, 100% ZA occupancy) ---
@@ -1515,7 +1646,7 @@ DEFINE_M5_16_DENSE _ami_sme2_m5_16_f16_nt,  fmopa,  1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M5_16_Q4 _ami_sme2_m5_16_q4_t,  0
@@ -1527,6 +1658,7 @@ DEFINE_M5_16_Q4 _ami_sme2_m5_16_q4_nt, 1
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -1548,6 +1680,11 @@ DEFINE_M5_16_Q4 _ami_sme2_m5_16_q4_nt, 1
     ldr     w15, [x19, #104]
 
 2:  // group loop (512 B = 128 B header + 2 halves x 192 B)
+    PRFM_WEIGHT \nt, x1, 512
+    PRFM_WEIGHT \nt, x2, 512
+    PRFM_WEIGHT \nt, x3, 512
+    PRFM_WEIGHT \nt, x4, 512
+    PRFM_ACT    x0, 512
     cbnz    w15, 40f
 
     // --- Affine path: 4-tile interleaved, zero spills (29/32 Z regs) ---
@@ -1768,14 +1905,15 @@ DEFINE_M5_16_Q4 _ami_sme2_m5_16_q4_nt, 1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_t,  0
 DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
 
-// --- 2D. Quantized q2 (1x4, M = 5..16, luti2 2-vec interleaved / 4-vec LUT) ---
+// --- 2D. Quantized q2 / LUT4 (1x4, M = 5..16, luti2 + multi-row ZA prefetch) ---
 .macro LUT2_1X4_PANEL_OCT za_tile, zn, bias_z, a_reg
+    PRFM_ACT \a_reg, 512
     luti2   {z16.h - z19.h}, zt0, \zn[0]
     ld1h    {z0.h}, p0/z, [\a_reg, #0, mul vl]
     ld1h    {z1.h}, p0/z, [\a_reg, #1, mul vl]
@@ -1811,6 +1949,7 @@ DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -1832,7 +1971,15 @@ DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
 2:  // group loop (384 B = 128 B header + 4 x 64 B codes)
     cbnz    w15, 40f
 
-    // --- Affine path: 4-tile interleaved ---
+    // --- Affine path: 4-tile interleaved + multi-row ZA prefetch ---
+    PRFM_WEIGHT \nt, x1, 384
+    PRFM_WEIGHT \nt, x2, 384
+    PRFM_WEIGHT \nt, x3, 384
+    PRFM_WEIGHT \nt, x4, 384
+    PRFM_WEIGHT \nt, x1, 512
+    PRFM_WEIGHT \nt, x2, 512
+    PRFM_WEIGHT \nt, x3, 512
+    PRFM_WEIGHT \nt, x4, 512
     LD1H_1  \nt, z8,  p0, x1, 0
     LD1H_1  \nt, z12, p0, x1, 1
     LD1H_1  \nt, z9,  p0, x2, 0
@@ -1848,6 +1995,7 @@ DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
 
     mov     x7, #4                       // 4 chunks of 64 B (each = 8 kp)
 3:
+    PRFM_ACT x0, 512
     LD1B_1  \nt, z24, p2, x1, 0
     LD1B_1  \nt, z25, p2, x2, 0
     LD1B_1  \nt, z26, p2, x3, 0
@@ -1885,7 +2033,10 @@ DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
     b.ne    3b
     b       50f
 
-40: // --- Custom ZT0 LUT codebook path (q2) ---
+40: // --- Custom ZT0 LUT4 codebook path (q2, 4-vec luti2 + cross-panel prefetch) ---
+    PRFM_WEIGHT \nt, x2, 0
+    PRFM_WEIGHT \nt, x2, 128
+    PRFM_WEIGHT \nt, x2, 256
     ldr     zt0, [x1]
     LD1H_1  \nt, z12, p0, x1, 1
     add     x1, x1, #128
@@ -1897,6 +2048,9 @@ DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
     LUT2_1X4_PANEL_OCT za0, z26, z12, x8
     LUT2_1X4_PANEL_OCT za0, z27, z12, x8
 
+    PRFM_WEIGHT \nt, x3, 0
+    PRFM_WEIGHT \nt, x3, 128
+    PRFM_WEIGHT \nt, x3, 256
     ldr     zt0, [x2]
     LD1H_1  \nt, z13, p0, x2, 1
     add     x2, x2, #128
@@ -1908,6 +2062,9 @@ DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
     LUT2_1X4_PANEL_OCT za1, z26, z13, x8
     LUT2_1X4_PANEL_OCT za1, z27, z13, x8
 
+    PRFM_WEIGHT \nt, x4, 0
+    PRFM_WEIGHT \nt, x4, 128
+    PRFM_WEIGHT \nt, x4, 256
     ldr     zt0, [x3]
     LD1H_1  \nt, z14, p0, x3, 1
     add     x3, x3, #128
@@ -1919,6 +2076,9 @@ DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
     LUT2_1X4_PANEL_OCT za2, z26, z14, x8
     LUT2_1X4_PANEL_OCT za2, z27, z14, x8
 
+    PRFM_WEIGHT \nt, x1, 0
+    PRFM_WEIGHT \nt, x1, 128
+    PRFM_WEIGHT \nt, x1, 256
     ldr     zt0, [x4]
     LD1H_1  \nt, z15, p0, x4, 1
     add     x4, x4, #128
@@ -1940,7 +2100,7 @@ DEFINE_M5_16_Q3 _ami_sme2_m5_16_q3_nt, 1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M5_16_Q2 _ami_sme2_m5_16_q2_t,  0
@@ -2033,12 +2193,13 @@ DEFINE_M5_16_Q2 _ami_sme2_m5_16_q2_nt, 1
     add     \a1_reg, \a1_reg, #256
 .endm
 
-// --- 3A. Dense bf16 / f16 (2x2, M >= 32) ---
+// --- 3A. Dense bf16 / f16 (2x2, M >= 32, multi-row ZA prefetch) ---
 .macro DEFINE_M32_DENSE sym, mopa_op, nt
 .p2align 4
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -2055,7 +2216,11 @@ DEFINE_M5_16_Q2 _ami_sme2_m5_16_q2_nt, 1
     LD1H_1  \nt, z16, p0, x2, 0
     LD1H_1  \nt, z17, p0, x3, 0
 
-2:  // Ping-pong K-loop: 2 kp steps (4 K elems, 4096 FLOPs) per iter
+2:  // Ping-pong K-loop: 2 kp steps (4 K elems, 4096 FLOPs) + 4-cacheline-ahead prefetch per iter
+    PRFM_ACT    x0, 512
+    PRFM_ACT    x1, 512
+    PRFM_WEIGHT \nt, x2, 512
+    PRFM_WEIGHT \nt, x3, 512
     ld1h    {z2.h}, p0/z, [x0, #1, mul vl]
     ld1h    {z3.h}, p0/z, [x1, #1, mul vl]
     LD1H_1  \nt, z18, p0, x2, 1
@@ -2096,7 +2261,7 @@ DEFINE_M5_16_Q2 _ami_sme2_m5_16_q2_nt, 1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M32_DENSE _ami_sme2_m32_bf16_t,  bfmopa, 0
@@ -2110,6 +2275,7 @@ DEFINE_M32_DENSE _ami_sme2_m32_f16_nt,  fmopa,  1
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -2128,6 +2294,10 @@ DEFINE_M32_DENSE _ami_sme2_m32_f16_nt,  fmopa,  1
     ldr     w15, [x19, #104]
 
 2:  // group loop
+    PRFM_WEIGHT \nt, x2, 640
+    PRFM_WEIGHT \nt, x3, 640
+    PRFM_ACT    x0, 512
+    PRFM_ACT    x1, 512
     cbnz    w15, 40f
 
     LD1H_1  \nt, z8,  p0, x2, 0
@@ -2194,7 +2364,7 @@ DEFINE_M32_DENSE _ami_sme2_m32_f16_nt,  fmopa,  1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M32_Q4 _ami_sme2_m32_q4_t,  0
@@ -2206,6 +2376,7 @@ DEFINE_M32_Q4 _ami_sme2_m32_q4_nt, 1
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -2226,6 +2397,10 @@ DEFINE_M32_Q4 _ami_sme2_m32_q4_nt, 1
     ldr     w15, [x19, #104]
 
 2:  // group loop
+    PRFM_WEIGHT \nt, x2, 512
+    PRFM_WEIGHT \nt, x3, 512
+    PRFM_ACT    x0, 512
+    PRFM_ACT    x1, 512
     cbnz    w15, 40f
 
     LD1H_1  \nt, z8,  p0, x2, 0
@@ -2358,13 +2533,13 @@ DEFINE_M32_Q4 _ami_sme2_m32_q4_nt, 1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M32_Q3 _ami_sme2_m32_q3_t,  0
 DEFINE_M32_Q3 _ami_sme2_m32_q3_nt, 1
 
-// --- 3D. Quantized q2 (2x2, M >= 32, 4-vec luti2!) ---
+// --- 3D. Quantized q2 / LUT4 (2x2, M >= 32, 4-vec luti2 + multi-row ZA prefetch) ---
 .macro FMAD_FMOPA_2X2_QUAD_Q2
     // z16..z19 = w0[kp+0..kp+3], z20..z23 = w1[kp+0..kp+3]
     // z8,z9 = scales; z12,z13 = biases; x0 = a0, x1 = a1
@@ -2409,6 +2584,8 @@ DEFINE_M32_Q3 _ami_sme2_m32_q3_nt, 1
 .endm
 
 .macro LUT2_2X2_PANEL_OCT za_top, za_bot, zn, bias_z, a0_reg, a1_reg
+    PRFM_ACT \a0_reg, 512
+    PRFM_ACT \a1_reg, 512
     luti2   {z16.h - z19.h}, zt0, \zn[0]
     fadd    z16.h, z16.h, \bias_z\().h
     fadd    z17.h, z17.h, \bias_z\().h
@@ -2462,6 +2639,7 @@ DEFINE_M32_Q3 _ami_sme2_m32_q3_nt, 1
 .globl \sym
 \sym:
     SME2_PROLOGUE
+L\sym\()_body:
     SME2_LOAD_COMMON
     cbz     w25, 9f
     cbz     w27, 9f
@@ -2482,6 +2660,12 @@ DEFINE_M32_Q3 _ami_sme2_m32_q3_nt, 1
 2:  // group loop
     cbnz    w15, 40f
 
+    PRFM_WEIGHT \nt, x2, 384
+    PRFM_WEIGHT \nt, x3, 384
+    PRFM_WEIGHT \nt, x2, 512
+    PRFM_WEIGHT \nt, x3, 512
+    PRFM_WEIGHT \nt, x2, 640
+    PRFM_WEIGHT \nt, x3, 640
     LD1H_1  \nt, z8,  p0, x2, 0
     LD1H_1  \nt, z12, p0, x2, 1
     LD1H_1  \nt, z9,  p0, x3, 0
@@ -2491,6 +2675,8 @@ DEFINE_M32_Q3 _ami_sme2_m32_q3_nt, 1
 
     mov     x7, #4
 3:
+    PRFM_ACT x0, 512
+    PRFM_ACT x1, 512
     LD1B_1  \nt, z24, p2, x2, 0
     LD1B_1  \nt, z25, p2, x3, 0
     add     x2, x2, #64
@@ -2508,7 +2694,10 @@ DEFINE_M32_Q3 _ami_sme2_m32_q3_nt, 1
     b.ne    3b
     b       50f
 
-40: // Custom ZT0 LUT codebook path (2x2 q2)
+40: // Custom ZT0 LUT4 codebook path (2x2 q2, 4-vec luti2 + cross-panel prefetch)
+    PRFM_WEIGHT \nt, x3, 0
+    PRFM_WEIGHT \nt, x3, 128
+    PRFM_WEIGHT \nt, x3, 256
     ldr     zt0, [x2]
     LD1H_1  \nt, z12, p0, x2, 1
     add     x2, x2, #128
@@ -2521,6 +2710,9 @@ DEFINE_M32_Q3 _ami_sme2_m32_q3_nt, 1
     LUT2_2X2_PANEL_OCT za0, za2, z26, z12, x8, x9
     LUT2_2X2_PANEL_OCT za0, za2, z27, z12, x8, x9
 
+    PRFM_WEIGHT \nt, x2, 0
+    PRFM_WEIGHT \nt, x2, 128
+    PRFM_WEIGHT \nt, x2, 256
     ldr     zt0, [x3]
     LD1H_1  \nt, z13, p0, x3, 1
     add     x3, x3, #128
@@ -2544,8 +2736,77 @@ DEFINE_M32_Q3 _ami_sme2_m32_q3_nt, 1
     b.ne    1b
 
 9:
-    SME2_EPILOGUE
+    SME2_EPILOGUE_OR_BATCH
 .endm
 
 DEFINE_M32_Q2 _ami_sme2_m32_q2_t,  0
 DEFINE_M32_Q2 _ami_sme2_m32_q2_nt, 1
+
+// ============================================================================
+// REGIME 4 (C24, ADR-0023): Hoisted `smstart` / `smstop` Batch Executor
+//
+// Executes `count` heterogeneous SME2 projections (layers, multi-LoRA adapters,
+// q2_affine / LUT4 draft passes) under a SINGLE `smstart`..`smstop` residency
+// window, preserving AAPCS64 x19..x30 and d8..d15 before `smstart` and with
+// ZERO `[sp` stack spills inside Streaming SVE mode.
+//
+// ABI: void ami_sme2_exec_batch(const BatchKernelTask *tasks /*x0*/, size_t count /*x1*/)
+//   BatchKernelTask (16 bytes): { +0: const KernelArgs *args, +8: u32 kernel_id, +12: u32 pad }
+// ============================================================================
+.p2align 4
+.globl _ami_sme2_exec_batch
+_ami_sme2_exec_batch:
+    SME2_PROLOGUE
+    mov     x16, x19                     // x16 = tasks ptr
+    mov     x17, x1                      // x17 = remaining task count
+    cbz     x17, L_ami_sme2_batch_exit
+
+L_ami_sme2_batch_dispatch:
+    ldr     x19, [x16, #0]               // x19 = task.args (*const KernelArgs)
+    ldr     w0,  [x16, #8]               // w0  = task.kernel_id (0..29)
+    cmp     w0,  #30
+    b.hs    L_ami_sme2_batch_next
+    adr     x1,  L_ami_sme2_branch_table
+    add     x1,  x1, x0, lsl #2
+    br      x1
+
+.p2align 2
+L_ami_sme2_branch_table:
+    b       L_ami_sme2_m1_4_bf16_t_body
+    b       L_ami_sme2_m1_4_bf16_nt_body
+    b       L_ami_sme2_m1_4_f16_t_body
+    b       L_ami_sme2_m1_4_f16_nt_body
+    b       L_ami_sme2_m1_4_q4_t_body
+    b       L_ami_sme2_m1_4_q4_nt_body
+    b       L_ami_sme2_m1_4_q3_t_body
+    b       L_ami_sme2_m1_4_q3_nt_body
+    b       L_ami_sme2_m1_4_q2_t_body
+    b       L_ami_sme2_m1_4_q2_nt_body
+    b       L_ami_sme2_m5_16_bf16_t_body
+    b       L_ami_sme2_m5_16_bf16_nt_body
+    b       L_ami_sme2_m5_16_f16_t_body
+    b       L_ami_sme2_m5_16_f16_nt_body
+    b       L_ami_sme2_m5_16_q4_t_body
+    b       L_ami_sme2_m5_16_q4_nt_body
+    b       L_ami_sme2_m5_16_q3_t_body
+    b       L_ami_sme2_m5_16_q3_nt_body
+    b       L_ami_sme2_m5_16_q2_t_body
+    b       L_ami_sme2_m5_16_q2_nt_body
+    b       L_ami_sme2_m32_bf16_t_body
+    b       L_ami_sme2_m32_bf16_nt_body
+    b       L_ami_sme2_m32_f16_t_body
+    b       L_ami_sme2_m32_f16_nt_body
+    b       L_ami_sme2_m32_q4_t_body
+    b       L_ami_sme2_m32_q4_nt_body
+    b       L_ami_sme2_m32_q3_t_body
+    b       L_ami_sme2_m32_q3_nt_body
+    b       L_ami_sme2_m32_q2_t_body
+    b       L_ami_sme2_m32_q2_nt_body
+
+L_ami_sme2_batch_next:
+    add     x16, x16, #16
+    subs    x17, x17, #1
+    b.ne    L_ami_sme2_batch_dispatch
+
+L_ami_sme2_batch_exit:
+    SME2_EPILOGUE

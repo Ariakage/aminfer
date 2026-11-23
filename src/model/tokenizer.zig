@@ -377,6 +377,309 @@ inline fn isDeepSeekCjk(cp: u21) bool {
         (cp >= 0x30A0 and cp <= 0x30FF);
 }
 
+inline fn isDeepSeekStage1Or2(cp: u21) bool {
+    return isNumber(cp) or isDeepSeekCjk(cp);
+}
+
+// ---------------------------------------------------------------------------
+// C23: ARM64 NEON BPE pre-tokenizer class-boundary scanners (ADR-0023)
+//   - Explicit 16-byte / 64-byte unrolled `@Vector(16, u8)` NEON fast paths
+//   - `shrn`-equivalent nibble-mask reduction (compatible with `-Dcpu=apple_m1`)
+//   - Clean `< 16 B` scalar tail fallback, zero dynamic heap allocation
+// ---------------------------------------------------------------------------
+
+const NeonVec16 = @Vector(16, u8);
+const NeonVec8u16 = @Vector(8, u16);
+const NeonVec8u8 = @Vector(8, u8);
+const NeonShift4: @Vector(8, u4) = @splat(4);
+
+inline fn neonBoolToMask(cond: @Vector(16, bool)) NeonVec16 {
+    return @select(u8, cond, @as(NeonVec16, @splat(0xFF)), @as(NeonVec16, @splat(0)));
+}
+
+inline fn neonMaskToU64(mask: NeonVec16) u64 {
+    const pairs: NeonVec8u16 = @bitCast(mask);
+    const nibbles: NeonVec8u8 = @truncate(pairs >> NeonShift4);
+    return @bitCast(nibbles);
+}
+
+inline fn neonNonAsciiAlphaMask(v: NeonVec16) NeonVec16 {
+    const lower = v | @as(NeonVec16, @splat(0x20));
+    const is_alpha = (lower -% @as(NeonVec16, @splat('a'))) <= @as(NeonVec16, @splat(25));
+    return ~neonBoolToMask(is_alpha);
+}
+
+inline fn neonNonAsciiPunctMask(v: NeonVec16) NeonVec16 {
+    const is_non_ascii = neonBoolToMask(v >= @as(NeonVec16, @splat(0x80)));
+    const lower = v | @as(NeonVec16, @splat(0x20));
+    const is_alpha = neonBoolToMask((lower -% @as(NeonVec16, @splat('a'))) <= @as(NeonVec16, @splat(25)));
+    const is_digit = neonBoolToMask((v -% @as(NeonVec16, @splat('0'))) <= @as(NeonVec16, @splat(9)));
+    const is_ws = neonBoolToMask(v == @as(NeonVec16, @splat(' '))) |
+        neonBoolToMask((v -% @as(NeonVec16, @splat(0x09))) <= @as(NeonVec16, @splat(4)));
+    return is_non_ascii | is_alpha | is_digit | is_ws;
+}
+
+inline fn neonNonAsciiWsMask(v: NeonVec16) NeonVec16 {
+    const is_ws = neonBoolToMask(v == @as(NeonVec16, @splat(' '))) |
+        neonBoolToMask((v -% @as(NeonVec16, @splat(0x09))) <= @as(NeonVec16, @splat(4)));
+    return ~is_ws;
+}
+
+inline fn neonCrLfMask(v: NeonVec16) NeonVec16 {
+    return neonBoolToMask(v == @as(NeonVec16, @splat('\r'))) |
+        neonBoolToMask(v == @as(NeonVec16, @splat('\n')));
+}
+
+/// Scans the leading contiguous ASCII `[A-Za-z]` run using 64 B / 16 B NEON.
+pub fn neonScanAsciiAlpha(bytes: []const u8) usize {
+    var pos: usize = 0;
+    const len = bytes.len;
+
+    while (pos + 64 <= len) : (pos += 64) {
+        const m0 = neonNonAsciiAlphaMask(bytes[pos..][0..16].*);
+        const m1 = neonNonAsciiAlphaMask(bytes[pos + 16 ..][0..16].*);
+        const m2 = neonNonAsciiAlphaMask(bytes[pos + 32 ..][0..16].*);
+        const m3 = neonNonAsciiAlphaMask(bytes[pos + 48 ..][0..16].*);
+        const any = (m0 | m1) | (m2 | m3);
+        if (@reduce(.Max, any) != 0) {
+            const b0 = neonMaskToU64(m0);
+            if (b0 != 0) return pos + (@as(usize, @ctz(b0)) >> 2);
+            const b1 = neonMaskToU64(m1);
+            if (b1 != 0) return pos + 16 + (@as(usize, @ctz(b1)) >> 2);
+            const b2 = neonMaskToU64(m2);
+            if (b2 != 0) return pos + 32 + (@as(usize, @ctz(b2)) >> 2);
+            const b3 = neonMaskToU64(m3);
+            return pos + 48 + (@as(usize, @ctz(b3)) >> 2);
+        }
+    }
+
+    while (pos + 16 <= len) : (pos += 16) {
+        const m = neonNonAsciiAlphaMask(bytes[pos..][0..16].*);
+        const u = neonMaskToU64(m);
+        if (u != 0) return pos + (@as(usize, @ctz(u)) >> 2);
+    }
+
+    while (pos < len and isAsciiAlpha(bytes[pos])) : (pos += 1) {}
+    return pos;
+}
+
+/// Scans the leading contiguous ASCII `isPunctOrSymbol` run (`< 0x80` and not
+/// whitespace, letter, or digit) using 64 B / 16 B NEON.
+pub fn neonScanAsciiPunctOrSym(bytes: []const u8) usize {
+    var pos: usize = 0;
+    const len = bytes.len;
+
+    while (pos + 64 <= len) : (pos += 64) {
+        const m0 = neonNonAsciiPunctMask(bytes[pos..][0..16].*);
+        const m1 = neonNonAsciiPunctMask(bytes[pos + 16 ..][0..16].*);
+        const m2 = neonNonAsciiPunctMask(bytes[pos + 32 ..][0..16].*);
+        const m3 = neonNonAsciiPunctMask(bytes[pos + 48 ..][0..16].*);
+        const any = (m0 | m1) | (m2 | m3);
+        if (@reduce(.Max, any) != 0) {
+            const b0 = neonMaskToU64(m0);
+            if (b0 != 0) return pos + (@as(usize, @ctz(b0)) >> 2);
+            const b1 = neonMaskToU64(m1);
+            if (b1 != 0) return pos + 16 + (@as(usize, @ctz(b1)) >> 2);
+            const b2 = neonMaskToU64(m2);
+            if (b2 != 0) return pos + 32 + (@as(usize, @ctz(b2)) >> 2);
+            const b3 = neonMaskToU64(m3);
+            return pos + 48 + (@as(usize, @ctz(b3)) >> 2);
+        }
+    }
+
+    while (pos + 16 <= len) : (pos += 16) {
+        const m = neonNonAsciiPunctMask(bytes[pos..][0..16].*);
+        const u = neonMaskToU64(m);
+        if (u != 0) return pos + (@as(usize, @ctz(u)) >> 2);
+    }
+
+    while (pos < len) : (pos += 1) {
+        const b = bytes[pos];
+        if (b >= 0x80 or !isPunctOrSymbol(b)) break;
+    }
+    return pos;
+}
+
+/// Scans the leading contiguous `[\r\n]` run using 64 B / 16 B NEON.
+pub fn neonScanCrLf(bytes: []const u8) usize {
+    var pos: usize = 0;
+    const len = bytes.len;
+
+    while (pos + 64 <= len) : (pos += 64) {
+        const m0 = ~neonCrLfMask(bytes[pos..][0..16].*);
+        const m1 = ~neonCrLfMask(bytes[pos + 16 ..][0..16].*);
+        const m2 = ~neonCrLfMask(bytes[pos + 32 ..][0..16].*);
+        const m3 = ~neonCrLfMask(bytes[pos + 48 ..][0..16].*);
+        const any = (m0 | m1) | (m2 | m3);
+        if (@reduce(.Max, any) != 0) {
+            const b0 = neonMaskToU64(m0);
+            if (b0 != 0) return pos + (@as(usize, @ctz(b0)) >> 2);
+            const b1 = neonMaskToU64(m1);
+            if (b1 != 0) return pos + 16 + (@as(usize, @ctz(b1)) >> 2);
+            const b2 = neonMaskToU64(m2);
+            if (b2 != 0) return pos + 32 + (@as(usize, @ctz(b2)) >> 2);
+            const b3 = neonMaskToU64(m3);
+            return pos + 48 + (@as(usize, @ctz(b3)) >> 2);
+        }
+    }
+
+    while (pos + 16 <= len) : (pos += 16) {
+        const m = ~neonCrLfMask(bytes[pos..][0..16].*);
+        const u = neonMaskToU64(m);
+        if (u != 0) return pos + (@as(usize, @ctz(u)) >> 2);
+    }
+
+    while (pos < len and (bytes[pos] == '\r' or bytes[pos] == '\n')) : (pos += 1) {}
+    return pos;
+}
+
+const AsciiWsRun = struct {
+    end: usize,
+    after_last_nl: ?usize,
+};
+
+fn neonScanAsciiWhitespaceRun(bytes: []const u8) AsciiWsRun {
+    var pos: usize = 0;
+    const len = bytes.len;
+    var after_last_nl: ?usize = null;
+
+    while (pos + 64 <= len) : (pos += 64) {
+        const v0: NeonVec16 = bytes[pos..][0..16].*;
+        const v1: NeonVec16 = bytes[pos + 16 ..][0..16].*;
+        const v2: NeonVec16 = bytes[pos + 32 ..][0..16].*;
+        const v3: NeonVec16 = bytes[pos + 48 ..][0..16].*;
+        const nw0 = neonNonAsciiWsMask(v0);
+        const nw1 = neonNonAsciiWsMask(v1);
+        const nw2 = neonNonAsciiWsMask(v2);
+        const nw3 = neonNonAsciiWsMask(v3);
+        const any_nw = (nw0 | nw1) | (nw2 | nw3);
+        if (@reduce(.Max, any_nw) != 0) break;
+
+        const nl0 = neonCrLfMask(v0);
+        const nl1 = neonCrLfMask(v1);
+        const nl2 = neonCrLfMask(v2);
+        const nl3 = neonCrLfMask(v3);
+        const any_nl = (nl0 | nl1) | (nl2 | nl3);
+        if (@reduce(.Max, any_nl) != 0) {
+            const b3 = neonMaskToU64(nl3);
+            if (b3 != 0) {
+                after_last_nl = pos + 48 + (15 - (@as(usize, @clz(b3)) >> 2)) + 1;
+            } else {
+                const b2 = neonMaskToU64(nl2);
+                if (b2 != 0) {
+                    after_last_nl = pos + 32 + (15 - (@as(usize, @clz(b2)) >> 2)) + 1;
+                } else {
+                    const b1 = neonMaskToU64(nl1);
+                    if (b1 != 0) {
+                        after_last_nl = pos + 16 + (15 - (@as(usize, @clz(b1)) >> 2)) + 1;
+                    } else {
+                        const b0 = neonMaskToU64(nl0);
+                        after_last_nl = pos + (15 - (@as(usize, @clz(b0)) >> 2)) + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    while (pos + 16 <= len) : (pos += 16) {
+        const v: NeonVec16 = bytes[pos..][0..16].*;
+        if (@reduce(.Max, neonNonAsciiWsMask(v)) != 0) break;
+        const u_nl = neonMaskToU64(neonCrLfMask(v));
+        if (u_nl != 0) {
+            after_last_nl = pos + (15 - (@as(usize, @clz(u_nl)) >> 2)) + 1;
+        }
+    }
+
+    while (pos < len) : (pos += 1) {
+        const b = bytes[pos];
+        if (b != ' ' and !(b >= 0x09 and b <= 0x0D)) break;
+        if (b == '\r' or b == '\n') after_last_nl = pos + 1;
+    }
+
+    return .{ .end = pos, .after_last_nl = after_last_nl };
+}
+
+const CJK_LEAD_NIBBLES: u64 = 0x000F_00F0_0F00_F00F; // lanes {0, 3, 6, 9, 12}
+const CJK_CONT_NIBBLES: u64 = 0x0FF0_FF0F_F0FF_0FF0; // lanes {1,2, 4,5, 7,8, 10,11, 13,14}
+
+inline fn neonChunkIs5Utf8Cjk(v: NeonVec16, comptime include_kana: bool) bool {
+    const v_next = @shuffle(u8, v, v, [16]i32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0 });
+    const is_e5_e8 = neonBoolToMask((v >= @as(NeonVec16, @splat(0xE5))) & (v <= @as(NeonVec16, @splat(0xE8))));
+    const is_e4 = neonBoolToMask((v == @as(NeonVec16, @splat(0xE4))) & (v_next >= @as(NeonVec16, @splat(0xB8))));
+    const is_e9 = neonBoolToMask((v == @as(NeonVec16, @splat(0xE9))) & (v_next <= @as(NeonVec16, @splat(0xBD))));
+    var lead = is_e5_e8 | is_e4 | is_e9;
+    if (include_kana) {
+        const is_kana = neonBoolToMask((v == @as(NeonVec16, @splat(0xE3))) &
+            (v_next >= @as(NeonVec16, @splat(0x81))) &
+            (v_next <= @as(NeonVec16, @splat(0x83))));
+        lead = lead | is_kana;
+    }
+    const cont = neonBoolToMask((v & @as(NeonVec16, @splat(0xC0))) == @as(NeonVec16, @splat(0x80)));
+    const lead_u64 = neonMaskToU64(lead);
+    const cont_u64 = neonMaskToU64(cont);
+    return ((lead_u64 & CJK_LEAD_NIBBLES) == CJK_LEAD_NIBBLES) and
+        ((cont_u64 & CJK_CONT_NIBBLES) == CJK_CONT_NIBBLES);
+}
+
+/// Scans leading 3-byte UTF-8 CJK (`U+4E00..U+9F7F`, and optionally Kana
+/// `U+3040..U+30FF`) in 60-byte (20-char) and 15-byte (5-char) NEON steps.
+/// Any boundary codepoint (e.g. `U+9F80..U+9FA5`) exits cleanly to scalar UTF-8.
+fn neonScanUtf8CjkFast(bytes: []const u8, comptime include_kana: bool) usize {
+    var pos: usize = 0;
+    const len = bytes.len;
+    // 60-byte unrolled loop (4 x 15 B; requires pos + 61 <= len so the 4th 16 B load is in-bounds).
+    while (pos + 61 <= len) : (pos += 60) {
+        if (!neonChunkIs5Utf8Cjk(bytes[pos..][0..16].*, include_kana)) break;
+        if (!neonChunkIs5Utf8Cjk(bytes[pos + 15 ..][0..16].*, include_kana)) {
+            pos += 15;
+            return pos;
+        }
+        if (!neonChunkIs5Utf8Cjk(bytes[pos + 30 ..][0..16].*, include_kana)) {
+            pos += 30;
+            return pos;
+        }
+        if (!neonChunkIs5Utf8Cjk(bytes[pos + 45 ..][0..16].*, include_kana)) {
+            pos += 45;
+            return pos;
+        }
+    }
+    while (pos + 16 <= len) : (pos += 15) {
+        if (!neonChunkIs5Utf8Cjk(bytes[pos..][0..16].*, include_kana)) break;
+    }
+    return pos;
+}
+
+const WsScanResult = struct {
+    ws_end: usize,
+    last_ws_start: usize,
+    after_last_nl: ?usize,
+};
+
+fn scanWhitespaceRun(rem: []const u8) WsScanResult {
+    var ws_end: usize = 0;
+    var last_ws_start: usize = 0;
+    var after_last_nl: ?usize = null;
+    while (ws_end < rem.len) {
+        if (rem[ws_end] < 0x80) {
+            const run = neonScanAsciiWhitespaceRun(rem[ws_end..]);
+            if (run.end == 0) break;
+            if (run.after_last_nl) |rel_nl| after_last_nl = ws_end + rel_nl;
+            last_ws_start = ws_end + run.end - 1;
+            ws_end += run.end;
+            continue;
+        }
+        const c = decodeNextCp(rem[ws_end..]);
+        if (!isWhitespace(c.cp)) break;
+        last_ws_start = ws_end;
+        ws_end += c.len;
+    }
+    return .{
+        .ws_end = ws_end,
+        .last_ws_start = last_ws_start,
+        .after_last_nl = after_last_nl,
+    };
+}
+
 /// Pre-tokenization dialect auto-detected from HuggingFace `tokenizer.json`.
 pub const PreTokenizerKind = enum(u8) {
     /// Qwen2 / Qwen3 / Qwen3.5 / Qwen3.8 single-digit `\p{N}` + contraction regex.
@@ -414,6 +717,46 @@ pub const PreTokenIterator = struct {
     }
 };
 
+fn scanDeepSeekLetters(rem: []const u8, start: usize) usize {
+    var end = start;
+    while (end < rem.len) {
+        if (rem[end] < 0x80) {
+            const adv = neonScanAsciiAlpha(rem[end..]);
+            if (adv == 0) break;
+            end += adv;
+            continue;
+        }
+        const c = decodeNextCp(rem[end..]);
+        if (!isLetterOrMark(c.cp) or isDeepSeekCjk(c.cp)) break;
+        end += c.len;
+    }
+    return end;
+}
+
+fn scanQwenLetters(rem: []const u8, start: usize) usize {
+    var end = start;
+    while (end < rem.len) {
+        const b = rem[end];
+        if (b < 0x80) {
+            const adv = neonScanAsciiAlpha(rem[end..]);
+            if (adv == 0) break;
+            end += adv;
+            continue;
+        }
+        if (b >= 0xE4 and b <= 0xE9) {
+            const adv = neonScanUtf8CjkFast(rem[end..], false);
+            if (adv > 0) {
+                end += adv;
+                continue;
+            }
+        }
+        const c = decodeNextCp(rem[end..]);
+        if (!isLetterOrMark(c.cp)) break;
+        end += c.len;
+    }
+    return end;
+}
+
 fn matchDeepSeekPreToken(rem: []const u8) usize {
     const c0 = decodeNextCp(rem);
 
@@ -434,6 +777,14 @@ fn matchDeepSeekPreToken(rem: []const u8) usize {
     if (isDeepSeekCjk(c0.cp)) {
         var end = c0.len;
         while (end < rem.len) {
+            const b = rem[end];
+            if (b >= 0xE3 and b <= 0xE9) {
+                const adv = neonScanUtf8CjkFast(rem[end..], true);
+                if (adv > 0) {
+                    end += adv;
+                    continue;
+                }
+            }
             const c = decodeNextCp(rem[end..]);
             if (!isDeepSeekCjk(c.cp)) break;
             end += c.len;
@@ -441,44 +792,22 @@ fn matchDeepSeekPreToken(rem: []const u8) usize {
         return end;
     }
 
-    // Bound stage 3 to the isolated non-number, non-CJK sub-slice produced by stages 1 & 2.
-    var sub_end: usize = c0.len;
-    while (sub_end < rem.len) {
-        const c = decodeNextCp(rem[sub_end..]);
-        if (isNumber(c.cp) or isDeepSeekCjk(c.cp)) break;
-        sub_end += c.len;
-    }
-    const sub = rem[0..sub_end];
+    // Stage 3 runs strictly over the non-number, non-CJK prefix without scanning
+    // past the current token (O(token_len) instead of O(rem.len), bit-exact).
 
     // Stage 3.1: `[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+`
-    if (sub.len >= 2 and isAsciiPunct(sub[0]) and isAsciiAlpha(sub[1])) {
-        var end: usize = 2;
-        while (end < sub.len and isAsciiAlpha(sub[end])) {
-            end += 1;
-        }
-        return end;
+    if (rem.len >= 2 and isAsciiPunct(rem[0]) and isAsciiAlpha(rem[1])) {
+        return 2 + neonScanAsciiAlpha(rem[2..]);
     }
 
     // Stage 3.2: `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`
     if (isLetterOrMark(c0.cp)) {
-        var end = c0.len;
-        while (end < sub.len) {
-            const c = decodeNextCp(sub[end..]);
-            if (!isLetterOrMark(c.cp)) break;
-            end += c.len;
-        }
-        return end;
+        return scanDeepSeekLetters(rem, c0.len);
     }
-    if (c0.cp != '\r' and c0.cp != '\n' and !isPunctOrSymbol(c0.cp) and c0.len < sub.len) {
-        const c1 = decodeNextCp(sub[c0.len..]);
-        if (isLetterOrMark(c1.cp)) {
-            var end = c0.len + c1.len;
-            while (end < sub.len) {
-                const c = decodeNextCp(sub[end..]);
-                if (!isLetterOrMark(c.cp)) break;
-                end += c.len;
-            }
-            return end;
+    if (c0.cp != '\r' and c0.cp != '\n' and !isPunctOrSymbol(c0.cp) and c0.len < rem.len) {
+        const c1 = decodeNextCp(rem[c0.len..]);
+        if (!isDeepSeekStage1Or2(c1.cp) and isLetterOrMark(c1.cp)) {
+            return scanDeepSeekLetters(rem, c0.len + c1.len);
         }
     }
 
@@ -487,44 +816,38 @@ fn matchDeepSeekPreToken(rem: []const u8) usize {
         var p_start: ?usize = null;
         if (isPunctOrSymbol(c0.cp)) {
             p_start = c0.len;
-        } else if (c0.cp == ' ' and c0.len < sub.len) {
-            const c1 = decodeNextCp(sub[c0.len..]);
-            if (isPunctOrSymbol(c1.cp)) {
+        } else if (c0.cp == ' ' and c0.len < rem.len) {
+            const c1 = decodeNextCp(rem[c0.len..]);
+            if (!isDeepSeekStage1Or2(c1.cp) and isPunctOrSymbol(c1.cp)) {
                 p_start = c0.len + c1.len;
             }
         }
         if (p_start) |start| {
             var end = start;
-            while (end < sub.len) {
-                const c = decodeNextCp(sub[end..]);
-                if (!isPunctOrSymbol(c.cp)) break;
+            while (end < rem.len) {
+                if (rem[end] < 0x80) {
+                    const adv = neonScanAsciiPunctOrSym(rem[end..]);
+                    if (adv == 0) break;
+                    end += adv;
+                    continue;
+                }
+                const c = decodeNextCp(rem[end..]);
+                if (isDeepSeekStage1Or2(c.cp) or !isPunctOrSymbol(c.cp)) break;
                 end += c.len;
             }
-            while (end < sub.len and (sub[end] == '\r' or sub[end] == '\n')) {
-                end += 1;
-            }
+            end += neonScanCrLf(rem[end..]);
             return end;
         }
     }
 
     // Stage 3.4: `\s*[\r\n]+|\s+(?!\S)|\s+`
     if (isWhitespace(c0.cp)) {
-        var ws_end: usize = 0;
-        var last_ws_start: usize = 0;
-        var after_last_nl: ?usize = null;
-        while (ws_end < sub.len) {
-            const c = decodeNextCp(sub[ws_end..]);
-            if (!isWhitespace(c.cp)) break;
-            last_ws_start = ws_end;
-            ws_end += c.len;
-            if (c.cp == '\r' or c.cp == '\n') {
-                after_last_nl = ws_end;
-            }
-        }
-        if (after_last_nl) |nl_end| return nl_end;
-        if (ws_end == sub.len) return ws_end;
-        if (last_ws_start > 0) return last_ws_start;
-        return ws_end;
+        const ws = scanWhitespaceRun(rem);
+        if (ws.after_last_nl) |nl_end| return nl_end;
+        const at_sub_end = (ws.ws_end == rem.len) or isDeepSeekStage1Or2(decodeNextCp(rem[ws.ws_end..]).cp);
+        if (at_sub_end) return ws.ws_end;
+        if (ws.last_ws_start > 0) return ws.last_ws_start;
+        return ws.ws_end;
     }
 
     return c0.len;
@@ -548,24 +871,12 @@ fn matchQwenPreToken(rem: []const u8) usize {
 
     // 2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
     if (isLetterOrMark(c0.cp)) {
-        var end = c0.len;
-        while (end < rem.len) {
-            const c = decodeNextCp(rem[end..]);
-            if (!isLetterOrMark(c.cp)) break;
-            end += c.len;
-        }
-        return end;
+        return scanQwenLetters(rem, c0.len);
     }
     if (c0.cp != '\r' and c0.cp != '\n' and !isNumber(c0.cp) and c0.len < rem.len) {
         const c1 = decodeNextCp(rem[c0.len..]);
         if (isLetterOrMark(c1.cp)) {
-            var end = c0.len + c1.len;
-            while (end < rem.len) {
-                const c = decodeNextCp(rem[end..]);
-                if (!isLetterOrMark(c.cp)) break;
-                end += c.len;
-            }
-            return end;
+            return scanQwenLetters(rem, c0.len + c1.len);
         }
     }
 
@@ -586,38 +897,31 @@ fn matchQwenPreToken(rem: []const u8) usize {
         if (p_start) |start| {
             var end = start;
             while (end < rem.len) {
+                if (rem[end] < 0x80) {
+                    const adv = neonScanAsciiPunctOrSym(rem[end..]);
+                    if (adv == 0) break;
+                    end += adv;
+                    continue;
+                }
                 const c = decodeNextCp(rem[end..]);
                 if (!isPunctOrSymbol(c.cp)) break;
                 end += c.len;
             }
-            while (end < rem.len and (rem[end] == '\r' or rem[end] == '\n')) {
-                end += 1;
-            }
+            end += neonScanCrLf(rem[end..]);
             return end;
         }
     }
 
     // 5. \s*[\r\n]+ , 6. \s+(?!\S) , 7. \s+
     if (isWhitespace(c0.cp)) {
-        var ws_end: usize = 0;
-        var last_ws_start: usize = 0;
-        var after_last_nl: ?usize = null;
-        while (ws_end < rem.len) {
-            const c = decodeNextCp(rem[ws_end..]);
-            if (!isWhitespace(c.cp)) break;
-            last_ws_start = ws_end;
-            ws_end += c.len;
-            if (c.cp == '\r' or c.cp == '\n') {
-                after_last_nl = ws_end;
-            }
-        }
+        const ws = scanWhitespaceRun(rem);
         // 5. \s*[\r\n]+
-        if (after_last_nl) |nl_end| return nl_end;
+        if (ws.after_last_nl) |nl_end| return nl_end;
         // 6. \s+(?!\S)
-        if (ws_end == rem.len) return ws_end;
-        if (last_ws_start > 0) return last_ws_start;
+        if (ws.ws_end == rem.len) return ws.ws_end;
+        if (ws.last_ws_start > 0) return ws.last_ws_start;
         // 7. \s+
-        return ws_end;
+        return ws.ws_end;
     }
 
     return c0.len;
@@ -2003,5 +2307,309 @@ test "opportunistic live Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash-1017 tokeniz
     } else |err| switch (err) {
         error.FileNotFound, error.NotDir => {},
         else => return err,
+    }
+}
+
+fn matchQwenPreTokenScalarRef(rem: []const u8) usize {
+    if (rem[0] == '\'') {
+        if (rem.len >= 2) {
+            switch (asciiLower(rem[1])) {
+                's', 't', 'm', 'd' => return 2,
+                'r' => if (rem.len >= 3 and asciiLower(rem[2]) == 'e') return 3,
+                'v' => if (rem.len >= 3 and asciiLower(rem[2]) == 'e') return 3,
+                'l' => if (rem.len >= 3 and asciiLower(rem[2]) == 'l') return 3,
+                else => {},
+            }
+        }
+    }
+    const c0 = decodeNextCp(rem);
+    if (isLetterOrMark(c0.cp)) {
+        var end = c0.len;
+        while (end < rem.len) {
+            const c = decodeNextCp(rem[end..]);
+            if (!isLetterOrMark(c.cp)) break;
+            end += c.len;
+        }
+        return end;
+    }
+    if (c0.cp != '\r' and c0.cp != '\n' and !isNumber(c0.cp) and c0.len < rem.len) {
+        const c1 = decodeNextCp(rem[c0.len..]);
+        if (isLetterOrMark(c1.cp)) {
+            var end = c0.len + c1.len;
+            while (end < rem.len) {
+                const c = decodeNextCp(rem[end..]);
+                if (!isLetterOrMark(c.cp)) break;
+                end += c.len;
+            }
+            return end;
+        }
+    }
+    if (isNumber(c0.cp)) return c0.len;
+    {
+        var p_start: ?usize = null;
+        if (isPunctOrSymbol(c0.cp)) {
+            p_start = c0.len;
+        } else if (c0.cp == ' ' and c0.len < rem.len) {
+            const c1 = decodeNextCp(rem[c0.len..]);
+            if (isPunctOrSymbol(c1.cp)) p_start = c0.len + c1.len;
+        }
+        if (p_start) |start| {
+            var end = start;
+            while (end < rem.len) {
+                const c = decodeNextCp(rem[end..]);
+                if (!isPunctOrSymbol(c.cp)) break;
+                end += c.len;
+            }
+            while (end < rem.len and (rem[end] == '\r' or rem[end] == '\n')) end += 1;
+            return end;
+        }
+    }
+    if (isWhitespace(c0.cp)) {
+        var ws_end: usize = 0;
+        var last_ws_start: usize = 0;
+        var after_last_nl: ?usize = null;
+        while (ws_end < rem.len) {
+            const c = decodeNextCp(rem[ws_end..]);
+            if (!isWhitespace(c.cp)) break;
+            last_ws_start = ws_end;
+            ws_end += c.len;
+            if (c.cp == '\r' or c.cp == '\n') after_last_nl = ws_end;
+        }
+        if (after_last_nl) |nl_end| return nl_end;
+        if (ws_end == rem.len) return ws_end;
+        if (last_ws_start > 0) return last_ws_start;
+        return ws_end;
+    }
+    return c0.len;
+}
+
+fn matchDeepSeekPreTokenScalarRef(rem: []const u8) usize {
+    const c0 = decodeNextCp(rem);
+    if (isNumber(c0.cp)) {
+        var end = c0.len;
+        var count: usize = 1;
+        while (count < 3 and end < rem.len) {
+            const c = decodeNextCp(rem[end..]);
+            if (!isNumber(c.cp)) break;
+            end += c.len;
+            count += 1;
+        }
+        return end;
+    }
+    if (isDeepSeekCjk(c0.cp)) {
+        var end = c0.len;
+        while (end < rem.len) {
+            const c = decodeNextCp(rem[end..]);
+            if (!isDeepSeekCjk(c.cp)) break;
+            end += c.len;
+        }
+        return end;
+    }
+    var sub_end: usize = c0.len;
+    while (sub_end < rem.len) {
+        const c = decodeNextCp(rem[sub_end..]);
+        if (isNumber(c.cp) or isDeepSeekCjk(c.cp)) break;
+        sub_end += c.len;
+    }
+    const sub = rem[0..sub_end];
+    if (sub.len >= 2 and isAsciiPunct(sub[0]) and isAsciiAlpha(sub[1])) {
+        var end: usize = 2;
+        while (end < sub.len and isAsciiAlpha(sub[end])) end += 1;
+        return end;
+    }
+    if (isLetterOrMark(c0.cp)) {
+        var end = c0.len;
+        while (end < sub.len) {
+            const c = decodeNextCp(sub[end..]);
+            if (!isLetterOrMark(c.cp)) break;
+            end += c.len;
+        }
+        return end;
+    }
+    if (c0.cp != '\r' and c0.cp != '\n' and !isPunctOrSymbol(c0.cp) and c0.len < sub.len) {
+        const c1 = decodeNextCp(sub[c0.len..]);
+        if (isLetterOrMark(c1.cp)) {
+            var end = c0.len + c1.len;
+            while (end < sub.len) {
+                const c = decodeNextCp(sub[end..]);
+                if (!isLetterOrMark(c.cp)) break;
+                end += c.len;
+            }
+            return end;
+        }
+    }
+    {
+        var p_start: ?usize = null;
+        if (isPunctOrSymbol(c0.cp)) {
+            p_start = c0.len;
+        } else if (c0.cp == ' ' and c0.len < sub.len) {
+            const c1 = decodeNextCp(sub[c0.len..]);
+            if (isPunctOrSymbol(c1.cp)) p_start = c0.len + c1.len;
+        }
+        if (p_start) |start| {
+            var end = start;
+            while (end < sub.len) {
+                const c = decodeNextCp(sub[end..]);
+                if (!isPunctOrSymbol(c.cp)) break;
+                end += c.len;
+            }
+            while (end < sub.len and (sub[end] == '\r' or sub[end] == '\n')) end += 1;
+            return end;
+        }
+    }
+    if (isWhitespace(c0.cp)) {
+        var ws_end: usize = 0;
+        var last_ws_start: usize = 0;
+        var after_last_nl: ?usize = null;
+        while (ws_end < sub.len) {
+            const c = decodeNextCp(sub[ws_end..]);
+            if (!isWhitespace(c.cp)) break;
+            last_ws_start = ws_end;
+            ws_end += c.len;
+            if (c.cp == '\r' or c.cp == '\n') after_last_nl = ws_end;
+        }
+        if (after_last_nl) |nl_end| return nl_end;
+        if (ws_end == sub.len) return ws_end;
+        if (last_ws_start > 0) return last_ws_start;
+        return ws_end;
+    }
+    return c0.len;
+}
+
+fn verifyPreTokenParity(text: []const u8, kind: PreTokenizerKind) !void {
+    var it = PreTokenIterator.initWithKind(text, kind);
+    var pos: usize = 0;
+    while (pos < text.len) {
+        const expected_len = switch (kind) {
+            .qwen => matchQwenPreTokenScalarRef(text[pos..]),
+            .deepseek => matchDeepSeekPreTokenScalarRef(text[pos..]),
+        };
+        const got = it.next() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(text[pos .. pos + expected_len], got);
+        pos += expected_len;
+    }
+    try std.testing.expect(it.next() == null);
+}
+
+test "C23 ARM64 NEON PreTokenIterator matches scalar bit-for-bit across prose, code, numbers, contractions, CJK/Kana, emoji, and 0..129 lengths" {
+    // 1. Exhaustive 0..129 boundary sweep on NEON low-level class scanners.
+    var buf: [160]u8 = undefined;
+    for (0..130) |len| {
+        for (0..len) |i| buf[i] = if ((i & 1) == 0) 'A' + @as(u8, @intCast(i % 26)) else 'a' + @as(u8, @intCast(i % 26));
+        try std.testing.expectEqual(len, neonScanAsciiAlpha(buf[0..len]));
+        if (len > 0) {
+            const stops = [_]u8{ '0', ' ', '@', '[', '`', '{', 0x7F, 0x80, 0xE4, 0xFF };
+            for (stops) |st| {
+                const mid = len / 2;
+                const saved = buf[mid];
+                buf[mid] = st;
+                try std.testing.expectEqual(mid, neonScanAsciiAlpha(buf[0..len]));
+                buf[mid] = saved;
+            }
+        }
+
+        // Punctuation/symbol scan
+        const puncts = [_]u8{ '!', '-', '.', ':', '@', '[', '_', '{', '~', 0x01, 0x7F };
+        for (0..len) |i| buf[i] = puncts[i % puncts.len];
+        try std.testing.expectEqual(len, neonScanAsciiPunctOrSym(buf[0..len]));
+        if (len > 0) {
+            const non_puncts = [_]u8{ 'a', 'Z', '5', ' ', '\t', '\n', '\r', 0x0B, 0x0C, 0x80, 0xE4 };
+            for (non_puncts) |np| {
+                const pos = len - 1;
+                const saved = buf[pos];
+                buf[pos] = np;
+                try std.testing.expectEqual(pos, neonScanAsciiPunctOrSym(buf[0..len]));
+                buf[pos] = saved;
+            }
+        }
+
+        // CRLF scan
+        for (0..len) |i| buf[i] = if ((i & 1) == 0) '\r' else '\n';
+        try std.testing.expectEqual(len, neonScanCrLf(buf[0..len]));
+        if (len > 0) {
+            buf[len - 1] = ' ';
+            try std.testing.expectEqual(len - 1, neonScanCrLf(buf[0..len]));
+        }
+    }
+
+    // 2. Diverse corpus covering both `.qwen` and `.deepseek`:
+    //    - long ASCII words (> 64 B and > 128 B)
+    //    - code indentation (spaces/tabs/newlines > 64 B), operators, punctuation runs > 64 B
+    //    - numbers (ASCII + Unicode `\p{N}`), contractions
+    //    - CJK & Kana including boundary codepoints (`\u{4DFF}`, `\u{4E00}`, `\u{9F7F}`, `\u{9F80}`, `\u{9FA5}`, `\u{9FA6}`, `\u{303F}`, `\u{3040}`, `\u{30A0}`, `\u{30FB}`, `\u{30FF}`)
+    //    - emoji (4-byte UTF-8), combining diacritics (`e\u{0301}`), Unicode whitespace (`\u{3000}`, `\u{00A0}`), malformed UTF-8
+    const corpora = [_][]const u8{
+        "",
+        "a",
+        "don't I've WE'LL they're she'd it's you'll I'm CAN'T 'RE 'VE 'LL 'S 'T 'D 'M",
+        "SupercalifragilisticexpialidociousSupercalifragilisticexpialidociousSupercalifragilisticexpialidocious end",
+        "Supercalifragilisticexpialidocious\u{0301}CombiningMarkInMiddleOfVeryLongAsciiWord1234567890",
+        "                                                                        def f(x):\r\n\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\treturn x + 42\r\n\r\n\n\n\r\r\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+        "    \t   \n   \r\n   \u{3000}\u{00A0}    42   你好   \t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t   123",
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\r\n\r\n" ++
+            "----====++++****////::::;;;;@@@@[[[[]]]]{{{{}}}}~~~~\n\n\n",
+        "pub fn alignUp(n: usize) usize { return (n + 16383) & ~@as(usize, 16383); } // .foo_bar -> ::baz_qux\n",
+        // Long CJK (> 60 bytes = > 20 chars) + Kana + exact boundary codepoints
+        "苹果芯片统一内存零拷贝推理引擎高性能矢量扫描器测试样本苹果芯片统一内存零拷贝推理引擎高性能矢量扫描器测试样本！" ++
+            "あいうえおかきくけこさしすせそたちつてとなにぬねのアイウエオカキクケコサシスセソタチツテト" ++
+            "\u{4DFF}\u{4E00}\u{4FFF}\u{5000}\u{8FFF}\u{9000}\u{9F7F}\u{9F80}\u{9FA5}\u{9FA6}" ++
+            "\u{303F}\u{3040}\u{3041}\u{309F}\u{30A0}\u{30A1}\u{30FB}\u{30FF}\u{3100}",
+        // Unicode digits, emoji, ZWJ, flags, Cyrillic, Greek, Arabic, Korean, malformed UTF-8
+        "2026年1017号 0123456789 ٢٣٤٥ ２０２６ ²³ 🚀🔥🧠👨‍👩‍👧‍👦🇺🇸 Привет мир Αθήνα مرحبا 안녕하세요 \xFF\xFE\xC0\xAF\xE4\x20",
+        // Space right before CJK / number vs space right before ASCII word (critical DeepSeek Stage 3.4 sub_end boundary!)
+        "   你好   123   abc   \u{30A0}   \u{30FB}   .veryLongAsciiIdentifierExceedingSixtyFourBytesForStage31NeonFastPath123",
+    };
+
+    for (corpora) |text| {
+        try verifyPreTokenParity(text, .qwen);
+        try verifyPreTokenParity(text, .deepseek);
+    }
+
+    // 3. Full BPE token-ID parity (encoding with NEON PreTokenIterator vs scalar-pretokenized BPE encode)
+    //    on synthetic tokenizer across both `.qwen` and `.deepseek` dialects.
+    const gpa = std.testing.allocator;
+    const json_bytes = try buildSyntheticTokenizerJson(gpa, false);
+    defer gpa.free(json_bytes);
+    var tok = try Tokenizer.fromHuggingFaceJson(gpa, json_bytes);
+    defer tok.deinit(gpa);
+
+    const mixed_prompt =
+        "don't hesitate! Here is a 72-byte identifier: " ++
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst " ++
+        "and code:\n                    return (x + 16383) & ~16383;\r\n" ++
+        "中文测试样本：苹果芯片统一内存零拷贝推理引擎高性能矢量扫描器！あいうえおアイウエオ 2026 🚀\n";
+
+    var scratch = try EncodeScratch.init(gpa, 4096);
+    defer scratch.deinit(gpa);
+    var neon_ids_buf: [2048]u32 = undefined;
+    var scalar_ids_buf: [2048]u32 = undefined;
+
+    const TestSliceWriter = struct {
+        buf: []u32,
+        len: usize = 0,
+        fn push(self: *@This(), id: u32) EncodeError!void {
+            if (self.len >= self.buf.len) return error.BufferTooSmall;
+            self.buf[self.len] = id;
+            self.len += 1;
+        }
+    };
+
+    for ([_]PreTokenizerKind{ .qwen, .deepseek }) |kind| {
+        tok.pre_tokenizer_kind = kind;
+        const neon_ids = try tok.encodeWithScratch(&scratch, mixed_prompt, &neon_ids_buf);
+
+        // Encode chunk-by-chunk using the scalar reference pre-tokenizer and compare every single token ID!
+        var scalar_writer = TestSliceWriter{ .buf = &scalar_ids_buf };
+        var pos: usize = 0;
+        while (pos < mixed_prompt.len) {
+            const clen = switch (kind) {
+                .qwen => matchQwenPreTokenScalarRef(mixed_prompt[pos..]),
+                .deepseek => matchDeepSeekPreTokenScalarRef(mixed_prompt[pos..]),
+            };
+            const chunk = mixed_prompt[pos .. pos + clen];
+            try tok.encodeChunk(&scalar_writer, null, &scratch, chunk);
+            pos += clen;
+        }
+        try std.testing.expectEqualSlices(u32, scalar_ids_buf[0..scalar_writer.len], neon_ids);
     }
 }
