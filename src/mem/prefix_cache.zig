@@ -28,6 +28,7 @@ const amf = @import("../format/amf.zig");
 const metal = @import("../bridge/metal.zig");
 const attention = @import("../gpu/attention.zig");
 const hybrid = @import("../gpu/hybrid.zig");
+const qos = @import("../platform/qos.zig");
 
 /// Sentinel index for empty intrusive-list links / root parent.
 pub const NONE_ID: u32 = std.math.maxInt(u32);
@@ -217,6 +218,21 @@ pub fn hashBlock(parent_hash: u64, block_tokens: []const u32) u64 {
     h ^= h >> 33;
     h *%= 0xc4ceb9fe1a85ec53;
     h ^= h >> 33;
+    return h;
+}
+
+/// Computes the chained 64-bit prefix hash across `tokens` in `block_tokens`
+/// chunks (matching `PrefixCache`'s chained `hashBlock` tree).
+pub fn hashPrefix(tokens: []const u32, block_tokens: u32) u64 {
+    if (tokens.len == 0 or block_tokens == 0) return 0;
+    var h: u64 = 0;
+    var off: usize = 0;
+    const step: usize = block_tokens;
+    while (off < tokens.len) {
+        const take: usize = @min(step, tokens.len - off);
+        h = hashBlock(h, tokens[off .. off + take]);
+        off += take;
+    }
     return h;
 }
 
@@ -1278,6 +1294,934 @@ pub const PrefixCache = struct {
 };
 
 // ===========================================================================
+// R10: Opt-In NVMe Persistent Prefix KV (`q8` / `FP4`) & `GDN` Cache
+// ===========================================================================
+
+pub const DISK_PREFIX_MAGIC: [8]u8 = .{ 'A', 'M', 'K', 'V', 'P', 'C', '0', '1' };
+pub const DISK_PREFIX_VERSION: u32 = 1;
+
+pub const DiskKvFormat = enum(u8) {
+    none = 0,
+    retired_q8 = 1,
+    mla_fp4 = 2,
+
+    pub fn label(self: DiskKvFormat) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .retired_q8 => "retired_q8",
+            .mla_fp4 => "mla_fp4",
+        };
+    }
+};
+
+/// 144-byte page-0 header for 16 KiB-aligned `F_NOCACHE` persisted prefix artifacts
+/// (`R10`, `ADR-0022`). Zero implicit padding; verified at compile time.
+pub const DiskPrefixHeader = extern struct {
+    magic: [8]u8,
+    version: u32,
+    page_size: u32,
+    amf_header_crc32: u32,
+    amf_dir_crc32: u32,
+    prefix_hash: u64,
+    parent_hash: u64,
+    token_count: u32,
+    num_kv_layers: u32,
+    kv_format: u8,
+    has_gdn_snapshot: u8,
+    quant_profile_tag: u16,
+    kv_bytes_per_layer: u32,
+    tokens_offset: u64,
+    tokens_blob_bytes: u64,
+    kv_offset: u64,
+    kv_data_bytes: u64,
+    kv_blob_bytes: u64,
+    gdn_offset: u64,
+    gdn_state_bytes: u64,
+    gdn_blob_bytes: u64,
+    tokens_crc32: u32,
+    kv_crc32: u32,
+    gdn_crc32: u32,
+    header_crc32: u32,
+    reserved: u64,
+
+    pub fn computeCrc32(self: *const DiskPrefixHeader) u32 {
+        var copy = self.*;
+        copy.header_crc32 = 0;
+        return std.hash.Crc32.hash(std.mem.asBytes(&copy));
+    }
+
+    pub fn kvFormat(self: *const DiskPrefixHeader) ?DiskKvFormat {
+        return std.enums.fromInt(DiskKvFormat, self.kv_format);
+    }
+};
+
+comptime {
+    if (@sizeOf(DiskPrefixHeader) != 144) @compileError("DiskPrefixHeader must be 144 bytes");
+}
+
+pub const DiskPrefixError = qos.Error || std.Thread.SpawnError || error{
+    Overflow,
+    InvalidConfig,
+    PathTooLong,
+    DirectoryFailed,
+    OpenFailed,
+    FcntlFailed,
+    StatFailed,
+    ReadFailed,
+    ShortRead,
+    WriteFailed,
+    RenameFailed,
+    BufferTooSmall,
+    PayloadTooLarge,
+    CorruptHeader,
+    ChecksumMismatch,
+    ModelMismatch,
+    FormatMismatch,
+    OutOfMemory,
+};
+
+pub const DiskPrefixCacheConfig = struct {
+    /// Directory where 16 KiB-aligned `.amkvc` prefix artifacts are persisted.
+    cache_dir: []const u8,
+    /// Owning model's `.amf` `header_crc32` (binds artifacts to exact checkpoint).
+    amf_header_crc32: u32,
+    /// Owning model's `.amf` `directory_crc32` (binds artifacts to exact quant layout).
+    amf_dir_crc32: u32,
+    /// Maximum tokens stored per persisted artifact (for preallocated staging & reload scratch).
+    max_tokens_per_artifact: u32 = DEFAULT_BLOCK_TOKENS,
+    /// Maximum compressed KV bytes (`R5` `q8` or `R7` `FP4`) per artifact.
+    max_kv_bytes_per_artifact: usize,
+    /// Maximum `GDN` recurrent state + `conv1d` snapshot bytes per artifact (`0` if non-GDN).
+    max_gdn_bytes_per_artifact: usize = 0,
+    /// Preallocated 16 KiB-aligned staging slots for async background spills (`1..32`).
+    max_pending_spills: u32 = 4,
+    /// Chunk granularity (multiple of 16 KiB) between cooperative yields to decode-critical cold reads.
+    write_chunk_bytes: usize = 64 * 1024,
+    /// Spawn a low-priority utility/throttled background spill worker thread.
+    enable_async_worker: bool = true,
+    worker_qos: qos.QosClass = .utility,
+    worker_io_policy: qos.DiskIoPolicy = .throttle,
+    /// Optional external atomic counter incremented by `C3`–`C5` decode-critical cold-expert reads.
+    external_cold_read_inflight: ?*const std.atomic.Value(u32) = null,
+};
+
+pub const DiskSpillPayload = struct {
+    prefix_hash: u64,
+    parent_hash: u64 = 0,
+    tokens: []const u32,
+    num_kv_layers: u32,
+    kv_format: DiskKvFormat,
+    quant_profile_tag: u16 = 0,
+    kv_bytes_per_layer: u32,
+    kv_bytes: []const u8,
+    gdn_bytes: ?[]const u8 = null,
+};
+
+pub const DiskReloadResult = struct {
+    header: DiskPrefixHeader,
+    kv_bytes_loaded: usize,
+    gdn_bytes_loaded: usize,
+    has_gdn_snapshot: bool,
+};
+
+pub const DiskPrefixStats = struct {
+    spills_enqueued: u64 = 0,
+    spills_completed: u64 = 0,
+    spills_failed: u64 = 0,
+    spills_dropped_full: u64 = 0,
+    reloads_hit: u64 = 0,
+    reloads_miss: u64 = 0,
+    reloads_rejected_collision: u64 = 0,
+    reloads_rejected_corrupt: u64 = 0,
+    bytes_written: u64 = 0,
+    bytes_read: u64 = 0,
+    io_yields_for_cold_reads: u64 = 0,
+};
+
+/// Opt-in NVMe persistent prefix KV (`R5` `q8` / `R7` `FP4`) & `GDN` snapshot
+/// cache (`R10`, `--disk-prefix-cache <dir>`, off by default).
+///
+/// All staging and reload scratch buffers are preallocated once in `init` with
+/// 16 KiB page alignment (`0` steady-state heap allocations). Background writes
+/// execute with `F_NOCACHE` on a utility/throttled I/O thread and cooperatively
+/// yield before every write chunk whenever decode-critical cold-expert reads are
+/// active.
+pub const DiskPrefixCache = struct {
+    const MAX_STAGING_SLOTS: usize = 32;
+
+    const StagingSlot = struct {
+        buf: []align(page.APPLE_PAGE_SIZE) u8,
+        total_bytes: usize = 0,
+        prefix_hash: u64 = 0,
+        in_queue: bool = false,
+    };
+
+    const SharedState = struct {
+        cache_dir: [std.fs.max_path_bytes]u8,
+        cache_dir_len: usize,
+        amf_header_crc32: u32,
+        amf_dir_crc32: u32,
+        write_chunk_bytes: usize,
+        worker_qos: qos.QosClass,
+        worker_io_policy: qos.DiskIoPolicy,
+        external_cold_read_inflight: ?*const std.atomic.Value(u32),
+        internal_cold_reads: std.atomic.Value(u32),
+
+        slots: []StagingSlot,
+        queue: [MAX_STAGING_SLOTS]u32,
+        q_head: usize,
+        q_tail: usize,
+        q_count: usize,
+        in_flight_writes: usize,
+        temp_seq: std.atomic.Value(u64),
+
+        shutdown: std.atomic.Value(bool),
+        worker_ready: std.atomic.Value(bool),
+        worker_init_err: ?qos.Error,
+
+        mutex: std.c.pthread_mutex_t,
+        work_cond: std.c.pthread_cond_t,
+        done_cond: std.c.pthread_cond_t,
+        init_cond: std.c.pthread_cond_t,
+
+        spills_enqueued: std.atomic.Value(u64),
+        spills_completed: std.atomic.Value(u64),
+        spills_failed: std.atomic.Value(u64),
+        spills_dropped_full: std.atomic.Value(u64),
+        bytes_written: std.atomic.Value(u64),
+        io_yields_for_cold_reads: std.atomic.Value(u64),
+
+        fn cacheDirSlice(self: *const SharedState) []const u8 {
+            return self.cache_dir[0..self.cache_dir_len];
+        }
+
+        fn shouldYieldToColdReads(self: *const SharedState) bool {
+            if (self.internal_cold_reads.load(.acquire) > 0) return true;
+            if (self.external_cold_read_inflight) |ext| {
+                if (ext.load(.acquire) > 0) return true;
+            }
+            return false;
+        }
+
+        fn waitWhileColdReadsActive(self: *SharedState) void {
+            while (self.shouldYieldToColdReads()) {
+                _ = self.io_yields_for_cold_reads.fetchAdd(1, .monotonic);
+                var ts: std.c.timespec = .{ .sec = 0, .nsec = 250_000 }; // 250 us
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+    };
+
+    state: *SharedState,
+    worker_thread: ?std.Thread,
+    max_tokens: u32,
+    max_kv_bytes: usize,
+    max_gdn_bytes: usize,
+    slot_capacity_bytes: usize,
+    reload_scratch: []align(page.APPLE_PAGE_SIZE) u8,
+    reloads_hit: u64,
+    reloads_miss: u64,
+    reloads_rejected_collision: u64,
+    reloads_rejected_corrupt: u64,
+    bytes_read: u64,
+
+    pub fn init(allocator: std.mem.Allocator, cfg: DiskPrefixCacheConfig) DiskPrefixError!DiskPrefixCache {
+        if (cfg.cache_dir.len == 0 or cfg.cache_dir.len + 96 >= std.fs.max_path_bytes) return error.PathTooLong;
+        if (cfg.max_tokens_per_artifact == 0) return error.InvalidConfig;
+        if (cfg.max_pending_spills == 0 or cfg.max_pending_spills > MAX_STAGING_SLOTS) return error.InvalidConfig;
+        if (cfg.write_chunk_bytes == 0 or (cfg.write_chunk_bytes % page.APPLE_PAGE_SIZE) != 0) return error.InvalidConfig;
+
+        try ensureDirExists(cfg.cache_dir);
+
+        const max_tok_bytes = try page.alignUp(
+            std.math.mul(usize, cfg.max_tokens_per_artifact, @sizeOf(u32)) catch return error.InvalidConfig,
+        );
+        const max_kv_aligned = if (cfg.max_kv_bytes_per_artifact > 0)
+            try page.alignUp(cfg.max_kv_bytes_per_artifact)
+        else
+            0;
+        const max_gdn_aligned = if (cfg.max_gdn_bytes_per_artifact > 0)
+            try page.alignUp(cfg.max_gdn_bytes_per_artifact)
+        else
+            0;
+        const slot_cap = page.APPLE_PAGE_SIZE + max_tok_bytes + max_kv_aligned + max_gdn_aligned;
+        const reload_scratch_len = @max(
+            @max(page.APPLE_PAGE_SIZE, max_tok_bytes),
+            @min(@max(max_kv_aligned, max_gdn_aligned), @as(usize, 256 * 1024)),
+        );
+
+        const state = try allocator.create(SharedState);
+        errdefer allocator.destroy(state);
+
+        const slots = try allocator.alloc(StagingSlot, cfg.max_pending_spills);
+        errdefer allocator.free(slots);
+        var allocated_slots: usize = 0;
+        errdefer for (0..allocated_slots) |i| allocator.free(slots[i].buf);
+
+        for (0..cfg.max_pending_spills) |i| {
+            const buf = try allocator.alignedAlloc(u8, .fromByteUnits(page.APPLE_PAGE_SIZE), slot_cap);
+            slots[i] = .{ .buf = buf };
+            allocated_slots += 1;
+        }
+
+        const reload_scratch = try allocator.alignedAlloc(u8, .fromByteUnits(page.APPLE_PAGE_SIZE), reload_scratch_len);
+        errdefer allocator.free(reload_scratch);
+
+        state.* = .{
+            .cache_dir = @splat(0),
+            .cache_dir_len = cfg.cache_dir.len,
+            .amf_header_crc32 = cfg.amf_header_crc32,
+            .amf_dir_crc32 = cfg.amf_dir_crc32,
+            .write_chunk_bytes = cfg.write_chunk_bytes,
+            .worker_qos = cfg.worker_qos,
+            .worker_io_policy = cfg.worker_io_policy,
+            .external_cold_read_inflight = cfg.external_cold_read_inflight,
+            .internal_cold_reads = .init(0),
+            .slots = slots,
+            .queue = @splat(0),
+            .q_head = 0,
+            .q_tail = 0,
+            .q_count = 0,
+            .in_flight_writes = 0,
+            .temp_seq = .init(1),
+            .shutdown = .init(false),
+            .worker_ready = .init(false),
+            .worker_init_err = null,
+            .mutex = std.c.PTHREAD_MUTEX_INITIALIZER,
+            .work_cond = std.c.PTHREAD_COND_INITIALIZER,
+            .done_cond = std.c.PTHREAD_COND_INITIALIZER,
+            .init_cond = std.c.PTHREAD_COND_INITIALIZER,
+            .spills_enqueued = .init(0),
+            .spills_completed = .init(0),
+            .spills_failed = .init(0),
+            .spills_dropped_full = .init(0),
+            .bytes_written = .init(0),
+            .io_yields_for_cold_reads = .init(0),
+        };
+        @memcpy(state.cache_dir[0..cfg.cache_dir.len], cfg.cache_dir);
+
+        var cache: DiskPrefixCache = .{
+            .state = state,
+            .worker_thread = null,
+            .max_tokens = cfg.max_tokens_per_artifact,
+            .max_kv_bytes = cfg.max_kv_bytes_per_artifact,
+            .max_gdn_bytes = cfg.max_gdn_bytes_per_artifact,
+            .slot_capacity_bytes = slot_cap,
+            .reload_scratch = reload_scratch,
+            .reloads_hit = 0,
+            .reloads_miss = 0,
+            .reloads_rejected_collision = 0,
+            .reloads_rejected_corrupt = 0,
+            .bytes_read = 0,
+        };
+        errdefer cache.deinit(allocator);
+
+        if (cfg.enable_async_worker) {
+            cache.worker_thread = try std.Thread.spawn(.{}, workerMain, .{state});
+            _ = std.c.pthread_mutex_lock(&state.mutex);
+            while (!state.worker_ready.load(.acquire)) {
+                _ = std.c.pthread_cond_wait(&state.init_cond, &state.mutex);
+            }
+            _ = std.c.pthread_mutex_unlock(&state.mutex);
+            if (state.worker_init_err) |err| return err;
+        }
+
+        return cache;
+    }
+
+    pub fn deinit(self: *DiskPrefixCache, allocator: std.mem.Allocator) void {
+        const st = self.state;
+        if (self.worker_thread) |th| {
+            _ = std.c.pthread_mutex_lock(&st.mutex);
+            st.shutdown.store(true, .release);
+            _ = std.c.pthread_cond_broadcast(&st.work_cond);
+            _ = std.c.pthread_mutex_unlock(&st.mutex);
+            th.join();
+            self.worker_thread = null;
+        }
+        _ = std.c.pthread_cond_destroy(&st.init_cond);
+        _ = std.c.pthread_cond_destroy(&st.done_cond);
+        _ = std.c.pthread_cond_destroy(&st.work_cond);
+        _ = std.c.pthread_mutex_destroy(&st.mutex);
+
+        allocator.free(self.reload_scratch);
+        for (st.slots) |slot| allocator.free(slot.buf);
+        allocator.free(st.slots);
+        allocator.destroy(st);
+    }
+
+    /// Marks the start of a decode-critical `C3`–`C5` cold-expert NVMe read.
+    /// Background `DiskPrefixCache` writes immediately yield until all critical
+    /// reads call `exitDecodeCriticalRead()`.
+    pub fn enterDecodeCriticalRead(self: *DiskPrefixCache) void {
+        _ = self.state.internal_cold_reads.fetchAdd(1, .acq_rel);
+    }
+
+    pub fn exitDecodeCriticalRead(self: *DiskPrefixCache) void {
+        const prev = self.state.internal_cold_reads.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+    }
+
+    pub fn stats(self: *const DiskPrefixCache) DiskPrefixStats {
+        const st = self.state;
+        return .{
+            .spills_enqueued = st.spills_enqueued.load(.monotonic),
+            .spills_completed = st.spills_completed.load(.monotonic),
+            .spills_failed = st.spills_failed.load(.monotonic),
+            .spills_dropped_full = st.spills_dropped_full.load(.monotonic),
+            .reloads_hit = self.reloads_hit,
+            .reloads_miss = self.reloads_miss,
+            .reloads_rejected_collision = self.reloads_rejected_collision,
+            .reloads_rejected_corrupt = self.reloads_rejected_corrupt,
+            .bytes_written = st.bytes_written.load(.monotonic),
+            .bytes_read = self.bytes_read,
+            .io_yields_for_cold_reads = st.io_yields_for_cold_reads.load(.monotonic),
+        };
+    }
+
+    /// Packs `payload` into a preallocated 16 KiB-aligned staging slot with ZERO
+    /// heap allocation and queues it for asynchronous `F_NOCACHE` disk spill.
+    /// Returns `false` (without blocking) if all staging slots are currently busy.
+    pub fn spillAsync(self: *DiskPrefixCache, payload: DiskSpillPayload) DiskPrefixError!bool {
+        if (self.worker_thread == null) {
+            try self.spillSync(payload);
+            return true;
+        }
+        try self.validatePayload(payload);
+
+        const st = self.state;
+        _ = std.c.pthread_mutex_lock(&st.mutex);
+        var free_idx: ?usize = null;
+        for (st.slots, 0..) |slot, i| {
+            if (!slot.in_queue) {
+                free_idx = i;
+                break;
+            }
+        }
+        if (free_idx == null) {
+            _ = std.c.pthread_mutex_unlock(&st.mutex);
+            _ = st.spills_dropped_full.fetchAdd(1, .monotonic);
+            return false;
+        }
+        const slot_idx = free_idx.?;
+        st.slots[slot_idx].in_queue = true;
+        _ = std.c.pthread_mutex_unlock(&st.mutex);
+
+        const total_bytes = packArtifactIntoBuffer(
+            st.amf_header_crc32,
+            st.amf_dir_crc32,
+            payload,
+            st.slots[slot_idx].buf,
+        ) catch |err| {
+            _ = std.c.pthread_mutex_lock(&st.mutex);
+            st.slots[slot_idx].in_queue = false;
+            _ = std.c.pthread_mutex_unlock(&st.mutex);
+            return err;
+        };
+
+        _ = std.c.pthread_mutex_lock(&st.mutex);
+        st.slots[slot_idx].total_bytes = total_bytes;
+        st.slots[slot_idx].prefix_hash = payload.prefix_hash;
+        st.queue[st.q_tail] = @intCast(slot_idx);
+        st.q_tail = (st.q_tail + 1) % MAX_STAGING_SLOTS;
+        st.q_count += 1;
+        _ = st.spills_enqueued.fetchAdd(1, .monotonic);
+        _ = std.c.pthread_cond_signal(&st.work_cond);
+        _ = std.c.pthread_mutex_unlock(&st.mutex);
+        return true;
+    }
+
+    /// Synchronously writes a 16 KiB-aligned `F_NOCACHE` prefix artifact using
+    /// a preallocated staging slot (`0` heap allocs), yielding to active
+    /// decode-critical cold-expert reads between chunks.
+    pub fn spillSync(self: *DiskPrefixCache, payload: DiskSpillPayload) DiskPrefixError!void {
+        try self.validatePayload(payload);
+        self.flush();
+
+        const st = self.state;
+        const total_bytes = try packArtifactIntoBuffer(
+            st.amf_header_crc32,
+            st.amf_dir_crc32,
+            payload,
+            st.slots[0].buf,
+        );
+        _ = st.spills_enqueued.fetchAdd(1, .monotonic);
+        writeArtifactAtomic(st, payload.prefix_hash, st.slots[0].buf[0..total_bytes]) catch |err| {
+            _ = st.spills_failed.fetchAdd(1, .monotonic);
+            return err;
+        };
+        _ = st.spills_completed.fetchAdd(1, .monotonic);
+    }
+
+    /// Blocks until all queued asynchronous spill writes finish.
+    pub fn flush(self: *DiskPrefixCache) void {
+        if (self.worker_thread == null) return;
+        const st = self.state;
+        _ = std.c.pthread_mutex_lock(&st.mutex);
+        while (st.q_count > 0 or st.in_flight_writes > 0) {
+            _ = std.c.pthread_cond_wait(&st.done_cond, &st.mutex);
+        }
+        _ = std.c.pthread_mutex_unlock(&st.mutex);
+    }
+
+    /// Reloads a persisted prefix artifact from disk with `F_NOCACHE` and zero
+    /// heap allocation. Verifies `.amf` header/directory CRC, format, quant tag,
+    /// full header/tokens/KV/GDN CRC-32s, and **exact token-slice equality**
+    /// (`0` hash-collision risk). Returns `null` on miss or collision rejection.
+    pub fn reload(
+        self: *DiskPrefixCache,
+        prefix_hash: u64,
+        expected_tokens: []const u32,
+        expected_format: DiskKvFormat,
+        expected_quant_profile: u16,
+        kv_dst: []u8,
+        gdn_dst: ?[]u8,
+    ) DiskPrefixError!?DiskReloadResult {
+        if (expected_tokens.len == 0 or expected_tokens.len > self.max_tokens) return error.InvalidConfig;
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = try formatArtifactPath(
+            self.state.cacheDirSlice(),
+            self.state.amf_header_crc32,
+            self.state.amf_dir_crc32,
+            prefix_hash,
+            &path_buf,
+        );
+
+        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) {
+            const err = std.c.errno(fd);
+            if (err == .NOENT) {
+                self.reloads_miss += 1;
+                return null;
+            }
+            return error.OpenFailed;
+        }
+        defer _ = std.c.close(fd);
+
+        if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0) return error.FcntlFailed;
+
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
+        if (st.size < page.APPLE_PAGE_SIZE) {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        }
+        const file_size: u64 = @intCast(st.size);
+        if ((file_size % page.APPLE_PAGE_SIZE) != 0) {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        }
+
+        // 1. Read and validate page 0 header.
+        const page0 = self.reload_scratch[0..page.APPLE_PAGE_SIZE];
+        try diskPreadExact(fd, page0, 0);
+        self.bytes_read += page.APPLE_PAGE_SIZE;
+
+        var hdr: DiskPrefixHeader = undefined;
+        @memcpy(std.mem.asBytes(&hdr), page0[0..@sizeOf(DiskPrefixHeader)]);
+
+        if (!std.mem.eql(u8, &hdr.magic, &DISK_PREFIX_MAGIC) or
+            hdr.version != DISK_PREFIX_VERSION or
+            hdr.page_size != page.APPLE_PAGE_SIZE)
+        {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        }
+        if (hdr.computeCrc32() != hdr.header_crc32) {
+            self.reloads_rejected_corrupt += 1;
+            return error.ChecksumMismatch;
+        }
+        if (hdr.amf_header_crc32 != self.state.amf_header_crc32 or
+            hdr.amf_dir_crc32 != self.state.amf_dir_crc32)
+        {
+            self.reloads_miss += 1;
+            return error.ModelMismatch;
+        }
+        if (hdr.prefix_hash != prefix_hash) {
+            self.reloads_rejected_collision += 1;
+            return null;
+        }
+        const fmt = hdr.kvFormat() orelse {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        };
+        if (fmt != expected_format or hdr.quant_profile_tag != expected_quant_profile) {
+            self.reloads_miss += 1;
+            return error.FormatMismatch;
+        }
+        if (hdr.token_count != expected_tokens.len) {
+            self.reloads_rejected_collision += 1;
+            return null;
+        }
+
+        // Validate aligned section geometry.
+        const tok_raw_bytes: u64 = @as(u64, hdr.token_count) * @sizeOf(u32);
+        const expected_tok_blob: u64 = try page.alignUp(@intCast(tok_raw_bytes));
+        const expected_kv_blob: u64 = if (hdr.kv_data_bytes > 0) try page.alignUp(@intCast(hdr.kv_data_bytes)) else 0;
+        const expected_gdn_blob: u64 = if (hdr.has_gdn_snapshot != 0 and hdr.gdn_state_bytes > 0)
+            try page.alignUp(@intCast(hdr.gdn_state_bytes))
+        else
+            0;
+        if (hdr.tokens_offset != page.APPLE_PAGE_SIZE or
+            hdr.tokens_blob_bytes != expected_tok_blob or
+            hdr.kv_offset != hdr.tokens_offset + hdr.tokens_blob_bytes or
+            hdr.kv_blob_bytes != expected_kv_blob or
+            (hdr.has_gdn_snapshot != 0 and hdr.gdn_offset != hdr.kv_offset + hdr.kv_blob_bytes) or
+            hdr.gdn_blob_bytes != expected_gdn_blob or
+            page.APPLE_PAGE_SIZE + hdr.tokens_blob_bytes + hdr.kv_blob_bytes + hdr.gdn_blob_bytes != file_size)
+        {
+            self.reloads_rejected_corrupt += 1;
+            return error.CorruptHeader;
+        }
+
+        if (hdr.kv_data_bytes > kv_dst.len) return error.BufferTooSmall;
+        if (hdr.has_gdn_snapshot != 0 and hdr.gdn_state_bytes > 0) {
+            const gd = gdn_dst orelse return error.BufferTooSmall;
+            if (hdr.gdn_state_bytes > gd.len) return error.BufferTooSmall;
+        }
+
+        // 2. Read full token slice blob, verify CRC32, and verify exact token equality.
+        const tok_blob_usize: usize = @intCast(hdr.tokens_blob_bytes);
+        if (tok_blob_usize > self.reload_scratch.len) return error.BufferTooSmall;
+        const tok_buf = self.reload_scratch[0..tok_blob_usize];
+        try diskPreadExact(fd, tok_buf, hdr.tokens_offset);
+        self.bytes_read += tok_blob_usize;
+
+        if (std.hash.Crc32.hash(tok_buf) != hdr.tokens_crc32) {
+            self.reloads_rejected_corrupt += 1;
+            return error.ChecksumMismatch;
+        }
+        const stored_tokens: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, tok_buf[0..@intCast(tok_raw_bytes)]));
+        if (!std.mem.eql(u32, stored_tokens, expected_tokens)) {
+            self.reloads_rejected_collision += 1;
+            return null;
+        }
+
+        // 3. Stream compressed KV tiles (`q8` or `FP4`) via F_NOCACHE pread and verify CRC32.
+        const kv_len: usize = @intCast(hdr.kv_data_bytes);
+        if (hdr.kv_blob_bytes > 0) {
+            const kv_crc = try self.streamSectionFromDisk(fd, hdr.kv_offset, hdr.kv_blob_bytes, kv_dst[0..kv_len]);
+            if (kv_crc != hdr.kv_crc32) {
+                self.reloads_rejected_corrupt += 1;
+                return error.ChecksumMismatch;
+            }
+        }
+
+        // 4. Stream optional GDN recurrent state snapshot and verify CRC32.
+        var gdn_len: usize = 0;
+        if (hdr.has_gdn_snapshot != 0 and hdr.gdn_blob_bytes > 0) {
+            gdn_len = @intCast(hdr.gdn_state_bytes);
+            const gdn_crc = try self.streamSectionFromDisk(fd, hdr.gdn_offset, hdr.gdn_blob_bytes, gdn_dst.?[0..gdn_len]);
+            if (gdn_crc != hdr.gdn_crc32) {
+                self.reloads_rejected_corrupt += 1;
+                return error.ChecksumMismatch;
+            }
+        }
+
+        self.reloads_hit += 1;
+        return .{
+            .header = hdr,
+            .kv_bytes_loaded = kv_len,
+            .gdn_bytes_loaded = gdn_len,
+            .has_gdn_snapshot = hdr.has_gdn_snapshot != 0,
+        };
+    }
+
+    /// Counts persisted `.amkvc` artifacts in `cache_dir` matching this model's
+    /// `.amf` header + directory CRC pair (used on cold restart).
+    pub fn countModelArtifacts(self: *const DiskPrefixCache) DiskPrefixError!u32 {
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_slice = self.state.cacheDirSlice();
+        @memcpy(dir_buf[0..dir_slice.len], dir_slice);
+        dir_buf[dir_slice.len] = 0;
+        const dp = std.c.opendir(dir_buf[0..dir_slice.len :0].ptr) orelse return error.DirectoryFailed;
+        defer _ = std.c.closedir(dp);
+
+        var prefix_buf: [32]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "pc_{x:0>8}_{x:0>8}_", .{
+            self.state.amf_header_crc32,
+            self.state.amf_dir_crc32,
+        }) catch return error.PathTooLong;
+
+        var count: u32 = 0;
+        while (std.c.readdir(dp)) |ent| {
+            const name = ent.name[0..ent.namlen];
+            if (std.mem.startsWith(u8, name, prefix) and std.mem.endsWith(u8, name, ".amkvc")) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn validatePayload(self: *const DiskPrefixCache, payload: DiskSpillPayload) DiskPrefixError!void {
+        if (payload.tokens.len == 0 or payload.tokens.len > self.max_tokens) return error.PayloadTooLarge;
+        const expected_kv = std.math.mul(usize, payload.num_kv_layers, payload.kv_bytes_per_layer) catch return error.PayloadTooLarge;
+        if (payload.kv_bytes.len != expected_kv) return error.InvalidConfig;
+        if (payload.kv_bytes.len > self.max_kv_bytes) return error.PayloadTooLarge;
+        if (payload.gdn_bytes) |gb| {
+            if (gb.len > self.max_gdn_bytes) return error.PayloadTooLarge;
+        }
+    }
+
+    fn streamSectionFromDisk(
+        self: *DiskPrefixCache,
+        fd: std.c.fd_t,
+        file_offset: u64,
+        blob_bytes: u64,
+        dst: []u8,
+    ) DiskPrefixError!u32 {
+        var hasher = std.hash.Crc32.init();
+        var done: u64 = 0;
+        while (done < blob_bytes) {
+            const take: usize = @intCast(@min(blob_bytes - done, @as(u64, self.reload_scratch.len)));
+            const chunk = self.reload_scratch[0..take];
+            try diskPreadExact(fd, chunk, file_offset + done);
+            self.bytes_read += take;
+            hasher.update(chunk);
+            if (done < dst.len) {
+                const copy_n: usize = @min(dst.len - @as(usize, @intCast(done)), take);
+                @memcpy(dst[@intCast(done) .. @as(usize, @intCast(done)) + copy_n], chunk[0..copy_n]);
+            }
+            done += take;
+        }
+        return hasher.final();
+    }
+
+    fn packArtifactIntoBuffer(
+        amf_header_crc32: u32,
+        amf_dir_crc32: u32,
+        payload: DiskSpillPayload,
+        buf: []align(page.APPLE_PAGE_SIZE) u8,
+    ) DiskPrefixError!usize {
+        const tok_raw_bytes = std.math.mul(usize, payload.tokens.len, @sizeOf(u32)) catch return error.PayloadTooLarge;
+        const tok_blob_bytes = try page.alignUp(tok_raw_bytes);
+        const kv_blob_bytes = if (payload.kv_bytes.len > 0) try page.alignUp(payload.kv_bytes.len) else 0;
+        const gdn_slice = payload.gdn_bytes orelse &.{};
+        const has_gdn: u8 = if (gdn_slice.len > 0) 1 else 0;
+        const gdn_blob_bytes = if (gdn_slice.len > 0) try page.alignUp(gdn_slice.len) else 0;
+
+        const tokens_offset: usize = page.APPLE_PAGE_SIZE;
+        const kv_offset: usize = tokens_offset + tok_blob_bytes;
+        const gdn_offset: usize = if (has_gdn != 0) kv_offset + kv_blob_bytes else 0;
+        const total_bytes: usize = kv_offset + kv_blob_bytes + gdn_blob_bytes;
+        if (total_bytes > buf.len) return error.PayloadTooLarge;
+
+        @memset(buf[0..total_bytes], 0);
+
+        @memcpy(buf[tokens_offset .. tokens_offset + tok_raw_bytes], std.mem.sliceAsBytes(payload.tokens));
+        const tok_crc = std.hash.Crc32.hash(buf[tokens_offset .. tokens_offset + tok_blob_bytes]);
+
+        var kv_crc: u32 = 0;
+        if (kv_blob_bytes > 0) {
+            @memcpy(buf[kv_offset .. kv_offset + payload.kv_bytes.len], payload.kv_bytes);
+            kv_crc = std.hash.Crc32.hash(buf[kv_offset .. kv_offset + kv_blob_bytes]);
+        }
+
+        var gdn_crc: u32 = 0;
+        if (gdn_blob_bytes > 0) {
+            @memcpy(buf[gdn_offset .. gdn_offset + gdn_slice.len], gdn_slice);
+            gdn_crc = std.hash.Crc32.hash(buf[gdn_offset .. gdn_offset + gdn_blob_bytes]);
+        }
+
+        var hdr: DiskPrefixHeader = .{
+            .magic = DISK_PREFIX_MAGIC,
+            .version = DISK_PREFIX_VERSION,
+            .page_size = page.APPLE_PAGE_SIZE,
+            .amf_header_crc32 = amf_header_crc32,
+            .amf_dir_crc32 = amf_dir_crc32,
+            .prefix_hash = payload.prefix_hash,
+            .parent_hash = payload.parent_hash,
+            .token_count = @intCast(payload.tokens.len),
+            .num_kv_layers = payload.num_kv_layers,
+            .kv_format = @backingInt(payload.kv_format),
+            .has_gdn_snapshot = has_gdn,
+            .quant_profile_tag = payload.quant_profile_tag,
+            .kv_bytes_per_layer = payload.kv_bytes_per_layer,
+            .tokens_offset = tokens_offset,
+            .tokens_blob_bytes = tok_blob_bytes,
+            .kv_offset = kv_offset,
+            .kv_data_bytes = payload.kv_bytes.len,
+            .kv_blob_bytes = kv_blob_bytes,
+            .gdn_offset = gdn_offset,
+            .gdn_state_bytes = gdn_slice.len,
+            .gdn_blob_bytes = gdn_blob_bytes,
+            .tokens_crc32 = tok_crc,
+            .kv_crc32 = kv_crc,
+            .gdn_crc32 = gdn_crc,
+            .header_crc32 = 0,
+            .reserved = 0,
+        };
+        hdr.header_crc32 = hdr.computeCrc32();
+        @memcpy(buf[0..@sizeOf(DiskPrefixHeader)], std.mem.asBytes(&hdr));
+        return total_bytes;
+    }
+
+    fn writeArtifactAtomic(st: *SharedState, prefix_hash: u64, data: []const u8) DiskPrefixError!void {
+        std.debug.assert((data.len % page.APPLE_PAGE_SIZE) == 0);
+        var final_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const final_z = try formatArtifactPath(
+            st.cacheDirSlice(),
+            st.amf_header_crc32,
+            st.amf_dir_crc32,
+            prefix_hash,
+            &final_buf,
+        );
+
+        const seq = st.temp_seq.fetchAdd(1, .monotonic);
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp_raw = std.fmt.bufPrint(tmp_buf[0 .. tmp_buf.len - 1], "{s}.tmp.{d}", .{
+            final_z,
+            seq,
+        }) catch return error.PathTooLong;
+        tmp_buf[tmp_raw.len] = 0;
+        const tmp_z: [:0]const u8 = tmp_buf[0..tmp_raw.len :0];
+
+        const fd = std.c.open(
+            tmp_z.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            @as(std.c.mode_t, 0o644),
+        );
+        if (fd < 0) return error.OpenFailed;
+        var closed = false;
+        errdefer {
+            if (!closed) _ = std.c.close(fd);
+            _ = std.c.unlink(tmp_z.ptr);
+        }
+
+        if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0) return error.FcntlFailed;
+
+        var written: usize = 0;
+        while (written < data.len) {
+            st.waitWhileColdReadsActive();
+            const take = @min(st.write_chunk_bytes, data.len - written);
+            try diskPwriteExact(fd, data[written .. written + take], written);
+            written += take;
+            _ = st.bytes_written.fetchAdd(take, .monotonic);
+        }
+        st.waitWhileColdReadsActive();
+        if (std.c.fsync(fd) != 0) return error.WriteFailed;
+        _ = std.c.close(fd);
+        closed = true;
+
+        if (std.c.rename(tmp_z.ptr, final_z.ptr) != 0) return error.RenameFailed;
+    }
+
+    fn workerMain(st: *SharedState) void {
+        var init_err: ?qos.Error = null;
+        if (qos.setCurrentThreadQos(st.worker_qos, 0)) {
+            if (qos.setThreadDiskIoPolicy(st.worker_io_policy)) {} else |err| {
+                init_err = err;
+            }
+        } else |err| {
+            init_err = err;
+        }
+
+        _ = std.c.pthread_mutex_lock(&st.mutex);
+        st.worker_init_err = init_err;
+        st.worker_ready.store(true, .release);
+        _ = std.c.pthread_cond_signal(&st.init_cond);
+        _ = std.c.pthread_mutex_unlock(&st.mutex);
+        if (init_err != null) return;
+
+        while (true) {
+            _ = std.c.pthread_mutex_lock(&st.mutex);
+            while (st.q_count == 0 and !st.shutdown.load(.acquire)) {
+                _ = std.c.pthread_cond_wait(&st.work_cond, &st.mutex);
+            }
+            if (st.q_count == 0 and st.shutdown.load(.acquire)) {
+                _ = std.c.pthread_mutex_unlock(&st.mutex);
+                return;
+            }
+            const slot_idx: usize = st.queue[st.q_head];
+            st.q_head = (st.q_head + 1) % MAX_STAGING_SLOTS;
+            st.q_count -= 1;
+            st.in_flight_writes += 1;
+            const total_bytes = st.slots[slot_idx].total_bytes;
+            const prefix_hash = st.slots[slot_idx].prefix_hash;
+            _ = std.c.pthread_mutex_unlock(&st.mutex);
+
+            if (writeArtifactAtomic(st, prefix_hash, st.slots[slot_idx].buf[0..total_bytes])) {
+                _ = st.spills_completed.fetchAdd(1, .monotonic);
+            } else |_| {
+                _ = st.spills_failed.fetchAdd(1, .monotonic);
+            }
+
+            _ = std.c.pthread_mutex_lock(&st.mutex);
+            st.slots[slot_idx].in_queue = false;
+            st.in_flight_writes -= 1;
+            if (st.q_count == 0 and st.in_flight_writes == 0) {
+                _ = std.c.pthread_cond_broadcast(&st.done_cond);
+            }
+            _ = std.c.pthread_mutex_unlock(&st.mutex);
+        }
+    }
+
+    fn formatArtifactPath(
+        cache_dir: []const u8,
+        amf_header_crc32: u32,
+        amf_dir_crc32: u32,
+        prefix_hash: u64,
+        buf: *[std.fs.max_path_bytes]u8,
+    ) DiskPrefixError![:0]const u8 {
+        const sep = if (std.mem.endsWith(u8, cache_dir, "/")) "" else "/";
+        const raw = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}{s}pc_{x:0>8}_{x:0>8}_{x:0>16}.amkvc", .{
+            cache_dir,
+            sep,
+            amf_header_crc32,
+            amf_dir_crc32,
+            prefix_hash,
+        }) catch return error.PathTooLong;
+        buf[raw.len] = 0;
+        return buf[0..raw.len :0];
+    }
+
+    fn ensureDirExists(dir_path: []const u8) DiskPrefixError!void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (dir_path.len == 0 or dir_path.len >= buf.len) return error.PathTooLong;
+        var i: usize = 1;
+        while (i <= dir_path.len) : (i += 1) {
+            if (i < dir_path.len and dir_path[i] != '/') continue;
+            @memcpy(buf[0..i], dir_path[0..i]);
+            buf[i] = 0;
+            const rc = std.c.mkdir(buf[0..i :0].ptr, 0o755);
+            if (rc != 0) {
+                const err = std.c.errno(rc);
+                if (err != .EXIST) return error.DirectoryFailed;
+            }
+        }
+    }
+
+    fn diskPreadExact(fd: std.c.fd_t, dst: []u8, offset: u64) DiskPrefixError!void {
+        var done: usize = 0;
+        while (done < dst.len) {
+            const rc = std.c.pread(fd, dst.ptr + done, dst.len - done, @intCast(offset + done));
+            if (rc < 0) {
+                const err = std.c.errno(rc);
+                if (err == .INTR) continue;
+                return error.ReadFailed;
+            }
+            if (rc == 0) return error.ShortRead;
+            done += @intCast(rc);
+        }
+    }
+
+    fn diskPwriteExact(fd: std.c.fd_t, src: []const u8, offset: u64) DiskPrefixError!void {
+        var done: usize = 0;
+        while (done < src.len) {
+            const rc = std.c.pwrite(fd, src.ptr + done, src.len - done, @intCast(offset + done));
+            if (rc < 0) {
+                const err = std.c.errno(rc);
+                if (err == .INTR) continue;
+                return error.WriteFailed;
+            }
+            if (rc == 0) return error.WriteFailed;
+            done += @intCast(rc);
+        }
+    }
+};
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -2147,4 +3091,167 @@ test "C15 PrefixCache evict_first priority and intra-tile ChatML message-boundar
     try std.testing.expect(promo2.already_existed);
     try std.testing.expectEqual(promo.entry_id, promo2.entry_id);
     try std.testing.expect(!(try cache.entryInfo(promo.entry_id)).evict_first);
+}
+
+test "R10 DiskPrefixCache spills/reloads q8 + FP4 KV tiles and GDN snapshots across cold restart with 0 collision risk" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}/disk_pc", .{tmp.sub_path});
+
+    const amf_hdr_crc: u32 = 0x1A2B_3C4D;
+    const amf_dir_crc: u32 = 0x5E6F_7788;
+    var tokens: [32]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(1000 + i * 7);
+    const p_hash = hashPrefix(&tokens, 16);
+
+    const num_layers: u32 = 2;
+    const kv_per_layer: u32 = 4096;
+    const kv_total = num_layers * kv_per_layer;
+    const gdn_total: usize = 2048;
+
+    const kv_q8_src = try gpa.alloc(u8, kv_total);
+    defer gpa.free(kv_q8_src);
+    for (kv_q8_src, 0..) |*b, i| b.* = @truncate((i * 31 + 17) & 0xFF);
+
+    const gdn_src = try gpa.alloc(u8, gdn_total);
+    defer gpa.free(gdn_src);
+    for (gdn_src, 0..) |*b, i| b.* = @truncate((i * 13 + 5) & 0xFF);
+
+    // 1. Spill q8 KV tiles + GDN snapshot asynchronously, exercising cooperative yield to cold reads!
+    {
+        var disk = try DiskPrefixCache.init(gpa, .{
+            .cache_dir = cache_dir,
+            .amf_header_crc32 = amf_hdr_crc,
+            .amf_dir_crc32 = amf_dir_crc,
+            .max_tokens_per_artifact = 64,
+            .max_kv_bytes_per_artifact = kv_total,
+            .max_gdn_bytes_per_artifact = gdn_total,
+            .max_pending_spills = 4,
+            .write_chunk_bytes = page.APPLE_PAGE_SIZE,
+            .enable_async_worker = true,
+        });
+        defer disk.deinit(gpa);
+
+        // Hold a decode-critical cold-expert read while enqueuing the spill so the worker yields.
+        disk.enterDecodeCriticalRead();
+        const queued = try disk.spillAsync(.{
+            .prefix_hash = p_hash,
+            .tokens = &tokens,
+            .num_kv_layers = num_layers,
+            .kv_format = .retired_q8,
+            .quant_profile_tag = 0x0840,
+            .kv_bytes_per_layer = kv_per_layer,
+            .kv_bytes = kv_q8_src,
+            .gdn_bytes = gdn_src,
+        });
+        try std.testing.expect(queued);
+        var wait_ts: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&wait_ts, null);
+        // Must not have finished while decode-critical read was active!
+        try std.testing.expectEqual(@as(u64, 0), disk.stats().spills_completed);
+        try std.testing.expect(disk.stats().io_yields_for_cold_reads >= 1);
+
+        disk.exitDecodeCriticalRead();
+        disk.flush();
+
+        const st = disk.stats();
+        try std.testing.expectEqual(@as(u64, 1), st.spills_completed);
+        try std.testing.expectEqual(@as(u64, 0), st.spills_failed);
+        try std.testing.expectEqual(@as(u32, 1), try disk.countModelArtifacts());
+
+        // Also spill an R7 MLA FP4 artifact under a different prefix hash.
+        var fp4_tokens = tokens;
+        fp4_tokens[31] = 99999;
+        const fp4_hash = hashPrefix(&fp4_tokens, 16);
+        try disk.spillSync(.{
+            .prefix_hash = fp4_hash,
+            .tokens = &fp4_tokens,
+            .num_kv_layers = num_layers,
+            .kv_format = .mla_fp4,
+            .quant_profile_tag = 0x0410,
+            .kv_bytes_per_layer = kv_per_layer,
+            .kv_bytes = kv_q8_src,
+            .gdn_bytes = null,
+        });
+        try std.testing.expectEqual(@as(u32, 2), try disk.countModelArtifacts());
+    }
+
+    // 2. Cold restart: brand-new DiskPrefixCache instance reloads exact q8 + GDN and FP4 bytes.
+    {
+        var cold_disk = try DiskPrefixCache.init(gpa, .{
+            .cache_dir = cache_dir,
+            .amf_header_crc32 = amf_hdr_crc,
+            .amf_dir_crc32 = amf_dir_crc,
+            .max_tokens_per_artifact = 64,
+            .max_kv_bytes_per_artifact = kv_total,
+            .max_gdn_bytes_per_artifact = gdn_total,
+            .enable_async_worker = false,
+        });
+        defer cold_disk.deinit(gpa);
+
+        const kv_out = try gpa.alloc(u8, kv_total);
+        defer gpa.free(kv_out);
+        const gdn_out = try gpa.alloc(u8, gdn_total);
+        defer gpa.free(gdn_out);
+
+        const hit = (try cold_disk.reload(p_hash, &tokens, .retired_q8, 0x0840, kv_out, gdn_out)) orelse {
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(kv_total, hit.kv_bytes_loaded);
+        try std.testing.expectEqual(gdn_total, hit.gdn_bytes_loaded);
+        try std.testing.expect(hit.has_gdn_snapshot);
+        try std.testing.expectEqualSlices(u8, kv_q8_src, kv_out);
+        try std.testing.expectEqualSlices(u8, gdn_src, gdn_out);
+
+        // Reload FP4 artifact.
+        var fp4_tokens = tokens;
+        fp4_tokens[31] = 99999;
+        const fp4_hash = hashPrefix(&fp4_tokens, 16);
+        @memset(kv_out, 0);
+        const fp4_hit = (try cold_disk.reload(fp4_hash, &fp4_tokens, .mla_fp4, 0x0410, kv_out, null)) orelse {
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(kv_total, fp4_hit.kv_bytes_loaded);
+        try std.testing.expect(!fp4_hit.has_gdn_snapshot);
+        try std.testing.expectEqualSlices(u8, kv_q8_src, kv_out);
+
+        // 3. Simulated hash collision: SAME prefix_hash, 1 mutated token -> MUST reject with null!
+        var colliding_tokens = tokens;
+        colliding_tokens[12] ^= 1;
+        const coll = try cold_disk.reload(p_hash, &colliding_tokens, .retired_q8, 0x0840, kv_out, gdn_out);
+        try std.testing.expect(coll == null);
+        try std.testing.expectEqual(@as(u64, 1), cold_disk.stats().reloads_rejected_collision);
+
+        // 4. Quantization profile / format mismatch is rejected cleanly.
+        try std.testing.expectError(
+            error.FormatMismatch,
+            cold_disk.reload(p_hash, &tokens, .mla_fp4, 0x0840, kv_out, gdn_out),
+        );
+        try std.testing.expectError(
+            error.FormatMismatch,
+            cold_disk.reload(p_hash, &tokens, .retired_q8, 0x9999, kv_out, gdn_out),
+        );
+    }
+
+    // 5. Cross-model isolation: different `.amf` CRC never hits another model's persisted prefixes.
+    {
+        var other_model = try DiskPrefixCache.init(gpa, .{
+            .cache_dir = cache_dir,
+            .amf_header_crc32 = amf_hdr_crc ^ 1,
+            .amf_dir_crc32 = amf_dir_crc,
+            .max_tokens_per_artifact = 64,
+            .max_kv_bytes_per_artifact = kv_total,
+            .max_gdn_bytes_per_artifact = gdn_total,
+            .enable_async_worker = false,
+        });
+        defer other_model.deinit(gpa);
+        const kv_out = try gpa.alloc(u8, kv_total);
+        defer gpa.free(kv_out);
+        const miss = try other_model.reload(p_hash, &tokens, .retired_q8, 0x0840, kv_out, null);
+        try std.testing.expect(miss == null);
+        try std.testing.expectEqual(@as(u32, 0), try other_model.countModelArtifacts());
+    }
 }

@@ -33,6 +33,8 @@ const accept_mod = @import("../spec/accept.zig");
 const rng_mod = @import("../runtime/rng.zig");
 const prefix_cache_mod = @import("../mem/prefix_cache.zig");
 const batch_sched = @import("../runtime/batch_scheduler.zig");
+pub const lora = @import("lora.zig");
+pub const embed_rerank = @import("embed_rerank.zig");
 
 /// Execution backend selection for D7 speculative MoE tree router prediction (`C13`, `ADR-0018`).
 pub const SmeRouterMode = enum {
@@ -1026,6 +1028,16 @@ pub const Qwen3Model = struct {
     aliased_scratch_saved_bytes: usize,
     wp_token_ids_host: []u32,
     wp_token_ids_bind: metal.BufferBinding,
+    wp_x_host: []f16,
+    wp_x_norm_host: []f16,
+    wp_q_host: []f16,
+    wp_k_host: []f16,
+    wp_v_host: []f16,
+    wp_attn_out_host: []f16,
+    wp_proj_out_host: []f16,
+    wp_dense_gate_host: []f16,
+    wp_dense_up_host: []f16,
+    wp_dense_act_host: []f16,
     wp_x_bind: metal.BufferBinding,
     wp_x_norm_bind: metal.BufferBinding,
     wp_q_bind: metal.BufferBinding,
@@ -1040,6 +1052,12 @@ pub const Qwen3Model = struct {
 
     // M6.9 Multi-Generation Apple Silicon & NAX TensorOps (`C16`, `G17`, ADR-0021)
     chip_profile: chip_profile_mod.ChipProfile,
+
+    // M7.5 Runtime Multi-LoRA (`W19`) & Final-RMSNorm Embedding Tap (`C21`)
+    lora_registry: ?*lora.LoraRegistry = null,
+    active_lora_slot: u32 = lora.NO_ADAPTER,
+    last_final_norm_hidden_rows: u32 = 0,
+    last_final_norm_uses_wide: bool = false,
 
     pub fn loadFromBytes(
         allocator: std.mem.Allocator,
@@ -1061,6 +1079,64 @@ pub const Qwen3Model = struct {
         var file = try amf.AmfFile.open(allocator, amf_path);
         defer file.close(allocator);
         return loadInternal(allocator, .{ .file = .{ .handle = &file, .path = amf_path } }, config, options);
+    }
+
+    /// Loads a `.amf` model resolving `config.json` with `W18` precedence:
+    ///   1. `explicit_config_path` (`--config` override)
+    ///   2. Embedded `__meta.config_json` inside `amf_path`
+    ///   3. Sidecar `config.json` next to `amf_path`
+    pub fn loadFromFileAutoConfig(
+        allocator: std.mem.Allocator,
+        amf_path: [:0]const u8,
+        explicit_config_path: ?[]const u8,
+        options: LoadOptions,
+    ) (LoadError || amf.ResolveMetadataError)!Qwen3Model {
+        var file = try amf.AmfFile.open(allocator, amf_path);
+        defer file.close(allocator);
+        var resolved_cfg = try amf.resolveConfigJsonAlloc(allocator, &file, amf_path, explicit_config_path);
+        defer resolved_cfg.deinit(allocator);
+        const cfg = try ModelConfig.fromJson(allocator, resolved_cfg.bytes);
+        return loadInternal(allocator, .{ .file = .{ .handle = &file, .path = amf_path } }, cfg, options);
+    }
+
+    /// Returns this model's projection geometry for initializing a `lora.LoraRegistry` (`W19`).
+    pub fn baseLoraShape(self: *const Qwen3Model) lora.BaseModelShape {
+        return .{
+            .num_layers = self.config.num_hidden_layers,
+            .hidden_size = self.config.hidden_size,
+            .q_dim = self.config.qDim(),
+            .kv_dim = self.config.kvDim(),
+            .intermediate_size = self.config.intermediate_size,
+        };
+    }
+
+    /// Attaches a non-owning preallocated `LoraRegistry` (`W19`). Detaching (`null`)
+    /// immediately restores the untouched zero-overhead base hot path.
+    pub fn attachLoraRegistry(self: *Qwen3Model, registry: ?*lora.LoraRegistry) void {
+        self.lora_registry = registry;
+        if (registry == null) self.active_lora_slot = lora.NO_ADAPTER;
+    }
+
+    pub fn setActiveLoraSlot(self: *Qwen3Model, slot_id: u32) void {
+        self.active_lora_slot = slot_id;
+    }
+
+    /// Parses `"<base>:<adapter>"` and sets the active LoRA slot (`NO_ADAPTER` for plain `"<base>"`).
+    pub fn selectModelAdapter(self: *Qwen3Model, model_selector: []const u8) lora.LoraError!void {
+        const sel = lora.parseModelSelector(model_selector);
+        if (sel.adapter == null) {
+            self.active_lora_slot = lora.NO_ADAPTER;
+            return;
+        }
+        const reg = self.lora_registry orelse return error.AdapterNotFound;
+        self.active_lora_slot = (try reg.resolveModelSelector(model_selector)) orelse lora.NO_ADAPTER;
+    }
+
+    /// Single-branch gate checked strictly OUTSIDE transformer layer loops (`0` instructions
+    /// added to the base forward pass when `active_adapters == 0`).
+    pub inline fn hasActiveLora(self: *const Qwen3Model) bool {
+        const reg = self.lora_registry orelse return false;
+        return reg.activeAdapterCount() > 0 and self.active_lora_slot != lora.NO_ADAPTER;
     }
 
     pub fn deinit(self: *Qwen3Model, allocator: std.mem.Allocator) void {
@@ -1840,6 +1916,9 @@ pub const Qwen3Model = struct {
         if (token_id >= self.config.vocab_size) return error.TokenOutOfRange;
         if (pos >= self.max_seq_len) return error.PositionOutOfRange;
         try self.retireBeforeWritePos(pos);
+        if (self.hasActiveLora()) {
+            return self.runStepWithLora(token_id, pos, skip_lm_head);
+        }
         if (self.has_sme2_weights) {
             return self.runStepHeterogeneous(token_id, pos, skip_lm_head);
         }
@@ -1987,6 +2066,206 @@ pub const Qwen3Model = struct {
 
         const sig = try frame.commit();
         try self.compute.wait(sig, self.timeout_ms);
+        self.seq_len = cur_seq_len;
+        if (!skip_lm_head) self.last_logits_row = 0;
+        return if (skip_lm_head) 0 else self.out_token_id_host.*;
+    }
+
+    /// Single-token forward pass with an active `W19` LoRA adapter (`active_adapters > 0`).
+    /// Strictly isolated from base `runStep` so `active_adapters == 0` executes zero extra
+    /// instructions inside the layer loop. Splits the Metal 4 frame only on layers/projections
+    /// targeted by the active adapter, applying `scale * (x @ A^T) @ B^T` zero-copy in shared RAM.
+    fn runStepWithLora(self: *Qwen3Model, token_id: u32, pos: u32, skip_lm_head: bool) StepError!u32 {
+        const reg = self.lora_registry.?;
+        const lora_slot = self.active_lora_slot;
+        const cur_seq_len: u32 = pos + 1;
+        const chunk_idx: usize = @intCast(pos / self.chunk_tokens);
+        const h = self.config.hidden_size;
+
+        const qkv_mask = lora.TargetProjection.q_proj.bit() |
+            lora.TargetProjection.k_proj.bit() |
+            lora.TargetProjection.v_proj.bit();
+        const o_mask = lora.TargetProjection.o_proj.bit();
+        const gate_up_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
+        const down_mask = lora.TargetProjection.down_proj.bit();
+
+        var frame_opt: ?metal.Compute.Frame = null;
+        errdefer if (frame_opt) |*f| f.abort();
+
+        {
+            const f = try self.ensureOptionalFrame(&frame_opt);
+            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+                .weight = self.embed.weight,
+                .scale_bias = self.embed.scale_bias,
+                .tokens = .{ .token_id = token_id },
+                .out = self.x_bind,
+                .m = 1,
+                .vocab_size = self.config.vocab_size,
+                .hidden_size = h,
+            }, false);
+        }
+
+        for (self.layers, 0..) |layer, l| {
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = layer.input_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.input_layernorm.dtype,
+                }, had);
+                try self.encodeLinearGemv(f, layer.q_proj, self.x_norm_bind, self.q_bind, true);
+                try self.encodeLinearGemv(f, layer.k_proj, self.x_norm_bind, self.k_bind, false);
+                try self.encodeLinearGemv(f, layer.v_proj, self.x_norm_bind, self.v_bind, false);
+            }
+
+            if (reg.slotTargetsLayerMask(lora_slot, l, qkv_mask)) {
+                try self.flushOptionalFrame(&frame_opt);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .q_proj, self.x_norm_host, self.q_host, 1);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .k_proj, self.x_norm_host, self.k_host, 1);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .v_proj, self.x_norm_host, self.v_host, 1);
+            }
+
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                const kv_pair = self.kvTileAt(l, chunk_idx);
+                try self.attn_pipes.encodeQkNormRopeKvWrite(f, .{
+                    .q = self.q_bind,
+                    .k = self.k_bind,
+                    .v = self.v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .k_tile = kv_pair.k,
+                    .v_tile = kv_pair.v,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .pos = pos,
+                    .chunk_tokens = self.chunk_tokens,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, had);
+                try self.encodeLayerGqaDecode(f, l, cur_seq_len, true);
+                try self.encodeLinearGemv(f, layer.o_proj, self.attn_out_bind, self.proj_out_bind, true);
+            }
+
+            if (reg.slotTargetsLayerMask(lora_slot, l, o_mask)) {
+                try self.flushOptionalFrame(&frame_opt);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .o_proj, self.attn_out_host, self.proj_out_host, 1);
+            }
+
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.moe_pipes.encodeResidualAdd(f, .{
+                    .x = self.x_bind,
+                    .delta = self.proj_out_bind,
+                    .count = h,
+                }, had);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = 1,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
+                }, true);
+            }
+
+            switch (self.config.arch) {
+                .qwen3_moe => {
+                    const f = try self.ensureOptionalFrame(&frame_opt);
+                    const ws = &(self.moe_ws.?);
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = self.x_norm_bind,
+                        .router = layer.router,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = ws,
+                        .workspace_buf = self.scratch_buf,
+                        .residual = self.x_bind,
+                        .out = self.x_bind,
+                        .m = 1,
+                        .num_experts = self.config.num_experts,
+                        .top_k = self.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = self.config.moe_intermediate_size,
+                        .norm_topk_prob = self.config.norm_topk_prob,
+                    };
+                    try self.encodeMoELayerDispatch(f, layer, moe_args, true);
+                },
+                .qwen3_dense => {
+                    {
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.encodeLinearGemv(f, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, true);
+                        try self.encodeLinearGemv(f, layer.dense_up, self.x_norm_bind, self.dense_up_bind, false);
+                    }
+                    if (reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask)) {
+                        try self.flushOptionalFrame(&frame_opt);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .gate_proj, self.x_norm_host, self.dense_gate_host, 1);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .up_proj, self.x_norm_host, self.dense_up_host, 1);
+                    }
+                    {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.moe_pipes.encodeSiluMul(f, .{
+                            .gate = self.dense_gate_bind,
+                            .up = self.dense_up_bind,
+                            .out = self.dense_act_bind,
+                            .count = self.config.intermediate_size,
+                        }, had);
+                        try self.encodeLinearGemv(f, layer.dense_down, self.dense_act_bind, self.proj_out_bind, true);
+                    }
+                    if (reg.slotTargetsLayerMask(lora_slot, l, down_mask)) {
+                        try self.flushOptionalFrame(&frame_opt);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .down_proj, self.dense_act_host, self.proj_out_host, 1);
+                    }
+                    {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.moe_pipes.encodeResidualAdd(f, .{
+                            .x = self.x_bind,
+                            .delta = self.proj_out_bind,
+                            .count = h,
+                        }, had);
+                    }
+                },
+            }
+
+            {
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.encodeAuxTapIfMatched(f, l, 1);
+            }
+        }
+
+        if (!skip_lm_head) {
+            const had = (frame_opt != null);
+            const f = try self.ensureOptionalFrame(&frame_opt);
+            try self.attn_pipes.encodeRmsNorm(f, .{
+                .x = self.x_bind,
+                .w = self.final_norm.binding,
+                .y = self.x_norm_bind,
+                .num_rows = 1,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = self.final_norm.dtype,
+            }, had);
+            try self.encodeLinearGemv(f, self.lm_head, self.x_norm_bind, self.logits_bind, true);
+            try self.moe_pipes.encodeArgmax(f, .{
+                .logits = self.logits_bind,
+                .out_token_id = self.out_token_id_bind,
+                .vocab_size = self.config.vocab_size,
+            }, true);
+        }
+
+        try self.flushOptionalFrame(&frame_opt);
         self.seq_len = cur_seq_len;
         if (!skip_lm_head) self.last_logits_row = 0;
         return if (skip_lm_head) 0 else self.out_token_id_host.*;
@@ -2322,6 +2601,10 @@ pub const Qwen3Model = struct {
             if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
         }
         try self.retireBeforeCommitRange(start_pos, m);
+
+        if (self.hasActiveLora()) {
+            return self.prefillWideChunkWithLora(tokens, start_pos, is_final_chunk, compute_logits, preserve_all_top_hidden);
+        }
 
         @memcpy(self.wp_token_ids_host[0..m], tokens);
         const h = self.config.hidden_size;
@@ -2712,6 +2995,467 @@ pub const Qwen3Model = struct {
             return self.out_token_ids_host[self.last_logits_row];
         }
         return 0;
+    }
+
+    /// Wide GPU prefill path when a `W19` LoRA adapter is active (`active_adapters > 0`).
+    /// Strictly bypassed outside the layer loop when no adapter is active.
+    fn prefillWideChunkWithLora(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        start_pos: u32,
+        is_final_chunk: bool,
+        compute_logits: bool,
+        preserve_all_top_hidden: bool,
+    ) StepError!u32 {
+        const reg = self.lora_registry.?;
+        const lora_slot = self.active_lora_slot;
+        const m: u32 = @intCast(tokens.len);
+        const m_usize: usize = tokens.len;
+        @memcpy(self.wp_token_ids_host[0..m], tokens);
+        const h = self.config.hidden_size;
+        const qkv_mask = lora.TargetProjection.q_proj.bit() |
+            lora.TargetProjection.k_proj.bit() |
+            lora.TargetProjection.v_proj.bit();
+        const o_mask = lora.TargetProjection.o_proj.bit();
+        const gate_up_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
+        const down_mask = lora.TargetProjection.down_proj.bit();
+
+        const has_retired = (self.retired_kv_pool != null and self.num_retired_chunks > 0);
+        const rpool_bind: ?metal.BufferBinding = if (has_retired) self.retired_kv_pool.?.binding(self.scratch_buf) else null;
+        const ret_plane_stride: u32 = if (has_retired) self.retired_kv_pool.?.plane_stride_bytes else 0;
+        const ret_chunk_stride: u32 = if (has_retired) self.retired_kv_pool.?.chunk_stride_bytes else 0;
+        const kv_len_after: u32 = start_pos + m;
+
+        var frame_opt: ?metal.Compute.Frame = null;
+        errdefer if (frame_opt) |*f| f.abort();
+
+        {
+            const f = try self.ensureOptionalFrame(&frame_opt);
+            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+                .weight = self.embed.weight,
+                .scale_bias = self.embed.scale_bias,
+                .tokens = .{ .token_ids = self.wp_token_ids_bind },
+                .out = self.wp_x_bind,
+                .m = m,
+                .vocab_size = self.config.vocab_size,
+                .hidden_size = h,
+            }, false);
+        }
+
+        for (self.layers, 0..) |layer, l| {
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.wp_x_bind,
+                    .w = layer.input_layernorm.binding,
+                    .y = self.wp_x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.input_layernorm.dtype,
+                }, had);
+                try self.encodeLinearGemmWithTile(f, layer.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
+                try self.encodeLinearGemmWithTile(f, layer.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
+                try self.encodeLinearGemmWithTile(f, layer.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+            }
+            if (reg.slotTargetsLayerMask(lora_slot, l, qkv_mask)) {
+                try self.flushOptionalFrame(&frame_opt);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .q_proj, self.wp_x_norm_host, self.wp_q_host, m_usize);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .k_proj, self.wp_x_norm_host, self.wp_k_host, m_usize);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .v_proj, self.wp_x_norm_host, self.wp_v_host, m_usize);
+            }
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.attn_pipes.encodePrefillQkNormRopeKvWrite(f, .{
+                    .q = self.wp_q_bind,
+                    .k = self.wp_k_bind,
+                    .v = self.wp_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .num_tokens = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .start_pos = start_pos,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = self.num_retired_chunks,
+                    .kv_only = false,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, had);
+                try self.attn_pipes.encodeGqaCausalPrefillFlashAttn(f, .{
+                    .q = self.wp_q_bind,
+                    .kv_tiles = layer.kv_tiles_binding,
+                    .retired_pool = rpool_bind,
+                    .retired_chunk_ids = if (has_retired) layer.retired_ids_binding else null,
+                    .out = self.wp_attn_out_bind,
+                    .num_q = m,
+                    .q_start_pos = start_pos,
+                    .kv_len = kv_len_after,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .chunk_tokens = self.chunk_tokens,
+                    .num_retired_chunks = if (has_retired) self.num_retired_chunks else 0,
+                    .retired_plane_stride_bytes = ret_plane_stride,
+                    .retired_chunk_stride_bytes = ret_chunk_stride,
+                }, true);
+                try self.encodeLinearGemmWithTile(f, layer.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, m, true, true);
+            }
+            if (reg.slotTargetsLayerMask(lora_slot, l, o_mask)) {
+                try self.flushOptionalFrame(&frame_opt);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .o_proj, self.wp_attn_out_host, self.wp_proj_out_host, m_usize);
+            }
+            {
+                const had = (frame_opt != null);
+                const f = try self.ensureOptionalFrame(&frame_opt);
+                try self.moe_pipes.encodeResidualAdd(f, .{
+                    .x = self.wp_x_bind,
+                    .delta = self.wp_proj_out_bind,
+                    .count = m * h,
+                }, had);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.wp_x_bind,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = self.wp_x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
+                }, true);
+            }
+            switch (self.config.arch) {
+                .qwen3_moe => {
+                    const f = try self.ensureOptionalFrame(&frame_opt);
+                    const ws_ptr = &(self.wp_moe_ws.?);
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = self.wp_x_norm_bind,
+                        .router = layer.router,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = ws_ptr,
+                        .workspace_buf = self.scratch_buf,
+                        .residual = self.wp_x_bind,
+                        .out = self.wp_x_bind,
+                        .m = m,
+                        .num_experts = self.config.num_experts,
+                        .top_k = self.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = self.config.moe_intermediate_size,
+                        .norm_topk_prob = self.config.norm_topk_prob,
+                    };
+                    try self.encodeMoELayerDispatch(f, layer, moe_args, true);
+                },
+                .qwen3_dense => {
+                    {
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.encodeLinearGemmWithTile(f, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, m, true, true);
+                        try self.encodeLinearGemmWithTile(f, layer.dense_up, self.wp_x_norm_bind, self.wp_dense_up_bind, m, true, false);
+                    }
+                    if (reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask)) {
+                        try self.flushOptionalFrame(&frame_opt);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .gate_proj, self.wp_x_norm_host, self.wp_dense_gate_host, m_usize);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .up_proj, self.wp_x_norm_host, self.wp_dense_up_host, m_usize);
+                    }
+                    {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.moe_pipes.encodeSiluMul(f, .{
+                            .gate = self.wp_dense_gate_bind,
+                            .up = self.wp_dense_up_bind,
+                            .out = self.wp_dense_act_bind,
+                            .count = m * self.config.intermediate_size,
+                        }, had);
+                        try self.encodeLinearGemmWithTile(f, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, m, true, true);
+                    }
+                    if (reg.slotTargetsLayerMask(lora_slot, l, down_mask)) {
+                        try self.flushOptionalFrame(&frame_opt);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .down_proj, self.wp_dense_act_host, self.wp_proj_out_host, m_usize);
+                    }
+                    {
+                        const had = (frame_opt != null);
+                        const f = try self.ensureOptionalFrame(&frame_opt);
+                        try self.moe_pipes.encodeResidualAdd(f, .{
+                            .x = self.wp_x_bind,
+                            .delta = self.wp_proj_out_bind,
+                            .count = m * h,
+                        }, had);
+                    }
+                },
+            }
+        }
+
+        if (self.enable_feature_taps and preserve_all_top_hidden) {
+            const had = (frame_opt != null);
+            const f = try self.ensureOptionalFrame(&frame_opt);
+            try self.moe_pipes.encodeCopyStrided(f, .{
+                .src = self.wp_x_bind,
+                .dst = self.accepted_top_bind,
+                .num_rows = m,
+                .copy_cols = h,
+                .src_stride = h,
+                .dst_stride = h,
+            }, had);
+        }
+
+        var logits_rows_computed: u32 = 0;
+        if (compute_logits and (is_final_chunk or self.compute_all_logits)) {
+            const had = (frame_opt != null);
+            const f = try self.ensureOptionalFrame(&frame_opt);
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = self.scratch_buf,
+                .offset = self.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            try self.attn_pipes.encodeRmsNorm(f, .{
+                .x = last_x_bind,
+                .w = self.final_norm.binding,
+                .y = self.wp_x_norm_bind,
+                .num_rows = 1,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = self.final_norm.dtype,
+            }, had);
+            try self.encodeLinearGemv(f, self.lm_head, self.wp_x_norm_bind, self.logits_bind, true);
+            try self.moe_pipes.encodeArgmaxRows(f, .{
+                .logits = self.logits_bind,
+                .out_token_ids = self.out_token_id_bind,
+                .num_rows = 1,
+                .vocab_size = self.config.vocab_size,
+                .logits_dtype = .f16,
+            }, true);
+            logits_rows_computed = 1;
+        }
+
+        try self.flushOptionalFrame(&frame_opt);
+        if (kv_len_after > self.seq_len) self.seq_len = kv_len_after;
+        try self.retireExcessCompletedChunks();
+        if (logits_rows_computed > 0) {
+            self.last_logits_row = 0;
+            return self.out_token_ids_host[0];
+        }
+        return 0;
+    }
+
+    // -----------------------------------------------------------------------
+    // C21: Final-RMSNorm Hidden-State Tap, Embeddings & Cross-Encoder Rerank
+    // -----------------------------------------------------------------------
+
+    pub const FinalNormTapMode = enum(u8) {
+        none = 0,
+        all_rows = 1,
+        first_row = 2,
+        last_row = 3,
+    };
+
+    /// Zero-copy read-only view of the final-RMSNormed hidden states captured by
+    /// the most recent `prefillFinalNormHidden` call (`[rows * hidden_size]f16`).
+    pub fn readFinalNormHiddenF16(self: *const Qwen3Model) []const f16 {
+        const count: usize = @as(usize, self.last_final_norm_hidden_rows) * self.config.hidden_size;
+        if (count == 0) return &.{};
+        return if (self.last_final_norm_uses_wide)
+            self.wp_x_norm_host[0..count]
+        else
+            self.x_norm_host[0..count];
+    }
+
+    /// Reuses `G15` wide prefill (with automatic fallback to `runStep`) to compute
+    /// post-`final_norm` hidden states in wired shared memory while **strictly eliding
+    /// `lm_head` and `argmax`** (`C21`, `ADR-0022`). Zero dynamic heap allocations.
+    pub fn prefillFinalNormHidden(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        start_pos: u32,
+        tap_mode: FinalNormTapMode,
+    ) StepError![]const f16 {
+        if (tokens.len == 0) return error.InvalidArgument;
+        const h = self.config.hidden_size;
+
+        if (self.usesWideGpuPrefill()) {
+            const m: u32 = @intCast(tokens.len);
+            if (m > self.wide_prefill_max_tokens) return error.TreeTooLarge;
+            if (start_pos + m > self.max_seq_len) return error.PositionOutOfRange;
+            for (tokens) |tid| {
+                if (tid >= self.config.vocab_size) return error.TokenOutOfRange;
+            }
+            try self.retireBeforeCommitRange(start_pos, m);
+
+            // Run the transformer stack via wide prefill with `compute_logits = false`.
+            // Setting `preserve_all_top_hidden = true` prevents last-layer tail pruning
+            // so `wp_x_bind[0..m, 0..h]` contains all valid top-layer hidden rows!
+            // When `tap_mode == .none`, tail pruning remains active to skip unused last-layer FFN work.
+            const need_top_rows = (tap_mode != .none);
+            _ = try self.prefillWideChunk(tokens, start_pos, true, false, need_top_rows);
+
+            if (tap_mode == .none) {
+                self.last_final_norm_hidden_rows = 0;
+                self.last_final_norm_uses_wide = true;
+                return &.{};
+            }
+
+            const norm_src: metal.BufferBinding = switch (tap_mode) {
+                .all_rows, .first_row => self.wp_x_bind,
+                .last_row => .{
+                    .buffer = self.scratch_buf,
+                    .offset = self.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+                },
+                .none => unreachable,
+            };
+            const norm_rows: u32 = switch (tap_mode) {
+                .all_rows => m,
+                .first_row, .last_row => 1,
+                .none => 0,
+            };
+
+            var frame = try self.compute.beginFrame(self.timeout_ms);
+            errdefer frame.abort();
+            try self.attn_pipes.encodeRmsNorm(&frame, .{
+                .x = norm_src,
+                .w = self.final_norm.binding,
+                .y = self.wp_x_norm_bind,
+                .num_rows = norm_rows,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = self.final_norm.dtype,
+            }, false);
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+
+            self.last_final_norm_hidden_rows = norm_rows;
+            self.last_final_norm_uses_wide = true;
+            return self.wp_x_norm_host[0 .. @as(usize, norm_rows) * h];
+        }
+
+        // Non-wide fallback (e.g. `tree64` or tiny models): run token-by-token skipping `lm_head`.
+        if (tokens.len > 1 and tap_mode == .all_rows) return error.TreeTooLarge;
+        for (tokens, 0..) |tok, i| {
+            _ = try self.runStep(tok, start_pos + @as(u32, @intCast(i)), true);
+            if (tap_mode == .first_row and i == 0) break;
+        }
+        if (tap_mode == .none) {
+            self.last_final_norm_hidden_rows = 0;
+            self.last_final_norm_uses_wide = false;
+            return &.{};
+        }
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+        try self.attn_pipes.encodeRmsNorm(&frame, .{
+            .x = self.x_bind,
+            .w = self.final_norm.binding,
+            .y = self.x_norm_bind,
+            .num_rows = 1,
+            .hidden_dim = h,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = self.final_norm.dtype,
+        }, false);
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+
+        self.last_final_norm_hidden_rows = 1;
+        self.last_final_norm_uses_wide = false;
+        return self.x_norm_host[0..h];
+    }
+
+    /// Computes a pooled, optionally Matryoshka-sliced and L2-normalized embedding
+    /// directly into `out_embedding` using `G15` wide prefill while eliding `lm_head`
+    /// (`C21`, `ADR-0022`). Zero dynamic heap allocations.
+    pub fn prefillEmbeddings(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        opts: embed_rerank.EmbedOptions,
+        out_embedding: []f32,
+    ) (StepError || embed_rerank.EmbedError)![]f32 {
+        if (tokens.len == 0) return error.EmptyInput;
+        const h = self.config.hidden_size;
+        const eff_dim: usize = try embed_rerank.effectiveDimensions(h, opts.dimensions);
+        if (out_embedding.len < eff_dim) return error.BufferTooSmall;
+        if (opts.reset_kv_before) self.resetKvCache();
+
+        const chunk_cap: usize = if (self.usesWideGpuPrefill()) self.prefillChunkCap() else 1;
+        switch (opts.pooling) {
+            .cls => {
+                // Causal token 0 only attends to itself; running `[tokens[0]]` is exact and elides `lm_head`.
+                const first_hidden = try self.prefillFinalNormHidden(tokens[0..1], 0, .first_row);
+                return embed_rerank.poolHiddenF16(first_hidden, 1, h, opts, out_embedding);
+            },
+            .last_token => {
+                var off: usize = 0;
+                while (off < tokens.len) {
+                    const take = @min(chunk_cap, tokens.len - off);
+                    const is_last = (off + take == tokens.len);
+                    const hidden = try self.prefillFinalNormHidden(
+                        tokens[off .. off + take],
+                        @intCast(off),
+                        if (is_last) .last_row else .none,
+                    );
+                    if (is_last) {
+                        return embed_rerank.poolHiddenF16(hidden, 1, h, opts, out_embedding);
+                    }
+                    off += take;
+                }
+                unreachable;
+            },
+            .mean => {
+                var acc = try embed_rerank.MeanPoolAccumulator.init(out_embedding, eff_dim);
+                var off: usize = 0;
+                while (off < tokens.len) {
+                    const take = @min(chunk_cap, tokens.len - off);
+                    const hidden = try self.prefillFinalNormHidden(
+                        tokens[off .. off + take],
+                        @intCast(off),
+                        .all_rows,
+                    );
+                    try acc.addChunkF16(hidden, take, h);
+                    off += take;
+                }
+                return acc.finish(opts.normalize);
+            },
+        }
+    }
+
+    /// Scores one pre-tokenized `(query, document)` cross-encoder sequence using
+    /// wide prefill final-token logits (`C21`, zero dynamic heap allocations).
+    pub fn scoreRerankSequence(
+        self: *Qwen3Model,
+        tokens: []const u32,
+        doc_index: u32,
+        cfg: embed_rerank.RerankConfig,
+    ) (StepError || embed_rerank.EmbedError)!embed_rerank.RerankScore {
+        if (tokens.len == 0) return error.EmptyInput;
+        self.resetKvCache();
+        if (self.usesWideGpuPrefill() or self.max_tree_nodes > 1) {
+            _ = try self.prefillChunk(tokens, 0, true);
+        } else {
+            for (tokens[0 .. tokens.len - 1], 0..) |tok, i| {
+                try self.prefillToken(tok, @intCast(i));
+            }
+            _ = try self.stepDecode(tokens[tokens.len - 1], @intCast(tokens.len - 1));
+        }
+        return embed_rerank.scoreCrossEncoderLogitsF16(self.readLastLogitsF16(), doc_index, cfg);
+    }
+
+    /// Scores and deterministically ranks `formatted_docs` in descending relevance order
+    /// into `out_scores`, slicing to `cfg.top_n` if requested (`0` dynamic heap allocations).
+    pub fn rerankSequences(
+        self: *Qwen3Model,
+        formatted_docs: []const []const u32,
+        cfg: embed_rerank.RerankConfig,
+        out_scores: []embed_rerank.RerankScore,
+    ) (StepError || embed_rerank.EmbedError)![]embed_rerank.RerankScore {
+        if (out_scores.len < formatted_docs.len) return error.BufferTooSmall;
+        for (formatted_docs, 0..) |seq, i| {
+            out_scores[i] = try self.scoreRerankSequence(seq, @intCast(i), cfg);
+        }
+        const filled = out_scores[0..formatted_docs.len];
+        embed_rerank.sortRerankScoresDesc(filled);
+        if (cfg.top_n) |k| {
+            const take: usize = @min(@as(usize, k), filled.len);
+            return filled[0..take];
+        }
+        return filled;
     }
 
     /// Batched causal prompt prefill chunk: uses wide-chunk FlashAttention + `64x64`
@@ -7419,14 +8163,20 @@ fn unpackPanel64ToF16(
 }
 
 fn findRequired(parsed: *const amf.Parsed, name: []const u8) LoadError!*const amf.TensorEntry {
-    return parsed.find(name) orelse error.MissingTensor;
+    const e = parsed.find(name) orelse return error.MissingTensor;
+    if (amf.isMetaEntry(e)) return error.MissingTensor;
+    return e;
 }
 
 fn findLinear(parsed: *const amf.Parsed, base: []const u8) LoadError!*const amf.TensorEntry {
-    if (parsed.find(base)) |e| return e;
+    if (parsed.find(base)) |e| {
+        if (!amf.isMetaEntry(e)) return e;
+    }
     var alt_buf: [64]u8 = undefined;
     const with_weight = std.fmt.bufPrint(&alt_buf, "{s}.weight", .{base}) catch return error.MissingTensor;
-    return parsed.find(with_weight) orelse error.MissingTensor;
+    const e = parsed.find(with_weight) orelse return error.MissingTensor;
+    if (amf.isMetaEntry(e)) return error.MissingTensor;
+    return e;
 }
 
 fn validateNorm1D(entry: *const amf.TensorEntry, dim: u32) LoadError!quant.FloatDType {
@@ -8321,6 +9071,16 @@ fn loadCore(
     // Region A: wide-prefill rolling activation scratch + wide MoeWorkspace / Dense FFN.
     var wp_token_ids_host: []u32 = &.{};
     var wp_token_ids_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+    var wp_x_host: []f16 = &.{};
+    var wp_x_norm_host: []f16 = &.{};
+    var wp_q_host: []f16 = &.{};
+    var wp_k_host: []f16 = &.{};
+    var wp_v_host: []f16 = &.{};
+    var wp_attn_out_host: []f16 = &.{};
+    var wp_proj_out_host: []f16 = &.{};
+    var wp_dense_gate_host: []f16 = &.{};
+    var wp_dense_up_host: []f16 = &.{};
+    var wp_dense_act_host: []f16 = &.{};
     var wp_x_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var wp_x_norm_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
     var wp_q_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
@@ -8344,6 +9104,13 @@ fn loadCore(
         @memset(wp_tok_raw, 0);
         wp_token_ids_host = @alignCast(std.mem.bytesAsSlice(u32, wp_tok_raw));
         wp_token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_tok_raw.ptr) };
+        wp_x_host = @alignCast(std.mem.bytesAsSlice(f16, wp_x_raw));
+        wp_x_norm_host = @alignCast(std.mem.bytesAsSlice(f16, wp_xn_raw));
+        wp_q_host = @alignCast(std.mem.bytesAsSlice(f16, wp_q_raw));
+        wp_k_host = @alignCast(std.mem.bytesAsSlice(f16, wp_k_raw));
+        wp_v_host = @alignCast(std.mem.bytesAsSlice(f16, wp_v_raw));
+        wp_attn_out_host = @alignCast(std.mem.bytesAsSlice(f16, wp_ao_raw));
+        wp_proj_out_host = @alignCast(std.mem.bytesAsSlice(f16, wp_po_raw));
         wp_x_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_x_raw.ptr) };
         wp_x_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_xn_raw.ptr) };
         wp_q_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_q_raw.ptr) };
@@ -8364,6 +9131,9 @@ fn loadCore(
             const wp_dg = try wp_arena.allocAligned(wp_inter_bytes, 64);
             const wp_du = try wp_arena.allocAligned(wp_inter_bytes, 64);
             const wp_da = try wp_arena.allocAligned(wp_inter_bytes, 64);
+            wp_dense_gate_host = @alignCast(std.mem.bytesAsSlice(f16, wp_dg));
+            wp_dense_up_host = @alignCast(std.mem.bytesAsSlice(f16, wp_du));
+            wp_dense_act_host = @alignCast(std.mem.bytesAsSlice(f16, wp_da));
             wp_dense_gate_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_dg.ptr) };
             wp_dense_up_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_du.ptr) };
             wp_dense_act_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wp_da.ptr) };
@@ -8974,6 +9744,16 @@ fn loadCore(
         .aliased_scratch_saved_bytes = aliased_scratch_saved_bytes,
         .wp_token_ids_host = wp_token_ids_host,
         .wp_token_ids_bind = wp_token_ids_bind,
+        .wp_x_host = wp_x_host,
+        .wp_x_norm_host = wp_x_norm_host,
+        .wp_q_host = wp_q_host,
+        .wp_k_host = wp_k_host,
+        .wp_v_host = wp_v_host,
+        .wp_attn_out_host = wp_attn_out_host,
+        .wp_proj_out_host = wp_proj_out_host,
+        .wp_dense_gate_host = wp_dense_gate_host,
+        .wp_dense_up_host = wp_dense_up_host,
+        .wp_dense_act_host = wp_dense_act_host,
         .wp_x_bind = wp_x_bind,
         .wp_x_norm_bind = wp_x_norm_bind,
         .wp_q_bind = wp_q_bind,
@@ -9065,6 +9845,8 @@ const BatchSlotState = struct {
     retired_is_shared: []bool = &.{},
     /// `[max_seq_len]` wired prompt token history for exact `PrefixCache` insertion (`0` alloc).
     prompt_tokens: []u32 = &.{},
+    /// Active `W19` LoRA adapter slot bound to this request slot (`lora.NO_ADAPTER` for base).
+    lora_slot: u32 = lora.NO_ADAPTER,
 };
 
 /// Preallocated zero-allocation continuous-batching (`C14`), shared `PrefixCache` (`R8`),
@@ -9131,6 +9913,8 @@ pub const Qwen3BatchRuntime = struct {
     kv_retire_events: u64 = 0,
     decode_batch_steps: u64 = 0,
     decode_batch_tokens: u64 = 0,
+    /// Optional non-owning `W19` multi-LoRA registry shared across concurrent batch slots.
+    lora_registry: ?*lora.LoraRegistry = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -9495,7 +10279,31 @@ pub const Qwen3BatchRuntime = struct {
             .p_res = p_res,
             .gpu_prefill_mode = eff_gpu_prefill_mode,
             .live_admission = live_admission,
+            .lora_registry = model.lora_registry,
         };
+    }
+
+    pub fn attachLoraRegistry(self: *Qwen3BatchRuntime, registry: ?*lora.LoraRegistry) void {
+        self.lora_registry = registry;
+        if (registry == null) {
+            for (self.slots) |*slot| slot.lora_slot = lora.NO_ADAPTER;
+        }
+    }
+
+    pub fn setSlotLora(self: *Qwen3BatchRuntime, slot_id: u32, lora_slot: u32) void {
+        if (slot_id >= self.max_slots) return;
+        self.slots[slot_id].lora_slot = lora_slot;
+    }
+
+    pub fn setSlotModelSelector(self: *Qwen3BatchRuntime, slot_id: u32, model_selector: []const u8) lora.LoraError!void {
+        if (slot_id >= self.max_slots) return error.InvalidConfig;
+        const sel = lora.parseModelSelector(model_selector);
+        if (sel.adapter == null) {
+            self.slots[slot_id].lora_slot = lora.NO_ADAPTER;
+            return;
+        }
+        const reg = self.lora_registry orelse return error.AdapterNotFound;
+        self.slots[slot_id].lora_slot = (try reg.resolveModelSelector(model_selector)) orelse lora.NO_ADAPTER;
     }
 
     pub fn deinit(self: *Qwen3BatchRuntime, allocator: std.mem.Allocator) void {
@@ -9847,6 +10655,7 @@ pub const Qwen3BatchRuntime = struct {
         slot.matched_prefix_tokens = 0;
         slot.prefix_cached_full_chunks = 0;
         slot.last_cached_parent_id = prefix_cache_mod.NONE_ID;
+        slot.lora_slot = lora.NO_ADAPTER;
         slot.in_use = false;
         self.syncSlotActiveTables(slot_id);
     }
@@ -9962,6 +10771,7 @@ pub const Qwen3BatchRuntime = struct {
     ) void {
         var pc = &(self.prefix_cache orelse return);
         const slot = &self.slots[slot_id];
+        if (slot.lora_slot != lora.NO_ADAPTER) return;
         const bs: u32 = self.model.chunk_tokens;
         const num_layers = self.model.layers.len;
 
@@ -10089,6 +10899,12 @@ pub const Qwen3BatchRuntime = struct {
         var ci: u32 = first_c;
         while (ci <= last_c) : (ci += 1) {
             if (!self.ensureSlotWritableChunk(slot_id, ci)) return error.PositionOutOfRange;
+        }
+
+        if (self.lora_registry) |reg| {
+            if (reg.activeAdapterCount() > 0 and slot.lora_slot != lora.NO_ADAPTER) {
+                return self.runPrefillWideChunkWithLora(reg, slot_id, slot.lora_slot, tokens, base_pos, is_final_chunk, compute_logits);
+            }
         }
 
         @memcpy(model.wp_token_ids_host[0..m], tokens);
@@ -10368,6 +11184,235 @@ pub const Qwen3BatchRuntime = struct {
 
         const sig = try frame.commit();
         try model.compute.wait(sig, model.timeout_ms);
+        slot.seq_len = kv_len_after;
+        if (compute_logits) model.last_logits_row = 0;
+        return if (compute_logits) model.out_token_ids_host[0] else 0;
+    }
+
+    fn runPrefillWideChunkWithLora(
+        self: *Qwen3BatchRuntime,
+        reg: *lora.LoraRegistry,
+        slot_id: u32,
+        lora_slot: u32,
+        tokens: []const u32,
+        base_pos: u32,
+        is_final_chunk: bool,
+        compute_logits: bool,
+    ) StepError!u32 {
+        _ = is_final_chunk;
+        const m: u32 = @intCast(tokens.len);
+        const m_usize: usize = tokens.len;
+        const model = self.model;
+        const slot = &self.slots[slot_id];
+        const h = model.config.hidden_size;
+
+        const qkv_mask = lora.TargetProjection.q_proj.bit() |
+            lora.TargetProjection.k_proj.bit() |
+            lora.TargetProjection.v_proj.bit();
+        const o_mask = lora.TargetProjection.o_proj.bit();
+        const gate_up_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
+        const down_mask = lora.TargetProjection.down_proj.bit();
+
+        @memcpy(model.wp_token_ids_host[0..m], tokens);
+        const has_retired = (self.retired_pool != null and slot.num_retired_chunks > 0);
+        const rpool_bind: ?metal.BufferBinding = if (has_retired) self.retired_pool.?.binding(self.batch_buf) else null;
+        const ret_plane_stride: u32 = if (has_retired) self.retired_pool.?.plane_stride_bytes else 0;
+        const ret_chunk_stride: u32 = if (has_retired) self.retired_pool.?.chunk_stride_bytes else 0;
+        const kv_len_after: u32 = base_pos + m;
+
+        var frame_opt: ?metal.Compute.Frame = null;
+        errdefer if (frame_opt) |*f| f.abort();
+
+        {
+            const f = try model.ensureOptionalFrame(&frame_opt);
+            try model.moe_pipes.encodeEmbedLookup(f, model.embed.dtype, .{
+                .weight = model.embed.weight,
+                .scale_bias = model.embed.scale_bias,
+                .tokens = .{ .token_ids = model.wp_token_ids_bind },
+                .out = model.wp_x_bind,
+                .m = m,
+                .vocab_size = model.config.vocab_size,
+                .hidden_size = h,
+            }, false);
+        }
+
+        for (model.layers, 0..) |layer, l| {
+            const slot_kv_bind = self.slotKvTilesBinding(l, slot_id);
+            const slot_ret_ids_bind: ?metal.BufferBinding = if (has_retired) self.slotRetiredIdsBinding(l, slot_id) else null;
+
+            {
+                const had = (frame_opt != null);
+                const f = try model.ensureOptionalFrame(&frame_opt);
+                try model.attn_pipes.encodeRmsNorm(f, .{
+                    .x = model.wp_x_bind,
+                    .w = layer.input_layernorm.binding,
+                    .y = model.wp_x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = model.config.rms_norm_eps,
+                    .w_dtype = layer.input_layernorm.dtype,
+                }, had);
+                try model.encodeLinearGemmWithTile(f, layer.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
+                try model.encodeLinearGemmWithTile(f, layer.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
+                try model.encodeLinearGemmWithTile(f, layer.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+            }
+            if (reg.slotTargetsLayerMask(lora_slot, l, qkv_mask)) {
+                try model.flushOptionalFrame(&frame_opt);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .q_proj, model.wp_x_norm_host, model.wp_q_host, m_usize);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .k_proj, model.wp_x_norm_host, model.wp_k_host, m_usize);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .v_proj, model.wp_x_norm_host, model.wp_v_host, m_usize);
+            }
+            {
+                const had = (frame_opt != null);
+                const f = try model.ensureOptionalFrame(&frame_opt);
+                try model.attn_pipes.encodePrefillQkNormRopeKvWrite(f, .{
+                    .q = model.wp_q_bind,
+                    .k = model.wp_k_bind,
+                    .v = model.wp_v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .kv_tiles = slot_kv_bind,
+                    .num_tokens = m,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .start_pos = base_pos,
+                    .chunk_tokens = model.chunk_tokens,
+                    .num_retired_chunks = slot.num_retired_chunks,
+                    .kv_only = false,
+                    .rms_eps = model.config.rms_norm_eps,
+                    .rope_theta = model.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, had);
+                try model.attn_pipes.encodeGqaCausalPrefillFlashAttn(f, .{
+                    .q = model.wp_q_bind,
+                    .kv_tiles = slot_kv_bind,
+                    .retired_pool = rpool_bind,
+                    .retired_chunk_ids = slot_ret_ids_bind,
+                    .out = model.wp_attn_out_bind,
+                    .num_q = m,
+                    .q_start_pos = base_pos,
+                    .kv_len = kv_len_after,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .chunk_tokens = model.chunk_tokens,
+                    .num_retired_chunks = if (has_retired) slot.num_retired_chunks else 0,
+                    .retired_plane_stride_bytes = ret_plane_stride,
+                    .retired_chunk_stride_bytes = ret_chunk_stride,
+                }, true);
+                try model.encodeLinearGemmWithTile(f, layer.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, m, true, true);
+            }
+            if (reg.slotTargetsLayerMask(lora_slot, l, o_mask)) {
+                try model.flushOptionalFrame(&frame_opt);
+                try reg.applySingleAdapterProjectionF16(lora_slot, l, .o_proj, model.wp_attn_out_host, model.wp_proj_out_host, m_usize);
+            }
+            {
+                const had = (frame_opt != null);
+                const f = try model.ensureOptionalFrame(&frame_opt);
+                try model.moe_pipes.encodeResidualAdd(f, .{
+                    .x = model.wp_x_bind,
+                    .delta = model.wp_proj_out_bind,
+                    .count = m * h,
+                }, had);
+                try model.attn_pipes.encodeRmsNorm(f, .{
+                    .x = model.wp_x_bind,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = model.wp_x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = model.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
+                }, true);
+            }
+            switch (model.config.arch) {
+                .qwen3_moe => {
+                    const f = try model.ensureOptionalFrame(&frame_opt);
+                    const ws_ptr = &(model.wp_moe_ws.?);
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = model.wp_x_norm_bind,
+                        .router = layer.router,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = ws_ptr,
+                        .workspace_buf = model.scratch_buf,
+                        .residual = model.wp_x_bind,
+                        .out = model.wp_x_bind,
+                        .m = m,
+                        .num_experts = model.config.num_experts,
+                        .top_k = model.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = model.config.moe_intermediate_size,
+                        .norm_topk_prob = model.config.norm_topk_prob,
+                    };
+                    try model.encodeMoELayerDispatch(f, layer, moe_args, true);
+                },
+                .qwen3_dense => {
+                    {
+                        const f = try model.ensureOptionalFrame(&frame_opt);
+                        try model.encodeLinearGemmWithTile(f, layer.dense_gate, model.wp_x_norm_bind, model.wp_dense_gate_bind, m, true, true);
+                        try model.encodeLinearGemmWithTile(f, layer.dense_up, model.wp_x_norm_bind, model.wp_dense_up_bind, m, true, false);
+                    }
+                    if (reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask)) {
+                        try model.flushOptionalFrame(&frame_opt);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .gate_proj, model.wp_x_norm_host, model.wp_dense_gate_host, m_usize);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .up_proj, model.wp_x_norm_host, model.wp_dense_up_host, m_usize);
+                    }
+                    {
+                        const had = (frame_opt != null);
+                        const f = try model.ensureOptionalFrame(&frame_opt);
+                        try model.moe_pipes.encodeSiluMul(f, .{
+                            .gate = model.wp_dense_gate_bind,
+                            .up = model.wp_dense_up_bind,
+                            .out = model.wp_dense_act_bind,
+                            .count = m * model.config.intermediate_size,
+                        }, had);
+                        try model.encodeLinearGemmWithTile(f, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, m, true, true);
+                    }
+                    if (reg.slotTargetsLayerMask(lora_slot, l, down_mask)) {
+                        try model.flushOptionalFrame(&frame_opt);
+                        try reg.applySingleAdapterProjectionF16(lora_slot, l, .down_proj, model.wp_dense_act_host, model.wp_proj_out_host, m_usize);
+                    }
+                    {
+                        const had = (frame_opt != null);
+                        const f = try model.ensureOptionalFrame(&frame_opt);
+                        try model.moe_pipes.encodeResidualAdd(f, .{
+                            .x = model.wp_x_bind,
+                            .delta = model.wp_proj_out_bind,
+                            .count = m * h,
+                        }, had);
+                    }
+                },
+            }
+        }
+
+        if (compute_logits) {
+            const had = (frame_opt != null);
+            const f = try model.ensureOptionalFrame(&frame_opt);
+            const last_x_bind: metal.BufferBinding = .{
+                .buffer = model.scratch_buf,
+                .offset = model.wp_x_bind.offset + @as(u64, m - 1) * h * @sizeOf(f16),
+            };
+            try model.attn_pipes.encodeRmsNorm(f, .{
+                .x = last_x_bind,
+                .w = model.final_norm.binding,
+                .y = model.wp_x_norm_bind,
+                .num_rows = 1,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = model.final_norm.dtype,
+            }, had);
+            try model.encodeLinearGemv(f, model.lm_head, model.wp_x_norm_bind, model.logits_bind, true);
+            try model.moe_pipes.encodeArgmaxRows(f, .{
+                .logits = model.logits_bind,
+                .out_token_ids = model.out_token_id_bind,
+                .num_rows = 1,
+                .vocab_size = model.config.vocab_size,
+                .logits_dtype = .f16,
+            }, true);
+        }
+
+        try model.flushOptionalFrame(&frame_opt);
         slot.seq_len = kv_len_after;
         if (compute_logits) model.last_logits_row = 0;
         return if (compute_logits) model.out_token_ids_host[0] else 0;
@@ -10804,6 +11849,25 @@ pub const Qwen3BatchRuntime = struct {
             }
         }
 
+        // Strict zero-overhead W19 gate OUTSIDE the transformer layer loop:
+        // when `active_adapters == 0` or no active slot in this batch selects a LoRA,
+        // the base `stepDecodeBatch` loop executes with ZERO extra branches.
+        if (self.lora_registry) |reg| {
+            if (reg.activeAdapterCount() > 0) {
+                var batch_lora: [batch_sched.MAX_BATCH_SLOTS]u32 = @splat(lora.NO_ADAPTER);
+                var any_lora = false;
+                for (0..b_usize) |bi| {
+                    const sid: u32 = view.slot_ids[bi];
+                    const lslot = self.slots[sid].lora_slot;
+                    batch_lora[bi] = lslot;
+                    if (lslot != lora.NO_ADAPTER) any_lora = true;
+                }
+                if (any_lora) {
+                    return self.stepDecodeBatchWithLora(reg, view, batch_lora[0..b_usize], max_seq, out_next_tokens);
+                }
+            }
+        }
+
         var frame_opt: ?metal.Compute.Frame = null;
         errdefer if (frame_opt) |*f| f.abort();
 
@@ -11023,6 +12087,238 @@ pub const Qwen3BatchRuntime = struct {
         model.flushOptionalFrame(&frame_opt) catch return error.DecodeFailed;
 
         // Per-slot `D11` isolated sampling & seq_len update.
+        for (0..b_usize) |bi| {
+            const sid: u32 = view.slot_ids[bi];
+            const temp = view.temperatures[bi];
+            if (temp > 0.0) {
+                const row = model.logits_host[bi * v_size .. (bi + 1) * v_size];
+                accept_mod.softmaxRow(f16, row, temp, self.p_res) catch return error.DecodeFailed;
+                out_next_tokens[bi] = accept_mod.sampleCategorical(self.p_res[0..v_size], view.rngs[bi].random());
+            } else {
+                out_next_tokens[bi] = model.out_token_ids_host[bi];
+            }
+            self.slots[sid].seq_len = view.seq_positions[bi] + 1;
+            self.maybeRetireSlotExcess(sid);
+        }
+
+        self.decode_batch_steps += 1;
+        self.decode_batch_tokens += b_usize;
+    }
+
+    /// Heterogeneous multi-LoRA `C14` continuous-batching decode step (`W19`):
+    /// concurrent slots in one batch may mix base-only (`NO_ADAPTER`) and distinct
+    /// hot-loaded LoRA adapters over a single shared wired base `.amf`.
+    fn stepDecodeBatchWithLora(
+        self: *Qwen3BatchRuntime,
+        reg: *lora.LoraRegistry,
+        view: *const batch_sched.BatchStepView,
+        batch_lora_slots: []const u32,
+        max_seq: u32,
+        out_next_tokens: []u32,
+    ) batch_sched.BackendError!void {
+        const b_usize = view.batchSize();
+        const b_u32: u32 = @intCast(b_usize);
+        const model = self.model;
+        const h = model.config.hidden_size;
+        const v_size: usize = model.config.vocab_size;
+
+        const qkv_mask = lora.TargetProjection.q_proj.bit() |
+            lora.TargetProjection.k_proj.bit() |
+            lora.TargetProjection.v_proj.bit();
+        const o_mask = lora.TargetProjection.o_proj.bit();
+        const gate_up_mask = lora.TargetProjection.gate_proj.bit() | lora.TargetProjection.up_proj.bit();
+        const down_mask = lora.TargetProjection.down_proj.bit();
+
+        var frame_opt: ?metal.Compute.Frame = null;
+        errdefer if (frame_opt) |*f| f.abort();
+
+        {
+            const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+            model.moe_pipes.encodeEmbedLookup(f, model.embed.dtype, .{
+                .weight = model.embed.weight,
+                .scale_bias = model.embed.scale_bias,
+                .tokens = .{ .token_ids = model.tree_token_ids_bind },
+                .out = model.x_bind,
+                .m = b_u32,
+                .vocab_size = model.config.vocab_size,
+                .hidden_size = h,
+            }, false) catch return error.DecodeFailed;
+        }
+
+        const ret_pool_bind: ?metal.BufferBinding = if (self.retired_pool) |rp| rp.binding(self.batch_buf) else null;
+        const ret_plane_stride: u32 = if (self.retired_pool) |rp| rp.plane_stride_bytes else 0;
+        const ret_chunk_stride: u32 = if (self.retired_pool) |rp| rp.chunk_stride_bytes else 0;
+
+        for (model.layers, 0..) |layer, l| {
+            {
+                const had = (frame_opt != null);
+                const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                model.attn_pipes.encodeRmsNorm(f, .{
+                    .x = model.x_bind,
+                    .w = layer.input_layernorm.binding,
+                    .y = model.x_norm_bind,
+                    .num_rows = b_u32,
+                    .hidden_dim = h,
+                    .eps = model.config.rms_norm_eps,
+                    .w_dtype = layer.input_layernorm.dtype,
+                }, had) catch return error.DecodeFailed;
+                model.encodeLinearGemm(f, layer.q_proj, model.x_norm_bind, model.q_bind, b_u32, true) catch return error.DecodeFailed;
+                model.encodeLinearGemm(f, layer.k_proj, model.x_norm_bind, model.k_bind, b_u32, false) catch return error.DecodeFailed;
+                model.encodeLinearGemm(f, layer.v_proj, model.x_norm_bind, model.v_bind, b_u32, false) catch return error.DecodeFailed;
+            }
+            if (reg.batchTargetsLayerMask(batch_lora_slots, l, qkv_mask)) {
+                model.flushOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                reg.applyBatchProjectionF16(batch_lora_slots, l, .q_proj, model.x_norm_host, model.q_host) catch return error.DecodeFailed;
+                reg.applyBatchProjectionF16(batch_lora_slots, l, .k_proj, model.x_norm_host, model.k_host) catch return error.DecodeFailed;
+                reg.applyBatchProjectionF16(batch_lora_slots, l, .v_proj, model.x_norm_host, model.v_host) catch return error.DecodeFailed;
+            }
+            {
+                const had = (frame_opt != null);
+                const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                model.attn_pipes.encodeBatchQkNormRopeKvWrite(f, .{
+                    .q = model.q_bind,
+                    .k = model.k_bind,
+                    .v = model.v_bind,
+                    .q_norm = layer.q_norm,
+                    .k_norm = layer.k_norm,
+                    .slots = self.layerWriteSlotsBinding(l),
+                    .batch_size = b_u32,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .chunk_tokens = model.chunk_tokens,
+                    .rms_eps = model.config.rms_norm_eps,
+                    .rope_theta = model.config.rope_theta,
+                    .norm_dtype = layer.qk_norm_dtype,
+                }, had) catch return error.DecodeFailed;
+                model.attn_pipes.encodeBatchGqaDecodeAttn(f, .{
+                    .q = model.q_bind,
+                    .kv_tiles = self.layerKvTilesBinding(l),
+                    .retired_pool = ret_pool_bind,
+                    .retired_chunk_ids = if (ret_pool_bind != null) self.layerRetiredIdsBinding(l) else null,
+                    .slots = self.layerGqaDescsBinding(l),
+                    .out = model.attn_out_bind,
+                    .scratch = self.gqa_batch_scratch_bind,
+                    .max_splits = attention.MAX_SPLITS,
+                    .batch_size = b_u32,
+                    .num_q_heads = model.config.num_attention_heads,
+                    .num_kv_heads = model.config.num_key_value_heads,
+                    .head_dim = model.config.head_dim,
+                    .max_seq_len = max_seq,
+                    .chunk_tokens = model.chunk_tokens,
+                    .retired_plane_stride_bytes = ret_plane_stride,
+                    .retired_chunk_stride_bytes = ret_chunk_stride,
+                }, true) catch return error.DecodeFailed;
+                model.encodeLinearGemm(f, layer.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+            }
+            if (reg.batchTargetsLayerMask(batch_lora_slots, l, o_mask)) {
+                model.flushOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                reg.applyBatchProjectionF16(batch_lora_slots, l, .o_proj, model.attn_out_host, model.proj_out_host) catch return error.DecodeFailed;
+            }
+            {
+                const had = (frame_opt != null);
+                const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                model.moe_pipes.encodeResidualAdd(f, .{
+                    .x = model.x_bind,
+                    .delta = model.proj_out_bind,
+                    .count = b_u32 * h,
+                }, had) catch return error.DecodeFailed;
+                model.attn_pipes.encodeRmsNorm(f, .{
+                    .x = model.x_bind,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = model.x_norm_bind,
+                    .num_rows = b_u32,
+                    .hidden_dim = h,
+                    .eps = model.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
+                }, true) catch return error.DecodeFailed;
+            }
+
+            switch (model.config.arch) {
+                .qwen3_moe => {
+                    const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                    var layer_ws = model.moe_ws.?;
+                    layer_ws.schedule_header_off = model.layer_sched_hdr_base_off + @as(u64, l) * 64;
+                    const moe_args: moe.MoELayerArgs = .{
+                        .x = model.x_norm_bind,
+                        .router = layer.router,
+                        .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                        .expert_table = layer.expert_table,
+                        .workspace = &layer_ws,
+                        .workspace_buf = model.scratch_buf,
+                        .residual = model.x_bind,
+                        .out = model.x_bind,
+                        .m = b_u32,
+                        .num_experts = model.config.num_experts,
+                        .top_k = model.config.num_experts_per_tok,
+                        .hidden_size = h,
+                        .intermediate_size = model.config.moe_intermediate_size,
+                        .norm_topk_prob = model.config.norm_topk_prob,
+                    };
+                    model.encodeMoELayerDispatch(f, layer, moe_args, true) catch return error.DecodeFailed;
+                },
+                .qwen3_dense => {
+                    {
+                        const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                        model.encodeLinearGemm(f, layer.dense_gate, model.x_norm_bind, model.dense_gate_bind, b_u32, true) catch return error.DecodeFailed;
+                        model.encodeLinearGemm(f, layer.dense_up, model.x_norm_bind, model.dense_up_bind, b_u32, false) catch return error.DecodeFailed;
+                    }
+                    if (reg.batchTargetsLayerMask(batch_lora_slots, l, gate_up_mask)) {
+                        model.flushOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                        reg.applyBatchProjectionF16(batch_lora_slots, l, .gate_proj, model.x_norm_host, model.dense_gate_host) catch return error.DecodeFailed;
+                        reg.applyBatchProjectionF16(batch_lora_slots, l, .up_proj, model.x_norm_host, model.dense_up_host) catch return error.DecodeFailed;
+                    }
+                    {
+                        const had = (frame_opt != null);
+                        const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                        model.moe_pipes.encodeSiluMul(f, .{
+                            .gate = model.dense_gate_bind,
+                            .up = model.dense_up_bind,
+                            .out = model.dense_act_bind,
+                            .count = b_u32 * model.config.intermediate_size,
+                        }, had) catch return error.DecodeFailed;
+                        model.encodeLinearGemm(f, layer.dense_down, model.dense_act_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
+                    }
+                    if (reg.batchTargetsLayerMask(batch_lora_slots, l, down_mask)) {
+                        model.flushOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                        reg.applyBatchProjectionF16(batch_lora_slots, l, .down_proj, model.dense_act_host, model.proj_out_host) catch return error.DecodeFailed;
+                    }
+                    {
+                        const had = (frame_opt != null);
+                        const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                        model.moe_pipes.encodeResidualAdd(f, .{
+                            .x = model.x_bind,
+                            .delta = model.proj_out_bind,
+                            .count = b_u32 * h,
+                        }, had) catch return error.DecodeFailed;
+                    }
+                },
+            }
+        }
+
+        {
+            const had = (frame_opt != null);
+            const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+            model.attn_pipes.encodeRmsNorm(f, .{
+                .x = model.x_bind,
+                .w = model.final_norm.binding,
+                .y = model.x_norm_bind,
+                .num_rows = b_u32,
+                .hidden_dim = h,
+                .eps = model.config.rms_norm_eps,
+                .w_dtype = model.final_norm.dtype,
+            }, had) catch return error.DecodeFailed;
+            model.encodeLinearGemm(f, model.lm_head, model.x_norm_bind, model.logits_bind, b_u32, true) catch return error.DecodeFailed;
+            model.moe_pipes.encodeArgmaxRows(f, .{
+                .logits = model.logits_bind,
+                .out_token_ids = model.out_token_id_bind,
+                .num_rows = b_u32,
+                .vocab_size = model.config.vocab_size,
+                .logits_dtype = .f16,
+            }, true) catch return error.DecodeFailed;
+        }
+        model.flushOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+
         for (0..b_usize) |bi| {
             const sid: u32 = view.slot_ids[bi];
             const temp = view.temperatures[bi];
@@ -12739,7 +14035,7 @@ pub fn repackAmfBytesToSme2(
             .routers => kind == .router,
             .all_linear => switch (kind) {
                 .router, .dense, .hot_expert, .cold_expert, .lm_head, .shared_expert, .loop_adapter => true,
-                .embedding, .norm, .sparse_table => false,
+                .embedding, .norm, .sparse_table, .metadata => false,
             },
         };
         if (mark_cold_expert_from) |cold_from| {
@@ -14178,4 +15474,236 @@ test "M6.9 C16+G17 Qwen3Model ChipProfile, NAX backend modes, strict-nax rejecti
         defer m_nax_strict.deinit(gpa);
         try std.testing.expect(m_nax_strict.dequant_pipes.activeBackend().isNax());
     }
+}
+
+test {
+    _ = lora;
+    _ = embed_rerank;
+}
+
+test "M7.5 W18+W19+C21 Qwen3Model single-file metadata, multi-LoRA single/batch routing, and embeddings/rerank" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q4,
+        .group_size = 64,
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 64,
+        .intermediate_size = 128,
+        .vocab_size = 64,
+        .tie_word_embeddings = false,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 10000.0,
+    };
+
+    const base_img = try buildSyntheticAmfImageWithSpec(gpa, cfg, .{
+        .linear_dtype = .f16,
+        .embed_dtype = .f16,
+        .norm_dtype = .f16,
+    }, 0x75_2026);
+    defer gpa.free(base_img);
+
+    // 1. W18: Embed config.json + tokenizer.json into single-file .amf and load with ZERO sidecar files!
+    const cfg_json =
+        \\{"model_type":"qwen3","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"intermediate_size":128,"vocab_size":64,"tie_word_embeddings":false,"rms_norm_eps":1e-6,"rope_theta":10000.0}
+    ;
+    const tok_json =
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"a":0},"merges":[]}}
+    ;
+    const sf_img = try amf.embedMetadataIntoAmfBytes(gpa, base_img, &.{
+        .{ .name = amf.META_CONFIG_JSON, .payload = cfg_json },
+        .{ .name = amf.META_TOKENIZER_JSON, .payload = tok_json },
+    });
+    defer gpa.free(sf_img);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "self_contained.amf", .data = sf_img });
+    var sf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sf_raw = try std.fmt.bufPrint(sf_path_buf[0 .. sf_path_buf.len - 1], ".zig-cache/tmp/{s}/self_contained.amf", .{tmp.sub_path});
+    sf_path_buf[sf_raw.len] = 0;
+    const sf_path_z: [:0]const u8 = sf_path_buf[0..sf_raw.len :0];
+
+    var model = try Qwen3Model.loadFromFileAutoConfig(gpa, sf_path_z, null, .{
+        .max_seq_len = 128,
+        .chunk_tokens = 64,
+        .max_tree_nodes = 16,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 8,
+    });
+    defer model.deinit(gpa);
+
+    // Baseline single-token step without any LoRA attached.
+    const base_tok = try model.stepDecode(5, 0);
+    var base_logits: [64]f16 = undefined;
+    @memcpy(&base_logits, model.readLastLogitsF16());
+
+    // 2. C21: Embeddings (`last_token`, `mean` multi-chunk across chunk_cap=8, `cls`, Matryoshka, base64) & Rerank!
+    const embed_tokens = [_]u32{ 3, 7, 11, 15, 19, 23, 27, 31, 35, 39 }; // 10 tokens > chunk_cap(8) -> exercises multi-chunk!
+    var emb_last: [64]f32 = undefined;
+    var emb_mean: [64]f32 = undefined;
+    var emb_cls: [64]f32 = undefined;
+    var emb_mrl: [32]f32 = undefined;
+
+    const v_last = try model.prefillEmbeddings(&embed_tokens, .{ .pooling = .last_token, .normalize = true }, &emb_last);
+    const v_mean = try model.prefillEmbeddings(&embed_tokens, .{ .pooling = .mean, .normalize = true }, &emb_mean);
+    const v_cls = try model.prefillEmbeddings(&embed_tokens, .{ .pooling = .cls, .normalize = true }, &emb_cls);
+    const v_mrl = try model.prefillEmbeddings(&embed_tokens, .{ .pooling = .last_token, .dimensions = 32, .normalize = true }, &emb_mrl);
+
+    try std.testing.expectEqual(@as(usize, 64), v_last.len);
+    try std.testing.expectEqual(@as(usize, 32), v_mrl.len);
+    // Unit L2 norms verified.
+    var norm_last: f32 = 0.0;
+    for (v_last) |x| norm_last += x * x;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), norm_last, 1e-3);
+    var norm_mean: f32 = 0.0;
+    for (v_mean) |x| norm_mean += x * x;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), norm_mean, 1e-3);
+    var norm_mrl: f32 = 0.0;
+    for (v_mrl) |x| norm_mrl += x * x;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), norm_mrl, 1e-3);
+
+    // Distinct pooling strategies produce distinct normalized directions on multi-token input.
+    const sim_last_cls = try embed_rerank.cosineSimilarity(v_last, v_cls);
+    try std.testing.expect(sim_last_cls < 0.9999);
+
+    // Cross-encoder rerank over 3 token sequences.
+    const doc_seqs = [_][]const u32{
+        &.{ 1, 2, 3, 4 },
+        &.{ 10, 20, 30, 40 },
+        &.{ 5, 15, 25, 35 },
+    };
+    var rr_scores: [3]embed_rerank.RerankScore = undefined;
+    const ranked = try model.rerankSequences(&doc_seqs, .{
+        .mode = .yes_no_sigmoid,
+        .positive_token_id = 1,
+        .negative_token_id = 2,
+        .top_n = 2,
+    }, &rr_scores);
+    try std.testing.expectEqual(@as(usize, 2), ranked.len);
+    try std.testing.expect(ranked[0].score >= ranked[1].score);
+    try std.testing.expect(ranked[0].score >= 0.0 and ranked[0].score <= 1.0);
+
+    // 3. W19: Attach LoraRegistry, verify zero-overhead bypass when active_adapters == 0,
+    //    then hot-load two adapters (row_major + sme2_panel64) and test single + C14 multi-slot batching!
+    var lora_reg = try lora.LoraRegistry.init(.{
+        .pool_bytes = 16 * page.APPLE_PAGE_SIZE,
+        .base_shape = model.baseLoraShape(),
+    });
+    defer lora_reg.deinit(gpa);
+    model.attachLoraRegistry(&lora_reg);
+    defer model.attachLoraRegistry(null);
+
+    // active_adapters == 0 -> bit-exact match with base_logits!
+    model.resetKvCache();
+    const bypass_tok = try model.stepDecode(5, 0);
+    try std.testing.expectEqual(base_tok, bypass_tok);
+    try std.testing.expectEqualSlices(f16, &base_logits, model.readLastLogitsF16());
+
+    const r: usize = 4;
+    // q_proj has N = q_dim = 128, K = hidden_size = 64; o_proj has N = hidden_size = 64, K = q_dim = 128.
+    var a_q_zero: [r * 64]f32 = @splat(0.0);
+    var b_q_zero: [128 * r]f32 = @splat(0.0);
+    var a_q_nz: [r * 64]f32 = undefined;
+    var b_q_nz: [128 * r]f32 = undefined;
+    var a_o_nz: [r * 128]f32 = undefined;
+    var b_o_nz: [64 * r]f32 = undefined;
+    for (&a_q_nz, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.4;
+    for (&b_q_nz, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.6;
+    for (&a_o_nz, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 7)) - 3)) * 0.4;
+    for (&b_o_nz, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 2) % 5)) - 2)) * 0.6;
+
+    const img_zero = try lora.buildSyntheticAmloraBytes(gpa, "zero-lora", r, 0.0, &.{
+        .{ .layer = 0, .target = .q_proj, .n = 128, .k = 64, .rank = r, .layout = .row_major, .a_f32 = &a_q_zero, .b_f32 = &b_q_zero },
+    });
+    defer gpa.free(img_zero);
+    const img_nz = try lora.buildSyntheticAmloraBytes(gpa, "active-lora", r, 16.0, &.{
+        .{ .layer = 0, .target = .q_proj, .n = 128, .k = 64, .rank = r, .layout = .sme2_panel64, .a_f32 = &a_q_nz, .b_f32 = &b_q_nz },
+        .{ .layer = 1, .target = .o_proj, .n = 64, .k = 128, .rank = r, .layout = .row_major, .a_f32 = &a_o_nz, .b_f32 = &b_o_nz },
+    });
+    defer gpa.free(img_nz);
+
+    const slot_zero = try lora_reg.loadAdapterFromBytes(gpa, "zero", img_zero);
+    const slot_nz = try lora_reg.loadAdapterFromBytes(gpa, "active", img_nz);
+
+    // Zero-scale adapter yields bit-exact base logits!
+    try model.selectModelAdapter("qwen3:zero");
+    model.resetKvCache();
+    _ = try model.stepDecode(5, 0);
+    try std.testing.expectEqualSlices(f16, &base_logits, model.readLastLogitsF16());
+
+    // Non-zero adapter perturbs logits deterministically!
+    try model.selectModelAdapter("qwen3:active");
+    model.resetKvCache();
+    _ = try model.stepDecode(5, 0);
+    var active_logits: [64]f16 = undefined;
+    @memcpy(&active_logits, model.readLastLogitsF16());
+    var max_diff: f32 = 0.0;
+    for (base_logits, active_logits) |bl, al| {
+        max_diff = @max(max_diff, @abs(@as(f32, @floatCast(al)) - @as(f32, @floatCast(bl))));
+    }
+    try std.testing.expect(max_diff > 1e-3);
+
+    // C14 multi-slot heterogeneous batching: slot 0 = base, slot 1 = active LoRA, slot 2 = zero LoRA!
+    model.setActiveLoraSlot(lora.NO_ADAPTER);
+    var batch_rt = try Qwen3BatchRuntime.init(gpa, &model, .{
+        .max_slots = 3,
+        .prefix_cache_chunks = 4,
+    });
+    defer batch_rt.deinit(gpa);
+    batch_rt.attachLoraRegistry(&lora_reg);
+
+    _ = batch_rt.lookupPrefix(0, &.{5});
+    _ = batch_rt.lookupPrefix(1, &.{5});
+    _ = batch_rt.lookupPrefix(2, &.{5});
+    try batch_rt.setSlotModelSelector(0, "qwen3");
+    try batch_rt.setSlotModelSelector(1, "qwen3:active");
+    batch_rt.setSlotLora(2, slot_zero);
+    try std.testing.expectEqual(slot_nz, batch_rt.slots[1].lora_slot);
+
+    var rngs = [_]rng_mod.RequestRng{
+        try rng_mod.RequestRng.init(1),
+        try rng_mod.RequestRng.init(2),
+        try rng_mod.RequestRng.init(3),
+    };
+    const rng_ptrs = [_]*rng_mod.RequestRng{ &rngs[0], &rngs[1], &rngs[2] };
+    const slot_ids = [_]u16{ 0, 1, 2 };
+    const in_toks = [_]u32{ 5, 5, 5 };
+    const positions = [_]u32{ 0, 0, 0 };
+    const temps = [_]f32{ 0.0, 0.0, 0.0 };
+    var out_toks: [3]u32 = undefined;
+    const req_ids = [_]u64{ 1, 2, 3 };
+    const user_tags = [_]u64{ 1, 2, 3 };
+    const domains = [_][]const u8{ "base", "active", "zero" };
+    const prefix_handles = [_]u64{ 1, 2, 3 };
+    const view: batch_sched.BatchStepView = .{
+        .slot_ids = &slot_ids,
+        .request_ids = &req_ids,
+        .user_tags = &user_tags,
+        .input_tokens = &in_toks,
+        .seq_positions = &positions,
+        .temperatures = &temps,
+        .rngs = &rng_ptrs,
+        .ngram_domains = &domains,
+        .prefix_handles = &prefix_handles,
+    };
+    try batch_rt.stepDecodeBatch(&view, &out_toks);
+
+    // Slot 0 (base) and Slot 2 (zero LoRA) must match base_logits, while Slot 1 matches active_logits!
+    const row0 = model.logits_host[0..64];
+    const row1 = model.logits_host[64..128];
+    const row2 = model.logits_host[128..192];
+    for (0..64) |v| {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(base_logits[v])), @as(f32, @floatCast(row0[v])), 1e-2);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(base_logits[v])), @as(f32, @floatCast(row2[v])), 1e-2);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(active_logits[v])), @as(f32, @floatCast(row1[v])), 1e-2);
+    }
+    var slot1_vs_slot0: f32 = 0.0;
+    for (0..64) |v| {
+        slot1_vs_slot0 = @max(slot1_vs_slot0, @abs(@as(f32, @floatCast(row1[v])) - @as(f32, @floatCast(row0[v]))));
+    }
+    try std.testing.expect(slot1_vs_slot0 > 1e-3);
 }

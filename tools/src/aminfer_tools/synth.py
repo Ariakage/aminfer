@@ -23,7 +23,10 @@ from aminfer_tools.amf import (
     AMF_VERSION,
     CHECKSUM_CRC32_IEEE,
     ENTRY_STRUCT,
+    FLAG_EMBEDDED_METADATA,
     HEADER_STRUCT,
+    META_CONFIG_JSON,
+    META_TOKENIZER_JSON,
     NO_EXPERT,
     NO_LAYER,
     SME2_GROUP_K,
@@ -905,8 +908,10 @@ def _write_planned_amf(
     *,
     u32_payloads: dict[str, bytes] | None = None,
     raw_payloads: dict[str, bytes] | None = None,
+    metadata_payloads: dict[str, bytes] | None = None,
 ) -> list[PackedTensorMeta]:
-    tensor_count = len(plans)
+    meta_items = sorted(metadata_payloads.items()) if metadata_payloads else []
+    tensor_count = len(plans) + len(meta_items)
     dir_offset = APPLE_PAGE_SIZE
     dir_raw_len = tensor_count * ENTRY_STRUCT.size
     dir_bytes = 0 if tensor_count == 0 else _align_up(dir_raw_len, APPLE_PAGE_SIZE)
@@ -922,6 +927,37 @@ def _write_planned_amf(
             meta = _stream_tensor_blob(fh, plan, seed, cursor, u32_payload=payload, raw_payload=r_payload)
             metas.append(meta)
             cursor += meta.blob_bytes
+
+        for m_name, m_bytes in meta_items:
+            if len(m_bytes) == 0:
+                raise ValueError(f"metadata payload for {m_name!r} must be non-empty")
+            m_blob_bytes = _align_up(len(m_bytes), APPLE_PAGE_SIZE)
+            fh.write(m_bytes)
+            crc = zlib.crc32(m_bytes, 0) & 0xFFFFFFFF
+            pad_len = m_blob_bytes - len(m_bytes)
+            if pad_len > 0:
+                crc = _stream_zeros(fh, pad_len, crc)
+            metas.append(
+                PackedTensorMeta(
+                    name=m_name,
+                    kind=TensorKind.METADATA,
+                    dtype=DType.U32,
+                    quant_bits=0,
+                    group_size=0,
+                    layer=NO_LAYER,
+                    expert=NO_EXPERT,
+                    shape=(len(m_bytes),),
+                    blob_offset=cursor,
+                    blob_bytes=m_blob_bytes,
+                    data_bytes=len(m_bytes),
+                    params_offset=0,
+                    params_bytes=0,
+                    blob_crc32=crc & 0xFFFFFFFF,
+                    layout=TensorLayout.ROW_MAJOR,
+                    quant_param_kind=QuantParamKind.AFFINE_SCALE_BIAS,
+                )
+            )
+            cursor += m_blob_bytes
 
         dir_raw = bytearray(dir_raw_len)
         for i, m in enumerate(metas):
@@ -953,10 +989,11 @@ def _write_planned_amf(
         dir_crc = zlib.crc32(dir_raw) & 0xFFFFFFFF
 
         model_id_bytes = model_id.encode("utf-8")
+        hdr_flags = FLAG_EMBEDDED_METADATA if meta_items else 0
         header_zero_crc = HEADER_STRUCT.pack(
             AMF_MAGIC,
             AMF_VERSION,
-            0,
+            hdr_flags,
             APPLE_PAGE_SIZE,
             CHECKSUM_CRC32_IEEE,
             tensor_count,
@@ -972,7 +1009,7 @@ def _write_planned_amf(
         header_packed = HEADER_STRUCT.pack(
             AMF_MAGIC,
             AMF_VERSION,
-            0,
+            hdr_flags,
             APPLE_PAGE_SIZE,
             CHECKSUM_CRC32_IEEE,
             tensor_count,
@@ -1004,6 +1041,7 @@ def generate_qwen3_bundle(
     *,
     seed: int = 42,
     cold_experts: Iterable[tuple[int, int]] = (),
+    embed_metadata: bool = False,
 ) -> SynthBundle:
     """Generate deterministic `model.amf`, `config.json`, and `tokenizer.json` in `output_dir`."""
     config.validate()
@@ -1013,17 +1051,23 @@ def generate_qwen3_bundle(
     config_path = output_dir / "config.json"
     tokenizer_path = output_dir / "tokenizer.json"
 
-    plans = _plan_qwen3_tensors(config, set(cold_experts))
-    metas = _write_planned_amf(amf_path, config.model_id, plans, seed)
+    cfg_text = json.dumps(config.to_hf_config_dict(), indent=2) + "\n"
+    tok_text = json.dumps(build_qwen3_tokenizer_dict(config), separators=(",", ":"), ensure_ascii=False) + "\n"
 
-    config_path.write_text(
-        json.dumps(config.to_hf_config_dict(), indent=2) + "\n",
-        encoding="utf-8",
+    meta_payloads = (
+        {
+            META_CONFIG_JSON: cfg_text.encode("utf-8"),
+            META_TOKENIZER_JSON: tok_text.encode("utf-8"),
+        }
+        if embed_metadata
+        else None
     )
-    tokenizer_path.write_text(
-        json.dumps(build_qwen3_tokenizer_dict(config), separators=(",", ":"), ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+
+    plans = _plan_qwen3_tensors(config, set(cold_experts))
+    metas = _write_planned_amf(amf_path, config.model_id, plans, seed, metadata_payloads=meta_payloads)
+
+    config_path.write_text(cfg_text, encoding="utf-8")
+    tokenizer_path.write_text(tok_text, encoding="utf-8")
 
     return SynthBundle(
         amf_path=amf_path,

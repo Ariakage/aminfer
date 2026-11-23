@@ -36,6 +36,13 @@ AMF_VERSION = 1
 CHECKSUM_CRC32_IEEE = 1
 NO_LAYER = 0xFFFF
 NO_EXPERT = 0xFFFF
+FLAG_EMBEDDED_METADATA = 1 << 0
+KNOWN_HEADER_FLAGS = FLAG_EMBEDDED_METADATA
+
+META_PREFIX = "__meta."
+META_CONFIG_JSON = "__meta.config_json"
+META_TOKENIZER_JSON = "__meta.tokenizer_json"
+META_ADAPTER_CONFIG_JSON = "__meta.adapter_config_json"
 
 HEADER_STRUCT = struct.Struct("<8sIIIIIIQQII64sQ")
 ENTRY_STRUCT = struct.Struct("<48sBBBBHHHHI4IQQQQQQ")
@@ -113,6 +120,34 @@ class TensorKind(enum.IntEnum):
     SHARED_EXPERT = 7
     SPARSE_TABLE = 8
     LOOP_ADAPTER = 9
+    METADATA = 10
+
+
+def is_meta_name(name: str) -> bool:
+    return name.startswith(META_PREFIX)
+
+
+def make_metadata_record(name: str, payload: bytes | str) -> tuple:
+    """Build a 12-tuple `write_amf` record for a cold `__meta.*` UTF-8 JSON blob (W18)."""
+    if not is_meta_name(name):
+        raise ValueError(f"metadata entry name must start with {META_PREFIX!r}, got {name!r}")
+    raw = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+    if len(raw) == 0:
+        raise ValueError(f"metadata payload for {name!r} must be non-empty")
+    return (
+        name,
+        TensorKind.METADATA,
+        DType.U32,
+        0,
+        0,
+        NO_LAYER,
+        NO_EXPERT,
+        (len(raw),),
+        raw,
+        b"",
+        TensorLayout.ROW_MAJOR,
+        QuantParamKind.AFFINE_SCALE_BIAS,
+    )
 
 
 class DType(enum.IntEnum):
@@ -513,11 +548,12 @@ def write_amf(
 
     dir_raw = _pack_directory(metas)
     dir_crc = _crc32(dir_raw)
+    flags = FLAG_EMBEDDED_METADATA if any(m.kind == TensorKind.METADATA for m in metas) else 0
 
     header_zero_crc = HEADER_STRUCT.pack(
         AMF_MAGIC,
         AMF_VERSION,
-        0,
+        flags,
         APPLE_PAGE_SIZE,
         CHECKSUM_CRC32_IEEE,
         tensor_count,
@@ -533,7 +569,7 @@ def write_amf(
     header_packed = HEADER_STRUCT.pack(
         AMF_MAGIC,
         AMF_VERSION,
-        0,
+        flags,
         APPLE_PAGE_SIZE,
         CHECKSUM_CRC32_IEEE,
         tensor_count,
@@ -1328,6 +1364,9 @@ def pack_amf_from_safetensors(
     workers: int = 1,
     strip_vision: bool = True,
     sme2_pack_loop_adapters: bool = True,
+    embed_metadata: bool = False,
+    config_path: pathlib.Path | None = None,
+    tokenizer_path: pathlib.Path | None = None,
     stats_out: dict[str, int] | None = None,
 ) -> list[PackedTensorMeta]:
     """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
@@ -1365,6 +1404,20 @@ def pack_amf_from_safetensors(
             strip_vision=strip_vision,
             stats_out=stats_out,
         )
+        if embed_metadata or config_path is not None or tokenizer_path is not None:
+            resolved_gsq = resolve_checkpoint(pathlib.Path(input_path))
+            cfg_p, tok_p = _resolve_metadata_paths(
+                pathlib.Path(input_path),
+                resolved_gsq.config_path,
+                config_path=config_path,
+                tokenizer_path=tokenizer_path,
+            )
+            return embed_metadata_into_amf(
+                output_path,
+                config_bytes=cfg_p.read_bytes() if cfg_p is not None else None,
+                tokenizer_bytes=tok_p.read_bytes() if tok_p is not None else None,
+                output_path=output_path,
+            )
         return report.metas
 
     model_id_bytes = model_id.encode("utf-8")
@@ -1400,7 +1453,20 @@ def pack_amf_from_safetensors(
         stats_out=stats_out,
     )
 
-    tensor_count = len(plan)
+    meta_blobs: list[tuple[str, bytes]] = []
+    if embed_metadata or config_path is not None or tokenizer_path is not None:
+        cfg_p, tok_p = _resolve_metadata_paths(
+            pathlib.Path(input_path),
+            resolved.config_path,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
+        )
+        if cfg_p is not None:
+            meta_blobs.append((META_CONFIG_JSON, cfg_p.read_bytes()))
+        if tok_p is not None:
+            meta_blobs.append((META_TOKENIZER_JSON, tok_p.read_bytes()))
+
+    tensor_count = len(plan) + len(meta_blobs)
     dir_offset = APPLE_PAGE_SIZE
     dir_raw_len = tensor_count * ENTRY_STRUCT.size
     dir_bytes = 0 if tensor_count == 0 else _align_up(dir_raw_len, APPLE_PAGE_SIZE)
@@ -1409,6 +1475,13 @@ def pack_amf_from_safetensors(
     for e in plan:
         offsets.append(cursor)
         cursor += e.blob_bytes
+    meta_offsets: list[tuple[str, bytes, int, int]] = []
+    for m_name, m_bytes in meta_blobs:
+        if len(m_bytes) == 0:
+            raise ValueError(f"metadata payload for {m_name!r} must be non-empty")
+        m_blob_bytes = _align_up(len(m_bytes), APPLE_PAGE_SIZE)
+        meta_offsets.append((m_name, m_bytes, cursor, m_blob_bytes))
+        cursor += m_blob_bytes
 
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1459,11 +1532,47 @@ def pack_amf_from_safetensors(
                         quant_param_kind=eff_param_kind,
                     )
                 )
+            for m_name, m_bytes, m_offset, m_blob_bytes in meta_offsets:
+                if out.tell() != m_offset:
+                    raise AssertionError(f"planned meta offset {m_offset} != file position {out.tell()} for {m_name}")
+                w = _BlobWriter(out)
+                w.write(m_bytes)
+                pad_len = m_blob_bytes - len(m_bytes)
+                if pad_len > 0:
+                    w.zeros(pad_len)
+                metas.append(
+                    PackedTensorMeta(
+                        name=m_name,
+                        kind=TensorKind.METADATA,
+                        dtype=DType.U32,
+                        quant_bits=0,
+                        group_size=0,
+                        layer=NO_LAYER,
+                        expert=NO_EXPERT,
+                        shape=(len(m_bytes),),
+                        blob_offset=m_offset,
+                        blob_bytes=m_blob_bytes,
+                        data_bytes=len(m_bytes),
+                        params_offset=0,
+                        params_bytes=0,
+                        blob_crc32=w.crc & 0xFFFFFFFF,
+                        layout=TensorLayout.ROW_MAJOR,
+                        quant_param_kind=QuantParamKind.AFFINE_SCALE_BIAS,
+                    )
+                )
             if out.tell() != cursor:
                 raise AssertionError(f"final size {out.tell()} != planned {cursor}")
 
             dir_raw = _pack_directory(metas)
-            header = _pack_header(model_id_bytes, tensor_count, dir_offset, dir_bytes, _crc32(dir_raw))
+            hdr_flags = FLAG_EMBEDDED_METADATA if meta_offsets else 0
+            header = _pack_header(
+                model_id_bytes,
+                tensor_count,
+                dir_offset,
+                dir_bytes,
+                _crc32(dir_raw),
+                flags=hdr_flags,
+            )
             out.seek(0)
             out.write(header)
             if dir_raw:
@@ -1508,11 +1617,19 @@ def _pack_directory(metas: Sequence[PackedTensorMeta]) -> bytes:
     return bytes(dir_raw)
 
 
-def _pack_header(model_id_bytes: bytes, tensor_count: int, dir_offset: int, dir_bytes: int, dir_crc: int) -> bytes:
+def _pack_header(
+    model_id_bytes: bytes,
+    tensor_count: int,
+    dir_offset: int,
+    dir_bytes: int,
+    dir_crc: int,
+    *,
+    flags: int = 0,
+) -> bytes:
     fields = [
         AMF_MAGIC,
         AMF_VERSION,
-        0,
+        flags,
         APPLE_PAGE_SIZE,
         CHECKSUM_CRC32_IEEE,
         tensor_count,
@@ -1526,6 +1643,184 @@ def _pack_header(model_id_bytes: bytes, tensor_count: int, dir_offset: int, dir_
     ]
     fields[10] = _crc32(HEADER_STRUCT.pack(*fields))
     return HEADER_STRUCT.pack(*fields)
+
+
+def _resolve_metadata_paths(
+    input_path: pathlib.Path,
+    resolved_config: pathlib.Path | None,
+    *,
+    config_path: pathlib.Path | None = None,
+    tokenizer_path: pathlib.Path | None = None,
+) -> tuple[pathlib.Path | None, pathlib.Path | None]:
+    base_dir = input_path if input_path.is_dir() else input_path.parent
+    cfg = pathlib.Path(config_path) if config_path is not None else resolved_config
+    if cfg is None:
+        cand = base_dir / "config.json"
+        if cand.is_file():
+            cfg = cand
+    elif not cfg.is_file():
+        raise FileNotFoundError(f"config.json not found: {cfg}")
+
+    tok = pathlib.Path(tokenizer_path) if tokenizer_path is not None else None
+    if tok is None:
+        cand = base_dir / "tokenizer.json"
+        if cand.is_file():
+            tok = cand
+    elif not tok.is_file():
+        raise FileNotFoundError(f"tokenizer.json not found: {tok}")
+    return cfg, tok
+
+
+def read_amf_metadata(amf_path: pathlib.Path, meta_name: str) -> bytes | None:
+    """Read and CRC32-verify a cold embedded `__meta.*` payload from an `.amf` file (W18)."""
+    header, metas = load_amf_metadata(pathlib.Path(amf_path))
+    _ = header
+    target = next((m for m in metas if m.name == meta_name), None)
+    if target is None:
+        return None
+    if target.kind != TensorKind.METADATA:
+        raise ValueError(f"entry {meta_name!r} is kind={target.kind}, expected TensorKind.METADATA")
+    with pathlib.Path(amf_path).open("rb", buffering=0) as fh:
+        raw_blob = _read_exact(fh, target.blob_offset, target.blob_bytes)
+    got_crc = _crc32(raw_blob)
+    if got_crc != target.blob_crc32:
+        raise ValueError(
+            f"metadata CRC mismatch for {meta_name!r}: expected {target.blob_crc32:#010x}, got {got_crc:#010x}"
+        )
+    return raw_blob[: target.data_bytes]
+
+
+def embed_metadata_into_amf(
+    amf_path: pathlib.Path,
+    *,
+    config_bytes: bytes | None = None,
+    tokenizer_bytes: bytes | None = None,
+    extra_metadata: dict[str, bytes] | None = None,
+    output_path: pathlib.Path | None = None,
+) -> list[PackedTensorMeta]:
+    """Attach or replace cold `__meta.*` JSON payloads inside an existing `.amf` file (W18)."""
+    src_path = pathlib.Path(amf_path)
+    dst_path = pathlib.Path(output_path) if output_path is not None else src_path
+    attachments: dict[str, bytes] = {}
+    if config_bytes is not None:
+        attachments[META_CONFIG_JSON] = bytes(config_bytes)
+    if tokenizer_bytes is not None:
+        attachments[META_TOKENIZER_JSON] = bytes(tokenizer_bytes)
+    if extra_metadata:
+        for k, v in extra_metadata.items():
+            if not is_meta_name(k):
+                raise ValueError(f"metadata key must start with {META_PREFIX!r}, got {k!r}")
+            attachments[k] = bytes(v)
+    for k, v in attachments.items():
+        if len(v) == 0:
+            raise ValueError(f"metadata payload for {k!r} must be non-empty")
+
+    header, old_metas = load_amf_metadata(src_path)
+    kept = [m for m in old_metas if m.name not in attachments]
+    total_count = len(kept) + len(attachments)
+    dir_offset = APPLE_PAGE_SIZE
+    dir_bytes = 0 if total_count == 0 else _align_up(total_count * ENTRY_STRUCT.size, APPLE_PAGE_SIZE)
+    cursor = dir_offset + dir_bytes
+
+    planned_kept: list[tuple[PackedTensorMeta, int]] = []
+    for m in kept:
+        planned_kept.append((m, cursor))
+        cursor += m.blob_bytes
+    planned_meta: list[tuple[str, bytes, int, int]] = []
+    for m_name, m_bytes in sorted(attachments.items()):
+        m_blob_bytes = _align_up(len(m_bytes), APPLE_PAGE_SIZE)
+        planned_meta.append((m_name, m_bytes, cursor, m_blob_bytes))
+        cursor += m_blob_bytes
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    partial = dst_path.with_name(dst_path.name + ".partial")
+    new_metas: list[PackedTensorMeta] = []
+    try:
+        with src_path.open("rb", buffering=0) as src_fh, partial.open("wb") as out_fh:
+            _set_nocache(src_fh.fileno())
+            _set_nocache(out_fh.fileno())
+            _BlobWriter(out_fh).zeros(dir_offset + dir_bytes)
+
+            for m, new_off in planned_kept:
+                w = _BlobWriter(out_fh)
+                done = 0
+                while done < m.blob_bytes:
+                    take = min(_COPY_CHUNK_BYTES, m.blob_bytes - done)
+                    w.write(_read_exact(src_fh, m.blob_offset + done, take))
+                    done += take
+                if (w.crc & 0xFFFFFFFF) != m.blob_crc32:
+                    raise ValueError(f"source blob CRC mismatch for {m.name!r}")
+                new_metas.append(
+                    PackedTensorMeta(
+                        name=m.name,
+                        kind=m.kind,
+                        dtype=m.dtype,
+                        quant_bits=m.quant_bits,
+                        group_size=m.group_size,
+                        layer=m.layer,
+                        expert=m.expert,
+                        shape=m.shape,
+                        blob_offset=new_off,
+                        blob_bytes=m.blob_bytes,
+                        data_bytes=m.data_bytes,
+                        params_offset=m.params_offset,
+                        params_bytes=m.params_bytes,
+                        blob_crc32=m.blob_crc32,
+                        layout=m.layout,
+                        quant_param_kind=m.quant_param_kind,
+                    )
+                )
+
+            for m_name, m_bytes, m_off, m_blob_bytes in planned_meta:
+                w = _BlobWriter(out_fh)
+                w.write(m_bytes)
+                pad_len = m_blob_bytes - len(m_bytes)
+                if pad_len > 0:
+                    w.zeros(pad_len)
+                new_metas.append(
+                    PackedTensorMeta(
+                        name=m_name,
+                        kind=TensorKind.METADATA,
+                        dtype=DType.U32,
+                        quant_bits=0,
+                        group_size=0,
+                        layer=NO_LAYER,
+                        expert=NO_EXPERT,
+                        shape=(len(m_bytes),),
+                        blob_offset=m_off,
+                        blob_bytes=m_blob_bytes,
+                        data_bytes=len(m_bytes),
+                        params_offset=0,
+                        params_bytes=0,
+                        blob_crc32=w.crc & 0xFFFFFFFF,
+                        layout=TensorLayout.ROW_MAJOR,
+                        quant_param_kind=QuantParamKind.AFFINE_SCALE_BIAS,
+                    )
+                )
+
+            dir_raw = _pack_directory(new_metas)
+            has_meta = any(m.kind == TensorKind.METADATA for m in new_metas)
+            hdr_flags = (header.flags | FLAG_EMBEDDED_METADATA) if has_meta else (header.flags & ~FLAG_EMBEDDED_METADATA)
+            new_hdr = _pack_header(
+                header.model_id.encode("utf-8"),
+                len(new_metas),
+                dir_offset,
+                dir_bytes,
+                _crc32(dir_raw),
+                flags=hdr_flags,
+            )
+            out_fh.seek(0)
+            out_fh.write(new_hdr)
+            if dir_raw:
+                out_fh.seek(dir_offset)
+                out_fh.write(dir_raw)
+            out_fh.flush()
+            os.fsync(out_fh.fileno())
+        os.replace(partial, dst_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return new_metas
 
 
 # ---------------------------------------------------------------------------
@@ -3052,6 +3347,7 @@ def repack_amf_sme2(
                 dir_offset,
                 dir_bytes,
                 _crc32(dir_raw),
+                flags=header.flags,
             )
             out_fh.seek(0)
             out_fh.write(new_header)

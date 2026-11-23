@@ -15,6 +15,17 @@ pub const CHECKSUM_CRC32_IEEE: u32 = 1;
 pub const NO_LAYER: u16 = 0xFFFF;
 pub const NO_EXPERT: u16 = 0xFFFF;
 
+/// `Header.flags` bit indicating cold embedded metadata blobs (`__meta.*`, ADR-0022, W18).
+pub const FLAG_EMBEDDED_METADATA: u32 = 1 << 0;
+pub const KNOWN_HEADER_FLAGS: u32 = FLAG_EMBEDDED_METADATA;
+
+/// Reserved directory entry prefix & canonical names for single-file `.amf` / `.amlora`
+/// cold metadata payloads (`ADR-0022`, `W18`, `W19`).
+pub const META_PREFIX: []const u8 = "__meta.";
+pub const META_CONFIG_JSON: []const u8 = "__meta.config_json";
+pub const META_TOKENIZER_JSON: []const u8 = "__meta.tokenizer_json";
+pub const META_ADAPTER_CONFIG_JSON: []const u8 = "__meta.adapter_config_json";
+
 /// ARMv9 SME2 `sme2_panel64` geometry constants (ADR-0018, W15).
 pub const SME2_PANEL_COLS: u64 = 16;
 pub const SME2_GROUP_K: u64 = 64;
@@ -53,20 +64,51 @@ pub const TensorKind = enum(u8) {
     sparse_table = 8,
     /// Wired recurrent `Step-LoRA` adapter (`lora_a`, `lora_b`, `alpha`, ADR-0019, W16).
     loop_adapter = 9,
+    /// Cold 16 KiB-aligned UTF-8 JSON metadata (`__meta.config_json`,
+    /// `__meta.tokenizer_json`, `__meta.adapter_config_json`, ADR-0022, W18/W19).
+    /// Never `mlock`ed into wired weight shards (`0` runtime decode overhead).
+    metadata = 10,
 
     /// Returns `true` for tensor kinds loaded into startup wired RAM and `false`
-    /// for cold NVMe-streamed kinds (`cold_expert`, `sparse_table`).
+    /// for cold NVMe-streamed or metadata kinds (`cold_expert`, `sparse_table`, `metadata`).
     pub fn isWired(self: TensorKind) bool {
         return switch (self) {
             .dense, .hot_expert, .embedding, .norm, .router, .lm_head, .shared_expert, .loop_adapter => true,
-            .cold_expert, .sparse_table => false,
+            .cold_expert, .sparse_table, .metadata => false,
         };
     }
 
     pub fn isCold(self: TensorKind) bool {
-        return !self.isWired();
+        return switch (self) {
+            .cold_expert, .sparse_table => true,
+            .dense, .hot_expert, .embedding, .norm, .router, .lm_head, .shared_expert, .loop_adapter, .metadata => false,
+        };
+    }
+
+    pub fn isMetadata(self: TensorKind) bool {
+        return self == .metadata;
     }
 };
+
+pub fn isMetaName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, META_PREFIX);
+}
+
+pub fn isMetaEntry(entry: *const TensorEntry) bool {
+    return entry.kind == @backingInt(TensorKind.metadata) or isMetaName(entry.nameSlice());
+}
+
+/// Builds a canonical `TensorKind.metadata` directory record for a non-empty
+/// UTF-8 metadata blob (`__meta.*`) of exact unpadded length `payload_len`.
+pub fn makeMetadataEntry(name_str: []const u8, payload_len: u64) ParseError!TensorEntry {
+    if (!isMetaName(name_str) or name_str.len >= 48) return error.InvalidTensorKind;
+    if (payload_len == 0 or payload_len > std.math.maxInt(u32)) return error.InvalidShape;
+    var entry = TensorEntry.zeroed(name_str, .metadata, .u32);
+    entry.rank = 1;
+    entry.shape = .{ @intCast(payload_len), 0, 0, 0 };
+    entry.data_bytes = payload_len;
+    return entry;
+}
 
 pub const DType = enum(u8) {
     f16 = 0,
@@ -377,6 +419,51 @@ pub const Parsed = struct {
         return total;
     }
 
+    /// Returns total 16 KiB-aligned blob bytes across all embedded cold metadata
+    /// payloads (`TensorKind.metadata`, `__meta.*`).
+    pub fn totalMetadataBytes(self: *const Parsed) u64 {
+        var total: u64 = 0;
+        for (self.entries) |*entry| {
+            const kind = std.enums.fromInt(TensorKind, entry.kind) orelse continue;
+            if (kind.isMetadata()) {
+                total += entry.blob_bytes;
+            }
+        }
+        return total;
+    }
+
+    pub fn hasEmbeddedMetadata(self: *const Parsed, meta_name: []const u8) bool {
+        const entry = self.find(meta_name) orelse return false;
+        return entry.kind == @backingInt(TensorKind.metadata);
+    }
+
+    pub fn hasEmbeddedConfig(self: *const Parsed) bool {
+        return self.hasEmbeddedMetadata(META_CONFIG_JSON);
+    }
+
+    pub fn hasEmbeddedTokenizer(self: *const Parsed) bool {
+        return self.hasEmbeddedMetadata(META_TOKENIZER_JSON);
+    }
+
+    /// Returns a zero-copy slice of an embedded metadata payload (`__meta.*`) from
+    /// an in-memory `.amf` image after verifying its 16 KiB-aligned blob CRC-32.
+    pub fn extractMetadataFromBytes(
+        self: *const Parsed,
+        bytes: []const u8,
+        meta_name: []const u8,
+    ) ParseError!?[]const u8 {
+        const entry = self.find(meta_name) orelse return null;
+        if ((try entry.tensorKind()) != .metadata) return error.InvalidTensorKind;
+        const start: usize = @intCast(entry.blob_offset);
+        const blob_len: usize = @intCast(entry.blob_bytes);
+        const data_len: usize = @intCast(entry.data_bytes);
+        if (start + blob_len > bytes.len or data_len > blob_len) return error.BlobOutOfBounds;
+        if (std.hash.Crc32.hash(bytes[start .. start + blob_len]) != entry.blob_crc32) {
+            return error.BlobChecksumMismatch;
+        }
+        return bytes[start .. start + data_len];
+    }
+
     /// Loads every startup-wired blob from an in-memory `.amf` image into `arena`
     /// with CRC-32 verification. Cold entries (`cold_expert`, `sparse_table`) stay
     /// `null` and consume zero wired bytes. Caller owns the returned pointer slice.
@@ -495,6 +582,48 @@ pub const AmfFile = struct {
         return self.parsed.totalColdBytes();
     }
 
+    pub fn totalMetadataBytes(self: *const AmfFile) u64 {
+        return self.parsed.totalMetadataBytes();
+    }
+
+    /// Reads an embedded cold metadata payload (`__meta.*`) from disk via
+    /// `F_NOCACHE` `pread` (zero `mlock`, zero wired-arena allocation), verifies
+    /// its full 16 KiB-aligned blob CRC-32, and returns an owned slice of exact
+    /// unpadded length `entry.data_bytes` (`null` when not embedded).
+    pub fn readMetadataAlloc(
+        self: *const AmfFile,
+        allocator: std.mem.Allocator,
+        meta_name: []const u8,
+    ) (ParseError || IoError)!?[]u8 {
+        const entry = self.parsed.find(meta_name) orelse return null;
+        if ((try entry.tensorKind()) != .metadata) return error.InvalidTensorKind;
+        const blob_len: usize = @intCast(entry.blob_bytes);
+        const data_len: usize = @intCast(entry.data_bytes);
+        if (data_len == 0 or data_len > blob_len) return error.InvalidShape;
+
+        const out = try allocator.alloc(u8, data_len);
+        errdefer allocator.free(out);
+
+        const chunk_len: usize = @min(blob_len, VERIFY_CHUNK_BYTES);
+        const scratch = try allocator.alignedAlloc(u8, .fromByteUnits(page.APPLE_PAGE_SIZE), chunk_len);
+        defer allocator.free(scratch);
+
+        var hasher = std.hash.Crc32.init();
+        var done: usize = 0;
+        while (done < blob_len) {
+            const take: usize = @min(blob_len - done, chunk_len);
+            try preadExact(self.fd, scratch[0..take], entry.blob_offset + done);
+            hasher.update(scratch[0..take]);
+            if (done < data_len) {
+                const copy_n = @min(data_len - done, take);
+                @memcpy(out[done .. done + copy_n], scratch[0..copy_n]);
+            }
+            done += take;
+        }
+        if (hasher.final() != entry.blob_crc32) return error.BlobChecksumMismatch;
+        return out;
+    }
+
     /// Loads every startup-wired blob from disk via `F_NOCACHE` `pread` into
     /// `arena` with CRC-32 verification. Cold entries (`cold_expert`, `sparse_table`)
     /// stay `null`, perform zero disk reads, and consume zero wired bytes.
@@ -584,6 +713,7 @@ fn preadExact(fd: std.c.fd_t, dst: []u8, offset: u64) IoError!void {
 fn validateHeader(hdr: *const Header, file_size: u64) ParseError!void {
     if (!std.mem.eql(u8, &hdr.magic, &MAGIC)) return error.InvalidMagic;
     if (hdr.version != FORMAT_VERSION) return error.UnsupportedVersion;
+    if ((hdr.flags & ~KNOWN_HEADER_FLAGS) != 0) return error.UnsupportedVersion;
     if (hdr.page_size != page.APPLE_PAGE_SIZE) return error.UnsupportedPageSize;
     if (hdr.checksum_algo != CHECKSUM_CRC32_IEEE) return error.UnsupportedChecksum;
     if (computeHeaderCrc32(hdr) != hdr.header_crc32) return error.HeaderChecksumMismatch;
@@ -655,6 +785,26 @@ fn validateEntries(
         }
         const blob_end = std.math.add(u64, entry.blob_offset, entry.blob_bytes) catch return error.BlobOutOfBounds;
         if (blob_end > file_size) return error.BlobOutOfBounds;
+
+        const name_is_meta = isMetaName(name);
+        if (kind == .metadata or name_is_meta) {
+            if (kind != .metadata or !name_is_meta) return error.InvalidTensorKind;
+            if (layout != .row_major) return error.InvalidTensorLayout;
+            if (param_kind != .affine_scale_bias) return error.InvalidQuantParamKind;
+            if (dtype != .u32) return error.InvalidDType;
+            if (entry.quant_bits != 0 or entry.group_size != 0) return error.InvalidQuantization;
+            if (entry.params_offset != 0 or entry.params_bytes != 0) return error.MisalignedParams;
+            if (entry.rank != 1) return error.InvalidRank;
+            if (entry.layer != NO_LAYER or entry.expert != NO_EXPERT) return error.InvalidShape;
+            if (entry.shape[0] == 0 or entry.shape[1] != 0 or entry.shape[2] != 0 or entry.shape[3] != 0) {
+                return error.InvalidShape;
+            }
+            if (entry.data_bytes != entry.shape[0] or entry.data_bytes > entry.blob_bytes) {
+                return error.InvalidShape;
+            }
+            ranges[i] = .{ .start = entry.blob_offset, .end = blob_end };
+            continue;
+        }
 
         switch (layout) {
             .row_major => {
@@ -739,6 +889,1008 @@ fn validateEntries(
         if (ranges[i].start < ranges[i - 1].end) return error.OverlappingBlobs;
     }
     return index;
+}
+
+// ============================================================================
+// W18: Self-Contained Single-File `.amf` Metadata & Zero-`mlock` Inspection
+// ============================================================================
+
+pub const MetadataSource = enum(u8) {
+    none = 0,
+    explicit_override = 1,
+    embedded = 2,
+    sidecar = 3,
+
+    pub fn label(self: MetadataSource) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .explicit_override => "explicit_override",
+            .embedded => "embedded",
+            .sidecar => "sidecar",
+        };
+    }
+};
+
+pub const ResolvedMetadata = struct {
+    bytes: []u8,
+    source: MetadataSource,
+    crc32: u32,
+
+    pub fn deinit(self: *ResolvedMetadata, allocator: std.mem.Allocator) void {
+        if (self.bytes.len > 0) allocator.free(self.bytes);
+        self.* = .{ .bytes = &.{}, .source = .none, .crc32 = 0 };
+    }
+};
+
+pub const ResolveMetadataError = ParseError || IoError || error{
+    MetadataNotFound,
+    PathTooLong,
+    MetadataTooLarge,
+};
+
+const MAX_METADATA_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+fn toPosixPathZ(path: []const u8, buf: *[std.fs.max_path_bytes]u8) error{PathTooLong}![:0]const u8 {
+    if (path.len == 0 or path.len >= buf.len) return error.PathTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0];
+}
+
+fn readRegularFileAlloc(allocator: std.mem.Allocator, path: []const u8) ResolveMetadataError![]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = try toPosixPathZ(path, &path_buf);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
+    if (st.size <= 0) return error.FileTooSmall;
+    const file_len_u64: u64 = @intCast(st.size);
+    if (file_len_u64 > MAX_METADATA_FILE_BYTES) return error.MetadataTooLarge;
+    const file_len: usize = @intCast(file_len_u64);
+
+    const out = try allocator.alloc(u8, file_len);
+    errdefer allocator.free(out);
+    try preadExact(fd, out, 0);
+    return out;
+}
+
+/// Resolves a model metadata JSON payload (`config.json` or `tokenizer.json`) with
+/// `ADR-0022` `W18` precedence:
+///   1. `explicit_override_path` (`--config` / `--tokenizer` CLI flag)
+///   2. Embedded cold metadata (`__meta.config_json` / `__meta.tokenizer_json`) inside `amf_file`
+///   3. Sidecar `<dirname(amf_path)>/<sidecar_filename>`
+pub fn resolveMetadataAlloc(
+    allocator: std.mem.Allocator,
+    amf_file: *const AmfFile,
+    amf_path: []const u8,
+    meta_name: []const u8,
+    sidecar_filename: []const u8,
+    explicit_override_path: ?[]const u8,
+) ResolveMetadataError!ResolvedMetadata {
+    if (explicit_override_path) |ov_path| {
+        const bytes = try readRegularFileAlloc(allocator, ov_path);
+        return .{
+            .bytes = bytes,
+            .source = .explicit_override,
+            .crc32 = std.hash.Crc32.hash(bytes),
+        };
+    }
+
+    if (try amf_file.readMetadataAlloc(allocator, meta_name)) |embedded_bytes| {
+        const entry = amf_file.parsed.find(meta_name).?;
+        return .{
+            .bytes = embedded_bytes,
+            .source = .embedded,
+            .crc32 = entry.blob_crc32,
+        };
+    }
+
+    const dir = std.fs.path.dirname(amf_path) orelse ".";
+    var sidecar_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar_path = std.fmt.bufPrint(&sidecar_buf, "{s}/{s}", .{ dir, sidecar_filename }) catch {
+        return error.PathTooLong;
+    };
+    const bytes = readRegularFileAlloc(allocator, sidecar_path) catch |err| switch (err) {
+        error.OpenFailed => return error.MetadataNotFound,
+        else => return err,
+    };
+    return .{
+        .bytes = bytes,
+        .source = .sidecar,
+        .crc32 = std.hash.Crc32.hash(bytes),
+    };
+}
+
+pub fn resolveConfigJsonAlloc(
+    allocator: std.mem.Allocator,
+    amf_file: *const AmfFile,
+    amf_path: []const u8,
+    explicit_config_path: ?[]const u8,
+) ResolveMetadataError!ResolvedMetadata {
+    return resolveMetadataAlloc(
+        allocator,
+        amf_file,
+        amf_path,
+        META_CONFIG_JSON,
+        "config.json",
+        explicit_config_path,
+    );
+}
+
+pub fn resolveTokenizerJsonAlloc(
+    allocator: std.mem.Allocator,
+    amf_file: *const AmfFile,
+    amf_path: []const u8,
+    explicit_tokenizer_path: ?[]const u8,
+) ResolveMetadataError!ResolvedMetadata {
+    return resolveMetadataAlloc(
+        allocator,
+        amf_file,
+        amf_path,
+        META_TOKENIZER_JSON,
+        "tokenizer.json",
+        explicit_tokenizer_path,
+    );
+}
+
+pub const MetadataAttachment = struct {
+    name: []const u8,
+    payload: []const u8,
+};
+
+/// Returns a new 16 KiB-aligned `.amf` image embedding/replacing `__meta.*`
+/// payloads inside `base_amf_bytes` while keeping all weight blobs bit-exact.
+pub fn embedMetadataIntoAmfBytes(
+    allocator: std.mem.Allocator,
+    base_amf_bytes: []const u8,
+    attachments: []const MetadataAttachment,
+) (ParseError || error{Overflow})![]u8 {
+    var parsed = try Parsed.parseBytes(allocator, base_amf_bytes);
+    defer parsed.deinit(allocator);
+    try parsed.verifyAllBlobsFromBytes(base_amf_bytes);
+
+    for (attachments) |att| {
+        _ = try makeMetadataEntry(att.name, att.payload.len);
+    }
+
+    var kept_indices = try allocator.alloc(usize, parsed.entries.len);
+    defer allocator.free(kept_indices);
+    var kept_count: usize = 0;
+    var any_remaining_meta = false;
+
+    for (parsed.entries, 0..) |*e, idx| {
+        var replaced = false;
+        for (attachments) |att| {
+            if (std.mem.eql(u8, e.nameSlice(), att.name)) {
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            kept_indices[kept_count] = idx;
+            kept_count += 1;
+            if (e.kind == @backingInt(TensorKind.metadata)) any_remaining_meta = true;
+        }
+    }
+
+    const total_entries = kept_count + attachments.len;
+    const new_entries = try allocator.alloc(TensorEntry, total_entries);
+    defer allocator.free(new_entries);
+
+    const dir_offset: usize = page.APPLE_PAGE_SIZE;
+    const dir_raw_len: usize = total_entries * @sizeOf(TensorEntry);
+    const dir_bytes: usize = if (total_entries == 0) 0 else try page.alignUp(dir_raw_len);
+    var cursor: usize = dir_offset + dir_bytes;
+
+    for (0..kept_count) |k| {
+        const src_e = parsed.entries[kept_indices[k]];
+        var dst_e = src_e;
+        dst_e.blob_offset = cursor;
+        new_entries[k] = dst_e;
+        cursor = std.math.add(usize, cursor, @intCast(src_e.blob_bytes)) catch return error.BlobOutOfBounds;
+    }
+
+    for (attachments, 0..) |att, a_idx| {
+        var meta_e = try makeMetadataEntry(att.name, att.payload.len);
+        const blob_len = try page.alignUp(att.payload.len);
+        meta_e.blob_offset = cursor;
+        meta_e.blob_bytes = blob_len;
+        new_entries[kept_count + a_idx] = meta_e;
+        cursor = std.math.add(usize, cursor, blob_len) catch return error.BlobOutOfBounds;
+    }
+
+    const out = try allocator.alloc(u8, cursor);
+    errdefer allocator.free(out);
+    @memset(out, 0);
+
+    for (0..kept_count) |k| {
+        const src_e = parsed.entries[kept_indices[k]];
+        const dst_e = &new_entries[k];
+        const src_off: usize = @intCast(src_e.blob_offset);
+        const dst_off: usize = @intCast(dst_e.blob_offset);
+        const blob_len: usize = @intCast(src_e.blob_bytes);
+        @memcpy(out[dst_off .. dst_off + blob_len], base_amf_bytes[src_off .. src_off + blob_len]);
+    }
+
+    for (attachments, 0..) |att, a_idx| {
+        const dst_e = &new_entries[kept_count + a_idx];
+        const dst_off: usize = @intCast(dst_e.blob_offset);
+        const blob_len: usize = @intCast(dst_e.blob_bytes);
+        @memcpy(out[dst_off .. dst_off + att.payload.len], att.payload);
+        dst_e.blob_crc32 = std.hash.Crc32.hash(out[dst_off .. dst_off + blob_len]);
+    }
+
+    const dir_slice = std.mem.sliceAsBytes(new_entries);
+    if (dir_slice.len > 0) {
+        @memcpy(out[dir_offset .. dir_offset + dir_slice.len], dir_slice);
+    }
+    const dir_crc = std.hash.Crc32.hash(dir_slice);
+
+    var hdr = parsed.header;
+    hdr.tensor_count = @intCast(total_entries);
+    hdr.directory_offset = dir_offset;
+    hdr.directory_bytes = dir_bytes;
+    hdr.directory_crc32 = dir_crc;
+    if (attachments.len > 0 or any_remaining_meta) {
+        hdr.flags |= FLAG_EMBEDDED_METADATA;
+    } else {
+        hdr.flags &= ~FLAG_EMBEDDED_METADATA;
+    }
+    hdr.header_crc32 = computeHeaderCrc32(&hdr);
+    @memcpy(out[0..@sizeOf(Header)], std.mem.asBytes(&hdr));
+    return out;
+}
+
+pub const DTYPE_COUNT: usize = 7;
+
+pub const DTypeStats = struct {
+    tensor_count: u32 = 0,
+    wired_bytes: u64 = 0,
+    cold_bytes: u64 = 0,
+    data_bytes: u64 = 0,
+};
+
+pub const MetaBlobReport = struct {
+    present: bool = false,
+    data_bytes: u64 = 0,
+    blob_bytes: u64 = 0,
+    crc32: u32 = 0,
+    crc_valid: bool = false,
+};
+
+pub const HardwareTier = enum(u8) {
+    m4_16gb = 0,
+    m4_24gb = 1,
+    pro_48gb = 2,
+    max_64gb = 3,
+    max_128gb = 4,
+    ultra_192gb = 5,
+    ultra_512gb = 6,
+    cluster_required = 7,
+
+    pub fn label(self: HardwareTier) []const u8 {
+        return switch (self) {
+            .m4_16gb => "M4 16GB",
+            .m4_24gb => "M4 24GB",
+            .pro_48gb => "Pro 48GB",
+            .max_64gb => "Max 64GB",
+            .max_128gb => "Max 128GB",
+            .ultra_192gb => "Ultra 192GB",
+            .ultra_512gb => "Ultra 512GB",
+            .cluster_required => "Cluster (>512GB)",
+        };
+    }
+
+    /// Usable wired budget (`physical_ram - DEFAULT_HEADROOM_BYTES`, ADR-0012).
+    pub fn usableWiredBytes(self: HardwareTier) u64 {
+        const gib: u64 = 1024 * 1024 * 1024;
+        const ram: u64 = switch (self) {
+            .m4_16gb => 16 * gib,
+            .m4_24gb => 24 * gib,
+            .pro_48gb => 48 * gib,
+            .max_64gb => 64 * gib,
+            .max_128gb => 128 * gib,
+            .ultra_192gb => 192 * gib,
+            .ultra_512gb => 512 * gib,
+            .cluster_required => 0,
+        };
+        return if (ram > budget_mod.DEFAULT_HEADROOM_BYTES)
+            ram - budget_mod.DEFAULT_HEADROOM_BYTES
+        else
+            0;
+    }
+};
+
+pub const TierFitSummary = struct {
+    fits_m4_16gb: bool,
+    fits_m4_24gb: bool,
+    fits_pro_48gb: bool,
+    fits_max_64gb: bool,
+    fits_max_128gb: bool,
+    fits_ultra_192gb: bool,
+    fits_ultra_512gb: bool,
+    recommended_min_tier: HardwareTier,
+
+    pub fn evaluate(required_wired_bytes: u64) TierFitSummary {
+        const fit16 = required_wired_bytes <= HardwareTier.m4_16gb.usableWiredBytes();
+        const fit24 = required_wired_bytes <= HardwareTier.m4_24gb.usableWiredBytes();
+        const fit48 = required_wired_bytes <= HardwareTier.pro_48gb.usableWiredBytes();
+        const fit64 = required_wired_bytes <= HardwareTier.max_64gb.usableWiredBytes();
+        const fit128 = required_wired_bytes <= HardwareTier.max_128gb.usableWiredBytes();
+        const fit192 = required_wired_bytes <= HardwareTier.ultra_192gb.usableWiredBytes();
+        const fit512 = required_wired_bytes <= HardwareTier.ultra_512gb.usableWiredBytes();
+        const min_tier: HardwareTier = if (fit16)
+            .m4_16gb
+        else if (fit24)
+            .m4_24gb
+        else if (fit48)
+            .pro_48gb
+        else if (fit64)
+            .max_64gb
+        else if (fit128)
+            .max_128gb
+        else if (fit192)
+            .ultra_192gb
+        else if (fit512)
+            .ultra_512gb
+        else
+            .cluster_required;
+        return .{
+            .fits_m4_16gb = fit16,
+            .fits_m4_24gb = fit24,
+            .fits_pro_48gb = fit48,
+            .fits_max_64gb = fit64,
+            .fits_max_128gb = fit128,
+            .fits_ultra_192gb = fit192,
+            .fits_ultra_512gb = fit512,
+            .recommended_min_tier = min_tier,
+        };
+    }
+};
+
+pub const ArchAxesSummary = struct {
+    arch_name: [48]u8 = @splat(0),
+    arch_len: u8 = 0,
+    attention_axis: [24]u8 = @splat(0),
+    attention_len: u8 = 0,
+    ffn_axis: [24]u8 = @splat(0),
+    ffn_len: u8 = 0,
+    kv_axis: [24]u8 = @splat(0),
+    kv_len: u8 = 0,
+    sparse_axis: [24]u8 = @splat(0),
+    sparse_len: u8 = 0,
+    hidden_size: u32 = 0,
+    num_hidden_layers: u32 = 0,
+    num_attention_heads: u32 = 0,
+    num_key_value_heads: u32 = 0,
+    head_dim: u32 = 0,
+    vocab_size: u32 = 0,
+    intermediate_size: u32 = 0,
+    moe_intermediate_size: u32 = 0,
+    num_experts: u32 = 0,
+    num_experts_per_tok: u32 = 0,
+    tie_word_embeddings: bool = false,
+    has_moe: bool = false,
+    has_shared_expert: bool = false,
+    has_gdn_hybrid: bool = false,
+    has_mla: bool = false,
+    has_sparse_ple_engram: bool = false,
+    has_loop_adapter: bool = false,
+    lora_rank: u32 = 0,
+
+    pub fn setArch(self: *ArchAxesSummary, s: []const u8) void {
+        const n: usize = @min(s.len, self.arch_name.len);
+        @memset(&self.arch_name, 0);
+        @memcpy(self.arch_name[0..n], s[0..n]);
+        self.arch_len = @intCast(n);
+    }
+
+    pub fn archSlice(self: *const ArchAxesSummary) []const u8 {
+        return self.arch_name[0..self.arch_len];
+    }
+
+    pub fn attentionSlice(self: *const ArchAxesSummary) []const u8 {
+        return self.attention_axis[0..self.attention_len];
+    }
+
+    pub fn ffnSlice(self: *const ArchAxesSummary) []const u8 {
+        return self.ffn_axis[0..self.ffn_len];
+    }
+
+    pub fn kvSlice(self: *const ArchAxesSummary) []const u8 {
+        return self.kv_axis[0..self.kv_len];
+    }
+
+    pub fn sparseSlice(self: *const ArchAxesSummary) []const u8 {
+        return self.sparse_axis[0..self.sparse_len];
+    }
+};
+
+fn setFixedField(dst: []u8, len_out: *u8, src: []const u8) void {
+    const n: usize = @min(src.len, dst.len);
+    @memset(dst, 0);
+    @memcpy(dst[0..n], src[0..n]);
+    len_out.* = @intCast(n);
+}
+
+pub const AmfInspection = struct {
+    path: []u8,
+    model_id: [64]u8,
+    model_id_len: u8,
+    file_bytes: u64,
+    header_crc32: u32,
+    directory_crc32: u32,
+    header_flags: u32,
+    total_entries: u32,
+    weight_tensors: u32,
+    metadata_entries: u32,
+    wired_weight_bytes: u64,
+    cold_weight_bytes: u64,
+    sparse_table_bytes: u64,
+    metadata_blob_bytes: u64,
+    estimated_runtime_kv_scratch_bytes: u64,
+    estimated_total_wired_bytes: u64,
+    effective_bits_per_weight: f64,
+    sme2_panel64_tensors: u32,
+    lut16_tensors: u32,
+    hot_expert_tensors: u32,
+    cold_expert_tensors: u32,
+    sparse_table_tensors: u32,
+    loop_adapter_tensors: u32,
+    per_dtype: [DTYPE_COUNT]DTypeStats,
+    config_meta: MetaBlobReport,
+    tokenizer_meta: MetaBlobReport,
+    adapter_config_meta: MetaBlobReport,
+    config_source: MetadataSource,
+    arch: ArchAxesSummary,
+    tier_fit: TierFitSummary,
+
+    pub fn deinit(self: *AmfInspection, allocator: std.mem.Allocator) void {
+        if (self.path.len > 0) allocator.free(self.path);
+        self.path = &.{};
+    }
+
+    pub fn modelIdSlice(self: *const AmfInspection) []const u8 {
+        return self.model_id[0..self.model_id_len];
+    }
+
+    pub fn archSlice(self: *const AmfInspection) []const u8 {
+        return self.arch.archSlice();
+    }
+};
+
+pub const InspectError = ParseError || IoError || error{
+    PathTooLong,
+    DirectoryOpenFailed,
+};
+
+fn jsonU32Opt(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .integer => |v| if (v >= 0 and v <= std.math.maxInt(u32)) @intCast(v) else null,
+        else => null,
+    };
+}
+
+fn jsonBoolOpt(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+
+fn jsonStrOpt(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn populateArchFromJson(allocator: std.mem.Allocator, json_bytes: []const u8, arch: *ArchAxesSummary) error{OutOfMemory}!void {
+    var parsed_json = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    defer parsed_json.deinit();
+    if (parsed_json.value != .object) return;
+    const root = parsed_json.value.object;
+    const obj = if (root.get("text_config")) |tc|
+        (if (tc == .object) tc.object else root)
+    else
+        root;
+
+    if (jsonStrOpt(obj, "model_type") orelse jsonStrOpt(root, "model_type") orelse jsonStrOpt(root, "peft_type")) |mt| {
+        arch.setArch(mt);
+    }
+    if (jsonU32Opt(obj, "hidden_size")) |v| arch.hidden_size = v;
+    if (jsonU32Opt(obj, "num_hidden_layers")) |v| arch.num_hidden_layers = v;
+    if (jsonU32Opt(obj, "num_attention_heads")) |v| arch.num_attention_heads = v;
+    if (jsonU32Opt(obj, "num_key_value_heads")) |v| arch.num_key_value_heads = v;
+    if (jsonU32Opt(obj, "head_dim")) |v| arch.head_dim = v;
+    if (jsonU32Opt(obj, "vocab_size")) |v| arch.vocab_size = v;
+    if (jsonU32Opt(obj, "intermediate_size")) |v| arch.intermediate_size = v;
+    if (jsonU32Opt(obj, "moe_intermediate_size")) |v| arch.moe_intermediate_size = v;
+    if (jsonU32Opt(obj, "num_experts") orelse jsonU32Opt(obj, "n_routed_experts")) |v| arch.num_experts = v;
+    if (jsonU32Opt(obj, "num_experts_per_tok")) |v| arch.num_experts_per_tok = v;
+    if (jsonBoolOpt(obj, "tie_word_embeddings") orelse jsonBoolOpt(root, "tie_word_embeddings")) |b| {
+        arch.tie_word_embeddings = b;
+    }
+    if (jsonU32Opt(root, "r")) |r_val| arch.lora_rank = r_val;
+
+    if (arch.head_dim == 0 and arch.hidden_size > 0 and arch.num_attention_heads > 0) {
+        arch.head_dim = arch.hidden_size / arch.num_attention_heads;
+    }
+    if (arch.num_experts > 0) arch.has_moe = true;
+    if ((jsonU32Opt(obj, "shared_expert_intermediate_size") orelse 0) > 0 or
+        (jsonU32Opt(obj, "n_shared_experts") orelse 0) > 0)
+    {
+        arch.has_shared_expert = true;
+    }
+    if ((jsonU32Opt(obj, "kv_lora_rank") orelse 0) > 0) arch.has_mla = true;
+    if ((jsonU32Opt(obj, "linear_key_head_dim") orelse 0) > 0 or
+        (jsonU32Opt(obj, "linear_num_value_heads") orelse 0) > 0)
+    {
+        arch.has_gdn_hybrid = true;
+    }
+
+    if (root.get("operator_axes") orelse obj.get("operator_axes")) |axes_val| {
+        if (axes_val == .object) {
+            const ax = axes_val.object;
+            if (jsonStrOpt(ax, "attention")) |s| {
+                setFixedField(&arch.attention_axis, &arch.attention_len, s);
+                if (std.mem.indexOf(u8, s, "mla") != null) arch.has_mla = true;
+                if (std.mem.indexOf(u8, s, "gdn") != null or std.mem.indexOf(u8, s, "hybrid") != null) {
+                    arch.has_gdn_hybrid = true;
+                }
+            }
+            if (jsonStrOpt(ax, "ffn")) |s| {
+                setFixedField(&arch.ffn_axis, &arch.ffn_len, s);
+                if (std.mem.indexOf(u8, s, "moe") != null) arch.has_moe = true;
+                if (std.mem.indexOf(u8, s, "shared") != null) arch.has_shared_expert = true;
+            }
+            if (jsonStrOpt(ax, "kv_layout") orelse jsonStrOpt(ax, "kv")) |s| {
+                setFixedField(&arch.kv_axis, &arch.kv_len, s);
+            }
+            if (jsonStrOpt(ax, "sparse_memory") orelse jsonStrOpt(ax, "sparse")) |s| {
+                setFixedField(&arch.sparse_axis, &arch.sparse_len, s);
+                if (!std.mem.eql(u8, s, "none")) arch.has_sparse_ple_engram = true;
+            }
+        }
+    }
+}
+
+fn inferMissingArchAxesFromEntries(entries: []const TensorEntry, arch: *ArchAxesSummary) void {
+    var max_layer_plus_one: u32 = 0;
+    var max_expert_plus_one: u32 = 0;
+    var q_out_dim: u32 = 0;
+    var k_out_dim: u32 = 0;
+    var seen_lora_pair = false;
+
+    for (entries) |*e| {
+        const kind = std.enums.fromInt(TensorKind, e.kind) orelse continue;
+        if (kind == .metadata) continue;
+        const nm = e.nameSlice();
+
+        if (e.layer != NO_LAYER) {
+            max_layer_plus_one = @max(max_layer_plus_one, @as(u32, e.layer) + 1);
+        }
+        if (e.expert != NO_EXPERT) {
+            max_expert_plus_one = @max(max_expert_plus_one, @as(u32, e.expert) + 1);
+        }
+        if (kind == .hot_expert or kind == .cold_expert or kind == .router) arch.has_moe = true;
+        if (kind == .shared_expert) arch.has_shared_expert = true;
+        if (kind == .sparse_table) arch.has_sparse_ple_engram = true;
+        if (kind == .loop_adapter) {
+            if (std.mem.endsWith(u8, nm, ".lora_a") and e.rank == 2) {
+                seen_lora_pair = true;
+                if (arch.lora_rank == 0) arch.lora_rank = e.shape[0];
+                if (arch.hidden_size == 0) arch.hidden_size = e.shape[1];
+            }
+            arch.has_loop_adapter = true;
+        }
+        if (std.mem.indexOf(u8, nm, "linear_attn") != null or std.mem.indexOf(u8, nm, "gdn") != null) {
+            arch.has_gdn_hybrid = true;
+        }
+        if (std.mem.indexOf(u8, nm, "kv_a_proj") != null or std.mem.indexOf(u8, nm, "q_a_proj") != null) {
+            arch.has_mla = true;
+        }
+
+        if ((std.mem.eql(u8, nm, "embed_tokens") or std.mem.eql(u8, nm, "embed_tokens.weight")) and e.rank == 2) {
+            if (arch.vocab_size == 0) arch.vocab_size = e.shape[0];
+            if (arch.hidden_size == 0) arch.hidden_size = e.shape[1];
+        } else if (std.mem.eql(u8, nm, "norm.weight") and e.rank == 1) {
+            if (arch.hidden_size == 0) arch.hidden_size = e.shape[0];
+        } else if (std.mem.endsWith(u8, nm, "self_attn.q_proj") or std.mem.endsWith(u8, nm, "self_attn.q_proj.weight")) {
+            if (e.rank == 2) {
+                q_out_dim = @max(q_out_dim, e.shape[0]);
+                if (arch.hidden_size == 0) arch.hidden_size = e.shape[1];
+            }
+        } else if (std.mem.endsWith(u8, nm, "self_attn.k_proj") or std.mem.endsWith(u8, nm, "self_attn.k_proj.weight")) {
+            if (e.rank == 2) k_out_dim = @max(k_out_dim, e.shape[0]);
+        } else if (std.mem.endsWith(u8, nm, "q_norm.weight") and e.rank == 1) {
+            if (arch.head_dim == 0) arch.head_dim = e.shape[0];
+        } else if (std.mem.endsWith(u8, nm, "mlp.gate_proj") or std.mem.endsWith(u8, nm, "mlp.gate_proj.weight")) {
+            if (e.rank == 2 and arch.intermediate_size == 0) arch.intermediate_size = e.shape[0];
+        } else if (std.mem.endsWith(u8, nm, ".gate_proj") and (kind == .hot_expert or kind == .cold_expert)) {
+            if (e.rank == 2 and arch.moe_intermediate_size == 0) arch.moe_intermediate_size = e.shape[0];
+        }
+    }
+
+    if (arch.num_hidden_layers == 0 and max_layer_plus_one > 0) arch.num_hidden_layers = max_layer_plus_one;
+    if (arch.num_experts == 0 and max_expert_plus_one > 0) arch.num_experts = max_expert_plus_one;
+    if (arch.head_dim > 0) {
+        if (arch.num_attention_heads == 0 and q_out_dim > 0) arch.num_attention_heads = q_out_dim / arch.head_dim;
+        if (arch.num_key_value_heads == 0 and k_out_dim > 0) arch.num_key_value_heads = k_out_dim / arch.head_dim;
+    }
+
+    if (arch.attention_len == 0) {
+        const attn_lbl = if (arch.has_mla and arch.has_gdn_hybrid)
+            "mla_gdn_hybrid"
+        else if (arch.has_mla)
+            "mla"
+        else if (arch.has_gdn_hybrid)
+            "gqa_gdn_hybrid"
+        else
+            "gqa";
+        setFixedField(&arch.attention_axis, &arch.attention_len, attn_lbl);
+    }
+    if (arch.ffn_len == 0) {
+        const ffn_lbl = if (arch.has_moe and arch.has_shared_expert)
+            "moe_shared"
+        else if (arch.has_moe)
+            "moe"
+        else
+            "dense";
+        setFixedField(&arch.ffn_axis, &arch.ffn_len, ffn_lbl);
+    }
+    if (arch.kv_len == 0) {
+        const kv_lbl = if (arch.has_mla) "fp4_latent" else "rgba16f_q8";
+        setFixedField(&arch.kv_axis, &arch.kv_len, kv_lbl);
+    }
+    if (arch.sparse_len == 0) {
+        const sp_lbl = if (arch.has_sparse_ple_engram) "nvme_sparse_table" else "none";
+        setFixedField(&arch.sparse_axis, &arch.sparse_len, sp_lbl);
+    }
+    if (arch.arch_len == 0) {
+        const inferred = if (seen_lora_pair and arch.vocab_size == 0)
+            "amlora"
+        else if (arch.has_mla)
+            "deepseek_v4_1"
+        else if (arch.has_gdn_hybrid and arch.has_sparse_ple_engram)
+            "qwen3_8"
+        else if (arch.has_gdn_hybrid)
+            "qwen3_next"
+        else if (arch.has_moe)
+            "qwen3_moe"
+        else
+            "qwen3_dense";
+        arch.setArch(inferred);
+    }
+}
+
+fn verifyMetaEntryReport(
+    amf_file: *const AmfFile,
+    allocator: std.mem.Allocator,
+    meta_name: []const u8,
+) (ParseError || IoError)!MetaBlobReport {
+    const entry = amf_file.parsed.find(meta_name) orelse return .{};
+    if ((try entry.tensorKind()) != .metadata) return error.InvalidTensorKind;
+
+    const blob_len: usize = @intCast(entry.blob_bytes);
+    const chunk_len: usize = @min(blob_len, VERIFY_CHUNK_BYTES);
+    const scratch = try allocator.alignedAlloc(u8, .fromByteUnits(page.APPLE_PAGE_SIZE), chunk_len);
+    defer allocator.free(scratch);
+
+    var hasher = std.hash.Crc32.init();
+    var done: usize = 0;
+    while (done < blob_len) {
+        const take: usize = @min(blob_len - done, chunk_len);
+        try preadExact(amf_file.fd, scratch[0..take], entry.blob_offset + done);
+        hasher.update(scratch[0..take]);
+        done += take;
+    }
+    const valid = (hasher.final() == entry.blob_crc32);
+    return .{
+        .present = true,
+        .data_bytes = entry.data_bytes,
+        .blob_bytes = entry.blob_bytes,
+        .crc32 = entry.blob_crc32,
+        .crc_valid = valid,
+    };
+}
+
+fn estimateRuntimeKvAndScratchBytes(arch: *const ArchAxesSummary) u64 {
+    const default_ctx_tokens: u64 = 2048;
+    const min_floor: u64 = 64 * 1024 * 1024;
+    if (arch.num_hidden_layers == 0 or arch.hidden_size == 0) return min_floor;
+
+    const layers: u64 = arch.num_hidden_layers;
+    const h: u64 = arch.hidden_size;
+    const kv_bytes: u64 = if (arch.has_mla)
+        layers * default_ctx_tokens * 324
+    else blk: {
+        const kv_heads: u64 = if (arch.num_key_value_heads > 0) arch.num_key_value_heads else 4;
+        const hd: u64 = if (arch.head_dim > 0) arch.head_dim else 128;
+        // K + V in FP16 (`2 * 2 = 4` bytes per channel per token).
+        break :blk layers * default_ctx_tokens * kv_heads * hd * 4;
+    };
+    const wide_chunk_tokens: u64 = 512;
+    const scratch_bytes: u64 = wide_chunk_tokens * h * 16;
+    const raw = kv_bytes + scratch_bytes;
+    const aligned = ((raw + page.APPLE_PAGE_SIZE - 1) / page.APPLE_PAGE_SIZE) * page.APPLE_PAGE_SIZE;
+    return @max(aligned, min_floor);
+}
+
+/// Header-only `.amf` inspector (`ADR-0022`, `W18`): reads page 0, the tensor
+/// directory, and any tiny cold metadata JSON (`__meta.*` or sidecar `config.json`)
+/// via `F_NOCACHE` `pread` without allocating a `WiredArena` or `mlock`ing any
+/// model weights (`0` wired weight bytes).
+pub fn inspectAmfPath(allocator: std.mem.Allocator, path: []const u8) InspectError!AmfInspection {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = try toPosixPathZ(path, &path_buf);
+
+    var file = try AmfFile.open(allocator, path_z);
+    defer file.close(allocator);
+
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+
+    var per_dtype: [DTYPE_COUNT]DTypeStats = @splat(.{});
+    var weight_tensors: u32 = 0;
+    var metadata_entries: u32 = 0;
+    var wired_weight_bytes: u64 = 0;
+    var cold_weight_bytes: u64 = 0;
+    var sparse_table_bytes: u64 = 0;
+    var metadata_blob_bytes: u64 = 0;
+    var sme2_panel64_tensors: u32 = 0;
+    var lut16_tensors: u32 = 0;
+    var hot_expert_tensors: u32 = 0;
+    var cold_expert_tensors: u32 = 0;
+    var sparse_table_tensors: u32 = 0;
+    var loop_adapter_tensors: u32 = 0;
+
+    var weighted_bits_sum: f64 = 0.0;
+    var total_weight_elems: f64 = 0.0;
+
+    for (file.parsed.entries) |*entry| {
+        const kind = try entry.tensorKind();
+        const dt = try entry.dataType();
+        const layout = try entry.tensorLayout();
+        const pk = try entry.quantParamKind();
+
+        if (kind == .metadata) {
+            metadata_entries += 1;
+            metadata_blob_bytes += entry.blob_bytes;
+            continue;
+        }
+
+        weight_tensors += 1;
+        if (layout == .sme2_panel64) sme2_panel64_tensors += 1;
+        if (pk == .lut16_codebook) lut16_tensors += 1;
+        switch (kind) {
+            .hot_expert => hot_expert_tensors += 1,
+            .cold_expert => cold_expert_tensors += 1,
+            .sparse_table => {
+                sparse_table_tensors += 1;
+                sparse_table_bytes += entry.blob_bytes;
+            },
+            .loop_adapter => loop_adapter_tensors += 1,
+            else => {},
+        }
+
+        const dt_idx: usize = @backingInt(dt);
+        per_dtype[dt_idx].tensor_count += 1;
+        per_dtype[dt_idx].data_bytes += entry.data_bytes;
+        if (kind.isWired()) {
+            wired_weight_bytes += entry.blob_bytes;
+            per_dtype[dt_idx].wired_bytes += entry.blob_bytes;
+        } else {
+            cold_weight_bytes += entry.blob_bytes;
+            per_dtype[dt_idx].cold_bytes += entry.blob_bytes;
+        }
+
+        var elems: u64 = 1;
+        for (0..entry.rank) |d| {
+            elems = std.math.mul(u64, elems, entry.shape[d]) catch 0;
+        }
+        if (elems > 0) {
+            const elems_f: f64 = @floatFromInt(elems);
+            const eff_bytes: f64 = @floatFromInt(entry.data_bytes + entry.params_bytes);
+            weighted_bits_sum += eff_bytes * 8.0;
+            total_weight_elems += elems_f;
+        }
+    }
+
+    const config_meta = try verifyMetaEntryReport(&file, allocator, META_CONFIG_JSON);
+    const tokenizer_meta = try verifyMetaEntryReport(&file, allocator, META_TOKENIZER_JSON);
+    const adapter_config_meta = try verifyMetaEntryReport(&file, allocator, META_ADAPTER_CONFIG_JSON);
+
+    var arch: ArchAxesSummary = .{};
+    var config_source: MetadataSource = .none;
+
+    if (config_meta.present and config_meta.crc_valid) {
+        if (try file.readMetadataAlloc(allocator, META_CONFIG_JSON)) |cfg_bytes| {
+            defer allocator.free(cfg_bytes);
+            try populateArchFromJson(allocator, cfg_bytes, &arch);
+            config_source = .embedded;
+        }
+    } else if (adapter_config_meta.present and adapter_config_meta.crc_valid) {
+        if (try file.readMetadataAlloc(allocator, META_ADAPTER_CONFIG_JSON)) |acfg_bytes| {
+            defer allocator.free(acfg_bytes);
+            try populateArchFromJson(allocator, acfg_bytes, &arch);
+            config_source = .embedded;
+        }
+    } else {
+        const dir = std.fs.path.dirname(path) orelse ".";
+        var sidecar_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sc_path = std.fmt.bufPrint(&sidecar_buf, "{s}/config.json", .{dir}) catch return error.PathTooLong;
+        const sc_opt: ?[]u8 = readRegularFileAlloc(allocator, sc_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.PathTooLong => return error.PathTooLong,
+            error.OpenFailed, error.StatFailed, error.FileTooSmall, error.MetadataTooLarge, error.ReadFailed, error.ShortRead => null,
+            else => return error.ReadFailed,
+        };
+        if (sc_opt) |sc_bytes| {
+            defer allocator.free(sc_bytes);
+            try populateArchFromJson(allocator, sc_bytes, &arch);
+            config_source = .sidecar;
+        }
+    }
+
+    inferMissingArchAxesFromEntries(file.parsed.entries, &arch);
+
+    const est_kv_scratch = if (std.mem.eql(u8, arch.archSlice(), "amlora"))
+        @as(u64, 0)
+    else
+        estimateRuntimeKvAndScratchBytes(&arch);
+    const est_total_wired = wired_weight_bytes + est_kv_scratch;
+    const eff_bpw: f64 = if (total_weight_elems > 0.0) weighted_bits_sum / total_weight_elems else 0.0;
+
+    const mid_slice = file.parsed.modelId();
+    var mid_buf: [64]u8 = @splat(0);
+    @memcpy(mid_buf[0..mid_slice.len], mid_slice);
+
+    return .{
+        .path = owned_path,
+        .model_id = mid_buf,
+        .model_id_len = @intCast(mid_slice.len),
+        .file_bytes = file.parsed.file_size,
+        .header_crc32 = file.parsed.header.header_crc32,
+        .directory_crc32 = file.parsed.header.directory_crc32,
+        .header_flags = file.parsed.header.flags,
+        .total_entries = @intCast(file.parsed.entries.len),
+        .weight_tensors = weight_tensors,
+        .metadata_entries = metadata_entries,
+        .wired_weight_bytes = wired_weight_bytes,
+        .cold_weight_bytes = cold_weight_bytes,
+        .sparse_table_bytes = sparse_table_bytes,
+        .metadata_blob_bytes = metadata_blob_bytes,
+        .estimated_runtime_kv_scratch_bytes = est_kv_scratch,
+        .estimated_total_wired_bytes = est_total_wired,
+        .effective_bits_per_weight = eff_bpw,
+        .sme2_panel64_tensors = sme2_panel64_tensors,
+        .lut16_tensors = lut16_tensors,
+        .hot_expert_tensors = hot_expert_tensors,
+        .cold_expert_tensors = cold_expert_tensors,
+        .sparse_table_tensors = sparse_table_tensors,
+        .loop_adapter_tensors = loop_adapter_tensors,
+        .per_dtype = per_dtype,
+        .config_meta = config_meta,
+        .tokenizer_meta = tokenizer_meta,
+        .adapter_config_meta = adapter_config_meta,
+        .config_source = config_source,
+        .arch = arch,
+        .tier_fit = TierFitSummary.evaluate(est_total_wired),
+    };
+}
+
+pub const ScanOptions = struct {
+    /// Also scan immediate 1-level bundle subdirectories (`<dir>/<bundle>/*.amf`).
+    scan_bundle_subdirs: bool = true,
+    /// Include `.amlora` adapter bundles alongside `.amf` model files.
+    include_amlora: bool = false,
+};
+
+fn hasMatchingAmfExtension(name: []const u8, include_amlora: bool) bool {
+    if (std.mem.endsWith(u8, name, ".partial")) return false;
+    if (std.mem.endsWith(u8, name, ".amf")) return true;
+    if (include_amlora and std.mem.endsWith(u8, name, ".amlora")) return true;
+    return false;
+}
+
+fn collectAmfPathsInDir(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    allow_subdirs: bool,
+    include_amlora: bool,
+    out_paths: *std.ArrayList([]u8),
+) InspectError!void {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_z = try toPosixPathZ(dir_path, &dir_buf);
+    const dp = std.c.opendir(dir_z.ptr) orelse return error.DirectoryOpenFailed;
+    defer _ = std.c.closedir(dp);
+
+    while (std.c.readdir(dp)) |ent| {
+        const name = ent.name[0..ent.namlen];
+        if (name.len == 0 or name[0] == '.') continue;
+
+        var child_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sep = if (std.mem.endsWith(u8, dir_path, "/")) "" else "/";
+        const child_path = std.fmt.bufPrint(&child_buf, "{s}{s}{s}", .{ dir_path, sep, name }) catch {
+            return error.PathTooLong;
+        };
+
+        var is_reg = (ent.type == std.c.DT.REG);
+        var is_dir = (ent.type == std.c.DT.DIR);
+        if (ent.type == std.c.DT.UNKNOWN or ent.type == std.c.DT.LNK) {
+            var st_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const st_z = try toPosixPathZ(child_path, &st_path_buf);
+            var st: std.c.Stat = undefined;
+            if (std.c.fstatat(std.c.AT.FDCWD, st_z.ptr, &st, 0) == 0) {
+                const ftype = st.mode & std.c.S.IFMT;
+                is_reg = (ftype == std.c.S.IFREG);
+                is_dir = (ftype == std.c.S.IFDIR);
+            }
+        }
+
+        if (is_reg and hasMatchingAmfExtension(name, include_amlora)) {
+            const duped = try allocator.dupe(u8, child_path);
+            errdefer allocator.free(duped);
+            try out_paths.append(allocator, duped);
+        } else if (is_dir and allow_subdirs) {
+            try collectAmfPathsInDir(allocator, child_path, false, include_amlora, out_paths);
+        }
+    }
+}
+
+fn pathLessThan(_: void, a: []u8, b: []u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Scans `dir_path` (and immediate bundle subdirectories by default) for `.amf`
+/// models, returning deterministic path-sorted header-only `AmfInspection` records
+/// with zero weight `mlock` (`ADR-0022`, `W18`).
+pub fn scanAmfDirectoryWithOptions(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    opts: ScanOptions,
+) InspectError![]AmfInspection {
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit(allocator);
+    }
+
+    try collectAmfPathsInDir(allocator, dir_path, opts.scan_bundle_subdirs, opts.include_amlora, &paths);
+    std.mem.sort([]u8, paths.items, {}, pathLessThan);
+
+    var results: std.ArrayList(AmfInspection) = .empty;
+    errdefer {
+        for (results.items) |*item| item.deinit(allocator);
+        results.deinit(allocator);
+    }
+
+    for (paths.items) |p| {
+        const info = try inspectAmfPath(allocator, p);
+        try results.append(allocator, info);
+    }
+    return results.toOwnedSlice(allocator);
+}
+
+pub fn scanAmfDirectory(allocator: std.mem.Allocator, dir_path: []const u8) InspectError![]AmfInspection {
+    return scanAmfDirectoryWithOptions(allocator, dir_path, .{});
+}
+
+pub fn freeAmfInspections(allocator: std.mem.Allocator, items: []AmfInspection) void {
+    for (items) |*item| item.deinit(allocator);
+    allocator.free(items);
 }
 
 fn buildTestAmf(allocator: std.mem.Allocator, entry: TensorEntry, blob_data: []const u8) ![]u8 {
@@ -1812,4 +2964,162 @@ test "QuantParamKind.lut16_codebook (reserved0=0x0101) validates across q4/q3/q2
         defer gpa.free(bad_img);
         try std.testing.expectError(error.InvalidQuantParamKind, Parsed.parseBytes(gpa, bad_img));
     }
+}
+
+test "W18 single-file embedded metadata, sidecar override precedence, and zero-mlock inspect/ls" {
+    const gpa = std.testing.allocator;
+
+    // Build a base .amf image with embed_tokens + q_proj + norm.weight (no embedded metadata).
+    var base_entries: [3]TensorEntry = undefined;
+    base_entries[0] = TensorEntry.zeroed("embed_tokens", .embedding, .f16);
+    base_entries[0].rank = 2;
+    base_entries[0].shape = .{ 128, 64, 0, 0 };
+    base_entries[0].data_bytes = 128 * 64 * 2;
+
+    const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+    base_entries[1] = TensorEntry.zeroed("layers.0.self_attn.q_proj", .dense, .q4_affine);
+    base_entries[1].quant_bits = 4;
+    base_entries[1].rank = 2;
+    base_entries[1].group_size = 64;
+    base_entries[1].layer = 0;
+    base_entries[1].shape = .{ 64, 64, 0, 0 };
+    base_entries[1].data_bytes = try Q4.packedWeightBytes(64, 64);
+    base_entries[1].params_offset = align64(@intCast(base_entries[1].data_bytes));
+    base_entries[1].params_bytes = try Q4.scaleBiasBytes(64, 64);
+
+    base_entries[2] = TensorEntry.zeroed("norm.weight", .norm, .f16);
+    base_entries[2].rank = 1;
+    base_entries[2].shape = .{ 64, 0, 0, 0 };
+    base_entries[2].data_bytes = 64 * 2;
+
+    const base_image = try buildTestAmfMulti(gpa, &base_entries);
+    defer gpa.free(base_image);
+
+    // Odd-length UTF-8 JSON payloads verify exact unpadded `data_bytes` preservation.
+    const embedded_cfg_json =
+        \\{"model_type":"qwen3","hidden_size":64,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"head_dim":32,"vocab_size":128,"intermediate_size":128,"tie_word_embeddings":true}
+    ;
+    const embedded_tok_json =
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"a":0},"merges":[]}}
+    ;
+    try std.testing.expect((embedded_cfg_json.len % 4) != 0 or (embedded_tok_json.len % 4) == 0);
+
+    const single_file_image = try embedMetadataIntoAmfBytes(gpa, base_image, &.{
+        .{ .name = META_CONFIG_JSON, .payload = embedded_cfg_json },
+        .{ .name = META_TOKENIZER_JSON, .payload = embedded_tok_json },
+    });
+    defer gpa.free(single_file_image);
+
+    var parsed_sf = try Parsed.parseBytes(gpa, single_file_image);
+    defer parsed_sf.deinit(gpa);
+    try parsed_sf.verifyAllBlobsFromBytes(single_file_image);
+
+    try std.testing.expect((parsed_sf.header.flags & FLAG_EMBEDDED_METADATA) != 0);
+    try std.testing.expect(parsed_sf.hasEmbeddedConfig());
+    try std.testing.expect(parsed_sf.hasEmbeddedTokenizer());
+    // Embedded metadata must consume ZERO wired bytes and ZERO cold weight bytes!
+    try std.testing.expectEqual(@as(u64, 3 * page.APPLE_PAGE_SIZE), parsed_sf.totalWiredBytes());
+    try std.testing.expectEqual(@as(u64, 0), parsed_sf.totalColdBytes());
+    try std.testing.expectEqual(@as(u64, 2 * page.APPLE_PAGE_SIZE), parsed_sf.totalMetadataBytes());
+
+    const got_cfg = (try parsed_sf.extractMetadataFromBytes(single_file_image, META_CONFIG_JSON)) orelse return error.TestUnexpectedResult;
+    const got_tok = (try parsed_sf.extractMetadataFromBytes(single_file_image, META_TOKENIZER_JSON)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(embedded_cfg_json, got_cfg);
+    try std.testing.expectEqualStrings(embedded_tok_json, got_tok);
+
+    // Verify `loadWiredFromBytes` skips `__meta.*` entries cleanly.
+    const cap = 4 * page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = 16 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = cap,
+        .global_user_wire_limit = cap,
+        .gpu_working_set_bytes = cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(cap, budget);
+    defer arena.deinit();
+    const wired_ptrs = try parsed_sf.loadWiredFromBytes(gpa, single_file_image, &arena);
+    defer gpa.free(wired_ptrs);
+    try std.testing.expectEqual(@as(usize, 5), wired_ptrs.len);
+    try std.testing.expect(wired_ptrs[0] != null and wired_ptrs[1] != null and wired_ptrs[2] != null);
+    try std.testing.expect(wired_ptrs[3] == null and wired_ptrs[4] == null);
+
+    // Write both single-file model and legacy sidecar bundle to disk to test resolution & ls/inspect.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "single.amf", .data = single_file_image });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "override_cfg.json", .data = "{\"model_type\":\"override\"}" });
+    try tmp.dir.createDirPath(std.testing.io, "legacy_bundle");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "legacy_bundle/model.amf", .data = base_image });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "legacy_bundle/config.json", .data = embedded_cfg_json });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "legacy_bundle/tokenizer.json", .data = embedded_tok_json });
+
+    var sf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sf_raw = try std.fmt.bufPrint(sf_path_buf[0 .. sf_path_buf.len - 1], ".zig-cache/tmp/{s}/single.amf", .{tmp.sub_path});
+    sf_path_buf[sf_raw.len] = 0;
+    const sf_path_z: [:0]const u8 = sf_path_buf[0..sf_raw.len :0];
+
+    var ov_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ov_path = try std.fmt.bufPrint(&ov_path_buf, ".zig-cache/tmp/{s}/override_cfg.json", .{tmp.sub_path});
+
+    var sf_file = try AmfFile.open(gpa, sf_path_z);
+    defer sf_file.close(gpa);
+
+    // 1. Default resolution on single-file .amf uses embedded metadata.
+    var res_emb = try resolveConfigJsonAlloc(gpa, &sf_file, sf_raw, null);
+    defer res_emb.deinit(gpa);
+    try std.testing.expectEqual(MetadataSource.embedded, res_emb.source);
+    try std.testing.expectEqualStrings(embedded_cfg_json, res_emb.bytes);
+
+    // 2. Explicit `--config` override beats embedded metadata.
+    var res_ov = try resolveConfigJsonAlloc(gpa, &sf_file, sf_raw, ov_path);
+    defer res_ov.deinit(gpa);
+    try std.testing.expectEqual(MetadataSource.explicit_override, res_ov.source);
+    try std.testing.expectEqualStrings("{\"model_type\":\"override\"}", res_ov.bytes);
+
+    // 3. Legacy `.amf` without embedded metadata resolves sidecar `config.json` & `tokenizer.json`.
+    var leg_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const leg_raw = try std.fmt.bufPrint(leg_path_buf[0 .. leg_path_buf.len - 1], ".zig-cache/tmp/{s}/legacy_bundle/model.amf", .{tmp.sub_path});
+    leg_path_buf[leg_raw.len] = 0;
+    var leg_file = try AmfFile.open(gpa, leg_path_buf[0..leg_raw.len :0]);
+    defer leg_file.close(gpa);
+    var res_sc = try resolveTokenizerJsonAlloc(gpa, &leg_file, leg_raw, null);
+    defer res_sc.deinit(gpa);
+    try std.testing.expectEqual(MetadataSource.sidecar, res_sc.source);
+    try std.testing.expectEqualStrings(embedded_tok_json, res_sc.bytes);
+
+    // 4. Header-only `inspectAmfPath` & `scanAmfDirectory` (zero weight mlock).
+    var dir_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_root = try std.fmt.bufPrint(&dir_root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const list = try scanAmfDirectory(gpa, dir_root);
+    defer freeAmfInspections(gpa, list);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+
+    // Sorted lexicographically: `legacy_bundle/model.amf` then `single.amf`.
+    const leg_info = &list[0];
+    const sf_info = &list[1];
+    try std.testing.expect(std.mem.endsWith(u8, leg_info.path, "legacy_bundle/model.amf"));
+    try std.testing.expect(!leg_info.config_meta.present);
+    try std.testing.expectEqual(MetadataSource.sidecar, leg_info.config_source);
+
+    try std.testing.expect(std.mem.endsWith(u8, sf_info.path, "single.amf"));
+    try std.testing.expect(sf_info.config_meta.present and sf_info.config_meta.crc_valid);
+    try std.testing.expect(sf_info.tokenizer_meta.present and sf_info.tokenizer_meta.crc_valid);
+    try std.testing.expectEqual(MetadataSource.embedded, sf_info.config_source);
+    try std.testing.expectEqual(@as(u32, 3), sf_info.weight_tensors);
+    try std.testing.expectEqual(@as(u32, 2), sf_info.metadata_entries);
+    try std.testing.expectEqual(@as(u32, 2), sf_info.per_dtype[@backingInt(DType.f16)].tensor_count);
+    try std.testing.expectEqual(@as(u32, 1), sf_info.per_dtype[@backingInt(DType.q4_affine)].tensor_count);
+    try std.testing.expectEqual(@as(u32, 64), sf_info.arch.hidden_size);
+    try std.testing.expectEqual(@as(u32, 128), sf_info.arch.vocab_size);
+    try std.testing.expect(sf_info.tier_fit.fits_m4_24gb);
+    try std.testing.expectEqual(HardwareTier.m4_16gb, sf_info.tier_fit.recommended_min_tier);
+
+    // 5. Corrupting embedded metadata byte triggers `BlobChecksumMismatch` on extraction.
+    const corrupted = try gpa.dupe(u8, single_file_image);
+    defer gpa.free(corrupted);
+    const meta_e = parsed_sf.find(META_CONFIG_JSON).?;
+    corrupted[@intCast(meta_e.blob_offset)] ^= 0xFF;
+    try std.testing.expectError(error.BlobChecksumMismatch, parsed_sf.extractMetadataFromBytes(corrupted, META_CONFIG_JSON));
 }

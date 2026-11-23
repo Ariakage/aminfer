@@ -17,10 +17,17 @@ from aminfer_tools.amf import (
     SME2_REPACK_TARGETS,
     QuantParamKind,
     TensorLayout,
+    embed_metadata_into_amf,
     load_cold_experts_from_heat_profile,
     pack_amf_from_safetensors,
     repack_amf_sme2,
     retag_amf_cold_experts,
+)
+from aminfer_tools.lora import (
+    LORA_DTYPES,
+    LORA_LAYOUTS,
+    generate_synthetic_lora,
+    pack_lora_from_peft,
 )
 from aminfer_tools.gsq_rco import gsq_convert
 from aminfer_tools.qwen4_exp import (
@@ -264,6 +271,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional output config.json path with canonical operator_axes & loop_schedule metadata",
     )
+    pack.add_argument(
+        "--embed-metadata",
+        action="store_true",
+        help=(
+            "Embed config.json and tokenizer.json inside the single .amf file as 16 KiB-aligned "
+            "cold __meta.* blobs with CRC-32 verification (W18, ADR-0022)"
+        ),
+    )
+    pack.add_argument(
+        "--config",
+        type=pathlib.Path,
+        default=None,
+        help="Explicit config.json path to embed into __meta.config_json (implies --embed-metadata)",
+    )
+    pack.add_argument(
+        "--tokenizer",
+        type=pathlib.Path,
+        default=None,
+        help="Explicit tokenizer.json path to embed into __meta.tokenizer_json (implies --embed-metadata)",
+    )
 
     gsq = sub.add_parser(
         "gsq-convert",
@@ -440,6 +467,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--cold-experts",
         default=None,
         help="Comma-separated LAYER:EXPERT pairs to mark as cold_expert",
+    )
+    synth.add_argument(
+        "--embed-metadata",
+        action="store_true",
+        help="Embed config.json and tokenizer.json inside model.amf as cold __meta.* blobs (W18)",
     )
 
     sq4 = sub.add_parser(
@@ -893,6 +925,44 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional directory to verify exported .mlpackage via `xcrun coremlcompiler compile`",
     )
     ngram_mod.add_subparser(sub)
+
+    plora = sub.add_parser(
+        "pack-lora",
+        help=(
+            "Convert a Hugging Face PEFT LoRA checkpoint or synthesize a test adapter into a "
+            "16 KiB-aligned .amlora (.amf-based) bundle (W19, ADR-0022)"
+        ),
+    )
+    plora.add_argument(
+        "--input",
+        type=pathlib.Path,
+        default=None,
+        help="Input PEFT directory (adapter_config.json + adapter_model.safetensors) or .safetensors file",
+    )
+    plora.add_argument("--output", required=True, type=pathlib.Path, help="Output .amlora path")
+    plora.add_argument("--adapter-id", default=None, help="Adapter identifier stored in header (default: output stem)")
+    plora.add_argument("--adapter-config", type=pathlib.Path, default=None, help="Explicit adapter_config.json override")
+    plora.add_argument("--layout", choices=LORA_LAYOUTS, default="row_major", help="Weight layout (default: row_major)")
+    plora.add_argument("--dtype", choices=LORA_DTYPES, default="f16", help="Adapter weight precision (default: f16)")
+    plora.add_argument("--rank", type=int, default=None, help="LoRA rank r (override or synthetic rank, 1..64)")
+    plora.add_argument("--lora-alpha", type=float, default=None, help="LoRA alpha scaling numerator")
+    plora.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Generate a deterministic synthetic .amlora test adapter instead of reading --input",
+    )
+    plora.add_argument("--num-layers", type=int, default=2, help="Synthetic layer count (default: 2)")
+    plora.add_argument("--hidden-size", type=int, default=64, help="Synthetic hidden_size (default: 64)")
+    plora.add_argument("--q-dim", type=int, default=None, help="Synthetic q_proj output dim (default: hidden_size)")
+    plora.add_argument("--kv-dim", type=int, default=None, help="Synthetic k/v_proj output dim (default: hidden_size)")
+    plora.add_argument("--intermediate-size", type=int, default=128, help="Synthetic MLP intermediate_size (default: 128)")
+    plora.add_argument(
+        "--target-modules",
+        default="q_proj,v_proj",
+        help="Comma-separated synthetic target modules (default: q_proj,v_proj)",
+    )
+    plora.add_argument("--seed", type=int, default=42, help="Synthetic PRNG seed (default: 42)")
+    plora.add_argument("--zero-init-b", action="store_true", help="Zero-initialize synthetic lora_b matrices")
     return parser
 
 
@@ -943,6 +1013,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config_output=args.config_output,
             )
             metas = rep_q4.metas
+            if args.embed_metadata or args.config is not None or args.tokenizer is not None:
+                base_dir = args.input if args.input.is_dir() else args.input.parent
+                cfg_p = args.config if args.config is not None else (args.config_output or (base_dir / "config.json"))
+                tok_p = args.tokenizer if args.tokenizer is not None else (base_dir / "tokenizer.json")
+                metas = embed_metadata_into_amf(
+                    args.output,
+                    config_bytes=cfg_p.read_bytes() if cfg_p is not None and cfg_p.is_file() else None,
+                    tokenizer_bytes=tok_p.read_bytes() if tok_p is not None and tok_p.is_file() else None,
+                    output_path=args.output,
+                )
             stripped_vision = rep_q4.stripped_vision_tensors
             if rep_q4.ple_shard_paths:
                 extra_notes.append(f"ple_shards={len(rep_q4.ple_shard_paths)}")
@@ -972,6 +1052,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest_path=args.manifest,
                 workers=args.workers,
                 strip_vision=not args.no_strip_vision,
+                embed_metadata=args.embed_metadata,
+                config_path=args.config,
+                tokenizer_path=args.tokenizer,
                 stats_out=stats_map,
             )
             stripped_vision = stats_map.get("stripped_vision_tensors", 0)
@@ -1242,6 +1325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cfg,
             seed=args.seed,
             cold_experts=cold,
+            embed_metadata=args.embed_metadata,
         )
         print(
             f"synthesized {len(bundle.metas)} tensors ({bundle.total_bytes} bytes) "
@@ -1514,6 +1598,51 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"  tier {tier} (ws={info['world_size']}): budget={info['per_rank_budget_gib']} GiB/rank, "
                     f"q3_wired={info['per_rank_q3_wired_gib']} GiB/rank -> {status}"
                 )
+        return 0
+
+    if args.command == "pack-lora":
+        started = time.monotonic()
+        if args.synthetic:
+            targets = _parse_csv(args.target_modules) or ["q_proj", "v_proj"]
+            rank = args.rank if args.rank is not None else 4
+            alpha = args.lora_alpha if args.lora_alpha is not None else float(rank * 2)
+            rep = generate_synthetic_lora(
+                args.output,
+                adapter_id=args.adapter_id or args.output.stem,
+                num_layers=args.num_layers,
+                hidden_size=args.hidden_size,
+                q_dim=args.q_dim,
+                kv_dim=args.kv_dim,
+                intermediate_size=args.intermediate_size,
+                rank=rank,
+                lora_alpha=alpha,
+                target_modules=targets,
+                layout=args.layout,
+                dtype=args.dtype,
+                seed=args.seed,
+                zero_init_b=args.zero_init_b,
+            )
+        else:
+            if args.input is None:
+                parser.error("pack-lora requires --input <peft_dir_or_safetensors> unless --synthetic is set")
+            rep = pack_lora_from_peft(
+                args.input,
+                args.output,
+                adapter_id=args.adapter_id,
+                adapter_config_path=args.adapter_config,
+                layout=args.layout,
+                dtype=args.dtype,
+                rank_override=args.rank,
+                alpha_override=args.lora_alpha,
+            )
+        elapsed = time.monotonic() - started
+        l2_tag = "fits_4MiB_L2" if rep.fits_l2_4mib else "EXCEEDS_4MiB_L2"
+        print(
+            f"packed LoRA {rep.adapter_id!r} ({rep.num_pairs} pair(s), rank={rep.rank}, "
+            f"alpha={rep.lora_alpha:g}, scale={rep.scale:g}, layout={rep.layout}, dtype={rep.dtype}, "
+            f"wired={rep.total_wired_bytes} B [{l2_tag}], file={rep.total_file_bytes} B) "
+            f"-> {rep.output_path} in {elapsed:.2f} s"
+        )
         return 0
 
     print(
