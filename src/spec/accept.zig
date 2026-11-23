@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const tree_mod = @import("tree.zig");
+pub const grammar = @import("grammar.zig");
+pub const sampling = @import("sampling.zig");
 
 pub const VerifyError = error{
     EmptyTree,
@@ -452,6 +454,516 @@ pub fn verifyStochasticF32(
         out_accepted_nodes,
         out_tokens,
     );
+}
+
+// ---------------------------------------------------------------------------
+// M7.5 C22 Grammar-Constrained & Shared-Sampler Speculative Tree Verification
+// ---------------------------------------------------------------------------
+
+pub const ConstrainedVerifyError = VerifyError || sampling.SampleError;
+
+/// Zero-allocation grammar hook for `G5`/`D9` speculative tree verification.
+/// When `program == null`, all verification routines take the unconstrained
+/// zero-overhead bypass path.
+pub const GrammarTreeAdapter = struct {
+    program: ?*const grammar.GrammarProgram = null,
+    state: *grammar.GrammarState,
+    vocab_index: ?*const grammar.VocabIndex = null,
+    token_slices: ?[]const ?[]const u8 = null,
+    eos_token_ids: []const u32 = &.{},
+    mask_scratch: []u32 = &.{},
+
+    pub inline fn isActive(self: GrammarTreeAdapter) bool {
+        return self.program != null;
+    }
+
+    pub fn fillBitmask(self: GrammarTreeAdapter, vocab_size: usize) ConstrainedVerifyError![]const u32 {
+        const words = grammar.bitmaskWordCount(vocab_size);
+        if (self.mask_scratch.len < words) return error.BitmaskTooSmall;
+        const mask_out = self.mask_scratch[0..words];
+        if (self.vocab_index) |vi| {
+            vi.fillAllowedTokenBitmask(self.program, self.state, mask_out);
+        } else if (self.token_slices) |slices| {
+            grammar.fillAllowedTokenBitmaskDirect(
+                self.program,
+                self.state,
+                slices[0..vocab_size],
+                self.eos_token_ids,
+                mask_out,
+            );
+        } else {
+            grammar.allowAllTokens(mask_out, vocab_size);
+        }
+        return mask_out;
+    }
+
+    pub fn advanceTokenOnState(
+        self: GrammarTreeAdapter,
+        st: *grammar.GrammarState,
+        token_id: u32,
+    ) bool {
+        const prog = self.program orelse return true;
+        for (self.eos_token_ids) |eid| {
+            if (eid == token_id) return st.isAccepting();
+        }
+        if (self.vocab_index) |vi| {
+            for (vi.eos_tokens[0..vi.eos_count]) |eid| {
+                if (eid == token_id) return st.isAccepting();
+            }
+        }
+        if (self.token_slices) |slices| {
+            if (token_id >= slices.len) return false;
+            const raw = slices[token_id] orelse return false;
+            if (raw.len == 0) return false;
+            return prog.advanceBytes(st, raw);
+        }
+        return false;
+    }
+};
+
+/// Propagates `GrammarState` across all branches of a `DraftTree` (`G5`) using O(1)
+/// value `snapshot()` / `restore()` at each parent node (`0` heap allocations).
+/// When `program == null`, marks every active tree node valid immediately.
+pub fn propagateGrammarAcrossTree(
+    comptime max_nodes: u16,
+    tree: *const tree_mod.DraftTree(max_nodes),
+    program_opt: ?*const grammar.GrammarProgram,
+    root_state: grammar.GrammarState,
+    token_slices: []const ?[]const u8,
+    eos_token_ids: []const u32,
+    out_node_states: *[max_nodes]grammar.GrammarState,
+    out_node_valid: *[max_nodes]bool,
+) void {
+    @memset(out_node_valid, false);
+    if (tree.count == 0) return;
+
+    const prog = program_opt orelse {
+        for (0..tree.count) |i| {
+            out_node_valid[i] = true;
+        }
+        return;
+    };
+
+    out_node_states[0] = root_state.snapshot();
+    out_node_valid[0] = true;
+
+    // Nodes in `DraftTree` are stored in topological order (`parent < child`).
+    var idx: u16 = 1;
+    while (idx < tree.count) : (idx += 1) {
+        const node = tree.nodes[idx];
+        const parent = node.parent;
+        if (parent >= idx or !out_node_valid[parent]) {
+            out_node_valid[idx] = false;
+            continue;
+        }
+
+        var branch_state: grammar.GrammarState = undefined;
+        branch_state.restore(out_node_states[parent]);
+
+        var ok = false;
+        var is_eos = false;
+        for (eos_token_ids) |eid| {
+            if (eid == node.token_id) {
+                is_eos = true;
+                ok = branch_state.isAccepting();
+                break;
+            }
+        }
+        if (!is_eos and node.token_id < token_slices.len) {
+            if (token_slices[node.token_id]) |raw| {
+                if (raw.len > 0) {
+                    ok = prog.advanceBytes(&branch_state, raw);
+                }
+            }
+        }
+
+        if (ok) {
+            out_node_states[idx] = branch_state;
+            out_node_valid[idx] = true;
+        } else {
+            out_node_valid[idx] = false;
+        }
+    }
+}
+
+/// Grammar- and sampler-aware speculative tree verification (`G5`/`D9` + `C22` + `C18`).
+///
+/// - **Zero-overhead bypass**: when `grammar_adapter == null` (or `.program == null`) and
+///   `params` has no penalties, `logit_bias`, `top_k`, `min_p`, `top_p < 1`, or bitmask:
+///   - `temperature == 0` performs direct greedy `argmax` tree walk (`0` softmax, `0` RNG);
+///   - `temperature > 0` delegates directly to `verifyStochastic`!
+/// - **Constrained mode**: evaluates the `C22` allowed-token bitmask at each visited node `u`,
+///   applies penalties/`logit_bias`, rejects any grammar-invalid draft sibling with zero
+///   target probability mass, advances `GrammarState` via O(1) snapshot/advance on accepted
+///   draft children and the final bonus token, and updates `penalty_tracker` in lockstep.
+pub fn verifyConstrained(
+    comptime max_nodes: u16,
+    comptime LogitT: type,
+    tree: *const tree_mod.DraftTree(max_nodes),
+    target_logits: []const LogitT,
+    vocab_size: usize,
+    draft_probs: ?[]const f32,
+    params: sampling.SamplingParams,
+    penalty_tracker: ?*sampling.DefaultPenaltyTracker,
+    grammar_adapter: ?GrammarTreeAdapter,
+    rng: std.Random,
+    scratch: sampling.SamplerScratch,
+    out_accepted_nodes: []u16,
+    out_tokens: []u32,
+) ConstrainedVerifyError!AcceptResult {
+    comptime {
+        if (LogitT != f16 and LogitT != f32) {
+            @compileError("verifyConstrained LogitT must be f16 or f32");
+        }
+    }
+    if (tree.count == 0) return error.EmptyTree;
+    if (vocab_size == 0) return error.EmptyVocab;
+    try params.validate();
+
+    const max_out: usize = @as(usize, tree.max_depth) + 1;
+    if (out_accepted_nodes.len < max_out or out_tokens.len < max_out) {
+        return error.OutputBufferTooSmall;
+    }
+    const total_logits = std.math.mul(usize, @as(usize, tree.count), vocab_size) catch return error.Overflow;
+    if (target_logits.len < total_logits) return error.InvalidTargetLength;
+
+    const gram_active = if (grammar_adapter) |ga| ga.isActive() else false;
+    const unconstrained_stochastic = !gram_active and
+        !params.hasPenalties() and
+        params.logit_bias.len == 0 and
+        params.allowed_token_mask == null and
+        params.top_k == 0 and
+        params.min_p == 0.0 and
+        params.top_p == 1.0;
+
+    // 1. Strict zero-overhead unconstrained fast paths!
+    if (!gram_active and params.isUnconstrainedGreedy()) {
+        var u: u16 = 0;
+        out_accepted_nodes[0] = 0;
+        var draft_accepted: u16 = 0;
+        while (true) {
+            const row = target_logits[@as(usize, u) * vocab_size ..][0..vocab_size];
+            const sampled = try sampling.sampleToken(LogitT, row, .{}, &.{}, rng, .{});
+            const t = sampled.token_id;
+            if (penalty_tracker) |pt| pt.recordToken(t);
+            if (tree.findChild(u, t)) |child| {
+                out_tokens[draft_accepted] = t;
+                draft_accepted += 1;
+                out_accepted_nodes[draft_accepted] = child;
+                u = child;
+            } else {
+                out_tokens[draft_accepted] = t;
+                const total: u16 = draft_accepted + 1;
+                return .{
+                    .accepted_node_count = total,
+                    .emitted_token_count = total,
+                    .draft_accepted = draft_accepted,
+                    .last_accepted_node = u,
+                    .bonus_token = t,
+                };
+            }
+        }
+    }
+
+    if (unconstrained_stochastic and params.temperature > 0.0) {
+        const res = try verifyStochastic(
+            max_nodes,
+            LogitT,
+            tree,
+            target_logits,
+            vocab_size,
+            draft_probs,
+            params.temperature,
+            rng,
+            scratch.logits_f32,
+            out_accepted_nodes,
+            out_tokens,
+        );
+        if (penalty_tracker) |pt| {
+            pt.recordSlice(out_tokens[0..res.emitted_token_count]);
+        }
+        return res;
+    }
+
+    if (scratch.logits_f32.len < vocab_size) return error.ScratchTooSmall;
+    if (draft_probs) |dp| {
+        if (dp.len < total_logits) return error.InvalidDraftLength;
+    }
+
+    var u: u16 = 0;
+    out_accepted_nodes[0] = 0;
+    var draft_accepted: u16 = 0;
+
+    while (true) {
+        const row_start = @as(usize, u) * vocab_size;
+        const row_logits = target_logits[row_start .. row_start + vocab_size];
+
+        var step_params = params;
+        if (gram_active) {
+            step_params.allowed_token_mask = try grammar_adapter.?.fillBitmask(vocab_size);
+        }
+        const seen = if (penalty_tracker) |pt| pt.activeEntries() else &[_]sampling.TokenFreqEntry{};
+
+        // Constrained / penalized greedy (`T == 0`)
+        if (step_params.temperature == 0.0) {
+            const sampled = try sampling.sampleToken(LogitT, row_logits, step_params, seen, rng, scratch);
+            const t = sampled.token_id;
+            if (gram_active) {
+                const ga = grammar_adapter.?;
+                const snap = ga.state.snapshot();
+                if (!ga.advanceTokenOnState(ga.state, t)) {
+                    ga.state.restore(snap);
+                    return error.EmptyAllowedSet;
+                }
+            }
+            if (penalty_tracker) |pt| pt.recordToken(t);
+
+            if (tree.findChild(u, t)) |child| {
+                out_tokens[draft_accepted] = t;
+                draft_accepted += 1;
+                out_accepted_nodes[draft_accepted] = child;
+                u = child;
+            } else {
+                out_tokens[draft_accepted] = t;
+                const total: u16 = draft_accepted + 1;
+                return .{
+                    .accepted_node_count = total,
+                    .emitted_token_count = total,
+                    .draft_accepted = draft_accepted,
+                    .last_accepted_node = u,
+                    .bonus_token = t,
+                };
+            }
+            continue;
+        }
+
+        // Constrained / filtered stochastic (`T > 0`) target distribution in `residual` (`scratch.logits_f32`)!
+        const residual = scratch.logits_f32[0..vocab_size];
+        const max_l = try sampling.prepareConstrainedLogits(LogitT, row_logits, step_params, seen, residual);
+        const inv_t: f64 = 1.0 / @as(f64, step_params.temperature);
+        const max_f64: f64 = @as(f64, max_l);
+
+        // Build target distribution `p_target` applying `top_k`, `min_p`, `top_p`, and `allowed_token_mask`.
+        var max_exp: f64 = 0.0;
+        var argmax_id: usize = 0;
+        for (0..vocab_size) |idx| {
+            const l = residual[idx];
+            if (l == max_l) argmax_id = idx;
+            if (l == -std.math.inf(f32)) {
+                residual[idx] = 0.0;
+                continue;
+            }
+            const shifted = (@as(f64, l) - max_f64) * inv_t;
+            const e: f64 = if (shifted < -80.0) 0.0 else @exp(shifted);
+            residual[idx] = @floatCast(e);
+            if (e > max_exp) max_exp = e;
+        }
+
+        if (step_params.min_p > 0.0 and max_exp > 0.0) {
+            const thresh: f32 = @floatCast(@as(f64, step_params.min_p) * max_exp);
+            for (0..vocab_size) |idx| {
+                if (idx != argmax_id and residual[idx] < thresh) residual[idx] = 0.0;
+            }
+        }
+
+        if ((step_params.top_k > 0 and step_params.top_k < vocab_size) or step_params.top_p < 1.0) {
+            if (scratch.cand_ids.len < vocab_size) return error.ScratchTooSmall;
+            var cnt: usize = 0;
+            for (0..vocab_size) |idx| {
+                if (residual[idx] > 0.0) {
+                    scratch.cand_ids[cnt] = @intCast(idx);
+                    cnt += 1;
+                }
+            }
+            const Ctx = struct {
+                s: []const f32,
+                pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                    const va = ctx.s[a];
+                    const vb = ctx.s[b];
+                    if (va != vb) return va > vb;
+                    return a < b;
+                }
+            };
+            std.mem.sort(u32, scratch.cand_ids[0..cnt], Ctx{ .s = residual }, Ctx.lessThan);
+            var keep = cnt;
+            if (step_params.top_k > 0 and step_params.top_k < keep) {
+                keep = @intCast(step_params.top_k);
+            }
+            if (step_params.top_p < 1.0 and keep > 1) {
+                var sum_all: f64 = 0.0;
+                for (scratch.cand_ids[0..keep]) |id| sum_all += @as(f64, residual[id]);
+                const target_mass = @as(f64, step_params.top_p) * sum_all;
+                var cum: f64 = 0.0;
+                var kp: usize = 0;
+                for (scratch.cand_ids[0..keep]) |id| {
+                    cum += @as(f64, residual[id]);
+                    kp += 1;
+                    if (cum >= target_mass) break;
+                }
+                keep = @max(kp, 1);
+            }
+            for (scratch.cand_ids[keep..cnt]) |drop_id| {
+                residual[drop_id] = 0.0;
+            }
+        }
+
+        var sum_e: f64 = 0.0;
+        for (residual) |e| sum_e += @as(f64, e);
+        if (!(sum_e > 0.0)) return error.EmptyAllowedSet;
+        const inv_sum_e: f64 = 1.0 / sum_e;
+        var norm_sum: f64 = 0.0;
+        for (residual) |*e| {
+            const p: f32 = @floatCast(@as(f64, e.*) * inv_sum_e);
+            e.* = p;
+            norm_sum += @as(f64, p);
+        }
+
+        const first_child = tree.nodes[u].first_child;
+        if (first_child == tree_mod.NO_NODE) {
+            const bonus = sampleCategorical(residual, rng);
+            if (gram_active) {
+                _ = grammar_adapter.?.advanceTokenOnState(grammar_adapter.?.state, bonus);
+            }
+            if (penalty_tracker) |pt| pt.recordToken(bonus);
+            out_tokens[draft_accepted] = bonus;
+            const total: u16 = draft_accepted + 1;
+            return .{
+                .accepted_node_count = total,
+                .emitted_token_count = total,
+                .draft_accepted = draft_accepted,
+                .last_accepted_node = u,
+                .bonus_token = bonus,
+            };
+        }
+
+        {
+            var chk = first_child;
+            while (chk != tree_mod.NO_NODE) : (chk = tree.nodes[chk].next_sibling) {
+                if (tree.nodes[chk].token_id >= vocab_size) return error.TokenOutOfRange;
+            }
+        }
+
+        var accepted_child: ?u16 = null;
+        if (draft_probs) |dp| {
+            const q_u = dp[row_start .. row_start + vocab_size];
+            var q_rem: f64 = 0.0;
+            for (q_u) |qv| {
+                if (!std.math.isFinite(qv) or qv < 0.0) return error.InvalidDraftProbs;
+                q_rem += @as(f64, qv);
+            }
+            var c = first_child;
+            while (c != tree_mod.NO_NODE) : (c = tree.nodes[c].next_sibling) {
+                const tok: usize = tree.nodes[c].token_id;
+                const p_tok: f64 = @as(f64, residual[tok]);
+                const q_raw: f64 = @as(f64, q_u[tok]);
+                if (q_raw > 0.0 and q_rem > 0.0) {
+                    const q_eff: f64 = @min(1.0, q_raw / q_rem);
+                    const alpha: f64 = if (p_tok >= q_eff) 1.0 else p_tok / q_eff;
+                    if (alpha > 0.0 and rng.float(f64) < alpha) {
+                        accepted_child = c;
+                        break;
+                    }
+                    const inv_q_rem: f64 = 1.0 / q_rem;
+                    var z: f64 = 0.0;
+                    for (0..vocab_size) |x| {
+                        if (x == tok or residual[x] <= 0.0) {
+                            residual[x] = 0.0;
+                            continue;
+                        }
+                        const diff = @as(f64, residual[x]) - @as(f64, q_u[x]) * inv_q_rem;
+                        if (diff > 0.0) {
+                            residual[x] = @floatCast(diff);
+                            z += diff;
+                        } else {
+                            residual[x] = 0.0;
+                        }
+                    }
+                    q_rem -= q_raw;
+                    if (q_rem < 0.0) q_rem = 0.0;
+                    if (z > 0.0) {
+                        const inv_z: f64 = 1.0 / z;
+                        for (residual) |*rv| {
+                            if (rv.* > 0.0) rv.* = @floatCast(@as(f64, rv.*) * inv_z);
+                        }
+                    } else {
+                        residual[argmax_id] = 1.0;
+                        break;
+                    }
+                } else {
+                    var rem: f64 = 0.0;
+                    for (residual) |pv| rem += @as(f64, pv);
+                    if (rem > 0.0 and p_tok > 0.0) {
+                        if (rng.float(f64) * rem < p_tok) {
+                            accepted_child = c;
+                            break;
+                        }
+                        residual[tok] = 0.0;
+                        const new_rem = rem - p_tok;
+                        if (new_rem > 0.0) {
+                            const inv_rem: f64 = 1.0 / new_rem;
+                            for (residual) |*rv| {
+                                if (rv.* > 0.0) rv.* = @floatCast(@as(f64, rv.*) * inv_rem);
+                            }
+                        } else {
+                            residual[argmax_id] = 1.0;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            var rem: f64 = norm_sum;
+            var c = first_child;
+            while (c != tree_mod.NO_NODE) : (c = tree.nodes[c].next_sibling) {
+                const tok: usize = tree.nodes[c].token_id;
+                const p_tok: f64 = @as(f64, residual[tok]);
+                if (rem > 0.0 and p_tok > 0.0) {
+                    if (rng.float(f64) * rem < p_tok) {
+                        accepted_child = c;
+                        break;
+                    }
+                    rem -= p_tok;
+                    if (rem < 0.0) rem = 0.0;
+                    residual[tok] = 0.0;
+                }
+            }
+            if (accepted_child == null and !(rem > 0.0)) {
+                residual[argmax_id] = 1.0;
+            }
+        }
+
+        if (accepted_child) |child| {
+            const ctok = tree.nodes[child].token_id;
+            if (gram_active) {
+                const ga = grammar_adapter.?;
+                const snap = ga.state.snapshot();
+                if (!ga.advanceTokenOnState(ga.state, ctok)) {
+                    ga.state.restore(snap);
+                    return error.EmptyAllowedSet;
+                }
+            }
+            if (penalty_tracker) |pt| pt.recordToken(ctok);
+            out_tokens[draft_accepted] = ctok;
+            draft_accepted += 1;
+            out_accepted_nodes[draft_accepted] = child;
+            u = child;
+        } else {
+            const bonus = sampleCategorical(residual, rng);
+            if (gram_active) {
+                _ = grammar_adapter.?.advanceTokenOnState(grammar_adapter.?.state, bonus);
+            }
+            if (penalty_tracker) |pt| pt.recordToken(bonus);
+            out_tokens[draft_accepted] = bonus;
+            const total: u16 = draft_accepted + 1;
+            return .{
+                .accepted_node_count = total,
+                .emitted_token_count = total,
+                .draft_accepted = draft_accepted,
+                .last_accepted_node = u,
+                .bonus_token = bonus,
+            };
+        }
+    }
 }
 
 fn sampleWithoutReplacement(probs: []const f32, k: usize, rng: std.Random, out: []u32) usize {
@@ -915,5 +1427,169 @@ test "verifyStochastic single-child chain matches Leviathan rejection sampling (
         tvd += @abs(emp - @as(f64, p_exact[v]));
     }
     tvd *= 0.5;
+    try std.testing.expect(tvd < 0.015);
+}
+
+test {
+    _ = grammar;
+    _ = sampling;
+}
+
+test "C22 speculative tree branch propagation and verifyConstrained enforce json_schema bitmask losslessly" {
+    const vocab = [_]?[]const u8{
+        null, // 0: EOS
+        "{", // 1
+        "\"ok\":", // 2
+        "true", // 3
+        "false", // 4
+        "}", // 5
+        "invalid", // 6
+        "123", // 7
+    };
+    const V = vocab.len;
+    const eos = [_]u32{0};
+
+    var prog: grammar.GrammarProgram = undefined;
+    try grammar.compileJsonSchema(&prog,
+        \\{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}
+    );
+
+    // 1. Multi-branch DraftTree (`G5`) O(1) snapshot/restore pruning check:
+    //    root(0) -> branch A: `{`(1) -> `"ok":`(2) -> `true`(3) -> `}`(5) [ALL VALID]
+    //            -> branch B: `{`(1) -> `"ok":`(2) -> `123`(7) -> `}`(5)  [7 & 5 INVALID: ok must be boolean!]
+    //            -> branch C: `invalid`(6)                                [INVALID at depth 1]
+    var tree = tree_mod.SmallTree.init(0);
+    const n_brace = tree.insertChild(0, 1, 0.8, .l1_seed).?;
+    const n_bad_root = tree.insertChild(0, 6, 0.2, .l2).?;
+    const n_key = tree.insertChild(n_brace, 2, 0.9, .l1_seed).?;
+    const n_bad_int = tree.insertChild(n_key, 7, 0.6, .l2).?;
+    const n_bad_close = tree.insertChild(n_bad_int, 5, 0.9, .l2).?;
+    const n_true = tree.insertChild(n_key, 3, 0.4, .l1_branch).?;
+    const n_good_close = tree.insertChild(n_true, 5, 0.9, .l1_branch).?;
+
+    var node_states: [16]grammar.GrammarState = undefined;
+    var node_valid: [16]bool = undefined;
+    propagateGrammarAcrossTree(16, &tree, &prog, prog.initialState(), &vocab, &eos, &node_states, &node_valid);
+
+    try std.testing.expect(node_valid[n_brace]);
+    try std.testing.expect(!node_valid[n_bad_root]);
+    try std.testing.expect(node_valid[n_key]);
+    try std.testing.expect(!node_valid[n_bad_int]);
+    try std.testing.expect(!node_valid[n_bad_close]);
+    try std.testing.expect(node_valid[n_true]);
+    try std.testing.expect(node_valid[n_good_close]);
+    try std.testing.expect(node_states[n_good_close].isAccepting());
+
+    // 2. Even if raw target logits strongly prefer grammar-invalid tokens (`invalid`=6 and `123`=7),
+    //    `verifyConstrained` masks them out, rejects `n_bad_int`(7), accepts `n_true`(3) -> `n_good_close`(5),
+    //    and emits EOS(0) as the bonus token!
+    var logits: [16 * V]f32 = @splat(0.0);
+    // At root(0): token 6 ("invalid") has highest raw logit 10.0, valid `{`(1) has 5.0 -> picks 1!
+    logits[0 * V + 6] = 10.0;
+    logits[0 * V + 1] = 5.0;
+    // At n_brace: `"ok":`(2) has 6.0, `invalid`(6) has 9.0 -> picks 2!
+    logits[@as(usize, n_brace) * V + 6] = 9.0;
+    logits[@as(usize, n_brace) * V + 2] = 6.0;
+    // At n_key: `123`(7) has 12.0 (invalid for boolean!), `true`(3) has 4.0 -> picks 3!
+    logits[@as(usize, n_key) * V + 7] = 12.0;
+    logits[@as(usize, n_key) * V + 3] = 4.0;
+    // At n_true: `}`(5) has 5.0 -> picks 5!
+    logits[@as(usize, n_true) * V + 5] = 5.0;
+    // At n_good_close (accepting!): EOS(0) has 3.0, `invalid`(6) has 8.0 -> picks EOS(0)!
+    logits[@as(usize, n_good_close) * V + 6] = 8.0;
+    logits[@as(usize, n_good_close) * V + 0] = 3.0;
+
+    var st = prog.initialState();
+    var mask_buf: [1]u32 = .{0};
+    var scratch_f32: [V]f32 = undefined;
+    var scratch_ids: [V]u32 = undefined;
+    var acc_nodes: [16]u16 = undefined;
+    var out_toks: [16]u32 = undefined;
+    var prng = std.Random.DefaultPrng.init(99);
+
+    const res = try verifyConstrained(
+        16,
+        f32,
+        &tree,
+        &logits,
+        V,
+        null,
+        .{ .temperature = 0.0 },
+        null,
+        .{
+            .program = &prog,
+            .state = &st,
+            .token_slices = &vocab,
+            .eos_token_ids = &eos,
+            .mask_scratch = &mask_buf,
+        },
+        prng.random(),
+        .{ .logits_f32 = &scratch_f32, .cand_ids = &scratch_ids },
+        &acc_nodes,
+        &out_toks,
+    );
+
+    try std.testing.expectEqual(@as(u16, 4), res.draft_accepted);
+    try std.testing.expectEqual(@as(u16, 5), res.emitted_token_count);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 3, 5, 0 }, out_toks[0..res.emitted_token_count]);
+    try std.testing.expect(st.isAccepting());
+
+    // 3. Stochastic distribution preservation under C22 grammar mask (`{"ok":` -> only `true`(3) or `false`(4) allowed!).
+    var st_bool_base = prog.initialState();
+    try std.testing.expect(prog.advanceBytes(&st_bool_base, "{\"ok\":"));
+
+    const row = [V]f32{ 2.0, 3.0, 1.0, 1.4, 0.6, 5.0, 9.0, 7.0 };
+    // Exact masked probabilities for tokens 3 (`1.4`) and 4 (`0.6`):
+    const e3 = @exp(1.4);
+    const e4 = @exp(0.6);
+    const p3_exact = e3 / (e3 + e4);
+    const p4_exact = e4 / (e3 + e4);
+
+    var counts: [V]u64 = @splat(0);
+    const rounds: usize = 20_000;
+    var bool_tree = tree_mod.SmallTree.init(2);
+    _ = bool_tree.insertChild(0, 7, 0.7, .l2); // grammar-invalid sibling `123`!
+    _ = bool_tree.insertChild(0, 4, 0.3, .l1_seed); // grammar-valid sibling `false`!
+    var two_rows: [3 * V]f32 = @splat(0.0);
+    @memcpy(two_rows[0..V], &row);
+    // At child `4` (`false`), allow `}`(5) for the bonus token
+    two_rows[2 * V + 5] = 1.0;
+
+    for (0..rounds) |_| {
+        var st_iter = st_bool_base.snapshot();
+        const r_st = try verifyConstrained(
+            16,
+            f32,
+            &bool_tree,
+            &two_rows,
+            V,
+            null,
+            .{ .temperature = 1.0 },
+            null,
+            .{
+                .program = &prog,
+                .state = &st_iter,
+                .token_slices = &vocab,
+                .eos_token_ids = &eos,
+                .mask_scratch = &mask_buf,
+            },
+            prng.random(),
+            .{ .logits_f32 = &scratch_f32, .cand_ids = &scratch_ids },
+            &acc_nodes,
+            &out_toks,
+        );
+        _ = r_st;
+        counts[out_toks[0]] += 1;
+    }
+
+    // Zero grammar-invalid tokens ever accepted!
+    for (0..V) |tok_i| {
+        if (tok_i != 3 and tok_i != 4) {
+            try std.testing.expectEqual(@as(u64, 0), counts[tok_i]);
+        }
+    }
+    const emp3 = @as(f64, @floatFromInt(counts[3])) / @as(f64, rounds);
+    const emp4 = @as(f64, @floatFromInt(counts[4])) / @as(f64, rounds);
+    const tvd = 0.5 * (@abs(emp3 - p3_exact) + @abs(emp4 - p4_exact));
     try std.testing.expect(tvd < 0.015);
 }
