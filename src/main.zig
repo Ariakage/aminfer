@@ -55,7 +55,7 @@ const usage =
     \\                    [--max-seq-len N] [--prefix-cache-chunks N] [-D|--disk-prefix-cache <dir>]
     \\                    [-W|--wired-cap-mib N] [-S|--strict-live-ram] [-V|--no-verify-crc]
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5, M6.8, M6.9, M7 and M7.5 benchmark suites
+    \\  bench             run full M1–M7.8 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
@@ -71,6 +71,8 @@ const usage =
     \\  bench-m7          run M7 R7/G11 MLA+CSA2 FP4, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED+DSpark & X1-X3 cluster
     \\                    [--bus-bandwidth-gbs F]
     \\  bench-m75         run M7.5 W18 single-file AMF, W19 multi-LoRA, C22 grammar bitmask, C19 monitor, C21 embed/rerank, R10 DiskPrefixCache & C17 C-ABI SDK suite
+    \\  bench-m78         run M7.8 G18 fusion/canary, G19 MMA FlashAttn, G20 indirect MoE, G21 248K sampler+C22 spec, C23 NEON, C24 SME2 luti2 & G22/W20 ViT suite
+    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -236,6 +238,12 @@ pub fn main(init: std.process.Init) !void {
         }
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m75")) {
         try runBenchM75(arena, out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m78")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM78(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
             try out.writeAll(usage);
@@ -2127,6 +2135,25 @@ fn runBenchM75(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try report.write(out);
 }
 
+fn runBenchM78(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    var cfg: aminfer.bench.M78Config = .{};
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        const flag = raw_args[i];
+        if (std.mem.eql(u8, flag, "--skip-real")) {
+            cfg.skip_real_checkpoints = true;
+        } else if (std.mem.eql(u8, flag, "--bus-bandwidth-gbs")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cfg.bus_bandwidth_gbs_override = try std.fmt.parseFloat(f64, raw_args[i]);
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    const report = try aminfer.bench.runM78WithConfig(allocator, cfg);
+    try report.write(out);
+}
+
 const PeerWorkerCliArgs = struct {
     host: [4]u8,
     port: u16,
@@ -2359,6 +2386,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM7(allocator, &.{}, out);
     try out.flush();
     try runBenchM75(allocator, out);
+    try out.flush();
+    try runBenchM78(allocator, &.{}, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -3815,10 +3844,51 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
 const ServeTarget = union(enum) {
     qwen3: *aminfer.qwen3.Qwen3Model,
     graph: *aminfer.graph.GraphModel,
+
+    fn gpuDevice(self: ServeTarget) aminfer.metal.Device {
+        return switch (self) {
+            .qwen3 => |m| m.device,
+            .graph => |g| g.device,
+        };
+    }
+
+    fn gpuLibrary(self: ServeTarget) aminfer.metal.Library {
+        return switch (self) {
+            .qwen3 => |m| m.library,
+            .graph => |g| g.library,
+        };
+    }
+
+    fn gpuCompute(self: ServeTarget) *aminfer.metal.Compute {
+        return switch (self) {
+            .qwen3 => |m| &m.compute,
+            .graph => |g| &g.compute,
+        };
+    }
+
+    fn timeoutMs(self: ServeTarget) u64 {
+        return switch (self) {
+            .qwen3 => |m| m.timeout_ms,
+            .graph => |g| g.timeout_ms,
+        };
+    }
+
+    fn lastLogitsBinding(self: ServeTarget) aminfer.metal.BufferBinding {
+        return switch (self) {
+            .qwen3 => |m| m.lastLogitsBinding(),
+            .graph => |g| g.lastLogitsBinding(),
+        };
+    }
 };
 
+fn serveTokenBytesForSpec(ctx: ?*const anyopaque, token_id: u32) ?[]const u8 {
+    const tok: *const aminfer.tokenizer.Tokenizer = @ptrCast(@alignCast(ctx orelse return null));
+    if (tok.isSpecialToken(token_id)) return null;
+    return tok.tokenBytes(token_id) catch null;
+}
+
 /// Zero-allocation inference runner bridging `Qwen3Model` / `GraphModel` / `SpecEngine` +
-/// `Tokenizer` into `server.Server`'s `EngineHandler` (`C7`, `C8`, `C18`, `C22`, `D11`, `W9`, `W19`).
+/// `Tokenizer` into `server.Server`'s `EngineHandler` (`C7`, `C8`, `C18`, `C22`, `D11`, `W9`, `W19`, `G21`).
 const ServeRunner = struct {
     target: ServeTarget,
     spec_engine: ?*aminfer.engine.SpecEngine,
@@ -3837,6 +3907,7 @@ const ServeRunner = struct {
     grammar_mask: []u32,
     vocab_index: ?aminfer.grammar.VocabIndex,
     penalty_tracker: *aminfer.sampling.DefaultPenaltyTracker,
+    gpu_sampler: ?aminfer.sampler.GpuSampler = null,
     model_mutex: ?*std.c.pthread_mutex_t = null,
     server_ptr: ?*aminfer.server.Server = null,
     round_buf: [aminfer.engine.MAX_TREE_NODES]u32,
@@ -3902,6 +3973,25 @@ const ServeRunner = struct {
             stop_tokens[0..stop_cnt],
         )) |vi| vi else |_| null;
 
+        var gpu_sampler: ?aminfer.sampler.GpuSampler = null;
+        if (spec_engine == null and vocab_size > 0 and vocab_size <= aminfer.sampler.MAX_VOCAB_SIZE) {
+            if (aminfer.sampler.GpuSampler.initStandalone(target.gpuDevice(), target.gpuLibrary(), .{
+                .max_vocab_size = vocab_size,
+                .max_batch_slots = 1,
+            })) |gs| {
+                var gs_mut = gs;
+                if (gs_mut.registerResident(target.gpuCompute().*)) {
+                    gpu_sampler = gs_mut;
+                } else |err| {
+                    gs_mut.close();
+                    return err;
+                }
+            } else |err| switch (err) {
+                error.BudgetExceeded, error.OutOfMemory, error.Overflow => {},
+                else => |e| return e,
+            }
+        }
+
         return .{
             .target = target,
             .spec_engine = spec_engine,
@@ -3920,6 +4010,7 @@ const ServeRunner = struct {
             .grammar_mask = grammar_mask,
             .vocab_index = vocab_index,
             .penalty_tracker = penalty_tracker,
+            .gpu_sampler = gpu_sampler,
             .round_buf = @splat(0),
         };
     }
@@ -3951,6 +4042,10 @@ const ServeRunner = struct {
     }
 
     fn deinit(self: *ServeRunner, allocator: std.mem.Allocator) void {
+        if (self.gpu_sampler) |*gs| {
+            gs.close();
+            self.gpu_sampler = null;
+        }
         if (self.vocab_index) |*vi| vi.deinit(allocator);
         allocator.destroy(self.penalty_tracker);
         allocator.free(self.grammar_mask);
@@ -4007,39 +4102,54 @@ const ServeRunner = struct {
         job: *const aminfer.server.InferenceJob,
         gstate: *aminfer.grammar.GrammarState,
     ) ?u32 {
-        const raw_logits = switch (self.target) {
-            .qwen3 => |m| m.readLastLogitsF16(),
-            .graph => |g| g.readLastLogitsF16(),
-        };
-        const n = @min(raw_logits.len, self.p_res.len);
-        if (n == 0) return null;
         var params = job.sampling;
         if (job.grammar_program) |gp| {
             const vi = &(self.vocab_index orelse return null);
-            const mask_len = (@min(n, vi.vocab_size) + 31) / 32;
+            const mask_len = (@min(@as(usize, self.vocab_size), vi.vocab_size) + 31) / 32;
             vi.fillAllowedTokenBitmask(gp, gstate, self.grammar_mask[0..mask_len]);
             params.allowed_token_mask = self.grammar_mask[0..mask_len];
         }
-        const out = aminfer.sampling.sampleToken(
-            f16,
-            raw_logits[0..n],
-            params,
-            self.penalty_tracker.activeEntries(),
-            job.rng,
-            .{
-                .logits_f32 = self.p_res[0..n],
-                .cand_ids = self.sampler_cand_ids[0..n],
-            },
-        ) catch return null;
+
+        const picked: u32 = if (self.gpu_sampler) |*gs| blk: {
+            const g_out = gs.sampleSync(self.target.gpuCompute(), .{
+                .logits = self.target.lastLogitsBinding(),
+                .logits_dtype = .f16,
+                .vocab_size = self.vocab_size,
+                .params = params,
+                .seen_frequencies = if (params.hasPenalties()) self.penalty_tracker.activeEntries() else null,
+                .rng_seed = job.rng.random().int(u64),
+            }, self.target.timeoutMs()) catch return null;
+            break :blk g_out.token_id;
+        } else blk: {
+            const raw_logits = switch (self.target) {
+                .qwen3 => |m| m.readLastLogitsF16(),
+                .graph => |g| g.readLastLogitsF16(),
+            };
+            const n = @min(raw_logits.len, self.p_res.len);
+            if (n == 0) return null;
+            const out = aminfer.sampling.sampleToken(
+                f16,
+                raw_logits[0..n],
+                params,
+                self.penalty_tracker.activeEntries(),
+                job.rng,
+                .{
+                    .logits_f32 = self.p_res[0..n],
+                    .cand_ids = self.sampler_cand_ids[0..n],
+                },
+            ) catch return null;
+            break :blk out.token_id;
+        };
+
         if (job.grammar_program) |gp| {
             if (self.vocab_index) |*vi| {
-                _ = vi.advanceToken(gp, gstate, self.tok, out.token_id);
+                _ = vi.advanceToken(gp, gstate, self.tok, picked);
             }
         }
         if (params.hasPenalties()) {
-            self.penalty_tracker.recordToken(out.token_id);
+            self.penalty_tracker.recordToken(picked);
         }
-        return out.token_id;
+        return picked;
     }
 
     fn handler(self: *ServeRunner) aminfer.server.EngineHandler {
@@ -4127,8 +4237,25 @@ const ServeRunner = struct {
             job.sampling.top_k > 0 or
             job.sampling.min_p > 0.0;
 
-        if (!use_constrained and self.spec_engine != null) {
+        if (self.spec_engine != null and !job.sampling.logprobs and job.sampling.top_logprobs == 0) {
             const eng = self.spec_engine.?;
+            if (use_constrained) {
+                var samp_p = job.sampling;
+                samp_p.temperature = job.temperature;
+                eng.setConstraints(.{
+                    .grammar_program = job.grammar_program,
+                    .vocab_index = if (self.vocab_index) |*vi| vi else null,
+                    .token_bytes_fn = serveTokenBytesForSpec,
+                    .token_bytes_ctx = self.tok,
+                    .eos_token_ids = self.stop_tokens[0..self.stop_token_count],
+                    .sampling = samp_p,
+                    .prompt_history = prompt_ids,
+                });
+            } else {
+                eng.clearConstraints();
+            }
+            defer eng.clearConstraints();
+
             eng.reset();
             eng.setActiveNgramDomain(job.ngram_domain);
             eng.config.temperature = job.temperature;
@@ -4369,6 +4496,10 @@ const BatchServeRunner = struct {
 
     inner_backend: aminfer.batch_scheduler.BatchBackend,
     qwen3_batch_rt: ?*aminfer.qwen3.Qwen3BatchRuntime = null,
+    graph_batch_rt: ?*aminfer.graph.GraphBatchRuntime = null,
+    gpu_sampler: ?aminfer.sampler.GpuSampler = null,
+    batch_row_reqs: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]aminfer.sampler.RowRequest = @splat(.{}),
+    batch_slot_indices: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]usize = @splat(0),
     model_mutex: ?*std.c.pthread_mutex_t = null,
     server_ptr: ?*aminfer.server.Server = null,
     ngram_registry: ?*aminfer.ngram_nvme.DomainNgramRegistry,
@@ -4465,12 +4596,44 @@ const BatchServeRunner = struct {
     }
 
     fn deinit(self: *BatchServeRunner, allocator: std.mem.Allocator) void {
+        if (self.gpu_sampler) |*gs| {
+            gs.close();
+            self.gpu_sampler = null;
+        }
         if (self.vocab_index) |*vi| vi.deinit(allocator);
         allocator.free(self.grammar_mask);
         allocator.free(self.sampler_cand_ids);
         allocator.free(self.p_res);
         allocator.free(self.boundary_verify_buf);
         self.encode_scratch.deinit(allocator);
+    }
+
+    fn initGpuSamplerForBatch(
+        self: *BatchServeRunner,
+        device: aminfer.metal.Device,
+        library: aminfer.metal.Library,
+        compute: *aminfer.metal.Compute,
+        vocab_size: u32,
+        max_slots: u32,
+    ) !void {
+        if (vocab_size == 0 or vocab_size > aminfer.sampler.MAX_VOCAB_SIZE) return;
+        const slots = @min(max_slots, aminfer.batch_scheduler.MAX_BATCH_SLOTS);
+        if (slots == 0) return;
+        if (aminfer.sampler.GpuSampler.initStandalone(device, library, .{
+            .max_vocab_size = vocab_size,
+            .max_batch_slots = slots,
+        })) |gs| {
+            var gs_mut = gs;
+            if (gs_mut.registerResident(compute.*)) {
+                self.gpu_sampler = gs_mut;
+            } else |err| {
+                gs_mut.close();
+                return err;
+            }
+        } else |err| switch (err) {
+            error.BudgetExceeded, error.OutOfMemory, error.Overflow => {},
+            else => |e| return e,
+        }
     }
 
     fn bindNextPendingToSlot(self: *BatchServeRunner, slot_id: u16) void {
@@ -4680,12 +4843,70 @@ const BatchServeRunner = struct {
         var res = try self.inner_backend.prefillSlot(chunk);
         if (chunk.is_final_chunk and chunk.slot_id < self.slot_constraints.len and self.slot_constraints[chunk.slot_id].active) {
             if (self.qwen3_batch_rt) |brt| {
-                if (self.sampleSlotConstrained(chunk.slot_id, brt.model.readLastLogitsF16())) |ctok| {
+                if (self.sampleSlotConstrainedGpu(
+                    chunk.slot_id,
+                    &brt.model.compute,
+                    brt.model.lastLogitsBinding(),
+                    brt.model.config.vocab_size,
+                    brt.model.timeout_ms,
+                    brt.model.readLastLogitsF16(),
+                )) |ctok| {
+                    res.first_token = ctok;
+                }
+            } else if (self.graph_batch_rt) |grt| {
+                if (self.sampleSlotConstrainedGpu(
+                    chunk.slot_id,
+                    &grt.model.compute,
+                    grt.model.lastLogitsBinding(),
+                    grt.model.config.vocab_size,
+                    grt.model.timeout_ms,
+                    grt.model.readLastLogitsF16(),
+                )) |ctok| {
                     res.first_token = ctok;
                 }
             }
         }
         return res;
+    }
+
+    fn sampleSlotConstrainedGpu(
+        self: *BatchServeRunner,
+        slot_id: u16,
+        compute: *aminfer.metal.Compute,
+        logits_bind: aminfer.metal.BufferBinding,
+        vocab_size: u32,
+        timeout_ms: u64,
+        raw_logits: []const f16,
+    ) ?u32 {
+        if (self.gpu_sampler) |*gs| {
+            if (slot_id >= self.slot_constraints.len) return null;
+            var sc = &self.slot_constraints[slot_id];
+            if (!sc.active) return null;
+            var params = sc.sampling;
+            if (sc.grammar_program) |gp| {
+                const vi = &(self.vocab_index orelse return null);
+                const mask_len = (@min(@as(usize, vocab_size), vi.vocab_size) + 31) / 32;
+                vi.fillAllowedTokenBitmask(gp, &sc.gstate, self.grammar_mask[0..mask_len]);
+                params.allowed_token_mask = self.grammar_mask[0..mask_len];
+            }
+            const rng_ptr = sc.rng orelse return null;
+            if (gs.sampleSync(compute, .{
+                .logits = logits_bind,
+                .logits_dtype = .f16,
+                .vocab_size = vocab_size,
+                .params = params,
+                .seen_frequencies = null,
+                .rng_seed = rng_ptr.random().int(u64),
+            }, timeout_ms)) |g_out| {
+                if (sc.grammar_program) |gp| {
+                    if (self.vocab_index) |*vi| {
+                        _ = vi.advanceToken(gp, &sc.gstate, self.tok, g_out.token_id);
+                    }
+                }
+                return g_out.token_id;
+            } else |_| {}
+        }
+        return self.sampleSlotConstrained(slot_id, raw_logits);
     }
 
     fn stepDecodeBatchCallback(
@@ -4704,14 +4925,33 @@ const BatchServeRunner = struct {
             for (0..view.batchSize()) |bi| {
                 const sid = view.slot_ids[bi];
                 if (sid < self.slot_constraints.len and self.slot_constraints[sid].active) {
+                    const row_bind: aminfer.metal.BufferBinding = .{
+                        .buffer = brt.model.logitsBaseBinding().buffer,
+                        .offset = brt.model.logitsBaseBinding().offset + @as(u64, bi) * @as(u64, v_size) * @sizeOf(f16),
+                    };
                     const row = brt.model.logits_host[bi * v_size .. (bi + 1) * v_size];
-                    if (self.sampleSlotConstrained(sid, row)) |ctok| {
+                    if (self.sampleSlotConstrainedGpu(sid, &brt.model.compute, row_bind, brt.model.config.vocab_size, brt.model.timeout_ms, row)) |ctok| {
                         out_next_tokens[bi] = ctok;
                     }
                 }
             }
             if (self.server_ptr) |s| {
                 s.setRetiredQ8Chunks(brt.stats().kv_retire_events);
+            }
+        } else if (self.graph_batch_rt) |grt| {
+            const v_size: usize = grt.model.config.vocab_size;
+            for (0..view.batchSize()) |bi| {
+                const sid = view.slot_ids[bi];
+                if (sid < self.slot_constraints.len and self.slot_constraints[sid].active) {
+                    const row_bind: aminfer.metal.BufferBinding = .{
+                        .buffer = grt.model.logitsBaseBinding().buffer,
+                        .offset = grt.model.logitsBaseBinding().offset + @as(u64, bi) * @as(u64, v_size) * @sizeOf(f16),
+                    };
+                    const row = grt.model.logits_host[bi * v_size .. (bi + 1) * v_size];
+                    if (self.sampleSlotConstrainedGpu(sid, &grt.model.compute, row_bind, grt.model.config.vocab_size, grt.model.timeout_ms, row)) |ctok| {
+                        out_next_tokens[bi] = ctok;
+                    }
+                }
             }
         }
         self.steady_steps += 1;
@@ -5148,6 +5388,8 @@ fn runServeGraph(
             eos_opt,
             max_seq_len,
         );
+        batch_runner_storage.graph_batch_rt = &batch_rt_storage;
+        try batch_runner_storage.initGpuSamplerForBatch(model.device, model.library, &model.compute, gcfg.vocab_size, @intCast(batch_slots));
         batch_runner_ptr = &batch_runner_storage;
     } else {
         runner_storage = try ServeRunner.init(
@@ -5608,6 +5850,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         );
         batch_runner_storage.qwen3_batch_rt = &batch_rt_storage;
         batch_runner_storage.model_mutex = &model_mutex;
+        try batch_runner_storage.initGpuSamplerForBatch(model.device, model.library, &model.compute, cfg.vocab_size, @intCast(batch_slots));
         batch_runner_ptr = &batch_runner_storage;
     } else {
         runner_storage = try ServeRunner.init(

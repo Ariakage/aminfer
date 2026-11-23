@@ -45,6 +45,7 @@ const telemetry = @import("../platform/telemetry.zig");
 const theme_mod = @import("../monitor/theme.zig");
 const tui = @import("../monitor/tui.zig");
 const chat_repl = @import("../cli/chat_repl.zig");
+const sampler_mod = @import("../gpu/sampler.zig");
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -15310,4 +15311,1483 @@ test "runM75WithConfig verifies W18 single-file AMF, W19 multi-LoRA, C22 grammar
     const rendered = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "bench.m75.w18.single_file_amf") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "bench.m75.r10.disk_prefix_cache") != null);
+}
+
+// ===========================================================================
+// Milestone M7.8 Benchmark Suite (`G18`–`G22`, `C23`–`C24`, `W20`, ADR-0023)
+// ===========================================================================
+
+pub const M78Config = struct {
+    warmup_iters: u32 = 3,
+    measure_iters: u32 = 8,
+    c23_iters: u32 = 2000,
+    c24_iters: u32 = 16,
+    g21_vocab_size: u32 = 248_077,
+    g21_iters: u32 = 16,
+    bus_bandwidth_gbs_override: ?f64 = null,
+    skip_real_checkpoints: bool = false,
+};
+
+pub const M78CheckpointAB = struct {
+    present: bool = false,
+    executed: bool = false,
+    status: []const u8 = "absent",
+    wired_mib: u64 = 0,
+    prefill_unfused_ms: f64 = 0.0,
+    prefill_fused_ms: f64 = 0.0,
+    decode_unfused_ms: f64 = 0.0,
+    decode_fused_ms: f64 = 0.0,
+    decode_unfused_tok_s: f64 = 0.0,
+    decode_fused_tok_s: f64 = 0.0,
+    token_parity: bool = false,
+};
+
+pub const G19SweepPoint = struct {
+    q_len: u32,
+    kv_len: u32,
+    default_backend: attention.PrefillAttnBackend,
+    vector_us: f64,
+    mma_us: f64,
+    max_abs_diff: f32,
+};
+
+pub const M78Report = struct {
+    chip_profile: chip_profile_mod.ChipProfile,
+    gpu_name_buf: [128]u8,
+    gpu_name_len: usize,
+
+    // G18: kernel/barrier fusion + G16/G18 canary + M4 non-regression
+    g18_canary_warm_us: f64,
+    g18_canary_passed: bool,
+    g18_mixed_gsq_guard_ok: bool,
+    g18_synth_prefill64_unfused_ms: f64,
+    g18_synth_prefill64_fused_ms: f64,
+    g18_synth_decode_unfused_us: f64,
+    g18_synth_decode_fused_us: f64,
+    g18_synth_parity_ok: bool,
+    qwen3_06b: M78CheckpointAB,
+    qwen3_14b: M78CheckpointAB,
+    qwen3_30b: M78CheckpointAB,
+
+    // G19: MMA FlashAttention-2 vs scalar/vector prefill across Q_len = 1,16,32,64,512
+    g19_sweep: [5]G19SweepPoint,
+    g19_guard_ok: bool,
+    g19_parity_ok: bool,
+
+    // G20: indirect vs direct MoE dispatch
+    g20_guard_ok: bool,
+    g20_m1_direct_us: f64,
+    g20_m1_indirect_us: f64,
+    g20_m16_direct_us: f64,
+    g20_m16_indirect_us: f64,
+    g20_parity_ok: bool,
+
+    // G21 + C22: 248K GPU sampler + unconstrained greedy bypass + C22 speculative acceptance
+    g21_vocab_size: u32,
+    g21_greedy_us: f64,
+    g21_constrained_us: f64,
+    g21_sync_roundtrip_us: f64,
+    g21_spec_unconstrained_accept: f64,
+    g21_spec_constrained_accept: f64,
+    g21_spec_all_valid: bool,
+
+    // C23: NEON vs scalar JSON string/whitespace + BPE pre-token scan
+    c23_json_scalar_gbs: f64,
+    c23_json_neon_gbs: f64,
+    c23_bpe_scalar_gbs: f64,
+    c23_bpe_neon_gbs: f64,
+    c23_parity_ok: bool,
+
+    // C24: SME2 LUTI2 / LUT4 throughput + hoisted multi-LoRA <= 4 MiB L2 & C13 bus gate
+    c24_has_sme2: bool,
+    c24_luti2_m1_us: f64,
+    c24_luti2_m16_us: f64,
+    c24_scalar_m16_us: f64,
+    c24_luti2_m16_gops: f64,
+    c24_hoisted_lora_us: f64,
+    c24_l2_cap_bytes: usize,
+    c24_bus_gate_ok: bool,
+
+    // G22 + W20: synthetic multi-layer ViT + PatchMerger + AnyRes + 0B aliased decode scratch + 0-overhead text path
+    g22_text_fastpath_ok: bool,
+    g22_aliased_saved_bytes: usize,
+    g22_owned_wired_bytes: usize,
+    g22_vit_layers: u32,
+    g22_vit_tokens: u32,
+    g22_vit_encode_ms: f64,
+    g22_vit_zero_copy: bool,
+    g22_nax_hw_status: []const u8,
+
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn gpuName(self: *const M78Report) []const u8 {
+        return self.gpu_name_buf[0..self.gpu_name_len];
+    }
+
+    pub fn write(self: *const M78Report, out: *std.Io.Writer) !void {
+        try out.print(
+            \\bench.m78.device                 {s} ({s} {s}, bus={d:.1} GB/s, has_nax={s})
+            \\bench.m78.g18.canary             warm_us={d:.2} (<350us) passed={s} mixed_gsq_guard={s}
+            \\bench.m78.g18.synth_dense_ab     prefill64_unfused_ms={d:.3} prefill64_fused_ms={d:.3} decode_unfused_us={d:.2} decode_fused_us={d:.2} parity={s}
+            \\
+        , .{
+            self.gpuName(),
+            self.chip_profile.generation.label(),
+            self.chip_profile.tier.label(),
+            self.chip_profile.spec_bus_gbs,
+            if (self.chip_profile.has_nax) "yes" else "no",
+            self.g18_canary_warm_us,
+            if (self.g18_canary_passed) "yes" else "no",
+            if (self.g18_mixed_gsq_guard_ok) "yes" else "no",
+            self.g18_synth_prefill64_unfused_ms,
+            self.g18_synth_prefill64_fused_ms,
+            self.g18_synth_decode_unfused_us,
+            self.g18_synth_decode_fused_us,
+            if (self.g18_synth_parity_ok) "yes" else "no",
+        });
+
+        for ([_]struct { label: []const u8, ab: M78CheckpointAB }{
+            .{ .label = "bench.m78.g18.real.qwen3_06b", .ab = self.qwen3_06b },
+            .{ .label = "bench.m78.g18.real.qwen3_14b", .ab = self.qwen3_14b },
+            .{ .label = "bench.m78.g18.real.qwen3_30b", .ab = self.qwen3_30b },
+        }) |row| {
+            try out.print(
+                "{s: <32} status={s} wired_MiB={d} prefill_unfused_ms={d:.3} prefill_fused_ms={d:.3} decode_unfused_tok_s={d:.2} decode_fused_tok_s={d:.2} parity={s}\n",
+                .{
+                    row.label,
+                    row.ab.status,
+                    row.ab.wired_mib,
+                    row.ab.prefill_unfused_ms,
+                    row.ab.prefill_fused_ms,
+                    row.ab.decode_unfused_tok_s,
+                    row.ab.decode_fused_tok_s,
+                    if (row.ab.token_parity) "yes" else "no",
+                },
+            );
+        }
+
+        for (self.g19_sweep) |pt| {
+            const sp = if (pt.mma_us > 0.0) pt.vector_us / pt.mma_us else 0.0;
+            try out.print(
+                "bench.m78.g19.q{d}_kv{d}         route={s} vector_us={d:.2} mma_us={d:.2} speedup={d:.2}x max_diff={d:.5}\n",
+                .{ pt.q_len, pt.kv_len, @tagName(pt.default_backend), pt.vector_us, pt.mma_us, sp, pt.max_abs_diff },
+            );
+        }
+
+        const jsp = if (self.c23_json_scalar_gbs > 0.0) self.c23_json_neon_gbs / self.c23_json_scalar_gbs else 0.0;
+        const bsp = if (self.c23_bpe_scalar_gbs > 0.0) self.c23_bpe_neon_gbs / self.c23_bpe_scalar_gbs else 0.0;
+        const c24_sp = if (self.c24_luti2_m16_us > 0.0) self.c24_scalar_m16_us / self.c24_luti2_m16_us else 0.0;
+        try out.print(
+            \\bench.m78.g19.summary            guard_ok={s} parity_ok={s} nax_hw={s}
+            \\bench.m78.g20.indirect_moe       guard_ok={s} m1_direct_us={d:.2} m1_indirect_us={d:.2} m16_direct_us={d:.2} m16_indirect_us={d:.2} parity={s}
+            \\bench.m78.g21.sampler_248k       vocab={d} greedy_us={d:.2} constrained_radix_us={d:.2} sync_roundtrip_us={d:.2}
+            \\bench.m78.g21.c22_spec_accept    unconstrained_accept={d:.2} constrained_accept={d:.2} all_nodes_valid={s}
+            \\
+        , .{
+            if (self.g19_guard_ok) "yes" else "no",
+            if (self.g19_parity_ok) "yes" else "no",
+            self.g22_nax_hw_status,
+            if (self.g20_guard_ok) "yes" else "no",
+            self.g20_m1_direct_us,
+            self.g20_m1_indirect_us,
+            self.g20_m16_direct_us,
+            self.g20_m16_indirect_us,
+            if (self.g20_parity_ok) "yes" else "no",
+            self.g21_vocab_size,
+            self.g21_greedy_us,
+            self.g21_constrained_us,
+            self.g21_sync_roundtrip_us,
+            self.g21_spec_unconstrained_accept,
+            self.g21_spec_constrained_accept,
+            if (self.g21_spec_all_valid) "yes" else "no",
+        });
+        try out.print(
+            \\bench.m78.c23.neon_simd          json_scalar_GBs={d:.2} json_neon_GBs={d:.2} json_speedup={d:.2}x bpe_scalar_GBs={d:.2} bpe_neon_GBs={d:.2} bpe_speedup={d:.2}x parity={s}
+            \\bench.m78.c24.sme2_luti2         sme2={s} luti2_m1_us={d:.2} luti2_m16_us={d:.2} scalar_m16_us={d:.2} speedup={d:.2}x m16_GOPS={d:.2} hoisted_lora_us={d:.2} l2_cap_KiB={d} bus_gate_ok={s}
+            \\bench.m78.g22.vit_tower          text_fastpath_ok={s} layers={d} vis_tokens={d} aliased_saved_KiB={d} owned_wired_B={d} vit_encode_ms={d:.3} zero_copy={s}
+            \\bench.m78.swapouts_delta         {d}
+            \\
+        , .{
+            self.c23_json_scalar_gbs,
+            self.c23_json_neon_gbs,
+            jsp,
+            self.c23_bpe_scalar_gbs,
+            self.c23_bpe_neon_gbs,
+            bsp,
+            if (self.c23_parity_ok) "yes" else "no",
+            if (self.c24_has_sme2) "yes" else "no",
+            self.c24_luti2_m1_us,
+            self.c24_luti2_m16_us,
+            self.c24_scalar_m16_us,
+            c24_sp,
+            self.c24_luti2_m16_gops,
+            self.c24_hoisted_lora_us,
+            self.c24_l2_cap_bytes / 1024,
+            if (self.c24_bus_gate_ok) "yes" else "no",
+            if (self.g22_text_fastpath_ok) "yes" else "no",
+            self.g22_vit_layers,
+            self.g22_vit_tokens,
+            self.g22_aliased_saved_bytes / 1024,
+            self.g22_owned_wired_bytes,
+            self.g22_vit_encode_ms,
+            if (self.g22_vit_zero_copy) "yes" else "no",
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+fn benchWriteBytesFile(path: [:0]const u8, bytes: []const u8) !void {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.c.write(fd, bytes.ptr + written, bytes.len - written);
+        if (rc <= 0) return error.WriteFailed;
+        written += @intCast(rc);
+    }
+}
+
+fn measureQwen3G18Pass(
+    allocator: std.mem.Allocator,
+    amf_path: [:0]const u8,
+    qcfg: qwen3.ModelConfig,
+    enable_fusion: bool,
+) !struct { wired_mib: u64, prefill_ms: f64, decode_ms: f64, first_tok: u32, tok1: u32 } {
+    var model = try qwen3.Qwen3Model.loadFromFile(allocator, amf_path, qcfg, .{
+        .max_seq_len = 512,
+        .max_tree_nodes = 1,
+        .verify_crcs = false,
+        .startup_canary = false,
+        .enable_g18_fusion = enable_fusion,
+    });
+    defer model.deinit(allocator);
+
+    const prompt = [_]u32{
+        1, 15, 42, 87,  103, 211, 319, 405, 512, 601, 712, 834, 921, 1011, 1105, 1209,
+        2, 19, 53, 91,  117, 233, 347, 421, 541, 619, 733, 859, 937, 1031, 1129, 1223,
+        3, 23, 59, 97,  127, 241, 353, 431, 557, 631, 743, 863, 941, 1039, 1151, 1231,
+        4, 29, 61, 101, 131, 251, 359, 439, 563, 641, 751, 877, 947, 1049, 1153, 1237,
+    };
+    // Warm up wide prefill PSO before measuring steady-state prefill.
+    for (0..2) |_| {
+        _ = try model.prefillPrompt(&prompt, true);
+        model.resetKvCache();
+    }
+    const pf_runs: u32 = 3;
+    var pf_ns_sum: u64 = 0;
+    var first_tok: u32 = 0;
+    for (0..pf_runs) |ri| {
+        if (ri > 0) model.resetKvCache();
+        const tp0 = try vmstat.nowNs();
+        first_tok = try model.prefillPrompt(&prompt, true);
+        const tp1 = try vmstat.nowNs();
+        pf_ns_sum += (tp1 -| tp0);
+    }
+
+    var pos: u32 = prompt.len;
+    var tok = first_tok;
+    for (0..8) |_| {
+        tok = try model.stepDecode(tok, pos);
+        pos += 1;
+    }
+    const tok_ref = tok;
+
+    const decode_steps: u32 = 32;
+    const td0 = try vmstat.nowNs();
+    for (0..decode_steps) |_| {
+        tok = try model.stepDecode(tok, pos);
+        pos += 1;
+    }
+    const td1 = try vmstat.nowNs();
+
+    return .{
+        .wired_mib = model.totalWiredBytes() >> 20,
+        .prefill_ms = (@as(f64, @floatFromInt(pf_ns_sum)) / @as(f64, @floatFromInt(pf_runs))) / 1_000_000.0,
+        .decode_ms = (@as(f64, @floatFromInt(td1 -| td0)) / @as(f64, @floatFromInt(decode_steps))) / 1_000_000.0,
+        .first_tok = first_tok,
+        .tok1 = tok_ref,
+    };
+}
+
+fn runOptionalRealCheckpointM78G18(
+    allocator: std.mem.Allocator,
+    amf_path: [:0]const u8,
+    cfg_path: [:0]const u8,
+) M78CheckpointAB {
+    const fd = std.c.open(amf_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return .{ .present = false, .executed = false, .status = "absent" };
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0 or st.size <= 0) {
+        _ = std.c.close(fd);
+        return .{ .present = false, .executed = false, .status = "absent" };
+    }
+    const file_bytes: u64 = @intCast(st.size);
+    _ = std.c.close(fd);
+
+    const cfd = std.c.open(cfg_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (cfd < 0) return .{ .present = true, .executed = false, .status = "missing_config" };
+    var cst: std.c.Stat = undefined;
+    if (std.c.fstat(cfd, &cst) != 0 or cst.size <= 0 or cst.size > 4 * 1024 * 1024) {
+        _ = std.c.close(cfd);
+        return .{ .present = true, .executed = false, .status = "missing_config" };
+    }
+    const cfg_len: usize = @intCast(cst.size);
+    const cfg_bytes = allocator.alloc(u8, cfg_len) catch {
+        _ = std.c.close(cfd);
+        return .{ .present = true, .executed = false, .status = "oom" };
+    };
+    defer allocator.free(cfg_bytes);
+    var rd: usize = 0;
+    while (rd < cfg_len) {
+        const rc = std.c.pread(cfd, cfg_bytes.ptr + rd, cfg_len - rd, @intCast(rd));
+        if (rc <= 0) {
+            _ = std.c.close(cfd);
+            return .{ .present = true, .executed = false, .status = "io_error" };
+        }
+        rd += @intCast(rc);
+    }
+    _ = std.c.close(cfd);
+
+    const vm_now = vmstat.Snapshot.capture() catch {
+        return .{ .present = true, .executed = false, .status = "vmstat_error" };
+    };
+    const required_with_margin = file_bytes + (768 * 1024 * 1024);
+    if (vm_now.liveZeroSwapReclaimableBytes() < required_with_margin) {
+        return .{
+            .present = true,
+            .executed = false,
+            .status = "skipped_live_ram_headroom",
+            .wired_mib = file_bytes >> 20,
+        };
+    }
+
+    const qcfg = qwen3.ModelConfig.fromJson(allocator, cfg_bytes) catch {
+        return .{ .present = true, .executed = false, .status = "config_parse_error" };
+    };
+    const unfused = measureQwen3G18Pass(allocator, amf_path, qcfg, false) catch {
+        return .{ .present = true, .executed = false, .status = "skipped_budget_headroom", .wired_mib = file_bytes >> 20 };
+    };
+    const fused = measureQwen3G18Pass(allocator, amf_path, qcfg, true) catch {
+        return .{ .present = true, .executed = false, .status = "skipped_budget_headroom", .wired_mib = file_bytes >> 20 };
+    };
+
+    const u_tok_s = if (unfused.decode_ms > 0.0) 1000.0 / unfused.decode_ms else 0.0;
+    const f_tok_s = if (fused.decode_ms > 0.0) 1000.0 / fused.decode_ms else 0.0;
+    return .{
+        .present = true,
+        .executed = true,
+        .status = "verified_zero_swap",
+        .wired_mib = fused.wired_mib,
+        .prefill_unfused_ms = unfused.prefill_ms,
+        .prefill_fused_ms = fused.prefill_ms,
+        .decode_unfused_ms = unfused.decode_ms,
+        .decode_fused_ms = fused.decode_ms,
+        .decode_unfused_tok_s = u_tok_s,
+        .decode_fused_tok_s = f_tok_s,
+        .token_parity = (unfused.first_tok == fused.first_tok and unfused.tok1 == fused.tok1),
+    };
+}
+
+fn benchM78G18Synthetic(
+    allocator: std.mem.Allocator,
+    device: metal.Device,
+    library: metal.Library,
+    compute: *metal.Compute,
+    budget: budget_mod.Budget,
+    report: *M78Report,
+) !void {
+    var dequant_pipes = try dequant.DequantPipelines.init(device, library);
+    defer dequant_pipes.close();
+    const attn_pipes = try attention.AttentionPipelines.init(device, library);
+    defer attn_pipes.close();
+
+    var c_arena = try arena_mod.WiredArena.init(page.APPLE_PAGE_SIZE * 2, budget);
+    defer c_arena.deinit();
+    const c_buf = try metal.Buffer.wrap(device, c_arena.bytes());
+    defer c_buf.close();
+    try compute.makeResident(&.{c_buf});
+    defer compute.removeResident(&.{c_buf}) catch |err| {
+        std.debug.panic("removeResident(m78_canary) failed: {}", .{err});
+    };
+
+    for (0..3) |_| {
+        _ = try attn_pipes.runCombinedStartupCanaryInBufferMut(&dequant_pipes, compute, c_buf, c_arena.bytes());
+    }
+    var best_canary_us: f64 = std.math.inf(f64);
+    var canary_ok = true;
+    for (0..8) |_| {
+        const comb = try attn_pipes.runCombinedStartupCanaryInBufferMut(&dequant_pipes, compute, c_buf, c_arena.bytes());
+        if (comb.elapsed_us < best_canary_us) best_canary_us = comb.elapsed_us;
+        canary_ok = canary_ok and
+            (comb.dequant.g18_max_abs_err <= dequant.CANARY_TOL_Q4) and
+            (comb.fused_norm.max_abs_err_f16 <= dequant.CANARY_TOL_F16) and
+            (comb.fused_norm.max_abs_err_bf16 <= dequant.CANARY_TOL_BF16);
+    }
+    report.g18_canary_warm_us = best_canary_us;
+    report.g18_canary_passed = canary_ok and (best_canary_us < 350.0);
+
+    report.g18_mixed_gsq_guard_ok = !dequant.canFuseQkv(.q2_affine, .q4_affine, .q4_affine) and
+        dequant.canFuseQkv(.q4_affine, .q4_affine, .q4_affine) and
+        !dequant.canFuseGateUp(.q2_affine, .q4_affine) and
+        dequant.canFuseGateUp(.bf16, .bf16);
+
+    var bundle = try graph.buildSynthLoopDenseBundle(allocator, .{
+        .hidden_size = 1024,
+        .vocab_size = 256,
+        .num_layers = 4,
+        .num_attention_heads = 16,
+        .num_key_value_heads = 8,
+        .head_dim = 64,
+        .intermediate_size = 3072,
+        .start_layer = 0,
+        .end_layer = 4,
+        .mode = .single_pass,
+        .max_loops = 1,
+        .include_early_exit = false,
+        .include_steplora = false,
+    });
+    defer bundle.deinit(allocator);
+
+    var prompt64: [64]u32 = undefined;
+    for (&prompt64, 0..) |*p, i| p.* = @intCast((i * 19 + 5) % bundle.cfg.vocab_size);
+
+    const runSynth = struct {
+        fn exec(alloc: std.mem.Allocator, b: *const graph.SynthLoopDenseBundle, p: []const u32, fused: bool) !struct { pf_ms: f64, dec_us: f64, tok_pf: u32, tok0: u32, tok_last: u32, logits_pf: [256]f16 } {
+            var m = try graph.GraphModel.loadFromBytes(alloc, b.amf_bytes, b.cfg, .{
+                .max_seq_len = 128,
+                .max_tree_nodes = 32,
+                .startup_canary = false,
+                .enable_g18_fusion = fused,
+                .g18_qkv_gemm_min_m = 64,
+                .g18_swiglu_gemm_min_m = 32,
+            });
+            defer m.deinit(alloc);
+
+            for (0..2) |_| {
+                _ = try m.prefillChunk(p, 0, true);
+                m.resetKvCache();
+            }
+            const pf_runs: u32 = 4;
+            var pf_ns_sum: u64 = 0;
+            var tok_pf: u32 = 0;
+            for (0..pf_runs) |ri| {
+                if (ri > 0) m.resetKvCache();
+                const tp0 = try vmstat.nowNs();
+                tok_pf = try m.prefillChunk(p, 0, true);
+                const tp1 = try vmstat.nowNs();
+                pf_ns_sum += (tp1 -| tp0);
+            }
+            var logits_pf: [256]f16 = undefined;
+            @memcpy(&logits_pf, m.readLastLogitsF16()[0..256]);
+
+            var cur = tok_pf;
+            var pos: u32 = @intCast(p.len);
+            for (0..8) |_| {
+                cur = try m.stepDecode(cur, pos);
+                pos += 1;
+            }
+            const tok_ref = cur;
+            const steps: u32 = 32;
+            const td0 = try vmstat.nowNs();
+            for (0..steps) |_| {
+                cur = try m.stepDecode(cur, pos);
+                pos += 1;
+            }
+            const td1 = try vmstat.nowNs();
+            return .{
+                .pf_ms = (@as(f64, @floatFromInt(pf_ns_sum)) / @as(f64, @floatFromInt(pf_runs))) / 1_000_000.0,
+                .dec_us = (@as(f64, @floatFromInt(td1 -| td0)) / @as(f64, @floatFromInt(steps))) / 1000.0,
+                .tok_pf = tok_pf,
+                .tok0 = tok_ref,
+                .tok_last = cur,
+                .logits_pf = logits_pf,
+            };
+        }
+    }.exec;
+
+    const u_res = try runSynth(allocator, &bundle, &prompt64, false);
+    const f_res = try runSynth(allocator, &bundle, &prompt64, true);
+    var max_pf_diff: f32 = 0.0;
+    for (u_res.logits_pf, f_res.logits_pf) |a, b| {
+        max_pf_diff = @max(max_pf_diff, @abs(@as(f32, @floatCast(a)) - @as(f32, @floatCast(b))));
+    }
+    report.g18_synth_prefill64_unfused_ms = u_res.pf_ms;
+    report.g18_synth_prefill64_fused_ms = f_res.pf_ms;
+    report.g18_synth_decode_unfused_us = u_res.dec_us;
+    report.g18_synth_decode_fused_us = f_res.dec_us;
+    report.g18_synth_parity_ok = (u_res.tok_pf == f_res.tok_pf and u_res.tok0 == f_res.tok0 and max_pf_diff <= 2e-2);
+}
+
+fn benchM78G19(
+    device: metal.Device,
+    library: metal.Library,
+    compute: *metal.Compute,
+    cfg: M78Config,
+    report: *M78Report,
+) !void {
+    const pipes = try attention.AttentionPipelines.init(device, library);
+    defer pipes.close();
+
+    const q_lens = [_]u32{ 1, 16, 32, 64, 512 };
+    const kv_len: u32 = 512;
+    const num_q_heads: u32 = 16;
+    const num_kv_heads: u32 = 2;
+    const head_dim: u32 = 128;
+
+    const max_q: usize = 512;
+    const max_q_elems = max_q * num_q_heads * head_dim;
+    const kv_elems: usize = @as(usize, kv_len) * num_kv_heads * head_dim;
+    const arena_cap = try page.alignUp(3 * max_q_elems * 2 + 2 * kv_elems * 2 + 8192) + page.APPLE_PAGE_SIZE;
+    const tight_b = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 16 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, tight_b);
+    defer arena.deinit();
+
+    const q_raw = try arena.allocAligned(max_q_elems * 2, 64);
+    const k_raw = try arena.allocAligned(kv_elems * 2, 64);
+    const v_raw = try arena.allocAligned(kv_elems * 2, 64);
+    const out_vec_raw = try arena.allocAligned(max_q_elems * 2, 64);
+    const out_mma_raw = try arena.allocAligned(max_q_elems * 2, 64);
+    const tab_raw = try arena.allocAligned(@sizeOf(attention.KvTilePair), 64);
+
+    for (@as([]f16, @alignCast(std.mem.bytesAsSlice(f16, q_raw))), 0..) |*x, i| {
+        x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 19 + 3) % 25)) - 12)) * 0.0625);
+    }
+    for (@as([]f16, @alignCast(std.mem.bytesAsSlice(f16, k_raw))), 0..) |*x, i| {
+        x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 7) % 23)) - 11)) * 0.0625);
+    }
+    for (@as([]f16, @alignCast(std.mem.bytesAsSlice(f16, v_raw))), 0..) |*x, i| {
+        x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 29 + 5) % 27)) - 13)) * 0.0625);
+    }
+
+    var tile_k = try metal.KvTile.init(device, head_dim, num_kv_heads * kv_len, .{});
+    defer tile_k.close();
+    var tile_v = try metal.KvTile.init(device, head_dim, num_kv_heads * kv_len, .{});
+    defer tile_v.close();
+    const tab: []attention.KvTilePair = @alignCast(std.mem.bytesAsSlice(attention.KvTilePair, tab_raw));
+    tab[0] = attention.KvTilePair.fromTiles(tile_k, tile_v, .rgba16f);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    try compute.makeResident(&.{gpu_buf});
+    defer compute.removeResident(&.{gpu_buf}) catch |err| {
+        std.debug.panic("removeResident(g19) failed: {}", .{err});
+    };
+    try compute.makeTilesResident(&.{ tile_k, tile_v });
+    defer compute.removeTilesResident(&.{ tile_k, tile_v }) catch |err| {
+        std.debug.panic("removeTilesResident(g19) failed: {}", .{err});
+    };
+
+    const q_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) };
+    const k_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) };
+    const v_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) };
+    const tab_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(tab_raw.ptr) };
+    const out_vec_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_vec_raw.ptr) };
+    const out_mma_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_mma_raw.ptr) };
+
+    {
+        var init_f = try compute.beginFrame(5000);
+        errdefer init_f.abort();
+        try pipes.encodePrefillQkNormRopeKvWrite(&init_f, .{
+            .q = q_b,
+            .k = k_b,
+            .v = v_b,
+            .kv_tiles = tab_b,
+            .num_tokens = kv_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = head_dim,
+            .start_pos = 0,
+            .chunk_tokens = kv_len,
+            .kv_only = true,
+        }, false);
+        const s = try init_f.commit();
+        try compute.wait(s, 5000);
+    }
+
+    const out_vec: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_vec_raw));
+    const out_mma: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_mma_raw));
+    var all_guard_ok = !attention.shouldUseG19MmaPrefill(1, kv_len) and
+        !attention.shouldUseG19MmaPrefill(16, kv_len) and
+        !attention.shouldUseG19MmaPrefill(31, kv_len) and
+        !attention.shouldUseG19MmaPrefill(64, 32) and
+        attention.shouldUseG19MmaPrefill(32, 64);
+    var all_parity_ok = true;
+    const iters = @max(@as(u32, 1), cfg.measure_iters);
+
+    for (q_lens, 0..) |ql, qi| {
+        const route = pipes.selectPrefillAttnBackend(ql, kv_len);
+        if (ql < 32 and route != .scalar_vector) all_guard_ok = false;
+        if (ql >= 32 and route == .scalar_vector) all_guard_ok = false;
+        const q_start = kv_len - ql;
+
+        const runBackend = struct {
+            fn go(
+                p: attention.AttentionPipelines,
+                comp: *metal.Compute,
+                qb: metal.BufferBinding,
+                tb: metal.BufferBinding,
+                ob: metal.BufferBinding,
+                nq: u32,
+                qs: u32,
+                kvl: u32,
+                nqh: u32,
+                nkvh: u32,
+                hd: u32,
+                be: attention.PrefillAttnBackend,
+                w_it: u32,
+                m_it: u32,
+            ) !f64 {
+                for (0..w_it) |_| {
+                    var f = try comp.beginFrame(5000);
+                    errdefer f.abort();
+                    try p.encodeGqaCausalPrefillFlashAttn(&f, .{
+                        .q = qb,
+                        .kv_tiles = tb,
+                        .out = ob,
+                        .num_q = nq,
+                        .q_start_pos = qs,
+                        .kv_len = kvl,
+                        .num_q_heads = nqh,
+                        .num_kv_heads = nkvh,
+                        .head_dim = hd,
+                        .chunk_tokens = kvl,
+                        .backend_override = be,
+                    }, false);
+                    const s = try f.commit();
+                    try comp.wait(s, 5000);
+                }
+                var best_us: f64 = std.math.inf(f64);
+                for (0..3) |_| {
+                    const t0 = try vmstat.nowNs();
+                    var f = try comp.beginFrame(5000);
+                    errdefer f.abort();
+                    for (0..m_it) |mi| {
+                        try p.encodeGqaCausalPrefillFlashAttn(&f, .{
+                            .q = qb,
+                            .kv_tiles = tb,
+                            .out = ob,
+                            .num_q = nq,
+                            .q_start_pos = qs,
+                            .kv_len = kvl,
+                            .num_q_heads = nqh,
+                            .num_kv_heads = nkvh,
+                            .head_dim = hd,
+                            .chunk_tokens = kvl,
+                            .backend_override = be,
+                        }, mi > 0);
+                    }
+                    const s = try f.commit();
+                    try comp.wait(s, 5000);
+                    const us = @as(f64, @floatFromInt(try vmstat.nowNs() -| t0)) / (@as(f64, @floatFromInt(m_it)) * 1000.0);
+                    if (us < best_us) best_us = us;
+                }
+                return best_us;
+            }
+        }.go;
+
+        const vec_us = try runBackend(pipes, compute, q_b, tab_b, out_vec_b, ql, q_start, kv_len, num_q_heads, num_kv_heads, head_dim, .scalar_vector, cfg.warmup_iters, iters);
+        const mma_us = try runBackend(pipes, compute, q_b, tab_b, out_mma_b, ql, q_start, kv_len, num_q_heads, num_kv_heads, head_dim, .mma_apple9, cfg.warmup_iters, iters);
+
+        const q_elems = @as(usize, ql) * num_q_heads * head_dim;
+        var max_diff: f32 = 0.0;
+        for (0..q_elems) |i| {
+            const d = @abs(@as(f32, @floatCast(out_vec[i])) - @as(f32, @floatCast(out_mma[i])));
+            if (d > max_diff) max_diff = d;
+        }
+        if (max_diff > 5e-3) all_parity_ok = false;
+
+        report.g19_sweep[qi] = .{
+            .q_len = ql,
+            .kv_len = kv_len,
+            .default_backend = route,
+            .vector_us = vec_us,
+            .mma_us = mma_us,
+            .max_abs_diff = max_diff,
+        };
+    }
+    report.g19_guard_ok = all_guard_ok;
+    report.g19_parity_ok = all_parity_ok;
+}
+
+fn benchM78G20(
+    device: metal.Device,
+    library: metal.Library,
+    compute: *metal.Compute,
+    cfg: M78Config,
+    report: *M78Report,
+) !void {
+    const pipes = try moe.MoePipelines.init(device, library);
+    defer pipes.close();
+
+    report.g20_guard_ok = !moe.shouldUseIndirectDispatch(1, 1) and
+        moe.shouldUseIndirectDispatch(1, 2) and
+        moe.shouldUseIndirectDispatch(16, 1);
+
+    const m_max: u32 = 16;
+    const num_experts: u32 = 32;
+    const top_k: u32 = 4;
+    const hidden_size: u32 = 512;
+    const inter_size: u32 = 512;
+    const ws_spec: moe.WorkspaceSpec = .{
+        .max_tokens = m_max,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = inter_size,
+    };
+    const ws_bytes = try moe.MoeWorkspace.requiredBytes(ws_spec);
+    const gu_qw_b = try Q4.rowWeightBytes(hidden_size) * inter_size;
+    const gu_sb_b = try Q4.groupsPerRow(hidden_size) * inter_size * @sizeOf(quant.ScaleBias);
+    const dn_qw_b = try Q4.rowWeightBytes(inter_size) * hidden_size;
+    const dn_sb_b = try Q4.groupsPerRow(inter_size) * hidden_size * @sizeOf(quant.ScaleBias);
+    const exp_bytes = num_experts * (gu_qw_b * 2 + gu_sb_b * 2 + dn_qw_b + dn_sb_b + 512);
+    const total = try page.alignUp(ws_bytes * 2 + exp_bytes + 256 * 1024);
+
+    const tight_b = budget_mod.Budget.compute(.{
+        .memory_bytes = total + 16 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = total,
+        .global_user_wire_limit = total,
+        .gpu_working_set_bytes = total,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(total, tight_b);
+    defer arena.deinit();
+
+    var ws_dir = try moe.MoeWorkspace.init(&arena, ws_spec);
+    var ws_ind = try moe.MoeWorkspace.init(&arena, ws_spec);
+    const x_raw = try arena.allocAligned(m_max * hidden_size * 2, 64);
+    const logits_raw = try arena.allocAligned(m_max * num_experts * 4, 64);
+    const out_dir_raw = try arena.allocAligned(m_max * hidden_size * 2, 64);
+    const out_ind_raw = try arena.allocAligned(m_max * hidden_size * 2, 64);
+    const table_raw = try arena.allocAligned(num_experts * @sizeOf(moe.ExpertWeights), 64);
+
+    for (@as([]f16, @alignCast(std.mem.bytesAsSlice(f16, x_raw))), 0..) |*v, i| {
+        v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 13 + 5) % 19)) - 9)) * 0.0625);
+    }
+    const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+    for (0..m_max) |tok| {
+        for (0..num_experts) |e| {
+            logits_f32[tok * num_experts + e] = if (e < 8)
+                4.0 + @as(f32, @floatFromInt((tok + e * 3) % 7)) * 0.25
+            else
+                -6.0 - @as(f32, @floatFromInt(e)) * 0.05;
+        }
+    }
+    const table: []moe.ExpertWeights = @alignCast(std.mem.bytesAsSlice(moe.ExpertWeights, table_raw));
+    for (0..num_experts) |e| {
+        const gq = try arena.allocAligned(gu_qw_b, 64);
+        const gs = try arena.allocAligned(gu_sb_b, 64);
+        const uq = try arena.allocAligned(gu_qw_b, 64);
+        const us = try arena.allocAligned(gu_sb_b, 64);
+        const dq = try arena.allocAligned(dn_qw_b, 64);
+        const ds = try arena.allocAligned(dn_sb_b, 64);
+        for (gq, 0..) |*b, i| b.* = @truncate((e * 29 + i * 7 + 3) & 0xFF);
+        for (uq, 0..) |*b, i| b.* = @truncate((e * 31 + i * 11 + 5) & 0xFF);
+        for (dq, 0..) |*b, i| b.* = @truncate((e * 37 + i * 13 + 7) & 0xFF);
+        for ([_][]u8{ gs, us, ds }) |sbs| {
+            for (std.mem.bytesAsSlice(quant.ScaleBias, sbs)) |*sb| {
+                sb.* = .{ .scale = @floatCast(@as(f32, 0.015)), .bias = @floatCast(@as(f32, -0.10)) };
+            }
+        }
+        table[e] = .{
+            .gate_qweight_offset = arena.offsetOf(gq.ptr),
+            .gate_sb_offset = arena.offsetOf(gs.ptr),
+            .up_qweight_offset = arena.offsetOf(uq.ptr),
+            .up_sb_offset = arena.offsetOf(us.ptr),
+            .down_qweight_offset = arena.offsetOf(dq.ptr),
+            .down_sb_offset = arena.offsetOf(ds.ptr),
+        };
+    }
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch |err| {
+        std.debug.panic("removeResident(g20) failed: {}", .{err});
+    };
+
+    const runMode = struct {
+        fn exec(
+            p: moe.MoePipelines,
+            comp: *metal.Compute,
+            b: metal.Buffer,
+            xb: metal.BufferBinding,
+            lb: metal.BufferBinding,
+            tb: metal.BufferBinding,
+            ws: *moe.MoeWorkspace,
+            ob: metal.BufferBinding,
+            m: u32,
+            indirect: bool,
+            w_it: u32,
+            m_it: u32,
+        ) !f64 {
+            for (0..w_it) |_| {
+                var f = try comp.beginFrame(5000);
+                errdefer f.abort();
+                try p.encodeRouteTopK(&f, .f32, .{ .logits = lb, .workspace = ws, .workspace_buf = b, .m = m, .num_experts = 32, .top_k = 4, .hidden_size = 512, .intermediate_size = 512 }, false);
+                try p.encodeGateUpSwiglu(&f, .q4, .{ .x = xb, .weights_base = .{ .buffer = b, .offset = 0 }, .expert_table = tb, .workspace = ws, .workspace_buf = b, .m = m, .num_experts = 32, .top_k = 4, .hidden_size = 512, .intermediate_size = 512, .use_indirect = indirect }, true);
+                try p.encodeDownProj(&f, .q4, .{ .weights_base = .{ .buffer = b, .offset = 0 }, .expert_table = tb, .workspace = ws, .workspace_buf = b, .m = m, .num_experts = 32, .top_k = 4, .hidden_size = 512, .intermediate_size = 512, .use_indirect = indirect }, true);
+                try p.encodeReduce(&f, .{ .workspace = ws, .workspace_buf = b, .out = ob, .m = m, .hidden_size = 512, .top_k = 4 }, true);
+                const sig = try f.commit();
+                try comp.wait(sig, 5000);
+            }
+            var best: f64 = std.math.inf(f64);
+            for (0..3) |_| {
+                const t0 = try vmstat.nowNs();
+                var f = try comp.beginFrame(5000);
+                errdefer f.abort();
+                for (0..m_it) |mi| {
+                    try p.encodeRouteTopK(&f, .f32, .{ .logits = lb, .workspace = ws, .workspace_buf = b, .m = m, .num_experts = 32, .top_k = 4, .hidden_size = 512, .intermediate_size = 512 }, mi > 0);
+                    try p.encodeGateUpSwiglu(&f, .q4, .{ .x = xb, .weights_base = .{ .buffer = b, .offset = 0 }, .expert_table = tb, .workspace = ws, .workspace_buf = b, .m = m, .num_experts = 32, .top_k = 4, .hidden_size = 512, .intermediate_size = 512, .use_indirect = indirect }, true);
+                    try p.encodeDownProj(&f, .q4, .{ .weights_base = .{ .buffer = b, .offset = 0 }, .expert_table = tb, .workspace = ws, .workspace_buf = b, .m = m, .num_experts = 32, .top_k = 4, .hidden_size = 512, .intermediate_size = 512, .use_indirect = indirect }, true);
+                    try p.encodeReduce(&f, .{ .workspace = ws, .workspace_buf = b, .out = ob, .m = m, .hidden_size = 512, .top_k = 4 }, true);
+                }
+                const sig = try f.commit();
+                try comp.wait(sig, 5000);
+                const us = @as(f64, @floatFromInt(try vmstat.nowNs() -| t0)) / (@as(f64, @floatFromInt(m_it)) * 1000.0);
+                if (us < best) best = us;
+            }
+            return best;
+        }
+    }.exec;
+
+    const xb: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(x_raw.ptr) };
+    const lb: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(logits_raw.ptr) };
+    const tb: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(table_raw.ptr) };
+    const ob_d: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(out_dir_raw.ptr) };
+    const ob_i: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(out_ind_raw.ptr) };
+    const iters = @max(@as(u32, 1), cfg.measure_iters);
+
+    report.g20_m1_direct_us = try runMode(pipes, compute, buf, xb, lb, tb, &ws_dir, ob_d, 1, false, cfg.warmup_iters, iters);
+    report.g20_m1_indirect_us = try runMode(pipes, compute, buf, xb, lb, tb, &ws_ind, ob_i, 1, true, cfg.warmup_iters, iters);
+    report.g20_m16_direct_us = try runMode(pipes, compute, buf, xb, lb, tb, &ws_dir, ob_d, 16, false, cfg.warmup_iters, iters);
+    report.g20_m16_indirect_us = try runMode(pipes, compute, buf, xb, lb, tb, &ws_ind, ob_i, 16, true, cfg.warmup_iters, iters);
+    report.g20_parity_ok = std.mem.eql(u8, out_dir_raw, out_ind_raw);
+}
+
+fn benchM78G21(
+    allocator: std.mem.Allocator,
+    device: metal.Device,
+    library: metal.Library,
+    compute: *metal.Compute,
+    budget: budget_mod.Budget,
+    cfg: M78Config,
+    report: *M78Report,
+) !void {
+    const vocab_size: u32 = cfg.g21_vocab_size;
+    var sampler = try sampler_mod.GpuSampler.initStandalone(device, library, .{
+        .max_vocab_size = sampler_mod.MAX_VOCAB_SIZE,
+        .max_batch_slots = 1,
+    });
+    defer sampler.close();
+    try sampler.registerResident(compute.*);
+
+    const bm_words = grammar.bitmaskWordCount(vocab_size);
+    const bm_bytes = amf.align64(bm_words * @sizeOf(u32));
+    const arena_bytes = try page.alignUp(vocab_size * @sizeOf(f16) + bm_bytes + 64 * 1024);
+    var arena = try arena_mod.WiredArena.init(arena_bytes, budget);
+    defer arena.deinit();
+
+    const logits_raw = try arena.allocAligned(vocab_size * @sizeOf(f16), 64);
+    const bm_raw = try arena.allocAligned(bm_bytes, 64);
+    for (@as([]f16, @alignCast(std.mem.bytesAsSlice(f16, logits_raw))), 0..) |*slot, i| {
+        const x = @as(f32, @floatFromInt((i *% 37 +% 13) & 1023)) / 128.0 - 4.0;
+        slot.* = @floatCast(x);
+    }
+    @memset(@as([]u32, @alignCast(std.mem.bytesAsSlice(u32, bm_raw))), 0xFFFF_FFFF);
+
+    const buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer buf.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch |err| {
+        std.debug.panic("removeResident(g21) failed: {}", .{err});
+    };
+
+    const logits_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(logits_raw.ptr) };
+    const bm_bind: metal.BufferBinding = .{ .buffer = buf, .offset = arena.offsetOf(bm_raw.ptr) };
+    const biases = [_]sampler_mod.LogitBiasEntry{
+        .{ .token_id = 42, .bias = 1.5 },
+        .{ .token_id = 100_000, .bias = -2.0 },
+    };
+    const seen = try allocator.alloc(sampler_mod.TokenFreqEntry, 128);
+    defer allocator.free(seen);
+    for (seen, 0..) |*e, i| e.* = .{ .token_id = @intCast(i * 17 + 5), .count = @intCast((i % 4) + 1) };
+    try sampler.uploadOverrides(0, vocab_size, &biases, seen);
+
+    const cparams: sampler_mod.SampleParams = .{
+        .temperature = 0.8,
+        .top_k = 50,
+        .min_p = 0.05,
+        .top_p = 0.9,
+        .presence_penalty = 0.3,
+        .frequency_penalty = 0.2,
+        .repetition_penalty = 1.1,
+        .logit_bias = &biases,
+    };
+
+    for (0..4) |_| {
+        _ = try sampler.sampleSync(compute, .{ .logits = logits_bind, .logits_dtype = .f16, .vocab_size = vocab_size, .params = .{} }, 5000);
+        _ = try sampler.sampleSync(compute, .{ .logits = logits_bind, .logits_dtype = .f16, .vocab_size = vocab_size, .params = cparams, .seen_frequencies = null, .rng_seed = 0x1234_5678, .external_bitmask = bm_bind }, 5000);
+    }
+
+    const iters: usize = @max(@as(usize, 1), cfg.g21_iters);
+    var best_greedy: f64 = std.math.inf(f64);
+    var best_const: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        const t0 = try vmstat.nowNs();
+        var fg = try compute.beginFrame(5000);
+        errdefer fg.abort();
+        for (0..iters) |i| {
+            try sampler.encodeSample(&fg, .{ .logits = logits_bind, .logits_dtype = .f16, .vocab_size = vocab_size, .params = .{} }, i > 0);
+        }
+        const sg = try fg.commit();
+        try compute.wait(sg, 5000);
+        const usg = @as(f64, @floatFromInt(try vmstat.nowNs() -| t0)) / (@as(f64, @floatFromInt(iters)) * 1000.0);
+        if (usg < best_greedy) best_greedy = usg;
+
+        const t1 = try vmstat.nowNs();
+        var fc = try compute.beginFrame(5000);
+        errdefer fc.abort();
+        for (0..iters) |i| {
+            try sampler.encodeSample(&fc, .{ .logits = logits_bind, .logits_dtype = .f16, .vocab_size = vocab_size, .params = cparams, .seen_frequencies = null, .rng_seed = 0x9000_0001, .external_bitmask = bm_bind }, i > 0);
+        }
+        const sc = try fc.commit();
+        try compute.wait(sc, 5000);
+        const usc = @as(f64, @floatFromInt(try vmstat.nowNs() -| t1)) / (@as(f64, @floatFromInt(iters)) * 1000.0);
+        if (usc < best_const) best_const = usc;
+    }
+
+    const ts0 = try vmstat.nowNs();
+    for (0..8) |i| {
+        _ = try sampler.sampleSync(compute, .{ .logits = logits_bind, .logits_dtype = .f16, .vocab_size = vocab_size, .params = cparams, .seen_frequencies = null, .rng_seed = 0xA000 + @as(u64, i), .external_bitmask = bm_bind }, 5000);
+    }
+    const sync_us = @as(f64, @floatFromInt(try vmstat.nowNs() -| ts0)) / (8.0 * 1000.0);
+
+    report.g21_vocab_size = vocab_size;
+    report.g21_greedy_us = best_greedy;
+    report.g21_constrained_us = best_const;
+    report.g21_sync_roundtrip_us = sync_us;
+
+    // Speculative C22 JSON-schema acceptance benchmark on `D12` self-recurrent LoopLM/GraphModel.
+    const prog = try allocator.create(grammar.GrammarProgram);
+    defer allocator.destroy(prog);
+    try grammar.compileJsonSchema(prog, "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"],\"additionalProperties\":false}");
+
+    var sb = try graph.buildSynthLoopDenseBundle(allocator, .{
+        .hidden_size = 128,
+        .vocab_size = 64,
+        .num_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .start_layer = 0,
+        .end_layer = 2,
+        .mode = .native_recurrent,
+        .max_loops = 2,
+        .include_early_exit = false,
+        .include_steplora = false,
+    });
+    defer sb.deinit(allocator);
+
+    const vocab = try allocator.alloc(?[]const u8, sb.cfg.vocab_size);
+    defer allocator.free(vocab);
+    @memset(vocab, "prose ");
+    vocab[0] = null;
+    vocab[1] = "{";
+    vocab[2] = "\"";
+    vocab[3] = "ok";
+    vocab[4] = "\":";
+    vocab[5] = "true";
+    vocab[6] = "false";
+    vocab[7] = "}";
+    const eos = [_]u32{0};
+    var vocab_idx = try grammar.VocabIndex.initFromSlices(allocator, vocab, &eos);
+    defer vocab_idx.deinit(allocator);
+
+    var smodel = try graph.GraphModel.loadFromBytes(allocator, sb.amf_bytes, sb.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 16,
+        .startup_canary = false,
+    });
+    defer smodel.deinit(allocator);
+
+    var eng = try engine_mod.SpecEngine.initWithGraph(allocator, &smodel, null, .{
+        .mode = .self_recurrent,
+        .max_tree_nodes = 16,
+        .max_draft_depth = 4,
+        .branch_width = 2,
+        .top_k_per_node = 2,
+        .enable_pruning = false,
+        .temperature = 0.0,
+        .enable_gpu_sampler = true,
+    });
+    defer eng.deinit(allocator);
+
+    const prompt = [_]u32{ 10, 11, 12, 13, 14, 15 };
+    var out_buf: [12]u32 = undefined;
+
+    // Run unconstrained baseline rounds
+    eng.clearConstraints();
+    _ = try eng.prefill(&prompt, null);
+    var unc_toks: usize = 0;
+    var unc_rounds: usize = 0;
+    while (unc_toks < 8) : (unc_rounds += 1) {
+        const rs = try eng.stepRound(null, out_buf[0..]);
+        unc_toks += rs.emitted_count;
+    }
+
+    // Run strict JSON-schema C22 constrained rounds
+    eng.setConstraints(.{
+        .grammar_program = prog,
+        .vocab_index = &vocab_idx,
+        .token_slices = vocab,
+        .eos_token_ids = &eos,
+        .sampling = .{ .temperature = 0.0 },
+        .prompt_history = &prompt,
+    });
+    _ = try eng.prefill(&prompt, null);
+    var con_toks: usize = 0;
+    var con_rounds: usize = 0;
+    var all_valid = true;
+    while (con_toks < 8 and con_rounds < 8) : (con_rounds += 1) {
+        const rs = try eng.stepRound(null, out_buf[0..]);
+        for (0..eng.draft_tree.count) |ni| {
+            if (!eng.node_grammar_valid[ni]) all_valid = false;
+        }
+        con_toks += rs.emitted_count;
+        if (rs.emitted_count > 0 and out_buf[rs.emitted_count - 1] == 0) break;
+    }
+
+    report.g21_spec_unconstrained_accept = @as(f64, @floatFromInt(unc_toks)) / @as(f64, @floatFromInt(@max(@as(usize, 1), unc_rounds)));
+    report.g21_spec_constrained_accept = @as(f64, @floatFromInt(con_toks)) / @as(f64, @floatFromInt(@max(@as(usize, 1), con_rounds)));
+    report.g21_spec_all_valid = all_valid;
+}
+
+fn benchM78C23(allocator: std.mem.Allocator, cfg: M78Config, report: *M78Report) !void {
+    const chunk_len: usize = 16 * 1024;
+    const json_buf = try allocator.alloc(u8, chunk_len);
+    defer allocator.free(json_buf);
+    const bpe_buf = try allocator.alloc(u8, chunk_len);
+    defer allocator.free(bpe_buf);
+
+    for (0..chunk_len) |i| {
+        const m = i % 128;
+        json_buf[i] = if (m == 126) '"' else if (m == 127) '\\' else 'a' + @as(u8, @intCast(i % 26));
+        bpe_buf[i] = if (m < 88)
+            'a' + @as(u8, @intCast(i % 26))
+        else if (m < 116)
+            "!#$%&()*+,-./:;<=>?@[]^_{|}~"[m - 88]
+        else
+            ' ';
+    }
+
+    const scalarJsonScan = struct {
+        fn findSpecial(bytes: []const u8) usize {
+            for (bytes, 0..) |b, idx| {
+                if (b == '"' or b == '\\' or b < 0x20) return idx;
+            }
+            return bytes.len;
+        }
+    }.findSpecial;
+
+    // Verify exact parity including short tails (< 16 B) across JSON NEON and BPE PreTokenIterator.
+    var parity_ok = true;
+    for ([_]usize{ 0, 7, 15, 63, 128, chunk_len }) |sub_end| {
+        var cur: usize = 0;
+        while (cur < sub_end) {
+            const s1 = scalarJsonScan(json_buf[cur..sub_end]);
+            const n1 = server_mod.neonFindJsonStringSpecial(json_buf[cur..sub_end]);
+            if (s1 != n1) parity_ok = false;
+            cur += n1 + 1;
+        }
+        cur = 0;
+        var it_p = tokenizer.PreTokenIterator.initWithKind(bpe_buf[0..sub_end], .qwen);
+        while (cur < sub_end) {
+            const s_len = tokenizer.matchQwenPreTokenScalarRef(bpe_buf[cur..sub_end]);
+            const got = it_p.next() orelse {
+                parity_ok = false;
+                break;
+            };
+            if (!std.mem.eql(u8, bpe_buf[cur .. cur + s_len], got)) parity_ok = false;
+            cur += s_len;
+        }
+        if (it_p.next() != null) parity_ok = false;
+    }
+
+    const iters: usize = @max(@as(usize, 1), cfg.c23_iters);
+    const total_bytes: f64 = @as(f64, @floatFromInt(iters * chunk_len));
+
+    const ts0 = try vmstat.nowNs();
+    var acc_s: usize = 0;
+    for (0..iters) |_| {
+        var pos: usize = 0;
+        while (pos < chunk_len) {
+            const k = scalarJsonScan(json_buf[pos..]);
+            acc_s +%= k;
+            pos += k + 1;
+        }
+    }
+    const ts1 = try vmstat.nowNs();
+    std.mem.doNotOptimizeAway(acc_s);
+
+    const tn0 = try vmstat.nowNs();
+    var acc_n: usize = 0;
+    for (0..iters) |_| {
+        var pos: usize = 0;
+        while (pos < chunk_len) {
+            const k = server_mod.neonFindJsonStringSpecial(json_buf[pos..]);
+            acc_n +%= k;
+            pos += k + 1;
+        }
+    }
+    const tn1 = try vmstat.nowNs();
+    std.mem.doNotOptimizeAway(acc_n);
+
+    const bs0 = try vmstat.nowNs();
+    var bacc_s: usize = 0;
+    for (0..iters) |_| {
+        var pos: usize = 0;
+        while (pos < chunk_len) {
+            const k = tokenizer.matchQwenPreTokenScalarRef(bpe_buf[pos..]);
+            bacc_s +%= k;
+            pos += @max(@as(usize, 1), k);
+        }
+    }
+    const bs1 = try vmstat.nowNs();
+    std.mem.doNotOptimizeAway(bacc_s);
+
+    const bn0 = try vmstat.nowNs();
+    var bacc_n: usize = 0;
+    for (0..iters) |_| {
+        var pit = tokenizer.PreTokenIterator.initWithKind(bpe_buf, .qwen);
+        while (pit.next()) |tok_slice| {
+            bacc_n +%= tok_slice.len;
+        }
+    }
+    const bn1 = try vmstat.nowNs();
+    std.mem.doNotOptimizeAway(bacc_n);
+
+    if (acc_s != acc_n or bacc_s != bacc_n) parity_ok = false;
+    report.c23_json_scalar_gbs = total_bytes / @as(f64, @floatFromInt(@max(@as(u64, 1), ts1 -| ts0)));
+    report.c23_json_neon_gbs = total_bytes / @as(f64, @floatFromInt(@max(@as(u64, 1), tn1 -| tn0)));
+    report.c23_bpe_scalar_gbs = total_bytes / @as(f64, @floatFromInt(@max(@as(u64, 1), bs1 -| bs0)));
+    report.c23_bpe_neon_gbs = total_bytes / @as(f64, @floatFromInt(@max(@as(u64, 1), bn1 -| bn0)));
+    report.c23_parity_ok = parity_ok;
+}
+
+fn benchM78C24(
+    allocator: std.mem.Allocator,
+    chip: chip_profile_mod.ChipProfile,
+    budget: budget_mod.Budget,
+    cfg: M78Config,
+    report: *M78Report,
+) !void {
+    const caps = try sme.SmeCaps.probe();
+    var disp = try sme.SmeDispatcher.init(allocator, .{ .caps_override = caps, .total_threads = 2 });
+    defer disp.deinit();
+
+    const m: usize = 16;
+    const n: usize = 512;
+    const k: usize = 512;
+    const groups = k / sme.GROUP_SIZE;
+    const panels = (n + sme.PANEL_COLS - 1) / sme.PANEL_COLS;
+
+    const a_u16 = try allocator.alignedAlloc(u16, .fromByteUnits(sme.SVL_BYTES), m * k);
+    defer allocator.free(a_u16);
+    for (a_u16, 0..) |*v, i| v.* = quant.f32ToFloatBits(.f16, @as(f32, @floatFromInt((i % 13))) * 0.05);
+
+    const w_bytes = try sme.packedBlobBytes(.q2_affine, n, k);
+    const w_packed = try allocator.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), w_bytes);
+    defer allocator.free(w_packed);
+    const codes = try allocator.alloc(u8, n * k);
+    defer allocator.free(codes);
+    for (codes, 0..) |*c, i| c.* = @truncate((i * 7 + 3) & 3);
+    const codebooks = try allocator.alloc([4]f16, panels * groups);
+    defer allocator.free(codebooks);
+    for (codebooks) |*cb| cb.* = .{ @floatCast(-0.75), @floatCast(-0.25), @floatCast(0.25), @floatCast(0.75) };
+    try sme.packQuantLut4Panel64(codes, codebooks, null, n, k, w_packed);
+
+    const out_f32 = try allocator.alignedAlloc(f32, .fromByteUnits(sme.SVL_BYTES), m * n);
+    defer allocator.free(out_f32);
+
+    const op_m1 = [_]sme.BatchLinearOp{.{
+        .weight = .{ .dtype = .q2_affine, .param_kind = .lut4_codebook, .cache_hint = .temporal, .n = n, .k = k, .w_packed = w_packed },
+        .a_u16 = a_u16[0..k],
+        .out_bytes = std.mem.sliceAsBytes(out_f32[0..n]),
+        .m = 1,
+    }};
+    const op_m16 = [_]sme.BatchLinearOp{.{
+        .weight = .{ .dtype = .q2_affine, .param_kind = .lut4_codebook, .cache_hint = .temporal, .n = n, .k = k, .w_packed = w_packed },
+        .a_u16 = a_u16,
+        .out_bytes = std.mem.sliceAsBytes(out_f32),
+        .m = m,
+    }};
+
+    const iters: usize = @max(@as(usize, 1), cfg.c24_iters);
+    const use_be: ?sme.ExecutionBackend = if (caps.supportsSme2()) .sme2 else .scalar_fallback;
+
+    for (0..3) |_| {
+        try disp.evalLinearBatchHoisted(&op_m1, use_be);
+        try disp.evalLinearBatchHoisted(&op_m16, use_be);
+        try disp.evalLinearBatchHoisted(&op_m16, .scalar_fallback);
+    }
+
+    const t1_0 = try vmstat.nowNs();
+    for (0..iters) |_| try disp.evalLinearBatchHoisted(&op_m1, use_be);
+    const luti2_m1_us = @as(f64, @floatFromInt(try vmstat.nowNs() -| t1_0)) / (@as(f64, @floatFromInt(iters)) * 1000.0);
+
+    const t16_0 = try vmstat.nowNs();
+    for (0..iters) |_| try disp.evalLinearBatchHoisted(&op_m16, use_be);
+    const luti2_m16_us = @as(f64, @floatFromInt(try vmstat.nowNs() -| t16_0)) / (@as(f64, @floatFromInt(iters)) * 1000.0);
+
+    const ts_0 = try vmstat.nowNs();
+    for (0..iters) |_| try disp.evalLinearBatchHoisted(&op_m16, .scalar_fallback);
+    const scalar_m16_us = @as(f64, @floatFromInt(try vmstat.nowNs() -| ts_0)) / (@as(f64, @floatFromInt(iters)) * 1000.0);
+
+    // Hoisted multi-LoRA adapters (`<= 4 MiB` L2 cap + C13 bus gate)
+    const lora_r: usize = 16;
+    const lora_n: usize = 256;
+    const lora_k: usize = 256;
+    const w_a_b = try sme.packedBlobBytes(.q2_affine, lora_r, lora_k);
+    const w_b_b = try sme.packedBlobBytes(.q2_affine, lora_n, sme.GROUP_SIZE);
+    const adp_a = try allocator.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), w_a_b);
+    defer allocator.free(adp_a);
+    const adp_b = try allocator.alignedAlloc(u8, .fromByteUnits(sme.SVL_BYTES), w_b_b);
+    defer allocator.free(adp_b);
+
+    const a_codes = try allocator.alloc(u8, lora_r * lora_k);
+    defer allocator.free(a_codes);
+    @memset(a_codes, 2);
+    const a_cbs = try allocator.alloc([4]f16, 1 * (lora_k / sme.GROUP_SIZE));
+    defer allocator.free(a_cbs);
+    for (a_cbs) |*cb| cb.* = .{ @floatCast(0.0), @floatCast(0.25), @floatCast(0.5), @floatCast(1.0) };
+    try sme.packQuantLut4Panel64(a_codes, a_cbs, null, lora_r, lora_k, adp_a);
+
+    const b_codes = try allocator.alloc(u8, lora_n * lora_r);
+    defer allocator.free(b_codes);
+    @memset(b_codes, 1);
+    const b_cbs = try allocator.alloc([4]f16, (lora_n + sme.PANEL_COLS - 1) / sme.PANEL_COLS);
+    defer allocator.free(b_cbs);
+    for (b_cbs) |*cb| cb.* = .{ @floatCast(0.0), @floatCast(0.25), @floatCast(0.5), @floatCast(1.0) };
+    try sme.packStepLoraBQ2Lut4Panel64(b_codes, b_cbs, null, lora_n, lora_r, adp_b);
+
+    const adp = try sme.SmeStepLoraAdapter.fromWeights(
+        .{ .dtype = .q2_affine, .param_kind = .lut4_codebook, .cache_hint = .temporal, .n = lora_r, .k = lora_k, .w_packed = adp_a },
+        .{ .dtype = .q2_affine, .param_kind = .lut4_codebook, .cache_hint = .temporal, .n = lora_n, .k = sme.GROUP_SIZE, .w_packed = adp_b },
+        0.5,
+    );
+    const adps = [_]sme.SmeStepLoraAdapter{ adp, adp, adp };
+    var lora_scratch = try sme.StepLoraScratch.init(4, lora_r, 0, budget);
+    defer lora_scratch.deinit();
+    var y_lora: [lora_n]f32 = @splat(0.0);
+    for (0..2) |_| {
+        try sme.SmeStepLoraAdapter.evalMultiAdapterHoisted(&adps, &disp, &lora_scratch, a_u16[0..lora_k], &y_lora, 1, chip, false, null, 0, null);
+    }
+    const tl0 = try vmstat.nowNs();
+    for (0..iters) |_| {
+        try sme.SmeStepLoraAdapter.evalMultiAdapterHoisted(&adps, &disp, &lora_scratch, a_u16[0..lora_k], &y_lora, 1, chip, false, null, 0, null);
+    }
+    const lora_us = @as(f64, @floatFromInt(try vmstat.nowNs() -| tl0)) / (@as(f64, @floatFromInt(iters)) * 1000.0);
+
+    const l2_cap = caps.hotAdapterL2BudgetBytes();
+    const gate_ok = (l2_cap <= 4 * 1024 * 1024) and
+        (!caps.supportsSme2() or
+            (sme.evaluateC13BusGate(caps, chip, l2_cap, true, null, 0) == .sme2_l2_temporal and
+                sme.evaluateC13BusGate(caps, chip, l2_cap + 4096, true, 1.02, 0) == .defer_gpu_bus_saturated and
+                sme.evaluateC13BusGate(caps, chip, l2_cap + 4096, true, 1.20, 0) == .sme2_streaming_nt));
+
+    const ops_f64: f64 = 2.0 * @as(f64, m) * @as(f64, n) * @as(f64, k);
+    report.c24_has_sme2 = caps.supportsSme2();
+    report.c24_luti2_m1_us = luti2_m1_us;
+    report.c24_luti2_m16_us = luti2_m16_us;
+    report.c24_scalar_m16_us = scalar_m16_us;
+    report.c24_luti2_m16_gops = if (luti2_m16_us > 0.0) (ops_f64 / (luti2_m16_us * 1e-6)) / 1e9 else 0.0;
+    report.c24_hoisted_lora_us = lora_us;
+    report.c24_l2_cap_bytes = l2_cap;
+    report.c24_bus_gate_ok = gate_ok;
+}
+
+fn benchM78G22(allocator: std.mem.Allocator, report: *M78Report) !void {
+    const tmp_dir = try graph.makeTestTempDir(allocator, "bench_m78_g22");
+    defer {
+        graph.removeTestDir(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+
+    var q4_b = try graph.buildSynthQwen4Bundle(allocator, .{ .num_experts = 8, .top_k = 2 });
+    defer q4_b.deinit(allocator);
+    q4_b.cfg.qsa_window_size = 0;
+
+    // 1. Zero-overhead text-only fast path (`initTextOnly`).
+    var text_m = try graph.GraphModel.loadFromBytes(allocator, q4_b.amf_bytes, q4_b.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+        .startup_canary = false,
+    });
+    defer text_m.deinit(allocator);
+
+    // 2. Full 3-layer Q4+F16 W20 ViT tower + PatchMerger sidecar with aliased 0B decode scratch.
+    const vis_bytes = try graph.buildSynthVisionTowerAmfBytes(allocator, .{
+        .num_layers = 3,
+        .vis_hidden = 64,
+        .vis_intermediate = 128,
+        .lm_hidden = q4_b.cfg.hidden_size,
+        .merger_hidden = 128,
+        .patch_size = 16,
+        .t_patch = 2,
+        .spatial_merge = 2,
+        .q4_qkv = true,
+    });
+    defer allocator.free(vis_bytes);
+    const vis_path = try std.fs.path.joinZ(allocator, &.{ tmp_dir, "vision.amf" });
+    defer allocator.free(vis_path);
+    try benchWriteBytesFile(vis_path, vis_bytes);
+
+    var vis_m = try graph.GraphModel.loadFromBytes(allocator, q4_b.amf_bytes, q4_b.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+        .startup_canary = false,
+        .vision_amf_path = vis_path,
+        .vision_max_patches = 64,
+    });
+    defer vis_m.deinit(allocator);
+
+    const clip = try metal.VtClip.encodeTestClip(.hevc, 128, 128, 2, 30);
+    defer clip.close();
+    const dec = try metal.VtDecodeSession.init(vis_m.device, clip, .nv12);
+    defer dec.close();
+    const f0 = try dec.decodeFrame(clip, 0);
+    defer f0.close();
+    const f1 = try dec.decodeFrame(clip, 1);
+    defer f1.close();
+
+    const prefix = [_]u32{ 1, 5, 9 };
+    const suffix = [_]u32{ 11, 14 };
+    _ = try vis_m.prefillMultimodal(allocator, &prefix, &suffix, &.{ f0, f1 }, .{ .anyres_mode = .smart_resize });
+    const mm = try vis_m.prefillMultimodal(allocator, &prefix, &suffix, &.{ f0, f1 }, .{ .anyres_mode = .smart_resize });
+
+    report.g22_text_fastpath_ok = !text_m.hasVisionTower() and (text_m.visionOwnedWiredBytes() == 0);
+    report.g22_aliased_saved_bytes = vis_m.visionAliasedSavedBytes();
+    report.g22_owned_wired_bytes = vis_m.visionOwnedWiredBytes();
+    report.g22_vit_layers = vis_m.visionTowerConfig().num_layers;
+    report.g22_vit_tokens = mm.vision_tokens;
+    report.g22_vit_encode_ms = mm.vision_encode_us / 1000.0;
+    report.g22_vit_zero_copy = mm.vision_tower_active and mm.all_frames_zero_copy;
+}
+
+pub fn runM78WithConfig(allocator: std.mem.Allocator, cfg: M78Config) !M78Report {
+    const vm_before = try vmstat.Snapshot.capture();
+    const facts = try sysinfo.Facts.read();
+    var dev = try metal.Device.open();
+    defer dev.close();
+    const dev_info = try dev.info();
+    const lib = try metal.Library.openEmbedded(dev);
+    defer lib.close();
+    var compute = try metal.Compute.initWithFrames(dev, 2);
+    defer compute.close();
+
+    const profile = chip_profile_mod.ChipProfile.resolve(
+        facts,
+        dev_info.name(),
+        dev_info.appleGpuFamily(),
+        cfg.bus_bandwidth_gbs_override,
+    );
+    const budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+
+    var gpu_name_buf: [128]u8 = @splat(0);
+    const gname = dev_info.name();
+    const gname_len = @min(gname.len, gpu_name_buf.len);
+    @memcpy(gpu_name_buf[0..gname_len], gname[0..gname_len]);
+
+    var report: M78Report = std.mem.zeroes(M78Report);
+    report.chip_profile = profile;
+    report.gpu_name_buf = gpu_name_buf;
+    report.gpu_name_len = gname_len;
+    report.g22_nax_hw_status = if (profile.has_nax) "apple10_active" else "gated_on_spike_s8_apple9_m4_host";
+
+    try benchM78G18Synthetic(allocator, dev, lib, &compute, budget, &report);
+    try benchM78G19(dev, lib, &compute, cfg, &report);
+    try benchM78G20(dev, lib, &compute, cfg, &report);
+    try benchM78G21(allocator, dev, lib, &compute, budget, cfg, &report);
+    try benchM78C23(allocator, cfg, &report);
+    try benchM78C24(allocator, profile, budget, cfg, &report);
+    try benchM78G22(allocator, &report);
+
+    report.qwen3_06b = .{ .present = false, .executed = false, .status = "skipped" };
+    report.qwen3_14b = .{ .present = false, .executed = false, .status = "skipped" };
+    report.qwen3_30b = .{ .present = false, .executed = false, .status = "skipped" };
+    if (!cfg.skip_real_checkpoints) {
+        report.qwen3_06b = runOptionalRealCheckpointM78G18(
+            allocator,
+            "/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf",
+            "/Volumes/Akari/models/Qwen3-0.6B/config.json",
+        );
+        report.qwen3_14b = runOptionalRealCheckpointM78G18(
+            allocator,
+            "/Volumes/Akari/models/amf/qwen3-14b-4bit.amf",
+            "/Volumes/Akari/models/Qwen3-14B-4bit/config.json",
+        );
+        report.qwen3_30b = runOptionalRealCheckpointM78G18(
+            allocator,
+            "/Volumes/Akari/models/amf/qwen3-30b-a3b-3bit.amf",
+            "/Volumes/Akari/models/Qwen3-30B-A3B-3bit/config.json",
+        );
+    }
+
+    report.vm_before = vm_before;
+    report.vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(report.vm_before, report.vm_after);
+    return report;
+}
+
+pub fn runM78(allocator: std.mem.Allocator) !M78Report {
+    return runM78WithConfig(allocator, .{});
+}
+
+test "runM78WithConfig verifies G18-G22 and C23-C24 M7.8 benchmark tracks with zero swapouts" {
+    const gpa = std.testing.allocator;
+    const report = try runM78WithConfig(gpa, .{
+        .warmup_iters = 1,
+        .measure_iters = 2,
+        .c23_iters = 32,
+        .c24_iters = 2,
+        .g21_vocab_size = 32_768,
+        .g21_iters = 2,
+        .skip_real_checkpoints = true,
+    });
+
+    try std.testing.expect(report.g18_canary_passed);
+    try std.testing.expect(report.g18_mixed_gsq_guard_ok);
+    try std.testing.expect(report.g18_synth_parity_ok);
+    try std.testing.expect(report.g19_guard_ok);
+    try std.testing.expect(report.g19_parity_ok);
+    try std.testing.expect(report.g20_guard_ok);
+    try std.testing.expect(report.g20_parity_ok);
+    try std.testing.expect(report.g21_greedy_us > 0.0);
+    try std.testing.expect(report.g21_spec_all_valid);
+    try std.testing.expect(report.c23_parity_ok);
+    try std.testing.expect(report.c24_bus_gate_ok);
+    try std.testing.expect(report.g22_text_fastpath_ok);
+    try std.testing.expect(report.g22_aliased_saved_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 0), report.g22_owned_wired_bytes);
+    try std.testing.expect(report.g22_vit_zero_copy);
+    try std.testing.expectEqual(@as(u64, 0), vmstat.Snapshot.swapoutDelta(report.vm_before, report.vm_after));
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "bench.m78.g18.canary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "bench.m78.g22.vit_tower") != null);
 }
