@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-**M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md))**: **In progress (engine, kernels, tools, CLI, and 2/4-rank loopback TCP cluster verified on M4; physical multi-Mac TB5 RDMA and full-scale 552B + 196B execution pending hardware)** — all M7 Phase 1 and Phase 2 code (`b2034c2..69d30af`) and M4 (`Apple9`, 24 GiB, TB4) benchmarks and 2-OS-process TCP loopback runs are verified and archived in [benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain deferred until `Apple10+`, `512 GB Ultra`, or multi-Mac TB5 RDMA hardware is available.
+**M7.5 — Native C/Python SDK, full HTTP/SSE protocol parity, and rootless terminal monitor (`C17`, `C18`, `C19`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md))**: **Planned** — codified next on the M4 baseline (`libaminfer.dylib` + `include/aminfer.h` + zero-dependency Python `ctypes` SDK, full tool-calling / stateful `/v1/responses` / Anthropic `/v1/messages` + `count_tokens` / sampling & structured-output parity, and rootless `aminfer monitor` TUI with built-in `trans-pride` theme and `btop` `.theme` support). **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
 
 ## Milestones
 
@@ -28,6 +28,7 @@ Status-row IDs refer to [status.md](status.md).
 | M6.8 | Wide-chunk GPU prefill, `prompt_tail` pruning, serving QoS & live-RAM / `.metallib` guards | R9, G15, G16, C15 | Default-on `--gpu-prefill-mode wide\|tree64` (`512+` FlashAttention + `BM=64, BN=64` GEMM, direct `KvTile` write) & lossless `prompt_tail` pruning verified bit-consistent vs `tree64`; single-request wide-prefill/`verifyTree` scratch aliasing; default-on `--decode-share`, `--adaptive-prefill-narrow`, and `--message-boundary-cache` `PrefixCache` checkpoints benchmarked under concurrent load; `HOST_VM_INFO64` non-anonymous live RAM soft cache scaling (`+ --strict-live-ram`) & startup `.metallib` numerical canary (`~0.19–0.24 ms` warm in-buffer / `~1.3–3.8 ms` cold first-submit) + `Apple10` `NAX` hook verified without swap | Completed |
 | M6.9 | Multi-generation Apple Silicon (`Apple9` + `Apple10+` GPU `NAX`) single-binary adaptation | G17, C16 | `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`) `f16`/`bf16` & staged group-64 `q2`/`q3`/`q4` kernels compiled into unified `aminfer.metallib` with lazy `MTL4Compiler` `Apple10`/`Apple11` selection (`--prefill-matmul-backend auto\|simdgroup\|nax`), `G16` canary auto-fallback to `simdgroup_apple9` (`+ --strict-nax`), chip-parameterized `spec_bus_gbs` (`--bus-bandwidth-gbs`), and runtime prefill/draft crossover calibration verified with zero M4 regression (`Apple10+` HW throughput gated on Spike `S8`) | In progress (code complete; awaiting Apple10+ HW acceptance & Spike S8 bench) |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV (`890 B/tok`), Single-Pass Mega-mHC, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA / TB4 TCP expert parallelism verified on M4 loopback cluster (`b2034c2..69d30af`); physical multi-Mac TB5 RDMA HCA transport and full 552B + 196B execution gated on 512 GB Ultra or multi-Mac TB5 RDMA hardware | In progress (code and M4 loopback cluster verified; 512 GB Ultra / TB5 RDMA HW pending) |
+| M7.5 | Native C/Python SDK, full HTTP/SSE protocol parity & rootless TUI monitor | C17, C18, C19 | `libaminfer.dylib` + `include/aminfer.h` + zero-dependency Python `ctypes` SDK (`python/aminfer/`, GIL-released zero-copy `logits`/`hidden`/vision views, `ami_cancel_token`, co-tenant wired guard); full `/v1/chat/completions`, `/v1/responses` (stateful `previous_response_id` + `GET`/`DELETE`/`cancel`), and `/v1/messages` (+ `count_tokens`) tool-calling, sampling, stop-holdback & `json_schema` parity; rootless `aminfer monitor` TUI (`trans-pride` default + `--theme`, `--once`/`--json`, `--server` attach) verified with zero hot-path alloc and zero swap | Planned |
 
 ## Spikes
 
@@ -658,6 +659,18 @@ batched GEMM kernels with lazy `MTL4Compiler` `Apple10`/`Apple11` selection,
 `spec_bus_gbs` telemetry, and runtime ANE/GPU/SME2 crossover calibration
 (with `Apple9` AIR/dispatch/fallback verified on M4 and physical `Apple10+`
 hardware measurements gated on Spike `S8`).
+Following M7 M4-loopback close-out and live HF metadata validation on
+2026-11-23, the user confirmed
+[ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md),
+scheduling Milestone **M7.5** (`C17`, `C18`, `C19`) for an outward plain-C
+shared library (`libaminfer.dylib` + `include/aminfer.h`) and zero-dependency
+Python `ctypes` SDK (`python/aminfer/`), full three-endpoint HTTP/SSE protocol
+parity across `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` (plus
+`POST /v1/messages/count_tokens`, tool calling, bounded stateful
+`previous_response_id`, shared sampling, stop holdback, and `json_schema`
+structured outputs), and the rootless `aminfer monitor` terminal TUI (default
+`trans-pride` TrueColor palette + `btop` `.theme` support, `--once`/`--json`,
+and `--server` attach).
 
 ## Session handoff snapshot
 
@@ -797,6 +810,11 @@ Update this before the context window runs out or when handing off.
     `--draft-mode dspark`, MLA loop-commit fix & `bench-m7` suite, `69d30af`
     tree SWA ring FP4 fallback alignment, Engram layer regex & chunked
     `bench-m7` KV fill
+  - Live HF metadata & tokenizer compatibility: `cd72273` native DeepSeek
+    3-stage pre-tokenizer auto-detection in `tokenizer.zig`, live
+    `Qwen/Qwen3.8-Flash-Next` and `deepseek-ai/DeepSeek-V4.1-Flash-1017`
+    tokenizer & `weight_map` key-alias fixes, and `aminfer-tools inspect-metadata`
+    dry-run validator
 - Current test & build baseline (`M0`–`M6.8` complete, `M6.9` code complete,
   `M7` code & M4 loopback cluster verified, live HF frontier metadata &
   tokenizer compatibility verified, `0` `catch {}`):
@@ -836,16 +854,21 @@ Update this before the context window runs out or when handing off.
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: **M6.9** (`G17`, `C16`, Spike `S8` per
+- In flight: **M7.5** (`C17` native C-ABI / Python `ctypes` SDK, `C18` full
+  three-endpoint HTTP/SSE protocol parity, and `C19` rootless `aminfer monitor`
+  TUI per
+  [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md))
+  is codified and planned next on M4. **M6.9** (`G17`, `C16`, Spike `S8` per
   [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))
   and **M7** (`R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3` per
   [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md) and
   [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernel,
-  tool, CLI, and M4 loopback verification gates are complete. Remaining
-  hardware-gated acceptances are physical `Apple10+` (M5+) `Spike S8`
-  (`aminfer bench-m69`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`),
-  and full-scale `552B + 196B` `DeepSeek-V4.1-Flash-1017` (`W11`) execution on
-  a 512 GB Ultra node or multi-Mac TB5 RDMA cluster
+  tool, CLI, live HF metadata dry-run (`cd72273`), and M4 loopback verification
+  gates are complete; remaining hardware-gated acceptances are physical
+  `Apple10+` (M5+) `Spike S8` (`aminfer bench-m69`), physical multi-Mac TB5 RDMA
+  HCA transport (`X1`–`X3`), and full-scale `552B + 196B`
+  `DeepSeek-V4.1-Flash-1017` (`W11`) execution on a 512 GB Ultra node or
+  multi-Mac TB5 RDMA cluster
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [architecture/model-roadmap.md](architecture/model-roadmap.md),
@@ -864,4 +887,5 @@ Update this before the context window runs out or when handing off.
   [decisions/0018-bare-metal-armv9-sme2-engine.md](decisions/0018-bare-metal-armv9-sme2-engine.md),
   [decisions/0019-recurrent-depth-and-post-m5-accelerators.md](decisions/0019-recurrent-depth-and-post-m5-accelerators.md),
   [decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md),
-  [decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md)
+  [decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md),
+  [decisions/0022-native-c-python-sdk-and-full-protocol-parity.md](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)

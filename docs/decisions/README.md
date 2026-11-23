@@ -39,6 +39,7 @@ items. ADRs record decisions, not capability status — that lives in
 | [0019](0019-recurrent-depth-and-post-m5-accelerators.md) | Composable recurrent depth (`LoopSchedule`), `SelfSpecRecurrent`, and post-M5 heterogeneous accelerators | Accepted | 2026-11-22 |
 | [0020](0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md) | Configurable wide-chunk GPU prefill, lossless tail pruning, serving QoS, and live non-anonymous RAM admission | Accepted | 2026-11-22 |
 | [0021](0021-multi-generation-apple-silicon-and-nax-tensorops.md) | Single-binary multi-generation Apple Silicon adaptation (`Apple9` and `Apple10+` GPU `NAX`) | Accepted | 2026-11-22 |
+| [0022](0022-native-c-python-sdk-and-full-protocol-parity.md) | Native C/Python SDK, full HTTP/SSE protocol parity, and rootless terminal monitor (M7.5) | Accepted | 2026-11-23 |
 
 ## Template
 

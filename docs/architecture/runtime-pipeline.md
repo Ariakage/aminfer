@@ -17,6 +17,18 @@
      emitter without server-side session storage, maximizing L1 suffix-automaton
      prefix hits (`D1`; rationale in
      [open-decisions-research.md](open-decisions-research.md#c8-kqueue-http--sse-server-api-shape)).
+   - Per [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)
+     (status tracked in [../status.md](../status.md)), the planned M7.5
+     extensions add full three-endpoint protocol parity (`C18`: streaming tool
+     calling, bounded wired-slot `previous_response_id` chaining and
+     `GET`/`DELETE`/`cancel` on `/v1/responses/{id}`, Anthropic `system`
+     `cache_control` / `thinking` `budget_tokens` + `POST /v1/messages/count_tokens`,
+     shared sampling, zero-alloc streaming stop holdback, and `json_schema`
+     structured outputs), an outward plain-C shared library (`libaminfer.dylib`
+     + `include/aminfer.h`) with a zero-dependency Python `ctypes` SDK (`C17`,
+     preserving [ADR-0001](../decisions/0001-language-and-toolchain-boundaries.md)),
+     and the rootless `aminfer monitor` terminal TUI (`C19`, default
+     `trans-pride` palette + `btop` `.theme` support and `--server` live attach).
    - On request admission, when `temperature > 0` and `"seed"` is omitted, one
      64-bit seed is drawn from Apple Silicon's Secure Enclave TRNG-backed kernel
      CSPRNG (`getentropy`) to initialize that request slot's dedicated 32-byte
