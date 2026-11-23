@@ -798,15 +798,21 @@ Update this before the context window runs out or when handing off.
     tree SWA ring FP4 fallback alignment, Engram layer regex & chunked
     `bench-m7` KV fill
 - Current test & build baseline (`M0`–`M6.8` complete, `M6.9` code complete,
-  `M7` code & M4 loopback cluster verified, `0` `catch {}`):
-  - Zig suite: `365/365` passing (`356` lib + `9` CLI) in `Debug`,
-    `ReleaseSafe`, and `ReleaseFast`; `-Dcpu=apple_m1` build passing; filtered
-    `test-vision` (`12/12`), `test-hybrid` (`20/20`), `test-sme` (`11/11`), and
-    `test-cluster` (`21/21`) passing in `Debug`; direct Debug binaries under
-    `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`lib` `356/356`, `CLI` `9/9`,
-    `test-vision` `12/12`, `test-hybrid` `20/20`, `test-sme` `11/11`,
-    `test-cluster` `21/21`, `0` validation errors)
-  - Offline Python `tools/` suite: `81/81` passing (`cd tools && uv run python -m unittest discover -s tests`)
+  `M7` code & M4 loopback cluster verified, live HF frontier metadata &
+  tokenizer compatibility verified, `0` `catch {}`):
+  - Zig suite: `368/368` passing (`359` lib + `9` CLI) in `Debug` and
+    `ReleaseSafe`, including native `PreTokenizerKind.deepseek` auto-detection
+    and live `Qwen/Qwen3.8-Flash-Next` + `deepseek-ai/DeepSeek-V4.1-Flash-1017`
+    `tokenizer.json` round-trip & zero-alloc `encodeWithScratch` tests;
+    previous `ReleaseFast`, `-Dcpu=apple_m1`, filtered (`test-vision` `12/12`,
+    `test-hybrid` `20/20`, `test-sme` `11/11`, `test-cluster` `21/21`), and
+    `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` runs passed with `0` validation
+    errors
+  - Offline Python `tools/` suite: `85/85` passing (`cd tools && uv run python -m unittest discover -s tests`),
+    including `aminfer-tools inspect-metadata` dry-run validation against live
+    Hugging Face JSON metadata (no weight shards on disk):
+    - `Qwen/Qwen3.8-Flash-Next` (`HTTP 200`, `13 MiB` in `/Volumes/Akari/models/metadata/Qwen__Qwen3.8-Flash-Next/`: `config.json` `4,745 B`, `tokenizer.json` `12.22 MiB`, `tokenizer_config.json` `9,984 B`, `model.safetensors.index.json` `170,726 B`): `48` layers (`36` GDN + `12` QSA), `hidden=2560`, `512` routed experts (top-10 + shared), `hc=4`, `128`-shard PLE at layer `2`, `1` MTP layer, `24,576 B/tok` FP16 KV + `108.0 MiB` FP32 GDN state, `1,658` tensors across `131` shards (`335.28 GiB` raw BF16, est `q3_affine` backbone `52.56 GiB`; `300` long `hyper_connection` names `> 47 B` flagged for canonical aliasing)
+    - `deepseek-ai/DeepSeek-V4.1-Flash-1017` (`HTTP 200`, `15 MiB` in `/Volumes/Akari/models/metadata/deepseek-ai__DeepSeek-V4.1-Flash-1017/`: `config.json` `3,311 B`, `tokenizer.json` `6.07 MiB`, `tokenizer_config.json` `801 B`, `model.safetensors.index.json` `7.12 MiB`): `40` layers (`20` enc + `20` dec from `compress_ratios`), `hidden=5120`, `384` routed experts (top-6 + `1` shared, `fp8` + `fp4` `ue8m0`), `mHC=4`, Engram at layers `[1, 14]` (`768,022,850` rows), `3`-layer `128`-expert `mtp.*` DSpark head, `4,608 B/tok` BF16 / `1,256 B/tok` FP4 KV across 4 KV-source layers, `96,085` tensors across `48` shards (`475.24 GiB` raw, est `q3_affine` backbone `224.79 GiB`; `0` backbone names `> 47 B`; fits `512gb-ultra`, `tb5-cluster-4x128gb`, `tb5-cluster-2x256gb`)
 - On-disk checkpoints & artifacts (strict rule: keep all `.amf`/`.ang`/`.mlpackage`
   and `TMPDIR` work on `/Volumes/Akari/models/` and `/Volumes/Akari/.tmp/`, never
   on `/` or `/tmp`):

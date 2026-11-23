@@ -46,23 +46,35 @@ _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
 _LOOP_STEP_RE = re.compile(r"(?:^|\.)loop\.step\.(\d+)\.")
 _SWITCH_MLP_RE = re.compile(
-    r"^(?:language_model\.)?(?:model\.)?layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)$"
+    r"^(?:model\.)?(?:language_model\.)?(?:model\.)?layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)$"
 )
 VISION_TENSOR_PREFIXES = (
     "visual.",
+    "vision.",
     "vision_tower.",
     "multi_modal_projector.",
+    "aligner.",
     "model.visual.",
+    "model.vision.",
     "model.vision_tower.",
     "model.multi_modal_projector.",
+    "model.aligner.",
     "vision_model.",
     "model.vision_model.",
+)
+VISION_EXACT_TENSOR_NAMES = (
+    "image_start",
+    "image_end",
+    "image_newline",
 )
 
 
 def is_vision_tensor(raw_name: str) -> bool:
-    """Return True if `raw_name` belongs to an offline-strippable vision tower (W10)."""
-    return raw_name.startswith(VISION_TENSOR_PREFIXES)
+    """Return True if `raw_name` belongs to an offline-strippable vision tower (W10, W11)."""
+    if raw_name.startswith(VISION_TENSOR_PREFIXES):
+        return True
+    stripped = raw_name[6:] if raw_name.startswith("model.") else raw_name
+    return stripped in VISION_EXACT_TENSOR_NAMES
 
 # Streaming granularity: raw copies move 8 MiB at a time; dtype conversions
 # process 1 Mi elements at a time. Both bound Python RSS independent of model size.
@@ -356,12 +368,9 @@ def pack_mlx_affine_2bit(codes: Sequence[int]) -> bytes:
 
 
 def _strip_model_prefix(raw_name: str) -> str:
-    if raw_name.startswith("language_model.model."):
-        return raw_name[len("language_model.model.") :]
-    if raw_name.startswith("language_model."):
-        return raw_name[len("language_model.") :]
-    if raw_name.startswith("model."):
-        return raw_name[6:]
+    for prefix in ("model.language_model.", "language_model.model.", "language_model.", "model."):
+        if raw_name.startswith(prefix):
+            return raw_name[len(prefix) :]
     return raw_name
 
 
@@ -408,9 +417,16 @@ def _classify_tensor(
         return (TensorKind.NORM, layer, expert)
     if "embed" in lower:
         return (TensorKind.EMBEDDING, layer, expert)
-    if "lm_head" in lower:
+    if "lm_head" in lower or lower in ("head", "head.weight"):
         return (TensorKind.LM_HEAD, layer, expert)
-    if lower.endswith(".mlp.gate") or lower.endswith(".mlp.gate.weight"):
+    if (
+        lower.endswith(".mlp.gate")
+        or lower.endswith(".mlp.gate.weight")
+        or lower.endswith(".ffn.gate")
+        or lower.endswith(".ffn.gate.weight")
+        or lower.endswith(".ffn.gate.bias")
+        or lower.endswith(".ffn.gate.bias_vl")
+    ):
         return (TensorKind.ROUTER, layer, expert)
     return (TensorKind.DENSE, layer, expert)
 

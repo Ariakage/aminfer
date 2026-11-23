@@ -78,7 +78,7 @@ from aminfer_tools.amf import (
 )
 
 _PLE_LAYER_RE = re.compile(r"(?:^|\.)(?:ple\.layers|layers)\.(\d+)\.")
-_PLE_SHARD_RE = re.compile(r"\.shard\.(\d+)\.")
+_PLE_SHARD_RE = re.compile(r"\.shard[._](\d+)(?:\.|$)")
 _LOOP_ADAPTER_RE = re.compile(
     r"^(?:language_model\.)?(?:model\.)?loop\.step\.(\d+)\.layers\.(\d+)\.([a-zA-Z0-9_]+)\.(lora_a|lora_b|alpha)(?:\.weight)?$"
 )
@@ -611,6 +611,17 @@ def _prepare_loop_adapter_records(
     return records, summary
 
 
+def _effective_text_config(config: dict[str, object] | None) -> dict[str, object]:
+    """Flatten HF `config.json` by merging nested `text_config` over top-level fields."""
+    if not isinstance(config, dict):
+        return {}
+    merged = dict(config)
+    text_cfg = config.get("text_config")
+    if isinstance(text_cfg, dict):
+        merged.update(text_cfg)
+    return merged
+
+
 def infer_operator_axes_and_loop_schedule(
     config: dict[str, object] | None,
     tensor_names: Iterable[str],
@@ -619,8 +630,8 @@ def infer_operator_axes_and_loop_schedule(
     loop_adapter_summary: dict[str, object] | None = None,
 ) -> tuple[OperatorAxes, LoopScheduleConfig]:
     """Infer canonical `OperatorAxes` and `LoopScheduleConfig` from HF config + packed tensor names."""
-    cfg = config or {}
-    names = list(tensor_names)
+    cfg = _effective_text_config(config)
+    names = [_strip_model_prefix(nm) for nm in tensor_names]
 
     # Determine layer count from config or tensor names.
     num_layers = int(cfg.get("num_hidden_layers", 0) or 0)
@@ -633,11 +644,25 @@ def infer_operator_axes_and_loop_schedule(
         num_layers = max(1, max_l + 1)
 
     has_linear_attn = any(".linear_attn." in nm for nm in names)
-    has_qsa_idx = any(".idx_wq" in nm or ".idx_wk" in nm or ".qsa_" in nm for nm in names)
-    has_gr = any(".gr." in nm for nm in names)
-    has_shared_expert = any(".shared_expert." in nm or ".shared_experts." in nm for nm in names)
+    has_qsa_idx = (
+        any(".idx_wq" in nm or ".idx_wk" in nm or ".qsa_" in nm or ".self_attn.indexer." in nm for nm in names)
+        or int(cfg.get("indexer_n_heads", 0) or 0) > 0
+    )
+    has_gr = (
+        any(".gr." in nm or "hyper_connection" in nm for nm in names)
+        or int(cfg.get("hc_count", 0) or 0) >= 2
+    )
+    has_shared_expert = (
+        any(".shared_expert." in nm or ".shared_experts." in nm for nm in names)
+        or int(cfg.get("shared_expert_intermediate_size", 0) or 0) > 0
+    )
     has_moe = any(".mlp.experts." in nm or ".mlp.gate" in nm for nm in names) or int(cfg.get("num_experts", 0) or 0) > 0
-    has_ple = ple_shard_count > 0 or any(is_ple_tensor(nm) for nm in names)
+    has_ple = (
+        ple_shard_count > 0
+        or any(is_ple_tensor(nm) for nm in names)
+        or bool(cfg.get("ple_layer_ids"))
+        or int(cfg.get("ngram_vocab_size_base", 0) or 0) > 0
+    )
     has_early_exit = any("early_exit_gate" in nm for nm in names)
 
     # Per-layer attention kinds (respect explicit config layer_types or 3:1 GDN:QSA interval).
@@ -672,8 +697,8 @@ def infer_operator_axes_and_loop_schedule(
         attention_kind = layer_attns[0] if layer_attns else "gqa_full"
 
     ffn_kind = "moe_swiglu" if has_moe else "dense_swiglu"
+    residual_branches = int(cfg.get("hc_count", 4) or 4) if has_gr else 1
     residual_kind = "gated_4branch" if has_gr else "single_stream"
-    residual_branches = 4 if has_gr else 1
     memory_lookup_kind = "ple_ngram" if has_ple else "none"
 
     # Infer loop_schedule from explicit config or loop adapter tensors.
@@ -1214,4 +1239,360 @@ def pack_qwen4_checkpoint(
         config_path=cfg_out_path,
         operator_axes=axes,
         loop_schedule=ls,
+    )
+
+
+@dataclass(frozen=True)
+class Qwen4MetadataReport:
+    """Offline metadata-only dry-run report for HF `qwen4_exp` (`Qwen3.8-Flash-Next`) repos."""
+
+    metadata_dir: pathlib.Path
+    model_type: str
+    architectures: tuple[str, ...]
+    num_hidden_layers: int
+    gdn_layers: int
+    qsa_layers: int
+    hidden_size: int
+    vocab_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    rotary_dim: int
+    num_experts: int
+    num_experts_per_tok: int
+    has_shared_expert: bool
+    moe_intermediate_size: int
+    shared_expert_intermediate_size: int
+    hc_count: int
+    ple_layer_ids: tuple[int, ...]
+    ple_shards_detected: int
+    mtp_layers: int
+    kv_bytes_per_token_fp16: int
+    gdn_state_bytes_fp32: int
+    total_index_entries: int
+    shard_file_count: int
+    index_total_size_bytes: int
+    backbone_tensor_count: int
+    vision_tensor_count: int
+    ple_tensor_count: int
+    mtp_tensor_count: int
+    loop_adapter_tensor_count: int
+    stacked_expert_tensor_count: int
+    per_expert_tensor_count: int
+    shared_expert_tensor_count: int
+    hyper_connection_tensor_count: int
+    qsa_indexer_tensor_count: int
+    gdn_tensor_count: int
+    long_backbone_names: tuple[str, ...]
+    estimated_backbone_q3_bytes: int
+    estimated_backbone_q4_bytes: int
+    estimated_ple_bf16_bytes: int
+    operator_axes: OperatorAxes
+    loop_schedule: LoopScheduleConfig
+    tier_admission: dict[str, dict[str, object]]
+    tokenizer_present: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "arch": "qwen4_exp",
+            "metadata_dir": str(self.metadata_dir),
+            "model_type": self.model_type,
+            "architectures": list(self.architectures),
+            "num_hidden_layers": self.num_hidden_layers,
+            "gdn_layers": self.gdn_layers,
+            "qsa_layers": self.qsa_layers,
+            "hidden_size": self.hidden_size,
+            "vocab_size": self.vocab_size,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "head_dim": self.head_dim,
+            "rotary_dim": self.rotary_dim,
+            "num_experts": self.num_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "has_shared_expert": self.has_shared_expert,
+            "moe_intermediate_size": self.moe_intermediate_size,
+            "shared_expert_intermediate_size": self.shared_expert_intermediate_size,
+            "hc_count": self.hc_count,
+            "ple_layer_ids": list(self.ple_layer_ids),
+            "ple_shards_detected": self.ple_shards_detected,
+            "mtp_layers": self.mtp_layers,
+            "kv_bytes_per_token_fp16": self.kv_bytes_per_token_fp16,
+            "gdn_state_bytes_fp32": self.gdn_state_bytes_fp32,
+            "total_index_entries": self.total_index_entries,
+            "shard_file_count": self.shard_file_count,
+            "index_total_size_bytes": self.index_total_size_bytes,
+            "tensor_buckets": {
+                "backbone": self.backbone_tensor_count,
+                "vision_strippable": self.vision_tensor_count,
+                "ple_nvme_table": self.ple_tensor_count,
+                "mtp_draft_head": self.mtp_tensor_count,
+                "loop_adapter": self.loop_adapter_tensor_count,
+                "stacked_experts": self.stacked_expert_tensor_count,
+                "per_expert": self.per_expert_tensor_count,
+                "shared_experts": self.shared_expert_tensor_count,
+                "hyper_connections": self.hyper_connection_tensor_count,
+                "qsa_indexer": self.qsa_indexer_tensor_count,
+                "gdn_linear_attn": self.gdn_tensor_count,
+            },
+            "long_backbone_names_over_47b": len(self.long_backbone_names),
+            "long_backbone_name_samples": list(self.long_backbone_names[:8]),
+            "estimated_backbone_q3_bytes": self.estimated_backbone_q3_bytes,
+            "estimated_backbone_q4_bytes": self.estimated_backbone_q4_bytes,
+            "estimated_ple_bf16_bytes": self.estimated_ple_bf16_bytes,
+            "operator_axes": self.operator_axes.to_dict(),
+            "loop_schedule": self.loop_schedule.to_dict(),
+            "tier_admission": self.tier_admission,
+            "tokenizer_present": self.tokenizer_present,
+        }
+
+
+def _estimate_qwen4_wired_bytes(
+    cfg: dict[str, object],
+    *,
+    bpw: float,
+    gdn_layers: int,
+    qsa_layers: int,
+    has_shared_expert: bool,
+) -> tuple[int, int, int]:
+    """Return `(total_backbone_bytes, non_expert_bytes, routed_expert_bytes)` excluding NVMe PLE."""
+    h = int(cfg.get("hidden_size", 2560) or 2560)
+    vocab = int(cfg.get("vocab_size", 248320) or 248320)
+    n_layers = gdn_layers + qsa_layers
+    n_heads = int(cfg.get("num_attention_heads", 24) or 24)
+    n_kv = int(cfg.get("num_key_value_heads", 2) or 2)
+    head_dim = int(cfg.get("head_dim", 256) or 256)
+    lin_kh = int(cfg.get("linear_num_key_heads", 16) or 16)
+    lin_vh = int(cfg.get("linear_num_value_heads", 48) or 48)
+    lin_kd = int(cfg.get("linear_key_head_dim", 128) or 128)
+    lin_vd = int(cfg.get("linear_value_head_dim", 128) or 128)
+    n_exp = int(cfg.get("num_experts", 512) or 512)
+    moe_i = int(cfg.get("moe_intermediate_size", 640) or 640)
+    shared_i = int(cfg.get("shared_expert_intermediate_size", moe_i) or moe_i) if has_shared_expert else 0
+    hc_count = int(cfg.get("hc_count", 4) or 4)
+    hc_lr = int(cfg.get("hc_lowrank", 320) or 320)
+    tie = bool(cfg.get("tie_word_embeddings", False))
+
+    qsa_elems = (n_heads * head_dim * 2 + 2 * n_kv * head_dim + n_heads * head_dim) * h
+    gdn_qkv = (2 * lin_kh * lin_kd + lin_vh * lin_vd) * h
+    gdn_z_out = (2 * lin_vh * lin_vd + 2 * lin_vh) * h
+    gdn_elems = gdn_qkv + gdn_z_out
+    hc_per_layer = 2 * (hc_count * h * hc_lr + hc_lr * hc_count * hc_count + hc_count * h)
+    shared_per_layer = (3 * shared_i * h + h) if has_shared_expert else 0
+    router_per_layer = n_exp * h
+
+    non_exp_quant_elems = qsa_layers * qsa_elems + gdn_layers * gdn_elems + n_layers * shared_per_layer
+    non_exp_fp16_elems = n_layers * (hc_per_layer + router_per_layer) + vocab * h
+    lm_head_bytes = 0 if tie else int(vocab * h * bpw)
+    non_expert_bytes = int(non_exp_quant_elems * bpw) + non_exp_fp16_elems * 2 + lm_head_bytes
+    routed_expert_bytes = int(n_layers * n_exp * 3 * moe_i * h * bpw)
+    return (non_expert_bytes + routed_expert_bytes, non_expert_bytes, routed_expert_bytes)
+
+
+def validate_hf_metadata_dir(
+    metadata_dir: pathlib.Path,
+    *,
+    host_ram_gib: float | None = None,
+) -> Qwen4MetadataReport:
+    """Validate a Hugging Face `qwen4_exp` (`Qwen3.8-Flash-Next`) metadata directory offline.
+
+    Requires only `config.json` and `model.safetensors.index.json` (no `.safetensors` shards
+    needed on disk). Maps every `weight_map` key, computes exact GDN/QSA/MoE/PLE geometry,
+    KV bytes/token, and multi-tier Apple Silicon wired admission plans.
+    """
+    base = pathlib.Path(metadata_dir)
+    if base.is_file() and base.name == "config.json":
+        base = base.parent
+    cfg_path = base / "config.json"
+    idx_path = base / "model.safetensors.index.json"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"missing config.json in {base}")
+    if not idx_path.is_file():
+        raise FileNotFoundError(f"missing model.safetensors.index.json in {base}")
+
+    raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("config.json must be a JSON object")
+    cfg = _effective_text_config(raw_cfg)
+
+    idx_obj = json.loads(idx_path.read_text(encoding="utf-8"))
+    if not isinstance(idx_obj, dict) or not isinstance(idx_obj.get("weight_map"), dict):
+        raise ValueError("model.safetensors.index.json must contain a weight_map object")
+    weight_map: dict[str, str] = idx_obj["weight_map"]
+    idx_meta = idx_obj.get("metadata") if isinstance(idx_obj.get("metadata"), dict) else {}
+    total_size = int(float(idx_meta.get("total_size", 0) or 0))
+    shard_files = set(weight_map.values())
+
+    vision_cnt = 0
+    ple_cnt = 0
+    mtp_cnt = 0
+    loop_cnt = 0
+    backbone_names: list[str] = []
+    ple_shard_ids: set[int] = set()
+    stacked_exp_cnt = 0
+    per_exp_cnt = 0
+    shared_exp_cnt = 0
+    hc_cnt = 0
+    qsa_idx_cnt = 0
+    gdn_cnt = 0
+    long_names: list[str] = []
+
+    for raw_name in sorted(weight_map.keys()):
+        if is_vision_tensor(raw_name):
+            vision_cnt += 1
+            continue
+        if is_ple_tensor(raw_name):
+            ple_cnt += 1
+            sm = _PLE_SHARD_RE.search(raw_name)
+            if sm is not None:
+                ple_shard_ids.add(int(sm.group(1)))
+            continue
+        if is_mtp_tensor(raw_name):
+            mtp_cnt += 1
+            continue
+        if is_loop_adapter_tensor(raw_name):
+            loop_cnt += 1
+            continue
+        norm = _strip_model_prefix(raw_name)
+        backbone_names.append(norm)
+        if len(norm.encode("utf-8")) > 47:
+            long_names.append(norm)
+        lower = norm.lower()
+        if ".linear_attn." in lower:
+            gdn_cnt += 1
+        if ".self_attn.indexer." in lower or ".idx_wq" in lower or ".idx_wk" in lower:
+            qsa_idx_cnt += 1
+        if "hyper_connection" in lower or ".gr." in lower:
+            hc_cnt += 1
+        if ".shared_expert." in lower or ".shared_experts." in lower or "shared_expert_gate" in lower:
+            shared_exp_cnt += 1
+        if re.search(r"\.experts\.(\d+)\.", lower):
+            per_exp_cnt += 1
+        elif ".experts." in lower:
+            stacked_exp_cnt += 1
+
+    ple_shards_detected = len(ple_shard_ids) if ple_shard_ids else int(cfg.get("split_ngram_parts", 0) or 0)
+    axes, ls = infer_operator_axes_and_loop_schedule(
+        raw_cfg,
+        backbone_names,
+        ple_shard_count=ple_shards_detected,
+    )
+    gdn_layers = sum(1 for k in axes.layer_attention_kinds if k == "gated_deltanet")
+    qsa_layers = sum(1 for k in axes.layer_attention_kinds if k in ("qsa_sparse", "gqa_full"))
+    num_layers = len(axes.layer_attention_kinds)
+    hidden_size = int(cfg.get("hidden_size", 0) or 0)
+    vocab_size = int(cfg.get("vocab_size", 0) or 0)
+    num_heads = int(cfg.get("num_attention_heads", 0) or 0)
+    num_kv_heads = int(cfg.get("num_key_value_heads", 0) or 0)
+    head_dim = int(cfg.get("head_dim", hidden_size // max(1, num_heads)) or 0)
+    rope_params = cfg.get("rope_parameters") if isinstance(cfg.get("rope_parameters"), dict) else {}
+    prf = float(cfg.get("partial_rotary_factor", rope_params.get("partial_rotary_factor", 1.0)) or 1.0)
+    rotary_dim = int(round(head_dim * prf))
+    num_experts = int(cfg.get("num_experts", 0) or 0)
+    num_experts_per_tok = int(cfg.get("num_experts_per_tok", 0) or 0)
+    moe_i = int(cfg.get("moe_intermediate_size", 0) or 0)
+    shared_i = int(cfg.get("shared_expert_intermediate_size", 0) or 0)
+    hc_count = int(cfg.get("hc_count", 4 if axes.residual_kind == "gated_4branch" else 1) or 1)
+    raw_ple_ids = cfg.get("ple_layer_ids")
+    ple_layer_ids = tuple(int(x) for x in raw_ple_ids) if isinstance(raw_ple_ids, list) else ()
+    mtp_cfg = cfg.get("mtp") if isinstance(cfg.get("mtp"), dict) else {}
+    mtp_layers = int(cfg.get("mtp_num_hidden_layers", mtp_cfg.get("num_hidden_layers", 0)) or 0)
+
+    # FP16 KV bytes/token across QSA full-attention layers only (GDN layers hold O(1) fixed recurrent state).
+    kv_bytes_per_token_fp16 = qsa_layers * 2 * num_kv_heads * head_dim * 2
+    lin_vh = int(cfg.get("linear_num_value_heads", 0) or 0)
+    lin_kd = int(cfg.get("linear_key_head_dim", 0) or 0)
+    lin_vd = int(cfg.get("linear_value_head_dim", 0) or 0)
+    gdn_state_bytes_fp32 = gdn_layers * lin_vh * lin_kd * lin_vd * 4
+
+    q3_total, q3_non_exp, q3_exp = _estimate_qwen4_wired_bytes(
+        cfg, bpw=(24 + 4) / 64.0, gdn_layers=gdn_layers, qsa_layers=qsa_layers, has_shared_expert=axes.has_shared_expert
+    )
+    q4_total, _, _ = _estimate_qwen4_wired_bytes(
+        cfg, bpw=(32 + 4) / 64.0, gdn_layers=gdn_layers, qsa_layers=qsa_layers, has_shared_expert=axes.has_shared_expert
+    )
+    ngram_base = int(cfg.get("ngram_vocab_size_base", 0) or 0)
+    ple_dim = int(cfg.get("ple_embed_dim", hidden_size) or hidden_size)
+    est_ple_bf16 = ngram_base * ple_dim * 2 if ngram_base > 0 else 0
+
+    tier_budgets = {
+        "24gb-m4": (1, 18 * (1024**3)),
+        "128gb-max": (1, 96 * (1024**3)),
+        "512gb-ultra": (1, 384 * (1024**3)),
+        "tb5-cluster-2x128gb": (2, 96 * (1024**3)),
+        "tb5-cluster-4x128gb": (4, 96 * (1024**3)),
+    }
+    if host_ram_gib is not None and host_ram_gib > 0:
+        tier_budgets["host-custom"] = (1, int(host_ram_gib * 0.75 * (1024**3)))
+
+    tier_admission: dict[str, dict[str, object]] = {}
+    for tier_name, (ws, budget_b) in tier_budgets.items():
+        per_rank_q3 = q3_non_exp + (q3_exp + ws - 1) // ws
+        fits_all_wired = per_rank_q3 <= budget_b
+        fits_cold_offload = q3_non_exp < budget_b
+        hot_expert_budget = max(0, budget_b - q3_non_exp)
+        hot_frac = min(1.0, hot_expert_budget / q3_exp) if q3_exp > 0 else 1.0
+        if fits_all_wired:
+            mode = "full_wired_q3_ple_nvme"
+        elif fits_cold_offload:
+            mode = f"hybrid_hot_cold_experts_ple_nvme (~{hot_frac * 100.0:.1f}% routed experts hot)"
+        else:
+            mode = "exceeds_non_expert_budget"
+        tier_admission[tier_name] = {
+            "world_size": ws,
+            "per_rank_budget_gib": round(budget_b / (1024**3), 2),
+            "per_rank_q3_wired_gib": round(per_rank_q3 / (1024**3), 2),
+            "non_expert_q3_gib": round(q3_non_exp / (1024**3), 2),
+            "fits_all_wired_q3": fits_all_wired,
+            "fits_with_nvme_cold_offload": fits_cold_offload,
+            "mode": mode,
+        }
+
+    raw_archs = raw_cfg.get("architectures")
+    archs = tuple(str(a) for a in raw_archs) if isinstance(raw_archs, list) else ()
+    return Qwen4MetadataReport(
+        metadata_dir=base,
+        model_type=str(raw_cfg.get("model_type", cfg.get("model_type", "unknown"))),
+        architectures=archs,
+        num_hidden_layers=num_layers,
+        gdn_layers=gdn_layers,
+        qsa_layers=qsa_layers,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        has_shared_expert=axes.has_shared_expert,
+        moe_intermediate_size=moe_i,
+        shared_expert_intermediate_size=shared_i,
+        hc_count=hc_count,
+        ple_layer_ids=ple_layer_ids,
+        ple_shards_detected=ple_shards_detected,
+        mtp_layers=mtp_layers,
+        kv_bytes_per_token_fp16=kv_bytes_per_token_fp16,
+        gdn_state_bytes_fp32=gdn_state_bytes_fp32,
+        total_index_entries=len(weight_map),
+        shard_file_count=len(shard_files),
+        index_total_size_bytes=total_size,
+        backbone_tensor_count=len(backbone_names),
+        vision_tensor_count=vision_cnt,
+        ple_tensor_count=ple_cnt,
+        mtp_tensor_count=mtp_cnt,
+        loop_adapter_tensor_count=loop_cnt,
+        stacked_expert_tensor_count=stacked_exp_cnt,
+        per_expert_tensor_count=per_exp_cnt,
+        shared_expert_tensor_count=shared_exp_cnt,
+        hyper_connection_tensor_count=hc_cnt,
+        qsa_indexer_tensor_count=qsa_idx_cnt,
+        gdn_tensor_count=gdn_cnt,
+        long_backbone_names=tuple(long_names),
+        estimated_backbone_q3_bytes=q3_total,
+        estimated_backbone_q4_bytes=q4_total,
+        estimated_ple_bf16_bytes=est_ple_bf16,
+        operator_axes=axes,
+        loop_schedule=ls,
+        tier_admission=tier_admission,
+        tokenizer_present=(base / "tokenizer.json").is_file(),
     )

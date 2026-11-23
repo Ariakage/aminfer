@@ -106,8 +106,45 @@ TIER_WIRED_BUDGET_BYTES: dict[str, int] = {
 DEFAULT_MAX_SYNTH_BYTES = 2 * (1024**3)
 
 _ENGRAM_LAYER_RE = re.compile(r"(?:^|\.)(?:engram\.layers|layers)\.(\d+)(?:\.|$)")
-_ENGRAM_SHARD_RE = re.compile(r"\.shard\.(\d+)(?:\.|$)")
-_DSPARK_PREFIXES = ("dspark.", "model.dspark.", "language_model.dspark.", "language_model.model.dspark.")
+_ENGRAM_SHARD_RE = re.compile(r"\.shard[._](\d+)(?:\.|$)")
+_DSPARK_PREFIXES = (
+    "dspark.",
+    "model.dspark.",
+    "language_model.dspark.",
+    "language_model.model.dspark.",
+    "mtp.",
+    "model.mtp.",
+    "language_model.mtp.",
+    "language_model.model.mtp.",
+)
+_DEEPSEEK41_MODEL_TYPES = ("deepseek41", "deepseek_v41", "deepseek_v41_text", "deepseek_v3", "deepseek_v32")
+
+
+def _effective_deepseek_text_config(src_config: dict[str, object] | None) -> dict[str, object]:
+    """Flatten HF `config.json` by merging nested `text_config` over top-level fields."""
+    if not isinstance(src_config, dict):
+        return {}
+    merged = dict(src_config)
+    text_cfg = src_config.get("text_config")
+    if isinstance(text_cfg, dict):
+        merged.update(text_cfg)
+    return merged
+
+
+def _infer_enc_dec_layers(cfg: dict[str, object], total_layers: int) -> tuple[int, int]:
+    """Infer `(num_encoder_layers, num_decoder_layers)` from explicit fields or `compress_ratios`."""
+    if cfg.get("num_encoder_layers") is not None and cfg.get("num_decoder_layers") is not None:
+        return (int(cfg["num_encoder_layers"]), int(cfg["num_decoder_layers"]))  # type: ignore[arg-type]
+    ratios = cfg.get("compress_ratios")
+    if isinstance(ratios, list) and len(ratios) >= total_layers and total_layers >= 2:
+        main_ratios = [int(x) for x in ratios[:total_layers]]
+        dec_l = sum(1 for r in main_ratios if r == 1)
+        enc_l = total_layers - dec_l
+        if enc_l >= 1 and dec_l >= 1:
+            return (enc_l, dec_l)
+    enc_l = max(1, total_layers // 2)
+    dec_l = max(1, total_layers - enc_l)
+    return (enc_l, dec_l)
 
 
 class HardwareTierError(ValueError):
@@ -1759,28 +1796,44 @@ def convert_deepseek41_checkpoint(
         if isinstance(loaded, dict):
             src_config = loaded
 
-    # Fast-fail hardware tier validation when config.json advertises full-scale 552B geometry.
-    if src_config.get("model_type") == "deepseek41" and int(src_config.get("num_experts", 0) or 0) >= 64:
-        enc_l = int(src_config.get("num_encoder_layers", 20) or 20)
-        dec_l = int(src_config.get("num_decoder_layers", 20) or 20)
-        h_sz = int(src_config.get("hidden_size", 7168) or 7168)
-        n_exp = int(src_config.get("num_experts", 512) or 512)
-        moe_i = int(src_config.get("moe_intermediate_size", 2048) or 2048)
+    # Fast-fail hardware tier validation when config.json advertises full-scale DeepSeek-V4.1 geometry.
+    text_cfg = _effective_deepseek_text_config(src_config)
+    top_mt = str(src_config.get("model_type", text_cfg.get("model_type", ""))).lower()
+    cfg_num_experts = int(text_cfg.get("num_experts", text_cfg.get("n_routed_experts", 0)) or 0)
+    if top_mt in _DEEPSEEK41_MODEL_TYPES and cfg_num_experts >= 64:
+        total_l = int(
+            text_cfg.get(
+                "num_hidden_layers",
+                int(text_cfg.get("num_encoder_layers", 20) or 20)
+                + int(text_cfg.get("num_decoder_layers", 20) or 20),
+            )
+            or 40
+        )
+        enc_l, dec_l = _infer_enc_dec_layers(text_cfg, total_l)
+        h_sz = int(text_cfg.get("hidden_size", 5120) or 5120)
+        n_exp = cfg_num_experts
+        moe_i = int(text_cfg.get("moe_intermediate_size", 2304) or 2304)
         eff_dt = target_dtype if target_dtype in VALID_DEEPSEEK41_DTYPES else "q3_affine"
+        top_k = int(text_cfg.get("num_experts_per_tok", 6) or 6)
+        n_shared = int(text_cfg.get("n_shared_experts", 1 if text_cfg.get("has_shared_expert", True) else 0) or 0)
+        kv_rank = int(text_cfg.get("kv_lora_rank", text_cfg.get("head_dim", 512)) or 512)
+        q_rank = int(text_cfg.get("q_lora_rank", 1280) or 1280)
         probe_cfg = DeepSeek41Config(
             model_id=model_id[:63],
             num_encoder_layers=enc_l,
             num_decoder_layers=dec_l,
             hidden_size=h_sz,
-            vocab_size=int(src_config.get("vocab_size", 129280) or 129280),
-            num_attention_heads=int(src_config.get("num_attention_heads", 128) or 128),
-            encoder_moe_top_k=int(src_config.get("encoder_moe_top_k", 8) or 8),
-            decoder_moe_top_k=int(src_config.get("decoder_moe_top_k", 16) or 16),
+            vocab_size=int(text_cfg.get("vocab_size", 129280) or 129280),
+            num_attention_heads=int(text_cfg.get("num_attention_heads", 64) or 64),
+            encoder_moe_top_k=int(text_cfg.get("encoder_moe_top_k", top_k) or top_k),
+            decoder_moe_top_k=int(text_cfg.get("decoder_moe_top_k", top_k) or top_k),
             num_experts=n_exp,
+            has_shared_expert=n_shared > 0,
             moe_intermediate_size=moe_i,
-            shared_expert_intermediate_size=int(src_config.get("shared_expert_intermediate_size", moe_i) or moe_i),
-            kv_lora_rank=int(src_config.get("kv_lora_rank", 1536) or 1536),
-            q_lora_rank=int(src_config.get("q_lora_rank", 1536) or 1536),
+            shared_expert_intermediate_size=int(text_cfg.get("shared_expert_intermediate_size", moe_i) or moe_i),
+            kv_lora_rank=kv_rank,
+            q_lora_rank=q_rank,
+            mhc_num_streams=int(text_cfg.get("mhc_num_streams", text_cfg.get("hc_mult", 4)) or 4),
             dtype=eff_dt,
             world_size=world_size,
         )
@@ -1986,4 +2039,357 @@ def convert_deepseek41_checkpoint(
         partition_report=part_report,
         tier_check=tier_check,
         stripped_vision_tensors=stripped_vision,
+    )
+
+
+@dataclass(frozen=True)
+class DeepSeek41MetadataReport:
+    """Offline metadata-only dry-run report for HF `DeepSeek-V4.1-Flash-1017` (`deepseek_v41`) repos."""
+
+    metadata_dir: pathlib.Path
+    model_type: str
+    architectures: tuple[str, ...]
+    num_hidden_layers: int
+    num_encoder_layers: int
+    num_decoder_layers: int
+    hidden_size: int
+    vocab_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    kv_latent_dim: int
+    qk_rope_head_dim: int
+    q_lora_rank: int
+    o_lora_rank: int
+    o_groups: int
+    num_routed_experts: int
+    num_shared_experts: int
+    num_experts_per_tok: int
+    moe_intermediate_size: int
+    mhc_num_streams: int
+    sliding_window: int
+    kv_source_layer_ids: tuple[int, ...]
+    index_source_layer_ids: tuple[int, ...]
+    engram_layer_ids: tuple[int, ...]
+    engram_total_embeddings: int
+    engram_n_heads: int
+    engram_head_dim: int
+    dspark_layers: int
+    dspark_block_size: int
+    dspark_n_routed_experts: int
+    quantization_config: dict[str, object]
+    kv_bytes_per_token_bf16: int
+    kv_bytes_per_token_fp4: int
+    total_index_entries: int
+    shard_file_count: int
+    index_total_size_bytes: int
+    backbone_tensor_count: int
+    vision_tensor_count: int
+    engram_tensor_count: int
+    dspark_mtp_tensor_count: int
+    routed_expert_tensor_count: int
+    routed_expert_ids_detected: int
+    shared_expert_tensor_count: int
+    mhc_tensor_count: int
+    csa2_indexer_tensor_count: int
+    quant_scale_tensor_count: int
+    long_backbone_names: tuple[str, ...]
+    estimated_backbone_q3_bytes: int
+    estimated_non_expert_q3_bytes: int
+    estimated_routed_expert_q3_bytes: int
+    estimated_backbone_q4_bytes: int
+    tier_admission: dict[str, dict[str, object]]
+    tokenizer_present: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "arch": "deepseek41",
+            "metadata_dir": str(self.metadata_dir),
+            "model_type": self.model_type,
+            "architectures": list(self.architectures),
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_encoder_layers": self.num_encoder_layers,
+            "num_decoder_layers": self.num_decoder_layers,
+            "hidden_size": self.hidden_size,
+            "vocab_size": self.vocab_size,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "kv_latent_dim": self.kv_latent_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "q_lora_rank": self.q_lora_rank,
+            "o_lora_rank": self.o_lora_rank,
+            "o_groups": self.o_groups,
+            "num_routed_experts": self.num_routed_experts,
+            "num_shared_experts": self.num_shared_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "moe_intermediate_size": self.moe_intermediate_size,
+            "mhc_num_streams": self.mhc_num_streams,
+            "sliding_window": self.sliding_window,
+            "kv_source_layer_ids": list(self.kv_source_layer_ids),
+            "index_source_layer_ids": list(self.index_source_layer_ids),
+            "engram_layer_ids": list(self.engram_layer_ids),
+            "engram_total_embeddings": self.engram_total_embeddings,
+            "engram_n_heads": self.engram_n_heads,
+            "engram_head_dim": self.engram_head_dim,
+            "dspark_layers": self.dspark_layers,
+            "dspark_block_size": self.dspark_block_size,
+            "dspark_n_routed_experts": self.dspark_n_routed_experts,
+            "quantization_config": dict(self.quantization_config),
+            "kv_bytes_per_token_bf16": self.kv_bytes_per_token_bf16,
+            "kv_bytes_per_token_fp4": self.kv_bytes_per_token_fp4,
+            "total_index_entries": self.total_index_entries,
+            "shard_file_count": self.shard_file_count,
+            "index_total_size_bytes": self.index_total_size_bytes,
+            "tensor_buckets": {
+                "backbone": self.backbone_tensor_count,
+                "vision_strippable": self.vision_tensor_count,
+                "engram_nvme_table": self.engram_tensor_count,
+                "dspark_mtp_head": self.dspark_mtp_tensor_count,
+                "routed_expert_tensors": self.routed_expert_tensor_count,
+                "routed_expert_ids_detected": self.routed_expert_ids_detected,
+                "shared_expert_tensors": self.shared_expert_tensor_count,
+                "mhc_tensors": self.mhc_tensor_count,
+                "csa2_indexer_tensors": self.csa2_indexer_tensor_count,
+                "quant_scale_tensors": self.quant_scale_tensor_count,
+            },
+            "long_backbone_names_over_47b": len(self.long_backbone_names),
+            "long_backbone_name_samples": list(self.long_backbone_names[:8]),
+            "estimated_backbone_q3_bytes": self.estimated_backbone_q3_bytes,
+            "estimated_non_expert_q3_bytes": self.estimated_non_expert_q3_bytes,
+            "estimated_routed_expert_q3_bytes": self.estimated_routed_expert_q3_bytes,
+            "estimated_backbone_q4_bytes": self.estimated_backbone_q4_bytes,
+            "tier_admission": self.tier_admission,
+            "tokenizer_present": self.tokenizer_present,
+        }
+
+
+def validate_hf_metadata_dir(
+    metadata_dir: pathlib.Path,
+    *,
+    host_ram_gib: float | None = None,
+) -> DeepSeek41MetadataReport:
+    """Validate a Hugging Face `DeepSeek-V4.1-Flash-1017` (`deepseek_v41`) metadata directory offline.
+
+    Requires only `config.json` and `model.safetensors.index.json` (no `.safetensors` shards
+    needed on disk). Maps every `weight_map` key, reports CED/MLA/CSA2/mHC/Engram/DSpark
+    parameters, KV bytes/token, and multi-tier + TB5 cluster wired admission plans.
+    """
+    base = pathlib.Path(metadata_dir)
+    if base.is_file() and base.name == "config.json":
+        base = base.parent
+    cfg_path = base / "config.json"
+    idx_path = base / "model.safetensors.index.json"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"missing config.json in {base}")
+    if not idx_path.is_file():
+        raise FileNotFoundError(f"missing model.safetensors.index.json in {base}")
+
+    raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("config.json must be a JSON object")
+    cfg = _effective_deepseek_text_config(raw_cfg)
+
+    idx_obj = json.loads(idx_path.read_text(encoding="utf-8"))
+    if not isinstance(idx_obj, dict) or not isinstance(idx_obj.get("weight_map"), dict):
+        raise ValueError("model.safetensors.index.json must contain a weight_map object")
+    weight_map: dict[str, str] = idx_obj["weight_map"]
+    idx_meta = idx_obj.get("metadata") if isinstance(idx_obj.get("metadata"), dict) else {}
+    total_size = int(float(idx_meta.get("total_size", 0) or 0))
+    shard_files = set(weight_map.values())
+
+    vision_cnt = 0
+    engram_cnt = 0
+    dspark_cnt = 0
+    backbone_cnt = 0
+    routed_exp_cnt = 0
+    shared_exp_cnt = 0
+    mhc_cnt = 0
+    csa2_cnt = 0
+    scale_cnt = 0
+    expert_ids_seen: set[int] = set()
+    long_names: list[str] = []
+
+    exp_re = re.compile(r"\.experts\.(\d+)\.")
+    for raw_name in sorted(weight_map.keys()):
+        if is_vision_tensor(raw_name):
+            vision_cnt += 1
+            continue
+        if is_engram_tensor(raw_name):
+            engram_cnt += 1
+            continue
+        if is_dspark_tensor(raw_name):
+            dspark_cnt += 1
+            continue
+        norm = _strip_model_prefix(raw_name)
+        backbone_cnt += 1
+        if len(norm.encode("utf-8")) > 47:
+            long_names.append(norm)
+        lower = norm.lower()
+        if lower.endswith(".scale"):
+            scale_cnt += 1
+        em = exp_re.search(lower)
+        if em is not None:
+            routed_exp_cnt += 1
+            expert_ids_seen.add(int(em.group(1)))
+        elif ".shared_expert" in lower:
+            shared_exp_cnt += 1
+        if ".hc_" in lower or ".mhc." in lower:
+            mhc_cnt += 1
+        if ".indexer." in lower or ".compressor." in lower or "csa2" in lower:
+            csa2_cnt += 1
+
+    total_layers = int(
+        cfg.get(
+            "num_hidden_layers",
+            int(cfg.get("num_encoder_layers", 0) or 0) + int(cfg.get("num_decoder_layers", 0) or 0),
+        )
+        or 40
+    )
+    enc_l, dec_l = _infer_enc_dec_layers(cfg, total_layers)
+    hidden_size = int(cfg.get("hidden_size", 5120) or 5120)
+    vocab_size = int(cfg.get("vocab_size", 129280) or 129280)
+    num_heads = int(cfg.get("num_attention_heads", 64) or 64)
+    num_kv_heads = int(cfg.get("num_key_value_heads", 1) or 1)
+    kv_latent_dim = int(cfg.get("kv_lora_rank", cfg.get("head_dim", 512)) or 512)
+    qk_rope_dim = int(cfg.get("qk_rope_head_dim", 64) or 64)
+    q_lora_rank = int(cfg.get("q_lora_rank", 1280) or 1280)
+    o_lora_rank = int(cfg.get("o_lora_rank", 1024) or 1024)
+    o_groups = int(cfg.get("o_groups", 8) or 8)
+    num_routed_experts = int(cfg.get("n_routed_experts", cfg.get("num_experts", len(expert_ids_seen))) or 0)
+    num_shared_experts = int(cfg.get("n_shared_experts", 1 if cfg.get("has_shared_expert", True) else 0) or 0)
+    num_experts_per_tok = int(cfg.get("num_experts_per_tok", cfg.get("encoder_moe_top_k", 6)) or 6)
+    moe_i = int(cfg.get("moe_intermediate_size", 2304) or 2304)
+    mhc_streams = int(cfg.get("hc_mult", cfg.get("mhc_num_streams", 4)) or 4)
+    swa = int(cfg.get("sliding_window", cfg.get("swa_window", 128)) or 128)
+    raw_kv_src = cfg.get("kv_source_layer_ids")
+    kv_source_ids = tuple(int(x) for x in raw_kv_src) if isinstance(raw_kv_src, list) else ()
+    raw_idx_src = cfg.get("index_source_layer_ids")
+    index_source_ids = tuple(int(x) for x in raw_idx_src) if isinstance(raw_idx_src, list) else ()
+    raw_eng_ids = cfg.get("engram_layer_ids")
+    engram_layer_ids = tuple(int(x) for x in raw_eng_ids) if isinstance(raw_eng_ids, list) else ()
+    raw_eng_rows = cfg.get("engram_num_embeddings")
+    engram_total_embeddings = (
+        sum(int(x) for x in raw_eng_rows)
+        if isinstance(raw_eng_rows, list)
+        else int(cfg.get("engram_num_rows", 0) or 0)
+    )
+    engram_n_heads = int(cfg.get("engram_n_heads", cfg.get("engram_num_heads", 8)) or 8)
+    engram_head_dim = int(cfg.get("engram_head_dim", 256) or 256)
+    dspark_layers = int(cfg.get("num_nextn_predict_layers", 3 if dspark_cnt > 0 else 0) or 0)
+    dspark_block_size = int(cfg.get("dspark_block_size", cfg.get("dspark_block_width", 5)) or 5)
+    dspark_n_experts = int(cfg.get("dspark_n_routed_experts", 0) or 0)
+    quant_cfg = raw_cfg.get("quantization_config") if isinstance(raw_cfg.get("quantization_config"), dict) else {}
+
+    kv_slots = len(kv_source_ids) if kv_source_ids else 1
+    kv_bytes_per_token_bf16 = kv_slots * (kv_latent_dim + qk_rope_dim) * 2
+    fp4_per_slot = kv_latent_dim // 2 + kv_latent_dim // 16 + 26
+    kv_bytes_per_token_fp4 = kv_slots * fp4_per_slot
+
+    # Estimate backbone bytes under aminfer q3_affine (3.5 bpw) and q4_affine (4.5 bpw), excluding NVMe Engram.
+    def _est_backbone(bpw: float) -> tuple[int, int, int]:
+        h = hidden_size
+        # Attention + low-rank Q/O + KV + compressor/indexer + shared expert + mHC + router
+        q_elems = q_lora_rank * h + num_heads * (kv_latent_dim + qk_rope_dim) * q_lora_rank
+        kv_elems = (kv_latent_dim + qk_rope_dim) * h
+        o_elems = (o_lora_rank * num_heads * kv_latent_dim) // max(1, o_groups) + h * o_lora_rank
+        shared_elems = num_shared_experts * 3 * moe_i * h
+        mhc_elems = 2 * (mhc_streams * h + mhc_streams * mhc_streams + mhc_streams)
+        router_elems = num_routed_experts * h
+        per_layer_non_exp = int((q_elems + kv_elems + o_elems + shared_elems) * bpw) + (mhc_elems + router_elems + 4 * h) * 2
+        embed_bytes = vocab_size * h * 2
+        lm_head_bytes = 0 if bool(cfg.get("tie_word_embeddings", False)) else int(vocab_size * h * bpw)
+        non_exp = total_layers * per_layer_non_exp + embed_bytes + lm_head_bytes
+        routed_exp = int(total_layers * num_routed_experts * 3 * moe_i * h * bpw)
+        return (non_exp + routed_exp, non_exp, routed_exp)
+
+    q3_total, q3_non_exp, q3_exp = _est_backbone((24 + 4) / 64.0)
+    q4_total, _, _ = _est_backbone((32 + 4) / 64.0)
+
+    tier_specs: list[tuple[str, str, int, float | None]] = [
+        ("24gb-m4", "24gb-m4", 1, 24.0),
+        ("128gb-max", "128gb-max", 1, 128.0),
+        ("256gb-ultra", "256gb-ultra", 1, 256.0),
+        ("512gb-ultra", "512gb-ultra", 1, 512.0),
+        ("tb5-cluster-2x128gb", "cluster", 2, 128.0),
+        ("tb5-cluster-4x128gb", "cluster", 4, 128.0),
+        ("tb5-cluster-2x256gb", "cluster", 2, 256.0),
+    ]
+    if host_ram_gib is not None and host_ram_gib > 0:
+        tier_specs.append(("host-custom", "auto", 1, host_ram_gib))
+
+    tier_admission: dict[str, dict[str, object]] = {}
+    for label, tier_key, ws, ram_g in tier_specs:
+        chk = evaluate_hardware_tier(
+            q3_total,
+            target_tier=tier_key,
+            host_ram_gib=ram_g,
+            world_size=ws,
+            non_expert_bytes=q3_non_exp,
+            routed_expert_bytes=q3_exp,
+            allow_override=True,
+        )
+        tier_admission[label] = {
+            "target_tier": chk.target_tier,
+            "world_size": chk.world_size,
+            "per_rank_budget_gib": round(chk.per_rank_budget_bytes / (1024**3), 2),
+            "per_rank_q3_wired_gib": round(chk.per_rank_wired_bytes / (1024**3), 2),
+            "fits_all_wired_q3": chk.fits,
+            "recommendation": chk.recommendation,
+        }
+
+    raw_archs = raw_cfg.get("architectures")
+    archs = tuple(str(a) for a in raw_archs) if isinstance(raw_archs, list) else ()
+    return DeepSeek41MetadataReport(
+        metadata_dir=base,
+        model_type=str(raw_cfg.get("model_type", cfg.get("model_type", "unknown"))),
+        architectures=archs,
+        num_hidden_layers=total_layers,
+        num_encoder_layers=enc_l,
+        num_decoder_layers=dec_l,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        kv_latent_dim=kv_latent_dim,
+        qk_rope_head_dim=qk_rope_dim,
+        q_lora_rank=q_lora_rank,
+        o_lora_rank=o_lora_rank,
+        o_groups=o_groups,
+        num_routed_experts=num_routed_experts,
+        num_shared_experts=num_shared_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        moe_intermediate_size=moe_i,
+        mhc_num_streams=mhc_streams,
+        sliding_window=swa,
+        kv_source_layer_ids=kv_source_ids,
+        index_source_layer_ids=index_source_ids,
+        engram_layer_ids=engram_layer_ids,
+        engram_total_embeddings=engram_total_embeddings,
+        engram_n_heads=engram_n_heads,
+        engram_head_dim=engram_head_dim,
+        dspark_layers=dspark_layers,
+        dspark_block_size=dspark_block_size,
+        dspark_n_routed_experts=dspark_n_experts,
+        quantization_config=quant_cfg,
+        kv_bytes_per_token_bf16=kv_bytes_per_token_bf16,
+        kv_bytes_per_token_fp4=kv_bytes_per_token_fp4,
+        total_index_entries=len(weight_map),
+        shard_file_count=len(shard_files),
+        index_total_size_bytes=total_size,
+        backbone_tensor_count=backbone_cnt,
+        vision_tensor_count=vision_cnt,
+        engram_tensor_count=engram_cnt,
+        dspark_mtp_tensor_count=dspark_cnt,
+        routed_expert_tensor_count=routed_exp_cnt,
+        routed_expert_ids_detected=len(expert_ids_seen),
+        shared_expert_tensor_count=shared_exp_cnt,
+        mhc_tensor_count=mhc_cnt,
+        csa2_indexer_tensor_count=csa2_cnt,
+        quant_scale_tensor_count=scale_cnt,
+        long_backbone_names=tuple(long_names),
+        estimated_backbone_q3_bytes=q3_total,
+        estimated_non_expert_q3_bytes=q3_non_exp,
+        estimated_routed_expert_q3_bytes=q3_exp,
+        estimated_backbone_q4_bytes=q4_total,
+        tier_admission=tier_admission,
+        tokenizer_present=(base / "tokenizer.json").is_file(),
     )

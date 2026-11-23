@@ -356,27 +356,179 @@ inline fn asciiLower(b: u8) u8 {
     return if (b >= 'A' and b <= 'Z') b + ('a' - 'A') else b;
 }
 
-/// Deterministic zero-allocation scanner implementing the Qwen2/Qwen3/Qwen3.5
-/// pre-tokenization regex:
-/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+inline fn isAsciiAlpha(b: u8) bool {
+    return (b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z');
+}
+
+/// ASCII punctuation class from DeepSeek's pre-tokenizer regex:
+/// `[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]`
+inline fn isAsciiPunct(b: u8) bool {
+    return (b >= '!' and b <= '/') or
+        (b >= ':' and b <= '@') or
+        (b >= '[' and b <= '`') or
+        (b >= '{' and b <= '~');
+}
+
+/// CJK / Kana range isolated in stage 2 of DeepSeek's pre-tokenizer:
+/// `[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+`
+inline fn isDeepSeekCjk(cp: u21) bool {
+    return (cp >= 0x4E00 and cp <= 0x9FA5) or
+        (cp >= 0x3040 and cp <= 0x309F) or
+        (cp >= 0x30A0 and cp <= 0x30FF);
+}
+
+/// Pre-tokenization dialect auto-detected from HuggingFace `tokenizer.json`.
+pub const PreTokenizerKind = enum(u8) {
+    /// Qwen2 / Qwen3 / Qwen3.5 / Qwen3.8 single-digit `\p{N}` + contraction regex.
+    qwen,
+    /// DeepSeek V3 / V4 / V4.1 3-stage isolated split (`\p{N}{1,3}`, CJK/Kana, punct+ASCII word).
+    deepseek,
+};
+
+/// Deterministic zero-allocation scanner implementing Qwen (`\p{N}`) and
+/// DeepSeek (`\p{N}{1,3}` + CJK isolation + ASCII-punct-word) pre-tokenization.
 pub const PreTokenIterator = struct {
     text: []const u8,
     pos: usize,
+    kind: PreTokenizerKind = .qwen,
 
     pub fn init(text: []const u8) PreTokenIterator {
-        return .{ .text = text, .pos = 0 };
+        return .{ .text = text, .pos = 0, .kind = .qwen };
+    }
+
+    pub fn initWithKind(text: []const u8, kind: PreTokenizerKind) PreTokenIterator {
+        return .{ .text = text, .pos = 0, .kind = kind };
     }
 
     pub fn next(self: *PreTokenIterator) ?[]const u8 {
         if (self.pos >= self.text.len) return null;
         const rem = self.text[self.pos..];
-        const len = matchQwenPreToken(rem);
+        const len = switch (self.kind) {
+            .qwen => matchQwenPreToken(rem),
+            .deepseek => matchDeepSeekPreToken(rem),
+        };
         std.debug.assert(len > 0 and len <= rem.len);
         const chunk = rem[0..len];
         self.pos += len;
         return chunk;
     }
 };
+
+fn matchDeepSeekPreToken(rem: []const u8) usize {
+    const c0 = decodeNextCp(rem);
+
+    // Stage 1: Isolated `\p{N}{1,3}`
+    if (isNumber(c0.cp)) {
+        var end = c0.len;
+        var count: usize = 1;
+        while (count < 3 and end < rem.len) {
+            const c = decodeNextCp(rem[end..]);
+            if (!isNumber(c.cp)) break;
+            end += c.len;
+            count += 1;
+        }
+        return end;
+    }
+
+    // Stage 2: Isolated `[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+`
+    if (isDeepSeekCjk(c0.cp)) {
+        var end = c0.len;
+        while (end < rem.len) {
+            const c = decodeNextCp(rem[end..]);
+            if (!isDeepSeekCjk(c.cp)) break;
+            end += c.len;
+        }
+        return end;
+    }
+
+    // Bound stage 3 to the isolated non-number, non-CJK sub-slice produced by stages 1 & 2.
+    var sub_end: usize = c0.len;
+    while (sub_end < rem.len) {
+        const c = decodeNextCp(rem[sub_end..]);
+        if (isNumber(c.cp) or isDeepSeekCjk(c.cp)) break;
+        sub_end += c.len;
+    }
+    const sub = rem[0..sub_end];
+
+    // Stage 3.1: `[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+`
+    if (sub.len >= 2 and isAsciiPunct(sub[0]) and isAsciiAlpha(sub[1])) {
+        var end: usize = 2;
+        while (end < sub.len and isAsciiAlpha(sub[end])) {
+            end += 1;
+        }
+        return end;
+    }
+
+    // Stage 3.2: `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`
+    if (isLetterOrMark(c0.cp)) {
+        var end = c0.len;
+        while (end < sub.len) {
+            const c = decodeNextCp(sub[end..]);
+            if (!isLetterOrMark(c.cp)) break;
+            end += c.len;
+        }
+        return end;
+    }
+    if (c0.cp != '\r' and c0.cp != '\n' and !isPunctOrSymbol(c0.cp) and c0.len < sub.len) {
+        const c1 = decodeNextCp(sub[c0.len..]);
+        if (isLetterOrMark(c1.cp)) {
+            var end = c0.len + c1.len;
+            while (end < sub.len) {
+                const c = decodeNextCp(sub[end..]);
+                if (!isLetterOrMark(c.cp)) break;
+                end += c.len;
+            }
+            return end;
+        }
+    }
+
+    // Stage 3.3: ` ?[\p{P}\p{S}]+[\r\n]*`
+    {
+        var p_start: ?usize = null;
+        if (isPunctOrSymbol(c0.cp)) {
+            p_start = c0.len;
+        } else if (c0.cp == ' ' and c0.len < sub.len) {
+            const c1 = decodeNextCp(sub[c0.len..]);
+            if (isPunctOrSymbol(c1.cp)) {
+                p_start = c0.len + c1.len;
+            }
+        }
+        if (p_start) |start| {
+            var end = start;
+            while (end < sub.len) {
+                const c = decodeNextCp(sub[end..]);
+                if (!isPunctOrSymbol(c.cp)) break;
+                end += c.len;
+            }
+            while (end < sub.len and (sub[end] == '\r' or sub[end] == '\n')) {
+                end += 1;
+            }
+            return end;
+        }
+    }
+
+    // Stage 3.4: `\s*[\r\n]+|\s+(?!\S)|\s+`
+    if (isWhitespace(c0.cp)) {
+        var ws_end: usize = 0;
+        var last_ws_start: usize = 0;
+        var after_last_nl: ?usize = null;
+        while (ws_end < sub.len) {
+            const c = decodeNextCp(sub[ws_end..]);
+            if (!isWhitespace(c.cp)) break;
+            last_ws_start = ws_end;
+            ws_end += c.len;
+            if (c.cp == '\r' or c.cp == '\n') {
+                after_last_nl = ws_end;
+            }
+        }
+        if (after_last_nl) |nl_end| return nl_end;
+        if (ws_end == sub.len) return ws_end;
+        if (last_ws_start > 0) return last_ws_start;
+        return ws_end;
+    }
+
+    return c0.len;
+}
 
 fn matchQwenPreToken(rem: []const u8) usize {
     // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
@@ -595,11 +747,12 @@ pub const Tokenizer = struct {
     merges: std.AutoHashMapUnmanaged(u64, MergeEntry),
     added_tokens: []AddedToken,
     added_first_byte: [256]bool,
+    pre_tokenizer_kind: PreTokenizerKind = .qwen,
     token_count: usize,
 
     /// Parses a HuggingFace `tokenizer.json` payload at startup into compact
     /// flat lookup tables. Supports both `"a b"` string and `["a", "b"]` array
-    /// merge formats and arbitrary JSON key ordering.
+    /// merge formats, Qwen and DeepSeek pre-tokenizers, and arbitrary JSON key ordering.
     pub fn fromHuggingFaceJson(allocator: std.mem.Allocator, json_bytes: []const u8) LoadError!Tokenizer {
         var temp_arena = std.heap.ArenaAllocator.init(allocator);
         defer temp_arena.deinit();
@@ -612,6 +765,7 @@ pub const Tokenizer = struct {
         if (first_tok != .object_begin) return error.InvalidJson;
 
         var saw_vocab = false;
+        var pre_tokenizer_kind: PreTokenizerKind = .qwen;
         var temp_vocab: std.StringHashMapUnmanaged(u32) = .empty;
         var vocab_list: std.ArrayList(RawVocabEntry) = .empty;
         var raw_merges: std.ArrayList(RawMergePair) = .empty;
@@ -630,6 +784,8 @@ pub const Tokenizer = struct {
                 try parseModelSection(&scanner, temp, &saw_vocab, &temp_vocab, &vocab_list, &raw_merges);
             } else if (std.mem.eql(u8, key, "added_tokens")) {
                 try parseAddedTokensSection(&scanner, temp, &raw_added);
+            } else if (std.mem.eql(u8, key, "pre_tokenizer")) {
+                pre_tokenizer_kind = try parsePreTokenizerSection(&scanner, temp);
             } else {
                 try skipJsonValue(&scanner);
             }
@@ -774,6 +930,7 @@ pub const Tokenizer = struct {
             .merges = merges,
             .added_tokens = added_tokens,
             .added_first_byte = added_first_byte,
+            .pre_tokenizer_kind = pre_tokenizer_kind,
             .token_count = token_count,
         };
     }
@@ -945,7 +1102,7 @@ pub const Tokenizer = struct {
         maybe_scratch: ?*EncodeScratch,
         segment: []const u8,
     ) EncodeError!void {
-        var it = PreTokenIterator.init(segment);
+        var it = PreTokenIterator.initWithKind(segment, self.pre_tokenizer_kind);
         while (it.next()) |chunk| {
             try self.encodeChunk(writer, maybe_alloc, maybe_scratch, chunk);
         }
@@ -1156,6 +1313,49 @@ fn parseU32Token(tok: std.json.Token) LoadError!u32 {
         else => return error.InvalidJson,
     };
     return std.fmt.parseInt(u32, raw, 10) catch return error.InvalidJson;
+}
+
+fn parsePreTokenizerSection(
+    scanner: *std.json.Scanner,
+    temp: std.mem.Allocator,
+) LoadError!PreTokenizerKind {
+    var kind: PreTokenizerKind = .qwen;
+    var depth: usize = 0;
+    var expect_regex_val = false;
+    while (true) {
+        const tok = try nextToken(scanner, temp);
+        switch (tok) {
+            .object_begin, .array_begin => {
+                depth += 1;
+                expect_regex_val = false;
+            },
+            .object_end, .array_end => {
+                if (depth == 0) return error.InvalidJson;
+                depth -= 1;
+                expect_regex_val = false;
+                if (depth == 0) break;
+            },
+            .string, .allocated_string => |s| {
+                if (expect_regex_val) {
+                    if (std.mem.indexOf(u8, s, "\\p{N}{1,3}") != null or
+                        std.mem.indexOf(u8, s, "\xe4\xb8\x80-\xe9\xbe\xa5") != null)
+                    {
+                        kind = .deepseek;
+                    }
+                    expect_regex_val = false;
+                } else if (std.mem.eql(u8, s, "Regex")) {
+                    expect_regex_val = true;
+                }
+                if (depth == 0) break;
+            },
+            .null, .true, .false, .number, .allocated_number => {
+                expect_regex_val = false;
+                if (depth == 0) break;
+            },
+            else => return error.InvalidJson,
+        }
+    }
+    return kind;
 }
 
 fn parseModelSection(
@@ -1673,4 +1873,135 @@ test "opportunistic Qwen3.5-0.8B tokenizer.json round-trips Chinese, code, and s
     const round_tripped = try tok.decodeAlloc(gpa, ids);
     defer gpa.free(round_tripped);
     try std.testing.expectEqualStrings(prompt, round_tripped);
+}
+
+test "DeepSeek pre-tokenizer groups 1-3 digits, isolates CJK/Kana, and joins ASCII punct+word" {
+    var it = PreTokenIterator.initWithKind("DeepSeek-V4.1 2026年1017号 .foo_bar", .deepseek);
+    const expected = [_][]const u8{
+        "DeepSeek",
+        "-V",
+        "4",
+        ".",
+        "1",
+        " ",
+        "202",
+        "6",
+        "年",
+        "101",
+        "7",
+        "号",
+        " .",
+        "foo",
+        "_bar",
+    };
+    for (expected) |exp| {
+        const got = it.next() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(exp, got);
+    }
+    try std.testing.expect(it.next() == null);
+
+    var it2 = PreTokenIterator.initWithKind(".foo_bar", .deepseek);
+    try std.testing.expectEqualStrings(".foo", it2.next().?);
+    try std.testing.expectEqualStrings("_bar", it2.next().?);
+    try std.testing.expect(it2.next() == null);
+}
+
+test "fromHuggingFaceJson auto-detects DeepSeek pre_tokenizer dialect" {
+    const gpa = std.testing.allocator;
+    const base_json = try buildSyntheticTokenizerJson(gpa, false);
+    defer gpa.free(base_json);
+    const prefix =
+        "{\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":[" ++
+        "{\"type\":\"Split\",\"pattern\":{\"Regex\":\"\\\\p{N}{1,3}\"},\"behavior\":\"Isolated\",\"invert\":false}," ++
+        "{\"type\":\"Split\",\"pattern\":{\"Regex\":\"[\\u4e00-\\u9fa5\\u3040-\\u309f\\u30a0-\\u30ff]+\"},\"behavior\":\"Isolated\",\"invert\":false}," ++
+        "{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":true,\"use_regex\":false}" ++
+        "]},";
+    const combined = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, base_json[1..] });
+    defer gpa.free(combined);
+
+    var tok = try Tokenizer.fromHuggingFaceJson(gpa, combined);
+    defer tok.deinit(gpa);
+    try std.testing.expectEqual(PreTokenizerKind.deepseek, tok.pre_tokenizer_kind);
+}
+
+test "opportunistic live Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash-1017 tokenizer.json compatibility" {
+    const gpa = std.testing.allocator;
+
+    // 1. Qwen/Qwen3.8-Flash-Next
+    if (std.Io.Dir.readFileAlloc(
+        std.Io.Dir.cwd(),
+        std.testing.io,
+        "/Volumes/Akari/models/metadata/Qwen__Qwen3.8-Flash-Next/tokenizer.json",
+        gpa,
+        .limited(64 * 1024 * 1024),
+    )) |bytes| {
+        defer gpa.free(bytes);
+        var tok = try Tokenizer.fromHuggingFaceJson(gpa, bytes);
+        defer tok.deinit(gpa);
+
+        try std.testing.expectEqual(PreTokenizerKind.qwen, tok.pre_tokenizer_kind);
+        try std.testing.expectEqual(@as(?u32, 248044), tok.addedTokenId("<|endoftext|>"));
+        try std.testing.expectEqual(@as(?u32, 248045), tok.addedTokenId("<|im_start|>"));
+        try std.testing.expectEqual(@as(?u32, 248046), tok.addedTokenId("<|im_end|>"));
+        try std.testing.expectEqual(@as(?u32, 248068), tok.addedTokenId("<think>"));
+        try std.testing.expectEqual(@as(?u32, 248069), tok.addedTokenId("</think>"));
+
+        const sample = "<|im_start|>user\nQwen3.8-Flash-Next 2026 16 KiB 对齐！\n<|im_end|>";
+        var scratch = try EncodeScratch.init(gpa, 256);
+        defer scratch.deinit(gpa);
+        var id_buf: [256]u32 = undefined;
+        const ids = try tok.encodeWithScratch(&scratch, sample, &id_buf);
+        try std.testing.expectEqual(@as(u32, 248045), ids[0]);
+        try std.testing.expectEqual(@as(u32, 248046), ids[ids.len - 1]);
+
+        var out_buf: [512]u8 = undefined;
+        const decoded = try tok.decode(ids, &out_buf);
+        try std.testing.expectEqualStrings(sample, decoded);
+        const plain = try tok.decodeSkippingSpecial(ids, &out_buf);
+        try std.testing.expectEqualStrings("user\nQwen3.8-Flash-Next 2026 16 KiB 对齐！\n", plain);
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => return err,
+    }
+
+    // 2. deepseek-ai/DeepSeek-V4.1-Flash-1017
+    if (std.Io.Dir.readFileAlloc(
+        std.Io.Dir.cwd(),
+        std.testing.io,
+        "/Volumes/Akari/models/metadata/deepseek-ai__DeepSeek-V4.1-Flash-1017/tokenizer.json",
+        gpa,
+        .limited(64 * 1024 * 1024),
+    )) |bytes| {
+        defer gpa.free(bytes);
+        var tok = try Tokenizer.fromHuggingFaceJson(gpa, bytes);
+        defer tok.deinit(gpa);
+
+        try std.testing.expectEqual(PreTokenizerKind.deepseek, tok.pre_tokenizer_kind);
+        try std.testing.expectEqual(@as(usize, 129_280), tok.vocabSize());
+        try std.testing.expectEqual(@as(?u32, 0), tok.addedTokenId("<｜begin▁of▁sentence｜>"));
+        try std.testing.expectEqual(@as(?u32, 1), tok.addedTokenId("<｜end▁of▁sentence｜>"));
+        try std.testing.expectEqual(@as(?u32, 2), tok.addedTokenId("<｜▁pad▁｜>"));
+        try std.testing.expect(tok.isSpecialToken(0));
+        try std.testing.expect(tok.isSpecialToken(1));
+
+        const sample =
+            "<｜begin▁of▁sentence｜>DeepSeek-V4.1-Flash-1017: 2026年10月17日，Apple Silicon 16 KiB zero-copy!\n" ++
+            "pub fn alignUp(n: usize) usize { return (n + 16383) & ~@as(usize, 16383); }<｜end▁of▁sentence｜>";
+        var scratch = try EncodeScratch.init(gpa, 256);
+        defer scratch.deinit(gpa);
+        var id_buf: [256]u32 = undefined;
+        const ids = try tok.encodeWithScratch(&scratch, sample, &id_buf);
+        try std.testing.expectEqual(@as(u32, 0), ids[0]);
+        try std.testing.expectEqual(@as(u32, 1), ids[ids.len - 1]);
+        try std.testing.expect(ids.len < sample.len / 2);
+
+        var out_buf: [512]u8 = undefined;
+        const decoded = try tok.decode(ids, &out_buf);
+        try std.testing.expectEqualStrings(sample, decoded);
+        const plain = try tok.decodeSkippingSpecial(ids, &out_buf);
+        try std.testing.expect(!std.mem.containsAtLeast(u8, plain, 1, "begin▁of▁sentence"));
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => return err,
+    }
 }

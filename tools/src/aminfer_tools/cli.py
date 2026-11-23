@@ -23,7 +23,10 @@ from aminfer_tools.amf import (
     retag_amf_cold_experts,
 )
 from aminfer_tools.gsq_rco import gsq_convert
-from aminfer_tools.qwen4_exp import pack_qwen4_checkpoint
+from aminfer_tools.qwen4_exp import (
+    pack_qwen4_checkpoint,
+    validate_hf_metadata_dir as validate_qwen4_metadata_dir,
+)
 from aminfer_tools.deepseek41 import (
     DEEPSEEK41_PRESETS,
     VALID_DEEPSEEK41_DTYPES,
@@ -33,6 +36,7 @@ from aminfer_tools.deepseek41 import (
     convert_deepseek41_checkpoint,
     generate_synth_deepseek41_bundle,
     partition_deepseek41_amf_shards,
+    validate_hf_metadata_dir as validate_deepseek41_metadata_dir,
 )
 from aminfer_tools import ngram as ngram_mod
 from aminfer_tools.coreml import (
@@ -637,6 +641,38 @@ def _build_parser() -> argparse.ArgumentParser:
         "--replicate-backbone",
         action="store_true",
         help="Replicate non-expert backbone tensors onto every worker rank shard (default: rank 0 only)",
+    )
+
+    insp = sub.add_parser(
+        "inspect-metadata",
+        help=(
+            "Offline metadata-only dry-run validator for HF qwen4_exp / deepseek_v41 checkpoints "
+            "(parses config.json + model.safetensors.index.json without weight shards on disk)"
+        ),
+    )
+    insp.add_argument(
+        "--input",
+        required=True,
+        type=pathlib.Path,
+        help="Metadata directory (containing config.json + model.safetensors.index.json) or config.json path",
+    )
+    insp.add_argument(
+        "--arch",
+        choices=("auto", "qwen4_exp", "deepseek41"),
+        default="auto",
+        help="Architecture validator to invoke (default: auto-detect from config.json)",
+    )
+    insp.add_argument(
+        "--host-ram-gib",
+        type=float,
+        default=None,
+        help="Optional host RAM (GiB) to include a custom tier-admission entry",
+    )
+    insp.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Emit full structured JSON report instead of human-readable summary",
     )
 
     draft = sub.add_parser(
@@ -1401,6 +1437,83 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"partitioned {rep.num_experts} experts across {rep.world_size} rank(s) "
             f"({rep.strategy}) into {rep.output_dir} (manifest={rep.manifest_path.name})"
         )
+        return 0
+
+    if args.command == "inspect-metadata":
+        base = args.input.parent if (args.input.is_file() and args.input.name == "config.json") else args.input
+        cfg_file = base / "config.json"
+        if not cfg_file.is_file():
+            print(f"error: missing config.json in {base}", file=sys.stderr)
+            return 2
+        raw_cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+        arch = args.arch
+        if arch == "auto":
+            mt = str(raw_cfg.get("model_type", "")).lower()
+            tc_mt = str(raw_cfg.get("text_config", {}).get("model_type", "")).lower() if isinstance(raw_cfg.get("text_config"), dict) else ""
+            combined_mt = f"{mt} {tc_mt}"
+            if "deepseek" in combined_mt:
+                arch = "deepseek41"
+            elif "qwen" in combined_mt:
+                arch = "qwen4_exp"
+            else:
+                print(f"error: cannot auto-detect arch from model_type={mt!r}; pass --arch", file=sys.stderr)
+                return 2
+        try:
+            rep = (
+                validate_deepseek41_metadata_dir(base, host_ram_gib=args.host_ram_gib)
+                if arch == "deepseek41"
+                else validate_qwen4_metadata_dir(base, host_ram_gib=args.host_ram_gib)
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        data = rep.to_dict()
+        if args.as_json:
+            print(json.dumps(data, indent=2))
+        elif arch == "qwen4_exp":
+            gib = rep.index_total_size_bytes / (1024**3)
+            q3_gib = rep.estimated_backbone_q3_bytes / (1024**3)
+            print(
+                f"qwen4_exp metadata OK ({rep.model_type}): "
+                f"layers={rep.num_hidden_layers} (GDN={rep.gdn_layers}, QSA={rep.qsa_layers}), "
+                f"hidden={rep.hidden_size}, experts={rep.num_experts} (top-{rep.num_experts_per_tok}, shared={rep.has_shared_expert}), "
+                f"hc={rep.hc_count}, PLE shards={rep.ple_shards_detected}, MTP layers={rep.mtp_layers}, "
+                f"KV={rep.kv_bytes_per_token_fp16} B/tok (FP16), GDN state={rep.gdn_state_bytes_fp32 / (1024**2):.1f} MiB"
+            )
+            print(
+                f"  index: {rep.total_index_entries} tensors / {rep.shard_file_count} shards ({gib:.2f} GiB raw, "
+                f"est q3 backbone={q3_gib:.2f} GiB); buckets: backbone={rep.backbone_tensor_count}, "
+                f"vision={rep.vision_tensor_count}, ple={rep.ple_tensor_count}, mtp={rep.mtp_tensor_count}, "
+                f"names>47B={len(rep.long_backbone_names)}"
+            )
+            for tier, info in rep.tier_admission.items():
+                print(
+                    f"  tier {tier}: budget={info['per_rank_budget_gib']} GiB/rank, "
+                    f"q3_wired={info['per_rank_q3_wired_gib']} GiB/rank -> {info['mode']}"
+                )
+        else:
+            gib = rep.index_total_size_bytes / (1024**3)
+            q3_gib = rep.estimated_backbone_q3_bytes / (1024**3)
+            print(
+                f"deepseek41 metadata OK ({rep.model_type}): "
+                f"layers={rep.num_hidden_layers} (enc={rep.num_encoder_layers}, dec={rep.num_decoder_layers}), "
+                f"hidden={rep.hidden_size}, experts={rep.num_routed_experts} (top-{rep.num_experts_per_tok}, shared={rep.num_shared_experts}), "
+                f"mHC={rep.mhc_num_streams}, Engram layers={list(rep.engram_layer_ids)} ({rep.engram_total_embeddings:,} rows), "
+                f"DSpark/MTP={rep.dspark_layers}L/{rep.dspark_n_routed_experts}E, "
+                f"KV={rep.kv_bytes_per_token_bf16} B/tok BF16 / {rep.kv_bytes_per_token_fp4} B/tok FP4"
+            )
+            print(
+                f"  index: {rep.total_index_entries} tensors / {rep.shard_file_count} shards ({gib:.2f} GiB raw, "
+                f"est q3 backbone={q3_gib:.2f} GiB); buckets: backbone={rep.backbone_tensor_count}, "
+                f"vision={rep.vision_tensor_count}, engram={rep.engram_tensor_count}, dspark_mtp={rep.dspark_mtp_tensor_count}, "
+                f"routed_exp={rep.routed_expert_tensor_count} ({rep.routed_expert_ids_detected} IDs), names>47B={len(rep.long_backbone_names)}"
+            )
+            for tier, info in rep.tier_admission.items():
+                status = "FITS" if info["fits_all_wired_q3"] else "EXCEEDS"
+                print(
+                    f"  tier {tier} (ws={info['world_size']}): budget={info['per_rank_budget_gib']} GiB/rank, "
+                    f"q3_wired={info['per_rank_q3_wired_gib']} GiB/rank -> {status}"
+                )
         return 0
 
     print(
