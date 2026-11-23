@@ -5012,6 +5012,11 @@ pub const GraphModel = struct {
         };
 
         const vis_t0 = try vmstat.nowNs();
+        const use_ane_offload = (rt.placement == .ane and
+            self.vision_state.ane_offload != null and
+            vcfg.spatial_merge == 1 and
+            total_patches <= self.vision_state.ane_offload.?.token_bucket and
+            total_vis_tokens == total_patches);
         {
             var vframe = try self.compute.beginFrame(self.timeout_ms);
             errdefer vframe.abort();
@@ -5075,34 +5080,69 @@ pub const GraphModel = struct {
                 }
             }
 
-            const tile0 = plan.tiles[0];
-            const emitted = try rt.encodeTowerForward(
-                &vframe,
-                self.vision_state.blocks,
-                merger,
-                tile0.grid_h,
-                tile0.grid_w,
-                tube_count * plan.num_tiles,
-                true,
-            );
-            std.debug.assert(emitted == total_vis_tokens);
+            if (use_ane_offload) {
+                const vsig = try vframe.commit();
+                try self.compute.wait(vsig, self.timeout_ms);
+            } else {
+                const tile0 = plan.tiles[0];
+                const emitted = try rt.encodeTowerForward(
+                    &vframe,
+                    self.vision_state.blocks,
+                    merger,
+                    tile0.grid_h,
+                    tile0.grid_w,
+                    tube_count * plan.num_tiles,
+                    true,
+                );
+                std.debug.assert(emitted == total_vis_tokens);
 
-            if (need_stage) {
-                try self.moe_pipes.encodeCopyStrided(&vframe, .{
-                    .src = sc.lmEmbedsBinding(),
-                    .dst = vis_embeds_bind,
-                    .num_rows = total_vis_tokens,
-                    .copy_cols = self.config.hidden_size,
-                    .src_stride = self.config.hidden_size,
-                    .dst_stride = self.config.hidden_size,
-                }, true);
+                if (need_stage) {
+                    try self.moe_pipes.encodeCopyStrided(&vframe, .{
+                        .src = sc.lmEmbedsBinding(),
+                        .dst = vis_embeds_bind,
+                        .num_rows = total_vis_tokens,
+                        .copy_cols = self.config.hidden_size,
+                        .src_stride = self.config.hidden_size,
+                        .dst_stride = self.config.hidden_size,
+                    }, true);
+                }
+                const vsig = try vframe.commit();
+                try self.compute.wait(vsig, self.timeout_ms);
             }
-            const vsig = try vframe.commit();
-            try self.compute.wait(vsig, self.timeout_ms);
         }
-        if (self.vision_state.ane_offload) |*offload| {
-            if (rt.placement == .ane) {
-                _ = try offload.predictZeroCopy();
+        if (use_ane_offload) {
+            const offload = &(self.vision_state.ane_offload.?);
+            const patch_src = sc.hiddenAF16();
+            {
+                var in_lock = try offload.in_frame.lockPlane(0, false);
+                errdefer in_lock.release();
+                const vis_row_bytes: usize = @as(usize, vcfg.vis_hidden) * @sizeOf(f16);
+                for (0..offload.token_bucket) |row_idx| {
+                    const row_bytes = in_lock.rowBytes(@intCast(row_idx));
+                    @memset(row_bytes, 0);
+                    if (row_idx < total_patches) {
+                        const src_slice = std.mem.sliceAsBytes(patch_src[row_idx * vcfg.vis_hidden .. (row_idx + 1) * vcfg.vis_hidden]);
+                        @memcpy(row_bytes[0..vis_row_bytes], src_slice);
+                    }
+                }
+                try in_lock.unlock();
+            }
+            _ = try offload.predictZeroCopy();
+            {
+                var out_lock = try offload.out_frame.lockPlane(0, true);
+                errdefer out_lock.release();
+                const dst_embeds: []f16 = if (stage_arena_opt) |*sa|
+                    @alignCast(std.mem.bytesAsSlice(f16, sa.bytes()))
+                else
+                    sc.lmEmbedsF16();
+                const lm_h: usize = self.config.hidden_size;
+                const lm_row_bytes: usize = lm_h * @sizeOf(f16);
+                for (0..total_vis_tokens) |row_idx| {
+                    const src_row = out_lock.rowBytes(@intCast(row_idx));
+                    const dst_slice = std.mem.sliceAsBytes(dst_embeds[row_idx * lm_h .. (row_idx + 1) * lm_h]);
+                    @memcpy(dst_slice, src_row[0..lm_row_bytes]);
+                }
+                try out_lock.unlock();
             }
         }
         const vis_t1 = try vmstat.nowNs();
@@ -14483,30 +14523,40 @@ fn initGraphVisionState(
         );
         errdefer offload.deinit();
         var est_gpu_us: f64 = 250.0;
-        if (blocks.len == vcfg.num_layers and merger != null and vcfg.spatial_merge * vcfg.spatial_merge <= vcfg.max_patches) {
+        const sm = vcfg.spatial_merge;
+        const tile_patches = sm * sm;
+        const cal_tiles: u32 = if (tile_patches > 0 and offload.token_bucket >= tile_patches and (offload.token_bucket % tile_patches) == 0 and offload.token_bucket <= vcfg.max_patches)
+            offload.token_bucket / tile_patches
+        else
+            1;
+        if (blocks.len == vcfg.num_layers and merger != null and tile_patches > 0 and cal_tiles * tile_patches <= vcfg.max_patches) {
             if (rt.scratch) |sc| {
-                const sm = vcfg.spatial_merge;
-                const np = sm * sm;
                 const coords_sl = sc.coordsSlice();
                 const bounds_sl = sc.windowBoundsSlice();
-                for (0..sm) |gh| {
-                    for (0..sm) |gw| {
-                        const p_i = gh * sm + gw;
-                        coords_sl[p_i] = .{ .h = @intCast(gh), .w = @intCast(gw) };
-                        bounds_sl[p_i] = .{ .kv_start = 0, .kv_end = np };
+                for (0..cal_tiles) |ti| {
+                    const tile_base: u32 = @intCast(ti * tile_patches);
+                    for (0..sm) |gh| {
+                        for (0..sm) |gw| {
+                            const p_i = tile_base + @as(u32, @intCast(gh * sm + gw));
+                            coords_sl[p_i] = .{ .h = @intCast(gh), .w = @intCast(gw) };
+                            bounds_sl[p_i] = .{ .kv_start = tile_base, .kv_end = tile_base + tile_patches };
+                        }
                     }
                 }
                 const t0 = try vmstat.nowNs();
                 var f = try compute.beginFrame(5000);
                 errdefer f.abort();
-                _ = rt.encodeTowerForward(&f, blocks, merger.?, sm, sm, 1, false) catch return error.InvalidConfig;
+                _ = rt.encodeTowerForward(&f, blocks, merger.?, sm, sm, cal_tiles, false) catch return error.InvalidConfig;
                 const sig = try f.commit();
                 try compute.wait(sig, 5000);
                 const t1 = try vmstat.nowNs();
                 est_gpu_us = @max(1.0, @as(f64, @floatFromInt(t1 - t0)) / 1000.0);
             }
         }
-        const cal = try offload.calibrateAgainstGpuUs(chip, est_gpu_us, 1, 3, placement_policy);
+        var cal = try offload.calibrateAgainstGpuUs(chip, est_gpu_us, 1, 3, placement_policy);
+        if (vcfg.spatial_merge > 1) {
+            cal.selected = .gpu;
+        }
         rt.placement = cal.selected;
         rt.ane_calibration = cal;
         ane_offload_opt = offload;
@@ -17411,6 +17461,81 @@ test "M7.8 G22 GraphModel text-only zero-overhead fast path + multi-layer ViT/An
     const snap1 = try vmstat.Snapshot.capture();
     try std.testing.expect(d1 < bundle.cfg.vocab_size);
     try std.testing.expectEqual(@as(u64, 0), vmstat.Snapshot.swapoutDelta(snap0, snap1));
+
+    // 5. ANE vision-tower offload execution path (`spatial_merge = 1`, `in_frame -> predictZeroCopy -> out_frame`).
+    const lm_h = bundle.cfg.hidden_size;
+    const vis_sm1_bytes = try buildSynthVisionTowerAmfBytes(allocator, .{
+        .num_layers = 1,
+        .vis_hidden = 64,
+        .vis_intermediate = 128,
+        .lm_hidden = lm_h,
+        .merger_hidden = 128,
+        .patch_size = 16,
+        .t_patch = 2,
+        .spatial_merge = 1,
+        .q4_qkv = false,
+    });
+    defer allocator.free(vis_sm1_bytes);
+    const vis_sm1_path = try std.fs.path.joinZ(allocator, &.{ tmp_dir, "vision_sm1.amf" });
+    defer allocator.free(vis_sm1_path);
+    try writeBytesFile(vis_sm1_path, vis_sm1_bytes);
+
+    var vis_ane_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+        .vision_amf_path = vis_sm1_path,
+        .vision_max_patches = 16,
+    });
+    defer vis_ane_m.deinit(allocator);
+
+    const ane_w = try allocator.alloc(f16, @as(usize, 64) * lm_h);
+    defer allocator.free(ane_w);
+    for (ane_w, 0..) |*w, wi| {
+        const s: f32 = if ((wi & 1) == 0) 0.02 else -0.015;
+        w.* = @floatCast(s);
+    }
+    const spec_bytes = try metal.emitCoreMlLinearModel(allocator, .{
+        .op = .inner_product,
+        .batch_or_spatial = 16,
+        .input_name = "patch_tokens",
+        .output_name = "visual_embeds",
+        .layers = &.{.{ .c_in = 64, .c_out = lm_h, .weights_f16 = ane_w }},
+    });
+    defer allocator.free(spec_bytes);
+
+    var offload = try vision_mod.VisionAneOffload.initFromSpecBytes(
+        vis_ane_m.device,
+        spec_bytes,
+        16,
+        64,
+        lm_h,
+        false,
+        "patch_tokens",
+        "visual_embeds",
+    );
+    vis_ane_m.vision_state.ane_offload = offload;
+    const cal_ane = try offload.calibrateAgainstGpuUs(vis_ane_m.chip_profile, 500.0, 1, 3, .ane);
+    try std.testing.expectEqual(vision_mod.VisionPlacement.ane, cal_ane.selected);
+    vis_ane_m.vision_state.runtime.placement = .ane;
+    vis_ane_m.vision_state.runtime.ane_calibration = cal_ane;
+    vis_ane_m.vision_state.ane_calibration = cal_ane;
+
+    const clip_sm1 = try metal.VtClip.encodeTestClip(.hevc, 64, 64, 2, 30);
+    defer clip_sm1.close();
+    const dec_sm1 = try metal.VtDecodeSession.init(vis_ane_m.device, clip_sm1, .nv12);
+    defer dec_sm1.close();
+    const af0 = try dec_sm1.decodeFrame(clip_sm1, 0);
+    defer af0.close();
+    const af1 = try dec_sm1.decodeFrame(clip_sm1, 1);
+    defer af1.close();
+
+    const mm_ane = try vis_ane_m.prefillMultimodal(allocator, &prefix, &suffix, &.{ af0, af1 }, .{
+        .anyres_mode = .smart_resize,
+    });
+    try std.testing.expect(mm_ane.vision_tower_active);
+    try std.testing.expect(mm_ane.all_frames_zero_copy);
+    try std.testing.expectEqual(@as(u32, 16), mm_ane.vision_tokens);
+    try std.testing.expect(mm_ane.first_token < bundle.cfg.vocab_size);
 }
 
 test "M7.8 G18 GraphModel dense homogeneous QKV/GateUpSwiGLU/residual epilogue A/B parity" {

@@ -773,6 +773,7 @@ pub const SdkEngine = struct {
 
     // Preallocated 16 KiB-aligned `mlock`ed SDK workspace (0 steady-state heap allocs).
     sdk_arena: arena_mod.WiredArena,
+    sdk_buf: ?metal.Buffer = null,
     logits_f32: []f32,
     hidden_norm_f16: []f16,
     hidden_norm_f32: []f32,
@@ -785,7 +786,6 @@ pub const SdkEngine = struct {
     rerank_buf: []u8,
     embed_accum_f32: []f32,
     gpu_sampler: ?sampler_mod.GpuSampler = null,
-    gpu_sampler_disabled: bool = false,
     penalty_entries: [sampler_mod.MAX_PENALTY_ENTRIES]sampling_mod.TokenFreqEntry = undefined,
 
     history_len: u32 = 0,
@@ -851,33 +851,6 @@ pub const SdkEngine = struct {
         };
     }
 
-    fn ensureGpuSampler(self: *SdkEngine) ?*sampler_mod.GpuSampler {
-        if (self.gpu_sampler != null) return &self.gpu_sampler.?;
-        if (self.gpu_sampler_disabled or self.vocab_size == 0 or self.vocab_size > sampler_mod.MAX_VOCAB_SIZE) return null;
-        if (sampler_mod.GpuSampler.initStandalone(self.metalDevice(), self.metalLibrary(), .{
-            .max_vocab_size = self.vocab_size,
-            .max_batch_slots = 1,
-            .enable_bitmask = false,
-        })) |gs| {
-            var gs_mut = gs;
-            if (gs_mut.registerResident(self.gpuCompute().*)) {
-                self.gpu_sampler = gs_mut;
-                return &self.gpu_sampler.?;
-            } else |err| switch (err) {
-                else => {
-                    gs_mut.close();
-                    self.gpu_sampler_disabled = true;
-                    return null;
-                },
-            }
-        } else |err| switch (err) {
-            else => {
-                self.gpu_sampler_disabled = true;
-                return null;
-            },
-        }
-    }
-
     fn resetKv(self: *SdkEngine) void {
         switch (self.backend) {
             .qwen3 => |*m| m.resetKvCache(),
@@ -920,6 +893,13 @@ pub const SdkEngine = struct {
         if (self.gpu_sampler) |*gs| {
             gs.close();
             self.gpu_sampler = null;
+        }
+        if (self.sdk_buf) |sb| {
+            self.gpuCompute().removeResident(&.{sb}) catch |err| {
+                std.debug.panic("removeResident(sdk_buf) failed: {}", .{err});
+            };
+            sb.close();
+            self.sdk_buf = null;
         }
         if (self.owned_tokenizer) |t| {
             t.destroy(allocator);
@@ -1425,6 +1405,14 @@ fn computeSdkArenaBytes(vocab_size: u32, hidden_size: u32, max_seq_len: u32) err
     const v: usize = vocab_size;
     const h: usize = hidden_size;
     const seq: usize = max_seq_len;
+    const gs_bytes: usize = if (vocab_size > 0 and vocab_size <= sampler_mod.MAX_VOCAB_SIZE) blk: {
+        const gs_req = sampler_mod.GpuSamplerWorkspace.requiredBytes(.{
+            .max_vocab_size = vocab_size,
+            .max_batch_slots = 1,
+            .enable_bitmask = false,
+        }) catch return error.Overflow;
+        break :blk gs_req + 2048;
+    } else 0;
     const raw = v * @sizeOf(f32) + // logits_f32
         h * @sizeOf(f16) + // hidden_norm_f16
         h * @sizeOf(f32) + // hidden_norm_f32
@@ -1436,6 +1424,7 @@ fn computeSdkArenaBytes(vocab_size: u32, hidden_size: u32, max_seq_len: u32) err
         seq * @sizeOf(u32) + // prompt_ids_scratch
         RERANK_PROMPT_CAP + // rerank_buf
         h * @sizeOf(f32) + // embed_accum_f32
+        gs_bytes + // preallocated GpuSampler workspace
         2048; // 64-byte alignment paddingslack
     return page.alignUp(raw);
 }
@@ -1629,6 +1618,40 @@ pub export fn ami_sdk_engine_create(
     const rerank_buf = sdk_arena.allocAligned(RERANK_PROMPT_CAP, 64) catch |err| return mapAnyError(err);
     const embed_accum_f32 = allocArenaSlice(f32, &sdk_arena, hidden_size) catch |err| return mapAnyError(err);
 
+    const b_dev: metal.Device = switch (backend) {
+        .qwen3 => |*m| m.device,
+        .graph => |*m| m.device,
+    };
+    const b_lib: metal.Library = switch (backend) {
+        .qwen3 => |*m| m.library,
+        .graph => |*m| m.library,
+    };
+    const b_comp: *metal.Compute = switch (backend) {
+        .qwen3 => |*m| &m.compute,
+        .graph => |*m| &m.compute,
+    };
+
+    var sdk_buf_opt: ?metal.Buffer = null;
+    errdefer if (sdk_buf_opt) |sb| {
+        b_comp.removeResident(&.{sb}) catch |err| {
+            std.debug.panic("removeResident(sdk_buf) failed: {}", .{err});
+        };
+        sb.close();
+    };
+    var gpu_sampler_opt: ?sampler_mod.GpuSampler = null;
+    errdefer if (gpu_sampler_opt) |*gs| gs.close();
+
+    if (vocab_size > 0 and vocab_size <= sampler_mod.MAX_VOCAB_SIZE) {
+        const sb = metal.Buffer.wrap(b_dev, sdk_arena.bytes()) catch |err| return mapAnyError(err);
+        sdk_buf_opt = sb;
+        b_comp.makeResident(&.{sb}) catch |err| return mapAnyError(err);
+        gpu_sampler_opt = sampler_mod.GpuSampler.initInArena(b_dev, b_lib, &sdk_arena, sb, .{
+            .max_vocab_size = vocab_size,
+            .max_batch_slots = 1,
+            .enable_bitmask = false,
+        }) catch |err| return mapAnyError(err);
+    }
+
     const eng = gpa.create(SdkEngine) catch return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "SdkEngine alloc failed");
     eng.* = .{
         .backend = backend,
@@ -1643,6 +1666,7 @@ pub export fn ami_sdk_engine_create(
         .live_reclaimable_bytes = live_reclaimable,
         .live_budget_bytes = sdk_live_plan.live_budget_bytes,
         .sdk_arena = sdk_arena,
+        .sdk_buf = sdk_buf_opt,
         .logits_f32 = logits_f32,
         .hidden_norm_f16 = hidden_norm_f16,
         .hidden_norm_f32 = hidden_norm_f32,
@@ -1654,6 +1678,7 @@ pub export fn ami_sdk_engine_create(
         .prompt_ids_scratch = prompt_ids_scratch,
         .rerank_buf = rerank_buf,
         .embed_accum_f32 = embed_accum_f32,
+        .gpu_sampler = gpu_sampler_opt,
     };
 
     out.* = eng;
@@ -1892,6 +1917,23 @@ pub export fn ami_sdk_step_decode(
     return AMI_SDK_OK;
 }
 
+fn applyTokenPenalty(
+    val_in: f32,
+    count: u32,
+    params: *const GenParams,
+    has_rep: bool,
+    has_freq: bool,
+    has_pres: bool,
+) f32 {
+    var val = val_in;
+    if (has_rep) {
+        if (val > 0.0) val /= params.repetition_penalty else val *= params.repetition_penalty;
+    }
+    if (has_freq) val -= params.frequency_penalty * @as(f32, @floatFromInt(count));
+    if (has_pres) val -= params.presence_penalty;
+    return val;
+}
+
 fn sampleNextToken(
     eng: *SdkEngine,
     greedy_argmax: u32,
@@ -1930,7 +1972,7 @@ fn sampleNextToken(
     }
 
     if (gpu_penalties_ok) {
-        if (eng.ensureGpuSampler()) |gs| {
+        if (eng.gpu_sampler) |*gs| {
             const eff_temp: f32 = if (params.temperature > 0.0) params.temperature else 0.0;
             const gpu_params: sampling_mod.SamplingParams = .{
                 .temperature = if (params.top_k == 1) 0.0 else eff_temp,
@@ -1961,18 +2003,11 @@ fn sampleNextToken(
     const probs = eng.sample_probs[0..v];
     for (0..v) |i| probs[i] = @floatCast(logits_f16[i]);
 
-    for (eng.penalty_entries[0..penalty_len]) |entry| {
-        const tid = entry.token_id;
-        const c = entry.count;
-        var val = probs[tid];
-        if (has_rep) {
-            if (val > 0.0) val /= params.repetition_penalty else val *= params.repetition_penalty;
+    if (gpu_penalties_ok) {
+        for (eng.penalty_entries[0..penalty_len]) |entry| {
+            probs[entry.token_id] = applyTokenPenalty(probs[entry.token_id], entry.count, params, has_rep, has_freq, has_pres);
         }
-        if (has_freq) val -= params.frequency_penalty * @as(f32, @floatFromInt(c));
-        if (has_pres) val -= params.presence_penalty;
-        probs[tid] = val;
-    }
-    if (!gpu_penalties_ok and any_penalty and eng.history_len > 0) {
+    } else if (any_penalty and eng.history_len > 0) {
         const hist = eng.history_ids[0..eng.history_len];
         for (hist) |tid| {
             if (tid < v) eng.token_counts[tid] += 1;
@@ -1982,13 +2017,7 @@ fn sampleNextToken(
             const c = eng.token_counts[tid];
             if (c == 0) continue;
             eng.token_counts[tid] = 0;
-            var val = probs[tid];
-            if (has_rep) {
-                if (val > 0.0) val /= params.repetition_penalty else val *= params.repetition_penalty;
-            }
-            if (has_freq) val -= params.frequency_penalty * @as(f32, @floatFromInt(c));
-            if (has_pres) val -= params.presence_penalty;
-            probs[tid] = val;
+            probs[tid] = applyTokenPenalty(probs[tid], c, params, has_rep, has_freq, has_pres);
         }
     }
 
@@ -4231,10 +4260,121 @@ test "sdk.c_api: end-to-end engine create, R9 budget guard, views, embed, rerank
         var sf_eng: ?*SdkEngine = null;
         try std.testing.expectEqual(AMI_SDK_OK, ami_sdk_engine_create(&sf_opts, &sf_eng));
         defer ami_sdk_engine_destroy(sf_eng);
+        try std.testing.expect(sf_eng.?.gpu_sampler != null);
 
         var sf_tok: ?*SdkTokenizer = null;
         try std.testing.expectEqual(AMI_SDK_OK, ami_sdk_tokenizer_from_file(&sf_path_buf, &sf_tok));
         defer ami_sdk_tokenizer_destroy(sf_tok);
         try std.testing.expectEqual(@as(u32, 258), ami_sdk_tokenizer_vocab_size(sf_tok));
     }
+}
+
+test "sdk.c_api: preallocated gpu_sampler at startup and single penalty on >MAX_PENALTY_ENTRIES fallback" {
+    const vocab_sz: u32 = sampler_mod.MAX_PENALTY_ENTRIES + 64; // 1088 > MAX_PENALTY_ENTRIES (1024)
+    const max_seq: u32 = vocab_sz + 32;
+    const qcfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q4,
+        .vocab_size = vocab_sz,
+        .hidden_size = 128,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .tie_word_embeddings = false,
+    };
+    const amf_bytes = try qwen3.buildSyntheticAmfImageWithSpec(std.testing.allocator, qcfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .f16,
+        .norm_dtype = .f16,
+    }, 91);
+    defer std.testing.allocator.free(amf_bytes);
+
+    var cfg_buf: [512]u8 = undefined;
+    const cfg_json = try std.fmt.bufPrint(&cfg_buf,
+        \\{{
+        \\  "model_type": "qwen3",
+        \\  "architectures": ["Qwen3ForCausalLM"],
+        \\  "vocab_size": {d},
+        \\  "hidden_size": 128,
+        \\  "num_hidden_layers": 1,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 64,
+        \\  "intermediate_size": 256,
+        \\  "rms_norm_eps": 1e-6,
+        \\  "rope_theta": 1000000.0,
+        \\  "max_position_embeddings": 2048,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {{"bits": 4, "group_size": 64}}
+        \\}}
+    , .{vocab_sz});
+
+    const tmp_root_z = std.c.getenv("TMPDIR") orelse "/tmp";
+    const tmp_root = std.mem.span(tmp_root_z);
+    const pid: u32 = @bitCast(std.c.getpid());
+    var amf_path_buf: [512:0]u8 = undefined;
+    var cfg_path_buf: [512:0]u8 = undefined;
+    const amf_slice = try std.fmt.bufPrint(&amf_path_buf, "{s}/ami_sdk_pen_{d}.amf", .{ std.mem.trimEnd(u8, tmp_root, "/"), pid });
+    amf_path_buf[amf_slice.len] = 0;
+    const cfg_slice = try std.fmt.bufPrint(&cfg_path_buf, "{s}/ami_sdk_pen_{d}_config.json", .{ std.mem.trimEnd(u8, tmp_root, "/"), pid });
+    cfg_path_buf[cfg_slice.len] = 0;
+
+    for ([_]struct { path: [:0]const u8, data: []const u8 }{
+        .{ .path = amf_path_buf[0..amf_slice.len :0], .data = amf_bytes },
+        .{ .path = cfg_path_buf[0..cfg_slice.len :0], .data = cfg_json },
+    }) |item| {
+        const fd = std.c.open(item.path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        var w: usize = 0;
+        while (w < item.data.len) {
+            const rc = std.c.write(fd, item.data.ptr + w, item.data.len - w);
+            try std.testing.expect(rc > 0);
+            w += @intCast(rc);
+        }
+    }
+    defer _ = std.c.unlink(&amf_path_buf);
+    defer _ = std.c.unlink(&cfg_path_buf);
+
+    var opts: EngineOptions = undefined;
+    ami_sdk_engine_options_init(&opts);
+    opts.amf_path = &amf_path_buf;
+    opts.config_json_path = &cfg_path_buf;
+    opts.max_seq_len = max_seq;
+    opts.startup_canary = 0;
+
+    var eng_opt: ?*SdkEngine = null;
+    try std.testing.expectEqual(AMI_SDK_OK, ami_sdk_engine_create(&opts, &eng_opt));
+    defer ami_sdk_engine_destroy(eng_opt);
+    const eng = eng_opt.?;
+
+    // Defect 2 guard: GPU sampler is preallocated once at engine creation.
+    try std.testing.expect(eng.gpu_sampler != null);
+    try std.testing.expect(eng.sdk_buf != null);
+
+    // Populate logits (`logits[0] = 10.0`, `logits[tail_tok] = 7.0`, others `-100.0`)
+    // and `> MAX_PENALTY_ENTRIES` distinct tokens in history (`0..1049`).
+    const qm = &eng.backend.qwen3;
+    const logits_mut: []f16 = @constCast(qm.readLastLogitsF16());
+    for (logits_mut) |*l| l.* = @floatCast(-100.0);
+    const tail_tok: u32 = sampler_mod.MAX_PENALTY_ENTRIES + 8; // 1032 (> 1024)
+    logits_mut[0] = @floatCast(10.0);
+    logits_mut[tail_tok] = @floatCast(7.0);
+
+    const n_hist: usize = sampler_mod.MAX_PENALTY_ENTRIES + 20; // 1044 distinct tokens
+    for (0..n_hist) |i| eng.history_ids[i] = @intCast(i);
+    eng.history_len = @intCast(n_hist);
+
+    var gparams: GenParams = undefined;
+    ami_sdk_gen_params_init(&gparams);
+    gparams.temperature = 0.0;
+    gparams.presence_penalty = 4.0;
+    var req_rng = rng_mod.RequestRng.initDeterministic(123);
+
+    // Single penalty application: 10.0 - 4.0 = 6.0 > 7.0 - 4.0 = 3.0 -> must pick token 0.
+    // (A double-penalty bug on [0..1024) would yield 10.0 - 8.0 = 2.0 < 3.0 and wrongly pick `tail_tok`.)
+    const picked = sampleNextToken(eng, 0, &gparams, &req_rng);
+    try std.testing.expectEqual(@as(u32, 0), picked);
 }
