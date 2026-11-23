@@ -15,11 +15,19 @@
 #import <Metal/Metal.h>
 #import <VideoToolbox/VideoToolbox.h>
 
+#include <dlfcn.h>
 #include <limits.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach/processor_info.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <termios.h>
+#include <unistd.h>
 
 #include "apple_bridge.h"
 
@@ -3151,4 +3159,468 @@ ami_status ami_vt_decode_clip_frame(ami_vt_decode_session *session,
         out_frame);
     CVPixelBufferRelease(out.pixel_buffer);
     return st;
+}
+
+
+// ============================================================================
+// M7.5 C19: Rootless Apple Silicon Telemetry & Terminal Raw-Mode Helpers
+// ============================================================================
+
+_Static_assert(sizeof(struct termios) <= sizeof(((ami_tty_raw_guard *)0)->opaque),
+               "ami_tty_raw_guard.opaque must fit struct termios");
+
+typedef mach_port_t ami_io_object_t;
+typedef ami_io_object_t ami_io_iterator_t;
+typedef ami_io_object_t ami_io_registry_entry_t;
+
+typedef CFMutableDictionaryRef (*ami_iokit_service_matching_fn)(const char *name);
+typedef kern_return_t (*ami_iokit_get_matching_services_fn)(
+    mach_port_t main_port,
+    CFDictionaryRef matching,
+    ami_io_iterator_t *existing);
+typedef ami_io_object_t (*ami_iokit_iterator_next_fn)(ami_io_iterator_t iterator);
+typedef kern_return_t (*ami_iokit_entry_create_props_fn)(
+    ami_io_registry_entry_t entry,
+    CFMutableDictionaryRef *properties,
+    CFAllocatorRef allocator,
+    uint32_t options);
+typedef kern_return_t (*ami_iokit_object_release_fn)(ami_io_object_t object);
+typedef ami_io_registry_entry_t (*ami_iokit_entry_from_path_fn)(
+    mach_port_t main_port,
+    const char *path);
+
+typedef struct ami_iokit_api {
+    bool ready;
+    ami_iokit_service_matching_fn service_matching;
+    ami_iokit_get_matching_services_fn get_matching_services;
+    ami_iokit_iterator_next_fn iterator_next;
+    ami_iokit_entry_create_props_fn entry_create_props;
+    ami_iokit_object_release_fn object_release;
+    ami_iokit_entry_from_path_fn entry_from_path;
+} ami_iokit_api;
+
+static ami_iokit_api g_iokit = { 0 };
+static uint32_t g_cpu_cluster_kind[AMI_MAX_CPU_CORES];
+
+static const ami_iokit_api *ami_get_iokit(void) {
+    static dispatch_once_t once_tok;
+    dispatch_once(&once_tok, ^{
+        void *handle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",
+                              RTLD_LAZY | RTLD_LOCAL);
+        if (handle == NULL) {
+            return;
+        }
+        g_iokit.service_matching =
+            (ami_iokit_service_matching_fn)dlsym(handle, "IOServiceMatching");
+        g_iokit.get_matching_services =
+            (ami_iokit_get_matching_services_fn)dlsym(handle, "IOServiceGetMatchingServices");
+        g_iokit.iterator_next =
+            (ami_iokit_iterator_next_fn)dlsym(handle, "IOIteratorNext");
+        g_iokit.entry_create_props =
+            (ami_iokit_entry_create_props_fn)dlsym(handle, "IORegistryEntryCreateCFProperties");
+        g_iokit.object_release =
+            (ami_iokit_object_release_fn)dlsym(handle, "IOObjectRelease");
+        g_iokit.entry_from_path =
+            (ami_iokit_entry_from_path_fn)dlsym(handle, "IORegistryEntryFromPath");
+
+        if (g_iokit.service_matching != NULL &&
+            g_iokit.get_matching_services != NULL &&
+            g_iokit.iterator_next != NULL &&
+            g_iokit.entry_create_props != NULL &&
+            g_iokit.object_release != NULL) {
+            g_iokit.ready = true;
+        }
+    });
+    return &g_iokit;
+}
+
+static void ami_init_cpu_cluster_topology(void) {
+    static dispatch_once_t topo_once;
+    dispatch_once(&topo_once, ^{
+        for (uint32_t i = 0; i < AMI_MAX_CPU_CORES; i++) {
+            g_cpu_cluster_kind[i] = AMI_CPU_CLUSTER_UNKNOWN;
+        }
+        const ami_iokit_api *io = ami_get_iokit();
+        if (!io->ready || io->entry_from_path == NULL) {
+            return;
+        }
+        for (uint32_t i = 0; i < AMI_MAX_CPU_CORES; i++) {
+            char path[64];
+            int n = snprintf(path, sizeof(path), "IODeviceTree:/cpus/cpu%u", i);
+            if (n <= 0 || (size_t)n >= sizeof(path)) {
+                break;
+            }
+            ami_io_registry_entry_t entry = io->entry_from_path(MACH_PORT_NULL, path);
+            if (entry == MACH_PORT_NULL) {
+                break;
+            }
+            CFMutableDictionaryRef props = NULL;
+            if (io->entry_create_props(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS &&
+                props != NULL) {
+                CFTypeRef val = CFDictionaryGetValue(props, CFSTR("cluster-type"));
+                if (val != NULL) {
+                    CFTypeID tid = CFGetTypeID(val);
+                    if (tid == CFDataGetTypeID()) {
+                        CFDataRef data = (CFDataRef)val;
+                        CFIndex len = CFDataGetLength(data);
+                        const UInt8 *ptr = CFDataGetBytePtr(data);
+                        if (len >= 1 && ptr != NULL) {
+                            if (ptr[0] == 'E' || ptr[0] == 'e') {
+                                g_cpu_cluster_kind[i] = AMI_CPU_CLUSTER_E;
+                            } else if (ptr[0] == 'P' || ptr[0] == 'p') {
+                                g_cpu_cluster_kind[i] = AMI_CPU_CLUSTER_P;
+                            }
+                        }
+                    } else if (tid == CFStringGetTypeID()) {
+                        char cbuf[8] = { 0 };
+                        if (CFStringGetCString((CFStringRef)val, cbuf, sizeof(cbuf),
+                                               kCFStringEncodingUTF8)) {
+                            if (cbuf[0] == 'E' || cbuf[0] == 'e') {
+                                g_cpu_cluster_kind[i] = AMI_CPU_CLUSTER_E;
+                            } else if (cbuf[0] == 'P' || cbuf[0] == 'p') {
+                                g_cpu_cluster_kind[i] = AMI_CPU_CLUSTER_P;
+                            }
+                        }
+                    }
+                }
+                CFRelease(props);
+            }
+            io->object_release(entry);
+        }
+    });
+}
+
+static bool ami_cf_dict_read_u64(CFDictionaryRef dict, CFStringRef key, uint64_t *out_val) {
+    if (dict == NULL || key == NULL || out_val == NULL) {
+        return false;
+    }
+    CFTypeRef raw = CFDictionaryGetValue(dict, key);
+    if (raw == NULL || CFGetTypeID(raw) != CFNumberGetTypeID()) {
+        return false;
+    }
+    int64_t signed_val = 0;
+    if (!CFNumberGetValue((CFNumberRef)raw, kCFNumberSInt64Type, &signed_val)) {
+        double dbl_val = 0.0;
+        if (!CFNumberGetValue((CFNumberRef)raw, kCFNumberDoubleType, &dbl_val)) {
+            return false;
+        }
+        if (dbl_val < 0.0) {
+            *out_val = 0;
+        } else {
+            *out_val = (uint64_t)dbl_val;
+        }
+        return true;
+    }
+    *out_val = (signed_val < 0) ? 0u : (uint64_t)signed_val;
+    return true;
+}
+
+static void ami_cf_dict_read_cstring(CFDictionaryRef dict, CFStringRef key,
+                                     char *out_buf, size_t cap) {
+    if (dict == NULL || key == NULL || out_buf == NULL || cap == 0) {
+        return;
+    }
+    CFTypeRef raw = CFDictionaryGetValue(dict, key);
+    if (raw == NULL || CFGetTypeID(raw) != CFStringGetTypeID()) {
+        return;
+    }
+    if (!CFStringGetCString((CFStringRef)raw, out_buf, (CFIndex)cap, kCFStringEncodingUTF8)) {
+        out_buf[0] = '\0';
+    }
+}
+
+ami_status ami_telemetry_sample_cpu(ami_telemetry_cpu_sample *out_sample) {
+    if (out_sample == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_sample, 0, sizeof(*out_sample));
+    ami_init_cpu_cluster_topology();
+
+    mach_port_t host = mach_host_self();
+    natural_t cpu_count = 0;
+    processor_info_array_t info_array = NULL;
+    mach_msg_type_number_t info_count = 0;
+
+    kern_return_t kr = host_processor_info(
+        host,
+        PROCESSOR_CPU_LOAD_INFO,
+        &cpu_count,
+        &info_array,
+        &info_count);
+    mach_port_deallocate(mach_task_self(), host);
+
+    if (kr != KERN_SUCCESS || info_array == NULL) {
+        return AMI_ERR_TELEMETRY;
+    }
+
+    uint32_t max_from_words = (uint32_t)(info_count / CPU_STATE_MAX);
+    uint32_t count = cpu_count;
+    if (count > max_from_words) {
+        count = max_from_words;
+    }
+    if (count > AMI_MAX_CPU_CORES) {
+        count = AMI_MAX_CPU_CORES;
+    }
+
+    out_sample->core_count = count;
+    for (uint32_t i = 0; i < count; i++) {
+        const integer_t *base = &info_array[(size_t)i * (size_t)CPU_STATE_MAX];
+        out_sample->cores[i].user = (uint32_t)base[CPU_STATE_USER];
+        out_sample->cores[i].system = (uint32_t)base[CPU_STATE_SYSTEM];
+        out_sample->cores[i].idle = (uint32_t)base[CPU_STATE_IDLE];
+        out_sample->cores[i].nice = (uint32_t)base[CPU_STATE_NICE];
+        out_sample->cores[i].cluster_kind = g_cpu_cluster_kind[i];
+    }
+
+    vm_deallocate(
+        mach_task_self(),
+        (vm_address_t)info_array,
+        (vm_size_t)info_count * sizeof(integer_t));
+
+    double avg[3] = { 0.0, 0.0, 0.0 };
+    if (getloadavg(avg, 3) == 3) {
+        out_sample->loadavg_1m = avg[0];
+        out_sample->loadavg_5m = avg[1];
+        out_sample->loadavg_15m = avg[2];
+    }
+
+    return AMI_OK;
+}
+
+ami_status ami_telemetry_sample_gpu(ami_telemetry_gpu_sample *out_sample) {
+    if (out_sample == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_sample, 0, sizeof(*out_sample));
+
+    @autoreleasepool {
+        NSProcessInfoThermalState ts = [[NSProcessInfo processInfo] thermalState];
+        switch (ts) {
+            case NSProcessInfoThermalStateNominal:
+                out_sample->thermal_state = AMI_THERMAL_NOMINAL;
+                break;
+            case NSProcessInfoThermalStateFair:
+                out_sample->thermal_state = AMI_THERMAL_FAIR;
+                break;
+            case NSProcessInfoThermalStateSerious:
+                out_sample->thermal_state = AMI_THERMAL_SERIOUS;
+                break;
+            case NSProcessInfoThermalStateCritical:
+                out_sample->thermal_state = AMI_THERMAL_CRITICAL;
+                break;
+            default:
+                out_sample->thermal_state = AMI_THERMAL_NOMINAL;
+                break;
+        }
+
+        const ami_iokit_api *io = ami_get_iokit();
+        if (!io->ready) {
+            return AMI_OK;
+        }
+
+        CFMutableDictionaryRef matching = io->service_matching("IOAccelerator");
+        if (matching == NULL) {
+            return AMI_OK;
+        }
+
+        ami_io_iterator_t iter = MACH_PORT_NULL;
+        kern_return_t kr = io->get_matching_services(MACH_PORT_NULL, matching, &iter);
+        if (kr != KERN_SUCCESS || iter == MACH_PORT_NULL) {
+            return AMI_OK;
+        }
+
+        ami_io_object_t service = MACH_PORT_NULL;
+        while ((service = io->iterator_next(iter)) != MACH_PORT_NULL) {
+            CFMutableDictionaryRef props = NULL;
+            if (io->entry_create_props(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS &&
+                props != NULL) {
+                CFTypeRef perf_raw = CFDictionaryGetValue(props, CFSTR("PerformanceStatistics"));
+                if (perf_raw != NULL && CFGetTypeID(perf_raw) == CFDictionaryGetTypeID()) {
+                    CFDictionaryRef perf = (CFDictionaryRef)perf_raw;
+                    uint64_t v = 0;
+
+                    out_sample->available = 1u;
+                    if (out_sample->accelerator_class[0] == '\0') {
+                        ami_cf_dict_read_cstring(props, CFSTR("IOClass"),
+                                                 out_sample->accelerator_class,
+                                                 sizeof(out_sample->accelerator_class));
+                        if (out_sample->accelerator_class[0] == '\0') {
+                            ami_cf_dict_read_cstring(props, CFSTR("MetalPluginClassName"),
+                                                     out_sample->accelerator_class,
+                                                     sizeof(out_sample->accelerator_class));
+                        }
+                    }
+
+                    if (ami_cf_dict_read_u64(perf, CFSTR("Device Utilization %"), &v)) {
+                        uint32_t pct = (v > 100u) ? 100u : (uint32_t)v;
+                        if (pct > out_sample->device_utilization_pct) {
+                            out_sample->device_utilization_pct = pct;
+                        }
+                    }
+                    if (ami_cf_dict_read_u64(perf, CFSTR("Renderer Utilization %"), &v)) {
+                        uint32_t pct = (v > 100u) ? 100u : (uint32_t)v;
+                        if (pct > out_sample->renderer_utilization_pct) {
+                            out_sample->renderer_utilization_pct = pct;
+                        }
+                    }
+                    if (ami_cf_dict_read_u64(perf, CFSTR("Tiler Utilization %"), &v)) {
+                        uint32_t pct = (v > 100u) ? 100u : (uint32_t)v;
+                        if (pct > out_sample->tiler_utilization_pct) {
+                            out_sample->tiler_utilization_pct = pct;
+                        }
+                    }
+                    if (ami_cf_dict_read_u64(perf, CFSTR("In use system memory"), &v)) {
+                        out_sample->in_use_system_memory += v;
+                    }
+                    if (ami_cf_dict_read_u64(perf, CFSTR("Alloc system memory"), &v)) {
+                        out_sample->alloc_system_memory += v;
+                    }
+                    if (ami_cf_dict_read_u64(perf, CFSTR("In use system memory (driver)"), &v)) {
+                        out_sample->driver_in_use_memory += v;
+                    }
+                    if (ami_cf_dict_read_u64(perf, CFSTR("TiledSceneBytes"), &v)) {
+                        out_sample->tiled_scene_bytes += v;
+                    }
+                    if (ami_cf_dict_read_u64(perf, CFSTR("recoveryCount"), &v)) {
+                        out_sample->recovery_count += (uint32_t)v;
+                    }
+                }
+                CFRelease(props);
+            }
+            io->object_release(service);
+        }
+        io->object_release(iter);
+    }
+
+    return AMI_OK;
+}
+
+ami_status ami_telemetry_sample_nvme(ami_telemetry_nvme_sample *out_sample) {
+    if (out_sample == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_sample, 0, sizeof(*out_sample));
+
+    @autoreleasepool {
+        const ami_iokit_api *io = ami_get_iokit();
+        if (!io->ready) {
+            return AMI_OK;
+        }
+
+        CFMutableDictionaryRef matching = io->service_matching("IOBlockStorageDriver");
+        if (matching == NULL) {
+            return AMI_OK;
+        }
+
+        ami_io_iterator_t iter = MACH_PORT_NULL;
+        kern_return_t kr = io->get_matching_services(MACH_PORT_NULL, matching, &iter);
+        if (kr != KERN_SUCCESS || iter == MACH_PORT_NULL) {
+            return AMI_OK;
+        }
+
+        ami_io_object_t service = MACH_PORT_NULL;
+        while ((service = io->iterator_next(iter)) != MACH_PORT_NULL) {
+            CFMutableDictionaryRef props = NULL;
+            if (io->entry_create_props(service, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS &&
+                props != NULL) {
+                CFTypeRef stats_raw = CFDictionaryGetValue(props, CFSTR("Statistics"));
+                if (stats_raw != NULL && CFGetTypeID(stats_raw) == CFDictionaryGetTypeID()) {
+                    CFDictionaryRef stats = (CFDictionaryRef)stats_raw;
+                    uint64_t v = 0;
+                    out_sample->available = 1u;
+                    out_sample->driver_count += 1u;
+
+                    if (ami_cf_dict_read_u64(stats, CFSTR("Bytes (Read)"), &v)) {
+                        out_sample->bytes_read += v;
+                    }
+                    if (ami_cf_dict_read_u64(stats, CFSTR("Bytes (Write)"), &v)) {
+                        out_sample->bytes_written += v;
+                    }
+                    if (ami_cf_dict_read_u64(stats, CFSTR("Operations (Read)"), &v)) {
+                        out_sample->ops_read += v;
+                    }
+                    if (ami_cf_dict_read_u64(stats, CFSTR("Operations (Write)"), &v)) {
+                        out_sample->ops_written += v;
+                    }
+                    if (ami_cf_dict_read_u64(stats, CFSTR("Total Time (Read)"), &v)) {
+                        out_sample->read_time_ns += v;
+                    }
+                    if (ami_cf_dict_read_u64(stats, CFSTR("Total Time (Write)"), &v)) {
+                        out_sample->write_time_ns += v;
+                    }
+                }
+                CFRelease(props);
+            }
+            io->object_release(service);
+        }
+        io->object_release(iter);
+    }
+
+    return AMI_OK;
+}
+
+uint32_t ami_tty_isatty(int32_t fd) {
+    if (fd < 0) {
+        return 0u;
+    }
+    return isatty(fd) != 0 ? 1u : 0u;
+}
+
+ami_status ami_tty_get_winsize(int32_t fd, uint16_t *out_cols, uint16_t *out_rows) {
+    if (fd < 0 || out_cols == NULL || out_rows == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    *out_cols = 0;
+    *out_rows = 0;
+    struct winsize ws;
+    memset(&ws, 0, sizeof(ws));
+    if (ioctl(fd, TIOCGWINSZ, &ws) != 0 || ws.ws_col == 0 || ws.ws_row == 0) {
+        return AMI_ERR_TTY;
+    }
+    *out_cols = ws.ws_col;
+    *out_rows = ws.ws_row;
+    return AMI_OK;
+}
+
+ami_status ami_tty_enter_raw(int32_t fd, ami_tty_raw_guard *out_guard) {
+    if (fd < 0 || out_guard == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_guard, 0, sizeof(*out_guard));
+    struct termios orig;
+    if (tcgetattr(fd, &orig) != 0) {
+        return AMI_ERR_TTY;
+    }
+    memcpy(out_guard->opaque, &orig, sizeof(orig));
+    out_guard->fd = fd;
+
+    struct termios raw = orig;
+    raw.c_iflag &= ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(tcflag_t)(OPOST);
+    raw.c_cflag |= (tcflag_t)(CS8);
+    raw.c_lflag &= ~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(fd, TCSAFLUSH, &raw) != 0) {
+        return AMI_ERR_TTY;
+    }
+    out_guard->active = 1u;
+    return AMI_OK;
+}
+
+ami_status ami_tty_leave_raw(ami_tty_raw_guard *guard) {
+    if (guard == NULL) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    if (!guard->active) {
+        return AMI_OK;
+    }
+    struct termios orig;
+    memcpy(&orig, guard->opaque, sizeof(orig));
+    guard->active = 0u;
+    if (tcsetattr(guard->fd, TCSAFLUSH, &orig) != 0) {
+        return AMI_ERR_TTY;
+    }
+    return AMI_OK;
 }

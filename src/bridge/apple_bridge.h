@@ -25,6 +25,7 @@ extern "C" {
 #define AMI_UNIFORM_SLOTS_PER_FRAME 2048u
 #define AMI_ANE_MAX_DIMS 5u
 #define AMI_ANE_MAX_BINDINGS 16u
+#define AMI_MAX_CPU_CORES 128u
 
 typedef int32_t ami_status;
 
@@ -42,6 +43,21 @@ enum {
     AMI_ERR_TILE = 10,
     AMI_ERR_ANE = 11,
     AMI_ERR_VISION = 12,
+    AMI_ERR_TELEMETRY = 13,
+    AMI_ERR_TTY = 14,
+};
+
+enum {
+    AMI_THERMAL_NOMINAL = 0,
+    AMI_THERMAL_FAIR = 1,
+    AMI_THERMAL_SERIOUS = 2,
+    AMI_THERMAL_CRITICAL = 3,
+};
+
+enum {
+    AMI_CPU_CLUSTER_UNKNOWN = 0,
+    AMI_CPU_CLUSTER_E = 1,
+    AMI_CPU_CLUSTER_P = 2,
 };
 
 enum {
@@ -595,6 +611,83 @@ ami_status ami_vt_decode_session_query(const ami_vt_decode_session *session,
 ami_status ami_vt_decode_clip_frame(ami_vt_decode_session *session,
                                     const ami_vt_clip *clip, uint32_t frame_index,
                                     ami_vision_frame **out_frame);
+
+/* --------------------------------------------------------------------------
+ * M7.5 C19: Rootless Apple Silicon Telemetry & Terminal Raw-Mode Helpers
+ * -------------------------------------------------------------------------- */
+
+typedef struct ami_cpu_core_ticks {
+    uint64_t user;
+    uint64_t system;
+    uint64_t idle;
+    uint64_t nice;
+    uint32_t cluster_kind; /* AMI_CPU_CLUSTER_UNKNOWN / E / P from IODeviceTree */
+    uint32_t reserved;
+} ami_cpu_core_ticks;
+
+typedef struct ami_telemetry_cpu_sample {
+    uint32_t core_count;
+    uint32_t reserved;
+    double loadavg_1m;
+    double loadavg_5m;
+    double loadavg_15m;
+    ami_cpu_core_ticks cores[AMI_MAX_CPU_CORES];
+} ami_telemetry_cpu_sample;
+
+typedef struct ami_telemetry_gpu_sample {
+    uint32_t available;                /* 1 if IOAccelerator PerformanceStatistics read */
+    uint32_t device_utilization_pct;   /* 0..100 ("Device Utilization %") */
+    uint32_t renderer_utilization_pct; /* 0..100 ("Renderer Utilization %") */
+    uint32_t tiler_utilization_pct;    /* 0..100 ("Tiler Utilization %") */
+    uint32_t thermal_state;            /* AMI_THERMAL_NOMINAL..AMI_THERMAL_CRITICAL */
+    uint32_t recovery_count;           /* "recoveryCount" */
+    uint64_t in_use_system_memory;     /* bytes ("In use system memory") */
+    uint64_t alloc_system_memory;      /* bytes ("Alloc system memory") */
+    uint64_t driver_in_use_memory;     /* bytes ("In use system memory (driver)") */
+    uint64_t tiled_scene_bytes;        /* bytes ("TiledSceneBytes") */
+    char accelerator_class[64];        /* e.g. "AGXAcceleratorG16G" */
+} ami_telemetry_gpu_sample;
+
+typedef struct ami_telemetry_nvme_sample {
+    uint32_t available;     /* 1 if >= 1 IOBlockStorageDriver Statistics read */
+    uint32_t driver_count;  /* number of IOBlockStorageDriver services sampled */
+    uint64_t bytes_read;    /* cumulative "Bytes (Read)" */
+    uint64_t bytes_written; /* cumulative "Bytes (Write)" */
+    uint64_t ops_read;      /* cumulative "Operations (Read)" */
+    uint64_t ops_written;   /* cumulative "Operations (Write)" */
+    uint64_t read_time_ns;  /* cumulative "Total Time (Read)" */
+    uint64_t write_time_ns; /* cumulative "Total Time (Write)" */
+} ami_telemetry_nvme_sample;
+
+typedef struct ami_tty_raw_guard {
+    uint64_t opaque[10]; /* holds struct termios on arm64-macos */
+    int32_t fd;
+    uint32_t active;
+} ami_tty_raw_guard;
+
+/*
+ * Samples per-core Mach PROCESSOR_CPU_LOAD_INFO ticks (properly vm_deallocated
+ * and mach_port_deallocated in C) plus 1/5/15m host load averages.
+ */
+ami_status ami_telemetry_sample_cpu(ami_telemetry_cpu_sample *out_sample);
+
+/*
+ * Samples rootless Apple Silicon GPU telemetry from IOKit IOAccelerator
+ * ("PerformanceStatistics") and NSProcessInfo.processInfo.thermalState (`0` sudo).
+ */
+ami_status ami_telemetry_sample_gpu(ami_telemetry_gpu_sample *out_sample);
+
+/*
+ * Samples rootless cumulative NVMe/block storage read/write bytes and IOPS
+ * across IOKit IOBlockStorageDriver ("Statistics") services (`0` sudo).
+ */
+ami_status ami_telemetry_sample_nvme(ami_telemetry_nvme_sample *out_sample);
+
+/* Terminal raw-mode & window-size helpers (`termios` + `TIOCGWINSZ`). */
+uint32_t ami_tty_isatty(int32_t fd);
+ami_status ami_tty_get_winsize(int32_t fd, uint16_t *out_cols, uint16_t *out_rows);
+ami_status ami_tty_enter_raw(int32_t fd, ami_tty_raw_guard *out_guard);
+ami_status ami_tty_leave_raw(ami_tty_raw_guard *guard);
 
 #ifdef __cplusplus
 }

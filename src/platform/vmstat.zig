@@ -394,3 +394,10 @@ test "liveZeroSwapReclaimableBytes sums free+speculative+purgeable+external and 
         live.liveZeroSwapReclaimableBytes(),
     );
 }
+
+test {
+    _ = @import("telemetry.zig");
+    _ = @import("../monitor/theme.zig");
+    _ = @import("../monitor/tui.zig");
+    _ = @import("../cli/chat_repl.zig");
+}
