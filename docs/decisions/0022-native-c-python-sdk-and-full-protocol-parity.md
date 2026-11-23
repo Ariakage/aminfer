@@ -275,9 +275,14 @@ and usage-accounting layer:
   full token-slice verification so cold-restart recovery never collides across
   models, quantization profiles, or diverged prefixes.
 
-### Scope boundary
+### Scope boundary and zero-overhead non-regression guardrails
 
 - Audio and speech ingress are explicitly excluded from Milestone M7.5.
+- **Strict zero-overhead fast paths when optional M7.5 features are inactive:**
+  1. `aminfer monitor` (`C19`) and `aminfer chat` (`C20`) are standalone CLI subcommands; `aminfer serve` and `decode` run zero `IOReport` polling when `monitor` is not running, and attaching `monitor --server` polls `/health` + rootless `IOReport` on `QOS_CLASS_UTILITY` E-cores at `>= 500 ms` intervals (`< 0.1%` E-core CPU, `0 B` GPU/wired bandwidth).
+  2. Single-file `.amf` metadata (`W18`), `--api-key`, and `--unix-socket` (`C18`) execute only at model load or per-request HTTP header ingress (`0` instructions added to per-token decode); `libaminfer.dylib` (`C17`) is a separate build target that leaves the static `aminfer` CLI binary unchanged.
+  3. Unconstrained requests (`response_format` unset, penalties `0`, `logit_bias` empty, `active_adapters == 0`) bypass `C22` grammar state machines and `W19` LoRA adapter dispatches outside the layer loop. When `C22` / penalties are active on large-vocabulary models (`151K–248K` tokens), `C22` pairs with the fused GPU radix/bucket sampler (`G21` in [ADR-0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md)) and propagates masks into speculative draft proposals so neither CPU logit scans nor draft rejections degrade throughput.
+  4. `W19` L2-resident SME2 LoRA adapters cap their P-core L2 footprint at `<= 4 MiB` (`25%` of M4's `16 MiB` P-core L2) inside the `R9` wired budget (never unpinning base weights). Stateful `/v1/responses` slots obey `R9` `evict_first` governance, and opt-in `--disk-prefix-cache` (`R10`, off by default) schedules `F_NOCACHE` writes on background utility I/O queues that yield strictly to `C3`–`C5` decode-critical cold-expert `pread`s.
 
 ## Consequences
 

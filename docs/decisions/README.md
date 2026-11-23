@@ -40,6 +40,7 @@ items. ADRs record decisions, not capability status — that lives in
 | [0020](0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md) | Configurable wide-chunk GPU prefill, lossless tail pruning, serving QoS, and live non-anonymous RAM admission | Accepted | 2026-11-22 |
 | [0021](0021-multi-generation-apple-silicon-and-nax-tensorops.md) | Single-binary multi-generation Apple Silicon adaptation (`Apple9` and `Apple10+` GPU `NAX`) | Accepted | 2026-11-22 |
 | [0022](0022-native-c-python-sdk-and-full-protocol-parity.md) | Native C/Python SDK, full HTTP/SSE protocol parity, and rootless terminal monitor (M7.5) | Accepted | 2026-11-23 |
+| [0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md) | Native Metal 4 sublayer fusion, MMA FlashAttention-2, GPU indirect MoE dispatch, and NEON/SME2 accelerators (M7.8) | Accepted | 2026-11-23 |
 
 ## Template
 

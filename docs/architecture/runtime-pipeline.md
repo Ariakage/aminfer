@@ -190,3 +190,13 @@ chunk.
 - No page faults on wired memory, no blocking system calls on P-core threads
   other than waits on events, no shader compilation (every pipeline is built at
   startup).
+- Planned Milestone M7.8 native kernel optimizations
+  ([ADR-0023](../decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md);
+  status rows `G18`–`G21`, `C23`–`C24` in [../status.md](../status.md)) further
+  reduce per-layer `MTLStageDispatch` barriers via fused residual/RMSNorm/QKV/SwiGLU
+  kernels, stage `simdgroup_matrix`/`NAX` tiles in FlashAttention-2 prefill,
+  drive `M > 1` / multi-scheme MoE buckets via GPU indirect threadgroup
+  dispatch, move `151K–248K`-vocab constrained sampling onto a two-pass GPU
+  radix sampler, and vectorize JSON/BPE scanning (`NEON`) and `2-bit`
+  `q2_affine` adapters (`SME2 luti2`) behind strict occupancy and sequence-length
+  crossover guards.
