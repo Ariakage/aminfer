@@ -57,6 +57,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const bridge_mod = bridge_c.createModule();
+
+    // Public C ABI header (`include/aminfer.h`), translated so `c_api.zig`
+    // verifies struct sizes and ABI constants at compile time (`C17`).
+    const sdk_c = b.addTranslateC(.{
+        .root_source_file = b.path("include/aminfer.h"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // All Metal kernels compiled into one library that the binary embeds
     // (including Apple10+ MetalPerformancePrimitives NAX TensorOps, ADR-0021).
@@ -77,7 +86,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addImport("apple_bridge", bridge_c.createModule());
+    mod.addImport("apple_bridge", bridge_mod);
     mod.addAnonymousImport("aminfer_metallib", .{ .root_source_file = metallib });
     mod.addImport("aminfer", mod);
     mod.addIncludePath(b.path("src/bridge"));
@@ -85,6 +94,31 @@ pub fn build(b: *std.Build) void {
     mod.addCSourceFiles(.{ .files = &.{"src/bridge/apple_bridge.m"}, .flags = &objc_flags });
     mod.addCSourceFiles(.{ .files = &.{"src/cpu/sme2_kernels.s"}, .flags = &sme2_asm_flags });
     for (frameworks) |name| mod.linkFramework(name, .{});
+
+    // Public C-ABI shared library (`zig-out/lib/libaminfer.dylib` + `zig-out/include/aminfer.h`,
+    // ADR-0022 `C17`); keeps the standalone `aminfer` CLI binary completely unchanged.
+    const sdk_mod = b.createModule(.{
+        .root_source_file = b.path("src/sdk/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "aminfer", .module = mod },
+            .{ .name = "apple_bridge", .module = bridge_mod },
+            .{ .name = "aminfer_sdk_c", .module = sdk_c.createModule() },
+        },
+    });
+    addMacosSdkPaths(b, sdk_mod, sdk);
+    for (frameworks) |name| sdk_mod.linkFramework(name, .{});
+    sdk_mod.linkFramework("IOKit", .{});
+
+    const dylib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "aminfer",
+        .root_module = sdk_mod,
+    });
+    dylib.installHeader(b.path("include/aminfer.h"), "aminfer.h");
+    b.installArtifact(dylib);
 
     const exe = b.addExecutable(.{
         .name = "aminfer",
@@ -172,9 +206,14 @@ pub fn build(b: *std.Build) void {
     const run_s7 = b.addRunArtifact(s7_exe);
     b.step("bench-s7-standalone", "Run standalone Spike S7 SME2 vs Accelerate benchmark").dependOn(&run_s7.step);
 
+    const sdk_test = b.addTest(.{ .root_module = sdk_mod });
+    const run_sdk_test = b.addRunArtifact(sdk_test);
+    b.step("test-sdk", "Run M7.5 C17 libaminfer C-ABI unit tests").dependOn(&run_sdk_test.step);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
+    test_step.dependOn(&run_sdk_test.step);
 }
 
 /// Resolves the active macOS SDK path once per build invocation.

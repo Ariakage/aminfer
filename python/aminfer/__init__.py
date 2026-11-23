@@ -1,0 +1,63 @@
+"""Pure-stdlib Python ctypes SDK for aminfer (ADR-0022 C17/C21)."""
+
+from __future__ import annotations
+
+from aminfer._bindings import (
+    AMI_SDK_ABI_VERSION,
+    AminferError,
+    BudgetExceededError,
+    CancelledError,
+    InvalidArgumentError,
+    SequenceFullError,
+    VisionError,
+)
+from aminfer.engine import (
+    CancelToken,
+    DeltaKind,
+    Dialect,
+    DType,
+    Engine,
+    EngineStats,
+    FinishReason,
+    GenerationConfig,
+    GenerationOutput,
+    HostVmSnapshot,
+    PoolingMode,
+    RerankItem,
+    RerankMode,
+    StreamChunk,
+    Tokenizer,
+    VisionFormat,
+    VisionFrameInfo,
+    VisionInput,
+    VisionPrefillResult,
+)
+
+__all__ = [
+    "AMI_SDK_ABI_VERSION",
+    "AminferError",
+    "BudgetExceededError",
+    "CancelToken",
+    "CancelledError",
+    "DType",
+    "DeltaKind",
+    "Dialect",
+    "Engine",
+    "EngineStats",
+    "FinishReason",
+    "GenerationConfig",
+    "GenerationOutput",
+    "HostVmSnapshot",
+    "InvalidArgumentError",
+    "PoolingMode",
+    "RerankItem",
+    "RerankMode",
+    "SequenceFullError",
+    "StreamChunk",
+    "Tokenizer",
+    "VisionError",
+    "VisionFormat",
+    "VisionFrameInfo",
+    "VisionInput",
+    "VisionPrefillResult",
+]

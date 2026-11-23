@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aminfer"
+version = "0.7.5"
+description = "Zero-dependency Python ctypes SDK for the aminfer Apple Silicon inference engine (C17/C21)"
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aminfer*"]
