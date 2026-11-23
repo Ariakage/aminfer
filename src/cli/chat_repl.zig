@@ -45,21 +45,31 @@ pub const Error = std.mem.Allocator.Error || vmstat.Error || prefix_cache.Error 
 };
 
 pub const HELP_TEXT: []const u8 =
-    \\Usage: aminfer chat --model <path.amf> [options]
+    \\usage: aminfer chat [-CHhqNSV] -m path.amf [-c config.json] [-D cache_dir]
+    \\                    [-k tokenizer.json] [-L name=path.amlora] [-n tokens]
+    \\                    [-s system_prompt] [-t temp] [-W wired_mib]
+    \\                    [--image path] [--video path] [--seed u64]
     \\
     \\Options:
-    \\  -m, --model <path>       Model .amf path or directory
-    \\  -s, --system <prompt>    System prompt (default: "You are a helpful assistant.")
-    \\  -n, --max-tokens <n>     Max generated tokens per turn (default: 1024)
-    \\  -t, --temperature <f>    Sampling temperature (default: 0.6)
-    \\  --seed <u64>             Deterministic RNG seed
-    \\  --no-think               Request non-thinking ChatML turn prefill
-    \\  --hide-think             Suppress <think>...</think> blocks from output
-    \\  --no-color               Disable ANSI dimming/colors
-    \\  --no-stats               Suppress 1-line post-turn throughput summary
-    \\  --image <path>           Attach an image to the initial turn (G14)
-    \\  --video <path>           Attach a video to the initial turn (G14)
-    \\  -h, --help               Show this help message
+    \\  -m, --model <path>              Model .amf path or directory
+    \\  -c, --config <path>             Explicit config.json override (W18)
+    \\  -k, --tokenizer <path>          Explicit tokenizer.json override (W18)
+    \\  -L, --lora <name>=<path.amlora> Load and activate a runtime LoRA adapter (W19)
+    \\  -D, --disk-prefix-cache <dir>   Enable R10 F_NOCACHE persistent prefix cache
+    \\  -W, --wired-cap-mib <n>         Override wired memory budget ceiling in MiB
+    \\  -s, --system <prompt>           System prompt (default: "You are a helpful assistant.")
+    \\  -n, --max-tokens <n>            Max generated tokens per turn (default: 1024)
+    \\  -t, --temperature <f>           Sampling temperature (default: 0.6)
+    \\      --seed <u64>                Deterministic RNG seed
+    \\  -N, --no-think                  Request non-thinking ChatML turn prefill
+    \\  -H, --hide-think                Suppress <think>...</think> blocks from output
+    \\  -C, --no-color                  Disable ANSI dimming/colors
+    \\  -q, --no-stats                  Suppress 1-line post-turn throughput summary
+    \\  -S, --strict-live-ram           Enforce strict R9 live non-anonymous RAM admission
+    \\  -V, --no-verify-crc             Skip .amf CRC-32 payload verification
+    \\      --image <path>              Attach an image to the initial turn (G14)
+    \\      --video <path>              Attach a video to the initial turn (G14)
+    \\  -h, --help                      Show this help message
     \\
     \\Interactive slash commands:
     \\  /clear                   Clear conversation history & reset PrefixCache state
@@ -156,14 +166,14 @@ pub const ChatConfig = struct {
                 i += 1;
                 if (i >= args.len) return error.MissingCliValue;
                 cfg.seed = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidCliArgument;
-            } else if (std.mem.eql(u8, arg, "--no-think")) {
+            } else if (std.mem.eql(u8, arg, "--no-think") or std.mem.eql(u8, arg, "-N")) {
                 cfg.enable_thinking = false;
-            } else if (std.mem.eql(u8, arg, "--hide-think")) {
+            } else if (std.mem.eql(u8, arg, "--hide-think") or std.mem.eql(u8, arg, "-H")) {
                 cfg.think_display = .hidden;
-            } else if (std.mem.eql(u8, arg, "--no-color")) {
+            } else if (std.mem.eql(u8, arg, "--no-color") or std.mem.eql(u8, arg, "-C")) {
                 cfg.use_color = false;
                 if (cfg.think_display == .dimmed) cfg.think_display = .plain;
-            } else if (std.mem.eql(u8, arg, "--no-stats")) {
+            } else if (std.mem.eql(u8, arg, "--no-stats") or std.mem.eql(u8, arg, "-q")) {
                 cfg.show_stats = false;
             } else if (std.mem.eql(u8, arg, "--image")) {
                 i += 1;
@@ -177,6 +187,20 @@ pub const ChatConfig = struct {
                 if (cfg.initial_video_count >= MAX_ATTACHMENTS_PER_TURN) return error.AttachmentLimitExceeded;
                 cfg.initial_videos[cfg.initial_video_count] = args[i];
                 cfg.initial_video_count += 1;
+            } else if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
+                for (arg[1..]) |ch| {
+                    switch (ch) {
+                        'C' => {
+                            cfg.use_color = false;
+                            if (cfg.think_display == .dimmed) cfg.think_display = .plain;
+                        },
+                        'H' => cfg.think_display = .hidden,
+                        'h' => cfg.show_help = true,
+                        'N' => cfg.enable_thinking = false,
+                        'q' => cfg.show_stats = false,
+                        else => return error.InvalidCliArgument,
+                    }
+                }
             } else {
                 return error.InvalidCliArgument;
             }

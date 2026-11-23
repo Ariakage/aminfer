@@ -51,17 +51,18 @@ pub const Error = telemetry.Error || theme_mod.Error || std.mem.Allocator.Error 
 };
 
 pub const HELP_TEXT: []const u8 =
-    \\Usage: aminfer monitor [options]
+    \\usage: aminfer monitor [-1hj] [-i ms] [-s host:port] [-t path.theme]
+    \\                       [--cols n] [--rows n]
     \\
     \\Options:
-    \\  --once                  Render a single TrueColor telemetry frame and exit
-    \\  --json                  Emit a single machine-readable JSON snapshot and exit
-    \\  --theme <path.theme>    Load a custom btop .theme file (default: trans-pride)
-    \\  --server <host:port>    Attach live HTTP /health polling to aminfer serve
-    \\  -i, --interval-ms <ms>  Refresh interval in ms (default: 1000)
-    \\  --cols <n>              Override terminal width (useful with --once)
-    \\  --rows <n>              Override terminal height (useful with --once)
-    \\  -h, --help              Show this help message
+    \\  -1, --once                  Render a single TrueColor telemetry frame and exit
+    \\  -j, --json                  Emit a single machine-readable JSON snapshot and exit
+    \\  -t, --theme <path.theme>    Load a custom btop .theme file (default: trans-pride)
+    \\  -s, --server <host:port>    Attach live HTTP /health polling to aminfer serve
+    \\  -i, --interval-ms <ms>      Refresh interval in ms (default: 1000)
+    \\      --cols <n>              Override terminal width (useful with --once)
+    \\      --rows <n>              Override terminal height (useful with --once)
+    \\  -h, --help                  Show this help message
     \\
     \\Interactive keys:
     \\  q / Esc     Quit monitor
@@ -98,17 +99,17 @@ pub const MonitorConfig = struct {
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
-            if (std.mem.eql(u8, arg, "--once")) {
+            if (std.mem.eql(u8, arg, "--once") or std.mem.eql(u8, arg, "-1")) {
                 cfg.once = true;
-            } else if (std.mem.eql(u8, arg, "--json")) {
+            } else if (std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "-j")) {
                 cfg.json = true;
             } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
                 cfg.show_help = true;
-            } else if (std.mem.eql(u8, arg, "--theme")) {
+            } else if (std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "-t")) {
                 i += 1;
                 if (i >= args.len) return error.MissingCliValue;
                 cfg.theme_path = args[i];
-            } else if (std.mem.eql(u8, arg, "--server")) {
+            } else if (std.mem.eql(u8, arg, "--server") or std.mem.eql(u8, arg, "-s")) {
                 i += 1;
                 if (i >= args.len) return error.MissingCliValue;
                 _ = try ServerEndpoint.parse(args[i]);
@@ -127,6 +128,15 @@ pub const MonitorConfig = struct {
                 i += 1;
                 if (i >= args.len) return error.MissingCliValue;
                 cfg.rows_override = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidCliArgument;
+            } else if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
+                for (arg[1..]) |ch| {
+                    switch (ch) {
+                        '1' => cfg.once = true,
+                        'j' => cfg.json = true,
+                        'h' => cfg.show_help = true,
+                        else => return error.InvalidCliArgument,
+                    }
+                }
             } else {
                 return error.InvalidCliArgument;
             }

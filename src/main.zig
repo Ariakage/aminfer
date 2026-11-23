@@ -5,21 +5,55 @@ const Io = std.Io;
 const aminfer = @import("aminfer");
 
 const usage =
-    \\usage: aminfer <command> [options]
+    \\usage: aminfer [-1ABCEeHhjlMNPRqSV] <command> [options]
+    \\       aminfer monitor [-1hj] [-i ms] [-s host:port] [-t path.theme] [--cols n] [--rows n]
+    \\       aminfer chat [-CHhqNSV] -m path.amf [-c config.json] [-D dir] [-k tok.json]
+    \\                    [-L name=path.amlora] [-n tokens] [-s prompt] [-t temp] [-W mib]
+    \\       aminfer decode [-AEehlNRSV] -m path.amf -p prompt [-c config.json] [-k tok.json]
+    \\                      [-n tokens] [-t temp] [-W mib] [options]
+    \\       aminfer spec-decode [-AEehlNPRSV] -m path.amf -p prompt [-c config.json]
+    \\                           [-d draft.amf] [-k tok.json] [-M mode] [-n tokens] [-t temp] [options]
+    \\       aminfer serve [-ABEhMNPSV] -m path.amf [-a key] [-c config.json] [-D dir]
+    \\                     [-H host] [-k tok.json] [-L name=path.amlora] [-p port] [-u sock] [options]
+    \\       aminfer bench-decode [-AEhlNRSV] -m path.amf [-c config.json] [-W mib] [options]
+    \\       aminfer peer-worker [-hRV] -l ip:port -m path.amf -c config.json -r rank -w world_size
+    \\       aminfer probe [-hN] [--prefill-matmul-backend auto|simdgroup|nax] [--bus-bandwidth-gbs F]
+    \\       aminfer ls [-h] [dir]
+    \\       aminfer inspect [-h] <path.amf>
+    \\       aminfer verify-amf [-h] <path.amf>
+    \\
+    \\posix boolean flags (clusterable, e.g. -1j, -CHqNSV, -AEelNRSV, -ABEhMNPSV):
+    \\  -1  render one monitor frame and exit (--once)
+    \\  -A  disable A2 ANE cross-layer expert predictor (--no-ane-predictor)
+    \\  -B  disable C15 ChatML message-boundary PrefixCache checkpoints (--message-boundary-cache off)
+    \\  -C  disable ANSI color/dimming in chat (--no-color)
+    \\  -E  enable D12 token-adaptive recurrent loop early exit (--loop-early-exit)
+    \\  -e  ignore EOS token during generation (--ignore-eos)
+    \\  -H  hide <think>...</think> reasoning blocks in chat (--hide-think)
+    \\  -h  print command usage / help (--help)
+    \\  -j  emit one JSON telemetry snapshot in monitor (--json)
+    \\  -l  send shutdown control frame to cluster peers on exit (--shutdown-peers)
+    \\  -M  disable C15 adaptive background prefill chunk narrowing (--adaptive-prefill-narrow off)
+    \\  -N  require Apple10+ GPU NAX backend (--strict-nax) or disable thinking in chat (--no-think)
+    \\  -P  disable D7 expert-byte-budget draft tree pruning (--no-prune)
+    \\  -R  require Thunderbolt 5 RDMA cluster transport (--strict-tb5-rdma)
+    \\  -q  suppress post-turn throughput summary in chat (--no-stats)
+    \\  -S  enforce strict R9 live non-anonymous RAM admission (--strict-live-ram)
+    \\  -V  skip .amf CRC-32 payload verification (--no-verify-crc)
     \\
     \\commands:
     \\  probe             print the kernel, chip profile, Metal, NAX and Neural Engine facts of this machine
-    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
+    \\                    [-hN] [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\  ls [dir]          scan a directory of .amf models without mlocking weights (W18)
     \\  inspect <path>    print header, metadata, dtype breakdown, wired estimate and tier fit of an .amf file (W18)
     \\  monitor           start the rootless btop-style TrueColor TUI hardware & inference monitor (C19)
-    \\                    [--theme <path.theme>] [--interval-ms N] [--once] [--json] [--server <host:port>]
+    \\                    [-1hj] [-t|--theme <path.theme>] [-i|--interval-ms N] [-1|--once] [-j|--json] [-s|--server <host:port>]
     \\  chat              start the plain scrolling CLI chat REPL or stdin pipe mode (C20)
-    \\                    --model <path.amf> [--config <path>] [--tokenizer <path>] [--system <text>]
-    \\                    [--lora <name>=<path.amlora>] [--no-think] [--hide-think] [--no-color] [--no-stats]
-    \\                    [--max-tokens N] [--temperature T] [--seed N] [--image <path>] [--video <path>]
-    \\                    [--max-seq-len N] [--prefix-cache-chunks N] [--disk-prefix-cache <dir>]
-    \\                    [--wired-cap-mib N] [--no-verify-crc]
+    \\                    [-CHhqNSV] -m|--model <path.amf> [-c|--config <path>] [-k|--tokenizer <path>] [-s|--system <text>]
+    \\                    [-L|--lora <name>=<path.amlora>] [-N|--no-think] [-H|--hide-think] [-C|--no-color] [-q|--no-stats]
+    \\                    [-n|--max-tokens N] [-t|--temperature T] [--seed N] [--image <path>] [--video <path>]
+    \\                    [--max-seq-len N] [--prefix-cache-chunks N] [-D|--disk-prefix-cache <dir>]
+    \\                    [-W|--wired-cap-mib N] [-S|--strict-live-ram] [-V|--no-verify-crc]
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
     \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5, M6.8, M6.9, M7 and M7.5 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
@@ -33,90 +67,102 @@ const usage =
     \\  bench-m65         run M6.5 G14 HW VideoToolbox vision, R5 32K q8 KV, R8 PrefixCache & C14 batch/ngram
     \\  bench-m68         run M6.8 G16 canary/Apple10, G15 wide prefill/tail-pruning A/B, C15 QoS/boundary & R9 live-RAM
     \\  bench-m69         run M6.9 C16 ChipProfile, G17 NAX metallib/fallback/demotion gates & Apple10+ Spike S8 sweep
-    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
+    \\                    [-hN] [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\  bench-m7          run M7 R7/G11 MLA+CSA2 FP4, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED+DSpark & X1-X3 cluster
     \\                    [--bus-bandwidth-gbs F]
     \\  bench-m75         run M7.5 W18 single-file AMF, W19 multi-LoRA, C22 grammar bitmask, C19 monitor, C21 embed/rerank, R10 DiskPrefixCache & C17 C-ABI SDK suite
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
-    \\                    --listen <ip:port> --amf <path> --config <path> --rank N --world-size N
+    \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
-    \\                    [--strict-tb5-rdma] [--max-requests N] [--max-tokens N] [--wired-cap-mib N]
-    \\                    [--no-verify-crc]
+    \\                    [-R|--strict-tb5-rdma] [--max-requests N] [-n|--max-tokens N] [-W|--wired-cap-mib N]
+    \\                    [-V|--no-verify-crc]
     \\  bench-a2          evaluate real-checkpoint A2 ANE cross-layer expert predictor recall/lead-time
-    \\                    --amf <path> --config <path> --tokenizer <path> [--prompt <text>]
-    \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [--no-verify-crc]
+    \\                    [-hV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>] [-p|--prompt <text>]
+    \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [-V|--no-verify-crc]
     \\  bench-decode      benchmark end-to-end greedy decode on a specific .amf + config.json
-    \\                    --amf <path> [--config <path>] [--scale-layers N] [--prefill-tokens N]
+    \\                    [-AEhlNRSV] -m|--amf <path> [-c|--config <path>] [--scale-layers N] [--prefill-tokens N]
     \\                    [--decode-steps N] [--cold-experts-per-layer N] [--heat-profile <path>]
-    \\                    [--cold-slots N] [--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [--cold-slots N] [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
-    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
-    \\                    [--strict-live-ram] [--ane-predictor <path>]
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
+    \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
     \\                    [--kv-retire-q8-after-chunks N]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
-    \\                    [--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
+    \\                    [-E|--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
-    \\                    [--strict-tb5-rdma] [--shutdown-peers] [--no-ane-predictor] [--no-verify-crc]
+    \\                    [-R|--strict-tb5-rdma] [-l|--shutdown-peers] [-A|--no-ane-predictor] [-V|--no-verify-crc]
     \\  decode            run end-to-end native BPE encode -> greedy/stochastic .amf decode -> BPE decode
-    \\                    --amf <path> [--config <path>] [--tokenizer <path>]
-    \\                    --prompt <text> [--max-tokens N] [--temperature T] [--seed N] [--ignore-eos]
+    \\                    [-AEehlNRSV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>]
+    \\                    -p|--prompt <text> [-n|--max-tokens N] [-t|--temperature T] [--seed N] [-e|--ignore-eos]
     \\                    [--sme-router auto|sme2|gpu] [--kv-retire-q8-after-chunks N]
     \\                    [--image <path.png>] [--vt-test-video hevc|h264]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
-    \\                    [--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
+    \\                    [-E|--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
-    \\                    [--strict-tb5-rdma] [--shutdown-peers]
+    \\                    [-R|--strict-tb5-rdma] [-l|--shutdown-peers]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
-    \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
-    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
-    \\                    [--strict-live-ram] [--ane-predictor <path>]
-    \\                    [--no-ane-predictor] [--no-verify-crc]
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
+    \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
+    \\                    [-A|--no-ane-predictor] [-V|--no-verify-crc]
     \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent/DSpark)
-    \\                    --amf <path> [--config <path>] [--tokenizer <path>] --prompt <text>
-    \\                    [--draft-amf <path> --draft-config <path>]
-    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark]
+    \\                    [-AEehlNPRSV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>] -p|--prompt <text>
+    \\                    [-d|--draft-amf <path> --draft-config <path>]
+    \\                    [-M|--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark]
     \\                    [--placement auto|gpu|ane|sme2] [--kv-retire-q8-after-chunks N]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
-    \\                    [--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
+    \\                    [-E|--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
-    \\                    [--strict-tb5-rdma] [--shutdown-peers]
+    \\                    [-R|--strict-tb5-rdma] [-l|--shutdown-peers]
     \\                    [--sme-router auto|sme2|gpu] [--pearl auto|on|off] [--pearl-min-target-ms F]
     \\                    [--ngram-nvme <path>] [--ngram-cache-pages N]
     \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
-    \\                    [--top-k N] [--no-prune] [--temperature T] [--seed N]
+    \\                    [--top-k N] [-P|--no-prune] [-t|--temperature T] [--seed N]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
-    \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
-    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
-    \\                    [--strict-live-ram] [--ane-predictor <path>]
-    \\                    [--no-ane-predictor] [--max-tokens N] [--ignore-eos] [--no-verify-crc]
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
+    \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
+    \\                    [-A|--no-ane-predictor] [-n|--max-tokens N] [-e|--ignore-eos] [-V|--no-verify-crc]
     \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15, C18, C21, C22, W19, R10)
-    \\                    --amf <path> [--config <path>] [--tokenizer <path>]
-    \\                    [--host 127.0.0.1] [--port 8080] [--unix-socket <path>] [--api-key <secret>]
-    \\                    [--model-id <id>] [--lora <name>=<path.amlora>] [--disk-prefix-cache <dir>]
+    \\                    [-ABEhMNPSV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>]
+    \\                    [-H|--host 127.0.0.1] [-p|--port 8080] [-u|--unix-socket <path>] [-a|--api-key <secret>]
+    \\                    [--model-id <id>] [-L|--lora <name>=<path.amlora>] [-D|--disk-prefix-cache <dir>]
     \\                    [--max-seq-len N] [--max-conns N] [--max-active-requests N]
     \\                    [--batch-mode auto|continuous|serial] [--prefix-cache-chunks N]
-    \\                    [--decode-share F] [--adaptive-prefill-narrow on|off]
-    \\                    [--message-boundary-cache on|off]
+    \\                    [--decode-share F] [-M|--adaptive-prefill-narrow on|off]
+    \\                    [-B|--message-boundary-cache on|off]
     \\                    [--kv-retire-q8-after-chunks N] [--ngram-pack <domain>=<path.ang>]
-    \\                    [--draft-amf <path> --draft-config <path>]
+    \\                    [-d|--draft-amf <path> --draft-config <path>]
     \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent]
     \\                    [--placement auto|gpu|ane|sme2]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
-    \\                    [--loop-early-exit]
+    \\                    [-E|--loop-early-exit]
     \\                    [--sme-router auto|sme2|gpu] [--pearl auto|on|off] [--pearl-min-target-ms F]
     \\                    [--ngram-nvme <path>] [--ngram-cache-pages N]
     \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
-    \\                    [--top-k N] [--no-prune]
+    \\                    [--top-k N] [-P|--no-prune]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
-    \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
+    \\                    [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
-    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
-    \\                    [--strict-live-ram] [--ane-predictor <path>]
-    \\                    [--no-ane-predictor] [--no-verify-crc]
+    \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
+    \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
+    \\                    [-A|--no-ane-predictor] [-V|--no-verify-crc]
     \\
 ;
+
+fn hasHelpFlag(args: []const [:0]const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return true;
+        if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
+            for (arg[1..]) |ch| {
+                if (ch == 'h') return true;
+            }
+        }
+    }
+    return false;
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -125,19 +171,35 @@ pub fn main(init: std.process.Init) !void {
     var stdout: Io.File.Writer = .init(.stdout(), init.io, &buffer);
     const out = &stdout.interface;
     if (args.len >= 2 and std.mem.eql(u8, args[1], "probe")) {
-        try probe(args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try probe(args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "ls")) {
-        try runLs(arena, args[2..], out);
-    } else if (args.len == 3 and std.mem.eql(u8, args[1], "inspect")) {
-        try runInspect(arena, args[2], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runLs(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "inspect")) {
+        if (args.len != 3 or hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runInspect(arena, args[2], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "monitor")) {
         try out.flush();
         try runMonitor(arena, args[2..]);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "chat")) {
         try out.flush();
         try runChat(arena, args[2..]);
-    } else if (args.len == 3 and std.mem.eql(u8, args[1], "verify-amf")) {
-        try verifyAmf(arena, args[2], out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "verify-amf")) {
+        if (args.len != 3 or hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try verifyAmf(arena, args[2], out);
+        }
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
         try runBenchAll(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m1")) {
@@ -161,23 +223,55 @@ pub fn main(init: std.process.Init) !void {
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m68")) {
         try runBenchM68(arena, out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m69")) {
-        try runBenchM69(arena, args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM69(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m7")) {
-        try runBenchM7(arena, args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM7(arena, args[2..], out);
+        }
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m75")) {
         try runBenchM75(arena, out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
-        try runPeerWorker(arena, args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runPeerWorker(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-a2")) {
-        try runBenchA2(arena, args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchA2(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-decode")) {
-        try runBenchDecode(arena, args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchDecode(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "decode")) {
-        try runDecode(arena, args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runDecode(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "spec-decode")) {
-        try runSpecDecode(arena, args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runSpecDecode(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "serve")) {
-        try runServe(arena, args[2..], out);
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runServe(arena, args[2..], out);
+        }
     } else {
         try out.writeAll(usage);
     }
@@ -563,7 +657,7 @@ const M69CliFlags = struct {
             self.prefill_backend_mode = aminfer.dequant.PrefillBackendMode.parse(args[i.*]) orelse
                 return error.InvalidPrefillMatmulBackend;
             return true;
-        } else if (std.mem.eql(u8, flag, "--strict-nax")) {
+        } else if (std.mem.eql(u8, flag, "--strict-nax") or std.mem.eql(u8, flag, "-N")) {
             self.strict_nax = true;
             return true;
         } else if (std.mem.eql(u8, flag, "--bus-bandwidth-gbs")) {
@@ -583,6 +677,17 @@ fn parseM69Args(args: []const [:0]const u8) !M69CliFlags {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m69.tryParseFlag(args, &i)) continue;
+        const flag = args[i];
+        if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
+            for (flag[1..]) |ch| {
+                switch (ch) {
+                    'N' => m69.strict_nax = true,
+                    'h' => {},
+                    else => return error.UnknownFlag,
+                }
+            }
+            continue;
+        }
         return error.UnknownFlag;
     }
     return m69;
@@ -948,27 +1053,27 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         if (try m69.tryParseFlag(args, &i)) continue;
         if (try m7.tryParseFlag(args, &i)) continue;
         const flag = args[i];
-        if (std.mem.eql(u8, flag, "--amf")) {
+        if (std.mem.eql(u8, flag, "--amf") or std.mem.eql(u8, flag, "-m")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             amf_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--config")) {
+        } else if (std.mem.eql(u8, flag, "--config") or std.mem.eql(u8, flag, "-c")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--tokenizer")) {
+        } else if (std.mem.eql(u8, flag, "--tokenizer") or std.mem.eql(u8, flag, "-k")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             tokenizer_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--prompt")) {
+        } else if (std.mem.eql(u8, flag, "--prompt") or std.mem.eql(u8, flag, "-p")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             prompt = args[i];
-        } else if (std.mem.eql(u8, flag, "--max-tokens")) {
+        } else if (std.mem.eql(u8, flag, "--max-tokens") or std.mem.eql(u8, flag, "-n")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             max_tokens = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--temperature")) {
+        } else if (std.mem.eql(u8, flag, "--temperature") or std.mem.eql(u8, flag, "-t")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             temperature = try std.fmt.parseFloat(f32, args[i]);
@@ -997,7 +1102,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             cold_slots = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
@@ -1033,6 +1138,21 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             vt_test_video = try parseVtCodec(args[i]);
+        } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
+            for (flag[1..]) |ch| {
+                switch (ch) {
+                    'A' => enable_ane_predictor = false,
+                    'E' => m6.loop_early_exit = true,
+                    'e' => ignore_eos = true,
+                    'h' => {},
+                    'l' => m7.shutdown_peers = true,
+                    'N' => m69.strict_nax = true,
+                    'R' => m7.strict_tb5_rdma = true,
+                    'S' => strict_live_ram = true,
+                    'V' => verify_crcs = false,
+                    else => return error.UnknownFlag,
+                }
+            }
         } else {
             return error.UnknownFlag;
         }
@@ -1119,11 +1239,11 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
         if (try m69.tryParseFlag(args, &i)) continue;
         if (try m7.tryParseFlag(args, &i)) continue;
         const flag = args[i];
-        if (std.mem.eql(u8, flag, "--amf")) {
+        if (std.mem.eql(u8, flag, "--amf") or std.mem.eql(u8, flag, "-m")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             amf_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--config")) {
+        } else if (std.mem.eql(u8, flag, "--config") or std.mem.eql(u8, flag, "-c")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config_path = args[i];
@@ -1153,7 +1273,7 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             cold_slots = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
@@ -1181,6 +1301,20 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             kv_retire_q8_after_chunks = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
+            for (flag[1..]) |ch| {
+                switch (ch) {
+                    'A' => enable_ane_predictor = false,
+                    'E' => m6.loop_early_exit = true,
+                    'h' => {},
+                    'l' => m7.shutdown_peers = true,
+                    'N' => m69.strict_nax = true,
+                    'R' => m7.strict_tb5_rdma = true,
+                    'S' => strict_live_ram = true,
+                    'V' => verify_crcs = false,
+                    else => return error.UnknownFlag,
+                }
+            }
         } else {
             return error.UnknownFlag;
         }
@@ -2026,23 +2160,23 @@ fn parsePeerWorkerArgs(args: []const [:0]const u8) !PeerWorkerCliArgs {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const flag = args[i];
-        if (std.mem.eql(u8, flag, "--listen")) {
+        if (std.mem.eql(u8, flag, "--listen") or std.mem.eql(u8, flag, "-l")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             listen = try parseHostPort(args[i]);
-        } else if (std.mem.eql(u8, flag, "--amf")) {
+        } else if (std.mem.eql(u8, flag, "--amf") or std.mem.eql(u8, flag, "-m")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             amf_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--config")) {
+        } else if (std.mem.eql(u8, flag, "--config") or std.mem.eql(u8, flag, "-c")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--rank")) {
+        } else if (std.mem.eql(u8, flag, "--rank") or std.mem.eql(u8, flag, "-r")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             rank = try std.fmt.parseInt(u16, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--world-size")) {
+        } else if (std.mem.eql(u8, flag, "--world-size") or std.mem.eql(u8, flag, "-w")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             const ws = try std.fmt.parseInt(u16, args[i], 10);
@@ -2062,18 +2196,27 @@ fn parsePeerWorkerArgs(args: []const [:0]const u8) !PeerWorkerCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             max_requests = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--max-tokens")) {
+        } else if (std.mem.eql(u8, flag, "--max-tokens") or std.mem.eql(u8, flag, "-n")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             const mt = try std.fmt.parseInt(u16, args[i], 10);
             if (mt == 0) return error.InvalidFlagValue;
             max_tokens = mt;
-        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
             verify_crcs = false;
+        } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
+            for (flag[1..]) |ch| {
+                switch (ch) {
+                    'h' => {},
+                    'R' => strict_tb5_rdma = true,
+                    'V' => verify_crcs = false,
+                    else => return error.UnknownFlag,
+                }
+            }
         } else {
             return error.UnknownFlag;
         }
@@ -2303,23 +2446,23 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         if (try m69.tryParseFlag(args, &i)) continue;
         if (try m7.tryParseFlag(args, &i)) continue;
         const flag = args[i];
-        if (std.mem.eql(u8, flag, "--amf")) {
+        if (std.mem.eql(u8, flag, "--amf") or std.mem.eql(u8, flag, "-m")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             amf_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--config")) {
+        } else if (std.mem.eql(u8, flag, "--config") or std.mem.eql(u8, flag, "-c")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--tokenizer")) {
+        } else if (std.mem.eql(u8, flag, "--tokenizer") or std.mem.eql(u8, flag, "-k")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             tokenizer_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--prompt")) {
+        } else if (std.mem.eql(u8, flag, "--prompt") or std.mem.eql(u8, flag, "-p")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             prompt = args[i];
-        } else if (std.mem.eql(u8, flag, "--draft-amf")) {
+        } else if (std.mem.eql(u8, flag, "--draft-amf") or std.mem.eql(u8, flag, "-d")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             draft_amf_path = args[i];
@@ -2327,7 +2470,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             draft_config_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--draft-mode")) {
+        } else if (std.mem.eql(u8, flag, "--draft-mode") or std.mem.eql(u8, flag, "-M")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             draft_mode = try aminfer.draft.DraftMode.parse(args[i]);
@@ -2374,7 +2517,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             top_k = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, flag, "--no-prune")) {
             enable_pruning = false;
-        } else if (std.mem.eql(u8, flag, "--temperature")) {
+        } else if (std.mem.eql(u8, flag, "--temperature") or std.mem.eql(u8, flag, "-t")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             temperature = try std.fmt.parseFloat(f32, args[i]);
@@ -2383,7 +2526,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             seed = try std.fmt.parseInt(u64, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--max-tokens")) {
+        } else if (std.mem.eql(u8, flag, "--max-tokens") or std.mem.eql(u8, flag, "-n")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             max_tokens = try std.fmt.parseInt(u32, args[i], 10);
@@ -2403,7 +2546,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             cold_slots = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
@@ -2431,6 +2574,22 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             kv_retire_q8_after_chunks = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
+            for (flag[1..]) |ch| {
+                switch (ch) {
+                    'A' => enable_ane_predictor = false,
+                    'E' => m6.loop_early_exit = true,
+                    'e' => ignore_eos = true,
+                    'h' => {},
+                    'l' => m7.shutdown_peers = true,
+                    'N' => m69.strict_nax = true,
+                    'P' => enable_pruning = false,
+                    'R' => m7.strict_tb5_rdma = true,
+                    'S' => strict_live_ram = true,
+                    'V' => verify_crcs = false,
+                    else => return error.UnknownFlag,
+                }
+            }
         } else {
             return error.UnknownFlag;
         }
@@ -3395,23 +3554,23 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         if (try m6.tryParseFlag(args, &i)) continue;
         if (try m69.tryParseFlag(args, &i)) continue;
         const flag = args[i];
-        if (std.mem.eql(u8, flag, "--amf")) {
+        if (std.mem.eql(u8, flag, "--amf") or std.mem.eql(u8, flag, "-m")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             amf_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--config")) {
+        } else if (std.mem.eql(u8, flag, "--config") or std.mem.eql(u8, flag, "-c")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             config_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--tokenizer")) {
+        } else if (std.mem.eql(u8, flag, "--tokenizer") or std.mem.eql(u8, flag, "-k")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             tokenizer_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--host")) {
+        } else if (std.mem.eql(u8, flag, "--host") or std.mem.eql(u8, flag, "-H")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             host = args[i];
-        } else if (std.mem.eql(u8, flag, "--port")) {
+        } else if (std.mem.eql(u8, flag, "--port") or std.mem.eql(u8, flag, "-p")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             port = try std.fmt.parseInt(u16, args[i], 10);
@@ -3465,7 +3624,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             if (ngram_pack_count >= ngram_packs.len) return error.TooManyNgramPacks;
             ngram_packs[ngram_pack_count] = try parseNgramPackArg(args[i]);
             ngram_pack_count += 1;
-        } else if (std.mem.eql(u8, flag, "--draft-amf")) {
+        } else if (std.mem.eql(u8, flag, "--draft-amf") or std.mem.eql(u8, flag, "-d")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             draft_amf_path = args[i];
@@ -3534,7 +3693,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             cold_slots = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
@@ -3558,27 +3717,42 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             ane_predictor_path = args[i];
         } else if (std.mem.eql(u8, flag, "--no-ane-predictor")) {
             enable_ane_predictor = false;
-        } else if (std.mem.eql(u8, flag, "--api-key")) {
+        } else if (std.mem.eql(u8, flag, "--api-key") or std.mem.eql(u8, flag, "-a")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             if (args[i].len == 0 or args[i].len > aminfer.server.MAX_API_KEY_BYTES) return error.InvalidApiKey;
             api_key = args[i];
-        } else if (std.mem.eql(u8, flag, "--unix-socket")) {
+        } else if (std.mem.eql(u8, flag, "--unix-socket") or std.mem.eql(u8, flag, "-u")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             if (args[i].len == 0 or args[i].len > aminfer.server.MAX_UNIX_SOCKET_PATH_BYTES) return error.InvalidUnixSocketPath;
             unix_socket_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--lora")) {
+        } else if (std.mem.eql(u8, flag, "--lora") or std.mem.eql(u8, flag, "-L")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             if (lora_spec_count >= lora_specs.len) return error.TooManyLoraAdapters;
             lora_specs[lora_spec_count] = try parseLoraSpecArg(args[i]);
             lora_spec_count += 1;
-        } else if (std.mem.eql(u8, flag, "--disk-prefix-cache")) {
+        } else if (std.mem.eql(u8, flag, "--disk-prefix-cache") or std.mem.eql(u8, flag, "-D")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             if (args[i].len == 0) return error.InvalidFlagValue;
             disk_prefix_cache_dir = args[i];
+        } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
+            for (flag[1..]) |ch| {
+                switch (ch) {
+                    'A' => enable_ane_predictor = false,
+                    'B' => message_boundary_cache = false,
+                    'E' => m6.loop_early_exit = true,
+                    'h' => {},
+                    'M' => adaptive_prefill_narrow = false,
+                    'N' => m69.strict_nax = true,
+                    'P' => enable_pruning = false,
+                    'S' => strict_live_ram = true,
+                    'V' => verify_crcs = false,
+                    else => return error.UnknownFlag,
+                }
+            }
         } else {
             return error.UnknownFlag;
         }
@@ -5808,6 +5982,7 @@ const ChatCliArgs = struct {
     max_seq_len: u32 = 4096,
     prefix_cache_chunks: u32 = 8,
     wired_cap_mib: ?u64 = null,
+    strict_live_ram: bool = false,
     verify_crcs: bool = true,
     chat_cfg: aminfer.chat_repl.ChatConfig = .{},
 };
@@ -5828,21 +6003,21 @@ fn parseChatCliArgs(args: []const [:0]const u8) !ChatCliArgs {
             repl_args_buf[repl_args_len] = "--model";
             repl_args_buf[repl_args_len + 1] = args[i];
             repl_args_len += 2;
-        } else if (std.mem.eql(u8, flag, "--config")) {
+        } else if (std.mem.eql(u8, flag, "--config") or std.mem.eql(u8, flag, "-c")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             out.config_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--tokenizer")) {
+        } else if (std.mem.eql(u8, flag, "--tokenizer") or std.mem.eql(u8, flag, "-k")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             out.tokenizer_path = args[i];
-        } else if (std.mem.eql(u8, flag, "--lora")) {
+        } else if (std.mem.eql(u8, flag, "--lora") or std.mem.eql(u8, flag, "-L")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             if (out.lora_spec_count >= out.lora_specs.len) return error.TooManyLoraAdapters;
             out.lora_specs[out.lora_spec_count] = try parseLoraSpecArg(args[i]);
             out.lora_spec_count += 1;
-        } else if (std.mem.eql(u8, flag, "--disk-prefix-cache")) {
+        } else if (std.mem.eql(u8, flag, "--disk-prefix-cache") or std.mem.eql(u8, flag, "-D")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             if (args[i].len == 0) return error.InvalidFlagValue;
@@ -5855,12 +6030,40 @@ fn parseChatCliArgs(args: []const [:0]const u8) !ChatCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             out.prefix_cache_chunks = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib") or std.mem.eql(u8, flag, "-W")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             out.wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
-        } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
+        } else if (std.mem.eql(u8, flag, "--strict-live-ram") or std.mem.eql(u8, flag, "-S")) {
+            out.strict_live_ram = true;
+        } else if (std.mem.eql(u8, flag, "--no-verify-crc") or std.mem.eql(u8, flag, "-V")) {
             out.verify_crcs = false;
+        } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-' and
+            !std.mem.eql(u8, flag, "-s") and !std.mem.eql(u8, flag, "-n") and !std.mem.eql(u8, flag, "-t"))
+        {
+            for (flag[1..]) |ch| {
+                const repl_flag: ?[]const u8 = switch (ch) {
+                    'C' => "--no-color",
+                    'H' => "--hide-think",
+                    'h' => "--help",
+                    'N' => "--no-think",
+                    'q' => "--no-stats",
+                    'S' => blk: {
+                        out.strict_live_ram = true;
+                        break :blk null;
+                    },
+                    'V' => blk: {
+                        out.verify_crcs = false;
+                        break :blk null;
+                    },
+                    else => return error.InvalidCliArgument,
+                };
+                if (repl_flag) |rf| {
+                    if (repl_args_len >= repl_args_buf.len) return error.TooManyFlags;
+                    repl_args_buf[repl_args_len] = rf;
+                    repl_args_len += 1;
+                }
+            }
         } else {
             if (repl_args_len >= repl_args_buf.len) return error.TooManyFlags;
             repl_args_buf[repl_args_len] = flag;
@@ -6160,6 +6363,7 @@ fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
         .max_tree_nodes = 32,
         .verify_crcs = cli.verify_crcs,
         .budget_override = budget_override,
+        .strict_live_ram = cli.strict_live_ram,
         .continuous_batch_only = true,
     });
     defer model.deinit(allocator);
@@ -7018,4 +7222,52 @@ test "M7.5 CLI parsers handle W18 optional metadata flags, C18 --api-key/--unix-
 
     try std.testing.expectError(error.InvalidLoraSpec, parseLoraSpecArg("no_equals"));
     try std.testing.expectError(error.InvalidLoraSpec, parseLoraSpecArg("=missing_name.amlora"));
+
+    // Verify ssh-style POSIX clustered boolean short flags across monitor, chat, decode, spec-decode, serve, and peer-worker.
+    const mon_cfg = try aminfer.tui.MonitorConfig.parseArgs(&.{ "-1j", "-s", "127.0.0.1:9090", "-i", "750" });
+    try std.testing.expect(mon_cfg.once);
+    try std.testing.expect(mon_cfg.json);
+    try std.testing.expectEqual(@as(u32, 750), mon_cfg.interval_ms);
+    try std.testing.expectEqualStrings("127.0.0.1:9090", mon_cfg.server_addr.?);
+
+    const chat_posix = try parseChatCliArgs(&.{ "-CHqNSV", "-m", "single_file.amf", "-L", "sql=sql.amlora", "-D", "/tmp/kv" });
+    try std.testing.expect(!chat_posix.chat_cfg.use_color);
+    try std.testing.expectEqual(aminfer.chat_repl.ThinkDisplayMode.hidden, chat_posix.chat_cfg.think_display);
+    try std.testing.expect(!chat_posix.chat_cfg.show_stats);
+    try std.testing.expect(!chat_posix.chat_cfg.enable_thinking);
+    try std.testing.expect(chat_posix.strict_live_ram);
+    try std.testing.expect(!chat_posix.verify_crcs);
+
+    const dec_posix = try parseDecodeArgs(&.{ "-AEelNRSV", "-m", "m.amf", "-p", "hi", "-n", "32" });
+    try std.testing.expect(!dec_posix.enable_ane_predictor);
+    try std.testing.expect(dec_posix.m6.loop_early_exit);
+    try std.testing.expect(dec_posix.ignore_eos);
+    try std.testing.expect(dec_posix.m7.shutdown_peers);
+    try std.testing.expect(dec_posix.m69.strict_nax);
+    try std.testing.expect(dec_posix.m7.strict_tb5_rdma);
+    try std.testing.expect(dec_posix.strict_live_ram);
+    try std.testing.expect(!dec_posix.verify_crcs);
+    try std.testing.expectEqual(@as(u32, 32), dec_posix.max_tokens);
+
+    const spec_posix = try parseSpecDecodeArgs(&.{ "-AEelNPRSV", "-m", "m.amf", "-p", "hi", "-M", "dspark" });
+    try std.testing.expect(!spec_posix.enable_pruning);
+    try std.testing.expect(!spec_posix.enable_ane_predictor);
+    try std.testing.expect(spec_posix.m6.loop_early_exit);
+    try std.testing.expect(spec_posix.ignore_eos);
+    try std.testing.expect(spec_posix.m7.shutdown_peers);
+    try std.testing.expect(spec_posix.m69.strict_nax);
+    try std.testing.expect(spec_posix.m7.strict_tb5_rdma);
+    try std.testing.expect(spec_posix.strict_live_ram);
+    try std.testing.expect(!spec_posix.verify_crcs);
+
+    const srv_posix = try parseServeArgs(&.{ "-ABEMNPSV", "-m", "m.amf", "-p", "8081", "-u", "/tmp/s.sock", "-a", "k1" });
+    try std.testing.expect(!srv_posix.enable_ane_predictor);
+    try std.testing.expect(!srv_posix.message_boundary_cache);
+    try std.testing.expect(srv_posix.m6.loop_early_exit);
+    try std.testing.expect(!srv_posix.adaptive_prefill_narrow);
+    try std.testing.expect(srv_posix.m69.strict_nax);
+    try std.testing.expect(!srv_posix.enable_pruning);
+    try std.testing.expect(srv_posix.strict_live_ram);
+    try std.testing.expect(!srv_posix.verify_crcs);
+    try std.testing.expectEqual(@as(u16, 8081), srv_posix.port);
 }
