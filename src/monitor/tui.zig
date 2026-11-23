@@ -1180,7 +1180,6 @@ pub const MonitorState = struct {
             .bg = pal.main_bg,
             .bold = true,
         });
-        x = canvas.putFmtClipped(x, 0, canvas.cols, .{ .fg = pal.hi_fg, .bg = pal.main_bg }, "[{s}] ", .{pal.name()});
         x = canvas.putFmtClipped(
             x,
             0,
@@ -2098,6 +2097,7 @@ test "Canvas double-buffered diff rendering and --once/--json modes run with zer
     const full_diff = try canvas.encodeDiff(true);
     try std.testing.expect(full_diff.len > 1024);
     try std.testing.expect(std.mem.indexOf(u8, full_diff, "aminfer monitor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_diff, "trans-pride") == null);
     try std.testing.expect(std.mem.indexOf(u8, full_diff, "17;19;29m") != null); // #11131D main_bg
 
     const noop_diff = try canvas.encodeDiff(false);

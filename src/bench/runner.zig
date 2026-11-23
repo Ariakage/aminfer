@@ -15095,8 +15095,10 @@ pub fn runM75WithConfig(allocator: std.mem.Allocator, cfg: M75Config) !M75Report
     // -----------------------------------------------------------------------
     const sdk_cycles = @max(@as(u32, 1), cfg.sdk_create_destroy_iters);
     var dylib_loaded = false;
-    const vm_c17_b = try vmstat.Snapshot.capture();
-    const c17_t0 = try vmstat.nowNs();
+    var vm_c17_b = try vmstat.Snapshot.capture();
+    var vm_c17_a = vm_c17_b;
+    var c17_t0 = try vmstat.nowNs();
+    var c17_t1 = c17_t0;
 
     const dylib_handle = std.c.dlopen("zig-out/lib/libaminfer.dylib", .{ .LAZY = true, .LOCAL = true });
     if (dylib_handle) |h_dl| {
@@ -15139,15 +15141,37 @@ pub fn runM75WithConfig(allocator: std.mem.Allocator, cfg: M75Config) !M75Report
             eopts.max_seq_len = 128;
             eopts.startup_canary = 0;
 
+            // Warm up 1 create/destroy cycle so one-time IOGPU/Metal driver
+            // singleton pages are settled before measuring per-cycle wired delta.
+            {
+                var warm_ptr: ?*anyopaque = null;
+                const wrc = createEng(&eopts, &warm_ptr);
+                if (wrc != 0 or warm_ptr == null) return error.SdkEngineCreateFailed;
+                destroyEng(warm_ptr);
+            }
+            vm_c17_b = try vmstat.Snapshot.capture();
+            c17_t0 = try vmstat.nowNs();
             for (0..sdk_cycles) |_| {
                 var eng_ptr: ?*anyopaque = null;
                 const rc = createEng(&eopts, &eng_ptr);
                 if (rc != 0 or eng_ptr == null) return error.SdkEngineCreateFailed;
                 destroyEng(eng_ptr);
             }
+            c17_t1 = try vmstat.nowNs();
+            vm_c17_a = try vmstat.Snapshot.capture();
         }
     }
     if (!dylib_loaded) {
+        {
+            var warm_m = try qwen3.Qwen3Model.loadFromFileAutoConfig(allocator, sf_path, null, .{
+                .max_seq_len = 128,
+                .max_tree_nodes = 1,
+                .startup_canary = false,
+            });
+            warm_m.deinit(allocator);
+        }
+        vm_c17_b = try vmstat.Snapshot.capture();
+        c17_t0 = try vmstat.nowNs();
         for (0..sdk_cycles) |_| {
             var tmp_m = try qwen3.Qwen3Model.loadFromFileAutoConfig(allocator, sf_path, null, .{
                 .max_seq_len = 128,
@@ -15157,9 +15181,9 @@ pub fn runM75WithConfig(allocator: std.mem.Allocator, cfg: M75Config) !M75Report
             _ = try tmp_m.prefillPrompt(&prompt_ids, true);
             tmp_m.deinit(allocator);
         }
+        c17_t1 = try vmstat.nowNs();
+        vm_c17_a = try vmstat.Snapshot.capture();
     }
-    const c17_t1 = try vmstat.nowNs();
-    const vm_c17_a = try vmstat.Snapshot.capture();
     const c17_cycle_ms = (@as(f64, @floatFromInt(c17_t1 -| c17_t0)) / @as(f64, @floatFromInt(sdk_cycles))) / 1_000_000.0;
     const c17_leaked_pages: i64 = if (vm_c17_a.wire_pages > vm_c17_b.wire_pages + 64)
         @intCast(vm_c17_a.wire_pages - vm_c17_b.wire_pages)

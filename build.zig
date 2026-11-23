@@ -210,9 +210,14 @@ pub fn build(b: *std.Build) void {
     const run_sdk_test = b.addRunArtifact(sdk_test);
     b.step("test-sdk", "Run M7.5 C17 libaminfer C-ABI unit tests").dependOn(&run_sdk_test.step);
 
+    const run_mod_test = b.addRunArtifact(b.addTest(.{ .root_module = mod }));
+    const run_exe_test = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
+    run_exe_test.step.dependOn(&run_mod_test.step);
+    run_sdk_test.step.dependOn(&run_exe_test.step);
+
     const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
+    test_step.dependOn(&run_mod_test.step);
+    test_step.dependOn(&run_exe_test.step);
     test_step.dependOn(&run_sdk_test.step);
 }
 
