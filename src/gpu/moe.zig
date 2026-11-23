@@ -34,6 +34,57 @@ pub const MAX_WIDE_PREFILL_TOKENS: u32 = 1024;
 pub const NUM_SCHEME_BUCKETS: usize = quant.WeightDType.COUNT;
 /// Byte stride between adjacent `ScheduleHeader` records inside `bucket_headers`.
 pub const BUCKET_HEADER_STRIDE: usize = 64;
+/// Byte offsets of the three G20 `metal.IndirectDispatchArgs` (`[3]u32`, 12 B each)
+/// embedded inside every 64-byte schedule slot (`schedule_header_off` and
+/// `bucket_headers_off + s * BUCKET_HEADER_STRIDE`, ADR-0023 §3).
+pub const INDIRECT_GATE_UP_Q_OFFSET: u64 = 16;
+pub const INDIRECT_GATE_UP_F_OFFSET: u64 = 28;
+pub const INDIRECT_DOWN_OFFSET: u64 = 40;
+
+/// M7.8 G20 static-grid crossover guard (ADR-0023 §3):
+/// When `M == 1` and all routed experts in the layer share a single homogeneous
+/// `DType` (`num_scheme_buckets <= 1`), `active_bucket_pairs == top_k` is
+/// statically known with zero empty threadgroups; keep direct CPU-encoded
+/// `dispatchThreadgroups` so `M = 1` decode pays zero indirect fetch stall.
+/// Activate GPU indirect dispatch ONLY when `M > 1` or `num_scheme_buckets > 1`.
+pub inline fn shouldUseIndirectDispatch(m: u32, num_scheme_buckets: u32) bool {
+    return m > 1 or num_scheme_buckets > 1;
+}
+
+/// Counts how many `WeightDType` scheme buckets are statically populated in a layer.
+pub inline fn countActiveSchemeBuckets(scheme_counts: [NUM_SCHEME_BUCKETS]u32) u32 {
+    var active: u32 = 0;
+    for (scheme_counts) |cnt| {
+        if (cnt > 0) active += 1;
+    }
+    return active;
+}
+
+inline fn gateUpGroupsXQ(intermediate_size: u32) u32 {
+    return @intCast((@as(u64, intermediate_size) + 7) / 8);
+}
+
+inline fn gateUpGroupsXF(intermediate_size: u32) u32 {
+    return @intCast((@as(u64, intermediate_size) + 15) / 16);
+}
+
+inline fn downGroupsX(hidden_size: u32) u32 {
+    return @intCast((@as(u64, hidden_size) + 15) / 16);
+}
+
+inline fn writeScheduleSlotIndirect(
+    slot_base: [*]u8,
+    active_experts: u32,
+    intermediate_size: u32,
+    hidden_size: u32,
+) void {
+    const gu_q: *metal.IndirectDispatchArgs = @ptrCast(@alignCast(slot_base + INDIRECT_GATE_UP_Q_OFFSET));
+    const gu_f: *metal.IndirectDispatchArgs = @ptrCast(@alignCast(slot_base + INDIRECT_GATE_UP_F_OFFSET));
+    const dn: *metal.IndirectDispatchArgs = @ptrCast(@alignCast(slot_base + INDIRECT_DOWN_OFFSET));
+    gu_q.* = metal.IndirectDispatchArgs.init(gateUpGroupsXQ(intermediate_size), active_experts, 1);
+    gu_f.* = metal.IndirectDispatchArgs.init(gateUpGroupsXF(intermediate_size), active_experts, 1);
+    dn.* = metal.IndirectDispatchArgs.init(downGroupsX(hidden_size), active_experts, 1);
+}
 
 /// Device-memory expert weight offset table entry (48 bytes, zero padding).
 /// All offsets are 64-bit byte offsets from the bound resident weights buffer,
@@ -73,6 +124,10 @@ pub const RouteParams = extern struct {
     num_experts: u32,
     top_k: u32,
     norm_topk_prob: u32,
+    gate_up_groups_x_q: u32 = 0,
+    gate_up_groups_x_f: u32 = 0,
+    down_groups_x: u32 = 0,
+    reserved: u32 = 0,
 };
 
 pub const MoeGateUpParams = extern struct {
@@ -186,7 +241,7 @@ pub const GatherRowsParams = extern struct {
     _pad1: u32 = 0,
 };
 
-/// Uniform payload matching `struct BucketRouteParams` in `moe_ffn.metal` (G13, ADR-0017).
+/// Uniform payload matching `struct BucketRouteParams` in `moe_ffn.metal` (G13/G20, ADR-0017/ADR-0023).
 pub const BucketRouteParams = extern struct {
     m: u32,
     num_experts: u32,
@@ -194,8 +249,12 @@ pub const BucketRouteParams = extern struct {
     norm_topk_prob: u32,
     bucket_unique_stride: u32,
     bucket_offsets_stride: u32,
+    gate_up_groups_x_q: u32 = 0,
+    gate_up_groups_x_f: u32 = 0,
+    down_groups_x: u32 = 0,
     _pad0: u32 = 0,
     _pad1: u32 = 0,
+    _pad2: u32 = 0,
 };
 
 /// Uniform payload matching `struct MoeSharedGateParams` in `moe_ffn.metal` (G7).
@@ -240,7 +299,7 @@ comptime {
     if (@sizeOf(ExpertWeights) != 48) @compileError("ExpertWeights must be 48 bytes");
     if (@sizeOf(ScheduleHeader) != 16) @compileError("ScheduleHeader must be 16 bytes");
     if (@sizeOf(RouterProjParams) != 16) @compileError("RouterProjParams must be 16 bytes");
-    if (@sizeOf(RouteParams) != 16) @compileError("RouteParams must be 16 bytes");
+    if (@sizeOf(RouteParams) != 32) @compileError("RouteParams must be 32 bytes");
     if (@sizeOf(MoeGateUpParams) != 16) @compileError("MoeGateUpParams must be 16 bytes");
     if (@sizeOf(MoeDownParams) != 24) @compileError("MoeDownParams must be 24 bytes");
     if (@sizeOf(MoeReduceParams) != 16) @compileError("MoeReduceParams must be 16 bytes");
@@ -254,7 +313,7 @@ comptime {
     if (@sizeOf(MoePerSlotParams) != 24) @compileError("MoePerSlotParams must be 24 bytes");
     if (@sizeOf(CopyStridedParams) != 32) @compileError("CopyStridedParams must be 32 bytes");
     if (@sizeOf(GatherRowsParams) != 16) @compileError("GatherRowsParams must be 16 bytes");
-    if (@sizeOf(BucketRouteParams) != 32) @compileError("BucketRouteParams must be 32 bytes");
+    if (@sizeOf(BucketRouteParams) != 48) @compileError("BucketRouteParams must be 48 bytes");
     if (@sizeOf(MoeSharedGateParams) != 16) @compileError("MoeSharedGateParams must be 16 bytes");
     if (@sizeOf(MoeSharedGateUpParams) != 64) @compileError("MoeSharedGateUpParams must be 64 bytes");
     if (@sizeOf(MoeSharedDownParams) != 48) @compileError("MoeSharedDownParams must be 48 bytes");
@@ -333,6 +392,7 @@ pub const MoeWorkspace = struct {
     shared_inter_off: u64,
 
     router_logits: []f32,
+    schedule_header_raw: []u8,
     schedule_header: *ScheduleHeader,
     unique_experts: []u32,
     expert_token_offsets: []u32,
@@ -374,7 +434,7 @@ pub const MoeWorkspace = struct {
 
         const sizes = [_]usize{
             std.math.mul(usize, logits_elems, @sizeOf(f32)) catch return error.Overflow,
-            @sizeOf(ScheduleHeader),
+            BUCKET_HEADER_STRIDE,
             std.math.mul(usize, n_exp, @sizeOf(u32)) catch return error.Overflow,
             std.math.mul(usize, n_exp + 1, @sizeOf(u32)) catch return error.Overflow,
             std.math.mul(usize, assignments, @sizeOf(u32)) catch return error.Overflow,
@@ -433,7 +493,7 @@ pub const MoeWorkspace = struct {
             0;
 
         const router_logits_raw = try arena.allocAligned(logits_bytes, 64);
-        const sched_hdr_raw = try arena.allocAligned(@sizeOf(ScheduleHeader), 64);
+        const sched_hdr_raw = try arena.allocAligned(BUCKET_HEADER_STRIDE, 64);
         const uniq_raw = try arena.allocAligned(uniq_bytes, 64);
         const offs_raw = try arena.allocAligned(offs_bytes, 64);
         const tok_idx_raw = try arena.allocAligned(tok_idx_bytes, 64);
@@ -481,6 +541,7 @@ pub const MoeWorkspace = struct {
             .shared_gate_scores_off = arena.offsetOf(shared_gate_raw.ptr),
             .shared_inter_off = shared_inter_off,
             .router_logits = @alignCast(std.mem.bytesAsSlice(f32, router_logits_raw)),
+            .schedule_header_raw = sched_hdr_raw,
             .schedule_header = @ptrCast(@alignCast(sched_hdr_raw.ptr)),
             .unique_experts = @alignCast(std.mem.bytesAsSlice(u32, uniq_raw)),
             .expert_token_offsets = @alignCast(std.mem.bytesAsSlice(u32, offs_raw)),
@@ -522,6 +583,38 @@ pub const MoeWorkspace = struct {
 
     pub fn bucketHeaderMut(self: *MoeWorkspace, scheme: quant.WeightDType) *ScheduleHeader {
         const off: usize = @as(usize, @backingInt(scheme)) * BUCKET_HEADER_STRIDE;
+        return @ptrCast(@alignCast(self.bucket_headers_raw.ptr + off));
+    }
+
+    pub fn scheduleIndirectOffset(self: *const MoeWorkspace, scheme: ?quant.WeightDType, field_off: u64) u64 {
+        const base = if (scheme) |s| self.bucketHeaderOffset(s) else self.schedule_header_off;
+        return base + field_off;
+    }
+
+    pub fn scheduleIndirectGateUpQ(self: *const MoeWorkspace) *const metal.IndirectDispatchArgs {
+        return @ptrCast(@alignCast(self.schedule_header_raw.ptr + INDIRECT_GATE_UP_Q_OFFSET));
+    }
+
+    pub fn scheduleIndirectGateUpF(self: *const MoeWorkspace) *const metal.IndirectDispatchArgs {
+        return @ptrCast(@alignCast(self.schedule_header_raw.ptr + INDIRECT_GATE_UP_F_OFFSET));
+    }
+
+    pub fn scheduleIndirectDown(self: *const MoeWorkspace) *const metal.IndirectDispatchArgs {
+        return @ptrCast(@alignCast(self.schedule_header_raw.ptr + INDIRECT_DOWN_OFFSET));
+    }
+
+    pub fn bucketIndirectGateUpQ(self: *const MoeWorkspace, scheme: quant.WeightDType) *const metal.IndirectDispatchArgs {
+        const off: usize = @as(usize, @backingInt(scheme)) * BUCKET_HEADER_STRIDE + INDIRECT_GATE_UP_Q_OFFSET;
+        return @ptrCast(@alignCast(self.bucket_headers_raw.ptr + off));
+    }
+
+    pub fn bucketIndirectGateUpF(self: *const MoeWorkspace, scheme: quant.WeightDType) *const metal.IndirectDispatchArgs {
+        const off: usize = @as(usize, @backingInt(scheme)) * BUCKET_HEADER_STRIDE + INDIRECT_GATE_UP_F_OFFSET;
+        return @ptrCast(@alignCast(self.bucket_headers_raw.ptr + off));
+    }
+
+    pub fn bucketIndirectDown(self: *const MoeWorkspace, scheme: quant.WeightDType) *const metal.IndirectDispatchArgs {
+        const off: usize = @as(usize, @backingInt(scheme)) * BUCKET_HEADER_STRIDE + INDIRECT_DOWN_OFFSET;
         return @ptrCast(@alignCast(self.bucket_headers_raw.ptr + off));
     }
 
@@ -605,10 +698,22 @@ pub const MoeWorkspace = struct {
                 .m = m_val,
                 .top_k = top_k_val,
             };
+            writeScheduleSlotIndirect(
+                self.bucket_headers_raw.ptr + s_idx * BUCKET_HEADER_STRIDE,
+                u_s,
+                self.spec.intermediate_size,
+                self.spec.hidden_size,
+            );
         }
         self.expert_token_offsets[run_u] = run_a;
         self.schedule_header.num_unique_experts = run_u;
         self.schedule_header.total_assignments = run_a;
+        writeScheduleSlotIndirect(
+            self.schedule_header_raw.ptr,
+            run_u,
+            self.spec.intermediate_size,
+            self.spec.hidden_size,
+        );
     }
 };
 
@@ -640,6 +745,9 @@ pub const RouteTopKArgs = struct {
     num_experts: u32,
     top_k: u32,
     norm_topk_prob: bool = true,
+    /// Optional layer dimensions for G20 indirect dispatch args (0 defaults to `workspace.spec`).
+    hidden_size: u32 = 0,
+    intermediate_size: u32 = 0,
 };
 
 /// Arguments for G13 scheme-bucketed routing (`ami_moe_route_topk_bucketed`).
@@ -653,6 +761,9 @@ pub const RouteTopKBucketedArgs = struct {
     num_experts: u32,
     top_k: u32,
     norm_topk_prob: bool = true,
+    /// Optional layer dimensions for G20 indirect dispatch args (0 defaults to `workspace.spec`).
+    hidden_size: u32 = 0,
+    intermediate_size: u32 = 0,
 };
 
 pub const GateUpSwigluArgs = struct {
@@ -670,6 +781,8 @@ pub const GateUpSwigluArgs = struct {
     scheme_bucket: ?quant.WeightDType = null,
     /// Optional tighter grid bound for a scheme bucket (defaults to `num_experts`).
     max_active_override: ?u32 = null,
+    /// Optional G20 indirect dispatch override; when null, applies `shouldUseIndirectDispatch`.
+    use_indirect: ?bool = null,
 };
 
 pub const DownProjArgs = struct {
@@ -686,6 +799,8 @@ pub const DownProjArgs = struct {
     scheme_bucket: ?quant.WeightDType = null,
     /// Optional tighter grid bound for a scheme bucket (defaults to `num_experts`).
     max_active_override: ?u32 = null,
+    /// Optional G20 indirect dispatch override; when null, applies `shouldUseIndirectDispatch`.
+    use_indirect: ?bool = null,
 };
 
 pub const ReduceArgs = struct {
@@ -1418,14 +1533,19 @@ pub const MoePipelines = struct {
             .f32 => if (args.top_k == 8) self.route_topk_f32_k8 else self.route_topk_f32_dyn,
             .f16 => if (args.top_k == 8) self.route_topk_f16_k8 else self.route_topk_f16_dyn,
         };
+        const ws = args.workspace;
+        const wb = args.workspace_buf;
+        const eff_inter = if (args.intermediate_size > 0) args.intermediate_size else ws.spec.intermediate_size;
+        const eff_hidden = if (args.hidden_size > 0) args.hidden_size else ws.spec.hidden_size;
         const params: RouteParams = .{
             .m = args.m,
             .num_experts = args.num_experts,
             .top_k = args.top_k,
             .norm_topk_prob = if (args.norm_topk_prob) 1 else 0,
+            .gate_up_groups_x_q = gateUpGroupsXQ(eff_inter),
+            .gate_up_groups_x_f = gateUpGroupsXF(eff_inter),
+            .down_groups_x = downGroupsX(eff_hidden),
         };
-        const ws = args.workspace;
-        const wb = args.workspace_buf;
         try frame.encodeThreadgroups(
             pipe,
             &.{
@@ -1473,6 +1593,8 @@ pub const MoePipelines = struct {
         };
         const ws = args.workspace;
         const wb = args.workspace_buf;
+        const eff_inter = if (args.intermediate_size > 0) args.intermediate_size else ws.spec.intermediate_size;
+        const eff_hidden = if (args.hidden_size > 0) args.hidden_size else ws.spec.hidden_size;
         const params: BucketRouteParams = .{
             .m = args.m,
             .num_experts = args.num_experts,
@@ -1480,6 +1602,9 @@ pub const MoePipelines = struct {
             .norm_topk_prob = if (args.norm_topk_prob) 1 else 0,
             .bucket_unique_stride = ws.bucket_unique_stride_u32,
             .bucket_offsets_stride = ws.bucket_offsets_stride_u32,
+            .gate_up_groups_x_q = gateUpGroupsXQ(eff_inter),
+            .gate_up_groups_x_f = gateUpGroupsXF(eff_inter),
+            .down_groups_x = downGroupsX(eff_hidden),
         };
         try frame.encodeThreadgroups(
             pipe,
@@ -1557,23 +1682,37 @@ pub const MoePipelines = struct {
         const hdr_off = if (args.scheme_bucket) |s| ws.bucketHeaderOffset(s) else ws.schedule_header_off;
         const unique_off = if (args.scheme_bucket) |s| ws.bucketUniqueOffset(s) else ws.unique_experts_off;
         const offsets_off = if (args.scheme_bucket) |s| ws.bucketOffsetsOffset(s) else ws.expert_token_offsets_off;
-        try frame.encodeThreadgroups(
-            pipe,
-            &.{
-                args.x,
-                args.weights_base,
-                args.expert_table,
-                .{ .buffer = wb, .offset = hdr_off },
-                .{ .buffer = wb, .offset = unique_off },
-                .{ .buffer = wb, .offset = offsets_off },
-                .{ .buffer = wb, .offset = ws.token_indices_off },
-                .{ .buffer = wb, .offset = ws.inter_off },
-            },
-            std.mem.asBytes(&params),
-            .{ groups_x, max_active, 1 },
-            .{ 128, 1, 1 },
-            insert_barrier_before,
-        );
+        const bindings = [_]metal.BufferBinding{
+            args.x,
+            args.weights_base,
+            args.expert_table,
+            .{ .buffer = wb, .offset = hdr_off },
+            .{ .buffer = wb, .offset = unique_off },
+            .{ .buffer = wb, .offset = offsets_off },
+            .{ .buffer = wb, .offset = ws.token_indices_off },
+            .{ .buffer = wb, .offset = ws.inter_off },
+        };
+        const use_indirect = args.use_indirect orelse
+            shouldUseIndirectDispatch(args.m, if (args.scheme_bucket != null) 2 else 1);
+        if (use_indirect) {
+            try frame.encodeThreadgroupsIndirect(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(args.scheme_bucket, INDIRECT_GATE_UP_Q_OFFSET) },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        } else {
+            try frame.encodeThreadgroups(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ groups_x, max_active, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        }
     }
 
     pub fn encodeDownProj(
@@ -1630,25 +1769,39 @@ pub const MoePipelines = struct {
         const hdr_off = if (args.scheme_bucket) |s| ws.bucketHeaderOffset(s) else ws.schedule_header_off;
         const unique_off = if (args.scheme_bucket) |s| ws.bucketUniqueOffset(s) else ws.unique_experts_off;
         const offsets_off = if (args.scheme_bucket) |s| ws.bucketOffsetsOffset(s) else ws.expert_token_offsets_off;
-        try frame.encodeThreadgroups(
-            pipe,
-            &.{
-                .{ .buffer = wb, .offset = ws.inter_off },
-                args.weights_base,
-                args.expert_table,
-                .{ .buffer = wb, .offset = hdr_off },
-                .{ .buffer = wb, .offset = unique_off },
-                .{ .buffer = wb, .offset = offsets_off },
-                .{ .buffer = wb, .offset = ws.token_indices_off },
-                .{ .buffer = wb, .offset = ws.routing_weights_off },
-                .{ .buffer = wb, .offset = ws.slot_k_indices_off },
-                .{ .buffer = wb, .offset = ws.down_out_off },
-            },
-            std.mem.asBytes(&params),
-            .{ groups_x, max_active, 1 },
-            .{ 128, 1, 1 },
-            insert_barrier_before,
-        );
+        const bindings = [_]metal.BufferBinding{
+            .{ .buffer = wb, .offset = ws.inter_off },
+            args.weights_base,
+            args.expert_table,
+            .{ .buffer = wb, .offset = hdr_off },
+            .{ .buffer = wb, .offset = unique_off },
+            .{ .buffer = wb, .offset = offsets_off },
+            .{ .buffer = wb, .offset = ws.token_indices_off },
+            .{ .buffer = wb, .offset = ws.routing_weights_off },
+            .{ .buffer = wb, .offset = ws.slot_k_indices_off },
+            .{ .buffer = wb, .offset = ws.down_out_off },
+        };
+        const use_indirect = args.use_indirect orelse
+            shouldUseIndirectDispatch(args.m, if (args.scheme_bucket != null) 2 else 1);
+        if (use_indirect) {
+            try frame.encodeThreadgroupsIndirect(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(args.scheme_bucket, INDIRECT_DOWN_OFFSET) },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        } else {
+            try frame.encodeThreadgroups(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ groups_x, max_active, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        }
     }
 
     pub fn encodeReduce(
@@ -1703,6 +1856,9 @@ pub const MoePipelines = struct {
     ) EncodeError!void {
         try self.encodeRouting(frame, args, insert_barrier_before);
 
+        // M7.8 G20 M=1 static-grid guard: homogeneous M==1 stays on direct dispatch.
+        const use_indirect = shouldUseIndirectDispatch(args.m, 1);
+
         try self.encodeGateUpSwiglu(frame, bits, .{
             .x = args.x,
             .weights_base = args.weights_base,
@@ -1714,6 +1870,7 @@ pub const MoePipelines = struct {
             .top_k = args.top_k,
             .hidden_size = args.hidden_size,
             .intermediate_size = args.intermediate_size,
+            .use_indirect = use_indirect,
         }, true);
 
         try self.encodeDownProj(frame, bits, .{
@@ -1726,6 +1883,7 @@ pub const MoePipelines = struct {
             .top_k = args.top_k,
             .hidden_size = args.hidden_size,
             .intermediate_size = args.intermediate_size,
+            .use_indirect = use_indirect,
         }, true);
 
         const default_shared_dt = quant.WeightDType.fromQuant(bits);
@@ -2036,6 +2194,8 @@ pub const MoePipelines = struct {
             .num_experts = args.num_experts,
             .top_k = args.top_k,
             .norm_topk_prob = args.norm_topk_prob,
+            .hidden_size = args.hidden_size,
+            .intermediate_size = args.intermediate_size,
         }, route_barrier);
     }
 
@@ -2086,6 +2246,8 @@ pub const MoePipelines = struct {
             .num_experts = base.num_experts,
             .top_k = base.top_k,
             .norm_topk_prob = base.norm_topk_prob,
+            .hidden_size = base.hidden_size,
+            .intermediate_size = base.intermediate_size,
         }, route_barrier);
     }
 
@@ -2097,6 +2259,9 @@ pub const MoePipelines = struct {
     /// When `skip_empty_from_host` is true (e.g., `ColdRuntime` after GPU
     /// routing sync), reads each bucket's live `num_unique_experts` from
     /// shared RAM and omits runtime-empty buckets completely.
+    /// Otherwise enforces the M7.8 G20 static-grid guard: keeps direct dispatch
+    /// only when `M == 1` and `num_scheme_buckets <= 1`, and uses GPU indirect
+    /// dispatch whenever `M > 1` or `num_scheme_buckets > 1`.
     pub fn encodeGateUpDownHetero(
         self: MoePipelines,
         frame: *metal.Compute.Frame,
@@ -2105,6 +2270,12 @@ pub const MoePipelines = struct {
         skip_empty_from_host: bool,
         insert_barrier_before: bool,
     ) EncodeError!void {
+        const num_scheme_buckets = countActiveSchemeBuckets(scheme_counts);
+        const use_indirect = if (skip_empty_from_host)
+            false
+        else
+            shouldUseIndirectDispatch(base.m, num_scheme_buckets);
+
         var bucket_caps: [NUM_SCHEME_BUCKETS]u32 = undefined;
         for (0..NUM_SCHEME_BUCKETS) |s_idx| {
             const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
@@ -2136,6 +2307,7 @@ pub const MoePipelines = struct {
                 .intermediate_size = base.intermediate_size,
                 .scheme_bucket = scheme,
                 .max_active_override = cap,
+                .use_indirect = use_indirect,
             };
             switch (scheme) {
                 .f16 => try self.encodeGateUpSwigluFloat(frame, .f16, gu_args, barrier),
@@ -2168,6 +2340,7 @@ pub const MoePipelines = struct {
                 .intermediate_size = base.intermediate_size,
                 .scheme_bucket = scheme,
                 .max_active_override = cap,
+                .use_indirect = use_indirect,
             };
             switch (scheme) {
                 .f16 => try self.encodeDownProjFloat(frame, .f16, dn_args, barrier),
@@ -2282,23 +2455,37 @@ pub const MoePipelines = struct {
         const hdr_off = if (args.scheme_bucket) |s| ws.bucketHeaderOffset(s) else ws.schedule_header_off;
         const unique_off = if (args.scheme_bucket) |s| ws.bucketUniqueOffset(s) else ws.unique_experts_off;
         const offsets_off = if (args.scheme_bucket) |s| ws.bucketOffsetsOffset(s) else ws.expert_token_offsets_off;
-        try frame.encodeThreadgroups(
-            pipe,
-            &.{
-                args.x,
-                args.weights_base,
-                args.expert_table,
-                .{ .buffer = wb, .offset = hdr_off },
-                .{ .buffer = wb, .offset = unique_off },
-                .{ .buffer = wb, .offset = offsets_off },
-                .{ .buffer = wb, .offset = ws.token_indices_off },
-                .{ .buffer = wb, .offset = ws.inter_off },
-            },
-            std.mem.asBytes(&params),
-            .{ groups_x, max_active, 1 },
-            .{ 128, 1, 1 },
-            insert_barrier_before,
-        );
+        const bindings = [_]metal.BufferBinding{
+            args.x,
+            args.weights_base,
+            args.expert_table,
+            .{ .buffer = wb, .offset = hdr_off },
+            .{ .buffer = wb, .offset = unique_off },
+            .{ .buffer = wb, .offset = offsets_off },
+            .{ .buffer = wb, .offset = ws.token_indices_off },
+            .{ .buffer = wb, .offset = ws.inter_off },
+        };
+        const use_indirect = args.use_indirect orelse
+            shouldUseIndirectDispatch(args.m, if (args.scheme_bucket != null) 2 else 1);
+        if (use_indirect) {
+            try frame.encodeThreadgroupsIndirect(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(args.scheme_bucket, INDIRECT_GATE_UP_F_OFFSET) },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        } else {
+            try frame.encodeThreadgroups(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ groups_x, max_active, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        }
     }
 
     /// Encodes the deduplicated FP16 / BF16 expert down projection scaled by
@@ -2346,25 +2533,39 @@ pub const MoePipelines = struct {
         const hdr_off = if (args.scheme_bucket) |s| ws.bucketHeaderOffset(s) else ws.schedule_header_off;
         const unique_off = if (args.scheme_bucket) |s| ws.bucketUniqueOffset(s) else ws.unique_experts_off;
         const offsets_off = if (args.scheme_bucket) |s| ws.bucketOffsetsOffset(s) else ws.expert_token_offsets_off;
-        try frame.encodeThreadgroups(
-            pipe,
-            &.{
-                .{ .buffer = wb, .offset = ws.inter_off },
-                args.weights_base,
-                args.expert_table,
-                .{ .buffer = wb, .offset = hdr_off },
-                .{ .buffer = wb, .offset = unique_off },
-                .{ .buffer = wb, .offset = offsets_off },
-                .{ .buffer = wb, .offset = ws.token_indices_off },
-                .{ .buffer = wb, .offset = ws.routing_weights_off },
-                .{ .buffer = wb, .offset = ws.slot_k_indices_off },
-                .{ .buffer = wb, .offset = ws.down_out_off },
-            },
-            std.mem.asBytes(&params),
-            .{ groups_x, max_active, 1 },
-            .{ 128, 1, 1 },
-            insert_barrier_before,
-        );
+        const bindings = [_]metal.BufferBinding{
+            .{ .buffer = wb, .offset = ws.inter_off },
+            args.weights_base,
+            args.expert_table,
+            .{ .buffer = wb, .offset = hdr_off },
+            .{ .buffer = wb, .offset = unique_off },
+            .{ .buffer = wb, .offset = offsets_off },
+            .{ .buffer = wb, .offset = ws.token_indices_off },
+            .{ .buffer = wb, .offset = ws.routing_weights_off },
+            .{ .buffer = wb, .offset = ws.slot_k_indices_off },
+            .{ .buffer = wb, .offset = ws.down_out_off },
+        };
+        const use_indirect = args.use_indirect orelse
+            shouldUseIndirectDispatch(args.m, if (args.scheme_bucket != null) 2 else 1);
+        if (use_indirect) {
+            try frame.encodeThreadgroupsIndirect(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(args.scheme_bucket, INDIRECT_DOWN_OFFSET) },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        } else {
+            try frame.encodeThreadgroups(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ groups_x, max_active, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        }
     }
 
     /// Encodes a complete deduplicated FP16 / BF16 MoE FFN layer into `frame`:
@@ -2381,6 +2582,9 @@ pub const MoePipelines = struct {
         if (args.hidden_size % 4 != 0 or args.intermediate_size % 4 != 0) return error.UnalignedK;
         try self.encodeRouting(frame, args, insert_barrier_before);
 
+        // M7.8 G20 M=1 static-grid guard: homogeneous M==1 stays on direct dispatch.
+        const use_indirect = shouldUseIndirectDispatch(args.m, 1);
+
         try self.encodeGateUpSwigluFloat(frame, dtype, .{
             .x = args.x,
             .weights_base = args.weights_base,
@@ -2392,6 +2596,7 @@ pub const MoePipelines = struct {
             .top_k = args.top_k,
             .hidden_size = args.hidden_size,
             .intermediate_size = args.intermediate_size,
+            .use_indirect = use_indirect,
         }, true);
 
         try self.encodeDownProjFloat(frame, dtype, .{
@@ -2404,6 +2609,7 @@ pub const MoePipelines = struct {
             .top_k = args.top_k,
             .hidden_size = args.hidden_size,
             .intermediate_size = args.intermediate_size,
+            .use_indirect = use_indirect,
         }, true);
 
         try self.encodeReduceAndOptionalShared(frame, args, quant.WeightDType.fromFloat(dtype));
@@ -7109,5 +7315,372 @@ test "G15: wide MoeWorkspace (M=512, M=1024), 3-bucket hetero + shared_expert, r
     for (topk_ref, topk_gpu) |r, g| {
         try std.testing.expectEqual(r.token_id, g.token_id);
         try std.testing.expectApproxEqAbs(r.prob, g.prob, 1e-4);
+    }
+}
+
+test "G20 GPU indirect MoE dispatch: static-grid guard, exact indirect args, runtime-empty buckets, and direct-vs-indirect parity" {
+    // 1. M=1 static-grid guard truth table (ADR-0023 §3).
+    try std.testing.expect(!shouldUseIndirectDispatch(1, 0));
+    try std.testing.expect(!shouldUseIndirectDispatch(1, 1));
+    try std.testing.expect(shouldUseIndirectDispatch(1, 2));
+    try std.testing.expect(shouldUseIndirectDispatch(1, 5));
+    try std.testing.expect(shouldUseIndirectDispatch(2, 1));
+    try std.testing.expect(shouldUseIndirectDispatch(8, 1));
+    try std.testing.expect(shouldUseIndirectDispatch(8, 3));
+
+    try std.testing.expectEqual(@as(u32, 0), countActiveSchemeBuckets(.{ 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 1), countActiveSchemeBuckets(.{ 0, 0, 16, 0, 0 }));
+    try std.testing.expectEqual(@as(u32, 3), countActiveSchemeBuckets(.{ 2, 0, 4, 6, 0 }));
+    try std.testing.expectEqual(@as(u32, 5), countActiveSchemeBuckets(.{ 1, 1, 1, 1, 1 }));
+
+    const device = try metal.Device.open();
+    defer device.close();
+    const lib = try metal.Library.openEmbedded(device);
+    defer lib.close();
+    const pipes = try MoePipelines.init(device, lib);
+    defer pipes.close();
+
+    // 2. Verify exact GPU-written IndirectDispatchArgs on homogeneous M=8 (correlated U < M*top_k)
+    //    and direct vs indirect bit-for-bit output parity on q4_affine & f16.
+    const m: u32 = 8;
+    const num_experts: u32 = 16;
+    const top_k: u32 = 4;
+    const hidden_size: u32 = 192; // ceil(192/16) = 12
+    const intermediate_size: u32 = 128; // ceil(128/8) = 16, ceil(128/16) = 8
+
+    const ws_spec: WorkspaceSpec = .{
+        .max_tokens = m,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .hidden_size = hidden_size,
+        .intermediate_size = intermediate_size,
+    };
+    const ws_bytes = try MoeWorkspace.requiredBytes(ws_spec);
+    const q4_bytes = try expertLayerBytes(.q4, num_experts, hidden_size, intermediate_size);
+    const f16_bytes = try singleExpertBytesForDType(.f16, hidden_size, intermediate_size) * num_experts;
+    const total_bytes = ws_bytes * 2 + @as(usize, @intCast(q4_bytes + f16_bytes)) + 256 * 1024;
+    var arena = try makeTestArena(total_bytes);
+    defer arena.deinit();
+
+    var ws_ind = try MoeWorkspace.init(&arena, ws_spec);
+    var ws_dir = try MoeWorkspace.init(&arena, ws_spec);
+
+    const x_raw = try arena.allocAligned(m * hidden_size * @sizeOf(f16), 64);
+    const logits_raw = try arena.allocAligned(m * num_experts * @sizeOf(f32), 64);
+    const out_ind_raw = try arena.allocAligned(m * hidden_size * @sizeOf(f16), 64);
+    const out_dir_raw = try arena.allocAligned(m * hidden_size * @sizeOf(f16), 64);
+    const schemes_raw = try arena.allocAligned(num_experts, 64);
+    const q4_table_raw = try arena.allocAligned(num_experts * @sizeOf(ExpertWeights), 64);
+    const f16_table_raw = try arena.allocAligned(num_experts * @sizeOf(ExpertWeights), 64);
+    const hetero_table_raw = try arena.allocAligned(num_experts * @sizeOf(ExpertWeights), 64);
+
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    for (x_f16, 0..) |*v, i| {
+        v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 13 + 5) % 19)) - 9)) * 0.0625);
+    }
+
+    // Skew logits heavily toward experts {0, 1, 2, 3, 4, 5} so:
+    // - Homogeneous M=8 deduplicates to U = 6 < M * top_k = 32.
+    // - Heterogeneous 5-bucket layout leaves `.bf16` and `.q2_affine` buckets runtime-EMPTY (0 active experts)!
+    const logits_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, logits_raw));
+    for (0..m) |tok| {
+        for (0..num_experts) |e| {
+            logits_f32[tok * num_experts + e] = if (e < 6)
+                5.0 + @as(f32, @floatFromInt(((tok * 3 + e * 5) % 7))) * 0.25
+            else
+                -8.0 - @as(f32, @floatFromInt(e)) * 0.1;
+        }
+    }
+
+    // Populate q4_affine experts and f16 experts.
+    const q4_table: []ExpertWeights = @alignCast(std.mem.bytesAsSlice(ExpertWeights, q4_table_raw));
+    const f16_table: []ExpertWeights = @alignCast(std.mem.bytesAsSlice(ExpertWeights, f16_table_raw));
+    const hetero_table: []ExpertWeights = @alignCast(std.mem.bytesAsSlice(ExpertWeights, hetero_table_raw));
+
+    const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+    const gu_qw_bytes = try Q4.rowWeightBytes(hidden_size) * intermediate_size;
+    const gu_sb_bytes = try Q4.groupsPerRow(hidden_size) * intermediate_size * @sizeOf(quant.ScaleBias);
+    const dn_qw_bytes = try Q4.rowWeightBytes(intermediate_size) * hidden_size;
+    const dn_sb_bytes = try Q4.groupsPerRow(intermediate_size) * hidden_size * @sizeOf(quant.ScaleBias);
+
+    for (0..num_experts) |e| {
+        const g_qw = try arena.allocAligned(gu_qw_bytes, 64);
+        const g_sb = try arena.allocAligned(gu_sb_bytes, 64);
+        const u_qw = try arena.allocAligned(gu_qw_bytes, 64);
+        const u_sb = try arena.allocAligned(gu_sb_bytes, 64);
+        const d_qw = try arena.allocAligned(dn_qw_bytes, 64);
+        const d_sb = try arena.allocAligned(dn_sb_bytes, 64);
+        for (g_qw, 0..) |*b, i| b.* = @truncate((e * 29 + i * 7 + 3) & 0xFF);
+        for (u_qw, 0..) |*b, i| b.* = @truncate((e * 31 + i * 11 + 5) & 0xFF);
+        for (d_qw, 0..) |*b, i| b.* = @truncate((e * 37 + i * 13 + 7) & 0xFF);
+        for (std.mem.bytesAsSlice(quant.ScaleBias, g_sb)) |*sb| sb.* = .{ .scale = @floatCast(@as(f32, 0.015)), .bias = @floatCast(@as(f32, -0.10)) };
+        for (std.mem.bytesAsSlice(quant.ScaleBias, u_sb)) |*sb| sb.* = .{ .scale = @floatCast(@as(f32, 0.015)), .bias = @floatCast(@as(f32, -0.10)) };
+        for (std.mem.bytesAsSlice(quant.ScaleBias, d_sb)) |*sb| sb.* = .{ .scale = @floatCast(@as(f32, 0.015)), .bias = @floatCast(@as(f32, -0.10)) };
+        q4_table[e] = .{
+            .gate_qweight_offset = arena.offsetOf(g_qw.ptr),
+            .gate_sb_offset = arena.offsetOf(g_sb.ptr),
+            .up_qweight_offset = arena.offsetOf(u_qw.ptr),
+            .up_sb_offset = arena.offsetOf(u_sb.ptr),
+            .down_qweight_offset = arena.offsetOf(d_qw.ptr),
+            .down_sb_offset = arena.offsetOf(d_sb.ptr),
+        };
+
+        const fg = try arena.allocAligned(intermediate_size * hidden_size * @sizeOf(f16), 64);
+        const fu = try arena.allocAligned(intermediate_size * hidden_size * @sizeOf(f16), 64);
+        const fd = try arena.allocAligned(hidden_size * intermediate_size * @sizeOf(f16), 64);
+        for (@as([]f16, @alignCast(std.mem.bytesAsSlice(f16, fg))), 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((e * 17 + i) % 11)) - 5)) * 0.02);
+        for (@as([]f16, @alignCast(std.mem.bytesAsSlice(f16, fu))), 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((e * 19 + i) % 11)) - 5)) * 0.02);
+        for (@as([]f16, @alignCast(std.mem.bytesAsSlice(f16, fd))), 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((e * 23 + i) % 11)) - 5)) * 0.02);
+        f16_table[e] = .{
+            .gate_qweight_offset = arena.offsetOf(fg.ptr),
+            .gate_sb_offset = 0,
+            .up_qweight_offset = arena.offsetOf(fu.ptr),
+            .up_sb_offset = 0,
+            .down_qweight_offset = arena.offsetOf(fd.ptr),
+            .down_sb_offset = 0,
+        };
+    }
+
+    // Assign heterogeneous schemes: experts 0..2 = f16, 3..5 = q4_affine, 6..10 = bf16, 11..15 = q2_affine.
+    // Because router only selects experts 0..5, `.bf16` and `.q2_affine` have 0 active experts at runtime
+    // despite having non-zero static `scheme_counts`!
+    var expert_dtypes: [num_experts]quant.WeightDType = undefined;
+    var scheme_counts: [NUM_SCHEME_BUCKETS]u32 = @splat(0);
+    for (0..num_experts) |e| {
+        const dt: quant.WeightDType = if (e < 3) .f16 else if (e < 6) .q4_affine else if (e < 11) .bf16 else .q2_affine;
+        expert_dtypes[e] = dt;
+        schemes_raw[e] = @backingInt(dt);
+        scheme_counts[@backingInt(dt)] += 1;
+        hetero_table[e] = if (dt == .f16 or dt == .bf16) f16_table[e] else q4_table[e];
+    }
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const x_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) };
+    const logits_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(logits_raw.ptr) };
+    const out_ind_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_ind_raw.ptr) };
+    const out_dir_bind: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_dir_raw.ptr) };
+
+    // Test A: Homogeneous q4_affine M=8 — indirect (default via encodeMoELayer) vs explicit direct.
+    @memset(out_ind_raw, 0);
+    @memset(out_dir_raw, 0);
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        // Indirect path via encodeMoELayer (M=8 > 1 -> indirect enabled).
+        try pipes.encodeMoELayer(&frame, .q4, .{
+            .x = x_bind,
+            .router = .{ .logits = .{ .binding = logits_bind, .dtype = .f32 } },
+            .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+            .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q4_table_raw.ptr) },
+            .workspace = &ws_ind,
+            .workspace_buf = gpu_buf,
+            .out = out_ind_bind,
+            .m = m,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+        }, false);
+        // Direct path on ws_dir with explicit `use_indirect = false`.
+        try pipes.encodeRouteTopK(&frame, .f32, .{
+            .logits = logits_bind,
+            .workspace = &ws_dir,
+            .workspace_buf = gpu_buf,
+            .m = m,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+        }, true);
+        try pipes.encodeGateUpSwiglu(&frame, .q4, .{
+            .x = x_bind,
+            .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+            .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q4_table_raw.ptr) },
+            .workspace = &ws_dir,
+            .workspace_buf = gpu_buf,
+            .m = m,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .use_indirect = false,
+        }, true);
+        try pipes.encodeDownProj(&frame, .q4, .{
+            .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+            .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q4_table_raw.ptr) },
+            .workspace = &ws_dir,
+            .workspace_buf = gpu_buf,
+            .m = m,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .use_indirect = false,
+        }, true);
+        try pipes.encodeReduce(&frame, .{
+            .workspace = &ws_dir,
+            .workspace_buf = gpu_buf,
+            .out = out_dir_bind,
+            .m = m,
+            .hidden_size = hidden_size,
+            .top_k = top_k,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+
+    // Verify exact GPU-written IndirectDispatchArgs on homogeneous route_topk!
+    const active_u = ws_ind.schedule_header.num_unique_experts;
+    try std.testing.expectEqual(@as(u32, 6), active_u);
+    try std.testing.expectEqual([3]u32{ 16, active_u, 1 }, ws_ind.scheduleIndirectGateUpQ().threadgroups_per_grid);
+    try std.testing.expectEqual([3]u32{ 8, active_u, 1 }, ws_ind.scheduleIndirectGateUpF().threadgroups_per_grid);
+    try std.testing.expectEqual([3]u32{ 12, active_u, 1 }, ws_ind.scheduleIndirectDown().threadgroups_per_grid);
+    try std.testing.expectEqualSlices(u8, out_dir_raw, out_ind_raw);
+
+    // Test B: Homogeneous f16 M=8 — indirect vs direct bit-for-bit parity.
+    @memset(out_ind_raw, 0);
+    @memset(out_dir_raw, 0);
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeMoELayerFloat(&frame, .f16, .{
+            .x = x_bind,
+            .router = .{ .logits = .{ .binding = logits_bind, .dtype = .f32 } },
+            .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+            .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(f16_table_raw.ptr) },
+            .workspace = &ws_ind,
+            .workspace_buf = gpu_buf,
+            .out = out_ind_bind,
+            .m = m,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+        }, false);
+        try pipes.encodeGateUpSwigluFloat(&frame, .f16, .{
+            .x = x_bind,
+            .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+            .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(f16_table_raw.ptr) },
+            .workspace = &ws_dir,
+            .workspace_buf = gpu_buf,
+            .m = m,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .use_indirect = false,
+        }, true);
+        try pipes.encodeDownProjFloat(&frame, .f16, .{
+            .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+            .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(f16_table_raw.ptr) },
+            .workspace = &ws_dir,
+            .workspace_buf = gpu_buf,
+            .m = m,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+            .use_indirect = false,
+        }, true);
+        try pipes.encodeReduce(&frame, .{
+            .workspace = &ws_dir,
+            .workspace_buf = gpu_buf,
+            .out = out_dir_bind,
+            .m = m,
+            .hidden_size = hidden_size,
+            .top_k = top_k,
+        }, true);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+    }
+    try std.testing.expectEqualSlices(u8, out_dir_raw, out_ind_raw);
+
+    // Test C: Heterogeneous GSQ layer at BOTH M=1 (num_scheme_buckets=4 > 1 -> indirect ON!)
+    //         and M=8 with runtime-empty `.bf16` and `.q2_affine` buckets (`active == 0`)!
+    const test_ms = [_]u32{ 1, m };
+    for (test_ms) |cur_m| {
+        @memset(out_ind_raw, 0);
+        @memset(out_dir_raw, 0);
+        const base_ind: MoELayerArgs = .{
+            .x = x_bind,
+            .router = .{ .logits = .{ .binding = logits_bind, .dtype = .f32 } },
+            .weights_base = .{ .buffer = gpu_buf, .offset = 0 },
+            .expert_table = .{ .buffer = gpu_buf, .offset = arena.offsetOf(hetero_table_raw.ptr) },
+            .workspace = &ws_ind,
+            .workspace_buf = gpu_buf,
+            .out = out_ind_bind,
+            .m = cur_m,
+            .num_experts = num_experts,
+            .top_k = top_k,
+            .hidden_size = hidden_size,
+            .intermediate_size = intermediate_size,
+        };
+        {
+            var frame = try compute.beginFrame(5000);
+            errdefer frame.abort();
+            // Zero-sync GPU indirect hetero layer!
+            try pipes.encodeMoELayerHetero(&frame, .{
+                .base = base_ind,
+                .expert_schemes = .{ .buffer = gpu_buf, .offset = arena.offsetOf(schemes_raw.ptr) },
+                .scheme_counts = scheme_counts,
+            }, false);
+            // Reference routing for CPU bucket rebuild + host-exact direct dispatch.
+            try pipes.encodeRouteTopK(&frame, .f32, .{
+                .logits = logits_bind,
+                .workspace = &ws_dir,
+                .workspace_buf = gpu_buf,
+                .m = cur_m,
+                .num_experts = num_experts,
+                .top_k = top_k,
+                .hidden_size = hidden_size,
+                .intermediate_size = intermediate_size,
+            }, true);
+            const sig = try frame.commit();
+            try compute.wait(sig, 5000);
+        }
+
+        // Verify per-scheme indirect dispatch args match exact active counts (including 0-active buckets!).
+        ws_dir.rebuildSchemeBucketsCpu(&expert_dtypes);
+        for (0..NUM_SCHEME_BUCKETS) |s_idx| {
+            const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
+            const exp_u = ws_ind.bucketHeader(scheme).num_unique_experts;
+            try std.testing.expectEqual([3]u32{ 16, exp_u, 1 }, ws_ind.bucketIndirectGateUpQ(scheme).threadgroups_per_grid);
+            try std.testing.expectEqual([3]u32{ 8, exp_u, 1 }, ws_ind.bucketIndirectGateUpF(scheme).threadgroups_per_grid);
+            try std.testing.expectEqual([3]u32{ 12, exp_u, 1 }, ws_ind.bucketIndirectDown(scheme).threadgroups_per_grid);
+            // CPU rebuildSchemeBucketsCpu must write identical indirect args.
+            try std.testing.expectEqual(ws_ind.bucketIndirectGateUpQ(scheme).threadgroups_per_grid, ws_dir.bucketIndirectGateUpQ(scheme).threadgroups_per_grid);
+            try std.testing.expectEqual(ws_ind.bucketIndirectGateUpF(scheme).threadgroups_per_grid, ws_dir.bucketIndirectGateUpF(scheme).threadgroups_per_grid);
+            try std.testing.expectEqual(ws_ind.bucketIndirectDown(scheme).threadgroups_per_grid, ws_dir.bucketIndirectDown(scheme).threadgroups_per_grid);
+        }
+        // Confirm runtime-empty buckets really have 0 active experts!
+        try std.testing.expectEqual(@as(u32, 0), ws_ind.bucketIndirectGateUpF(.bf16).threadgroups_per_grid[1]);
+        try std.testing.expectEqual(@as(u32, 0), ws_ind.bucketIndirectGateUpQ(.q2_affine).threadgroups_per_grid[1]);
+
+        var base_dir = base_ind;
+        base_dir.workspace = &ws_dir;
+        base_dir.out = out_dir_bind;
+        {
+            var frame = try compute.beginFrame(5000);
+            errdefer frame.abort();
+            try pipes.encodeGateUpDownHetero(&frame, base_dir, scheme_counts, true, false);
+            try pipes.encodeReduce(&frame, .{
+                .workspace = &ws_dir,
+                .workspace_buf = gpu_buf,
+                .out = out_dir_bind,
+                .m = cur_m,
+                .hidden_size = hidden_size,
+                .top_k = top_k,
+            }, true);
+            const sig = try frame.commit();
+            try compute.wait(sig, 5000);
+        }
+
+        const slice_bytes = @as(usize, cur_m) * hidden_size * @sizeOf(f16);
+        try std.testing.expectEqualSlices(u8, out_dir_raw[0..slice_bytes], out_ind_raw[0..slice_bytes]);
     }
 }

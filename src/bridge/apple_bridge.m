@@ -1078,6 +1078,87 @@ ami_status ami_compute_encode_dispatch_ex(ami_compute *compute, const ami_pipeli
     return AMI_OK;
 }
 
+_Static_assert(sizeof(ami_indirect_dispatch_args) == sizeof(MTLDispatchThreadgroupsIndirectArguments),
+               "ami_indirect_dispatch_args must match MTLDispatchThreadgroupsIndirectArguments");
+
+ami_status ami_mtl4_compute_dispatch_indirect(ami_compute *compute, const ami_pipeline *pipeline,
+                                              const ami_buffer_binding *bindings,
+                                              size_t binding_count,
+                                              const void *uniform_bytes, size_t uniform_len,
+                                              const ami_buffer *indirect_buffer,
+                                              uint64_t indirect_offset,
+                                              uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
+                                              uint32_t insert_barrier_before) {
+    if (compute == NULL || compute->active_slot < 0 || compute->active_encoder == NULL ||
+        pipeline == NULL || indirect_buffer == NULL ||
+        tg_x == 0 || tg_y == 0 || tg_z == 0 ||
+        (binding_count > 0 && bindings == NULL) ||
+        (uniform_len > 0 && uniform_bytes == NULL) ||
+        uniform_len > AMI_UNIFORM_STRIDE ||
+        (indirect_offset & 3ull) != 0) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    size_t total_bindings = binding_count + (uniform_len > 0 ? 1u : 0u);
+    if (total_bindings > AMI_MAX_BUFFER_BINDINGS) {
+        return AMI_ERR_INVALID_ARGUMENT;
+    }
+    for (size_t i = 0; i < binding_count; i++) {
+        if (bindings[i].buffer == NULL) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+    }
+
+    ami_frame_slot *slot = &compute->slots[compute->active_slot];
+    if (uniform_len > 0 && compute->uniform_cursor >= AMI_UNIFORM_SLOTS_PER_FRAME) {
+        return AMI_ERR_OUT_OF_MEMORY;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> ind_buf = buffer_of(indirect_buffer);
+        if (ind_buf == nil) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+        uint64_t ind_len = (uint64_t)ind_buf.length;
+        if (indirect_offset > ind_len ||
+            (ind_len - indirect_offset) < (uint64_t)sizeof(MTLDispatchThreadgroupsIndirectArguments)) {
+            return AMI_ERR_INVALID_ARGUMENT;
+        }
+
+        id<MTL4ComputeCommandEncoder> encoder =
+            (__bridge id<MTL4ComputeCommandEncoder>)compute->active_encoder;
+        id<MTL4ArgumentTable> arg_table = (__bridge id<MTL4ArgumentTable>)slot->mtl_arg_table;
+        id<MTLComputePipelineState> state = pipeline_of(pipeline);
+
+        if (insert_barrier_before != 0) {
+            [encoder barrierAfterEncoderStages:MTLStageDispatch
+                           beforeEncoderStages:MTLStageDispatch
+                             visibilityOptions:MTL4VisibilityOptionDevice];
+        }
+
+        for (size_t i = 0; i < binding_count; i++) {
+            MTLGPUAddress addr = buffer_of(bindings[i].buffer).gpuAddress + bindings[i].offset;
+            [arg_table setAddress:addr atIndex:(NSUInteger)i];
+        }
+
+        if (uniform_len > 0) {
+            size_t u_off = (size_t)compute->uniform_cursor * AMI_UNIFORM_STRIDE;
+            memcpy(slot->uniform_base + u_off, uniform_bytes, uniform_len);
+            [arg_table setAddress:(slot->uniform_gpu + u_off)
+                          atIndex:(NSUInteger)binding_count];
+            compute->uniform_cursor++;
+        }
+
+        [encoder setComputePipelineState:state];
+        [encoder setArgumentTable:arg_table];
+
+        MTLGPUAddress indirect_addr = ind_buf.gpuAddress + indirect_offset;
+        MTLSize tg = MTLSizeMake((NSUInteger)tg_x, (NSUInteger)tg_y, (NSUInteger)tg_z);
+        [encoder dispatchThreadgroupsWithIndirectBuffer:indirect_addr
+                                  threadsPerThreadgroup:tg];
+    }
+    return AMI_OK;
+}
+
 ami_status ami_compute_commit_frame(ami_compute *compute, uint64_t *out_signal) {
     if (compute == NULL || compute->active_slot < 0 || compute->active_encoder == NULL) {
         return AMI_ERR_INVALID_ARGUMENT;

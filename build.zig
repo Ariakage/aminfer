@@ -37,6 +37,7 @@ const kernel_sources = [_][]const u8{
     "src/kernels/hybrid_ops.metal",
     "src/kernels/vision_ingress.metal",
     "src/kernels/nax_tensorops.metal",
+    "src/kernels/sampling.metal",
 };
 
 pub fn build(b: *std.Build) void {

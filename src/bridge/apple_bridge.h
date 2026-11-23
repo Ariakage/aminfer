@@ -292,6 +292,26 @@ ami_status ami_compute_encode_dispatch_ex(ami_compute *compute, const ami_pipeli
                                           uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
                                           uint32_t dispatch_mode, uint32_t insert_barrier_before);
 
+/* Matches Metal's `MTLDispatchThreadgroupsIndirectArguments` (12 bytes, 4-byte aligned). */
+typedef struct ami_indirect_dispatch_args {
+    uint32_t threadgroups_per_grid[3];
+} ami_indirect_dispatch_args;
+
+/*
+ * Encodes an indirect compute threadgroup dispatch into the active Metal 4
+ * frame (G20, ADR-0023). `indirect_buffer` must be resident and
+ * `indirect_offset` must be 4-byte aligned with at least 12 bytes remaining.
+ * Zero dynamic heap allocation.
+ */
+ami_status ami_mtl4_compute_dispatch_indirect(ami_compute *compute, const ami_pipeline *pipeline,
+                                              const ami_buffer_binding *bindings,
+                                              size_t binding_count,
+                                              const void *uniform_bytes, size_t uniform_len,
+                                              const ami_buffer *indirect_buffer,
+                                              uint64_t indirect_offset,
+                                              uint64_t tg_x, uint64_t tg_y, uint64_t tg_z,
+                                              uint32_t insert_barrier_before);
+
 ami_status ami_compute_commit_frame(ami_compute *compute, uint64_t *out_signal);
 ami_status ami_compute_wait(ami_compute *compute, uint64_t signal, uint64_t timeout_ms);
 

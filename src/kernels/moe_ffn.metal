@@ -36,6 +36,34 @@ struct MoeScheduleHeader {
     uint top_k;
 };
 
+// Matches Metal's `MTLDispatchThreadgroupsIndirectArguments` (12 bytes, 4-byte aligned).
+struct MoeIndirectDispatchArgs {
+    uint threadgroups_per_grid[3];
+};
+
+static_assert(sizeof(MoeIndirectDispatchArgs) == 12, "MoeIndirectDispatchArgs must be 12 bytes");
+
+// Writes exact G20 `[ceil(N / BN), active_experts, 1]` indirect threadgroup grids
+// into bytes 16..51 of a 64-byte schedule slot (`sched_hdr` or `bucket_headers + s * 64`).
+static inline void write_schedule_indirect(device uchar *slot_base,
+                                           uint active_experts,
+                                           uint gate_up_groups_x_q,
+                                           uint gate_up_groups_x_f,
+                                           uint down_groups_x) {
+    device MoeIndirectDispatchArgs *gu_q = (device MoeIndirectDispatchArgs *)(slot_base + 16ul);
+    device MoeIndirectDispatchArgs *gu_f = (device MoeIndirectDispatchArgs *)(slot_base + 28ul);
+    device MoeIndirectDispatchArgs *dn   = (device MoeIndirectDispatchArgs *)(slot_base + 40ul);
+    gu_q->threadgroups_per_grid[0] = gate_up_groups_x_q;
+    gu_q->threadgroups_per_grid[1] = active_experts;
+    gu_q->threadgroups_per_grid[2] = 1u;
+    gu_f->threadgroups_per_grid[0] = gate_up_groups_x_f;
+    gu_f->threadgroups_per_grid[1] = active_experts;
+    gu_f->threadgroups_per_grid[2] = 1u;
+    dn->threadgroups_per_grid[0]   = down_groups_x;
+    dn->threadgroups_per_grid[1]   = active_experts;
+    dn->threadgroups_per_grid[2]   = 1u;
+}
+
 struct RouterProjParams {
     uint m;
     uint num_experts;
@@ -48,7 +76,13 @@ struct RouteParams {
     uint num_experts;
     uint top_k;
     uint norm_topk_prob;
+    uint gate_up_groups_x_q;
+    uint gate_up_groups_x_f;
+    uint down_groups_x;
+    uint reserved;
 };
+
+static_assert(sizeof(RouteParams) == 32, "RouteParams must be 32 bytes");
 
 struct MoeGateUpParams {
     uint hidden_size;
@@ -504,6 +538,11 @@ kernel void ami_moe_route_topk(const device uchar *logits_raw [[buffer(0)]],
         sched_hdr->total_assignments = total_assign;
         sched_hdr->m = p.m;
         sched_hdr->top_k = top_k;
+        write_schedule_indirect((device uchar *)sched_hdr,
+                                u_base,
+                                p.gate_up_groups_x_q,
+                                p.gate_up_groups_x_f,
+                                p.down_groups_x);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2236,11 +2275,15 @@ struct BucketRouteParams {
     uint norm_topk_prob;
     uint bucket_unique_stride;
     uint bucket_offsets_stride;
+    uint gate_up_groups_x_q;
+    uint gate_up_groups_x_f;
+    uint down_groups_x;
     uint _pad0;
     uint _pad1;
+    uint _pad2;
 };
 
-static_assert(sizeof(BucketRouteParams) == 32, "BucketRouteParams must be 32 bytes");
+static_assert(sizeof(BucketRouteParams) == 48, "BucketRouteParams must be 48 bytes");
 
 kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(0)]],
                                         device MoeScheduleHeader *sched_hdr [[buffer(1)]],
@@ -2510,11 +2553,17 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
 
         if (tid == 0u) {
             bucket_expert_token_offsets[o_base_off + u_cnt_s] = running_a_base + a_cnt_s;
-            device MoeScheduleHeader *bhdr = (device MoeScheduleHeader *)(bucket_headers + ulong(s) * 64ul);
+            device uchar *slot_ptr = bucket_headers + ulong(s) * 64ul;
+            device MoeScheduleHeader *bhdr = (device MoeScheduleHeader *)slot_ptr;
             bhdr->num_unique_experts = u_cnt_s;
             bhdr->total_assignments = a_cnt_s;
             bhdr->m = p.m;
             bhdr->top_k = top_k;
+            write_schedule_indirect(slot_ptr,
+                                    u_cnt_s,
+                                    p.gate_up_groups_x_q,
+                                    p.gate_up_groups_x_f,
+                                    p.down_groups_x);
         }
         running_u_base += u_cnt_s;
         running_a_base += a_cnt_s;
@@ -2527,6 +2576,11 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
         sched_hdr->total_assignments = running_a_base;
         sched_hdr->m = p.m;
         sched_hdr->top_k = top_k;
+        write_schedule_indirect((device uchar *)sched_hdr,
+                                running_u_base,
+                                p.gate_up_groups_x_q,
+                                p.gate_up_groups_x_f,
+                                p.down_groups_x);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

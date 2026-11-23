@@ -169,6 +169,27 @@ pub const BufferBinding = struct {
     offset: u64 = 0,
 };
 
+/// Matches Metal's `MTLDispatchThreadgroupsIndirectArguments` (`[3]u32`, 12 bytes, 4-byte aligned).
+pub const IndirectDispatchArgs = extern struct {
+    threadgroups_per_grid: [3]u32,
+
+    pub const ALIGN: usize = 4;
+    pub const SIZE: usize = 12;
+
+    pub inline fn init(x: u32, y: u32, z: u32) IndirectDispatchArgs {
+        return .{ .threadgroups_per_grid = .{ x, y, z } };
+    }
+
+    comptime {
+        if (@sizeOf(IndirectDispatchArgs) != 12 or @alignOf(IndirectDispatchArgs) != 4) {
+            @compileError("IndirectDispatchArgs must match MTLDispatchThreadgroupsIndirectArguments (12 bytes, align 4)");
+        }
+        if (@sizeOf(c.ami_indirect_dispatch_args) != @sizeOf(IndirectDispatchArgs)) {
+            @compileError("ami_indirect_dispatch_args ABI mismatch");
+        }
+    }
+};
+
 /// Metal texture view format over an IOSurface-backed fp16 KV tile (ADR-0004).
 pub const TextureView = enum {
     /// RGBA16Float view (`width = row_f16 / 4`, default for decode attention).
@@ -428,6 +449,29 @@ pub const Compute = struct {
             insert_barrier_before: bool,
         ) Error!void {
             return self.encodeEx(pipeline, bindings, &.{}, uniform_bytes, grid_groups, threadgroup, c.AMI_DISPATCH_THREADGROUPS, insert_barrier_before);
+        }
+
+        /// Encodes a GPU-driven indirect threadgroup dispatch (`G20`, ADR-0023).
+        /// `indirect.offset` must be 4-byte aligned with at least 12 bytes
+        /// (`IndirectDispatchArgs`) remaining inside the resident `indirect.buffer`.
+        pub fn encodeThreadgroupsIndirect(
+            self: *Frame,
+            pipeline: Pipeline,
+            bindings: []const BufferBinding,
+            uniform_bytes: ?[]const u8,
+            indirect: BufferBinding,
+            threadgroup: [3]u64,
+            insert_barrier_before: bool,
+        ) Error!void {
+            if (!self.open) return error.InvalidArgument;
+            return self.compute.dispatchIndirect(
+                pipeline,
+                bindings,
+                uniform_bytes,
+                indirect,
+                threadgroup,
+                insert_barrier_before,
+            );
         }
 
         /// Encodes a threads-grid dispatch with explicit texture bindings.
@@ -720,6 +764,54 @@ pub const Compute = struct {
     /// Waits on the shared event until `signal` has been reached by the GPU.
     pub fn wait(self: Compute, signal: u64, timeout_ms: u64) Error!void {
         try check(c.ami_compute_wait(self.handle, signal, timeout_ms));
+    }
+
+    /// Encodes a GPU-driven indirect threadgroup dispatch into the active Metal 4
+    /// frame (`G20`, ADR-0023). Zero dynamic heap allocation; validates 4-byte
+    /// indirect-buffer alignment, binding limits, and buffer bounds.
+    pub fn dispatchIndirect(
+        self: *Compute,
+        pipeline: Pipeline,
+        bindings: []const BufferBinding,
+        uniform_bytes: ?[]const u8,
+        indirect: BufferBinding,
+        threadgroup: [3]u64,
+        insert_barrier_before: bool,
+    ) Error!void {
+        if ((indirect.offset & (IndirectDispatchArgs.ALIGN - 1)) != 0) {
+            return error.InvalidArgument;
+        }
+        if (threadgroup[0] == 0 or threadgroup[1] == 0 or threadgroup[2] == 0) {
+            return error.InvalidArgument;
+        }
+        const extra: usize = if (uniform_bytes != null and uniform_bytes.?.len > 0) 1 else 0;
+        if (bindings.len + extra > MAX_BUFFER_BINDINGS) {
+            return error.InvalidArgument;
+        }
+        if (uniform_bytes) |u| {
+            if (u.len > MAX_UNIFORM_BYTES) return error.InvalidArgument;
+        }
+        var raw_bufs: [MAX_BUFFER_BINDINGS]c.ami_buffer_binding = undefined;
+        for (bindings, 0..) |b, i| {
+            raw_bufs[i] = .{ .buffer = b.buffer.handle, .offset = b.offset };
+        }
+        const b_ptr: ?[*]const c.ami_buffer_binding = if (bindings.len > 0) &raw_bufs else null;
+        const u_ptr: ?*const anyopaque = if (uniform_bytes) |u| u.ptr else null;
+        const u_len: usize = if (uniform_bytes) |u| u.len else 0;
+        try check(c.ami_mtl4_compute_dispatch_indirect(
+            self.handle,
+            pipeline.handle,
+            b_ptr,
+            bindings.len,
+            u_ptr,
+            u_len,
+            indirect.buffer.handle,
+            indirect.offset,
+            threadgroup[0],
+            threadgroup[1],
+            threadgroup[2],
+            if (insert_barrier_before) 1 else 0,
+        ));
     }
 
     /// Encodes a single 1D dispatch on the reusable command buffer and waits for
@@ -3459,4 +3551,165 @@ test "accelerateSgemm matches fp32 scalar reference for transposed and non-trans
 
     try std.testing.expectError(error.InvalidArgument, accelerateSgemm(0, n, k, 1.0, &a, &b_nk, 0.0, &c_trans, true));
     try std.testing.expectError(error.InvalidArgument, accelerateSgemm(m, n, k, 1.0, a[0..1], &b_nk, 0.0, &c_trans, true));
+}
+
+test "G20 Metal 4 Compute.dispatchIndirect executes non-zero/zero grids and validates alignment and bounds" {
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(IndirectDispatchArgs));
+    try std.testing.expectEqual(@as(usize, 4), @alignOf(IndirectDispatchArgs));
+
+    const device = try Device.open();
+    defer device.close();
+    const lib = try Library.openEmbedded(device);
+    defer lib.close();
+
+    const iota_pipe = try Pipeline.init(device, lib, "ami_smoke_iota");
+    defer iota_pipe.close();
+    const scale_pipe = try Pipeline.initSpecialized(
+        device,
+        lib,
+        "ami_smoke_scale_add",
+        &.{.{ .index = 0, .value = .{ .u32 = 3 } }},
+    );
+    defer scale_pipe.close();
+
+    const data_region = try page.WiredRegion.init(page.APPLE_PAGE_SIZE);
+    defer data_region.deinit();
+    const ind_region = try page.WiredRegion.init(page.APPLE_PAGE_SIZE);
+    defer ind_region.deinit();
+
+    const data_u32: []u32 = @alignCast(std.mem.bytesAsSlice(u32, data_region.bytes));
+    @memset(data_u32, 0);
+
+    // Place 4 IndirectDispatchArgs records at 16-byte stride inside `ind_region`.
+    const ind_bytes = ind_region.bytes;
+    @memset(ind_bytes, 0);
+    const args0: *IndirectDispatchArgs = @ptrCast(@alignCast(ind_bytes.ptr + 0));
+    const args1: *IndirectDispatchArgs = @ptrCast(@alignCast(ind_bytes.ptr + 16));
+    const args_zero_y: *IndirectDispatchArgs = @ptrCast(@alignCast(ind_bytes.ptr + 32));
+    const args_zero_all: *IndirectDispatchArgs = @ptrCast(@alignCast(ind_bytes.ptr + 48));
+    args0.* = IndirectDispatchArgs.init(4, 1, 1); // 4 * 32 = 128 threads
+    args1.* = IndirectDispatchArgs.init(2, 1, 1); // 2 * 32 = 64 threads
+    args_zero_y.* = IndirectDispatchArgs.init(4, 0, 1); // 0 threadgroups (empty bucket pattern)
+    args_zero_all.* = IndirectDispatchArgs.init(0, 0, 0); // 0 threadgroups
+
+    const data_buf = try Buffer.wrap(device, data_region.bytes);
+    defer data_buf.close();
+    const ind_buf = try Buffer.wrap(device, ind_region.bytes);
+    defer ind_buf.close();
+
+    var compute = try Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{ data_buf, ind_buf });
+
+    // 1. Calling dispatchIndirect outside an active frame must fail cleanly.
+    try std.testing.expectError(error.InvalidArgument, compute.dispatchIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 0 }},
+        null,
+        .{ .buffer = ind_buf, .offset = 0 },
+        .{ 32, 1, 1 },
+        false,
+    ));
+
+    // 2. Execute chained non-zero indirect dispatches with intra-encoder barrier & uniform,
+    //    plus zero-grid indirect dispatches (`{4, 0, 1}` and `{0, 0, 0}`) targeting untouched tail.
+    const SmokeParams = extern struct { addend: u32 };
+    const params: SmokeParams = .{ .addend = 11 };
+
+    var frame = try compute.beginFrame(5000);
+    errdefer frame.abort();
+
+    // Alignment / bounds / zero-tg validation inside an active frame:
+    try std.testing.expectError(error.InvalidArgument, frame.encodeThreadgroupsIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 0 }},
+        null,
+        .{ .buffer = ind_buf, .offset = 2 }, // unaligned (not multiple of 4)
+        .{ 32, 1, 1 },
+        false,
+    ));
+    try std.testing.expectError(error.InvalidArgument, frame.encodeThreadgroupsIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 0 }},
+        null,
+        .{ .buffer = ind_buf, .offset = page.APPLE_PAGE_SIZE - 8 }, // < 12 bytes remaining
+        .{ 32, 1, 1 },
+        false,
+    ));
+    try std.testing.expectError(error.InvalidArgument, frame.encodeThreadgroupsIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 0 }},
+        null,
+        .{ .buffer = ind_buf, .offset = page.APPLE_PAGE_SIZE }, // out of bounds
+        .{ 32, 1, 1 },
+        false,
+    ));
+    try std.testing.expectError(error.InvalidArgument, frame.encodeThreadgroupsIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 0 }},
+        null,
+        .{ .buffer = ind_buf, .offset = 0 },
+        .{ 0, 1, 1 }, // zero threadgroup dim
+        false,
+    ));
+
+    // Actual indirect dispatches:
+    try frame.encodeThreadgroupsIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 0 }},
+        null,
+        .{ .buffer = ind_buf, .offset = 0 },
+        .{ 32, 1, 1 },
+        false,
+    );
+    try compute.dispatchIndirect(
+        scale_pipe,
+        &.{.{ .buffer = data_buf, .offset = 0 }},
+        std.mem.asBytes(&params),
+        .{ .buffer = ind_buf, .offset = 16 },
+        .{ 32, 1, 1 },
+        true,
+    );
+    // Zero-threadgroup indirect dispatches aimed at offset 512.. (elements 128..) must write nothing.
+    try frame.encodeThreadgroupsIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 128 * @sizeOf(u32) }},
+        null,
+        .{ .buffer = ind_buf, .offset = 32 },
+        .{ 32, 1, 1 },
+        true,
+    );
+    try frame.encodeThreadgroupsIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 128 * @sizeOf(u32) }},
+        null,
+        .{ .buffer = ind_buf, .offset = 48 },
+        .{ 32, 1, 1 },
+        false,
+    );
+
+    const sig = try frame.commit();
+    try compute.wait(sig, 5000);
+
+    // Closed frame must reject further indirect dispatches.
+    try std.testing.expectError(error.InvalidArgument, frame.encodeThreadgroupsIndirect(
+        iota_pipe,
+        &.{.{ .buffer = data_buf, .offset = 0 }},
+        null,
+        .{ .buffer = ind_buf, .offset = 0 },
+        .{ 32, 1, 1 },
+        false,
+    ));
+
+    for (0..64) |i| {
+        const expected = (@as(u32, @intCast(i)) ^ 0xA5A5_A5A5) *% 3 +% 11;
+        try std.testing.expectEqual(expected, data_u32[i]);
+    }
+    for (64..128) |i| {
+        const expected = @as(u32, @intCast(i)) ^ 0xA5A5_A5A5;
+        try std.testing.expectEqual(expected, data_u32[i]);
+    }
+    for (128..256) |i| {
+        try std.testing.expectEqual(@as(u32, 0), data_u32[i]);
+    }
 }
