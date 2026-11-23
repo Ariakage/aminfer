@@ -1998,32 +1998,88 @@ fn tryInitSmeProjectionRuntime(
     const n: usize = blob.entry.shape[0];
     const k: usize = blob.entry.shape[1];
     if (k == 0 or (k % sme.GROUP_SIZE) != 0) return null;
-    const panel_dt: sme.PanelDType = switch (dtype) {
-        .f16 => .f16,
-        .bf16 => .bf16,
-        else => return null,
-    };
-    const packed_bytes = sme.packedBlobBytes(panel_dt, n, k) catch return null;
+    const layout = blob.entry.tensorLayout() catch return null;
     const l2_limit = caps.draftL2BudgetBytes();
-    if (packed_bytes > l2_limit) return null;
 
-    const aligned_w = try page.alignUp(packed_bytes);
-    draft_budget.checkPlan(aligned_w) catch return null;
-    var w_arena = arena_mod.WiredArena.init(aligned_w, draft_budget) catch return null;
+    var weight: sme.SmeLinearWeight = undefined;
+    var packed_bytes: usize = 0;
+    var w_arena: arena_mod.WiredArena = undefined;
+
+    if (layout == .sme2_panel64) {
+        const sw = sme.SmeLinearWeight.fromAmfEntry(blob.entry, blob.slice, .temporal) catch return null;
+        packed_bytes = sw.byteSize();
+        if (packed_bytes > l2_limit) return null;
+        const aligned_w = try page.alignUp(packed_bytes);
+        draft_budget.checkPlan(aligned_w) catch return null;
+        w_arena = arena_mod.WiredArena.init(aligned_w, draft_budget) catch return null;
+        errdefer w_arena.deinit();
+        const w_raw = try w_arena.allocPages(packed_bytes);
+        @memcpy(w_raw[0..packed_bytes], sw.w_packed);
+        weight = .{
+            .w_packed = w_raw[0..packed_bytes],
+            .n = sw.n,
+            .k = sw.k,
+            .dtype = sw.dtype,
+            .param_kind = sw.param_kind,
+            .cache_hint = .temporal,
+        };
+    } else {
+        switch (dtype) {
+            .f16, .bf16 => {
+                const panel_dt: sme.PanelDType = if (dtype == .bf16) .bf16 else .f16;
+                packed_bytes = sme.packedBlobBytes(panel_dt, n, k) catch return null;
+                if (packed_bytes > l2_limit) return null;
+                const aligned_w = try page.alignUp(packed_bytes);
+                draft_budget.checkPlan(aligned_w) catch return null;
+                w_arena = arena_mod.WiredArena.init(aligned_w, draft_budget) catch return null;
+                errdefer w_arena.deinit();
+                const w_raw = try w_arena.allocPages(packed_bytes);
+                const src_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, blob.slice[0 .. n * k * 2]));
+                try sme.packDensePanel64(panel_dt, src_u16, n, k, w_raw[0..packed_bytes]);
+                weight = .{
+                    .w_packed = w_raw[0..packed_bytes],
+                    .n = n,
+                    .k = k,
+                    .dtype = panel_dt,
+                    .param_kind = .affine_scale_bias,
+                    .cache_hint = .temporal,
+                };
+            },
+            .q2_affine => {
+                const OpsQ2 = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                packed_bytes = sme.packedBlobBytes(.q2_affine, n, k) catch return null;
+                if (packed_bytes > l2_limit) return null;
+                const groups = OpsQ2.groupsPerRow(k) catch return null;
+                const row_bytes = OpsQ2.rowWeightBytes(k) catch return null;
+                const need_w = n * row_bytes;
+                const need_sb = n * groups * @sizeOf(quant.ScaleBias);
+                const p_off: usize = @intCast(blob.entry.params_offset);
+                if (blob.slice.len < need_w or blob.slice.len < p_off + need_sb) return null;
+
+                const aligned_w = try page.alignUp(packed_bytes);
+                draft_budget.checkPlan(aligned_w) catch return null;
+                w_arena = arena_mod.WiredArena.init(aligned_w, draft_budget) catch return null;
+                errdefer w_arena.deinit();
+                const w_raw = try w_arena.allocPages(packed_bytes);
+
+                const sb: []const quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(
+                    quant.ScaleBias,
+                    blob.slice[p_off .. p_off + need_sb],
+                ));
+                try sme.packMlxQuantPanel64(.q2, blob.slice[0..need_w], sb, n, k, w_raw[0..packed_bytes]);
+                weight = .{
+                    .w_packed = w_raw[0..packed_bytes],
+                    .n = n,
+                    .k = k,
+                    .dtype = .q2_affine,
+                    .param_kind = .affine_scale_bias,
+                    .cache_hint = .temporal,
+                };
+            },
+            else => return null,
+        }
+    }
     errdefer w_arena.deinit();
-
-    const w_raw = try w_arena.allocPages(packed_bytes);
-    const src_u16: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, blob.slice[0 .. n * k * 2]));
-    try sme.packDensePanel64(panel_dt, src_u16, n, k, w_raw[0..packed_bytes]);
-
-    const weight: sme.SmeLinearWeight = .{
-        .w_packed = w_raw[0..packed_bytes],
-        .n = n,
-        .k = k,
-        .dtype = panel_dt,
-        .param_kind = .affine_scale_bias,
-        .cache_hint = .temporal,
-    };
     var proj = try sme.SmeDraftProjection.init(weight, .{
         .max_m = @min(@as(usize, max_m), sme.MAX_STEP_LORA_M),
         .l2_limit_bytes = l2_limit,

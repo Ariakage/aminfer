@@ -1161,6 +1161,28 @@ pub const GraphLoadOptions = struct {
     cluster_coordinator: ?*expert_parallel.ExpertParallelCoordinator = null,
     /// Optional explicit expert partition plan (defaults to `cluster_coordinator.config.plan` when non-null).
     cluster_plan: ?expert_parallel.ExpertPartitionPlan = null,
+
+    // M7.8 Native Kernel Barrier Fusion (`G18`, ADR-0023 §1)
+    /// Enable G18 kernel & barrier fusions (`has_residual_epilogue`, `ami_fused_residual_rmsnorm`,
+    /// homogeneous `ami_fused_qkv_*`, and `ami_dense_gate_up_swiglu`). Set to `false` for A/B gating.
+    enable_g18_fusion: bool = true,
+    g18_qkv_gemm_min_m: u32 = 64,
+    g18_swiglu_gemm_min_m: u32 = 32,
+
+    // M7.8 Native Full Vision Tower (`W20`, `G22`, `C16`/`D5`, ADR-0023 §5)
+    /// Explicit ViT + PatchMerger configuration override (`null` auto-detects embedded or sidecar `.amf`
+    /// vision weights; if absent, defaults to the zero-overhead `initTextOnly` fast path).
+    vision_config: ?vision_mod.VisionTowerConfig = null,
+    /// Optional standalone `vision.amf` sidecar path packed by `--vision-sidecar` / `pack-vision` (`W20`).
+    vision_amf_path: ?[:0]const u8 = null,
+    /// Optional CoreML `.mlpackage` (`export-coreml --component vision-tower`) for `C16`/`D5` ANE offload.
+    vision_coreml_path: ?[:0]const u8 = null,
+    /// Placement policy (`auto`, `gpu`, `ane`) for `C16`/`D5` vision-tower execution.
+    vision_placement: vision_mod.VisionPlacement = .auto,
+    /// Default max unmerged patch budget when inferring `VisionTowerConfig` from `.amf`.
+    vision_max_patches: u32 = 1024,
+    /// Force the zero-overhead `VisionTowerRuntime.initTextOnly()` fast path even on multimodal `.amf` files.
+    disable_vision_tower: bool = false,
 };
 
 pub const M7Stats = struct {
@@ -1196,9 +1218,10 @@ pub const LoopIsolationStats = struct {
     /// Isolation #4 (MoE G7/C5): `r >= 1` pinned-only routing masks & cold stalls on `r >= 1`.
     moe_r_ge1_pinned_routes: u64 = 0,
     moe_r_ge1_cold_stalls: u64 = 0,
-    /// W16 Step-LoRA: `r = 0` zero-alpha skips vs active SME2 evaluations.
+    /// W16 Step-LoRA: `r = 0` zero-alpha skips vs active SME2 evaluations & C13 bus deferrals.
     steplora_zero_alpha_skips: u64 = 0,
     steplora_active_evals: u64 = 0,
+    steplora_c13_defers: u64 = 0,
 };
 
 pub const GraphLoadError = error{
@@ -1219,7 +1242,7 @@ pub const GraphLoadError = error{
     expert_parallel.PlanError || expert_parallel.ClusterError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError || hybrid.ArenaError || hybrid.HybridKvRing.InitError ||
     attention.RetiredKvQ8PoolError ||
-    moe.WorkspaceError || ple_mod.Error || sme.WiredScratchError ||
+    moe.WorkspaceError || ple_mod.Error || sme.WiredScratchError || vision_mod.Error ||
     cache_mod.PoolError || cache_mod.CacheError || aio.EcorePoolError;
 
 pub const GraphStepError = error{
@@ -1242,6 +1265,62 @@ pub const GraphStepError = error{
 const WeightShard = struct {
     arena: arena_mod.WiredArena,
     buffer: metal.Buffer,
+};
+
+const VisionPatchEmbedWeights = struct {
+    weight: metal.BufferBinding,
+    dtype: quant.FloatDType,
+    bias: ?metal.BufferBinding = null,
+    pos_embed: ?metal.BufferBinding = null,
+    in_dim: u32,
+};
+
+const GraphVisionState = struct {
+    runtime: vision_mod.VisionTowerRuntime = vision_mod.VisionTowerRuntime.initTextOnly(),
+    blocks: []vision_mod.VisionBlockWeights = &.{},
+    merger: ?vision_mod.VisionMergerWeights = null,
+    patch_embed: ?VisionPatchEmbedWeights = null,
+    sidecar_arena: ?arena_mod.WiredArena = null,
+    sidecar_buf: ?metal.Buffer = null,
+    ane_offload: ?vision_mod.VisionAneOffload = null,
+    ane_calibration: ?vision_mod.VisionAneCalibration = null,
+    aliased_saved_bytes: usize = 0,
+    scratch_bytes: usize = 0,
+    tr_scratch_bytes: usize = 0,
+    is_sidecar: bool = false,
+
+    fn hasLoadedWeights(self: *const GraphVisionState) bool {
+        return self.runtime.isActive() and
+            self.patch_embed != null and
+            self.merger != null and
+            self.blocks.len == self.runtime.config.num_layers;
+    }
+
+    fn deinit(self: *GraphVisionState, allocator: std.mem.Allocator, compute: metal.Compute) void {
+        if (self.ane_offload) |*offload| {
+            offload.deinit();
+            self.ane_offload = null;
+        }
+        self.ane_calibration = null;
+        self.runtime.deinit();
+        if (self.blocks.len > 0) {
+            allocator.free(self.blocks);
+            self.blocks = &.{};
+        }
+        self.merger = null;
+        self.patch_embed = null;
+        if (self.sidecar_buf) |buf| {
+            compute.removeResident(&.{buf}) catch |err| {
+                std.debug.panic("removeResident(vision_sidecar) failed in GraphModel.deinit: {}", .{err});
+            };
+            buf.close();
+            self.sidecar_buf = null;
+        }
+        if (self.sidecar_arena) |*sa| {
+            sa.deinit();
+            self.sidecar_arena = null;
+        }
+    }
 };
 
 const GrLayerWeights = struct {
@@ -1687,6 +1766,38 @@ pub const GraphModel = struct {
     cluster_accum_f32: []f32 = &.{},
     m7_stats: M7Stats = .{},
 
+    // M7.8 Native Kernel Barrier Fusion (`G18`, ADR-0023 §1)
+    enable_g18_fusion: bool = true,
+    g18_qkv_gemm_min_m: u32 = 64,
+    g18_swiglu_gemm_min_m: u32 = 32,
+
+    // M7.8 Native Full Vision Tower (`W20`, `G22`, `C16`/`D5`, ADR-0023 §5)
+    vision_state: GraphVisionState = .{},
+
+    pub fn hasVisionTower(self: *const GraphModel) bool {
+        return self.vision_state.runtime.isActive();
+    }
+
+    pub fn visionTowerConfig(self: *const GraphModel) vision_mod.VisionTowerConfig {
+        return self.vision_state.runtime.config;
+    }
+
+    pub fn visionOwnedWiredBytes(self: *const GraphModel) usize {
+        return self.vision_state.runtime.ownedWiredBytes();
+    }
+
+    pub fn visionAliasedSavedBytes(self: *const GraphModel) usize {
+        return self.vision_state.aliased_saved_bytes;
+    }
+
+    pub fn visionPlacement(self: *const GraphModel) vision_mod.VisionPlacement {
+        return self.vision_state.runtime.placement;
+    }
+
+    pub fn visionAneCalibration(self: *const GraphModel) ?vision_mod.VisionAneCalibration {
+        return self.vision_state.ane_calibration;
+    }
+
     // -----------------------------------------------------------------------
     // Loading & Teardown
     // -----------------------------------------------------------------------
@@ -1740,6 +1851,7 @@ pub const GraphModel = struct {
     }
 
     pub fn deinit(self: *GraphModel, allocator: std.mem.Allocator) void {
+        self.vision_state.deinit(allocator, self.compute);
         if (self.adapter_rt) |art| {
             art.deinit(allocator);
             allocator.destroy(art);
@@ -2157,6 +2269,20 @@ pub const GraphModel = struct {
         return self.logits_host[self.last_logits_row * v .. (self.last_logits_row + 1) * v];
     }
 
+    /// Base device `BufferBinding` backing `logits_host` (`[max_rows, vocab_size]f16`).
+    pub fn logitsBaseBinding(self: *const GraphModel) metal.BufferBinding {
+        return self.logits_bind;
+    }
+
+    /// Device `BufferBinding` for the row returned by `readLastLogitsF16()` (`G21`).
+    pub fn lastLogitsBinding(self: *const GraphModel) metal.BufferBinding {
+        const byte_off = @as(u64, self.last_logits_row) * @as(u64, self.config.vocab_size) * @sizeOf(f16);
+        return .{
+            .buffer = self.logits_bind.buffer,
+            .offset = self.logits_bind.offset + byte_off,
+        };
+    }
+
     pub fn readTopHiddenF16(self: *const GraphModel, num_nodes: u32) []const f16 {
         return self.accepted_top_host[0 .. @as(usize, num_nodes) * self.config.hidden_size];
     }
@@ -2187,6 +2313,18 @@ pub const GraphModel = struct {
         y: metal.BufferBinding,
         barrier_before: bool,
     ) dequant.EncodeError!void {
+        return self.encodeLinearGemvResidual(frame, lin, x, y, null, barrier_before);
+    }
+
+    pub fn encodeLinearGemvResidual(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        lin: qwen3.LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        residual: ?metal.BufferBinding,
+        barrier_before: bool,
+    ) dequant.EncodeError!void {
         switch (lin.dtype) {
             .q2_affine => try self.dequant_pipes.encodeGemv(frame, .q2, .{
                 .x = x,
@@ -2195,6 +2333,7 @@ pub const GraphModel = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
             .q3_affine => try self.dequant_pipes.encodeGemv(frame, .q3, .{
                 .x = x,
@@ -2203,6 +2342,7 @@ pub const GraphModel = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
             .q4_affine => try self.dequant_pipes.encodeGemv(frame, .q4, .{
                 .x = x,
@@ -2211,6 +2351,7 @@ pub const GraphModel = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
             .f16 => try self.dequant_pipes.encodeDenseGemv(frame, .f16, .{
                 .x = x,
@@ -2218,6 +2359,7 @@ pub const GraphModel = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
             .bf16 => try self.dequant_pipes.encodeDenseGemv(frame, .bf16, .{
                 .x = x,
@@ -2225,6 +2367,7 @@ pub const GraphModel = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
         }
     }
@@ -2238,8 +2381,21 @@ pub const GraphModel = struct {
         m: u32,
         barrier_before: bool,
     ) dequant.EncodeError!void {
+        return self.encodeLinearBatchedResidual(frame, lin, x, y, null, m, barrier_before);
+    }
+
+    pub fn encodeLinearBatchedResidual(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        lin: qwen3.LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        residual: ?metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) dequant.EncodeError!void {
         if (m == 1) {
-            return self.encodeLinearGemv(frame, lin, x, y, barrier_before);
+            return self.encodeLinearGemvResidual(frame, lin, x, y, residual, barrier_before);
         }
         switch (lin.dtype) {
             .q2_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q2, .{
@@ -2250,6 +2406,7 @@ pub const GraphModel = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
             .q3_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q3, .{
                 .x = x,
@@ -2259,6 +2416,7 @@ pub const GraphModel = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
             .q4_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q4, .{
                 .x = x,
@@ -2268,6 +2426,7 @@ pub const GraphModel = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
             .f16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .f16, .{
                 .x = x,
@@ -2276,6 +2435,7 @@ pub const GraphModel = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
             .bf16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .bf16, .{
                 .x = x,
@@ -2284,6 +2444,7 @@ pub const GraphModel = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, barrier_before),
         }
     }
@@ -2298,8 +2459,22 @@ pub const GraphModel = struct {
         wide_tile: bool,
         barrier_before: bool,
     ) dequant.EncodeError!void {
+        return self.encodeLinearGemmWithTileResidual(frame, lin, x, y, null, m, wide_tile, barrier_before);
+    }
+
+    pub fn encodeLinearGemmWithTileResidual(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        lin: qwen3.LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        residual: ?metal.BufferBinding,
+        m: u32,
+        wide_tile: bool,
+        barrier_before: bool,
+    ) dequant.EncodeError!void {
         if (m < 16) {
-            return self.encodeLinearBatched(frame, lin, x, y, m, barrier_before);
+            return self.encodeLinearBatchedResidual(frame, lin, x, y, residual, m, barrier_before);
         }
         switch (lin.dtype) {
             .q2_affine => try self.dequant_pipes.encodeGemm(frame, .q2, .{
@@ -2311,6 +2486,7 @@ pub const GraphModel = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, barrier_before),
             .q3_affine => try self.dequant_pipes.encodeGemm(frame, .q3, .{
                 .x = x,
@@ -2321,6 +2497,7 @@ pub const GraphModel = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, barrier_before),
             .q4_affine => try self.dequant_pipes.encodeGemm(frame, .q4, .{
                 .x = x,
@@ -2331,6 +2508,7 @@ pub const GraphModel = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, barrier_before),
             .f16 => try self.dequant_pipes.encodeDenseGemm(frame, .f16, .{
                 .x = x,
@@ -2340,6 +2518,7 @@ pub const GraphModel = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, barrier_before),
             .bf16 => try self.dequant_pipes.encodeDenseGemm(frame, .bf16, .{
                 .x = x,
@@ -2349,8 +2528,163 @@ pub const GraphModel = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, barrier_before),
         }
+    }
+
+    fn encodeLinearByModeResidual(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        lin: qwen3.LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        residual: ?metal.BufferBinding,
+        m: u32,
+        mode: qwen3.Qwen3Model.LinearDispatchMode,
+        barrier_before: bool,
+    ) dequant.EncodeError!void {
+        return switch (mode) {
+            .batched_gemv => self.encodeLinearBatchedResidual(frame, lin, x, y, residual, m, barrier_before),
+            .gemm32 => self.encodeLinearGemmWithTileResidual(frame, lin, x, y, residual, m, false, barrier_before),
+            .gemm_wide => self.encodeLinearGemmWithTileResidual(frame, lin, x, y, residual, m, true, barrier_before),
+        };
+    }
+
+    fn qkvProjBinding(lin: qwen3.LinearBinding, y: metal.BufferBinding) dequant.QkvProjBinding {
+        return .{
+            .dtype = dequant.weightDTypeToAmf(lin.dtype),
+            .weight = lin.weight,
+            .scale_bias = lin.scale_bias,
+            .y = y,
+            .n = lin.n,
+        };
+    }
+
+    fn encodeQkvProj(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        q_proj: qwen3.LinearBinding,
+        k_proj: qwen3.LinearBinding,
+        v_proj: qwen3.LinearBinding,
+        x: metal.BufferBinding,
+        q_out: metal.BufferBinding,
+        k_out: metal.BufferBinding,
+        v_out: metal.BufferBinding,
+        m: u32,
+        mode: qwen3.Qwen3Model.LinearDispatchMode,
+        barrier_before: bool,
+    ) dequant.EncodeError!void {
+        const q_amf = dequant.weightDTypeToAmf(q_proj.dtype);
+        const k_amf = dequant.weightDTypeToAmf(k_proj.dtype);
+        const v_amf = dequant.weightDTypeToAmf(v_proj.dtype);
+        const use_nax_wide = mode == .gemm_wide and m >= 64 and self.dequant_pipes.activeBackend().isNax();
+        const allow_fused_m = (m == 1) or (mode != .batched_gemv and m >= self.g18_qkv_gemm_min_m);
+        if (self.enable_g18_fusion and allow_fused_m and !use_nax_wide and dequant.canFuseQkv(q_amf, k_amf, v_amf)) {
+            const path = self.dequant_pipes.encodeFusedQkvGemm(frame, .{
+                .x = x,
+                .q = qkvProjBinding(q_proj, q_out),
+                .k_proj = qkvProjBinding(k_proj, k_out),
+                .v = qkvProjBinding(v_proj, v_out),
+                .m = m,
+                .k = q_proj.k,
+                .allow_unfused_fallback = false,
+            }, barrier_before) catch |err| switch (err) {
+                error.HeterogeneousDType, error.UnsupportedDType => dequant.FusionPath.unfused_heterogeneous,
+                else => |e| return e,
+            };
+            if (path == .fused) return;
+        }
+        try self.encodeLinearByModeResidual(frame, q_proj, x, q_out, null, m, mode, barrier_before);
+        try self.encodeLinearByModeResidual(frame, k_proj, x, k_out, null, m, mode, false);
+        try self.encodeLinearByModeResidual(frame, v_proj, x, v_out, null, m, mode, false);
+    }
+
+    fn encodeDenseGateUpAct(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        gate_proj: qwen3.LinearBinding,
+        up_proj: qwen3.LinearBinding,
+        x_norm: metal.BufferBinding,
+        gate_out: metal.BufferBinding,
+        up_out: metal.BufferBinding,
+        act_out: metal.BufferBinding,
+        m: u32,
+        mode: qwen3.Qwen3Model.LinearDispatchMode,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        const g_amf = dequant.weightDTypeToAmf(gate_proj.dtype);
+        const u_amf = dequant.weightDTypeToAmf(up_proj.dtype);
+        const allow_fused_m = (mode != .batched_gemv and m >= self.g18_swiglu_gemm_min_m);
+        if (self.enable_g18_fusion and allow_fused_m and dequant.canFuseGateUp(g_amf, u_amf)) {
+            var used_fused = true;
+            self.dequant_pipes.encodeDenseGateUpSwiglu(frame, .{
+                .x = x_norm,
+                .gate_dtype = g_amf,
+                .w_gate = gate_proj.weight,
+                .sb_gate = gate_proj.scale_bias,
+                .up_dtype = u_amf,
+                .w_up = up_proj.weight,
+                .sb_up = up_proj.scale_bias,
+                .y = act_out,
+                .m = m,
+                .n = gate_proj.n,
+                .k = gate_proj.k,
+            }, barrier_before) catch |err| switch (err) {
+                error.HeterogeneousDType, error.UnsupportedDType => {
+                    used_fused = false;
+                },
+                else => |e| return e,
+            };
+            if (used_fused) return;
+        }
+        try self.encodeLinearByModeResidual(frame, gate_proj, x_norm, gate_out, null, m, mode, barrier_before);
+        try self.encodeLinearByModeResidual(frame, up_proj, x_norm, up_out, null, m, mode, false);
+        try self.moe_pipes.encodeSiluMul(frame, .{
+            .gate = gate_out,
+            .up = up_out,
+            .out = act_out,
+            .count = m * self.config.intermediate_size,
+        }, true);
+    }
+
+    fn encodeResidualThenRmsNorm(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        x: metal.BufferBinding,
+        delta: metal.BufferBinding,
+        norm: qwen3.NormBinding,
+        x_norm: metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) moe.EncodeError!void {
+        if (self.enable_g18_fusion) {
+            try self.attn_pipes.encodeFusedResidualRmsNorm(frame, .{
+                .x = x,
+                .delta = delta,
+                .w = norm.binding,
+                .x_norm = x_norm,
+                .num_rows = m,
+                .hidden_dim = self.config.hidden_size,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = norm.dtype,
+            }, barrier_before);
+            return;
+        }
+        try self.moe_pipes.encodeResidualAdd(frame, .{
+            .x = x,
+            .delta = delta,
+            .count = m * self.config.hidden_size,
+        }, barrier_before);
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = x,
+            .w = norm.binding,
+            .y = x_norm,
+            .num_rows = m,
+            .hidden_dim = self.config.hidden_size,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = norm.dtype,
+        }, true);
     }
 
     pub fn usesWideGpuPrefill(self: *const GraphModel) bool {
@@ -3263,9 +3597,7 @@ pub const GraphModel = struct {
                                 .rope_theta = self.config.rope_theta,
                             }, false);
                         } else {
-                            try self.encodeLinearGemmWithTile(frame, qsa.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
-                            try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, k_chunk_bind, m, true, false);
-                            try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, v_chunk_bind, m, true, false);
+                            try self.encodeQkvProj(frame, qsa.q_proj, qsa.k_proj, qsa.v_proj, self.wp_x_norm_bind, self.wp_q_bind, k_chunk_bind, v_chunk_bind, m, .gemm_wide, true);
                             try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                                 .q = self.wp_q_bind,
                                 .k = k_chunk_bind,
@@ -3470,9 +3802,7 @@ pub const GraphModel = struct {
                                 .rope_theta = self.config.rope_theta,
                             }, false);
                         } else {
-                            try self.encodeLinearGemmWithTile(frame, qsa.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
-                            try self.encodeLinearGemmWithTile(frame, qsa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
-                            try self.encodeLinearGemmWithTile(frame, qsa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                            try self.encodeQkvProj(frame, qsa.q_proj, qsa.k_proj, qsa.v_proj, self.wp_x_norm_bind, self.wp_q_bind, self.wp_k_bind, self.wp_v_bind, m, .gemm_wide, true);
                             try self.hybrid_pipes.encodeQsaPrefillRope(frame, .{
                                 .q = self.wp_q_bind,
                                 .k = self.wp_k_bind,
@@ -3681,9 +4011,7 @@ pub const GraphModel = struct {
                             .norm_dtype = gqa.qk_norm_dtype,
                         }, false);
                     } else {
-                        try self.encodeLinearGemmWithTile(frame, gqa.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
-                        try self.encodeLinearGemmWithTile(frame, gqa.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
-                        try self.encodeLinearGemmWithTile(frame, gqa.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                        try self.encodeQkvProj(frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, self.wp_x_norm_bind, self.wp_q_bind, self.wp_k_bind, self.wp_v_bind, m, .gemm_wide, true);
                         try self.attn_pipes.encodePrefillQkNormRopeKvWrite(frame, .{
                             .q = self.wp_q_bind,
                             .k = self.wp_k_bind,
@@ -3796,39 +4124,47 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .branch_token_stride = w_stride,
                 }, true);
-            } else {
-                try self.moe_pipes.encodeResidualAdd(frame, .{
+                try self.attn_pipes.encodeRmsNorm(frame, .{
                     .x = eff_x_bind,
-                    .delta = self.wp_proj_out_bind,
-                    .count = eff_m * h,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = self.wp_x_norm_bind,
+                    .num_rows = eff_m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
                 }, true);
+            } else {
+                try self.encodeResidualThenRmsNorm(
+                    frame,
+                    eff_x_bind,
+                    self.wp_proj_out_bind,
+                    layer.post_attention_layernorm,
+                    self.wp_x_norm_bind,
+                    eff_m,
+                    true,
+                );
             }
-
-            try self.attn_pipes.encodeRmsNorm(frame, .{
-                .x = eff_x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = self.wp_x_norm_bind,
-                .num_rows = eff_m,
-                .hidden_dim = h,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
         }
 
         switch (self.config.axes.ffn_kind) {
             .dense_swiglu => {
-                try self.encodeLinearGemmWithTile(frame, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, eff_m, true, true);
-                try self.encodeLinearGemmWithTile(frame, layer.dense_up, self.wp_x_norm_bind, self.wp_dense_up_bind, eff_m, true, false);
-                try self.moe_pipes.encodeSiluMul(frame, .{
-                    .gate = self.wp_dense_gate_bind,
-                    .up = self.wp_dense_up_bind,
-                    .out = self.wp_dense_act_bind,
-                    .count = eff_m * self.config.intermediate_size,
-                }, true);
-                try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
+                try self.encodeDenseGateUpAct(
+                    frame,
+                    layer.dense_gate,
+                    layer.dense_up,
+                    self.wp_x_norm_bind,
+                    self.wp_dense_gate_bind,
+                    self.wp_dense_up_bind,
+                    self.wp_dense_act_bind,
+                    eff_m,
+                    .gemm_wide,
+                    true,
+                );
                 if (self.wp_mhc_arena) |*mhc| {
+                    try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
                     try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer.mhc.?, eff_m, true);
                 } else if (self.wp_gr_arena) |*gr| {
+                    try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
                     const stream_eff: metal.BufferBinding = if (tail_m1_last)
                         .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
                     else
@@ -3850,7 +4186,10 @@ pub const GraphModel = struct {
                         .hidden_dim = h,
                         .branch_token_stride = w_stride,
                     }, true);
+                } else if (self.enable_g18_fusion and (eff_m == 1 or eff_m >= 64)) {
+                    try self.encodeLinearGemmWithTileResidual(frame, layer.dense_down, self.wp_dense_act_bind, eff_x_bind, eff_x_bind, eff_m, true, true);
                 } else {
+                    try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
                     try self.moe_pipes.encodeResidualAdd(frame, .{
                         .x = eff_x_bind,
                         .delta = self.wp_proj_out_bind,
@@ -4226,7 +4565,7 @@ pub const GraphModel = struct {
         try self.retireExcessCompletedChunks();
     }
 
-    /// M6.5 G14 multimodal prefill options for zero-copy `IOSurface` vision/video ingress.
+    /// M6.5 G14 / M7.8 G22 multimodal prefill options for zero-copy `IOSurface` vision/video ingress.
     pub const MultimodalPrefillOptions = struct {
         patch_size: u32 = 16,
         t_patch: u32 = 1,
@@ -4234,6 +4573,11 @@ pub const GraphModel = struct {
         norm: vision_mod.NormParams = vision_mod.NormParams.QWEN_VL_DEFAULT,
         compute_logits: bool = true,
         budget_override: ?budget_mod.Budget = null,
+        anyres_mode: vision_mod.AnyResMode = .smart_resize,
+        anyres_tile_size: u32 = 0,
+        anyres_max_tiles: u32 = 6,
+        anyres_include_thumbnail: bool = true,
+        anyres_min_pixels: u32 = 16 * 16,
     };
 
     pub const MultimodalPrefillResult = struct {
@@ -4250,6 +4594,8 @@ pub const GraphModel = struct {
         all_frames_zero_copy: bool,
         all_frames_page_aligned: bool,
         vision_encode_us: f64,
+        vision_tower_active: bool = false,
+        vision_placement: vision_mod.VisionPlacement = .gpu,
     };
 
     pub const MultimodalPrefillError = GraphStepError || vision_mod.VisionIngress.InitError ||
@@ -4262,12 +4608,12 @@ pub const GraphModel = struct {
         OutOfMemory,
     };
 
-    /// Zero-copy multimodal prefill (`G14`): reads `IOSurface`-backed `VisionFrame`s
+    /// Zero-copy multimodal prefill (`G14` & `G22`): reads `IOSurface`-backed `VisionFrame`s
     /// (`ImageIO` PNG or hardware `VideoToolbox` H.264/HEVC) directly as `MTLTexture`
-    /// planes (`0` host copies), runs Metal 4 patchify + `2x2` spatial-temporal merge +
-    /// linear embed into visual token positions, builds true 3D `[t, h, w]` interleaved
-    /// MRoPE (`[11, 11, 10]`) positions via `buildMultimodalMropePositions`, and prefills
-    /// `[prefix_tokens | vision_tokens | suffix_tokens]` through `GraphModel`.
+    /// planes (`0` host copies). When `G22` ViT tower + PatchMerger weights are loaded
+    /// (`vision_state`), runs `AnyResPatchifyEmbed` -> full `L_vis`-layer 2D-RoPE
+    /// bidirectional FlashAttention-2 ViT tower -> `PatchMerger` over aliased scratch
+    /// before building true 3D `[t, h, w]` interleaved MRoPE positions and chunked prefill.
     pub fn prefillMultimodal(
         self: *GraphModel,
         allocator: std.mem.Allocator,
@@ -4293,6 +4639,22 @@ pub const GraphModel = struct {
             }
             all_zc = all_zc and inf.zeroCopyVerified();
             all_aligned = all_aligned and ((inf.baseAddress() % page.APPLE_PAGE_SIZE) == 0);
+        }
+
+        if (self.vision_state.hasLoadedWeights()) {
+            return self.prefillMultimodalVisionTower(
+                allocator,
+                prefix_tokens,
+                suffix_tokens,
+                frames,
+                fmt0,
+                width,
+                height,
+                is_full_range,
+                all_zc,
+                all_aligned,
+                opts,
+            );
         }
 
         const eff_t_patch: u32 = if (opts.t_patch == 2 and frames.len >= 2) 2 else 1;
@@ -4415,13 +4777,58 @@ pub const GraphModel = struct {
         const all_pos3d = ingress.mropePos3d()[0..total_tokens];
 
         // Build contiguous token ID sequence (placeholder ID 0 for visual positions; replaced on GPU by embedOutBinding).
+        return self.runMultimodalPrefillChunks(
+            allocator,
+            prefix_tokens,
+            suffix_tokens,
+            total_vis_tokens,
+            grid,
+            mrope_res.next_text_pos,
+            all_pos3d,
+            ingress.embedOutBinding(),
+            width,
+            height,
+            @intCast(frames.len),
+            all_zc,
+            all_aligned,
+            vision_encode_us,
+            opts.compute_logits,
+            false,
+            .gpu,
+        );
+    }
+
+    fn runMultimodalPrefillChunks(
+        self: *GraphModel,
+        allocator: std.mem.Allocator,
+        prefix_tokens: []const u32,
+        suffix_tokens: []const u32,
+        total_vis_tokens: u32,
+        grid: vision_mod.VisionGridSpec,
+        next_mrope_pos: u32,
+        all_pos3d: []const hybrid.Pos3D,
+        vis_embeds_bind: metal.BufferBinding,
+        width: u32,
+        height: u32,
+        frame_count: u32,
+        all_zc: bool,
+        all_aligned: bool,
+        vision_encode_us: f64,
+        compute_logits: bool,
+        vision_tower_active: bool,
+        vision_placement: vision_mod.VisionPlacement,
+    ) MultimodalPrefillError!MultimodalPrefillResult {
+        const prefix_u32: u32 = @intCast(prefix_tokens.len);
+        const suffix_u32: u32 = @intCast(suffix_tokens.len);
+        const total_tokens = prefix_u32 + total_vis_tokens + suffix_u32;
+
         const full_toks = try allocator.alloc(u32, total_tokens);
         defer allocator.free(full_toks);
         @memcpy(full_toks[0..prefix_u32], prefix_tokens);
         @memset(full_toks[prefix_u32 .. prefix_u32 + total_vis_tokens], 0);
         @memcpy(full_toks[prefix_u32 + total_vis_tokens .. total_tokens], suffix_tokens);
 
-        // 3. Prefill `[prefix | vision | suffix]` in causal chunks with true 3D MRoPE + GPU visual embed injection.
+        // Prefill `[prefix | vision | suffix]` in causal chunks with true 3D MRoPE + GPU visual embed injection.
         self.resetKvCache();
         const chunk_cap: usize = @max(@as(usize, 1), @as(usize, self.max_tree_nodes));
         const vis_start: usize = prefix_u32;
@@ -4449,7 +4856,7 @@ pub const GraphModel = struct {
             const vis_ov: ?VisualEmbedOverride = if (ov_lo < ov_hi) .{
                 .local_start = @intCast(ov_lo - offset),
                 .count = @intCast(ov_hi - ov_lo),
-                .src_bind = ingress.embedOutBinding(),
+                .src_bind = vis_embeds_bind,
                 .src_row_offset = @intCast(ov_lo - vis_start),
             } else null;
 
@@ -4460,7 +4867,7 @@ pub const GraphModel = struct {
                 mask_buf[0..take],
                 cur_base,
                 self.effective_max_loops,
-                is_last_chunk and opts.compute_logits,
+                is_last_chunk and compute_logits,
                 0,
                 null,
                 true,
@@ -4475,12 +4882,12 @@ pub const GraphModel = struct {
             }
             self.seq_len = cur_base + @as(u32, @intCast(take));
             try self.retireExcessCompletedChunks();
-            if (is_last_chunk and opts.compute_logits) {
+            if (is_last_chunk and compute_logits) {
                 first_tok = vr.argmax_tokens[take - 1];
             }
             offset += take;
         }
-        self.mrope_next_pos = mrope_res.next_text_pos;
+        self.mrope_next_pos = next_mrope_pos;
 
         return .{
             .first_token = first_tok,
@@ -4488,15 +4895,246 @@ pub const GraphModel = struct {
             .vision_tokens = total_vis_tokens,
             .suffix_tokens = suffix_u32,
             .total_prompt_tokens = total_tokens,
-            .next_mrope_pos = mrope_res.next_text_pos,
+            .next_mrope_pos = next_mrope_pos,
             .grid = grid,
             .frame_width = width,
             .frame_height = height,
-            .frame_count = @intCast(frames.len),
+            .frame_count = frame_count,
             .all_frames_zero_copy = all_zc,
             .all_frames_page_aligned = all_aligned,
             .vision_encode_us = vision_encode_us,
+            .vision_tower_active = vision_tower_active,
+            .vision_placement = vision_placement,
         };
+    }
+
+    fn prefillMultimodalVisionTower(
+        self: *GraphModel,
+        allocator: std.mem.Allocator,
+        prefix_tokens: []const u32,
+        suffix_tokens: []const u32,
+        frames: []const metal.VisionFrame,
+        fmt0: metal.VisionFormat,
+        width: u32,
+        height: u32,
+        is_full_range: bool,
+        all_zc: bool,
+        all_aligned: bool,
+        opts: MultimodalPrefillOptions,
+    ) MultimodalPrefillError!MultimodalPrefillResult {
+        const rt = &self.vision_state.runtime;
+        const vcfg = rt.config;
+        const pipes = rt.pipelines orelse return error.InvalidBlockWeights;
+        const sc = rt.scratch orelse return error.InvalidBlockWeights;
+        const pe = self.vision_state.patch_embed orelse return error.InvalidBlockWeights;
+        const merger = self.vision_state.merger orelse return error.InvalidBlockWeights;
+
+        const eff_t_patch: u32 = vcfg.t_patch;
+        const tube_count: u32 = @intCast((frames.len + eff_t_patch - 1) / eff_t_patch);
+        if (tube_count == 0) return error.EmptyFrames;
+        const max_patches_per_tube = vcfg.max_patches / tube_count;
+        if (max_patches_per_tube == 0) return error.InvalidGeometry;
+
+        const factor = std.math.mul(u32, vcfg.patch_size, vcfg.spatial_merge) catch return error.Overflow;
+        const min_pixels = if (opts.anyres_min_pixels > 0) opts.anyres_min_pixels else factor * factor;
+        const max_pixels = std.math.mul(u32, max_patches_per_tube, vcfg.patch_size * vcfg.patch_size) catch return error.Overflow;
+        const def_tile_size = if (opts.anyres_tile_size > 0)
+            opts.anyres_tile_size
+        else
+            @max(factor, (@min(width, height) / factor) * factor);
+        const plan = try vision_mod.planAnyResGrid(width, height, .{
+            .mode = opts.anyres_mode,
+            .patch_size = vcfg.patch_size,
+            .t_patch = eff_t_patch,
+            .spatial_merge = vcfg.spatial_merge,
+            .min_pixels = min_pixels,
+            .max_pixels = max_pixels,
+            .tile_size = def_tile_size,
+            .max_tiles = opts.anyres_max_tiles,
+            .include_thumbnail = opts.anyres_include_thumbnail,
+        });
+        const total_patches = std.math.mul(u32, tube_count, plan.total_patches) catch return error.Overflow;
+        if (total_patches == 0 or total_patches > vcfg.max_patches) return error.InvalidGeometry;
+        const total_vis_tokens = std.math.mul(u32, tube_count, plan.total_merged_tokens) catch return error.Overflow;
+
+        const prefix_u32: u32 = @intCast(prefix_tokens.len);
+        const suffix_u32: u32 = @intCast(suffix_tokens.len);
+        const total_tokens = prefix_u32 + total_vis_tokens + suffix_u32;
+        if (total_tokens == 0) return error.InvalidBatchSize;
+        if (total_tokens > self.max_seq_len) return error.SequenceFull;
+
+        // Populate 2D-RoPE coordinates & tile-isolated bidirectional window bounds in aliased scratch.
+        const coords_sl = sc.coordsSlice();
+        const bounds_sl = sc.windowBoundsSlice();
+        for (0..tube_count) |t_idx| {
+            const tube_off = @as(u32, @intCast(t_idx)) * plan.total_patches;
+            _ = try plan.fillRope2DCoords(coords_sl[tube_off .. tube_off + plan.total_patches]);
+            _ = try plan.fillWindowBounds(0, bounds_sl[tube_off .. tube_off + plan.total_patches]);
+            for (bounds_sl[tube_off .. tube_off + plan.total_patches]) |*wb| {
+                wb.kv_start += tube_off;
+                wb.kv_end += tube_off;
+            }
+        }
+
+        // If `sc.lm_embeds_off` aliases `tr_arena` `[0 .. tr_scratch_bytes)`, stage emitted embeddings
+        // on the GPU before `runForwardInternal` reuses `tr_arena` across prefill chunks (`0` CPU memcpy).
+        const need_stage = (sc.lm_embeds_off < self.vision_state.tr_scratch_bytes);
+        var stage_arena_opt: ?arena_mod.WiredArena = null;
+        var stage_buf_opt: ?metal.Buffer = null;
+        defer {
+            if (stage_buf_opt) |b| {
+                self.compute.removeResident(&.{b}) catch |err| {
+                    std.debug.panic("removeResident(vision_stage) failed: {}", .{err});
+                };
+                b.close();
+            }
+            if (stage_arena_opt) |*sa| sa.deinit();
+        }
+        var vis_embeds_bind = sc.lmEmbedsBinding();
+        if (need_stage) {
+            const facts = try sysinfo.Facts.read();
+            const dev_info = try self.device.info();
+            const wired_budget = opts.budget_override orelse budget_mod.Budget.fromHost(facts, dev_info, .{});
+            const stage_bytes = try page.alignUp(@as(usize, total_vis_tokens) * self.config.hidden_size * @sizeOf(f16));
+            var sa = try arena_mod.WiredArena.init(stage_bytes, wired_budget);
+            errdefer sa.deinit();
+            const sb = try metal.Buffer.wrap(self.device, sa.bytes());
+            errdefer sb.close();
+            try self.compute.makeResident(&.{sb});
+            stage_arena_opt = sa;
+            stage_buf_opt = sb;
+            vis_embeds_bind = .{ .buffer = sb, .offset = 0 };
+        }
+
+        try self.compute.makeVisionFramesResident(frames);
+        defer self.compute.removeVisionFramesResident(frames) catch |err| {
+            std.debug.panic("removeVisionFramesResident failed: {}", .{err});
+        };
+
+        const vis_t0 = try vmstat.nowNs();
+        {
+            var vframe = try self.compute.beginFrame(self.timeout_ms);
+            errdefer vframe.abort();
+
+            var first_dispatch = true;
+            var tube: u32 = 0;
+            while (tube < tube_count) : (tube += 1) {
+                const f0_idx: usize = @as(usize, tube) * eff_t_patch;
+                const f1_opt: ?metal.VisionFrame = if (eff_t_patch == 2)
+                    frames[@min(f0_idx + 1, frames.len - 1)]
+                else
+                    null;
+                const tube_off = tube * plan.total_patches;
+                for (plan.activeTiles()) |tile| {
+                    var t_spec = tile;
+                    t_spec.token_offset = tube_off + tile.token_offset;
+                    const barrier = !first_dispatch;
+                    first_dispatch = false;
+                    switch (fmt0) {
+                        .bgra8 => try pipes.encodeAnyResPatchifyEmbedBgra8(
+                            &vframe,
+                            frames[f0_idx],
+                            f1_opt,
+                            width,
+                            height,
+                            t_spec,
+                            vcfg.patch_size,
+                            eff_t_patch,
+                            vcfg.vis_hidden,
+                            opts.norm,
+                            pe.weight,
+                            pe.bias,
+                            pe.pos_embed,
+                            sc.hiddenABinding(),
+                            pe.dtype,
+                            .f16,
+                            barrier,
+                        ),
+                        .nv12 => try pipes.encodeAnyResPatchifyEmbedNv12(
+                            &vframe,
+                            frames[f0_idx],
+                            f1_opt,
+                            width,
+                            height,
+                            t_spec,
+                            vcfg.patch_size,
+                            eff_t_patch,
+                            vcfg.vis_hidden,
+                            is_full_range,
+                            opts.norm,
+                            pe.weight,
+                            pe.bias,
+                            pe.pos_embed,
+                            sc.hiddenABinding(),
+                            pe.dtype,
+                            .f16,
+                            barrier,
+                        ),
+                        else => unreachable,
+                    }
+                }
+            }
+
+            const tile0 = plan.tiles[0];
+            const emitted = try rt.encodeTowerForward(
+                &vframe,
+                self.vision_state.blocks,
+                merger,
+                tile0.grid_h,
+                tile0.grid_w,
+                tube_count * plan.num_tiles,
+                true,
+            );
+            std.debug.assert(emitted == total_vis_tokens);
+
+            if (need_stage) {
+                try self.moe_pipes.encodeCopyStrided(&vframe, .{
+                    .src = sc.lmEmbedsBinding(),
+                    .dst = vis_embeds_bind,
+                    .num_rows = total_vis_tokens,
+                    .copy_cols = self.config.hidden_size,
+                    .src_stride = self.config.hidden_size,
+                    .dst_stride = self.config.hidden_size,
+                }, true);
+            }
+            const vsig = try vframe.commit();
+            try self.compute.wait(vsig, self.timeout_ms);
+        }
+        if (self.vision_state.ane_offload) |*offload| {
+            if (rt.placement == .ane) {
+                _ = try offload.predictZeroCopy();
+            }
+        }
+        const vis_t1 = try vmstat.nowNs();
+        const vision_encode_us: f64 = @as(f64, @floatFromInt(vis_t1 - vis_t0)) / 1000.0;
+
+        const grid = plan.toVisionGridSpec(tube_count, 1);
+        const mrope_planar = try allocator.alloc(u32, @as(usize, total_tokens) * 3);
+        defer allocator.free(mrope_planar);
+        const all_pos3d = try allocator.alloc(hybrid.Pos3D, total_tokens);
+        defer allocator.free(all_pos3d);
+        const mrope_res = try vision_mod.buildMultimodalMropePositions(prefix_u32, grid, suffix_u32, mrope_planar);
+        try vision_mod.packMropePlanarToPos3D(mrope_planar, mrope_res.total_tokens, all_pos3d);
+
+        return self.runMultimodalPrefillChunks(
+            allocator,
+            prefix_tokens,
+            suffix_tokens,
+            total_vis_tokens,
+            grid,
+            mrope_res.next_text_pos,
+            all_pos3d,
+            vis_embeds_bind,
+            width,
+            height,
+            @intCast(frames.len),
+            all_zc,
+            all_aligned,
+            vision_encode_us,
+            opts.compute_logits,
+            true,
+            rt.placement,
+        );
     }
 
     const VisualEmbedOverride = struct {
@@ -5154,18 +5792,6 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .branch_token_stride = self.max_tree_nodes,
                 }, true);
-            } else {
-                const f = try self.ensureFrame(frame_opt);
-                try self.moe_pipes.encodeResidualAdd(f, .{
-                    .x = self.x_bind,
-                    .delta = self.proj_out_bind,
-                    .count = m * h,
-                }, true);
-            }
-
-            // Post-attention RMSNorm -> `x_norm_bind`.
-            {
-                const f = try self.ensureFrame(frame_opt);
                 try self.attn_pipes.encodeRmsNorm(f, .{
                     .x = self.x_bind,
                     .w = layer.post_attention_layernorm.binding,
@@ -5175,25 +5801,53 @@ pub const GraphModel = struct {
                     .eps = self.config.rms_norm_eps,
                     .w_dtype = layer.post_attention_layernorm.dtype,
                 }, true);
+            } else {
+                const f = try self.ensureFrame(frame_opt);
+                try self.encodeResidualThenRmsNorm(f, self.x_bind, self.proj_out_bind, layer.post_attention_layernorm, self.x_norm_bind, m, true);
             }
         }
 
         // --- FFN / MoE Dispatch ---
         switch (self.config.axes.ffn_kind) {
             .dense_swiglu => {
-                try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .gate_proj, layer.dense_gate, self.x_norm_bind, self.x_norm_host, self.dense_gate_bind, self.dense_gate_host, m, true);
-                try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .up_proj, layer.dense_up, self.x_norm_bind, self.x_norm_host, self.dense_up_bind, self.dense_up_host, m, false);
+                const use_fused_gu = !self.hasActiveStepLora(l, loop_step, .gate_proj) and
+                    !self.hasActiveStepLora(l, loop_step, .up_proj);
+                if (use_fused_gu) {
+                    const f = try self.ensureFrame(frame_opt);
+                    try self.encodeDenseGateUpAct(
+                        f,
+                        layer.dense_gate,
+                        layer.dense_up,
+                        self.x_norm_bind,
+                        self.dense_gate_bind,
+                        self.dense_up_bind,
+                        self.dense_act_bind,
+                        m,
+                        .batched_gemv,
+                        true,
+                    );
+                } else {
+                    try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .gate_proj, layer.dense_gate, self.x_norm_bind, self.x_norm_host, self.dense_gate_bind, self.dense_gate_host, m, true);
+                    try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .up_proj, layer.dense_up, self.x_norm_bind, self.x_norm_host, self.dense_up_bind, self.dense_up_host, m, false);
+                    {
+                        const f = try self.ensureFrame(frame_opt);
+                        try self.moe_pipes.encodeSiluMul(f, .{
+                            .gate = self.dense_gate_bind,
+                            .up = self.dense_up_bind,
+                            .out = self.dense_act_bind,
+                            .count = m * self.config.intermediate_size,
+                        }, true);
+                    }
+                }
+                if (self.enable_g18_fusion and (m == 1 or m >= 64) and self.mhc_arena == null and self.gr_arena == null and
+                    !self.hasActiveStepLora(l, loop_step, .down_proj))
                 {
                     const f = try self.ensureFrame(frame_opt);
-                    try self.moe_pipes.encodeSiluMul(f, .{
-                        .gate = self.dense_gate_bind,
-                        .up = self.dense_up_bind,
-                        .out = self.dense_act_bind,
-                        .count = m * self.config.intermediate_size,
-                    }, true);
+                    try self.encodeLinearBatchedResidual(f, layer.dense_down, self.dense_act_bind, self.x_bind, self.x_bind, m, true);
+                } else {
+                    try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .down_proj, layer.dense_down, self.dense_act_bind, self.dense_act_host, self.proj_out_bind, self.proj_out_host, m, true);
+                    try self.applyFfnResidual(frame_opt, l, m, h);
                 }
-                try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .down_proj, layer.dense_down, self.dense_act_bind, self.dense_act_host, self.proj_out_bind, self.proj_out_host, m, true);
-                try self.applyFfnResidual(frame_opt, l, m, h);
             },
             .moe_swiglu => {
                 try self.execMoeFfn(frame_opt, l, layer, m, loop_step);
@@ -5462,24 +6116,13 @@ pub const GraphModel = struct {
         loop_step: u32,
         commit_kv: bool,
     ) GraphStepError!void {
-        try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, qsa.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
-        {
+        if (loop_step == 0 and !self.hasActiveStepLora(l, loop_step, .q_proj)) {
             const f = try self.ensureFrame(frame_opt);
+            try self.encodeQkvProj(f, qsa.q_proj, qsa.k_proj, qsa.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
             const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_k_off };
             const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_v_off };
 
-            // Shared r=0 KV across recurrent passes (`LoopLM` KV sharing, ADR-0019):
-            // compute `K, V` once at `r = 0` into `tree_k/tree_v` and reuse them on `r >= 1`
-            // so batched `verifyTree(M > 1)` matches serial `stepDecode(M = 1)` bit-for-bit
-            // and QSA `reuse_block_indices` sees identical KV keys across loops.
-            if (loop_step == 0) {
-                try self.encodeLinearBatched(f, qsa.k_proj, self.x_norm_bind, self.k_bind, m, false);
-                try self.encodeLinearBatched(f, qsa.v_proj, self.x_norm_bind, self.v_bind, m, false);
-            }
-
-            // QK-Norm + YaRN + Interleaved 3D MRoPE: at `r = 0` write into `tree_k/tree_v`;
-            // at `r >= 1` rotate `Q` in-place and route K/V output to scratch `k_bind/v_bind`
-            // so `tree_k/tree_v` preserve `r = 0` K/V untouched.
+            // QK-Norm + YaRN + Interleaved 3D MRoPE
             const mrope_rot: u32 = (self.config.mrope_section.section[0] + self.config.mrope_section.section[1] + self.config.mrope_section.section[2]) * 2;
             const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= self.config.head_dim) mrope_rot else self.config.head_dim;
             try self.hybrid_pipes.encodeQsaTreeRope(f, .{
@@ -5489,8 +6132,8 @@ pub const GraphModel = struct {
                 .q_norm = qsa.q_norm,
                 .k_norm = qsa.k_norm,
                 .positions_3d = self.pos3d_bind,
-                .k_tree_out = if (loop_step == 0) tree_k else self.k_bind,
-                .v_tree_out = if (loop_step == 0) tree_v else self.v_bind,
+                .k_tree_out = tree_k,
+                .v_tree_out = tree_v,
                 .num_nodes = m,
                 .num_q_heads = self.config.num_attention_heads,
                 .num_kv_heads = self.config.num_key_value_heads,
@@ -5502,6 +6145,53 @@ pub const GraphModel = struct {
                 .yarn = self.config.yarn,
                 .norm_dtype = qsa.qk_norm_dtype,
             }, true);
+        } else {
+            try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, qsa.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
+            {
+                const f = try self.ensureFrame(frame_opt);
+                const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_k_off };
+                const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_v_off };
+
+                // Shared r=0 KV across recurrent passes (`LoopLM` KV sharing, ADR-0019):
+                // compute `K, V` once at `r = 0` into `tree_k/tree_v` and reuse them on `r >= 1`
+                // so batched `verifyTree(M > 1)` matches serial `stepDecode(M = 1)` bit-for-bit
+                // and QSA `reuse_block_indices` sees identical KV keys across loops.
+                if (loop_step == 0) {
+                    try self.encodeLinearBatched(f, qsa.k_proj, self.x_norm_bind, self.k_bind, m, false);
+                    try self.encodeLinearBatched(f, qsa.v_proj, self.x_norm_bind, self.v_bind, m, false);
+                }
+
+                // QK-Norm + YaRN + Interleaved 3D MRoPE: at `r = 0` write into `tree_k/tree_v`;
+                // at `r >= 1` rotate `Q` in-place and route K/V output to scratch `k_bind/v_bind`
+                // so `tree_k/tree_v` preserve `r = 0` K/V untouched.
+                const mrope_rot: u32 = (self.config.mrope_section.section[0] + self.config.mrope_section.section[1] + self.config.mrope_section.section[2]) * 2;
+                const eff_rot_dim: u32 = if (mrope_rot > 0 and mrope_rot <= self.config.head_dim) mrope_rot else self.config.head_dim;
+                try self.hybrid_pipes.encodeQsaTreeRope(f, .{
+                    .q = self.q_bind,
+                    .k = self.k_bind,
+                    .v = self.v_bind,
+                    .q_norm = qsa.q_norm,
+                    .k_norm = qsa.k_norm,
+                    .positions_3d = self.pos3d_bind,
+                    .k_tree_out = if (loop_step == 0) tree_k else self.k_bind,
+                    .v_tree_out = if (loop_step == 0) tree_v else self.v_bind,
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .rotary_dim = eff_rot_dim,
+                    .mrope = self.config.mrope_section,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .yarn = self.config.yarn,
+                    .norm_dtype = qsa.qk_norm_dtype,
+                }, true);
+            }
+        }
+        {
+            const f = try self.ensureFrame(frame_opt);
+            const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_k_off };
+            const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = qsa.tree_v_off };
 
             // --- Isolation #3 (QSA G9): compute block indices at `r = 0`, reuse on `r >= 1` ---
             const reuse_idx = (loop_step >= 1);
@@ -5575,19 +6265,11 @@ pub const GraphModel = struct {
         loop_step: u32,
         commit_kv: bool,
     ) GraphStepError!void {
-        try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, gqa.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
-        {
+        if (loop_step == 0 and !self.hasActiveStepLora(l, loop_step, .q_proj)) {
             const f = try self.ensureFrame(frame_opt);
+            try self.encodeQkvProj(f, gqa.q_proj, gqa.k_proj, gqa.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
             const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_k_off };
             const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_v_off };
-
-            // Shared r=0 KV across recurrent passes (`LoopLM` KV sharing, ADR-0019):
-            // compute `K, V` once at `r = 0` into `tree_k/tree_v` and reuse on `r >= 1`
-            // so parallel `prefill` / `verifyTree(M > 1)` matches serial `stepDecode(M = 1)` bit-for-bit.
-            if (loop_step == 0) {
-                try self.encodeLinearBatched(f, gqa.k_proj, self.x_norm_bind, self.k_bind, m, false);
-                try self.encodeLinearBatched(f, gqa.v_proj, self.x_norm_bind, self.v_bind, m, false);
-            }
 
             try self.attn_pipes.encodeTreeQkNormRope(f, .{
                 .q = self.q_bind,
@@ -5596,8 +6278,8 @@ pub const GraphModel = struct {
                 .q_norm = gqa.q_norm,
                 .k_norm = gqa.k_norm,
                 .positions = self.positions_bind,
-                .k_tree_out = if (loop_step == 0) tree_k else self.k_bind,
-                .v_tree_out = if (loop_step == 0) tree_v else self.v_bind,
+                .k_tree_out = tree_k,
+                .v_tree_out = tree_v,
                 .num_nodes = m,
                 .num_q_heads = self.config.num_attention_heads,
                 .num_kv_heads = self.config.num_key_value_heads,
@@ -5606,6 +6288,44 @@ pub const GraphModel = struct {
                 .rope_theta = self.config.rope_theta,
                 .norm_dtype = gqa.qk_norm_dtype,
             }, true);
+        } else {
+            try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .q_proj, gqa.q_proj, self.x_norm_bind, self.x_norm_host, self.q_bind, self.q_host, m, true);
+            {
+                const f = try self.ensureFrame(frame_opt);
+                const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_k_off };
+                const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_v_off };
+
+                // Shared r=0 KV across recurrent passes (`LoopLM` KV sharing, ADR-0019):
+                // compute `K, V` once at `r = 0` into `tree_k/tree_v` and reuse on `r >= 1`
+                // so parallel `prefill` / `verifyTree(M > 1)` matches serial `stepDecode(M = 1)` bit-for-bit.
+                if (loop_step == 0) {
+                    try self.encodeLinearBatched(f, gqa.k_proj, self.x_norm_bind, self.k_bind, m, false);
+                    try self.encodeLinearBatched(f, gqa.v_proj, self.x_norm_bind, self.v_bind, m, false);
+                }
+
+                try self.attn_pipes.encodeTreeQkNormRope(f, .{
+                    .q = self.q_bind,
+                    .k = self.k_bind,
+                    .v = self.v_bind,
+                    .q_norm = gqa.q_norm,
+                    .k_norm = gqa.k_norm,
+                    .positions = self.positions_bind,
+                    .k_tree_out = if (loop_step == 0) tree_k else self.k_bind,
+                    .v_tree_out = if (loop_step == 0) tree_v else self.v_bind,
+                    .num_nodes = m,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .rms_eps = self.config.rms_norm_eps,
+                    .rope_theta = self.config.rope_theta,
+                    .norm_dtype = gqa.qk_norm_dtype,
+                }, true);
+            }
+        }
+        {
+            const f = try self.ensureFrame(frame_opt);
+            const tree_k: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_k_off };
+            const tree_v: metal.BufferBinding = .{ .buffer = self.scratch_buf, .offset = gqa.tree_v_off };
 
             if (self.num_retired_chunks > 0 and base_pos > 0 and self.retired_kv_pool != null) {
                 const rpool = self.retired_kv_pool.?;
@@ -5935,6 +6655,12 @@ pub const GraphModel = struct {
         return self.encodeMoELayerDispatch(frame, layer, args, barrier_before);
     }
 
+    fn hasActiveStepLora(self: *const GraphModel, l: usize, loop_step: u32, proj: AdapterProjKind) bool {
+        const art = self.adapter_rt orelse return false;
+        const adp = art.get(loop_step, @intCast(l), proj) orelse return false;
+        return adp.alpha != 0.0;
+    }
+
     /// Evaluates a base linear projection on GPU plus optional L2-resident SME2
     /// `Step-LoRA` adapter (`W16`, ADR-0019).
     /// When `alpha == 0.0` (`r = 0`), executes strictly on GPU with zero CPU syncs
@@ -5968,7 +6694,7 @@ pub const GraphModel = struct {
             }
 
             // Active `r >= 1` Step-LoRA: flush input readiness, launch GPU base linear
-            // concurrently with L2-resident P-core SME2 `SmeStepLoraAdapter.evalU16`!
+            // concurrently with L2-resident P-core SME2 `SmeStepLoraAdapter.evalMultiAdapterHoisted` (`C24`).
             const art = self.adapter_rt.?;
             try self.flushFrame(frame_opt);
 
@@ -5982,9 +6708,50 @@ pub const GraphModel = struct {
             const delta_slice = art.delta_f32[0..mn];
             @memset(delta_slice, 0.0);
             const x_u16: []const u16 = @ptrCast(x_host[0..mk]);
-            try adapter.evalU16(&art.dispatcher, &art.scratch, x_u16, delta_slice, m, null, null);
+            const adp_slice = [_]sme.SmeStepLoraAdapter{adapter};
+            var waited = false;
+            sme.SmeStepLoraAdapter.evalMultiAdapterHoisted(
+                &adp_slice,
+                &art.dispatcher,
+                &art.scratch,
+                x_u16,
+                delta_slice,
+                m,
+                self.chip_profile,
+                true, // GPU base linear reads weights over unified bus concurrently
+                null,
+                0,
+                null,
+            ) catch |err| switch (err) {
+                error.BusContentionDeferred => {
+                    // Exceeded 4 MiB hot-adapter L2 cap under active GPU bus saturation (`C13`/`C24`):
+                    // wait for GPU frame to finish, then execute cleanly with zero bus contention.
+                    try self.compute.wait(sig, self.timeout_ms);
+                    waited = true;
+                    self.loop_stats.steplora_c13_defers += 1;
+                    sme.SmeStepLoraAdapter.evalMultiAdapterHoisted(
+                        &adp_slice,
+                        &art.dispatcher,
+                        &art.scratch,
+                        x_u16,
+                        delta_slice,
+                        m,
+                        null,
+                        false,
+                        null,
+                        0,
+                        null,
+                    ) catch |e2| switch (e2) {
+                        error.BusContentionDeferred => return error.ComputeFailed,
+                        else => |sme_err| return sme_err,
+                    };
+                },
+                else => |sme_err| return sme_err,
+            };
 
-            try self.compute.wait(sig, self.timeout_ms);
+            if (!waited) {
+                try self.compute.wait(sig, self.timeout_ms);
+            }
             for (0..mn) |i| {
                 const sum: f32 = @as(f32, @floatCast(y_host[i])) + delta_slice[i];
                 y_host[i] = @floatCast(sum);
@@ -7308,8 +8075,42 @@ pub const GraphModel = struct {
             .headroom_bytes = budget_mod.DEFAULT_HEADROOM_BYTES,
         });
 
-        // --- 1. Partition wired tensors into <= MAX_SHARD_BYTES shards (skipping cold/sparse) ---
+        // --- 1. Resolve W20/G22 Vision Tower (embedded or sidecar) & partition wired shards ---
         const entries = source.entries();
+        var vis_sidecar_file: ?amf.AmfFile = null;
+        defer if (vis_sidecar_file) |*sf| sf.close(allocator);
+        if (!options.disable_vision_tower) {
+            if (options.vision_amf_path) |vis_path| {
+                vis_sidecar_file = try amf.AmfFile.open(allocator, vis_path);
+            }
+        }
+        const vis_source: VisionAmfSource = if (vis_sidecar_file) |*sf|
+            .{ .sidecar = &sf.parsed }
+        else
+            .{ .main = source };
+        const resolved_vision_cfg: vision_mod.VisionTowerConfig = if (options.disable_vision_tower)
+            .{ .has_vision = false }
+        else if (options.vision_config) |explicit_vcfg| blk: {
+            try explicit_vcfg.validate();
+            break :blk explicit_vcfg;
+        } else try inferVisionConfigFromEntries(vis_source, config.hidden_size, options.vision_max_patches);
+        const vis_scratch_bytes: usize = if (resolved_vision_cfg.has_vision)
+            try vision_mod.VisionTowerScratch.requiredBytes(resolved_vision_cfg)
+        else
+            0;
+
+        var vis_sidecar_bytes: usize = 0;
+        if (vis_sidecar_file) |*sf| {
+            for (sf.parsed.entries) |*se| {
+                const sk = try se.tensorKind();
+                if (sk == .metadata or sk == .sparse_table or sk == .cold_expert) continue;
+                vis_sidecar_bytes += try page.alignUp(@intCast(se.blob_bytes));
+            }
+            if (vis_sidecar_bytes > 0) {
+                vis_sidecar_bytes = try page.alignUp(vis_sidecar_bytes);
+            }
+        }
+
         var shard_sizes: std.ArrayListUnmanaged(usize) = .empty;
         defer shard_sizes.deinit(allocator);
         var entry_shard = try allocator.alloc(u16, entries.len);
@@ -7332,6 +8133,8 @@ pub const GraphModel = struct {
         try shard_sizes.append(allocator, 0);
         for (entries, 0..) |*e, idx| {
             const kind = try e.tensorKind();
+            if (kind == .metadata or kind == .sparse_table) continue;
+            if (options.disable_vision_tower and isVisionAmfName(e.nameSlice())) continue;
             if (kind == .cold_expert) {
                 if (effective_cluster_plan) |plan| {
                     if (e.expert != amf.NO_EXPERT and !plan.isLocal(e.expert)) continue;
@@ -7354,7 +8157,6 @@ pub const GraphModel = struct {
                     if (e.expert != amf.NO_EXPERT and !plan.isLocal(e.expert)) continue;
                 }
             }
-            if (kind == .sparse_table) continue;
             if (kind == .loop_adapter) inline_loop_adapters += 1;
 
             const aligned = try page.alignUp(@intCast(e.blob_bytes));
@@ -7697,7 +8499,7 @@ pub const GraphModel = struct {
         const wide_enabled = (wide_prefill_max_tokens > 0);
         const w_cap: usize = wide_prefill_max_tokens;
         const multi_loop = (effective_max_loops > 1);
-        const use_aliased_scratch = wide_enabled and options.alias_prefill_tree_scratch;
+        const use_aliased_scratch = (wide_enabled or vis_scratch_bytes > 0) and options.alias_prefill_tree_scratch;
         const logits_cap: usize = if (options.compute_all_logits and wide_enabled) @max(@as(usize, max_m), w_cap) else max_m;
         const feat_cap: usize = if (wide_enabled and options.enable_feature_taps) @max(@as(usize, max_m), w_cap) else max_m;
 
@@ -8037,18 +8839,19 @@ pub const GraphModel = struct {
             }
         }
 
+        const phase_a_bytes: usize = @max(wide_scratch_bytes, vis_scratch_bytes);
         const aliased_block_bytes: usize = if (use_aliased_scratch)
-            @max(try page.alignUp(wide_scratch_bytes), try page.alignUp(tree_scratch_bytes))
-        else if (wide_enabled)
-            (try page.alignUp(wide_scratch_bytes)) + (try page.alignUp(tree_scratch_bytes))
+            @max(try page.alignUp(phase_a_bytes), try page.alignUp(tree_scratch_bytes))
         else
-            try page.alignUp(tree_scratch_bytes);
+            (if (wide_enabled) try page.alignUp(wide_scratch_bytes) else 0) +
+                (if (vis_scratch_bytes > 0) try page.alignUp(vis_scratch_bytes) else 0) +
+                try page.alignUp(tree_scratch_bytes);
 
         // Generous page margin for sub-arena page rounding.
         const scratch_bytes = try page.alignUp(aliased_block_bytes + persist_bytes + 32 * page.APPLE_PAGE_SIZE);
         // Update live admission with exact required wired footprint (enforcing `--strict-live-ram` before mlock).
         live_admission = try wired_budget.planWithLiveRam(
-            total_wired_bytes + scratch_bytes,
+            total_wired_bytes + scratch_bytes + vis_sidecar_bytes,
             optional_cold_bytes + optional_ple_bytes,
             live_reclaimable_bytes,
             .{
@@ -8056,7 +8859,7 @@ pub const GraphModel = struct {
                 .strict_live_ram = options.strict_live_ram,
             },
         );
-        try wired_budget.checkPlan(total_wired_bytes + scratch_bytes);
+        try wired_budget.checkPlan(total_wired_bytes + scratch_bytes + vis_sidecar_bytes);
 
         var scratch_arena = try arena_mod.WiredArena.init(scratch_bytes, wired_budget);
         errdefer scratch_arena.deinit();
@@ -8070,24 +8873,44 @@ pub const GraphModel = struct {
         // `nax -> simdgroup_apple9` on canary failure unless `strict_nax`.
         var canary_result: ?dequant.CanaryResult = null;
         if (options.startup_canary) {
-            canary_result = try dequant_pipes.runStartupNumericalCanaryInBufferMut(&compute, scratch_buf, scratch_arena.bytes());
+            const comb = try attn_pipes.runCombinedStartupCanaryInBufferMut(&dequant_pipes, &compute, scratch_buf, scratch_arena.bytes());
+            canary_result = comb.dequant;
             @memset(scratch_arena.bytes()[0..page.APPLE_PAGE_SIZE], 0);
         }
 
-        // P0-B2 (`R9`, ADR-0020): Allocate aliased wide-prefill / verifyTree pair FIRST
+        // P0-B2 + G22 (`R9`, ADR-0020, ADR-0023): Allocate aliased wide-prefill & ViT / verifyTree pair FIRST
         // (at offset 0 of `scratch_arena`) so `arena_a.offsetOf(p) == arena_b.offsetOf(p) ==
         // scratch_arena.offsetOf(p)` for `GrStreamArena`, `QsaIndexBuffer`, `MoeWorkspace`,
-        // and all Metal buffer bindings while keeping `lm_head` 100% wired!
+        // `VisionTowerScratch`, and all Metal buffer bindings while keeping `lm_head` 100% wired!
         var aliased_scratch_saved_bytes: usize = 0;
+        var vis_aliased_saved_bytes: usize = 0;
         var aliased_pair: ?arena_mod.AliasedScratchPair = null;
         if (use_aliased_scratch) {
-            const pair = try scratch_arena.allocAliasedPair(wide_scratch_bytes, tree_scratch_bytes);
+            const pair = try scratch_arena.allocAliasedPair(phase_a_bytes, tree_scratch_bytes);
             std.debug.assert(scratch_arena.offsetOf(pair.backing.ptr) == 0);
             aliased_scratch_saved_bytes = pair.saved_bytes;
+            if (vis_scratch_bytes > 0) {
+                const aligned_vis = try page.alignUp(vis_scratch_bytes);
+                const other_bytes = @max(
+                    if (wide_enabled) try page.alignUp(wide_scratch_bytes) else 0,
+                    try page.alignUp(tree_scratch_bytes),
+                );
+                vis_aliased_saved_bytes = @min(aligned_vis, other_bytes);
+            }
             aliased_pair = pair;
         }
         const wp_arena: *arena_mod.WiredArena = if (aliased_pair != null) &aliased_pair.?.arena_a else &scratch_arena;
         const tr_arena: *arena_mod.WiredArena = if (aliased_pair != null) &aliased_pair.?.arena_b else &scratch_arena;
+        var vis_sub_arena_opt: ?arena_mod.WiredArena = if (vis_scratch_bytes > 0) blk: {
+            if (aliased_pair) |pair| {
+                // Capture offset-0 `arena_a` copy BEFORE `wp_arena` bumps so ViT scratch and
+                // wide prefill / verifyTree scratch physically share the same wired pages (`0 B` extra decode RAM).
+                break :blk pair.arena_a;
+            } else {
+                const vis_pages = try scratch_arena.allocPages(vis_scratch_bytes);
+                break :blk arena_mod.WiredArena.initFromAlignedSlice(vis_pages);
+            }
+        } else null;
 
         // --- Carve Region A: wide-prefill scratch (`wp_arena`) ---
         var wp_token_ids_host: []u32 = &.{};
@@ -9273,6 +10096,34 @@ pub const GraphModel = struct {
         errdefer if (cluster_accum_f32.len > 0) allocator.free(cluster_accum_f32);
         if (cluster_accum_f32.len > 0) @memset(cluster_accum_f32, 0.0);
 
+        const tr_scratch_aligned = try page.alignUp(tree_scratch_bytes);
+        var vision_state = try initGraphVisionState(
+            allocator,
+            device,
+            library,
+            &compute,
+            resolved_chip_profile,
+            wired_budget,
+            &total_wired_bytes,
+            resolved_vision_cfg,
+            if (vis_sub_arena_opt) |*va| va else null,
+            scratch_buf,
+            if (vis_sub_arena_opt) |*va| scratch_arena.offsetOf(va.bytes().ptr) else 0,
+            vis_aliased_saved_bytes,
+            vis_scratch_bytes,
+            tr_scratch_aligned,
+            source,
+            entries,
+            weight_shards,
+            entry_shard,
+            entry_offsets,
+            if (vis_sidecar_file) |*sf| sf else null,
+            vis_sidecar_bytes,
+            options.vision_coreml_path,
+            options.vision_placement,
+        );
+        errdefer vision_state.deinit(allocator, compute);
+
         const aux_ids = options.aux_layer_ids orelse qwen3.defaultEagle3AuxLayerIds(config.num_hidden_layers);
         const embed_row_alg_bytes = embed.alg_bytes / config.vocab_size;
         const global_head_bytes = embed_row_alg_bytes + lm_head.alg_bytes;
@@ -9456,6 +10307,10 @@ pub const GraphModel = struct {
             .cluster_assignments = cluster_assignments,
             .cluster_accum_f32 = cluster_accum_f32,
             .m7_stats = .{},
+            .enable_g18_fusion = options.enable_g18_fusion,
+            .g18_qkv_gemm_min_m = options.g18_qkv_gemm_min_m,
+            .g18_swiglu_gemm_min_m = options.g18_swiglu_gemm_min_m,
+            .vision_state = vision_state,
         };
     }
 };
@@ -11400,9 +12255,7 @@ pub const GraphBatchRuntime = struct {
                             .norm_dtype = gqa.qk_norm_dtype,
                         }, false);
                     } else {
-                        try model.encodeLinearGemmWithTile(&frame, gqa.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
-                        try model.encodeLinearGemmWithTile(&frame, gqa.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
-                        try model.encodeLinearGemmWithTile(&frame, gqa.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                        try model.encodeQkvProj(&frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, model.wp_x_norm_bind, model.wp_q_bind, model.wp_k_bind, model.wp_v_bind, m, .gemm_wide, true);
                         try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
                             .q = model.wp_q_bind,
                             .k = model.wp_k_bind,
@@ -11473,36 +12326,35 @@ pub const GraphBatchRuntime = struct {
                     .hidden_dim = h,
                     .branch_token_stride = w_stride,
                 }, true);
-            } else {
-                try model.moe_pipes.encodeResidualAdd(&frame, .{
+                try model.attn_pipes.encodeRmsNorm(&frame, .{
                     .x = eff_x_bind,
-                    .delta = model.wp_proj_out_bind,
-                    .count = eff_m * h,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = model.wp_x_norm_bind,
+                    .num_rows = eff_m,
+                    .hidden_dim = h,
+                    .eps = model.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
                 }, true);
+            } else {
+                try model.encodeResidualThenRmsNorm(&frame, eff_x_bind, model.wp_proj_out_bind, layer.post_attention_layernorm, model.wp_x_norm_bind, eff_m, true);
             }
-
-            try model.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = eff_x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = model.wp_x_norm_bind,
-                .num_rows = eff_m,
-                .hidden_dim = h,
-                .eps = model.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
 
             switch (model.config.axes.ffn_kind) {
                 .dense_swiglu => {
-                    try model.encodeLinearGemmWithTile(&frame, layer.dense_gate, model.wp_x_norm_bind, model.wp_dense_gate_bind, eff_m, true, true);
-                    try model.encodeLinearGemmWithTile(&frame, layer.dense_up, model.wp_x_norm_bind, model.wp_dense_up_bind, eff_m, true, false);
-                    try model.moe_pipes.encodeSiluMul(&frame, .{
-                        .gate = model.wp_dense_gate_bind,
-                        .up = model.wp_dense_up_bind,
-                        .out = model.wp_dense_act_bind,
-                        .count = eff_m * model.config.intermediate_size,
-                    }, true);
-                    try model.encodeLinearGemmWithTile(&frame, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, true, true);
+                    try model.encodeDenseGateUpAct(
+                        &frame,
+                        layer.dense_gate,
+                        layer.dense_up,
+                        model.wp_x_norm_bind,
+                        model.wp_dense_gate_bind,
+                        model.wp_dense_up_bind,
+                        model.wp_dense_act_bind,
+                        eff_m,
+                        .gemm_wide,
+                        true,
+                    );
                     if (model.wp_gr_arena) |*gr| {
+                        try model.encodeLinearGemmWithTile(&frame, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, true, true);
                         const stream_eff: metal.BufferBinding = if (tail_m1_last)
                             .{ .buffer = model.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
                         else
@@ -11524,7 +12376,10 @@ pub const GraphBatchRuntime = struct {
                             .hidden_dim = h,
                             .branch_token_stride = w_stride,
                         }, true);
+                    } else if (model.enable_g18_fusion and (eff_m == 1 or eff_m >= 64)) {
+                        try model.encodeLinearGemmWithTileResidual(&frame, layer.dense_down, model.wp_dense_act_bind, eff_x_bind, eff_x_bind, eff_m, true, true);
                     } else {
+                        try model.encodeLinearGemmWithTile(&frame, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, true, true);
                         try model.moe_pipes.encodeResidualAdd(&frame, .{
                             .x = eff_x_bind,
                             .delta = model.wp_proj_out_bind,
@@ -12675,9 +13530,7 @@ pub const GraphBatchRuntime = struct {
                 },
                 .gqa => |gqa| {
                     const kv_idx = self.layer_to_kv_idx[l];
-                    model.encodeLinearBatched(&frame, gqa.q_proj, model.x_norm_bind, model.q_bind, b_u32, true) catch return error.DecodeFailed;
-                    model.encodeLinearBatched(&frame, gqa.k_proj, model.x_norm_bind, model.k_bind, b_u32, false) catch return error.DecodeFailed;
-                    model.encodeLinearBatched(&frame, gqa.v_proj, model.x_norm_bind, model.v_bind, b_u32, false) catch return error.DecodeFailed;
+                    model.encodeQkvProj(&frame, gqa.q_proj, gqa.k_proj, gqa.v_proj, model.x_norm_bind, model.q_bind, model.k_bind, model.v_bind, b_u32, .batched_gemv, true) catch return error.DecodeFailed;
 
                     model.attn_pipes.encodeBatchQkNormRopeKvWrite(&frame, .{
                         .q = model.q_bind,
@@ -12748,23 +13601,18 @@ pub const GraphBatchRuntime = struct {
                     .hidden_dim = h,
                     .branch_token_stride = model.max_tree_nodes,
                 }, true) catch return error.DecodeFailed;
-            } else {
-                model.moe_pipes.encodeResidualAdd(&frame, .{
+                model.attn_pipes.encodeRmsNorm(&frame, .{
                     .x = model.x_bind,
-                    .delta = model.proj_out_bind,
-                    .count = b_u32 * h,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = model.x_norm_bind,
+                    .num_rows = b_u32,
+                    .hidden_dim = h,
+                    .eps = model.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
                 }, true) catch return error.DecodeFailed;
+            } else {
+                model.encodeResidualThenRmsNorm(&frame, model.x_bind, model.proj_out_bind, layer.post_attention_layernorm, model.x_norm_bind, b_u32, true) catch return error.DecodeFailed;
             }
-
-            model.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = model.x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = model.x_norm_bind,
-                .num_rows = b_u32,
-                .hidden_dim = h,
-                .eps = model.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true) catch return error.DecodeFailed;
 
             self.encodeLayerFfnBatched(&frame, l, layer, b_u32) catch return error.DecodeFailed;
         }
@@ -13035,6 +13883,650 @@ fn loadStepLoraAdapters(
     };
     ext_arena = null; // ownership transferred
     return art;
+}
+
+const VisionAmfSource = union(enum) {
+    main: GraphModel.AmfSource,
+    sidecar: *const amf.Parsed,
+
+    fn find(self: VisionAmfSource, name: []const u8) ?*const amf.TensorEntry {
+        return switch (self) {
+            .main => |m| m.find(name),
+            .sidecar => |p| p.find(name),
+        };
+    }
+
+    fn entries(self: VisionAmfSource) []const amf.TensorEntry {
+        return switch (self) {
+            .main => |m| m.entries(),
+            .sidecar => |p| p.entries,
+        };
+    }
+};
+
+fn isVisionAmfName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "visual.") or
+        std.mem.startsWith(u8, name, "vision.") or
+        std.mem.startsWith(u8, name, "aligner.") or
+        std.mem.startsWith(u8, name, "multi_modal_projector.") or
+        std.mem.eql(u8, name, "image_start") or
+        std.mem.eql(u8, name, "image_end") or
+        std.mem.eql(u8, name, "image_newline");
+}
+
+fn amfToFloatDType(dt: amf.DType) ?quant.FloatDType {
+    return switch (dt) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        else => null,
+    };
+}
+
+fn integerExactSqrt(val: u64) ?u32 {
+    if (val == 0) return 0;
+    const root: u64 = std.math.sqrt(val);
+    if (root * root != val or root > std.math.maxInt(u32)) return null;
+    return @intCast(root);
+}
+
+fn findVisionStemEntry(vsrc: VisionAmfSource, stem: []const u8) ?*const amf.TensorEntry {
+    var alt_buf: [128]u8 = undefined;
+    const w_name = std.fmt.bufPrint(&alt_buf, "{s}.weight", .{stem}) catch return null;
+    return vsrc.find(w_name) orelse vsrc.find(stem);
+}
+
+fn findVisionStemFirst(vsrc: VisionAmfSource, stems: []const []const u8) ?struct { entry: *const amf.TensorEntry, stem: []const u8 } {
+    for (stems) |s| {
+        if (findVisionStemEntry(vsrc, s)) |e| return .{ .entry = e, .stem = s };
+    }
+    return null;
+}
+
+fn findVisionPrefix(vsrc: VisionAmfSource) ?[]const u8 {
+    const prefixes = [_][]const u8{ "visual.", "vision." };
+    var buf: [64]u8 = undefined;
+    for (prefixes) |pfx| {
+        const stem = std.fmt.bufPrint(&buf, "{s}blocks.0.norm1", .{pfx}) catch continue;
+        if (findVisionStemEntry(vsrc, stem) != null) return pfx;
+    }
+    return null;
+}
+
+fn entryFlattenedCols(e: *const amf.TensorEntry) ?u32 {
+    if (e.rank < 2 or e.rank > 5) return null;
+    var cols: u64 = 1;
+    for (1..e.rank) |i| {
+        cols = std.math.mul(u64, cols, e.shape[i]) catch return null;
+    }
+    if (cols > std.math.maxInt(u32)) return null;
+    return @intCast(cols);
+}
+
+fn inferVisionConfigFromEntries(
+    vsrc: VisionAmfSource,
+    lm_hidden: u32,
+    max_patches: u32,
+) GraphLoadError!vision_mod.VisionTowerConfig {
+    const pfx = findVisionPrefix(vsrc) orelse return .{ .has_vision = false };
+    var buf: [128]u8 = undefined;
+
+    const norm0 = findVisionStemEntry(vsrc, std.fmt.bufPrint(&buf, "{s}blocks.0.norm1", .{pfx}) catch unreachable) orelse
+        return .{ .has_vision = false };
+    const vis_hidden = norm0.shape[0];
+    if (vis_hidden == 0) return error.InvalidConfig;
+
+    var num_layers: u32 = 0;
+    while (num_layers < 256) : (num_layers += 1) {
+        const stem = std.fmt.bufPrint(&buf, "{s}blocks.{d}.norm1", .{ pfx, num_layers }) catch return error.InvalidConfig;
+        if (findVisionStemEntry(vsrc, stem) == null) break;
+    }
+    if (num_layers == 0) return .{ .has_vision = false };
+
+    const head_candidates = [_]u32{ 72, 64, 48, 32, 16, 12, 8, 4 };
+    var head_dim: u32 = 0;
+    for (head_candidates) |cand| {
+        if (cand <= vision_mod.MAX_VIT_HEAD_DIM and (vis_hidden % cand) == 0) {
+            head_dim = cand;
+            break;
+        }
+    }
+    if (head_dim == 0) return error.InvalidConfig;
+    const num_heads = vis_hidden / head_dim;
+
+    var mlp_kind: vision_mod.VisionMlpKind = .gelu_tanh;
+    var vis_inter: u32 = 0;
+    const gate_s = std.fmt.bufPrint(&buf, "{s}blocks.0.mlp.gate_proj", .{pfx}) catch return error.InvalidConfig;
+    if (findVisionStemEntry(vsrc, gate_s)) |ge| {
+        mlp_kind = .swiglu;
+        vis_inter = ge.shape[0];
+    } else {
+        var up_buf: [128]u8 = undefined;
+        const w1_s = std.fmt.bufPrint(&buf, "{s}blocks.0.mlp.w1", .{pfx}) catch return error.InvalidConfig;
+        const w3_s = std.fmt.bufPrint(&up_buf, "{s}blocks.0.mlp.w3", .{pfx}) catch return error.InvalidConfig;
+        if (findVisionStemEntry(vsrc, w3_s) != null) {
+            if (findVisionStemEntry(vsrc, w1_s)) |w1e| {
+                mlp_kind = .swiglu;
+                vis_inter = w1e.shape[0];
+            }
+        }
+        if (vis_inter == 0) {
+            var s0_buf: [128]u8 = undefined;
+            var s1_buf: [128]u8 = undefined;
+            var s2_buf: [128]u8 = undefined;
+            const fc1_stems = [_][]const u8{
+                std.fmt.bufPrint(&s0_buf, "{s}blocks.0.mlp.linear_fc1", .{pfx}) catch unreachable,
+                std.fmt.bufPrint(&s1_buf, "{s}blocks.0.mlp.fc1", .{pfx}) catch unreachable,
+                std.fmt.bufPrint(&s2_buf, "{s}blocks.0.mlp.w1", .{pfx}) catch unreachable,
+            };
+            const fc1 = findVisionStemFirst(vsrc, &fc1_stems) orelse return error.MissingTensor;
+            vis_inter = fc1.entry.shape[0];
+        }
+    }
+
+    var pe0_buf: [128]u8 = undefined;
+    var pe1_buf: [128]u8 = undefined;
+    const pe_stems = [_][]const u8{
+        std.fmt.bufPrint(&pe0_buf, "{s}patch_embed.proj", .{pfx}) catch unreachable,
+        std.fmt.bufPrint(&pe1_buf, "{s}patch_embed", .{pfx}) catch unreachable,
+    };
+    const pe = (findVisionStemFirst(vsrc, &pe_stems) orelse return error.MissingTensor).entry;
+    var t_patch: u32 = 1;
+    var patch_size: u32 = 16;
+    if (pe.rank == 5) {
+        t_patch = pe.shape[2];
+        patch_size = pe.shape[3];
+    } else if (pe.rank == 4) {
+        t_patch = 1;
+        patch_size = pe.shape[2];
+    } else {
+        const cols = entryFlattenedCols(pe) orelse return error.TensorShapeMismatch;
+        if ((cols % 6) == 0) {
+            if (integerExactSqrt(cols / 6)) |p| {
+                t_patch = 2;
+                patch_size = p;
+            } else if ((cols % 3) == 0) {
+                t_patch = 1;
+                patch_size = integerExactSqrt(cols / 3) orelse return error.TensorShapeMismatch;
+            } else return error.TensorShapeMismatch;
+        } else if ((cols % 3) == 0) {
+            t_patch = 1;
+            patch_size = integerExactSqrt(cols / 3) orelse return error.TensorShapeMismatch;
+        } else return error.TensorShapeMismatch;
+    }
+
+    const merger_stems = [_][]const u8{
+        "visual.merger.linear_fc1",
+        "visual.merger.fc1",
+        "visual.merger.w1",
+        "vision.merger.linear_fc1",
+        "vision.merger.fc1",
+        "vision.merger.w1",
+        "aligner.linear_fc1",
+        "aligner.fc1",
+        "aligner.w1",
+        "multi_modal_projector.linear_1",
+    };
+    const m1 = (findVisionStemFirst(vsrc, &merger_stems) orelse return error.MissingTensor).entry;
+    const merger_hidden = m1.shape[0];
+    const merged_in_dim = m1.shape[1];
+    var spatial_merge: u32 = 0;
+    for ([_]u32{ 1, 2, 3, 4 }) |sm| {
+        if (sm * sm * vis_hidden == merged_in_dim) {
+            spatial_merge = sm;
+            break;
+        }
+    }
+    if (spatial_merge == 0) return error.TensorShapeMismatch;
+
+    const cfg: vision_mod.VisionTowerConfig = .{
+        .has_vision = true,
+        .num_layers = num_layers,
+        .vis_hidden = vis_hidden,
+        .vis_intermediate = vis_inter,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .lm_hidden = lm_hidden,
+        .merger_hidden = merger_hidden,
+        .patch_size = patch_size,
+        .t_patch = t_patch,
+        .spatial_merge = spatial_merge,
+        .max_patches = max_patches,
+        .mlp_kind = mlp_kind,
+        .qkv_layout = .split_3hd,
+        .rope_interleaved = false,
+        .rope_theta = 10000.0,
+    };
+    try cfg.validate();
+    return cfg;
+}
+
+const VisionTensorResolver = struct {
+    vsrc: VisionAmfSource,
+    entries: []const amf.TensorEntry,
+    base_ptr: usize,
+    shards: []const WeightShard,
+    entry_shard: []const u16,
+    entry_offsets: []const u64,
+    single_buf: ?metal.Buffer = null,
+
+    fn bindingForEntry(self: *const VisionTensorResolver, e: *const amf.TensorEntry) GraphLoadError!metal.BufferBinding {
+        const idx = (@intFromPtr(e) - self.base_ptr) / @sizeOf(amf.TensorEntry);
+        const off = self.entry_offsets[idx];
+        if (self.single_buf) |sb| {
+            return .{ .buffer = sb, .offset = off };
+        }
+        const si = self.entry_shard[idx];
+        if (si == std.math.maxInt(u16)) return error.MissingTensor;
+        return .{ .buffer = self.shards[si].buffer, .offset = off };
+    }
+
+    fn bindOptionalBias(self: *const VisionTensorResolver, stem: []const u8, expected_len: u32) GraphLoadError!?struct {
+        bind: metal.BufferBinding,
+        dtype: quant.FloatDType,
+    } {
+        var b_buf: [144]u8 = undefined;
+        const b_name = std.fmt.bufPrint(&b_buf, "{s}.bias", .{stem}) catch return error.MissingTensor;
+        const be = self.vsrc.find(b_name) orelse return null;
+        if (be.shape[0] != expected_len) return error.TensorShapeMismatch;
+        const fdt = amfToFloatDType(try be.dataType()) orelse return error.UnsupportedDType;
+        return .{ .bind = try self.bindingForEntry(be), .dtype = fdt };
+    }
+
+    fn bindNorm(self: *const VisionTensorResolver, stem: []const u8, expected_len: u32) GraphLoadError!vision_mod.VisionNormWeight {
+        const we = findVisionStemEntry(self.vsrc, stem) orelse return error.MissingTensor;
+        if (we.shape[0] != expected_len) return error.TensorShapeMismatch;
+        const fdt = amfToFloatDType(try we.dataType()) orelse return error.UnsupportedDType;
+        const gamma = try self.bindingForEntry(we);
+        const bias = try self.bindOptionalBias(stem, expected_len);
+        return .{
+            .gamma = gamma,
+            .beta = if (bias) |b| b.bind else null,
+            .dtype = fdt,
+            .kind = if (bias != null) .layer_norm else .rms_norm,
+            .eps = 1e-6,
+        };
+    }
+
+    fn bindLinear(
+        self: *const VisionTensorResolver,
+        stems: []const []const u8,
+        expected_n: u32,
+        expected_k: u32,
+    ) GraphLoadError!vision_mod.VisionLinearWeight {
+        const found = findVisionStemFirst(self.vsrc, stems) orelse return error.MissingTensor;
+        const e = found.entry;
+        if (e.shape[0] != expected_n or e.shape[1] != expected_k) return error.TensorShapeMismatch;
+        const base_bind = try self.bindingForEntry(e);
+        const bias = try self.bindOptionalBias(found.stem, expected_n);
+        const dt = try e.dataType();
+        if (dt == .q4_affine) {
+            return .{ .q4_affine = .{
+                .qweight = base_bind,
+                .scale_bias = .{ .buffer = base_bind.buffer, .offset = base_bind.offset + e.params_offset },
+                .group_size = if (e.group_size > 0) e.group_size else 64,
+                .bias = if (bias) |b| b.bind else null,
+                .bias_dtype = if (bias) |b| b.dtype else .f16,
+            } };
+        }
+        const fdt = amfToFloatDType(dt) orelse return error.UnsupportedDType;
+        return .{ .dense = .{
+            .weight = base_bind,
+            .dtype = fdt,
+            .bias = if (bias) |b| b.bind else null,
+        } };
+    }
+};
+
+fn bindVisionWeights(
+    allocator: std.mem.Allocator,
+    res: *const VisionTensorResolver,
+    cfg: vision_mod.VisionTowerConfig,
+) GraphLoadError!struct {
+    blocks: []vision_mod.VisionBlockWeights,
+    merger: vision_mod.VisionMergerWeights,
+    patch_embed: VisionPatchEmbedWeights,
+} {
+    const pfx = findVisionPrefix(res.vsrc) orelse return error.MissingTensor;
+    const vis_h = cfg.vis_hidden;
+    const vis_inter = cfg.vis_intermediate;
+    const merged_in_dim = try cfg.mergedInDim();
+
+    var pe0_b: [128]u8 = undefined;
+    var pe1_b: [128]u8 = undefined;
+    const pe_stems = [_][]const u8{
+        std.fmt.bufPrint(&pe0_b, "{s}patch_embed.proj", .{pfx}) catch unreachable,
+        std.fmt.bufPrint(&pe1_b, "{s}patch_embed", .{pfx}) catch unreachable,
+    };
+    const pe_found = findVisionStemFirst(res.vsrc, &pe_stems) orelse return error.MissingTensor;
+    const expected_in_dim = 3 * cfg.t_patch * cfg.patch_size * cfg.patch_size;
+    const actual_cols = entryFlattenedCols(pe_found.entry) orelse return error.TensorShapeMismatch;
+    if (pe_found.entry.shape[0] != vis_h or actual_cols != expected_in_dim) {
+        return error.TensorShapeMismatch;
+    }
+    const pe_dtype = amfToFloatDType(try pe_found.entry.dataType()) orelse return error.UnsupportedDType;
+    const pe_bias = try res.bindOptionalBias(pe_found.stem, vis_h);
+
+    var pos_b: [128]u8 = undefined;
+    const pos_stem = std.fmt.bufPrint(&pos_b, "{s}pos_embed", .{pfx}) catch unreachable;
+    const pos_bind: ?metal.BufferBinding = if (findVisionStemEntry(res.vsrc, pos_stem)) |pose|
+        try res.bindingForEntry(pose)
+    else
+        null;
+
+    const patch_embed: VisionPatchEmbedWeights = .{
+        .weight = try res.bindingForEntry(pe_found.entry),
+        .dtype = pe_dtype,
+        .bias = if (pe_bias) |b| b.bind else null,
+        .pos_embed = pos_bind,
+        .in_dim = expected_in_dim,
+    };
+
+    const blocks = try allocator.alloc(vision_mod.VisionBlockWeights, cfg.num_layers);
+    errdefer allocator.free(blocks);
+
+    var b0: [128]u8 = undefined;
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    var b3: [128]u8 = undefined;
+    for (0..cfg.num_layers) |l| {
+        const n1_stem = std.fmt.bufPrint(&b0, "{s}blocks.{d}.norm1", .{ pfx, l }) catch unreachable;
+        const norm1 = try res.bindNorm(n1_stem, vis_h);
+        const n2_stem = std.fmt.bufPrint(&b1, "{s}blocks.{d}.norm2", .{ pfx, l }) catch unreachable;
+        const norm2 = try res.bindNorm(n2_stem, vis_h);
+
+        const qkv_stems = [_][]const u8{
+            std.fmt.bufPrint(&b0, "{s}blocks.{d}.attn.qkv", .{ pfx, l }) catch unreachable,
+            std.fmt.bufPrint(&b1, "{s}blocks.{d}.attn.wqkv", .{ pfx, l }) catch unreachable,
+        };
+        const qkv = try res.bindLinear(&qkv_stems, 3 * vis_h, vis_h);
+
+        const proj_stems = [_][]const u8{
+            std.fmt.bufPrint(&b0, "{s}blocks.{d}.attn.proj", .{ pfx, l }) catch unreachable,
+            std.fmt.bufPrint(&b1, "{s}blocks.{d}.attn.wo", .{ pfx, l }) catch unreachable,
+        };
+        const proj = try res.bindLinear(&proj_stems, vis_h, vis_h);
+
+        var mlp_fc1: vision_mod.VisionLinearWeight = undefined;
+        var mlp_up: ?vision_mod.VisionLinearWeight = null;
+        var mlp_fc2: vision_mod.VisionLinearWeight = undefined;
+        if (cfg.mlp_kind == .swiglu) {
+            const g_stems = [_][]const u8{
+                std.fmt.bufPrint(&b0, "{s}blocks.{d}.mlp.gate_proj", .{ pfx, l }) catch unreachable,
+                std.fmt.bufPrint(&b1, "{s}blocks.{d}.mlp.w1", .{ pfx, l }) catch unreachable,
+            };
+            mlp_fc1 = try res.bindLinear(&g_stems, vis_inter, vis_h);
+            const u_stems = [_][]const u8{
+                std.fmt.bufPrint(&b0, "{s}blocks.{d}.mlp.up_proj", .{ pfx, l }) catch unreachable,
+                std.fmt.bufPrint(&b1, "{s}blocks.{d}.mlp.w3", .{ pfx, l }) catch unreachable,
+            };
+            mlp_up = try res.bindLinear(&u_stems, vis_inter, vis_h);
+            const d_stems = [_][]const u8{
+                std.fmt.bufPrint(&b0, "{s}blocks.{d}.mlp.down_proj", .{ pfx, l }) catch unreachable,
+                std.fmt.bufPrint(&b1, "{s}blocks.{d}.mlp.w2", .{ pfx, l }) catch unreachable,
+            };
+            mlp_fc2 = try res.bindLinear(&d_stems, vis_h, vis_inter);
+        } else {
+            const c1_stems = [_][]const u8{
+                std.fmt.bufPrint(&b0, "{s}blocks.{d}.mlp.linear_fc1", .{ pfx, l }) catch unreachable,
+                std.fmt.bufPrint(&b1, "{s}blocks.{d}.mlp.fc1", .{ pfx, l }) catch unreachable,
+                std.fmt.bufPrint(&b2, "{s}blocks.{d}.mlp.w1", .{ pfx, l }) catch unreachable,
+            };
+            mlp_fc1 = try res.bindLinear(&c1_stems, vis_inter, vis_h);
+            const c2_stems = [_][]const u8{
+                std.fmt.bufPrint(&b0, "{s}blocks.{d}.mlp.linear_fc2", .{ pfx, l }) catch unreachable,
+                std.fmt.bufPrint(&b1, "{s}blocks.{d}.mlp.fc2", .{ pfx, l }) catch unreachable,
+                std.fmt.bufPrint(&b2, "{s}blocks.{d}.mlp.w2", .{ pfx, l }) catch unreachable,
+            };
+            mlp_fc2 = try res.bindLinear(&c2_stems, vis_h, vis_inter);
+        }
+
+        blocks[l] = .{
+            .norm1 = norm1,
+            .qkv = qkv,
+            .proj = proj,
+            .norm2 = norm2,
+            .mlp_fc1 = mlp_fc1,
+            .mlp_up = mlp_up,
+            .mlp_fc2 = mlp_fc2,
+            .use_window_attn = false,
+        };
+    }
+    _ = &b3;
+
+    const m1_stems = [_][]const u8{
+        "visual.merger.linear_fc1",
+        "visual.merger.fc1",
+        "visual.merger.w1",
+        "vision.merger.linear_fc1",
+        "vision.merger.fc1",
+        "vision.merger.w1",
+        "aligner.linear_fc1",
+        "aligner.fc1",
+        "aligner.w1",
+        "multi_modal_projector.linear_1",
+    };
+    const m_fc1 = try res.bindLinear(&m1_stems, cfg.merger_hidden, merged_in_dim);
+
+    const m2_stems = [_][]const u8{
+        "visual.merger.linear_fc2",
+        "visual.merger.fc2",
+        "visual.merger.w2",
+        "vision.merger.linear_fc2",
+        "vision.merger.fc2",
+        "vision.merger.w2",
+        "aligner.linear_fc2",
+        "aligner.fc2",
+        "aligner.w2",
+        "multi_modal_projector.linear_2",
+    };
+    const m_fc2 = try res.bindLinear(&m2_stems, cfg.lm_hidden, cfg.merger_hidden);
+
+    const mnorm_stems = [_][]const u8{
+        "visual.merger.norm",
+        "vision.merger.norm",
+        "aligner.norm",
+        "vision.norm",
+        "visual.norm",
+    };
+    var m_norm: ?vision_mod.VisionNormWeight = null;
+    var norm_placement: vision_mod.MergerNormPlacement = .none;
+    if (findVisionStemFirst(res.vsrc, &mnorm_stems)) |mn| {
+        const nlen = mn.entry.shape[0];
+        if (nlen == vis_h) {
+            norm_placement = .pre_merge;
+            m_norm = try res.bindNorm(mn.stem, vis_h);
+        } else if (nlen == merged_in_dim) {
+            norm_placement = .post_merge;
+            m_norm = try res.bindNorm(mn.stem, merged_in_dim);
+        } else {
+            return error.TensorShapeMismatch;
+        }
+    }
+
+    return .{
+        .blocks = blocks,
+        .merger = .{
+            .norm = m_norm,
+            .norm_placement = norm_placement,
+            .fc1 = m_fc1,
+            .fc2 = m_fc2,
+            .merger_hidden_size = cfg.merger_hidden,
+            .act_kind = .gelu_tanh,
+        },
+        .patch_embed = patch_embed,
+    };
+}
+
+fn initGraphVisionState(
+    allocator: std.mem.Allocator,
+    device: metal.Device,
+    library: metal.Library,
+    compute: *metal.Compute,
+    chip: chip_profile_mod.ChipProfile,
+    wired_budget: budget_mod.Budget,
+    total_wired_bytes: *u64,
+    vcfg: vision_mod.VisionTowerConfig,
+    vis_sub_arena: ?*arena_mod.WiredArena,
+    scratch_buf: metal.Buffer,
+    vis_base_off: usize,
+    vis_aliased_saved_bytes: usize,
+    vis_scratch_bytes: usize,
+    tr_scratch_bytes: usize,
+    main_source: GraphModel.AmfSource,
+    main_entries: []const amf.TensorEntry,
+    weight_shards: []const WeightShard,
+    entry_shard: []const u16,
+    entry_offsets: []const u64,
+    sidecar_file_opt: ?*amf.AmfFile,
+    sidecar_bytes: usize,
+    coreml_path_opt: ?[:0]const u8,
+    placement_policy: vision_mod.VisionPlacement,
+) GraphLoadError!GraphVisionState {
+    if (!vcfg.has_vision) {
+        return .{ .runtime = vision_mod.VisionTowerRuntime.initTextOnly() };
+    }
+
+    var rt = try vision_mod.VisionTowerRuntime.initAliased(
+        device,
+        library,
+        vis_sub_arena.?,
+        scratch_buf,
+        vis_base_off,
+        vcfg,
+    );
+    errdefer rt.deinit();
+
+    var sidecar_arena_opt: ?arena_mod.WiredArena = null;
+    var sidecar_buf_opt: ?metal.Buffer = null;
+    errdefer {
+        if (sidecar_buf_opt) |sb| {
+            compute.removeResident(&.{sb}) catch |err| {
+                std.debug.panic("removeResident(vision_sidecar) failed in errdefer: {}", .{err});
+            };
+            sb.close();
+        }
+        if (sidecar_arena_opt) |*sa| sa.deinit();
+    }
+
+    var blocks: []vision_mod.VisionBlockWeights = &.{};
+    errdefer if (blocks.len > 0) allocator.free(blocks);
+    var merger: ?vision_mod.VisionMergerWeights = null;
+    var patch_embed: ?VisionPatchEmbedWeights = null;
+    var is_sidecar = false;
+
+    if (sidecar_file_opt) |sf| {
+        is_sidecar = true;
+        const sc_entries = sf.parsed.entries;
+        const alloc_bytes = try page.alignUp(@max(sidecar_bytes, page.APPLE_PAGE_SIZE));
+        try wired_budget.checkPlan(total_wired_bytes.* + alloc_bytes);
+        var sa = try arena_mod.WiredArena.init(alloc_bytes, wired_budget);
+        errdefer sa.deinit();
+        const sb = try metal.Buffer.wrap(device, sa.bytes());
+        errdefer sb.close();
+        try compute.makeResident(&.{sb});
+        sidecar_arena_opt = sa;
+        sidecar_buf_opt = sb;
+        total_wired_bytes.* += alloc_bytes;
+
+        const sc_offs = try allocator.alloc(u64, sc_entries.len);
+        defer allocator.free(sc_offs);
+        @memset(sc_offs, 0);
+        for (sc_entries, 0..) |*se, i| {
+            const sk = try se.tensorKind();
+            if (sk == .metadata or sk == .sparse_table or sk == .cold_expert) continue;
+            const raw = try sf.loadBlob(se, &(sidecar_arena_opt.?));
+            sc_offs[i] = sidecar_arena_opt.?.offsetOf(raw.ptr);
+        }
+
+        const resolver: VisionTensorResolver = .{
+            .vsrc = .{ .sidecar = &sf.parsed },
+            .entries = sc_entries,
+            .base_ptr = @intFromPtr(sc_entries.ptr),
+            .shards = &.{},
+            .entry_shard = &.{},
+            .entry_offsets = sc_offs,
+            .single_buf = sb,
+        };
+        const bound = try bindVisionWeights(allocator, &resolver, vcfg);
+        blocks = bound.blocks;
+        merger = bound.merger;
+        patch_embed = bound.patch_embed;
+    } else {
+        const resolver: VisionTensorResolver = .{
+            .vsrc = .{ .main = main_source },
+            .entries = main_entries,
+            .base_ptr = @intFromPtr(main_entries.ptr),
+            .shards = weight_shards,
+            .entry_shard = entry_shard,
+            .entry_offsets = entry_offsets,
+            .single_buf = null,
+        };
+        if (findVisionPrefix(resolver.vsrc) != null) {
+            const bound = try bindVisionWeights(allocator, &resolver, vcfg);
+            blocks = bound.blocks;
+            merger = bound.merger;
+            patch_embed = bound.patch_embed;
+        }
+    }
+
+    var ane_offload_opt: ?vision_mod.VisionAneOffload = null;
+    errdefer if (ane_offload_opt) |*o| o.deinit();
+    var ane_cal_opt: ?vision_mod.VisionAneCalibration = null;
+    if (coreml_path_opt) |coreml_path| {
+        var offload = try vision_mod.VisionAneOffload.initFromPath(
+            device,
+            coreml_path,
+            vcfg.max_patches,
+            vcfg.vis_hidden,
+            vcfg.lm_hidden,
+            false,
+        );
+        errdefer offload.deinit();
+        var est_gpu_us: f64 = 250.0;
+        if (blocks.len == vcfg.num_layers and merger != null and vcfg.spatial_merge * vcfg.spatial_merge <= vcfg.max_patches) {
+            if (rt.scratch) |sc| {
+                const sm = vcfg.spatial_merge;
+                const np = sm * sm;
+                const coords_sl = sc.coordsSlice();
+                const bounds_sl = sc.windowBoundsSlice();
+                for (0..sm) |gh| {
+                    for (0..sm) |gw| {
+                        const p_i = gh * sm + gw;
+                        coords_sl[p_i] = .{ .h = @intCast(gh), .w = @intCast(gw) };
+                        bounds_sl[p_i] = .{ .kv_start = 0, .kv_end = np };
+                    }
+                }
+                const t0 = try vmstat.nowNs();
+                var f = try compute.beginFrame(5000);
+                errdefer f.abort();
+                _ = rt.encodeTowerForward(&f, blocks, merger.?, sm, sm, 1, false) catch return error.InvalidConfig;
+                const sig = try f.commit();
+                try compute.wait(sig, 5000);
+                const t1 = try vmstat.nowNs();
+                est_gpu_us = @max(1.0, @as(f64, @floatFromInt(t1 - t0)) / 1000.0);
+            }
+        }
+        const cal = try offload.calibrateAgainstGpuUs(chip, est_gpu_us, 1, 3, placement_policy);
+        rt.placement = cal.selected;
+        rt.ane_calibration = cal;
+        ane_offload_opt = offload;
+        ane_cal_opt = cal;
+    }
+
+    return .{
+        .runtime = rt,
+        .blocks = blocks,
+        .merger = merger,
+        .patch_embed = patch_embed,
+        .sidecar_arena = sidecar_arena_opt,
+        .sidecar_buf = sidecar_buf_opt,
+        .ane_offload = ane_offload_opt,
+        .ane_calibration = ane_cal_opt,
+        .aliased_saved_bytes = vis_aliased_saved_bytes,
+        .scratch_bytes = vis_scratch_bytes,
+        .tr_scratch_bytes = tr_scratch_bytes,
+        .is_sidecar = is_sidecar,
+    };
 }
 
 // ===========================================================================
@@ -15686,4 +17178,294 @@ test "M7 X2/X3 2-rank live loopback TCP ExpertParallelCoordinator matches 1-rank
     try std.testing.expectEqual(@as(u64, 0), vmstat.Snapshot.swapoutDelta(snap_before, snap_after));
     _ = hdelta;
     try coord.shutdownPeers();
+}
+
+pub const SynthVisionTowerSpec = struct {
+    num_layers: u32 = 3,
+    vis_hidden: u32 = 64,
+    vis_intermediate: u32 = 128,
+    lm_hidden: u32 = 64,
+    merger_hidden: u32 = 128,
+    patch_size: u32 = 16,
+    t_patch: u32 = 2,
+    spatial_merge: u32 = 2,
+    q4_qkv: bool = true,
+    swiglu: bool = false,
+};
+
+pub fn buildSynthVisionTowerAmfBytes(allocator: std.mem.Allocator, spec: SynthVisionTowerSpec) ![]u8 {
+    var blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| allocator.free(b.bytes);
+        blobs.deinit(allocator);
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+
+    const addVis = struct {
+        fn dense(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            nms: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            layer: u16,
+            dt: amf.DType,
+            shape: [4]u32,
+            ndim: u8,
+            data: []u8,
+        ) !void {
+            const dup = try alloc.dupe(u8, nm);
+            try nms.append(alloc, dup);
+            try list.append(alloc, .{
+                .name = dup,
+                .kind = if (ndim == 1) .norm else .dense,
+                .dtype = dt,
+                .layer = layer,
+                .shape = shape,
+                .ndim = ndim,
+                .bytes = data,
+            });
+        }
+    };
+
+    const vh = spec.vis_hidden;
+    const vi = spec.vis_intermediate;
+    const mh = spec.merger_hidden;
+    const sm_in = vh * spec.spatial_merge * spec.spatial_merge;
+    const pe_in = 3 * spec.t_patch * spec.patch_size * spec.patch_size;
+    const pfx = if (spec.swiglu) "vision." else "visual.";
+    var nb: [96]u8 = undefined;
+
+    try addVis.dense(
+        allocator,
+        &blobs,
+        &names,
+        std.fmt.bufPrint(&nb, "{s}patch_embed.proj.weight", .{pfx}) catch unreachable,
+        amf.NO_LAYER,
+        .f16,
+        .{ vh, pe_in, 0, 0 },
+        2,
+        try fillDeterministicF16(allocator, 7101, vh * pe_in, 0.02),
+    );
+    try addVis.dense(
+        allocator,
+        &blobs,
+        &names,
+        std.fmt.bufPrint(&nb, "{s}patch_embed.proj.bias", .{pfx}) catch unreachable,
+        amf.NO_LAYER,
+        .f16,
+        .{ vh, 0, 0, 0 },
+        1,
+        try fillDeterministicF16(allocator, 7102, vh, 0.005),
+    );
+
+    for (0..spec.num_layers) |l| {
+        const s0: u64 = 8000 + l * 100;
+        const l16: u16 = @intCast(l);
+        try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.norm1.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, s0 + 1, vh, 1.0));
+        try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.norm2.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, s0 + 2, vh, 1.0));
+        if (!spec.swiglu) {
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.norm1.bias", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, s0 + 3, vh, 0.01));
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.norm2.bias", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, s0 + 4, vh, 0.01));
+        }
+
+        if (spec.q4_qkv and (vh % 64) == 0) {
+            const q4 = try fillDeterministicQ4(allocator, s0 + 5, 3 * vh, vh, 0.03);
+            const dup = try allocator.dupe(u8, std.fmt.bufPrint(&nb, "{s}blocks.{d}.attn.qkv.weight", .{ pfx, l }) catch unreachable);
+            try names.append(allocator, dup);
+            try blobs.append(allocator, .{
+                .name = dup,
+                .kind = .dense,
+                .dtype = .q4_affine,
+                .layer = l16,
+                .shape = .{ 3 * vh, vh, 0, 0 },
+                .ndim = 2,
+                .bytes = q4.bytes,
+                .data_bytes_override = q4.data_bytes,
+                .params_offset = q4.params_offset,
+                .params_bytes = q4.params_bytes,
+            });
+        } else {
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.attn.qkv.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ 3 * vh, vh, 0, 0 }, 2, try fillDeterministicF16(allocator, s0 + 5, 3 * vh * vh, 0.03));
+        }
+        try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.attn.qkv.bias", .{ pfx, l }) catch unreachable, l16, .f16, .{ 3 * vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, s0 + 6, 3 * vh, 0.005));
+        try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.attn.proj.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, vh, 0, 0 }, 2, try fillDeterministicF16(allocator, s0 + 7, vh * vh, 0.03));
+        try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.attn.proj.bias", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, s0 + 8, vh, 0.005));
+
+        if (spec.swiglu) {
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.mlp.gate_proj.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ vi, vh, 0, 0 }, 2, try fillDeterministicF16(allocator, s0 + 9, vi * vh, 0.02));
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.mlp.up_proj.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ vi, vh, 0, 0 }, 2, try fillDeterministicF16(allocator, s0 + 10, vi * vh, 0.02));
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.mlp.down_proj.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, vi, 0, 0 }, 2, try fillDeterministicF16(allocator, s0 + 11, vh * vi, 0.02));
+        } else {
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.mlp.linear_fc1.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ vi, vh, 0, 0 }, 2, try fillDeterministicF16(allocator, s0 + 9, vi * vh, 0.02));
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.mlp.linear_fc1.bias", .{ pfx, l }) catch unreachable, l16, .f16, .{ vi, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, s0 + 10, vi, 0.005));
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.mlp.linear_fc2.weight", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, vi, 0, 0 }, 2, try fillDeterministicF16(allocator, s0 + 11, vh * vi, 0.02));
+            try addVis.dense(allocator, &blobs, &names, std.fmt.bufPrint(&nb, "{s}blocks.{d}.mlp.linear_fc2.bias", .{ pfx, l }) catch unreachable, l16, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, s0 + 12, vh, 0.005));
+        }
+    }
+
+    if (spec.swiglu) {
+        try addVis.dense(allocator, &blobs, &names, "vision.norm.weight", amf.NO_LAYER, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, 9101, vh, 1.0));
+        try addVis.dense(allocator, &blobs, &names, "aligner.w1.weight", amf.NO_LAYER, .f16, .{ mh, sm_in, 0, 0 }, 2, try fillDeterministicF16(allocator, 9102, mh * sm_in, 0.02));
+        try addVis.dense(allocator, &blobs, &names, "aligner.w2.weight", amf.NO_LAYER, .f16, .{ spec.lm_hidden, mh, 0, 0 }, 2, try fillDeterministicF16(allocator, 9103, spec.lm_hidden * mh, 0.02));
+    } else {
+        try addVis.dense(allocator, &blobs, &names, "visual.merger.norm.weight", amf.NO_LAYER, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, 9101, vh, 1.0));
+        try addVis.dense(allocator, &blobs, &names, "visual.merger.norm.bias", amf.NO_LAYER, .f16, .{ vh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, 9102, vh, 0.01));
+        try addVis.dense(allocator, &blobs, &names, "visual.merger.linear_fc1.weight", amf.NO_LAYER, .f16, .{ mh, sm_in, 0, 0 }, 2, try fillDeterministicF16(allocator, 9103, mh * sm_in, 0.02));
+        try addVis.dense(allocator, &blobs, &names, "visual.merger.linear_fc1.bias", amf.NO_LAYER, .f16, .{ mh, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, 9104, mh, 0.005));
+        try addVis.dense(allocator, &blobs, &names, "visual.merger.linear_fc2.weight", amf.NO_LAYER, .f16, .{ spec.lm_hidden, mh, 0, 0 }, 2, try fillDeterministicF16(allocator, 9105, spec.lm_hidden * mh, 0.02));
+        try addVis.dense(allocator, &blobs, &names, "visual.merger.linear_fc2.bias", amf.NO_LAYER, .f16, .{ spec.lm_hidden, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, 9106, spec.lm_hidden, 0.005));
+    }
+    return buildTestAmf(allocator, "synth-vit-tower", blobs.items);
+}
+
+test "M7.8 G22 GraphModel text-only zero-overhead fast path + multi-layer ViT/AnyRes/PatchMerger aliased 0B decode RAM" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = try makeTestTempDir(allocator, "g22_vision");
+    defer {
+        removeTestDir(allocator, tmp_dir);
+        allocator.free(tmp_dir);
+    }
+
+    var bundle = try buildSynthQwen4TestBundle(allocator, 8, 2, 0, 1, 0, null);
+    defer bundle.deinit(allocator);
+    bundle.cfg.qsa_window_size = 0;
+
+    // 1. Text-only zero-overhead fast path (`initTextOnly`): 0 pipelines, 0 owned wired bytes, 0 saved aliases.
+    var text_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+    });
+    defer text_m.deinit(allocator);
+    try std.testing.expect(!text_m.hasVisionTower());
+    try std.testing.expectEqual(@as(usize, 0), text_m.visionOwnedWiredBytes());
+    try std.testing.expectEqual(@as(usize, 0), text_m.visionAliasedSavedBytes());
+
+    // 2. Pack synthetic 3-layer Q4+F16 W20 vision sidecar & load over aliased scratch.
+    const vis_bytes = try buildSynthVisionTowerAmfBytes(allocator, .{
+        .num_layers = 3,
+        .vis_hidden = 64,
+        .vis_intermediate = 128,
+        .lm_hidden = bundle.cfg.hidden_size,
+        .merger_hidden = 128,
+        .patch_size = 16,
+        .t_patch = 2,
+        .spatial_merge = 2,
+        .q4_qkv = true,
+    });
+    defer allocator.free(vis_bytes);
+    const vis_path = try std.fs.path.joinZ(allocator, &.{ tmp_dir, "vision.amf" });
+    defer allocator.free(vis_path);
+    try writeBytesFile(vis_path, vis_bytes);
+
+    var vis_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+        .vision_amf_path = vis_path,
+        .vision_max_patches = 64,
+    });
+    defer vis_m.deinit(allocator);
+    try std.testing.expect(vis_m.hasVisionTower());
+    try std.testing.expectEqual(@as(u32, 3), vis_m.visionTowerConfig().num_layers);
+    try std.testing.expectEqual(@as(usize, 0), vis_m.visionOwnedWiredBytes());
+    try std.testing.expect(vis_m.visionAliasedSavedBytes() > 0);
+    try std.testing.expectEqual(vision_mod.VisionPlacement.gpu, vis_m.visionPlacement());
+
+    // `--disable-vision-tower` forces zero-overhead text-only path even when sidecar is passed.
+    var novis_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 32,
+        .vision_amf_path = vis_path,
+        .disable_vision_tower = true,
+    });
+    defer novis_m.deinit(allocator);
+    try std.testing.expect(!novis_m.hasVisionTower());
+    try std.testing.expectEqual(@as(usize, 0), novis_m.visionOwnedWiredBytes());
+
+    // 3. End-to-end multimodal prefill executing full 3-layer ViT + PatchMerger over HEVC IOSurfaces.
+    const clip = try metal.VtClip.encodeTestClip(.hevc, 128, 128, 2, 30);
+    defer clip.close();
+    const dec = try metal.VtDecodeSession.init(vis_m.device, clip, .nv12);
+    defer dec.close();
+    const f0 = try dec.decodeFrame(clip, 0);
+    defer f0.close();
+    const f1 = try dec.decodeFrame(clip, 1);
+    defer f1.close();
+
+    const prefix = [_]u32{ 1, 5, 9 };
+    const suffix = [_]u32{ 11, 14 };
+    const mm = try vis_m.prefillMultimodal(allocator, &prefix, &suffix, &.{ f0, f1 }, .{
+        .anyres_mode = .smart_resize,
+    });
+    try std.testing.expect(mm.vision_tower_active);
+    try std.testing.expect(mm.all_frames_zero_copy);
+    try std.testing.expectEqual(@as(u32, 16), mm.vision_tokens);
+    try std.testing.expectEqual(@as(u32, 21), mm.total_prompt_tokens);
+    try std.testing.expect(mm.first_token < bundle.cfg.vocab_size);
+    try std.testing.expect(mm.vision_encode_us > 0.0);
+
+    // 4. Text decode after ViT prefill aliases the same scratch pages cleanly with `0` swapouts.
+    const snap0 = try vmstat.Snapshot.capture();
+    const d1 = try vis_m.stepDecode(mm.first_token, mm.total_prompt_tokens);
+    const snap1 = try vmstat.Snapshot.capture();
+    try std.testing.expect(d1 < bundle.cfg.vocab_size);
+    try std.testing.expectEqual(@as(u64, 0), vmstat.Snapshot.swapoutDelta(snap0, snap1));
+}
+
+test "M7.8 G18 GraphModel dense homogeneous QKV/GateUpSwiGLU/residual epilogue A/B parity" {
+    const allocator = std.testing.allocator;
+    var bundle = try buildSynthLoopDenseBundle(allocator, .{
+        .hidden_size = 128,
+        .vocab_size = 128,
+        .num_layers = 2,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .start_layer = 0,
+        .end_layer = 2,
+        .mode = .single_pass,
+        .max_loops = 1,
+        .include_early_exit = false,
+        .include_steplora = false,
+    });
+    defer bundle.deinit(allocator);
+
+    var fused_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .enable_g18_fusion = true,
+        .g18_qkv_gemm_min_m = 4,
+        .g18_swiglu_gemm_min_m = 4,
+    });
+    defer fused_m.deinit(allocator);
+
+    var unfused_m = try GraphModel.loadFromBytes(allocator, bundle.amf_bytes, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .enable_g18_fusion = false,
+    });
+    defer unfused_m.deinit(allocator);
+
+    const prompt = [_]u32{ 3, 17, 29, 41, 53, 67, 79, 97 };
+    const f_tok = try fused_m.prefillChunk(&prompt, 0, true);
+    const u_tok = try unfused_m.prefillChunk(&prompt, 0, true);
+    try std.testing.expectEqual(u_tok, f_tok);
+
+    const f_d1 = try fused_m.stepDecode(f_tok, @intCast(prompt.len));
+    const u_d1 = try unfused_m.stepDecode(u_tok, @intCast(prompt.len));
+    try std.testing.expectEqual(u_d1, f_d1);
+
+    const f_logits = fused_m.readLastLogitsF16();
+    const u_logits = unfused_m.readLastLogitsF16();
+    for (0..bundle.cfg.vocab_size) |i| {
+        const a: f32 = @floatCast(f_logits[i]);
+        const b: f32 = @floatCast(u_logits[i]);
+        try std.testing.expectApproxEqAbs(b, a, 2e-2);
+    }
+
+    const f_vr = try fused_m.verifyTree(&.{ f_d1, 11 }, &.{ @intCast(prompt.len + 1), @intCast(prompt.len + 2) }, &.{ 0b01, 0b11 }, @intCast(prompt.len + 1));
+    const u_vr = try unfused_m.verifyTree(&.{ u_d1, 11 }, &.{ @intCast(prompt.len + 1), @intCast(prompt.len + 2) }, &.{ 0b01, 0b11 }, @intCast(prompt.len + 1));
+    try std.testing.expectEqualSlices(u32, u_vr.argmax_tokens[0..2], f_vr.argmax_tokens[0..2]);
 }

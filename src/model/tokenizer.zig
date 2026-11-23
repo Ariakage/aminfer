@@ -2310,7 +2310,7 @@ test "opportunistic live Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash-1017 tokeniz
     }
 }
 
-fn matchQwenPreTokenScalarRef(rem: []const u8) usize {
+pub fn matchQwenPreTokenScalarRef(rem: []const u8) usize {
     if (rem[0] == '\'') {
         if (rem.len >= 2) {
             switch (asciiLower(rem[1])) {

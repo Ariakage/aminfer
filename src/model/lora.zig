@@ -22,6 +22,7 @@ const budget_mod = @import("../mem/budget.zig");
 const amf = @import("../format/amf.zig");
 const quant = @import("../quant/spec.zig");
 const sme = @import("../cpu/sme.zig");
+const chip_profile = @import("../platform/chip_profile.zig");
 
 /// Hard cap on P-core L2-resident LoRA wired pool (`4 MiB`, ADR-0022).
 pub const MAX_LORA_POOL_BYTES: usize = 4 * 1024 * 1024;
@@ -113,7 +114,7 @@ pub fn parseModelSelector(raw: []const u8) ModelSelector {
     return .{ .base = trimmed, .adapter = null };
 }
 
-pub const LoraError = amf.ParseError || amf.IoError || page.WiredRegion.InitError || budget_mod.PlanError || sme.Error || error{
+pub const LoraError = amf.ParseError || amf.IoError || page.WiredRegion.InitError || budget_mod.PlanError || sme.Error || sme.WiredScratchError || error{
     InvalidConfig,
     PoolCapExceeded,
     PoolOutOfSpace,
@@ -223,9 +224,11 @@ pub const LoraLinearPair = struct {
     scale: f32,
     layout: amf.TensorLayout,
     dtype: quant.FloatDType,
+    weight_dtype: quant.WeightDType = .f16,
+    param_kind: amf.QuantParamKind = .affine_scale_bias,
     a_blob: []const u8,
     b_blob: []const u8,
-    /// Present when `layout == .sme2_panel64` (fast L2-resident SME2 `ld1b` path).
+    /// Present when `layout == .sme2_panel64` (fast L2-resident SME2 `ld1b` / `luti2` path).
     sme_adapter: ?sme.SmeStepLoraAdapter = null,
 
     /// Evaluates `y_f16[row, 0..n] += scale * ((x_f16[row, 0..k] @ A^T) @ B^T)` for
@@ -273,24 +276,91 @@ pub const LoraLinearPair = struct {
                 }
             },
             .sme2_panel64 => {
-                if (dispatcher != null and self.sme_adapter != null and self.dtype == .f16 and z_u16_scratch.len >= sme.GROUP_SIZE) {
+                if (dispatcher != null and self.sme_adapter != null and z_u16_scratch.len >= sme.GROUP_SIZE) {
                     const x_u16: []const u16 = @ptrCast(x_row[0..k]);
                     const adp = self.sme_adapter.?;
-                    try sme.evalSmeLinear(
-                        dispatcher.?,
-                        adp.a_weight,
-                        x_u16,
-                        null,
-                        std.mem.sliceAsBytes(z_scratch[0..r]),
-                        1,
-                        .{ .cache_hint = .temporal, .epilogue = .none, .out_dtype = .f32 },
-                    );
-                    for (0..r) |j| {
-                        z_u16_scratch[j] = quant.f32ToFloatBits(.f16, z_scratch[j] * self.scale);
+                    if (!adp.a_weight.dtype.activationIsBf16()) {
+                        try sme.evalSmeLinear(
+                            dispatcher.?,
+                            adp.a_weight,
+                            x_u16,
+                            null,
+                            std.mem.sliceAsBytes(z_scratch[0..r]),
+                            1,
+                            .{ .cache_hint = .temporal, .epilogue = .none, .out_dtype = .f32 },
+                        );
+                        const b_act_dt: quant.FloatDType = if (adp.b_weight.dtype.activationIsBf16()) .bf16 else .f16;
+                        for (0..r) |j| {
+                            z_u16_scratch[j] = quant.f32ToFloatBits(b_act_dt, z_scratch[j] * self.scale);
+                        }
+                        @memset(z_u16_scratch[r..sme.GROUP_SIZE], 0);
+                        if (adp.b_weight.dtype.isQuantized()) {
+                            if (n > 8192) return error.BufferTooSmall;
+                            var y_f32_tmp: [8192]f32 = undefined;
+                            try sme.evalSmeLinear(
+                                dispatcher.?,
+                                adp.b_weight,
+                                z_u16_scratch[0..sme.GROUP_SIZE],
+                                null,
+                                std.mem.sliceAsBytes(y_f32_tmp[0..n]),
+                                1,
+                                .{ .cache_hint = .temporal, .epilogue = .none, .out_dtype = .f32 },
+                            );
+                            for (0..n) |o| {
+                                y_row[o] = @floatCast(@as(f32, @floatCast(y_row[o])) + y_f32_tmp[o]);
+                            }
+                            return;
+                        }
+                        self.addPanel64BToF16Row(z_u16_scratch[0..sme.GROUP_SIZE], y_row);
+                        return;
                     }
-                    @memset(z_u16_scratch[r..sme.GROUP_SIZE], 0);
-                    self.addPanel64BToF16Row(z_u16_scratch[0..sme.GROUP_SIZE], y_row);
-                    return;
+                }
+                if (self.sme_adapter) |adp| {
+                    if (adp.a_weight.dtype.isQuantized() or adp.b_weight.dtype.isQuantized() or self.weight_dtype == .q2_affine) {
+                        if (n > 8192 or z_u16_scratch.len < sme.GROUP_SIZE) return error.BufferTooSmall;
+                        const x_u16: []const u16 = @ptrCast(x_row[0..k]);
+                        sme.matmulPanel64ScalarRange(
+                            adp.a_weight.dtype,
+                            adp.a_weight.param_kind,
+                            .none,
+                            .f32,
+                            x_u16,
+                            adp.a_weight.w_packed,
+                            null,
+                            std.mem.sliceAsBytes(z_scratch[0..r]),
+                            0,
+                            1,
+                            0,
+                            sme.panelCount(r),
+                            r,
+                            k,
+                        );
+                        for (0..r) |j| {
+                            z_u16_scratch[j] = quant.f32ToFloatBits(.f16, z_scratch[j] * self.scale);
+                        }
+                        @memset(z_u16_scratch[r..sme.GROUP_SIZE], 0);
+                        var y_f32_tmp: [8192]f32 = undefined;
+                        sme.matmulPanel64ScalarRange(
+                            adp.b_weight.dtype,
+                            adp.b_weight.param_kind,
+                            .none,
+                            .f32,
+                            z_u16_scratch[0..sme.GROUP_SIZE],
+                            adp.b_weight.w_packed,
+                            null,
+                            std.mem.sliceAsBytes(y_f32_tmp[0..n]),
+                            0,
+                            1,
+                            0,
+                            sme.panelCount(n),
+                            n,
+                            sme.GROUP_SIZE,
+                        );
+                        for (0..n) |o| {
+                            y_row[o] = @floatCast(@as(f32, @floatCast(y_row[o])) + y_f32_tmp[o]);
+                        }
+                        return;
+                    }
                 }
                 self.applyPanel64ScalarF16(x_row, y_row, z_scratch);
             },
@@ -443,8 +513,10 @@ pub const LoraRegistryConfig = struct {
     wired_budget: ?budget_mod.Budget = null,
     /// Base model shape against which every hot-loaded `.amlora` is validated.
     base_shape: BaseModelShape,
-    /// Optional shared SME2 dispatcher for `sme2_panel64` LoRA acceleration.
+    /// Optional shared SME2 dispatcher for `sme2_panel64` LoRA acceleration (`C24`).
     sme_dispatcher: ?*sme.SmeDispatcher = null,
+    /// Optional target chip profile for `C13`/`C16`/`C24` unified memory bus gating.
+    chip_profile: ?chip_profile.ChipProfile = null,
 };
 
 pub const LoraRegistryStats = struct {
@@ -457,13 +529,14 @@ pub const LoraRegistryStats = struct {
     total_unloads: u64,
 };
 
-/// Preallocated wired-RAM multi-LoRA registry (`W19`, `ADR-0022`).
+/// Preallocated wired-RAM multi-LoRA registry (`W19`, `ADR-0022`, `C24`).
 ///
 /// Owns ONE fixed `page.WiredRegion` (`<= 4 MiB`, `mlock`ed once at `init`) and
 /// manages hot-load / hot-unload of up to `MAX_ADAPTERS` `.amlora` bundles via
-/// a 16 KiB page-ownership bitmap. Zero OS `mlock`/`munlock` churn at runtime,
-/// zero base-weight unpinning, and zero heap allocations during per-token delta
-/// evaluation.
+/// a 16 KiB page-ownership bitmap. When an SME2 dispatcher is attached, also
+/// maintains wired `StepLoraScratch` + `f32` accumulation buffers to run
+/// `sme.SmeStepLoraAdapter.evalMultiAdapterHoisted` (`<= 4 MiB` L2 cap & `C13`
+/// bus gate) with zero hot-path allocations.
 pub const LoraRegistry = struct {
     const FREE_PAGE_OWNER: u8 = 0xFF;
 
@@ -474,6 +547,12 @@ pub const LoraRegistry = struct {
 
     base_shape: BaseModelShape,
     sme_dispatcher: ?*sme.SmeDispatcher,
+    chip_profile: ?chip_profile.ChipProfile,
+    gpu_bus_saturated: bool,
+    measured_coexec_speedup: ?f64,
+    swapouts_delta: u64,
+    sme_scratch: ?sme.StepLoraScratch,
+    delta_f32_region: ?page.WiredRegion,
     slots: [MAX_ADAPTERS]LoadedAdapter,
     active_count: u32,
     total_loads: u64,
@@ -482,6 +561,13 @@ pub const LoraRegistry = struct {
     // Preallocated zero-alloc evaluation scratch (inside struct — no runtime heap alloc).
     z_f32_scratch: [MAX_LORA_RANK]f32,
     z_u16_scratch: [sme.GROUP_SIZE]u16,
+
+    fn maxOutDim(base: BaseModelShape) usize {
+        return @max(
+            @as(usize, base.hidden_size),
+            @max(@as(usize, base.q_dim), @max(@as(usize, base.kv_dim), @as(usize, base.intermediate_size))),
+        );
+    }
 
     pub fn init(cfg: LoraRegistryConfig) LoraError!LoraRegistry {
         if (cfg.pool_bytes == 0 or (cfg.pool_bytes % page.APPLE_PAGE_SIZE) != 0) {
@@ -498,6 +584,20 @@ pub const LoraRegistry = struct {
         }
 
         const region = try page.WiredRegion.init(cfg.pool_bytes);
+        errdefer region.deinit();
+
+        var sme_scratch: ?sme.StepLoraScratch = null;
+        errdefer if (sme_scratch) |*sc| sc.deinit();
+        var delta_region: ?page.WiredRegion = null;
+        errdefer if (delta_region) |dr| dr.deinit();
+
+        if (cfg.sme_dispatcher != null) {
+            sme_scratch = try sme.StepLoraScratch.init(MAX_LORA_BATCH_ROWS, MAX_LORA_RANK, 0, cfg.wired_budget);
+            const max_out = maxOutDim(cfg.base_shape);
+            const delta_bytes = try page.alignUp(max_out * @sizeOf(f32));
+            delta_region = try page.WiredRegion.init(delta_bytes);
+        }
+
         return .{
             .pool = region,
             .total_pages = cfg.pool_bytes / page.APPLE_PAGE_SIZE,
@@ -505,6 +605,12 @@ pub const LoraRegistry = struct {
             .used_pages = 0,
             .base_shape = cfg.base_shape,
             .sme_dispatcher = cfg.sme_dispatcher,
+            .chip_profile = cfg.chip_profile,
+            .gpu_bus_saturated = false,
+            .measured_coexec_speedup = null,
+            .swapouts_delta = 0,
+            .sme_scratch = sme_scratch,
+            .delta_f32_region = delta_region,
             .slots = @splat(.{}),
             .active_count = 0,
             .total_loads = 0,
@@ -523,7 +629,27 @@ pub const LoraRegistry = struct {
         }
         self.active_count = 0;
         self.used_pages = 0;
+        if (self.sme_scratch) |*sc| {
+            sc.deinit();
+            self.sme_scratch = null;
+        }
+        if (self.delta_f32_region) |dr| {
+            dr.deinit();
+            self.delta_f32_region = null;
+        }
         self.pool.deinit();
+    }
+
+    /// Updates live `C13` / `C16` unified memory bus pressure telemetry used by `evalMultiAdapterHoisted`.
+    pub fn setBusContentionState(
+        self: *LoraRegistry,
+        gpu_bus_saturated: bool,
+        measured_coexec_speedup: ?f64,
+        swapouts_delta: u64,
+    ) void {
+        self.gpu_bus_saturated = gpu_bus_saturated;
+        self.measured_coexec_speedup = measured_coexec_speedup;
+        self.swapouts_delta = swapouts_delta;
     }
 
     /// O(1) hot-path gate checked strictly OUTSIDE transformer layer loops.
@@ -637,8 +763,11 @@ pub const LoraRegistry = struct {
         return false;
     }
 
-    /// Applies a single adapter's rank-`r` projection delta across `num_rows`
-    /// (`m`) rows of `[num_rows, k]` -> `[num_rows, n]` in-place (`0` heap allocs).
+    /// Evaluates a single adapter's rank-`r` projection delta across `num_rows`
+    /// (`m`) rows of `[num_rows, k]` -> `[num_rows, n]` in-place (`0` heap allocs),
+    /// routing `.sme2_panel64` adapters (including `q2_affine` / `LUT4`) through
+    /// hoisted `sme.SmeStepLoraAdapter.evalMultiAdapterHoisted` (`<= 4 MiB` L2 cap
+    /// & `C13` bus gate) when SME2 hoisted runtime scratch is attached.
     pub fn applySingleAdapterProjectionF16(
         self: *LoraRegistry,
         slot_id: u32,
@@ -647,14 +776,55 @@ pub const LoraRegistry = struct {
         x_f16: []const f16,
         y_f16: []f16,
         num_rows: usize,
-    ) sme.Error!void {
-        if (slot_id == NO_ADAPTER) return;
+    ) (sme.Error || error{BusContentionDeferred})!void {
+        if (slot_id == NO_ADAPTER or num_rows == 0) return;
         const adp = self.adapterAt(slot_id) orelse return;
         const la = adp.layerAdapters(layer_idx) orelse return;
         const pair = la.projections[@backingInt(target)] orelse return;
+        if (pair.scale == 0.0) return;
 
         const k: usize = pair.k;
         const n: usize = pair.n;
+        if (pair.layout == .sme2_panel64 and pair.sme_adapter != null and
+            self.sme_dispatcher != null and self.sme_scratch != null and self.delta_f32_region != null)
+        {
+            const sme_adp = pair.sme_adapter.?.withAlpha(pair.scale);
+            if (!sme_adp.a_weight.dtype.activationIsBf16()) {
+                const delta_all: []f32 = @alignCast(std.mem.bytesAsSlice(f32, self.delta_f32_region.?.bytes));
+                const cap_rows: usize = @min(MAX_LORA_BATCH_ROWS, delta_all.len / n);
+                if (cap_rows > 0) {
+                    const adps = [_]sme.SmeStepLoraAdapter{sme_adp};
+                    var row_off: usize = 0;
+                    while (row_off < num_rows) {
+                        const chunk_m: usize = @min(num_rows - row_off, cap_rows);
+                        const mn: usize = chunk_m * n;
+                        const delta_slice = delta_all[0..mn];
+                        @memset(delta_slice, 0.0);
+                        const x_u16: []const u16 = @ptrCast(x_f16[row_off * k ..][0 .. chunk_m * k]);
+                        try sme.SmeStepLoraAdapter.evalMultiAdapterHoisted(
+                            &adps,
+                            self.sme_dispatcher.?,
+                            &self.sme_scratch.?,
+                            x_u16,
+                            delta_slice,
+                            chunk_m,
+                            self.chip_profile,
+                            self.gpu_bus_saturated,
+                            self.measured_coexec_speedup,
+                            self.swapouts_delta,
+                            null,
+                        );
+                        const y_dst = y_f16[row_off * n ..][0..mn];
+                        for (0..mn) |i| {
+                            y_dst[i] = @floatCast(@as(f32, @floatCast(y_dst[i])) + delta_slice[i]);
+                        }
+                        row_off += chunk_m;
+                    }
+                    return;
+                }
+            }
+        }
+
         for (0..num_rows) |row| {
             try pair.applySingleRowF16(
                 x_f16[row * k ..][0..k],
@@ -663,6 +833,84 @@ pub const LoraRegistry = struct {
                 &self.z_u16_scratch,
                 self.sme_dispatcher,
             );
+        }
+    }
+
+    /// Evaluates multiple active LoRA adapters stacked on the SAME `[num_rows, k]`
+    /// input in hoisted `sme.SmeStepLoraAdapter.evalMultiAdapterHoisted` waves (`C24`),
+    /// enforcing `<= 4 MiB` P-core L2 cap and `C13` unified memory bus gating with zero
+    /// hot-path heap allocations.
+    pub fn applyMultiAdapterProjectionF16(
+        self: *LoraRegistry,
+        slot_ids: []const u32,
+        layer_idx: usize,
+        target: TargetProjection,
+        x_f16: []const f16,
+        y_f16: []f16,
+        num_rows: usize,
+    ) (sme.Error || error{BusContentionDeferred})!void {
+        if (slot_ids.len == 0 or num_rows == 0) return;
+        const dims = self.base_shape.expectedDims(target);
+        const k: usize = dims.k;
+        const n: usize = dims.n;
+
+        var hoisted: [MAX_ADAPTERS]sme.SmeStepLoraAdapter = undefined;
+        var hoisted_count: usize = 0;
+        var fallback_slots: [MAX_ADAPTERS]u32 = undefined;
+        var fallback_count: usize = 0;
+
+        for (slot_ids) |sid| {
+            if (sid == NO_ADAPTER) continue;
+            const adp = self.adapterAt(sid) orelse continue;
+            const la = adp.layerAdapters(layer_idx) orelse continue;
+            const pair = la.projections[@backingInt(target)] orelse continue;
+            if (pair.scale == 0.0) continue;
+            if (pair.layout == .sme2_panel64 and pair.sme_adapter != null and
+                self.sme_dispatcher != null and self.sme_scratch != null and self.delta_f32_region != null and
+                !pair.sme_adapter.?.a_weight.dtype.activationIsBf16() and hoisted_count < MAX_ADAPTERS)
+            {
+                hoisted[hoisted_count] = pair.sme_adapter.?.withAlpha(pair.scale);
+                hoisted_count += 1;
+            } else if (fallback_count < MAX_ADAPTERS) {
+                fallback_slots[fallback_count] = sid;
+                fallback_count += 1;
+            }
+        }
+
+        if (hoisted_count > 0) {
+            const delta_all: []f32 = @alignCast(std.mem.bytesAsSlice(f32, self.delta_f32_region.?.bytes));
+            const cap_rows: usize = @min(MAX_LORA_BATCH_ROWS, delta_all.len / n);
+            if (cap_rows == 0) return error.BufferTooSmall;
+            var row_off: usize = 0;
+            while (row_off < num_rows) {
+                const chunk_m: usize = @min(num_rows - row_off, cap_rows);
+                const mn: usize = chunk_m * n;
+                const delta_slice = delta_all[0..mn];
+                @memset(delta_slice, 0.0);
+                const x_u16: []const u16 = @ptrCast(x_f16[row_off * k ..][0 .. chunk_m * k]);
+                try sme.SmeStepLoraAdapter.evalMultiAdapterHoisted(
+                    hoisted[0..hoisted_count],
+                    self.sme_dispatcher.?,
+                    &self.sme_scratch.?,
+                    x_u16,
+                    delta_slice,
+                    chunk_m,
+                    self.chip_profile,
+                    self.gpu_bus_saturated,
+                    self.measured_coexec_speedup,
+                    self.swapouts_delta,
+                    null,
+                );
+                const y_dst = y_f16[row_off * n ..][0..mn];
+                for (0..mn) |i| {
+                    y_dst[i] = @floatCast(@as(f32, @floatCast(y_dst[i])) + delta_slice[i]);
+                }
+                row_off += chunk_m;
+            }
+        }
+
+        for (fallback_slots[0..fallback_count]) |sid| {
+            try self.applySingleAdapterProjectionF16(sid, layer_idx, target, x_f16, y_f16, num_rows);
         }
     }
 
@@ -880,16 +1128,27 @@ pub const LoraRegistry = struct {
 
             const a_dt = try a_entry.dataType();
             const b_dt = try b_entry.dataType();
-            if (a_dt != b_dt) return error.UnsupportedDType;
-            const fdt: quant.FloatDType = switch (a_dt) {
-                .f16 => .f16,
-                .bf16 => .bf16,
-                else => return error.UnsupportedDType,
-            };
+            const a_ok = (a_dt == .f16 or a_dt == .bf16 or a_dt == .q2_affine);
+            const b_ok = (b_dt == .f16 or b_dt == .bf16 or b_dt == .q2_affine);
+            if (!a_ok or !b_ok) return error.UnsupportedDType;
 
             const a_lay = try a_entry.tensorLayout();
             const b_lay = try b_entry.tensorLayout();
             if (a_lay != b_lay) return error.InvalidTensorLayout;
+            if ((a_dt == .q2_affine or b_dt == .q2_affine) and a_lay != .sme2_panel64) {
+                return error.InvalidTensorLayout;
+            }
+            if (a_dt != .q2_affine and b_dt != .q2_affine and a_dt != b_dt) {
+                return error.UnsupportedDType;
+            }
+            const fdt: quant.FloatDType = if (a_dt == .bf16 or b_dt == .bf16) .bf16 else .f16;
+            const b_wdt: quant.WeightDType = switch (b_dt) {
+                .f16 => .f16,
+                .bf16 => .bf16,
+                .q2_affine => .q2_affine,
+                else => return error.UnsupportedDType,
+            };
+            const b_pk = try b_entry.quantParamKind();
             if (a_entry.rank != 2 or b_entry.rank != 2) return error.InvalidRank;
 
             const rank = a_entry.shape[0];
@@ -946,6 +1205,8 @@ pub const LoraRegistry = struct {
                 .scale = effective_scale,
                 .layout = a_lay,
                 .dtype = fdt,
+                .weight_dtype = b_wdt,
+                .param_kind = b_pk,
                 .a_blob = a_dst,
                 .b_blob = b_dst,
                 .sme_adapter = sme_adp,
@@ -989,6 +1250,8 @@ pub const SyntheticLoraSpec = struct {
     rank: u32,
     layout: amf.TensorLayout = .row_major,
     dtype: quant.FloatDType = .f16,
+    b_weight_dtype: ?quant.WeightDType = null,
+    b_lut4: bool = false,
     a_f32: []const f32,
     b_f32: []const f32,
 };
@@ -1041,6 +1304,17 @@ pub fn buildSyntheticAmloraBytes(
     for (specs, 0..) |sp, si| {
         const amf_dt: amf.DType = if (sp.dtype == .bf16) .bf16 else .f16;
         const pdt: sme.PanelDType = if (sp.dtype == .bf16) .bf16 else .f16;
+        const b_wdt: quant.WeightDType = sp.b_weight_dtype orelse if (sp.dtype == .bf16) .bf16 else .f16;
+        const b_amf_dt: amf.DType = switch (b_wdt) {
+            .f16 => .f16,
+            .bf16 => .bf16,
+            .q2_affine => .q2_affine,
+            else => return error.UnsupportedDType,
+        };
+        const b_pk: amf.QuantParamKind = if (b_wdt == .q2_affine and sp.b_lut4)
+            .lut16_codebook
+        else
+            .affine_scale_bias;
 
         var a_name_buf: [48]u8 = undefined;
         const a_name = try std.fmt.bufPrint(&a_name_buf, "layers.{d}.{s}.lora_a", .{ sp.layer, sp.target.suffix() });
@@ -1053,10 +1327,14 @@ pub fn buildSyntheticAmloraBytes(
         ae.shape = .{ sp.rank, sp.k, 0, 0 };
         ae.setLayoutAndParamKind(sp.layout, .affine_scale_bias);
 
-        var be = amf.TensorEntry.zeroed(b_name, .loop_adapter, amf_dt);
+        var be = amf.TensorEntry.zeroed(b_name, .loop_adapter, b_amf_dt);
         be.rank = 2;
         be.layer = @intCast(sp.layer);
-        be.setLayoutAndParamKind(sp.layout, .affine_scale_bias);
+        be.setLayoutAndParamKind(sp.layout, b_pk);
+        if (b_wdt == .q2_affine) {
+            be.quant_bits = 2;
+            be.group_size = sme.GROUP_SIZE;
+        }
 
         const a_data_bytes: usize = switch (sp.layout) {
             .row_major => @as(usize, sp.rank) * sp.k * 2,
@@ -1082,12 +1360,14 @@ pub fn buildSyntheticAmloraBytes(
 
         const b_data_bytes: usize = switch (sp.layout) {
             .row_major => blk: {
+                if (b_wdt == .q2_affine) return error.InvalidTensorLayout;
                 be.shape = .{ sp.n, sp.rank, 0, 0 };
                 break :blk @as(usize, sp.n) * sp.rank * 2;
             },
             .sme2_panel64 => blk: {
                 be.shape = .{ sp.n, sme.GROUP_SIZE, 0, 0 };
-                break :blk try sme.packedBlobBytes(pdt, sp.n, sme.GROUP_SIZE);
+                const b_pdt: sme.PanelDType = if (b_wdt == .q2_affine) .q2_affine else pdt;
+                break :blk try sme.packedBlobBytes(b_pdt, sp.n, sme.GROUP_SIZE);
             },
         };
         const b_blob_len = try page.alignUp(b_data_bytes);
@@ -1101,7 +1381,82 @@ pub fn buildSyntheticAmloraBytes(
                 }
             },
             .sme2_panel64 => {
-                try sme.packStepLoraBDenseFromF32Panel64(pdt, sp.b_f32, sp.n, sp.rank, b_blob[0..b_data_bytes]);
+                if (b_wdt == .q2_affine) {
+                    const n_us: usize = sp.n;
+                    const r_us: usize = sp.rank;
+                    const codes = try allocator.alloc(u8, n_us * r_us);
+                    defer allocator.free(codes);
+                    if (sp.b_lut4) {
+                        const panels = sme.panelCount(n_us);
+                        const cbs = try allocator.alloc([4]f16, panels);
+                        defer allocator.free(cbs);
+                        for (0..panels) |p| {
+                            const col_start = p * sme.PANEL_COLS;
+                            const col_end = @min(col_start + sme.PANEL_COLS, n_us);
+                            var lo: f32 = std.math.inf(f32);
+                            var hi: f32 = -std.math.inf(f32);
+                            for (col_start..col_end) |row| {
+                                for (0..r_us) |col| {
+                                    const v = sp.b_f32[row * r_us + col];
+                                    if (v < lo) lo = v;
+                                    if (v > hi) hi = v;
+                                }
+                            }
+                            if (!std.math.isFinite(lo)) {
+                                lo = 0.0;
+                                hi = 0.0;
+                            }
+                            const step = if (hi > lo) (hi - lo) / 3.0 else 0.0;
+                            cbs[p] = .{
+                                @floatCast(lo),
+                                @floatCast(lo + step),
+                                @floatCast(lo + 2.0 * step),
+                                @floatCast(hi),
+                            };
+                            for (col_start..col_end) |row| {
+                                for (0..r_us) |col| {
+                                    const v = sp.b_f32[row * r_us + col];
+                                    var best_q: u8 = 0;
+                                    var best_err: f32 = std.math.inf(f32);
+                                    for (0..4) |qi| {
+                                        const err = @abs(v - @as(f32, @floatCast(cbs[p][qi])));
+                                        if (err < best_err) {
+                                            best_err = err;
+                                            best_q = @intCast(qi);
+                                        }
+                                    }
+                                    codes[row * r_us + col] = best_q;
+                                }
+                            }
+                        }
+                        try sme.packStepLoraBQ2Lut4Panel64(codes, cbs, null, n_us, r_us, b_blob[0..b_data_bytes]);
+                    } else {
+                        const sbs = try allocator.alloc(quant.ScaleBias, n_us);
+                        defer allocator.free(sbs);
+                        for (0..n_us) |row| {
+                            var lo: f32 = std.math.inf(f32);
+                            var hi: f32 = -std.math.inf(f32);
+                            for (0..r_us) |col| {
+                                const v = sp.b_f32[row * r_us + col];
+                                if (v < lo) lo = v;
+                                if (v > hi) hi = v;
+                            }
+                            const scale_f32 = if (hi > lo) (hi - lo) / 3.0 else 1.0;
+                            const scale_h: f16 = @floatCast(scale_f32);
+                            const bias_h: f16 = @floatCast(lo);
+                            const inv_s = 1.0 / @as(f32, @floatCast(scale_h));
+                            sbs[row] = .{ .scale = scale_h, .bias = bias_h };
+                            for (0..r_us) |col| {
+                                const v = sp.b_f32[row * r_us + col];
+                                const qf = std.math.clamp(@round((v - @as(f32, @floatCast(bias_h))) * inv_s), 0.0, 3.0);
+                                codes[row * r_us + col] = @intFromFloat(qf);
+                            }
+                        }
+                        try sme.packStepLoraBQ2AffinePanel64(codes, sbs, n_us, r_us, b_blob[0..b_data_bytes]);
+                    }
+                } else {
+                    try sme.packStepLoraBDenseFromF32Panel64(pdt, sp.b_f32, sp.n, sp.rank, b_blob[0..b_data_bytes]);
+                }
             },
         }
         be.data_bytes = b_data_bytes;
@@ -1289,4 +1644,185 @@ test "W19 LoraRegistry enforces 4 MiB wired cap, hot-loads/unloads without leaks
     try reg.unloadAdapter(gpa, "sql-reloaded");
     try std.testing.expectEqual(@as(u32, 0), reg.activeAdapterCount());
     try std.testing.expectEqual(@as(usize, 0), reg.stats().pool_used_bytes);
+}
+
+test "C24 LoraRegistry supports Q2 affine & LUT4 Step-LoRA, hoisted multi-adapter waves, and C13 bus gate" {
+    const gpa = std.testing.allocator;
+    var disp = try sme.SmeDispatcher.init(gpa, .{});
+    defer disp.deinit();
+    const base_shape: BaseModelShape = .{
+        .num_layers = 1,
+        .hidden_size = 64,
+        .q_dim = 64,
+        .kv_dim = 64,
+        .intermediate_size = 128,
+    };
+    const pool_bytes: usize = 512 * 1024;
+    const wired_budget = budget_mod.Budget.compute(.{
+        .memory_bytes = 64 * 1024 * 1024,
+        .user_wire_limit = 32 * 1024 * 1024,
+        .global_user_wire_limit = 32 * 1024 * 1024,
+        .gpu_working_set_bytes = 32 * 1024 * 1024,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    const m4_prof: chip_profile.ChipProfile = .{
+        .generation = .m4,
+        .tier = .base,
+        .gpu_apple_family = 9,
+        .p_cores = 4,
+        .e_cores = 6,
+        .has_sme2 = true,
+        .has_nax = false,
+        .spec_bus_gbs = 120.0,
+        .bandwidth_source = .apple_spec_table,
+        .c13_min_coexec_speedup = 1.05,
+        .ane_wavefront_min_tokens_default = 256,
+    };
+    var reg = try LoraRegistry.init(.{
+        .pool_bytes = pool_bytes,
+        .wired_budget = wired_budget,
+        .base_shape = base_shape,
+        .sme_dispatcher = &disp,
+        .chip_profile = m4_prof,
+    });
+    defer reg.deinit(gpa);
+
+    const r: usize = 4;
+    const n: usize = 64;
+    const k: usize = 64;
+    const m: usize = 2;
+    const q2_levels = [_]f32{ -0.75, -0.25, 0.25, 0.75 };
+
+    var a_aff: [r * k]f32 = undefined;
+    var b_aff: [n * r]f32 = undefined;
+    var a_lut: [r * k]f32 = undefined;
+    var b_lut: [n * r]f32 = undefined;
+    for (&a_aff, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.25;
+    for (&a_lut, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 7)) - 3)) * 0.125;
+    for (&b_aff, 0..) |*v, i| v.* = q2_levels[i % 4];
+    for (&b_lut, 0..) |*v, i| v.* = q2_levels[(i * 3 + 1) % 4];
+
+    const img_aff = try buildSyntheticAmloraBytes(gpa, "q2-affine", r, 4.0, &.{
+        .{
+            .layer = 0,
+            .target = .q_proj,
+            .n = n,
+            .k = k,
+            .rank = r,
+            .layout = .sme2_panel64,
+            .dtype = .f16,
+            .b_weight_dtype = .q2_affine,
+            .b_lut4 = false,
+            .a_f32 = &a_aff,
+            .b_f32 = &b_aff,
+        },
+    });
+    defer gpa.free(img_aff);
+
+    const img_lut = try buildSyntheticAmloraBytes(gpa, "q2-lut4", r, 8.0, &.{
+        .{
+            .layer = 0,
+            .target = .q_proj,
+            .n = n,
+            .k = k,
+            .rank = r,
+            .layout = .sme2_panel64,
+            .dtype = .f16,
+            .b_weight_dtype = .q2_affine,
+            .b_lut4 = true,
+            .a_f32 = &a_lut,
+            .b_f32 = &b_lut,
+        },
+    });
+    defer gpa.free(img_lut);
+
+    const slot_aff = try reg.loadAdapterFromBytes(gpa, "aff", img_aff);
+    const slot_lut = try reg.loadAdapterFromBytes(gpa, "lut", img_lut);
+
+    var x_in: [m * k]f16 = undefined;
+    var y_hoisted: [m * n]f16 = undefined;
+    var y_base: [m * n]f16 = undefined;
+    for (0..m) |row| {
+        for (0..k) |j| {
+            x_in[row * k + j] = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((row * 7 + j) % 9)) - 4)) * 0.25);
+        }
+        for (0..n) |o| {
+            const init_val: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((row + o) % 5)) - 2)) * 0.5);
+            y_hoisted[row * n + o] = init_val;
+            y_base[row * n + o] = init_val;
+        }
+    }
+
+    // 1) Multi-adapter hoisted wave combining Q2 affine (scale=1.0) + Q2 LUT4 (scale=2.0).
+    const multi_slots = [_]u32{ slot_aff, slot_lut };
+    try reg.applyMultiAdapterProjectionF16(&multi_slots, 0, .q_proj, &x_in, &y_hoisted, m);
+
+    const refs = [_]struct { scale: f32, a: []const f32, b: []const f32 }{
+        .{ .scale = 1.0, .a = &a_aff, .b = &b_aff },
+        .{ .scale = 2.0, .a = &a_lut, .b = &b_lut },
+    };
+    for (0..m) |row| {
+        for (0..n) |o| {
+            var expected: f32 = @floatCast(y_base[row * n + o]);
+            for (refs) |rf| {
+                for (0..r) |j| {
+                    var acc: f32 = 0.0;
+                    for (0..k) |t| acc += @as(f32, @floatCast(x_in[row * k + t])) * rf.a[j * k + t];
+                    expected += acc * rf.scale * rf.b[o * r + j];
+                }
+            }
+            const got: f32 = @floatCast(y_hoisted[row * n + o]);
+            try std.testing.expectApproxEqAbs(expected, got, 0.08);
+        }
+    }
+
+    // 2) C13 bus contention gate:
+    //    - Active wave `<= 4 MiB` stays L2-resident and executes even under saturated GPU bus.
+    //    - Active wave `> 4 MiB` defers cleanly (`error.BusContentionDeferred`) under GPU saturation.
+    reg.setBusContentionState(true, 1.0, 1);
+    try reg.applyMultiAdapterProjectionF16(&multi_slots, 0, .q_proj, &x_in, &y_hoisted, m);
+
+    const large_k: usize = 1024;
+    const large_n: usize = 4096;
+    const large_r: usize = 64;
+    const a_large = try gpa.alloc(f32, large_r * large_k);
+    defer gpa.free(a_large);
+    const b_large = try gpa.alloc(f32, large_n * large_r);
+    defer gpa.free(b_large);
+    @memset(a_large, 0.0625);
+    @memset(b_large, 0.0625);
+    const img_large = try buildSyntheticAmloraBytes(gpa, "large-lora", large_r, 64.0, &.{
+        .{ .layer = 0, .target = .q_proj, .n = large_n, .k = large_k, .rank = large_r, .layout = .sme2_panel64, .dtype = .f16, .a_f32 = a_large, .b_f32 = b_large },
+    });
+    defer gpa.free(img_large);
+
+    var reg_large = try LoraRegistry.init(.{
+        .pool_bytes = 2 * 1024 * 1024,
+        .wired_budget = wired_budget,
+        .base_shape = .{ .num_layers = 1, .hidden_size = large_k, .q_dim = large_n, .kv_dim = large_n, .intermediate_size = large_n },
+        .sme_dispatcher = &disp,
+        .chip_profile = m4_prof,
+    });
+    defer reg_large.deinit(gpa);
+    const slot_large = try reg_large.loadAdapterFromBytes(gpa, "lg", img_large);
+    const x_large = try gpa.alloc(f16, large_k);
+    defer gpa.free(x_large);
+    const y_large = try gpa.alloc(f16, large_n);
+    defer gpa.free(y_large);
+    @memset(x_large, 0.5);
+    @memset(y_large, 0.0);
+
+    reg_large.setBusContentionState(true, 1.0, 1);
+    const heavy_wave = [_]u32{
+        slot_large, slot_large, slot_large, slot_large,
+        slot_large, slot_large, slot_large, slot_large,
+    }; // 8 * 640 KiB = 5.0 MiB > 4 MiB L2 cap
+    try std.testing.expectError(
+        error.BusContentionDeferred,
+        reg_large.applyMultiAdapterProjectionF16(&heavy_wave, 0, .q_proj, x_large, y_large, 1),
+    );
+    reg_large.setBusContentionState(false, null, 0);
+    try reg_large.applyMultiAdapterProjectionF16(&heavy_wave, 0, .q_proj, x_large, y_large, 1);
+    reg.setBusContentionState(false, null, 0);
 }

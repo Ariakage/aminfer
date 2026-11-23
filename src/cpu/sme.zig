@@ -5278,10 +5278,10 @@ test "C24: luti2 2-bit q2_affine and LUT4 codebook fp32 parity across M=1..35, o
         &.{.scalar_fallback};
 
     const shapes = [_]struct { m: usize, n: usize, k: usize }{
-        .{ .m = 1, .n = 17, .k = 64 },   // M==1 branch-free luti2 fast path, odd N
-        .{ .m = 1, .n = 65, .k = 256 },  // M==1 multi-group & multi-panel prefetch
-        .{ .m = 3, .n = 33, .k = 192 },  // M=2..4 streaming burst dot
-        .{ .m = 5, .n = 37, .k = 128 },  // M=5..16 1x4 ZA
+        .{ .m = 1, .n = 17, .k = 64 }, // M==1 branch-free luti2 fast path, odd N
+        .{ .m = 1, .n = 65, .k = 256 }, // M==1 multi-group & multi-panel prefetch
+        .{ .m = 3, .n = 33, .k = 192 }, // M=2..4 streaming burst dot
+        .{ .m = 5, .n = 37, .k = 128 }, // M=5..16 1x4 ZA
         .{ .m = 16, .n = 64, .k = 256 }, // full 1x4 ZA with 4-group prefetch
         .{ .m = 17, .n = 35, .k = 128 }, // M=17..31 2x2 ZA odd rows
         .{ .m = 35, .n = 51, .k = 192 }, // hybrid 32-row 2x2 + 3-row m1_4 tail

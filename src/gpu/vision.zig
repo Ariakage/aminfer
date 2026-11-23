@@ -2164,7 +2164,7 @@ pub const VisionTowerPipelines = struct {
                     .row_bytes = 0,
                     .has_bias = if (d.bias != null) 1 else 0,
                     .has_residual = if (residual != null) 1 else 0,
-                    .act_kind = @intFromEnum(act),
+                    .act_kind = @backingInt(act),
                 };
                 const use_nax = self.backend == .apple10_nax_tensorops and self.linear_nax != null and m >= 32 and n >= 32;
                 const pipe = if (use_nax)
@@ -2192,7 +2192,7 @@ pub const VisionTowerPipelines = struct {
                     .row_bytes = num_groups * 32,
                     .has_bias = if (q4.bias != null) 1 else 0,
                     .has_residual = if (residual != null) 1 else 0,
-                    .act_kind = @intFromEnum(act),
+                    .act_kind = @backingInt(act),
                 };
                 try frame.encodeThreadgroups(
                     self.linear_q4_mma[@backingInt(q4.bias_dtype)],

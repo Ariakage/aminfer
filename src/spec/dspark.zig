@@ -24,6 +24,8 @@ const sysinfo = @import("../platform/sysinfo.zig");
 const quant = @import("../quant/spec.zig");
 const tree_mod = @import("tree.zig");
 const sam_mod = @import("sam.zig");
+const grammar_mod = @import("grammar.zig");
+const accept_mod = @import("accept.zig");
 
 /// Maximum semi-autoregressive parallel block width (`W`).
 pub const MAX_BLOCK_WIDTH: u8 = 16;
@@ -495,11 +497,43 @@ pub const DSparkProposer = struct {
         sam: ?*const sam_mod.SuffixAutomaton,
         out_tree: *tree_mod.DraftTree(max_nodes),
     ) Error!ProposeResult {
+        return self.proposeIntoConstrained(
+            max_nodes,
+            root_token,
+            encoder_summary,
+            last_decoder_hidden,
+            sam,
+            null,
+            out_tree,
+        );
+    }
+
+    /// Grammar-aware `D10` tree proposer (`C22`, zero heap alloc): when `grammar`
+    /// is non-null and active, truncates L1 chains to valid prefixes and masks
+    /// `slot_logits` at every parent frontier node using `GrammarState` bitmasks
+    /// so every drafted branch satisfies strict JSON schemas without collapsing depth.
+    pub fn proposeIntoConstrained(
+        self: *DSparkProposer,
+        comptime max_nodes: u16,
+        root_token: u32,
+        encoder_summary: ?[]const f32,
+        last_decoder_hidden: []const f32,
+        sam: ?*const sam_mod.SuffixAutomaton,
+        grammar_opt: ?accept_mod.GrammarTreeAdapter,
+        out_tree: *tree_mod.DraftTree(max_nodes),
+    ) Error!ProposeResult {
         out_tree.reset(root_token);
 
         const node_limit: u16 = @min(@as(u16, self.config.max_tree_nodes), max_nodes);
+        const gram_active = if (grammar_opt) |ga| ga.isActive() else false;
+        var node_states: [tree_mod.MAX_SUPPORTED_NODES]grammar_mod.GrammarState = undefined;
+        var node_valid: [tree_mod.MAX_SUPPORTED_NODES]bool = @splat(false);
+        node_valid[0] = true;
+        if (grammar_opt) |ga| {
+            if (ga.isActive()) node_states[0] = ga.state.snapshot();
+        }
 
-        // 1. Optional L1 SAM prefix seed / branch merge (ADR-0005).
+        // 1. Optional L1 SAM prefix seed / branch merge (ADR-0005), pruned to grammar-valid prefix.
         var l1_match_len: u32 = 0;
         var l1_inserted: u16 = 0;
         var l1_is_seed: bool = false;
@@ -512,17 +546,40 @@ pub const DSparkProposer = struct {
             );
             if (max_l1 > 0) {
                 const q = automaton.queryActive(max_l1, self.workspace.l1_draft_buf[0..max_l1]);
-                l1_match_len = q.match_len;
-                if (q.draft_len > 0) {
+                var valid_len: usize = q.draft_len;
+                if (gram_active) {
+                    const ga = grammar_opt.?;
+                    var st_walk = node_states[0].snapshot();
+                    valid_len = 0;
+                    for (self.workspace.l1_draft_buf[0..q.draft_len]) |tid| {
+                        if (!ga.advanceTokenOnState(&st_walk, tid)) break;
+                        valid_len += 1;
+                    }
+                }
+                l1_match_len = if (valid_len == q.draft_len) q.match_len else @intCast(@min(q.match_len, valid_len));
+                if (valid_len > 0) {
                     const ins = out_tree.insertL1Continuation(
-                        q.match_len,
-                        self.workspace.l1_draft_buf[0..q.draft_len],
+                        @intCast(@max(@as(u32, 1), l1_match_len)),
+                        self.workspace.l1_draft_buf[0..valid_len],
                         self.config.l1_seed_step_prob,
                         self.config.l1_branch_step_prob,
                     );
                     l1_inserted = ins.inserted_count;
                     l1_is_seed = ins.is_seed;
                     seed_tail_node = ins.seed_tail_node;
+                    if (gram_active) {
+                        const ga = grammar_opt.?;
+                        for (1..out_tree.count) |ni| {
+                            const nd = out_tree.nodes[ni];
+                            if (node_valid[nd.parent]) {
+                                var cs = node_states[nd.parent].snapshot();
+                                if (ga.advanceTokenOnState(&cs, nd.token_id)) {
+                                    node_states[ni] = cs;
+                                    node_valid[ni] = true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -541,11 +598,16 @@ pub const DSparkProposer = struct {
 
         const w: u8 = self.config.block_width;
         const k: usize = self.config.top_k_per_pos;
+        const v: usize = self.config.vocab_size;
+        const inv_temp: f32 = 1.0 / self.config.temperature;
+        var masked_toks: [MAX_TOP_K_PER_POS]u32 = undefined;
+        var masked_probs: [MAX_TOP_K_PER_POS]f32 = undefined;
 
         for (0..w) |pos_usize| {
             const pos: u8 = @intCast(pos_usize);
             const pos_tokens = self.workspace.slotTokens(pos);
             const pos_probs = self.workspace.slotProbs(pos);
+            const pos_logits = self.workspace.slot_logits[@as(usize, pos) * v ..][0..v];
 
             // Sort current frontier deterministically by descending `cum_prob`,
             // breaking ties by ascending node index so highest-value paths always
@@ -554,9 +616,33 @@ pub const DSparkProposer = struct {
 
             var next_len: usize = 0;
             for (frontier_cur[0..cur_len]) |parent| {
-                for (0..k) |ki| {
-                    const tok = pos_tokens[ki];
-                    const prob = pos_probs[ki];
+                if (gram_active and !node_valid[parent]) continue;
+                var cand_count: usize = k;
+                var cand_toks: []const u32 = pos_tokens;
+                var cand_probs: []const f32 = pos_probs;
+                if (gram_active) {
+                    var parent_ga = grammar_opt.?;
+                    var pstate = node_states[parent].snapshot();
+                    parent_ga.state = &pstate;
+                    const mask = parent_ga.fillBitmask(v) catch return error.InvalidLogits;
+                    cand_count = try extractDeterministicTopKMasked(
+                        pos_logits,
+                        inv_temp,
+                        mask,
+                        masked_toks[0..k],
+                        masked_probs[0..k],
+                    );
+                    cand_toks = masked_toks[0..cand_count];
+                    cand_probs = masked_probs[0..cand_count];
+                }
+                for (0..cand_count) |ki| {
+                    const tok = cand_toks[ki];
+                    const prob = cand_probs[ki];
+                    var child_state: grammar_mod.GrammarState = undefined;
+                    if (gram_active) {
+                        child_state = node_states[parent].snapshot();
+                        if (!grammar_opt.?.advanceTokenOnState(&child_state, tok)) continue;
+                    }
                     const child = if (out_tree.findChild(parent, tok)) |existing| blk: {
                         // Deduplicate against L1 / prior branch without exceeding node_limit.
                         break :blk out_tree.insertChild(parent, tok, prob, .l2) orelse existing;
@@ -566,6 +652,10 @@ pub const DSparkProposer = struct {
                     };
 
                     if (child) |c_idx| {
+                        if (gram_active) {
+                            node_states[c_idx] = child_state;
+                            node_valid[c_idx] = true;
+                        }
                         if (next_len < tree_mod.MAX_SUPPORTED_NODES and
                             !containsNode(frontier_next[0..next_len], c_idx))
                         {
@@ -583,15 +673,33 @@ pub const DSparkProposer = struct {
 
         // 4. Dual-source ADR-0005 seed continuation: if L1 produced a high-confidence
         //    seed chain and capacity remains, extend `seed_tail_node` with DSpark's
-        //    top-1 parallel chain.
-        if (l1_is_seed and seed_tail_node != 0 and out_tree.count < node_limit) {
+        //    top-1 parallel chain (grammar-masked when C22 is active).
+        if (l1_is_seed and seed_tail_node != 0 and out_tree.count < node_limit and (!gram_active or node_valid[seed_tail_node])) {
             var tail: u16 = seed_tail_node;
             for (0..w) |pos_usize| {
                 if (out_tree.count >= node_limit) break;
                 const pos: u8 = @intCast(pos_usize);
-                const tok = self.workspace.slotTokens(pos)[0];
-                const prob = self.workspace.slotProbs(pos)[0];
+                var tok = self.workspace.slotTokens(pos)[0];
+                var prob = self.workspace.slotProbs(pos)[0];
+                var next_st: grammar_mod.GrammarState = undefined;
+                if (gram_active) {
+                    var tail_ga = grammar_opt.?;
+                    var tstate = node_states[tail].snapshot();
+                    tail_ga.state = &tstate;
+                    const mask = tail_ga.fillBitmask(v) catch break;
+                    const pos_logits = self.workspace.slot_logits[@as(usize, pos) * v ..][0..v];
+                    const got = extractDeterministicTopKMasked(pos_logits, inv_temp, mask, masked_toks[0..1], masked_probs[0..1]) catch break;
+                    if (got == 0) break;
+                    tok = masked_toks[0];
+                    prob = masked_probs[0];
+                    next_st = node_states[tail].snapshot();
+                    if (!grammar_opt.?.advanceTokenOnState(&next_st, tok)) break;
+                }
                 const next = out_tree.insertChild(tail, tok, prob, .l2) orelse break;
+                if (gram_active) {
+                    node_states[next] = next_st;
+                    node_valid[next] = true;
+                }
                 tail = next;
             }
         }
@@ -733,22 +841,44 @@ fn extractDeterministicTopK(
     out_tokens: []u32,
     out_probs: []f32,
 ) Error!void {
+    const got = try extractDeterministicTopKMasked(logits, inv_temp, null, out_tokens, out_probs);
+    if (got < out_tokens.len) return error.InvalidLogits;
+}
+
+fn extractDeterministicTopKMasked(
+    logits: []const f32,
+    inv_temp: f32,
+    allowed_mask: ?[]const u32,
+    out_tokens: []u32,
+    out_probs: []f32,
+) Error!usize {
     const k = out_tokens.len;
     std.debug.assert(k > 0 and k <= MAX_TOP_K_PER_POS and k <= logits.len);
     std.debug.assert(out_probs.len == k);
 
     var max_val: f32 = -std.math.inf(f32);
-    for (logits) |val| {
+    var allowed_count: usize = 0;
+    for (logits, 0..) |val, idx| {
         if (!std.math.isFinite(val)) return error.InvalidLogits;
+        if (allowed_mask) |mask| {
+            const word = mask[idx >> 5];
+            if ((word & (@as(u32, 1) << @as(u5, @intCast(idx & 31)))) == 0) continue;
+        }
+        allowed_count += 1;
         const scaled = val * inv_temp;
         if (scaled > max_val) max_val = scaled;
     }
+    if (allowed_count == 0) return 0;
 
     var top_vals: [MAX_TOP_K_PER_POS]f32 = @splat(-std.math.inf(f32));
     var top_ids: [MAX_TOP_K_PER_POS]u32 = @splat(std.math.maxInt(u32));
     var denom: f64 = 0.0;
 
     for (logits, 0..) |val, idx| {
+        if (allowed_mask) |mask| {
+            const word = mask[idx >> 5];
+            if ((word & (@as(u32, 1) << @as(u5, @intCast(idx & 31)))) == 0) continue;
+        }
         const tok_id: u32 = @intCast(idx);
         const scaled = val * inv_temp;
         denom += @exp(@as(f64, scaled - max_val));
@@ -774,10 +904,12 @@ fn extractDeterministicTopK(
     }
 
     if (!(denom > 0.0) or !std.math.isFinite(denom)) return error.InvalidLogits;
-    for (0..k) |i| {
+    const take: usize = @min(k, allowed_count);
+    for (0..take) |i| {
         out_tokens[i] = top_ids[i];
         out_probs[i] = @floatCast(@exp(@as(f64, top_vals[i] - max_val)) / denom);
     }
+    return take;
 }
 
 // ============================================================================
@@ -822,8 +954,6 @@ fn verifyTreeInvariants(comptime max_nodes: u16, t: *const tree_mod.DraftTree(ma
 }
 
 test "D10 DSpark zero-alloc WiredArena workspace, encoder conditioning, valid G5 masks and D9 greedy verify" {
-    const accept_mod = @import("accept.zig");
-
     const h: u32 = 8;
     const v: u32 = 16;
     const w: u8 = 4;

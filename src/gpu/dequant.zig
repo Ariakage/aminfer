@@ -136,6 +136,7 @@ pub const CanaryResult = struct {
     max_abs_err_f16: f32,
     max_abs_err_bf16: f32,
     max_abs_err_q4: f32,
+    g18_max_abs_err: f32 = 0.0,
     nax_tested: bool = false,
     nax_demoted: bool = false,
     active_backend: PrefillMatmulBackend = .simdgroup_apple9,
@@ -235,6 +236,27 @@ pub fn verifyCanarySlices(
         .max_abs_err_bf16 = max_bf16,
         .max_abs_err_q4 = max_q4,
     };
+}
+
+/// Verifies one `f16` slice against an `fp32` reference for finiteness and
+/// `max_abs_err <= tol` (`ADR-0020` / `ADR-0023` M7.8 G16 startup canary).
+pub fn verifyCanaryPair(
+    got: []const f16,
+    ref: []const f32,
+    tol: f32,
+) error{MetallibNumericalCanaryFailed}!f32 {
+    if (got.len == 0 or got.len != ref.len) return error.MetallibNumericalCanaryFailed;
+    var max_err: f32 = 0.0;
+    for (got, ref) |g_h, r| {
+        const g: f32 = @floatCast(g_h);
+        if (std.math.isNan(g) or std.math.isInf(g) or std.math.isNan(r) or std.math.isInf(r)) {
+            return error.MetallibNumericalCanaryFailed;
+        }
+        const err = @abs(g - r);
+        if (err > tol) return error.MetallibNumericalCanaryFailed;
+        if (err > max_err) max_err = err;
+    }
+    return max_err;
 }
 
 /// Uniform payload matching `struct DequantParams` in `dequant_gemm.metal`.
@@ -342,6 +364,16 @@ pub fn isFusableLinearDType(dtype: amf.DType) bool {
     return switch (dtype) {
         .f16, .bf16, .q4_affine, .q3_affine, .q2_affine => true,
         else => false,
+    };
+}
+
+pub fn weightDTypeToAmf(dtype: quant.WeightDType) amf.DType {
+    return switch (dtype) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .q4_affine => .q4_affine,
+        .q3_affine => .q3_affine,
+        .q2_affine => .q2_affine,
     };
 }
 
@@ -1916,66 +1948,87 @@ pub const DequantPipelines = struct {
         return res;
     }
 
-    /// Runs the startup numerical canary reusing an existing `metal.Compute`
-    /// context and a caller-supplied, already-resident `16 KiB`-aligned wired
-    /// slice (minimum 16 KiB). Zero heap allocations.
-    pub fn runStartupNumericalCanaryInBuffer(
+    pub const COMBINED_CANARY_TAIL_OFFSET: usize = 13568;
+
+    const canary_cm: usize = 16;
+    const canary_cn: usize = 16;
+    const canary_ck: usize = 64;
+    const canary_x_off: usize = 0; // 16 * 64 * 2 = 2048 B
+    const canary_w_f16_off: usize = 2048; // 2048 B
+    const canary_w_bf16_off: usize = 4096; // 2048 B
+    const canary_w_q4_off: usize = 6144; // 16 * 32 = 512 B
+    const canary_sb_q4_off: usize = 6656; // 16 * 4 = 64 B
+    const canary_y_f16_off: usize = 6720; // 16 * 16 * 2 = 512 B
+    const canary_y_bf16_off: usize = 7232; // 512 B
+    const canary_y_q4_off: usize = 7744; // 512 B
+    const canary_y_f16_wide_off: usize = 8256; // 512 B
+    const canary_y_bf16_wide_off: usize = 8768; // 512 B
+    const canary_y_q4_wide_off: usize = 9280; // 512 B
+    const canary_y_f16_nax_off: usize = 9792; // 512 B
+    const canary_y_bf16_nax_off: usize = 10304; // 512 B
+    const canary_y_q4_nax_off: usize = 10816; // 512 B
+    // M7.8 G18 fused kernel startup canary slices (`11328..13504 <= COMBINED_CANARY_TAIL_OFFSET <= 16384 B`).
+    const canary_res_seed_off: usize = 11328; // 16 * 16 * 2 = 512 B
+    const canary_y_res_q4_wide_off: usize = 11840; // 512 B
+    const canary_y_res_f16_gemv_off: usize = 12352; // 32 B padded to 64 B
+    const canary_y_res_q4_gemv_off: usize = 12416; // 32 B padded to 64 B
+    const canary_y_fqkv_gemv_q_off: usize = 12480; // 1 * 8 * 2 -> 64 B
+    const canary_y_fqkv_gemv_k_off: usize = 12544; // 1 * 4 * 2 -> 64 B
+    const canary_y_fqkv_gemv_v_off: usize = 12608; // 1 * 4 * 2 -> 64 B
+    const canary_y_fqkv_gemm_q_off: usize = 12672; // 16 * 8 * 2 = 256 B
+    const canary_y_fqkv_gemm_k_off: usize = 12928; // 16 * 4 * 2 = 128 B
+    const canary_y_fqkv_gemm_v_off: usize = 13056; // 16 * 4 * 2 = 128 B
+    const canary_y_swiglu_gemv_off: usize = 13184; // 1 * 8 * 2 -> 64 B
+    const canary_y_swiglu_gemm_off: usize = 13248; // 16 * 8 * 2 = 256 B
+    const canary_g18_end: usize = canary_y_swiglu_gemm_off + 256;
+
+    comptime {
+        std.debug.assert(canary_y_q4_nax_off + 512 <= page.APPLE_PAGE_SIZE);
+        std.debug.assert(canary_g18_end <= COMBINED_CANARY_TAIL_OFFSET);
+        std.debug.assert(COMBINED_CANARY_TAIL_OFFSET <= page.APPLE_PAGE_SIZE);
+    }
+
+    pub const StartupCanaryState = struct {
+        run_real_nax: bool = false,
+        run_simulated_nax_fail: bool = false,
+        ref_f16: [canary_cm * canary_cn]f32 = undefined,
+        ref_bf16: [canary_cm * canary_cn]f32 = undefined,
+        ref_q4: [canary_cm * canary_cn]f32 = undefined,
+        ref_res_q4: [canary_cm * canary_cn]f32 = undefined,
+        ref_res_f16_gemv: [canary_cn]f32 = undefined,
+        ref_fqkv_q: [canary_cm * 8]f32 = undefined,
+        ref_fqkv_k: [canary_cm * 4]f32 = undefined,
+        ref_fqkv_v: [canary_cm * 4]f32 = undefined,
+        ref_swiglu: [canary_cm * 8]f32 = undefined,
+    };
+
+    /// Populates deterministic `f16`/`bf16`/`q4`/`G18` canary inputs and CPU
+    /// fp32 reference buffers inside `wired_bytes[0..canary_g18_end]`.
+    pub fn prepareStartupNumericalCanary(
         self: *const DequantPipelines,
-        compute: *metal.Compute,
-        gpu_buf: metal.Buffer,
         wired_bytes: []align(page.APPLE_PAGE_SIZE) u8,
-    ) CanaryError!CanaryResult {
+        state: *StartupCanaryState,
+    ) CanaryError!void {
         if (wired_bytes.len < page.APPLE_PAGE_SIZE) return error.InvalidArgument;
 
-        const cm: usize = 16;
-        const cn: usize = 16;
-        const ck: usize = 64;
+        const cm = canary_cm;
+        const cn = canary_cn;
+        const ck = canary_ck;
         const OpsQ4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
 
-        const x_off: usize = 0; // 16 * 64 * 2 = 2048 B
-        const w_f16_off: usize = 2048; // 2048 B
-        const w_bf16_off: usize = 4096; // 2048 B
-        const w_q4_off: usize = 6144; // 16 * 32 = 512 B
-        const sb_q4_off: usize = 6656; // 16 * 4 = 64 B
-        const y_f16_off: usize = 6720; // 16 * 16 * 2 = 512 B
-        const y_bf16_off: usize = 7232; // 512 B
-        const y_q4_off: usize = 7744; // 512 B
-        const y_f16_wide_off: usize = 8256; // 512 B
-        const y_bf16_wide_off: usize = 8768; // 512 B
-        const y_q4_wide_off: usize = 9280; // 512 B
-        const y_f16_nax_off: usize = 9792; // 512 B
-        const y_bf16_nax_off: usize = 10304; // 512 B
-        const y_q4_nax_off: usize = 10816; // 512 B
-        comptime {
-            std.debug.assert(y_q4_nax_off + 512 <= page.APPLE_PAGE_SIZE);
-        }
-
         const already_demoted = if (self.nax_state) |st| st.isCanaryDemoted() else false;
-        const run_real_nax = self.nax_pipelines_compiled and self.activeBackend().isNax();
-        const run_simulated_nax_fail = self.simulate_nax_canary_failure and !already_demoted;
-        const clear_end: usize = if (run_real_nax) y_q4_nax_off + 512 else y_q4_wide_off + 512;
+        state.run_real_nax = self.nax_pipelines_compiled and self.activeBackend().isNax();
+        state.run_simulated_nax_fail = self.simulate_nax_canary_failure and !already_demoted;
 
-        @memset(wired_bytes[0..clear_end], 0);
+        @memset(wired_bytes[0..canary_g18_end], 0);
 
-        const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[x_off .. x_off + cm * ck * 2]));
-        const w_f16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, wired_bytes[w_f16_off .. w_f16_off + cn * ck * 2]));
-        const w_bf16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, wired_bytes[w_bf16_off .. w_bf16_off + cn * ck * 2]));
-        const w_q4: []u8 = wired_bytes[w_q4_off .. w_q4_off + cn * 32];
-        const sb_q4: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, wired_bytes[sb_q4_off .. sb_q4_off + cn * 4]));
+        const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_x_off .. canary_x_off + cm * ck * 2]));
+        const w_f16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, wired_bytes[canary_w_f16_off .. canary_w_f16_off + cn * ck * 2]));
+        const w_bf16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, wired_bytes[canary_w_bf16_off .. canary_w_bf16_off + cn * ck * 2]));
+        const w_q4: []u8 = wired_bytes[canary_w_q4_off .. canary_w_q4_off + cn * 32];
+        const sb_q4: []quant.ScaleBias = @alignCast(std.mem.bytesAsSlice(quant.ScaleBias, wired_bytes[canary_sb_q4_off .. canary_sb_q4_off + cn * 4]));
+        const res_seed: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_res_seed_off .. canary_res_seed_off + cm * cn * 2]));
 
-        const y_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_f16_off .. y_f16_off + cm * cn * 2]));
-        const y_bf16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_bf16_off .. y_bf16_off + cm * cn * 2]));
-        const y_q4: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_q4_off .. y_q4_off + cm * cn * 2]));
-        const y_f16_wide: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_f16_wide_off .. y_f16_wide_off + cm * cn * 2]));
-        const y_bf16_wide: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_bf16_wide_off .. y_bf16_wide_off + cm * cn * 2]));
-        const y_q4_wide: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_q4_wide_off .. y_q4_wide_off + cm * cn * 2]));
-        const y_f16_nax: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_f16_nax_off .. y_f16_nax_off + cm * cn * 2]));
-        const y_bf16_nax: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_bf16_nax_off .. y_bf16_nax_off + cm * cn * 2]));
-        const y_q4_nax: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[y_q4_nax_off .. y_q4_nax_off + cm * cn * 2]));
-
-        // Populate deterministic signed fractional inputs/weights exercising
-        // f16, bf16 exponent+mantissa paths (including column-0 > f16 max paired
-        // with 2^-14 activation), and q4_affine group-64 packing.
         for (0..cm) |mi| {
             for (0..ck) |ki| {
                 const idx = mi * ck + ki;
@@ -2013,122 +2066,263 @@ pub const DequantPipelines = struct {
             sb_q4[ni] = .{ .scale = @floatCast(sc), .bias = @floatCast(bi) };
         }
 
-        var ref_f16: [cm * cn]f32 = undefined;
-        var ref_bf16: [cm * cn]f32 = undefined;
-        var ref_q4: [cm * cn]f32 = undefined;
-        try quant.denseGemmCpuRef(.f16, x_f16, w_f16, &ref_f16, cm, cn, ck);
-        try quant.denseGemmCpuRef(.bf16, x_f16, w_bf16, &ref_bf16, cm, cn, ck);
-        try OpsQ4.matmulRef(x_f16, w_q4, sb_q4, &ref_q4, cm, cn, ck);
+        try quant.denseGemmCpuRef(.f16, x_f16, w_f16, &state.ref_f16, cm, cn, ck);
+        try quant.denseGemmCpuRef(.bf16, x_f16, w_bf16, &state.ref_bf16, cm, cn, ck);
+        try OpsQ4.matmulRef(x_f16, w_q4, sb_q4, &state.ref_q4, cm, cn, ck);
 
-        const x_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = x_off };
-        const w_f16_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = w_f16_off };
-        const w_bf16_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = w_bf16_off };
-        const w_q4_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = w_q4_off };
-        const sb_q4_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = sb_q4_off };
+        for (0..cm) |mi| {
+            for (0..cn) |ni| {
+                const idx = mi * cn + ni;
+                const rs: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((idx * 7 + 3) % 13)) - 6)) * 0.0625);
+                res_seed[idx] = rs;
+                const rsf: f32 = @floatCast(rs);
+                state.ref_res_q4[idx] = state.ref_q4[idx] + rsf;
+                if (mi == 0) state.ref_res_f16_gemv[ni] = state.ref_f16[ni] + rsf;
+            }
+            for (0..8) |ni| {
+                const g = state.ref_q4[mi * cn + ni];
+                const u = state.ref_q4[mi * cn + 8 + ni];
+                const silu_g = g / (1.0 + @exp(-g));
+                state.ref_fqkv_q[mi * 8 + ni] = g;
+                state.ref_swiglu[mi * 8 + ni] = silu_g * u;
+            }
+            for (0..4) |ni| {
+                state.ref_fqkv_k[mi * 4 + ni] = state.ref_q4[mi * cn + 8 + ni];
+                state.ref_fqkv_v[mi * 4 + ni] = state.ref_q4[mi * cn + 12 + ni];
+            }
+        }
+    }
 
-        const t0 = try vmstat.nowNs();
-        var frame = try compute.beginFrame(5000);
-        errdefer frame.abort();
+    /// Encodes all G16 + M7.8 G18 dequant/fused kernel canary dispatches into
+    /// `frame` with zero intra-frame barriers.
+    pub fn encodeStartupNumericalCanary(
+        self: *const DequantPipelines,
+        frame: *metal.Compute.Frame,
+        gpu_buf: metal.Buffer,
+        state: *const StartupCanaryState,
+    ) CanaryError!void {
+        const cm = canary_cm;
+        const cn = canary_cn;
+        const ck = canary_ck;
 
-        // Dispatch NAX (when compiled on Apple10+) plus all 6 verified Apple9
-        // simdgroup micro-checks in ONE single Metal 4 command buffer with zero
-        // intra-buffer barriers (read-only inputs, disjoint outputs).
-        if (run_real_nax) {
-            try self.encodeNaxDenseGemm(&frame, .f16, .{
+        const x_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_x_off };
+        const w_f16_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_w_f16_off };
+        const w_bf16_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_w_bf16_off };
+        const w_q4_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_w_q4_off };
+        const sb_q4_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_sb_q4_off };
+        const res_seed_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_res_seed_off };
+        const w_q4_k_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_w_q4_off + 8 * 32 };
+        const sb_q4_k_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_sb_q4_off + 8 * 4 };
+        const w_q4_v_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_w_q4_off + 12 * 32 };
+        const sb_q4_v_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = canary_sb_q4_off + 12 * 4 };
+
+        if (state.run_real_nax) {
+            try self.encodeNaxDenseGemm(frame, .f16, .{
                 .x = x_b,
                 .weight = w_f16_b,
-                .y = .{ .buffer = gpu_buf, .offset = y_f16_nax_off },
+                .y = .{ .buffer = gpu_buf, .offset = canary_y_f16_nax_off },
                 .m = cm,
                 .n = cn,
                 .k = ck,
             }, false);
-            try self.encodeNaxDenseGemm(&frame, .bf16, .{
+            try self.encodeNaxDenseGemm(frame, .bf16, .{
                 .x = x_b,
                 .weight = w_bf16_b,
-                .y = .{ .buffer = gpu_buf, .offset = y_bf16_nax_off },
+                .y = .{ .buffer = gpu_buf, .offset = canary_y_bf16_nax_off },
                 .m = cm,
                 .n = cn,
                 .k = ck,
             }, false);
-            try self.encodeNaxGemm(&frame, .q4, .{
+            try self.encodeNaxGemm(frame, .q4, .{
                 .x = x_b,
                 .qweight = w_q4_b,
                 .scale_bias = sb_q4_b,
-                .y = .{ .buffer = gpu_buf, .offset = y_q4_nax_off },
+                .y = .{ .buffer = gpu_buf, .offset = canary_y_q4_nax_off },
                 .m = cm,
                 .n = cn,
                 .k = ck,
             }, false);
         }
 
-        try self.encodeDenseGemm32(&frame, .f16, .{
+        try self.encodeDenseGemm32(frame, .f16, .{
             .x = x_b,
             .weight = w_f16_b,
-            .y = .{ .buffer = gpu_buf, .offset = y_f16_off },
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_f16_off },
             .m = cm,
             .n = cn,
             .k = ck,
         }, false);
-        try self.encodeDenseGemm32(&frame, .bf16, .{
+        try self.encodeDenseGemm32(frame, .bf16, .{
             .x = x_b,
             .weight = w_bf16_b,
-            .y = .{ .buffer = gpu_buf, .offset = y_bf16_off },
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_bf16_off },
             .m = cm,
             .n = cn,
             .k = ck,
         }, false);
-        try self.encodeGemm32(&frame, .q4, .{
+        try self.encodeGemm32(frame, .q4, .{
             .x = x_b,
             .qweight = w_q4_b,
             .scale_bias = sb_q4_b,
-            .y = .{ .buffer = gpu_buf, .offset = y_q4_off },
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_q4_off },
             .m = cm,
             .n = cn,
             .k = ck,
         }, false);
-        try self.encodeWideSimdgroupDenseGemm(&frame, .f16, .{
+        try self.encodeWideSimdgroupDenseGemm(frame, .f16, .{
             .x = x_b,
             .weight = w_f16_b,
-            .y = .{ .buffer = gpu_buf, .offset = y_f16_wide_off },
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_f16_wide_off },
             .m = cm,
             .n = cn,
             .k = ck,
         }, false);
-        try self.encodeWideSimdgroupDenseGemm(&frame, .bf16, .{
+        try self.encodeWideSimdgroupDenseGemm(frame, .bf16, .{
             .x = x_b,
             .weight = w_bf16_b,
-            .y = .{ .buffer = gpu_buf, .offset = y_bf16_wide_off },
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_bf16_wide_off },
             .m = cm,
             .n = cn,
             .k = ck,
         }, false);
-        try self.encodeWideSimdgroupGemm(&frame, .q4, .{
+        try self.encodeWideSimdgroupGemm(frame, .q4, .{
             .x = x_b,
             .qweight = w_q4_b,
             .scale_bias = sb_q4_b,
-            .y = .{ .buffer = gpu_buf, .offset = y_q4_wide_off },
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_q4_wide_off },
             .m = cm,
             .n = cn,
             .k = ck,
         }, false);
 
-        const sig = try frame.commit();
-        try compute.wait(sig, 5000);
-        const t1 = try vmstat.nowNs();
+        try self.encodeWideSimdgroupGemm(frame, .q4, .{
+            .x = x_b,
+            .qweight = w_q4_b,
+            .scale_bias = sb_q4_b,
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_res_q4_wide_off },
+            .residual = res_seed_b,
+            .m = cm,
+            .n = cn,
+            .k = ck,
+        }, false);
+        try self.encodeDenseGemv(frame, .f16, .{
+            .x = x_b,
+            .weight = w_f16_b,
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_res_f16_gemv_off },
+            .residual = res_seed_b,
+            .n = cn,
+            .k = ck,
+        }, false);
+        try self.encodeGemv(frame, .q4, .{
+            .x = x_b,
+            .qweight = w_q4_b,
+            .scale_bias = sb_q4_b,
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_res_q4_gemv_off },
+            .residual = res_seed_b,
+            .n = cn,
+            .k = ck,
+        }, false);
+        _ = self.encodeFusedQkvGemv(frame, .{
+            .x = x_b,
+            .q = .{ .dtype = .q4_affine, .weight = w_q4_b, .scale_bias = sb_q4_b, .y = .{ .buffer = gpu_buf, .offset = canary_y_fqkv_gemv_q_off }, .n = 8 },
+            .k_proj = .{ .dtype = .q4_affine, .weight = w_q4_k_b, .scale_bias = sb_q4_k_b, .y = .{ .buffer = gpu_buf, .offset = canary_y_fqkv_gemv_k_off }, .n = 4 },
+            .v = .{ .dtype = .q4_affine, .weight = w_q4_v_b, .scale_bias = sb_q4_v_b, .y = .{ .buffer = gpu_buf, .offset = canary_y_fqkv_gemv_v_off }, .n = 4 },
+            .k = ck,
+            .allow_unfused_fallback = false,
+        }, false) catch |err| switch (err) {
+            error.HeterogeneousDType, error.UnsupportedDType => return error.MetallibNumericalCanaryFailed,
+            else => |e| return e,
+        };
+        _ = self.encodeFusedQkvGemm(frame, .{
+            .x = x_b,
+            .q = .{ .dtype = .q4_affine, .weight = w_q4_b, .scale_bias = sb_q4_b, .y = .{ .buffer = gpu_buf, .offset = canary_y_fqkv_gemm_q_off }, .n = 8 },
+            .k_proj = .{ .dtype = .q4_affine, .weight = w_q4_k_b, .scale_bias = sb_q4_k_b, .y = .{ .buffer = gpu_buf, .offset = canary_y_fqkv_gemm_k_off }, .n = 4 },
+            .v = .{ .dtype = .q4_affine, .weight = w_q4_v_b, .scale_bias = sb_q4_v_b, .y = .{ .buffer = gpu_buf, .offset = canary_y_fqkv_gemm_v_off }, .n = 4 },
+            .m = cm,
+            .k = ck,
+            .allow_unfused_fallback = false,
+        }, false) catch |err| switch (err) {
+            error.HeterogeneousDType, error.UnsupportedDType => return error.MetallibNumericalCanaryFailed,
+            else => |e| return e,
+        };
+        self.encodeDenseGateUpSwiglu(frame, .{
+            .x = x_b,
+            .gate_dtype = .q4_affine,
+            .w_gate = w_q4_b,
+            .sb_gate = sb_q4_b,
+            .up_dtype = .q4_affine,
+            .w_up = w_q4_k_b,
+            .sb_up = sb_q4_k_b,
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_swiglu_gemv_off },
+            .m = 1,
+            .n = 8,
+            .k = ck,
+        }, false) catch |err| switch (err) {
+            error.HeterogeneousDType, error.UnsupportedDType => return error.MetallibNumericalCanaryFailed,
+            else => |e| return e,
+        };
+        self.encodeDenseGateUpSwiglu(frame, .{
+            .x = x_b,
+            .gate_dtype = .q4_affine,
+            .w_gate = w_q4_b,
+            .sb_gate = sb_q4_b,
+            .up_dtype = .q4_affine,
+            .w_up = w_q4_k_b,
+            .sb_up = sb_q4_k_b,
+            .y = .{ .buffer = gpu_buf, .offset = canary_y_swiglu_gemm_off },
+            .m = cm,
+            .n = 8,
+            .k = ck,
+        }, false) catch |err| switch (err) {
+            error.HeterogeneousDType, error.UnsupportedDType => return error.MetallibNumericalCanaryFailed,
+            else => |e| return e,
+        };
+    }
 
-        // 1. Validate NAX first when active or under test failure injection (`G16` + `G17`).
+    /// Validates completed GPU canary outputs in `wired_bytes` against `state`.
+    pub fn verifyStartupNumericalCanary(
+        self: *const DequantPipelines,
+        wired_bytes: []align(page.APPLE_PAGE_SIZE) const u8,
+        state: *const StartupCanaryState,
+        elapsed_us: f64,
+    ) CanaryError!CanaryResult {
+        const cm = canary_cm;
+        const cn = canary_cn;
+
+        const y_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_f16_off .. canary_y_f16_off + cm * cn * 2]));
+        const y_bf16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_bf16_off .. canary_y_bf16_off + cm * cn * 2]));
+        const y_q4: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_q4_off .. canary_y_q4_off + cm * cn * 2]));
+        const y_f16_wide: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_f16_wide_off .. canary_y_f16_wide_off + cm * cn * 2]));
+        const y_bf16_wide: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_bf16_wide_off .. canary_y_bf16_wide_off + cm * cn * 2]));
+        const y_q4_wide: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_q4_wide_off .. canary_y_q4_wide_off + cm * cn * 2]));
+        const y_f16_nax: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_f16_nax_off .. canary_y_f16_nax_off + cm * cn * 2]));
+        const y_bf16_nax: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_bf16_nax_off .. canary_y_bf16_nax_off + cm * cn * 2]));
+        const y_q4_nax: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_q4_nax_off .. canary_y_q4_nax_off + cm * cn * 2]));
+
+        const y_res_q4_wide: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_res_q4_wide_off .. canary_y_res_q4_wide_off + cm * cn * 2]));
+        const y_res_f16_gemv: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_res_f16_gemv_off .. canary_y_res_f16_gemv_off + cn * 2]));
+        const y_res_q4_gemv: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_res_q4_gemv_off .. canary_y_res_q4_gemv_off + cn * 2]));
+        const y_fqkv_gemv_q: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_fqkv_gemv_q_off .. canary_y_fqkv_gemv_q_off + 8 * 2]));
+        const y_fqkv_gemv_k: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_fqkv_gemv_k_off .. canary_y_fqkv_gemv_k_off + 4 * 2]));
+        const y_fqkv_gemv_v: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_fqkv_gemv_v_off .. canary_y_fqkv_gemv_v_off + 4 * 2]));
+        const y_fqkv_gemm_q: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_fqkv_gemm_q_off .. canary_y_fqkv_gemm_q_off + cm * 8 * 2]));
+        const y_fqkv_gemm_k: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_fqkv_gemm_k_off .. canary_y_fqkv_gemm_k_off + cm * 4 * 2]));
+        const y_fqkv_gemm_v: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_fqkv_gemm_v_off .. canary_y_fqkv_gemm_v_off + cm * 4 * 2]));
+        const y_swiglu_gemv: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_swiglu_gemv_off .. canary_y_swiglu_gemv_off + 8 * 2]));
+        const y_swiglu_gemm: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[canary_y_swiglu_gemm_off .. canary_y_swiglu_gemm_off + cm * 8 * 2]));
+
         var nax_tested = false;
         var nax_demoted = false;
         var max_nax_f16: f32 = 0.0;
         var max_nax_bf16: f32 = 0.0;
         var max_nax_q4: f32 = 0.0;
 
-        if (run_real_nax or run_simulated_nax_fail) {
+        if (state.run_real_nax or state.run_simulated_nax_fail) {
             nax_tested = true;
-            const nax_ok: error{MetallibNumericalCanaryFailed}!CanarySliceErrors = if (run_simulated_nax_fail)
+            const nax_ok: error{MetallibNumericalCanaryFailed}!CanarySliceErrors = if (state.run_simulated_nax_fail)
                 error.MetallibNumericalCanaryFailed
             else
-                verifyCanarySlices(y_f16_nax, &ref_f16, y_bf16_nax, &ref_bf16, y_q4_nax, &ref_q4);
+                verifyCanarySlices(y_f16_nax, &state.ref_f16, y_bf16_nax, &state.ref_bf16, y_q4_nax, &state.ref_q4);
 
             if (nax_ok) |err_nax| {
                 max_nax_f16 = err_nax.max_abs_err_f16;
@@ -2143,20 +2337,56 @@ pub const DequantPipelines = struct {
             }
         }
 
-        // 2. Always verify the `simdgroup_apple9` baseline / fallback kernels pass.
-        const err32 = try verifyCanarySlices(y_f16, &ref_f16, y_bf16, &ref_bf16, y_q4, &ref_q4);
-        const err64 = try verifyCanarySlices(y_f16_wide, &ref_f16, y_bf16_wide, &ref_bf16, y_q4_wide, &ref_q4);
+        const err32 = try verifyCanarySlices(y_f16, &state.ref_f16, y_bf16, &state.ref_bf16, y_q4, &state.ref_q4);
+        const err64 = try verifyCanarySlices(y_f16_wide, &state.ref_f16, y_bf16_wide, &state.ref_bf16, y_q4_wide, &state.ref_q4);
+
+        var g18_err: f32 = 0.0;
+        g18_err = @max(g18_err, try verifyCanaryPair(y_res_q4_wide, &state.ref_res_q4, CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_res_f16_gemv, &state.ref_res_f16_gemv, CANARY_TOL_F16));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_res_q4_gemv, state.ref_res_q4[0..cn], CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_fqkv_gemv_q, state.ref_fqkv_q[0..8], CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_fqkv_gemv_k, state.ref_fqkv_k[0..4], CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_fqkv_gemv_v, state.ref_fqkv_v[0..4], CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_fqkv_gemm_q, &state.ref_fqkv_q, CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_fqkv_gemm_k, &state.ref_fqkv_k, CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_fqkv_gemm_v, &state.ref_fqkv_v, CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_swiglu_gemv, state.ref_swiglu[0..8], CANARY_TOL_Q4));
+        g18_err = @max(g18_err, try verifyCanaryPair(y_swiglu_gemm, &state.ref_swiglu, CANARY_TOL_Q4));
 
         return .{
-            .elapsed_us = @as(f64, @floatFromInt(t1 - t0)) / 1000.0,
+            .elapsed_us = elapsed_us,
             .max_abs_err_f16 = @max(@max(err32.max_abs_err_f16, err64.max_abs_err_f16), max_nax_f16),
             .max_abs_err_bf16 = @max(@max(err32.max_abs_err_bf16, err64.max_abs_err_bf16), max_nax_bf16),
             .max_abs_err_q4 = @max(@max(err32.max_abs_err_q4, err64.max_abs_err_q4), max_nax_q4),
+            .g18_max_abs_err = g18_err,
             .nax_tested = nax_tested,
             .nax_demoted = nax_demoted,
             .active_backend = self.activeBackend(),
             .nax_fallback_reason = self.naxFallbackReason(),
         };
+    }
+
+    /// Runs the startup numerical canary reusing an existing `metal.Compute`
+    /// context and a caller-supplied, already-resident `16 KiB`-aligned wired
+    /// slice (minimum 16 KiB). Zero heap allocations.
+    pub fn runStartupNumericalCanaryInBuffer(
+        self: *const DequantPipelines,
+        compute: *metal.Compute,
+        gpu_buf: metal.Buffer,
+        wired_bytes: []align(page.APPLE_PAGE_SIZE) u8,
+    ) CanaryError!CanaryResult {
+        var state: StartupCanaryState = .{};
+        try self.prepareStartupNumericalCanary(wired_bytes, &state);
+
+        const t0 = try vmstat.nowNs();
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try self.encodeStartupNumericalCanary(&frame, gpu_buf, &state);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+        const t1 = try vmstat.nowNs();
+
+        return self.verifyStartupNumericalCanary(wired_bytes, &state, @as(f64, @floatFromInt(t1 - t0)) / 1000.0);
     }
 };
 
@@ -2979,10 +3209,11 @@ test "G16: startup metallib numerical canary passes quickly and rejects NaN / co
         try std.testing.expect(r.max_abs_err_f16 <= CANARY_TOL_F16);
         try std.testing.expect(r.max_abs_err_bf16 <= CANARY_TOL_BF16);
         try std.testing.expect(r.max_abs_err_q4 <= CANARY_TOL_Q4);
+        try std.testing.expect(r.g18_max_abs_err <= CANARY_TOL_Q4);
     }
     const validation_on = (std.c.getenv("MTL_SHADER_VALIDATION") != null or std.c.getenv("MTL_DEBUG_LAYER") != null);
     if (!validation_on) {
-        try std.testing.expect(best_us < 500.0);
+        try std.testing.expect(best_us < 350.0);
     }
 
     // Explicit unit checks for verifyCanarySlices rejection of NaN, Inf, and bf16 corruption.

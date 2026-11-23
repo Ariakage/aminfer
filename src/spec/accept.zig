@@ -470,6 +470,8 @@ pub const GrammarTreeAdapter = struct {
     state: *grammar.GrammarState,
     vocab_index: ?*const grammar.VocabIndex = null,
     token_slices: ?[]const ?[]const u8 = null,
+    token_bytes_fn: ?*const fn (ctx: ?*const anyopaque, token_id: u32) ?[]const u8 = null,
+    token_bytes_ctx: ?*const anyopaque = null,
     eos_token_ids: []const u32 = &.{},
     mask_scratch: []u32 = &.{},
 
@@ -514,6 +516,11 @@ pub const GrammarTreeAdapter = struct {
         if (self.token_slices) |slices| {
             if (token_id >= slices.len) return false;
             const raw = slices[token_id] orelse return false;
+            if (raw.len == 0) return false;
+            return prog.advanceBytes(st, raw);
+        }
+        if (self.token_bytes_fn) |get_fn| {
+            const raw = get_fn(self.token_bytes_ctx, token_id) orelse return false;
             if (raw.len == 0) return false;
             return prog.advanceBytes(st, raw);
         }

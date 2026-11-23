@@ -26,6 +26,8 @@ const vision_mod = aminfer.vision;
 const attention = aminfer.attention;
 const moe = aminfer.moe;
 const rng_mod = aminfer.rng;
+const sampler_mod = aminfer.sampler;
+const sampling_mod = aminfer.sampling;
 
 // ---------------------------------------------------------------------------
 // Objective-C Runtime, CoreVideo & IOSurface C Declarations (macOS Frameworks)
@@ -782,6 +784,9 @@ pub const SdkEngine = struct {
     prompt_ids_scratch: []u32,
     rerank_buf: []u8,
     embed_accum_f32: []f32,
+    gpu_sampler: ?sampler_mod.GpuSampler = null,
+    gpu_sampler_disabled: bool = false,
+    penalty_entries: [sampler_mod.MAX_PENALTY_ENTRIES]sampling_mod.TokenFreqEntry = undefined,
 
     history_len: u32 = 0,
     has_step_state: bool = false,
@@ -816,6 +821,61 @@ pub const SdkEngine = struct {
             .qwen3 => |*m| m.device,
             .graph => |*m| m.device,
         };
+    }
+
+    fn metalLibrary(self: *const SdkEngine) metal.Library {
+        return switch (self.backend) {
+            .qwen3 => |*m| m.library,
+            .graph => |*m| m.library,
+        };
+    }
+
+    fn gpuCompute(self: *SdkEngine) *metal.Compute {
+        return switch (self.backend) {
+            .qwen3 => |*m| &m.compute,
+            .graph => |*m| &m.compute,
+        };
+    }
+
+    fn timeoutMs(self: *const SdkEngine) u64 {
+        return switch (self.backend) {
+            .qwen3 => |*m| m.timeout_ms,
+            .graph => |*m| m.timeout_ms,
+        };
+    }
+
+    fn lastLogitsBinding(self: *const SdkEngine) metal.BufferBinding {
+        return switch (self.backend) {
+            .qwen3 => |*m| m.lastLogitsBinding(),
+            .graph => |*m| m.lastLogitsBinding(),
+        };
+    }
+
+    fn ensureGpuSampler(self: *SdkEngine) ?*sampler_mod.GpuSampler {
+        if (self.gpu_sampler != null) return &self.gpu_sampler.?;
+        if (self.gpu_sampler_disabled or self.vocab_size == 0 or self.vocab_size > sampler_mod.MAX_VOCAB_SIZE) return null;
+        if (sampler_mod.GpuSampler.initStandalone(self.metalDevice(), self.metalLibrary(), .{
+            .max_vocab_size = self.vocab_size,
+            .max_batch_slots = 1,
+            .enable_bitmask = false,
+        })) |gs| {
+            var gs_mut = gs;
+            if (gs_mut.registerResident(self.gpuCompute().*)) {
+                self.gpu_sampler = gs_mut;
+                return &self.gpu_sampler.?;
+            } else |err| switch (err) {
+                else => {
+                    gs_mut.close();
+                    self.gpu_sampler_disabled = true;
+                    return null;
+                },
+            }
+        } else |err| switch (err) {
+            else => {
+                self.gpu_sampler_disabled = true;
+                return null;
+            },
+        }
     }
 
     fn resetKv(self: *SdkEngine) void {
@@ -857,6 +917,10 @@ pub const SdkEngine = struct {
     }
 
     fn destroy(self: *SdkEngine, allocator: std.mem.Allocator) void {
+        if (self.gpu_sampler) |*gs| {
+            gs.close();
+            self.gpu_sampler = null;
+        }
         if (self.owned_tokenizer) |t| {
             t.destroy(allocator);
             self.owned_tokenizer = null;
@@ -1844,25 +1908,79 @@ fn sampleNextToken(
     }
 
     const v: usize = eng.vocab_size;
-    const logits_f16 = eng.lastLogitsF16();
-    const probs = eng.sample_probs[0..v];
-    for (0..v) |i| probs[i] = @floatCast(logits_f16[i]);
-
+    var penalty_len: usize = 0;
+    var gpu_penalties_ok = true;
     if (any_penalty and eng.history_len > 0) {
         const hist = eng.history_ids[0..eng.history_len];
         for (hist) |tid| {
             if (tid < v) eng.token_counts[tid] += 1;
         }
-        defer for (hist) |tid| {
-            if (tid < v) eng.token_counts[tid] = 0;
-        };
-
         for (hist) |tid| {
             if (tid >= v) continue;
             const c = eng.token_counts[tid];
             if (c == 0) continue;
-            // Apply once per unique seen token ID by negating/marking via MSB? Even cleaner:
-            // clear count immediately after applying so duplicates in `hist` are O(1) skipped!
+            eng.token_counts[tid] = 0;
+            if (penalty_len < sampler_mod.MAX_PENALTY_ENTRIES) {
+                eng.penalty_entries[penalty_len] = .{ .token_id = tid, .count = c };
+                penalty_len += 1;
+            } else {
+                gpu_penalties_ok = false;
+            }
+        }
+    }
+
+    if (gpu_penalties_ok) {
+        if (eng.ensureGpuSampler()) |gs| {
+            const eff_temp: f32 = if (params.temperature > 0.0) params.temperature else 0.0;
+            const gpu_params: sampling_mod.SamplingParams = .{
+                .temperature = if (params.top_k == 1) 0.0 else eff_temp,
+                .top_p = if (params.top_p > 0.0 and params.top_p < 1.0) params.top_p else 1.0,
+                .top_k = params.top_k,
+                .min_p = if (params.min_p > 0.0 and params.min_p < 1.0) params.min_p else 0.0,
+                .presence_penalty = params.presence_penalty,
+                .frequency_penalty = params.frequency_penalty,
+                .repetition_penalty = if (params.repetition_penalty > 0.0) params.repetition_penalty else 1.0,
+            };
+            if (gs.sampleSync(eng.gpuCompute(), .{
+                .logits = eng.lastLogitsBinding(),
+                .logits_dtype = .f16,
+                .vocab_size = eng.vocab_size,
+                .params = gpu_params,
+                .seen_frequencies = if (penalty_len > 0) eng.penalty_entries[0..penalty_len] else null,
+                .rng_seed = req_rng.random().int(u64),
+            }, eng.timeoutMs())) |g_out| {
+                return g_out.token_id;
+            } else |err| switch (err) {
+                // Fall back to CPU constrained sampler cleanly when GPU sampling errors.
+                else => {},
+            }
+        }
+    }
+
+    const logits_f16 = eng.lastLogitsF16();
+    const probs = eng.sample_probs[0..v];
+    for (0..v) |i| probs[i] = @floatCast(logits_f16[i]);
+
+    for (eng.penalty_entries[0..penalty_len]) |entry| {
+        const tid = entry.token_id;
+        const c = entry.count;
+        var val = probs[tid];
+        if (has_rep) {
+            if (val > 0.0) val /= params.repetition_penalty else val *= params.repetition_penalty;
+        }
+        if (has_freq) val -= params.frequency_penalty * @as(f32, @floatFromInt(c));
+        if (has_pres) val -= params.presence_penalty;
+        probs[tid] = val;
+    }
+    if (!gpu_penalties_ok and any_penalty and eng.history_len > 0) {
+        const hist = eng.history_ids[0..eng.history_len];
+        for (hist) |tid| {
+            if (tid < v) eng.token_counts[tid] += 1;
+        }
+        for (hist) |tid| {
+            if (tid >= v) continue;
+            const c = eng.token_counts[tid];
+            if (c == 0) continue;
             eng.token_counts[tid] = 0;
             var val = probs[tid];
             if (has_rep) {

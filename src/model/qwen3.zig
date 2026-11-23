@@ -487,6 +487,15 @@ pub const LoadOptions = struct {
     strict_nax: bool = false,
     /// Optional explicit memory-bus bandwidth override in GB/s (`--bus-bandwidth-gbs`).
     bus_bandwidth_gbs_override: ?f64 = null,
+
+    // M7.8 Native Kernel Barrier Fusion (`G18`, ADR-0023 §1)
+    /// Enable G18 kernel & barrier fusions (`has_residual_epilogue`, `ami_fused_residual_rmsnorm`,
+    /// homogeneous `ami_fused_qkv_*`, and `ami_dense_gate_up_swiglu`). Set to `false` for A/B gating.
+    enable_g18_fusion: bool = true,
+    /// Minimum batched `M` for `ami_fused_qkv_gemm` (calibrated on M4 for zero regression).
+    g18_qkv_gemm_min_m: u32 = 64,
+    /// Minimum batched `M` for `ami_dense_gate_up_swiglu` GEMM (`32x32` tile).
+    g18_swiglu_gemm_min_m: u32 = 32,
 };
 
 pub const LoadError = error{
@@ -517,6 +526,7 @@ pub const StepError = error{
     TreeTooLarge,
     HybridPrefillNotEnabled,
     WavefrontFailed,
+    BusContentionDeferred,
 } || metal.Error || dequant.EncodeError || moe.EncodeError ||
     attention.RetiredKvQ8PoolError ||
     cache_mod.CacheError || predictor_mod.AneExpertPredictor.Error ||
@@ -1059,6 +1069,11 @@ pub const Qwen3Model = struct {
     last_final_norm_hidden_rows: u32 = 0,
     last_final_norm_uses_wide: bool = false,
 
+    // M7.8 Native Kernel Barrier Fusion (`G18`, ADR-0023 §1)
+    enable_g18_fusion: bool = true,
+    g18_qkv_gemm_min_m: u32 = 64,
+    g18_swiglu_gemm_min_m: u32 = 32,
+
     pub fn loadFromBytes(
         allocator: std.mem.Allocator,
         amf_bytes: []const u8,
@@ -1385,6 +1400,20 @@ pub const Qwen3Model = struct {
         return self.logits_host[self.last_logits_row * v .. (self.last_logits_row + 1) * v];
     }
 
+    /// Base device `BufferBinding` backing `logits_host` (`[max_rows, vocab_size]f16`).
+    pub fn logitsBaseBinding(self: *const Qwen3Model) metal.BufferBinding {
+        return self.logits_bind;
+    }
+
+    /// Device `BufferBinding` for the row returned by `readLastLogitsF16()` (`G21`).
+    pub fn lastLogitsBinding(self: *const Qwen3Model) metal.BufferBinding {
+        const byte_off = @as(u64, self.last_logits_row) * @as(u64, self.config.vocab_size) * @sizeOf(f16);
+        return .{
+            .buffer = self.logits_bind.buffer,
+            .offset = self.logits_bind.offset + byte_off,
+        };
+    }
+
     /// Samples a token from `readLastLogitsF16()` at `temperature > 0` using
     /// caller-preallocated `p_res` scratch (`len >= vocab_size`) and `rng` (`D11`).
     /// Zero dynamic heap allocation.
@@ -1618,6 +1647,18 @@ pub const Qwen3Model = struct {
         y: metal.BufferBinding,
         insert_barrier_before: bool,
     ) dequant.EncodeError!void {
+        return self.encodeLinearGemvResidual(frame, lin, x, y, null, insert_barrier_before);
+    }
+
+    pub fn encodeLinearGemvResidual(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        lin: LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        residual: ?metal.BufferBinding,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
         switch (lin.dtype) {
             .f16 => try self.dequant_pipes.encodeDenseGemv(frame, .f16, .{
                 .x = x,
@@ -1625,6 +1666,7 @@ pub const Qwen3Model = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
             .bf16 => try self.dequant_pipes.encodeDenseGemv(frame, .bf16, .{
                 .x = x,
@@ -1632,6 +1674,7 @@ pub const Qwen3Model = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
             .q4_affine => try self.dequant_pipes.encodeGemv(frame, .q4, .{
                 .x = x,
@@ -1640,6 +1683,7 @@ pub const Qwen3Model = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
             .q3_affine => try self.dequant_pipes.encodeGemv(frame, .q3, .{
                 .x = x,
@@ -1648,6 +1692,7 @@ pub const Qwen3Model = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
             .q2_affine => try self.dequant_pipes.encodeGemv(frame, .q2, .{
                 .x = x,
@@ -1656,6 +1701,7 @@ pub const Qwen3Model = struct {
                 .y = y,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
         }
     }
@@ -1671,8 +1717,21 @@ pub const Qwen3Model = struct {
         m: u32,
         insert_barrier_before: bool,
     ) dequant.EncodeError!void {
+        return self.encodeLinearBatchedResidual(frame, lin, x, y, null, m, insert_barrier_before);
+    }
+
+    pub fn encodeLinearBatchedResidual(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        lin: LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        residual: ?metal.BufferBinding,
+        m: u32,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
         if (m == 1) {
-            return self.encodeLinearGemv(frame, lin, x, y, insert_barrier_before);
+            return self.encodeLinearGemvResidual(frame, lin, x, y, residual, insert_barrier_before);
         }
         switch (lin.dtype) {
             .f16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .f16, .{
@@ -1682,6 +1741,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
             .bf16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .bf16, .{
                 .x = x,
@@ -1690,6 +1750,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
             .q4_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q4, .{
                 .x = x,
@@ -1699,6 +1760,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
             .q3_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q3, .{
                 .x = x,
@@ -1708,6 +1770,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
             .q2_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q2, .{
                 .x = x,
@@ -1717,6 +1780,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .n = lin.n,
                 .k = lin.k,
+                .residual = residual,
             }, insert_barrier_before),
         }
     }
@@ -1796,8 +1860,22 @@ pub const Qwen3Model = struct {
         wide_tile: bool,
         insert_barrier_before: bool,
     ) dequant.EncodeError!void {
+        return self.encodeLinearGemmWithTileResidual(frame, lin, x, y, null, m, wide_tile, insert_barrier_before);
+    }
+
+    pub fn encodeLinearGemmWithTileResidual(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        lin: LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        residual: ?metal.BufferBinding,
+        m: u32,
+        wide_tile: bool,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
         if (m < 16) {
-            return self.encodeLinearBatched(frame, lin, x, y, m, insert_barrier_before);
+            return self.encodeLinearBatchedResidual(frame, lin, x, y, residual, m, insert_barrier_before);
         }
         switch (lin.dtype) {
             .f16 => try self.dequant_pipes.encodeDenseGemm(frame, .f16, .{
@@ -1808,6 +1886,7 @@ pub const Qwen3Model = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, insert_barrier_before),
             .bf16 => try self.dequant_pipes.encodeDenseGemm(frame, .bf16, .{
                 .x = x,
@@ -1817,6 +1896,7 @@ pub const Qwen3Model = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, insert_barrier_before),
             .q4_affine => try self.dequant_pipes.encodeGemm(frame, .q4, .{
                 .x = x,
@@ -1827,6 +1907,7 @@ pub const Qwen3Model = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, insert_barrier_before),
             .q3_affine => try self.dequant_pipes.encodeGemm(frame, .q3, .{
                 .x = x,
@@ -1837,6 +1918,7 @@ pub const Qwen3Model = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, insert_barrier_before),
             .q2_affine => try self.dequant_pipes.encodeGemm(frame, .q2, .{
                 .x = x,
@@ -1847,8 +1929,234 @@ pub const Qwen3Model = struct {
                 .n = lin.n,
                 .k = lin.k,
                 .wide_tile = wide_tile,
+                .residual = residual,
             }, insert_barrier_before),
         }
+    }
+
+    pub const LinearDispatchMode = enum {
+        batched_gemv,
+        gemm32,
+        gemm_wide,
+    };
+
+    fn encodeLinearByModeResidual(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        lin: LinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        residual: ?metal.BufferBinding,
+        m: u32,
+        mode: LinearDispatchMode,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
+        return switch (mode) {
+            .batched_gemv => self.encodeLinearBatchedResidual(frame, lin, x, y, residual, m, insert_barrier_before),
+            .gemm32 => self.encodeLinearGemmWithTileResidual(frame, lin, x, y, residual, m, false, insert_barrier_before),
+            .gemm_wide => self.encodeLinearGemmWithTileResidual(frame, lin, x, y, residual, m, true, insert_barrier_before),
+        };
+    }
+
+    fn qkvProjBinding(lin: LinearBinding, y: metal.BufferBinding) dequant.QkvProjBinding {
+        return .{
+            .dtype = dequant.weightDTypeToAmf(lin.dtype),
+            .weight = lin.weight,
+            .scale_bias = lin.scale_bias,
+            .y = y,
+            .n = lin.n,
+        };
+    }
+
+    /// G18 fused QKV helper (`ADR-0023 §1`): dispatches `ami_fused_qkv_gemv` (`m == 1`)
+    /// or `ami_fused_qkv_gemm` (`m >= g18_qkv_gemm_min_m`) when `q/k/v` share one
+    /// homogeneous `DType` (and not Apple10+ NAX wide tile). Strictly preserves
+    /// the unfused 3-projection path on heterogeneous GSQ layers or A/B disable.
+    pub fn encodeQkvProj(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        q_proj: LinearBinding,
+        k_proj: LinearBinding,
+        v_proj: LinearBinding,
+        x: metal.BufferBinding,
+        q_out: metal.BufferBinding,
+        k_out: metal.BufferBinding,
+        v_out: metal.BufferBinding,
+        m: u32,
+        mode: LinearDispatchMode,
+        insert_barrier_before: bool,
+    ) dequant.EncodeError!void {
+        const q_amf = dequant.weightDTypeToAmf(q_proj.dtype);
+        const k_amf = dequant.weightDTypeToAmf(k_proj.dtype);
+        const v_amf = dequant.weightDTypeToAmf(v_proj.dtype);
+        const use_nax_wide = mode == .gemm_wide and m >= 64 and self.dequant_pipes.activeBackend().isNax();
+        const allow_fused_m = (m == 1) or (mode != .batched_gemv and m >= self.g18_qkv_gemm_min_m);
+        if (self.enable_g18_fusion and allow_fused_m and !use_nax_wide and dequant.canFuseQkv(q_amf, k_amf, v_amf)) {
+            const path = self.dequant_pipes.encodeFusedQkvGemm(frame, .{
+                .x = x,
+                .q = qkvProjBinding(q_proj, q_out),
+                .k_proj = qkvProjBinding(k_proj, k_out),
+                .v = qkvProjBinding(v_proj, v_out),
+                .m = m,
+                .k = q_proj.k,
+                .allow_unfused_fallback = false,
+            }, insert_barrier_before) catch |err| switch (err) {
+                error.HeterogeneousDType, error.UnsupportedDType => dequant.FusionPath.unfused_heterogeneous,
+                else => |e| return e,
+            };
+            if (path == .fused) return;
+        }
+        try self.encodeLinearByModeResidual(frame, q_proj, x, q_out, null, m, mode, insert_barrier_before);
+        try self.encodeLinearByModeResidual(frame, k_proj, x, k_out, null, m, mode, false);
+        try self.encodeLinearByModeResidual(frame, v_proj, x, v_out, null, m, mode, false);
+    }
+
+    /// G18 fused dense Gate+Up+SwiGLU (`ADR-0023 §1`) with strict heterogeneous-GSQ guard.
+    fn encodeDenseGateUpAct(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        layer: LayerWeights,
+        x_norm: metal.BufferBinding,
+        gate_out: metal.BufferBinding,
+        up_out: metal.BufferBinding,
+        act_out: metal.BufferBinding,
+        m: u32,
+        mode: LinearDispatchMode,
+        insert_barrier_before: bool,
+    ) StepError!void {
+        const g_amf = dequant.weightDTypeToAmf(layer.dense_gate.dtype);
+        const u_amf = dequant.weightDTypeToAmf(layer.dense_up.dtype);
+        const allow_fused_m = (mode != .batched_gemv and m >= self.g18_swiglu_gemm_min_m);
+        if (self.enable_g18_fusion and allow_fused_m and dequant.canFuseGateUp(g_amf, u_amf)) {
+            var used_fused = true;
+            self.dequant_pipes.encodeDenseGateUpSwiglu(frame, .{
+                .x = x_norm,
+                .gate_dtype = g_amf,
+                .w_gate = layer.dense_gate.weight,
+                .sb_gate = layer.dense_gate.scale_bias,
+                .up_dtype = u_amf,
+                .w_up = layer.dense_up.weight,
+                .sb_up = layer.dense_up.scale_bias,
+                .y = act_out,
+                .m = m,
+                .n = layer.dense_gate.n,
+                .k = layer.dense_gate.k,
+            }, insert_barrier_before) catch |err| switch (err) {
+                error.HeterogeneousDType, error.UnsupportedDType => {
+                    used_fused = false;
+                },
+                else => |e| return e,
+            };
+            if (used_fused) return;
+        }
+        try self.encodeLinearByModeResidual(frame, layer.dense_gate, x_norm, gate_out, null, m, mode, insert_barrier_before);
+        try self.encodeLinearByModeResidual(frame, layer.dense_up, x_norm, up_out, null, m, mode, false);
+        try self.moe_pipes.encodeSiluMul(frame, .{
+            .gate = gate_out,
+            .up = up_out,
+            .out = act_out,
+            .count = m * self.config.intermediate_size,
+        }, true);
+    }
+
+    /// G18 fused residual epilogue + RMSNorm helper (`o_proj` -> `x += o_proj(...)` -> `rmsnorm`).
+    fn encodeProjResidualAndPostNorm(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        proj: LinearBinding,
+        norm: NormBinding,
+        attn_out: metal.BufferBinding,
+        x: metal.BufferBinding,
+        proj_out: metal.BufferBinding,
+        x_norm: metal.BufferBinding,
+        m: u32,
+        mode: LinearDispatchMode,
+        insert_barrier_before: bool,
+    ) StepError!void {
+        if (self.enable_g18_fusion and (m == 1 or m >= 64)) {
+            try self.encodeLinearByModeResidual(frame, proj, attn_out, x, x, m, mode, insert_barrier_before);
+        } else {
+            try self.encodeLinearByModeResidual(frame, proj, attn_out, proj_out, null, m, mode, insert_barrier_before);
+            try self.moe_pipes.encodeResidualAdd(frame, .{
+                .x = x,
+                .delta = proj_out,
+                .count = m * self.config.hidden_size,
+            }, true);
+        }
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = x,
+            .w = norm.binding,
+            .y = x_norm,
+            .num_rows = m,
+            .hidden_dim = self.config.hidden_size,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = norm.dtype,
+        }, true);
+    }
+
+    /// G18 fused residual epilogue helper (`down_proj` -> `x += down_proj(...)`).
+    fn encodeDownResidual(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        proj: LinearBinding,
+        act_in: metal.BufferBinding,
+        x: metal.BufferBinding,
+        proj_out: metal.BufferBinding,
+        m: u32,
+        mode: LinearDispatchMode,
+        insert_barrier_before: bool,
+    ) StepError!void {
+        if (self.enable_g18_fusion and (m == 1 or m >= 64)) {
+            try self.encodeLinearByModeResidual(frame, proj, act_in, x, x, m, mode, insert_barrier_before);
+        } else {
+            try self.encodeLinearByModeResidual(frame, proj, act_in, proj_out, null, m, mode, insert_barrier_before);
+            try self.moe_pipes.encodeResidualAdd(frame, .{
+                .x = x,
+                .delta = proj_out,
+                .count = m * self.config.hidden_size,
+            }, true);
+        }
+    }
+
+    /// G18 fused `ami_fused_residual_rmsnorm` (`x += delta`, `x_norm = rmsnorm(x)`)
+    /// for post-LoRA / ANE delta boundaries, with unfused A/B fallback.
+    fn encodeResidualThenRmsNorm(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        x: metal.BufferBinding,
+        delta: metal.BufferBinding,
+        norm: NormBinding,
+        x_norm: metal.BufferBinding,
+        m: u32,
+        insert_barrier_before: bool,
+    ) moe.EncodeError!void {
+        if (self.enable_g18_fusion) {
+            try self.attn_pipes.encodeFusedResidualRmsNorm(frame, .{
+                .x = x,
+                .delta = delta,
+                .w = norm.binding,
+                .x_norm = x_norm,
+                .num_rows = m,
+                .hidden_dim = self.config.hidden_size,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = norm.dtype,
+            }, insert_barrier_before);
+            return;
+        }
+        try self.moe_pipes.encodeResidualAdd(frame, .{
+            .x = x,
+            .delta = delta,
+            .count = m * self.config.hidden_size,
+        }, insert_barrier_before);
+        try self.attn_pipes.encodeRmsNorm(frame, .{
+            .x = x,
+            .w = norm.binding,
+            .y = x_norm,
+            .num_rows = m,
+            .hidden_dim = self.config.hidden_size,
+            .eps = self.config.rms_norm_eps,
+            .w_dtype = norm.dtype,
+        }, true);
     }
 
     /// Dispatches one complete MoE FFN layer onto GPU: preserves the fast
@@ -1956,10 +2264,8 @@ pub const Qwen3Model = struct {
                 .w_dtype = layer.input_layernorm.dtype,
             }, true);
 
-            // q_proj, k_proj, v_proj read x_norm concurrently into disjoint outputs.
-            try self.encodeLinearGemv(&frame, layer.q_proj, self.x_norm_bind, self.q_bind, true);
-            try self.encodeLinearGemv(&frame, layer.k_proj, self.x_norm_bind, self.k_bind, false);
-            try self.encodeLinearGemv(&frame, layer.v_proj, self.x_norm_bind, self.v_bind, false);
+            // q_proj, k_proj, v_proj (G18 fused homogeneous QKV GEMV fast path + heterogeneous GSQ guard).
+            try self.encodeQkvProj(&frame, layer.q_proj, layer.k_proj, layer.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, 1, .batched_gemv, true);
 
             // QK-Norm + NeoX RoPE + direct RGBA16Float IOSurface KV-tile write.
             const kv_pair = self.kvTileAt(l, chunk_idx);
@@ -1984,24 +2290,19 @@ pub const Qwen3Model = struct {
             // GQA decode attention over committed IOSurface (and retired q8) KV tiles.
             try self.encodeLayerGqaDecode(&frame, l, cur_seq_len, true);
 
-            // o_proj + residual add into x.
-            try self.encodeLinearGemv(&frame, layer.o_proj, self.attn_out_bind, self.proj_out_bind, true);
-            try self.moe_pipes.encodeResidualAdd(&frame, .{
-                .x = self.x_bind,
-                .delta = self.proj_out_bind,
-                .count = self.config.hidden_size,
-            }, true);
-
-            // post_attention_layernorm: x -> x_norm
-            try self.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = self.x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = self.x_norm_bind,
-                .num_rows = 1,
-                .hidden_dim = self.config.hidden_size,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
+            // o_proj + residual add + post_attention_layernorm (G18 residual epilogue when enabled).
+            try self.encodeProjResidualAndPostNorm(
+                &frame,
+                layer.o_proj,
+                layer.post_attention_layernorm,
+                self.attn_out_bind,
+                self.x_bind,
+                self.proj_out_bind,
+                self.x_norm_bind,
+                1,
+                .batched_gemv,
+                true,
+            );
 
             // FFN + residual add into x.
             switch (self.config.arch) {
@@ -2026,20 +2327,27 @@ pub const Qwen3Model = struct {
                     try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
                 },
                 .qwen3_dense => {
-                    try self.encodeLinearGemv(&frame, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, true);
-                    try self.encodeLinearGemv(&frame, layer.dense_up, self.x_norm_bind, self.dense_up_bind, false);
-                    try self.moe_pipes.encodeSiluMul(&frame, .{
-                        .gate = self.dense_gate_bind,
-                        .up = self.dense_up_bind,
-                        .out = self.dense_act_bind,
-                        .count = self.config.intermediate_size,
-                    }, true);
-                    try self.encodeLinearGemv(&frame, layer.dense_down, self.dense_act_bind, self.proj_out_bind, true);
-                    try self.moe_pipes.encodeResidualAdd(&frame, .{
-                        .x = self.x_bind,
-                        .delta = self.proj_out_bind,
-                        .count = self.config.hidden_size,
-                    }, true);
+                    try self.encodeDenseGateUpAct(
+                        &frame,
+                        layer,
+                        self.x_norm_bind,
+                        self.dense_gate_bind,
+                        self.dense_up_bind,
+                        self.dense_act_bind,
+                        1,
+                        .batched_gemv,
+                        true,
+                    );
+                    try self.encodeDownResidual(
+                        &frame,
+                        layer.dense_down,
+                        self.dense_act_bind,
+                        self.x_bind,
+                        self.proj_out_bind,
+                        1,
+                        .batched_gemv,
+                        true,
+                    );
                 },
             }
 
@@ -2106,6 +2414,7 @@ pub const Qwen3Model = struct {
         }
 
         for (self.layers, 0..) |layer, l| {
+            const qkv_has_lora = reg.slotTargetsLayerMask(lora_slot, l, qkv_mask);
             {
                 const had = (frame_opt != null);
                 const f = try self.ensureOptionalFrame(&frame_opt);
@@ -2118,18 +2427,23 @@ pub const Qwen3Model = struct {
                     .eps = self.config.rms_norm_eps,
                     .w_dtype = layer.input_layernorm.dtype,
                 }, had);
-                try self.encodeLinearGemv(f, layer.q_proj, self.x_norm_bind, self.q_bind, true);
-                try self.encodeLinearGemv(f, layer.k_proj, self.x_norm_bind, self.k_bind, false);
-                try self.encodeLinearGemv(f, layer.v_proj, self.x_norm_bind, self.v_bind, false);
+                if (!qkv_has_lora) {
+                    try self.encodeQkvProj(f, layer.q_proj, layer.k_proj, layer.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, 1, .batched_gemv, true);
+                } else {
+                    try self.encodeLinearGemv(f, layer.q_proj, self.x_norm_bind, self.q_bind, true);
+                    try self.encodeLinearGemv(f, layer.k_proj, self.x_norm_bind, self.k_bind, false);
+                    try self.encodeLinearGemv(f, layer.v_proj, self.x_norm_bind, self.v_bind, false);
+                }
             }
 
-            if (reg.slotTargetsLayerMask(lora_slot, l, qkv_mask)) {
+            if (qkv_has_lora) {
                 try self.flushOptionalFrame(&frame_opt);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .q_proj, self.x_norm_host, self.q_host, 1);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .k_proj, self.x_norm_host, self.k_host, 1);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .v_proj, self.x_norm_host, self.v_host, 1);
             }
 
+            const o_has_lora = reg.slotTargetsLayerMask(lora_slot, l, o_mask);
             {
                 const had = (frame_opt != null);
                 const f = try self.ensureOptionalFrame(&frame_opt);
@@ -2152,31 +2466,30 @@ pub const Qwen3Model = struct {
                     .norm_dtype = layer.qk_norm_dtype,
                 }, had);
                 try self.encodeLayerGqaDecode(f, l, cur_seq_len, true);
-                try self.encodeLinearGemv(f, layer.o_proj, self.attn_out_bind, self.proj_out_bind, true);
+                if (!o_has_lora) {
+                    try self.encodeProjResidualAndPostNorm(
+                        f,
+                        layer.o_proj,
+                        layer.post_attention_layernorm,
+                        self.attn_out_bind,
+                        self.x_bind,
+                        self.proj_out_bind,
+                        self.x_norm_bind,
+                        1,
+                        .batched_gemv,
+                        true,
+                    );
+                } else {
+                    try self.encodeLinearGemv(f, layer.o_proj, self.attn_out_bind, self.proj_out_bind, true);
+                }
             }
 
-            if (reg.slotTargetsLayerMask(lora_slot, l, o_mask)) {
+            if (o_has_lora) {
                 try self.flushOptionalFrame(&frame_opt);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .o_proj, self.attn_out_host, self.proj_out_host, 1);
-            }
-
-            {
                 const had = (frame_opt != null);
                 const f = try self.ensureOptionalFrame(&frame_opt);
-                try self.moe_pipes.encodeResidualAdd(f, .{
-                    .x = self.x_bind,
-                    .delta = self.proj_out_bind,
-                    .count = h,
-                }, had);
-                try self.attn_pipes.encodeRmsNorm(f, .{
-                    .x = self.x_bind,
-                    .w = layer.post_attention_layernorm.binding,
-                    .y = self.x_norm_bind,
-                    .num_rows = 1,
-                    .hidden_dim = h,
-                    .eps = self.config.rms_norm_eps,
-                    .w_dtype = layer.post_attention_layernorm.dtype,
-                }, true);
+                try self.encodeResidualThenRmsNorm(f, self.x_bind, self.proj_out_bind, layer.post_attention_layernorm, self.x_norm_bind, 1, had);
             }
 
             switch (self.config.arch) {
@@ -2202,39 +2515,62 @@ pub const Qwen3Model = struct {
                     try self.encodeMoELayerDispatch(f, layer, moe_args, true);
                 },
                 .qwen3_dense => {
-                    {
+                    const gu_has_lora = reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask);
+                    const dn_has_lora = reg.slotTargetsLayerMask(lora_slot, l, down_mask);
+                    if (!gu_has_lora) {
                         const f = try self.ensureOptionalFrame(&frame_opt);
-                        try self.encodeLinearGemv(f, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, true);
-                        try self.encodeLinearGemv(f, layer.dense_up, self.x_norm_bind, self.dense_up_bind, false);
-                    }
-                    if (reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask)) {
+                        try self.encodeDenseGateUpAct(
+                            f,
+                            layer,
+                            self.x_norm_bind,
+                            self.dense_gate_bind,
+                            self.dense_up_bind,
+                            self.dense_act_bind,
+                            1,
+                            .batched_gemv,
+                            true,
+                        );
+                    } else {
+                        {
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.encodeLinearGemv(f, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, true);
+                            try self.encodeLinearGemv(f, layer.dense_up, self.x_norm_bind, self.dense_up_bind, false);
+                        }
                         try self.flushOptionalFrame(&frame_opt);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .gate_proj, self.x_norm_host, self.dense_gate_host, 1);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .up_proj, self.x_norm_host, self.dense_up_host, 1);
+                        {
+                            const had = (frame_opt != null);
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.moe_pipes.encodeSiluMul(f, .{
+                                .gate = self.dense_gate_bind,
+                                .up = self.dense_up_bind,
+                                .out = self.dense_act_bind,
+                                .count = self.config.intermediate_size,
+                            }, had);
+                        }
                     }
-                    {
+                    if (!dn_has_lora) {
                         const had = (frame_opt != null);
                         const f = try self.ensureOptionalFrame(&frame_opt);
-                        try self.moe_pipes.encodeSiluMul(f, .{
-                            .gate = self.dense_gate_bind,
-                            .up = self.dense_up_bind,
-                            .out = self.dense_act_bind,
-                            .count = self.config.intermediate_size,
-                        }, had);
-                        try self.encodeLinearGemv(f, layer.dense_down, self.dense_act_bind, self.proj_out_bind, true);
-                    }
-                    if (reg.slotTargetsLayerMask(lora_slot, l, down_mask)) {
+                        try self.encodeDownResidual(f, layer.dense_down, self.dense_act_bind, self.x_bind, self.proj_out_bind, 1, .batched_gemv, had);
+                    } else {
+                        {
+                            const had = (frame_opt != null);
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.encodeLinearGemv(f, layer.dense_down, self.dense_act_bind, self.proj_out_bind, had);
+                        }
                         try self.flushOptionalFrame(&frame_opt);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .down_proj, self.dense_act_host, self.proj_out_host, 1);
-                    }
-                    {
-                        const had = (frame_opt != null);
-                        const f = try self.ensureOptionalFrame(&frame_opt);
-                        try self.moe_pipes.encodeResidualAdd(f, .{
-                            .x = self.x_bind,
-                            .delta = self.proj_out_bind,
-                            .count = h,
-                        }, had);
+                        {
+                            const had = (frame_opt != null);
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.moe_pipes.encodeResidualAdd(f, .{
+                                .x = self.x_bind,
+                                .delta = self.proj_out_bind,
+                                .count = h,
+                            }, had);
+                        }
                     }
                 },
             }
@@ -2331,9 +2667,7 @@ pub const Qwen3Model = struct {
                 .w_dtype = layer.input_layernorm.dtype,
             }, true);
 
-            try self.encodeLinearBatched(&frame, layer.q_proj, self.x_norm_bind, self.q_bind, m, true);
-            try self.encodeLinearBatched(&frame, layer.k_proj, self.x_norm_bind, self.k_bind, m, false);
-            try self.encodeLinearBatched(&frame, layer.v_proj, self.x_norm_bind, self.v_bind, m, false);
+            try self.encodeQkvProj(&frame, layer.q_proj, layer.k_proj, layer.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
 
             const k_tree_bind = self.treeKBinding(l);
             const v_tree_bind = self.treeVBinding(l);
@@ -2357,22 +2691,18 @@ pub const Qwen3Model = struct {
 
             try self.encodeLayerGqaTreeVerify(&frame, l, m, base_pos, k_tree_bind, v_tree_bind, true);
 
-            try self.encodeLinearBatched(&frame, layer.o_proj, self.attn_out_bind, self.proj_out_bind, m, true);
-            try self.moe_pipes.encodeResidualAdd(&frame, .{
-                .x = self.x_bind,
-                .delta = self.proj_out_bind,
-                .count = m * h,
-            }, true);
-
-            try self.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = self.x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = self.x_norm_bind,
-                .num_rows = m,
-                .hidden_dim = h,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
+            try self.encodeProjResidualAndPostNorm(
+                &frame,
+                layer.o_proj,
+                layer.post_attention_layernorm,
+                self.attn_out_bind,
+                self.x_bind,
+                self.proj_out_bind,
+                self.x_norm_bind,
+                m,
+                .batched_gemv,
+                true,
+            );
 
             switch (self.config.arch) {
                 .qwen3_moe => {
@@ -2399,20 +2729,27 @@ pub const Qwen3Model = struct {
                     try self.encodeMoELayerDispatch(&frame, layer, moe_args, true);
                 },
                 .qwen3_dense => {
-                    try self.encodeLinearBatched(&frame, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, m, true);
-                    try self.encodeLinearBatched(&frame, layer.dense_up, self.x_norm_bind, self.dense_up_bind, m, false);
-                    try self.moe_pipes.encodeSiluMul(&frame, .{
-                        .gate = self.dense_gate_bind,
-                        .up = self.dense_up_bind,
-                        .out = self.dense_act_bind,
-                        .count = m * self.config.intermediate_size,
-                    }, true);
-                    try self.encodeLinearBatched(&frame, layer.dense_down, self.dense_act_bind, self.proj_out_bind, m, true);
-                    try self.moe_pipes.encodeResidualAdd(&frame, .{
-                        .x = self.x_bind,
-                        .delta = self.proj_out_bind,
-                        .count = m * h,
-                    }, true);
+                    try self.encodeDenseGateUpAct(
+                        &frame,
+                        layer,
+                        self.x_norm_bind,
+                        self.dense_gate_bind,
+                        self.dense_up_bind,
+                        self.dense_act_bind,
+                        m,
+                        .batched_gemv,
+                        true,
+                    );
+                    try self.encodeDownResidual(
+                        &frame,
+                        layer.dense_down,
+                        self.dense_act_bind,
+                        self.x_bind,
+                        self.proj_out_bind,
+                        m,
+                        .batched_gemv,
+                        true,
+                    );
                 },
             }
 
@@ -2761,9 +3098,7 @@ pub const Qwen3Model = struct {
                     .retired_chunk_stride_bytes = ret_chunk_stride,
                 }, true);
             } else {
-                try self.encodeLinearGemmWithTile(&frame, layer.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
-                try self.encodeLinearGemmWithTile(&frame, layer.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
-                try self.encodeLinearGemmWithTile(&frame, layer.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                try self.encodeQkvProj(&frame, layer.q_proj, layer.k_proj, layer.v_proj, self.wp_x_norm_bind, self.wp_q_bind, self.wp_k_bind, self.wp_v_bind, m, .gemm_wide, true);
 
                 try self.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
                     .q = self.wp_q_bind,
@@ -2808,22 +3143,18 @@ pub const Qwen3Model = struct {
             const eff_x_bind: metal.BufferBinding = if (tail_m1_last) last_x_bind else self.wp_x_bind;
             _ = q_dim;
 
-            try self.encodeLinearGemmWithTile(&frame, layer.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
-            try self.moe_pipes.encodeResidualAdd(&frame, .{
-                .x = eff_x_bind,
-                .delta = self.wp_proj_out_bind,
-                .count = eff_m * h,
-            }, true);
-
-            try self.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = eff_x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = self.wp_x_norm_bind,
-                .num_rows = eff_m,
-                .hidden_dim = h,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
+            try self.encodeProjResidualAndPostNorm(
+                &frame,
+                layer.o_proj,
+                layer.post_attention_layernorm,
+                self.wp_attn_out_bind,
+                eff_x_bind,
+                self.wp_proj_out_bind,
+                self.wp_x_norm_bind,
+                eff_m,
+                .gemm_wide,
+                true,
+            );
 
             switch (self.config.arch) {
                 .qwen3_moe => {
@@ -2888,20 +3219,27 @@ pub const Qwen3Model = struct {
                     }
                 },
                 .qwen3_dense => {
-                    try self.encodeLinearGemmWithTile(&frame, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, eff_m, true, true);
-                    try self.encodeLinearGemmWithTile(&frame, layer.dense_up, self.wp_x_norm_bind, self.wp_dense_up_bind, eff_m, true, false);
-                    try self.moe_pipes.encodeSiluMul(&frame, .{
-                        .gate = self.wp_dense_gate_bind,
-                        .up = self.wp_dense_up_bind,
-                        .out = self.wp_dense_act_bind,
-                        .count = eff_m * self.config.intermediate_size,
-                    }, true);
-                    try self.encodeLinearGemmWithTile(&frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
-                    try self.moe_pipes.encodeResidualAdd(&frame, .{
-                        .x = eff_x_bind,
-                        .delta = self.wp_proj_out_bind,
-                        .count = eff_m * h,
-                    }, true);
+                    try self.encodeDenseGateUpAct(
+                        &frame,
+                        layer,
+                        self.wp_x_norm_bind,
+                        self.wp_dense_gate_bind,
+                        self.wp_dense_up_bind,
+                        self.wp_dense_act_bind,
+                        eff_m,
+                        .gemm_wide,
+                        true,
+                    );
+                    try self.encodeDownResidual(
+                        &frame,
+                        layer.dense_down,
+                        self.wp_dense_act_bind,
+                        eff_x_bind,
+                        self.wp_proj_out_bind,
+                        eff_m,
+                        .gemm_wide,
+                        true,
+                    );
                 },
             }
 
@@ -3043,6 +3381,7 @@ pub const Qwen3Model = struct {
         }
 
         for (self.layers, 0..) |layer, l| {
+            const qkv_has_lora = reg.slotTargetsLayerMask(lora_slot, l, qkv_mask);
             {
                 const had = (frame_opt != null);
                 const f = try self.ensureOptionalFrame(&frame_opt);
@@ -3055,16 +3394,21 @@ pub const Qwen3Model = struct {
                     .eps = self.config.rms_norm_eps,
                     .w_dtype = layer.input_layernorm.dtype,
                 }, had);
-                try self.encodeLinearGemmWithTile(f, layer.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
-                try self.encodeLinearGemmWithTile(f, layer.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
-                try self.encodeLinearGemmWithTile(f, layer.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                if (!qkv_has_lora) {
+                    try self.encodeQkvProj(f, layer.q_proj, layer.k_proj, layer.v_proj, self.wp_x_norm_bind, self.wp_q_bind, self.wp_k_bind, self.wp_v_bind, m, .gemm_wide, true);
+                } else {
+                    try self.encodeLinearGemmWithTile(f, layer.q_proj, self.wp_x_norm_bind, self.wp_q_bind, m, true, true);
+                    try self.encodeLinearGemmWithTile(f, layer.k_proj, self.wp_x_norm_bind, self.wp_k_bind, m, true, false);
+                    try self.encodeLinearGemmWithTile(f, layer.v_proj, self.wp_x_norm_bind, self.wp_v_bind, m, true, false);
+                }
             }
-            if (reg.slotTargetsLayerMask(lora_slot, l, qkv_mask)) {
+            if (qkv_has_lora) {
                 try self.flushOptionalFrame(&frame_opt);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .q_proj, self.wp_x_norm_host, self.wp_q_host, m_usize);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .k_proj, self.wp_x_norm_host, self.wp_k_host, m_usize);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .v_proj, self.wp_x_norm_host, self.wp_v_host, m_usize);
             }
+            const o_has_lora = reg.slotTargetsLayerMask(lora_slot, l, o_mask);
             {
                 const had = (frame_opt != null);
                 const f = try self.ensureOptionalFrame(&frame_opt);
@@ -3104,29 +3448,29 @@ pub const Qwen3Model = struct {
                     .retired_plane_stride_bytes = ret_plane_stride,
                     .retired_chunk_stride_bytes = ret_chunk_stride,
                 }, true);
-                try self.encodeLinearGemmWithTile(f, layer.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, m, true, true);
+                if (!o_has_lora) {
+                    try self.encodeProjResidualAndPostNorm(
+                        f,
+                        layer.o_proj,
+                        layer.post_attention_layernorm,
+                        self.wp_attn_out_bind,
+                        self.wp_x_bind,
+                        self.wp_proj_out_bind,
+                        self.wp_x_norm_bind,
+                        m,
+                        .gemm_wide,
+                        true,
+                    );
+                } else {
+                    try self.encodeLinearGemmWithTile(f, layer.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, m, true, true);
+                }
             }
-            if (reg.slotTargetsLayerMask(lora_slot, l, o_mask)) {
+            if (o_has_lora) {
                 try self.flushOptionalFrame(&frame_opt);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .o_proj, self.wp_attn_out_host, self.wp_proj_out_host, m_usize);
-            }
-            {
                 const had = (frame_opt != null);
                 const f = try self.ensureOptionalFrame(&frame_opt);
-                try self.moe_pipes.encodeResidualAdd(f, .{
-                    .x = self.wp_x_bind,
-                    .delta = self.wp_proj_out_bind,
-                    .count = m * h,
-                }, had);
-                try self.attn_pipes.encodeRmsNorm(f, .{
-                    .x = self.wp_x_bind,
-                    .w = layer.post_attention_layernorm.binding,
-                    .y = self.wp_x_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = self.config.rms_norm_eps,
-                    .w_dtype = layer.post_attention_layernorm.dtype,
-                }, true);
+                try self.encodeResidualThenRmsNorm(f, self.wp_x_bind, self.wp_proj_out_bind, layer.post_attention_layernorm, self.wp_x_norm_bind, m, had);
             }
             switch (self.config.arch) {
                 .qwen3_moe => {
@@ -3151,39 +3495,62 @@ pub const Qwen3Model = struct {
                     try self.encodeMoELayerDispatch(f, layer, moe_args, true);
                 },
                 .qwen3_dense => {
-                    {
+                    const gu_has_lora = reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask);
+                    const dn_has_lora = reg.slotTargetsLayerMask(lora_slot, l, down_mask);
+                    if (!gu_has_lora) {
                         const f = try self.ensureOptionalFrame(&frame_opt);
-                        try self.encodeLinearGemmWithTile(f, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, m, true, true);
-                        try self.encodeLinearGemmWithTile(f, layer.dense_up, self.wp_x_norm_bind, self.wp_dense_up_bind, m, true, false);
-                    }
-                    if (reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask)) {
+                        try self.encodeDenseGateUpAct(
+                            f,
+                            layer,
+                            self.wp_x_norm_bind,
+                            self.wp_dense_gate_bind,
+                            self.wp_dense_up_bind,
+                            self.wp_dense_act_bind,
+                            m,
+                            .gemm_wide,
+                            true,
+                        );
+                    } else {
+                        {
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.encodeLinearGemmWithTile(f, layer.dense_gate, self.wp_x_norm_bind, self.wp_dense_gate_bind, m, true, true);
+                            try self.encodeLinearGemmWithTile(f, layer.dense_up, self.wp_x_norm_bind, self.wp_dense_up_bind, m, true, false);
+                        }
                         try self.flushOptionalFrame(&frame_opt);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .gate_proj, self.wp_x_norm_host, self.wp_dense_gate_host, m_usize);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .up_proj, self.wp_x_norm_host, self.wp_dense_up_host, m_usize);
+                        {
+                            const had = (frame_opt != null);
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.moe_pipes.encodeSiluMul(f, .{
+                                .gate = self.wp_dense_gate_bind,
+                                .up = self.wp_dense_up_bind,
+                                .out = self.wp_dense_act_bind,
+                                .count = m * self.config.intermediate_size,
+                            }, had);
+                        }
                     }
-                    {
+                    if (!dn_has_lora) {
                         const had = (frame_opt != null);
                         const f = try self.ensureOptionalFrame(&frame_opt);
-                        try self.moe_pipes.encodeSiluMul(f, .{
-                            .gate = self.wp_dense_gate_bind,
-                            .up = self.wp_dense_up_bind,
-                            .out = self.wp_dense_act_bind,
-                            .count = m * self.config.intermediate_size,
-                        }, had);
-                        try self.encodeLinearGemmWithTile(f, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, m, true, true);
-                    }
-                    if (reg.slotTargetsLayerMask(lora_slot, l, down_mask)) {
+                        try self.encodeDownResidual(f, layer.dense_down, self.wp_dense_act_bind, self.wp_x_bind, self.wp_proj_out_bind, m, .gemm_wide, had);
+                    } else {
+                        {
+                            const had = (frame_opt != null);
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.encodeLinearGemmWithTile(f, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, m, true, had);
+                        }
                         try self.flushOptionalFrame(&frame_opt);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .down_proj, self.wp_dense_act_host, self.wp_proj_out_host, m_usize);
-                    }
-                    {
-                        const had = (frame_opt != null);
-                        const f = try self.ensureOptionalFrame(&frame_opt);
-                        try self.moe_pipes.encodeResidualAdd(f, .{
-                            .x = self.wp_x_bind,
-                            .delta = self.wp_proj_out_bind,
-                            .count = m * h,
-                        }, had);
+                        {
+                            const had = (frame_opt != null);
+                            const f = try self.ensureOptionalFrame(&frame_opt);
+                            try self.moe_pipes.encodeResidualAdd(f, .{
+                                .x = self.wp_x_bind,
+                                .delta = self.wp_proj_out_bind,
+                                .count = m * h,
+                            }, had);
+                        }
                     }
                 },
             }
@@ -4642,9 +5009,7 @@ pub const Qwen3Model = struct {
             .eps = self.config.rms_norm_eps,
             .w_dtype = layer.input_layernorm.dtype,
         }, barrier_before);
-        try self.encodeLinearGemv(frame, layer.q_proj, self.x_norm_bind, self.q_bind, true);
-        try self.encodeLinearGemv(frame, layer.k_proj, self.x_norm_bind, self.k_bind, false);
-        try self.encodeLinearGemv(frame, layer.v_proj, self.x_norm_bind, self.v_bind, false);
+        try self.encodeQkvProj(frame, layer.q_proj, layer.k_proj, layer.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, 1, .batched_gemv, true);
 
         const kv_pair = self.kvTileAt(l, chunk_idx);
         try self.attn_pipes.encodeQkNormRopeKvWrite(frame, .{
@@ -4667,21 +5032,18 @@ pub const Qwen3Model = struct {
 
         try self.encodeLayerGqaDecode(frame, l, cur_seq_len, true);
 
-        try self.encodeLinearGemv(frame, layer.o_proj, self.attn_out_bind, self.proj_out_bind, true);
-        try self.moe_pipes.encodeResidualAdd(frame, .{
-            .x = self.x_bind,
-            .delta = self.proj_out_bind,
-            .count = h,
-        }, true);
-        try self.attn_pipes.encodeRmsNorm(frame, .{
-            .x = self.x_bind,
-            .w = layer.post_attention_layernorm.binding,
-            .y = self.x_norm_bind,
-            .num_rows = 1,
-            .hidden_dim = h,
-            .eps = self.config.rms_norm_eps,
-            .w_dtype = layer.post_attention_layernorm.dtype,
-        }, true);
+        try self.encodeProjResidualAndPostNorm(
+            frame,
+            layer.o_proj,
+            layer.post_attention_layernorm,
+            self.attn_out_bind,
+            self.x_bind,
+            self.proj_out_bind,
+            self.x_norm_bind,
+            1,
+            .batched_gemv,
+            true,
+        );
     }
 
     fn encodeLayerAttentionTree(
@@ -4704,9 +5066,7 @@ pub const Qwen3Model = struct {
             .w_dtype = layer.input_layernorm.dtype,
         }, barrier_before);
 
-        try self.encodeLinearBatched(frame, layer.q_proj, self.x_norm_bind, self.q_bind, m, true);
-        try self.encodeLinearBatched(frame, layer.k_proj, self.x_norm_bind, self.k_bind, m, false);
-        try self.encodeLinearBatched(frame, layer.v_proj, self.x_norm_bind, self.v_bind, m, false);
+        try self.encodeQkvProj(frame, layer.q_proj, layer.k_proj, layer.v_proj, self.x_norm_bind, self.q_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
 
         const k_tree_bind = self.treeKBinding(l);
         const v_tree_bind = self.treeVBinding(l);
@@ -4730,21 +5090,18 @@ pub const Qwen3Model = struct {
 
         try self.encodeLayerGqaTreeVerify(frame, l, m, base_pos, k_tree_bind, v_tree_bind, true);
 
-        try self.encodeLinearBatched(frame, layer.o_proj, self.attn_out_bind, self.proj_out_bind, m, true);
-        try self.moe_pipes.encodeResidualAdd(frame, .{
-            .x = self.x_bind,
-            .delta = self.proj_out_bind,
-            .count = m * h,
-        }, true);
-        try self.attn_pipes.encodeRmsNorm(frame, .{
-            .x = self.x_bind,
-            .w = layer.post_attention_layernorm.binding,
-            .y = self.x_norm_bind,
-            .num_rows = m,
-            .hidden_dim = h,
-            .eps = self.config.rms_norm_eps,
-            .w_dtype = layer.post_attention_layernorm.dtype,
-        }, true);
+        try self.encodeProjResidualAndPostNorm(
+            frame,
+            layer.o_proj,
+            layer.post_attention_layernorm,
+            self.attn_out_bind,
+            self.x_bind,
+            self.proj_out_bind,
+            self.x_norm_bind,
+            m,
+            .batched_gemv,
+            true,
+        );
     }
 
     fn encodeLayerRouter(
@@ -4835,6 +5192,9 @@ pub const Qwen3Model = struct {
             try self.moe_pipes.encodeGateUpDownHetero(frame, base, layer.expert_scheme_counts, true, barrier_before);
             return;
         }
+        // Homogeneous ColdRuntime two-pass CSR patches `num_unique_experts` on host
+        // without re-encoding indirect grid buffers; keep direct dispatch here to
+        // match `encodeGateUpDownHetero(..., skip_empty_from_host = true)`.
         const gu_args: moe.GateUpSwigluArgs = .{
             .x = x_norm,
             .weights_base = .{ .buffer = weights_buf, .offset = 0 },
@@ -4846,6 +5206,7 @@ pub const Qwen3Model = struct {
             .top_k = self.config.num_experts_per_tok,
             .hidden_size = self.config.hidden_size,
             .intermediate_size = self.config.moe_intermediate_size,
+            .use_indirect = false,
         };
         const dp_args: moe.DownProjArgs = .{
             .weights_base = .{ .buffer = weights_buf, .offset = 0 },
@@ -4857,6 +5218,7 @@ pub const Qwen3Model = struct {
             .top_k = self.config.num_experts_per_tok,
             .hidden_size = self.config.hidden_size,
             .intermediate_size = self.config.moe_intermediate_size,
+            .use_indirect = false,
         };
         switch (layer.expert_dtype) {
             .q2_affine => {
@@ -5378,9 +5740,7 @@ pub const Qwen3Model = struct {
                 .w_dtype = layer.input_layernorm.dtype,
             }, true);
 
-            try self.encodeLinearBatched(&frame, layer.q_proj, self.x_norm_bind, q_sub_bind, m, true);
-            try self.encodeLinearBatched(&frame, layer.k_proj, self.x_norm_bind, self.k_bind, m, false);
-            try self.encodeLinearBatched(&frame, layer.v_proj, self.x_norm_bind, self.v_bind, m, false);
+            try self.encodeQkvProj(&frame, layer.q_proj, layer.k_proj, layer.v_proj, self.x_norm_bind, q_sub_bind, self.k_bind, self.v_bind, m, .batched_gemv, true);
 
             const k_tree_base = self.treeKBinding(l);
             const v_tree_base = self.treeVBinding(l);
@@ -5408,7 +5768,7 @@ pub const Qwen3Model = struct {
             try self.encodeLayerGqaTreeVerify(&frame, l, total_slots, kv_base_pos, k_tree_base, v_tree_base, true);
 
             // Optional ANE placement override for layer 0 `o_proj` (D5).
-            if (ane_o_proj_hook) |hook| {
+            const used_ane_o_proj = if (ane_o_proj_hook) |hook| blk: {
                 if (l == 0 and m <= hook.max_batch_rows and q_dim == hook.c_in and h == hook.c_out) {
                     try self.moe_pipes.encodeCopyStrided(&frame, .{
                         .src = attn_out_sub_bind,
@@ -5427,54 +5787,50 @@ pub const Qwen3Model = struct {
                     hook.last_zero_copy_ok.* = pinfo.allOutputsZeroCopy();
 
                     frame = try self.compute.beginFrame(self.timeout_ms);
-                    try self.moe_pipes.encodeResidualAdd(&frame, .{
-                        .x = self.x_bind,
-                        .delta = hook.out_bind,
-                        .count = m * h,
-                    }, false);
-                } else {
-                    try self.encodeLinearBatched(&frame, layer.o_proj, attn_out_sub_bind, self.proj_out_bind, m, true);
-                    try self.moe_pipes.encodeResidualAdd(&frame, .{
-                        .x = self.x_bind,
-                        .delta = self.proj_out_bind,
-                        .count = m * h,
-                    }, true);
+                    try self.encodeResidualThenRmsNorm(&frame, self.x_bind, hook.out_bind, layer.post_attention_layernorm, self.x_norm_bind, m, false);
+                    break :blk true;
                 }
-            } else {
-                try self.encodeLinearBatched(&frame, layer.o_proj, attn_out_sub_bind, self.proj_out_bind, m, true);
-                try self.moe_pipes.encodeResidualAdd(&frame, .{
-                    .x = self.x_bind,
-                    .delta = self.proj_out_bind,
-                    .count = m * h,
-                }, true);
-            }
+                break :blk false;
+            } else false;
 
-            try self.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = self.x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = self.x_norm_bind,
-                .num_rows = m,
-                .hidden_dim = h,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
+            if (!used_ane_o_proj) {
+                try self.encodeProjResidualAndPostNorm(
+                    &frame,
+                    layer.o_proj,
+                    layer.post_attention_layernorm,
+                    attn_out_sub_bind,
+                    self.x_bind,
+                    self.proj_out_bind,
+                    self.x_norm_bind,
+                    m,
+                    .batched_gemv,
+                    true,
+                );
+            }
 
             switch (self.config.arch) {
                 .qwen3_dense => {
-                    try self.encodeLinearBatched(&frame, layer.dense_gate, self.x_norm_bind, self.dense_gate_bind, m, true);
-                    try self.encodeLinearBatched(&frame, layer.dense_up, self.x_norm_bind, self.dense_up_bind, m, false);
-                    try self.moe_pipes.encodeSiluMul(&frame, .{
-                        .gate = self.dense_gate_bind,
-                        .up = self.dense_up_bind,
-                        .out = self.dense_act_bind,
-                        .count = m * self.config.intermediate_size,
-                    }, true);
-                    try self.encodeLinearBatched(&frame, layer.dense_down, self.dense_act_bind, self.proj_out_bind, m, true);
-                    try self.moe_pipes.encodeResidualAdd(&frame, .{
-                        .x = self.x_bind,
-                        .delta = self.proj_out_bind,
-                        .count = m * h,
-                    }, true);
+                    try self.encodeDenseGateUpAct(
+                        &frame,
+                        layer,
+                        self.x_norm_bind,
+                        self.dense_gate_bind,
+                        self.dense_up_bind,
+                        self.dense_act_bind,
+                        m,
+                        .batched_gemv,
+                        true,
+                    );
+                    try self.encodeDownResidual(
+                        &frame,
+                        layer.dense_down,
+                        self.dense_act_bind,
+                        self.x_bind,
+                        self.proj_out_bind,
+                        m,
+                        .batched_gemv,
+                        true,
+                    );
                 },
                 .qwen3_moe => {
                     const ws = &(self.moe_ws.?);
@@ -6613,45 +6969,27 @@ pub const Qwen3Model = struct {
         const proj_out_b = if (use_hybrid_ws) self.hybrid_rt.?.proj_out_chunk_bind else self.proj_out_bind;
         const ws_buf = if (use_hybrid_ws) self.hybrid_rt.?.ffn_buf else self.scratch_buf;
 
-        var need_barrier = insert_barrier_before;
         if (attn_out) |ao| {
-            try self.moe_pipes.encodeResidualAdd(frame, .{
+            try self.encodeResidualThenRmsNorm(frame, x_in_out, ao, layer.post_attention_layernorm, x_norm_b, m, insert_barrier_before);
+        } else {
+            try self.attn_pipes.encodeRmsNorm(frame, .{
                 .x = x_in_out,
-                .delta = ao,
-                .count = m * h,
-            }, need_barrier);
-            need_barrier = true;
+                .w = layer.post_attention_layernorm.binding,
+                .y = x_norm_b,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
+            }, insert_barrier_before);
         }
-
-        try self.attn_pipes.encodeRmsNorm(frame, .{
-            .x = x_in_out,
-            .w = layer.post_attention_layernorm.binding,
-            .y = x_norm_b,
-            .num_rows = m,
-            .hidden_dim = h,
-            .eps = self.config.rms_norm_eps,
-            .w_dtype = layer.post_attention_layernorm.dtype,
-        }, need_barrier);
 
         switch (self.config.arch) {
             .qwen3_dense => {
                 const dg_b = if (use_hybrid_ws) self.hybrid_rt.?.dense_gate_chunk_bind else self.dense_gate_bind;
                 const du_b = if (use_hybrid_ws) self.hybrid_rt.?.dense_up_chunk_bind else self.dense_up_bind;
                 const da_b = if (use_hybrid_ws) self.hybrid_rt.?.dense_act_chunk_bind else self.dense_act_bind;
-                try self.encodeLinearGemm(frame, layer.dense_gate, x_norm_b, dg_b, m, true);
-                try self.encodeLinearGemm(frame, layer.dense_up, x_norm_b, du_b, m, false);
-                try self.moe_pipes.encodeSiluMul(frame, .{
-                    .gate = dg_b,
-                    .up = du_b,
-                    .out = da_b,
-                    .count = m * self.config.intermediate_size,
-                }, true);
-                try self.encodeLinearGemm(frame, layer.dense_down, da_b, proj_out_b, m, true);
-                try self.moe_pipes.encodeResidualAdd(frame, .{
-                    .x = x_in_out,
-                    .delta = proj_out_b,
-                    .count = m * h,
-                }, true);
+                try self.encodeDenseGateUpAct(frame, layer, x_norm_b, dg_b, du_b, da_b, m, .gemm_wide, true);
+                try self.encodeDownResidual(frame, layer.dense_down, da_b, x_in_out, proj_out_b, m, .gemm_wide, true);
             },
             .qwen3_moe => {
                 const ws_ptr: *const moe.MoeWorkspace = if (use_hybrid_ws)
@@ -8991,7 +9329,8 @@ fn loadCore(
     // atomically demoting `nax -> simdgroup_apple9` on canary failure unless `strict_nax`.
     var canary_result: ?dequant.CanaryResult = null;
     if (options.startup_canary) {
-        canary_result = try dequant_pipes.runStartupNumericalCanaryInBufferMut(&compute, scratch_buf, scratch_arena.bytes());
+        const comb = try attn_pipes.runCombinedStartupCanaryInBufferMut(&dequant_pipes, &compute, scratch_buf, scratch_arena.bytes());
+        canary_result = comb.dequant;
         @memset(scratch_arena.bytes()[0..page.APPLE_PAGE_SIZE], 0);
     }
 
@@ -9766,6 +10105,9 @@ fn loadCore(
         .wp_dense_up_bind = wp_dense_up_bind,
         .wp_dense_act_bind = wp_dense_act_bind,
         .chip_profile = resolved_chip_profile,
+        .enable_g18_fusion = options.enable_g18_fusion,
+        .g18_qkv_gemm_min_m = options.g18_qkv_gemm_min_m,
+        .g18_swiglu_gemm_min_m = options.g18_swiglu_gemm_min_m,
     };
 }
 
@@ -11055,9 +11397,7 @@ pub const Qwen3BatchRuntime = struct {
                     .retired_chunk_stride_bytes = ret_chunk_stride,
                 }, true);
             } else {
-                try model.encodeLinearGemmWithTile(&frame, layer.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
-                try model.encodeLinearGemmWithTile(&frame, layer.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
-                try model.encodeLinearGemmWithTile(&frame, layer.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                try model.encodeQkvProj(&frame, layer.q_proj, layer.k_proj, layer.v_proj, model.wp_x_norm_bind, model.wp_q_bind, model.wp_k_bind, model.wp_v_bind, m, .gemm_wide, true);
 
                 try model.attn_pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
                     .q = model.wp_q_bind,
@@ -11101,22 +11441,18 @@ pub const Qwen3BatchRuntime = struct {
             const eff_m: u32 = if (tail_m1_last) 1 else m;
             const eff_x_bind: metal.BufferBinding = if (tail_m1_last) last_x_bind else model.wp_x_bind;
 
-            try model.encodeLinearGemmWithTile(&frame, layer.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
-            try model.moe_pipes.encodeResidualAdd(&frame, .{
-                .x = eff_x_bind,
-                .delta = model.wp_proj_out_bind,
-                .count = eff_m * h,
-            }, true);
-
-            try model.attn_pipes.encodeRmsNorm(&frame, .{
-                .x = eff_x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = model.wp_x_norm_bind,
-                .num_rows = eff_m,
-                .hidden_dim = h,
-                .eps = model.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
+            try model.encodeProjResidualAndPostNorm(
+                &frame,
+                layer.o_proj,
+                layer.post_attention_layernorm,
+                model.wp_attn_out_bind,
+                eff_x_bind,
+                model.wp_proj_out_bind,
+                model.wp_x_norm_bind,
+                eff_m,
+                .gemm_wide,
+                true,
+            );
 
             switch (model.config.arch) {
                 .qwen3_moe => {
@@ -11140,20 +11476,27 @@ pub const Qwen3BatchRuntime = struct {
                     try model.encodeMoELayerDispatch(&frame, layer, moe_args, true);
                 },
                 .qwen3_dense => {
-                    try model.encodeLinearGemmWithTile(&frame, layer.dense_gate, model.wp_x_norm_bind, model.wp_dense_gate_bind, eff_m, true, true);
-                    try model.encodeLinearGemmWithTile(&frame, layer.dense_up, model.wp_x_norm_bind, model.wp_dense_up_bind, eff_m, true, false);
-                    try model.moe_pipes.encodeSiluMul(&frame, .{
-                        .gate = model.wp_dense_gate_bind,
-                        .up = model.wp_dense_up_bind,
-                        .out = model.wp_dense_act_bind,
-                        .count = eff_m * model.config.intermediate_size,
-                    }, true);
-                    try model.encodeLinearGemmWithTile(&frame, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, eff_m, true, true);
-                    try model.moe_pipes.encodeResidualAdd(&frame, .{
-                        .x = eff_x_bind,
-                        .delta = model.wp_proj_out_bind,
-                        .count = eff_m * h,
-                    }, true);
+                    try model.encodeDenseGateUpAct(
+                        &frame,
+                        layer,
+                        model.wp_x_norm_bind,
+                        model.wp_dense_gate_bind,
+                        model.wp_dense_up_bind,
+                        model.wp_dense_act_bind,
+                        eff_m,
+                        .gemm_wide,
+                        true,
+                    );
+                    try model.encodeDownResidual(
+                        &frame,
+                        layer.dense_down,
+                        model.wp_dense_act_bind,
+                        eff_x_bind,
+                        model.wp_proj_out_bind,
+                        eff_m,
+                        .gemm_wide,
+                        true,
+                    );
                 },
             }
         }
@@ -11240,6 +11583,7 @@ pub const Qwen3BatchRuntime = struct {
             const slot_kv_bind = self.slotKvTilesBinding(l, slot_id);
             const slot_ret_ids_bind: ?metal.BufferBinding = if (has_retired) self.slotRetiredIdsBinding(l, slot_id) else null;
 
+            const qkv_has_lora = reg.slotTargetsLayerMask(lora_slot, l, qkv_mask);
             {
                 const had = (frame_opt != null);
                 const f = try model.ensureOptionalFrame(&frame_opt);
@@ -11252,16 +11596,21 @@ pub const Qwen3BatchRuntime = struct {
                     .eps = model.config.rms_norm_eps,
                     .w_dtype = layer.input_layernorm.dtype,
                 }, had);
-                try model.encodeLinearGemmWithTile(f, layer.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
-                try model.encodeLinearGemmWithTile(f, layer.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
-                try model.encodeLinearGemmWithTile(f, layer.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                if (!qkv_has_lora) {
+                    try model.encodeQkvProj(f, layer.q_proj, layer.k_proj, layer.v_proj, model.wp_x_norm_bind, model.wp_q_bind, model.wp_k_bind, model.wp_v_bind, m, .gemm_wide, true);
+                } else {
+                    try model.encodeLinearGemmWithTile(f, layer.q_proj, model.wp_x_norm_bind, model.wp_q_bind, m, true, true);
+                    try model.encodeLinearGemmWithTile(f, layer.k_proj, model.wp_x_norm_bind, model.wp_k_bind, m, true, false);
+                    try model.encodeLinearGemmWithTile(f, layer.v_proj, model.wp_x_norm_bind, model.wp_v_bind, m, true, false);
+                }
             }
-            if (reg.slotTargetsLayerMask(lora_slot, l, qkv_mask)) {
+            if (qkv_has_lora) {
                 try model.flushOptionalFrame(&frame_opt);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .q_proj, model.wp_x_norm_host, model.wp_q_host, m_usize);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .k_proj, model.wp_x_norm_host, model.wp_k_host, m_usize);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .v_proj, model.wp_x_norm_host, model.wp_v_host, m_usize);
             }
+            const o_has_lora = reg.slotTargetsLayerMask(lora_slot, l, o_mask);
             {
                 const had = (frame_opt != null);
                 const f = try model.ensureOptionalFrame(&frame_opt);
@@ -11301,29 +11650,29 @@ pub const Qwen3BatchRuntime = struct {
                     .retired_plane_stride_bytes = ret_plane_stride,
                     .retired_chunk_stride_bytes = ret_chunk_stride,
                 }, true);
-                try model.encodeLinearGemmWithTile(f, layer.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, m, true, true);
+                if (!o_has_lora) {
+                    try model.encodeProjResidualAndPostNorm(
+                        f,
+                        layer.o_proj,
+                        layer.post_attention_layernorm,
+                        model.wp_attn_out_bind,
+                        model.wp_x_bind,
+                        model.wp_proj_out_bind,
+                        model.wp_x_norm_bind,
+                        m,
+                        .gemm_wide,
+                        true,
+                    );
+                } else {
+                    try model.encodeLinearGemmWithTile(f, layer.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, m, true, true);
+                }
             }
-            if (reg.slotTargetsLayerMask(lora_slot, l, o_mask)) {
+            if (o_has_lora) {
                 try model.flushOptionalFrame(&frame_opt);
                 try reg.applySingleAdapterProjectionF16(lora_slot, l, .o_proj, model.wp_attn_out_host, model.wp_proj_out_host, m_usize);
-            }
-            {
                 const had = (frame_opt != null);
                 const f = try model.ensureOptionalFrame(&frame_opt);
-                try model.moe_pipes.encodeResidualAdd(f, .{
-                    .x = model.wp_x_bind,
-                    .delta = model.wp_proj_out_bind,
-                    .count = m * h,
-                }, had);
-                try model.attn_pipes.encodeRmsNorm(f, .{
-                    .x = model.wp_x_bind,
-                    .w = layer.post_attention_layernorm.binding,
-                    .y = model.wp_x_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = model.config.rms_norm_eps,
-                    .w_dtype = layer.post_attention_layernorm.dtype,
-                }, true);
+                try model.encodeResidualThenRmsNorm(f, model.wp_x_bind, model.wp_proj_out_bind, layer.post_attention_layernorm, model.wp_x_norm_bind, m, had);
             }
             switch (model.config.arch) {
                 .qwen3_moe => {
@@ -11348,39 +11697,62 @@ pub const Qwen3BatchRuntime = struct {
                     try model.encodeMoELayerDispatch(f, layer, moe_args, true);
                 },
                 .qwen3_dense => {
-                    {
+                    const gu_has_lora = reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask);
+                    const dn_has_lora = reg.slotTargetsLayerMask(lora_slot, l, down_mask);
+                    if (!gu_has_lora) {
                         const f = try model.ensureOptionalFrame(&frame_opt);
-                        try model.encodeLinearGemmWithTile(f, layer.dense_gate, model.wp_x_norm_bind, model.wp_dense_gate_bind, m, true, true);
-                        try model.encodeLinearGemmWithTile(f, layer.dense_up, model.wp_x_norm_bind, model.wp_dense_up_bind, m, true, false);
-                    }
-                    if (reg.slotTargetsLayerMask(lora_slot, l, gate_up_mask)) {
+                        try model.encodeDenseGateUpAct(
+                            f,
+                            layer,
+                            model.wp_x_norm_bind,
+                            model.wp_dense_gate_bind,
+                            model.wp_dense_up_bind,
+                            model.wp_dense_act_bind,
+                            m,
+                            .gemm_wide,
+                            true,
+                        );
+                    } else {
+                        {
+                            const f = try model.ensureOptionalFrame(&frame_opt);
+                            try model.encodeLinearGemmWithTile(f, layer.dense_gate, model.wp_x_norm_bind, model.wp_dense_gate_bind, m, true, true);
+                            try model.encodeLinearGemmWithTile(f, layer.dense_up, model.wp_x_norm_bind, model.wp_dense_up_bind, m, true, false);
+                        }
                         try model.flushOptionalFrame(&frame_opt);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .gate_proj, model.wp_x_norm_host, model.wp_dense_gate_host, m_usize);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .up_proj, model.wp_x_norm_host, model.wp_dense_up_host, m_usize);
+                        {
+                            const had = (frame_opt != null);
+                            const f = try model.ensureOptionalFrame(&frame_opt);
+                            try model.moe_pipes.encodeSiluMul(f, .{
+                                .gate = model.wp_dense_gate_bind,
+                                .up = model.wp_dense_up_bind,
+                                .out = model.wp_dense_act_bind,
+                                .count = m * model.config.intermediate_size,
+                            }, had);
+                        }
                     }
-                    {
+                    if (!dn_has_lora) {
                         const had = (frame_opt != null);
                         const f = try model.ensureOptionalFrame(&frame_opt);
-                        try model.moe_pipes.encodeSiluMul(f, .{
-                            .gate = model.wp_dense_gate_bind,
-                            .up = model.wp_dense_up_bind,
-                            .out = model.wp_dense_act_bind,
-                            .count = m * model.config.intermediate_size,
-                        }, had);
-                        try model.encodeLinearGemmWithTile(f, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, m, true, true);
-                    }
-                    if (reg.slotTargetsLayerMask(lora_slot, l, down_mask)) {
+                        try model.encodeDownResidual(f, layer.dense_down, model.wp_dense_act_bind, model.wp_x_bind, model.wp_proj_out_bind, m, .gemm_wide, had);
+                    } else {
+                        {
+                            const had = (frame_opt != null);
+                            const f = try model.ensureOptionalFrame(&frame_opt);
+                            try model.encodeLinearGemmWithTile(f, layer.dense_down, model.wp_dense_act_bind, model.wp_proj_out_bind, m, true, had);
+                        }
                         try model.flushOptionalFrame(&frame_opt);
                         try reg.applySingleAdapterProjectionF16(lora_slot, l, .down_proj, model.wp_dense_act_host, model.wp_proj_out_host, m_usize);
-                    }
-                    {
-                        const had = (frame_opt != null);
-                        const f = try model.ensureOptionalFrame(&frame_opt);
-                        try model.moe_pipes.encodeResidualAdd(f, .{
-                            .x = model.wp_x_bind,
-                            .delta = model.wp_proj_out_bind,
-                            .count = m * h,
-                        }, had);
+                        {
+                            const had = (frame_opt != null);
+                            const f = try model.ensureOptionalFrame(&frame_opt);
+                            try model.moe_pipes.encodeResidualAdd(f, .{
+                                .x = model.wp_x_bind,
+                                .delta = model.wp_proj_out_bind,
+                                .count = m * h,
+                            }, had);
+                        }
                     }
                 },
             }
@@ -11482,9 +11854,7 @@ pub const Qwen3BatchRuntime = struct {
                 _ = try model.execLinearHetero(&frame_opt, layer.v_proj, model.x_norm_bind, model.x_norm_host, model.v_bind, model.v_host, m, false);
             } else {
                 const f = try model.ensureOptionalFrame(&frame_opt);
-                try model.encodeLinearGemmWithTile(f, layer.q_proj, model.x_norm_bind, model.q_bind, m, false, true);
-                try model.encodeLinearGemmWithTile(f, layer.k_proj, model.x_norm_bind, model.k_bind, m, false, false);
-                try model.encodeLinearGemmWithTile(f, layer.v_proj, model.x_norm_bind, model.v_bind, m, false, false);
+                try model.encodeQkvProj(f, layer.q_proj, layer.k_proj, layer.v_proj, model.x_norm_bind, model.q_bind, model.k_bind, model.v_bind, m, .gemm32, true);
             }
 
             {
@@ -11556,28 +11926,23 @@ pub const Qwen3BatchRuntime = struct {
 
             if (model.has_sme2_weights) {
                 _ = try model.execLinearHetero(&frame_opt, layer.o_proj, model.attn_out_bind, model.attn_out_host, model.proj_out_bind, model.proj_out_host, m, true);
-            } else {
-                const f = try model.ensureOptionalFrame(&frame_opt);
-                try model.encodeLinearGemmWithTile(f, layer.o_proj, model.attn_out_bind, model.proj_out_bind, m, false, true);
-            }
-
-            {
                 const had = (frame_opt != null);
                 const f = try model.ensureOptionalFrame(&frame_opt);
-                try model.moe_pipes.encodeResidualAdd(f, .{
-                    .x = model.x_bind,
-                    .delta = model.proj_out_bind,
-                    .count = m * h,
-                }, had);
-                try model.attn_pipes.encodeRmsNorm(f, .{
-                    .x = model.x_bind,
-                    .w = layer.post_attention_layernorm.binding,
-                    .y = model.x_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = model.config.rms_norm_eps,
-                    .w_dtype = layer.post_attention_layernorm.dtype,
-                }, true);
+                try model.encodeResidualThenRmsNorm(f, model.x_bind, model.proj_out_bind, layer.post_attention_layernorm, model.x_norm_bind, m, had);
+            } else {
+                const f = try model.ensureOptionalFrame(&frame_opt);
+                try model.encodeProjResidualAndPostNorm(
+                    f,
+                    layer.o_proj,
+                    layer.post_attention_layernorm,
+                    model.attn_out_bind,
+                    model.x_bind,
+                    model.proj_out_bind,
+                    model.x_norm_bind,
+                    m,
+                    .gemm32,
+                    true,
+                );
             }
 
             switch (model.config.arch) {
@@ -11629,20 +11994,27 @@ pub const Qwen3BatchRuntime = struct {
                         }
                     } else {
                         const f = try model.ensureOptionalFrame(&frame_opt);
-                        try model.encodeLinearGemmWithTile(f, layer.dense_gate, model.x_norm_bind, model.dense_gate_bind, m, false, true);
-                        try model.encodeLinearGemmWithTile(f, layer.dense_up, model.x_norm_bind, model.dense_up_bind, m, false, false);
-                        try model.moe_pipes.encodeSiluMul(f, .{
-                            .gate = model.dense_gate_bind,
-                            .up = model.dense_up_bind,
-                            .out = model.dense_act_bind,
-                            .count = m * model.config.intermediate_size,
-                        }, true);
-                        try model.encodeLinearGemmWithTile(f, layer.dense_down, model.dense_act_bind, model.proj_out_bind, m, false, true);
-                        try model.moe_pipes.encodeResidualAdd(f, .{
-                            .x = model.x_bind,
-                            .delta = model.proj_out_bind,
-                            .count = m * h,
-                        }, true);
+                        try model.encodeDenseGateUpAct(
+                            f,
+                            layer,
+                            model.x_norm_bind,
+                            model.dense_gate_bind,
+                            model.dense_up_bind,
+                            model.dense_act_bind,
+                            m,
+                            .gemm32,
+                            true,
+                        );
+                        try model.encodeDownResidual(
+                            f,
+                            layer.dense_down,
+                            model.dense_act_bind,
+                            model.x_bind,
+                            model.proj_out_bind,
+                            m,
+                            .gemm32,
+                            true,
+                        );
                     }
                 },
             }
@@ -11909,9 +12281,7 @@ pub const Qwen3BatchRuntime = struct {
                 _ = model.execLinearHetero(&frame_opt, layer.v_proj, model.x_norm_bind, model.x_norm_host, model.v_bind, model.v_host, b_u32, false) catch return error.DecodeFailed;
             } else {
                 const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
-                model.encodeLinearGemm(f, layer.q_proj, model.x_norm_bind, model.q_bind, b_u32, true) catch return error.DecodeFailed;
-                model.encodeLinearGemm(f, layer.k_proj, model.x_norm_bind, model.k_bind, b_u32, false) catch return error.DecodeFailed;
-                model.encodeLinearGemm(f, layer.v_proj, model.x_norm_bind, model.v_bind, b_u32, false) catch return error.DecodeFailed;
+                model.encodeQkvProj(f, layer.q_proj, layer.k_proj, layer.v_proj, model.x_norm_bind, model.q_bind, model.k_bind, model.v_bind, b_u32, .gemm32, true) catch return error.DecodeFailed;
             }
 
             {
@@ -11956,28 +12326,23 @@ pub const Qwen3BatchRuntime = struct {
 
             if (model.has_sme2_weights) {
                 _ = model.execLinearHetero(&frame_opt, layer.o_proj, model.attn_out_bind, model.attn_out_host, model.proj_out_bind, model.proj_out_host, b_u32, true) catch return error.DecodeFailed;
-            } else {
-                const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
-                model.encodeLinearGemm(f, layer.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
-            }
-
-            {
                 const had = (frame_opt != null);
                 const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
-                model.moe_pipes.encodeResidualAdd(f, .{
-                    .x = model.x_bind,
-                    .delta = model.proj_out_bind,
-                    .count = b_u32 * h,
-                }, had) catch return error.DecodeFailed;
-                model.attn_pipes.encodeRmsNorm(f, .{
-                    .x = model.x_bind,
-                    .w = layer.post_attention_layernorm.binding,
-                    .y = model.x_norm_bind,
-                    .num_rows = b_u32,
-                    .hidden_dim = h,
-                    .eps = model.config.rms_norm_eps,
-                    .w_dtype = layer.post_attention_layernorm.dtype,
-                }, true) catch return error.DecodeFailed;
+                model.encodeResidualThenRmsNorm(f, model.x_bind, model.proj_out_bind, layer.post_attention_layernorm, model.x_norm_bind, b_u32, had) catch return error.DecodeFailed;
+            } else {
+                const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
+                model.encodeProjResidualAndPostNorm(
+                    f,
+                    layer.o_proj,
+                    layer.post_attention_layernorm,
+                    model.attn_out_bind,
+                    model.x_bind,
+                    model.proj_out_bind,
+                    model.x_norm_bind,
+                    b_u32,
+                    .gemm32,
+                    true,
+                ) catch return error.DecodeFailed;
             }
 
             switch (model.config.arch) {
@@ -12029,20 +12394,27 @@ pub const Qwen3BatchRuntime = struct {
                         }
                     } else {
                         const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
-                        model.encodeLinearGemm(f, layer.dense_gate, model.x_norm_bind, model.dense_gate_bind, b_u32, true) catch return error.DecodeFailed;
-                        model.encodeLinearGemm(f, layer.dense_up, model.x_norm_bind, model.dense_up_bind, b_u32, false) catch return error.DecodeFailed;
-                        model.moe_pipes.encodeSiluMul(f, .{
-                            .gate = model.dense_gate_bind,
-                            .up = model.dense_up_bind,
-                            .out = model.dense_act_bind,
-                            .count = b_u32 * model.config.intermediate_size,
-                        }, true) catch return error.DecodeFailed;
-                        model.encodeLinearGemm(f, layer.dense_down, model.dense_act_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
-                        model.moe_pipes.encodeResidualAdd(f, .{
-                            .x = model.x_bind,
-                            .delta = model.proj_out_bind,
-                            .count = b_u32 * h,
-                        }, true) catch return error.DecodeFailed;
+                        model.encodeDenseGateUpAct(
+                            f,
+                            layer,
+                            model.x_norm_bind,
+                            model.dense_gate_bind,
+                            model.dense_up_bind,
+                            model.dense_act_bind,
+                            b_u32,
+                            .gemm32,
+                            true,
+                        ) catch return error.DecodeFailed;
+                        model.encodeDownResidual(
+                            f,
+                            layer.dense_down,
+                            model.dense_act_bind,
+                            model.x_bind,
+                            model.proj_out_bind,
+                            b_u32,
+                            .gemm32,
+                            true,
+                        ) catch return error.DecodeFailed;
                     }
                 },
             }

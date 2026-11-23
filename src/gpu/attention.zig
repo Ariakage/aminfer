@@ -2463,6 +2463,209 @@ pub const AttentionPipelines = struct {
             insert_barrier_before,
         );
     }
+
+    pub const FusedNormCanaryResult = struct {
+        elapsed_us: f64,
+        max_abs_err_f16: f32,
+        max_abs_err_bf16: f32,
+    };
+
+    pub const CombinedStartupCanaryResult = struct {
+        dequant: dequant.CanaryResult,
+        fused_norm: FusedNormCanaryResult,
+        elapsed_us: f64,
+    };
+
+    const fused_canary_rows: usize = 4;
+    const fused_canary_hidden: usize = 64;
+    const fused_canary_elems: usize = fused_canary_rows * fused_canary_hidden;
+    const fused_canary_bytes: usize = 2816; // 4 * 64 * 2 * 5 + 64 * 2 * 2
+
+    const FusedNormCanaryState = struct {
+        base_off: usize,
+        cpu_sum: [fused_canary_elems]f32 = undefined,
+        w_f16: [fused_canary_hidden]u16 = undefined,
+        w_bf16: [fused_canary_hidden]u16 = undefined,
+    };
+
+    fn prepareFusedNormCanaryAtOffset(
+        wired_bytes: []align(page.APPLE_PAGE_SIZE) u8,
+        base_off: usize,
+        state: *FusedNormCanaryState,
+    ) dequant.CanaryError!void {
+        if (base_off + fused_canary_bytes > wired_bytes.len) return error.InvalidArgument;
+        state.base_off = base_off;
+        const rows = fused_canary_rows;
+        const hidden = fused_canary_hidden;
+        const elems = fused_canary_elems;
+        const x_f16_off = base_off + 0;
+        const x_bf16_off = base_off + 512;
+        const d_off = base_off + 1024;
+        const w_f16_off = base_off + 1536;
+        const w_bf16_off = base_off + 1664;
+        const n_bf16_off = base_off + 2304;
+        @memset(wired_bytes[base_off .. n_bf16_off + elems * 2], 0);
+
+        const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[x_f16_off .. x_f16_off + elems * 2]));
+        const x_bf16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[x_bf16_off .. x_bf16_off + elems * 2]));
+        const d_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[d_off .. d_off + elems * 2]));
+        const w_f16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, wired_bytes[w_f16_off .. w_f16_off + hidden * 2]));
+        const w_bf16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, wired_bytes[w_bf16_off .. w_bf16_off + hidden * 2]));
+        _ = rows;
+
+        for (0..elems) |i| {
+            const xv: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 19 + 7) % 31)) - 15)) * 0.0625);
+            const dv: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 3) % 23)) - 11)) * 0.03125);
+            x_f16[i] = xv;
+            x_bf16[i] = xv;
+            d_f16[i] = dv;
+            const s: f16 = @floatCast(@as(f32, @floatCast(xv)) + @as(f32, @floatCast(dv)));
+            state.cpu_sum[i] = @floatCast(s);
+        }
+        for (0..hidden) |j| {
+            const wv = 0.75 + @as(f32, @floatFromInt(j % 17)) * 0.03125;
+            const wf = quant.f32ToFloatBits(.f16, wv);
+            const wbf = quant.f32ToFloatBits(.bf16, wv);
+            w_f16[j] = wf;
+            w_bf16[j] = wbf;
+            state.w_f16[j] = wf;
+            state.w_bf16[j] = wbf;
+        }
+    }
+
+    fn encodeFusedNormCanaryAtOffset(
+        self: *const AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        gpu_buf: metal.Buffer,
+        base_off: usize,
+    ) metal.Error!void {
+        try self.encodeFusedResidualRmsNorm(frame, .{
+            .x = .{ .buffer = gpu_buf, .offset = base_off + 0 },
+            .delta = .{ .buffer = gpu_buf, .offset = base_off + 1024 },
+            .w = .{ .buffer = gpu_buf, .offset = base_off + 1536 },
+            .x_norm = .{ .buffer = gpu_buf, .offset = base_off + 1792 },
+            .num_rows = fused_canary_rows,
+            .hidden_dim = fused_canary_hidden,
+            .eps = 1e-6,
+            .w_dtype = .f16,
+        }, false);
+        try self.encodeFusedResidualRmsNorm(frame, .{
+            .x = .{ .buffer = gpu_buf, .offset = base_off + 512 },
+            .delta = .{ .buffer = gpu_buf, .offset = base_off + 1024 },
+            .w = .{ .buffer = gpu_buf, .offset = base_off + 1664 },
+            .x_norm = .{ .buffer = gpu_buf, .offset = base_off + 2304 },
+            .num_rows = fused_canary_rows,
+            .hidden_dim = fused_canary_hidden,
+            .eps = 1e-6,
+            .w_dtype = .bf16,
+        }, false);
+    }
+
+    fn verifyFusedNormCanaryAtOffset(
+        wired_bytes: []align(page.APPLE_PAGE_SIZE) const u8,
+        state: *const FusedNormCanaryState,
+        elapsed_us: f64,
+    ) dequant.CanaryError!FusedNormCanaryResult {
+        const rows = fused_canary_rows;
+        const hidden = fused_canary_hidden;
+        const elems = fused_canary_elems;
+        const x_f16_off = state.base_off + 0;
+        const x_bf16_off = state.base_off + 512;
+        const n_f16_off = state.base_off + 1792;
+        const n_bf16_off = state.base_off + 2304;
+
+        const x_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[x_f16_off .. x_f16_off + elems * 2]));
+        const x_bf16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[x_bf16_off .. x_bf16_off + elems * 2]));
+        const n_f16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[n_f16_off .. n_f16_off + elems * 2]));
+        const n_bf16: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, wired_bytes[n_bf16_off .. n_bf16_off + elems * 2]));
+
+        var ref_norm_f16: [elems]f32 = undefined;
+        var ref_norm_bf16: [elems]f32 = undefined;
+        for (0..rows) |r| {
+            const base = r * hidden;
+            var sum_sq: f64 = 0.0;
+            for (0..hidden) |j| {
+                const xr = state.cpu_sum[base + j];
+                sum_sq += @as(f64, xr) * @as(f64, xr);
+            }
+            const inv_rms: f32 = @floatCast(1.0 / @sqrt(sum_sq / @as(f64, @floatFromInt(hidden)) + 1e-6));
+            for (0..hidden) |j| {
+                ref_norm_f16[base + j] = state.cpu_sum[base + j] * inv_rms * quant.floatBitsToF32(.f16, state.w_f16[j]);
+                ref_norm_bf16[base + j] = state.cpu_sum[base + j] * inv_rms * quant.floatBitsToF32(.bf16, state.w_bf16[j]);
+            }
+        }
+        _ = try dequant.verifyCanaryPair(x_f16, &state.cpu_sum, dequant.CANARY_TOL_F16);
+        _ = try dequant.verifyCanaryPair(x_bf16, &state.cpu_sum, dequant.CANARY_TOL_F16);
+        const err_f16 = try dequant.verifyCanaryPair(n_f16, &ref_norm_f16, dequant.CANARY_TOL_F16);
+        const err_bf16 = try dequant.verifyCanaryPair(n_bf16, &ref_norm_bf16, dequant.CANARY_TOL_BF16);
+
+        return .{
+            .elapsed_us = elapsed_us,
+            .max_abs_err_f16 = err_f16,
+            .max_abs_err_bf16 = err_bf16,
+        };
+    }
+
+    /// Startup numerical canary (`G16` + `G18`) for `ami_fused_residual_rmsnorm`
+    /// across `f16` and `bf16` norm weights reusing the caller's resident
+    /// `16 KiB` wired buffer (`>= 4096 B`). Zero heap allocation.
+    pub fn runStartupFusedNormCanaryInBuffer(
+        self: *const AttentionPipelines,
+        compute: *metal.Compute,
+        gpu_buf: metal.Buffer,
+        wired_bytes: []align(page.APPLE_PAGE_SIZE) u8,
+    ) dequant.CanaryError!FusedNormCanaryResult {
+        if (wired_bytes.len < page.APPLE_PAGE_SIZE) return error.InvalidArgument;
+        var state: FusedNormCanaryState = .{ .base_off = 0 };
+        try prepareFusedNormCanaryAtOffset(wired_bytes, 0, &state);
+
+        const t0 = try vmstat.nowNs();
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try self.encodeFusedNormCanaryAtOffset(&frame, gpu_buf, 0);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+        const t1 = try vmstat.nowNs();
+
+        return verifyFusedNormCanaryAtOffset(wired_bytes, &state, @as(f64, @floatFromInt(t1 - t0)) / 1000.0);
+    }
+
+    /// Runs both `DequantPipelines` (`G16`/`G17`/`G18`) and `ami_fused_residual_rmsnorm`
+    /// (`G18`) startup numerical canaries inside a single Metal 4 command buffer and
+    /// single `16 KiB` resident wired page, eliminating duplicate submit/wait overhead.
+    pub fn runCombinedStartupCanaryInBufferMut(
+        self: *const AttentionPipelines,
+        dq_pipes: *dequant.DequantPipelines,
+        compute: *metal.Compute,
+        gpu_buf: metal.Buffer,
+        wired_bytes: []align(page.APPLE_PAGE_SIZE) u8,
+    ) dequant.CanaryError!CombinedStartupCanaryResult {
+        if (wired_bytes.len < page.APPLE_PAGE_SIZE) return error.InvalidArgument;
+
+        var dq_state: dequant.DequantPipelines.StartupCanaryState = .{};
+        try dq_pipes.prepareStartupNumericalCanary(wired_bytes, &dq_state);
+        var norm_state: FusedNormCanaryState = .{ .base_off = dequant.DequantPipelines.COMBINED_CANARY_TAIL_OFFSET };
+        try prepareFusedNormCanaryAtOffset(wired_bytes, dequant.DequantPipelines.COMBINED_CANARY_TAIL_OFFSET, &norm_state);
+
+        const t0 = try vmstat.nowNs();
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try dq_pipes.encodeStartupNumericalCanary(&frame, gpu_buf, &dq_state);
+        try self.encodeFusedNormCanaryAtOffset(&frame, gpu_buf, dequant.DequantPipelines.COMBINED_CANARY_TAIL_OFFSET);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+        const t1 = try vmstat.nowNs();
+
+        const elapsed_us = @as(f64, @floatFromInt(t1 - t0)) / 1000.0;
+        const dq_res = try dq_pipes.verifyStartupNumericalCanary(wired_bytes, &dq_state, elapsed_us);
+        dq_pipes.syncNaxState();
+        const norm_res = try verifyFusedNormCanaryAtOffset(wired_bytes, &norm_state, elapsed_us);
+        return .{
+            .dequant = dq_res,
+            .fused_norm = norm_res,
+            .elapsed_us = elapsed_us,
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -7482,6 +7685,33 @@ test "G18: ami_fused_residual_rmsnorm matches CPU fp32 reference for f16/bf16 we
                 const expected = cpu_res[base + j] * inv_rms * wv;
                 try std.testing.expectApproxEqAbs(expected, @as(f32, @floatCast(n_f16[base + j])), tc.tol);
             }
+        }
+    }
+
+    // Also verify the combined G16+G18 startup numerical canary (`dequant` +
+    // `ami_fused_residual_rmsnorm`) keeps warm latency < 0.35 ms (`350 us`).
+    {
+        var dq_pipes = try dequant.DequantPipelines.init(device, library);
+        defer dq_pipes.close();
+        const scratch = try page.WiredRegion.init(page.APPLE_PAGE_SIZE);
+        defer scratch.deinit();
+        const gpu_buf = try metal.Buffer.wrap(device, scratch.bytes);
+        defer gpu_buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+
+        var best_total_us: f64 = std.math.inf(f64);
+        for (0..8) |_| {
+            const comb = try pipes.runCombinedStartupCanaryInBufferMut(&dq_pipes, &compute, gpu_buf, scratch.bytes);
+            try std.testing.expect(comb.dequant.g18_max_abs_err <= dequant.CANARY_TOL_Q4);
+            try std.testing.expect(comb.fused_norm.max_abs_err_f16 <= dequant.CANARY_TOL_F16);
+            try std.testing.expect(comb.fused_norm.max_abs_err_bf16 <= dequant.CANARY_TOL_BF16);
+            best_total_us = @min(best_total_us, comb.elapsed_us);
+        }
+        const validation_on = (std.c.getenv("MTL_SHADER_VALIDATION") != null or std.c.getenv("MTL_DEBUG_LAYER") != null);
+        if (!validation_on) {
+            try std.testing.expect(best_total_us < 350.0);
         }
     }
 }

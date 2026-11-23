@@ -35,6 +35,9 @@ const rng_mod = @import("../runtime/rng.zig");
 const qos = @import("../platform/qos.zig");
 const vmstat = @import("../platform/vmstat.zig");
 const sme = @import("../cpu/sme.zig");
+const grammar_mod = @import("grammar.zig");
+const sampling_mod = @import("sampling.zig");
+const gpu_sampler_mod = @import("../gpu/sampler.zig");
 
 pub const MAX_TREE_NODES: u16 = tree_mod.MAX_SUPPORTED_NODES;
 const MAX_PRED_LAYERS: usize = qwen3.MAX_EXPERT_PRED_LAYERS;
@@ -104,6 +107,20 @@ pub const SpecConfig = struct {
     ngram_table: ?*ngram_nvme.NvmeNgramTable = null,
     /// Optional C14 hot-swappable multi-pack `.ang` domain registry.
     ngram_registry: ?*ngram_nvme.DomainNgramRegistry = null,
+    /// Enable G21 GPU-resident constrained/radix sampler up to 248K vocab when
+    /// wired headroom allows (strictly bypassed for unconstrained greedy).
+    enable_gpu_sampler: bool = true,
+};
+
+pub const SpecConstraints = struct {
+    grammar_program: ?*const grammar_mod.GrammarProgram = null,
+    vocab_index: ?*const grammar_mod.VocabIndex = null,
+    token_slices: ?[]const ?[]const u8 = null,
+    token_bytes_fn: ?*const fn (ctx: ?*const anyopaque, token_id: u32) ?[]const u8 = null,
+    token_bytes_ctx: ?*const anyopaque = null,
+    eos_token_ids: []const u32 = &.{},
+    sampling: sampling_mod.SamplingParams = .{},
+    prompt_history: []const u32 = &.{},
 };
 
 pub const SpecStats = struct {
@@ -201,7 +218,7 @@ pub const InitError = error{
     BudgetExceeded,
     OutOfMemory,
 } || sam_mod.InitError || arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError ||
-    budget_mod.PlanError || std.Thread.SpawnError || qos.Error;
+    budget_mod.PlanError || std.Thread.SpawnError || qos.Error || gpu_sampler_mod.Error;
 
 pub const RunError = error{
     EmptyPrompt,
@@ -211,7 +228,7 @@ pub const RunError = error{
     TokenOutOfRange,
     MissingRng,
 } || qwen3.StepError || graph.GraphStepError || draft_mod.DraftStepError || dspark_mod.Error || tree_mod.PruneError ||
-    accept_mod.VerifyError || ngram_nvme.RegistryQueryError;
+    accept_mod.VerifyError || accept_mod.ConstrainedVerifyError || gpu_sampler_mod.Error || ngram_nvme.RegistryQueryError;
 
 /// Startup-loaded `D10` `DSpark` proposer bundle backed by a `dspark.amf` weight
 /// container and a zero-copy GPU `LmHeadHook.callback` tied to `GraphModel.evalLmHeadBatchF32`.
@@ -480,6 +497,48 @@ pub const TargetModel = union(enum) {
         return switch (self) {
             .qwen3 => |m| m.last_logits_row,
             .graph => |g| g.last_logits_row,
+        };
+    }
+
+    pub fn logitsBaseBinding(self: TargetModel) metal.BufferBinding {
+        return switch (self) {
+            .qwen3 => |m| m.logitsBaseBinding(),
+            .graph => |g| g.logitsBaseBinding(),
+        };
+    }
+
+    pub fn lastLogitsBinding(self: TargetModel) metal.BufferBinding {
+        return switch (self) {
+            .qwen3 => |m| m.lastLogitsBinding(),
+            .graph => |g| g.lastLogitsBinding(),
+        };
+    }
+
+    pub fn gpuCompute(self: TargetModel) *metal.Compute {
+        return switch (self) {
+            .qwen3 => |m| &m.compute,
+            .graph => |g| &g.compute,
+        };
+    }
+
+    pub fn gpuDevice(self: TargetModel) metal.Device {
+        return switch (self) {
+            .qwen3 => |m| m.device,
+            .graph => |g| g.device,
+        };
+    }
+
+    pub fn gpuLibrary(self: TargetModel) metal.Library {
+        return switch (self) {
+            .qwen3 => |m| m.library,
+            .graph => |g| g.library,
+        };
+    }
+
+    pub fn timeoutMs(self: TargetModel) u64 {
+        return switch (self) {
+            .qwen3 => |m| m.timeout_ms,
+            .graph => |g| g.timeout_ms,
         };
     }
 
@@ -1242,6 +1301,22 @@ pub const SpecEngine = struct {
     prefetch_tail_buf: [ngram_nvme.MAX_CTX_LEN]u32,
     shifted_tokens: [MAX_TREE_NODES]u32,
     p_res: []f32,
+    sampler_cand_ids: []u32,
+    grammar_mask: []u32,
+    penalty_tracker: *sampling_mod.DefaultPenaltyTracker,
+    gpu_sampler: ?gpu_sampler_mod.GpuSampler,
+    gpu_sampler_wired_bytes: u64,
+    batch_row_reqs: [MAX_TREE_NODES]gpu_sampler_mod.RowRequest,
+    vocab_index: ?*const grammar_mod.VocabIndex,
+    token_slices: ?[]const ?[]const u8,
+    token_bytes_fn: ?*const fn (ctx: ?*const anyopaque, token_id: u32) ?[]const u8,
+    token_bytes_ctx: ?*const anyopaque,
+    eos_token_ids: []const u32,
+    grammar_program: ?*const grammar_mod.GrammarProgram,
+    grammar_state: grammar_mod.GrammarState,
+    sampling_params: sampling_mod.SamplingParams,
+    node_grammar_states: [MAX_TREE_NODES]grammar_mod.GrammarState,
+    node_grammar_valid: [MAX_TREE_NODES]bool,
 
     next_pos: u32,
     last_token: u32,
@@ -1383,6 +1458,54 @@ pub const SpecEngine = struct {
 
         const p_res = try allocator.alloc(f32, target.vocabSize());
         errdefer allocator.free(p_res);
+        const sampler_cand_ids = try allocator.alloc(u32, target.vocabSize());
+        errdefer allocator.free(sampler_cand_ids);
+        const mask_words = @max(@as(usize, 1), grammar_mod.bitmaskWordCount(target.vocabSize()));
+        const grammar_mask = try allocator.alloc(u32, mask_words);
+        errdefer allocator.free(grammar_mask);
+        @memset(grammar_mask, 0xFFFF_FFFF);
+        const penalty_tracker = try allocator.create(sampling_mod.DefaultPenaltyTracker);
+        errdefer allocator.destroy(penalty_tracker);
+        penalty_tracker.* = sampling_mod.DefaultPenaltyTracker.init();
+
+        var gpu_sampler_opt: ?gpu_sampler_mod.GpuSampler = null;
+        var gpu_sampler_wired: u64 = 0;
+        const v_u32 = target.vocabSize();
+        if (config.enable_gpu_sampler and v_u32 > 0 and v_u32 <= gpu_sampler_mod.MAX_VOCAB_SIZE) {
+            const avail_after_sam = if (target.wiredBudgetBytes() > existing_wired + arena_bytes)
+                target.wiredBudgetBytes() - (existing_wired + arena_bytes)
+            else
+                0;
+            const preferred_slots: u32 = @min(target.maxTreeNodes(), gpu_sampler_mod.MAX_BATCH_SLOTS);
+            const candidates = [_]u32{ preferred_slots, 1 };
+            for (candidates) |slots| {
+                if (slots == 0) continue;
+                const req_sz = gpu_sampler_mod.GpuSamplerWorkspace.requiredBytes(.{
+                    .max_vocab_size = v_u32,
+                    .max_batch_slots = slots,
+                }) catch continue;
+                const padded = page.alignUp(req_sz + page.APPLE_PAGE_SIZE) catch continue;
+                if (padded > avail_after_sam) continue;
+                if (gpu_sampler_mod.GpuSampler.initStandalone(target.gpuDevice(), target.gpuLibrary(), .{
+                    .max_vocab_size = v_u32,
+                    .max_batch_slots = slots,
+                })) |gs| {
+                    var gs_mut = gs;
+                    if (gs_mut.registerResident(target.gpuCompute().*)) {
+                        gpu_sampler_opt = gs_mut;
+                        gpu_sampler_wired = if (gs_mut.owned_arena) |oa| oa.bytes().len else padded;
+                    } else |err| {
+                        gs_mut.close();
+                        return err;
+                    }
+                } else |err| switch (err) {
+                    error.BudgetExceeded, error.OutOfMemory, error.Overflow => continue,
+                    else => |e| return e,
+                }
+                break;
+            }
+        }
+        errdefer if (gpu_sampler_opt) |*gs| gs.close();
 
         var cost = config.cost_model orelse switch (target) {
             .qwen3 => |m| defaultCostModelForTarget(m),
@@ -1483,6 +1606,22 @@ pub const SpecEngine = struct {
             .prefetch_tail_buf = @splat(0),
             .shifted_tokens = @splat(0),
             .p_res = p_res,
+            .sampler_cand_ids = sampler_cand_ids,
+            .grammar_mask = grammar_mask,
+            .penalty_tracker = penalty_tracker,
+            .gpu_sampler = gpu_sampler_opt,
+            .gpu_sampler_wired_bytes = gpu_sampler_wired,
+            .batch_row_reqs = @splat(.{}),
+            .vocab_index = null,
+            .token_slices = null,
+            .token_bytes_fn = null,
+            .token_bytes_ctx = null,
+            .eos_token_ids = &.{},
+            .grammar_program = null,
+            .grammar_state = undefined,
+            .sampling_params = .{},
+            .node_grammar_states = undefined,
+            .node_grammar_valid = @splat(true),
             .next_pos = 0,
             .last_token = 0,
             .has_prefilled = false,
@@ -1495,10 +1634,65 @@ pub const SpecEngine = struct {
             prt.deinit(allocator);
             self.pearl_rt = null;
         }
+        if (self.gpu_sampler) |*gs| {
+            gs.close();
+            self.gpu_sampler = null;
+        }
         if (self.expert_bytes_sampled.len > 0) allocator.free(self.expert_bytes_sampled);
         if (self.expert_bw_sampled.len > 0) allocator.free(self.expert_bw_sampled);
+        allocator.destroy(self.penalty_tracker);
+        allocator.free(self.grammar_mask);
+        allocator.free(self.sampler_cand_ids);
         allocator.free(self.p_res);
         self.sam_arena.deinit();
+    }
+
+    /// Configures per-request `C22` grammar state tracking and `C18` sampling
+    /// constraints with zero hot-path allocations (`G21`, ADR-0023 §4).
+    pub fn setConstraints(self: *SpecEngine, opts: SpecConstraints) void {
+        self.grammar_program = opts.grammar_program;
+        self.vocab_index = opts.vocab_index;
+        self.token_slices = opts.token_slices;
+        self.token_bytes_fn = opts.token_bytes_fn;
+        self.token_bytes_ctx = opts.token_bytes_ctx;
+        self.eos_token_ids = opts.eos_token_ids;
+        self.sampling_params = opts.sampling;
+        self.config.temperature = opts.sampling.temperature;
+        if (opts.grammar_program) |gp| {
+            self.grammar_state = gp.initialState();
+        }
+        self.penalty_tracker.reset();
+        if (opts.sampling.hasPenalties() and opts.prompt_history.len > 0) {
+            self.penalty_tracker.recordSlice(opts.prompt_history);
+        }
+        if (self.gpu_sampler) |*gs| {
+            const slots: usize = gs.workspace.spec.max_batch_slots;
+            for (0..slots) |s| {
+                gs.clearOverrides(@intCast(s));
+            }
+        }
+    }
+
+    /// Restores the strict unconstrained speculative decoding fast path.
+    pub fn clearConstraints(self: *SpecEngine) void {
+        self.grammar_program = null;
+        self.vocab_index = null;
+        self.token_slices = null;
+        self.token_bytes_fn = null;
+        self.token_bytes_ctx = null;
+        self.eos_token_ids = &.{};
+        self.sampling_params = .{};
+        self.penalty_tracker.reset();
+    }
+
+    pub fn isSamplingConstrained(self: *const SpecEngine) bool {
+        return self.grammar_program != null or
+            self.sampling_params.hasPenalties() or
+            self.sampling_params.logit_bias.len > 0 or
+            self.sampling_params.top_p < 1.0 or
+            self.sampling_params.top_k > 0 or
+            self.sampling_params.min_p > 0.0 or
+            self.sampling_params.allowed_token_mask != null;
     }
 
     pub fn setNgramTable(self: *SpecEngine, tbl: ?*ngram_nvme.NvmeNgramTable) void {
@@ -1531,6 +1725,17 @@ pub const SpecEngine = struct {
         self.has_prefilled = false;
         self.stats = .{};
         self.stats.pearl_enabled = self.pearl_enabled;
+        if (self.grammar_program) |gp| {
+            self.grammar_state = gp.initialState();
+        }
+        self.penalty_tracker.reset();
+        @memset(&self.node_grammar_valid, true);
+        if (self.gpu_sampler) |*gs| {
+            const slots: usize = gs.workspace.spec.max_batch_slots;
+            for (0..slots) |s| {
+                gs.clearOverrides(@intCast(s));
+            }
+        }
     }
 
     pub fn totalWiredBytes(self: *const SpecEngine) u64 {
@@ -1544,7 +1749,7 @@ pub const SpecEngine = struct {
             0;
         const ngram_bytes: u64 = (if (self.ngram_table) |nt| nt.totalWiredBytes() else 0) +
             (if (self.ngram_registry) |nr| nr.totalWiredBytes() else 0);
-        return self.target.totalWiredBytes() + draft_bytes + self.sam_arena.bytes().len + ngram_bytes;
+        return self.target.totalWiredBytes() + draft_bytes + self.sam_arena.bytes().len + ngram_bytes + self.gpu_sampler_wired_bytes;
     }
 
     pub fn effectivePlacement(self: *const SpecEngine) draft_mod.Placement {
@@ -1574,13 +1779,329 @@ pub const SpecEngine = struct {
         };
     }
 
-    fn sampleFirstToken(self: *SpecEngine, row_idx: usize, greedy_tok: u32, rng: ?std.Random) RunError!u32 {
-        if (self.config.temperature == 0.0) return greedy_tok;
-        const r = rng orelse return error.MissingRng;
+    fn queryDraftTopK(self: *const SpecEngine, vocab_limit: u32) u32 {
+        const k: u32 = if (self.grammar_program != null) draft_mod.MAX_DRAFT_TOP_K else self.config.top_k_per_node;
+        return @min(k, @min(vocab_limit, draft_mod.MAX_DRAFT_TOP_K));
+    }
+
+    fn makeGrammarAdapter(self: *SpecEngine, st: *grammar_mod.GrammarState) accept_mod.GrammarTreeAdapter {
+        return .{
+            .program = self.grammar_program,
+            .state = st,
+            .vocab_index = self.vocab_index,
+            .token_slices = self.token_slices,
+            .token_bytes_fn = self.token_bytes_fn,
+            .token_bytes_ctx = self.token_bytes_ctx,
+            .eos_token_ids = self.eos_token_ids,
+            .mask_scratch = self.grammar_mask,
+        };
+    }
+
+    fn fillBitmaskForState(self: *SpecEngine, st: *const grammar_mod.GrammarState) []const u32 {
         const v: usize = self.target.vocabSize();
-        const logits_row = self.target.logitsHost()[row_idx * v .. (row_idx + 1) * v];
-        try accept_mod.softmaxRow(f16, logits_row, self.config.temperature, self.p_res);
-        return accept_mod.sampleCategorical(self.p_res, r);
+        const words = grammar_mod.bitmaskWordCount(v);
+        const mask_out = self.grammar_mask[0..words];
+        if (self.vocab_index) |vi| {
+            vi.fillAllowedTokenBitmask(self.grammar_program, st, mask_out);
+        } else if (self.token_slices) |slices| {
+            grammar_mod.fillAllowedTokenBitmaskDirect(self.grammar_program, st, slices[0..v], self.eos_token_ids, mask_out);
+        } else if (self.token_bytes_fn) |get_fn| {
+            const prog = self.grammar_program orelse {
+                grammar_mod.allowAllTokens(mask_out, v);
+                return mask_out;
+            };
+            grammar_mod.clearBitmask(mask_out, v);
+            for (0..v) |tid_usize| {
+                const tid: u32 = @intCast(tid_usize);
+                var is_eos = false;
+                for (self.eos_token_ids) |eid| {
+                    if (eid == tid) {
+                        is_eos = true;
+                        break;
+                    }
+                }
+                const ok = if (is_eos) st.isAccepting() else blk: {
+                    const bytes = get_fn(self.token_bytes_ctx, tid) orelse break :blk false;
+                    if (bytes.len == 0) break :blk false;
+                    var tmp = st.snapshot();
+                    break :blk prog.advanceBytes(&tmp, bytes);
+                };
+                if (ok) mask_out[tid_usize >> 5] |= @as(u32, 1) << @as(u5, @intCast(tid_usize & 31));
+            }
+        } else {
+            grammar_mod.allowAllTokens(mask_out, v);
+        }
+        return mask_out;
+    }
+
+    fn advanceGrammarOnState(self: *const SpecEngine, st: *grammar_mod.GrammarState, token_id: u32) bool {
+        const prog = self.grammar_program orelse return true;
+        for (self.eos_token_ids) |eid| {
+            if (eid == token_id) return st.isAccepting();
+        }
+        if (self.vocab_index) |vi| {
+            for (vi.eos_tokens[0..vi.eos_count]) |eid| {
+                if (eid == token_id) return st.isAccepting();
+            }
+        }
+        if (self.token_slices) |slices| {
+            if (token_id >= slices.len) return false;
+            const raw = slices[token_id] orelse return false;
+            if (raw.len == 0) return false;
+            return prog.advanceBytes(st, raw);
+        }
+        if (self.token_bytes_fn) |get_fn| {
+            const raw = get_fn(self.token_bytes_ctx, token_id) orelse return false;
+            if (raw.len == 0) return false;
+            return prog.advanceBytes(st, raw);
+        }
+        return false;
+    }
+
+    fn tryInsertGrammarChild(
+        self: *SpecEngine,
+        parent: u16,
+        token_id: u32,
+        prob: f32,
+        source: tree_mod.NodeSource,
+    ) ?u16 {
+        if (self.grammar_program == null) {
+            return self.draft_tree.insertChild(parent, token_id, prob, source);
+        }
+        if (!self.node_grammar_valid[parent]) return null;
+        var child_st = self.node_grammar_states[parent].snapshot();
+        if (!self.advanceGrammarOnState(&child_st, token_id)) return null;
+        const idx = self.draft_tree.insertChild(parent, token_id, prob, source) orelse return null;
+        self.node_grammar_states[idx] = child_st;
+        self.node_grammar_valid[idx] = true;
+        return idx;
+    }
+
+    fn isEosTokenId(self: *const SpecEngine, token_id: u32) bool {
+        for (self.eos_token_ids) |eid| {
+            if (eid == token_id) return true;
+        }
+        if (self.vocab_index) |vi| {
+            for (vi.eos_tokens[0..vi.eos_count]) |eid| {
+                if (eid == token_id) return true;
+            }
+        }
+        return false;
+    }
+
+    fn backfillGrammarValidChildren(
+        self: *SpecEngine,
+        parent: u16,
+        candidate_cap: u16,
+        max_insert: u32,
+        fallback_logits_f16: ?[]const f16,
+    ) bool {
+        if (self.grammar_program == null or !self.node_grammar_valid[parent] or max_insert == 0) return false;
+        const v: usize = self.target.vocabSize();
+        const st_snap = self.node_grammar_states[parent].snapshot();
+        const mask = self.fillBitmaskForState(&st_snap);
+        var added_any = false;
+
+        if (fallback_logits_f16) |row_logits| {
+            if (row_logits.len >= v) {
+                const pick_k: usize = @min(@as(usize, max_insert), draft_mod.MAX_DRAFT_TOP_K);
+                var picked_ids: [draft_mod.MAX_DRAFT_TOP_K]u32 = undefined;
+                var picked_vals: [draft_mod.MAX_DRAFT_TOP_K]f32 = @splat(-std.math.inf(f32));
+                var picked_cnt: usize = 0;
+                for (mask, 0..) |word, w_idx| {
+                    var w = word;
+                    while (w != 0) {
+                        const bit: u5 = @intCast(@ctz(w));
+                        w &= w - 1;
+                        const tid_usize = (w_idx << 5) + @as(usize, bit);
+                        if (tid_usize >= v) break;
+                        const val: f32 = @floatCast(row_logits[tid_usize]);
+                        if (!std.math.isFinite(val)) continue;
+                        const tid: u32 = @intCast(tid_usize);
+                        if (picked_cnt < pick_k) {
+                            picked_vals[picked_cnt] = val;
+                            picked_ids[picked_cnt] = tid;
+                            picked_cnt += 1;
+                        } else if (val > picked_vals[pick_k - 1]) {
+                            picked_vals[pick_k - 1] = val;
+                            picked_ids[pick_k - 1] = tid;
+                        } else {
+                            continue;
+                        }
+                        var pos = picked_cnt - 1;
+                        while (pos > 0 and picked_vals[pos] > picked_vals[pos - 1]) : (pos -= 1) {
+                            const tv = picked_vals[pos - 1];
+                            const ti = picked_ids[pos - 1];
+                            picked_vals[pos - 1] = picked_vals[pos];
+                            picked_ids[pos - 1] = picked_ids[pos];
+                            picked_vals[pos] = tv;
+                            picked_ids[pos] = ti;
+                        }
+                    }
+                }
+                if (picked_cnt > 0) {
+                    const max_v = picked_vals[0];
+                    var denom: f32 = 0.0;
+                    for (0..picked_cnt) |i| denom += @exp(picked_vals[i] - max_v);
+                    for (0..picked_cnt) |i| {
+                        if (self.draft_tree.count >= candidate_cap and
+                            self.draft_tree.findChild(parent, picked_ids[i]) == null) break;
+                        const p: f32 = if (denom > 0.0) @exp(picked_vals[i] - max_v) / denom else 0.5;
+                        const before = self.draft_tree.count;
+                        _ = self.tryInsertGrammarChild(parent, picked_ids[i], p, .l2);
+                        if (self.draft_tree.count > before) added_any = true;
+                    }
+                    if (added_any) return true;
+                }
+            }
+        }
+
+        // Fallback when draft logits row isn't exposed on host (e.g. mapped EAGLE-3 head):
+        // pick allowed structural token(s) directly from the C22 bitmask so tree depth
+        // stays intact across deterministic JSON punctuation / schema transitions.
+        var inserted: u32 = 0;
+        var eos_fallback: ?u32 = null;
+        for (mask, 0..) |word, w_idx| {
+            var w = word;
+            while (w != 0) {
+                const bit: u5 = @intCast(@ctz(w));
+                w &= w - 1;
+                const tid_usize = (w_idx << 5) + @as(usize, bit);
+                if (tid_usize >= v) break;
+                const tid: u32 = @intCast(tid_usize);
+                if (self.isEosTokenId(tid)) {
+                    if (eos_fallback == null) eos_fallback = tid;
+                    continue;
+                }
+                if (self.draft_tree.count >= candidate_cap and self.draft_tree.findChild(parent, tid) == null) break;
+                const before = self.draft_tree.count;
+                if (self.tryInsertGrammarChild(parent, tid, 0.85, .l2) != null) {
+                    if (self.draft_tree.count > before) added_any = true;
+                    inserted += 1;
+                    if (inserted >= max_insert) return added_any;
+                }
+            }
+        }
+        if (inserted == 0) {
+            if (eos_fallback) |eid| {
+                if (self.draft_tree.count < candidate_cap or self.draft_tree.findChild(parent, eid) != null) {
+                    const before = self.draft_tree.count;
+                    if (self.tryInsertGrammarChild(parent, eid, 0.85, .l2) != null) {
+                        if (self.draft_tree.count > before) added_any = true;
+                    }
+                }
+            }
+        }
+        return added_any;
+    }
+
+    fn insertDraftCandidatesForParent(
+        self: *SpecEngine,
+        parent: u16,
+        row_cands: []const moe.TopKCandidate,
+        candidate_cap: u16,
+        target_limit: u32,
+        fallback_logits_f16: ?[]const f16,
+    ) bool {
+        var added_any = false;
+        if (self.grammar_program == null) {
+            for (row_cands) |cand| {
+                if (self.draft_tree.count >= candidate_cap and
+                    self.draft_tree.findChild(parent, cand.token_id) == null)
+                {
+                    break;
+                }
+                const before = self.draft_tree.count;
+                _ = self.draft_tree.insertChild(parent, cand.token_id, cand.prob, .l2);
+                if (self.draft_tree.count > before) added_any = true;
+            }
+            return added_any;
+        }
+
+        if (!self.node_grammar_valid[parent]) return false;
+        var valid_inserted: u32 = 0;
+        for (row_cands) |cand| {
+            if (valid_inserted >= target_limit) break;
+            if (self.draft_tree.count >= candidate_cap and
+                self.draft_tree.findChild(parent, cand.token_id) == null)
+            {
+                break;
+            }
+            const before = self.draft_tree.count;
+            if (self.tryInsertGrammarChild(parent, cand.token_id, cand.prob, .l2) != null) {
+                valid_inserted += 1;
+                if (self.draft_tree.count > before) added_any = true;
+            }
+        }
+        if (valid_inserted == 0) {
+            if (self.backfillGrammarValidChildren(parent, candidate_cap, @min(target_limit, 2), fallback_logits_f16)) {
+                added_any = true;
+            }
+        }
+        return added_any;
+    }
+
+    fn effectiveSamplingParams(self: *const SpecEngine) sampling_mod.SamplingParams {
+        var p = self.sampling_params;
+        p.temperature = self.config.temperature;
+        return p;
+    }
+
+    fn sampleFirstToken(self: *SpecEngine, row_idx: usize, greedy_tok: u32, rng: ?std.Random) RunError!u32 {
+        const eff_params = self.effectiveSamplingParams();
+        const unconstrained_greedy = (self.grammar_program == null) and eff_params.isUnconstrainedGreedy();
+        if (unconstrained_greedy) return greedy_tok;
+        if (eff_params.temperature > 0.0 and rng == null) return error.MissingRng;
+
+        const seed_u64: u64 = if (rng) |r| r.int(u64) else 0;
+        const v: usize = self.target.vocabSize();
+        var picked: u32 = greedy_tok;
+
+        if (self.gpu_sampler) |*gs| {
+            var samp_p = eff_params;
+            if (self.grammar_program != null) {
+                const st_snap = self.grammar_state.snapshot();
+                samp_p.allowed_token_mask = self.fillBitmaskForState(&st_snap);
+            }
+            const g_out = try gs.sampleSync(self.target.gpuCompute(), .{
+                .logits = self.target.lastLogitsBinding(),
+                .logits_dtype = .f16,
+                .vocab_size = @intCast(v),
+                .params = samp_p,
+                .seen_frequencies = if (samp_p.hasPenalties()) self.penalty_tracker.activeEntries() else null,
+                .rng_seed = seed_u64,
+            }, self.target.timeoutMs());
+            picked = g_out.token_id;
+        } else {
+            var samp_p = eff_params;
+            if (self.grammar_program != null) {
+                const st_snap = self.grammar_state.snapshot();
+                samp_p.allowed_token_mask = self.fillBitmaskForState(&st_snap);
+            }
+            const logits_row = self.target.logitsHost()[row_idx * v .. (row_idx + 1) * v];
+            var fallback_rng_box = std.Random.DefaultPrng.init(seed_u64);
+            var rng_req = rng_mod.RequestRng.initDeterministic(if (rng != null) fallback_rng_box.random().int(u64) else 0);
+            const c_out = try sampling_mod.sampleToken(
+                f16,
+                logits_row,
+                samp_p,
+                if (samp_p.hasPenalties()) self.penalty_tracker.activeEntries() else &.{},
+                &rng_req,
+                .{
+                    .logits_f32 = self.p_res,
+                    .cand_ids = self.sampler_cand_ids,
+                },
+            );
+            picked = c_out.token_id;
+        }
+
+        if (self.grammar_program != null) {
+            _ = self.advanceGrammarOnState(&self.grammar_state, picked);
+        }
+        if (eff_params.hasPenalties()) {
+            self.penalty_tracker.recordToken(picked);
+        }
+        return picked;
     }
 
     /// Prefills `prompt_tokens` using chunked causal verification (`prefillChunk`),
@@ -1598,6 +2119,9 @@ pub const SpecEngine = struct {
         }
 
         self.reset();
+        if (self.sampling_params.hasPenalties()) {
+            self.penalty_tracker.recordSlice(prompt_tokens);
+        }
 
         const need_top_hidden: bool = if (self.draft_head) |dh|
             (dh.config.format != .eagle3)
@@ -1656,7 +2180,7 @@ pub const SpecEngine = struct {
                             first_tok;
                     }
                     const is_final_sub = is_last and (sub + sub_take == take);
-                    const top_k: u32 = if (is_final_sub) self.config.top_k_per_node else 0;
+                    const top_k: u32 = if (is_final_sub) self.queryDraftTopK(dh.config.draft_vocab_size) else 0;
                     const sub_feat: metal.BufferBinding = .{
                         .buffer = feat_base.buffer,
                         .offset = feat_base.offset + @as(u64, sub) * feat_row_bytes,
@@ -1691,7 +2215,7 @@ pub const SpecEngine = struct {
 
         // Prefill standalone same-family small draft model (`D4`, zero target hidden-state dep).
         if (self.small_draft) |sd| {
-            try sd.prefillAndSeedRoot(prompt_tokens, first_tok, self.config.top_k_per_node);
+            try sd.prefillAndSeedRoot(prompt_tokens, first_tok, self.queryDraftTopK(sd.model.config.vocab_size));
         }
 
         self.next_pos = @intCast(prompt_tokens.len);
@@ -1722,6 +2246,134 @@ pub const SpecEngine = struct {
         return self.prefetch_tail_buf[0..need];
     }
 
+    fn validL1PrefixLen(self: *const SpecEngine, tokens: []const u32) usize {
+        if (self.grammar_program == null) return tokens.len;
+        var st = self.grammar_state.snapshot();
+        var n: usize = 0;
+        for (tokens) |tid| {
+            if (!self.advanceGrammarOnState(&st, tid)) break;
+            n += 1;
+        }
+        return n;
+    }
+
+    fn syncTreeGrammarStates(self: *SpecEngine) void {
+        if (self.grammar_program == null or self.draft_tree.count == 0) {
+            for (0..self.draft_tree.count) |i| self.node_grammar_valid[i] = true;
+            return;
+        }
+        self.node_grammar_states[0] = self.grammar_state.snapshot();
+        self.node_grammar_valid[0] = true;
+        var i: u16 = 1;
+        while (i < self.draft_tree.count) : (i += 1) {
+            const nd = self.draft_tree.nodes[i];
+            if (!self.node_grammar_valid[nd.parent]) {
+                self.node_grammar_valid[i] = false;
+                continue;
+            }
+            var st = self.node_grammar_states[nd.parent].snapshot();
+            if (self.advanceGrammarOnState(&st, nd.token_id)) {
+                self.node_grammar_states[i] = st;
+                self.node_grammar_valid[i] = true;
+            } else {
+                self.node_grammar_valid[i] = false;
+            }
+        }
+    }
+
+    fn verifyConstrainedGpuBatch(
+        self: *SpecEngine,
+        verified_nodes: u16,
+        params: sampling_mod.SamplingParams,
+        rng: ?std.Random,
+        out_tokens: []u32,
+    ) RunError!accept_mod.AcceptResult {
+        const gs = &(self.gpu_sampler.?);
+        const v_u32: u32 = self.target.vocabSize();
+        const grammar_active = (self.grammar_program != null);
+        if (grammar_active) {
+            for (0..verified_nodes) |ui| {
+                if (self.node_grammar_valid[ui]) {
+                    const st_snap = self.node_grammar_states[ui].snapshot();
+                    const mask = self.fillBitmaskForState(&st_snap);
+                    try gs.setBitmask(@intCast(ui), v_u32, mask);
+                } else {
+                    try gs.setBitmaskAllAllowed(@intCast(ui), v_u32);
+                }
+            }
+        }
+
+        const base_seed: u64 = if (rng) |r| r.int(u64) else 0;
+        var row_p = params;
+        row_p.allowed_token_mask = null; // supplied via `external_bitmasks`
+        for (0..verified_nodes) |ui| {
+            self.batch_row_reqs[ui] = .{
+                .params = row_p,
+                .seen_frequencies = null,
+                .rng_seed = base_seed +% @as(u64, ui),
+                .bitmask_slot = @intCast(ui),
+            };
+        }
+
+        const compute = self.target.gpuCompute();
+        var frame = try compute.beginFrame(self.target.timeoutMs());
+        errdefer frame.abort();
+        try gs.encodeSampleBatch(&frame, .{
+            .logits = self.target.logitsBaseBinding(),
+            .logits_dtype = .f16,
+            .vocab_size = v_u32,
+            .rows = self.batch_row_reqs[0..verified_nodes],
+            .external_bitmasks = if (grammar_active) .{
+                .buffer = gs.ws_buf,
+                .offset = gs.workspace.bitmasks_off,
+            } else null,
+            .external_bitmask_stride_u32 = gs.workspace.bitmask_stride_u32,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, self.target.timeoutMs());
+
+        var u: u16 = 0;
+        self.accepted_nodes[0] = 0;
+        var draft_accepted: u16 = 0;
+        while (true) {
+            const g_out = try gs.readOutput(@intCast(u));
+            const t = g_out.token_id;
+            if (self.grammar_program != null) {
+                if (!self.advanceGrammarOnState(&self.grammar_state, t)) break;
+            }
+            if (params.hasPenalties()) {
+                self.penalty_tracker.recordToken(t);
+            }
+            if (self.draft_tree.findChild(u, t)) |child| {
+                if (!grammar_active or self.node_grammar_valid[child]) {
+                    out_tokens[draft_accepted] = t;
+                    draft_accepted += 1;
+                    self.accepted_nodes[draft_accepted] = child;
+                    u = child;
+                    continue;
+                }
+            }
+            out_tokens[draft_accepted] = t;
+            return .{
+                .accepted_node_count = draft_accepted + 1,
+                .emitted_token_count = draft_accepted + 1,
+                .draft_accepted = draft_accepted,
+                .last_accepted_node = u,
+                .bonus_token = t,
+            };
+        }
+        // Fallback when token matched end-of-grammar without a child branch.
+        const last_out = try gs.readOutput(@intCast(u));
+        out_tokens[draft_accepted] = last_out.token_id;
+        return .{
+            .accepted_node_count = draft_accepted + 1,
+            .emitted_token_count = draft_accepted + 1,
+            .draft_accepted = draft_accepted,
+            .last_accepted_node = u,
+            .bonus_token = last_out.token_id,
+        };
+    }
+
     /// Executes one full speculative decode round with zero dynamic heap allocation:
     /// 1) L1 Suffix Automaton (`D1`, `D6`) + optional C6 NVMe `.ang` query when SAM `< 4`,
     /// 2) L2 dynamic EAGLE-2/3/MTP / SmallDraft expansion (or zero-wait D8 PEARL reuse),
@@ -1741,6 +2393,10 @@ pub const SpecEngine = struct {
         if (!self.has_prefilled) return error.NotPrefilled;
         if (out_tokens.len == 0) return error.OutputBufferTooSmall;
         if (self.config.temperature > 0.0 and rng == null) return error.MissingRng;
+
+        const grammar_active = (self.grammar_program != null);
+        const constrained = grammar_active or self.isSamplingConstrained();
+        const eff_params = self.effectiveSamplingParams();
 
         const max_seq = self.effectiveMaxSeqLen();
         if (self.next_pos >= max_seq) return error.SequenceFull;
@@ -1763,9 +2419,9 @@ pub const SpecEngine = struct {
 
         const t_draft_start = std.Io.Timestamp.now(std.Options.debug_io, .awake);
 
-        // Adopt pre-drafted D8 PEARL tree if available, otherwise reset tree to root `0` = `last_token`.
+        // Adopt pre-drafted D8 PEARL tree when unconstrained, otherwise reset tree to root `0`.
         var used_pearl_tree = false;
-        if (self.has_pearl_ready_tree and self.pearl_ready_tree.nodes[0].token_id == self.last_token) {
+        if (!constrained and self.has_pearl_ready_tree and self.pearl_ready_tree.nodes[0].token_id == self.last_token) {
             self.draft_tree.copyTruncatedFrom(&self.pearl_ready_tree, max_allowed_depth, candidate_cap);
             self.has_pearl_ready_tree = false;
             used_pearl_tree = true;
@@ -1778,16 +2434,23 @@ pub const SpecEngine = struct {
         @memset(&self.slot_ancestor_masks, 0);
         self.tree_slot_of_node[0] = 0; // root hidden lives in draft `hidden_pool[0]`
         self.slot_expanded[0] = true;
+        self.syncTreeGrammarStates();
 
         // 1. L1 Suffix Automaton (`D1`, `D6`, ADR-0005) + C6 NVMe N-gram fallback when SAM `< 4`.
         const l1_cap: usize = @min(
             @as(usize, self.config.l1_max_draft),
             @min(@as(usize, max_allowed_depth), @as(usize, candidate_cap - 1)),
         );
-        const sam_q = if (l1_cap > 0)
+        var sam_q = if (l1_cap > 0)
             self.sam.queryActive(l1_cap, self.l1_buf[0..l1_cap])
         else
             sam_mod.QueryResult{ .match_len = 0, .draft_len = 0, .is_seed = false };
+        if (grammar_active and sam_q.draft_len > 0) {
+            const valid_sam = self.validL1PrefixLen(self.l1_buf[0..sam_q.draft_len]);
+            sam_q.draft_len = @intCast(valid_sam);
+            if (valid_sam < sam_mod.SEED_MIN_MATCH_LEN) sam_q.is_seed = false;
+            if (valid_sam == 0) sam_q.match_len = 0;
+        }
 
         var effective_l1_match_len: u32 = sam_q.match_len;
         var ngram_match_len: u32 = 0;
@@ -1799,7 +2462,7 @@ pub const SpecEngine = struct {
         };
 
         if (l1_cap > 0 and sam_q.match_len < sam_mod.SEED_MIN_MATCH_LEN and (self.ngram_registry != null or self.ngram_table != null)) {
-            const nq: ngram_nvme.QueryResult = if (self.ngram_registry) |nr|
+            var nq: ngram_nvme.QueryResult = if (self.ngram_registry) |nr|
                 try nr.queryDomain(self.active_ngram_domain, self.sam.historySlice(), self.ngram_buf[0..l1_cap])
             else blk: {
                 const nt = self.ngram_table.?;
@@ -1810,6 +2473,12 @@ pub const SpecEngine = struct {
             };
             self.stats.ngram_queries += 1;
             if (nq.cache_hit) self.stats.ngram_cache_hits += 1;
+            if (grammar_active and nq.draft_len > 0) {
+                const valid_ng = self.validL1PrefixLen(self.ngram_buf[0..nq.draft_len]);
+                nq.draft_len = @intCast(valid_ng);
+                if (valid_ng < sam_mod.SEED_MIN_MATCH_LEN) nq.is_seed = false;
+                if (valid_ng == 0) nq.match_len = 0;
+            }
 
             if (nq.draft_len > 0) {
                 ngram_match_len = nq.match_len;
@@ -1852,7 +2521,7 @@ pub const SpecEngine = struct {
                         ngram_branch_prob,
                     );
                 }
-            } else {
+            } else if (sam_q.draft_len > 0) {
                 l1_res = self.draft_tree.insertL1Continuation(
                     sam_q.match_len,
                     self.l1_buf[0..sam_q.draft_len],
@@ -1860,7 +2529,7 @@ pub const SpecEngine = struct {
                     self.config.l1_branch_step_prob,
                 );
             }
-        } else {
+        } else if (sam_q.draft_len > 0) {
             l1_res = self.draft_tree.insertL1Continuation(
                 sam_q.match_len,
                 self.l1_buf[0..sam_q.draft_len],
@@ -1868,6 +2537,7 @@ pub const SpecEngine = struct {
                 self.config.l1_branch_step_prob,
             );
         }
+        if (grammar_active) self.syncTreeGrammarStates();
 
         if (l1_res.is_seed) {
             self.stats.l1_seed_rounds += 1;
@@ -1916,14 +2586,26 @@ pub const SpecEngine = struct {
                 if (self.dspark_proposer) |dp| {
                     if (max_allowed_depth >= 1 and candidate_cap > 1) {
                         const g = self.target.graph;
-                        const pr = try dp.proposeInto(
-                            MAX_TREE_NODES,
-                            self.last_token,
-                            g.encoderSummaryF32(),
-                            g.lastDecoderHiddenF32(),
-                            &self.sam,
-                            &self.draft_tree,
-                        );
+                        var dp_state = self.grammar_state.snapshot();
+                        const pr = if (grammar_active)
+                            try dp.proposeIntoConstrained(
+                                MAX_TREE_NODES,
+                                self.last_token,
+                                g.encoderSummaryF32(),
+                                g.lastDecoderHiddenF32(),
+                                &self.sam,
+                                self.makeGrammarAdapter(&dp_state),
+                                &self.draft_tree,
+                            )
+                        else
+                            try dp.proposeInto(
+                                MAX_TREE_NODES,
+                                self.last_token,
+                                g.encoderSummaryF32(),
+                                g.lastDecoderHiddenF32(),
+                                &self.sam,
+                                &self.draft_tree,
+                            );
                         self.stats.dspark_rounds += 1;
                         self.stats.dspark_inserted_nodes += pr.dspark_inserted;
                         // Respect remaining sequence/output budget depth & node cap cleanly.
@@ -1931,6 +2613,7 @@ pub const SpecEngine = struct {
                             self.eval_tree.copyTruncatedFrom(&self.draft_tree, max_allowed_depth, candidate_cap);
                             self.draft_tree = self.eval_tree;
                         }
+                        if (grammar_active) self.syncTreeGrammarStates();
                     }
                 }
             }
@@ -1945,9 +2628,11 @@ pub const SpecEngine = struct {
         if (self.config.enable_pruning and self.draft_tree.count > 1) {
             const draft_us: f32 = @floatCast(@as(f64, @floatFromInt(draft_ns)) / 1000.0);
             _ = try self.pruneTreeInPlace(&self.draft_tree, draft_us, hard_cap);
+            if (grammar_active) self.syncTreeGrammarStates();
         } else if (self.draft_tree.count > hard_cap) {
             self.eval_tree.copyTruncatedFrom(&self.draft_tree, max_allowed_depth, hard_cap);
             self.draft_tree = self.eval_tree;
+            if (grammar_active) self.syncTreeGrammarStates();
         }
         const t_prune_end = std.Io.Timestamp.now(std.Options.debug_io, .awake);
         const prune_ns: u64 = @intCast(@max(@as(i96, 0), t_prune_start.durationTo(t_prune_end).toNanoseconds()));
@@ -1979,7 +2664,7 @@ pub const SpecEngine = struct {
         };
         const off_gpu_draft = if (self.small_draft) |sd| sd.model.hasPureCpuSme2Draft() else false;
         const skip_for_base_probe = (self.config.pearl_mode == .auto and !off_gpu_draft and self.stats.rounds == 0);
-        if (self.pearl_enabled and !skip_for_base_probe) {
+        if (!constrained and self.pearl_enabled and !skip_for_base_probe) {
             if (self.pearl_rt) |prt| {
                 if (self.small_draft) |sd| {
                     const committed_before = sd.seqLen();
@@ -2036,8 +2721,10 @@ pub const SpecEngine = struct {
             self.pearl_rt.?.requestEarlyStop();
         }
 
-        // 5. Lossless Verification (`D9`): greedy (`T = 0`) or stochastic (`T > 0`).
-        const acc = if (self.config.temperature == 0.0)
+        // 5. Lossless Verification (`D9` + `C22` + `G21`):
+        //    strict zero-overhead bypass for unconstrained greedy (`T = 0`) and stochastic (`T > 0`),
+        //    or G21 GPU batch sampler / C22 grammar-aware verification under constraints.
+        const acc = if (!constrained and self.config.temperature == 0.0)
             try accept_mod.verifyGreedy(
                 MAX_TREE_NODES,
                 &self.draft_tree,
@@ -2045,7 +2732,7 @@ pub const SpecEngine = struct {
                 self.accepted_nodes[0..],
                 out_tokens,
             )
-        else
+        else if (!constrained)
             try accept_mod.verifyStochastic(
                 MAX_TREE_NODES,
                 f16,
@@ -2058,7 +2745,36 @@ pub const SpecEngine = struct {
                 self.p_res,
                 self.accepted_nodes[0..],
                 out_tokens,
+            )
+        else if (eff_params.temperature == 0.0 and !eff_params.hasPenalties() and
+            self.gpu_sampler != null and verified_nodes <= self.gpu_sampler.?.workspace.spec.max_batch_slots)
+            try self.verifyConstrainedGpuBatch(verified_nodes, eff_params, rng, out_tokens)
+        else blk: {
+            var det_prng = std.Random.DefaultPrng.init(0);
+            const eff_rng: std.Random = if (rng) |r| r else det_prng.random();
+            const ga_opt: ?accept_mod.GrammarTreeAdapter = if (grammar_active)
+                self.makeGrammarAdapter(&self.grammar_state)
+            else
+                null;
+            break :blk try accept_mod.verifyConstrained(
+                MAX_TREE_NODES,
+                f16,
+                &self.draft_tree,
+                vr.logits_f16,
+                self.target.vocabSize(),
+                null,
+                eff_params,
+                if (eff_params.hasPenalties()) self.penalty_tracker else null,
+                ga_opt,
+                eff_rng,
+                .{
+                    .logits_f32 = self.p_res,
+                    .cand_ids = self.sampler_cand_ids,
+                },
+                self.accepted_nodes[0..],
+                out_tokens,
             );
+        };
 
         // 6. Commit accepted target KV + advance L1 SAM + sync L2 DraftHead / D8 PEARL resolve.
         const t_commit_start = std.Io.Timestamp.now(std.Options.debug_io, .awake);
@@ -2084,7 +2800,7 @@ pub const SpecEngine = struct {
         var round_pearl_hit = false;
         if (self.draft_head) |dh| {
             const top_k: u32 = if (base_pos + acc.emitted_token_count < max_seq)
-                self.config.top_k_per_node
+                self.queryDraftTopK(dh.config.draft_vocab_size)
             else
                 0;
             try self.target.syncDraftHead(
@@ -2153,6 +2869,7 @@ pub const SpecEngine = struct {
             }
         } else if (self.small_draft) |sd| {
             if (base_pos + acc.emitted_token_count < max_seq) {
+                const sd_sync_k = self.queryDraftTopK(sd.model.config.vocab_size);
                 const pending_len: usize = self.pearl_pending_sync_len;
                 if (pending_len > 0) {
                     const sync_start = sd.seqLen();
@@ -2161,11 +2878,11 @@ pub const SpecEngine = struct {
                     try sd.syncAcceptedChunked(
                         self.pearl_rollback_buf[0 .. pending_len + emitted.len],
                         sync_start,
-                        self.config.top_k_per_node,
+                        sd_sync_k,
                     );
                     self.pearl_pending_sync_len = 0;
                 } else {
-                    try sd.syncAcceptedChunked(emitted, base_pos + 1, self.config.top_k_per_node);
+                    try sd.syncAcceptedChunked(emitted, base_pos + 1, sd_sync_k);
                 }
             } else {
                 self.pearl_pending_sync_len = 0;
@@ -2253,19 +2970,13 @@ pub const SpecEngine = struct {
         t_draft_start: std.Io.Timestamp,
     ) RunError!void {
         const eff_top_k: u32 = @min(self.config.top_k_per_node, dh.config.draft_vocab_size);
+        const query_k: u32 = self.queryDraftTopK(dh.config.draft_vocab_size);
         const root_cands = dh.rootCandidates();
-        const root_take = @min(root_cands.len, @as(usize, eff_top_k));
+        const root_take = @min(root_cands.len, @as(usize, query_k));
 
         // Attach cached depth-1 L2 candidates directly onto root `0` (zero extra GPU work;
         // deduplicates automatically with L1 nodes in place per ADR-0005).
-        for (root_cands[0..root_take]) |cand| {
-            if (self.draft_tree.count >= candidate_cap and
-                self.draft_tree.findChild(0, cand.token_id) == null)
-            {
-                break;
-            }
-            _ = self.draft_tree.insertChild(0, cand.token_id, cand.prob, .l2);
-        }
+        _ = self.insertDraftCandidatesForParent(0, root_cands[0..root_take], candidate_cap, eff_top_k, null);
 
         const target_depth: u16 = @min(self.config.max_draft_depth, max_allowed_depth);
         if (target_depth <= 1) return;
@@ -2311,7 +3022,7 @@ pub const SpecEngine = struct {
                     self.batch_positions[0] = base_pos + node.depth - 1;
 
                     const is_tail = (idx + 1 == path_len);
-                    const step_k: u32 = if (is_tail and node.depth < target_depth) eff_top_k else 0;
+                    const step_k: u32 = if (is_tail and node.depth < target_depth) query_k else 0;
                     try self.target.stepDraftHeadTreeBatch(
                         dh,
                         self.batch_tokens[0..1],
@@ -2328,14 +3039,7 @@ pub const SpecEngine = struct {
                     used_slots += 1;
 
                     if (step_k > 0) {
-                        for (self.batch_cands[0..step_k]) |cand| {
-                            if (self.draft_tree.count >= candidate_cap and
-                                self.draft_tree.findChild(node_idx, cand.token_id) == null)
-                            {
-                                break;
-                            }
-                            _ = self.draft_tree.insertChild(node_idx, cand.token_id, cand.prob, .l2);
-                        }
+                        _ = self.insertDraftCandidatesForParent(node_idx, self.batch_cands[0..step_k], candidate_cap, eff_top_k, null);
                     }
                 }
             }
@@ -2375,7 +3079,7 @@ pub const SpecEngine = struct {
             }
 
             const total_slots = slot_start + @as(u32, @intCast(frontier_count));
-            const cand_len = frontier_count * @as(usize, eff_top_k);
+            const cand_len = frontier_count * @as(usize, query_k);
             try self.target.stepDraftHeadTreeBatch(
                 dh,
                 self.batch_tokens[0..frontier_count],
@@ -2383,7 +3087,7 @@ pub const SpecEngine = struct {
                 self.batch_positions[0..frontier_count],
                 self.slot_ancestor_masks[0..total_slots],
                 slot_start,
-                eff_top_k,
+                query_k,
                 self.batch_cands[0..cand_len],
             );
 
@@ -2393,15 +3097,8 @@ pub const SpecEngine = struct {
                 self.tree_slot_of_node[v] = @intCast(1 + slot_idx);
                 self.slot_expanded[v] = true;
 
-                const row_cands = self.batch_cands[i * eff_top_k .. (i + 1) * eff_top_k];
-                for (row_cands) |cand| {
-                    if (self.draft_tree.count >= candidate_cap and
-                        self.draft_tree.findChild(v, cand.token_id) == null)
-                    {
-                        break;
-                    }
-                    _ = self.draft_tree.insertChild(v, cand.token_id, cand.prob, .l2);
-                }
+                const row_cands = self.batch_cands[i * query_k .. (i + 1) * query_k];
+                _ = self.insertDraftCandidatesForParent(v, row_cands, candidate_cap, eff_top_k, null);
             }
             used_slots = total_slots;
 
@@ -2428,19 +3125,15 @@ pub const SpecEngine = struct {
         t_draft_start: std.Io.Timestamp,
     ) RunError!void {
         const eff_top_k: u32 = @min(self.config.top_k_per_node, sd.model.config.vocab_size);
+        const query_k: u32 = self.queryDraftTopK(sd.model.config.vocab_size);
         const root_cands = sd.rootCandidates();
-        const root_take = @min(root_cands.len, @as(usize, eff_top_k));
+        const root_take = @min(root_cands.len, @as(usize, query_k));
+        const sd_v: usize = sd.model.config.vocab_size;
+        const root_logits_opt: ?[]const f16 = if (sd_v == self.target.vocabSize()) sd.model.readLastLogitsF16() else null;
 
         // Attach cached depth-1 candidates directly onto root `0` (zero extra GPU work;
         // deduplicates in place with any L1 candidates per ADR-0005).
-        for (root_cands[0..root_take]) |cand| {
-            if (self.draft_tree.count >= candidate_cap and
-                self.draft_tree.findChild(0, cand.token_id) == null)
-            {
-                break;
-            }
-            _ = self.draft_tree.insertChild(0, cand.token_id, cand.prob, .l2);
-        }
+        _ = self.insertDraftCandidatesForParent(0, root_cands[0..root_take], candidate_cap, eff_top_k, root_logits_opt);
 
         const target_depth: u16 = @min(self.config.max_draft_depth, max_allowed_depth);
         if (target_depth <= 1) return;
@@ -2476,8 +3169,8 @@ pub const SpecEngine = struct {
                     self.batch_tokens[0..path_len],
                     base_pos + 1,
                     &self.slot_ancestor_masks,
-                    eff_top_k,
-                    self.batch_cands[0..eff_top_k],
+                    query_k,
+                    self.batch_cands[0..query_k],
                 );
                 for (0..path_len) |idx| {
                     self.tree_slot_of_node[seed_path[idx]] = @intCast(1 + idx);
@@ -2487,14 +3180,8 @@ pub const SpecEngine = struct {
 
                 const tail_node = l1_res.seed_tail_node;
                 if (self.draft_tree.nodes[tail_node].depth < target_depth) {
-                    for (self.batch_cands[0..got_k]) |cand| {
-                        if (self.draft_tree.count >= candidate_cap and
-                            self.draft_tree.findChild(tail_node, cand.token_id) == null)
-                        {
-                            break;
-                        }
-                        _ = self.draft_tree.insertChild(tail_node, cand.token_id, cand.prob, .l2);
-                    }
+                    const tail_logits_opt: ?[]const f16 = if (sd_v == self.target.vocabSize()) sd.model.readLastLogitsF16() else null;
+                    _ = self.insertDraftCandidatesForParent(tail_node, self.batch_cands[0..got_k], candidate_cap, eff_top_k, tail_logits_opt);
                 }
             }
         }
@@ -2533,13 +3220,13 @@ pub const SpecEngine = struct {
             }
 
             const total_slots = slot_start + @as(u32, @intCast(frontier_count));
-            const cand_len = frontier_count * @as(usize, eff_top_k);
+            const cand_len = frontier_count * @as(usize, query_k);
             const got_k = try sd.stepTreeBatch(
                 self.batch_tokens[0..frontier_count],
                 self.batch_positions[0..frontier_count],
                 self.slot_ancestor_masks[0..total_slots],
                 slot_start,
-                eff_top_k,
+                query_k,
                 self.batch_cands[0..cand_len],
             );
 
@@ -2550,14 +3237,11 @@ pub const SpecEngine = struct {
                 self.slot_expanded[v] = true;
 
                 const row_cands = self.batch_cands[i * got_k .. (i + 1) * got_k];
-                for (row_cands) |cand| {
-                    if (self.draft_tree.count >= candidate_cap and
-                        self.draft_tree.findChild(v, cand.token_id) == null)
-                    {
-                        break;
-                    }
-                    _ = self.draft_tree.insertChild(v, cand.token_id, cand.prob, .l2);
-                }
+                const row_logits_opt: ?[]const f16 = if (sd_v == self.target.vocabSize() and (i + 1) * sd_v <= sd.model.logits_host.len)
+                    sd.model.logits_host[i * sd_v ..][0..sd_v]
+                else
+                    null;
+                _ = self.insertDraftCandidatesForParent(v, row_cands, candidate_cap, eff_top_k, row_logits_opt);
             }
             used_slots = total_slots;
 
@@ -2661,6 +3345,8 @@ pub const SpecEngine = struct {
         if (target_depth == 0 or candidate_cap <= 1) return;
 
         const eff_top_k: u32 = @min(self.config.top_k_per_node, @min(g.config.vocab_size, draft_mod.MAX_DRAFT_TOP_K));
+        const query_k: u32 = self.queryDraftTopK(g.config.vocab_size);
+        const gv: usize = g.config.vocab_size;
         var expanded_mask: [MAX_TREE_NODES]bool = @splat(false);
 
         var level: u16 = 0;
@@ -2675,6 +3361,7 @@ pub const SpecEngine = struct {
                 const node = self.draft_tree.nodes[ni];
                 if (expanded_mask[ni] or node.depth != level) continue;
                 if (level > 0 and node.cum_prob < self.config.min_frontier_prob) continue;
+                if (self.grammar_program != null and !self.node_grammar_valid[ni]) continue;
                 frontier[f_count] = @intCast(ni);
                 f_count += 1;
             }
@@ -2705,8 +3392,8 @@ pub const SpecEngine = struct {
                 self.verify_positions[0..cur_n],
                 self.verify_masks[0..cur_n],
                 base_pos,
-                eff_top_k,
-                self.batch_cands[0 .. @as(usize, cur_n) * eff_top_k],
+                query_k,
+                self.batch_cands[0 .. @as(usize, cur_n) * query_k],
             );
             self.stats.self_recurrent_draft_steps += 1;
 
@@ -2715,15 +3402,12 @@ pub const SpecEngine = struct {
                 const parent_idx = frontier[fi];
                 expanded_mask[parent_idx] = true;
                 const row_cands = self.batch_cands[@as(usize, parent_idx) * got_k ..][0..got_k];
-                for (row_cands) |cand| {
-                    if (self.draft_tree.count >= candidate_cap and
-                        self.draft_tree.findChild(parent_idx, cand.token_id) == null)
-                    {
-                        break;
-                    }
-                    const before_cnt = self.draft_tree.count;
-                    _ = self.draft_tree.insertChild(parent_idx, cand.token_id, cand.prob, .l2);
-                    if (self.draft_tree.count > before_cnt) added_any = true;
+                const row_logits_opt: ?[]const f16 = if (@as(usize, parent_idx + 1) * gv <= g.logits_host.len)
+                    g.logits_host[@as(usize, parent_idx) * gv ..][0..gv]
+                else
+                    null;
+                if (self.insertDraftCandidatesForParent(parent_idx, row_cands, candidate_cap, eff_top_k, row_logits_opt)) {
+                    added_any = true;
                 }
             }
             if (!added_any) break;
@@ -4292,4 +4976,207 @@ test "M7 D10 SpecEngine DSpark on deepseek41 CED matches non-speculative stepDec
     try std.testing.expect(eng.stats.dspark_inserted_nodes > 0);
     try std.testing.expectEqual(@as(u64, 0), spec_model.m7Stats().encoder_layer_dispatches_decode);
     try std.testing.expect(spec_model.m7Stats().decoder_layer_dispatches_decode > 0);
+}
+
+test "M7.8 G21+C22 SpecEngine grammar bitmask propagation across draft trees (D12 & D10) and GPU constrained verification" {
+    const allocator = std.testing.allocator;
+
+    const schema_json =
+        \\{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}
+    ;
+    const prog_ptr = try allocator.create(grammar_mod.GrammarProgram);
+    defer allocator.destroy(prog_ptr);
+    prog_ptr.* = .{};
+    try grammar_mod.compileJsonSchema(prog_ptr, schema_json);
+    const prog = prog_ptr;
+
+    // 1. D12 SelfRecurrent LoopLM under strict JSON schema with G21 GPU constrained batch verification.
+    {
+        const tmp_dir = try graph.makeTestTempDir(allocator, "m78_c22_d12");
+        defer {
+            graph.removeTestDir(allocator, tmp_dir);
+            allocator.free(tmp_dir);
+        }
+        var synth = try graph.buildSynthQwen4Bundle(allocator, .{
+            .num_experts = 8,
+            .top_k = 2,
+            .cold_experts_per_layer = 0,
+            .max_loops = 2,
+            .ple_num_shards = 0,
+            .include_steplora = false,
+            .tmp_dir = tmp_dir,
+        });
+        defer {
+            if (synth.amf_file_path) |p| graph.removeTestFile(p);
+            for (synth.ple_paths) |p| graph.removeTestFile(p);
+            synth.deinit(allocator);
+        }
+
+        const v_len: usize = synth.cfg.vocab_size;
+        const vocab = try allocator.alloc(?[]const u8, v_len);
+        defer allocator.free(vocab);
+        @memset(vocab, "prose ");
+        vocab[0] = null; // EOS
+        vocab[1] = "{";
+        vocab[2] = "\"";
+        vocab[3] = "ok";
+        vocab[4] = "\":";
+        vocab[5] = "true";
+        vocab[6] = "false";
+        vocab[7] = "}";
+        const eos = [_]u32{0};
+
+        var vocab_idx = try grammar_mod.VocabIndex.initFromSlices(allocator, vocab, &eos);
+        defer vocab_idx.deinit(allocator);
+
+        var target = try graph.GraphModel.loadFromFile(allocator, synth.amf_file_path.?, synth.cfg, .{
+            .max_seq_len = 64,
+            .max_tree_nodes = 16,
+            .startup_canary = false,
+        });
+        defer target.deinit(allocator);
+
+        var eng = try SpecEngine.initWithGraph(allocator, &target, null, .{
+            .mode = .self_recurrent,
+            .max_tree_nodes = 16,
+            .max_draft_depth = 4,
+            .branch_width = 2,
+            .top_k_per_node = 2,
+            .enable_pruning = false,
+            .temperature = 0.0,
+            .enable_gpu_sampler = true,
+        });
+        defer eng.deinit(allocator);
+        try std.testing.expect(eng.gpu_sampler != null);
+
+        const prompt = [_]u32{ 10, 11, 12, 13, 14, 15 };
+        eng.setConstraints(.{
+            .grammar_program = prog,
+            .vocab_index = &vocab_idx,
+            .token_slices = vocab,
+            .eos_token_ids = &eos,
+            .sampling = .{ .temperature = 0.0 },
+            .prompt_history = &prompt,
+        });
+
+        var gen: [12]u32 = undefined;
+        gen[0] = try eng.prefill(&prompt, null);
+        var out_len: usize = 1;
+        while (out_len < gen.len) {
+            const rs = try eng.stepRound(null, gen[out_len..]);
+            try std.testing.expect(eng.draft_tree.count >= 2);
+            for (0..eng.draft_tree.count) |ni| {
+                try std.testing.expect(eng.node_grammar_valid[ni]);
+            }
+            out_len += rs.emitted_count;
+            if (gen[out_len - 1] == 0) break;
+        }
+
+        // Reconstruct generated byte sequence (excluding EOS) and validate against C22 schema state!
+        var assembled: [256]u8 = undefined;
+        var alen: usize = 0;
+        var verify_st = prog.initialState();
+        for (gen[0..out_len]) |tid| {
+            if (tid == 0) {
+                try std.testing.expect(verify_st.isAccepting());
+                break;
+            }
+            const piece = vocab[tid].?;
+            @memcpy(assembled[alen..][0..piece.len], piece);
+            alen += piece.len;
+            try std.testing.expect(prog.advanceBytes(&verify_st, piece));
+        }
+        try std.testing.expect(alen >= 5);
+        eng.clearConstraints();
+    }
+
+    // 2. D10 DSpark `SpecEngine.initWithDSpark` + `proposeIntoConstrained` under strict JSON schema.
+    {
+        const tmp_dir = try graph.makeTestTempDir(allocator, "m78_c22_d10");
+        defer allocator.free(tmp_dir);
+        defer graph.removeTestDir(allocator, tmp_dir);
+
+        var bundle = try graph.buildSynthDeepSeek41Bundle(allocator, .{
+            .engram_num_shards = 1,
+            .include_dspark = true,
+            .tmp_dir = tmp_dir,
+        });
+        defer bundle.deinit(allocator);
+
+        const eng_const = try allocator.alloc([:0]const u8, bundle.engram_paths.len);
+        defer allocator.free(eng_const);
+        for (bundle.engram_paths, 0..) |p, i| eng_const[i] = p;
+
+        const v_len: usize = bundle.cfg.vocab_size;
+        const vocab = try allocator.alloc(?[]const u8, v_len);
+        defer allocator.free(vocab);
+        @memset(vocab, "prose ");
+        vocab[0] = null;
+        vocab[1] = "{";
+        vocab[2] = "\"";
+        vocab[3] = "ok";
+        vocab[4] = "\":";
+        vocab[5] = "true";
+        vocab[6] = "false";
+        vocab[7] = "}";
+        const eos = [_]u32{0};
+
+        var vocab_idx = try grammar_mod.VocabIndex.initFromSlices(allocator, vocab, &eos);
+        defer vocab_idx.deinit(allocator);
+
+        var spec_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+            .max_seq_len = 128,
+            .max_tree_nodes = 32,
+            .ple_paths = eng_const,
+            .startup_canary = false,
+        });
+        defer spec_model.deinit(allocator);
+
+        var dspark_loaded = try LoadedDSparkProposer.loadFromFile(allocator, &spec_model, bundle.dspark_amf_path.?, null, null);
+        defer dspark_loaded.deinit(allocator);
+
+        var eng = try SpecEngine.initWithDSpark(allocator, &spec_model, &dspark_loaded.proposer, .{
+            .mode = .dspark,
+            .max_tree_nodes = 32,
+            .max_draft_depth = 6,
+            .enable_pruning = false,
+            .temperature = 0.0,
+            .enable_gpu_sampler = true,
+        });
+        defer eng.deinit(allocator);
+
+        const prompt = [_]u32{ 5, 11, 23, 7, 19, 31 };
+        eng.setConstraints(.{
+            .grammar_program = prog,
+            .vocab_index = &vocab_idx,
+            .token_slices = vocab,
+            .eos_token_ids = &eos,
+            .sampling = .{ .temperature = 0.0 },
+            .prompt_history = &prompt,
+        });
+
+        var gen: [12]u32 = undefined;
+        gen[0] = try eng.prefill(&prompt, null);
+        var out_len: usize = 1;
+        while (out_len < gen.len) {
+            const rs = try eng.stepRound(null, gen[out_len..]);
+            for (0..eng.draft_tree.count) |ni| {
+                try std.testing.expect(eng.node_grammar_valid[ni]);
+            }
+            out_len += rs.emitted_count;
+            if (gen[out_len - 1] == 0) break;
+        }
+        try std.testing.expect(eng.stats.dspark_rounds > 0);
+        try std.testing.expect(eng.stats.dspark_inserted_nodes > 0);
+
+        var verify_st = prog.initialState();
+        for (gen[0..out_len]) |tid| {
+            if (tid == 0) {
+                try std.testing.expect(verify_st.isAccepting());
+                break;
+            }
+            try std.testing.expect(prog.advanceBytes(&verify_st, vocab[tid].?));
+        }
+        eng.clearConstraints();
+    }
 }

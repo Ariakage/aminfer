@@ -14,6 +14,7 @@ pub const attention = @import("gpu/attention.zig");
 pub const moe = @import("gpu/moe.zig");
 pub const hybrid = @import("gpu/hybrid.zig");
 pub const vision = @import("gpu/vision.zig");
+pub const sampler = @import("gpu/sampler.zig");
 pub const ring = @import("runtime/ring.zig");
 pub const batch_scheduler = @import("runtime/batch_scheduler.zig");
 pub const qos = @import("platform/qos.zig");
@@ -65,6 +66,7 @@ test {
     _ = moe;
     _ = hybrid;
     _ = vision;
+    _ = sampler;
     _ = ring;
     _ = batch_scheduler;
     _ = qos;
