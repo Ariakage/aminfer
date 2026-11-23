@@ -17,6 +17,7 @@
 //
 // Compiled with `-std=metal4.0 -Wall -Werror -mmacosx-version-min=26.0`.
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 constant uint GDN_HEAD_K_DIM [[function_constant(0)]];
@@ -3191,6 +3192,516 @@ kernel void ami_qsa_swa_prefill_attn(const device half *q [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel (`G9` + `G19`, ADR-0023 §2): `ami_qsa_swa_prefill_attn_mma`
+//
+// Hardware `simdgroup_half8x8` (`Apple9`) tiled FlashAttention-2 prefill for
+// QSA full & SWA prefill (`BQ = 32, BK = 64` for `D = 64` in 15,872 B SRAM;
+// `BQ = 32, BK = 32` for `D = 128` in 15,360 B SRAM; both `<= 16 KiB` with
+// bank-conflict-free padding). Strictly gated on `Q_len >= 32` and
+// `KV_len >= 64` by `src/gpu/hybrid.zig`.
+// Grid: (num_kv_heads, ceil(num_q * gqa_ratio / 32), 1) threadgroups, 128 threads.
+// ---------------------------------------------------------------------------
+template <uint D, uint D_PAD, uint BK, bool IS_V>
+static inline void qsa_mma_load_kv(threadgroup half4 *KVs4,
+                                   const device QsaKvTilePair *kv_tiles,
+                                   const device half *kv_chunk,
+                                   const device uchar *retired_pool,
+                                   const device uint *retired_chunk_ids,
+                                   constant QsaSwaPrefillAttnParams &p,
+                                   uint kv_head,
+                                   uint kv_block_start,
+                                   uint kv_block_end,
+                                   uint tid) {
+    constexpr uint D_VEC4 = D >> 2;
+    constexpr uint D_PAD4 = D_PAD >> 2;
+    constexpr uint ROW_STEP = 128u / D_VEC4;
+    constexpr uint GROUPS_PER_HEAD = D >> 6;
+
+    const uint load_row0 = tid / D_VEC4;
+    const uint load_col4 = tid & (D_VEC4 - 1u);
+
+    for (uint row = load_row0; row < BK; row += ROW_STEP) {
+        const uint t = kv_block_start + row;
+        half4 val = half4(0.0h);
+        if (t < kv_block_end) {
+            if (t >= p.chunk_start_pos) {
+                const ulong c_off = (ulong(t - p.chunk_start_pos) * p.num_kv_heads + kv_head) * D + load_col4 * 4u;
+                val = *(const device half4 *)(kv_chunk + c_off);
+            } else {
+                const uint phys_t = (p.ring_capacity > 0u) ? (t % p.ring_capacity) : t;
+                const uint chunk = phys_t / p.chunk_tokens;
+                const uint slot = phys_t - chunk * p.chunk_tokens;
+                const uint tex_row = kv_head * p.chunk_tokens + slot;
+                if (p.ring_capacity == 0u && chunk < p.num_retired_chunks) {
+                    const uint phys_slot = retired_chunk_ids[chunk];
+                    const device uchar *plane = retired_pool +
+                        ulong(phys_slot) * p.retired_chunk_stride_bytes +
+                        (IS_V ? p.retired_plane_stride_bytes : 0u);
+                    val = hybrid_load_q8_half4(plane, tex_row, GROUPS_PER_HEAD, load_col4);
+                } else {
+                    const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+                    val = IS_V ? kv_tiles[active_chunk].v_tex.read(uint2(load_col4, tex_row))
+                               : kv_tiles[active_chunk].k_tex.read(uint2(load_col4, tex_row));
+                }
+            }
+        }
+        KVs4[row * D_PAD4 + load_col4] = val;
+    }
+}
+
+union QsaMmaD64Union {
+    half4 KVs4[64u * 18u];  // 9,216 B
+    float Ss[32u * 64u];    // 8,192 B
+};
+
+static inline void qsa_mma_exec_d128(const device half *q,
+                                     const device QsaKvTilePair *kv_tiles,
+                                     const device half *k_chunk,
+                                     const device half *v_chunk,
+                                     device half *out,
+                                     const device uchar *retired_pool,
+                                     const device uint *retired_chunk_ids,
+                                     constant QsaSwaPrefillAttnParams &p,
+                                     threadgroup half4 *KVs4,
+                                     threadgroup float *Ss,
+                                     threadgroup half *Ps,
+                                     uint2 tg_pos,
+                                     uint tid,
+                                     uint sg_id,
+                                     uint lane) {
+    constexpr uint D = 128u;
+    constexpr uint D_PAD = 136u;
+    constexpr uint D_PAD4 = 34u;
+    constexpr uint BQ = 32u;
+    constexpr uint BK = 32u;
+    constexpr uint D_VEC4 = 32u;
+    constexpr uint ROW_STEP = 4u;
+    constexpr uint D_TILES8 = 16u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint kv_head = tg_pos.x;
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint total_q = p.num_q * gqa_ratio;
+    const uint flat_q_base = tg_pos.y * BQ;
+    if (kv_head >= p.num_kv_heads || flat_q_base >= total_q) {
+        return;
+    }
+
+    const uint q_cnt = min(BQ, total_q - flat_q_base);
+    const uint min_q_pos = p.q_start_pos + (flat_q_base / gqa_ratio);
+    const uint max_q_pos = p.q_start_pos + ((flat_q_base + q_cnt - 1u) / gqa_ratio);
+    const uint kv_end = min(p.kv_len, max_q_pos + 1u);
+    const uint kv_begin = (p.window_size > 0u && (min_q_pos + 1u) > p.window_size)
+        ? (min_q_pos + 1u - p.window_size)
+        : 0u;
+
+    {
+        const uint load_row0 = tid / D_VEC4;
+        const uint load_col4 = tid & (D_VEC4 - 1u);
+        for (uint row = load_row0; row < BQ; row += ROW_STEP) {
+            const uint flat_q = flat_q_base + row;
+            if (flat_q < total_q) {
+                const uint qi = flat_q / gqa_ratio;
+                const uint qh = kv_head * gqa_ratio + (flat_q - qi * gqa_ratio);
+                const ulong q_off = (ulong(qi) * p.num_q_heads + qh) * D + load_col4 * 4u;
+                KVs4[row * D_PAD4 + load_col4] = *(const device half4 *)(q + q_off);
+            } else {
+                KVs4[row * D_PAD4 + load_col4] = half4(0.0h);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint r0 = sg_id * 8u;
+    const threadgroup half *KVs = (const threadgroup half *)KVs4;
+    simdgroup_half8x8 q_frag[D_TILES8];
+    #pragma clang loop unroll(full)
+    for (uint kt = 0u; kt < D_TILES8; kt++) {
+        simdgroup_load(q_frag[kt], KVs + r0 * D_PAD + kt * 8u, D_PAD);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_val[8];
+    float l_val[8];
+    float o_reg[8][4];
+    #pragma clang loop unroll(full)
+    for (uint r = 0u; r < 8u; r++) {
+        m_val[r] = -INFINITY;
+        l_val[r] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint c = 0u; c < 4u; c++) {
+            o_reg[r][c] = 0.0f;
+        }
+    }
+
+    const float scale_log2e = p.scale * LOG2E;
+
+    for (uint kv_block_start = kv_begin; kv_block_start < kv_end; kv_block_start += BK) {
+        const uint kv_block_end = min(kv_block_start + BK, kv_end);
+
+        qsa_mma_load_kv<D, D_PAD, BK, false>(
+            KVs4, kv_tiles, k_chunk, retired_pool, retired_chunk_ids, p,
+            kv_head, kv_block_start, kv_block_end, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 s_frag[4];
+        #pragma clang loop unroll(full)
+        for (uint bj = 0u; bj < 4u; bj++) {
+            s_frag[bj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        for (uint kt = 0u; kt < D_TILES8; kt++) {
+            const uint kk = kt * 8u;
+            #pragma clang loop unroll(full)
+            for (uint bj = 0u; bj < 4u; bj++) {
+                simdgroup_half8x8 k_frag;
+                simdgroup_load(k_frag, KVs + (bj * 8u) * D_PAD + kk, D_PAD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s_frag[bj], q_frag[kt], k_frag, s_frag[bj]);
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (uint bj = 0u; bj < 4u; bj++) {
+            simdgroup_store(s_frag[bj], Ss + r0 * BK + bj * 8u, BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float alpha[8];
+        const uint kv_pos = kv_block_start + lane;
+        const bool in_blk = (kv_pos < kv_block_end);
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < 8u; r++) {
+            const uint flat_q = flat_q_base + r0 + r;
+            const bool act = (flat_q < total_q);
+            const uint qp = p.q_start_pos + (act ? (flat_q / gqa_ratio) : 0u);
+            const float raw_s = Ss[(r0 + r) * BK + lane];
+            const bool valid = act && in_blk && (kv_pos <= qp) &&
+                               (p.window_size == 0u || (qp - kv_pos) < p.window_size);
+            const float score = valid ? (raw_s * scale_log2e) : -INFINITY;
+            const float row_m = simd_max(score);
+            float p_val = 0.0f;
+            if (row_m > -INFINITY) {
+                const float m_new = max(m_val[r], row_m);
+                const float a = (l_val[r] > 0.0f) ? exp2(m_val[r] - m_new) : 0.0f;
+                p_val = valid ? exp2(score - m_new) : 0.0f;
+                const float row_l = simd_sum(p_val);
+                l_val[r] = fma(l_val[r], a, row_l);
+                m_val[r] = m_new;
+                alpha[r] = a;
+            } else {
+                alpha[r] = 1.0f;
+            }
+            Ps[(r0 + r) * 40u + lane] = half(p_val);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        qsa_mma_load_kv<D, D_PAD, BK, true>(
+            KVs4, kv_tiles, v_chunk, retired_pool, retired_chunk_ids, p,
+            kv_head, kv_block_start, kv_block_end, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (uint c = 0u; c < 4u; c++) {
+            const uint d_blk = c * 32u;
+            simdgroup_float8x8 pv[4];
+            #pragma clang loop unroll(full)
+            for (uint bj = 0u; bj < 4u; bj++) {
+                pv[bj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+            #pragma clang loop unroll(full)
+            for (uint kk = 0u; kk < BK; kk += 8u) {
+                simdgroup_half8x8 p_frag;
+                simdgroup_load(p_frag, Ps + r0 * 40u + kk, 40u);
+                #pragma clang loop unroll(full)
+                for (uint bj = 0u; bj < 4u; bj++) {
+                    simdgroup_half8x8 v_frag;
+                    simdgroup_load(v_frag, KVs + kk * D_PAD + d_blk + bj * 8u, D_PAD);
+                    simdgroup_multiply_accumulate(pv[bj], p_frag, v_frag, pv[bj]);
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (uint bj = 0u; bj < 4u; bj++) {
+                simdgroup_store(pv[bj], Ss + r0 * 32u + bj * 8u, 32u);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 8u; r++) {
+                o_reg[r][c] = fma(o_reg[r][c], alpha[r], Ss[(r0 + r) * 32u + lane]);
+            }
+            if (c + 1u < 4u) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0u; r < 8u; r++) {
+        const uint flat_q = flat_q_base + r0 + r;
+        if (flat_q >= total_q) {
+            continue;
+        }
+        const uint qi = flat_q / gqa_ratio;
+        const uint qh = kv_head * gqa_ratio + (flat_q - qi * gqa_ratio);
+        const float inv_l = (l_val[r] > 0.0f) ? (1.0f / l_val[r]) : 0.0f;
+        const ulong out_base = (ulong(qi) * p.num_q_heads + qh) * D;
+        #pragma clang loop unroll(full)
+        for (uint c = 0u; c < 4u; c++) {
+            out[out_base + c * 32u + lane] = half(o_reg[r][c] * inv_l);
+        }
+    }
+}
+
+static inline void qsa_mma_exec_d64(const device half *q,
+                                    const device QsaKvTilePair *kv_tiles,
+                                    const device half *k_chunk,
+                                    const device half *v_chunk,
+                                    device half *out,
+                                    const device uchar *retired_pool,
+                                    const device uint *retired_chunk_ids,
+                                    constant QsaSwaPrefillAttnParams &p,
+                                    threadgroup QsaMmaD64Union &u_smem,
+                                    threadgroup half *Ps,
+                                    threadgroup float *Os,
+                                    uint2 tg_pos,
+                                    uint tid,
+                                    uint sg_id,
+                                    uint lane) {
+    constexpr uint D = 64u;
+    constexpr uint D_PAD = 72u;
+    constexpr uint D_PAD4 = 18u;
+    constexpr uint BQ = 32u;
+    constexpr uint BK = 64u;
+    constexpr uint BK_PAD = 72u;
+    constexpr uint D_VEC4 = 16u;
+    constexpr uint ROW_STEP = 8u;
+    constexpr uint D_TILES8 = 8u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint kv_head = tg_pos.x;
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint total_q = p.num_q * gqa_ratio;
+    const uint flat_q_base = tg_pos.y * BQ;
+    if (kv_head >= p.num_kv_heads || flat_q_base >= total_q) {
+        return;
+    }
+
+    const uint q_cnt = min(BQ, total_q - flat_q_base);
+    const uint min_q_pos = p.q_start_pos + (flat_q_base / gqa_ratio);
+    const uint max_q_pos = p.q_start_pos + ((flat_q_base + q_cnt - 1u) / gqa_ratio);
+    const uint kv_end = min(p.kv_len, max_q_pos + 1u);
+    const uint kv_begin = (p.window_size > 0u && (min_q_pos + 1u) > p.window_size)
+        ? (min_q_pos + 1u - p.window_size)
+        : 0u;
+
+    {
+        const uint load_row0 = tid / D_VEC4;
+        const uint load_col4 = tid & (D_VEC4 - 1u);
+        for (uint row = load_row0; row < BQ; row += ROW_STEP) {
+            const uint flat_q = flat_q_base + row;
+            if (flat_q < total_q) {
+                const uint qi = flat_q / gqa_ratio;
+                const uint qh = kv_head * gqa_ratio + (flat_q - qi * gqa_ratio);
+                const ulong q_off = (ulong(qi) * p.num_q_heads + qh) * D + load_col4 * 4u;
+                u_smem.KVs4[row * D_PAD4 + load_col4] = *(const device half4 *)(q + q_off);
+            } else {
+                u_smem.KVs4[row * D_PAD4 + load_col4] = half4(0.0h);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint r0 = sg_id * 8u;
+    const threadgroup half *KVs = (const threadgroup half *)u_smem.KVs4;
+    simdgroup_half8x8 q_frag[D_TILES8];
+    #pragma clang loop unroll(full)
+    for (uint kt = 0u; kt < D_TILES8; kt++) {
+        simdgroup_load(q_frag[kt], KVs + r0 * D_PAD + kt * 8u, D_PAD);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_val[8];
+    float l_val[8];
+    float o_reg[8][2];
+    #pragma clang loop unroll(full)
+    for (uint r = 0u; r < 8u; r++) {
+        m_val[r] = -INFINITY;
+        l_val[r] = 0.0f;
+        o_reg[r][0] = 0.0f;
+        o_reg[r][1] = 0.0f;
+    }
+
+    const float scale_log2e = p.scale * LOG2E;
+
+    for (uint kv_block_start = kv_begin; kv_block_start < kv_end; kv_block_start += BK) {
+        const uint kv_block_end = min(kv_block_start + BK, kv_end);
+
+        qsa_mma_load_kv<D, D_PAD, BK, false>(
+            u_smem.KVs4, kv_tiles, k_chunk, retired_pool, retired_chunk_ids, p,
+            kv_head, kv_block_start, kv_block_end, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 s_frag[8];
+        #pragma clang loop unroll(full)
+        for (uint bj = 0u; bj < 8u; bj++) {
+            s_frag[bj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        #pragma clang loop unroll(full)
+        for (uint kt = 0u; kt < D_TILES8; kt++) {
+            const uint kk = kt * 8u;
+            #pragma clang loop unroll(full)
+            for (uint bj = 0u; bj < 8u; bj++) {
+                simdgroup_half8x8 k_frag;
+                simdgroup_load(k_frag, KVs + (bj * 8u) * D_PAD + kk, D_PAD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s_frag[bj], q_frag[kt], k_frag, s_frag[bj]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (uint bj = 0u; bj < 8u; bj++) {
+            simdgroup_store(s_frag[bj], u_smem.Ss + r0 * BK + bj * 8u, BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float alpha[8];
+        const uint kv_pos0 = kv_block_start + lane;
+        const uint kv_pos1 = kv_block_start + lane + 32u;
+        const bool in_blk0 = (kv_pos0 < kv_block_end);
+        const bool in_blk1 = (kv_pos1 < kv_block_end);
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < 8u; r++) {
+            const uint flat_q = flat_q_base + r0 + r;
+            const bool act = (flat_q < total_q);
+            const uint qp = p.q_start_pos + (act ? (flat_q / gqa_ratio) : 0u);
+            const float raw_s0 = u_smem.Ss[(r0 + r) * BK + lane];
+            const float raw_s1 = u_smem.Ss[(r0 + r) * BK + lane + 32u];
+            const bool v0 = act && in_blk0 && (kv_pos0 <= qp) &&
+                            (p.window_size == 0u || (qp - kv_pos0) < p.window_size);
+            const bool v1 = act && in_blk1 && (kv_pos1 <= qp) &&
+                            (p.window_size == 0u || (qp - kv_pos1) < p.window_size);
+            const float sc0 = v0 ? (raw_s0 * scale_log2e) : -INFINITY;
+            const float sc1 = v1 ? (raw_s1 * scale_log2e) : -INFINITY;
+            const float row_m = simd_max(max(sc0, sc1));
+            float p0 = 0.0f;
+            float p1 = 0.0f;
+            if (row_m > -INFINITY) {
+                const float m_new = max(m_val[r], row_m);
+                const float a = (l_val[r] > 0.0f) ? exp2(m_val[r] - m_new) : 0.0f;
+                p0 = v0 ? exp2(sc0 - m_new) : 0.0f;
+                p1 = v1 ? exp2(sc1 - m_new) : 0.0f;
+                const float row_l = simd_sum(p0 + p1);
+                l_val[r] = fma(l_val[r], a, row_l);
+                m_val[r] = m_new;
+                alpha[r] = a;
+            } else {
+                alpha[r] = 1.0f;
+            }
+            Ps[(r0 + r) * BK_PAD + lane] = half(p0);
+            Ps[(r0 + r) * BK_PAD + lane + 32u] = half(p1);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        qsa_mma_load_kv<D, D_PAD, BK, true>(
+            u_smem.KVs4, kv_tiles, v_chunk, retired_pool, retired_chunk_ids, p,
+            kv_head, kv_block_start, kv_block_end, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (uint p16 = 0u; p16 < 4u; p16++) {
+            const uint d_blk = p16 * 16u;
+            simdgroup_float8x8 pv[2];
+            pv[0] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            pv[1] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint kk = 0u; kk < BK; kk += 8u) {
+                simdgroup_half8x8 p_frag;
+                simdgroup_load(p_frag, Ps + r0 * BK_PAD + kk, BK_PAD);
+                simdgroup_half8x8 v0, v1;
+                simdgroup_load(v0, KVs + kk * D_PAD + d_blk + 0u, D_PAD);
+                simdgroup_load(v1, KVs + kk * D_PAD + d_blk + 8u, D_PAD);
+                simdgroup_multiply_accumulate(pv[0], p_frag, v0, pv[0]);
+                simdgroup_multiply_accumulate(pv[1], p_frag, v1, pv[1]);
+            }
+            simdgroup_store(pv[0], Os + r0 * 16u + 0u, 16u);
+            simdgroup_store(pv[1], Os + r0 * 16u + 8u, 16u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint c = p16 >> 1;
+            const bool hi_half = ((p16 & 1u) != 0u);
+            if (!hi_half) {
+                if (lane < 16u) {
+                    #pragma clang loop unroll(full)
+                    for (uint r = 0u; r < 8u; r++) {
+                        o_reg[r][c] = fma(o_reg[r][c], alpha[r], Os[(r0 + r) * 16u + lane]);
+                    }
+                }
+            } else {
+                if (lane >= 16u) {
+                    const uint col = lane - 16u;
+                    #pragma clang loop unroll(full)
+                    for (uint r = 0u; r < 8u; r++) {
+                        o_reg[r][c] = fma(o_reg[r][c], alpha[r], Os[(r0 + r) * 16u + col]);
+                    }
+                }
+            }
+            if (p16 + 1u < 4u) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0u; r < 8u; r++) {
+        const uint flat_q = flat_q_base + r0 + r;
+        if (flat_q >= total_q) {
+            continue;
+        }
+        const uint qi = flat_q / gqa_ratio;
+        const uint qh = kv_head * gqa_ratio + (flat_q - qi * gqa_ratio);
+        const float inv_l = (l_val[r] > 0.0f) ? (1.0f / l_val[r]) : 0.0f;
+        const ulong out_base = (ulong(qi) * p.num_q_heads + qh) * D;
+        out[out_base + lane] = half(o_reg[r][0] * inv_l);
+        out[out_base + 32u + lane] = half(o_reg[r][1] * inv_l);
+    }
+}
+
+kernel void ami_qsa_swa_prefill_attn_mma(const device half *q [[buffer(0)]],
+                                         const device QsaKvTilePair *kv_tiles [[buffer(1)]],
+                                         const device half *k_chunk [[buffer(2)]],
+                                         const device half *v_chunk [[buffer(3)]],
+                                         device half *out [[buffer(4)]],
+                                         const device uchar *retired_pool [[buffer(5)]],
+                                         const device uint *retired_chunk_ids [[buffer(6)]],
+                                         constant QsaSwaPrefillAttnParams &p [[buffer(7)]],
+                                         uint2 tg_pos [[threadgroup_position_in_grid]],
+                                         uint tid [[thread_index_in_threadgroup]],
+                                         uint sg_id [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]]) {
+    union QsaMmaSmem {
+        struct {
+            half4 KVs4[32u * 34u];  // 8,704 B
+            float Ss[32u * 32u];    // 4,096 B
+            half Ps[32u * 40u];     // 2,560 B
+        } d128;                     // 15,360 B total
+        struct {
+            QsaMmaD64Union u;       // 9,216 B
+            half Ps[32u * 72u];     // 4,608 B
+            float Os[32u * 16u];    // 2,048 B
+        } d64;                      // 15,872 B total (<= 16 KiB)
+    };
+    threadgroup QsaMmaSmem smem;
+
+    if (QSA_HEAD_DIM == 128u) {
+        qsa_mma_exec_d128(q, kv_tiles, k_chunk, v_chunk, out, retired_pool, retired_chunk_ids, p,
+                          smem.d128.KVs4, smem.d128.Ss, smem.d128.Ps, tg_pos, tid, sg_id, lane);
+    } else {
+        qsa_mma_exec_d64(q, kv_tiles, k_chunk, v_chunk, out, retired_pool, retired_chunk_ids, p,
+                         smem.d64.u, smem.d64.Ps, smem.d64.Os, tg_pos, tid, sg_id, lane);
+    }
+}
+
 // ===========================================================================
 // Section E: M7 (R7 + G11) — MLA + CSA2 (Full / Reindex / Reuse) + FP4 KV
 // (`E2M1` + `E4M3` per-16-channel scale, 890 B/tok geometry) + SWA Replay
@@ -4136,6 +4647,416 @@ kernel void ami_mla_csa2_attend(const device half *q_nope [[buffer(0)]],
             out[ch + 1ul] = half(acc_reg[u].y * inv_l);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel (`G11` + `G19`, ADR-0023 §2): `ami_mla_csa2_attend_mma`
+//
+// Hardware `simdgroup_half8x8` (`Apple9`) tiled FlashAttention-2 prefill for
+// DeepSeek-V4.1 MLA + CSA2 prefill (`BQ = 32, BK = 32` per tile, `q_head` x `q_tile`).
+// Uses <= 16 KiB bank-conflict-free padded threadgroup SRAM:
+//   - Qs[32, 40] (2,560 B) + KVs[32, 40] (2,560 B) = 5,120 B
+//   - Ss[32, 32] (4,096 B)
+//   - Ps[32, 40] (2,560 B)
+//   - Os[32, 32] (4,096 B)
+//   Total = 15,872 B (<= 16 KiB).
+// Streams `32`-dim slices of `kv_lora_rank` and `qk_rope_dim` for `Q * K^T`
+// and `32`-dim slices of `kv_lora_rank` for `O += exp(S - m) * V` via
+// `simdgroup_half8x8`, strictly gated on `Q_len >= 32` and `KV_len >= 64`
+// (non-tree, non-batch prefill) by `src/gpu/hybrid.zig`.
+// Grid: (num_q_heads, ceil(num_nodes / 32), 1) threadgroups, 128 threads.
+// ---------------------------------------------------------------------------
+static inline void mla_mma_stage_kv_slice(threadgroup half *dst,
+                                          const device uchar *e2m1_base,
+                                          const device uchar *scale_base,
+                                          const device uchar *rope_base,
+                                          const device half *swa_lat_base,
+                                          const device half *swa_rope_base,
+                                          constant MlaCsa2AttnParams &p,
+                                          uint kv_pos,
+                                          uint ring_valid_lo,
+                                          uint slice_off,
+                                          uint slice_len,
+                                          bool is_rope,
+                                          uint num_bytes,
+                                          ulong rope_row_bytes,
+                                          uint lane) {
+    half v = half(0.0h);
+    if (lane < slice_len) {
+        const uint d = slice_off + lane;
+        const bool use_swa = (p.swa_ring_capacity > 0u && kv_pos >= ring_valid_lo);
+        if (is_rope) {
+            if (use_swa) {
+                const uint slot = kv_pos % p.swa_ring_capacity;
+                v = swa_rope_base[ulong(slot) * p.qk_rope_dim + d];
+            } else {
+                const device uchar *rope_row = rope_base + ulong(kv_pos) * rope_row_bytes;
+                v = (p.rope_tail_format == 1u)
+                    ? half(mla_e4m3_to_f32(rope_row[d]))
+                    : ((const device half *)rope_row)[d];
+            }
+        } else {
+            if (use_swa) {
+                const uint slot = kv_pos % p.swa_ring_capacity;
+                v = swa_lat_base[ulong(slot) * p.kv_lora_rank + d];
+            } else {
+                const uchar packed = e2m1_base[ulong(kv_pos) * num_bytes + (d >> 1)];
+                const float sc = mla_e4m3_to_f32(scale_base[ulong(kv_pos) * (p.kv_lora_rank >> 4) + (d >> 4)]);
+                const uint nib = ((d & 1u) == 0u) ? (uint(packed) & 0xFu) : ((uint(packed) >> 4) & 0xFu);
+                v = half(mla_e2m1_to_f32(nib) * sc);
+            }
+        }
+    }
+    dst[lane] = v;
+}
+
+static inline void mla_mma_attend_kv_block(const device half *q_nope,
+                                           const device half *q_pe,
+                                           const device uchar *e2m1_base,
+                                           const device uchar *scale_base,
+                                           const device uchar *rope_base,
+                                           const device half *swa_lat_base,
+                                           const device half *swa_rope_base,
+                                           constant MlaCsa2AttnParams &p,
+                                           threadgroup half *Qs,
+                                           threadgroup half *KVs,
+                                           threadgroup float *Ss,
+                                           threadgroup half *Ps,
+                                           threadgroup float *Os,
+                                           uint q_head,
+                                           uint q_base,
+                                           uint kv_start,
+                                           uint kv_end,
+                                           uint out_d0,
+                                           uint num_slices32,
+                                           uint num_bytes,
+                                           ulong rope_row_bytes,
+                                           uint ring_valid_lo,
+                                           float scale_log2e,
+                                           bool is_swa_pass,
+                                           uint tile_row_mask,
+                                           uint sg_id,
+                                           uint lane,
+                                           thread float *m_val,
+                                           thread float *l_val,
+                                           thread float *o_reg) {
+    constexpr uint BQ = 32u;
+    constexpr uint BK = 32u;
+    constexpr uint SLICE_PAD = 40u;
+    const uint r0 = sg_id * 8u;
+
+    // 1. S = Q[32, kv_lora_rank + qk_rope_dim] @ K[32, ...]^T via simdgroup_half8x8.
+    simdgroup_float8x8 s_frag[4];
+    #pragma clang loop unroll(full)
+    for (uint bj = 0u; bj < 4u; bj++) {
+        s_frag[bj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (uint sl = 0u; sl < p.kv_lora_rank; sl += 32u) {
+        const uint sl_len = min(32u, p.kv_lora_rank - sl);
+        for (uint rr = sg_id; rr < BQ; rr += 4u) {
+            const uint q_idx = q_base + rr;
+            const half qv = (q_idx < p.num_nodes && lane < sl_len)
+                ? q_nope[(ulong(q_idx) * p.num_q_heads + q_head) * p.kv_lora_rank + sl + lane]
+                : half(0.0h);
+            Qs[rr * SLICE_PAD + lane] = qv;
+
+            const uint kv_pos = kv_start + rr;
+            if (kv_pos < kv_end) {
+                mla_mma_stage_kv_slice(KVs + rr * SLICE_PAD, e2m1_base, scale_base, rope_base,
+                                       swa_lat_base, swa_rope_base, p, kv_pos, ring_valid_lo,
+                                       sl, sl_len, false, num_bytes, rope_row_bytes, lane);
+            } else {
+                KVs[rr * SLICE_PAD + lane] = half(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 q_f;
+            simdgroup_load(q_f, Qs + r0 * SLICE_PAD + kk, SLICE_PAD);
+            #pragma clang loop unroll(full)
+            for (uint bj = 0u; bj < 4u; bj++) {
+                simdgroup_half8x8 k_f;
+                simdgroup_load(k_f, KVs + (bj * 8u) * SLICE_PAD + kk, SLICE_PAD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s_frag[bj], q_f, k_f, s_frag[bj]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint sl = 0u; sl < p.qk_rope_dim; sl += 32u) {
+        const uint sl_len = min(32u, p.qk_rope_dim - sl);
+        for (uint rr = sg_id; rr < BQ; rr += 4u) {
+            const uint q_idx = q_base + rr;
+            const half qv = (q_idx < p.num_nodes && lane < sl_len)
+                ? q_pe[(ulong(q_idx) * p.num_q_heads + q_head) * p.qk_rope_dim + sl + lane]
+                : half(0.0h);
+            Qs[rr * SLICE_PAD + lane] = qv;
+
+            const uint kv_pos = kv_start + rr;
+            if (kv_pos < kv_end) {
+                mla_mma_stage_kv_slice(KVs + rr * SLICE_PAD, e2m1_base, scale_base, rope_base,
+                                       swa_lat_base, swa_rope_base, p, kv_pos, ring_valid_lo,
+                                       sl, sl_len, true, num_bytes, rope_row_bytes, lane);
+            } else {
+                KVs[rr * SLICE_PAD + lane] = half(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 q_f;
+            simdgroup_load(q_f, Qs + r0 * SLICE_PAD + kk, SLICE_PAD);
+            #pragma clang loop unroll(full)
+            for (uint bj = 0u; bj < 4u; bj++) {
+                simdgroup_half8x8 k_f;
+                simdgroup_load(k_f, KVs + (bj * 8u) * SLICE_PAD + kk, SLICE_PAD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s_frag[bj], q_f, k_f, s_frag[bj]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint bj = 0u; bj < 4u; bj++) {
+        simdgroup_store(s_frag[bj], Ss + r0 * BK + bj * 8u, BK);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Causal, SWA-dedup, and block-selection masking + online softmax.
+    float alpha[8];
+    const uint kv_pos = kv_start + lane;
+    const bool in_blk = (kv_pos < kv_end);
+    #pragma clang loop unroll(full)
+    for (uint r = 0u; r < 8u; r++) {
+        const uint q_local = r0 + r;
+        const uint q_idx = q_base + q_local;
+        const bool q_in = (q_idx < p.num_nodes);
+        const bool sel_ok = is_swa_pass || (((tile_row_mask >> q_local) & 1u) != 0u);
+        const bool act = q_in && sel_ok;
+        const uint eff_kv = q_in ? ((p.causal_q_start_pos != 0xFFFFFFFFu)
+            ? min(p.kv_len, max(p.encoder_prefix_len, p.causal_q_start_pos + q_idx + 1u))
+            : p.kv_len) : 0u;
+        const uint swa_lo = (p.swa_window > 0u)
+            ? ((eff_kv > p.swa_window) ? (eff_kv - p.swa_window) : 0u)
+            : eff_kv;
+        const bool in_swa = (kv_pos >= swa_lo && kv_pos < eff_kv);
+        const bool valid = act && in_blk && (kv_pos < eff_kv) && (is_swa_pass ? in_swa : !in_swa);
+        const float score = valid ? (Ss[q_local * BK + lane] * scale_log2e) : -INFINITY;
+        const float row_m = simd_max(score);
+        float p_val = 0.0f;
+        if (row_m > -INFINITY) {
+            const float m_new = max(m_val[r], row_m);
+            const float a = (l_val[r] > 0.0f) ? exp2(m_val[r] - m_new) : 0.0f;
+            p_val = valid ? exp2(score - m_new) : 0.0f;
+            const float row_l = simd_sum(p_val);
+            l_val[r] = fma(l_val[r], a, row_l);
+            m_val[r] = m_new;
+            alpha[r] = a;
+        } else {
+            alpha[r] = 1.0f;
+        }
+        Ps[q_local * SLICE_PAD + lane] = half(p_val);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. O += P[32, 32] @ V[32, chunk_cols] via simdgroup_half8x8 in 32-col slices.
+    #pragma clang loop unroll(full)
+    for (uint sl_i = 0u; sl_i < 4u; sl_i++) {
+        if (sl_i < num_slices32) {
+            const uint d_off = out_d0 + sl_i * 32u;
+            const uint sl_len = min(32u, p.kv_lora_rank - d_off);
+            for (uint rr = sg_id; rr < BK; rr += 4u) {
+                const uint kpos = kv_start + rr;
+                if (kpos < kv_end) {
+                    mla_mma_stage_kv_slice(KVs + rr * SLICE_PAD, e2m1_base, scale_base, rope_base,
+                                           swa_lat_base, swa_rope_base, p, kpos, ring_valid_lo,
+                                           d_off, sl_len, false, num_bytes, rope_row_bytes, lane);
+                } else {
+                    KVs[rr * SLICE_PAD + lane] = half(0.0h);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_float8x8 pv[4];
+            #pragma clang loop unroll(full)
+            for (uint bj = 0u; bj < 4u; bj++) {
+                pv[bj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+            #pragma clang loop unroll(full)
+            for (uint kk = 0u; kk < BK; kk += 8u) {
+                simdgroup_half8x8 p_frag;
+                simdgroup_load(p_frag, Ps + r0 * SLICE_PAD + kk, SLICE_PAD);
+                #pragma clang loop unroll(full)
+                for (uint bj = 0u; bj < 4u; bj++) {
+                    simdgroup_half8x8 v_frag;
+                    simdgroup_load(v_frag, KVs + kk * SLICE_PAD + bj * 8u, SLICE_PAD);
+                    simdgroup_multiply_accumulate(pv[bj], p_frag, v_frag, pv[bj]);
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (uint bj = 0u; bj < 4u; bj++) {
+                simdgroup_store(pv[bj], Os + r0 * 32u + bj * 8u, 32u);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 8u; r++) {
+                o_reg[r * 4u + sl_i] = fma(o_reg[r * 4u + sl_i], alpha[r], Os[(r0 + r) * 32u + lane]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+kernel void ami_mla_csa2_attend_mma(const device half *q_nope [[buffer(0)]],
+                                    const device half *q_pe [[buffer(1)]],
+                                    const device uchar *kv_slab [[buffer(2)]],
+                                    const device uchar *swa_ring [[buffer(3)]],
+                                    const device uint *selected_blocks [[buffer(4)]],
+                                    const device uint *selected_counts [[buffer(5)]],
+                                    const device half *kv_tree_latent [[buffer(6)]],
+                                    const device half *kv_tree_rope [[buffer(7)]],
+                                    const device ulong *ancestor_masks [[buffer(8)]],
+                                    const device uint *batch_kv_lens [[buffer(9)]],
+                                    device half *out [[buffer(10)]],
+                                    constant MlaCsa2AttnParams &p [[buffer(11)]],
+                                    uint2 tg_pos [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint sg_id [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    (void)kv_tree_latent;
+    (void)kv_tree_rope;
+    (void)ancestor_masks;
+    (void)batch_kv_lens;
+
+    constexpr uint BQ = 32u;
+    constexpr uint BK = 32u;
+    constexpr uint SLICE_PAD = 40u;
+
+    const uint q_head = tg_pos.x;
+    const uint q_base = tg_pos.y * BQ;
+    if (q_head >= p.num_q_heads || q_base >= p.num_nodes) {
+        return;
+    }
+
+    // 15,872 B total threadgroup SRAM (<= 16 KiB).
+    threadgroup half Qs[BQ * SLICE_PAD];   // 2,560 B
+    threadgroup half KVs[BK * SLICE_PAD];  // 2,560 B
+    threadgroup float Ss[BQ * BK];         // 4,096 B
+    threadgroup half Ps[BQ * SLICE_PAD];   // 2,560 B
+    threadgroup float Os[BQ * 32u];        // 4,096 B
+
+    const uint num_bytes = p.kv_lora_rank >> 1;
+    const device uchar *e2m1_base = kv_slab + p.e2m1_plane_offset;
+    const device uchar *scale_base = kv_slab + p.scale_plane_offset;
+    const device uchar *rope_base = kv_slab + p.rope_plane_offset;
+    const ulong rope_row_bytes = (p.rope_tail_format == 1u)
+        ? ulong(p.qk_rope_dim)
+        : (ulong(p.qk_rope_dim) * 2ul);
+    const device half *swa_lat_base = (const device half *)swa_ring;
+    const device half *swa_rope_base = (const device half *)(swa_ring + p.swa_rope_plane_offset);
+
+    const uint r0 = sg_id * 8u;
+    const uint q_cnt = min(BQ, p.num_nodes - q_base);
+
+    uint min_eff_kv = p.kv_len;
+    uint max_eff_kv = 0u;
+    for (uint r = 0u; r < q_cnt; r++) {
+        const uint q_idx = q_base + r;
+        const uint eff = (p.causal_q_start_pos != 0xFFFFFFFFu)
+            ? min(p.kv_len, max(p.encoder_prefix_len, p.causal_q_start_pos + q_idx + 1u))
+            : p.kv_len;
+        min_eff_kv = min(min_eff_kv, eff);
+        max_eff_kv = max(max_eff_kv, eff);
+    }
+
+    const uint ring_valid_lo = (p.swa_ring_capacity > 0u && p.kv_len > p.swa_ring_capacity)
+        ? (p.kv_len - p.swa_ring_capacity)
+        : 0u;
+    const float scale_log2e = p.scale * 1.4426950408889634f;
+    const uint swa_lo_tile = (p.swa_window > 0u)
+        ? ((min_eff_kv > p.swa_window) ? (min_eff_kv - p.swa_window) : 0u)
+        : max_eff_kv;
+    const uint num_blocks = (max_eff_kv + p.block_tokens - 1u) / p.block_tokens;
+
+    for (uint out_d0 = 0u; out_d0 < p.kv_lora_rank; out_d0 += 128u) {
+        const uint chunk_cols = min(128u, p.kv_lora_rank - out_d0);
+        const uint num_slices32 = (chunk_cols + 31u) >> 5;
+
+        // Keep online softmax stats and O accumulators in scalar registers (0 allocas).
+        float m_val[8];
+        float l_val[8];
+        float o_reg[32];
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < 8u; r++) {
+            m_val[r] = -INFINITY;
+            l_val[r] = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint c = 0u; c < 4u; c++) {
+                o_reg[r * 4u + c] = 0.0f;
+            }
+        }
+
+        // Phase 1: Selected sparse CSA2 blocks + Phase 2: SWA bounded replay.
+        // Unified single loop (`pass == 0`: sparse blocks, `pass == 1`: SWA) so
+        // `mla_mma_attend_kv_block` is called once inside the loop and fully inlined.
+        for (uint pass = 0u; pass < 2u; pass++) {
+            const bool is_swa = (pass == 1u);
+            const uint n_iter = is_swa ? 1u : num_blocks;
+            for (uint it = 0u; it < n_iter; it++) {
+                uint tile_mask = 0xFFFFFFFFu;
+                uint seg_start = swa_lo_tile;
+                uint seg_end = max_eff_kv;
+                if (!is_swa) {
+                    tile_mask = 0u;
+                    for (uint r = 0u; r < q_cnt; r++) {
+                        const uint q_idx = q_base + r;
+                        const uint sc = min(selected_counts[q_idx], p.top_k_blocks);
+                        const ulong sb_off = ulong(q_idx) * p.top_k_blocks;
+                        for (uint j = 0u; j < sc; j++) {
+                            if (selected_blocks[sb_off + j] == it) {
+                                tile_mask |= (1u << r);
+                                break;
+                            }
+                        }
+                    }
+                    if (tile_mask == 0u) {
+                        continue;
+                    }
+                    seg_start = it * p.block_tokens;
+                    seg_end = min(seg_start + p.block_tokens, max_eff_kv);
+                }
+                for (uint kv_start = seg_start; kv_start < seg_end; kv_start += BK) {
+                    const uint kv_end = min(kv_start + BK, seg_end);
+                    mla_mma_attend_kv_block(
+                        q_nope, q_pe, e2m1_base, scale_base, rope_base, swa_lat_base, swa_rope_base,
+                        p, Qs, KVs, Ss, Ps, Os, q_head, q_base, kv_start, kv_end, out_d0, num_slices32,
+                        num_bytes, rope_row_bytes, ring_valid_lo, scale_log2e, is_swa, tile_mask,
+                        sg_id, lane, m_val, l_val, o_reg);
+                }
+            }
+        }
+
+        // Write normalized FP16 output slice for this simdgroup's 8 rows.
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < 8u; r++) {
+            const uint q_idx = q_base + r0 + r;
+            if (q_idx >= p.num_nodes) {
+                continue;
+            }
+            const float inv_l = (l_val[r] > 0.0f) ? (1.0f / l_val[r]) : 0.0f;
+            const ulong out_base = (ulong(q_idx) * p.num_q_heads + q_head) * p.kv_lora_rank + out_d0;
+            if (0u < num_slices32 && lane < chunk_cols) out[out_base + lane] = half(o_reg[r * 4u + 0u] * inv_l);
+            if (1u < num_slices32 && 32u + lane < chunk_cols) out[out_base + 32u + lane] = half(o_reg[r * 4u + 1u] * inv_l);
+            if (2u < num_slices32 && 64u + lane < chunk_cols) out[out_base + 64u + lane] = half(o_reg[r * 4u + 2u] * inv_l);
+            if (3u < num_slices32 && 96u + lane < chunk_cols) out[out_base + 96u + lane] = half(o_reg[r * 4u + 3u] * inv_l);
+        }
+    }
+    (void)tid;
 }
 
 // ===========================================================================

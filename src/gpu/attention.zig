@@ -536,6 +536,24 @@ pub const RmsNormArgs = struct {
     w_dtype: quant.FloatDType = .f16,
 };
 
+/// Arguments for `ami_fused_residual_rmsnorm` (`G18`, ADR-0023 §1): updates
+/// `x` in place (`x += delta`) and writes normalized `x_norm` directly from
+/// threadgroup registers with zero intermediate GPU dispatch barrier.
+pub const FusedResidualRmsNormArgs = struct {
+    /// Residual stream `[num_rows, hidden_dim]` (`f16`), updated in place.
+    x: metal.BufferBinding,
+    /// Sublayer output `[num_rows, hidden_dim]` (`f16`) added into `x`.
+    delta: metal.BufferBinding,
+    /// `[hidden_dim]` RMSNorm weight stored as `w_dtype`.
+    w: metal.BufferBinding,
+    /// Normalized output `[num_rows, hidden_dim]` (`f16`); may alias `delta`.
+    x_norm: metal.BufferBinding,
+    num_rows: u32 = 1,
+    hidden_dim: u32,
+    eps: f32 = 1e-6,
+    w_dtype: quant.FloatDType = .f16,
+};
+
 pub const QkNormRopeKvArgs = struct {
     /// `[num_q_heads, head_dim]` fp16, updated in-place.
     q: metal.BufferBinding,
@@ -904,11 +922,31 @@ pub const PrefillQkNormRopeKvArgs = struct {
     norm_dtype: quant.FloatDType = .f16,
 };
 
-/// Arguments for `encodeGqaCausalPrefillFlashAttn` (`G15`, ADR-0020):
-/// block-tiled causal FlashAttention-2 (`BQ = 32, BK = 32`) supporting both
-/// full-chunk wide prefill (`num_q = C, q_start_pos = start_pos`) and `P0-B1`
-/// final-chunk tail narrowing (`num_q = 1, q_start_pos = start_pos + C - 1`),
-/// seamlessly spanning `R5` retired group-64 `q8` chunks and active `KvTilePair`s.
+/// Strict `G19` short-sequence crossover thresholds (ADR-0023 §2): hardware
+/// `8x8` MMA / `NAX` FlashAttention-2 activates ONLY when `Q_len >= 32` and
+/// `KV_len >= 64` (never `M = 1` decode or narrow draft trees `Q_len < 32`).
+pub const G19_MIN_Q_LEN: u32 = 32;
+pub const G19_MIN_KV_LEN: u32 = 64;
+
+/// Active prefill FlashAttention-2 execution path (`G19`, ADR-0023 §2).
+pub const PrefillAttnBackend = enum(u8) {
+    scalar_vector = 0,
+    mma_apple9 = 1,
+    nax_apple10 = 2,
+};
+
+/// Returns `true` strictly when `(num_q, kv_len)` meets the `G19` hardware MMA
+/// / `NAX` FlashAttention-2 activation threshold (`Q_len >= 32` and `KV_len >= 64`).
+pub fn shouldUseG19MmaPrefill(num_q: u32, kv_len: u32) bool {
+    return num_q >= G19_MIN_Q_LEN and kv_len >= G19_MIN_KV_LEN;
+}
+
+/// Arguments for `encodeGqaCausalPrefillFlashAttn` (`G15` / `G19`, ADR-0020,
+/// ADR-0023): dispatches the scalar/vector FlashAttention path when `Q_len < 32`
+/// or `KV_len < 64`, and hardware `simdgroup_half8x8` (`Apple9`) or `NAX`
+/// `mpp::tensor_ops::matmul2d` (`Apple10+`) tiled FlashAttention-2 once
+/// `Q_len >= 32` and `KV_len >= 64`, seamlessly spanning `R5` retired group-64
+/// `q8` chunks and active `KvTilePair`s.
 pub const CausalPrefillAttnArgs = struct {
     /// `[num_q, num_q_heads, head_dim]` fp16 post-RoPE queries.
     q: metal.BufferBinding,
@@ -937,6 +975,9 @@ pub const CausalPrefillAttnArgs = struct {
     retired_offset: u32 = 0,
     retired_plane_stride_bytes: u32 = 0,
     retired_chunk_stride_bytes: u32 = 0,
+    /// Optional backend override for parity testing & `bench-m78` A/B runs
+    /// (`null` enforces the strict `G19` `Q_len >= 32 && KV_len >= 64` guard).
+    backend_override: ?PrefillAttnBackend = null,
 };
 
 /// Chooses the split-KV partition count for FlashDecoding on Apple Silicon.
@@ -1015,6 +1056,14 @@ pub const AttentionPipelines = struct {
     prefill_qknorm_rope_kv_write_bf16: metal.Pipeline,
     gqa_causal_prefill_flash_d64: metal.Pipeline,
     gqa_causal_prefill_flash_d128: metal.Pipeline,
+    // M7.8 (G18, G19, ADR-0023): fused ResidualAdd+RMSNorm, short-seq scalar/vector
+    // FlashAttention-2 fallback, and lazy Apple10+ NAX FlashAttention-2 hook.
+    fused_residual_rmsnorm: metal.Pipeline,
+    fused_residual_rmsnorm_bf16: metal.Pipeline,
+    gqa_causal_prefill_flash_vec_d64: metal.Pipeline,
+    gqa_causal_prefill_flash_vec_d128: metal.Pipeline,
+    gqa_causal_prefill_flash_nax_d64: ?metal.Pipeline = null,
+    gqa_causal_prefill_flash_nax_d128: ?metal.Pipeline = null,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!AttentionPipelines {
         const rmsnorm = try metal.Pipeline.initSpecialized(device, library, "ami_rmsnorm", &.{
@@ -1218,6 +1267,51 @@ pub const AttentionPipelines = struct {
         });
         errdefer gqa_causal_prefill_flash_d128.close();
 
+        const fused_residual_rmsnorm = try metal.Pipeline.initSpecialized(device, library, "ami_fused_residual_rmsnorm", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+        });
+        errdefer fused_residual_rmsnorm.close();
+
+        const fused_residual_rmsnorm_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_fused_residual_rmsnorm", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+        });
+        errdefer fused_residual_rmsnorm_bf16.close();
+
+        const gqa_causal_prefill_flash_vec_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_causal_prefill_flash_attn_vec", &.{
+            .{ .index = 0, .value = .{ .u32 = 64 } },
+        });
+        errdefer gqa_causal_prefill_flash_vec_d64.close();
+
+        const gqa_causal_prefill_flash_vec_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_gqa_causal_prefill_flash_attn_vec", &.{
+            .{ .index = 0, .value = .{ .u32 = 128 } },
+        });
+        errdefer gqa_causal_prefill_flash_vec_d128.close();
+
+        // Lazy Apple10+ NAX FlashAttention-2 PSO instantiation (`G19`, ADR-0023):
+        // zero startup or runtime cost on Apple9 (M4) and older GPUs.
+        var gqa_causal_prefill_flash_nax_d64: ?metal.Pipeline = null;
+        var gqa_causal_prefill_flash_nax_d128: ?metal.Pipeline = null;
+        errdefer if (gqa_causal_prefill_flash_nax_d64) |p| p.close();
+        errdefer if (gqa_causal_prefill_flash_nax_d128) |p| p.close();
+        const dev_info = try device.info();
+        if (dev_info.supportsNaxTensorOps() and try library.hasFunction("ami_gqa_causal_prefill_flash_attn_nax")) {
+            if (metal.Pipeline.initSpecialized(device, library, "ami_gqa_causal_prefill_flash_attn_nax", &.{
+                .{ .index = 4, .value = .{ .u32 = 64 } },
+            })) |p64| {
+                if (metal.Pipeline.initSpecialized(device, library, "ami_gqa_causal_prefill_flash_attn_nax", &.{
+                    .{ .index = 4, .value = .{ .u32 = 128 } },
+                })) |p128| {
+                    gqa_causal_prefill_flash_nax_d64 = p64;
+                    gqa_causal_prefill_flash_nax_d128 = p128;
+                } else |err| {
+                    p64.close();
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                }
+            } else |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+            }
+        }
+
         return .{
             .rmsnorm = rmsnorm,
             .qknorm_rope_kv_write = qknorm_rope_kv_write,
@@ -1258,10 +1352,32 @@ pub const AttentionPipelines = struct {
             .prefill_qknorm_rope_kv_write_bf16 = prefill_qknorm_rope_kv_write_bf16,
             .gqa_causal_prefill_flash_d64 = gqa_causal_prefill_flash_d64,
             .gqa_causal_prefill_flash_d128 = gqa_causal_prefill_flash_d128,
+            .fused_residual_rmsnorm = fused_residual_rmsnorm,
+            .fused_residual_rmsnorm_bf16 = fused_residual_rmsnorm_bf16,
+            .gqa_causal_prefill_flash_vec_d64 = gqa_causal_prefill_flash_vec_d64,
+            .gqa_causal_prefill_flash_vec_d128 = gqa_causal_prefill_flash_vec_d128,
+            .gqa_causal_prefill_flash_nax_d64 = gqa_causal_prefill_flash_nax_d64,
+            .gqa_causal_prefill_flash_nax_d128 = gqa_causal_prefill_flash_nax_d128,
         };
     }
 
+    pub fn useNaxFlashAttn(self: AttentionPipelines) bool {
+        return self.gqa_causal_prefill_flash_nax_d64 != null and self.gqa_causal_prefill_flash_nax_d128 != null;
+    }
+
+    pub fn selectPrefillAttnBackend(self: AttentionPipelines, num_q: u32, kv_len: u32) PrefillAttnBackend {
+        if (!shouldUseG19MmaPrefill(num_q, kv_len)) return .scalar_vector;
+        if (self.useNaxFlashAttn()) return .nax_apple10;
+        return .mma_apple9;
+    }
+
     pub fn close(self: AttentionPipelines) void {
+        if (self.gqa_causal_prefill_flash_nax_d128) |p| p.close();
+        if (self.gqa_causal_prefill_flash_nax_d64) |p| p.close();
+        self.gqa_causal_prefill_flash_vec_d128.close();
+        self.gqa_causal_prefill_flash_vec_d64.close();
+        self.fused_residual_rmsnorm_bf16.close();
+        self.fused_residual_rmsnorm.close();
         self.gqa_causal_prefill_flash_d128.close();
         self.gqa_causal_prefill_flash_d64.close();
         self.prefill_qknorm_rope_kv_write_bf16.close();
@@ -1326,6 +1442,37 @@ pub const AttentionPipelines = struct {
         try frame.encodeThreadgroups(
             pipe,
             &.{ args.x, args.w, args.y },
+            std.mem.asBytes(&params),
+            .{ args.num_rows, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+    }
+
+    /// Encodes `ami_fused_residual_rmsnorm` (`G18`, ADR-0023 §1): adds `delta`
+    /// into `x` in place and emits normalized `x_norm` directly from registers
+    /// in one dispatch with zero intermediate GPU barrier. Zero heap alloc.
+    pub fn encodeFusedResidualRmsNorm(
+        self: AttentionPipelines,
+        frame: *metal.Compute.Frame,
+        args: FusedResidualRmsNormArgs,
+        insert_barrier_before: bool,
+    ) metal.Error!void {
+        if (args.num_rows == 0 or args.hidden_dim == 0 or args.eps < 0.0) {
+            return error.InvalidArgument;
+        }
+        const params: RmsNormParams = .{
+            .num_rows = args.num_rows,
+            .hidden_dim = args.hidden_dim,
+            .eps = args.eps,
+        };
+        const pipe = switch (args.w_dtype) {
+            .f16 => self.fused_residual_rmsnorm,
+            .bf16 => self.fused_residual_rmsnorm_bf16,
+        };
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{ args.x, args.delta, args.w, args.x_norm },
             std.mem.asBytes(&params),
             .{ args.num_rows, 1, 1 },
             .{ 256, 1, 1 },
@@ -2212,11 +2359,12 @@ pub const AttentionPipelines = struct {
         );
     }
 
-    /// Encodes `ami_gqa_causal_prefill_flash_attn` (`G15`, ADR-0020): block-tiled
-    /// (`BQ = 32, BK = 32`) hardware `simdgroup_matrix` causal FlashAttention-2
-    /// skipping upper-triangular KV blocks (`kv_block_start > max_q_pos_in_tile`),
-    /// enforcing exact causal `kv_pos <= q_pos` and optional `sliding_window > 0`,
-    /// reading across both `R5` retired group-64 `q8` chunks and active `KvTilePair`s.
+    /// Encodes causal FlashAttention-2 prefill (`G15` / `G19`, ADR-0020,
+    /// ADR-0023 §2): strictly gates hardware `simdgroup_half8x8` (`Apple9`,
+    /// `BQ = 32, BK = 64` for `D = 64` / `BQ = 32, BK = 32` for `D = 128` in
+    /// `<= 16 KiB` padded SRAM) and `Apple10+` `NAX` `mpp::tensor_ops::matmul2d`
+    /// on `Q_len >= 32` and `KV_len >= 64`; shorter sequences route to the
+    /// zero-padding scalar/vector `ami_gqa_causal_prefill_flash_attn_vec` path.
     pub fn encodeGqaCausalPrefillFlashAttn(
         self: AttentionPipelines,
         frame: *metal.Compute.Frame,
@@ -2228,10 +2376,26 @@ pub const AttentionPipelines = struct {
         {
             return error.InvalidArgument;
         }
-        const pipe = switch (args.head_dim) {
-            64 => self.gqa_causal_prefill_flash_d64,
-            128 => self.gqa_causal_prefill_flash_d128,
-            else => return error.InvalidArgument,
+        if (args.head_dim != 64 and args.head_dim != 128) {
+            return error.InvalidArgument;
+        }
+        const backend = args.backend_override orelse self.selectPrefillAttnBackend(args.num_q, args.kv_len);
+        const pipe = switch (backend) {
+            .scalar_vector => switch (args.head_dim) {
+                64 => self.gqa_causal_prefill_flash_vec_d64,
+                128 => self.gqa_causal_prefill_flash_vec_d128,
+                else => unreachable,
+            },
+            .mma_apple9 => switch (args.head_dim) {
+                64 => self.gqa_causal_prefill_flash_d64,
+                128 => self.gqa_causal_prefill_flash_d128,
+                else => unreachable,
+            },
+            .nax_apple10 => switch (args.head_dim) {
+                64 => self.gqa_causal_prefill_flash_nax_d64 orelse return error.Unsupported,
+                128 => self.gqa_causal_prefill_flash_nax_d128 orelse return error.Unsupported,
+                else => unreachable,
+            },
         };
         const retired_tokens = std.math.mul(u64, args.num_retired_chunks, args.chunk_tokens) catch return error.InvalidArgument;
         if (args.num_retired_chunks > 0) {
@@ -2270,13 +2434,25 @@ pub const AttentionPipelines = struct {
             .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
             .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
         };
-        const gqa_ratio: u64 = args.num_q_heads / args.num_kv_heads;
-        const total_q: u64 = @as(u64, args.num_q) * gqa_ratio;
-        const q_tiles: u64 = (total_q + 31) / 32;
-
         const kv_tiles_bind = args.kv_tiles orelse args.q;
         const retired_pool_bind = args.retired_pool orelse args.q;
         const retired_ids_bind = args.retired_chunk_ids orelse args.q;
+
+        if (backend == .scalar_vector) {
+            try frame.encodeThreadgroups(
+                pipe,
+                &.{ args.q, kv_tiles_bind, retired_pool_bind, retired_ids_bind, args.out },
+                std.mem.asBytes(&params),
+                .{ args.num_q_heads, args.num_q, 1 },
+                .{ 32, 1, 1 },
+                insert_barrier_before,
+            );
+            return;
+        }
+
+        const gqa_ratio: u64 = args.num_q_heads / args.num_kv_heads;
+        const total_q: u64 = @as(u64, args.num_q) * gqa_ratio;
+        const q_tiles: u64 = (total_q + 31) / 32;
 
         try frame.encodeThreadgroups(
             pipe,
@@ -7206,4 +7382,242 @@ test "C16: Spike S1 and G4 percentOfBus scales accurately across M4, M4 Pro, and
     try std.testing.expect(std.mem.indexOf(u8, rendered, "g4.spec_bus_gbs") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "546.00") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "25.0") != null);
+}
+
+test "G18: ami_fused_residual_rmsnorm matches CPU fp32 reference for f16/bf16 weights across M=1,65 and odd hidden_dim" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try AttentionPipelines.init(device, library);
+    defer pipes.close();
+
+    const Cases = [_]struct {
+        rows: u32,
+        hidden: u32,
+        w_dtype: quant.FloatDType,
+        tol: f32,
+    }{
+        .{ .rows = 1, .hidden = 2048, .w_dtype = .f16, .tol = 2e-3 },
+        .{ .rows = 1, .hidden = 4096, .w_dtype = .bf16, .tol = 1e-2 },
+        .{ .rows = 65, .hidden = 1536, .w_dtype = .f16, .tol = 2e-3 },
+        .{ .rows = 17, .hidden = 1027, .w_dtype = .bf16, .tol = 1e-2 },
+        .{ .rows = 4, .hidden = 8704, .w_dtype = .f16, .tol = 2e-3 }, // exercises > 8192 fallback path
+    };
+
+    for (Cases) |tc| {
+        const elems: usize = @as(usize, tc.rows) * tc.hidden;
+        const x_bytes = try page.alignUp(elems * @sizeOf(f16) + 256);
+        const w_bytes = try page.alignUp(@as(usize, tc.hidden) * @sizeOf(u16) + 256);
+        const arena_cap = 3 * x_bytes + w_bytes + page.APPLE_PAGE_SIZE;
+        const budget = budget_mod.Budget.compute(.{
+            .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+            .user_wire_limit = arena_cap,
+            .global_user_wire_limit = arena_cap,
+            .gpu_working_set_bytes = arena_cap,
+            .configured_cap = null,
+            .headroom_bytes = page.APPLE_PAGE_SIZE,
+        });
+        var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+        defer arena.deinit();
+
+        const x_raw = try arena.allocAligned(elems * @sizeOf(f16), 64);
+        const d_raw = try arena.allocAligned(elems * @sizeOf(f16), 64);
+        const n_raw = try arena.allocAligned(elems * @sizeOf(f16), 64);
+        const w_raw = try arena.allocAligned(@as(usize, tc.hidden) * @sizeOf(u16), 64);
+
+        const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+        const d_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, d_raw));
+        const n_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, n_raw));
+        const w_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_raw));
+
+        const cpu_res = try gpa.alloc(f32, elems);
+        defer gpa.free(cpu_res);
+
+        for (0..elems) |i| {
+            const xv: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 19 + 7) % 31)) - 15)) * 0.0625);
+            const dv: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 3) % 23)) - 11)) * 0.03125);
+            x_f16[i] = xv;
+            d_f16[i] = dv;
+            const sum_f16: f16 = @floatCast(@as(f32, @floatCast(xv)) + @as(f32, @floatCast(dv)));
+            cpu_res[i] = @floatCast(sum_f16);
+        }
+        for (0..tc.hidden) |j| {
+            w_bits[j] = quant.f32ToFloatBits(tc.w_dtype, 0.75 + @as(f32, @floatFromInt(j % 17)) * 0.03125);
+        }
+
+        const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer gpu_buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeFusedResidualRmsNorm(&frame, .{
+            .x = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) },
+            .delta = .{ .buffer = gpu_buf, .offset = arena.offsetOf(d_raw.ptr) },
+            .w = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w_raw.ptr) },
+            .x_norm = .{ .buffer = gpu_buf, .offset = arena.offsetOf(n_raw.ptr) },
+            .num_rows = tc.rows,
+            .hidden_dim = tc.hidden,
+            .eps = 1e-6,
+            .w_dtype = tc.w_dtype,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        for (0..tc.rows) |r| {
+            const base = r * tc.hidden;
+            var sum_sq: f64 = 0.0;
+            for (0..tc.hidden) |j| {
+                const xr = cpu_res[base + j];
+                try std.testing.expectApproxEqAbs(xr, @as(f32, @floatCast(x_f16[base + j])), 1e-3);
+                sum_sq += @as(f64, xr) * @as(f64, xr);
+            }
+            const inv_rms: f32 = @floatCast(1.0 / @sqrt(sum_sq / @as(f64, @floatFromInt(tc.hidden)) + 1e-6));
+            for (0..tc.hidden) |j| {
+                const wv = quant.floatBitsToF32(tc.w_dtype, w_bits[j]);
+                const expected = cpu_res[base + j] * inv_rms * wv;
+                try std.testing.expectApproxEqAbs(expected, @as(f32, @floatCast(n_f16[base + j])), tc.tol);
+            }
+        }
+    }
+}
+
+test "G19: short-sequence guard and Apple9 MMA FlashAttention-2 parity vs scalar/vector baseline" {
+    // Strictly validate G19 threshold guard: Q_len >= 32 and KV_len >= 64.
+    try std.testing.expect(!shouldUseG19MmaPrefill(1, 512));
+    try std.testing.expect(!shouldUseG19MmaPrefill(31, 512));
+    try std.testing.expect(!shouldUseG19MmaPrefill(32, 63));
+    try std.testing.expect(!shouldUseG19MmaPrefill(64, 32));
+    try std.testing.expect(shouldUseG19MmaPrefill(32, 64));
+    try std.testing.expect(shouldUseG19MmaPrefill(128, 256));
+
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try AttentionPipelines.init(device, library);
+    defer pipes.close();
+
+    // Verify backend selection helper respects short-sequence guard.
+    try std.testing.expectEqual(PrefillAttnBackend.scalar_vector, pipes.selectPrefillAttnBackend(1, 128));
+    try std.testing.expectEqual(PrefillAttnBackend.scalar_vector, pipes.selectPrefillAttnBackend(16, 128));
+    try std.testing.expectEqual(PrefillAttnBackend.scalar_vector, pipes.selectPrefillAttnBackend(32, 48));
+    const expected_long: PrefillAttnBackend = if (pipes.useNaxFlashAttn()) .nax_apple10 else .mma_apple9;
+    try std.testing.expectEqual(expected_long, pipes.selectPrefillAttnBackend(32, 64));
+
+    // Verify numerical parity between MMA FlashAttention-2 (D=64 BK=64 & D=128 BK=32) and scalar/vector baseline.
+    for ([_]struct { head_dim: u32, num_q: u32, kv_len: u32, q_start: u32, win: u32 }{
+        .{ .head_dim = 64, .num_q = 65, .kv_len = 137, .q_start = 72, .win = 0 },
+        .{ .head_dim = 64, .num_q = 37, .kv_len = 128, .q_start = 91, .win = 64 },
+        .{ .head_dim = 128, .num_q = 64, .kv_len = 128, .q_start = 64, .win = 0 },
+        .{ .head_dim = 128, .num_q = 45, .kv_len = 96, .q_start = 51, .win = 48 },
+    }) |tc| {
+        const num_q_heads: u32 = 8;
+        const num_kv_heads: u32 = 2;
+        const chunk_tokens: u32 = DEFAULT_CHUNK_TOKENS;
+
+        var tile_k = try metal.KvTile.init(device, tc.head_dim, num_kv_heads * chunk_tokens, .{});
+        defer tile_k.close();
+        var tile_v = try metal.KvTile.init(device, tc.head_dim, num_kv_heads * chunk_tokens, .{});
+        defer tile_v.close();
+
+        const q_elems: usize = @as(usize, tc.num_q) * num_q_heads * tc.head_dim;
+        const kv_elems: usize = @as(usize, tc.kv_len) * num_kv_heads * tc.head_dim;
+        const arena_cap = try page.alignUp(3 * q_elems * 2 + 2 * kv_elems * 2 + 4096) + page.APPLE_PAGE_SIZE;
+        const budget = budget_mod.Budget.compute(.{
+            .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+            .user_wire_limit = arena_cap,
+            .global_user_wire_limit = arena_cap,
+            .gpu_working_set_bytes = arena_cap,
+            .configured_cap = null,
+            .headroom_bytes = page.APPLE_PAGE_SIZE,
+        });
+        var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+        defer arena.deinit();
+
+        const q_raw = try arena.allocAligned(q_elems * 2, 64);
+        const k_raw = try arena.allocAligned(kv_elems * 2, 64);
+        const v_raw = try arena.allocAligned(kv_elems * 2, 64);
+        const out_vec_raw = try arena.allocAligned(q_elems * 2, 64);
+        const out_mma_raw = try arena.allocAligned(q_elems * 2, 64);
+        const tab_raw = try arena.allocAligned(@sizeOf(KvTilePair), 64);
+
+        const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw));
+        const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw));
+        const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw));
+        const out_vec: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_vec_raw));
+        const out_mma: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_mma_raw));
+        const tab: []KvTilePair = @alignCast(std.mem.bytesAsSlice(KvTilePair, tab_raw));
+        tab[0] = KvTilePair.fromTiles(tile_k, tile_v, .rgba16f);
+
+        for (q_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 19 + 3) % 25)) - 12)) * 0.0625);
+        for (k_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 11 + 7) % 23)) - 11)) * 0.0625);
+        for (v_f16, 0..) |*x, i| x.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 29 + 5) % 27)) - 13)) * 0.0625);
+
+        const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer gpu_buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{gpu_buf});
+        try compute.makeTilesResident(&.{ tile_k, tile_v });
+
+        const tab_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(tab_raw.ptr) };
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        // Write K/V into tile using KV-only mode, leaving Q unrotated so both paths read identical Q/K/V.
+        try pipes.encodePrefillQkNormRopeKvWrite(&frame, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) },
+            .k = .{ .buffer = gpu_buf, .offset = arena.offsetOf(k_raw.ptr) },
+            .v = .{ .buffer = gpu_buf, .offset = arena.offsetOf(v_raw.ptr) },
+            .kv_tiles = tab_b,
+            .num_tokens = tc.kv_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = tc.head_dim,
+            .start_pos = 0,
+            .chunk_tokens = chunk_tokens,
+            .kv_only = true,
+        }, false);
+        try pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) },
+            .kv_tiles = tab_b,
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_vec_raw.ptr) },
+            .num_q = tc.num_q,
+            .q_start_pos = tc.q_start,
+            .kv_len = tc.kv_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = tc.head_dim,
+            .chunk_tokens = chunk_tokens,
+            .sliding_window = tc.win,
+            .backend_override = .scalar_vector,
+        }, true);
+        try pipes.encodeGqaCausalPrefillFlashAttn(&frame, .{
+            .q = .{ .buffer = gpu_buf, .offset = arena.offsetOf(q_raw.ptr) },
+            .kv_tiles = tab_b,
+            .out = .{ .buffer = gpu_buf, .offset = arena.offsetOf(out_mma_raw.ptr) },
+            .num_q = tc.num_q,
+            .q_start_pos = tc.q_start,
+            .kv_len = tc.kv_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = tc.head_dim,
+            .chunk_tokens = chunk_tokens,
+            .sliding_window = tc.win,
+            .backend_override = .mma_apple9,
+        }, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        for (0..q_elems) |i| {
+            const gv: f32 = @floatCast(out_vec[i]);
+            const gm: f32 = @floatCast(out_mma[i]);
+            try std.testing.expect(std.math.isFinite(gm));
+            try std.testing.expectApproxEqAbs(gv, gm, 3e-3);
+        }
+    }
 }

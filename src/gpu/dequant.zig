@@ -253,6 +253,9 @@ pub const GemvArgs = struct {
     y: metal.BufferBinding,
     n: u32,
     k: u32,
+    /// Optional fused residual input `[n]` (`G18`, ADR-0023): when non-null,
+    /// computes `y[i] = dot(W_i, x) + residual[i]` in one pass (may alias `y`).
+    residual: ?metal.BufferBinding = null,
 };
 
 pub const GemmArgs = struct {
@@ -267,6 +270,9 @@ pub const GemmArgs = struct {
     /// kernel once `m >= 64`. Set to `false` to force the legacy `32x32` path
     /// (e.g. `--gpu-prefill-mode tree64` A/B comparison).
     wide_tile: bool = true,
+    /// Optional fused residual input `[m, n]` (`G18`, ADR-0023): when non-null,
+    /// computes `y[r, c] = dot(W_c, x_r) + residual[r, c]` in one pass (may alias `y`).
+    residual: ?metal.BufferBinding = null,
 };
 
 /// Uniform payload matching `struct DenseParams` in `dequant_gemm.metal`.
@@ -277,9 +283,26 @@ pub const DenseParams = extern struct {
     _pad: u32 = 0,
 };
 
+/// Uniform payload matching `struct FusedQkvParams` in `dequant_gemm.metal`.
+pub const FusedQkvParams = extern struct {
+    m: u32,
+    n_q: u32,
+    n_k: u32,
+    n_v: u32,
+    k: u32,
+    num_groups: u32,
+    row_bytes: u32,
+    tgs_q: u32,
+    tgs_k: u32,
+    tgs_v: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
 comptime {
     if (@sizeOf(DequantParams) != 20) @compileError("DequantParams must be 20 bytes");
     if (@sizeOf(DenseParams) != 16) @compileError("DenseParams must be 16 bytes");
+    if (@sizeOf(FusedQkvParams) != 48) @compileError("FusedQkvParams must be 48 bytes");
 }
 
 /// Dense FP16 / BF16 GEMV: `x` is `f16 [k]`, `weight` is `f16` or `bf16`
@@ -291,6 +314,9 @@ pub const DenseGemvArgs = struct {
     y: metal.BufferBinding,
     n: u32,
     k: u32,
+    /// Optional fused residual input `[n]` (`G18`, ADR-0023): when non-null,
+    /// computes `y[i] = dot(W_i, x) + residual[i]` in one pass (may alias `y`).
+    residual: ?metal.BufferBinding = null,
 };
 
 /// Dense FP16 / BF16 GEMM: `x` is `f16 [m, k]`, `weight` is `f16` or `bf16`
@@ -305,9 +331,98 @@ pub const DenseGemmArgs = struct {
     /// When `true` (default), `encodeDenseGemm` dispatches the `64x64` wide
     /// prefill kernel once `m >= 64`. Set to `false` to force legacy `32x32`.
     wide_tile: bool = true,
+    /// Optional fused residual input `[m, n]` (`G18`, ADR-0023): when non-null,
+    /// computes `y[r, c] = dot(W_c, x_r) + residual[r, c]` in one pass (may alias `y`).
+    residual: ?metal.BufferBinding = null,
+};
+
+/// Returns `true` if `dtype` is supported by the homogeneous G18 fused linear
+/// kernels (`f16`, `bf16`, `q4_affine`, `q3_affine`, `q2_affine`).
+pub fn isFusableLinearDType(dtype: amf.DType) bool {
+    return switch (dtype) {
+        .f16, .bf16, .q4_affine, .q3_affine, .q2_affine => true,
+        else => false,
+    };
+}
+
+/// Heterogeneous-GSQ guard (`G18`, ADR-0023 §1): returns `true` strictly when
+/// `q`, `k`, and `v` projections share one homogeneous supported `DType`.
+pub fn canFuseQkv(q_dtype: amf.DType, k_dtype: amf.DType, v_dtype: amf.DType) bool {
+    return q_dtype == k_dtype and k_dtype == v_dtype and isFusableLinearDType(q_dtype);
+}
+
+/// Heterogeneous-GSQ guard (`G18`, ADR-0023 §1): returns `true` strictly when
+/// dense FFN `gate_proj` and `up_proj` share one homogeneous supported `DType`.
+pub fn canFuseGateUp(gate_dtype: amf.DType, up_dtype: amf.DType) bool {
+    return gate_dtype == up_dtype and isFusableLinearDType(gate_dtype);
+}
+
+/// Reports whether a G18 guarded fusion helper executed the fused single-pass
+/// kernel or fell back to the unfused path for a mixed-DType GSQ layer.
+pub const FusionPath = enum(u8) {
+    fused = 0,
+    unfused_heterogeneous = 1,
+};
+
+/// Single projection descriptor for `FusedQkvGemvArgs` / `FusedQkvGemmArgs`.
+pub const QkvProjBinding = struct {
+    dtype: amf.DType,
+    weight: metal.BufferBinding,
+    /// Required for `q2_affine`/`q3_affine`/`q4_affine`; ignored (`null`) for `f16`/`bf16`.
+    scale_bias: ?metal.BufferBinding = null,
+    y: metal.BufferBinding,
+    n: u32,
+};
+
+/// Arguments for homogeneous-DType fused QKV GEMV (`M = 1`, `G18`, ADR-0023).
+pub const FusedQkvGemvArgs = struct {
+    x: metal.BufferBinding,
+    q: QkvProjBinding,
+    k_proj: QkvProjBinding,
+    v: QkvProjBinding,
+    k: u32,
+    /// When `true` (default), mixed-DType GSQ layers automatically route to the
+    /// 3 unfused projection dispatches instead of returning `error.HeterogeneousDType`.
+    allow_unfused_fallback: bool = true,
+};
+
+/// Arguments for homogeneous-DType fused QKV GEMM (`M >= 1`, `G18`, ADR-0023).
+pub const FusedQkvGemmArgs = struct {
+    x: metal.BufferBinding,
+    q: QkvProjBinding,
+    k_proj: QkvProjBinding,
+    v: QkvProjBinding,
+    m: u32,
+    k: u32,
+    /// When `true` (default), mixed-DType GSQ layers automatically route to the
+    /// 3 unfused projection dispatches instead of returning `error.HeterogeneousDType`.
+    allow_unfused_fallback: bool = true,
+};
+
+/// Arguments for homogeneous-DType fused dense FFN `Gate + Up + SwiGLU` (`G18`,
+/// ADR-0023): computes `y = SiLU(x @ W_gate^T) * (x @ W_up^T)` without writing
+/// `2 * m * n` intermediate activations to unified DRAM.
+pub const DenseGateUpSwigluArgs = struct {
+    x: metal.BufferBinding,
+    gate_dtype: amf.DType,
+    w_gate: metal.BufferBinding,
+    sb_gate: ?metal.BufferBinding = null,
+    up_dtype: amf.DType,
+    w_up: metal.BufferBinding,
+    sb_up: ?metal.BufferBinding = null,
+    y: metal.BufferBinding,
+    m: u32,
+    /// `intermediate_size`.
+    n: u32,
+    /// `hidden_size`.
+    k: u32,
 };
 
 pub const EncodeError = metal.Error || quant.ShapeError;
+pub const FusedEncodeError = EncodeError || error{
+    HeterogeneousDType,
+    UnsupportedDType,
+};
 
 /// Startup-compiled specialized Metal 4 pipelines for 2-bit, 3-bit and 4-bit
 /// group-64 affine dequantization GEMV and GEMM (G1, G2, G13), dense FP16/BF16
@@ -334,12 +449,44 @@ pub const DequantPipelines = struct {
     gemm_wide_bf16: metal.Pipeline,
     gemv_batch_f16: metal.Pipeline,
     gemv_batch_bf16: metal.Pipeline,
+    /// M7.8 (`G18`, ADR-0023): function-constant-specialized (`has_residual_epilogue = true`)
+    /// variants computing `y[i] = dot(W_i, x) + residual[i]` in a single pass.
+    gemv_q4_res: metal.Pipeline,
+    gemv_q3_res: metal.Pipeline,
+    gemv_q2_res: metal.Pipeline,
+    gemm_q4_res: metal.Pipeline,
+    gemm_q3_res: metal.Pipeline,
+    gemm_q2_res: metal.Pipeline,
+    gemm_wide_q4_res: metal.Pipeline,
+    gemm_wide_q3_res: metal.Pipeline,
+    gemm_wide_q2_res: metal.Pipeline,
+    gemv_batch_q4_res: metal.Pipeline,
+    gemv_batch_q3_res: metal.Pipeline,
+    gemv_batch_q2_res: metal.Pipeline,
+    gemv_f16_res: metal.Pipeline,
+    gemv_bf16_res: metal.Pipeline,
+    gemm_f16_res: metal.Pipeline,
+    gemm_bf16_res: metal.Pipeline,
+    gemm_wide_f16_res: metal.Pipeline,
+    gemm_wide_bf16_res: metal.Pipeline,
+    gemv_batch_f16_res: metal.Pipeline,
+    gemv_batch_bf16_res: metal.Pipeline,
+    /// M7.8 (`G18`, ADR-0023): homogeneous-DType fused QKV and dense Gate+Up+SwiGLU.
+    fused_qkv_gemv: HomogeneousLinearSet,
+    fused_qkv_gemm: HomogeneousLinearSet,
+    dense_swiglu_gemv: HomogeneousLinearSet,
+    dense_swiglu_gemm: HomogeneousLinearSet,
     /// Lazily instantiated Apple10+ NAX TensorOps pipelines (null on Apple9 / M4).
     gemm_nax_q4: ?metal.Pipeline = null,
     gemm_nax_q3: ?metal.Pipeline = null,
     gemm_nax_q2: ?metal.Pipeline = null,
     gemm_nax_f16: ?metal.Pipeline = null,
     gemm_nax_bf16: ?metal.Pipeline = null,
+    gemm_nax_q4_res: ?metal.Pipeline = null,
+    gemm_nax_q3_res: ?metal.Pipeline = null,
+    gemm_nax_q2_res: ?metal.Pipeline = null,
+    gemm_nax_f16_res: ?metal.Pipeline = null,
+    gemm_nax_bf16_res: ?metal.Pipeline = null,
     nax_pipelines_compiled: bool = false,
     active_backend: PrefillMatmulBackend = .simdgroup_apple9,
     nax_fallback_reason: NaxFallbackReason = .unsupported_gpu_family,
@@ -347,14 +494,96 @@ pub const DequantPipelines = struct {
     simulate_nax_canary_failure: bool = false,
     nax_state: ?*NaxRuntimeState = null,
 
+    pub const HomogeneousLinearSet = struct {
+        f16: metal.Pipeline,
+        bf16: metal.Pipeline,
+        q4: metal.Pipeline,
+        q3: metal.Pipeline,
+        q2: metal.Pipeline,
+
+        fn init(device: metal.Device, library: metal.Library, fn_name: [:0]const u8) metal.Error!HomogeneousLinearSet {
+            const p_f16 = try metal.Pipeline.initSpecialized(device, library, fn_name, &.{
+                .{ .index = 0, .value = .{ .u32 = 0 } },
+                .{ .index = 1, .value = .{ .u32 = 64 } },
+                .{ .index = 2, .value = .{ .bool = false } },
+            });
+            errdefer p_f16.close();
+
+            const p_bf16 = try metal.Pipeline.initSpecialized(device, library, fn_name, &.{
+                .{ .index = 0, .value = .{ .u32 = 0 } },
+                .{ .index = 1, .value = .{ .u32 = 64 } },
+                .{ .index = 2, .value = .{ .bool = true } },
+            });
+            errdefer p_bf16.close();
+
+            const p_q4 = try metal.Pipeline.initSpecialized(device, library, fn_name, &.{
+                .{ .index = 0, .value = .{ .u32 = 4 } },
+                .{ .index = 1, .value = .{ .u32 = 64 } },
+                .{ .index = 2, .value = .{ .bool = false } },
+            });
+            errdefer p_q4.close();
+
+            const p_q3 = try metal.Pipeline.initSpecialized(device, library, fn_name, &.{
+                .{ .index = 0, .value = .{ .u32 = 3 } },
+                .{ .index = 1, .value = .{ .u32 = 64 } },
+                .{ .index = 2, .value = .{ .bool = false } },
+            });
+            errdefer p_q3.close();
+
+            const p_q2 = try metal.Pipeline.initSpecialized(device, library, fn_name, &.{
+                .{ .index = 0, .value = .{ .u32 = 2 } },
+                .{ .index = 1, .value = .{ .u32 = 64 } },
+                .{ .index = 2, .value = .{ .bool = false } },
+            });
+            errdefer p_q2.close();
+
+            return .{
+                .f16 = p_f16,
+                .bf16 = p_bf16,
+                .q4 = p_q4,
+                .q3 = p_q3,
+                .q2 = p_q2,
+            };
+        }
+
+        fn select(self: HomogeneousLinearSet, dtype: amf.DType) ?metal.Pipeline {
+            return switch (dtype) {
+                .f16 => self.f16,
+                .bf16 => self.bf16,
+                .q4_affine => self.q4,
+                .q3_affine => self.q3,
+                .q2_affine => self.q2,
+                else => null,
+            };
+        }
+
+        fn close(self: HomogeneousLinearSet) void {
+            self.q2.close();
+            self.q3.close();
+            self.q4.close();
+            self.bf16.close();
+            self.f16.close();
+        }
+    };
+
     const NaxCompiledSet = struct {
         gemm_nax_q4: metal.Pipeline,
         gemm_nax_q3: metal.Pipeline,
         gemm_nax_q2: metal.Pipeline,
         gemm_nax_f16: metal.Pipeline,
         gemm_nax_bf16: metal.Pipeline,
+        gemm_nax_q4_res: metal.Pipeline,
+        gemm_nax_q3_res: metal.Pipeline,
+        gemm_nax_q2_res: metal.Pipeline,
+        gemm_nax_f16_res: metal.Pipeline,
+        gemm_nax_bf16_res: metal.Pipeline,
 
         fn close(self: NaxCompiledSet) void {
+            self.gemm_nax_bf16_res.close();
+            self.gemm_nax_f16_res.close();
+            self.gemm_nax_q2_res.close();
+            self.gemm_nax_q3_res.close();
+            self.gemm_nax_q4_res.close();
             self.gemm_nax_bf16.close();
             self.gemm_nax_f16.close();
             self.gemm_nax_q2.close();
@@ -366,31 +595,69 @@ pub const DequantPipelines = struct {
     fn compileNaxPipelines(device: metal.Device, library: metal.Library) metal.Error!NaxCompiledSet {
         const gemm_nax_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm_nax", &.{
             .{ .index = 2, .value = .{ .bool = false } },
+            .{ .index = 3, .value = .{ .bool = false } },
         });
         errdefer gemm_nax_f16.close();
 
         const gemm_nax_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm_nax", &.{
             .{ .index = 2, .value = .{ .bool = true } },
+            .{ .index = 3, .value = .{ .bool = false } },
         });
         errdefer gemm_nax_bf16.close();
 
         const gemm_nax_q4 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
             .{ .index = 0, .value = .{ .u32 = 4 } },
             .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = false } },
         });
         errdefer gemm_nax_q4.close();
 
         const gemm_nax_q3 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
             .{ .index = 0, .value = .{ .u32 = 3 } },
             .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = false } },
         });
         errdefer gemm_nax_q3.close();
 
         const gemm_nax_q2 = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
             .{ .index = 0, .value = .{ .u32 = 2 } },
             .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = false } },
         });
         errdefer gemm_nax_q2.close();
+
+        const gemm_nax_f16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm_nax", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_nax_f16_res.close();
+
+        const gemm_nax_bf16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm_nax", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_nax_bf16_res.close();
+
+        const gemm_nax_q4_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_nax_q4_res.close();
+
+        const gemm_nax_q3_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_nax_q3_res.close();
+
+        const gemm_nax_q2_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_nax", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_nax_q2_res.close();
 
         return .{
             .gemm_nax_q4 = gemm_nax_q4,
@@ -398,6 +665,11 @@ pub const DequantPipelines = struct {
             .gemm_nax_q2 = gemm_nax_q2,
             .gemm_nax_f16 = gemm_nax_f16,
             .gemm_nax_bf16 = gemm_nax_bf16,
+            .gemm_nax_q4_res = gemm_nax_q4_res,
+            .gemm_nax_q3_res = gemm_nax_q3_res,
+            .gemm_nax_q2_res = gemm_nax_q2_res,
+            .gemm_nax_f16_res = gemm_nax_f16_res,
+            .gemm_nax_bf16_res = gemm_nax_bf16_res,
         };
     }
 
@@ -535,8 +807,155 @@ pub const DequantPipelines = struct {
 
         const gemv_batch_bf16 = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv_batch", &.{
             .{ .index = 2, .value = .{ .bool = true } },
+            .{ .index = 3, .value = .{ .bool = false } },
         });
         errdefer gemv_batch_bf16.close();
+
+        // M7.8 (G18, ADR-0023): fused residual-epilogue (`has_residual_epilogue = true`) PSOs.
+        const gemv_q4_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_q4_res.close();
+
+        const gemv_q3_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_q3_res.close();
+
+        const gemv_q2_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_q2_res.close();
+
+        const gemm_q4_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_q4_res.close();
+
+        const gemm_q3_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_q3_res.close();
+
+        const gemm_q2_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_q2_res.close();
+
+        const gemm_wide_q4_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_wide", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_wide_q4_res.close();
+
+        const gemm_wide_q3_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_wide", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_wide_q3_res.close();
+
+        const gemm_wide_q2_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemm_wide", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_wide_q2_res.close();
+
+        const gemv_batch_q4_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv_batch", &.{
+            .{ .index = 0, .value = .{ .u32 = 4 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_batch_q4_res.close();
+
+        const gemv_batch_q3_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv_batch", &.{
+            .{ .index = 0, .value = .{ .u32 = 3 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_batch_q3_res.close();
+
+        const gemv_batch_q2_res = try metal.Pipeline.initSpecialized(device, library, "ami_dequant_gemv_batch", &.{
+            .{ .index = 0, .value = .{ .u32 = 2 } },
+            .{ .index = 1, .value = .{ .u32 = 64 } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_batch_q2_res.close();
+
+        const gemv_f16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_f16_res.close();
+
+        const gemv_bf16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_bf16_res.close();
+
+        const gemm_f16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_f16_res.close();
+
+        const gemm_bf16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_bf16_res.close();
+
+        const gemm_wide_f16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm_wide", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_wide_f16_res.close();
+
+        const gemm_wide_bf16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemm_wide", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemm_wide_bf16_res.close();
+
+        const gemv_batch_f16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv_batch", &.{
+            .{ .index = 2, .value = .{ .bool = false } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_batch_f16_res.close();
+
+        const gemv_batch_bf16_res = try metal.Pipeline.initSpecialized(device, library, "ami_dense_gemv_batch", &.{
+            .{ .index = 2, .value = .{ .bool = true } },
+            .{ .index = 3, .value = .{ .bool = true } },
+        });
+        errdefer gemv_batch_bf16_res.close();
+
+        // M7.8 (G18, ADR-0023): homogeneous-DType fused QKV and dense Gate+Up+SwiGLU PSOs.
+        const fused_qkv_gemv = try HomogeneousLinearSet.init(device, library, "ami_fused_qkv_gemv");
+        errdefer fused_qkv_gemv.close();
+
+        const fused_qkv_gemm = try HomogeneousLinearSet.init(device, library, "ami_fused_qkv_gemm");
+        errdefer fused_qkv_gemm.close();
+
+        const dense_swiglu_gemv = try HomogeneousLinearSet.init(device, library, "ami_dense_gate_up_swiglu");
+        errdefer dense_swiglu_gemv.close();
+
+        const dense_swiglu_gemm = try HomogeneousLinearSet.init(device, library, "ami_dense_gate_up_swiglu_gemm");
+        errdefer dense_swiglu_gemm.close();
 
         // Lazy Apple10+ NAX PSO compilation (`G17`, ADR-0021): skipped completely
         // when forced to `simdgroup` or on `Apple9` (M4) so M4 startup pays zero
@@ -607,11 +1026,40 @@ pub const DequantPipelines = struct {
             .gemm_wide_bf16 = gemm_wide_bf16,
             .gemv_batch_f16 = gemv_batch_f16,
             .gemv_batch_bf16 = gemv_batch_bf16,
+            .gemv_q4_res = gemv_q4_res,
+            .gemv_q3_res = gemv_q3_res,
+            .gemv_q2_res = gemv_q2_res,
+            .gemm_q4_res = gemm_q4_res,
+            .gemm_q3_res = gemm_q3_res,
+            .gemm_q2_res = gemm_q2_res,
+            .gemm_wide_q4_res = gemm_wide_q4_res,
+            .gemm_wide_q3_res = gemm_wide_q3_res,
+            .gemm_wide_q2_res = gemm_wide_q2_res,
+            .gemv_batch_q4_res = gemv_batch_q4_res,
+            .gemv_batch_q3_res = gemv_batch_q3_res,
+            .gemv_batch_q2_res = gemv_batch_q2_res,
+            .gemv_f16_res = gemv_f16_res,
+            .gemv_bf16_res = gemv_bf16_res,
+            .gemm_f16_res = gemm_f16_res,
+            .gemm_bf16_res = gemm_bf16_res,
+            .gemm_wide_f16_res = gemm_wide_f16_res,
+            .gemm_wide_bf16_res = gemm_wide_bf16_res,
+            .gemv_batch_f16_res = gemv_batch_f16_res,
+            .gemv_batch_bf16_res = gemv_batch_bf16_res,
+            .fused_qkv_gemv = fused_qkv_gemv,
+            .fused_qkv_gemm = fused_qkv_gemm,
+            .dense_swiglu_gemv = dense_swiglu_gemv,
+            .dense_swiglu_gemm = dense_swiglu_gemm,
             .gemm_nax_q4 = if (nax_set) |ns| ns.gemm_nax_q4 else null,
             .gemm_nax_q3 = if (nax_set) |ns| ns.gemm_nax_q3 else null,
             .gemm_nax_q2 = if (nax_set) |ns| ns.gemm_nax_q2 else null,
             .gemm_nax_f16 = if (nax_set) |ns| ns.gemm_nax_f16 else null,
             .gemm_nax_bf16 = if (nax_set) |ns| ns.gemm_nax_bf16 else null,
+            .gemm_nax_q4_res = if (nax_set) |ns| ns.gemm_nax_q4_res else null,
+            .gemm_nax_q3_res = if (nax_set) |ns| ns.gemm_nax_q3_res else null,
+            .gemm_nax_q2_res = if (nax_set) |ns| ns.gemm_nax_q2_res else null,
+            .gemm_nax_f16_res = if (nax_set) |ns| ns.gemm_nax_f16_res else null,
+            .gemm_nax_bf16_res = if (nax_set) |ns| ns.gemm_nax_bf16_res else null,
             .nax_pipelines_compiled = nax_compiled,
             .active_backend = active_backend,
             .nax_fallback_reason = fallback_reason,
@@ -644,11 +1092,40 @@ pub const DequantPipelines = struct {
 
     pub fn close(self: DequantPipelines) void {
         if (self.nax_state) |st| std.heap.c_allocator.destroy(st);
+        if (self.gemm_nax_bf16_res) |p| p.close();
+        if (self.gemm_nax_f16_res) |p| p.close();
+        if (self.gemm_nax_q2_res) |p| p.close();
+        if (self.gemm_nax_q3_res) |p| p.close();
+        if (self.gemm_nax_q4_res) |p| p.close();
         if (self.gemm_nax_bf16) |p| p.close();
         if (self.gemm_nax_f16) |p| p.close();
         if (self.gemm_nax_q2) |p| p.close();
         if (self.gemm_nax_q3) |p| p.close();
         if (self.gemm_nax_q4) |p| p.close();
+        self.dense_swiglu_gemm.close();
+        self.dense_swiglu_gemv.close();
+        self.fused_qkv_gemm.close();
+        self.fused_qkv_gemv.close();
+        self.gemv_batch_bf16_res.close();
+        self.gemv_batch_f16_res.close();
+        self.gemm_wide_bf16_res.close();
+        self.gemm_wide_f16_res.close();
+        self.gemm_bf16_res.close();
+        self.gemm_f16_res.close();
+        self.gemv_bf16_res.close();
+        self.gemv_f16_res.close();
+        self.gemv_batch_q2_res.close();
+        self.gemv_batch_q3_res.close();
+        self.gemv_batch_q4_res.close();
+        self.gemm_wide_q2_res.close();
+        self.gemm_wide_q3_res.close();
+        self.gemm_wide_q4_res.close();
+        self.gemm_q2_res.close();
+        self.gemm_q3_res.close();
+        self.gemm_q4_res.close();
+        self.gemv_q2_res.close();
+        self.gemv_q3_res.close();
+        self.gemv_q4_res.close();
         self.gemv_batch_bf16.close();
         self.gemv_batch_f16.close();
         self.gemm_wide_bf16.close();
@@ -679,18 +1156,19 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.n == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const num_groups, const row_bytes, const pipe = switch (bits) {
             .q4 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_q4 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemv_q4_res else self.gemv_q4 };
             },
             .q3 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_q3 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemv_q3_res else self.gemv_q3 };
             },
             .q2 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_q2 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemv_q2_res else self.gemv_q2 };
             },
         };
         const params: DequantParams = .{
@@ -703,7 +1181,7 @@ pub const DequantPipelines = struct {
         const groups_x: u64 = (@as(u64, args.n) + 15) / 16;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.qweight, args.scale_bias, args.y },
+            &.{ args.x, args.qweight, args.scale_bias, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, 1, 1 },
             .{ 128, 1, 1 },
@@ -732,18 +1210,19 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.m == 0 or args.n == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const num_groups, const row_bytes, const pipe = switch (bits) {
             .q4 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_q4 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemm_q4_res else self.gemm_q4 };
             },
             .q3 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_q3 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemm_q3_res else self.gemm_q3 };
             },
             .q2 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_q2 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemm_q2_res else self.gemm_q2 };
             },
         };
         const params: DequantParams = .{
@@ -757,7 +1236,7 @@ pub const DequantPipelines = struct {
         const groups_y: u64 = (@as(u64, args.m) + 31) / 32;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.qweight, args.scale_bias, args.y },
+            &.{ args.x, args.qweight, args.scale_bias, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 128, 1, 1 },
@@ -794,18 +1273,19 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.m == 0 or args.n == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const num_groups, const row_bytes, const pipe = switch (bits) {
             .q4 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_wide_q4 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemm_wide_q4_res else self.gemm_wide_q4 };
             },
             .q3 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_wide_q3 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemm_wide_q3_res else self.gemm_wide_q3 };
             },
             .q2 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_wide_q2 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemm_wide_q2_res else self.gemm_wide_q2 };
             },
         };
         const params: DequantParams = .{
@@ -819,7 +1299,7 @@ pub const DequantPipelines = struct {
         const groups_y: u64 = (@as(u64, args.m) + 63) / 64;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.qweight, args.scale_bias, args.y },
+            &.{ args.x, args.qweight, args.scale_bias, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 256, 1, 1 },
@@ -835,18 +1315,22 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.m == 0 or args.n == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const num_groups, const row_bytes, const pipe = switch (bits) {
             .q4 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_nax_q4 orelse return error.Unsupported };
+                const p_opt = if (has_res) self.gemm_nax_q4_res else self.gemm_nax_q4;
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), p_opt orelse return error.Unsupported };
             },
             .q3 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_nax_q3 orelse return error.Unsupported };
+                const p_opt = if (has_res) self.gemm_nax_q3_res else self.gemm_nax_q3;
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), p_opt orelse return error.Unsupported };
             },
             .q2 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemm_nax_q2 orelse return error.Unsupported };
+                const p_opt = if (has_res) self.gemm_nax_q2_res else self.gemm_nax_q2;
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), p_opt orelse return error.Unsupported };
             },
         };
         const params: DequantParams = .{
@@ -860,7 +1344,7 @@ pub const DequantPipelines = struct {
         const groups_y: u64 = (@as(u64, args.m) + 63) / 64;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.qweight, args.scale_bias, args.y },
+            &.{ args.x, args.qweight, args.scale_bias, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 128, 1, 1 },
@@ -878,15 +1362,16 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const pipe = switch (dtype) {
-            .f16 => self.gemv_f16,
-            .bf16 => self.gemv_bf16,
+            .f16 => if (has_res) self.gemv_f16_res else self.gemv_f16,
+            .bf16 => if (has_res) self.gemv_bf16_res else self.gemv_bf16,
         };
         const params: DenseParams = .{ .m = 1, .n = args.n, .k = args.k };
         const groups_x: u64 = (@as(u64, args.n) + 15) / 16;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.weight, args.y },
+            &.{ args.x, args.weight, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, 1, 1 },
             .{ 128, 1, 1 },
@@ -905,18 +1390,19 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.m == 0 or args.n == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const num_groups, const row_bytes, const pipe = switch (bits) {
             .q4 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_batch_q4 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemv_batch_q4_res else self.gemv_batch_q4 };
             },
             .q3 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_batch_q3 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemv_batch_q3_res else self.gemv_batch_q3 };
             },
             .q2 => blk: {
                 const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
-                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), self.gemv_batch_q2 };
+                break :blk .{ try Ops.groupsPerRow(args.k), try Ops.rowWeightBytes(args.k), if (has_res) self.gemv_batch_q2_res else self.gemv_batch_q2 };
             },
         };
         const params: DequantParams = .{
@@ -930,7 +1416,7 @@ pub const DequantPipelines = struct {
         const groups_y: u64 = (@as(u64, args.m) + 7) / 8;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.qweight, args.scale_bias, args.y },
+            &.{ args.x, args.qweight, args.scale_bias, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 128, 1, 1 },
@@ -949,16 +1435,17 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const pipe = switch (dtype) {
-            .f16 => self.gemv_batch_f16,
-            .bf16 => self.gemv_batch_bf16,
+            .f16 => if (has_res) self.gemv_batch_f16_res else self.gemv_batch_f16,
+            .bf16 => if (has_res) self.gemv_batch_bf16_res else self.gemv_batch_bf16,
         };
         const params: DenseParams = .{ .m = args.m, .n = args.n, .k = args.k };
         const groups_x: u64 = (@as(u64, args.n) + 7) / 8;
         const groups_y: u64 = (@as(u64, args.m) + 7) / 8;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.weight, args.y },
+            &.{ args.x, args.weight, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 128, 1, 1 },
@@ -990,16 +1477,17 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const pipe = switch (dtype) {
-            .f16 => self.gemm_f16,
-            .bf16 => self.gemm_bf16,
+            .f16 => if (has_res) self.gemm_f16_res else self.gemm_f16,
+            .bf16 => if (has_res) self.gemm_bf16_res else self.gemm_bf16,
         };
         const params: DenseParams = .{ .m = args.m, .n = args.n, .k = args.k };
         const groups_x: u64 = (@as(u64, args.n) + 31) / 32;
         const groups_y: u64 = (@as(u64, args.m) + 31) / 32;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.weight, args.y },
+            &.{ args.x, args.weight, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 128, 1, 1 },
@@ -1036,16 +1524,17 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const pipe = switch (dtype) {
-            .f16 => self.gemm_wide_f16,
-            .bf16 => self.gemm_wide_bf16,
+            .f16 => if (has_res) self.gemm_wide_f16_res else self.gemm_wide_f16,
+            .bf16 => if (has_res) self.gemm_wide_bf16_res else self.gemm_wide_bf16,
         };
         const params: DenseParams = .{ .m = args.m, .n = args.n, .k = args.k };
         const groups_x: u64 = (@as(u64, args.n) + 63) / 64;
         const groups_y: u64 = (@as(u64, args.m) + 63) / 64;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.weight, args.y },
+            &.{ args.x, args.weight, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 256, 1, 1 },
@@ -1061,21 +1550,279 @@ pub const DequantPipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+        const has_res = (args.residual != null);
         const pipe = switch (dtype) {
-            .f16 => self.gemm_nax_f16 orelse return error.Unsupported,
-            .bf16 => self.gemm_nax_bf16 orelse return error.Unsupported,
+            .f16 => (if (has_res) self.gemm_nax_f16_res else self.gemm_nax_f16) orelse return error.Unsupported,
+            .bf16 => (if (has_res) self.gemm_nax_bf16_res else self.gemm_nax_bf16) orelse return error.Unsupported,
         };
         const params: DenseParams = .{ .m = args.m, .n = args.n, .k = args.k };
         const groups_x: u64 = (@as(u64, args.n) + 63) / 64;
         const groups_y: u64 = (@as(u64, args.m) + 63) / 64;
         try frame.encodeThreadgroups(
             pipe,
-            &.{ args.x, args.weight, args.y },
+            &.{ args.x, args.weight, args.y, args.residual orelse args.y },
             std.mem.asBytes(&params),
             .{ groups_x, groups_y, 1 },
             .{ 128, 1, 1 },
             insert_barrier_before,
         );
+    }
+
+    fn quantShapeForDType(dtype: amf.DType, k: u32) FusedEncodeError!struct { num_groups: u32, row_bytes: u32, is_quant: bool } {
+        return switch (dtype) {
+            .f16, .bf16 => .{ .num_groups = 0, .row_bytes = 0, .is_quant = false },
+            .q4_affine => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+                break :blk .{ .num_groups = @intCast(try Ops.groupsPerRow(k)), .row_bytes = @intCast(try Ops.rowWeightBytes(k)), .is_quant = true };
+            },
+            .q3_affine => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q3, .group_size = 64 });
+                break :blk .{ .num_groups = @intCast(try Ops.groupsPerRow(k)), .row_bytes = @intCast(try Ops.rowWeightBytes(k)), .is_quant = true };
+            },
+            .q2_affine => blk: {
+                const Ops = quant.QuantOps(.{ .bits = .q2, .group_size = 64 });
+                break :blk .{ .num_groups = @intCast(try Ops.groupsPerRow(k)), .row_bytes = @intCast(try Ops.rowWeightBytes(k)), .is_quant = true };
+            },
+            else => error.UnsupportedDType,
+        };
+    }
+
+    fn encodeSingleProjGemv(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        x: metal.BufferBinding,
+        proj: QkvProjBinding,
+        k: u32,
+        insert_barrier_before: bool,
+    ) FusedEncodeError!void {
+        switch (proj.dtype) {
+            .f16 => try self.encodeDenseGemv(frame, .f16, .{ .x = x, .weight = proj.weight, .y = proj.y, .n = proj.n, .k = k }, insert_barrier_before),
+            .bf16 => try self.encodeDenseGemv(frame, .bf16, .{ .x = x, .weight = proj.weight, .y = proj.y, .n = proj.n, .k = k }, insert_barrier_before),
+            .q4_affine => try self.encodeGemv(frame, .q4, .{ .x = x, .qweight = proj.weight, .scale_bias = proj.scale_bias orelse return error.InvalidArgument, .y = proj.y, .n = proj.n, .k = k }, insert_barrier_before),
+            .q3_affine => try self.encodeGemv(frame, .q3, .{ .x = x, .qweight = proj.weight, .scale_bias = proj.scale_bias orelse return error.InvalidArgument, .y = proj.y, .n = proj.n, .k = k }, insert_barrier_before),
+            .q2_affine => try self.encodeGemv(frame, .q2, .{ .x = x, .qweight = proj.weight, .scale_bias = proj.scale_bias orelse return error.InvalidArgument, .y = proj.y, .n = proj.n, .k = k }, insert_barrier_before),
+            else => return error.UnsupportedDType,
+        }
+    }
+
+    fn encodeSingleProjGemm(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        x: metal.BufferBinding,
+        proj: QkvProjBinding,
+        m: u32,
+        k: u32,
+        insert_barrier_before: bool,
+    ) FusedEncodeError!void {
+        switch (proj.dtype) {
+            .f16 => try self.encodeDenseGemm(frame, .f16, .{ .x = x, .weight = proj.weight, .y = proj.y, .m = m, .n = proj.n, .k = k }, insert_barrier_before),
+            .bf16 => try self.encodeDenseGemm(frame, .bf16, .{ .x = x, .weight = proj.weight, .y = proj.y, .m = m, .n = proj.n, .k = k }, insert_barrier_before),
+            .q4_affine => try self.encodeGemm(frame, .q4, .{ .x = x, .qweight = proj.weight, .scale_bias = proj.scale_bias orelse return error.InvalidArgument, .y = proj.y, .m = m, .n = proj.n, .k = k }, insert_barrier_before),
+            .q3_affine => try self.encodeGemm(frame, .q3, .{ .x = x, .qweight = proj.weight, .scale_bias = proj.scale_bias orelse return error.InvalidArgument, .y = proj.y, .m = m, .n = proj.n, .k = k }, insert_barrier_before),
+            .q2_affine => try self.encodeGemm(frame, .q2, .{ .x = x, .qweight = proj.weight, .scale_bias = proj.scale_bias orelse return error.InvalidArgument, .y = proj.y, .m = m, .n = proj.n, .k = k }, insert_barrier_before),
+            else => return error.UnsupportedDType,
+        }
+    }
+
+    /// Encodes `ami_fused_qkv_gemv` (`M = 1`, `G18`, ADR-0023 §1) for layers
+    /// whose `q`, `k`, `v` projections share one homogeneous `DType`.
+    /// Mixed-DType GSQ layers are strictly guarded: they either route cleanly
+    /// to the 3 unfused dispatches (`args.allow_unfused_fallback == true`,
+    /// returning `.unfused_heterogeneous`) or fail with `error.HeterogeneousDType`.
+    pub fn encodeFusedQkvGemv(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        args: FusedQkvGemvArgs,
+        insert_barrier_before: bool,
+    ) FusedEncodeError!FusionPath {
+        if (args.k == 0 or args.q.n == 0 or args.k_proj.n == 0 or args.v.n == 0) {
+            return error.ZeroDimension;
+        }
+        if (!canFuseQkv(args.q.dtype, args.k_proj.dtype, args.v.dtype)) {
+            if (!args.allow_unfused_fallback) return error.HeterogeneousDType;
+            try self.encodeSingleProjGemv(frame, args.x, args.q, args.k, insert_barrier_before);
+            try self.encodeSingleProjGemv(frame, args.x, args.k_proj, args.k, false);
+            try self.encodeSingleProjGemv(frame, args.x, args.v, args.k, false);
+            return .unfused_heterogeneous;
+        }
+        const qshape = try quantShapeForDType(args.q.dtype, args.k);
+        if (qshape.is_quant and (args.q.scale_bias == null or args.k_proj.scale_bias == null or args.v.scale_bias == null)) {
+            return error.InvalidArgument;
+        }
+        const pipe = self.fused_qkv_gemv.select(args.q.dtype) orelse return error.UnsupportedDType;
+        const tgs_q: u32 = @intCast((@as(u64, args.q.n) + 15) / 16);
+        const tgs_k: u32 = @intCast((@as(u64, args.k_proj.n) + 15) / 16);
+        const tgs_v: u32 = @intCast((@as(u64, args.v.n) + 15) / 16);
+        const params: FusedQkvParams = .{
+            .m = 1,
+            .n_q = args.q.n,
+            .n_k = args.k_proj.n,
+            .n_v = args.v.n,
+            .k = args.k,
+            .num_groups = qshape.num_groups,
+            .row_bytes = qshape.row_bytes,
+            .tgs_q = tgs_q,
+            .tgs_k = tgs_k,
+            .tgs_v = tgs_v,
+        };
+        const total_tgs: u64 = @as(u64, tgs_q) + @as(u64, tgs_k) + @as(u64, tgs_v);
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.x,
+                args.q.weight,
+                args.q.scale_bias orelse args.q.weight,
+                args.k_proj.weight,
+                args.k_proj.scale_bias orelse args.k_proj.weight,
+                args.v.weight,
+                args.v.scale_bias orelse args.v.weight,
+                args.q.y,
+                args.k_proj.y,
+                args.v.y,
+            },
+            std.mem.asBytes(&params),
+            .{ total_tgs, 1, 1 },
+            .{ 128, 1, 1 },
+            insert_barrier_before,
+        );
+        return .fused;
+    }
+
+    /// Encodes `ami_fused_qkv_gemm` (`M >= 1`, `G18`, ADR-0023 §1) for layers
+    /// whose `q`, `k`, `v` projections share one homogeneous `DType`.
+    /// Dispatches `ami_fused_qkv_gemv` when `args.m == 1`, and strictly guards
+    /// mixed-DType GSQ layers onto the 3 unfused projection dispatches.
+    pub fn encodeFusedQkvGemm(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        args: FusedQkvGemmArgs,
+        insert_barrier_before: bool,
+    ) FusedEncodeError!FusionPath {
+        if (args.m == 0 or args.k == 0 or args.q.n == 0 or args.k_proj.n == 0 or args.v.n == 0) {
+            return error.ZeroDimension;
+        }
+        if (args.m == 1) {
+            return self.encodeFusedQkvGemv(frame, .{
+                .x = args.x,
+                .q = args.q,
+                .k_proj = args.k_proj,
+                .v = args.v,
+                .k = args.k,
+                .allow_unfused_fallback = args.allow_unfused_fallback,
+            }, insert_barrier_before);
+        }
+        if (!canFuseQkv(args.q.dtype, args.k_proj.dtype, args.v.dtype)) {
+            if (!args.allow_unfused_fallback) return error.HeterogeneousDType;
+            try self.encodeSingleProjGemm(frame, args.x, args.q, args.m, args.k, insert_barrier_before);
+            try self.encodeSingleProjGemm(frame, args.x, args.k_proj, args.m, args.k, false);
+            try self.encodeSingleProjGemm(frame, args.x, args.v, args.m, args.k, false);
+            return .unfused_heterogeneous;
+        }
+        const qshape = try quantShapeForDType(args.q.dtype, args.k);
+        if (qshape.is_quant and (args.q.scale_bias == null or args.k_proj.scale_bias == null or args.v.scale_bias == null)) {
+            return error.InvalidArgument;
+        }
+        const pipe = self.fused_qkv_gemm.select(args.q.dtype) orelse return error.UnsupportedDType;
+        const tgs_q: u32 = @intCast((@as(u64, args.q.n) + 63) / 64);
+        const tgs_k: u32 = @intCast((@as(u64, args.k_proj.n) + 63) / 64);
+        const tgs_v: u32 = @intCast((@as(u64, args.v.n) + 63) / 64);
+        const params: FusedQkvParams = .{
+            .m = args.m,
+            .n_q = args.q.n,
+            .n_k = args.k_proj.n,
+            .n_v = args.v.n,
+            .k = args.k,
+            .num_groups = qshape.num_groups,
+            .row_bytes = qshape.row_bytes,
+            .tgs_q = tgs_q,
+            .tgs_k = tgs_k,
+            .tgs_v = tgs_v,
+        };
+        const total_tgs_x: u64 = @as(u64, tgs_q) + @as(u64, tgs_k) + @as(u64, tgs_v);
+        const groups_y: u64 = (@as(u64, args.m) + 63) / 64;
+        try frame.encodeThreadgroups(
+            pipe,
+            &.{
+                args.x,
+                args.q.weight,
+                args.q.scale_bias orelse args.q.weight,
+                args.k_proj.weight,
+                args.k_proj.scale_bias orelse args.k_proj.weight,
+                args.v.weight,
+                args.v.scale_bias orelse args.v.weight,
+                args.q.y,
+                args.k_proj.y,
+                args.v.y,
+            },
+            std.mem.asBytes(&params),
+            .{ total_tgs_x, groups_y, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
+        return .fused;
+    }
+
+    /// Encodes fused dense FFN `Gate + Up + SwiGLU` (`G18`, ADR-0023 §1):
+    /// computes `y = SiLU(x @ W_gate^T) * (x @ W_up^T)` in registers/SRAM
+    /// without writing `2 x m x n` intermediate activations to unified DRAM.
+    /// Strictly guarded: returns `error.HeterogeneousDType` when
+    /// `gate_dtype != up_dtype` so mixed-DType GSQ layers use the unfused path.
+    pub fn encodeDenseGateUpSwiglu(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        args: DenseGateUpSwigluArgs,
+        insert_barrier_before: bool,
+    ) FusedEncodeError!void {
+        if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+        if (!canFuseGateUp(args.gate_dtype, args.up_dtype)) {
+            if (!isFusableLinearDType(args.gate_dtype) or !isFusableLinearDType(args.up_dtype)) {
+                return error.UnsupportedDType;
+            }
+            return error.HeterogeneousDType;
+        }
+        const qshape = try quantShapeForDType(args.gate_dtype, args.k);
+        if (qshape.is_quant and (args.sb_gate == null or args.sb_up == null)) {
+            return error.InvalidArgument;
+        }
+        const params: DequantParams = .{
+            .m = args.m,
+            .n = args.n,
+            .k = args.k,
+            .num_groups = qshape.num_groups,
+            .row_bytes = qshape.row_bytes,
+        };
+        const bindings = [_]metal.BufferBinding{
+            args.x,
+            args.w_gate,
+            args.sb_gate orelse args.w_gate,
+            args.w_up,
+            args.sb_up orelse args.w_up,
+            args.y,
+        };
+        if (args.m == 1) {
+            const pipe = self.dense_swiglu_gemv.select(args.gate_dtype) orelse return error.UnsupportedDType;
+            const groups_x: u64 = (@as(u64, args.n) + 7) / 8;
+            try frame.encodeThreadgroups(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ groups_x, 1, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        } else {
+            const pipe = self.dense_swiglu_gemm.select(args.gate_dtype) orelse return error.UnsupportedDType;
+            const groups_x: u64 = (@as(u64, args.n) + 31) / 32;
+            const groups_y: u64 = (@as(u64, args.m) + 31) / 32;
+            try frame.encodeThreadgroups(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ groups_x, groups_y, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+        }
     }
 
     /// Runs the startup `.metallib` GPU numerical canary (`G16`, ADR-0020,
@@ -2517,5 +3264,384 @@ test "G15: 64x64 wide dense GEMM (f16, bf16) matches 32x32 and CPU fp32 across M
     for (shapes) |s| {
         try verifyWideDenseParity(.f16, s.m, s.n, s.k);
         try verifyWideDenseParity(.bf16, s.m, s.n, s.k);
+    }
+}
+
+test "G18: fused residual epilogue matches unfused GEMV/GEMM + residual add across q4/q3/q2/f16/bf16" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try DequantPipelines.init(device, library);
+    defer pipes.close();
+
+    // Verify dense (f16, bf16) and quantized (q4, q3, q2) residual epilogues at M=1, M=17 (32x32), M=65 (64x64 wide).
+    const ms = [_]usize{ 1, 17, 65 };
+    const n: usize = 67;
+    const k: usize = 128;
+
+    const max_m: usize = 65;
+    const w_dense_bytes = n * k * @sizeOf(u16);
+    const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+    const w_q4_bytes = n * try Q4.rowWeightBytes(k);
+    const sb_q4_bytes = n * (try Q4.groupsPerRow(k)) * @sizeOf(u32);
+    const x_bytes = max_m * k * @sizeOf(f16);
+    const y_bytes = max_m * n * @sizeOf(f16);
+
+    const arena_cap = try page.alignUp(w_dense_bytes + 256) +
+        try page.alignUp(w_q4_bytes + 256) +
+        try page.alignUp(sb_q4_bytes + 256) +
+        try page.alignUp(x_bytes + 256) +
+        5 * try page.alignUp(y_bytes + 256) +
+        2 * page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    const w_dense_raw = try arena.allocPages(w_dense_bytes);
+    const w_q_raw = try arena.allocPages(w_q4_bytes);
+    const sb_q_raw = try arena.allocPages(sb_q4_bytes);
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+    const res_raw = try arena.allocAligned(y_bytes, 64);
+    const y_unfused_raw = try arena.allocAligned(y_bytes, 64);
+    const y_fused_raw = try arena.allocAligned(y_bytes, 64);
+    const y_q_unfused_raw = try arena.allocAligned(y_bytes, 64);
+    const y_q_fused_raw = try arena.allocAligned(y_bytes, 64);
+
+    const w_bits: []u16 = @alignCast(std.mem.bytesAsSlice(u16, w_dense_raw[0..w_dense_bytes]));
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    const res_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, res_raw));
+    const y_unfused: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_unfused_raw));
+    const y_fused: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_fused_raw));
+    const y_q_unfused: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_q_unfused_raw));
+    const y_q_fused: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_q_fused_raw));
+
+    for (x_f16, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 13 + 5) % 29)) - 14)) * 0.0625);
+    for (res_f16, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 19 + 3) % 23)) - 11)) * 0.03125);
+    for (w_q_raw[0..w_q4_bytes], 0..) |*b, i| b.* = @intCast((i * 37 + 11) & 0xFF);
+    const sb_u16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, sb_q_raw[0..sb_q4_bytes]));
+    for (0..sb_u16.len / 2) |gi| {
+        sb_u16[gi * 2 + 0] = @bitCast(@as(f16, 0.0625));
+        sb_u16[gi * 2 + 1] = @bitCast(@as(f16, -0.375));
+    }
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const x_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) };
+    const res_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(res_raw.ptr) };
+    const wd_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w_dense_raw.ptr) };
+    const wq_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w_q_raw.ptr) };
+    const sbq_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(sb_q_raw.ptr) };
+    const yu_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_unfused_raw.ptr) };
+    const yf_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_fused_raw.ptr) };
+    const yqu_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_q_unfused_raw.ptr) };
+    const yqf_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_q_fused_raw.ptr) };
+
+    const ref_q = try gpa.alloc(f32, max_m * n);
+    defer gpa.free(ref_q);
+
+    for ([_]quant.FloatDType{ .f16, .bf16 }) |dt| {
+        for (w_bits, 0..) |*v, i| {
+            v.* = quant.f32ToFloatBits(dt, @as(f32, @floatFromInt(@as(i32, @intCast((i * 23 + 7) % 31)) - 15)) * 0.015625);
+        }
+        for (ms) |m| {
+            var frame = try compute.beginFrame(5000);
+            errdefer frame.abort();
+            if (m == 1) {
+                try pipes.encodeDenseGemv(&frame, dt, .{ .x = x_b, .weight = wd_b, .y = yu_b, .n = @intCast(n), .k = @intCast(k) }, false);
+                try pipes.encodeDenseGemv(&frame, dt, .{ .x = x_b, .weight = wd_b, .y = yf_b, .n = @intCast(n), .k = @intCast(k), .residual = res_b }, false);
+            } else {
+                try pipes.encodeDenseGemm(&frame, dt, .{ .x = x_b, .weight = wd_b, .y = yu_b, .m = @intCast(m), .n = @intCast(n), .k = @intCast(k) }, false);
+                try pipes.encodeDenseGemm(&frame, dt, .{ .x = x_b, .weight = wd_b, .y = yf_b, .m = @intCast(m), .n = @intCast(n), .k = @intCast(k), .residual = res_b }, false);
+            }
+            const sig = try frame.commit();
+            try compute.wait(sig, 5000);
+
+            for (0..m * n) |idx| {
+                const expected: f32 = @floatCast(@as(f16, @floatCast(@as(f32, @floatCast(y_unfused[idx])) + @as(f32, @floatCast(res_f16[idx])))));
+                const got: f32 = @floatCast(y_fused[idx]);
+                try std.testing.expectApproxEqAbs(expected, got, 2e-3);
+            }
+        }
+    }
+
+    for ([_]quant.QuantBits{ .q4, .q3, .q2 }) |bits| {
+        const rb = switch (bits) {
+            .q4 => try quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).rowWeightBytes(k),
+            .q3 => try quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).rowWeightBytes(k),
+            .q2 => try quant.QuantOps(.{ .bits = .q2, .group_size = 64 }).rowWeightBytes(k),
+        };
+        const ng = k / 64;
+        for (ms) |m| {
+            var frame = try compute.beginFrame(5000);
+            errdefer frame.abort();
+            if (m == 1) {
+                try pipes.encodeGemv(&frame, bits, .{ .x = x_b, .qweight = wq_b, .scale_bias = sbq_b, .y = yqu_b, .n = @intCast(n), .k = @intCast(k) }, false);
+                try pipes.encodeGemv(&frame, bits, .{ .x = x_b, .qweight = wq_b, .scale_bias = sbq_b, .y = yqf_b, .n = @intCast(n), .k = @intCast(k), .residual = res_b }, false);
+            } else {
+                try pipes.encodeGemm(&frame, bits, .{ .x = x_b, .qweight = wq_b, .scale_bias = sbq_b, .y = yqu_b, .m = @intCast(m), .n = @intCast(n), .k = @intCast(k) }, false);
+                try pipes.encodeGemm(&frame, bits, .{ .x = x_b, .qweight = wq_b, .scale_bias = sbq_b, .y = yqf_b, .m = @intCast(m), .n = @intCast(n), .k = @intCast(k), .residual = res_b }, false);
+            }
+            const sig = try frame.commit();
+            try compute.wait(sig, 5000);
+
+            _ = rb;
+            _ = ng;
+            for (0..m * n) |idx| {
+                const expected: f32 = @floatCast(@as(f16, @floatCast(@as(f32, @floatCast(y_q_unfused[idx])) + @as(f32, @floatCast(res_f16[idx])))));
+                const got: f32 = @floatCast(y_q_fused[idx]);
+                try std.testing.expectApproxEqAbs(expected, got, 4e-3);
+            }
+        }
+    }
+}
+
+test "G18: homogeneous fused QKV and dense Gate+Up+SwiGLU match unfused paths and strictly guard mixed-DType GSQ" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try DequantPipelines.init(device, library);
+    defer pipes.close();
+
+    // Verify heterogeneous-GSQ guard helpers.
+    try std.testing.expect(canFuseQkv(.q4_affine, .q4_affine, .q4_affine));
+    try std.testing.expect(!canFuseQkv(.q4_affine, .q3_affine, .q4_affine));
+    try std.testing.expect(!canFuseQkv(.f16, .f16, .bf16));
+    try std.testing.expect(canFuseGateUp(.bf16, .bf16));
+    try std.testing.expect(!canFuseGateUp(.q4_affine, .q2_affine));
+
+    const max_m: usize = 65;
+    const n_q: usize = 128;
+    const n_k: usize = 64;
+    const n_v: usize = 64;
+    const n_ffn: usize = 132;
+    const k: usize = 128;
+    const max_n: usize = n_ffn;
+
+    const w_dense_bytes = max_n * k * @sizeOf(u16);
+    const Q4 = quant.QuantOps(.{ .bits = .q4, .group_size = 64 });
+    const sb_bytes = max_n * (try Q4.groupsPerRow(k)) * @sizeOf(u32);
+    const x_bytes = max_m * k * @sizeOf(f16);
+    const y_bytes = max_m * max_n * @sizeOf(f16);
+
+    const arena_cap = 3 * try page.alignUp(w_dense_bytes + 256) +
+        3 * try page.alignUp(sb_bytes + 256) +
+        try page.alignUp(x_bytes + 256) +
+        8 * try page.alignUp(y_bytes + 256) +
+        2 * page.APPLE_PAGE_SIZE;
+    const budget = budget_mod.Budget.compute(.{
+        .memory_bytes = arena_cap + 4 * page.APPLE_PAGE_SIZE,
+        .user_wire_limit = arena_cap,
+        .global_user_wire_limit = arena_cap,
+        .gpu_working_set_bytes = arena_cap,
+        .configured_cap = null,
+        .headroom_bytes = page.APPLE_PAGE_SIZE,
+    });
+    var arena = try arena_mod.WiredArena.init(arena_cap, budget);
+    defer arena.deinit();
+
+    const w0_raw = try arena.allocPages(w_dense_bytes);
+    const w1_raw = try arena.allocPages(w_dense_bytes);
+    const w2_raw = try arena.allocPages(w_dense_bytes);
+    const sb0_raw = try arena.allocPages(sb_bytes);
+    const sb1_raw = try arena.allocPages(sb_bytes);
+    const sb2_raw = try arena.allocPages(sb_bytes);
+    const x_raw = try arena.allocAligned(x_bytes, 64);
+
+    const y_q_u_raw = try arena.allocAligned(y_bytes, 64);
+    const y_k_u_raw = try arena.allocAligned(y_bytes, 64);
+    const y_v_u_raw = try arena.allocAligned(y_bytes, 64);
+    const y_q_f_raw = try arena.allocAligned(y_bytes, 64);
+    const y_k_f_raw = try arena.allocAligned(y_bytes, 64);
+    const y_v_f_raw = try arena.allocAligned(y_bytes, 64);
+    const y_gate_raw = try arena.allocAligned(y_bytes, 64);
+    const y_up_raw = try arena.allocAligned(y_bytes, 64);
+
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    for (x_f16, 0..) |*v, i| v.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 17 + 3) % 27)) - 13)) * 0.0625);
+
+    const gpu_buf = try metal.Buffer.wrap(device, arena.bytes());
+    defer gpu_buf.close();
+    var compute = try metal.Compute.initWithFrames(device, 2);
+    defer compute.close();
+    try compute.makeResident(&.{gpu_buf});
+
+    const x_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(x_raw.ptr) };
+    const w0_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w0_raw.ptr) };
+    const w1_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w1_raw.ptr) };
+    const w2_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(w2_raw.ptr) };
+    const sb0_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(sb0_raw.ptr) };
+    const sb1_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(sb1_raw.ptr) };
+    const sb2_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(sb2_raw.ptr) };
+    const yqu_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_q_u_raw.ptr) };
+    const yku_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_k_u_raw.ptr) };
+    const yvu_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_v_u_raw.ptr) };
+    const yqf_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_q_f_raw.ptr) };
+    const ykf_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_k_f_raw.ptr) };
+    const yvf_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_v_f_raw.ptr) };
+    const yg_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_gate_raw.ptr) };
+    const yu_b: metal.BufferBinding = .{ .buffer = gpu_buf, .offset = arena.offsetOf(y_up_raw.ptr) };
+
+    const yqu_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_q_u_raw));
+    const yku_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_k_u_raw));
+    const yvu_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_v_u_raw));
+    const yqf_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_q_f_raw));
+    const ykf_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_k_f_raw));
+    const yvf_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_v_f_raw));
+    const yg_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_gate_raw));
+    const yu_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, y_up_raw));
+
+    const cpu_gate = try gpa.alloc(f32, max_m * n_ffn);
+    defer gpa.free(cpu_gate);
+    const cpu_up = try gpa.alloc(f32, max_m * n_ffn);
+    defer gpa.free(cpu_up);
+
+    // 1. Homogeneous float (f16, bf16) and quantized (q4, q3, q2) QKV + Gate+Up+SwiGLU at M=1 and M=65.
+    for ([_]amf.DType{ .f16, .bf16, .q4_affine, .q3_affine, .q2_affine }) |dt| {
+        if (dt == .f16 or dt == .bf16) {
+            const fdt: quant.FloatDType = if (dt == .bf16) .bf16 else .f16;
+            for ([_][]u8{ w0_raw, w1_raw, w2_raw }, 0..) |wbuf, wi| {
+                const ws: []u16 = @alignCast(std.mem.bytesAsSlice(u16, wbuf[0..w_dense_bytes]));
+                for (ws, 0..) |*v, i| {
+                    v.* = quant.f32ToFloatBits(fdt, @as(f32, @floatFromInt(@as(i32, @intCast((i * (11 + wi * 6) + 5) % 29)) - 14)) * 0.015625);
+                }
+            }
+        } else {
+            for ([_][]u8{ w0_raw, w1_raw, w2_raw }, [_][]u8{ sb0_raw, sb1_raw, sb2_raw }, 0..) |wbuf, sbuf, wi| {
+                for (wbuf[0..w_dense_bytes], 0..) |*b, i| b.* = @intCast((i * (31 + wi * 12) + 7) & 0xFF);
+                const sbu16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, sbuf[0..sb_bytes]));
+                for (0..sbu16.len / 2) |gi| {
+                    sbu16[gi * 2 + 0] = @bitCast(@as(f16, 0.0625));
+                    sbu16[gi * 2 + 1] = @bitCast(@as(f16, -0.375));
+                }
+            }
+        }
+
+        for ([_]usize{ 1, 65 }) |m| {
+            var frame = try compute.beginFrame(5000);
+            errdefer frame.abort();
+
+            const q_unfused: QkvProjBinding = .{ .dtype = dt, .weight = w0_b, .scale_bias = sb0_b, .y = yqu_b, .n = @intCast(n_q) };
+            const k_unfused: QkvProjBinding = .{ .dtype = dt, .weight = w1_b, .scale_bias = sb1_b, .y = yku_b, .n = @intCast(n_k) };
+            const v_unfused: QkvProjBinding = .{ .dtype = dt, .weight = w2_b, .scale_bias = sb2_b, .y = yvu_b, .n = @intCast(n_v) };
+            if (m == 1) {
+                try pipes.encodeSingleProjGemv(&frame, x_b, q_unfused, @intCast(k), false);
+                try pipes.encodeSingleProjGemv(&frame, x_b, k_unfused, @intCast(k), false);
+                try pipes.encodeSingleProjGemv(&frame, x_b, v_unfused, @intCast(k), false);
+            } else {
+                try pipes.encodeSingleProjGemm(&frame, x_b, q_unfused, @intCast(m), @intCast(k), false);
+                try pipes.encodeSingleProjGemm(&frame, x_b, k_unfused, @intCast(m), @intCast(k), false);
+                try pipes.encodeSingleProjGemm(&frame, x_b, v_unfused, @intCast(m), @intCast(k), false);
+            }
+
+            const qkv_path = try pipes.encodeFusedQkvGemm(&frame, .{
+                .x = x_b,
+                .q = .{ .dtype = dt, .weight = w0_b, .scale_bias = sb0_b, .y = yqf_b, .n = @intCast(n_q) },
+                .k_proj = .{ .dtype = dt, .weight = w1_b, .scale_bias = sb1_b, .y = ykf_b, .n = @intCast(n_k) },
+                .v = .{ .dtype = dt, .weight = w2_b, .scale_bias = sb2_b, .y = yvf_b, .n = @intCast(n_v) },
+                .m = @intCast(m),
+                .k = @intCast(k),
+            }, false);
+            try std.testing.expectEqual(FusionPath.fused, qkv_path);
+
+            // Unfused Gate + Up projections -> y_gate_raw, y_up_raw; fused SwiGLU -> yqu_b.
+            const g_proj: QkvProjBinding = .{ .dtype = dt, .weight = w0_b, .scale_bias = sb0_b, .y = yg_b, .n = @intCast(n_ffn) };
+            const u_proj: QkvProjBinding = .{ .dtype = dt, .weight = w1_b, .scale_bias = sb1_b, .y = yu_b, .n = @intCast(n_ffn) };
+            if (m == 1) {
+                try pipes.encodeSingleProjGemv(&frame, x_b, g_proj, @intCast(k), true);
+                try pipes.encodeSingleProjGemv(&frame, x_b, u_proj, @intCast(k), false);
+            } else {
+                try pipes.encodeSingleProjGemm(&frame, x_b, g_proj, @intCast(m), @intCast(k), true);
+                try pipes.encodeSingleProjGemm(&frame, x_b, u_proj, @intCast(m), @intCast(k), false);
+            }
+            const sig_qkv = try frame.commit();
+            try compute.wait(sig_qkv, 5000);
+
+            for (0..m * n_q) |i| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(yqu_f16[i])), @as(f32, @floatCast(yqf_f16[i])), 4e-3);
+            for (0..m * n_k) |i| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(yku_f16[i])), @as(f32, @floatCast(ykf_f16[i])), 4e-3);
+            for (0..m * n_v) |i| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(yvu_f16[i])), @as(f32, @floatCast(yvf_f16[i])), 4e-3);
+
+            var frame2 = try compute.beginFrame(5000);
+            errdefer frame2.abort();
+            try pipes.encodeDenseGateUpSwiglu(&frame2, .{
+                .x = x_b,
+                .gate_dtype = dt,
+                .w_gate = w0_b,
+                .sb_gate = sb0_b,
+                .up_dtype = dt,
+                .w_up = w1_b,
+                .sb_up = sb1_b,
+                .y = yqu_b,
+                .m = @intCast(m),
+                .n = @intCast(n_ffn),
+                .k = @intCast(k),
+            }, false);
+            const sig = try frame2.commit();
+            try compute.wait(sig, 5000);
+
+            // SwiGLU parity vs unfused Gate/Up + fp32 SiLU(g)*u
+            for (0..m * n_ffn) |i| {
+                const gv: f32 = @floatCast(yg_f16[i]);
+                const uv: f32 = @floatCast(yu_f16[i]);
+                const silu_g = gv / (1.0 + @exp(-gv));
+                const expected: f32 = @floatCast(@as(f16, @floatCast(silu_g * uv)));
+                const got: f32 = @floatCast(yqu_f16[i]);
+                try std.testing.expectApproxEqAbs(expected, got, 5e-3);
+            }
+        }
+    }
+
+    // 2. Verify heterogeneous-GSQ layers cleanly reject direct fusion and fall back to unfused QKV.
+    {
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        try std.testing.expectError(error.HeterogeneousDType, pipes.encodeDenseGateUpSwiglu(&frame, .{
+            .x = x_b,
+            .gate_dtype = .q4_affine,
+            .w_gate = w0_b,
+            .sb_gate = sb0_b,
+            .up_dtype = .q3_affine,
+            .w_up = w1_b,
+            .sb_up = sb1_b,
+            .y = yg_b,
+            .m = 32,
+            .n = @intCast(n_ffn),
+            .k = @intCast(k),
+        }, false));
+        try std.testing.expectError(error.HeterogeneousDType, pipes.encodeFusedQkvGemm(&frame, .{
+            .x = x_b,
+            .q = .{ .dtype = .q4_affine, .weight = w0_b, .scale_bias = sb0_b, .y = yqf_b, .n = @intCast(n_q) },
+            .k_proj = .{ .dtype = .q3_affine, .weight = w1_b, .scale_bias = sb1_b, .y = ykf_b, .n = @intCast(n_k) },
+            .v = .{ .dtype = .q4_affine, .weight = w2_b, .scale_bias = sb2_b, .y = yvf_b, .n = @intCast(n_v) },
+            .m = 1,
+            .k = @intCast(k),
+            .allow_unfused_fallback = false,
+        }, false));
+        const fallback_path = try pipes.encodeFusedQkvGemm(&frame, .{
+            .x = x_b,
+            .q = .{ .dtype = .q4_affine, .weight = w0_b, .scale_bias = sb0_b, .y = yqf_b, .n = @intCast(n_q) },
+            .k_proj = .{ .dtype = .q3_affine, .weight = w1_b, .scale_bias = sb1_b, .y = ykf_b, .n = @intCast(n_k) },
+            .v = .{ .dtype = .q2_affine, .weight = w2_b, .scale_bias = sb2_b, .y = yvf_b, .n = @intCast(n_v) },
+            .m = 8,
+            .k = @intCast(k),
+            .allow_unfused_fallback = true,
+        }, false);
+        try std.testing.expectEqual(FusionPath.unfused_heterogeneous, fallback_path);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
     }
 }

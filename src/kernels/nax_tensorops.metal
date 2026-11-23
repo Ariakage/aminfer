@@ -18,11 +18,19 @@ using namespace metal;
 constant uint QUANT_BITS [[function_constant(0)]];
 constant uint GROUP_SIZE [[function_constant(1)]];
 constant bool DENSE_IS_BF16 [[function_constant(2)]];
+constant bool NAX_RESIDUAL_EPILOGUE_RAW [[function_constant(3)]];
+constant uint NAX_ATTN_HEAD_DIM_RAW [[function_constant(4)]];
 
 constant bool NAX_HAS_GROUP_SIZE = is_function_constant_defined(GROUP_SIZE);
 constant bool NAX_HAS_ACT_BF16 = is_function_constant_defined(DENSE_IS_BF16);
 constant uint NAX_EFF_GROUP_SIZE = NAX_HAS_GROUP_SIZE ? GROUP_SIZE : 64u;
 constant bool ACT_BF16 = NAX_HAS_ACT_BF16 ? DENSE_IS_BF16 : false;
+constant bool NAX_HAS_RESIDUAL_EPILOGUE = is_function_constant_defined(NAX_RESIDUAL_EPILOGUE_RAW)
+    ? NAX_RESIDUAL_EPILOGUE_RAW
+    : false;
+constant uint NAX_ATTN_HEAD_DIM = is_function_constant_defined(NAX_ATTN_HEAD_DIM_RAW)
+    ? NAX_ATTN_HEAD_DIM_RAW
+    : 128u;
 
 // Uniform parameter layouts matching `DenseParams` (16 B) and `DequantParams` (20 B)
 // in `src/gpu/dequant.zig`, plus M7-ready `NaxFp4Params` (24 B).
@@ -81,11 +89,11 @@ union NaxDequantSmem {
 
 // Coalesced, bank-conflict-free epilogue storing `64 x 64` FP32 threadgroup tile
 // `Cs` to row-major `[M, N]` `T` (`half` or `bfloat`) output `y` with exact
-// `m < M, n < N` masking. Lanes 0..31 / 32..63 write contiguous `N` elements
-// per row across 128 threads.
-template <typename OutT>
+// `m < M, n < N` masking and optional fused residual add (`G18`, ADR-0023).
+template <typename OutT, bool ADD_RESIDUAL>
 static inline void nax_store_tile(const threadgroup float *Cs,
                                   device OutT *y,
+                                  const device OutT *residual,
                                   uint m_dim,
                                   uint n_dim,
                                   uint m_base,
@@ -98,7 +106,12 @@ static inline void nax_store_tile(const threadgroup float *Cs,
         for (uint lm = row_half; lm < NAX_BM; lm += 2u) {
             const uint gm = m_base + lm;
             if (gm < m_dim) {
-                y[ulong(gm) * n_dim + gn] = OutT(Cs[lm * NAX_BN + ln]);
+                const ulong idx = ulong(gm) * n_dim + gn;
+                float val = Cs[lm * NAX_BN + ln];
+                if (ADD_RESIDUAL) {
+                    val += float(residual[idx]);
+                }
+                y[idx] = OutT(val);
             }
         }
     }
@@ -223,7 +236,8 @@ static inline void nax_dense_stage_bf16(const device half *x,
 kernel void ami_dense_gemm_nax(const device half *x [[buffer(0)]],
                                const device uchar *w [[buffer(1)]],
                                device half *y [[buffer(2)]],
-                               constant NaxDenseParams &p [[buffer(3)]],
+                               const device half *residual [[buffer(3)]],
+                               constant NaxDenseParams &p [[buffer(4)]],
                                uint2 tg_pos [[threadgroup_position_in_grid]],
                                uint tid [[thread_index_in_threadgroup]]) {
     const uint n_base = tg_pos.x * NAX_BN;
@@ -270,7 +284,11 @@ kernel void ami_dense_gemm_nax(const device half *x [[buffer(0)]],
             smem.Cs, extents<int, int(NAX_BN), int(NAX_BM)>());
         cT.store(tC);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        nax_store_tile<half>(smem.Cs, y, p.m, p.n, m_base, n_base, tid);
+        if (NAX_HAS_RESIDUAL_EPILOGUE) {
+            nax_store_tile<half, true>(smem.Cs, y, residual, p.m, p.n, m_base, n_base, tid);
+        } else {
+            nax_store_tile<half, false>(smem.Cs, y, residual, p.m, p.n, m_base, n_base, tid);
+        }
     } else {
         using TileA = tensor<threadgroup half, extents<int, int(NAX_DENSE_BK), int(NAX_BM)>, tensor_inline>;
         using TileB = tensor<threadgroup half, extents<int, int(NAX_DENSE_BK), int(NAX_BN)>, tensor_inline>;
@@ -297,7 +315,11 @@ kernel void ami_dense_gemm_nax(const device half *x [[buffer(0)]],
             smem.Cs, extents<int, int(NAX_BN), int(NAX_BM)>());
         cT.store(tC);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        nax_store_tile<half>(smem.Cs, y, p.m, p.n, m_base, n_base, tid);
+        if (NAX_HAS_RESIDUAL_EPILOGUE) {
+            nax_store_tile<half, true>(smem.Cs, y, residual, p.m, p.n, m_base, n_base, tid);
+        } else {
+            nax_store_tile<half, false>(smem.Cs, y, residual, p.m, p.n, m_base, n_base, tid);
+        }
     }
 }
 
@@ -425,7 +447,8 @@ kernel void ami_dequant_gemm_nax(const device half *x [[buffer(0)]],
                                  const device uchar *qweight [[buffer(1)]],
                                  const device half2 *scale_bias [[buffer(2)]],
                                  device half *y [[buffer(3)]],
-                                 constant NaxDequantParams &p [[buffer(4)]],
+                                 const device half *residual [[buffer(4)]],
+                                 constant NaxDequantParams &p [[buffer(5)]],
                                  uint2 tg_pos [[threadgroup_position_in_grid]],
                                  uint tid [[thread_index_in_threadgroup]]) {
     const uint n_base = tg_pos.x * NAX_BN;
@@ -473,7 +496,11 @@ kernel void ami_dequant_gemm_nax(const device half *x [[buffer(0)]],
             smem.Cs, extents<int, int(NAX_BN), int(NAX_BM)>());
         cT.store(tC);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        nax_store_tile<bfloat>(smem.Cs, (device bfloat *)y, p.m, p.n, m_base, n_base, tid);
+        if (NAX_HAS_RESIDUAL_EPILOGUE) {
+            nax_store_tile<bfloat, true>(smem.Cs, (device bfloat *)y, (const device bfloat *)residual, p.m, p.n, m_base, n_base, tid);
+        } else {
+            nax_store_tile<bfloat, false>(smem.Cs, (device bfloat *)y, (const device bfloat *)residual, p.m, p.n, m_base, n_base, tid);
+        }
     } else {
         using TileA = tensor<threadgroup half, extents<int, int(NAX_DEQ_BK), int(NAX_BM)>, tensor_inline>;
         using TileB = tensor<threadgroup half, extents<int, int(NAX_DEQ_BK), int(NAX_BN)>, tensor_inline>;
@@ -500,7 +527,11 @@ kernel void ami_dequant_gemm_nax(const device half *x [[buffer(0)]],
             smem.Cs, extents<int, int(NAX_BN), int(NAX_BM)>());
         cT.store(tC);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        nax_store_tile<half>(smem.Cs, y, p.m, p.n, m_base, n_base, tid);
+        if (NAX_HAS_RESIDUAL_EPILOGUE) {
+            nax_store_tile<half, true>(smem.Cs, y, residual, p.m, p.n, m_base, n_base, tid);
+        } else {
+            nax_store_tile<half, false>(smem.Cs, y, residual, p.m, p.n, m_base, n_base, tid);
+        }
     }
 }
 
@@ -619,5 +650,313 @@ kernel void ami_fp4_e2m1_gemm_nax(const device half *x [[buffer(0)]],
         smem.Cs, extents<int, int(NAX_BN), int(NAX_BM)>());
     cT.store(tC);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    nax_store_tile<half>(smem.Cs, y, p.m, p.n, m_base, n_base, tid);
+    nax_store_tile<half, false>(smem.Cs, y, y, p.m, p.n, m_base, n_base, tid);
+}
+
+// ---------------------------------------------------------------------------
+// Kernel 4 (`G19`, ADR-0023): `ami_gqa_causal_prefill_flash_attn_nax`
+//
+// Apple10+ (M5+) Metal 4 TensorOps (`mpp::tensor_ops::matmul2d`,
+// `execution_simdgroups<4>`, 128 threads) causal FlashAttention-2 prefill
+// kernel (`BQ = 32, BK = 32`, `D in {64, 128}` via `NAX_ATTN_HEAD_DIM`).
+//
+// Uses 10 KiB threadgroup SRAM (`<= 16 KiB`), exact causal + sliding-window
+// masking, `R5` retired group-64 q8 chunks, and circular ring capacity.
+// Co-packaged into the unified `aminfer.metallib`; lazily instantiated by
+// `AttentionPipelines` only when `gpu_apple_family >= 10` and `Q_len >= 32`
+// and `KV_len >= 64`.
+// ---------------------------------------------------------------------------
+struct NaxKvTilePair {
+    texture2d<half, access::read> k_tex;
+    texture2d<half, access::read> v_tex;
+};
+
+struct NaxCausalPrefillAttnParams {
+    uint num_q;
+    uint q_start_pos;
+    uint kv_len;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_dim;
+    uint chunk_tokens;
+    uint sliding_window;
+    uint ring_capacity;
+    float scale;
+    uint num_retired_chunks;
+    uint tile_table_offset;
+    uint retired_offset;
+    uint retired_plane_stride_bytes;
+    uint retired_chunk_stride_bytes;
+    uint _pad0;
+};
+
+static_assert(sizeof(NaxKvTilePair) == 16, "NaxKvTilePair must match KvTilePair");
+static_assert(sizeof(NaxCausalPrefillAttnParams) == 64, "NaxCausalPrefillAttnParams must match CausalPrefillAttnParams");
+
+static inline half4 nax_load_q8_half4(const device uchar *plane_base,
+                                      uint row,
+                                      uint groups_per_head,
+                                      uint col) {
+    const uint grp = col >> 4;
+    const uint col_in_grp = col & 15u;
+    const ulong off = (ulong(row) * groups_per_head + grp) * 68ul;
+    const char4 q4 = *(const device char4 *)(plane_base + off + col_in_grp * 4u);
+    const half2 sb = *(const device half2 *)(plane_base + off + 64u);
+    return half4(fma(float4(q4), float4(float(sb.x)), float4(float(sb.y))));
+}
+
+template <uint D, bool IS_V>
+static inline void nax_flash_stage_kv_slice32(threadgroup half4 *KVs4,
+                                              const device NaxKvTilePair *kv_tiles,
+                                              const device uchar *retired_pool,
+                                              const device uint *retired_chunk_ids,
+                                              constant NaxCausalPrefillAttnParams &p,
+                                              uint kv_head,
+                                              uint kv_block_start,
+                                              uint kv_block_end,
+                                              uint d_base,
+                                              uint tid) {
+    // 32 rows x 8 half4s (32 halfs) = 256 half4s -> 2 half4s per thread (128 threads).
+    constexpr uint GROUPS_PER_HEAD = D >> 6;
+    const uint col4 = tid & 7u;        // 0..7
+    const uint row0 = tid >> 3;        // 0..15
+    const uint g_col4 = (d_base >> 2) + col4;
+
+    #pragma clang loop unroll(full)
+    for (uint pass = 0u; pass < 2u; pass++) {
+        const uint row = row0 + pass * 16u;
+        const uint kv_pos = kv_block_start + row;
+        half4 val = half4(0.0h);
+        if (kv_pos < kv_block_end) {
+            const uint phys_pos = (p.ring_capacity > 0u) ? (kv_pos % p.ring_capacity) : kv_pos;
+            const uint chunk = phys_pos / p.chunk_tokens;
+            const uint slot = phys_pos - chunk * p.chunk_tokens;
+            const uint tex_row = kv_head * p.chunk_tokens + slot;
+            if (p.ring_capacity == 0u && chunk < p.num_retired_chunks) {
+                const uint phys_slot = retired_chunk_ids[p.retired_offset + chunk];
+                const device uchar *plane = retired_pool +
+                    ulong(phys_slot) * p.retired_chunk_stride_bytes +
+                    (IS_V ? p.retired_plane_stride_bytes : 0u);
+                val = nax_load_q8_half4(plane, tex_row, GROUPS_PER_HEAD, g_col4);
+            } else {
+                const uint active_chunk = (p.ring_capacity == 0u) ? (chunk - p.num_retired_chunks) : chunk;
+                const NaxKvTilePair pair = kv_tiles[p.tile_table_offset + active_chunk];
+                val = IS_V ? pair.v_tex.read(uint2(g_col4, tex_row))
+                           : pair.k_tex.read(uint2(g_col4, tex_row));
+            }
+        }
+        KVs4[row * 8u + col4] = val;
+    }
+}
+
+template <uint D>
+static inline void nax_flash_prefill_exec(const device half *q,
+                                          const device NaxKvTilePair *kv_tiles,
+                                          const device uchar *retired_pool,
+                                          const device uint *retired_chunk_ids,
+                                          device half *out,
+                                          constant NaxCausalPrefillAttnParams &p,
+                                          threadgroup half *Qs,
+                                          threadgroup half *KVs,
+                                          threadgroup float *Ss,
+                                          threadgroup half *Ps,
+                                          uint2 tg_pos,
+                                          uint tid,
+                                          uint sg_id,
+                                          uint lane) {
+    constexpr uint BQ = 32u;
+    constexpr uint BK = 32u;
+    constexpr uint D_SLICES = D >> 5;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint kv_head = tg_pos.x;
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint total_q = p.num_q * gqa_ratio;
+    const uint flat_q_base = tg_pos.y * BQ;
+    if (kv_head >= p.num_kv_heads || flat_q_base >= total_q) {
+        return;
+    }
+
+    const uint q_cnt = min(BQ, total_q - flat_q_base);
+    const uint min_q_pos = p.q_start_pos + (flat_q_base / gqa_ratio);
+    const uint max_q_pos = p.q_start_pos + ((flat_q_base + q_cnt - 1u) / gqa_ratio);
+    const uint kv_end = min(p.kv_len, max_q_pos + 1u);
+    const uint kv_begin = (p.sliding_window > 0u && (min_q_pos + 1u) > p.sliding_window)
+        ? (min_q_pos + 1u - p.sliding_window)
+        : 0u;
+
+    threadgroup half4 *Qs4 = (threadgroup half4 *)Qs;
+    threadgroup half4 *KVs4 = (threadgroup half4 *)KVs;
+
+    constexpr auto desc_qk = mpp::tensor_ops::matmul2d_descriptor(
+        int(BQ), int(BK), 32, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto desc_pv = mpp::tensor_ops::matmul2d_descriptor(
+        int(BQ), 32, int(BK), false, false, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc_qk, metal::execution_simdgroups<4>> op_qk;
+    mpp::tensor_ops::matmul2d<desc_pv, metal::execution_simdgroups<4>> op_pv;
+
+    using Tile32x32 = tensor<threadgroup half, extents<int, 32, 32>, tensor_inline>;
+    using TileOut32x32 = tensor<threadgroup float, extents<int, 32, 32>, tensor_inline>;
+
+    Tile32x32 tQ(Qs, extents<int, 32, 32>());
+    Tile32x32 tKV(KVs, extents<int, 32, 32>());
+    Tile32x32 tP(Ps, extents<int, 32, 32>());
+    TileOut32x32 tS(Ss, extents<int, 32, 32>());
+
+    const uint r0 = sg_id * 8u;
+    float m_val[8];
+    float l_val[8];
+    float o_reg[8][D_SLICES];
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0u; r < 8u; r++) {
+        m_val[r] = -INFINITY;
+        l_val[r] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint c = 0u; c < D_SLICES; c++) {
+            o_reg[r][c] = 0.0f;
+        }
+    }
+
+    const float scale_log2e = p.scale * LOG2E;
+    const uint st_col4 = tid & 7u;
+    const uint st_row0 = tid >> 3;
+
+    for (uint kv_block_start = kv_begin; kv_block_start < kv_end; kv_block_start += BK) {
+        const uint kv_block_end = min(kv_block_start + BK, kv_end);
+
+        // 1. S = Q[32, D] @ K[32, D]^T via NAX mpp::tensor_ops::matmul2d in 32-dim K slices.
+        auto sT = op_qk.get_destination_cooperative_tensor<Tile32x32, Tile32x32, float>();
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0u; i < sT.get_capacity(); ++i) {
+            if (sT.is_valid_element(i)) {
+                sT[i] = 0.0f;
+            }
+        }
+
+        for (uint d_sl = 0u; d_sl < D_SLICES; d_sl++) {
+            const uint d_base = d_sl * 32u;
+            #pragma clang loop unroll(full)
+            for (uint pass = 0u; pass < 2u; pass++) {
+                const uint row = st_row0 + pass * 16u;
+                const uint flat_q = flat_q_base + row;
+                if (flat_q < total_q) {
+                    const uint qi = flat_q / gqa_ratio;
+                    const uint qh = kv_head * gqa_ratio + (flat_q - qi * gqa_ratio);
+                    const ulong q_off = (ulong(qi) * p.num_q_heads + qh) * D + d_base + st_col4 * 4u;
+                    Qs4[row * 8u + st_col4] = *(const device half4 *)(q + q_off);
+                } else {
+                    Qs4[row * 8u + st_col4] = half4(0.0h);
+                }
+            }
+            nax_flash_stage_kv_slice32<D, false>(
+                KVs4, kv_tiles, retired_pool, retired_chunk_ids, p,
+                kv_head, kv_block_start, kv_block_end, d_base, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            op_qk.run(tQ, tKV, sT);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        sT.store(tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. Causal + sliding-window mask & FP32 base-2 online softmax.
+        float alpha[8];
+        const uint kv_pos = kv_block_start + lane;
+        const bool in_blk = (kv_pos < kv_block_end);
+        #pragma clang loop unroll(full)
+        for (uint r = 0u; r < 8u; r++) {
+            const uint flat_q = flat_q_base + r0 + r;
+            const bool act = (flat_q < total_q);
+            const uint qp = p.q_start_pos + (act ? (flat_q / gqa_ratio) : 0u);
+            const float raw_s = Ss[(r0 + r) * BK + lane];
+            const bool valid = act && in_blk && (kv_pos <= qp) &&
+                               (p.sliding_window == 0u || (qp - kv_pos) < p.sliding_window);
+            const float score = valid ? (raw_s * scale_log2e) : -INFINITY;
+            const float row_m = simd_max(score);
+            float p_val = 0.0f;
+            if (row_m > -INFINITY) {
+                const float m_new = max(m_val[r], row_m);
+                const float a = (l_val[r] > 0.0f) ? exp2(m_val[r] - m_new) : 0.0f;
+                p_val = valid ? exp2(score - m_new) : 0.0f;
+                const float row_l = simd_sum(p_val);
+                l_val[r] = fma(l_val[r], a, row_l);
+                m_val[r] = m_new;
+                alpha[r] = a;
+            } else {
+                alpha[r] = 1.0f;
+            }
+            Ps[(r0 + r) * BK + lane] = half(p_val);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3. O += P[32, 32] @ V[32, D] via NAX mpp::tensor_ops::matmul2d in 32-col slices.
+        #pragma clang loop unroll(full)
+        for (uint d_sl = 0u; d_sl < D_SLICES; d_sl++) {
+            const uint d_base = d_sl * 32u;
+            nax_flash_stage_kv_slice32<D, true>(
+                KVs4, kv_tiles, retired_pool, retired_chunk_ids, p,
+                kv_head, kv_block_start, kv_block_end, d_base, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            auto pvT = op_pv.get_destination_cooperative_tensor<Tile32x32, Tile32x32, float>();
+            #pragma clang loop unroll(full)
+            for (uint16_t i = 0u; i < pvT.get_capacity(); ++i) {
+                if (pvT.is_valid_element(i)) {
+                    pvT[i] = 0.0f;
+                }
+            }
+            op_pv.run(tP, tKV, pvT);
+            pvT.store(tS);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 8u; r++) {
+                o_reg[r][d_sl] = fma(o_reg[r][d_sl], alpha[r], Ss[(r0 + r) * 32u + lane]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // 4. Finalize normalized FP16 output rows.
+    #pragma clang loop unroll(full)
+    for (uint r = 0u; r < 8u; r++) {
+        const uint flat_q = flat_q_base + r0 + r;
+        if (flat_q >= total_q) {
+            continue;
+        }
+        const uint qi = flat_q / gqa_ratio;
+        const uint qh = kv_head * gqa_ratio + (flat_q - qi * gqa_ratio);
+        const float inv_l = (l_val[r] > 0.0f) ? (1.0f / l_val[r]) : 0.0f;
+        const ulong out_base = (ulong(qi) * p.num_q_heads + qh) * D;
+        #pragma clang loop unroll(full)
+        for (uint d_sl = 0u; d_sl < D_SLICES; d_sl++) {
+            out[out_base + d_sl * 32u + lane] = half(o_reg[r][d_sl] * inv_l);
+        }
+    }
+}
+
+kernel void ami_gqa_causal_prefill_flash_attn_nax(const device half *q [[buffer(0)]],
+                                                  const device NaxKvTilePair *kv_tiles [[buffer(1)]],
+                                                  const device uchar *retired_pool [[buffer(2)]],
+                                                  const device uint *retired_chunk_ids [[buffer(3)]],
+                                                  device half *out [[buffer(4)]],
+                                                  constant NaxCausalPrefillAttnParams &p [[buffer(5)]],
+                                                  uint2 tg_pos [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint sg_id [[simdgroup_index_in_threadgroup]],
+                                                  uint lane [[thread_index_in_simdgroup]]) {
+    // 10 KiB total threadgroup SRAM (<= 16 KiB): Qs (2 KiB) + KVs (2 KiB) + Ss (4 KiB) + Ps (2 KiB).
+    threadgroup half Qs[32u * 32u];
+    threadgroup half KVs[32u * 32u];
+    threadgroup float Ss[32u * 32u];
+    threadgroup half Ps[32u * 32u];
+
+    if (NAX_ATTN_HEAD_DIM == 128u) {
+        nax_flash_prefill_exec<128u>(q, kv_tiles, retired_pool, retired_chunk_ids, out, p, Qs, KVs, Ss, Ps, tg_pos, tid, sg_id, lane);
+    } else {
+        nax_flash_prefill_exec<64u>(q, kv_tiles, retired_pool, retired_chunk_ids, out, p, Qs, KVs, Ss, Ps, tg_pos, tid, sg_id, lane);
+    }
 }

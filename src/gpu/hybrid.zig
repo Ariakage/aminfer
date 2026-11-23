@@ -1533,6 +1533,8 @@ pub const QsaSwaPrefillAttnArgs = struct {
     num_retired_chunks: u32 = 0,
     retired_plane_stride_bytes: u32 = 0,
     retired_chunk_stride_bytes: u32 = 0,
+    /// Optional `G19` MMA override (`null` enforces strict `Q_len >= 32 && KV_len >= 64` guard).
+    use_mma_override: ?bool = null,
 };
 
 // ===========================================================================
@@ -2511,6 +2513,8 @@ pub const MlaCsa2AttendArgs = struct {
     block_tokens: u32 = CSA2_DEFAULT_BLOCK_TOKENS,
     top_k_blocks: u32 = 16,
     scale: ?f32 = null,
+    /// Optional `G19` MMA override (`null` enforces strict `Q_len >= 32 && KV_len >= 64` guard).
+    use_mma_override: ?bool = null,
 };
 
 /// Dispatch telemetry returned by `encodeMlaCsa2Layer` verifying zero duplicate KV
@@ -2717,6 +2721,9 @@ pub const HybridPipelines = struct {
     qsa_swa_prefill_attn_d64: metal.Pipeline,
     qsa_swa_prefill_attn_d128: metal.Pipeline,
     qsa_swa_prefill_attn_dyn: metal.Pipeline,
+    // M7.8 (G19, ADR-0023): hardware `simdgroup_half8x8` QSA prefill
+    qsa_swa_prefill_attn_mma_d64: metal.Pipeline,
+    qsa_swa_prefill_attn_mma_d128: metal.Pipeline,
 
     // 4-Branch GR (G10): indexed as `[stream_bf16][act_bf16]` (`0=f16, 1=bf16`)
     gr_init: [2][2]metal.Pipeline,
@@ -2739,6 +2746,8 @@ pub const HybridPipelines = struct {
     csa2_update_summaries: metal.Pipeline,
     csa2_index_blocks: metal.Pipeline,
     mla_csa2_attend: metal.Pipeline,
+    // M7.8 (G19, ADR-0023): hardware `simdgroup_half8x8` MLA prefill
+    mla_csa2_attend_mma: metal.Pipeline,
 
     // M7 (G10): Single-Pass Mega-mHC (`[stream_bf16][act_bf16]`)
     mhc_single_pass: [2][2]metal.Pipeline,
@@ -3013,6 +3022,16 @@ pub const HybridPipelines = struct {
         });
         errdefer qsa_swa_prefill_attn_dyn.close();
 
+        const qsa_swa_prefill_attn_mma_d64 = try metal.Pipeline.initSpecialized(device, library, "ami_qsa_swa_prefill_attn_mma", &.{
+            .{ .index = 2, .value = .{ .u32 = 64 } },
+        });
+        errdefer qsa_swa_prefill_attn_mma_d64.close();
+
+        const qsa_swa_prefill_attn_mma_d128 = try metal.Pipeline.initSpecialized(device, library, "ami_qsa_swa_prefill_attn_mma", &.{
+            .{ .index = 2, .value = .{ .u32 = 128 } },
+        });
+        errdefer qsa_swa_prefill_attn_mma_d128.close();
+
         const mla_fp4_kv_write = try metal.Pipeline.init(device, library, "ami_mla_fp4_kv_write");
         errdefer mla_fp4_kv_write.close();
 
@@ -3024,6 +3043,9 @@ pub const HybridPipelines = struct {
 
         const mla_csa2_attend = try metal.Pipeline.init(device, library, "ami_mla_csa2_attend");
         errdefer mla_csa2_attend.close();
+
+        const mla_csa2_attend_mma = try metal.Pipeline.init(device, library, "ami_mla_csa2_attend_mma");
+        errdefer mla_csa2_attend_mma.close();
 
         var mhc_single_pass: [2][2]metal.Pipeline = undefined;
         var mhc_post_mix: [2][2]metal.Pipeline = undefined;
@@ -3103,6 +3125,8 @@ pub const HybridPipelines = struct {
             .qsa_swa_prefill_attn_d64 = qsa_swa_prefill_attn_d64,
             .qsa_swa_prefill_attn_d128 = qsa_swa_prefill_attn_d128,
             .qsa_swa_prefill_attn_dyn = qsa_swa_prefill_attn_dyn,
+            .qsa_swa_prefill_attn_mma_d64 = qsa_swa_prefill_attn_mma_d64,
+            .qsa_swa_prefill_attn_mma_d128 = qsa_swa_prefill_attn_mma_d128,
             .gr_init = gr_init,
             .gr_read = gr_read,
             .gr_write = gr_write,
@@ -3119,6 +3143,7 @@ pub const HybridPipelines = struct {
             .csa2_update_summaries = csa2_update_summaries,
             .csa2_index_blocks = csa2_index_blocks,
             .mla_csa2_attend = mla_csa2_attend,
+            .mla_csa2_attend_mma = mla_csa2_attend_mma,
             .mhc_single_pass = mhc_single_pass,
             .mhc_post_mix = mhc_post_mix,
         };
@@ -3131,10 +3156,13 @@ pub const HybridPipelines = struct {
                 self.mhc_single_pass[sb][ab].close();
             }
         }
+        self.mla_csa2_attend_mma.close();
         self.mla_csa2_attend.close();
         self.csa2_index_blocks.close();
         self.csa2_update_summaries.close();
         self.mla_fp4_kv_write.close();
+        self.qsa_swa_prefill_attn_mma_d128.close();
+        self.qsa_swa_prefill_attn_mma_d64.close();
         self.qsa_swa_prefill_attn_dyn.close();
         self.qsa_swa_prefill_attn_d128.close();
         self.qsa_swa_prefill_attn_d64.close();
@@ -4144,6 +4172,17 @@ pub const HybridPipelines = struct {
     /// `HybridKvRing` prefix (`t < chunk_start_pos`) plus in-flight chunk `k_chunk`/
     /// `v_chunk` (`t >= chunk_start_pos`), strictly skipping upper-triangular
     /// (`kv_pos > q_pos`) and out-of-window positions.
+    /// Returns `true` when QSA prefill qualifies for the `G19` `simdgroup_half8x8`
+    /// MMA tile kernel (`Q_len >= 32` and `KV_len >= 64` and `head_dim in {64, 128}`).
+    pub fn shouldUseQsaMmaPrefill(args: QsaSwaPrefillAttnArgs) bool {
+        if (args.head_dim != 64 and args.head_dim != 128) return false;
+        if (args.use_mma_override) |ov| return ov;
+        return attention.shouldUseG19MmaPrefill(args.num_q, args.kv_len);
+    }
+
+    /// Encodes `ami_qsa_swa_prefill_attn` / `ami_qsa_swa_prefill_attn_mma` (`G9` +
+    /// `G15` / `G19`, ADR-0020, ADR-0023 §2): strictly gates hardware `simdgroup_half8x8`
+    /// MMA tiles on `Q_len >= 32` and `KV_len >= 64` (never `M = 1` or narrow draft trees).
     pub fn encodeQsaSwaPrefillAttn(
         self: HybridPipelines,
         frame: *metal.Compute.Frame,
@@ -4189,7 +4228,35 @@ pub const HybridPipelines = struct {
             .retired_plane_stride_bytes = args.retired_plane_stride_bytes,
             .retired_chunk_stride_bytes = args.retired_chunk_stride_bytes,
         };
+        const bindings = [_]metal.BufferBinding{
+            args.q,
+            args.kv_tiles orelse args.q,
+            args.k_chunk,
+            args.v_chunk,
+            args.out,
+            args.retired_pool orelse args.q,
+            args.retired_chunk_ids orelse args.q,
+        };
         const gqa_ratio = args.num_q_heads / args.num_kv_heads;
+        if (shouldUseQsaMmaPrefill(args)) {
+            const pipe = switch (args.head_dim) {
+                64 => self.qsa_swa_prefill_attn_mma_d64,
+                128 => self.qsa_swa_prefill_attn_mma_d128,
+                else => unreachable,
+            };
+            const total_q: u64 = @as(u64, args.num_q) * gqa_ratio;
+            const q_tiles: u64 = (total_q + 31) / 32;
+            try frame.encodeThreadgroups(
+                pipe,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ args.num_kv_heads, q_tiles, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+            return;
+        }
+
         const q_groups_per_kv: u64 = (@as(u64, gqa_ratio) + 7) / 8;
         const pipe = switch (args.head_dim) {
             64 => self.qsa_swa_prefill_attn_d64,
@@ -4198,15 +4265,7 @@ pub const HybridPipelines = struct {
         };
         try frame.encodeThreadgroups(
             pipe,
-            &.{
-                args.q,
-                args.kv_tiles orelse args.q,
-                args.k_chunk,
-                args.v_chunk,
-                args.out,
-                args.retired_pool orelse args.q,
-                args.retired_chunk_ids orelse args.q,
-            },
+            &bindings,
             std.mem.asBytes(&params),
             .{ @as(u64, args.num_kv_heads) * q_groups_per_kv, args.num_q, 1 },
             .{ 256, 1, 1 },
@@ -4777,21 +4836,40 @@ pub const HybridPipelines = struct {
             .kv_batch_stride_bytes = if (has_batch) args.kv_arena.layer_stride_bytes else 0,
             .swa_batch_stride_bytes = swa_batch_stride,
         };
+        const bindings = [_]metal.BufferBinding{
+            args.q_nope,
+            args.q_pe orelse args.q_nope,
+            kv_binding,
+            swa_binding,
+            args.index_buf.blocksBinding(args.index_metal_buf),
+            args.index_buf.countsBinding(args.index_metal_buf),
+            args.kv_tree_latent orelse args.q_nope,
+            args.kv_tree_rope orelse args.q_nope,
+            args.ancestor_masks orelse args.q_nope,
+            args.batch_kv_lens orelse args.q_nope,
+            args.out,
+        };
+
+        // G19 short-sequence + non-tree/non-batch guard: hardware simdgroup_half8x8
+        // MMA activates strictly when Q_len >= 32 and KV_len >= 64 on contiguous prefill.
+        const can_use_mma = !has_any_tree and !has_batch;
+        const use_mma = can_use_mma and (args.use_mma_override orelse attention.shouldUseG19MmaPrefill(args.num_nodes, args.kv_len));
+        if (use_mma) {
+            const q_tiles: u64 = (@as(u64, args.num_nodes) + 31) / 32;
+            try frame.encodeThreadgroups(
+                self.mla_csa2_attend_mma,
+                &bindings,
+                std.mem.asBytes(&params),
+                .{ args.num_q_heads, q_tiles, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+            return;
+        }
+
         try frame.encodeThreadgroups(
             self.mla_csa2_attend,
-            &.{
-                args.q_nope,
-                args.q_pe orelse args.q_nope,
-                kv_binding,
-                swa_binding,
-                args.index_buf.blocksBinding(args.index_metal_buf),
-                args.index_buf.countsBinding(args.index_metal_buf),
-                args.kv_tree_latent orelse args.q_nope,
-                args.kv_tree_rope orelse args.q_nope,
-                args.ancestor_masks orelse args.q_nope,
-                args.batch_kv_lens orelse args.q_nope,
-                args.out,
-            },
+            &bindings,
             std.mem.asBytes(&params),
             .{ args.num_q_heads, args.num_nodes, 1 },
             .{ 256, 1, 1 },
@@ -9527,5 +9605,231 @@ test "G10: Single-Pass Mega-mHC (4-stream f16 & 6-stream bf16, fused RMSNorm, Si
         }
         try std.testing.expect(max_branch_err < tc.tol);
         try std.testing.expect(max_stream_err < tc.tol);
+    }
+}
+
+test "gpu.hybrid: G19 QSA and MLA simdgroup_half8x8 prefill parity vs scalar/vector path with short-sequence guard" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+    const pipes = try HybridPipelines.init(device, library);
+    defer pipes.close();
+
+    // 1. QSA prefill MMA parity (D=64 & D=128) + short-sequence guard verification.
+    try std.testing.expect(!HybridPipelines.shouldUseQsaMmaPrefill(.{
+        .q = undefined,
+        .k_chunk = undefined,
+        .v_chunk = undefined,
+        .out = undefined,
+        .num_q = 16,
+        .q_start_pos = 0,
+        .chunk_start_pos = 0,
+        .kv_len = 128,
+        .num_q_heads = 8,
+        .num_kv_heads = 2,
+        .head_dim = 64,
+    }));
+    try std.testing.expect(HybridPipelines.shouldUseQsaMmaPrefill(.{
+        .q = undefined,
+        .k_chunk = undefined,
+        .v_chunk = undefined,
+        .out = undefined,
+        .num_q = 32,
+        .q_start_pos = 0,
+        .chunk_start_pos = 0,
+        .kv_len = 64,
+        .num_q_heads = 8,
+        .num_kv_heads = 2,
+        .head_dim = 128,
+    }));
+
+    for ([_]u32{ 64, 128 }) |hd| {
+        const num_q: u32 = 40;
+        const kv_len: u32 = 72;
+        const num_q_heads: u32 = 8;
+        const num_kv_heads: u32 = 2;
+        const q_elems: usize = @as(usize, num_q) * num_q_heads * hd;
+        const kv_elems: usize = @as(usize, kv_len) * num_kv_heads * hd;
+        var arena = try makeTestArena(try page.alignUp((3 * q_elems + 2 * kv_elems) * 2 + 4096));
+        defer arena.deinit();
+
+        const q_raw = try arena.allocAligned(q_elems * 2, 64);
+        const k_raw = try arena.allocAligned(kv_elems * 2, 64);
+        const v_raw = try arena.allocAligned(kv_elems * 2, 64);
+        const o_vec_raw = try arena.allocAligned(q_elems * 2, 64);
+        const o_mma_raw = try arena.allocAligned(q_elems * 2, 64);
+
+        const q_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_raw));
+        const k_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, k_raw));
+        const v_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, v_raw));
+        const o_vec: []f16 = @alignCast(std.mem.bytesAsSlice(f16, o_vec_raw));
+        const o_mma: []f16 = @alignCast(std.mem.bytesAsSlice(f16, o_mma_raw));
+        for (q_f16, 0..) |*v, i| v.* = @floatCast(synthF32(i + 13, 0.08));
+        for (k_f16, 0..) |*v, i| v.* = @floatCast(synthF32(i + 37, 0.08));
+        for (v_f16, 0..) |*v, i| v.* = @floatCast(synthF32(i + 61, 0.08));
+
+        const buf = try metal.Buffer.wrap(device, arena.bytes());
+        defer buf.close();
+        var compute = try metal.Compute.initWithFrames(device, 2);
+        defer compute.close();
+        try compute.makeResident(&.{buf});
+
+        var frame = try compute.beginFrame(5000);
+        errdefer frame.abort();
+        const base_args: QsaSwaPrefillAttnArgs = .{
+            .q = .{ .buffer = buf, .offset = arena.offsetOf(q_raw.ptr) },
+            .k_chunk = .{ .buffer = buf, .offset = arena.offsetOf(k_raw.ptr) },
+            .v_chunk = .{ .buffer = buf, .offset = arena.offsetOf(v_raw.ptr) },
+            .out = .{ .buffer = buf, .offset = arena.offsetOf(o_vec_raw.ptr) },
+            .num_q = num_q,
+            .q_start_pos = kv_len - num_q,
+            .chunk_start_pos = 0,
+            .kv_len = kv_len,
+            .num_q_heads = num_q_heads,
+            .num_kv_heads = num_kv_heads,
+            .head_dim = hd,
+            .window_size = 48,
+            .ring_capacity = 0,
+            .chunk_tokens = 512,
+            .use_mma_override = false,
+        };
+        try pipes.encodeQsaSwaPrefillAttn(&frame, base_args, false);
+        var mma_args = base_args;
+        mma_args.out = .{ .buffer = buf, .offset = arena.offsetOf(o_mma_raw.ptr) };
+        mma_args.use_mma_override = true;
+        try pipes.encodeQsaSwaPrefillAttn(&frame, mma_args, false);
+        const sig = try frame.commit();
+        try compute.wait(sig, 5000);
+
+        for (0..q_elems) |i| {
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(o_vec[i])), @as(f32, @floatCast(o_mma[i])), 3e-3);
+        }
+    }
+
+    // 2. MLA + CSA2 prefill MMA parity (`num_nodes = 40 >= 32`, `kv_len = 80 >= 64`).
+    const mla_nodes: u32 = 40;
+    const mla_kv_len: u32 = 80;
+    const mla_heads: u32 = 4;
+    const mla_rank: u32 = 160;
+    const mla_rope: u32 = 32;
+    const swa_win: u32 = 24;
+    const blk_tok: u32 = 16;
+    const top_k: u32 = 3;
+
+    const kv_spec: MlaFp4KvSpec = .{
+        .num_kv_layers = 1,
+        .max_tokens = 128,
+        .kv_lora_rank = mla_rank,
+        .qk_rope_dim = mla_rope,
+        .rope_tail_format = .f16,
+    };
+    const swa_spec: MlaSwaRingSpec = .{
+        .num_kv_layers = 1,
+        .swa_window = swa_win,
+        .kv_lora_rank = mla_rank,
+        .qk_rope_dim = mla_rope,
+    };
+    const idx_spec: Csa2IndexBufferSpec = .{
+        .max_nodes = mla_nodes,
+        .top_k_blocks = top_k,
+    };
+    const q_nope_elems: usize = @as(usize, mla_nodes) * mla_heads * mla_rank;
+    const q_pe_elems: usize = @as(usize, mla_nodes) * mla_heads * mla_rope;
+    const lat_elems: usize = @as(usize, mla_kv_len) * mla_rank;
+    const rope_elems: usize = @as(usize, mla_kv_len) * mla_rope;
+    const arena_need = try MlaFp4KvArena.requiredBytes(kv_spec) +
+        try MlaSwaRingArena.requiredBytes(swa_spec) +
+        try Csa2IndexBuffer.requiredBytes(idx_spec) +
+        try page.alignUp((3 * q_nope_elems + q_pe_elems + lat_elems + rope_elems) * 2 + 4096);
+    var mla_arena = try makeTestArena(arena_need);
+    defer mla_arena.deinit();
+
+    const kv_arena = try MlaFp4KvArena.init(&mla_arena, kv_spec);
+    const swa_ring = try MlaSwaRingArena.init(&mla_arena, swa_spec);
+    const idx_buf = try Csa2IndexBuffer.init(&mla_arena, idx_spec);
+
+    const q_nope_raw = try mla_arena.allocAligned(q_nope_elems * 2, 64);
+    const q_pe_raw = try mla_arena.allocAligned(q_pe_elems * 2, 64);
+    const lat_raw = try mla_arena.allocAligned(lat_elems * 2, 64);
+    const rope_raw = try mla_arena.allocAligned(rope_elems * 2, 64);
+    const out_vec_raw = try mla_arena.allocAligned(q_nope_elems * 2, 64);
+    const out_mma_raw = try mla_arena.allocAligned(q_nope_elems * 2, 64);
+
+    const q_nope_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_nope_raw));
+    const q_pe_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_pe_raw));
+    const lat_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, lat_raw));
+    const rope_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, rope_raw));
+    const out_vec_mla: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_vec_raw));
+    const out_mma_mla: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_mma_raw));
+
+    for (q_nope_f16, 0..) |*v, i| v.* = @floatCast(synthF32(i + 11, 0.07));
+    for (q_pe_f16, 0..) |*v, i| v.* = @floatCast(synthF32(i + 23, 0.07));
+    for (lat_f16, 0..) |*v, i| v.* = @floatCast(synthF32(i + 47, 0.08));
+    for (rope_f16, 0..) |*v, i| v.* = @floatCast(synthF32(i + 71, 0.08));
+
+    const sel_blocks = idx_buf.blocks;
+    const sel_counts = idx_buf.counts;
+    for (0..mla_nodes) |ni| {
+        sel_counts[ni] = 2;
+        sel_blocks[ni * top_k + 0] = 0;
+        sel_blocks[ni * top_k + 1] = @intCast((ni % 2) + 1);
+        sel_blocks[ni * top_k + 2] = 0xFFFF_FFFF;
+    }
+
+    const mla_buf = try metal.Buffer.wrap(device, mla_arena.bytes());
+    defer mla_buf.close();
+    var mla_compute = try metal.Compute.initWithFrames(device, 2);
+    defer mla_compute.close();
+    try mla_compute.makeResident(&.{mla_buf});
+
+    {
+        var frame = try mla_compute.beginFrame(5000);
+        errdefer frame.abort();
+        try pipes.encodeMlaFp4KvWrite(&frame, .{
+            .latent_in = .{ .buffer = mla_buf, .offset = mla_arena.offsetOf(lat_raw.ptr) },
+            .rope_in = .{ .buffer = mla_buf, .offset = mla_arena.offsetOf(rope_raw.ptr) },
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = mla_buf,
+            .kv_slot = 0,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = mla_buf,
+            .num_tokens = mla_kv_len,
+            .start_pos = 0,
+        }, false);
+
+        const base_mla: MlaCsa2AttendArgs = .{
+            .q_nope = .{ .buffer = mla_buf, .offset = mla_arena.offsetOf(q_nope_raw.ptr) },
+            .q_pe = .{ .buffer = mla_buf, .offset = mla_arena.offsetOf(q_pe_raw.ptr) },
+            .kv_arena = &kv_arena,
+            .kv_metal_buf = mla_buf,
+            .kv_slot = 0,
+            .swa_ring = &swa_ring,
+            .swa_metal_buf = mla_buf,
+            .index_buf = &idx_buf,
+            .index_metal_buf = mla_buf,
+            .out = .{ .buffer = mla_buf, .offset = mla_arena.offsetOf(out_vec_raw.ptr) },
+            .num_nodes = mla_nodes,
+            .num_q_heads = mla_heads,
+            .kv_len = mla_kv_len,
+            .causal_q_start_pos = mla_kv_len - mla_nodes,
+            .swa_window = swa_win,
+            .block_tokens = blk_tok,
+            .top_k_blocks = top_k,
+            .use_mma_override = false,
+        };
+        try pipes.encodeMlaCsa2Attend(&frame, base_mla, true);
+        var mma_mla = base_mla;
+        mma_mla.out = .{ .buffer = mla_buf, .offset = mla_arena.offsetOf(out_mma_raw.ptr) };
+        mma_mla.use_mma_override = true;
+        try pipes.encodeMlaCsa2Attend(&frame, mma_mla, false);
+        const sig = try frame.commit();
+        try mla_compute.wait(sig, 5000);
+    }
+
+    _ = gpa;
+    for (0..q_nope_elems) |i| {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(out_vec_mla[i])), @as(f32, @floatCast(out_mma_mla[i])), 4e-3);
     }
 }
