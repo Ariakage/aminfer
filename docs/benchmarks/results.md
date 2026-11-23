@@ -5800,3 +5800,51 @@ inspect.swapouts_delta           0
 [6 tok | 923.4 tok/s | TTFT 5.4 ms | PrefixCache hit 0/82 tok]
 ```
 
+## M7.8: Native Kernel Barrier Fusion, MMA FlashAttention, and SIMD Accelerators
+
+Recorded on Apple M4 (`Mac16,12`, `Apple9` GPU, `24 GiB` unified memory,
+`120.0 GB/s` bus, `has_nax=no`) via `aminfer bench-m78` (`-Doptimize=ReleaseFast`,
+`swapouts_delta = 0`). `Apple10+` `NAX` FlashAttention-2 hardware benchmarking
+remains gated on physical `Apple10+` silicon in Spike `S8`
+([ADR-0023](../decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md)).
+
+### Summary
+
+| Track | Scope / Condition | Measured Result (M4, ReleaseFast) | Notes / Guard |
+| --- | --- | --- | --- |
+| **G18 Canary** | Combined `G16` + `G18` single-frame startup canary | `warm_us = 122.79 us` (`< 350 us`), `mixed_gsq_guard = yes` | `16 KiB` single-page reuse; zero extra submit/wait roundtrip |
+| **G18 Synth A/B** | 4L `GraphModel` (`hidden=1024, inter=3072`, `prompt64`) | Prefill64 `9.216 -> 4.342 ms` (`2.12x`), decode `2244.54 -> 2017.60 us` (`1.11x`), `parity = yes` | Shape gates calibrated for M4 (`qkv_min_m=64`, `swiglu_min_m=32`, residual epilogue `M==1 \|\| M>=64`) |
+| **G18 Real `Qwen3-0.6B` BF16** | `1,213 MiB` wired, `prompt64`, zero-swap | Prefill `48.767 -> 44.933 ms` (`1.09x`), decode `45.90 -> 47.77 tok/s` (`1.04x`), `parity = yes` | `Qwen3-14B-4bit` (`7,924 MiB`) & `Qwen3-30B-A3B-3bit` (`12,744 MiB`) present and cleanly `skipped_live_ram_headroom` on 24 GiB host |
+| **G19 MMA FlashAttn-2** | Causal GQA prefill (`KV_len = 512`, `Apple9` `simdgroup_half8x8`) | `Q=1`: `scalar_vector` (`197.02 vs 201.06 us`); `Q=16`: `scalar_vector`; `Q=32`: `2.36x`; `Q=64`: `3.72x`; `Q=512`: `5.50x` (`4825.79 -> 877.30 us`) | Strictly gated `Q_len >= 32 && KV_len >= 64`; `max_diff <= 0.00049`; `Apple10+` NAX HW pending Spike `S8` |
+| **G20 Indirect MoE** | GPU `MTLDispatchThreadgroupsIndirectArguments` dispatch | `guard_ok = yes`, `M=1` direct `44.66 us`, `M=16` direct `168.53 us` / indirect `163.33 us`, `parity = yes` | `shouldUseIndirectDispatch`: `M > 1 \|\| num_scheme_buckets > 1`; direct path kept for `M=1` homogeneous MoE |
+| **G21 248K GPU Sampler + C22** | `vocab = 248,077`, `C22` JSON schema speculative tree | `greedy = 14.31 us`, `constrained_radix = 111.89 us`, `sync_roundtrip = 784.96 us`; constrained accept `9.00` vs unconstrained `2.25` | Unconstrained greedy `argmax` fast-path bypass + full tree bitmask propagation |
+| **C23 ARM64 NEON SIMD** | `16 KiB` JSON structural scanner + BPE `PreTokenIterator` | JSON `1.46 -> 7.58 GB/s` (`5.18x`); BPE `1.88 -> 3.81 GB/s` (`2.02x`); `parity = yes` | Exact bit parity including `< 16 B` tails |
+| **C24 SME2 `luti2` + Multi-LoRA** | `m=1/16, n=512, k=512` `q2_affine` / `LUT4`, `<= 4 MiB` L2 cap | `luti2_m1 = 3.08 us`, `luti2_m16 = 14.83 us` vs scalar `1299.23 us` (`87.64x`, `565.82 GOPS`), `hoisted_lora = 7.69 us`, `bus_gate_ok = yes` | `0` streaming `[sp` spills across `35` `_ami_sme2_*` symbols (`otool -tvV`) |
+| **G22 ViT Tower** | 3-layer synthetic ViT + `PatchMerger` + AnyRes + aliased scratch | `vit_encode = 0.603 ms`, `aliased_saved = 128 KiB`, `owned_wired = 0 B` during decode, `text_fastpath_ok = yes`, `zero_copy = yes` | `WiredArena.allocAliasedPair` reuses prefill scratch (`0 B` steady-state text decode overhead) |
+
+### Verbatim `aminfer bench-m78` output
+
+`TMPDIR=/Volumes/Akari/.tmp/m78-engine ./zig-out/bin/aminfer bench-m78`:
+
+```text
+bench.m78.device                 Apple M4 (m4 base, bus=120.0 GB/s, has_nax=no)
+bench.m78.g18.canary             warm_us=122.79 (<350us) passed=yes mixed_gsq_guard=yes
+bench.m78.g18.synth_dense_ab     prefill64_unfused_ms=9.216 prefill64_fused_ms=4.342 decode_unfused_us=2244.54 decode_fused_us=2017.60 parity=yes
+bench.m78.g18.real.qwen3_06b     status=verified_zero_swap wired_MiB=1213 prefill_unfused_ms=48.767 prefill_fused_ms=44.933 decode_unfused_tok_s=45.90 decode_fused_tok_s=47.77 parity=yes
+bench.m78.g18.real.qwen3_14b     status=skipped_live_ram_headroom wired_MiB=7924 prefill_unfused_ms=0.000 prefill_fused_ms=0.000 decode_unfused_tok_s=0.00 decode_fused_tok_s=0.00 parity=no
+bench.m78.g18.real.qwen3_30b     status=skipped_live_ram_headroom wired_MiB=12744 prefill_unfused_ms=0.000 prefill_fused_ms=0.000 decode_unfused_tok_s=0.00 decode_fused_tok_s=0.00 parity=no
+bench.m78.g19.q1_kv512         route=scalar_vector vector_us=197.02 mma_us=201.06 speedup=0.98x max_diff=0.00001
+bench.m78.g19.q16_kv512         route=scalar_vector vector_us=307.66 mma_us=201.13 speedup=1.53x max_diff=0.00002
+bench.m78.g19.q32_kv512         route=mma_apple9 vector_us=534.84 mma_us=226.42 speedup=2.36x max_diff=0.00002
+bench.m78.g19.q64_kv512         route=mma_apple9 vector_us=962.91 mma_us=259.11 speedup=3.72x max_diff=0.00002
+bench.m78.g19.q512_kv512         route=mma_apple9 vector_us=4825.79 mma_us=877.30 speedup=5.50x max_diff=0.00049
+bench.m78.g19.summary            guard_ok=yes parity_ok=yes nax_hw=gated_on_spike_s8_apple9_m4_host
+bench.m78.g20.indirect_moe       guard_ok=yes m1_direct_us=44.66 m1_indirect_us=40.69 m16_direct_us=168.53 m16_indirect_us=163.33 parity=yes
+bench.m78.g21.sampler_248k       vocab=248077 greedy_us=14.31 constrained_radix_us=111.89 sync_roundtrip_us=784.96
+bench.m78.g21.c22_spec_accept    unconstrained_accept=2.25 constrained_accept=9.00 all_nodes_valid=yes
+bench.m78.c23.neon_simd          json_scalar_GBs=1.46 json_neon_GBs=7.58 json_speedup=5.18x bpe_scalar_GBs=1.88 bpe_neon_GBs=3.81 bpe_speedup=2.02x parity=yes
+bench.m78.c24.sme2_luti2         sme2=yes luti2_m1_us=3.08 luti2_m16_us=14.83 scalar_m16_us=1299.23 speedup=87.64x m16_GOPS=565.82 hoisted_lora_us=7.69 l2_cap_KiB=4096 bus_gate_ok=yes
+bench.m78.g22.vit_tower          text_fastpath_ok=yes layers=3 vis_tokens=16 aliased_saved_KiB=128 owned_wired_B=0 vit_encode_ms=0.603 zero_copy=yes
+bench.m78.swapouts_delta         0
+```
+
