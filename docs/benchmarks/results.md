@@ -5689,3 +5689,114 @@ Strict TB5 RDMA negative gate (`--strict-tb5-rdma` on M4 TB4):
 ```text
 error: Tb5RdmaUnavailable
 ```
+
+## M7.5: Native C/Python SDK, full HTTP/SSE protocol parity, rootless TUI monitor and local ergonomics
+
+Recorded on 2026-11-23 (`ReleaseFast` on Apple M4 24 GB unified memory, macOS 26.0, commits `996782f..ddd90a4`, [ADR-0022](../decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)).
+
+### Summary metrics
+
+| Component | Capability | Measured M4 metric (`ReleaseFast`) | Invariant check |
+| --- | --- | --- | --- |
+| `W18` Single-file `.amf` metadata & header-only inspect | `aminfer inspect` / `aminfer ls` & `loadFromFileAutoConfig` | `127.96 us` header-only inspect; `9.778 ms` single-file auto-config load (`parity=yes`) | `0 B` wired delta during inspect; `0` swapouts |
+| `W19` Multi-LoRA hot-loading & per-request routing | `LoraRegistry` (`512 KiB` wired pool `<= 4 MiB` L2 cap, rank-8 `.amlora` `128 KiB`) | `304.82 us` base vs `273.47 us` `active_adapters == 0` bypass (`zero_bypass_match=yes`, `unload_match=yes`); `1684.67 us` active rank-8 LoRA | `0` instructions added inside base layer loop when `active_adapters == 0` |
+| `C22` Preallocated `json_schema` / GBNF bitmask engine | `compileJsonSchema` + `VocabIndex.fillAllowedTokenBitmask` (`vocab=4096`) | `43.54 us` PDA compile; `6.01 us` per-step token bitmask evaluation (`schema_match=yes`) | `0` steady-state heap blocks (`malloc_blocks_delta=0`, `malloc_bytes_delta=0`) |
+| `C19` Rootless `aminfer monitor` telemetry | Mach `PROCESSOR_CPU_LOAD_INFO` (`4P+6E`), `HOST_VM_INFO64` / `R9`, `IOAccelerator`, `IOBlockStorageDriver` | `1170.11 us` full host sample + `1761 B` JSON snapshot (`wired_limit_MiB=18186`, `live_reclaimable_MiB=7076`) | Rootless (`0` `sudo`), `0` steady-state heap blocks (`malloc_blocks_delta=0`) |
+| `C21` Native embeddings & cross-encoder reranking | `prefillEmbeddings` (`lm_head` elided, Matryoshka `dim=64`, L2 norm) & `rerankSequences` (`4` docs) | `1050.77 us` embedding (`l2_norm=1.0000`); `2395.79 us` 4-doc cross-encoder rerank (`sorted_ok=yes`) | Reuses `G15` wide prefill while eliding `lm_head`; `0` swapouts |
+| `R10` Opt-in `DiskPrefixCache` NVMe persistence | 16 KiB-aligned `F_NOCACHE` atomic spill & cold-restart reload (`256 KiB` `retired_q8` artifact) | `2059.17 us` spill (`0.13 GB/s`); `1823.08 us` cold reload (`0.14 GB/s`, `token_verified=yes`, `collision_rejected=yes`) | Full token-slice verification rejects hash collisions (`0` collision risk) |
+| `C17` Plain-C `libaminfer.dylib` & Python `ctypes` SDK | Dynamic `dlopen` create/destroy lifecycle (`4` cycles) + real `Qwen3-0.6B` BF16 zero-swap check | `102.520 ms` mean create/destroy cycle (`leaked_wired_pages=0`); `Qwen3-0.6B` BF16 `48.21 tok/s` (`20.741 ms/tok`, `1213 MiB` wired) | `0` Python / third-party dylibs linked; `0` leaked wired pages; `swapouts_delta=0` |
+
+### Raw verification outputs
+
+`otool -L zig-out/lib/libaminfer.dylib`:
+
+```text
+zig-out/lib/libaminfer.dylib:
+	@rpath/libaminfer.dylib (compatibility version 1.0.0, current version 1.0.0)
+	/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate (compatibility version 1.0.0, current version 4.0.0)
+	/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics (compatibility version 64.0.0, current version 2050.0.0)
+	/System/Library/Frameworks/CoreML.framework/Versions/A/CoreML (compatibility version 1.0.0, current version 1.0.0)
+	/System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia (compatibility version 1.0.0, current version 3350.77.5)
+	/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo (compatibility version 1.2.0, current version 758.27.0)
+	/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.0.69)
+	/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit (compatibility version 1.0.0, current version 275.0.0)
+	/System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface (compatibility version 1.0.0, current version 1.0.0)
+	/System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO (compatibility version 1.0.0, current version 1.0.0)
+	/System/Library/Frameworks/Metal.framework/Versions/A/Metal (compatibility version 1.0.0, current version 382.5.3)
+	/System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox (compatibility version 1.0.0, current version 3350.77.5)
+	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)
+	/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5027.0.69)
+	/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)
+```
+
+`TMPDIR=/Volumes/Akari/.tmp/m75-engine ./zig-out/bin/aminfer bench-m75`:
+
+```text
+bench.m75.device                 Apple M4 (m4 base, bus=120.0 GB/s)
+bench.m75.w18.single_file_amf    inspect_us=127.96 inspect_wired_delta_B=0 auto_load_ms=9.778 parity=yes (file_B=786432, wired_weight_B=720896, meta_blob_B=32768)
+bench.m75.w19.multi_lora         rank=8 pool_KiB=512 adapter_KiB=128 base_us=304.82 zero_adapter_us=273.47 active_lora_us=1684.67 delta_us=1379.85 zero_bypass_match=yes unload_match=yes malloc_blocks_delta=96
+bench.m75.c22.grammar_bitmask    vocab=4096 compile_us=43.54 mask_eval_us=6.01 schema_match=yes malloc_blocks_delta=0 malloc_bytes_delta=0
+bench.m75.c19.monitor_json       sample_us=1170.11 cores=4P+6E wired_limit_MiB=18186 live_reclaimable_MiB=7076 json_B=1761 malloc_blocks_delta=0
+bench.m75.c21.embed_rerank       embed_dim=64 embed_us=1050.77 l2_norm=1.0000 rerank_docs=4 rerank_us=2395.79 sorted_ok=yes malloc_blocks_delta=128
+bench.m75.r10.disk_prefix_cache  artifact_KiB=256 spill_us=2059.17 spill_GBs=0.13 cold_reload_us=1823.08 reload_GBs=0.14 token_verified=yes collision_rejected=yes
+bench.m75.c17.c_abi_lifecycle    dylib_dlopen=yes cycles=4 mean_cycle_ms=102.520 leaked_wired_pages=0
+bench.m75.real.qwen3_0_6b        status=verified_zero_swap wired_MiB=1213 prefill_ms=66.616 decode_ms_per_tok=20.741 decode_tok_s=48.21
+bench.m75.real.qwen3_14b_4bit    status=skipped_live_ram_headroom wired_MiB=7924 prefill_ms=0.000 decode_ms_per_tok=0.000 decode_tok_s=0.00
+bench.m75.swapouts_delta         0
+```
+
+`./zig-out/bin/aminfer monitor --json`:
+
+```json
+{"theme":"trans-pride","chip":{"generation":"m4","tier":"base","device_name":"Apple M4","gpu_apple_family":9,"p_cores":4,"e_cores":6,"has_sme2":true,"has_nax":false,"spec_bus_gbs":120.0},"cpu":{"core_count":10,"p_core_count":4,"e_core_count":6,"total_pct":24.00,"p_core_pct":17.50,"e_core_pct":28.33,"loadavg":[3.46,3.84,3.77],"per_core_pct":[50.00,25.00,25.00,25.00,25.00,20.00,20.00,25.00,25.00,0.00]},"memory":{"total_bytes":25769803776,"page_size":16384,"wired_bytes":4283826176,"wired_budget_bytes":19069665280,"binding_limit":"MTLDevice.recommendedMaxWorkingSetSize","user_wire_limit_bytes":19585050869,"gpu_wired_limit_bytes":19069665280,"reclaimable_zero_swap_bytes":6968803328,"free_bytes":833650688,"speculative_bytes":784367616,"purgeable_bytes":74940416,"external_bytes":5275844608,"active_bytes":6030622720,"inactive_bytes":5397741568,"compressor_bytes":7610253312,"swap_used_bytes":4498653184,"swap_total_bytes":5368709120,"swapouts_total":47790386,"swapouts_delta":0},"gpu":{"available":true,"accelerator_class":"AGXAcceleratorG16G","thermal_state":"Nominal","device_utilization_pct":73,"renderer_utilization_pct":72,"tiler_utilization_pct":73,"in_use_system_memory_bytes":1425555456,"alloc_system_memory_bytes":5296898048},"nvme":{"available":true,"driver_count":7,"bytes_read_total":21915024297472,"bytes_written_total":15913135154176,"ops_read_total":1785264173,"ops_written_total":499343470,"read_mb_s":209.30,"write_mb_s":0.00,"read_iops":3307.77,"write_iops":0.00},"server":{"attached":false,"online":false,"address":"","model":"","wired_mib":0,"active_requests":0,"active_batch_size":0,"prefill_slots":0,"decode_slots":0,"mean_batch_size":0.00,"tok_per_s":0.00,"decode_share":0.00,"prefix_hit_tokens":0,"retired_q8_kv_chunks":0,"cluster_peers_online":0}}
+```
+
+`./zig-out/bin/aminfer ls /Volumes/Akari/models/amf`:
+
+```text
+ls.dir                           /Volumes/Akari/models/amf
+ls.models_found                  12
+  model_id / file                   arch                     bpw   file_mib   wired_mib  meta        min_tier      
+  qwen3-0.6b-bf16.amf               qwen3_dense            16.00     1138.6      1370.5  -/-/-       M4 16GB       
+  qwen3-0.6b-gsq-rco-sme2.amf       qwen3_dense             4.72      336.9       568.9  -/-/-       M4 16GB       
+  qwen3-0.6b-gsq-rco.amf            qwen3_dense             4.35      310.7       542.6  -/-/-       M4 16GB       
+  qwen3-0.6b-lut16-sme2.amf         qwen3_dense             4.72      336.9       568.9  -/-/-       M4 16GB       
+  qwen3-14b-4bit.amf                qwen3_dense             4.50     7924.7      8284.6  -/-/-       M4 16GB       
+  qwen3-30b-a3b-3bit.amf            qwen3_moe               3.50    12744.3     12949.9  -/-/-       M4 16GB       
+  qwen3-30b-a3b-eagle3.amf          qwen3_dense            16.00      995.8      1059.8  -/-/-       M4 16GB       
+  qwen3-30b-a3b-gsq-rco.amf         qwen3_moe               2.70     9831.6     10037.3  -/-/-       M4 16GB       
+  dspark.amf                        deepseek41             16.00        0.9        64.8  -/-/-       M4 16GB       
+  engram-shard-00-of-02.amf         deepseek41              4.50        0.2        64.0  -/-/-       M4 16GB       
+  engram-shard-01-of-02.amf         deepseek41              4.50        0.2        64.0  -/-/-       M4 16GB       
+  model.amf                         deepseek41              5.68        5.8        69.8  -/-/-       M4 16GB       
+```
+
+Single-file `.amf` (`--embed-metadata`, zero sidecars) `inspect`, `decode`, and `chat --lora` via `stdin` pipe:
+
+```text
+inspect.path                     /Volumes/Akari/.tmp/m75-engine/cli_check/model.amf
+inspect.model_id                 qwen3-tiny-dense-4bit
+inspect.file_bytes               704512 (0.67 MiB)
+inspect.header_crc32             0x0d6ebc66
+inspect.directory_crc32          0xb504dc13
+inspect.header_flags             0x00000001 (embedded_metadata=yes)
+inspect.entries                  total=27 weights=25 metadata=2
+inspect.wired_weight_bytes       638976 (0.61 MiB)
+inspect.cold_weight_bytes        0
+inspect.sparse_table_bytes       0
+inspect.metadata_blob_bytes      32768
+inspect.estimated_kv_scratch     67108864
+inspect.estimated_total_wired    67747840 (64.61 MiB)
+inspect.effective_bpw            4.52
+inspect.config_source            embedded (embedded=yes, crc_valid=yes)
+inspect.tokenizer_meta           embedded=yes (bytes=7305, crc_valid=yes)
+inspect.adapter_config_meta      embedded=no (bytes=0, crc_valid=no)
+inspect.arch                     qwen3 (attn=gqa, ffn=dense, kv=rgba16f_q8, sparse=none)
+inspect.dims                     layers=2 hidden=128 heads=4/2 head_dim=64 vocab=512
+inspect.tier_fit                 min_tier="M4 16GB" (m4_16gb=yes, m4_24gb=yes, pro_48gb=yes, max_128gb=yes)
+inspect.swapouts_delta           0
+
+ v000301 v000301 v000301 v000301 v000301 v000301
+[6 tok | 923.4 tok/s | TTFT 5.4 ms | PrefixCache hit 0/82 tok]
+```
+

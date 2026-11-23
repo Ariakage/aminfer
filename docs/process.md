@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-**M7.5 (`R10`, `W18`, `W19`, `C17`–`C22`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)) and M7.8 (`G18`–`G21`, `C23`–`C24`; [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))**: **Planned** — **M7.5** delivers the native C/Python SDK (`libaminfer.dylib` + `include/aminfer.h` + zero-dependency `python/aminfer/`), full three-endpoint HTTP/SSE protocol parity (`/v1/chat/completions`, `/v1/responses`, `/v1/messages` + `count_tokens`, `--api-key`, `--unix-socket`), rootless `aminfer monitor` TUI (`trans-pride` default + `btop` `.theme`), single-file `.amf` metadata (`ls`/`inspect`), scrolling `aminfer chat` REPL + `stdin` pipe, native `/v1/embeddings` & `/v1/rerank`, preallocated `json_schema`/GBNF bitmask engine, runtime multi-LoRA routing, and opt-in `--disk-prefix-cache` NVMe persistence (audio ingress excluded); **M7.8** delivers native Metal 4 sublayer/epilogue fusion (`4–5` fewer dispatch barriers/layer), hardware `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE threadgroup dispatch, fused `248K`-vocab GPU radix constrained sampling + ARM64 NEON JSON/BPE vector scanning, and ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels, gated by explicit occupancy/crossover non-regression checks. **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
+**M7.8 (`G18`–`G21`, `C23`–`C24`; [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))**: **Planned next** — **M7.8** delivers native Metal 4 sublayer/epilogue fusion (`4–5` fewer dispatch barriers/layer), hardware `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE threadgroup dispatch, fused `248K`-vocab GPU radix constrained sampling + ARM64 NEON JSON/BPE vector scanning, and ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels, gated by explicit occupancy/crossover non-regression checks. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)) is **Completed** and verified on M4 ([benchmarks/results.md](benchmarks/results.md#m75-native-cpython-sdk-full-httpsse-protocol-parity-rootless-tui-monitor-and-local-ergonomics)). **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
 
 ## Milestones
 
@@ -28,7 +28,7 @@ Status-row IDs refer to [status.md](status.md).
 | M6.8 | Wide-chunk GPU prefill, `prompt_tail` pruning, serving QoS & live-RAM / `.metallib` guards | R9, G15, G16, C15 | Default-on `--gpu-prefill-mode wide\|tree64` (`512+` FlashAttention + `BM=64, BN=64` GEMM, direct `KvTile` write) & lossless `prompt_tail` pruning verified bit-consistent vs `tree64`; single-request wide-prefill/`verifyTree` scratch aliasing; default-on `--decode-share`, `--adaptive-prefill-narrow`, and `--message-boundary-cache` `PrefixCache` checkpoints benchmarked under concurrent load; `HOST_VM_INFO64` non-anonymous live RAM soft cache scaling (`+ --strict-live-ram`) & startup `.metallib` numerical canary (`~0.19–0.24 ms` warm in-buffer / `~1.3–3.8 ms` cold first-submit) + `Apple10` `NAX` hook verified without swap | Completed |
 | M6.9 | Multi-generation Apple Silicon (`Apple9` + `Apple10+` GPU `NAX`) single-binary adaptation | G17, C16 | `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`) `f16`/`bf16` & staged group-64 `q2`/`q3`/`q4` kernels compiled into unified `aminfer.metallib` with lazy `MTL4Compiler` `Apple10`/`Apple11` selection (`--prefill-matmul-backend auto\|simdgroup\|nax`), `G16` canary auto-fallback to `simdgroup_apple9` (`+ --strict-nax`), chip-parameterized `spec_bus_gbs` (`--bus-bandwidth-gbs`), and runtime prefill/draft crossover calibration verified with zero M4 regression (`Apple10+` HW throughput gated on Spike `S8`) | In progress (code complete; awaiting Apple10+ HW acceptance & Spike S8 bench) |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV (`890 B/tok`), Single-Pass Mega-mHC, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA / TB4 TCP expert parallelism verified on M4 loopback cluster (`b2034c2..69d30af`); physical multi-Mac TB5 RDMA HCA transport and full 552B + 196B execution gated on 512 GB Ultra or multi-Mac TB5 RDMA hardware | In progress (code and M4 loopback cluster verified; 512 GB Ultra / TB5 RDMA HW pending) |
-| M7.5 | Native C/Python SDK, full HTTP/SSE protocol parity, rootless TUI monitor & local ergonomics | R10, W18, W19, C17–C22 | `libaminfer.dylib` + `include/aminfer.h` + zero-dependency Python `ctypes` SDK (`python/aminfer/`); full `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (+ `count_tokens`, `--api-key`, `--unix-socket`); rootless `aminfer monitor` TUI (`trans-pride` + `--theme`); single-file `.amf` metadata (`ls`/`inspect`); scrolling `aminfer chat` REPL + `stdin` pipe; `/v1/embeddings` & `/v1/rerank`; zero-alloc `json_schema`/GBNF bitmask engine; runtime multi-LoRA routing; opt-in `--disk-prefix-cache` NVMe persistence verified with zero hot-path alloc and zero swap | Planned |
+| M7.5 | Native C/Python SDK, full HTTP/SSE protocol parity, rootless TUI monitor & local ergonomics | R10, W18, W19, C17–C22 | `libaminfer.dylib` + `include/aminfer.h` + zero-dependency Python `ctypes` SDK (`python/aminfer/`); full `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (+ `count_tokens`, `--api-key`, `--unix-socket`); rootless `aminfer monitor` TUI (`trans-pride` + `--theme`); single-file `.amf` metadata (`ls`/`inspect`); scrolling `aminfer chat` REPL + `stdin` pipe; `/v1/embeddings` & `/v1/rerank`; zero-alloc `json_schema`/GBNF bitmask engine; runtime multi-LoRA routing; opt-in `--disk-prefix-cache` NVMe persistence verified with zero hot-path alloc and zero swap | Completed |
 | M7.8 | Native Metal 4 sublayer barrier fusion, MMA FlashAttention-2, GPU indirect MoE dispatch & NEON/SME2 accelerators | G18–G21, C23–C24 | Fused `o_proj`/`down_proj` `+= residual` epilogues, `ami_fused_residual_rmsnorm`, and homogeneous-`DType` `ami_fused_qkv` + `ami_dense_gate_up_swiglu` (`0` stack spill); `simdgroup_half8x8` (`Apple9`) + `NAX` (`Apple10+`) FlashAttention-2 prefill (`Q_len >= 32`, `KV_len >= 64` gated); `MTLDispatchThreadgroupsIndirectArguments` MoE dispatch (`M > 1` & multi-scheme `G13`); fused `248K`-vocab GPU radix constrained sampler + 16/64-byte NEON JSON/BPE scanning; ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels (`0` `[sp` spills) benchmarked in `aminfer bench-m78` with zero M4 decode/prefill regression and zero swap | Planned |
 
 ## Spikes
@@ -690,6 +690,26 @@ ARM64 NEON JSON/BPE vector scanning (`C23`), and ARMv9.2 SME2 `luti2` (`2-bit`)
 assembly microkernels (`C24`), alongside strict zero-overhead fast paths and
 occupancy/crossover non-regression gates across `M7.5` and `M7.8`.
 
+On the same date, Milestone **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`,
+`996782f..ddd90a4`) landed and was verified end-to-end on M4
+([benchmarks/results.md](benchmarks/results.md#m75-native-cpython-sdk-full-httpsse-protocol-parity-rootless-tui-monitor-and-local-ergonomics)):
+rootless `aminfer monitor` TUI (`C19`, `trans-pride` default palette + `btop`
+`.theme` loader, `--once`, `--json`, `--server`), plain scrolling `aminfer chat`
+REPL + `stdin` pipe (`C20`, `/clear`, `/retry`, `/edit` `C15` boundary
+checkpoints, `/image` & `/video` `G14`), plain-C `libaminfer.dylib` +
+`include/aminfer.h` and zero-dependency Python `ctypes` SDK (`C17`, `0`
+third-party dylibs via `otool -L`, `0` leaked wired pages across create/destroy
+cycles), single-file `.amf` embedded metadata + `aminfer ls`/`inspect` (`W18`,
+`127.96 us` inspect with `0 B` wired delta), runtime multi-LoRA hot-loading and
+`"<base>:<adapter>"` routing (`W19`, `<= 4 MiB` L2 wired pool with `0`-overhead
+`active_adapters == 0` bypass), native `lm_head`-elided `/v1/embeddings` and
+`/v1/rerank` (`C21`), opt-in `--disk-prefix-cache` 16 KiB-aligned `F_NOCACHE`
+spill/reload (`R10`, full token-slice collision rejection), preallocated
+`json_schema`/GBNF token-bitmask PDA (`C22`, `43.54 us` compile, `6.01 us`
+per-step bitmask eval, `0` per-step heap alloc), and full three-endpoint
+HTTP/SSE protocol parity (`C18`, `/v1/chat/completions`, `/v1/responses`,
+`/v1/messages` + `count_tokens`, `--api-key`, `--unix-socket`).
+
 ## Session handoff snapshot
 
 Update this before the context window runs out or when handing off.
@@ -833,19 +853,29 @@ Update this before the context window runs out or when handing off.
     `Qwen/Qwen3.8-Flash-Next` and `deepseek-ai/DeepSeek-V4.1-Flash-1017`
     tokenizer & `weight_map` key-alias fixes, and `aminfer-tools inspect-metadata`
     dry-run validator
-- Current test & build baseline (`M0`–`M6.8` complete, `M6.9` code complete,
-  `M7` code & M4 loopback cluster verified, live HF frontier metadata &
-  tokenizer compatibility verified, `0` `catch {}`):
-  - Zig suite: `368/368` passing (`359` lib + `9` CLI) in `Debug` and
-    `ReleaseSafe`, including native `PreTokenizerKind.deepseek` auto-detection
-    and live `Qwen/Qwen3.8-Flash-Next` + `deepseek-ai/DeepSeek-V4.1-Flash-1017`
-    `tokenizer.json` round-trip & zero-alloc `encodeWithScratch` tests;
-    previous `ReleaseFast`, `-Dcpu=apple_m1`, filtered (`test-vision` `12/12`,
-    `test-hybrid` `20/20`, `test-sme` `11/11`, `test-cluster` `21/21`), and
-    `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` runs passed with `0` validation
-    errors
-  - Offline Python `tools/` suite: `85/85` passing (`cd tools && uv run python -m unittest discover -s tests`),
-    including `aminfer-tools inspect-metadata` dry-run validation against live
+  - M7.5: `996782f` `C19` rootless `btop`-style TUI `aminfer monitor`
+    (`trans-pride` default + `.theme`) & `C20` scrolling `aminfer chat` REPL +
+    `stdin` pipe, `198fe6b` `C17` `libaminfer.dylib` (`include/aminfer.h`) &
+    zero-dependency Python `ctypes` SDK (`python/aminfer/`), `2531d69` `W18`
+    single-file `.amf` metadata (`ls`/`inspect`), `W19` `LoraRegistry`
+    (`.amlora`), `C21` `prefillEmbeddings`/`rerankSequences` & `R10`
+    `DiskPrefixCache`, `4933d1d` `C22` preallocated `json_schema`/GBNF bitmask
+    engine, `sampling.zig`/`StopHoldback` & `C18` full 3-endpoint HTTP/SSE
+    protocol parity (`count_tokens`, `--api-key`, `--unix-socket`), `ddd90a4`
+    CLI (`ls`, `inspect`, `monitor`, `chat`, `serve`), `W18` C-SDK auto-metadata
+    & `aminfer bench-m75` integration
+- Current test & build baseline (`M0`–`M6.8` and `M7.5` complete, `M6.9` code
+  complete, `M7` code & M4 loopback cluster verified, live HF frontier metadata
+  & tokenizer compatibility verified, `0` `catch {}`):
+  - Zig suite: `404/404` passing (`391` lib + `10` CLI + `3` C-ABI SDK) in
+    `Debug` and `ReleaseSafe`, including `W18` single-file `.amf`, `W19`
+    multi-LoRA, `C22` grammar bitmask, `C18` 3-endpoint HTTP/SSE parity, `C19`
+    monitor TUI/theme/telemetry, `C20` chat REPL, `C21` embeddings/rerank,
+    `R10` `DiskPrefixCache`, `C17` `libaminfer` C-ABI, and `runM75WithConfig`;
+    `ReleaseFast` `aminfer bench-m75` passes with `swapouts_delta = 0`
+  - Offline Python `tools/` suite: `89/89` passing (`cd tools && uv run python -m unittest discover -s tests`)
+  - Zero-dependency Python `ctypes` SDK suite: `5/5` passing (`PYTHONPATH=python python3 -m unittest discover -s python/tests -v`)
+    and `aminfer-tools inspect-metadata` dry-run validation against live
     Hugging Face JSON metadata (no weight shards on disk):
     - `Qwen/Qwen3.8-Flash-Next` (`HTTP 200`, `13 MiB` in `/Volumes/Akari/models/metadata/Qwen__Qwen3.8-Flash-Next/`: `config.json` `4,745 B`, `tokenizer.json` `12.22 MiB`, `tokenizer_config.json` `9,984 B`, `model.safetensors.index.json` `170,726 B`): `48` layers (`36` GDN + `12` QSA), `hidden=2560`, `512` routed experts (top-10 + shared), `hc=4`, `128`-shard PLE at layer `2`, `1` MTP layer, `24,576 B/tok` FP16 KV + `108.0 MiB` FP32 GDN state, `1,658` tensors across `131` shards (`335.28 GiB` raw BF16, est `q3_affine` backbone `52.56 GiB`; `300` long `hyper_connection` names `> 47 B` flagged for canonical aliasing)
     - `deepseek-ai/DeepSeek-V4.1-Flash-1017` (`HTTP 200`, `15 MiB` in `/Volumes/Akari/models/metadata/deepseek-ai__DeepSeek-V4.1-Flash-1017/`: `config.json` `3,311 B`, `tokenizer.json` `6.07 MiB`, `tokenizer_config.json` `801 B`, `model.safetensors.index.json` `7.12 MiB`): `40` layers (`20` enc + `20` dec from `compress_ratios`), `hidden=5120`, `384` routed experts (top-6 + `1` shared, `fp8` + `fp4` `ue8m0`), `mHC=4`, Engram at layers `[1, 14]` (`768,022,850` rows), `3`-layer `128`-expert `mtp.*` DSpark head, `4,608 B/tok` BF16 / `1,256 B/tok` FP4 KV across 4 KV-source layers, `96,085` tensors across `48` shards (`475.24 GiB` raw, est `q3_affine` backbone `224.79 GiB`; `0` backbone names `> 47 B`; fits `512gb-ultra`, `tb5-cluster-4x128gb`, `tb5-cluster-2x256gb`)
@@ -872,14 +902,14 @@ Update this before the context window runs out or when handing off.
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22` per
-  [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md))
-  and **M7.8** (`G18`–`G21`, `C23`–`C24`: Metal 4 sublayer barrier fusion,
+- In flight: **M7.8** (`G18`–`G21`, `C23`–`C24`: Metal 4 sublayer barrier fusion,
   `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE dispatch,
   fused `248K`-vocab GPU radix constrained sampler + NEON JSON/BPE scanners, and
   ARMv9.2 SME2 `luti2` `2-bit` `.s` microkernels per
   [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))
-  are codified and planned next on M4. **M6.9** (`G17`, `C16`, Spike `S8` per
+  is codified and planned next on M4. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`
+  per [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md))
+  is complete on M4 (`996782f..ddd90a4`). **M6.9** (`G17`, `C16`, Spike `S8` per
   [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))
   and **M7** (`R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3` per
   [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md) and
