@@ -969,11 +969,16 @@ Update this before the context window runs out or when handing off.
     `dspark.amf`, `config.json`, `dspark_config.json`, `tokenizer.json`)
   - Exported ANE `.mlpackage` bundles: `/Volumes/Akari/models/coreml/`
 - Session & `/swarm` operating conventions:
-  - Swarm models per user instruction: coding/integration workers use
-    `gemini-4-hydrogen-xhigh` and review/verifier/monitor workers use
-    `gemini-4-neon-xhigh` (never `claude-*` or `gpt-*`); commits stay local
-    (do not `git push` unless explicitly requested) and run `ikat sync` after
-    every commit
+  - 3-tier swarm model hierarchy per user instruction (`0` `claude-*` / `gpt-*`):
+    - **Top tier (`gemini-4-carbon-high`, effort `high`)**: `coordinator`
+      (architecture, cross-module arbitration, merge orchestration) and final
+      milestone independent `verifier-*`
+    - **Middle tier (`gemini-4-neon-xhigh`, effort `xhigh`)**: subsystem /
+      Phase-2 engine integration (`*-engine`), code review, and `monitor`
+    - **Bottom tier (`gemini-4-hydrogen-xhigh`, effort `xhigh`)**: parallel
+      module / kernel / tool implementation workers (`workspace: "share"`)
+  - Commits stay local (do not `git push` unless explicitly requested) and run
+    `ikat sync` after every commit
 - In flight: **M8.1** (`W21`, `W22`, `W24`, `G23`, `G24`, `C25`) followed by
   **M8.2** (`W23`, `G25`, `D14`, `C26`) per
   [ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md)
