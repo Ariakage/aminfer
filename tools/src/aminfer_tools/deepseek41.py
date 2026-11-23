@@ -105,8 +105,8 @@ TIER_WIRED_BUDGET_BYTES: dict[str, int] = {
 # Soft safety cap preventing accidental multi-hundred-GiB synthetic file generation.
 DEFAULT_MAX_SYNTH_BYTES = 2 * (1024**3)
 
-_ENGRAM_LAYER_RE = re.compile(r"(?:^|\.)(?:engram\.layers|layers)\.(\d+)\.")
-_ENGRAM_SHARD_RE = re.compile(r"\.shard\.(\d+)\.")
+_ENGRAM_LAYER_RE = re.compile(r"(?:^|\.)(?:engram\.layers|layers)\.(\d+)(?:\.|$)")
+_ENGRAM_SHARD_RE = re.compile(r"\.shard\.(\d+)(?:\.|$)")
 _DSPARK_PREFIXES = ("dspark.", "model.dspark.", "language_model.dspark.", "language_model.model.dspark.")
 
 

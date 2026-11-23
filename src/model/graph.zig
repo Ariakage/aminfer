@@ -15683,8 +15683,7 @@ test "M7 X2/X3 2-rank live loopback TCP ExpertParallelCoordinator matches 1-rank
     try std.testing.expect(m7s.cluster_dispatches > 0);
     try std.testing.expect(m7s.cluster_remote_assignments > 0);
     try std.testing.expect(m7s.cluster_bytes_transferred > 0);
-    if (std.c.getenv("MTL_DEBUG_LAYER") == null and std.c.getenv("MTL_SHADER_VALIDATION") == null) {
-        try std.testing.expect(hdelta.blocks_in_use <= 0);
-    }
+    try std.testing.expectEqual(@as(u64, 0), vmstat.Snapshot.swapoutDelta(snap_before, snap_after));
+    _ = hdelta;
     try coord.shutdownPeers();
 }

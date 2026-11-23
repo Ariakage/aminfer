@@ -3936,8 +3936,11 @@ kernel void ami_mla_csa2_attend(const device half *q_nope [[buffer(0)]],
     const uint swa_lo = (p.swa_window > 0u)
         ? ((eff_kv_len > p.swa_window) ? (eff_kv_len - p.swa_window) : 0u)
         : eff_kv_len;
-    const uint ring_valid_lo = (p.swa_ring_capacity > 0u && raw_kv_len > p.swa_ring_capacity)
-        ? (raw_kv_len - p.swa_ring_capacity)
+    const uint tree_anc = (p.has_tree != 0u) ? uint(popcount(ancestor_masks[node])) : 0u;
+    const uint depth_above_root = (tree_anc > 1u) ? (tree_anc - 1u) : 0u;
+    const uint eff_ring_pos = raw_kv_len + depth_above_root;
+    const uint ring_valid_lo = (p.swa_ring_capacity > 0u && eff_ring_pos > p.swa_ring_capacity)
+        ? (eff_ring_pos - p.swa_ring_capacity)
         : 0u;
 
     const float scale_log2e = p.scale * 1.4426950408889634f;

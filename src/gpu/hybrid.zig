@@ -5605,11 +5605,6 @@ pub fn mlaCsa2AttendCpuRef(
         .f16 => @as(usize, qk_rope_dim) * 2,
         .e4m3 => qk_rope_dim,
     };
-    const ring_valid_lo: u32 = if (swa_ring_capacity > 0 and kv_len > swa_ring_capacity)
-        kv_len - swa_ring_capacity
-    else
-        0;
-
     var kv_lat_tmp: [MAX_MLA_LATENT_DIM]f32 = undefined;
     var kv_rope_tmp: [MAX_MLA_ROPE_DIM]f32 = undefined;
 
@@ -5618,6 +5613,13 @@ pub fn mlaCsa2AttendCpuRef(
             @min(kv_len, @max(encoder_prefix_len, q0 + @as(u32, @intCast(node)) + 1))
         else
             kv_len;
+        const tree_anc: u32 = if (ancestor_masks) |ms| @popCount(ms[node]) else 0;
+        const depth_above_root: u32 = if (tree_anc > 1) tree_anc - 1 else 0;
+        const eff_ring_pos: u32 = kv_len + depth_above_root;
+        const ring_valid_lo: u32 = if (swa_ring_capacity > 0 and eff_ring_pos > swa_ring_capacity)
+            eff_ring_pos - swa_ring_capacity
+        else
+            0;
         const swa_hi: u32 = eff_kv_len;
         const swa_lo: u32 = if (swa_window > 0)
             (if (eff_kv_len > swa_window) eff_kv_len - swa_window else 0)
