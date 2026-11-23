@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-**M7.8 (`W20`, `G18`–`G22`, `C23`–`C24`; [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))**: **Planned next** — **M7.8** delivers native Metal 4 sublayer/epilogue fusion (`4–5` fewer dispatch barriers/layer), hardware `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE threadgroup dispatch, fused `248K`-vocab GPU radix constrained sampling + ARM64 NEON JSON/BPE vector scanning, ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels, and full multi-layer Vision Transformer (`ViT`) tower + 2-layer `PatchMerger`/`Aligner` MLP packing and Metal 4 / CoreML ANE execution (`W20`, `G22`), gated by explicit occupancy/crossover non-regression checks. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)) is **Completed** and verified on M4 ([benchmarks/results.md](benchmarks/results.md#m75-native-cpython-sdk-full-httpsse-protocol-parity-rootless-tui-monitor-and-local-ergonomics)). **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
+**M7.8 (`W20`, `G18`–`G22`, `C23`–`C24`; [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))**: **Planned next** — **M7.8** delivers native Metal 4 sublayer/epilogue fusion (`4–5` fewer dispatch barriers/layer), hardware `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE threadgroup dispatch, fused `248K`-vocab GPU radix constrained sampling + ARM64 NEON JSON/BPE vector scanning, ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels, and full multi-layer Vision Transformer (`ViT`) tower + 2-layer `PatchMerger`/`Aligner` MLP packing and Metal 4 / CoreML ANE execution (`W20`, `G22`), gated by explicit occupancy/crossover non-regression checks. **M8** (`W21`–`W24`, `G23`–`G25`, `D14`, `C25`–`C26`; [ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md)) is **Planned** after `M7.8` for zero-loss native `FP8`/`MXFP8`/`NVFP4`/`MLX`/`GGUF` compatibility, end-to-end `Inkling-2-Mini` on `24 GB` M4, and `Inkling 2` / `Hy4` family operators + `DFlare`/`DFly2` drafting. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)) is **Completed** and verified on M4 ([benchmarks/results.md](benchmarks/results.md#m75-native-cpython-sdk-full-httpsse-protocol-parity-rootless-tui-monitor-and-local-ergonomics)). **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
 
 ## Milestones
 
@@ -30,6 +30,7 @@ Status-row IDs refer to [status.md](status.md).
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV (`890 B/tok`), Single-Pass Mega-mHC, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA / TB4 TCP expert parallelism verified on M4 loopback cluster (`b2034c2..69d30af`); physical multi-Mac TB5 RDMA HCA transport and full 552B + 196B execution gated on 512 GB Ultra or multi-Mac TB5 RDMA hardware | In progress (code and M4 loopback cluster verified; 512 GB Ultra / TB5 RDMA HW pending) |
 | M7.5 | Native C/Python SDK, full HTTP/SSE protocol parity, rootless TUI monitor & local ergonomics | R10, W18, W19, C17–C22 | `libaminfer.dylib` + `include/aminfer.h` + zero-dependency Python `ctypes` SDK (`python/aminfer/`); full `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (+ `count_tokens`, `--api-key`, `--unix-socket`); rootless `aminfer monitor` TUI (`trans-pride` + `--theme`); single-file `.amf` metadata (`ls`/`inspect`); scrolling `aminfer chat` REPL + `stdin` pipe; `/v1/embeddings` & `/v1/rerank`; zero-alloc `json_schema`/GBNF bitmask engine; runtime multi-LoRA routing; opt-in `--disk-prefix-cache` NVMe persistence verified with zero hot-path alloc and zero swap | Completed |
 | M7.8 | Native Metal 4 sublayer barrier fusion, MMA FlashAttention-2, GPU indirect MoE dispatch, full ViT vision encoder tower & NEON/SME2 accelerators | W20, G18–G22, C23–C24 | Fused `o_proj`/`down_proj` `+= residual` epilogues, `ami_fused_residual_rmsnorm`, and homogeneous-`DType` `ami_fused_qkv` + `ami_dense_gate_up_swiglu` (`0` stack spill); `simdgroup_half8x8` (`Apple9`) + `NAX` (`Apple10+`) FlashAttention-2 prefill (`Q_len >= 32`, `KV_len >= 64` gated); `MTLDispatchThreadgroupsIndirectArguments` MoE dispatch (`M > 1` & multi-scheme `G13`); fused `248K`-vocab GPU radix constrained sampler + 16/64-byte NEON JSON/BPE scanning; ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels (`0` `[sp` spills); full multi-layer bidirectional 2D-RoPE `ViT` tower + 2-layer `PatchMerger`/`Aligner` MLP + AnyRes tiling (`W20`, `G22`) benchmarked in `aminfer bench-m78` with zero M4 decode/prefill regression and zero swap | Planned |
+| M8 | Zero-loss quantized-format parity (`FP8`/`MXFP8`/`NVFP4`/`GGUF`/`MLX`), `Inkling-2-Mini` on `24 GB` M4, and `Inkling 2` + `Hy4` family adaptation | W21–W24, G23–G25, D14, C25–C26 | Native `.amf` dtypes & register-dequant Metal/`SME2` kernels (`fp8_e4m3_block`/`_row`/`_tensor`, `mxfp8_g32`, `nvfp4_g16`, MLX `5/6/8-bit` `g32`/`g128`); lossless offline `GGUF` -> `.amf` repacker rejecting colliding fork type IDs (`STQ1_0` vs `F8_E4M3`); opt-in `--act-quant emulate` & `W24` `KL`/top-1 quality gate; `o200k`/`ignore_merges` + `Hy4` tokenizers and pluggable `ChatTemplate` replacing hardcoded ChatML; `Inkling-2-Mini` end-to-end on `24 GB` M4 (`<= 17.76 GiB` wired + cold-expert NVMe, `0` swap); `Inkling 2` & `Hy4` operators (`sconv`, low-rank rel-attn, softcaps, `IndexCache`/`IndexPool`, `LatentMoE`, `DFlare`/`DFly2`) verified on `hy4-preview-tiny-random` & synthetic suites (`Small`/`Hy4`/`Hy4-flash` full runs hardware-gated) | Planned |
 
 ## Spikes
 
@@ -712,6 +713,25 @@ per-step bitmask eval, `0` per-step heap alloc), and full three-endpoint
 HTTP/SSE protocol parity (`C18`, `/v1/chat/completions`, `/v1/responses`,
 `/v1/messages` + `count_tokens`, `--api-key`, `--unix-socket`).
 
+Following `M7.5` and Hugging Face checkpoint/header verification (`Inkling 2` and
+`Hy4` safetensors, tokenizers, chat templates, `FP8`/`MXFP8`/`NVFP4` scale
+granularities, and GGUF per-tensor type scans), the user confirmed
+[ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md),
+scheduling Milestone **M8** (`W21`–`W24`, `G23`–`G25`, `D14`, `C25`–`C26`)
+after `M7.8`: zero-loss native `.amf` dtypes and Metal/SME2 register
+dequantization (`fp8_e4m3_block` `128×128` `F32`/`BF16`, `fp8_e4m3_row`,
+`mxfp8_g32`, `nvfp4_g16`, MLX `5/6/8-bit` `g32`/`g128`), a pure-stdlib lossless
+offline `GGUF` -> `.amf` repacker rejecting colliding fork type IDs (such as
+`AngelSlim` `STQ1_0` overloading upstream `GGML_TYPE_F8_E4M3 = 43`), opt-in
+`--act-quant emulate` (`G24`), imatrix-aware sub-4-bit protection paired with a
+mandatory `KL`/top-1 capability gate (`W24`), `o200k`/`ignore_merges` + `Hy4`
+tokenizers and pluggable chat templates replacing hardcoded ChatML, end-to-end
+`Inkling-2-Mini` (`24L` recurrent + NVMe cold experts, plus `Q8_0`/`BF16`
+`dflash`) on the `24 GB` M4 baseline, and `Inkling 2` / `Hy4` operators +
+`DFlare`/`DFly2` block-parallel drafting (`D14`), with full-scale
+`Inkling-2-Small`, `Hy4-preview`, `Hy4`, and `Hy4-flash` runs hardware-gated
+on `128–512 GB` / `TB5` clusters.
+
 ## Session handoff snapshot
 
 Update this before the context window runs out or when handing off.
@@ -910,7 +930,12 @@ Update this before the context window runs out or when handing off.
   scanners, ARMv9.2 SME2 `luti2` `2-bit` `.s` microkernels, and full multi-layer
   bidirectional 2D-RoPE `ViT` tower + 2-layer `PatchMerger`/`Aligner` MLP per
   [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))
-  is codified and planned next on M4. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`
+  is codified and planned next on M4; **M8** (`W21`–`W24`, `G23`–`G25`, `D14`,
+  `C25`–`C26` per
+  [ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md):
+  zero-loss `FP8`/`MXFP8`/`NVFP4`/`GGUF`/`MLX` parity, end-to-end
+  `Inkling-2-Mini` on `24 GB` M4, and `Inkling 2` / `Hy4` family operators +
+  `DFlare`/`DFly2`) is codified and planned following `M7.8`. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`
   per [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md))
   is complete on M4 (`996782f..ddd90a4`). **M6.9** (`G17`, `C16`, Spike `S8` per
   [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))
@@ -943,4 +968,5 @@ Update this before the context window runs out or when handing off.
   [decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md](decisions/0020-wide-gpu-prefill-tail-pruning-qos-and-live-ram-guards.md),
   [decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md),
   [decisions/0022-native-c-python-sdk-and-full-protocol-parity.md](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md),
-  [decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md)
+  [decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md),
+  [decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md)

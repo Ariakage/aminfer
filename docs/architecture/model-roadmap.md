@@ -35,7 +35,9 @@ matching M1/M2 `.amf` packing).
 | --- | --- | --- | --- | --- |
 | **Tier 1** (M2–M5, incl. M2.5 FP16/BF16) | `Qwen3-30B-A3B` (3-bit / BF16), `Qwen3-14B` (4-bit / BF16), `Qwen3-0.6B`–`8B` (BF16 / FP16); extensible to Llama 3/4, Mistral, Gemma, DeepSeek-V2/V3 | 0.6B–30.5B (3B active MoE; 0.6B–14B dense) | ~12.4 GiB (30B-3bit), ~7.5 GiB (14B-4bit), ~1.2–15.3 GiB (0.6B–8B BF16) | **24 GB M4 baseline** (30B-3bit, 14B-4bit, ≤8B BF16/FP16 fully wired) · **36–128 GB+ Macs** (14B/30B BF16/FP16 fully wired, [ADR-0016](../decisions/0016-native-fp16-bf16-and-multishard-import.md)) |
 | **Tier 2** (M6) | **`Qwen3.8-Flash-Next`** (`qwen4_exp`) | 125B backbone (6B active/tok) + 51B PLE + 4B MTP | ~54.7 GiB backbone + NVMe-sharded PLE | **128 GB+ Max / Ultra** (full backbone wired) · **24 GB M4** (wired hot set + NVMe cold experts & PLE via ANE prediction + E-core async I/O) |
+| **Tier 2B** (M8) | **`Inkling-2-Mini`** (`inkling2_loop`, 24L × 3 core passes, 128E top-8) | ~26.4B params (`~5.4B` eff. active; `NVFP4`/`MXFP8` + `0.59 GiB` ViT + `0.59 GiB` DFlare) | `18.18 GiB` native (`~17.6 GiB` excl. ViT); `10.9 GiB` (`UD-IQ3_XXS`) / `16.4 GiB` (`UD-Q4_K_XL`) | **24 GB M4 baseline** (native `NVFP4`/`MXFP8` with selective cold-expert NVMe spill, or `UD-IQ3_XXS`/`UD-Q4_K_XL` / MLX `4-bit` within `17.76 GiB` wired limit) |
 | **Tier 3** (M7 / Future) | **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`) | 552B CED MoE (8B prefill / 16B decode) + 196B Engram (~748B total) | ~241.5 GiB backbone + ~86 GiB Engram (>330 GiB on disk; ~7.0 GiB/tok decode reads) | **512 GB Ultra** (full backbone wired on 800 GB/s bus) · **Multi-Mac 128–256 GB Thunderbolt 5 RDMA cluster** (`thunderbolt_peer`); **not viable on 24 GB M4** (< 0.7 tok/s NVMe bound) |
+| **Tier 3B** (M8 / HW-gated) | **`Inkling-2-Small`** (`inkling2`), **`Hy4-flash`** (`hy_v4_flash`), **`Hy4` / `Hy4-preview`** (`hy_v4*`) | Small: 48L `384E` top-8 (`363.27 GiB` native); Hy4-flash: `220B` / `11.3B` text active incl. `63.5B` Engram; Hy4/preview: `770B` / `49B` active | Small `78.7–118.8 GiB` (`2-bit`/`IQ1_S`), `318–354 GiB` `4-bit`; Hy4-flash `76.3 GiB` (`MLX 3.5b`), `150 GiB` (`NVFP4`), `267 GiB` (`FP8`); Hy4 `219 GiB` (`IQ1_M`), `404–457 GiB` (`4b`/`NVFP4`), `732–758 GiB` (`FP8`/`MXFP8`) | Small `2-bit` / Hy4-flash `3.5-bit` on **128 GB+ Max**; Hy4-flash `Q4_K_M`/`NVFP4` on **256 GB**; Small native, Hy4-flash `FP8` & Hy4 `IQ1_M` on **512 GB Ultra**; Hy4 `4-bit`/`NVFP4`/`FP8` on **TB5 cluster** (`hy4-preview-tiny-random` on **24 GB M4**) |
 
 ### Optional GSQ-RCO footprint reduction across Tiers 1–3
 
@@ -181,3 +183,38 @@ interleaved MRoPE (`G14`).
    ([ADR-0003](../decisions/0003-expert-source-tagged-union.md)) to partition
    the 552B MoE experts across multi-Mac clusters when a single 512 GB node is
    not used.
+
+## Quantized-format parity, `Inkling 2` and `Hy4` extensions (`ADR-0024`)
+
+Milestone `M8` ([ADR-0024](../decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md),
+capabilities `W21`–`W24`, `G23`–`G25`, `D14`, `C25`–`C26` in
+[../status.md](../status.md)) extends both weight-format parity and the model
+operator axes without sacrificing runtime alignment or conversion fidelity:
+
+- **Native multi-format `.amf` + zero-loss offline `GGUF` repacking (`W21`,
+  `W22`, `G23`, `G24`, `C25`):** Add native `.amf` dtypes and bit-exact Metal 4
+  register-dequant (`+ SME2`) kernels for `fp8_e4m3_block` (`128×128` `F32`/`BF16`
+  inverse scales), `fp8_e4m3_row`, `fp8_e4m3_tensor`, `mxfp8_g32` (`UE8M0`),
+  `nvfp4_g16` (`E2M1` + `E4M3` + per-tensor/expert `F32`), MLX `q5`/`q6`/`q8_affine`
+  with `group_size in {32, 64, 128}`, and standard upstream `GGUF` types (`Q*`,
+  `K`-quants, `IQ*` codebooks in threadgroup SRAM, `TQ1_0`/`TQ2_0`, `MXFP4`,
+  `NVFP4` id `40`, `Q2_0` id `42`, `F8_E4M3` id `43`), rejecting colliding or
+  custom fork encodings (such as AngelSlim `type 43` `STQ1_0` at `1.312 bpw`,
+  `VQ-GGUF`, and `EXL3`) via byte-length validation and gating all new profiles
+  through opt-in `--act-quant emulate` and `W24` `KL`/top-1 quality checks.
+- **`Inkling 2` (`inkling2`, `inkling2_loop`)**: Reuses `LoopSchedule` (3-pass
+  recurrent core `layers 6..17` + cross-pass / rank-64 controllers) and
+  `HybridKvRing` SWA, adding `k = 4` static and global dynamic `sconv`,
+  low-rank relative-position attention (`d_rel = 16`, `rel_extent = 1024`),
+  `q/rel_l2_clip`, `log_scaling`, `attn_sink_proj`, `gate_attn`, `attn_res`,
+  softcaps (`4`/`25`/`30`), router `bias + route_scale`, `o200k`/`ignore_merges`
+  tokenization, pluggable chat templates, `23L` ViT (`W20`/`G22`), and `DFlare`
+  drafting (`D14`). `Inkling-2-Mini` runs locally on the `24 GB` M4 baseline.
+- **`Hy4` family (`hy_v4`, `hy_v4_vl`, `hy_v4_flash`)**: Reuses `G7` `512`-expert
+  MoE, `G10` `4`-stream iHC/mHC, `G11` MLA + FP4 KV, `C10` NVMe Engram
+  streaming (`F8_E4M3` row-scaled or BF16), and `W20`/`G22` `40L`/`27L` AnyRes
+  `ViT`, adding `IndexCache` period-4 sharing, `IndexPool` compressed indexers,
+  `LatentMoE`, sigmoid routing with correction bias, `linear_gate`,
+  `learnable_sink_param`, `swiglu_limit = 10`, `sandwich_norm`, and `5L` `DFly2`
+  block-parallel drafting (`D14`), parity-validated locally on
+  `yujiepan/hy4-preview-tiny-random` (`21 MB`).

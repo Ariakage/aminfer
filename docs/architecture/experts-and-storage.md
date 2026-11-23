@@ -96,6 +96,14 @@ they cannot be read straight into wired slots. v0 layout (`src/format/amf.zig`):
     opt-in offline GSQ + RCO per-tensor / per-expert hybrid quantization
     (`--quant-profile gsq-rco`, with `--quant-profile uniform` remaining the
     default).
+  - **Planned native multi-format & lossless GGUF offline repack (M8)**
+    (capabilities `W21` / `W22` in [../status.md](../status.md),
+    [ADR-0024](../decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md)):
+    extending `DType` / `QuantScheme` with `fp8_e4m3_block` / `_row` /
+    `_tensor`, `mxfp8_g32`, `nvfp4_g16`, MLX `q5`/`q6`/`q8_affine` (`g32`/`g64`/
+    `g128`), and a pure-stdlib offline `GGUF` -> `.amf` repacker (rejecting
+    colliding or custom fork type IDs by byte-length validation), keeping zero
+    double quantization and strict `16 KiB` `.amf` alignment at runtime.
 
 ## Optional GSQ-RCO quantization
 
