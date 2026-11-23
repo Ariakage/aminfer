@@ -30,7 +30,7 @@ import re
 import struct
 import zlib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
@@ -67,12 +67,19 @@ from aminfer_tools.amf import (
     encode_reserved0,
     f16_bytes_to_bf16_bytes,
     interleave_scale_bias_f16,
+    VISION_BLOCK_DTYPES,
+    extract_vision_config_summary,
+    gsq_convert_with_vision,
+    is_vision_block_linear,
+    is_vision_pinned_float,
     is_vision_tensor,
     load_cold_experts_from_heat_profile,
     pack_mlx_affine_3bit,
     pack_mlx_affine_4bit,
+    pack_vision_tower_amf,
     plan_amf_entries,
     resolve_checkpoint,
+    resolve_vision_mode,
 )
 from aminfer_tools.qwen4_exp import _slice_row_byte_range, _split_row_ranges
 from aminfer_tools.synth import (
@@ -1327,6 +1334,9 @@ class DeepSeek41ConvertReport:
     partition_report: ExpertPartitionReport | None
     tier_check: HardwareTierCheck
     stripped_vision_tensors: int
+    vision_amf: pathlib.Path | None = None
+    vision_metas: list[PackedTensorMeta] = field(default_factory=list)
+    included_vision_tensors: int = 0
 
 
 def _decode_row_to_f32(raw_row: bytes, src_dtype: str) -> list[float]:
@@ -1572,6 +1582,7 @@ def _write_backbone_stream(
     *,
     quantize_float_bits: int = 0,
     group_size: int = 64,
+    vision_block_dtype: str = "auto",
 ) -> list[PackedTensorMeta]:
     """Stream planned backbone entries to `output_path`, optionally quantizing 2D float weights."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1591,8 +1602,29 @@ def _write_backbone_stream(
         cursor = dir_offset + dir_bytes
 
         for e in entries:
+            is_vis = is_vision_tensor(e.name)
+            vis_pinned = is_vision_pinned_float(e.name, e.shape)
+            vis_block = is_vision_block_linear(e.name, e.shape)
+
+            eff_bits = quantize_float_bits
+            if is_vis:
+                if vis_pinned:
+                    eff_bits = 0
+                elif vis_block:
+                    if vision_block_dtype in ("f16", "bf16"):
+                        eff_bits = 0
+                    elif vision_block_dtype == "q4_affine":
+                        eff_bits = 4
+                    elif quantize_float_bits in (3, 4):
+                        # W20 invariant: vision blocks stay in f16/bf16/q4_affine (never <= 3-bit).
+                        eff_bits = 4
+                    else:
+                        eff_bits = 0
+                else:
+                    eff_bits = 0
+
             should_quant = (
-                quantize_float_bits in (3, 4)
+                eff_bits in (3, 4)
                 and e.quant_bits == 0
                 and e.kind in quant_kinds
                 and len(e.shape) == 2
@@ -1606,7 +1638,7 @@ def _write_backbone_stream(
                 if len(raw) != e.data.length:
                     raise EOFError(f"short read for {e.name!r}")
                 code_bytes, param_bytes = _quantize_2d_affine(
-                    raw, e.data.dtype, e.shape[0], e.shape[1], quantize_float_bits, group_size
+                    raw, e.data.dtype, e.shape[0], e.shape[1], eff_bits, group_size
                 )
                 params_offset = _align_up(len(code_bytes), 64)
                 blob_bytes = _align_up(params_offset + len(param_bytes), APPLE_PAGE_SIZE)
@@ -1617,14 +1649,14 @@ def _write_backbone_stream(
                 w.write(param_bytes)
                 if blob_bytes > w.written:
                     w.write(b"\x00" * (blob_bytes - w.written))
-                amf_dt = DType.Q3_AFFINE if quantize_float_bits == 3 else DType.Q4_AFFINE
+                amf_dt = DType.Q3_AFFINE if eff_bits == 3 else DType.Q4_AFFINE
                 q_name = e.name[: -len(".weight")] if e.name.endswith(".weight") else e.name
                 metas.append(
                     PackedTensorMeta(
                         name=q_name,
                         kind=e.kind,
                         dtype=amf_dt,
-                        quant_bits=quantize_float_bits,
+                        quant_bits=eff_bits,
                         group_size=group_size,
                         layer=e.layer,
                         expert=e.expert,
@@ -1744,7 +1776,10 @@ def convert_deepseek41_checkpoint(
     lut16_sme2: bool = False,
     tie_word_embeddings: bool | None = None,
     exclude_tensors: Iterable[str] = (),
-    strip_vision: bool = True,
+    strip_vision: bool | None = None,
+    include_vision: bool | None = None,
+    vision_sidecar: pathlib.Path | None = None,
+    vision_block_dtype: str = "auto",
     engram_output: pathlib.Path | None = None,
     engram_shards: int = 1,
     dspark_output: pathlib.Path | None = None,
@@ -1760,6 +1795,8 @@ def convert_deepseek41_checkpoint(
     """Streaming multi-shard safetensors converter for `DeepSeek-V4.1-Flash-1017` (`pack-deepseek41`).
 
     Supports `q3_affine`, `q4_affine`, `bf16`, and `--quant-profile gsq-rco`,
+    W20 vision-tower packing (`vision.*` + `aligner.*` + `image_*` via default
+    include, `--strip-vision`, or `--vision-sidecar vision.amf`),
     splits external `engram.*` tables into sharded `TensorKind.SPARSE_TABLE`
     `.amf` files, extracts optional `dspark.*` weights into `dspark.amf`, and
     validates ADR-0015 hardware-tier wired memory constraints before writing.
@@ -1772,6 +1809,8 @@ def convert_deepseek41_checkpoint(
         raise ValueError(f"quant_profile must be one of {QUANT_PROFILES}, got {quant_profile!r}")
     if sme2_pack not in SME2_PACK_MODES:
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
+    if vision_block_dtype not in VISION_BLOCK_DTYPES:
+        raise ValueError(f"vision_block_dtype must be one of {VISION_BLOCK_DTYPES}, got {vision_block_dtype!r}")
     if group_size != 64:
         raise ValueError(f"aminfer v0 supports group_size=64 only, got {group_size}")
     if engram_shards < 1:
@@ -1846,14 +1885,29 @@ def convert_deepseek41_checkpoint(
         )
 
     all_tensors = _collect_tensors(resolved.shard_paths)
+    vision_mode = resolve_vision_mode(
+        all_tensors.keys(),
+        include_vision=include_vision,
+        strip_vision=strip_vision,
+        vision_sidecar=vision_sidecar,
+    )
     stripped_vision = 0
+    included_vision = 0
+    vision_tensors: dict[str, _ShardTensor] = {}
     engram_tensors: dict[str, _ShardTensor] = {}
     dspark_tensors: dict[str, _ShardTensor] = {}
     backbone_tensors: dict[str, _ShardTensor] = {}
 
     for raw_name, st in all_tensors.items():
-        if strip_vision and is_vision_tensor(raw_name):
-            stripped_vision += 1
+        if is_vision_tensor(raw_name):
+            if vision_mode == "strip":
+                stripped_vision += 1
+                continue
+            if vision_mode == "sidecar":
+                vision_tensors[raw_name] = st
+                continue
+            included_vision += 1
+            backbone_tensors[raw_name] = st
             continue
         if is_engram_tensor(raw_name):
             engram_tensors[raw_name] = st
@@ -1893,6 +1947,26 @@ def convert_deepseek41_checkpoint(
     )
 
     out_path = pathlib.Path(output_path)
+
+    # 0. Pack standalone vision sidecar when requested.
+    vision_amf_path: pathlib.Path | None = None
+    vision_metas: list[PackedTensorMeta] = []
+    if vision_mode == "sidecar" and vision_sidecar is not None and vision_tensors:
+        vision_amf_path = pathlib.Path(vision_sidecar)
+        eff_vis_block_dt = vision_block_dtype
+        if eff_vis_block_dt == "auto" and target_dtype in ("q3_affine", "q4_affine"):
+            eff_vis_block_dt = "q4_affine"
+        vision_metas = pack_vision_tower_amf(
+            input_path,
+            vision_amf_path,
+            model_id=f"{model_id[:55]}-vision",
+            dtype_mode=eff_dtype_mode,
+            quant_profile=quant_profile,
+            vision_block_dtype=eff_vis_block_dt,
+            group_size=group_size,
+            use_rco=use_rco,
+            workers=workers,
+        )
 
     # 1. Pack external Engram SPARSE_TABLE shards when present.
     engram_paths: list[pathlib.Path] = []
@@ -1953,15 +2027,14 @@ def convert_deepseek41_checkpoint(
             readers,
             quantize_float_bits=quantize_bits,
             group_size=group_size,
+            vision_block_dtype=vision_block_dtype,
         )
     finally:
         readers.close()
 
     if quant_profile == "gsq-rco":
-        from aminfer_tools.gsq_rco import gsq_convert
-
         eff_target = 3.25 if target_bits is None else float(target_bits)
-        rep = gsq_convert(
+        backbone_metas = gsq_convert_with_vision(
             out_path,
             out_path,
             target_bits=eff_target,
@@ -1977,8 +2050,10 @@ def convert_deepseek41_checkpoint(
             use_rco=use_rco,
             manifest_path=manifest_path,
             workers=workers,
+            include_vision=(vision_mode == "include"),
+            strip_vision=(vision_mode != "include"),
+            vision_block_dtype=vision_block_dtype,
         )
-        backbone_metas = rep.metas
 
     # 4. Optional multi-rank expert-parallel shard export (`world_size > 1`).
     part_report: ExpertPartitionReport | None = None
@@ -2002,6 +2077,16 @@ def convert_deepseek41_checkpoint(
         out_cfg.setdefault("mhc_num_streams", 4)
         out_cfg.setdefault("memory_lookup_kind", "engram")
         out_cfg.setdefault("fp4_kv", True)
+        out_cfg["stripped_vision_tensors"] = stripped_vision
+        if vision_amf_path is not None:
+            vis_summary = extract_vision_config_summary(vision_metas, src_config=src_config)
+            vis_summary["mode"] = "sidecar"
+            vis_summary["amf_file"] = vision_amf_path.name
+            out_cfg["vision"] = vis_summary
+        elif included_vision > 0:
+            vis_summary = extract_vision_config_summary(backbone_metas, src_config=src_config)
+            vis_summary["mode"] = "embedded"
+            out_cfg["vision"] = vis_summary
         if engram_paths:
             out_cfg["engram_files"] = [p.name for p in engram_paths]
         if dspark_path is not None:
@@ -2039,6 +2124,9 @@ def convert_deepseek41_checkpoint(
         partition_report=part_report,
         tier_check=tier_check,
         stripped_vision_tensors=stripped_vision,
+        vision_amf=vision_amf_path,
+        vision_metas=vision_metas,
+        included_vision_tensors=included_vision,
     )
 
 

@@ -15,11 +15,16 @@ from aminfer_tools.amf import (
     QUANT_PROFILES,
     SME2_PACK_MODES,
     SME2_REPACK_TARGETS,
+    VISION_BLOCK_DTYPES,
     QuantParamKind,
+    SyntheticVitConfig,
     TensorLayout,
     embed_metadata_into_amf,
+    generate_synth_vit_amf,
+    gsq_convert_with_vision,
     load_cold_experts_from_heat_profile,
     pack_amf_from_safetensors,
+    pack_vision_tower_amf,
     repack_amf_sme2,
     retag_amf_cold_experts,
 )
@@ -49,11 +54,14 @@ from aminfer_tools import ngram as ngram_mod
 from aminfer_tools.coreml import (
     COREML_KINDS,
     COREML_OPS,
+    DEFAULT_VISION_TOKEN_BUCKETS,
     DRAFT_STAGES,
+    VISION_MLP_ACTS,
     compile_mlpackage,
     export_attention_qkv,
     export_draft_head,
     export_expert_predictor,
+    export_vision_tower,
 )
 from aminfer_tools.heat import DEFAULT_SAMPLE_TOKENS, compute_expert_heat, write_heat_profile
 from aminfer_tools.synth import (
@@ -237,9 +245,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Parallel worker processes for offline GSQ+RCO / LUT16 quantization (default: 1)",
     )
     pack.add_argument(
+        "--include-vision",
+        action="store_true",
+        help="Include vision tower tensors (default when visual.blocks.*/vision.blocks.* are present, W20)",
+    )
+    pack.add_argument(
+        "--strip-vision",
+        action="store_true",
+        help="Opt out of packing vision tower tensors and strip them from the output .amf (W20)",
+    )
+    pack.add_argument(
         "--no-strip-vision",
         action="store_true",
-        help="Keep visual.*/vision_tower.*/multi_modal_projector.* tensors instead of stripping them (W10)",
+        help="Alias for --include-vision: keep visual.*/vision.*/aligner.* tensors (W10/W20)",
+    )
+    pack.add_argument(
+        "--vision-sidecar",
+        type=pathlib.Path,
+        default=None,
+        help="Extract vision tower tensors into a standalone 16 KiB-aligned vision.amf sidecar (W20)",
+    )
+    pack.add_argument(
+        "--vision-block-dtype",
+        choices=VISION_BLOCK_DTYPES,
+        default="auto",
+        help="Precision policy for ViT block projections: auto, f16, bf16, or q4_affine (W20)",
     )
     pack.add_argument(
         "--ple-output",
@@ -368,7 +398,21 @@ def _build_parser() -> argparse.ArgumentParser:
     gsq.add_argument("--sample-rows", type=int, default=32, help="Rows sampled per tensor for GSQ scoring (default: 32)")
     gsq.add_argument("--manifest", type=pathlib.Path, default=None, help="Optional JSON allocation manifest path")
     gsq.add_argument("--workers", type=int, default=1, help="Parallel worker processes (default: 1)")
-    gsq.add_argument("--no-strip-vision", action="store_true", help="Keep vision tower tensors if present")
+    gsq.add_argument("--include-vision", action="store_true", help="Include vision tower tensors with W20 GSQ+RCO policy")
+    gsq.add_argument("--strip-vision", action="store_true", help="Strip vision tower tensors")
+    gsq.add_argument("--no-strip-vision", action="store_true", help="Alias for --include-vision")
+    gsq.add_argument(
+        "--vision-sidecar",
+        type=pathlib.Path,
+        default=None,
+        help="Extract vision tower into a standalone 16 KiB-aligned vision.amf sidecar (W20)",
+    )
+    gsq.add_argument(
+        "--vision-block-dtype",
+        choices=VISION_BLOCK_DTYPES,
+        default="auto",
+        help="Precision for ViT block projections under GSQ+RCO: auto (q4_affine), f16, bf16, or q4_affine",
+    )
 
     repack = sub.add_parser(
         "repack-sme2",
@@ -652,6 +696,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     pds41.add_argument("--allow-tier-override", action="store_true", help="Bypass ADR-0015 hardware-tier rejection (expert use)")
     pds41.add_argument("--workers", type=int, default=1, help="Worker threads for GSQ+RCO quantization")
+    pds41.add_argument("--include-vision", action="store_true", help="Include vision.* + aligner.* tensors (default for full ViT towers, W20)")
+    pds41.add_argument("--strip-vision", action="store_true", help="Strip vision.* + aligner.* tensors from output .amf")
+    pds41.add_argument("--no-strip-vision", action="store_true", help="Alias for --include-vision")
+    pds41.add_argument("--vision-sidecar", type=pathlib.Path, default=None, help="Extract vision.* + aligner.* into standalone vision.amf (W20)")
+    pds41.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto", help="Precision for ViT block projections (auto, f16, bf16, q4_affine)")
 
     part = sub.add_parser(
         "partition-experts",
@@ -813,13 +862,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     coreml = sub.add_parser(
         "export-coreml",
-        help="Export pure-stdlib CoreML .mlpackage bundles for the Apple Neural Engine (W7)",
+        help="Export pure-stdlib CoreML .mlpackage bundles for the Apple Neural Engine (W7, W20)",
     )
     coreml.add_argument(
         "--kind",
-        required=True,
+        default=None,
         choices=COREML_KINDS,
-        help="CoreML graph kind: expert-predictor (A2), attention-qkv (A1), or draft-head (D4/D5)",
+        help="CoreML graph kind: expert-predictor (A2), attention-qkv (A1), draft-head (D4/D5), or vision-tower (W20)",
+    )
+    coreml.add_argument(
+        "--component",
+        default=None,
+        choices=COREML_KINDS,
+        help="Alias for --kind (e.g. --component vision-tower for W20 ANE vision tower export)",
     )
     coreml.add_argument(
         "--output",
@@ -919,6 +974,59 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output width for synthetic draft-head linear/fc stage",
     )
     coreml.add_argument(
+        "--token-buckets",
+        default=None,
+        help="Comma-separated static token buckets for vision-tower (default: 64,256,576)",
+    )
+    coreml.add_argument(
+        "--num-vision-layers",
+        type=int,
+        default=4,
+        help="Synthetic vision-tower layer count when --amf is omitted (default: 4)",
+    )
+    coreml.add_argument(
+        "--vision-hidden-size",
+        type=int,
+        default=128,
+        help="Synthetic vision-tower hidden width when --amf is omitted (default: 128)",
+    )
+    coreml.add_argument(
+        "--vision-intermediate-size",
+        type=int,
+        default=256,
+        help="Synthetic vision-tower MLP intermediate width when --amf is omitted (default: 256)",
+    )
+    coreml.add_argument(
+        "--out-hidden-size",
+        type=int,
+        default=128,
+        help="Synthetic PatchMerger/Aligner LM output width when --amf is omitted (default: 128)",
+    )
+    coreml.add_argument(
+        "--spatial-merge-size",
+        type=int,
+        default=2,
+        help="Spatial patch merge factor for vision-tower (default: 2)",
+    )
+    coreml.add_argument(
+        "--patch-size",
+        type=int,
+        default=14,
+        help="Vision patch size recorded in CoreML metadata (default: 14)",
+    )
+    coreml.add_argument(
+        "--t-patch",
+        type=int,
+        default=1,
+        help="Temporal patch tube depth recorded in CoreML metadata (default: 1)",
+    )
+    coreml.add_argument(
+        "--mlp-act",
+        choices=VISION_MLP_ACTS,
+        default="gelu",
+        help="Vision-tower MLP activation for synthetic export: gelu (default) or swiglu",
+    )
+    coreml.add_argument(
         "--verify-compile",
         type=pathlib.Path,
         default=None,
@@ -963,7 +1071,40 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     plora.add_argument("--seed", type=int, default=42, help="Synthetic PRNG seed (default: 42)")
     plora.add_argument("--zero-init-b", action="store_true", help="Zero-initialize synthetic lora_b matrices")
+
+    svit = sub.add_parser(
+        "synth-vit",
+        help="Synthesize a deterministic multi-layer ViT + PatchMerger/Aligner standalone vision.amf bundle (W20)",
+    )
+    svit.add_argument("--output", required=True, type=pathlib.Path, help="Output vision.amf path")
+    svit.add_argument("--family", choices=("qwen_vl", "deepseek_v41"), default="qwen_vl", help="Vision tower family")
+    svit.add_argument("--num-layers", type=int, default=4, help="Number of ViT encoder blocks (default: 4)")
+    svit.add_argument("--vision-hidden-size", type=int, default=128, help="ViT hidden width (default: 128)")
+    svit.add_argument("--vision-intermediate-size", type=int, default=256, help="ViT MLP width (default: 256)")
+    svit.add_argument("--out-hidden-size", type=int, default=128, help="LM output hidden width (default: 128)")
+    svit.add_argument("--patch-size", type=int, default=14, help="Patch size (default: 14)")
+    svit.add_argument("--spatial-merge-size", type=int, default=2, help="Spatial merge size (default: 2)")
+    svit.add_argument("--mlp-act", choices=VISION_MLP_ACTS, default="gelu", help="MLP activation (gelu or swiglu)")
+    svit.add_argument("--dtype", choices=("bf16", "f16"), default="bf16", help="Base float dtype (default: bf16)")
+    svit.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform", help="uniform or gsq-rco")
+    svit.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto", help="Vision block precision")
+    svit.add_argument("--model-id", default="synth-vit-tower", help="Model identifier stored in .amf header")
+    svit.add_argument("--seed", type=int, default=42, help="Deterministic PRNG seed (default: 42)")
+    svit.add_argument("--embed-metadata", action="store_true", help="Embed vision_config JSON inside __meta.config_json")
     return parser
+
+
+def _resolve_cli_vision_flags(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> tuple[bool | None, bool | None]:
+    inc = True if (getattr(args, "include_vision", False) or getattr(args, "no_strip_vision", False)) else None
+    strip = True if getattr(args, "strip_vision", False) else None
+    if inc is True and strip is True:
+        parser.error("cannot specify both --include-vision/--no-strip-vision and --strip-vision")
+    if strip is True and getattr(args, "vision_sidecar", None) is not None:
+        parser.error("cannot specify both --strip-vision and --vision-sidecar")
+    return inc, strip
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -975,6 +1116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "pack-amf":
         cold = _parse_cold_experts(args.cold_experts)
         excludes = _parse_csv(args.exclude_tensors)
+        inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
         started = time.monotonic()
         use_qwen4_pipeline = (
             args.ple_output is not None
@@ -1005,7 +1147,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 use_rco=not args.no_rco,
                 manifest_path=args.manifest,
                 workers=args.workers,
-                strip_vision=not args.no_strip_vision,
+                strip_vision=strip_vis,
+                include_vision=inc_vis,
+                vision_sidecar=args.vision_sidecar,
+                vision_block_dtype=args.vision_block_dtype,
                 ple_output=args.ple_output,
                 ple_shards=args.ple_shards,
                 mtp_output=args.mtp_output,
@@ -1024,6 +1169,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     output_path=args.output,
                 )
             stripped_vision = rep_q4.stripped_vision_tensors
+            if rep_q4.vision_amf_path is not None:
+                extra_notes.append(f"vision_sidecar={len(rep_q4.vision_metas)}")
+            elif rep_q4.included_vision_tensors > 0:
+                extra_notes.append(f"vision_tensors={rep_q4.included_vision_tensors}")
             if rep_q4.ple_shard_paths:
                 extra_notes.append(f"ple_shards={len(rep_q4.ple_shard_paths)}")
             if rep_q4.mtp_amf_path is not None:
@@ -1051,13 +1200,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 use_rco=not args.no_rco,
                 manifest_path=args.manifest,
                 workers=args.workers,
-                strip_vision=not args.no_strip_vision,
+                strip_vision=strip_vis,
+                include_vision=inc_vis,
+                vision_sidecar=args.vision_sidecar,
+                vision_block_dtype=args.vision_block_dtype,
                 embed_metadata=args.embed_metadata,
                 config_path=args.config,
                 tokenizer_path=args.tokenizer,
                 stats_out=stats_map,
             )
             stripped_vision = stats_map.get("stripped_vision_tensors", 0)
+            if stats_map.get("sidecar_vision_tensors", 0) > 0:
+                extra_notes.append(f"vision_sidecar={stats_map['sidecar_vision_tensors']}")
+            elif stats_map.get("included_vision_tensors", 0) > 0:
+                extra_notes.append(f"vision_tensors={stats_map['included_vision_tensors']}")
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
         by_dtype: dict[str, int] = {}
@@ -1086,7 +1242,64 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "gsq-convert":
         cold = _parse_cold_experts(args.cold_experts)
         excludes = _parse_csv(args.exclude_tensors)
+        inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
         started = time.monotonic()
+        use_vision_wrapper = (
+            inc_vis is True
+            or args.vision_sidecar is not None
+            or args.vision_block_dtype != "auto"
+            or (strip_vis is None)
+        )
+        if use_vision_wrapper:
+            vis_stats: dict[str, int] = {}
+            metas = gsq_convert_with_vision(
+                args.input,
+                args.output,
+                target_bits=args.target_bits,
+                model_id=args.model_id,
+                group_size=args.group_size,
+                dtype_mode=args.dtype,
+                heat_profile=args.heat_profile,
+                cold_experts=cold,
+                cold_experts_per_layer=args.cold_experts_per_layer,
+                all_experts_cold=args.all_experts_cold,
+                tie_word_embeddings=args.tie_word_embeddings,
+                exclude_tensors=excludes,
+                sme2_pack=args.sme2_pack,
+                lut16_sme2=args.lut16_sme2,
+                use_rco=not args.no_rco,
+                rco_iters=args.rco_iters,
+                lloyd_iters=args.lloyd_iters,
+                sample_rows=args.sample_rows,
+                manifest_path=args.manifest,
+                workers=args.workers,
+                strip_vision=strip_vis,
+                include_vision=inc_vis,
+                vision_sidecar=args.vision_sidecar,
+                vision_block_dtype=args.vision_block_dtype,
+                stats_out=vis_stats,
+            )
+            elapsed = time.monotonic() - started
+            total_bytes = args.output.stat().st_size
+            by_dtype: dict[str, int] = {}
+            lut16_cnt = 0
+            for m in metas:
+                by_dtype[m.dtype.name.lower()] = by_dtype.get(m.dtype.name.lower(), 0) + 1
+                if m.quant_param_kind == QuantParamKind.LUT16_CODEBOOK:
+                    lut16_cnt += 1
+            dtype_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_dtype.items()))
+            lut_note = f", lut16_codebook={lut16_cnt}" if lut16_cnt > 0 else ""
+            vis_note = ""
+            if vis_stats.get("sidecar_vision_tensors", 0) > 0:
+                vis_note = f", vision_sidecar={vis_stats['sidecar_vision_tensors']}"
+            elif vis_stats.get("included_vision_tensors", 0) > 0:
+                vis_note = f", vision_tensors={vis_stats['included_vision_tensors']}"
+            print(
+                f"gsq-converted {len(metas)} tensors into {args.output} ({total_bytes} bytes, "
+                f"target={args.target_bits:.2f}b, rco={'on' if not args.no_rco else 'off'}{lut_note}{vis_note}) "
+                f"in {elapsed:.1f} s [{dtype_summary}]"
+            )
+            return 0
         rep = gsq_convert(
             args.input,
             args.output,
@@ -1108,7 +1321,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sample_rows=args.sample_rows,
             manifest_path=args.manifest,
             workers=args.workers,
-            strip_vision=not args.no_strip_vision,
+            strip_vision=True,
         )
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
@@ -1200,7 +1413,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "export-coreml":
         started = time.monotonic()
-        if args.kind == "expert-predictor":
+        if args.kind is not None and args.component is not None and args.kind != args.component:
+            parser.error(f"conflicting --kind {args.kind!r} and --component {args.component!r}")
+        eff_kind = args.component or args.kind
+        if eff_kind is None:
+            parser.error("export-coreml requires --kind or --component")
+        if eff_kind == "expert-predictor":
             res = export_expert_predictor(
                 args.output,
                 amf_path=args.amf,
@@ -1215,7 +1433,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seed=args.seed,
                 model_id=args.model_id,
             )
-        elif args.kind == "attention-qkv":
+        elif eff_kind == "attention-qkv":
             res = export_attention_qkv(
                 args.output,
                 amf_path=args.amf,
@@ -1229,7 +1447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seed=args.seed,
                 model_id=args.model_id,
             )
-        elif args.kind == "draft-head":
+        elif eff_kind == "draft-head":
             res = export_draft_head(
                 args.output,
                 amf_path=args.amf,
@@ -1243,8 +1461,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seed=args.seed,
                 model_id=args.model_id,
             )
+        elif eff_kind == "vision-tower":
+            buckets = _parse_int_csv(args.token_buckets)
+            if buckets is None:
+                buckets = DEFAULT_VISION_TOKEN_BUCKETS
+            res = export_vision_tower(
+                args.output,
+                amf_path=args.amf,
+                token_buckets=buckets,
+                op=args.op,
+                num_layers=args.num_vision_layers,
+                vision_hidden_size=args.vision_hidden_size,
+                vision_intermediate_size=args.vision_intermediate_size,
+                out_hidden_size=args.out_hidden_size,
+                spatial_merge_size=args.spatial_merge_size,
+                patch_size=args.patch_size,
+                t_patch=args.t_patch,
+                mlp_act=args.mlp_act,
+                seed=args.seed,
+                model_id=args.model_id,
+            )
         else:
-            parser.error(f"unsupported CoreML kind {args.kind!r}")
+            parser.error(f"unsupported CoreML kind {eff_kind!r}")
 
         if args.verify_compile is not None:
             for pkg in res.bundle_paths:
@@ -1467,6 +1705,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "pack-deepseek41":
         cold = _parse_cold_experts(args.cold_experts)
+        inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
         try:
             rep = convert_deepseek41_checkpoint(
                 args.input,
@@ -1485,6 +1724,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cold_experts_per_layer=args.cold_experts_per_layer,
                 sme2_pack=args.sme2_pack,
                 lut16_sme2=args.lut16_sme2,
+                strip_vision=strip_vis,
+                include_vision=inc_vis,
+                vision_sidecar=args.vision_sidecar,
+                vision_block_dtype=args.vision_block_dtype,
                 engram_output=args.engram_output,
                 engram_shards=args.engram_shards,
                 dspark_output=args.dspark_output,
@@ -1500,12 +1743,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         except HardwareTierError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        vis_note = ""
+        if rep.vision_amf is not None:
+            vis_note = f", {len(rep.vision_metas)} vision sidecar tensors"
+        elif rep.included_vision_tensors > 0:
+            vis_note = f", {rep.included_vision_tensors} vision tensors"
         print(
             f"packed deepseek41 ({len(rep.backbone_metas)} backbone tensors, "
             f"{len(rep.engram_paths)} Engram shard(s), "
-            f"{len(rep.dspark_metas)} DSpark tensors, "
+            f"{len(rep.dspark_metas)} DSpark tensors{vis_note}, "
             f"tier={rep.tier_check.target_tier} world_size={rep.tier_check.world_size}) "
             f"into {rep.backbone_amf}"
+        )
+        return 0
+
+    if args.command == "synth-vit":
+        started = time.monotonic()
+        vit_cfg = SyntheticVitConfig(
+            family=args.family,
+            num_vision_layers=args.num_layers,
+            vision_hidden_size=args.vision_hidden_size,
+            vision_intermediate_size=args.vision_intermediate_size,
+            out_hidden_size=args.out_hidden_size,
+            patch_size=args.patch_size,
+            spatial_merge_size=args.spatial_merge_size,
+            mlp_act=args.mlp_act,
+            dtype=args.dtype,
+            model_id=args.model_id,
+        )
+        metas = generate_synth_vit_amf(
+            args.output,
+            vit_cfg,
+            seed=args.seed,
+            quant_profile=args.quant_profile,
+            vision_block_dtype=args.vision_block_dtype,
+            embed_metadata=args.embed_metadata,
+        )
+        elapsed = time.monotonic() - started
+        print(
+            f"synthesized {args.family} vision tower ({len(metas)} tensors, "
+            f"{args.output.stat().st_size} bytes) -> {args.output} in {elapsed:.2f} s"
         )
         return 0
 

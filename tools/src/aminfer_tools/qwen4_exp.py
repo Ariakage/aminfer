@@ -29,7 +29,7 @@ import pathlib
 import re
 import struct
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
@@ -68,12 +68,17 @@ from aminfer_tools.amf import (
     f16_bytes_to_bf16_bytes,
     f16_bytes_to_f32_list,
     f32_bytes_to_f32_list,
+    VISION_BLOCK_DTYPES,
+    extract_vision_config_summary,
+    gsq_convert_with_vision,
     is_vision_tensor,
     load_cold_experts_from_heat_profile,
     pack_amf_from_safetensors,
     pack_sme2_panel64_f16_panel,
+    pack_vision_tower_amf,
     plan_amf_entries,
     resolve_checkpoint,
+    resolve_vision_mode,
     sme2_panel64_data_bytes,
 )
 
@@ -816,6 +821,9 @@ class Qwen4PackReport:
     config_path: pathlib.Path | None
     operator_axes: OperatorAxes
     loop_schedule: LoopScheduleConfig
+    vision_amf_path: pathlib.Path | None = None
+    vision_metas: list[PackedTensorMeta] = field(default_factory=list)
+    included_vision_tensors: int = 0
 
 
 def _write_backbone_with_adapters(
@@ -981,7 +989,10 @@ def pack_qwen4_checkpoint(
     use_rco: bool = True,
     manifest_path: pathlib.Path | None = None,
     workers: int = 1,
-    strip_vision: bool = True,
+    strip_vision: bool | None = None,
+    include_vision: bool | None = None,
+    vision_sidecar: pathlib.Path | None = None,
+    vision_block_dtype: str = "auto",
     ple_output: pathlib.Path | None = None,
     ple_shards: int = 1,
     mtp_output: pathlib.Path | None = None,
@@ -989,19 +1000,22 @@ def pack_qwen4_checkpoint(
     force_zero_r0_alpha: bool = False,
     config_output: pathlib.Path | None = None,
 ) -> Qwen4PackReport:
-    """Import a `qwen4_exp` or native/adapter-extended `LoopLM` safetensors checkpoint.
+    """Import a `qwen4_exp` / `Qwen3.8` / `Qwen3-VL` or native/adapter-extended `LoopLM` safetensors checkpoint.
 
-    Automatically strips vision towers (`visual.*`, `vision_tower.*`,
-    `multi_modal_projector.*`), extracts sharded `SPARSE_TABLE = 8` PLE `.amf` files
-    and `4B MTP` draft head `.amf` files when present, packs `SHARED_EXPERT = 7` and
-    `>= 512` routed experts, packs `LOOP_ADAPTER = 9` Step-LoRA weights into
+    Handles full multi-layer vision towers (`visual.patch_embed.*`, `visual.blocks.0..N.*`,
+    `visual.merger.*`) via W20 default-include, `--strip-vision` opt-out, or standalone
+    `--vision-sidecar vision.amf` extraction, extracts sharded `SPARSE_TABLE = 8` PLE
+    `.amf` files and `4B MTP` draft head `.amf` files when present, packs `SHARED_EXPERT = 7`
+    and `>= 512` routed experts, packs `LOOP_ADAPTER = 9` Step-LoRA weights into
     `sme2_panel64` (enforcing `alpha == 0.0` at `r = 0`), and emits canonical
-    `operator_axes` + `loop_schedule` metadata in `config.json`.
+    `operator_axes` + `loop_schedule` + `vision` metadata in `config.json`.
     """
     if quant_profile not in QUANT_PROFILES:
         raise ValueError(f"quant_profile must be one of {QUANT_PROFILES}, got {quant_profile!r}")
     if sme2_pack not in SME2_PACK_MODES:
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
+    if vision_block_dtype not in VISION_BLOCK_DTYPES:
+        raise ValueError(f"vision_block_dtype must be one of {VISION_BLOCK_DTYPES}, got {vision_block_dtype!r}")
     if ple_shards < 1:
         raise ValueError(f"ple_shards must be >= 1, got {ple_shards}")
 
@@ -1025,15 +1039,30 @@ def pack_qwen4_checkpoint(
             src_config = loaded
 
     all_tensors = _collect_tensors(resolved.shard_paths)
+    vision_mode = resolve_vision_mode(
+        all_tensors.keys(),
+        include_vision=include_vision,
+        strip_vision=strip_vision,
+        vision_sidecar=vision_sidecar,
+    )
     stripped_vision = 0
+    included_vision = 0
+    vision_tensors: dict[str, _ShardTensor] = {}
     ple_tensors: dict[str, _ShardTensor] = {}
     mtp_tensors: dict[str, _ShardTensor] = {}
     embedded_adapter_tensors: dict[str, _ShardTensor] = {}
     backbone_tensors: dict[str, _ShardTensor] = {}
 
     for raw_name, st in all_tensors.items():
-        if strip_vision and is_vision_tensor(raw_name):
-            stripped_vision += 1
+        if is_vision_tensor(raw_name):
+            if vision_mode == "strip":
+                stripped_vision += 1
+                continue
+            if vision_mode == "sidecar":
+                vision_tensors[raw_name] = st
+                continue
+            included_vision += 1
+            backbone_tensors[raw_name] = st
             continue
         if is_ple_tensor(raw_name):
             ple_tensors[raw_name] = st
@@ -1046,6 +1075,25 @@ def pack_qwen4_checkpoint(
             continue
         backbone_tensors[raw_name] = st
 
+    out_path = pathlib.Path(output_path)
+
+    # Pack standalone vision sidecar when requested.
+    vision_amf_path: pathlib.Path | None = None
+    vision_metas: list[PackedTensorMeta] = []
+    if vision_mode == "sidecar" and vision_sidecar is not None and vision_tensors:
+        vision_amf_path = pathlib.Path(vision_sidecar)
+        vision_metas = pack_vision_tower_amf(
+            input_path,
+            vision_amf_path,
+            model_id=f"{model_id[:55]}-vision",
+            dtype_mode=dtype_mode,
+            quant_profile=quant_profile,
+            vision_block_dtype=vision_block_dtype,
+            group_size=group_size,
+            use_rco=use_rco,
+            workers=workers,
+        )
+
     # Load optional external loop adapter safetensors.
     external_adapter_tensors: dict[str, _ShardTensor] = {}
     if loop_adapter_input is not None:
@@ -1054,7 +1102,6 @@ def pack_qwen4_checkpoint(
     merged_adapter_tensors = {**embedded_adapter_tensors, **external_adapter_tensors}
 
     # Pack PLE shards when PLE tensors exist.
-    out_path = pathlib.Path(output_path)
     ple_paths: list[pathlib.Path] = []
     ple_metas: list[list[PackedTensorMeta]] = []
     if ple_tensors:
@@ -1141,10 +1188,13 @@ def pack_qwen4_checkpoint(
                 use_rco=use_rco,
                 manifest_path=manifest_path,
                 workers=workers,
-                strip_vision=strip_vision,
+                strip_vision=(vision_mode in ("strip", "sidecar")),
+                include_vision=(vision_mode == "include"),
+                vision_block_dtype=vision_block_dtype,
                 stats_out=stats_map,
             )
-            stripped_vision = stats_map.get("stripped_vision_tensors", stripped_vision)
+            if vision_mode == "strip":
+                stripped_vision = stats_map.get("stripped_vision_tensors", stripped_vision)
         else:
             eff_sme2 = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
             backbone_plan = plan_amf_entries(
@@ -1168,11 +1218,8 @@ def pack_qwen4_checkpoint(
                 workers=workers,
             )
             if quant_profile == "gsq-rco":
-                # Run GSQ+RCO over the freshly packed backbone+adapter .amf (adapters stay pinned!).
-                from aminfer_tools.gsq_rco import gsq_convert
-
                 eff_target = 3.25 if target_bits is None else float(target_bits)
-                rep = gsq_convert(
+                metas = gsq_convert_with_vision(
                     out_path,
                     out_path,
                     target_bits=eff_target,
@@ -1188,8 +1235,10 @@ def pack_qwen4_checkpoint(
                     use_rco=use_rco,
                     manifest_path=manifest_path,
                     workers=workers,
+                    include_vision=(vision_mode == "include"),
+                    strip_vision=(vision_mode != "include"),
+                    vision_block_dtype=vision_block_dtype,
                 )
-                metas = rep.metas
     finally:
         readers.close()
 
@@ -1208,6 +1257,15 @@ def pack_qwen4_checkpoint(
         out_cfg["operator_axes"] = axes.to_dict()
         out_cfg["loop_schedule"] = ls.to_dict()
         out_cfg["stripped_vision_tensors"] = stripped_vision
+        if vision_amf_path is not None:
+            vis_summary = extract_vision_config_summary(vision_metas, src_config=src_config)
+            vis_summary["mode"] = "sidecar"
+            vis_summary["amf_file"] = vision_amf_path.name
+            out_cfg["vision"] = vis_summary
+        elif included_vision > 0:
+            vis_summary = extract_vision_config_summary(metas, src_config=src_config)
+            vis_summary["mode"] = "embedded"
+            out_cfg["vision"] = vis_summary
         if ple_paths:
             ple_meta0 = ple_metas[0][0] if ple_metas and ple_metas[0] else None
             total_ple_rows = sum(m.shape[0] for sm in ple_metas for m in sm if m.layer == (ple_meta0.layer if ple_meta0 else 0))
@@ -1239,6 +1297,9 @@ def pack_qwen4_checkpoint(
         config_path=cfg_out_path,
         operator_axes=axes,
         loop_schedule=ls,
+        vision_amf_path=vision_amf_path,
+        vision_metas=vision_metas,
+        included_vision_tensors=included_vision,
     )
 
 

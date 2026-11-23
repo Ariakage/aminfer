@@ -46,9 +46,11 @@ COREML_ARRAY_FLOAT32 = 65568
 COREML_EXACT_ARRAY_MAPPING = 1
 IOSURFACE_F16_ROW_ALIGN = 32  # 32 fp16 elements = 64 bytes (Apple IOSurface row stride)
 
-COREML_KINDS = ("expert-predictor", "attention-qkv", "draft-head")
+COREML_KINDS = ("expert-predictor", "attention-qkv", "draft-head", "vision-tower")
 COREML_OPS = ("inner-product", "conv1x1")
 DRAFT_STAGES = ("ffn", "fc", "linear")
+VISION_MLP_ACTS = ("gelu", "swiglu")
+DEFAULT_VISION_TOKEN_BUCKETS = (64, 256, 576)
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,7 @@ def pb_inner_product_layer(
     if bias_f16 is not None:
         if len(bias_f16) != c_out * 2:
             raise ValueError(f"layer {name!r}: expected {c_out * 2} bias bytes, got {len(bias_f16)}")
-        parts.append(_pb_bytes(30, _pb_weight_params_f16(bias_f16)))
+        parts.append(_pb_bytes(21, _pb_weight_params_f16(bias_f16)))
     return (
         _pb_str(1, name)
         + _pb_str(2, input_blob)
@@ -224,7 +226,7 @@ def pb_conv1x1_layer(
     if bias_f16 is not None:
         if len(bias_f16) != c_out * 2:
             raise ValueError(f"layer {name!r}: expected {c_out * 2} bias bytes, got {len(bias_f16)}")
-        parts.append(_pb_bytes(95, _pb_weight_params_f16(bias_f16)))
+        parts.append(_pb_bytes(91, _pb_weight_params_f16(bias_f16)))
     return (
         _pb_str(1, name)
         + _pb_str(2, input_blob)
@@ -258,6 +260,38 @@ def pb_sigmoid_layer(name: str, input_blob: str, output_blob: str) -> bytes:
         + _pb_str(3, output_blob)
         + _pb_bytes(130, _pb_bytes(40, b""))
     )
+
+
+def _pb_float32(field: int, val: float) -> bytes:
+    return _encode_varint((field << 3) | 5) + struct.pack("<f", float(val))
+
+
+def pb_activation_linear_layer(
+    name: str,
+    input_blob: str,
+    output_blob: str,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> bytes:
+    """Encode `ActivationParams` with `ActivationLinear` (layer field 130, linear field 5)."""
+    linear_params = _pb_float32(1, alpha) + _pb_float32(2, beta)
+    return (
+        _pb_str(1, name)
+        + _pb_str(2, input_blob)
+        + _pb_str(3, output_blob)
+        + _pb_bytes(130, _pb_bytes(5, linear_params))
+    )
+
+
+def pb_quick_gelu_layers(prefix: str, input_blob: str, output_blob: str) -> list[bytes]:
+    """Emit ANE-native QuickGELU `x * sigmoid(1.702 * x)` using CoreML v7 standard layers."""
+    scaled = f"{prefix}_scaled"
+    sig = f"{prefix}_sig"
+    return [
+        pb_activation_linear_layer(f"{prefix}_scale", input_blob, scaled, alpha=1.702, beta=0.0),
+        pb_sigmoid_layer(f"{prefix}_sig", scaled, sig),
+        pb_multiply_layer(f"{prefix}_mul", (input_blob, sig), output_blob),
+    ]
 
 
 def pb_add_layer(name: str, input_blobs: Sequence[str], output_blob: str) -> bytes:
@@ -1160,4 +1194,603 @@ def export_draft_head(
         model_bytes=len(model_bytes),
         metadata=meta,
         bundle_paths=(out,),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kind 4: vision-tower (W20 / G22, static-bucket CoreML ANE ViT + Merger/Aligner)
+# ---------------------------------------------------------------------------
+
+
+def _try_find_amf_tensor(reader: AmfReader, candidates: Sequence[str]) -> PackedTensorMeta | None:
+    for name in candidates:
+        if name in reader.by_name:
+            return reader.by_name[name]
+    return None
+
+
+def _detect_vision_tower_from_amf(reader: AmfReader) -> tuple[str, list[int]]:
+    """Detect vision family (`qwen_vl` or `deepseek_v41`) and sorted block indices in `reader`."""
+    qwen_blocks: set[int] = set()
+    ds_blocks: set[int] = set()
+    for name in reader.by_name:
+        if name.startswith("visual.blocks."):
+            parts = name.split(".")
+            if len(parts) >= 4 and parts[2].isdigit():
+                qwen_blocks.add(int(parts[2]))
+        elif name.startswith("vision.blocks."):
+            parts = name.split(".")
+            if len(parts) >= 4 and parts[2].isdigit():
+                ds_blocks.add(int(parts[2]))
+    if qwen_blocks:
+        return "qwen_vl", sorted(qwen_blocks)
+    if ds_blocks:
+        return "deepseek_v41", sorted(ds_blocks)
+    raise ValueError("AMF file contains neither visual.blocks.* (Qwen-VL) nor vision.blocks.* (DeepSeek-V4.1) tensors")
+
+
+def _extract_2d_f16_or_pad(
+    weights_f16: bytes,
+    rows: int,
+    cols: int,
+    padded_rows: int,
+    padded_cols: int,
+) -> bytes:
+    """Zero-pad a row-major `[rows, cols]` fp16 matrix to `[padded_rows, padded_cols]`."""
+    if rows == padded_rows and cols == padded_cols:
+        return weights_f16
+    row_src = cols * 2
+    row_dst = padded_cols * 2
+    out = bytearray(padded_rows * row_dst)
+    for r in range(rows):
+        out[r * row_dst : r * row_dst + row_src] = weights_f16[r * row_src : (r + 1) * row_src]
+    return bytes(out)
+
+
+def _extract_1d_f16_or_pad(bias_f16: bytes | None, rows: int, padded_rows: int) -> bytes | None:
+    if bias_f16 is None:
+        return None
+    if rows == padded_rows:
+        return bias_f16
+    return bias_f16 + bytes((padded_rows - rows) * 2)
+
+
+def export_vision_tower(
+    output_path: pathlib.Path,
+    *,
+    amf_path: pathlib.Path | None = None,
+    token_buckets: Sequence[int] = DEFAULT_VISION_TOKEN_BUCKETS,
+    op: str = "inner-product",
+    num_layers: int = 4,
+    vision_hidden_size: int = 128,
+    vision_intermediate_size: int = 256,
+    out_hidden_size: int = 128,
+    spatial_merge_size: int = 2,
+    patch_size: int = 14,
+    t_patch: int = 1,
+    mlp_act: str = "gelu",
+    seed: int = 42,
+    model_id: str | None = None,
+) -> CoreMlExportResult:
+    """Export static-bucket CoreML `.mlpackage` vision-tower bundle(s) over zero-copy G14 IOSurface (W20).
+
+    Supports extracting real weights from either embedded multimodal `.amf` files or
+    standalone `vision.amf` sidecars (`Qwen-VL`/`Qwen3.8` `visual.*` and `DeepSeek-V4.1`
+    `vision.*` + `aligner.*`, automatically dequantizing `q4_affine`/`bf16` to `f16`),
+    as well as deterministic synthetic export when `amf_path is None`.
+
+    Every exported static bucket enforces `IOSURFACE_F16_ROW_ALIGN = 32` (64 B
+    `CVPixelBuffer` row stride) so `src/gpu/vision.zig` can bind `OneComponent16Half`
+    `IOSurface` tensors zero-copy into the Apple Neural Engine.
+    """
+    if op not in COREML_OPS:
+        raise ValueError(f"op must be one of {COREML_OPS}, got {op!r}")
+    if mlp_act not in VISION_MLP_ACTS:
+        raise ValueError(f"mlp_act must be one of {VISION_MLP_ACTS}, got {mlp_act!r}")
+    if spatial_merge_size < 1:
+        raise ValueError(f"spatial_merge_size must be >= 1, got {spatial_merge_size}")
+    buckets = tuple(int(b) for b in token_buckets)
+    if not buckets:
+        raise ValueError("token_buckets must be non-empty")
+    for b in buckets:
+        if b <= 0:
+            raise ValueError(f"token bucket must be positive, got {b}")
+        if op == "conv1x1" and b % IOSURFACE_F16_ROW_ALIGN != 0:
+            raise ValueError(
+                f"conv1x1 vision-tower requires token bucket divisible by {IOSURFACE_F16_ROW_ALIGN}, got {b}"
+            )
+
+    block_weights: list[dict[str, object]] = []
+    merger_fc1_parts: list[bytes] = []
+    merger_fc1_bias: bytes | None = None
+    merger_fc2_w: bytes
+    merger_fc2_bias: bytes | None = None
+    eff_mlp_act = mlp_act
+    eff_family = "synthetic"
+    eff_spatial_merge = spatial_merge_size
+
+    if amf_path is not None:
+        with AmfReader(amf_path, verify_header_crc=True, verify_dir_crc=True) as reader:
+            eff_model_id = model_id or reader.header.model_id or pathlib.Path(amf_path).stem
+            eff_family, block_ids = _detect_vision_tower_from_amf(reader)
+            prefix_root = "visual" if eff_family == "qwen_vl" else "vision"
+            b0 = block_ids[0]
+            qkv0 = _find_amf_tensor(
+                reader,
+                (
+                    f"{prefix_root}.blocks.{b0}.attn.qkv",
+                    f"{prefix_root}.blocks.{b0}.attn.qkv.weight",
+                    f"{prefix_root}.blocks.{b0}.attn.wqkv",
+                    f"{prefix_root}.blocks.{b0}.attn.wqkv.weight",
+                ),
+            )
+            if len(qkv0.shape) != 2 or qkv0.shape[0] != 3 * qkv0.shape[1]:
+                raise ValueError(f"unexpected vision QKV shape {qkv0.shape} for {qkv0.name!r}")
+            raw_vis_h = qkv0.shape[1]
+            eff_vis_h = _align_up(raw_vis_h, IOSURFACE_F16_ROW_ALIGN)
+
+            # Detect SwiGLU vs GELU from block 0 MLP tensors.
+            has_swiglu = (
+                _try_find_amf_tensor(
+                    reader,
+                    (
+                        f"{prefix_root}.blocks.{b0}.mlp.gate_proj",
+                        f"{prefix_root}.blocks.{b0}.mlp.gate_proj.weight",
+                        f"{prefix_root}.blocks.{b0}.mlp.w3",
+                        f"{prefix_root}.blocks.{b0}.mlp.w3.weight",
+                    ),
+                )
+                is not None
+            )
+            eff_mlp_act = "swiglu" if has_swiglu else "gelu"
+
+            eff_vis_inter = 0
+            for blk in block_ids:
+                bp = f"{prefix_root}.blocks.{blk}"
+                qkv_m = _find_amf_tensor(
+                    reader,
+                    (f"{bp}.attn.qkv", f"{bp}.attn.qkv.weight", f"{bp}.attn.wqkv", f"{bp}.attn.wqkv.weight"),
+                )
+                qkv_b_m = _try_find_amf_tensor(reader, (f"{bp}.attn.qkv.bias", f"{bp}.attn.wqkv.bias"))
+                proj_m = _find_amf_tensor(
+                    reader,
+                    (f"{bp}.attn.proj", f"{bp}.attn.proj.weight", f"{bp}.attn.wo", f"{bp}.attn.wo.weight"),
+                )
+                proj_b_m = _try_find_amf_tensor(reader, (f"{bp}.attn.proj.bias", f"{bp}.attn.wo.bias"))
+
+                qkv_raw = reader.read_tensor_f16_bytes(qkv_m)
+                chunk_bytes = raw_vis_h * raw_vis_h * 2
+                wq = _extract_2d_f16_or_pad(qkv_raw[0:chunk_bytes], raw_vis_h, raw_vis_h, eff_vis_h, eff_vis_h)
+                wk = _extract_2d_f16_or_pad(
+                    qkv_raw[chunk_bytes : 2 * chunk_bytes], raw_vis_h, raw_vis_h, eff_vis_h, eff_vis_h
+                )
+                wv = _extract_2d_f16_or_pad(
+                    qkv_raw[2 * chunk_bytes : 3 * chunk_bytes], raw_vis_h, raw_vis_h, eff_vis_h, eff_vis_h
+                )
+                bq = bk = bv = None
+                if qkv_b_m is not None:
+                    qkv_b_raw = reader.read_tensor_f16_bytes(qkv_b_m)
+                    b_chunk = raw_vis_h * 2
+                    bq = _extract_1d_f16_or_pad(qkv_b_raw[0:b_chunk], raw_vis_h, eff_vis_h)
+                    bk = _extract_1d_f16_or_pad(qkv_b_raw[b_chunk : 2 * b_chunk], raw_vis_h, eff_vis_h)
+                    bv = _extract_1d_f16_or_pad(qkv_b_raw[2 * b_chunk : 3 * b_chunk], raw_vis_h, eff_vis_h)
+
+                wo = _extract_2d_f16_or_pad(
+                    reader.read_tensor_f16_bytes(proj_m), raw_vis_h, raw_vis_h, eff_vis_h, eff_vis_h
+                )
+                bo = _extract_1d_f16_or_pad(
+                    reader.read_tensor_f16_bytes(proj_b_m) if proj_b_m is not None else None,
+                    raw_vis_h,
+                    eff_vis_h,
+                )
+
+                if eff_mlp_act == "swiglu":
+                    g_m = _find_amf_tensor(
+                        reader,
+                        (f"{bp}.mlp.gate_proj", f"{bp}.mlp.gate_proj.weight", f"{bp}.mlp.w1", f"{bp}.mlp.w1.weight"),
+                    )
+                    u_m = _find_amf_tensor(
+                        reader,
+                        (f"{bp}.mlp.up_proj", f"{bp}.mlp.up_proj.weight", f"{bp}.mlp.w3", f"{bp}.mlp.w3.weight"),
+                    )
+                    d_m = _find_amf_tensor(
+                        reader,
+                        (f"{bp}.mlp.down_proj", f"{bp}.mlp.down_proj.weight", f"{bp}.mlp.w2", f"{bp}.mlp.w2.weight"),
+                    )
+                    raw_inter = g_m.shape[0]
+                    eff_inter = _align_up(raw_inter, IOSURFACE_F16_ROW_ALIGN)
+                    eff_vis_inter = max(eff_vis_inter, eff_inter)
+                    block_weights.append(
+                        {
+                            "idx": blk,
+                            "wq": wq,
+                            "wk": wk,
+                            "wv": wv,
+                            "bq": bq,
+                            "bk": bk,
+                            "bv": bv,
+                            "wo": wo,
+                            "bo": bo,
+                            "inter": eff_inter,
+                            "w_gate": _extract_2d_f16_or_pad(
+                                reader.read_tensor_f16_bytes(g_m), raw_inter, raw_vis_h, eff_inter, eff_vis_h
+                            ),
+                            "w_up": _extract_2d_f16_or_pad(
+                                reader.read_tensor_f16_bytes(u_m), raw_inter, raw_vis_h, eff_inter, eff_vis_h
+                            ),
+                            "w_down": _extract_2d_f16_or_pad(
+                                reader.read_tensor_f16_bytes(d_m), raw_vis_h, raw_inter, eff_vis_h, eff_inter
+                            ),
+                        }
+                    )
+                else:
+                    fc1_m = _find_amf_tensor(
+                        reader,
+                        (
+                            f"{bp}.mlp.linear_fc1",
+                            f"{bp}.mlp.linear_fc1.weight",
+                            f"{bp}.mlp.fc1",
+                            f"{bp}.mlp.fc1.weight",
+                            f"{bp}.mlp.w1",
+                            f"{bp}.mlp.w1.weight",
+                        ),
+                    )
+                    fc1_b_m = _try_find_amf_tensor(
+                        reader, (f"{bp}.mlp.linear_fc1.bias", f"{bp}.mlp.fc1.bias", f"{bp}.mlp.w1.bias")
+                    )
+                    fc2_m = _find_amf_tensor(
+                        reader,
+                        (
+                            f"{bp}.mlp.linear_fc2",
+                            f"{bp}.mlp.linear_fc2.weight",
+                            f"{bp}.mlp.fc2",
+                            f"{bp}.mlp.fc2.weight",
+                            f"{bp}.mlp.w2",
+                            f"{bp}.mlp.w2.weight",
+                        ),
+                    )
+                    fc2_b_m = _try_find_amf_tensor(
+                        reader, (f"{bp}.mlp.linear_fc2.bias", f"{bp}.mlp.fc2.bias", f"{bp}.mlp.w2.bias")
+                    )
+                    raw_inter = fc1_m.shape[0]
+                    eff_inter = _align_up(raw_inter, IOSURFACE_F16_ROW_ALIGN)
+                    eff_vis_inter = max(eff_vis_inter, eff_inter)
+                    block_weights.append(
+                        {
+                            "idx": blk,
+                            "wq": wq,
+                            "wk": wk,
+                            "wv": wv,
+                            "bq": bq,
+                            "bk": bk,
+                            "bv": bv,
+                            "wo": wo,
+                            "bo": bo,
+                            "inter": eff_inter,
+                            "w_fc1": _extract_2d_f16_or_pad(
+                                reader.read_tensor_f16_bytes(fc1_m), raw_inter, raw_vis_h, eff_inter, eff_vis_h
+                            ),
+                            "b_fc1": _extract_1d_f16_or_pad(
+                                reader.read_tensor_f16_bytes(fc1_b_m) if fc1_b_m is not None else None,
+                                raw_inter,
+                                eff_inter,
+                            ),
+                            "w_fc2": _extract_2d_f16_or_pad(
+                                reader.read_tensor_f16_bytes(fc2_m), raw_vis_h, raw_inter, eff_vis_h, eff_inter
+                            ),
+                            "b_fc2": _extract_1d_f16_or_pad(
+                                reader.read_tensor_f16_bytes(fc2_b_m) if fc2_b_m is not None else None,
+                                raw_vis_h,
+                                eff_vis_h,
+                            ),
+                        }
+                    )
+
+            m_fc1 = _find_amf_tensor(
+                reader,
+                (
+                    "visual.merger.linear_fc1.weight",
+                    "visual.merger.linear_fc1",
+                    "visual.merger.mlp.0.weight",
+                    "visual.merger.mlp.0",
+                    "aligner.w1.weight",
+                    "aligner.w1",
+                ),
+            )
+            m_fc1_b = _try_find_amf_tensor(
+                reader,
+                ("visual.merger.linear_fc1.bias", "visual.merger.mlp.0.bias", "aligner.w1.bias"),
+            )
+            m_fc2 = _find_amf_tensor(
+                reader,
+                (
+                    "visual.merger.linear_fc2.weight",
+                    "visual.merger.linear_fc2",
+                    "visual.merger.mlp.2.weight",
+                    "visual.merger.mlp.2",
+                    "aligner.w2.weight",
+                    "aligner.w2",
+                ),
+            )
+            m_fc2_b = _try_find_amf_tensor(
+                reader,
+                ("visual.merger.linear_fc2.bias", "visual.merger.mlp.2.bias", "aligner.w2.bias"),
+            )
+            raw_m_mid, raw_m_in = m_fc1.shape
+            raw_out_h = m_fc2.shape[0]
+            eff_m_mid = _align_up(raw_m_mid, IOSURFACE_F16_ROW_ALIGN)
+            eff_out_h = _align_up(raw_out_h, IOSURFACE_F16_ROW_ALIGN)
+            merge_slots = max(1, raw_m_in // raw_vis_h)
+            eff_spatial_merge = max(1, int(round(merge_slots**0.5)))
+
+            m_fc1_raw = reader.read_tensor_f16_bytes(m_fc1)
+            row_stride_in = raw_m_in * 2
+            slot_bytes = raw_vis_h * 2
+            for slot in range(merge_slots):
+                slot_mat = bytearray(raw_m_mid * slot_bytes)
+                for r in range(raw_m_mid):
+                    src_off = r * row_stride_in + slot * slot_bytes
+                    slot_mat[r * slot_bytes : (r + 1) * slot_bytes] = m_fc1_raw[src_off : src_off + slot_bytes]
+                merger_fc1_parts.append(
+                    _extract_2d_f16_or_pad(bytes(slot_mat), raw_m_mid, raw_vis_h, eff_m_mid, eff_vis_h)
+                )
+            merger_fc1_bias = _extract_1d_f16_or_pad(
+                reader.read_tensor_f16_bytes(m_fc1_b) if m_fc1_b is not None else None, raw_m_mid, eff_m_mid
+            )
+            merger_fc2_w = _extract_2d_f16_or_pad(
+                reader.read_tensor_f16_bytes(m_fc2), raw_out_h, raw_m_mid, eff_out_h, eff_m_mid
+            )
+            merger_fc2_bias = _extract_1d_f16_or_pad(
+                reader.read_tensor_f16_bytes(m_fc2_b) if m_fc2_b is not None else None, raw_out_h, eff_out_h
+            )
+            eff_num_layers = len(block_weights)
+    else:
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+        eff_model_id = model_id or "synthetic-vision-tower"
+        eff_vis_h = _align_up(vision_hidden_size, IOSURFACE_F16_ROW_ALIGN)
+        eff_vis_inter = _align_up(vision_intermediate_size, IOSURFACE_F16_ROW_ALIGN)
+        eff_out_h = _align_up(out_hidden_size, IOSURFACE_F16_ROW_ALIGN)
+        eff_num_layers = num_layers
+        merge_slots = eff_spatial_merge * eff_spatial_merge
+        eff_m_mid = _align_up(eff_vis_h * merge_slots, IOSURFACE_F16_ROW_ALIGN)
+
+        for blk in range(eff_num_layers):
+            s0 = seed + blk * 31
+            entry: dict[str, object] = {
+                "idx": blk,
+                "wq": _synth_weights_f16(eff_vis_h, eff_vis_h, s0 + 1),
+                "wk": _synth_weights_f16(eff_vis_h, eff_vis_h, s0 + 2),
+                "wv": _synth_weights_f16(eff_vis_h, eff_vis_h, s0 + 3),
+                "bq": None,
+                "bk": None,
+                "bv": None,
+                "wo": _synth_weights_f16(eff_vis_h, eff_vis_h, s0 + 4),
+                "bo": None,
+                "inter": eff_vis_inter,
+            }
+            if eff_mlp_act == "swiglu":
+                entry["w_gate"] = _synth_weights_f16(eff_vis_inter, eff_vis_h, s0 + 5)
+                entry["w_up"] = _synth_weights_f16(eff_vis_inter, eff_vis_h, s0 + 6)
+                entry["w_down"] = _synth_weights_f16(eff_vis_h, eff_vis_inter, s0 + 7)
+            else:
+                entry["w_fc1"] = _synth_weights_f16(eff_vis_inter, eff_vis_h, s0 + 5)
+                entry["b_fc1"] = None
+                entry["w_fc2"] = _synth_weights_f16(eff_vis_h, eff_vis_inter, s0 + 6)
+                entry["b_fc2"] = None
+            block_weights.append(entry)
+        for slot in range(merge_slots):
+            merger_fc1_parts.append(_synth_weights_f16(eff_m_mid, eff_vis_h, seed + 1000 + slot))
+        merger_fc2_w = _synth_weights_f16(eff_out_h, eff_m_mid, seed + 2000)
+
+    def _build_layers() -> tuple[list[bytes], int]:
+        layers_pb: list[bytes] = []
+        w_bytes = 0
+        cur_blob = "patch_tokens"
+        for blk_info in block_weights:
+            b = int(blk_info["idx"])  # type: ignore[arg-type]
+            inter = int(blk_info["inter"])  # type: ignore[arg-type]
+            wq = blk_info["wq"]  # type: ignore[assignment]
+            wk = blk_info["wk"]  # type: ignore[assignment]
+            wv = blk_info["wv"]  # type: ignore[assignment]
+            wo = blk_info["wo"]  # type: ignore[assignment]
+            bq = blk_info["bq"]  # type: ignore[assignment]
+            bk = blk_info["bk"]  # type: ignore[assignment]
+            bv = blk_info["bv"]  # type: ignore[assignment]
+            bo = blk_info["bo"]  # type: ignore[assignment]
+            assert isinstance(wq, bytes) and isinstance(wk, bytes) and isinstance(wv, bytes) and isinstance(wo, bytes)
+
+            q_blob = f"vit_b{b}_q"
+            k_blob = f"vit_b{b}_k"
+            v_blob = f"vit_b{b}_v"
+            qk_sum = f"vit_b{b}_qk_sum"
+            qk_gate = f"vit_b{b}_qk_gate"
+            ctx_blob = f"vit_b{b}_ctx"
+            proj_blob = f"vit_b{b}_attn_proj"
+            res1_blob = f"vit_b{b}_res1"
+
+            layers_pb.append(pb_linear_layer(op, f"vit_b{b}_q_proj", cur_blob, q_blob, eff_vis_h, eff_vis_h, wq, bq))
+            layers_pb.append(pb_linear_layer(op, f"vit_b{b}_k_proj", cur_blob, k_blob, eff_vis_h, eff_vis_h, wk, bk))
+            layers_pb.append(pb_linear_layer(op, f"vit_b{b}_v_proj", cur_blob, v_blob, eff_vis_h, eff_vis_h, wv, bv))
+            layers_pb.append(pb_add_layer(f"vit_b{b}_qk_add", (q_blob, k_blob), qk_sum))
+            layers_pb.append(pb_sigmoid_layer(f"vit_b{b}_qk_sig", qk_sum, qk_gate))
+            layers_pb.append(pb_multiply_layer(f"vit_b{b}_ctx_mul", (qk_gate, v_blob), ctx_blob))
+            layers_pb.append(pb_linear_layer(op, f"vit_b{b}_o_proj", ctx_blob, proj_blob, eff_vis_h, eff_vis_h, wo, bo))
+            layers_pb.append(pb_add_layer(f"vit_b{b}_attn_res", (cur_blob, proj_blob), res1_blob))
+            w_bytes += len(wq) + len(wk) + len(wv) + len(wo)
+
+            res2_blob = f"vit_b{b}_out"
+            if eff_mlp_act == "swiglu":
+                wg = blk_info["w_gate"]  # type: ignore[assignment]
+                wu = blk_info["w_up"]  # type: ignore[assignment]
+                wd = blk_info["w_down"]  # type: ignore[assignment]
+                assert isinstance(wg, bytes) and isinstance(wu, bytes) and isinstance(wd, bytes)
+                g_pre = f"vit_b{b}_gate_pre"
+                u_pre = f"vit_b{b}_up_pre"
+                g_sig = f"vit_b{b}_gate_sig"
+                g_act = f"vit_b{b}_gate_act"
+                mid = f"vit_b{b}_mlp_mid"
+                down_out = f"vit_b{b}_mlp_out"
+                layers_pb.append(pb_linear_layer(op, f"vit_b{b}_gate", res1_blob, g_pre, eff_vis_h, inter, wg))
+                layers_pb.append(pb_linear_layer(op, f"vit_b{b}_up", res1_blob, u_pre, eff_vis_h, inter, wu))
+                layers_pb.append(pb_sigmoid_layer(f"vit_b{b}_silu_sig", g_pre, g_sig))
+                layers_pb.append(pb_multiply_layer(f"vit_b{b}_silu_mul", (g_pre, g_sig), g_act))
+                layers_pb.append(pb_multiply_layer(f"vit_b{b}_swiglu", (g_act, u_pre), mid))
+                layers_pb.append(pb_linear_layer(op, f"vit_b{b}_down", mid, down_out, inter, eff_vis_h, wd))
+                layers_pb.append(pb_add_layer(f"vit_b{b}_mlp_res", (res1_blob, down_out), res2_blob))
+                w_bytes += len(wg) + len(wu) + len(wd)
+            else:
+                w1 = blk_info["w_fc1"]  # type: ignore[assignment]
+                b1 = blk_info["b_fc1"]  # type: ignore[assignment]
+                w2 = blk_info["w_fc2"]  # type: ignore[assignment]
+                b2 = blk_info["b_fc2"]  # type: ignore[assignment]
+                assert isinstance(w1, bytes) and isinstance(w2, bytes)
+                fc1_pre = f"vit_b{b}_fc1_pre"
+                fc1_act = f"vit_b{b}_fc1_act"
+                fc2_out = f"vit_b{b}_mlp_out"
+                layers_pb.append(pb_linear_layer(op, f"vit_b{b}_fc1", res1_blob, fc1_pre, eff_vis_h, inter, w1, b1))
+                layers_pb.extend(pb_quick_gelu_layers(f"vit_b{b}_gelu", fc1_pre, fc1_act))
+                layers_pb.append(pb_linear_layer(op, f"vit_b{b}_fc2", fc1_act, fc2_out, inter, eff_vis_h, w2, b2))
+                layers_pb.append(pb_add_layer(f"vit_b{b}_mlp_res", (res1_blob, fc2_out), res2_blob))
+                w_bytes += len(w1) + len(w2)
+            cur_blob = res2_blob
+
+        # 2-layer PatchMerger / Aligner MLP (`fc1 -> GELU -> fc2 -> visual_embeds`).
+        if len(merger_fc1_parts) == 1:
+            m1_pre = "merger_fc1_pre"
+            layers_pb.append(
+                pb_linear_layer(
+                    op,
+                    "merger_fc1",
+                    cur_blob,
+                    m1_pre,
+                    eff_vis_h,
+                    eff_m_mid,
+                    merger_fc1_parts[0],
+                    merger_fc1_bias,
+                )
+            )
+            w_bytes += len(merger_fc1_parts[0])
+        else:
+            slot_blobs: list[str] = []
+            for s_idx, w_slot in enumerate(merger_fc1_parts):
+                sb = f"merger_fc1_slot{s_idx}"
+                layers_pb.append(
+                    pb_linear_layer(
+                        op,
+                        f"merger_fc1_s{s_idx}",
+                        cur_blob,
+                        sb,
+                        eff_vis_h,
+                        eff_m_mid,
+                        w_slot,
+                        merger_fc1_bias if s_idx == 0 else None,
+                    )
+                )
+                w_bytes += len(w_slot)
+                slot_blobs.append(sb)
+            m1_pre = "merger_fc1_pre"
+            layers_pb.append(pb_add_layer("merger_fc1_merge", slot_blobs, m1_pre))
+
+        m1_act = "merger_fc1_act"
+        layers_pb.extend(pb_quick_gelu_layers("merger_gelu", m1_pre, m1_act))
+        layers_pb.append(
+            pb_linear_layer(
+                op,
+                "merger_fc2",
+                m1_act,
+                "visual_embeds",
+                eff_m_mid,
+                eff_out_h,
+                merger_fc2_w,
+                merger_fc2_bias,
+            )
+        )
+        w_bytes += len(merger_fc2_w)
+        return layers_pb, w_bytes
+
+    layers_pb, weight_bytes = _build_layers()
+    out = pathlib.Path(output_path)
+    single_pkg = len(buckets) == 1 and out.suffix == ".mlpackage"
+    if not single_pkg and out.suffix == ".mlpackage":
+        raise ValueError(
+            f"multi-bucket vision-tower export ({buckets}) requires a directory --output path, got {out}"
+        )
+
+    bundle_paths: list[pathlib.Path] = []
+    first_inputs: tuple[TensorSpec, ...] = ()
+    first_outputs: tuple[TensorSpec, ...] = ()
+    first_meta: dict[str, str] = {}
+    total_model_bytes = 0
+
+    for b in buckets:
+        pkg_path = out if single_pkg else out / f"vision_tower_t{b}.mlpackage"
+        in_spec = TensorSpec(
+            name="patch_tokens",
+            shape=_tensor_shape_for_op(op, b, eff_vis_h),
+            description=f"Zero-copy G14 IOSurface patch tokens [T={b}, D_vis={eff_vis_h}] (fp16)",
+        )
+        out_spec = TensorSpec(
+            name="visual_embeds",
+            shape=_tensor_shape_for_op(op, b, eff_out_h),
+            description=f"PatchMerger/Aligner LM embeddings [T={b}, D_lm={eff_out_h}] (fp16)",
+        )
+        meta = {
+            "aminfer_kind": "vision-tower",
+            "aminfer_component": "vision-tower",
+            "aminfer_op": op,
+            "model_id": eff_model_id,
+            "vision_family": eff_family,
+            "token_bucket": str(b),
+            "token_buckets": ",".join(str(x) for x in buckets),
+            "num_vision_layers": str(eff_num_layers),
+            "vision_hidden_size": str(eff_vis_h),
+            "vision_intermediate_size": str(eff_vis_inter),
+            "out_hidden_size": str(eff_out_h),
+            "spatial_merge_size": str(eff_spatial_merge),
+            "patch_size": str(patch_size),
+            "t_patch": str(t_patch),
+            "mlp_act": eff_mlp_act,
+            "iosurface_row_align": str(IOSURFACE_F16_ROW_ALIGN),
+            "g14_zero_copy": "true",
+        }
+        short_desc = (
+            f"aminfer W20/G22 ANE vision-tower ({eff_model_id}, L={eff_num_layers}, "
+            f"bucket={b}, D_vis={eff_vis_h}->{eff_out_h})"
+        )
+        model_bytes = build_neural_network_model(
+            [in_spec],
+            [out_spec],
+            layers_pb,
+            use_exact_mapping=(op == "inner-product"),
+            short_description=short_desc,
+            user_defined=meta,
+        )
+        write_mlpackage(
+            pkg_path,
+            model_bytes,
+            [in_spec],
+            [out_spec],
+            short_description=short_desc,
+            user_defined=meta,
+        )
+        bundle_paths.append(pkg_path)
+        total_model_bytes += len(model_bytes)
+        if not first_inputs:
+            first_inputs = (in_spec,)
+            first_outputs = (out_spec,)
+            first_meta = meta
+
+    return CoreMlExportResult(
+        output_path=bundle_paths[0] if single_pkg else out,
+        kind="vision-tower",
+        op=op,
+        model_id=eff_model_id,
+        inputs=first_inputs,
+        outputs=first_outputs,
+        layer_count=len(layers_pb),
+        weight_bytes=weight_bytes,
+        model_bytes=total_model_bytes,
+        metadata=first_meta,
+        bundle_paths=tuple(bundle_paths),
     )

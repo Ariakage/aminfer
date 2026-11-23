@@ -20,8 +20,10 @@ import array
 import enum
 import fcntl
 import json
+import math
 import os
 import pathlib
+import random
 import re
 import struct
 import sys
@@ -50,6 +52,11 @@ assert HEADER_STRUCT.size == 128
 assert ENTRY_STRUCT.size == 128
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+_VISION_BLOCK_RE = re.compile(r"(?:^|\.)(?:visual|vision)\.blocks\.(\d+)\.")
+_VISION_TOWER_BLOCK_RE = re.compile(
+    r"^(?:model\.)?(?:visual|vision|vision_tower\.vision_model\.encoder|vision_model\.encoder)"
+    r"\.(?:blocks|layers)\.\d+\.(?:norm\d?|attn|self_attn|mlp|ffn|layernorm|layer_norm)\."
+)
 _EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
 _LOOP_STEP_RE = re.compile(r"(?:^|\.)loop\.step\.(\d+)\.")
 _SWITCH_MLP_RE = re.compile(
@@ -74,14 +81,133 @@ VISION_EXACT_TENSOR_NAMES = (
     "image_end",
     "image_newline",
 )
+VISION_BLOCK_DTYPES = ("auto", "f16", "bf16", "q4_affine")
 
 
 def is_vision_tensor(raw_name: str) -> bool:
-    """Return True if `raw_name` belongs to an offline-strippable vision tower (W10, W11)."""
+    """Return True if `raw_name` belongs to a multimodal vision tower / merger / aligner (W10, W11, W20)."""
     if raw_name.startswith(VISION_TENSOR_PREFIXES):
         return True
     stripped = raw_name[6:] if raw_name.startswith("model.") else raw_name
     return stripped in VISION_EXACT_TENSOR_NAMES
+
+
+def has_vision_tower(tensor_names: Iterable[str]) -> bool:
+    """Return True when `tensor_names` contain multi-layer ViT encoder blocks (`visual.blocks.*` / `vision.blocks.*`).
+
+    Distinguishes full multimodal checkpoints (`Qwen-VL`, `Qwen3.8`, `DeepSeek-V4.1`, SigLIP)
+    from legacy text-only test fixtures carrying 1-3 dangling stub vision weights.
+    """
+    return any(_VISION_TOWER_BLOCK_RE.match(name) is not None for name in tensor_names)
+
+
+def resolve_vision_mode(
+    tensor_names: Iterable[str],
+    *,
+    include_vision: bool | None = None,
+    strip_vision: bool | None = None,
+    vision_sidecar: pathlib.Path | None = None,
+) -> str:
+    """Resolve effective W20 vision packing mode: `'include'`, `'strip'`, or `'sidecar'`.
+
+    Precedence:
+    - Conflicting explicit flags (`include_vision=True` + `strip_vision=True`, or
+      `strip_vision=True` + `vision_sidecar`) raise `ValueError`.
+    - `vision_sidecar` extracts vision tensors into a standalone 16 KiB-aligned `.amf`.
+    - Explicit `include_vision=True` or `strip_vision=False` keeps all vision tensors.
+    - Explicit `strip_vision=True` or `include_vision=False` strips all vision tensors.
+    - Default (`None`): includes full ViT towers automatically when `has_vision_tower` holds.
+    """
+    if include_vision is True and strip_vision is True:
+        raise ValueError("cannot specify both include_vision=True and strip_vision=True")
+    if vision_sidecar is not None:
+        if strip_vision is True or include_vision is False:
+            raise ValueError("cannot combine strip_vision with vision_sidecar")
+        return "sidecar"
+    if include_vision is True or strip_vision is False:
+        return "include"
+    if strip_vision is True or include_vision is False:
+        return "strip"
+    return "include" if has_vision_tower(tensor_names) else "strip"
+
+
+_VERBOSE_VISION_PREFIX_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^vision_tower\.vision_model\.encoder\.layers\.(\d+)\."), r"vision.blocks.\1."),
+    (re.compile(r"^vision_model\.encoder\.layers\.(\d+)\."), r"vision.blocks.\1."),
+    (re.compile(r"^vision_tower\.encoder\.layers\.(\d+)\."), r"vision.blocks.\1."),
+    (re.compile(r"^vision_tower\.vision_model\.embeddings\.patch_embedding\."), "vision.patch_embed.proj."),
+    (re.compile(r"^vision_model\.embeddings\.patch_embedding\."), "vision.patch_embed.proj."),
+    (re.compile(r"^vision_tower\.vision_model\.embeddings\.position_embedding\."), "vision.pos_embed."),
+    (re.compile(r"^vision_model\.embeddings\.position_embedding\."), "vision.pos_embed."),
+    (re.compile(r"^vision_tower\.vision_model\.post_layernorm\."), "vision.norm."),
+    (re.compile(r"^vision_model\.post_layernorm\."), "vision.norm."),
+)
+
+
+def normalize_vision_name(raw_name: str) -> str:
+    """Normalize a vision-tower tensor key to canonical `<= 47 B` `.amf` form (W20).
+
+    Preserves native Qwen-VL / Qwen3.8 (`visual.*`) and DeepSeek-V4.1 (`vision.*`,
+    `aligner.*`, `image_*`) keys verbatim while compacting verbose HF SigLIP /
+    LLaVA / `vision_tower.*` paths so every name fits the 48-byte `.amf` slot.
+    """
+    name = _strip_model_prefix(raw_name)
+    for pat, repl in _VERBOSE_VISION_PREFIX_RULES:
+        updated = pat.sub(repl, name, count=1)
+        if updated != name:
+            name = updated
+            break
+
+    # Compact standard sub-module names on verbose vision keys (or whenever > 47 B).
+    if len(name.encode("utf-8")) > 47 or name.startswith(("vision.blocks.", "visual.blocks.")):
+        name = name.replace(".self_attn.", ".attn.")
+        name = name.replace(".layer_norm1.", ".norm1.")
+        name = name.replace(".layer_norm2.", ".norm2.")
+        name = name.replace(".input_layernorm.", ".norm1.")
+        name = name.replace(".post_attention_layernorm.", ".norm2.")
+        name = name.replace(".out_proj.", ".proj.")
+        if len(name.encode("utf-8")) > 47:
+            name = name.replace(".linear_fc1.", ".fc1.")
+            name = name.replace(".linear_fc2.", ".fc2.")
+            if name.startswith("multi_modal_projector."):
+                name = "visual.merger." + name[len("multi_modal_projector.") :]
+    return name
+
+
+def is_vision_pinned_float(name: str, shape: Sequence[int] | None = None) -> bool:
+    """Return True if a vision tensor must remain unquantized (`f16`/`bf16`) under W14/W20.
+
+    Keeps `patch_embed`, `pos_embed`, all norms, 1D biases, special image tokens
+    (`image_start`/`image_end`/`image_newline`), and final `merger`/`aligner`
+    projection weights in full 16-bit float precision.
+    """
+    if not is_vision_tensor(name):
+        return False
+    if shape is not None and len(shape) != 2:
+        return True
+    norm_name = normalize_vision_name(name)
+    lower = norm_name.lower()
+    if norm_name in VISION_EXACT_TENSOR_NAMES:
+        return True
+    if "patch_embed" in lower or "pos_embed" in lower or "position_embedding" in lower:
+        return True
+    if "norm" in lower or ".ln_" in lower:
+        return True
+    if lower.startswith(("visual.merger.", "vision.merger.", "aligner.", "multi_modal_projector.")):
+        return True
+    if ".merger." in lower or ".aligner." in lower:
+        return True
+    return False
+
+
+def is_vision_block_linear(name: str, shape: Sequence[int] | None = None) -> bool:
+    """Return True for 2D linear projections inside ViT encoder blocks (`visual.blocks.*` / `vision.blocks.*`)."""
+    if not is_vision_tensor(name) or is_vision_pinned_float(name, shape):
+        return False
+    norm_name = normalize_vision_name(name)
+    if _VISION_BLOCK_RE.search(norm_name) is None:
+        return False
+    return shape is None or len(shape) == 2
 
 # Streaming granularity: raw copies move 8 MiB at a time; dtype conversions
 # process 1 Mi elements at a time. Both bound Python RSS independent of model size.
@@ -410,7 +536,7 @@ def _strip_model_prefix(raw_name: str) -> str:
 
 
 def _normalize_name(raw_name: str) -> str:
-    name = _strip_model_prefix(raw_name)
+    name = normalize_vision_name(raw_name) if is_vision_tensor(raw_name) else _strip_model_prefix(raw_name)
     encoded = name.encode("utf-8")
     if len(encoded) == 0 or len(encoded) > 47:
         raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(encoded)}: {name!r}")
@@ -422,7 +548,7 @@ def _classify_tensor(
     cold_experts: set[tuple[int, int]],
     all_experts_cold: bool,
 ) -> tuple[TensorKind, int, int]:
-    layer_match = _LAYER_RE.search(name)
+    layer_match = _LAYER_RE.search(name) or _VISION_BLOCK_RE.search(name)
     layer = int(layer_match.group(1)) if layer_match else NO_LAYER
     expert_match = _EXPERT_RE.search(name)
     expert = int(expert_match.group(1)) if expert_match else NO_EXPERT
@@ -836,12 +962,15 @@ def _make_entry(
         raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(name_bytes)}: {name!r}")
     if not (1 <= len(shape) <= 4):
         raise ValueError(f"tensor rank must be 1..4 for {name!r}, got {len(shape)}")
-    use_sme2 = _should_sme2_pack(
-        kind,
-        dtype,
-        shape,
-        sme2_pack,
-        sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+    use_sme2 = (
+        not is_vision_tensor(name)
+        and _should_sme2_pack(
+            kind,
+            dtype,
+            shape,
+            sme2_pack,
+            sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+        )
     )
     if use_sme2:
         layout = TensorLayout.SME2_PANEL64
@@ -911,7 +1040,8 @@ def plan_amf_entries(
     tie_word_embeddings: bool = False,
     exclude_tensors: Iterable[str] = (),
     sme2_pack: str = "none",
-    strip_vision: bool = True,
+    strip_vision: bool | None = None,
+    include_vision: bool | None = None,
     sme2_pack_loop_adapters: bool = True,
     stats_out: dict[str, int] | None = None,
 ) -> list[_PlannedEntry]:
@@ -933,15 +1063,26 @@ def plan_amf_entries(
     def is_excluded(raw_name: str) -> bool:
         return raw_name in excluded or _normalize_lenient(raw_name) in excluded
 
+    eff_vision_mode = resolve_vision_mode(
+        tensors.keys(),
+        include_vision=include_vision,
+        strip_vision=strip_vision,
+    )
+    do_strip_vision = eff_vision_mode == "strip"
+
     stripped_vision = 0
+    included_vision = 0
     filtered_tensors: dict[str, _ShardTensor] = {}
     for name, st in tensors.items():
-        if strip_vision and is_vision_tensor(name):
-            stripped_vision += 1
-            continue
+        if is_vision_tensor(name):
+            if do_strip_vision:
+                stripped_vision += 1
+                continue
+            included_vision += 1
         filtered_tensors[name] = st
     if stats_out is not None:
         stats_out["stripped_vision_tensors"] = stripped_vision
+        stats_out["included_vision_tensors"] = included_vision
     tensors = filtered_tensors
 
     quant_prefixes: set[str] = set()
@@ -1087,6 +1228,13 @@ def plan_amf_entries(
             continue
         norm_name = _normalize_name(name)
         kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
+        # Flatten 5D Conv3d vision `patch_embed` weights `[out_c, 3, t_patch, kh, kw]`
+        # into 2D `[out_c, 3 * t_patch * kh * kw]` to fit AMF v0's 4-dim shape slot
+        # and match `vision_ingress.metal`'s exact contiguous tube layout.
+        eff_shape = t.shape
+        if len(eff_shape) == 5 and is_vision_tensor(norm_name) and "patch_embed" in norm_name.lower():
+            flat_in = eff_shape[1] * eff_shape[2] * eff_shape[3] * eff_shape[4]
+            eff_shape = (eff_shape[0], flat_in)
         entries.append(
             _make_entry(
                 norm_name,
@@ -1096,7 +1244,7 @@ def plan_amf_entries(
                 0,
                 layer,
                 expert,
-                t.shape,
+                eff_shape,
                 _full_range(t),
                 convert,
                 sme2_pack=sme2_pack,
@@ -1114,7 +1262,7 @@ def plan_amf_entries(
 
 
 def _normalize_lenient(raw_name: str) -> str:
-    return _strip_model_prefix(raw_name)
+    return normalize_vision_name(raw_name) if is_vision_tensor(raw_name) else _strip_model_prefix(raw_name)
 
 
 class _ShardReaders:
@@ -1362,7 +1510,10 @@ def pack_amf_from_safetensors(
     use_rco: bool = True,
     manifest_path: pathlib.Path | None = None,
     workers: int = 1,
-    strip_vision: bool = True,
+    strip_vision: bool | None = None,
+    include_vision: bool | None = None,
+    vision_sidecar: pathlib.Path | None = None,
+    vision_block_dtype: str = "auto",
     sme2_pack_loop_adapters: bool = True,
     embed_metadata: bool = False,
     config_path: pathlib.Path | None = None,
@@ -1376,14 +1527,58 @@ def pack_amf_from_safetensors(
     preserves existing uniform packing behavior bit-exact; `quant_profile='gsq-rco'`
     runs optional ADR-0017 offline GSQ + RCO per-tensor / per-expert hybrid
     quantization targeting `target_bits` (default 3.25 when omitted).
+
+    W20 vision-tower modes:
+    - default (`include_vision=None, strip_vision=None, vision_sidecar=None`):
+      automatically includes complete multi-layer ViT towers (`visual.blocks.*` /
+      `vision.blocks.*`) while stripping dangling legacy vision stubs.
+    - `include_vision=True` / `strip_vision=False`: keeps all vision tensors in
+      `output_path`.
+    - `strip_vision=True` / `include_vision=False`: strips all vision tensors.
+    - `vision_sidecar=<path>`: extracts all vision tensors into standalone
+      16 KiB-aligned `vision.amf` and omits them from the backbone `.amf`.
     """
     if quant_profile not in QUANT_PROFILES:
         raise ValueError(f"quant_profile must be one of {QUANT_PROFILES}, got {quant_profile!r}")
-    if quant_profile == "gsq-rco":
-        from aminfer_tools.gsq_rco import gsq_convert
+    if vision_block_dtype not in VISION_BLOCK_DTYPES:
+        raise ValueError(
+            f"vision_block_dtype must be one of {VISION_BLOCK_DTYPES}, got {vision_block_dtype!r}"
+        )
 
+    resolved_probe = resolve_checkpoint(pathlib.Path(input_path))
+    probe_tensors = _collect_tensors(resolved_probe.shard_paths)
+    vision_mode = resolve_vision_mode(
+        probe_tensors.keys(),
+        include_vision=include_vision,
+        strip_vision=strip_vision,
+        vision_sidecar=vision_sidecar,
+    )
+    vision_present = any(is_vision_tensor(n) for n in probe_tensors)
+
+    if vision_mode == "sidecar" and vision_sidecar is not None and vision_present:
+        vis_stats: dict[str, int] = {}
+        sidecar_metas = pack_vision_tower_amf(
+            input_path,
+            vision_sidecar,
+            model_id=f"{model_id[:55]}-vision",
+            dtype_mode=dtype_mode,
+            quant_profile=quant_profile,
+            vision_block_dtype=vision_block_dtype,
+            group_size=group_size,
+            use_rco=use_rco,
+            workers=workers,
+            embed_metadata=embed_metadata,
+            config_path=config_path,
+            stats_out=vis_stats,
+        )
+        if stats_out is not None:
+            stats_out["sidecar_vision_tensors"] = len(sidecar_metas)
+
+    eff_strip_for_backbone = vision_mode in ("strip", "sidecar")
+
+    if quant_profile == "gsq-rco":
         eff_target = 3.25 if target_bits is None else float(target_bits)
-        report = gsq_convert(
+        metas_gsq = gsq_convert_with_vision(
             input_path,
             output_path,
             target_bits=eff_target,
@@ -1401,14 +1596,15 @@ def pack_amf_from_safetensors(
             use_rco=use_rco,
             manifest_path=manifest_path,
             workers=workers,
-            strip_vision=strip_vision,
+            strip_vision=eff_strip_for_backbone,
+            include_vision=(vision_mode == "include"),
+            vision_block_dtype=vision_block_dtype,
             stats_out=stats_out,
         )
         if embed_metadata or config_path is not None or tokenizer_path is not None:
-            resolved_gsq = resolve_checkpoint(pathlib.Path(input_path))
             cfg_p, tok_p = _resolve_metadata_paths(
                 pathlib.Path(input_path),
-                resolved_gsq.config_path,
+                resolved_probe.config_path,
                 config_path=config_path,
                 tokenizer_path=tokenizer_path,
             )
@@ -1418,7 +1614,35 @@ def pack_amf_from_safetensors(
                 tokenizer_bytes=tok_p.read_bytes() if tok_p is not None else None,
                 output_path=output_path,
             )
-        return report.metas
+        return metas_gsq
+
+    if vision_mode == "include" and vision_present and vision_block_dtype == "q4_affine":
+        # Pack backbone uniformly + vision with W20 q4_affine block quantization (pins patch_embed/norms/merger).
+        return _pack_uniform_backbone_with_quant_vision(
+            input_path,
+            output_path,
+            resolved=resolved_probe,
+            tensors=probe_tensors,
+            model_id=model_id,
+            group_size=group_size,
+            cold_experts=cold_experts,
+            all_experts_cold=all_experts_cold,
+            dtype_mode=dtype_mode,
+            tie_word_embeddings=tie_word_embeddings,
+            exclude_tensors=exclude_tensors,
+            heat_profile=heat_profile,
+            cold_experts_per_layer=cold_experts_per_layer,
+            sme2_pack=sme2_pack,
+            lut16_sme2=lut16_sme2,
+            use_rco=use_rco,
+            workers=workers,
+            vision_block_dtype=vision_block_dtype,
+            sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+            embed_metadata=embed_metadata,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
+            stats_out=stats_out,
+        )
 
     model_id_bytes = model_id.encode("utf-8")
     if len(model_id_bytes) == 0 or len(model_id_bytes) > 63:
@@ -1436,9 +1660,9 @@ def pack_amf_from_safetensors(
         raise ValueError("cold_experts_per_layer requires heat_profile in pack_amf_from_safetensors")
 
     eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
-    resolved = resolve_checkpoint(pathlib.Path(input_path))
+    resolved = resolved_probe
     tie = _load_tie_flag(resolved.config_path) if tie_word_embeddings is None else tie_word_embeddings
-    tensors = _collect_tensors(resolved.shard_paths)
+    tensors = probe_tensors
     plan = plan_amf_entries(
         tensors,
         group_size=group_size,
@@ -1448,7 +1672,7 @@ def pack_amf_from_safetensors(
         tie_word_embeddings=tie,
         exclude_tensors=exclude_tensors,
         sme2_pack=eff_sme2_pack,
-        strip_vision=strip_vision,
+        strip_vision=eff_strip_for_backbone,
         sme2_pack_loop_adapters=sme2_pack_loop_adapters,
         stats_out=stats_out,
     )
@@ -3361,3 +3585,1021 @@ def repack_amf_sme2(
         partial.unlink(missing_ok=True)
         raise
     return new_metas
+
+
+# ---------------------------------------------------------------------------
+# W20 Vision Tower Packing, W14 GSQ+RCO Vision Policy & Synthetic ViT Bundle
+# ---------------------------------------------------------------------------
+
+
+def _f32_values_to_bf16_bytes(values: Sequence[float]) -> bytes:
+    out = bytearray(len(values) * 2)
+    for i, v in enumerate(values):
+        bits = struct.unpack("<I", struct.pack("<f", float(v)))[0]
+        # Round-to-nearest-even to BF16 (matching PyTorch / IEEE 754).
+        if (bits & 0x7FFFFFFF) > 0x7F800000:
+            bf = (bits >> 16) | 0x0040
+        else:
+            rounding = 0x7FFF + ((bits >> 16) & 1)
+            bf = (bits + rounding) >> 16
+        struct.pack_into("<H", out, i * 2, bf & 0xFFFF)
+    return bytes(out)
+
+
+def _read_planned_entry_bytes(
+    e: _PlannedEntry,
+    readers: _ShardReaders,
+) -> tuple[bytes, bytes]:
+    """Read a planned entry's converted data and optional params bytes from safetensors."""
+    fh = readers.get(e.data.path)
+    raw = _read_exact(fh, e.data.offset, e.data.length)
+    if e.data_convert == "bf16_to_f16":
+        data = bf16_bytes_to_f16_bytes(raw, what=e.name)
+    elif e.data_convert == "f16_to_bf16":
+        data = f16_bytes_to_bf16_bytes(raw)
+    elif e.data_convert == "d2t_i64_to_u32":
+        vals = struct.unpack(f"<{len(raw) // 8}q", raw)
+        data = struct.pack(f"<{len(vals)}I", *vals)
+    elif e.data_convert == "d2t_i32_to_u32":
+        vals = struct.unpack(f"<{len(raw) // 4}i", raw)
+        data = struct.pack(f"<{len(vals)}I", *vals)
+    else:
+        data = raw
+
+    params = b""
+    if e.scales is not None and e.biases is not None:
+        sfh = readers.get(e.scales.path)
+        bfh = readers.get(e.biases.path)
+        s_raw = _read_exact(sfh, e.scales.offset, e.scales.length)
+        b_raw = _read_exact(bfh, e.biases.offset, e.biases.length)
+        s_f16 = _to_f16_chunk(s_raw, e.scales.dtype, f"{e.name}.scales")
+        b_f16 = _to_f16_chunk(b_raw, e.biases.dtype, f"{e.name}.biases")
+        params = interleave_scale_bias_f16(s_f16, b_f16)
+    return data, params
+
+
+def _decode_raw_to_f32_rows(raw: bytes, dtype_str: str, rows: int, cols: int) -> list[list[float]]:
+    if dtype_str == "F16":
+        flat = f16_bytes_to_f32_list(raw)
+    elif dtype_str == "BF16":
+        flat = bf16_bytes_to_f32_list(raw)
+    elif dtype_str == "F32":
+        flat = f32_bytes_to_f32_list(raw)
+    else:
+        raise ValueError(f"unsupported float dtype {dtype_str!r} for vision quantization")
+    return [flat[r * cols : (r + 1) * cols] for r in range(rows)]
+
+
+def _build_vision_records_from_safetensors(
+    vision_tensors: dict[str, _ShardTensor],
+    readers: _ShardReaders,
+    *,
+    dtype_mode: str = "auto",
+    quantize_blocks_q4: bool = False,
+    vision_block_dtype: str = "auto",
+    group_size: int = 64,
+    use_rco: bool = True,
+    workers: int = 1,
+) -> list[tuple]:
+    """Build 12-tuple `write_amf` records for vision-tower tensors with W20 GSQ+RCO policy.
+
+    - Pinned tensors (`patch_embed`, `pos_embed`, all norms, 1D biases, `merger.*`,
+      `aligner.*`, `image_start`/`image_end`/`image_newline`) always remain in `f16`/`bf16`
+      (or source `f32` when `dtype_mode == 'auto'` and source is `F32`).
+    - Vision encoder block 2D linear projections (`visual.blocks.*` / `vision.blocks.*`)
+      are quantized to `q4_affine` (via W14 RCO when `use_rco=True`) when
+      `quantize_blocks_q4` or `vision_block_dtype == 'q4_affine'` and `K % group_size == 0`,
+      or kept in `f16`/`bf16`.
+    """
+    if vision_block_dtype not in VISION_BLOCK_DTYPES:
+        raise ValueError(
+            f"vision_block_dtype must be one of {VISION_BLOCK_DTYPES}, got {vision_block_dtype!r}"
+        )
+    plan = plan_amf_entries(
+        vision_tensors,
+        group_size=group_size,
+        dtype_mode=dtype_mode,
+        tie_word_embeddings=False,
+        sme2_pack="none",
+        strip_vision=False,
+    )
+    should_q4_blocks = (vision_block_dtype == "q4_affine") or (
+        quantize_blocks_q4 and vision_block_dtype == "auto"
+    )
+    quant_fn = None
+    if should_q4_blocks:
+        from aminfer_tools.gsq_rco import quantize_rows_affine
+
+        quant_fn = quantize_rows_affine
+
+    used_names: set[str] = set()
+    records: list[tuple] = []
+    for e in plan:
+        pinned = is_vision_pinned_float(e.name, e.shape)
+        is_block_lin = is_vision_block_linear(e.name, e.shape)
+
+        if (
+            e.quant_bits == 0
+            and is_block_lin
+            and not pinned
+            and should_q4_blocks
+            and quant_fn is not None
+            and len(e.shape) == 2
+            and e.shape[1] > 0
+            and e.shape[1] % group_size == 0
+            and e.data.dtype in ("F16", "BF16", "F32")
+        ):
+            fh = readers.get(e.data.path)
+            raw = _read_exact(fh, e.data.offset, e.data.length)
+            rows = _decode_raw_to_f32_rows(raw, e.data.dtype, e.shape[0], e.shape[1])
+            q_data, q_params, _mse, _mm_mse = quant_fn(
+                rows,
+                bits=4,
+                group_size=group_size,
+                use_rco=use_rco,
+            )
+            out_name = e.name[: -len(".weight")] if e.name.endswith(".weight") else e.name
+            if out_name in used_names:
+                out_name = e.name
+            used_names.add(out_name)
+            records.append(
+                (
+                    out_name,
+                    e.kind,
+                    DType.Q4_AFFINE,
+                    4,
+                    group_size,
+                    e.layer,
+                    e.expert,
+                    e.shape,
+                    q_data,
+                    q_params,
+                    TensorLayout.ROW_MAJOR,
+                    QuantParamKind.AFFINE_SCALE_BIAS,
+                )
+            )
+            continue
+
+        data, params = _read_planned_entry_bytes(e, readers)
+        out_dtype = e.dtype
+        if e.quant_bits == 0 and is_block_lin and vision_block_dtype in ("f16", "bf16"):
+            if vision_block_dtype == "f16" and out_dtype == DType.BF16:
+                data = bf16_bytes_to_f16_bytes(data, what=e.name)
+                out_dtype = DType.F16
+            elif vision_block_dtype == "bf16" and out_dtype == DType.F16:
+                data = f16_bytes_to_bf16_bytes(data)
+                out_dtype = DType.BF16
+        elif e.quant_bits == 0 and pinned and out_dtype == DType.F32 and dtype_mode in ("f16", "bf16"):
+            f32_vals = f32_bytes_to_f32_list(data)
+            if dtype_mode == "f16":
+                data = f32_values_to_f16_bytes(f32_vals, what=e.name)
+                out_dtype = DType.F16
+            else:
+                data = _f32_values_to_bf16_bytes(f32_vals)
+                out_dtype = DType.BF16
+        used_names.add(e.name)
+        records.append(
+            (
+                e.name,
+                e.kind,
+                out_dtype,
+                e.quant_bits,
+                e.group_size,
+                e.layer,
+                e.expert,
+                e.shape,
+                data,
+                params,
+                e.layout,
+                e.quant_param_kind,
+            )
+        )
+    records.sort(key=lambda r: _natural_key(r[0]))
+    return records
+
+
+def _build_vision_records_from_amf(
+    reader: AmfReader,
+    *,
+    dtype_mode: str = "auto",
+    quantize_blocks_q4: bool = False,
+    vision_block_dtype: str = "auto",
+    group_size: int = 64,
+    use_rco: bool = True,
+    workers: int = 1,
+) -> list[tuple]:
+    """Extract and optionally W20-quantize vision entries from an existing `.amf`."""
+    should_q4_blocks = (vision_block_dtype == "q4_affine") or (
+        quantize_blocks_q4 and vision_block_dtype == "auto"
+    )
+    quant_fn = None
+    if should_q4_blocks:
+        from aminfer_tools.gsq_rco import quantize_rows_affine
+
+        quant_fn = quantize_rows_affine
+
+    used_names: set[str] = set()
+    records: list[tuple] = []
+    for m in reader.entries:
+        if not is_vision_tensor(m.name):
+            continue
+        norm_name = _normalize_name(m.name)
+        pinned = is_vision_pinned_float(norm_name, m.shape)
+        is_block_lin = is_vision_block_linear(norm_name, m.shape)
+        blob = reader.read_blob(m, verify_crc=True)
+        data = blob[: m.data_bytes]
+        params = blob[m.params_offset : m.params_offset + m.params_bytes] if m.params_bytes > 0 else b""
+
+        if (
+            m.quant_bits == 0
+            and is_block_lin
+            and not pinned
+            and should_q4_blocks
+            and quant_fn is not None
+            and len(m.shape) == 2
+            and m.shape[1] > 0
+            and m.shape[1] % group_size == 0
+            and m.dtype in (DType.F16, DType.BF16, DType.F32)
+        ):
+            src_dt_str = m.dtype.name
+            rows = _decode_raw_to_f32_rows(data, src_dt_str, m.shape[0], m.shape[1])
+            q_data, q_params, _mse, _mm_mse = quant_fn(
+                rows,
+                bits=4,
+                group_size=group_size,
+                use_rco=use_rco,
+            )
+            out_name = norm_name[: -len(".weight")] if norm_name.endswith(".weight") else norm_name
+            if out_name in used_names:
+                out_name = norm_name
+            used_names.add(out_name)
+            records.append(
+                (
+                    out_name,
+                    m.kind,
+                    DType.Q4_AFFINE,
+                    4,
+                    group_size,
+                    m.layer,
+                    m.expert,
+                    m.shape,
+                    q_data,
+                    q_params,
+                    TensorLayout.ROW_MAJOR,
+                    QuantParamKind.AFFINE_SCALE_BIAS,
+                )
+            )
+            continue
+
+        out_dtype = m.dtype
+        if m.quant_bits == 0:
+            want = vision_block_dtype if (is_block_lin and vision_block_dtype in ("f16", "bf16")) else dtype_mode
+            if want == "f16" and out_dtype == DType.BF16:
+                data = bf16_bytes_to_f16_bytes(data, what=norm_name)
+                out_dtype = DType.F16
+            elif want == "bf16" and out_dtype == DType.F16:
+                data = f16_bytes_to_bf16_bytes(data)
+                out_dtype = DType.BF16
+        used_names.add(norm_name)
+        records.append(
+            (
+                norm_name,
+                m.kind,
+                out_dtype,
+                m.quant_bits,
+                m.group_size,
+                m.layer,
+                m.expert,
+                m.shape,
+                data,
+                params,
+                m.layout,
+                m.quant_param_kind,
+            )
+        )
+    records.sort(key=lambda r: _natural_key(r[0]))
+    return records
+
+
+def _merge_amf_with_vision_records(
+    backbone_amf_path: pathlib.Path,
+    vision_records: Sequence[tuple],
+    output_path: pathlib.Path,
+    *,
+    model_id: str,
+) -> list[PackedTensorMeta]:
+    """Merge an existing 16 KiB-aligned backbone `.amf` with W20 vision records cleanly."""
+    combined_records: list[tuple] = []
+    seen_names: set[str] = set()
+    with AmfReader(backbone_amf_path, verify_header_crc=True, verify_dir_crc=True) as rdr:
+        for m in rdr.entries:
+            if is_vision_tensor(m.name):
+                continue
+            blob = rdr.read_blob(m, verify_crc=True)
+            data = blob[: m.data_bytes]
+            params = blob[m.params_offset : m.params_offset + m.params_bytes] if m.params_bytes > 0 else b""
+            seen_names.add(m.name)
+            combined_records.append(
+                (
+                    m.name,
+                    m.kind,
+                    m.dtype,
+                    m.quant_bits,
+                    m.group_size,
+                    m.layer,
+                    m.expert,
+                    m.shape,
+                    data,
+                    params,
+                    m.layout,
+                    m.quant_param_kind,
+                )
+            )
+    for rec in vision_records:
+        if rec[0] in seen_names:
+            raise ValueError(f"duplicate tensor name when merging vision tower: {rec[0]!r}")
+        seen_names.add(rec[0])
+        combined_records.append(rec)
+
+    meta_recs = [r for r in combined_records if r[1] == TensorKind.METADATA]
+    weight_recs = [r for r in combined_records if r[1] != TensorKind.METADATA]
+    weight_recs.sort(key=lambda r: _natural_key(r[0]))
+    ordered = weight_recs + meta_recs
+
+    out_path = pathlib.Path(output_path)
+    partial = out_path.with_name(out_path.name + ".merge.partial")
+    try:
+        metas = write_amf(partial, model_id, ordered)
+        os.replace(partial, out_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    return metas
+
+
+def _pack_uniform_backbone_with_quant_vision(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    *,
+    resolved: ResolvedCheckpoint,
+    tensors: dict[str, _ShardTensor],
+    model_id: str,
+    group_size: int,
+    cold_experts: Iterable[tuple[int, int]],
+    all_experts_cold: bool,
+    dtype_mode: str,
+    tie_word_embeddings: bool | None,
+    exclude_tensors: Iterable[str],
+    heat_profile: pathlib.Path | None,
+    cold_experts_per_layer: int | None,
+    sme2_pack: str,
+    lut16_sme2: bool,
+    use_rco: bool,
+    workers: int,
+    vision_block_dtype: str,
+    sme2_pack_loop_adapters: bool,
+    embed_metadata: bool,
+    config_path: pathlib.Path | None,
+    tokenizer_path: pathlib.Path | None,
+    stats_out: dict[str, int] | None,
+) -> list[PackedTensorMeta]:
+    vision_tensors = {k: v for k, v in tensors.items() if is_vision_tensor(k)}
+    backbone_tensors = {k: v for k, v in tensors.items() if not is_vision_tensor(k)}
+    if not backbone_tensors:
+        return pack_vision_tower_amf(
+            input_path,
+            output_path,
+            model_id=model_id,
+            dtype_mode=dtype_mode,
+            quant_profile="uniform",
+            vision_block_dtype=vision_block_dtype,
+            group_size=group_size,
+            use_rco=use_rco,
+            workers=workers,
+            embed_metadata=embed_metadata,
+            config_path=config_path,
+            stats_out=stats_out,
+        )
+
+    out_path = pathlib.Path(output_path)
+    tmp_backbone = out_path.with_name(out_path.name + ".bb.partial")
+    readers = _ShardReaders()
+    try:
+        pack_amf_from_safetensors(
+            input_path,
+            tmp_backbone,
+            model_id=model_id,
+            group_size=group_size,
+            cold_experts=cold_experts,
+            all_experts_cold=all_experts_cold,
+            dtype_mode=dtype_mode,
+            tie_word_embeddings=tie_word_embeddings,
+            exclude_tensors=exclude_tensors,
+            heat_profile=heat_profile,
+            cold_experts_per_layer=cold_experts_per_layer,
+            sme2_pack=sme2_pack,
+            lut16_sme2=lut16_sme2,
+            quant_profile="uniform",
+            strip_vision=True,
+            sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+            embed_metadata=embed_metadata,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
+        )
+        vis_recs = _build_vision_records_from_safetensors(
+            vision_tensors,
+            readers,
+            dtype_mode=dtype_mode,
+            quantize_blocks_q4=(vision_block_dtype == "q4_affine"),
+            vision_block_dtype=vision_block_dtype,
+            group_size=group_size,
+            use_rco=use_rco,
+            workers=workers,
+        )
+        metas = _merge_amf_with_vision_records(tmp_backbone, vis_recs, out_path, model_id=model_id)
+        if stats_out is not None:
+            stats_out["stripped_vision_tensors"] = 0
+            stats_out["included_vision_tensors"] = len(vis_recs)
+        return metas
+    finally:
+        readers.close()
+        tmp_backbone.unlink(missing_ok=True)
+
+
+def pack_vision_tower_amf(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    *,
+    model_id: str = "vision-tower",
+    dtype_mode: str = "auto",
+    quant_profile: str = "uniform",
+    vision_block_dtype: str = "auto",
+    group_size: int = 64,
+    use_rco: bool = True,
+    workers: int = 1,
+    embed_metadata: bool = False,
+    config_path: pathlib.Path | None = None,
+    stats_out: dict[str, int] | None = None,
+) -> list[PackedTensorMeta]:
+    """Pack only the multimodal vision tower into a standalone 16 KiB-aligned `vision.amf` (W20).
+
+    Supports both single/multi-shard safetensors checkpoints and existing `.amf` files.
+    Under `quant_profile='gsq-rco'` (or `vision_block_dtype='q4_affine'`), pins
+    `patch_embed`, `pos_embed`, all norms, biases, and `merger`/`aligner` in `f16`/`bf16`
+    while quantizing vision encoder block 2D projections to `q4_affine`.
+    """
+    if quant_profile not in QUANT_PROFILES:
+        raise ValueError(f"quant_profile must be one of {QUANT_PROFILES}, got {quant_profile!r}")
+    if vision_block_dtype not in VISION_BLOCK_DTYPES:
+        raise ValueError(
+            f"vision_block_dtype must be one of {VISION_BLOCK_DTYPES}, got {vision_block_dtype!r}"
+        )
+    if group_size != 64:
+        raise ValueError(f"aminfer v0 supports group_size=64 only, got {group_size}")
+
+    in_path = pathlib.Path(input_path)
+    out_path = pathlib.Path(output_path)
+    quantize_blocks_q4 = (quant_profile == "gsq-rco") or (vision_block_dtype == "q4_affine")
+    src_config: dict[str, object] = {}
+
+    if in_path.is_file() and in_path.suffix == ".amf":
+        with AmfReader(in_path, verify_header_crc=True, verify_dir_crc=True) as rdr:
+            records = _build_vision_records_from_amf(
+                rdr,
+                dtype_mode=dtype_mode,
+                quantize_blocks_q4=quantize_blocks_q4,
+                vision_block_dtype=vision_block_dtype,
+                group_size=group_size,
+                use_rco=use_rco,
+                workers=workers,
+            )
+            if META_CONFIG_JSON in rdr.by_name:
+                raw_cfg = rdr.read_metadata_bytes(META_CONFIG_JSON, verify_crc=True)
+                loaded = json.loads(raw_cfg.decode("utf-8"))
+                if isinstance(loaded, dict):
+                    src_config = loaded
+    else:
+        resolved = resolve_checkpoint(in_path)
+        if resolved.config_path is not None and resolved.config_path.is_file():
+            loaded = json.loads(resolved.config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                src_config = loaded
+        all_tensors = _collect_tensors(resolved.shard_paths)
+        vision_tensors = {k: v for k, v in all_tensors.items() if is_vision_tensor(k)}
+        if not vision_tensors:
+            raise ValueError(f"no vision tensors found in {in_path}")
+        readers = _ShardReaders()
+        try:
+            records = _build_vision_records_from_safetensors(
+                vision_tensors,
+                readers,
+                dtype_mode=dtype_mode,
+                quantize_blocks_q4=quantize_blocks_q4,
+                vision_block_dtype=vision_block_dtype,
+                group_size=group_size,
+                use_rco=use_rco,
+                workers=workers,
+            )
+        finally:
+            readers.close()
+
+    if not records:
+        raise ValueError(f"no vision tensors found in {in_path}")
+
+    if config_path is not None and pathlib.Path(config_path).is_file():
+        loaded = json.loads(pathlib.Path(config_path).read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            src_config = loaded
+
+    partial = out_path.with_name(out_path.name + ".vis.partial")
+    try:
+        metas = write_amf(partial, model_id[:63], records)
+        if embed_metadata or config_path is not None:
+            summary = extract_vision_config_summary(metas, src_config=src_config)
+            cfg_payload = dict(src_config)
+            cfg_payload["vision_tower_summary"] = summary
+            metas = embed_metadata_into_amf(
+                partial,
+                config_bytes=(json.dumps(cfg_payload, indent=2) + "\n").encode("utf-8"),
+                output_path=partial,
+            )
+        os.replace(partial, out_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+    if stats_out is not None:
+        stats_out["sidecar_vision_tensors"] = len([m for m in metas if m.kind != TensorKind.METADATA])
+    return metas
+
+
+def gsq_convert_with_vision(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    *,
+    target_bits: float,
+    model_id: str | None = None,
+    group_size: int = 64,
+    dtype_mode: str = "auto",
+    heat_profile: pathlib.Path | None = None,
+    cold_experts: Iterable[tuple[int, int]] = (),
+    cold_experts_per_layer: int | None = None,
+    all_experts_cold: bool = False,
+    tie_word_embeddings: bool | None = None,
+    exclude_tensors: Iterable[str] = (),
+    sme2_pack: str = "none",
+    lut16_sme2: bool = False,
+    use_rco: bool = True,
+    rco_iters: int = 3,
+    lloyd_iters: int = 10,
+    sample_rows: int = 32,
+    manifest_path: pathlib.Path | None = None,
+    workers: int = 1,
+    strip_vision: bool | None = None,
+    include_vision: bool | None = None,
+    vision_sidecar: pathlib.Path | None = None,
+    vision_block_dtype: str = "auto",
+    stats_out: dict[str, int] | None = None,
+) -> list[PackedTensorMeta]:
+    """Run W14 GSQ+RCO with W20 vision-tower precision policy.
+
+    Keeps `patch_embed`, `pos_embed`, norms, 1D biases, and final `merger`/`aligner`
+    tensors in `f16`/`bf16`, while quantizing vision encoder block 2D projections to
+    `q4_affine` (unless `vision_block_dtype` pins them to `f16`/`bf16`).
+    """
+    from aminfer_tools.gsq_rco import gsq_convert
+
+    in_path = pathlib.Path(input_path)
+    out_path = pathlib.Path(output_path)
+    eff_model_id = model_id or out_path.stem[:63]
+
+    is_amf_in = in_path.is_file() and in_path.suffix == ".amf"
+    if is_amf_in:
+        with AmfReader(in_path, verify_header_crc=True, verify_dir_crc=True) as rdr:
+            all_names = [m.name for m in rdr.entries if m.kind != TensorKind.METADATA]
+            if model_id is None:
+                eff_model_id = rdr.header.model_id or eff_model_id
+    else:
+        resolved = resolve_checkpoint(in_path)
+        all_tensors = _collect_tensors(resolved.shard_paths)
+        all_names = list(all_tensors.keys())
+
+    vision_mode = resolve_vision_mode(
+        all_names,
+        include_vision=include_vision,
+        strip_vision=strip_vision,
+        vision_sidecar=vision_sidecar,
+    )
+    vision_names = [n for n in all_names if is_vision_tensor(n)]
+    backbone_names = [n for n in all_names if not is_vision_tensor(n)]
+
+    if vision_mode == "sidecar" and vision_sidecar is not None and vision_names:
+        pack_vision_tower_amf(
+            in_path,
+            vision_sidecar,
+            model_id=f"{eff_model_id[:55]}-vision",
+            dtype_mode=dtype_mode,
+            quant_profile="gsq-rco",
+            vision_block_dtype=vision_block_dtype,
+            group_size=group_size,
+            use_rco=use_rco,
+            workers=workers,
+            stats_out=stats_out,
+        )
+
+    if vision_mode == "strip" or not vision_names or vision_mode == "sidecar":
+        if not backbone_names:
+            raise ValueError(f"no non-vision tensors left to pack in {in_path}")
+        rep = gsq_convert(
+            in_path,
+            out_path,
+            target_bits=target_bits,
+            model_id=eff_model_id,
+            group_size=group_size,
+            dtype_mode=dtype_mode,
+            heat_profile=heat_profile,
+            cold_experts=cold_experts,
+            cold_experts_per_layer=cold_experts_per_layer,
+            all_experts_cold=all_experts_cold,
+            tie_word_embeddings=tie_word_embeddings,
+            exclude_tensors=exclude_tensors,
+            sme2_pack=sme2_pack,
+            lut16_sme2=lut16_sme2,
+            use_rco=use_rco,
+            rco_iters=rco_iters,
+            lloyd_iters=lloyd_iters,
+            sample_rows=sample_rows,
+            manifest_path=manifest_path,
+            workers=workers,
+            strip_vision=True,
+            stats_out=stats_out,
+        )
+        return rep.metas
+
+    # vision_mode == "include" and vision_names is non-empty:
+    if not backbone_names:
+        return pack_vision_tower_amf(
+            in_path,
+            out_path,
+            model_id=eff_model_id,
+            dtype_mode=dtype_mode,
+            quant_profile="gsq-rco",
+            vision_block_dtype=vision_block_dtype,
+            group_size=group_size,
+            use_rco=use_rco,
+            workers=workers,
+            stats_out=stats_out,
+        )
+
+    tmp_bb = out_path.with_name(out_path.name + ".gsq_bb.partial")
+    try:
+        gsq_convert(
+            in_path,
+            tmp_bb,
+            target_bits=target_bits,
+            model_id=eff_model_id,
+            group_size=group_size,
+            dtype_mode=dtype_mode,
+            heat_profile=heat_profile,
+            cold_experts=cold_experts,
+            cold_experts_per_layer=cold_experts_per_layer,
+            all_experts_cold=all_experts_cold,
+            tie_word_embeddings=tie_word_embeddings,
+            exclude_tensors=exclude_tensors,
+            sme2_pack=sme2_pack,
+            lut16_sme2=lut16_sme2,
+            use_rco=use_rco,
+            rco_iters=rco_iters,
+            lloyd_iters=lloyd_iters,
+            sample_rows=sample_rows,
+            manifest_path=manifest_path,
+            workers=workers,
+            strip_vision=True,
+        )
+        if is_amf_in:
+            with AmfReader(in_path, verify_header_crc=True, verify_dir_crc=True) as rdr:
+                vis_recs = _build_vision_records_from_amf(
+                    rdr,
+                    dtype_mode=dtype_mode,
+                    quantize_blocks_q4=True,
+                    vision_block_dtype=vision_block_dtype,
+                    group_size=group_size,
+                    use_rco=use_rco,
+                    workers=workers,
+                )
+        else:
+            vision_only = {k: v for k, v in all_tensors.items() if is_vision_tensor(k)}
+            readers = _ShardReaders()
+            try:
+                vis_recs = _build_vision_records_from_safetensors(
+                    vision_only,
+                    readers,
+                    dtype_mode=dtype_mode,
+                    quantize_blocks_q4=True,
+                    vision_block_dtype=vision_block_dtype,
+                    group_size=group_size,
+                    use_rco=use_rco,
+                    workers=workers,
+                )
+            finally:
+                readers.close()
+
+        metas = _merge_amf_with_vision_records(tmp_bb, vis_recs, out_path, model_id=eff_model_id)
+        if stats_out is not None:
+            stats_out["stripped_vision_tensors"] = 0
+            stats_out["included_vision_tensors"] = len(vis_recs)
+        if manifest_path is not None and pathlib.Path(manifest_path).is_file():
+            mpath = pathlib.Path(manifest_path)
+            manifest_obj = json.loads(mpath.read_text(encoding="utf-8"))
+            if isinstance(manifest_obj, dict):
+                manifest_obj["vision_tower"] = extract_vision_config_summary(
+                    [m for m in metas if is_vision_tensor(m.name)]
+                )
+                mpath.write_text(json.dumps(manifest_obj, indent=2) + "\n", encoding="utf-8")
+        return metas
+    finally:
+        tmp_bb.unlink(missing_ok=True)
+
+
+def extract_vision_config_summary(
+    metas: Sequence[PackedTensorMeta],
+    *,
+    src_config: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Summarize packed W20 vision-tower geometry and precision breakdown for `config.json`."""
+    vis_metas = [m for m in metas if is_vision_tensor(m.name)]
+    block_ids: set[int] = set()
+    dtype_counts: dict[str, int] = {}
+    has_qwen_visual = False
+    has_deepseek_vision = False
+    vis_hidden = 0
+    vis_inter = 0
+    out_hidden = 0
+
+    for m in vis_metas:
+        dt_key = m.dtype.name.lower()
+        dtype_counts[dt_key] = dtype_counts.get(dt_key, 0) + 1
+        if m.name.startswith("visual."):
+            has_qwen_visual = True
+        if m.name.startswith(("vision.", "aligner.")):
+            has_deepseek_vision = True
+        bm = _VISION_BLOCK_RE.search(m.name)
+        if bm is not None:
+            block_ids.add(int(bm.group(1)))
+            if (".attn.proj" in m.name or ".attn.wo" in m.name) and len(m.shape) == 2:
+                vis_hidden = max(vis_hidden, m.shape[0])
+            if (".mlp.linear_fc1" in m.name or ".mlp.w1" in m.name or ".mlp.gate_proj" in m.name) and len(m.shape) == 2:
+                vis_inter = max(vis_inter, m.shape[0])
+                if vis_hidden == 0:
+                    vis_hidden = m.shape[1]
+        if (m.name.startswith(("visual.merger.linear_fc2", "visual.merger.mlp.2", "aligner.w2"))) and len(m.shape) == 2:
+            out_hidden = max(out_hidden, m.shape[0])
+
+    vcfg = src_config.get("vision_config") if isinstance(src_config, dict) and isinstance(src_config.get("vision_config"), dict) else {}
+    family = "deepseek_v41" if (has_deepseek_vision and not has_qwen_visual) else "qwen_vl"
+    return {
+        "family": family,
+        "vision_tensor_count": len(vis_metas),
+        "num_vision_layers": len(block_ids) if block_ids else int(vcfg.get("depth", vcfg.get("num_hidden_layers", 0)) or 0),
+        "vision_hidden_size": vis_hidden or int(vcfg.get("hidden_size", 0) or 0),
+        "vision_intermediate_size": vis_inter or int(vcfg.get("intermediate_size", 0) or 0),
+        "out_hidden_size": out_hidden or int(vcfg.get("out_hidden_size", 0) or 0),
+        "patch_size": int(vcfg.get("patch_size", 14 if family == "deepseek_v41" else 16) or 14),
+        "temporal_patch_size": int(vcfg.get("temporal_patch_size", 1 if family == "deepseek_v41" else 2) or 1),
+        "spatial_merge_size": int(vcfg.get("spatial_merge_size", vcfg.get("downsample_ratio", 2)) or 2),
+        "dtype_counts": dtype_counts,
+    }
+
+
+@dataclass(frozen=True)
+class SyntheticVitConfig:
+    """Deterministic synthetic multi-layer ViT + PatchMerger/Aligner generator config (W20)."""
+
+    family: str = "qwen_vl"  # "qwen_vl" or "deepseek_v41"
+    num_vision_layers: int = 4
+    vision_hidden_size: int = 128
+    vision_intermediate_size: int = 256
+    vision_num_heads: int = 4
+    out_hidden_size: int = 128
+    patch_size: int = 14
+    temporal_patch_size: int = 2
+    spatial_merge_size: int = 2
+    num_position_embeddings: int = 16
+    mlp_act: str = "gelu"  # "gelu" or "swiglu"
+    dtype: str = "bf16"  # "bf16" or "f16"
+    use_conv3d_patch_embed: bool = True
+    include_language_backbone: bool = False
+    backbone_layers: int = 2
+    vocab_size: int = 128
+    model_id: str = "synth-vit-tower"
+
+
+def _write_simple_safetensors(
+    path: pathlib.Path,
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]],
+) -> None:
+    header: dict[str, object] = {}
+    chunks: list[bytes] = []
+    offset = 0
+    for name in sorted(tensors):
+        dt, shape, payload = tensors[name]
+        header[name] = {
+            "dtype": dt,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + len(payload)],
+        }
+        chunks.append(payload)
+        offset += len(payload)
+    hdr_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    pad = (8 - (len(hdr_bytes) % 8)) % 8
+    hdr_bytes += b" " * pad
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fh:
+        fh.write(struct.pack("<Q", len(hdr_bytes)))
+        fh.write(hdr_bytes)
+        for c in chunks:
+            fh.write(c)
+
+
+def generate_synth_vit_checkpoint(
+    output_dir: pathlib.Path,
+    config: SyntheticVitConfig | None = None,
+    *,
+    seed: int = 42,
+) -> tuple[pathlib.Path, dict[str, object]]:
+    """Generate a deterministic safetensors checkpoint containing a full multi-layer ViT tower (W20).
+
+    Supports both `qwen_vl` (`model.visual.*`: `patch_embed`, `pos_embed`, `blocks.0..N-1`,
+    `merger.*`) and `deepseek_v41` (`vision.*` + `aligner.*` + `image_start/end/newline`),
+    plus an optional minimal language backbone for end-to-end multimodal packing tests.
+    """
+    cfg = config or SyntheticVitConfig()
+    if cfg.family not in ("qwen_vl", "deepseek_v41"):
+        raise ValueError(f"family must be 'qwen_vl' or 'deepseek_v41', got {cfg.family!r}")
+    if cfg.dtype not in ("bf16", "f16"):
+        raise ValueError(f"dtype must be 'bf16' or 'f16', got {cfg.dtype!r}")
+    if cfg.mlp_act not in ("gelu", "swiglu"):
+        raise ValueError(f"mlp_act must be 'gelu' or 'swiglu', got {cfg.mlp_act!r}")
+    if cfg.num_vision_layers < 1:
+        raise ValueError(f"num_vision_layers must be >= 1, got {cfg.num_vision_layers}")
+
+    rng = random.Random(seed)
+    sf_dt = "BF16" if cfg.dtype == "bf16" else "F16"
+    enc = _f32_values_to_bf16_bytes if cfg.dtype == "bf16" else lambda vals: f32_values_to_f16_bytes(vals, what="vit")
+
+    def _mat(rows: int, cols: int, std: float = 0.05) -> bytes:
+        return enc([rng.gauss(0.0, std) for _ in range(rows * cols)])
+
+    def _vec(n: int, val: float = 1.0) -> bytes:
+        return enc([val] * n)
+
+    dv = cfg.vision_hidden_size
+    df = cfg.vision_intermediate_size
+    dl = cfg.out_hidden_size
+    p = cfg.patch_size
+    tp = cfg.temporal_patch_size if cfg.family == "qwen_vl" else 1
+    sm = cfg.spatial_merge_size
+    merger_in = dv * sm * sm
+
+    tensors: dict[str, tuple[str, tuple[int, ...], bytes]] = {}
+    if cfg.family == "qwen_vl":
+        if cfg.use_conv3d_patch_embed:
+            pe_shape: tuple[int, ...] = (dv, 3, tp, p, p)
+        else:
+            pe_shape = (dv, 3 * tp * p * p)
+        pe_numel = dv * 3 * tp * p * p
+        tensors["model.visual.patch_embed.proj.weight"] = (sf_dt, pe_shape, _mat(1, pe_numel, 0.03))
+        tensors["model.visual.patch_embed.proj.bias"] = (sf_dt, (dv,), _vec(dv, 0.0))
+        tensors["model.visual.pos_embed.weight"] = (sf_dt, (cfg.num_position_embeddings, dv), _mat(cfg.num_position_embeddings, dv, 0.02))
+        for blk in range(cfg.num_vision_layers):
+            bp = f"model.visual.blocks.{blk}"
+            tensors[f"{bp}.norm1.weight"] = (sf_dt, (dv,), _vec(dv, 1.0))
+            tensors[f"{bp}.norm1.bias"] = (sf_dt, (dv,), _vec(dv, 0.0))
+            tensors[f"{bp}.attn.qkv.weight"] = (sf_dt, (3 * dv, dv), _mat(3 * dv, dv))
+            tensors[f"{bp}.attn.qkv.bias"] = (sf_dt, (3 * dv,), _vec(3 * dv, 0.0))
+            tensors[f"{bp}.attn.proj.weight"] = (sf_dt, (dv, dv), _mat(dv, dv))
+            tensors[f"{bp}.attn.proj.bias"] = (sf_dt, (dv,), _vec(dv, 0.0))
+            tensors[f"{bp}.norm2.weight"] = (sf_dt, (dv,), _vec(dv, 1.0))
+            tensors[f"{bp}.norm2.bias"] = (sf_dt, (dv,), _vec(dv, 0.0))
+            if cfg.mlp_act == "swiglu":
+                tensors[f"{bp}.mlp.gate_proj.weight"] = (sf_dt, (df, dv), _mat(df, dv))
+                tensors[f"{bp}.mlp.up_proj.weight"] = (sf_dt, (df, dv), _mat(df, dv))
+                tensors[f"{bp}.mlp.down_proj.weight"] = (sf_dt, (dv, df), _mat(dv, df))
+            else:
+                tensors[f"{bp}.mlp.linear_fc1.weight"] = (sf_dt, (df, dv), _mat(df, dv))
+                tensors[f"{bp}.mlp.linear_fc1.bias"] = (sf_dt, (df,), _vec(df, 0.0))
+                tensors[f"{bp}.mlp.linear_fc2.weight"] = (sf_dt, (dv, df), _mat(dv, df))
+                tensors[f"{bp}.mlp.linear_fc2.bias"] = (sf_dt, (dv,), _vec(dv, 0.0))
+        tensors["model.visual.merger.norm.weight"] = (sf_dt, (dv,), _vec(dv, 1.0))
+        tensors["model.visual.merger.norm.bias"] = (sf_dt, (dv,), _vec(dv, 0.0))
+        tensors["model.visual.merger.linear_fc1.weight"] = (sf_dt, (merger_in, merger_in), _mat(merger_in, merger_in))
+        tensors["model.visual.merger.linear_fc1.bias"] = (sf_dt, (merger_in,), _vec(merger_in, 0.0))
+        tensors["model.visual.merger.linear_fc2.weight"] = (sf_dt, (dl, merger_in), _mat(dl, merger_in))
+        tensors["model.visual.merger.linear_fc2.bias"] = (sf_dt, (dl,), _vec(dl, 0.0))
+        vision_cfg_json: dict[str, object] = {
+            "model_type": "qwen4_exp",
+            "depth": cfg.num_vision_layers,
+            "hidden_size": dv,
+            "intermediate_size": df,
+            "num_heads": cfg.vision_num_heads,
+            "out_hidden_size": dl,
+            "patch_size": p,
+            "temporal_patch_size": tp,
+            "spatial_merge_size": sm,
+            "num_position_embeddings": cfg.num_position_embeddings,
+            "hidden_act": "gelu_pytorch_tanh" if cfg.mlp_act == "gelu" else "silu",
+        }
+    else:
+        # DeepSeek-V4.1 vision tower (`vision.*` + `aligner.*` + `image_*`).
+        tensors["vision.patch_embed.proj.weight"] = (sf_dt, (dv, 3, p, p), _mat(1, dv * 3 * p * p, 0.03))
+        tensors["vision.patch_embed.proj.bias"] = (sf_dt, (dv,), _vec(dv, 0.0))
+        for blk in range(cfg.num_vision_layers):
+            bp = f"vision.blocks.{blk}"
+            tensors[f"{bp}.norm1.weight"] = (sf_dt, (dv,), _vec(dv, 1.0))
+            tensors[f"{bp}.attn.wqkv.weight"] = (sf_dt, (3 * dv, dv), _mat(3 * dv, dv))
+            tensors[f"{bp}.attn.wqkv.bias"] = (sf_dt, (3 * dv,), _vec(3 * dv, 0.0))
+            tensors[f"{bp}.attn.wo.weight"] = (sf_dt, (dv, dv), _mat(dv, dv))
+            tensors[f"{bp}.attn.wo.bias"] = (sf_dt, (dv,), _vec(dv, 0.0))
+            tensors[f"{bp}.norm2.weight"] = (sf_dt, (dv,), _vec(dv, 1.0))
+            tensors[f"{bp}.mlp.w1.weight"] = (sf_dt, (df, dv), _mat(df, dv))
+            if cfg.mlp_act == "swiglu":
+                tensors[f"{bp}.mlp.w3.weight"] = (sf_dt, (df, dv), _mat(df, dv))
+            tensors[f"{bp}.mlp.w2.weight"] = (sf_dt, (dv, df), _mat(dv, df))
+        tensors["vision.norm.weight"] = (sf_dt, (dv,), _vec(dv, 1.0))
+        tensors["aligner.w1.weight"] = (sf_dt, (dl, merger_in), _mat(dl, merger_in))
+        tensors["aligner.w1.bias"] = (sf_dt, (dl,), _vec(dl, 0.0))
+        tensors["aligner.w2.weight"] = (sf_dt, (dl, dl), _mat(dl, dl))
+        tensors["aligner.w2.bias"] = (sf_dt, (dl,), _vec(dl, 0.0))
+        tensors["image_start"] = (sf_dt, (dl,), _vec(dl, 0.01))
+        tensors["image_end"] = (sf_dt, (dl,), _vec(dl, -0.01))
+        tensors["image_newline"] = (sf_dt, (dl,), _vec(dl, 0.02))
+        vision_cfg_json = {
+            "model_type": "deepseek_v41_vision",
+            "num_hidden_layers": cfg.num_vision_layers,
+            "hidden_size": dv,
+            "intermediate_size": df,
+            "num_attention_heads": cfg.vision_num_heads,
+            "out_hidden_size": dl,
+            "patch_size": p,
+            "downsample_ratio": sm,
+            "rope_theta": 10000,
+        }
+
+    cfg_json: dict[str, object] = {
+        "model_type": "qwen4_exp" if cfg.family == "qwen_vl" else "deepseek41",
+        "model_id": cfg.model_id,
+        "hidden_size": dl,
+        "vocab_size": cfg.vocab_size,
+        "num_hidden_layers": cfg.backbone_layers if cfg.include_language_backbone else 0,
+        "tie_word_embeddings": False,
+        "vision_config": vision_cfg_json,
+    }
+
+    if cfg.include_language_backbone:
+        tensors["model.embed_tokens.weight"] = (sf_dt, (cfg.vocab_size, dl), _mat(cfg.vocab_size, dl))
+        tensors["model.norm.weight"] = (sf_dt, (dl,), _vec(dl, 1.0))
+        tensors["lm_head.weight"] = (sf_dt, (cfg.vocab_size, dl), _mat(cfg.vocab_size, dl))
+        for l in range(cfg.backbone_layers):
+            lp = f"model.layers.{l}"
+            tensors[f"{lp}.input_layernorm.weight"] = (sf_dt, (dl,), _vec(dl, 1.0))
+            tensors[f"{lp}.self_attn.q_proj.weight"] = (sf_dt, (dl, dl), _mat(dl, dl))
+            tensors[f"{lp}.self_attn.k_proj.weight"] = (sf_dt, (dl, dl), _mat(dl, dl))
+            tensors[f"{lp}.self_attn.v_proj.weight"] = (sf_dt, (dl, dl), _mat(dl, dl))
+            tensors[f"{lp}.self_attn.o_proj.weight"] = (sf_dt, (dl, dl), _mat(dl, dl))
+            tensors[f"{lp}.post_attention_layernorm.weight"] = (sf_dt, (dl,), _vec(dl, 1.0))
+            tensors[f"{lp}.mlp.gate_proj.weight"] = (sf_dt, (2 * dl, dl), _mat(2 * dl, dl))
+            tensors[f"{lp}.mlp.up_proj.weight"] = (sf_dt, (2 * dl, dl), _mat(2 * dl, dl))
+            tensors[f"{lp}.mlp.down_proj.weight"] = (sf_dt, (dl, 2 * dl), _mat(dl, 2 * dl))
+
+    out_dir = pathlib.Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_simple_safetensors(out_dir / "model.safetensors", tensors)
+    (out_dir / "config.json").write_text(json.dumps(cfg_json, indent=2) + "\n", encoding="utf-8")
+    return out_dir, cfg_json
+
+
+def generate_synth_vit_amf(
+    output_path: pathlib.Path,
+    config: SyntheticVitConfig | None = None,
+    *,
+    seed: int = 42,
+    quant_profile: str = "uniform",
+    vision_block_dtype: str = "auto",
+    dtype_mode: str = "auto",
+    embed_metadata: bool = False,
+) -> list[PackedTensorMeta]:
+    """Synthesize and pack a deterministic standalone ViT `.amf` bundle (W20)."""
+    import tempfile
+
+    cfg = config or SyntheticVitConfig()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_dir, _ = generate_synth_vit_checkpoint(pathlib.Path(tmpdir) / "ckpt", cfg, seed=seed)
+        return pack_vision_tower_amf(
+            ckpt_dir,
+            output_path,
+            model_id=cfg.model_id,
+            dtype_mode=dtype_mode,
+            quant_profile=quant_profile,
+            vision_block_dtype=vision_block_dtype,
+            embed_metadata=embed_metadata,
+        )
