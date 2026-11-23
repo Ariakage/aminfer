@@ -1944,7 +1944,7 @@ pub fn run(
             .ext = .{ 0, 0 },
         },
         .{
-            .ident = @intCast(std.c.SIG.WINCH),
+            .ident = @backingInt(std.c.SIG.WINCH),
             .filter = std.c.EVFILT.SIGNAL,
             .flags = std.c.EV.ADD | std.c.EV.ENABLE,
             .fflags = 0,
@@ -1997,7 +1997,7 @@ pub fn run(
             if (ev.filter == std.c.EVFILT.TIMER) {
                 need_sample = true;
                 need_redraw = true;
-            } else if (ev.filter == std.c.EVFILT.SIGNAL and ev.ident == @as(u64, @intCast(std.c.SIG.WINCH))) {
+            } else if (ev.filter == std.c.EVFILT.SIGNAL and ev.ident == @as(u64, @backingInt(std.c.SIG.WINCH))) {
                 const ws = queryTerminalSize(out_fd, cfg);
                 canvas.resize(ws.cols, ws.rows);
                 force_full = true;

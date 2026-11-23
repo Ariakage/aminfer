@@ -18,6 +18,7 @@ const arena_mod = aminfer.arena;
 const sysinfo = aminfer.sysinfo;
 const vmstat = aminfer.vmstat;
 const metal = aminfer.metal;
+const amf_mod = aminfer.amf;
 const tokenizer_mod = aminfer.tokenizer;
 const qwen3 = aminfer.qwen3;
 const graph = aminfer.graph;
@@ -951,7 +952,8 @@ fn mapAnyError(err: anyerror) Status {
         std.mem.eql(u8, name, "UnexpectedEof") or
         std.mem.eql(u8, name, "OpenFailed") or
         std.mem.eql(u8, name, "StatFailed") or
-        std.mem.eql(u8, name, "PreadFailed"))
+        std.mem.eql(u8, name, "PreadFailed") or
+        std.mem.eql(u8, name, "MetadataNotFound"))
     {
         status = AMI_SDK_ERR_IO;
     } else if (std.mem.eql(u8, name, "BadMagic") or
@@ -1169,6 +1171,18 @@ pub export fn ami_sdk_tokenizer_from_file(
     const raw_path = path_ptr orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "path is NULL");
     const path = std.mem.span(raw_path);
     if (path.len == 0) return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "path is empty");
+
+    if (std.mem.endsWith(u8, path, ".amf")) {
+        var amf_file = amf_mod.AmfFile.open(gpa, path) catch |err| return mapAnyError(err);
+        defer amf_file.close(gpa);
+        var resolved_tok = amf_mod.resolveTokenizerJsonAlloc(gpa, &amf_file, path, null) catch |err| return mapAnyError(err);
+        defer resolved_tok.deinit(gpa);
+        const handle = SdkTokenizer.createFromBytes(gpa, resolved_tok.bytes) catch |err| {
+            return failFmt(AMI_SDK_ERR_TOKENIZER, "tokenizer load failed: {s}", .{@errorName(err)});
+        };
+        out.* = handle;
+        return AMI_SDK_OK;
+    }
 
     const json_bytes = readFileAllocPosix(gpa, path, 64 * 1024 * 1024) catch |err| return mapAnyError(err);
     defer gpa.free(json_bytes);
@@ -1391,47 +1405,37 @@ pub export fn ami_sdk_engine_create(
 
     const max_seq_len: u32 = if (opts.max_seq_len == 0) 2048 else opts.max_seq_len;
 
-    // Resolve config.json path (explicit or auto-discovered sibling).
-    var auto_cfg_path: ?[:0]u8 = null;
-    defer if (auto_cfg_path) |p| gpa.free(p);
-    const cfg_path: [:0]const u8 = if (opts.config_json_path) |cp|
-        std.mem.span(cp)
-    else blk: {
-        auto_cfg_path = buildSiblingPathZ(gpa, amf_path, "config.json") catch {
-            return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "config path alloc failed");
-        };
-        break :blk auto_cfg_path.?;
-    };
+    // W18 embedded-metadata auto-resolution (explicit path -> embedded __meta.* -> sidecar).
+    var amf_file = amf_mod.AmfFile.open(gpa, amf_path) catch |err| return mapAnyError(err);
+    defer amf_file.close(gpa);
 
-    const cfg_bytes = readFileAllocPosix(gpa, cfg_path, 4 * 1024 * 1024) catch |err| return mapAnyError(err);
-    defer gpa.free(cfg_bytes);
+    const explicit_cfg: ?[]const u8 = if (opts.config_json_path) |cp| blk: {
+        const s = std.mem.span(cp);
+        break :blk if (s.len > 0) s else null;
+    } else null;
+    var resolved_cfg = amf_mod.resolveConfigJsonAlloc(gpa, &amf_file, amf_path, explicit_cfg) catch |err| return mapAnyError(err);
+    defer resolved_cfg.deinit(gpa);
+    const cfg_bytes = resolved_cfg.bytes;
 
-    // Resolve optional tokenizer.json (explicit or auto-discovered sibling if it exists).
-    var auto_tok_path: ?[:0]u8 = null;
-    defer if (auto_tok_path) |p| gpa.free(p);
+    // Resolve optional tokenizer.json (explicit -> embedded __meta.tokenizer_json -> sibling).
+    const explicit_tok: ?[]const u8 = if (opts.tokenizer_json_path) |tp| blk: {
+        const s = std.mem.span(tp);
+        break :blk if (s.len > 0) s else null;
+    } else null;
     var owned_tokenizer: ?*SdkTokenizer = null;
     errdefer if (owned_tokenizer) |t| t.destroy(gpa);
 
-    if (opts.tokenizer_json_path) |tp| {
-        const tpath = std.mem.span(tp);
-        if (tpath.len > 0) {
-            const tok_bytes = readFileAllocPosix(gpa, tpath, 64 * 1024 * 1024) catch |err| return mapAnyError(err);
-            defer gpa.free(tok_bytes);
-            owned_tokenizer = SdkTokenizer.createFromBytes(gpa, tok_bytes) catch |err| {
-                return failFmt(AMI_SDK_ERR_TOKENIZER, "tokenizer load failed: {s}", .{@errorName(err)});
-            };
-        }
-    } else {
-        auto_tok_path = buildSiblingPathZ(gpa, amf_path, "tokenizer.json") catch {
-            return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "tokenizer path alloc failed");
+    if (amf_mod.resolveTokenizerJsonAlloc(gpa, &amf_file, amf_path, explicit_tok)) |resolved_tok_val| {
+        var resolved_tok = resolved_tok_val;
+        defer resolved_tok.deinit(gpa);
+        owned_tokenizer = SdkTokenizer.createFromBytes(gpa, resolved_tok.bytes) catch |err| {
+            return failFmt(AMI_SDK_ERR_TOKENIZER, "tokenizer load failed: {s}", .{@errorName(err)});
         };
-        if (fileExistsPosix(auto_tok_path.?)) {
-            const tok_bytes = readFileAllocPosix(gpa, auto_tok_path.?, 64 * 1024 * 1024) catch |err| return mapAnyError(err);
-            defer gpa.free(tok_bytes);
-            owned_tokenizer = SdkTokenizer.createFromBytes(gpa, tok_bytes) catch |err| {
-                return failFmt(AMI_SDK_ERR_TOKENIZER, "tokenizer load failed: {s}", .{@errorName(err)});
-            };
-        }
+    } else |err| switch (err) {
+        error.MetadataNotFound => {
+            if (explicit_tok != null) return mapAnyError(err);
+        },
+        else => return mapAnyError(err),
     }
 
     const is_graph = graph.GraphConfig.isGraphConfigJson(cfg_bytes);
@@ -4055,5 +4059,64 @@ test "sdk.c_api: end-to-end engine create, R9 budget guard, views, embed, rerank
             try std.testing.expectEqual(@as(u32, 1), vres.all_frames_zero_copy);
             try std.testing.expectEqual(@as(u32, 1), vres.all_frames_page_aligned);
         }
+    }
+
+    // 3. W18 single-file .amf embedded-metadata auto-resolution (NULL config & tokenizer paths, zero sidecars).
+    {
+        var tok_aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer tok_aw.deinit();
+        const tw = &tok_aw.writer;
+        try tw.writeAll("{\"model\":{\"type\":\"BPE\",\"vocab\":{");
+        for (0..256) |b| {
+            if (b > 0) try tw.writeAll(",");
+            var u_buf: [4]u8 = undefined;
+            const u_len = try std.unicode.utf8Encode(tokenizer_mod.BYTE_TO_UNICODE[b], &u_buf);
+            try tw.writeAll("\"");
+            for (u_buf[0..u_len]) |ch| {
+                if (ch == '"' or ch == '\\') try tw.writeByte('\\');
+                try tw.writeByte(ch);
+            }
+            try tw.print("\":{d}", .{b});
+        }
+        try tw.writeAll(",\"<|im_start|>\":256,\"<|im_end|>\":257},\"merges\":[]},\"added_tokens\":[{\"id\":256,\"content\":\"<|im_start|>\",\"special\":true},{\"id\":257,\"content\":\"<|im_end|>\",\"special\":true}]}");
+
+        const sf_bytes = try amf_mod.embedMetadataIntoAmfBytes(std.testing.allocator, amf_bytes, &.{
+            .{ .name = amf_mod.META_CONFIG_JSON, .payload = cfg_json },
+            .{ .name = amf_mod.META_TOKENIZER_JSON, .payload = tok_aw.written() },
+        });
+        defer std.testing.allocator.free(sf_bytes);
+
+        var sf_path_buf: [512:0]u8 = undefined;
+        const sf_slice = try std.fmt.bufPrint(&sf_path_buf, "{s}/ami_sdk_sf_{d}.amf", .{ std.mem.trimEnd(u8, tmp_root, "/"), pid });
+        sf_path_buf[sf_slice.len] = 0;
+        {
+            const fd = std.c.open(&sf_path_buf, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+            try std.testing.expect(fd >= 0);
+            defer _ = std.c.close(fd);
+            var written: usize = 0;
+            while (written < sf_bytes.len) {
+                const rc = std.c.write(fd, sf_bytes.ptr + written, sf_bytes.len - written);
+                try std.testing.expect(rc > 0);
+                written += @intCast(rc);
+            }
+        }
+        defer _ = std.c.unlink(&sf_path_buf);
+
+        var sf_opts: EngineOptions = undefined;
+        ami_sdk_engine_options_init(&sf_opts);
+        sf_opts.amf_path = &sf_path_buf;
+        sf_opts.config_json_path = null;
+        sf_opts.tokenizer_json_path = null;
+        sf_opts.max_seq_len = 64;
+        sf_opts.startup_canary = 0;
+
+        var sf_eng: ?*SdkEngine = null;
+        try std.testing.expectEqual(AMI_SDK_OK, ami_sdk_engine_create(&sf_opts, &sf_eng));
+        defer ami_sdk_engine_destroy(sf_eng);
+
+        var sf_tok: ?*SdkTokenizer = null;
+        try std.testing.expectEqual(AMI_SDK_OK, ami_sdk_tokenizer_from_file(&sf_path_buf, &sf_tok));
+        defer ami_sdk_tokenizer_destroy(sf_tok);
+        try std.testing.expectEqual(@as(u32, 258), ami_sdk_tokenizer_vocab_size(sf_tok));
     }
 }

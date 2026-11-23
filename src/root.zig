@@ -20,13 +20,18 @@ pub const qos = @import("platform/qos.zig");
 pub const sysinfo = @import("platform/sysinfo.zig");
 pub const chip_profile = @import("platform/chip_profile.zig");
 pub const vmstat = @import("platform/vmstat.zig");
+pub const telemetry = @import("platform/telemetry.zig");
 pub const tokenizer = @import("model/tokenizer.zig");
 pub const qwen3 = @import("model/qwen3.zig");
+pub const lora = @import("model/lora.zig");
+pub const embed_rerank = @import("model/embed_rerank.zig");
 pub const graph = @import("model/graph.zig");
 pub const bench = @import("bench/runner.zig");
 pub const sam = @import("spec/sam.zig");
 pub const tree = @import("spec/tree.zig");
 pub const accept = @import("spec/accept.zig");
+pub const grammar = @import("spec/grammar.zig");
+pub const sampling = @import("spec/sampling.zig");
 pub const draft = @import("spec/draft.zig");
 pub const dspark = @import("spec/dspark.zig");
 pub const engine = @import("spec/engine.zig");
@@ -42,6 +47,9 @@ pub const rng = @import("runtime/rng.zig");
 pub const ngram_nvme = @import("spec/ngram_nvme.zig");
 pub const server = @import("server/http_sse.zig");
 pub const http_sse = server;
+pub const theme = @import("monitor/theme.zig");
+pub const tui = @import("monitor/tui.zig");
+pub const chat_repl = @import("cli/chat_repl.zig");
 
 test {
     _ = metal;
@@ -63,13 +71,18 @@ test {
     _ = sysinfo;
     _ = chip_profile;
     _ = vmstat;
+    _ = telemetry;
     _ = tokenizer;
     _ = qwen3;
+    _ = lora;
+    _ = embed_rerank;
     _ = graph;
     _ = bench;
     _ = sam;
     _ = tree;
     _ = accept;
+    _ = grammar;
+    _ = sampling;
     _ = draft;
     _ = dspark;
     _ = engine;
@@ -84,4 +97,7 @@ test {
     _ = rng;
     _ = ngram_nvme;
     _ = server;
+    _ = theme;
+    _ = tui;
+    _ = chat_repl;
 }

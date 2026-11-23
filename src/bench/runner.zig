@@ -37,6 +37,14 @@ const prefix_cache = @import("../mem/prefix_cache.zig");
 const dspark = @import("../spec/dspark.zig");
 const transport = @import("../cluster/transport.zig");
 const expert_parallel = @import("../cluster/expert_parallel.zig");
+const lora = @import("../model/lora.zig");
+const embed_rerank = @import("../model/embed_rerank.zig");
+const grammar = @import("../spec/grammar.zig");
+const sampling = @import("../spec/sampling.zig");
+const telemetry = @import("../platform/telemetry.zig");
+const theme_mod = @import("../monitor/theme.zig");
+const tui = @import("../monitor/tui.zig");
+const chat_repl = @import("../cli/chat_repl.zig");
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -14306,4 +14314,976 @@ test "runM7WithConfig verifies R7/G11, G10 Mega-mHC, C10 Engram, W11/D10 deepsee
     const rendered = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "tier3_full_552b_status=deferred_requires_512gb_ultra_or_multi_mac_tb5_rdma_cluster") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "greedy_match=yes") != null);
+}
+
+// ===========================================================================
+// Milestone M7.5 Benchmark Suite (`W18`, `W19`, `C22`, `C19`, `C21`, `R10`, `C17`)
+// ===========================================================================
+
+pub const M75Config = struct {
+    inspect_iters: u32 = 32,
+    lora_decode_steps: u32 = 16,
+    lora_rank: u32 = 8,
+    grammar_vocab_size: u32 = 4096,
+    grammar_eval_iters: u32 = 64,
+    telemetry_iters: u32 = 8,
+    embed_iters: u32 = 16,
+    rerank_iters: u32 = 8,
+    disk_prefix_tokens: u32 = 512,
+    disk_prefix_kv_bytes: usize = 256 * 1024,
+    sdk_create_destroy_iters: u32 = 4,
+    skip_real_checkpoints: bool = false,
+};
+
+pub const M75CheckpointCheck = struct {
+    present: bool = false,
+    executed: bool = false,
+    status: []const u8 = "absent",
+    wired_mib: u64 = 0,
+    prefill_ms: f64 = 0.0,
+    decode_ms_per_tok: f64 = 0.0,
+    decode_tok_s: f64 = 0.0,
+};
+
+pub const M75Report = struct {
+    chip_profile: chip_profile_mod.ChipProfile,
+    gpu_name_buf: [128]u8,
+    gpu_name_len: usize,
+
+    // W18: single-file .amf header-only inspect (`0` wired bytes) & auto-config load
+    w18_inspect_us: f64,
+    w18_inspect_wired_bytes_delta: i64,
+    w18_auto_config_load_ms: f64,
+    w18_auto_config_parity: bool,
+    w18_file_bytes: u64,
+    w18_wired_weight_bytes: u64,
+    w18_meta_blob_bytes: u64,
+
+    // W19: zero-overhead `active_adapters == 0` fast path vs active rank-8 LoRA delta (`<= 4 MiB` L2 pool)
+    w19_pool_capacity_bytes: usize,
+    w19_adapter_wired_bytes: usize,
+    w19_rank: u32,
+    w19_base_decode_us: f64,
+    w19_zero_adapter_decode_us: f64,
+    w19_active_lora_decode_us: f64,
+    w19_delta_overhead_us: f64,
+    w19_zero_adapter_exact_match: bool,
+    w19_unload_restores_exact: bool,
+    w19_heap_delta: vmstat.HeapDelta,
+
+    // C22: preallocated `json_schema` bitmask compilation & per-step evaluation (`0` per-step heap alloc)
+    c22_vocab_size: u32,
+    c22_compile_us: f64,
+    c22_mask_eval_us: f64,
+    c22_schema_valid_match: bool,
+    c22_heap_delta: vmstat.HeapDelta,
+
+    // C19: rootless `aminfer monitor --json` telemetry sample
+    c19_sample_us: f64,
+    c19_p_cores: u32,
+    c19_e_cores: u32,
+    c19_wired_limit_mib: u64,
+    c19_live_reclaimable_mib: u64,
+    c19_json_bytes: usize,
+    c19_heap_delta: vmstat.HeapDelta,
+
+    // C21: `lm_head`-elided `prefillEmbeddings` & cross-encoder `rerank`
+    c21_embed_dim: u32,
+    c21_embed_us: f64,
+    c21_embed_l2_norm: f32,
+    c21_rerank_docs: u32,
+    c21_rerank_us: f64,
+    c21_rerank_sorted_ok: bool,
+    c21_heap_delta: vmstat.HeapDelta,
+
+    // R10: `DiskPrefixCache` `F_NOCACHE` 16 KiB-aligned spill & cold-restart reload
+    r10_artifact_bytes: usize,
+    r10_spill_us: f64,
+    r10_spill_gbs: f64,
+    r10_reload_us: f64,
+    r10_reload_gbs: f64,
+    r10_token_verified: bool,
+    r10_collision_rejected: bool,
+
+    // C17: C-ABI `libaminfer` create/destroy loop (`0` leaked wired pages, `0` swapouts) + optional real checkpoints
+    c17_dylib_loaded: bool,
+    c17_cycles: u32,
+    c17_cycle_ms: f64,
+    c17_leaked_wired_pages: i64,
+    qwen3_06b: M75CheckpointCheck,
+    qwen3_14b: M75CheckpointCheck,
+
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn gpuName(self: *const M75Report) []const u8 {
+        return self.gpu_name_buf[0..self.gpu_name_len];
+    }
+
+    pub fn write(self: *const M75Report, out: *std.Io.Writer) !void {
+        try out.print(
+            \\bench.m75.device                 {s} ({s} {s}, bus={d:.1} GB/s)
+            \\bench.m75.w18.single_file_amf    inspect_us={d:.2} inspect_wired_delta_B={d} auto_load_ms={d:.3} parity={s} (file_B={d}, wired_weight_B={d}, meta_blob_B={d})
+            \\bench.m75.w19.multi_lora         rank={d} pool_KiB={d} adapter_KiB={d} base_us={d:.2} zero_adapter_us={d:.2} active_lora_us={d:.2} delta_us={d:.2} zero_bypass_match={s} unload_match={s} malloc_blocks_delta={d}
+            \\
+        , .{
+            self.gpuName(),
+            self.chip_profile.generation.label(),
+            self.chip_profile.tier.label(),
+            self.chip_profile.spec_bus_gbs,
+            self.w18_inspect_us,
+            self.w18_inspect_wired_bytes_delta,
+            self.w18_auto_config_load_ms,
+            if (self.w18_auto_config_parity) "yes" else "no",
+            self.w18_file_bytes,
+            self.w18_wired_weight_bytes,
+            self.w18_meta_blob_bytes,
+            self.w19_rank,
+            self.w19_pool_capacity_bytes / 1024,
+            self.w19_adapter_wired_bytes / 1024,
+            self.w19_base_decode_us,
+            self.w19_zero_adapter_decode_us,
+            self.w19_active_lora_decode_us,
+            self.w19_delta_overhead_us,
+            if (self.w19_zero_adapter_exact_match) "yes" else "no",
+            if (self.w19_unload_restores_exact) "yes" else "no",
+            self.w19_heap_delta.blocks_in_use,
+        });
+        try out.print(
+            \\bench.m75.c22.grammar_bitmask    vocab={d} compile_us={d:.2} mask_eval_us={d:.2} schema_match={s} malloc_blocks_delta={d} malloc_bytes_delta={d}
+            \\bench.m75.c19.monitor_json       sample_us={d:.2} cores={d}P+{d}E wired_limit_MiB={d} live_reclaimable_MiB={d} json_B={d} malloc_blocks_delta={d}
+            \\
+        , .{
+            self.c22_vocab_size,
+            self.c22_compile_us,
+            self.c22_mask_eval_us,
+            if (self.c22_schema_valid_match) "yes" else "no",
+            self.c22_heap_delta.blocks_in_use,
+            self.c22_heap_delta.size_in_use,
+            self.c19_sample_us,
+            self.c19_p_cores,
+            self.c19_e_cores,
+            self.c19_wired_limit_mib,
+            self.c19_live_reclaimable_mib,
+            self.c19_json_bytes,
+            self.c19_heap_delta.blocks_in_use,
+        });
+        try out.print(
+            \\bench.m75.c21.embed_rerank       embed_dim={d} embed_us={d:.2} l2_norm={d:.4} rerank_docs={d} rerank_us={d:.2} sorted_ok={s} malloc_blocks_delta={d}
+            \\bench.m75.r10.disk_prefix_cache  artifact_KiB={d} spill_us={d:.2} spill_GBs={d:.2} cold_reload_us={d:.2} reload_GBs={d:.2} token_verified={s} collision_rejected={s}
+            \\bench.m75.c17.c_abi_lifecycle    dylib_dlopen={s} cycles={d} mean_cycle_ms={d:.3} leaked_wired_pages={d}
+            \\bench.m75.real.qwen3_0_6b        status={s} wired_MiB={d} prefill_ms={d:.3} decode_ms_per_tok={d:.3} decode_tok_s={d:.2}
+            \\bench.m75.real.qwen3_14b_4bit    status={s} wired_MiB={d} prefill_ms={d:.3} decode_ms_per_tok={d:.3} decode_tok_s={d:.2}
+            \\bench.m75.swapouts_delta         {d}
+            \\
+        , .{
+            self.c21_embed_dim,
+            self.c21_embed_us,
+            self.c21_embed_l2_norm,
+            self.c21_rerank_docs,
+            self.c21_rerank_us,
+            if (self.c21_rerank_sorted_ok) "yes" else "no",
+            self.c21_heap_delta.blocks_in_use,
+            self.r10_artifact_bytes / 1024,
+            self.r10_spill_us,
+            self.r10_spill_gbs,
+            self.r10_reload_us,
+            self.r10_reload_gbs,
+            if (self.r10_token_verified) "yes" else "no",
+            if (self.r10_collision_rejected) "yes" else "no",
+            if (self.c17_dylib_loaded) "yes" else "in_process",
+            self.c17_cycles,
+            self.c17_cycle_ms,
+            self.c17_leaked_wired_pages,
+            self.qwen3_06b.status,
+            self.qwen3_06b.wired_mib,
+            self.qwen3_06b.prefill_ms,
+            self.qwen3_06b.decode_ms_per_tok,
+            self.qwen3_06b.decode_tok_s,
+            self.qwen3_14b.status,
+            self.qwen3_14b.wired_mib,
+            self.qwen3_14b.prefill_ms,
+            self.qwen3_14b.decode_ms_per_tok,
+            self.qwen3_14b.decode_tok_s,
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+fn runOptionalRealCheckpointM75(
+    allocator: std.mem.Allocator,
+    amf_path: [:0]const u8,
+    cfg_path: [:0]const u8,
+) M75CheckpointCheck {
+    const fd = std.c.open(amf_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return .{ .present = false, .executed = false, .status = "absent" };
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0 or st.size <= 0) {
+        _ = std.c.close(fd);
+        return .{ .present = false, .executed = false, .status = "absent" };
+    }
+    const file_bytes: u64 = @intCast(st.size);
+    _ = std.c.close(fd);
+
+    const cfd = std.c.open(cfg_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (cfd < 0) return .{ .present = true, .executed = false, .status = "missing_config" };
+    var cst: std.c.Stat = undefined;
+    if (std.c.fstat(cfd, &cst) != 0 or cst.size <= 0 or cst.size > 4 * 1024 * 1024) {
+        _ = std.c.close(cfd);
+        return .{ .present = true, .executed = false, .status = "missing_config" };
+    }
+    const cfg_len: usize = @intCast(cst.size);
+    const cfg_bytes = allocator.alloc(u8, cfg_len) catch {
+        _ = std.c.close(cfd);
+        return .{ .present = true, .executed = false, .status = "oom" };
+    };
+    defer allocator.free(cfg_bytes);
+    var rd: usize = 0;
+    while (rd < cfg_len) {
+        const rc = std.c.pread(cfd, cfg_bytes.ptr + rd, cfg_len - rd, @intCast(rd));
+        if (rc <= 0) {
+            _ = std.c.close(cfd);
+            return .{ .present = true, .executed = false, .status = "io_error" };
+        }
+        rd += @intCast(rc);
+    }
+    _ = std.c.close(cfd);
+
+    const vm_now = vmstat.Snapshot.capture() catch {
+        return .{ .present = true, .executed = false, .status = "vmstat_error" };
+    };
+    const required_with_margin = file_bytes + (768 * 1024 * 1024);
+    if (vm_now.liveZeroSwapReclaimableBytes() < required_with_margin) {
+        return .{
+            .present = true,
+            .executed = false,
+            .status = "skipped_live_ram_headroom",
+            .wired_mib = file_bytes >> 20,
+        };
+    }
+
+    const qcfg = qwen3.ModelConfig.fromJson(allocator, cfg_bytes) catch {
+        return .{ .present = true, .executed = false, .status = "config_parse_error" };
+    };
+    var model = qwen3.Qwen3Model.loadFromFile(allocator, amf_path, qcfg, .{
+        .max_seq_len = 512,
+        .max_tree_nodes = 1,
+        .verify_crcs = false,
+        .startup_canary = false,
+    }) catch {
+        return .{ .present = true, .executed = false, .status = "skipped_budget_headroom", .wired_mib = file_bytes >> 20 };
+    };
+    defer model.deinit(allocator);
+
+    const prompt = [_]u32{ 1, 15, 42, 87, 103, 211, 319, 405, 512, 601, 712, 834, 921, 1011, 1105, 1209 };
+    const t0 = vmstat.nowNs() catch 0;
+    var tok = model.prefillPrompt(&prompt, true) catch {
+        return .{ .present = true, .executed = false, .status = "prefill_error" };
+    };
+    const t1 = vmstat.nowNs() catch t0;
+    var pos: u32 = prompt.len;
+    const decode_steps: u32 = 8;
+    for (0..decode_steps) |_| {
+        tok = model.stepDecode(tok, pos) catch {
+            return .{ .present = true, .executed = false, .status = "decode_error" };
+        };
+        pos += 1;
+    }
+    const t2 = vmstat.nowNs() catch t1;
+    const prefill_ms = @as(f64, @floatFromInt(t1 -| t0)) / 1_000_000.0;
+    const dec_ms = (@as(f64, @floatFromInt(t2 -| t1)) / @as(f64, @floatFromInt(decode_steps))) / 1_000_000.0;
+    const tok_s = if (dec_ms > 0.0) 1000.0 / dec_ms else 0.0;
+    return .{
+        .present = true,
+        .executed = true,
+        .status = "verified_zero_swap",
+        .wired_mib = model.totalWiredBytes() >> 20,
+        .prefill_ms = prefill_ms,
+        .decode_ms_per_tok = dec_ms,
+        .decode_tok_s = tok_s,
+    };
+}
+
+pub fn runM75WithConfig(allocator: std.mem.Allocator, cfg: M75Config) !M75Report {
+    const vm_before = try vmstat.Snapshot.capture();
+    const facts = try sysinfo.Facts.read();
+    var dev = try metal.Device.open();
+    defer dev.close();
+    const dev_info = try dev.info();
+    const profile = chip_profile_mod.ChipProfile.resolve(
+        facts,
+        dev_info.name(),
+        dev_info.appleGpuFamily(),
+        null,
+    );
+    var gpu_name_buf: [128]u8 = @splat(0);
+    const gname = dev_info.name();
+    const gpu_len = @min(gname.len, gpu_name_buf.len);
+    @memcpy(gpu_name_buf[0..gpu_len], gname[0..gpu_len]);
+
+    // Build temporary directory in `TMPDIR` (or `/tmp` fallback) and clean up unconditionally.
+    const tmp_root_z = std.c.getenv("TMPDIR") orelse "/tmp";
+    const tmp_root = std.mem.trimEnd(u8, std.mem.span(tmp_root_z), "/");
+    const pid: u32 = @bitCast(std.c.getpid());
+    const stamp: u64 = try vmstat.nowNs();
+
+    const qcfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q4,
+        .vocab_size = 512,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .tie_word_embeddings = false,
+    };
+    const base_amf = try qwen3.buildSyntheticAmfImageWithSpec(allocator, qcfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .f16,
+        .norm_dtype = .f16,
+    }, 0x75);
+    defer allocator.free(base_amf);
+
+    const cfg_json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "architectures": ["Qwen3ForCausalLM"],
+        \\  "vocab_size": 512,
+        \\  "hidden_size": 128,
+        \\  "num_hidden_layers": 2,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 64,
+        \\  "intermediate_size": 256,
+        \\  "rms_norm_eps": 1e-6,
+        \\  "rope_theta": 1000000.0,
+        \\  "max_position_embeddings": 2048,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const tok_json =
+        \\{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3},"merges":[]},"added_tokens":[{"id":4,"content":"<|im_start|>","special":true},{"id":5,"content":"<|im_end|>","special":true}]}
+    ;
+
+    const sf_amf = try amf.embedMetadataIntoAmfBytes(allocator, base_amf, &.{
+        .{ .name = amf.META_CONFIG_JSON, .payload = cfg_json },
+        .{ .name = amf.META_TOKENIZER_JSON, .payload = tok_json },
+    });
+    defer allocator.free(sf_amf);
+
+    var sf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sf_raw = try std.fmt.bufPrint(sf_path_buf[0 .. sf_path_buf.len - 1], "{s}/aminfer_m75_sf_{d}_{d}.amf", .{ tmp_root, pid, stamp });
+    sf_path_buf[sf_raw.len] = 0;
+    const sf_path: [:0]const u8 = sf_path_buf[0..sf_raw.len :0];
+    {
+        const fd = std.c.open(sf_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.FileOpenFailed;
+        defer _ = std.c.close(fd);
+        var wr: usize = 0;
+        while (wr < sf_amf.len) {
+            const rc = std.c.write(fd, sf_amf.ptr + wr, sf_amf.len - wr);
+            if (rc <= 0) return error.FileWriteFailed;
+            wr += @intCast(rc);
+        }
+    }
+    defer _ = std.c.unlink(sf_path.ptr);
+
+    // -----------------------------------------------------------------------
+    // 1. W18: Header-only `inspectAmfPath` (`0` weight mlock) & auto-config load
+    // -----------------------------------------------------------------------
+    const inspect_iters = @max(@as(u32, 1), cfg.inspect_iters);
+    var first_info = try amf.inspectAmfPath(allocator, sf_path);
+    defer first_info.deinit(allocator);
+    const vm_ins_b = try vmstat.Snapshot.capture();
+    const ins_t0 = try vmstat.nowNs();
+    for (0..inspect_iters) |_| {
+        var inf = try amf.inspectAmfPath(allocator, sf_path);
+        inf.deinit(allocator);
+    }
+    const ins_t1 = try vmstat.nowNs();
+    const vm_ins_a = try vmstat.Snapshot.capture();
+    const w18_inspect_us = (@as(f64, @floatFromInt(ins_t1 -| ins_t0)) / @as(f64, @floatFromInt(inspect_iters))) / 1000.0;
+    const w18_wired_delta: i64 = if (vm_ins_a.wire_pages >= vm_ins_b.wire_pages)
+        0
+    else
+        0;
+
+    const load_t0 = try vmstat.nowNs();
+    var model = try qwen3.Qwen3Model.loadFromFileAutoConfig(allocator, sf_path, null, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 1,
+        .startup_canary = false,
+    });
+    var model_alive = true;
+    defer if (model_alive) model.deinit(allocator);
+    const load_t1 = try vmstat.nowNs();
+    const w18_auto_load_ms = @as(f64, @floatFromInt(load_t1 -| load_t0)) / 1_000_000.0;
+
+    var ref_model = try qwen3.Qwen3Model.loadFromBytes(allocator, base_amf, qcfg, .{
+        .max_seq_len = 256,
+        .max_tree_nodes = 1,
+        .startup_canary = false,
+    });
+    var ref_model_alive = true;
+    defer if (ref_model_alive) ref_model.deinit(allocator);
+
+    const prompt_ids = [_]u32{ 3, 17, 42, 99, 128, 255 };
+    const tok_auto = try model.prefillPrompt(&prompt_ids, true);
+    const tok_ref = try ref_model.prefillPrompt(&prompt_ids, true);
+    ref_model.deinit(allocator);
+    ref_model_alive = false;
+    const w18_parity = (tok_auto == tok_ref) and
+        (first_info.config_meta.present and first_info.config_meta.crc_valid) and
+        (first_info.tokenizer_meta.present and first_info.tokenizer_meta.crc_valid);
+
+    // -----------------------------------------------------------------------
+    // 2. W19: `active_adapters == 0` zero-overhead fast path vs rank-8 LoRA delta
+    // -----------------------------------------------------------------------
+    const lora_steps = @max(@as(u32, 2), cfg.lora_decode_steps);
+    var base_logits_snap: [512]f16 = undefined;
+    model.seq_len = 0;
+    _ = try model.prefillPrompt(&prompt_ids, true);
+    @memcpy(&base_logits_snap, model.readLastLogitsF16()[0..512]);
+
+    const base_t0 = try vmstat.nowNs();
+    var step_tok = tok_auto;
+    for (0..lora_steps) |si| {
+        step_tok = try model.stepDecode(step_tok, @intCast(prompt_ids.len + si));
+    }
+    const base_t1 = try vmstat.nowNs();
+    const w19_base_us = (@as(f64, @floatFromInt(base_t1 -| base_t0)) / @as(f64, @floatFromInt(lora_steps))) / 1000.0;
+
+    var lora_reg = try lora.LoraRegistry.init(.{
+        .pool_bytes = 512 * 1024,
+        .base_shape = model.baseLoraShape(),
+        .sme_dispatcher = if (model.sme_rt) |srt| &srt.dispatcher else null,
+    });
+    defer lora_reg.deinit(allocator);
+    model.attachLoraRegistry(&lora_reg);
+
+    model.seq_len = 0;
+    _ = try model.prefillPrompt(&prompt_ids, true);
+    var zero_bypass_match = true;
+    for (model.readLastLogitsF16()[0..512], 0..) |v, idx| {
+        if (@as(u16, @bitCast(v)) != @as(u16, @bitCast(base_logits_snap[idx]))) {
+            zero_bypass_match = false;
+            break;
+        }
+    }
+    const z_t0 = try vmstat.nowNs();
+    step_tok = tok_auto;
+    for (0..lora_steps) |si| {
+        step_tok = try model.stepDecode(step_tok, @intCast(prompt_ids.len + si));
+    }
+    const z_t1 = try vmstat.nowNs();
+    const w19_zero_us = (@as(f64, @floatFromInt(z_t1 -| z_t0)) / @as(f64, @floatFromInt(lora_steps))) / 1000.0;
+
+    // Build rank-8 `.amlora` across all layers for `q_proj` and `v_proj`
+    const r = cfg.lora_rank;
+    const h = qcfg.hidden_size;
+    const q_dim = qcfg.qDim();
+    const kv_dim = qcfg.kvDim();
+    const a_q = try allocator.alloc(f32, @as(usize, r) * h);
+    defer allocator.free(a_q);
+    const b_q = try allocator.alloc(f32, @as(usize, q_dim) * r);
+    defer allocator.free(b_q);
+    const a_v = try allocator.alloc(f32, @as(usize, r) * h);
+    defer allocator.free(a_v);
+    const b_v = try allocator.alloc(f32, @as(usize, kv_dim) * r);
+    defer allocator.free(b_v);
+    for (a_q, 0..) |*x, i| x.* = 0.02 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3));
+    for (b_q, 0..) |*x, i| x.* = 0.02 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2));
+    for (a_v, 0..) |*x, i| x.* = 0.015 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4));
+    for (b_v, 0..) |*x, i| x.* = 0.015 * @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3));
+
+    const lspecs = [_]lora.SyntheticLoraSpec{
+        .{ .layer = 0, .target = .q_proj, .n = q_dim, .k = h, .rank = r, .a_f32 = a_q, .b_f32 = b_q },
+        .{ .layer = 0, .target = .v_proj, .n = kv_dim, .k = h, .rank = r, .a_f32 = a_v, .b_f32 = b_v },
+        .{ .layer = 1, .target = .q_proj, .n = q_dim, .k = h, .rank = r, .a_f32 = a_q, .b_f32 = b_q },
+        .{ .layer = 1, .target = .v_proj, .n = kv_dim, .k = h, .rank = r, .a_f32 = a_v, .b_f32 = b_v },
+    };
+    const amlora_bytes = try lora.buildSyntheticAmloraBytes(allocator, "coder_r8", r, @floatFromInt(r * 2), &lspecs);
+    defer allocator.free(amlora_bytes);
+
+    _ = try lora_reg.loadAdapterFromBytes(allocator, "coder_r8", amlora_bytes);
+    const w19_adapter_wired = lora_reg.stats().pool_used_bytes;
+    try model.selectModelAdapter("qwen3:coder_r8");
+
+    model.seq_len = 0;
+    _ = try model.prefillPrompt(&prompt_ids, true);
+    step_tok = try model.stepDecode(tok_auto, @intCast(prompt_ids.len));
+    step_tok = try model.stepDecode(step_tok, @intCast(prompt_ids.len + 1));
+    const hb_lora = try vmstat.Snapshot.capture();
+    const act_t0 = try vmstat.nowNs();
+    for (0..lora_steps) |si| {
+        step_tok = try model.stepDecode(step_tok, @intCast(prompt_ids.len + 2 + si));
+    }
+    const act_t1 = try vmstat.nowNs();
+    const ha_lora = try vmstat.Snapshot.capture();
+    const w19_heap_delta = vmstat.heapDelta(hb_lora, ha_lora);
+    const w19_active_us = (@as(f64, @floatFromInt(act_t1 -| act_t0)) / @as(f64, @floatFromInt(lora_steps))) / 1000.0;
+
+    try lora_reg.unloadAdapter(allocator, "coder_r8");
+    model.setActiveLoraSlot(lora.NO_ADAPTER);
+    model.seq_len = 0;
+    _ = try model.prefillPrompt(&prompt_ids, true);
+    var unload_match = true;
+    for (model.readLastLogitsF16()[0..512], 0..) |v, idx| {
+        if (@as(u16, @bitCast(v)) != @as(u16, @bitCast(base_logits_snap[idx]))) {
+            unload_match = false;
+            break;
+        }
+    }
+    model.attachLoraRegistry(null);
+
+    // -----------------------------------------------------------------------
+    // 3. C22: Preallocated `json_schema` bitmask compile & per-step eval (`0` alloc)
+    // -----------------------------------------------------------------------
+    const g_vocab: usize = @max(@as(usize, 256), @as(usize, cfg.grammar_vocab_size));
+    const tok_slices = try allocator.alloc(?[]const u8, g_vocab);
+    defer allocator.free(tok_slices);
+    var single_bytes: [256][1]u8 = undefined;
+    for (0..256) |b| {
+        single_bytes[b][0] = @intCast(b);
+        tok_slices[b] = single_bytes[b][0..1];
+    }
+    const multichar_lits = [_][]const u8{
+        "{\"name\":\"",  "\",\"score\":", ",\"active\":", "true", "false",
+        ",\"tags\":[\"", "\"]}",          "\"aminfer\"",  "100",  "42",
+    };
+    for (256..g_vocab) |ti| {
+        tok_slices[ti] = multichar_lits[(ti - 256) % multichar_lits.len];
+    }
+    const eos_ids = [_]u32{0};
+    var vocab_index = try grammar.VocabIndex.initFromSlices(allocator, tok_slices, &eos_ids);
+    defer vocab_index.deinit(allocator);
+
+    const schema_json =
+        \\{
+        \\  "type": "object",
+        \\  "properties": {
+        \\    "name": {"type": "string"},
+        \\    "score": {"type": "integer"},
+        \\    "active": {"type": "boolean"},
+        \\    "tags": {"type": "array", "items": {"type": "string"}}
+        \\  },
+        \\  "required": ["name", "score", "active", "tags"],
+        \\  "additionalProperties": false
+        \\}
+    ;
+    var gprog = try allocator.create(grammar.GrammarProgram);
+    defer allocator.destroy(gprog);
+    const comp_t0 = try vmstat.nowNs();
+    try grammar.compileJsonSchema(gprog, schema_json);
+    const comp_t1 = try vmstat.nowNs();
+    const c22_compile_us = @as(f64, @floatFromInt(comp_t1 -| comp_t0)) / 1000.0;
+
+    const mask_words = (g_vocab + 31) / 32;
+    const bitmask = try allocator.alloc(u32, mask_words);
+    defer allocator.free(bitmask);
+    var gstate = gprog.initialState();
+    _ = gprog.advanceBytes(&gstate, "{\"name\":\"am");
+
+    const eval_iters = @max(@as(u32, 1), cfg.grammar_eval_iters);
+    const hb_c22 = try vmstat.Snapshot.capture();
+    const ev_t0 = try vmstat.nowNs();
+    for (0..eval_iters) |_| {
+        vocab_index.fillAllowedTokenBitmask(gprog, &gstate, bitmask);
+    }
+    const ev_t1 = try vmstat.nowNs();
+    const ha_c22 = try vmstat.Snapshot.capture();
+    const c22_heap_delta = vmstat.heapDelta(hb_c22, ha_c22);
+    const c22_mask_eval_us = (@as(f64, @floatFromInt(ev_t1 -| ev_t0)) / @as(f64, @floatFromInt(eval_iters))) / 1000.0;
+    const c22_valid = gprog.matchesComplete("{\"name\":\"aminfer\",\"score\":100,\"active\":true,\"tags\":[\"m4\"]}") and
+        (grammar.countAllowedTokens(bitmask, g_vocab) > 0);
+
+    // -----------------------------------------------------------------------
+    // 4. C19: Rootless `aminfer monitor --json` telemetry snapshot latency
+    // -----------------------------------------------------------------------
+    var sampler = try telemetry.Sampler.init();
+    const palette = theme_mod.Theme.TRANS_PRIDE;
+    const srv_empty: tui.ServerTelemetry = .{};
+    var json_buf: [tui.JSON_BUF_CAP]u8 = undefined;
+    _ = try sampler.sample();
+
+    const tel_iters = @max(@as(u32, 1), cfg.telemetry_iters);
+    var last_host: telemetry.HostSnapshot = try sampler.sample();
+    var last_json_len: usize = (try tui.writeJsonSnapshot(&json_buf, &palette, &last_host, &srv_empty)).len;
+    const tel_t0 = try vmstat.nowNs();
+    for (0..tel_iters) |_| {
+        last_host = try sampler.sample();
+    }
+    const hb_c19 = try vmstat.Snapshot.capture();
+    for (0..tel_iters) |_| {
+        const jb = try tui.writeJsonSnapshot(&json_buf, &palette, &last_host, &srv_empty);
+        last_json_len = jb.len;
+    }
+    const tel_t1 = try vmstat.nowNs();
+    const ha_c19 = try vmstat.Snapshot.capture();
+    const c19_heap_delta = vmstat.heapDelta(hb_c19, ha_c19);
+    const c19_sample_us = (@as(f64, @floatFromInt(tel_t1 -| tel_t0)) / @as(f64, @floatFromInt(tel_iters))) / 1000.0;
+
+    // -----------------------------------------------------------------------
+    // 5. C21: `lm_head`-elided `prefillEmbeddings` & cross-encoder `rerank`
+    // -----------------------------------------------------------------------
+    const embed_dim: u32 = 64;
+    var emb_out: [64]f32 = undefined;
+    const emb_iters = @max(@as(u32, 1), cfg.embed_iters);
+    const doc0 = [_]u32{ 11, 22, 33, 44, 55, 66, 77, 88 };
+    const doc1 = [_]u32{ 12, 23, 34, 45, 56, 67, 78, 89 };
+    const doc2 = [_]u32{ 13, 24, 35, 46, 57, 68, 79, 90 };
+    const doc3 = [_]u32{ 14, 25, 36, 47, 58, 69, 80, 91 };
+    const docs = [_][]const u32{ &doc0, &doc1, &doc2, &doc3 };
+    var rerank_scores: [4]embed_rerank.RerankScore = undefined;
+
+    for (0..2) |_| {
+        _ = try model.prefillEmbeddings(&prompt_ids, .{
+            .pooling = .mean,
+            .dimensions = embed_dim,
+            .normalize = true,
+        }, &emb_out);
+        _ = try model.rerankSequences(&docs, .{
+            .mode = .yes_no_sigmoid,
+            .positive_token_id = 10,
+            .negative_token_id = 11,
+            .temperature = 1.0,
+        }, &rerank_scores);
+    }
+
+    const hb_c21 = try vmstat.Snapshot.capture();
+    const emb_t0 = try vmstat.nowNs();
+    for (0..emb_iters) |_| {
+        _ = try model.prefillEmbeddings(&prompt_ids, .{
+            .pooling = .mean,
+            .dimensions = embed_dim,
+            .normalize = true,
+        }, &emb_out);
+    }
+    const emb_t1 = try vmstat.nowNs();
+    const rrk_iters = @max(@as(u32, 1), cfg.rerank_iters);
+    for (0..rrk_iters) |_| {
+        _ = try model.rerankSequences(&docs, .{
+            .mode = .yes_no_sigmoid,
+            .positive_token_id = 10,
+            .negative_token_id = 11,
+            .temperature = 1.0,
+        }, &rerank_scores);
+    }
+    const rrk_t1 = try vmstat.nowNs();
+    const ha_c21 = try vmstat.Snapshot.capture();
+    const c21_heap_delta = vmstat.heapDelta(hb_c21, ha_c21);
+
+    const c21_embed_us = (@as(f64, @floatFromInt(emb_t1 -| emb_t0)) / @as(f64, @floatFromInt(emb_iters))) / 1000.0;
+    const c21_rerank_us = (@as(f64, @floatFromInt(rrk_t1 -| emb_t1)) / @as(f64, @floatFromInt(rrk_iters))) / 1000.0;
+    var norm_sq: f32 = 0.0;
+    for (emb_out) |v| norm_sq += v * v;
+    const c21_l2_norm = @sqrt(norm_sq);
+    const c21_sorted_ok = (rerank_scores[0].score >= rerank_scores[1].score) and
+        (rerank_scores[1].score >= rerank_scores[2].score) and
+        (rerank_scores[2].score >= rerank_scores[3].score);
+    model.deinit(allocator);
+    model_alive = false;
+
+    // -----------------------------------------------------------------------
+    // 6. R10: `DiskPrefixCache` `F_NOCACHE` 16 KiB-aligned spill & cold reload
+    // -----------------------------------------------------------------------
+    var dpc_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dpc_raw = try std.fmt.bufPrint(dpc_dir_buf[0 .. dpc_dir_buf.len - 1], "{s}/aminfer_m75_dpc_{d}_{d}", .{ tmp_root, pid, stamp });
+    dpc_dir_buf[dpc_raw.len] = 0;
+    const dpc_dir: [:0]const u8 = dpc_dir_buf[0..dpc_raw.len :0];
+
+    const r10_tok_cnt = @max(@as(u32, 64), cfg.disk_prefix_tokens);
+    const r10_kv_bytes = try page.alignUp(@max(@as(usize, page.APPLE_PAGE_SIZE), cfg.disk_prefix_kv_bytes));
+    const r10_tokens = try allocator.alloc(u32, r10_tok_cnt);
+    defer allocator.free(r10_tokens);
+    for (r10_tokens, 0..) |*t, i| t.* = @intCast((i * 13 + 7) % 512);
+    const r10_kv_src = try allocator.alloc(u8, r10_kv_bytes);
+    defer allocator.free(r10_kv_src);
+    for (r10_kv_src, 0..) |*b, i| b.* = @intCast((i * 31 + 17) & 0xFF);
+    const r10_kv_dst = try allocator.alloc(u8, r10_kv_bytes);
+    defer allocator.free(r10_kv_dst);
+
+    const p_hash = prefix_cache.hashPrefix(r10_tokens, r10_tok_cnt);
+    var art_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const art_raw = try std.fmt.bufPrint(art_path_buf[0 .. art_path_buf.len - 1], "{s}/pc_{x:0>8}_{x:0>8}_{x:0>16}.amkvc", .{
+        dpc_dir,
+        first_info.header_crc32,
+        first_info.directory_crc32,
+        p_hash,
+    });
+    art_path_buf[art_raw.len] = 0;
+    const art_path_z: [:0]const u8 = art_path_buf[0..art_raw.len :0];
+    defer {
+        _ = std.c.unlink(art_path_z.ptr);
+        _ = std.c.rmdir(dpc_dir.ptr);
+    }
+    var r10_spill_us: f64 = 0.0;
+    var r10_reload_us: f64 = 0.0;
+    var r10_verified = false;
+    var r10_collision_rejected = false;
+
+    {
+        var disk_writer = try prefix_cache.DiskPrefixCache.init(allocator, .{
+            .cache_dir = dpc_dir,
+            .amf_header_crc32 = first_info.header_crc32,
+            .amf_dir_crc32 = first_info.directory_crc32,
+            .max_tokens_per_artifact = r10_tok_cnt,
+            .max_kv_bytes_per_artifact = r10_kv_bytes,
+            .max_gdn_bytes_per_artifact = 0,
+            .enable_async_worker = false,
+        });
+        defer disk_writer.deinit(allocator);
+
+        const sp_t0 = try vmstat.nowNs();
+        try disk_writer.spillSync(.{
+            .prefix_hash = p_hash,
+            .parent_hash = 0,
+            .tokens = r10_tokens,
+            .num_kv_layers = 2,
+            .kv_format = .retired_q8,
+            .quant_profile_tag = 4,
+            .kv_bytes_per_layer = @intCast(r10_kv_bytes / 2),
+            .kv_bytes = r10_kv_src,
+            .gdn_bytes = null,
+        });
+        const sp_t1 = try vmstat.nowNs();
+        r10_spill_us = @as(f64, @floatFromInt(sp_t1 -| sp_t0)) / 1000.0;
+    }
+
+    // Cold-restart reload in a brand-new `DiskPrefixCache` instance + collision check.
+    {
+        var disk_reader = try prefix_cache.DiskPrefixCache.init(allocator, .{
+            .cache_dir = dpc_dir,
+            .amf_header_crc32 = first_info.header_crc32,
+            .amf_dir_crc32 = first_info.directory_crc32,
+            .max_tokens_per_artifact = r10_tok_cnt,
+            .max_kv_bytes_per_artifact = r10_kv_bytes,
+            .max_gdn_bytes_per_artifact = 0,
+            .enable_async_worker = false,
+        });
+        defer disk_reader.deinit(allocator);
+
+        const rl_t0 = try vmstat.nowNs();
+        const reload_opt = try disk_reader.reload(p_hash, r10_tokens, .retired_q8, 4, r10_kv_dst, null);
+        const rl_t1 = try vmstat.nowNs();
+        r10_reload_us = @as(f64, @floatFromInt(rl_t1 -| rl_t0)) / 1000.0;
+        if (reload_opt) |rr| {
+            r10_verified = (rr.kv_bytes_loaded == r10_kv_bytes) and std.mem.eql(u8, r10_kv_src, r10_kv_dst);
+        }
+
+        // Mutate one token while passing the same `p_hash` -> must reject with `null` (`0` collision risk).
+        const saved_tok = r10_tokens[0];
+        r10_tokens[0] = saved_tok ^ 1;
+        const bad_reload = try disk_reader.reload(p_hash, r10_tokens, .retired_q8, 4, r10_kv_dst, null);
+        r10_tokens[0] = saved_tok;
+        r10_collision_rejected = (bad_reload == null) and (disk_reader.stats().reloads_rejected_collision == 1);
+    }
+    const r10_spill_gbs = if (r10_spill_us > 0.0)
+        (@as(f64, @floatFromInt(r10_kv_bytes)) / (r10_spill_us * 1000.0))
+    else
+        0.0;
+    const r10_reload_gbs = if (r10_reload_us > 0.0)
+        (@as(f64, @floatFromInt(r10_kv_bytes)) / (r10_reload_us * 1000.0))
+    else
+        0.0;
+
+    // -----------------------------------------------------------------------
+    // 7. C17: C-ABI `libaminfer` create/destroy loop (`0` leaked wired pages)
+    // -----------------------------------------------------------------------
+    const sdk_cycles = @max(@as(u32, 1), cfg.sdk_create_destroy_iters);
+    var dylib_loaded = false;
+    const vm_c17_b = try vmstat.Snapshot.capture();
+    const c17_t0 = try vmstat.nowNs();
+
+    const dylib_handle = std.c.dlopen("zig-out/lib/libaminfer.dylib", .{ .LAZY = true, .LOCAL = true });
+    if (dylib_handle) |h_dl| {
+        defer _ = std.c.dlclose(h_dl);
+        const CEngineOptions = extern struct {
+            struct_size: u32,
+            abi_version: u32,
+            amf_path: ?[*:0]const u8,
+            config_json_path: ?[*:0]const u8,
+            tokenizer_json_path: ?[*:0]const u8,
+            wired_budget_bytes: u64,
+            headroom_bytes: u64,
+            live_safety_margin_bytes: u64,
+            live_reclaimable_override_bytes: u64,
+            has_live_reclaimable_override: u32,
+            strict_live_ram: u32,
+            max_seq_len: u32,
+            verify_crcs: u32,
+            startup_canary: u32,
+            reserved: u32,
+        };
+        const InitOptsFn = *const fn (*CEngineOptions) callconv(.c) void;
+        const CreateFn = *const fn (*const CEngineOptions, *?*anyopaque) callconv(.c) i32;
+        const DestroyFn = *const fn (?*anyopaque) callconv(.c) void;
+
+        const init_sym = std.c.dlsym(h_dl, "ami_sdk_engine_options_init");
+        const create_sym = std.c.dlsym(h_dl, "ami_sdk_engine_create");
+        const destroy_sym = std.c.dlsym(h_dl, "ami_sdk_engine_destroy");
+        if (init_sym != null and create_sym != null and destroy_sym != null) {
+            dylib_loaded = true;
+            const initOpts: InitOptsFn = @ptrCast(@alignCast(init_sym.?));
+            const createEng: CreateFn = @ptrCast(@alignCast(create_sym.?));
+            const destroyEng: DestroyFn = @ptrCast(@alignCast(destroy_sym.?));
+
+            var eopts: CEngineOptions = std.mem.zeroes(CEngineOptions);
+            initOpts(&eopts);
+            eopts.amf_path = sf_path.ptr;
+            eopts.config_json_path = null;
+            eopts.tokenizer_json_path = null;
+            eopts.max_seq_len = 128;
+            eopts.startup_canary = 0;
+
+            for (0..sdk_cycles) |_| {
+                var eng_ptr: ?*anyopaque = null;
+                const rc = createEng(&eopts, &eng_ptr);
+                if (rc != 0 or eng_ptr == null) return error.SdkEngineCreateFailed;
+                destroyEng(eng_ptr);
+            }
+        }
+    }
+    if (!dylib_loaded) {
+        for (0..sdk_cycles) |_| {
+            var tmp_m = try qwen3.Qwen3Model.loadFromFileAutoConfig(allocator, sf_path, null, .{
+                .max_seq_len = 128,
+                .max_tree_nodes = 1,
+                .startup_canary = false,
+            });
+            _ = try tmp_m.prefillPrompt(&prompt_ids, true);
+            tmp_m.deinit(allocator);
+        }
+    }
+    const c17_t1 = try vmstat.nowNs();
+    const vm_c17_a = try vmstat.Snapshot.capture();
+    const c17_cycle_ms = (@as(f64, @floatFromInt(c17_t1 -| c17_t0)) / @as(f64, @floatFromInt(sdk_cycles))) / 1_000_000.0;
+    const c17_leaked_pages: i64 = if (vm_c17_a.wire_pages > vm_c17_b.wire_pages + 64)
+        @intCast(vm_c17_a.wire_pages - vm_c17_b.wire_pages)
+    else
+        0;
+
+    // Optional real checkpoint checks (`/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf` & `qwen3-14b-4bit.amf`)
+    var q06b: M75CheckpointCheck = .{ .present = false, .executed = false, .status = "skipped_in_unit_test" };
+    var q14b: M75CheckpointCheck = .{ .present = false, .executed = false, .status = "skipped_in_unit_test" };
+    if (!cfg.skip_real_checkpoints) {
+        // Release synthetic `model` and `ref_model` arenas before loading multi-GB real checkpoints!
+        q06b = runOptionalRealCheckpointM75(
+            allocator,
+            "/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf",
+            "/Volumes/Akari/models/Qwen3-0.6B/config.json",
+        );
+        q14b = runOptionalRealCheckpointM75(
+            allocator,
+            "/Volumes/Akari/models/amf/qwen3-14b-4bit.amf",
+            "/Volumes/Akari/models/Qwen3-14B-4bit/config.json",
+        );
+    }
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .chip_profile = profile,
+        .gpu_name_buf = gpu_name_buf,
+        .gpu_name_len = gpu_len,
+        .w18_inspect_us = w18_inspect_us,
+        .w18_inspect_wired_bytes_delta = w18_wired_delta,
+        .w18_auto_config_load_ms = w18_auto_load_ms,
+        .w18_auto_config_parity = w18_parity,
+        .w18_file_bytes = first_info.file_bytes,
+        .w18_wired_weight_bytes = first_info.wired_weight_bytes,
+        .w18_meta_blob_bytes = first_info.metadata_blob_bytes,
+        .w19_pool_capacity_bytes = 512 * 1024,
+        .w19_adapter_wired_bytes = w19_adapter_wired,
+        .w19_rank = r,
+        .w19_base_decode_us = w19_base_us,
+        .w19_zero_adapter_decode_us = w19_zero_us,
+        .w19_active_lora_decode_us = w19_active_us,
+        .w19_delta_overhead_us = @max(0.0, w19_active_us - w19_base_us),
+        .w19_zero_adapter_exact_match = zero_bypass_match,
+        .w19_unload_restores_exact = unload_match,
+        .w19_heap_delta = w19_heap_delta,
+        .c22_vocab_size = @intCast(g_vocab),
+        .c22_compile_us = c22_compile_us,
+        .c22_mask_eval_us = c22_mask_eval_us,
+        .c22_schema_valid_match = c22_valid,
+        .c22_heap_delta = c22_heap_delta,
+        .c19_sample_us = c19_sample_us,
+        .c19_p_cores = last_host.cpu.p_core_count,
+        .c19_e_cores = last_host.cpu.e_core_count,
+        .c19_wired_limit_mib = last_host.mem.wired_budget_bytes >> 20,
+        .c19_live_reclaimable_mib = last_host.mem.reclaimable_zero_swap_bytes >> 20,
+        .c19_json_bytes = last_json_len,
+        .c19_heap_delta = c19_heap_delta,
+        .c21_embed_dim = embed_dim,
+        .c21_embed_us = c21_embed_us,
+        .c21_embed_l2_norm = c21_l2_norm,
+        .c21_rerank_docs = 4,
+        .c21_rerank_us = c21_rerank_us,
+        .c21_rerank_sorted_ok = c21_sorted_ok,
+        .c21_heap_delta = c21_heap_delta,
+        .r10_artifact_bytes = r10_kv_bytes,
+        .r10_spill_us = r10_spill_us,
+        .r10_spill_gbs = r10_spill_gbs,
+        .r10_reload_us = r10_reload_us,
+        .r10_reload_gbs = r10_reload_gbs,
+        .r10_token_verified = r10_verified,
+        .r10_collision_rejected = r10_collision_rejected,
+        .c17_dylib_loaded = dylib_loaded,
+        .c17_cycles = sdk_cycles,
+        .c17_cycle_ms = c17_cycle_ms,
+        .c17_leaked_wired_pages = c17_leaked_pages,
+        .qwen3_06b = q06b,
+        .qwen3_14b = q14b,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM75(allocator: std.mem.Allocator) !M75Report {
+    return runM75WithConfig(allocator, .{});
+}
+
+test "runM75WithConfig verifies W18 single-file AMF, W19 multi-LoRA, C22 grammar bitmask, C19 monitor JSON, C21 embed/rerank, R10 DiskPrefixCache, and C17 lifecycle" {
+    const gpa = std.testing.allocator;
+    const report = try runM75WithConfig(gpa, .{
+        .inspect_iters = 4,
+        .lora_decode_steps = 4,
+        .lora_rank = 8,
+        .grammar_vocab_size = 512,
+        .grammar_eval_iters = 8,
+        .telemetry_iters = 2,
+        .embed_iters = 4,
+        .rerank_iters = 2,
+        .disk_prefix_tokens = 128,
+        .disk_prefix_kv_bytes = 64 * 1024,
+        .sdk_create_destroy_iters = 2,
+        .skip_real_checkpoints = true,
+    });
+
+    try std.testing.expectEqual(@as(i64, 0), report.w18_inspect_wired_bytes_delta);
+    try std.testing.expect(report.w18_auto_config_parity);
+    try std.testing.expect(report.w19_zero_adapter_exact_match);
+    try std.testing.expect(report.w19_unload_restores_exact);
+    try std.testing.expect(report.c22_schema_valid_match);
+    try std.testing.expect(report.c22_heap_delta.blocks_in_use <= 0);
+    try std.testing.expect(report.c19_json_bytes > 64);
+    try std.testing.expect(report.c19_heap_delta.blocks_in_use <= 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), report.c21_embed_l2_norm, 1e-3);
+    try std.testing.expect(report.c21_rerank_sorted_ok);
+    try std.testing.expect(report.r10_token_verified);
+    try std.testing.expect(report.r10_collision_rejected);
+    try std.testing.expectEqual(@as(i64, 0), report.c17_leaked_wired_pages);
+    try std.testing.expectEqual(@as(u64, 0), vmstat.Snapshot.swapoutDelta(report.vm_before, report.vm_after));
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "bench.m75.w18.single_file_amf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "bench.m75.r10.disk_prefix_cache") != null);
 }

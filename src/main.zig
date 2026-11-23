@@ -10,8 +10,18 @@ const usage =
     \\commands:
     \\  probe             print the kernel, chip profile, Metal, NAX and Neural Engine facts of this machine
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
+    \\  ls [dir]          scan a directory of .amf models without mlocking weights (W18)
+    \\  inspect <path>    print header, metadata, dtype breakdown, wired estimate and tier fit of an .amf file (W18)
+    \\  monitor           start the rootless btop-style TrueColor TUI hardware & inference monitor (C19)
+    \\                    [--theme <path.theme>] [--interval-ms N] [--once] [--json] [--server <host:port>]
+    \\  chat              start the plain scrolling CLI chat REPL or stdin pipe mode (C20)
+    \\                    --model <path.amf> [--config <path>] [--tokenizer <path>] [--system <text>]
+    \\                    [--lora <name>=<path.amlora>] [--no-think] [--hide-think] [--no-color] [--no-stats]
+    \\                    [--max-tokens N] [--temperature T] [--seed N] [--image <path>] [--video <path>]
+    \\                    [--max-seq-len N] [--prefix-cache-chunks N] [--disk-prefix-cache <dir>]
+    \\                    [--wired-cap-mib N] [--no-verify-crc]
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5, M6.8, M6.9 and M7 benchmark suites
+    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5, M6.8, M6.9, M7 and M7.5 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
@@ -26,6 +36,7 @@ const usage =
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\  bench-m7          run M7 R7/G11 MLA+CSA2 FP4, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED+DSpark & X1-X3 cluster
     \\                    [--bus-bandwidth-gbs F]
+    \\  bench-m75         run M7.5 W18 single-file AMF, W19 multi-LoRA, C22 grammar bitmask, C19 monitor, C21 embed/rerank, R10 DiskPrefixCache & C17 C-ABI SDK suite
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    --listen <ip:port> --amf <path> --config <path> --rank N --world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -35,7 +46,7 @@ const usage =
     \\                    --amf <path> --config <path> --tokenizer <path> [--prompt <text>]
     \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [--no-verify-crc]
     \\  bench-decode      benchmark end-to-end greedy decode on a specific .amf + config.json
-    \\                    --amf <path> --config <path> [--scale-layers N] [--prefill-tokens N]
+    \\                    --amf <path> [--config <path>] [--scale-layers N] [--prefill-tokens N]
     \\                    [--decode-steps N] [--cold-experts-per-layer N] [--heat-profile <path>]
     \\                    [--cold-slots N] [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
@@ -47,7 +58,7 @@ const usage =
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
     \\                    [--strict-tb5-rdma] [--shutdown-peers] [--no-ane-predictor] [--no-verify-crc]
     \\  decode            run end-to-end native BPE encode -> greedy/stochastic .amf decode -> BPE decode
-    \\                    --amf <path> --config <path> --tokenizer <path>
+    \\                    --amf <path> [--config <path>] [--tokenizer <path>]
     \\                    --prompt <text> [--max-tokens N] [--temperature T] [--seed N] [--ignore-eos]
     \\                    [--sme-router auto|sme2|gpu] [--kv-retire-q8-after-chunks N]
     \\                    [--image <path.png>] [--vt-test-video hevc|h264]
@@ -62,7 +73,7 @@ const usage =
     \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--no-verify-crc]
     \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent/DSpark)
-    \\                    --amf <path> --config <path> --tokenizer <path> --prompt <text>
+    \\                    --amf <path> [--config <path>] [--tokenizer <path>] --prompt <text>
     \\                    [--draft-amf <path> --draft-config <path>]
     \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark]
     \\                    [--placement auto|gpu|ane|sme2] [--kv-retire-q8-after-chunks N]
@@ -80,9 +91,10 @@ const usage =
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--max-tokens N] [--ignore-eos] [--no-verify-crc]
-    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15)
-    \\                    --amf <path> --config <path> --tokenizer <path>
-    \\                    [--host 127.0.0.1] [--port 8080] [--model-id <id>]
+    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15, C18, C21, C22, W19, R10)
+    \\                    --amf <path> [--config <path>] [--tokenizer <path>]
+    \\                    [--host 127.0.0.1] [--port 8080] [--unix-socket <path>] [--api-key <secret>]
+    \\                    [--model-id <id>] [--lora <name>=<path.amlora>] [--disk-prefix-cache <dir>]
     \\                    [--max-seq-len N] [--max-conns N] [--max-active-requests N]
     \\                    [--batch-mode auto|continuous|serial] [--prefix-cache-chunks N]
     \\                    [--decode-share F] [--adaptive-prefill-narrow on|off]
@@ -114,6 +126,16 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout.interface;
     if (args.len >= 2 and std.mem.eql(u8, args[1], "probe")) {
         try probe(args[2..], out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "ls")) {
+        try runLs(arena, args[2..], out);
+    } else if (args.len == 3 and std.mem.eql(u8, args[1], "inspect")) {
+        try runInspect(arena, args[2], out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "monitor")) {
+        try out.flush();
+        try runMonitor(arena, args[2..]);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "chat")) {
+        try out.flush();
+        try runChat(arena, args[2..]);
     } else if (args.len == 3 and std.mem.eql(u8, args[1], "verify-amf")) {
         try verifyAmf(arena, args[2], out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
@@ -142,6 +164,8 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM69(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m7")) {
         try runBenchM7(arena, args[2..], out);
+    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m75")) {
+        try runBenchM75(arena, out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         try runPeerWorker(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-a2")) {
@@ -260,6 +284,92 @@ fn parseNgramPackArg(arg: [:0]const u8) error{InvalidNgramPackSpec}!NgramPackArg
         .domain = domain,
         .path = path,
     };
+}
+
+const LoraSpecArg = struct {
+    name: []const u8,
+    path: [:0]const u8,
+};
+
+fn parseLoraSpecArg(arg: [:0]const u8) error{InvalidLoraSpec}!LoraSpecArg {
+    const eq_idx = std.mem.indexOfScalar(u8, arg, '=') orelse return error.InvalidLoraSpec;
+    if (eq_idx == 0 or eq_idx + 1 >= arg.len) return error.InvalidLoraSpec;
+    const name = arg[0..eq_idx];
+    if (name.len > aminfer.lora.MAX_ADAPTER_NAME_LEN) return error.InvalidLoraSpec;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or c == '-' or c == '.';
+        if (!ok) return error.InvalidLoraSpec;
+    }
+    const path: [:0]const u8 = arg[eq_idx + 1 .. :0];
+    return .{
+        .name = name,
+        .path = path,
+    };
+}
+
+const ResolvedMetadataPair = struct {
+    config: aminfer.amf.ResolvedMetadata,
+    tokenizer: aminfer.amf.ResolvedMetadata,
+    amf_header_crc32: u32,
+    amf_dir_crc32: u32,
+
+    fn deinit(self: *ResolvedMetadataPair, allocator: std.mem.Allocator) void {
+        self.tokenizer.deinit(allocator);
+        self.config.deinit(allocator);
+    }
+};
+
+/// Resolves `config.json` and `tokenizer.json` with `ADR-0022` `W18` precedence:
+///   1. Explicit CLI flag (`--config` / `--tokenizer`)
+///   2. Embedded cold metadata (`__meta.config_json` / `__meta.tokenizer_json`) inside `amf_path`
+///   3. Sidecar `config.json` / `tokenizer.json` next to `amf_path`
+fn resolveConfigAndTokenizerAlloc(
+    allocator: std.mem.Allocator,
+    amf_path: [:0]const u8,
+    explicit_config_path: ?[:0]const u8,
+    explicit_tokenizer_path: ?[:0]const u8,
+) !ResolvedMetadataPair {
+    var amf_file = try aminfer.amf.AmfFile.open(allocator, amf_path);
+    defer amf_file.close(allocator);
+
+    var cfg_meta = try aminfer.amf.resolveConfigJsonAlloc(
+        allocator,
+        &amf_file,
+        amf_path,
+        if (explicit_config_path) |p| @as([]const u8, p) else null,
+    );
+    errdefer cfg_meta.deinit(allocator);
+
+    const tok_meta = try aminfer.amf.resolveTokenizerJsonAlloc(
+        allocator,
+        &amf_file,
+        amf_path,
+        if (explicit_tokenizer_path) |p| @as([]const u8, p) else null,
+    );
+    return .{
+        .config = cfg_meta,
+        .tokenizer = tok_meta,
+        .amf_header_crc32 = amf_file.parsed.header.header_crc32,
+        .amf_dir_crc32 = amf_file.parsed.header.directory_crc32,
+    };
+}
+
+fn resolveConfigOnlyAlloc(
+    allocator: std.mem.Allocator,
+    amf_path: [:0]const u8,
+    explicit_config_path: ?[:0]const u8,
+) !aminfer.amf.ResolvedMetadata {
+    var amf_file = try aminfer.amf.AmfFile.open(allocator, amf_path);
+    defer amf_file.close(allocator);
+    return aminfer.amf.resolveConfigJsonAlloc(
+        allocator,
+        &amf_file,
+        amf_path,
+        if (explicit_config_path) |p| @as([]const u8, p) else null,
+    );
 }
 
 fn writeRetiredKvStats(
@@ -777,8 +887,8 @@ fn writeLoopIsolationStats(prefix: []const u8, iso: aminfer.graph.LoopIsolationS
 
 const DecodeCliArgs = struct {
     amf_path: [:0]const u8,
-    config_path: [:0]const u8,
-    tokenizer_path: [:0]const u8,
+    config_path: ?[:0]const u8 = null,
+    tokenizer_path: ?[:0]const u8 = null,
     prompt: []const u8,
     max_tokens: u32 = 16,
     temperature: f32 = 0.0,
@@ -930,8 +1040,8 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
 
     return .{
         .amf_path = amf_path orelse return error.MissingRequiredFlag,
-        .config_path = config_path orelse return error.MissingRequiredFlag,
-        .tokenizer_path = tokenizer_path orelse return error.MissingRequiredFlag,
+        .config_path = config_path,
+        .tokenizer_path = tokenizer_path,
         .prompt = prompt,
         .max_tokens = max_tokens,
         .temperature = temperature,
@@ -960,7 +1070,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
 
 const BenchDecodeCliArgs = struct {
     amf_path: [:0]const u8,
-    config_path: [:0]const u8,
+    config_path: ?[:0]const u8 = null,
     scale_layers: ?u32 = null,
     prefill_tokens: u32 = 511,
     decode_steps: u32 = 16,
@@ -1078,7 +1188,7 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
 
     return .{
         .amf_path = amf_path orelse return error.MissingRequiredFlag,
-        .config_path = config_path orelse return error.MissingRequiredFlag,
+        .config_path = config_path,
         .scale_layers = scale_layers,
         .prefill_tokens = prefill_tokens,
         .decode_steps = decode_steps,
@@ -1102,8 +1212,8 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
 
 const BenchA2CliArgs = struct {
     amf_path: [:0]const u8,
-    config_path: [:0]const u8,
-    tokenizer_path: [:0]const u8,
+    config_path: ?[:0]const u8 = null,
+    tokenizer_path: ?[:0]const u8 = null,
     prompt: []const u8 = "Explain how B-trees keep search, insertion, and deletion logarithmic in height and provide a Python implementation:",
     capture_steps: u32 = 16,
     lookahead: u32 = 3,
@@ -1161,8 +1271,8 @@ fn parseBenchA2Args(args: []const [:0]const u8) !BenchA2CliArgs {
 
     return .{
         .amf_path = amf_path orelse return error.MissingRequiredFlag,
-        .config_path = config_path orelse return error.MissingRequiredFlag,
-        .tokenizer_path = tokenizer_path orelse return error.MissingRequiredFlag,
+        .config_path = config_path,
+        .tokenizer_path = tokenizer_path,
         .prompt = prompt,
         .capture_steps = capture_steps,
         .lookahead = lookahead,
@@ -1173,13 +1283,11 @@ fn parseBenchA2Args(args: []const [:0]const u8) !BenchA2CliArgs {
 
 fn runBenchA2(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
     const cli = try parseBenchA2Args(raw_args);
-    const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
-    defer allocator.free(cfg_bytes);
-    const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
+    var meta = try resolveConfigAndTokenizerAlloc(allocator, cli.amf_path, cli.config_path, cli.tokenizer_path);
+    defer meta.deinit(allocator);
+    const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, meta.config.bytes);
 
-    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
-    defer allocator.free(tok_bytes);
-    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
+    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, meta.tokenizer.bytes);
     defer tok.deinit(allocator);
 
     var prompt_ids = try tok.encodeAlloc(allocator, cli.prompt);
@@ -1203,13 +1311,12 @@ fn runDecodeGraph(
     allocator: std.mem.Allocator,
     cli: DecodeCliArgs,
     cfg_bytes: []const u8,
+    tok_bytes: []const u8,
     out: *Io.Writer,
 ) !void {
     var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
     defer gcfg.deinit(allocator);
 
-    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
-    defer allocator.free(tok_bytes);
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
@@ -1221,7 +1328,7 @@ fn runDecodeGraph(
         prompt_ids[0] = if (gcfg.bos_token_id < gcfg.vocab_size) gcfg.bos_token_id else 0;
     }
 
-    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, &gcfg);
+    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse cli.amf_path, &gcfg);
     defer freePlePaths(allocator, ple_paths);
 
     const has_vision = (cli.image_path != null or cli.vt_test_video != null);
@@ -1507,10 +1614,13 @@ fn runDecodeGraph(
 fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
     const cli = try parseDecodeArgs(raw_args);
 
-    const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
-    defer allocator.free(cfg_bytes);
+    var meta = try resolveConfigAndTokenizerAlloc(allocator, cli.amf_path, cli.config_path, cli.tokenizer_path);
+    defer meta.deinit(allocator);
+    const cfg_bytes = meta.config.bytes;
+    const tok_bytes = meta.tokenizer.bytes;
+
     if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, null)) {
-        return runDecodeGraph(allocator, cli, cfg_bytes, out);
+        return runDecodeGraph(allocator, cli, cfg_bytes, tok_bytes, out);
     }
     if (cli.image_path != null or cli.vt_test_video != null) {
         return error.UnsupportedVisionTarget;
@@ -1523,8 +1633,6 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         null;
     defer if (heat_bytes) |hb| allocator.free(hb);
 
-    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
-    defer allocator.free(tok_bytes);
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
@@ -1712,14 +1820,15 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
 
 fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
     const cli = try parseBenchDecodeArgs(raw_args);
-    const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
-    defer allocator.free(cfg_bytes);
+    var cfg_meta = try resolveConfigOnlyAlloc(allocator, cli.amf_path, cli.config_path);
+    defer cfg_meta.deinit(allocator);
+    const cfg_bytes = cfg_meta.bytes;
     const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
     const max_seq_len: u32 = @max(@as(u32, 576), cli.prefill_tokens + 64);
     if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, null)) {
         var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
         defer gcfg.deinit(allocator);
-        const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, &gcfg);
+        const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse cli.amf_path, &gcfg);
         defer freePlePaths(allocator, ple_paths);
         if (!cli.m7.hasPeers() and cli.m7.effectiveTransport() == .tb5_rdma) {
             _ = try aminfer.transport.selectTransport(.tb5_rdma);
@@ -1876,6 +1985,11 @@ fn runBenchM7(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out:
     const report = try aminfer.bench.runM7WithConfig(allocator, .{
         .bus_bandwidth_gbs_override = cli.bus_bandwidth_gbs,
     });
+    try report.write(out);
+}
+
+fn runBenchM75(allocator: std.mem.Allocator, out: *Io.Writer) !void {
+    const report = try aminfer.bench.runM75(allocator);
     try report.write(out);
 }
 
@@ -2100,12 +2214,14 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM69(allocator, &.{}, out);
     try out.flush();
     try runBenchM7(allocator, &.{}, out);
+    try out.flush();
+    try runBenchM75(allocator, out);
 }
 
 const SpecDecodeCliArgs = struct {
     amf_path: [:0]const u8,
-    config_path: [:0]const u8,
-    tokenizer_path: [:0]const u8,
+    config_path: ?[:0]const u8 = null,
+    tokenizer_path: ?[:0]const u8 = null,
     prompt: []const u8 = "",
     draft_amf_path: ?[:0]const u8 = null,
     draft_config_path: ?[:0]const u8 = null,
@@ -2322,8 +2438,8 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
 
     return .{
         .amf_path = amf_path orelse return error.MissingRequiredFlag,
-        .config_path = config_path orelse return error.MissingRequiredFlag,
-        .tokenizer_path = tokenizer_path orelse return error.MissingRequiredFlag,
+        .config_path = config_path,
+        .tokenizer_path = tokenizer_path,
         .prompt = prompt,
         .draft_amf_path = draft_amf_path,
         .draft_config_path = draft_config_path,
@@ -2365,13 +2481,12 @@ fn runSpecDecodeGraph(
     allocator: std.mem.Allocator,
     cli: SpecDecodeCliArgs,
     cfg_bytes: []const u8,
+    tok_bytes: []const u8,
     out: *Io.Writer,
 ) !void {
     var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
     defer gcfg.deinit(allocator);
 
-    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
-    defer allocator.free(tok_bytes);
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
@@ -2410,7 +2525,7 @@ fn runSpecDecodeGraph(
         draft_cfg_opt.?.format = mode;
     }
 
-    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, &gcfg);
+    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse cli.amf_path, &gcfg);
     defer freePlePaths(allocator, ple_paths);
 
     const needed_seq: u32 = @intCast(prompt_ids.len + cli.max_tokens + cli.max_tree_nodes + 32);
@@ -2482,7 +2597,7 @@ fn runSpecDecodeGraph(
     var dspark_loaded: ?*aminfer.engine.LoadedDSparkProposer = null;
     defer if (dspark_loaded) |dp| dp.deinit(allocator);
     if (mode == .dspark) {
-        const dspark_path = try resolveDSparkPathAlloc(allocator, cli.draft_amf_path, cli.config_path, &gcfg);
+        const dspark_path = try resolveDSparkPathAlloc(allocator, cli.draft_amf_path, cli.config_path orelse cli.amf_path, &gcfg);
         defer allocator.free(dspark_path);
         dspark_loaded = try aminfer.engine.LoadedDSparkProposer.loadFromFile(
             allocator,
@@ -2705,10 +2820,13 @@ fn runSpecDecodeGraph(
 fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
     const cli = try parseSpecDecodeArgs(raw_args);
 
-    const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
-    defer allocator.free(cfg_bytes);
+    var meta = try resolveConfigAndTokenizerAlloc(allocator, cli.amf_path, cli.config_path, cli.tokenizer_path);
+    defer meta.deinit(allocator);
+    const cfg_bytes = meta.config.bytes;
+    const tok_bytes = meta.tokenizer.bytes;
+
     if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, cli.draft_mode)) {
-        return runSpecDecodeGraph(allocator, cli, cfg_bytes, out);
+        return runSpecDecodeGraph(allocator, cli, cfg_bytes, tok_bytes, out);
     }
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
 
@@ -2752,8 +2870,6 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         draft_cfg_opt.?.format = mode;
     }
 
-    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
-    defer allocator.free(tok_bytes);
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
@@ -3171,10 +3287,15 @@ fn handleServeShutdownSignal(_: std.c.SIG) callconv(.c) void {
 
 const ServeCliArgs = struct {
     amf_path: [:0]const u8,
-    config_path: [:0]const u8,
-    tokenizer_path: [:0]const u8,
+    config_path: ?[:0]const u8 = null,
+    tokenizer_path: ?[:0]const u8 = null,
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
+    api_key: ?[]const u8 = null,
+    unix_socket_path: ?[]const u8 = null,
+    lora_specs: [aminfer.lora.MAX_ADAPTERS]LoraSpecArg = undefined,
+    lora_spec_count: usize = 0,
+    disk_prefix_cache_dir: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     max_seq_len: u32 = 4096,
     max_conns: usize = aminfer.server.DEFAULT_MAX_CONNS,
@@ -3223,6 +3344,11 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var tokenizer_path: ?[:0]const u8 = null;
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8080;
+    var api_key: ?[]const u8 = null;
+    var unix_socket_path: ?[]const u8 = null;
+    var lora_specs: [aminfer.lora.MAX_ADAPTERS]LoraSpecArg = undefined;
+    var lora_spec_count: usize = 0;
+    var disk_prefix_cache_dir: ?[]const u8 = null;
     var model_id: ?[]const u8 = null;
     var max_seq_len: u32 = 4096;
     var max_conns: usize = aminfer.server.DEFAULT_MAX_CONNS;
@@ -3432,6 +3558,27 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
             ane_predictor_path = args[i];
         } else if (std.mem.eql(u8, flag, "--no-ane-predictor")) {
             enable_ane_predictor = false;
+        } else if (std.mem.eql(u8, flag, "--api-key")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len == 0 or args[i].len > aminfer.server.MAX_API_KEY_BYTES) return error.InvalidApiKey;
+            api_key = args[i];
+        } else if (std.mem.eql(u8, flag, "--unix-socket")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len == 0 or args[i].len > aminfer.server.MAX_UNIX_SOCKET_PATH_BYTES) return error.InvalidUnixSocketPath;
+            unix_socket_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--lora")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (lora_spec_count >= lora_specs.len) return error.TooManyLoraAdapters;
+            lora_specs[lora_spec_count] = try parseLoraSpecArg(args[i]);
+            lora_spec_count += 1;
+        } else if (std.mem.eql(u8, flag, "--disk-prefix-cache")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len == 0) return error.InvalidFlagValue;
+            disk_prefix_cache_dir = args[i];
         } else {
             return error.UnknownFlag;
         }
@@ -3439,10 +3586,15 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
 
     return .{
         .amf_path = amf_path orelse return error.MissingRequiredFlag,
-        .config_path = config_path orelse return error.MissingRequiredFlag,
-        .tokenizer_path = tokenizer_path orelse return error.MissingRequiredFlag,
+        .config_path = config_path,
+        .tokenizer_path = tokenizer_path,
         .host = host,
         .port = port,
+        .api_key = api_key,
+        .unix_socket_path = unix_socket_path,
+        .lora_specs = lora_specs,
+        .lora_spec_count = lora_spec_count,
+        .disk_prefix_cache_dir = disk_prefix_cache_dir,
         .model_id = model_id,
         .max_seq_len = max_seq_len,
         .max_conns = max_conns,
@@ -3492,7 +3644,7 @@ const ServeTarget = union(enum) {
 };
 
 /// Zero-allocation inference runner bridging `Qwen3Model` / `GraphModel` / `SpecEngine` +
-/// `Tokenizer` into `server.Server`'s `EngineHandler` (`C7`, `C8`, `D11`, `W9`).
+/// `Tokenizer` into `server.Server`'s `EngineHandler` (`C7`, `C8`, `C18`, `C22`, `D11`, `W9`, `W19`).
 const ServeRunner = struct {
     target: ServeTarget,
     spec_engine: ?*aminfer.engine.SpecEngine,
@@ -3507,6 +3659,12 @@ const ServeRunner = struct {
     encode_scratch: aminfer.tokenizer.EncodeScratch,
     prompt_ids_buf: []u32,
     p_res: []f32,
+    sampler_cand_ids: []u32,
+    grammar_mask: []u32,
+    vocab_index: ?aminfer.grammar.VocabIndex,
+    penalty_tracker: *aminfer.sampling.DefaultPenaltyTracker,
+    model_mutex: ?*std.c.pthread_mutex_t = null,
+    server_ptr: ?*aminfer.server.Server = null,
     round_buf: [aminfer.engine.MAX_TREE_NODES]u32,
     steady_steps: u64 = 0,
     steady_heap_start: ?aminfer.vmstat.Snapshot = null,
@@ -3533,6 +3691,14 @@ const ServeRunner = struct {
         errdefer allocator.free(prompt_ids_buf);
         const p_res = try allocator.alloc(f32, vocab_size);
         errdefer allocator.free(p_res);
+        const sampler_cand_ids = try allocator.alloc(u32, vocab_size);
+        errdefer allocator.free(sampler_cand_ids);
+        const mask_words = (@as(usize, vocab_size) + 31) / 32;
+        const grammar_mask = try allocator.alloc(u32, @max(@as(usize, 1), mask_words));
+        errdefer allocator.free(grammar_mask);
+        const penalty_tracker = try allocator.create(aminfer.sampling.DefaultPenaltyTracker);
+        errdefer allocator.destroy(penalty_tracker);
+        penalty_tracker.* = aminfer.sampling.DefaultPenaltyTracker.init();
 
         var stop_tokens: [4]u32 = @splat(0);
         var stop_cnt: usize = 0;
@@ -3556,6 +3722,12 @@ const ServeRunner = struct {
             }
         }
 
+        const vocab_index: ?aminfer.grammar.VocabIndex = if (aminfer.grammar.VocabIndex.initFromTokenizer(
+            allocator,
+            tok,
+            stop_tokens[0..stop_cnt],
+        )) |vi| vi else |_| null;
+
         return .{
             .target = target,
             .spec_engine = spec_engine,
@@ -3570,6 +3742,10 @@ const ServeRunner = struct {
             .encode_scratch = encode_scratch,
             .prompt_ids_buf = prompt_ids_buf,
             .p_res = p_res,
+            .sampler_cand_ids = sampler_cand_ids,
+            .grammar_mask = grammar_mask,
+            .vocab_index = vocab_index,
+            .penalty_tracker = penalty_tracker,
             .round_buf = @splat(0),
         };
     }
@@ -3601,6 +3777,10 @@ const ServeRunner = struct {
     }
 
     fn deinit(self: *ServeRunner, allocator: std.mem.Allocator) void {
+        if (self.vocab_index) |*vi| vi.deinit(allocator);
+        allocator.destroy(self.penalty_tracker);
+        allocator.free(self.grammar_mask);
+        allocator.free(self.sampler_cand_ids);
         allocator.free(self.p_res);
         allocator.free(self.prompt_ids_buf);
         self.encode_scratch.deinit(allocator);
@@ -3626,6 +3806,68 @@ const ServeRunner = struct {
         return .ok;
     }
 
+    fn emitTokenWithStop(
+        self: *const ServeRunner,
+        stream: *aminfer.server.TokenStream,
+        tid: u32,
+        ignore_eos: bool,
+        stop_cfg: *const aminfer.sampling.StopConfig,
+        stop_hb: *aminfer.sampling.StopHoldback,
+    ) EmitResult {
+        if (!ignore_eos and self.isStopToken(tid)) return .stop;
+        if (self.tok.isSpecialToken(tid)) return .ok;
+        const piece = self.tok.tokenBytes(tid) catch return .ok;
+        if (!stream.emitTokenBytes(piece)) return .cancelled;
+        if (stop_cfg.count > 0) {
+            const Noop = struct {
+                fn onSafe(_: void, _: []const u8) error{}!void {}
+            };
+            const cont = stop_hb.feed(stop_cfg, piece, {}, Noop.onSafe) catch true;
+            if (!cont) return .stop;
+        }
+        return .ok;
+    }
+
+    fn sampleConstrainedStep(
+        self: *ServeRunner,
+        job: *const aminfer.server.InferenceJob,
+        gstate: *aminfer.grammar.GrammarState,
+    ) ?u32 {
+        const raw_logits = switch (self.target) {
+            .qwen3 => |m| m.readLastLogitsF16(),
+            .graph => |g| g.readLastLogitsF16(),
+        };
+        const n = @min(raw_logits.len, self.p_res.len);
+        if (n == 0) return null;
+        var params = job.sampling;
+        if (job.grammar_program) |gp| {
+            const vi = &(self.vocab_index orelse return null);
+            const mask_len = (@min(n, vi.vocab_size) + 31) / 32;
+            vi.fillAllowedTokenBitmask(gp, gstate, self.grammar_mask[0..mask_len]);
+            params.allowed_token_mask = self.grammar_mask[0..mask_len];
+        }
+        const out = aminfer.sampling.sampleToken(
+            f16,
+            raw_logits[0..n],
+            params,
+            self.penalty_tracker.activeEntries(),
+            job.rng,
+            .{
+                .logits_f32 = self.p_res[0..n],
+                .cand_ids = self.sampler_cand_ids[0..n],
+            },
+        ) catch return null;
+        if (job.grammar_program) |gp| {
+            if (self.vocab_index) |*vi| {
+                _ = vi.advanceToken(gp, gstate, self.tok, out.token_id);
+            }
+        }
+        if (params.hasPenalties()) {
+            self.penalty_tracker.recordToken(out.token_id);
+        }
+        return out.token_id;
+    }
+
     fn handler(self: *ServeRunner) aminfer.server.EngineHandler {
         return .{
             .ctx = self,
@@ -3647,6 +3889,38 @@ const ServeRunner = struct {
         job: *const aminfer.server.InferenceJob,
         stream: *aminfer.server.TokenStream,
     ) void {
+        if (self.model_mutex) |mtx| _ = std.c.pthread_mutex_lock(mtx);
+        defer if (self.model_mutex) |mtx| {
+            _ = std.c.pthread_mutex_unlock(mtx);
+        };
+        defer if (self.server_ptr) |s| {
+            if (self.target == .qwen3) {
+                s.setRetiredQ8Chunks(self.target.qwen3.retiredKvChunks());
+            }
+        };
+
+        // W19 per-request LoRA selection (`active_adapters == 0` or `lora_adapter == null`
+        // keeps `active_lora_slot = NO_ADAPTER` for the zero-overhead outside-layer-loop bypass).
+        if (self.target == .qwen3) {
+            const m = self.target.qwen3;
+            if (job.lora_adapter) |adp| {
+                const reg = m.lora_registry orelse {
+                    stream.fail("requested LoRA adapter not loaded");
+                    return;
+                };
+                const slot_id = reg.findSlotByName(adp) orelse {
+                    stream.fail("requested LoRA adapter not found");
+                    return;
+                };
+                m.setActiveLoraSlot(slot_id);
+            } else {
+                m.setActiveLoraSlot(aminfer.lora.NO_ADAPTER);
+            }
+        }
+        defer if (self.target == .qwen3) {
+            self.target.qwen3.setActiveLoraSlot(aminfer.lora.NO_ADAPTER);
+        };
+
         var prompt_ids = self.tok.encodeWithScratch(
             &self.encode_scratch,
             job.prompt,
@@ -3672,7 +3946,15 @@ const ServeRunner = struct {
             return;
         }
 
-        if (self.spec_engine) |eng| {
+        const use_constrained = (job.grammar_program != null) or
+            job.sampling.hasPenalties() or
+            job.sampling.logit_bias.len > 0 or
+            job.sampling.top_p < 1.0 or
+            job.sampling.top_k > 0 or
+            job.sampling.min_p > 0.0;
+
+        if (!use_constrained and self.spec_engine != null) {
+            const eng = self.spec_engine.?;
             eng.reset();
             eng.setActiveNgramDomain(job.ngram_domain);
             eng.config.temperature = job.temperature;
@@ -3683,7 +3965,8 @@ const ServeRunner = struct {
             };
             if (!stream.setPromptTokens(prompt_len_u32)) return;
 
-            switch (self.emitToken(stream, first_tok, job.ignore_eos)) {
+            var stop_hb: aminfer.sampling.StopHoldback = .{};
+            switch (self.emitTokenWithStop(stream, first_tok, job.ignore_eos, job.stop_config, &stop_hb)) {
                 .stop => {
                     stream.finish(.stop, prompt_len_u32);
                     return;
@@ -3701,7 +3984,7 @@ const ServeRunner = struct {
                 };
                 self.recordSteadyStep();
                 for (self.round_buf[0..rs.emitted_count]) |tid| {
-                    switch (self.emitToken(stream, tid, job.ignore_eos)) {
+                    switch (self.emitTokenWithStop(stream, tid, job.ignore_eos, job.stop_config, &stop_hb)) {
                         .stop => {
                             stream.finish(.stop, prompt_len_u32);
                             return;
@@ -3723,54 +4006,13 @@ const ServeRunner = struct {
             queryNgramPromptTail(reg, self.tok, job.ngram_domain, prompt_ids, &self.ngram_query_errors);
         }
 
-        // Direct non-speculative decode path (`Qwen3Model` or `GraphModel`).
-        var next_tok: u32 = switch (self.target) {
-            .qwen3 => |m| blk: {
-                m.seq_len = 0;
-                const t = m.prefillPrompt(prompt_ids, true) catch {
-                    stream.fail("prefill failed");
-                    return;
-                };
-                break :blk if (job.temperature > 0.0)
-                    m.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
-                        stream.fail("sampling failed");
-                        return;
-                    }
-                else
-                    t;
-            },
-            .graph => |g| blk: {
-                g.resetKvCache();
-                const t = g.prefillChunk(prompt_ids, 0, true) catch {
-                    stream.fail("graph prefill failed");
-                    return;
-                };
-                break :blk if (job.temperature > 0.0)
-                    g.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
-                        stream.fail("sampling failed");
-                        return;
-                    }
-                else
-                    t;
-            },
-        };
-        if (!stream.setPromptTokens(prompt_len_u32)) return;
-
-        switch (self.emitToken(stream, next_tok, job.ignore_eos)) {
-            .stop => {
-                stream.finish(.stop, prompt_len_u32);
-                return;
-            },
-            .cancelled => return,
-            .ok => {},
-        }
-        var pos: u32 = prompt_len_u32;
-        var emitted: u32 = 1;
-        while (emitted < max_gen and !stream.isCancelled()) {
-            next_tok = switch (self.target) {
+        // Strict zero-overhead unconstrained fast path when `use_constrained == false` and `stop_config.count == 0`.
+        if (!use_constrained and job.stop_config.count == 0) {
+            var next_tok: u32 = switch (self.target) {
                 .qwen3 => |m| blk: {
-                    const t = m.stepDecode(next_tok, pos) catch {
-                        stream.fail("decode step failed");
+                    m.seq_len = 0;
+                    const t = m.prefillPrompt(prompt_ids, true) catch {
+                        stream.fail("prefill failed");
                         return;
                     };
                     break :blk if (job.temperature > 0.0)
@@ -3782,8 +4024,9 @@ const ServeRunner = struct {
                         t;
                 },
                 .graph => |g| blk: {
-                    const t = g.stepDecode(next_tok, pos) catch {
-                        stream.fail("graph decode step failed");
+                    g.resetKvCache();
+                    const t = g.prefillChunk(prompt_ids, 0, true) catch {
+                        stream.fail("graph prefill failed");
                         return;
                     };
                     break :blk if (job.temperature > 0.0)
@@ -3795,9 +4038,127 @@ const ServeRunner = struct {
                         t;
                 },
             };
+            if (!stream.setPromptTokens(prompt_len_u32)) return;
+
+            switch (self.emitToken(stream, next_tok, job.ignore_eos)) {
+                .stop => {
+                    stream.finish(.stop, prompt_len_u32);
+                    return;
+                },
+                .cancelled => return,
+                .ok => {},
+            }
+            var pos: u32 = prompt_len_u32;
+            var emitted: u32 = 1;
+            while (emitted < max_gen and !stream.isCancelled()) {
+                next_tok = switch (self.target) {
+                    .qwen3 => |m| blk: {
+                        const t = m.stepDecode(next_tok, pos) catch {
+                            stream.fail("decode step failed");
+                            return;
+                        };
+                        break :blk if (job.temperature > 0.0)
+                            m.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                                stream.fail("sampling failed");
+                                return;
+                            }
+                        else
+                            t;
+                    },
+                    .graph => |g| blk: {
+                        const t = g.stepDecode(next_tok, pos) catch {
+                            stream.fail("graph decode step failed");
+                            return;
+                        };
+                        break :blk if (job.temperature > 0.0)
+                            g.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                                stream.fail("sampling failed");
+                                return;
+                            }
+                        else
+                            t;
+                    },
+                };
+                self.recordSteadyStep();
+                pos += 1;
+                switch (self.emitToken(stream, next_tok, job.ignore_eos)) {
+                    .stop => {
+                        stream.finish(.stop, prompt_len_u32);
+                        return;
+                    },
+                    .cancelled => return,
+                    .ok => {},
+                }
+                emitted += 1;
+            }
+            if (!stream.isCancelled()) {
+                stream.finish(.length, prompt_len_u32);
+            }
+            return;
+        }
+
+        // Constrained (`C22` grammar bitmask / `C18` sampling penalties / `StopHoldback`) decode path.
+        var gstate: aminfer.grammar.GrammarState = if (job.grammar_program) |gp| gp.initialState() else undefined;
+        self.penalty_tracker.reset();
+        if (job.sampling.hasPenalties()) {
+            self.penalty_tracker.recordSlice(prompt_ids);
+        }
+        var stop_hb: aminfer.sampling.StopHoldback = .{};
+
+        switch (self.target) {
+            .qwen3 => |m| {
+                m.seq_len = 0;
+                _ = m.prefillPrompt(prompt_ids, true) catch {
+                    stream.fail("prefill failed");
+                    return;
+                };
+            },
+            .graph => |g| {
+                g.resetKvCache();
+                _ = g.prefillChunk(prompt_ids, 0, true) catch {
+                    stream.fail("graph prefill failed");
+                    return;
+                };
+            },
+        }
+        var next_tok = self.sampleConstrainedStep(job, &gstate) orelse {
+            stream.fail("constrained sampling failed");
+            return;
+        };
+        if (!stream.setPromptTokens(prompt_len_u32)) return;
+
+        switch (self.emitTokenWithStop(stream, next_tok, job.ignore_eos, job.stop_config, &stop_hb)) {
+            .stop => {
+                stream.finish(.stop, prompt_len_u32);
+                return;
+            },
+            .cancelled => return,
+            .ok => {},
+        }
+        var pos: u32 = prompt_len_u32;
+        var emitted: u32 = 1;
+        while (emitted < max_gen and !stream.isCancelled()) {
+            switch (self.target) {
+                .qwen3 => |m| {
+                    _ = m.stepDecode(next_tok, pos) catch {
+                        stream.fail("decode step failed");
+                        return;
+                    };
+                },
+                .graph => |g| {
+                    _ = g.stepDecode(next_tok, pos) catch {
+                        stream.fail("graph decode step failed");
+                        return;
+                    };
+                },
+            }
+            next_tok = self.sampleConstrainedStep(job, &gstate) orelse {
+                stream.fail("constrained sampling failed");
+                return;
+            };
             self.recordSteadyStep();
             pos += 1;
-            switch (self.emitToken(stream, next_tok, job.ignore_eos)) {
+            switch (self.emitTokenWithStop(stream, next_tok, job.ignore_eos, job.stop_config, &stop_hb)) {
                 .stop => {
                     stream.finish(.stop, prompt_len_u32);
                     return;
@@ -3816,7 +4177,26 @@ const ServeRunner = struct {
 /// Zero-allocation `C14` continuous-batching runner bridging `Qwen3BatchRuntime` or
 /// `GraphBatchRuntime` + `Tokenizer` + `DomainNgramRegistry` into `Server.runBatchedWorkerLoop`.
 const BatchServeRunner = struct {
+    const PendingJobMeta = struct {
+        lora_slot: u32 = aminfer.lora.NO_ADAPTER,
+        grammar_program: ?*const aminfer.grammar.GrammarProgram = null,
+        sampling: aminfer.sampling.SamplingParams = .{},
+        rng: ?*aminfer.rng.RequestRng = null,
+        constrained: bool = false,
+    };
+
+    const SlotConstraint = struct {
+        active: bool = false,
+        grammar_program: ?*const aminfer.grammar.GrammarProgram = null,
+        gstate: aminfer.grammar.GrammarState = undefined,
+        sampling: aminfer.sampling.SamplingParams = .{},
+        rng: ?*aminfer.rng.RequestRng = null,
+    };
+
     inner_backend: aminfer.batch_scheduler.BatchBackend,
+    qwen3_batch_rt: ?*aminfer.qwen3.Qwen3BatchRuntime = null,
+    model_mutex: ?*std.c.pthread_mutex_t = null,
+    server_ptr: ?*aminfer.server.Server = null,
     ngram_registry: ?*aminfer.ngram_nvme.DomainNgramRegistry,
     tok: *const aminfer.tokenizer.Tokenizer,
     bos_token_id: ?u32,
@@ -3825,6 +4205,14 @@ const BatchServeRunner = struct {
     stop_token_count: u8,
     encode_scratch: aminfer.tokenizer.EncodeScratch,
     boundary_verify_buf: []u32,
+    p_res: []f32,
+    sampler_cand_ids: []u32,
+    grammar_mask: []u32,
+    vocab_index: ?aminfer.grammar.VocabIndex,
+    pending_fifo: [aminfer.batch_scheduler.MAX_BATCH_SLOTS * 2]PendingJobMeta = @splat(.{}),
+    pending_head: usize = 0,
+    pending_tail: usize = 0,
+    slot_constraints: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]SlotConstraint = @splat(.{}),
     boundary_fallback_count: u64 = 0,
     steady_steps: u64 = 0,
     steady_heap_start: ?aminfer.vmstat.Snapshot = null,
@@ -3848,6 +4236,14 @@ const BatchServeRunner = struct {
         errdefer encode_scratch.deinit(allocator);
         const boundary_verify_buf = try allocator.alloc(u32, @max(@as(usize, 1), @as(usize, max_seq_len)));
         errdefer allocator.free(boundary_verify_buf);
+        const v_cap = @max(@as(usize, 1), tok.vocabSize());
+        const p_res = try allocator.alloc(f32, v_cap);
+        errdefer allocator.free(p_res);
+        const sampler_cand_ids = try allocator.alloc(u32, v_cap);
+        errdefer allocator.free(sampler_cand_ids);
+        const mask_words = @max(@as(usize, 1), (v_cap + 31) / 32);
+        const grammar_mask = try allocator.alloc(u32, mask_words);
+        errdefer allocator.free(grammar_mask);
 
         var stop_tokens: [aminfer.batch_scheduler.MAX_STOP_TOKENS]u32 = @splat(0);
         var stop_cnt: u8 = 0;
@@ -3871,6 +4267,12 @@ const BatchServeRunner = struct {
             }
         }
 
+        const vocab_index: ?aminfer.grammar.VocabIndex = if (aminfer.grammar.VocabIndex.initFromTokenizer(
+            allocator,
+            tok,
+            stop_tokens[0..stop_cnt],
+        )) |vi| vi else |_| null;
+
         return .{
             .inner_backend = inner_backend,
             .ngram_registry = ngram_registry,
@@ -3881,12 +4283,71 @@ const BatchServeRunner = struct {
             .stop_token_count = stop_cnt,
             .encode_scratch = encode_scratch,
             .boundary_verify_buf = boundary_verify_buf,
+            .p_res = p_res,
+            .sampler_cand_ids = sampler_cand_ids,
+            .grammar_mask = grammar_mask,
+            .vocab_index = vocab_index,
         };
     }
 
     fn deinit(self: *BatchServeRunner, allocator: std.mem.Allocator) void {
+        if (self.vocab_index) |*vi| vi.deinit(allocator);
+        allocator.free(self.grammar_mask);
+        allocator.free(self.sampler_cand_ids);
+        allocator.free(self.p_res);
         allocator.free(self.boundary_verify_buf);
         self.encode_scratch.deinit(allocator);
+    }
+
+    fn bindNextPendingToSlot(self: *BatchServeRunner, slot_id: u16) void {
+        if (self.pending_head == self.pending_tail) return;
+        const meta = self.pending_fifo[self.pending_head];
+        self.pending_head = (self.pending_head + 1) % self.pending_fifo.len;
+        if (self.qwen3_batch_rt) |brt| {
+            brt.setSlotLora(slot_id, meta.lora_slot);
+        }
+        if (slot_id < self.slot_constraints.len) {
+            self.slot_constraints[slot_id] = .{
+                .active = meta.constrained,
+                .grammar_program = meta.grammar_program,
+                .gstate = if (meta.grammar_program) |gp| gp.initialState() else undefined,
+                .sampling = meta.sampling,
+                .rng = meta.rng,
+            };
+        }
+    }
+
+    fn sampleSlotConstrained(self: *BatchServeRunner, slot_id: u16, raw_logits: []const f16) ?u32 {
+        if (slot_id >= self.slot_constraints.len) return null;
+        var sc = &self.slot_constraints[slot_id];
+        if (!sc.active) return null;
+        const n = @min(raw_logits.len, self.p_res.len);
+        if (n == 0) return null;
+        var params = sc.sampling;
+        if (sc.grammar_program) |gp| {
+            const vi = &(self.vocab_index orelse return null);
+            const mask_len = (@min(n, vi.vocab_size) + 31) / 32;
+            vi.fillAllowedTokenBitmask(gp, &sc.gstate, self.grammar_mask[0..mask_len]);
+            params.allowed_token_mask = self.grammar_mask[0..mask_len];
+        }
+        const rng_ptr = sc.rng orelse return null;
+        const out = aminfer.sampling.sampleToken(
+            f16,
+            raw_logits[0..n],
+            params,
+            &.{},
+            rng_ptr,
+            .{
+                .logits_f32 = self.p_res[0..n],
+                .cand_ids = self.sampler_cand_ids[0..n],
+            },
+        ) catch return null;
+        if (sc.grammar_program) |gp| {
+            if (self.vocab_index) |*vi| {
+                _ = vi.advanceToken(gp, &sc.gstate, self.tok, out.token_id);
+            }
+        }
+        return out.token_id;
     }
 
     fn steadyHeapDelta(self: *const BatchServeRunner) aminfer.vmstat.HeapDelta {
@@ -3936,6 +4397,12 @@ const BatchServeRunner = struct {
         out_tokens: []u32,
     ) aminfer.batch_scheduler.BackendError!aminfer.server.TokenizeResult {
         const self: *BatchServeRunner = @ptrCast(@alignCast(ctx));
+        var lora_slot: u32 = aminfer.lora.NO_ADAPTER;
+        if (job.lora_adapter) |adp| {
+            const brt = self.qwen3_batch_rt orelse return error.TokenizeFailed;
+            const reg = brt.lora_registry orelse return error.TokenizeFailed;
+            lora_slot = reg.findSlotByName(adp) orelse return error.TokenizeFailed;
+        }
         var prompt_ids = self.tok.encodeWithScratch(
             &self.encode_scratch,
             job.prompt,
@@ -3949,6 +4416,23 @@ const BatchServeRunner = struct {
         if (prompt_ids.len + 1 >= self.max_seq_len) return error.TokenizeFailed;
         if (self.ngram_registry) |reg| {
             queryNgramPromptTail(reg, self.tok, job.ngram_domain, prompt_ids, &self.ngram_query_errors);
+        }
+
+        const constrained = (job.grammar_program != null) or
+            job.sampling.logit_bias.len > 0 or
+            job.sampling.top_p < 1.0 or
+            job.sampling.top_k > 0 or
+            job.sampling.min_p > 0.0;
+        const next_tail = (self.pending_tail + 1) % self.pending_fifo.len;
+        if (next_tail != self.pending_head) {
+            self.pending_fifo[self.pending_tail] = .{
+                .lora_slot = lora_slot,
+                .grammar_program = job.grammar_program,
+                .sampling = job.sampling,
+                .rng = job.rng,
+                .constrained = constrained,
+            };
+            self.pending_tail = next_tail;
         }
 
         var boundary_tok: ?u32 = null;
@@ -3999,6 +4483,11 @@ const BatchServeRunner = struct {
         prompt_tokens: []const u32,
     ) aminfer.batch_scheduler.PrefixLookupResult {
         const self: *BatchServeRunner = @ptrCast(@alignCast(ctx));
+        if (self.model_mutex) |mtx| _ = std.c.pthread_mutex_lock(mtx);
+        defer if (self.model_mutex) |mtx| {
+            _ = std.c.pthread_mutex_unlock(mtx);
+        };
+        self.bindNextPendingToSlot(slot_id);
         return self.inner_backend.lookupPrefix(slot_id, prompt_tokens);
     }
 
@@ -4007,7 +4496,22 @@ const BatchServeRunner = struct {
         chunk: *const aminfer.batch_scheduler.PrefillChunkView,
     ) aminfer.batch_scheduler.BackendError!aminfer.batch_scheduler.PrefillResult {
         const self: *BatchServeRunner = @ptrCast(@alignCast(ctx));
-        return self.inner_backend.prefillSlot(chunk);
+        if (self.model_mutex) |mtx| _ = std.c.pthread_mutex_lock(mtx);
+        defer if (self.model_mutex) |mtx| {
+            _ = std.c.pthread_mutex_unlock(mtx);
+        };
+        if (self.inner_backend.lookupPrefixFn == null and chunk.start_pos == 0) {
+            self.bindNextPendingToSlot(chunk.slot_id);
+        }
+        var res = try self.inner_backend.prefillSlot(chunk);
+        if (chunk.is_final_chunk and chunk.slot_id < self.slot_constraints.len and self.slot_constraints[chunk.slot_id].active) {
+            if (self.qwen3_batch_rt) |brt| {
+                if (self.sampleSlotConstrained(chunk.slot_id, brt.model.readLastLogitsF16())) |ctok| {
+                    res.first_token = ctok;
+                }
+            }
+        }
+        return res;
     }
 
     fn stepDecodeBatchCallback(
@@ -4016,7 +4520,26 @@ const BatchServeRunner = struct {
         out_next_tokens: []u32,
     ) aminfer.batch_scheduler.BackendError!void {
         const self: *BatchServeRunner = @ptrCast(@alignCast(ctx));
+        if (self.model_mutex) |mtx| _ = std.c.pthread_mutex_lock(mtx);
+        defer if (self.model_mutex) |mtx| {
+            _ = std.c.pthread_mutex_unlock(mtx);
+        };
         try self.inner_backend.stepDecodeBatch(view, out_next_tokens);
+        if (self.qwen3_batch_rt) |brt| {
+            const v_size: usize = brt.model.config.vocab_size;
+            for (0..view.batchSize()) |bi| {
+                const sid = view.slot_ids[bi];
+                if (sid < self.slot_constraints.len and self.slot_constraints[sid].active) {
+                    const row = brt.model.logits_host[bi * v_size .. (bi + 1) * v_size];
+                    if (self.sampleSlotConstrained(sid, row)) |ctok| {
+                        out_next_tokens[bi] = ctok;
+                    }
+                }
+            }
+            if (self.server_ptr) |s| {
+                s.setRetiredQ8Chunks(brt.stats().kv_retire_events);
+            }
+        }
         self.steady_steps += 1;
         if (self.steady_steps == 2) {
             if (aminfer.vmstat.Snapshot.capture()) |snap| {
@@ -4039,7 +4562,207 @@ const BatchServeRunner = struct {
         prefix_handle: u64,
     ) void {
         const self: *BatchServeRunner = @ptrCast(@alignCast(ctx));
+        if (self.model_mutex) |mtx| _ = std.c.pthread_mutex_lock(mtx);
+        defer if (self.model_mutex) |mtx| {
+            _ = std.c.pthread_mutex_unlock(mtx);
+        };
+        if (self.qwen3_batch_rt) |brt| {
+            brt.setSlotLora(slot_id, aminfer.lora.NO_ADAPTER);
+        }
+        if (slot_id < self.slot_constraints.len) {
+            self.slot_constraints[slot_id] = .{};
+        }
         self.inner_backend.releaseSlot(slot_id, prefix_handle);
+    }
+};
+
+/// Preallocated zero-allocation `C21` `POST /v1/embeddings` and `POST /v1/rerank`
+/// backend bound to `Qwen3Model` + `Tokenizer` (guarded by `model_mutex`).
+const ServeEmbedRerankCtx = struct {
+    model: *aminfer.qwen3.Qwen3Model,
+    tok: *const aminfer.tokenizer.Tokenizer,
+    model_mutex: *std.c.pthread_mutex_t,
+    max_tokens_cap: usize,
+    bos_token_id: u32,
+    yes_token_id: u32,
+    no_token_id: u32,
+    encode_scratch: aminfer.tokenizer.EncodeScratch,
+    token_ids_buf: []u32,
+    rerank_prompt_buf: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        model: *aminfer.qwen3.Qwen3Model,
+        tok: *const aminfer.tokenizer.Tokenizer,
+        model_mutex: *std.c.pthread_mutex_t,
+        max_tokens_cap: usize,
+    ) !ServeEmbedRerankCtx {
+        const cap = @max(@as(usize, 64), max_tokens_cap);
+        var encode_scratch = try aminfer.tokenizer.EncodeScratch.init(allocator, @max(@as(usize, 8192), cap * 2));
+        errdefer encode_scratch.deinit(allocator);
+        const token_ids_buf = try allocator.alloc(u32, cap);
+        errdefer allocator.free(token_ids_buf);
+        const rerank_prompt_buf = try allocator.alloc(u8, 64 * 1024);
+        errdefer allocator.free(rerank_prompt_buf);
+
+        var yes_buf: [8]u32 = undefined;
+        var no_buf: [8]u32 = undefined;
+        const yes_id: u32 = tok.addedTokenId("yes") orelse tok.addedTokenId("Yes") orelse blk: {
+            if (tok.encodeWithScratch(&encode_scratch, "yes", &yes_buf)) |s| {
+                if (s.len > 0) break :blk s[0];
+            } else |_| {}
+            break :blk 1;
+        };
+        var no_id: u32 = tok.addedTokenId("no") orelse tok.addedTokenId("No") orelse blk: {
+            if (tok.encodeWithScratch(&encode_scratch, "no", &no_buf)) |s| {
+                if (s.len > 0) break :blk s[0];
+            } else |_| {}
+            break :blk 0;
+        };
+        if (no_id == yes_id) no_id = if (yes_id > 0) yes_id - 1 else 1;
+
+        return .{
+            .model = model,
+            .tok = tok,
+            .model_mutex = model_mutex,
+            .max_tokens_cap = cap,
+            .bos_token_id = model.config.bos_token_id orelse 0,
+            .yes_token_id = yes_id,
+            .no_token_id = no_id,
+            .encode_scratch = encode_scratch,
+            .token_ids_buf = token_ids_buf,
+            .rerank_prompt_buf = rerank_prompt_buf,
+        };
+    }
+
+    fn deinit(self: *ServeEmbedRerankCtx, allocator: std.mem.Allocator) void {
+        allocator.free(self.rerank_prompt_buf);
+        allocator.free(self.token_ids_buf);
+        self.encode_scratch.deinit(allocator);
+    }
+
+    fn embeddingHandler(self: *ServeEmbedRerankCtx) aminfer.server.EmbeddingHandler {
+        return .{
+            .ctx = self,
+            .embedFn = embedCallback,
+        };
+    }
+
+    fn rerankHandler(self: *ServeEmbedRerankCtx) aminfer.server.RerankHandler {
+        return .{
+            .ctx = self,
+            .rerankFn = rerankCallback,
+        };
+    }
+
+    fn embedCallback(
+        ctx: *anyopaque,
+        req: *const aminfer.server.EmbedRequest,
+        out_vectors: []f32,
+    ) anyerror!aminfer.server.EmbedResult {
+        const self: *ServeEmbedRerankCtx = @ptrCast(@alignCast(ctx));
+        _ = std.c.pthread_mutex_lock(self.model_mutex);
+        defer _ = std.c.pthread_mutex_unlock(self.model_mutex);
+
+        if (req.model_tag.adapter) |adp| {
+            const reg = self.model.lora_registry orelse return error.AdapterNotFound;
+            const slot_id = reg.findSlotByName(adp) orelse return error.AdapterNotFound;
+            self.model.setActiveLoraSlot(slot_id);
+        } else {
+            self.model.setActiveLoraSlot(aminfer.lora.NO_ADAPTER);
+        }
+        defer self.model.setActiveLoraSlot(aminfer.lora.NO_ADAPTER);
+
+        const eff_dim: usize = try aminfer.embed_rerank.effectiveDimensions(
+            self.model.config.hidden_size,
+            req.dimensions,
+        );
+        if (req.input_count * eff_dim > out_vectors.len) return error.BufferTooSmall;
+
+        var total_tokens: u32 = 0;
+        for (req.inputs[0..req.input_count], 0..) |text, idx| {
+            var ids = self.tok.encodeWithScratch(&self.encode_scratch, text, self.token_ids_buf) catch blk: {
+                const sub = text[0..@min(text.len, self.token_ids_buf.len)];
+                break :blk try self.tok.encodeWithScratch(&self.encode_scratch, sub, self.token_ids_buf);
+            };
+            if (ids.len == 0) {
+                self.token_ids_buf[0] = self.bos_token_id;
+                ids = self.token_ids_buf[0..1];
+            }
+            const dst = out_vectors[idx * eff_dim .. (idx + 1) * eff_dim];
+            _ = try self.model.prefillEmbeddings(ids, .{
+                .pooling = .last_token,
+                .dimensions = req.dimensions,
+                .normalize = true,
+            }, dst);
+            total_tokens +|= @intCast(ids.len);
+        }
+        return .{
+            .dim = eff_dim,
+            .prompt_tokens = total_tokens,
+        };
+    }
+
+    fn rerankCallback(
+        ctx: *anyopaque,
+        req: *const aminfer.server.RerankRequest,
+        out_items: []aminfer.server.RerankItem,
+    ) anyerror!aminfer.server.RerankResult {
+        const self: *ServeEmbedRerankCtx = @ptrCast(@alignCast(ctx));
+        _ = std.c.pthread_mutex_lock(self.model_mutex);
+        defer _ = std.c.pthread_mutex_unlock(self.model_mutex);
+
+        if (req.model_tag.adapter) |adp| {
+            const reg = self.model.lora_registry orelse return error.AdapterNotFound;
+            const slot_id = reg.findSlotByName(adp) orelse return error.AdapterNotFound;
+            self.model.setActiveLoraSlot(slot_id);
+        } else {
+            self.model.setActiveLoraSlot(aminfer.lora.NO_ADAPTER);
+        }
+        defer self.model.setActiveLoraSlot(aminfer.lora.NO_ADAPTER);
+
+        if (req.document_count > out_items.len or req.document_count > aminfer.server.MAX_RERANK_DOCS) {
+            return error.BufferTooSmall;
+        }
+        var scores_buf: [aminfer.server.MAX_RERANK_DOCS]aminfer.embed_rerank.RerankScore = undefined;
+        var total_tokens: u32 = 0;
+
+        for (req.documents[0..req.document_count], 0..) |doc, idx| {
+            const formatted = std.fmt.bufPrint(
+                self.rerank_prompt_buf,
+                "<|im_start|>user\nQuery: {s}\nDocument: {s}\nRelevant (yes/no):<|im_end|>\n<|im_start|>assistant\n",
+                .{ req.query, doc },
+            ) catch doc;
+            var ids = self.tok.encodeWithScratch(&self.encode_scratch, formatted, self.token_ids_buf) catch blk: {
+                const sub = formatted[0..@min(formatted.len, self.token_ids_buf.len)];
+                break :blk try self.tok.encodeWithScratch(&self.encode_scratch, sub, self.token_ids_buf);
+            };
+            if (ids.len == 0) {
+                self.token_ids_buf[0] = self.bos_token_id;
+                ids = self.token_ids_buf[0..1];
+            }
+            scores_buf[idx] = try self.model.scoreRerankSequence(ids, @intCast(idx), .{
+                .mode = .yes_no_sigmoid,
+                .positive_token_id = @min(self.yes_token_id, self.model.config.vocab_size - 1),
+                .negative_token_id = @min(self.no_token_id, self.model.config.vocab_size - 1),
+                .temperature = 1.0,
+            });
+            total_tokens +|= @intCast(ids.len);
+        }
+
+        const filled = scores_buf[0..req.document_count];
+        aminfer.embed_rerank.sortRerankScoresDesc(filled);
+        const take: usize = if (req.top_n) |k| @min(@as(usize, k), filled.len) else filled.len;
+        for (filled[0..take], 0..) |sc, i| {
+            out_items[i] = .{
+                .index = sc.index,
+                .relevance_score = sc.score,
+            };
+        }
+        return .{
+            .count = take,
+            .prompt_tokens = total_tokens,
+        };
     }
 };
 
@@ -4048,13 +4771,12 @@ fn runServeGraph(
     cli: ServeCliArgs,
     host_ipv4: [4]u8,
     cfg_bytes: []const u8,
+    tok_bytes: []const u8,
     out: *Io.Writer,
 ) !void {
     var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
     defer gcfg.deinit(allocator);
 
-    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
-    defer allocator.free(tok_bytes);
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
@@ -4104,7 +4826,7 @@ fn runServeGraph(
         draft_cfg_opt.?.format = mode;
     }
 
-    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, &gcfg);
+    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse cli.amf_path, &gcfg);
     defer freePlePaths(allocator, ple_paths);
 
     const target_tree_cap: u32 = if (use_continuous)
@@ -4288,6 +5010,9 @@ fn runServeGraph(
         .decode_share = cli.decode_share,
         .adaptive_prefill_narrow = cli.adaptive_prefill_narrow,
         .ngram_registry = ngram_reg_ptr,
+        .api_key = cli.api_key,
+        .unix_socket_path = cli.unix_socket_path,
+        .tokenizer = &tok,
     });
     defer srv.deinit(allocator);
 
@@ -4406,10 +5131,13 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
     const cli = try parseServeArgs(raw_args);
     const host_ipv4 = try aminfer.server.parseIpv4(cli.host);
 
-    const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
-    defer allocator.free(cfg_bytes);
+    var meta = try resolveConfigAndTokenizerAlloc(allocator, cli.amf_path, cli.config_path, cli.tokenizer_path);
+    defer meta.deinit(allocator);
+    const cfg_bytes = meta.config.bytes;
+    const tok_bytes = meta.tokenizer.bytes;
+
     if (shouldUseGraphModel(cfg_bytes, cli.m6, .{}, cli.draft_mode)) {
-        return runServeGraph(allocator, cli, host_ipv4, cfg_bytes, out);
+        return runServeGraph(allocator, cli, host_ipv4, cfg_bytes, tok_bytes, out);
     }
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
 
@@ -4419,8 +5147,6 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         null;
     defer if (heat_bytes) |hb| allocator.free(hb);
 
-    const tok_bytes = try readFileAllocPosix(allocator, cli.tokenizer_path, 64 * 1024 * 1024);
-    defer allocator.free(tok_bytes);
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
@@ -4628,6 +5354,52 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         spec_eng_ptr = &spec_eng_storage;
     }
 
+    var lora_reg_storage: aminfer.lora.LoraRegistry = undefined;
+    var lora_reg_ptr: ?*aminfer.lora.LoraRegistry = null;
+    defer if (lora_reg_ptr) |lr| lr.deinit(allocator);
+    if (cli.lora_spec_count > 0) {
+        lora_reg_storage = try aminfer.lora.LoraRegistry.init(.{
+            .pool_bytes = aminfer.lora.MAX_LORA_POOL_BYTES,
+            .base_shape = model.baseLoraShape(),
+            .sme_dispatcher = if (model.sme_rt) |srt| &srt.dispatcher else null,
+            .wired_budget = budget_override,
+        });
+        lora_reg_ptr = &lora_reg_storage;
+        for (cli.lora_specs[0..cli.lora_spec_count]) |ls| {
+            _ = try lora_reg_storage.loadAdapterFromFile(allocator, ls.name, ls.path);
+        }
+        model.attachLoraRegistry(lora_reg_ptr);
+    }
+
+    var disk_prefix_storage: aminfer.prefix_cache.DiskPrefixCache = undefined;
+    var disk_prefix_ptr: ?*aminfer.prefix_cache.DiskPrefixCache = null;
+    defer if (disk_prefix_ptr) |dp| dp.deinit(allocator);
+    if (cli.disk_prefix_cache_dir) |dpc_dir| {
+        const kv_bytes_per_layer: usize = @as(usize, aminfer.prefix_cache.DEFAULT_BLOCK_TOKENS) *
+            @as(usize, cfg.num_key_value_heads) * @as(usize, cfg.head_dim) * 2;
+        const max_kv_art = @max(@as(usize, aminfer.page.APPLE_PAGE_SIZE), kv_bytes_per_layer * @as(usize, cfg.num_hidden_layers));
+        disk_prefix_storage = try aminfer.prefix_cache.DiskPrefixCache.init(allocator, .{
+            .cache_dir = dpc_dir,
+            .amf_header_crc32 = meta.amf_header_crc32,
+            .amf_dir_crc32 = meta.amf_dir_crc32,
+            .max_tokens_per_artifact = aminfer.prefix_cache.DEFAULT_BLOCK_TOKENS,
+            .max_kv_bytes_per_artifact = max_kv_art,
+            .max_gdn_bytes_per_artifact = 0,
+            .enable_async_worker = true,
+        });
+        disk_prefix_ptr = &disk_prefix_storage;
+    }
+
+    var model_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+    defer _ = std.c.pthread_mutex_destroy(&model_mutex);
+
+    const embed_tok_cap: usize = if (use_continuous)
+        @min(@as(usize, max_seq_len), @as(usize, aminfer.attention.DEFAULT_CHUNK_TOKENS))
+    else
+        max_seq_len;
+    var embed_ctx = try ServeEmbedRerankCtx.init(allocator, &model, &tok, &model_mutex, embed_tok_cap);
+    defer embed_ctx.deinit(allocator);
+
     var batch_rt_storage: aminfer.qwen3.Qwen3BatchRuntime = undefined;
     var batch_rt_ptr: ?*aminfer.qwen3.Qwen3BatchRuntime = null;
     defer if (batch_rt_ptr) |br| br.deinit(allocator);
@@ -4649,6 +5421,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
             .gpu_prefill_mode = cli.gpu_prefill_mode,
             .strict_live_ram = cli.strict_live_ram,
         });
+        batch_rt_storage.attachLoraRegistry(lora_reg_ptr);
         batch_rt_ptr = &batch_rt_storage;
         batch_runner_storage = try BatchServeRunner.init(
             allocator,
@@ -4659,6 +5432,8 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
             cfg.eos_token_id,
             max_seq_len,
         );
+        batch_runner_storage.qwen3_batch_rt = &batch_rt_storage;
+        batch_runner_storage.model_mutex = &model_mutex;
         batch_runner_ptr = &batch_runner_storage;
     } else {
         runner_storage = try ServeRunner.init(
@@ -4672,11 +5447,13 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
             cfg.eos_token_id,
             max_seq_len,
         );
+        runner_storage.model_mutex = &model_mutex;
         runner_ptr = &runner_storage;
     }
 
     const total_wired_bytes: u64 = (if (spec_eng_ptr) |se| se.totalWiredBytes() else model.totalWiredBytes()) +
         (if (batch_rt_ptr) |br| br.totalWiredBytes() else 0) +
+        (if (lora_reg_ptr) |lr| @as(u64, lr.stats().pool_capacity_bytes) else 0) +
         (if (ngram_tbl_ptr) |nt| nt.totalWiredBytes() else 0) +
         (if (ngram_reg_ptr) |nr| (if (spec_eng_ptr == null) nr.totalWiredBytes() else 0) else 0);
     const total_wired_mib: u64 = total_wired_bytes >> 20;
@@ -4695,8 +5472,15 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .decode_share = cli.decode_share,
         .adaptive_prefill_narrow = cli.adaptive_prefill_narrow,
         .ngram_registry = ngram_reg_ptr,
+        .api_key = cli.api_key,
+        .unix_socket_path = cli.unix_socket_path,
+        .tokenizer = &tok,
+        .embedding_handler = embed_ctx.embeddingHandler(),
+        .rerank_handler = embed_ctx.rerankHandler(),
     });
     defer srv.deinit(allocator);
+    if (batch_runner_ptr) |br| br.server_ptr = srv;
+    if (runner_ptr) |r| r.server_ptr = srv;
 
     g_active_serve_ptr.store(@intFromPtr(srv), .release);
     defer g_active_serve_ptr.store(0, .release);
@@ -4824,6 +5608,7 @@ fn verifyAmf(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) 
     var total_wired_bytes: u64 = 0;
     var cold_bytes: u64 = 0;
     var sparse_table_bytes: u64 = 0;
+    var metadata_bytes: u64 = 0;
     var lut16_tensors: u64 = 0;
     var loop_adapter_tensors: u64 = 0;
     for (file.parsed.entries) |*entry| {
@@ -4835,6 +5620,8 @@ fn verifyAmf(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) 
             cold_bytes += entry.blob_bytes;
         } else if (kind == .sparse_table) {
             sparse_table_bytes += entry.blob_bytes;
+        } else if (kind == .metadata) {
+            metadata_bytes += entry.blob_bytes;
         } else {
             total_wired_bytes += entry.blob_bytes;
         }
@@ -4862,6 +5649,9 @@ fn verifyAmf(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) 
         total_wired_bytes,
         cold_bytes,
     });
+    if (metadata_bytes > 0) {
+        try out.print("amf.meta_bytes   {d}\n", .{metadata_bytes});
+    }
     if (sparse_table_bytes > 0) {
         try out.print("amf.sparse_bytes {d}\n", .{sparse_table_bytes});
     }
@@ -4871,6 +5661,560 @@ fn verifyAmf(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) 
     if (loop_adapter_tensors > 0) {
         try out.print("amf.loop_tensors {d}\n", .{loop_adapter_tensors});
     }
+}
+
+fn runLs(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const dir_path: []const u8 = if (raw_args.len >= 1) raw_args[0] else ".";
+    const items = try aminfer.amf.scanAmfDirectory(allocator, dir_path);
+    defer aminfer.amf.freeAmfInspections(allocator, items);
+
+    try out.print("ls.dir                           {s}\n", .{dir_path});
+    try out.print("ls.models_found                  {d}\n", .{items.len});
+    try out.print(
+        "  {s:<32}  {s:<18}  {s:>8}  {s:>9}  {s:>10}  {s:<10}  {s:<14}\n",
+        .{ "model_id / file", "arch", "bpw", "file_mib", "wired_mib", "meta", "min_tier" },
+    );
+    for (items) |*item| {
+        const base = std.fs.path.basename(item.path);
+        const file_mib = @as(f64, @floatFromInt(item.file_bytes)) / (1024.0 * 1024.0);
+        const wired_mib = @as(f64, @floatFromInt(item.estimated_total_wired_bytes)) / (1024.0 * 1024.0);
+        var meta_buf: [16]u8 = undefined;
+        const meta_tag = std.fmt.bufPrint(
+            &meta_buf,
+            "{s}/{s}/{s}",
+            .{
+                if (item.config_meta.present) "c" else "-",
+                if (item.tokenizer_meta.present) "t" else "-",
+                if (item.adapter_config_meta.present) "l" else "-",
+            },
+        ) catch "-/-/-";
+        try out.print(
+            "  {s:<32}  {s:<18}  {d:>8.2}  {d:>9.1}  {d:>10.1}  {s:<10}  {s:<14}\n",
+            .{
+                base,
+                if (item.archSlice().len > 0) item.archSlice() else item.modelIdSlice(),
+                item.effective_bits_per_weight,
+                file_mib,
+                wired_mib,
+                meta_tag,
+                item.tier_fit.recommended_min_tier.label(),
+            },
+        );
+    }
+}
+
+fn runInspect(allocator: std.mem.Allocator, path: [:0]const u8, out: *Io.Writer) !void {
+    const vm_before = try aminfer.vmstat.Snapshot.capture();
+    var info = try aminfer.amf.inspectAmfPath(allocator, path);
+    defer info.deinit(allocator);
+    const vm_after = try aminfer.vmstat.Snapshot.capture();
+
+    const file_mib = @as(f64, @floatFromInt(info.file_bytes)) / (1024.0 * 1024.0);
+    const wired_weight_mib = @as(f64, @floatFromInt(info.wired_weight_bytes)) / (1024.0 * 1024.0);
+    const est_total_mib = @as(f64, @floatFromInt(info.estimated_total_wired_bytes)) / (1024.0 * 1024.0);
+    const has_emb_flag = (info.header_flags & aminfer.amf.FLAG_EMBEDDED_METADATA) != 0;
+
+    try out.print(
+        \\inspect.path                     {s}
+        \\inspect.model_id                 {s}
+        \\inspect.file_bytes               {d} ({d:.2} MiB)
+        \\inspect.header_crc32             0x{x:0>8}
+        \\inspect.directory_crc32          0x{x:0>8}
+        \\inspect.header_flags             0x{x:0>8} (embedded_metadata={s})
+        \\inspect.entries                  total={d} weights={d} metadata={d}
+        \\inspect.wired_weight_bytes       {d} ({d:.2} MiB)
+        \\inspect.cold_weight_bytes        {d}
+        \\inspect.sparse_table_bytes       {d}
+        \\inspect.metadata_blob_bytes      {d}
+        \\inspect.estimated_kv_scratch     {d}
+        \\inspect.estimated_total_wired    {d} ({d:.2} MiB)
+        \\inspect.effective_bpw            {d:.2}
+        \\
+    , .{
+        info.path,
+        info.modelIdSlice(),
+        info.file_bytes,
+        file_mib,
+        info.header_crc32,
+        info.directory_crc32,
+        info.header_flags,
+        if (has_emb_flag) "yes" else "no",
+        info.total_entries,
+        info.weight_tensors,
+        info.metadata_entries,
+        info.wired_weight_bytes,
+        wired_weight_mib,
+        info.cold_weight_bytes,
+        info.sparse_table_bytes,
+        info.metadata_blob_bytes,
+        info.estimated_runtime_kv_scratch_bytes,
+        info.estimated_total_wired_bytes,
+        est_total_mib,
+        info.effective_bits_per_weight,
+    });
+    try out.print(
+        \\inspect.config_source            {s} (embedded={s}, crc_valid={s})
+        \\inspect.tokenizer_meta           embedded={s} (bytes={d}, crc_valid={s})
+        \\inspect.adapter_config_meta      embedded={s} (bytes={d}, crc_valid={s})
+        \\inspect.arch                     {s} (attn={s}, ffn={s}, kv={s}, sparse={s})
+        \\inspect.dims                     layers={d} hidden={d} heads={d}/{d} head_dim={d} vocab={d}
+        \\inspect.tier_fit                 min_tier="{s}" (m4_16gb={s}, m4_24gb={s}, pro_48gb={s}, max_128gb={s})
+        \\inspect.swapouts_delta           {d}
+        \\
+    , .{
+        info.config_source.label(),
+        if (info.config_meta.present) "yes" else "no",
+        if (info.config_meta.crc_valid) "yes" else "no",
+        if (info.tokenizer_meta.present) "yes" else "no",
+        info.tokenizer_meta.data_bytes,
+        if (info.tokenizer_meta.crc_valid) "yes" else "no",
+        if (info.adapter_config_meta.present) "yes" else "no",
+        info.adapter_config_meta.data_bytes,
+        if (info.adapter_config_meta.crc_valid) "yes" else "no",
+        if (info.archSlice().len > 0) info.archSlice() else "unknown",
+        info.arch.attentionSlice(),
+        info.arch.ffnSlice(),
+        info.arch.kvSlice(),
+        info.arch.sparseSlice(),
+        info.arch.num_hidden_layers,
+        info.arch.hidden_size,
+        info.arch.num_attention_heads,
+        info.arch.num_key_value_heads,
+        info.arch.head_dim,
+        info.arch.vocab_size,
+        info.tier_fit.recommended_min_tier.label(),
+        if (info.tier_fit.fits_m4_16gb) "yes" else "no",
+        if (info.tier_fit.fits_m4_24gb) "yes" else "no",
+        if (info.tier_fit.fits_pro_48gb) "yes" else "no",
+        if (info.tier_fit.fits_max_128gb) "yes" else "no",
+        aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+    });
+}
+
+fn runMonitor(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
+    const plain = try allocator.alloc([]const u8, raw_args.len);
+    defer allocator.free(plain);
+    for (raw_args, 0..) |a, idx| plain[idx] = a;
+    try aminfer.tui.runCli(allocator, plain);
+}
+
+const ChatCliArgs = struct {
+    model_path: ?[:0]const u8 = null,
+    config_path: ?[:0]const u8 = null,
+    tokenizer_path: ?[:0]const u8 = null,
+    lora_specs: [aminfer.lora.MAX_ADAPTERS]LoraSpecArg = undefined,
+    lora_spec_count: usize = 0,
+    disk_prefix_cache_dir: ?[]const u8 = null,
+    max_seq_len: u32 = 4096,
+    prefix_cache_chunks: u32 = 8,
+    wired_cap_mib: ?u64 = null,
+    verify_crcs: bool = true,
+    chat_cfg: aminfer.chat_repl.ChatConfig = .{},
+};
+
+fn parseChatCliArgs(args: []const [:0]const u8) !ChatCliArgs {
+    var out: ChatCliArgs = .{};
+    var repl_args_buf: [64][]const u8 = undefined;
+    var repl_args_len: usize = 0;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const flag = args[i];
+        if (std.mem.eql(u8, flag, "--model") or std.mem.eql(u8, flag, "-m") or std.mem.eql(u8, flag, "--amf")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.model_path = args[i];
+            if (repl_args_len + 2 > repl_args_buf.len) return error.TooManyFlags;
+            repl_args_buf[repl_args_len] = "--model";
+            repl_args_buf[repl_args_len + 1] = args[i];
+            repl_args_len += 2;
+        } else if (std.mem.eql(u8, flag, "--config")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.config_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--tokenizer")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.tokenizer_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--lora")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (out.lora_spec_count >= out.lora_specs.len) return error.TooManyLoraAdapters;
+            out.lora_specs[out.lora_spec_count] = try parseLoraSpecArg(args[i]);
+            out.lora_spec_count += 1;
+        } else if (std.mem.eql(u8, flag, "--disk-prefix-cache")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len == 0) return error.InvalidFlagValue;
+            out.disk_prefix_cache_dir = args[i];
+        } else if (std.mem.eql(u8, flag, "--max-seq-len")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.max_seq_len = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--prefix-cache-chunks")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.prefix_cache_chunks = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
+            out.verify_crcs = false;
+        } else {
+            if (repl_args_len >= repl_args_buf.len) return error.TooManyFlags;
+            repl_args_buf[repl_args_len] = flag;
+            repl_args_len += 1;
+        }
+    }
+    out.chat_cfg = try aminfer.chat_repl.ChatConfig.parseArgs(repl_args_buf[0..repl_args_len]);
+    return out;
+}
+
+const ChatEngineRunner = struct {
+    model: *aminfer.qwen3.Qwen3Model,
+    batch_rt: *aminfer.qwen3.Qwen3BatchRuntime,
+    tok: *const aminfer.tokenizer.Tokenizer,
+    max_seq_len: u32,
+    bos_token_id: u32,
+    stop_tokens: [4]u32,
+    stop_token_count: usize,
+    encode_scratch: aminfer.tokenizer.EncodeScratch,
+    prompt_ids_buf: []u32,
+    boundary_verify_buf: []u32,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        model: *aminfer.qwen3.Qwen3Model,
+        batch_rt: *aminfer.qwen3.Qwen3BatchRuntime,
+        tok: *const aminfer.tokenizer.Tokenizer,
+        max_seq_len: u32,
+    ) !ChatEngineRunner {
+        var encode_scratch = try aminfer.tokenizer.EncodeScratch.init(
+            allocator,
+            @max(@as(usize, 8192), @as(usize, max_seq_len) * 2),
+        );
+        errdefer encode_scratch.deinit(allocator);
+        const prompt_ids_buf = try allocator.alloc(u32, max_seq_len);
+        errdefer allocator.free(prompt_ids_buf);
+        const boundary_verify_buf = try allocator.alloc(u32, max_seq_len);
+        errdefer allocator.free(boundary_verify_buf);
+
+        var stop_tokens: [4]u32 = @splat(0);
+        var stop_cnt: usize = 0;
+        const candidates = [_]?u32{
+            model.config.eos_token_id,
+            tok.addedTokenId("<|im_end|>"),
+            tok.addedTokenId("<|endoftext|>"),
+        };
+        for (candidates) |maybe_id| {
+            const id = maybe_id orelse continue;
+            var dup = false;
+            for (stop_tokens[0..stop_cnt]) |existing| {
+                if (existing == id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup and stop_cnt < stop_tokens.len) {
+                stop_tokens[stop_cnt] = id;
+                stop_cnt += 1;
+            }
+        }
+
+        return .{
+            .model = model,
+            .batch_rt = batch_rt,
+            .tok = tok,
+            .max_seq_len = max_seq_len,
+            .bos_token_id = model.config.bos_token_id orelse 0,
+            .stop_tokens = stop_tokens,
+            .stop_token_count = stop_cnt,
+            .encode_scratch = encode_scratch,
+            .prompt_ids_buf = prompt_ids_buf,
+            .boundary_verify_buf = boundary_verify_buf,
+        };
+    }
+
+    fn deinit(self: *ChatEngineRunner, allocator: std.mem.Allocator) void {
+        allocator.free(self.boundary_verify_buf);
+        allocator.free(self.prompt_ids_buf);
+        self.encode_scratch.deinit(allocator);
+    }
+
+    fn isStopToken(self: *const ChatEngineRunner, tid: u32) bool {
+        for (self.stop_tokens[0..self.stop_token_count]) |st| {
+            if (tid == st) return true;
+        }
+        return false;
+    }
+
+    fn turnRunner(self: *ChatEngineRunner) aminfer.chat_repl.TurnRunner {
+        return .{
+            .ctx = self,
+            .runTurnFn = runTurnCallback,
+            .onClearFn = onClearCallback,
+            .loadAttachmentFn = loadAttachmentCallback,
+        };
+    }
+
+    fn onClearCallback(ctx: *anyopaque) void {
+        const self: *ChatEngineRunner = @ptrCast(@alignCast(ctx));
+        if (self.batch_rt.prefix_cache) |*pc| {
+            pc.reset();
+        }
+    }
+
+    fn loadAttachmentCallback(
+        ctx: *anyopaque,
+        kind: aminfer.chat_repl.AttachmentKind,
+        path: []const u8,
+    ) aminfer.chat_repl.Error!?*anyopaque {
+        const self: *ChatEngineRunner = @ptrCast(@alignCast(ctx));
+        if (path.len == 0 or path.len >= std.fs.max_path_bytes) return error.BackendFailed;
+        var path_z_buf: [std.fs.max_path_bytes]u8 = undefined;
+        @memcpy(path_z_buf[0..path.len], path);
+        path_z_buf[path.len] = 0;
+        const path_z: [:0]const u8 = path_z_buf[0..path.len :0];
+
+        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.BackendFailed;
+        defer _ = std.c.close(fd);
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0 or st.size <= 0) return error.BackendFailed;
+
+        // If `kind == .image` and ImageIO can decode it into a 16 KiB-aligned G14 IOSurface
+        // VisionFrame, verify zero-copy ingress and release the temporary surface cleanly.
+        if (kind == .image) {
+            if (aminfer.metal.VisionFrame.loadImage(self.model.device, path_z)) |vf_val| {
+                var vf = vf_val;
+                vf.close();
+            } else |_| {}
+        }
+        return @ptrFromInt(1);
+    }
+
+    fn runTurnCallback(
+        ctx: *anyopaque,
+        req: *const aminfer.chat_repl.TurnRequest,
+        stream: *aminfer.chat_repl.TurnStream,
+    ) aminfer.chat_repl.Error!aminfer.chat_repl.TurnStats {
+        const self: *ChatEngineRunner = @ptrCast(@alignCast(ctx));
+        const t0 = try aminfer.vmstat.nowNs();
+
+        var prompt_ids = self.tok.encodeWithScratch(
+            &self.encode_scratch,
+            req.chatml_prompt,
+            self.prompt_ids_buf,
+        ) catch return error.PromptTooLarge;
+        if (prompt_ids.len == 0) {
+            self.prompt_ids_buf[0] = self.bos_token_id;
+            prompt_ids = self.prompt_ids_buf[0..1];
+        }
+        if (prompt_ids.len + 1 >= self.max_seq_len) return error.PromptTooLarge;
+
+        var boundary_tok: ?u32 = null;
+        if (req.last_user_msg_byte_offset) |b_off| {
+            if (b_off > 0 and b_off < req.chatml_prompt.len and prompt_ids.len <= self.boundary_verify_buf.len) {
+                if (self.tok.encodeWithScratch(&self.encode_scratch, req.chatml_prompt[0..b_off], self.boundary_verify_buf)) |prefix_ids| {
+                    if (prefix_ids.len > 0 and prefix_ids.len < prompt_ids.len) {
+                        if (self.tok.encodeWithScratch(
+                            &self.encode_scratch,
+                            req.chatml_prompt[b_off..],
+                            self.boundary_verify_buf[prefix_ids.len..],
+                        )) |suffix_ids| {
+                            if (prefix_ids.len + suffix_ids.len == prompt_ids.len and
+                                std.mem.eql(u32, self.boundary_verify_buf[0..prompt_ids.len], prompt_ids))
+                            {
+                                boundary_tok = @intCast(prefix_ids.len);
+                            }
+                        } else |_| {}
+                    }
+                } else |_| {}
+            }
+        }
+
+        var req_rng = aminfer.rng.RequestRng.init(req.seed) catch return error.BackendFailed;
+        const lookup = self.batch_rt.lookupPrefix(0, prompt_ids);
+        var cur_prefix_handle: u64 = lookup.prefix_handle;
+        defer self.batch_rt.batchBackend().releaseSlot(0, cur_prefix_handle);
+
+        const chunk_cap: usize = aminfer.batch_scheduler.DEFAULT_MAX_PREFILL_CHUNK_TOKENS;
+        var off: usize = @min(@as(usize, lookup.matched_tokens), prompt_ids.len - 1);
+        var first_tok: u32 = 0;
+        while (off < prompt_ids.len) {
+            var take: usize = @min(chunk_cap, prompt_ids.len - off);
+            var is_bndry_ckpt = false;
+            if (boundary_tok) |b_tok| {
+                const b_usize: usize = b_tok;
+                if (b_usize > off and b_usize < prompt_ids.len and off + take >= b_usize) {
+                    take = b_usize - off;
+                    is_bndry_ckpt = true;
+                }
+            }
+            const is_last = (off + take == prompt_ids.len);
+            const pres = self.batch_rt.prefillSlot(&.{
+                .slot_id = 0,
+                .request_id = @as(u64, req.turn_index) + 1,
+                .user_tag = 0,
+                .tokens = prompt_ids[off .. off + take],
+                .start_pos = @intCast(off),
+                .total_prompt_len = @intCast(prompt_ids.len),
+                .is_final_chunk = is_last,
+                .prefix_handle = cur_prefix_handle,
+                .temperature = req.temperature,
+                .rng = &req_rng,
+                .ngram_domain = "",
+                .message_boundary_token = boundary_tok,
+                .is_message_boundary_checkpoint = is_bndry_ckpt,
+            }) catch return error.BackendFailed;
+            if (pres.update_prefix_handle) {
+                cur_prefix_handle = pres.prefix_handle;
+            }
+            if (is_last) {
+                first_tok = pres.first_token;
+            }
+            off += take;
+        }
+
+        const prompt_len_u32: u32 = @intCast(prompt_ids.len);
+        const room: u32 = self.max_seq_len - prompt_len_u32 - 1;
+        const max_gen: u32 = @min(req.max_tokens, room);
+        var emitted: u32 = 0;
+        var cur_tok: u32 = first_tok;
+
+        if (max_gen > 0 and !self.isStopToken(cur_tok)) {
+            if (!self.tok.isSpecialToken(cur_tok)) {
+                const piece = self.tok.tokenBytes(cur_tok) catch "";
+                try stream.emitText(piece);
+            }
+            emitted = 1;
+            var pos: u32 = prompt_len_u32;
+            const slot_ids = [_]u16{0};
+            const req_ids = [_]u64{@as(u64, req.turn_index) + 1};
+            const user_tags = [_]u64{0};
+            const temps = [_]f32{req.temperature};
+            const rngs = [_]*aminfer.rng.RequestRng{&req_rng};
+            const ngram_domains = [_][]const u8{""};
+            const prefix_handles = [_]u64{cur_prefix_handle};
+            var next_out = [_]u32{0};
+
+            while (emitted < max_gen) {
+                const in_toks = [_]u32{cur_tok};
+                const seq_pos = [_]u32{pos};
+                const view: aminfer.batch_scheduler.BatchStepView = .{
+                    .slot_ids = &slot_ids,
+                    .request_ids = &req_ids,
+                    .user_tags = &user_tags,
+                    .input_tokens = &in_toks,
+                    .seq_positions = &seq_pos,
+                    .temperatures = &temps,
+                    .rngs = &rngs,
+                    .ngram_domains = &ngram_domains,
+                    .prefix_handles = &prefix_handles,
+                };
+                self.batch_rt.stepDecodeBatch(&view, &next_out) catch return error.BackendFailed;
+                cur_tok = next_out[0];
+                pos += 1;
+                if (self.isStopToken(cur_tok)) break;
+                if (!self.tok.isSpecialToken(cur_tok)) {
+                    const piece = self.tok.tokenBytes(cur_tok) catch "";
+                    try stream.emitText(piece);
+                }
+                emitted += 1;
+            }
+        }
+
+        const t1 = try aminfer.vmstat.nowNs();
+        const ttft_ns: u64 = if (stream.first_token_ns) |ft| (ft -| t0) else (t1 -| t0);
+        return .{
+            .prompt_tokens = prompt_len_u32,
+            .generated_tokens = emitted,
+            .prefix_hit_tokens = lookup.matched_tokens,
+            .ttft_ns = ttft_ns,
+            .total_ns = t1 -| t0,
+        };
+    }
+};
+
+fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
+    const cli = try parseChatCliArgs(raw_args);
+    if (cli.chat_cfg.show_help) {
+        try aminfer.tui.writeAllFd(1, aminfer.chat_repl.HELP_TEXT);
+        return;
+    }
+    const amf_path = cli.model_path orelse return error.MissingRequiredFlag;
+
+    var meta = try resolveConfigAndTokenizerAlloc(allocator, amf_path, cli.config_path, cli.tokenizer_path);
+    defer meta.deinit(allocator);
+    const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, meta.config.bytes);
+
+    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, meta.tokenizer.bytes);
+    defer tok.deinit(allocator);
+
+    const max_seq_len: u32 = @min(cfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
+    const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
+
+    var model = try aminfer.qwen3.Qwen3Model.loadFromFile(allocator, amf_path, cfg, .{
+        .max_seq_len = max_seq_len,
+        .max_tree_nodes = 32,
+        .verify_crcs = cli.verify_crcs,
+        .budget_override = budget_override,
+        .continuous_batch_only = true,
+    });
+    defer model.deinit(allocator);
+
+    var lora_reg_storage: aminfer.lora.LoraRegistry = undefined;
+    var lora_reg_ptr: ?*aminfer.lora.LoraRegistry = null;
+    defer if (lora_reg_ptr) |lr| lr.deinit(allocator);
+    var active_lora_slot: u32 = aminfer.lora.NO_ADAPTER;
+    if (cli.lora_spec_count > 0) {
+        lora_reg_storage = try aminfer.lora.LoraRegistry.init(.{
+            .pool_bytes = aminfer.lora.MAX_LORA_POOL_BYTES,
+            .base_shape = model.baseLoraShape(),
+            .sme_dispatcher = if (model.sme_rt) |srt| &srt.dispatcher else null,
+            .wired_budget = budget_override,
+        });
+        lora_reg_ptr = &lora_reg_storage;
+        for (cli.lora_specs[0..cli.lora_spec_count]) |ls| {
+            active_lora_slot = try lora_reg_storage.loadAdapterFromFile(allocator, ls.name, ls.path);
+        }
+        model.attachLoraRegistry(lora_reg_ptr);
+        model.setActiveLoraSlot(active_lora_slot);
+    }
+
+    var disk_prefix_storage: aminfer.prefix_cache.DiskPrefixCache = undefined;
+    var disk_prefix_ptr: ?*aminfer.prefix_cache.DiskPrefixCache = null;
+    defer if (disk_prefix_ptr) |dp| dp.deinit(allocator);
+    if (cli.disk_prefix_cache_dir) |dpc_dir| {
+        const kv_bytes_per_layer: usize = @as(usize, aminfer.prefix_cache.DEFAULT_BLOCK_TOKENS) *
+            @as(usize, cfg.num_key_value_heads) * @as(usize, cfg.head_dim) * 2;
+        const max_kv_art = @max(@as(usize, aminfer.page.APPLE_PAGE_SIZE), kv_bytes_per_layer * @as(usize, cfg.num_hidden_layers));
+        disk_prefix_storage = try aminfer.prefix_cache.DiskPrefixCache.init(allocator, .{
+            .cache_dir = dpc_dir,
+            .amf_header_crc32 = meta.amf_header_crc32,
+            .amf_dir_crc32 = meta.amf_dir_crc32,
+            .max_tokens_per_artifact = aminfer.prefix_cache.DEFAULT_BLOCK_TOKENS,
+            .max_kv_bytes_per_artifact = max_kv_art,
+            .max_gdn_bytes_per_artifact = 0,
+            .enable_async_worker = true,
+        });
+        disk_prefix_ptr = &disk_prefix_storage;
+    }
+
+    var batch_rt = try aminfer.qwen3.Qwen3BatchRuntime.init(allocator, &model, .{
+        .max_slots = 1,
+        .prefix_cache_chunks = @max(@as(u32, 4), cli.prefix_cache_chunks),
+        .budget_override = budget_override,
+    });
+    defer batch_rt.deinit(allocator);
+    batch_rt.attachLoraRegistry(lora_reg_ptr);
+    batch_rt.setSlotLora(0, active_lora_slot);
+
+    var chat_runner = try ChatEngineRunner.init(allocator, &model, &batch_rt, &tok, max_seq_len);
+    defer chat_runner.deinit(allocator);
+
+    try aminfer.chat_repl.runReplOrPipe(allocator, cli.chat_cfg, chat_runner.turnRunner(), 0, 1, 2, null);
 }
 
 /// Auto-clamps default `batch_slots` (when `--max-active-requests` was not
@@ -5046,14 +6390,18 @@ test "parseDecodeArgs validates required flags and options" {
         "--ignore-eos",
     });
     try std.testing.expectEqualStrings("m.amf", ok.amf_path);
-    try std.testing.expectEqualStrings("c.json", ok.config_path);
-    try std.testing.expectEqualStrings("t.json", ok.tokenizer_path);
+    try std.testing.expectEqualStrings("c.json", ok.config_path.?);
+    try std.testing.expectEqualStrings("t.json", ok.tokenizer_path.?);
     try std.testing.expectEqualStrings("hello world", ok.prompt);
     try std.testing.expectEqual(@as(u32, 8), ok.max_tokens);
     try std.testing.expect(ok.ignore_eos);
     try std.testing.expect(ok.verify_crcs);
 
-    try std.testing.expectError(error.MissingRequiredFlag, parseDecodeArgs(&.{ "--amf", "m.amf" }));
+    const sf = try parseDecodeArgs(&.{ "--amf", "m.amf" });
+    try std.testing.expectEqual(@as(?[:0]const u8, null), sf.config_path);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), sf.tokenizer_path);
+
+    try std.testing.expectError(error.MissingRequiredFlag, parseDecodeArgs(&.{}));
     try std.testing.expectError(error.UnknownFlag, parseDecodeArgs(&.{"--bogus"}));
 }
 
@@ -5624,4 +6972,50 @@ test "M7 CLI parsers handle peer-worker, --peer/--rank/--world-size/--partition/
         "--rank",       "2",
         "--world-size", "2",
     }));
+}
+
+test "M7.5 CLI parsers handle W18 optional metadata flags, C18 --api-key/--unix-socket, W19 --lora, R10 --disk-prefix-cache, and C20 aminfer chat" {
+    const srv = try parseServeArgs(&.{
+        "--amf",               "single_file.amf",
+        "--api-key",           "secret-token-123",
+        "--unix-socket",       "/tmp/aminfer_m75.sock",
+        "--lora",              "coder=coder_r8.amlora",
+        "--lora",              "math=math_r8.amlora",
+        "--disk-prefix-cache", "/tmp/aminfer_kv_cache",
+    });
+    try std.testing.expectEqualStrings("single_file.amf", srv.amf_path);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), srv.config_path);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), srv.tokenizer_path);
+    try std.testing.expectEqualStrings("secret-token-123", srv.api_key.?);
+    try std.testing.expectEqualStrings("/tmp/aminfer_m75.sock", srv.unix_socket_path.?);
+    try std.testing.expectEqual(@as(usize, 2), srv.lora_spec_count);
+    try std.testing.expectEqualStrings("coder", srv.lora_specs[0].name);
+    try std.testing.expectEqualStrings("coder_r8.amlora", srv.lora_specs[0].path);
+    try std.testing.expectEqualStrings("math", srv.lora_specs[1].name);
+    try std.testing.expectEqualStrings("math_r8.amlora", srv.lora_specs[1].path);
+    try std.testing.expectEqualStrings("/tmp/aminfer_kv_cache", srv.disk_prefix_cache_dir.?);
+
+    const chat = try parseChatCliArgs(&.{
+        "--model",             "single_file.amf",
+        "--system",            "You are concise.",
+        "--lora",              "coder=coder_r8.amlora",
+        "--disk-prefix-cache", "/tmp/aminfer_chat_kv",
+        "--no-think",          "--max-tokens",
+        "128",                 "--temperature",
+        "0.2",                 "--seed",
+        "42",
+    });
+    try std.testing.expectEqualStrings("single_file.amf", chat.model_path.?);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), chat.config_path);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), chat.tokenizer_path);
+    try std.testing.expectEqual(@as(usize, 1), chat.lora_spec_count);
+    try std.testing.expectEqualStrings("coder", chat.lora_specs[0].name);
+    try std.testing.expectEqualStrings("You are concise.", chat.chat_cfg.system_prompt);
+    try std.testing.expect(!chat.chat_cfg.enable_thinking);
+    try std.testing.expectEqual(@as(u32, 128), chat.chat_cfg.max_tokens);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), chat.chat_cfg.temperature, 1e-6);
+    try std.testing.expectEqual(@as(?u64, 42), chat.chat_cfg.seed);
+
+    try std.testing.expectError(error.InvalidLoraSpec, parseLoraSpecArg("no_equals"));
+    try std.testing.expectError(error.InvalidLoraSpec, parseLoraSpecArg("=missing_name.amlora"));
 }
