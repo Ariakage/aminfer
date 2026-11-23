@@ -34,6 +34,9 @@ const ple = @import("../storage/ple.zig");
 const graph = @import("../model/graph.zig");
 const tokenizer = @import("../model/tokenizer.zig");
 const prefix_cache = @import("../mem/prefix_cache.zig");
+const dspark = @import("../spec/dspark.zig");
+const transport = @import("../cluster/transport.zig");
+const expert_parallel = @import("../cluster/expert_parallel.zig");
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -5992,6 +5995,7 @@ pub const GraphDecodeBenchOptions = struct {
     prefill_backend_mode: dequant.PrefillBackendMode = .auto,
     strict_nax: bool = false,
     bus_bandwidth_gbs_override: ?f64 = null,
+    cluster_coordinator: ?*expert_parallel.ExpertParallelCoordinator = null,
 };
 
 pub const GraphDecodeBenchResult = struct {
@@ -6145,6 +6149,7 @@ pub fn runGraphDecodeBenchFromFile(
         .prefill_backend_mode = opts.prefill_backend_mode,
         .strict_nax = opts.strict_nax,
         .bus_bandwidth_gbs_override = opts.bus_bandwidth_gbs_override,
+        .cluster_coordinator = opts.cluster_coordinator,
     });
     defer model.deinit(allocator);
     const load_t1 = try vmstat.nowNs();
@@ -13021,4 +13026,1287 @@ test "runM69WithConfig verifies metallib NAX symbols, ChipProfile, fallback/demo
         try std.testing.expect(report.s8_row_count >= 6);
         try std.testing.expect(std.mem.indexOf(u8, rendered, "spike_s8.nax_hw_status=executed") != null);
     }
+}
+
+// ===========================================================================
+// Milestone M7: `aminfer bench-m7` Suite
+// (R7/G11 MLA+CSA2 FP4 KV, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED +
+//  DSpark, X1-X3 TB4 TCP / TB5 RDMA-probed 2-rank & 4-rank Expert Parallelism)
+// ===========================================================================
+
+pub const M7Config = struct {
+    bus_bandwidth_gbs_override: ?f64 = null,
+    mla_kv_len: u32 = 2048,
+    mla_swa_window: u32 = 256,
+    mla_top_k_blocks: u32 = 16,
+    mhc_hidden_size: u32 = 4096,
+    gpu_warmup: u32 = 8,
+    gpu_iters: u32 = 32,
+    engram_rows: u32 = 2048,
+    engram_cold_lookups: u32 = 16,
+    engram_warm_lookups: u32 = 64,
+    ced_decode_steps: u32 = 16,
+    cluster_4rank_iters: u32 = 16,
+};
+
+pub const M7Report = struct {
+    chip_profile: chip_profile_mod.ChipProfile,
+    gpu_name_buf: [64]u8,
+    gpu_name_len: usize,
+
+    // Section 1: R7 + G11 MLA FP4 KV (`890 B/tok`) & CSA2 (`Full` / `Reindex` / `Reuse` + SWA)
+    deepseek41_fp4_bytes_per_tok: u32,
+    deepseek41_fp16_mla_bytes_per_tok: u32,
+    deepseek41_unabsorbed_fp16_bytes_per_tok: u32,
+    fp4_latent_max_abs_err: f32,
+    fp4_latent_rmse: f32,
+    fp4_rope_e4m3_max_abs_err: f32,
+    mla_bench_kv_len: u32,
+    mla_kv_bytes_shared_3layers: usize,
+    mla_kv_bytes_unshared_3layers: usize,
+    mla_full_us: f64,
+    mla_reindex_us: f64,
+    mla_reuse_us: f64,
+    mla_heap_delta: vmstat.HeapDelta,
+
+    // Section 2: G10 Single-Pass Mega-mHC (`mhc_single_pass` + `mhc_post_mix`)
+    mhc_streams: u32,
+    mhc_hidden_size: u32,
+    mhc_m1_us: f64,
+    mhc_m1_gbs: f64,
+    mhc_m64_us: f64,
+    mhc_m64_gbs: f64,
+    mhc_heap_delta: vmstat.HeapDelta,
+
+    // Section 3: C10 Engram (`F_NOCACHE` multi-shard cold vs `PlePageCache` hit vs `r >= 1` reuse)
+    engram_shards: u32,
+    engram_rows: u32,
+    engram_heads: u32,
+    engram_cold_us: f64,
+    engram_cold_nvme_reads: u64,
+    engram_hit_us: f64,
+    engram_hit_nvme_reads: u64,
+    engram_loop_us: f64,
+    engram_loop_nvme_reads: u64,
+    engram_heap_delta: vmstat.HeapDelta,
+
+    // Section 4: W11 + D10 Synthetic `deepseek41` CED 2-phase + `DSpark` speculative decoding
+    ced_encoder_layers: u32,
+    ced_decoder_layers: u32,
+    ced_prefill_ms: f64,
+    ced_decode_ms_per_tok: f64,
+    ced_decode_tok_s: f64,
+    ced_encoder_decode_dispatches: u64,
+    ced_engram_r_ge1_nvme_reads: u64,
+    ced_heap_delta: vmstat.HeapDelta,
+    dspark_decode_ms_per_tok: f64,
+    dspark_decode_tok_s: f64,
+    dspark_mean_accept: f64,
+    dspark_speedup: f64,
+    dspark_greedy_match: bool,
+    dspark_encoder_decode_dispatches: u64,
+    dspark_heap_delta: vmstat.HeapDelta,
+
+    // Section 5: X1-X3 TB5 RDMA probe + live 2-rank & 4-rank loopback TCP cluster
+    rdma_probe: transport.RdmaProbeResult,
+    auto_transport: transport.TransportKind,
+    strict_tb5_reject_ok: bool,
+    cluster_2r_greedy_match: bool,
+    cluster_2r_encoder_decode_dispatches: u64,
+    cluster_2r_dispatches: u64,
+    cluster_2r_remote_assignments: u64,
+    cluster_2r_rpc_us: f64,
+    cluster_2r_bytes_transferred: u64,
+    cluster_2r_heap_delta: vmstat.HeapDelta,
+    cluster_4r_m1_max_abs_err: f32,
+    cluster_4r_m8_max_abs_err: f32,
+    cluster_4r_dispatches: u64,
+    cluster_4r_remote_assignments: u64,
+    cluster_4r_rpc_us: f64,
+    cluster_4r_bytes_transferred: u64,
+    cluster_4r_heap_delta: vmstat.HeapDelta,
+
+    vm_before: vmstat.Snapshot,
+    vm_after: vmstat.Snapshot,
+
+    pub fn gpuName(self: *const M7Report) []const u8 {
+        return self.gpu_name_buf[0..self.gpu_name_len];
+    }
+
+    pub fn write(self: *const M7Report, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        const ratio_vs_fp16_mla = @as(f64, @floatFromInt(self.deepseek41_fp16_mla_bytes_per_tok)) /
+            @as(f64, @floatFromInt(self.deepseek41_fp4_bytes_per_tok));
+        const ratio_vs_unabsorbed = @as(f64, @floatFromInt(self.deepseek41_unabsorbed_fp16_bytes_per_tok)) /
+            @as(f64, @floatFromInt(self.deepseek41_fp4_bytes_per_tok));
+        const kv_saved_bytes = self.mla_kv_bytes_unshared_3layers - self.mla_kv_bytes_shared_3layers;
+        const kv_saved_pct = if (self.mla_kv_bytes_unshared_3layers > 0)
+            (@as(f64, @floatFromInt(kv_saved_bytes)) / @as(f64, @floatFromInt(self.mla_kv_bytes_unshared_3layers))) * 100.0
+        else
+            0.0;
+        const bus_gbs = if (self.chip_profile.spec_bus_gbs > 0.0) self.chip_profile.spec_bus_gbs else M4_BUS_BANDWIDTH_GBS;
+        const auto_label: []const u8 = switch (self.auto_transport) {
+            .tb4_tcp => "tb4_tcp",
+            .tb5_rdma => "tb5_rdma",
+            .auto => "auto",
+        };
+
+        try out.print(
+            \\== aminfer M7 benchmark (R7/G11 MLA+CSA2 FP4, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED+DSpark, X1-X3 Cluster) ==
+            \\m7.host.gpu                      {s} ({s})
+            \\m7.host.spec_bus_gbs             {d:.1}
+            \\
+            \\-- Section 1: R7 + G11 MLA FP4 KV (890 B/tok) & CSA2 (Full/Reindex/Reuse + SWA) --
+            \\m7.r7.deepseek41_fp4_b_per_tok   {d} (ratio={d:.2}x vs {d} B/tok FP16-MLA; {d:.1}x vs {d} B/tok unabsorbed FP16 K+V)
+            \\m7.r7.fp4_latent_err             max_abs={d:.4} rmse={d:.4}
+            \\m7.r7.fp4_rope_e4m3_err          max_abs={d:.4}
+            \\m7.g11.mla_csa2_kv_len           {d}
+            \\m7.g11.mla_csa2_kv_bytes_3layer  shared={d} unshared={d} saved={d} ({d:.1}%)
+            \\m7.g11.mla_csa2_latency_us       full={d:.2} reindex={d:.2} reuse={d:.2}
+            \\m7.g11.malloc_blocks_delta       {d}
+            \\
+            \\-- Section 2: G10 Single-Pass Mega-mHC (4 streams, Sinkhorn-Knopp Birkhoff) --
+            \\m7.g10.mhc_shape                 streams={d} hidden={d}
+            \\m7.g10.mhc_m1_decode             latency_us={d:.2} effective_gbs={d:.2} ({d:.1}% of bus)
+            \\m7.g10.mhc_m64_prefill           latency_us={d:.2} effective_gbs={d:.2} ({d:.1}% of bus)
+            \\m7.g10.malloc_blocks_delta       {d}
+            \\
+        , .{
+            self.gpuName(),
+            self.chip_profile.generation.label(),
+            bus_gbs,
+            self.deepseek41_fp4_bytes_per_tok,
+            ratio_vs_fp16_mla,
+            self.deepseek41_fp16_mla_bytes_per_tok,
+            ratio_vs_unabsorbed,
+            self.deepseek41_unabsorbed_fp16_bytes_per_tok,
+            self.fp4_latent_max_abs_err,
+            self.fp4_latent_rmse,
+            self.fp4_rope_e4m3_max_abs_err,
+            self.mla_bench_kv_len,
+            self.mla_kv_bytes_shared_3layers,
+            self.mla_kv_bytes_unshared_3layers,
+            kv_saved_bytes,
+            kv_saved_pct,
+            self.mla_full_us,
+            self.mla_reindex_us,
+            self.mla_reuse_us,
+            self.mla_heap_delta.blocks_in_use,
+            self.mhc_streams,
+            self.mhc_hidden_size,
+            self.mhc_m1_us,
+            self.mhc_m1_gbs,
+            (self.mhc_m1_gbs / bus_gbs) * 100.0,
+            self.mhc_m64_us,
+            self.mhc_m64_gbs,
+            (self.mhc_m64_gbs / bus_gbs) * 100.0,
+            self.mhc_heap_delta.blocks_in_use,
+        });
+        try out.print(
+            \\-- Section 3: C10 Engram Multi-Head F_NOCACHE Lookup & Loop Reuse --
+            \\m7.c10.engram_config             shards={d} rows={d} heads={d}
+            \\m7.c10.engram_cold_ssd           latency_us={d:.2} nvme_reads={d}
+            \\m7.c10.engram_cache_hit          latency_us={d:.2} nvme_reads={d}
+            \\m7.c10.engram_loop_r_ge1         latency_us={d:.2} nvme_reads={d}
+            \\m7.c10.malloc_blocks_delta       {d}
+            \\
+            \\-- Section 4: W11 + D10 Synthetic deepseek41 CED 2-Phase + DSpark Speculative Decode --
+            \\m7.w11.ced_layers                encoder={d} decoder={d}
+            \\m7.w11.ced_prefill_ms            {d:.3}
+            \\m7.w11.ced_decode                ms_per_tok={d:.3} tok_s={d:.2} encoder_decode_dispatches={d} engram_r_ge1_nvme_reads={d}
+            \\m7.w11.malloc_blocks_delta       {d}
+            \\m7.d10.dspark_decode             ms_per_tok={d:.3} tok_s={d:.2} mean_accept={d:.2} speedup={d:.2}x greedy_match={s} encoder_decode_dispatches={d}
+            \\m7.d10.malloc_blocks_delta       {d}
+            \\
+        , .{
+            self.engram_shards,
+            self.engram_rows,
+            self.engram_heads,
+            self.engram_cold_us,
+            self.engram_cold_nvme_reads,
+            self.engram_hit_us,
+            self.engram_hit_nvme_reads,
+            self.engram_loop_us,
+            self.engram_loop_nvme_reads,
+            self.engram_heap_delta.blocks_in_use,
+            self.ced_encoder_layers,
+            self.ced_decoder_layers,
+            self.ced_prefill_ms,
+            self.ced_decode_ms_per_tok,
+            self.ced_decode_tok_s,
+            self.ced_encoder_decode_dispatches,
+            self.ced_engram_r_ge1_nvme_reads,
+            self.ced_heap_delta.blocks_in_use,
+            self.dspark_decode_ms_per_tok,
+            self.dspark_decode_tok_s,
+            self.dspark_mean_accept,
+            self.dspark_speedup,
+            if (self.dspark_greedy_match) "yes" else "no",
+            self.dspark_encoder_decode_dispatches,
+            self.dspark_heap_delta.blocks_in_use,
+        });
+        try out.print(
+            \\-- Section 5: X1-X3 TB5 RDMA Probe & Live Loopback TCP Cluster --
+            \\m7.x1.tb5_rdma_hw                {s} (driver_lib_found={s} devices={d} reason={s})
+            \\m7.x1.transport_selection        auto={s} strict_tb5_reject={s}
+            \\m7.x2.cluster_2rank_ced          greedy_match={s} encoder_decode_dispatches={d} dispatches={d} remote_assignments={d} rpc_us={d:.2} bytes_transferred={d}
+            \\m7.x2.cluster_2rank_malloc_delta {d}
+            \\m7.x3.cluster_4rank_moe          m1_max_err={d:.6} m8_max_err={d:.6} dispatches={d} remote_assignments={d} rpc_us={d:.2} bytes_transferred={d}
+            \\m7.x3.cluster_4rank_malloc_delta {d}
+            \\tier3_full_552b_status=deferred_requires_512gb_ultra_or_multi_mac_tb5_rdma_cluster
+            \\m7.vm.swapouts_delta             {d}
+            \\m7.vm.pageouts_delta             {d}
+            \\
+        , .{
+            if (self.rdma_probe.available) "available" else "unavailable",
+            if (self.rdma_probe.driver_lib_found) "yes" else "no",
+            self.rdma_probe.device_count,
+            self.rdma_probe.reason,
+            auto_label,
+            if (self.strict_tb5_reject_ok) "pass" else "fail",
+            if (self.cluster_2r_greedy_match) "yes" else "no",
+            self.cluster_2r_encoder_decode_dispatches,
+            self.cluster_2r_dispatches,
+            self.cluster_2r_remote_assignments,
+            self.cluster_2r_rpc_us,
+            self.cluster_2r_bytes_transferred,
+            self.cluster_2r_heap_delta.blocks_in_use,
+            self.cluster_4r_m1_max_abs_err,
+            self.cluster_4r_m8_max_abs_err,
+            self.cluster_4r_dispatches,
+            self.cluster_4r_remote_assignments,
+            self.cluster_4r_rpc_us,
+            self.cluster_4r_bytes_transferred,
+            self.cluster_4r_heap_delta.blocks_in_use,
+            vmstat.Snapshot.swapoutDelta(self.vm_before, self.vm_after),
+            vmstat.Snapshot.pageoutDelta(self.vm_before, self.vm_after),
+        });
+    }
+};
+
+pub fn runM7WithConfig(allocator: std.mem.Allocator, cfg: M7Config) !M7Report {
+    const facts = try sysinfo.Facts.read();
+    const dev = try metal.Device.open();
+    defer dev.close();
+    const dev_info = try dev.info();
+    const lib = try metal.Library.openEmbedded(dev);
+    defer lib.close();
+    const profile = chip_profile_mod.ChipProfile.resolve(
+        facts,
+        dev_info.name(),
+        dev_info.appleGpuFamily(),
+        cfg.bus_bandwidth_gbs_override,
+    );
+    const wired_budget = budget_mod.Budget.fromHost(facts, dev_info, .{});
+
+    var gpu_name_buf: [64]u8 = @splat(0);
+    const gpu_s = dev_info.name();
+    const gpu_len = @min(gpu_s.len, gpu_name_buf.len);
+    @memcpy(gpu_name_buf[0..gpu_len], gpu_s[0..gpu_len]);
+
+    const vm_before = try vmstat.Snapshot.capture();
+
+    // -----------------------------------------------------------------------
+    // Section 1: R7 + G11 MLA FP4 KV (890 B/tok) & CSA2 GPU Benchmark
+    // -----------------------------------------------------------------------
+    const ds_full_spec = hybrid.MlaFp4KvSpec.deepseek41Full(1024, 1);
+    const ds_fp4_bpt = ds_full_spec.bytesPerToken();
+    const ds_fp16_mla_bpt: u32 = (ds_full_spec.kv_lora_rank + ds_full_spec.qk_rope_dim) * 2;
+    const ds_unabsorbed_fp16_bpt: u32 = 128 * (128 + 128 + 26) * 2;
+
+    var src_lat: [hybrid.DEEPSEEK41_KV_LORA_RANK]f32 = undefined;
+    for (0..src_lat.len) |i| {
+        const x: f32 = @floatFromInt(i);
+        src_lat[i] = @sin(x * 0.173) * 1.15 + @cos(x * 0.041) * 0.45;
+    }
+    var lat_e2m1: [hybrid.DEEPSEEK41_KV_LORA_RANK / 2]u8 = undefined;
+    var lat_scales: [hybrid.DEEPSEEK41_KV_LORA_RANK / hybrid.MLA_FP4_GROUP_SIZE]u8 = undefined;
+    var dec_lat: [hybrid.DEEPSEEK41_KV_LORA_RANK]f32 = undefined;
+    hybrid.encodeMlaFp4LatentRowCpu(&src_lat, &lat_e2m1, &lat_scales);
+    hybrid.decodeMlaFp4LatentRowCpu(&lat_e2m1, &lat_scales, &dec_lat);
+
+    var fp4_lat_max_err: f32 = 0.0;
+    var fp4_lat_sq_sum: f64 = 0.0;
+    for (0..src_lat.len) |i| {
+        const diff = @abs(src_lat[i] - dec_lat[i]);
+        fp4_lat_max_err = @max(fp4_lat_max_err, diff);
+        fp4_lat_sq_sum += @as(f64, diff) * @as(f64, diff);
+    }
+    const fp4_lat_rmse: f32 = @floatCast(@sqrt(fp4_lat_sq_sum / @as(f64, @floatFromInt(src_lat.len))));
+
+    var src_rope: [hybrid.DEEPSEEK41_QK_ROPE_DIM]f32 = undefined;
+    for (0..src_rope.len) |i| {
+        src_rope[i] = @cos(@as(f32, @floatFromInt(i)) * 0.29) * 1.5;
+    }
+    var rope_e4m3: [hybrid.DEEPSEEK41_QK_ROPE_DIM]u8 = undefined;
+    var dec_rope: [hybrid.DEEPSEEK41_QK_ROPE_DIM]f32 = undefined;
+    hybrid.encodeMlaRopeRowCpu(&src_rope, .e4m3, &rope_e4m3);
+    hybrid.decodeMlaRopeRowCpu(&rope_e4m3, .e4m3, &dec_rope);
+    var fp4_rope_max_err: f32 = 0.0;
+    for (0..src_rope.len) |i| {
+        fp4_rope_max_err = @max(fp4_rope_max_err, @abs(src_rope[i] - dec_rope[i]));
+    }
+
+    var mla_full_us: f64 = 0.0;
+    var mla_reindex_us: f64 = 0.0;
+    var mla_reuse_us: f64 = 0.0;
+    var mla_kv_shared: usize = 0;
+    var mla_kv_unshared: usize = 0;
+    var mla_heap_delta: vmstat.HeapDelta = std.mem.zeroes(vmstat.HeapDelta);
+    {
+        const hpipes = try hybrid.HybridPipelines.init(dev, lib);
+        defer hpipes.close();
+        var compute = try metal.Compute.initWithFrames(dev, 2);
+        defer compute.close();
+
+        const kv_rank: u32 = 512;
+        const rope_dim: u32 = 64;
+        const n_heads: u32 = 16;
+        const kv_len: u32 = cfg.mla_kv_len;
+        const max_toks: u32 = kv_len + 16;
+        const swa_win: u32 = @min(cfg.mla_swa_window, kv_len);
+        const block_tokens: u32 = 16;
+        const top_k_blocks: u32 = cfg.mla_top_k_blocks;
+
+        const kv_spec: hybrid.MlaFp4KvSpec = .{
+            .num_kv_layers = 1,
+            .max_tokens = max_toks,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_dim = rope_dim,
+            .rope_tail_format = .f16,
+        };
+        const unshared_spec: hybrid.MlaFp4KvSpec = .{
+            .num_kv_layers = 3,
+            .max_tokens = max_toks,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_dim = rope_dim,
+            .rope_tail_format = .f16,
+        };
+        mla_kv_shared = try hybrid.MlaFp4KvArena.requiredBytes(kv_spec);
+        mla_kv_unshared = try hybrid.MlaFp4KvArena.requiredBytes(unshared_spec);
+
+        const sum_spec: hybrid.Csa2SummarySpec = .{
+            .num_kv_layers = 1,
+            .max_tokens = max_toks,
+            .index_dim = kv_rank,
+            .block_tokens = block_tokens,
+        };
+        const swa_spec: hybrid.MlaSwaRingSpec = .{
+            .num_kv_layers = 1,
+            .swa_window = swa_win,
+            .kv_lora_rank = kv_rank,
+            .qk_rope_dim = rope_dim,
+        };
+        const idx_spec: hybrid.Csa2IndexBufferSpec = .{
+            .max_nodes = 1,
+            .top_k_blocks = top_k_blocks,
+        };
+
+        const q_nope_bytes = try page.alignUp(@as(usize, n_heads) * kv_rank * 2);
+        const q_pe_bytes = try page.alignUp(@as(usize, n_heads) * rope_dim * 2);
+        const out_bytes = try page.alignUp(@as(usize, n_heads) * kv_rank * 2);
+        const lat_prefill_bytes = try page.alignUp(@as(usize, kv_len) * kv_rank * 2);
+        const rope_prefill_bytes = try page.alignUp(@as(usize, kv_len) * rope_dim * 2);
+        const total_arena = mla_kv_shared +
+            (try hybrid.Csa2SummaryArena.requiredBytes(sum_spec)) +
+            (try hybrid.MlaSwaRingArena.requiredBytes(swa_spec)) +
+            (try hybrid.Csa2IndexBuffer.requiredBytes(idx_spec)) +
+            q_nope_bytes + q_pe_bytes + out_bytes + lat_prefill_bytes + rope_prefill_bytes + page.APPLE_PAGE_SIZE * 4;
+
+        var arena = try arena_mod.WiredArena.init(total_arena, wired_budget);
+        defer arena.deinit();
+        const mbuf = try metal.Buffer.wrap(dev, arena.bytes());
+        defer mbuf.close();
+        try compute.makeResident(&.{mbuf});
+
+        var kv_arena = try hybrid.MlaFp4KvArena.init(&arena, kv_spec);
+        var sum_arena = try hybrid.Csa2SummaryArena.init(&arena, sum_spec);
+        var swa_arena = try hybrid.MlaSwaRingArena.init(&arena, swa_spec);
+        var idx_buf = try hybrid.Csa2IndexBuffer.init(&arena, idx_spec);
+
+        const q_nope_raw = try arena.allocPages(q_nope_bytes);
+        const q_pe_raw = try arena.allocPages(q_pe_bytes);
+        const out_raw = try arena.allocPages(out_bytes);
+        const lat_raw = try arena.allocPages(lat_prefill_bytes);
+        const rope_raw = try arena.allocPages(rope_prefill_bytes);
+
+        const q_nope_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_nope_raw[0 .. @as(usize, n_heads) * kv_rank * 2]));
+        for (q_nope_f16, 0..) |*v, i| v.* = @floatCast(@sin(@as(f32, @floatFromInt(i)) * 0.013) * 0.25);
+        const q_pe_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, q_pe_raw[0 .. @as(usize, n_heads) * rope_dim * 2]));
+        for (q_pe_f16, 0..) |*v, i| v.* = @floatCast(@cos(@as(f32, @floatFromInt(i)) * 0.031) * 0.25);
+        const lat_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, lat_raw[0 .. @as(usize, kv_len) * kv_rank * 2]));
+        for (lat_f16, 0..) |*v, i| v.* = @floatCast(@sin(@as(f32, @floatFromInt(i)) * 0.007) * 0.5);
+        const rope_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, rope_raw[0 .. @as(usize, kv_len) * rope_dim * 2]));
+        for (rope_f16, 0..) |*v, i| v.* = @floatCast(@cos(@as(f32, @floatFromInt(i)) * 0.019) * 0.5);
+
+        const q_nope_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(q_nope_raw.ptr) };
+        const q_pe_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(q_pe_raw.ptr) };
+        const out_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(out_raw.ptr) };
+        const lat_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(lat_raw.ptr) };
+        const rope_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(rope_raw.ptr) };
+
+        // Populate `kv_len` FP4 KV entries + CSA2 fine/coarse summaries once before timing.
+        {
+            var f = try compute.beginFrame(5_000);
+            try hpipes.encodeMlaFp4KvWrite(&f, .{
+                .latent_in = lat_bind,
+                .rope_in = rope_bind,
+                .kv_arena = &kv_arena,
+                .kv_metal_buf = mbuf,
+                .kv_slot = 0,
+                .swa_ring = &swa_arena,
+                .swa_metal_buf = mbuf,
+                .num_tokens = kv_len,
+                .start_pos = 0,
+                .is_encoder_projection = false,
+            }, false);
+            try hpipes.encodeCsa2UpdateSummaries(&f, .{
+                .kv_arena = &kv_arena,
+                .kv_metal_buf = mbuf,
+                .summary_arena = &sum_arena,
+                .summary_metal_buf = mbuf,
+                .kv_slot = 0,
+                .kv_len = kv_len,
+                .start_coarse_block = 0,
+            }, true);
+            const sig = try f.commit();
+            try compute.wait(sig, 5_000);
+        }
+
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_rank + rope_dim)));
+        const makeArgs = struct {
+            fn call(
+                mode: hybrid.Csa2Mode,
+                kv_a: *const hybrid.MlaFp4KvArena,
+                sum_a: *const hybrid.Csa2SummaryArena,
+                swa_a: *const hybrid.MlaSwaRingArena,
+                idx_b: *const hybrid.Csa2IndexBuffer,
+                buf: metal.Buffer,
+                qn: metal.BufferBinding,
+                qp: metal.BufferBinding,
+                ob: metal.BufferBinding,
+                lb: metal.BufferBinding,
+                rb: metal.BufferBinding,
+                klen: u32,
+                swin: u32,
+                btoks: u32,
+                tkb: u32,
+                nh: u32,
+                sc: f32,
+            ) hybrid.MlaCsa2LayerArgs {
+                return .{
+                    .mode = mode,
+                    .loop_step = 0,
+                    .shared_kv_owner = 0,
+                    .kv_arena = kv_a,
+                    .kv_metal_buf = buf,
+                    .summary_arena = sum_a,
+                    .summary_metal_buf = buf,
+                    .swa_ring = swa_a,
+                    .swa_metal_buf = buf,
+                    .index_buf = idx_b,
+                    .index_metal_buf = buf,
+                    .write_latent_in = if (mode == .full) lb else null,
+                    .write_rope_in = if (mode == .full) rb else null,
+                    .write_num_tokens = if (mode == .full) 1 else 0,
+                    .write_start_pos = klen,
+                    .q_nope = qn,
+                    .q_pe = qp,
+                    .out = ob,
+                    .num_nodes = 1,
+                    .num_q_heads = nh,
+                    .kv_len = klen + 1,
+                    .encoder_prefix_len = 0,
+                    .causal_q_start_pos = klen,
+                    .swa_window = swin,
+                    .block_tokens = btoks,
+                    .top_k_blocks = tkb,
+                    .top_k_coarse = @min(@as(u32, 4), tkb),
+                    .num_local_blocks = 2,
+                    .scale = sc,
+                };
+            }
+        }.call;
+
+        const modes = [_]hybrid.Csa2Mode{ .full, .reindex, .reuse };
+        // Warmup all three modes so Metal 4 residency/PSO caches are completely steady.
+        for (0..cfg.gpu_warmup) |_| {
+            for (modes) |m| {
+                var f = try compute.beginFrame(5_000);
+                _ = try hpipes.encodeMlaCsa2Layer(&f, makeArgs(m, &kv_arena, &sum_arena, &swa_arena, &idx_buf, mbuf, q_nope_bind, q_pe_bind, out_bind, lat_bind, rope_bind, kv_len, swa_win, block_tokens, top_k_blocks, n_heads, scale), false);
+                const sig = try f.commit();
+                try compute.wait(sig, 5_000);
+            }
+        }
+
+        const hb = try vmstat.Snapshot.capture();
+        var mode_us: [3]f64 = .{ 0.0, 0.0, 0.0 };
+        for (modes, 0..) |m, mi| {
+            const t0 = try vmstat.nowNs();
+            for (0..cfg.gpu_iters) |_| {
+                var f = try compute.beginFrame(5_000);
+                _ = try hpipes.encodeMlaCsa2Layer(&f, makeArgs(m, &kv_arena, &sum_arena, &swa_arena, &idx_buf, mbuf, q_nope_bind, q_pe_bind, out_bind, lat_bind, rope_bind, kv_len, swa_win, block_tokens, top_k_blocks, n_heads, scale), false);
+                const sig = try f.commit();
+                try compute.wait(sig, 5_000);
+            }
+            const t1 = try vmstat.nowNs();
+            mode_us[mi] = (@as(f64, @floatFromInt(t1 - t0)) / @as(f64, @floatFromInt(cfg.gpu_iters))) / 1000.0;
+        }
+        const ha = try vmstat.Snapshot.capture();
+        mla_heap_delta = vmstat.heapDelta(hb, ha);
+        mla_full_us = mode_us[0];
+        mla_reindex_us = mode_us[1];
+        mla_reuse_us = mode_us[2];
+    }
+
+    // -----------------------------------------------------------------------
+    // Section 2: G10 Single-Pass Mega-mHC (`m = 1` decode & `m = 64` prefill)
+    // -----------------------------------------------------------------------
+    const mhc_streams: u32 = 4;
+    const mhc_h: u32 = cfg.mhc_hidden_size;
+    var mhc_m1_us: f64 = 0.0;
+    var mhc_m1_gbs: f64 = 0.0;
+    var mhc_m64_us: f64 = 0.0;
+    var mhc_m64_gbs: f64 = 0.0;
+    var mhc_heap_delta: vmstat.HeapDelta = std.mem.zeroes(vmstat.HeapDelta);
+    {
+        const hpipes = try hybrid.HybridPipelines.init(dev, lib);
+        defer hpipes.close();
+        var compute = try metal.Compute.initWithFrames(dev, 2);
+        defer compute.close();
+
+        const max_m: u32 = 64;
+        const mhc_spec: hybrid.MhcStreamSpec = .{
+            .max_tokens = max_m,
+            .num_streams = mhc_streams,
+            .hidden_size = mhc_h,
+            .dtype = .f16,
+        };
+        const stream_bytes = try hybrid.MhcStreamArena.requiredBytes(mhc_spec);
+        const branch_bytes = try page.alignUp(@as(usize, max_m) * mhc_h * 2);
+        const norm_bytes = try page.alignUp(@as(usize, mhc_h) * 2);
+        const coeff_bytes = try page.alignUp(@as(usize, mhc_streams) * mhc_streams * 4);
+        var arena = try arena_mod.WiredArena.init(stream_bytes + branch_bytes + norm_bytes + coeff_bytes * 3 + page.APPLE_PAGE_SIZE * 2, wired_budget);
+        defer arena.deinit();
+        const mbuf = try metal.Buffer.wrap(dev, arena.bytes());
+        defer mbuf.close();
+        try compute.makeResident(&.{mbuf});
+
+        const s_arena = try hybrid.MhcStreamArena.init(&arena, mhc_spec);
+        const branch_raw = try arena.allocPages(branch_bytes);
+        const norm_raw = try arena.allocPages(norm_bytes);
+        const hpre_raw = try arena.allocPages(coeff_bytes);
+        const hpost_raw = try arena.allocPages(coeff_bytes);
+        const hres_raw = try arena.allocPages(coeff_bytes);
+
+        const norm_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, norm_raw[0 .. @as(usize, mhc_h) * 2]));
+        @memset(norm_f16, @as(f16, 1.0));
+        const hpre_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hpre_raw[0 .. @as(usize, mhc_streams) * 4]));
+        const hpost_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hpost_raw[0 .. @as(usize, mhc_streams) * 4]));
+        const hres_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hres_raw[0 .. @as(usize, mhc_streams) * mhc_streams * 4]));
+        for (0..mhc_streams) |s| {
+            hpre_f32[s] = 0.25;
+            hpost_f32[s] = 0.25;
+            for (0..mhc_streams) |t| {
+                hres_f32[s * mhc_streams + t] = if (s == t) 0.5 else 0.1;
+            }
+        }
+
+        const mhc_cfg: hybrid.MhcConfig = .{
+            .num_streams = mhc_streams,
+            .hidden_size = mhc_h,
+            .stream_dtype = .f16,
+            .act_dtype = .f16,
+            .norm_dtype = .f16,
+            .sinkhorn_iters = 4,
+            .apply_h_res_pre = false,
+            .apply_h_res_post = true,
+            .activate_coeffs = true,
+            .shared_coeffs = true,
+            .post_scale = 2.0,
+        };
+        const s_bind = s_arena.binding(mbuf);
+        const b_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(branch_raw.ptr) };
+        const n_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(norm_raw.ptr) };
+        const hp_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(hpre_raw.ptr) };
+        const hpo_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(hpost_raw.ptr) };
+        const hr_bind: metal.BufferBinding = .{ .buffer = mbuf, .offset = arena.offsetOf(hres_raw.ptr) };
+
+        const ms = [_]u32{ 1, 64 };
+        for (0..cfg.gpu_warmup) |_| {
+            for (ms) |m| {
+                var f = try compute.beginFrame(5_000);
+                try hpipes.encodeMegaMhc(&f, .{
+                    .config = mhc_cfg,
+                    .streams = s_bind,
+                    .h_pre = hp_bind,
+                    .h_res = null,
+                    .norm_w = n_bind,
+                    .branch_out = b_bind,
+                    .m = m,
+                }, false);
+                try hpipes.encodeMegaMhcPostMix(&f, .{
+                    .config = mhc_cfg,
+                    .streams = s_bind,
+                    .sublayer_out = b_bind,
+                    .h_post = hpo_bind,
+                    .h_res = hr_bind,
+                    .m = m,
+                }, true);
+                const sig = try f.commit();
+                try compute.wait(sig, 5_000);
+            }
+        }
+
+        const hb = try vmstat.Snapshot.capture();
+        const dispatches_per_frame: u32 = 8;
+        var mhc_us: [2]f64 = .{ 0.0, 0.0 };
+        var mhc_gbs: [2]f64 = .{ 0.0, 0.0 };
+        for (ms, 0..) |m, mi| {
+            const t0 = try vmstat.nowNs();
+            for (0..cfg.gpu_iters) |_| {
+                var f = try compute.beginFrame(5_000);
+                for (0..dispatches_per_frame) |d| {
+                    try hpipes.encodeMegaMhc(&f, .{
+                        .config = mhc_cfg,
+                        .streams = s_bind,
+                        .h_pre = hp_bind,
+                        .h_res = null,
+                        .norm_w = n_bind,
+                        .branch_out = b_bind,
+                        .m = m,
+                    }, d > 0);
+                    try hpipes.encodeMegaMhcPostMix(&f, .{
+                        .config = mhc_cfg,
+                        .streams = s_bind,
+                        .sublayer_out = b_bind,
+                        .h_post = hpo_bind,
+                        .h_res = hr_bind,
+                        .m = m,
+                    }, true);
+                }
+                const sig = try f.commit();
+                try compute.wait(sig, 5_000);
+            }
+            const t1 = try vmstat.nowNs();
+            const pair_ns = @as(f64, @floatFromInt(t1 - t0)) / @as(f64, @floatFromInt(@as(u64, cfg.gpu_iters) * dispatches_per_frame));
+            mhc_us[mi] = pair_ns / 1000.0;
+            // Logical global memory traffic for pre (`S*H` read + `H` norm read + `H` write) +
+            // post (`S*H` read + `H` read + `S*H` write) = `(3*S + 2) * m * H * 2 + H * 2` bytes.
+            const logical_bytes: f64 = @floatFromInt((@as(u64, 3 * mhc_streams + 2) * m * mhc_h + mhc_h) * 2);
+            mhc_gbs[mi] = if (pair_ns > 0.0) logical_bytes / pair_ns else 0.0;
+        }
+        const ha = try vmstat.Snapshot.capture();
+        mhc_heap_delta = vmstat.heapDelta(hb, ha);
+        mhc_m1_us = mhc_us[0];
+        mhc_m1_gbs = mhc_gbs[0];
+        mhc_m64_us = mhc_us[1];
+        mhc_m64_gbs = mhc_gbs[1];
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared synthetic `deepseek41` bundle for Sections 3, 4 & 5
+    // -----------------------------------------------------------------------
+    const tmp_dir = try graph.makeTestTempDir(allocator, "bench-m7");
+    defer allocator.free(tmp_dir);
+    defer graph.removeTestDir(allocator, tmp_dir);
+
+    var bundle = try graph.buildSynthDeepSeek41Bundle(allocator, .{
+        .num_encoder_layers = 2,
+        .num_decoder_layers = 4,
+        .hidden_size = 256,
+        .kv_lora_rank = 128,
+        .q_lora_rank = 128,
+        .num_attention_heads = 4,
+        .qk_nope_head_dim = 32,
+        .qk_rope_head_dim = 16,
+        .v_head_dim = 32,
+        .moe_inter = 128,
+        .shared_inter = 128,
+        .num_experts = 8,
+        .encoder_moe_top_k = 2,
+        .decoder_moe_top_k = 2,
+        .max_loops = 2,
+        .engram_rows = cfg.engram_rows,
+        .engram_num_shards = 2,
+        .engram_num_heads = 2,
+        .engram_orders = .{ 2, 3, 0, 0, 0, 0, 0, 0 },
+        .include_dspark = true,
+        .tmp_dir = tmp_dir,
+    });
+    defer bundle.deinit(allocator);
+
+    const eng_const = try allocator.alloc([:0]const u8, bundle.engram_paths.len);
+    defer allocator.free(eng_const);
+    for (bundle.engram_paths, 0..) |p, i| eng_const[i] = p;
+
+    // -----------------------------------------------------------------------
+    // Section 3: C10 Engram (`F_NOCACHE` cold SSD vs cache hit vs `r >= 1` reuse)
+    // -----------------------------------------------------------------------
+    var engram_cold_us: f64 = 0.0;
+    var engram_cold_reads: u64 = 0;
+    var engram_hit_us: f64 = 0.0;
+    var engram_hit_reads: u64 = 0;
+    var engram_loop_us: f64 = 0.0;
+    var engram_loop_reads: u64 = 0;
+    var engram_heap_delta: vmstat.HeapDelta = std.mem.zeroes(vmstat.HeapDelta);
+    {
+        var store = try ple.PleStore.open(allocator, eng_const, .{
+            .cache = .{
+                .cache_pages = 128,
+                .budget_override = wired_budget,
+            },
+            .table_kind = .engram_conditional,
+        });
+        defer store.deinit(allocator);
+
+        var scratch = try ple.LoopPleScratch.initEngram(
+            allocator,
+            @intCast(bundle.cfg.num_hidden_layers),
+            1,
+            2,
+            bundle.cfg.hidden_size,
+            wired_budget,
+        );
+        defer scratch.deinit(allocator);
+
+        const orders = [_]u8{ 2, 3 };
+        const h_dim: usize = bundle.cfg.hidden_size;
+        const h_in = try allocator.alloc(f16, h_dim);
+        defer allocator.free(h_in);
+        const h_out = try allocator.alloc(f16, h_dim);
+        defer allocator.free(h_out);
+        for (0..h_dim) |d| h_in[d] = @floatCast(@sin(@as(f32, @floatFromInt(d)) * 0.05) * 0.4);
+
+        var tok_wins: [64][4]u32 = undefined;
+        const n_cold = @min(cfg.engram_cold_lookups, 64);
+        for (0..n_cold) |i| {
+            const base: u32 = @intCast(i * 197 + 13);
+            tok_wins[i] = .{ base, base + 7, base + 31, base + 97 };
+        }
+
+        const hb = try vmstat.Snapshot.capture();
+        // 3a. Cold lookups (`F_NOCACHE` page misses from SSD).
+        const reads_c0 = store.stats().nvme_reads;
+        const ct0 = try vmstat.nowNs();
+        for (0..n_cold) |i| {
+            const win_slice = [_][]const u32{&tok_wins[i]};
+            try store.lookupEngramConditional(0, &win_slice, &orders, h_in, 0, &scratch, h_out);
+        }
+        const ct1 = try vmstat.nowNs();
+        engram_cold_reads = store.stats().nvme_reads - reads_c0;
+        engram_cold_us = (@as(f64, @floatFromInt(ct1 - ct0)) / @as(f64, @floatFromInt(n_cold))) / 1000.0;
+
+        // 3b. Warm `PlePageCache` hits (`r = 0`, 0 new SSD reads).
+        const reads_h0 = store.stats().nvme_reads;
+        const ht0 = try vmstat.nowNs();
+        for (0..cfg.engram_warm_lookups) |i| {
+            const win_slice = [_][]const u32{&tok_wins[i % n_cold]};
+            try store.lookupEngramConditional(0, &win_slice, &orders, h_in, 0, &scratch, h_out);
+        }
+        const ht1 = try vmstat.nowNs();
+        engram_hit_reads = store.stats().nvme_reads - reads_h0;
+        engram_hit_us = (@as(f64, @floatFromInt(ht1 - ht0)) / @as(f64, @floatFromInt(cfg.engram_warm_lookups))) / 1000.0;
+
+        // 3c. Loop `r >= 1` scratch reuse (`ADR-0019` Isolation #2, strictly 0 SSD reads).
+        const win0 = [_][]const u32{&tok_wins[0]};
+        try store.lookupEngramConditional(0, &win0, &orders, h_in, 0, &scratch, h_out);
+        const reads_l0 = store.stats().nvme_reads;
+        const lt0 = try vmstat.nowNs();
+        for (0..cfg.engram_warm_lookups) |i| {
+            const r_step: u32 = @intCast((i % 2) + 1);
+            try store.lookupEngramConditional(0, &win0, &orders, h_in, r_step, &scratch, h_out);
+        }
+        const lt1 = try vmstat.nowNs();
+        engram_loop_reads = store.stats().nvme_reads - reads_l0;
+        engram_loop_us = (@as(f64, @floatFromInt(lt1 - lt0)) / @as(f64, @floatFromInt(cfg.engram_warm_lookups))) / 1000.0;
+        const ha = try vmstat.Snapshot.capture();
+        engram_heap_delta = vmstat.heapDelta(hb, ha);
+    }
+
+    // -----------------------------------------------------------------------
+    // Section 4: W11 + D10 Synthetic `deepseek41` CED + `DSpark` Spec Decode
+    // -----------------------------------------------------------------------
+    const prompt = [_]u32{ 5, 11, 23, 7, 19, 31, 5, 11, 23, 7, 19, 31, 13, 41, 17, 29 };
+    const n_steps: usize = @max(@as(usize, 6), cfg.ced_decode_steps);
+    const ref_toks = try allocator.alloc(u32, n_steps);
+    defer allocator.free(ref_toks);
+
+    var ced_prefill_ms: f64 = 0.0;
+    var ced_dec_ms: f64 = 0.0;
+    var ced_dec_tok_s: f64 = 0.0;
+    var ced_enc_dec_disp: u64 = 0;
+    var ced_engram_r_ge1_reads: u64 = 0;
+    var ced_heap_delta: vmstat.HeapDelta = std.mem.zeroes(vmstat.HeapDelta);
+    {
+        var ref_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 32,
+            .ple_paths = eng_const,
+            .wired_budget_override = wired_budget,
+            .startup_canary = false,
+        });
+        defer ref_model.deinit(allocator);
+
+        const pt0 = try vmstat.nowNs();
+        ref_toks[0] = try ref_model.prefillChunk(&prompt, 0, true);
+        const pt1 = try vmstat.nowNs();
+        ced_prefill_ms = @as(f64, @floatFromInt(pt1 - pt0)) / 1_000_000.0;
+
+        // Warm up both frame slots of the 2-frame Metal 4 ring before steady-state malloc check.
+        ref_toks[1] = try ref_model.stepDecode(ref_toks[0], @intCast(prompt.len));
+        ref_toks[2] = try ref_model.stepDecode(ref_toks[1], @intCast(prompt.len + 1));
+        ref_model.resetM7Stats();
+        ref_model.resetLoopIsolationStats();
+
+        const hb = try vmstat.Snapshot.capture();
+        const dt0 = try vmstat.nowNs();
+        for (3..n_steps) |s| {
+            ref_toks[s] = try ref_model.stepDecode(ref_toks[s - 1], @intCast(prompt.len + s - 1));
+        }
+        const dt1 = try vmstat.nowNs();
+        const ha = try vmstat.Snapshot.capture();
+        ced_heap_delta = vmstat.heapDelta(hb, ha);
+        const timed_n: f64 = @floatFromInt(n_steps - 3);
+        ced_dec_ms = (@as(f64, @floatFromInt(dt1 - dt0)) / timed_n) / 1_000_000.0;
+        ced_dec_tok_s = if (ced_dec_ms > 0.0) 1000.0 / ced_dec_ms else 0.0;
+        ced_enc_dec_disp = ref_model.m7Stats().encoder_layer_dispatches_decode;
+        ced_engram_r_ge1_reads = ref_model.loopIsolationStats().ple_r_ge1_nvme_reads;
+    }
+
+    var dspark_dec_ms: f64 = 0.0;
+    var dspark_dec_tok_s: f64 = 0.0;
+    var dspark_mean_accept: f64 = 0.0;
+    var dspark_greedy_match = true;
+    var dspark_enc_dec_disp: u64 = 0;
+    var dspark_heap_delta: vmstat.HeapDelta = std.mem.zeroes(vmstat.HeapDelta);
+    {
+        var spec_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 32,
+            .ple_paths = eng_const,
+            .wired_budget_override = wired_budget,
+            .startup_canary = false,
+        });
+        defer spec_model.deinit(allocator);
+
+        var dspark_loaded = try engine_mod.LoadedDSparkProposer.loadFromFile(
+            allocator,
+            &spec_model,
+            bundle.dspark_amf_path.?,
+            null,
+            wired_budget,
+        );
+        defer dspark_loaded.deinit(allocator);
+
+        var eng = try engine_mod.SpecEngine.initWithDSpark(allocator, &spec_model, &dspark_loaded.proposer, .{
+            .mode = .dspark,
+            .max_tree_nodes = 16,
+            .max_draft_depth = 4,
+            .temperature = 0.0,
+            .enable_pruning = false,
+        });
+        defer eng.deinit(allocator);
+
+        const spec_toks = try allocator.alloc(u32, n_steps);
+        defer allocator.free(spec_toks);
+
+        spec_toks[0] = try eng.prefill(&prompt, null);
+        var produced: usize = 1;
+        var round_buf: [engine_mod.MAX_TREE_NODES]u32 = undefined;
+
+        // Warmup first verifyTree round before steady-state malloc measurement.
+        if (produced < n_steps) {
+            const rs0 = try eng.stepRound(null, round_buf[0..@min(n_steps - produced, round_buf.len)]);
+            for (round_buf[0..rs0.emitted_count]) |tid| {
+                if (produced < n_steps) {
+                    spec_toks[produced] = tid;
+                    produced += 1;
+                }
+            }
+        }
+        spec_model.resetM7Stats();
+        const timed_start_produced = produced;
+        const hb = try vmstat.Snapshot.capture();
+        const st0 = try vmstat.nowNs();
+        while (produced < n_steps) {
+            const rem = n_steps - produced;
+            const rs = try eng.stepRound(null, round_buf[0..@min(rem, round_buf.len)]);
+            for (round_buf[0..rs.emitted_count]) |tid| {
+                if (produced < n_steps) {
+                    spec_toks[produced] = tid;
+                    produced += 1;
+                }
+            }
+        }
+        const st1 = try vmstat.nowNs();
+        const ha = try vmstat.Snapshot.capture();
+        dspark_heap_delta = vmstat.heapDelta(hb, ha);
+
+        for (0..n_steps) |i| {
+            if (spec_toks[i] != ref_toks[i]) {
+                dspark_greedy_match = false;
+                break;
+            }
+        }
+        const timed_toks: usize = if (produced > timed_start_produced) produced - timed_start_produced else 1;
+        dspark_dec_ms = (@as(f64, @floatFromInt(st1 - st0)) / @as(f64, @floatFromInt(timed_toks))) / 1_000_000.0;
+        dspark_dec_tok_s = if (dspark_dec_ms > 0.0) 1000.0 / dspark_dec_ms else 0.0;
+        dspark_mean_accept = eng.stats.meanAcceptanceLength();
+        dspark_enc_dec_disp = spec_model.m7Stats().encoder_layer_dispatches_decode;
+    }
+
+    // -----------------------------------------------------------------------
+    // Section 5: X1-X3 TB5 RDMA Probe & Live 2-Rank / 4-Rank Loopback TCP Cluster
+    // -----------------------------------------------------------------------
+    const rdma_probe = transport.probeTb5Rdma();
+    const auto_resolved = try transport.selectTransportWithProbe(.auto, rdma_probe);
+    const strict_tb5_reject_ok = if (rdma_probe.available)
+        true
+    else if (transport.selectTransportWithProbe(.tb5_rdma, rdma_probe)) |_|
+        false
+    else |err|
+        (err == error.Tb5RdmaUnavailable);
+
+    // 5a. Live 2-rank loopback TCP end-to-end `deepseek41` CED decode (Rank 0 + Rank 1).
+    var c2_match = true;
+    var c2_enc_dec_disp: u64 = 0;
+    var c2_dispatches: u64 = 0;
+    var c2_remote_assign: u64 = 0;
+    var c2_rpc_us: f64 = 0.0;
+    var c2_bytes: u64 = 0;
+    var c2_heap_delta: vmstat.HeapDelta = std.mem.zeroes(vmstat.HeapDelta);
+    {
+        const plan_r1 = try expert_parallel.ExpertPartitionPlan.init(
+            2,
+            1,
+            @intCast(bundle.cfg.num_hidden_layers),
+            @intCast(bundle.cfg.num_experts),
+            .contiguous_by_rank,
+        );
+        var store_r1 = try graph.LoadedCpuMoeStore.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, plan_r1, wired_budget);
+        defer store_r1.deinit(allocator);
+
+        var worker1 = try expert_parallel.PeerWorkerServer.init(.{
+            .plan = plan_r1,
+            .host = .{ 127, 0, 0, 1 },
+            .port = 0,
+            .hidden_size = bundle.cfg.hidden_size,
+            .max_tokens = 64,
+            .max_assignments = 64 * 8,
+            .backend = store_r1.backend(),
+        });
+        defer worker1.deinit();
+        try worker1.start();
+        defer worker1.stop();
+
+        const plan_r0 = try expert_parallel.ExpertPartitionPlan.init(
+            2,
+            0,
+            @intCast(bundle.cfg.num_hidden_layers),
+            @intCast(bundle.cfg.num_experts),
+            .contiguous_by_rank,
+        );
+        var store_r0 = try graph.LoadedCpuMoeStore.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, plan_r0, wired_budget);
+        defer store_r0.deinit(allocator);
+
+        const peers = [_]expert_parallel.PeerEndpoint{.{
+            .rank = 1,
+            .host = .{ 127, 0, 0, 1 },
+            .port = worker1.boundPort(),
+        }};
+        var coord = try expert_parallel.ExpertParallelCoordinator.init(.{
+            .plan = plan_r0,
+            .peers = &peers,
+            .hidden_size = bundle.cfg.hidden_size,
+            .max_tokens = 64,
+            .max_assignments = 64 * 8,
+            .local_backend = store_r0.backend(),
+            .transport_kind = .auto,
+        });
+        defer coord.deinit();
+
+        var dist_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+            .max_seq_len = 256,
+            .max_tree_nodes = 32,
+            .ple_paths = eng_const,
+            .wired_budget_override = wired_budget,
+            .startup_canary = false,
+            .cluster_coordinator = &coord,
+        });
+        defer dist_model.deinit(allocator);
+
+        const dist_steps = @min(n_steps, 8);
+        const dist_toks = try allocator.alloc(u32, dist_steps);
+        defer allocator.free(dist_toks);
+        dist_toks[0] = try dist_model.prefillChunk(&prompt, 0, true);
+        dist_toks[1] = try dist_model.stepDecode(dist_toks[0], @intCast(prompt.len));
+        dist_toks[2] = try dist_model.stepDecode(dist_toks[1], @intCast(prompt.len + 1));
+        dist_model.resetM7Stats();
+
+        const hb = try vmstat.Snapshot.capture();
+        for (3..dist_steps) |s| {
+            dist_toks[s] = try dist_model.stepDecode(dist_toks[s - 1], @intCast(prompt.len + s - 1));
+        }
+        const ha = try vmstat.Snapshot.capture();
+        c2_heap_delta = vmstat.heapDelta(hb, ha);
+
+        for (0..dist_steps) |i| {
+            if (dist_toks[i] != ref_toks[i]) {
+                c2_match = false;
+                break;
+            }
+        }
+        const m7s = dist_model.m7Stats();
+        c2_enc_dec_disp = m7s.encoder_layer_dispatches_decode;
+        c2_dispatches = m7s.cluster_dispatches;
+        c2_remote_assign = m7s.cluster_remote_assignments;
+        c2_bytes = m7s.cluster_bytes_transferred;
+        c2_rpc_us = if (m7s.cluster_dispatches > 0)
+            (@as(f64, @floatFromInt(m7s.cluster_remote_rpc_ns)) / @as(f64, @floatFromInt(m7s.cluster_dispatches))) / 1000.0
+        else
+            0.0;
+    }
+
+    // 5b. Live 4-rank loopback TCP MoE layer dispatch (Rank 0 + Ranks 1, 2, 3) vs 1-rank reference.
+    var c4_m1_err: f32 = 0.0;
+    var c4_m8_err: f32 = 0.0;
+    var c4_dispatches: u64 = 0;
+    var c4_remote_assign: u64 = 0;
+    var c4_rpc_us: f64 = 0.0;
+    var c4_bytes: u64 = 0;
+    var c4_heap_delta: vmstat.HeapDelta = std.mem.zeroes(vmstat.HeapDelta);
+    {
+        const n_layers16: u16 = @intCast(bundle.cfg.num_hidden_layers);
+        const n_experts16: u16 = @intCast(bundle.cfg.num_experts);
+        const h_dim: usize = bundle.cfg.hidden_size;
+
+        const plan_full = try expert_parallel.ExpertPartitionPlan.init(1, 0, n_layers16, n_experts16, .contiguous_by_rank);
+        var store_full = try graph.LoadedCpuMoeStore.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, plan_full, wired_budget);
+        defer store_full.deinit(allocator);
+
+        var stores: [4]graph.LoadedCpuMoeStore = undefined;
+        var loaded_stores: usize = 0;
+        errdefer for (0..loaded_stores) |i| stores[i].deinit(allocator);
+        for (0..4) |r| {
+            const pr = try expert_parallel.ExpertPartitionPlan.init(4, @intCast(r), n_layers16, n_experts16, .contiguous_by_rank);
+            stores[r] = try graph.LoadedCpuMoeStore.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, pr, wired_budget);
+            loaded_stores += 1;
+        }
+        defer for (0..4) |i| stores[i].deinit(allocator);
+
+        var workers: [3]expert_parallel.PeerWorkerServer = undefined;
+        var init_workers: usize = 0;
+        errdefer for (0..init_workers) |i| workers[i].deinit();
+        for (0..3) |wi| {
+            const rank: u16 = @intCast(wi + 1);
+            const pr = try expert_parallel.ExpertPartitionPlan.init(4, rank, n_layers16, n_experts16, .contiguous_by_rank);
+            workers[wi] = try expert_parallel.PeerWorkerServer.init(.{
+                .plan = pr,
+                .host = .{ 127, 0, 0, 1 },
+                .port = 0,
+                .hidden_size = bundle.cfg.hidden_size,
+                .max_tokens = 16,
+                .max_assignments = 16 * 8,
+                .backend = stores[rank].backend(),
+            });
+            init_workers += 1;
+        }
+        defer for (0..3) |i| workers[i].deinit();
+        for (0..3) |wi| try workers[wi].start();
+        defer for (0..3) |wi| workers[wi].stop();
+
+        const peers = [_]expert_parallel.PeerEndpoint{
+            .{ .rank = 1, .host = .{ 127, 0, 0, 1 }, .port = workers[0].boundPort() },
+            .{ .rank = 2, .host = .{ 127, 0, 0, 1 }, .port = workers[1].boundPort() },
+            .{ .rank = 3, .host = .{ 127, 0, 0, 1 }, .port = workers[2].boundPort() },
+        };
+        const plan_r0 = try expert_parallel.ExpertPartitionPlan.init(4, 0, n_layers16, n_experts16, .contiguous_by_rank);
+        var coord4 = try expert_parallel.ExpertParallelCoordinator.init(.{
+            .plan = plan_r0,
+            .peers = &peers,
+            .hidden_size = bundle.cfg.hidden_size,
+            .max_tokens = 16,
+            .max_assignments = 16 * 8,
+            .local_backend = stores[0].backend(),
+            .transport_kind = .auto,
+        });
+        defer coord4.deinit();
+
+        const x_in = try allocator.alloc(f16, 8 * h_dim);
+        defer allocator.free(x_in);
+        for (x_in, 0..) |*v, i| v.* = @floatCast(@sin(@as(f32, @floatFromInt(i)) * 0.037) * 0.45);
+        const ref_out = try allocator.alloc(f32, 8 * h_dim);
+        defer allocator.free(ref_out);
+        const dist_out = try allocator.alloc(f32, 8 * h_dim);
+        defer allocator.free(dist_out);
+
+        // Route across all 4 ranks (experts 0, 2, 4, 6 -> ranks 0, 1, 2, 3).
+        const assigns_m1 = [_]transport.Assignment{
+            .{ .token_idx = 0, .expert_id = 0, .weight = 0.25 },
+            .{ .token_idx = 0, .expert_id = 2, .weight = 0.25 },
+            .{ .token_idx = 0, .expert_id = 4, .weight = 0.25 },
+            .{ .token_idx = 0, .expert_id = 6, .weight = 0.25 },
+        };
+        var assigns_m8: [16]transport.Assignment = undefined;
+        for (0..8) |t| {
+            assigns_m8[t * 2 + 0] = .{ .token_idx = @intCast(t), .expert_id = @intCast(t % 8), .weight = 0.6 };
+            assigns_m8[t * 2 + 1] = .{ .token_idx = @intCast(t), .expert_id = @intCast((t + 3) % 8), .weight = 0.4 };
+        }
+
+        // Exact 1-rank references for m=1 and m=8.
+        @memset(ref_out[0..h_dim], 0.0);
+        _ = try store_full.backend().evalLocalSubset(0, 1, x_in[0..h_dim], &assigns_m1, ref_out[0..h_dim]);
+        _ = try coord4.dispatchLayerExperts(0, 1, x_in[0..h_dim], &assigns_m1, dist_out[0..h_dim]);
+        for (0..h_dim) |i| c4_m1_err = @max(c4_m1_err, @abs(ref_out[i] - dist_out[i]));
+
+        @memset(ref_out[0 .. 8 * h_dim], 0.0);
+        _ = try store_full.backend().evalLocalSubset(1, 8, x_in[0 .. 8 * h_dim], &assigns_m8, ref_out[0 .. 8 * h_dim]);
+        _ = try coord4.dispatchLayerExperts(1, 8, x_in[0 .. 8 * h_dim], &assigns_m8, dist_out[0 .. 8 * h_dim]);
+        for (0..8 * h_dim) |i| c4_m8_err = @max(c4_m8_err, @abs(ref_out[i] - dist_out[i]));
+
+        // Timed steady-state 4-rank dispatches (`0` heap allocations).
+        var total_rpc_ns: u64 = 0;
+        const hb = try vmstat.Snapshot.capture();
+        for (0..cfg.cluster_4rank_iters) |it| {
+            const layer_i: u16 = @intCast(it % bundle.cfg.num_hidden_layers);
+            const ds = try coord4.dispatchLayerExperts(layer_i, 1, x_in[0..h_dim], &assigns_m1, dist_out[0..h_dim]);
+            c4_dispatches += 1;
+            c4_remote_assign += ds.remote_assignments;
+            c4_bytes += ds.bytes_transferred;
+            total_rpc_ns += ds.remote_rpc_ns;
+        }
+        const ha = try vmstat.Snapshot.capture();
+        c4_heap_delta = vmstat.heapDelta(hb, ha);
+        c4_rpc_us = (@as(f64, @floatFromInt(total_rpc_ns)) / @as(f64, @floatFromInt(c4_dispatches))) / 1000.0;
+    }
+
+    const vm_after = try vmstat.Snapshot.capture();
+    try vmstat.checkNoSwap(vm_before, vm_after);
+
+    return .{
+        .chip_profile = profile,
+        .gpu_name_buf = gpu_name_buf,
+        .gpu_name_len = gpu_len,
+        .deepseek41_fp4_bytes_per_tok = ds_fp4_bpt,
+        .deepseek41_fp16_mla_bytes_per_tok = ds_fp16_mla_bpt,
+        .deepseek41_unabsorbed_fp16_bytes_per_tok = ds_unabsorbed_fp16_bpt,
+        .fp4_latent_max_abs_err = fp4_lat_max_err,
+        .fp4_latent_rmse = fp4_lat_rmse,
+        .fp4_rope_e4m3_max_abs_err = fp4_rope_max_err,
+        .mla_bench_kv_len = cfg.mla_kv_len,
+        .mla_kv_bytes_shared_3layers = mla_kv_shared,
+        .mla_kv_bytes_unshared_3layers = mla_kv_unshared,
+        .mla_full_us = mla_full_us,
+        .mla_reindex_us = mla_reindex_us,
+        .mla_reuse_us = mla_reuse_us,
+        .mla_heap_delta = mla_heap_delta,
+        .mhc_streams = mhc_streams,
+        .mhc_hidden_size = mhc_h,
+        .mhc_m1_us = mhc_m1_us,
+        .mhc_m1_gbs = mhc_m1_gbs,
+        .mhc_m64_us = mhc_m64_us,
+        .mhc_m64_gbs = mhc_m64_gbs,
+        .mhc_heap_delta = mhc_heap_delta,
+        .engram_shards = 2,
+        .engram_rows = cfg.engram_rows,
+        .engram_heads = 2,
+        .engram_cold_us = engram_cold_us,
+        .engram_cold_nvme_reads = engram_cold_reads,
+        .engram_hit_us = engram_hit_us,
+        .engram_hit_nvme_reads = engram_hit_reads,
+        .engram_loop_us = engram_loop_us,
+        .engram_loop_nvme_reads = engram_loop_reads,
+        .engram_heap_delta = engram_heap_delta,
+        .ced_encoder_layers = bundle.cfg.num_encoder_layers,
+        .ced_decoder_layers = bundle.cfg.num_decoder_layers,
+        .ced_prefill_ms = ced_prefill_ms,
+        .ced_decode_ms_per_tok = ced_dec_ms,
+        .ced_decode_tok_s = ced_dec_tok_s,
+        .ced_encoder_decode_dispatches = ced_enc_dec_disp,
+        .ced_engram_r_ge1_nvme_reads = ced_engram_r_ge1_reads,
+        .ced_heap_delta = ced_heap_delta,
+        .dspark_decode_ms_per_tok = dspark_dec_ms,
+        .dspark_decode_tok_s = dspark_dec_tok_s,
+        .dspark_mean_accept = dspark_mean_accept,
+        .dspark_speedup = if (ced_dec_tok_s > 0.0) dspark_dec_tok_s / ced_dec_tok_s else 0.0,
+        .dspark_greedy_match = dspark_greedy_match,
+        .dspark_encoder_decode_dispatches = dspark_enc_dec_disp,
+        .dspark_heap_delta = dspark_heap_delta,
+        .rdma_probe = rdma_probe,
+        .auto_transport = auto_resolved.kind,
+        .strict_tb5_reject_ok = strict_tb5_reject_ok,
+        .cluster_2r_greedy_match = c2_match,
+        .cluster_2r_encoder_decode_dispatches = c2_enc_dec_disp,
+        .cluster_2r_dispatches = c2_dispatches,
+        .cluster_2r_remote_assignments = c2_remote_assign,
+        .cluster_2r_rpc_us = c2_rpc_us,
+        .cluster_2r_bytes_transferred = c2_bytes,
+        .cluster_2r_heap_delta = c2_heap_delta,
+        .cluster_4r_m1_max_abs_err = c4_m1_err,
+        .cluster_4r_m8_max_abs_err = c4_m8_err,
+        .cluster_4r_dispatches = c4_dispatches,
+        .cluster_4r_remote_assignments = c4_remote_assign,
+        .cluster_4r_rpc_us = c4_rpc_us,
+        .cluster_4r_bytes_transferred = c4_bytes,
+        .cluster_4r_heap_delta = c4_heap_delta,
+        .vm_before = vm_before,
+        .vm_after = vm_after,
+    };
+}
+
+pub fn runM7(allocator: std.mem.Allocator) !M7Report {
+    return runM7WithConfig(allocator, .{});
+}
+
+test "runM7WithConfig verifies R7/G11, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED+DSpark, and X1-X3 2-rank & 4-rank loopback TCP cluster" {
+    const gpa = std.testing.allocator;
+    const report = try runM7WithConfig(gpa, .{
+        .mla_kv_len = 256,
+        .mla_swa_window = 64,
+        .mla_top_k_blocks = 8,
+        .mhc_hidden_size = 512,
+        .gpu_warmup = 8,
+        .gpu_iters = 2,
+        .engram_rows = 256,
+        .engram_cold_lookups = 4,
+        .engram_warm_lookups = 8,
+        .ced_decode_steps = 6,
+        .cluster_4rank_iters = 4,
+    });
+
+    const mtl_debug = (std.c.getenv("MTL_DEBUG_LAYER") != null or std.c.getenv("MTL_SHADER_VALIDATION") != null);
+    try std.testing.expectEqual(@as(u32, 890), report.deepseek41_fp4_bytes_per_tok);
+    try std.testing.expect(report.fp4_latent_rmse < 0.25);
+    try std.testing.expect(report.mla_kv_bytes_shared_3layers < report.mla_kv_bytes_unshared_3layers);
+    try std.testing.expect(report.engram_cold_nvme_reads > 0);
+    try std.testing.expectEqual(@as(u64, 0), report.engram_hit_nvme_reads);
+    try std.testing.expectEqual(@as(u64, 0), report.engram_loop_nvme_reads);
+    try std.testing.expect(report.engram_heap_delta.blocks_in_use <= 0);
+    try std.testing.expectEqual(@as(u64, 0), report.ced_encoder_decode_dispatches);
+    try std.testing.expectEqual(@as(u64, 0), report.ced_engram_r_ge1_nvme_reads);
+    try std.testing.expect(report.dspark_greedy_match);
+    try std.testing.expectEqual(@as(u64, 0), report.dspark_encoder_decode_dispatches);
+    try std.testing.expect(report.strict_tb5_reject_ok);
+    try std.testing.expect(report.cluster_2r_greedy_match);
+    try std.testing.expectEqual(@as(u64, 0), report.cluster_2r_encoder_decode_dispatches);
+    try std.testing.expect(report.cluster_2r_remote_assignments > 0);
+    try std.testing.expect(report.cluster_4r_m1_max_abs_err <= 1e-4);
+    try std.testing.expect(report.cluster_4r_m8_max_abs_err <= 1e-4);
+    try std.testing.expect(report.cluster_4r_remote_assignments > 0);
+    try std.testing.expect(report.cluster_4r_heap_delta.blocks_in_use <= 0);
+    if (!mtl_debug) {
+        try std.testing.expect(report.mla_heap_delta.blocks_in_use <= 0);
+        try std.testing.expect(report.mhc_heap_delta.blocks_in_use <= 0);
+        try std.testing.expect(report.ced_heap_delta.blocks_in_use <= 0);
+        try std.testing.expect(report.dspark_heap_delta.blocks_in_use <= 0);
+        try std.testing.expect(report.cluster_2r_heap_delta.blocks_in_use <= 0);
+    }
+    try std.testing.expectEqual(@as(u64, 0), vmstat.Snapshot.swapoutDelta(report.vm_before, report.vm_after));
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try report.write(&aw.writer);
+    const rendered = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "tier3_full_552b_status=deferred_requires_512gb_ultra_or_multi_mac_tb5_rdma_cluster") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "greedy_match=yes") != null);
 }

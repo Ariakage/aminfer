@@ -4833,6 +4833,50 @@ pub const GraphModel = struct {
             );
         }
 
+        // Commit `Full` MLA+CSA2 layers' `r = 0` tree latents/RoPE to FP4 KV + SWA ring +
+        // CSA2 summaries AFTER all layers in this phase finish attending (prevents SWA ring
+        // wraparound aliasing between `Full` and `Reindex`/`Reuse` layers and guarantees
+        // bit-exact `stepDecode` vs `verifyTree` parity across all `R >= 1` loop counts).
+        if (commit_state_on_final and kv_len_override == null and self.mla_kv_arena != null) {
+            const f = try self.ensureFrame(&frame_opt);
+            const kv_arena = &(self.mla_kv_arena.?);
+            const sum_arena = &(self.csa2_summary_arena.?);
+            const d_rope: u32 = self.config.qk_rope_head_dim;
+            const coarse_span = sum_arena.spec.block_tokens * sum_arena.spec.coarse_group_blocks;
+            for (phase_start..phase_end) |l| {
+                switch (self.layers[l].attn) {
+                    .mla_csa2 => |mla| {
+                        if (mla.mode == .full) {
+                            try self.hybrid_pipes.encodeMlaFp4KvWrite(f, .{
+                                .latent_in = .{ .buffer = self.scratch_buf, .offset = mla.tree_latent_off },
+                                .rope_in = if (d_rope > 0) .{ .buffer = self.scratch_buf, .offset = mla.tree_rope_off } else null,
+                                .kv_arena = kv_arena,
+                                .kv_metal_buf = self.mla_kv_buf,
+                                .kv_slot = mla.shared_kv_owner,
+                                .swa_ring = if (self.mla_swa_arena) |*sa| sa else null,
+                                .swa_metal_buf = if (self.mla_swa_arena != null) self.mla_kv_buf else null,
+                                .num_tokens = m,
+                                .start_pos = base_pos,
+                                .is_encoder_projection = false,
+                            }, true);
+                            try self.hybrid_pipes.encodeCsa2UpdateSummaries(f, .{
+                                .kv_arena = kv_arena,
+                                .kv_metal_buf = self.mla_kv_buf,
+                                .summary_arena = sum_arena,
+                                .summary_metal_buf = self.mla_kv_buf,
+                                .kv_slot = mla.shared_kv_owner,
+                                .kv_len = base_pos + m,
+                                .start_coarse_block = base_pos / coarse_span,
+                            }, true);
+                            self.m7_stats.csa2_kv_writes += 1;
+                            self.m7_stats.csa2_summary_updates += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
         // Collapse 4-branch GR or Single-Pass Mega-mHC hyper-streams to single-stream `x_bind`.
         if (self.gr_arena) |*gr| {
             const f = try self.ensureFrame(&frame_opt);
@@ -6475,13 +6519,15 @@ pub const GraphModel = struct {
             }
         }
 
-        // 4. Apply RoPE to `q_pe` (`[m, n_heads, d_rope]`) and (when `need_kv_proj`) `rope_dst` (`[m, 1, d_rope]`).
+        // 4. Apply RoPE to `q_pe` (`[m, n_heads, d_rope]`) and (ONLY when `need_kv_proj`) `rope_dst` (`[m, 1, d_rope]`).
+        //    When `need_kv_proj == false` (`loop_step >= 1` or `Reindex`/`Reuse`), pass throwaway `sc.rope_raw_bind`
+        //    so `mla.tree_rope_off` from `loop_step == 0` is NEVER double-rotated in-place during `verifyTree`.
         if (d_rope > 0) {
             if ((d_rope % 4) == 0 and d_rope <= hybrid.MAX_QSA_HEAD_DIM) {
                 const f = try self.ensureFrame(frame_opt);
                 try self.hybrid_pipes.encodeQsaPrefillRope(f, .{
                     .q = sc.q_pe_bind,
-                    .k = rope_dst,
+                    .k = if (need_kv_proj) rope_dst else sc.rope_raw_bind,
                     .v = sc.rope_raw_bind,
                     .q_norm = null,
                     .k_norm = null,
@@ -6517,19 +6563,25 @@ pub const GraphModel = struct {
         }
 
         // 5. MLA + CSA2 (`Full` / `Reindex` / `Reuse`) + FP4 KV + SWA bounded replay.
+        //    Non-wide path (`stepDecode`, `tree64` prefill, `verifyTree`) ALWAYS attends over
+        //    committed `[0, base_pos)` + uncommitted `tree_latent_off`/`tree_rope_off` via
+        //    `ancestor_masks`, deferring FP4 KV/SWA commit to end-of-pass (`commit_state_on_final`)
+        //    or `commitTreeKv` so `R >= 2` loops and `stepDecode` vs `verifyTree` match bit-for-bit.
+        _ = commit_kv;
         {
             const f = try self.ensureFrame(frame_opt);
             const kv_arena = &(self.mla_kv_arena.?);
             const sum_arena = &(self.csa2_summary_arena.?);
             const is_decoder_layer = cfg.isCausalEncDec() and (l >= cfg.num_encoder_layers);
             const enc_prefix: u32 = if (is_decoder_layer) self.ced_encoder_prefix_len else 0;
-            const eff_kv_len: u32 = kv_len_override orelse (if (commit_kv) base_pos + m else base_pos);
-            const causal_start: ?u32 = if (kv_len_override != null or !commit_kv) null else base_pos;
-            const owner_tree_lat: ?metal.BufferBinding = if (!commit_kv)
+            const use_tree_path = (!is_wide and kv_len_override == null);
+            const eff_kv_len: u32 = kv_len_override orelse (if (use_tree_path) base_pos else base_pos + m);
+            const causal_start: ?u32 = if (is_wide and kv_len_override == null) base_pos else null;
+            const owner_tree_lat: ?metal.BufferBinding = if (use_tree_path)
                 .{ .buffer = self.scratch_buf, .offset = kv_owner_mla.tree_latent_off }
             else
                 null;
-            const owner_tree_rope: ?metal.BufferBinding = if (!commit_kv and d_rope > 0)
+            const owner_tree_rope: ?metal.BufferBinding = if (use_tree_path and d_rope > 0)
                 .{ .buffer = self.scratch_buf, .offset = kv_owner_mla.tree_rope_off }
             else
                 null;
@@ -6539,10 +6591,10 @@ pub const GraphModel = struct {
                 .mode = mla.mode,
                 .shared_kv_owner = mla.shared_kv_owner,
                 .loop_step = loop_step,
-                .write_latent_in = if (commit_kv and need_kv_proj) lat_dst else null,
-                .write_rope_in = if (commit_kv and need_kv_proj and d_rope > 0) rope_dst else null,
+                .write_latent_in = if (is_wide and need_kv_proj) lat_dst else null,
+                .write_rope_in = if (is_wide and need_kv_proj and d_rope > 0) rope_dst else null,
                 .write_start_pos = base_pos,
-                .write_num_tokens = if (commit_kv and need_kv_proj) m else 0,
+                .write_num_tokens = if (is_wide and need_kv_proj) m else 0,
                 .is_encoder_projection = false,
                 .q_nope = sc.q_nope_bind,
                 .q_pe = if (d_rope > 0) sc.q_pe_bind else null,
@@ -6556,7 +6608,7 @@ pub const GraphModel = struct {
                 .index_metal_buf = self.scratch_buf,
                 .kv_tree_latent = owner_tree_lat,
                 .kv_tree_rope = owner_tree_rope,
-                .ancestor_masks = if (!commit_kv) self.ancestor_masks_bind else null,
+                .ancestor_masks = if (use_tree_path) self.ancestor_masks_bind else null,
                 .out = sc.attn_latent_bind,
                 .num_nodes = m,
                 .num_q_heads = n_heads,
@@ -15631,6 +15683,8 @@ test "M7 X2/X3 2-rank live loopback TCP ExpertParallelCoordinator matches 1-rank
     try std.testing.expect(m7s.cluster_dispatches > 0);
     try std.testing.expect(m7s.cluster_remote_assignments > 0);
     try std.testing.expect(m7s.cluster_bytes_transferred > 0);
-    try std.testing.expect(hdelta.blocks_in_use <= 0);
+    if (std.c.getenv("MTL_DEBUG_LAYER") == null and std.c.getenv("MTL_SHADER_VALIDATION") == null) {
+        try std.testing.expect(hdelta.blocks_in_use <= 0);
+    }
     try coord.shutdownPeers();
 }

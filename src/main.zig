@@ -11,7 +11,7 @@ const usage =
     \\  probe             print the kernel, chip profile, Metal, NAX and Neural Engine facts of this machine
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5, M6.8 and M6.9 benchmark suites
+    \\  bench             run full M1, M2, M2.5, M3, M4, M4.5, M5, M6, M6.5, M6.8, M6.9 and M7 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
@@ -24,6 +24,13 @@ const usage =
     \\  bench-m68         run M6.8 G16 canary/Apple10, G15 wide prefill/tail-pruning A/B, C15 QoS/boundary & R9 live-RAM
     \\  bench-m69         run M6.9 C16 ChipProfile, G17 NAX metallib/fallback/demotion gates & Apple10+ Spike S8 sweep
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
+    \\  bench-m7          run M7 R7/G11 MLA+CSA2 FP4, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED+DSpark & X1-X3 cluster
+    \\                    [--bus-bandwidth-gbs F]
+    \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
+    \\                    --listen <ip:port> --amf <path> --config <path> --rank N --world-size N
+    \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
+    \\                    [--strict-tb5-rdma] [--max-requests N] [--max-tokens N] [--wired-cap-mib N]
+    \\                    [--no-verify-crc]
     \\  bench-a2          evaluate real-checkpoint A2 ANE cross-layer expert predictor recall/lead-time
     \\                    --amf <path> --config <path> --tokenizer <path> [--prompt <text>]
     \\                    [--capture-steps N] [--lookahead N] [--ane-predictor <path>] [--no-verify-crc]
@@ -36,27 +43,33 @@ const usage =
     \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--kv-retire-q8-after-chunks N]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
-    \\                    [--loop-early-exit] [--no-ane-predictor] [--no-verify-crc]
+    \\                    [--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
+    \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
+    \\                    [--strict-tb5-rdma] [--shutdown-peers] [--no-ane-predictor] [--no-verify-crc]
     \\  decode            run end-to-end native BPE encode -> greedy/stochastic .amf decode -> BPE decode
     \\                    --amf <path> --config <path> --tokenizer <path>
     \\                    --prompt <text> [--max-tokens N] [--temperature T] [--seed N] [--ignore-eos]
     \\                    [--sme-router auto|sme2|gpu] [--kv-retire-q8-after-chunks N]
     \\                    [--image <path.png>] [--vt-test-video hevc|h264]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
-    \\                    [--loop-early-exit]
+    \\                    [--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
+    \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
+    \\                    [--strict-tb5-rdma] [--shutdown-peers]
     \\                    [--cold-experts-per-layer N] [--heat-profile <path>] [--cold-slots N]
     \\                    [--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--strict-live-ram] [--ane-predictor <path>]
     \\                    [--no-ane-predictor] [--no-verify-crc]
-    \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent)
+    \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent/DSpark)
     \\                    --amf <path> --config <path> --tokenizer <path> --prompt <text>
     \\                    [--draft-amf <path> --draft-config <path>]
-    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent]
+    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark]
     \\                    [--placement auto|gpu|ane|sme2] [--kv-retire-q8-after-chunks N]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
-    \\                    [--loop-early-exit]
+    \\                    [--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
+    \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
+    \\                    [--strict-tb5-rdma] [--shutdown-peers]
     \\                    [--sme-router auto|sme2|gpu] [--pearl auto|on|off] [--pearl-min-target-ms F]
     \\                    [--ngram-nvme <path>] [--ngram-cache-pages N]
     \\                    [--max-tree-nodes N] [--max-draft-depth N] [--branch-width N]
@@ -127,6 +140,10 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM68(arena, out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m69")) {
         try runBenchM69(arena, args[2..], out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m7")) {
+        try runBenchM7(arena, args[2..], out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
+        try runPeerWorker(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-a2")) {
         try runBenchA2(arena, args[2..], out);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-decode")) {
@@ -461,9 +478,221 @@ fn parseM69Args(args: []const [:0]const u8) !M69CliFlags {
     return m69;
 }
 
+const ParsedHostPort = struct {
+    host: [4]u8,
+    port: u16,
+};
+
+fn parseHostPort(text: []const u8) !ParsedHostPort {
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.InvalidPeerAddress;
+    const host_s = text[0..colon];
+    const port_s = text[colon + 1 ..];
+    const host = aminfer.transport.parseIpv4(host_s) catch return error.InvalidPeerAddress;
+    const port = std.fmt.parseInt(u16, port_s, 10) catch return error.InvalidPeerAddress;
+    if (port == 0) return error.InvalidPeerAddress;
+    return .{ .host = host, .port = port };
+}
+
+fn parsePartitionStrategy(text: []const u8) !aminfer.expert_parallel.PartitionStrategy {
+    if (std.mem.eql(u8, text, "contiguous") or std.mem.eql(u8, text, "contiguous_by_rank")) {
+        return .contiguous_by_rank;
+    }
+    if (std.mem.eql(u8, text, "round-robin") or std.mem.eql(u8, text, "round_robin")) {
+        return .round_robin;
+    }
+    return error.InvalidPartitionStrategy;
+}
+
+fn parseClusterTransport(text: []const u8) !aminfer.transport.TransportKind {
+    if (std.mem.eql(u8, text, "auto")) return .auto;
+    if (std.mem.eql(u8, text, "tcp") or std.mem.eql(u8, text, "tb4_tcp")) return .tb4_tcp;
+    if (std.mem.eql(u8, text, "rdma") or std.mem.eql(u8, text, "tb5_rdma")) return .tb5_rdma;
+    return error.InvalidClusterTransport;
+}
+
+const M7ClusterCliFlags = struct {
+    peer_specs: [aminfer.expert_parallel.MAX_WORLD_SIZE - 1][]const u8 = undefined,
+    peer_count: usize = 0,
+    rank: u16 = 0,
+    world_size: u16 = 0,
+    partition: aminfer.expert_parallel.PartitionStrategy = .contiguous_by_rank,
+    transport_kind: aminfer.transport.TransportKind = .auto,
+    strict_tb5_rdma: bool = false,
+    shutdown_peers: bool = false,
+
+    fn hasPeers(self: M7ClusterCliFlags) bool {
+        return self.peer_count > 0;
+    }
+
+    fn effectiveTransport(self: M7ClusterCliFlags) aminfer.transport.TransportKind {
+        return if (self.strict_tb5_rdma) .tb5_rdma else self.transport_kind;
+    }
+
+    fn effectiveWorldSize(self: M7ClusterCliFlags) u16 {
+        if (self.world_size > 0) return self.world_size;
+        return @intCast(self.peer_count + 1);
+    }
+
+    fn tryParseFlag(self: *M7ClusterCliFlags, args: []const [:0]const u8, i: *usize) !bool {
+        const flag = args[i.*];
+        if (std.mem.eql(u8, flag, "--peer")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            if (self.peer_count >= self.peer_specs.len) return error.TooManyPeers;
+            // Validate peer syntax eagerly (`ip:port` or `rank=ip:port`).
+            const spec = args[i.*];
+            if (std.mem.indexOfScalar(u8, spec, '=')) |eq| {
+                _ = std.fmt.parseInt(u16, spec[0..eq], 10) catch return error.InvalidPeerAddress;
+                _ = try parseHostPort(spec[eq + 1 ..]);
+            } else {
+                _ = try parseHostPort(spec);
+            }
+            self.peer_specs[self.peer_count] = spec;
+            self.peer_count += 1;
+            return true;
+        } else if (std.mem.eql(u8, flag, "--rank")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            self.rank = try std.fmt.parseInt(u16, args[i.*], 10);
+            return true;
+        } else if (std.mem.eql(u8, flag, "--world-size")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            const ws = try std.fmt.parseInt(u16, args[i.*], 10);
+            if (ws == 0 or ws > aminfer.expert_parallel.MAX_WORLD_SIZE) return error.InvalidWorldSize;
+            self.world_size = ws;
+            return true;
+        } else if (std.mem.eql(u8, flag, "--partition")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            self.partition = try parsePartitionStrategy(args[i.*]);
+            return true;
+        } else if (std.mem.eql(u8, flag, "--cluster-transport")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            self.transport_kind = try parseClusterTransport(args[i.*]);
+            return true;
+        } else if (std.mem.eql(u8, flag, "--strict-tb5-rdma")) {
+            self.strict_tb5_rdma = true;
+            return true;
+        } else if (std.mem.eql(u8, flag, "--shutdown-peers")) {
+            self.shutdown_peers = true;
+            return true;
+        }
+        return false;
+    }
+
+    fn resolveEndpoints(self: *const M7ClusterCliFlags, out_buf: *[aminfer.expert_parallel.MAX_WORLD_SIZE - 1]aminfer.expert_parallel.PeerEndpoint) ![]const aminfer.expert_parallel.PeerEndpoint {
+        const ws = self.effectiveWorldSize();
+        if (self.rank >= ws) return error.InvalidRank;
+        if (self.peer_count != ws - 1) return error.PeerCountMismatch;
+        var next_rank: u16 = 0;
+        for (0..self.peer_count) |idx| {
+            const spec = self.peer_specs[idx];
+            if (std.mem.indexOfScalar(u8, spec, '=')) |eq| {
+                const r = std.fmt.parseInt(u16, spec[0..eq], 10) catch return error.InvalidPeerAddress;
+                const hp = try parseHostPort(spec[eq + 1 ..]);
+                out_buf[idx] = .{ .rank = r, .host = hp.host, .port = hp.port };
+            } else {
+                if (next_rank == self.rank) next_rank += 1;
+                const hp = try parseHostPort(spec);
+                out_buf[idx] = .{ .rank = next_rank, .host = hp.host, .port = hp.port };
+                next_rank += 1;
+            }
+        }
+        return out_buf[0..self.peer_count];
+    }
+};
+
+const ClusterCoordinatorCtx = struct {
+    store: aminfer.graph.LoadedCpuMoeStore,
+    coordinator: aminfer.expert_parallel.ExpertParallelCoordinator,
+    shutdown_peers: bool,
+
+    fn initAlloc(
+        allocator: std.mem.Allocator,
+        amf_path: [:0]const u8,
+        gcfg: aminfer.graph.GraphConfig,
+        m7: M7ClusterCliFlags,
+        max_tokens: u16,
+        budget_override: ?aminfer.budget.Budget,
+    ) !*ClusterCoordinatorCtx {
+        var ep_buf: [aminfer.expert_parallel.MAX_WORLD_SIZE - 1]aminfer.expert_parallel.PeerEndpoint = undefined;
+        const peers = try m7.resolveEndpoints(&ep_buf);
+        const ws = m7.effectiveWorldSize();
+        const plan = try aminfer.expert_parallel.ExpertPartitionPlan.init(
+            ws,
+            m7.rank,
+            @intCast(gcfg.num_hidden_layers),
+            @intCast(gcfg.num_experts),
+            m7.partition,
+        );
+        const ctx = try allocator.create(ClusterCoordinatorCtx);
+        errdefer allocator.destroy(ctx);
+        ctx.store = try aminfer.graph.LoadedCpuMoeStore.loadFromFile(allocator, amf_path, gcfg, plan, budget_override);
+        errdefer ctx.store.deinit(allocator);
+        const top_k_cap: u32 = @max(gcfg.num_experts_per_tok, @max(gcfg.encoder_moe_top_k, gcfg.decoder_moe_top_k));
+        ctx.coordinator = try aminfer.expert_parallel.ExpertParallelCoordinator.init(.{
+            .plan = plan,
+            .peers = peers,
+            .hidden_size = gcfg.hidden_size,
+            .max_tokens = max_tokens,
+            .max_assignments = @as(u32, max_tokens) * @max(@as(u32, 1), top_k_cap),
+            .local_backend = ctx.store.backend(),
+            .transport_kind = m7.effectiveTransport(),
+        });
+        ctx.shutdown_peers = m7.shutdown_peers;
+        return ctx;
+    }
+
+    fn deinit(self: *ClusterCoordinatorCtx, allocator: std.mem.Allocator) void {
+        if (self.shutdown_peers) {
+            self.coordinator.shutdownPeers() catch |err| {
+                std.debug.print("warning: cluster peer shutdown failed: {s}\n", .{@errorName(err)});
+            };
+        }
+        self.coordinator.deinit();
+        self.store.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+fn transportKindLabel(k: aminfer.transport.TransportKind) []const u8 {
+    return switch (k) {
+        .auto => "auto",
+        .tb4_tcp => "tb4_tcp",
+        .tb5_rdma => "tb5_rdma",
+    };
+}
+
+fn partitionLabel(p: aminfer.expert_parallel.PartitionStrategy) []const u8 {
+    return switch (p) {
+        .contiguous_by_rank => "contiguous",
+        .round_robin => "round-robin",
+    };
+}
+
+fn resolveDSparkPathAlloc(
+    allocator: std.mem.Allocator,
+    draft_amf_override: ?[:0]const u8,
+    config_path: []const u8,
+    gcfg: *const aminfer.graph.GraphConfig,
+) ![:0]u8 {
+    if (draft_amf_override) |p| {
+        return std.fmt.allocPrintSentinel(allocator, "{s}", .{p}, 0);
+    }
+    const fname: []const u8 = if (gcfg.dspark_amf_file) |f| (if (f.len > 0) f else "dspark.amf") else "dspark.amf";
+    if (std.fs.path.isAbsolute(fname)) {
+        return std.fmt.allocPrintSentinel(allocator, "{s}", .{fname}, 0);
+    }
+    const dir = std.fs.path.dirname(config_path) orelse ".";
+    return std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, fname }, 0);
+}
+
 fn shouldUseGraphModel(
     cfg_bytes: []const u8,
     m6: M6GraphCliFlags,
+    m7: M7ClusterCliFlags,
     draft_mode: ?aminfer.draft.DraftMode,
 ) bool {
     if (aminfer.graph.GraphConfig.isGraphConfigJson(cfg_bytes)) return true;
@@ -473,8 +702,9 @@ fn shouldUseGraphModel(
     if (m6.max_loops) |ml| {
         if (ml > 1) return true;
     }
+    if (m7.hasPeers()) return true;
     if (draft_mode) |dm| {
-        if (dm == .self_recurrent) return true;
+        if (dm == .self_recurrent or dm == .dspark) return true;
     }
     return false;
 }
@@ -571,6 +801,7 @@ const DecodeCliArgs = struct {
     vt_test_video: ?aminfer.metal.VtCodec = null,
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
+    m7: M7ClusterCliFlags = .{},
 };
 
 fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
@@ -599,11 +830,13 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var vt_test_video: ?aminfer.metal.VtCodec = null;
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
+    var m7: M7ClusterCliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
         if (try m69.tryParseFlag(args, &i)) continue;
+        if (try m7.tryParseFlag(args, &i)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf")) {
             i += 1;
@@ -721,6 +954,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .vt_test_video = vt_test_video,
         .m6 = m6,
         .m69 = m69,
+        .m7 = m7,
     };
 }
 
@@ -744,6 +978,7 @@ const BenchDecodeCliArgs = struct {
     kv_retire_q8_after_chunks: u32 = 0,
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
+    m7: M7ClusterCliFlags = .{},
 };
 
 fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
@@ -766,11 +1001,13 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
     var kv_retire_q8_after_chunks: u32 = 0;
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
+    var m7: M7ClusterCliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
         if (try m69.tryParseFlag(args, &i)) continue;
+        if (try m7.tryParseFlag(args, &i)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf")) {
             i += 1;
@@ -859,6 +1096,7 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
         .m6 = m6,
         .m69 = m69,
+        .m7 = m7,
     };
 }
 
@@ -991,6 +1229,22 @@ fn runDecodeGraph(
     const max_seq_len: u32 = @min(gcfg.max_position_embeddings, @max(@as(u32, 512), needed_seq));
     const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
 
+    if (!cli.m7.hasPeers() and cli.m7.effectiveTransport() == .tb5_rdma) {
+        _ = try aminfer.transport.selectTransport(.tb5_rdma);
+    }
+    const cluster_ctx: ?*ClusterCoordinatorCtx = if (cli.m7.hasPeers())
+        try ClusterCoordinatorCtx.initAlloc(
+            allocator,
+            cli.amf_path,
+            gcfg,
+            cli.m7,
+            @intCast(@min(@as(usize, 1024), @max(prompt_ids.len, @as(usize, 64)))),
+            budget_override,
+        )
+    else
+        null;
+    defer if (cluster_ctx) |cc| cc.deinit(allocator);
+
     var model = try aminfer.graph.GraphModel.loadFromFile(allocator, cli.amf_path, gcfg, .{
         .max_seq_len = max_seq_len,
         .max_tree_nodes = if (cli.gpu_prefill_mode == .tree64) 64 else 16,
@@ -1006,6 +1260,7 @@ fn runDecodeGraph(
         .prefill_backend_mode = cli.m69.prefill_backend_mode,
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+        .cluster_coordinator = if (cluster_ctx) |cc| &cc.coordinator else null,
     });
     defer model.deinit(allocator);
 
@@ -1158,6 +1413,44 @@ fn runDecodeGraph(
         aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
     });
     try writeLoopIsolationStats("decode", model.loopIsolationStats(), out);
+    const m7_stats = model.m7Stats();
+    if (gcfg.axes.backbone_kind == .causal_enc_dec or cluster_ctx != null) {
+        try out.print(
+            \\decode.m7.enc_prefill_dispatches {d}
+            \\decode.m7.enc_decode_dispatches  {d}
+            \\decode.m7.dec_decode_dispatches  {d}
+            \\
+        , .{
+            m7_stats.encoder_layer_dispatches_prefill,
+            m7_stats.encoder_layer_dispatches_decode,
+            m7_stats.decoder_layer_dispatches_decode,
+        });
+    }
+    if (cluster_ctx) |cc| {
+        const avg_rpc_us: f64 = if (m7_stats.cluster_dispatches > 0)
+            (@as(f64, @floatFromInt(m7_stats.cluster_remote_rpc_ns)) / @as(f64, @floatFromInt(m7_stats.cluster_dispatches))) / 1000.0
+        else
+            0.0;
+        try out.print(
+            \\decode.cluster.world_size        {d} (rank={d}, partition={s})
+            \\decode.cluster.transport         {s} (rdma_reason={s})
+            \\decode.cluster.dispatches        {d} (local={d}, remote={d})
+            \\decode.cluster.rpc_us            {d:.2}
+            \\decode.cluster.bytes_transferred {d}
+            \\
+        , .{
+            cc.coordinator.config.plan.world_size,
+            cc.coordinator.config.plan.local_rank,
+            partitionLabel(cc.coordinator.config.plan.strategy),
+            transportKindLabel(cc.coordinator.resolved_transport.kind),
+            cc.coordinator.resolved_transport.probe.reason,
+            m7_stats.cluster_dispatches,
+            m7_stats.cluster_local_assignments,
+            m7_stats.cluster_remote_assignments,
+            avg_rpc_us,
+            m7_stats.cluster_bytes_transferred,
+        });
+    }
     if (model.pleStats()) |ps| {
         try out.print(
             \\decode.ple_nvme_reads            {d}
@@ -1216,7 +1509,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
 
     const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
     defer allocator.free(cfg_bytes);
-    if (shouldUseGraphModel(cfg_bytes, cli.m6, null)) {
+    if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, null)) {
         return runDecodeGraph(allocator, cli, cfg_bytes, out);
     }
     if (cli.image_path != null or cli.vt_test_video != null) {
@@ -1423,11 +1716,26 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
     defer allocator.free(cfg_bytes);
     const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
     const max_seq_len: u32 = @max(@as(u32, 576), cli.prefill_tokens + 64);
-    if (shouldUseGraphModel(cfg_bytes, cli.m6, null)) {
+    if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, null)) {
         var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
         defer gcfg.deinit(allocator);
         const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path, &gcfg);
         defer freePlePaths(allocator, ple_paths);
+        if (!cli.m7.hasPeers() and cli.m7.effectiveTransport() == .tb5_rdma) {
+            _ = try aminfer.transport.selectTransport(.tb5_rdma);
+        }
+        const cluster_ctx: ?*ClusterCoordinatorCtx = if (cli.m7.hasPeers())
+            try ClusterCoordinatorCtx.initAlloc(
+                allocator,
+                cli.amf_path,
+                gcfg,
+                cli.m7,
+                @intCast(@min(@as(u32, 1024), @max(cli.prefill_tokens, @as(u32, 64)))),
+                budget_override,
+            )
+        else
+            null;
+        defer if (cluster_ctx) |cc| cc.deinit(allocator);
         const res = try aminfer.bench.runGraphDecodeBenchFromFile(allocator, cli.amf_path, gcfg, .{
             .prefill_tokens = cli.prefill_tokens,
             .decode_steps = cli.decode_steps,
@@ -1444,8 +1752,23 @@ fn runBenchDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, 
             .prefill_backend_mode = cli.m69.prefill_backend_mode,
             .strict_nax = cli.m69.strict_nax,
             .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+            .cluster_coordinator = if (cluster_ctx) |cc| &cc.coordinator else null,
         });
         try res.write(out);
+        if (cluster_ctx) |cc| {
+            try out.print(
+                \\graph_bench.cluster.world_size   {d} (rank={d}, transport={s})
+                \\graph_bench.cluster.dispatches   {d} (remote_assignments={d}, bytes={d})
+                \\
+            , .{
+                cc.coordinator.config.plan.world_size,
+                cc.coordinator.config.plan.local_rank,
+                transportKindLabel(cc.coordinator.resolved_transport.kind),
+                cc.coordinator.total_dispatches,
+                cc.coordinator.total_remote_assignments,
+                cc.coordinator.total_bytes_transferred,
+            });
+        }
         return;
     }
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
@@ -1548,6 +1871,211 @@ fn runBenchM69(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
     try report.write(out);
 }
 
+fn runBenchM7(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseM69Args(raw_args);
+    const report = try aminfer.bench.runM7WithConfig(allocator, .{
+        .bus_bandwidth_gbs_override = cli.bus_bandwidth_gbs,
+    });
+    try report.write(out);
+}
+
+const PeerWorkerCliArgs = struct {
+    host: [4]u8,
+    port: u16,
+    amf_path: [:0]const u8,
+    config_path: [:0]const u8,
+    rank: u16,
+    world_size: u16,
+    partition: aminfer.expert_parallel.PartitionStrategy = .contiguous_by_rank,
+    transport_kind: aminfer.transport.TransportKind = .auto,
+    strict_tb5_rdma: bool = false,
+    max_requests: u32 = 0,
+    max_tokens: u16 = 64,
+    wired_cap_mib: ?u64 = null,
+    verify_crcs: bool = true,
+};
+
+fn parsePeerWorkerArgs(args: []const [:0]const u8) !PeerWorkerCliArgs {
+    var listen: ?ParsedHostPort = null;
+    var amf_path: ?[:0]const u8 = null;
+    var config_path: ?[:0]const u8 = null;
+    var rank: ?u16 = null;
+    var world_size: ?u16 = null;
+    var partition: aminfer.expert_parallel.PartitionStrategy = .contiguous_by_rank;
+    var transport_kind: aminfer.transport.TransportKind = .auto;
+    var strict_tb5_rdma = false;
+    var max_requests: u32 = 0;
+    var max_tokens: u16 = 64;
+    var wired_cap_mib: ?u64 = null;
+    var verify_crcs = true;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const flag = args[i];
+        if (std.mem.eql(u8, flag, "--listen")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            listen = try parseHostPort(args[i]);
+        } else if (std.mem.eql(u8, flag, "--amf")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            amf_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--config")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            config_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--rank")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            rank = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--world-size")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            const ws = try std.fmt.parseInt(u16, args[i], 10);
+            if (ws == 0 or ws > aminfer.expert_parallel.MAX_WORLD_SIZE) return error.InvalidWorldSize;
+            world_size = ws;
+        } else if (std.mem.eql(u8, flag, "--partition")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            partition = try parsePartitionStrategy(args[i]);
+        } else if (std.mem.eql(u8, flag, "--cluster-transport")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            transport_kind = try parseClusterTransport(args[i]);
+        } else if (std.mem.eql(u8, flag, "--strict-tb5-rdma")) {
+            strict_tb5_rdma = true;
+        } else if (std.mem.eql(u8, flag, "--max-requests")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            max_requests = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--max-tokens")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            const mt = try std.fmt.parseInt(u16, args[i], 10);
+            if (mt == 0) return error.InvalidFlagValue;
+            max_tokens = mt;
+        } else if (std.mem.eql(u8, flag, "--wired-cap-mib")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--no-verify-crc")) {
+            verify_crcs = false;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+
+    const hp = listen orelse return error.MissingRequiredFlag;
+    const r = rank orelse return error.MissingRequiredFlag;
+    const ws = world_size orelse return error.MissingRequiredFlag;
+    if (r >= ws) return error.InvalidRank;
+
+    return .{
+        .host = hp.host,
+        .port = hp.port,
+        .amf_path = amf_path orelse return error.MissingRequiredFlag,
+        .config_path = config_path orelse return error.MissingRequiredFlag,
+        .rank = r,
+        .world_size = ws,
+        .partition = partition,
+        .transport_kind = transport_kind,
+        .strict_tb5_rdma = strict_tb5_rdma,
+        .max_requests = max_requests,
+        .max_tokens = max_tokens,
+        .wired_cap_mib = wired_cap_mib,
+        .verify_crcs = verify_crcs,
+    };
+}
+
+fn runPeerWorker(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parsePeerWorkerArgs(raw_args);
+    const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
+    defer allocator.free(cfg_bytes);
+    var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
+    defer gcfg.deinit(allocator);
+
+    const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
+    const plan = try aminfer.expert_parallel.ExpertPartitionPlan.init(
+        cli.world_size,
+        cli.rank,
+        @intCast(gcfg.num_hidden_layers),
+        @intCast(gcfg.num_experts),
+        cli.partition,
+    );
+    var store = try aminfer.graph.LoadedCpuMoeStore.loadFromFile(
+        allocator,
+        cli.amf_path,
+        gcfg,
+        plan,
+        budget_override,
+    );
+    defer store.deinit(allocator);
+
+    const eff_transport: aminfer.transport.TransportKind = if (cli.strict_tb5_rdma) .tb5_rdma else cli.transport_kind;
+    const top_k_cap: u32 = @max(gcfg.num_experts_per_tok, @max(gcfg.encoder_moe_top_k, gcfg.decoder_moe_top_k));
+    var server = try aminfer.expert_parallel.PeerWorkerServer.init(.{
+        .host = cli.host,
+        .port = cli.port,
+        .transport_kind = eff_transport,
+        .plan = plan,
+        .hidden_size = gcfg.hidden_size,
+        .max_tokens = cli.max_tokens,
+        .max_assignments = @as(u32, cli.max_tokens) * @max(@as(u32, 1), top_k_cap),
+        .max_requests = cli.max_requests,
+        .backend = store.backend(),
+    });
+    defer server.deinit();
+
+    const range = try plan.rankExpertRange(cli.rank);
+    const vm_before = try aminfer.vmstat.Snapshot.capture();
+    try out.print(
+        \\peer_worker.listen               {d}.{d}.{d}.{d}:{d}
+        \\peer_worker.rank                 {d}/{d} (partition={s})
+        \\peer_worker.local_experts        {d}..{d} (of {d}, layers={d})
+        \\peer_worker.transport            {s} (rdma_reason={s})
+        \\peer_worker.max_requests         {d}
+        \\peer_worker.status               ready
+        \\
+    , .{
+        cli.host[0],
+        cli.host[1],
+        cli.host[2],
+        cli.host[3],
+        server.boundPort(),
+        cli.rank,
+        cli.world_size,
+        partitionLabel(cli.partition),
+        range.start,
+        range.end,
+        gcfg.num_experts,
+        gcfg.num_hidden_layers,
+        transportKindLabel(server.resolved_transport.kind),
+        server.resolved_transport.probe.reason,
+        cli.max_requests,
+    });
+    try out.flush();
+
+    server.run();
+
+    const vm_after = try aminfer.vmstat.Snapshot.capture();
+    try aminfer.vmstat.checkNoSwap(vm_before, vm_after);
+    const st = server.stats();
+    try out.print(
+        \\peer_worker.requests_served      {d}
+        \\peer_worker.assignments_eval     {d}
+        \\peer_worker.bytes_rx             {d}
+        \\peer_worker.bytes_tx             {d}
+        \\peer_worker.swapouts_delta       {d}
+        \\
+    , .{
+        st.requests_served,
+        st.assignments_evaluated,
+        st.bytes_rx,
+        st.bytes_tx,
+        aminfer.vmstat.Snapshot.swapoutDelta(vm_before, vm_after),
+    });
+}
+
 fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM1(allocator, out);
     try out.flush();
@@ -1570,6 +2098,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM68(allocator, out);
     try out.flush();
     try runBenchM69(allocator, &.{}, out);
+    try out.flush();
+    try runBenchM7(allocator, &.{}, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -1609,6 +2139,7 @@ const SpecDecodeCliArgs = struct {
     kv_retire_q8_after_chunks: u32 = 0,
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
+    m7: M7ClusterCliFlags = .{},
 };
 
 fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
@@ -1648,11 +2179,13 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var kv_retire_q8_after_chunks: u32 = 0;
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
+    var m7: M7ClusterCliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
         if (try m69.tryParseFlag(args, &i)) continue;
+        if (try m7.tryParseFlag(args, &i)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf")) {
             i += 1;
@@ -1824,6 +2357,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
         .m6 = m6,
         .m69 = m69,
+        .m7 = m7,
     };
 }
 
@@ -1851,21 +2385,27 @@ fn runSpecDecodeGraph(
 
     var draft_cfg_opt: ?aminfer.draft.DraftConfig = null;
     var mode: aminfer.draft.DraftMode = cli.draft_mode orelse blk: {
+        const has_dspark_file = if (gcfg.dspark_amf_file) |f| f.len > 0 else false;
+        if (gcfg.axes.backbone_kind == .causal_enc_dec and (cli.draft_amf_path != null or has_dspark_file)) {
+            break :blk .dspark;
+        }
         if (cli.draft_amf_path == null and gcfg.axes.loop_schedule.isRecurrent()) break :blk .self_recurrent;
         break :blk .l1_only;
     };
 
     if (cli.draft_config_path) |dc_path| {
-        const dcfg_bytes = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
-        defer allocator.free(dcfg_bytes);
-        draft_cfg_opt = try aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes);
-        if (cli.draft_mode == null) {
-            mode = draft_cfg_opt.?.format;
-        } else {
-            draft_cfg_opt.?.format = mode;
+        if (mode != .dspark) {
+            const dcfg_bytes = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
+            defer allocator.free(dcfg_bytes);
+            draft_cfg_opt = try aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes);
+            if (cli.draft_mode == null) {
+                mode = draft_cfg_opt.?.format;
+            } else {
+                draft_cfg_opt.?.format = mode;
+            }
         }
     }
-    if (mode != .l1_only and mode != .self_recurrent) {
+    if (mode != .l1_only and mode != .self_recurrent and mode != .dspark) {
         if (cli.draft_amf_path == null or draft_cfg_opt == null) return error.MissingRequiredFlag;
         draft_cfg_opt.?.format = mode;
     }
@@ -1881,7 +2421,23 @@ fn runSpecDecodeGraph(
         @as(u32, cli.max_tree_nodes);
     const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
     const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc| dc.aux_layer_ids else null;
-    const needs_taps = (mode != .l1_only and mode != .self_recurrent);
+    const needs_taps = (mode != .l1_only and mode != .self_recurrent and mode != .dspark);
+
+    if (!cli.m7.hasPeers() and cli.m7.effectiveTransport() == .tb5_rdma) {
+        _ = try aminfer.transport.selectTransport(.tb5_rdma);
+    }
+    const cluster_ctx: ?*ClusterCoordinatorCtx = if (cli.m7.hasPeers())
+        try ClusterCoordinatorCtx.initAlloc(
+            allocator,
+            cli.amf_path,
+            gcfg,
+            cli.m7,
+            @intCast(@min(@as(usize, 1024), @max(prompt_ids.len, @as(usize, target_tree_cap)))),
+            budget_override,
+        )
+    else
+        null;
+    defer if (cluster_ctx) |cc| cc.deinit(allocator);
 
     var model = try aminfer.graph.GraphModel.loadFromFile(allocator, cli.amf_path, gcfg, .{
         .max_seq_len = max_seq_len,
@@ -1900,6 +2456,7 @@ fn runSpecDecodeGraph(
         .prefill_backend_mode = cli.m69.prefill_backend_mode,
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+        .cluster_coordinator = if (cluster_ctx) |cc| &cc.coordinator else null,
     });
     defer model.deinit(allocator);
 
@@ -1922,6 +2479,20 @@ fn runSpecDecodeGraph(
         draft_head_ptr = &draft_head_storage;
     }
 
+    var dspark_loaded: ?*aminfer.engine.LoadedDSparkProposer = null;
+    defer if (dspark_loaded) |dp| dp.deinit(allocator);
+    if (mode == .dspark) {
+        const dspark_path = try resolveDSparkPathAlloc(allocator, cli.draft_amf_path, cli.config_path, &gcfg);
+        defer allocator.free(dspark_path);
+        dspark_loaded = try aminfer.engine.LoadedDSparkProposer.loadFromFile(
+            allocator,
+            &model,
+            dspark_path,
+            null,
+            budget_override,
+        );
+    }
+
     var ngram_tbl_storage: aminfer.ngram_nvme.NvmeNgramTable = undefined;
     var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
     defer if (ngram_tbl_ptr) |nt| nt.deinit(allocator);
@@ -1940,7 +2511,7 @@ fn runSpecDecodeGraph(
         ngram_tbl_ptr = &ngram_tbl_storage;
     }
 
-    var eng = try aminfer.engine.SpecEngine.initWithGraph(allocator, &model, draft_head_ptr, .{
+    const eng_opts: aminfer.engine.SpecConfig = .{
         .mode = mode,
         .placement = cli.placement,
         .max_tree_nodes = cli.max_tree_nodes,
@@ -1952,7 +2523,11 @@ fn runSpecDecodeGraph(
         .pearl_mode = cli.pearl_mode,
         .pearl_min_target_us = cli.pearl_min_target_ms * 1000.0,
         .ngram_table = ngram_tbl_ptr,
-    });
+    };
+    var eng = if (dspark_loaded) |dp|
+        try aminfer.engine.SpecEngine.initWithDSpark(allocator, &model, &dp.proposer, eng_opts)
+    else
+        try aminfer.engine.SpecEngine.initWithGraph(allocator, &model, draft_head_ptr, eng_opts);
     defer eng.deinit(allocator);
 
     const generated = try allocator.alloc(u32, cli.max_tokens);
@@ -2086,6 +2661,19 @@ fn runSpecDecodeGraph(
         aminfer.vmstat.Snapshot.swapoutDelta(decode_vm_before, vm_after),
     });
     try writeLoopIsolationStats("spec", model.loopIsolationStats(), out);
+    if (gcfg.axes.backbone_kind == .causal_enc_dec or cluster_ctx != null) {
+        const m7_stats = model.m7Stats();
+        try out.print(
+            \\spec.m7.enc_prefill_dispatches   {d}
+            \\spec.m7.enc_decode_dispatches    {d}
+            \\spec.m7.dec_decode_dispatches    {d}
+            \\
+        , .{
+            m7_stats.encoder_layer_dispatches_prefill,
+            m7_stats.encoder_layer_dispatches_decode,
+            m7_stats.decoder_layer_dispatches_decode,
+        });
+    }
     if (model.pleStats()) |ps| {
         try out.print(
             \\spec.ple_nvme_reads              {d}
@@ -2119,7 +2707,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
 
     const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
     defer allocator.free(cfg_bytes);
-    if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.draft_mode)) {
+    if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, cli.draft_mode)) {
         return runSpecDecodeGraph(allocator, cli, cfg_bytes, out);
     }
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
@@ -3820,7 +4408,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
 
     const cfg_bytes = try readFileAllocPosix(allocator, cli.config_path, 4 * 1024 * 1024);
     defer allocator.free(cfg_bytes);
-    if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.draft_mode)) {
+    if (shouldUseGraphModel(cfg_bytes, cli.m6, .{}, cli.draft_mode)) {
         return runServeGraph(allocator, cli, host_ipv4, cfg_bytes, out);
     }
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
@@ -4957,4 +5545,83 @@ test "M6.9 CLI parsers handle --prefill-matmul-backend, --strict-nax, and --bus-
         "--bus-bandwidth-gbs", "-120.0",
     }));
     try std.testing.expectError(error.UnknownFlag, parseM69Args(&.{"--unknown"}));
+}
+
+test "M7 CLI parsers handle peer-worker, --peer/--rank/--world-size/--partition/--cluster-transport/--strict-tb5-rdma, and --draft-mode dspark" {
+    const pw = try parsePeerWorkerArgs(&.{
+        "--listen",            "127.0.0.1:19410",
+        "--amf",               "model.amf",
+        "--config",            "config.json",
+        "--rank",              "1",
+        "--world-size",        "2",
+        "--partition",         "round-robin",
+        "--cluster-transport", "tcp",
+        "--max-requests",      "12",
+    });
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, pw.host);
+    try std.testing.expectEqual(@as(u16, 19410), pw.port);
+    try std.testing.expectEqual(@as(u16, 1), pw.rank);
+    try std.testing.expectEqual(@as(u16, 2), pw.world_size);
+    try std.testing.expectEqual(aminfer.expert_parallel.PartitionStrategy.round_robin, pw.partition);
+    try std.testing.expectEqual(aminfer.transport.TransportKind.tb4_tcp, pw.transport_kind);
+    try std.testing.expectEqual(@as(u32, 12), pw.max_requests);
+
+    const dec = try parseDecodeArgs(&.{
+        "--amf",               "model.amf",
+        "--config",            "config.json",
+        "--tokenizer",         "tok.json",
+        "--peer",              "127.0.0.1:19410",
+        "--peer",              "127.0.0.1:19411",
+        "--rank",              "0",
+        "--world-size",        "3",
+        "--partition",         "contiguous",
+        "--cluster-transport", "auto",
+        "--shutdown-peers",
+    });
+    try std.testing.expect(dec.m7.hasPeers());
+    try std.testing.expectEqual(@as(u16, 3), dec.m7.effectiveWorldSize());
+    try std.testing.expect(dec.m7.shutdown_peers);
+    var ep_buf: [aminfer.expert_parallel.MAX_WORLD_SIZE - 1]aminfer.expert_parallel.PeerEndpoint = undefined;
+    const eps = try dec.m7.resolveEndpoints(&ep_buf);
+    try std.testing.expectEqual(@as(usize, 2), eps.len);
+    try std.testing.expectEqual(@as(u16, 1), eps[0].rank);
+    try std.testing.expectEqual(@as(u16, 19410), eps[0].port);
+    try std.testing.expectEqual(@as(u16, 2), eps[1].rank);
+    try std.testing.expectEqual(@as(u16, 19411), eps[1].port);
+
+    const spec = try parseSpecDecodeArgs(&.{
+        "--amf",             "model.amf",
+        "--config",          "config.json",
+        "--tokenizer",       "tok.json",
+        "--draft-mode",      "dspark",
+        "--strict-tb5-rdma",
+    });
+    try std.testing.expectEqual(aminfer.draft.DraftMode.dspark, spec.draft_mode.?);
+    try std.testing.expectEqual(aminfer.transport.TransportKind.tb5_rdma, spec.m7.effectiveTransport());
+
+    const bdec = try parseBenchDecodeArgs(&.{
+        "--amf",        "model.amf",
+        "--config",     "config.json",
+        "--peer",       "1=127.0.0.1:19412",
+        "--world-size", "2",
+    });
+    try std.testing.expect(bdec.m7.hasPeers());
+    const eps_b = try bdec.m7.resolveEndpoints(&ep_buf);
+    try std.testing.expectEqual(@as(u16, 1), eps_b[0].rank);
+    try std.testing.expectEqual(@as(u16, 19412), eps_b[0].port);
+
+    try std.testing.expectError(error.InvalidPeerAddress, parsePeerWorkerArgs(&.{
+        "--listen",     "not-an-ip",
+        "--amf",        "m.amf",
+        "--config",     "c.json",
+        "--rank",       "1",
+        "--world-size", "2",
+    }));
+    try std.testing.expectError(error.InvalidRank, parsePeerWorkerArgs(&.{
+        "--listen",     "127.0.0.1:9000",
+        "--amf",        "m.amf",
+        "--config",     "c.json",
+        "--rank",       "2",
+        "--world-size", "2",
+    }));
 }

@@ -558,6 +558,8 @@ pub const PeerWorkerConfig = struct {
     max_tokens: u16 = 64,
     max_assignments: u32 = 1024,
     max_clients: u16 = 4,
+    /// Optional request cap (`0` = unlimited until `stop()` or `shutdown` frame).
+    max_requests: u32 = 0,
     timeout_ms: u32 = transport.DEFAULT_TIMEOUT_MS,
     backend: ExpertEvalBackend,
     /// Optional `16 KiB`-aligned slice carved from an external `WiredArena`.
@@ -853,6 +855,9 @@ pub const PeerWorkerServer = struct {
             .complete => |n| {
                 if (n > 0) _ = self.stat_bytes_tx.fetchAdd(n, .monotonic);
                 self.disarmWrite(idx);
+                if (self.config.max_requests > 0 and self.stat_requests_served.load(.acquire) >= self.config.max_requests) {
+                    self.stop_requested.store(true, .release);
+                }
             },
             .would_block => |n| {
                 if (n > 0) _ = self.stat_bytes_tx.fetchAdd(n, .monotonic);
@@ -885,6 +890,7 @@ pub const PeerWorkerServer = struct {
                     self.slots[idx].chan.resetRx();
                     if (self.slots[idx].chan.hasPendingTx()) {
                         self.driveClientWrite(idx);
+                        if (self.stop_requested.load(.acquire)) return;
                     }
                 },
             }
