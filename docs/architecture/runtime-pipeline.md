@@ -23,12 +23,20 @@
      calling, bounded wired-slot `previous_response_id` chaining and
      `GET`/`DELETE`/`cancel` on `/v1/responses/{id}`, Anthropic `system`
      `cache_control` / `thinking` `budget_tokens` + `POST /v1/messages/count_tokens`,
-     shared sampling, zero-alloc streaming stop holdback, and `json_schema`
-     structured outputs), an outward plain-C shared library (`libaminfer.dylib`
-     + `include/aminfer.h`) with a zero-dependency Python `ctypes` SDK (`C17`,
-     preserving [ADR-0001](../decisions/0001-language-and-toolchain-boundaries.md)),
-     and the rootless `aminfer monitor` terminal TUI (`C19`, default
-     `trans-pride` palette + `btop` `.theme` support and `--server` live attach).
+     shared sampling, zero-alloc streaming stop holdback, constant-time
+     `--api-key` auth, and `AF_UNIX` `--unix-socket`), a preallocated
+     `json_schema`/GBNF token-bitmask engine compatible with `G5`/`D9`
+     speculative tree verification (`C22`), native `/v1/embeddings` and
+     `/v1/rerank` (`C21`), runtime multi-LoRA `"<base>:<adapter>"` routing over
+     one shared wired base `.amf` (`W19`), opt-in `--disk-prefix-cache` NVMe
+     KV/GDN persistence (`R10`), self-contained single-file `.amf` metadata
+     with `aminfer ls`/`inspect` (`W18`), a plain scrolling `aminfer chat` CLI
+     REPL + `stdin` pipe (`C20`), an outward plain-C shared library
+     (`libaminfer.dylib` + `include/aminfer.h`) with a zero-dependency Python
+     `ctypes` SDK (`C17`, preserving
+     [ADR-0001](../decisions/0001-language-and-toolchain-boundaries.md)), and
+     the rootless `aminfer monitor` terminal TUI (`C19`, default `trans-pride`
+     palette + `btop` `.theme` support and `--server` live attach).
    - On request admission, when `temperature > 0` and `"seed"` is omitted, one
      64-bit seed is drawn from Apple Silicon's Secure Enclave TRNG-backed kernel
      CSPRNG (`getentropy`) to initialize that request slot's dedicated 32-byte

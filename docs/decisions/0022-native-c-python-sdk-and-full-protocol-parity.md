@@ -43,8 +43,11 @@ adoption on single-node and clustered Apple Silicon hosts:
    immediate rootless visibility using native macOS Mach, IOKit, and Foundation
    APIs.
 
-The user confirmed codifying `C17`, `C18`, and `C19` into **Milestone M7.5**
-([../status.md](../status.md), [../process.md](../process.md)).
+The user confirmed codifying `C17`, `C18`, `C19`, `W18`, `C20`, `C21`, `C22`,
+`W19`, and `R10` into **Milestone M7.5** ([../status.md](../status.md),
+[../process.md](../process.md)), explicitly excluding audio/speech ingress from
+this milestone and keeping `aminfer chat` (`C20`) as a plain scrolling CLI REPL
+rather than a full-screen TUI.
 
 ## Decision
 
@@ -117,15 +120,20 @@ and usage-accounting layer:
      `message_start` through `message_stop` SSE lifecycle.
    - Add `POST /v1/messages/count_tokens` backed directly by the native Zig BPE
      tokenizer (`W5`) with zero Python execution.
-4. **Shared sampling, stop-sequence holdback, structured outputs, and telemetry:**
+4. **Shared sampling, stop-sequence holdback, structured outputs, security, IPC, and telemetry:**
    - Support `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`,
      `repetition_penalty`, `logit_bias`, `logprobs` / `top_logprobs`, and
      `max_tokens` / `max_completion_tokens` / `max_output_tokens`.
    - Implement a zero-allocation streaming `stop` / `stop_sequences` prefix
      holdback ring so partial stop-string prefixes are buffered until
      disambiguated and matched stop sequences are never leaked to SSE clients.
-   - Support `json_object` and `json_schema` constrained structured output
-     decoding via preallocated finite-state / grammar logit masks.
+   - Delegate `json_object`, `json_schema` (`strict: true`), and strict
+     OpenAI/Anthropic tool-call schemas to the preallocated P-core grammar
+     bitmask engine (`C22`).
+   - Add opt-in constant-time `--api-key` authentication validating both
+     `Authorization: Bearer <key>` and `x-api-key` headers without timing leaks,
+     plus a `kqueue` `AF_UNIX` `--unix-socket <path>` listener alongside TCP for
+     low-overhead local IPC.
    - Emit `stream_options.include_usage`, OpenAI `prompt_tokens_details.cached_tokens`
      and `completion_tokens_details.reasoning_tokens`, and Anthropic
      `cache_read_input_tokens` from `PrefixCache` (`R8`/`C15`) accounting.
@@ -206,19 +214,88 @@ and usage-accounting layer:
   - Interactive keybindings: `q` / `Esc` to quit, `+` / `-` to adjust refresh
     interval, `1`–`4` to toggle panels, and `r` to reset cumulative deltas.
 
+### 4. Self-contained single-file `.amf` metadata and `ls` / `inspect` CLI (`W18`, M7.5)
+
+- Extend `.amf` v0 packing (`W1`–`W3`, [ADR-0006](0006-amf-cold-experts-direct-io.md))
+  to embed `config.json` and `tokenizer.json` inside dedicated 16 KiB-aligned
+  metadata sections within a single `.amf` file while maintaining full
+  backward compatibility with sidecar files and explicit `--config` /
+  `--tokenizer` CLI overrides.
+- Add `aminfer ls` and `aminfer inspect <model.amf>` subcommands to list local
+  `.amf` models and print architecture axes, quantization breakdown, embedded
+  metadata CRC/presence, wired-memory estimates, and hardware-tier fit without
+  loading weight tensors into wired RAM.
+
+### 5. Simple streaming CLI REPL `aminfer chat` and `stdin` pipe mode (`C20`, M7.5)
+
+- Add `aminfer chat` as a **plain scrolling terminal line-REPL** (explicitly
+  NOT an alternate-screen full-screen TUI; full-screen terminal rendering
+  belongs exclusively to `aminfer monitor` `C19`) paired with non-interactive
+  `stdin` pipe mode.
+- Features: inline streaming token output, optional dimmed `<think>` reasoning
+  output, a compact 1-line post-turn summary (`tok/s`, TTFT, `PrefixCache`
+  reuse), interactive slash commands `/clear`, `/retry`, and `/edit` (reusing
+  `C15` ChatML message-boundary `PrefixCache` checkpoints), and `/image` /
+  `/video` attachments routed through `G14` zero-copy vision ingress.
+
+### 6. Native embeddings and reranking (`C21`, M7.5)
+
+- Add `POST /v1/embeddings` and `POST /v1/rerank` to `aminfer serve` plus
+  matching `embed()` and `rerank()` methods in the `C17` C/Python SDK.
+- Reuse the `G15` / `G17` wide prefill path while eliding `lm_head`, supporting
+  `last_token`, `mean`, and `cls` pooling, Matryoshka `dimensions` prefix
+  slicing, L2 normalization, `float` and `base64` wire encodings, and
+  cross-encoder rerank logit scoring with zero steady-state heap allocation.
+
+### 7. Preallocated grammar, JSON Schema, and GBNF token-bitmask engine (`C22`, M7.5)
+
+- Compile `json_object`, `json_schema` (`strict: true` structured outputs and
+  OpenAI/Anthropic strict tool schemas in `C18`), and GBNF grammars at request
+  admission into a preallocated pushdown state machine and `vocab_size`
+  allowed-token bitmask.
+- Evaluate the bitmask on P-cores with zero per-token heap allocation and
+  integrate mask advancement with `G5` / `D9` speculative tree verification so
+  drafted branches remain strictly grammar-valid and distribution-preserving.
+
+### 8. Runtime multi-LoRA hot-loading and per-request adapter routing (`W19`, M7.5)
+
+- Generalize `W16` `sme2_panel64` `Step-LoRA` adapters to standard Hugging Face
+  PEFT LoRA checkpoints (`.amlora` / safetensors offline import and runtime hot
+  loading within the startup wired-budget pool).
+- Route `"model": "<base>:<adapter>"` per request across concurrent `C14`
+  continuous-batching slots over a single shared wired base `.amf`, eliminating
+  base-weight duplication across adapters.
+
+### 9. Opt-in NVMe persistent prefix KV and GDN cache (`R10`, M7.5)
+
+- Add opt-in `--disk-prefix-cache <dir>` enabling asynchronous 16 KiB-aligned
+  `F_NOCACHE` disk spill and reload of compressed `R5` `q8` / `R7` `FP4` KV
+  tiles and `GDN` recurrent state snapshots.
+- Key every persisted prefix artifact by model `.amf` CRC, prefix hash, and
+  full token-slice verification so cold-restart recovery never collides across
+  models, quantization profiles, or diverged prefixes.
+
+### Scope boundary
+
+- Audio and speech ingress are explicitly excluded from Milestone M7.5.
+
 ## Consequences
 
 - **Positive:** Python and native hosts can embed `aminfer` in-process with zero
-  weight/logit copies and zero Python inside the engine; standard OpenAI,
-  Anthropic, and tool-calling agents work directly against `aminfer serve`; and
-  operators gain a rootless, zero-dependency live Apple Silicon TUI with full
-  `btop` theme compatibility and scriptable `--json` output.
+  weight/logit copies and zero Python inside the engine (`C17`); standard
+  OpenAI, Anthropic, tool-calling, embedding, reranking, and multi-LoRA clients
+  work directly against `aminfer serve` over TCP or `AF_UNIX` with `--api-key`
+  auth and strict grammar masks (`C18`, `C21`, `C22`, `W19`); single-file `.amf`
+  bundles (`W18`), scrolling `aminfer chat` (`C20`), NVMe persistent prefix
+  recovery (`R10`), and rootless `aminfer monitor` (`C19`) cover daily local
+  workflows without third-party runtime dependencies.
 - **Negative / trade-offs:** Maintaining a stable C ABI (`include/aminfer.h`),
-  stateful `/v1/responses` slot retention, grammar-constrained JSON decoding,
-  and three-endpoint SSE formatters adds surface area in `src/runtime/`,
-  `src/server/`, and `src/bridge/`. Preallocated fixed-slot tables keep memory
+  stateful `/v1/responses` slot retention, grammar-constrained decoding,
+  multi-LoRA slot routing, persistent KV disk validation, and three-endpoint
+  SSE formatters adds surface area in `src/runtime/`, `src/server/`,
+  `src/format/`, and `src/bridge/`. Preallocated fixed-slot tables keep memory
   bounded and zero-alloc on the hot path, while capping concurrent stateful
-  responses and grammar state depth to configured startup limits.
+  responses, active LoRA adapters, and grammar stack depth to startup limits.
 
 ## Evidence
 
