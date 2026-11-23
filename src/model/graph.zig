@@ -43,6 +43,8 @@ const prefix_cache_mod = @import("../mem/prefix_cache.zig");
 const batch_sched = @import("../runtime/batch_scheduler.zig");
 const vmstat = @import("../platform/vmstat.zig");
 const rng_mod = @import("../runtime/rng.zig");
+const transport = @import("../cluster/transport.zig");
+const expert_parallel = @import("../cluster/expert_parallel.zig");
 
 /// Maximum wired bytes per GPU weight shard (matches `qwen3.zig` to stay below
 /// macOS single-`MTLBuffer` maxBufferLength on 24 GiB–512 GiB Apple Silicon).
@@ -295,6 +297,11 @@ pub const OperatorAxes = struct {
         return false;
     }
 
+    pub fn hasMlaCsa2(self: OperatorAxes) bool {
+        for (self.layer_attention_kinds) |k| if (k == .mla_csa2) return true;
+        return false;
+    }
+
     pub fn attentionSummaryLabel(self: OperatorAxes) []const u8 {
         if (self.layer_attention_kinds.len == 0) return "gqa_full";
         const first = self.layer_attention_kinds[0];
@@ -306,7 +313,7 @@ pub const OperatorAxes = struct {
 };
 
 // ===========================================================================
-// Section 2: `GraphConfig` & JSON Parsing (`qwen4_exp`, `LoopLM`, `Step-LoRA`)
+// Section 2: `GraphConfig` & JSON Parsing (`qwen4_exp`, `deepseek41`, `LoopLM`, `Step-LoRA`)
 // ===========================================================================
 
 pub const GraphConfig = struct {
@@ -332,6 +339,28 @@ pub const GraphConfig = struct {
     quant_bits: u8 = 3,
     group_size: u16 = 64,
 
+    // Causal Encoder-Decoder (`W11` `deepseek41`) geometry
+    num_encoder_layers: u32 = 0,
+    num_decoder_layers: u32 = 0,
+    encoder_moe_top_k: u32 = 0,
+    decoder_moe_top_k: u32 = 0,
+
+    // MLA + CSA2 + FP4 KV (`R7`/`G11`) geometry
+    kv_lora_rank: u32 = 0,
+    q_lora_rank: u32 = 0,
+    qk_nope_head_dim: u32 = 0,
+    qk_rope_head_dim: u32 = 0,
+    v_head_dim: u32 = 0,
+    csa2_modes: []hybrid.Csa2Mode = &.{},
+    csa2_block_tokens: u32 = hybrid.CSA2_DEFAULT_BLOCK_TOKENS,
+    csa2_top_k_blocks: u32 = 16,
+    fp4_kv: bool = true,
+    fp4_rope_tail_format: hybrid.MlaRopeTailFormat = .f16,
+    swa_window: u32 = 0,
+
+    // Single-Pass Mega-mHC (`G10`) geometry
+    mhc_num_streams: u32 = hybrid.DEFAULT_MHC_STREAMS,
+
     // Gated DeltaNet (`R6`/`G8`) geometry
     linear_num_key_heads: u32 = 0,
     linear_num_value_heads: u32 = 0,
@@ -348,16 +377,23 @@ pub const GraphConfig = struct {
     mrope_section: hybrid.MropeSection = hybrid.MropeSection.QWEN38_DEFAULT,
     mrope_interleaved: bool = true,
 
-    // PLE (`C10`) metadata
+    // PLE / Engram (`C10`) metadata
     ple_num_rows: u64 = 0,
     ple_embed_dim: u32 = 0,
     ple_ngram_order: u8 = 2,
     ple_num_shards: u32 = 0,
     ple_shard_files: [][]u8 = &.{},
+    engram_num_heads: u8 = 0,
+    engram_orders: [ple_mod.ENGRAM_MAX_HEADS]u8 = @splat(0),
 
-    // MTP metadata (optional file name relative to config directory)
+    // MTP / DSpark metadata (optional file name relative to config directory)
     mtp_amf_file: ?[]u8 = null,
     mtp_config_file: ?[]u8 = null,
+    dspark_amf_file: ?[]u8 = null,
+    dspark_config_file: ?[]u8 = null,
+    dspark_block_width: u8 = 4,
+    dspark_top_k_per_pos: u8 = 2,
+    dspark_max_tree_nodes: u8 = 32,
 
     pub const ConfigError = error{
         InvalidJson,
@@ -370,6 +406,10 @@ pub const GraphConfig = struct {
         if (self.axes.layer_attention_kinds.len > 0) {
             allocator.free(self.axes.layer_attention_kinds);
             self.axes.layer_attention_kinds = &.{};
+        }
+        if (self.csa2_modes.len > 0) {
+            allocator.free(self.csa2_modes);
+            self.csa2_modes = &.{};
         }
         for (self.ple_shard_files) |s| allocator.free(s);
         if (self.ple_shard_files.len > 0) {
@@ -384,6 +424,52 @@ pub const GraphConfig = struct {
             allocator.free(s);
             self.mtp_config_file = null;
         }
+        if (self.dspark_amf_file) |s| {
+            allocator.free(s);
+            self.dspark_amf_file = null;
+        }
+        if (self.dspark_config_file) |s| {
+            allocator.free(s);
+            self.dspark_config_file = null;
+        }
+    }
+
+    pub fn isCausalEncDec(self: GraphConfig) bool {
+        return self.axes.backbone_kind == .causal_enc_dec;
+    }
+
+    pub fn layerTopK(self: GraphConfig, layer_idx: usize) u32 {
+        if (self.axes.backbone_kind == .causal_enc_dec) {
+            if (layer_idx < self.num_encoder_layers) {
+                return if (self.encoder_moe_top_k > 0) self.encoder_moe_top_k else self.num_experts_per_tok;
+            }
+            return if (self.decoder_moe_top_k > 0) self.decoder_moe_top_k else self.num_experts_per_tok;
+        }
+        return self.num_experts_per_tok;
+    }
+
+    pub fn maxLayerTopK(self: GraphConfig) u32 {
+        return @max(self.num_experts_per_tok, @max(self.encoder_moe_top_k, self.decoder_moe_top_k));
+    }
+
+    pub fn engramOrdersSlice(self: *const GraphConfig) []const u8 {
+        return self.engram_orders[0..self.engram_num_heads];
+    }
+
+    pub fn mlaQDim(self: GraphConfig) u32 {
+        return self.num_attention_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim);
+    }
+
+    pub fn mlaKvADim(self: GraphConfig) u32 {
+        return self.kv_lora_rank + self.qk_rope_head_dim;
+    }
+
+    pub fn mlaKvBDim(self: GraphConfig) u32 {
+        return self.num_attention_heads * (self.qk_nope_head_dim + self.v_head_dim);
+    }
+
+    pub fn mlaVDim(self: GraphConfig) u32 {
+        return self.num_attention_heads * self.v_head_dim;
     }
 
     pub fn qDim(self: GraphConfig) u32 {
@@ -403,18 +489,52 @@ pub const GraphConfig = struct {
     }
 
     pub fn validate(self: GraphConfig) ConfigError!void {
-        if (self.axes.backbone_kind != .decoder_only) return error.UnsupportedOperatorAxis;
-        if (self.axes.residual_kind == .mhc_single_pass) return error.UnsupportedOperatorAxis;
-        if (self.axes.memory_lookup_kind == .engram) return error.UnsupportedOperatorAxis;
         if (self.vocab_size == 0 or self.hidden_size == 0 or self.num_hidden_layers == 0) return error.InvalidConfig;
         if (self.axes.layer_attention_kinds.len != self.num_hidden_layers) return error.InvalidConfig;
-        for (self.axes.layer_attention_kinds) |ak| {
-            if (ak == .mla_csa2) return error.UnsupportedOperatorAxis;
+        if (self.axes.backbone_kind == .causal_enc_dec) {
+            if (self.num_encoder_layers == 0 or self.num_decoder_layers == 0) return error.InvalidConfig;
+            if (self.num_encoder_layers + self.num_decoder_layers != self.num_hidden_layers) return error.InvalidConfig;
         }
         if (self.axes.hasQsa() or self.axes.hasGqa()) {
             if (self.num_attention_heads == 0 or self.num_key_value_heads == 0 or self.head_dim == 0) return error.InvalidConfig;
             if ((self.num_attention_heads % self.num_key_value_heads) != 0) return error.InvalidConfig;
             if ((self.head_dim % 4) != 0 or self.head_dim > hybrid.MAX_QSA_HEAD_DIM) return error.InvalidConfig;
+        }
+        if (self.axes.hasMlaCsa2()) {
+            if (self.num_attention_heads == 0 or self.kv_lora_rank == 0 or self.q_lora_rank == 0 or
+                self.qk_nope_head_dim == 0 or self.v_head_dim == 0)
+            {
+                return error.InvalidConfig;
+            }
+            if ((self.kv_lora_rank % 32) != 0 or self.kv_lora_rank > hybrid.MAX_MLA_LATENT_DIM) return error.InvalidConfig;
+            if ((self.qk_rope_head_dim % 2) != 0 or self.qk_rope_head_dim > hybrid.MAX_MLA_ROPE_DIM) return error.InvalidConfig;
+            if (self.csa2_modes.len != self.num_hidden_layers) return error.InvalidConfig;
+            if (self.csa2_block_tokens == 0 or self.csa2_top_k_blocks == 0 or self.csa2_top_k_blocks > hybrid.CSA2_MAX_TOP_K_BLOCKS) {
+                return error.InvalidConfig;
+            }
+            // Verify every MLA layer has a preceding `Full` KV owner within its own phase.
+            var has_phase_full = false;
+            var has_phase_idx = false;
+            for (0..self.num_hidden_layers) |l| {
+                if (self.axes.backbone_kind == .causal_enc_dec and l == self.num_encoder_layers) {
+                    has_phase_full = false;
+                    has_phase_idx = false;
+                }
+                if (self.axes.layer_attention_kinds[l] != .mla_csa2) continue;
+                switch (self.csa2_modes[l]) {
+                    .full => {
+                        has_phase_full = true;
+                        has_phase_idx = true;
+                    },
+                    .reindex => {
+                        if (!has_phase_full) return error.InvalidConfig;
+                        has_phase_idx = true;
+                    },
+                    .reuse => {
+                        if (!has_phase_full or !has_phase_idx) return error.InvalidConfig;
+                    },
+                }
+            }
         }
         if (self.axes.hasGdn()) {
             if (self.linear_num_key_heads == 0 or self.linear_num_value_heads == 0 or
@@ -431,8 +551,14 @@ pub const GraphConfig = struct {
             },
             .moe_swiglu => {
                 if (self.num_experts == 0 or self.num_experts > moe.MAX_EXPERTS) return error.InvalidConfig;
-                if (self.num_experts_per_tok == 0 or self.num_experts_per_tok > moe.MAX_TOP_K or
-                    self.num_experts_per_tok > self.num_experts) return error.InvalidConfig;
+                const max_tk = self.maxLayerTopK();
+                if (max_tk == 0 or max_tk > moe.MAX_TOP_K or max_tk > self.num_experts) return error.InvalidConfig;
+                if (self.axes.backbone_kind == .causal_enc_dec) {
+                    const enc_tk = self.layerTopK(0);
+                    const dec_tk = self.layerTopK(self.num_encoder_layers);
+                    if (enc_tk == 0 or enc_tk > moe.MAX_TOP_K or enc_tk > self.num_experts) return error.InvalidConfig;
+                    if (dec_tk == 0 or dec_tk > moe.MAX_TOP_K or dec_tk > self.num_experts) return error.InvalidConfig;
+                }
                 if (self.moe_intermediate_size == 0) return error.InvalidConfig;
                 if (self.axes.has_shared_expert and self.shared_expert_intermediate_size == 0) return error.InvalidConfig;
             },
@@ -440,17 +566,35 @@ pub const GraphConfig = struct {
         if (self.axes.residual_kind == .gated_4branch and self.axes.residual_branches != hybrid.GR_NUM_BRANCHES) {
             return error.InvalidConfig;
         }
+        if (self.axes.residual_kind == .mhc_single_pass) {
+            if (self.mhc_num_streams < hybrid.MIN_MHC_STREAMS or self.mhc_num_streams > hybrid.MAX_MHC_STREAMS) {
+                return error.InvalidConfig;
+            }
+        }
         if (self.axes.memory_lookup_kind == .ple_ngram) {
             if (self.ple_embed_dim != 0 and self.ple_embed_dim != self.hidden_size) return error.InvalidConfig;
+        } else if (self.axes.memory_lookup_kind == .engram) {
+            if (self.engram_num_heads < ple_mod.ENGRAM_MIN_HEADS or self.engram_num_heads > ple_mod.ENGRAM_MAX_HEADS) {
+                return error.InvalidConfig;
+            }
+            for (self.engram_orders[0..self.engram_num_heads]) |ord| {
+                if (ord < ple_mod.ENGRAM_MIN_ORDER or ord > ple_mod.ENGRAM_MAX_ORDER) return error.InvalidConfig;
+            }
         }
         try self.axes.loop_schedule.validate(self.num_hidden_layers);
     }
 
     /// Lightweight detector telling CLI / server whether a `config.json` requires
-    /// the composable `GraphModel` executor (`qwen4_exp`, `LoopLM`, `Step-LoRA`,
-    /// hybrid GDN/QSA, 4-branch GR, PLE, or `max_loops > 1`).
+    /// the composable `GraphModel` executor (`qwen4_exp`, `deepseek41`, `LoopLM`,
+    /// `Step-LoRA`, hybrid GDN/QSA/MLA-CSA2, 4-branch GR, Mega-mHC, PLE/Engram,
+    /// or `max_loops > 1`).
     pub fn isGraphConfigJson(json_bytes: []const u8) bool {
         if (std.mem.indexOf(u8, json_bytes, "\"qwen4_exp\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"deepseek41\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"causal_enc_dec\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"mla_csa2\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"mhc_single_pass\"") != null) return true;
+        if (std.mem.indexOf(u8, json_bytes, "\"engram\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"looplm\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"gated_deltanet\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"qsa_sparse\"") != null) return true;
@@ -484,22 +628,47 @@ pub const GraphConfig = struct {
 
         const model_type = jsonStr(obj, "model_type") orelse jsonStr(root, "model_type") orelse "";
         const is_qwen4 = std.mem.eql(u8, model_type, "qwen4_exp");
+        const is_deepseek41 = std.mem.eql(u8, model_type, "deepseek41");
         const is_looplm = std.mem.eql(u8, model_type, "looplm") or
             std.mem.eql(u8, model_type, "huginn") or
             std.mem.eql(u8, model_type, "ouro");
 
-        var backbone_kind: BackboneKind = .decoder_only;
+        var backbone_kind: BackboneKind = if (is_deepseek41) .causal_enc_dec else .decoder_only;
+        if (jsonStr(obj, "backbone_kind") orelse jsonStr(root, "backbone_kind")) |s| {
+            backbone_kind = BackboneKind.parse(s) catch return error.UnsupportedOperatorAxis;
+        }
         var ffn_kind: FfnKind = if ((jsonU32(obj, "num_experts") orelse 0) > 0) .moe_swiglu else .dense_swiglu;
-        var has_shared_expert: bool = (jsonU32(obj, "shared_expert_intermediate_size") orelse 0) > 0;
-        var residual_branches: u32 = jsonU32(obj, "residual_branches") orelse (if (is_qwen4) @as(u32, 4) else 1);
-        var residual_kind: ResidualKind = if (residual_branches == 4) .gated_4branch else .single_stream;
-        var mem_kind: MemoryLookupKind = if (obj.get("ple") != null or root.get("ple") != null) .ple_ngram else .none;
+        var has_shared_expert: bool = jsonBool(obj, "has_shared_expert") orelse
+            ((jsonU32(obj, "shared_expert_intermediate_size") orelse 0) > 0);
+        const mhc_num_streams: u32 = jsonU32(obj, "mhc_num_streams") orelse hybrid.DEFAULT_MHC_STREAMS;
+        var residual_branches: u32 = jsonU32(obj, "residual_branches") orelse
+            (if (is_deepseek41) mhc_num_streams else if (is_qwen4) @as(u32, 4) else 1);
+        var residual_kind: ResidualKind = if (is_deepseek41)
+            .mhc_single_pass
+        else if (residual_branches == 4)
+            .gated_4branch
+        else
+            .single_stream;
+        if (jsonStr(obj, "residual_kind") orelse jsonStr(root, "residual_kind")) |s| {
+            residual_kind = ResidualKind.parse(s) catch return error.UnsupportedOperatorAxis;
+        }
+        var mem_kind: MemoryLookupKind = if (is_deepseek41)
+            .engram
+        else if (obj.get("ple") != null or root.get("ple") != null)
+            .ple_ngram
+        else
+            .none;
+        if (jsonStr(obj, "memory_lookup_kind") orelse jsonStr(root, "memory_lookup_kind")) |s| {
+            mem_kind = MemoryLookupKind.parse(s) catch return error.UnsupportedOperatorAxis;
+        }
 
         const layer_attns = try allocator.alloc(AttentionKind, num_layers);
         errdefer allocator.free(layer_attns);
         const full_interval = jsonU32(obj, "full_attention_interval") orelse 4;
         for (0..num_layers) |l| {
-            layer_attns[l] = if (is_qwen4)
+            layer_attns[l] = if (is_deepseek41)
+                .mla_csa2
+            else if (is_qwen4)
                 (if (((l + 1) % full_interval) == 0) .qsa_sparse else .gated_deltanet)
             else
                 .gqa_full;
@@ -541,6 +710,75 @@ pub const GraphConfig = struct {
                                 layer_attns[l] = AttentionKind.parse(item.string) catch return error.UnsupportedOperatorAxis;
                             }
                         }
+                    }
+                }
+            }
+        }
+        const eff_mhc_streams: u32 = if (residual_kind == .mhc_single_pass)
+            (jsonU32(obj, "mhc_num_streams") orelse residual_branches)
+        else
+            mhc_num_streams;
+
+        // Parse CED (`causal_enc_dec`) encoder/decoder split & MoE top-k.
+        const num_encoder_layers: u32 = jsonU32(obj, "num_encoder_layers") orelse
+            (if (backbone_kind == .causal_enc_dec) (num_layers / 2) else 0);
+        const num_decoder_layers: u32 = jsonU32(obj, "num_decoder_layers") orelse
+            (if (backbone_kind == .causal_enc_dec) (num_layers -| num_encoder_layers) else 0);
+        const enc_top_k: u32 = jsonU32(obj, "encoder_moe_top_k") orelse 0;
+        const dec_top_k: u32 = jsonU32(obj, "decoder_moe_top_k") orelse 0;
+        const raw_top_k: u32 = jsonU32(obj, "num_experts_per_tok") orelse @max(enc_top_k, dec_top_k);
+
+        // Parse MLA + CSA2 geometry and per-layer `csa2_modes`.
+        const kv_lora_rank: u32 = jsonU32(obj, "kv_lora_rank") orelse 0;
+        const q_lora_rank: u32 = jsonU32(obj, "q_lora_rank") orelse 0;
+        const qk_nope_head_dim: u32 = jsonU32(obj, "qk_nope_head_dim") orelse 0;
+        const qk_rope_head_dim: u32 = jsonU32(obj, "qk_rope_head_dim") orelse 0;
+        const v_head_dim: u32 = jsonU32(obj, "v_head_dim") orelse 0;
+        const swa_window: u32 = jsonU32(obj, "swa_window") orelse 0;
+        const fp4_kv: bool = jsonBool(obj, "fp4_kv") orelse true;
+        const fp4_rope_tail_bytes: u32 = jsonU32(obj, "fp4_rope_tail_bytes") orelse 0;
+        const fp4_rope_tail_fmt: hybrid.MlaRopeTailFormat = if (fp4_rope_tail_bytes > 0 and fp4_rope_tail_bytes == qk_rope_head_dim)
+            .e4m3
+        else
+            .f16;
+
+        var has_mla = false;
+        for (layer_attns) |ak| {
+            if (ak == .mla_csa2) {
+                has_mla = true;
+                break;
+            }
+        }
+        var csa2_modes: []hybrid.Csa2Mode = &.{};
+        errdefer if (csa2_modes.len > 0) allocator.free(csa2_modes);
+        if (has_mla or obj.get("csa2_modes") != null or root.get("csa2_modes") != null) {
+            csa2_modes = try allocator.alloc(hybrid.Csa2Mode, num_layers);
+            for (0..num_layers) |l| {
+                const phase_local = if (backbone_kind == .causal_enc_dec and l >= num_encoder_layers)
+                    (l - num_encoder_layers)
+                else
+                    l;
+                csa2_modes[l] = if (phase_local == 0)
+                    .full
+                else if ((phase_local % 3) == 1)
+                    .reindex
+                else if ((phase_local % 3) == 2)
+                    .reuse
+                else
+                    .full;
+            }
+            if (obj.get("csa2_modes") orelse root.get("csa2_modes")) |cm_val| {
+                if (cm_val != .array or cm_val.array.items.len != num_layers) return error.InvalidConfig;
+                for (cm_val.array.items, 0..) |item, l| {
+                    if (item != .string) return error.InvalidConfig;
+                    if (std.mem.eql(u8, item.string, "full")) {
+                        csa2_modes[l] = .full;
+                    } else if (std.mem.eql(u8, item.string, "reindex")) {
+                        csa2_modes[l] = .reindex;
+                    } else if (std.mem.eql(u8, item.string, "reuse")) {
+                        csa2_modes[l] = .reuse;
+                    } else {
+                        return error.InvalidConfig;
                     }
                 }
             }
@@ -619,7 +857,7 @@ pub const GraphConfig = struct {
             }
         }
 
-        // Parse PLE metadata.
+        // Parse PLE / Engram metadata.
         var ple_num_rows: u64 = 0;
         var ple_embed_dim: u32 = hidden_size;
         var ple_ngram_order: u8 = 2;
@@ -656,7 +894,48 @@ pub const GraphConfig = struct {
             }
         }
 
-        // Parse optional MTP filenames.
+        var engram_num_heads: u8 = 0;
+        var engram_orders: [ple_mod.ENGRAM_MAX_HEADS]u8 = @splat(0);
+        if (mem_kind == .engram or obj.get("engram_num_heads") != null or obj.get("engram_files") != null) {
+            const raw_heads = jsonU32(obj, "engram_num_heads") orelse 3;
+            if (raw_heads < ple_mod.ENGRAM_MIN_HEADS or raw_heads > ple_mod.ENGRAM_MAX_HEADS) return error.InvalidConfig;
+            engram_num_heads = @intCast(raw_heads);
+            if (obj.get("engram_orders") orelse root.get("engram_orders")) |eo_val| {
+                if (eo_val != .array or eo_val.array.items.len != engram_num_heads) return error.InvalidConfig;
+                for (eo_val.array.items, 0..) |item, hi| {
+                    const ov = jsonItemU32(item) orelse return error.InvalidConfig;
+                    if (ov < ple_mod.ENGRAM_MIN_ORDER or ov > ple_mod.ENGRAM_MAX_ORDER) return error.InvalidConfig;
+                    engram_orders[hi] = @intCast(ov);
+                }
+            } else {
+                for (0..engram_num_heads) |hi| {
+                    engram_orders[hi] = @intCast(@min(ple_mod.ENGRAM_MAX_ORDER, ple_mod.ENGRAM_MIN_ORDER + hi));
+                }
+            }
+            if (ple_num_rows == 0) ple_num_rows = jsonU64(obj, "engram_num_rows") orelse 0;
+            if (ple_num_shards == 0) ple_num_shards = jsonU32(obj, "engram_shards") orelse 0;
+            if (ple_shard_files.len == 0) {
+                if (obj.get("engram_files") orelse root.get("engram_files")) |ef_val| {
+                    if (ef_val == .array and ef_val.array.items.len > 0) {
+                        const files = try allocator.alloc([]u8, ef_val.array.items.len);
+                        var built: usize = 0;
+                        errdefer {
+                            for (0..built) |i| allocator.free(files[i]);
+                            allocator.free(files);
+                        }
+                        for (ef_val.array.items, 0..) |item, i| {
+                            if (item != .string) return error.InvalidConfig;
+                            files[i] = try allocator.dupe(u8, item.string);
+                            built += 1;
+                        }
+                        ple_shard_files = files;
+                        if (ple_num_shards == 0) ple_num_shards = @intCast(files.len);
+                    }
+                }
+            }
+        }
+
+        // Parse optional MTP & DSpark filenames.
         var mtp_amf_file: ?[]u8 = null;
         errdefer if (mtp_amf_file) |s| allocator.free(s);
         var mtp_config_file: ?[]u8 = null;
@@ -665,6 +944,24 @@ pub const GraphConfig = struct {
             if (mtp_val == .object) {
                 if (jsonStr(mtp_val.object, "amf_file")) |s| mtp_amf_file = try allocator.dupe(u8, s);
                 if (jsonStr(mtp_val.object, "config_file")) |s| mtp_config_file = try allocator.dupe(u8, s);
+            }
+        }
+
+        var dspark_amf_file: ?[]u8 = null;
+        errdefer if (dspark_amf_file) |s| allocator.free(s);
+        var dspark_config_file: ?[]u8 = null;
+        errdefer if (dspark_config_file) |s| allocator.free(s);
+        var dspark_block_width: u8 = 4;
+        var dspark_top_k_per_pos: u8 = 2;
+        var dspark_max_tree_nodes: u8 = 32;
+        if (obj.get("dspark") orelse root.get("dspark")) |ds_val| {
+            if (ds_val == .object) {
+                const dso = ds_val.object;
+                if (jsonStr(dso, "amf_file")) |s| dspark_amf_file = try allocator.dupe(u8, s);
+                if (jsonStr(dso, "config_file")) |s| dspark_config_file = try allocator.dupe(u8, s);
+                if (jsonU32(dso, "block_width")) |v| dspark_block_width = @intCast(@min(16, @max(1, v)));
+                if (jsonU32(dso, "top_k_per_pos")) |v| dspark_top_k_per_pos = @intCast(@min(8, @max(1, v)));
+                if (jsonU32(dso, "max_tree_nodes")) |v| dspark_max_tree_nodes = @intCast(@min(64, @max(2, v)));
             }
         }
 
@@ -685,7 +982,7 @@ pub const GraphConfig = struct {
                 .ffn_kind = ffn_kind,
                 .has_shared_expert = has_shared_expert,
                 .residual_kind = residual_kind,
-                .residual_branches = residual_branches,
+                .residual_branches = if (residual_kind == .mhc_single_pass) eff_mhc_streams else residual_branches,
                 .memory_lookup_kind = mem_kind,
                 .loop_schedule = ls,
             },
@@ -699,7 +996,7 @@ pub const GraphConfig = struct {
             .moe_intermediate_size = jsonU32(obj, "moe_intermediate_size") orelse 0,
             .shared_expert_intermediate_size = jsonU32(obj, "shared_expert_intermediate_size") orelse 0,
             .num_experts = jsonU32(obj, "num_experts") orelse 0,
-            .num_experts_per_tok = jsonU32(obj, "num_experts_per_tok") orelse 0,
+            .num_experts_per_tok = raw_top_k,
             .norm_topk_prob = jsonBool(obj, "norm_topk_prob") orelse true,
             .rms_norm_eps = jsonF32(obj, "rms_norm_eps") orelse 1e-6,
             .rope_theta = jsonF32(obj, "rope_theta") orelse 1_000_000.0,
@@ -709,6 +1006,22 @@ pub const GraphConfig = struct {
             .eos_token_id = jsonU32(obj, "eos_token_id") orelse jsonU32(root, "eos_token_id") orelse 151645,
             .quant_bits = qbits,
             .group_size = gsize,
+            .num_encoder_layers = num_encoder_layers,
+            .num_decoder_layers = num_decoder_layers,
+            .encoder_moe_top_k = enc_top_k,
+            .decoder_moe_top_k = dec_top_k,
+            .kv_lora_rank = kv_lora_rank,
+            .q_lora_rank = q_lora_rank,
+            .qk_nope_head_dim = qk_nope_head_dim,
+            .qk_rope_head_dim = qk_rope_head_dim,
+            .v_head_dim = v_head_dim,
+            .csa2_modes = csa2_modes,
+            .csa2_block_tokens = jsonU32(obj, "csa2_block_tokens") orelse hybrid.CSA2_DEFAULT_BLOCK_TOKENS,
+            .csa2_top_k_blocks = jsonU32(obj, "csa2_top_k_blocks") orelse 16,
+            .fp4_kv = fp4_kv,
+            .fp4_rope_tail_format = fp4_rope_tail_fmt,
+            .swa_window = swa_window,
+            .mhc_num_streams = eff_mhc_streams,
             .linear_num_key_heads = jsonU32(obj, "linear_num_key_heads") orelse 0,
             .linear_num_value_heads = jsonU32(obj, "linear_num_value_heads") orelse 0,
             .linear_key_head_dim = jsonU32(obj, "linear_key_head_dim") orelse 0,
@@ -726,8 +1039,15 @@ pub const GraphConfig = struct {
             .ple_ngram_order = ple_ngram_order,
             .ple_num_shards = ple_num_shards,
             .ple_shard_files = ple_shard_files,
+            .engram_num_heads = engram_num_heads,
+            .engram_orders = engram_orders,
             .mtp_amf_file = mtp_amf_file,
             .mtp_config_file = mtp_config_file,
+            .dspark_amf_file = dspark_amf_file,
+            .dspark_config_file = dspark_config_file,
+            .dspark_block_width = dspark_block_width,
+            .dspark_top_k_per_pos = dspark_top_k_per_pos,
+            .dspark_max_tree_nodes = dspark_max_tree_nodes,
         };
         try cfg.validate();
         return cfg;
@@ -834,6 +1154,30 @@ pub const GraphLoadOptions = struct {
     strict_nax: bool = false,
     /// Optional explicit memory-bus bandwidth override in GB/s (`--bus-bandwidth-gbs`).
     bus_bandwidth_gbs_override: ?f64 = null,
+
+    // M7 Multi-Mac Expert-Parallel Cluster (`X2`/`X3`, ADR-0003, ADR-0015)
+    /// Optional connected `ExpertParallelCoordinator` for layers containing
+    /// `.thunderbolt_peer` remote MoE experts (overlaps remote RPC with local eval).
+    cluster_coordinator: ?*expert_parallel.ExpertParallelCoordinator = null,
+    /// Optional explicit expert partition plan (defaults to `cluster_coordinator.config.plan` when non-null).
+    cluster_plan: ?expert_parallel.ExpertPartitionPlan = null,
+};
+
+pub const M7Stats = struct {
+    encoder_layer_dispatches_prefill: u64 = 0,
+    encoder_layer_dispatches_decode: u64 = 0,
+    decoder_layer_dispatches_prefill: u64 = 0,
+    decoder_layer_dispatches_decode: u64 = 0,
+    csa2_kv_writes: u64 = 0,
+    csa2_summary_updates: u64 = 0,
+    csa2_index_dispatches: u64 = 0,
+    csa2_attn_dispatches: u64 = 0,
+    engram_lookups: u64 = 0,
+    cluster_dispatches: u64 = 0,
+    cluster_local_assignments: u64 = 0,
+    cluster_remote_assignments: u64 = 0,
+    cluster_bytes_transferred: u64 = 0,
+    cluster_remote_rpc_ns: u64 = 0,
 };
 
 pub const LoopIsolationStats = struct {
@@ -871,7 +1215,8 @@ pub const GraphLoadError = error{
     OutOfMemory,
 } || amf.ParseError || amf.IoError || metal.Error || sysinfo.Error || vmstat.Error ||
     budget_mod.PlanError || dequant.InitError || dequant.CanaryError ||
-    page.ShareError || expert.NvmeExpert.InitError ||
+    page.ShareError || expert.NvmeExpert.InitError || expert.PeerExpert.InitError ||
+    expert_parallel.PlanError || expert_parallel.ClusterError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError || hybrid.ArenaError || hybrid.HybridKvRing.InitError ||
     attention.RetiredKvQ8PoolError ||
     moe.WorkspaceError || ple_mod.Error || sme.WiredScratchError ||
@@ -887,7 +1232,7 @@ pub const GraphStepError = error{
     Overflow,
 } || metal.Error || dequant.EncodeError || moe.EncodeError ||
     hybrid.EncodeError || hybrid.ArenaError || ple_mod.Error ||
-    attention.RetiredKvQ8PoolError ||
+    attention.RetiredKvQ8PoolError || expert_parallel.ClusterError ||
     sme.Error || cache_mod.CacheError || accept_mod.VerifyError;
 
 // ===========================================================================
@@ -904,6 +1249,61 @@ const GrLayerWeights = struct {
     write_gate: metal.BufferBinding,
     decay_gate: metal.BufferBinding,
     dtype: quant.FloatDType,
+};
+
+const MhcLayerWeights = struct {
+    h_pre_bind: metal.BufferBinding,
+    h_post_bind: metal.BufferBinding,
+    h_res_bind: metal.BufferBinding,
+};
+
+const CedBridgeWeights = struct {
+    norm: qwen3.NormBinding,
+    global_kv_a_proj: qwen3.LinearBinding,
+    global_kv_norm: qwen3.NormBinding,
+};
+
+const MlaScratchBindings = struct {
+    q_a_bind: metal.BufferBinding = undefined,
+    q_a_norm_bind: metal.BufferBinding = undefined,
+    q_full_bind: metal.BufferBinding = undefined,
+    q_nope_bind: metal.BufferBinding = undefined,
+    q_pe_bind: metal.BufferBinding = undefined,
+    q_pe_host: []f16 = &.{},
+    kv_a_bind: metal.BufferBinding = undefined,
+    latent_raw_bind: metal.BufferBinding = undefined,
+    latent_norm_bind: metal.BufferBinding = undefined,
+    rope_raw_bind: metal.BufferBinding = undefined,
+    rope_rot_bind: metal.BufferBinding = undefined,
+    rope_rot_host: []f16 = &.{},
+    head_in_bind: metal.BufferBinding = undefined,
+    head_out_bind: metal.BufferBinding = undefined,
+    attn_latent_bind: metal.BufferBinding = undefined,
+};
+
+const MlaCsa2LayerWeights = struct {
+    mode: hybrid.Csa2Mode,
+    mla_idx: u32,
+    shared_kv_owner: u32,
+    kv_owner_layer: usize,
+    index_owner_layer: usize,
+    q_a_proj: qwen3.LinearBinding,
+    q_a_norm: qwen3.NormBinding,
+    q_b_proj: qwen3.LinearBinding,
+    kv_a_proj: qwen3.LinearBinding,
+    kv_a_norm: qwen3.NormBinding,
+    o_proj: qwen3.LinearBinding,
+    csa2_idx_proj: ?qwen3.LinearBinding = null,
+    /// Per-head absorbed K projection `W_UK^T` (`[n_heads]`, each `[kv_lora_rank, qk_nope_head_dim]` `f16`).
+    w_uk_t_heads: []qwen3.LinearBinding = &.{},
+    /// Per-head absorbed V projection `W_UV` (`[n_heads]`, each `[v_head_dim, kv_lora_rank]` `f16`).
+    w_uv_heads: []qwen3.LinearBinding = &.{},
+    /// Per-layer CSA2 index buffer (non-null for `Full` and `Reindex`; `Reuse` aliases `index_owner_layer`).
+    index_buf: ?hybrid.Csa2IndexBuffer = null,
+    wp_index_buf: ?hybrid.Csa2IndexBuffer = null,
+    /// Tree-verification uncommitted KV scratch offsets (`Full` layers only).
+    tree_latent_off: u64 = 0,
+    tree_rope_off: u64 = 0,
 };
 
 const GdnLayerWeights = struct {
@@ -989,6 +1389,7 @@ const LayerAttention = union(enum) {
     gqa: GqaLayerWeights,
     gdn: GdnLayerWeights,
     qsa: QsaLayerWeights,
+    mla_csa2: MlaCsa2LayerWeights,
 };
 
 const GraphLayerWeights = struct {
@@ -996,6 +1397,7 @@ const GraphLayerWeights = struct {
     input_layernorm: qwen3.NormBinding,
     post_attention_layernorm: qwen3.NormBinding,
     gr: ?GrLayerWeights = null,
+    mhc: ?MhcLayerWeights = null,
     attn: LayerAttention,
 
     // Dense SwiGLU (when `ffn_kind == .dense_swiglu`)
@@ -1017,6 +1419,8 @@ const GraphLayerWeights = struct {
     is_hetero_moe: bool = false,
     has_cold_experts: bool = false,
     cold_expert_count: u32 = 0,
+    has_remote_experts: bool = false,
+    expert_sources: []expert.ExpertSource = &.{},
     shared_expert: ?moe.ExpertWeights = null,
     shared_expert_buf: ?metal.Buffer = null,
     shared_expert_dtype: ?quant.WeightDType = null,
@@ -1028,6 +1432,8 @@ const PleRuntime = struct {
     store: ple_mod.PleStore,
     scratch: ple_mod.LoopPleScratch,
     f32_tmp: []f32,
+    engram_windows: [ple_mod.MAX_BATCH_TOKENS][]const u32 = undefined,
+    engram_win_storage: [ple_mod.MAX_BATCH_TOKENS][ple_mod.ENGRAM_MAX_ORDER]u32 = undefined,
 };
 
 const ColdRuntime = struct {
@@ -1251,6 +1657,36 @@ pub const GraphModel = struct {
     // M6.9 Multi-Generation Apple Silicon & NAX TensorOps (`C16`, `G17`, ADR-0021)
     chip_profile: chip_profile_mod.ChipProfile = undefined,
 
+    // M7 DeepSeek-V4.1 CED (`W11`), MLA+CSA2 FP4 KV (`R7`/`G11`), Mega-mHC (`G10`),
+    // Engram (`C10`), DSpark Conditioning (`D10`) & Expert-Parallel Cluster (`X2`/`X3`)
+    mla_kv_buf: metal.Buffer = undefined,
+    mla_kv_arena: ?hybrid.MlaFp4KvArena = null,
+    mla_swa_arena: ?hybrid.MlaSwaRingArena = null,
+    csa2_summary_arena: ?hybrid.Csa2SummaryArena = null,
+    mhc_arena: ?hybrid.MhcStreamArena = null,
+    wp_mhc_arena: ?hybrid.MhcStreamArena = null,
+    mhc_uniform_pre_bind: metal.BufferBinding = undefined,
+    ced_bridge: ?CedBridgeWeights = null,
+    ced_encoder_prefix_len: u32 = 0,
+    ced_encoder_sum_host: []f32 = &.{},
+    ced_encoder_summary_host: []f32 = &.{},
+    ced_last_decoder_hidden_host: []f32 = &.{},
+    ced_tree_top_hidden_host: []f16 = &.{},
+    mla_scratch: MlaScratchBindings = .{},
+    wp_mla_scratch: MlaScratchBindings = .{},
+    mla_commit_latent_bind: metal.BufferBinding = undefined,
+    mla_commit_rope_bind: metal.BufferBinding = undefined,
+    mla_commit_latent_host: []f16 = &.{},
+    mla_commit_rope_host: []f16 = &.{},
+    wp_x_host: []f16 = &.{},
+    wp_x_norm_host: []f16 = &.{},
+    wp_proj_out_host: []f16 = &.{},
+    cluster_coordinator: ?*expert_parallel.ExpertParallelCoordinator = null,
+    cluster_plan: ?expert_parallel.ExpertPartitionPlan = null,
+    cluster_assignments: []transport.Assignment = &.{},
+    cluster_accum_f32: []f32 = &.{},
+    m7_stats: M7Stats = .{},
+
     // -----------------------------------------------------------------------
     // Loading & Teardown
     // -----------------------------------------------------------------------
@@ -1333,9 +1769,20 @@ pub const GraphModel = struct {
                     };
                     qsa.kv_ring.deinit(allocator);
                 },
+                .mla_csa2 => |*mla| {
+                    if (mla.w_uk_t_heads.len > 0) allocator.free(mla.w_uk_t_heads);
+                    if (mla.w_uv_heads.len > 0) allocator.free(mla.w_uv_heads);
+                },
                 else => {},
             }
+            if (layer.expert_sources.len > 0) allocator.free(layer.expert_sources);
         }
+        if (self.cluster_assignments.len > 0) allocator.free(self.cluster_assignments);
+        if (self.cluster_accum_f32.len > 0) allocator.free(self.cluster_accum_f32);
+        if (self.ced_encoder_sum_host.len > 0) allocator.free(self.ced_encoder_sum_host);
+        if (self.ced_encoder_summary_host.len > 0) allocator.free(self.ced_encoder_summary_host);
+        if (self.ced_last_decoder_hidden_host.len > 0) allocator.free(self.ced_last_decoder_hidden_host);
+        if (self.ced_tree_top_hidden_host.len > 0) allocator.free(self.ced_tree_top_hidden_host);
         if (self.gqa_kv_tiles.len > 0) {
             self.compute.removeTilesResident(self.gqa_kv_tiles) catch |err| {
                 std.debug.panic("removeTilesResident failed in GraphModel.deinit: {}", .{err});
@@ -1374,11 +1821,18 @@ pub const GraphModel = struct {
 
     pub fn resetKvCache(self: *GraphModel) void {
         self.seq_len = 0;
+        self.ced_encoder_prefix_len = 0;
         self.mrope_next_pos = 0;
         self.last_logits_row = 0;
         self.last_verified_nodes = 0;
         self.num_retired_chunks = 0;
         self.kv_retire_events = 0;
+        if (self.ced_encoder_sum_host.len > 0) @memset(self.ced_encoder_sum_host, 0.0);
+        if (self.ced_encoder_summary_host.len > 0) @memset(self.ced_encoder_summary_host, 0.0);
+        if (self.ced_last_decoder_hidden_host.len > 0) @memset(self.ced_last_decoder_hidden_host, 0.0);
+        if (self.mla_kv_arena) |*ka| @memset(ka.backing, 0);
+        if (self.mla_swa_arena) |*sa| @memset(sa.backing, 0);
+        if (self.csa2_summary_arena) |*csa| @memset(csa.backing, 0);
         if (self.retired_kv_pool) |*pool| pool.reset();
         for (0..self.active_tile_phys_ring.len) |i| {
             self.active_tile_phys_ring[i] = @intCast(i);
@@ -1454,7 +1908,7 @@ pub const GraphModel = struct {
                         );
                     }
                 },
-                .gdn => {},
+                .gdn, .mla_csa2 => {},
             }
         }
     }
@@ -1498,7 +1952,7 @@ pub const GraphModel = struct {
                     }, false);
                     dispatched = true;
                 },
-                .gdn => {},
+                .gdn, .mla_csa2 => {},
             }
         }
 
@@ -1596,10 +2050,63 @@ pub const GraphModel = struct {
         return self.total_layers_non_expert_bytes;
     }
 
+    pub fn m7Stats(self: *const GraphModel) M7Stats {
+        return self.m7_stats;
+    }
+
+    pub fn resetM7Stats(self: *GraphModel) void {
+        self.m7_stats = .{};
+    }
+
+    /// Mean-pooled final encoder hidden summary (`[hidden_size]` FP32) for `DSpark` (`D10`)
+    /// on `BackboneKind.causal_enc_dec` models (returns `null` on decoder-only models or
+    /// before CED prefill has encoded any prompt tokens).
+    pub fn encoderSummaryF32(self: *const GraphModel) ?[]const f32 {
+        if (!self.config.isCausalEncDec() or self.ced_encoder_prefix_len == 0 or self.ced_encoder_summary_host.len == 0) {
+            return null;
+        }
+        return self.ced_encoder_summary_host;
+    }
+
+    /// Most recently accepted decoder top hidden state (`[hidden_size]` FP32) for `DSpark` (`D10`).
+    pub fn lastDecoderHiddenF32(self: *const GraphModel) []const f32 {
+        return self.ced_last_decoder_hidden_host;
+    }
+
+    /// Evaluates the target model's `lm_head` on `[block_width, hidden_size]` FP32 hidden
+    /// states on GPU and writes `[block_width, vocab_size]` FP32 logits into `out_logits`.
+    /// Zero dynamic heap allocations; wired as `dspark.LmHeadHook.callback` for `D10`.
+    pub fn evalLmHeadBatchF32(
+        self: *GraphModel,
+        slot_hiddens: []const f32,
+        block_width: u8,
+        out_logits: []f32,
+    ) GraphStepError!void {
+        const w: u32 = block_width;
+        const h: usize = self.config.hidden_size;
+        const v: usize = self.config.vocab_size;
+        if (w == 0 or w > self.max_tree_nodes) return error.InvalidBatchSize;
+        if (slot_hiddens.len < @as(usize, w) * h or out_logits.len < @as(usize, w) * v) {
+            return error.InvalidBatchSize;
+        }
+        for (0..@as(usize, w) * h) |i| {
+            self.x_norm_host[i] = @floatCast(slot_hiddens[i]);
+        }
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+        try self.encodeLinearBatched(&frame, self.lm_head, self.x_norm_bind, self.logits_bind, w, false);
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+        for (0..@as(usize, w) * v) |i| {
+            out_logits[i] = @floatCast(self.logits_host[i]);
+        }
+    }
+
     pub fn bytesPerDecodeToken(self: *const GraphModel, seq_len: u32) u64 {
         const loops: u64 = self.effective_max_loops;
         var kv_bytes: u64 = 0;
-        for (self.layers) |layer| {
+        const dec_start: usize = if (self.config.isCausalEncDec()) self.config.num_encoder_layers else 0;
+        for (self.layers[dec_start..]) |layer| {
             switch (layer.attn) {
                 .gqa => {
                     kv_bytes += 2 * @as(u64, self.config.num_key_value_heads) * seq_len * self.config.head_dim * @sizeOf(f16);
@@ -1616,13 +2123,22 @@ pub const GraphModel = struct {
                         self.config.linear_key_head_dim * self.config.linear_value_head_dim * @sizeOf(f32);
                     kv_bytes += 2 * state_b; // read + write recurrent state
                 },
+                .mla_csa2 => |mla| {
+                    const tok_b: u64 = if (self.mla_kv_arena) |*ka| ka.spec.bytesPerToken() else 890;
+                    const vis_sparse: u64 = @min(@as(u64, seq_len), @as(u64, self.config.csa2_top_k_blocks) * self.config.csa2_block_tokens);
+                    const vis_swa: u64 = @min(@as(u64, seq_len), self.config.swa_window);
+                    kv_bytes += vis_sparse * tok_b + vis_swa * (@as(u64, self.config.kv_lora_rank) + self.config.qk_rope_head_dim) * @sizeOf(f16);
+                    if (mla.mode == .full) kv_bytes += tok_b;
+                },
             }
         }
+        const active_layers: u64 = @intCast(self.layers.len - dec_start);
+        const active_top_k: u64 = if (self.config.isCausalEncDec()) self.config.layerTopK(dec_start) else self.config.num_experts_per_tok;
         const layer_bytes: u64 = if (self.config.axes.ffn_kind == .moe_swiglu)
-            self.total_layers_non_expert_bytes +
-                @as(u64, self.config.num_hidden_layers) * self.config.num_experts_per_tok * self.single_expert_bytes
+            (self.total_layers_non_expert_bytes * active_layers / self.config.num_hidden_layers) +
+                active_layers * active_top_k * self.single_expert_bytes
         else
-            self.total_layers_static_bytes;
+            self.total_layers_static_bytes * active_layers / self.config.num_hidden_layers;
         const ls = self.config.axes.loop_schedule;
         const core_layers: u64 = if (ls.end_layer > ls.start_layer) (ls.end_layer - ls.start_layer) else self.config.num_hidden_layers;
         const extra_loop_bytes: u64 = if (loops > 1)
@@ -1926,6 +2442,39 @@ pub const GraphModel = struct {
                 accept_nodes[i] = @intCast(i);
             }
 
+            if (self.config.isCausalEncDec()) {
+                // CED Phase 1 (`tree64` path): execute ONLY causal encoder layers `[0 .. N_enc)`,
+                // project final encoder states into global decoder FP4 KV + CSA2 summaries, and
+                // on the final prompt token run the decoder `[N_enc .. N_enc + N_dec)` (`M = 1`).
+                _ = try self.runForwardInternalEx(
+                    tokens[offset .. offset + take],
+                    pos_buf[0..take],
+                    mask_buf[0..take],
+                    cur_base,
+                    self.effective_max_loops,
+                    false,
+                    0,
+                    null,
+                    true,
+                    null,
+                    null,
+                    .ced_encoder_only,
+                    null,
+                );
+                try self.projectCedEncoderToDecoderKv(cur_base, @intCast(take), false);
+                for (0..take) |i| {
+                    self.token_history[cur_base + @as(u32, @intCast(i))] = tokens[offset + i];
+                }
+                self.ced_encoder_prefix_len = cur_base + @as(u32, @intCast(take));
+                self.seq_len = self.ced_encoder_prefix_len;
+                self.mrope_next_pos = self.seq_len;
+                if (is_last_chunk and opts.compute_logits) {
+                    last_argmax = try self.runCedDecoderInitialStep(tokens[tokens.len - 1], self.ced_encoder_prefix_len - 1);
+                }
+                offset += take;
+                continue;
+            }
+
             try self.retireBeforeCommitRange(cur_base, @intCast(take));
             const vr = try self.runForwardInternal(
                 tokens[offset .. offset + take],
@@ -2049,19 +2598,21 @@ pub const GraphModel = struct {
         if (base_pos + m > self.max_seq_len) return error.SequenceFull;
         try self.retireBeforeCommitRange(base_pos, m);
 
+        const is_ced = self.config.isCausalEncDec();
+        const active_end_layer: u32 = if (is_ced) self.config.num_encoder_layers else self.config.num_hidden_layers;
         const h: u32 = self.config.hidden_size;
         const w_stride: u32 = self.wide_prefill_max_tokens;
         const ls = self.config.axes.loop_schedule;
         const R: u32 = @max(@as(u32, 1), self.effective_max_loops);
-        const core_start: u32 = if (R > 1) ls.start_layer else 0;
+        const core_start: u32 = if (R > 1) @min(ls.start_layer, active_end_layer) else 0;
         const core_end: u32 = if (R > 1)
-            (if (ls.end_layer > ls.start_layer) ls.end_layer else self.config.num_hidden_layers)
+            @min(if (ls.end_layer > ls.start_layer) ls.end_layer else active_end_layer, active_end_layer)
         else
-            self.config.num_hidden_layers;
-        const last_l: usize = self.config.num_hidden_layers - 1;
+            active_end_layer;
+        const last_l: usize = active_end_layer - 1;
         const aux_needs_last = self.enable_feature_taps and
             (self.aux_layer_ids[0] == last_l or self.aux_layer_ids[1] == last_l or self.aux_layer_ids[2] == last_l);
-        const allow_tail_prune = self.enable_prompt_tail_pruning and !self.compute_all_logits and
+        const allow_tail_prune = (!is_ced) and self.enable_prompt_tail_pruning and !self.compute_all_logits and
             !preserve_all_top_hidden and !aux_needs_last;
         const prune_non_final_last = allow_tail_prune and (!is_final_chunk or !compute_logits);
         const prune_final_last_to_m1 = allow_tail_prune and is_final_chunk and compute_logits and (m > 1);
@@ -2095,6 +2646,8 @@ pub const GraphModel = struct {
                 .hidden_dim = h,
                 .branch_token_stride = w_stride,
             }, true);
+        } else if (self.wp_mhc_arena) |*mhc| {
+            try self.encodeMhcInitStreams(&frame, mhc.binding(self.scratch_buf), self.wp_x_bind, m, true);
         }
 
         // Prelude layers `[0 .. core_start)`.
@@ -2113,6 +2666,8 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .branch_token_stride = w_stride,
                 }, true);
+            } else if (self.wp_mhc_arena) |*mhc| {
+                try self.encodeMhcCollapseStreams(&frame, mhc.binding(self.scratch_buf), self.wp_x_init_bind, m, true);
             } else {
                 try self.moe_pipes.encodeCopyStrided(&frame, .{
                     .src = self.wp_x_bind,
@@ -2126,7 +2681,7 @@ pub const GraphModel = struct {
         }
 
         // Core recurrent block `[core_start .. core_end) x R`.
-        const has_coda = (core_end < self.config.num_hidden_layers);
+        const has_coda = (core_end < active_end_layer);
         var r: u32 = 0;
         while (r < R) : (r += 1) {
             self.loop_stats.total_loop_steps += 1;
@@ -2139,6 +2694,16 @@ pub const GraphModel = struct {
                         .a = 0.5,
                         .b = 0.5,
                     }, true);
+                } else if (self.wp_mhc_arena) |*mhc| {
+                    try self.encodeMhcCollapseStreams(&frame, mhc.binding(self.scratch_buf), self.wp_x_bind, m, true);
+                    try self.hybrid_pipes.encodeBlendF16(&frame, .{
+                        .dst = self.wp_x_bind,
+                        .src = self.wp_x_init_bind,
+                        .count = m * h,
+                        .a = 0.5,
+                        .b = 0.5,
+                    }, true);
+                    try self.encodeMhcInitStreams(&frame, mhc.binding(self.scratch_buf), self.wp_x_bind, m, true);
                 } else {
                     try self.hybrid_pipes.encodeBlendF16(&frame, .{
                         .dst = self.wp_x_bind,
@@ -2167,8 +2732,8 @@ pub const GraphModel = struct {
             }
         }
 
-        // Coda layers `[core_end .. num_hidden_layers)`.
-        for (core_end..self.config.num_hidden_layers) |l| {
+        // Coda layers `[core_end .. active_end_layer)`.
+        for (core_end..active_end_layer) |l| {
             const is_terminal_exec = (l == last_l);
             try self.execLayerWide(
                 &frame,
@@ -2213,6 +2778,8 @@ pub const GraphModel = struct {
                         .branch_token_stride = w_stride,
                     }, true);
                 }
+            } else if (self.wp_mhc_arena) |*mhc| {
+                try self.encodeMhcCollapseStreams(&frame, mhc.binding(self.scratch_buf), self.wp_x_bind, m, true);
             }
             if (self.enable_feature_taps and preserve_all_top_hidden) {
                 try self.moe_pipes.encodeCopyStrided(&frame, .{
@@ -2224,6 +2791,24 @@ pub const GraphModel = struct {
                     .dst_stride = h,
                 }, true);
             }
+        }
+
+        if (is_ced) {
+            // Finish encoder chunk, project global decoder FP4 KV + CSA2 summaries across all
+            // decoder `Full` layers, then run the initial decoder step (`M = 1`) if requested.
+            const sig = try frame.commit();
+            try self.compute.wait(sig, self.timeout_ms);
+            try self.projectCedEncoderToDecoderKv(base_pos, m, true);
+            for (0..m) |i| {
+                self.token_history[base_pos + @as(u32, @intCast(i))] = tokens[i];
+            }
+            self.ced_encoder_prefix_len = base_pos + m;
+            self.seq_len = self.ced_encoder_prefix_len;
+            self.mrope_next_pos = self.seq_len;
+            if (compute_logits and is_final_chunk) {
+                return try self.runCedDecoderInitialStep(tokens[tokens.len - 1], self.ced_encoder_prefix_len - 1);
+            }
+            return 0;
         }
 
         var logits_rows_computed: u32 = 0;
@@ -2308,54 +2893,97 @@ pub const GraphModel = struct {
         const w_stride: u32 = self.wide_prefill_max_tokens;
         const multi_loop = (total_loops > 1);
         const kv_len_after: u32 = base_pos + m;
+        if (self.config.isCausalEncDec()) {
+            if (l < self.config.num_encoder_layers) {
+                self.m7_stats.encoder_layer_dispatches_prefill += 1;
+            } else {
+                self.m7_stats.decoder_layer_dispatches_prefill += 1;
+            }
+        }
 
         if (self.ple_rt) |prt| {
-            try self.preparePleLayerWide(prt, l, tokens, base_pos, m, loop_step);
+            if (self.config.axes.memory_lookup_kind == .ple_ngram) {
+                try self.preparePleLayerWide(prt, l, tokens, base_pos, m, loop_step);
+            }
         }
 
-        // Pre-attention 4-branch GR read gate.
-        if (self.wp_gr_arena) |*gr| {
-            const gr_w = layer.gr.?;
-            try self.hybrid_pipes.encodeGrComputeGates(frame, .{
-                .stream = gr.binding(self.scratch_buf),
-                .w_read = gr_w.read_gate,
-                .w_write = gr_w.write_gate,
-                .w_decay = gr_w.decay_gate,
-                .g_read_out = self.wp_gr_g_read_bind,
-                .g_write_out = self.wp_gr_g_write_bind,
-                .decay_out = self.wp_gr_decay_bind,
-                .m = m,
-                .hidden_dim = h,
-                .branch_token_stride = w_stride,
-                .weight_dtype = gr_w.dtype,
-            }, true);
-            try self.hybrid_pipes.encodeGrReadGate(frame, .{
-                .stream = gr.binding(self.scratch_buf),
-                .g_read = self.wp_gr_g_read_bind,
-                .x_in = self.wp_x_bind,
-                .m = m,
-                .hidden_dim = h,
-                .branch_token_stride = w_stride,
-            }, true);
-        }
+        // Pre-attention residual read + input RMSNorm (`G10` Mega-mHC, 4-branch GR, or single-stream).
+        if (self.wp_mhc_arena) |*mhc| {
+            const mhc_w = layer.mhc.?;
+            try self.encodeMhcPre(frame, mhc.binding(self.scratch_buf), mhc_w, layer.input_layernorm, self.wp_x_norm_bind, m, true);
+            if (self.ple_rt) |prt| {
+                if (self.config.axes.memory_lookup_kind == .engram) {
+                    try self.flushAndReopenWideFrame(frame);
+                    try self.prepareEngramLayer(prt, l, tokens, null, base_pos, m, loop_step, self.wp_x_norm_host, true);
+                    try self.encodeMhcAddResidual(frame, mhc.binding(self.scratch_buf), self.wpPleLayerBinding(l), m, false);
+                    try self.encodeMhcPre(frame, mhc.binding(self.scratch_buf), mhc_w, layer.input_layernorm, self.wp_x_norm_bind, m, true);
+                }
+            }
+        } else {
+            if (self.wp_gr_arena) |*gr| {
+                const gr_w = layer.gr.?;
+                try self.hybrid_pipes.encodeGrComputeGates(frame, .{
+                    .stream = gr.binding(self.scratch_buf),
+                    .w_read = gr_w.read_gate,
+                    .w_write = gr_w.write_gate,
+                    .w_decay = gr_w.decay_gate,
+                    .g_read_out = self.wp_gr_g_read_bind,
+                    .g_write_out = self.wp_gr_g_write_bind,
+                    .decay_out = self.wp_gr_decay_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                    .weight_dtype = gr_w.dtype,
+                }, true);
+                try self.hybrid_pipes.encodeGrReadGate(frame, .{
+                    .stream = gr.binding(self.scratch_buf),
+                    .g_read = self.wp_gr_g_read_bind,
+                    .x_in = self.wp_x_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                }, true);
+            }
 
-        if (self.ple_rt != null) {
-            try self.moe_pipes.encodeResidualAdd(frame, .{
+            if (self.ple_rt != null and self.config.axes.memory_lookup_kind == .ple_ngram) {
+                try self.moe_pipes.encodeResidualAdd(frame, .{
+                    .x = self.wp_x_bind,
+                    .delta = self.wpPleLayerBinding(l),
+                    .count = m * h,
+                }, true);
+            }
+
+            try self.attn_pipes.encodeRmsNorm(frame, .{
                 .x = self.wp_x_bind,
-                .delta = self.wpPleLayerBinding(l),
-                .count = m * h,
+                .w = layer.input_layernorm.binding,
+                .y = self.wp_x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.input_layernorm.dtype,
             }, true);
-        }
 
-        try self.attn_pipes.encodeRmsNorm(frame, .{
-            .x = self.wp_x_bind,
-            .w = layer.input_layernorm.binding,
-            .y = self.wp_x_norm_bind,
-            .num_rows = m,
-            .hidden_dim = h,
-            .eps = self.config.rms_norm_eps,
-            .w_dtype = layer.input_layernorm.dtype,
-        }, true);
+            if (self.ple_rt) |prt| {
+                if (self.config.axes.memory_lookup_kind == .engram) {
+                    try self.flushAndReopenWideFrame(frame);
+                    try self.prepareEngramLayer(prt, l, tokens, null, base_pos, m, loop_step, self.wp_x_norm_host, true);
+                    try self.moe_pipes.encodeResidualAdd(frame, .{
+                        .x = self.wp_x_bind,
+                        .delta = self.wpPleLayerBinding(l),
+                        .count = m * h,
+                    }, false);
+                    try self.attn_pipes.encodeRmsNorm(frame, .{
+                        .x = self.wp_x_bind,
+                        .w = layer.input_layernorm.binding,
+                        .y = self.wp_x_norm_bind,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = layer.input_layernorm.dtype,
+                    }, true);
+                }
+            }
+        }
 
         const last_x_bind: metal.BufferBinding = .{
             .buffer = self.scratch_buf,
@@ -3121,60 +3749,71 @@ pub const GraphModel = struct {
                 }, true);
                 try self.encodeLinearGemmWithTile(frame, gqa.o_proj, self.wp_attn_out_bind, self.wp_proj_out_bind, eff_m, true, true);
             },
+            .mla_csa2 => |*mla| {
+                var f_opt: ?metal.Compute.Frame = frame.*;
+                try self.execMlaCsa2LayerForward(&f_opt, l, mla, base_pos, m, loop_step, true, true, null);
+                frame.* = f_opt orelse try self.compute.beginFrame(self.timeout_ms);
+            },
         }
 
-        // Post-attention residual update (4-branch GR or standard residual add).
-        if (self.wp_gr_arena) |*gr| {
-            const stream_eff: metal.BufferBinding = if (tail_m1_last)
-                .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
-            else
-                gr.binding(self.scratch_buf);
-            const decay_eff: metal.BufferBinding = if (tail_m1_last)
-                .{ .buffer = self.scratch_buf, .offset = self.wp_gr_decay_bind.offset + @as(u64, m - 1) * 4 * 4 }
-            else
-                self.wp_gr_decay_bind;
-            const gwrite_eff: metal.BufferBinding = if (tail_m1_last)
-                .{ .buffer = self.scratch_buf, .offset = self.wp_gr_g_write_bind.offset + @as(u64, m - 1) * 4 * 4 }
-            else
-                self.wp_gr_g_write_bind;
-            const gread_eff: metal.BufferBinding = if (tail_m1_last)
-                .{ .buffer = self.scratch_buf, .offset = self.wp_gr_g_read_bind.offset + @as(u64, m - 1) * 4 * 4 }
-            else
-                self.wp_gr_g_read_bind;
-            try self.hybrid_pipes.encodeGrWriteGate(frame, .{
-                .stream = stream_eff,
-                .y_delta = self.wp_proj_out_bind,
-                .decay = decay_eff,
-                .g_write = gwrite_eff,
-                .m = eff_m,
-                .hidden_dim = h,
-                .branch_token_stride = w_stride,
-            }, true);
-            try self.hybrid_pipes.encodeGrReadGate(frame, .{
-                .stream = stream_eff,
-                .g_read = gread_eff,
-                .x_in = eff_x_bind,
-                .m = eff_m,
-                .hidden_dim = h,
-                .branch_token_stride = w_stride,
-            }, true);
+        // Post-attention residual update & post-attention RMSNorm (`G10` Mega-mHC, 4-branch GR, or single-stream).
+        if (self.wp_mhc_arena) |*mhc| {
+            const mhc_w = layer.mhc.?;
+            try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, mhc_w, eff_m, true);
+            try self.encodeMhcPre(frame, mhc.binding(self.scratch_buf), mhc_w, layer.post_attention_layernorm, self.wp_x_norm_bind, eff_m, true);
         } else {
-            try self.moe_pipes.encodeResidualAdd(frame, .{
+            if (self.wp_gr_arena) |*gr| {
+                const stream_eff: metal.BufferBinding = if (tail_m1_last)
+                    .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
+                else
+                    gr.binding(self.scratch_buf);
+                const decay_eff: metal.BufferBinding = if (tail_m1_last)
+                    .{ .buffer = self.scratch_buf, .offset = self.wp_gr_decay_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                else
+                    self.wp_gr_decay_bind;
+                const gwrite_eff: metal.BufferBinding = if (tail_m1_last)
+                    .{ .buffer = self.scratch_buf, .offset = self.wp_gr_g_write_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                else
+                    self.wp_gr_g_write_bind;
+                const gread_eff: metal.BufferBinding = if (tail_m1_last)
+                    .{ .buffer = self.scratch_buf, .offset = self.wp_gr_g_read_bind.offset + @as(u64, m - 1) * 4 * 4 }
+                else
+                    self.wp_gr_g_read_bind;
+                try self.hybrid_pipes.encodeGrWriteGate(frame, .{
+                    .stream = stream_eff,
+                    .y_delta = self.wp_proj_out_bind,
+                    .decay = decay_eff,
+                    .g_write = gwrite_eff,
+                    .m = eff_m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                }, true);
+                try self.hybrid_pipes.encodeGrReadGate(frame, .{
+                    .stream = stream_eff,
+                    .g_read = gread_eff,
+                    .x_in = eff_x_bind,
+                    .m = eff_m,
+                    .hidden_dim = h,
+                    .branch_token_stride = w_stride,
+                }, true);
+            } else {
+                try self.moe_pipes.encodeResidualAdd(frame, .{
+                    .x = eff_x_bind,
+                    .delta = self.wp_proj_out_bind,
+                    .count = eff_m * h,
+                }, true);
+            }
+
+            try self.attn_pipes.encodeRmsNorm(frame, .{
                 .x = eff_x_bind,
-                .delta = self.wp_proj_out_bind,
-                .count = eff_m * h,
+                .w = layer.post_attention_layernorm.binding,
+                .y = self.wp_x_norm_bind,
+                .num_rows = eff_m,
+                .hidden_dim = h,
+                .eps = self.config.rms_norm_eps,
+                .w_dtype = layer.post_attention_layernorm.dtype,
             }, true);
         }
-
-        try self.attn_pipes.encodeRmsNorm(frame, .{
-            .x = eff_x_bind,
-            .w = layer.post_attention_layernorm.binding,
-            .y = self.wp_x_norm_bind,
-            .num_rows = eff_m,
-            .hidden_dim = h,
-            .eps = self.config.rms_norm_eps,
-            .w_dtype = layer.post_attention_layernorm.dtype,
-        }, true);
 
         switch (self.config.axes.ffn_kind) {
             .dense_swiglu => {
@@ -3187,7 +3826,9 @@ pub const GraphModel = struct {
                     .count = eff_m * self.config.intermediate_size,
                 }, true);
                 try self.encodeLinearGemmWithTile(frame, layer.dense_down, self.wp_dense_act_bind, self.wp_proj_out_bind, eff_m, true, true);
-                if (self.wp_gr_arena) |*gr| {
+                if (self.wp_mhc_arena) |*mhc| {
+                    try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer.mhc.?, eff_m, true);
+                } else if (self.wp_gr_arena) |*gr| {
                     const stream_eff: metal.BufferBinding = if (tail_m1_last)
                         .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
                     else
@@ -3219,6 +3860,7 @@ pub const GraphModel = struct {
             },
             .moe_swiglu => {
                 const ws_ptr = &(self.wp_moe_ws.?);
+                const layer_top_k = self.config.layerTopK(l);
                 const router_src: moe.RouterSource = if (layer.router_quant_dtype) |rqd| .{
                     .quant_weights = .{
                         .qweight = layer.router_binding,
@@ -3236,8 +3878,9 @@ pub const GraphModel = struct {
                         .dtype = layer.router_dtype,
                     },
                 };
-                const residual_bind: ?metal.BufferBinding = if (self.wp_gr_arena != null) null else eff_x_bind;
-                const out_bind: metal.BufferBinding = if (self.wp_gr_arena != null) self.wp_proj_out_bind else eff_x_bind;
+                const needs_proj_out = (self.wp_gr_arena != null or self.wp_mhc_arena != null);
+                const residual_bind: ?metal.BufferBinding = if (needs_proj_out) null else eff_x_bind;
+                const out_bind: metal.BufferBinding = if (needs_proj_out) self.wp_proj_out_bind else eff_x_bind;
                 const moe_args: moe.MoELayerArgs = .{
                     .x = self.wp_x_norm_bind,
                     .router = router_src,
@@ -3249,7 +3892,7 @@ pub const GraphModel = struct {
                     .out = out_bind,
                     .m = eff_m,
                     .num_experts = self.config.num_experts,
-                    .top_k = self.config.num_experts_per_tok,
+                    .top_k = layer_top_k,
                     .hidden_size = h,
                     .intermediate_size = self.config.moe_intermediate_size,
                     .norm_topk_prob = self.config.norm_topk_prob,
@@ -3260,7 +3903,11 @@ pub const GraphModel = struct {
                     .shared_gate_weight = layer.shared_gate_weight,
                     .shared_gate_dtype = layer.shared_gate_dtype,
                 };
-                if (layer.is_hetero_moe) {
+                if (layer.has_remote_experts and self.cluster_coordinator != null) {
+                    var f_opt: ?metal.Compute.Frame = frame.*;
+                    try self.execClusterMoeFfn(&f_opt, l, layer, ws_ptr, router_src, self.wp_x_norm_bind, self.wp_x_norm_host, self.wp_proj_out_bind, self.wp_proj_out_host, eff_x_bind, eff_m, layer_top_k, needs_proj_out);
+                    frame.* = f_opt orelse try self.compute.beginFrame(self.timeout_ms);
+                } else if (layer.is_hetero_moe) {
                     try self.moe_pipes.encodeMoELayerHetero(frame, .{
                         .base = moe_args,
                         .expert_schemes = layer.expert_dtypes_binding.?,
@@ -3275,7 +3922,9 @@ pub const GraphModel = struct {
                         .bf16 => try self.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, true),
                     }
                 }
-                if (self.wp_gr_arena) |*gr| {
+                if (self.wp_mhc_arena) |*mhc| {
+                    try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer.mhc.?, eff_m, true);
+                } else if (self.wp_gr_arena) |*gr| {
                     const stream_eff: metal.BufferBinding = if (tail_m1_last)
                         .{ .buffer = self.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
                     else
@@ -3436,7 +4085,10 @@ pub const GraphModel = struct {
         errdefer frame.abort();
         var had_dispatch = false;
 
-        for (self.layers) |*layer| {
+        const commit_layer_start: usize = if (self.config.isCausalEncDec()) self.config.num_encoder_layers else 0;
+        const mla_k: u32 = @intCast(accepted_nodes.len);
+        const mla_new_kv_len: u32 = base_pos + mla_k;
+        for (self.layers[commit_layer_start..]) |*layer| {
             switch (layer.attn) {
                 .gdn => |g| {
                     const ga = &(self.gdn_arena.?);
@@ -3477,6 +4129,65 @@ pub const GraphModel = struct {
                     try self.encodeGqaCommitAccepted(&frame, gqa, base_pos, accepted_nodes, had_dispatch);
                     had_dispatch = true;
                 },
+                .mla_csa2 => |mla| {
+                    if (mla.mode == .full) {
+                        // Gather accepted rows from this layer's uncommitted `tree_latent_off` / `tree_rope_off`
+                        // into contiguous per-layer commit slice, then write FP4 KV + update CSA2 summaries.
+                        // Flush any prior dispatches before host gather if another Full layer already used commit scratch.
+                        if (had_dispatch) {
+                            const sig_prev = try frame.commit();
+                            try self.compute.wait(sig_prev, self.timeout_ms);
+                            frame = try self.compute.beginFrame(self.timeout_ms);
+                            had_dispatch = false;
+                        }
+                        const kv_rank: usize = self.config.kv_lora_rank;
+                        const d_rope: usize = self.config.qk_rope_head_dim;
+                        const scratch_raw = self.scratch_arena.bytes();
+                        const src_lat: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, scratch_raw[@intCast(mla.tree_latent_off)..][0 .. @as(usize, self.max_tree_nodes) * kv_rank * 2]));
+                        for (accepted_nodes, 0..) |nid, idx| {
+                            @memcpy(
+                                self.mla_commit_latent_host[idx * kv_rank ..][0..kv_rank],
+                                src_lat[@as(usize, nid) * kv_rank ..][0..kv_rank],
+                            );
+                        }
+                        if (d_rope > 0) {
+                            const src_rope: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, scratch_raw[@intCast(mla.tree_rope_off)..][0 .. @as(usize, self.max_tree_nodes) * d_rope * 2]));
+                            for (accepted_nodes, 0..) |nid, idx| {
+                                @memcpy(
+                                    self.mla_commit_rope_host[idx * d_rope ..][0..d_rope],
+                                    src_rope[@as(usize, nid) * d_rope ..][0..d_rope],
+                                );
+                            }
+                        }
+                        const kv_arena = &(self.mla_kv_arena.?);
+                        const sum_arena = &(self.csa2_summary_arena.?);
+                        try self.hybrid_pipes.encodeMlaFp4KvWrite(&frame, .{
+                            .latent_in = self.mla_commit_latent_bind,
+                            .rope_in = if (d_rope > 0) self.mla_commit_rope_bind else null,
+                            .kv_arena = kv_arena,
+                            .kv_metal_buf = self.mla_kv_buf,
+                            .kv_slot = mla.shared_kv_owner,
+                            .swa_ring = if (self.mla_swa_arena) |*sa| sa else null,
+                            .swa_metal_buf = if (self.mla_swa_arena != null) self.mla_kv_buf else null,
+                            .num_tokens = mla_k,
+                            .start_pos = base_pos,
+                            .is_encoder_projection = false,
+                        }, had_dispatch);
+                        const coarse_span = sum_arena.spec.block_tokens * sum_arena.spec.coarse_group_blocks;
+                        try self.hybrid_pipes.encodeCsa2UpdateSummaries(&frame, .{
+                            .kv_arena = kv_arena,
+                            .kv_metal_buf = self.mla_kv_buf,
+                            .summary_arena = sum_arena,
+                            .summary_metal_buf = self.mla_kv_buf,
+                            .kv_slot = mla.shared_kv_owner,
+                            .kv_len = mla_new_kv_len,
+                            .start_coarse_block = base_pos / coarse_span,
+                        }, true);
+                        self.m7_stats.csa2_kv_writes += 1;
+                        self.m7_stats.csa2_summary_updates += 1;
+                        had_dispatch = true;
+                    }
+                },
             }
         }
 
@@ -3490,6 +4201,18 @@ pub const GraphModel = struct {
             try self.compute.wait(sig, self.timeout_ms);
         } else {
             frame.abort();
+        }
+
+        // Update DSpark `last_decoder_hidden` to the last accepted node's top hidden state.
+        if (self.ced_last_decoder_hidden_host.len == self.config.hidden_size and
+            self.ced_tree_top_hidden_host.len >= @as(usize, self.max_tree_nodes) * self.config.hidden_size)
+        {
+            const last_acc = accepted_nodes[accepted_nodes.len - 1];
+            if (last_acc < self.last_verified_nodes) {
+                const h: usize = self.config.hidden_size;
+                const src = self.ced_tree_top_hidden_host[@as(usize, last_acc) * h ..][0..h];
+                for (0..h) |d| self.ced_last_decoder_hidden_host[d] = @floatCast(src[d]);
+            }
         }
 
         // Advance committed token history for PLE N-gram hashes.
@@ -3826,6 +4549,12 @@ pub const GraphModel = struct {
     // Core Forward Execution with All 4 ADR-0019 Loop Isolations
     // -----------------------------------------------------------------------
 
+    const ForwardPhase = enum {
+        auto,
+        ced_encoder_only,
+        ced_decoder_only,
+    };
+
     fn runForwardInternal(
         self: *GraphModel,
         token_ids: []const u32,
@@ -3840,15 +4569,61 @@ pub const GraphModel = struct {
         custom_pos3d: ?[]const hybrid.Pos3D,
         vis_override: ?VisualEmbedOverride,
     ) GraphStepError!qwen3.VerifyTreeResult {
+        return self.runForwardInternalEx(
+            token_ids,
+            positions,
+            ancestor_masks,
+            base_pos,
+            num_loops,
+            compute_logits,
+            topk_k,
+            topk_out,
+            commit_state_on_final,
+            custom_pos3d,
+            vis_override,
+            .auto,
+            null,
+        );
+    }
+
+    fn runForwardInternalEx(
+        self: *GraphModel,
+        token_ids: []const u32,
+        positions: []const u32,
+        ancestor_masks: []const u64,
+        base_pos: u32,
+        num_loops: u32,
+        compute_logits: bool,
+        topk_k: u32,
+        topk_out: ?[]moe.TopKCandidate,
+        commit_state_on_final: bool,
+        custom_pos3d: ?[]const hybrid.Pos3D,
+        vis_override: ?VisualEmbedOverride,
+        phase: ForwardPhase,
+        kv_len_override: ?u32,
+    ) GraphStepError!qwen3.VerifyTreeResult {
         const m: u32 = @intCast(token_ids.len);
         const h: u32 = self.config.hidden_size;
         const ls = self.config.axes.loop_schedule;
         const R: u32 = @max(@as(u32, 1), num_loops);
-        const core_start: u32 = if (R > 1) ls.start_layer else 0;
+        const is_ced = self.config.isCausalEncDec();
+        const phase_start: u32 = if (!is_ced)
+            0
+        else switch (phase) {
+            .ced_encoder_only => 0,
+            .auto, .ced_decoder_only => self.config.num_encoder_layers,
+        };
+        const phase_end: u32 = if (!is_ced)
+            self.config.num_hidden_layers
+        else switch (phase) {
+            .ced_encoder_only => self.config.num_encoder_layers,
+            .auto, .ced_decoder_only => self.config.num_hidden_layers,
+        };
+        const core_start: u32 = if (R > 1) @min(@max(ls.start_layer, phase_start), phase_end) else phase_start;
         const core_end: u32 = if (R > 1)
-            (if (ls.end_layer > ls.start_layer) ls.end_layer else self.config.num_hidden_layers)
+            @min(@max(if (ls.end_layer > ls.start_layer) ls.end_layer else phase_end, core_start), phase_end)
         else
-            self.config.num_hidden_layers;
+            phase_end;
 
         // Stage inputs into preallocated wired host slices (0 heap allocs).
         for (0..m) |i| {
@@ -3899,7 +4674,7 @@ pub const GraphModel = struct {
                 }, true);
             }
 
-            // Initialize 4-branch GR stream (`G10`) if active.
+            // Initialize 4-branch GR stream or Single-Pass Mega-mHC hyper-streams (`G10`).
             if (self.gr_arena) |*gr| {
                 try self.hybrid_pipes.encodeGrInitStream0(f, .{
                     .x0 = self.x_bind,
@@ -3908,12 +4683,14 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .branch_token_stride = self.max_tree_nodes,
                 }, true);
+            } else if (self.mhc_arena) |*mhc| {
+                try self.encodeMhcInitStreams(f, mhc.binding(self.scratch_buf), self.x_bind, m, true);
             }
         }
 
-        // 2. Prelude layers `[0 .. core_start)` (executed once at `r = 0`).
-        for (0..core_start) |l| {
-            try self.execLayer(
+        // 2. Prelude layers `[phase_start .. core_start)` (executed once at `r = 0`).
+        for (phase_start..core_start) |l| {
+            try self.execLayerEx(
                 &frame_opt,
                 l,
                 token_ids,
@@ -3921,8 +4698,10 @@ pub const GraphModel = struct {
                 base_pos,
                 m,
                 0,
-                true, // prelude always commits on single pass when `commit_state_on_final`
+                true,
                 commit_state_on_final,
+                phase,
+                kv_len_override,
             );
         }
 
@@ -3938,6 +4717,8 @@ pub const GraphModel = struct {
                     .hidden_dim = h,
                     .branch_token_stride = self.max_tree_nodes,
                 }, true);
+            } else if (self.mhc_arena) |*mhc| {
+                try self.encodeMhcCollapseStreams(f, mhc.binding(self.scratch_buf), self.x_init_bind, m, true);
             } else {
                 try self.moe_pipes.encodeCopyStrided(f, .{
                     .src = self.x_bind,
@@ -3967,6 +4748,16 @@ pub const GraphModel = struct {
                         .a = 0.5,
                         .b = 0.5,
                     }, true);
+                } else if (self.mhc_arena) |*mhc| {
+                    try self.encodeMhcCollapseStreams(f, mhc.binding(self.scratch_buf), self.x_bind, m, true);
+                    try self.hybrid_pipes.encodeBlendF16(f, .{
+                        .dst = self.x_bind,
+                        .src = self.x_init_bind,
+                        .count = m * h,
+                        .a = 0.5,
+                        .b = 0.5,
+                    }, true);
+                    try self.encodeMhcInitStreams(f, mhc.binding(self.scratch_buf), self.x_bind, m, true);
                 } else {
                     try self.hybrid_pipes.encodeBlendF16(f, .{
                         .dst = self.x_bind,
@@ -3980,7 +4771,7 @@ pub const GraphModel = struct {
 
             const is_final_pass = (r == R - 1);
             for (core_start..core_end) |l| {
-                try self.execLayer(
+                try self.execLayerEx(
                     &frame_opt,
                     l,
                     token_ids,
@@ -3990,6 +4781,8 @@ pub const GraphModel = struct {
                     r,
                     is_final_pass,
                     commit_state_on_final and is_final_pass,
+                    phase,
+                    kv_len_override,
                 );
             }
 
@@ -4007,6 +4800,9 @@ pub const GraphModel = struct {
                         .hidden_dim = h,
                         .branch_token_stride = self.max_tree_nodes,
                     }, true);
+                } else if (self.mhc_arena) |*mhc| {
+                    const f = try self.ensureFrame(&frame_opt);
+                    try self.encodeMhcCollapseStreams(f, mhc.binding(self.scratch_buf), self.x_bind, m, true);
                 }
                 try self.flushFrame(&frame_opt);
                 if (self.shouldEarlyExitCpu(m)) {
@@ -4020,9 +4816,9 @@ pub const GraphModel = struct {
             }
         }
 
-        // 4. Coda layers `[core_end .. num_hidden_layers)` (executed once after Core).
-        for (core_end..self.config.num_hidden_layers) |l| {
-            try self.execLayer(
+        // 4. Coda layers `[core_end .. phase_end)` (executed once after Core).
+        for (core_end..phase_end) |l| {
+            try self.execLayerEx(
                 &frame_opt,
                 l,
                 token_ids,
@@ -4032,10 +4828,12 @@ pub const GraphModel = struct {
                 0,
                 true,
                 commit_state_on_final,
+                phase,
+                kv_len_override,
             );
         }
 
-        // Collapse 4-branch GR stream to single-stream `x_bind` (`mean` of 4 branches).
+        // Collapse 4-branch GR or Single-Pass Mega-mHC hyper-streams to single-stream `x_bind`.
         if (self.gr_arena) |*gr| {
             const f = try self.ensureFrame(&frame_opt);
             try self.hybrid_pipes.encodeGrCollapse(f, .{
@@ -4046,6 +4844,9 @@ pub const GraphModel = struct {
                 .hidden_dim = h,
                 .branch_token_stride = self.max_tree_nodes,
             }, true);
+        } else if (self.mhc_arena) |*mhc| {
+            const f = try self.ensureFrame(&frame_opt);
+            try self.encodeMhcCollapseStreams(f, mhc.binding(self.scratch_buf), self.x_bind, m, true);
         }
 
         // 5. Final norm + `lm_head` + argmax / optional top-K (NEVER run on `r < R - 1`).
@@ -4081,6 +4882,14 @@ pub const GraphModel = struct {
         }
 
         try self.flushFrame(&frame_opt);
+        if (phase != .ced_encoder_only and self.ced_last_decoder_hidden_host.len == h) {
+            if (commit_state_on_final or kv_len_override != null) {
+                const last_row = self.x_host[@as(usize, m - 1) * h ..][0..h];
+                for (0..h) |d| self.ced_last_decoder_hidden_host[d] = @floatCast(last_row[d]);
+            } else if (self.ced_tree_top_hidden_host.len >= @as(usize, m) * h) {
+                @memcpy(self.ced_tree_top_hidden_host[0 .. @as(usize, m) * h], self.x_host[0 .. @as(usize, m) * h]);
+            }
+        }
         if (compute_logits) {
             self.last_logits_row = @as(usize, m) - 1;
             if (topk_k > 0) {
@@ -4091,16 +4900,17 @@ pub const GraphModel = struct {
             }
         }
 
-        // Gather measured unique active experts across MoE layers.
+        // Gather measured unique active experts across active MoE layers.
         var total_unique: u64 = 0;
         if (self.config.axes.ffn_kind == .moe_swiglu) {
-            for (0..self.layers.len) |l| {
+            for (phase_start..phase_end) |l| {
                 const hdr: *const moe.ScheduleHeader = @ptrCast(@alignCast(self.layer_sched_hdr_raw.ptr + l * 64));
                 total_unique += hdr.num_unique_experts;
             }
         }
+        const active_layer_count: usize = @max(@as(usize, 1), @as(usize, phase_end - phase_start));
         const avg_unique: f64 = if (self.config.axes.ffn_kind == .moe_swiglu)
-            @as(f64, @floatFromInt(total_unique)) / @as(f64, @floatFromInt(self.layers.len))
+            @as(f64, @floatFromInt(total_unique)) / @as(f64, @floatFromInt(active_layer_count))
         else
             0.0;
 
@@ -4128,7 +4938,7 @@ pub const GraphModel = struct {
         };
     }
 
-    fn execLayer(
+    fn execLayerEx(
         self: *GraphModel,
         frame_opt: *?metal.Compute.Frame,
         l: usize,
@@ -4139,64 +4949,122 @@ pub const GraphModel = struct {
         loop_step: u32,
         is_final_pass: bool,
         commit_kv_and_gdn: bool,
+        phase: ForwardPhase,
+        kv_len_override: ?u32,
     ) GraphStepError!void {
         const layer = &self.layers[l];
         const h = self.config.hidden_size;
+        if (self.config.isCausalEncDec()) {
+            if (l < self.config.num_encoder_layers) {
+                if (phase == .ced_encoder_only) {
+                    self.m7_stats.encoder_layer_dispatches_prefill += 1;
+                } else {
+                    self.m7_stats.encoder_layer_dispatches_decode += 1;
+                }
+            } else {
+                if (kv_len_override != null) {
+                    self.m7_stats.decoder_layer_dispatches_prefill += 1;
+                } else {
+                    self.m7_stats.decoder_layer_dispatches_decode += 1;
+                }
+            }
+        }
 
         // --- Isolation #2 (PLE C10): single lookup at `r = 0`, 0 NVMe reads at `r >= 1` ---
         if (self.ple_rt) |prt| {
-            try self.preparePleLayer(prt, l, token_ids, ancestor_masks, base_pos, m, loop_step);
+            if (self.config.axes.memory_lookup_kind == .ple_ngram) {
+                try self.preparePleLayer(prt, l, token_ids, ancestor_masks, base_pos, m, loop_step);
+            }
         }
 
-        // --- Pre-Attention 4-Branch GR Read Gate (G10) ---
-        if (self.gr_arena) |*gr| {
-            const gr_w = layer.gr.?;
-            const f = try self.ensureFrame(frame_opt);
-            try self.hybrid_pipes.encodeGrComputeGates(f, .{
-                .stream = gr.binding(self.scratch_buf),
-                .w_read = gr_w.read_gate,
-                .w_write = gr_w.write_gate,
-                .w_decay = gr_w.decay_gate,
-                .g_read_out = self.gr_g_read_bind,
-                .g_write_out = self.gr_g_write_bind,
-                .decay_out = self.gr_decay_bind,
-                .m = m,
-                .hidden_dim = h,
-                .branch_token_stride = self.max_tree_nodes,
-                .weight_dtype = gr_w.dtype,
-            }, true);
-            try self.hybrid_pipes.encodeGrReadGate(f, .{
-                .stream = gr.binding(self.scratch_buf),
-                .g_read = self.gr_g_read_bind,
-                .x_in = self.x_bind,
-                .m = m,
-                .hidden_dim = h,
-                .branch_token_stride = self.max_tree_nodes,
-            }, true);
-        }
+        // --- Pre-Attention Residual Mix + Input RMSNorm (`G10` Mega-mHC, 4-branch GR, or single-stream) ---
+        if (self.mhc_arena) |*mhc| {
+            const mhc_w = layer.mhc.?;
+            {
+                const f = try self.ensureFrame(frame_opt);
+                try self.encodeMhcPre(f, mhc.binding(self.scratch_buf), mhc_w, layer.input_layernorm, self.x_norm_bind, m, true);
+            }
+            if (self.ple_rt) |prt| {
+                if (self.config.axes.memory_lookup_kind == .engram) {
+                    try self.flushFrame(frame_opt);
+                    try self.prepareEngramLayer(prt, l, token_ids, ancestor_masks, base_pos, m, loop_step, self.x_norm_host, false);
+                    const f = try self.ensureFrame(frame_opt);
+                    try self.encodeMhcAddResidual(f, mhc.binding(self.scratch_buf), self.pleLayerBinding(l), m, false);
+                    try self.encodeMhcPre(f, mhc.binding(self.scratch_buf), mhc_w, layer.input_layernorm, self.x_norm_bind, m, true);
+                }
+            }
+        } else {
+            if (self.gr_arena) |*gr| {
+                const gr_w = layer.gr.?;
+                const f = try self.ensureFrame(frame_opt);
+                try self.hybrid_pipes.encodeGrComputeGates(f, .{
+                    .stream = gr.binding(self.scratch_buf),
+                    .w_read = gr_w.read_gate,
+                    .w_write = gr_w.write_gate,
+                    .w_decay = gr_w.decay_gate,
+                    .g_read_out = self.gr_g_read_bind,
+                    .g_write_out = self.gr_g_write_bind,
+                    .decay_out = self.gr_decay_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = self.max_tree_nodes,
+                    .weight_dtype = gr_w.dtype,
+                }, true);
+                try self.hybrid_pipes.encodeGrReadGate(f, .{
+                    .stream = gr.binding(self.scratch_buf),
+                    .g_read = self.gr_g_read_bind,
+                    .x_in = self.x_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = self.max_tree_nodes,
+                }, true);
+            }
 
-        // Accumulate PLE contribution into `x_bind` (inside the same Metal CB, 0 mid-pass sync).
-        if (self.ple_rt != null) {
-            const f = try self.ensureFrame(frame_opt);
-            try self.moe_pipes.encodeResidualAdd(f, .{
-                .x = self.x_bind,
-                .delta = self.pleLayerBinding(l),
-                .count = m * h,
-            }, true);
-        }
+            // Accumulate PLE contribution into `x_bind` (inside the same Metal CB, 0 mid-pass sync).
+            if (self.ple_rt != null and self.config.axes.memory_lookup_kind == .ple_ngram) {
+                const f = try self.ensureFrame(frame_opt);
+                try self.moe_pipes.encodeResidualAdd(f, .{
+                    .x = self.x_bind,
+                    .delta = self.pleLayerBinding(l),
+                    .count = m * h,
+                }, true);
+            }
 
-        // Input RMSNorm -> `x_norm_bind`.
-        {
-            const f = try self.ensureFrame(frame_opt);
-            try self.attn_pipes.encodeRmsNorm(f, .{
-                .x = self.x_bind,
-                .w = layer.input_layernorm.binding,
-                .y = self.x_norm_bind,
-                .num_rows = m,
-                .hidden_dim = h,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = layer.input_layernorm.dtype,
-            }, true);
+            // Input RMSNorm -> `x_norm_bind`.
+            {
+                const f = try self.ensureFrame(frame_opt);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = layer.input_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.input_layernorm.dtype,
+                }, true);
+            }
+
+            if (self.ple_rt) |prt| {
+                if (self.config.axes.memory_lookup_kind == .engram) {
+                    try self.flushFrame(frame_opt);
+                    try self.prepareEngramLayer(prt, l, token_ids, ancestor_masks, base_pos, m, loop_step, self.x_norm_host, false);
+                    const f = try self.ensureFrame(frame_opt);
+                    try self.moe_pipes.encodeResidualAdd(f, .{
+                        .x = self.x_bind,
+                        .delta = self.pleLayerBinding(l),
+                        .count = m * h,
+                    }, false);
+                    try self.attn_pipes.encodeRmsNorm(f, .{
+                        .x = self.x_bind,
+                        .w = layer.input_layernorm.binding,
+                        .y = self.x_norm_bind,
+                        .num_rows = m,
+                        .hidden_dim = h,
+                        .eps = self.config.rms_norm_eps,
+                        .w_dtype = layer.input_layernorm.dtype,
+                    }, true);
+                }
+            }
         }
 
         // --- Attention / Sequence Mixer Dispatch ---
@@ -4210,50 +5078,60 @@ pub const GraphModel = struct {
             .gqa => |gqa| {
                 try self.execGqaAttention(frame_opt, l, gqa, base_pos, m, loop_step, commit_kv_and_gdn);
             },
+            .mla_csa2 => |*mla| {
+                try self.execMlaCsa2LayerForward(frame_opt, l, mla, base_pos, m, loop_step, commit_kv_and_gdn, false, kv_len_override);
+            },
         }
 
-        // Residual update after attention (`G10` 4-branch write-gate or standard residual add).
-        if (self.gr_arena) |*gr| {
+        // Residual update after attention + Post-attention RMSNorm (`G10` Mega-mHC, 4-branch GR, or single-stream).
+        if (self.mhc_arena) |*mhc| {
+            const mhc_w = layer.mhc.?;
             const f = try self.ensureFrame(frame_opt);
-            try self.hybrid_pipes.encodeGrWriteGate(f, .{
-                .stream = gr.binding(self.scratch_buf),
-                .y_delta = self.proj_out_bind,
-                .decay = self.gr_decay_bind,
-                .g_write = self.gr_g_write_bind,
-                .m = m,
-                .hidden_dim = h,
-                .branch_token_stride = self.max_tree_nodes,
-            }, true);
-            // Read updated stream back into `x_bind` for FFN sub-block.
-            try self.hybrid_pipes.encodeGrReadGate(f, .{
-                .stream = gr.binding(self.scratch_buf),
-                .g_read = self.gr_g_read_bind,
-                .x_in = self.x_bind,
-                .m = m,
-                .hidden_dim = h,
-                .branch_token_stride = self.max_tree_nodes,
-            }, true);
+            try self.encodeMhcPost(f, mhc.binding(self.scratch_buf), self.proj_out_bind, mhc_w, m, true);
+            try self.encodeMhcPre(f, mhc.binding(self.scratch_buf), mhc_w, layer.post_attention_layernorm, self.x_norm_bind, m, true);
         } else {
-            const f = try self.ensureFrame(frame_opt);
-            try self.moe_pipes.encodeResidualAdd(f, .{
-                .x = self.x_bind,
-                .delta = self.proj_out_bind,
-                .count = m * h,
-            }, true);
-        }
+            if (self.gr_arena) |*gr| {
+                const f = try self.ensureFrame(frame_opt);
+                try self.hybrid_pipes.encodeGrWriteGate(f, .{
+                    .stream = gr.binding(self.scratch_buf),
+                    .y_delta = self.proj_out_bind,
+                    .decay = self.gr_decay_bind,
+                    .g_write = self.gr_g_write_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = self.max_tree_nodes,
+                }, true);
+                // Read updated stream back into `x_bind` for FFN sub-block.
+                try self.hybrid_pipes.encodeGrReadGate(f, .{
+                    .stream = gr.binding(self.scratch_buf),
+                    .g_read = self.gr_g_read_bind,
+                    .x_in = self.x_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .branch_token_stride = self.max_tree_nodes,
+                }, true);
+            } else {
+                const f = try self.ensureFrame(frame_opt);
+                try self.moe_pipes.encodeResidualAdd(f, .{
+                    .x = self.x_bind,
+                    .delta = self.proj_out_bind,
+                    .count = m * h,
+                }, true);
+            }
 
-        // Post-attention RMSNorm -> `x_norm_bind`.
-        {
-            const f = try self.ensureFrame(frame_opt);
-            try self.attn_pipes.encodeRmsNorm(f, .{
-                .x = self.x_bind,
-                .w = layer.post_attention_layernorm.binding,
-                .y = self.x_norm_bind,
-                .num_rows = m,
-                .hidden_dim = h,
-                .eps = self.config.rms_norm_eps,
-                .w_dtype = layer.post_attention_layernorm.dtype,
-            }, true);
+            // Post-attention RMSNorm -> `x_norm_bind`.
+            {
+                const f = try self.ensureFrame(frame_opt);
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = self.x_bind,
+                    .w = layer.post_attention_layernorm.binding,
+                    .y = self.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = self.config.rms_norm_eps,
+                    .w_dtype = layer.post_attention_layernorm.dtype,
+                }, true);
+            }
         }
 
         // --- FFN / MoE Dispatch ---
@@ -4271,7 +5149,7 @@ pub const GraphModel = struct {
                     }, true);
                 }
                 try self.execLinearWithOptionalStepLora(frame_opt, l, loop_step, .down_proj, layer.dense_down, self.dense_act_bind, self.dense_act_host, self.proj_out_bind, self.proj_out_host, m, true);
-                try self.applyFfnResidual(frame_opt, m, h);
+                try self.applyFfnResidual(frame_opt, l, m, h);
             },
             .moe_swiglu => {
                 try self.execMoeFfn(frame_opt, l, layer, m, loop_step);
@@ -4292,6 +5170,8 @@ pub const GraphModel = struct {
                             .hidden_dim = h,
                             .branch_token_stride = self.max_tree_nodes,
                         }, true);
+                    } else if (self.mhc_arena) |*mhc| {
+                        try self.encodeMhcCollapseStreams(f, mhc.binding(self.scratch_buf), self.x_bind, m, true);
                     }
                     try self.moe_pipes.encodeCopyStrided(f, .{
                         .src = self.x_bind,
@@ -4307,9 +5187,11 @@ pub const GraphModel = struct {
         }
     }
 
-    fn applyFfnResidual(self: *GraphModel, frame_opt: *?metal.Compute.Frame, m: u32, h: u32) GraphStepError!void {
+    fn applyFfnResidual(self: *GraphModel, frame_opt: *?metal.Compute.Frame, l: usize, m: u32, h: u32) GraphStepError!void {
         const f = try self.ensureFrame(frame_opt);
-        if (self.gr_arena) |*gr| {
+        if (self.mhc_arena) |*mhc| {
+            try self.encodeMhcPost(f, mhc.binding(self.scratch_buf), self.proj_out_bind, self.layers[l].mhc.?, m, true);
+        } else if (self.gr_arena) |*gr| {
             try self.hybrid_pipes.encodeGrWriteGate(f, .{
                 .stream = gr.binding(self.scratch_buf),
                 .y_delta = self.proj_out_bind,
@@ -4765,10 +5647,38 @@ pub const GraphModel = struct {
             },
         };
 
-        // Residual target: for 4-branch GR, write FFN delta into `proj_out_bind` (zero residual)
-        // and feed into `ami_gr_write_gate`; for single-stream, fuse `x + ffn` directly into `x_bind`.
-        const moe_residual: ?metal.BufferBinding = if (self.gr_arena != null) null else self.x_bind;
-        const moe_out: metal.BufferBinding = if (self.gr_arena != null) self.proj_out_bind else self.x_bind;
+        // Residual target: for 4-branch GR / Mega-mHC, write FFN delta into `proj_out_bind` (zero residual)
+        // and feed into `applyFfnResidual`; for single-stream, fuse `x + ffn` directly into `x_bind`.
+        const layer_top_k: u32 = self.config.layerTopK(l);
+        const needs_proj_out = (self.gr_arena != null or self.mhc_arena != null);
+        const moe_residual: ?metal.BufferBinding = if (needs_proj_out) null else self.x_bind;
+        const moe_out: metal.BufferBinding = if (needs_proj_out) self.proj_out_bind else self.x_bind;
+
+        // --- M7 X2/X3 Multi-Mac Expert-Parallel Cluster path (overlapped remote RPC + local eval) ---
+        if (layer.has_remote_experts and self.cluster_coordinator != null) {
+            if (loop_step >= 1) {
+                self.loop_stats.moe_r_ge1_pinned_routes += 1;
+            }
+            try self.execClusterMoeFfn(
+                frame_opt,
+                l,
+                layer,
+                &layer_ws,
+                router_src,
+                self.x_norm_bind,
+                self.x_norm_host,
+                self.proj_out_bind,
+                self.proj_out_host,
+                self.x_bind,
+                m,
+                layer_top_k,
+                needs_proj_out,
+            );
+            if (needs_proj_out) {
+                try self.applyFfnResidual(frame_opt, l, m, h);
+            }
+            return;
+        }
 
         // --- Isolation #4 (MoE G7, C5): cold-expert resolution on `r = 0`, pinned-only routing on `r >= 1` ---
         if (layer.has_cold_experts and self.cold_rt != null) {
@@ -4801,17 +5711,14 @@ pub const GraphModel = struct {
             try self.flushFrame(frame_opt);
 
             const n_exp: usize = self.config.num_experts;
-            const top_k: usize = self.config.num_experts_per_tok;
+            const top_k: usize = layer_top_k;
+            const max_top_k: usize = self.config.maxLayerTopK();
             const max_m: usize = self.max_tree_nodes;
             const before_misses = crt.expert_cache.telemetry().sync_misses;
             if (loop_step >= 1) {
-                // ADR-0019 Isolation #4: restrict `r >= 1` routing for `(l, tok)` strictly to
-                // wired `.hot` experts plus `(l, tok)`'s own `r = 0` selected cold experts (when
-                // still `.cached_ready`), preventing unaccepted speculative siblings (or prior
-                // tokens) from polluting `r >= 1` routing while guaranteeing 0 cold NVMe stalls.
                 for (0..m) |tok| {
                     const row = layer_ws.router_logits[tok * n_exp ..][0..n_exp];
-                    const r0_ids = crt.r0_selected[(l * max_m + tok) * top_k ..][0..top_k];
+                    const r0_ids = crt.r0_selected[(l * max_m + tok) * max_top_k ..][0..top_k];
                     var allowed_count: usize = 0;
                     for (0..n_exp) |eid| {
                         const allow = switch (crt.expert_cache.residencyState(@intCast(l), @intCast(eid))) {
@@ -4834,8 +5741,6 @@ pub const GraphModel = struct {
                             row[eid] = -std.math.inf(f32);
                         }
                     }
-                    // Defensive guard only reachable if `num_hot < top_k` and a tiny slot pool
-                    // evicted `tok`'s own `r = 0` cold experts; keeps 0 cold stalls & finite softmax.
                     if (allowed_count < top_k) {
                         for (0..n_exp) |eid| {
                             if (row[eid] == -std.math.inf(f32) and crt.expert_cache.isResident(@intCast(l), @intCast(eid))) {
@@ -4858,7 +5763,7 @@ pub const GraphModel = struct {
                     .workspace_buf = self.scratch_buf,
                     .m = m,
                     .num_experts = self.config.num_experts,
-                    .top_k = self.config.num_experts_per_tok,
+                    .top_k = layer_top_k,
                     .norm_topk_prob = self.config.norm_topk_prob,
                 }, false);
             }
@@ -4866,7 +5771,7 @@ pub const GraphModel = struct {
 
             if (loop_step == 0) {
                 for (0..m) |tok| {
-                    const dst = crt.r0_selected[(l * max_m + tok) * top_k ..][0..top_k];
+                    const dst = crt.r0_selected[(l * max_m + tok) * max_top_k ..][0..top_k];
                     const src = layer_ws.scratch_topk_experts[tok * top_k ..][0..top_k];
                     for (0..top_k) |k| {
                         dst[k] = @intCast(src[k]);
@@ -4899,7 +5804,7 @@ pub const GraphModel = struct {
                 .out = moe_out,
                 .m = m,
                 .num_experts = self.config.num_experts,
-                .top_k = self.config.num_experts_per_tok,
+                .top_k = layer_top_k,
                 .hidden_size = h,
                 .intermediate_size = self.config.moe_intermediate_size,
                 .norm_topk_prob = self.config.norm_topk_prob,
@@ -4933,7 +5838,7 @@ pub const GraphModel = struct {
                 .out = moe_out,
                 .m = m,
                 .num_experts = self.config.num_experts,
-                .top_k = self.config.num_experts_per_tok,
+                .top_k = layer_top_k,
                 .hidden_size = h,
                 .intermediate_size = self.config.moe_intermediate_size,
                 .norm_topk_prob = self.config.norm_topk_prob,
@@ -4947,8 +5852,8 @@ pub const GraphModel = struct {
             try self.encodeMoELayerDispatch(f, layer, moe_args, true);
         }
 
-        if (self.gr_arena != null) {
-            try self.applyFfnResidual(frame_opt, m, h);
+        if (needs_proj_out) {
+            try self.applyFfnResidual(frame_opt, l, m, h);
         }
     }
 
@@ -5136,6 +6041,876 @@ pub const GraphModel = struct {
         };
     }
 
+    // -----------------------------------------------------------------------
+    // M7 Helpers: Mega-mHC, Engram C10, MLA+CSA2 FP4, CED Bridge & Cluster MoE
+    // -----------------------------------------------------------------------
+
+    fn flushAndReopenWideFrame(self: *GraphModel, frame: *metal.Compute.Frame) GraphStepError!void {
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+        frame.* = try self.compute.beginFrame(self.timeout_ms);
+    }
+
+    fn encodeMhcInitStreams(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        streams: metal.BufferBinding,
+        x_in: metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        const h: u32 = self.config.hidden_size;
+        const s_cnt: u32 = self.config.mhc_num_streams;
+        var barrier = barrier_before;
+        for (0..s_cnt) |s| {
+            try self.moe_pipes.encodeCopyStrided(frame, .{
+                .src = x_in,
+                .dst = streams,
+                .num_rows = m,
+                .copy_cols = h,
+                .src_stride = h,
+                .dst_stride = s_cnt * h,
+                .dst_col_off = @as(u32, @intCast(s)) * h,
+            }, barrier);
+            barrier = false;
+        }
+    }
+
+    fn encodeMhcCollapseStreams(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        streams: metal.BufferBinding,
+        x_out: metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        try self.hybrid_pipes.encodeMegaMhc(frame, .{
+            .config = .{
+                .num_streams = self.config.mhc_num_streams,
+                .hidden_size = self.config.hidden_size,
+                .stream_dtype = .f16,
+                .act_dtype = .f16,
+                .norm_dtype = .f16,
+                .rms_eps = self.config.rms_norm_eps,
+                .sinkhorn_iters = 0,
+                .activate_coeffs = false,
+                .shared_coeffs = true,
+                .apply_h_res_pre = false,
+                .apply_h_res_post = false,
+            },
+            .streams = streams,
+            .h_pre = self.mhc_uniform_pre_bind,
+            .h_res = null,
+            .norm_w = null,
+            .branch_out = x_out,
+            .m = m,
+        }, barrier_before);
+    }
+
+    fn encodeMhcPre(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        streams: metal.BufferBinding,
+        mhc_w: MhcLayerWeights,
+        norm: qwen3.NormBinding,
+        branch_out: metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        try self.hybrid_pipes.encodeMegaMhc(frame, .{
+            .config = .{
+                .num_streams = self.config.mhc_num_streams,
+                .hidden_size = self.config.hidden_size,
+                .stream_dtype = .f16,
+                .act_dtype = .f16,
+                .norm_dtype = norm.dtype,
+                .rms_eps = self.config.rms_norm_eps,
+                .sinkhorn_iters = 4,
+                .activate_coeffs = true,
+                .shared_coeffs = true,
+                .apply_h_res_pre = false,
+                .apply_h_res_post = true,
+                .post_scale = 2.0,
+            },
+            .streams = streams,
+            .h_pre = mhc_w.h_pre_bind,
+            .h_res = null,
+            .norm_w = norm.binding,
+            .branch_out = branch_out,
+            .m = m,
+        }, barrier_before);
+    }
+
+    fn encodeMhcPost(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        streams: metal.BufferBinding,
+        sublayer_out: metal.BufferBinding,
+        mhc_w: MhcLayerWeights,
+        m: u32,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        try self.hybrid_pipes.encodeMegaMhcPostMix(frame, .{
+            .config = .{
+                .num_streams = self.config.mhc_num_streams,
+                .hidden_size = self.config.hidden_size,
+                .stream_dtype = .f16,
+                .act_dtype = .f16,
+                .norm_dtype = .f16,
+                .rms_eps = self.config.rms_norm_eps,
+                .sinkhorn_iters = 4,
+                .activate_coeffs = true,
+                .shared_coeffs = true,
+                .apply_h_res_pre = false,
+                .apply_h_res_post = true,
+                .post_scale = 2.0,
+            },
+            .streams = streams,
+            .sublayer_out = sublayer_out,
+            .h_post = mhc_w.h_post_bind,
+            .h_res = mhc_w.h_res_bind,
+            .m = m,
+        }, barrier_before);
+    }
+
+    fn encodeMhcAddResidual(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        streams: metal.BufferBinding,
+        delta: metal.BufferBinding,
+        m: u32,
+        barrier_before: bool,
+    ) GraphStepError!void {
+        try self.hybrid_pipes.encodeMegaMhcPostMix(frame, .{
+            .config = .{
+                .num_streams = self.config.mhc_num_streams,
+                .hidden_size = self.config.hidden_size,
+                .stream_dtype = .f16,
+                .act_dtype = .f16,
+                .norm_dtype = .f16,
+                .rms_eps = self.config.rms_norm_eps,
+                .sinkhorn_iters = 0,
+                .activate_coeffs = false,
+                .shared_coeffs = true,
+                .apply_h_res_pre = false,
+                .apply_h_res_post = false,
+                .post_scale = 1.0,
+            },
+            .streams = streams,
+            .sublayer_out = delta,
+            .h_post = self.mhc_uniform_pre_bind,
+            .h_res = null,
+            .m = m,
+        }, barrier_before);
+    }
+
+    /// M7 `C10` 196B Engram conditional memory lookup (`ADR-0019` Isolation #2):
+    /// `loop_step == 0` fetches multi-head `(k_h, v_h)` rows once via `F_NOCACHE` +
+    /// `PlePageCache`; `loop_step >= 1` reuses `LoopPleScratch` with strictly `0` NVMe
+    /// reads while dynamically re-gating against the current `hidden_norm_host`.
+    fn prepareEngramLayer(
+        self: *GraphModel,
+        prt: *PleRuntime,
+        l: usize,
+        token_ids: []const u32,
+        ancestor_masks: ?[]const u64,
+        base_pos: u32,
+        m: u32,
+        loop_step: u32,
+        hidden_norm_host: []const f16,
+        is_wide: bool,
+    ) GraphStepError!void {
+        const orders = self.config.engramOrdersSlice();
+        var max_order: usize = 2;
+        for (orders) |ord| {
+            if (ord > max_order) max_order = ord;
+        }
+        const h: usize = self.config.hidden_size;
+
+        for (0..m) |node| {
+            var rev: [ple_mod.ENGRAM_MAX_ORDER]u32 = undefined;
+            var collected: usize = 0;
+            rev[0] = token_ids[node];
+            collected = 1;
+
+            if (ancestor_masks) |masks| {
+                var anc_nodes: [ple_mod.ENGRAM_MAX_ORDER]u32 = undefined;
+                var n_anc: usize = 0;
+                const mask = masks[node];
+                if (node > 0) {
+                    var cand: isize = @as(isize, @intCast(node)) - 1;
+                    while (cand >= 0 and n_anc < max_order - 1) : (cand -= 1) {
+                        if (((mask >> @intCast(cand)) & 1) != 0) {
+                            anc_nodes[n_anc] = @intCast(cand);
+                            n_anc += 1;
+                        }
+                    }
+                }
+                for (0..n_anc) |a| {
+                    rev[collected] = token_ids[anc_nodes[a]];
+                    collected += 1;
+                }
+            } else {
+                var back: usize = 1;
+                while (collected < max_order and back <= node) : (back += 1) {
+                    rev[collected] = token_ids[node - back];
+                    collected += 1;
+                }
+            }
+            var past_back: u32 = 1;
+            while (collected < max_order and base_pos >= past_back) : (past_back += 1) {
+                rev[collected] = self.token_history[base_pos - past_back];
+                collected += 1;
+            }
+            for (0..collected) |k| {
+                prt.engram_win_storage[node][k] = rev[collected - 1 - k];
+            }
+            prt.engram_windows[node] = prt.engram_win_storage[node][0..collected];
+        }
+
+        const dst_stride = if (is_wide) @as(usize, self.wide_prefill_max_tokens) * h else @as(usize, self.max_tree_nodes) * h;
+        const dst_f16 = if (is_wide)
+            self.wp_ple_f16_host[l * dst_stride ..][0 .. @as(usize, m) * h]
+        else
+            self.ple_f16_host[l * dst_stride ..][0 .. @as(usize, m) * h];
+
+        const before_nvme = prt.store.stats().nvme_reads;
+        try prt.store.lookupEngramConditional(
+            @intCast(l),
+            prt.engram_windows[0..m],
+            orders,
+            hidden_norm_host[0 .. @as(usize, m) * h],
+            loop_step,
+            &prt.scratch,
+            dst_f16,
+        );
+        const after_nvme = prt.store.stats().nvme_reads;
+        if (loop_step == 0) {
+            self.loop_stats.ple_r0_fills += 1;
+        } else {
+            self.loop_stats.ple_r_ge1_reuses += 1;
+            self.loop_stats.ple_r_ge1_nvme_reads += (after_nvme - before_nvme);
+        }
+        self.m7_stats.engram_lookups += m;
+    }
+
+    fn applyRopeHostF16(
+        data: []f16,
+        num_tokens: u32,
+        num_heads: u32,
+        d_rope: u32,
+        positions: ?[]const u32,
+        start_pos: u32,
+        rope_theta: f32,
+    ) void {
+        const half_d: usize = d_rope / 2;
+        const inv_d: f32 = 2.0 / @as(f32, @floatFromInt(d_rope));
+        for (0..num_tokens) |t| {
+            const pos_f: f32 = @floatFromInt(if (positions) |ps| ps[t] else (start_pos + @as(u32, @intCast(t))));
+            for (0..num_heads) |hd| {
+                const row = data[(t * num_heads + hd) * d_rope ..][0..d_rope];
+                for (0..half_d) |j| {
+                    const freq = 1.0 / std.math.pow(f32, rope_theta, @as(f32, @floatFromInt(j)) * inv_d);
+                    const angle = pos_f * freq;
+                    const c = @cos(angle);
+                    const s = @sin(angle);
+                    const x0: f32 = @floatCast(row[j]);
+                    const x1: f32 = @floatCast(row[j + half_d]);
+                    row[j] = @floatCast(x0 * c - x1 * s);
+                    row[j + half_d] = @floatCast(x1 * c + x0 * s);
+                }
+            }
+        }
+    }
+
+    /// Unified M7 (`R7`/`G11`) MLA + CSA2 (`Full`/`Reindex`/`Reuse`) + FP4 KV + SWA replay
+    /// attention executor shared across decode, `verifyTree`, and wide prefill.
+    fn execMlaCsa2LayerForward(
+        self: *GraphModel,
+        frame_opt: *?metal.Compute.Frame,
+        l: usize,
+        mla: *MlaCsa2LayerWeights,
+        base_pos: u32,
+        m: u32,
+        loop_step: u32,
+        commit_kv: bool,
+        is_wide: bool,
+        kv_len_override: ?u32,
+    ) GraphStepError!void {
+        const cfg = self.config;
+        const n_heads: u32 = cfg.num_attention_heads;
+        const kv_rank: u32 = cfg.kv_lora_rank;
+        const q_rank: u32 = cfg.q_lora_rank;
+        const d_nope: u32 = cfg.qk_nope_head_dim;
+        const d_rope: u32 = cfg.qk_rope_head_dim;
+        const d_v: u32 = cfg.v_head_dim;
+        const q_head_stride: u32 = d_nope + d_rope;
+        const q_full_dim: u32 = n_heads * q_head_stride;
+        const kv_a_dim: u32 = kv_rank + d_rope;
+        const v_total_dim: u32 = n_heads * d_v;
+
+        const sc = if (is_wide) &self.wp_mla_scratch else &self.mla_scratch;
+        const x_norm_bind = if (is_wide) self.wp_x_norm_bind else self.x_norm_bind;
+        const pos3d_bind = if (is_wide) self.wp_pos3d_bind else self.pos3d_bind;
+        const attn_out_bind = if (is_wide) self.wp_attn_out_bind else self.attn_out_bind;
+        const proj_out_bind = if (is_wide) self.wp_proj_out_bind else self.proj_out_bind;
+
+        const encodeMatmul = struct {
+            fn call(
+                gm: *const GraphModel,
+                f: *metal.Compute.Frame,
+                lin: qwen3.LinearBinding,
+                x: metal.BufferBinding,
+                y: metal.BufferBinding,
+                rows: u32,
+                wide: bool,
+                barrier: bool,
+            ) GraphStepError!void {
+                if (wide) {
+                    try gm.encodeLinearGemmWithTile(f, lin, x, y, rows, true, barrier);
+                } else {
+                    try gm.encodeLinearBatched(f, lin, x, y, rows, barrier);
+                }
+            }
+        }.call;
+
+        const kv_owner_mla = &self.layers[mla.kv_owner_layer].attn.mla_csa2;
+        const idx_owner_mla = &self.layers[mla.index_owner_layer].attn.mla_csa2;
+        const idx_buf = if (is_wide) &(idx_owner_mla.wp_index_buf.?) else &(idx_owner_mla.index_buf.?);
+        const need_kv_proj = (mla.mode == .full and loop_step == 0 and kv_len_override == null);
+
+        const lat_dst: metal.BufferBinding = if (!is_wide and mla.mode == .full)
+            .{ .buffer = self.scratch_buf, .offset = mla.tree_latent_off }
+        else
+            sc.latent_norm_bind;
+        const rope_dst: metal.BufferBinding = if (!is_wide and need_kv_proj)
+            .{ .buffer = self.scratch_buf, .offset = mla.tree_rope_off }
+        else
+            sc.rope_rot_bind;
+
+        {
+            const f = try self.ensureFrame(frame_opt);
+
+            // 1. Q path: `q_a_proj -> q_a_layernorm -> q_b_proj`.
+            try encodeMatmul(self, f, mla.q_a_proj, x_norm_bind, sc.q_a_bind, m, is_wide, true);
+            try self.attn_pipes.encodeRmsNorm(f, .{
+                .x = sc.q_a_bind,
+                .w = mla.q_a_norm.binding,
+                .y = sc.q_a_norm_bind,
+                .num_rows = m,
+                .hidden_dim = q_rank,
+                .eps = cfg.rms_norm_eps,
+                .w_dtype = mla.q_a_norm.dtype,
+            }, true);
+            try encodeMatmul(self, f, mla.q_b_proj, sc.q_a_norm_bind, sc.q_full_bind, m, is_wide, true);
+
+            // 2. Absorb per-head `q_nope` via `W_UK^T` -> `[m, n_heads, kv_lora_rank]` and extract `q_pe`.
+            for (0..n_heads) |hd| {
+                const hd_u32: u32 = @intCast(hd);
+                try self.moe_pipes.encodeCopyStrided(f, .{
+                    .src = sc.q_full_bind,
+                    .dst = sc.head_in_bind,
+                    .num_rows = m,
+                    .copy_cols = d_nope,
+                    .src_stride = q_full_dim,
+                    .src_col_off = hd_u32 * q_head_stride,
+                    .dst_stride = d_nope,
+                }, true);
+                try encodeMatmul(self, f, mla.w_uk_t_heads[hd], sc.head_in_bind, sc.head_out_bind, m, is_wide, true);
+                try self.moe_pipes.encodeCopyStrided(f, .{
+                    .src = sc.head_out_bind,
+                    .dst = sc.q_nope_bind,
+                    .num_rows = m,
+                    .copy_cols = kv_rank,
+                    .src_stride = kv_rank,
+                    .dst_stride = n_heads * kv_rank,
+                    .dst_col_off = hd_u32 * kv_rank,
+                }, true);
+                if (d_rope > 0) {
+                    try self.moe_pipes.encodeCopyStrided(f, .{
+                        .src = sc.q_full_bind,
+                        .dst = sc.q_pe_bind,
+                        .num_rows = m,
+                        .copy_cols = d_rope,
+                        .src_stride = q_full_dim,
+                        .src_col_off = hd_u32 * q_head_stride + d_nope,
+                        .dst_stride = n_heads * d_rope,
+                        .dst_col_off = hd_u32 * d_rope,
+                    }, false);
+                }
+            }
+
+            // 3. KV path (`Full` layers on `loop_step == 0` only): `kv_a_proj_with_mqa -> split -> kv_a_norm`.
+            if (need_kv_proj) {
+                try encodeMatmul(self, f, mla.kv_a_proj, x_norm_bind, sc.kv_a_bind, m, is_wide, true);
+                try self.moe_pipes.encodeCopyStrided(f, .{
+                    .src = sc.kv_a_bind,
+                    .dst = sc.latent_raw_bind,
+                    .num_rows = m,
+                    .copy_cols = kv_rank,
+                    .src_stride = kv_a_dim,
+                    .src_col_off = 0,
+                    .dst_stride = kv_rank,
+                }, true);
+                if (d_rope > 0) {
+                    try self.moe_pipes.encodeCopyStrided(f, .{
+                        .src = sc.kv_a_bind,
+                        .dst = rope_dst,
+                        .num_rows = m,
+                        .copy_cols = d_rope,
+                        .src_stride = kv_a_dim,
+                        .src_col_off = kv_rank,
+                        .dst_stride = d_rope,
+                    }, false);
+                }
+                try self.attn_pipes.encodeRmsNorm(f, .{
+                    .x = sc.latent_raw_bind,
+                    .w = mla.kv_a_norm.binding,
+                    .y = lat_dst,
+                    .num_rows = m,
+                    .hidden_dim = kv_rank,
+                    .eps = cfg.rms_norm_eps,
+                    .w_dtype = mla.kv_a_norm.dtype,
+                }, true);
+            }
+        }
+
+        // 4. Apply RoPE to `q_pe` (`[m, n_heads, d_rope]`) and (when `need_kv_proj`) `rope_dst` (`[m, 1, d_rope]`).
+        if (d_rope > 0) {
+            if ((d_rope % 4) == 0 and d_rope <= hybrid.MAX_QSA_HEAD_DIM) {
+                const f = try self.ensureFrame(frame_opt);
+                try self.hybrid_pipes.encodeQsaPrefillRope(f, .{
+                    .q = sc.q_pe_bind,
+                    .k = rope_dst,
+                    .v = sc.rope_raw_bind,
+                    .q_norm = null,
+                    .k_norm = null,
+                    .norm_dtype = .f16,
+                    .positions_3d = pos3d_bind,
+                    .kv_tiles = null,
+                    .num_tokens = m,
+                    .num_q_heads = n_heads,
+                    .num_kv_heads = 1,
+                    .head_dim = d_rope,
+                    .rotary_dim = d_rope,
+                    .start_pos = base_pos,
+                    .mrope = hybrid.MropeSection.text1d(d_rope),
+                    .yarn = cfg.yarn,
+                    .chunk_tokens = self.chunk_tokens,
+                    .kv_only = false,
+                    .write_to_tiles = false,
+                    .rms_eps = cfg.rms_norm_eps,
+                    .rope_theta = cfg.rope_theta,
+                }, true);
+            } else {
+                try self.flushFrame(frame_opt);
+                const pos_slice: ?[]const u32 = if (!is_wide) self.positions_host[0..m] else null;
+                applyRopeHostF16(sc.q_pe_host, m, n_heads, d_rope, pos_slice, base_pos, cfg.rope_theta);
+                if (need_kv_proj) {
+                    const rope_host: []f16 = if (!is_wide) blk: {
+                        const raw = self.scratch_arena.bytes()[@intCast(mla.tree_rope_off)..][0 .. @as(usize, m) * d_rope * 2];
+                        break :blk @alignCast(std.mem.bytesAsSlice(f16, raw));
+                    } else sc.rope_rot_host;
+                    applyRopeHostF16(rope_host, m, 1, d_rope, pos_slice, base_pos, cfg.rope_theta);
+                }
+            }
+        }
+
+        // 5. MLA + CSA2 (`Full` / `Reindex` / `Reuse`) + FP4 KV + SWA bounded replay.
+        {
+            const f = try self.ensureFrame(frame_opt);
+            const kv_arena = &(self.mla_kv_arena.?);
+            const sum_arena = &(self.csa2_summary_arena.?);
+            const is_decoder_layer = cfg.isCausalEncDec() and (l >= cfg.num_encoder_layers);
+            const enc_prefix: u32 = if (is_decoder_layer) self.ced_encoder_prefix_len else 0;
+            const eff_kv_len: u32 = kv_len_override orelse (if (commit_kv) base_pos + m else base_pos);
+            const causal_start: ?u32 = if (kv_len_override != null or !commit_kv) null else base_pos;
+            const owner_tree_lat: ?metal.BufferBinding = if (!commit_kv)
+                .{ .buffer = self.scratch_buf, .offset = kv_owner_mla.tree_latent_off }
+            else
+                null;
+            const owner_tree_rope: ?metal.BufferBinding = if (!commit_kv and d_rope > 0)
+                .{ .buffer = self.scratch_buf, .offset = kv_owner_mla.tree_rope_off }
+            else
+                null;
+            const q_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d_nope + d_rope)));
+
+            const disp = try self.hybrid_pipes.encodeMlaCsa2Layer(f, .{
+                .mode = mla.mode,
+                .shared_kv_owner = mla.shared_kv_owner,
+                .loop_step = loop_step,
+                .write_latent_in = if (commit_kv and need_kv_proj) lat_dst else null,
+                .write_rope_in = if (commit_kv and need_kv_proj and d_rope > 0) rope_dst else null,
+                .write_start_pos = base_pos,
+                .write_num_tokens = if (commit_kv and need_kv_proj) m else 0,
+                .is_encoder_projection = false,
+                .q_nope = sc.q_nope_bind,
+                .q_pe = if (d_rope > 0) sc.q_pe_bind else null,
+                .kv_arena = kv_arena,
+                .kv_metal_buf = self.mla_kv_buf,
+                .swa_ring = if (self.mla_swa_arena) |*sa| sa else null,
+                .swa_metal_buf = if (self.mla_swa_arena != null) self.mla_kv_buf else null,
+                .summary_arena = sum_arena,
+                .summary_metal_buf = self.mla_kv_buf,
+                .index_buf = idx_buf,
+                .index_metal_buf = self.scratch_buf,
+                .kv_tree_latent = owner_tree_lat,
+                .kv_tree_rope = owner_tree_rope,
+                .ancestor_masks = if (!commit_kv) self.ancestor_masks_bind else null,
+                .out = sc.attn_latent_bind,
+                .num_nodes = m,
+                .num_q_heads = n_heads,
+                .kv_len = eff_kv_len,
+                .encoder_prefix_len = enc_prefix,
+                .causal_q_start_pos = causal_start,
+                .swa_window = cfg.swa_window,
+                .block_tokens = cfg.csa2_block_tokens,
+                .top_k_blocks = cfg.csa2_top_k_blocks,
+                .scale = q_scale,
+            }, true);
+            self.m7_stats.csa2_kv_writes += disp.kv_writes;
+            self.m7_stats.csa2_summary_updates += disp.summary_updates;
+            self.m7_stats.csa2_index_dispatches += disp.index_dispatches;
+            self.m7_stats.csa2_attn_dispatches += disp.attn_dispatches;
+
+            // 6. Unabsorb per-head latent attention output via `W_UV` -> `[m, n_heads * v_head_dim]`.
+            for (0..n_heads) |hd| {
+                const hd_u32: u32 = @intCast(hd);
+                try self.moe_pipes.encodeCopyStrided(f, .{
+                    .src = sc.attn_latent_bind,
+                    .dst = sc.head_out_bind,
+                    .num_rows = m,
+                    .copy_cols = kv_rank,
+                    .src_stride = n_heads * kv_rank,
+                    .src_col_off = hd_u32 * kv_rank,
+                    .dst_stride = kv_rank,
+                }, true);
+                try encodeMatmul(self, f, mla.w_uv_heads[hd], sc.head_out_bind, sc.head_in_bind, m, is_wide, true);
+                try self.moe_pipes.encodeCopyStrided(f, .{
+                    .src = sc.head_in_bind,
+                    .dst = attn_out_bind,
+                    .num_rows = m,
+                    .copy_cols = d_v,
+                    .src_stride = d_v,
+                    .dst_stride = v_total_dim,
+                    .dst_col_off = hd_u32 * d_v,
+                }, true);
+            }
+
+            // 7. Output projection `o_proj` -> `proj_out_bind`.
+            try encodeMatmul(self, f, mla.o_proj, attn_out_bind, proj_out_bind, m, is_wide, true);
+        }
+    }
+
+    /// CED Phase 1 bridge: takes final causal-encoder hidden states (`x_bind` or `wp_x_bind`),
+    /// applies `enc_dec.norm`, updates the running `ced_encoder_summary_host` for `DSpark`,
+    /// projects `enc_dec.global_kv_a_proj -> enc_dec.global_kv_norm` + RoPE, and writes
+    /// FP4 latent KV + CSA2 hierarchical summaries into EVERY decoder `Full` layer.
+    fn projectCedEncoderToDecoderKv(
+        self: *GraphModel,
+        base_pos: u32,
+        m: u32,
+        is_wide: bool,
+    ) GraphStepError!void {
+        const bridge = self.ced_bridge orelse return;
+        const cfg = self.config;
+        const h: u32 = cfg.hidden_size;
+        const kv_rank: u32 = cfg.kv_lora_rank;
+        const d_rope: u32 = cfg.qk_rope_head_dim;
+        const kv_a_dim: u32 = kv_rank + d_rope;
+        const sc = if (is_wide) &self.wp_mla_scratch else &self.mla_scratch;
+        const x_bind = if (is_wide) self.wp_x_bind else self.x_bind;
+        const x_norm_bind = if (is_wide) self.wp_x_norm_bind else self.x_norm_bind;
+        const x_norm_host = if (is_wide) self.wp_x_norm_host else self.x_norm_host;
+        const pos3d_bind = if (is_wide) self.wp_pos3d_bind else self.pos3d_bind;
+
+        var frame = try self.compute.beginFrame(self.timeout_ms);
+        errdefer frame.abort();
+
+        try self.attn_pipes.encodeRmsNorm(&frame, .{
+            .x = x_bind,
+            .w = bridge.norm.binding,
+            .y = x_norm_bind,
+            .num_rows = m,
+            .hidden_dim = h,
+            .eps = cfg.rms_norm_eps,
+            .w_dtype = bridge.norm.dtype,
+        }, false);
+        if (is_wide) {
+            try self.encodeLinearGemmWithTile(&frame, bridge.global_kv_a_proj, x_norm_bind, sc.kv_a_bind, m, true, true);
+        } else {
+            try self.encodeLinearBatched(&frame, bridge.global_kv_a_proj, x_norm_bind, sc.kv_a_bind, m, true);
+        }
+        try self.moe_pipes.encodeCopyStrided(&frame, .{
+            .src = sc.kv_a_bind,
+            .dst = sc.latent_raw_bind,
+            .num_rows = m,
+            .copy_cols = kv_rank,
+            .src_stride = kv_a_dim,
+            .src_col_off = 0,
+            .dst_stride = kv_rank,
+        }, true);
+        if (d_rope > 0) {
+            try self.moe_pipes.encodeCopyStrided(&frame, .{
+                .src = sc.kv_a_bind,
+                .dst = sc.rope_rot_bind,
+                .num_rows = m,
+                .copy_cols = d_rope,
+                .src_stride = kv_a_dim,
+                .src_col_off = kv_rank,
+                .dst_stride = d_rope,
+            }, false);
+        }
+        try self.attn_pipes.encodeRmsNorm(&frame, .{
+            .x = sc.latent_raw_bind,
+            .w = bridge.global_kv_norm.binding,
+            .y = sc.latent_norm_bind,
+            .num_rows = m,
+            .hidden_dim = kv_rank,
+            .eps = cfg.rms_norm_eps,
+            .w_dtype = bridge.global_kv_norm.dtype,
+        }, true);
+
+        if (d_rope > 0 and (d_rope % 4) == 0 and d_rope <= hybrid.MAX_QSA_HEAD_DIM) {
+            try self.hybrid_pipes.encodeQsaPrefillRope(&frame, .{
+                .q = sc.q_pe_bind,
+                .k = sc.rope_rot_bind,
+                .v = sc.rope_raw_bind,
+                .q_norm = null,
+                .k_norm = null,
+                .norm_dtype = .f16,
+                .positions_3d = pos3d_bind,
+                .kv_tiles = null,
+                .num_tokens = m,
+                .num_q_heads = 1,
+                .num_kv_heads = 1,
+                .head_dim = d_rope,
+                .rotary_dim = d_rope,
+                .start_pos = base_pos,
+                .mrope = hybrid.MropeSection.text1d(d_rope),
+                .yarn = cfg.yarn,
+                .chunk_tokens = self.chunk_tokens,
+                .kv_only = true,
+                .write_to_tiles = false,
+                .rms_eps = cfg.rms_norm_eps,
+                .rope_theta = cfg.rope_theta,
+            }, true);
+        } else if (d_rope > 0) {
+            const sig_r = try frame.commit();
+            try self.compute.wait(sig_r, self.timeout_ms);
+            applyRopeHostF16(sc.rope_rot_host, m, 1, d_rope, null, base_pos, cfg.rope_theta);
+            frame = try self.compute.beginFrame(self.timeout_ms);
+        }
+
+        const kv_arena = &(self.mla_kv_arena.?);
+        const sum_arena = &(self.csa2_summary_arena.?);
+        const coarse_span = sum_arena.spec.block_tokens * sum_arena.spec.coarse_group_blocks;
+        const new_prefix_len: u32 = base_pos + m;
+        for (self.layers[cfg.num_encoder_layers..]) |layer| {
+            switch (layer.attn) {
+                .mla_csa2 => |mla| {
+                    if (mla.mode != .full) continue;
+                    try self.hybrid_pipes.encodeMlaFp4KvWrite(&frame, .{
+                        .latent_in = sc.latent_norm_bind,
+                        .rope_in = if (d_rope > 0) sc.rope_rot_bind else null,
+                        .kv_arena = kv_arena,
+                        .kv_metal_buf = self.mla_kv_buf,
+                        .kv_slot = mla.shared_kv_owner,
+                        .swa_ring = if (self.mla_swa_arena) |*sa| sa else null,
+                        .swa_metal_buf = if (self.mla_swa_arena != null) self.mla_kv_buf else null,
+                        .num_tokens = m,
+                        .start_pos = base_pos,
+                        .is_encoder_projection = true,
+                    }, true);
+                    try self.hybrid_pipes.encodeCsa2UpdateSummaries(&frame, .{
+                        .kv_arena = kv_arena,
+                        .kv_metal_buf = self.mla_kv_buf,
+                        .summary_arena = sum_arena,
+                        .summary_metal_buf = self.mla_kv_buf,
+                        .kv_slot = mla.shared_kv_owner,
+                        .kv_len = new_prefix_len,
+                        .start_coarse_block = base_pos / coarse_span,
+                    }, true);
+                    self.m7_stats.csa2_kv_writes += 1;
+                    self.m7_stats.csa2_summary_updates += 1;
+                },
+                else => {},
+            }
+        }
+
+        const sig = try frame.commit();
+        try self.compute.wait(sig, self.timeout_ms);
+
+        // Update chunk-invariant running mean `ced_encoder_summary_host` over `[0 .. new_prefix_len)`.
+        if (self.ced_encoder_sum_host.len == h and self.ced_encoder_summary_host.len == h) {
+            if (base_pos == 0) @memset(self.ced_encoder_sum_host, 0.0);
+            for (0..m) |tok| {
+                const row = x_norm_host[tok * h ..][0..h];
+                for (0..h) |d| {
+                    self.ced_encoder_sum_host[d] += @as(f32, @floatCast(row[d]));
+                }
+            }
+            const inv_len: f32 = 1.0 / @as(f32, @floatFromInt(new_prefix_len));
+            for (0..h) |d| {
+                self.ced_encoder_summary_host[d] = self.ced_encoder_sum_host[d] * inv_len;
+            }
+        }
+    }
+
+    /// CED Phase 1 final step: executes ONLY decoder layers `[N_enc .. N_enc + N_dec)` on
+    /// the final prompt token (`M = 1`) attending over `[0, ced_encoder_prefix_len)` without
+    /// duplicating position `last_pos` in the decoder KV cache, producing initial next-token logits.
+    fn runCedDecoderInitialStep(self: *GraphModel, last_token: u32, last_pos: u32) GraphStepError!u32 {
+        const tok = [_]u32{last_token};
+        const p = [_]u32{last_pos};
+        const mask = [_]u64{1};
+        const vr = try self.runForwardInternalEx(
+            &tok,
+            &p,
+            &mask,
+            last_pos,
+            self.effective_max_loops,
+            true,
+            0,
+            null,
+            true,
+            null,
+            null,
+            .ced_decoder_only,
+            self.ced_encoder_prefix_len,
+        );
+        return vr.argmax_tokens[0];
+    }
+
+    /// M7 (`X2`/`X3`) Expert-Parallel MoE execution: runs GPU router + top-k schedule,
+    /// dispatches routed assignments through `ExpertParallelCoordinator` (non-blocking remote
+    /// RPC overlapped with local eval), adds optional GPU `shared_expert`, and fuses residual.
+    fn execClusterMoeFfn(
+        self: *GraphModel,
+        frame_opt: *?metal.Compute.Frame,
+        l: usize,
+        layer: *GraphLayerWeights,
+        layer_ws: *moe.MoeWorkspace,
+        router_src: moe.RouterSource,
+        x_norm_bind: metal.BufferBinding,
+        x_norm_host: []const f16,
+        proj_out_bind: metal.BufferBinding,
+        proj_out_host: []f16,
+        x_bind: metal.BufferBinding,
+        m: u32,
+        layer_top_k: u32,
+        needs_proj_out: bool,
+    ) GraphStepError!void {
+        const coord = self.cluster_coordinator.?;
+        const h: u32 = self.config.hidden_size;
+        const logits_bind = layer_ws.routerLogitsBinding(self.scratch_buf);
+
+        // 1. Run exact GPU router projection + top-k softmax selection.
+        {
+            const f = try self.ensureFrame(frame_opt);
+            switch (router_src) {
+                .weights => |w| try self.moe_pipes.encodeRouterProj(f, w.dtype, .{
+                    .x = x_norm_bind,
+                    .router_weights = w.binding,
+                    .logits = logits_bind,
+                    .m = m,
+                    .num_experts = self.config.num_experts,
+                    .hidden_size = h,
+                }, true),
+                .quant_weights => |qw| try self.moe_pipes.encodeRouterProjQuant(f, qw.bits, .{
+                    .x = x_norm_bind,
+                    .qweight = qw.qweight,
+                    .scale_bias = qw.scale_bias,
+                    .logits = logits_bind,
+                    .m = m,
+                    .num_experts = self.config.num_experts,
+                    .hidden_size = h,
+                }, true),
+                .logits => {},
+            }
+            try self.moe_pipes.encodeRouteTopK(f, .f32, .{
+                .logits = logits_bind,
+                .workspace = layer_ws,
+                .workspace_buf = self.scratch_buf,
+                .m = m,
+                .num_experts = self.config.num_experts,
+                .top_k = layer_top_k,
+                .norm_topk_prob = self.config.norm_topk_prob,
+            }, true);
+        }
+        try self.flushFrame(frame_opt);
+
+        // 2. Pack routed `(token_idx, expert_id, weight)` into preallocated flat buffer (0 allocs).
+        const top_k: usize = layer_top_k;
+        const n_assign: usize = @as(usize, m) * top_k;
+        for (0..m) |tok| {
+            for (0..top_k) |k| {
+                const idx = tok * top_k + k;
+                self.cluster_assignments[idx] = .{
+                    .token_idx = @intCast(tok),
+                    .expert_id = @intCast(layer_ws.scratch_topk_experts[idx]),
+                    .weight = layer_ws.scratch_topk_weights[idx],
+                };
+            }
+        }
+
+        // 3. Overlapped remote RPC + local expert evaluation via `ExpertParallelCoordinator`.
+        const total_elems: usize = @as(usize, m) * h;
+        const dstats = try coord.dispatchLayerExperts(
+            @intCast(l),
+            @intCast(m),
+            x_norm_host[0..total_elems],
+            self.cluster_assignments[0..n_assign],
+            self.cluster_accum_f32[0..total_elems],
+        );
+        self.m7_stats.cluster_dispatches += 1;
+        self.m7_stats.cluster_local_assignments += dstats.local_assignments;
+        self.m7_stats.cluster_remote_assignments += dstats.remote_assignments;
+        self.m7_stats.cluster_bytes_transferred += dstats.bytes_transferred;
+        self.m7_stats.cluster_remote_rpc_ns += dstats.remote_rpc_ns;
+
+        for (0..total_elems) |i| {
+            proj_out_host[i] = @floatCast(self.cluster_accum_f32[i]);
+        }
+
+        // 4. Optional unconditional GPU `shared_expert` accumulation + single-stream residual.
+        if (layer.shared_expert != null or !needs_proj_out) {
+            const f = try self.ensureFrame(frame_opt);
+            if (layer.shared_expert != null) {
+                const se_dtype = layer.shared_expert_dtype orelse layer.expert_weight_dtype;
+                try self.moe_pipes.encodeSharedExpertAccum(f, se_dtype, .{
+                    .x = x_norm_bind,
+                    .router = router_src,
+                    .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
+                    .expert_table = layer.expert_table,
+                    .workspace = layer_ws,
+                    .workspace_buf = self.scratch_buf,
+                    .residual = null,
+                    .out = proj_out_bind,
+                    .m = m,
+                    .num_experts = self.config.num_experts,
+                    .top_k = layer_top_k,
+                    .hidden_size = h,
+                    .intermediate_size = self.config.moe_intermediate_size,
+                    .norm_topk_prob = self.config.norm_topk_prob,
+                    .shared_expert = layer.shared_expert,
+                    .shared_weights_base = if (layer.shared_expert_buf) |sb| .{ .buffer = sb, .offset = 0 } else null,
+                    .shared_expert_dtype = layer.shared_expert_dtype,
+                    .shared_intermediate_size = self.config.shared_expert_intermediate_size,
+                    .shared_gate_weight = layer.shared_gate_weight,
+                    .shared_gate_dtype = layer.shared_gate_dtype,
+                }, false);
+            }
+            if (!needs_proj_out) {
+                try self.moe_pipes.encodeResidualAdd(f, .{
+                    .x = x_bind,
+                    .delta = proj_out_bind,
+                    .count = m * h,
+                }, layer.shared_expert != null);
+            }
+        }
+    }
+
     fn shouldEarlyExitCpu(self: *const GraphModel, m: u32) bool {
         const w_bytes = self.early_exit_gate_host orelse return false;
         const h: usize = self.config.hidden_size;
@@ -5201,6 +6976,35 @@ pub const GraphModel = struct {
                 },
                 .gqa => |gqa| {
                     try self.encodeGqaCommitAccepted(f, gqa, base_pos, chain[0..m], true);
+                },
+                .mla_csa2 => |mla| {
+                    if (mla.mode == .full) {
+                        const kv_arena = &(self.mla_kv_arena.?);
+                        const sum_arena = &(self.csa2_summary_arena.?);
+                        const d_rope = self.config.qk_rope_head_dim;
+                        try self.hybrid_pipes.encodeMlaFp4KvWrite(f, .{
+                            .latent_in = .{ .buffer = self.scratch_buf, .offset = mla.tree_latent_off },
+                            .rope_in = if (d_rope > 0) .{ .buffer = self.scratch_buf, .offset = mla.tree_rope_off } else null,
+                            .kv_arena = kv_arena,
+                            .kv_metal_buf = self.mla_kv_buf,
+                            .kv_slot = mla.shared_kv_owner,
+                            .swa_ring = if (self.mla_swa_arena) |*sa| sa else null,
+                            .swa_metal_buf = if (self.mla_swa_arena != null) self.mla_kv_buf else null,
+                            .num_tokens = m,
+                            .start_pos = base_pos,
+                            .is_encoder_projection = false,
+                        }, true);
+                        const coarse_span = sum_arena.spec.block_tokens * sum_arena.spec.coarse_group_blocks;
+                        try self.hybrid_pipes.encodeCsa2UpdateSummaries(f, .{
+                            .kv_arena = kv_arena,
+                            .kv_metal_buf = self.mla_kv_buf,
+                            .summary_arena = sum_arena,
+                            .summary_metal_buf = self.mla_kv_buf,
+                            .kv_slot = mla.shared_kv_owner,
+                            .kv_len = base_pos + m,
+                            .start_coarse_block = base_pos / coarse_span,
+                        }, true);
+                    }
                 },
             }
         }
@@ -5468,12 +7272,18 @@ pub const GraphModel = struct {
         var max_cold_down_bytes: usize = 0;
         var inline_loop_adapters: usize = 0;
 
+        const effective_cluster_plan: ?expert_parallel.ExpertPartitionPlan = options.cluster_plan orelse
+            (if (options.cluster_coordinator) |cc| cc.config.plan else null);
+
         // First scan: compute total bytes and identify cold experts & inline loop adapters.
         var cur_shard: usize = 0;
         try shard_sizes.append(allocator, 0);
         for (entries, 0..) |*e, idx| {
             const kind = try e.tensorKind();
             if (kind == .cold_expert) {
+                if (effective_cluster_plan) |plan| {
+                    if (e.expert != amf.NO_EXPERT and !plan.isLocal(e.expert)) continue;
+                }
                 has_any_cold = true;
                 cold_entry_count += 1;
                 const aligned = try page.alignUp(@intCast(e.blob_bytes));
@@ -5486,6 +7296,11 @@ pub const GraphModel = struct {
                     max_cold_down_bytes = @max(max_cold_down_bytes, aligned);
                 }
                 continue;
+            }
+            if (kind == .hot_expert) {
+                if (effective_cluster_plan) |plan| {
+                    if (e.expert != amf.NO_EXPERT and !plan.isLocal(e.expert)) continue;
+                }
             }
             if (kind == .sparse_table) continue;
             if (kind == .loop_adapter) inline_loop_adapters += 1;
@@ -5734,17 +7549,36 @@ pub const GraphModel = struct {
             };
         }
 
+        const ced_bridge: ?CedBridgeWeights = if (config.isCausalEncDec()) .{
+            .norm = try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, "enc_dec.norm.weight", h),
+            .global_kv_a_proj = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, "enc_dec.global_kv_a_proj", config.mlaKvADim(), h),
+            .global_kv_norm = try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, "enc_dec.global_kv_norm.weight", config.kv_lora_rank),
+        } else null;
+
         // --- 3. Compute exact scratch arena size ---
         const max_m = options.max_tree_nodes;
         var num_gdn_layers: u32 = 0;
         var num_qsa_layers: u32 = 0;
         var num_gqa_layers: u32 = 0;
-        for (config.axes.layer_attention_kinds) |ak| {
+        var num_mla_layers: u32 = 0;
+        var num_mla_full_layers: u32 = 0;
+        var num_mla_index_layers: u32 = 0;
+        for (config.axes.layer_attention_kinds, 0..) |ak, l_idx| {
             switch (ak) {
                 .gated_deltanet => num_gdn_layers += 1,
                 .qsa_sparse => num_qsa_layers += 1,
                 .gqa_full => num_gqa_layers += 1,
-                .mla_csa2 => return error.UnsupportedOperatorAxis,
+                .mla_csa2 => {
+                    num_mla_layers += 1;
+                    switch (config.csa2_modes[l_idx]) {
+                        .full => {
+                            num_mla_full_layers += 1;
+                            num_mla_index_layers += 1;
+                        },
+                        .reindex => num_mla_index_layers += 1,
+                        .reuse => {},
+                    }
+                },
             }
         }
         const num_chunks: u32 = (options.max_seq_len + options.chunk_tokens - 1) / options.chunk_tokens;
@@ -5821,15 +7655,18 @@ pub const GraphModel = struct {
             }
         }.call;
 
-        const max_q_dim: u32 = @max(@max(config.qDim(), config.gdnQkDim()), h);
-        const max_kv_dim: u32 = @max(@max(config.kvDim(), config.gdnQkDim()), @max(config.gdnVDim(), h));
-        const max_attn_out: u32 = @max(@max(config.qDim(), config.gdnVDim()), h);
+        const max_q_dim: u32 = @max(@max(config.qDim(), config.gdnQkDim()), @max(config.mlaQDim(), h));
+        const max_kv_dim: u32 = @max(@max(config.kvDim(), config.gdnQkDim()), @max(config.gdnVDim(), @max(config.mlaKvADim(), h)));
+        const max_attn_out: u32 = @max(@max(config.qDim(), config.gdnVDim()), @max(config.mlaVDim(), h));
         const max_inter: u32 = @max(@max(config.intermediate_size, config.moe_intermediate_size), @max(config.shared_expert_intermediate_size, h));
+        const max_top_k: u32 = if (config.axes.ffn_kind == .moe_swiglu) config.maxLayerTopK() else 1;
+        const mla_head_in_dim: u32 = @max(config.qk_nope_head_dim, config.v_head_dim);
+        const mla_head_out_dim: u32 = @max(config.kv_lora_rank, 1);
 
         const moe_ws_spec: moe.WorkspaceSpec = .{
             .max_tokens = max_m,
             .num_experts = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts else 1,
-            .top_k = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts_per_tok else 1,
+            .top_k = max_top_k,
             .hidden_size = h,
             .intermediate_size = if (config.axes.ffn_kind == .moe_swiglu) config.moe_intermediate_size else h,
             .shared_intermediate_size = config.shared_expert_intermediate_size,
@@ -5837,7 +7674,7 @@ pub const GraphModel = struct {
         const wp_moe_ws_spec: moe.WorkspaceSpec = .{
             .max_tokens = if (wide_enabled) wide_prefill_max_tokens else 1,
             .num_experts = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts else 1,
-            .top_k = if (config.axes.ffn_kind == .moe_swiglu) config.num_experts_per_tok else 1,
+            .top_k = max_top_k,
             .hidden_size = h,
             .intermediate_size = if (config.axes.ffn_kind == .moe_swiglu) config.moe_intermediate_size else h,
             .shared_intermediate_size = config.shared_expert_intermediate_size,
@@ -5854,6 +7691,13 @@ pub const GraphModel = struct {
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_g_write
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4); // gr_decay
         } else {
+            if (config.axes.residual_kind == .mhc_single_pass) {
+                tree_scratch_bytes += try hybrid.MhcStreamArena.requiredBytes(.{
+                    .max_tokens = max_m,
+                    .num_streams = config.mhc_num_streams,
+                    .hidden_size = h,
+                });
+            }
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
@@ -5919,6 +7763,31 @@ pub const GraphModel = struct {
                 addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kvDim() * 2);
             }
         }
+        if (num_mla_layers > 0) {
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.q_lora_rank * 2); // q_a
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.q_lora_rank * 2); // q_a_norm
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.mlaQDim() * 2); // q_full
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.num_attention_heads * config.kv_lora_rank * 2); // q_nope
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.num_attention_heads * @max(config.qk_rope_head_dim, 2) * 2); // q_pe
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.mlaKvADim() * 2); // kv_a
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kv_lora_rank * 2); // latent_raw
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kv_lora_rank * 2); // latent_norm
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2); // rope_raw
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2); // rope_rot
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * mla_head_in_dim * 2); // head_in
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * mla_head_out_dim * 2); // head_out
+            addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.num_attention_heads * config.kv_lora_rank * 2); // attn_latent
+            for (0..num_mla_index_layers) |_| {
+                tree_scratch_bytes += (try hybrid.Csa2IndexBuffer.requiredBytes(.{
+                    .max_nodes = max_m,
+                    .top_k_blocks = config.csa2_top_k_blocks,
+                })) + page.APPLE_PAGE_SIZE;
+            }
+            for (0..num_mla_full_layers) |_| {
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.kv_lora_rank * 2); // tree_latent
+                addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2); // tree_rope
+            }
+        }
         tree_scratch_bytes += 4 * page.APPLE_PAGE_SIZE;
 
         // Region A (`wide_scratch_bytes`): wide-prefill (`512–1024`-token) rolling activation scratch + MoeWorkspace.
@@ -5932,6 +7801,12 @@ pub const GraphModel = struct {
                 addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
                 addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
                 addAligned(&wide_scratch_bytes, w_cap * 4 * 4);
+            } else if (config.axes.residual_kind == .mhc_single_pass) {
+                wide_scratch_bytes += try hybrid.MhcStreamArena.requiredBytes(.{
+                    .max_tokens = wide_prefill_max_tokens,
+                    .num_streams = config.mhc_num_streams,
+                    .hidden_size = h,
+                });
             }
             addAligned(&wide_scratch_bytes, w_cap * 4); // wp_token_ids
             addAligned(&wide_scratch_bytes, w_cap * @sizeOf(hybrid.Pos3D)); // wp_pos3d
@@ -5985,12 +7860,81 @@ pub const GraphModel = struct {
                     }
                 }
             }
+            if (num_mla_layers > 0) {
+                addAligned(&wide_scratch_bytes, w_cap * config.q_lora_rank * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.q_lora_rank * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.mlaQDim() * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.num_attention_heads * config.kv_lora_rank * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.num_attention_heads * @max(config.qk_rope_head_dim, 2) * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.mlaKvADim() * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.kv_lora_rank * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.kv_lora_rank * 2);
+                addAligned(&wide_scratch_bytes, w_cap * @max(config.qk_rope_head_dim, 2) * 2);
+                addAligned(&wide_scratch_bytes, w_cap * @max(config.qk_rope_head_dim, 2) * 2);
+                addAligned(&wide_scratch_bytes, w_cap * mla_head_in_dim * 2);
+                addAligned(&wide_scratch_bytes, w_cap * mla_head_out_dim * 2);
+                addAligned(&wide_scratch_bytes, w_cap * config.num_attention_heads * config.kv_lora_rank * 2);
+                for (0..num_mla_index_layers) |_| {
+                    wide_scratch_bytes += (try hybrid.Csa2IndexBuffer.requiredBytes(.{
+                        .max_nodes = wide_prefill_max_tokens,
+                        .top_k_blocks = config.csa2_top_k_blocks,
+                    })) + page.APPLE_PAGE_SIZE;
+                }
+            }
             wide_scratch_bytes += 4 * page.APPLE_PAGE_SIZE;
         }
 
         // Persistent / non-aliased scratch bytes (GDN states, Conv1D states, KV tile tables,
-        // QSA block_keys, R5 retired pool, logits, out_token_ids, accepted taps, expert tables).
+        // QSA block_keys, MLA FP4 KV / SWA / CSA2 summaries / absorbed projections, Mega-mHC coeffs,
+        // R5 retired pool, logits, out_token_ids, accepted taps, expert tables).
         var persist_bytes: usize = 0;
+        const mla_kv_max_toks: u32 = if (options.continuous_batch_only) @min(options.max_seq_len, 64) else options.max_seq_len;
+        const mla_kv_spec: hybrid.MlaFp4KvSpec = .{
+            .num_kv_layers = @max(@as(u32, 1), num_mla_full_layers),
+            .max_tokens = mla_kv_max_toks,
+            .kv_lora_rank = if (num_mla_layers > 0) config.kv_lora_rank else 32,
+            .qk_rope_dim = if (num_mla_layers > 0) config.qk_rope_head_dim else 0,
+            .rope_tail_format = config.fp4_rope_tail_format,
+        };
+        const mla_sum_spec: hybrid.Csa2SummarySpec = .{
+            .num_kv_layers = @max(@as(u32, 1), num_mla_full_layers),
+            .max_tokens = mla_kv_max_toks,
+            .index_dim = if (num_mla_layers > 0) config.kv_lora_rank else 32,
+            .block_tokens = config.csa2_block_tokens,
+        };
+        const mla_swa_spec: hybrid.MlaSwaRingSpec = .{
+            .num_kv_layers = @max(@as(u32, 1), num_mla_full_layers),
+            .swa_window = @max(@as(u32, 1), config.swa_window),
+            .kv_lora_rank = if (num_mla_layers > 0) config.kv_lora_rank else 32,
+            .qk_rope_dim = if (num_mla_layers > 0) config.qk_rope_head_dim else 0,
+        };
+        if (num_mla_layers > 0) {
+            persist_bytes += try hybrid.MlaFp4KvArena.requiredBytes(mla_kv_spec);
+            persist_bytes += try hybrid.Csa2SummaryArena.requiredBytes(mla_sum_spec);
+            if (config.swa_window > 0) {
+                persist_bytes += try hybrid.MlaSwaRingArena.requiredBytes(mla_swa_spec);
+            }
+            addAligned(&persist_bytes, @as(usize, max_m) * config.kv_lora_rank * 2); // mla_commit_latent
+            addAligned(&persist_bytes, @as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2); // mla_commit_rope
+            // Startup-dequantized per-head `W_UK^T` (`[kv_lora_rank, d_nope]` f16) and `W_UV` (`[d_v, kv_lora_rank]` f16).
+            const per_head_uk = @as(usize, config.kv_lora_rank) * config.qk_nope_head_dim * 2;
+            const per_head_uv = @as(usize, config.v_head_dim) * config.kv_lora_rank * 2;
+            for (0..num_mla_layers) |_| {
+                for (0..config.num_attention_heads) |_| {
+                    addAligned(&persist_bytes, per_head_uk);
+                    addAligned(&persist_bytes, per_head_uv);
+                }
+            }
+        }
+        if (config.axes.residual_kind == .mhc_single_pass) {
+            const s_cnt: usize = config.mhc_num_streams;
+            addAligned(&persist_bytes, s_cnt * 4); // mhc_uniform_pre
+            for (0..config.num_hidden_layers) |_| {
+                addAligned(&persist_bytes, s_cnt * 4); // h_pre
+                addAligned(&persist_bytes, s_cnt * 4); // h_post
+                addAligned(&persist_bytes, s_cnt * s_cnt * 4); // h_res
+            }
+        }
         if (num_gdn_layers > 0) {
             persist_bytes += try hybrid.GdnStateArena.requiredBytes(.{
                 .num_gdn_layers = num_gdn_layers,
@@ -6122,6 +8066,11 @@ pub const GraphModel = struct {
         var wp_dense_up_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
         var wp_dense_act_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
         var wp_moe_ws: ?moe.MoeWorkspace = null;
+        var wp_mhc_arena: ?hybrid.MhcStreamArena = null;
+        var wp_mla_scratch: MlaScratchBindings = .{};
+        var wp_x_host: []f16 = &.{};
+        var wp_x_norm_host: []f16 = &.{};
+        var wp_proj_out_host: []f16 = &.{};
         if (wide_enabled) {
             if (config.axes.residual_kind == .gated_4branch) {
                 wp_gr_arena = try hybrid.GrStreamArena.init(wp_arena, .{
@@ -6134,6 +8083,12 @@ pub const GraphModel = struct {
                 wp_gr_g_read_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_r.ptr) };
                 wp_gr_g_write_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_w.ptr) };
                 wp_gr_decay_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(gr_d.ptr) };
+            } else if (config.axes.residual_kind == .mhc_single_pass) {
+                wp_mhc_arena = try hybrid.MhcStreamArena.init(wp_arena, .{
+                    .max_tokens = wide_prefill_max_tokens,
+                    .num_streams = config.mhc_num_streams,
+                    .hidden_size = h,
+                });
             }
             const wt_raw = try wp_arena.allocAligned(w_cap * 4, 64);
             const wp3_raw = try wp_arena.allocAligned(w_cap * @sizeOf(hybrid.Pos3D), 64);
@@ -6150,6 +8105,7 @@ pub const GraphModel = struct {
             }
             const wx_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
             wp_x_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wx_raw.ptr) };
+            wp_x_host = @alignCast(std.mem.bytesAsSlice(f16, wx_raw[0 .. w_cap * h * 2]));
             if (multi_loop) {
                 const wxi_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
                 wp_x_init_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wxi_raw.ptr) };
@@ -6159,6 +8115,7 @@ pub const GraphModel = struct {
             const wk_raw = try wp_arena.allocAligned(w_cap * max_kv_dim * 2, 64);
             const wv_raw = try wp_arena.allocAligned(w_cap * max_kv_dim * 2, 64);
             wp_x_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wxn_raw.ptr) };
+            wp_x_norm_host = @alignCast(std.mem.bytesAsSlice(f16, wxn_raw[0 .. w_cap * h * 2]));
             wp_q_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wq_raw.ptr) };
             wp_k_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wk_raw.ptr) };
             wp_v_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wv_raw.ptr) };
@@ -6180,6 +8137,7 @@ pub const GraphModel = struct {
             const wpo_raw = try wp_arena.allocAligned(w_cap * h * 2, 64);
             wp_attn_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wao_raw.ptr) };
             wp_proj_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(wpo_raw.ptr) };
+            wp_proj_out_host = @alignCast(std.mem.bytesAsSlice(f16, wpo_raw[0 .. w_cap * h * 2]));
             if (config.axes.ffn_kind == .dense_swiglu) {
                 const wdg = try wp_arena.allocAligned(w_cap * max_inter * 2, 64);
                 const wdu = try wp_arena.allocAligned(w_cap * max_inter * 2, 64);
@@ -6190,6 +8148,39 @@ pub const GraphModel = struct {
             } else {
                 wp_moe_ws = try moe.MoeWorkspace.init(wp_arena, wp_moe_ws_spec);
             }
+            if (num_mla_layers > 0) {
+                const d_rope_alloc: usize = @max(config.qk_rope_head_dim, 2);
+                const w_qa = try wp_arena.allocAligned(w_cap * config.q_lora_rank * 2, 64);
+                const w_qan = try wp_arena.allocAligned(w_cap * config.q_lora_rank * 2, 64);
+                const w_qf = try wp_arena.allocAligned(w_cap * config.mlaQDim() * 2, 64);
+                const w_qn = try wp_arena.allocAligned(w_cap * config.num_attention_heads * config.kv_lora_rank * 2, 64);
+                const w_qp = try wp_arena.allocAligned(w_cap * config.num_attention_heads * d_rope_alloc * 2, 64);
+                const w_kva = try wp_arena.allocAligned(w_cap * config.mlaKvADim() * 2, 64);
+                const w_lr = try wp_arena.allocAligned(w_cap * config.kv_lora_rank * 2, 64);
+                const w_ln = try wp_arena.allocAligned(w_cap * config.kv_lora_rank * 2, 64);
+                const w_rr = try wp_arena.allocAligned(w_cap * d_rope_alloc * 2, 64);
+                const w_rrot = try wp_arena.allocAligned(w_cap * d_rope_alloc * 2, 64);
+                const w_hi = try wp_arena.allocAligned(w_cap * mla_head_in_dim * 2, 64);
+                const w_ho = try wp_arena.allocAligned(w_cap * mla_head_out_dim * 2, 64);
+                const w_al = try wp_arena.allocAligned(w_cap * config.num_attention_heads * config.kv_lora_rank * 2, 64);
+                wp_mla_scratch = .{
+                    .q_a_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_qa.ptr) },
+                    .q_a_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_qan.ptr) },
+                    .q_full_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_qf.ptr) },
+                    .q_nope_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_qn.ptr) },
+                    .q_pe_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_qp.ptr) },
+                    .q_pe_host = @alignCast(std.mem.bytesAsSlice(f16, w_qp[0 .. w_cap * config.num_attention_heads * d_rope_alloc * 2])),
+                    .kv_a_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_kva.ptr) },
+                    .latent_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_lr.ptr) },
+                    .latent_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_ln.ptr) },
+                    .rope_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_rr.ptr) },
+                    .rope_rot_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_rrot.ptr) },
+                    .rope_rot_host = @alignCast(std.mem.bytesAsSlice(f16, w_rrot[0 .. w_cap * d_rope_alloc * 2])),
+                    .head_in_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_hi.ptr) },
+                    .head_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_ho.ptr) },
+                    .attn_latent_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(w_al.ptr) },
+                };
+            }
         }
 
         // --- Carve Region B: decode & `verifyTree` scratch (`tr_arena`) ---
@@ -6197,6 +8188,14 @@ pub const GraphModel = struct {
             try hybrid.GrStreamArena.init(tr_arena, .{
                 .max_tokens = max_m,
                 .hidden_dim = h,
+            })
+        else
+            null;
+        const mhc_arena: ?hybrid.MhcStreamArena = if (config.axes.residual_kind == .mhc_single_pass)
+            try hybrid.MhcStreamArena.init(tr_arena, .{
+                .max_tokens = max_m,
+                .num_streams = config.mhc_num_streams,
+                .hidden_size = h,
             })
         else
             null;
@@ -6239,7 +8238,75 @@ pub const GraphModel = struct {
         else
             null;
 
+        var mla_scratch: MlaScratchBindings = .{};
+        if (num_mla_layers > 0) {
+            const d_rope_alloc: usize = @max(config.qk_rope_head_dim, 2);
+            const t_qa = try tr_arena.allocAligned(@as(usize, max_m) * config.q_lora_rank * 2, 64);
+            const t_qan = try tr_arena.allocAligned(@as(usize, max_m) * config.q_lora_rank * 2, 64);
+            const t_qf = try tr_arena.allocAligned(@as(usize, max_m) * config.mlaQDim() * 2, 64);
+            const t_qn = try tr_arena.allocAligned(@as(usize, max_m) * config.num_attention_heads * config.kv_lora_rank * 2, 64);
+            const t_qp = try tr_arena.allocAligned(@as(usize, max_m) * config.num_attention_heads * d_rope_alloc * 2, 64);
+            const t_kva = try tr_arena.allocAligned(@as(usize, max_m) * config.mlaKvADim() * 2, 64);
+            const t_lr = try tr_arena.allocAligned(@as(usize, max_m) * config.kv_lora_rank * 2, 64);
+            const t_ln = try tr_arena.allocAligned(@as(usize, max_m) * config.kv_lora_rank * 2, 64);
+            const t_rr = try tr_arena.allocAligned(@as(usize, max_m) * d_rope_alloc * 2, 64);
+            const t_rrot = try tr_arena.allocAligned(@as(usize, max_m) * d_rope_alloc * 2, 64);
+            const t_hi = try tr_arena.allocAligned(@as(usize, max_m) * mla_head_in_dim * 2, 64);
+            const t_ho = try tr_arena.allocAligned(@as(usize, max_m) * mla_head_out_dim * 2, 64);
+            const t_al = try tr_arena.allocAligned(@as(usize, max_m) * config.num_attention_heads * config.kv_lora_rank * 2, 64);
+            mla_scratch = .{
+                .q_a_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_qa.ptr) },
+                .q_a_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_qan.ptr) },
+                .q_full_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_qf.ptr) },
+                .q_nope_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_qn.ptr) },
+                .q_pe_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_qp.ptr) },
+                .q_pe_host = @alignCast(std.mem.bytesAsSlice(f16, t_qp[0 .. @as(usize, max_m) * config.num_attention_heads * d_rope_alloc * 2])),
+                .kv_a_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_kva.ptr) },
+                .latent_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_lr.ptr) },
+                .latent_norm_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_ln.ptr) },
+                .rope_raw_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_rr.ptr) },
+                .rope_rot_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_rrot.ptr) },
+                .rope_rot_host = @alignCast(std.mem.bytesAsSlice(f16, t_rrot[0 .. @as(usize, max_m) * d_rope_alloc * 2])),
+                .head_in_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_hi.ptr) },
+                .head_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_ho.ptr) },
+                .attn_latent_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(t_al.ptr) },
+            };
+        }
+
         // --- Carve persistent non-aliased sub-arenas inside `scratch_arena` ---
+        const mla_kv_arena: ?hybrid.MlaFp4KvArena = if (num_mla_layers > 0)
+            try hybrid.MlaFp4KvArena.init(&scratch_arena, mla_kv_spec)
+        else
+            null;
+        const csa2_summary_arena: ?hybrid.Csa2SummaryArena = if (num_mla_layers > 0)
+            try hybrid.Csa2SummaryArena.init(&scratch_arena, mla_sum_spec)
+        else
+            null;
+        const mla_swa_arena: ?hybrid.MlaSwaRingArena = if (num_mla_layers > 0 and config.swa_window > 0)
+            try hybrid.MlaSwaRingArena.init(&scratch_arena, mla_swa_spec)
+        else
+            null;
+        var mla_commit_latent_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var mla_commit_rope_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        var mla_commit_latent_host: []f16 = &.{};
+        var mla_commit_rope_host: []f16 = &.{};
+        if (num_mla_layers > 0) {
+            const cl_raw = try scratch_arena.allocAligned(@as(usize, max_m) * config.kv_lora_rank * 2, 64);
+            const cr_raw = try scratch_arena.allocAligned(@as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2, 64);
+            mla_commit_latent_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(cl_raw.ptr) };
+            mla_commit_rope_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(cr_raw.ptr) };
+            mla_commit_latent_host = @alignCast(std.mem.bytesAsSlice(f16, cl_raw[0 .. @as(usize, max_m) * config.kv_lora_rank * 2]));
+            mla_commit_rope_host = @alignCast(std.mem.bytesAsSlice(f16, cr_raw[0 .. @as(usize, max_m) * @max(config.qk_rope_head_dim, 2) * 2]));
+        }
+        var mhc_uniform_pre_bind: metal.BufferBinding = .{ .buffer = scratch_buf, .offset = 0 };
+        if (config.axes.residual_kind == .mhc_single_pass) {
+            const s_cnt: usize = config.mhc_num_streams;
+            const u_raw = try scratch_arena.allocAligned(s_cnt * 4, 64);
+            const u_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, u_raw[0 .. s_cnt * 4]));
+            const inv_s: f32 = 1.0 / @as(f32, @floatFromInt(s_cnt));
+            for (u_f32) |*v| v.* = inv_s;
+            mhc_uniform_pre_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(u_raw.ptr) };
+        }
         const retired_kv_pool: ?attention.RetiredKvQ8Pool = if (use_retired_q8)
             try attention.RetiredKvQ8Pool.init(&scratch_arena, retired_pool_spec)
         else
@@ -6333,8 +8400,13 @@ pub const GraphModel = struct {
                         };
                         qsa.kv_ring.deinit(allocator);
                     },
+                    .mla_csa2 => |*mla| {
+                        if (mla.w_uk_t_heads.len > 0) allocator.free(mla.w_uk_t_heads);
+                        if (mla.w_uv_heads.len > 0) allocator.free(mla.w_uv_heads);
+                    },
                     else => {},
                 }
+                if (layers[li].expert_sources.len > 0) allocator.free(layers[li].expert_sources);
             }
             allocator.free(layers);
         }
@@ -6342,6 +8414,11 @@ pub const GraphModel = struct {
         var gdn_cursor: u32 = 0;
         var qsa_cursor: u32 = 0;
         var gqa_cursor: u32 = 0;
+        var mla_cursor: u32 = 0;
+        var mla_full_cursor: u32 = 0;
+        var cur_kv_owner_slot: u32 = 0;
+        var cur_kv_owner_layer: usize = 0;
+        var cur_idx_owner_layer: usize = 0;
         var name_buf: [160]u8 = undefined;
         var single_expert_bytes: u64 = 0;
         var total_layers_non_expert_bytes: u64 = 0;
@@ -6372,6 +8449,51 @@ pub const GraphModel = struct {
                     .dtype = gdt,
                 };
                 total_layers_non_expert_bytes += 3 * 4 * @as(u64, h) * 2;
+            }
+
+            var mhc_w: ?MhcLayerWeights = null;
+            if (config.axes.residual_kind == .mhc_single_pass) {
+                const s_cnt: usize = config.mhc_num_streams;
+                const pre_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mhc.pre_mix.weight", .{l}) catch unreachable;
+                const pre_e = source.find(pre_nm) orelse return error.MissingTensor;
+                const pre_idx = entryIndexOf(entry_base_ptr, pre_e);
+                const post_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mhc.post_mix.weight", .{l}) catch unreachable;
+                const post_e = source.find(post_nm) orelse return error.MissingTensor;
+                const post_idx = entryIndexOf(entry_base_ptr, post_e);
+                const res_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mhc.res_mix.weight", .{l}) catch unreachable;
+                const res_e = source.find(res_nm) orelse return error.MissingTensor;
+                const res_idx = entryIndexOf(entry_base_ptr, res_e);
+
+                const hp_raw = try scratch_arena.allocAligned(s_cnt * 4, 64);
+                const hpo_raw = try scratch_arena.allocAligned(s_cnt * 4, 64);
+                const hr_raw = try scratch_arena.allocAligned(s_cnt * s_cnt * 4, 64);
+                const hp_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hp_raw[0 .. s_cnt * 4]));
+                const hpo_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hpo_raw[0 .. s_cnt * 4]));
+                const hr_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, hr_raw[0 .. s_cnt * s_cnt * 4]));
+
+                const pre_dt = try pre_e.dataType();
+                const post_dt = try post_e.dataType();
+                const res_dt = try res_e.dataType();
+                const inv_sqrt_h: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
+                for (0..s_cnt) |s| {
+                    var sum_pre: f32 = 0.0;
+                    var sum_post: f32 = 0.0;
+                    for (0..h) |d| {
+                        sum_pre += readFloatElem(entry_slices[pre_idx], pre_dt, s * h + d);
+                        sum_post += readFloatElem(entry_slices[post_idx], post_dt, s * h + d);
+                    }
+                    hp_f32[s] = sum_pre * inv_sqrt_h;
+                    hpo_f32[s] = sum_post * inv_sqrt_h;
+                }
+                for (0..s_cnt * s_cnt) |k| {
+                    hr_f32[k] = readFloatElem(entry_slices[res_idx], res_dt, k);
+                }
+                mhc_w = .{
+                    .h_pre_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(hp_raw.ptr) },
+                    .h_post_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(hpo_raw.ptr) },
+                    .h_res_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(hr_raw.ptr) },
+                };
+                total_layers_non_expert_bytes += (2 * s_cnt * @as(u64, h) + s_cnt * s_cnt) * 2;
             }
 
             var attn_union: LayerAttention = undefined;
@@ -6666,7 +8788,155 @@ pub const GraphModel = struct {
                     gqa_cursor += 1;
                     layer_attn_bytes = q_p.alg_bytes + k_p.alg_bytes + v_p.alg_bytes + o_p.alg_bytes;
                 },
-                .mla_csa2 => return error.UnsupportedOperatorAxis,
+                .mla_csa2 => {
+                    const csa_mode = config.csa2_modes[l];
+                    const n_heads: u32 = config.num_attention_heads;
+                    const kv_rank: u32 = config.kv_lora_rank;
+                    const q_rank: u32 = config.q_lora_rank;
+                    const d_nope: u32 = config.qk_nope_head_dim;
+                    const d_rope: u32 = config.qk_rope_head_dim;
+                    const d_v: u32 = config.v_head_dim;
+
+                    const qa_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_a_proj", .{l}) catch unreachable;
+                    const qa_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qa_nm, q_rank, h);
+                    const qan_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_a_layernorm.weight", .{l}) catch unreachable;
+                    const qan = try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qan_nm, q_rank);
+                    const qb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.q_b_proj", .{l}) catch unreachable;
+                    const qb_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, qb_nm, config.mlaQDim(), q_rank);
+                    const kva_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_a_proj_with_mqa", .{l}) catch unreachable;
+                    const kva_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kva_nm, config.mlaKvADim(), h);
+                    const kvan_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_a_layernorm.weight", .{l}) catch unreachable;
+                    const kvan = try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kvan_nm, kv_rank);
+                    const kvb_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_b_proj", .{l}) catch unreachable;
+                    const kvb_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, kvb_nm, config.mlaKvBDim(), kv_rank);
+                    const o_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable;
+                    const o_p = try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, o_nm, h, config.mlaVDim());
+
+                    const idx_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.csa2_idx_proj", .{l}) catch unreachable;
+                    const csa_idx_p: ?qwen3.LinearBinding = if (source.find(idx_nm) != null)
+                        try bindLinear(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, idx_nm, kv_rank, h)
+                    else
+                        null;
+
+                    // Startup-only dequantization of `kv_b_proj` (`[n_heads * (d_nope + d_v), kv_rank]`)
+                    // into per-head absorbed `W_UK^T` (`[kv_rank, d_nope]` f16) and `W_UV` (`[d_v, kv_rank]` f16)
+                    // inside wired `scratch_arena` (0 hot-path heap allocs).
+                    const kvb_lookup = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_b_proj", .{l}) catch unreachable;
+                    const kvb_entry = source.find(kvb_lookup) orelse blk: {
+                        const kvb_w = std.fmt.bufPrint(&name_buf, "layers.{d}.self_attn.kv_b_proj.weight", .{l}) catch unreachable;
+                        break :blk source.find(kvb_w) orelse return error.MissingTensor;
+                    };
+                    const kvb_idx = entryIndexOf(entry_base_ptr, kvb_entry);
+                    const kvb_raw = entry_slices[kvb_idx];
+                    const kvb_dt = try kvb_entry.dataType();
+
+                    const w_uk_t_heads = try allocator.alloc(qwen3.LinearBinding, n_heads);
+                    errdefer allocator.free(w_uk_t_heads);
+                    const w_uv_heads = try allocator.alloc(qwen3.LinearBinding, n_heads);
+                    errdefer allocator.free(w_uv_heads);
+
+                    const row_buf = try allocator.alloc(f32, kv_rank);
+                    defer allocator.free(row_buf);
+                    const per_head_rows: usize = d_nope + d_v;
+                    for (0..n_heads) |hd| {
+                        const uk_raw = try scratch_arena.allocAligned(@as(usize, kv_rank) * d_nope * 2, 64);
+                        const uk_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, uk_raw[0 .. @as(usize, kv_rank) * d_nope * 2]));
+                        for (0..d_nope) |c| {
+                            try decodeMatrixRowF32(kvb_entry, kvb_dt, kvb_raw, hd * per_head_rows + c, kv_rank, row_buf);
+                            for (0..kv_rank) |r| {
+                                uk_f16[r * d_nope + c] = @floatCast(row_buf[r]);
+                            }
+                        }
+                        w_uk_t_heads[hd] = .{
+                            .weight = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(uk_raw.ptr) },
+                            .scale_bias = null,
+                            .n = kv_rank,
+                            .k = d_nope,
+                            .dtype = .f16,
+                            .alg_bytes = @as(u64, kv_rank) * d_nope * 2,
+                        };
+
+                        const uv_raw = try scratch_arena.allocAligned(@as(usize, d_v) * kv_rank * 2, 64);
+                        const uv_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, uv_raw[0 .. @as(usize, d_v) * kv_rank * 2]));
+                        for (0..d_v) |j| {
+                            try decodeMatrixRowF32(kvb_entry, kvb_dt, kvb_raw, hd * per_head_rows + d_nope + j, kv_rank, row_buf);
+                            for (0..kv_rank) |r| {
+                                uv_f16[j * kv_rank + r] = @floatCast(row_buf[r]);
+                            }
+                        }
+                        w_uv_heads[hd] = .{
+                            .weight = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(uv_raw.ptr) },
+                            .scale_bias = null,
+                            .n = d_v,
+                            .k = kv_rank,
+                            .dtype = .f16,
+                            .alg_bytes = @as(u64, d_v) * kv_rank * 2,
+                        };
+                    }
+
+                    var shared_kv_owner: u32 = cur_kv_owner_slot;
+                    var kv_owner_layer: usize = cur_kv_owner_layer;
+                    var idx_owner_layer: usize = cur_idx_owner_layer;
+                    var mla_idx_buf: ?hybrid.Csa2IndexBuffer = null;
+                    var mla_wp_idx_buf: ?hybrid.Csa2IndexBuffer = null;
+                    var tree_lat_off: u64 = 0;
+                    var tree_rope_off: u64 = 0;
+
+                    if (csa_mode == .full) {
+                        shared_kv_owner = mla_full_cursor;
+                        cur_kv_owner_slot = mla_full_cursor;
+                        kv_owner_layer = l;
+                        cur_kv_owner_layer = l;
+                        idx_owner_layer = l;
+                        cur_idx_owner_layer = l;
+                        mla_full_cursor += 1;
+
+                        const tl_raw = try tr_arena.allocAligned(@as(usize, max_m) * kv_rank * 2, 64);
+                        const tr_raw = try tr_arena.allocAligned(@as(usize, max_m) * @max(d_rope, 2) * 2, 64);
+                        tree_lat_off = scratch_arena.offsetOf(tl_raw.ptr);
+                        tree_rope_off = scratch_arena.offsetOf(tr_raw.ptr);
+                    } else if (csa_mode == .reindex) {
+                        idx_owner_layer = l;
+                        cur_idx_owner_layer = l;
+                    }
+
+                    if (csa_mode != .reuse) {
+                        mla_idx_buf = try hybrid.Csa2IndexBuffer.init(tr_arena, .{
+                            .max_nodes = max_m,
+                            .top_k_blocks = config.csa2_top_k_blocks,
+                        });
+                        if (wide_enabled) {
+                            mla_wp_idx_buf = try hybrid.Csa2IndexBuffer.init(wp_arena, .{
+                                .max_nodes = wide_prefill_max_tokens,
+                                .top_k_blocks = config.csa2_top_k_blocks,
+                            });
+                        }
+                    }
+
+                    attn_union = .{ .mla_csa2 = .{
+                        .mode = csa_mode,
+                        .mla_idx = mla_cursor,
+                        .shared_kv_owner = shared_kv_owner,
+                        .kv_owner_layer = kv_owner_layer,
+                        .index_owner_layer = idx_owner_layer,
+                        .q_a_proj = qa_p,
+                        .q_a_norm = qan,
+                        .q_b_proj = qb_p,
+                        .kv_a_proj = kva_p,
+                        .kv_a_norm = kvan,
+                        .o_proj = o_p,
+                        .csa2_idx_proj = csa_idx_p,
+                        .w_uk_t_heads = w_uk_t_heads,
+                        .w_uv_heads = w_uv_heads,
+                        .index_buf = mla_idx_buf,
+                        .wp_index_buf = mla_wp_idx_buf,
+                        .tree_latent_off = tree_lat_off,
+                        .tree_rope_off = tree_rope_off,
+                    } };
+                    mla_cursor += 1;
+                    layer_attn_bytes = qa_p.alg_bytes + qb_p.alg_bytes + kva_p.alg_bytes + kvb_p.alg_bytes + o_p.alg_bytes +
+                        (if (csa_idx_p) |ip| ip.alg_bytes else 0);
+                },
             }
 
             var lw: GraphLayerWeights = .{
@@ -6674,6 +8944,7 @@ pub const GraphModel = struct {
                 .input_layernorm = in_ln,
                 .post_attention_layernorm = post_ln,
                 .gr = gr_w,
+                .mhc = mhc_w,
                 .attn = attn_union,
             };
 
@@ -6753,7 +9024,23 @@ pub const GraphModel = struct {
                     var first_dt: ?quant.WeightDType = null;
                     var hetero = false;
                     var exp_buf: metal.Buffer = weight_shards[0].buffer;
+                    if (effective_cluster_plan != null) {
+                        lw.expert_sources = try allocator.alloc(expert.ExpertSource, config.num_experts);
+                    }
                     for (0..config.num_experts) |e| {
+                        const is_remote_peer = if (effective_cluster_plan) |plan| !plan.isLocal(@intCast(e)) else false;
+                        if (is_remote_peer) {
+                            const plan = effective_cluster_plan.?;
+                            lw.has_remote_experts = true;
+                            tbl[e] = std.mem.zeroes(moe.ExpertWeights);
+                            dt_raw[e] = @backingInt(first_dt orelse .q3_affine);
+                            const remote_len: u64 = if (single_expert_bytes > 0)
+                                try page.alignUp(single_expert_bytes)
+                            else
+                                page.APPLE_PAGE_SIZE;
+                            lw.expert_sources[e] = try plan.buildExpertSource(@intCast(l), @intCast(e), null, 0, remote_len);
+                            continue;
+                        }
                         const g_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
                         const ge = source.find(g_nm) orelse return error.MissingTensor;
                         const u_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable;
@@ -6784,6 +9071,10 @@ pub const GraphModel = struct {
                             const triple = try cache_mod.ColdExpertTriple.fromAmfEntries(cold_rt.?.amf_file.?.fd, 0, ge, ue, de);
                             try cold_rt.?.expert_cache.registerCold(@intCast(l), @intCast(e), triple);
                             tbl[e] = std.mem.zeroes(moe.ExpertWeights);
+                            if (lw.expert_sources.len > 0) {
+                                const nvme_e = try expert.NvmeExpert.init(0, ge.blob_offset, try page.alignUp(ge.blob_bytes));
+                                lw.expert_sources[e] = .{ .local_nvme_ssd = nvme_e };
+                            }
                             if (single_expert_bytes == 0) single_expert_bytes = triple.totalBlobBytes();
                         } else {
                             const g_idx = entryIndexOf(entry_base_ptr, ge);
@@ -6792,6 +9083,9 @@ pub const GraphModel = struct {
                             exp_buf = weight_shards[entry_shard[g_idx]].buffer;
                             const ew = makeExpertWeights(wdt, entry_offsets[g_idx], ge.params_offset, entry_offsets[u_idx], ue.params_offset, entry_offsets[d_idx], de.params_offset);
                             tbl[e] = ew;
+                            if (lw.expert_sources.len > 0) {
+                                lw.expert_sources[e] = .{ .local_wired_ram = try expert.WiredExpert.init(entry_page_slices[g_idx]) };
+                            }
                             if (cold_rt) |crt| {
                                 try crt.expert_cache.registerHot(@intCast(l), @intCast(e), .{
                                     .gate = try expert.WiredExpert.init(entry_page_slices[g_idx]),
@@ -6820,7 +9114,7 @@ pub const GraphModel = struct {
             layers_built += 1;
         }
 
-        // --- 6. Optional PLE Store (`C10`, `F_NOCACHE`) ---
+        // --- 6. Optional PLE / Engram Store (`C10`, `F_NOCACHE`) ---
         var ple_rt: ?*PleRuntime = null;
         errdefer if (ple_rt) |prt| {
             allocator.free(prt.f32_tmp);
@@ -6833,19 +9127,30 @@ pub const GraphModel = struct {
             const prt = try allocator.create(PleRuntime);
             errdefer allocator.destroy(prt);
             var store = try ple_mod.PleStore.open(allocator, options.ple_paths, .{
+                .table_kind = if (config.axes.memory_lookup_kind == .engram) .engram_conditional else null,
                 .cache = .{
                     .cache_pages = eff_ple_cache_pages,
                     .budget_override = wired_budget,
                 },
             });
             errdefer store.deinit(allocator);
-            var ple_scratch = try ple_mod.LoopPleScratch.init(
-                allocator,
-                @intCast(config.num_hidden_layers),
-                @intCast(ple_max_m),
-                h,
-                wired_budget,
-            );
+            var ple_scratch = if (config.axes.memory_lookup_kind == .engram)
+                try ple_mod.LoopPleScratch.initEngram(
+                    allocator,
+                    @intCast(config.num_hidden_layers),
+                    @intCast(ple_max_m),
+                    config.engram_num_heads,
+                    h,
+                    wired_budget,
+                )
+            else
+                try ple_mod.LoopPleScratch.init(
+                    allocator,
+                    @intCast(config.num_hidden_layers),
+                    @intCast(ple_max_m),
+                    h,
+                    wired_budget,
+                );
             errdefer ple_scratch.deinit(allocator);
             const f32_tmp = try allocator.alloc(f32, @as(usize, ple_max_m) * h);
             errdefer allocator.free(f32_tmp);
@@ -6889,6 +9194,32 @@ pub const GraphModel = struct {
             break :blk ring;
         } else &.{};
         errdefer if (active_tile_phys_ring.len > 0) allocator.free(active_tile_phys_ring);
+
+        const ced_encoder_sum_host: []f32 = if (config.isCausalEncDec()) try allocator.alloc(f32, h) else &.{};
+        errdefer if (ced_encoder_sum_host.len > 0) allocator.free(ced_encoder_sum_host);
+        if (ced_encoder_sum_host.len > 0) @memset(ced_encoder_sum_host, 0.0);
+        const ced_encoder_summary_host: []f32 = if (config.isCausalEncDec()) try allocator.alloc(f32, h) else &.{};
+        errdefer if (ced_encoder_summary_host.len > 0) allocator.free(ced_encoder_summary_host);
+        if (ced_encoder_summary_host.len > 0) @memset(ced_encoder_summary_host, 0.0);
+        const ced_last_decoder_hidden_host: []f32 = try allocator.alloc(f32, h);
+        errdefer allocator.free(ced_last_decoder_hidden_host);
+        @memset(ced_last_decoder_hidden_host, 0.0);
+        const ced_tree_top_hidden_host: []f16 = try allocator.alloc(f16, @as(usize, max_m) * h);
+        errdefer allocator.free(ced_tree_top_hidden_host);
+        @memset(ced_tree_top_hidden_host, 0);
+
+        const cluster_max_m: usize = @max(@as(usize, max_m), w_cap);
+        const cluster_assignments: []transport.Assignment = if (options.cluster_coordinator != null)
+            try allocator.alloc(transport.Assignment, cluster_max_m * max_top_k)
+        else
+            &.{};
+        errdefer if (cluster_assignments.len > 0) allocator.free(cluster_assignments);
+        const cluster_accum_f32: []f32 = if (options.cluster_coordinator != null)
+            try allocator.alloc(f32, cluster_max_m * h)
+        else
+            &.{};
+        errdefer if (cluster_accum_f32.len > 0) allocator.free(cluster_accum_f32);
+        if (cluster_accum_f32.len > 0) @memset(cluster_accum_f32, 0.0);
 
         const aux_ids = options.aux_layer_ids orelse qwen3.defaultEagle3AuxLayerIds(config.num_hidden_layers);
         const embed_row_alg_bytes = embed.alg_bytes / config.vocab_size;
@@ -7046,7 +9377,248 @@ pub const GraphModel = struct {
             .wp_dense_act_bind = wp_dense_act_bind,
             .wp_moe_ws = wp_moe_ws,
             .chip_profile = resolved_chip_profile,
+            .mla_kv_buf = scratch_buf,
+            .mla_kv_arena = mla_kv_arena,
+            .mla_swa_arena = mla_swa_arena,
+            .csa2_summary_arena = csa2_summary_arena,
+            .mhc_arena = mhc_arena,
+            .wp_mhc_arena = wp_mhc_arena,
+            .mhc_uniform_pre_bind = mhc_uniform_pre_bind,
+            .ced_bridge = ced_bridge,
+            .ced_encoder_prefix_len = 0,
+            .ced_encoder_sum_host = ced_encoder_sum_host,
+            .ced_encoder_summary_host = ced_encoder_summary_host,
+            .ced_last_decoder_hidden_host = ced_last_decoder_hidden_host,
+            .ced_tree_top_hidden_host = ced_tree_top_hidden_host,
+            .mla_scratch = mla_scratch,
+            .wp_mla_scratch = wp_mla_scratch,
+            .mla_commit_latent_bind = mla_commit_latent_bind,
+            .mla_commit_rope_bind = mla_commit_rope_bind,
+            .mla_commit_latent_host = mla_commit_latent_host,
+            .mla_commit_rope_host = mla_commit_rope_host,
+            .wp_x_host = wp_x_host,
+            .wp_x_norm_host = wp_x_norm_host,
+            .wp_proj_out_host = wp_proj_out_host,
+            .cluster_coordinator = options.cluster_coordinator,
+            .cluster_plan = effective_cluster_plan,
+            .cluster_assignments = cluster_assignments,
+            .cluster_accum_f32 = cluster_accum_f32,
+            .m7_stats = .{},
         };
+    }
+};
+
+fn readFloatElem(raw: []const u8, dt: amf.DType, idx: usize) f32 {
+    return switch (dt) {
+        .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw[idx * 2 ..][0..2], .little)))),
+        .bf16 => quant.bf16ToF32(std.mem.readInt(u16, raw[idx * 2 ..][0..2], .little)),
+        .f32 => @bitCast(std.mem.readInt(u32, raw[idx * 4 ..][0..4], .little)),
+        else => 0.0,
+    };
+}
+
+fn decodeMatrixRowF32(
+    entry: *const amf.TensorEntry,
+    dt: amf.DType,
+    raw: []const u8,
+    row_idx: usize,
+    cols: usize,
+    out_row: []f32,
+) GraphLoadError!void {
+    switch (dt) {
+        .f16 => {
+            const base = row_idx * cols * 2;
+            for (0..cols) |c| {
+                const bits = std.mem.readInt(u16, raw[base + c * 2 ..][0..2], .little);
+                out_row[c] = @floatCast(@as(f16, @bitCast(bits)));
+            }
+        },
+        .bf16 => {
+            const base = row_idx * cols * 2;
+            for (0..cols) |c| {
+                const bits = std.mem.readInt(u16, raw[base + c * 2 ..][0..2], .little);
+                out_row[c] = quant.bf16ToF32(bits);
+            }
+        },
+        .f32 => {
+            const base = row_idx * cols * 4;
+            for (0..cols) |c| {
+                out_row[c] = @bitCast(std.mem.readInt(u32, raw[base + c * 4 ..][0..4], .little));
+            }
+        },
+        .q4_affine, .q3_affine, .q2_affine => {
+            const gs: usize = if (entry.group_size > 0) entry.group_size else 64;
+            if (gs != 64 or (cols % 64) != 0) return error.UnsupportedDType;
+            const groups = cols / 64;
+            const grp_code_bytes: usize = switch (dt) {
+                .q4_affine => 32,
+                .q3_affine => 24,
+                .q2_affine => 16,
+                else => unreachable,
+            };
+            const row_code_base = row_idx * groups * grp_code_bytes;
+            const row_param_base: usize = @as(usize, @intCast(entry.params_offset)) + row_idx * groups * 4;
+            for (0..groups) |g| {
+                const sb_off = row_param_base + g * 4;
+                const sb: quant.ScaleBias = .{
+                    .scale = @bitCast(std.mem.readInt(u16, raw[sb_off + 0 ..][0..2], .little)),
+                    .bias = @bitCast(std.mem.readInt(u16, raw[sb_off + 2 ..][0..2], .little)),
+                };
+                const dst: *[64]f32 = out_row[g * 64 ..][0..64];
+                const src = raw[row_code_base + g * grp_code_bytes ..];
+                switch (dt) {
+                    .q4_affine => quant.QuantOps(.{ .bits = .q4, .group_size = 64 }).dequantizeGroup(src[0..32], sb, dst),
+                    .q3_affine => quant.QuantOps(.{ .bits = .q3, .group_size = 64 }).dequantizeGroup(src[0..24], sb, dst),
+                    .q2_affine => quant.QuantOps(.{ .bits = .q2, .group_size = 64 }).dequantizeGroup(src[0..16], sb, dst),
+                    else => unreachable,
+                }
+            }
+        },
+        else => return error.UnsupportedDType,
+    }
+}
+
+/// Self-contained 16 KiB-aligned wired `CpuMoeExpertStore` loader over an `.amf`
+/// file or memory buffer for a specific rank's owned experts (`X2`/`X3` `peer-worker`
+/// and rank-0 local expert evaluation). Zero dynamic heap allocations during eval!
+pub const LoadedCpuMoeStore = struct {
+    arena: arena_mod.WiredArena,
+    entries: []expert_parallel.CpuExpertEntry,
+    scratch_act_f32: []f32,
+    store: expert_parallel.CpuMoeExpertStore,
+
+    pub fn loadFromFile(
+        allocator: std.mem.Allocator,
+        amf_path: [:0]const u8,
+        config: GraphConfig,
+        plan: expert_parallel.ExpertPartitionPlan,
+        budget_override: ?budget_mod.Budget,
+    ) GraphLoadError!LoadedCpuMoeStore {
+        var amf_file = try amf.AmfFile.open(allocator, amf_path);
+        defer amf_file.close(allocator);
+        return loadFromSource(allocator, .{ .file = .{ .file = &amf_file, .path = amf_path } }, config, plan, budget_override);
+    }
+
+    pub fn loadFromBytes(
+        allocator: std.mem.Allocator,
+        amf_bytes: []const u8,
+        config: GraphConfig,
+        plan: expert_parallel.ExpertPartitionPlan,
+        budget_override: ?budget_mod.Budget,
+    ) GraphLoadError!LoadedCpuMoeStore {
+        var parsed = try amf.parse(allocator, amf_bytes);
+        defer parsed.deinit(allocator);
+        return loadFromSource(allocator, .{ .bytes = .{ .parsed = &parsed, .raw = amf_bytes } }, config, plan, budget_override);
+    }
+
+    fn loadFromSource(
+        allocator: std.mem.Allocator,
+        source: GraphModel.AmfSource,
+        config: GraphConfig,
+        plan: expert_parallel.ExpertPartitionPlan,
+        budget_override: ?budget_mod.Budget,
+    ) GraphLoadError!LoadedCpuMoeStore {
+        if (config.axes.ffn_kind != .moe_swiglu) return error.InvalidConfig;
+        const num_layers: usize = config.num_hidden_layers;
+        const num_experts: usize = config.num_experts;
+        var name_buf: [160]u8 = undefined;
+
+        var total_bytes: usize = 0;
+        for (0..num_layers) |l| {
+            for (0..num_experts) |e| {
+                if (!plan.isLocal(@intCast(e))) continue;
+                const gn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
+                const ge = source.find(gn) orelse return error.MissingTensor;
+                const un = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable;
+                const ue = source.find(un) orelse return error.MissingTensor;
+                const dn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable;
+                const de = source.find(dn) orelse return error.MissingTensor;
+                total_bytes += try page.alignUp(@intCast(ge.blob_bytes));
+                total_bytes += try page.alignUp(@intCast(ue.blob_bytes));
+                total_bytes += try page.alignUp(@intCast(de.blob_bytes));
+            }
+        }
+        const arena_bytes = try page.alignUp(@max(total_bytes, page.APPLE_PAGE_SIZE));
+        const wired_budget = budget_override orelse blk: {
+            const facts = try sysinfo.Facts.read();
+            break :blk budget_mod.Budget.compute(.{
+                .memory_bytes = facts.memory_bytes,
+                .user_wire_limit = facts.user_wire_limit,
+                .global_user_wire_limit = facts.global_user_wire_limit,
+                .gpu_working_set_bytes = facts.memory_bytes,
+                .configured_cap = null,
+                .headroom_bytes = budget_mod.DEFAULT_HEADROOM_BYTES,
+            });
+        };
+        var w_arena = try arena_mod.WiredArena.init(arena_bytes, wired_budget);
+        errdefer w_arena.deinit();
+
+        const entries = try allocator.alloc(expert_parallel.CpuExpertEntry, num_layers * num_experts);
+        errdefer allocator.free(entries);
+        @memset(entries, .{
+            .present = false,
+            .dtype = .q4_affine,
+            .weights = std.mem.zeroes(expert_parallel.CpuExpertWeights),
+        });
+
+        for (0..num_layers) |l| {
+            for (0..num_experts) |e| {
+                if (!plan.isLocal(@intCast(e))) continue;
+                const gn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
+                const ge = source.find(gn) orelse return error.MissingTensor;
+                const un = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable;
+                const ue = source.find(un) orelse return error.MissingTensor;
+                const dn = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable;
+                const de = source.find(dn) orelse return error.MissingTensor;
+                const wdt = amfToWeightDType(try ge.dataType()) orelse return error.UnsupportedDType;
+                const g_raw = try source.loadIntoArena(ge, &w_arena);
+                const u_raw = try source.loadIntoArena(ue, &w_arena);
+                const d_raw = try source.loadIntoArena(de, &w_arena);
+                const g_off = w_arena.offsetOf(g_raw.ptr);
+                const u_off = w_arena.offsetOf(u_raw.ptr);
+                const d_off = w_arena.offsetOf(d_raw.ptr);
+                entries[l * num_experts + e] = .{
+                    .present = true,
+                    .dtype = wdt,
+                    .weights = .{
+                        .gate_weight_offset = g_off,
+                        .gate_sb_offset = if (wdt.isQuantized()) g_off + ge.params_offset else 0,
+                        .up_weight_offset = u_off,
+                        .up_sb_offset = if (wdt.isQuantized()) u_off + ue.params_offset else 0,
+                        .down_weight_offset = d_off,
+                        .down_sb_offset = if (wdt.isQuantized()) d_off + de.params_offset else 0,
+                    },
+                };
+            }
+        }
+        const scratch_act_f32 = try allocator.alloc(f32, config.moe_intermediate_size);
+        errdefer allocator.free(scratch_act_f32);
+        @memset(scratch_act_f32, 0.0);
+        const store = try expert_parallel.CpuMoeExpertStore.init(
+            @intCast(num_layers),
+            @intCast(num_experts),
+            config.hidden_size,
+            config.moe_intermediate_size,
+            w_arena.bytes(),
+            entries,
+            scratch_act_f32,
+        );
+        return .{
+            .arena = w_arena,
+            .entries = entries,
+            .scratch_act_f32 = scratch_act_f32,
+            .store = store,
+        };
+    }
+
+    pub fn backend(self: *LoadedCpuMoeStore) expert_parallel.ExpertEvalBackend {
+        return self.store.backend();
+    }
+
+    pub fn deinit(self: *LoadedCpuMoeStore, allocator: std.mem.Allocator) void {
+        allocator.free(self.scratch_act_f32);
+        allocator.free(self.entries);
+        self.arena.deinit();
     }
 };
 
@@ -7103,6 +9675,7 @@ const GRAPH_NONE_GROUP: u32 = std.math.maxInt(u32);
 const GraphBatchSlotState = struct {
     in_use: bool = false,
     seq_len: u32 = 0,
+    ced_encoder_prefix_len: u32 = 0,
     matched_prefix_tokens: u32 = 0,
     prefix_cached_full_chunks: u32 = 0,
     last_cached_parent_id: u32 = prefix_cache_mod.NONE_ID,
@@ -7172,6 +9745,11 @@ pub const GraphBatchRuntime = struct {
     qsa_block_keys_layer_stride_bytes: u64,
     qsa_max_blocks: u32,
 
+    // M7 per-slot zero-copy FP4 MLA KV / CSA2 summary / SWA arenas (`C14` + `deepseek41` CED)
+    slot_mla_kv: []hybrid.MlaFp4KvArena = &.{},
+    slot_csa2_sum: []hybrid.Csa2SummaryArena = &.{},
+    slot_mla_swa: []hybrid.MlaSwaRingArena = &.{},
+
     prefix_cache: ?prefix_cache_mod.PrefixCache,
     slots: []GraphBatchSlotState,
     scratch_handles: []prefix_cache_mod.KvBlockHandle,
@@ -7232,6 +9810,7 @@ pub const GraphBatchRuntime = struct {
                     num_kv_layers += 1;
                     num_gqa_layers += 1;
                 },
+                .mla_csa2 => {},
             }
         }
         const kv_idx_to_layer = try allocator.alloc(u32, num_kv_layers);
@@ -7400,11 +9979,36 @@ pub const GraphBatchRuntime = struct {
         else
             0;
 
+        const has_mla_batch = (model.mla_kv_arena != null);
+        const slot_mla_kv_spec: hybrid.MlaFp4KvSpec = if (model.mla_kv_arena) |ka| .{
+            .num_kv_layers = ka.spec.num_kv_layers,
+            .max_tokens = model.max_seq_len,
+            .kv_lora_rank = ka.spec.kv_lora_rank,
+            .qk_rope_dim = ka.spec.qk_rope_dim,
+            .rope_tail_format = ka.spec.rope_tail_format,
+        } else .{ .num_kv_layers = 1, .max_tokens = 1, .kv_lora_rank = 32, .qk_rope_dim = 0 };
+        const slot_csa2_sum_spec: hybrid.Csa2SummarySpec = if (model.csa2_summary_arena) |sa| .{
+            .num_kv_layers = sa.spec.num_kv_layers,
+            .max_tokens = model.max_seq_len,
+            .index_dim = sa.spec.index_dim,
+            .block_tokens = sa.spec.block_tokens,
+            .coarse_group_blocks = sa.spec.coarse_group_blocks,
+        } else .{ .num_kv_layers = 1, .max_tokens = 1, .index_dim = 32 };
+        const slot_mla_swa_spec: ?hybrid.MlaSwaRingSpec = if (model.mla_swa_arena) |sw| sw.spec else null;
+        var batch_mla_bytes: usize = 0;
+        if (has_mla_batch) {
+            const per_slot_kv = try hybrid.MlaFp4KvArena.requiredBytes(slot_mla_kv_spec);
+            const per_slot_sum = try hybrid.Csa2SummaryArena.requiredBytes(slot_csa2_sum_spec);
+            const per_slot_swa = if (slot_mla_swa_spec) |sw| try hybrid.MlaSwaRingArena.requiredBytes(sw) else 0;
+            batch_mla_bytes = @as(usize, cfg.max_slots) * (per_slot_kv + per_slot_sum + per_slot_swa);
+        }
+
         const arena_raw: usize =
             gdn_snap_bytes +
             pc_bytes +
             gdn_pool_bytes +
             gdn_conv_pool_bytes +
+            batch_mla_bytes +
             amf.align64(@as(usize, cfg.max_slots) * @sizeOf(u32)) + // gdn_slot_ids
             @as(usize, num_kv_layers) * kv_tiles_layer_stride_bytes +
             @as(usize, num_gqa_layers) * write_slots_layer_stride_bytes +
@@ -7525,6 +10129,27 @@ pub const GraphBatchRuntime = struct {
         const prompt_hist_raw = try batch_arena.allocAligned(prompt_hist_bytes, 64);
         const prompt_hist_all: []u32 = @alignCast(std.mem.bytesAsSlice(u32, prompt_hist_raw));
 
+        var slot_mla_kv: []hybrid.MlaFp4KvArena = &.{};
+        errdefer if (slot_mla_kv.len > 0) allocator.free(slot_mla_kv);
+        var slot_csa2_sum: []hybrid.Csa2SummaryArena = &.{};
+        errdefer if (slot_csa2_sum.len > 0) allocator.free(slot_csa2_sum);
+        var slot_mla_swa: []hybrid.MlaSwaRingArena = &.{};
+        errdefer if (slot_mla_swa.len > 0) allocator.free(slot_mla_swa);
+        if (has_mla_batch) {
+            slot_mla_kv = try allocator.alloc(hybrid.MlaFp4KvArena, cfg.max_slots);
+            slot_csa2_sum = try allocator.alloc(hybrid.Csa2SummaryArena, cfg.max_slots);
+            if (slot_mla_swa_spec != null) {
+                slot_mla_swa = try allocator.alloc(hybrid.MlaSwaRingArena, cfg.max_slots);
+            }
+            for (0..cfg.max_slots) |si| {
+                slot_mla_kv[si] = try hybrid.MlaFp4KvArena.init(&batch_arena, slot_mla_kv_spec);
+                slot_csa2_sum[si] = try hybrid.Csa2SummaryArena.init(&batch_arena, slot_csa2_sum_spec);
+                if (slot_mla_swa_spec) |sw| {
+                    slot_mla_swa[si] = try hybrid.MlaSwaRingArena.init(&batch_arena, sw);
+                }
+            }
+        }
+
         // Allocate shared IOSurface KV tiles.
         const total_pool_tiles: usize = @as(usize, pool_chunk_groups) * num_kv_layers * 2;
         const pool_tiles = try allocator.alloc(metal.KvTile, total_pool_tiles);
@@ -7630,6 +10255,9 @@ pub const GraphBatchRuntime = struct {
             .qsa_block_keys_slot_stride_bytes = qsa_block_keys_slot_stride_bytes,
             .qsa_block_keys_layer_stride_bytes = qsa_block_keys_layer_stride_bytes,
             .qsa_max_blocks = qsa_max_blocks,
+            .slot_mla_kv = slot_mla_kv,
+            .slot_csa2_sum = slot_csa2_sum,
+            .slot_mla_swa = slot_mla_swa,
             .prefix_cache = prefix_cache,
             .slots = slots,
             .scratch_handles = scratch_handles,
@@ -7641,6 +10269,9 @@ pub const GraphBatchRuntime = struct {
     }
 
     pub fn deinit(self: *GraphBatchRuntime, allocator: std.mem.Allocator) void {
+        if (self.slot_mla_swa.len > 0) allocator.free(self.slot_mla_swa);
+        if (self.slot_csa2_sum.len > 0) allocator.free(self.slot_csa2_sum);
+        if (self.slot_mla_kv.len > 0) allocator.free(self.slot_mla_kv);
         allocator.free(self.p_res);
         allocator.free(self.scratch_evicted_handles);
         allocator.free(self.scratch_handles);
@@ -7997,7 +10628,13 @@ pub const GraphBatchRuntime = struct {
             slot.chunk_is_shared[c] = false;
         }
         slot.seq_len = 0;
+        slot.ced_encoder_prefix_len = 0;
         slot.matched_prefix_tokens = 0;
+        if (self.slot_mla_kv.len > 0) {
+            @memset(self.slot_mla_kv[slot_id].backing, 0);
+            @memset(self.slot_csa2_sum[slot_id].backing, 0);
+            if (self.slot_mla_swa.len > 0) @memset(self.slot_mla_swa[slot_id].backing, 0);
+        }
         slot.prefix_cached_full_chunks = 0;
         slot.last_cached_parent_id = prefix_cache_mod.NONE_ID;
         slot.in_use = false;
@@ -8747,6 +11384,7 @@ pub const GraphBatchRuntime = struct {
                     }, true);
                     try model.encodeLinearGemmWithTile(&frame, gqa.o_proj, model.wp_attn_out_bind, model.wp_proj_out_bind, eff_m, true, true);
                 },
+                .mla_csa2 => {},
             }
 
             if (model.wp_gr_arena) |*gr| {
@@ -9312,6 +11950,7 @@ pub const GraphBatchRuntime = struct {
 
                     try model.encodeLinearBatched(&frame, gqa.o_proj, model.attn_out_bind, model.proj_out_bind, m, true);
                 },
+                .mla_csa2 => {},
             }
 
             // Residual add (4-branch GR or standard)
@@ -9537,6 +12176,47 @@ pub const GraphBatchRuntime = struct {
         }
         @memcpy(slot.prompt_tokens[chunk.start_pos .. chunk.start_pos + chunk.tokens.len], chunk.tokens);
 
+        if (self.slot_mla_kv.len > 0) {
+            const m = self.model;
+            const saved_buf = m.mla_kv_buf;
+            const saved_kv = m.mla_kv_arena;
+            const saved_sum = m.csa2_summary_arena;
+            const saved_swa = m.mla_swa_arena;
+            const saved_enc = m.ced_encoder_prefix_len;
+            const saved_seq = m.seq_len;
+            defer {
+                m.mla_kv_buf = saved_buf;
+                m.mla_kv_arena = saved_kv;
+                m.csa2_summary_arena = saved_sum;
+                m.mla_swa_arena = saved_swa;
+                m.ced_encoder_prefix_len = saved_enc;
+                m.seq_len = saved_seq;
+            }
+            m.mla_kv_buf = self.batch_buf;
+            m.mla_kv_arena = self.slot_mla_kv[chunk.slot_id];
+            m.csa2_summary_arena = self.slot_csa2_sum[chunk.slot_id];
+            m.mla_swa_arena = if (self.slot_mla_swa.len > 0) self.slot_mla_swa[chunk.slot_id] else null;
+            m.ced_encoder_prefix_len = slot.ced_encoder_prefix_len;
+            m.seq_len = slot.seq_len;
+            if (chunk.start_pos > 0) {
+                @memcpy(m.token_history[0..chunk.start_pos], slot.prompt_tokens[0..chunk.start_pos]);
+            }
+            const last_argmax = m.prefillChunkWithOptions(chunk.tokens, chunk.start_pos, .{
+                .compute_logits = chunk.is_final_chunk,
+                .preserve_all_top_hidden = false,
+            }) catch return error.PrefillFailed;
+            slot.ced_encoder_prefix_len = m.ced_encoder_prefix_len;
+            slot.seq_len = m.seq_len;
+            if (chunk.is_final_chunk) {
+                const first_tok: u32 = if (chunk.temperature > 0.0)
+                    m.sampleFromLastLogits(chunk.temperature, chunk.rng.random(), self.p_res) catch return error.PrefillFailed
+                else
+                    last_argmax;
+                return .{ .first_token = first_tok };
+            }
+            return .{};
+        }
+
         const use_wide = (self.gpu_prefill_mode == .wide and self.model.usesWideGpuPrefill() and self.model.effective_max_loops == 1);
         const sub_cap: usize = if (use_wide) self.model.wide_prefill_max_tokens else self.model.max_tree_nodes;
         const bs: usize = self.kv_chunk_tokens;
@@ -9606,6 +12286,52 @@ pub const GraphBatchRuntime = struct {
         const model = self.model;
         const h = model.config.hidden_size;
         const v_size: usize = model.config.vocab_size;
+
+        if (self.slot_mla_kv.len > 0) {
+            const saved_buf = model.mla_kv_buf;
+            const saved_kv = model.mla_kv_arena;
+            const saved_sum = model.csa2_summary_arena;
+            const saved_swa = model.mla_swa_arena;
+            const saved_enc = model.ced_encoder_prefix_len;
+            const saved_seq = model.seq_len;
+            defer {
+                model.mla_kv_buf = saved_buf;
+                model.mla_kv_arena = saved_kv;
+                model.csa2_summary_arena = saved_sum;
+                model.mla_swa_arena = saved_swa;
+                model.ced_encoder_prefix_len = saved_enc;
+                model.seq_len = saved_seq;
+            }
+            for (0..b_usize) |bi| {
+                const sid: u32 = view.slot_ids[bi];
+                const tok = view.input_tokens[bi];
+                const pos = view.seq_positions[bi];
+                if (sid >= self.max_slots or tok >= model.config.vocab_size or pos >= model.max_seq_len) {
+                    return error.DecodeFailed;
+                }
+                const slot = &self.slots[sid];
+                model.mla_kv_buf = self.batch_buf;
+                model.mla_kv_arena = self.slot_mla_kv[sid];
+                model.csa2_summary_arena = self.slot_csa2_sum[sid];
+                model.mla_swa_arena = if (self.slot_mla_swa.len > 0) self.slot_mla_swa[sid] else null;
+                model.ced_encoder_prefix_len = slot.ced_encoder_prefix_len;
+                model.seq_len = pos;
+                if (pos > 0) {
+                    @memcpy(model.token_history[0..pos], slot.prompt_tokens[0..pos]);
+                }
+                const next_argmax = model.stepDecode(tok, pos) catch return error.DecodeFailed;
+                slot.prompt_tokens[pos] = tok;
+                slot.seq_len = pos + 1;
+                const temp = view.temperatures[bi];
+                out_next_tokens[bi] = if (temp > 0.0)
+                    model.sampleFromLastLogits(temp, view.rngs[bi].random(), self.p_res) catch return error.DecodeFailed
+                else
+                    next_argmax;
+            }
+            self.decode_batch_steps += 1;
+            self.decode_batch_tokens += b_usize;
+            return;
+        }
 
         var max_seq: u32 = 0;
         for (0..b_usize) |bi| {
@@ -9935,6 +12661,7 @@ pub const GraphBatchRuntime = struct {
 
                     model.encodeLinearBatched(&frame, gqa.o_proj, model.attn_out_bind, model.proj_out_bind, b_u32, true) catch return error.DecodeFailed;
                 },
+                .mla_csa2 => {},
             }
 
             if (model.gr_arena) |*gr| {
@@ -12270,4 +14997,640 @@ test "M6.9 C16+G17 GraphModel ChipProfile, NAX backend modes, strict-nax rejecti
         defer m_nax_strict.deinit(allocator);
         try std.testing.expect(m_nax_strict.dequant_pipes.activeBackend().isNax());
     }
+}
+
+// ===========================================================================
+// Section 7: M7 `deepseek41` Synthetic Bundle Builder & End-to-End Tests
+// ===========================================================================
+
+pub const SynthDeepSeek41Spec = struct {
+    num_encoder_layers: u32 = 2,
+    num_decoder_layers: u32 = 3,
+    hidden_size: u32 = 128,
+    vocab_size: u32 = 256,
+    num_attention_heads: u32 = 4,
+    kv_lora_rank: u32 = 64,
+    q_lora_rank: u32 = 64,
+    qk_nope_head_dim: u32 = 32,
+    qk_rope_head_dim: u32 = 32,
+    v_head_dim: u32 = 32,
+    swa_window: u32 = 16,
+    mhc_num_streams: u32 = 4,
+    num_experts: u32 = 8,
+    encoder_moe_top_k: u32 = 2,
+    decoder_moe_top_k: u32 = 4,
+    moe_inter: u32 = 64,
+    shared_inter: u32 = 64,
+    max_loops: u32 = 1,
+    engram_num_shards: u32 = 2,
+    engram_rows: u64 = 64,
+    engram_num_heads: u8 = 3,
+    engram_orders: [ple_mod.ENGRAM_MAX_HEADS]u8 = .{ 2, 3, 4, 0, 0, 0, 0, 0 },
+    dspark_block_width: u8 = 4,
+    dspark_top_k_per_pos: u8 = 2,
+    dspark_max_tree_nodes: u8 = 32,
+    include_dspark: bool = true,
+    tmp_dir: ?[]const u8 = null,
+};
+
+pub const SynthDeepSeek41Bundle = struct {
+    cfg: GraphConfig,
+    amf_bytes: []u8,
+    amf_file_path: ?[:0]u8,
+    engram_paths: [][:0]u8,
+    dspark_amf_path: ?[:0]u8,
+
+    pub fn deinit(self: *SynthDeepSeek41Bundle, allocator: std.mem.Allocator) void {
+        self.cfg.deinit(allocator);
+        allocator.free(self.amf_bytes);
+        if (self.amf_file_path) |p| allocator.free(p);
+        for (self.engram_paths) |p| allocator.free(p);
+        allocator.free(self.engram_paths);
+        if (self.dspark_amf_path) |p| allocator.free(p);
+    }
+};
+
+pub fn buildSynthDeepSeek41Bundle(
+    allocator: std.mem.Allocator,
+    spec: SynthDeepSeek41Spec,
+) !SynthDeepSeek41Bundle {
+    const n_enc = spec.num_encoder_layers;
+    const n_dec = spec.num_decoder_layers;
+    const n_layers = n_enc + n_dec;
+    const h = spec.hidden_size;
+    const vocab = spec.vocab_size;
+    const n_heads = spec.num_attention_heads;
+    const kv_rank = spec.kv_lora_rank;
+    const q_rank = spec.q_lora_rank;
+    const d_nope = spec.qk_nope_head_dim;
+    const d_rope = spec.qk_rope_head_dim;
+    const d_v = spec.v_head_dim;
+    const q_dim = n_heads * (d_nope + d_rope);
+    const kv_a_dim = kv_rank + d_rope;
+    const kv_b_dim = n_heads * (d_nope + d_v);
+    const v_tot = n_heads * d_v;
+    const streams = spec.mhc_num_streams;
+
+    const layer_attns = try allocator.alloc(AttentionKind, n_layers);
+    errdefer allocator.free(layer_attns);
+    @memset(layer_attns, .mla_csa2);
+
+    const csa2_modes = try allocator.alloc(hybrid.Csa2Mode, n_layers);
+    errdefer allocator.free(csa2_modes);
+    for (0..n_layers) |l| {
+        const phase_local = if (l >= n_enc) (l - n_enc) else l;
+        csa2_modes[l] = switch (phase_local % 3) {
+            0 => .full,
+            1 => .reindex,
+            else => .reuse,
+        };
+    }
+
+    const cfg: GraphConfig = .{
+        .axes = .{
+            .backbone_kind = .causal_enc_dec,
+            .layer_attention_kinds = layer_attns,
+            .ffn_kind = .moe_swiglu,
+            .has_shared_expert = true,
+            .residual_kind = .mhc_single_pass,
+            .residual_branches = streams,
+            .memory_lookup_kind = if (spec.engram_num_shards > 0) .engram else .none,
+            .loop_schedule = .{
+                .mode = if (spec.max_loops > 1) .native_recurrent else .single_pass,
+                .start_layer = if (spec.max_loops > 1) n_enc else 0,
+                .end_layer = n_layers,
+                .max_loops = spec.max_loops,
+                .inject_x_init = (spec.max_loops > 1),
+            },
+        },
+        .vocab_size = vocab,
+        .hidden_size = h,
+        .num_hidden_layers = n_layers,
+        .num_attention_heads = n_heads,
+        .num_key_value_heads = n_heads,
+        .head_dim = d_v,
+        .moe_intermediate_size = spec.moe_inter,
+        .shared_expert_intermediate_size = spec.shared_inter,
+        .num_experts = spec.num_experts,
+        .num_experts_per_tok = @max(spec.encoder_moe_top_k, spec.decoder_moe_top_k),
+        .norm_topk_prob = true,
+        .quant_bits = 4,
+        .group_size = 64,
+        .num_encoder_layers = n_enc,
+        .num_decoder_layers = n_dec,
+        .encoder_moe_top_k = spec.encoder_moe_top_k,
+        .decoder_moe_top_k = spec.decoder_moe_top_k,
+        .kv_lora_rank = kv_rank,
+        .q_lora_rank = q_rank,
+        .qk_nope_head_dim = d_nope,
+        .qk_rope_head_dim = d_rope,
+        .v_head_dim = d_v,
+        .csa2_modes = csa2_modes,
+        .csa2_block_tokens = 16,
+        .csa2_top_k_blocks = 8,
+        .fp4_kv = true,
+        .fp4_rope_tail_format = .f16,
+        .swa_window = spec.swa_window,
+        .mhc_num_streams = streams,
+        .ple_num_rows = spec.engram_rows,
+        .ple_embed_dim = h,
+        .ple_num_shards = spec.engram_num_shards,
+        .engram_num_heads = if (spec.engram_num_shards > 0) spec.engram_num_heads else 0,
+        .engram_orders = spec.engram_orders,
+        .dspark_block_width = spec.dspark_block_width,
+        .dspark_top_k_per_pos = spec.dspark_top_k_per_pos,
+        .dspark_max_tree_nodes = spec.dspark_max_tree_nodes,
+    };
+    try cfg.validate();
+
+    var blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+    var owned_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (blobs.items) |b| allocator.free(b.bytes);
+        blobs.deinit(allocator);
+        for (owned_names.items) |n| allocator.free(n);
+        owned_names.deinit(allocator);
+    }
+
+    const addBlob = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            kind: amf.TensorKind,
+            dt: amf.DType,
+            layer: u16,
+            expert_id: u16,
+            shape: [4]u32,
+            ndim: u8,
+            data: []u8,
+            data_bytes_ov: u64,
+            p_off: u64,
+            p_bytes: u64,
+        ) !void {
+            const dup = try alloc.dupe(u8, nm);
+            try names.append(alloc, dup);
+            try list.append(alloc, .{
+                .name = dup,
+                .kind = kind,
+                .dtype = dt,
+                .layer = layer,
+                .expert = expert_id,
+                .shape = shape,
+                .ndim = ndim,
+                .bytes = data,
+                .data_bytes_override = data_bytes_ov,
+                .params_offset = p_off,
+                .params_bytes = p_bytes,
+            });
+        }
+    }.call;
+
+    const addQ4 = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(TestTensorBlob),
+            names: *std.ArrayListUnmanaged([]u8),
+            nm: []const u8,
+            kind: amf.TensorKind,
+            layer: u16,
+            expert_id: u16,
+            n_dim: u32,
+            k_dim: u32,
+            seed: u64,
+            amp: f32,
+        ) !void {
+            if ((k_dim % 64) == 0) {
+                const q = try fillDeterministicQ4(alloc, seed, n_dim, k_dim, amp);
+                try addBlob(alloc, list, names, nm, kind, .q4_affine, layer, expert_id, .{ n_dim, k_dim, 0, 0 }, 2, q.bytes, q.data_bytes, q.params_offset, q.params_bytes);
+            } else {
+                const f = try fillDeterministicF16(alloc, seed, @as(usize, n_dim) * k_dim, amp);
+                try addBlob(alloc, list, names, nm, kind, .f16, layer, expert_id, .{ n_dim, k_dim, 0, 0 }, 2, f, 0, 0, 0);
+            }
+        }
+    }.call;
+
+    try addBlob(allocator, &blobs, &owned_names, "embed_tokens.weight", .embedding, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ vocab, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, 7001, @as(usize, vocab) * h, 0.25), 0, 0, 0);
+
+    var nbuf: [160]u8 = undefined;
+    const inv_h: f32 = 0.5 / @sqrt(@as(f32, @floatFromInt(h)));
+    const inv_q: f32 = 0.5 / @sqrt(@as(f32, @floatFromInt(q_rank)));
+    const inv_kv: f32 = 0.5 / @sqrt(@as(f32, @floatFromInt(kv_rank)));
+    const inv_v: f32 = 0.5 / @sqrt(@as(f32, @floatFromInt(v_tot)));
+    const inv_moe: f32 = 0.5 / @sqrt(@as(f32, @floatFromInt(spec.moe_inter)));
+    const inv_sh: f32 = 0.5 / @sqrt(@as(f32, @floatFromInt(spec.shared_inter)));
+
+    for (0..n_layers) |l| {
+        const l16: u16 = @intCast(l);
+        const sbase: u64 = 7100 + @as(u64, l) * 1000;
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mhc.pre_mix.weight", .{l}) catch unreachable, .dense, .bf16, l16, amf.NO_EXPERT, .{ streams, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 1, @as(usize, streams) * h, 0.2 * inv_h), 0, 0, 0);
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mhc.post_mix.weight", .{l}) catch unreachable, .dense, .bf16, l16, amf.NO_EXPERT, .{ streams, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 2, @as(usize, streams) * h, 0.2 * inv_h), 0, 0, 0);
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mhc.res_mix.weight", .{l}) catch unreachable, .dense, .bf16, l16, amf.NO_EXPERT, .{ streams, streams, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 3, @as(usize, streams) * streams, 0.25), 0, 0, 0);
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable, .norm, .bf16, l16, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 4, h, 1.0), 0, 0, 0);
+
+        try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_a_proj", .{l}) catch unreachable, .dense, l16, amf.NO_EXPERT, q_rank, h, sbase + 10, inv_h);
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_a_layernorm.weight", .{l}) catch unreachable, .norm, .bf16, l16, amf.NO_EXPERT, .{ q_rank, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 11, q_rank, 1.0), 0, 0, 0);
+        try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_b_proj", .{l}) catch unreachable, .dense, l16, amf.NO_EXPERT, q_dim, q_rank, sbase + 12, inv_q);
+        try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_a_proj_with_mqa", .{l}) catch unreachable, .dense, l16, amf.NO_EXPERT, kv_a_dim, h, sbase + 13, inv_h);
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_a_layernorm.weight", .{l}) catch unreachable, .norm, .bf16, l16, amf.NO_EXPERT, .{ kv_rank, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 14, kv_rank, 1.0), 0, 0, 0);
+        try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.kv_b_proj", .{l}) catch unreachable, .dense, l16, amf.NO_EXPERT, kv_b_dim, kv_rank, sbase + 15, inv_kv);
+        try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj", .{l}) catch unreachable, .dense, l16, amf.NO_EXPERT, h, v_tot, sbase + 16, inv_v);
+        if (csa2_modes[l] != .reuse) {
+            try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.csa2_idx_proj", .{l}) catch unreachable, .dense, l16, amf.NO_EXPERT, kv_rank, h, sbase + 17, 0.35 * inv_h);
+        }
+
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable, .norm, .bf16, l16, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, sbase + 20, h, 1.0), 0, 0, 0);
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate.weight", .{l}) catch unreachable, .router, .bf16, l16, amf.NO_EXPERT, .{ spec.num_experts, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 21, @as(usize, spec.num_experts) * h, inv_h), 0, 0, 0);
+
+        try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.gate_proj", .{l}) catch unreachable, .shared_expert, l16, amf.NO_EXPERT, spec.shared_inter, h, sbase + 30, inv_h);
+        try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.up_proj", .{l}) catch unreachable, .shared_expert, l16, amf.NO_EXPERT, spec.shared_inter, h, sbase + 31, inv_h);
+        try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert.down_proj", .{l}) catch unreachable, .shared_expert, l16, amf.NO_EXPERT, h, spec.shared_inter, sbase + 32, inv_sh);
+        try addBlob(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.shared_expert_gate.weight", .{l}) catch unreachable, .shared_expert, .bf16, l16, amf.NO_EXPERT, .{ 1, h, 0, 0 }, 2, try fillDeterministicBf16(allocator, sbase + 33, h, 0.25 * inv_h), 0, 0, 0);
+
+        for (0..spec.num_experts) |e| {
+            const e16: u16 = @intCast(e);
+            const eseed = sbase + 100 + @as(u64, e) * 17;
+            try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable, .hot_expert, l16, e16, spec.moe_inter, h, eseed + 0, inv_h);
+            try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e }) catch unreachable, .hot_expert, l16, e16, spec.moe_inter, h, eseed + 1, inv_h);
+            try addQ4(allocator, &blobs, &owned_names, std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable, .hot_expert, l16, e16, h, spec.moe_inter, eseed + 2, inv_moe);
+        }
+    }
+
+    // CED Encoder -> Decoder global KV projector bridge.
+    try addBlob(allocator, &blobs, &owned_names, "enc_dec.norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, 79001, h, 1.0), 0, 0, 0);
+    try addQ4(allocator, &blobs, &owned_names, "enc_dec.global_kv_a_proj", .dense, amf.NO_LAYER, amf.NO_EXPERT, kv_a_dim, h, 79002, inv_h);
+    try addBlob(allocator, &blobs, &owned_names, "enc_dec.global_kv_norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ kv_rank, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, 79003, kv_rank, 1.0), 0, 0, 0);
+    try addQ4(allocator, &blobs, &owned_names, "enc_dec.global_kv_b_proj", .dense, amf.NO_LAYER, amf.NO_EXPERT, kv_b_dim, kv_rank, 79004, inv_kv);
+
+    try addBlob(allocator, &blobs, &owned_names, "norm.weight", .norm, .bf16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillDeterministicBf16(allocator, 79010, h, 1.0), 0, 0, 0);
+    try addQ4(allocator, &blobs, &owned_names, "lm_head", .lm_head, amf.NO_LAYER, amf.NO_EXPERT, vocab, h, 79011, inv_h);
+
+    const amf_bytes = try buildTestAmf(allocator, "deepseek41-synth", blobs.items);
+    errdefer allocator.free(amf_bytes);
+
+    var amf_file_path: ?[:0]u8 = null;
+    errdefer if (amf_file_path) |p| allocator.free(p);
+    var engram_paths = try allocator.alloc([:0]u8, if (spec.tmp_dir != null) spec.engram_num_shards else 0);
+    var built_shards: usize = 0;
+    errdefer {
+        for (0..built_shards) |i| allocator.free(engram_paths[i]);
+        allocator.free(engram_paths);
+    }
+    var dspark_amf_path: ?[:0]u8 = null;
+    errdefer if (dspark_amf_path) |p| allocator.free(p);
+
+    if (spec.tmp_dir) |dir| {
+        amf_file_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.amf", .{dir}, 0);
+        try writeBytesFile(amf_file_path.?, amf_bytes);
+
+        if (spec.engram_num_shards > 0) {
+            const rows_per_shard = spec.engram_rows / spec.engram_num_shards;
+            for (0..spec.engram_num_shards) |s| {
+                const cnt: u32 = @intCast(if (s + 1 == spec.engram_num_shards) (spec.engram_rows - rows_per_shard * s) else rows_per_shard);
+                var s_blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+                var s_names: std.ArrayListUnmanaged([]u8) = .empty;
+                defer {
+                    for (s_blobs.items) |b| allocator.free(b.bytes);
+                    s_blobs.deinit(allocator);
+                    for (s_names.items) |n| allocator.free(n);
+                    s_names.deinit(allocator);
+                }
+                for (0..n_layers) |l| {
+                    const nm = if (spec.engram_num_shards > 1)
+                        std.fmt.bufPrint(&nbuf, "engram.layers.{d}.shard.{d}", .{ l, s }) catch unreachable
+                    else
+                        std.fmt.bufPrint(&nbuf, "engram.layers.{d}", .{l}) catch unreachable;
+                    const q = try fillDeterministicQ4(allocator, 88000 + @as(u64, l) * 31 + s, cnt, h * 2, 0.15);
+                    try addBlob(allocator, &s_blobs, &s_names, nm, .sparse_table, .q4_affine, @intCast(l), amf.NO_EXPERT, .{ cnt, h * 2, 0, 0 }, 2, q.bytes, q.data_bytes, q.params_offset, q.params_bytes);
+                }
+                const shard_img = try buildTestAmf(allocator, "deepseek41-engram", s_blobs.items);
+                defer allocator.free(shard_img);
+                engram_paths[s] = try std.fmt.allocPrintSentinel(allocator, "{s}/engram_{d}.amf", .{ dir, s }, 0);
+                try writeBytesFile(engram_paths[s], shard_img);
+                built_shards += 1;
+            }
+        }
+
+        if (spec.include_dspark) {
+            var d_blobs: std.ArrayListUnmanaged(TestTensorBlob) = .empty;
+            var d_names: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (d_blobs.items) |b| allocator.free(b.bytes);
+                d_blobs.deinit(allocator);
+                for (d_names.items) |n| allocator.free(n);
+                d_names.deinit(allocator);
+            }
+            try addBlob(allocator, &d_blobs, &d_names, "dspark.enc_proj.weight", .dense, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 91001, @as(usize, h) * h, inv_h), 0, 0, 0);
+            try addBlob(allocator, &d_blobs, &d_names, "dspark.dec_proj.weight", .dense, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 91002, @as(usize, h) * h, inv_h), 0, 0, 0);
+            try addBlob(allocator, &d_blobs, &d_names, "dspark.norm.weight", .norm, .f16, amf.NO_LAYER, amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, 91003, h, 1.0), 0, 0, 0);
+            for (0..spec.dspark_block_width) |slot| {
+                try addBlob(allocator, &d_blobs, &d_names, std.fmt.bufPrint(&nbuf, "dspark.slot.{d}.proj.weight", .{slot}) catch unreachable, .dense, .f16, @intCast(slot), amf.NO_EXPERT, .{ h, h, 0, 0 }, 2, try fillDeterministicF16(allocator, 91100 + @as(u64, slot) * 7, @as(usize, h) * h, inv_h), 0, 0, 0);
+                try addBlob(allocator, &d_blobs, &d_names, std.fmt.bufPrint(&nbuf, "dspark.slot.{d}.embed.weight", .{slot}) catch unreachable, .embedding, .f16, @intCast(slot), amf.NO_EXPERT, .{ h, 0, 0, 0 }, 1, try fillDeterministicF16(allocator, 91200 + @as(u64, slot) * 7, h, 0.25), 0, 0, 0);
+            }
+            const ds_img = try buildTestAmf(allocator, "deepseek41-dspark", d_blobs.items);
+            defer allocator.free(ds_img);
+            dspark_amf_path = try std.fmt.allocPrintSentinel(allocator, "{s}/dspark.amf", .{dir}, 0);
+            try writeBytesFile(dspark_amf_path.?, ds_img);
+        }
+    }
+
+    return .{
+        .cfg = cfg,
+        .amf_bytes = amf_bytes,
+        .amf_file_path = amf_file_path,
+        .engram_paths = engram_paths,
+        .dspark_amf_path = dspark_amf_path,
+    };
+}
+
+test "M7 W11 deepseek41 config.json parser handles CED, MLA+CSA2, Mega-mHC, Engram and DSpark" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "deepseek41",
+        \\  "backbone_kind": "causal_enc_dec",
+        \\  "num_hidden_layers": 5,
+        \\  "num_encoder_layers": 2,
+        \\  "num_decoder_layers": 3,
+        \\  "hidden_size": 256,
+        \\  "vocab_size": 2048,
+        \\  "num_attention_heads": 4,
+        \\  "encoder_moe_top_k": 2,
+        \\  "decoder_moe_top_k": 4,
+        \\  "num_experts": 8,
+        \\  "has_shared_expert": true,
+        \\  "moe_intermediate_size": 128,
+        \\  "shared_expert_intermediate_size": 128,
+        \\  "kv_lora_rank": 64,
+        \\  "q_lora_rank": 64,
+        \\  "qk_nope_head_dim": 32,
+        \\  "qk_rope_head_dim": 32,
+        \\  "v_head_dim": 64,
+        \\  "csa2_modes": ["full", "reindex", "full", "reindex", "reuse"],
+        \\  "swa_window": 64,
+        \\  "residual_kind": "mhc_single_pass",
+        \\  "mhc_num_streams": 4,
+        \\  "memory_lookup_kind": "engram",
+        \\  "engram_num_heads": 3,
+        \\  "engram_orders": [2, 3, 4],
+        \\  "engram_num_rows": 128,
+        \\  "engram_shards": 2,
+        \\  "engram_files": ["engram_0.amf", "engram_1.amf"],
+        \\  "dspark": {"enabled": true, "amf_file": "dspark.amf", "block_width": 4, "top_k_per_pos": 2, "max_tree_nodes": 32}
+        \\}
+    ;
+    try std.testing.expect(GraphConfig.isGraphConfigJson(json));
+    var cfg = try GraphConfig.fromJson(allocator, json);
+    defer cfg.deinit(allocator);
+    try std.testing.expectEqual(BackboneKind.causal_enc_dec, cfg.axes.backbone_kind);
+    try std.testing.expectEqual(@as(u32, 2), cfg.num_encoder_layers);
+    try std.testing.expectEqual(@as(u32, 3), cfg.num_decoder_layers);
+    try std.testing.expectEqual(@as(u32, 2), cfg.layerTopK(0));
+    try std.testing.expectEqual(@as(u32, 4), cfg.layerTopK(2));
+    try std.testing.expectEqual(ResidualKind.mhc_single_pass, cfg.axes.residual_kind);
+    try std.testing.expectEqual(@as(u32, 4), cfg.mhc_num_streams);
+    try std.testing.expectEqual(MemoryLookupKind.engram, cfg.axes.memory_lookup_kind);
+    try std.testing.expectEqual(@as(u8, 3), cfg.engram_num_heads);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 3, 4 }, cfg.engramOrdersSlice());
+    try std.testing.expectEqual(@as(usize, 2), cfg.ple_shard_files.len);
+    try std.testing.expectEqual(hybrid.Csa2Mode.full, cfg.csa2_modes[0]);
+    try std.testing.expectEqual(hybrid.Csa2Mode.reindex, cfg.csa2_modes[1]);
+    try std.testing.expectEqual(hybrid.Csa2Mode.reuse, cfg.csa2_modes[4]);
+    try std.testing.expect(cfg.dspark_amf_file != null);
+}
+
+test "M7 W11 deepseek41 CED 2-phase prefill/decode (0 encoder dispatches in decode), CSA2 Full/Reindex/Reuse, Mega-mHC, Engram, wide vs tree64 & BatchRuntime" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = try makeTestTempDir(allocator, "m7-ced-e2e");
+    defer allocator.free(tmp_dir);
+    defer removeTestDir(allocator, tmp_dir);
+
+    var bundle = try buildSynthDeepSeek41Bundle(allocator, .{
+        .max_loops = 2,
+        .tmp_dir = tmp_dir,
+    });
+    defer bundle.deinit(allocator);
+
+    const eng_const = try allocator.alloc([:0]const u8, bundle.engram_paths.len);
+    defer allocator.free(eng_const);
+    for (bundle.engram_paths, 0..) |p, i| eng_const[i] = p;
+
+    const prompt = [_]u32{ 5, 19, 42, 7, 13, 61, 88, 3, 17, 29, 91, 11 };
+
+    // 1. Wide prefill vs tree64 prefill parity + zero encoder dispatches during decode!
+    var m_wide = try GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .ple_paths = eng_const,
+        .gpu_prefill_mode = .wide,
+        .wide_prefill_chunk_tokens = 64,
+        .startup_canary = false,
+    });
+    defer m_wide.deinit(allocator);
+
+    var m_t64 = try GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .ple_paths = eng_const,
+        .gpu_prefill_mode = .tree64,
+        .startup_canary = false,
+    });
+    defer m_t64.deinit(allocator);
+
+    const first_wide = try m_wide.prefillChunk(&prompt, 0, true);
+    const first_t64 = try m_t64.prefillChunk(&prompt, 0, true);
+    try std.testing.expectEqual(first_t64, first_wide);
+    try std.testing.expectEqual(@as(u32, prompt.len), m_wide.ced_encoder_prefix_len);
+    try std.testing.expect(m_wide.encoderSummaryF32() != null);
+
+    // Verify ADR-0019 r >= 1 zero-NVMe-read Engram isolation & zero encoder dispatches on decode!
+    const prefill_stats = m_wide.m7Stats();
+    try std.testing.expect(prefill_stats.encoder_layer_dispatches_prefill > 0);
+    try std.testing.expect(prefill_stats.decoder_layer_dispatches_prefill > 0);
+    try std.testing.expectEqual(@as(u64, 0), prefill_stats.encoder_layer_dispatches_decode);
+    try std.testing.expect(prefill_stats.engram_lookups > 0);
+
+    var cur_w = first_wide;
+    var cur_t = first_t64;
+    var decode_seq_w: [6]u32 = undefined;
+    var decode_seq_t: [6]u32 = undefined;
+    for (0..6) |step| {
+        cur_w = try m_wide.stepDecode(cur_w, @intCast(prompt.len + step));
+        cur_t = try m_t64.stepDecode(cur_t, @intCast(prompt.len + step));
+        decode_seq_w[step] = cur_w;
+        decode_seq_t[step] = cur_t;
+    }
+    try std.testing.expectEqualSlices(u32, &decode_seq_t, &decode_seq_w);
+
+    const dec_stats = m_wide.m7Stats();
+    try std.testing.expectEqual(@as(u64, 0), dec_stats.encoder_layer_dispatches_decode);
+    try std.testing.expect(dec_stats.decoder_layer_dispatches_decode > 0);
+    try std.testing.expect(dec_stats.csa2_kv_writes > 0);
+    try std.testing.expect(dec_stats.csa2_index_dispatches > 0);
+    try std.testing.expect(dec_stats.csa2_attn_dispatches > dec_stats.csa2_index_dispatches);
+    const iso = m_wide.loopIsolationStats();
+    try std.testing.expect(iso.ple_r0_fills > 0);
+    try std.testing.expect(iso.ple_r_ge1_reuses > 0);
+    try std.testing.expectEqual(@as(u64, 0), iso.ple_r_ge1_nvme_reads);
+
+    // 2. Verify BatchScheduler (`GraphBatchRuntime`, C14) on CED + MLA+CSA2 + Mega-mHC!
+    var brt = try GraphBatchRuntime.init(allocator, &m_t64, .{
+        .max_slots = 2,
+        .prefix_cache_chunks = 0,
+    });
+    defer brt.deinit(allocator);
+    var rng0 = rng_mod.RequestRng.initDeterministic(1);
+    const chunk0: batch_sched.PrefillChunkView = .{
+        .slot_id = 0,
+        .request_id = 1,
+        .user_tag = 0,
+        .tokens = &prompt,
+        .start_pos = 0,
+        .total_prompt_len = prompt.len,
+        .is_final_chunk = true,
+        .prefix_handle = 0,
+        .temperature = 0.0,
+        .rng = &rng0,
+        .ngram_domain = "",
+    };
+    const pr0 = try brt.prefillSlot(&chunk0);
+    try std.testing.expectEqual(first_t64, pr0.first_token);
+
+    m_t64.resetM7Stats();
+    var slot_ids = [_]u16{0};
+    var req_ids = [_]u64{1};
+    var user_tags = [_]u64{0};
+    var in_toks = [_]u32{first_t64};
+    var pos_arr = [_]u32{prompt.len};
+    var temps = [_]f32{0.0};
+    var rng_ptrs = [_]*rng_mod.RequestRng{&rng0};
+    var domains = [_][]const u8{""};
+    var pref_handles = [_]u64{0};
+    var out_toks = [_]u32{0};
+    const bview: batch_sched.BatchStepView = .{
+        .slot_ids = &slot_ids,
+        .request_ids = &req_ids,
+        .user_tags = &user_tags,
+        .input_tokens = &in_toks,
+        .seq_positions = &pos_arr,
+        .temperatures = &temps,
+        .rngs = &rng_ptrs,
+        .ngram_domains = &domains,
+        .prefix_handles = &pref_handles,
+    };
+    try brt.stepDecodeBatch(&bview, &out_toks);
+    try std.testing.expectEqual(decode_seq_t[0], out_toks[0]);
+    try std.testing.expectEqual(@as(u64, 0), m_t64.m7Stats().encoder_layer_dispatches_decode);
+}
+
+test "M7 X2/X3 2-rank live loopback TCP ExpertParallelCoordinator matches 1-rank deepseek41 GraphModel" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = try makeTestTempDir(allocator, "m7-cluster-ced");
+    defer allocator.free(tmp_dir);
+    defer removeTestDir(allocator, tmp_dir);
+
+    var bundle = try buildSynthDeepSeek41Bundle(allocator, .{
+        .engram_num_shards = 0,
+        .include_dspark = false,
+        .tmp_dir = tmp_dir,
+    });
+    defer bundle.deinit(allocator);
+
+    const prompt = [_]u32{ 4, 15, 27, 9, 31, 63 };
+
+    // 1. 1-rank reference `GraphModel` (all 8 experts local on GPU).
+    var ref_model = try GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .startup_canary = false,
+    });
+    defer ref_model.deinit(allocator);
+
+    const ref_first = try ref_model.prefillChunk(&prompt, 0, true);
+    var ref_toks: [5]u32 = undefined;
+    ref_toks[0] = ref_first;
+    for (1..ref_toks.len) |i| {
+        ref_toks[i] = try ref_model.stepDecode(ref_toks[i - 1], @intCast(prompt.len + i - 1));
+    }
+
+    // 2. 2-rank live loopback TCP cluster: Rank 1 `PeerWorkerServer` + Rank 0 `ExpertParallelCoordinator`.
+    const plan_r1 = try expert_parallel.ExpertPartitionPlan.init(
+        2,
+        1,
+        @intCast(bundle.cfg.num_hidden_layers),
+        @intCast(bundle.cfg.num_experts),
+        .contiguous_by_rank,
+    );
+    var store_r1 = try LoadedCpuMoeStore.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, plan_r1, null);
+    defer store_r1.deinit(allocator);
+
+    var worker = try expert_parallel.PeerWorkerServer.init(.{
+        .plan = plan_r1,
+        .host = .{ 127, 0, 0, 1 },
+        .port = 0,
+        .hidden_size = bundle.cfg.hidden_size,
+        .max_tokens = 64,
+        .max_assignments = 64 * 8,
+        .backend = store_r1.backend(),
+    });
+    defer worker.deinit();
+    try worker.start();
+    defer worker.stop();
+
+    const plan_r0 = try expert_parallel.ExpertPartitionPlan.init(
+        2,
+        0,
+        @intCast(bundle.cfg.num_hidden_layers),
+        @intCast(bundle.cfg.num_experts),
+        .contiguous_by_rank,
+    );
+    var store_r0 = try LoadedCpuMoeStore.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, plan_r0, null);
+    defer store_r0.deinit(allocator);
+
+    const peers = [_]expert_parallel.PeerEndpoint{.{
+        .rank = 1,
+        .host = .{ 127, 0, 0, 1 },
+        .port = worker.boundPort(),
+    }};
+    var coord = try expert_parallel.ExpertParallelCoordinator.init(.{
+        .plan = plan_r0,
+        .peers = &peers,
+        .hidden_size = bundle.cfg.hidden_size,
+        .max_tokens = 64,
+        .max_assignments = 64 * 8,
+        .local_backend = store_r0.backend(),
+        .transport_kind = .auto,
+    });
+    defer coord.deinit();
+
+    var dist_model = try GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 64,
+        .max_tree_nodes = 16,
+        .startup_canary = false,
+        .cluster_coordinator = &coord,
+    });
+    defer dist_model.deinit(allocator);
+
+    const dist_first = try dist_model.prefillChunk(&prompt, 0, true);
+    var dist_toks: [5]u32 = undefined;
+    dist_toks[0] = dist_first;
+    // Warm up the M=1 Metal 4 decode PSOs on the first decode token before capturing steady-state malloc delta.
+    dist_toks[1] = try dist_model.stepDecode(dist_toks[0], @intCast(prompt.len));
+
+    const snap_before = try vmstat.Snapshot.capture();
+    for (2..dist_toks.len) |i| {
+        dist_toks[i] = try dist_model.stepDecode(dist_toks[i - 1], @intCast(prompt.len + i - 1));
+    }
+    const snap_after = try vmstat.Snapshot.capture();
+    const hdelta = vmstat.heapDelta(snap_before, snap_after);
+
+    try std.testing.expectEqualSlices(u32, &ref_toks, &dist_toks);
+    const m7s = dist_model.m7Stats();
+    try std.testing.expectEqual(@as(u64, 0), m7s.encoder_layer_dispatches_decode);
+    try std.testing.expect(m7s.cluster_dispatches > 0);
+    try std.testing.expect(m7s.cluster_remote_assignments > 0);
+    try std.testing.expect(m7s.cluster_bytes_transferred > 0);
+    try std.testing.expect(hdelta.blocks_in_use <= 0);
+    try coord.shutdownPeers();
 }

@@ -28,6 +28,8 @@ const sam_mod = @import("sam.zig");
 const tree_mod = @import("tree.zig");
 const accept_mod = @import("accept.zig");
 const draft_mod = @import("draft.zig");
+const dspark_mod = @import("dspark.zig");
+const amf = @import("../format/amf.zig");
 const ngram_nvme = @import("ngram_nvme.zig");
 const rng_mod = @import("../runtime/rng.zig");
 const qos = @import("../platform/qos.zig");
@@ -145,6 +147,9 @@ pub const SpecStats = struct {
     pearl_worker_ns: u64 = 0,
     // D12 SelfSpecRecurrent telemetry
     self_recurrent_draft_steps: u64 = 0,
+    // D10 DSpark semi-autoregressive telemetry
+    dspark_rounds: u64 = 0,
+    dspark_inserted_nodes: u64 = 0,
 
     pub fn meanAcceptanceLength(self: *const SpecStats) f64 {
         if (self.rounds == 0) return 0.0;
@@ -205,8 +210,195 @@ pub const RunError = error{
     OutputBufferTooSmall,
     TokenOutOfRange,
     MissingRng,
-} || qwen3.StepError || graph.GraphStepError || draft_mod.DraftStepError || tree_mod.PruneError ||
+} || qwen3.StepError || graph.GraphStepError || draft_mod.DraftStepError || dspark_mod.Error || tree_mod.PruneError ||
     accept_mod.VerifyError || ngram_nvme.RegistryQueryError;
+
+/// Startup-loaded `D10` `DSpark` proposer bundle backed by a `dspark.amf` weight
+/// container and a zero-copy GPU `LmHeadHook.callback` tied to `GraphModel.evalLmHeadBatchF32`.
+/// All hot-path scratch lives in `workspace` (16 KiB-aligned `WiredArena`, `0` hot-path allocs).
+pub const LoadedDSparkProposer = struct {
+    enc_proj: ?[]f32,
+    dec_proj: ?[]f32,
+    slot_projs: []f32,
+    slot_embed: []f32,
+    slot_norm: ?[]f32,
+    workspace: dspark_mod.DSparkWorkspace,
+    proposer: dspark_mod.DSparkProposer,
+
+    pub const LoadError = error{
+        MissingTensor,
+        InvalidWeights,
+        UnsupportedDType,
+        OutOfMemory,
+    } || amf.ParseError || amf.IoError || dspark_mod.Error;
+
+    fn evalTargetLmHeadCb(
+        ctx: ?*anyopaque,
+        slot_hiddens: []const f32,
+        block_width: u8,
+        hidden_size: u32,
+        vocab_size: u32,
+        out_logits: []f32,
+    ) dspark_mod.Error!void {
+        const gm: *graph.GraphModel = @ptrCast(@alignCast(ctx orelse return error.InvalidWeights));
+        if (gm.config.hidden_size != hidden_size or gm.config.vocab_size != vocab_size) {
+            return error.DimensionMismatch;
+        }
+        gm.evalLmHeadBatchF32(slot_hiddens, block_width, out_logits) catch return error.CallbackFailed;
+    }
+
+    fn loadFloatTensorF32(
+        allocator: std.mem.Allocator,
+        amf_file: *amf.AmfFile,
+        name: []const u8,
+        expected_elems: usize,
+    ) LoadError![]f32 {
+        const entry = amf_file.parsed.find(name) orelse return error.MissingTensor;
+        const dt = try entry.dataType();
+        const elem_bytes: usize = switch (dt) {
+            .f16, .bf16 => 2,
+            .f32 => 4,
+            else => return error.UnsupportedDType,
+        };
+        const raw_bytes = expected_elems * elem_bytes;
+        if (entry.blob_bytes < raw_bytes) return error.InvalidWeights;
+        const raw = try allocator.alloc(u8, @intCast(entry.blob_bytes));
+        defer allocator.free(raw);
+        var done: usize = 0;
+        while (done < raw.len) {
+            const rc = std.c.pread(
+                amf_file.fd,
+                raw.ptr + done,
+                raw.len - done,
+                @intCast(entry.blob_offset + done),
+            );
+            if (rc <= 0) return error.ShortRead;
+            done += @intCast(rc);
+        }
+        if (std.hash.Crc32.hash(raw) != entry.blob_crc32) return error.BlobChecksumMismatch;
+        const out = try allocator.alloc(f32, expected_elems);
+        switch (dt) {
+            .f16 => {
+                for (0..expected_elems) |i| {
+                    const bits = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
+                    out[i] = @floatCast(@as(f16, @bitCast(bits)));
+                }
+            },
+            .bf16 => {
+                for (0..expected_elems) |i| {
+                    const bits = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
+                    out[i] = quant.bf16ToF32(bits);
+                }
+            },
+            .f32 => {
+                for (0..expected_elems) |i| {
+                    out[i] = @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little));
+                }
+            },
+            else => unreachable,
+        }
+        return out;
+    }
+
+    pub fn loadFromFile(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        amf_path: [:0]const u8,
+        cfg_override: ?dspark_mod.DSparkConfig,
+        budget_override: ?budget_mod.Budget,
+    ) LoadError!*LoadedDSparkProposer {
+        var amf_file = try amf.AmfFile.open(allocator, amf_path);
+        defer amf_file.close(allocator);
+
+        const h: u32 = target.config.hidden_size;
+        const v: u32 = target.config.vocab_size;
+        const cfg: dspark_mod.DSparkConfig = cfg_override orelse .{
+            .block_width = target.config.dspark_block_width,
+            .top_k_per_pos = target.config.dspark_top_k_per_pos,
+            .max_tree_nodes = @intCast(@min(target.config.dspark_max_tree_nodes, target.max_tree_nodes)),
+            .hidden_size = h,
+            .vocab_size = v,
+            .rms_eps = target.config.rms_norm_eps,
+        };
+        try cfg.validate();
+
+        const hh: usize = @as(usize, h) * h;
+        const w: usize = cfg.block_width;
+        const enc_proj: ?[]f32 = if (amf_file.parsed.find("dspark.enc_proj.weight") != null)
+            try loadFloatTensorF32(allocator, &amf_file, "dspark.enc_proj.weight", hh)
+        else
+            null;
+        errdefer if (enc_proj) |p| allocator.free(p);
+
+        const dec_proj: ?[]f32 = if (amf_file.parsed.find("dspark.dec_proj.weight") != null)
+            try loadFloatTensorF32(allocator, &amf_file, "dspark.dec_proj.weight", hh)
+        else
+            null;
+        errdefer if (dec_proj) |p| allocator.free(p);
+
+        const slot_norm: ?[]f32 = if (amf_file.parsed.find("dspark.norm.weight") != null)
+            try loadFloatTensorF32(allocator, &amf_file, "dspark.norm.weight", h)
+        else
+            null;
+        errdefer if (slot_norm) |p| allocator.free(p);
+
+        const slot_projs = try allocator.alloc(f32, w * hh);
+        errdefer allocator.free(slot_projs);
+        const slot_embed = try allocator.alloc(f32, w * h);
+        errdefer allocator.free(slot_embed);
+
+        var name_buf: [96]u8 = undefined;
+        for (0..w) |s| {
+            const p_nm = std.fmt.bufPrint(&name_buf, "dspark.slot.{d}.proj.weight", .{s}) catch unreachable;
+            const p_slice = try loadFloatTensorF32(allocator, &amf_file, p_nm, hh);
+            defer allocator.free(p_slice);
+            @memcpy(slot_projs[s * hh ..][0..hh], p_slice);
+
+            const e_nm = std.fmt.bufPrint(&name_buf, "dspark.slot.{d}.embed.weight", .{s}) catch unreachable;
+            const e_slice = try loadFloatTensorF32(allocator, &amf_file, e_nm, h);
+            defer allocator.free(e_slice);
+            @memcpy(slot_embed[s * h ..][0..h], e_slice);
+        }
+
+        const bundle = try allocator.create(LoadedDSparkProposer);
+        errdefer allocator.destroy(bundle);
+        var ws = try dspark_mod.DSparkWorkspace.init(cfg, budget_override);
+        errdefer ws.deinit();
+
+        const weights: dspark_mod.DSparkWeights = .{
+            .enc_proj = enc_proj,
+            .dec_proj = dec_proj,
+            .slot_projs = slot_projs,
+            .slot_embed = slot_embed,
+            .slot_norm_weight = slot_norm,
+            .lm_head = .{ .callback = .{
+                .ctx = @ptrCast(target),
+                .eval_fn = evalTargetLmHeadCb,
+            } },
+        };
+        bundle.* = .{
+            .enc_proj = enc_proj,
+            .dec_proj = dec_proj,
+            .slot_projs = slot_projs,
+            .slot_embed = slot_embed,
+            .slot_norm = slot_norm,
+            .workspace = ws,
+            .proposer = undefined,
+        };
+        bundle.proposer = try dspark_mod.DSparkProposer.init(cfg, weights, &bundle.workspace);
+        return bundle;
+    }
+
+    pub fn deinit(self: *LoadedDSparkProposer, allocator: std.mem.Allocator) void {
+        self.workspace.deinit();
+        if (self.enc_proj) |p| allocator.free(p);
+        if (self.dec_proj) |p| allocator.free(p);
+        if (self.slot_norm) |p| allocator.free(p);
+        allocator.free(self.slot_projs);
+        allocator.free(self.slot_embed);
+        allocator.destroy(self);
+    }
+};
 
 /// Unified speculative target handle supporting both Tier 1 `Qwen3Model` and
 /// Tier 2 composable `GraphModel` (`qwen4_exp`, native `LoopLM`, `Step-LoRA`).
@@ -997,6 +1189,7 @@ pub const SpecEngine = struct {
     target: TargetModel,
     draft_head: ?*draft_mod.DraftHead,
     small_draft: ?*draft_mod.SmallDraftModel,
+    dspark_proposer: ?*dspark_mod.DSparkProposer,
     ngram_table: ?*ngram_nvme.NvmeNgramTable,
     ngram_registry: ?*ngram_nvme.DomainNgramRegistry,
     active_ngram_domain: ?[]const u8,
@@ -1061,19 +1254,30 @@ pub const SpecEngine = struct {
         draft_head: ?*draft_mod.DraftHead,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, .{ .qwen3 = target }, draft_head, null, config);
+        return initInternal(allocator, .{ .qwen3 = target }, draft_head, null, null, config);
     }
 
     /// Initializes `SpecEngine` backed by a composable `GraphModel` (`qwen4_exp`,
-    /// native `LoopLM`, or `Step-LoRA`), supporting `.l1_only`, `.self_recurrent` (`D12`,
-    /// `0` extra draft-model RAM), and `.mtp` / `.eagle2` / `.eagle3` draft heads.
+    /// `deepseek41`, native `LoopLM`, or `Step-LoRA`), supporting `.l1_only`,
+    /// `.self_recurrent` (`D12`, `0` extra draft-model RAM), and `.mtp` / `.eagle2` / `.eagle3` draft heads.
     pub fn initWithGraph(
         allocator: std.mem.Allocator,
         target: *graph.GraphModel,
         draft_head: ?*draft_mod.DraftHead,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, .{ .graph = target }, draft_head, null, config);
+        return initInternal(allocator, .{ .graph = target }, draft_head, null, null, config);
+    }
+
+    /// Initializes `SpecEngine` backed by a `GraphModel` (`deepseek41` CED or decoder-only)
+    /// paired with a `D10` `DSparkProposer` conditioned on encoder summary + last decoder hidden.
+    pub fn initWithDSpark(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        proposer: *dspark_mod.DSparkProposer,
+        config: SpecConfig,
+    ) InitError!SpecEngine {
+        return initInternal(allocator, .{ .graph = target }, null, null, proposer, config);
     }
 
     /// Initializes `SpecEngine` paired with a standalone same-family small draft
@@ -1085,7 +1289,7 @@ pub const SpecEngine = struct {
         small_draft: *draft_mod.SmallDraftModel,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, .{ .qwen3 = target }, null, small_draft, config);
+        return initInternal(allocator, .{ .qwen3 = target }, null, small_draft, null, config);
     }
 
     fn computeInitialPearlEnabled(
@@ -1107,6 +1311,7 @@ pub const SpecEngine = struct {
         target: TargetModel,
         draft_head: ?*draft_mod.DraftHead,
         small_draft: ?*draft_mod.SmallDraftModel,
+        dspark_proposer: ?*dspark_mod.DSparkProposer,
         config: SpecConfig,
     ) InitError!SpecEngine {
         if (target.maxTreeNodes() <= 1) return error.TreeNotEnabled;
@@ -1123,16 +1328,21 @@ pub const SpecEngine = struct {
             .l1_only => {},
             .self_recurrent => {
                 if (target != .graph) return error.DraftModeMismatch;
+                if (draft_head != null or small_draft != null or dspark_proposer != null) return error.DraftModeMismatch;
+            },
+            .dspark => {
+                if (target != .graph) return error.DraftModeMismatch;
+                if (dspark_proposer == null) return error.DraftHeadRequired;
                 if (draft_head != null or small_draft != null) return error.DraftModeMismatch;
             },
             .small_draft => {
                 if (target != .qwen3) return error.DraftModeMismatch;
                 if (small_draft == null) return error.DraftHeadRequired;
-                if (draft_head != null) return error.DraftModeMismatch;
+                if (draft_head != null or dspark_proposer != null) return error.DraftModeMismatch;
             },
             .eagle3, .eagle2, .mtp => {
                 const dh = draft_head orelse return error.DraftHeadRequired;
-                if (small_draft != null) return error.DraftModeMismatch;
+                if (small_draft != null or dspark_proposer != null) return error.DraftModeMismatch;
                 if (dh.config.format != config.mode) return error.DraftModeMismatch;
                 if (!target.enableFeatureTaps()) return error.FeatureTapsRequired;
             },
@@ -1148,6 +1358,8 @@ pub const SpecEngine = struct {
             dh.totalWiredBytes()
         else if (small_draft) |sd|
             sd.totalWiredBytes()
+        else if (dspark_proposer) |dp|
+            dp.workspace.totalWiredBytes()
         else
             0;
         const existing_wired: u64 = target.totalWiredBytes() + draft_wired;
@@ -1225,6 +1437,7 @@ pub const SpecEngine = struct {
             .target = target,
             .draft_head = draft_head,
             .small_draft = small_draft,
+            .dspark_proposer = dspark_proposer,
             .ngram_table = config.ngram_table,
             .ngram_registry = config.ngram_registry,
             .active_ngram_domain = null,
@@ -1325,6 +1538,8 @@ pub const SpecEngine = struct {
             dh.totalWiredBytes()
         else if (self.small_draft) |sd|
             sd.totalWiredBytes()
+        else if (self.dspark_proposer) |dp|
+            dp.workspace.totalWiredBytes()
         else
             0;
         const ngram_bytes: u64 = (if (self.ngram_table) |nt| nt.totalWiredBytes() else 0) +
@@ -1355,7 +1570,7 @@ pub const SpecEngine = struct {
         return switch (dh.config.format) {
             .eagle3 => self.target.acceptedAuxBind(),
             .eagle2, .mtp => self.target.acceptedTopBind(),
-            .l1_only, .small_draft, .self_recurrent => unreachable,
+            .l1_only, .small_draft, .self_recurrent, .dspark => unreachable,
         };
     }
 
@@ -1696,6 +1911,27 @@ pub const SpecEngine = struct {
                         max_allowed_depth,
                         candidate_cap,
                     );
+                }
+            } else if (self.config.mode == .dspark) {
+                if (self.dspark_proposer) |dp| {
+                    if (max_allowed_depth >= 1 and candidate_cap > 1) {
+                        const g = self.target.graph;
+                        const pr = try dp.proposeInto(
+                            MAX_TREE_NODES,
+                            self.last_token,
+                            g.encoderSummaryF32(),
+                            g.lastDecoderHiddenF32(),
+                            &self.sam,
+                            &self.draft_tree,
+                        );
+                        self.stats.dspark_rounds += 1;
+                        self.stats.dspark_inserted_nodes += pr.dspark_inserted;
+                        // Respect remaining sequence/output budget depth & node cap cleanly.
+                        if (self.draft_tree.count > candidate_cap or pr.max_depth > max_allowed_depth) {
+                            self.eval_tree.copyTruncatedFrom(&self.draft_tree, max_allowed_depth, candidate_cap);
+                            self.draft_tree = self.eval_tree;
+                        }
+                    }
                 }
             }
         }
@@ -3984,4 +4220,76 @@ test "D12+W9+W16: 4-layer qwen4_exp (GDN+QSA+MoE+cold+4-branch GR+PLE+Step-LoRA,
     try std.testing.expectEqual(@as(u64, 0), iso.moe_r_ge1_cold_stalls);
     try std.testing.expect(iso.steplora_zero_alpha_skips > 0);
     try std.testing.expect(iso.steplora_active_evals > 0);
+}
+
+test "M7 D10 SpecEngine DSpark on deepseek41 CED matches non-speculative stepDecode 100% bit-for-bit at T=0 with 0 encoder decode dispatches" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = try graph.makeTestTempDir(allocator, "m7-dspark-ced");
+    defer allocator.free(tmp_dir);
+    defer graph.removeTestDir(allocator, tmp_dir);
+
+    var bundle = try graph.buildSynthDeepSeek41Bundle(allocator, .{
+        .engram_num_shards = 1,
+        .include_dspark = true,
+        .tmp_dir = tmp_dir,
+    });
+    defer bundle.deinit(allocator);
+
+    const eng_const = try allocator.alloc([:0]const u8, bundle.engram_paths.len);
+    defer allocator.free(eng_const);
+    for (bundle.engram_paths, 0..) |p, i| eng_const[i] = p;
+
+    // Prompt with repeated motif so both L1 SAM seeds and DSpark parallel slots fire.
+    const prompt = [_]u32{ 5, 11, 23, 7, 19, 31, 5, 11, 23, 7 };
+
+    // 1. Reference non-speculative greedy CED decode.
+    var ref_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .ple_paths = eng_const,
+        .startup_canary = false,
+    });
+    defer ref_model.deinit(allocator);
+
+    var expected: [14]u32 = undefined;
+    expected[0] = try ref_model.prefillChunk(&prompt, 0, true);
+    for (1..expected.len) |i| {
+        expected[i] = try ref_model.stepDecode(expected[i - 1], @intCast(prompt.len + i - 1));
+    }
+
+    // 2. Speculative `DraftMode.dspark` (`D10`) conditioned on encoder summary + last decoder hidden + L1 SAM.
+    var spec_model = try graph.GraphModel.loadFromFile(allocator, bundle.amf_file_path.?, bundle.cfg, .{
+        .max_seq_len = 128,
+        .max_tree_nodes = 32,
+        .ple_paths = eng_const,
+        .startup_canary = false,
+    });
+    defer spec_model.deinit(allocator);
+
+    var dspark_loaded = try LoadedDSparkProposer.loadFromFile(allocator, &spec_model, bundle.dspark_amf_path.?, null, null);
+    defer dspark_loaded.deinit(allocator);
+
+    var eng = try SpecEngine.initWithDSpark(allocator, &spec_model, &dspark_loaded.proposer, .{
+        .mode = .dspark,
+        .max_tree_nodes = 32,
+        .max_draft_depth = 6,
+        .enable_pruning = false,
+        .temperature = 0.0,
+    });
+    defer eng.deinit(allocator);
+
+    var got: [14]u32 = undefined;
+    got[0] = try eng.prefill(&prompt, null);
+    try std.testing.expect(spec_model.encoderSummaryF32() != null);
+    var p_out: usize = 1;
+    while (p_out < got.len) {
+        const rs = try eng.stepRound(null, got[p_out..]);
+        p_out += rs.emitted_count;
+    }
+
+    try std.testing.expectEqualSlices(u32, &expected, &got);
+    try std.testing.expect(eng.stats.dspark_rounds > 0);
+    try std.testing.expect(eng.stats.dspark_inserted_nodes > 0);
+    try std.testing.expectEqual(@as(u64, 0), spec_model.m7Stats().encoder_layer_dispatches_decode);
+    try std.testing.expect(spec_model.m7Stats().decoder_layer_dispatches_decode > 0);
 }
