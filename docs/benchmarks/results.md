@@ -5392,3 +5392,300 @@ serve.steady_malloc_blocks       650
 serve.steady_malloc_bytes        42432
 serve.swapouts_delta             0
 ```
+
+## M7: Ultra and cluster scale-out (deepseek41 CED, MLA/CSA2 FP4, Mega-mHC, Engram, DSpark, and loopback TCP cluster)
+
+Measured on 2026-11-23 on the Apple M4 24 GiB (`Apple9`, TB4) baseline at commit
+`69d30afd9b53c2199f07046795899b06a1e95795` (`ReleaseFast`, `swapouts_delta = 0`,
+`pageouts_delta = 0`).
+
+Hardware scope notice: all measurements below ran locally on the single 24 GiB
+M4 (`Apple9`, Thunderbolt 4) host using loopback TCP (`127.0.0.1`) and compact
+synthetic `deepseek41` bundles. Physical multi-Mac Thunderbolt 5 RDMA HCA
+transport (`X1`–`X3`) and full-scale `552B + 196B` `DeepSeek-V4.1-Flash-1017`
+execution (`W11`) require a 512 GB Apple Silicon Ultra node or a multi-Mac TB5
+RDMA cluster and were not executed on this host
+(`tier3_full_552b_status=deferred_requires_512gb_ultra_or_multi_mac_tb5_rdma_cluster`).
+
+### Summary metrics
+
+| Area | Metric | Measured result |
+| --- | --- | --- |
+| `R7` FP4 KV codec | `deepseek41` full geometry (`kv_lora_rank=1536`, `qk_rope_dim=26`, `E4M3` RoPE) | `890 B/tok` (`3.51x` vs `3,124 B/tok` FP16 MLA; `81.1x` vs `72,192 B/tok` unabsorbed FP16 K+V); latent `max_abs=0.2778`, `rmse=0.0822`; RoPE `max_abs=0.0624` |
+| `G11` MLA + CSA2 GPU | 3-layer `[Full, Reindex, Reuse]` sharing 1 FP4 KV slab (`kv_len=2048`) | `868,352 B` shared vs `2,605,056 B` unshared (`66.7%` saved); latency `full=891.32 us`, `reindex=922.37 us`, `reuse=788.24 us` |
+| `G10` Single-Pass Mega-mHC | 4 streams, `hidden=4096`, Sinkhorn-Knopp Birkhoff (`4` iters) | `m=1`: `215.85 us` (`0.57 GB/s`); `m=64`: `230.70 us` (`31.85 GB/s`, `26.5%` of `120.0 GB/s` bus) |
+| `C10` Engram `F_NOCACHE` | 2 shards, `2,048` rows, `2` heads (`orders=[2,3]`) | Cold SSD: `7.47 us` (`24` NVMe reads); `PlePageCache` hit: `0.82 us` (`0` reads); loop `r >= 1` scratch reuse: `0.49 us` (`0` reads); `malloc_blocks_delta = 0` |
+| `W11` + `D10` CED + DSpark | Synthetic `deepseek41` (`2` enc + `4` dec, `R=2`, `8` experts, 2 Engram shards) | CED decode `341.26 tok/s` (`2.930 ms/tok`, `0` encoder decode dispatches, `0` `r >= 1` Engram SSD reads); `DSpark` `greedy_match=yes`, `mean_accept=1.07`, `0` encoder decode dispatches |
+| `X1` TB5 RDMA probe | Runtime `probeTb5Rdma()` on M4 TB4 | `tb5_rdma_hw=unavailable` (`driver_lib_found=no`, `devices=0`, `reason=rdma_framework_absent`); `.auto -> tb4_tcp`; `--strict-tb5-rdma -> error: Tb5RdmaUnavailable` |
+| `X2` 2-rank loopback CED | In-process 2-rank loopback TCP `deepseek41` CED (`world_size=2`) | `greedy_match=yes` vs 1-rank, `0` encoder decode dispatches, `40` dispatches, `46` remote assignments, `118.73 us` avg RPC, `59,408 B` transferred |
+| `X3` 4-rank loopback MoE | 4-rank loopback TCP (`3` `PeerWorkerServer`s + Rank 0 coordinator) | `m1_max_err=0.000000`, `m8_max_err=0.000000`, `16` dispatches, `48` remote assignments, `121.20 us` avg RPC, `79,104 B`, `malloc_blocks_delta = 0` |
+| Live 2-OS-process TCP cluster | `/Volumes/Akari/models/amf/synth-deepseek41/` (`7.0 MiB`): 1-process `decode` vs 2-OS-process `peer-worker` (Rank 1) + `decode --peer` (Rank 0) vs `spec-decode --draft-mode dspark` | `15/15` bit-exact greedy `token_ids` match across all three; `0` encoder decode dispatches; `32` TCP RPCs / `123` remote assignments (`285.87 us` avg RPC, `130,264 B`); `swapouts_delta = 0` |
+
+Note on `malloc_blocks_delta`: pure-CPU/IO/TCP paths (`m7.c10.malloc_blocks_delta = 0`,
+`m7.x3.cluster_4rank_malloc_delta = 0`) perform zero steady-state heap
+allocations. Short Metal 4 GPU bursts (`< 1,000` submits) exhibit the macOS
+26.0 Metal 4 driver-internal `64 B` tracking-slab growth (`~2` blocks/commit)
+previously documented in M6.5 and M6.8. On the random-weight synthetic
+`deepseek41` bundle (`vocab = 2048`), the CPU `f32` MoE worker and GPU `f16`
+MoE path agree bit-for-bit on `15/15` greedy tokens for `--max-tokens 15`
+(on longer random-weight runs, near-tied uniform logits within `1 ULP` of
+`f16` intermediate rounding can flip argmax).
+
+### Verbatim `aminfer bench-m7` output (ReleaseFast)
+
+Command: `./zig-out/bin/aminfer bench-m7`
+
+```text
+== aminfer M7 benchmark (R7/G11 MLA+CSA2 FP4, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED+DSpark, X1-X3 Cluster) ==
+m7.host.gpu                      Apple M4 (m4)
+m7.host.spec_bus_gbs             120.0
+
+-- Section 1: R7 + G11 MLA FP4 KV (890 B/tok) & CSA2 (Full/Reindex/Reuse + SWA) --
+m7.r7.deepseek41_fp4_b_per_tok   890 (ratio=3.51x vs 3124 B/tok FP16-MLA; 81.1x vs 72192 B/tok unabsorbed FP16 K+V)
+m7.r7.fp4_latent_err             max_abs=0.2778 rmse=0.0822
+m7.r7.fp4_rope_e4m3_err          max_abs=0.0624
+m7.g11.mla_csa2_kv_len           2048
+m7.g11.mla_csa2_kv_bytes_3layer  shared=868352 unshared=2605056 saved=1736704 (66.7%)
+m7.g11.mla_csa2_latency_us       full=891.32 reindex=922.37 reuse=788.24
+m7.g11.malloc_blocks_delta       191
+
+-- Section 2: G10 Single-Pass Mega-mHC (4 streams, Sinkhorn-Knopp Birkhoff) --
+m7.g10.mhc_shape                 streams=4 hidden=4096
+m7.g10.mhc_m1_decode             latency_us=215.85 effective_gbs=0.57 (0.5% of bus)
+m7.g10.mhc_m64_prefill           latency_us=230.70 effective_gbs=31.85 (26.5% of bus)
+m7.g10.malloc_blocks_delta       128
+-- Section 3: C10 Engram Multi-Head F_NOCACHE Lookup & Loop Reuse --
+m7.c10.engram_config             shards=2 rows=2048 heads=2
+m7.c10.engram_cold_ssd           latency_us=7.47 nvme_reads=24
+m7.c10.engram_cache_hit          latency_us=0.82 nvme_reads=0
+m7.c10.engram_loop_r_ge1         latency_us=0.49 nvme_reads=0
+m7.c10.malloc_blocks_delta       0
+
+-- Section 4: W11 + D10 Synthetic deepseek41 CED 2-Phase + DSpark Speculative Decode --
+m7.w11.ced_layers                encoder=2 decoder=4
+m7.w11.ced_prefill_ms            6.406
+m7.w11.ced_decode                ms_per_tok=2.930 tok_s=341.26 encoder_decode_dispatches=0 engram_r_ge1_nvme_reads=0
+m7.w11.malloc_blocks_delta       234
+m7.d10.dspark_decode             ms_per_tok=3.661 tok_s=273.17 mean_accept=1.07 speedup=0.80x greedy_match=yes encoder_decode_dispatches=0
+m7.d10.malloc_blocks_delta       310
+-- Section 5: X1-X3 TB5 RDMA Probe & Live Loopback TCP Cluster --
+m7.x1.tb5_rdma_hw                unavailable (driver_lib_found=no devices=0 reason=rdma_framework_absent)
+m7.x1.transport_selection        auto=tb4_tcp strict_tb5_reject=pass
+m7.x2.cluster_2rank_ced          greedy_match=yes encoder_decode_dispatches=0 dispatches=40 remote_assignments=46 rpc_us=118.73 bytes_transferred=59408
+m7.x2.cluster_2rank_malloc_delta 170
+m7.x3.cluster_4rank_moe          m1_max_err=0.000000 m8_max_err=0.000000 dispatches=16 remote_assignments=48 rpc_us=121.20 bytes_transferred=79104
+m7.x3.cluster_4rank_malloc_delta 0
+tier3_full_552b_status=deferred_requires_512gb_ultra_or_multi_mac_tb5_rdma_cluster
+m7.vm.swapouts_delta             0
+m7.vm.pageouts_delta             0
+```
+
+### Verbatim synthetic `deepseek41` bundle verification and live 2-OS-process TCP cluster runs (ReleaseFast)
+
+Bundle generator: `cd tools && uv run aminfer-tools synth-deepseek41 --preset tiny-deepseek41 --output-dir /Volumes/Akari/models/amf/synth-deepseek41` (`7.0 MiB` total).
+
+Command: `./zig-out/bin/aminfer verify-amf /Volumes/Akari/models/amf/synth-deepseek41/model.amf`
+
+```text
+amf.status       ok
+amf.model_id     deepseek41-tiny-synth
+amf.tensors      174
+amf.file_bytes   6111232
+amf.wired_bytes  6062080
+amf.cold_bytes   0
+```
+
+Command: `./zig-out/bin/aminfer verify-amf /Volumes/Akari/models/amf/synth-deepseek41/engram-shard-00-of-02.amf`
+
+```text
+amf.status       ok
+amf.model_id     deepseek41-tiny-synth-engram-s0
+amf.tensors      4
+amf.file_bytes   163840
+amf.wired_bytes  0
+amf.cold_bytes   0
+amf.sparse_bytes 131072
+```
+
+Command: `./zig-out/bin/aminfer verify-amf /Volumes/Akari/models/amf/synth-deepseek41/engram-shard-01-of-02.amf`
+
+```text
+amf.status       ok
+amf.model_id     deepseek41-tiny-synth-engram-s1
+amf.tensors      4
+amf.file_bytes   163840
+amf.wired_bytes  0
+amf.cold_bytes   0
+amf.sparse_bytes 131072
+```
+
+Command: `./zig-out/bin/aminfer verify-amf /Volumes/Akari/models/amf/synth-deepseek41/dspark.amf`
+
+```text
+amf.status       ok
+amf.model_id     deepseek41-tiny-synth-dspark
+amf.tensors      11
+amf.file_bytes   901120
+amf.wired_bytes  868352
+amf.cold_bytes   0
+```
+
+Baseline 1-process greedy decode:
+`./zig-out/bin/aminfer decode --amf /Volumes/Akari/models/amf/synth-deepseek41/model.amf --config /Volumes/Akari/models/amf/synth-deepseek41/config.json --tokenizer /Volumes/Akari/models/amf/synth-deepseek41/tokenizer.json --prompt "Hello Apple Silicon cluster" --max-tokens 15 --ignore-eos`
+
+```text
+decode.arch                      graph (mla_csa2, moe_swiglu, mhc_single_pass, loop=single_pass R=1)
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    4
+decode.shards                    1
+decode.wired_mib                 11
+decode.prompt_tokens             26
+decode.generated_tokens          15
+decode.prefill_ms                6.090
+decode.decode_ms_per_tok         1.141
+decode.decode_tok_per_s          876.10
+decode.bytes_per_tok             1564132
+decode.effective_gbs             1.37
+decode.malloc_blocks_delta       84
+decode.malloc_bytes_delta        5376
+decode.swapouts_delta            0
+decode.loop_total_steps             14
+decode.loop_early_exit_tokens       0
+decode.loop_gdn_scratch_evals       0
+decode.loop_gdn_final_commits       0
+decode.loop_ple_r0_fills            28
+decode.loop_ple_r_ge1_reuses        0
+decode.loop_ple_r_ge1_nvme_reads    0
+decode.loop_qsa_index_computes      0
+decode.loop_qsa_index_reuses        0
+decode.loop_moe_r_ge1_pinned_routes 0
+decode.loop_moe_r_ge1_cold_stalls   0
+decode.loop_steplora_zero_skips     0
+decode.loop_steplora_active_evals   0
+decode.m7.enc_prefill_dispatches 2
+decode.m7.enc_decode_dispatches  0
+decode.m7.dec_decode_dispatches  28
+decode.ple_nvme_reads            16
+decode.ple_cache_hits            492
+decode.token_ids                 [670, 1924, 825, 1521, 1983, 1140, 76, 1991, 1702, 1173, 382, 1602, 1037, 527, 896]
+decode.text                       v000670 v001924 v000825 v001521 v001983 v001140L v001991 v001702 v001173 v000382 v001602 v001037 v000527 v000896
+```
+
+Live 2-OS-process TCP cluster — Process 1 (`peer-worker`, Rank 1):
+`./zig-out/bin/aminfer peer-worker --listen 127.0.0.1:19471 --amf /Volumes/Akari/models/amf/synth-deepseek41/model.amf --config /Volumes/Akari/models/amf/synth-deepseek41/config.json --rank 1 --world-size 2 --partition contiguous`
+
+```text
+peer_worker.listen               127.0.0.1:19471
+peer_worker.rank                 1/2 (partition=contiguous)
+peer_worker.local_experts        4..8 (of 8, layers=4)
+peer_worker.transport            tb4_tcp (rdma_reason=rdma_framework_absent)
+peer_worker.max_requests         0
+peer_worker.status               ready
+peer_worker.requests_served      32
+peer_worker.assignments_eval     123
+peer_worker.bytes_rx             44720
+peer_worker.bytes_tx             85944
+peer_worker.swapouts_delta       0
+```
+
+Live 2-OS-process TCP cluster — Process 2 (`decode --peer`, Rank 0):
+`./zig-out/bin/aminfer decode --amf /Volumes/Akari/models/amf/synth-deepseek41/model.amf --config /Volumes/Akari/models/amf/synth-deepseek41/config.json --tokenizer /Volumes/Akari/models/amf/synth-deepseek41/tokenizer.json --prompt "Hello Apple Silicon cluster" --max-tokens 15 --ignore-eos --peer 127.0.0.1:19471 --rank 0 --world-size 2 --partition contiguous --shutdown-peers`
+
+```text
+decode.arch                      graph (mla_csa2, moe_swiglu, mhc_single_pass, loop=single_pass R=1)
+decode.temperature               0.00
+decode.seed_used                 0
+decode.seed_source               greedy
+decode.layers                    4
+decode.shards                    1
+decode.wired_mib                 9
+decode.prompt_tokens             26
+decode.generated_tokens          15
+decode.prefill_ms                12.414
+decode.decode_ms_per_tok         2.647
+decode.decode_tok_per_s          377.85
+decode.bytes_per_tok             1564132
+decode.effective_gbs             0.59
+decode.malloc_blocks_delta       140
+decode.malloc_bytes_delta        8960
+decode.swapouts_delta            0
+decode.loop_total_steps             14
+decode.loop_early_exit_tokens       0
+decode.loop_gdn_scratch_evals       0
+decode.loop_gdn_final_commits       0
+decode.loop_ple_r0_fills            28
+decode.loop_ple_r_ge1_reuses        0
+decode.loop_ple_r_ge1_nvme_reads    0
+decode.loop_qsa_index_computes      0
+decode.loop_qsa_index_reuses        0
+decode.loop_moe_r_ge1_pinned_routes 0
+decode.loop_moe_r_ge1_cold_stalls   0
+decode.loop_steplora_zero_skips     0
+decode.loop_steplora_active_evals   0
+decode.m7.enc_prefill_dispatches 2
+decode.m7.enc_decode_dispatches  0
+decode.m7.dec_decode_dispatches  28
+decode.cluster.world_size        2 (rank=0, partition=contiguous)
+decode.cluster.transport         tb4_tcp (rdma_reason=rdma_framework_absent)
+decode.cluster.dispatches        32 (local=101, remote=123)
+decode.cluster.rpc_us            285.87
+decode.cluster.bytes_transferred 130264
+decode.ple_nvme_reads            16
+decode.ple_cache_hits            492
+decode.token_ids                 [670, 1924, 825, 1521, 1983, 1140, 76, 1991, 1702, 1173, 382, 1602, 1037, 527, 896]
+decode.text                       v000670 v001924 v000825 v001521 v001983 v001140L v001991 v001702 v001173 v000382 v001602 v001037 v000527 v000896
+```
+
+`DSpark` speculative decode (`--draft-mode dspark`):
+`./zig-out/bin/aminfer spec-decode --amf /Volumes/Akari/models/amf/synth-deepseek41/model.amf --config /Volumes/Akari/models/amf/synth-deepseek41/config.json --tokenizer /Volumes/Akari/models/amf/synth-deepseek41/tokenizer.json --prompt "Hello Apple Silicon cluster" --max-tokens 15 --ignore-eos --draft-mode dspark`
+
+```text
+spec.arch                        graph (mla_csa2, moe_swiglu, mhc_single_pass, loop=single_pass R=1)
+spec.mode                        dspark
+spec.placement                   gpu (requested=auto)
+spec.temperature                 0.00
+spec.seed_used                   0
+spec.seed_source                 greedy
+spec.layers                      4
+spec.wired_mib                   11
+spec.prompt_tokens               26
+spec.generated_tokens            15
+spec.rounds                      14
+spec.mean_accept_len             1.000
+spec.self_recurrent_draft_steps  0
+spec.prefill_ms                  7.982
+spec.decode_ms_per_tok           2.394
+spec.decode_tok_per_s            417.67
+spec.malloc_blocks_delta         139
+spec.malloc_bytes_delta          8928
+spec.swapouts_delta              0
+spec.loop_total_steps             14
+spec.loop_early_exit_tokens       0
+spec.loop_gdn_scratch_evals       0
+spec.loop_gdn_final_commits       0
+spec.loop_ple_r0_fills            28
+spec.loop_ple_r_ge1_reuses        0
+spec.loop_ple_r_ge1_nvme_reads    0
+spec.loop_qsa_index_computes      0
+spec.loop_qsa_index_reuses        0
+spec.loop_moe_r_ge1_pinned_routes 0
+spec.loop_moe_r_ge1_cold_stalls   0
+spec.loop_steplora_zero_skips     0
+spec.loop_steplora_active_evals   0
+spec.m7.enc_prefill_dispatches   2
+spec.m7.enc_decode_dispatches    0
+spec.m7.dec_decode_dispatches    28
+spec.ple_nvme_reads              16
+spec.ple_cache_hits              600
+spec.token_ids                   [670, 1924, 825, 1521, 1983, 1140, 76, 1991, 1702, 1173, 382, 1602, 1037, 527, 896]
+spec.text                         v000670 v001924 v000825 v001521 v001983 v001140L v001991 v001702 v001173 v000382 v001602 v001037 v000527 v000896
+```
+
+Strict TB5 RDMA negative gate (`--strict-tb5-rdma` on M4 TB4):
+`./zig-out/bin/aminfer decode --amf /Volumes/Akari/models/amf/synth-deepseek41/model.amf --config /Volumes/Akari/models/amf/synth-deepseek41/config.json --tokenizer /Volumes/Akari/models/amf/synth-deepseek41/tokenizer.json --prompt "hi" --max-tokens 2 --strict-tb5-rdma`
+
+```text
+error: Tb5RdmaUnavailable
+```

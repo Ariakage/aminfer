@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-**M6.9 — single-binary multi-generation Apple Silicon adaptation (`Apple9` + `Apple10+` GPU `NAX` TensorOps, canary-guarded fallback, and chip-parameterized bandwidth/crossover profiles; `G17`, `C16`, Spike `S8`; [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))**: **In progress (code complete; awaiting Apple10+ HW acceptance & Spike S8 bench)** — all host/AIR/`.metallib`/fallback/`ChipProfile`/CLI/`bench-m69` code and M4 (`Apple9`) verification gates are implemented (`3bf7cc4..320791e`), while physical `Apple10+` (M5+) hardware acceptance and `Spike S8` benchmark archiving in [benchmarks/results.md](benchmarks/results.md) remain deferred until an `Apple10+` host is available; next milestone after `Spike S8` is **M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`)**.
+**M7 — Ultra and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md))**: **In progress (engine, kernels, tools, CLI, and 2/4-rank loopback TCP cluster verified on M4; physical multi-Mac TB5 RDMA and full-scale 552B + 196B execution pending hardware)** — all M7 Phase 1 and Phase 2 code (`b2034c2..69d30af`) and M4 (`Apple9`, 24 GiB, TB4) benchmarks and 2-OS-process TCP loopback runs are verified and archived in [benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain deferred until `Apple10+`, `512 GB Ultra`, or multi-Mac TB5 RDMA hardware is available.
 
 ## Milestones
 
@@ -27,7 +27,7 @@ Status-row IDs refer to [status.md](status.md).
 | M6.5 | Continuous batching, long-context KV tiering & zero-copy multimodal ingress | R5, R8, G14, C14 | Server iteration-level continuous batching (`M > 1` slots per GPU/SME2 pass), shared prefix `KvTile`/`GDN` cache, 32K+ GPU `q8` retired KV tier, domain `.ang` packs, and `VideoToolbox → IOSurface → MTLTexture` zero-copy vision/video ingress verified without swap | Completed |
 | M6.8 | Wide-chunk GPU prefill, `prompt_tail` pruning, serving QoS & live-RAM / `.metallib` guards | R9, G15, G16, C15 | Default-on `--gpu-prefill-mode wide\|tree64` (`512+` FlashAttention + `BM=64, BN=64` GEMM, direct `KvTile` write) & lossless `prompt_tail` pruning verified bit-consistent vs `tree64`; single-request wide-prefill/`verifyTree` scratch aliasing; default-on `--decode-share`, `--adaptive-prefill-narrow`, and `--message-boundary-cache` `PrefixCache` checkpoints benchmarked under concurrent load; `HOST_VM_INFO64` non-anonymous live RAM soft cache scaling (`+ --strict-live-ram`) & startup `.metallib` numerical canary (`~0.19–0.24 ms` warm in-buffer / `~1.3–3.8 ms` cold first-submit) + `Apple10` `NAX` hook verified without swap | Completed |
 | M6.9 | Multi-generation Apple Silicon (`Apple9` + `Apple10+` GPU `NAX`) single-binary adaptation | G17, C16 | `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`) `f16`/`bf16` & staged group-64 `q2`/`q3`/`q4` kernels compiled into unified `aminfer.metallib` with lazy `MTL4Compiler` `Apple10`/`Apple11` selection (`--prefill-matmul-backend auto\|simdgroup\|nax`), `G16` canary auto-fallback to `simdgroup_apple9` (`+ --strict-nax`), chip-parameterized `spec_bus_gbs` (`--bus-bandwidth-gbs`), and runtime prefill/draft crossover calibration verified with zero M4 regression (`Apple10+` HW throughput gated on Spike `S8`) | In progress (code complete; awaiting Apple10+ HW acceptance & Spike S8 bench) |
-| M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA expert parallelism verified on 512 GB Ultra or multi-Mac TB5 clusters | Future |
+| M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV (`890 B/tok`), Single-Pass Mega-mHC, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA / TB4 TCP expert parallelism verified on M4 loopback cluster (`b2034c2..69d30af`); physical multi-Mac TB5 RDMA HCA transport and full 552B + 196B execution gated on 512 GB Ultra or multi-Mac TB5 RDMA hardware | In progress (code and M4 loopback cluster verified; 512 GB Ultra / TB5 RDMA HW pending) |
 
 ## Spikes
 
@@ -530,6 +530,16 @@ runs including 3/3 consecutive `bench-m68` executions):
 - [x] M4 (`Apple9`) build, cross-generation `-Dcpu=apple_m1`, `Debug`/`ReleaseSafe`/`ReleaseFast` full & filtered unit tests, Metal API/Shader validation (`0` errors), CLI `probe`/`--help` smoke checks, offline `tools/` tests, and markdown verification (`340/340` Zig tests, `72/72` Python tests)
 - [ ] Physical `Apple10+` (M5+) hardware acceptance and `Spike S8` benchmark run (`aminfer bench-m69` TFLOP/s, `fp32` parity, `G16` canary margins vs offline `metalfe`, and GPU-vs-ANE wavefront prefill crossover) archived in [benchmarks/results.md](benchmarks/results.md)
 
+## M7 task list
+
+- [x] `X1`–`X3` Thunderbolt-peer cluster transport and runtime (`src/cluster/transport.zig`, `src/cluster/expert_parallel.zig`, `src/mem/expert.zig`): runtime `probeTb5Rdma()` (`auto -> tb4_tcp` on M4 TB4, strict `--strict-tb5-rdma` rejection), 16 KiB wired-slab `kqueue` `FrameChannel` (`AMI7` CRC-32), `ExpertPartitionPlan` (`contiguous` / `round-robin`), `PeerWorkerServer`, and overlapped `ExpertParallelCoordinator` (`b2034c2`)
+- [x] `C10` 196B Engram conditional memory store, `D10` `DSparkProposer`, and offline `deepseek41` toolchain (`src/storage/ple.zig`, `src/spec/dspark.zig`, `tools/src/aminfer_tools/deepseek41.py`, `tools/src/aminfer_tools/cli.py`): multi-shard `F_NOCACHE` Engram lookup with `r = 0` single-lookup loop reuse, semi-autoregressive `DSpark` block proposer, and `synth-deepseek41` / `pack-deepseek41` / `partition-experts` CLI with ADR-0015 Tier 3 budget guard (`2abc0fe`, `69d30af`)
+- [x] `R7` / `G11` MLA + CSA2 (`Full` / `Reindex` / `Reuse`) + FP4 (`E2M1` + `E4M3` scale, `890 B/tok`) KV + SWA bounded replay and `G10` Single-Pass Mega-mHC (`mhc_single_pass` / `mhc_post_mix`, Sinkhorn-Knopp Birkhoff) Metal 4 kernels and host arenas (`src/kernels/hybrid_ops.metal`, `src/gpu/hybrid.zig`) (`b17bb9d`, `69d30af`)
+- [x] `W11` / `D10` / `X2` / `X3` engine, speculative, and root/build integration (`src/root.zig`, `build.zig`, `src/model/graph.zig`, `src/spec/{draft,engine}.zig`): `deepseek41` `BackboneKind.causal_enc_dec` two-phase scheduler (`0` encoder dispatches during decode), `AttentionKind.mla_csa2`, `ResidualKind.mhc_single_pass`, `MemoryLookupKind.engram`, `GraphBatchRuntime` (`C14`), `DraftMode.dspark`, `ExpertParallelCoordinator` MoE wiring, and `test-cluster` build step (`7edf3c3`, `0a84cef`)
+- [x] M7 CLI and benchmark harness (`src/main.zig`, `src/bench/runner.zig`): `aminfer peer-worker`, `--peer` / `--rank` / `--world-size` / `--partition` / `--cluster-transport` / `--strict-tb5-rdma` / `--shutdown-peers` and `--draft-mode dspark` across `decode`, `spec-decode`, and `bench-decode`, plus `aminfer bench-m7` covering `R7`/`G11`, `G10` mHC, `C10` Engram, `W11`/`D10` synthetic `deepseek41` CED + `DSpark`, and `X1`–`X3` 2-rank and 4-rank loopback TCP cluster (`b9f8b9d`, `69d30af`)
+- [x] M4 (`Apple9`, 24 GiB, TB4) verification gate, ReleaseFast `aminfer bench-m7`, persistent compact synthetic `deepseek41` bundle (`/Volumes/Akari/models/amf/synth-deepseek41/`, `7.0 MiB`), and live 2-OS-process `peer-worker` + `decode --peer` + `spec-decode --draft-mode dspark` parity check archived in [benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)
+- [ ] Physical multi-Mac Thunderbolt 5 RDMA HCA transport acceptance (`X1`–`X3`) and full-scale `552B + 196B` `DeepSeek-V4.1-Flash-1017` (`W11`) execution on a 512 GB Apple Silicon Ultra node or multi-Mac TB5 RDMA cluster
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -578,6 +588,8 @@ Only checks that actually ran are listed.
 | 2026-11-22 | M6.8 Phase 2, audit remediation & final gate (`f70becf`, `ad3ee7f`, `2063bc9`, `2b9312d`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug/ReleaseFast), `zig build test` (Debug, ReleaseSafe, ReleaseFast: `327/327` = `320` lib + `7` CLI, incl. `R = 3` QSA sparse `tail_m1_last` + PLE Isolation #2/#3 regression test and `autoClampServeBatchSlots` tests), filtered `test-vision` (`11/11`), `test-hybrid` (`16/16`), and `test-sme` (`10/10`) in Debug and ReleaseSafe, direct Debug `test-vision` (`11/11`), `test-hybrid` (`16/16`), `test-sme` (`10/10`), lib (`320/320`), and CLI (`7/7`) binaries under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (Metal API + GPU Validation enabled, `0` errors), `tools` unittest (`72/72`), ReleaseFast `aminfer probe` (`supports_apple10=no`, `simdgroup_apple9`, `live_zero_swap_reclaimable_mib=10053`, `canary.cold_elapsed_us=2132.5`, `canary.warm_inbuf_elapsed_us=219.0`), 3/3 consecutive ReleaseFast `aminfer bench-m68` runs (`1.72x–3.91x` wide+pruning across 6 real + 1 synth rows, `100%` greedy match, `R9`-gated `EAGLE-3` `cold_exp=66/41/96` with `greedy_match=yes` & `malloc_blk=0`, QoS `p50` `103.7x` / `p99` `1.47x` with `narrowed_chunks=3`, ChatML boundary `6.37x` TTFT, soft cache `64 -> 16`, `--strict-live-ram` rejection, `infer_swapouts_delta=0`, `total_swapouts_delta=0` on 3/3 runs), standalone `aminfer bench-decode` `tree64` vs `wide` A/B (`0.6B` `2.44x`, `14B` `2.24x`, `30B-A3B` `1.27x`, `-37..-39 MiB` wired, `0` swapouts), and live `aminfer serve` HTTP/SSE with default `--max-active-requests` at `--max-seq-len 10240 --prefix-cache-chunks 16` (`max_batch_size=2`, `3,534 MiB` wired, `Turn 1 -> 2` `11.06x` TTFT, `boundary_hits=1`, `evict_first_evictions=1`, `qos_steps=decode=210 prefill=4 narrowed_chunks=1`, `0` swapouts) archived in [benchmarks/results.md](benchmarks/results.md#m68-wide-chunk-gpu-prefill-prompt_tail-pruning-serving-qos-live-ram-admission-and-metallib-canary) | Pass |
 | 2026-11-22 | M6.9 Phase 1 (`3bf7cc4`, `76e08c7`): `C16` `ChipProfile` (`sysinfo`, `chip_profile`, `attention`, `wavefront`, `sme`, `draft`) and `G17` Metal 4 `NAX` TensorOps (`nax_tensorops.metal` compiled into unified `aminfer.metallib` with `-std=metal4.0 -Wall -Werror`, `Apple7..11` probe + `Library.hasFunction`, lazy `*_nax` PSOs & canary auto-demotion in `dequant.zig`) | Pass |
 | 2026-11-22 | M6.9 Phase 2 code & M4 (`Apple9`) verification gate (`4fcfc0c`, `320791e`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug) & `zig build -Dcpu=apple_m1`, `zig build test` (Debug, ReleaseSafe, ReleaseFast: `340/340` = `332` lib + `8` CLI), filtered `test-vision` (`12/12`), `test-hybrid` (`17/17`), and `test-sme` (`11/11`) in Debug and ReleaseSafe, direct Debug binaries (`lib` `332/332`, `CLI` `8/8`, `test-vision` `12/12`, `test-hybrid` `17/17`, `test-sme` `11/11`) under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (Metal API + GPU Validation enabled, `0` errors), `./zig-out/bin/aminfer --help` & `./zig-out/bin/aminfer probe` (`chip.generation=m4`, `chip.spec_bus_gbs=120.00`, `gpu.apple_family=9`, `gpu.supports_nax=no`, `metallib.has_*_nax=yes`, `gpu.nax_fallback_reason=unsupported_gpu_family`, plus `--bus-bandwidth-gbs 546 --prefill-matmul-backend simdgroup` override check), `tools` unittest (`72/72`), and markdown link/anchor/hygiene audit across all 38 `.md` files (`Spike S8` physical `Apple10+` hardware bench deferred) | Pass (M4 code/unit gate; Apple10+ Spike S8 pending) |
+| 2026-11-23 | M7 Phase 1 (`b2034c2`, `2abc0fe`, `b17bb9d`, `7edf3c3`): TB4 TCP / runtime TB5 RDMA-probed `kqueue` cluster transport & `ExpertParallelCoordinator`/`PeerWorkerServer` (`X1`–`X3`), `C10` 196B Engram store & `D10` `DSparkProposer` + `tools` `deepseek41` converter/partitioner (`W11`), Metal 4 `R7`/`G11` MLA+CSA2 FP4 (`890 B/tok`) KV + SWA replay & `G10` Single-Pass Mega-mHC kernels, and `src/root.zig` / `build.zig` `test-cluster` exports | Pass |
+| 2026-11-23 | M7 Phase 2 engine, CLI, loopback cluster & M4 verification gate (`0a84cef`, `b9f8b9d`, `69d30af`): `zig fmt --check build.zig src`, `0` `catch {}`, `zig build` (Debug) & `zig build -Dcpu=apple_m1`, `zig build test` (Debug, ReleaseSafe, ReleaseFast: `365/365` = `356` lib + `9` CLI), filtered Debug `test-vision` (`12/12`), `test-hybrid` (`20/20`), `test-sme` (`11/11`), and `test-cluster` (`21/21`), direct Debug binaries (`lib` `356/356`, `CLI` `9/9`, `test-vision` `12/12`, `test-hybrid` `20/20`, `test-sme` `11/11`, `test-cluster` `21/21`) under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`0` Metal validation errors), `tools` unittest (`81/81`), generated compact synthetic `deepseek41` bundle (`/Volumes/Akari/models/amf/synth-deepseek41/`, `7.0 MiB`, `verify-amf` OK on backbone, 2 Engram shards, and `dspark.amf`), ReleaseFast `aminfer bench-m7` (`890 B/tok` `3.51x`/`81.1x`, `66.7%` 3-layer CSA2 KV savings, Mega-mHC `31.85 GB/s` at `M=64`, Engram `7.47 -> 0.82 -> 0.49 us` / `0` `r>=1` SSD reads, synthetic CED `341.26 tok/s` & `DSpark` `greedy_match=yes` with `0` encoder decode dispatches, `tb5_rdma_hw=unavailable` -> `tb4_tcp` & `strict_tb5_reject=pass`, 2-rank CED `greedy_match=yes` at `118.73 us` RPC, 4-rank MoE `0.000000` max error at `121.20 us` RPC, `swapouts_delta=0`), and live 2-OS-process `peer-worker` (Rank 1) + `decode --peer` (Rank 0) + `spec-decode --draft-mode dspark` (`15/15` bit-exact greedy token parity across all three, `0` encoder decode dispatches, `swapouts_delta=0`, `--strict-tb5-rdma` returning `Tb5RdmaUnavailable`) archived in [benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster); physical multi-Mac TB5 RDMA and full `552B + 196B` execution deferred pending hardware | Pass (M4 code, bench-m7 & 2-process loopback gate; 512 GB Ultra / TB5 RDMA HW pending) |
 
 The measured platform facts are collected in
 [architecture/hardware.md](architecture/hardware.md).
@@ -651,7 +663,7 @@ hardware measurements gated on Spike `S8`).
 
 Update this before the context window runs out or when handing off.
 
-- Last updated: 2026-11-22
+- Last updated: 2026-11-23
 - Commits so far:
   - M0: `1ad0da8` AGENTS.md, `6d5053d` license, `3a573a5` docs baseline,
     `0518ea8` build graph and probe, `06e8656` wired regions, `e6c9221`
@@ -772,15 +784,29 @@ Update this before the context window runs out or when handing off.
     backend options, canary demotion & wavefront routing, `320791e` CLI flags,
     enhanced `probe` telemetry, `spec_bus_gbs` benchmark wiring & `bench-m69`
     harness
-- Current test & build baseline (`M0`–`M6.8` complete, `M6.9` code complete, `0` `catch {}`):
-  - Zig suite: `340/340` passing (`332` lib + `8` CLI) in `Debug`,
+  - M7 (engine, kernels, tools, CLI & loopback TCP cluster verified on M4;
+    physical multi-Mac TB5 RDMA & full 552B + 196B pending hardware):
+    `b2034c2` TB4 TCP / runtime TB5 RDMA-probed transport & multi-rank
+    `ExpertParallelCoordinator`/`PeerWorkerServer` (`X1`–`X3`), `2abc0fe` 196B
+    Engram store, `DSparkProposer` & `deepseek41` offline toolchain (`C10`,
+    `D10`, `W11`), `b17bb9d` Metal 4 MLA+CSA2 FP4 (`890 B/tok`) KV, SWA replay
+    & Single-Pass Mega-mHC kernels (`R7`, `G10`, `G11`), `7edf3c3` root module
+    exports & `test-cluster` build step, `0a84cef` `GraphModel` `deepseek41`
+    CED two-phase scheduler, MLA+CSA2, Mega-mHC, Engram, `DSpark` & cluster
+    coordinator integration, `b9f8b9d` `peer-worker` CLI, cluster flags,
+    `--draft-mode dspark`, MLA loop-commit fix & `bench-m7` suite, `69d30af`
+    tree SWA ring FP4 fallback alignment, Engram layer regex & chunked
+    `bench-m7` KV fill
+- Current test & build baseline (`M0`–`M6.8` complete, `M6.9` code complete,
+  `M7` code & M4 loopback cluster verified, `0` `catch {}`):
+  - Zig suite: `365/365` passing (`356` lib + `9` CLI) in `Debug`,
     `ReleaseSafe`, and `ReleaseFast`; `-Dcpu=apple_m1` build passing; filtered
-    `test-vision` (`12/12`), `test-hybrid` (`17/17`), and `test-sme` (`11/11`)
-    passing in `Debug` and `ReleaseSafe`; direct Debug binaries under
-    `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`test-vision` `12/12`,
-    `test-hybrid` `17/17`, `test-sme` `11/11`, lib `332/332`, CLI `8/8`,
-    `0` validation errors)
-  - Offline Python `tools/` suite: `72/72` passing (`cd tools && uv run python -m unittest discover -s tests`)
+    `test-vision` (`12/12`), `test-hybrid` (`20/20`), `test-sme` (`11/11`), and
+    `test-cluster` (`21/21`) passing in `Debug`; direct Debug binaries under
+    `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` (`lib` `356/356`, `CLI` `9/9`,
+    `test-vision` `12/12`, `test-hybrid` `20/20`, `test-sme` `11/11`,
+    `test-cluster` `21/21`, `0` validation errors)
+  - Offline Python `tools/` suite: `81/81` passing (`cd tools && uv run python -m unittest discover -s tests`)
 - On-disk checkpoints & artifacts (strict rule: keep all `.amf`/`.ang`/`.mlpackage`
   and `TMPDIR` work on `/Volumes/Akari/models/` and `/Volumes/Akari/.tmp/`, never
   on `/` or `/tmp`):
@@ -793,8 +819,11 @@ Update this before the context window runs out or when handing off.
     `qwen3-30b-a3b-3bit.amf` (`12.45 GiB`), `qwen3-30b-a3b-gsq-rco.amf`
     (`9.599 GiB` wired, `2.700b` heat-guided GSQ+RCO),
     `qwen3-30b-a3b-eagle3.amf` (`996 MiB`), `qwen3-30b-a3b-heat.json`,
-    `aminfer-repo.ang` (`128.02 MiB`, `879,949` repo N-grams), and
-    `aminfer-docs.ang` (`32.02 MiB`, `198,113` docs N-grams, `table_crc32=0xc1f2f6ed`)
+    `aminfer-repo.ang` (`128.02 MiB`, `879,949` repo N-grams),
+    `aminfer-docs.ang` (`32.02 MiB`, `198,113` docs N-grams, `table_crc32=0xc1f2f6ed`),
+    and `/Volumes/Akari/models/amf/synth-deepseek41/` (`7.0 MiB` compact
+    synthetic `deepseek41` CED bundle: `model.amf`, 2 Engram shards,
+    `dspark.amf`, `config.json`, `dspark_config.json`, `tokenizer.json`)
   - Exported ANE `.mlpackage` bundles: `/Volumes/Akari/models/coreml/`
 - Session & `/swarm` operating conventions:
   - Swarm models restricted per user instruction to `gemini-4-carbon-*` and
@@ -803,13 +832,14 @@ Update this before the context window runs out or when handing off.
     every commit
 - In flight: **M6.9** (`G17`, `C16`, Spike `S8` per
   [ADR-0021](decisions/0021-multi-generation-apple-silicon-and-nax-tensorops.md))
-  code & M4 (`Apple9`) verification gates complete; physical `Apple10+` (M5+)
-  hardware acceptance and `Spike S8` (`aminfer bench-m69`) benchmark archive in
-  [benchmarks/results.md](benchmarks/results.md) deferred until an `Apple10+`
-  host is available. Next milestone after `Spike S8` is **M7** covering Ultra
-  and cluster scale-out (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC,
-  `G11`, `D10`, `C10` Engram, and `X1`–`X3` per
-  [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md))
+  and **M7** (`R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3` per
+  [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md) and
+  [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernel,
+  tool, CLI, and M4 loopback verification gates are complete. Remaining
+  hardware-gated acceptances are physical `Apple10+` (M5+) `Spike S8`
+  (`aminfer bench-m69`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`),
+  and full-scale `552B + 196B` `DeepSeek-V4.1-Flash-1017` (`W11`) execution on
+  a 512 GB Ultra node or multi-Mac TB5 RDMA cluster
 - Awaiting the user: nothing
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [architecture/model-roadmap.md](architecture/model-roadmap.md),
