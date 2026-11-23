@@ -192,9 +192,11 @@ chunk.
   startup).
 - Planned Milestone M7.8 native kernel optimizations
   ([ADR-0023](../decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md);
-  status rows `G18`–`G21`, `C23`–`C24` in [../status.md](../status.md)) further
+  status rows `W20`, `G18`–`G22`, `C23`–`C24` in [../status.md](../status.md)) further
   reduce per-layer `MTLStageDispatch` barriers via fused residual/RMSNorm/QKV/SwiGLU
-  kernels, stage `simdgroup_matrix`/`NAX` tiles in FlashAttention-2 prefill,
+  kernels, stage `simdgroup_matrix`/`NAX` tiles in causal and bidirectional ViT
+  FlashAttention-2 prefill, execute full multi-layer `ViT` vision towers and
+  2-layer `PatchMerger`/`Aligner` MLPs over zero-copy `G14` `IOSurface` frames,
   drive `M > 1` / multi-scheme MoE buckets via GPU indirect threadgroup
   dispatch, move `151K–248K`-vocab constrained sampling onto a two-pass GPU
   radix sampler, and vectorize JSON/BPE scanning (`NEON`) and `2-bit`

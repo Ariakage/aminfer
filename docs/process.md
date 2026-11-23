@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-**M7.8 (`G18`–`G21`, `C23`–`C24`; [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))**: **Planned next** — **M7.8** delivers native Metal 4 sublayer/epilogue fusion (`4–5` fewer dispatch barriers/layer), hardware `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE threadgroup dispatch, fused `248K`-vocab GPU radix constrained sampling + ARM64 NEON JSON/BPE vector scanning, and ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels, gated by explicit occupancy/crossover non-regression checks. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)) is **Completed** and verified on M4 ([benchmarks/results.md](benchmarks/results.md#m75-native-cpython-sdk-full-httpsse-protocol-parity-rootless-tui-monitor-and-local-ergonomics)). **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
+**M7.8 (`W20`, `G18`–`G22`, `C23`–`C24`; [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))**: **Planned next** — **M7.8** delivers native Metal 4 sublayer/epilogue fusion (`4–5` fewer dispatch barriers/layer), hardware `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE threadgroup dispatch, fused `248K`-vocab GPU radix constrained sampling + ARM64 NEON JSON/BPE vector scanning, ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels, and full multi-layer Vision Transformer (`ViT`) tower + 2-layer `PatchMerger`/`Aligner` MLP packing and Metal 4 / CoreML ANE execution (`W20`, `G22`), gated by explicit occupancy/crossover non-regression checks. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)) is **Completed** and verified on M4 ([benchmarks/results.md](benchmarks/results.md#m75-native-cpython-sdk-full-httpsse-protocol-parity-rootless-tui-monitor-and-local-ergonomics)). **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
 
 ## Milestones
 
@@ -29,7 +29,7 @@ Status-row IDs refer to [status.md](status.md).
 | M6.9 | Multi-generation Apple Silicon (`Apple9` + `Apple10+` GPU `NAX`) single-binary adaptation | G17, C16 | `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`) `f16`/`bf16` & staged group-64 `q2`/`q3`/`q4` kernels compiled into unified `aminfer.metallib` with lazy `MTL4Compiler` `Apple10`/`Apple11` selection (`--prefill-matmul-backend auto\|simdgroup\|nax`), `G16` canary auto-fallback to `simdgroup_apple9` (`+ --strict-nax`), chip-parameterized `spec_bus_gbs` (`--bus-bandwidth-gbs`), and runtime prefill/draft crossover calibration verified with zero M4 regression (`Apple10+` HW throughput gated on Spike `S8`) | In progress (code complete; awaiting Apple10+ HW acceptance & Spike S8 bench) |
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV (`890 B/tok`), Single-Pass Mega-mHC, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA / TB4 TCP expert parallelism verified on M4 loopback cluster (`b2034c2..69d30af`); physical multi-Mac TB5 RDMA HCA transport and full 552B + 196B execution gated on 512 GB Ultra or multi-Mac TB5 RDMA hardware | In progress (code and M4 loopback cluster verified; 512 GB Ultra / TB5 RDMA HW pending) |
 | M7.5 | Native C/Python SDK, full HTTP/SSE protocol parity, rootless TUI monitor & local ergonomics | R10, W18, W19, C17–C22 | `libaminfer.dylib` + `include/aminfer.h` + zero-dependency Python `ctypes` SDK (`python/aminfer/`); full `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (+ `count_tokens`, `--api-key`, `--unix-socket`); rootless `aminfer monitor` TUI (`trans-pride` + `--theme`); single-file `.amf` metadata (`ls`/`inspect`); scrolling `aminfer chat` REPL + `stdin` pipe; `/v1/embeddings` & `/v1/rerank`; zero-alloc `json_schema`/GBNF bitmask engine; runtime multi-LoRA routing; opt-in `--disk-prefix-cache` NVMe persistence verified with zero hot-path alloc and zero swap | Completed |
-| M7.8 | Native Metal 4 sublayer barrier fusion, MMA FlashAttention-2, GPU indirect MoE dispatch & NEON/SME2 accelerators | G18–G21, C23–C24 | Fused `o_proj`/`down_proj` `+= residual` epilogues, `ami_fused_residual_rmsnorm`, and homogeneous-`DType` `ami_fused_qkv` + `ami_dense_gate_up_swiglu` (`0` stack spill); `simdgroup_half8x8` (`Apple9`) + `NAX` (`Apple10+`) FlashAttention-2 prefill (`Q_len >= 32`, `KV_len >= 64` gated); `MTLDispatchThreadgroupsIndirectArguments` MoE dispatch (`M > 1` & multi-scheme `G13`); fused `248K`-vocab GPU radix constrained sampler + 16/64-byte NEON JSON/BPE scanning; ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels (`0` `[sp` spills) benchmarked in `aminfer bench-m78` with zero M4 decode/prefill regression and zero swap | Planned |
+| M7.8 | Native Metal 4 sublayer barrier fusion, MMA FlashAttention-2, GPU indirect MoE dispatch, full ViT vision encoder tower & NEON/SME2 accelerators | W20, G18–G22, C23–C24 | Fused `o_proj`/`down_proj` `+= residual` epilogues, `ami_fused_residual_rmsnorm`, and homogeneous-`DType` `ami_fused_qkv` + `ami_dense_gate_up_swiglu` (`0` stack spill); `simdgroup_half8x8` (`Apple9`) + `NAX` (`Apple10+`) FlashAttention-2 prefill (`Q_len >= 32`, `KV_len >= 64` gated); `MTLDispatchThreadgroupsIndirectArguments` MoE dispatch (`M > 1` & multi-scheme `G13`); fused `248K`-vocab GPU radix constrained sampler + 16/64-byte NEON JSON/BPE scanning; ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels (`0` `[sp` spills); full multi-layer bidirectional 2D-RoPE `ViT` tower + 2-layer `PatchMerger`/`Aligner` MLP + AnyRes tiling (`W20`, `G22`) benchmarked in `aminfer bench-m78` with zero M4 decode/prefill regression and zero swap | Planned |
 
 ## Spikes
 
@@ -681,13 +681,15 @@ speculative tree verification (`C22`), runtime multi-LoRA hot-loading and
 KV/GDN persistence (`R10`), explicitly excluding audio/speech ingress.
 On the same date, the user confirmed
 [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md),
-scheduling Milestone **M7.8** (`G18`–`G21`, `C23`–`C24`) for native Metal 4
+scheduling Milestone **M7.8** (`W20`, `G18`–`G22`, `C23`–`C24`) for native Metal 4
 sublayer fusion and `MTLStageDispatch` barrier elimination (`G18`), hardware
 `simdgroup_half8x8` (`Apple9` MMA) and `Apple10+` `NAX` FlashAttention-2
 prefill (`G19`), GPU-driven indirect MoE threadgroup dispatch (`G20`), fused
 GPU `248K`-vocab radix/bucket constrained sampling (`G21`) paired with explicit
-ARM64 NEON JSON/BPE vector scanning (`C23`), and ARMv9.2 SME2 `luti2` (`2-bit`)
-assembly microkernels (`C24`), alongside strict zero-overhead fast paths and
+ARM64 NEON JSON/BPE vector scanning (`C23`), ARMv9.2 SME2 `luti2` (`2-bit`)
+assembly microkernels (`C24`), and full multi-layer Vision Transformer (`ViT`)
+encoder tower + 2-layer `PatchMerger`/`Aligner` MLP packing and Metal 4 / CoreML
+ANE execution (`W20`, `G22`), alongside strict zero-overhead fast paths and
 occupancy/crossover non-regression gates across `M7.5` and `M7.8`.
 
 On the same date, Milestone **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`,
@@ -902,10 +904,11 @@ Update this before the context window runs out or when handing off.
     `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: **M7.8** (`G18`–`G21`, `C23`–`C24`: Metal 4 sublayer barrier fusion,
-  `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE dispatch,
-  fused `248K`-vocab GPU radix constrained sampler + NEON JSON/BPE scanners, and
-  ARMv9.2 SME2 `luti2` `2-bit` `.s` microkernels per
+- In flight: **M7.8** (`W20`, `G18`–`G22`, `C23`–`C24`: Metal 4 sublayer barrier
+  fusion, `simdgroup_matrix`/`NAX` FlashAttention-2 prefill, GPU indirect MoE
+  dispatch, fused `248K`-vocab GPU radix constrained sampler + NEON JSON/BPE
+  scanners, ARMv9.2 SME2 `luti2` `2-bit` `.s` microkernels, and full multi-layer
+  bidirectional 2D-RoPE `ViT` tower + 2-layer `PatchMerger`/`Aligner` MLP per
   [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))
   is codified and planned next on M4. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`
   per [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md))
