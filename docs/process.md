@@ -7,7 +7,7 @@ lives in [status.md](status.md); decisions live in
 
 ## Current focus
 
-**M7.8 (`W20`, `G18`–`G22`, `C23`–`C24`; [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))**: **Completed** on M4 ([benchmarks/results.md](benchmarks/results.md#m78-native-kernel-barrier-fusion-mma-flashattention-and-simd-accelerators)); `Apple10+` `NAX` FlashAttention-2 hardware benchmarking remains gated on physical `Apple10+` silicon in Spike `S8`. **M8** (`W21`–`W24`, `G23`–`G25`, `D14`, `C25`–`C26`; [ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md)) is **Planned next** for zero-loss native `FP8`/`MXFP8`/`NVFP4`/`MLX`/`GGUF` compatibility, end-to-end `Inkling-2-Mini` on `24 GB` M4, and `Inkling 2` / `Hy4` family operators + `DFlare`/`DFly2` drafting. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)) is **Completed** and verified on M4 ([benchmarks/results.md](benchmarks/results.md#m75-native-cpython-sdk-full-httpsse-protocol-parity-rootless-tui-monitor-and-local-ergonomics)). **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`, `G19` NAX HW), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
+**M7.8 (`W20`, `G18`–`G22`, `C23`–`C24`; [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))**: **Completed** on M4 ([benchmarks/results.md](benchmarks/results.md#m78-native-kernel-barrier-fusion-mma-flashattention-and-simd-accelerators)); `Apple10+` `NAX` FlashAttention-2 hardware benchmarking remains gated on physical `Apple10+` silicon in Spike `S8`. **M8** ([ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md)) is **Planned next** in two sequential sub-milestones — **M8.1** (`W21`, `W22`, `W24`, `G23`, `G24`, `C25`: zero-loss native `FP8`/`MXFP8`/`NVFP4`/`MLX`/`GGUF` substrate, pure-stdlib `GGUF` streaming repacker, multi-dialect tokenizers + declarative `.amf` JSON `ChatTemplate` state machine, and `KL`/top-1 quality gate) followed by **M8.2** (`W23`, `G25`, `D14`, `C26`: `Inkling 2` and `Hy4` operators, `DFlare`/`DFly2` block-parallel draft heads, NVMe cold-expert/Engram placement, and end-to-end `Inkling-2-Mini` + `hy4-preview-tiny-random` runs on `24 GB` M4) — currently paused awaiting user disk cleanup on `/Volumes/Akari`. **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`; [ADR-0022](decisions/0022-native-c-python-sdk-and-full-protocol-parity.md)) is **Completed** and verified on M4 ([benchmarks/results.md](benchmarks/results.md#m75-native-cpython-sdk-full-httpsse-protocol-parity-rootless-tui-monitor-and-local-ergonomics)). **M7** (`DeepSeek-V4.1-Flash-1017`, `R7`, `W11`, `G10` mHC, `G11`, `D10`, `C10` Engram, `X1`–`X3`; [ADR-0015](decisions/0015-tiered-frontier-model-roadmap.md), [ADR-0003](decisions/0003-expert-source-tagged-union.md)) engine, kernels, tools, CLI, live HF metadata dry-run validation (`cd72273`), and 2/4-rank loopback TCP cluster runs are verified on M4 ([benchmarks/results.md](benchmarks/results.md#m7-ultra-and-cluster-scale-out-deepseek41-ced-mlacsa2-fp4-mega-mhc-engram-dspark-and-loopback-tcp-cluster)); physical `Apple10+` Spike `S8` acceptance (`M6.9`, `G19` NAX HW), physical multi-Mac TB5 RDMA HCA transport (`X1`–`X3`), and full-scale `552B + 196B` `deepseek41` execution (`W11`) remain gated on hardware.
 
 ## Milestones
 
@@ -30,7 +30,8 @@ Status-row IDs refer to [status.md](status.md).
 | M7 | Ultra & cluster scale-out (`DeepSeek-V4.1-Flash-1017`) | R7, W11, G10 (mHC), G11, D10, C10 (Engram), X1–X3 | Causal Encoder-Decoder scheduler, MLA/CSA2 + FP4 KV (`890 B/tok`), Single-Pass Mega-mHC, 196B Engram lookup, DSpark drafting and Thunderbolt 5 RDMA / TB4 TCP expert parallelism verified on M4 loopback cluster (`b2034c2..69d30af`); physical multi-Mac TB5 RDMA HCA transport and full 552B + 196B execution gated on 512 GB Ultra or multi-Mac TB5 RDMA hardware | In progress (code and M4 loopback cluster verified; 512 GB Ultra / TB5 RDMA HW pending) |
 | M7.5 | Native C/Python SDK, full HTTP/SSE protocol parity, rootless TUI monitor & local ergonomics | R10, W18, W19, C17–C22 | `libaminfer.dylib` + `include/aminfer.h` + zero-dependency Python `ctypes` SDK (`python/aminfer/`); full `/v1/chat/completions`, `/v1/responses`, `/v1/messages` (+ `count_tokens`, `--api-key`, `--unix-socket`); rootless `aminfer monitor` TUI (`trans-pride` + `--theme`); single-file `.amf` metadata (`ls`/`inspect`); scrolling `aminfer chat` REPL + `stdin` pipe; `/v1/embeddings` & `/v1/rerank`; zero-alloc `json_schema`/GBNF bitmask engine; runtime multi-LoRA routing; opt-in `--disk-prefix-cache` NVMe persistence verified with zero hot-path alloc and zero swap | Completed |
 | M7.8 | Native Metal 4 sublayer barrier fusion, MMA FlashAttention-2, GPU indirect MoE dispatch, full ViT vision encoder tower & NEON/SME2 accelerators | W20, G18–G22, C23–C24 | Fused `o_proj`/`down_proj` `+= residual` epilogues, `ami_fused_residual_rmsnorm`, and homogeneous-`DType` `ami_fused_qkv` + `ami_dense_gate_up_swiglu` (`0` stack spill); `simdgroup_half8x8` (`Apple9`) + `NAX` (`Apple10+`) FlashAttention-2 prefill (`Q_len >= 32`, `KV_len >= 64` gated); `MTLDispatchThreadgroupsIndirectArguments` MoE dispatch (`M > 1` & multi-scheme `G13`); fused `248K`-vocab GPU radix constrained sampler + 16/64-byte NEON JSON/BPE scanning; ARMv9.2 SME2 `luti2` (`2-bit`) `.s` microkernels (`0` `[sp` spills); full multi-layer bidirectional 2D-RoPE `ViT` tower + 2-layer `PatchMerger`/`Aligner` MLP + AnyRes tiling (`W20`, `G22`) benchmarked in `aminfer bench-m78` with zero M4 decode/prefill regression and zero swap | Completed (M4 verified; Apple10+ NAX HW pending Spike S8) |
-| M8 | Zero-loss quantized-format parity (`FP8`/`MXFP8`/`NVFP4`/`GGUF`/`MLX`), `Inkling-2-Mini` on `24 GB` M4, and `Inkling 2` + `Hy4` family adaptation | W21–W24, G23–G25, D14, C25–C26 | Native `.amf` dtypes & register-dequant Metal/`SME2` kernels (`fp8_e4m3_block`/`_row`/`_tensor`, `mxfp8_g32`, `nvfp4_g16`, MLX `5/6/8-bit` `g32`/`g128`); lossless offline `GGUF` -> `.amf` repacker rejecting colliding fork type IDs (`STQ1_0` vs `F8_E4M3`); opt-in `--act-quant emulate` & `W24` `KL`/top-1 quality gate; `o200k`/`ignore_merges` + `Hy4` tokenizers and pluggable `ChatTemplate` replacing hardcoded ChatML; `Inkling-2-Mini` end-to-end on `24 GB` M4 (`<= 17.76 GiB` wired + cold-expert NVMe, `0` swap); `Inkling 2` & `Hy4` operators (`sconv`, low-rank rel-attn, softcaps, `IndexCache`/`IndexPool`, `LatentMoE`, `DFlare`/`DFly2`) verified on `hy4-preview-tiny-random` & synthetic suites (`Small`/`Hy4`/`Hy4-flash` full runs hardware-gated) | Planned |
+| M8.1 | Zero-loss multi-format quantization substrate (`FP8`/`MXFP8`/`NVFP4`/`GGUF`/`MLX`), tokenizers, declarative `ChatTemplate`, and `KL` quality gate | W21, W22, W24, G23, G24, C25 | Native `.amf` dtypes & register-dequant Metal/`SME2` kernels (`fp8_e4m3_block`/`_row`/`_tensor`, `mxfp8_g32`, `nvfp4_g16`, MLX `5/6/8-bit` `g32`/`g128`, GGUF `Q*`/`K`/`IQ*`/`TQ*`/`MXFP4`/`Q2_0`, `M = 1` bus-% gated vs `q4_affine`); bounded-disk stream packing & lossless pure-stdlib `GGUF` -> `.amf` repacker rejecting colliding fork type IDs (`STQ1_0` vs `F8_E4M3`); opt-in `--act-quant emulate`; `o200k`/`ignore_merges` + `Hy4` tokenizers; offline-compiled declarative `.amf` JSON `chat_template_spec` + zero-alloc Zig state-machine `ChatTemplate` replacing hardcoded ChatML; `W24` `KL`/top-1/code-math quality gate | Planned |
+| M8.2 | `Inkling 2` and `Hy4` family operators, `DFlare`/`DFly2` block-parallel draft heads, and `Inkling-2-Mini` + `hy4-preview-tiny-random` on `24 GB` M4 | W23, G25, D14, C26 | `Inkling 2` (`inkling2`, `inkling2_loop`: `k=4` `sconv`, low-rank rel-attn, `q/rel_l2_clip`, `attn_sink_proj`, `gate_attn`, `attn_res`, softcaps `4`/`25`/`30`, `route_scale`, `23L` ViT) and `Hy4` (`hy_v4*`: `IndexCache` period-4, `IndexPool`, `LatentMoE`, sigmoid + correction-bias routing, `linear_gate`, `learnable_sink_param`, `swiglu_limit=10`, `sandwich_norm`, per-row `F8_E4M3` Engram NVMe streaming, `40L`/`27L` AnyRes ViT) operators; `DFlare` (`block_size=8`) & `DFly2` (`block_size=7`) draft heads (`D14`); end-to-end `Inkling-2-Mini` (`<= 17.76 GiB` wired + cold-expert NVMe, `0` swap) & `hy4-preview-tiny-random` verified on `24 GB` M4 (`Small`/`Hy4`/`Hy4-flash` full runs hardware-gated) | Planned |
 
 ## Spikes
 
@@ -552,6 +553,19 @@ runs including 3/3 consecutive `bench-m68` executions):
 - [x] M7.8 Phase 2 integration (`root.zig`, `Qwen3Model`, `GraphModel` aliased ViT scratch via `WiredArena.allocAliasedPair` + `initTextOnly`, `lora.zig`, `C22` speculative tree bitmask propagation in `draft.zig`/`accept.zig`/`dspark.zig`/`engine.zig`, `c_api.zig`), M4 zero-regression `G18` shape calibration (`qkv_min_m=64`, `swiglu_min_m=32`, residual `M==1 || M>=64`), and ReleaseFast `aminfer bench-m78` archived in [benchmarks/results.md](benchmarks/results.md#m78-native-kernel-barrier-fusion-mma-flashattention-and-simd-accelerators) (`0de204b`, `5345566`)
 - [ ] Physical `Apple10+` `NAX` FlashAttention-2 hardware throughput bench (gated on `Apple10+` silicon in Spike `S8`)
 
+## M8.1 task list
+
+- [ ] `W21` native `.amf` dtypes (`fp8_e4m3_block`/`_row`/`_tensor`, `mxfp8_g32`, `nvfp4_g16`, MLX `q5`/`q6`/`q8` + `g32`/`g128`), bounded-disk / HTTP Range stream packing, and imatrix-aware GSQ+RCO source protection
+- [ ] `W22` pure-stdlib lossless offline `GGUF` -> `.amf` streaming repacker (`tools/src/aminfer_tools/gguf.py`) with offset-derived byte-length fork guard (rejecting colliding `STQ1_0` vs `F8_E4M3 = 43`, `VQ-GGUF`, `EXL3`), `mmproj` -> `W20`, and `arch=dflash` draft extraction
+- [ ] `G23`, `G24` & `C25` bit-exact Metal 4 register-dequant GEMV/MoE + tiled `fp16` prefill kernels, opt-in `--act-quant emulate`, and ARMv9.2 SME2 `.s` `E2M1`/`Q2_0`/`TQ`/`IQ2` microkernels (`0` `[sp` spills, `M = 1` bus-% gated)
+- [ ] `W24` `o200k`/`ignore_merges` + `Hy4` `<｜hy_*｜>` tokenizers, offline-compiled declarative `.amf` JSON `chat_template_spec` + deterministic zero-alloc Zig state-machine `ChatTemplate` renderer across CLI/server/SDK/bench, and `KL`/top-1/code-math quality-gate harness
+
+## M8.2 task list
+
+- [ ] `W23` & `G25` `Inkling 2` (`inkling2`, `inkling2_loop`) and `Hy4` (`hy_v4`, `hy_v4_vl`, `hy_v4_flash`) `.amf` converters and Metal 4 operator suite (`k=4` `sconv`, low-rank rel-attn, `q/rel_l2_clip`, `attn_sink_proj`/`learnable_sink_param`, `gate_attn`/`linear_gate`, `attn_res`/cross-pass controllers, softcaps/`swiglu_limit`, `IndexCache`/`IndexPool`, `LatentMoE`, `sandwich_norm`, `ViT` wiring)
+- [ ] `D14` block-parallel speculative draft heads (`Inkling 2` `DFlare` `block_size=8` + standalone `dflash` GGUF and `Hy4` `DFly2` `block_size=7`) wired into `DraftSource` + `G5`/`D9`
+- [ ] `C26` cold-expert NVMe `F_NOCACHE` placement for `Inkling-2-Mini` (`24 GB` M4 `<= 17.76 GiB` wired fit, `0` swap) and `Hy4-flash` per-row `F8_E4M3` Engram NVMe streaming, plus end-to-end local verification on `Inkling-2-Mini` and `yujiepan/hy4-preview-tiny-random` (`Small`/`Hy4`/`Hy4-flash` full runs hardware-gated)
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -742,11 +756,22 @@ tokenizers and pluggable chat templates replacing hardcoded ChatML, end-to-end
 `Inkling-2-Small`, `Hy4-preview`, `Hy4`, and `Hy4-flash` runs hardware-gated
 on `128–512 GB` / `TB5` clusters.
 
+On `2026-11-24`, following completion of `M7.8` (`8929b81`), the user refined
+[ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md)
+execution with three pre-implementation confirmations: (1) splitting `M8` into
+sequential **M8.1** (`W21`, `W22`, `W24`, `G23`, `G24`, `C25` substrate) ->
+**M8.2** (`W23`, `G25`, `D14`, `C26` `Inkling 2` / `Hy4` operators, draft heads,
+and end-to-end runs); (2) compiling Hugging Face `chat_template.jinja` offline
+in `tools/` into a declarative `.amf` JSON `chat_template_spec` rendered by a
+deterministic zero-allocation Zig state machine (`W24`, zero runtime Jinja2 AST
+interpreter); and (3) pausing heavy `M8` checkpoint downloads until disk space
+on `/Volumes/Akari` (`12 GiB` free / `95%` full) is cleaned up.
+
 ## Session handoff snapshot
 
 Update this before the context window runs out or when handing off.
 
-- Last updated: 2026-11-23
+- Last updated: 2026-11-24
 - Commits so far:
   - M0: `1ad0da8` AGENTS.md, `6d5053d` license, `3a573a5` docs baseline,
     `0518ea8` build graph and probe, `06e8656` wired regions, `e6c9221`
@@ -906,8 +931,10 @@ Update this before the context window runs out or when handing off.
     248K GPU radix sampler, `0de204b` Phase-2 engine/speculative/SDK integration
     (`root.zig`, `qwen3.zig`, `graph.zig`, `lora.zig`, `spec/*`, `c_api.zig`,
     single-frame `G16`+`G18` canary, M4 `G18` shape calibration), and `5345566`
-    `aminfer bench-m78` CLI & benchmark gates (followed by M7.8 docs archive
-    and verifier defect remediation)
+    `aminfer bench-m78` CLI & benchmark gates, `83a3763` M7.8 docs archive,
+    `76530ff` verifier remediation (`c_api.zig` preallocated `GpuSampler` +
+    penalty dedup, `graph.zig` ANE ViT bucket/merge alignment), and `8929b81`
+    M7.8 doc audit fixes (`229c616` `ADR-0024` M8 codification)
 - Current test & build baseline (`M0`–`M6.8`, `M7.5`, and `M7.8` complete on M4,
   `M6.9` code complete, `M7` code & M4 loopback cluster verified, live HF
   frontier metadata & tokenizer compatibility verified, `0` `catch {}`):
@@ -942,15 +969,17 @@ Update this before the context window runs out or when handing off.
     `dspark.amf`, `config.json`, `dspark_config.json`, `tokenizer.json`)
   - Exported ANE `.mlpackage` bundles: `/Volumes/Akari/models/coreml/`
 - Session & `/swarm` operating conventions:
-  - Swarm models restricted per user instruction to `gemini-4-carbon-*` and
-    `gemini-4-neon-*` only (never `claude-*` or `gpt-*`); commits stay local
+  - Swarm models per user instruction: coding/integration workers use
+    `gemini-4-hydrogen-xhigh` and review/verifier/monitor workers use
+    `gemini-4-neon-xhigh` (never `claude-*` or `gpt-*`); commits stay local
     (do not `git push` unless explicitly requested) and run `ikat sync` after
     every commit
-- In flight: **M8** (`W21`–`W24`, `G23`–`G25`, `D14`, `C25`–`C26` per
-  [ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md):
-  zero-loss `FP8`/`MXFP8`/`NVFP4`/`GGUF`/`MLX` parity, end-to-end
-  `Inkling-2-Mini` on `24 GB` M4, and `Inkling 2` / `Hy4` family operators +
-  `DFlare`/`DFly2`) is codified and planned next. **M7.8** (`W20`, `G18`–`G22`,
+- In flight: **M8.1** (`W21`, `W22`, `W24`, `G23`, `G24`, `C25`) followed by
+  **M8.2** (`W23`, `G25`, `D14`, `C26`) per
+  [ADR-0024](decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md)
+  (zero-loss `FP8`/`MXFP8`/`NVFP4`/`GGUF`/`MLX` parity, declarative `.amf` JSON
+  `ChatTemplate` state machine, end-to-end `Inkling-2-Mini` on `24 GB` M4, and
+  `Inkling 2` / `Hy4` family operators + `DFlare`/`DFly2`) are planned next. **M7.8** (`W20`, `G18`–`G22`,
   `C23`–`C24` per
   [ADR-0023](decisions/0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md))
   and **M7.5** (`R10`, `W18`, `W19`, `C17`–`C22`
@@ -966,7 +995,8 @@ Update this before the context window runs out or when handing off.
   FlashAttention-2 HW bench), physical multi-Mac TB5 RDMA HCA transport
   (`X1`–`X3`), and full-scale `552B + 196B` `DeepSeek-V4.1-Flash-1017` (`W11`)
   execution on a 512 GB Ultra node or multi-Mac TB5 RDMA cluster
-- Awaiting the user: nothing
+- Awaiting the user: disk space cleanup on `/Volumes/Akari` (currently `12 GiB`
+  free / `95%` full) before starting `M8.1` checkpoint downloads / heavy work
 - Key evidence: [architecture/hardware.md](architecture/hardware.md),
   [architecture/model-roadmap.md](architecture/model-roadmap.md),
   [architecture/open-decisions-research.md](architecture/open-decisions-research.md),

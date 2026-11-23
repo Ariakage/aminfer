@@ -41,7 +41,7 @@ items. ADRs record decisions, not capability status — that lives in
 | [0021](0021-multi-generation-apple-silicon-and-nax-tensorops.md) | Single-binary multi-generation Apple Silicon adaptation (`Apple9` and `Apple10+` GPU `NAX`) | Accepted | 2026-11-22 |
 | [0022](0022-native-c-python-sdk-and-full-protocol-parity.md) | Native C/Python SDK, full HTTP/SSE protocol parity, and rootless terminal monitor (M7.5) | Accepted | 2026-11-23 |
 | [0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md) | Native Metal 4 sublayer fusion, MMA FlashAttention-2, GPU indirect MoE dispatch, and NEON/SME2 accelerators (M7.8) | Accepted | 2026-11-23 |
-| [0024](0024-quantized-format-parity-and-inkling2-hy4-adaptation.md) | Zero-loss quantized-format compatibility (`FP8` / `MXFP8` / `NVFP4` / `GGUF` / `MLX` / sub-4-bit) and `Inkling 2` + `Hy4` family adaptation (M8) | Accepted | 2026-11-23 |
+| [0024](0024-quantized-format-parity-and-inkling2-hy4-adaptation.md) | Zero-loss quantized-format compatibility (`FP8` / `MXFP8` / `NVFP4` / `GGUF` / `MLX` / sub-4-bit) and `Inkling 2` + `Hy4` family adaptation (M8.1–M8.2) | Accepted | 2026-11-23 |
 
 ## Template
 
