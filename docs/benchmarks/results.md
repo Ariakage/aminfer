@@ -5995,5 +5995,28 @@ quality_gate.synth.gguf_q2_0            mean_kl=2.302979 max_kl=4.410398 top1=0.
 quality_gate.real.qwen3-0.6b-bf16_vs_qwen3-0.6b-gsq-rco status=ok mean_kl=0.313250 max_kl=1.712455 top1=62.5% (20/32) greedy=4/32 math=4/11 code=0/11 reason=0/10 max_4gram=1 loop=no tok=resolved act_quant=none finite=yes
 ```
 
+### 3. Native Zig Weighted OLS RCO accelerator (`7cceef9`, `468cede`) and live `Qwen3-30B-A3B` BF16 `GSQ-RCO v2` A/B regression
+
+- **Native multi-threaded Weighted OLS RCO C-ABI accelerator (`src/quant/rco.zig`, `ami_sdk_quantize_rows_affine_raw`, `tools/src/aminfer_tools/gsq_rco.py`)**:
+  - Cross-language parity vs pure-Python `quantize_rows_affine`: `432/432` combinations (`F32/F16/BF16` x `g32/g64/g128` x `2/3/4/5/6/8-bit` x weighted/unweighted/edge-weights x minmax/RCO) bit-for-bit exact (`exact_q=432/432`, `exact_p=432/432`, `max_mse_diff=6.661e-16`).
+  - `ReleaseFast` M4 throughput (`1024 x 2048` BF16 `q3_affine`, `rco_iters=3`): unweighted `2,487.9 ms` (Python) -> `6.57 ms` (native, **`378.5x`**); `imatrix`-weighted `4,222.5 ms` -> `11.78 ms` (**`358.6x`**); `_analyze_tensor_sample` sensitivity probing (`18,867` tensors, `vDSP` + batched native RCO) `972.9 s` -> `25.5 s` (**`38.1x`**).
+  - Full `tools/` unittest suite: `118/118` pass with native enabled (`44.8 s`) and `118/118` (`2` native-only tests skipped) with `AMINFER_DISABLE_NATIVE_RCO=1`.
+- **Real 48-layer hidden-state router trace (`W8`) vs legacy shallow `embed_router_sample` on `Qwen3-30B-A3B`**:
+  - Captured `56,304` lines (`1,173` steps across 6 domains x 48 layers x Top-8) via `aminfer decode --dump-router-trace` -> `qwen3-30b-a3b-heat-v2.json` (`calibration_mode = "router_trace"`, `0` warnings).
+  - Overlap of legacy `qwen3-30b-a3b-heat.json` (`embed_router_sample`, `48` tokens) against real `router_trace` on layers `L1..L47`: Hot-64 mean overlap **`52.6%`** (vs `50.0%` random baseline; min `39.1%`), Top-16 mean overlap **`15.7%`** (vs `12.5%` random baseline; layer 29 only **`6.2%`**, `1/16`).
+- **Live BF16 `GSQ-RCO v2` export (`Qwen/Qwen3-30B-A3B` `56.89 GiB` BF16 + `imatrix_unsloth.dat` + `qwen3-30b-a3b-heat-v2.json`)**:
+  - Output: `/Volumes/Akari/models/amf/qwen3-30b-a3b-gsq-rco-v2.amf` (`13,362,921,472 B` = `12.445 GiB`, matching `qwen3-30b-a3b-3bit.amf`'s `13,363,314,688 B`), exported in `658.9 s` at `~65.7 MiB` host RSS; `aminfer verify-amf` `ok` (`18,867` tensors, `13,360,480,256 B` wired, `0` cold).
+  - Allocation: `48/48` routers lossless `bf16`; `192/192` attention projections, `embedding`, and `lm_head` `q4_affine` (`0%` backbone `q2_affine`); MoE experts `6` `q6_affine`, `1,647` `q4_affine` (`26.8%`), `2,468` `q3_affine` (`40.2%`), `2,023` coldest `q2_affine` (`32.9%`, layer 29 reduced from `92.2%` to `29.7%`; global `q2_affine` weight share `31.26%`).
+- **3-Model side-by-side greedy (`-t 0`, `n = 128`, `swapouts_delta = 0` on all 9 runs) & chat regression on `24 GB` M4**:
+
+| Model | Math (`17 * 23 + 19`) | Code (`fibonacci(n)`) | Riemann Hypothesis (`告诉我黎曼猜想是什么`) | `max_4gram` (Math / Code / Riemann) | Decode tok/s | `swapouts_delta` |
+| --- | --- | --- | --- | --- | --- | --- |
+| Old `qwen3-30b-a3b-gsq-rco.amf` (`2.700b`) | Wrong (`416`, no EOS, `128 tok`) | Wrong (`n*(n+1)/2`, no EOS, `128 tok`) | Hallucinated (`赫尔曼·克莱因`, `皮埃尔·皮埃拉斯`, claimed proved) + loop | `5 / 2 / 5` | `27.15–28.15` | `0` |
+| New `qwen3-30b-a3b-gsq-rco-v2.amf` (`3.50b`, BF16 `GSQ-RCO v2`) | Exact (`410`, clean EOS at `34 tok`) | Exact iterative `a, b = 0, 1` (clean EOS at `70 tok`) | Exact (`Bernhard Riemann`, `1859`, `ζ(s)`, analytic continuation, trivial/non-trivial zeros, `Re(s)=1/2`) | `2 / 2 / 2` | `26.46–37.27` | `0` |
+| Baseline `qwen3-30b-a3b-3bit.amf` (`100% 3-bit`) | Exact (`410`, clean EOS at `70 tok`) | Exact iterative `a, b = 0, 1` (clean EOS at `42 tok`) | Exact (`Bernhard Riemann`, `1859`, `ζ(s)`) | `2 / 2 / 2` | `26.35–34.29` | `0` |
+
+- Additional live `aminfer chat` checks on `qwen3-30b-a3b-gsq-rco-v2.amf`: `"hi"` (`-t 0.6`, 4 seeds `42/101/202/303`) `4/4` clean (`50–107 tok`, `19.3–31.5 tok/s`, `0` thinking loops); `"告诉我黎曼猜想是什么"` greedy (`-t 0`), no-think greedy (`-t 0 -N`), default M8.15 sampling (`-t 0.6`, `768 tok` full turn at `23.1 tok/s`), and multi-turn Chinese + Python primality proof (`sqrt(n)` proof) all accurate with `0` loops.
+
+
 
 
