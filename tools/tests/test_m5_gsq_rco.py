@@ -18,6 +18,7 @@ from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
     AmfReader,
     DType,
+    QuantParamKind,
     TensorKind,
     TensorLayout,
     dequantize_q2_row_f32,
@@ -36,12 +37,15 @@ from aminfer_tools.amf import (
     sme2_panel64_data_bytes,
     write_amf,
 )
-from aminfer_tools.cli import main
+from aminfer_tools.cli import _is_moe_checkpoint_input, main
 from aminfer_tools.gsq_rco import (
     _BACKBONE_PROTECTED_ROLES,
     QuantUnitCandidate,
     QuantUnitInput,
+    _imatrix_col_weights,
+    _imatrix_tensor_multipliers,
     gsq_convert,
+    parse_gguf_imatrix,
     quantize_group_minmax,
     quantize_group_rco,
     quantize_rows_affine,
@@ -1347,6 +1351,298 @@ class M5GsqRcoTests(unittest.TestCase):
             self.assertEqual(err2.getvalue(), "")
             heat_doc = json.loads(heat_trace.read_text(encoding="utf-8"))
             self.assertEqual(heat_doc["calibration_mode"], "router_trace")
+
+    def test_weighted_rco_degenerate_imatrix_entries_and_nonfinite_target_bits(self) -> None:
+        rng = random.Random(777)
+        grp = [rng.uniform(-0.2, 0.2) for _ in range(60)] + [2.0, -2.0, 1.8, -1.7]
+        s_uw, b_uw, c_uw, mse_uw = quantize_group_rco(grp, 2, iters=3)
+
+        # Degenerate all-zero / negative / NaN / inf weight vectors must fall back cleanly to unweighted RCO.
+        for bad_w in (
+            [0.0] * 64,
+            [-5.0] * 64,
+            [float("nan")] * 64,
+            [float("inf")] * 64,
+            [float("-inf")] * 64,
+            [0.0, -1.0, float("nan"), float("inf")] * 16,
+        ):
+            s_d, b_d, c_d, mse_d = quantize_group_rco(grp, 2, iters=3, weights=bad_w)
+            self.assertEqual((s_d, b_d, c_d), (s_uw, b_uw, c_uw))
+            self.assertAlmostEqual(mse_d, mse_uw, places=12)
+
+        # Mixed finite + NaN/inf/negative/huge weights must remain finite and satisfy rco_wmse <= minmax_wmse.
+        mixed_w = [1e308] * 8 + [1e307] * 8 + [float("nan"), float("inf"), float("-inf"), -3.0] * 12
+        _, _, rco_mse, mm_mse = quantize_rows_affine(
+            [grp, grp], 2, group_size=64, use_rco=True, compute_minmax_mse=True, col_weights=mixed_w
+        )
+        self.assertTrue(math.isfinite(rco_mse) and math.isfinite(mm_mse))
+        self.assertLessEqual(rco_mse, mm_mse + 1e-15)
+
+        # `_imatrix_tensor_multipliers` must ignore non-finite values without poisoning valid tensors.
+        mults = _imatrix_tensor_multipliers(
+            {
+                "a": [1.0, 2.0, 3.0],
+                "b": [2.0, 4.0, 6.0],
+                "bad_inf": [float("inf"), 1.0],
+                "bad_nan": [float("nan"), float("-inf")],
+                "huge": [1e308, 1e308],
+            }
+        )
+        self.assertNotIn("bad_nan", mults)
+        for k, v in mults.items():
+            self.assertTrue(math.isfinite(v) and 0.5 <= v <= 4.0, msg=f"{k}={v}")
+        self.assertAlmostEqual(mults["b"] / mults["a"], 2.0, places=6)
+
+        # Non-finite target_bits must raise ValueError cleanly in both solver and gsq_convert.
+        u = QuantUnitInput(
+            unit_id="x",
+            tensor_names=("x",),
+            role="dense_ffn",
+            layer=0,
+            expert=0,
+            numel=64 * 64,
+            sensitivity=1.0,
+            candidates=(QuantUnitCandidate(DType.Q4_AFFINE, (64 * 64 * 36) // 64, 1.0, 0.01, 64),),
+        )
+        for bad_tb in (float("nan"), float("inf"), float("-inf"), 0.0, -1.0):
+            with self.assertRaises(ValueError):
+                solve_gsq_allocation([u], target_bits=bad_tb)
+            with self.assertRaises(ValueError):
+                gsq_convert(pathlib.Path("/nonexistent.amf"), pathlib.Path("/tmp/out.amf"), target_bits=bad_tb)
+
+    def test_moe_stacked_3d_imatrix_matching_and_shape_mismatch_safety(self) -> None:
+        rng = random.Random(202604)
+
+        def _write_min_gguf_imatrix(
+            path: pathlib.Path,
+            tensors: list[tuple[str, tuple[int, ...], bytes]],
+        ) -> None:
+            align = 32
+            buf = bytearray(b"GGUF")
+            buf.extend(struct.pack("<IQQ", 3, len(tensors), 0))
+            data = bytearray()
+            offs: list[int] = []
+            for _n, _d, payload in tensors:
+                pad = (align - (len(data) % align)) % align
+                data.extend(b"\x00" * pad)
+                offs.append(len(data))
+                data.extend(payload)
+            for (name, dims, _), rel in zip(tensors, offs):
+                nb = name.encode("utf-8")
+                buf.extend(struct.pack("<Q", len(nb)) + nb)
+                buf.extend(struct.pack("<I", len(dims)))
+                for d in dims:
+                    buf.extend(struct.pack("<Q", d))
+                buf.extend(struct.pack("<IQ", 0, rel))  # GGML_TYPE_F32 = 0
+            pad_hdr = (align - (len(buf) % align)) % align
+            buf.extend(b"\x00" * pad_hdr)
+            buf.extend(data)
+            path.write_bytes(bytes(buf))
+
+        def _bf16_rows(mat: list[list[float]]) -> bytes:
+            flat = [v for r in mat for v in r]
+            f32 = struct.pack(f"<{len(flat)}f", *flat)
+            out = bytearray(len(flat) * 2)
+            out[0::2] = f32[2::4]
+            out[1::2] = f32[3::4]
+            return bytes(out)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+
+            # 1. GGUF stacked 3D MoE imatrix with per-expert `.counts` (4 experts x 64 cols) + shared broadcast (64 cols).
+            e0_w = [200.0] * 16 + [2e-4] * 48  # divided by count=2 -> [100.0]*16 + [1e-4]*48
+            e1_w = [4e-4] * 16 + [400.0] * 16 + [4e-4] * 32  # divided by count=4 -> [1e-4]*16 + [100.0]*16 + [1e-4]*32
+            e2_w = [0.0] * 64  # cold/unrouted expert, count=0 -> falls back safely to unweighted
+            e3_w = [1e-4] * 32 + [100.0] * 16 + [1e-4] * 16  # count=1
+            stacked_gate = e0_w + e1_w + e2_w + e3_w
+            shared_up = [50.0] * 16 + [1e-4] * 48
+
+            gguf_im = tmp / "moe_imatrix.gguf"
+            _write_min_gguf_imatrix(
+                gguf_im,
+                [
+                    ("blk.0.ffn_gate_exps.weight.in_sum2", (64, 4), struct.pack(f"<{len(stacked_gate)}f", *stacked_gate)),
+                    ("blk.0.ffn_gate_exps.weight.counts", (4,), struct.pack("<4f", 2.0, 4.0, 0.0, 1.0)),
+                    ("blk.0.ffn_up_exps.weight.in_sum2", (64,), struct.pack("<64f", *shared_up)),
+                    ("blk.0.ffn_up_exps.weight.counts", (1,), struct.pack("<1f", 1.0)),
+                ],
+            )
+            parsed = parse_gguf_imatrix(gguf_im)
+            cw0 = _imatrix_col_weights(parsed, "layers.0.mlp.experts.0.gate_proj.weight", 64, layer=0, expert=0)
+            cw1 = _imatrix_col_weights(parsed, "layers.0.mlp.experts.1.gate_proj", 64, layer=0, expert=1)
+            cw_up = _imatrix_col_weights(parsed, "layers.0.mlp.experts.3.up_proj", 64, layer=0, expert=3)
+            self.assertIsNotNone(cw0)
+            self.assertIsNotNone(cw1)
+            self.assertIsNotNone(cw_up)
+            assert cw0 is not None and cw1 is not None and cw_up is not None
+            self.assertAlmostEqual(cw0[0], 100.0, places=3)
+            self.assertAlmostEqual(cw0[20], 1e-4, places=6)
+            self.assertAlmostEqual(cw1[0], 1e-4, places=6)
+            self.assertAlmostEqual(cw1[20], 100.0, places=3)
+            self.assertAlmostEqual(cw_up[0], 50.0, places=3)
+
+            # Shape mismatches and out-of-bounds expert indices must safely return None.
+            self.assertIsNone(_imatrix_col_weights(parsed, "layers.0.mlp.experts.4.gate_proj", 64, layer=0, expert=4))
+            self.assertIsNone(_imatrix_col_weights(parsed, "layers.0.mlp.experts.0.gate_proj", 63, layer=0, expert=0))
+            self.assertIsNone(_imatrix_col_weights({"layers.0.mlp.gate_proj": [1.0] * 128}, "layers.0.mlp.gate_proj", 64))
+            self.assertIsNotNone(
+                _imatrix_col_weights(
+                    {"model.layers.0.mlp.switch_mlp.down_proj.weight": [2.0] * 64},
+                    "layers.0.mlp.experts.2.down_proj",
+                    64,
+                    layer=0,
+                    expert=2,
+                )
+            )
+
+            # 2. End-to-end MoE `gsq_convert` with GGUF stacked 3D imatrix must lower per-expert weighted MSE.
+            sf_dir = tmp / "moe_im_ckpt"
+            sf_dir.mkdir()
+            ones = _bf16_rows([[1.0] * 64])
+            tensors: dict[str, tuple[str, tuple[int, ...], bytes]] = {
+                "model.embed_tokens.weight": ("BF16", (64, 64), _rand_bf16_bytes(rng, 64 * 64, 0.1)),
+                "model.layers.0.input_layernorm.weight": ("BF16", (64,), ones),
+                "model.layers.0.post_attention_layernorm.weight": ("BF16", (64,), ones),
+                "model.layers.0.self_attn.q_proj.weight": ("BF16", (64, 64), _rand_bf16_bytes(rng, 64 * 64, 0.1)),
+                "model.layers.0.mlp.gate.weight": ("BF16", (4, 64), _rand_bf16_bytes(rng, 4 * 64, 0.1)),
+                "model.norm.weight": ("BF16", (64,), ones),
+            }
+            exp_mats: dict[int, list[list[float]]] = {}
+            for e in range(4):
+                # Put fine structure on expert-specific active cols and outliers on low-weight cols.
+                mat = [
+                    [rng.uniform(-0.12, 0.12) for _ in range(48)] + [2.2, -2.1, 1.9, -1.8] * 4
+                    for _ in range(128)
+                ]
+                exp_mats[e] = mat
+                tensors[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"] = ("BF16", (128, 64), _bf16_rows(mat))
+                tensors[f"model.layers.0.mlp.experts.{e}.up_proj.weight"] = ("BF16", (128, 64), _rand_bf16_bytes(rng, 128 * 64, 0.1))
+                tensors[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] = ("BF16", (64, 128), _rand_bf16_bytes(rng, 64 * 128, 0.1))
+            _write_safetensors(sf_dir / "model.safetensors", tensors)
+            (sf_dir / "config.json").write_text(json.dumps({"tie_word_embeddings": True}), encoding="utf-8")
+
+            amf_uw = tmp / "moe_uw.amf"
+            amf_w = tmp / "moe_w.amf"
+            gsq_convert(sf_dir, amf_uw, target_bits=2.75, model_id="moe-uw")
+            gsq_convert(sf_dir, amf_w, target_bits=2.75, model_id="moe-w", imatrix_path=gguf_im)
+
+            with AmfReader(amf_uw) as r_uw, AmfReader(amf_w) as r_w:
+                for e, active_slice in ((0, range(0, 16)), (1, range(16, 32))):
+                    name = f"layers.0.mlp.experts.{e}.gate_proj"
+                    m_uw = r_uw.by_name[name]
+                    m_w = r_w.by_name[name]
+                    self.assertEqual(m_uw.dtype, DType.Q2_AFFINE)
+                    self.assertEqual(m_w.dtype, DType.Q2_AFFINE)
+                    mat_uw = r_uw.read_matrix_f32(m_uw)
+                    mat_w = r_w.read_matrix_f32(m_w)
+                    err_uw = sum((mat_uw[r][c] - exp_mats[e][r][c]) ** 2 for r in range(128) for c in active_slice)
+                    err_w = sum((mat_w[r][c] - exp_mats[e][r][c]) ** 2 for r in range(128) for c in active_slice)
+                    self.assertLess(err_w, err_uw * 0.5, msg=f"expert {e} did not benefit from stacked GGUF imatrix")
+
+            # 3. `_is_moe_checkpoint_input` detects HF 3D stacked `mlp.experts.gate_up_proj` checkpoints.
+            hf_3d_dir = tmp / "hf_3d_moe"
+            hf_3d_dir.mkdir()
+            _write_safetensors(
+                hf_3d_dir / "model.safetensors",
+                {
+                    "model.layers.0.mlp.experts.gate_up_proj.weight": (
+                        "BF16",
+                        (4, 128, 64),
+                        _rand_bf16_bytes(rng, 4 * 128 * 64, 0.1),
+                    ),
+                },
+            )
+            self.assertTrue(_is_moe_checkpoint_input(hf_3d_dir))
+
+    def test_fine_rungs_with_lut16_sme2_strict_gating_and_moe_uniform_layout_decode_parity(self) -> None:
+        self.assertTrue(AMINFER_BIN.exists(), f"missing {AMINFER_BIN}; run `zig build` first")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            cases = (
+                (False, "dense_fine_lut16", "4.60", True, False),
+                (True, "moe_fine_lut16_mixed_q4_q6", "5.00", False, True),
+                (True, "moe_fine_lut16_all_sme2", "3.60", True, False),
+            )
+            for is_moe, label, t_bits, expect_lut16, expect_mixed_non_sme2_moe in cases:
+                sf_dir = tmp / label
+                _, cfg_path, tok_path = _build_synthetic_bf16_qwen3_checkpoint(
+                    sf_dir,
+                    is_moe=is_moe,
+                    seed=919 if is_moe else 818,
+                    num_layers=2,
+                    num_experts=8,
+                    top_k=2,
+                )
+                out_amf = tmp / f"{label}.amf"
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = main([
+                        "gsq-convert",
+                        "--input", str(sf_dir),
+                        "--output", str(out_amf),
+                        "--target-bits", t_bits,
+                        "--fine-rungs",
+                        "--lut16-sme2",
+                    ])
+                self.assertEqual(rc, 0)
+                _, metas = load_amf_metadata(out_amf)
+
+                # Strict gating: LUT16_CODEBOOK is ONLY emitted on Q2/Q3/Q4_AFFINE with group_size == 64!
+                lut_metas = [m for m in metas if m.quant_param_kind == QuantParamKind.LUT16_CODEBOOK]
+                if expect_lut16:
+                    self.assertGreater(len(lut_metas), 0, msg=f"{label} expected at least one lut16 tensor")
+                for m in lut_metas:
+                    self.assertIn(m.dtype, (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE))
+                    self.assertEqual(m.group_size, 64)
+                    self.assertEqual(m.layout, TensorLayout.SME2_PANEL64)
+
+                # Every MoE layer must keep uniform TensorLayout across all its experts (matching `qwen3.zig`).
+                if is_moe:
+                    saw_non_sme2_exp = False
+                    for l in range(2):
+                        exp_l = [
+                            m for m in metas
+                            if m.layer == l and m.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT)
+                        ]
+                        layouts = {m.layout for m in exp_l}
+                        self.assertEqual(len(layouts), 1, msg=f"{label} layer {l} mixed expert layouts {layouts}")
+                        if any(m.dtype in (DType.Q5_AFFINE, DType.Q6_AFFINE, DType.Q8_AFFINE) or m.group_size == 32 for m in exp_l):
+                            saw_non_sme2_exp = True
+                            self.assertEqual(layouts, {TensorLayout.ROW_MAJOR})
+                    if expect_mixed_non_sme2_moe:
+                        self.assertTrue(saw_non_sme2_exp, msg=f"{label} did not mix non-SME2 fine rungs into MoE layers")
+
+                v_proc = subprocess.run([str(AMINFER_BIN), "verify-amf", str(out_amf)], capture_output=True, text=True)
+                self.assertEqual(v_proc.returncode, 0, msg=v_proc.stdout + v_proc.stderr)
+                self.assertIn("amf.status       ok", v_proc.stdout)
+
+                d_proc = subprocess.run(
+                    [
+                        str(AMINFER_BIN),
+                        "decode",
+                        "--amf", str(out_amf),
+                        "--config", str(cfg_path),
+                        "--tokenizer", str(tok_path),
+                        "--prompt", "",
+                        "--max-tokens", "4",
+                        "--ignore-eos",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(d_proc.returncode, 0, msg=f"{label} decode failed:\n{d_proc.stdout}\n{d_proc.stderr}")
+                self.assertIn("decode.swapouts_delta            0", d_proc.stdout)
+                m_toks = re.search(r"decode\.token_ids\s+\[([^\]]*)\]", d_proc.stdout)
+                self.assertIsNotNone(m_toks, msg=d_proc.stdout)
+                assert m_toks is not None
+                zig_tokens = [int(x.strip()) for x in m_toks.group(1).split(",") if x.strip()]
+                cfg_dict = json.loads(cfg_path.read_text(encoding="utf-8"))
+                bos_id = int(cfg_dict.get("bos_token_id", 0))
+                ref_tokens = _cpu_fp32_qwen3_greedy(out_amf, cfg_dict, [bos_id], max_new=4)
+                self.assertEqual(zig_tokens, ref_tokens, msg=f"{label} tokens {zig_tokens} != {ref_tokens}")
 
 
 if __name__ == "__main__":

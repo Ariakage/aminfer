@@ -257,8 +257,9 @@ def _normalize_group_weights(weights: Sequence[float], n: int) -> list[float] | 
     w_max = max(w_raw)
     if w_max <= w_min * (1.0 + 1e-12):
         return None
-    scale = n / math.fsum(w_raw)
-    return [w * scale for w in w_raw]
+    w_scaled = [w / w_max for w in w_raw]
+    scale = n / math.fsum(w_scaled)
+    return [w * scale for w in w_scaled]
 
 
 def _clipped_initializers(
@@ -1740,14 +1741,18 @@ def parse_gguf_imatrix(path: pathlib.Path) -> dict[str, list[float]]:
                 fh.seek(g.data_offset + t.offset)
                 vals = list(struct.unpack(f"<{t.numel}f", fh.read(t.numel * 4)))
                 cnt_t = by_name.get(f"{base_raw}.counts")
-                if cnt_t is not None and cnt_t.ggml_type == 0 and cnt_t.numel in (1, t.numel):
+                if cnt_t is not None and cnt_t.ggml_type == 0 and cnt_t.numel > 0 and t.numel % cnt_t.numel == 0:
                     fh.seek(g.data_offset + cnt_t.offset)
                     cnts = struct.unpack(f"<{cnt_t.numel}f", fh.read(cnt_t.numel * 4))
                     if len(cnts) == 1:
-                        denom = cnts[0] if cnts[0] > 0.0 else 1.0
+                        denom = cnts[0] if (math.isfinite(cnts[0]) and cnts[0] > 0.0) else 1.0
                         vals = [v / denom for v in vals]
+                    elif len(cnts) == len(vals):
+                        vals = [v / (c if (math.isfinite(c) and c > 0.0) else 1.0) for v, c in zip(vals, cnts)]
                     else:
-                        vals = [v / (c if c > 0.0 else 1.0) for v, c in zip(vals, cnts)]
+                        stride = len(vals) // len(cnts)
+                        denoms = [c if (math.isfinite(c) and c > 0.0) else 1.0 for c in cnts]
+                        vals = [v / denoms[i // stride] for i, v in enumerate(vals)]
                 norm = normalize_gguf_tensor_name(base_raw)
                 out[norm] = vals
         return out
@@ -1796,36 +1801,108 @@ def _imatrix_tensor_multipliers(imatrix: dict[str, list[float]]) -> dict[str, fl
     means: dict[str, float] = {}
     for k, vec in imatrix.items():
         if vec:
-            pos = [max(0.0, float(v)) for v in vec]
-            m = sum(pos) / len(pos)
-            if m > 0.0:
+            inv_len = 1.0 / len(vec)
+            m = math.fsum(float(v) * inv_len for v in vec if math.isfinite(v) and float(v) > 0.0)
+            if math.isfinite(m) and m > 0.0:
                 means[k] = m
     if not means:
         return {}
     s = sorted(means.values())
     mid = len(s) // 2
     med = s[mid] if (len(s) & 1) else 0.5 * (s[mid - 1] + s[mid])
-    if med <= 0.0:
+    if not math.isfinite(med) or med <= 0.0:
         return {}
     return {k: max(0.5, min(4.0, v / med)) for k, v in means.items()}
+
+
+_MOE_PROJ_TO_GGUF_EXPS = {
+    "gate_proj": ("ffn_gate_exps", "ffn_gate_up_exps"),
+    "up_proj": ("ffn_up_exps", "ffn_gate_up_exps"),
+    "down_proj": ("ffn_down_exps",),
+    "gate_up_proj": ("ffn_gate_up_exps",),
+}
+
+
+def _imatrix_direct_candidates(tensor_name: str) -> tuple[str, ...]:
+    base = tensor_name.removesuffix(".weight")
+    cands = [tensor_name, base, f"{base}.weight"]
+    if not base.startswith("model."):
+        cands.extend((f"model.{base}", f"model.{base}.weight"))
+    else:
+        stripped = base[len("model.") :]
+        cands.extend((stripped, f"{stripped}.weight"))
+    return tuple(dict.fromkeys(cands))
+
+
+def _imatrix_stacked_moe_candidates(tensor_name: str, layer: int) -> tuple[str, ...]:
+    base = tensor_name.removesuffix(".weight")
+    proj = base.rsplit(".", 1)[-1]
+    gguf_exps = _MOE_PROJ_TO_GGUF_EXPS.get(proj, ())
+    if not gguf_exps:
+        return ()
+    cands: list[str] = []
+    for g_name in gguf_exps:
+        cands.extend(
+            (
+                f"layers.{layer}.{g_name}.weight",
+                f"layers.{layer}.{g_name}",
+                f"blk.{layer}.{g_name}.weight",
+                f"blk.{layer}.{g_name}",
+            )
+        )
+    proj_names = (proj, "gate_up_proj") if proj in ("gate_proj", "up_proj") else (proj,)
+    for p_name in proj_names:
+        cands.extend(
+            (
+                f"layers.{layer}.mlp.switch_mlp.{p_name}.weight",
+                f"layers.{layer}.mlp.switch_mlp.{p_name}",
+                f"model.layers.{layer}.mlp.switch_mlp.{p_name}.weight",
+                f"model.layers.{layer}.mlp.switch_mlp.{p_name}",
+                f"layers.{layer}.mlp.experts.{p_name}.weight",
+                f"layers.{layer}.mlp.experts.{p_name}",
+                f"model.layers.{layer}.mlp.experts.{p_name}.weight",
+                f"model.layers.{layer}.mlp.experts.{p_name}",
+            )
+        )
+    return tuple(dict.fromkeys(cands))
 
 
 def _imatrix_col_weights(
     imatrix: dict[str, list[float]],
     tensor_name: str,
     cols: int,
+    *,
+    layer: int = NO_LAYER,
+    expert: int = NO_EXPERT,
 ) -> list[float] | None:
-    """Return per-column `w_i = max(E[x_i^2], 1e-12)` vector when `len == cols`, else `None`."""
+    """Return per-column `w_i = max(E[x_i^2], 1e-12)` vector matching `cols`, else `None`.
+
+    Supports exact 2D / per-expert vectors (`len == cols`) as well as stacked 3D MoE
+    imatrix entries (`blk.<L>.ffn_*_exps.weight`, `layers.<L>.mlp.switch_mlp.*`,
+    `layers.<L>.mlp.experts.*`) stored either as shared `[cols]` broadcasts or contiguous
+    per-expert `[num_experts * cols]` slices (`vec[expert * cols : (expert + 1) * cols]`).
+    """
     if not imatrix or cols <= 0:
         return None
-    vec = (
-        imatrix.get(tensor_name)
-        or imatrix.get(tensor_name.removesuffix(".weight"))
-        or imatrix.get(f"{tensor_name}.weight")
-    )
-    if vec is None or len(vec) != cols:
-        return None
-    return [max(1e-12, float(v)) if math.isfinite(v) else 1e-12 for v in vec]
+    for key in _imatrix_direct_candidates(tensor_name):
+        vec = imatrix.get(key)
+        if vec is not None:
+            if len(vec) != cols:
+                return None
+            return [max(1e-12, float(v)) if math.isfinite(v) else 1e-12 for v in vec]
+
+    if layer != NO_LAYER and expert != NO_EXPERT and expert >= 0:
+        for key in _imatrix_stacked_moe_candidates(tensor_name, layer):
+            vec = imatrix.get(key)
+            if vec is None:
+                continue
+            if len(vec) == cols:
+                return [max(1e-12, float(v)) if math.isfinite(v) else 1e-12 for v in vec]
+            if len(vec) % cols == 0 and (expert + 1) * cols <= len(vec):
+                sl = vec[expert * cols : (expert + 1) * cols]
+                return [max(1e-12, float(v)) if math.isfinite(v) else 1e-12 for v in sl]
+            return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -1923,7 +2000,7 @@ def solve_gsq_allocation(
     then greedily upgrades units with the highest distortion reduction per extra
     byte until `target_bits` is reached.
     """
-    if target_bits <= 0.0:
+    if not math.isfinite(target_bits) or target_bits <= 0.0:
         raise ValueError(f"target_bits must be positive, got {target_bits}")
     if max_q2_share is not None and (not math.isfinite(max_q2_share) or max_q2_share < 0.0 or max_q2_share > 1.0):
         raise ValueError(f"max_q2_share must be in [0.0, 1.0], got {max_q2_share}")
@@ -3200,7 +3277,7 @@ def gsq_convert(
         raise ValueError(f"dtype_mode must be one of {DTYPE_MODES}, got {dtype_mode!r}")
     if sme2_pack not in SME2_PACK_MODES:
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
-    if target_bits is not None and target_bits <= 0.0:
+    if target_bits is not None and (not math.isfinite(target_bits) or target_bits <= 0.0):
         raise ValueError(f"target_bits must be positive, got {target_bits}")
     if max_q2_share is not None and (not math.isfinite(max_q2_share) or max_q2_share < 0.0 or max_q2_share > 1.0):
         raise ValueError(f"max_q2_share must be in [0.0, 1.0], got {max_q2_share}")
@@ -3447,7 +3524,7 @@ def gsq_convert(
             for m in members:
                 numel_m = m.shape[0] * m.shape[1]
                 total_numel += numel_m
-                cw = _imatrix_col_weights(imatrix_raw, m.name, m.shape[1])
+                cw = _imatrix_col_weights(imatrix_raw, m.name, m.shape[1], layer=m.layer, expert=m.expert)
                 col_weights_by_tensor[m.name] = cw
                 var_m, out_m, mse_m = _analyze_tensor_sample(
                     src,
@@ -3473,11 +3550,20 @@ def gsq_convert(
 
             im_mult = 1.0
             if imatrix_mults:
-                found_im = [
-                    imatrix_mults.get(m.name) or imatrix_mults.get(m.name.removesuffix(".weight"))
-                    for m in members
-                ]
-                pos_im = [v for v in found_im if v is not None]
+                pos_im: list[float] = []
+                for m in members:
+                    val: float | None = None
+                    for key in _imatrix_direct_candidates(m.name):
+                        val = imatrix_mults.get(key)
+                        if val is not None:
+                            break
+                    if val is None and m.layer != NO_LAYER and m.expert != NO_EXPERT:
+                        for key in _imatrix_stacked_moe_candidates(m.name, m.layer):
+                            val = imatrix_mults.get(key)
+                            if val is not None:
+                                break
+                    if val is not None:
+                        pos_im.append(val)
                 if pos_im:
                     im_mult = max(pos_im)
                 elif unit_id in imatrix_mults:
@@ -3617,6 +3703,30 @@ def gsq_convert(
         cursor = dir_offset + dir_bytes
         used_out_names: set[str] = set()
 
+        # MoE layers in `src/model/qwen3.zig` require uniform `TensorLayout` across all experts
+        # in the same layer (`layer_w.expert_layout`). If any expert in a layer chose a non-SME2
+        # scheme (e.g. `q2_affine g=32` or `q5/q6/q8_affine` under `--fine-rungs`), keep every
+        # expert in that layer in `ROW_MAJOR` while non-expert linears may still use `SME2_PANEL64`.
+        moe_layer_sme2_allowed: dict[int, bool] = {}
+        for t in src.tensors:
+            if t.kind not in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) or t.layer == NO_LAYER:
+                continue
+            uid = tensor_to_unit.get(t.name)
+            if uid is not None:
+                t_dt, t_gs = chosen_by_unit[uid]
+            else:
+                t_dt, t_gs = t.dtype, t.group_size
+            eff_gs_t = (t_gs if t_gs > 0 else group_size) if t_dt in _QUANT_DTYPES else (t.group_size if t_dt == t.dtype else 0)
+            exp_sme2_ok = (
+                t_dt in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
+                and (t_dt not in _QUANT_DTYPES or eff_gs_t == SME2_GROUP_K)
+                and _should_sme2_pack(t.kind, t_dt, t.shape, eff_sme2_pack)
+            )
+            if t.layer not in moe_layer_sme2_allowed:
+                moe_layer_sme2_allowed[t.layer] = exp_sme2_ok
+            elif not exp_sme2_ok:
+                moe_layer_sme2_allowed[t.layer] = False
+
         for t in src.tensors:
             uid = tensor_to_unit.get(t.name)
             if uid is not None:
@@ -3635,8 +3745,14 @@ def gsq_convert(
             else:
                 q_bits = 0
                 g_size = 0
+            layer_allows_sme2 = (
+                moe_layer_sme2_allowed.get(t.layer, True)
+                if t.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) and t.layer != NO_LAYER
+                else True
+            )
             use_sme2 = (
-                target_dtype in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
+                layer_allows_sme2
+                and target_dtype in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
                 and (target_dtype not in _QUANT_DTYPES or g_size == SME2_GROUP_K)
                 and (
                     _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack)

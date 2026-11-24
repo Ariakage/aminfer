@@ -25,6 +25,7 @@ from aminfer_tools.amf import (
     TensorKind,
     TensorLayout,
     _collect_tensors,
+    _resolve_stacked_expert_meta,
     embed_metadata_into_amf,
     generate_synth_vit_amf,
     gsq_convert_with_vision,
@@ -163,8 +164,14 @@ def _is_moe_checkpoint_input(path: pathlib.Path) -> bool:
         tensors = _collect_tensors(resolved.shard_paths)
         expert_ids: set[int] = set()
         for name, t in tensors.items():
-            if len(t.shape) == 3 and ".switch_mlp." in name and t.shape[0] > 1:
-                return True
+            if len(t.shape) == 3 and t.shape[0] > 1:
+                stem = name
+                for sfx in (".weight", ".scales", ".biases"):
+                    if stem.endswith(sfx):
+                        stem = stem[: -len(sfx)]
+                        break
+                if ".switch_mlp." in name or _resolve_stacked_expert_meta(stem) is not None:
+                    return True
             m = re.search(r"\.experts\.(\d+)\.", name)
             if m is not None:
                 expert_ids.add(int(m.group(1)))

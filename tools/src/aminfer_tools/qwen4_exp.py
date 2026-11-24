@@ -1218,11 +1218,10 @@ def pack_qwen4_checkpoint(
                 workers=workers,
             )
             if quant_profile == "gsq-rco":
-                eff_target = 3.25 if target_bits is None else float(target_bits)
                 metas = gsq_convert_with_vision(
                     out_path,
                     out_path,
-                    target_bits=eff_target,
+                    target_bits=target_bits,
                     model_id=model_id,
                     group_size=group_size,
                     dtype_mode=dtype_mode,
