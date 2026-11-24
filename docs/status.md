@@ -5,7 +5,7 @@ not built, and what is planned. Other documents link here instead of restating
 status ([ADR-0007](decisions/0007-docs-single-source-of-truth.md)). Progress
 and milestones live in [process.md](process.md).
 
-Last updated: 2026-11-23.
+Last updated: 2026-11-24.
 
 ## Status vocabulary
 

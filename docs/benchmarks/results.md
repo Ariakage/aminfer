@@ -5858,13 +5858,13 @@ Recorded on Apple M4 (`Mac16,12`, `Apple9` GPU, `24 GiB` unified memory,
 
 | Track | Scope / Condition | Measured Result (M4, ReleaseFast) | Notes / Guard |
 | --- | --- | --- | --- |
-| **G23 M=1 GEMV** | `4096 x 4096` rotating `>= 64 MiB` working set across 14 `W21`/`W22` dtypes vs legacy `q4_g64` (`38.14 GB/s`, `31.8%` bus) | `gguf_q4_0`: `71.53 GB/s` (`59.6%` bus, `132.17 us`); `q8_affine_g64`: `68.84 GB/s` (`57.4%`); `gguf_q8_0`: `68.48 GB/s` (`57.1%`); `q6_affine_g64`: `62.83 GB/s`; `q5_affine_g64`: `59.92 GB/s`; `q4_affine_g64`: `58.68 GB/s`; `nvfp4_g16`: `55.99 GB/s` (`46.7%`); `fp8_e4m3_block`: `46.91 GB/s`; `mxfp8_g32`: `46.69 GB/s`; `gguf_q4_k`: `43.79 GB/s`; `gguf_q2_0`: `38.62 GB/s`; `gguf_iq2_xxs`: `25.79 GB/s`; `gguf_tq1_0`: `12.72 GB/s` | `quant_formats.metal` compiled with `-std=metal4.0 -Wall -Werror -Wframe-larger-than=1` (`0` warnings, `0` register spills) |
-| **G23 M=64 Prefill** | `M = 64, N = 2048, K = 2048` tiled `fp16` dequant + `G15` GEMM | `fp8_block`: `0.705 ms` (`0.76 TFLOPS`); `nvfp4_g16`: `0.713 ms` (`0.75 TFLOPS`); `mxfp8_g32`: `0.738 ms` (`0.73 TFLOPS`); `gguf_q4_k`: `1.373 ms` (`0.39 TFLOPS`) | Reuses preallocated `16 KiB`-aligned tile buffer (`0` hot-path allocs) |
-| **G24 Act-Quant** | Opt-in `--act-quant` (`K = 4096`, `M = 1` & `M = 16`) | `none`: `0` dispatches (`0.00 us`); `fp8_g128`: `m1=9.84 us, m16=15.07 us, mae=0.028059`; `mxfp8_g32`: `m1=14.44 us, m16=16.76 us, mae=0.034028`; `nvfp4_g16`: `m1=26.68 us, m16=28.50 us, mae=0.118255`; `fouroversix_mae`: `m1=42.66 us, m16=291.18 us, mae=0.109436` (`99.9%` win rate, `7.46%` MAE reduction vs `nvfp4_g16`) | Default `none` incurs `0` dispatch overhead |
-| **C25 SME2 `.s`** | Bare-metal ARMv9.2 SME2 `E2M1`/`Q2_0`/`TQ`/`IQ2` microkernels (`M = 4` & `M = 16`) | `tq1_0`: `334.43 / 632.86 GOPS`; `q2_0`: `310.45 / 631.86 GOPS`; `tq2_0`: `334.43 / 619.70 GOPS`; `nvfp4_g16`: `119.34 / 496.64 GOPS`; `iq2_xxs`: `234.78 / 259.23 GOPS` (`max_err=1.22e-4`); `mxfp4_g32`: `201.53 / 257.82 GOPS`; `c13_bus_gate = pass` | `otool -tvV` audited `61` `_ami_sme2_*` symbols (`0` streaming `[sp` spills, `0` leaked ops, `0` missing `d8–d15` saves) |
+| **G23 M=1 GEMV** | `4096 x 4096` rotating `>= 64 MiB` working set across 14 `W21`/`W22` dtypes vs legacy `q4_g64` (`76.73 GB/s`, `63.9%` bus) | `q4_affine_g64`: `90.96 GB/s` (`75.8%` bus, `103.93 us`); `q4_affine_g32`: `87.34 GB/s` (`72.8%`); `gguf_q4_0`: `87.22 GB/s` (`72.7%`, `108.39 us`); `q8_affine_g64`: `86.73 GB/s` (`72.3%`); `q6_affine_g64`: `84.74 GB/s`; `gguf_q8_0`: `82.60 GB/s`; `q5_affine_g64`: `80.54 GB/s`; `nvfp4_g16`: `72.81 GB/s` (`60.7%`); `mxfp8_g32`: `66.32 GB/s`; `fp8_e4m3_block`: `65.22 GB/s`; `gguf_q4_k`: `60.62 GB/s`; `gguf_q2_0`: `54.94 GB/s`; `gguf_iq2_xxs`: `35.51 GB/s`; `gguf_tq1_0`: `21.16 GB/s` | `quant_formats.metal` compiled with `-std=metal4.0 -Wall -Werror -Wframe-larger-than=1` (`0` warnings, `0` register spills) |
+| **G23 M=64 Prefill** | `M = 64, N = 2048, K = 2048` tiled `fp16` dequant + `G15` GEMM | `gguf_q4_k`: `0.604 ms` (`0.89 TFLOPS`); `nvfp4_g16`: `0.617 ms` (`0.87 TFLOPS`); `fp8_block`: `0.668 ms` (`0.80 TFLOPS`); `mxfp8_g32`: `0.693 ms` (`0.77 TFLOPS`) | Reuses preallocated `16 KiB`-aligned tile buffer (`0` hot-path allocs) |
+| **G24 Act-Quant** | Opt-in `--act-quant` (`K = 4096`, `M = 1` & `M = 16`) | `none`: `0` dispatches (`0.00 us`); `fp8_g128`: `m1=13.57 us, m16=17.25 us, mae=0.028059`; `mxfp8_g32`: `m1=16.56 us, m16=28.64 us, mae=0.034028`; `nvfp4_g16`: `m1=25.23 us, m16=25.81 us, mae=0.118255`; `fouroversix_mae`: `m1=35.41 us, m16=36.20 us, mae=0.109436` (`99.9%` win rate, `7.46%` MAE reduction vs `nvfp4_g16`) | Default `none` incurs `0` dispatch overhead |
+| **C25 SME2 `.s`** | Bare-metal ARMv9.2 SME2 `E2M1`/`Q2_0`/`TQ`/`IQ2` microkernels (`M = 4` & `M = 16`) | `tq1_0`: `159.91 / 298.93 GOPS`; `nvfp4_g16`: `50.92 / 229.37 GOPS`; `tq2_0`: `87.61 / 218.42 GOPS`; `q2_0`: `94.59 / 202.57 GOPS`; `iq2_xxs`: `98.93 / 185.45 GOPS` (`max_err=1.22e-4`); `mxfp4_g32`: `99.40 / 130.48 GOPS`; `c13_bus_gate = pass` | `otool -tvV` audited `67` `_ami_sme2_*` symbols (`61` public `.globl` entrypoints + `6` local `.s` helpers; `0` streaming `[sp` spills, `0` leaked ops, `0` missing `d8–d15` saves) |
 | **W21 / W22 E2E** | Dense `nvfp4_g16` + `q8_affine` embed, hetero asymmetric MoE (`nvfp4_g16`+`gguf_q2_0`/`gguf_q4_k` + `fp8_e4m3_block` attn + `gguf_q8_0` embed), quantized `DraftHead`, fork guard | `dense_e2e_parity = pass`, `moe_hetero_parity = pass`, `draft_quant_parity = pass`, `fork_stq1_reject = pass` | `M = 16` prefill + `M = 1` decode + `M = 4` `verifyTree` all finite; colliding `STQ1_0` payload on `type 43` rejected |
-| **W24 + C18** | Live `Inkling-2-Mini` (`o200k` + `ignore_merges`) & `Hy4-flash` tokenizers, zero-alloc `ChatTemplate`, live loopback HTTP/SSE | `Inkling-2`: `96.69 MB/s` (`live_metadata`); `Hy4`: `63.31 MB/s` (`live_metadata`); `ChatTemplate` render: `chatml=0.32 us`, `inkling2=0.38 us`, `hy4=0.17 us`; `keepalive=pass`, `hmac_sig_400=pass`, `resp_completed_output=pass` | Tested against `/Volumes/Akari/models/metadata/{thinkingmachines__Inkling-2-Mini,tencent__Hy4-flash}/tokenizer.json` |
-| **W24 KL Quality Gate** | 11-format synthetic `BF16` vs quantized sweep + real on-disk `Qwen3-0.6B` `BF16` vs `GSQ-RCO` (`8` greedy steps, `R9` live-RAM gated) | Synthetic: `gguf_q8_0` `mean_kl=0.000356` (`100.0%` top-1, `8/8` greedy), `q8_affine_g64` `0.000387`, `q6_affine_g64` `0.005392`, `fp8_e4m3_block` `0.013708`, `mxfp8_g32` `0.017925` (`100.0%` top-1, `8/8` greedy), `q5_affine_g64` `0.019284`, `gguf_q4_k` `0.079079`, `q4_affine_g32` `0.080456`, `nvfp4_g16` `0.252315`, `nvfp4_g16_aq46` `0.380999`, `gguf_q2_0` `2.302979`; Real `Qwen3-0.6B` `BF16` vs `GSQ-RCO`: `status=ok`, `mean_kl=0.161378`, `max_kl=0.556827`, `top1=100.0% (8/8)`, `greedy=8/8`, `finite=yes` | Standalone `aminfer quality-gate` matches identically; `swapouts_delta = 0` |
+| **W24 + C18** | Live `Inkling-2-Mini` (`o200k` + `ignore_merges`) & `Hy4-flash` tokenizers, zero-alloc `ChatTemplate`, live loopback HTTP/SSE | `Inkling-2`: `46.18 MB/s` (`live_metadata`); `Hy4`: `27.57 MB/s` (`live_metadata`); `ChatTemplate` render: `chatml=0.38 us`, `inkling2=0.49 us`, `hy4=0.25 us`; `keepalive=pass`, `hmac_sig_400=pass`, `resp_completed_output=pass` | Tested against `/Volumes/Akari/models/metadata/{thinkingmachines__Inkling-2-Mini,tencent__Hy4-flash}/tokenizer.json` |
+| **W24 KL Quality Gate** | 11-format synthetic `BF16` vs quantized sweep + real on-disk `Qwen3-0.6B` `BF16` vs `GSQ-RCO` multi-prompt math + code eval (`8` greedy steps = `4` math + `4` code, `R9` live-RAM gated) | Synthetic: `gguf_q8_0` `mean_kl=0.000356` (`100.0%` top-1, `8/8` greedy), `q8_affine_g64` `0.000387`, `q6_affine_g64` `0.005392`, `fp8_e4m3_block` `0.013708`, `mxfp8_g32` `0.017925` (`100.0%` top-1, `8/8` greedy), `q5_affine_g64` `0.019284`, `gguf_q4_k` `0.079079`, `q4_affine_g32` `0.080456`, `nvfp4_g16` `0.252315`, `nvfp4_g16_aq46` `0.380999`, `gguf_q2_0` `2.302979`; Real `qwen3-0.6b-bf16_vs_qwen3-0.6b-gsq-rco`: `status=ok`, `mean_kl=0.401752`, `max_kl=1.712455`, `top1=62.5% (5/8)`, `greedy=3/8`, `math=3/4`, `code=0/4`, `tok=resolved`, `finite=yes` | Standalone `aminfer quality-gate` matches identically (and runs cleanly with `tok=fallback` when `-k` is omitted on non-embedded `.amf`); `swapouts_delta = 0` |
 
 ### Verbatim `aminfer bench-m81` output
 
@@ -5873,46 +5873,46 @@ Recorded on Apple M4 (`Mac16,12`, `Apple9` GPU, `24 GiB` unified memory,
 ```text
 bench.m81.chip                   Apple M4 (m4, spec_bus=120.0 GB/s)
 bench.m81.swapouts_delta         0
-bench.m81.g23.baseline.q4_g64    38.14 GB/s (31.8% bus)
-bench.m81.g23.gemv.q4_affine_g64    58.68 GB/s (48.9% bus, 161.10 us)
-bench.m81.g23.gemv.q4_affine_g32    57.09 GB/s (47.6% bus, 183.97 us)
-bench.m81.g23.gemv.q5_affine_g64    59.92 GB/s (49.9% bus, 192.78 us)
-bench.m81.g23.gemv.q6_affine_g64    62.83 GB/s (52.4% bus, 217.23 us)
-bench.m81.g23.gemv.q8_affine_g64    68.84 GB/s (57.4% bus, 259.18 us)
-bench.m81.g23.gemv.fp8_e4m3_block   46.91 GB/s (39.1% bus, 358.10 us)
-bench.m81.g23.gemv.mxfp8_g32        46.69 GB/s (38.9% bus, 370.88 us)
-bench.m81.g23.gemv.nvfp4_g16        55.99 GB/s (46.7% bus, 168.84 us)
-bench.m81.g23.gemv.gguf_q8_0        68.48 GB/s (57.1% bus, 260.55 us)
-bench.m81.g23.gemv.gguf_q4_0        71.53 GB/s (59.6% bus, 132.17 us)
-bench.m81.g23.gemv.gguf_q4_k        43.79 GB/s (36.5% bus, 215.88 us)
-bench.m81.g23.gemv.gguf_q2_0        38.62 GB/s (32.2% bus, 122.60 us)
-bench.m81.g23.gemv.gguf_iq2_xxs     25.79 GB/s (21.5% bus, 168.36 us)
-bench.m81.g23.gemv.gguf_tq1_0       12.72 GB/s (10.6% bus, 279.57 us)
-bench.m81.g23.prefill64.nvfp4_g16   0.713 ms (0.75 TFLOPS)
-bench.m81.g23.prefill64.mxfp8_g32   0.738 ms (0.73 TFLOPS)
-bench.m81.g23.prefill64.fp8_block   0.705 ms (0.76 TFLOPS)
-bench.m81.g23.prefill64.gguf_q4_k   1.373 ms (0.39 TFLOPS)
+bench.m81.g23.baseline.q4_g64    76.73 GB/s (63.9% bus)
+bench.m81.g23.gemv.q4_affine_g64    90.96 GB/s (75.8% bus, 103.93 us)
+bench.m81.g23.gemv.q4_affine_g32    87.34 GB/s (72.8% bus, 120.24 us)
+bench.m81.g23.gemv.q5_affine_g64    80.54 GB/s (67.1% bus, 143.42 us)
+bench.m81.g23.gemv.q6_affine_g64    84.74 GB/s (70.6% bus, 161.06 us)
+bench.m81.g23.gemv.q8_affine_g64    86.73 GB/s (72.3% bus, 205.72 us)
+bench.m81.g23.gemv.fp8_e4m3_block   65.22 GB/s (54.3% bus, 257.57 us)
+bench.m81.g23.gemv.mxfp8_g32        66.32 GB/s (55.3% bus, 261.14 us)
+bench.m81.g23.gemv.nvfp4_g16        72.81 GB/s (60.7% bus, 129.84 us)
+bench.m81.g23.gemv.gguf_q8_0        82.60 GB/s (68.8% bus, 216.02 us)
+bench.m81.g23.gemv.gguf_q4_0        87.22 GB/s (72.7% bus, 108.39 us)
+bench.m81.g23.gemv.gguf_q4_k        60.62 GB/s (50.5% bus, 155.94 us)
+bench.m81.g23.gemv.gguf_q2_0        54.94 GB/s (45.8% bus, 86.19 us)
+bench.m81.g23.gemv.gguf_iq2_xxs     35.51 GB/s (29.6% bus, 122.26 us)
+bench.m81.g23.gemv.gguf_tq1_0       21.16 GB/s (17.6% bus, 168.05 us)
+bench.m81.g23.prefill64.nvfp4_g16   0.617 ms (0.87 TFLOPS)
+bench.m81.g23.prefill64.mxfp8_g32   0.693 ms (0.77 TFLOPS)
+bench.m81.g23.prefill64.fp8_block   0.668 ms (0.80 TFLOPS)
+bench.m81.g23.prefill64.gguf_q4_k   0.604 ms (0.89 TFLOPS)
 bench.m81.g24.none_dispatches    0
 bench.m81.g24.act.none              m1=0.00 us m16=0.00 us mae=0.000000
-bench.m81.g24.act.mxfp8_g32         m1=14.44 us m16=16.76 us mae=0.034028
-bench.m81.g24.act.fp8_g128          m1=9.84 us m16=15.07 us mae=0.028059
-bench.m81.g24.act.nvfp4_g16         m1=26.68 us m16=28.50 us mae=0.118255
-bench.m81.g24.act.fouroversix_mae   m1=42.66 us m16=291.18 us mae=0.109436
+bench.m81.g24.act.mxfp8_g32         m1=16.56 us m16=28.64 us mae=0.034028
+bench.m81.g24.act.fp8_g128          m1=13.57 us m16=17.25 us mae=0.028059
+bench.m81.g24.act.nvfp4_g16         m1=25.23 us m16=25.81 us mae=0.118255
+bench.m81.g24.act.fouroversix_mae   m1=35.41 us m16=36.20 us mae=0.109436
 bench.m81.g24.fouroversix        win_rate=99.9% mae_reduction=7.46%
 bench.m81.c25.sme2_hw            active (c13_bus_gate=pass)
-bench.m81.c25.sme2.nvfp4_g16        m4=119.34 GOPS m16=496.64 GOPS max_err=0.00e0 parity=pass
-bench.m81.c25.sme2.mxfp4_g32        m4=201.53 GOPS m16=257.82 GOPS max_err=0.00e0 parity=pass
-bench.m81.c25.sme2.q2_0             m4=310.45 GOPS m16=631.86 GOPS max_err=0.00e0 parity=pass
-bench.m81.c25.sme2.tq1_0            m4=334.43 GOPS m16=632.86 GOPS max_err=0.00e0 parity=pass
-bench.m81.c25.sme2.tq2_0            m4=334.43 GOPS m16=619.70 GOPS max_err=0.00e0 parity=pass
-bench.m81.c25.sme2.iq2_xxs          m4=234.78 GOPS m16=259.23 GOPS max_err=1.22e-4 parity=pass
+bench.m81.c25.sme2.nvfp4_g16        m4=50.92 GOPS m16=229.37 GOPS max_err=0.00e0 parity=pass
+bench.m81.c25.sme2.mxfp4_g32        m4=99.40 GOPS m16=130.48 GOPS max_err=0.00e0 parity=pass
+bench.m81.c25.sme2.q2_0             m4=94.59 GOPS m16=202.57 GOPS max_err=0.00e0 parity=pass
+bench.m81.c25.sme2.tq1_0            m4=159.91 GOPS m16=298.93 GOPS max_err=0.00e0 parity=pass
+bench.m81.c25.sme2.tq2_0            m4=87.61 GOPS m16=218.42 GOPS max_err=0.00e0 parity=pass
+bench.m81.c25.sme2.iq2_xxs          m4=98.93 GOPS m16=185.45 GOPS max_err=1.22e-4 parity=pass
 bench.m81.w21.dense_e2e_parity   pass
 bench.m81.w22.moe_hetero_parity  pass
 bench.m81.w22.draft_quant_parity pass
 bench.m81.w22.fork_stq1_reject   pass
-bench.m81.w24.tok.inkling2       96.69 MB/s (source=live_metadata)
-bench.m81.w24.tok.hy4            63.31 MB/s (source=live_metadata)
-bench.m81.w24.tpl_render_us      chatml=0.32 inkling2=0.38 hy4=0.17
+bench.m81.w24.tok.inkling2       46.18 MB/s (source=live_metadata)
+bench.m81.w24.tok.hy4            27.57 MB/s (source=live_metadata)
+bench.m81.w24.tpl_render_us      chatml=0.38 inkling2=0.49 hy4=0.25
 bench.m81.c18.http_hardening     keepalive=pass hmac_sig_400=pass resp_completed_output=pass
 quality_gate.swapouts_delta      0
 quality_gate.synth.fp8_e4m3_block       mean_kl=0.013708 max_kl=0.018387 top1=87.5% (7/8) greedy=4/8 act_quant=none finite=yes
@@ -5926,6 +5926,6 @@ quality_gate.synth.nvfp4_g16_aq46       mean_kl=0.380999 max_kl=0.447204 top1=37
 quality_gate.synth.gguf_q8_0            mean_kl=0.000356 max_kl=0.000722 top1=100.0% (8/8) greedy=8/8 act_quant=none finite=yes
 quality_gate.synth.gguf_q4_k            mean_kl=0.079079 max_kl=0.134074 top1=87.5% (7/8) greedy=4/8 act_quant=none finite=yes
 quality_gate.synth.gguf_q2_0            mean_kl=2.302979 max_kl=4.410398 top1=0.0% (0/8) greedy=0/8 act_quant=none finite=yes
-quality_gate.real.qwen3-0.6b-bf16_vs_gsq status=ok mean_kl=0.161378 max_kl=0.556827 top1=100.0% (8/8) greedy=8/8 act_quant=none finite=yes
+quality_gate.real.qwen3-0.6b-bf16_vs_qwen3-0.6b-gsq-rco status=ok mean_kl=0.401752 max_kl=1.712455 top1=62.5% (5/8) greedy=3/8 math=3/4 code=0/4 tok=resolved act_quant=none finite=yes
 ```
 
