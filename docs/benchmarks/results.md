@@ -5929,3 +5929,71 @@ quality_gate.synth.gguf_q2_0            mean_kl=2.302979 max_kl=4.410398 top1=0.
 quality_gate.real.qwen3-0.6b-bf16_vs_qwen3-0.6b-gsq-rco status=ok mean_kl=0.401752 max_kl=1.712455 top1=62.5% (5/8) greedy=3/8 math=3/4 code=0/4 tok=resolved act_quant=none finite=yes
 ```
 
+## M8.15: Sampling Penalty Parity, GSQ-RCO v2 Fidelity Hardening, and Router-Trace Loop Quality Gate
+
+Recorded on Apple M4 (`Mac16,12`, `Apple9` GPU, `24 GiB` unified memory,
+`120.0 GB/s` bus) during Milestone M8.15
+([ADR-0017](../decisions/0017-optional-gsq-rco-hybrid-quantization.md#m815-gsq-rco-v2-fidelity-hardening-w8-w14-w17-w24-c18-c20),
+[ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md)).
+
+### 1. Root-cause diagnosis: `qwen3-30b-a3b-gsq-rco.amf` (`2.700b`) vs uniform `3-bit` baseline (`qwen3-30b-a3b-3bit.amf`)
+
+Controlled CLI and tensor-level comparison on `2026-11-24` isolated why
+`qwen3-30b-a3b-gsq-rco.amf` (`2.700b`) exhibited open-`<think>` repetition loops
+and factual collapse on long reasoning prompts while passing short M6 sanity
+prompts (`Paris is the capital of France.`):
+
+- **Tensor distribution & dequantization audit (`18,867` tensors, `10,309,206,016 B` file / `10,306,764,800 B` wired)**:
+  - `5,178 / 6,144` routed experts (`84.3%` overall, `52.3%`–`92.2%` per layer
+    — `67 / 128` at layer `0` up to `118 / 128` at layer `29`;
+    `15,534` expert projection tensors) were double-quantized from the `3-bit`
+    source (`mlx-community/Qwen3-30B-A3B-3bit`) down to `q2_affine` (`g64`);
+  - All `3,140` `q3_affine` tensors (`2,898` hot expert tensors across `966`
+    experts + `192` attention projections + `48` routers + `embed_tokens` +
+    `lm_head`) are byte-for-byte identical (`same = 3140, diff = 0`) to
+    `qwen3-30b-a3b-3bit.amf`;
+  - Dequantizing the `q2_affine` expert projections against
+    `qwen3-30b-a3b-3bit.amf` yields cosine similarity `cos = 0.9523–0.9543`
+    (confirming bit-exact `(scale, bias)` and `dequant8_q2` kernel layout) but a
+    per-matrix relative RMSE of `rel_rmse = 0.2988–0.3052` (`~30%` relative
+    error compounded across 48 top-8 MoE layers), aggravated by shallow
+    `embed_router_sample` (`48` static embedding tokens) heat selection.
+- **Controlled CLI matrix (same engine binary)**:
+
+| Model | Command & flags | Prompt | Measured behavior |
+| --- | --- | --- | --- |
+| `qwen3-30b-a3b-gsq-rco.amf` (`2.700b`) | `chat --max-seq-len 4096 -n 512 -t 0.6 -V -C` (4 turns via `/retry`) | `hi` | Stochastic `<think>` loop without penalties: Turn 1 (`88 tok`), Retry 2 (`75 tok`), and Retry 3 (`74 tok`) terminate normally; Retry 1 (`512 tok`, `PrefixCache hit 19/20`) misses `</think>` at paragraph boundary and repeats the opening `<think>` paragraph 11+ times under unpenalized full-vocab sampling |
+| `qwen3-30b-a3b-gsq-rco.amf` (`2.700b`) | `chat --max-seq-len 4096 -n 300 -t 0 -V -C` & `decode --no-verify-crc -n 200 -t 0` | `告诉我黎曼猜想是什么` | Knowledge collapse + deterministic repetition loop even at greedy `T = 0` and `-N` (`--no-think`, `12.0–15.53 tok/s`, `swapouts_delta = 0`), hallucinating names/dates and looping template clauses |
+| `qwen3-0.6b-gsq-rco.amf` (`4.348b`, `0` `q2_affine`) | `decode --no-verify-crc -n 128 -t 0` | `告诉我黎曼猜想是什么` | Coherent (`128 tok`, `83.10 tok/s`): accurately explains the Riemann zeta function $\zeta(s)$ without loops |
+| `qwen3-30b-a3b-3bit.amf` (`3.50b` uniform, `0` `q2_affine`) | `chat --max-seq-len 512 -n 200 -t 0 -V -C` | `告诉我黎曼猜想是什么` | Accurate, zero repetition loops (`200 tok`, `12.8 tok/s`, `TTFT 653.2 ms`), deriving $\zeta(s) = \sum_{n=1}^{\infty} n^{-s}$, the $s = 1$ pole, and $\operatorname{Re}(s) = 1/2$ |
+
+### 2. M8.15 verification summary and 3-prompt `W24` quality-gate telemetry (`7bcab5a`, `066bbb2`, `019bad7`, `b8c4824`)
+
+| Track | Scope / Condition | Measured Result (M4) | Notes / Guard |
+| --- | --- | --- | --- |
+| **Zig Engine & CLI (`C18`, `C20`, `W8`, `W24`)** | `zig build test` (Debug & `-Doptimize=ReleaseSafe`) | **`480/480` passed** (`459` lib + `15` CLI + `6` C-ABI SDK across `10/10` steps; `0` `catch {}`, `zig fmt --check` clean) | Covers `BatchServeRunner` request/prompt-keyed `pending_jobs` concurrent slot binding + per-slot `DefaultPenaltyTracker` (`slot_penalties`) + constrained `temperatures = 0.0` prefill/decode gating, `aminfer chat` `--top-k`/`--top-p`/`--min-p`/`--repetition-penalty`/`--presence-penalty`/`--frequency-penalty` (`T = 0` bit-exact greedy bypass), `aminfer decode --dump-router-trace` single-frame 64 B/layer scratch redirect matching `stepDecodeCaptureLayerRouting` bit-for-bit, and `W24` 4-gram/consecutive repetition loop detector |
+| **Python `GSQ-RCO v2` & SDK (`W8`, `W14`, `W17`, `C17`)** | `uv run --directory tools python -m unittest discover -s tests -v` & `python/tests` | **`115/115` `tools/` passed** (`14/14` in `test_m5_gsq_rco.py`) and **`6/6` `python/tests` SDK passed** | Verified activation-weighted OLS RCO (2D + 3D stacked MoE `col_weights` & per-expert `.counts` from `parse_gguf_imatrix`), `_BACKBONE_PROTECTED_ROLES` non-`q2_affine` floor (`target_bits=2.1` -> `ValueError`), `max_q2_share`, auto `4.15` Dense (`0` `q2_affine`) / `3.50` MoE `target_bits` (incl. `qwen4_exp` & HF 3D stacked `mlp.experts.*`), CLI low-bit `3-bit -> q2_affine` double-quantization guard (`--allow-retranscode-lowbit`), `--fine-rungs` (`g32` + `Q5`/`Q6`/`Q8_AFFINE` capped `<= 5` schemes/layer, uniform per-layer MoE `TensorLayout` under `--lut16-sme2`) round-trip via `aminfer verify-amf` & `aminfer decode`, and `decode --dump-router-trace` -> `expert-heat --calibration-jsonl` (`calibration_mode = "router_trace"`, no stderr warning) |
+| **3-Prompt `W24` Quality Gate (`--steps 32`)** | `qwen3-0.6b-bf16.amf` vs `qwen3-0.6b-gsq-rco.amf` across math (`11` steps), code (`11` steps), and conceptual reasoning (`Riemann zeta`, `10` steps) (`ReleaseFast`) | `status=ok`, `mean_kl=0.313250`, `max_kl=1.712455`, `top1=62.5% (20/32)`, `greedy=4/32` (`math=4/11`, `code=0/11`, `reason=0/10`), `max_4gram=1`, `loop=no`, `tok=resolved`, `act_quant=none`, `finite=yes` | `quality_gate.swapouts_delta = 0` (external `vm_stat` swapouts `55156714 -> 55156714`, `delta = 0`); all `11/11` synthetic format pairs `finite=yes` |
+
+### Verbatim 32-step 3-prompt `aminfer quality-gate` output (`ReleaseFast`, commits `7bcab5a` / `019bad7`)
+
+`./zig-out/bin/aminfer quality-gate --ref /Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf --cand /Volumes/Akari/models/amf/qwen3-0.6b-gsq-rco.amf --config /Volumes/Akari/models/Qwen3-0.6B/config.json --tokenizer /Volumes/Akari/models/Qwen3-0.6B/tokenizer.json --steps 32`:
+
+```text
+quality_gate.swapouts_delta      0
+quality_gate.synth.fp8_e4m3_block       mean_kl=0.013708 max_kl=0.018387 top1=87.5% (7/8) greedy=4/8 act_quant=none finite=yes
+quality_gate.synth.mxfp8_g32            mean_kl=0.017925 max_kl=0.031343 top1=100.0% (8/8) greedy=8/8 act_quant=none finite=yes
+quality_gate.synth.q8_affine_g64        mean_kl=0.000387 max_kl=0.000628 top1=87.5% (7/8) greedy=4/8 act_quant=none finite=yes
+quality_gate.synth.q6_affine_g64        mean_kl=0.005392 max_kl=0.008049 top1=87.5% (7/8) greedy=4/8 act_quant=none finite=yes
+quality_gate.synth.q5_affine_g64        mean_kl=0.019284 max_kl=0.024888 top1=75.0% (6/8) greedy=4/8 act_quant=none finite=yes
+quality_gate.synth.q4_affine_g32        mean_kl=0.080456 max_kl=0.118350 top1=87.5% (7/8) greedy=4/8 act_quant=none finite=yes
+quality_gate.synth.nvfp4_g16            mean_kl=0.252315 max_kl=0.338868 top1=50.0% (4/8) greedy=1/8 act_quant=none finite=yes
+quality_gate.synth.nvfp4_g16_aq46       mean_kl=0.380999 max_kl=0.447204 top1=37.5% (3/8) greedy=0/8 act_quant=fouroversix_mae finite=yes
+quality_gate.synth.gguf_q8_0            mean_kl=0.000356 max_kl=0.000722 top1=100.0% (8/8) greedy=8/8 act_quant=none finite=yes
+quality_gate.synth.gguf_q4_k            mean_kl=0.079079 max_kl=0.134074 top1=87.5% (7/8) greedy=4/8 act_quant=none finite=yes
+quality_gate.synth.gguf_q2_0            mean_kl=2.302979 max_kl=4.410398 top1=0.0% (0/8) greedy=0/8 act_quant=none finite=yes
+quality_gate.real.qwen3-0.6b-bf16_vs_qwen3-0.6b-gsq-rco status=ok mean_kl=0.313250 max_kl=1.712455 top1=62.5% (20/32) greedy=4/32 math=4/11 code=0/11 reason=0/10 max_4gram=1 loop=no tok=resolved act_quant=none finite=yes
+```
+
+
+

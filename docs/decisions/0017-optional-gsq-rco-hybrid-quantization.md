@@ -91,8 +91,8 @@ IDs `W14` and `G13`; authoritative implementation status lives in
    | `q2_affine` | 2-bit | 64 (compile-time) | 16 B + 4 B `half2` (or inline `ZT0` LUT) | 2.50 | See [../status.md](../status.md) (`W14` / `G13`) |
    | `q3_affine` | 3-bit | 64 (compile-time) | 24 B + 4 B `half2` | 3.50 | Implemented (`W1` / `G1`) |
    | `q4_affine` | 4-bit | 64 (compile-time) | 32 B + 4 B `half2` (or inline `ZT0` LUT) | 4.50 | Implemented (`W1` / `G1`) |
-   | `q6_affine` | 6-bit | 64 (compile-time) | 48 B + 4 B `half2` | 6.50 | Deferred post-M5 unless benchmark-justified |
-   | `q8_affine` | 8-bit | 64 (compile-time) | 64 B + 4 B `half2` | 8.50 | Deferred post-M5 unless benchmark-justified |
+   | `q6_affine` | 6-bit | 64 (compile-time) | 48 B + 4 B `half2` | 6.50 | Implemented in M8.1/M8.15 (`W21` / `G23`, `--fine-rungs`; see [../status.md](../status.md)) |
+   | `q8_affine` | 8-bit | 64 (compile-time) | 64 B + 4 B `half2` | 8.50 | Implemented in M8.1/M8.15 (`W21` / `G23`, `--fine-rungs`; see [../status.md](../status.md)) |
    | `f16` | 16-bit | 0 (unquantized) | — | 16.00 | Implemented (`W1` / `G12`) |
    | `bf16` | 16-bit | 0 (unquantized) | — | 16.00 | Implemented (`W12` / `G12`) |
 
@@ -175,6 +175,101 @@ IDs `W14` and `G13`; authoritative implementation status lives in
      effective `bytes/token`, and end-to-end `tok/s` in
      [../benchmarks/results.md](../benchmarks/results.md).
 
+### M8.15 GSQ-RCO v2 fidelity hardening (`W8`, `W14`, `W17`, `W24`, `C18`, `C20`)
+
+Post-M8.1 root-cause diagnosis on `qwen3-30b-a3b-gsq-rco.amf` (`2.700b`, built in
+M6 from already-quantized `mlx-community/Qwen3-30B-A3B-3bit`) vs the uniform
+`3-bit` baseline (`qwen3-30b-a3b-3bit.amf`, which decodes conceptual reasoning
+prompts accurately with zero repetition loops on the same engine) identified
+three compounding failure modes:
+
+1. **Low-bit `3-bit -> 2.70b` double-quantization with extreme `q2_affine`
+   expert share**: transcoding a `3-bit` source checkpoint to `2.700b` forced
+   `5,178 / 6,144` routed experts (`84.3%` overall, `52.3%`–`92.2%` of routed
+   experts per layer — up to `118 / 128` at layer `29`; `15,534` expert
+   projection tensors) down to `q2_affine`,
+   incurring `~30%` per-matrix relative weight RMSE (`rel_rmse = 0.299–0.305`
+   despite valid `cos = 0.952–0.954` bit packing), while unweighted OLS RCO
+   weighted all input channels equally instead of weighting by per-channel
+   activation second moments $E[x_c^2]$.
+2. **Shallow embedding-only `expert-heat` calibration (`embed_router_sample`)**:
+   without `--calibration-jsonl`, `expert-heat` multiplied `48` static token
+   embeddings directly by router gates, ignoring pre-layer Transformer
+   activation transformations when selecting the `15.7%` (`966`) experts kept at
+   `q3_affine`.
+3. **Unpenalized chat and batch-serving decoding (`C20`, `C18`)**:
+   `ChatEngineRunner` (`aminfer chat`) and `BatchServeRunner`
+   (`seen_frequencies = null`) passed raw `temperature` into full-vocabulary
+   softmax sampling without `top_k` / `top_p` / `min_p` filtering or
+   repetition/presence/frequency penalties, allowing open `<think>` chains or
+   degraded 2-bit templates to lock into verbatim repetition loops.
+
+To prevent these failure modes across all Dense and MoE checkpoints (including
+upcoming [ADR-0025](0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md)
+frontier tier-down profiles), Milestone **M8.15** hardens the offline
+quantization toolchain, router-trace pipeline, and runtime samplers with four
+binding rules:
+
+1. **Activation-weighted OLS RCO (`W14`)**: when `--imatrix` is supplied,
+   `parse_gguf_imatrix` provides both tensor-level sensitivity multipliers and
+   per-column channel weight vectors $w_c = \max(E[x_c^2], 10^{-12})$ (across
+   both 2D projections and 3D stacked MoE expert tensors via shared `[cols]`
+   broadcast or per-expert `[num_experts * cols]` channel slicing + per-expert
+   `.counts`) to `quantize_rows_affine` and `quantize_group_rco`, minimizing
+   $\sum_{i \in g} w_i (\hat{x}_i - x_i)^2$ (for group weights $x_i$,
+   reconstructed $\hat{x}_i = b + q_i s$, and channel importance $w_i$) over
+   each group-32 / group-64 / group-128 slice (with automatic fallback to
+   min-max under the same weighted objective if alternating refinement does not
+   improve error).
+2. **Hard backbone role floor, `--max-q2-share`, architecture-aware auto
+   `target_bits`, CLI low-bit double-quantization guard, and `--fine-rungs`
+   (`W14`, `W17`)**:
+   - `enforce_backbone_floor = True` forbids `DType.Q2_AFFINE` candidates on
+     all `18` `_BACKBONE_PROTECTED_ROLES` (`_PROTECTED_HIGH_PRECISION_ROLES`:
+     `router`, `controller`, `sconv`, `ihc`, `mtp_dflare`, `vision`,
+     `embedding`, `lm_head`, `shared_expert`, `attn_qk`, `attn_v`, `attn_o`,
+     `attn_vo`, `norm`, plus GGUF/hybrid `embed_head`, `attn_qkv_o`,
+     `ssm_dt_a`, `ssm_proj`), and `--max-q2-share` caps
+     `q2_numel / quantizable_numel` inside `solve_gsq_allocation` (override via
+     `--allow-unsafe-q2`);
+   - Omitting `--target-bits` resolves automatically to `4.15` for Dense models
+     (`num_experts <= 1`, default `max_q2_share = 0.0` so `0` tensors drop to
+     `q2_affine`) and `3.50` for MoE models (`num_experts > 1`, CLI default
+     `max_q2_share = 0.55`, including `qwen4_exp` and HF 3D stacked
+     `mlp.experts.*` checkpoints);
+   - CLI `pack-amf` and `gsq-convert` reject `q2/q3/q4_affine -> q2_affine`
+     low-bit double-quantization by default unless `--allow-retranscode-lowbit`
+     is explicitly passed;
+   - `--fine-rungs` enables intermediate M8.1 schemes (`(Q2/Q3/Q4_AFFINE, g32)`
+     and `(Q5/Q6/Q8_AFFINE, g64)`) on float sources while capping `moe_expert`
+     candidate schemes to `<= 5` per layer (`moe.NUM_SCHEME_BUCKETS = 5`
+     defined in `src/gpu/moe.zig` and enforced in `src/model/qwen3.zig` and
+     `src/model/graph.zig`, with `lut16_sme2` gated strictly to group-64
+     `Q2/Q3/Q4_AFFINE` and per-layer uniform MoE `TensorLayout` keeping all
+     experts in a layer `ROW_MAJOR` whenever any expert selects a non-SME2
+     scheme).
+3. **Zero-copy single-frame GPU router top-k trace export and shallow-heat
+   warning (`W8`)**: `aminfer decode --dump-router-trace <path.jsonl>` carves a
+   `num_layers * 64 B` buffer in `scratch_arena` and redirects each layer's
+   `scratch_topk_experts_off` inside single-frame decode (`runStep`,
+   `runStepWithLora`, `runStepHeterogeneous`, plus `@memcpy` in `runStepCold`)
+   to emit real multi-layer JSONL router traces (`calibration_mode =
+   "router_trace"`), while `aminfer-tools expert-heat` emits a stderr warning
+   whenever `calibration_mode != "router_trace"`.
+4. **Runtime sampling/penalty parity and `W24` loop quality gate (`C18`, `C20`,
+   `W24`)**: `aminfer chat` (`C20`) wires `--top-k` (`40`), `--top-p` (`0.95`),
+   `--min-p` (`0.05`), `--repetition-penalty` (`1.05` when `T > 0`; `1.0` when
+   `T = 0` for bit-exact greedy parity), `--presence-penalty` (`0.0`), and
+   `--frequency-penalty` (`0.0`) into `ChatEngineRunner` via per-turn
+   `DefaultPenaltyTracker`; `BatchServeRunner` (`C18`) binds `pending_jobs`
+   metadata by `request_id` and `slotPromptBuffer` pointer (isolating concurrent
+   out-of-order prefill slots and orphaned tokenizations) and maintains per-slot
+   `slot_penalties: []DefaultPenaltyTracker` across prompt seeding, GPU
+   `sampleSync` (`seen_frequencies`), CPU fallback `sampleSlotConstrained`, and
+   forced thinking-close tokens; and `aminfer quality-gate` (`W24`) evaluates a
+   3rd conceptual reasoning prompt (`Riemann zeta`) and flags 4-gram or
+   consecutive-token repetition loops (`fail_repetition_loop`).
+
 ## Consequences
 
 - **No runtime bloat or invariant regression**: uniform `.amf` files remain
@@ -197,10 +292,14 @@ IDs `W14` and `G13`; authoritative implementation status lives in
 
 ## Evidence
 
-Authoritative status lives in [../status.md](../status.md), and side-by-side M5
-measurements (`aminfer bench-m5` + real `Qwen3-0.6B` GSQ+RCO vs MinMax vs BF16)
-live in
-[../benchmarks/results.md](../benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization).
+Authoritative status lives in [../status.md](../status.md), and side-by-side M5,
+M6, and M8.15 measurements (`aminfer bench-m5`, real `Qwen3-0.6B` GSQ+RCO vs
+MinMax vs BF16, `Qwen3-30B-A3B` root-cause & `GSQ-RCO v2` hardening, and
+3-prompt `aminfer quality-gate` with `fail_repetition_loop`) live in
+[../benchmarks/results.md](../benchmarks/results.md#m5-serving-pipelining-c6-nvme-n-gram-and-adr-0017-gsqrco-hybrid-quantization),
+[../benchmarks/results.md](../benchmarks/results.md#m6-frontier-hybrid-sparse-models-recurrent-depth-large-moe-gsqrco-and-off-gpu-sme2-draft-heads),
+and
+[../benchmarks/results.md](../benchmarks/results.md#m815-sampling-penalty-parity-gsq-rco-v2-fidelity-hardening-and-router-trace-loop-quality-gate).
 The following verified foundations confirm the architecture requires no breaking
 format or runtime redesign:
 
@@ -220,13 +319,14 @@ format or runtime redesign:
 
 ## Open items
 
-- Calibration dataset selection, reproducibility metadata (written as an
-  offline companion manifest outside the runtime hot path), and exact GSQ
-  sensitivity / RCO solver formulation in `tools/` (`W14`, M5).
+- Calibration dataset selection, reproducibility metadata (`--manifest`), and
+  GSQ sensitivity / RCO solver formulation in `tools/` (`W14`, implemented in M5
+  and hardened with `--imatrix` activation-weighted OLS RCO + `router_trace`
+  calibration in M8.15).
 - Initial M5 `G13` kernel set **locked on 2026-11-21** to
-  `{q2_affine, q3_affine, q4_affine, bf16, f16}` (`q6_affine` / `q8_affine`
-  deferred unless side-by-side baseline benchmarks in
-  [../benchmarks/results.md](../benchmarks/results.md) show a quality gap; see
+  `{q2_affine, q3_affine, q4_affine, bf16, f16}` (extended in M8.1 `W21`/`G23`
+  and M8.15 `--fine-rungs` with `g32` and `q5_affine` / `q6_affine` /
+  `q8_affine`; see [../status.md](../status.md) and
   [open-decisions-research.md](../architecture/open-decisions-research.md#remaining-m3m5-open-tuning-items-adr-0017-d8-adr-0005)).
 - Measured decode (`M = 1`) and tree-verification (`M = 4..16`) dispatch
   overhead of 2-bucket vs 3-bucket `QuantScheme` CSR MoE execution and
