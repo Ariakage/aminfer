@@ -6016,6 +6016,18 @@ quality_gate.real.qwen3-0.6b-bf16_vs_qwen3-0.6b-gsq-rco status=ok mean_kl=0.3132
 | Baseline `qwen3-30b-a3b-3bit.amf` (`100% 3-bit`) | Exact (`410`, clean EOS at `70 tok`) | Exact iterative `a, b = 0, 1` (clean EOS at `42 tok`) | Exact (`Bernhard Riemann`, `1859`, `ζ(s)`) | `2 / 2 / 2` | `26.35–34.29` | `0` |
 
 - Additional live `aminfer chat` checks on `qwen3-30b-a3b-gsq-rco-v2.amf`: `"hi"` (`-t 0.6`, 4 seeds `42/101/202/303`) `4/4` clean (`50–107 tok`, `19.3–31.5 tok/s`, `0` thinking loops); `"告诉我黎曼猜想是什么"` greedy (`-t 0`), no-think greedy (`-t 0 -N`), default M8.15 sampling (`-t 0.6`, `768 tok` full turn at `23.1 tok/s`), and multi-turn Chinese + Python primality proof (`sqrt(n)` proof) all accurate with `0` loops.
+- **5-problem executable Python coding benchmark (`aminfer decode -t 0`, no-think, automated `assert` execution, `swapouts_delta = 0`)**:
+
+| Task | New `v2_3.50b` (`12.445 GiB`) | Baseline `ref_3bit` (`12.446 GiB`) | Old `old_2.70b` (`9.60 GiB`) |
+| --- | --- | --- | --- |
+| `lru_cache` (O(1) `get`/`put`, no `functools`) | `PASS` | `PASS` | `FAIL` (`AssertionError`) |
+| `topo_lex` (lexicographical topo sort + cycle) | `PASS` | `FAIL` (missing `import heapq`) | `FAIL` (`SyntaxError`) |
+| `min_window` (O(\|s\|+\|t\|) min window substring) | `PASS` | `FAIL` (`AssertionError`) | `FAIL` (`SyntaxError`) |
+| `interval_merge` (insert + touching merge) | `PASS` | `PASS` | `FAIL` (bracket mismatch `SyntaxError`) |
+| `expr_eval` (no `eval`/`ast`, unary minus, trunc `//`) | `FAIL` (`NameError: parse_factor`) | `FAIL` (`SyntaxError`) | `FAIL` (used forbidden `eval`) |
+| **Total passed** | **`4 / 5`** | **`2 / 5`** | **`0 / 5`** |
+
+- Diagnostic note logged to [process.md](../process.md#deferred-improvements--temporary-todo-backlog): `imatrix_unsloth.dat` exhibits Pre-LN variance growth (`L0` `ffn_down_exps` peak `0.269` vs `L1` peak `204.56`), causing global cross-layer normalization in `_imatrix_tensor_multipliers` to clip `L0` to `0.5` and assign `60.2%` `q2_affine` at `L0` (vs `32.9%` global MoE expert mean, `0/128` zero-hit experts at `L0`, `226/6,144 = 3.7%` zero-hit overall across the 6-prompt trace).
 
 
 

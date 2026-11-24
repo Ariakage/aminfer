@@ -332,3 +332,13 @@ format or runtime redesign:
   overhead of 2-bucket vs 3-bucket `QuantScheme` CSR MoE execution and
   calibration of per-scheme effective bandwidth `β_s` for
   [ADR-0009](0009-expert-byte-budget-tree-pruning.md).
+- Per-layer normalization of `_imatrix_tensor_multipliers` in
+  `tools/src/aminfer_tools/gsq_rco.py` so Pre-LN activation variance growth
+  across depth (`L1` peak `204.56` vs `L0` peak `0.269` in `imatrix_unsloth.dat`)
+  does not clip shallow-layer `L0`–`L3` multipliers to `0.5` and over-allocate
+  `q2_affine` to `L0` (`60.2%` vs `32.9%` model-wide mean).
+- Coding-priority calibration and `--max-q2-share 0.0` export profile: expand
+  `--dump-router-trace` calibration to a 50–100+ prompt multi-language coding
+  suite and evaluate zero-`q2` MoE exports (pairing `>= q3_affine` experts with
+  lossless NVMe cold-expert offload rather than `q2_affine`) to avoid long-tail
+  specialist-expert degradation on niche programming languages.

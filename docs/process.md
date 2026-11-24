@@ -587,6 +587,16 @@ runs including 3/3 consecutive `bench-m68` executions):
 - [ ] **M9.2 (`GLM-5` family: `W26`, `G27`, `D15`)**: `glm_moe_dsa` (`GLM-5.2`/`5.3` `753B`) & `glm5_next` (`GLM-5.3-Flash` `320B` + `W20` `24L` ViT sidecar split) `.amf` converters + `GSQ-RCO` profiles; `index_topk_freq=4` + `index_share_for_mtp_iteration=true` zero-reindex `MLA`/`DSA`, single-kernel register-fused 20-step `hc_mult=4` `mHC` Sinkhorn, `34L` `fused_qkvbfg_a_proj` linear attention + `11L` `NoPE MLA` (`qk_rope=0`, `index_kpool=4`), and `1L` MTP / `DFlash2`
 - [ ] **M9.3 (`Ling-3.1-flash-1019` & `C27` dynamic MoE tiering: `W27`, `G28`, `C27`)**: `bailing_hybrid` (`572B`) `.amf` converter + `RCO-Q3` dense-`KDA` compression; `63L` `KDA` (`kda_lower_bound=-5.0`, `kda_safe_gate`, `k=4` short conv) + `9L` Gated `MLA` (`g_proj`) + L2 `SME2` `eh_proj` `1L` MTP; lossless session-local dynamic hot-expert working-set promotion in `WiredArena` + opt-in `--cold-expert-min-weight` (`0.0` default lossless, `W24` quality-gated)
 
+## Deferred improvements & temporary TODO backlog
+
+Observed during live M8.15 `Qwen3-30B-A3B` BF16 `GSQ-RCO v2` export and executable coding evaluation; tracked here for future scheduling without blocking `M8.2`:
+
+- [ ] **Per-layer `_imatrix_tensor_multipliers` normalization (`tools/src/aminfer_tools/gsq_rco.py`)**: replace global cross-layer median normalization with per-layer (or per-role-within-layer) normalization so Pre-LN activation variance growth across depth (`L1` `ffn_down_exps` peak `204.56` vs `L0` `0.269`, `~760x` in `imatrix_unsloth.dat`) does not clip shallow-layer `L0`–`L3` multipliers to `0.5` and over-allocate `q2_affine` to `L0` (`60.2%` vs `32.9%` model-wide mean).
+- [ ] **Coding-priority zero-`q2` profile & multi-language `router_trace` corpus (`W8` / `W14`)**: expand `aminfer decode --dump-router-trace` calibration beyond the initial 6-prompt (`1,173`-token, 1 coding prompt) trace to a 50–100+ prompt multi-language coding suite (Python, TypeScript, Rust, C++, Go, Zig, SQL, Shell), and evaluate a coding-first `--max-q2-share 0.0` export (keeping every MoE expert `>= q3_affine`, backbone `bf16`/`q4`, hot experts `q4`/`q6`, pairing with lossless `--cold-experts-per-layer` NVMe offload when tighter wired RAM is needed) to eliminate long-tail specialist-expert degradation on niche languages.
+- [ ] **Expanded executable coding & niche-language regression suite**: extend the 5-problem Python greedy executable harness (`v2_3.50b` `4/5` vs `ref_3bit` `2/5` vs `old_2.70b` `0/5`, `swapouts_delta = 0`, archived in [benchmarks/results.md](benchmarks/results.md#3-native-zig-weighted-ols-rco-accelerator-7cceef9-468cede-and-live-qwen3-30b-a3b-bf16-gsq-rco-v2-ab-regression)) with niche-domain tests (Rust borrow checker, C++ templates, SQL window functions, Metal shaders) and thinking-mode (`-t 0.6`) parser synthesis (`expr_eval`).
+- [ ] **Pre-existing `GraphBatchRuntime` MLA decode buffer note (`src/model/graph.zig:13503-13545`)**: inspect and isolate per-slot `logits_host` row indexing in the `slot_mla_kv.len > 0` branch flagged during the Hydrogen cross-audit (`f904b86` / `#312`).
+- [ ] **Optional `/Volumes/Akari` checkpoint cleanup (user-gated)**: `/Volumes/Akari` has `23 GiB` free; once no further re-exports or A/B checks are needed, confirm with the user before deleting `/Volumes/Akari/models/Qwen3-30B-A3B/*.safetensors` (`56.89 GiB`, keeping `config.json`/`tokenizer.json`) and/or legacy `/Volumes/Akari/models/amf/qwen3-30b-a3b-gsq-rco.amf` (`9.60 GiB`).
+
 ## Verification log
 
 Only checks that actually ran are listed.
@@ -1039,12 +1049,17 @@ Update this before the context window runs out or when handing off.
     `pending_jobs` concurrent slot binding & orphan guard; `b8c4824` `W14`/`W17`
     3D stacked MoE `--imatrix` channel slicing, uniform per-layer MoE
     `TensorLayout` guard under `--fine-rungs --lut16-sme2`, `qwen4_exp` auto
-    `target_bits` parity, and non-finite `target_bits` validation
+    `target_bits` parity, and non-finite `target_bits` validation; `7cceef9` +
+    `468cede` native multi-threaded Zig Weighted OLS RCO C-ABI quantizer
+    (`src/quant/rco.zig`, `ami_sdk_quantize_rows_affine_raw`, `358.6x–378.5x`
+    speedup, `432/432` bit-exact) + `76243ef` live `Qwen/Qwen3-30B-A3B` BF16
+    `GSQ-RCO v2` export & 3-model A/B results
 - Current test & build baseline (`M0`–`M6.8`, `M7.5`, `M7.8`, `M8.1`, and `M8.15`
   complete on M4, `M6.9` code complete, `M7` code & M4 loopback cluster verified,
   live HF frontier metadata & tokenizer compatibility verified, `0` `catch {}`):
   - Zig suite: `480/480` passing (`459` lib + `15` CLI + `6` C-ABI SDK across
-    `10/10` steps) in `Debug` and `ReleaseSafe`, plus `test-quant-formats`
+    `10/10` steps, plus `quant_rco` & `ami_sdk_quantize_rows_affine_raw` tests
+    in `7cceef9`) in `Debug` and `ReleaseSafe`, plus `test-quant-formats`
     (`21/21`), `test-sme` (`22/22`), `test-vision` (`22/22`), `test-hybrid`
     (`26/26`), and `test-cluster` (`27/27`); `zig fmt --check build.zig src`
     clean; `quant_formats.metal` `-std=metal4.0 -Wall -Werror
@@ -1053,7 +1068,7 @@ Update this before the context window runs out or when handing off.
     `.s` helpers, `otool -tvV`); `ReleaseFast` `aminfer bench-m75`, `bench-m78`,
     and `bench-m81` + standalone 32-step 3-prompt `aminfer quality-gate` all
     pass with `swapouts_delta = 0` (`loop=no`, `max_4gram=1`)
-  - Offline Python `tools/` suite: `115/115` passing (`uv run --directory tools python -m unittest discover -s tests -v`, incl. `14/14` in `test_m5_gsq_rco.py`)
+  - Offline Python `tools/` suite: `118/118` passing (`uv run --directory tools python -m unittest discover -s tests -v`, incl. `17/17` in `test_m5_gsq_rco.py`, both native enabled and `AMINFER_DISABLE_NATIVE_RCO=1`)
   - Zero-dependency Python `ctypes` SDK suite: `6/6` passing (`PYTHONPATH=python python3 -m unittest discover -s python/tests -v`)
     and `aminfer-tools inspect-metadata` dry-run validation against live
     Hugging Face JSON metadata (no weight shards on disk):
@@ -1062,15 +1077,17 @@ Update this before the context window runs out or when handing off.
 - On-disk checkpoints & artifacts (strict rule: keep all `.amf`/`.ang`/`.mlpackage`
   and `TMPDIR` work on `/Volumes/Akari/models/` and `/Volumes/Akari/.tmp/`, never
   on `/` or `/tmp`):
-  - Source checkpoints: `/Volumes/Akari/models/{Qwen3-0.6B,Qwen3-14B-4bit,Qwen3-30B-A3B-3bit,Qwen3-30B-A3B-Eagle3}`
+  - Source checkpoints: `/Volumes/Akari/models/{Qwen3-0.6B,Qwen3-14B-4bit,Qwen3-30B-A3B,Qwen3-30B-A3B-3bit,Qwen3-30B-A3B-Eagle3}` and `/Volumes/Akari/models/imatrix/imatrix_unsloth.dat` (`116 MiB`)
   - Verified `.amf` / `.ang` / heat artifacts in `/Volumes/Akari/models/amf/`:
     `qwen3-0.6b-bf16.amf` (`1.11 GiB`), `qwen3-0.6b-gsq-rco.amf` (`311 MB`,
     `4.348b`), `qwen3-0.6b-gsq-rco-sme2.amf` (`337 MB`, off-GPU `sme2_panel64`
     small draft), `qwen3-0.6b-lut16-sme2.amf` (`336.9 MiB`, `196` `0x0101`
     `LUT16` tensors), `qwen3-14b-4bit.amf` (`7.74 GiB`),
     `qwen3-30b-a3b-3bit.amf` (`12.45 GiB`), `qwen3-30b-a3b-gsq-rco.amf`
-    (`9.599 GiB` wired, `2.700b` heat-guided GSQ+RCO),
+    (`9.599 GiB` wired, legacy `2.700b`), `qwen3-30b-a3b-gsq-rco-v2.amf`
+    (`12.445 GiB` wired, BF16 `3.50b` `GSQ-RCO v2` + `qwen3-30b-a3b-gsq-rco-v2.manifest.json`),
     `qwen3-30b-a3b-eagle3.amf` (`996 MiB`), `qwen3-30b-a3b-heat.json`,
+    `qwen3-30b-a3b-router-trace.jsonl` (`56,304` lines), `qwen3-30b-a3b-heat-v2.json` (`router_trace`),
     `aminfer-repo.ang` (`128.02 MiB`, `879,949` repo N-grams),
     `aminfer-docs.ang` (`32.02 MiB`, `198,113` docs N-grams, `table_crc32=0xc1f2f6ed`),
     and `/Volumes/Akari/models/amf/synth-deepseek41/` (`7.0 MiB` compact
