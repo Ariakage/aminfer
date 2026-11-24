@@ -31,6 +31,9 @@ const grammar_mod = @import("../spec/grammar.zig");
 const sampling_mod = @import("../spec/sampling.zig");
 const tokenizer_mod = @import("../model/tokenizer.zig");
 const qos = @import("../platform/qos.zig");
+const chat_template = @import("../model/chat_template.zig");
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Apple Silicon page size for backing slab alignment.
 pub const APPLE_PAGE_SIZE: usize = 16384;
@@ -41,9 +44,10 @@ pub const DEFAULT_MAX_CONNS: usize = 32;
 pub const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 16;
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_PROMPT_BYTES: usize = 64 * 1024;
-pub const DEFAULT_TX_BUF_BYTES: usize = 64 * 1024;
-pub const DEFAULT_NONSTREAM_REASONING_BYTES: usize = 16 * 1024;
-pub const DEFAULT_NONSTREAM_CONTENT_BYTES: usize = 32 * 1024;
+pub const DEFAULT_TX_BUF_BYTES: usize = 256 * 1024;
+pub const DEFAULT_NONSTREAM_REASONING_BYTES: usize = 64 * 1024;
+pub const DEFAULT_NONSTREAM_CONTENT_BYTES: usize = 128 * 1024;
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TOKEN_RING_CAP: usize = 256;
 pub const DEFAULT_JOB_RING_CAP: usize = 64;
 pub const DEFAULT_MAX_TOKENS: u32 = 256;
@@ -60,10 +64,10 @@ pub const MAX_TOOL_NAME_BYTES: usize = 64;
 pub const MAX_TOOL_CALL_ID_BYTES: usize = 48;
 pub const MAX_TOOLS_PER_REQUEST: usize = 16;
 pub const MAX_STORED_TOOL_CALLS: usize = 8;
-pub const DEFAULT_STATEFUL_RESPONSE_SLOTS: usize = 32;
-pub const DEFAULT_STATEFUL_RESPONSE_PROMPT_BYTES: usize = 16 * 1024;
-pub const DEFAULT_STATEFUL_RESPONSE_CONTENT_BYTES: usize = 8 * 1024;
-pub const DEFAULT_STATEFUL_RESPONSE_REASONING_BYTES: usize = 4 * 1024;
+pub const DEFAULT_STATEFUL_RESPONSE_SLOTS: usize = 64;
+pub const DEFAULT_STATEFUL_RESPONSE_PROMPT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_STATEFUL_RESPONSE_CONTENT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_STATEFUL_RESPONSE_REASONING_BYTES: usize = 32 * 1024;
 pub const MAX_EMBEDDING_INPUTS: usize = 32;
 pub const MAX_RERANK_DOCS: usize = 64;
 pub const MAX_EMBEDDING_DIM: usize = 8192;
@@ -208,21 +212,115 @@ pub const ToolChoiceMode = enum(u8) {
     named = 3,
 };
 
-pub const ReasoningEffort = enum(u8) {
-    none = 0,
-    low = 1,
-    medium = 2,
-    high = 3,
+pub const ReasoningEffort = chat_template.ReasoningEffort;
 
-    pub fn name(self: ReasoningEffort) []const u8 {
+pub const ReasoningSummaryMode = enum(u8) {
+    auto = 0,
+    detailed = 1,
+    concise = 2,
+    none = 3,
+
+    pub fn parseString(raw: []const u8) error{InvalidFieldValue}!ReasoningSummaryMode {
+        const s = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, s, "auto")) return .auto;
+        if (std.mem.eql(u8, s, "detailed")) return .detailed;
+        if (std.mem.eql(u8, s, "concise")) return .concise;
+        if (std.mem.eql(u8, s, "none")) return .none;
+        return error.InvalidFieldValue;
+    }
+
+    pub fn name(self: ReasoningSummaryMode) []const u8 {
         return switch (self) {
+            .auto => "auto",
+            .detailed => "detailed",
+            .concise => "concise",
             .none => "none",
-            .low => "low",
-            .medium => "medium",
-            .high => "high",
         };
     }
 };
+
+fn isSentenceTerm(b: u8) bool {
+    return b == '.' or b == '!' or b == '?' or b == '\n';
+}
+
+/// Zero-alloc O(head + tail) CPU sentence extractor for `reasoning.summary = "concise"`.
+pub fn extractConciseReasoningSummary(raw: []const u8, out: []u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or out.len == 0) return "";
+    if (trimmed.len <= 160 and trimmed.len <= out.len) {
+        @memcpy(out[0..trimmed.len], trimmed);
+        return out[0..trimmed.len];
+    }
+
+    // Head: up to end of first sentence, capped at 128 bytes.
+    const head_limit = @min(trimmed.len, 128);
+    var head_end: usize = head_limit;
+    for (0..head_limit) |idx| {
+        if (isSentenceTerm(trimmed[idx])) {
+            if (idx > 0) {
+                head_end = idx + 1;
+                while (head_end < head_limit and isSentenceTerm(trimmed[head_end])) : (head_end += 1) {}
+                break;
+            }
+        }
+    }
+    const head = std.mem.trimEnd(u8, trimmed[0..head_end], " \t\r\n");
+
+    // Tail: up to last sentence, capped at 128 bytes.
+    const tail_floor = if (trimmed.len > 128) trimmed.len - 128 else 0;
+    var scan = trimmed.len;
+    while (scan > tail_floor and isSentenceTerm(trimmed[scan - 1])) : (scan -= 1) {}
+    var tail_start: usize = tail_floor;
+    var j = scan;
+    while (j > tail_floor) {
+        j -= 1;
+        if (isSentenceTerm(trimmed[j])) {
+            tail_start = j + 1;
+            break;
+        }
+    }
+    const tail = std.mem.trim(u8, trimmed[tail_start..], " \t\r\n");
+
+    if (head_end >= tail_start or tail.len == 0) {
+        const take = @min(trimmed.len, out.len);
+        @memcpy(out[0..take], trimmed[0..take]);
+        return out[0..take];
+    }
+
+    var w = FixedWriter.init(out);
+    w.writeAll(head) catch {
+        const take = @min(head.len, out.len);
+        @memcpy(out[0..take], head[0..take]);
+        return out[0..take];
+    };
+    w.writeAll(" ... ") catch return w.written();
+    w.writeAll(tail) catch {
+        const rem = w.remaining();
+        if (rem > 0) {
+            const take = @min(tail.len, rem);
+            @memcpy(out[w.pos .. w.pos + take], tail[0..take]);
+            w.pos += take;
+        }
+        return w.written();
+    };
+    return w.written();
+}
+
+pub fn computeThinkingSignature(key: *const [32]u8, thinking: []const u8, out_hex: *[64]u8) []const u8 {
+    var tag: [32]u8 = undefined;
+    HmacSha256.create(&tag, thinking, key);
+    out_hex.* = std.fmt.bytesToHex(tag, .lower);
+    return out_hex[0..];
+}
+
+pub fn verifyThinkingSignature(key: *const [32]u8, thinking: []const u8, sig_hex: []const u8) bool {
+    if (sig_hex.len != 64) return false;
+    var provided: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&provided, sig_hex) catch return false;
+    var expected: [32]u8 = undefined;
+    HmacSha256.create(&expected, thinking, key);
+    return std.crypto.timing_safe.eql([32]u8, expected, provided);
+}
 
 pub const ResponseFormatKind = enum(u8) {
     text = 0,
@@ -237,6 +335,7 @@ pub const ParsedToolSpec = struct {
     strict: bool = false,
     /// Raw JSON slice of `parameters` (OpenAI) or `input_schema` (Anthropic) inside the request body.
     parameters_json: []const u8 = "",
+    description_json: []const u8 = "",
 
     pub fn nameSlice(self: *const ParsedToolSpec) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -326,6 +425,7 @@ pub const TokenEvent = struct {
     finish_reason: FinishReason = .stop,
     token_count: u32 = 0,
     cached_tokens: u32 = 0,
+    timestamp_ns: u64 = 0,
     text_len: u16 = 0,
     text: [MAX_CHUNK_TEXT_BYTES]u8 = undefined,
 
@@ -378,6 +478,10 @@ pub const ServerConfig = struct {
     unix_socket_path: ?[]const u8 = null,
     /// Fixed preallocated capacity of stateful `/v1/responses` slot table (`evict_first` LRU).
     stateful_response_slots: usize = DEFAULT_STATEFUL_RESPONSE_SLOTS,
+    chat_template: chat_template.ChatTemplate = chat_template.ChatTemplate.preset(.chatml),
+    max_response_bytes: ?usize = null,
+    http_read_timeout_ms: u32 = 30_000,
+    keepalive_idle_timeout_ms: u32 = 60_000,
     /// Optional native Zig BPE `Tokenizer` (`W5`) backing `POST /v1/messages/count_tokens`.
     tokenizer: ?*const tokenizer_mod.Tokenizer = null,
     /// Optional `C21` embeddings backend callback for `POST /v1/embeddings`.
@@ -466,6 +570,8 @@ pub const InferenceJob = struct {
     reasoning_effort: ?ReasoningEffort = null,
     thinking_budget_tokens: ?u32 = null,
     cache_control_pin: bool = false,
+    template_dialect: chat_template.Dialect = .chatml,
+    starts_in_think: bool = false,
     stream_include_usage: bool = false,
 };
 
@@ -959,88 +1065,8 @@ pub const Utf8StreamAssembler = struct {
 // Zero-allocation streaming `<think>...</think>` state machine
 // ---------------------------------------------------------------------------
 
-pub const StreamChannel = enum(u8) {
-    content = 0,
-    reasoning = 1,
-};
-
-/// Splits streaming text into `.reasoning` (inside `<think>...</think>`) and
-/// `.content` (outside) with zero heap allocation, handling tags arbitrarily
-/// fragmented across chunk/token boundaries.
-pub const ThinkSplitter = struct {
-    const OPEN_TAG = "<think>";
-    const CLOSE_TAG = "</think>";
-
-    in_think: bool = false,
-    pending: [CLOSE_TAG.len]u8 = undefined,
-    pending_len: u8 = 0,
-
-    pub fn reset(self: *ThinkSplitter, start_in_think: bool) void {
-        self.in_think = start_in_think;
-        self.pending_len = 0;
-    }
-
-    /// Feeds `chunk` through the splitter, invoking `emit_fn(ctx, channel, slice)`
-    /// for each non-empty classified span. Propagates any error from `emit_fn`.
-    pub fn feed(
-        self: *ThinkSplitter,
-        chunk: []const u8,
-        ctx: anytype,
-        comptime emit_fn: anytype,
-    ) !void {
-        var i: usize = 0;
-        while (i < chunk.len) {
-            const tag: []const u8 = if (self.in_think) CLOSE_TAG else OPEN_TAG;
-            const channel: StreamChannel = if (self.in_think) .reasoning else .content;
-
-            if (self.pending_len == 0) {
-                // Fast path: emit everything up to the next '<' in one slice.
-                if (std.mem.indexOfScalarPos(u8, chunk, i, '<')) |lt_pos| {
-                    if (lt_pos > i) {
-                        try emit_fn(ctx, channel, chunk[i..lt_pos]);
-                    }
-                    self.pending[0] = '<';
-                    self.pending_len = 1;
-                    i = lt_pos + 1;
-                } else {
-                    try emit_fn(ctx, channel, chunk[i..]);
-                    return;
-                }
-            } else {
-                const b = chunk[i];
-                if (b == tag[self.pending_len]) {
-                    self.pending[self.pending_len] = b;
-                    self.pending_len += 1;
-                    i += 1;
-                    if (self.pending_len == tag.len) {
-                        self.pending_len = 0;
-                        self.in_think = !self.in_think;
-                    }
-                } else {
-                    // Since '<' appears only at index 0 of both `<think>` and `</think>`,
-                    // no proper suffix of `pending[1..pending_len]` can start a tag.
-                    const flushed = self.pending[0..self.pending_len];
-                    self.pending_len = 0;
-                    try emit_fn(ctx, channel, flushed);
-                    // Re-process `chunk[i]` in the next loop iteration (it may itself be '<').
-                }
-            }
-        }
-    }
-
-    /// Flushes any trailing partial tag bytes at end-of-stream.
-    pub fn flush(
-        self: *ThinkSplitter,
-        ctx: anytype,
-        comptime emit_fn: anytype,
-    ) !void {
-        if (self.pending_len == 0) return;
-        const channel: StreamChannel = if (self.in_think) .reasoning else .content;
-        const flushed = self.pending[0..self.pending_len];
-        self.pending_len = 0;
-        try emit_fn(ctx, channel, flushed);
-    }
-};
+pub const StreamChannel = chat_template.StreamChannel;
+pub const ThinkSplitter = chat_template.ThinkSplitter;
 
 // ---------------------------------------------------------------------------
 // Zero-allocation streaming `<tool_call>` parser (`C18`)
@@ -1072,19 +1098,39 @@ pub const ToolCallStreamEvent = union(enum) {
 pub const ToolCallParser = struct {
     const OPEN_TAG = "<tool_call>";
     const CLOSE_TAG = "</tool_call>";
+    const OPEN_INKLING = "<|content_invoke_tool_json|>";
+    const CLOSE_INKLING = "<|end_message|>";
+    const OPEN_HY4 = "<tool_call:opensource>";
+    const CLOSE_HY4 = "</tool_call:opensource>";
+    const WRAP_HY4_OPEN = "<tool_calls:opensource>";
+    const WRAP_HY4_CLOSE = "</tool_calls:opensource>";
+    const INKLING_TEXT_TAG = "<|content_text|>";
+    const INKLING_EOS_TAG = "<|content_model_end_sampling|>";
+    const MAX_TAG_LEN: usize = 32;
+
+    const ActiveFormat = enum(u8) {
+        qwen = 0,
+        inkling2 = 1,
+        hy4 = 2,
+    };
 
     const Mode = enum(u8) {
         outside = 0,
         inside_preamble = 1,
         streaming_args = 2,
         inside_tail = 3,
+        inside_hy4_xml = 4,
     };
 
+    dialect: chat_template.Dialect = .chatml,
+    active_format: ActiveFormat = .qwen,
     mode: Mode = .outside,
-    pending: [CLOSE_TAG.len]u8 = undefined,
+    pending: [MAX_TAG_LEN]u8 = undefined,
     pending_len: u8 = 0,
     preamble_buf: [512]u8 = undefined,
     preamble_len: u16 = 0,
+    hy4_buf: [2048]u8 = undefined,
+    hy4_len: u16 = 0,
     name_buf: [MAX_TOOL_NAME_BYTES]u8 = undefined,
     name_len: u8 = 0,
     id_buf: [MAX_TOOL_CALL_ID_BYTES]u8 = undefined,
@@ -1100,9 +1146,16 @@ pub const ToolCallParser = struct {
     emitted_any_args: bool = false,
 
     pub fn reset(self: *ToolCallParser, request_id: u64) void {
+        self.resetForDialect(request_id, .chatml);
+    }
+
+    pub fn resetForDialect(self: *ToolCallParser, request_id: u64, dialect: chat_template.Dialect) void {
+        self.dialect = dialect;
+        self.active_format = .qwen;
         self.mode = .outside;
         self.pending_len = 0;
         self.preamble_len = 0;
+        self.hy4_len = 0;
         self.name_len = 0;
         self.id_len = 0;
         self.request_id = request_id;
@@ -1138,6 +1191,60 @@ pub const ToolCallParser = struct {
         return self.name_buf[0..self.name_len];
     }
 
+    inline fn activeCloseTag(self: *const ToolCallParser) []const u8 {
+        return switch (self.active_format) {
+            .qwen => CLOSE_TAG,
+            .inkling2 => CLOSE_INKLING,
+            .hy4 => CLOSE_HY4,
+        };
+    }
+
+    fn matchOutsideTag(self: *const ToolCallParser, cand: []const u8) enum {
+        none,
+        prefix,
+        open_qwen,
+        open_inkling,
+        open_hy4,
+        strip_tag,
+    } {
+        if (std.mem.eql(u8, cand, OPEN_TAG)) return .open_qwen;
+        if (std.mem.eql(u8, cand, OPEN_INKLING)) return .open_inkling;
+        if (std.mem.eql(u8, cand, OPEN_HY4)) return .open_hy4;
+
+        const strip_hy4 = (self.dialect == .hy4);
+        const strip_ink = (self.dialect == .inkling2);
+        if (strip_hy4 and (std.mem.eql(u8, cand, WRAP_HY4_OPEN) or std.mem.eql(u8, cand, WRAP_HY4_CLOSE))) return .strip_tag;
+        if (strip_ink and (std.mem.eql(u8, cand, INKLING_TEXT_TAG) or std.mem.eql(u8, cand, INKLING_EOS_TAG) or std.mem.eql(u8, cand, CLOSE_INKLING))) return .strip_tag;
+
+        if ((cand.len < OPEN_TAG.len and std.mem.startsWith(u8, OPEN_TAG, cand)) or
+            (cand.len < OPEN_INKLING.len and std.mem.startsWith(u8, OPEN_INKLING, cand)) or
+            (cand.len < OPEN_HY4.len and std.mem.startsWith(u8, OPEN_HY4, cand)) or
+            (strip_hy4 and ((cand.len < WRAP_HY4_OPEN.len and std.mem.startsWith(u8, WRAP_HY4_OPEN, cand)) or
+                (cand.len < WRAP_HY4_CLOSE.len and std.mem.startsWith(u8, WRAP_HY4_CLOSE, cand)))) or
+            (strip_ink and ((cand.len < INKLING_TEXT_TAG.len and std.mem.startsWith(u8, INKLING_TEXT_TAG, cand)) or
+                (cand.len < INKLING_EOS_TAG.len and std.mem.startsWith(u8, INKLING_EOS_TAG, cand)) or
+                (cand.len < CLOSE_INKLING.len and std.mem.startsWith(u8, CLOSE_INKLING, cand)))))
+        {
+            return .prefix;
+        }
+        return .none;
+    }
+
+    fn beginOpenToolCall(self: *ToolCallParser, fmt: ActiveFormat) void {
+        self.pending_len = 0;
+        self.active_format = fmt;
+        self.mode = if (fmt == .hy4) .inside_hy4_xml else .inside_preamble;
+        self.preamble_len = 0;
+        self.hy4_len = 0;
+        self.name_len = 0;
+        self.args_is_string = false;
+        self.args_brace_depth = 0;
+        self.args_in_string = false;
+        self.args_escape = false;
+        self.args_started = false;
+        self.emitted_any_args = false;
+    }
+
     pub fn feed(
         self: *ToolCallParser,
         chunk: []const u8,
@@ -1161,21 +1268,35 @@ pub const ToolCallParser = struct {
                     }
                 } else {
                     const b = chunk[i];
-                    if (b == OPEN_TAG[self.pending_len]) {
+                    if (self.pending_len < MAX_TAG_LEN) {
                         self.pending[self.pending_len] = b;
-                        self.pending_len += 1;
-                        i += 1;
-                        if (self.pending_len == OPEN_TAG.len) {
-                            self.pending_len = 0;
-                            self.mode = .inside_preamble;
-                            self.preamble_len = 0;
-                            self.name_len = 0;
-                            self.args_is_string = false;
-                            self.args_brace_depth = 0;
-                            self.args_in_string = false;
-                            self.args_escape = false;
-                            self.args_started = false;
-                            self.emitted_any_args = false;
+                        const cand = self.pending[0 .. self.pending_len + 1];
+                        switch (self.matchOutsideTag(cand)) {
+                            .prefix => {
+                                self.pending_len += 1;
+                                i += 1;
+                            },
+                            .open_qwen => {
+                                i += 1;
+                                self.beginOpenToolCall(.qwen);
+                            },
+                            .open_inkling => {
+                                i += 1;
+                                self.beginOpenToolCall(.inkling2);
+                            },
+                            .open_hy4 => {
+                                i += 1;
+                                self.beginOpenToolCall(.hy4);
+                            },
+                            .strip_tag => {
+                                self.pending_len = 0;
+                                i += 1;
+                            },
+                            .none => {
+                                const flushed = self.pending[0..self.pending_len];
+                                self.pending_len = 0;
+                                try emit_fn(ctx, ToolCallStreamEvent{ .text = flushed });
+                            },
                         }
                     } else {
                         const flushed = self.pending[0..self.pending_len];
@@ -1186,9 +1307,10 @@ pub const ToolCallParser = struct {
                 continue;
             }
 
-            // Inside `<tool_call> ... </tool_call>`: scan for `</tool_call>` tag across chunks.
+            // Inside active tool call: scan for `activeCloseTag()` across chunks.
             const b = chunk[i];
             i += 1;
+            const ctag = self.activeCloseTag();
             if (self.pending_len == 0) {
                 if (b == '<' and !self.args_in_string) {
                     self.pending[0] = '<';
@@ -1197,17 +1319,17 @@ pub const ToolCallParser = struct {
                     try self.consumeInsideByte(b, ctx, emit_fn);
                 }
             } else {
-                if (b == CLOSE_TAG[self.pending_len]) {
+                if (self.pending_len < ctag.len and b == ctag[self.pending_len]) {
                     self.pending[self.pending_len] = b;
                     self.pending_len += 1;
-                    if (self.pending_len == CLOSE_TAG.len) {
+                    if (self.pending_len == ctag.len) {
                         self.pending_len = 0;
                         try self.finishActiveCall(ctx, emit_fn);
                         self.mode = .outside;
                     }
                 } else {
                     // Flush false prefix bytes into current inside mode, then re-handle `b`!
-                    var tmp: [CLOSE_TAG.len]u8 = undefined;
+                    var tmp: [MAX_TAG_LEN]u8 = undefined;
                     const n = self.pending_len;
                     @memcpy(tmp[0..n], self.pending[0..n]);
                     self.pending_len = 0;
@@ -1234,6 +1356,12 @@ pub const ToolCallParser = struct {
         switch (self.mode) {
             .outside => unreachable,
             .inside_tail => {},
+            .inside_hy4_xml => {
+                if (self.hy4_len < self.hy4_buf.len) {
+                    self.hy4_buf[self.hy4_len] = b;
+                    self.hy4_len += 1;
+                }
+            },
             .inside_preamble => {
                 if (self.preamble_len < self.preamble_buf.len) {
                     self.preamble_buf[self.preamble_len] = b;
@@ -1261,8 +1389,9 @@ pub const ToolCallParser = struct {
         }
         if (self.name_len == 0) return;
 
-        // Locate `"arguments"` or `"input"` key followed by `:` and first value token byte!
+        // Locate `"arguments"`, `"args"` (Inkling 2), or `"input"` key followed by `:` and first value byte!
         const val_pos = findJsonFieldValueStart(buf, "arguments") orelse
+            findJsonFieldValueStart(buf, "args") orelse
             findJsonFieldValueStart(buf, "input") orelse return;
         if (val_pos >= buf.len) return;
 
@@ -1380,11 +1509,109 @@ pub const ToolCallParser = struct {
         }
     }
 
+    fn emitHy4XmlToolCall(
+        self: *ToolCallParser,
+        ctx: anytype,
+        comptime emit_fn: anytype,
+    ) !void {
+        const xml = self.hy4_buf[0..self.hy4_len];
+        const first_key_pos = std.mem.indexOf(u8, xml, "<arg_key:opensource>") orelse xml.len;
+        const fn_name = std.mem.trim(u8, xml[0..first_key_pos], " \t\r\n");
+        if (fn_name.len == 0) {
+            self.hy4_len = 0;
+            return;
+        }
+        const nlen = @min(fn_name.len, self.name_buf.len);
+        @memcpy(self.name_buf[0..nlen], fn_name[0..nlen]);
+        self.name_len = @intCast(nlen);
+
+        self.active_index = self.call_count;
+        self.call_count += 1;
+        const call_id = self.formatCallId(self.active_index);
+
+        try emit_fn(ctx, ToolCallStreamEvent{ .tool_start = .{
+            .index = self.active_index,
+            .id = call_id,
+            .name = self.nameSlice(),
+        } });
+
+        var jbuf: [2048]u8 = undefined;
+        const args_json = formatHy4ArgsJson(xml, first_key_pos, &jbuf) catch |err| switch (err) {
+            error.BufferTooSmall => "{}",
+        };
+
+        try emit_fn(ctx, ToolCallStreamEvent{ .tool_args_delta = .{
+            .index = self.active_index,
+            .id = call_id,
+            .delta = args_json,
+        } });
+        try emit_fn(ctx, ToolCallStreamEvent{ .tool_end = .{
+            .index = self.active_index,
+            .id = call_id,
+            .name = self.nameSlice(),
+        } });
+        self.hy4_len = 0;
+    }
+
+    fn formatHy4ArgsJson(xml: []const u8, first_key_pos: usize, out: []u8) error{BufferTooSmall}![]const u8 {
+        const KEY_OPEN = "<arg_key:opensource>";
+        const KEY_CLOSE = "</arg_key:opensource>";
+        const VAL_OPEN = "<arg_value:opensource>";
+        const VAL_CLOSE = "</arg_value:opensource>";
+
+        var jw = FixedWriter.init(out);
+        try jw.writeByte('{');
+        var pos: usize = first_key_pos;
+        var first_arg = true;
+        while (pos < xml.len) {
+            const ko = std.mem.indexOfPos(u8, xml, pos, KEY_OPEN) orelse break;
+            const k_start = ko + KEY_OPEN.len;
+            const kc = std.mem.indexOfPos(u8, xml, k_start, KEY_CLOSE) orelse break;
+            const k_raw = std.mem.trim(u8, xml[k_start..kc], " \t\r\n");
+            const vo = std.mem.indexOfPos(u8, xml, kc + KEY_CLOSE.len, VAL_OPEN) orelse break;
+            const v_start = vo + VAL_OPEN.len;
+            const vc = std.mem.indexOfPos(u8, xml, v_start, VAL_CLOSE) orelse break;
+            const v_raw = xml[v_start..vc];
+            const v_trim = std.mem.trim(u8, v_raw, " \t\r\n");
+            pos = vc + VAL_CLOSE.len;
+
+            if (!first_arg) try jw.writeByte(',');
+            first_arg = false;
+            try jw.writeByte('"');
+            try jw.writeJsonEscaped(k_raw);
+            try jw.writeAll("\":");
+            if (isRawJsonLiteral(v_trim)) {
+                try jw.writeAll(v_trim);
+            } else {
+                try jw.writeByte('"');
+                try jw.writeJsonEscaped(v_raw);
+                try jw.writeByte('"');
+            }
+        }
+        try jw.writeByte('}');
+        return jw.written();
+    }
+
+    fn isRawJsonLiteral(s: []const u8) bool {
+        if (s.len == 0) return false;
+        if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "null")) return true;
+        if ((s[0] == '{' and s[s.len - 1] == '}') or (s[0] == '[' and s[s.len - 1] == ']')) return true;
+        if (s[0] == '-' or (s[0] >= '0' and s[0] <= '9')) {
+            _ = std.fmt.parseFloat(f64, s) catch return false;
+            return true;
+        }
+        return false;
+    }
+
     fn finishActiveCall(
         self: *ToolCallParser,
         ctx: anytype,
         comptime emit_fn: anytype,
     ) !void {
+        if (self.mode == .inside_hy4_xml) {
+            try self.emitHy4XmlToolCall(ctx, emit_fn);
+            return;
+        }
         if (self.mode == .inside_preamble) {
             // Arguments omitted (`{"name": "ping"}`): still emit a valid `{}` tool call if name found!
             if (self.name_len == 0) {
@@ -1531,6 +1758,10 @@ pub const ParsedRequest = struct {
     cache_control_pin: bool = false,
     thinking_budget_tokens: ?u32 = null,
     reasoning_effort: ?ReasoningEffort = null,
+    preserved_thinking: ?bool = null,
+    reasoning_summary: ReasoningSummaryMode = .auto,
+    starts_in_think: bool = false,
+    template_dialect: chat_template.Dialect = .chatml,
     store_response: bool = true,
 
     previous_response_id_buf: [MAX_RESPONSE_ID_BYTES]u8 = @splat(0),
@@ -2322,6 +2553,8 @@ fn parseToolsArray(
                                         spec.name_len = @intCast(nm.len);
                                     } else if (std.mem.eql(u8, fkey, "parameters")) {
                                         spec.parameters_json = try r.captureValueSlice(3);
+                                    } else if (std.mem.eql(u8, fkey, "description")) {
+                                        spec.description_json = try r.captureValueSlice(3);
                                     } else if (std.mem.eql(u8, fkey, "strict")) {
                                         spec.strict = try r.readBool();
                                     } else {
@@ -2347,6 +2580,8 @@ fn parseToolsArray(
                         spec.name_len = @intCast(nm.len);
                     } else if (std.mem.eql(u8, key, "parameters") or std.mem.eql(u8, key, "input_schema")) {
                         spec.parameters_json = try r.captureValueSlice(2);
+                    } else if (std.mem.eql(u8, key, "description")) {
+                        spec.description_json = try r.captureValueSlice(2);
                     } else if (std.mem.eql(u8, key, "strict")) {
                         spec.strict = try r.readBool();
                     } else {
@@ -2380,31 +2615,824 @@ fn parseToolsArray(
     }
 }
 
-/// Appends Qwen3 `<tools>...</tools>` declaration block into the ChatML system prompt.
-fn appendToolDeclarationsPrompt(
-    tools_json: []const u8,
+fn mapTemplateError(err: chat_template.TemplateError) ParseError {
+    return switch (err) {
+        error.BufferTooSmall => error.BufferTooSmall,
+        error.InvalidJson => error.InvalidJson,
+        error.DepthExceeded,
+        error.InvalidReasoningEffort,
+        error.InvalidSpec,
+        error.MissingToolName,
+        error.UnsupportedContent,
+        error.UnsupportedDialect,
+        => error.InvalidFieldValue,
+    };
+}
+
+fn unescapeQuotedJson(
+    raw_quoted: []const u8,
+    scratch: []u8,
+    scratch_pos: *usize,
+) ParseError![]const u8 {
+    if (raw_quoted.len < 2 or raw_quoted[0] != '"' or raw_quoted[raw_quoted.len - 1] != '"') {
+        return error.InvalidFieldValue;
+    }
+    const inner = raw_quoted[1 .. raw_quoted.len - 1];
+    if (std.mem.indexOfScalar(u8, inner, '\\') == null) {
+        return inner;
+    }
+    var jr = JsonReader{ .src = raw_quoted };
+    var fw = FixedWriter.init(scratch[scratch_pos.*..]);
+    try jr.readStringInto(&fw);
+    const slice = fw.written();
+    scratch_pos.* += fw.pos;
+    return slice;
+}
+
+fn readReasoningEffortValue(r: *JsonReader) ParseError!ReasoningEffort {
+    const ch = r.peek() orelse return error.InvalidJson;
+    if (ch == '"') {
+        var ebuf: [24]u8 = undefined;
+        const s = try r.readSmallString(&ebuf);
+        return ReasoningEffort.parseString(s) catch return error.InvalidFieldValue;
+    }
+    if (ch == '-' or (ch >= '0' and ch <= '9')) {
+        const s = try r.readNumberSlice();
+        const v = std.fmt.parseFloat(f64, s) catch return error.InvalidFieldValue;
+        return ReasoningEffort.fromFloat(v) catch return error.InvalidFieldValue;
+    }
+    return error.InvalidFieldValue;
+}
+
+const MAX_CONTENT_PARTS_PER_MSG: usize = 32;
+const MAX_TOOL_CALLS_PER_MSG: usize = 16;
+
+const PendingToolResultMsg = struct {
+    tool_use_id: []const u8,
+    content: []const u8,
+};
+
+fn readJsonStringValueToScratch(
+    reader: *JsonReader,
+    scratch: []u8,
+    scratch_pos: *usize,
+) ParseError![]const u8 {
+    const raw = try reader.captureValueSlice(4);
+    if (raw.len < 2 or raw[0] != '"') return error.InvalidFieldValue;
+    return unescapeQuotedJson(raw, scratch, scratch_pos);
+}
+
+fn appendToolResultContentToWriter(
+    reader: *JsonReader,
+    fw: *FixedWriter,
+    out_cache_control: *bool,
+) ParseError!void {
+    const ch = reader.peek() orelse return error.InvalidJson;
+    if (ch == '"') {
+        try reader.readStringInto(fw);
+    } else if (ch == '[') {
+        reader.pos += 1;
+        if (reader.peek() != ']') {
+            while (true) {
+                try reader.expectByte('{');
+                var text_raw: ?[]const u8 = null;
+                if (reader.peek() != '}') {
+                    while (true) {
+                        var kb: [64]u8 = undefined;
+                        const mk = try reader.readKeyOrSkip(&kb);
+                        try reader.expectByte(':');
+                        if (mk != null and std.mem.eql(u8, mk.?, "text")) {
+                            text_raw = try reader.captureValueSlice(5);
+                        } else if (mk != null and std.mem.eql(u8, mk.?, "cache_control")) {
+                            try reader.skipValue(5);
+                            out_cache_control.* = true;
+                        } else {
+                            try reader.skipValue(5);
+                        }
+                        const s = reader.peek() orelse return error.InvalidJson;
+                        if (s == ',') {
+                            reader.pos += 1;
+                        } else if (s == '}') {
+                            reader.pos += 1;
+                            break;
+                        } else return error.InvalidJson;
+                    }
+                } else reader.pos += 1;
+                if (text_raw) |tr| {
+                    var sub = JsonReader{ .src = tr };
+                    try sub.readStringInto(fw);
+                }
+                const s2 = reader.peek() orelse return error.InvalidJson;
+                if (s2 == ',') {
+                    reader.pos += 1;
+                } else if (s2 == ']') {
+                    reader.pos += 1;
+                    break;
+                } else return error.InvalidJson;
+            }
+        } else reader.pos += 1;
+    } else if (reader.consumeKeyword("null")) {
+        // empty
+    } else {
+        return error.InvalidFieldValue;
+    }
+}
+
+fn parseOpenAiToolCallsToViews(
+    tool_calls_json: []const u8,
+    calls_buf: *[MAX_TOOL_CALLS_PER_MSG]chat_template.ToolCallView,
+    calls_len: *usize,
+    scratch: []u8,
+    scratch_pos: *usize,
+) ParseError!void {
+    var r = JsonReader{ .src = tool_calls_json };
+    try r.expectByte('[');
+    if (r.peek() == ']') {
+        r.pos += 1;
+        return;
+    }
+    while (true) {
+        try r.expectByte('{');
+        var call_id: []const u8 = "";
+        var fn_name: []const u8 = "";
+        var fn_args: []const u8 = "{}";
+        if (r.peek() != '}') {
+            while (true) {
+                var kb: [64]u8 = undefined;
+                const mk = try r.readKeyOrSkip(&kb);
+                try r.expectByte(':');
+                if (mk) |key| {
+                    if (std.mem.eql(u8, key, "id")) {
+                        if (!r.consumeKeyword("null")) {
+                            call_id = try readJsonStringValueToScratch(&r, scratch, scratch_pos);
+                        }
+                    } else if (std.mem.eql(u8, key, "name")) {
+                        if (!r.consumeKeyword("null")) {
+                            fn_name = try readJsonStringValueToScratch(&r, scratch, scratch_pos);
+                        }
+                    } else if (std.mem.eql(u8, key, "arguments")) {
+                        if (r.peek() == '"') {
+                            fn_args = try readJsonStringValueToScratch(&r, scratch, scratch_pos);
+                        } else if (!r.consumeKeyword("null")) {
+                            fn_args = try r.captureValueSlice(3);
+                        }
+                    } else if (std.mem.eql(u8, key, "function") and r.peek() == '{') {
+                        r.pos += 1;
+                        if (r.peek() != '}') {
+                            while (true) {
+                                var fkb: [64]u8 = undefined;
+                                const mfk = try r.readKeyOrSkip(&fkb);
+                                try r.expectByte(':');
+                                if (mfk) |fkey| {
+                                    if (std.mem.eql(u8, fkey, "name")) {
+                                        fn_name = try readJsonStringValueToScratch(&r, scratch, scratch_pos);
+                                    } else if (std.mem.eql(u8, fkey, "arguments")) {
+                                        if (r.peek() == '"') {
+                                            fn_args = try readJsonStringValueToScratch(&r, scratch, scratch_pos);
+                                        } else {
+                                            fn_args = try r.captureValueSlice(4);
+                                        }
+                                    } else {
+                                        try r.skipValue(4);
+                                    }
+                                } else {
+                                    try r.skipValue(4);
+                                }
+                                const fs = r.peek() orelse return error.InvalidJson;
+                                if (fs == ',') {
+                                    r.pos += 1;
+                                } else if (fs == '}') {
+                                    r.pos += 1;
+                                    break;
+                                } else return error.InvalidJson;
+                            }
+                        } else r.pos += 1;
+                    } else {
+                        try r.skipValue(3);
+                    }
+                } else {
+                    try r.skipValue(3);
+                }
+                const sep = r.peek() orelse return error.InvalidJson;
+                if (sep == ',') {
+                    r.pos += 1;
+                } else if (sep == '}') {
+                    r.pos += 1;
+                    break;
+                } else return error.InvalidJson;
+            }
+        } else r.pos += 1;
+
+        if (calls_len.* >= calls_buf.len) return error.BufferTooSmall;
+        calls_buf[calls_len.*] = .{
+            .id = call_id,
+            .name = fn_name,
+            .arguments_json = fn_args,
+        };
+        calls_len.* += 1;
+
+        const sep2 = r.peek() orelse return error.InvalidJson;
+        if (sep2 == ',') {
+            r.pos += 1;
+        } else if (sep2 == ']') {
+            r.pos += 1;
+            return;
+        } else return error.InvalidJson;
+    }
+}
+
+fn parseMessageContentForTemplate(
+    dialect: chat_template.Dialect,
+    content_json: []const u8,
+    parts_buf: *[MAX_CONTENT_PARTS_PER_MSG]chat_template.ContentPart,
+    parts_len: *usize,
+    calls_buf: *[MAX_TOOL_CALLS_PER_MSG]chat_template.ToolCallView,
+    calls_len: *usize,
+    tool_results_buf: *[MAX_TOOL_CALLS_PER_MSG]PendingToolResultMsg,
+    tool_results_len: *usize,
+    out_reasoning: *[]const u8,
+    scratch: []u8,
+    scratch_pos: *usize,
+    signature_key: ?*const [32]u8,
+    out_cache_control: *bool,
+) ParseError!void {
+    var r = JsonReader{ .src = content_json };
+    const ch = r.peek() orelse return error.InvalidJson;
+    if (ch == '"') {
+        const s = try unescapeQuotedJson(content_json[r.pos..], scratch, scratch_pos);
+        if (s.len > 0) {
+            if (parts_len.* >= parts_buf.len) return error.BufferTooSmall;
+            parts_buf[parts_len.*] = .{ .text = s };
+            parts_len.* += 1;
+        }
+        return;
+    }
+    if (r.consumeKeyword("null")) return;
+    if (ch != '[') return error.InvalidFieldValue;
+
+    r.pos += 1;
+    if (r.peek() == ']') {
+        r.pos += 1;
+        return;
+    }
+    while (true) {
+        try r.expectByte('{');
+        var btype_buf: [32]u8 = undefined;
+        var btype: []const u8 = "";
+        var text_raw: ?[]const u8 = null;
+        var thinking_raw: ?[]const u8 = null;
+        var sig_raw: ?[]const u8 = null;
+        var tu_id: []const u8 = "";
+        var tu_name: []const u8 = "";
+        var tu_input: []const u8 = "{}";
+        var tr_id: []const u8 = "";
+        var tr_is_error = false;
+        var tr_content_raw: ?[]const u8 = null;
+
+        if (r.peek() != '}') {
+            while (true) {
+                var kb: [64]u8 = undefined;
+                const mk = try r.readKeyOrSkip(&kb);
+                try r.expectByte(':');
+                if (mk) |key| {
+                    if (std.mem.eql(u8, key, "type")) {
+                        btype = try r.readSmallString(&btype_buf);
+                    } else if (std.mem.eql(u8, key, "text")) {
+                        text_raw = try r.captureValueSlice(3);
+                    } else if (std.mem.eql(u8, key, "thinking")) {
+                        thinking_raw = try r.captureValueSlice(3);
+                    } else if (std.mem.eql(u8, key, "signature")) {
+                        if (!r.consumeKeyword("null")) {
+                            sig_raw = try r.captureValueSlice(3);
+                        }
+                    } else if (std.mem.eql(u8, key, "id")) {
+                        tu_id = try readJsonStringValueToScratch(&r, scratch, scratch_pos);
+                    } else if (std.mem.eql(u8, key, "name")) {
+                        tu_name = try readJsonStringValueToScratch(&r, scratch, scratch_pos);
+                    } else if (std.mem.eql(u8, key, "input")) {
+                        tu_input = try r.captureValueSlice(3);
+                    } else if (std.mem.eql(u8, key, "tool_use_id")) {
+                        tr_id = try readJsonStringValueToScratch(&r, scratch, scratch_pos);
+                    } else if (std.mem.eql(u8, key, "is_error")) {
+                        if (!r.consumeKeyword("null")) tr_is_error = try r.readBool();
+                    } else if (std.mem.eql(u8, key, "content")) {
+                        tr_content_raw = try r.captureValueSlice(3);
+                    } else if (std.mem.eql(u8, key, "cache_control")) {
+                        try readerSkipCacheControl(&r, out_cache_control);
+                    } else {
+                        try r.skipValue(3);
+                    }
+                } else {
+                    try r.skipValue(3);
+                }
+                const sep = r.peek() orelse return error.InvalidJson;
+                if (sep == ',') {
+                    r.pos += 1;
+                } else if (sep == '}') {
+                    r.pos += 1;
+                    break;
+                } else return error.InvalidJson;
+            }
+        } else r.pos += 1;
+
+        if (btype.len == 0 or std.mem.eql(u8, btype, "text") or std.mem.eql(u8, btype, "input_text") or std.mem.eql(u8, btype, "output_text")) {
+            if (text_raw) |tr| {
+                const txt = try unescapeQuotedJson(tr, scratch, scratch_pos);
+                if (txt.len > 0) {
+                    if (parts_len.* >= parts_buf.len) return error.BufferTooSmall;
+                    parts_buf[parts_len.*] = .{ .text = txt };
+                    parts_len.* += 1;
+                }
+            }
+        } else if (std.mem.eql(u8, btype, "image_url") or std.mem.eql(u8, btype, "image") or std.mem.eql(u8, btype, "input_image")) {
+            if (parts_len.* >= parts_buf.len) return error.BufferTooSmall;
+            parts_buf[parts_len.*] = .image;
+            parts_len.* += 1;
+        } else if (std.mem.eql(u8, btype, "video_url") or std.mem.eql(u8, btype, "video") or std.mem.eql(u8, btype, "input_video")) {
+            if (parts_len.* >= parts_buf.len) return error.BufferTooSmall;
+            parts_buf[parts_len.*] = .video;
+            parts_len.* += 1;
+        } else if (std.mem.eql(u8, btype, "thinking")) {
+            const th_raw = thinking_raw orelse return error.InvalidFieldValue;
+            const th_txt = try unescapeQuotedJson(th_raw, scratch, scratch_pos);
+            if (signature_key) |key| {
+                const sr = sig_raw orelse return error.InvalidFieldValue;
+                const sig_txt = try unescapeQuotedJson(sr, scratch, scratch_pos);
+                if (!verifyThinkingSignature(key, th_txt, sig_txt)) {
+                    return error.InvalidFieldValue;
+                }
+            }
+            if (out_reasoning.len == 0) {
+                out_reasoning.* = th_txt;
+            } else {
+                // Append adjacent thinking blocks cleanly in scratch.
+                const prev = out_reasoning.*;
+                var fw = FixedWriter.init(scratch[scratch_pos.*..]);
+                try fw.writeAll(prev);
+                try fw.writeAll(th_txt);
+                out_reasoning.* = fw.written();
+                scratch_pos.* += fw.pos;
+            }
+        } else if (std.mem.eql(u8, btype, "tool_use")) {
+            if (calls_len.* >= calls_buf.len) return error.BufferTooSmall;
+            calls_buf[calls_len.*] = .{
+                .id = tu_id,
+                .name = tu_name,
+                .arguments_json = tu_input,
+            };
+            calls_len.* += 1;
+        } else if (std.mem.eql(u8, btype, "tool_result")) {
+            var fw = FixedWriter.init(scratch[scratch_pos.*..]);
+            if (dialect == .chatml or dialect == .deepseek or dialect == .custom) {
+                try fw.writeAll("<tool_response>\n");
+                if (tr_id.len > 0) {
+                    try fw.writeAll("[tool_use_id=");
+                    try fw.writeAll(tr_id);
+                    if (tr_is_error) try fw.writeAll(" is_error=true");
+                    try fw.writeAll("]\n");
+                } else if (tr_is_error) {
+                    try fw.writeAll("[is_error=true]\n");
+                }
+                if (tr_content_raw) |cr| {
+                    var sub = JsonReader{ .src = cr };
+                    try appendToolResultContentToWriter(&sub, &fw, out_cache_control);
+                }
+                try fw.writeAll("\n</tool_response>\n");
+                const txt = fw.written();
+                scratch_pos.* += fw.pos;
+                if (parts_len.* >= parts_buf.len) return error.BufferTooSmall;
+                parts_buf[parts_len.*] = .{ .text = txt };
+                parts_len.* += 1;
+            } else {
+                if (tr_is_error) try fw.writeAll("[is_error=true]\n");
+                if (tr_content_raw) |cr| {
+                    var sub = JsonReader{ .src = cr };
+                    try appendToolResultContentToWriter(&sub, &fw, out_cache_control);
+                }
+                const txt = fw.written();
+                scratch_pos.* += fw.pos;
+                if (tool_results_len.* >= tool_results_buf.len) return error.BufferTooSmall;
+                tool_results_buf[tool_results_len.*] = .{
+                    .tool_use_id = tr_id,
+                    .content = txt,
+                };
+                tool_results_len.* += 1;
+            }
+        } else {
+            return error.InvalidFieldValue;
+        }
+
+        const sep2 = r.peek() orelse return error.InvalidJson;
+        if (sep2 == ',') {
+            r.pos += 1;
+        } else if (sep2 == ']') {
+            r.pos += 1;
+            return;
+        } else return error.InvalidJson;
+    }
+}
+
+fn readerSkipCacheControl(r: *JsonReader, out_cache_control: *bool) ParseError!void {
+    out_cache_control.* = true;
+    try r.skipValue(4);
+}
+
+fn scanLastUserMsgIndex(
+    has_leading_sys_header: bool,
+    array_json: []const u8,
+) ParseError!struct { count: usize, last_user_idx: ?usize, has_first_system: bool } {
+    var r = JsonReader{ .src = array_json };
+    try r.expectByte('[');
+    if (r.peek() == ']') {
+        r.pos += 1;
+        return .{ .count = 0, .last_user_idx = null, .has_first_system = has_leading_sys_header };
+    }
+    var count: usize = 0;
+    var last_user_idx: ?usize = null;
+    var has_first_system = has_leading_sys_header;
+    const base_idx: usize = if (has_leading_sys_header) 1 else 0;
+    while (true) {
+        try r.expectByte('{');
+        var role_buf: [32]u8 = undefined;
+        var role: []const u8 = "";
+        var itype_buf: [32]u8 = undefined;
+        var itype: []const u8 = "";
+        if (r.peek() != '}') {
+            while (true) {
+                var kb: [64]u8 = undefined;
+                const mk = try r.readKeyOrSkip(&kb);
+                try r.expectByte(':');
+                if (mk != null and std.mem.eql(u8, mk.?, "role")) {
+                    role = try r.readSmallString(&role_buf);
+                } else if (mk != null and std.mem.eql(u8, mk.?, "type")) {
+                    itype = try r.readSmallString(&itype_buf);
+                } else {
+                    try r.skipValue(2);
+                }
+                const sep = r.peek() orelse return error.InvalidJson;
+                if (sep == ',') {
+                    r.pos += 1;
+                } else if (sep == '}') {
+                    r.pos += 1;
+                    break;
+                } else return error.InvalidJson;
+            }
+        } else r.pos += 1;
+
+        if (count == 0 and !has_leading_sys_header and (std.mem.eql(u8, role, "system") or std.mem.eql(u8, role, "developer"))) {
+            has_first_system = true;
+        }
+        if (std.mem.eql(u8, role, "user") or std.mem.eql(u8, itype, "function_call_output")) {
+            last_user_idx = base_idx + count;
+        }
+        count += 1;
+        const sep2 = r.peek() orelse return error.InvalidJson;
+        if (sep2 == ',') {
+            r.pos += 1;
+        } else if (sep2 == ']') {
+            r.pos += 1;
+            return .{ .count = count, .last_user_idx = last_user_idx, .has_first_system = has_first_system };
+        } else return error.InvalidJson;
+    }
+}
+
+fn renderProtocolToTemplate(
+    endpoint: Endpoint,
+    tpl: *const chat_template.ChatTemplate,
+    prompt_buf: []u8,
+    prior_prompt: ?[]const u8,
+    system_slice: ?[]const u8,
+    messages_slice: ?[]const u8,
+    input_slice: ?[]const u8,
+    tools: []const ParsedToolSpec,
+    tools_raw_slice: ?[]const u8,
     tool_choice: ToolChoiceMode,
     tool_choice_name: []const u8,
     parallel_tool_calls: bool,
-    dst: *FixedWriter,
-) ParseError!void {
-    try dst.writeAll("<|im_start|>system\n# Tools\nYou may call one or more functions to assist with the user query.\n");
-    switch (tool_choice) {
-        .auto => {},
-        .none => try dst.writeAll("Do NOT call any tools.\n"),
-        .required => try dst.writeAll("You MUST call at least one tool.\n"),
-        .named => {
-            try dst.writeAll("You MUST call the tool named \"");
-            try dst.writeAll(tool_choice_name);
-            try dst.writeAll("\".\n");
+    reasoning_effort: ?ReasoningEffort,
+    enable_thinking: bool,
+    preserved_thinking: ?bool,
+    unescape_scratch: ?[]u8,
+    signature_key: ?*const [32]u8,
+    out_cache_control: *bool,
+) ParseError!struct { prompt_len: usize, last_user_msg_byte_offset: ?usize, starts_in_think: bool } {
+    var stack_scratch: [32 * 1024]u8 = undefined;
+    const scratch: []u8 = unescape_scratch orelse &stack_scratch;
+    var scratch_pos: usize = 0;
+
+    var tool_views: [MAX_TOOLS_PER_REQUEST]chat_template.ToolDeclView = undefined;
+    for (tools, 0..) |t, ti| {
+        const desc: []const u8 = if (t.description_json.len >= 2 and t.description_json[0] == '"')
+            try unescapeQuotedJson(t.description_json, scratch, &scratch_pos)
+        else
+            "";
+        tool_views[ti] = .{
+            .tool_type = "function",
+            .name = t.nameSlice(),
+            .description = desc,
+            .parameters_json = t.parameters_json,
+        };
+    }
+    const tool_scratch_base = scratch_pos;
+
+    var input_is_string = false;
+    var has_leading_sys = (system_slice != null);
+    var last_user_idx: ?usize = null;
+    switch (endpoint) {
+        .chat_completions, .messages => {
+            const msgs = messages_slice orelse return error.MissingRequiredField;
+            const scan = try scanLastUserMsgIndex(has_leading_sys, msgs);
+            if (scan.count == 0) return error.MissingRequiredField;
+            has_leading_sys = scan.has_first_system;
+            last_user_idx = scan.last_user_idx;
+        },
+        .responses => {
+            const inp = input_slice orelse return error.MissingRequiredField;
+            var ir = JsonReader{ .src = inp };
+            const ch = ir.peek() orelse return error.InvalidJson;
+            if (ch == '"') {
+                input_is_string = true;
+                last_user_idx = if (has_leading_sys) 1 else 0;
+            } else if (ch == '[') {
+                const scan = try scanLastUserMsgIndex(has_leading_sys, inp);
+                if (scan.count == 0) return error.MissingRequiredField;
+                has_leading_sys = scan.has_first_system;
+                last_user_idx = scan.last_user_idx;
+            } else {
+                return error.InvalidFieldValue;
+            }
         },
     }
-    if (!parallel_tool_calls) {
-        try dst.writeAll("Call at most one tool per turn.\n");
+
+    const mapped_tool_choice: chat_template.ToolChoiceKind = switch (tool_choice) {
+        .auto => .auto,
+        .none => .none,
+        .required => .required,
+        .named => .named,
+    };
+
+    var fw = chat_template.FixedWriter.init(prompt_buf);
+    var renderer = chat_template.PromptRenderer.init(
+        tpl,
+        &fw,
+        .{
+            .reasoning_effort = reasoning_effort,
+            .enable_thinking = enable_thinking,
+            .preserved_thinking = preserved_thinking,
+            .tools = tool_views[0..tools.len],
+            .raw_tools_json = if (tpl.dialect == .chatml or tpl.dialect == .deepseek or tpl.dialect == .custom) tools_raw_slice else null,
+            .tool_choice = mapped_tool_choice,
+            .tool_choice_name = tool_choice_name,
+            .parallel_tool_calls = parallel_tool_calls,
+            .prior_prompt = prior_prompt,
+        },
+        has_leading_sys,
+        last_user_idx,
+    );
+    renderer.begin() catch |err| return mapTemplateError(err);
+
+    var msg_idx: usize = 0;
+    var last_msg_is_user = false;
+    var total_messages: usize = if (prior_prompt) |p| if (p.len > 0) @as(usize, 2) else 0 else 0;
+
+    if (system_slice) |sys_json| {
+        var sys_parts: [MAX_CONTENT_PARTS_PER_MSG]chat_template.ContentPart = undefined;
+        var sys_parts_len: usize = 0;
+        var dummy_calls: [MAX_TOOL_CALLS_PER_MSG]chat_template.ToolCallView = undefined;
+        var dummy_calls_len: usize = 0;
+        var dummy_trs: [MAX_TOOL_CALLS_PER_MSG]PendingToolResultMsg = undefined;
+        var dummy_trs_len: usize = 0;
+        var dummy_reason: []const u8 = "";
+        scratch_pos = tool_scratch_base;
+        try parseMessageContentForTemplate(
+            tpl.dialect,
+            sys_json,
+            &sys_parts,
+            &sys_parts_len,
+            &dummy_calls,
+            &dummy_calls_len,
+            &dummy_trs,
+            &dummy_trs_len,
+            &dummy_reason,
+            scratch,
+            &scratch_pos,
+            signature_key,
+            out_cache_control,
+        );
+        renderer.pushMessage(.{
+            .role = .system,
+            .parts = sys_parts[0..sys_parts_len],
+        }, msg_idx) catch |err| return mapTemplateError(err);
+        msg_idx += 1;
+        total_messages += 1;
     }
-    try dst.writeAll("Return each tool call inside <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>.\n<tools>\n");
-    try dst.writeAll(tools_json);
-    try dst.writeAll("\n</tools><|im_end|>\n");
+
+    if (tools_raw_slice != null and tool_choice != .none) {
+        total_messages += 1;
+    }
+
+    if (endpoint == .responses and input_is_string) {
+        scratch_pos = tool_scratch_base;
+        const user_txt = try unescapeQuotedJson(input_slice.?, scratch, &scratch_pos);
+        renderer.pushMessage(.{
+            .role = .user,
+            .content = user_txt,
+        }, msg_idx) catch |err| return mapTemplateError(err);
+        last_msg_is_user = true;
+        total_messages += 1;
+    } else {
+        const arr_json = if (endpoint == .responses) input_slice.? else messages_slice.?;
+        var r = JsonReader{ .src = arr_json };
+        try r.expectByte('[');
+        if (r.peek() != ']') {
+            while (true) {
+                try r.expectByte('{');
+                scratch_pos = tool_scratch_base;
+                var role_buf: [32]u8 = undefined;
+                var role_str: []const u8 = "";
+                var itype_buf: [32]u8 = undefined;
+                var itype: []const u8 = "";
+                var msg_name: []const u8 = "";
+                var call_id: []const u8 = "";
+                var fc_name: []const u8 = "";
+                var fc_args: []const u8 = "{}";
+                var content_raw: ?[]const u8 = null;
+                var output_raw: ?[]const u8 = null;
+                var tool_calls_raw: ?[]const u8 = null;
+                var reasoning_txt: []const u8 = "";
+
+                if (r.peek() != '}') {
+                    while (true) {
+                        var kb: [64]u8 = undefined;
+                        const mk = try r.readKeyOrSkip(&kb);
+                        try r.expectByte(':');
+                        if (mk) |key| {
+                            if (std.mem.eql(u8, key, "role")) {
+                                role_str = try r.readSmallString(&role_buf);
+                            } else if (std.mem.eql(u8, key, "type")) {
+                                itype = try r.readSmallString(&itype_buf);
+                            } else if (std.mem.eql(u8, key, "name")) {
+                                if (!r.consumeKeyword("null")) {
+                                    const nr = try r.captureValueSlice(2);
+                                    msg_name = try unescapeQuotedJson(nr, scratch, &scratch_pos);
+                                    fc_name = msg_name;
+                                }
+                            } else if (std.mem.eql(u8, key, "call_id") or std.mem.eql(u8, key, "tool_call_id")) {
+                                if (!r.consumeKeyword("null")) {
+                                    const cr = try r.captureValueSlice(2);
+                                    call_id = try unescapeQuotedJson(cr, scratch, &scratch_pos);
+                                }
+                            } else if (std.mem.eql(u8, key, "arguments")) {
+                                if (r.peek() == '"') {
+                                    const ar = try r.captureValueSlice(2);
+                                    fc_args = try unescapeQuotedJson(ar, scratch, &scratch_pos);
+                                } else if (!r.consumeKeyword("null")) {
+                                    fc_args = try r.captureValueSlice(2);
+                                }
+                            } else if (std.mem.eql(u8, key, "reasoning_content")) {
+                                if (!r.consumeKeyword("null")) {
+                                    const rr = try r.captureValueSlice(2);
+                                    reasoning_txt = try unescapeQuotedJson(rr, scratch, &scratch_pos);
+                                }
+                            } else if (std.mem.eql(u8, key, "content")) {
+                                content_raw = try r.captureValueSlice(2);
+                            } else if (std.mem.eql(u8, key, "output")) {
+                                output_raw = try r.captureValueSlice(2);
+                            } else if (std.mem.eql(u8, key, "tool_calls")) {
+                                if (!r.consumeKeyword("null")) {
+                                    tool_calls_raw = try r.captureValueSlice(2);
+                                }
+                            } else {
+                                try r.skipValue(2);
+                            }
+                        } else {
+                            try r.skipValue(2);
+                        }
+                        const sep = r.peek() orelse return error.InvalidJson;
+                        if (sep == ',') {
+                            r.pos += 1;
+                        } else if (sep == '}') {
+                            r.pos += 1;
+                            break;
+                        } else return error.InvalidJson;
+                    }
+                } else r.pos += 1;
+
+                if (std.mem.eql(u8, itype, "function_call_output")) {
+                    const out_txt = if (output_raw) |oraw| blk: {
+                        var sub = JsonReader{ .src = oraw };
+                        var sub_fw = FixedWriter.init(scratch[scratch_pos..]);
+                        if (sub.peek() == '"') {
+                            try sub.readStringInto(&sub_fw);
+                        } else {
+                            try sub_fw.writeAll(oraw);
+                        }
+                        const slice = sub_fw.written();
+                        scratch_pos += sub_fw.pos;
+                        break :blk slice;
+                    } else "";
+                    renderer.pushMessage(.{
+                        .role = .tool,
+                        .tool_call_id = call_id,
+                        .name = msg_name,
+                        .content = out_txt,
+                    }, msg_idx) catch |err| return mapTemplateError(err);
+                    last_msg_is_user = true;
+                } else if (std.mem.eql(u8, itype, "function_call")) {
+                    const single_tc = [_]chat_template.ToolCallView{.{
+                        .id = call_id,
+                        .name = fc_name,
+                        .arguments_json = fc_args,
+                    }};
+                    renderer.pushMessage(.{
+                        .role = .assistant,
+                        .tool_calls = &single_tc,
+                    }, msg_idx) catch |err| return mapTemplateError(err);
+                    last_msg_is_user = false;
+                } else {
+                    if (role_str.len == 0) return error.MissingRequiredField;
+                    const role = chat_template.Role.parse(role_str) orelse return error.InvalidFieldValue;
+
+                    var parts_buf: [MAX_CONTENT_PARTS_PER_MSG]chat_template.ContentPart = undefined;
+                    var parts_len: usize = 0;
+                    var calls_buf: [MAX_TOOL_CALLS_PER_MSG]chat_template.ToolCallView = undefined;
+                    var calls_len: usize = 0;
+                    var trs_buf: [MAX_TOOL_CALLS_PER_MSG]PendingToolResultMsg = undefined;
+                    var trs_len: usize = 0;
+
+                    if (content_raw) |craw| {
+                        try parseMessageContentForTemplate(
+                            tpl.dialect,
+                            craw,
+                            &parts_buf,
+                            &parts_len,
+                            &calls_buf,
+                            &calls_len,
+                            &trs_buf,
+                            &trs_len,
+                            &reasoning_txt,
+                            scratch,
+                            &scratch_pos,
+                            signature_key,
+                            out_cache_control,
+                        );
+                    }
+                    if (tool_calls_raw) |tc_raw| {
+                        try parseOpenAiToolCallsToViews(tc_raw, &calls_buf, &calls_len, scratch, &scratch_pos);
+                    }
+
+                    if (trs_len > 0) {
+                        if (parts_len > 0) {
+                            renderer.pushMessage(.{
+                                .role = role,
+                                .name = msg_name,
+                                .parts = parts_buf[0..parts_len],
+                            }, msg_idx) catch |err| return mapTemplateError(err);
+                        }
+                        for (trs_buf[0..trs_len]) |tr_item| {
+                            renderer.pushMessage(.{
+                                .role = .tool,
+                                .tool_call_id = tr_item.tool_use_id,
+                                .content = tr_item.content,
+                            }, msg_idx) catch |err| return mapTemplateError(err);
+                        }
+                        last_msg_is_user = true;
+                    } else {
+                        renderer.pushMessage(.{
+                            .role = role,
+                            .name = msg_name,
+                            .tool_call_id = call_id,
+                            .reasoning_content = reasoning_txt,
+                            .parts = parts_buf[0..parts_len],
+                            .tool_calls = calls_buf[0..calls_len],
+                        }, msg_idx) catch |err| return mapTemplateError(err);
+                        last_msg_is_user = (role == .user or role == .tool);
+                    }
+                }
+                msg_idx += 1;
+                total_messages += 1;
+
+                const sep = r.peek() orelse return error.InvalidJson;
+                if (sep == ',') {
+                    r.pos += 1;
+                } else if (sep == ']') {
+                    r.pos += 1;
+                    break;
+                } else return error.InvalidJson;
+            }
+        }
+    }
+
+    renderer.finish() catch |err| return mapTemplateError(err);
+    const boundary: ?usize = if (total_messages >= 2 and last_msg_is_user)
+        renderer.last_user_msg_byte_offset
+    else
+        null;
+    return .{
+        .prompt_len = fw.pos,
+        .last_user_msg_byte_offset = boundary,
+        .starts_in_think = renderer.starts_in_think,
+    };
 }
 
 fn parseStopValue(r: *JsonReader, out_cfg: *sampling_mod.StopConfig) ParseError!void {
@@ -2518,8 +3546,8 @@ fn parseResponseFormatObject(
 }
 
 /// Zero-allocation parser for `/v1/chat/completions`, `/v1/responses`, and
-/// `/v1/messages`. Translates all three protocols into Qwen3 ChatML directly
-/// inside `prompt_buf` regardless of JSON key ordering.
+/// `/v1/messages`. Translates all three protocols via the declarative
+/// `ChatTemplate` (`ChatML`, `DeepSeek`, `Inkling 2`, `Hy4`, or `custom`).
 pub fn parseInferenceRequest(
     endpoint: Endpoint,
     body: []const u8,
@@ -2527,7 +3555,8 @@ pub fn parseInferenceRequest(
     prompt_buf: []u8,
     model_buf: []u8,
 ) ParseError!ParsedRequest {
-    return parseInferenceRequestWithPriorPrompt(endpoint, body, default_model, null, prompt_buf, model_buf);
+    const default_tpl = chat_template.ChatTemplate.preset(.chatml);
+    return parseInferenceRequestWithTemplate(endpoint, body, default_model, &default_tpl, null, null, null, prompt_buf, model_buf);
 }
 
 /// Extended zero-allocation parser supporting optional `prior_chatml` prefix
@@ -2537,6 +3566,21 @@ pub fn parseInferenceRequestWithPriorPrompt(
     body: []const u8,
     default_model: []const u8,
     prior_chatml: ?[]const u8,
+    prompt_buf: []u8,
+    model_buf: []u8,
+) ParseError!ParsedRequest {
+    const default_tpl = chat_template.ChatTemplate.preset(.chatml);
+    return parseInferenceRequestWithTemplate(endpoint, body, default_model, &default_tpl, prior_chatml, null, null, prompt_buf, model_buf);
+}
+
+pub fn parseInferenceRequestWithTemplate(
+    endpoint: Endpoint,
+    body: []const u8,
+    default_model: []const u8,
+    tpl: *const chat_template.ChatTemplate,
+    prior_chatml: ?[]const u8,
+    unescape_scratch: ?[]u8,
+    signature_key: ?*const [32]u8,
     prompt_buf: []u8,
     model_buf: []u8,
 ) ParseError!ParsedRequest {
@@ -2550,7 +3594,14 @@ pub fn parseInferenceRequestWithPriorPrompt(
     var seed: ?u64 = null;
     var stream: bool = false;
     var ignore_eos: bool = false;
-    var enable_thinking: bool = true;
+    var top_enable_thinking: ?bool = null;
+    var kw_enable_thinking: ?bool = null;
+    var thinking_type_enabled: ?bool = null;
+    var kw_preserved_thinking: ?bool = null;
+    var top_reasoning_effort: ?ReasoningEffort = null;
+    var kw_reasoning_effort: ?ReasoningEffort = null;
+    var nested_reasoning_effort: ?ReasoningEffort = null;
+    var reasoning_summary: ReasoningSummaryMode = .auto;
     var ngram_domain_buf: [MAX_NGRAM_DOMAIN_BYTES]u8 = @splat(0);
     var ngram_domain_len: u8 = 0;
 
@@ -2568,7 +3619,6 @@ pub fn parseInferenceRequestWithPriorPrompt(
     var stream_include_usage: bool = false;
     var cache_control_pin: bool = false;
     var thinking_budget_tokens: ?u32 = null;
-    var reasoning_effort: ?ReasoningEffort = null;
     var store_response: bool = true;
 
     var prev_resp_id_buf: [MAX_RESPONSE_ID_BYTES]u8 = @splat(0);
@@ -2850,7 +3900,7 @@ pub fn parseInferenceRequestWithPriorPrompt(
                     } else r.pos += 1;
                 }
             } else if (std.mem.eql(u8, maybe_key.?, "reasoning")) {
-                // OpenAI `/v1/responses` `reasoning.effort` (`none`|`low`|`medium`|`high`).
+                // OpenAI `/v1/responses` `reasoning.effort` + `reasoning.summary`.
                 if (!r.consumeKeyword("null")) {
                     try r.expectByte('{');
                     if (r.peek() != '}') {
@@ -2859,21 +3909,17 @@ pub fn parseInferenceRequestWithPriorPrompt(
                             const mrk = try r.readKeyOrSkip(&rk_buf);
                             try r.expectByte(':');
                             if (mrk != null and std.mem.eql(u8, mrk.?, "effort")) {
-                                var ebuf: [16]u8 = undefined;
-                                const ef = try r.readSmallString(&ebuf);
-                                if (std.mem.eql(u8, ef, "none")) {
-                                    reasoning_effort = .none;
-                                    enable_thinking = false;
-                                } else if (std.mem.eql(u8, ef, "low")) {
-                                    reasoning_effort = .low;
-                                    enable_thinking = true;
-                                } else if (std.mem.eql(u8, ef, "medium")) {
-                                    reasoning_effort = .medium;
-                                    enable_thinking = true;
-                                } else if (std.mem.eql(u8, ef, "high")) {
-                                    reasoning_effort = .high;
-                                    enable_thinking = true;
-                                } else return error.InvalidFieldValue;
+                                if (!r.consumeKeyword("null")) {
+                                    nested_reasoning_effort = try readReasoningEffortValue(&r);
+                                }
+                            } else if (mrk != null and std.mem.eql(u8, mrk.?, "summary")) {
+                                if (r.consumeKeyword("null")) {
+                                    reasoning_summary = .none;
+                                } else {
+                                    var sbuf: [24]u8 = undefined;
+                                    const sm = try r.readSmallString(&sbuf);
+                                    reasoning_summary = try ReasoningSummaryMode.parseString(sm);
+                                }
                             } else {
                                 try r.skipValue(2);
                             }
@@ -2887,6 +3933,10 @@ pub fn parseInferenceRequestWithPriorPrompt(
                         }
                     } else r.pos += 1;
                 }
+            } else if (std.mem.eql(u8, maybe_key.?, "reasoning_effort")) {
+                if (!r.consumeKeyword("null")) {
+                    top_reasoning_effort = try readReasoningEffortValue(&r);
+                }
             } else if (std.mem.eql(u8, maybe_key.?, "store")) {
                 if (!r.consumeKeyword("null")) {
                     store_response = try r.readBool();
@@ -2898,7 +3948,7 @@ pub fn parseInferenceRequestWithPriorPrompt(
             } else if (std.mem.eql(u8, maybe_key.?, "ignore_eos")) {
                 ignore_eos = try r.readBool();
             } else if (std.mem.eql(u8, maybe_key.?, "enable_thinking")) {
-                enable_thinking = try r.readBool();
+                top_enable_thinking = try r.readBool();
             } else if (std.mem.eql(u8, maybe_key.?, "chat_template_kwargs")) {
                 if (r.peek() == '{') {
                     r.pos += 1;
@@ -2908,7 +3958,13 @@ pub fn parseInferenceRequestWithPriorPrompt(
                             const maybe_sub = try r.readKeyOrSkip(&sub_key_buf);
                             try r.expectByte(':');
                             if (maybe_sub != null and std.mem.eql(u8, maybe_sub.?, "enable_thinking")) {
-                                enable_thinking = try r.readBool();
+                                kw_enable_thinking = try r.readBool();
+                            } else if (maybe_sub != null and std.mem.eql(u8, maybe_sub.?, "reasoning_effort")) {
+                                if (!r.consumeKeyword("null")) {
+                                    kw_reasoning_effort = try readReasoningEffortValue(&r);
+                                }
+                            } else if (maybe_sub != null and std.mem.eql(u8, maybe_sub.?, "preserved_thinking")) {
+                                kw_preserved_thinking = try r.readBool();
                             } else {
                                 try r.skipValue(2);
                             }
@@ -2940,9 +3996,9 @@ pub fn parseInferenceRequestWithPriorPrompt(
                                 var type_buf: [32]u8 = undefined;
                                 const t = try r.readSmallString(&type_buf);
                                 if (std.mem.eql(u8, t, "disabled")) {
-                                    enable_thinking = false;
+                                    thinking_type_enabled = false;
                                 } else if (std.mem.eql(u8, t, "enabled")) {
-                                    enable_thinking = true;
+                                    thinking_type_enabled = true;
                                 } else {
                                     return error.InvalidFieldValue;
                                 }
@@ -3020,90 +4076,74 @@ pub fn parseInferenceRequestWithPriorPrompt(
         model_len = copy_len;
     }
 
-    var pw = FixedWriter.init(prompt_buf);
-    var total_messages: usize = 0;
-    var last_msg_offset: usize = 0;
-    var last_msg_is_user: bool = false;
-
-    // Prepend prior stateful `/v1/responses` ChatML conversation transcript when chaining.
-    if (prior_chatml) |prior| {
-        if (prior.len > 0) {
-            try pw.writeAll(prior);
-            total_messages += 2;
-        }
+    if (top_enable_thinking != null and kw_enable_thinking != null and top_enable_thinking.? != kw_enable_thinking.?) {
+        return error.InvalidFieldValue;
     }
-
-    // Emit optional top-level system/instructions turn first.
-    if (system_slice) |sys_json| {
-        last_msg_offset = pw.pos;
-        last_msg_is_user = false;
-        try appendChatMlMessageEx(&pw, "system", sys_json, &cache_control_pin);
-        total_messages += 1;
+    const en_bool: ?bool = kw_enable_thinking orelse top_enable_thinking;
+    if (en_bool != null and thinking_type_enabled != null and en_bool.? != thinking_type_enabled.?) {
+        return error.InvalidFieldValue;
     }
+    const resolved_enable_opt: ?bool = en_bool orelse thinking_type_enabled;
 
-    // Inject tool schemas into Qwen3 system prompt when tools are supplied and not disabled (`tool_choice != none`).
-    if (tools_raw_slice) |ts_raw| {
-        if (tool_choice != .none) {
-            last_msg_offset = pw.pos;
-            last_msg_is_user = false;
-            try appendToolDeclarationsPrompt(
-                ts_raw,
-                tool_choice,
-                tool_choice_name_buf[0..tool_choice_name_len],
-                parallel_tool_calls,
-                &pw,
-            );
-            total_messages += 1;
-        }
-    }
-
-    switch (endpoint) {
-        .chat_completions, .messages => {
-            const msgs = messages_slice orelse return error.MissingRequiredField;
-            const res = try appendMessagesArrayEx(msgs, &pw, &cache_control_pin);
-            if (res.count == 0) return error.MissingRequiredField;
-            total_messages += res.count;
-            last_msg_offset = res.last_msg_offset;
-            last_msg_is_user = res.last_msg_is_user;
-        },
-        .responses => {
-            const inp = input_slice orelse return error.MissingRequiredField;
-            var ir = JsonReader{ .src = inp };
-            const ch = ir.peek() orelse return error.InvalidJson;
-            if (ch == '"') {
-                last_msg_offset = pw.pos;
-                last_msg_is_user = true;
-                try appendChatMlMessageEx(&pw, "user", inp, &cache_control_pin);
-                total_messages += 1;
-            } else if (ch == '[') {
-                const res = try appendMessagesArrayEx(inp, &pw, &cache_control_pin);
-                if (res.count == 0) return error.MissingRequiredField;
-                total_messages += res.count;
-                last_msg_offset = res.last_msg_offset;
-                last_msg_is_user = res.last_msg_is_user;
+    const efforts = [_]?ReasoningEffort{ nested_reasoning_effort, top_reasoning_effort, kw_reasoning_effort };
+    var first_effort: ?ReasoningEffort = null;
+    for (efforts) |me| {
+        if (me) |eff| {
+            if (first_effort) |prev| {
+                if (!prev.eqlNormalized(eff)) return error.InvalidFieldValue;
             } else {
-                return error.InvalidFieldValue;
+                first_effort = eff;
             }
-        },
+        }
     }
+    const resolved_effort_opt: ?ReasoningEffort = kw_reasoning_effort orelse top_reasoning_effort orelse nested_reasoning_effort;
 
-    // Qwen3 ChatML assistant generation prompt (disabling thinking pre-fills an empty think block).
-    if (enable_thinking) {
-        try pw.writeAll("<|im_start|>assistant\n");
-    } else {
-        try pw.writeAll("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    if (resolved_enable_opt != null and resolved_effort_opt != null) {
+        if (resolved_enable_opt.? != resolved_effort_opt.?.isThinkingEnabled()) {
+            return error.InvalidFieldValue;
+        }
     }
-
-    const last_user_msg_byte_offset: ?usize = if (total_messages >= 2 and last_msg_is_user and last_msg_offset > 0)
-        last_msg_offset
+    const enable_thinking: bool = if (resolved_enable_opt) |b|
+        b
+    else if (resolved_effort_opt) |e|
+        e.isThinkingEnabled()
+    else
+        true;
+    const resolved_effort: ?ReasoningEffort = if (resolved_effort_opt) |e|
+        e
+    else if (!enable_thinking)
+        .none
     else
         null;
+    const resolved_budget_tokens: ?u32 = if (enable_thinking) thinking_budget_tokens else null;
+
+    const rendered = try renderProtocolToTemplate(
+        endpoint,
+        tpl,
+        prompt_buf,
+        prior_chatml,
+        system_slice,
+        messages_slice,
+        input_slice,
+        tools[0..tool_count],
+        tools_raw_slice,
+        tool_choice,
+        tool_choice_name_buf[0..tool_choice_name_len],
+        parallel_tool_calls,
+        resolved_effort,
+        enable_thinking,
+        kw_preserved_thinking,
+        unescape_scratch,
+        signature_key,
+        &cache_control_pin,
+    );
+    const starts_in_think = rendered.starts_in_think;
 
     return .{
         .endpoint = endpoint,
         .model_len = @intCast(model_len),
-        .prompt_len = pw.pos,
-        .last_user_msg_byte_offset = last_user_msg_byte_offset,
+        .prompt_len = rendered.prompt_len,
+        .last_user_msg_byte_offset = rendered.last_user_msg_byte_offset,
         .max_tokens = max_tokens,
         .temperature = temperature,
         .seed = seed,
@@ -3125,8 +4165,12 @@ pub fn parseInferenceRequestWithPriorPrompt(
         .stop_config = stop_config,
         .stream_include_usage = stream_include_usage,
         .cache_control_pin = cache_control_pin,
-        .thinking_budget_tokens = thinking_budget_tokens,
-        .reasoning_effort = reasoning_effort,
+        .thinking_budget_tokens = resolved_budget_tokens,
+        .reasoning_effort = resolved_effort,
+        .preserved_thinking = kw_preserved_thinking,
+        .reasoning_summary = reasoning_summary,
+        .starts_in_think = starts_in_think,
+        .template_dialect = tpl.dialect,
         .store_response = store_response,
         .previous_response_id_buf = prev_resp_id_buf,
         .previous_response_id_len = prev_resp_id_len,
@@ -3503,6 +4547,7 @@ const HttpHeadersResult = struct {
     authorization_bearer: ?[]const u8 = null,
     x_api_key: ?[]const u8 = null,
     anthropic_version: ?[]const u8 = null,
+    connection_close: bool = false,
 };
 
 const HttpParseError = error{
@@ -3525,6 +4570,7 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
     const version_str = parts.next() orelse return error.BadRequest;
     if (parts.next() != null) return error.BadRequest;
     if (!std.mem.startsWith(u8, version_str, "HTTP/1.")) return error.BadRequest;
+    const default_close = std.mem.eql(u8, version_str, "HTTP/1.0");
     if (target_str.len == 0 or target_str[0] != '/') return error.BadRequest;
 
     const method: HttpMethod = if (std.mem.eql(u8, method_str, "GET"))
@@ -3544,6 +4590,7 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
     var authorization_bearer: ?[]const u8 = null;
     var x_api_key: ?[]const u8 = null;
     var anthropic_version: ?[]const u8 = null;
+    var connection_close: bool = default_close;
 
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -3562,6 +4609,12 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
                 chunked = true;
             } else {
                 return error.BadRequest;
+            }
+        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            if (asciiContainsIgnoreCase(val, "close")) {
+                connection_close = true;
+            } else if (asciiContainsIgnoreCase(val, "keep-alive")) {
+                connection_close = false;
             }
         } else if (std.ascii.eqlIgnoreCase(name, "expect")) {
             if (std.ascii.eqlIgnoreCase(val, "100-continue")) {
@@ -3591,6 +4644,7 @@ fn parseHttpHeaders(buf: []const u8) HttpParseError!HttpHeadersResult {
         .authorization_bearer = authorization_bearer,
         .x_api_key = x_api_key,
         .anthropic_version = anthropic_version,
+        .connection_close = connection_close,
     };
 }
 
@@ -3606,7 +4660,10 @@ fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 const ChunkedDecodeStatus = union(enum) {
     incomplete,
-    complete: usize,
+    complete: struct {
+        decoded_len: usize,
+        consumed_len: usize,
+    },
 };
 
 /// Validates and decodes an HTTP/1.1 `Transfer-Encoding: chunked` body in place
@@ -3614,6 +4671,7 @@ const ChunkedDecodeStatus = union(enum) {
 fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
     // First verify the entire chunked payload has arrived before mutating in place.
     var scan: usize = 0;
+    var consumed_len: usize = 0;
     while (true) {
         const line_rel = neonFindCrlf(body_buf[scan..]) orelse return .incomplete;
         const size_line_full = body_buf[scan .. scan + line_rel];
@@ -3627,10 +4685,11 @@ fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
         if (chunk_len == 0) {
             if (body_buf.len - scan < 2) return .incomplete;
             if (body_buf[scan] == '\r' and body_buf[scan + 1] == '\n') {
+                consumed_len = scan + 2;
                 break;
             }
             const trailer_end = neonFindCrlfCrlf(body_buf[scan..]) orelse return .incomplete;
-            _ = trailer_end;
+            consumed_len = scan + trailer_end + 4;
             break;
         }
         if (body_buf.len - scan < chunk_len + 2) return .incomplete;
@@ -3657,7 +4716,7 @@ fn decodeChunkedInPlace(body_buf: []u8) error{BadRequest}!ChunkedDecodeStatus {
         out_pos += chunk_len;
         read_pos += chunk_len + 2;
     }
-    return .{ .complete = out_pos };
+    return .{ .complete = .{ .decoded_len = out_pos, .consumed_len = consumed_len } };
 }
 
 // ---------------------------------------------------------------------------
@@ -3795,6 +4854,7 @@ const ResponseRecordStatus = enum(u8) {
     completed = 1,
     cancelled = 2,
     failed = 3,
+    incomplete = 4,
 
     fn name(self: ResponseRecordStatus) []const u8 {
         return switch (self) {
@@ -3802,6 +4862,21 @@ const ResponseRecordStatus = enum(u8) {
             .completed => "completed",
             .cancelled => "cancelled",
             .failed => "failed",
+            .incomplete => "incomplete",
+        };
+    }
+};
+
+const IncompleteReason = enum(u8) {
+    none = 0,
+    max_output_tokens = 1,
+    max_response_bytes = 2,
+
+    fn name(self: IncompleteReason) []const u8 {
+        return switch (self) {
+            .none => "",
+            .max_output_tokens => "max_output_tokens",
+            .max_response_bytes => "max_response_bytes",
         };
     }
 };
@@ -3814,6 +4889,9 @@ const StatefulResponseSlot = struct {
     request_id: u64 = 0,
     created_unix: u64 = 0,
     status: ResponseRecordStatus = .completed,
+    incomplete_reason: IncompleteReason = .none,
+    reasoning_summary: ReasoningSummaryMode = .auto,
+    transcript_corrupt: bool = false,
     seed_used: u64 = 0,
     seed_source: EffectiveSeedSource = .greedy,
     prompt_tokens: u32 = 0,
@@ -3909,13 +4987,30 @@ const ConnectionSlot = struct {
     stateful_resp_slot_idx: ?u16,
 
     // Timing, accounting, and streaming protocol state.
+    keep_alive: bool,
+    has_completed_request: bool,
+    rx_consumed_len: usize,
+    read_start_ns: u64,
+    last_activity_ns: u64,
     admit_ns: u64,
+    prefill_done_ns: u64,
+    first_generated_token_ns: u64,
+    first_emitted_ns: u64,
     first_token_ns: u64,
     created_unix: u64,
     prompt_tokens: u32,
     cached_tokens: u32,
     completion_tokens: u32,
     reasoning_tokens: u32,
+    nonstream_reasoning_truncated: bool,
+    nonstream_content_truncated: bool,
+    tool_calls_truncated: bool,
+    thinking_budget_tokens: ?u32,
+    thinking_budget_exhausted: bool,
+    reasoning_summary: ReasoningSummaryMode,
+    template_dialect: chat_template.Dialect,
+    thinking_hmac: HmacSha256,
+    anthropic_block_had_delta: bool,
     sent_first_chunk: bool,
     preamble_sent: bool,
     responses_seq_num: u32,
@@ -3984,12 +5079,46 @@ const ConnectionSlot = struct {
         self.write_armed = false;
         self.sent_continue = false;
         self.request_counted = false;
+        self.keep_alive = false;
+        self.has_completed_request = false;
         self.rx_len = 0;
+        self.rx_consumed_len = 0;
+        const now = monotonicNowNs();
+        self.read_start_ns = now;
+        self.last_activity_ns = now;
+        self.resetPerRequestState();
+        // Drain any stale token events from a previous generation.
+        while (self.token_ring.tryPop() != null) {}
+    }
+
+    fn resetForNextKeepAliveRequest(self: *ConnectionSlot, rem_rx_len: usize, now_ns: u64) void {
+        self.state = .reading_request;
+        self.write_armed = false;
+        self.sent_continue = false;
+        self.request_counted = false;
+        self.has_completed_request = true;
+        self.rx_len = rem_rx_len;
+        self.rx_consumed_len = 0;
+        self.read_start_ns = if (rem_rx_len > 0) now_ns else 0;
+        self.last_activity_ns = now_ns;
+        self.resetPerRequestState();
+        while (self.token_ring.tryPop() != null) {}
+    }
+
+    fn resetPerRequestState(self: *ConnectionSlot) void {
         self.prompt_len = 0;
         self.tx_read_pos = 0;
         self.tx_write_pos = 0;
         self.nonstream_reasoning_len = 0;
         self.nonstream_content_len = 0;
+        self.nonstream_reasoning_truncated = false;
+        self.nonstream_content_truncated = false;
+        self.tool_calls_truncated = false;
+        self.thinking_budget_tokens = null;
+        self.thinking_budget_exhausted = false;
+        self.reasoning_summary = .auto;
+        self.template_dialect = .chatml;
+        self.anthropic_block_had_delta = false;
         self.ngram_domain_len = 0;
         self.logit_bias_len = 0;
         self.stop_config.reset();
@@ -4001,6 +5130,9 @@ const ConnectionSlot = struct {
         self.stateful_resp_slot_idx = null;
         self.cancelled.store(false, .release);
         self.admit_ns = 0;
+        self.prefill_done_ns = 0;
+        self.first_generated_token_ns = 0;
+        self.first_emitted_ns = 0;
         self.first_token_ns = 0;
         self.created_unix = 0;
         self.prompt_tokens = 0;
@@ -4023,8 +5155,6 @@ const ConnectionSlot = struct {
         self.think_splitter.reset(false);
         self.tool_parser.reset(0);
         self.stored_tool_call_count = 0;
-        // Drain any stale token events from a previous generation.
-        while (self.token_ring.tryPop() != null) {}
     }
 };
 
@@ -4039,6 +5169,33 @@ pub const TokenStream = struct {
     prompt_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     finished: bool = false,
+    thinking_budget_tokens: ?u32 = null,
+    worker_think_splitter: ThinkSplitter = .{},
+    worker_splitter_initialized: bool = false,
+    reasoning_tokens_seen: u32 = 0,
+    thinking_budget_reached: std.atomic.Value(bool) = .init(false),
+
+    pub fn setThinkingBudget(
+        self: *TokenStream,
+        budget: ?u32,
+        dialect: chat_template.Dialect,
+        starts_in_think: bool,
+    ) void {
+        self.thinking_budget_tokens = budget;
+        self.worker_think_splitter.resetForDialect(dialect, starts_in_think);
+        self.worker_splitter_initialized = true;
+        self.reasoning_tokens_seen = 0;
+        self.thinking_budget_reached.store(false, .release);
+    }
+
+    pub fn thinkingBudgetExceeded(self: *const TokenStream) bool {
+        return self.thinking_budget_reached.load(.acquire);
+    }
+
+    pub fn thinkingBudgetRemaining(self: *const TokenStream) ?u32 {
+        const budget = self.thinking_budget_tokens orelse self.slot.thinking_budget_tokens orelse return null;
+        return budget -| self.reasoning_tokens_seen;
+    }
 
     /// Non-blocking cancellation check (`true` if the client disconnected or
     /// server shutdown was requested).
@@ -4060,6 +5217,7 @@ pub const TokenStream = struct {
             .kind = .prefill_done,
             .token_count = count,
             .cached_tokens = cached_tokens,
+            .timestamp_ns = monotonicNowNs(),
             .text_len = 0,
         };
         return self.pushEvent(ev);
@@ -4071,13 +5229,30 @@ pub const TokenStream = struct {
     pub fn emitBytes(self: *TokenStream, bytes: []const u8, token_delta: u32) bool {
         if (self.isCancelled()) return false;
         self.completion_tokens +|= token_delta;
+        const now_ns = monotonicNowNs();
+        if (!self.worker_splitter_initialized) {
+            self.worker_think_splitter.resetForDialect(self.slot.template_dialect, self.slot.think_splitter.in_think);
+            self.worker_splitter_initialized = true;
+            if (self.thinking_budget_tokens == null) {
+                self.thinking_budget_tokens = self.slot.thinking_budget_tokens;
+            }
+        }
 
         const EmitCtx = struct {
             stream: *TokenStream,
             pending_tokens: u32,
+            ts_ns: u64,
             emitted_any: bool = false,
+            had_reasoning: bool = false,
+
+            fn onSplitSpan(ctx: *@This(), ch: StreamChannel, span: []const u8) error{}!void {
+                if (ch == .reasoning and span.len > 0) {
+                    ctx.had_reasoning = true;
+                }
+            }
 
             fn onUtf8(ctx: *@This(), valid_utf8: []const u8) bool {
+                ctx.stream.worker_think_splitter.feed(valid_utf8, ctx, onSplitSpan) catch unreachable;
                 var off: usize = 0;
                 while (off < valid_utf8.len) {
                     const take = utf8ChunkLen(valid_utf8[off..], MAX_CHUNK_TEXT_BYTES);
@@ -4087,6 +5262,7 @@ pub const TokenStream = struct {
                         .generation = ctx.stream.generation,
                         .kind = .token_text,
                         .token_count = tok_cnt,
+                        .timestamp_ns = ctx.ts_ns,
                         .text_len = @intCast(take),
                     };
                     @memcpy(ev.text[0..take], valid_utf8[off .. off + take]);
@@ -4101,8 +5277,18 @@ pub const TokenStream = struct {
         var ctx = EmitCtx{
             .stream = self,
             .pending_tokens = token_delta,
+            .ts_ns = now_ns,
         };
         if (!self.utf8.push(bytes, &ctx, EmitCtx.onUtf8)) return false;
+
+        if (ctx.had_reasoning and token_delta > 0) {
+            self.reasoning_tokens_seen +|= token_delta;
+            if (self.thinking_budget_tokens orelse self.slot.thinking_budget_tokens) |budget| {
+                if (self.reasoning_tokens_seen >= budget) {
+                    self.thinking_budget_reached.store(true, .release);
+                }
+            }
+        }
 
         // If `bytes` only buffered incomplete UTF-8 carry bytes (or was empty) while
         // advancing `token_delta`, still record the token count accurately.
@@ -4111,6 +5297,7 @@ pub const TokenStream = struct {
                 .generation = self.generation,
                 .kind = .token_text,
                 .token_count = ctx.pending_tokens,
+                .timestamp_ns = now_ns,
                 .text_len = 0,
             };
             if (!self.pushEvent(ev)) return false;
@@ -4214,6 +5401,7 @@ pub const Server = struct {
     model_id_len: u16,
     api_key_buf: [MAX_API_KEY_BYTES]u8,
     api_key_len: u16,
+    signature_key: [32]u8,
     unix_socket_path_buf: [MAX_UNIX_SOCKET_PATH_BYTES + 1]u8,
     unix_socket_path_len: u16,
 
@@ -4349,7 +5537,10 @@ pub const Server = struct {
         errdefer allocator.free(grammar_programs);
 
         // Preallocated fixed-slot stateful `/v1/responses` table (`evict_first` LRU, 16 KiB aligned).
-        const resp_slot_count = config.stateful_response_slots;
+        const resp_slot_count = if (config.stateful_response_slots == DEFAULT_STATEFUL_RESPONSE_SLOTS and config.max_conns > config.stateful_response_slots)
+            config.max_conns
+        else
+            config.stateful_response_slots;
         const per_resp_bytes = DEFAULT_STATEFUL_RESPONSE_PROMPT_BYTES +
             DEFAULT_STATEFUL_RESPONSE_REASONING_BYTES +
             DEFAULT_STATEFUL_RESPONSE_CONTENT_BYTES;
@@ -4481,13 +5672,30 @@ pub const Server = struct {
                 .previous_response_id_buf = @splat(0),
                 .previous_response_id_len = 0,
                 .stateful_resp_slot_idx = null,
+                .keep_alive = false,
+                .has_completed_request = false,
+                .rx_consumed_len = 0,
+                .read_start_ns = 0,
+                .last_activity_ns = 0,
                 .admit_ns = 0,
+                .prefill_done_ns = 0,
+                .first_generated_token_ns = 0,
+                .first_emitted_ns = 0,
                 .first_token_ns = 0,
                 .created_unix = 0,
                 .prompt_tokens = 0,
                 .cached_tokens = 0,
                 .completion_tokens = 0,
                 .reasoning_tokens = 0,
+                .nonstream_reasoning_truncated = false,
+                .nonstream_content_truncated = false,
+                .tool_calls_truncated = false,
+                .thinking_budget_tokens = null,
+                .thinking_budget_exhausted = false,
+                .reasoning_summary = .auto,
+                .template_dialect = .chatml,
+                .thinking_hmac = HmacSha256.init(&@as([32]u8, @splat(0))),
+                .anthropic_block_had_delta = false,
                 .sent_first_chunk = false,
                 .preamble_sent = false,
                 .responses_seq_num = 0,
@@ -4614,11 +5822,22 @@ pub const Server = struct {
 
         var api_key_buf: [MAX_API_KEY_BYTES]u8 = @splat(0);
         var api_key_len: u16 = 0;
+        var signature_key: [32]u8 = undefined;
         if (config.api_key) |ak| {
             if (ak.len > 0) {
                 @memcpy(api_key_buf[0..ak.len], ak);
                 api_key_len = @intCast(ak.len);
+                var sh = Sha256.init(.{});
+                sh.update("aminfer-anthropic-thinking-hmac-v1:");
+                sh.update(ak);
+                sh.final(&signature_key);
+            } else {
+                var r = rng_mod.RequestRng.init(null) catch rng_mod.RequestRng.initDeterministic(monotonicNowNs() ^ 0x5A17_9A23);
+                r.random().bytes(&signature_key);
             }
+        } else {
+            var r = rng_mod.RequestRng.init(null) catch rng_mod.RequestRng.initDeterministic(monotonicNowNs() ^ 0x5A17_9A23);
+            r.random().bytes(&signature_key);
         }
 
         self.* = .{
@@ -4627,6 +5846,7 @@ pub const Server = struct {
             .model_id_len = @intCast(config.model_id.len),
             .api_key_buf = api_key_buf,
             .api_key_len = api_key_len,
+            .signature_key = signature_key,
             .unix_socket_path_buf = unix_path_buf,
             .unix_socket_path_len = unix_path_len,
             .kq_fd = kq_fd,
@@ -4951,6 +6171,7 @@ pub const Server = struct {
                         .slot = slot,
                         .generation = job.generation,
                     };
+                    stream.setThinkingBudget(job.thinking_budget_tokens, job.template_dialect, job.starts_in_think);
                     handler.generateFn(handler.ctx, &job, &stream);
                     if (!stream.finished and !stream.isCancelled()) {
                         stream.finish(.stop, stream.prompt_tokens);
@@ -5096,6 +6317,7 @@ pub const Server = struct {
                     .slot = conn,
                     .generation = job.generation,
                 };
+                self.batch_slot_streams[free_bsid].setThinkingBudget(job.thinking_budget_tokens, job.template_dialect, job.starts_in_think);
 
                 const prompt_buf = self.batch_scheduler.slotPromptBuffer(free_bsid);
                 const tok_res: TokenizeResult = if (handler.tokenizeWithBoundaryFn) |f|
@@ -5195,9 +6417,17 @@ pub const Server = struct {
         self.wakeup_pending.store(false, .seq_cst);
         self.drainAllSlots();
 
+        const now_before = monotonicNowNs();
+        self.sweepConnectionTimeouts(now_before);
+
+        var eff_timeout_ns = timeout_ns;
+        if (self.nextConnectionDeadlineNs(now_before)) |rem_ns| {
+            eff_timeout_ns = if (eff_timeout_ns) |cur| @min(cur, rem_ns) else rem_ns;
+        }
+
         var empty_changes: [1]std.c.kevent64_s = .{std.mem.zeroes(std.c.kevent64_s)};
         var ts: std.c.timespec = undefined;
-        const ts_ptr: ?*const std.c.timespec = if (timeout_ns) |ns| blk: {
+        const ts_ptr: ?*const std.c.timespec = if (eff_timeout_ns) |ns| blk: {
             ts = nsToTimespec(ns);
             break :blk &ts;
         } else null;
@@ -5242,6 +6472,7 @@ pub const Server = struct {
             self.wakeup_pending.store(false, .seq_cst);
             self.drainAllSlots();
         }
+        self.sweepConnectionTimeouts(monotonicNowNs());
         return count;
     }
 
@@ -5359,6 +6590,72 @@ pub const Server = struct {
         }
     }
 
+    fn nextConnectionDeadlineNs(self: *const Server, now_ns: u64) ?u64 {
+        const read_ms = self.config.http_read_timeout_ms;
+        const idle_ms = self.config.keepalive_idle_timeout_ms;
+        var min_rem: ?u64 = null;
+        for (self.slots) |*slot| {
+            if (slot.state != .reading_request) continue;
+            const deadline_ns: ?u64 = if (slot.read_start_ns > 0 and read_ms > 0)
+                slot.read_start_ns + @as(u64, read_ms) * std.time.ns_per_ms
+            else if (slot.read_start_ns == 0 and slot.has_completed_request and idle_ms > 0)
+                slot.last_activity_ns + @as(u64, idle_ms) * std.time.ns_per_ms
+            else
+                null;
+            if (deadline_ns) |dl| {
+                const rem = dl -| now_ns;
+                min_rem = if (min_rem) |prev| @min(prev, rem) else rem;
+            }
+        }
+        return min_rem;
+    }
+
+    fn sweepConnectionTimeouts(self: *Server, now_ns: u64) void {
+        const read_ms = self.config.http_read_timeout_ms;
+        const idle_ms = self.config.keepalive_idle_timeout_ms;
+        for (self.slots) |*slot| {
+            if (slot.state != .reading_request) continue;
+            if (slot.read_start_ns > 0 and read_ms > 0) {
+                if ((now_ns -| slot.read_start_ns) >= @as(u64, read_ms) * std.time.ns_per_ms) {
+                    slot.keep_alive = false;
+                    self.sendErrorResponse(
+                        slot,
+                        408,
+                        "Request Timeout",
+                        null,
+                        "request read timed out",
+                        "invalid_request_error",
+                        "request_timeout",
+                    );
+                }
+            } else if (slot.read_start_ns == 0 and slot.has_completed_request and idle_ms > 0) {
+                if ((now_ns -| slot.last_activity_ns) >= @as(u64, idle_ms) * std.time.ns_per_ms) {
+                    self.closeSlotSocketAndRelease(slot, false);
+                }
+            }
+        }
+    }
+
+    fn finishHttpExchange(self: *Server, slot: *ConnectionSlot) void {
+        if (!slot.keep_alive or slot.fd < 0) {
+            self.closeSlotSocketAndRelease(slot, false);
+            return;
+        }
+        const rem = slot.rx_len -| slot.rx_consumed_len;
+        if (rem > 0 and slot.rx_consumed_len > 0) {
+            std.mem.copyForwards(
+                u8,
+                slot.rx_buf[0..rem],
+                slot.rx_buf[slot.rx_consumed_len..slot.rx_len],
+            );
+        }
+        self.setWriteInterest(slot, false);
+        slot.resetForNextKeepAliveRequest(rem, monotonicNowNs());
+        if (rem > 0) {
+            self.tryDispatchHttpRequest(slot, false);
+        }
+    }
+
     fn closeSlotSocketAndRelease(self: *Server, slot: *ConnectionSlot, was_client_abort: bool) void {
         if (slot.fd >= 0) {
             _ = std.c.close(slot.fd);
@@ -5394,6 +6691,9 @@ pub const Server = struct {
                     const avail = slot.rx_buf[slot.rx_len..];
                     const n = std.c.recv(slot.fd, avail.ptr, avail.len, 0);
                     if (n > 0) {
+                        const now = monotonicNowNs();
+                        if (slot.read_start_ns == 0) slot.read_start_ns = now;
+                        slot.last_activity_ns = now;
                         slot.rx_len += @intCast(n);
                     } else if (n == 0) {
                         eof_seen = true;
@@ -5442,7 +6742,7 @@ pub const Server = struct {
         if (slot.state == .streaming_active) {
             self.drainSlotTokens(slot);
         } else if (slot.state == .draining_response and slot.pendingTxLen() == 0) {
-            self.closeSlotSocketAndRelease(slot, false);
+            self.finishHttpExchange(slot);
         }
     }
 
@@ -5480,21 +6780,27 @@ pub const Server = struct {
         const hdr = parseHttpHeaders(slot.rx_buf[0..slot.rx_len]) catch |err| switch (err) {
             error.Incomplete => {
                 if (slot.rx_len >= slot.rx_buf.len) {
+                    slot.keep_alive = false;
                     self.sendErrorResponse(slot, 413, "Payload Too Large", null, "request headers exceed preallocated slot buffer", "invalid_request_error", "payload_too_large");
                 } else if (eof_seen) {
-                    self.closeSlotSocketAndRelease(slot, true);
+                    const was_abort = (slot.rx_len > 0) or !slot.has_completed_request;
+                    self.closeSlotSocketAndRelease(slot, was_abort);
                 }
                 return;
             },
             error.BadRequest => {
+                slot.keep_alive = false;
                 self.sendErrorResponse(slot, 400, "Bad Request", null, "malformed HTTP/1.1 request", "invalid_request_error", "bad_request");
                 return;
             },
             error.PayloadTooLarge => {
+                slot.keep_alive = false;
                 self.sendErrorResponse(slot, 413, "Payload Too Large", null, "request exceeds preallocated slot buffer", "invalid_request_error", "payload_too_large");
                 return;
             },
         };
+
+        slot.keep_alive = !hdr.connection_close;
 
         // Support curl's `Expect: 100-continue` immediately so large POST bodies never stall.
         if (hdr.expect_continue and !slot.sent_continue) {
@@ -5504,40 +6810,49 @@ pub const Server = struct {
 
         // Wait until the full request body (if any) has arrived.
         var body: []const u8 = "";
+        slot.rx_consumed_len = hdr.header_end;
         if (hdr.chunked) {
             const decoded = decodeChunkedInPlace(slot.rx_buf[hdr.header_end..slot.rx_len]) catch {
+                slot.keep_alive = false;
                 self.sendErrorResponse(slot, 400, "Bad Request", null, "malformed chunked request body", "invalid_request_error", "bad_request");
                 return;
             };
             switch (decoded) {
                 .incomplete => {
                     if (slot.rx_len >= slot.rx_buf.len) {
+                        slot.keep_alive = false;
                         self.sendErrorResponse(slot, 413, "Payload Too Large", null, "chunked body exceeds preallocated slot buffer", "invalid_request_error", "payload_too_large");
                     } else if (eof_seen) {
+                        slot.keep_alive = false;
                         self.sendErrorResponse(slot, 400, "Bad Request", null, "truncated chunked request body", "invalid_request_error", "bad_request");
                     }
                     return;
                 },
-                .complete => |n| {
-                    body = slot.rx_buf[hdr.header_end .. hdr.header_end + n];
+                .complete => |cd| {
+                    body = slot.rx_buf[hdr.header_end .. hdr.header_end + cd.decoded_len];
+                    slot.rx_consumed_len = hdr.header_end + cd.consumed_len;
                 },
             }
         } else if (hdr.content_length) |cl| {
             const total_needed = std.math.add(usize, hdr.header_end, cl) catch {
+                slot.keep_alive = false;
                 self.sendErrorResponse(slot, 413, "Payload Too Large", null, "content-length overflow", "invalid_request_error", "payload_too_large");
                 return;
             };
             if (total_needed > slot.rx_buf.len) {
+                slot.keep_alive = false;
                 self.sendErrorResponse(slot, 413, "Payload Too Large", null, "request body exceeds preallocated slot buffer", "invalid_request_error", "payload_too_large");
                 return;
             }
             if (slot.rx_len < total_needed) {
                 if (eof_seen) {
+                    slot.keep_alive = false;
                     self.sendErrorResponse(slot, 400, "Bad Request", null, "truncated HTTP request body", "invalid_request_error", "bad_request");
                 }
                 return;
             }
             body = slot.rx_buf[hdr.header_end..total_needed];
+            slot.rx_consumed_len = total_needed;
         }
 
         // Route dispatch.
@@ -5714,10 +7029,11 @@ pub const Server = struct {
     ) void {
         var hdr_buf: [512]u8 = undefined;
         var w = FixedWriter.init(&hdr_buf);
-        w.print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n", .{
+        w.print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n", .{
             status_code,
             reason,
             json_body.len,
+            if (slot.keep_alive) "keep-alive" else "close",
         }) catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -5755,7 +7071,7 @@ pub const Server = struct {
         };
         slot.state = .draining_response;
         if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.closeSlotSocketAndRelease(slot, false);
+            self.finishHttpExchange(slot);
         }
     }
 
@@ -6034,10 +7350,14 @@ pub const Server = struct {
     // -----------------------------------------------------------------------
 
     fn handleMessagesCountTokens(self: *Server, slot: *ConnectionSlot, body: []const u8) void {
-        const parsed = parseInferenceRequest(
+        const parsed = parseInferenceRequestWithTemplate(
             .messages,
             body,
             self.modelId(),
+            &self.config.chat_template,
+            null,
+            slot.nonstream_content_buf,
+            &self.signature_key,
             slot.prompt_buf,
             &slot.model_buf,
         ) catch |err| {
@@ -6168,8 +7488,8 @@ pub const Server = struct {
         var hdr_buf: [HEADER_RESERVE]u8 = undefined;
         var hw = FixedWriter.init(&hdr_buf);
         hw.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{json_body.len},
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
+            .{ json_body.len, if (slot.keep_alive) "keep-alive" else "close" },
         ) catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -6180,7 +7500,7 @@ pub const Server = struct {
         slot.tx_write_pos = HEADER_RESERVE + json_body.len;
         slot.state = .draining_response;
         if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.closeSlotSocketAndRelease(slot, false);
+            self.finishHttpExchange(slot);
         }
     }
 
@@ -6251,8 +7571,8 @@ pub const Server = struct {
         var hdr_buf: [HEADER_RESERVE]u8 = undefined;
         var hw = FixedWriter.init(&hdr_buf);
         hw.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{json_body.len},
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
+            .{ json_body.len, if (slot.keep_alive) "keep-alive" else "close" },
         ) catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -6263,7 +7583,7 @@ pub const Server = struct {
         slot.tx_write_pos = HEADER_RESERVE + json_body.len;
         slot.state = .draining_response;
         if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.closeSlotSocketAndRelease(slot, false);
+            self.finishHttpExchange(slot);
         }
     }
 
@@ -6279,6 +7599,7 @@ pub const Server = struct {
     }
 
     /// Allocates or LRU-evicts (`evict_first`) a preallocated fixed slot for a `/v1/responses` record.
+    /// Never evicts active `.in_progress` slots (`C18`/`W24`).
     fn allocStatefulResponseSlot(self: *Server) ?u16 {
         if (self.response_store.len == 0) return null;
         var victim_idx: ?usize = null;
@@ -6287,23 +7608,77 @@ pub const Server = struct {
             if (!rec.occupied) {
                 return @intCast(idx);
             }
-            // Prefer evicting completed/cancelled/failed slots before any in-progress slot.
+            // Only completed/cancelled/failed/incomplete slots are eligible for eviction.
             if (rec.status != .in_progress and rec.lru_tick < oldest_tick) {
                 oldest_tick = rec.lru_tick;
                 victim_idx = idx;
             }
         }
-        if (victim_idx) |vi| return @intCast(vi);
-        // All slots in-progress: evict global oldest.
-        var any_idx: usize = 0;
-        var any_tick: u64 = self.response_store[0].lru_tick;
-        for (self.response_store[1..], 1..) |*rec, idx| {
-            if (rec.lru_tick < any_tick) {
-                any_tick = rec.lru_tick;
-                any_idx = idx;
+        return if (victim_idx) |vi| @intCast(vi) else null;
+    }
+
+    fn writeResponsesOutputArrayJson(
+        bw: *FixedWriter,
+        request_id: u64,
+        item_status: []const u8,
+        reasoning: []const u8,
+        content: []const u8,
+        summary_mode: ReasoningSummaryMode,
+        has_tools: bool,
+        tool_calls: []const StoredToolCall,
+    ) error{BufferTooSmall}!void {
+        try bw.writeByte('[');
+        var need_comma = false;
+        if (reasoning.len > 0) {
+            try bw.print("{{\"id\":\"rs_{d}\",\"type\":\"reasoning\",\"status\":\"completed\",", .{request_id});
+            try bw.writeAll("\"content\":[{\"type\":\"reasoning_text\",\"text\":\"");
+            try bw.writeJsonEscaped(reasoning);
+            try bw.writeAll("\"}],\"summary\":[");
+            switch (summary_mode) {
+                .none => {},
+                .auto, .detailed => {
+                    try bw.writeAll("{\"type\":\"summary_text\",\"text\":\"");
+                    try bw.writeJsonEscaped(reasoning);
+                    try bw.writeAll("\"}");
+                },
+                .concise => {
+                    var cbuf: [320]u8 = undefined;
+                    const concise = extractConciseReasoningSummary(reasoning, &cbuf);
+                    if (concise.len > 0) {
+                        try bw.writeAll("{\"type\":\"summary_text\",\"text\":\"");
+                        try bw.writeJsonEscaped(concise);
+                        try bw.writeAll("\"}");
+                    }
+                },
             }
+            try bw.writeAll("]}");
+            need_comma = true;
         }
-        return @intCast(any_idx);
+        if (content.len > 0 or !has_tools) {
+            if (need_comma) try bw.writeByte(',');
+            try bw.print(
+                "{{\"id\":\"msg_{d}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"{s}\",\"content\":[{{\"type\":\"output_text\",\"text\":\"",
+                .{ request_id, item_status },
+            );
+            try bw.writeJsonEscaped(content);
+            try bw.writeAll("\"}]}");
+            need_comma = true;
+        }
+        for (tool_calls, 0..) |*tc, idx| {
+            if (need_comma) try bw.writeByte(',');
+            try bw.print("{{\"id\":\"fc_{d}_{d}\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"", .{
+                request_id,
+                idx,
+            });
+            try bw.writeJsonEscaped(tc.idSlice());
+            try bw.writeAll("\",\"name\":\"");
+            try bw.writeJsonEscaped(tc.nameSlice());
+            try bw.writeAll("\",\"arguments\":\"");
+            try bw.writeJsonEscaped(if (tc.args_len > 0) tc.argsSlice() else "{}");
+            try bw.writeAll("\"}");
+            need_comma = true;
+        }
+        try bw.writeByte(']');
     }
 
     fn writeResponseObjectJson(bw: *FixedWriter, rec: *const StatefulResponseSlot) error{BufferTooSmall}!void {
@@ -6318,52 +7693,30 @@ pub const Server = struct {
             rec.seed_used,
             rec.seed_source.name(),
         });
+        if (rec.status == .incomplete and rec.incomplete_reason != .none) {
+            try bw.print(",\"incomplete_details\":{{\"reason\":\"{s}\"}}", .{rec.incomplete_reason.name()});
+        }
         if (rec.previous_id_len > 0) {
             try bw.writeAll(",\"previous_response_id\":\"");
             try bw.writeJsonEscaped(rec.previousIdSlice());
             try bw.writeByte('"');
         }
-        try bw.writeAll(",\"output\":[");
-        var need_comma = false;
         const reasoning = rec.reasoning_buf[0..rec.reasoning_len];
         const content = rec.content_buf[0..rec.content_len];
-
-        if (reasoning.len > 0) {
-            try bw.print(
-                "{{\"id\":\"rs_{d}\",\"type\":\"reasoning\",\"summary\":[{{\"type\":\"summary_text\",\"text\":\"",
-                .{rec.request_id},
-            );
-            try bw.writeJsonEscaped(reasoning);
-            try bw.writeAll("\"}]}");
-            need_comma = true;
-        }
-        if (content.len > 0 or rec.tool_call_count == 0) {
-            if (need_comma) try bw.writeByte(',');
-            try bw.print(
-                "{{\"id\":\"msg_{d}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"{s}\",\"content\":[{{\"type\":\"output_text\",\"text\":\"",
-                .{ rec.request_id, rec.status.name() },
-            );
-            try bw.writeJsonEscaped(content);
-            try bw.writeAll("\"}]}");
-            need_comma = true;
-        }
-        for (rec.tool_calls[0..rec.tool_call_count], 0..) |*tc, idx| {
-            if (need_comma) try bw.writeByte(',');
-            try bw.print("{{\"id\":\"fc_{d}_{d}\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"", .{
-                rec.request_id,
-                idx,
-            });
-            try bw.writeJsonEscaped(tc.idSlice());
-            try bw.writeAll("\",\"name\":\"");
-            try bw.writeJsonEscaped(tc.nameSlice());
-            try bw.writeAll("\",\"arguments\":\"");
-            try bw.writeJsonEscaped(tc.argsSlice());
-            try bw.writeAll("\"}");
-            need_comma = true;
-        }
+        try bw.writeAll(",\"output\":");
+        try writeResponsesOutputArrayJson(
+            bw,
+            rec.request_id,
+            rec.status.name(),
+            reasoning,
+            content,
+            rec.reasoning_summary,
+            rec.tool_call_count > 0,
+            rec.tool_calls[0..rec.tool_call_count],
+        );
 
         const total_tokens = rec.prompt_tokens +| rec.completion_tokens;
-        try bw.writeAll("],\"output_text\":\"");
+        try bw.writeAll(",\"output_text\":\"");
         try bw.writeJsonEscaped(content);
         try bw.print(
             "\",\"usage\":{{\"input_tokens\":{d},\"input_tokens_details\":{{\"cached_tokens\":{d}}},\"output_tokens\":{d},\"output_tokens_details\":{{\"reasoning_tokens\":{d}}},\"total_tokens\":{d}}}}}",
@@ -6395,8 +7748,8 @@ pub const Server = struct {
         var hdr_buf: [HEADER_RESERVE]u8 = undefined;
         var hw = FixedWriter.init(&hdr_buf);
         hw.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{bw.pos},
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
+            .{ bw.pos, if (slot.keep_alive) "keep-alive" else "close" },
         ) catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -6407,7 +7760,7 @@ pub const Server = struct {
         slot.tx_write_pos = HEADER_RESERVE + bw.pos;
         slot.state = .draining_response;
         if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.closeSlotSocketAndRelease(slot, false);
+            self.finishHttpExchange(slot);
         }
     }
 
@@ -6473,8 +7826,8 @@ pub const Server = struct {
         var hdr_buf: [HEADER_RESERVE]u8 = undefined;
         var hw = FixedWriter.init(&hdr_buf);
         hw.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{bw.pos},
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
+            .{ bw.pos, if (slot.keep_alive) "keep-alive" else "close" },
         ) catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -6485,17 +7838,109 @@ pub const Server = struct {
         slot.tx_write_pos = HEADER_RESERVE + bw.pos;
         slot.state = .draining_response;
         if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.closeSlotSocketAndRelease(slot, false);
+            self.finishHttpExchange(slot);
         }
     }
 
-    fn finalizeStatefulResponseRecord(self: *Server, slot: *ConnectionSlot, status: ResponseRecordStatus) void {
+    fn appendCompletedTranscriptTurn(
+        tpl: *const chat_template.ChatTemplate,
+        rec: *const StatefulResponseSlot,
+        prompt_bytes: []const u8,
+        cw: *FixedWriter,
+    ) error{BufferTooSmall}!void {
+        try cw.writeAll(prompt_bytes);
+        const reasoning = rec.reasoning_buf[0..rec.reasoning_len];
+        const content = rec.content_buf[0..rec.content_len];
+        switch (tpl.dialect) {
+            .inkling2 => {
+                if (reasoning.len > 0) {
+                    try cw.writeAll(tpl.role_tokens.header_assistant.slice());
+                    try cw.writeAll(tpl.thinking.open_tag.slice());
+                    try cw.writeAll(reasoning);
+                    try cw.writeAll(tpl.role_tokens.end_message_tag.slice());
+                }
+                if (content.len > 0) {
+                    try cw.writeAll(tpl.role_tokens.header_assistant.slice());
+                    try cw.writeAll(tpl.role_tokens.content_text_tag.slice());
+                    try cw.writeAll(content);
+                    try cw.writeAll(tpl.role_tokens.end_message_tag.slice());
+                }
+                for (rec.tool_calls[0..rec.tool_call_count]) |*tc| {
+                    try cw.writeAll(tpl.role_tokens.header_assistant.slice());
+                    try cw.writeAll(tc.nameSlice());
+                    try cw.writeAll(tpl.tool_calling.call_open.slice());
+                    try cw.writeAll("{\"name\":\"");
+                    try cw.writeJsonEscaped(tc.nameSlice());
+                    try cw.writeAll("\",\"args\":");
+                    try cw.writeAll(if (tc.args_len > 0) tc.argsSlice() else "{}");
+                    try cw.writeByte('}');
+                    try cw.writeAll(tpl.tool_calling.call_close.slice());
+                }
+                try cw.writeAll(tpl.eos_token.slice());
+            },
+            .hy4 => {
+                const open_tag = tpl.thinking.open_tag.slice();
+                if (std.mem.endsWith(u8, prompt_bytes, open_tag)) {
+                    try cw.writeAll(reasoning);
+                    try cw.writeAll(tpl.thinking.close_tag.slice());
+                } else if (reasoning.len > 0) {
+                    try cw.writeAll(open_tag);
+                    try cw.writeAll(reasoning);
+                    try cw.writeAll(tpl.thinking.close_tag.slice());
+                }
+                if (content.len > 0) try cw.writeAll(content);
+                if (rec.tool_call_count > 0) {
+                    try cw.writeAll(tpl.tool_calling.call_open.slice());
+                    for (rec.tool_calls[0..rec.tool_call_count]) |*tc| {
+                        try cw.writeAll("<tool_call:opensource>");
+                        try cw.writeAll(tc.nameSlice());
+                        // Preserve arguments as raw JSON or key/value fallback.
+                        try cw.writeAll("<arg_key:opensource>args</arg_key:opensource><arg_value:opensource>");
+                        try cw.writeAll(if (tc.args_len > 0) tc.argsSlice() else "{}");
+                        try cw.writeAll("</arg_value:opensource></tool_call:opensource>");
+                    }
+                    try cw.writeAll(tpl.tool_calling.call_close.slice());
+                }
+                try cw.writeAll(tpl.role_tokens.hy4_end.slice());
+            },
+            .chatml, .deepseek, .custom => {
+                if (content.len > 0) try cw.writeAll(content);
+                for (rec.tool_calls[0..rec.tool_call_count]) |*tc| {
+                    try cw.writeAll(tpl.tool_calling.call_open.slice());
+                    try cw.writeAll("{\"name\":\"");
+                    try cw.writeJsonEscaped(tc.nameSlice());
+                    try cw.writeAll("\",\"arguments\":");
+                    try cw.writeAll(if (tc.args_len > 0) tc.argsSlice() else "{}");
+                    try cw.writeByte('}');
+                    try cw.writeAll(tpl.tool_calling.call_close.slice());
+                }
+                try cw.writeAll(tpl.assistantEndDelimiter());
+            },
+        }
+    }
+
+    fn finalizeStatefulResponseRecord(self: *Server, slot: *ConnectionSlot, status: ResponseRecordStatus, inc_reason: IncompleteReason) void {
         const r_idx = slot.stateful_resp_slot_idx orelse return;
         if (r_idx >= self.response_store.len) return;
         const rec = &self.response_store[r_idx];
         if (!rec.occupied or rec.request_id != slot.request_id) return;
 
-        rec.status = status;
+        const was_truncated = slot.nonstream_reasoning_truncated or
+            slot.nonstream_content_truncated or
+            slot.tool_calls_truncated or
+            (slot.nonstream_reasoning_len > rec.reasoning_buf.len) or
+            (slot.nonstream_content_len > rec.content_buf.len);
+
+        var final_status = status;
+        var final_inc_reason = inc_reason;
+        if (was_truncated and final_status == .completed) {
+            final_status = .incomplete;
+            if (final_inc_reason == .none) final_inc_reason = .max_response_bytes;
+        }
+
+        rec.status = final_status;
+        rec.incomplete_reason = final_inc_reason;
+        rec.reasoning_summary = slot.reasoning_summary;
         rec.active_conn_slot = null;
         rec.prompt_tokens = slot.prompt_tokens;
         rec.cached_tokens = slot.cached_tokens;
@@ -6517,34 +7962,22 @@ pub const Server = struct {
             rec.tool_calls[i] = slot.stored_tool_calls[i];
         }
 
-        // Persist full completed ChatML transcript (`prompt` + assistant output + `<|im_end|>\n`)
-        // so follow-up requests referencing `previous_response_id` chain losslessly!
+        // Refuse to persist truncated or incomplete transcripts into `rec.chatml_buf` (`W24`/`C18`).
+        if (was_truncated or final_status != .completed) {
+            rec.transcript_corrupt = true;
+            rec.chatml_len = 0;
+            return;
+        }
+
         var cw = FixedWriter.init(rec.chatml_buf);
-        const prompt_bytes = slot.prompt_buf[0..slot.prompt_len];
-        const copy_p = @min(prompt_bytes.len, cw.remaining());
-        if (copy_p > 0) {
-            @memcpy(cw.buf[cw.pos .. cw.pos + copy_p], prompt_bytes[0..copy_p]);
-            cw.pos += copy_p;
-        }
-        if (c_len > 0) {
-            const copy_c = @min(c_len, cw.remaining());
-            if (copy_c > 0) {
-                @memcpy(cw.buf[cw.pos .. cw.pos + copy_c], rec.content_buf[0..copy_c]);
-                cw.pos += copy_c;
-            }
-        }
-        for (rec.tool_calls[0..rec.tool_call_count]) |*tc| {
-            cw.writeAll("<tool_call>\n{\"name\":\"") catch break;
-            cw.writeJsonEscaped(tc.nameSlice()) catch break;
-            cw.writeAll("\",\"arguments\":") catch break;
-            cw.writeAll(if (tc.args_len > 0) tc.argsSlice() else "{}") catch break;
-            cw.writeAll("}\n</tool_call>\n") catch break;
-        }
-        const end_tok = "<|im_end|>\n";
-        if (cw.remaining() >= end_tok.len) {
-            @memcpy(cw.buf[cw.pos .. cw.pos + end_tok.len], end_tok);
-            cw.pos += end_tok.len;
-        }
+        appendCompletedTranscriptTurn(&self.config.chat_template, rec, slot.prompt_buf[0..slot.prompt_len], &cw) catch {
+            rec.status = .incomplete;
+            rec.incomplete_reason = .max_response_bytes;
+            rec.transcript_corrupt = true;
+            rec.chatml_len = 0;
+            return;
+        };
+        rec.transcript_corrupt = false;
         rec.chatml_len = cw.pos;
     }
 
@@ -6568,16 +8001,31 @@ pub const Server = struct {
                         );
                         return;
                     };
+                    if (prev_rec.transcript_corrupt or prev_rec.status != .completed or prev_rec.chatml_len == 0) {
+                        self.sendErrorResponse(
+                            slot,
+                            409,
+                            "Conflict",
+                            null,
+                            "previous_response_id transcript is incomplete or truncated",
+                            "invalid_request_error",
+                            "incomplete_previous_response",
+                        );
+                        return;
+                    }
                     prior_chatml = prev_rec.chatml_buf[0..prev_rec.chatml_len];
                 }
             }
         }
 
-        const parsed = parseInferenceRequestWithPriorPrompt(
+        const parsed = parseInferenceRequestWithTemplate(
             endpoint,
             body,
             self.modelId(),
+            &self.config.chat_template,
             prior_chatml,
+            slot.nonstream_content_buf,
+            &self.signature_key,
             slot.prompt_buf,
             &slot.model_buf,
         ) catch |err| {
@@ -6740,12 +8188,24 @@ pub const Server = struct {
         slot.previous_response_id_len = parsed.previous_response_id_len;
         slot.stateful_resp_slot_idx = null;
         slot.admit_ns = monotonicNowNs();
+        slot.prefill_done_ns = 0;
+        slot.first_generated_token_ns = 0;
+        slot.first_emitted_ns = 0;
         slot.first_token_ns = 0;
         slot.created_unix = unixTimestampSec();
         slot.prompt_tokens = 0;
         slot.cached_tokens = 0;
         slot.completion_tokens = 0;
         slot.reasoning_tokens = 0;
+        slot.nonstream_reasoning_truncated = false;
+        slot.nonstream_content_truncated = false;
+        slot.tool_calls_truncated = false;
+        slot.thinking_budget_tokens = parsed.thinking_budget_tokens;
+        slot.thinking_budget_exhausted = false;
+        slot.reasoning_summary = parsed.reasoning_summary;
+        slot.template_dialect = parsed.template_dialect;
+        slot.thinking_hmac = HmacSha256.init(&self.signature_key);
+        slot.anthropic_block_had_delta = false;
         slot.sent_first_chunk = false;
         slot.preamble_sent = false;
         slot.responses_seq_num = 0;
@@ -6761,47 +8221,66 @@ pub const Server = struct {
         slot.anthropic_block_idx = 0;
         slot.nonstream_reasoning_len = 0;
         slot.nonstream_content_len = 0;
-        slot.think_splitter.reset(false);
-        slot.tool_parser.reset(slot.request_id);
+        slot.think_splitter.resetForDialect(parsed.template_dialect, parsed.starts_in_think);
+        slot.tool_parser.resetForDialect(slot.request_id, parsed.template_dialect);
         slot.stored_tool_call_count = 0;
         slot.cancelled.store(false, .release);
         while (slot.token_ring.tryPop() != null) {}
 
         // Reserve stateful `/v1/responses` slot (`in_progress`) so GET & POST /cancel work live!
+        // Never evict active `.in_progress` slots (`503 server_overloaded` when all slots active).
         if (endpoint == .responses and parsed.store_response) {
-            if (self.allocStatefulResponseSlot()) |r_idx| {
-                const rec = &self.response_store[r_idx];
-                rec.occupied = true;
-                rec.lru_tick = self.response_lru_clock;
-                self.response_lru_clock +%= 1;
-                rec.request_id = slot.request_id;
-                rec.created_unix = slot.created_unix;
-                rec.status = .in_progress;
-                rec.seed_used = slot.seed_used;
-                rec.seed_source = slot.seed_source;
-                rec.prompt_tokens = 0;
-                rec.cached_tokens = 0;
-                rec.completion_tokens = 0;
-                rec.reasoning_tokens = 0;
-                rec.active_conn_slot = slot.index;
-                rec.active_generation = slot.generation;
-                var idw = FixedWriter.init(&rec.id_buf);
-                idw.print("resp_{d}", .{slot.request_id}) catch {
-                    rec.occupied = false;
-                };
-                rec.id_len = @intCast(idw.pos);
-                rec.model_len = slot.model_len;
-                @memcpy(rec.model_buf[0..slot.model_len], slot.model_buf[0..slot.model_len]);
-                rec.previous_id_len = slot.previous_response_id_len;
-                if (rec.previous_id_len > 0) {
-                    @memcpy(rec.previous_id_buf[0..rec.previous_id_len], slot.previous_response_id_buf[0..rec.previous_id_len]);
-                }
-                rec.chatml_len = 0;
-                rec.reasoning_len = 0;
-                rec.content_len = 0;
-                rec.tool_call_count = 0;
-                slot.stateful_resp_slot_idx = r_idx;
+            const r_idx = self.allocStatefulResponseSlot() orelse {
+                _ = self.rejected_503_count.fetchAdd(1, .monotonic);
+                self.sendErrorResponse(
+                    slot,
+                    503,
+                    "Service Unavailable",
+                    null,
+                    "server busy: all stateful response slots in progress",
+                    "server_error",
+                    "server_overloaded",
+                );
+                return;
+            };
+            const rec = &self.response_store[r_idx];
+            rec.occupied = true;
+            rec.lru_tick = self.response_lru_clock;
+            self.response_lru_clock +%= 1;
+            rec.request_id = slot.request_id;
+            rec.created_unix = slot.created_unix;
+            rec.status = .in_progress;
+            rec.incomplete_reason = .none;
+            rec.reasoning_summary = parsed.reasoning_summary;
+            rec.transcript_corrupt = false;
+            rec.seed_used = slot.seed_used;
+            rec.seed_source = slot.seed_source;
+            rec.prompt_tokens = 0;
+            rec.cached_tokens = 0;
+            rec.completion_tokens = 0;
+            rec.reasoning_tokens = 0;
+            rec.active_conn_slot = slot.index;
+            rec.active_generation = slot.generation;
+            var idw = FixedWriter.init(&rec.id_buf);
+            idw.print("resp_{d}", .{slot.request_id}) catch {
+                rec.occupied = false;
+            };
+            rec.id_len = @intCast(idw.pos);
+            rec.model_len = slot.model_len;
+            @memcpy(rec.model_buf[0..slot.model_len], slot.model_buf[0..slot.model_len]);
+            rec.previous_id_len = slot.previous_response_id_len;
+            if (rec.previous_id_len > 0) {
+                @memcpy(rec.previous_id_buf[0..rec.previous_id_len], slot.previous_response_id_buf[0..rec.previous_id_len]);
             }
+            rec.chatml_len = 0;
+            rec.reasoning_len = 0;
+            rec.content_len = 0;
+            rec.tool_call_count = 0;
+            slot.stateful_resp_slot_idx = r_idx;
+        }
+
+        if (parsed.stream) {
+            slot.keep_alive = false;
         }
 
         // For SSE streams, send HTTP 200 headers (with X-Aminfer-Seed-Used) immediately.
@@ -6818,10 +8297,12 @@ pub const Server = struct {
                     "\r\n",
                 .{ slot.seed_used, slot.seed_source.name() },
             ) catch {
+                self.rollbackStatefulResponseSlot(slot);
                 self.closeSlotSocketAndRelease(slot, false);
                 return;
             };
             slot.appendTx(w.written()) catch {
+                self.rollbackStatefulResponseSlot(slot);
                 self.closeSlotSocketAndRelease(slot, false);
                 return;
             };
@@ -6865,15 +8346,19 @@ pub const Server = struct {
             .reasoning_effort = parsed.reasoning_effort,
             .thinking_budget_tokens = parsed.thinking_budget_tokens,
             .cache_control_pin = parsed.cache_control_pin,
+            .template_dialect = parsed.template_dialect,
+            .starts_in_think = parsed.starts_in_think,
             .stream_include_usage = parsed.stream_include_usage,
         };
 
         if (!self.job_ring.tryPush(job)) {
+            self.rollbackStatefulResponseSlot(slot);
             slot.worker_active.store(false, .release);
             self.releaseRequestCount(slot);
             _ = self.rejected_503_count.fetchAdd(1, .monotonic);
             slot.tx_read_pos = 0;
             slot.tx_write_pos = 0;
+            slot.keep_alive = false;
             self.sendErrorResponse(
                 slot,
                 503,
@@ -6892,6 +8377,19 @@ pub const Server = struct {
         }
     }
 
+    fn rollbackStatefulResponseSlot(self: *Server, slot: *ConnectionSlot) void {
+        if (slot.stateful_resp_slot_idx) |r_idx| {
+            if (r_idx < self.response_store.len) {
+                const rec = &self.response_store[r_idx];
+                rec.occupied = false;
+                rec.active_conn_slot = null;
+                rec.id_len = 0;
+                rec.chatml_len = 0;
+            }
+            slot.stateful_resp_slot_idx = null;
+        }
+    }
+
     fn drainAllSlots(self: *Server) void {
         for (self.slots) |*slot| {
             switch (slot.state) {
@@ -6903,7 +8401,7 @@ pub const Server = struct {
                 },
                 .draining_response => {
                     if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-                        self.closeSlotSocketAndRelease(slot, false);
+                        self.finishHttpExchange(slot);
                     }
                 },
                 .free, .reading_request => {},
@@ -6941,24 +8439,27 @@ pub const Server = struct {
                 .prefill_done => {
                     slot.prompt_tokens = ev.token_count;
                     slot.cached_tokens = ev.cached_tokens;
+                    if (slot.prefill_done_ns == 0) {
+                        slot.prefill_done_ns = if (ev.timestamp_ns != 0) ev.timestamp_ns else monotonicNowNs();
+                    }
                     if (slot.stream) {
                         self.ensureStreamPreamble(slot);
                     }
                 },
                 .token_text => {
+                    if (slot.first_generated_token_ns == 0) {
+                        slot.first_generated_token_ns = if (ev.timestamp_ns != 0) ev.timestamp_ns else monotonicNowNs();
+                    }
                     if (slot.first_token_ns == 0) {
-                        slot.first_token_ns = monotonicNowNs();
+                        slot.first_token_ns = slot.first_generated_token_ns;
                     }
                     slot.completion_tokens +|= ev.token_count;
-                    if (slot.think_splitter.in_think) {
-                        slot.reasoning_tokens +|= ev.token_count;
-                    }
                     if (slot.stream) {
                         self.ensureStreamPreamble(slot);
                     }
                     const text = ev.textSlice();
                     if (text.len > 0) {
-                        self.feedSlotText(slot, text);
+                        self.feedSlotText(slot, text, ev.token_count);
                         if (slot.stop_holdback.stopped) {
                             // Matched a stop sequence: stop worker immediately and emit final frame
                             // without ever leaking the stop string!
@@ -6971,7 +8472,9 @@ pub const Server = struct {
                 },
                 .finished => {
                     if (ev.token_count > 0) slot.prompt_tokens = ev.token_count;
-                    if (slot.first_token_ns == 0) slot.first_token_ns = monotonicNowNs();
+                    if (slot.first_generated_token_ns == 0 and slot.first_token_ns == 0) {
+                        slot.first_token_ns = monotonicNowNs();
+                    }
                     const final_reason: FinishReason = if (slot.stop_holdback.stopped)
                         .stop_sequence
                     else
@@ -6981,7 +8484,7 @@ pub const Server = struct {
                 },
                 .failed => {
                     if (ev.token_count > 0) slot.prompt_tokens = ev.token_count;
-                    self.finalizeStatefulResponseRecord(slot, .failed);
+                    self.finalizeStatefulResponseRecord(slot, .failed, .none);
                     self.failSlotResponse(slot, ev.textSlice());
                     return;
                 },
@@ -6993,28 +8496,83 @@ pub const Server = struct {
         }
     }
 
-    fn feedSlotText(self: *Server, slot: *ConnectionSlot, text: []const u8) void {
-        const HoldCtx = struct {
+    fn feedSlotText(self: *Server, slot: *ConnectionSlot, text: []const u8, token_count: u32) void {
+        const ThinkCtx = struct {
             server: *Server,
             slot: *ConnectionSlot,
-            fn onSafe(ctx: *@This(), safe_bytes: []const u8) error{BufferTooSmall}!void {
-                if (safe_bytes.len == 0) return;
-                const ThinkCtx = struct {
-                    server: *Server,
-                    slot: *ConnectionSlot,
-                    fn onSpan(tctx: *@This(), channel: StreamChannel, span: []const u8) error{BufferTooSmall}!void {
-                        if (span.len == 0) return;
-                        try tctx.server.dispatchChannelSpan(tctx.slot, channel, span);
-                    }
-                };
-                var tctx = ThinkCtx{ .server = ctx.server, .slot = ctx.slot };
-                try ctx.slot.think_splitter.feed(safe_bytes, &tctx, ThinkCtx.onSpan);
+            reasoning_bytes: usize = 0,
+            content_bytes: usize = 0,
+
+            fn onSpan(tctx: *@This(), channel: StreamChannel, span: []const u8) error{BufferTooSmall}!void {
+                if (span.len == 0) return;
+                if (channel == .reasoning) {
+                    if (tctx.slot.thinking_budget_exhausted) return;
+                    tctx.reasoning_bytes += span.len;
+                    try tctx.server.dispatchChannelSpan(tctx.slot, .reasoning, span);
+                } else {
+                    tctx.content_bytes += span.len;
+                    try tctx.server.dispatchChannelSpan(tctx.slot, .content, span);
+                }
             }
         };
-        var hctx = HoldCtx{ .server = self, .slot = slot };
+        const HoldCtx = struct {
+            tctx: *ThinkCtx,
+            fn onSafe(ctx: *@This(), safe_bytes: []const u8) error{BufferTooSmall}!void {
+                if (safe_bytes.len == 0) return;
+                try ctx.tctx.slot.think_splitter.feed(safe_bytes, ctx.tctx, ThinkCtx.onSpan);
+            }
+        };
+        var tctx = ThinkCtx{ .server = self, .slot = slot };
+        var hctx = HoldCtx{ .tctx = &tctx };
         _ = slot.stop_holdback.feed(&slot.stop_config, text, &hctx, HoldCtx.onSafe) catch {
             self.closeSlotSocketAndRelease(slot, true);
+            return;
         };
+
+        // Post-`ThinkSplitter` channel-attributed `reasoning_tokens` (`W24`/`C18`).
+        if (tctx.reasoning_bytes > 0 and token_count > 0) {
+            if (tctx.content_bytes == 0 or token_count == 1) {
+                slot.reasoning_tokens +|= token_count;
+            } else {
+                const total_b = tctx.reasoning_bytes + tctx.content_bytes;
+                const numer = @as(u64, token_count) * tctx.reasoning_bytes + total_b / 2;
+                const r_toks: u32 = @max(@as(u32, 1), @min(token_count, @as(u32, @intCast(numer / total_b))));
+                slot.reasoning_tokens +|= r_toks;
+            }
+        }
+
+        if (!slot.thinking_budget_exhausted) {
+            if (slot.thinking_budget_tokens) |budget| {
+                if (slot.reasoning_tokens >= budget and slot.think_splitter.in_think) {
+                    slot.thinking_budget_exhausted = true;
+                    self.forceCloseThinkingAfterBudget(slot) catch {
+                        self.closeSlotSocketAndRelease(slot, true);
+                    };
+                }
+            }
+        }
+    }
+
+    fn forceCloseThinkingAfterBudget(self: *Server, slot: *ConnectionSlot) error{BufferTooSmall}!void {
+        if (!slot.stream) return;
+        switch (slot.endpoint) {
+            .messages => {
+                if (slot.anthropic_block == .thinking) {
+                    var buf: [512]u8 = undefined;
+                    var w = FixedWriter.init(&buf);
+                    try self.writeAnthropicBlockStop(slot, &w);
+                    slot.anthropic_block_idx += 1;
+                    slot.anthropic_block = .none;
+                    try slot.appendTx(w.written());
+                }
+            },
+            .responses => {
+                if (slot.responses_reasoning_opened and !slot.responses_reasoning_closed) {
+                    try self.flushAndCloseResponsesOpenItems(slot);
+                }
+            },
+            .chat_completions => {},
+        }
     }
 
     fn dispatchChannelSpan(
@@ -7023,7 +8581,11 @@ pub const Server = struct {
         channel: StreamChannel,
         span: []const u8,
     ) error{BufferTooSmall}!void {
+        if (slot.first_emitted_ns == 0) {
+            slot.first_emitted_ns = monotonicNowNs();
+        }
         if (channel == .reasoning) {
+            slot.thinking_hmac.update(span);
             self.appendNonStreamSpan(slot, .reasoning, span);
             if (slot.stream) {
                 try self.appendStreamDelta(slot, .reasoning, span);
@@ -7066,6 +8628,8 @@ pub const Server = struct {
                     dst.name_len = @intCast(nl);
                     dst.args_len = 0;
                     slot.stored_tool_call_count += 1;
+                } else {
+                    slot.tool_calls_truncated = true;
                 }
                 if (slot.stream) {
                     try self.appendToolStartStream(slot, st.index, st.id, st.name);
@@ -7080,6 +8644,9 @@ pub const Server = struct {
                         @memcpy(dst.args_buf[dst.args_len .. dst.args_len + take], ad.delta[0..take]);
                         dst.args_len += @intCast(take);
                     }
+                    if (take < ad.delta.len) slot.tool_calls_truncated = true;
+                } else {
+                    slot.tool_calls_truncated = true;
                 }
                 if (slot.stream) {
                     try self.appendToolArgsDeltaStream(slot, ad.index, ad.id, ad.delta);
@@ -7125,7 +8692,7 @@ pub const Server = struct {
                 try slot.appendTx(w.written());
             },
             .responses => {
-                try self.closeResponsesOpenItems(slot, &w);
+                try self.flushAndCloseResponsesOpenItems(slot);
                 const out_idx = slot.responses_output_index;
                 slot.responses_output_index += 1;
                 slot.responses_active_call_output_idx = out_idx;
@@ -7262,13 +8829,18 @@ pub const Server = struct {
         }
     }
 
-    fn writeAnthropicBlockStop(_: *Server, slot: *ConnectionSlot, w: *FixedWriter) error{BufferTooSmall}!void {
+    fn writeAnthropicBlockStop(self: *Server, slot: *ConnectionSlot, w: *FixedWriter) error{BufferTooSmall}!void {
         if (slot.anthropic_block == .thinking) {
-            // Emit Anthropic `signature_delta` right before closing a `thinking` block (`C18`)!
+            // Emit cryptographic HMAC-SHA256 `signature_delta` before closing a `thinking` block (`C18`/`W24`).
+            var mac = slot.thinking_hmac;
+            var tag: [32]u8 = undefined;
+            mac.final(&tag);
+            const sig_hex = std.fmt.bytesToHex(tag, .lower);
             try w.print(
-                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"aminfer_sig_{d}_{d}\"}}}}\n\n",
-                .{ slot.anthropic_block_idx, slot.request_id, slot.anthropic_block_idx },
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{s}\"}}}}\n\n",
+                .{ slot.anthropic_block_idx, sig_hex[0..] },
             );
+            slot.thinking_hmac = HmacSha256.init(&self.signature_key);
         }
         try w.print(
             "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n",
@@ -7276,27 +8848,98 @@ pub const Server = struct {
         );
     }
 
+    fn flushAndCloseResponsesOpenItems(self: *Server, slot: *ConnectionSlot) error{BufferTooSmall}!void {
+        if ((!slot.responses_reasoning_opened or slot.responses_reasoning_closed) and
+            (!slot.responses_text_opened or slot.responses_text_closed))
+        {
+            return;
+        }
+        _ = self.flushTx(slot);
+        slot.compactTx();
+        var fw = FixedWriter.init(slot.tx_buf[slot.tx_write_pos..]);
+        try self.closeResponsesOpenItems(slot, &fw);
+        slot.tx_write_pos += fw.pos;
+    }
+
     fn closeResponsesOpenItems(_: *Server, slot: *ConnectionSlot, w: *FixedWriter) error{BufferTooSmall}!void {
         if (slot.responses_reasoning_opened and !slot.responses_reasoning_closed) {
             slot.responses_reasoning_closed = true;
             const reasoning = slot.nonstream_reasoning_buf[0..slot.nonstream_reasoning_len];
-            const s1 = slot.responses_seq_num;
+
+            const s_done = slot.responses_seq_num;
             slot.responses_seq_num += 1;
             try w.print(
-                "event: response.reasoning_summary_text.done\ndata: {{\"type\":\"response.reasoning_summary_text.done\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"summary_index\":0,\"text\":\"",
-                .{ s1, slot.request_id, slot.responses_reasoning_output_idx },
+                "event: response.reasoning_text.done\ndata: {{\"type\":\"response.reasoning_text.done\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"content_index\":0,\"text\":\"",
+                .{ s_done, slot.request_id, slot.responses_reasoning_output_idx },
             );
             try w.writeJsonEscaped(reasoning);
             try w.writeAll("\"}\n\n");
 
+            const s_part = slot.responses_seq_num;
+            slot.responses_seq_num += 1;
+            try w.print(
+                "event: response.content_part.done\ndata: {{\"type\":\"response.content_part.done\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"content_index\":0,\"part\":{{\"type\":\"reasoning_text\",\"text\":\"",
+                .{ s_part, slot.request_id, slot.responses_reasoning_output_idx },
+            );
+            try w.writeJsonEscaped(reasoning);
+            try w.writeAll("\"}}\n\n");
+
+            var concise_buf: [320]u8 = undefined;
+            const summary_text: []const u8 = switch (slot.reasoning_summary) {
+                .none => "",
+                .auto, .detailed => reasoning,
+                .concise => extractConciseReasoningSummary(reasoning, &concise_buf),
+            };
+            if (slot.reasoning_summary == .concise and summary_text.len > 0) {
+                const s_pa = slot.responses_seq_num;
+                slot.responses_seq_num += 1;
+                try w.print(
+                    "event: response.reasoning_summary_part.added\ndata: {{\"type\":\"response.reasoning_summary_part.added\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"summary_index\":0,\"part\":{{\"type\":\"summary_text\",\"text\":\"\"}}}}\n\n",
+                    .{ s_pa, slot.request_id, slot.responses_reasoning_output_idx },
+                );
+                const s_dl = slot.responses_seq_num;
+                slot.responses_seq_num += 1;
+                try w.print(
+                    "event: response.reasoning_summary_text.delta\ndata: {{\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"summary_index\":0,\"delta\":\"",
+                    .{ s_dl, slot.request_id, slot.responses_reasoning_output_idx },
+                );
+                try w.writeJsonEscaped(summary_text);
+                try w.writeAll("\"}\n\n");
+            }
+            if (slot.reasoning_summary != .none) {
+                const s1 = slot.responses_seq_num;
+                slot.responses_seq_num += 1;
+                try w.print(
+                    "event: response.reasoning_summary_text.done\ndata: {{\"type\":\"response.reasoning_summary_text.done\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"summary_index\":0,\"text\":\"",
+                    .{ s1, slot.request_id, slot.responses_reasoning_output_idx },
+                );
+                try w.writeJsonEscaped(summary_text);
+                try w.writeAll("\"}\n\n");
+
+                const s_spd = slot.responses_seq_num;
+                slot.responses_seq_num += 1;
+                try w.print(
+                    "event: response.reasoning_summary_part.done\ndata: {{\"type\":\"response.reasoning_summary_part.done\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"summary_index\":0,\"part\":{{\"type\":\"summary_text\",\"text\":\"",
+                    .{ s_spd, slot.request_id, slot.responses_reasoning_output_idx },
+                );
+                try w.writeJsonEscaped(summary_text);
+                try w.writeAll("\"}}\n\n");
+            }
+
             const s2 = slot.responses_seq_num;
             slot.responses_seq_num += 1;
             try w.print(
-                "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"sequence_number\":{d},\"output_index\":{d},\"item\":{{\"id\":\"rs_{d}\",\"type\":\"reasoning\",\"status\":\"completed\",\"summary\":[{{\"type\":\"summary_text\",\"text\":\"",
+                "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"sequence_number\":{d},\"output_index\":{d},\"item\":{{\"id\":\"rs_{d}\",\"type\":\"reasoning\",\"status\":\"completed\",\"content\":[{{\"type\":\"reasoning_text\",\"text\":\"",
                 .{ s2, slot.responses_reasoning_output_idx, slot.request_id },
             );
             try w.writeJsonEscaped(reasoning);
-            try w.writeAll("\"}]}}\n\n");
+            try w.writeAll("\"}],\"summary\":[");
+            if (slot.reasoning_summary != .none and (slot.reasoning_summary != .concise or summary_text.len > 0)) {
+                try w.writeAll("{\"type\":\"summary_text\",\"text\":\"");
+                try w.writeJsonEscaped(summary_text);
+                try w.writeAll("\"}");
+            }
+            try w.writeAll("]}}\n\n");
         }
         if (slot.responses_text_opened and !slot.responses_text_closed) {
             slot.responses_text_closed = true;
@@ -7330,23 +8973,30 @@ pub const Server = struct {
         }
     }
 
-    fn appendNonStreamSpan(_: *Server, slot: *ConnectionSlot, channel: StreamChannel, span: []const u8) void {
+    fn appendNonStreamSpan(self: *Server, slot: *ConnectionSlot, channel: StreamChannel, span: []const u8) void {
+        const max_total: usize = self.config.max_response_bytes orelse std.math.maxInt(usize);
+        const total_used = slot.nonstream_reasoning_len + slot.nonstream_content_len;
+        const total_avail = max_total -| total_used;
         switch (channel) {
             .reasoning => {
-                const avail = slot.nonstream_reasoning_buf.len - slot.nonstream_reasoning_len;
+                const buf_avail = slot.nonstream_reasoning_buf.len - slot.nonstream_reasoning_len;
+                const avail = @min(buf_avail, total_avail);
                 const n = @min(avail, span.len);
                 if (n > 0) {
                     @memcpy(slot.nonstream_reasoning_buf[slot.nonstream_reasoning_len .. slot.nonstream_reasoning_len + n], span[0..n]);
                     slot.nonstream_reasoning_len += n;
                 }
+                if (n < span.len) slot.nonstream_reasoning_truncated = true;
             },
             .content => {
-                const avail = slot.nonstream_content_buf.len - slot.nonstream_content_len;
+                const buf_avail = slot.nonstream_content_buf.len - slot.nonstream_content_len;
+                const avail = @min(buf_avail, total_avail);
                 const n = @min(avail, span.len);
                 if (n > 0) {
                     @memcpy(slot.nonstream_content_buf[slot.nonstream_content_len .. slot.nonstream_content_len + n], span[0..n]);
                     slot.nonstream_content_len += n;
                 }
+                if (n < span.len) slot.nonstream_content_truncated = true;
             },
         }
     }
@@ -7440,22 +9090,47 @@ pub const Server = struct {
                             const s0 = slot.responses_seq_num;
                             slot.responses_seq_num += 1;
                             try w.print(
-                                "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"sequence_number\":{d},\"output_index\":{d},\"item\":{{\"id\":\"rs_{d}\",\"type\":\"reasoning\",\"status\":\"in_progress\",\"summary\":[]}}}}\n\n",
+                                "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"sequence_number\":{d},\"output_index\":{d},\"item\":{{\"id\":\"rs_{d}\",\"type\":\"reasoning\",\"status\":\"in_progress\",\"content\":[],\"summary\":[]}}}}\n\n",
                                 .{ s0, slot.responses_reasoning_output_idx, slot.request_id },
                             );
+                            const s1 = slot.responses_seq_num;
+                            slot.responses_seq_num += 1;
+                            try w.print(
+                                "event: response.content_part.added\ndata: {{\"type\":\"response.content_part.added\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"content_index\":0,\"part\":{{\"type\":\"reasoning_text\",\"text\":\"\"}}}}\n\n",
+                                .{ s1, slot.request_id, slot.responses_reasoning_output_idx },
+                            );
+                            if (slot.reasoning_summary == .auto or slot.reasoning_summary == .detailed) {
+                                const s2 = slot.responses_seq_num;
+                                slot.responses_seq_num += 1;
+                                try w.print(
+                                    "event: response.reasoning_summary_part.added\ndata: {{\"type\":\"response.reasoning_summary_part.added\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"summary_index\":0,\"part\":{{\"type\":\"summary_text\",\"text\":\"\"}}}}\n\n",
+                                    .{ s2, slot.request_id, slot.responses_reasoning_output_idx },
+                                );
+                            }
                         }
-                        const sd = slot.responses_seq_num;
+                        const srt = slot.responses_seq_num;
                         slot.responses_seq_num += 1;
                         try w.print(
-                            "event: response.reasoning_summary_text.delta\ndata: {{\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"summary_index\":0,\"delta\":\"",
-                            .{ sd, slot.request_id, slot.responses_reasoning_output_idx },
+                            "event: response.reasoning_text.delta\ndata: {{\"type\":\"response.reasoning_text.delta\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"content_index\":0,\"delta\":\"",
+                            .{ srt, slot.request_id, slot.responses_reasoning_output_idx },
                         );
                         try w.writeJsonEscaped(span);
                         try w.writeAll("\"}\n\n");
+
+                        if (slot.reasoning_summary == .auto or slot.reasoning_summary == .detailed) {
+                            const sd = slot.responses_seq_num;
+                            slot.responses_seq_num += 1;
+                            try w.print(
+                                "event: response.reasoning_summary_text.delta\ndata: {{\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":{d},\"item_id\":\"rs_{d}\",\"output_index\":{d},\"summary_index\":0,\"delta\":\"",
+                                .{ sd, slot.request_id, slot.responses_reasoning_output_idx },
+                            );
+                            try w.writeJsonEscaped(span);
+                            try w.writeAll("\"}\n\n");
+                        }
                     },
                     .content => {
                         if (slot.responses_reasoning_opened and !slot.responses_reasoning_closed) {
-                            try self.closeResponsesOpenItems(slot, &w);
+                            try self.flushAndCloseResponsesOpenItems(slot);
                         }
                         if (!slot.responses_text_opened) {
                             slot.responses_text_opened = true;
@@ -7540,12 +9215,19 @@ pub const Server = struct {
     };
 
     fn computeTimings(slot: *const ConnectionSlot, end_ns: u64) Timings {
-        const first_ns = if (slot.first_token_ns > 0) slot.first_token_ns else end_ns;
-        const ttft_ns = first_ns -| slot.admit_ns;
+        const first_gen_ns = if (slot.first_generated_token_ns > 0)
+            slot.first_generated_token_ns
+        else if (slot.first_token_ns > 0)
+            slot.first_token_ns
+        else if (slot.first_emitted_ns > 0)
+            slot.first_emitted_ns
+        else
+            end_ns;
+        const ttft_ns = first_gen_ns -| slot.admit_ns;
         const ttft_ms = @as(f64, @floatFromInt(ttft_ns)) / 1_000_000.0;
 
         if (slot.completion_tokens > 1) {
-            const decode_ns = end_ns -| first_ns;
+            const decode_ns = end_ns -| first_gen_ns;
             if (decode_ns > 0) {
                 const denom = @as(f64, @floatFromInt(slot.completion_tokens - 1));
                 const decode_s = @as(f64, @floatFromInt(decode_ns)) / 1_000_000_000.0;
@@ -7557,7 +9239,11 @@ pub const Server = struct {
             }
         }
         if (slot.completion_tokens >= 1) {
-            const total_ns = end_ns -| slot.admit_ns;
+            const decode_anchor = if (slot.prefill_done_ns > 0 and slot.prefill_done_ns <= end_ns)
+                slot.prefill_done_ns
+            else
+                slot.admit_ns;
+            const total_ns = end_ns -| decode_anchor;
             if (total_ns > 0) {
                 const total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
                 const cnt = @as(f64, @floatFromInt(slot.completion_tokens));
@@ -7584,6 +9270,7 @@ pub const Server = struct {
                         slot: *ConnectionSlot,
                         fn onSpan(tctx: *@This(), channel: StreamChannel, span: []const u8) error{BufferTooSmall}!void {
                             if (span.len == 0) return;
+                            if (channel == .reasoning and tctx.slot.thinking_budget_exhausted) return;
                             try tctx.server.dispatchChannelSpan(tctx.slot, channel, span);
                         }
                     };
@@ -7605,6 +9292,7 @@ pub const Server = struct {
                 slot: *ConnectionSlot,
                 fn onSpan(ctx: *@This(), channel: StreamChannel, span: []const u8) error{BufferTooSmall}!void {
                     if (span.len == 0) return;
+                    if (channel == .reasoning and ctx.slot.thinking_budget_exhausted) return;
                     try ctx.server.dispatchChannelSpan(ctx.slot, channel, span);
                 }
             };
@@ -7645,11 +9333,97 @@ pub const Server = struct {
             self.last_tok_per_s_x100.store(@intFromFloat(@min(timings.tok_per_s * 100.0, 1e12)), .release);
         }
         const total_tokens: u32 = slot.prompt_tokens +| slot.completion_tokens;
-        const rec_status: ResponseRecordStatus = if (reason == .cancelled) .cancelled else .completed;
-        self.finalizeStatefulResponseRecord(slot, rec_status);
+        const was_truncated = slot.nonstream_reasoning_truncated or slot.nonstream_content_truncated or slot.tool_calls_truncated;
+        const inc_reason: IncompleteReason = if (was_truncated)
+            .max_response_bytes
+        else if (reason == .length)
+            .max_output_tokens
+        else
+            .none;
+        const rec_status: ResponseRecordStatus = if (reason == .cancelled)
+            .cancelled
+        else if (was_truncated or reason == .length)
+            .incomplete
+        else
+            .completed;
+        self.finalizeStatefulResponseRecord(slot, rec_status, inc_reason);
 
         if (slot.stream) {
             self.ensureStreamPreamble(slot);
+            if (slot.endpoint == .responses) {
+                self.flushAndCloseResponsesOpenItems(slot) catch {
+                    self.closeSlotSocketAndRelease(slot, true);
+                    return;
+                };
+                _ = self.flushTx(slot);
+                slot.compactTx();
+                var w = FixedWriter.init(slot.tx_buf[slot.tx_write_pos..]);
+                const sc = slot.responses_seq_num;
+                slot.responses_seq_num += 1;
+                const reasoning = slot.nonstream_reasoning_buf[0..slot.nonstream_reasoning_len];
+                const content = slot.nonstream_content_buf[0..slot.nonstream_content_len];
+                const write_ok: bool = blk: {
+                    w.print(
+                        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":{d},\"response\":{{\"id\":\"resp_{d}\",\"object\":\"response\",\"created_at\":{d},\"status\":\"{s}\",\"model\":\"",
+                        .{ sc, slot.request_id, slot.created_unix, rec_status.name() },
+                    ) catch break :blk false;
+                    w.writeJsonEscaped(slot.modelSlice()) catch break :blk false;
+                    w.print("\",\"seed_used\":{d},\"seed_source\":\"{s}\"", .{
+                        slot.seed_used,
+                        slot.seed_source.name(),
+                    }) catch break :blk false;
+                    if (rec_status == .incomplete and inc_reason != .none) {
+                        w.print(",\"incomplete_details\":{{\"reason\":\"{s}\"}}", .{inc_reason.name()}) catch break :blk false;
+                    }
+                    if (slot.previous_response_id_len > 0) {
+                        w.writeAll(",\"previous_response_id\":\"") catch break :blk false;
+                        w.writeJsonEscaped(slot.previousResponseIdSlice()) catch break :blk false;
+                        w.writeByte('"') catch break :blk false;
+                    } else {
+                        w.writeAll(",\"previous_response_id\":null") catch break :blk false;
+                    }
+                    w.writeAll(",\"output\":") catch break :blk false;
+                    writeResponsesOutputArrayJson(
+                        &w,
+                        slot.request_id,
+                        rec_status.name(),
+                        reasoning,
+                        content,
+                        slot.reasoning_summary,
+                        slot.stored_tool_call_count > 0,
+                        slot.stored_tool_calls[0..slot.stored_tool_call_count],
+                    ) catch break :blk false;
+                    w.writeAll(",\"output_text\":\"") catch break :blk false;
+                    w.writeJsonEscaped(content) catch break :blk false;
+                    w.print(
+                        "\",\"usage\":{{\"input_tokens\":{d},\"input_tokens_details\":{{\"cached_tokens\":{d}}},\"output_tokens\":{d},\"output_tokens_details\":{{\"reasoning_tokens\":{d}}},\"total_tokens\":{d}}}," ++
+                            "\"aminfer_timings\":{{\"ttft_ms\":{d:.3},\"tpot_ms\":{d:.3},\"tok_per_s\":{d:.2}}}}}}}\n\n",
+                        .{
+                            slot.prompt_tokens,
+                            slot.cached_tokens,
+                            slot.completion_tokens,
+                            slot.reasoning_tokens,
+                            total_tokens,
+                            timings.ttft_ms,
+                            timings.tpot_ms,
+                            timings.tok_per_s,
+                        },
+                    ) catch break :blk false;
+                    break :blk true;
+                };
+                if (!write_ok) {
+                    self.closeSlotSocketAndRelease(slot, true);
+                    return;
+                }
+                slot.tx_write_pos += w.pos;
+                self.releaseRequestCount(slot);
+                slot.state = .draining_response;
+                if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
+                    self.closeSlotSocketAndRelease(slot, false);
+                }
+                return;
+            }
+
             var buf: [4096]u8 = undefined;
             var w = FixedWriter.init(&buf);
             switch (slot.endpoint) {
@@ -7718,45 +9492,7 @@ pub const Server = struct {
                         return;
                     };
                 },
-                .responses => {
-                    self.closeResponsesOpenItems(slot, &w) catch {
-                        self.closeSlotSocketAndRelease(slot, true);
-                        return;
-                    };
-                    const sc = slot.responses_seq_num;
-                    slot.responses_seq_num += 1;
-                    w.print(
-                        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":{d},\"response\":{{\"id\":\"resp_{d}\",\"object\":\"response\",\"status\":\"{s}\",\"model\":\"",
-                        .{ sc, slot.request_id, rec_status.name() },
-                    ) catch {
-                        self.closeSlotSocketAndRelease(slot, true);
-                        return;
-                    };
-                    w.writeJsonEscaped(slot.modelSlice()) catch {
-                        self.closeSlotSocketAndRelease(slot, true);
-                        return;
-                    };
-                    w.print(
-                        "\",\"seed_used\":{d},\"seed_source\":\"{s}\"," ++
-                            "\"usage\":{{\"input_tokens\":{d},\"input_tokens_details\":{{\"cached_tokens\":{d}}},\"output_tokens\":{d},\"output_tokens_details\":{{\"reasoning_tokens\":{d}}},\"total_tokens\":{d}}}," ++
-                            "\"aminfer_timings\":{{\"ttft_ms\":{d:.3},\"tpot_ms\":{d:.3},\"tok_per_s\":{d:.2}}}}}}}\n\n",
-                        .{
-                            slot.seed_used,
-                            slot.seed_source.name(),
-                            slot.prompt_tokens,
-                            slot.cached_tokens,
-                            slot.completion_tokens,
-                            slot.reasoning_tokens,
-                            total_tokens,
-                            timings.ttft_ms,
-                            timings.tpot_ms,
-                            timings.tok_per_s,
-                        },
-                    ) catch {
-                        self.closeSlotSocketAndRelease(slot, true);
-                        return;
-                    };
-                },
+                .responses => unreachable,
                 .messages => {
                     if (slot.anthropic_block != .none) {
                         self.writeAnthropicBlockStop(slot, &w) catch {
@@ -7826,13 +9562,15 @@ pub const Server = struct {
         // Non-streaming JSON response: format directly into `slot.tx_buf` with a
         // reserved header prefix so zero extra scratch buffers are required.
         self.releaseRequestCount(slot);
-        self.writeNonStreamJsonResponse(slot, reason, timings, total_tokens);
+        self.writeNonStreamJsonResponse(slot, reason, rec_status, inc_reason, timings, total_tokens);
     }
 
     fn writeNonStreamJsonResponse(
         self: *Server,
         slot: *ConnectionSlot,
         reason: FinishReason,
+        rec_status: ResponseRecordStatus,
+        inc_reason: IncompleteReason,
         timings: Timings,
         total_tokens: u32,
     ) void {
@@ -7904,55 +9642,34 @@ pub const Server = struct {
                 },
                 .responses => {
                     bw.print(
-                        "{{\"id\":\"resp_{d}\",\"object\":\"response\",\"created_at\":{d},\"status\":\"completed\",\"model\":\"",
-                        .{ slot.request_id, slot.created_unix },
+                        "{{\"id\":\"resp_{d}\",\"object\":\"response\",\"created_at\":{d},\"status\":\"{s}\",\"model\":\"",
+                        .{ slot.request_id, slot.created_unix, rec_status.name() },
                     ) catch break :blk false;
                     bw.writeJsonEscaped(slot.modelSlice()) catch break :blk false;
                     bw.print("\",\"seed_used\":{d},\"seed_source\":\"{s}\"", .{
                         slot.seed_used,
                         slot.seed_source.name(),
                     }) catch break :blk false;
+                    if (rec_status == .incomplete and inc_reason != .none) {
+                        bw.print(",\"incomplete_details\":{{\"reason\":\"{s}\"}}", .{inc_reason.name()}) catch break :blk false;
+                    }
                     if (slot.previous_response_id_len > 0) {
                         bw.writeAll(",\"previous_response_id\":\"") catch break :blk false;
                         bw.writeJsonEscaped(slot.previousResponseIdSlice()) catch break :blk false;
                         bw.writeByte('"') catch break :blk false;
                     }
-                    bw.writeAll(",\"output\":[") catch break :blk false;
-                    var need_comma = false;
-                    if (reasoning.len > 0) {
-                        bw.print(
-                            "{{\"id\":\"rs_{d}\",\"type\":\"reasoning\",\"summary\":[{{\"type\":\"summary_text\",\"text\":\"",
-                            .{slot.request_id},
-                        ) catch break :blk false;
-                        bw.writeJsonEscaped(reasoning) catch break :blk false;
-                        bw.writeAll("\"}]}") catch break :blk false;
-                        need_comma = true;
-                    }
-                    if (content.len > 0 or !has_tools) {
-                        if (need_comma) bw.writeByte(',') catch break :blk false;
-                        bw.print(
-                            "{{\"id\":\"msg_{d}\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{{\"type\":\"output_text\",\"text\":\"",
-                            .{slot.request_id},
-                        ) catch break :blk false;
-                        bw.writeJsonEscaped(content) catch break :blk false;
-                        bw.writeAll("\"}]}") catch break :blk false;
-                        need_comma = true;
-                    }
-                    for (slot.stored_tool_calls[0..slot.stored_tool_call_count], 0..) |*tc, idx| {
-                        if (need_comma) bw.writeByte(',') catch break :blk false;
-                        bw.print("{{\"id\":\"fc_{d}_{d}\",\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"", .{
-                            slot.request_id,
-                            idx,
-                        }) catch break :blk false;
-                        bw.writeJsonEscaped(tc.idSlice()) catch break :blk false;
-                        bw.writeAll("\",\"name\":\"") catch break :blk false;
-                        bw.writeJsonEscaped(tc.nameSlice()) catch break :blk false;
-                        bw.writeAll("\",\"arguments\":\"") catch break :blk false;
-                        bw.writeJsonEscaped(if (tc.args_len > 0) tc.argsSlice() else "{}") catch break :blk false;
-                        bw.writeAll("\"}") catch break :blk false;
-                        need_comma = true;
-                    }
-                    bw.writeAll("],\"output_text\":\"") catch break :blk false;
+                    bw.writeAll(",\"output\":") catch break :blk false;
+                    writeResponsesOutputArrayJson(
+                        &bw,
+                        slot.request_id,
+                        rec_status.name(),
+                        reasoning,
+                        content,
+                        slot.reasoning_summary,
+                        has_tools,
+                        slot.stored_tool_calls[0..slot.stored_tool_call_count],
+                    ) catch break :blk false;
+                    bw.writeAll(",\"output_text\":\"") catch break :blk false;
                     bw.writeJsonEscaped(content) catch break :blk false;
                     bw.print(
                         "\",\"usage\":{{\"input_tokens\":{d},\"input_tokens_details\":{{\"cached_tokens\":{d}}},\"output_tokens\":{d},\"output_tokens_details\":{{\"reasoning_tokens\":{d}}},\"total_tokens\":{d}}}," ++
@@ -7981,8 +9698,12 @@ pub const Server = struct {
                     }) catch break :blk false;
                     var need_comma = false;
                     if (reasoning.len > 0) {
+                        var sig_hex: [64]u8 = undefined;
+                        const sig = computeThinkingSignature(&self.signature_key, reasoning, &sig_hex);
                         bw.writeAll("{\"type\":\"thinking\",\"thinking\":\"") catch break :blk false;
                         bw.writeJsonEscaped(reasoning) catch break :blk false;
+                        bw.writeAll("\",\"signature\":\"") catch break :blk false;
+                        bw.writeAll(sig) catch break :blk false;
                         bw.writeAll("\"}") catch break :blk false;
                         need_comma = true;
                     }
@@ -8044,11 +9765,11 @@ pub const Server = struct {
             "HTTP/1.1 200 OK\r\n" ++
                 "Content-Type: application/json\r\n" ++
                 "Content-Length: {d}\r\n" ++
-                "Connection: close\r\n" ++
+                "Connection: {s}\r\n" ++
                 "X-Aminfer-Seed-Used: {d}\r\n" ++
                 "X-Aminfer-Seed-Source: {s}\r\n" ++
                 "\r\n",
-            .{ body_len, slot.seed_used, slot.seed_source.name() },
+            .{ body_len, if (slot.keep_alive) "keep-alive" else "close", slot.seed_used, slot.seed_source.name() },
         ) catch {
             self.closeSlotSocketAndRelease(slot, false);
             return;
@@ -8060,7 +9781,7 @@ pub const Server = struct {
         slot.tx_write_pos = HEADER_RESERVE + body_len;
         slot.state = .draining_response;
         if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.closeSlotSocketAndRelease(slot, false);
+            self.finishHttpExchange(slot);
         }
     }
 
@@ -8093,7 +9814,7 @@ pub const Server = struct {
         self.releaseRequestCount(slot);
         slot.state = .draining_response;
         if (self.flushTx(slot) and slot.pendingTxLen() == 0) {
-            self.closeSlotSocketAndRelease(slot, false);
+            self.finishHttpExchange(slot);
         }
     }
 };
@@ -8169,11 +9890,41 @@ fn testRecvAll(fd: std.c.fd_t, out_buf: []u8) TestClientError![]const u8 {
     }
 }
 
+fn testRecvOneHttpResponse(fd: std.c.fd_t, out_buf: []u8) TestClientError![]const u8 {
+    var total: usize = 0;
+    var expected_end: ?usize = null;
+    while (true) {
+        if (expected_end) |ee| {
+            if (total >= ee) return out_buf[0..ee];
+        }
+        if (total >= out_buf.len) return error.BufferTooSmall;
+        const n = std.c.recv(fd, out_buf.ptr + total, out_buf.len - total, 0);
+        if (n > 0) {
+            total += @intCast(n);
+            if (expected_end == null) {
+                if (std.mem.indexOf(u8, out_buf[0..total], "\r\n\r\n")) |sep| {
+                    const hdr_end = sep + 4;
+                    if (extractHeaderValue(out_buf[0..hdr_end], "Content-Length")) |cl_str| {
+                        const cl = std.fmt.parseInt(usize, cl_str, 10) catch return error.RecvFailed;
+                        expected_end = hdr_end + cl;
+                        if (expected_end.? > out_buf.len) return error.BufferTooSmall;
+                    }
+                }
+            }
+        } else if (n == 0) {
+            return out_buf[0..total];
+        } else {
+            if (std.c.errno(n) == .INTR) continue;
+            return error.RecvFailed;
+        }
+    }
+}
+
 fn testHttpExchange(port: u16, raw_request: []const u8, resp_buf: []u8) TestClientError![]const u8 {
     const fd = try testConnectLoopback(port);
     defer _ = std.c.close(fd);
     try testSendAll(fd, raw_request);
-    return testRecvAll(fd, resp_buf);
+    return testRecvOneHttpResponse(fd, resp_buf);
 }
 
 fn testHttpPostJson(port: u16, path: []const u8, json_body: []const u8, req_buf: []u8, resp_buf: []u8) TestClientError![]const u8 {
@@ -8765,7 +10516,7 @@ test "POST /v1/responses and POST /v1/messages stateless streaming & non-streami
         const json = extractHttpBody(resp) orelse return error.TestUnexpectedResult;
         try expectValidJson(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"message\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, json, "{\"type\":\"thinking\",\"thinking\":\"reason A\"}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "{\"type\":\"thinking\",\"thinking\":\"reason A\",\"signature\":\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "{\"type\":\"text\",\"text\":\"Final B\"}") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"stop_reason\":\"end_turn\"") != null);
     }
@@ -10111,7 +11862,7 @@ fn testUnixExchange(path: []const u8, raw_request: []const u8, resp_buf: []u8) T
     const fd = try testConnectUnix(path);
     defer _ = std.c.close(fd);
     try testSendAll(fd, raw_request);
-    return testRecvAll(fd, resp_buf);
+    return testRecvOneHttpResponse(fd, resp_buf);
 }
 
 test "C18 end-to-end tool calling SSE & non-streaming across /v1/chat/completions, /v1/responses, and /v1/messages + multi-turn history" {
@@ -10699,4 +12450,711 @@ test "C23 ARM64 NEON JSON/HTTP scanners match scalar bit-for-bit across 0..129 o
     try std.testing.expectEqual(@as(u8, 1), parsed.tool_count);
     try std.testing.expectEqualStrings("run_sql", parsed.toolsSlice()[0].nameSlice());
     try std.testing.expect(parsed.prompt_len > 10 * 1024);
+}
+
+test "W24 (a)+(b) reasoning_effort, chat_template_kwargs, contradiction 400 rejection, and Inkling 2 / Hy4 tool calling" {
+    var prompt_buf: [8192]u8 = undefined;
+    var model_buf: [MAX_MODEL_ID_BYTES]u8 = undefined;
+    const ink_tpl = chat_template.ChatTemplate.preset(.inkling2);
+    const hy4_tpl = chat_template.ChatTemplate.preset(.hy4);
+
+    // 1. `/v1/chat/completions` top-level `reasoning_effort` + float + `chat_template_kwargs` on Inkling 2 & Hy4.
+    {
+        const body =
+            \\{"messages":[{"role":"user","content":"Solve"}],"reasoning_effort":"xhigh"}
+        ;
+        const req = try parseInferenceRequestWithTemplate(.chat_completions, body, "ink", &ink_tpl, null, null, null, &prompt_buf, &model_buf);
+        try std.testing.expect(req.enable_thinking);
+        try std.testing.expectEqualStrings(
+            "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Solve<|end_message|>",
+            prompt_buf[0..req.prompt_len],
+        );
+    }
+    {
+        const body =
+            \\{"messages":[{"role":"user","content":"Solve"}],"chat_template_kwargs":{"reasoning_effort":0.5,"preserved_thinking":true,"enable_thinking":true}}
+        ;
+        const req = try parseInferenceRequestWithTemplate(.chat_completions, body, "ink", &ink_tpl, null, null, null, &prompt_buf, &model_buf);
+        try std.testing.expect(req.enable_thinking);
+        try std.testing.expectEqual(@as(?bool, true), req.preserved_thinking);
+        try std.testing.expect(std.mem.indexOf(u8, prompt_buf[0..req.prompt_len], "Thinking effort level: 0.5") != null);
+    }
+    {
+        const body =
+            \\{"messages":[{"role":"user","content":"Hi"}],"reasoning_effort":"medium"}
+        ;
+        const req = try parseInferenceRequestWithTemplate(.chat_completions, body, "hy4", &hy4_tpl, null, null, null, &prompt_buf, &model_buf);
+        try std.testing.expect(req.enable_thinking);
+        try std.testing.expect(req.starts_in_think);
+        try std.testing.expect(std.mem.indexOf(u8, prompt_buf[0..req.prompt_len], "<｜reasoning_mode:opensource｜>reasoning_effort:high") != null);
+        try std.testing.expect(std.mem.endsWith(u8, prompt_buf[0..req.prompt_len], "<think:opensource>"));
+    }
+    {
+        const body =
+            \\{"messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{"reasoning_effort":"no_think","enable_thinking":false}}
+        ;
+        const req = try parseInferenceRequestWithTemplate(.chat_completions, body, "hy4", &hy4_tpl, null, null, null, &prompt_buf, &model_buf);
+        try std.testing.expect(!req.enable_thinking);
+        try std.testing.expect(!req.starts_in_think);
+        try std.testing.expect(std.mem.indexOf(u8, prompt_buf[0..req.prompt_len], "reasoning_effort:no_think") != null);
+    }
+
+    // 2. Contradictory thinking parameters MUST fail with `error.InvalidFieldValue`.
+    const contradictions = [_][]const u8{
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"enable_thinking\":false,\"reasoning_effort\":\"high\"}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"enable_thinking\":true,\"reasoning_effort\":\"none\"}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"reasoning_effort\":\"low\",\"chat_template_kwargs\":{\"reasoning_effort\":\"high\"}}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"enable_thinking\":true,\"chat_template_kwargs\":{\"enable_thinking\":false}}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"a\"}],\"thinking\":{\"type\":\"disabled\"},\"reasoning_effort\":\"medium\"}",
+    };
+    for (contradictions) |bad_body| {
+        try std.testing.expectError(
+            error.InvalidFieldValue,
+            parseInferenceRequest(.chat_completions, bad_body, "m", &prompt_buf, &model_buf),
+        );
+    }
+
+    // 3. HTTP loopback test: contradiction returns 400 + Inkling 2 & Hy4 tool calling SSE works end-to-end.
+    const InklingMock = struct {
+        fn generate(_: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(8);
+            if (std.mem.indexOf(u8, job.prompt, "Thinking effort level: 0.7") == null) {
+                stream.fail("missing inkling effort");
+                return;
+            }
+            const chunks = [_][]const u8{
+                "<|message_model|><|content_thin",
+                "king|>plan<|end_mes",
+                "sage|><|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}<|end_message|><|content_model_end_sampling|>",
+            };
+            for (chunks) |c| {
+                if (!stream.emitTokenBytes(c)) return;
+            }
+            stream.finish(.stop, 8);
+        }
+    };
+    var dummy: u8 = 0;
+    const srv_ink = try Server.init(std.testing.allocator, .{
+        .port = 0,
+        .model_id = "inkling-2",
+        .chat_template = ink_tpl,
+        .apply_qos = false,
+    });
+    defer srv_ink.deinit(std.testing.allocator);
+    try srv_ink.start(.{ .ctx = &dummy, .generateFn = InklingMock.generate });
+    defer srv_ink.stop();
+
+    var req_buf: [2048]u8 = undefined;
+    var resp_buf: [16 * 1024]u8 = undefined;
+
+    const bad_resp = try testHttpPostJson(
+        srv_ink.boundPort(),
+        "/v1/chat/completions",
+        contradictions[0],
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, bad_resp, "HTTP/1.1 400 Bad Request\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, bad_resp, "invalid_request_error") != null);
+
+    const ink_resp = try testHttpPostJson(
+        srv_ink.boundPort(),
+        "/v1/chat/completions",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Weather?\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\"}}}],\"reasoning_effort\":\"medium\",\"stream\":false}",
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, ink_resp, "HTTP/1.1 200 OK\r\n"));
+    const ink_json = extractHttpBody(ink_resp) orelse return error.TestUnexpectedResult;
+    try expectValidJson(ink_json);
+    try std.testing.expect(std.mem.indexOf(u8, ink_json, "\"reasoning_content\":\"plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ink_json, "\"name\":\"get_weather\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ink_json, "Tokyo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ink_json, "\"finish_reason\":\"tool_calls\"") != null);
+
+    // 4. Hy4 loopback with starts_in_think == true + XML tool call!
+    const Hy4Mock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(6);
+            const chunks = [_][]const u8{
+                "hy_plan</think:open",
+                "source><tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Kyoto</arg_value:opensource><arg_key:opensource>days</arg_key:opensource><arg_value:opensource>3</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+            };
+            for (chunks) |c| {
+                if (!stream.emitTokenBytes(c)) return;
+            }
+            stream.finish(.stop, 6);
+        }
+    };
+    const srv_hy4 = try Server.init(std.testing.allocator, .{
+        .port = 0,
+        .model_id = "hy4-flash",
+        .chat_template = hy4_tpl,
+        .apply_qos = false,
+    });
+    defer srv_hy4.deinit(std.testing.allocator);
+    try srv_hy4.start(.{ .ctx = &dummy, .generateFn = Hy4Mock.generate });
+    defer srv_hy4.stop();
+
+    const hy_resp = try testHttpPostJson(
+        srv_hy4.boundPort(),
+        "/v1/chat/completions",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Kyoto?\"}],\"reasoning_effort\":\"low\",\"stream\":false}",
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, hy_resp, "HTTP/1.1 200 OK\r\n"));
+    const hy_json = extractHttpBody(hy_resp) orelse return error.TestUnexpectedResult;
+    try expectValidJson(hy_json);
+    try std.testing.expect(std.mem.indexOf(u8, hy_json, "\"reasoning_content\":\"hy_plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hy_json, "\"name\":\"get_weather\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hy_json, "Kyoto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hy_json, "\"finish_reason\":\"tool_calls\"") != null);
+}
+
+test "C18 (c)+(e) active thinking_budget_tokens enforcement and post-ThinkSplitter reasoning_tokens counting" {
+    const BudgetMock = struct {
+        mode: enum { ignore_budget, check_budget, split_edge } = .ignore_budget,
+        saw_worker_cutoff: std.atomic.Value(bool) = .init(false),
+
+        fn generate(ctx: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = stream.setPromptTokens(5);
+            switch (self.mode) {
+                .ignore_budget => {
+                    // Worker ignores budget and emits 5 reasoning tokens + close + answer.
+                    const toks = [_][]const u8{ "<think>", "t1", "t2", "t3", "t4", "t5", "</think>", "Done" };
+                    for (toks) |t| {
+                        if (!stream.emitTokenBytes(t)) return;
+                    }
+                },
+                .check_budget => {
+                    const toks = [_][]const u8{ "<think>", "r1", "r2", "r3", "r4" };
+                    for (toks) |t| {
+                        if (!stream.emitTokenBytes(t)) return;
+                        if (stream.thinkingBudgetExceeded()) {
+                            self.saw_worker_cutoff.store(true, .release);
+                            _ = stream.emitTokenBytes("</think>");
+                            break;
+                        }
+                    }
+                    _ = stream.emitTokenBytes("Answer");
+                },
+                .split_edge => {
+                    // Test (e): opening `<think>a` batch must count, closing `</think>body` must NOT overcount!
+                    const toks = [_][]const u8{ "<think>a", "b", "</think>body" };
+                    for (toks) |t| {
+                        if (!stream.emitTokenBytes(t)) return;
+                    }
+                },
+            }
+            stream.finish(.stop, 5);
+        }
+    };
+
+    var mock = BudgetMock{ .mode = .ignore_budget };
+    const srv = try Server.init(std.testing.allocator, .{ .port = 0, .model_id = "qwen3", .apply_qos = false });
+    defer srv.deinit(std.testing.allocator);
+    try srv.start(.{ .ctx = &mock, .generateFn = BudgetMock.generate });
+    defer srv.stop();
+
+    var req_buf: [2048]u8 = undefined;
+    var resp_buf: [16 * 1024]u8 = undefined;
+
+    // 1. Server-enforced budget cutoff (`budget_tokens: 3`): drops `t4`, `t5`, keeps `Done`, `reasoning_tokens == 3`!
+    const r1 = try testHttpPostJson(
+        srv.boundPort(),
+        "/v1/messages",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":3},\"max_tokens\":64,\"stream\":false}",
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r1, "HTTP/1.1 200 OK\r\n"));
+    const j1 = extractHttpBody(r1) orelse return error.TestUnexpectedResult;
+    try expectValidJson(j1);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "\"thinking\":\"t1t2t3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "t4") == null);
+    try std.testing.expect(std.mem.indexOf(u8, j1, "\"text\":\"Done\"") != null);
+
+    // 2. Worker-cooperative budget cutoff via `stream.thinkingBudgetExceeded()`.
+    mock.mode = .check_budget;
+    const r2 = try testHttpPostJson(
+        srv.boundPort(),
+        "/v1/messages",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":3},\"max_tokens\":64,\"stream\":true}",
+        &req_buf,
+        &resp_buf,
+    );
+    const sse2 = extractHttpBody(r2) orelse return error.TestUnexpectedResult;
+    _ = try expectValidSseJsonFrames(sse2);
+    try std.testing.expect(mock.saw_worker_cutoff.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, sse2, "r4") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sse2, "\"text\":\"Answer\"") != null);
+
+    // 3. (e) Opening `<think>a` + closing `</think>body` -> exact `completion_tokens=3`, `reasoning_tokens=2`!
+    mock.mode = .split_edge;
+    const r3 = try testHttpPostJson(
+        srv.boundPort(),
+        "/v1/chat/completions",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}",
+        &req_buf,
+        &resp_buf,
+    );
+    const j3 = extractHttpBody(r3) orelse return error.TestUnexpectedResult;
+    try expectValidJson(j3);
+    try std.testing.expect(std.mem.indexOf(u8, j3, "\"completion_tokens\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j3, "\"reasoning_tokens\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j3, "\"reasoning_content\":\"ab\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j3, "\"content\":\"body\"") != null);
+}
+
+test "C18 (d)+(f)+(g) reasoning_text, summary modes, full response.completed output, and HMAC-SHA256 thinking signature" {
+    const RichMock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(10);
+            const reason =
+                "First sentence establishes the problem framing carefully. " ++
+                "Middle step explores intermediate algebraic transformations in considerable detail so total length exceeds concise threshold. " ++
+                "Final sentence concludes the exact numerical result cleanly.";
+            _ = stream.emitTokenBytes("<think>");
+            _ = stream.emitTokenBytes(reason);
+            _ = stream.emitTokenBytes("</think>Result=42");
+            stream.finish(.stop, 10);
+        }
+    };
+    var dummy: u8 = 0;
+    const srv = try Server.init(std.testing.allocator, .{
+        .port = 0,
+        .model_id = "qwen3-sig",
+        .api_key = "test-secret-key",
+        .apply_qos = false,
+    });
+    defer srv.deinit(std.testing.allocator);
+    try srv.start(.{ .ctx = &dummy, .generateFn = RichMock.generate });
+    defer srv.stop();
+
+    var req_buf: [4096]u8 = undefined;
+    var resp_buf: [24 * 1024]u8 = undefined;
+    const AuthHelper = struct {
+        fn post(port: u16, path: []const u8, body: []const u8, rbuf: []u8, obuf: []u8) ![]const u8 {
+            var w = FixedWriter.init(rbuf);
+            try w.print(
+                "POST {s} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-secret-key\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ path, body.len, body },
+            );
+            return testHttpExchange(port, w.written(), obuf);
+        }
+    };
+
+    // 1. (d)+(f): `/v1/responses` with `summary: "concise"` streaming -> reasoning_text + head..tail summary + full response.completed!
+    {
+        const r = try AuthHelper.post(
+            srv.boundPort(),
+            "/v1/responses",
+            "{\"input\":\"hi\",\"reasoning\":{\"effort\":\"high\",\"summary\":\"concise\"},\"stream\":true}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 200 OK\r\n"));
+        const sse = extractHttpBody(r) orelse return error.TestUnexpectedResult;
+        _ = try expectValidSseJsonFrames(sse);
+        try std.testing.expect(std.mem.indexOf(u8, sse, "event: response.reasoning_text.delta\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sse, "event: response.reasoning_text.done\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sse, "First sentence establishes the problem framing carefully. ... Final sentence concludes the exact numerical result cleanly.") != null);
+        // `response.completed.response` includes `created_at`, `previous_response_id`, and `output` array!
+        const comp_pos = std.mem.indexOf(u8, sse, "event: response.completed\n") orelse return error.TestUnexpectedResult;
+        const comp_tail = sse[comp_pos..];
+        try std.testing.expect(std.mem.indexOf(u8, comp_tail, "\"created_at\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, comp_tail, "\"previous_response_id\":null") != null);
+        try std.testing.expect(std.mem.indexOf(u8, comp_tail, "\"output\":[") != null);
+        try std.testing.expect(std.mem.indexOf(u8, comp_tail, "\"type\":\"reasoning_text\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, comp_tail, "\"output_text\":\"Result=42\"") != null);
+    }
+
+    // 2. (d) `/v1/responses` with `summary: "none"` -> `content: [reasoning_text]`, `summary: []`.
+    {
+        const r = try AuthHelper.post(
+            srv.boundPort(),
+            "/v1/responses",
+            "{\"input\":\"hi\",\"reasoning\":{\"effort\":\"high\",\"summary\":\"none\"},\"stream\":false}",
+            &req_buf,
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 200 OK\r\n"));
+        const json = extractHttpBody(r) orelse return error.TestUnexpectedResult;
+        try expectValidJson(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"reasoning_text\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"summary\":[]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"summary_text\"") == null);
+    }
+
+    // 3. (g) Anthropic `/v1/messages`: extract HMAC-SHA256 signature from response, verify turn-2 echo passes & tampered signature returns 400!
+    {
+        const r_stream = try AuthHelper.post(
+            srv.boundPort(),
+            "/v1/messages",
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":32,\"stream\":true}",
+            &req_buf,
+            &resp_buf,
+        );
+        const sse = extractHttpBody(r_stream) orelse return error.TestUnexpectedResult;
+        _ = try expectValidSseJsonFrames(sse);
+
+        const r_non = try AuthHelper.post(
+            srv.boundPort(),
+            "/v1/messages",
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":32,\"stream\":false}",
+            &req_buf,
+            &resp_buf,
+        );
+        const json = extractHttpBody(r_non) orelse return error.TestUnexpectedResult;
+        try expectValidJson(json);
+
+        var sig_buf: [128]u8 = undefined;
+        const sig = findJsonStringField(json, "signature", &sig_buf) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 64), sig.len);
+        // Streaming signature_delta emitted the exact same HMAC-SHA256 digest!
+        try std.testing.expect(std.mem.indexOf(u8, sse, sig) != null);
+
+        const reason =
+            "First sentence establishes the problem framing carefully. " ++
+            "Middle step explores intermediate algebraic transformations in considerable detail so total length exceeds concise threshold. " ++
+            "Final sentence concludes the exact numerical result cleanly.";
+
+        // Valid multi-turn echo with genuine HMAC signature -> 200 OK!
+        var valid_body: [2048]u8 = undefined;
+        var vw = FixedWriter.init(&valid_body);
+        try vw.print(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}},{{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"{s}\",\"signature\":\"{s}\"}},{{\"type\":\"text\",\"text\":\"Result=42\"}}]}},{{\"role\":\"user\",\"content\":\"next\"}}],\"max_tokens\":32,\"stream\":false}}",
+            .{ reason, sig },
+        );
+        var hdr_req: [3072]u8 = undefined;
+        var hw = FixedWriter.init(&hdr_req);
+        try hw.print(
+            "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-secret-key\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ vw.pos, vw.written() },
+        );
+        const ok_turn2 = try testHttpExchange(srv.boundPort(), hw.written(), &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, ok_turn2, "HTTP/1.1 200 OK\r\n"));
+
+        // Tampered signature (flip last hex char) -> 400 Bad Request!
+        var bad_sig: [64]u8 = undefined;
+        @memcpy(&bad_sig, sig[0..64]);
+        bad_sig[63] = if (bad_sig[63] == '0') '1' else '0';
+        var bad_body: [2048]u8 = undefined;
+        var bw2 = FixedWriter.init(&bad_body);
+        try bw2.print(
+            "{{\"messages\":[{{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"{s}\",\"signature\":\"{s}\"}}]}},{{\"role\":\"user\",\"content\":\"next\"}}],\"max_tokens\":32}}",
+            .{ reason, bad_sig[0..] },
+        );
+        var bad_hdr: [3072]u8 = undefined;
+        var bhw = FixedWriter.init(&bad_hdr);
+        try bhw.print(
+            "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-secret-key\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ bw2.pos, bw2.written() },
+        );
+        const bad_turn2 = try testHttpExchange(srv.boundPort(), bhw.written(), &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, bad_turn2, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+}
+
+test "C18 (h)+(i)+(j) truncation incomplete status + refuse corrupt chain, non-evictable in_progress slots 503, and tryPush rollback" {
+    // 1. (h) `max_response_bytes` cap sets `status: "incomplete"`, `incomplete_details`, and refuses corrupt chaining.
+    {
+        const LongMock = struct {
+            fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+                _ = stream.setPromptTokens(4);
+                _ = stream.emitTokenBytes("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+                stream.finish(.stop, 4);
+            }
+        };
+        var dummy: u8 = 0;
+        const srv = try Server.init(std.testing.allocator, .{
+            .port = 0,
+            .model_id = "qwen3-trunc",
+            .max_response_bytes = 24,
+            .apply_qos = false,
+        });
+        defer srv.deinit(std.testing.allocator);
+        try srv.start(.{ .ctx = &dummy, .generateFn = LongMock.generate });
+        defer srv.stop();
+
+        var req_buf: [1024]u8 = undefined;
+        var resp_buf: [8192]u8 = undefined;
+        const r = try testHttpPostJson(
+            srv.boundPort(),
+            "/v1/responses",
+            "{\"input\":\"long\",\"stream\":false}",
+            &req_buf,
+            &resp_buf,
+        );
+        const json = extractHttpBody(r) orelse return error.TestUnexpectedResult;
+        try expectValidJson(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"incomplete\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"max_response_bytes\"") != null);
+
+        var id_buf: [64]u8 = undefined;
+        const rid = findJsonStringField(json, "id", &id_buf) orelse return error.TestUnexpectedResult;
+        var chain_body: [256]u8 = undefined;
+        var cw = FixedWriter.init(&chain_body);
+        try cw.print("{{\"input\":\"follow up\",\"previous_response_id\":\"{s}\",\"stream\":false}}", .{rid});
+        const r_chain = try testHttpPostJson(srv.boundPort(), "/v1/responses", cw.written(), &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r_chain, "HTTP/1.1 409 Conflict\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, r_chain, "incomplete_previous_response") != null);
+    }
+
+    // 2. (i)+(j): Active `.in_progress` stateful slots never evicted (`503 server_overloaded`) + `tryPush` rollback!
+    {
+        const GateMock = struct {
+            entered: std.atomic.Value(u32) = .init(0),
+            release: std.atomic.Value(bool) = .init(false),
+            fn generate(ctx: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                _ = self.entered.fetchAdd(1, .acq_rel);
+                _ = stream.setPromptTokens(2);
+                while (!self.release.load(.acquire) and !stream.isCancelled()) {
+                    sleepNs(500_000);
+                }
+                _ = stream.emitTokenBytes("ok");
+                stream.finish(.stop, 2);
+            }
+        };
+        var mock = GateMock{};
+        // (i) 2 stateful slots, 6 conns, 4 active requests -> 2 active `/v1/responses` streams saturate store!
+        const srv = try Server.init(std.testing.allocator, .{
+            .port = 0,
+            .model_id = "qwen3-slot",
+            .max_conns = 6,
+            .max_active_requests = 4,
+            .stateful_response_slots = 2,
+            .job_ring_cap = 8,
+            .apply_qos = false,
+        });
+        defer srv.deinit(std.testing.allocator);
+        try srv.start(.{ .ctx = &mock, .generateFn = GateMock.generate });
+        defer srv.stop();
+
+        const port = srv.boundPort();
+        const stream_body = "{\"input\":\"hold\",\"stream\":true}";
+        var sreq: [512]u8 = undefined;
+        var sw = FixedWriter.init(&sreq);
+        try sw.print("POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ stream_body.len, stream_body });
+
+        const fd1 = try testConnectLoopback(port);
+        defer _ = std.c.close(fd1);
+        try testSendAll(fd1, sw.written());
+        const fd2 = try testConnectLoopback(port);
+        defer _ = std.c.close(fd2);
+        try testSendAll(fd2, sw.written());
+
+        // Wait until first request is held in worker AND second has at least been admitted (store holds 2 `.in_progress`).
+        while (mock.entered.load(.acquire) < 1 or srv.stats().active_requests < 2) {
+            sleepNs(500_000);
+        }
+
+        // 3rd `/v1/responses` MUST get `503 Service Unavailable` (`server_overloaded`), NOT evict `.in_progress` slots!
+        var req_buf: [512]u8 = undefined;
+        var resp_buf: [4096]u8 = undefined;
+        const r3 = try testHttpPostJson(port, "/v1/responses", "{\"input\":\"overflow\",\"stream\":false}", &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r3, "HTTP/1.1 503 Service Unavailable\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, r3, "server_overloaded") != null);
+
+        // Both active slots remain intact!
+        try std.testing.expectEqual(ResponseRecordStatus.in_progress, srv.response_store[0].status);
+        try std.testing.expectEqual(ResponseRecordStatus.in_progress, srv.response_store[1].status);
+
+        mock.release.store(true, .release);
+        var tmp1: [4096]u8 = undefined;
+        var tmp2: [4096]u8 = undefined;
+        _ = try testRecvAll(fd1, &tmp1);
+        _ = try testRecvAll(fd2, &tmp2);
+    }
+
+    // (j) Separate check: `max_active_requests = 2, job_ring_cap = 2` -> worker holds 1st, 2nd queued, 3rd returns 503 with zero leaked slot; plus direct `rollbackStatefulResponseSlot` verification!
+    {
+        const HoldMock = struct {
+            entered: std.atomic.Value(bool) = .init(false),
+            release: std.atomic.Value(bool) = .init(false),
+            fn generate(ctx: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                self.entered.store(true, .release);
+                _ = stream.setPromptTokens(1);
+                while (!self.release.load(.acquire) and !stream.isCancelled()) {
+                    sleepNs(500_000);
+                }
+                _ = stream.emitTokenBytes("done");
+                stream.finish(.stop, 1);
+            }
+        };
+        var hmock = HoldMock{};
+        const srv = try Server.init(std.testing.allocator, .{
+            .port = 0,
+            .model_id = "qwen3-rollback",
+            .max_conns = 6,
+            .max_active_requests = 2,
+            .stateful_response_slots = 4,
+            .job_ring_cap = 2,
+            .apply_qos = false,
+        });
+        defer srv.deinit(std.testing.allocator);
+        try srv.start(.{ .ctx = &hmock, .generateFn = HoldMock.generate });
+        defer srv.stop();
+
+        const port = srv.boundPort();
+        const b1 = "{\"input\":\"first\",\"stream\":false}";
+        var rb1: [512]u8 = undefined;
+        var w1 = FixedWriter.init(&rb1);
+        try w1.print("POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ b1.len, b1 });
+        const c1 = try testConnectLoopback(port);
+        defer _ = std.c.close(c1);
+        try testSendAll(c1, w1.written());
+        while (!hmock.entered.load(.acquire)) sleepNs(500_000);
+
+        // 2nd request queued while worker is held -> active_requests == 2.
+        const c2 = try testConnectLoopback(port);
+        defer _ = std.c.close(c2);
+        try testSendAll(c2, w1.written());
+        while (srv.stats().active_requests < 2) sleepNs(500_000);
+
+        // 3rd request MUST hit 503 AND leave only 2 response_store slots occupied!
+        var req_buf: [512]u8 = undefined;
+        var resp_buf: [4096]u8 = undefined;
+        const r3 = try testHttpPostJson(port, "/v1/responses", b1, &req_buf, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r3, "HTTP/1.1 503 Service Unavailable\r\n"));
+
+        var occupied_in_progress: usize = 0;
+        for (srv.response_store) |*rec| {
+            if (rec.occupied) occupied_in_progress += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), occupied_in_progress);
+
+        hmock.release.store(true, .release);
+        var o1: [4096]u8 = undefined;
+        var o2: [4096]u8 = undefined;
+        _ = try testRecvAll(c1, &o1);
+        _ = try testRecvAll(c2, &o2);
+
+        // Direct `rollbackStatefulResponseSlot` check matching `job_ring.tryPush` failure cleanup.
+        const rs_idx: usize = 3;
+        srv.response_store[rs_idx].occupied = true;
+        srv.response_store[rs_idx].active_conn_slot = 0;
+        srv.response_store[rs_idx].id_len = 5;
+        srv.response_store[rs_idx].chatml_len = 5;
+        srv.slots[0].stateful_resp_slot_idx = rs_idx;
+        srv.rollbackStatefulResponseSlot(&srv.slots[0]);
+        try std.testing.expect(!srv.response_store[rs_idx].occupied);
+        try std.testing.expectEqual(@as(?u16, null), srv.response_store[rs_idx].active_conn_slot);
+        try std.testing.expectEqual(@as(u8, 0), srv.response_store[rs_idx].id_len);
+        try std.testing.expectEqual(@as(usize, 0), srv.response_store[rs_idx].chatml_len);
+        try std.testing.expectEqual(@as(?u16, null), srv.slots[0].stateful_resp_slot_idx);
+    }
+}
+
+test "C18 (k)+(l) http_read_timeout_ms 408 across headers/Content-Length/chunked, HTTP/1.1 keep-alive reuse, and separated timings" {
+    const TimingMock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            sleepNs(3_000_000); // 3 ms simulated prefill
+            _ = stream.setPromptTokens(6);
+            sleepNs(2_000_000); // 2 ms to first generated token
+            _ = stream.emitTokenBytes("tok");
+            sleepNs(2_000_000); // 2 ms decode
+            stream.finish(.stop, 6);
+        }
+    };
+    var dummy: u8 = 0;
+    const srv = try Server.init(std.testing.allocator, .{
+        .port = 0,
+        .model_id = "qwen3-ka",
+        .http_read_timeout_ms = 60,
+        .keepalive_idle_timeout_ms = 120,
+        .apply_qos = false,
+    });
+    defer srv.deinit(std.testing.allocator);
+    try srv.start(.{ .ctx = &dummy, .generateFn = TimingMock.generate });
+    defer srv.stop();
+
+    const port = srv.boundPort();
+    var resp_buf: [8192]u8 = undefined;
+
+    // 1. (k) Slow incomplete headers -> `408 Request Timeout`.
+    {
+        const fd = try testConnectLoopback(port);
+        defer _ = std.c.close(fd);
+        try testSendAll(fd, "GET /health HTTP/1.1\r\nHost: localhost\r\n");
+        const r = try testRecvAll(fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 408 Request Timeout\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, r, "request_timeout") != null);
+    }
+
+    // 2. (k) Incomplete `Content-Length` body -> `408 Request Timeout`.
+    {
+        const fd = try testConnectLoopback(port);
+        defer _ = std.c.close(fd);
+        try testSendAll(fd, "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 50\r\n\r\n{\"a\":");
+        const r = try testRecvAll(fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 408 Request Timeout\r\n"));
+    }
+
+    // 3. (k) Incomplete `Transfer-Encoding: chunked` body -> `408 Request Timeout`.
+    {
+        const fd = try testConnectLoopback(port);
+        defer _ = std.c.close(fd);
+        try testSendAll(fd, "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
+        const r = try testRecvAll(fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 408 Request Timeout\r\n"));
+    }
+
+    // 4. (l) HTTP/1.1 `keep-alive` reuse across multiple sequential non-streaming requests + `Connection: close` + accurate timings!
+    {
+        const fd = try testConnectLoopback(port);
+        defer _ = std.c.close(fd);
+
+        // Request 1 on socket (default HTTP/1.1 keep-alive)
+        try testSendAll(fd, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        const r1 = try testRecvOneHttpResponse(fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r1, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqualStrings("keep-alive", extractHeaderValue(r1, "Connection") orelse "");
+
+        // Request 2 on SAME socket: single-token inference verifying separated timings (`ttft_ms` >= 4ms, `tpot_ms` > 0ms)!
+        const post_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}";
+        var req2: [512]u8 = undefined;
+        var w2 = FixedWriter.init(&req2);
+        try w2.print("POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ post_body.len, post_body });
+        try testSendAll(fd, w2.written());
+        const r2 = try testRecvOneHttpResponse(fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r2, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expectEqualStrings("keep-alive", extractHeaderValue(r2, "Connection") orelse "");
+        const j2 = extractHttpBody(r2) orelse return error.TestUnexpectedResult;
+        try expectValidJson(j2);
+        try std.testing.expect(std.mem.indexOf(u8, j2, "\"content\":\"tok\"") != null);
+        // Single-token tpot_ms uses prefill_done_ns instead of 0.0!
+        try std.testing.expect(std.mem.indexOf(u8, j2, "\"tpot_ms\":0.000") == null);
+
+        // Request 3 + 4 pipelined in one send, with `Connection: close` on Request 4!
+        try testSendAll(
+            fd,
+            "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+                "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        // Read both pipelined responses back cleanly:
+        const combined = try testRecvAll(fd, &resp_buf);
+        try std.testing.expect(std.mem.indexOf(u8, combined, "\"object\":\"list\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, combined, "\"status\":\"ok\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, combined, "Connection: close\r\n") != null);
+    }
+
+    // 5. (l) Idle keep-alive socket reaped after `keepalive_idle_timeout_ms` without 408 or client-abort inflation.
+    {
+        const before_cancels = srv.stats().cancelled_count;
+        const fd = try testConnectLoopback(port);
+        defer _ = std.c.close(fd);
+        try testSendAll(fd, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        const r1 = try testRecvOneHttpResponse(fd, &resp_buf);
+        try std.testing.expect(std.mem.startsWith(u8, r1, "HTTP/1.1 200 OK\r\n"));
+
+        // Wait past `keepalive_idle_timeout_ms` (120 ms): server closes TCP cleanly with EOF (`recv == 0`), NOT 408!
+        const eof_tail = try testRecvAll(fd, &resp_buf);
+        try std.testing.expectEqual(@as(usize, 0), eof_tail.len);
+        try std.testing.expectEqual(before_cancels, srv.stats().cancelled_count);
+    }
 }

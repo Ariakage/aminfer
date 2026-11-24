@@ -19,6 +19,7 @@ const vmstat = @import("../platform/vmstat.zig");
 const arena_mod = @import("../mem/arena.zig");
 const budget_mod = @import("../mem/budget.zig");
 const prefix_cache = @import("../mem/prefix_cache.zig");
+const chat_template = @import("../model/chat_template.zig");
 
 pub const MAX_TURNS: usize = 128;
 pub const MAX_ATTACHMENTS_PER_TURN: usize = 8;
@@ -61,7 +62,8 @@ pub const HELP_TEXT: []const u8 =
     \\  -n, --max-tokens <n>            Max generated tokens per turn (default: 1024)
     \\  -t, --temperature <f>           Sampling temperature (default: 0.6)
     \\      --seed <u64>                Deterministic RNG seed
-    \\  -N, --no-think                  Request non-thinking ChatML turn prefill
+    \\  -N, --no-think                  Request non-thinking turn prefill
+    \\      --reasoning-effort <level>  Reasoning effort (none|minimal|low|medium|high|xhigh|max|0..0.99)
     \\  -H, --hide-think                Suppress <think>...</think> blocks from output
     \\  -C, --no-color                  Disable ANSI dimming/colors
     \\  -q, --no-stats                  Suppress 1-line post-turn throughput summary
@@ -128,6 +130,8 @@ pub const ChatConfig = struct {
     temperature: f32 = 0.6,
     seed: ?u64 = null,
     enable_thinking: bool = true,
+    reasoning_effort: ?chat_template.ReasoningEffort = null,
+    chat_template: chat_template.ChatTemplate = chat_template.ChatTemplate.preset(.chatml),
     think_display: ThinkDisplayMode = .dimmed,
     use_color: bool = true,
     show_stats: bool = true,
@@ -139,6 +143,8 @@ pub const ChatConfig = struct {
 
     pub fn parseArgs(args: []const []const u8) Error!ChatConfig {
         var cfg: ChatConfig = .{};
+        var explicit_no_think = false;
+        var explicit_effort: ?chat_template.ReasoningEffort = null;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
             const arg = args[i];
@@ -167,7 +173,15 @@ pub const ChatConfig = struct {
                 if (i >= args.len) return error.MissingCliValue;
                 cfg.seed = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidCliArgument;
             } else if (std.mem.eql(u8, arg, "--no-think") or std.mem.eql(u8, arg, "-N")) {
+                explicit_no_think = true;
                 cfg.enable_thinking = false;
+            } else if (std.mem.eql(u8, arg, "--reasoning-effort")) {
+                i += 1;
+                if (i >= args.len) return error.MissingCliValue;
+                explicit_effort = chat_template.ReasoningEffort.parseCliArg(args[i]) catch return error.InvalidCliArgument;
+            } else if (std.mem.startsWith(u8, arg, "--reasoning-effort=")) {
+                const val = arg["--reasoning-effort=".len..];
+                explicit_effort = chat_template.ReasoningEffort.parseCliArg(val) catch return error.InvalidCliArgument;
             } else if (std.mem.eql(u8, arg, "--hide-think") or std.mem.eql(u8, arg, "-H")) {
                 cfg.think_display = .hidden;
             } else if (std.mem.eql(u8, arg, "--no-color") or std.mem.eql(u8, arg, "-C")) {
@@ -196,7 +210,10 @@ pub const ChatConfig = struct {
                         },
                         'H' => cfg.think_display = .hidden,
                         'h' => cfg.show_help = true,
-                        'N' => cfg.enable_thinking = false,
+                        'N' => {
+                            explicit_no_think = true;
+                            cfg.enable_thinking = false;
+                        },
                         'q' => cfg.show_stats = false,
                         else => return error.InvalidCliArgument,
                     }
@@ -205,86 +222,21 @@ pub const ChatConfig = struct {
                 return error.InvalidCliArgument;
             }
         }
+        if (explicit_effort) |eff| {
+            if (explicit_no_think and eff.isThinkingEnabled()) return error.InvalidCliArgument;
+            cfg.reasoning_effort = eff;
+            cfg.enable_thinking = eff.isThinkingEnabled();
+        }
         return cfg;
     }
 };
 
 // ---------------------------------------------------------------------------
-// Streaming `<think>...</think>` Splitter (zero heap allocation)
+// Streaming Think-Block Splitter (shared with `chat_template.zig`, zero heap alloc)
 // ---------------------------------------------------------------------------
 
-pub const StreamChannel = enum(u8) {
-    content = 0,
-    reasoning = 1,
-};
-
-pub const ThinkSplitter = struct {
-    const OPEN_TAG = "<think>";
-    const CLOSE_TAG = "</think>";
-
-    in_think: bool = false,
-    pending: [CLOSE_TAG.len]u8 = undefined,
-    pending_len: u8 = 0,
-
-    pub fn reset(self: *ThinkSplitter, start_in_think: bool) void {
-        self.in_think = start_in_think;
-        self.pending_len = 0;
-    }
-
-    pub fn feed(
-        self: *ThinkSplitter,
-        chunk: []const u8,
-        ctx: anytype,
-        comptime emit_fn: anytype,
-    ) !void {
-        var i: usize = 0;
-        while (i < chunk.len) {
-            const tag: []const u8 = if (self.in_think) CLOSE_TAG else OPEN_TAG;
-            const channel: StreamChannel = if (self.in_think) .reasoning else .content;
-
-            if (self.pending_len == 0) {
-                if (std.mem.indexOfScalarPos(u8, chunk, i, '<')) |lt_pos| {
-                    if (lt_pos > i) {
-                        try emit_fn(ctx, channel, chunk[i..lt_pos]);
-                    }
-                    self.pending[0] = '<';
-                    self.pending_len = 1;
-                    i = lt_pos + 1;
-                } else {
-                    try emit_fn(ctx, channel, chunk[i..]);
-                    return;
-                }
-            } else {
-                const b = chunk[i];
-                if (b == tag[self.pending_len]) {
-                    self.pending[self.pending_len] = b;
-                    self.pending_len += 1;
-                    i += 1;
-                    if (self.pending_len == tag.len) {
-                        self.pending_len = 0;
-                        self.in_think = !self.in_think;
-                    }
-                } else {
-                    const flushed = self.pending[0..self.pending_len];
-                    self.pending_len = 0;
-                    try emit_fn(ctx, channel, flushed);
-                }
-            }
-        }
-    }
-
-    pub fn flush(
-        self: *ThinkSplitter,
-        ctx: anytype,
-        comptime emit_fn: anytype,
-    ) !void {
-        if (self.pending_len == 0) return;
-        const channel: StreamChannel = if (self.in_think) .reasoning else .content;
-        const flushed = self.pending[0..self.pending_len];
-        self.pending_len = 0;
-        try emit_fn(ctx, channel, flushed);
-    }
-};
+pub const StreamChannel = chat_template.StreamChannel;
+pub const ThinkSplitter = chat_template.ThinkSplitter;
 
 // ---------------------------------------------------------------------------
 // Writer Sink & Turn-Runner Abstraction (ready for `main.zig` wiring)
@@ -350,6 +302,7 @@ pub const TurnRequest = struct {
     temperature: f32,
     seed: ?u64,
     enable_thinking: bool,
+    reasoning_effort: ?chat_template.ReasoningEffort = null,
 };
 
 pub const TurnStats = struct {
@@ -881,6 +834,11 @@ pub const ChatSession = struct {
             };
         }
 
+        const effective_enable_thinking = if (self.cfg.reasoning_effort) |re|
+            (self.cfg.enable_thinking and re.isThinkingEnabled())
+        else
+            self.cfg.enable_thinking;
+
         const req: TurnRequest = .{
             .turn_index = @intCast(self.turn_count),
             .chatml_prompt = built.prompt,
@@ -892,7 +850,8 @@ pub const ChatSession = struct {
             .max_tokens = self.cfg.max_tokens,
             .temperature = self.cfg.temperature,
             .seed = self.cfg.seed,
-            .enable_thinking = self.cfg.enable_thinking,
+            .enable_thinking = effective_enable_thinking,
+            .reasoning_effort = self.cfg.reasoning_effort,
         };
 
         const assistant_start = self.text_pool_used;
@@ -907,7 +866,7 @@ pub const ChatSession = struct {
         // If `enable_thinking == false`, Qwen3 ChatML pre-closes `<think>\n\n</think>\n`
         // in the prompt, so streaming starts in `.content`; otherwise `.content`
         // transitions into `.reasoning` when `<think>` arrives.
-        stream.splitter.reset(false);
+        stream.splitter.resetForDialect(self.cfg.chat_template.dialect, built.starts_in_think);
 
         var stats = try runner.runTurnFn(runner.ctx, &req, &stream);
         try stream.finish();
@@ -983,7 +942,59 @@ pub const ChatSession = struct {
     const BuiltPrompt = struct {
         prompt: []const u8,
         last_user_msg_byte_offset: ?usize,
+        starts_in_think: bool,
     };
+
+    fn mapTemplateErr(err: chat_template.TemplateError) Error {
+        return switch (err) {
+            error.BufferTooSmall => error.PromptTooLarge,
+            error.DepthExceeded,
+            error.InvalidJson,
+            error.InvalidReasoningEffort,
+            error.InvalidSpec,
+            error.MissingToolName,
+            error.UnsupportedContent,
+            error.UnsupportedDialect,
+            => error.InvalidCliArgument,
+        };
+    }
+
+    fn pushUserTurnWithAttachments(
+        self: *const ChatSession,
+        renderer: *chat_template.PromptRenderer,
+        user_off: u32,
+        user_len: u32,
+        attach_start: u16,
+        attach_count: u8,
+        msg_idx: usize,
+    ) Error!void {
+        const user_txt = self.sliceText(user_off, user_len);
+        if (attach_count > 0) {
+            var parts_buf: [MAX_ATTACHMENTS_PER_TURN * 2 + 1]chat_template.ContentPart = undefined;
+            var p_len: usize = 0;
+            for (0..attach_count) |ai| {
+                const att = self.attachments[@as(usize, attach_start) + ai];
+                parts_buf[p_len] = switch (att.kind) {
+                    .image => .image,
+                    .video => .video,
+                };
+                p_len += 1;
+                parts_buf[p_len] = .{ .text = "\n" };
+                p_len += 1;
+            }
+            parts_buf[p_len] = .{ .text = user_txt };
+            p_len += 1;
+            renderer.pushMessage(.{
+                .role = .user,
+                .parts = parts_buf[0..p_len],
+            }, msg_idx) catch |err| return mapTemplateErr(err);
+        } else {
+            renderer.pushMessage(.{
+                .role = .user,
+                .content = user_txt,
+            }, msg_idx) catch |err| return mapTemplateErr(err);
+        }
+    }
 
     fn buildChatMlPrompt(
         self: *ChatSession,
@@ -992,56 +1003,57 @@ pub const ChatSession = struct {
         curr_attach_start: u16,
         curr_attach_count: u8,
     ) Error!BuiltPrompt {
-        var pos: usize = 0;
-        if (self.cfg.system_prompt.len > 0) {
-            try appendPrompt(&self.prompt_buf, &pos, "<|im_start|>system\n");
-            try appendPrompt(&self.prompt_buf, &pos, self.cfg.system_prompt);
-            try appendPrompt(&self.prompt_buf, &pos, "<|im_end|>\n");
+        const effective_enable_thinking = if (self.cfg.reasoning_effort) |re|
+            (self.cfg.enable_thinking and re.isThinkingEnabled())
+        else
+            self.cfg.enable_thinking;
+        const has_leading_sys = self.cfg.system_prompt.len > 0;
+        const last_user_idx = (if (has_leading_sys) @as(usize, 1) else 0) + (self.turn_count * 2);
+
+        var fw = chat_template.FixedWriter.init(self.prompt_buf);
+        var renderer = chat_template.PromptRenderer.init(
+            &self.cfg.chat_template,
+            &fw,
+            .{
+                .reasoning_effort = self.cfg.reasoning_effort,
+                .enable_thinking = effective_enable_thinking,
+                .repl_compact_nothink = (self.cfg.chat_template.dialect == .chatml),
+            },
+            has_leading_sys,
+            last_user_idx,
+        );
+        renderer.begin() catch |err| return mapTemplateErr(err);
+
+        var msg_idx: usize = 0;
+        if (has_leading_sys) {
+            renderer.pushMessage(.{
+                .role = .system,
+                .content = self.cfg.system_prompt,
+            }, msg_idx) catch |err| return mapTemplateErr(err);
+            msg_idx += 1;
         }
 
         for (self.turns[0..self.turn_count]) |t| {
-            try appendPrompt(&self.prompt_buf, &pos, "<|im_start|>user\n");
-            for (0..t.attach_count) |ai| {
-                const att = self.attachments[@as(usize, t.attach_start) + ai];
-                try appendPrompt(&self.prompt_buf, &pos, att.kind.chatMlTag());
-                try appendPrompt(&self.prompt_buf, &pos, "\n");
-            }
-            try appendPrompt(&self.prompt_buf, &pos, self.sliceText(t.user_off, t.user_len));
-            try appendPrompt(&self.prompt_buf, &pos, "<|im_end|>\n<|im_start|>assistant\n");
-            try appendPrompt(&self.prompt_buf, &pos, self.sliceText(t.assistant_off, t.assistant_len));
-            try appendPrompt(&self.prompt_buf, &pos, "<|im_end|>\n");
+            try self.pushUserTurnWithAttachments(&renderer, t.user_off, t.user_len, t.attach_start, t.attach_count, msg_idx);
+            msg_idx += 1;
+
+            renderer.pushMessage(.{
+                .role = .assistant,
+                .content = self.sliceText(t.assistant_off, t.assistant_len),
+            }, msg_idx) catch |err| return mapTemplateErr(err);
+            msg_idx += 1;
         }
 
-        // Record exact `C15` ChatML message-boundary byte offset right before final
-        // `<|im_start|>user\n` whenever prior turns/system messages exist!
-        const has_prior_messages = (self.turn_count > 0) or (self.cfg.system_prompt.len > 0);
-        const boundary_offset: ?usize = if (has_prior_messages) pos else null;
-
-        try appendPrompt(&self.prompt_buf, &pos, "<|im_start|>user\n");
-        for (0..curr_attach_count) |ai| {
-            const att = self.attachments[@as(usize, curr_attach_start) + ai];
-            try appendPrompt(&self.prompt_buf, &pos, att.kind.chatMlTag());
-            try appendPrompt(&self.prompt_buf, &pos, "\n");
-        }
-        try appendPrompt(&self.prompt_buf, &pos, self.sliceText(curr_user_off, curr_user_len));
-        try appendPrompt(&self.prompt_buf, &pos, "<|im_end|>\n<|im_start|>assistant\n");
-        if (!self.cfg.enable_thinking) {
-            try appendPrompt(&self.prompt_buf, &pos, "<think>\n\n</think>\n");
-        }
+        try self.pushUserTurnWithAttachments(&renderer, curr_user_off, curr_user_len, curr_attach_start, curr_attach_count, msg_idx);
+        renderer.finish() catch |err| return mapTemplateErr(err);
 
         return .{
-            .prompt = self.prompt_buf[0..pos],
-            .last_user_msg_byte_offset = boundary_offset,
+            .prompt = fw.written(),
+            .last_user_msg_byte_offset = renderer.last_user_msg_byte_offset,
+            .starts_in_think = renderer.starts_in_think,
         };
     }
 };
-
-fn appendPrompt(buf_ptr: *[]u8, pos: *usize, slice: []const u8) Error!void {
-    const buf = buf_ptr.*;
-    if (pos.* + slice.len > buf.len) return error.PromptTooLarge;
-    @memcpy(buf[pos.* .. pos.* + slice.len], slice);
-    pos.* += slice.len;
-}
 
 // ---------------------------------------------------------------------------
 // Scrolling Terminal REPL & Non-Interactive `stdin` Pipe Entry Point
@@ -1458,4 +1470,106 @@ test "stdin pipe mode streams clean content to stdout and summary to stderr over
     try std.testing.expect(err_n > 0);
     const stderr_str = stderr_buf[0..@intCast(err_n)];
     try std.testing.expect(std.mem.indexOf(u8, stderr_str, "120.0 tok/s") != null);
+}
+
+test "ChatConfig --reasoning-effort CLI parsing and multi-dialect Inkling 2 / Hy4 ChatSession turns" {
+    const gpa = std.testing.allocator;
+
+    // 1. `--reasoning-effort` parsing, numeric floats, `none` disable, and contradiction check.
+    const c_med = try ChatConfig.parseArgs(&.{ "--reasoning-effort", "medium" });
+    try std.testing.expectEqual(@as(?chat_template.ReasoningEffort, .medium), c_med.reasoning_effort);
+    try std.testing.expect(c_med.enable_thinking);
+
+    const c_num = try ChatConfig.parseArgs(&.{"--reasoning-effort=0.35"});
+    try std.testing.expect(c_num.enable_thinking);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.35), c_num.reasoning_effort.?.numeric, 1e-6);
+
+    const c_none = try ChatConfig.parseArgs(&.{ "--reasoning-effort", "none" });
+    try std.testing.expect(!c_none.enable_thinking);
+
+    const c_nothink_ok = try ChatConfig.parseArgs(&.{ "--no-think", "--reasoning-effort=no_think" });
+    try std.testing.expect(!c_nothink_ok.enable_thinking);
+
+    try std.testing.expectError(
+        error.InvalidCliArgument,
+        ChatConfig.parseArgs(&.{ "--no-think", "--reasoning-effort", "high" }),
+    );
+    try std.testing.expectError(
+        error.InvalidCliArgument,
+        ChatConfig.parseArgs(&.{ "-N", "--reasoning-effort=low" }),
+    );
+    try std.testing.expectError(
+        error.InvalidCliArgument,
+        ChatConfig.parseArgs(&.{ "--reasoning-effort", "turbo" }),
+    );
+
+    // 2. Inkling 2 dialect turn: prompt + `<|content_thinking|>..<|end_message|>` splitter
+    const DialectRunner = struct {
+        mode: enum { inkling2, hy4 },
+        captured_prompt: [2048]u8 = undefined,
+        captured_len: usize = 0,
+        fn runTurn(ctx: *anyopaque, req: *const TurnRequest, stream: *TurnStream) Error!TurnStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            @memcpy(self.captured_prompt[0..req.chatml_prompt.len], req.chatml_prompt);
+            self.captured_len = req.chatml_prompt.len;
+            switch (self.mode) {
+                .inkling2 => {
+                    try stream.emitText("<|content_thinking|>");
+                    try stream.emitText("plan");
+                    try stream.emitText("<|end_message|>");
+                    try stream.emitText("42");
+                },
+                .hy4 => {
+                    try stream.emitText("step");
+                    try stream.emitText("</think:opensource>");
+                    try stream.emitText("Ok");
+                },
+            }
+            return .{ .generated_tokens = 4, .prompt_tokens = 12, .ttft_ns = 1_000_000, .total_ns = 10_000_000 };
+        }
+    };
+
+    const OutSink = struct {
+        buf: [1024]u8 = undefined,
+        len: usize = 0,
+        fn byteSink(self: *@This()) ByteSink {
+            return .{ .ctx = self, .writeFn = write };
+        }
+        fn write(ctx: *anyopaque, bytes: []const u8) error{WriteFailed}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.len + bytes.len > self.buf.len) return error.WriteFailed;
+            @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
+            self.len += bytes.len;
+        }
+    };
+
+    var ink_runner = DialectRunner{ .mode = .inkling2 };
+    var ink_cfg = try ChatConfig.parseArgs(&.{ "--hide-think", "--reasoning-effort", "medium", "--no-stats" });
+    ink_cfg.chat_template = chat_template.ChatTemplate.preset(.inkling2);
+    ink_cfg.system_prompt = "Sys";
+    var ink_sess = try ChatSession.init(gpa, ink_cfg);
+    defer ink_sess.deinit(gpa);
+    var ink_out = OutSink{};
+    var ink_sum = OutSink{};
+    try ink_sess.submitUserTurn("Hi", .{ .ctx = &ink_runner, .runTurnFn = DialectRunner.runTurn }, ink_out.byteSink(), ink_sum.byteSink());
+    try std.testing.expectEqualStrings(
+        "<|message_system|><|content_text|>Sys<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hi<|end_message|>",
+        ink_runner.captured_prompt[0..ink_runner.captured_len],
+    );
+    try std.testing.expectEqualStrings("42\n", ink_out.buf[0..ink_out.len]);
+
+    // 3. Hy4 dialect turn: prompt ends with `<think:opensource>` -> splitter starts in think!
+    var hy_runner = DialectRunner{ .mode = .hy4 };
+    var hy_cfg = try ChatConfig.parseArgs(&.{ "--hide-think", "--reasoning-effort", "low", "--no-stats" });
+    hy_cfg.chat_template = chat_template.ChatTemplate.preset(.hy4);
+    var hy_sess = try ChatSession.init(gpa, hy_cfg);
+    defer hy_sess.deinit(gpa);
+    var hy_out = OutSink{};
+    var hy_sum = OutSink{};
+    try hy_sess.submitUserTurn("Yo", .{ .ctx = &hy_runner, .runTurnFn = DialectRunner.runTurn }, hy_out.byteSink(), hy_sum.byteSink());
+    try std.testing.expectEqualStrings(
+        "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>You are a helpful assistant.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Yo<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>",
+        hy_runner.captured_prompt[0..hy_runner.captured_len],
+    );
+    try std.testing.expectEqualStrings("Ok\n", hy_out.buf[0..hy_out.len]);
 }
