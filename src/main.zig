@@ -53,7 +53,9 @@ const usage =
     \\                    [-L|--lora <name>=<path.amlora>] [-N|--no-think] [-H|--hide-think] [-C|--no-color] [-q|--no-stats]
     \\                    [--reasoning-effort <none|no_think|minimal|low|medium|high|xhigh|max|0.0..0.99>]
     \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
-    \\                    [-n|--max-tokens N] [-t|--temperature T] [--seed N] [--image <path>] [--video <path>]
+    \\                    [-n|--max-tokens N] [-t|--temperature T] [--top-k N] [--top-p F] [--min-p F]
+    \\                    [--repetition-penalty F] [--presence-penalty F] [--frequency-penalty F]
+    \\                    [--seed N] [--image <path>] [--video <path>]
     \\                    [--max-seq-len N] [--prefix-cache-chunks N] [-D|--disk-prefix-cache <dir>]
     \\                    [-W|--wired-cap-mib N] [-S|--strict-live-ram] [-V|--no-verify-crc]
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
@@ -116,6 +118,7 @@ const usage =
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
     \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
     \\                    [--reasoning-effort <none|no_think|minimal|low|medium|high|xhigh|max|0.0..0.99>]
+    \\                    [--dump-router-trace <path.jsonl>]
     \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
     \\                    [-A|--no-ane-predictor] [-V|--no-verify-crc]
     \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent/DSpark)
@@ -1175,6 +1178,7 @@ const DecodeCliArgs = struct {
     kv_retire_q8_after_chunks: u32 = 0,
     image_path: ?[:0]const u8 = null,
     vt_test_video: ?aminfer.metal.VtCodec = null,
+    dump_router_trace_path: ?[:0]const u8 = null,
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
     m7: M7ClusterCliFlags = .{},
@@ -1205,6 +1209,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var kv_retire_q8_after_chunks: u32 = 0;
     var image_path: ?[:0]const u8 = null;
     var vt_test_video: ?aminfer.metal.VtCodec = null;
+    var dump_router_trace_path: ?[:0]const u8 = null;
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
     var m7: M7ClusterCliFlags = .{};
@@ -1302,6 +1307,15 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             vt_test_video = try parseVtCodec(args[i]);
+        } else if (std.mem.eql(u8, flag, "--dump-router-trace")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            if (args[i].len == 0) return error.InvalidFlagValue;
+            dump_router_trace_path = args[i];
+        } else if (std.mem.startsWith(u8, flag, "--dump-router-trace=")) {
+            const val: [:0]const u8 = flag["--dump-router-trace=".len..];
+            if (val.len == 0) return error.InvalidFlagValue;
+            dump_router_trace_path = val;
         } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
             for (flag[1..]) |ch| {
                 switch (ch) {
@@ -1346,6 +1360,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
         .image_path = image_path,
         .vt_test_video = vt_test_video,
+        .dump_router_trace_path = dump_router_trace_path,
         .m6 = m6,
         .m69 = m69,
         .m7 = m7,
@@ -1981,8 +1996,52 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
         .act_quant_policy = cli.m81.act_quant_policy,
+        .enable_router_trace = (cli.dump_router_trace_path != null),
     });
     defer model.deinit(allocator);
+
+    var trace_fd: std.c.fd_t = -1;
+    defer if (trace_fd >= 0) {
+        _ = std.c.close(trace_fd);
+    };
+    if (cli.dump_router_trace_path) |tpath| {
+        if (cfg.arch != .qwen3_moe) return error.InvalidArgument;
+        trace_fd = std.c.open(
+            tpath.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            @as(std.c.mode_t, 0o644),
+        );
+        if (trace_fd < 0) return error.OpenFailed;
+    }
+    const writeTraceStep = struct {
+        fn emit(fd: std.c.fd_t, m_ptr: *const aminfer.qwen3.Qwen3Model, n_layers: u32) !void {
+            if (fd < 0) return;
+            var line_buf: [512]u8 = undefined;
+            for (0..n_layers) |l| {
+                const exps = m_ptr.lastStepRouterTopK(l) orelse continue;
+                var pos_b: usize = 0;
+                const hdr = try std.fmt.bufPrint(line_buf[pos_b..], "{{\"layer\":{d},\"experts\":[", .{l});
+                pos_b += hdr.len;
+                for (exps, 0..) |eid, ki| {
+                    const seg = if (ki == 0)
+                        try std.fmt.bufPrint(line_buf[pos_b..], "{d}", .{eid})
+                    else
+                        try std.fmt.bufPrint(line_buf[pos_b..], ",{d}", .{eid});
+                    pos_b += seg.len;
+                }
+                const tail = "]}\n";
+                if (pos_b + tail.len > line_buf.len) return error.NoSpaceLeft;
+                @memcpy(line_buf[pos_b .. pos_b + tail.len], tail);
+                pos_b += tail.len;
+                var off_w: usize = 0;
+                while (off_w < pos_b) {
+                    const rc = std.c.write(fd, line_buf[off_w..].ptr, pos_b - off_w);
+                    if (rc <= 0) return error.WriteFailed;
+                    off_w += @intCast(rc);
+                }
+            }
+        }
+    }.emit;
 
     const generated = try allocator.alloc(u32, cli.max_tokens);
     defer allocator.free(generated);
@@ -2003,7 +2062,15 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
     const vm_before = try aminfer.vmstat.Snapshot.capture();
     const prefill_t0 = try aminfer.vmstat.nowNs();
 
-    var next_tok: u32 = try model.prefillPrompt(prompt_ids, true);
+    var next_tok: u32 = 0;
+    if (trace_fd >= 0) {
+        for (prompt_ids, 0..) |ptid, pidx| {
+            next_tok = try model.stepDecode(ptid, @intCast(pidx));
+            try writeTraceStep(trace_fd, &model, cfg.num_hidden_layers);
+        }
+    } else {
+        next_tok = try model.prefillPrompt(prompt_ids, true);
+    }
     if (cli.temperature > 0.0) {
         next_tok = try model.sampleFromLastLogits(cli.temperature, req_rng.?.random(), p_res);
     }
@@ -2023,6 +2090,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
             const dec_t0 = try aminfer.vmstat.nowNs();
             while (gen_count < cli.max_tokens) {
                 next_tok = try model.stepDecode(next_tok, pos);
+                try writeTraceStep(trace_fd, &model, cfg.num_hidden_layers);
                 if (cli.temperature > 0.0) {
                     next_tok = try model.sampleFromLastLogits(cli.temperature, req_rng.?.random(), p_res);
                 }
@@ -4905,6 +4973,7 @@ const BatchServeRunner = struct {
 
     const SlotConstraint = struct {
         active: bool = false,
+        prompt_recorded: bool = false,
         grammar_program: ?*const aminfer.grammar.GrammarProgram = null,
         gstate: aminfer.grammar.GrammarState = undefined,
         sampling: aminfer.sampling.SamplingParams = .{},
@@ -4944,6 +5013,7 @@ const BatchServeRunner = struct {
     pending_head: usize = 0,
     pending_tail: usize = 0,
     slot_constraints: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]SlotConstraint = @splat(.{}),
+    slot_penalties: []aminfer.sampling.DefaultPenaltyTracker,
     slot_thinking_cutoff: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]SlotThinkingCutoff = @splat(.{}),
     boundary_fallback_count: u64 = 0,
     steady_steps: u64 = 0,
@@ -4977,6 +5047,12 @@ const BatchServeRunner = struct {
         const mask_words = @max(@as(usize, 1), (v_cap + 31) / 32);
         const grammar_mask = try allocator.alloc(u32, mask_words);
         errdefer allocator.free(grammar_mask);
+        const slot_penalties = try allocator.alloc(
+            aminfer.sampling.DefaultPenaltyTracker,
+            aminfer.batch_scheduler.MAX_BATCH_SLOTS,
+        );
+        errdefer allocator.free(slot_penalties);
+        for (slot_penalties) |*sp| sp.* = aminfer.sampling.DefaultPenaltyTracker.init();
 
         var stop_tokens: [aminfer.batch_scheduler.MAX_STOP_TOKENS]u32 = @splat(0);
         var stop_cnt: u8 = 0;
@@ -5038,6 +5114,7 @@ const BatchServeRunner = struct {
             .sampler_cand_ids = sampler_cand_ids,
             .grammar_mask = grammar_mask,
             .vocab_index = vocab_index,
+            .slot_penalties = slot_penalties,
         };
     }
 
@@ -5047,6 +5124,7 @@ const BatchServeRunner = struct {
             self.gpu_sampler = null;
         }
         if (self.vocab_index) |*vi| vi.deinit(allocator);
+        allocator.free(self.slot_penalties);
         allocator.free(self.grammar_mask);
         allocator.free(self.sampler_cand_ids);
         allocator.free(self.p_res);
@@ -5092,11 +5170,18 @@ const BatchServeRunner = struct {
         if (slot_id < self.slot_constraints.len) {
             self.slot_constraints[slot_id] = .{
                 .active = meta.constrained,
+                .prompt_recorded = false,
                 .grammar_program = meta.grammar_program,
                 .gstate = if (meta.grammar_program) |gp| gp.initialState() else undefined,
                 .sampling = meta.sampling,
                 .rng = meta.rng,
             };
+        }
+        if (slot_id < self.slot_penalties.len) {
+            self.slot_penalties[slot_id].reset();
+        }
+        if (self.gpu_sampler) |*gs| {
+            gs.workspace.clearPenalties(0);
         }
     }
 
@@ -5114,11 +5199,15 @@ const BatchServeRunner = struct {
             params.allowed_token_mask = self.grammar_mask[0..mask_len];
         }
         const rng_ptr = sc.rng orelse return null;
+        const seen = if (params.hasPenalties() and slot_id < self.slot_penalties.len)
+            self.slot_penalties[slot_id].activeEntries()
+        else
+            &.{};
         const out = aminfer.sampling.sampleToken(
             f16,
             raw_logits[0..n],
             params,
-            &.{},
+            seen,
             rng_ptr,
             .{
                 .logits_f32 = self.p_res[0..n],
@@ -5129,6 +5218,9 @@ const BatchServeRunner = struct {
             if (self.vocab_index) |*vi| {
                 _ = vi.advanceToken(gp, &sc.gstate, self.tok, out.token_id);
             }
+        }
+        if (params.hasPenalties() and slot_id < self.slot_penalties.len) {
+            self.slot_penalties[slot_id].recordToken(out.token_id);
         }
         return out.token_id;
     }
@@ -5202,6 +5294,7 @@ const BatchServeRunner = struct {
         }
 
         const constrained = (job.grammar_program != null) or
+            job.sampling.hasPenalties() or
             job.sampling.logit_bias.len > 0 or
             job.sampling.top_p < 1.0 or
             job.sampling.top_k > 0 or
@@ -5272,6 +5365,12 @@ const BatchServeRunner = struct {
             _ = std.c.pthread_mutex_unlock(mtx);
         };
         self.bindNextPendingToSlot(slot_id);
+        if (slot_id < self.slot_constraints.len and slot_id < self.slot_penalties.len) {
+            if (self.slot_constraints[slot_id].sampling.hasPenalties()) {
+                self.slot_penalties[slot_id].recordSlice(prompt_tokens);
+                self.slot_constraints[slot_id].prompt_recorded = true;
+            }
+        }
         return self.inner_backend.lookupPrefix(slot_id, prompt_tokens);
     }
 
@@ -5287,8 +5386,18 @@ const BatchServeRunner = struct {
         if (self.inner_backend.lookupPrefixFn == null and chunk.start_pos == 0) {
             self.bindNextPendingToSlot(chunk.slot_id);
         }
-        var res = try self.inner_backend.prefillSlot(chunk);
-        if (chunk.is_final_chunk and chunk.slot_id < self.slot_constraints.len and self.slot_constraints[chunk.slot_id].active) {
+        const slot_constrained = (chunk.slot_id < self.slot_constraints.len and self.slot_constraints[chunk.slot_id].active);
+        if (chunk.slot_id < self.slot_constraints.len and chunk.slot_id < self.slot_penalties.len) {
+            var sc = &self.slot_constraints[chunk.slot_id];
+            if (!sc.prompt_recorded and sc.sampling.hasPenalties()) {
+                self.slot_penalties[chunk.slot_id].recordSlice(chunk.tokens);
+                if (chunk.is_final_chunk) sc.prompt_recorded = true;
+            }
+        }
+        var chunk_eff = chunk.*;
+        if (slot_constrained) chunk_eff.temperature = 0.0;
+        var res = try self.inner_backend.prefillSlot(&chunk_eff);
+        if (chunk.is_final_chunk and slot_constrained) {
             if (self.qwen3_batch_rt) |brt| {
                 if (self.sampleSlotConstrainedGpu(
                     chunk.slot_id,
@@ -5337,18 +5446,25 @@ const BatchServeRunner = struct {
                 params.allowed_token_mask = self.grammar_mask[0..mask_len];
             }
             const rng_ptr = sc.rng orelse return null;
+            const seen_opt: ?[]const aminfer.sampling.TokenFreqEntry = if (params.hasPenalties() and slot_id < self.slot_penalties.len)
+                self.slot_penalties[slot_id].activeEntries()
+            else
+                null;
             if (gs.sampleSync(compute, .{
                 .logits = logits_bind,
                 .logits_dtype = .f16,
                 .vocab_size = vocab_size,
                 .params = params,
-                .seen_frequencies = null,
+                .seen_frequencies = seen_opt,
                 .rng_seed = rng_ptr.random().int(u64),
             }, timeout_ms)) |g_out| {
                 if (sc.grammar_program) |gp| {
                     if (self.vocab_index) |*vi| {
                         _ = vi.advanceToken(gp, &sc.gstate, self.tok, g_out.token_id);
                     }
+                }
+                if (params.hasPenalties() and slot_id < self.slot_penalties.len) {
+                    self.slot_penalties[slot_id].recordToken(g_out.token_id);
                 }
                 return g_out.token_id;
             } else |_| {}
@@ -5366,7 +5482,23 @@ const BatchServeRunner = struct {
         defer if (self.model_mutex) |mtx| {
             _ = std.c.pthread_mutex_unlock(mtx);
         };
-        try self.inner_backend.stepDecodeBatch(view, out_next_tokens);
+        var eff_temps: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]f32 = undefined;
+        var view_eff = view.*;
+        var any_constrained = false;
+        const b_sz = view.batchSize();
+        for (0..b_sz) |bi| {
+            const sid = view.slot_ids[bi];
+            if (sid < self.slot_constraints.len and self.slot_constraints[sid].active) {
+                eff_temps[bi] = 0.0;
+                any_constrained = true;
+            } else {
+                eff_temps[bi] = view.temperatures[bi];
+            }
+        }
+        if (any_constrained) {
+            view_eff.temperatures = eff_temps[0..b_sz];
+        }
+        try self.inner_backend.stepDecodeBatch(&view_eff, out_next_tokens);
         // Active `thinking_budget_tokens` cutoff (`ADR-0024` L65): when a slot exceeds
         // its thinking budget, force-inject the pre-tokenized dialect closing delimiter
         // tokens into `out_next_tokens` so `BatchScheduler` commits them into the slot's
@@ -5392,6 +5524,9 @@ const BatchServeRunner = struct {
                     out_next_tokens[bi] = self.thinking_close_ids[sc.next_idx];
                     sc.next_idx += 1;
                     forced_mask[bi] = true;
+                    if (sid < self.slot_constraints.len and sid < self.slot_penalties.len and self.slot_constraints[sid].sampling.hasPenalties()) {
+                        self.slot_penalties[sid].recordToken(out_next_tokens[bi]);
+                    }
                 }
             }
         }
@@ -5462,6 +5597,12 @@ const BatchServeRunner = struct {
         }
         if (slot_id < self.slot_constraints.len) {
             self.slot_constraints[slot_id] = .{};
+        }
+        if (slot_id < self.slot_penalties.len) {
+            self.slot_penalties[slot_id].reset();
+        }
+        if (self.gpu_sampler) |*gs| {
+            gs.workspace.clearPenalties(0);
         }
         if (slot_id < self.slot_thinking_cutoff.len) {
             self.slot_thinking_cutoff[slot_id] = .{};
@@ -6834,6 +6975,9 @@ const ChatEngineRunner = struct {
     encode_scratch: aminfer.tokenizer.EncodeScratch,
     prompt_ids_buf: []u32,
     boundary_verify_buf: []u32,
+    p_res: []f32,
+    sampler_cand_ids: []u32,
+    penalty_tracker: *aminfer.sampling.DefaultPenaltyTracker,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -6851,6 +6995,14 @@ const ChatEngineRunner = struct {
         errdefer allocator.free(prompt_ids_buf);
         const boundary_verify_buf = try allocator.alloc(u32, max_seq_len);
         errdefer allocator.free(boundary_verify_buf);
+        const v_cap = @max(@as(usize, 1), @as(usize, model.config.vocab_size));
+        const p_res = try allocator.alloc(f32, v_cap);
+        errdefer allocator.free(p_res);
+        const sampler_cand_ids = try allocator.alloc(u32, v_cap);
+        errdefer allocator.free(sampler_cand_ids);
+        const penalty_tracker = try allocator.create(aminfer.sampling.DefaultPenaltyTracker);
+        errdefer allocator.destroy(penalty_tracker);
+        penalty_tracker.* = aminfer.sampling.DefaultPenaltyTracker.init();
 
         const chat_tpl = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(tok);
         var stop_tokens: [4]u32 = @splat(0);
@@ -6892,10 +7044,16 @@ const ChatEngineRunner = struct {
             .encode_scratch = encode_scratch,
             .prompt_ids_buf = prompt_ids_buf,
             .boundary_verify_buf = boundary_verify_buf,
+            .p_res = p_res,
+            .sampler_cand_ids = sampler_cand_ids,
+            .penalty_tracker = penalty_tracker,
         };
     }
 
     fn deinit(self: *ChatEngineRunner, allocator: std.mem.Allocator) void {
+        allocator.destroy(self.penalty_tracker);
+        allocator.free(self.sampler_cand_ids);
+        allocator.free(self.p_res);
         allocator.free(self.boundary_verify_buf);
         allocator.free(self.prompt_ids_buf);
         self.encode_scratch.deinit(allocator);
@@ -6993,11 +7151,27 @@ const ChatEngineRunner = struct {
             }
         }
 
+        const sampling_params: aminfer.sampling.SamplingParams = .{
+            .temperature = req.temperature,
+            .top_p = req.top_p,
+            .top_k = req.top_k,
+            .min_p = req.min_p,
+            .repetition_penalty = req.repetition_penalty,
+            .presence_penalty = req.presence_penalty,
+            .frequency_penalty = req.frequency_penalty,
+        };
+        const use_constrained_sampler = !sampling_params.isUnconstrainedGreedy();
+        self.penalty_tracker.reset();
+        if (sampling_params.hasPenalties()) {
+            self.penalty_tracker.recordSlice(prompt_ids);
+        }
+
         var req_rng = aminfer.rng.RequestRng.init(req.seed) catch return error.BackendFailed;
         const lookup = self.batch_rt.lookupPrefix(0, prompt_ids);
         var cur_prefix_handle: u64 = lookup.prefix_handle;
         defer self.batch_rt.batchBackend().releaseSlot(0, cur_prefix_handle);
 
+        const v_size: usize = @min(@as(usize, self.model.config.vocab_size), self.p_res.len);
         const chunk_cap: usize = aminfer.batch_scheduler.DEFAULT_MAX_PREFILL_CHUNK_TOKENS;
         var off: usize = @min(@as(usize, lookup.matched_tokens), prompt_ids.len - 1);
         var first_tok: u32 = 0;
@@ -7021,7 +7195,7 @@ const ChatEngineRunner = struct {
                 .total_prompt_len = @intCast(prompt_ids.len),
                 .is_final_chunk = is_last,
                 .prefix_handle = cur_prefix_handle,
-                .temperature = req.temperature,
+                .temperature = if (use_constrained_sampler) 0.0 else req.temperature,
                 .rng = &req_rng,
                 .ngram_domain = "",
                 .message_boundary_token = boundary_tok,
@@ -7031,7 +7205,27 @@ const ChatEngineRunner = struct {
                 cur_prefix_handle = pres.prefix_handle;
             }
             if (is_last) {
-                first_tok = pres.first_token;
+                if (use_constrained_sampler) {
+                    const raw_lg = self.model.readLastLogitsF16();
+                    const seen = if (sampling_params.hasPenalties()) self.penalty_tracker.activeEntries() else &.{};
+                    const s_out = aminfer.sampling.sampleToken(
+                        f16,
+                        raw_lg[0..@min(raw_lg.len, v_size)],
+                        sampling_params,
+                        seen,
+                        &req_rng,
+                        .{
+                            .logits_f32 = self.p_res[0..v_size],
+                            .cand_ids = self.sampler_cand_ids[0..v_size],
+                        },
+                    ) catch return error.BackendFailed;
+                    first_tok = s_out.token_id;
+                    if (sampling_params.hasPenalties()) {
+                        self.penalty_tracker.recordToken(first_tok);
+                    }
+                } else {
+                    first_tok = pres.first_token;
+                }
             }
             off += take;
         }
@@ -7052,7 +7246,7 @@ const ChatEngineRunner = struct {
             const slot_ids = [_]u16{0};
             const req_ids = [_]u64{@as(u64, req.turn_index) + 1};
             const user_tags = [_]u64{0};
-            const temps = [_]f32{req.temperature};
+            const temps = [_]f32{if (use_constrained_sampler) 0.0 else req.temperature};
             const rngs = [_]*aminfer.rng.RequestRng{&req_rng};
             const ngram_domains = [_][]const u8{""};
             const prefix_handles = [_]u64{cur_prefix_handle};
@@ -7073,7 +7267,27 @@ const ChatEngineRunner = struct {
                     .prefix_handles = &prefix_handles,
                 };
                 self.batch_rt.stepDecodeBatch(&view, &next_out) catch return error.BackendFailed;
-                cur_tok = next_out[0];
+                if (use_constrained_sampler) {
+                    const row_lg = self.model.logits_host[0..v_size];
+                    const seen = if (sampling_params.hasPenalties()) self.penalty_tracker.activeEntries() else &.{};
+                    const s_out = aminfer.sampling.sampleToken(
+                        f16,
+                        row_lg,
+                        sampling_params,
+                        seen,
+                        &req_rng,
+                        .{
+                            .logits_f32 = self.p_res[0..v_size],
+                            .cand_ids = self.sampler_cand_ids[0..v_size],
+                        },
+                    ) catch return error.BackendFailed;
+                    cur_tok = s_out.token_id;
+                    if (sampling_params.hasPenalties()) {
+                        self.penalty_tracker.recordToken(cur_tok);
+                    }
+                } else {
+                    cur_tok = next_out[0];
+                }
                 pos += 1;
                 if (self.isStopToken(cur_tok)) break;
                 const piece = self.tok.tokenBytes(cur_tok) catch "";
@@ -8193,4 +8407,247 @@ test "M8.1 BatchServeRunner preserves Inkling 2 special structural tags, registe
     try std.testing.expectEqual(@as(u32, 4), out_t[0]); // <|content_text|>
     try BatchServeRunner.stepDecodeBatchCallback(&br, &view, &out_t);
     try std.testing.expectEqual(@as(u32, 0), out_t[0]); // resumes normal model output
+}
+
+test "M8.15 C18 BatchServeRunner wires DefaultPenaltyTracker constrained gating, prompt recording, and penalty logit adjustment" {
+    const gpa = std.testing.allocator;
+    const tok_json =
+        \\{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3},"merges":[]},"added_tokens":[]}
+    ;
+    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(gpa, tok_json);
+    defer tok.deinit(gpa);
+    const tpl = aminfer.chat_template.ChatTemplate.preset(.chatml);
+
+    const RecordingBackend = struct {
+        last_prefill_temp: f32 = -1.0,
+        last_decode_temp: f32 = -1.0,
+        fn lookup(_: *anyopaque, _: u16, _: []const u32) aminfer.batch_scheduler.PrefixLookupResult {
+            return .{};
+        }
+        fn prefill(ctx: *anyopaque, chunk: *const aminfer.batch_scheduler.PrefillChunkView) aminfer.batch_scheduler.BackendError!aminfer.batch_scheduler.PrefillResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.last_prefill_temp = chunk.temperature;
+            return .{ .first_token = 0 };
+        }
+        fn decode(ctx: *anyopaque, view: *const aminfer.batch_scheduler.BatchStepView, out: []u32) aminfer.batch_scheduler.BackendError!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (view.batchSize() > 0) self.last_decode_temp = view.temperatures[0];
+            for (0..view.batchSize()) |i| out[i] = 0;
+        }
+        fn release(_: *anyopaque, _: u16, _: u64) void {}
+    };
+
+    var rec = RecordingBackend{};
+    const backend_with_lookup: aminfer.batch_scheduler.BatchBackend = .{
+        .ctx = &rec,
+        .lookupPrefixFn = RecordingBackend.lookup,
+        .prefillSlotFn = RecordingBackend.prefill,
+        .stepDecodeBatchFn = RecordingBackend.decode,
+        .releaseSlotFn = RecordingBackend.release,
+    };
+
+    var br = try BatchServeRunner.init(gpa, backend_with_lookup, null, &tok, tpl, null, null, 64);
+    defer br.deinit(gpa);
+
+    var rng = try aminfer.rng.RequestRng.init(42);
+    var out_tokens: [16]u32 = undefined;
+
+    // 1. Unconstrained greedy job (no penalties) keeps `constrained == false`.
+    const greedy_job: aminfer.server.InferenceJob = .{
+        .slot_index = 0,
+        .generation = 1,
+        .request_id = 1,
+        .endpoint = .chat_completions,
+        .prompt = "ab",
+        .rng = &rng,
+        .seed_used = 42,
+        .seed_source = .explicit,
+        .max_tokens = 8,
+        .temperature = 0.0,
+        .stream = false,
+        .ignore_eos = true,
+        .enable_thinking = false,
+        .sampling = .{},
+    };
+    try std.testing.expect(!greedy_job.sampling.hasPenalties());
+    _ = try BatchServeRunner.tokenizeWithBoundaryCallback(&br, &greedy_job, &out_tokens);
+    _ = BatchServeRunner.lookupPrefixCallback(&br, 0, &.{ 0, 1 });
+    try std.testing.expect(!br.slot_constraints[0].active);
+    try std.testing.expectEqual(@as(usize, 0), br.slot_penalties[0].activeEntries().len);
+    BatchServeRunner.releaseSlotCallback(&br, 0, 0);
+
+    // 2. Penalty-only job (`T = 0.0` + `repetition_penalty = 2.0`, `presence_penalty = 1.5`)
+    //    must activate constrained sampling via `SamplingParams.hasPenalties()`.
+    const pen_sampling: aminfer.sampling.SamplingParams = .{
+        .temperature = 0.0,
+        .repetition_penalty = 2.0,
+        .presence_penalty = 1.5,
+        .frequency_penalty = 0.0,
+    };
+    try std.testing.expect(pen_sampling.hasPenalties());
+    try std.testing.expect(!pen_sampling.isUnconstrainedGreedy());
+    const pen_job: aminfer.server.InferenceJob = .{
+        .slot_index = 0,
+        .generation = 2,
+        .request_id = 2,
+        .endpoint = .chat_completions,
+        .prompt = "aa",
+        .rng = &rng,
+        .seed_used = 42,
+        .seed_source = .explicit,
+        .max_tokens = 8,
+        .temperature = 0.7,
+        .stream = false,
+        .ignore_eos = true,
+        .enable_thinking = false,
+        .sampling = pen_sampling,
+    };
+    const tok_res = try BatchServeRunner.tokenizeWithBoundaryCallback(&br, &pen_job, &out_tokens);
+    try std.testing.expectEqual(@as(usize, 2), tok_res.prompt_len);
+
+    // `lookupPrefixCallback` binds slot 0, records prompt tokens `[0, 0]`, and sets `prompt_recorded = true`.
+    _ = BatchServeRunner.lookupPrefixCallback(&br, 0, out_tokens[0..tok_res.prompt_len]);
+    try std.testing.expect(br.slot_constraints[0].active);
+    try std.testing.expect(br.slot_constraints[0].prompt_recorded);
+    try std.testing.expectEqual(@as(usize, 1), br.slot_penalties[0].activeEntries().len);
+    try std.testing.expectEqual(@as(u32, 0), br.slot_penalties[0].activeEntries()[0].token_id);
+    try std.testing.expectEqual(@as(u32, 2), br.slot_penalties[0].activeEntries()[0].count);
+
+    // `prefillSlotCallback` must NOT double-record prompt tokens and must zero `chunk_eff.temperature = 0.0`.
+    const pchunk: aminfer.batch_scheduler.PrefillChunkView = .{
+        .slot_id = 0,
+        .request_id = 2,
+        .user_tag = 0,
+        .tokens = out_tokens[0..tok_res.prompt_len],
+        .start_pos = 0,
+        .total_prompt_len = 2,
+        .is_final_chunk = true,
+        .prefix_handle = 0,
+        .temperature = 0.7,
+        .rng = &rng,
+        .ngram_domain = "",
+    };
+    _ = try BatchServeRunner.prefillSlotCallback(&br, &pchunk);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), rec.last_prefill_temp, 1e-6);
+    try std.testing.expectEqual(@as(u32, 2), br.slot_penalties[0].activeEntries()[0].count);
+
+    // Penalty logit adjustment: seen token 0 has raw logit 4.0 -> penalized 4.0/2.0 - 1.5 = 0.5,
+    // so unseen runner-up token 1 (logit 3.0) MUST win over token 0 and be recorded into `slot_penalties[0]`!
+    const logits = [_]f16{ @floatCast(@as(f32, 4.0)), @floatCast(@as(f32, 3.0)), @floatCast(@as(f32, -2.0)), @floatCast(@as(f32, -2.0)) };
+    const chosen = br.sampleSlotConstrained(0, &logits) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), chosen);
+    try std.testing.expectEqual(@as(usize, 2), br.slot_penalties[0].activeEntries().len);
+
+    // `stepDecodeBatchCallback` must zero `view.temperatures` for constrained slots before invoking inner backend.
+    const sids = [_]u16{0};
+    const rids = [_]u64{2};
+    const utags = [_]u64{0};
+    const in_t = [_]u32{chosen};
+    const spos = [_]u32{2};
+    const temps = [_]f32{0.8};
+    const rngs = [_]*aminfer.rng.RequestRng{&rng};
+    const ndoms = [_][]const u8{""};
+    const phs = [_]u64{0};
+    const view: aminfer.batch_scheduler.BatchStepView = .{
+        .slot_ids = &sids,
+        .request_ids = &rids,
+        .user_tags = &utags,
+        .input_tokens = &in_t,
+        .seq_positions = &spos,
+        .temperatures = &temps,
+        .rngs = &rngs,
+        .ngram_domains = &ndoms,
+        .prefix_handles = &phs,
+    };
+    var next_out = [_]u32{99};
+    try BatchServeRunner.stepDecodeBatchCallback(&br, &view, &next_out);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), rec.last_decode_temp, 1e-6);
+
+    // `releaseSlotCallback` clears per-slot penalty state completely.
+    BatchServeRunner.releaseSlotCallback(&br, 0, 0);
+    try std.testing.expect(!br.slot_constraints[0].active);
+    try std.testing.expectEqual(@as(usize, 0), br.slot_penalties[0].activeEntries().len);
+
+    // 3. `lookupPrefixFn == null` fallback records prompt chunks inside `prefillSlotCallback`.
+    var rec2 = RecordingBackend{};
+    const backend_no_lookup: aminfer.batch_scheduler.BatchBackend = .{
+        .ctx = &rec2,
+        .lookupPrefixFn = null,
+        .prefillSlotFn = RecordingBackend.prefill,
+        .stepDecodeBatchFn = RecordingBackend.decode,
+        .releaseSlotFn = RecordingBackend.release,
+    };
+    var br2 = try BatchServeRunner.init(gpa, backend_no_lookup, null, &tok, tpl, null, null, 64);
+    defer br2.deinit(gpa);
+    _ = try BatchServeRunner.tokenizeWithBoundaryCallback(&br2, &pen_job, &out_tokens);
+    _ = try BatchServeRunner.prefillSlotCallback(&br2, &pchunk);
+    try std.testing.expect(br2.slot_constraints[0].prompt_recorded);
+    try std.testing.expectEqual(@as(usize, 1), br2.slot_penalties[0].activeEntries().len);
+    try std.testing.expectEqual(@as(u32, 2), br2.slot_penalties[0].activeEntries()[0].count);
+}
+
+test "M8.15 W8 decode --dump-router-trace CLI parsing, router-trace alignment, and C20 chat CLI forwarding" {
+    const dec_space = try parseDecodeArgs(&.{
+        "-m",                  "moe.amf",
+        "-p",                  "hello",
+        "--dump-router-trace", "/tmp/router_trace.jsonl",
+    });
+    try std.testing.expectEqualStrings("/tmp/router_trace.jsonl", dec_space.dump_router_trace_path.?);
+
+    const dec_eq = try parseDecodeArgs(&.{
+        "-m",                                       "moe.amf",
+        "-p",                                       "hello",
+        "--dump-router-trace=/tmp/router_eq.jsonl",
+    });
+    try std.testing.expectEqualStrings("/tmp/router_eq.jsonl", dec_eq.dump_router_trace_path.?);
+
+    try std.testing.expectError(error.MissingFlagValue, parseDecodeArgs(&.{ "-m", "moe.amf", "--dump-router-trace" }));
+    try std.testing.expectError(error.InvalidFlagValue, parseDecodeArgs(&.{ "-m", "moe.amf", "--dump-router-trace", "" }));
+    try std.testing.expectError(error.InvalidFlagValue, parseDecodeArgs(&.{ "-m", "moe.amf", "--dump-router-trace=" }));
+
+    // Verify W8 per-layer router trace stride (64 B = MAX_TOP_K * u32) and 16 KiB Apple page alignment.
+    try std.testing.expectEqual(@as(usize, 64), @as(usize, aminfer.moe.MAX_TOP_K) * @sizeOf(u32));
+    try std.testing.expectEqual(@as(usize, 16384), aminfer.page.APPLE_PAGE_SIZE);
+    try std.testing.expectEqual(@as(usize, 0), aminfer.page.APPLE_PAGE_SIZE % 64);
+
+    // Verify C20 sampling/penalty flags forward cleanly through `parseChatCliArgs`.
+    const chat_def = try parseChatCliArgs(&.{ "-m", "m.amf" });
+    try std.testing.expectEqual(@as(u32, 40), chat_def.chat_cfg.top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.95), chat_def.chat_cfg.top_p, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), chat_def.chat_cfg.min_p, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.05), chat_def.chat_cfg.repetition_penalty, 1e-6);
+
+    const chat_greedy = try parseChatCliArgs(&.{ "-m", "m.amf", "-t", "0" });
+    const greedy_sp: aminfer.sampling.SamplingParams = .{
+        .temperature = chat_greedy.chat_cfg.temperature,
+        .top_k = chat_greedy.chat_cfg.top_k,
+        .top_p = chat_greedy.chat_cfg.top_p,
+        .min_p = chat_greedy.chat_cfg.min_p,
+        .repetition_penalty = chat_greedy.chat_cfg.repetition_penalty,
+        .presence_penalty = chat_greedy.chat_cfg.presence_penalty,
+        .frequency_penalty = chat_greedy.chat_cfg.frequency_penalty,
+    };
+    try std.testing.expect(greedy_sp.isUnconstrainedGreedy());
+
+    const chat_pen = try parseChatCliArgs(&.{
+        "-m",                   "m.amf",
+        "-t",                   "0",
+        "--repetition-penalty", "1.12",
+        "--presence-penalty",   "0.3",
+        "--frequency-penalty",  "0.2",
+        "--top-k",              "32",
+        "--top-p",              "0.9",
+        "--min-p",              "0.04",
+    });
+    const pen_sp: aminfer.sampling.SamplingParams = .{
+        .temperature = chat_pen.chat_cfg.temperature,
+        .top_k = chat_pen.chat_cfg.top_k,
+        .top_p = chat_pen.chat_cfg.top_p,
+        .min_p = chat_pen.chat_cfg.min_p,
+        .repetition_penalty = chat_pen.chat_cfg.repetition_penalty,
+        .presence_penalty = chat_pen.chat_cfg.presence_penalty,
+        .frequency_penalty = chat_pen.chat_cfg.frequency_penalty,
+    };
+    try std.testing.expect(pen_sp.hasPenalties());
+    try std.testing.expect(!pen_sp.isUnconstrainedGreedy());
 }

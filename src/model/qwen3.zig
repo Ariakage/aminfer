@@ -433,6 +433,10 @@ pub const LoadOptions = struct {
     enable_ane_predictor: bool = true,
     /// Optional offline W7 `.mlpackage`/`.mlmodelc` path for all-layers ANE expert predictor.
     ane_predictor_path: ?[:0]const u8 = null,
+    /// Carves per-layer `scratch_topk_experts` capture slots (`num_layers * 64 B`) so
+    /// single-frame `stepDecode` exposes exact multi-layer GPU router top-K selections
+    /// via `lastStepRouterTopK(layer)` for `W8` `--dump-router-trace`.
+    enable_router_trace: bool = false,
 
     // M4 Hybrid ANE/GPU Wavefront Prefill (A1, A3, G6, ADR-0010)
     /// Prompt prefill mode (`auto`, `gpu`, `hybrid`).
@@ -1020,6 +1024,9 @@ pub const Qwen3Model = struct {
     moe_ws: ?moe.MoeWorkspace,
     layer_sched_hdr_base_off: u64,
     layer_sched_hdr_raw: []u8,
+    router_trace_enabled: bool = false,
+    router_trace_base_off: u64 = 0,
+    router_trace_host: []u32 = &.{},
     pred_topk_base_off: u64,
     pred_topk_layer_stride: u64,
     pred_topk_host: []u32,
@@ -1580,6 +1587,17 @@ pub const Qwen3Model = struct {
     /// returns the argmax next token ID.
     pub fn stepDecode(self: *Qwen3Model, token_id: u32, pos: u32) StepError!u32 {
         return self.runStep(token_id, pos, false);
+    }
+
+    /// Returns the exact `top_k` expert IDs routed on `layer_idx` during the most
+    /// recent `stepDecode` when `LoadOptions.enable_router_trace == true`.
+    pub fn lastStepRouterTopK(self: *const Qwen3Model, layer_idx: usize) ?[]const u32 {
+        if (!self.router_trace_enabled or self.config.arch != .qwen3_moe) return null;
+        if (layer_idx >= self.layers.len) return null;
+        const top_k: usize = self.config.num_experts_per_tok;
+        const base = layer_idx * moe.MAX_TOP_K;
+        if (base + top_k > self.router_trace_host.len) return null;
+        return self.router_trace_host[base .. base + top_k];
     }
 
     fn kvTileAt(self: *const Qwen3Model, layer_idx: usize, chunk_idx: usize) struct { k: metal.KvTile, v: metal.KvTile } {
@@ -2404,13 +2422,16 @@ pub const Qwen3Model = struct {
             // FFN + residual add into x.
             switch (self.config.arch) {
                 .qwen3_moe => {
-                    const ws = &(self.moe_ws.?);
+                    var layer_ws = self.moe_ws.?;
+                    if (self.router_trace_enabled) {
+                        layer_ws.scratch_topk_experts_off = self.router_trace_base_off + @as(u64, l) * 64;
+                    }
                     const moe_args: moe.MoELayerArgs = .{
                         .x = self.x_norm_bind,
                         .router = layer.router,
                         .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
                         .expert_table = layer.expert_table,
-                        .workspace = ws,
+                        .workspace = &layer_ws,
                         .workspace_buf = self.scratch_buf,
                         .residual = self.x_bind,
                         .out = self.x_bind,
@@ -2592,13 +2613,16 @@ pub const Qwen3Model = struct {
             switch (self.config.arch) {
                 .qwen3_moe => {
                     const f = try self.ensureOptionalFrame(&frame_opt);
-                    const ws = &(self.moe_ws.?);
+                    var layer_ws = self.moe_ws.?;
+                    if (self.router_trace_enabled) {
+                        layer_ws.scratch_topk_experts_off = self.router_trace_base_off + @as(u64, l) * 64;
+                    }
                     const moe_args: moe.MoELayerArgs = .{
                         .x = self.x_norm_bind,
                         .router = layer.router,
                         .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
                         .expert_table = layer.expert_table,
-                        .workspace = ws,
+                        .workspace = &layer_ws,
                         .workspace_buf = self.scratch_buf,
                         .residual = self.x_bind,
                         .out = self.x_bind,
@@ -4489,6 +4513,7 @@ pub const Qwen3Model = struct {
         x_norm_f16: []const f16,
         x_residual_io: []f16,
         m: u32,
+        trace_out: ?[]u32,
     ) StepError!u32 {
         const srt = self.sme_rt.?;
         const experts = layer.expert_sme_blobs.?;
@@ -4544,6 +4569,12 @@ pub const Qwen3Model = struct {
                 tok_top_e[r][j] = best_e[j];
                 tok_top_w[r][j] = best_p[j];
                 used_mask.set(best_e[j]);
+            }
+        }
+        if (m_u == 1) {
+            if (trace_out) |dst| {
+                const n_copy = @min(top_k, dst.len);
+                @memcpy(dst[0..n_copy], tok_top_e[0][0..n_copy]);
             }
         }
 
@@ -4781,21 +4812,28 @@ pub const Qwen3Model = struct {
 
             switch (self.config.arch) {
                 .qwen3_moe => {
-                    const ws = &(self.moe_ws.?);
+                    var layer_ws = self.moe_ws.?;
+                    if (self.router_trace_enabled) {
+                        layer_ws.scratch_topk_experts_off = self.router_trace_base_off + @as(u64, l) * 64;
+                    }
                     const router_src: moe.RouterSource = if (layer.router_layout == .sme2_panel64) blk: {
                         try self.flushOptionalFrame(&frame_opt);
-                        try self.runRouterSme2(layer, self.x_norm_host, ws.router_logits, 1);
-                        break :blk .{ .logits = .{ .binding = ws.routerLogitsBinding(self.scratch_buf), .dtype = .f32 } };
+                        try self.runRouterSme2(layer, self.x_norm_host, layer_ws.router_logits, 1);
+                        break :blk .{ .logits = .{ .binding = layer_ws.routerLogitsBinding(self.scratch_buf), .dtype = .f32 } };
                     } else layer.router;
 
                     if (layer.expert_layout == .sme2_panel64) {
                         if (layer.router_layout == .row_major) {
                             const had = (frame_opt != null);
                             const f = try self.ensureOptionalFrame(&frame_opt);
-                            try self.encodeLayerRouter(f, l, ws, self.scratch_buf, self.x_norm_bind, 1, had);
+                            try self.encodeLayerRouter(f, l, &layer_ws, self.scratch_buf, self.x_norm_bind, 1, had);
                             try self.flushOptionalFrame(&frame_opt);
                         }
-                        _ = try self.runMoeExpertsSme2(layer, ws.router_logits, self.x_norm_host, self.x_host, 1);
+                        const trace_dst: ?[]u32 = if (self.router_trace_enabled)
+                            self.router_trace_host[l * moe.MAX_TOP_K ..][0..self.config.num_experts_per_tok]
+                        else
+                            null;
+                        _ = try self.runMoeExpertsSme2(layer, layer_ws.router_logits, self.x_norm_host, self.x_host, 1, trace_dst);
                     } else {
                         const had = (frame_opt != null);
                         const f = try self.ensureOptionalFrame(&frame_opt);
@@ -4804,7 +4842,7 @@ pub const Qwen3Model = struct {
                             .router = router_src,
                             .weights_base = .{ .buffer = layer.expert_weights_buf, .offset = 0 },
                             .expert_table = layer.expert_table,
-                            .workspace = ws,
+                            .workspace = &layer_ws,
                             .workspace_buf = self.scratch_buf,
                             .residual = self.x_bind,
                             .out = self.x_bind,
@@ -5005,7 +5043,7 @@ pub const Qwen3Model = struct {
                             try self.encodeLayerRouter(f, l, &layer_ws, self.scratch_buf, self.x_norm_bind, m, had);
                             try self.flushOptionalFrame(&frame_opt);
                         }
-                        const uniq = try self.runMoeExpertsSme2(layer, layer_ws.router_logits, self.x_norm_host, self.x_host, m);
+                        const uniq = try self.runMoeExpertsSme2(layer, layer_ws.router_logits, self.x_norm_host, self.x_host, m, null);
                         const hdr: *moe.ScheduleHeader = @ptrCast(@alignCast(self.layer_sched_hdr_raw.ptr + l * 64));
                         hdr.num_unique_experts = uniq;
                         total_unique += uniq;
@@ -5611,6 +5649,10 @@ pub const Qwen3Model = struct {
 
             // Pin active experts for layer `l` and update `expert_table_host` offsets.
             const prep = try self.prepareColdLayerExperts(crt, l, ws, self.scratch_buf, self.x_norm_bind, 1);
+            if (self.router_trace_enabled) {
+                const tk: usize = self.config.num_experts_per_tok;
+                @memcpy(self.router_trace_host[l * moe.MAX_TOP_K ..][0..tk], ws.scratch_topk_experts[0..tk]);
+            }
 
             // Frame `l + 1`: layer `l` MoE FFN + aux tap + layer `l + 1` attn/router (or head).
             var frame = try self.compute.beginFrame(self.timeout_ms);
@@ -9274,6 +9316,13 @@ fn loadCore(
         num_layers * 64
     else
         0;
+    comptime {
+        std.debug.assert(moe.MAX_TOP_K * @sizeOf(u32) == 64);
+    }
+    const router_trace_bytes: usize = if (config.arch == .qwen3_moe and options.enable_router_trace)
+        num_layers * 64
+    else
+        0;
     const pred_sampled_layers: usize = if (config.arch == .qwen3_moe and tree_enabled)
         @min(num_layers, MAX_EXPERT_PRED_LAYERS)
     else
@@ -9360,6 +9409,7 @@ fn loadCore(
         num_layers * expert_tbl_per_layer +
         num_layers * expert_schemes_per_layer +
         layer_sched_hdr_bytes +
+        router_trace_bytes +
         8 * page.APPLE_PAGE_SIZE;
     const scratch_arena_bytes = try page.alignUp(aliased_block_bytes + non_aliased_raw);
 
@@ -9913,6 +9963,15 @@ fn loadCore(
         layer_sched_hdr_base_off = scratch_arena.offsetOf(layer_sched_hdr_raw.ptr);
     }
 
+    var router_trace_base_off: u64 = 0;
+    var router_trace_host: []u32 = &.{};
+    if (router_trace_bytes > 0) {
+        const rt_raw = try scratch_arena.allocAligned(router_trace_bytes, 64);
+        @memset(rt_raw, 0);
+        router_trace_base_off = scratch_arena.offsetOf(rt_raw.ptr);
+        router_trace_host = @alignCast(std.mem.bytesAsSlice(u32, rt_raw));
+    }
+
     // --- 8. Load global weight blobs into shard 0 (zero-duplicate tied lm_head) ---
     const embed_shard_idx: u16 = @intCast(group_shard[0]);
     const g_shard = &shards[embed_shard_idx];
@@ -10404,6 +10463,9 @@ fn loadCore(
         .moe_ws = moe_ws,
         .layer_sched_hdr_base_off = layer_sched_hdr_base_off,
         .layer_sched_hdr_raw = layer_sched_hdr_raw,
+        .router_trace_enabled = (router_trace_bytes > 0),
+        .router_trace_base_off = router_trace_base_off,
+        .router_trace_host = router_trace_host,
         .pred_topk_base_off = pred_topk_base_off,
         .pred_topk_layer_stride = pred_topk_layer_stride,
         .pred_topk_host = pred_topk_host,
@@ -16452,4 +16514,68 @@ test "M7.5 W18+W19+C21 Qwen3Model single-file metadata, multi-LoRA single/batch 
         slot1_vs_slot0 = @max(slot1_vs_slot0, @abs(@as(f32, @floatCast(row1[v])) - @as(f32, @floatCast(row0[v]))));
     }
     try std.testing.expect(slot1_vs_slot0 > 1e-3);
+}
+
+test "M8.15 W8 enable_router_trace captures exact per-layer GPU top-K routing with 64B alignment" {
+    const gpa = std.testing.allocator;
+    const cfg: ModelConfig = .{
+        .arch = .qwen3_moe,
+        .quant_bits = .q3,
+        .vocab_size = 256,
+        .hidden_size = 128,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .moe_intermediate_size = 128,
+        .num_experts = 8,
+        .num_experts_per_tok = 2,
+        .norm_topk_prob = true,
+    };
+
+    const image = try buildSyntheticAmfImage(gpa, cfg, false, 73);
+    defer gpa.free(image);
+
+    var ref_model = try Qwen3Model.loadFromBytes(gpa, image, cfg, .{
+        .max_seq_len = 32,
+        .enable_router_trace = false,
+    });
+    defer ref_model.deinit(gpa);
+    try std.testing.expect(!ref_model.router_trace_enabled);
+    try std.testing.expectEqual(@as(usize, 0), ref_model.router_trace_host.len);
+    try std.testing.expect(ref_model.lastStepRouterTopK(0) == null);
+
+    var traced = try Qwen3Model.loadFromBytes(gpa, image, cfg, .{
+        .max_seq_len = 32,
+        .enable_router_trace = true,
+    });
+    defer traced.deinit(gpa);
+    try std.testing.expect(traced.router_trace_enabled);
+    try std.testing.expectEqual(@as(u64, 0), traced.router_trace_base_off % 64);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(traced.router_trace_host.ptr) % 64);
+    try std.testing.expectEqual(@as(usize, cfg.num_hidden_layers) * moe.MAX_TOP_K, traced.router_trace_host.len);
+    try std.testing.expect(traced.lastStepRouterTopK(cfg.num_hidden_layers) == null);
+
+    const ref_hidden = try gpa.alloc(f16, @as(usize, cfg.num_hidden_layers) * cfg.hidden_size);
+    defer gpa.free(ref_hidden);
+    const ref_topk = try gpa.alloc(u32, @as(usize, cfg.num_hidden_layers) * cfg.num_experts_per_tok);
+    defer gpa.free(ref_topk);
+
+    var tok: u32 = 19;
+    for (0..3) |step_idx| {
+        const pos: u32 = @intCast(step_idx);
+        const ref_next = try ref_model.stepDecodeCaptureLayerRouting(tok, pos, ref_hidden, ref_topk);
+        const traced_next = try traced.stepDecode(tok, pos);
+        try std.testing.expectEqual(ref_next, traced_next);
+
+        for (0..cfg.num_hidden_layers) |l| {
+            const got = traced.lastStepRouterTopK(l) orelse return error.TestUnexpectedResult;
+            const exp = ref_topk[l * cfg.num_experts_per_tok .. (l + 1) * cfg.num_experts_per_tok];
+            try std.testing.expectEqualSlices(u32, exp, got);
+            for (got) |eid| {
+                try std.testing.expect(eid < cfg.num_experts);
+            }
+        }
+        tok = traced_next;
+    }
 }

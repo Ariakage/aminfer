@@ -195,6 +195,10 @@ pub const QualityGatePairResult = struct {
     math_greedy_matches: u32 = 0,
     code_greedy_steps: u32 = 0,
     code_greedy_matches: u32 = 0,
+    reasoning_greedy_steps: u32 = 0,
+    reasoning_greedy_matches: u32 = 0,
+    cand_max_4gram_repeats: u32 = 0,
+    repetition_loop_detected: bool = false,
     tokenizer_resolved: bool = false,
     all_finite: bool = true,
     executed: bool = false,
@@ -255,7 +259,7 @@ pub const QualityGateReport = struct {
         }
         if (self.file_pair) |*fp| {
             try w.print(
-                "quality_gate.real.{s:<21} status={s} mean_kl={d:.6} max_kl={d:.6} top1={d:.1}% ({d}/{d}) greedy={d}/{d} math={d}/{d} code={d}/{d} tok={s} act_quant={s} finite={s}\n",
+                "quality_gate.real.{s:<21} status={s} mean_kl={d:.6} max_kl={d:.6} top1={d:.1}% ({d}/{d}) greedy={d}/{d} math={d}/{d} code={d}/{d} reason={d}/{d} max_4gram={d} loop={s} tok={s} act_quant={s} finite={s}\n",
                 .{
                     fp.label(),
                     fp.status,
@@ -270,6 +274,10 @@ pub const QualityGateReport = struct {
                     fp.math_greedy_steps,
                     fp.code_greedy_matches,
                     fp.code_greedy_steps,
+                    fp.reasoning_greedy_matches,
+                    fp.reasoning_greedy_steps,
+                    fp.cand_max_4gram_repeats,
+                    if (fp.repetition_loop_detected) "yes" else "no",
                     if (fp.tokenizer_resolved) "resolved" else "fallback",
                     fp.act_quant.label(),
                     if (fp.all_finite) "yes" else "no",
@@ -278,6 +286,68 @@ pub const QualityGateReport = struct {
         }
     }
 };
+
+/// Returns the highest occurrence count of any contiguous `n`-gram inside `tokens`.
+/// Zero dynamic heap allocation (`O(tokens.len^2)` over bounded evaluation rollouts).
+pub fn computeMaxNgramRepeatCount(tokens: []const u32, comptime n: usize) u32 {
+    comptime {
+        if (n == 0) @compileError("n must be >= 1");
+    }
+    if (tokens.len < n) return 0;
+    const windows = tokens.len - n + 1;
+    var best: u32 = 1;
+    for (0..windows) |i| {
+        const needle = tokens[i .. i + n];
+        var cnt: u32 = 1;
+        var j: usize = i + 1;
+        while (j < windows) : (j += 1) {
+            if (std.mem.eql(u32, needle, tokens[j .. j + n])) {
+                cnt += 1;
+            }
+        }
+        if (cnt > best) best = cnt;
+    }
+    return best;
+}
+
+/// Detects degenerate repetition lock-in on `cand_tokens` relative to `ref_tokens`:
+/// flags a loop if any 4-gram repeats `>= 3` times (and exceeds reference by `>= 2`),
+/// or if `>= 6` identical consecutive tokens appear when absent from reference.
+pub fn hasDegenerateRepetitionLoop(ref_tokens: []const u32, cand_tokens: []const u32) bool {
+    const cand_4g = computeMaxNgramRepeatCount(cand_tokens, 4);
+    const ref_4g = computeMaxNgramRepeatCount(ref_tokens, 4);
+    if (cand_4g >= 3 and cand_4g >= ref_4g + 2) return true;
+    const cand_1g_run: u32 = blk: {
+        if (cand_tokens.len == 0) break :blk 0;
+        var best_run: u32 = 1;
+        var cur_run: u32 = 1;
+        for (1..cand_tokens.len) |i| {
+            if (cand_tokens[i] == cand_tokens[i - 1]) {
+                cur_run += 1;
+                if (cur_run > best_run) best_run = cur_run;
+            } else {
+                cur_run = 1;
+            }
+        }
+        break :blk best_run;
+    };
+    const ref_1g_run: u32 = blk: {
+        if (ref_tokens.len == 0) break :blk 0;
+        var best_run: u32 = 1;
+        var cur_run: u32 = 1;
+        for (1..ref_tokens.len) |i| {
+            if (ref_tokens[i] == ref_tokens[i - 1]) {
+                cur_run += 1;
+                if (cur_run > best_run) best_run = cur_run;
+            } else {
+                cur_run = 1;
+            }
+        }
+        break :blk best_run;
+    };
+    if (cand_1g_run >= 6 and cand_1g_run >= ref_1g_run + 4) return true;
+    return false;
+}
 
 // ============================================================================
 // Deterministic Multi-Format Synthetic `.amf` Builder (Zero Double-Quant)
@@ -1057,20 +1127,24 @@ pub fn runFileQualityGate(
     }
 
     const cfg = try qwen3.ModelConfig.fromJson(allocator, cfg_meta.bytes);
-    const steps: u32 = @max(@as(u32, 1), @min(steps_in, 16));
-    const seq_cap: u32 = @min(cfg.max_position_embeddings, @max(max_seq_len, 64));
+    const steps: u32 = @max(@as(u32, 1), @min(steps_in, 48));
+    const seq_cap: u32 = @min(cfg.max_position_embeddings, @max(max_seq_len, 128));
 
-    // Resolve deterministic multi-prompt math + code eval tokens (via explicit `-k`,
-    // embedded `__meta.tokenizer_json`, or sidecar `tokenizer.json` before fallback).
+    // Resolve deterministic multi-prompt math + code + conceptual reasoning eval tokens
+    // (via explicit `-k`, embedded `__meta.tokenizer_json`, or sidecar `tokenizer.json`).
     var owned_math_prompt: ?[]u32 = null;
     defer if (owned_math_prompt) |op| allocator.free(op);
     var owned_code_prompt: ?[]u32 = null;
     defer if (owned_code_prompt) |op| allocator.free(op);
+    var owned_reason_prompt: ?[]u32 = null;
+    defer if (owned_reason_prompt) |op| allocator.free(op);
 
     const fallback_math = [_]u32{ 1, 17, 23, 42, 100 };
     const fallback_code = [_]u32{ 2, 11, 29, 53, 89 };
+    const fallback_reason = [_]u32{ 3, 13, 31, 61, 97 };
     var math_slice: []const u32 = explicit_tokens orelse &fallback_math;
     var code_slice: []const u32 = explicit_tokens orelse &fallback_code;
+    var reason_slice: []const u32 = explicit_tokens orelse &fallback_reason;
 
     if (explicit_tokens == null) {
         if (tok_meta_opt) |tm| {
@@ -1080,7 +1154,7 @@ pub fn runFileQualityGate(
                 res.tokenizer_resolved = true;
                 var scratch = try tokenizer_mod.EncodeScratch.init(allocator, 4096);
                 defer scratch.deinit(allocator);
-                var ids_buf: [64]u32 = undefined;
+                var ids_buf: [96]u32 = undefined;
                 const math_text = "Compute 17 * 23 = ";
                 if (tok.encodeWithScratch(&scratch, math_text, &ids_buf)) |encoded| {
                     if (encoded.len > 0) {
@@ -1105,6 +1179,18 @@ pub fn runFileQualityGate(
                     error.OutOfMemory => return error.OutOfMemory,
                     else => {},
                 }
+                const reason_text = "The Riemann zeta function zeta(s) has a simple pole at s = 1 and its nontrivial zeros are conjectured to satisfy Re(s) = ";
+                if (tok.encodeWithScratch(&scratch, reason_text, &ids_buf)) |encoded| {
+                    if (encoded.len > 0) {
+                        const copy = try allocator.alloc(u32, encoded.len);
+                        @memcpy(copy, encoded);
+                        owned_reason_prompt = copy;
+                        reason_slice = copy;
+                    }
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                }
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {},
@@ -1112,17 +1198,28 @@ pub fn runFileQualityGate(
         }
     }
 
-    const math_steps: u32 = if (explicit_tokens != null or steps == 1) steps else (steps + 1) / 2;
-    const code_steps: u32 = steps - math_steps;
-    const prompt_slices = [_][]const u32{ math_slice, code_slice };
-    const prompt_steps = [_]u32{ math_steps, code_steps };
-    const prompt_count: usize = if (code_steps > 0) 2 else 1;
+    var math_steps: u32 = steps;
+    var code_steps: u32 = 0;
+    var reason_steps: u32 = 0;
+    if (explicit_tokens == null and steps >= 3) {
+        math_steps = (steps + 2) / 3;
+        code_steps = (steps - math_steps + 1) / 2;
+        reason_steps = steps - math_steps - code_steps;
+    } else if (explicit_tokens == null and steps == 2) {
+        math_steps = 1;
+        code_steps = 1;
+    }
+    const prompt_slices = [_][]const u32{ math_slice, code_slice, reason_slice };
+    const prompt_steps = [_]u32{ math_steps, code_steps, reason_steps };
+    const prompt_count: usize = if (reason_steps > 0) 3 else if (code_steps > 0) 2 else 1;
 
     const vocab: usize = cfg.vocab_size;
     const ref_logits_all = try allocator.alloc(f32, @as(usize, steps) * vocab);
     defer allocator.free(ref_logits_all);
     const ref_greedy = try allocator.alloc(u32, steps);
     defer allocator.free(ref_greedy);
+    const cand_greedy = try allocator.alloc(u32, steps);
+    defer allocator.free(cand_greedy);
 
     // Phase 1: Load reference, record teacher-forced logits & greedy rollouts across
     // math + code prompts, then DEINIT immediately!
@@ -1178,6 +1275,9 @@ pub fn runFileQualityGate(
         var greedy_matches: u32 = 0;
         var math_matches: u32 = 0;
         var code_matches: u32 = 0;
+        var reason_matches: u32 = 0;
+        var max_4gram_rep: u32 = 0;
+        var loop_detected = false;
         var all_finite = true;
         const cand_tmp = try allocator.alloc(f32, vocab);
         defer allocator.free(cand_tmp);
@@ -1209,7 +1309,7 @@ pub fn runFileQualityGate(
                 }
             }
 
-            // Free-running greedy rollout parity on this prompt.
+            // Free-running greedy rollout parity + n-gram loop detection on this prompt.
             cand_model.resetKvCache();
             pos = 0;
             var free_tok: u32 = pslice[0];
@@ -1219,17 +1319,27 @@ pub fn runFileQualityGate(
             }
             var p_greedy: u32 = 0;
             for (0..psteps) |s| {
+                cand_greedy[step_off + s] = free_tok;
                 if (free_tok == ref_greedy[step_off + s]) p_greedy += 1;
                 if (s + 1 < psteps) {
                     free_tok = try cand_model.stepDecode(free_tok, pos);
                     pos += 1;
                 }
             }
+            const ref_seg = ref_greedy[step_off .. step_off + psteps];
+            const cand_seg = cand_greedy[step_off .. step_off + psteps];
+            const seg_4g = computeMaxNgramRepeatCount(cand_seg, 4);
+            if (seg_4g > max_4gram_rep) max_4gram_rep = seg_4g;
+            if (hasDegenerateRepetitionLoop(ref_seg, cand_seg)) {
+                loop_detected = true;
+            }
             greedy_matches += p_greedy;
             if (pi == 0) {
                 math_matches = p_greedy;
-            } else {
+            } else if (pi == 1) {
                 code_matches = p_greedy;
+            } else {
+                reason_matches = p_greedy;
             }
             step_off += psteps;
         }
@@ -1245,9 +1355,13 @@ pub fn runFileQualityGate(
         res.math_greedy_matches = math_matches;
         res.code_greedy_steps = code_steps;
         res.code_greedy_matches = code_matches;
+        res.reasoning_greedy_steps = reason_steps;
+        res.reasoning_greedy_matches = reason_matches;
+        res.cand_max_4gram_repeats = max_4gram_rep;
+        res.repetition_loop_detected = loop_detected;
         res.all_finite = all_finite;
         res.executed = true;
-        res.status = "ok";
+        res.status = if (loop_detected) "fail_repetition_loop" else "ok";
     }
 
     return res;
@@ -2582,4 +2696,18 @@ test "m81: runM81WithConfig and W24 KL quality gate verify all 5 M8.1 tracks wit
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "bench.m81.g23.gemv.nvfp4_g16") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "quality_gate.synth.fp8_e4m3_block") != null);
+}
+
+test "W24 quality-gate n-gram repetition loop detector flags degenerate candidate loops" {
+    const clean_ref = [_]u32{ 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 };
+    const clean_cand = [_]u32{ 10, 11, 12, 13, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35 };
+    try std.testing.expectEqual(@as(u32, 1), computeMaxNgramRepeatCount(&clean_cand, 4));
+    try std.testing.expect(!hasDegenerateRepetitionLoop(&clean_ref, &clean_cand));
+
+    const looped_cand = [_]u32{ 10, 11, 50, 51, 52, 53, 50, 51, 52, 53, 50, 51, 52, 53, 99, 100 };
+    try std.testing.expectEqual(@as(u32, 3), computeMaxNgramRepeatCount(&looped_cand, 4));
+    try std.testing.expect(hasDegenerateRepetitionLoop(&clean_ref, &looped_cand));
+
+    const stutter_cand = [_]u32{ 10, 11, 77, 77, 77, 77, 77, 77, 12, 13 };
+    try std.testing.expect(hasDegenerateRepetitionLoop(&clean_ref, &stutter_cand));
 }

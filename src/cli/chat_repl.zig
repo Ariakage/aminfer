@@ -61,6 +61,12 @@ pub const HELP_TEXT: []const u8 =
     \\  -s, --system <prompt>           System prompt (default: "You are a helpful assistant.")
     \\  -n, --max-tokens <n>            Max generated tokens per turn (default: 1024)
     \\  -t, --temperature <f>           Sampling temperature (default: 0.6)
+    \\      --top-k <n>                 Top-k sampling cutoff, 0 = disabled (default: 40)
+    \\      --top-p <f>                 Nucleus sampling cutoff in (0, 1] (default: 0.95)
+    \\      --min-p <f>                 Min-p relative cutoff in [0, 1) (default: 0.05)
+    \\      --repetition-penalty <f>    Repetition penalty > 0 (default: 1.05 when T>0, 1.0 when T=0)
+    \\      --presence-penalty <f>      OpenAI additive presence penalty (default: 0.0)
+    \\      --frequency-penalty <f>     OpenAI additive frequency penalty (default: 0.0)
     \\      --seed <u64>                Deterministic RNG seed
     \\  -N, --no-think                  Request non-thinking turn prefill
     \\      --reasoning-effort <level>  Reasoning effort (none|minimal|low|medium|high|xhigh|max|0..0.99)
@@ -128,6 +134,12 @@ pub const ChatConfig = struct {
     system_prompt: []const u8 = "You are a helpful assistant.",
     max_tokens: u32 = 1024,
     temperature: f32 = 0.6,
+    top_k: u32 = 40,
+    top_p: f32 = 0.95,
+    min_p: f32 = 0.05,
+    repetition_penalty: f32 = 1.05,
+    presence_penalty: f32 = 0.0,
+    frequency_penalty: f32 = 0.0,
     seed: ?u64 = null,
     enable_thinking: bool = true,
     reasoning_effort: ?chat_template.ReasoningEffort = null,
@@ -144,6 +156,7 @@ pub const ChatConfig = struct {
     pub fn parseArgs(args: []const []const u8) Error!ChatConfig {
         var cfg: ChatConfig = .{};
         var explicit_no_think = false;
+        var explicit_rep_penalty = false;
         var explicit_effort: ?chat_template.ReasoningEffort = null;
         var i: usize = 0;
         while (i < args.len) : (i += 1) {
@@ -168,6 +181,54 @@ pub const ChatConfig = struct {
                 if (i >= args.len) return error.MissingCliValue;
                 cfg.temperature = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidCliArgument;
                 if (cfg.temperature < 0.0 or !std.math.isFinite(cfg.temperature)) return error.InvalidCliArgument;
+            } else if (std.mem.eql(u8, arg, "--top-k")) {
+                i += 1;
+                if (i >= args.len) return error.MissingCliValue;
+                cfg.top_k = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidCliArgument;
+            } else if (std.mem.startsWith(u8, arg, "--top-k=")) {
+                cfg.top_k = std.fmt.parseInt(u32, arg["--top-k=".len..], 10) catch return error.InvalidCliArgument;
+            } else if (std.mem.eql(u8, arg, "--top-p")) {
+                i += 1;
+                if (i >= args.len) return error.MissingCliValue;
+                cfg.top_p = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.top_p) or !(cfg.top_p > 0.0) or cfg.top_p > 1.0) return error.InvalidCliArgument;
+            } else if (std.mem.startsWith(u8, arg, "--top-p=")) {
+                cfg.top_p = std.fmt.parseFloat(f32, arg["--top-p=".len..]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.top_p) or !(cfg.top_p > 0.0) or cfg.top_p > 1.0) return error.InvalidCliArgument;
+            } else if (std.mem.eql(u8, arg, "--min-p")) {
+                i += 1;
+                if (i >= args.len) return error.MissingCliValue;
+                cfg.min_p = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.min_p) or cfg.min_p < 0.0 or cfg.min_p >= 1.0) return error.InvalidCliArgument;
+            } else if (std.mem.startsWith(u8, arg, "--min-p=")) {
+                cfg.min_p = std.fmt.parseFloat(f32, arg["--min-p=".len..]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.min_p) or cfg.min_p < 0.0 or cfg.min_p >= 1.0) return error.InvalidCliArgument;
+            } else if (std.mem.eql(u8, arg, "--repetition-penalty")) {
+                i += 1;
+                if (i >= args.len) return error.MissingCliValue;
+                cfg.repetition_penalty = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.repetition_penalty) or !(cfg.repetition_penalty > 0.0)) return error.InvalidCliArgument;
+                explicit_rep_penalty = true;
+            } else if (std.mem.startsWith(u8, arg, "--repetition-penalty=")) {
+                cfg.repetition_penalty = std.fmt.parseFloat(f32, arg["--repetition-penalty=".len..]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.repetition_penalty) or !(cfg.repetition_penalty > 0.0)) return error.InvalidCliArgument;
+                explicit_rep_penalty = true;
+            } else if (std.mem.eql(u8, arg, "--presence-penalty")) {
+                i += 1;
+                if (i >= args.len) return error.MissingCliValue;
+                cfg.presence_penalty = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.presence_penalty)) return error.InvalidCliArgument;
+            } else if (std.mem.startsWith(u8, arg, "--presence-penalty=")) {
+                cfg.presence_penalty = std.fmt.parseFloat(f32, arg["--presence-penalty=".len..]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.presence_penalty)) return error.InvalidCliArgument;
+            } else if (std.mem.eql(u8, arg, "--frequency-penalty")) {
+                i += 1;
+                if (i >= args.len) return error.MissingCliValue;
+                cfg.frequency_penalty = std.fmt.parseFloat(f32, args[i]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.frequency_penalty)) return error.InvalidCliArgument;
+            } else if (std.mem.startsWith(u8, arg, "--frequency-penalty=")) {
+                cfg.frequency_penalty = std.fmt.parseFloat(f32, arg["--frequency-penalty=".len..]) catch return error.InvalidCliArgument;
+                if (!std.math.isFinite(cfg.frequency_penalty)) return error.InvalidCliArgument;
             } else if (std.mem.eql(u8, arg, "--seed")) {
                 i += 1;
                 if (i >= args.len) return error.MissingCliValue;
@@ -221,6 +282,9 @@ pub const ChatConfig = struct {
             } else {
                 return error.InvalidCliArgument;
             }
+        }
+        if (cfg.temperature == 0.0 and !explicit_rep_penalty) {
+            cfg.repetition_penalty = 1.0;
         }
         if (explicit_effort) |eff| {
             if (explicit_no_think and eff.isThinkingEnabled()) return error.InvalidCliArgument;
@@ -300,6 +364,12 @@ pub const TurnRequest = struct {
     attachments: []const AttachmentView,
     max_tokens: u32,
     temperature: f32,
+    top_k: u32 = 0,
+    top_p: f32 = 1.0,
+    min_p: f32 = 0.0,
+    repetition_penalty: f32 = 1.0,
+    presence_penalty: f32 = 0.0,
+    frequency_penalty: f32 = 0.0,
     seed: ?u64,
     enable_thinking: bool,
     reasoning_effort: ?chat_template.ReasoningEffort = null,
@@ -857,6 +927,12 @@ pub const ChatSession = struct {
             .attachments = attach_views[0..attach_count],
             .max_tokens = self.cfg.max_tokens,
             .temperature = self.cfg.temperature,
+            .top_k = self.cfg.top_k,
+            .top_p = self.cfg.top_p,
+            .min_p = self.cfg.min_p,
+            .repetition_penalty = self.cfg.repetition_penalty,
+            .presence_penalty = self.cfg.presence_penalty,
+            .frequency_penalty = self.cfg.frequency_penalty,
             .seed = self.cfg.seed,
             .enable_thinking = effective_enable_thinking,
             .reasoning_effort = self.cfg.reasoning_effort,
@@ -1580,4 +1656,67 @@ test "ChatConfig --reasoning-effort CLI parsing and multi-dialect Inkling 2 / Hy
         hy_runner.captured_prompt[0..hy_runner.captured_len],
     );
     try std.testing.expectEqualStrings("Ok\n", hy_out.buf[0..hy_out.len]);
+}
+
+test "ChatConfig sampling defaults, greedy T=0 parity, and TurnRequest penalty forwarding" {
+    const gpa = std.testing.allocator;
+
+    const def_cfg = try ChatConfig.parseArgs(&.{});
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), def_cfg.temperature, 1e-6);
+    try std.testing.expectEqual(@as(u32, 40), def_cfg.top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.95), def_cfg.top_p, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), def_cfg.min_p, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.05), def_cfg.repetition_penalty, 1e-6);
+
+    const greedy_cfg = try ChatConfig.parseArgs(&.{ "-t", "0" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), greedy_cfg.temperature, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), greedy_cfg.repetition_penalty, 1e-6);
+
+    const greedy_rep_cfg = try ChatConfig.parseArgs(&.{ "-t", "0", "--repetition-penalty", "1.15" });
+    try std.testing.expectApproxEqAbs(@as(f32, 1.15), greedy_rep_cfg.repetition_penalty, 1e-6);
+
+    try std.testing.expectError(error.InvalidCliArgument, ChatConfig.parseArgs(&.{ "--top-p", "0.0" }));
+    try std.testing.expectError(error.InvalidCliArgument, ChatConfig.parseArgs(&.{ "--min-p", "1.0" }));
+    try std.testing.expectError(error.InvalidCliArgument, ChatConfig.parseArgs(&.{ "--repetition-penalty", "0.0" }));
+
+    const CaptureReqRunner = struct {
+        last_top_k: u32 = 0,
+        last_top_p: f32 = 0,
+        last_min_p: f32 = 0,
+        last_rep: f32 = 0,
+        last_pres: f32 = 0,
+        last_freq: f32 = 0,
+        fn runTurn(ctx: *anyopaque, req: *const TurnRequest, stream: *TurnStream) Error!TurnStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.last_top_k = req.top_k;
+            self.last_top_p = req.top_p;
+            self.last_min_p = req.min_p;
+            self.last_rep = req.repetition_penalty;
+            self.last_pres = req.presence_penalty;
+            self.last_freq = req.frequency_penalty;
+            try stream.emitText("Done.");
+            return .{ .prompt_tokens = 4, .generated_tokens = 1 };
+        }
+    };
+    var cap_runner = CaptureReqRunner{};
+    const custom_cfg = try ChatConfig.parseArgs(&.{
+        "--top-k=64",
+        "--top-p=0.9",
+        "--min-p=0.08",
+        "--repetition-penalty=1.12",
+        "--presence-penalty=0.4",
+        "--frequency-penalty=0.25",
+        "--no-stats",
+    });
+    var sess = try ChatSession.init(gpa, custom_cfg);
+    defer sess.deinit(gpa);
+    var out_b = CaptureBuf{};
+    var sum_b = CaptureBuf{};
+    try sess.submitUserTurn("test", .{ .ctx = &cap_runner, .runTurnFn = CaptureReqRunner.runTurn }, out_b.sink(), sum_b.sink());
+    try std.testing.expectEqual(@as(u32, 64), cap_runner.last_top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), cap_runner.last_top_p, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.08), cap_runner.last_min_p, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.12), cap_runner.last_rep, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), cap_runner.last_pres, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), cap_runner.last_freq, 1e-6);
 }
