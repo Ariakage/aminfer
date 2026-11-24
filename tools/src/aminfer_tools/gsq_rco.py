@@ -89,8 +89,12 @@ from aminfer_tools.amf import (
     f32_bytes_to_f32_list,
     is_vision_tensor,
     load_cold_experts_from_heat_profile,
+    pack_mlx_affine_2bit,
     pack_mlx_affine_3bit,
     pack_mlx_affine_4bit,
+    pack_mlx_affine_5bit,
+    pack_mlx_affine_6bit,
+    pack_mlx_affine_8bit,
     pack_sme2_lut16_header,
     pack_sme2_panel64_f16_panel,
     pack_sme2_panel64_q2_from_mlx_panel,
@@ -107,7 +111,17 @@ _F16_PAIR_STRUCT = struct.Struct("<2e")
 _F16_16_STRUCT = struct.Struct("<16e")
 _F16_32_STRUCT = struct.Struct("<32e")
 _F16_MAX = 65504.0
-_QUANT_DTYPES = (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
+_QUANT_DTYPES = (
+    DType.Q2_AFFINE,
+    DType.Q3_AFFINE,
+    DType.Q4_AFFINE,
+    DType.Q5_AFFINE,
+    DType.Q6_AFFINE,
+    DType.Q8_AFFINE,
+)
+_SME2_QUANT_DTYPES = (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
+_LOWBIT_AFFINE_DTYPES = (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
+_SUPPORTED_AFFINE_BITS = (2, 3, 4, 5, 6, 8)
 _DTYPE_BITS_RANK = {
     DType.Q2_AFFINE: 2,
     DType.Q3_AFFINE: 3,
@@ -192,6 +206,112 @@ def _eval_group_with_sb(
     return codes, err2 / n, sum_q, sum_q2, sum_wq
 
 
+def _eval_group_with_sb_weighted(
+    values: Sequence[float],
+    w_norm: Sequence[float],
+    s_h: float,
+    b_h: float,
+    qmax: int,
+) -> tuple[list[int], float, float, float, float]:
+    """Quantize `values` under exact IEEE-f16 `(s_h, b_h)` and compute weighted MSE (`sum(w_norm) == n`)."""
+    n = len(values)
+    inv_n = 1.0 / n
+    if s_h <= 0.0:
+        codes = [0] * n
+        w_err2 = 0.0
+        for x, wi in zip(values, w_norm):
+            d = x - b_h
+            w_err2 += wi * d * d
+        return codes, w_err2 * inv_n, 0.0, 0.0, 0.0
+
+    inv_s = 1.0 / s_h
+    codes = [0] * n
+    sum_wq = 0.0
+    sum_wq2 = 0.0
+    sum_wxq = 0.0
+    w_err2 = 0.0
+    for i, (x, wi) in enumerate(zip(values, w_norm)):
+        v = (x - b_h) * inv_s
+        if v <= 0.0:
+            q = 0
+        else:
+            q = int(v + 0.5)
+            if q > qmax:
+                q = qmax
+        codes[i] = q
+        wq = wi * q
+        sum_wq += wq
+        sum_wq2 += wq * q
+        sum_wxq += wq * x
+        d = x - (b_h + q * s_h)
+        w_err2 += wi * d * d
+    return codes, w_err2 * inv_n, sum_wq, sum_wq2, sum_wxq
+
+
+def _normalize_group_weights(weights: Sequence[float], n: int) -> list[float] | None:
+    """Return `w_norm` summing to `n` when weights are non-uniform, else `None`."""
+    if len(weights) != n:
+        raise ValueError(f"group weights length {len(weights)} != values length {n}")
+    w_raw = [float(w) if (math.isfinite(w) and float(w) > 1e-12) else 1e-12 for w in weights]
+    w_min = min(w_raw)
+    w_max = max(w_raw)
+    if w_max <= w_min * (1.0 + 1e-12):
+        return None
+    scale = n / math.fsum(w_raw)
+    return [w * scale for w in w_raw]
+
+
+def _clipped_initializers(
+    bits: int,
+    qmax: int,
+    lo: float,
+    hi: float,
+    mean: float,
+    std: float,
+    s_mm: float,
+    b_mm: float,
+) -> list[tuple[float, float]]:
+    """Build clipped `(scale_f16, bias_f16)` initializers targeting outlier shrinkage."""
+    out: list[tuple[float, float]] = []
+    if std <= 0.0 or hi <= lo:
+        return out
+    span = hi - lo
+    if bits == 2:
+        for mult in (1.75, 2.25):
+            c_lo = max(lo, mean - mult * std)
+            c_hi = min(hi, mean + mult * std)
+            if c_hi > c_lo:
+                s0, b0 = _round_pair_f16((c_hi - c_lo) / qmax, c_lo)
+                if s0 > 0.0 and (s0 != s_mm or b0 != b_mm):
+                    out.append((s0, b0))
+    elif bits == 3:
+        if span > 4.2 * std:
+            for mult in (2.35, 2.85):
+                c_lo = max(lo, mean - mult * std)
+                c_hi = min(hi, mean + mult * std)
+                if c_hi > c_lo:
+                    s0, b0 = _round_pair_f16((c_hi - c_lo) / qmax, c_lo)
+                    if s0 > 0.0 and (s0 != s_mm or b0 != b_mm):
+                        out.append((s0, b0))
+    elif bits == 4:
+        if span > 4.8 * std:
+            mid = 0.5 * (lo + hi)
+            for alpha in (0.84, 0.92):
+                half = 0.5 * span * alpha
+                s0, b0 = _round_pair_f16((2.0 * half) / qmax, mid - half)
+                if s0 > 0.0 and (s0 != s_mm or b0 != b_mm):
+                    out.append((s0, b0))
+    elif bits in (5, 6):
+        if span > 5.5 * std:
+            mid = 0.5 * (lo + hi)
+            for alpha in (0.90, 0.96):
+                half = 0.5 * span * alpha
+                s0, b0 = _round_pair_f16((2.0 * half) / qmax, mid - half)
+                if s0 > 0.0 and (s0 != s_mm or b0 != b_mm):
+                    out.append((s0, b0))
+    return out
+
+
 def quantize_group_minmax(
     values: Sequence[float],
     bits: int,
@@ -200,8 +320,8 @@ def quantize_group_minmax(
 
     Returns `(scale_f16, bias_f16, codes, mse)`.
     """
-    if bits not in (2, 3, 4):
-        raise ValueError(f"unsupported quant bits {bits} (expected 2, 3, or 4)")
+    if bits not in _SUPPORTED_AFFINE_BITS:
+        raise ValueError(f"unsupported quant bits {bits} (expected one of {_SUPPORTED_AFFINE_BITS})")
     n = len(values)
     if n == 0:
         raise ValueError("group values must be non-empty")
@@ -233,24 +353,149 @@ def quantize_group_rco(
     bits: int,
     *,
     iters: int = 3,
+    weights: Sequence[float] | None = None,
 ) -> tuple[float, float, list[int], float]:
     """Residual Compensation Optimization (RCO) for group affine quantization (ADR-0017).
 
     Refines `(scale_f16, bias_f16, codes)` over clipped initializers using
     alternating ridge-stabilized closed-form OLS residual compensation and exact
-    IEEE-754 float16 rounding verification. Provably guarantees `mse_rco <= mse_minmax`.
+    IEEE-754 float16 rounding verification. When `weights` is supplied (`w_i = max(E[x_i^2], 1e-12)`),
+    minimizes weighted squared error `sum_i w_i * (x_hat_i - x_i)^2` and returns normalized
+    weighted MSE while guaranteeing `mse_rco <= mse_minmax`.
     """
-    if bits not in (2, 3, 4):
-        raise ValueError(f"unsupported quant bits {bits} (expected 2, 3, or 4)")
+    if bits not in _SUPPORTED_AFFINE_BITS:
+        raise ValueError(f"unsupported quant bits {bits} (expected one of {_SUPPORTED_AFFINE_BITS})")
     n = len(values)
     if n == 0:
         raise ValueError("group values must be non-empty")
 
+    w_norm = _normalize_group_weights(weights, n) if weights is not None else None
     qmax = (1 << bits) - 1
     lo = min(values)
     hi = max(values)
     sum_w = math.fsum(values)
     sum_w2 = math.sumprod(values, values)
+    inv_n = 1.0 / n
+
+    if w_norm is not None:
+        sum_wx = math.sumprod(w_norm, values)
+        sum_wx2 = math.fsum(wi * x * x for wi, x in zip(w_norm, values))
+        if hi <= lo:
+            b_h = _clamp_f16(lo)
+            codes, wmse, _, _, _ = _eval_group_with_sb_weighted(values, w_norm, 0.0, b_h, qmax)
+            return 0.0, b_h, codes, wmse
+
+        s_mm, b_mm = _round_pair_f16((hi - lo) / qmax, lo)
+        if s_mm <= 0.0:
+            b_mean = _clamp_f16(sum_wx * inv_n)
+            codes, wmse, _, _, _ = _eval_group_with_sb_weighted(values, w_norm, 0.0, b_mean, qmax)
+            return 0.0, b_mean, codes, wmse
+
+        best_codes, best_wmse, mm_swq, mm_swq2, mm_swxq = _eval_group_with_sb_weighted(
+            values, w_norm, s_mm, b_mm, qmax
+        )
+        minmax_wmse = best_wmse
+        best_s = s_mm
+        best_b = b_mm
+        if best_wmse == 0.0 or iters <= 0:
+            return best_s, best_b, best_codes, best_wmse
+
+        seen_sb: set[tuple[float, float]] = {(s_mm, b_mm)}
+        starts_w: list[tuple[float, float, list[int] | None, float, float, float]] = [
+            (s_mm, b_mm, best_codes, mm_swq, mm_swq2, mm_swxq),
+        ]
+
+        def _add_start(s0: float, b0: float) -> None:
+            if s0 > 0.0 and (s0, b0) not in seen_sb:
+                seen_sb.add((s0, b0))
+                starts_w.append((s0, b0, None, 0.0, 0.0, 0.0))
+
+        # Tight bounding box over high-activation channels so low-weight outliers never hijack range.
+        w_thresh = 0.05 * max(w_norm)
+        imp_vals = [x for x, wi in zip(values, w_norm) if wi >= w_thresh]
+        if imp_vals:
+            lo_imp = min(imp_vals)
+            hi_imp = max(imp_vals)
+            if hi_imp > lo_imp:
+                s0, b0 = _round_pair_f16((hi_imp - lo_imp) / qmax, lo_imp)
+                _add_start(s0, b0)
+
+        w_mean = sum_wx * inv_n
+        w_std = math.sqrt(max(0.0, sum_wx2 * inv_n - w_mean * w_mean))
+        if w_std > 0.0:
+            mults = (1.5, 2.0, 2.5) if bits == 2 else ((2.0, 2.6) if bits == 3 else (2.5, 3.2))
+            for mult in mults:
+                c_lo = max(lo, w_mean - mult * w_std)
+                c_hi = min(hi, w_mean + mult * w_std)
+                if c_hi > c_lo:
+                    s0, b0 = _round_pair_f16((c_hi - c_lo) / qmax, c_lo)
+                    _add_start(s0, b0)
+
+        u_mean = sum_w * inv_n
+        u_std = math.sqrt(max(0.0, sum_w2 * inv_n - u_mean * u_mean))
+        for s0, b0 in _clipped_initializers(bits, qmax, lo, hi, u_mean, u_std, s_mm, b_mm):
+            _add_start(s0, b0)
+
+        for s_cur, b_cur, pre_codes, sum_wq, sum_wq2, sum_wxq in starts_w:
+            if pre_codes is None:
+                codes, wmse, sum_wq, sum_wq2, sum_wxq = _eval_group_with_sb_weighted(
+                    values, w_norm, s_cur, b_cur, qmax
+                )
+                if wmse < best_wmse:
+                    best_wmse = wmse
+                    best_s = s_cur
+                    best_b = b_cur
+                    best_codes = codes
+            else:
+                codes = pre_codes
+
+            for _ in range(iters):
+                denom = n * sum_wq2 - sum_wq * sum_wq
+                if denom <= 0.0:
+                    break
+                lam = 1e-12 * max(1.0, sum_wq2)
+                s_new = (n * sum_wxq - sum_wq * sum_wx + lam * s_cur) / (denom + lam)
+                if s_new <= 0.0:
+                    break
+                b_new = (sum_wx - s_new * sum_wq) * inv_n
+                s_h, b_h = _round_pair_f16(s_new, b_new)
+                if s_h <= 0.0 or (s_h == s_cur and b_h == b_cur):
+                    break
+                new_codes, new_wmse, sum_wq, sum_wq2, sum_wxq = _eval_group_with_sb_weighted(
+                    values, w_norm, s_h, b_h, qmax
+                )
+                if new_wmse < best_wmse:
+                    best_wmse = new_wmse
+                    best_s = s_h
+                    best_b = b_h
+                    best_codes = new_codes
+                same_codes = new_codes == codes
+                s_cur = s_h
+                b_cur = b_h
+                codes = new_codes
+                if same_codes:
+                    break
+
+        if best_s > 0.0:
+            sum_wq_best = math.fsum(wi * q for wi, q in zip(w_norm, best_codes))
+            b_opt = _clamp_f16((sum_wx - best_s * sum_wq_best) * inv_n)
+            if b_opt != best_b:
+                opt_codes, opt_wmse, _, _, _ = _eval_group_with_sb_weighted(
+                    values, w_norm, best_s, b_opt, qmax
+                )
+                if opt_wmse < best_wmse:
+                    best_wmse = opt_wmse
+                    best_b = b_opt
+                    best_codes = opt_codes
+
+        # Fallback check against unweighted RCO if weighted OLS failed to improve over min-max.
+        if best_wmse >= minmax_wmse:
+            s_uw, b_uw, _, _ = quantize_group_rco(values, bits, iters=iters, weights=None)
+            uw_codes, uw_wmse, _, _, _ = _eval_group_with_sb_weighted(values, w_norm, s_uw, b_uw, qmax)
+            if uw_wmse < best_wmse:
+                return s_uw, b_uw, uw_codes, uw_wmse
+
+        return best_s, best_b, best_codes, best_wmse
 
     # Always initialize `best` with exact min-max so `mse_rco <= mse_minmax` is invariant.
     if hi <= lo:
@@ -270,44 +515,15 @@ def quantize_group_rco(
     if best_mse == 0.0 or iters <= 0:
         return best_s, best_b, best_codes, best_mse
 
-    mean = sum_w / n
-    var = max(0.0, sum_w2 / n - mean * mean)
-    std = math.sqrt(var)
-    span = hi - lo
+    mean = sum_w * inv_n
+    std = math.sqrt(max(0.0, sum_w2 * inv_n - mean * mean))
 
-    # Build compact candidate initializers targeting outlier shrinkage where it pays most.
     starts: list[tuple[float, float, list[int] | None, int, int, float]] = [
         (s_mm, b_mm, best_codes, mm_sq, mm_sq2, mm_swq),
     ]
-    if std > 0.0:
-        if bits == 2:
-            # 2-bit has only 4 levels; Lloyd-Max Gaussian optimal span is ~+/-1.8..2.2 sigma.
-            for mult in (1.75, 2.25):
-                c_lo = max(lo, mean - mult * std)
-                c_hi = min(hi, mean + mult * std)
-                if c_hi > c_lo:
-                    s0, b0 = _round_pair_f16((c_hi - c_lo) / qmax, c_lo)
-                    if s0 > 0.0 and (s0 != s_mm or b0 != b_mm):
-                        starts.append((s0, b0, None, 0, 0, 0.0))
-        elif bits == 3:
-            if span > 4.2 * std:
-                for mult in (2.35, 2.85):
-                    c_lo = max(lo, mean - mult * std)
-                    c_hi = min(hi, mean + mult * std)
-                    if c_hi > c_lo:
-                        s0, b0 = _round_pair_f16((c_hi - c_lo) / qmax, c_lo)
-                        if s0 > 0.0 and (s0 != s_mm or b0 != b_mm):
-                            starts.append((s0, b0, None, 0, 0, 0.0))
-        else:  # bits == 4
-            if span > 4.8 * std:
-                mid = 0.5 * (lo + hi)
-                for alpha in (0.84, 0.92):
-                    half = 0.5 * span * alpha
-                    s0, b0 = _round_pair_f16((2.0 * half) / qmax, mid - half)
-                    if s0 > 0.0 and (s0 != s_mm or b0 != b_mm):
-                        starts.append((s0, b0, None, 0, 0, 0.0))
+    for s0, b0 in _clipped_initializers(bits, qmax, lo, hi, mean, std, s_mm, b_mm):
+        starts.append((s0, b0, None, 0, 0, 0.0))
 
-    inv_n = 1.0 / n
     for s_cur, b_cur, pre_codes, sum_q, sum_q2, sum_wq in starts:
         if pre_codes is None:
             codes, mse, sum_q, sum_q2, sum_wq = _eval_group_with_sb(values, sum_w, sum_w2, s_cur, b_cur, qmax)
@@ -394,6 +610,15 @@ def _pack_group_codes(codes: Sequence[int], bits: int, dst: bytearray, dst_off: 
                 | ((codes[i + 3] & 0x03) << 6)
             )
             dst_off += 1
+    elif bits == 5:
+        packed = pack_mlx_affine_5bit(codes)
+        dst[dst_off : dst_off + len(packed)] = packed
+    elif bits == 6:
+        packed = pack_mlx_affine_6bit(codes)
+        dst[dst_off : dst_off + len(packed)] = packed
+    elif bits == 8:
+        packed = pack_mlx_affine_8bit(codes)
+        dst[dst_off : dst_off + len(packed)] = packed
     else:
         raise ValueError(f"unsupported quant bits {bits}")
 
@@ -406,6 +631,7 @@ def quantize_rows_affine(
     use_rco: bool = True,
     rco_iters: int = 3,
     compute_minmax_mse: bool = False,
+    col_weights: Sequence[float] | None = None,
 ) -> tuple[bytes, bytes, float, float]:
     """Quantize a batch of 2D rows `[n_rows, k]` into row-major MLX affine bytes.
 
@@ -413,13 +639,17 @@ def quantize_rows_affine(
     When `compute_minmax_mse` is False and `use_rco` is True, `mean_minmax_mse`
     equals `mean_mse` (avoiding redundant baseline passes on large checkpoints).
     """
-    if bits not in (2, 3, 4):
+    if bits not in _SUPPORTED_AFFINE_BITS:
         raise ValueError(f"unsupported quant bits {bits}")
+    if group_size not in AFFINE_GROUP_SIZES:
+        raise ValueError(f"unsupported quant group_size {group_size} (expected {AFFINE_GROUP_SIZES})")
     if not rows:
         return b"", b"", 0.0, 0.0
     k = len(rows[0])
     if k <= 0 or k % group_size != 0:
         raise ValueError(f"quantized row width k={k} must be a positive multiple of {group_size}")
+    if col_weights is not None and len(col_weights) != k:
+        raise ValueError(f"col_weights length {len(col_weights)} != row width k={k}")
     n_rows = len(rows)
     groups = k // group_size
     grp_data_bytes = (group_size * bits) // 8
@@ -430,9 +660,17 @@ def quantize_rows_affine(
     p_out = bytearray(n_rows * row_param_bytes)
     pack_sb = _F16_PAIR_STRUCT.pack_into
 
+    grp_w_norms: list[list[float] | None] | None = None
+    grp_weights_raw: list[Sequence[float]] | None = None
+    if col_weights is not None:
+        grp_weights_raw = [col_weights[g * group_size : (g + 1) * group_size] for g in range(groups)]
+        if compute_minmax_mse or not use_rco:
+            grp_w_norms = [_normalize_group_weights(gw, group_size) for gw in grp_weights_raw]
+
     mse_sum = 0.0
     mm_mse_sum = 0.0
     total_groups = n_rows * groups
+    qmax = (1 << bits) - 1
 
     for r_idx, row in enumerate(rows):
         if len(row) != k:
@@ -441,14 +679,23 @@ def quantize_rows_affine(
         p_base = r_idx * row_param_bytes
         for g in range(groups):
             grp = row[g * group_size : (g + 1) * group_size]
+            gw = grp_weights_raw[g] if grp_weights_raw is not None else None
             if use_rco:
-                s_h, b_h, codes, mse = quantize_group_rco(grp, bits, iters=rco_iters)
+                s_h, b_h, codes, mse = quantize_group_rco(grp, bits, iters=rco_iters, weights=gw)
                 mse_sum += mse
                 if compute_minmax_mse:
-                    _, _, _, mm_mse = quantize_group_minmax(grp, bits)
+                    s_mm, b_mm, _, mm_mse = quantize_group_minmax(grp, bits)
+                    if grp_w_norms is not None and grp_w_norms[g] is not None:
+                        _, mm_mse, _, _, _ = _eval_group_with_sb_weighted(
+                            grp, grp_w_norms[g], s_mm, b_mm, qmax  # type: ignore[arg-type]
+                        )
                     mm_mse_sum += mm_mse
             else:
                 s_h, b_h, codes, mse = quantize_group_minmax(grp, bits)
+                if grp_w_norms is not None and grp_w_norms[g] is not None:
+                    _, mse, _, _, _ = _eval_group_with_sb_weighted(
+                        grp, grp_w_norms[g], s_h, b_h, qmax  # type: ignore[arg-type]
+                    )
                 mse_sum += mse
                 mm_mse_sum += mse
             _pack_group_codes(codes, bits, q_out, d_base + g * grp_data_bytes)
@@ -459,10 +706,17 @@ def quantize_rows_affine(
     return bytes(q_out), bytes(p_out), mean_mse, mean_mm
 
 
-def _quantize_worker_task(args: tuple[list[list[float]], int, int, bool, int]) -> tuple[bytes, bytes, float]:
-    rows, bits, group_size, use_rco, rco_iters = args
+def _quantize_worker_task(
+    args: tuple[list[list[float]], int, int, bool, int, Sequence[float] | None],
+) -> tuple[bytes, bytes, float]:
+    rows, bits, group_size, use_rco, rco_iters, col_weights = args
     q_bytes, p_bytes, mse, _ = quantize_rows_affine(
-        rows, bits, group_size=group_size, use_rco=use_rco, rco_iters=rco_iters
+        rows,
+        bits,
+        group_size=group_size,
+        use_rco=use_rco,
+        rco_iters=rco_iters,
+        col_weights=col_weights,
     )
     return q_bytes, p_bytes, mse
 
@@ -1449,6 +1703,15 @@ _PROTECTED_HIGH_PRECISION_ROLES = frozenset(
     }
 )
 
+_BACKBONE_PROTECTED_ROLES = _PROTECTED_HIGH_PRECISION_ROLES | frozenset(
+    {
+        "ssm_dt_a",
+        "embed_head",
+        "attn_qkv_o",
+        "ssm_proj",
+    }
+)
+
 
 def parse_gguf_imatrix(path: pathlib.Path) -> dict[str, list[float]]:
     """Parse importance matrix weights from llama.cpp `.gguf`, legacy `.dat`, or JSON imatrix.
@@ -1547,12 +1810,31 @@ def _imatrix_tensor_multipliers(imatrix: dict[str, list[float]]) -> dict[str, fl
     return {k: max(0.5, min(4.0, v / med)) for k, v in means.items()}
 
 
+def _imatrix_col_weights(
+    imatrix: dict[str, list[float]],
+    tensor_name: str,
+    cols: int,
+) -> list[float] | None:
+    """Return per-column `w_i = max(E[x_i^2], 1e-12)` vector when `len == cols`, else `None`."""
+    if not imatrix or cols <= 0:
+        return None
+    vec = (
+        imatrix.get(tensor_name)
+        or imatrix.get(tensor_name.removesuffix(".weight"))
+        or imatrix.get(f"{tensor_name}.weight")
+    )
+    if vec is None or len(vec) != cols:
+        return None
+    return [max(1e-12, float(v)) if math.isfinite(v) else 1e-12 for v in vec]
+
+
 @dataclass(frozen=True)
 class QuantUnitCandidate:
     dtype: DType
     alg_bytes: int
     weighted_distortion: float
     raw_mse: float
+    group_size: int = 64
 
 
 @dataclass(frozen=True)
@@ -1580,6 +1862,7 @@ class QuantUnitPlan:
     alg_bytes: int
     weighted_distortion: float
     raw_mse: float
+    group_size: int = 64
 
 
 @dataclass(frozen=True)
@@ -1598,6 +1881,8 @@ class GsqAllocationReport:
 def _best_hull_step(
     cands: Sequence[QuantUnitCandidate],
     cur_idx: int,
+    *,
+    forbid_q2: bool = False,
 ) -> tuple[float, int] | None:
     """Find the upgrade `j > cur_idx` maximizing marginal distortion reduction per byte."""
     cur = cands[cur_idx]
@@ -1605,6 +1890,8 @@ def _best_hull_step(
     best_j = -1
     for j in range(cur_idx + 1, len(cands)):
         nxt = cands[j]
+        if forbid_q2 and nxt.dtype == DType.Q2_AFFINE:
+            continue
         db = nxt.alg_bytes - cur.alg_bytes
         if db <= 0:
             continue
@@ -1624,17 +1911,22 @@ def solve_gsq_allocation(
     target_bits: float,
     pinned_weights: int = 0,
     pinned_alg_bytes: int = 0,
+    enforce_backbone_floor: bool = True,
+    max_q2_share: float | None = None,
 ) -> GsqAllocationReport:
     """Discrete convex-hull marginal-distortion-per-byte knapsack solver (ADR-0017).
 
-    Starts every quantizable unit at its lowest-bit candidate (`q2_affine`),
-    applies sensitivity-guided protection floors when the budget permits
-    (routers -> highest precision, embeddings/lm_head -> >= `q4_affine`), and
+    Starts every quantizable unit at its lowest legal candidate (forbidding
+    `q2_affine` on `_BACKBONE_PROTECTED_ROLES` when `enforce_backbone_floor=True`),
+    enforces `q2_numel / quantizable_numel <= max_q2_share` when specified,
+    applies sensitivity-guided protection floors when the budget permits, and
     then greedily upgrades units with the highest distortion reduction per extra
     byte until `target_bits` is reached.
     """
     if target_bits <= 0.0:
         raise ValueError(f"target_bits must be positive, got {target_bits}")
+    if max_q2_share is not None and (not math.isfinite(max_q2_share) or max_q2_share < 0.0 or max_q2_share > 1.0):
+        raise ValueError(f"max_q2_share must be in [0.0, 1.0], got {max_q2_share}")
 
     total_weights = pinned_weights + sum(u.numel for u in units)
     if total_weights <= 0:
@@ -1642,16 +1934,93 @@ def solve_gsq_allocation(
     budget_bytes = int(math.floor(target_bits * total_weights / 8.0 + 1e-9))
 
     chosen_idx = [0] * len(units)
-    cur_bytes = pinned_alg_bytes + sum(u.candidates[0].alg_bytes for u in units)
+    for idx, u in enumerate(units):
+        if not u.candidates:
+            raise ValueError(f"unit {u.unit_id!r} has no candidate dtypes")
+        if enforce_backbone_floor and u.role in _BACKBONE_PROTECTED_ROLES:
+            legal_j = next((j for j, c in enumerate(u.candidates) if c.dtype != DType.Q2_AFFINE), -1)
+            if legal_j < 0:
+                raise ValueError(
+                    f"backbone protection floor forbids q2_affine on protected unit {u.unit_id!r} (role={u.role})"
+                )
+            chosen_idx[idx] = legal_j
+
+    cur_bytes = pinned_alg_bytes + sum(u.candidates[chosen_idx[i]].alg_bytes for i, u in enumerate(units))
+    if cur_bytes > budget_bytes:
+        min_bpw = (8.0 * cur_bytes) / total_weights
+        raise ValueError(
+            f"cannot satisfy target_bits={target_bits:.3f} under backbone floor "
+            f"(minimum achievable {min_bpw:.3f} bpw)"
+        )
+
+    quantizable_numel = sum(u.numel for u in units)
+    q2_numel = sum(
+        u.numel for i, u in enumerate(units) if u.candidates[chosen_idx[i]].dtype == DType.Q2_AFFINE
+    )
+    max_q2_numel = (
+        int(math.floor(max_q2_share * quantizable_numel + 1e-9))
+        if (max_q2_share is not None and quantizable_numel > 0)
+        else quantizable_numel
+    )
+
+    def _set_choice(idx: int, new_j: int) -> None:
+        nonlocal cur_bytes, q2_numel
+        u = units[idx]
+        old_c = u.candidates[chosen_idx[idx]]
+        new_c = u.candidates[new_j]
+        cur_bytes += new_c.alg_bytes - old_c.alg_bytes
+        if old_c.dtype == DType.Q2_AFFINE and new_c.dtype != DType.Q2_AFFINE:
+            q2_numel -= u.numel
+        elif old_c.dtype != DType.Q2_AFFINE and new_c.dtype == DType.Q2_AFFINE:
+            q2_numel += u.numel
+        chosen_idx[idx] = new_j
+
+    # Enforce `max_q2_share` cap BEFORE optional protection upgrades so they cannot starve mandatory Q2 lifts.
+    if max_q2_share is not None and quantizable_numel > 0:
+        while q2_numel > max_q2_numel:
+            best_pick: tuple[int, float, float, str, int, int] | None = None
+            for idx, u in enumerate(units):
+                cur_j = chosen_idx[idx]
+                cur_c = u.candidates[cur_j]
+                if cur_c.dtype != DType.Q2_AFFINE:
+                    continue
+                next_j = next(
+                    (j for j in range(cur_j + 1, len(u.candidates)) if u.candidates[j].dtype != DType.Q2_AFFINE),
+                    -1,
+                )
+                if next_j < 0:
+                    continue
+                nxt_c = u.candidates[next_j]
+                extra = nxt_c.alg_bytes - cur_c.alg_bytes
+                dd = cur_c.weighted_distortion - nxt_c.weighted_distortion
+                gain = (dd / extra) if (dd > 0.0 and extra > 0) else 0.0
+                fits = 0 if (cur_bytes + extra <= budget_bytes) else 1
+                key = (fits, -gain, -u.sensitivity, u.unit_id, idx, next_j)
+                if best_pick is None or key < best_pick:
+                    best_pick = key
+            if best_pick is None:
+                raise ValueError(
+                    f"cannot satisfy max_q2_share={max_q2_share:.3f}: no non-q2 candidate available"
+                )
+            _, _, _, _, pick_idx, pick_j = best_pick
+            _set_choice(pick_idx, pick_j)
+        if cur_bytes > budget_bytes:
+            min_bpw = (8.0 * cur_bytes) / total_weights
+            raise ValueError(
+                f"cannot satisfy target_bits={target_bits:.3f} with max_q2_share={max_q2_share:.3f} "
+                f"(minimum achievable {min_bpw:.3f} bpw)"
+            )
 
     # Protection pass 1: routers are tiny (<0.05% of model) and directly control MoE routing.
     for idx, u in enumerate(units):
         if u.role == "router" and len(u.candidates) > 1:
-            top_j = len(u.candidates) - 1
-            extra = u.candidates[top_j].alg_bytes - u.candidates[0].alg_bytes
-            if cur_bytes + extra <= budget_bytes:
-                chosen_idx[idx] = top_j
-                cur_bytes += extra
+            for cand_j in range(len(u.candidates) - 1, chosen_idx[idx], -1):
+                if enforce_backbone_floor and u.candidates[cand_j].dtype == DType.Q2_AFFINE:
+                    continue
+                extra = u.candidates[cand_j].alg_bytes - u.candidates[chosen_idx[idx]].alg_bytes
+                if cur_bytes + extra <= budget_bytes:
+                    _set_choice(idx, cand_j)
+                    break
 
     def _best_floor_candidate_idx(u: QuantUnitInput, cur_j: int) -> int:
         """Select highest quantized candidate `<= Q4_AFFINE` (i.e. Q4 if present, else Q3)."""
@@ -1672,8 +2041,7 @@ def solve_gsq_allocation(
             if target_j > chosen_idx[idx]:
                 extra = u.candidates[target_j].alg_bytes - u.candidates[chosen_idx[idx]].alg_bytes
                 if cur_bytes + extra <= budget_bytes:
-                    chosen_idx[idx] = target_j
-                    cur_bytes += extra
+                    _set_choice(idx, target_j)
 
     # Protection pass 3: protect recurrent controllers/sconv/iHC/MTP/DFlare/vision, boundary
     # layers (layer 0 and final layer), and attention projections at >= q4_affine when budget permits.
@@ -1682,7 +2050,6 @@ def solve_gsq_allocation(
     has_boundary_layers = max_unit_layer >= 3
 
     def _protect_floor(predicate) -> None:
-        nonlocal cur_bytes
         # Order deterministically by highest sensitivity first so tighter budgets
         # protect the most critical units first.
         order = [
@@ -1696,8 +2063,7 @@ def solve_gsq_allocation(
             if target_j > chosen_idx[idx]:
                 extra = u.candidates[target_j].alg_bytes - u.candidates[chosen_idx[idx]].alg_bytes
                 if cur_bytes + extra <= budget_bytes:
-                    chosen_idx[idx] = target_j
-                    cur_bytes += extra
+                    _set_choice(idx, target_j)
 
     _protect_floor(lambda u: u.role in ("controller", "sconv", "ihc", "mtp_dflare", "vision"))
     if has_boundary_layers:
@@ -1710,7 +2076,8 @@ def solve_gsq_allocation(
     # Tie-break deterministically by (-sensitivity, unit_id).
     heap: list[tuple[float, float, str, int, int, int]] = []
     for idx, u in enumerate(units):
-        step = _best_hull_step(u.candidates, chosen_idx[idx])
+        forbid_q2 = enforce_backbone_floor and u.role in _BACKBONE_PROTECTED_ROLES
+        step = _best_hull_step(u.candidates, chosen_idx[idx], forbid_q2=forbid_q2)
         if step is not None:
             gain, target_j = step
             heapq.heappush(heap, (-gain, -u.sensitivity, u.unit_id, idx, chosen_idx[idx], target_j))
@@ -1722,11 +2089,19 @@ def solve_gsq_allocation(
         u = units[idx]
         cur_c = u.candidates[from_j]
         nxt_c = u.candidates[target_j]
+        forbid_q2 = enforce_backbone_floor and u.role in _BACKBONE_PROTECTED_ROLES
+        if forbid_q2 and nxt_c.dtype == DType.Q2_AFFINE:
+            continue
+        q2_cap_ok = not (
+            max_q2_share is not None
+            and nxt_c.dtype == DType.Q2_AFFINE
+            and cur_c.dtype != DType.Q2_AFFINE
+            and q2_numel + u.numel > max_q2_numel
+        )
         extra = nxt_c.alg_bytes - cur_c.alg_bytes
-        if cur_bytes + extra <= budget_bytes:
-            chosen_idx[idx] = target_j
-            cur_bytes += extra
-            nxt_step = _best_hull_step(u.candidates, target_j)
+        if q2_cap_ok and cur_bytes + extra <= budget_bytes:
+            _set_choice(idx, target_j)
+            nxt_step = _best_hull_step(u.candidates, target_j, forbid_q2=forbid_q2)
             if nxt_step is not None:
                 gain, next_j = nxt_step
                 heapq.heappush(heap, (-gain, -u.sensitivity, u.unit_id, idx, target_j, next_j))
@@ -1736,6 +2111,15 @@ def solve_gsq_allocation(
             best_small_j = -1
             for j in range(from_j + 1, target_j):
                 cand = u.candidates[j]
+                if forbid_q2 and cand.dtype == DType.Q2_AFFINE:
+                    continue
+                if (
+                    max_q2_share is not None
+                    and cand.dtype == DType.Q2_AFFINE
+                    and cur_c.dtype != DType.Q2_AFFINE
+                    and q2_numel + u.numel > max_q2_numel
+                ):
+                    continue
                 db = cand.alg_bytes - cur_c.alg_bytes
                 if db <= 0 or cur_bytes + db > budget_bytes:
                     continue
@@ -1768,6 +2152,7 @@ def solve_gsq_allocation(
                 alg_bytes=c.alg_bytes,
                 weighted_distortion=c.weighted_distortion,
                 raw_mse=c.raw_mse,
+                group_size=c.group_size,
             )
         )
         key = c.dtype.name.lower()
@@ -2457,17 +2842,26 @@ def _analyze_tensor_sample(
     src: _UnifiedSource,
     t: _SourceTensor,
     *,
-    group_size: int,
+    cand_specs: Sequence[tuple[DType, int]],
     sample_rows: int,
     use_rco: bool,
     rco_iters: int,
-    max_cand_bits: int,
-) -> tuple[float, float, dict[DType, float]]:
-    """Stream-sample a 2D tensor to estimate `(var, outlier_factor, mse_by_quant_dtype)`."""
-    if max_cand_bits == 3 and t.dtype == DType.Q3_AFFINE and group_size == 64:
+    col_weights: Sequence[float] | None = None,
+) -> tuple[float, float, dict[tuple[DType, int], float]]:
+    """Stream-sample a 2D tensor to estimate `(var, outlier_factor, mse_by_spec)`."""
+    quant_specs = [spec for spec in cand_specs if spec[0] in _QUANT_DTYPES]
+    if (
+        col_weights is None
+        and use_rco
+        and t.dtype == DType.Q3_AFFINE
+        and t.group_size == 64
+        and quant_specs
+        and set(quant_specs).issubset({(DType.Q2_AFFINE, 64), (DType.Q3_AFFINE, 64)})
+    ):
         fast = _analyze_q3_sample_fast(src, t, sample_rows=sample_rows, use_rco=use_rco)
         if fast is not None:
-            return fast
+            var_f, out_f, mse_map = fast
+            return var_f, out_f, {(dt, 64): mse_map[dt] for dt, _ in quant_specs if dt in mse_map}
     n_rows, k = t.shape
     row_ids = _sample_row_indices(n_rows, sample_rows)
     rows = src.read_rows_f32(t, row_ids)
@@ -2489,38 +2883,54 @@ def _analyze_tensor_sample(
     rms = math.sqrt(sum_w2 / max(1, n_vals))
     outlier_ratio = max_abs / max(1e-8, rms)
 
-    # Sample up to 64 groups across sampled rows for fast, accurate empirical distortion curves.
-    groups_per_row = k // group_size
-    sampled_groups: list[list[float]] = []
+    sampled_by_gs: dict[int, tuple[list[list[float]], list[Sequence[float]] | None]] = {}
     max_groups = 64
-    total_avail = len(rows) * groups_per_row
-    stride = max(1, total_avail // max_groups)
-    g_counter = 0
-    for row in rows:
-        for g in range(groups_per_row):
-            if g_counter % stride == 0 and len(sampled_groups) < max_groups:
-                sampled_groups.append(row[g * group_size : (g + 1) * group_size])
-            g_counter += 1
 
-    mse_by_dtype: dict[DType, float] = {}
-    for dt, bits in ((DType.Q2_AFFINE, 2), (DType.Q3_AFFINE, 3), (DType.Q4_AFFINE, 4)):
-        if bits > max_cand_bits:
+    def _get_sampled_groups(gs: int) -> tuple[list[list[float]], list[Sequence[float]] | None]:
+        cached = sampled_by_gs.get(gs)
+        if cached is not None:
+            return cached
+        groups_per_row = k // gs
+        s_grps: list[list[float]] = []
+        s_wts: list[Sequence[float]] | None = [] if (col_weights is not None and len(col_weights) == k) else None
+        total_avail = len(rows) * groups_per_row
+        stride = max(1, total_avail // max_groups)
+        g_counter = 0
+        for row in rows:
+            for g in range(groups_per_row):
+                if g_counter % stride == 0 and len(s_grps) < max_groups:
+                    s_grps.append(row[g * gs : (g + 1) * gs])
+                    if s_wts is not None and col_weights is not None:
+                        s_wts.append(col_weights[g * gs : (g + 1) * gs])
+                g_counter += 1
+        sampled_by_gs[gs] = (s_grps, s_wts)
+        return s_grps, s_wts
+
+    mse_by_spec: dict[tuple[DType, int], float] = {}
+    for dt, gs in quant_specs:
+        if t.dtype == dt and (t.group_size or gs) == gs:
+            mse_by_spec[(dt, gs)] = 0.0
             continue
-        if t.dtype == dt:
-            mse_by_dtype[dt] = 0.0
-            continue
+        bits = _DTYPE_BITS_RANK[dt]
+        s_grps, s_wts = _get_sampled_groups(gs)
         m_sum = 0.0
-        for grp in sampled_groups:
+        qmax = (1 << bits) - 1
+        for idx_g, grp in enumerate(s_grps):
+            gw = s_wts[idx_g] if s_wts is not None else None
             if use_rco:
-                _, _, _, m_val = quantize_group_rco(grp, bits, iters=rco_iters)
+                _, _, _, m_val = quantize_group_rco(grp, bits, iters=rco_iters, weights=gw)
             else:
-                _, _, _, m_val = quantize_group_minmax(grp, bits)
+                s_mm, b_mm, _, m_val = quantize_group_minmax(grp, bits)
+                if gw is not None:
+                    w_norm = _normalize_group_weights(gw, gs)
+                    if w_norm is not None:
+                        _, m_val, _, _, _ = _eval_group_with_sb_weighted(grp, w_norm, s_mm, b_mm, qmax)
             m_sum += m_val
-        mse_by_dtype[dt] = m_sum / max(1, len(sampled_groups))
+        mse_by_spec[(dt, gs)] = m_sum / max(1, len(s_grps))
 
     # Outlier multiplier boosts heavy-tailed tensors (activation-sensitive channels).
     outlier_factor = 1.0 + 0.12 * max(0.0, outlier_ratio - 3.0)
-    return var, outlier_factor, mse_by_dtype
+    return var, outlier_factor, mse_by_spec
 
 
 def _output_name_for_tensor(src_name: str, target_dtype: DType, existing_names: set[str]) -> str:
@@ -2544,6 +2954,7 @@ def _stream_quantize_tensor(
     use_rco: bool,
     rco_iters: int,
     lloyd_iters: int = 10,
+    col_weights: Sequence[float] | None = None,
     w: _BlobWriter,
     pool: concurrent.futures.ProcessPoolExecutor | None,
 ) -> float:
@@ -2556,6 +2967,11 @@ def _stream_quantize_tensor(
 
     # LUT16 ZT0 codebook path (`QuantParamKind.LUT16_CODEBOOK`, `reserved0 == 0x0101`).
     if target_layout == TensorLayout.SME2_PANEL64 and target_param_kind == QuantParamKind.LUT16_CODEBOOK:
+        if target_dtype not in _SME2_QUANT_DTYPES or group_size != SME2_GROUP_K:
+            raise ValueError(
+                f"lut16_sme2 requires dtype in {_SME2_QUANT_DTYPES} and group_size={SME2_GROUP_K}, "
+                f"got {target_dtype.name} group_size={group_size}"
+            )
         mse_acc = 0.0
         n_batches = 0
         if pool is None or n_rows < _ROW_BATCH_SIZE * 2:
@@ -2585,9 +3001,10 @@ def _stream_quantize_tensor(
         w.zeros(blob_bytes - w.written)
         return mse_acc / max(1, n_batches)
 
-    # Fast exact SWAR 8-bin OLS RCO path for `q3_affine -> q2_affine` when tensor is moderately sized.
+    # Fast exact SWAR 8-bin OLS RCO path for `q3_affine -> q2_affine` when unweighted & g=64.
     if (
-        t.dtype == DType.Q3_AFFINE
+        col_weights is None
+        and t.dtype == DType.Q3_AFFINE
         and target_dtype == DType.Q2_AFFINE
         and use_rco
         and group_size == 64
@@ -2618,11 +3035,18 @@ def _stream_quantize_tensor(
             w.zeros(blob_bytes - w.written)
             return mse_fast
 
+    col_w_list = list(col_weights) if col_weights is not None else None
+
     def _iter_quantized_batches() -> Iterator[tuple[bytes, bytes, float]]:
         if pool is None or n_rows < _ROW_BATCH_SIZE * 2:
             for batch in src.iter_row_batches_f32(t, _ROW_BATCH_SIZE):
                 qb, pb, mse, _ = quantize_rows_affine(
-                    batch, bits, group_size=group_size, use_rco=use_rco, rco_iters=rco_iters
+                    batch,
+                    bits,
+                    group_size=group_size,
+                    use_rco=use_rco,
+                    rco_iters=rco_iters,
+                    col_weights=col_w_list,
                 )
                 yield qb, pb, mse
             return
@@ -2631,7 +3055,9 @@ def _stream_quantize_tensor(
         max_inflight = max(2, (os.cpu_count() or 4))
         pending: list[concurrent.futures.Future[tuple[bytes, bytes, float]]] = []
         for batch in src.iter_row_batches_f32(t, _ROW_BATCH_SIZE):
-            pending.append(pool.submit(_quantize_worker_task, (batch, bits, group_size, use_rco, rco_iters)))
+            pending.append(
+                pool.submit(_quantize_worker_task, (batch, bits, group_size, use_rco, rco_iters, col_w_list))
+            )
             if len(pending) >= max_inflight:
                 yield pending.pop(0).result()
         for fut in pending:
@@ -2719,6 +3145,7 @@ class GsqConvertReport:
                     "layer": None if u.layer == NO_LAYER else u.layer,
                     "expert": None if u.expert == NO_EXPERT else u.expert,
                     "dtype": u.chosen_dtype.name.lower(),
+                    "group_size": u.group_size,
                     "numel": u.numel,
                     "alg_bytes": u.alg_bytes,
                     "sensitivity": round(u.sensitivity, 6),
@@ -2734,7 +3161,7 @@ def gsq_convert(
     input_path: pathlib.Path,
     output_path: pathlib.Path,
     *,
-    target_bits: float,
+    target_bits: float | None = None,
     model_id: str | None = None,
     group_size: int = 64,
     dtype_mode: str = "auto",
@@ -2754,6 +3181,10 @@ def gsq_convert(
     workers: int = 1,
     strip_vision: bool = True,
     imatrix_path: pathlib.Path | None = None,
+    enforce_backbone_floor: bool = True,
+    max_q2_share: float | None = None,
+    allow_lowbit_q2_retranscode: bool = True,
+    fine_rungs: bool = False,
     stats_out: dict[str, int] | None = None,
 ) -> GsqConvertReport:
     """Convert a float/quantized safetensors checkpoint or `.amf` into a GSQ+RCO `.amf` v0.
@@ -2769,12 +3200,16 @@ def gsq_convert(
         raise ValueError(f"dtype_mode must be one of {DTYPE_MODES}, got {dtype_mode!r}")
     if sme2_pack not in SME2_PACK_MODES:
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
-    if target_bits <= 0.0:
+    if target_bits is not None and target_bits <= 0.0:
         raise ValueError(f"target_bits must be positive, got {target_bits}")
+    if max_q2_share is not None and (not math.isfinite(max_q2_share) or max_q2_share < 0.0 or max_q2_share > 1.0):
+        raise ValueError(f"max_q2_share must be in [0.0, 1.0], got {max_q2_share}")
 
+    imatrix_raw: dict[str, list[float]] = {}
     imatrix_mults: dict[str, float] = {}
     if imatrix_path is not None:
-        imatrix_mults = _imatrix_tensor_multipliers(parse_gguf_imatrix(pathlib.Path(imatrix_path)))
+        imatrix_raw = parse_gguf_imatrix(pathlib.Path(imatrix_path))
+        imatrix_mults = _imatrix_tensor_multipliers(imatrix_raw)
 
     eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
 
@@ -2874,9 +3309,18 @@ def gsq_convert(
             else:
                 standalone_quant.append(t)
 
+        is_moe = len({e for (_, e) in expert_groups}) > 1
+        if target_bits is None:
+            eff_target_bits = 3.50 if is_moe else 4.15
+            eff_max_q2_share = (0.0 if max_q2_share is None else max_q2_share) if not is_moe else max_q2_share
+        else:
+            eff_target_bits = float(target_bits)
+            eff_max_q2_share = max_q2_share
+
         # Build QuantUnitInput list with sensitivity & empirical distortion curves.
         unit_inputs: list[QuantUnitInput] = []
         tensor_to_unit: dict[str, str] = {}
+        col_weights_by_tensor: dict[str, list[float] | None] = {}
 
         def _float_target_for(t: _SourceTensor) -> DType:
             if dtype_mode == "f16":
@@ -2916,28 +3360,109 @@ def gsq_convert(
             # fabricate bits by upscaling an already-quantized input tensor.
             max_bits = min(_DTYPE_BITS_RANK.get(m.dtype, 4) for m in members)
             f_target = _float_target_for(members[0])
+            src_dt = members[0].dtype
+            all_same_src = all(m.dtype == src_dt for m in members)
+            is_float_src = all(m.dtype in (DType.F16, DType.BF16, DType.F32) for m in members)
+
+            cand_specs: list[tuple[DType, int]] = []
+            seen_specs: set[tuple[DType, int]] = set()
+
+            def _add_spec(cdt: DType, gs: int) -> None:
+                if (cdt, gs) in seen_specs:
+                    return
+                if cdt in _QUANT_DTYPES and any(m.shape[1] % gs != 0 for m in members):
+                    return
+                if (
+                    enforce_backbone_floor
+                    and role in _BACKBONE_PROTECTED_ROLES
+                    and cdt == DType.Q2_AFFINE
+                    and src_dt != DType.Q2_AFFINE
+                ):
+                    return
+                seen_specs.add((cdt, gs))
+                cand_specs.append((cdt, gs))
+
+            if fine_rungs and is_float_src:
+                if role == "moe_expert":
+                    # Strictly cap per-layer expert schemes <= 5 (`NUM_SCHEME_BUCKETS = 5` in `src/model/qwen3.zig`).
+                    if group_size == 64:
+                        expert_rungs: tuple[tuple[DType, int], ...] = (
+                            (DType.Q2_AFFINE, 64),
+                            (DType.Q2_AFFINE, 32),
+                            (DType.Q3_AFFINE, 64),
+                            (DType.Q4_AFFINE, 64),
+                            (DType.Q6_AFFINE, 64),
+                        )
+                    else:
+                        top_exp = (
+                            (DType.Q6_AFFINE, 64)
+                            if all(m.shape[1] % 64 == 0 for m in members)
+                            else (f_target, 0)
+                        )
+                        expert_rungs = (
+                            (DType.Q2_AFFINE, group_size),
+                            (DType.Q3_AFFINE, group_size),
+                            (DType.Q4_AFFINE, group_size),
+                            (DType.Q5_AFFINE, group_size),
+                            top_exp,
+                        )
+                    for cdt, gs in expert_rungs:
+                        _add_spec(cdt, gs)
+                else:
+                    for cdt, gs in (
+                        (DType.Q2_AFFINE, group_size),
+                        (DType.Q3_AFFINE, group_size),
+                        (DType.Q4_AFFINE, group_size),
+                        (DType.Q2_AFFINE, 32),
+                        (DType.Q3_AFFINE, 32),
+                        (DType.Q4_AFFINE, 32),
+                        (DType.Q5_AFFINE, 64),
+                        (DType.Q6_AFFINE, 64),
+                        (DType.Q8_AFFINE, 64),
+                    ):
+                        _add_spec(cdt, gs)
+                    _add_spec(f_target, 0)
+            else:
+                for qdt, qb in ((DType.Q2_AFFINE, 2), (DType.Q3_AFFINE, 3), (DType.Q4_AFFINE, 4)):
+                    if qb <= max_bits:
+                        _add_spec(qdt, group_size)
+                if all_same_src and src_dt not in (DType.F16, DType.BF16, DType.F32):
+                    src_gs = (members[0].group_size or group_size) if src_dt in _QUANT_DTYPES else (members[0].group_size or group_size)
+                    _add_spec(src_dt, src_gs)
+                if max_bits >= 16:
+                    _add_spec(f_target, 0)
+
+            if not cand_specs:
+                raise ValueError(
+                    f"unit {unit_id!r} (role={role}, src={src_dt.name}) has no legal candidates under safety floor"
+                )
 
             total_numel = 0
             var_weighted = 0.0
             out_weighted = 0.0
-            mse_weighted: dict[DType, float] = {DType.Q2_AFFINE: 0.0, DType.Q3_AFFINE: 0.0, DType.Q4_AFFINE: 0.0}
+            mse_weighted: dict[tuple[DType, int], float] = {
+                spec: 0.0 for spec in cand_specs if spec[0] in _QUANT_DTYPES
+            }
 
             for m in members:
                 numel_m = m.shape[0] * m.shape[1]
                 total_numel += numel_m
+                cw = _imatrix_col_weights(imatrix_raw, m.name, m.shape[1])
+                col_weights_by_tensor[m.name] = cw
                 var_m, out_m, mse_m = _analyze_tensor_sample(
                     src,
                     m,
-                    group_size=group_size,
+                    cand_specs=cand_specs,
                     sample_rows=sample_rows,
                     use_rco=use_rco,
                     rco_iters=rco_iters,
-                    max_cand_bits=max_bits,
+                    col_weights=cw,
                 )
                 var_weighted += var_m * numel_m
                 out_weighted += out_m * numel_m
-                for qdt, qmse in mse_m.items():
-                    mse_weighted[qdt] += qmse * numel_m
+                for spec, qmse in mse_m.items():
+                    if spec in mse_weighted:
+                        mse_weighted[spec] += qmse * numel_m
 
             mean_var = max(1e-12, var_weighted / max(1, total_numel))
             mean_outlier = out_weighted / max(1, total_numel)
@@ -2967,27 +3492,12 @@ def gsq_convert(
                 * im_mult
             )
 
-            cand_dtypes: list[DType] = []
-            for qdt, qb in ((DType.Q2_AFFINE, 2), (DType.Q3_AFFINE, 3), (DType.Q4_AFFINE, 4)):
-                if qb <= max_bits:
-                    cand_dtypes.append(qdt)
-            src_dt = members[0].dtype
-            if (
-                all(m.dtype == src_dt for m in members)
-                and src_dt not in _QUANT_DTYPES
-                and src_dt not in (DType.F16, DType.BF16, DType.F32)
-            ):
-                # Allow preserving native non-affine-lowbit source precision (FP8, MXFP8, NVFP4, Q5..Q8) on protected units.
-                cand_dtypes.append(src_dt)
-            if max_bits >= 16:
-                cand_dtypes.append(f_target)
-
             candidates: list[QuantUnitCandidate] = []
-            for cdt in cand_dtypes:
-                eff_gs = members[0].group_size if (cdt == src_dt and members[0].group_size) else group_size
+            for cdt, c_gs in cand_specs:
+                eff_gs = c_gs if c_gs > 0 else group_size
                 alg_b = sum(_algorithmic_bytes(cdt, m.shape, eff_gs) for m in members)
                 if cdt in _QUANT_DTYPES:
-                    raw_mse = mse_weighted[cdt] / max(1, total_numel)
+                    raw_mse = mse_weighted[(cdt, c_gs)] / max(1, total_numel)
                 else:
                     raw_mse = 0.0
                 # Relative squared error weighted by unit sensitivity and parameter count.
@@ -2998,10 +3508,11 @@ def gsq_convert(
                         alg_bytes=alg_b,
                         weighted_distortion=w_dist,
                         raw_mse=raw_mse,
+                        group_size=c_gs if cdt in _QUANT_DTYPES else (members[0].group_size if cdt == src_dt else 0),
                     )
                 )
 
-            candidates.sort(key=lambda c: c.alg_bytes)
+            candidates.sort(key=lambda c: (c.alg_bytes, _DTYPE_BITS_RANK.get(c.dtype, 16), -c.group_size))
             for m in members:
                 tensor_to_unit[m.name] = unit_id
             return QuantUnitInput(
@@ -3031,13 +3542,55 @@ def gsq_convert(
             pinned_weights += numel_t
             pinned_alg_bytes += _algorithmic_bytes(t.dtype, t.shape, t.group_size or group_size)
 
+        if not allow_lowbit_q2_retranscode:
+            src_by_name = {t.name: t for t in src.tensors}
+            total_w = pinned_weights + sum(u.numel for u in unit_inputs)
+            budget_b = int(math.floor(eff_target_bits * total_w / 8.0 + 1e-9)) if total_w > 0 else 0
+            filtered_units: list[QuantUnitInput] = []
+            min_no_lowbit_q2 = pinned_alg_bytes
+            lowbit_q2_blocked = False
+            for u in unit_inputs:
+                has_lowbit_src = any(src_by_name[nm].dtype in _LOWBIT_AFFINE_DTYPES for nm in u.tensor_names)
+                has_non_q2_src = any(src_by_name[nm].dtype != DType.Q2_AFFINE for nm in u.tensor_names)
+                has_q2_cand = any(c.dtype == DType.Q2_AFFINE for c in u.candidates)
+                if has_lowbit_src and has_non_q2_src and has_q2_cand:
+                    lowbit_q2_blocked = True
+                    kept = tuple(c for c in u.candidates if c.dtype != DType.Q2_AFFINE)
+                    if not kept:
+                        raise ValueError(
+                            f"refusing to double-quantize low-bit unit {u.unit_id!r} to q2_affine "
+                            "(pass allow_lowbit_q2_retranscode=True / --allow-retranscode-lowbit to override)"
+                        )
+                    u = QuantUnitInput(
+                        unit_id=u.unit_id,
+                        tensor_names=u.tensor_names,
+                        role=u.role,
+                        layer=u.layer,
+                        expert=u.expert,
+                        numel=u.numel,
+                        sensitivity=u.sensitivity,
+                        candidates=kept,
+                    )
+                filtered_units.append(u)
+                min_no_lowbit_q2 += u.candidates[0].alg_bytes
+            if lowbit_q2_blocked and min_no_lowbit_q2 > budget_b:
+                min_bpw = (8.0 * min_no_lowbit_q2) / max(1, total_w)
+                raise ValueError(
+                    f"refusing to double-quantize low-bit (q2/q3/q4_affine) weights to q2_affine under "
+                    f"target_bits={eff_target_bits:.3f} (minimum without q2 retranscode is {min_bpw:.3f} bpw; "
+                    "pass --allow-retranscode-lowbit to override)"
+                )
+            unit_inputs = filtered_units
+
         alloc = solve_gsq_allocation(
             unit_inputs,
-            target_bits=target_bits,
+            target_bits=eff_target_bits,
             pinned_weights=pinned_weights,
             pinned_alg_bytes=pinned_alg_bytes,
+            enforce_backbone_floor=enforce_backbone_floor,
+            max_q2_share=eff_max_q2_share,
         )
-        chosen_by_unit = {u.unit_id: u.chosen_dtype for u in alloc.units}
+        chosen_by_unit = {u.unit_id: (u.chosen_dtype, u.group_size) for u in alloc.units}
 
         # 3. Plan final `.amf` directory layout (16 KiB-aligned blobs) before streaming writes.
         existing_names = {t.name for t in src.tensors}
@@ -3066,13 +3619,16 @@ def gsq_convert(
 
         for t in src.tensors:
             uid = tensor_to_unit.get(t.name)
-            target_dtype = chosen_by_unit[uid] if uid is not None else t.dtype
+            if uid is not None:
+                target_dtype, chosen_gs = chosen_by_unit[uid]
+            else:
+                target_dtype, chosen_gs = t.dtype, t.group_size
             out_name = _output_name_for_tensor(t.name, target_dtype, existing_names | used_out_names)
             used_out_names.add(out_name)
 
             if target_dtype in _QUANT_DTYPES:
                 q_bits = _DTYPE_BITS_RANK[target_dtype]
-                g_size = group_size
+                g_size = chosen_gs if chosen_gs > 0 else group_size
             elif target_dtype == t.dtype:
                 q_bits = t.quant_bits
                 g_size = t.group_size
@@ -3080,7 +3636,7 @@ def gsq_convert(
                 q_bits = 0
                 g_size = 0
             use_sme2 = (
-                target_dtype in (DType.F16, DType.BF16, DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
+                target_dtype in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
                 and (target_dtype not in _QUANT_DTYPES or g_size == SME2_GROUP_K)
                 and (
                     _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack)
@@ -3091,7 +3647,7 @@ def gsq_convert(
                 layout = TensorLayout.SME2_PANEL64
                 param_kind = (
                     QuantParamKind.LUT16_CODEBOOK
-                    if (lut16_sme2 and target_dtype in _QUANT_DTYPES)
+                    if (lut16_sme2 and target_dtype in _SME2_QUANT_DTYPES and g_size == SME2_GROUP_K)
                     else QuantParamKind.AFFINE_SCALE_BIAS
                 )
                 data_bytes = sme2_panel64_data_bytes(target_dtype, t.shape[0], t.shape[1], g_size)
@@ -3147,15 +3703,16 @@ def gsq_convert(
                 next_scan = 0
 
                 def _is_fast_q3_to_q2(spec_idx: int) -> bool:
-                    t_s, _, t_dt, _, _, lay_s, pk_s, *_ = out_specs[spec_idx]
+                    t_s, _, t_dt, _, gs_s, lay_s, pk_s, *_ = out_specs[spec_idx]
                     return (
                         pool is not None
+                        and col_weights_by_tensor.get(t_s.name) is None
                         and t_s.dtype == DType.Q3_AFFINE
                         and t_dt == DType.Q2_AFFINE
                         and lay_s == TensorLayout.ROW_MAJOR
                         and pk_s == QuantParamKind.AFFINE_SCALE_BIAS
                         and use_rco
-                        and group_size == 64
+                        and gs_s == 64
                         and len(t_s.shape) == 2
                         and t_s.shape[0] * t_s.shape[1] <= 8_000_000
                     )
@@ -3211,7 +3768,9 @@ def gsq_convert(
                         quant_mse_sum += mse_t
                         quant_tensor_count += 1
                     elif target_dtype in _QUANT_DTYPES and (
-                        target_dtype != t.dtype or param_kind == QuantParamKind.LUT16_CODEBOOK
+                        target_dtype != t.dtype
+                        or g_size != t.group_size
+                        or param_kind == QuantParamKind.LUT16_CODEBOOK
                     ):
                         mse_t = _stream_quantize_tensor(
                             src,
@@ -3219,11 +3778,12 @@ def gsq_convert(
                             target_dtype=target_dtype,
                             target_layout=layout,
                             target_param_kind=param_kind,
-                            group_size=group_size,
+                            group_size=g_size,
                             blob_bytes=blob_bytes,
                             use_rco=use_rco,
                             rco_iters=rco_iters,
                             lloyd_iters=lloyd_iters,
+                            col_weights=col_weights_by_tensor.get(t.name),
                             w=w,
                             pool=pool,
                         )
@@ -3282,7 +3842,7 @@ def gsq_convert(
             input_path=pathlib.Path(input_path),
             output_path=out_path,
             model_id=model_id_str,
-            target_bits=target_bits,
+            target_bits=eff_target_bits,
             effective_bits=alloc.effective_bits,
             use_rco=use_rco,
             allocation=alloc,

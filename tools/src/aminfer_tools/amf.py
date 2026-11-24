@@ -2816,6 +2816,10 @@ def pack_amf_from_safetensors(
     chat_template_path: pathlib.Path | None = None,
     nvfp4_global_scale_is_divisor: bool | None = None,
     imatrix_path: pathlib.Path | None = None,
+    enforce_backbone_floor: bool = True,
+    max_q2_share: float | None = None,
+    allow_lowbit_q2_retranscode: bool = True,
+    fine_rungs: bool = False,
     stats_out: dict[str, int] | None = None,
 ) -> list[PackedTensorMeta]:
     """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
@@ -2824,7 +2828,7 @@ def pack_amf_from_safetensors(
     file, or a checkpoint directory. `quant_profile='uniform'` (default)
     preserves existing uniform packing behavior bit-exact; `quant_profile='gsq-rco'`
     runs optional ADR-0017 offline GSQ + RCO per-tensor / per-expert hybrid
-    quantization targeting `target_bits` (default 3.25 when omitted).
+    quantization targeting `target_bits` (auto: 4.15 Dense / 3.50 MoE when omitted).
 
     W20 vision-tower modes:
     - default (`include_vision=None, strip_vision=None, vision_sidecar=None`):
@@ -2881,11 +2885,10 @@ def pack_amf_from_safetensors(
     eff_strip_for_backbone = vision_mode in ("strip", "sidecar")
 
     if quant_profile == "gsq-rco":
-        eff_target = 3.25 if target_bits is None else float(target_bits)
         metas_gsq = gsq_convert_with_vision(
             input_path,
             output_path,
-            target_bits=eff_target,
+            target_bits=target_bits,
             model_id=model_id,
             group_size=eff_group_size,
             cold_experts=cold_experts,
@@ -2904,6 +2907,10 @@ def pack_amf_from_safetensors(
             include_vision=(vision_mode == "include"),
             vision_block_dtype=vision_block_dtype,
             imatrix_path=imatrix_path,
+            enforce_backbone_floor=enforce_backbone_floor,
+            max_q2_share=max_q2_share,
+            allow_lowbit_q2_retranscode=allow_lowbit_q2_retranscode,
+            fine_rungs=fine_rungs,
             stats_out=stats_out,
         )
         ct_bytes = _maybe_compile_chat_template_bytes(
@@ -5590,7 +5597,7 @@ def gsq_convert_with_vision(
     input_path: pathlib.Path,
     output_path: pathlib.Path,
     *,
-    target_bits: float,
+    target_bits: float | None = None,
     model_id: str | None = None,
     group_size: int = 64,
     dtype_mode: str = "auto",
@@ -5613,6 +5620,10 @@ def gsq_convert_with_vision(
     vision_sidecar: pathlib.Path | None = None,
     vision_block_dtype: str = "auto",
     imatrix_path: pathlib.Path | None = None,
+    enforce_backbone_floor: bool = True,
+    max_q2_share: float | None = None,
+    allow_lowbit_q2_retranscode: bool = True,
+    fine_rungs: bool = False,
     stats_out: dict[str, int] | None = None,
 ) -> list[PackedTensorMeta]:
     """Run W14 GSQ+RCO with W20 vision-tower precision policy.
@@ -5687,6 +5698,10 @@ def gsq_convert_with_vision(
             workers=workers,
             strip_vision=True,
             imatrix_path=imatrix_path,
+            enforce_backbone_floor=enforce_backbone_floor,
+            max_q2_share=max_q2_share,
+            allow_lowbit_q2_retranscode=allow_lowbit_q2_retranscode,
+            fine_rungs=fine_rungs,
             stats_out=stats_out,
         )
         return rep.metas
@@ -5731,6 +5746,10 @@ def gsq_convert_with_vision(
             workers=workers,
             strip_vision=True,
             imatrix_path=imatrix_path,
+            enforce_backbone_floor=enforce_backbone_floor,
+            max_q2_share=max_q2_share,
+            allow_lowbit_q2_retranscode=allow_lowbit_q2_retranscode,
+            fine_rungs=fine_rungs,
         )
         if is_amf_in:
             with AmfReader(in_path, verify_header_crc=True, verify_dir_crc=True) as rdr:

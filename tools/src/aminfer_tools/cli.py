@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 import time
 from collections.abc import Sequence
@@ -13,13 +14,17 @@ from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
     AFFINE_GROUP_SIZES,
     DTYPE_MODES,
+    NO_EXPERT,
     QUANT_PROFILES,
     SME2_PACK_MODES,
     SME2_REPACK_TARGETS,
     VISION_BLOCK_DTYPES,
+    AmfReader,
     QuantParamKind,
     SyntheticVitConfig,
+    TensorKind,
     TensorLayout,
+    _collect_tensors,
     embed_metadata_into_amf,
     generate_synth_vit_amf,
     gsq_convert_with_vision,
@@ -27,6 +32,7 @@ from aminfer_tools.amf import (
     pack_amf_from_safetensors,
     pack_vision_tower_amf,
     repack_amf_sme2,
+    resolve_checkpoint,
     retag_amf_cold_experts,
 )
 from aminfer_tools.chat_template import compile_chat_template_bytes
@@ -116,6 +122,79 @@ def _parse_int_csv(raw: str | None) -> tuple[int, ...] | None:
     if not items:
         return None
     return tuple(int(tok) for tok in items)
+
+
+def _add_gsq_safety_args(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "--max-q2-share",
+        type=float,
+        default=None,
+        help="Maximum fraction of quantizable weights permitted in q2_affine (default: 0.0 auto Dense, 0.55 MoE)",
+    )
+    subparser.add_argument(
+        "--allow-unsafe-q2",
+        action="store_true",
+        help="Disable backbone non-Q2 floor and Q2 weight-share cap (enforce_backbone_floor=False, max_q2_share=1.0)",
+    )
+    subparser.add_argument(
+        "--allow-retranscode-lowbit",
+        action="store_true",
+        help="Allow double-quantizing existing q2/q3/q4_affine source tensors down to q2_affine",
+    )
+    subparser.add_argument(
+        "--fine-rungs",
+        action="store_true",
+        help="Enable intermediate g32 and q5/q6/q8_affine GSQ rungs (MoE layers capped <= 5 schemes)",
+    )
+
+
+def _is_moe_checkpoint_input(path: pathlib.Path) -> bool:
+    """Return True when `path` is an MoE checkpoint (`num_experts > 1`) without loading tensor payloads."""
+    try:
+        if path.is_file() and path.suffix == ".amf":
+            with AmfReader(path, verify_header_crc=False, verify_dir_crc=False) as rdr:
+                experts = {
+                    e.expert
+                    for e in rdr.entries
+                    if e.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) and e.expert != NO_EXPERT
+                }
+                return len(experts) > 1
+        resolved = resolve_checkpoint(path)
+        tensors = _collect_tensors(resolved.shard_paths)
+        expert_ids: set[int] = set()
+        for name, t in tensors.items():
+            if len(t.shape) == 3 and ".switch_mlp." in name and t.shape[0] > 1:
+                return True
+            m = re.search(r"\.experts\.(\d+)\.", name)
+            if m is not None:
+                expert_ids.add(int(m.group(1)))
+                if len(expert_ids) > 1:
+                    return True
+        return False
+    except (OSError, ValueError):
+        return False
+
+
+def _resolve_cli_gsq_safety_flags(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    input_path: pathlib.Path,
+) -> tuple[bool, float | None, bool, bool]:
+    if args.max_q2_share is not None and not (0.0 <= args.max_q2_share <= 1.0):
+        parser.error(f"--max-q2-share must be in [0.0, 1.0], got {args.max_q2_share}")
+    enforce_backbone_floor = not args.allow_unsafe_q2
+    if args.allow_unsafe_q2:
+        max_q2_share = 1.0 if args.max_q2_share is None else args.max_q2_share
+    elif args.max_q2_share is not None:
+        max_q2_share = args.max_q2_share
+    else:
+        max_q2_share = 0.55 if _is_moe_checkpoint_input(input_path) else None
+    return (
+        enforce_backbone_floor,
+        max_q2_share,
+        bool(args.allow_retranscode_lowbit),
+        bool(args.fine_rungs),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -234,8 +313,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--target-bits",
         type=float,
         default=None,
-        help="Target average effective bits/weight when --quant-profile gsq-rco is selected (default: 3.25)",
+        help="Target average effective bits/weight when --quant-profile gsq-rco is selected (default: auto 4.15 Dense / 3.50 MoE)",
     )
+    _add_gsq_safety_args(pack)
     pack.add_argument(
         "--no-rco",
         action="store_true",
@@ -395,10 +475,11 @@ def _build_parser() -> argparse.ArgumentParser:
     gsq.add_argument("--output", required=True, type=pathlib.Path, help="Output .amf path")
     gsq.add_argument(
         "--target-bits",
-        required=True,
+        default=None,
         type=float,
-        help="Target average effective bits/weight across all model weights (e.g. 3.25)",
+        help="Target average effective bits/weight across all model weights (default: auto 4.15 Dense / 3.50 MoE)",
     )
+    _add_gsq_safety_args(gsq)
     gsq.add_argument(
         "--heat-profile",
         type=pathlib.Path,
@@ -1287,6 +1368,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             if gguf_stats.get("deduplicated_layers", 0) > 0:
                 extra_notes.append(f"dedup_layers={gguf_stats['deduplicated_layers']}")
         elif use_qwen4_pipeline:
+            if (
+                args.max_q2_share is not None
+                or args.allow_unsafe_q2
+                or args.allow_retranscode_lowbit
+                or args.fine_rungs
+            ):
+                parser.error(
+                    "--max-q2-share, --allow-unsafe-q2, --allow-retranscode-lowbit, and --fine-rungs "
+                    "are not yet supported with qwen4 PLE/MTP/adapter pipeline flags; run `gsq-convert` separately"
+                )
             rep_q4 = pack_qwen4_checkpoint(
                 args.input,
                 args.output,
@@ -1340,6 +1431,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 extra_notes.append(f"loop_adapters={rep_q4.loop_adapter_count}")
         else:
             stats_map: dict[str, int] = {}
+            if args.quant_profile == "gsq-rco":
+                enforce_floor, max_q2, allow_lowbit, fine_rungs = _resolve_cli_gsq_safety_flags(
+                    parser, args, args.input
+                )
+            else:
+                enforce_floor, max_q2, allow_lowbit, fine_rungs = True, None, True, False
             metas = pack_amf_from_safetensors(
                 args.input,
                 args.output,
@@ -1368,6 +1465,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tokenizer_path=args.tokenizer,
                 chat_template_path=args.chat_template,
                 imatrix_path=args.imatrix,
+                enforce_backbone_floor=enforce_floor,
+                max_q2_share=max_q2,
+                allow_lowbit_q2_retranscode=allow_lowbit,
+                fine_rungs=fine_rungs,
                 stats_out=stats_map,
             )
             stripped_vision = stats_map.get("stripped_vision_tensors", 0)
@@ -1404,6 +1505,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         cold = _parse_cold_experts(args.cold_experts)
         excludes = _parse_csv(args.exclude_tensors)
         inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
+        enforce_floor, max_q2, allow_lowbit, fine_rungs = _resolve_cli_gsq_safety_flags(
+            parser, args, args.input
+        )
         started = time.monotonic()
         use_vision_wrapper = (
             inc_vis is True
@@ -1439,6 +1543,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 vision_sidecar=args.vision_sidecar,
                 vision_block_dtype=args.vision_block_dtype,
                 imatrix_path=args.imatrix,
+                enforce_backbone_floor=enforce_floor,
+                max_q2_share=max_q2,
+                allow_lowbit_q2_retranscode=allow_lowbit,
+                fine_rungs=fine_rungs,
                 stats_out=vis_stats,
             )
             elapsed = time.monotonic() - started
@@ -1456,9 +1564,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 vis_note = f", vision_sidecar={vis_stats['sidecar_vision_tensors']}"
             elif vis_stats.get("included_vision_tensors", 0) > 0:
                 vis_note = f", vision_tensors={vis_stats['included_vision_tensors']}"
+            target_label = "auto" if args.target_bits is None else f"{args.target_bits:.2f}b"
             print(
                 f"gsq-converted {len(metas)} tensors into {args.output} ({total_bytes} bytes, "
-                f"target={args.target_bits:.2f}b, rco={'on' if not args.no_rco else 'off'}{lut_note}{vis_note}) "
+                f"target={target_label}, rco={'on' if not args.no_rco else 'off'}{lut_note}{vis_note}) "
                 f"in {elapsed:.1f} s [{dtype_summary}]"
             )
             return 0
@@ -1485,6 +1594,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             workers=args.workers,
             strip_vision=True,
             imatrix_path=args.imatrix,
+            enforce_backbone_floor=enforce_floor,
+            max_q2_share=max_q2,
+            allow_lowbit_q2_retranscode=allow_lowbit,
+            fine_rungs=fine_rungs,
         )
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size
@@ -1562,6 +1675,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             group_size=args.group_size,
         )
         elapsed = time.monotonic() - started
+        if profile.calibration_mode != "router_trace":
+            print(
+                f"WARNING: expert-heat used shallow calibration_mode={profile.calibration_mode!r}; "
+                "for accurate per-layer MoE routing heat, capture a trace with "
+                "`aminfer decode --dump-router-trace <trace.jsonl>` and pass `--calibration-jsonl <trace.jsonl>`.",
+                file=sys.stderr,
+            )
         if args.output is not None:
             write_heat_profile(profile, args.output)
             print(

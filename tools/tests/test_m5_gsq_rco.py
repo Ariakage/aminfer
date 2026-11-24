@@ -12,7 +12,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
@@ -21,10 +21,16 @@ from aminfer_tools.amf import (
     TensorKind,
     TensorLayout,
     dequantize_q2_row_f32,
+    dequantize_q3_row_f32,
+    dequantize_q4_row_f32,
+    dequantize_q5_row_f32,
+    dequantize_q6_row_f32,
+    dequantize_q8_row_f32,
     dequantize_sme2_panel64_q2_panel_f32,
     load_amf_metadata,
     pack_amf_from_safetensors,
     pack_mlx_affine_2bit,
+    pack_mlx_affine_3bit,
     pack_sme2_panel64_q2_from_mlx_panel,
     repack_amf_sme2,
     sme2_panel64_data_bytes,
@@ -32,6 +38,7 @@ from aminfer_tools.amf import (
 )
 from aminfer_tools.cli import main
 from aminfer_tools.gsq_rco import (
+    _BACKBONE_PROTECTED_ROLES,
     QuantUnitCandidate,
     QuantUnitInput,
     gsq_convert,
@@ -881,6 +888,465 @@ class M5GsqRcoTests(unittest.TestCase):
                 for name in u.tensor_names
             }
             self.assertGreater(sens["layers.0.self_attn.o_proj"], sens["layers.3.self_attn.o_proj"])
+
+    def test_weighted_ols_rco_and_extended_quant_rungs_g32_g64_g128(self) -> None:
+        rng = random.Random(20261124)
+        deq_by_bits = {
+            2: dequantize_q2_row_f32,
+            3: dequantize_q3_row_f32,
+            4: dequantize_q4_row_f32,
+            5: dequantize_q5_row_f32,
+            6: dequantize_q6_row_f32,
+            8: dequantize_q8_row_f32,
+        }
+        for gs in (32, 64, 128):
+            rows = [[rng.gauss(0.0, 0.15) for _ in range(gs * 2)] for _ in range(3)]
+            for bits, deq_fn in deq_by_bits.items():
+                qb, pb, rco_mse, mm_mse = quantize_rows_affine(
+                    rows, bits, group_size=gs, use_rco=True, compute_minmax_mse=True
+                )
+                self.assertLessEqual(rco_mse, mm_mse + 1e-15, msg=f"bits={bits}, gs={gs}")
+                row_d_bytes = (len(rows[0]) * bits) // 8
+                row_p_bytes = (len(rows[0]) // gs) * 4
+                for r_idx, orig_row in enumerate(rows):
+                    deq = deq_fn(
+                        qb[r_idx * row_d_bytes : (r_idx + 1) * row_d_bytes],
+                        pb[r_idx * row_p_bytes : (r_idx + 1) * row_p_bytes],
+                        len(orig_row),
+                        group_size=gs,
+                    )
+                    self.assertEqual(len(deq), len(orig_row))
+
+        # High-E[x^2] channels live in [-0.14, 0.14], while low-E[x^2] channels carry large outliers [-2.2, 2.2].
+        # Weighted OLS RCO must focus resolution onto the important channels and slash weighted error!
+        grp = [rng.uniform(-0.14, 0.14) for _ in range(16)] + [rng.uniform(-0.08, 0.08) for _ in range(44)] + [2.2, -2.1, 1.9, -1.8]
+        weights = [100.0] * 16 + [1e-4] * 48
+        sum_w = sum(weights)
+
+        def _wmse(s: float, b: float, codes: list[int]) -> float:
+            return sum(w * (x - (b + q * s)) ** 2 for x, w, q in zip(grp, weights, codes)) / sum_w
+
+        s_mm, b_mm, c_mm, _ = quantize_group_minmax(grp, 2)
+        s_uw, b_uw, c_uw, _ = quantize_group_rco(grp, 2, iters=3)
+        s_w, b_w, c_w, reported_wmse = quantize_group_rco(grp, 2, iters=3, weights=weights)
+        self.assertAlmostEqual(reported_wmse, _wmse(s_w, b_w, c_w), places=10)
+        self.assertLessEqual(reported_wmse, _wmse(s_mm, b_mm, c_mm) + 1e-15)
+        self.assertLess(reported_wmse, _wmse(s_uw, b_uw, c_uw) * 0.5)
+
+        # Row-level `col_weights` + end-to-end `gsq_convert(..., imatrix_path=...)` propagation check.
+        rows_2d = [
+            [rng.uniform(-0.14, 0.14) for _ in range(16)]
+            + [rng.uniform(-0.08, 0.08) for _ in range(44)]
+            + [2.2, -2.1, 1.9, -1.8]
+            for _ in range(8)
+        ]
+        _, _, w_row_mse, w_mm_mse = quantize_rows_affine(
+            rows_2d, 2, group_size=64, use_rco=True, compute_minmax_mse=True, col_weights=weights
+        )
+        self.assertLessEqual(w_row_mse, w_mm_mse + 1e-15)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            sf_dir = tmp / "imatrix_ckpt"
+            sf_dir.mkdir()
+
+            def _bf16_from_rows(mat: list[list[float]]) -> bytes:
+                flat = [v for r in mat for v in r]
+                f32 = struct.pack(f"<{len(flat)}f", *flat)
+                out = bytearray(len(flat) * 2)
+                out[0::2] = f32[2::4]
+                out[1::2] = f32[3::4]
+                return bytes(out)
+
+            ffn_mat = [
+                [rng.uniform(-0.14, 0.14) for _ in range(16)]
+                + [rng.uniform(-0.08, 0.08) for _ in range(44)]
+                + [2.2, -2.1, 1.9, -1.8]
+                for _ in range(256)
+            ]
+            tensors = {
+                "model.embed_tokens.weight": ("BF16", (64, 64), _rand_bf16_bytes(rng, 64 * 64, 0.1)),
+                "model.layers.0.input_layernorm.weight": ("BF16", (64,), _bf16_from_rows([[1.0] * 64])),
+                "model.layers.0.self_attn.q_proj.weight": ("BF16", (64, 64), _rand_bf16_bytes(rng, 64 * 64, 0.1)),
+                "model.layers.0.mlp.gate_proj.weight": ("BF16", (256, 64), _bf16_from_rows(ffn_mat)),
+                "model.norm.weight": ("BF16", (64,), _bf16_from_rows([[1.0] * 64])),
+            }
+            _write_safetensors(sf_dir / "model.safetensors", tensors)
+            (sf_dir / "config.json").write_text(json.dumps({"tie_word_embeddings": True}), encoding="utf-8")
+
+            im_path = tmp / "imatrix.json"
+            im_path.write_text(json.dumps({"layers.0.mlp.gate_proj": weights}), encoding="utf-8")
+
+            amf_uw = tmp / "uw.amf"
+            amf_w = tmp / "w.amf"
+            gsq_convert(sf_dir, amf_uw, target_bits=3.05, model_id="uw-test")
+            gsq_convert(sf_dir, amf_w, target_bits=3.05, model_id="w-test", imatrix_path=im_path)
+
+            with AmfReader(amf_uw) as r_uw, AmfReader(amf_w) as r_w:
+                m_uw = r_uw.by_name["layers.0.mlp.gate_proj"]
+                m_w = r_w.by_name["layers.0.mlp.gate_proj"]
+                self.assertEqual(m_uw.dtype, DType.Q2_AFFINE)
+                self.assertEqual(m_w.dtype, DType.Q2_AFFINE)
+                mat_uw = r_uw.read_matrix_f32(m_uw)
+                mat_w = r_w.read_matrix_f32(m_w)
+                err_uw = sum(
+                    weights[c] * (mat_uw[r][c] - ffn_mat[r][c]) ** 2
+                    for r in range(256)
+                    for c in range(16)
+                )
+                err_w = sum(
+                    weights[c] * (mat_w[r][c] - ffn_mat[r][c]) ** 2
+                    for r in range(256)
+                    for c in range(16)
+                )
+                self.assertLess(err_w, err_uw * 0.5)
+
+    def test_backbone_protection_floor_and_max_q2_share(self) -> None:
+        for role in ("router", "embedding", "lm_head", "attn_qk", "attn_v", "attn_o", "vision", "ssm_dt_a", "embed_head", "attn_qkv_o", "ssm_proj"):
+            self.assertIn(role, _BACKBONE_PROTECTED_ROLES)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            sf_dir = tmp / "dense_bf16"
+            _build_synthetic_bf16_qwen3_checkpoint(sf_dir, is_moe=False, num_layers=2)
+            # Backbone floor prevents dropping protected backbone roles to q2_affine at target_bits=2.1!
+            with self.assertRaises(ValueError):
+                gsq_convert(sf_dir, tmp / "too_low.amf", target_bits=2.1, model_id="too-low")
+
+        # Unit-level `solve_gsq_allocation` checks for `enforce_backbone_floor` and `max_q2_share`.
+        numel = 64 * 64
+        def _mk_unit(uid: str, role: str, sens: float) -> QuantUnitInput:
+            return QuantUnitInput(
+                unit_id=uid,
+                tensor_names=(uid,),
+                role=role,
+                layer=0,
+                expert=0,
+                numel=numel,
+                sensitivity=sens,
+                candidates=(
+                    QuantUnitCandidate(DType.Q2_AFFINE, (numel * 20) // 64, sens * numel * 0.12, 0.12, 64),
+                    QuantUnitCandidate(DType.Q3_AFFINE, (numel * 28) // 64, sens * numel * 0.03, 0.03, 64),
+                    QuantUnitCandidate(DType.Q4_AFFINE, (numel * 36) // 64, sens * numel * 0.008, 0.008, 64),
+                    QuantUnitCandidate(DType.BF16, numel * 2, 0.0, 0.0, 0),
+                ),
+            )
+
+        units = [
+            _mk_unit("layers.0.mlp.gate", "router", 10.0),
+            _mk_unit("layers.0.self_attn.q_proj", "attn_qkv_o", 5.0),
+            _mk_unit("embed_tokens", "embed_head", 5.0),
+            _mk_unit("layers.0.ssm.dt_a", "ssm_dt_a", 5.0),
+            _mk_unit("layers.0.ssm.in_proj", "ssm_proj", 5.0),
+            _mk_unit("layers.0.mlp.experts.0", "moe_expert", 3.0),
+            _mk_unit("layers.0.mlp.experts.1", "moe_expert", 2.0),
+            _mk_unit("layers.0.mlp.experts.2", "moe_expert", 1.0),
+            _mk_unit("layers.0.mlp.experts.3", "moe_expert", 0.5),
+        ]
+        with self.assertRaises(ValueError):
+            solve_gsq_allocation(units, target_bits=2.1, enforce_backbone_floor=True)
+
+        rep = solve_gsq_allocation(units, target_bits=3.5, enforce_backbone_floor=True, max_q2_share=0.25)
+        for u in rep.units:
+            if u.role in _BACKBONE_PROTECTED_ROLES:
+                self.assertNotEqual(u.chosen_dtype, DType.Q2_AFFINE)
+        q2_w = sum(u.numel for u in rep.units if u.chosen_dtype == DType.Q2_AFFINE)
+        total_q = sum(u.numel for u in rep.units)
+        self.assertLessEqual(q2_w / total_q, 0.25 + 1e-9)
+
+        with self.assertRaises(ValueError):
+            solve_gsq_allocation(units, target_bits=2.8, enforce_backbone_floor=True, max_q2_share=0.0)
+
+    def test_cli_lowbit_retranscode_guard_and_auto_target_bits(self) -> None:
+        rng = random.Random(3030)
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+
+            # 1. Build a synthetic 3-bit MLX MoE safetensors checkpoint & pack to 3-bit .amf.
+            h, inter, num_experts, num_layers = 128, 128, 4, 1
+            def _make_q3(rows: int, cols: int) -> tuple[bytes, bytes, bytes]:
+                groups = cols // 64
+                qb = bytearray()
+                sv: list[float] = []
+                bv: list[float] = []
+                for _ in range(rows):
+                    qb.extend(pack_mlx_affine_3bit([rng.randint(0, 7) for _ in range(cols)]))
+                    for _ in range(groups):
+                        sv.append(rng.uniform(0.01, 0.04))
+                        bv.append(rng.uniform(-0.1, 0.1))
+                f32_s = struct.pack(f"<{len(sv)}f", *sv)
+                f32_b = struct.pack(f"<{len(bv)}f", *bv)
+                s_bf16 = bytearray(len(sv) * 2)
+                b_bf16 = bytearray(len(bv) * 2)
+                s_bf16[0::2] = f32_s[2::4]
+                s_bf16[1::2] = f32_s[3::4]
+                b_bf16[0::2] = f32_b[2::4]
+                b_bf16[1::2] = f32_b[3::4]
+                return bytes(qb), bytes(s_bf16), bytes(b_bf16)
+
+            def _add_q3(td_map: dict[str, tuple[str, tuple[int, ...], bytes]], stem: str, rows: int, cols: int) -> None:
+                wd, sd, bd = _make_q3(rows, cols)
+                td_map[f"{stem}.weight"] = ("U32", (rows, (cols * 3) // 32), wd)
+                td_map[f"{stem}.scales"] = ("BF16", (rows, cols // 64), sd)
+                td_map[f"{stem}.biases"] = ("BF16", (rows, cols // 64), bd)
+
+            q3_dir = tmp / "moe_3bit"
+            q3_dir.mkdir()
+            ones_bf16 = bytearray(h * 2)
+            f32_1 = struct.pack(f"<{h}f", *([1.0] * h))
+            ones_bf16[0::2] = f32_1[2::4]
+            ones_bf16[1::2] = f32_1[3::4]
+            q3_tensors: dict[str, tuple[str, tuple[int, ...], bytes]] = {
+                "model.norm.weight": ("BF16", (h,), bytes(ones_bf16)),
+                "model.layers.0.input_layernorm.weight": ("BF16", (h,), bytes(ones_bf16)),
+                "model.layers.0.post_attention_layernorm.weight": ("BF16", (h,), bytes(ones_bf16)),
+            }
+            _add_q3(q3_tensors, "model.embed_tokens", 128, h)
+            _add_q3(q3_tensors, "lm_head", 128, h)
+            _add_q3(q3_tensors, "model.layers.0.self_attn.q_proj", h, h)
+            _add_q3(q3_tensors, "model.layers.0.self_attn.k_proj", 64, h)
+            _add_q3(q3_tensors, "model.layers.0.self_attn.v_proj", 64, h)
+            _add_q3(q3_tensors, "model.layers.0.self_attn.o_proj", h, h)
+            _add_q3(q3_tensors, "model.layers.0.mlp.gate", num_experts, h)
+            for proj, r_dim, c_dim in (("gate_proj", inter, h), ("up_proj", inter, h), ("down_proj", h, inter)):
+                w_all, s_all, b_all = bytearray(), bytearray(), bytearray()
+                for _ in range(num_experts):
+                    wd, sd, bd = _make_q3(r_dim, c_dim)
+                    w_all.extend(wd)
+                    s_all.extend(sd)
+                    b_all.extend(bd)
+                q3_tensors[f"model.layers.0.mlp.switch_mlp.{proj}.weight"] = ("U32", (num_experts, r_dim, (c_dim * 3) // 32), bytes(w_all))
+                q3_tensors[f"model.layers.0.mlp.switch_mlp.{proj}.scales"] = ("BF16", (num_experts, r_dim, c_dim // 64), bytes(s_all))
+                q3_tensors[f"model.layers.0.mlp.switch_mlp.{proj}.biases"] = ("BF16", (num_experts, r_dim, c_dim // 64), bytes(b_all))
+            _write_safetensors(q3_dir / "model.safetensors", q3_tensors)
+            (q3_dir / "config.json").write_text(json.dumps({"tie_word_embeddings": False}), encoding="utf-8")
+
+            # CLI `gsq-convert` refuses 3-bit -> q2_affine double-quantization by default!
+            with self.assertRaises(ValueError):
+                main([
+                    "gsq-convert",
+                    "--input", str(q3_dir),
+                    "--output", str(tmp / "blocked.amf"),
+                    "--target-bits", "2.95",
+                ])
+
+            # With `--allow-retranscode-lowbit` (and `--allow-unsafe-q2` since 2.95 needs >55% Q2 on small 4-expert model), succeeds!
+            retrans_amf = tmp / "retrans.amf"
+            buf_rt = io.StringIO()
+            with redirect_stdout(buf_rt):
+                rc_rt = main([
+                    "gsq-convert",
+                    "--input", str(q3_dir),
+                    "--output", str(retrans_amf),
+                    "--target-bits", "2.95",
+                    "--allow-retranscode-lowbit",
+                    "--allow-unsafe-q2",
+                ])
+            self.assertEqual(rc_rt, 0)
+            _, rt_metas = load_amf_metadata(retrans_amf)
+            self.assertTrue(any(m.dtype == DType.Q2_AFFINE for m in rt_metas))
+
+            # 2. Auto `target_bits`: Dense `--quant-profile gsq-rco` without `--target-bits` -> 0 `q2_affine` & >= 4.0b!
+            dense_dir = tmp / "dense_auto"
+            _build_synthetic_bf16_qwen3_checkpoint(dense_dir, is_moe=False, num_layers=2)
+            dense_pack_amf = tmp / "dense_pack_auto.amf"
+            dense_manifest = tmp / "dense_auto_manifest.json"
+            buf_dp = io.StringIO()
+            with redirect_stdout(buf_dp):
+                rc_dp = main([
+                    "pack-amf",
+                    "--input", str(dense_dir),
+                    "--output", str(dense_pack_amf),
+                    "--model-id", "dense-auto",
+                    "--quant-profile", "gsq-rco",
+                    "--manifest", str(dense_manifest),
+                ])
+            self.assertEqual(rc_dp, 0)
+            dm = json.loads(dense_manifest.read_text(encoding="utf-8"))
+            self.assertAlmostEqual(dm["target_bits"], 4.15, places=2)
+            self.assertGreaterEqual(dm["effective_bits"], 4.0)
+            self.assertLessEqual(dm["effective_bits"], 4.20)
+            _, dp_metas = load_amf_metadata(dense_pack_amf)
+            self.assertFalse(any(m.dtype == DType.Q2_AFFINE for m in dp_metas))
+
+            dense_gsq_amf = tmp / "dense_gsq_auto.amf"
+            buf_dg = io.StringIO()
+            with redirect_stdout(buf_dg):
+                rc_dg = main([
+                    "gsq-convert",
+                    "--input", str(dense_dir),
+                    "--output", str(dense_gsq_amf),
+                ])
+            self.assertEqual(rc_dg, 0)
+            _, dg_metas = load_amf_metadata(dense_gsq_amf)
+            self.assertFalse(any(m.dtype == DType.Q2_AFFINE for m in dg_metas))
+
+            # 3. `pack-amf --quant-profile gsq-rco` also blocks 3-bit -> q2_affine without `--allow-retranscode-lowbit`,
+            #    and MoE auto `target_bits` resolves to 3.50 with CLI default `max_q2_share=0.55`.
+            with self.assertRaises(ValueError):
+                main([
+                    "pack-amf",
+                    "--input", str(q3_dir),
+                    "--output", str(tmp / "pack_blocked.amf"),
+                    "--quant-profile", "gsq-rco",
+                    "--target-bits", "2.95",
+                ])
+
+            moe_dir = tmp / "moe_auto"
+            _build_synthetic_bf16_qwen3_checkpoint(moe_dir, is_moe=True, num_layers=2, num_experts=8)
+            moe_auto_amf = tmp / "moe_auto.amf"
+            moe_manifest = tmp / "moe_auto_manifest.json"
+            buf_ma = io.StringIO()
+            with redirect_stdout(buf_ma):
+                rc_ma = main([
+                    "gsq-convert",
+                    "--input", str(moe_dir),
+                    "--output", str(moe_auto_amf),
+                    "--manifest", str(moe_manifest),
+                ])
+            self.assertEqual(rc_ma, 0)
+            mm = json.loads(moe_manifest.read_text(encoding="utf-8"))
+            self.assertAlmostEqual(mm["target_bits"], 3.50, places=2)
+            self.assertLessEqual(mm["effective_bits"], 3.55)
+            self.assertLessEqual(mm["dtype_weight_share"].get("q2_affine", 0.0), 0.55 + 1e-6)
+
+    def test_fine_rungs_dense_and_moe_verify_and_decode_parity(self) -> None:
+        self.assertTrue(AMINFER_BIN.exists(), f"missing {AMINFER_BIN}; run `zig build` first")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            for is_moe, label, t_bits in ((False, "dense_fine", "4.60"), (True, "moe_fine", "3.60")):
+                sf_dir = tmp / label
+                _, cfg_path, tok_path = _build_synthetic_bf16_qwen3_checkpoint(
+                    sf_dir,
+                    is_moe=is_moe,
+                    seed=909 if is_moe else 808,
+                    num_layers=2,
+                    num_experts=8,
+                    top_k=2,
+                )
+                out_amf = tmp / f"{label}.amf"
+                manifest_p = tmp / f"{label}_manifest.json"
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = main([
+                        "gsq-convert",
+                        "--input", str(sf_dir),
+                        "--output", str(out_amf),
+                        "--target-bits", t_bits,
+                        "--fine-rungs",
+                        "--manifest", str(manifest_p),
+                    ])
+                self.assertEqual(rc, 0)
+                _, metas = load_amf_metadata(out_amf)
+                # Confirm fine rungs actually surfaced g=32 or Q5/Q6/Q8_AFFINE!
+                fine_hits = [
+                    m for m in metas
+                    if m.dtype in (DType.Q5_AFFINE, DType.Q6_AFFINE, DType.Q8_AFFINE) or m.group_size == 32
+                ]
+                self.assertGreater(len(fine_hits), 0, msg=f"{label} did not use any fine rungs")
+
+                if is_moe:
+                    for l in range(2):
+                        layer_schemes = {
+                            (m.dtype, m.group_size)
+                            for m in metas
+                            if m.layer == l and m.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT)
+                        }
+                        self.assertLessEqual(len(layer_schemes), 5, msg=f"layer {l} exceeded NUM_SCHEME_BUCKETS=5")
+
+                v_proc = subprocess.run([str(AMINFER_BIN), "verify-amf", str(out_amf)], capture_output=True, text=True)
+                self.assertEqual(v_proc.returncode, 0, msg=v_proc.stdout + v_proc.stderr)
+                self.assertIn("amf.status       ok", v_proc.stdout)
+
+                d_proc = subprocess.run(
+                    [
+                        str(AMINFER_BIN),
+                        "decode",
+                        "--amf", str(out_amf),
+                        "--config", str(cfg_path),
+                        "--tokenizer", str(tok_path),
+                        "--prompt", "",
+                        "--max-tokens", "4",
+                        "--ignore-eos",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(d_proc.returncode, 0, msg=f"{label} decode failed:\n{d_proc.stdout}\n{d_proc.stderr}")
+                self.assertIn("decode.swapouts_delta            0", d_proc.stdout)
+                m_toks = re.search(r"decode\.token_ids\s+\[([^\]]*)\]", d_proc.stdout)
+                self.assertIsNotNone(m_toks, msg=d_proc.stdout)
+                assert m_toks is not None
+                zig_tokens = [int(x.strip()) for x in m_toks.group(1).split(",") if x.strip()]
+                cfg_dict = json.loads(cfg_path.read_text(encoding="utf-8"))
+                bos_id = int(cfg_dict.get("bos_token_id", 0))
+                ref_tokens = _cpu_fp32_qwen3_greedy(out_amf, cfg_dict, [bos_id], max_new=4)
+                self.assertEqual(zig_tokens, ref_tokens, msg=f"{label} tokens {zig_tokens} != {ref_tokens}")
+
+    def test_w8_router_trace_from_decode_consumed_by_expert_heat_no_warning(self) -> None:
+        self.assertTrue(AMINFER_BIN.exists(), f"missing {AMINFER_BIN}; run `zig build` first")
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            sf_dir = tmp / "moe_src"
+            _, cfg_path, tok_path = _build_synthetic_bf16_qwen3_checkpoint(
+                sf_dir, is_moe=True, seed=5150, num_layers=2, num_experts=8, top_k=2
+            )
+            amf_path = tmp / "moe.amf"
+            pack_amf_from_safetensors(sf_dir, amf_path, model_id="w8-trace-moe")
+
+            # 1. Shallow `expert-heat` without `--calibration-jsonl` emits `WARNING:` on stderr.
+            heat_shallow = tmp / "heat_shallow.json"
+            out1, err1 = io.StringIO(), io.StringIO()
+            with redirect_stdout(out1), redirect_stderr(err1):
+                rc1 = main([
+                    "expert-heat",
+                    "--input", str(amf_path),
+                    "--output", str(heat_shallow),
+                ])
+            self.assertEqual(rc1, 0)
+            self.assertIn("WARNING:", err1.getvalue())
+            self.assertIn("--dump-router-trace", err1.getvalue())
+            self.assertIn("--calibration-jsonl", err1.getvalue())
+
+            # 2. Capture real router trace via `aminfer decode --dump-router-trace`.
+            trace_jsonl = tmp / "router_trace.jsonl"
+            d_proc = subprocess.run(
+                [
+                    str(AMINFER_BIN),
+                    "decode",
+                    "--amf", str(amf_path),
+                    "--config", str(cfg_path),
+                    "--tokenizer", str(tok_path),
+                    "--prompt", "",
+                    "--max-tokens", "4",
+                    "--ignore-eos",
+                    "--dump-router-trace", str(trace_jsonl),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(d_proc.returncode, 0, msg=d_proc.stdout + d_proc.stderr)
+            self.assertTrue(trace_jsonl.is_file())
+            self.assertGreater(len(trace_jsonl.read_text(encoding="utf-8").splitlines()), 0)
+
+            # 3. `expert-heat --calibration-jsonl <trace.jsonl>` yields `calibration_mode == "router_trace"` with NO warning!
+            heat_trace = tmp / "heat_trace.json"
+            out2, err2 = io.StringIO(), io.StringIO()
+            with redirect_stdout(out2), redirect_stderr(err2):
+                rc2 = main([
+                    "expert-heat",
+                    "--input", str(amf_path),
+                    "--calibration-jsonl", str(trace_jsonl),
+                    "--output", str(heat_trace),
+                ])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(err2.getvalue(), "")
+            heat_doc = json.loads(heat_trace.read_text(encoding="utf-8"))
+            self.assertEqual(heat_doc["calibration_mode"], "router_trace")
 
 
 if __name__ == "__main__":
