@@ -59,11 +59,27 @@ typedef enum ami_sdk_dtype {
     AMI_SDK_DTYPE_F32 = 1
 } ami_sdk_dtype;
 
-/* Pre-tokenizer dialect auto-detected from tokenizer.json (W5). */
+/* Pre-tokenizer dialect auto-detected from tokenizer.json (W5 / W24). */
 typedef enum ami_sdk_dialect {
     AMI_SDK_DIALECT_QWEN     = 0,
-    AMI_SDK_DIALECT_DEEPSEEK = 1
+    AMI_SDK_DIALECT_DEEPSEEK = 1,
+    AMI_SDK_DIALECT_INKLING2 = 2,
+    AMI_SDK_DIALECT_HY4      = 3
 } ami_sdk_dialect;
+
+/* Reasoning effort level for W24 / ADR-0024 template and thinking control. */
+typedef enum ami_sdk_reasoning_effort {
+    AMI_SDK_EFFORT_DEFAULT      = 0,
+    AMI_SDK_EFFORT_NONE         = 1,
+    AMI_SDK_EFFORT_NO_THINK     = 2,
+    AMI_SDK_EFFORT_MINIMAL      = 3,
+    AMI_SDK_EFFORT_LOW          = 4,
+    AMI_SDK_EFFORT_MEDIUM       = 5,
+    AMI_SDK_EFFORT_HIGH         = 6,
+    AMI_SDK_EFFORT_XHIGH        = 7,
+    AMI_SDK_EFFORT_MAX          = 8,
+    AMI_SDK_EFFORT_CUSTOM_FLOAT = 9
+} ami_sdk_reasoning_effort;
 
 /* Streaming callback delta channel classification. */
 typedef enum ami_sdk_delta_kind {
@@ -177,6 +193,8 @@ typedef struct ami_sdk_gen_params {
     uint32_t reset_kv_cache;          /* 1 => reset KV cache before prefill, 0 => append */
     uint32_t skip_special_tokens;     /* 1 => omit special tokens from UTF-8 deltas */
     uint32_t reserved;
+    uint32_t reasoning_effort;        /* ami_sdk_reasoning_effort */
+    float reasoning_effort_value;     /* [0.0f, 0.99f] when AMI_SDK_EFFORT_CUSTOM_FLOAT */
     const ami_sdk_cancel_token *cancel_token;
 } ami_sdk_gen_params;
 

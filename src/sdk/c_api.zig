@@ -144,6 +144,21 @@ pub const DType = enum(u32) {
 pub const Dialect = enum(u32) {
     qwen = 0,
     deepseek = 1,
+    inkling2 = 2,
+    hy4 = 3,
+};
+
+pub const ReasoningEffort = enum(u32) {
+    default = 0,
+    none = 1,
+    no_think = 2,
+    minimal = 3,
+    low = 4,
+    medium = 5,
+    high = 6,
+    xhigh = 7,
+    max = 8,
+    custom_float = 9,
 };
 
 pub const DeltaKind = enum(u32) {
@@ -237,6 +252,8 @@ pub const GenParams = extern struct {
     reset_kv_cache: u32,
     skip_special_tokens: u32,
     reserved: u32,
+    reasoning_effort: u32,
+    reasoning_effort_value: f32,
     cancel_token: ?*const SdkCancelToken,
 };
 
@@ -338,6 +355,31 @@ comptime {
     std.debug.assert(@sizeOf(EngineOptions) == @sizeOf(sdk_c.ami_sdk_engine_options));
     std.debug.assert(@sizeOf(EngineStats) == @sizeOf(sdk_c.ami_sdk_engine_stats));
     std.debug.assert(@sizeOf(GenParams) == @sizeOf(sdk_c.ami_sdk_gen_params));
+    std.debug.assert(@offsetOf(GenParams, "struct_size") == @offsetOf(sdk_c.ami_sdk_gen_params, "struct_size"));
+    std.debug.assert(@offsetOf(GenParams, "max_tokens") == @offsetOf(sdk_c.ami_sdk_gen_params, "max_tokens"));
+    std.debug.assert(@offsetOf(GenParams, "temperature") == @offsetOf(sdk_c.ami_sdk_gen_params, "temperature"));
+    std.debug.assert(@offsetOf(GenParams, "top_p") == @offsetOf(sdk_c.ami_sdk_gen_params, "top_p"));
+    std.debug.assert(@offsetOf(GenParams, "top_k") == @offsetOf(sdk_c.ami_sdk_gen_params, "top_k"));
+    std.debug.assert(@offsetOf(GenParams, "min_p") == @offsetOf(sdk_c.ami_sdk_gen_params, "min_p"));
+    std.debug.assert(@offsetOf(GenParams, "repetition_penalty") == @offsetOf(sdk_c.ami_sdk_gen_params, "repetition_penalty"));
+    std.debug.assert(@offsetOf(GenParams, "presence_penalty") == @offsetOf(sdk_c.ami_sdk_gen_params, "presence_penalty"));
+    std.debug.assert(@offsetOf(GenParams, "frequency_penalty") == @offsetOf(sdk_c.ami_sdk_gen_params, "frequency_penalty"));
+    std.debug.assert(@offsetOf(GenParams, "has_seed") == @offsetOf(sdk_c.ami_sdk_gen_params, "has_seed"));
+    std.debug.assert(@offsetOf(GenParams, "seed") == @offsetOf(sdk_c.ami_sdk_gen_params, "seed"));
+    std.debug.assert(@offsetOf(GenParams, "stop_token_ids") == @offsetOf(sdk_c.ami_sdk_gen_params, "stop_token_ids"));
+    std.debug.assert(@offsetOf(GenParams, "stop_token_count") == @offsetOf(sdk_c.ami_sdk_gen_params, "stop_token_count"));
+    std.debug.assert(@offsetOf(GenParams, "ignore_eos") == @offsetOf(sdk_c.ami_sdk_gen_params, "ignore_eos"));
+    std.debug.assert(@offsetOf(GenParams, "start_in_think") == @offsetOf(sdk_c.ami_sdk_gen_params, "start_in_think"));
+    std.debug.assert(@offsetOf(GenParams, "reset_kv_cache") == @offsetOf(sdk_c.ami_sdk_gen_params, "reset_kv_cache"));
+    std.debug.assert(@offsetOf(GenParams, "skip_special_tokens") == @offsetOf(sdk_c.ami_sdk_gen_params, "skip_special_tokens"));
+    std.debug.assert(@offsetOf(GenParams, "reserved") == @offsetOf(sdk_c.ami_sdk_gen_params, "reserved"));
+    std.debug.assert(@offsetOf(GenParams, "reasoning_effort") == @offsetOf(sdk_c.ami_sdk_gen_params, "reasoning_effort"));
+    std.debug.assert(@offsetOf(GenParams, "reasoning_effort_value") == @offsetOf(sdk_c.ami_sdk_gen_params, "reasoning_effort_value"));
+    std.debug.assert(@offsetOf(GenParams, "cancel_token") == @offsetOf(sdk_c.ami_sdk_gen_params, "cancel_token"));
+    std.debug.assert(@backingInt(Dialect.inkling2) == sdk_c.AMI_SDK_DIALECT_INKLING2);
+    std.debug.assert(@backingInt(Dialect.hy4) == sdk_c.AMI_SDK_DIALECT_HY4);
+    std.debug.assert(@backingInt(ReasoningEffort.default) == sdk_c.AMI_SDK_EFFORT_DEFAULT);
+    std.debug.assert(@backingInt(ReasoningEffort.custom_float) == sdk_c.AMI_SDK_EFFORT_CUSTOM_FLOAT);
     std.debug.assert(@sizeOf(StreamEvent) == @sizeOf(sdk_c.ami_sdk_stream_event));
     std.debug.assert(@sizeOf(GenResult) == @sizeOf(sdk_c.ami_sdk_gen_result));
     std.debug.assert(@sizeOf(TensorView) == @sizeOf(sdk_c.ami_sdk_tensor_view));
@@ -1129,6 +1171,8 @@ pub export fn ami_sdk_gen_params_init(params_ptr: ?*GenParams) callconv(.c) void
         .reset_kv_cache = 1,
         .skip_special_tokens = 1,
         .reserved = 0,
+        .reasoning_effort = @backingInt(ReasoningEffort.default),
+        .reasoning_effort_value = 0.0,
         .cancel_token = null,
     };
 }
@@ -1267,6 +1311,9 @@ pub export fn ami_sdk_tokenizer_vocab_size(tokenizer: ?*const SdkTokenizer) call
 
 pub export fn ami_sdk_tokenizer_dialect(tokenizer: ?*const SdkTokenizer) callconv(.c) u32 {
     const tok = tokenizer orelse return @backingInt(Dialect.qwen);
+    if (@hasField(@TypeOf(tok.tok), "dialect")) {
+        return @backingInt(tok.tok.dialect);
+    }
     return switch (tok.tok.pre_tokenizer_kind) {
         .qwen => @backingInt(Dialect.qwen),
         .deepseek => @backingInt(Dialect.deepseek),
@@ -1371,8 +1418,10 @@ pub export fn ami_sdk_detokenize(
     const ids = iptr[0..ids_len];
     const skip = (skip_special_tokens != 0);
 
+    const v = tok.tok.vocabSize();
     var needed: usize = 0;
     for (ids) |id| {
+        if (id >= v) return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "token_id out of range");
         if (skip and tok.tok.isSpecialToken(id)) continue;
         const piece = tok.tok.tokenBytes(id) catch |err| {
             return failFmt(AMI_SDK_ERR_TOKENIZER, "detokenize failed: {s}", .{@errorName(err)});
@@ -2166,6 +2215,45 @@ const StreamDispatchCtx = struct {
     }
 };
 
+fn validateGenParams(params: *const GenParams) Status {
+    if (params.struct_size != @sizeOf(GenParams)) {
+        return fail(AMI_SDK_ERR_ABI_MISMATCH, "GenParams struct_size mismatch");
+    }
+    if (!std.math.isFinite(params.temperature) or params.temperature < 0.0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "temperature must be finite and >= 0.0");
+    }
+    if (!std.math.isFinite(params.top_p) or params.top_p <= 0.0 or params.top_p > 1.0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "top_p must be finite and in (0.0, 1.0]");
+    }
+    if (!std.math.isFinite(params.min_p) or params.min_p < 0.0 or params.min_p >= 1.0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "min_p must be finite and in [0.0, 1.0)");
+    }
+    if (!std.math.isFinite(params.repetition_penalty) or params.repetition_penalty <= 0.0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "repetition_penalty must be finite and > 0.0");
+    }
+    if (!std.math.isFinite(params.presence_penalty)) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "presence_penalty must be finite");
+    }
+    if (!std.math.isFinite(params.frequency_penalty)) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "frequency_penalty must be finite");
+    }
+    if (params.stop_token_count > MAX_STOP_TOKENS) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "stop_token_count exceeds AMI_SDK_MAX_STOP_TOKENS");
+    }
+    if (params.reasoning_effort > @backingInt(ReasoningEffort.custom_float)) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "invalid reasoning_effort tier");
+    }
+    if (params.reasoning_effort == @backingInt(ReasoningEffort.custom_float)) {
+        if (!std.math.isFinite(params.reasoning_effort_value) or
+            params.reasoning_effort_value < 0.0 or
+            params.reasoning_effort_value > 0.99)
+        {
+            return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "reasoning_effort_value must be in [0.0, 0.99]");
+        }
+    }
+    return AMI_SDK_OK;
+}
+
 fn generateTokensImpl(
     eng: *SdkEngine,
     prompt_ids: []const u32,
@@ -2175,9 +2263,8 @@ fn generateTokensImpl(
     out_token_ids: ?[]u32,
     out_result: ?*GenResult,
 ) Status {
-    if (params.struct_size != @sizeOf(GenParams)) {
-        return fail(AMI_SDK_ERR_ABI_MISMATCH, "GenParams struct_size mismatch");
-    }
+    const param_st = validateGenParams(params);
+    if (param_st != AMI_SDK_OK) return param_st;
     if (out_result) |res| {
         if (res.struct_size != 0 and res.struct_size < @sizeOf(GenResult)) {
             return fail(AMI_SDK_ERR_ABI_MISMATCH, "GenResult struct_size mismatch");
@@ -2367,6 +2454,8 @@ pub export fn ami_sdk_generate_text(
     if (prompt_len == 0) return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "prompt_len is 0");
     const pstr = prompt_utf8 orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "prompt_utf8 is NULL");
     const params = params_ptr orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "params is NULL");
+    const param_st = validateGenParams(params);
+    if (param_st != AMI_SDK_OK) return param_st;
 
     var tok_len: usize = 0;
     const tok_st = ami_sdk_tokenize(
@@ -3741,6 +3830,12 @@ pub export fn ami_sdk_prefill_vision(
 
     const prefix_slice: []const u32 = if (prefix_len > 0) prefix_ids.?[0..prefix_len] else &.{};
     const suffix_slice: []const u32 = if (suffix_len > 0) suffix_ids.?[0..suffix_len] else &.{};
+    for (prefix_slice) |tid| {
+        if (tid >= eng.vocab_size) return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "prefix token_id out of range");
+    }
+    for (suffix_slice) |tid| {
+        if (tid >= eng.vocab_size) return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "suffix token_id out of range");
+    }
 
     var stack_frames: [32]metal.VisionFrame = undefined;
     var heap_frames: ?[]metal.VisionFrame = null;
@@ -4377,4 +4472,200 @@ test "sdk.c_api: preallocated gpu_sampler at startup and single penalty on >MAX_
     // (A double-penalty bug on [0..1024) would yield 10.0 - 8.0 = 2.0 < 3.0 and wrongly pick `tail_tok`.)
     const picked = sampleNextToken(eng, 0, &gparams, &req_rng);
     try std.testing.expectEqual(@as(u32, 0), picked);
+}
+
+test "sdk.c_api: C17 parameter validation, reasoning_effort bounds, max_tokens=0, and token range guards" {
+    const qcfg: qwen3.ModelConfig = .{
+        .arch = .qwen3_dense,
+        .quant_bits = .q4,
+        .vocab_size = 256,
+        .hidden_size = 128,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .intermediate_size = 256,
+        .tie_word_embeddings = false,
+    };
+    const amf_bytes = try qwen3.buildSyntheticAmfImageWithSpec(std.testing.allocator, qcfg, .{
+        .linear_dtype = .q4_affine,
+        .embed_dtype = .f16,
+        .norm_dtype = .f16,
+    }, 33);
+    defer std.testing.allocator.free(amf_bytes);
+
+    const cfg_json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "architectures": ["Qwen3ForCausalLM"],
+        \\  "vocab_size": 256,
+        \\  "hidden_size": 128,
+        \\  "num_hidden_layers": 1,
+        \\  "num_attention_heads": 4,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 64,
+        \\  "intermediate_size": 256,
+        \\  "rms_norm_eps": 1e-6,
+        \\  "rope_theta": 1000000.0,
+        \\  "max_position_embeddings": 128,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+
+    const tmp_root_z = std.c.getenv("TMPDIR") orelse "/tmp";
+    const tmp_root = std.mem.span(tmp_root_z);
+    const pid: u32 = @bitCast(std.c.getpid());
+    var amf_path_buf: [512:0]u8 = undefined;
+    var cfg_path_buf: [512:0]u8 = undefined;
+    const amf_slice = try std.fmt.bufPrint(&amf_path_buf, "{s}/ami_sdk_c17_{d}.amf", .{ std.mem.trimEnd(u8, tmp_root, "/"), pid });
+    amf_path_buf[amf_slice.len] = 0;
+    const cfg_slice = try std.fmt.bufPrint(&cfg_path_buf, "{s}/ami_sdk_c17_{d}_config.json", .{ std.mem.trimEnd(u8, tmp_root, "/"), pid });
+    cfg_path_buf[cfg_slice.len] = 0;
+
+    for ([_]struct { path: [:0]const u8, data: []const u8 }{
+        .{ .path = amf_path_buf[0..amf_slice.len :0], .data = amf_bytes },
+        .{ .path = cfg_path_buf[0..cfg_slice.len :0], .data = cfg_json },
+    }) |item| {
+        const fd = std.c.open(item.path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        var w: usize = 0;
+        while (w < item.data.len) {
+            const rc = std.c.write(fd, item.data.ptr + w, item.data.len - w);
+            try std.testing.expect(rc > 0);
+            w += @intCast(rc);
+        }
+    }
+    defer _ = std.c.unlink(&amf_path_buf);
+    defer _ = std.c.unlink(&cfg_path_buf);
+
+    var opts: EngineOptions = undefined;
+    ami_sdk_engine_options_init(&opts);
+    opts.amf_path = &amf_path_buf;
+    opts.config_json_path = &cfg_path_buf;
+    opts.max_seq_len = 64;
+    opts.startup_canary = 0;
+
+    var eng: ?*SdkEngine = null;
+    try std.testing.expectEqual(AMI_SDK_OK, ami_sdk_engine_create(&opts, &eng));
+    defer ami_sdk_engine_destroy(eng);
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    var gres: GenResult = std.mem.zeroes(GenResult);
+    gres.struct_size = @sizeOf(GenResult);
+
+    // 1. max_tokens = 0 with null output buffer succeeds cleanly with 0 generated tokens.
+    {
+        var gp: GenParams = undefined;
+        ami_sdk_gen_params_init(&gp);
+        gp.max_tokens = 0;
+        gp.reasoning_effort = @backingInt(ReasoningEffort.high);
+        try std.testing.expectEqual(
+            AMI_SDK_OK,
+            ami_sdk_generate_tokens(eng, &prompt, prompt.len, &gp, null, null, null, 0, &gres),
+        );
+        try std.testing.expectEqual(@as(u32, 0), gres.generated_tokens);
+        try std.testing.expectEqual(@as(u32, 3), gres.prompt_tokens);
+    }
+
+    // 2. Valid CUSTOM_FLOAT boundaries (0.0 and 0.99) and min_p == 0.0 succeed.
+    for ([_]f32{ 0.0, 0.5, 0.99 }) |eff| {
+        var gp: GenParams = undefined;
+        ami_sdk_gen_params_init(&gp);
+        gp.max_tokens = 1;
+        gp.min_p = 0.0;
+        gp.reasoning_effort = @backingInt(ReasoningEffort.custom_float);
+        gp.reasoning_effort_value = eff;
+        var out_tok: [1]u32 = undefined;
+        try std.testing.expectEqual(
+            AMI_SDK_OK,
+            ami_sdk_generate_tokens(eng, &prompt, prompt.len, &gp, null, null, &out_tok, 1, &gres),
+        );
+        try std.testing.expectEqual(@as(u32, 1), gres.generated_tokens);
+    }
+
+    // 3. Invalid sampling & reasoning_effort parameters are rejected with AMI_SDK_ERR_INVALID_ARGUMENT.
+    const BadCase = struct {
+        temp: f32 = 0.0,
+        top_p: f32 = 1.0,
+        min_p: f32 = 0.0,
+        rep: f32 = 1.0,
+        pres: f32 = 0.0,
+        freq: f32 = 0.0,
+        stop_cnt: u32 = 0,
+        effort: u32 = @backingInt(ReasoningEffort.default),
+        effort_val: f32 = 0.0,
+    };
+    const bad_cases = [_]BadCase{
+        .{ .temp = -0.1 },
+        .{ .temp = std.math.nan(f32) },
+        .{ .temp = std.math.inf(f32) },
+        .{ .top_p = 0.0 },
+        .{ .top_p = -0.2 },
+        .{ .top_p = 1.01 },
+        .{ .top_p = std.math.nan(f32) },
+        .{ .min_p = -0.01 },
+        .{ .min_p = 1.0 },
+        .{ .min_p = std.math.inf(f32) },
+        .{ .rep = 0.0 },
+        .{ .rep = -1.0 },
+        .{ .rep = std.math.nan(f32) },
+        .{ .pres = std.math.inf(f32) },
+        .{ .freq = -std.math.inf(f32) },
+        .{ .stop_cnt = MAX_STOP_TOKENS + 1 },
+        .{ .effort = 10 },
+        .{ .effort = @backingInt(ReasoningEffort.custom_float), .effort_val = -0.01 },
+        .{ .effort = @backingInt(ReasoningEffort.custom_float), .effort_val = 1.0 },
+        .{ .effort = @backingInt(ReasoningEffort.custom_float), .effort_val = std.math.nan(f32) },
+    };
+    for (bad_cases) |bc| {
+        var gp: GenParams = undefined;
+        ami_sdk_gen_params_init(&gp);
+        gp.max_tokens = 1;
+        gp.temperature = bc.temp;
+        gp.top_p = bc.top_p;
+        gp.min_p = bc.min_p;
+        gp.repetition_penalty = bc.rep;
+        gp.presence_penalty = bc.pres;
+        gp.frequency_penalty = bc.freq;
+        gp.stop_token_count = bc.stop_cnt;
+        gp.reasoning_effort = bc.effort;
+        gp.reasoning_effort_value = bc.effort_val;
+        try std.testing.expectEqual(
+            AMI_SDK_ERR_INVALID_ARGUMENT,
+            ami_sdk_generate_tokens(eng, &prompt, prompt.len, &gp, null, null, null, 0, &gres),
+        );
+    }
+
+    // 4. Out-of-range token IDs rejected in prefill, generate, step_decode, and detokenize.
+    const bad_prompt = [_]u32{ 1, 256 };
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_prefill_tokens(eng, &bad_prompt, bad_prompt.len, 1, 1, null),
+    );
+    {
+        var gp: GenParams = undefined;
+        ami_sdk_gen_params_init(&gp);
+        try std.testing.expectEqual(
+            AMI_SDK_ERR_INVALID_ARGUMENT,
+            ami_sdk_generate_tokens(eng, &bad_prompt, bad_prompt.len, &gp, null, null, null, 0, &gres),
+        );
+    }
+    var next_tok: u32 = 0;
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_step_decode(eng, 256, &next_tok));
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_step_decode(eng, TOKEN_NONE, &next_tok));
+
+    const mini_tok_json =
+        \\{"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]},"added_tokens":[]}
+    ;
+    var tok: ?*SdkTokenizer = null;
+    try std.testing.expectEqual(AMI_SDK_OK, ami_sdk_tokenizer_from_json(mini_tok_json.ptr, mini_tok_json.len, &tok));
+    defer ami_sdk_tokenizer_destroy(tok);
+    const bad_detok = [_]u32{ 0, 2 };
+    var need_bytes: usize = 0;
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_detokenize(tok, &bad_detok, bad_detok.len, 1, null, 0, &need_bytes),
+    );
 }

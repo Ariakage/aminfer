@@ -59,6 +59,68 @@ pub const ZT0_LUT4_IDENTITY_TABLE: [32]f16 align(64) = blk: {
     break :blk tbl;
 };
 
+/// Constant 64-byte `ZT0` register codebook for 4-bit `E2M1` (`luti4`, C25)
+/// at 32-bit stride (`{0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6}`).
+pub const ZT0_E2M1_TABLE: [32]f16 align(64) = blk: {
+    const vals = [16]f16{
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        @as(f16, @bitCast(@as(u16, 0x8000))),
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    };
+    var tbl: [32]f16 = undefined;
+    for (vals, 0..) |v, i| {
+        tbl[2 * i] = v;
+        tbl[2 * i + 1] = v;
+    }
+    break :blk tbl;
+};
+
+/// Constant 64-byte `ZT0` register codebook for `gguf_q2_0` (`luti2`: `{-1, 0, +1, +2}`).
+pub const ZT0_Q2_0_TABLE: [32]f16 align(64) = blk: {
+    const vals = [4]f16{ -1.0, 0.0, 1.0, 2.0 };
+    var tbl: [32]f16 = @splat(0.0);
+    for (vals, 0..) |v, i| {
+        tbl[2 * i] = v;
+        tbl[2 * i + 1] = v;
+    }
+    break :blk tbl;
+};
+
+/// Constant 64-byte `ZT0` register codebook for ternary `tq1_0`/`tq2_0` (`luti2`: `{-1, 0, +1, 0}`).
+pub const ZT0_TQ_TABLE: [32]f16 align(64) = blk: {
+    const vals = [4]f16{ -1.0, 0.0, 1.0, 0.0 };
+    var tbl: [32]f16 = @splat(0.0);
+    for (vals, 0..) |v, i| {
+        tbl[2 * i] = v;
+        tbl[2 * i + 1] = v;
+    }
+    break :blk tbl;
+};
+
+/// Constant 64-byte `ZT0` register codebook for `iq2_xxs` (`luti4`: `{8, 25, 43, 0, -8, -25, -43, 0}`).
+pub const ZT0_IQ2_XXS_TABLE: [32]f16 align(64) = blk: {
+    const vals = [8]f16{ 8.0, 25.0, 43.0, 0.0, -8.0, -25.0, -43.0, 0.0 };
+    var tbl: [32]f16 = @splat(0.0);
+    for (vals, 0..) |v, i| {
+        tbl[2 * i] = v;
+        tbl[2 * i + 1] = v;
+    }
+    break :blk tbl;
+};
+
 /// Hard `<= 4 MiB` L2-residency ceiling for hot SME2 `Step-LoRA` / `W19`
 /// multi-LoRA adapters (`25%` of M4's `16 MiB` P-core L2, ADR-0023 C24).
 pub const MAX_HOT_LORA_L2_BYTES: usize = 4 * 1024 * 1024;
@@ -66,18 +128,31 @@ pub const MAX_HOT_LORA_L2_BYTES: usize = 4 * 1024 * 1024;
 /// call (`0` dynamic heap allocations on the hot path).
 pub const MAX_HOISTED_BATCH_OPS: usize = 64;
 
-/// Weight storage format inside an `sme2_panel64` matrix blob (ADR-0018, W15).
+/// Weight storage format inside an `sme2_panel64` matrix blob (ADR-0018, W15, ADR-0024 C25).
 pub const PanelDType = enum(u8) {
     f16 = 0,
     bf16 = 1,
     q4_affine = 2,
     q3_affine = 3,
     q2_affine = 4,
+    nvfp4_g16 = 5,
+    mxfp4_g32 = 6,
+    q2_0 = 7,
+    tq1_0 = 8,
+    tq2_0 = 9,
+    iq2_xxs = 10,
 
     pub fn isQuantized(self: PanelDType) bool {
         return switch (self) {
             .f16, .bf16 => false,
+            .q4_affine, .q3_affine, .q2_affine, .nvfp4_g16, .mxfp4_g32, .q2_0, .tq1_0, .tq2_0, .iq2_xxs => true,
+        };
+    }
+
+    pub fn hasAffineBias(self: PanelDType) bool {
+        return switch (self) {
             .q4_affine, .q3_affine, .q2_affine => true,
+            .f16, .bf16, .nvfp4_g16, .mxfp4_g32, .q2_0, .tq1_0, .tq2_0, .iq2_xxs => false,
         };
     }
 
@@ -92,6 +167,12 @@ pub const PanelDType = enum(u8) {
             .q4_affine => "q4",
             .q3_affine => "q3",
             .q2_affine => "q2",
+            .nvfp4_g16 => "nvfp4",
+            .mxfp4_g32 => "mxfp4",
+            .q2_0 => "q2_0",
+            .tq1_0 => "tq1_0",
+            .tq2_0 => "tq2_0",
+            .iq2_xxs => "iq2_xxs",
         };
     }
 };
@@ -184,7 +265,7 @@ pub const KernelArgs = extern struct {
     epilogue_op: u32,
     out_dtype: u32,
     param_kind: u32,
-    _pad: u32 = 0,
+    outer_scale: f32 = 1.0,
 };
 
 comptime {
@@ -206,6 +287,7 @@ comptime {
     if (@offsetOf(KernelArgs, "epilogue_op") != 96) @compileError("epilogue_op offset mismatch");
     if (@offsetOf(KernelArgs, "out_dtype") != 100) @compileError("out_dtype offset mismatch");
     if (@offsetOf(KernelArgs, "param_kind") != 104) @compileError("param_kind offset mismatch");
+    if (@offsetOf(KernelArgs, "outer_scale") != 108) @compileError("outer_scale offset mismatch");
 }
 
 pub const KernelFn = *const fn (*const KernelArgs) callconv(.c) void;
@@ -229,7 +311,7 @@ comptime {
 /// all `count` tasks with zero `[sp` spills, and executes `smstop` once.
 extern fn ami_sme2_exec_batch(tasks: [*]const BatchKernelTask, count: usize) callconv(.c) void;
 
-// All 30 bare-metal ARMv9.2 SME2 assembly entrypoints from `src/cpu/sme2_kernels.s`.
+// All bare-metal ARMv9.2 SME2 assembly entrypoints from `src/cpu/sme2_kernels.s`.
 extern fn ami_sme2_m1_4_bf16_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m1_4_bf16_nt(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m1_4_f16_t(args: *const KernelArgs) callconv(.c) void;
@@ -240,6 +322,16 @@ extern fn ami_sme2_m1_4_q3_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m1_4_q3_nt(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m1_4_q2_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m1_4_q2_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_nvfp4_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_nvfp4_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_mxfp4_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_mxfp4_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_q2_0_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_q2_0_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_tq_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_tq_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_iq2_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m1_4_iq2_nt(args: *const KernelArgs) callconv(.c) void;
 
 extern fn ami_sme2_m5_16_bf16_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m5_16_bf16_nt(args: *const KernelArgs) callconv(.c) void;
@@ -251,6 +343,16 @@ extern fn ami_sme2_m5_16_q3_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m5_16_q3_nt(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m5_16_q2_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m5_16_q2_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_nvfp4_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_nvfp4_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_mxfp4_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_mxfp4_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_q2_0_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_q2_0_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_tq_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_tq_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_iq2_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m5_16_iq2_nt(args: *const KernelArgs) callconv(.c) void;
 
 extern fn ami_sme2_m32_bf16_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m32_bf16_nt(args: *const KernelArgs) callconv(.c) void;
@@ -262,6 +364,16 @@ extern fn ami_sme2_m32_q3_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m32_q3_nt(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m32_q2_t(args: *const KernelArgs) callconv(.c) void;
 extern fn ami_sme2_m32_q2_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_nvfp4_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_nvfp4_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_mxfp4_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_mxfp4_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_q2_0_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_q2_0_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_tq_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_tq_nt(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_iq2_t(args: *const KernelArgs) callconv(.c) void;
+extern fn ami_sme2_m32_iq2_nt(args: *const KernelArgs) callconv(.c) void;
 
 pub const KernelEntry = struct {
     name: []const u8,
@@ -282,6 +394,18 @@ pub const ALL_KERNEL_ENTRIES = [_]KernelEntry{
     .{ .name = "ami_sme2_m1_4_q3_nt", .regime = .m1_4, .dtype = .q3_affine, .hint = .non_temporal, .func = &ami_sme2_m1_4_q3_nt },
     .{ .name = "ami_sme2_m1_4_q2_t", .regime = .m1_4, .dtype = .q2_affine, .hint = .temporal, .func = &ami_sme2_m1_4_q2_t },
     .{ .name = "ami_sme2_m1_4_q2_nt", .regime = .m1_4, .dtype = .q2_affine, .hint = .non_temporal, .func = &ami_sme2_m1_4_q2_nt },
+    .{ .name = "ami_sme2_m1_4_nvfp4_t", .regime = .m1_4, .dtype = .nvfp4_g16, .hint = .temporal, .func = &ami_sme2_m1_4_nvfp4_t },
+    .{ .name = "ami_sme2_m1_4_nvfp4_nt", .regime = .m1_4, .dtype = .nvfp4_g16, .hint = .non_temporal, .func = &ami_sme2_m1_4_nvfp4_nt },
+    .{ .name = "ami_sme2_m1_4_mxfp4_t", .regime = .m1_4, .dtype = .mxfp4_g32, .hint = .temporal, .func = &ami_sme2_m1_4_mxfp4_t },
+    .{ .name = "ami_sme2_m1_4_mxfp4_nt", .regime = .m1_4, .dtype = .mxfp4_g32, .hint = .non_temporal, .func = &ami_sme2_m1_4_mxfp4_nt },
+    .{ .name = "ami_sme2_m1_4_q2_0_t", .regime = .m1_4, .dtype = .q2_0, .hint = .temporal, .func = &ami_sme2_m1_4_q2_0_t },
+    .{ .name = "ami_sme2_m1_4_q2_0_nt", .regime = .m1_4, .dtype = .q2_0, .hint = .non_temporal, .func = &ami_sme2_m1_4_q2_0_nt },
+    .{ .name = "ami_sme2_m1_4_tq_t(tq1_0)", .regime = .m1_4, .dtype = .tq1_0, .hint = .temporal, .func = &ami_sme2_m1_4_tq_t },
+    .{ .name = "ami_sme2_m1_4_tq_nt(tq1_0)", .regime = .m1_4, .dtype = .tq1_0, .hint = .non_temporal, .func = &ami_sme2_m1_4_tq_nt },
+    .{ .name = "ami_sme2_m1_4_tq_t(tq2_0)", .regime = .m1_4, .dtype = .tq2_0, .hint = .temporal, .func = &ami_sme2_m1_4_tq_t },
+    .{ .name = "ami_sme2_m1_4_tq_nt(tq2_0)", .regime = .m1_4, .dtype = .tq2_0, .hint = .non_temporal, .func = &ami_sme2_m1_4_tq_nt },
+    .{ .name = "ami_sme2_m1_4_iq2_t", .regime = .m1_4, .dtype = .iq2_xxs, .hint = .temporal, .func = &ami_sme2_m1_4_iq2_t },
+    .{ .name = "ami_sme2_m1_4_iq2_nt", .regime = .m1_4, .dtype = .iq2_xxs, .hint = .non_temporal, .func = &ami_sme2_m1_4_iq2_nt },
 
     .{ .name = "ami_sme2_m5_16_bf16_t", .regime = .m5_16, .dtype = .bf16, .hint = .temporal, .func = &ami_sme2_m5_16_bf16_t },
     .{ .name = "ami_sme2_m5_16_bf16_nt", .regime = .m5_16, .dtype = .bf16, .hint = .non_temporal, .func = &ami_sme2_m5_16_bf16_nt },
@@ -293,6 +417,18 @@ pub const ALL_KERNEL_ENTRIES = [_]KernelEntry{
     .{ .name = "ami_sme2_m5_16_q3_nt", .regime = .m5_16, .dtype = .q3_affine, .hint = .non_temporal, .func = &ami_sme2_m5_16_q3_nt },
     .{ .name = "ami_sme2_m5_16_q2_t", .regime = .m5_16, .dtype = .q2_affine, .hint = .temporal, .func = &ami_sme2_m5_16_q2_t },
     .{ .name = "ami_sme2_m5_16_q2_nt", .regime = .m5_16, .dtype = .q2_affine, .hint = .non_temporal, .func = &ami_sme2_m5_16_q2_nt },
+    .{ .name = "ami_sme2_m5_16_nvfp4_t", .regime = .m5_16, .dtype = .nvfp4_g16, .hint = .temporal, .func = &ami_sme2_m5_16_nvfp4_t },
+    .{ .name = "ami_sme2_m5_16_nvfp4_nt", .regime = .m5_16, .dtype = .nvfp4_g16, .hint = .non_temporal, .func = &ami_sme2_m5_16_nvfp4_nt },
+    .{ .name = "ami_sme2_m5_16_mxfp4_t", .regime = .m5_16, .dtype = .mxfp4_g32, .hint = .temporal, .func = &ami_sme2_m5_16_mxfp4_t },
+    .{ .name = "ami_sme2_m5_16_mxfp4_nt", .regime = .m5_16, .dtype = .mxfp4_g32, .hint = .non_temporal, .func = &ami_sme2_m5_16_mxfp4_nt },
+    .{ .name = "ami_sme2_m5_16_q2_0_t", .regime = .m5_16, .dtype = .q2_0, .hint = .temporal, .func = &ami_sme2_m5_16_q2_0_t },
+    .{ .name = "ami_sme2_m5_16_q2_0_nt", .regime = .m5_16, .dtype = .q2_0, .hint = .non_temporal, .func = &ami_sme2_m5_16_q2_0_nt },
+    .{ .name = "ami_sme2_m5_16_tq_t(tq1_0)", .regime = .m5_16, .dtype = .tq1_0, .hint = .temporal, .func = &ami_sme2_m5_16_tq_t },
+    .{ .name = "ami_sme2_m5_16_tq_nt(tq1_0)", .regime = .m5_16, .dtype = .tq1_0, .hint = .non_temporal, .func = &ami_sme2_m5_16_tq_nt },
+    .{ .name = "ami_sme2_m5_16_tq_t(tq2_0)", .regime = .m5_16, .dtype = .tq2_0, .hint = .temporal, .func = &ami_sme2_m5_16_tq_t },
+    .{ .name = "ami_sme2_m5_16_tq_nt(tq2_0)", .regime = .m5_16, .dtype = .tq2_0, .hint = .non_temporal, .func = &ami_sme2_m5_16_tq_nt },
+    .{ .name = "ami_sme2_m5_16_iq2_t", .regime = .m5_16, .dtype = .iq2_xxs, .hint = .temporal, .func = &ami_sme2_m5_16_iq2_t },
+    .{ .name = "ami_sme2_m5_16_iq2_nt", .regime = .m5_16, .dtype = .iq2_xxs, .hint = .non_temporal, .func = &ami_sme2_m5_16_iq2_nt },
 
     .{ .name = "ami_sme2_m32_bf16_t", .regime = .m32, .dtype = .bf16, .hint = .temporal, .func = &ami_sme2_m32_bf16_t },
     .{ .name = "ami_sme2_m32_bf16_nt", .regime = .m32, .dtype = .bf16, .hint = .non_temporal, .func = &ami_sme2_m32_bf16_nt },
@@ -304,19 +440,42 @@ pub const ALL_KERNEL_ENTRIES = [_]KernelEntry{
     .{ .name = "ami_sme2_m32_q3_nt", .regime = .m32, .dtype = .q3_affine, .hint = .non_temporal, .func = &ami_sme2_m32_q3_nt },
     .{ .name = "ami_sme2_m32_q2_t", .regime = .m32, .dtype = .q2_affine, .hint = .temporal, .func = &ami_sme2_m32_q2_t },
     .{ .name = "ami_sme2_m32_q2_nt", .regime = .m32, .dtype = .q2_affine, .hint = .non_temporal, .func = &ami_sme2_m32_q2_nt },
+    .{ .name = "ami_sme2_m32_nvfp4_t", .regime = .m32, .dtype = .nvfp4_g16, .hint = .temporal, .func = &ami_sme2_m32_nvfp4_t },
+    .{ .name = "ami_sme2_m32_nvfp4_nt", .regime = .m32, .dtype = .nvfp4_g16, .hint = .non_temporal, .func = &ami_sme2_m32_nvfp4_nt },
+    .{ .name = "ami_sme2_m32_mxfp4_t", .regime = .m32, .dtype = .mxfp4_g32, .hint = .temporal, .func = &ami_sme2_m32_mxfp4_t },
+    .{ .name = "ami_sme2_m32_mxfp4_nt", .regime = .m32, .dtype = .mxfp4_g32, .hint = .non_temporal, .func = &ami_sme2_m32_mxfp4_nt },
+    .{ .name = "ami_sme2_m32_q2_0_t", .regime = .m32, .dtype = .q2_0, .hint = .temporal, .func = &ami_sme2_m32_q2_0_t },
+    .{ .name = "ami_sme2_m32_q2_0_nt", .regime = .m32, .dtype = .q2_0, .hint = .non_temporal, .func = &ami_sme2_m32_q2_0_nt },
+    .{ .name = "ami_sme2_m32_tq_t(tq1_0)", .regime = .m32, .dtype = .tq1_0, .hint = .temporal, .func = &ami_sme2_m32_tq_t },
+    .{ .name = "ami_sme2_m32_tq_nt(tq1_0)", .regime = .m32, .dtype = .tq1_0, .hint = .non_temporal, .func = &ami_sme2_m32_tq_nt },
+    .{ .name = "ami_sme2_m32_tq_t(tq2_0)", .regime = .m32, .dtype = .tq2_0, .hint = .temporal, .func = &ami_sme2_m32_tq_t },
+    .{ .name = "ami_sme2_m32_tq_nt(tq2_0)", .regime = .m32, .dtype = .tq2_0, .hint = .non_temporal, .func = &ami_sme2_m32_tq_nt },
+    .{ .name = "ami_sme2_m32_iq2_t", .regime = .m32, .dtype = .iq2_xxs, .hint = .temporal, .func = &ami_sme2_m32_iq2_t },
+    .{ .name = "ami_sme2_m32_iq2_nt", .regime = .m32, .dtype = .iq2_xxs, .hint = .non_temporal, .func = &ami_sme2_m32_iq2_nt },
 };
+
+pub fn defaultZt0TablePtr(dtype: PanelDType) [*]const u8 {
+    return switch (dtype) {
+        .q2_affine => std.mem.sliceAsBytes(&ZT0_LUT4_IDENTITY_TABLE).ptr,
+        .nvfp4_g16, .mxfp4_g32 => std.mem.sliceAsBytes(&ZT0_E2M1_TABLE).ptr,
+        .q2_0 => std.mem.sliceAsBytes(&ZT0_Q2_0_TABLE).ptr,
+        .tq1_0, .tq2_0 => std.mem.sliceAsBytes(&ZT0_TQ_TABLE).ptr,
+        .iq2_xxs => std.mem.sliceAsBytes(&ZT0_IQ2_XXS_TABLE).ptr,
+        .f16, .bf16, .q4_affine, .q3_affine => std.mem.sliceAsBytes(&ZT0_AFFINE_TABLE).ptr,
+    };
+}
 
 pub fn selectKernelFn(regime: KernelRegime, dtype: PanelDType, hint: CacheHint) KernelFn {
     return ALL_KERNEL_ENTRIES[kernelId(regime, dtype, hint)].func;
 }
 
-/// Maps `(regime, dtype, hint)` to its exact `0..29` index in `ALL_KERNEL_ENTRIES`
+/// Maps `(regime, dtype, hint)` to its exact `0..65` index in `ALL_KERNEL_ENTRIES`
 /// and `_ami_sme2_exec_batch`'s `L_ami_sme2_branch_table` (`src/cpu/sme2_kernels.s`).
 pub fn kernelId(regime: KernelRegime, dtype: PanelDType, hint: CacheHint) u32 {
     const r_off: u32 = switch (regime) {
         .m1_4 => 0,
-        .m5_16 => 10,
-        .m32 => 20,
+        .m5_16 => 22,
+        .m32 => 44,
     };
     const d_off: u32 = switch (dtype) {
         .bf16 => 0,
@@ -324,6 +483,12 @@ pub fn kernelId(regime: KernelRegime, dtype: PanelDType, hint: CacheHint) u32 {
         .q4_affine => 4,
         .q3_affine => 6,
         .q2_affine => 8,
+        .nvfp4_g16 => 10,
+        .mxfp4_g32 => 12,
+        .q2_0 => 14,
+        .tq1_0 => 16,
+        .tq2_0 => 18,
+        .iq2_xxs => 20,
     };
     const h_off: u32 = if (hint == .temporal) 0 else 1;
     return r_off + d_off + h_off;
@@ -482,6 +647,10 @@ pub inline fn groupBytes(dtype: PanelDType) usize {
         .q4_affine => QUANT_HEADER_BYTES + 512, // 640 B
         .q3_affine => QUANT_HEADER_BYTES + 384, // 512 B
         .q2_affine => QUANT_HEADER_BYTES + 256, // 384 B
+        .nvfp4_g16 => 4 * (32 + 128), // 640 B (4 x 16-K sub-groups: 32 B f16 scales + 128 B E2M1 nibbles)
+        .mxfp4_g32 => 2 * (16 + 256), // 544 B (2 x 32-K sub-groups: 16 B u8 UE8M0 + 256 B E2M1 nibbles)
+        .q2_0, .tq1_0, .tq2_0 => 32 + 256, // 288 B (32 B f16 scales + 256 B luti2 2-bit codes)
+        .iq2_xxs => 2 * (64 + 256), // 640 B (2 x 32-K sub-groups: 64 B f32 db scales + 256 B 4-bit codes)
     };
 }
 
@@ -645,7 +814,7 @@ fn writeQuantCodesForGroup(
                 }
             }
         },
-        .f16, .bf16 => unreachable,
+        else => unreachable,
     }
 }
 
@@ -660,7 +829,7 @@ pub fn packQuantAffinePanel64(
     k: usize,
     dst: []u8,
 ) Error!void {
-    if (!dtype.isQuantized()) return error.InvalidDType;
+    if (!dtype.hasAffineBias()) return error.InvalidDType;
     const total_bytes = try packedBlobBytes(dtype, n, k);
     const nk = std.math.mul(usize, n, k) catch return error.Overflow;
     const groups = k / GROUP_SIZE;
@@ -839,7 +1008,7 @@ pub fn packQuantLut16Panel64(
     k: usize,
     dst: []u8,
 ) Error!void {
-    if (!dtype.isQuantized()) return error.InvalidDType;
+    if (!dtype.hasAffineBias()) return error.InvalidDType;
     const total_bytes = try packedBlobBytes(dtype, n, k);
     const nk = std.math.mul(usize, n, k) catch return error.Overflow;
     const panels = panelCount(n);
@@ -992,6 +1161,826 @@ pub fn computeGroupActivationSums(
 }
 
 // ============================================================================
+// C25 Multi-Format Tables, Reference Decoders & `sme2_panel64` Packers
+// ============================================================================
+
+pub const E2M1_TABLE = [16]f32{
+    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+};
+
+pub inline fn e2m1ToF32(code: u4) f32 {
+    return E2M1_TABLE[code];
+}
+
+/// Decodes OCP FP8 `E4M3FN` (`S.E4.M3`, bias 7, `0x7F`/`0xFF` -> `0.0`).
+pub inline fn e4m3ToF32(b: u8) f32 {
+    const s = (b >> 7) & 1;
+    const e: u32 = (b >> 3) & 0xF;
+    const m: u32 = b & 0x7;
+    const val: f32 = if (e == 0)
+        @as(f32, @floatFromInt(m)) * (1.0 / 512.0)
+    else if (e == 15 and m == 7)
+        0.0
+    else
+        std.math.ldexp(@as(f32, @floatFromInt(8 + m)), @as(i32, @intCast(e)) - 10);
+    return if (s != 0) -val else val;
+}
+
+/// Decodes OCP `UE8M0` scale byte `2^(e - 127)` (`0` -> `2^-127`, `255` -> `0.0`).
+pub inline fn ue8m0ToF32(e: u8) f32 {
+    const bits: u32 = if (e == 0)
+        0x00400000
+    else if (e == 255)
+        0
+    else
+        @as(u32, e) << 23;
+    return @bitCast(bits);
+}
+
+/// Upstream `ggml` `iq2xxs_grid[256]` (8 x `u8` magnitudes in `{8, 25, 43}`).
+pub const IQ2XXS_GRID: [256]u64 = .{
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+};
+
+pub const KSIGNS_IQ2XS: [128]u8 = blk: {
+    var tbl: [128]u8 = undefined;
+    for (0..128) |i| {
+        const b: u8 = @intCast(i);
+        tbl[i] = b | ((@as(u8, @popCount(b)) & 1) << 7);
+    }
+    break :blk tbl;
+};
+
+pub const KMASK_IQ2XS = [8]u8{ 1, 2, 4, 8, 16, 32, 64, 128 };
+
+/// Reference CPU decoder for one `nvfp4_g16` row (`k` elements: `k/2` consecutive nibbles + `k/16` `E4M3` micro-scales + `outer_scale`).
+pub fn dequantNvfp4RowCpuRef(nibbles: []const u8, scales_e4m3: []const u8, outer_scale: f32, k: usize, dst: []f32) void {
+    std.debug.assert((k % 16) == 0);
+    std.debug.assert(nibbles.len >= k / 2 and scales_e4m3.len >= k / 16 and dst.len >= k);
+    for (0..(k / 16)) |g| {
+        const s = e4m3ToF32(scales_e4m3[g]) * outer_scale;
+        for (0..8) |j| {
+            const byte = nibbles[g * 8 + j];
+            dst[g * 16 + 2 * j] = e2m1ToF32(@truncate(byte & 0x0F)) * s;
+            dst[g * 16 + 2 * j + 1] = e2m1ToF32(@truncate(byte >> 4)) * s;
+        }
+    }
+}
+
+/// Reference CPU decoder for one upstream GGUF `MXFP4` row (`17 B / 32`: `u8 e` + split-half `qs[16]`).
+pub fn dequantMxfp4RowCpuRef(raw_blocks: []const u8, k: usize, dst: []f32) void {
+    std.debug.assert((k % 32) == 0);
+    const nb = k / 32;
+    std.debug.assert(raw_blocks.len >= nb * 17 and dst.len >= k);
+    for (0..nb) |b| {
+        const blk = raw_blocks[b * 17 ..][0..17];
+        const d = ue8m0ToF32(blk[0]);
+        for (0..16) |j| {
+            const byte = blk[1 + j];
+            dst[b * 32 + j] = e2m1ToF32(@truncate(byte & 0x0F)) * d;
+            dst[b * 32 + j + 16] = e2m1ToF32(@truncate(byte >> 4)) * d;
+        }
+    }
+}
+
+/// Reference CPU decoder for one upstream GGUF `Q2_0` row (`18 B / 64`: `f16 d` + `qs[16]`).
+pub fn dequantQ20RowCpuRef(raw_blocks: []const u8, k: usize, dst: []f32) void {
+    std.debug.assert((k % 64) == 0);
+    const nb = k / 64;
+    std.debug.assert(raw_blocks.len >= nb * 18 and dst.len >= k);
+    for (0..nb) |b| {
+        const blk = raw_blocks[b * 18 ..][0..18];
+        const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, blk[0..2], .little))));
+        for (0..64) |j| {
+            const q: i32 = @intCast((blk[2 + (j / 4)] >> @intCast((j % 4) * 2)) & 0x03);
+            dst[b * 64 + j] = @as(f32, @floatFromInt(q - 1)) * d;
+        }
+    }
+}
+
+/// Reference CPU decoder for one upstream GGUF `TQ1_0` row (`54 B / 256`: `qs[48]`, `qh[4]`, `f16 d`).
+pub fn dequantTq10RowCpuRef(raw_blocks: []const u8, k: usize, dst: []f32) void {
+    std.debug.assert((k % 256) == 0);
+    const nb = k / 256;
+    std.debug.assert(raw_blocks.len >= nb * 54 and dst.len >= k);
+    const pow3 = [6]u8{ 1, 3, 9, 27, 81, 243 };
+    for (0..nb) |b| {
+        const blk = raw_blocks[b * 54 ..][0..54];
+        const qs = blk[0..48];
+        const qh = blk[48..52];
+        const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, blk[52..54], .little))));
+        var out_idx: usize = b * 256;
+
+        // First 32 bytes of qs -> 5 * 32 = 160 weights
+        for (0..5) |n_it| {
+            for (0..32) |m_it| {
+                const q: u8 = qs[m_it] *% pow3[n_it];
+                const xi: i32 = @intCast((@as(u16, q) * 3) >> 8);
+                dst[out_idx] = @as(f32, @floatFromInt(xi - 1)) * d;
+                out_idx += 1;
+            }
+        }
+        // Remaining 16 bytes of qs -> 5 * 16 = 80 weights
+        for (0..5) |n_it| {
+            for (0..16) |m_it| {
+                const q: u8 = qs[32 + m_it] *% pow3[n_it];
+                const xi: i32 = @intCast((@as(u16, q) * 3) >> 8);
+                dst[out_idx] = @as(f32, @floatFromInt(xi - 1)) * d;
+                out_idx += 1;
+            }
+        }
+        // 4 bytes of qh -> 4 * 4 = 16 weights
+        for (0..4) |n_it| {
+            for (0..4) |j| {
+                const q: u8 = qh[j] *% pow3[n_it];
+                const xi: i32 = @intCast((@as(u16, q) * 3) >> 8);
+                dst[out_idx] = @as(f32, @floatFromInt(xi - 1)) * d;
+                out_idx += 1;
+            }
+        }
+    }
+}
+
+/// Reference CPU decoder for one upstream GGUF `TQ2_0` row (`66 B / 256`: `qs[64]`, `f16 d`).
+pub fn dequantTq20RowCpuRef(raw_blocks: []const u8, k: usize, dst: []f32) void {
+    std.debug.assert((k % 256) == 0);
+    const nb = k / 256;
+    std.debug.assert(raw_blocks.len >= nb * 66 and dst.len >= k);
+    for (0..nb) |b| {
+        const blk = raw_blocks[b * 66 ..][0..66];
+        const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, blk[64..66], .little))));
+        var out_idx: usize = b * 256;
+        for ([_]usize{ 0, 32 }) |j| {
+            for (0..4) |l| {
+                for (0..32) |m_it| {
+                    const q: i32 = @intCast((blk[j + m_it] >> @intCast(l * 2)) & 0x03);
+                    dst[out_idx] = @as(f32, @floatFromInt(q - 1)) * d;
+                    out_idx += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Reference CPU decoder for one upstream GGUF `IQ2_XXS` row (`66 B / 256`: `f16 d`, `qs[32]u16`).
+pub fn dequantIq2XxsRowCpuRef(raw_blocks: []const u8, k: usize, dst: []f32) void {
+    std.debug.assert((k % 256) == 0);
+    const nb = k / 256;
+    std.debug.assert(raw_blocks.len >= nb * 66 and dst.len >= k);
+    for (0..nb) |b| {
+        const blk = raw_blocks[b * 66 ..][0..66];
+        const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, blk[0..2], .little))));
+        var out_idx: usize = b * 256;
+        for (0..8) |ib32| {
+            const aux0 = std.mem.readInt(u32, blk[2 + ib32 * 8 ..][0..4], .little);
+            const aux1 = std.mem.readInt(u32, blk[2 + ib32 * 8 + 4 ..][0..4], .little);
+            const db = d * (0.5 + @as(f32, @floatFromInt(aux1 >> 28))) * 0.25;
+            for (0..4) |l| {
+                const grid_idx: u8 = @truncate((aux0 >> @intCast(l * 8)) & 0xFF);
+                const grid_u64 = IQ2XXS_GRID[grid_idx];
+                const signs = KSIGNS_IQ2XS[@intCast((aux1 >> @intCast(7 * l)) & 127)];
+                for (0..8) |j| {
+                    const mag: f32 = @floatFromInt(@as(u8, @truncate((grid_u64 >> @intCast(j * 8)) & 0xFF)));
+                    const sign: f32 = if ((signs & KMASK_IQ2XS[j]) != 0) -1.0 else 1.0;
+                    dst[out_idx] = db * mag * sign;
+                    out_idx += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Packs unpacked `E2M1` codes `[n, k]` (`0..15`) and `E4M3` micro-scales `[n, k/16]`
+/// into `sme2_panel64` `.nvfp4_g16` (`4 x 160 B` sub-groups per `64-K` group).
+pub fn packNvfp4CodesPanel64(
+    codes_nk: []const u8,
+    scales_e4m3_nk16: []const u8,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    const total_bytes = try packedBlobBytes(.nvfp4_g16, n, k);
+    const nk = std.math.mul(usize, n, k) catch return error.Overflow;
+    const sub16_per_row = k / 16;
+    const ns16 = std.math.mul(usize, n, sub16_per_row) catch return error.Overflow;
+    if (codes_nk.len < nk or scales_e4m3_nk16.len < ns16 or dst.len < total_bytes) return error.BufferTooSmall;
+
+    const panels = panelCount(n);
+    const groups = k / GROUP_SIZE;
+    const g_bytes = groupBytes(.nvfp4_g16);
+
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        for (0..groups) |g| {
+            const grp_slice = dst[out_off .. out_off + g_bytes];
+            for (0..4) |sg| {
+                const sg_off = sg * 160;
+                const sg_k_base = g * GROUP_SIZE + sg * 16;
+                const sg_idx = g * 4 + sg;
+                for (0..PANEL_COLS) |c| {
+                    const col = p * PANEL_COLS + c;
+                    const sc_f16: f16 = if (col < n)
+                        @floatCast(e4m3ToF32(scales_e4m3_nk16[col * sub16_per_row + sg_idx]))
+                    else
+                        0.0;
+                    std.mem.writeInt(u16, grp_slice[sg_off + c * 2 ..][0..2], @bitCast(sc_f16), .little);
+                }
+                for (0..8) |kp| {
+                    const k0 = sg_k_base + 2 * kp;
+                    const k1 = k0 + 1;
+                    for (0..PANEL_COLS) |c| {
+                        const col = p * PANEL_COLS + c;
+                        const q0: u8 = if (col < n) (codes_nk[col * k + k0] & 0x0F) else 0;
+                        const q1: u8 = if (col < n) (codes_nk[col * k + k1] & 0x0F) else 0;
+                        grp_slice[sg_off + 32 + kp * 16 + c] = q0 | (q1 << 4);
+                    }
+                }
+            }
+            out_off += g_bytes;
+        }
+    }
+}
+
+/// Packs `.amf` `nvfp4_g16` row-major packed nibbles `[n, k/2]` (low-nibble-first)
+/// and `E4M3` micro-scales `[n, k/16]` into `sme2_panel64` `.nvfp4_g16`.
+pub fn packNvfp4Panel64(
+    nibbles_nk2: []const u8,
+    scales_e4m3_nk16: []const u8,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    const total_bytes = try packedBlobBytes(.nvfp4_g16, n, k);
+    const nk2 = std.math.mul(usize, n, k / 2) catch return error.Overflow;
+    const sub16_per_row = k / 16;
+    const ns16 = std.math.mul(usize, n, sub16_per_row) catch return error.Overflow;
+    if (nibbles_nk2.len < nk2 or scales_e4m3_nk16.len < ns16 or dst.len < total_bytes) return error.BufferTooSmall;
+
+    const panels = panelCount(n);
+    const groups = k / GROUP_SIZE;
+    const g_bytes = groupBytes(.nvfp4_g16);
+
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        for (0..groups) |g| {
+            const grp_slice = dst[out_off .. out_off + g_bytes];
+            for (0..4) |sg| {
+                const sg_off = sg * 160;
+                const sg_k_base = g * GROUP_SIZE + sg * 16;
+                const sg_idx = g * 4 + sg;
+                for (0..PANEL_COLS) |c| {
+                    const col = p * PANEL_COLS + c;
+                    const sc_f16: f16 = if (col < n)
+                        @floatCast(e4m3ToF32(scales_e4m3_nk16[col * sub16_per_row + sg_idx]))
+                    else
+                        0.0;
+                    std.mem.writeInt(u16, grp_slice[sg_off + c * 2 ..][0..2], @bitCast(sc_f16), .little);
+                }
+                for (0..8) |kp| {
+                    const byte_idx = (sg_k_base / 2) + kp;
+                    for (0..PANEL_COLS) |c| {
+                        const col = p * PANEL_COLS + c;
+                        grp_slice[sg_off + 32 + kp * 16 + c] = if (col < n)
+                            nibbles_nk2[col * (k / 2) + byte_idx]
+                        else
+                            0;
+                    }
+                }
+            }
+            out_off += g_bytes;
+        }
+    }
+}
+
+/// Packs unpacked `E2M1` codes `[n, k]` (`0..15`) and `UE8M0` scales `[n, k/32]`
+/// into `sme2_panel64` `.mxfp4_g32` (`2 x 272 B` sub-groups per `64-K` group).
+pub fn packMxfp4Panel64(
+    codes_nk: []const u8,
+    scales_ue8m0_nk32: []const u8,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    const total_bytes = try packedBlobBytes(.mxfp4_g32, n, k);
+    const nk = std.math.mul(usize, n, k) catch return error.Overflow;
+    const sub32_per_row = k / 32;
+    const ns32 = std.math.mul(usize, n, sub32_per_row) catch return error.Overflow;
+    if (codes_nk.len < nk or scales_ue8m0_nk32.len < ns32 or dst.len < total_bytes) return error.BufferTooSmall;
+
+    const panels = panelCount(n);
+    const groups = k / GROUP_SIZE;
+    const g_bytes = groupBytes(.mxfp4_g32);
+
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        for (0..groups) |g| {
+            const grp_slice = dst[out_off .. out_off + g_bytes];
+            for (0..2) |sg| {
+                const sg_off = sg * 272;
+                const sg_k_base = g * GROUP_SIZE + sg * 32;
+                const sg_idx = g * 2 + sg;
+                for (0..PANEL_COLS) |c| {
+                    const col = p * PANEL_COLS + c;
+                    grp_slice[sg_off + c] = if (col < n)
+                        scales_ue8m0_nk32[col * sub32_per_row + sg_idx]
+                    else
+                        0;
+                }
+                for (0..16) |kp| {
+                    const k0 = sg_k_base + 2 * kp;
+                    const k1 = k0 + 1;
+                    for (0..PANEL_COLS) |c| {
+                        const col = p * PANEL_COLS + c;
+                        const q0: u8 = if (col < n) (codes_nk[col * k + k0] & 0x0F) else 0;
+                        const q1: u8 = if (col < n) (codes_nk[col * k + k1] & 0x0F) else 0;
+                        grp_slice[sg_off + 16 + kp * 16 + c] = q0 | (q1 << 4);
+                    }
+                }
+            }
+            out_off += g_bytes;
+        }
+    }
+}
+
+/// Losslessly repacks upstream GGUF `MXFP4` blocks (`17 B / 32`, split-half nibbles)
+/// into `sme2_panel64` `.mxfp4_g32` (`2 x 272 B` per `64-K` group).
+pub fn packGgufMxfp4Panel64(
+    raw_gguf_mxfp4: []const u8,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    const total_bytes = try packedBlobBytes(.mxfp4_g32, n, k);
+    const sub32_per_row = k / 32;
+    const row_bytes = std.math.mul(usize, sub32_per_row, 17) catch return error.Overflow;
+    const need_src = std.math.mul(usize, n, row_bytes) catch return error.Overflow;
+    if (raw_gguf_mxfp4.len < need_src or dst.len < total_bytes) return error.BufferTooSmall;
+
+    const panels = panelCount(n);
+    const groups = k / GROUP_SIZE;
+    const g_bytes = groupBytes(.mxfp4_g32);
+
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        for (0..groups) |g| {
+            const grp_slice = dst[out_off .. out_off + g_bytes];
+            for (0..2) |sg| {
+                const sg_off = sg * 272;
+                const sg_idx = g * 2 + sg;
+                for (0..PANEL_COLS) |c| {
+                    const col = p * PANEL_COLS + c;
+                    grp_slice[sg_off + c] = if (col < n)
+                        raw_gguf_mxfp4[col * row_bytes + sg_idx * 17]
+                    else
+                        0;
+                }
+                for (0..16) |kp| {
+                    const k0 = 2 * kp;
+                    const k1 = k0 + 1;
+                    for (0..PANEL_COLS) |c| {
+                        const col = p * PANEL_COLS + c;
+                        if (col >= n) {
+                            grp_slice[sg_off + 16 + kp * 16 + c] = 0;
+                            continue;
+                        }
+                        const qs = raw_gguf_mxfp4[col * row_bytes + sg_idx * 17 + 1 ..][0..16];
+                        const q0: u8 = if (k0 < 16) (qs[k0] & 0x0F) else (qs[k0 - 16] >> 4);
+                        const q1: u8 = if (k1 < 16) (qs[k1] & 0x0F) else (qs[k1 - 16] >> 4);
+                        grp_slice[sg_off + 16 + kp * 16 + c] = q0 | (q1 << 4);
+                    }
+                }
+            }
+            out_off += g_bytes;
+        }
+    }
+}
+
+fn writeLut2ScaledGroup(
+    codes_nk: []const u8,
+    scales_f16: []const f16,
+    n: usize,
+    k: usize,
+    panel: usize,
+    group: usize,
+    grp_slice: []u8,
+) void {
+    const groups = k / GROUP_SIZE;
+    const k_base = group * GROUP_SIZE;
+    for (0..PANEL_COLS) |c| {
+        const col = panel * PANEL_COLS + c;
+        const sc: f16 = if (col < n) scales_f16[col * groups + group] else 0.0;
+        std.mem.writeInt(u16, grp_slice[c * 2 ..][0..2], @bitCast(sc), .little);
+    }
+    const code_dst = grp_slice[32..];
+    for (0..32) |kp| {
+        const k0 = k_base + 2 * kp;
+        const k1 = k0 + 1;
+        for (0..8) |b| {
+            const col0 = panel * PANEL_COLS + 2 * b;
+            const col1 = col0 + 1;
+            const c00: u8 = if (col0 < n) (codes_nk[col0 * k + k0] & 0x03) else 0;
+            const c01: u8 = if (col0 < n) (codes_nk[col0 * k + k1] & 0x03) else 0;
+            const c10: u8 = if (col1 < n) (codes_nk[col1 * k + k0] & 0x03) else 0;
+            const c11: u8 = if (col1 < n) (codes_nk[col1 * k + k1] & 0x03) else 0;
+            code_dst[kp * 8 + b] = c00 | (c01 << 2) | (c10 << 4) | (c11 << 6);
+        }
+    }
+}
+
+/// Packs 2-bit `q2_0` codes `[n, k]` (`0..3` -> `{-1, 0, +1, +2}`) and `f16` scales `[n, k/64]`.
+pub fn packQ20Panel64(
+    codes_nk: []const u8,
+    scales_f16: []const f16,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    const total_bytes = try packedBlobBytes(.q2_0, n, k);
+    const nk = std.math.mul(usize, n, k) catch return error.Overflow;
+    const groups = k / GROUP_SIZE;
+    const ng = std.math.mul(usize, n, groups) catch return error.Overflow;
+    if (codes_nk.len < nk or scales_f16.len < ng or dst.len < total_bytes) return error.BufferTooSmall;
+    const panels = panelCount(n);
+    const g_bytes = groupBytes(.q2_0);
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        for (0..groups) |g| {
+            writeLut2ScaledGroup(codes_nk, scales_f16, n, k, p, g, dst[out_off .. out_off + g_bytes]);
+            out_off += g_bytes;
+        }
+    }
+}
+
+/// Losslessly repacks upstream GGUF `Q2_0` blocks (`18 B / 64`) into `sme2_panel64` `.q2_0`.
+pub fn packGgufQ20Panel64(
+    raw_gguf_q2_0: []const u8,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    const total_bytes = try packedBlobBytes(.q2_0, n, k);
+    const groups = k / GROUP_SIZE;
+    const row_bytes = std.math.mul(usize, groups, 18) catch return error.Overflow;
+    const need_src = std.math.mul(usize, n, row_bytes) catch return error.Overflow;
+    if (raw_gguf_q2_0.len < need_src or dst.len < total_bytes) return error.BufferTooSmall;
+
+    const panels = panelCount(n);
+    const g_bytes = groupBytes(.q2_0);
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        for (0..groups) |g| {
+            const grp_slice = dst[out_off .. out_off + g_bytes];
+            for (0..PANEL_COLS) |c| {
+                const col = p * PANEL_COLS + c;
+                const d_bits: u16 = if (col < n)
+                    std.mem.readInt(u16, raw_gguf_q2_0[col * row_bytes + g * 18 ..][0..2], .little)
+                else
+                    0;
+                std.mem.writeInt(u16, grp_slice[c * 2 ..][0..2], d_bits, .little);
+            }
+            const code_dst = grp_slice[32..];
+            for (0..32) |kp| {
+                const k0 = 2 * kp;
+                const k1 = k0 + 1;
+                for (0..8) |b| {
+                    const col0 = p * PANEL_COLS + 2 * b;
+                    const col1 = col0 + 1;
+                    const c00: u8 = if (col0 < n) ((raw_gguf_q2_0[col0 * row_bytes + g * 18 + 2 + (k0 / 4)] >> @intCast((k0 % 4) * 2)) & 0x03) else 0;
+                    const c01: u8 = if (col0 < n) ((raw_gguf_q2_0[col0 * row_bytes + g * 18 + 2 + (k1 / 4)] >> @intCast((k1 % 4) * 2)) & 0x03) else 0;
+                    const c10: u8 = if (col1 < n) ((raw_gguf_q2_0[col1 * row_bytes + g * 18 + 2 + (k0 / 4)] >> @intCast((k0 % 4) * 2)) & 0x03) else 0;
+                    const c11: u8 = if (col1 < n) ((raw_gguf_q2_0[col1 * row_bytes + g * 18 + 2 + (k1 / 4)] >> @intCast((k1 % 4) * 2)) & 0x03) else 0;
+                    code_dst[kp * 8 + b] = c00 | (c01 << 2) | (c10 << 4) | (c11 << 6);
+                }
+            }
+            out_off += g_bytes;
+        }
+    }
+}
+
+/// Packs 2-bit ternary codes `[n, k]` (`0=-1, 1=0, 2=+1`) and `f16` scales `[n, k/64]` into `.tq1_0` or `.tq2_0`.
+pub fn packTernaryCodesPanel64(
+    dtype: PanelDType,
+    codes_nk: []const u8,
+    scales_f16: []const f16,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    if (dtype != .tq1_0 and dtype != .tq2_0) return error.InvalidDType;
+    const total_bytes = try packedBlobBytes(dtype, n, k);
+    const nk = std.math.mul(usize, n, k) catch return error.Overflow;
+    const groups = k / GROUP_SIZE;
+    const ng = std.math.mul(usize, n, groups) catch return error.Overflow;
+    if (codes_nk.len < nk or scales_f16.len < ng or dst.len < total_bytes) return error.BufferTooSmall;
+    const panels = panelCount(n);
+    const g_bytes = groupBytes(dtype);
+    var out_off: usize = 0;
+    for (0..panels) |p| {
+        for (0..groups) |g| {
+            writeLut2ScaledGroup(codes_nk, scales_f16, n, k, p, g, dst[out_off .. out_off + g_bytes]);
+            out_off += g_bytes;
+        }
+    }
+}
+
+/// Losslessly repacks upstream GGUF `TQ1_0` (`54 B / 256`) blocks into `sme2_panel64` `.tq1_0` (`k % 256 == 0`).
+pub fn packTq10Panel64(
+    raw_gguf_tq1_0: []const u8,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    if (n == 0 or k == 0) return error.ZeroDimension;
+    if ((k % 256) != 0) return error.UnalignedK;
+    const total_bytes = try packedBlobBytes(.tq1_0, n, k);
+    const nb = k / 256;
+    const row_bytes = std.math.mul(usize, nb, 54) catch return error.Overflow;
+    const need_src = std.math.mul(usize, n, row_bytes) catch return error.Overflow;
+    if (raw_gguf_tq1_0.len < need_src or dst.len < total_bytes) return error.BufferTooSmall;
+
+    const pow3 = [6]u8{ 1, 3, 9, 27, 81, 243 };
+    const panels = panelCount(n);
+    const groups = k / GROUP_SIZE;
+    const g_bytes = groupBytes(.tq1_0);
+    var row_trits: [256]u8 = undefined;
+    var panel_trits: [PANEL_COLS][256]u8 = undefined;
+    var panel_scales: [PANEL_COLS]u16 = undefined;
+
+    for (0..panels) |p| {
+        for (0..nb) |b| {
+            for (0..PANEL_COLS) |c| {
+                const col = p * PANEL_COLS + c;
+                if (col >= n) {
+                    panel_scales[c] = 0;
+                    @memset(&panel_trits[c], 1); // code 1 => 0.0
+                    continue;
+                }
+                const blk = raw_gguf_tq1_0[col * row_bytes + b * 54 ..][0..54];
+                const qs = blk[0..48];
+                const qh = blk[48..52];
+                panel_scales[c] = std.mem.readInt(u16, blk[52..54], .little);
+                var idx: usize = 0;
+                for (0..5) |n_it| {
+                    for (0..32) |m_it| {
+                        const q: u8 = qs[m_it] *% pow3[n_it];
+                        row_trits[idx] = @intCast((@as(u16, q) * 3) >> 8);
+                        idx += 1;
+                    }
+                }
+                for (0..5) |n_it| {
+                    for (0..16) |m_it| {
+                        const q: u8 = qs[32 + m_it] *% pow3[n_it];
+                        row_trits[idx] = @intCast((@as(u16, q) * 3) >> 8);
+                        idx += 1;
+                    }
+                }
+                for (0..4) |n_it| {
+                    for (0..4) |j| {
+                        const q: u8 = qh[j] *% pow3[n_it];
+                        row_trits[idx] = @intCast((@as(u16, q) * 3) >> 8);
+                        idx += 1;
+                    }
+                }
+                panel_trits[c] = row_trits;
+            }
+            for (0..4) |g_sub| {
+                const g = b * 4 + g_sub;
+                const grp_off = (p * groups + g) * g_bytes;
+                const grp_slice = dst[grp_off .. grp_off + g_bytes];
+                for (0..PANEL_COLS) |c| {
+                    std.mem.writeInt(u16, grp_slice[c * 2 ..][0..2], panel_scales[c], .little);
+                }
+                const code_dst = grp_slice[32..];
+                const k_sub_base = g_sub * 64;
+                for (0..32) |kp| {
+                    const k0 = k_sub_base + 2 * kp;
+                    const k1 = k0 + 1;
+                    for (0..8) |b_idx| {
+                        const c00 = panel_trits[2 * b_idx][k0] & 0x03;
+                        const c01 = panel_trits[2 * b_idx][k1] & 0x03;
+                        const c10 = panel_trits[2 * b_idx + 1][k0] & 0x03;
+                        const c11 = panel_trits[2 * b_idx + 1][k1] & 0x03;
+                        code_dst[kp * 8 + b_idx] = c00 | (c01 << 2) | (c10 << 4) | (c11 << 6);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Losslessly repacks upstream GGUF `TQ2_0` (`66 B / 256`) blocks into `sme2_panel64` `.tq2_0` (`k % 256 == 0`).
+pub fn packTq20Panel64(
+    raw_gguf_tq2_0: []const u8,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    if (n == 0 or k == 0) return error.ZeroDimension;
+    if ((k % 256) != 0) return error.UnalignedK;
+    const total_bytes = try packedBlobBytes(.tq2_0, n, k);
+    const nb = k / 256;
+    const row_bytes = std.math.mul(usize, nb, 66) catch return error.Overflow;
+    const need_src = std.math.mul(usize, n, row_bytes) catch return error.Overflow;
+    if (raw_gguf_tq2_0.len < need_src or dst.len < total_bytes) return error.BufferTooSmall;
+
+    const panels = panelCount(n);
+    const groups = k / GROUP_SIZE;
+    const g_bytes = groupBytes(.tq2_0);
+    var panel_trits: [PANEL_COLS][256]u8 = undefined;
+    var panel_scales: [PANEL_COLS]u16 = undefined;
+
+    for (0..panels) |p| {
+        for (0..nb) |b| {
+            for (0..PANEL_COLS) |c| {
+                const col = p * PANEL_COLS + c;
+                if (col >= n) {
+                    panel_scales[c] = 0;
+                    @memset(&panel_trits[c], 1);
+                    continue;
+                }
+                const blk = raw_gguf_tq2_0[col * row_bytes + b * 66 ..][0..66];
+                panel_scales[c] = std.mem.readInt(u16, blk[64..66], .little);
+                var idx: usize = 0;
+                for ([_]usize{ 0, 32 }) |j| {
+                    for (0..4) |l| {
+                        for (0..32) |m_it| {
+                            panel_trits[c][idx] = (blk[j + m_it] >> @intCast(l * 2)) & 0x03;
+                            idx += 1;
+                        }
+                    }
+                }
+            }
+            for (0..4) |g_sub| {
+                const g = b * 4 + g_sub;
+                const grp_off = (p * groups + g) * g_bytes;
+                const grp_slice = dst[grp_off .. grp_off + g_bytes];
+                for (0..PANEL_COLS) |c| {
+                    std.mem.writeInt(u16, grp_slice[c * 2 ..][0..2], panel_scales[c], .little);
+                }
+                const code_dst = grp_slice[32..];
+                const k_sub_base = g_sub * 64;
+                for (0..32) |kp| {
+                    const k0 = k_sub_base + 2 * kp;
+                    const k1 = k0 + 1;
+                    for (0..8) |b_idx| {
+                        const c00 = panel_trits[2 * b_idx][k0] & 0x03;
+                        const c01 = panel_trits[2 * b_idx][k1] & 0x03;
+                        const c10 = panel_trits[2 * b_idx + 1][k0] & 0x03;
+                        const c11 = panel_trits[2 * b_idx + 1][k1] & 0x03;
+                        code_dst[kp * 8 + b_idx] = c00 | (c01 << 2) | (c10 << 4) | (c11 << 6);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Losslessly repacks upstream GGUF `IQ2_XXS` (`66 B / 256`) blocks via `IQ2XXS_GRID`
+/// and `KSIGNS_IQ2XS` into `sme2_panel64` `.iq2_xxs` (`2 x 320 B` sub-groups per `64-K` group, `k % 256 == 0`).
+pub fn packIq2XxsPanel64(
+    raw_gguf_iq2_xxs: []const u8,
+    n: usize,
+    k: usize,
+    dst: []u8,
+) Error!void {
+    if (n == 0 or k == 0) return error.ZeroDimension;
+    if ((k % 256) != 0) return error.UnalignedK;
+    const total_bytes = try packedBlobBytes(.iq2_xxs, n, k);
+    const nb = k / 256;
+    const row_bytes = std.math.mul(usize, nb, 66) catch return error.Overflow;
+    const need_src = std.math.mul(usize, n, row_bytes) catch return error.Overflow;
+    if (raw_gguf_iq2_xxs.len < need_src or dst.len < total_bytes) return error.BufferTooSmall;
+
+    const panels = panelCount(n);
+    const groups = k / GROUP_SIZE;
+    const g_bytes = groupBytes(.iq2_xxs);
+    var panel_codes: [PANEL_COLS][256]u8 = undefined;
+    var panel_dbs: [PANEL_COLS][8]f32 = undefined;
+
+    for (0..panels) |p| {
+        for (0..nb) |b| {
+            for (0..PANEL_COLS) |c| {
+                const col = p * PANEL_COLS + c;
+                if (col >= n) {
+                    @memset(&panel_codes[c], 3); // ZT0_IQ2_XXS_TABLE[3] == 0.0
+                    @memset(&panel_dbs[c], 0.0);
+                    continue;
+                }
+                const blk = raw_gguf_iq2_xxs[col * row_bytes + b * 66 ..][0..66];
+                const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, blk[0..2], .little))));
+                for (0..8) |ib32| {
+                    const aux0 = std.mem.readInt(u32, blk[2 + ib32 * 8 ..][0..4], .little);
+                    const aux1 = std.mem.readInt(u32, blk[2 + ib32 * 8 + 4 ..][0..4], .little);
+                    panel_dbs[c][ib32] = d * (0.5 + @as(f32, @floatFromInt(aux1 >> 28))) * 0.25;
+                    for (0..4) |l| {
+                        const grid_idx: u8 = @truncate((aux0 >> @intCast(l * 8)) & 0xFF);
+                        const grid_u64 = IQ2XXS_GRID[grid_idx];
+                        const signs = KSIGNS_IQ2XS[@intCast((aux1 >> @intCast(7 * l)) & 127)];
+                        for (0..8) |j| {
+                            const mag: u8 = @truncate((grid_u64 >> @intCast(j * 8)) & 0xFF);
+                            const mag_idx: u8 = switch (mag) {
+                                0x08 => 0,
+                                0x19 => 1,
+                                0x2b => 2,
+                                else => 3,
+                            };
+                            const neg_bit: u8 = if ((signs & KMASK_IQ2XS[j]) != 0) 4 else 0;
+                            panel_codes[c][ib32 * 32 + l * 8 + j] = mag_idx | neg_bit;
+                        }
+                    }
+                }
+            }
+            for (0..4) |g_sub| {
+                const g = b * 4 + g_sub;
+                const grp_off = (p * groups + g) * g_bytes;
+                const grp_slice = dst[grp_off .. grp_off + g_bytes];
+                for (0..2) |sg| {
+                    const sg_off = sg * 320;
+                    const ib32 = g_sub * 2 + sg;
+                    const sg_k_base = ib32 * 32;
+                    for (0..PANEL_COLS) |c| {
+                        std.mem.writeInt(u32, grp_slice[sg_off + c * 4 ..][0..4], @bitCast(panel_dbs[c][ib32]), .little);
+                    }
+                    for (0..16) |kp| {
+                        const k0 = sg_k_base + 2 * kp;
+                        const k1 = k0 + 1;
+                        for (0..PANEL_COLS) |c| {
+                            const q0 = panel_codes[c][k0] & 0x0F;
+                            const q1 = panel_codes[c][k1] & 0x0F;
+                            grp_slice[sg_off + 64 + kp * 16 + c] = q0 | (q1 << 4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Pure-Zig FP32 scalar reference & M1–M3 fallback (zero SME instructions!)
 // ============================================================================
 
@@ -1047,6 +2036,43 @@ pub fn matmulPanel64ScalarRange(
     panel_count: usize,
     n: usize,
     k: usize,
+) void {
+    matmulPanel64ScalarRangeScaled(
+        dtype,
+        param_kind,
+        epilogue,
+        out_dtype,
+        a_u16,
+        w_packed,
+        aux_f32,
+        out_bytes,
+        m_start,
+        m_rows,
+        panel_start,
+        panel_count,
+        n,
+        k,
+        1.0,
+    );
+}
+
+/// Scalar execution over `sme2_panel64` weights with explicit `nvfp4_g16` `outer_scale`.
+pub fn matmulPanel64ScalarRangeScaled(
+    dtype: PanelDType,
+    param_kind: QuantParamKind,
+    epilogue: EpilogueOp,
+    out_dtype: OutputDType,
+    a_u16: []const u16,
+    w_packed: []const u8,
+    aux_f32: ?[]const f32,
+    out_bytes: []u8,
+    m_start: usize,
+    m_rows: usize,
+    panel_start: usize,
+    panel_count: usize,
+    n: usize,
+    k: usize,
+    outer_scale: f32,
 ) void {
     const groups = k / GROUP_SIZE;
     const g_bytes = groupBytes(dtype);
@@ -1178,13 +2204,97 @@ pub fn matmulPanel64ScalarRange(
                             else => unreachable,
                         }
                     },
+                    .nvfp4_g16 => {
+                        for (0..4) |sg| {
+                            const sg_slice = grp[sg * 160 ..][0..160];
+                            const sg_k = k_base + sg * 16;
+                            var scales: [PANEL_COLS]f32 = undefined;
+                            for (0..PANEL_COLS) |c| {
+                                scales[c] = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, sg_slice[c * 2 ..][0..2], .little))));
+                            }
+                            for (0..8) |kp| {
+                                const x0 = quant.floatBitsToF32(.f16, a_row[sg_k + 2 * kp]);
+                                const x1 = quant.floatBitsToF32(.f16, a_row[sg_k + 2 * kp + 1]);
+                                for (0..valid_cols) |c| {
+                                    const byte = sg_slice[32 + kp * 16 + c];
+                                    const w0 = E2M1_TABLE[byte & 0x0F] * scales[c];
+                                    const w1 = E2M1_TABLE[byte >> 4] * scales[c];
+                                    acc[c] += x0 * w0 + x1 * w1;
+                                }
+                            }
+                        }
+                    },
+                    .mxfp4_g32 => {
+                        for (0..2) |sg| {
+                            const sg_slice = grp[sg * 272 ..][0..272];
+                            const sg_k = k_base + sg * 32;
+                            var scales: [PANEL_COLS]f32 = undefined;
+                            for (0..PANEL_COLS) |c| {
+                                scales[c] = ue8m0ToF32(sg_slice[c]);
+                            }
+                            for (0..16) |kp| {
+                                const x0 = quant.floatBitsToF32(.f16, a_row[sg_k + 2 * kp]);
+                                const x1 = quant.floatBitsToF32(.f16, a_row[sg_k + 2 * kp + 1]);
+                                for (0..valid_cols) |c| {
+                                    const byte = sg_slice[16 + kp * 16 + c];
+                                    const w0 = E2M1_TABLE[byte & 0x0F] * scales[c];
+                                    const w1 = E2M1_TABLE[byte >> 4] * scales[c];
+                                    acc[c] += x0 * w0 + x1 * w1;
+                                }
+                            }
+                        }
+                    },
+                    .q2_0, .tq1_0, .tq2_0 => {
+                        const lut4: [4]f32 = if (dtype == .q2_0)
+                            .{ -1.0, 0.0, 1.0, 2.0 }
+                        else
+                            .{ -1.0, 0.0, 1.0, 0.0 };
+                        var scales: [PANEL_COLS]f32 = undefined;
+                        for (0..PANEL_COLS) |c| {
+                            scales[c] = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, grp[c * 2 ..][0..2], .little))));
+                        }
+                        const codes = grp[32..];
+                        for (0..32) |kp| {
+                            const x0 = quant.floatBitsToF32(.f16, a_row[k_base + 2 * kp]);
+                            const x1 = quant.floatBitsToF32(.f16, a_row[k_base + 2 * kp + 1]);
+                            for (0..valid_cols) |c| {
+                                const byte = codes[kp * 8 + (c / 2)];
+                                const shift: u3 = @intCast((c & 1) * 4);
+                                const q0 = (byte >> shift) & 0x03;
+                                const q1 = (byte >> (shift + 2)) & 0x03;
+                                acc[c] += x0 * (lut4[q0] * scales[c]) + x1 * (lut4[q1] * scales[c]);
+                            }
+                        }
+                    },
+                    .iq2_xxs => {
+                        const iq2_vals = [8]f32{ 8.0, 25.0, 43.0, 0.0, -8.0, -25.0, -43.0, 0.0 };
+                        for (0..2) |sg| {
+                            const sg_slice = grp[sg * 320 ..][0..320];
+                            const sg_k = k_base + sg * 32;
+                            var scales: [PANEL_COLS]f32 = undefined;
+                            for (0..PANEL_COLS) |c| {
+                                scales[c] = @bitCast(std.mem.readInt(u32, sg_slice[c * 4 ..][0..4], .little));
+                            }
+                            for (0..16) |kp| {
+                                const x0 = quant.floatBitsToF32(.f16, a_row[sg_k + 2 * kp]);
+                                const x1 = quant.floatBitsToF32(.f16, a_row[sg_k + 2 * kp + 1]);
+                                for (0..valid_cols) |c| {
+                                    const byte = sg_slice[64 + kp * 16 + c];
+                                    const q0 = byte & 0x07;
+                                    const q1 = (byte >> 4) & 0x07;
+                                    acc[c] += x0 * (iq2_vals[q0] * scales[c]) + x1 * (iq2_vals[q1] * scales[c]);
+                                }
+                            }
+                        }
+                    },
                 }
             }
 
             for (0..valid_cols) |c| {
+                const scaled_acc = if (dtype == .nvfp4_g16) acc[c] * outer_scale else acc[c];
                 const idx = mi * n + col_base + c;
                 const aux_val: f32 = if (epilogue != .none) aux_f32.?[idx] else 0.0;
-                applyEpilogueAndStoreScalar(acc[c], aux_val, epilogue, out_dtype, out_bytes, idx);
+                applyEpilogueAndStoreScalar(scaled_acc, aux_val, epilogue, out_dtype, out_bytes, idx);
             }
         }
     }
@@ -1228,6 +2338,8 @@ pub const GemmConfig = struct {
     cache_hint: CacheHint = .temporal,
     epilogue: EpilogueOp = .none,
     out_dtype: OutputDType = .f32,
+    /// Optional `nvfp4_g16` tensor-level multiplicative outer scale.
+    outer_scale: f32 = 1.0,
     /// When `null`, uses `SmeCaps.default_backend` (`.sme2` on M4+, `.scalar_fallback` on M1–M3).
     backend: ?ExecutionBackend = null,
     /// Optional thread-count cap (`1..dispatcher.threadCount()`), e.g. for Spike S7 sweeps.
@@ -1256,6 +2368,7 @@ const DispatchJob = struct {
     param_kind: QuantParamKind = .affine_scale_bias,
     epilogue: EpilogueOp = .none,
     out_dtype: OutputDType = .f32,
+    outer_scale: f32 = 1.0,
     kernel_fn: KernelFn = &ami_sme2_m1_4_f16_t,
     a_raw_ptr: [*]const u16 = undefined,
     a_packed_ptr: [*]const u8 = undefined,
@@ -1443,7 +2556,7 @@ pub const SmeDispatcher = struct {
             const total_w_bytes = job.total_panels * job.panel_stride_bytes;
             const total_a_elems = (job.m_start + job.m_rows) * job.k;
             const aux_slice: ?[]const f32 = if (job.aux_ptr) |ap| ap[0..total_out_elems] else null;
-            matmulPanel64ScalarRange(
+            matmulPanel64ScalarRangeScaled(
                 job.dtype,
                 job.param_kind,
                 job.epilogue,
@@ -1458,6 +2571,7 @@ pub const SmeDispatcher = struct {
                 p_count,
                 job.n,
                 job.k,
+                job.outer_scale,
             );
             return;
         }
@@ -1475,7 +2589,7 @@ pub const SmeDispatcher = struct {
             .out_ptr = job.out_ptr + out_tile_off,
             .aux_ptr = aux_tile_ptr,
             .x_group_sums_ptr = job.x_group_sums_ptr,
-            .zt0_table_ptr = std.mem.sliceAsBytes(&ZT0_AFFINE_TABLE).ptr,
+            .zt0_table_ptr = defaultZt0TablePtr(job.dtype),
             .a_row_stride_bytes = job.a_row_stride_bytes,
             .panel_stride_bytes = job.panel_stride_bytes,
             .out_row_stride_bytes = job.out_row_stride_bytes,
@@ -1487,6 +2601,7 @@ pub const SmeDispatcher = struct {
             .epilogue_op = @backingInt(job.epilogue),
             .out_dtype = @backingInt(job.out_dtype),
             .param_kind = @backingInt(job.param_kind),
+            .outer_scale = job.outer_scale,
         };
         job.kernel_fn(&args);
     }
@@ -1570,7 +2685,7 @@ pub const SmeDispatcher = struct {
                 .m1_4 => {
                     a_packed_ptr = std.mem.sliceAsBytes(a_u16[m_start * k ..]).ptr;
                     a_row_stride_bytes = k * @sizeOf(u16);
-                    if (cfg.dtype.isQuantized()) {
+                    if (cfg.dtype.hasAffineBias()) {
                         const need_sums = m_rows * groups;
                         if (need_sums > self.x_sums_scratch.len) return error.BufferTooSmall;
                         computeGroupActivationSums(a_u16, m_start, m_rows, k, self.x_sums_scratch[0..need_sums]);
@@ -1620,6 +2735,7 @@ pub const SmeDispatcher = struct {
             .param_kind = cfg.param_kind,
             .epilogue = cfg.epilogue,
             .out_dtype = cfg.out_dtype,
+            .outer_scale = cfg.outer_scale,
             .kernel_fn = selectKernelFn(regime, cfg.dtype, cfg.cache_hint),
             .a_raw_ptr = a_u16.ptr,
             .a_packed_ptr = a_packed_ptr,
@@ -1783,7 +2899,7 @@ pub const SmeDispatcher = struct {
         if (backend == .scalar_fallback) {
             for (ops) |op| {
                 const w = op.weight;
-                matmulPanel64ScalarRange(
+                matmulPanel64ScalarRangeScaled(
                     w.dtype,
                     w.param_kind,
                     op.epilogue,
@@ -1798,6 +2914,7 @@ pub const SmeDispatcher = struct {
                     panelCount(w.n),
                     w.n,
                     w.k,
+                    w.outer_scale,
                 );
             }
             return;
@@ -1835,10 +2952,7 @@ pub const SmeDispatcher = struct {
             const groups = w.k / GROUP_SIZE;
             const elem_bytes = op.out_dtype.elemBytes();
             const out_row_stride = w.n * elem_bytes;
-            const zt0_ptr: [*]const u8 = if (w.dtype == .q2_affine)
-                std.mem.sliceAsBytes(&ZT0_LUT4_IDENTITY_TABLE).ptr
-            else
-                std.mem.sliceAsBytes(&ZT0_AFFINE_TABLE).ptr;
+            const zt0_ptr: [*]const u8 = defaultZt0TablePtr(w.dtype);
 
             var m_cur: usize = 0;
             while (m_cur < op.m) {
@@ -1872,7 +2986,7 @@ pub const SmeDispatcher = struct {
                     .m1_4 => {
                         a_packed_ptr = std.mem.sliceAsBytes(op.a_u16[m_cur * w.k ..]).ptr;
                         a_row_stride_bytes = w.k * @sizeOf(u16);
-                        if (w.dtype.isQuantized()) {
+                        if (w.dtype.hasAffineBias()) {
                             if (last_sums != null and
                                 last_sums.?.a_ptr == op.a_u16.ptr and
                                 last_sums.?.m_start == m_cur and
@@ -2009,6 +3123,7 @@ pub const SmeDispatcher = struct {
                     .epilogue_op = @backingInt(op.epilogue),
                     .out_dtype = @backingInt(op.out_dtype),
                     .param_kind = @backingInt(w.param_kind),
+                    .outer_scale = w.outer_scale,
                 };
                 task_buf[task_count] = .{
                     .args = &args_buf[task_count],
@@ -2077,20 +3192,28 @@ pub const SmeDispatcher = struct {
 // ============================================================================
 
 pub fn panelDTypeFromAmf(dtype: amf.DType) Error!PanelDType {
-    return switch (dtype) {
-        .f16 => .f16,
-        .bf16 => .bf16,
-        .q4_affine => .q4_affine,
-        .q3_affine => .q3_affine,
-        .q2_affine => .q2_affine,
-        .f32, .u32 => error.InvalidDType,
+    return switch (@backingInt(dtype)) {
+        0 => .f16,
+        2 => .q4_affine,
+        3 => .q3_affine,
+        4 => .bf16,
+        6 => .q2_affine,
+        14 => .nvfp4_g16,
+        27 => .iq2_xxs,
+        34 => .tq1_0,
+        35 => .tq2_0,
+        36 => .mxfp4_g32,
+        37 => .q2_0,
+        else => error.InvalidDType,
     };
 }
 
 pub fn quantParamKindFromAmf(pk: amf.QuantParamKind) QuantParamKind {
-    return switch (pk) {
-        .affine_scale_bias => .affine_scale_bias,
-        .lut16_codebook => .lut16_codebook,
+    return switch (@backingInt(pk)) {
+        0 => .affine_scale_bias,
+        1 => .lut16_codebook,
+        2 => .lut4_codebook,
+        else => .affine_scale_bias,
     };
 }
 
@@ -2105,6 +3228,7 @@ pub const SmeLinearWeight = struct {
     n: usize,
     k: usize,
     w_packed: []const u8,
+    outer_scale: f32 = 1.0,
 
     pub fn fromAmfEntry(
         entry: *const amf.TensorEntry,
@@ -2184,6 +3308,7 @@ pub fn evalSmeLinear(
             .cache_hint = opts.cache_hint orelse weight.cache_hint,
             .epilogue = opts.epilogue,
             .out_dtype = opts.out_dtype,
+            .outer_scale = weight.outer_scale,
             .backend = opts.backend,
             .max_threads = opts.max_threads,
         },
@@ -4135,7 +5260,7 @@ test "SmeCaps probes host SME2 features and supports simulated M1-M3 fallback cl
     try std.testing.expectEqual(MAX_L2_DRAFT_PROJ_BYTES, fake_svl128.draftL2BudgetBytes());
 }
 
-test "register-clobber canary verifies 0-bit corruption of x19..x28 and d8..d15 across all 30 SME2 entrypoints" {
+test "register-clobber canary verifies 0-bit corruption of x19..x28 and d8..d15 across all 66 SME2 entrypoints" {
     const caps = try SmeCaps.probe();
     if (!caps.supportsSme2()) return;
 
@@ -4188,7 +5313,7 @@ test "register-clobber canary verifies 0-bit corruption of x19..x28 and d8..d15 
                 .out_ptr = std.mem.sliceAsBytes(out_buf).ptr,
                 .aux_ptr = aux_buf.ptr,
                 .x_group_sums_ptr = x_sums.ptr,
-                .zt0_table_ptr = std.mem.sliceAsBytes(&ZT0_AFFINE_TABLE).ptr,
+                .zt0_table_ptr = defaultZt0TablePtr(entry.dtype),
                 .a_row_stride_bytes = a_stride,
                 .panel_stride_bytes = try panelStrideBytes(entry.dtype, k),
                 .out_row_stride_bytes = n * 4,
@@ -4200,6 +5325,7 @@ test "register-clobber canary verifies 0-bit corruption of x19..x28 and d8..d15 
                 .epilogue_op = @backingInt(epi),
                 .out_dtype = @backingInt(OutputDType.f32),
                 .param_kind = @backingInt(QuantParamKind.affine_scale_bias),
+                .outer_scale = if (entry.dtype == .nvfp4_g16) 0.5 else 1.0,
             };
             try invokeWithRegisterCanary(entry.func, &args);
         }
@@ -5848,4 +6974,484 @@ test "C24: 4 MiB hot-adapter L2 residency cap, C13/C16 unified-bus contention ga
         error.BusContentionDeferred,
         SmeStepLoraAdapter.evalMultiAdapterHoisted(&adps, &tight_disp, &tight_scratch, a_u16, &y_tight, 1, m4_chip, true, 1.02, 0, null),
     );
+}
+
+test "C25 E2M1, E4M3, UE8M0 decoders and panelDTypeFromAmf mapping" {
+    try std.testing.expectEqual(@as(f32, 0.0), e2m1ToF32(0));
+    try std.testing.expectEqual(@as(f32, 0.5), e2m1ToF32(1));
+    try std.testing.expectEqual(@as(f32, 6.0), e2m1ToF32(7));
+    try std.testing.expect(std.math.signbit(e2m1ToF32(8)));
+    try std.testing.expectEqual(@as(f32, -6.0), e2m1ToF32(15));
+
+    // OCP E4M3 micro-scales: normal 1.0 = 0x38, subnormal min = 0x01, NaN slots 0x7F/0xFF -> 0.0
+    try std.testing.expectEqual(@as(f32, 0.0), e4m3ToF32(0x00));
+    try std.testing.expectEqual(@as(f32, 1.0), e4m3ToF32(0x38));
+    try std.testing.expectEqual(@as(f32, -1.5), e4m3ToF32(0xBC));
+    try std.testing.expectEqual(@as(f32, 0.0), e4m3ToF32(0x7F));
+    try std.testing.expectEqual(@as(f32, 0.0), e4m3ToF32(0xFF));
+
+    // UE8M0: 0 -> 2^-127, 127 -> 1.0, 255 -> 0.0
+    try std.testing.expectApproxEqRel(std.math.pow(f32, 2.0, -127.0), ue8m0ToF32(0), 1e-6);
+    try std.testing.expectEqual(@as(f32, 1.0), ue8m0ToF32(127));
+    try std.testing.expectEqual(@as(f32, 0.25), ue8m0ToF32(125));
+    try std.testing.expectEqual(@as(f32, 0.0), ue8m0ToF32(255));
+
+    try std.testing.expectEqual(PanelDType.f16, try panelDTypeFromAmf(.f16));
+    try std.testing.expectEqual(PanelDType.bf16, try panelDTypeFromAmf(.bf16));
+    try std.testing.expectEqual(PanelDType.q4_affine, try panelDTypeFromAmf(.q4_affine));
+    try std.testing.expectEqual(PanelDType.q3_affine, try panelDTypeFromAmf(.q3_affine));
+    try std.testing.expectEqual(PanelDType.q2_affine, try panelDTypeFromAmf(.q2_affine));
+    try std.testing.expectError(error.InvalidDType, panelDTypeFromAmf(.f32));
+    try std.testing.expectError(error.InvalidDType, panelDTypeFromAmf(.u32));
+    try std.testing.expect(!PanelDType.nvfp4_g16.hasAffineBias());
+    try std.testing.expect(!PanelDType.mxfp4_g32.hasAffineBias());
+    try std.testing.expect(!PanelDType.q2_0.hasAffineBias());
+    try std.testing.expect(!PanelDType.tq1_0.hasAffineBias());
+    try std.testing.expect(!PanelDType.tq2_0.hasAffineBias());
+    try std.testing.expect(!PanelDType.iq2_xxs.hasAffineBias());
+}
+
+test "C25 NVFP4 and MXFP4 SME2 microkernels and scalar fallback match CPU reference decoders" {
+    const caps = try SmeCaps.probe();
+    const gpa = std.testing.allocator;
+    var disp = try SmeDispatcher.init(gpa, .{ .total_threads = 2 });
+    defer disp.deinit();
+
+    const m_cases = [_]usize{ 1, 4, 5, 16, 17, 32, 35 };
+    const n: usize = 67; // 5 panels (tests tail valid_cols = 3 alongside full 4-panel groups)
+    const k: usize = 128;
+
+    // 1. NVFP4 (`nvfp4_g16`): packed nibbles [n, k/2], E4M3 micro-scales [n, k/16], outer_scale = 0.375
+    {
+        const sub16 = k / 16;
+        const nibbles = try gpa.alloc(u8, n * (k / 2));
+        defer gpa.free(nibbles);
+        const micro_e4m3 = try gpa.alloc(u8, n * sub16);
+        defer gpa.free(micro_e4m3);
+        const w_ref = try gpa.alloc(f32, n * k);
+        defer gpa.free(w_ref);
+        const outer_scale: f32 = 0.375;
+
+        const sample_scales = [_]u8{ 0x38, 0x34, 0x3C, 0x40, 0xB8, 0x2C, 0x7F, 0x30 };
+        for (0..n) |col| {
+            for (0..(k / 2)) |bi| {
+                const lo: u8 = @intCast((col * 7 + bi * 3) & 0x0F);
+                const hi: u8 = @intCast((col * 5 + bi * 11 + 1) & 0x0F);
+                nibbles[col * (k / 2) + bi] = lo | (hi << 4);
+            }
+            for (0..sub16) |g16| {
+                micro_e4m3[col * sub16 + g16] = sample_scales[(col + g16) % sample_scales.len];
+            }
+            dequantNvfp4RowCpuRef(
+                nibbles[col * (k / 2) ..][0 .. k / 2],
+                micro_e4m3[col * sub16 ..][0..sub16],
+                outer_scale,
+                k,
+                w_ref[col * k ..][0..k],
+            );
+        }
+
+        const w_bytes = try packedBlobBytes(.nvfp4_g16, n, k);
+        const w_panel = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), w_bytes);
+        defer gpa.free(w_panel);
+        try packNvfp4Panel64(nibbles, micro_e4m3, n, k, w_panel);
+
+        for ([_]ExecutionBackend{
+            if (caps.supportsSme2()) .sme2 else .scalar_fallback,
+            .scalar_fallback,
+        }) |backend| {
+            for (m_cases) |m| {
+                const a_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), m * k);
+                defer gpa.free(a_u16);
+                const a_f32 = try gpa.alloc(f32, m * k);
+                defer gpa.free(a_f32);
+                for (0..(m * k)) |i| {
+                    const v: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 13)) - 6)) * 0.125);
+                    a_u16[i] = @bitCast(v);
+                    a_f32[i] = @floatCast(v);
+                }
+
+                const aux = try gpa.alloc(f32, m * n);
+                defer gpa.free(aux);
+                for (aux, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4)) * 0.25;
+
+                const out_f32 = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), m * n);
+                defer gpa.free(out_f32);
+                const ref_f32 = try gpa.alloc(f32, m * n);
+                defer gpa.free(ref_f32);
+
+                for ([_]CacheHint{ .temporal, .non_temporal }) |hint| {
+                    for ([_]EpilogueOp{ .none, .add_residual, .swiglu_gate_up }) |epi| {
+                        matmulRowMajorRefF32(a_f32, w_ref, aux, epi, ref_f32, m, n, k);
+                        try disp.gemm(
+                            .{
+                                .dtype = .nvfp4_g16,
+                                .cache_hint = hint,
+                                .epilogue = epi,
+                                .outer_scale = outer_scale,
+                                .backend = backend,
+                            },
+                            a_u16,
+                            w_panel,
+                            aux,
+                            std.mem.sliceAsBytes(out_f32),
+                            m,
+                            n,
+                            k,
+                        );
+                        for (0..(m * n)) |idx| {
+                            try std.testing.expectApproxEqAbs(ref_f32[idx], out_f32[idx], 2e-2);
+                        }
+                    }
+                }
+
+                // Also verify f16/bf16 output encoding.
+                for ([_]OutputDType{ .f16, .bf16 }) |odt| {
+                    matmulRowMajorRefF32(a_f32, w_ref, null, .none, ref_f32, m, n, k);
+                    const out_16 = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), m * n);
+                    defer gpa.free(out_16);
+                    try disp.gemm(
+                        .{
+                            .dtype = .nvfp4_g16,
+                            .out_dtype = odt,
+                            .outer_scale = outer_scale,
+                            .backend = backend,
+                        },
+                        a_u16,
+                        w_panel,
+                        null,
+                        std.mem.sliceAsBytes(out_16),
+                        m,
+                        n,
+                        k,
+                    );
+                    const qdt: quant.FloatDType = if (odt == .bf16) .bf16 else .f16;
+                    for (0..(m * n)) |idx| {
+                        const got = quant.floatBitsToF32(qdt, out_16[idx]);
+                        const exp = quant.floatBitsToF32(qdt, quant.f32ToFloatBits(qdt, ref_f32[idx]));
+                        try std.testing.expectApproxEqAbs(exp, got, 5e-2);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. GGUF MXFP4 (`mxfp4_g32`): split-half nibbles + UE8M0 exponent bytes (`0`, `125..129`, `255`)
+    {
+        const nb = k / 32;
+        const row_bytes = nb * 17;
+        const raw_mxfp4 = try gpa.alloc(u8, n * row_bytes);
+        defer gpa.free(raw_mxfp4);
+        const w_ref = try gpa.alloc(f32, n * k);
+        defer gpa.free(w_ref);
+
+        const ue8m0_exps = [_]u8{ 125, 126, 127, 128, 129, 0, 255, 124 };
+        for (0..n) |col| {
+            for (0..nb) |b| {
+                const blk = raw_mxfp4[col * row_bytes + b * 17 ..][0..17];
+                blk[0] = ue8m0_exps[(col + b) % ue8m0_exps.len];
+                for (0..16) |j| {
+                    const lo: u8 = @intCast((col * 3 + b * 5 + j) & 0x0F);
+                    const hi: u8 = @intCast((col * 9 + b * 7 + j + 2) & 0x0F);
+                    blk[1 + j] = lo | (hi << 4);
+                }
+            }
+            dequantMxfp4RowCpuRef(raw_mxfp4[col * row_bytes ..][0..row_bytes], k, w_ref[col * k ..][0..k]);
+        }
+
+        const w_bytes = try packedBlobBytes(.mxfp4_g32, n, k);
+        const w_panel = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), w_bytes);
+        defer gpa.free(w_panel);
+        try packGgufMxfp4Panel64(raw_mxfp4, n, k, w_panel);
+
+        for ([_]ExecutionBackend{
+            if (caps.supportsSme2()) .sme2 else .scalar_fallback,
+            .scalar_fallback,
+        }) |backend| {
+            for (m_cases) |m| {
+                const a_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), m * k);
+                defer gpa.free(a_u16);
+                const a_f32 = try gpa.alloc(f32, m * k);
+                defer gpa.free(a_f32);
+                for (0..(m * k)) |i| {
+                    const v: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 11)) - 5)) * 0.125);
+                    a_u16[i] = @bitCast(v);
+                    a_f32[i] = @floatCast(v);
+                }
+
+                const aux = try gpa.alloc(f32, m * n);
+                defer gpa.free(aux);
+                for (aux, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.2;
+
+                const out_f32 = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), m * n);
+                defer gpa.free(out_f32);
+                const ref_f32 = try gpa.alloc(f32, m * n);
+                defer gpa.free(ref_f32);
+
+                for ([_]CacheHint{ .temporal, .non_temporal }) |hint| {
+                    for ([_]EpilogueOp{ .none, .swiglu_gate_up, .add_residual }) |epi| {
+                        matmulRowMajorRefF32(a_f32, w_ref, aux, epi, ref_f32, m, n, k);
+                        try disp.gemm(
+                            .{
+                                .dtype = .mxfp4_g32,
+                                .cache_hint = hint,
+                                .epilogue = epi,
+                                .backend = backend,
+                            },
+                            a_u16,
+                            w_panel,
+                            aux,
+                            std.mem.sliceAsBytes(out_f32),
+                            m,
+                            n,
+                            k,
+                        );
+                        for (0..(m * n)) |idx| {
+                            try std.testing.expectApproxEqAbs(ref_f32[idx], out_f32[idx], 2e-2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "C25 GGUF Q2_0, TQ1_0, TQ2_0, IQ2_XXS SME2 microkernels, hoisted batch, and C13 draft gate parity" {
+    const caps = try SmeCaps.probe();
+    const gpa = std.testing.allocator;
+    var disp = try SmeDispatcher.init(gpa, .{ .total_threads = 2 });
+    defer disp.deinit();
+
+    const m_cases = [_]usize{ 1, 4, 5, 16, 17, 32, 35 };
+    const n: usize = 67; // 5 panels
+    const k: usize = 256;
+
+    // Prepare packed blobs + FP32 reference matrices for all 4 low-bit GGUF formats.
+    const raw_q2 = try gpa.alloc(u8, n * (k / 64) * 18);
+    defer gpa.free(raw_q2);
+    const w_q2_ref = try gpa.alloc(f32, n * k);
+    defer gpa.free(w_q2_ref);
+    for (0..n) |col| {
+        for (0..(k / 64)) |g| {
+            const blk = raw_q2[(col * (k / 64) + g) * 18 ..][0..18];
+            const d: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((col + g) % 5)) + 1)) * 0.125);
+            std.mem.writeInt(u16, blk[0..2], @bitCast(d), .little);
+            for (0..16) |qi| {
+                blk[2 + qi] = @intCast((col * 17 + g * 13 + qi * 29) & 0xFF);
+            }
+        }
+        dequantQ20RowCpuRef(raw_q2[col * (k / 64) * 18 ..][0 .. (k / 64) * 18], k, w_q2_ref[col * k ..][0..k]);
+    }
+    const w_q2_panel = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.q2_0, n, k));
+    defer gpa.free(w_q2_panel);
+    try packGgufQ20Panel64(raw_q2, n, k, w_q2_panel);
+
+    const raw_tq1 = try gpa.alloc(u8, n * 54);
+    defer gpa.free(raw_tq1);
+    const w_tq1_ref = try gpa.alloc(f32, n * k);
+    defer gpa.free(w_tq1_ref);
+    for (0..n) |col| {
+        const blk = raw_tq1[col * 54 ..][0..54];
+        for (0..52) |bi| blk[bi] = @intCast((col * 23 + bi * 37) & 0xFF);
+        const d: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(col % 4)) + 1)) * 0.125);
+        std.mem.writeInt(u16, blk[52..54], @bitCast(d), .little);
+        dequantTq10RowCpuRef(blk, k, w_tq1_ref[col * k ..][0..k]);
+    }
+    const w_tq1_panel = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.tq1_0, n, k));
+    defer gpa.free(w_tq1_panel);
+    try packTq10Panel64(raw_tq1, n, k, w_tq1_panel);
+
+    const raw_tq2 = try gpa.alloc(u8, n * 66);
+    defer gpa.free(raw_tq2);
+    const w_tq2_ref = try gpa.alloc(f32, n * k);
+    defer gpa.free(w_tq2_ref);
+    for (0..n) |col| {
+        const blk = raw_tq2[col * 66 ..][0..66];
+        // Pack valid 2-bit trits 0..2 (`0xAA` max would be 2, keep mix of 0,1,2 using 0x94 / masks)
+        for (0..64) |bi| {
+            const p0: u8 = @intCast((col + bi) % 3);
+            const p1: u8 = @intCast((col + bi + 1) % 3);
+            const p2: u8 = @intCast((col + bi + 2) % 3);
+            const p3: u8 = @intCast((col * 2 + bi) % 3);
+            blk[bi] = p0 | (p1 << 2) | (p2 << 4) | (p3 << 6);
+        }
+        const d: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(col % 3)) + 1)) * 0.2);
+        std.mem.writeInt(u16, blk[64..66], @bitCast(d), .little);
+        dequantTq20RowCpuRef(blk, k, w_tq2_ref[col * k ..][0..k]);
+    }
+    const w_tq2_panel = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.tq2_0, n, k));
+    defer gpa.free(w_tq2_panel);
+    try packTq20Panel64(raw_tq2, n, k, w_tq2_panel);
+
+    const raw_iq2 = try gpa.alloc(u8, n * 66);
+    defer gpa.free(raw_iq2);
+    const w_iq2_ref = try gpa.alloc(f32, n * k);
+    defer gpa.free(w_iq2_ref);
+    for (0..n) |col| {
+        const blk = raw_iq2[col * 66 ..][0..66];
+        const d: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(col % 4)) + 1)) * 0.015625);
+        std.mem.writeInt(u16, blk[0..2], @bitCast(d), .little);
+        for (0..8) |ib32| {
+            const aux0: u32 = @as(u32, @truncate((col * 31 + ib32 * 17) & 0xFF)) |
+                (@as(u32, @truncate((col * 19 + ib32 * 41) & 0xFF)) << 8) |
+                (@as(u32, @truncate((col * 11 + ib32 * 53) & 0xFF)) << 16) |
+                (@as(u32, @truncate((col * 7 + ib32 * 67) & 0xFF)) << 24);
+            const aux1: u32 = (@as(u32, @intCast((col * 5 + ib32) & 0x0F)) << 28) | @as(u32, @intCast((col * 12345 + ib32 * 6789) & 0x0FFFFFFF));
+            std.mem.writeInt(u32, blk[2 + ib32 * 8 ..][0..4], aux0, .little);
+            std.mem.writeInt(u32, blk[2 + ib32 * 8 + 4 ..][0..4], aux1, .little);
+        }
+        dequantIq2XxsRowCpuRef(blk, k, w_iq2_ref[col * k ..][0..k]);
+    }
+    const w_iq2_panel = try gpa.alignedAlloc(u8, .fromByteUnits(SVL_BYTES), try packedBlobBytes(.iq2_xxs, n, k));
+    defer gpa.free(w_iq2_panel);
+    try packIq2XxsPanel64(raw_iq2, n, k, w_iq2_panel);
+
+    const FormatCase = struct {
+        dtype: PanelDType,
+        w_panel: []const u8,
+        w_ref: []const f32,
+        tol: f32,
+    };
+    const cases = [_]FormatCase{
+        .{ .dtype = .q2_0, .w_panel = w_q2_panel, .w_ref = w_q2_ref, .tol = 2e-2 },
+        .{ .dtype = .tq1_0, .w_panel = w_tq1_panel, .w_ref = w_tq1_ref, .tol = 2e-2 },
+        .{ .dtype = .tq2_0, .w_panel = w_tq2_panel, .w_ref = w_tq2_ref, .tol = 2e-2 },
+        .{ .dtype = .iq2_xxs, .w_panel = w_iq2_panel, .w_ref = w_iq2_ref, .tol = 5e-2 },
+    };
+
+    for (cases) |c| {
+        for ([_]ExecutionBackend{
+            if (caps.supportsSme2()) .sme2 else .scalar_fallback,
+            .scalar_fallback,
+        }) |backend| {
+            for (m_cases) |m| {
+                const a_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), m * k);
+                defer gpa.free(a_u16);
+                const a_f32 = try gpa.alloc(f32, m * k);
+                defer gpa.free(a_f32);
+                for (0..(m * k)) |i| {
+                    const v: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 11)) - 5)) * 0.125);
+                    a_u16[i] = @bitCast(v);
+                    a_f32[i] = @floatCast(v);
+                }
+
+                const aux = try gpa.alloc(f32, m * n);
+                defer gpa.free(aux);
+                for (aux, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
+
+                const out_f32 = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), m * n);
+                defer gpa.free(out_f32);
+                const ref_f32 = try gpa.alloc(f32, m * n);
+                defer gpa.free(ref_f32);
+
+                for ([_]CacheHint{ .temporal, .non_temporal }) |hint| {
+                    for ([_]EpilogueOp{ .none, .swiglu_gate_up, .add_residual }) |epi| {
+                        matmulRowMajorRefF32(a_f32, c.w_ref, aux, epi, ref_f32, m, n, k);
+                        try disp.gemm(
+                            .{
+                                .dtype = c.dtype,
+                                .cache_hint = hint,
+                                .epilogue = epi,
+                                .backend = backend,
+                            },
+                            a_u16,
+                            c.w_panel,
+                            aux,
+                            std.mem.sliceAsBytes(out_f32),
+                            m,
+                            n,
+                            k,
+                        );
+                        for (0..(m * n)) |idx| {
+                            try std.testing.expectApproxEqAbs(ref_f32[idx], out_f32[idx], c.tol);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Verify hoisted batch (`smstart`..`smstop`) combining `tq2_0`, `q2_0`, and `iq2_xxs` + `C13` draft gating.
+    const batch_m: usize = 6;
+    const batch_a_u16 = try gpa.alignedAlloc(u16, .fromByteUnits(SVL_BYTES), batch_m * k);
+    defer gpa.free(batch_a_u16);
+    const batch_a_f32 = try gpa.alloc(f32, batch_m * k);
+    defer gpa.free(batch_a_f32);
+    for (0..(batch_m * k)) |i| {
+        const v: f16 = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 9)) - 4)) * 0.125);
+        batch_a_u16[i] = @bitCast(v);
+        batch_a_f32[i] = @floatCast(v);
+    }
+
+    const out_b0 = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), batch_m * n);
+    defer gpa.free(out_b0);
+    const out_b1 = try gpa.alignedAlloc(f32, .fromByteUnits(SVL_BYTES), batch_m * n);
+    defer gpa.free(out_b1);
+    const ref_b0 = try gpa.alloc(f32, batch_m * n);
+    defer gpa.free(ref_b0);
+    const ref_b1 = try gpa.alloc(f32, batch_m * n);
+    defer gpa.free(ref_b1);
+    matmulRowMajorRefF32(batch_a_f32, w_tq2_ref, null, .none, ref_b0, batch_m, n, k);
+    matmulRowMajorRefF32(batch_a_f32, w_iq2_ref, null, .none, ref_b1, batch_m, n, k);
+
+    const ops = [_]BatchLinearOp{
+        .{
+            .weight = .{ .dtype = .tq2_0, .param_kind = .affine_scale_bias, .cache_hint = .temporal, .n = n, .k = k, .w_packed = w_tq2_panel },
+            .a_u16 = batch_a_u16,
+            .out_bytes = std.mem.sliceAsBytes(out_b0),
+            .m = batch_m,
+        },
+        .{
+            .weight = .{ .dtype = .iq2_xxs, .param_kind = .affine_scale_bias, .cache_hint = .non_temporal, .n = n, .k = k, .w_packed = w_iq2_panel },
+            .a_u16 = batch_a_u16,
+            .out_bytes = std.mem.sliceAsBytes(out_b1),
+            .m = batch_m,
+        },
+    };
+    try disp.evalLinearBatchHoisted(&ops, if (caps.supportsSme2()) .sme2 else .scalar_fallback);
+    for (0..(batch_m * n)) |idx| {
+        try std.testing.expectApproxEqAbs(ref_b0[idx], out_b0[idx], 2e-2);
+        try std.testing.expectApproxEqAbs(ref_b1[idx], out_b1[idx], 5e-2);
+    }
+
+    // D8 / D13 `SmeDraftProjection` + `C13` bus contention check on `.tq2_0`
+    var draft = try SmeDraftProjection.init(
+        .{ .dtype = .tq2_0, .param_kind = .affine_scale_bias, .cache_hint = .temporal, .n = n, .k = k, .w_packed = w_tq2_panel },
+        .{ .max_m = 8 },
+    );
+    defer draft.deinit();
+    try draft.evalU16(&disp, batch_a_u16, null, std.mem.sliceAsBytes(out_b0), batch_m, .{});
+    for (0..(batch_m * n)) |idx| {
+        try std.testing.expectApproxEqAbs(ref_b0[idx], out_b0[idx], 2e-2);
+    }
+    if (caps.supportsSme2()) {
+        const m4_facts: sysinfo.Facts = .{
+            .memory_bytes = 24 * 1024 * 1024 * 1024,
+            .page_size = page.APPLE_PAGE_SIZE,
+            .performance_cores = 4,
+            .efficiency_cores = 6,
+            .pcore_physical_cpu = 4,
+            .pcore_cpus_per_l2 = 4,
+            .pcore_clusters = 1,
+            .pcore_l2_cache_bytes = 16 * 1024 * 1024,
+            .user_wire_limit = 0,
+            .global_user_wire_limit = 0,
+            .gpu_wired_limit_mib = 0,
+            .has_sme = true,
+            .has_sme2 = true,
+            .has_sme_b16f32 = true,
+            .has_sme_f16f32 = true,
+            .has_sme_i16i64 = true,
+            .sme_max_svl_bytes = 64,
+        };
+        const m4_chip = chip_profile.ChipProfile.resolve(m4_facts, "Apple M4", 9, null);
+        try std.testing.expectEqual(
+            PlacementDecision.defer_gpu_bus_saturated,
+            evaluateC13BusGate(caps, m4_chip, 8 * 1024 * 1024, true, 1.02, 0),
+        );
+        try std.testing.expectEqual(
+            PlacementDecision.sme2_streaming_nt,
+            evaluateC13BusGate(caps, m4_chip, 8 * 1024 * 1024, true, 1.12, 0),
+        );
+    }
 }

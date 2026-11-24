@@ -8495,6 +8495,7 @@ fn unpackPanel64ToF16(
                         else => unreachable,
                     }
                 },
+                else => return error.UnexpectedTensorDType,
             }
         }
     }

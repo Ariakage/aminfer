@@ -269,6 +269,22 @@ _ami_sme2_exp_consts:
     .endif
 .endm
 
+.macro LD1W_1 nt, zd, pg, base, imm=0
+    .if \nt
+        .if \imm == 0
+            ldnt1w {\zd\().s}, \pg/z, [\base]
+        .else
+            ldnt1w {\zd\().s}, \pg/z, [\base, #\imm, mul vl]
+        .endif
+    .else
+        .if \imm == 0
+            ld1w {\zd\().s}, \pg/z, [\base]
+        .else
+            ld1w {\zd\().s}, \pg/z, [\base, #\imm, mul vl]
+        .endif
+    .endif
+.endm
+
 // ============================================================================
 // Fused in-register readout epilogue helper (called inside streaming mode)
 //
@@ -558,6 +574,87 @@ _ami_sme2_drain_2x2:
 
 .L_d2x2_done:
     ret     x15
+
+// ============================================================================
+// Shared ZA outer_scale multipliers (for nvfp4_g16 when outer_scale != 1.0f)
+//   Expects: x19 = KernelArgs (+108 outer_scale), x28 = m_rows, x6 = panels_in_tile
+//   Clobbers: z0, z14, x4, w10, w12. Preserves x19..x28, x6, p0..p2, pn8..pn9.
+// ============================================================================
+.p2align 4
+_ami_sme2_scale_za_1x4:
+    add     x4, x19, #108
+    ld1rw   {z14.s}, p1/z, [x4]
+    mov     w12, #0
+.L_sz1x4_row:
+    cmp     w12, w28
+    b.hs    .L_sz1x4_done
+    mova    z0.s, p1/m, za0h.s[w12, #0]
+    fmul    z0.s, z0.s, z14.s
+    mova    za0h.s[w12, #0], p1/m, z0.s
+    cmp     x6, #1
+    b.le    .L_sz1x4_next
+    mova    z0.s, p1/m, za1h.s[w12, #0]
+    fmul    z0.s, z0.s, z14.s
+    mova    za1h.s[w12, #0], p1/m, z0.s
+    cmp     x6, #2
+    b.le    .L_sz1x4_next
+    mova    z0.s, p1/m, za2h.s[w12, #0]
+    fmul    z0.s, z0.s, z14.s
+    mova    za2h.s[w12, #0], p1/m, z0.s
+    cmp     x6, #3
+    b.le    .L_sz1x4_next
+    mova    z0.s, p1/m, za3h.s[w12, #0]
+    fmul    z0.s, z0.s, z14.s
+    mova    za3h.s[w12, #0], p1/m, z0.s
+.L_sz1x4_next:
+    add     w12, w12, #1
+    b       .L_sz1x4_row
+.L_sz1x4_done:
+    ret
+
+.p2align 4
+_ami_sme2_scale_za_2x2:
+    add     x4, x19, #108
+    ld1rw   {z14.s}, p1/z, [x4]
+    mov     w10, #16
+    cmp     w28, w10
+    csel    w10, w28, w10, lo
+    mov     w12, #0
+.L_sz2x2_top:
+    cmp     w12, w10
+    b.hs    .L_sz2x2_bot_init
+    mova    z0.s, p1/m, za0h.s[w12, #0]
+    fmul    z0.s, z0.s, z14.s
+    mova    za0h.s[w12, #0], p1/m, z0.s
+    cmp     x6, #1
+    b.le    .L_sz2x2_top_next
+    mova    z0.s, p1/m, za1h.s[w12, #0]
+    fmul    z0.s, z0.s, z14.s
+    mova    za1h.s[w12, #0], p1/m, z0.s
+.L_sz2x2_top_next:
+    add     w12, w12, #1
+    b       .L_sz2x2_top
+.L_sz2x2_bot_init:
+    cmp     w28, #16
+    b.ls    .L_sz2x2_done
+    sub     w10, w28, #16
+    mov     w12, #0
+.L_sz2x2_bot:
+    cmp     w12, w10
+    b.hs    .L_sz2x2_done
+    mova    z0.s, p1/m, za2h.s[w12, #0]
+    fmul    z0.s, z0.s, z14.s
+    mova    za2h.s[w12, #0], p1/m, z0.s
+    cmp     x6, #1
+    b.le    .L_sz2x2_bot_next
+    mova    z0.s, p1/m, za3h.s[w12, #0]
+    fmul    z0.s, z0.s, z14.s
+    mova    za3h.s[w12, #0], p1/m, z0.s
+.L_sz2x2_bot_next:
+    add     w12, w12, #1
+    b       .L_sz2x2_bot
+.L_sz2x2_done:
+    ret
 
 // Fast M == 1 dot macros (zero branches inside K-loop)
 .macro DOT4_M1_ONLY dot_op
@@ -2743,6 +2840,1057 @@ DEFINE_M32_Q2 _ami_sme2_m32_q2_t,  0
 DEFINE_M32_Q2 _ami_sme2_m32_q2_nt, 1
 
 // ============================================================================
+// REGIME 5 (C25, ADR-0024): Multi-format SME2 microkernels
+//   - nvfp4_g16 : E2M1 nibbles (ZT0 luti4) + E4M3 micro-scales/16 + f32 outer_scale
+//   - mxfp4_g32 : E2M1 nibbles (ZT0 luti4) + UE8M0 2^(e-127) scales/32 (FP32)
+//   - q2_0      : 2-bit codes (ZT0 luti2 {-1,0,+1,+2}) + f16 scale/64
+//   - tq1_0/tq2_0: 2-bit ternary codes (ZT0 luti2 {-1,0,+1,0}) + f16 scale/64
+//   - iq2_xxs   : 4-bit grid/sign codes (ZT0 luti4 {8,25,43,0,-8,-25,-43,0}) + f32 db/32
+// Zero `[sp` spills between smstart and smstop; d8-d15 saved pre-smstart.
+// ============================================================================
+
+// Helper: fold 4-way ZA sub-group sums into z0..z3 multiplied by FP32 scale_z (zero bias).
+.macro FOLD_SCALE_M1_4 scale_z
+    mova    {z4.s - z7.s}, za.s[w8, 0, vgx4]
+    fadd    z4.s, z4.s, z5.s
+    fadd    z6.s, z6.s, z7.s
+    fadd    z4.s, z4.s, z6.s
+    fmla    z0.s, p1/m, z4.s, \scale_z\().s
+    cmp     w28, #1
+    b.eq    L_fsm14_\@
+    mova    {z4.s - z7.s}, za.s[w9, 0, vgx4]
+    fadd    z4.s, z4.s, z5.s
+    fadd    z6.s, z6.s, z7.s
+    fadd    z4.s, z4.s, z6.s
+    fmla    z1.s, p1/m, z4.s, \scale_z\().s
+    cmp     w28, #2
+    b.eq    L_fsm14_\@
+    mova    {z4.s - z7.s}, za.s[w10, 0, vgx4]
+    fadd    z4.s, z4.s, z5.s
+    fadd    z6.s, z6.s, z7.s
+    fadd    z4.s, z4.s, z6.s
+    fmla    z2.s, p1/m, z4.s, \scale_z\().s
+    cmp     w28, #3
+    b.eq    L_fsm14_\@
+    mova    {z4.s - z7.s}, za.s[w11, 0, vgx4]
+    fadd    z4.s, z4.s, z5.s
+    fadd    z6.s, z6.s, z7.s
+    fadd    z4.s, z4.s, z6.s
+    fmla    z3.s, p1/m, z4.s, \scale_z\().s
+L_fsm14_\@:
+.endm
+
+// Helper: decode 16 x u8 UE8M0 bytes in low 16 bytes of zd.b -> 16 x f32 in zd.s.
+// Preserves z0..z7, z16..z31, x0..x14; clobbers zt, p4, p5, w15.
+.macro DECODE_UE8M0_16 zd, zt
+    uunpklo \zd\().h, \zd\().b
+    uunpklo \zd\().s, \zd\().h
+    cmpeq   p4.s, p1/z, \zd\().s, #0
+    mov     w15, #255
+    dup     \zt\().s, w15
+    cmpeq   p5.s, p1/z, \zd\().s, \zt\().s
+    lsl     \zd\().s, \zd\().s, #23
+    mov     w15, #0x00400000
+    dup     \zt\().s, w15
+    sel     \zd\().s, p4, \zt\().s, \zd\().s
+    dup     \zt\().s, #0
+    sel     \zd\().s, p5, \zt\().s, \zd\().s
+.endm
+
+// Helper: load 16 x f16 scales from [base] (temporal or nt) and duplicate [s_c, s_c] into zd.h.
+.macro LOAD_DUP_F16_SCALES nt, zd, zt, base
+    LD1H_1  \nt, \zd, p0, \base, 0
+    uunpklo \zd\().s, \zd\().h
+    lsl     \zt\().s, \zd\().s, #16
+    orr     \zd\().d, \zd\().d, \zt\().d
+.endm
+
+// Helper: 2 kp steps of 1x4 scaled f16 outer product (zero bias)
+.macro FMUL_FMOPA_1X4_PAIR
+    ld1h    {z0.h}, p0/z, [x0, #0, mul vl]
+    ld1h    {z1.h}, p0/z, [x0, #1, mul vl]
+    add     x0, x0, #128
+
+    fmul    z16.h, z16.h, z8.h
+    fmul    z18.h, z18.h, z9.h
+    fmul    z20.h, z20.h, z10.h
+    fmul    z22.h, z22.h, z11.h
+
+    fmopa   za0.s, p0/m, p0/m, z0.h, z16.h
+    fmopa   za1.s, p0/m, p0/m, z0.h, z18.h
+    fmopa   za2.s, p0/m, p0/m, z0.h, z20.h
+    fmopa   za3.s, p0/m, p0/m, z0.h, z22.h
+
+    fmul    z17.h, z17.h, z8.h
+    fmul    z19.h, z19.h, z9.h
+    fmul    z21.h, z21.h, z10.h
+    fmul    z23.h, z23.h, z11.h
+
+    fmopa   za0.s, p0/m, p0/m, z1.h, z17.h
+    fmopa   za1.s, p0/m, p0/m, z1.h, z19.h
+    fmopa   za2.s, p0/m, p0/m, z1.h, z21.h
+    fmopa   za3.s, p0/m, p0/m, z1.h, z23.h
+.endm
+
+// Helper: 2 kp steps of 2x2 scaled f16 outer product (zero bias)
+.macro FMUL_FMOPA_2X2_PAIR
+    ld1h    {z0.h}, p0/z, [x0, #0, mul vl]
+    ld1h    {z1.h}, p0/z, [x1, #0, mul vl]
+    ld1h    {z2.h}, p0/z, [x0, #1, mul vl]
+    ld1h    {z3.h}, p0/z, [x1, #1, mul vl]
+    add     x0, x0, #128
+    add     x1, x1, #128
+
+    fmul    z16.h, z16.h, z8.h
+    fmul    z18.h, z18.h, z9.h
+
+    fmopa   za0.s, p0/m, p0/m, z0.h, z16.h
+    fmopa   za1.s, p0/m, p0/m, z0.h, z18.h
+    fmopa   za2.s, p0/m, p0/m, z1.h, z16.h
+    fmopa   za3.s, p0/m, p0/m, z1.h, z18.h
+
+    fmul    z17.h, z17.h, z8.h
+    fmul    z19.h, z19.h, z9.h
+
+    fmopa   za0.s, p0/m, p0/m, z2.h, z17.h
+    fmopa   za1.s, p0/m, p0/m, z2.h, z19.h
+    fmopa   za2.s, p0/m, p0/m, z3.h, z17.h
+    fmopa   za3.s, p0/m, p0/m, z3.h, z19.h
+.endm
+
+// Helper: 2 kp steps of FP32 fmopa for 1x4 panel `za_tile`, scaled by FP32 `scale_z`.
+// Converts w pairs (z16.h, z17.h) and packed A (a_reg[0..1]) to f32 on the fly.
+.macro FP32_FMOPA_1X4_2KP za_tile, scale_z, a_reg
+    // kp + 0
+    fcvt    z20.s, p1/m, z16.h
+    lsr     z21.s, z16.s, #16
+    fcvt    z21.s, p1/m, z21.h
+    fmul    z20.s, z20.s, \scale_z\().s
+    fmul    z21.s, z21.s, \scale_z\().s
+    ld1h    {z0.h}, p0/z, [\a_reg, #0, mul vl]
+    fcvt    z2.s, p1/m, z0.h
+    lsr     z3.s, z0.s, #16
+    fcvt    z3.s, p1/m, z3.h
+    fmopa   \za_tile\().s, p1/m, p1/m, z2.s, z20.s
+    fmopa   \za_tile\().s, p1/m, p1/m, z3.s, z21.s
+
+    // kp + 1
+    fcvt    z20.s, p1/m, z17.h
+    lsr     z21.s, z17.s, #16
+    fcvt    z21.s, p1/m, z21.h
+    fmul    z20.s, z20.s, \scale_z\().s
+    fmul    z21.s, z21.s, \scale_z\().s
+    ld1h    {z0.h}, p0/z, [\a_reg, #1, mul vl]
+    add     \a_reg, \a_reg, #128
+    fcvt    z2.s, p1/m, z0.h
+    lsr     z3.s, z0.s, #16
+    fcvt    z3.s, p1/m, z3.h
+    fmopa   \za_tile\().s, p1/m, p1/m, z2.s, z20.s
+    fmopa   \za_tile\().s, p1/m, p1/m, z3.s, z21.s
+.endm
+
+// Helper: 2 kp steps of FP32 fmopa for 2x2 panel (za_top, za_bot), scaled by FP32 `scale_z`.
+.macro FP32_FMOPA_2X2_2KP za_top, za_bot, scale_z, a0_reg, a1_reg
+    // kp + 0
+    fcvt    z20.s, p1/m, z16.h
+    lsr     z21.s, z16.s, #16
+    fcvt    z21.s, p1/m, z21.h
+    fmul    z20.s, z20.s, \scale_z\().s
+    fmul    z21.s, z21.s, \scale_z\().s
+    ld1h    {z0.h}, p0/z, [\a0_reg, #0, mul vl]
+    ld1h    {z1.h}, p0/z, [\a1_reg, #0, mul vl]
+    fcvt    z2.s, p1/m, z0.h
+    lsr     z3.s, z0.s, #16
+    fcvt    z3.s, p1/m, z3.h
+    fcvt    z4.s, p1/m, z1.h
+    lsr     z5.s, z1.s, #16
+    fcvt    z5.s, p1/m, z5.h
+    fmopa   \za_top\().s, p1/m, p1/m, z2.s, z20.s
+    fmopa   \za_top\().s, p1/m, p1/m, z3.s, z21.s
+    fmopa   \za_bot\().s, p1/m, p1/m, z4.s, z20.s
+    fmopa   \za_bot\().s, p1/m, p1/m, z5.s, z21.s
+
+    // kp + 1
+    fcvt    z20.s, p1/m, z17.h
+    lsr     z21.s, z17.s, #16
+    fcvt    z21.s, p1/m, z21.h
+    fmul    z20.s, z20.s, \scale_z\().s
+    fmul    z21.s, z21.s, \scale_z\().s
+    ld1h    {z0.h}, p0/z, [\a0_reg, #1, mul vl]
+    ld1h    {z1.h}, p0/z, [\a1_reg, #1, mul vl]
+    add     \a0_reg, \a0_reg, #128
+    add     \a1_reg, \a1_reg, #128
+    fcvt    z2.s, p1/m, z0.h
+    lsr     z3.s, z0.s, #16
+    fcvt    z3.s, p1/m, z3.h
+    fcvt    z4.s, p1/m, z1.h
+    lsr     z5.s, z1.s, #16
+    fcvt    z5.s, p1/m, z5.h
+    fmopa   \za_top\().s, p1/m, p1/m, z2.s, z20.s
+    fmopa   \za_top\().s, p1/m, p1/m, z3.s, z21.s
+    fmopa   \za_bot\().s, p1/m, p1/m, z4.s, z20.s
+    fmopa   \za_bot\().s, p1/m, p1/m, z5.s, z21.s
+.endm
+
+// --- 5A. NVFP4_G16 (E2M1 + E4M3 micro-scale/16 + f32 outer_scale) ---
+// Sub-group layout (160 B per 16 K x 16 cols, 4 sub-groups = 640 B per group):
+//   +0..31   : 16 x f16 exact micro-scales
+//   +32..159 : 128 B E2M1 packed nibbles (8 kp x 16 cols)
+.macro DEFINE_M1_4_NVFP4 sym, nt
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]               // ZT0_E2M1_TABLE
+    ldr     zt0, [x0]
+    mov     w8, #0
+    mov     w9, #4
+    mov     w10, #8
+    mov     w11, #12
+
+1:  // panel loop
+    dup     z0.s, #0
+    dup     z1.s, #0
+    dup     z2.s, #0
+    dup     z3.s, #0
+    mov     x0, x20
+    ldr     x1, [x19, #48]
+    mov     x3, x21
+    lsl     x13, x27, #2                 // 4 x 16-K sub-groups per 64-K group
+
+2:  // 16-K sub-group loop (160 B = 32 B f16 scales + 128 B E2M1 nibbles = 8 kp)
+    PRFM_WEIGHT \nt, x3, 320
+    PRFM_WEIGHT \nt, x3, 448
+    PRFM_ACT    x0, 128
+    zero    {za}
+
+    LD1H_1  \nt, z12, p0, x3, 0
+    uunpklo z12.s, z12.h
+    fcvt    z12.s, p1/m, z12.h           // 16 x f32 micro-scales
+    add     x3, x3, #32
+
+    LD1B_2  \nt, z24, z25, pn8, x3, 0
+    add     x3, x3, #128
+
+    luti4   {z16.h, z17.h}, zt0, z24[0]
+    luti4   {z18.h, z19.h}, zt0, z24[1]
+    luti4   {z20.h, z21.h}, zt0, z25[0]
+    luti4   {z22.h, z23.h}, zt0, z25[1]
+
+    cmp     w28, #1
+    b.ne    20f
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+    mova    {z4.s - z7.s}, za.s[w8, 0, vgx4]
+    fadd    z4.s, z4.s, z5.s
+    fadd    z6.s, z6.s, z7.s
+    fadd    z4.s, z4.s, z6.s
+    fmla    z0.s, p1/m, z4.s, z12.s
+    b       21f
+20:
+    DOT4_M1_4 fdot
+    add     x0, x0, #16
+    DOT4_M1_4_B fdot
+    add     x0, x0, #16
+    FOLD_SCALE_M1_4 z12
+21:
+    subs    x13, x13, #1
+    b.ne    2b
+
+    // Multiply accumulated panel outputs by f32 outer_scale (KernelArgs +108)
+    add     x4, x19, #108
+    ld1rw   {z14.s}, p1/z, [x4]
+    fmul    z0.s, z0.s, z14.s
+    fmul    z1.s, z1.s, z14.s
+    fmul    z2.s, z2.s, z14.s
+    fmul    z3.s, z3.s, z14.s
+
+    bl      _ami_sme2_store_m1_4_panel
+    mov     w8, #0
+    mov     w9, #4
+    mov     w10, #8
+    mov     w11, #12
+
+    add     x21, x21, x23
+    CALC_OUT_PANEL_STEP x12, 13
+    add     x22, x22, x12
+    add     x26, x26, #16
+    subs    w25, w25, #1
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M1_4_NVFP4 _ami_sme2_m1_4_nvfp4_t,  0
+DEFINE_M1_4_NVFP4 _ami_sme2_m1_4_nvfp4_nt, 1
+
+.macro DEFINE_M5_16_NVFP4 sym, nt
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]
+    ldr     zt0, [x0]
+
+1:  // 4-panel tile loop
+    zero    {za}
+    SETUP_1X4_WEIGHT_PTRS
+    mov     x0, x20
+    lsl     x5, x27, #2                 // 4 x 16-K sub-groups per group
+
+2:
+    PRFM_WEIGHT \nt, x1, 320
+    PRFM_WEIGHT \nt, x2, 320
+    PRFM_WEIGHT \nt, x3, 320
+    PRFM_WEIGHT \nt, x4, 320
+    PRFM_ACT    x0, 512
+
+    LOAD_DUP_F16_SCALES \nt, z8,  z12, x1
+    LOAD_DUP_F16_SCALES \nt, z9,  z12, x2
+    LOAD_DUP_F16_SCALES \nt, z10, z12, x3
+    LOAD_DUP_F16_SCALES \nt, z11, z12, x4
+    add     x1, x1, #32
+    add     x2, x2, #32
+    add     x3, x3, #32
+    add     x4, x4, #32
+
+    mov     x7, #2                       // 2 chunks of 64 B (= 8 kp)
+3:
+    LD1B_1  \nt, z24, p2, x1, 0
+    LD1B_1  \nt, z25, p2, x2, 0
+    LD1B_1  \nt, z26, p2, x3, 0
+    LD1B_1  \nt, z27, p2, x4, 0
+    add     x1, x1, #64
+    add     x2, x2, #64
+    add     x3, x3, #64
+    add     x4, x4, #64
+
+    luti4   {z16.h, z17.h}, zt0, z24[0]
+    luti4   {z18.h, z19.h}, zt0, z25[0]
+    luti4   {z20.h, z21.h}, zt0, z26[0]
+    luti4   {z22.h, z23.h}, zt0, z27[0]
+    FMUL_FMOPA_1X4_PAIR
+
+    luti4   {z16.h, z17.h}, zt0, z24[1]
+    luti4   {z18.h, z19.h}, zt0, z25[1]
+    luti4   {z20.h, z21.h}, zt0, z26[1]
+    luti4   {z22.h, z23.h}, zt0, z27[1]
+    FMUL_FMOPA_1X4_PAIR
+
+    subs    x7, x7, #1
+    b.ne    3b
+
+    subs    x5, x5, #1
+    b.ne    2b
+
+    ldr     w4, [x19, #108]
+    mov     w7, #0x0000
+    movk    w7, #0x3F80, lsl #16
+    cmp     w4, w7
+    b.eq    4f
+    bl      _ami_sme2_scale_za_1x4
+4:
+    bl      _ami_sme2_drain_1x4
+    ADVANCE_1X4_TILE
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M5_16_NVFP4 _ami_sme2_m5_16_nvfp4_t,  0
+DEFINE_M5_16_NVFP4 _ami_sme2_m5_16_nvfp4_nt, 1
+
+.macro DEFINE_M32_NVFP4 sym, nt
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]
+    ldr     zt0, [x0]
+
+1:  // 2-panel tile loop
+    zero    {za}
+    SETUP_2X2_PTRS
+    lsl     x5, x27, #2
+
+2:
+    PRFM_WEIGHT \nt, x2, 320
+    PRFM_WEIGHT \nt, x3, 320
+    PRFM_ACT    x0, 512
+    PRFM_ACT    x1, 512
+
+    LOAD_DUP_F16_SCALES \nt, z8, z12, x2
+    LOAD_DUP_F16_SCALES \nt, z9, z12, x3
+    add     x2, x2, #32
+    add     x3, x3, #32
+
+    mov     x7, #2
+3:
+    LD1B_1  \nt, z24, p2, x2, 0
+    LD1B_1  \nt, z25, p2, x3, 0
+    add     x2, x2, #64
+    add     x3, x3, #64
+
+    luti4   {z16.h, z17.h}, zt0, z24[0]
+    luti4   {z18.h, z19.h}, zt0, z25[0]
+    FMUL_FMOPA_2X2_PAIR
+
+    luti4   {z16.h, z17.h}, zt0, z24[1]
+    luti4   {z18.h, z19.h}, zt0, z25[1]
+    FMUL_FMOPA_2X2_PAIR
+
+    subs    x7, x7, #1
+    b.ne    3b
+
+    subs    x5, x5, #1
+    b.ne    2b
+
+    ldr     w4, [x19, #108]
+    mov     w7, #0x0000
+    movk    w7, #0x3F80, lsl #16
+    cmp     w4, w7
+    b.eq    4f
+    bl      _ami_sme2_scale_za_2x2
+4:
+    bl      _ami_sme2_drain_2x2
+    ADVANCE_2X2_TILE
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M32_NVFP4 _ami_sme2_m32_nvfp4_t,  0
+DEFINE_M32_NVFP4 _ami_sme2_m32_nvfp4_nt, 1
+
+// --- 5B & 5E. MXFP4_G32 (272 B/32K: 16 B UE8M0 + 256 B E2M1) & IQ2_XXS (320 B/32K: 64 B f32 db + 256 B codes) ---
+// Shared FP32-scale 32-K sub-group kernels (`is_iq2 == 0` -> mxfp4, `is_iq2 == 1` -> iq2_xxs).
+.macro LOAD_FP32_SUB32_SCALE nt, is_iq2, zd, ztmp, ptr_reg
+    .if \is_iq2
+        LD1W_1  \nt, \zd, p1, \ptr_reg, 0
+        add     \ptr_reg, \ptr_reg, #64
+    .else
+        LD1B_1  \nt, \zd, p2, \ptr_reg, 0
+        DECODE_UE8M0_16 \zd, \ztmp
+        add     \ptr_reg, \ptr_reg, #16
+    .endif
+.endm
+
+.macro DEFINE_M1_4_SUB32_LUT4 sym, nt, is_iq2
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]               // ZT0_E2M1_TABLE or ZT0_IQ2_XXS_TABLE
+    ldr     zt0, [x0]
+    mov     w8, #0
+    mov     w9, #4
+    mov     w10, #8
+    mov     w11, #12
+
+1:  // panel loop
+    dup     z0.s, #0
+    dup     z1.s, #0
+    dup     z2.s, #0
+    dup     z3.s, #0
+    mov     x0, x20
+    ldr     x1, [x19, #48]
+    mov     x3, x21
+    lsl     x13, x27, #1                 // 2 x 32-K sub-groups per 64-K group
+
+2:  // 32-K sub-group loop (16 kp)
+    PRFM_WEIGHT \nt, x3, 320
+    PRFM_WEIGHT \nt, x3, 448
+    PRFM_ACT    x0, 256
+    zero    {za}
+
+    LOAD_FP32_SUB32_SCALE \nt, \is_iq2, z12, z13, x3
+    LD1B_4  \nt, z24, z27, pn8, x3, 0
+    add     x3, x3, #256
+
+    cmp     w28, #1
+    b.ne    20f
+
+    // M == 1 branch-free fast path
+    luti4   {z16.h, z17.h}, zt0, z24[0]
+    luti4   {z18.h, z19.h}, zt0, z24[1]
+    luti4   {z20.h, z21.h}, zt0, z25[0]
+    luti4   {z22.h, z23.h}, zt0, z25[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    luti4   {z16.h, z17.h}, zt0, z26[0]
+    luti4   {z18.h, z19.h}, zt0, z26[1]
+    luti4   {z20.h, z21.h}, zt0, z27[0]
+    luti4   {z22.h, z23.h}, zt0, z27[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    mova    {z4.s - z7.s}, za.s[w8, 0, vgx4]
+    fadd    z4.s, z4.s, z5.s
+    fadd    z6.s, z6.s, z7.s
+    fadd    z4.s, z4.s, z6.s
+    fmla    z0.s, p1/m, z4.s, z12.s
+    b       21f
+
+20:
+    luti4   {z16.h, z17.h}, zt0, z24[0]
+    luti4   {z18.h, z19.h}, zt0, z24[1]
+    luti4   {z20.h, z21.h}, zt0, z25[0]
+    luti4   {z22.h, z23.h}, zt0, z25[1]
+    DOT4_M1_4 fdot
+    add     x0, x0, #16
+    DOT4_M1_4_B fdot
+    add     x0, x0, #16
+
+    luti4   {z16.h, z17.h}, zt0, z26[0]
+    luti4   {z18.h, z19.h}, zt0, z26[1]
+    luti4   {z20.h, z21.h}, zt0, z27[0]
+    luti4   {z22.h, z23.h}, zt0, z27[1]
+    DOT4_M1_4 fdot
+    add     x0, x0, #16
+    DOT4_M1_4_B fdot
+    add     x0, x0, #16
+
+    FOLD_SCALE_M1_4 z12
+21:
+    subs    x13, x13, #1
+    b.ne    2b
+
+    bl      _ami_sme2_store_m1_4_panel
+    mov     w8, #0
+    mov     w9, #4
+    mov     w10, #8
+    mov     w11, #12
+
+    add     x21, x21, x23
+    CALC_OUT_PANEL_STEP x12, 13
+    add     x22, x22, x12
+    add     x26, x26, #16
+    subs    w25, w25, #1
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M1_4_SUB32_LUT4 _ami_sme2_m1_4_mxfp4_t,  0, 0
+DEFINE_M1_4_SUB32_LUT4 _ami_sme2_m1_4_mxfp4_nt, 1, 0
+DEFINE_M1_4_SUB32_LUT4 _ami_sme2_m1_4_iq2_t,    0, 1
+DEFINE_M1_4_SUB32_LUT4 _ami_sme2_m1_4_iq2_nt,   1, 1
+
+.macro SUB32_LUT4_1X4_PANEL za_tile, nt, is_iq2, w_reg, a_reg
+    LOAD_FP32_SUB32_SCALE \nt, \is_iq2, z12, z13, \w_reg
+    LD1B_4  \nt, z24, z27, pn8, \w_reg, 0
+    add     \w_reg, \w_reg, #256
+    luti4   {z16.h, z17.h}, zt0, z24[0]
+    FP32_FMOPA_1X4_2KP \za_tile, z12, \a_reg
+    luti4   {z16.h, z17.h}, zt0, z24[1]
+    FP32_FMOPA_1X4_2KP \za_tile, z12, \a_reg
+    luti4   {z16.h, z17.h}, zt0, z25[0]
+    FP32_FMOPA_1X4_2KP \za_tile, z12, \a_reg
+    luti4   {z16.h, z17.h}, zt0, z25[1]
+    FP32_FMOPA_1X4_2KP \za_tile, z12, \a_reg
+    luti4   {z16.h, z17.h}, zt0, z26[0]
+    FP32_FMOPA_1X4_2KP \za_tile, z12, \a_reg
+    luti4   {z16.h, z17.h}, zt0, z26[1]
+    FP32_FMOPA_1X4_2KP \za_tile, z12, \a_reg
+    luti4   {z16.h, z17.h}, zt0, z27[0]
+    FP32_FMOPA_1X4_2KP \za_tile, z12, \a_reg
+    luti4   {z16.h, z17.h}, zt0, z27[1]
+    FP32_FMOPA_1X4_2KP \za_tile, z12, \a_reg
+.endm
+
+.macro DEFINE_M5_16_SUB32_LUT4 sym, nt, is_iq2
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]
+    ldr     zt0, [x0]
+
+1:  // 4-panel tile loop
+    zero    {za}
+    SETUP_1X4_WEIGHT_PTRS
+    mov     x0, x20
+    lsl     x5, x27, #1                 // 2 x 32-K sub-groups per 64-K group
+
+2:
+    PRFM_WEIGHT \nt, x1, 320
+    PRFM_WEIGHT \nt, x2, 320
+    PRFM_WEIGHT \nt, x3, 320
+    PRFM_WEIGHT \nt, x4, 320
+    PRFM_ACT    x0, 512
+
+    mov     x8, x0
+    SUB32_LUT4_1X4_PANEL za0, \nt, \is_iq2, x1, x8
+    mov     x8, x0
+    SUB32_LUT4_1X4_PANEL za1, \nt, \is_iq2, x2, x8
+    mov     x8, x0
+    SUB32_LUT4_1X4_PANEL za2, \nt, \is_iq2, x3, x8
+    mov     x8, x0
+    SUB32_LUT4_1X4_PANEL za3, \nt, \is_iq2, x4, x8
+    mov     x0, x8                       // advance A past 32-K sub-group (1024 B)
+
+    subs    x5, x5, #1
+    b.ne    2b
+
+    bl      _ami_sme2_drain_1x4
+    ADVANCE_1X4_TILE
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M5_16_SUB32_LUT4 _ami_sme2_m5_16_mxfp4_t,  0, 0
+DEFINE_M5_16_SUB32_LUT4 _ami_sme2_m5_16_mxfp4_nt, 1, 0
+DEFINE_M5_16_SUB32_LUT4 _ami_sme2_m5_16_iq2_t,    0, 1
+DEFINE_M5_16_SUB32_LUT4 _ami_sme2_m5_16_iq2_nt,   1, 1
+
+.macro SUB32_LUT4_2X2_PANEL za_top, za_bot, nt, is_iq2, w_reg, a0_reg, a1_reg
+    LOAD_FP32_SUB32_SCALE \nt, \is_iq2, z12, z13, \w_reg
+    LD1B_4  \nt, z24, z27, pn8, \w_reg, 0
+    add     \w_reg, \w_reg, #256
+    luti4   {z16.h, z17.h}, zt0, z24[0]
+    FP32_FMOPA_2X2_2KP \za_top, \za_bot, z12, \a0_reg, \a1_reg
+    luti4   {z16.h, z17.h}, zt0, z24[1]
+    FP32_FMOPA_2X2_2KP \za_top, \za_bot, z12, \a0_reg, \a1_reg
+    luti4   {z16.h, z17.h}, zt0, z25[0]
+    FP32_FMOPA_2X2_2KP \za_top, \za_bot, z12, \a0_reg, \a1_reg
+    luti4   {z16.h, z17.h}, zt0, z25[1]
+    FP32_FMOPA_2X2_2KP \za_top, \za_bot, z12, \a0_reg, \a1_reg
+    luti4   {z16.h, z17.h}, zt0, z26[0]
+    FP32_FMOPA_2X2_2KP \za_top, \za_bot, z12, \a0_reg, \a1_reg
+    luti4   {z16.h, z17.h}, zt0, z26[1]
+    FP32_FMOPA_2X2_2KP \za_top, \za_bot, z12, \a0_reg, \a1_reg
+    luti4   {z16.h, z17.h}, zt0, z27[0]
+    FP32_FMOPA_2X2_2KP \za_top, \za_bot, z12, \a0_reg, \a1_reg
+    luti4   {z16.h, z17.h}, zt0, z27[1]
+    FP32_FMOPA_2X2_2KP \za_top, \za_bot, z12, \a0_reg, \a1_reg
+.endm
+
+.macro DEFINE_M32_SUB32_LUT4 sym, nt, is_iq2
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]
+    ldr     zt0, [x0]
+
+1:  // 2-panel tile loop
+    zero    {za}
+    SETUP_2X2_PTRS
+    lsl     x5, x27, #1
+
+2:
+    PRFM_WEIGHT \nt, x2, 320
+    PRFM_WEIGHT \nt, x3, 320
+    PRFM_ACT    x0, 512
+    PRFM_ACT    x1, 512
+
+    mov     x8, x0
+    mov     x9, x1
+    SUB32_LUT4_2X2_PANEL za0, za2, \nt, \is_iq2, x2, x8, x9
+    mov     x8, x0
+    mov     x9, x1
+    SUB32_LUT4_2X2_PANEL za1, za3, \nt, \is_iq2, x3, x8, x9
+    mov     x0, x8
+    mov     x1, x9
+
+    subs    x5, x5, #1
+    b.ne    2b
+
+    bl      _ami_sme2_drain_2x2
+    ADVANCE_2X2_TILE
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M32_SUB32_LUT4 _ami_sme2_m32_mxfp4_t,  0, 0
+DEFINE_M32_SUB32_LUT4 _ami_sme2_m32_mxfp4_nt, 1, 0
+DEFINE_M32_SUB32_LUT4 _ami_sme2_m32_iq2_t,    0, 1
+DEFINE_M32_SUB32_LUT4 _ami_sme2_m32_iq2_nt,   1, 1
+
+// --- 5C & 5D. Q2_0 & TQ1_0/TQ2_0 (288 B/64K: 32 B f16 scales + 256 B luti2 codes, zero bias) ---
+.macro DEFINE_M1_4_LUT2_SCALED sym, nt
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]               // ZT0_Q2_0_TABLE or ZT0_TQ_TABLE
+    ldr     zt0, [x0]
+    mov     w8, #0
+    mov     w9, #4
+    mov     w10, #8
+    mov     w11, #12
+
+1:  // panel loop
+    dup     z0.s, #0
+    dup     z1.s, #0
+    dup     z2.s, #0
+    dup     z3.s, #0
+    mov     x0, x20
+    ldr     x1, [x19, #48]
+    mov     x3, x21
+    mov     x13, x27
+
+2:  // 64-K group loop (288 B = 32 B f16 scales + 256 B luti2 codes)
+    PRFM_WEIGHT \nt, x3, 288
+    PRFM_WEIGHT \nt, x3, 416
+    PRFM_ACT    x0, 256
+    zero    {za}
+
+    LD1H_1  \nt, z12, p0, x3, 0
+    uunpklo z12.s, z12.h
+    fcvt    z12.s, p1/m, z12.h           // 16 x f32 scales
+    add     x3, x3, #32
+
+    LD1B_4  \nt, z24, z27, pn8, x3, 0
+    add     x3, x3, #256
+
+    cmp     w28, #1
+    b.ne    20f
+
+    // M == 1 branch-free luti2 fast path
+    luti2   {z16.h - z19.h}, zt0, z24[0]
+    luti2   {z20.h - z23.h}, zt0, z24[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z25[0]
+    luti2   {z20.h - z23.h}, zt0, z25[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z26[0]
+    luti2   {z20.h - z23.h}, zt0, z26[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z27[0]
+    luti2   {z20.h - z23.h}, zt0, z27[1]
+    DOT4_M1_ONLY fdot
+    add     x0, x0, #16
+    DOT4_M1_ONLY_B fdot
+    add     x0, x0, #16
+
+    mova    {z4.s - z7.s}, za.s[w8, 0, vgx4]
+    fadd    z4.s, z4.s, z5.s
+    fadd    z6.s, z6.s, z7.s
+    fadd    z4.s, z4.s, z6.s
+    fmla    z0.s, p1/m, z4.s, z12.s
+    b       21f
+
+20:
+    luti2   {z16.h - z19.h}, zt0, z24[0]
+    luti2   {z20.h - z23.h}, zt0, z24[1]
+    DOT4_M1_4 fdot
+    add     x0, x0, #16
+    DOT4_M1_4_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z25[0]
+    luti2   {z20.h - z23.h}, zt0, z25[1]
+    DOT4_M1_4 fdot
+    add     x0, x0, #16
+    DOT4_M1_4_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z26[0]
+    luti2   {z20.h - z23.h}, zt0, z26[1]
+    DOT4_M1_4 fdot
+    add     x0, x0, #16
+    DOT4_M1_4_B fdot
+    add     x0, x0, #16
+
+    luti2   {z16.h - z19.h}, zt0, z27[0]
+    luti2   {z20.h - z23.h}, zt0, z27[1]
+    DOT4_M1_4 fdot
+    add     x0, x0, #16
+    DOT4_M1_4_B fdot
+    add     x0, x0, #16
+
+    FOLD_SCALE_M1_4 z12
+21:
+    subs    x13, x13, #1
+    b.ne    2b
+
+    bl      _ami_sme2_store_m1_4_panel
+    mov     w8, #0
+    mov     w9, #4
+    mov     w10, #8
+    mov     w11, #12
+
+    add     x21, x21, x23
+    CALC_OUT_PANEL_STEP x12, 13
+    add     x22, x22, x12
+    add     x26, x26, #16
+    subs    w25, w25, #1
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M1_4_LUT2_SCALED _ami_sme2_m1_4_q2_0_t,  0
+DEFINE_M1_4_LUT2_SCALED _ami_sme2_m1_4_q2_0_nt, 1
+DEFINE_M1_4_LUT2_SCALED _ami_sme2_m1_4_tq_t,    0
+DEFINE_M1_4_LUT2_SCALED _ami_sme2_m1_4_tq_nt,   1
+
+.macro DEFINE_M5_16_LUT2_SCALED sym, nt
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]
+    ldr     zt0, [x0]
+
+1:  // 4-panel tile loop
+    zero    {za}
+    SETUP_1X4_WEIGHT_PTRS
+    mov     x0, x20
+    mov     x5, x27
+
+2:  // 64-K group loop (288 B = 32 B f16 scales + 4 x 64 B luti2 codes)
+    PRFM_WEIGHT \nt, x1, 288
+    PRFM_WEIGHT \nt, x2, 288
+    PRFM_WEIGHT \nt, x3, 288
+    PRFM_WEIGHT \nt, x4, 288
+
+    LOAD_DUP_F16_SCALES \nt, z8,  z12, x1
+    LOAD_DUP_F16_SCALES \nt, z9,  z12, x2
+    LOAD_DUP_F16_SCALES \nt, z10, z12, x3
+    LOAD_DUP_F16_SCALES \nt, z11, z12, x4
+    add     x1, x1, #32
+    add     x2, x2, #32
+    add     x3, x3, #32
+    add     x4, x4, #32
+
+    mov     x7, #4
+3:
+    PRFM_ACT x0, 512
+    LD1B_1  \nt, z24, p2, x1, 0
+    LD1B_1  \nt, z25, p2, x2, 0
+    LD1B_1  \nt, z26, p2, x3, 0
+    LD1B_1  \nt, z27, p2, x4, 0
+    add     x1, x1, #64
+    add     x2, x2, #64
+    add     x3, x3, #64
+    add     x4, x4, #64
+
+    luti2   {z16.h, z17.h}, zt0, z24[0]
+    luti2   {z18.h, z19.h}, zt0, z25[0]
+    luti2   {z20.h, z21.h}, zt0, z26[0]
+    luti2   {z22.h, z23.h}, zt0, z27[0]
+    FMUL_FMOPA_1X4_PAIR
+
+    luti2   {z16.h, z17.h}, zt0, z24[1]
+    luti2   {z18.h, z19.h}, zt0, z25[1]
+    luti2   {z20.h, z21.h}, zt0, z26[1]
+    luti2   {z22.h, z23.h}, zt0, z27[1]
+    FMUL_FMOPA_1X4_PAIR
+
+    luti2   {z16.h, z17.h}, zt0, z24[2]
+    luti2   {z18.h, z19.h}, zt0, z25[2]
+    luti2   {z20.h, z21.h}, zt0, z26[2]
+    luti2   {z22.h, z23.h}, zt0, z27[2]
+    FMUL_FMOPA_1X4_PAIR
+
+    luti2   {z16.h, z17.h}, zt0, z24[3]
+    luti2   {z18.h, z19.h}, zt0, z25[3]
+    luti2   {z20.h, z21.h}, zt0, z26[3]
+    luti2   {z22.h, z23.h}, zt0, z27[3]
+    FMUL_FMOPA_1X4_PAIR
+
+    subs    x7, x7, #1
+    b.ne    3b
+
+    subs    x5, x5, #1
+    b.ne    2b
+
+    bl      _ami_sme2_drain_1x4
+    ADVANCE_1X4_TILE
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M5_16_LUT2_SCALED _ami_sme2_m5_16_q2_0_t,  0
+DEFINE_M5_16_LUT2_SCALED _ami_sme2_m5_16_q2_0_nt, 1
+DEFINE_M5_16_LUT2_SCALED _ami_sme2_m5_16_tq_t,    0
+DEFINE_M5_16_LUT2_SCALED _ami_sme2_m5_16_tq_nt,   1
+
+.macro FMUL_FMOPA_2X2_QUAD_LUT2
+    fmul    z16.h, z16.h, z8.h
+    fmul    z20.h, z20.h, z9.h
+    ld1h    {z0.h}, p0/z, [x0, #0, mul vl]
+    ld1h    {z1.h}, p0/z, [x1, #0, mul vl]
+    fmopa   za0.s, p0/m, p0/m, z0.h, z16.h
+    fmopa   za1.s, p0/m, p0/m, z0.h, z20.h
+    fmopa   za2.s, p0/m, p0/m, z1.h, z16.h
+    fmopa   za3.s, p0/m, p0/m, z1.h, z20.h
+
+    fmul    z17.h, z17.h, z8.h
+    fmul    z21.h, z21.h, z9.h
+    ld1h    {z2.h}, p0/z, [x0, #1, mul vl]
+    ld1h    {z3.h}, p0/z, [x1, #1, mul vl]
+    fmopa   za0.s, p0/m, p0/m, z2.h, z17.h
+    fmopa   za1.s, p0/m, p0/m, z2.h, z21.h
+    fmopa   za2.s, p0/m, p0/m, z3.h, z17.h
+    fmopa   za3.s, p0/m, p0/m, z3.h, z21.h
+
+    fmul    z18.h, z18.h, z8.h
+    fmul    z22.h, z22.h, z9.h
+    ld1h    {z0.h}, p0/z, [x0, #2, mul vl]
+    ld1h    {z1.h}, p0/z, [x1, #2, mul vl]
+    fmopa   za0.s, p0/m, p0/m, z0.h, z18.h
+    fmopa   za1.s, p0/m, p0/m, z0.h, z22.h
+    fmopa   za2.s, p0/m, p0/m, z1.h, z18.h
+    fmopa   za3.s, p0/m, p0/m, z1.h, z22.h
+
+    fmul    z19.h, z19.h, z8.h
+    fmul    z23.h, z23.h, z9.h
+    ld1h    {z2.h}, p0/z, [x0, #3, mul vl]
+    ld1h    {z3.h}, p0/z, [x1, #3, mul vl]
+    fmopa   za0.s, p0/m, p0/m, z2.h, z19.h
+    fmopa   za1.s, p0/m, p0/m, z2.h, z23.h
+    fmopa   za2.s, p0/m, p0/m, z3.h, z19.h
+    fmopa   za3.s, p0/m, p0/m, z3.h, z23.h
+
+    add     x0, x0, #256
+    add     x1, x1, #256
+.endm
+
+.macro DEFINE_M32_LUT2_SCALED sym, nt
+.p2align 4
+.globl \sym
+\sym:
+    SME2_PROLOGUE
+L\sym\()_body:
+    SME2_LOAD_COMMON
+    cbz     w25, 9f
+    cbz     w27, 9f
+    cbz     w28, 9f
+
+    ldr     x0, [x19, #40]
+    ldr     zt0, [x0]
+
+1:  // 2-panel tile loop
+    zero    {za}
+    SETUP_2X2_PTRS
+    mov     x5, x27
+
+2:
+    PRFM_WEIGHT \nt, x2, 288
+    PRFM_WEIGHT \nt, x3, 288
+    LOAD_DUP_F16_SCALES \nt, z8, z12, x2
+    LOAD_DUP_F16_SCALES \nt, z9, z12, x3
+    add     x2, x2, #32
+    add     x3, x3, #32
+
+    mov     x7, #4
+3:
+    PRFM_ACT x0, 512
+    PRFM_ACT x1, 512
+    LD1B_1  \nt, z24, p2, x2, 0
+    LD1B_1  \nt, z25, p2, x3, 0
+    add     x2, x2, #64
+    add     x3, x3, #64
+
+    luti2   {z16.h - z19.h}, zt0, z24[0]
+    luti2   {z20.h - z23.h}, zt0, z25[0]
+    FMUL_FMOPA_2X2_QUAD_LUT2
+
+    luti2   {z16.h - z19.h}, zt0, z24[1]
+    luti2   {z20.h - z23.h}, zt0, z25[1]
+    FMUL_FMOPA_2X2_QUAD_LUT2
+
+    subs    x7, x7, #1
+    b.ne    3b
+
+    subs    x5, x5, #1
+    b.ne    2b
+
+    bl      _ami_sme2_drain_2x2
+    ADVANCE_2X2_TILE
+    b.ne    1b
+
+9:
+    SME2_EPILOGUE_OR_BATCH
+.endm
+
+DEFINE_M32_LUT2_SCALED _ami_sme2_m32_q2_0_t,  0
+DEFINE_M32_LUT2_SCALED _ami_sme2_m32_q2_0_nt, 1
+DEFINE_M32_LUT2_SCALED _ami_sme2_m32_tq_t,    0
+DEFINE_M32_LUT2_SCALED _ami_sme2_m32_tq_nt,   1
+
+// ============================================================================
 // REGIME 4 (C24, ADR-0023): Hoisted `smstart` / `smstop` Batch Executor
 //
 // Executes `count` heterogeneous SME2 projections (layers, multi-LoRA adapters,
@@ -2763,8 +3911,8 @@ _ami_sme2_exec_batch:
 
 L_ami_sme2_batch_dispatch:
     ldr     x19, [x16, #0]               // x19 = task.args (*const KernelArgs)
-    ldr     w0,  [x16, #8]               // w0  = task.kernel_id (0..29)
-    cmp     w0,  #30
+    ldr     w0,  [x16, #8]               // w0  = task.kernel_id (0..65)
+    cmp     w0,  #66
     b.hs    L_ami_sme2_batch_next
     adr     x1,  L_ami_sme2_branch_table
     add     x1,  x1, x0, lsl #2
@@ -2782,6 +3930,18 @@ L_ami_sme2_branch_table:
     b       L_ami_sme2_m1_4_q3_nt_body
     b       L_ami_sme2_m1_4_q2_t_body
     b       L_ami_sme2_m1_4_q2_nt_body
+    b       L_ami_sme2_m1_4_nvfp4_t_body
+    b       L_ami_sme2_m1_4_nvfp4_nt_body
+    b       L_ami_sme2_m1_4_mxfp4_t_body
+    b       L_ami_sme2_m1_4_mxfp4_nt_body
+    b       L_ami_sme2_m1_4_q2_0_t_body
+    b       L_ami_sme2_m1_4_q2_0_nt_body
+    b       L_ami_sme2_m1_4_tq_t_body
+    b       L_ami_sme2_m1_4_tq_nt_body
+    b       L_ami_sme2_m1_4_tq_t_body
+    b       L_ami_sme2_m1_4_tq_nt_body
+    b       L_ami_sme2_m1_4_iq2_t_body
+    b       L_ami_sme2_m1_4_iq2_nt_body
     b       L_ami_sme2_m5_16_bf16_t_body
     b       L_ami_sme2_m5_16_bf16_nt_body
     b       L_ami_sme2_m5_16_f16_t_body
@@ -2792,6 +3952,18 @@ L_ami_sme2_branch_table:
     b       L_ami_sme2_m5_16_q3_nt_body
     b       L_ami_sme2_m5_16_q2_t_body
     b       L_ami_sme2_m5_16_q2_nt_body
+    b       L_ami_sme2_m5_16_nvfp4_t_body
+    b       L_ami_sme2_m5_16_nvfp4_nt_body
+    b       L_ami_sme2_m5_16_mxfp4_t_body
+    b       L_ami_sme2_m5_16_mxfp4_nt_body
+    b       L_ami_sme2_m5_16_q2_0_t_body
+    b       L_ami_sme2_m5_16_q2_0_nt_body
+    b       L_ami_sme2_m5_16_tq_t_body
+    b       L_ami_sme2_m5_16_tq_nt_body
+    b       L_ami_sme2_m5_16_tq_t_body
+    b       L_ami_sme2_m5_16_tq_nt_body
+    b       L_ami_sme2_m5_16_iq2_t_body
+    b       L_ami_sme2_m5_16_iq2_nt_body
     b       L_ami_sme2_m32_bf16_t_body
     b       L_ami_sme2_m32_bf16_nt_body
     b       L_ami_sme2_m32_f16_t_body
@@ -2802,6 +3974,18 @@ L_ami_sme2_branch_table:
     b       L_ami_sme2_m32_q3_nt_body
     b       L_ami_sme2_m32_q2_t_body
     b       L_ami_sme2_m32_q2_nt_body
+    b       L_ami_sme2_m32_nvfp4_t_body
+    b       L_ami_sme2_m32_nvfp4_nt_body
+    b       L_ami_sme2_m32_mxfp4_t_body
+    b       L_ami_sme2_m32_mxfp4_nt_body
+    b       L_ami_sme2_m32_q2_0_t_body
+    b       L_ami_sme2_m32_q2_0_nt_body
+    b       L_ami_sme2_m32_tq_t_body
+    b       L_ami_sme2_m32_tq_nt_body
+    b       L_ami_sme2_m32_tq_t_body
+    b       L_ami_sme2_m32_tq_nt_body
+    b       L_ami_sme2_m32_iq2_t_body
+    b       L_ami_sme2_m32_iq2_nt_body
 
 L_ami_sme2_batch_next:
     add     x16, x16, #16

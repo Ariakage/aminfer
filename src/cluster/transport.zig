@@ -22,6 +22,7 @@ pub const APPLE_PAGE_SIZE: usize = page.APPLE_PAGE_SIZE;
 pub const MAGIC: u32 = std.mem.readInt(u32, "AMI7", .little);
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const HEADER_BYTES: usize = 32;
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = std.math.maxInt(u32);
 pub const MAX_EXPERTS_BITMAP_WORDS: usize = 16;
 pub const MAX_EXPERTS_BITMAP_BITS: usize = MAX_EXPERTS_BITMAP_WORDS * 64;
 pub const DEFAULT_TIMEOUT_MS: u32 = 5_000;
@@ -85,6 +86,12 @@ pub const ProtocolError = error{
 pub const SlabError = page.WiredRegion.InitError || page.ShareError || error{
     InvalidAlignment,
     OutOfSlabSpace,
+};
+
+pub const FramePayloadError = error{
+    PayloadTooLarge,
+    BufferTooSmall,
+    Overflow,
 };
 
 /// Dynamically probed `libibverbs` / `RDMA.framework` symbols (no link dep).
@@ -986,17 +993,50 @@ pub const FrameChannel = struct {
         self.resetState();
     }
 
+    fn validateTxPayloadBounds(self: *const FrameChannel, payload_len: usize) FramePayloadError!usize {
+        const total = std.math.add(usize, HEADER_BYTES, payload_len) catch return error.Overflow;
+        if (payload_len > MAX_FRAME_PAYLOAD_BYTES) return error.PayloadTooLarge;
+        if (total > self.tx_buf.len) return error.BufferTooSmall;
+        return total;
+    }
+
     /// Reserves an 8-byte-aligned payload region inside `tx_buf` directly after
     /// the 32-byte frame header so callers encode payloads with zero extra copy.
-    pub fn preparePayload(self: *FrameChannel, payload_len: usize) error{ BufferTooSmall, Overflow }![]align(8) u8 {
-        const total = try std.math.add(usize, HEADER_BYTES, payload_len);
-        if (total > self.tx_buf.len) return error.BufferTooSmall;
-        const slice: []align(8) u8 = @alignCast(self.tx_buf[HEADER_BYTES .. HEADER_BYTES + payload_len]);
+    pub fn preparePayload(self: *FrameChannel, payload_len: usize) FramePayloadError![]align(8) u8 {
+        const total = try self.validateTxPayloadBounds(payload_len);
+        const slice: []align(8) u8 = @alignCast(self.tx_buf[HEADER_BYTES..total]);
         return slice;
     }
 
-    /// Finalizes the 32-byte `AMI7` header (with payload & header CRC32) for a
-    /// payload previously written into `tx_buf[HEADER_BYTES..]`.
+    /// Validates `payload_len` against both `MAX_FRAME_PAYLOAD_BYTES` (`u32`) and
+    /// `tx_buf.len`, then finalizes the 32-byte `AMI7` header for a payload
+    /// previously written into `tx_buf[HEADER_BYTES..]`.
+    pub fn commitFrameChecked(
+        self: *FrameChannel,
+        msg_type: MsgType,
+        flags: u8,
+        seq_id: u64,
+        payload_len: usize,
+    ) FramePayloadError!FrameHeader {
+        const total = try self.validateTxPayloadBounds(payload_len);
+        const payload_len_u32 = std.math.cast(u32, payload_len) orelse return error.PayloadTooLarge;
+        const payload = self.tx_buf[HEADER_BYTES..total];
+        const raw_hdr: FrameHeader = .{
+            .msg_type = msg_type,
+            .flags = flags,
+            .seq_id = seq_id,
+            .payload_len = payload_len_u32,
+            .payload_crc32 = std.hash.Crc32.hash(payload),
+        };
+        const encoded = raw_hdr.encode(self.tx_buf[0..HEADER_BYTES]);
+        self.tx_len = total;
+        self.tx_sent = 0;
+        return encoded;
+    }
+
+    /// Non-failing wrapper around `commitFrameChecked` for existing `preparePayload`
+    /// callers: validates bounds explicitly and clears pending TX state rather than
+    /// triggering `@intCast` traps or silently truncating oversized frames.
     pub fn commitFrame(
         self: *FrameChannel,
         msg_type: MsgType,
@@ -1004,18 +1044,20 @@ pub const FrameChannel = struct {
         seq_id: u64,
         payload_len: usize,
     ) FrameHeader {
-        const payload = self.tx_buf[HEADER_BYTES .. HEADER_BYTES + payload_len];
-        const raw_hdr: FrameHeader = .{
-            .msg_type = msg_type,
-            .flags = flags,
-            .seq_id = seq_id,
-            .payload_len = @intCast(payload_len),
-            .payload_crc32 = std.hash.Crc32.hash(payload),
+        return self.commitFrameChecked(msg_type, flags, seq_id, payload_len) catch |err| switch (err) {
+            error.PayloadTooLarge, error.BufferTooSmall, error.Overflow => {
+                self.tx_len = 0;
+                self.tx_sent = 0;
+                return .{
+                    .msg_type = msg_type,
+                    .flags = flags,
+                    .seq_id = seq_id,
+                    .payload_len = 0,
+                    .header_crc32 = 0,
+                    .payload_crc32 = 0,
+                };
+            },
         };
-        const encoded = raw_hdr.encode(self.tx_buf[0..HEADER_BYTES]);
-        self.tx_len = HEADER_BYTES + payload_len;
-        self.tx_sent = 0;
-        return encoded;
     }
 
     /// Non-blocking drain of queued TX bytes.
@@ -1369,4 +1411,48 @@ test "WiredSlab carves 16 KiB aligned frames and drives loopback FrameChannel ro
     try std.testing.expectEqual(MsgType.pong, resp.header.msg_type);
     try std.testing.expectEqual(@as(u64, 77), resp.header.seq_id);
     client_chan.resetRx();
+}
+
+test "X1 FrameChannel enforces u32 MAX_FRAME_PAYLOAD_BYTES and tx_buf bounds without traps or truncation" {
+    var slab = try WiredSlab.initOwned(2 * APPLE_PAGE_SIZE);
+    defer slab.deinit();
+
+    const tx_buf = try slab.carvePages(APPLE_PAGE_SIZE);
+    const rx_buf = try slab.carvePages(APPLE_PAGE_SIZE);
+    var chan = try FrameChannel.init(-1, tx_buf, rx_buf);
+    defer chan.close();
+
+    // 1. Overflow in HEADER_BYTES + payload_len.
+    try std.testing.expectError(error.Overflow, chan.preparePayload(std.math.maxInt(usize)));
+    try std.testing.expectError(error.Overflow, chan.commitFrameChecked(.ping, 0, 1, std.math.maxInt(usize)));
+
+    // 2. Exceeds u32 wire limit (`> MAX_FRAME_PAYLOAD_BYTES`) -> PayloadTooLarge (never @intCast trap/truncation).
+    const over_u32: usize = @as(usize, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.PayloadTooLarge, chan.preparePayload(over_u32));
+    try std.testing.expectError(error.PayloadTooLarge, chan.commitFrameChecked(.eval_experts_req, 0, 2, over_u32));
+
+    // 3. Within u32 limit, exceeds tx_buf capacity -> BufferTooSmall.
+    const max_fit = APPLE_PAGE_SIZE - HEADER_BYTES;
+    try std.testing.expectError(error.BufferTooSmall, chan.preparePayload(max_fit + 1));
+    try std.testing.expectError(error.BufferTooSmall, chan.commitFrameChecked(.eval_experts_req, 0, 3, max_fit + 1));
+
+    // 4. Non-failing commitFrame safely drops oversized frames instead of truncating or trapping.
+    const bad_u32 = chan.commitFrame(.ping, 0, 4, over_u32);
+    try std.testing.expectEqual(@as(u32, 0), bad_u32.payload_len);
+    try std.testing.expect(!chan.hasPendingTx());
+    try std.testing.expectEqual(@as(usize, 0), chan.tx_len);
+
+    const bad_buf = chan.commitFrame(.ping, 0, 5, max_fit + 1);
+    try std.testing.expectEqual(@as(u32, 0), bad_buf.payload_len);
+    try std.testing.expect(!chan.hasPendingTx());
+    try std.testing.expectEqual(@as(usize, 0), chan.tx_len);
+
+    // 5. Exact boundary `max_fit` succeeds cleanly.
+    const full_payload = try chan.preparePayload(max_fit);
+    try std.testing.expectEqual(max_fit, full_payload.len);
+    @memset(full_payload, 0xA5);
+    const ok_hdr = try chan.commitFrameChecked(.eval_experts_resp, 1, 6, max_fit);
+    try std.testing.expectEqual(@as(u32, max_fit), ok_hdr.payload_len);
+    try std.testing.expect(chan.hasPendingTx());
+    try std.testing.expectEqual(APPLE_PAGE_SIZE, chan.tx_len);
 }

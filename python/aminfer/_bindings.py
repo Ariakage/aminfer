@@ -16,6 +16,24 @@ AMI_SDK_ABI_VERSION: Final[int] = 1
 AMI_SDK_MAX_STOP_TOKENS: Final[int] = 8
 AMI_SDK_TOKEN_NONE: Final[int] = 0xFFFFFFFF
 
+# Tokenizer dialects (must match include/aminfer.h).
+AMI_SDK_DIALECT_QWEN: Final[int] = 0
+AMI_SDK_DIALECT_DEEPSEEK: Final[int] = 1
+AMI_SDK_DIALECT_INKLING2: Final[int] = 2
+AMI_SDK_DIALECT_HY4: Final[int] = 3
+
+# Reasoning effort tiers (must match include/aminfer.h).
+AMI_SDK_EFFORT_DEFAULT: Final[int] = 0
+AMI_SDK_EFFORT_NONE: Final[int] = 1
+AMI_SDK_EFFORT_NO_THINK: Final[int] = 2
+AMI_SDK_EFFORT_MINIMAL: Final[int] = 3
+AMI_SDK_EFFORT_LOW: Final[int] = 4
+AMI_SDK_EFFORT_MEDIUM: Final[int] = 5
+AMI_SDK_EFFORT_HIGH: Final[int] = 6
+AMI_SDK_EFFORT_XHIGH: Final[int] = 7
+AMI_SDK_EFFORT_MAX: Final[int] = 8
+AMI_SDK_EFFORT_CUSTOM_FLOAT: Final[int] = 9
+
 # Status codes (must match include/aminfer.h).
 AMI_SDK_OK: Final[int] = 0
 AMI_SDK_ERR_INVALID_ARGUMENT: Final[int] = -1
@@ -137,6 +155,8 @@ class GenParamsC(ctypes.Structure):
         ("reset_kv_cache", ctypes.c_uint32),
         ("skip_special_tokens", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
+        ("reasoning_effort", ctypes.c_uint32),
+        ("reasoning_effort_value", ctypes.c_float),
         ("cancel_token", ctypes.c_void_p),
     ]
 

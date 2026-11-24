@@ -13,6 +13,7 @@ import contextlib
 import ctypes
 import dataclasses
 import enum
+import math
 import os
 import queue
 import threading
@@ -21,6 +22,20 @@ from typing import Any, overload
 
 from aminfer._bindings import (
     AMI_SDK_ABI_VERSION,
+    AMI_SDK_DIALECT_DEEPSEEK,
+    AMI_SDK_DIALECT_HY4,
+    AMI_SDK_DIALECT_INKLING2,
+    AMI_SDK_DIALECT_QWEN,
+    AMI_SDK_EFFORT_CUSTOM_FLOAT,
+    AMI_SDK_EFFORT_DEFAULT,
+    AMI_SDK_EFFORT_HIGH,
+    AMI_SDK_EFFORT_LOW,
+    AMI_SDK_EFFORT_MAX,
+    AMI_SDK_EFFORT_MEDIUM,
+    AMI_SDK_EFFORT_MINIMAL,
+    AMI_SDK_EFFORT_NONE,
+    AMI_SDK_EFFORT_NO_THINK,
+    AMI_SDK_EFFORT_XHIGH,
     AMI_SDK_ERR_BUFFER_TOO_SMALL,
     AMI_SDK_MAX_STOP_TOKENS,
     AMI_SDK_OK,
@@ -72,8 +87,23 @@ class DType(enum.IntEnum):
 
 
 class Dialect(enum.IntEnum):
-    QWEN = 0
-    DEEPSEEK = 1
+    QWEN = AMI_SDK_DIALECT_QWEN
+    DEEPSEEK = AMI_SDK_DIALECT_DEEPSEEK
+    INKLING2 = AMI_SDK_DIALECT_INKLING2
+    HY4 = AMI_SDK_DIALECT_HY4
+
+
+class ReasoningEffort(enum.IntEnum):
+    DEFAULT = AMI_SDK_EFFORT_DEFAULT
+    NONE = AMI_SDK_EFFORT_NONE
+    NO_THINK = AMI_SDK_EFFORT_NO_THINK
+    MINIMAL = AMI_SDK_EFFORT_MINIMAL
+    LOW = AMI_SDK_EFFORT_LOW
+    MEDIUM = AMI_SDK_EFFORT_MEDIUM
+    HIGH = AMI_SDK_EFFORT_HIGH
+    XHIGH = AMI_SDK_EFFORT_XHIGH
+    MAX = AMI_SDK_EFFORT_MAX
+    CUSTOM_FLOAT = AMI_SDK_EFFORT_CUSTOM_FLOAT
 
 
 class DeltaKind(enum.IntEnum):
@@ -183,6 +213,92 @@ class EngineStats:
     live_budget_bytes: int
 
 
+_EFFORT_NAME_MAP: dict[str, int] = {
+    "default": AMI_SDK_EFFORT_DEFAULT,
+    "none": AMI_SDK_EFFORT_NONE,
+    "no_think": AMI_SDK_EFFORT_NO_THINK,
+    "nothink": AMI_SDK_EFFORT_NO_THINK,
+    "minimal": AMI_SDK_EFFORT_MINIMAL,
+    "low": AMI_SDK_EFFORT_LOW,
+    "medium": AMI_SDK_EFFORT_MEDIUM,
+    "high": AMI_SDK_EFFORT_HIGH,
+    "xhigh": AMI_SDK_EFFORT_XHIGH,
+    "max": AMI_SDK_EFFORT_MAX,
+}
+
+
+def _invalid_arg(msg: str) -> InvalidArgumentError:
+    return InvalidArgumentError(-1, "AMI_SDK_ERR_INVALID_ARGUMENT", msg)
+
+
+def _validate_u32(val: Any, name: str) -> int:
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise _invalid_arg(f"{name} must be an integer in [0, 0xFFFFFFFF], got {val!r}")
+    iv = int(val)
+    if iv < 0 or iv > 0xFFFFFFFF:
+        raise _invalid_arg(f"{name} out of u32 range [0, 0xFFFFFFFF]: {iv}")
+    return iv
+
+
+def _validate_u64(val: Any, name: str) -> int:
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise _invalid_arg(f"{name} must be an integer in [0, 0xFFFFFFFFFFFFFFFF], got {val!r}")
+    iv = int(val)
+    if iv < 0 or iv > 0xFFFFFFFFFFFFFFFF:
+        raise _invalid_arg(f"{name} out of u64 range: {iv}")
+    return iv
+
+
+def _validate_finite_float(val: Any, name: str) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise _invalid_arg(f"{name} must be a finite real number, got {val!r}")
+    fv = float(val)
+    if not math.isfinite(fv) or not math.isfinite(float(ctypes.c_float(fv).value)):
+        raise _invalid_arg(f"{name} must be finite, got {val!r}")
+    return fv
+
+
+def _coerce_reasoning_effort(val: ReasoningEffort | str | float | None) -> tuple[int, float]:
+    if val is None:
+        return (AMI_SDK_EFFORT_DEFAULT, 0.0)
+    if isinstance(val, bool):
+        raise _invalid_arg(f"reasoning_effort cannot be bool: {val!r}")
+    if isinstance(val, ReasoningEffort):
+        if val == ReasoningEffort.CUSTOM_FLOAT:
+            raise _invalid_arg("ReasoningEffort.CUSTOM_FLOAT requires a float in [0.0, 0.99]")
+        return (int(val), 0.0)
+    if isinstance(val, str):
+        norm = val.strip().lower().replace("-", "_")
+        mapped = _EFFORT_NAME_MAP.get(norm)
+        if mapped is None:
+            raise _invalid_arg(f"unsupported reasoning_effort string: {val!r}")
+        return (mapped, 0.0)
+    if isinstance(val, (int, float)):
+        fv = float(val)
+        if not math.isfinite(fv) or fv < 0.0 or fv > 0.99:
+            raise _invalid_arg(f"numeric reasoning_effort must be finite and in [0.0, 0.99], got {val!r}")
+        return (AMI_SDK_EFFORT_CUSTOM_FLOAT, fv)
+    raise _invalid_arg(f"unsupported reasoning_effort type: {type(val).__name__}")
+
+
+def _validate_token_id(tid: Any, *, vocab_size: int | None = None, name: str = "token_id") -> int:
+    iv = _validate_u32(tid, name)
+    if vocab_size is not None and vocab_size > 0 and iv >= vocab_size:
+        raise _invalid_arg(f"{name} ({iv}) >= vocab_size ({vocab_size})")
+    return iv
+
+
+def _validate_token_ids(
+    token_ids: Sequence[int],
+    *,
+    vocab_size: int | None = None,
+    name: str = "token_ids",
+) -> list[int]:
+    if isinstance(token_ids, (str, bytes, bytearray)):
+        raise _invalid_arg(f"{name} must be a sequence of integer token IDs, got {type(token_ids).__name__}")
+    return [_validate_token_id(x, vocab_size=vocab_size, name=name) for x in token_ids]
+
+
 @dataclasses.dataclass(slots=True)
 class GenerationConfig:
     max_tokens: int = 64
@@ -199,40 +315,69 @@ class GenerationConfig:
     start_in_think: bool = False
     reset_kv_cache: bool = True
     skip_special_tokens: bool = True
+    reasoning_effort: ReasoningEffort | str | float | None = None
     cancel_token: CancelToken | None = None
 
     def to_c(self, lib: ctypes.CDLL) -> GenParamsC:
+        max_tokens_u32 = _validate_u32(self.max_tokens, "max_tokens")
+        top_k_u32 = _validate_u32(self.top_k, "top_k")
+
+        temperature = _validate_finite_float(self.temperature, "temperature")
+        if temperature < 0.0:
+            raise _invalid_arg(f"temperature must be >= 0.0, got {temperature}")
+
+        top_p = _validate_finite_float(self.top_p, "top_p")
+        if top_p <= 0.0 or top_p > 1.0:
+            raise _invalid_arg(f"top_p must be in (0.0, 1.0], got {top_p}")
+
+        min_p = _validate_finite_float(self.min_p, "min_p")
+        if min_p < 0.0 or min_p >= 1.0:
+            raise _invalid_arg(f"min_p must be in [0.0, 1.0), got {min_p}")
+
+        repetition_penalty = _validate_finite_float(self.repetition_penalty, "repetition_penalty")
+        if repetition_penalty <= 0.0:
+            raise _invalid_arg(f"repetition_penalty must be > 0.0, got {repetition_penalty}")
+
+        presence_penalty = _validate_finite_float(self.presence_penalty, "presence_penalty")
+        frequency_penalty = _validate_finite_float(self.frequency_penalty, "frequency_penalty")
+
+        effort_enum, effort_val = _coerce_reasoning_effort(self.reasoning_effort)
+
+        if isinstance(self.stop_token_ids, (str, bytes, bytearray)):
+            raise _invalid_arg("stop_token_ids must be a sequence of token IDs")
+        stops = list(self.stop_token_ids)
+        if len(stops) > AMI_SDK_MAX_STOP_TOKENS:
+            raise _invalid_arg(f"at most {AMI_SDK_MAX_STOP_TOKENS} stop_token_ids are supported")
+        validated_stops = [
+            _validate_u32(sid, f"stop_token_ids[{i}]") for i, sid in enumerate(stops)
+        ]
+
         params = GenParamsC()
         lib.ami_sdk_gen_params_init(ctypes.byref(params))
-        params.max_tokens = int(self.max_tokens)
-        params.temperature = float(self.temperature)
-        params.top_p = float(self.top_p)
-        params.top_k = int(self.top_k)
-        params.min_p = float(self.min_p)
-        params.repetition_penalty = float(self.repetition_penalty)
-        params.presence_penalty = float(self.presence_penalty)
-        params.frequency_penalty = float(self.frequency_penalty)
+        params.max_tokens = max_tokens_u32
+        params.temperature = temperature
+        params.top_p = top_p
+        params.top_k = top_k_u32
+        params.min_p = min_p
+        params.repetition_penalty = repetition_penalty
+        params.presence_penalty = presence_penalty
+        params.frequency_penalty = frequency_penalty
         if self.seed is not None:
             params.has_seed = 1
-            params.seed = int(self.seed) & 0xFFFFFFFFFFFFFFFF
+            params.seed = _validate_u64(self.seed, "seed")
         else:
             params.has_seed = 0
             params.seed = 0
-        stops = list(self.stop_token_ids)
-        if len(stops) > AMI_SDK_MAX_STOP_TOKENS:
-            raise InvalidArgumentError(
-                -1,
-                "AMI_SDK_ERR_INVALID_ARGUMENT",
-                f"at most {AMI_SDK_MAX_STOP_TOKENS} stop_token_ids are supported",
-            )
-        params.stop_token_count = len(stops)
-        for i, sid in enumerate(stops):
-            params.stop_token_ids[i] = int(sid)
+        params.stop_token_count = len(validated_stops)
+        for i, sid in enumerate(validated_stops):
+            params.stop_token_ids[i] = sid
         params.ignore_eos = 1 if self.ignore_eos else 0
         params.start_in_think = 1 if self.start_in_think else 0
         params.reset_kv_cache = 1 if self.reset_kv_cache else 0
         params.skip_special_tokens = 1 if self.skip_special_tokens else 0
-        params.cancel_token = self.cancel_token._handle if self.cancel_token is not None else None
+        params.reasoning_effort = effort_enum
+        params.reasoning_effort_value = effort_val
+        params.cancel_token = self.cancel_token._require_open() if self.cancel_token is not None else None
         return params
 
 
@@ -462,11 +607,15 @@ class Tokenizer:
     def detokenize_bytes(
         self, token_ids: Sequence[int], *, skip_special_tokens: bool = True
     ) -> bytes:
-        n = len(token_ids)
+        handle = self._require_open()
+        vocab = self.vocab_size
+        validated = _validate_token_ids(
+            token_ids, vocab_size=vocab if vocab > 0 else None, name="token_ids"
+        )
+        n = len(validated)
         if n == 0:
             return b""
-        handle = self._require_open()
-        ids_arr = (ctypes.c_uint32 * n)(*token_ids)
+        ids_arr = (ctypes.c_uint32 * n)(*validated)
         skip = 1 if skip_special_tokens else 0
         needed = ctypes.c_size_t()
         check_status(
@@ -723,6 +872,7 @@ class Engine:
             self._tokenizer_view = Tokenizer(
                 self._lib, ctypes.c_void_p(tok_ptr), _owned=False, _owner=self
             )
+        self._vocab_size: int = self.stats.vocab_size
 
     @staticmethod
     def host_vm_snapshot(*, lib_path: str | os.PathLike[str] | None = None) -> HostVmSnapshot:
@@ -829,7 +979,8 @@ class Engine:
     def _prompt_to_ids(self, prompt: str | bytes | Sequence[int]) -> list[int]:
         if isinstance(prompt, (str, bytes)):
             return self.tokenize(prompt, allow_special_tokens=True)
-        return [int(x) for x in prompt]
+        v = self._vocab_size if self._vocab_size > 0 else None
+        return _validate_token_ids(prompt, vocab_size=v, name="prompt")
 
     def prefill(
         self,
@@ -857,11 +1008,14 @@ class Engine:
         )
 
     def step_decode(self, token_id: int) -> int:
+        handle = self._require_open()
+        v = self._vocab_size if self._vocab_size > 0 else None
+        tid = _validate_token_id(token_id, vocab_size=v, name="token_id")
         out_next = ctypes.c_uint32()
         check_status(
             self._lib,
             self._lib.ami_sdk_step_decode(
-                self._require_open(), int(token_id), ctypes.byref(out_next)
+                handle, tid, ctypes.byref(out_next)
             ),
         )
         return int(out_next.value)
@@ -877,8 +1031,8 @@ class Engine:
         cfg = config if config is not None else GenerationConfig()
         c_params = cfg.to_c(self._lib)
 
-        max_toks = max(0, int(cfg.max_tokens))
-        out_ids = (ctypes.c_uint32 * max(1, max_toks))()
+        max_toks = int(c_params.max_tokens)
+        out_ids = (ctypes.c_uint32 * max_toks)() if max_toks > 0 else None
         c_res = GenResultC(struct_size=ctypes.sizeof(GenResultC))
 
         text_parts: list[str] = []
@@ -932,6 +1086,8 @@ class Engine:
         cb_ptr = ctypes.cast(_c_stream_cb, ctypes.c_void_p)
         if isinstance(prompt, (str, bytes)):
             raw_prompt = _as_utf8(prompt)
+            if not raw_prompt:
+                raise _invalid_arg("prompt is empty")
             rc = self._lib.ami_sdk_generate_text(
                 handle,
                 raw_prompt,
@@ -944,9 +1100,10 @@ class Engine:
                 ctypes.byref(c_res),
             )
         else:
-            ids = [int(x) for x in prompt]
+            v = self._vocab_size if self._vocab_size > 0 else None
+            ids = _validate_token_ids(prompt, vocab_size=v, name="prompt")
             if not ids:
-                raise InvalidArgumentError(-1, "AMI_SDK_ERR_INVALID_ARGUMENT", "prompt is empty")
+                raise _invalid_arg("prompt is empty")
             ids_arr = (ctypes.c_uint32 * len(ids))(*ids)
             rc = self._lib.ami_sdk_generate_tokens(
                 handle,
@@ -968,7 +1125,10 @@ class Engine:
             tool_calls.append("".join(current_tool_parts))
 
         gen_count = int(c_res.generated_tokens)
-        gen_tuple = tuple(int(x) for x in out_ids[:gen_count])
+        if max_toks == 0 or gen_count == 0 or out_ids is None:
+            gen_tuple: tuple[int, ...] = ()
+        else:
+            gen_tuple = tuple(int(x) for x in out_ids[: min(gen_count, max_toks)])
         text_str = "".join(text_parts)
         if not text_str and not reasoning_parts and not tool_calls and self._tokenizer_view is None:
             text_str = ""
@@ -1134,11 +1294,10 @@ class Engine:
                     ),
                 )
             else:
-                ids = [int(x) for x in item]
+                v = self._vocab_size if self._vocab_size > 0 else None
+                ids = _validate_token_ids(item, vocab_size=v, name="token_ids")
                 if not ids:
-                    raise InvalidArgumentError(
-                        -1, "AMI_SDK_ERR_INVALID_ARGUMENT", "token_ids sequence is empty"
-                    )
+                    raise _invalid_arg("token_ids sequence is empty")
                 ids_arr = (ctypes.c_uint32 * len(ids))(*ids)
                 check_status(
                     self._lib,
@@ -1182,10 +1341,14 @@ class Engine:
         self._lib.ami_sdk_rerank_params_init(ctypes.byref(c_params))
         c_params.score_mode = int(rmode)
         c_params.positive_token_id = (
-            AMI_SDK_TOKEN_NONE if positive_token_id is None else int(positive_token_id)
+            AMI_SDK_TOKEN_NONE
+            if positive_token_id is None
+            else _validate_u32(positive_token_id, "positive_token_id")
         )
         c_params.negative_token_id = (
-            AMI_SDK_TOKEN_NONE if negative_token_id is None else int(negative_token_id)
+            AMI_SDK_TOKEN_NONE
+            if negative_token_id is None
+            else _validate_u32(negative_token_id, "negative_token_id")
         )
         c_params.cancel_token = (
             cancel_token._require_open() if cancel_token is not None else None
@@ -1212,17 +1375,18 @@ class Engine:
                 ),
             )
         else:
-            q_ids = [int(x) for x in query]
-            q_arr = (ctypes.c_uint32 * len(q_ids))(*q_ids)
+            v = self._vocab_size if self._vocab_size > 0 else None
+            q_ids = _validate_token_ids(query, vocab_size=v, name="query")
+            q_arr = (ctypes.c_uint32 * len(q_ids))(*q_ids) if q_ids else None
             c_u32_p = ctypes.POINTER(ctypes.c_uint32)
             doc_arrays = []
             doc_ptrs_tok = (c_u32_p * num_docs)()
             doc_lens_tok = (ctypes.c_size_t * num_docs)()
             for i, d_seq in enumerate(documents):
-                d_ids = [int(x) for x in d_seq]  # type: ignore[union-attr]
-                arr = (ctypes.c_uint32 * len(d_ids))(*d_ids)
+                d_ids = _validate_token_ids(d_seq, vocab_size=v, name=f"documents[{i}]")  # type: ignore[arg-type]
+                arr = (ctypes.c_uint32 * len(d_ids))(*d_ids) if d_ids else None
                 doc_arrays.append(arr)
-                doc_ptrs_tok[i] = ctypes.cast(arr, c_u32_p)
+                doc_ptrs_tok[i] = ctypes.cast(arr, c_u32_p) if arr is not None else c_u32_p()
                 doc_lens_tok[i] = len(d_ids)
             check_status(
                 self._lib,

@@ -19,6 +19,7 @@ and verifies:
 
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import pathlib
@@ -49,13 +50,29 @@ from aminfer import (  # noqa: E402
     Engine,
     FinishReason,
     GenerationConfig,
+    InvalidArgumentError,
     PoolingMode,
     RerankMode,
     Tokenizer,
     VisionFormat,
     VisionInput,
 )
-from aminfer._bindings import find_libaminfer, load_lib  # noqa: E402
+from aminfer._bindings import (  # noqa: E402
+    AMI_SDK_EFFORT_CUSTOM_FLOAT,
+    AMI_SDK_EFFORT_DEFAULT,
+    AMI_SDK_EFFORT_HIGH,
+    AMI_SDK_EFFORT_MAX,
+    AMI_SDK_EFFORT_MEDIUM,
+    AMI_SDK_EFFORT_MINIMAL,
+    AMI_SDK_EFFORT_NO_THINK,
+    AMI_SDK_EFFORT_NONE,
+    AMI_SDK_EFFORT_LOW,
+    AMI_SDK_EFFORT_XHIGH,
+    GenParamsC,
+    find_libaminfer,
+    load_lib,
+)
+from aminfer.engine import ReasoningEffort  # noqa: E402
 
 
 def _make_deepseek_tokenizer_json() -> str:
@@ -379,6 +396,125 @@ class TestAminferPythonSdk(unittest.TestCase):
         # (confirming every WiredArena munlock + Objective-C autorelease pool drained cleanly).
         heap_growth = vm_after.phys_footprint_bytes - vm_before.phys_footprint_bytes
         self.assertLess(heap_growth, wired_footprint_per_engine)
+
+    def test_06_reasoning_effort_and_c17_parameter_bounds_hardening(self) -> None:
+        lib = load_lib()
+        self.assertEqual(ctypes.sizeof(GenParamsC), 120)
+        self.assertEqual(int(Dialect.INKLING2), 2)
+        self.assertEqual(int(Dialect.HY4), 3)
+
+        # 1. reasoning_effort mapping parity (`None`, tiers, floats in [0.0, 0.99]).
+        tier_cases = [
+            (None, AMI_SDK_EFFORT_DEFAULT, 0.0),
+            ("default", AMI_SDK_EFFORT_DEFAULT, 0.0),
+            ("none", AMI_SDK_EFFORT_NONE, 0.0),
+            ("no_think", AMI_SDK_EFFORT_NO_THINK, 0.0),
+            ("no-think", AMI_SDK_EFFORT_NO_THINK, 0.0),
+            ("minimal", AMI_SDK_EFFORT_MINIMAL, 0.0),
+            ("low", AMI_SDK_EFFORT_LOW, 0.0),
+            ("medium", AMI_SDK_EFFORT_MEDIUM, 0.0),
+            ("HIGH", AMI_SDK_EFFORT_HIGH, 0.0),
+            ("xhigh", AMI_SDK_EFFORT_XHIGH, 0.0),
+            ("max", AMI_SDK_EFFORT_MAX, 0.0),
+            (ReasoningEffort.MEDIUM, AMI_SDK_EFFORT_MEDIUM, 0.0),
+        ]
+        for effort_in, exp_enum, exp_val in tier_cases:
+            c_gp = GenerationConfig(reasoning_effort=effort_in).to_c(lib)
+            self.assertEqual(int(c_gp.reasoning_effort), exp_enum)
+            self.assertAlmostEqual(float(c_gp.reasoning_effort_value), exp_val, places=5)
+
+        for fval in (0, 0.0, 0.35, 0.99):
+            c_gp = GenerationConfig(reasoning_effort=fval).to_c(lib)
+            self.assertEqual(int(c_gp.reasoning_effort), AMI_SDK_EFFORT_CUSTOM_FLOAT)
+            self.assertAlmostEqual(float(c_gp.reasoning_effort_value), float(fval), places=5)
+
+        # 2. Invalid reasoning_effort & C17 sampling/integer parameter rejection.
+        invalid_configs: list[dict[str, object]] = [
+            {"max_tokens": -1},
+            {"max_tokens": 1 << 32},
+            {"max_tokens": True},
+            {"max_tokens": 1.5},
+            {"top_k": -1},
+            {"top_k": 1 << 32},
+            {"top_k": False},
+            {"stop_token_ids": (-1,)},
+            {"stop_token_ids": (1 << 32,)},
+            {"stop_token_ids": (True,)},
+            {"stop_token_ids": tuple(range(9))},
+            {"temperature": -0.01},
+            {"temperature": math.nan},
+            {"temperature": math.inf},
+            {"temperature": True},
+            {"top_p": 0.0},
+            {"top_p": -0.5},
+            {"top_p": 1.01},
+            {"top_p": math.nan},
+            {"top_p": math.inf},
+            {"min_p": -0.01},
+            {"min_p": 1.0},
+            {"min_p": 1.5},
+            {"min_p": math.nan},
+            {"min_p": math.inf},
+            {"repetition_penalty": 0.0},
+            {"repetition_penalty": -1.0},
+            {"repetition_penalty": math.nan},
+            {"repetition_penalty": math.inf},
+            {"presence_penalty": math.nan},
+            {"presence_penalty": math.inf},
+            {"presence_penalty": 1e40},
+            {"frequency_penalty": math.nan},
+            {"frequency_penalty": -math.inf},
+            {"reasoning_effort": True},
+            {"reasoning_effort": "ultra"},
+            {"reasoning_effort": -0.01},
+            {"reasoning_effort": 1.0},
+            {"reasoning_effort": math.nan},
+            {"reasoning_effort": math.inf},
+            {"reasoning_effort": ReasoningEffort.CUSTOM_FLOAT},
+        ]
+        for kwargs in invalid_configs:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(InvalidArgumentError):
+                    GenerationConfig(**kwargs).to_c(lib)  # type: ignore[arg-type]
+
+        # min_p == 0.0 and valid boundary values must succeed.
+        ok_gp = GenerationConfig(max_tokens=0, min_p=0.0, top_p=1.0, temperature=0.0, reasoning_effort=0.99).to_c(lib)
+        self.assertEqual(int(ok_gp.max_tokens), 0)
+
+        # 3. End-to-end Engine checks: max_tokens=0 clean return (no OOB slice) + token ID validation.
+        with Engine(self.amf_path, max_seq_len=64, startup_canary=False) as engine:
+            zero_text_out = engine.generate("Hello", GenerationConfig(max_tokens=0, reasoning_effort="no_think"))
+            self.assertEqual(zero_text_out.generated_tokens, 0)
+            self.assertEqual(zero_text_out.token_ids, ())
+            self.assertEqual(zero_text_out.text, "")
+            self.assertEqual(zero_text_out.finish_reason, FinishReason.LENGTH)
+
+            zero_ids_out = engine.generate([1, 2, 3], GenerationConfig(max_tokens=0, reasoning_effort=0.25))
+            self.assertEqual(zero_ids_out.generated_tokens, 0)
+            self.assertEqual(zero_ids_out.token_ids, ())
+
+            with self.assertRaises(InvalidArgumentError):
+                engine.generate("Hello", GenerationConfig(max_tokens=-1))
+
+            bad_tokens: list[object] = [True, False, -1, 1 << 32, 320, 999]
+            for bad_tok in bad_tokens:
+                with self.subTest(bad_tok=bad_tok):
+                    with self.assertRaises(InvalidArgumentError):
+                        engine._prompt_to_ids([1, bad_tok])  # type: ignore[list-item]
+                    with self.assertRaises(InvalidArgumentError):
+                        engine.generate([1, bad_tok], GenerationConfig(max_tokens=1))  # type: ignore[list-item]
+                    with self.assertRaises(InvalidArgumentError):
+                        engine.step_decode(bad_tok)  # type: ignore[arg-type]
+                    with self.assertRaises(InvalidArgumentError):
+                        engine.detokenize([1, bad_tok])  # type: ignore[list-item]
+                    with self.assertRaises(InvalidArgumentError):
+                        engine.tokenizer.detokenize([bad_tok])  # type: ignore[union-attr,list-item]
+                    with self.assertRaises(InvalidArgumentError):
+                        engine.embed([bad_tok])  # type: ignore[list-item]
+
+            # Valid reasoning_effort generate round-trip.
+            eff_out = engine.generate([1, 2, 3], GenerationConfig(max_tokens=2, ignore_eos=True, reasoning_effort=0.7))
+            self.assertEqual(eff_out.generated_tokens, 2)
 
 
 if __name__ == "__main__":
