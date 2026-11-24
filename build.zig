@@ -231,6 +231,15 @@ pub fn build(b: *std.Build) void {
     const run_m82_gpu_test = b.addRunArtifact(m82_gpu_test);
     b.step("test-m82-gpu", "Run M8.2 G25 Inkling 2 and Hy4 fused Metal 4 operator tests").dependOn(&run_m82_gpu_test.step);
 
+    // Dedicated M8.2 D14 + C26 test step (`zig build test-m82-draft`), filtering
+    // `cpu.inkling2_ctrl.*`, `spec.dflare_dfly.*`, and `storage.ple.*` from `mod`.
+    const m82_draft_test = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{ "cpu.inkling2_ctrl.", "spec.dflare_dfly.", "storage.ple." },
+    });
+    const run_m82_draft_test = b.addRunArtifact(m82_draft_test);
+    b.step("test-m82-draft", "Run M8.2 D14 DFlare/DFly2, C26 SME2 loop controllers, and FP8 Engram tests").dependOn(&run_m82_draft_test.step);
+
     const run_mod_test = b.addRunArtifact(b.addTest(.{ .root_module = mod }));
     const run_exe_test = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
     run_exe_test.step.dependOn(&run_mod_test.step);
