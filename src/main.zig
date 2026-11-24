@@ -4964,6 +4964,10 @@ const ServeRunner = struct {
 /// `GraphBatchRuntime` + `Tokenizer` + `DomainNgramRegistry` into `Server.runBatchedWorkerLoop`.
 const BatchServeRunner = struct {
     const PendingJobMeta = struct {
+        active: bool = false,
+        request_id: u64 = 0,
+        prompt_ptr: ?[*]const u32 = null,
+        seq: u64 = 0,
         lora_slot: u32 = aminfer.lora.NO_ADAPTER,
         grammar_program: ?*const aminfer.grammar.GrammarProgram = null,
         sampling: aminfer.sampling.SamplingParams = .{},
@@ -4974,6 +4978,7 @@ const BatchServeRunner = struct {
     const SlotConstraint = struct {
         active: bool = false,
         prompt_recorded: bool = false,
+        request_id: u64 = 0,
         grammar_program: ?*const aminfer.grammar.GrammarProgram = null,
         gstate: aminfer.grammar.GrammarState = undefined,
         sampling: aminfer.sampling.SamplingParams = .{},
@@ -5009,9 +5014,8 @@ const BatchServeRunner = struct {
     sampler_cand_ids: []u32,
     grammar_mask: []u32,
     vocab_index: ?aminfer.grammar.VocabIndex,
-    pending_fifo: [aminfer.batch_scheduler.MAX_BATCH_SLOTS * 2]PendingJobMeta = @splat(.{}),
-    pending_head: usize = 0,
-    pending_tail: usize = 0,
+    pending_jobs: [aminfer.batch_scheduler.MAX_BATCH_SLOTS * 2]PendingJobMeta = @splat(.{}),
+    pending_seq: u64 = 0,
     slot_constraints: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]SlotConstraint = @splat(.{}),
     slot_penalties: []aminfer.sampling.DefaultPenaltyTracker,
     slot_thinking_cutoff: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]SlotThinkingCutoff = @splat(.{}),
@@ -5160,10 +5164,63 @@ const BatchServeRunner = struct {
         }
     }
 
-    fn bindNextPendingToSlot(self: *BatchServeRunner, slot_id: u16) void {
-        if (self.pending_head == self.pending_tail) return;
-        const meta = self.pending_fifo[self.pending_head];
-        self.pending_head = (self.pending_head + 1) % self.pending_fifo.len;
+    fn recordPendingJob(self: *BatchServeRunner, meta: PendingJobMeta) void {
+        self.pending_seq += 1;
+        var entry = meta;
+        entry.active = true;
+        entry.seq = self.pending_seq;
+
+        var free_idx: ?usize = null;
+        var oldest_idx: usize = 0;
+        for (&self.pending_jobs, 0..) |*p, idx| {
+            if (p.active) {
+                if ((entry.request_id != 0 and p.request_id == entry.request_id) or
+                    (entry.prompt_ptr != null and p.prompt_ptr == entry.prompt_ptr))
+                {
+                    p.* = entry;
+                    return;
+                }
+                if (!self.pending_jobs[oldest_idx].active or p.seq < self.pending_jobs[oldest_idx].seq) {
+                    oldest_idx = idx;
+                }
+            } else if (free_idx == null) {
+                free_idx = idx;
+            }
+        }
+        self.pending_jobs[free_idx orelse oldest_idx] = entry;
+    }
+
+    fn takePendingJob(
+        self: *BatchServeRunner,
+        request_id: ?u64,
+        prompt_ptr: ?[*]const u32,
+    ) ?PendingJobMeta {
+        var req_idx: ?usize = null;
+        var ptr_idx: ?usize = null;
+        var oldest_idx: ?usize = null;
+        for (&self.pending_jobs, 0..) |*p, idx| {
+            if (!p.active) continue;
+            if (request_id) |rid| {
+                if (rid != 0 and p.request_id == rid) {
+                    if (req_idx == null or p.seq < self.pending_jobs[req_idx.?].seq) req_idx = idx;
+                }
+            }
+            if (prompt_ptr) |ptr| {
+                if (p.prompt_ptr != null and p.prompt_ptr.? == ptr) {
+                    if (ptr_idx == null or p.seq < self.pending_jobs[ptr_idx.?].seq) ptr_idx = idx;
+                }
+            }
+            if (oldest_idx == null or p.seq < self.pending_jobs[oldest_idx.?].seq) {
+                oldest_idx = idx;
+            }
+        }
+        const pick = req_idx orelse ptr_idx orelse oldest_idx orelse return null;
+        const meta = self.pending_jobs[pick];
+        self.pending_jobs[pick].active = false;
+        return meta;
+    }
+
+    fn bindMetaToSlot(self: *BatchServeRunner, slot_id: u16, meta: PendingJobMeta) void {
         if (self.qwen3_batch_rt) |brt| {
             brt.setSlotLora(slot_id, meta.lora_slot);
         }
@@ -5171,6 +5228,7 @@ const BatchServeRunner = struct {
             self.slot_constraints[slot_id] = .{
                 .active = meta.constrained,
                 .prompt_recorded = false,
+                .request_id = meta.request_id,
                 .grammar_program = meta.grammar_program,
                 .gstate = if (meta.grammar_program) |gp| gp.initialState() else undefined,
                 .sampling = meta.sampling,
@@ -5299,17 +5357,15 @@ const BatchServeRunner = struct {
             job.sampling.top_p < 1.0 or
             job.sampling.top_k > 0 or
             job.sampling.min_p > 0.0;
-        const next_tail = (self.pending_tail + 1) % self.pending_fifo.len;
-        if (next_tail != self.pending_head) {
-            self.pending_fifo[self.pending_tail] = .{
-                .lora_slot = lora_slot,
-                .grammar_program = job.grammar_program,
-                .sampling = job.sampling,
-                .rng = job.rng,
-                .constrained = constrained,
-            };
-            self.pending_tail = next_tail;
-        }
+        self.recordPendingJob(.{
+            .request_id = job.request_id,
+            .prompt_ptr = out_tokens.ptr,
+            .lora_slot = lora_slot,
+            .grammar_program = job.grammar_program,
+            .sampling = job.sampling,
+            .rng = job.rng,
+            .constrained = constrained,
+        });
 
         var boundary_tok: ?u32 = null;
         if (job.last_user_msg_byte_offset) |b_off| {
@@ -5364,7 +5420,9 @@ const BatchServeRunner = struct {
         defer if (self.model_mutex) |mtx| {
             _ = std.c.pthread_mutex_unlock(mtx);
         };
-        self.bindNextPendingToSlot(slot_id);
+        if (self.takePendingJob(null, prompt_tokens.ptr)) |meta| {
+            self.bindMetaToSlot(slot_id, meta);
+        }
         if (slot_id < self.slot_constraints.len and slot_id < self.slot_penalties.len) {
             if (self.slot_constraints[slot_id].sampling.hasPenalties()) {
                 self.slot_penalties[slot_id].recordSlice(prompt_tokens);
@@ -5383,8 +5441,14 @@ const BatchServeRunner = struct {
         defer if (self.model_mutex) |mtx| {
             _ = std.c.pthread_mutex_unlock(mtx);
         };
-        if (self.inner_backend.lookupPrefixFn == null and chunk.start_pos == 0) {
-            self.bindNextPendingToSlot(chunk.slot_id);
+        if (chunk.start_pos == 0) {
+            const need_bind = (self.inner_backend.lookupPrefixFn == null) or
+                (chunk.slot_id < self.slot_constraints.len and self.slot_constraints[chunk.slot_id].request_id != chunk.request_id);
+            if (need_bind) {
+                if (self.takePendingJob(chunk.request_id, chunk.tokens.ptr)) |meta| {
+                    self.bindMetaToSlot(chunk.slot_id, meta);
+                }
+            }
         }
         const slot_constrained = (chunk.slot_id < self.slot_constraints.len and self.slot_constraints[chunk.slot_id].active);
         if (chunk.slot_id < self.slot_constraints.len and chunk.slot_id < self.slot_penalties.len) {
@@ -8650,4 +8714,113 @@ test "M8.15 W8 decode --dump-router-trace CLI parsing, router-trace alignment, a
     };
     try std.testing.expect(pen_sp.hasPenalties());
     try std.testing.expect(!pen_sp.isUnconstrainedGreedy());
+}
+
+test "M8.15 C18 BatchServeRunner isolates concurrent out-of-order slot binding and orphaned tokenizations" {
+    const gpa = std.testing.allocator;
+    const tok_json =
+        \\{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3},"merges":[]},"added_tokens":[]}
+    ;
+    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(gpa, tok_json);
+    defer tok.deinit(gpa);
+    const tpl = aminfer.chat_template.ChatTemplate.preset(.chatml);
+
+    const NoopBackend = struct {
+        fn lookup(_: *anyopaque, _: u16, _: []const u32) aminfer.batch_scheduler.PrefixLookupResult {
+            return .{};
+        }
+        fn prefill(_: *anyopaque, _: *const aminfer.batch_scheduler.PrefillChunkView) aminfer.batch_scheduler.BackendError!aminfer.batch_scheduler.PrefillResult {
+            return .{ .first_token = 0 };
+        }
+        fn decode(_: *anyopaque, view: *const aminfer.batch_scheduler.BatchStepView, out: []u32) aminfer.batch_scheduler.BackendError!void {
+            for (0..view.batchSize()) |i| out[i] = 0;
+        }
+        fn release(_: *anyopaque, _: u16, _: u64) void {}
+    };
+    var noop_ctx: u8 = 0;
+    const backend: aminfer.batch_scheduler.BatchBackend = .{
+        .ctx = &noop_ctx,
+        .lookupPrefixFn = NoopBackend.lookup,
+        .prefillSlotFn = NoopBackend.prefill,
+        .stepDecodeBatchFn = NoopBackend.decode,
+        .releaseSlotFn = NoopBackend.release,
+    };
+
+    var br = try BatchServeRunner.init(gpa, backend, null, &tok, tpl, null, null, 64);
+    defer br.deinit(gpa);
+
+    var rng = try aminfer.rng.RequestRng.init(99);
+    var slot0_buf: [16]u32 = undefined;
+    var slot1_buf: [16]u32 = undefined;
+
+    // 1. Orphaned tokenization on slot 0 (e.g. failed enqueueInPlace or cancelled queued slot)
+    //    must NOT hijack slot 1 or shift subsequent requests.
+    const orphan_job: aminfer.server.InferenceJob = .{
+        .slot_index = 0,
+        .generation = 1,
+        .request_id = 100,
+        .endpoint = .chat_completions,
+        .prompt = "abcd",
+        .rng = &rng,
+        .seed_used = 99,
+        .seed_source = .explicit,
+        .max_tokens = 8,
+        .temperature = 0.0,
+        .stream = false,
+        .ignore_eos = true,
+        .enable_thinking = false,
+        .sampling = .{ .repetition_penalty = 1.9 },
+    };
+    _ = try BatchServeRunner.tokenizeWithBoundaryCallback(&br, &orphan_job, &slot0_buf);
+
+    // 2. Slot 1 is tokenized FIRST (unconstrained greedy), then slot 0 is reused for a
+    //    penalized job, and slot 0 runs `lookupPrefixCallback` BEFORE slot 1.
+    const job_slot1: aminfer.server.InferenceJob = .{
+        .slot_index = 1,
+        .generation = 2,
+        .request_id = 101,
+        .endpoint = .chat_completions,
+        .prompt = "ab",
+        .rng = &rng,
+        .seed_used = 99,
+        .seed_source = .explicit,
+        .max_tokens = 8,
+        .temperature = 0.0,
+        .stream = false,
+        .ignore_eos = true,
+        .enable_thinking = false,
+        .sampling = .{},
+    };
+    const res1 = try BatchServeRunner.tokenizeWithBoundaryCallback(&br, &job_slot1, &slot1_buf);
+
+    const job_slot0: aminfer.server.InferenceJob = .{
+        .slot_index = 0,
+        .generation = 3,
+        .request_id = 102,
+        .endpoint = .chat_completions,
+        .prompt = "cc",
+        .rng = &rng,
+        .seed_used = 99,
+        .seed_source = .explicit,
+        .max_tokens = 8,
+        .temperature = 0.0,
+        .stream = false,
+        .ignore_eos = true,
+        .enable_thinking = false,
+        .sampling = .{ .presence_penalty = 1.25 },
+    };
+    const res0 = try BatchServeRunner.tokenizeWithBoundaryCallback(&br, &job_slot0, &slot0_buf);
+
+    _ = BatchServeRunner.lookupPrefixCallback(&br, 0, slot0_buf[0..res0.prompt_len]);
+    _ = BatchServeRunner.lookupPrefixCallback(&br, 1, slot1_buf[0..res1.prompt_len]);
+
+    try std.testing.expectEqual(@as(u64, 102), br.slot_constraints[0].request_id);
+    try std.testing.expect(br.slot_constraints[0].active);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), br.slot_constraints[0].sampling.presence_penalty, 1e-6);
+    try std.testing.expectEqual(@as(usize, 1), br.slot_penalties[0].activeEntries().len);
+    try std.testing.expectEqual(@as(u32, 2), br.slot_penalties[0].activeEntries()[0].token_id);
+
+    try std.testing.expectEqual(@as(u64, 101), br.slot_constraints[1].request_id);
+    try std.testing.expect(!br.slot_constraints[1].active);
+    try std.testing.expectEqual(@as(usize, 0), br.slot_penalties[1].activeEntries().len);
 }
