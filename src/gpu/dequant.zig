@@ -9,6 +9,7 @@ const page = @import("../mem/page.zig");
 const arena_mod = @import("../mem/arena.zig");
 const budget_mod = @import("../mem/budget.zig");
 const quant = @import("../quant/spec.zig");
+const quant_formats = @import("quant_formats.zig");
 const amf = @import("../format/amf.zig");
 const vmstat = @import("../platform/vmstat.zig");
 
@@ -454,6 +455,99 @@ pub const EncodeError = metal.Error || quant.ShapeError;
 pub const FusedEncodeError = EncodeError || error{
     HeterogeneousDType,
     UnsupportedDType,
+};
+
+fn mapQfEncodeError(err: quant_formats.EncodeError) EncodeError {
+    return switch (err) {
+        error.InvalidGroupSize, error.PipelineNotInitialized => error.InvalidArgument,
+        else => |e| e,
+    };
+}
+
+/// Returns `true` when `(amf_dtype, group_size)` routes through `QuantFormatPipelines`
+/// (`G23`, ADR-0024) rather than the legacy dense FP16/BF16 or group-64 q2/q3/q4 kernels.
+pub fn usesQuantFormats(amf_dtype: amf.DType, group_size: u16) bool {
+    return switch (amf_dtype) {
+        .f16, .bf16, .f32, .u32 => false,
+        .q4_affine, .q3_affine, .q2_affine => group_size != 0 and group_size != 64,
+        else => true,
+    };
+}
+
+/// Returns `true` for every 2D linear / MoE weight `.amf` `DType` executable by
+/// `DequantPipelines` + `QuantFormatPipelines` (`f16`, `bf16`, and all 34 `W21`/`W22`
+/// quantized formats `2..37`).
+pub fn isSupportedLinearAmfDType(dtype: amf.DType) bool {
+    return switch (dtype) {
+        .f16, .bf16 => true,
+        .f32, .u32 => false,
+        else => quant_formats.DType.fromAmf(dtype) != null,
+    };
+}
+
+/// Returns `true` when an `fp8_e4m3_tensor` blob carries per-row `f32[N]` scales
+/// (`params_bytes == N * 4`, `N > 1`) instead of a single scalar `f32[1]` scale.
+pub fn isTensorScalePerRow(dtype: amf.DType, n: u32, params_bytes: u64) bool {
+    return dtype == .fp8_e4m3_tensor and n > 1 and params_bytes == @as(u64, n) * 4;
+}
+
+/// Validates `[n, k]` shape alignment for any supported linear `amf.DType` and `group_size`.
+pub fn validateLinearAmfShape(
+    dtype: amf.DType,
+    n: u32,
+    k: u32,
+    group_size: u16,
+) (quant_formats.ShapeError || error{UnexpectedTensorDType})!void {
+    if (n == 0 or k == 0) return error.ZeroDimension;
+    switch (dtype) {
+        .f16, .bf16 => return,
+        .f32, .u32 => return error.UnexpectedTensorDType,
+        else => {
+            const qf_dt = quant_formats.DType.fromAmf(dtype) orelse return error.UnexpectedTensorDType;
+            try qf_dt.validateShape(n, k, group_size);
+        },
+    }
+}
+
+/// Legacy `WeightDType` approximation for struct compatibility; authoritative dispatch
+/// uses `amf_dtype` + `group_size` via `usesQuantFormats`.
+pub fn legacyWeightDTypeForAmf(dtype: amf.DType) quant.WeightDType {
+    return switch (dtype) {
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .q4_affine => .q4_affine,
+        .q3_affine => .q3_affine,
+        .q2_affine => .q2_affine,
+        else => .q4_affine,
+    };
+}
+
+pub const UnifiedLinearMode = enum(u8) {
+    gemv,
+    batched,
+    gemm32,
+    gemm_wide,
+};
+
+pub const UnifiedLinearArgs = struct {
+    amf_dtype: amf.DType,
+    group_size: u16 = 64,
+    tensor_scale_per_row: bool = false,
+    weight: metal.BufferBinding,
+    params: ?metal.BufferBinding = null,
+    x: metal.BufferBinding,
+    y: metal.BufferBinding,
+    residual: ?metal.BufferBinding = null,
+    m: u32,
+    n: u32,
+    k: u32,
+    mode: UnifiedLinearMode = .gemv,
+    qf_pipes: ?*const quant_formats.QuantFormatPipelines = null,
+    tile_f16: ?metal.BufferBinding = null,
+    tile_f16_bytes: u64 = 0,
+    act_quant_policy: quant_formats.ActQuantPolicy = .none,
+    act_scratch: ?metal.BufferBinding = null,
+    act_scratch_bytes: u64 = 0,
 };
 
 /// Startup-compiled specialized Metal 4 pipelines for 2-bit, 3-bit and 4-bit
@@ -1598,6 +1692,137 @@ pub const DequantPipelines = struct {
             .{ 128, 1, 1 },
             insert_barrier_before,
         );
+    }
+
+    /// Unified zero-alloc linear dispatch across all `.amf` `DType`s (`0..37`,
+    /// `f16`/`bf16`, MLX affine `q2..q8` across `g32/g64/g128`, FP8/MXFP8/NVFP4,
+    /// and all 23 GGUF block formats), with optional `G24` activation-quantization
+    /// emulation (`0` dispatches when `act_quant_policy == .none`) and `M >= 16`
+    /// tiled `fp16` wide prefill feeding `G15`/`G17`/`G19` GEMM paths.
+    pub fn encodeLinearUnified(
+        self: DequantPipelines,
+        frame: *metal.Compute.Frame,
+        args: UnifiedLinearArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.n == 0 or args.k == 0) return error.ZeroDimension;
+
+        var x_eff = args.x;
+        var barrier = insert_barrier_before;
+
+        const aq_mode = args.act_quant_policy.resolveForTensor(args.amf_dtype, args.k);
+        if (aq_mode != .none) {
+            const need_bytes = std.math.mul(u64, @as(u64, args.m) * args.k, @sizeOf(f16)) catch return error.Overflow;
+            if (args.qf_pipes) |qf| {
+                if (args.act_scratch) |scratch| {
+                    if (args.act_scratch_bytes >= need_bytes) {
+                        qf.encodeActQuantEmulate(frame, aq_mode, .{
+                            .x_in = args.x,
+                            .x_out = scratch,
+                            .m = args.m,
+                            .k = args.k,
+                        }, barrier) catch |err| return mapQfEncodeError(err);
+                        x_eff = scratch;
+                        barrier = true;
+                    }
+                }
+            }
+        }
+
+        if (!usesQuantFormats(args.amf_dtype, args.group_size)) {
+            if (args.mode == .gemv or args.m == 1) {
+                switch (args.amf_dtype) {
+                    .f16 => try self.encodeDenseGemv(frame, .f16, .{ .x = x_eff, .weight = args.weight, .y = args.y, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    .bf16 => try self.encodeDenseGemv(frame, .bf16, .{ .x = x_eff, .weight = args.weight, .y = args.y, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    .q4_affine => try self.encodeGemv(frame, .q4, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    .q3_affine => try self.encodeGemv(frame, .q3, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    .q2_affine => try self.encodeGemv(frame, .q2, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    else => return error.InvalidArgument,
+                }
+                return;
+            }
+            if (args.mode == .batched or args.m < 16) {
+                switch (args.amf_dtype) {
+                    .f16 => try self.encodeDenseGemvBatch(frame, .f16, .{ .x = x_eff, .weight = args.weight, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    .bf16 => try self.encodeDenseGemvBatch(frame, .bf16, .{ .x = x_eff, .weight = args.weight, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    .q4_affine => try self.encodeGemvBatch(frame, .q4, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    .q3_affine => try self.encodeGemvBatch(frame, .q3, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    .q2_affine => try self.encodeGemvBatch(frame, .q2, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .residual = args.residual }, barrier),
+                    else => return error.InvalidArgument,
+                }
+                return;
+            }
+            const wide_tile = (args.mode == .gemm_wide);
+            switch (args.amf_dtype) {
+                .f16 => try self.encodeDenseGemm(frame, .f16, .{ .x = x_eff, .weight = args.weight, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .wide_tile = wide_tile, .residual = args.residual }, barrier),
+                .bf16 => try self.encodeDenseGemm(frame, .bf16, .{ .x = x_eff, .weight = args.weight, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .wide_tile = wide_tile, .residual = args.residual }, barrier),
+                .q4_affine => try self.encodeGemm(frame, .q4, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .wide_tile = wide_tile, .residual = args.residual }, barrier),
+                .q3_affine => try self.encodeGemm(frame, .q3, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .wide_tile = wide_tile, .residual = args.residual }, barrier),
+                .q2_affine => try self.encodeGemm(frame, .q2, .{ .x = x_eff, .qweight = args.weight, .scale_bias = args.params orelse return error.InvalidArgument, .y = args.y, .m = args.m, .n = args.n, .k = args.k, .wide_tile = wide_tile, .residual = args.residual }, barrier),
+                else => return error.InvalidArgument,
+            }
+            return;
+        }
+
+        const qf = args.qf_pipes orelse return error.InvalidArgument;
+        const qf_dt = quant_formats.DType.fromAmf(args.amf_dtype) orelse return error.InvalidArgument;
+
+        if (args.mode == .gemv or args.m == 1) {
+            qf.encodeGemv(frame, qf_dt, args.group_size, .{
+                .x = x_eff,
+                .qweight = args.weight,
+                .params = args.params,
+                .y = args.y,
+                .residual = args.residual,
+                .n = args.n,
+                .k = args.k,
+                .tensor_scale_per_row = args.tensor_scale_per_row,
+            }, barrier) catch |err| return mapQfEncodeError(err);
+            return;
+        }
+
+        if ((args.mode == .gemm32 or args.mode == .gemm_wide) and args.m >= 16) {
+            const tile_bytes = std.math.mul(u64, @as(u64, args.n) * args.k, @sizeOf(f16)) catch 0;
+            if (args.tile_f16) |tile_b| {
+                if (tile_bytes > 0 and tile_bytes <= args.tile_f16_bytes) {
+                    qf.encodeDequantTileF16(frame, qf_dt, args.group_size, .{
+                        .qweight = args.weight,
+                        .params = args.params,
+                        .dst_f16 = tile_b,
+                        .n_total = args.n,
+                        .k_total = args.k,
+                        .tile_n_start = 0,
+                        .tile_k_start = 0,
+                        .tile_n = args.n,
+                        .tile_k = args.k,
+                        .tensor_scale_per_row = args.tensor_scale_per_row,
+                    }, barrier) catch |err| return mapQfEncodeError(err);
+                    try self.encodeDenseGemm(frame, .f16, .{
+                        .x = x_eff,
+                        .weight = tile_b,
+                        .y = args.y,
+                        .m = args.m,
+                        .n = args.n,
+                        .k = args.k,
+                        .wide_tile = (args.mode == .gemm_wide),
+                        .residual = args.residual,
+                    }, true);
+                    return;
+                }
+            }
+        }
+
+        qf.encodeGemvBatch(frame, qf_dt, args.group_size, .{
+            .x = x_eff,
+            .qweight = args.weight,
+            .params = args.params,
+            .y = args.y,
+            .residual = args.residual,
+            .m = args.m,
+            .n = args.n,
+            .k = args.k,
+            .tensor_scale_per_row = args.tensor_scale_per_row,
+        }, barrier) catch |err| return mapQfEncodeError(err);
     }
 
     fn quantShapeForDType(dtype: amf.DType, k: u32) FusedEncodeError!struct { num_groups: u32, row_bytes: u32, is_quant: bool } {

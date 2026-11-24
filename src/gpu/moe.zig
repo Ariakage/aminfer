@@ -15,6 +15,8 @@ const page = @import("../mem/page.zig");
 const arena_mod = @import("../mem/arena.zig");
 const budget_mod = @import("../mem/budget.zig");
 const quant = @import("../quant/spec.zig");
+const quant_formats = @import("quant_formats.zig");
+const dequant = @import("dequant.zig");
 const amf = @import("../format/amf.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const vmstat = @import("../platform/vmstat.zig");
@@ -349,7 +351,7 @@ pub const WorkspaceError = error{
     Overflow,
 } || arena_mod.WiredArena.AllocError;
 
-pub const EncodeError = metal.Error || quant.ShapeError || error{
+pub const EncodeError = metal.Error || quant.ShapeError || quant_formats.EncodeError || error{
     UnsupportedExpertCount,
     UnsupportedTopK,
     WorkspaceTooSmall,
@@ -830,6 +832,83 @@ pub const RouterSource = union(enum) {
         scale_bias: metal.BufferBinding,
         bits: quant.QuantBits,
     },
+    /// Any `W21`/`W22` quantized router weight (`q2..q8`, `fp8`, `mxfp8`, `nvfp4`,
+    /// or GGUF block format), writing `f16` logits into the workspace.
+    quant_format: struct {
+        dtype: quant_formats.DType,
+        group_size: u16 = 64,
+        tensor_scale_per_row: bool = false,
+        qweight: metal.BufferBinding,
+        params: ?metal.BufferBinding = null,
+        qf_pipes: *const quant_formats.QuantFormatPipelines,
+    },
+};
+
+/// Descriptor for one MoE expert quantization scheme bucket (uniform or
+/// heterogeneous, supporting asymmetric `gate/up` vs `down` dtypes as seen in
+/// dynamic GGUFs such as `Inkling-2-Mini` `UD-*`).
+pub const MoeSchemeDesc = struct {
+    gate_up_dtype: amf.DType = .q4_affine,
+    gate_up_group_size: u16 = 64,
+    gate_up_tensor_scale_per_row: bool = false,
+    down_dtype: amf.DType = .q4_affine,
+    down_group_size: u16 = 64,
+    down_tensor_scale_per_row: bool = false,
+
+    pub fn uniform(dtype: amf.DType, group_size: u16, tensor_scale_per_row: bool) MoeSchemeDesc {
+        return .{
+            .gate_up_dtype = dtype,
+            .gate_up_group_size = group_size,
+            .gate_up_tensor_scale_per_row = tensor_scale_per_row,
+            .down_dtype = dtype,
+            .down_group_size = group_size,
+            .down_tensor_scale_per_row = tensor_scale_per_row,
+        };
+    }
+
+    pub fn eql(a: MoeSchemeDesc, b: MoeSchemeDesc) bool {
+        return a.gate_up_dtype == b.gate_up_dtype and
+            a.gate_up_group_size == b.gate_up_group_size and
+            a.gate_up_tensor_scale_per_row == b.gate_up_tensor_scale_per_row and
+            a.down_dtype == b.down_dtype and
+            a.down_group_size == b.down_group_size and
+            a.down_tensor_scale_per_row == b.down_tensor_scale_per_row;
+    }
+
+    pub fn usesQuantFormatsGateUp(self: MoeSchemeDesc) bool {
+        return dequant.usesQuantFormats(self.gate_up_dtype, self.gate_up_group_size);
+    }
+
+    pub fn usesQuantFormatsDown(self: MoeSchemeDesc) bool {
+        return dequant.usesQuantFormats(self.down_dtype, self.down_group_size);
+    }
+
+    pub fn usesAnyQuantFormats(self: MoeSchemeDesc) bool {
+        return self.usesQuantFormatsGateUp() or self.usesQuantFormatsDown();
+    }
+};
+
+/// Multi-format MoE layer dispatch arguments covering all `W21`/`W22` `.amf`
+/// dtypes (`0..37`), optional heterogeneous scheme buckets (`0..NUM_SCHEME_BUCKETS-1`),
+/// and optional `G24` activation quantization emulation.
+pub const MoELayerMultiFormatArgs = struct {
+    base: MoELayerArgs,
+    /// When `true`, routes via `ami_moe_route_topk_bucketed` using `expert_schemes`
+    /// and `scheme_counts[0..NUM_SCHEME_BUCKETS]` mapped to `scheme_descs`.
+    is_heterogeneous: bool = false,
+    expert_schemes: ?metal.BufferBinding = null,
+    scheme_counts: [NUM_SCHEME_BUCKETS]u32 = .{ 0, 0, 0, 0, 0 },
+    /// Per-bucket descriptors (`scheme_descs[0]` is used when `is_heterogeneous == false`).
+    scheme_descs: [NUM_SCHEME_BUCKETS]MoeSchemeDesc = .{
+        .{}, .{}, .{}, .{}, .{},
+    },
+    qf_pipes: ?*const quant_formats.QuantFormatPipelines = null,
+    act_quant_policy: quant_formats.ActQuantPolicy = .none,
+    act_scratch: ?metal.BufferBinding = null,
+    act_scratch_bytes: u64 = 0,
+    shared_expert_amf_dtype: ?amf.DType = null,
+    shared_expert_group_size: u16 = 64,
+    shared_expert_tensor_scale_per_row: bool = false,
 };
 
 pub const MoELayerArgs = struct {
@@ -2183,6 +2262,32 @@ pub const MoePipelines = struct {
                 }, insert_barrier_before);
                 break :blk .{ lb, LogitsDType.f32, true };
             },
+            .quant_format => |qf_r| blk: {
+                const lb = args.workspace.routerLogitsBinding(args.workspace_buf);
+                if (args.m == 1) {
+                    try qf_r.qf_pipes.encodeGemv(frame, qf_r.dtype, qf_r.group_size, .{
+                        .x = args.x,
+                        .qweight = qf_r.qweight,
+                        .params = qf_r.params,
+                        .y = lb,
+                        .n = args.num_experts,
+                        .k = args.hidden_size,
+                        .tensor_scale_per_row = qf_r.tensor_scale_per_row,
+                    }, insert_barrier_before);
+                } else {
+                    try qf_r.qf_pipes.encodeGemvBatch(frame, qf_r.dtype, qf_r.group_size, .{
+                        .x = args.x,
+                        .qweight = qf_r.qweight,
+                        .params = qf_r.params,
+                        .y = lb,
+                        .m = args.m,
+                        .n = args.num_experts,
+                        .k = args.hidden_size,
+                        .tensor_scale_per_row = qf_r.tensor_scale_per_row,
+                    }, insert_barrier_before);
+                }
+                break :blk .{ lb, LogitsDType.f16, true };
+            },
             .logits => |l| .{ l.binding, l.dtype, insert_barrier_before },
         };
 
@@ -2233,6 +2338,32 @@ pub const MoePipelines = struct {
                     .hidden_size = base.hidden_size,
                 }, insert_barrier_before);
                 break :blk .{ lb, LogitsDType.f32, true };
+            },
+            .quant_format => |qf_r| blk: {
+                const lb = base.workspace.routerLogitsBinding(base.workspace_buf);
+                if (base.m == 1) {
+                    try qf_r.qf_pipes.encodeGemv(frame, qf_r.dtype, qf_r.group_size, .{
+                        .x = base.x,
+                        .qweight = qf_r.qweight,
+                        .params = qf_r.params,
+                        .y = lb,
+                        .n = base.num_experts,
+                        .k = base.hidden_size,
+                        .tensor_scale_per_row = qf_r.tensor_scale_per_row,
+                    }, insert_barrier_before);
+                } else {
+                    try qf_r.qf_pipes.encodeGemvBatch(frame, qf_r.dtype, qf_r.group_size, .{
+                        .x = base.x,
+                        .qweight = qf_r.qweight,
+                        .params = qf_r.params,
+                        .y = lb,
+                        .m = base.m,
+                        .n = base.num_experts,
+                        .k = base.hidden_size,
+                        .tensor_scale_per_row = qf_r.tensor_scale_per_row,
+                    }, insert_barrier_before);
+                }
+                break :blk .{ lb, LogitsDType.f16, true };
             },
             .logits => |l| .{ l.binding, l.dtype, insert_barrier_before },
         };
@@ -2367,6 +2498,359 @@ pub const MoePipelines = struct {
         try self.encodeRoutingBucketed(frame, args, insert_barrier_before);
         try self.encodeGateUpDownHetero(frame, args.base, args.scheme_counts, false, true);
         try self.encodeReduceAndOptionalShared(frame, args.base, .q4_affine);
+    }
+
+    fn encodeBucketGateUpOne(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        base: MoELayerArgs,
+        x_in: metal.BufferBinding,
+        desc: MoeSchemeDesc,
+        scheme_bucket: ?quant.WeightDType,
+        cap: u32,
+        use_indirect: bool,
+        qf_pipes: ?*const quant_formats.QuantFormatPipelines,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (!desc.usesQuantFormatsGateUp()) {
+            const gu_args: GateUpSwigluArgs = .{
+                .x = x_in,
+                .weights_base = base.weights_base,
+                .expert_table = base.expert_table,
+                .workspace = base.workspace,
+                .workspace_buf = base.workspace_buf,
+                .m = base.m,
+                .num_experts = base.num_experts,
+                .top_k = base.top_k,
+                .hidden_size = base.hidden_size,
+                .intermediate_size = base.intermediate_size,
+                .scheme_bucket = scheme_bucket,
+                .max_active_override = cap,
+                .use_indirect = use_indirect,
+            };
+            switch (desc.gate_up_dtype) {
+                .f16 => try self.encodeGateUpSwigluFloat(frame, .f16, gu_args, insert_barrier_before),
+                .bf16 => try self.encodeGateUpSwigluFloat(frame, .bf16, gu_args, insert_barrier_before),
+                .q4_affine => try self.encodeGateUpSwiglu(frame, .q4, gu_args, insert_barrier_before),
+                .q3_affine => try self.encodeGateUpSwiglu(frame, .q3, gu_args, insert_barrier_before),
+                .q2_affine => try self.encodeGateUpSwiglu(frame, .q2, gu_args, insert_barrier_before),
+                else => return error.InvalidArgument,
+            }
+            return;
+        }
+        const qf = qf_pipes orelse return error.PipelineNotInitialized;
+        const qf_dt = quant_formats.DType.fromAmf(desc.gate_up_dtype) orelse return error.InvalidArgument;
+        const cap_active: u32 = @min(cap, base.num_experts);
+        const max_active: u32 = @min(base.m * base.top_k, cap_active);
+        if (max_active == 0) return;
+        const ws = base.workspace;
+        const wb = base.workspace_buf;
+        const hdr_off = if (scheme_bucket) |s| ws.bucketHeaderOffset(s) else ws.schedule_header_off;
+        const unique_off = if (scheme_bucket) |s| ws.bucketUniqueOffset(s) else ws.unique_experts_off;
+        const offsets_off = if (scheme_bucket) |s| ws.bucketOffsetsOffset(s) else ws.expert_token_offsets_off;
+        try qf.encodeMoeGateUpSwiglu(frame, qf_dt, desc.gate_up_group_size, .{
+            .x = x_in,
+            .weights_base = base.weights_base,
+            .expert_table = base.expert_table,
+            .sched_hdr = .{ .buffer = wb, .offset = hdr_off },
+            .unique_experts = .{ .buffer = wb, .offset = unique_off },
+            .expert_token_offsets = .{ .buffer = wb, .offset = offsets_off },
+            .token_indices = .{ .buffer = wb, .offset = ws.token_indices_off },
+            .inter = .{ .buffer = wb, .offset = ws.inter_off },
+            .num_unique_experts = max_active,
+            .hidden_size = base.hidden_size,
+            .intermediate_size = base.intermediate_size,
+            .tensor_scale_per_row = desc.gate_up_tensor_scale_per_row,
+            .indirect_args = if (use_indirect) .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(scheme_bucket, INDIRECT_GATE_UP_Q_OFFSET) } else null,
+        }, insert_barrier_before);
+    }
+
+    fn encodeBucketDownOne(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        base: MoELayerArgs,
+        inter_in: metal.BufferBinding,
+        desc: MoeSchemeDesc,
+        scheme_bucket: ?quant.WeightDType,
+        cap: u32,
+        use_indirect: bool,
+        qf_pipes: ?*const quant_formats.QuantFormatPipelines,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (!desc.usesQuantFormatsDown()) {
+            const dn_args: DownProjArgs = .{
+                .weights_base = base.weights_base,
+                .expert_table = base.expert_table,
+                .workspace = base.workspace,
+                .workspace_buf = base.workspace_buf,
+                .m = base.m,
+                .num_experts = base.num_experts,
+                .top_k = base.top_k,
+                .hidden_size = base.hidden_size,
+                .intermediate_size = base.intermediate_size,
+                .scheme_bucket = scheme_bucket,
+                .max_active_override = cap,
+                .use_indirect = use_indirect,
+            };
+            switch (desc.down_dtype) {
+                .f16 => try self.encodeDownProjFloat(frame, .f16, dn_args, insert_barrier_before),
+                .bf16 => try self.encodeDownProjFloat(frame, .bf16, dn_args, insert_barrier_before),
+                .q4_affine => try self.encodeDownProj(frame, .q4, dn_args, insert_barrier_before),
+                .q3_affine => try self.encodeDownProj(frame, .q3, dn_args, insert_barrier_before),
+                .q2_affine => try self.encodeDownProj(frame, .q2, dn_args, insert_barrier_before),
+                else => return error.InvalidArgument,
+            }
+            return;
+        }
+        const qf = qf_pipes orelse return error.PipelineNotInitialized;
+        const qf_dt = quant_formats.DType.fromAmf(desc.down_dtype) orelse return error.InvalidArgument;
+        const cap_active: u32 = @min(cap, base.num_experts);
+        const max_active: u32 = @min(base.m * base.top_k, cap_active);
+        if (max_active == 0) return;
+        const ws = base.workspace;
+        const wb = base.workspace_buf;
+        const hdr_off = if (scheme_bucket) |s| ws.bucketHeaderOffset(s) else ws.schedule_header_off;
+        const unique_off = if (scheme_bucket) |s| ws.bucketUniqueOffset(s) else ws.unique_experts_off;
+        const offsets_off = if (scheme_bucket) |s| ws.bucketOffsetsOffset(s) else ws.expert_token_offsets_off;
+        try qf.encodeMoeDownProj(frame, qf_dt, desc.down_group_size, .{
+            .inter = inter_in,
+            .weights_base = base.weights_base,
+            .expert_table = base.expert_table,
+            .sched_hdr = .{ .buffer = wb, .offset = hdr_off },
+            .unique_experts = .{ .buffer = wb, .offset = unique_off },
+            .expert_token_offsets = .{ .buffer = wb, .offset = offsets_off },
+            .token_indices = .{ .buffer = wb, .offset = ws.token_indices_off },
+            .routing_weights = .{ .buffer = wb, .offset = ws.routing_weights_off },
+            .slot_k_indices = .{ .buffer = wb, .offset = ws.slot_k_indices_off },
+            .down_out = .{ .buffer = wb, .offset = ws.down_out_off },
+            .num_unique_experts = max_active,
+            .hidden_size = base.hidden_size,
+            .intermediate_size = base.intermediate_size,
+            .top_k = base.top_k,
+            .tensor_scale_per_row = desc.down_tensor_scale_per_row,
+            .indirect_args = if (use_indirect) .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(scheme_bucket, INDIRECT_DOWN_OFFSET) } else null,
+        }, insert_barrier_before);
+    }
+
+    /// Encodes a complete multi-format MoE FFN layer across ALL `W21`/`W22` `.amf`
+    /// `DType`s (`0..37`, uniform or up to `NUM_SCHEME_BUCKETS` heterogeneous buckets,
+    /// including asymmetric `gate_up_dtype != down_dtype`) and optional `G24`
+    /// activation-quantization emulation. Zero hot-path heap allocation.
+    pub fn encodeMoELayerMultiFormat(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        args: MoELayerMultiFormatArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        const base = args.base;
+        if (args.is_heterogeneous) {
+            const es = args.expert_schemes orelse return error.InvalidArgument;
+            try self.encodeRoutingBucketed(frame, .{
+                .base = base,
+                .expert_schemes = es,
+                .scheme_counts = args.scheme_counts,
+            }, insert_barrier_before);
+
+            const num_buckets = countActiveSchemeBuckets(args.scheme_counts);
+            const use_indirect = shouldUseIndirectDispatch(base.m, num_buckets);
+
+            var first_gu = true;
+            for (0..NUM_SCHEME_BUCKETS) |s_idx| {
+                const cap = args.scheme_counts[s_idx];
+                if (cap == 0) continue;
+                const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
+                const desc = args.scheme_descs[s_idx];
+                var x_eff = base.x;
+                var gu_barrier = first_gu;
+                const aq_gu = args.act_quant_policy.resolveForTensor(desc.gate_up_dtype, base.hidden_size);
+                if (aq_gu != .none) {
+                    const need = std.math.mul(u64, @as(u64, base.m) * base.hidden_size, @sizeOf(f16)) catch return error.Overflow;
+                    if (args.qf_pipes) |qf| {
+                        if (args.act_scratch) |scratch| {
+                            if (args.act_scratch_bytes >= need) {
+                                try qf.encodeActQuantEmulate(frame, aq_gu, .{
+                                    .x_in = base.x,
+                                    .x_out = scratch,
+                                    .m = base.m,
+                                    .k = base.hidden_size,
+                                }, true);
+                                x_eff = scratch;
+                                gu_barrier = true;
+                            }
+                        }
+                    }
+                }
+                try self.encodeBucketGateUpOne(frame, base, x_eff, desc, scheme, cap, use_indirect, args.qf_pipes, gu_barrier);
+                first_gu = false;
+            }
+
+            var first_dn = true;
+            for (0..NUM_SCHEME_BUCKETS) |s_idx| {
+                const cap = args.scheme_counts[s_idx];
+                if (cap == 0) continue;
+                const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
+                const desc = args.scheme_descs[s_idx];
+                const inter_bind = metal.BufferBinding{ .buffer = base.workspace_buf, .offset = base.workspace.inter_off };
+                try self.encodeBucketDownOne(frame, base, inter_bind, desc, scheme, cap, use_indirect, args.qf_pipes, first_dn);
+                first_dn = false;
+            }
+        } else {
+            try self.encodeRouting(frame, base, insert_barrier_before);
+            const desc = args.scheme_descs[0];
+            const use_indirect = shouldUseIndirectDispatch(base.m, 1);
+            var x_eff = base.x;
+            var gu_barrier = true;
+            const aq_gu = args.act_quant_policy.resolveForTensor(desc.gate_up_dtype, base.hidden_size);
+            if (aq_gu != .none) {
+                const need = std.math.mul(u64, @as(u64, base.m) * base.hidden_size, @sizeOf(f16)) catch return error.Overflow;
+                if (args.qf_pipes) |qf| {
+                    if (args.act_scratch) |scratch| {
+                        if (args.act_scratch_bytes >= need) {
+                            try qf.encodeActQuantEmulate(frame, aq_gu, .{
+                                .x_in = base.x,
+                                .x_out = scratch,
+                                .m = base.m,
+                                .k = base.hidden_size,
+                            }, true);
+                            x_eff = scratch;
+                            gu_barrier = true;
+                        }
+                    }
+                }
+            }
+            try self.encodeBucketGateUpOne(frame, base, x_eff, desc, null, base.num_experts, use_indirect, args.qf_pipes, gu_barrier);
+            var inter_eff = metal.BufferBinding{ .buffer = base.workspace_buf, .offset = base.workspace.inter_off };
+            var dn_barrier = true;
+            const aq_dn = args.act_quant_policy.resolveForTensor(desc.down_dtype, base.intermediate_size);
+            if (aq_dn != .none and desc.usesQuantFormatsDown()) {
+                const rows = base.m * base.top_k;
+                const need = std.math.mul(u64, @as(u64, rows) * base.intermediate_size, @sizeOf(f16)) catch return error.Overflow;
+                if (args.qf_pipes) |qf| {
+                    if (args.act_scratch) |scratch| {
+                        if (args.act_scratch_bytes >= need) {
+                            try qf.encodeActQuantEmulate(frame, aq_dn, .{
+                                .x_in = inter_eff,
+                                .x_out = scratch,
+                                .m = rows,
+                                .k = base.intermediate_size,
+                            }, true);
+                            inter_eff = scratch;
+                            dn_barrier = true;
+                        }
+                    }
+                }
+            }
+            try self.encodeBucketDownOne(frame, base, inter_eff, desc, null, base.num_experts, use_indirect, args.qf_pipes, dn_barrier);
+        }
+
+        // Shared expert + routed reduction.
+        const se_amf = args.shared_expert_amf_dtype orelse args.scheme_descs[0].gate_up_dtype;
+        if (base.shared_expert != null and dequant.usesQuantFormats(se_amf, args.shared_expert_group_size)) {
+            try self.encodeReduce(frame, .{
+                .workspace = base.workspace,
+                .workspace_buf = base.workspace_buf,
+                .residual = base.residual,
+                .out = base.out,
+                .m = base.m,
+                .hidden_size = base.hidden_size,
+                .top_k = base.top_k,
+            }, true);
+            const se = base.shared_expert.?;
+            const qf = args.qf_pipes orelse return error.PipelineNotInitialized;
+            const qf_dt = quant_formats.DType.fromAmf(se_amf) orelse return error.InvalidArgument;
+            const se_inter = if (base.shared_intermediate_size > 0) base.shared_intermediate_size else base.intermediate_size;
+            const se_weights = base.shared_weights_base orelse base.weights_base;
+            const gate_off = try resolveSharedInterOffset(base.workspace, base.m, se_inter);
+            const gate_elems: usize = @as(usize, base.m) * se_inter;
+            const up_bind: metal.BufferBinding = if (gate_elems <= base.workspace.down_out.len)
+                .{ .buffer = base.workspace_buf, .offset = base.workspace.down_out_off }
+            else if (gate_off == base.workspace.inter_off and 2 * gate_elems <= base.workspace.inter.len)
+                .{ .buffer = base.workspace_buf, .offset = gate_off + @as(u64, gate_elems) * @sizeOf(f16) }
+            else
+                return error.WorkspaceTooSmall;
+            const gate_bind = metal.BufferBinding{ .buffer = base.workspace_buf, .offset = gate_off };
+            const w_gate = metal.BufferBinding{ .buffer = se_weights.buffer, .offset = se_weights.offset + se.gate_qweight_offset };
+            const p_gate: ?metal.BufferBinding = if (se.gate_sb_offset != 0) .{ .buffer = se_weights.buffer, .offset = se_weights.offset + se.gate_sb_offset } else null;
+            const w_up = metal.BufferBinding{ .buffer = se_weights.buffer, .offset = se_weights.offset + se.up_qweight_offset };
+            const p_up: ?metal.BufferBinding = if (se.up_sb_offset != 0) .{ .buffer = se_weights.buffer, .offset = se_weights.offset + se.up_sb_offset } else null;
+            const w_dn = metal.BufferBinding{ .buffer = se_weights.buffer, .offset = se_weights.offset + se.down_qweight_offset };
+            const p_dn: ?metal.BufferBinding = if (se.down_sb_offset != 0) .{ .buffer = se_weights.buffer, .offset = se_weights.offset + se.down_sb_offset } else null;
+
+            if (base.m == 1) {
+                try qf.encodeGemv(frame, qf_dt, args.shared_expert_group_size, .{
+                    .x = base.x,
+                    .qweight = w_gate,
+                    .params = p_gate,
+                    .y = gate_bind,
+                    .n = se_inter,
+                    .k = base.hidden_size,
+                    .tensor_scale_per_row = args.shared_expert_tensor_scale_per_row,
+                }, true);
+                try qf.encodeGemv(frame, qf_dt, args.shared_expert_group_size, .{
+                    .x = base.x,
+                    .qweight = w_up,
+                    .params = p_up,
+                    .y = up_bind,
+                    .n = se_inter,
+                    .k = base.hidden_size,
+                    .tensor_scale_per_row = args.shared_expert_tensor_scale_per_row,
+                }, false);
+            } else {
+                try qf.encodeGemvBatch(frame, qf_dt, args.shared_expert_group_size, .{
+                    .x = base.x,
+                    .qweight = w_gate,
+                    .params = p_gate,
+                    .y = gate_bind,
+                    .m = base.m,
+                    .n = se_inter,
+                    .k = base.hidden_size,
+                    .tensor_scale_per_row = args.shared_expert_tensor_scale_per_row,
+                }, true);
+                try qf.encodeGemvBatch(frame, qf_dt, args.shared_expert_group_size, .{
+                    .x = base.x,
+                    .qweight = w_up,
+                    .params = p_up,
+                    .y = up_bind,
+                    .m = base.m,
+                    .n = se_inter,
+                    .k = base.hidden_size,
+                    .tensor_scale_per_row = args.shared_expert_tensor_scale_per_row,
+                }, false);
+            }
+            try self.encodeSiluMul(frame, .{
+                .gate = gate_bind,
+                .up = up_bind,
+                .out = gate_bind,
+                .count = @intCast(gate_elems),
+            }, true);
+            if (base.m == 1) {
+                try qf.encodeGemv(frame, qf_dt, args.shared_expert_group_size, .{
+                    .x = gate_bind,
+                    .qweight = w_dn,
+                    .params = p_dn,
+                    .y = base.out,
+                    .residual = base.out,
+                    .n = base.hidden_size,
+                    .k = se_inter,
+                    .tensor_scale_per_row = args.shared_expert_tensor_scale_per_row,
+                }, true);
+            } else {
+                try qf.encodeGemvBatch(frame, qf_dt, args.shared_expert_group_size, .{
+                    .x = gate_bind,
+                    .qweight = w_dn,
+                    .params = p_dn,
+                    .y = base.out,
+                    .residual = base.out,
+                    .m = base.m,
+                    .n = base.hidden_size,
+                    .k = se_inter,
+                    .tensor_scale_per_row = args.shared_expert_tensor_scale_per_row,
+                }, true);
+            }
+        } else {
+            const default_se = dequant.legacyWeightDTypeForAmf(args.scheme_descs[0].gate_up_dtype);
+            try self.encodeReduceAndOptionalShared(frame, base, default_se);
+        }
     }
 
     /// Encodes an MLX affine 2-bit / 3-bit / 4-bit group-64 router projection

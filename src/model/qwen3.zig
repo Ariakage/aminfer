@@ -17,8 +17,10 @@ const arena_mod = @import("../mem/arena.zig");
 const quant = @import("../quant/spec.zig");
 const amf = @import("../format/amf.zig");
 const dequant = @import("../gpu/dequant.zig");
+const quant_formats = @import("../gpu/quant_formats.zig");
 const attention = @import("../gpu/attention.zig");
 const moe = @import("../gpu/moe.zig");
+const chat_template_mod = @import("chat_template.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const chip_profile_mod = @import("../platform/chip_profile.zig");
 const vmstat = @import("../platform/vmstat.zig");
@@ -496,6 +498,12 @@ pub const LoadOptions = struct {
     g18_qkv_gemm_min_m: u32 = 64,
     /// Minimum batched `M` for `ami_dense_gate_up_swiglu` GEMM (`32x32` tile).
     g18_swiglu_gemm_min_m: u32 = 32,
+
+    // M8.1 Multi-format Quantization (`G23`), Activation Quantization (`G24`), and ChatTemplate (`W24`)
+    /// Opt-in `G24` activation-quantization emulation policy (`.none` default = `0` extra dispatches).
+    act_quant_policy: quant_formats.ActQuantPolicy = .none,
+    /// Optional explicit `chat_template.json` / `chat_template_spec` path overriding embedded `__meta.chat_template_json`.
+    chat_template_json_path: ?[]const u8 = null,
 };
 
 pub const LoadError = error{
@@ -510,6 +518,7 @@ pub const LoadError = error{
     SmeCalibrationFailed,
     OutOfMemory,
 } || ModelConfig.ConfigError || amf.AmfFile.OpenError || quant.ShapeError ||
+    quant_formats.InitError || quant_formats.ShapeError ||
     sysinfo.Error || vmstat.Error || metal.WrapError || budget_mod.PlanError ||
     dequant.InitError || dequant.CanaryError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError ||
@@ -590,6 +599,12 @@ pub const LinearBinding = struct {
     n: u32,
     k: u32,
     dtype: quant.WeightDType,
+    /// Exact canonical `.amf` `DType` (`0..37`, M8.1 `W21`/`W22`/`G23`).
+    amf_dtype: amf.DType = .bf16,
+    /// Quantization group size (`32`/`64`/`128` for affine; `0` or native block width otherwise).
+    group_size: u16 = 64,
+    /// True when `amf_dtype == .fp8_e4m3_tensor` carries per-row `f32[N]` scales.
+    tensor_scale_per_row: bool = false,
     alg_bytes: u64,
     layout: amf.TensorLayout = .row_major,
     param_kind: amf.QuantParamKind = .affine_scale_bias,
@@ -599,6 +614,19 @@ pub const LinearBinding = struct {
     /// Zero-copy CPU slices into the owning `WiredArena` shard for pure-CPU SME2 draft execution.
     weight_host: []const u8 = &.{},
     scale_bias_host: ?[]const u8 = null,
+
+    pub inline fn effectiveAmfDType(self: LinearBinding) amf.DType {
+        // Backward-compatible for synthetic tests that construct `LinearBinding`
+        // setting only `.dtype` while leaving `.amf_dtype` at its default `.bf16`.
+        if (self.amf_dtype == .bf16 and self.dtype != .bf16) {
+            return dequant.weightDTypeToAmf(self.dtype);
+        }
+        return self.amf_dtype;
+    }
+
+    pub inline fn panelDType(self: LinearBinding) sme.PanelDType {
+        return sme.panelDTypeFromAmf(self.effectiveAmfDType()) catch weightDTypeToPanelDType(self.dtype);
+    }
 };
 
 pub const NormBinding = struct {
@@ -617,6 +645,7 @@ const SmeExpertTriple = struct {
     up: []const u8,
     down: []const u8,
     dtype: quant.WeightDType = .q3_affine,
+    amf_dtype: amf.DType = .q3_affine,
     param_kind: amf.QuantParamKind = .affine_scale_bias,
     is_cold: bool = false,
 };
@@ -637,6 +666,11 @@ const LayerWeights = struct {
 
     // MoE-specific (valid when config.arch == .qwen3_moe)
     router: moe.RouterSource,
+    router_amf_dtype: amf.DType = .f16,
+    router_group_size: u16 = 64,
+    router_tensor_scale_per_row: bool = false,
+    router_weight: ?metal.BufferBinding = null,
+    router_params: ?metal.BufferBinding = null,
     router_layout: amf.TensorLayout = .row_major,
     router_param_kind: amf.QuantParamKind = .affine_scale_bias,
     router_panel_dtype: ?sme.PanelDType = null,
@@ -644,12 +678,19 @@ const LayerWeights = struct {
     router_sme_packed: ?[]const u8 = null,
     /// Uniform expert dtype when `is_heterogeneous_moe == false`; expert 0's dtype otherwise.
     expert_dtype: quant.WeightDType,
+    expert_amf_dtype: amf.DType = .q3_affine,
     expert_layout: amf.TensorLayout = .row_major,
     expert_param_kind: amf.QuantParamKind = .affine_scale_bias,
-    /// True iff experts inside this layer span > 1 `WeightDType` scheme (G13, ADR-0017).
+    /// True iff experts inside this layer span > 1 scheme bucket (G13/G23, ADR-0017, ADR-0024).
     is_heterogeneous_moe: bool = false,
-    /// Static expert count per `WeightDType` bucket in this layer (`sum == num_experts`).
+    /// True iff any routed expert in this layer requires `QuantFormatPipelines` (`G23`).
+    uses_quant_formats_moe: bool = false,
+    /// Static expert count per scheme bucket in this layer (`sum == num_experts`).
     expert_scheme_counts: [moe.NUM_SCHEME_BUCKETS]u32 = @splat(0),
+    /// Per-bucket `MoeSchemeDesc` (`expert_scheme_descs[0]` used when uniform).
+    expert_scheme_descs: [moe.NUM_SCHEME_BUCKETS]moe.MoeSchemeDesc = .{
+        .{}, .{}, .{}, .{}, .{},
+    },
     /// Device-resident `[num_experts]u8` mapping `expert_id -> @backingInt(WeightDType)`.
     expert_schemes_bind: metal.BufferBinding,
     expert_weights_buf: metal.Buffer,
@@ -1074,6 +1115,18 @@ pub const Qwen3Model = struct {
     g18_qkv_gemm_min_m: u32 = 64,
     g18_swiglu_gemm_min_m: u32 = 32,
 
+    // M8.1 Multi-format Quantization (`G23`), Activation Quantization (`G24`), and ChatTemplate (`W24`)
+    qf_pipes: ?quant_formats.QuantFormatPipelines = null,
+    act_quant_policy: quant_formats.ActQuantPolicy = .none,
+    qf_tile_region: ?page.WiredRegion = null,
+    qf_tile_buf: ?metal.Buffer = null,
+    qf_tile_bytes: u64 = 0,
+    act_quant_region: ?page.WiredRegion = null,
+    act_quant_buf: ?metal.Buffer = null,
+    act_quant_bytes: u64 = 0,
+    embed_dequant_f32: ?[]f32 = null,
+    chat_template: ?chat_template_mod.ChatTemplate = null,
+
     pub fn loadFromBytes(
         allocator: std.mem.Allocator,
         amf_bytes: []const u8,
@@ -1174,6 +1227,12 @@ pub const Qwen3Model = struct {
         for (self.layers) |layer| {
             if (layer.expert_sme_blobs) |esb| allocator.free(esb);
         }
+        if (self.embed_dequant_f32) |ed| allocator.free(ed);
+        if (self.qf_pipes) |*qfp| qfp.close();
+        if (self.qf_tile_buf) |tb| tb.close();
+        if (self.qf_tile_region) |tr| tr.deinit();
+        if (self.act_quant_buf) |ab| ab.close();
+        if (self.act_quant_region) |ar| ar.deinit();
         self.moe_pipes.close();
         self.attn_pipes.close();
         self.dequant_pipes.close();
@@ -1659,51 +1718,26 @@ pub const Qwen3Model = struct {
         residual: ?metal.BufferBinding,
         insert_barrier_before: bool,
     ) dequant.EncodeError!void {
-        switch (lin.dtype) {
-            .f16 => try self.dequant_pipes.encodeDenseGemv(frame, .f16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-            .bf16 => try self.dequant_pipes.encodeDenseGemv(frame, .bf16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q4_affine => try self.dequant_pipes.encodeGemv(frame, .q4, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q3_affine => try self.dequant_pipes.encodeGemv(frame, .q3, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q2_affine => try self.dequant_pipes.encodeGemv(frame, .q2, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-        }
+        const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+        const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        return self.dequant_pipes.encodeLinearUnified(frame, .{
+            .amf_dtype = lin.effectiveAmfDType(),
+            .group_size = lin.group_size,
+            .tensor_scale_per_row = lin.tensor_scale_per_row,
+            .weight = lin.weight,
+            .params = lin.scale_bias,
+            .x = x,
+            .y = y,
+            .residual = residual,
+            .m = 1,
+            .n = lin.n,
+            .k = lin.k,
+            .mode = .gemv,
+            .qf_pipes = qf_ptr,
+            .act_quant_policy = self.act_quant_policy,
+            .act_scratch = act_b,
+            .act_scratch_bytes = self.act_quant_bytes,
+        }, insert_barrier_before);
     }
 
     /// Encodes a linear projection for `m >= 1` rows, using `encodeLinearGemv`
@@ -1733,56 +1767,26 @@ pub const Qwen3Model = struct {
         if (m == 1) {
             return self.encodeLinearGemvResidual(frame, lin, x, y, residual, insert_barrier_before);
         }
-        switch (lin.dtype) {
-            .f16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .f16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-            .bf16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .bf16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q4_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q4, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q3_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q3, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q2_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q2, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, insert_barrier_before),
-        }
+        const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+        const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        return self.dequant_pipes.encodeLinearUnified(frame, .{
+            .amf_dtype = lin.effectiveAmfDType(),
+            .group_size = lin.group_size,
+            .tensor_scale_per_row = lin.tensor_scale_per_row,
+            .weight = lin.weight,
+            .params = lin.scale_bias,
+            .x = x,
+            .y = y,
+            .residual = residual,
+            .m = m,
+            .n = lin.n,
+            .k = lin.k,
+            .mode = .batched,
+            .qf_pipes = qf_ptr,
+            .act_quant_policy = self.act_quant_policy,
+            .act_scratch = act_b,
+            .act_scratch_bytes = self.act_quant_bytes,
+        }, insert_barrier_before);
     }
 
     pub fn hasColdExperts(self: *const Qwen3Model) bool {
@@ -1877,61 +1881,29 @@ pub const Qwen3Model = struct {
         if (m < 16) {
             return self.encodeLinearBatchedResidual(frame, lin, x, y, residual, m, insert_barrier_before);
         }
-        switch (lin.dtype) {
-            .f16 => try self.dequant_pipes.encodeDenseGemm(frame, .f16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, insert_barrier_before),
-            .bf16 => try self.dequant_pipes.encodeDenseGemm(frame, .bf16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q4_affine => try self.dequant_pipes.encodeGemm(frame, .q4, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q3_affine => try self.dequant_pipes.encodeGemm(frame, .q3, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, insert_barrier_before),
-            .q2_affine => try self.dequant_pipes.encodeGemm(frame, .q2, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, insert_barrier_before),
-        }
+        const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+        const tile_b: ?metal.BufferBinding = if (self.qf_tile_buf) |tb| .{ .buffer = tb, .offset = 0 } else null;
+        const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        return self.dequant_pipes.encodeLinearUnified(frame, .{
+            .amf_dtype = lin.effectiveAmfDType(),
+            .group_size = lin.group_size,
+            .tensor_scale_per_row = lin.tensor_scale_per_row,
+            .weight = lin.weight,
+            .params = lin.scale_bias,
+            .x = x,
+            .y = y,
+            .residual = residual,
+            .m = m,
+            .n = lin.n,
+            .k = lin.k,
+            .mode = if (wide_tile) .gemm_wide else .gemm32,
+            .qf_pipes = qf_ptr,
+            .tile_f16 = tile_b,
+            .tile_f16_bytes = self.qf_tile_bytes,
+            .act_quant_policy = self.act_quant_policy,
+            .act_scratch = act_b,
+            .act_scratch_bytes = self.act_quant_bytes,
+        }, insert_barrier_before);
     }
 
     pub const LinearDispatchMode = enum {
@@ -1986,12 +1958,15 @@ pub const Qwen3Model = struct {
         mode: LinearDispatchMode,
         insert_barrier_before: bool,
     ) dequant.EncodeError!void {
-        const q_amf = dequant.weightDTypeToAmf(q_proj.dtype);
-        const k_amf = dequant.weightDTypeToAmf(k_proj.dtype);
-        const v_amf = dequant.weightDTypeToAmf(v_proj.dtype);
+        const q_amf = q_proj.effectiveAmfDType();
+        const k_amf = k_proj.effectiveAmfDType();
+        const v_amf = v_proj.effectiveAmfDType();
+        const any_qf = dequant.usesQuantFormats(q_amf, q_proj.group_size) or
+            dequant.usesQuantFormats(k_amf, k_proj.group_size) or
+            dequant.usesQuantFormats(v_amf, v_proj.group_size);
         const use_nax_wide = mode == .gemm_wide and m >= 64 and self.dequant_pipes.activeBackend().isNax();
         const allow_fused_m = (m == 1) or (mode != .batched_gemv and m >= self.g18_qkv_gemm_min_m);
-        if (self.enable_g18_fusion and allow_fused_m and !use_nax_wide and dequant.canFuseQkv(q_amf, k_amf, v_amf)) {
+        if (self.enable_g18_fusion and !self.act_quant_policy.isEnabled() and !any_qf and allow_fused_m and !use_nax_wide and dequant.canFuseQkv(q_amf, k_amf, v_amf)) {
             const path = self.dequant_pipes.encodeFusedQkvGemm(frame, .{
                 .x = x,
                 .q = qkvProjBinding(q_proj, q_out),
@@ -2006,9 +1981,10 @@ pub const Qwen3Model = struct {
             };
             if (path == .fused) return;
         }
+        const seq_barrier = self.act_quant_policy.isEnabled() or (any_qf and m >= 16);
         try self.encodeLinearByModeResidual(frame, q_proj, x, q_out, null, m, mode, insert_barrier_before);
-        try self.encodeLinearByModeResidual(frame, k_proj, x, k_out, null, m, mode, false);
-        try self.encodeLinearByModeResidual(frame, v_proj, x, v_out, null, m, mode, false);
+        try self.encodeLinearByModeResidual(frame, k_proj, x, k_out, null, m, mode, seq_barrier);
+        try self.encodeLinearByModeResidual(frame, v_proj, x, v_out, null, m, mode, seq_barrier);
     }
 
     /// G18 fused dense Gate+Up+SwiGLU (`ADR-0023 §1`) with strict heterogeneous-GSQ guard.
@@ -2024,10 +2000,12 @@ pub const Qwen3Model = struct {
         mode: LinearDispatchMode,
         insert_barrier_before: bool,
     ) StepError!void {
-        const g_amf = dequant.weightDTypeToAmf(layer.dense_gate.dtype);
-        const u_amf = dequant.weightDTypeToAmf(layer.dense_up.dtype);
+        const g_amf = layer.dense_gate.effectiveAmfDType();
+        const u_amf = layer.dense_up.effectiveAmfDType();
+        const any_qf = dequant.usesQuantFormats(g_amf, layer.dense_gate.group_size) or
+            dequant.usesQuantFormats(u_amf, layer.dense_up.group_size);
         const allow_fused_m = (mode != .batched_gemv and m >= self.g18_swiglu_gemm_min_m);
-        if (self.enable_g18_fusion and allow_fused_m and dequant.canFuseGateUp(g_amf, u_amf)) {
+        if (self.enable_g18_fusion and !self.act_quant_policy.isEnabled() and !any_qf and allow_fused_m and dequant.canFuseGateUp(g_amf, u_amf)) {
             var used_fused = true;
             self.dequant_pipes.encodeDenseGateUpSwiglu(frame, .{
                 .x = x_norm,
@@ -2049,8 +2027,9 @@ pub const Qwen3Model = struct {
             };
             if (used_fused) return;
         }
+        const seq_barrier = self.act_quant_policy.isEnabled() or (any_qf and m >= 16);
         try self.encodeLinearByModeResidual(frame, layer.dense_gate, x_norm, gate_out, null, m, mode, insert_barrier_before);
-        try self.encodeLinearByModeResidual(frame, layer.dense_up, x_norm, up_out, null, m, mode, false);
+        try self.encodeLinearByModeResidual(frame, layer.dense_up, x_norm, up_out, null, m, mode, seq_barrier);
         try self.moe_pipes.encodeSiluMul(frame, .{
             .gate = gate_out,
             .up = up_out,
@@ -2160,29 +2139,147 @@ pub const Qwen3Model = struct {
     }
 
     /// Dispatches one complete MoE FFN layer onto GPU: preserves the fast
-    /// single-dispatch path untouched for uniform layers, and uses G13
-    /// zero-sync scheme-bucketed dispatch for heterogeneous layers (`ADR-0017`).
-    fn encodeMoELayerDispatch(
+    /// single-dispatch path untouched for uniform legacy layers, and routes
+    /// multi-format `G23` (`W21`/`W22` dtypes) or `G24` `act_quant` layers
+    /// through `encodeMoELayerMultiFormat` with zero hot-path allocations.
+    pub fn encodeMoELayerDispatch(
         self: *const Qwen3Model,
         frame: *metal.Compute.Frame,
         layer: LayerWeights,
         moe_args: moe.MoELayerArgs,
         insert_barrier_before: bool,
     ) moe.EncodeError!void {
+        var resolved_args = moe_args;
+        const router_uses_qf = (layer.router_layout != .sme2_panel64) and
+            dequant.usesQuantFormats(layer.router_amf_dtype, layer.router_group_size);
+        if (router_uses_qf) {
+            // Only replace the router when caller passed `layer.router` (not pre-computed SME2 `.logits`).
+            if (resolved_args.router != .logits or layer.router_weight != null) {
+                if (resolved_args.router != .logits) {
+                    const qfp = if (self.qf_pipes) |*p| p else return error.PipelineNotInitialized;
+                    const r_dt = quant_formats.DType.fromAmf(layer.router_amf_dtype) orelse return error.InvalidArgument;
+                    resolved_args.router = .{ .quant_format = .{
+                        .dtype = r_dt,
+                        .group_size = layer.router_group_size,
+                        .tensor_scale_per_row = layer.router_tensor_scale_per_row,
+                        .qweight = layer.router_weight orelse return error.InvalidArgument,
+                        .params = layer.router_params,
+                        .qf_pipes = qfp,
+                    } };
+                }
+            }
+        }
+        if (layer.uses_quant_formats_moe or self.act_quant_policy.isEnabled() or router_uses_qf) {
+            const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+            const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+            return self.moe_pipes.encodeMoELayerMultiFormat(frame, .{
+                .base = resolved_args,
+                .is_heterogeneous = layer.is_heterogeneous_moe,
+                .expert_schemes = if (layer.is_heterogeneous_moe) layer.expert_schemes_bind else null,
+                .scheme_counts = layer.expert_scheme_counts,
+                .scheme_descs = layer.expert_scheme_descs,
+                .qf_pipes = qf_ptr,
+                .act_quant_policy = self.act_quant_policy,
+                .act_scratch = act_b,
+                .act_scratch_bytes = self.act_quant_bytes,
+            }, insert_barrier_before);
+        }
         if (layer.is_heterogeneous_moe) {
             try self.moe_pipes.encodeMoELayerHetero(frame, .{
-                .base = moe_args,
+                .base = resolved_args,
                 .expert_schemes = layer.expert_schemes_bind,
                 .scheme_counts = layer.expert_scheme_counts,
             }, insert_barrier_before);
         } else {
             switch (layer.expert_dtype) {
-                .q2_affine => try self.moe_pipes.encodeMoELayer(frame, .q2, moe_args, insert_barrier_before),
-                .q3_affine => try self.moe_pipes.encodeMoELayer(frame, .q3, moe_args, insert_barrier_before),
-                .q4_affine => try self.moe_pipes.encodeMoELayer(frame, .q4, moe_args, insert_barrier_before),
-                .f16 => try self.moe_pipes.encodeMoELayerFloat(frame, .f16, moe_args, insert_barrier_before),
-                .bf16 => try self.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, insert_barrier_before),
+                .q2_affine => try self.moe_pipes.encodeMoELayer(frame, .q2, resolved_args, insert_barrier_before),
+                .q3_affine => try self.moe_pipes.encodeMoELayer(frame, .q3, resolved_args, insert_barrier_before),
+                .q4_affine => try self.moe_pipes.encodeMoELayer(frame, .q4, resolved_args, insert_barrier_before),
+                .f16 => try self.moe_pipes.encodeMoELayerFloat(frame, .f16, resolved_args, insert_barrier_before),
+                .bf16 => try self.moe_pipes.encodeMoELayerFloat(frame, .bf16, resolved_args, insert_barrier_before),
             }
+        }
+    }
+
+    /// Unified embedding lookup supporting both legacy GPU `encodeEmbedLookup`
+    /// (`f16`/`bf16`/`q2..q4` g64) and any `W21`/`W22` quantized embedding table
+    /// (`q2..q8`, `fp8`, `mxfp8`, `nvfp4`, and all 23 GGUF block formats).
+    pub fn encodeEmbedLookupUnified(
+        self: *const Qwen3Model,
+        frame: *metal.Compute.Frame,
+        args: moe.EmbedLookupArgs,
+        host_token_ids: ?[]const u32,
+        host_out_f16: ?[]f16,
+        insert_barrier_before: bool,
+    ) moe.EncodeError!void {
+        const emb_amf = self.embed.effectiveAmfDType();
+        if (!dequant.usesQuantFormats(emb_amf, self.embed.group_size)) {
+            return self.moe_pipes.encodeEmbedLookup(frame, self.embed.dtype, args, insert_barrier_before);
+        }
+        const qf_dt = quant_formats.DType.fromAmf(emb_amf) orelse return error.InvalidArgument;
+        switch (args.tokens) {
+            .token_id => |tok| {
+                const qf = if (self.qf_pipes) |*qfp| qfp else return error.PipelineNotInitialized;
+                try qf.encodeDequantTileF16(frame, qf_dt, self.embed.group_size, .{
+                    .qweight = self.embed.weight,
+                    .params = self.embed.scale_bias,
+                    .dst_f16 = args.out,
+                    .n_total = self.embed.n,
+                    .k_total = self.embed.k,
+                    .tile_n_start = tok,
+                    .tile_n = 1,
+                    .tile_k_start = 0,
+                    .tile_k = self.embed.k,
+                    .tensor_scale_per_row = self.embed.tensor_scale_per_row,
+                }, insert_barrier_before);
+            },
+            .token_ids => {
+                if (host_token_ids != null and host_out_f16 != null and self.embed_dequant_f32 != null) {
+                    const tids = host_token_ids.?[0..args.m];
+                    const dst_f16 = host_out_f16.?;
+                    const tmp_f32 = self.embed_dequant_f32.?;
+                    const h: usize = self.embed.k;
+                    const p_bytes: []const u8 = self.embed.scale_bias_host orelse &.{};
+                    for (tids, 0..) |tok, r| {
+                        quant_formats.dequantRowCpuRef(
+                            qf_dt,
+                            self.embed.group_size,
+                            self.embed.weight_host,
+                            p_bytes,
+                            tok,
+                            self.embed.n,
+                            h,
+                            tmp_f32,
+                        ) catch return error.InvalidArgument;
+                        const row_out = dst_f16[r * h ..][0..h];
+                        for (0..h) |j| row_out[j] = @floatCast(tmp_f32[j]);
+                    }
+                    return;
+                }
+                if (host_token_ids) |tids_full| {
+                    const qf = if (self.qf_pipes) |*qfp| qfp else return error.PipelineNotInitialized;
+                    const h: u64 = self.embed.k;
+                    for (tids_full[0..args.m], 0..) |tok, r| {
+                        try qf.encodeDequantTileF16(frame, qf_dt, self.embed.group_size, .{
+                            .qweight = self.embed.weight,
+                            .params = self.embed.scale_bias,
+                            .dst_f16 = .{
+                                .buffer = args.out.buffer,
+                                .offset = args.out.offset + @as(u64, r) * h * @sizeOf(f16),
+                            },
+                            .n_total = self.embed.n,
+                            .k_total = self.embed.k,
+                            .tile_n_start = tok,
+                            .tile_n = 1,
+                            .tile_k_start = 0,
+                            .tile_k = self.embed.k,
+                            .tensor_scale_per_row = self.embed.tensor_scale_per_row,
+                        }, if (r == 0) insert_barrier_before else false);
+                    }
+                    return;
+                }
+                return error.InvalidArgument;
+            },
         }
     }
 
@@ -2242,7 +2339,7 @@ pub const Qwen3Model = struct {
         var frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
 
-        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+        try self.encodeEmbedLookupUnified(&frame, .{
             .weight = self.embed.weight,
             .scale_bias = self.embed.scale_bias,
             .tokens = .{ .token_id = token_id },
@@ -2250,7 +2347,7 @@ pub const Qwen3Model = struct {
             .m = 1,
             .vocab_size = self.config.vocab_size,
             .hidden_size = self.config.hidden_size,
-        }, false);
+        }, null, null, false);
 
         for (self.layers, 0..) |layer, l| {
             // input_layernorm: x -> x_norm (waits on embed lookup or prior layer)
@@ -2402,7 +2499,7 @@ pub const Qwen3Model = struct {
 
         {
             const f = try self.ensureOptionalFrame(&frame_opt);
-            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+            try self.encodeEmbedLookupUnified(f, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
                 .tokens = .{ .token_id = token_id },
@@ -2410,7 +2507,7 @@ pub const Qwen3Model = struct {
                 .m = 1,
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, null, null, false);
         }
 
         for (self.layers, 0..) |layer, l| {
@@ -2646,7 +2743,7 @@ pub const Qwen3Model = struct {
         var frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
 
-        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+        try self.encodeEmbedLookupUnified(&frame, .{
             .weight = self.embed.weight,
             .scale_bias = self.embed.scale_bias,
             .tokens = .{ .token_ids = self.tree_token_ids_bind },
@@ -2654,7 +2751,7 @@ pub const Qwen3Model = struct {
             .m = m,
             .vocab_size = self.config.vocab_size,
             .hidden_size = h,
-        }, false);
+        }, self.tree_token_ids_host, self.x_host, false);
 
         for (self.layers, 0..) |layer, l| {
             try self.attn_pipes.encodeRmsNorm(&frame, .{
@@ -2966,7 +3063,7 @@ pub const Qwen3Model = struct {
         var frame_active = true;
         errdefer if (frame_active) frame.abort();
 
-        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+        try self.encodeEmbedLookupUnified(&frame, .{
             .weight = self.embed.weight,
             .scale_bias = self.embed.scale_bias,
             .tokens = .{ .token_ids = self.wp_token_ids_bind },
@@ -2974,7 +3071,7 @@ pub const Qwen3Model = struct {
             .m = m,
             .vocab_size = self.config.vocab_size,
             .hidden_size = h,
-        }, false);
+        }, self.wp_token_ids_host, self.wp_x_host, false);
 
         for (self.layers, 0..) |layer, l| {
             const is_last_layer = (l == last_l);
@@ -3369,7 +3466,7 @@ pub const Qwen3Model = struct {
 
         {
             const f = try self.ensureOptionalFrame(&frame_opt);
-            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+            try self.encodeEmbedLookupUnified(f, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
                 .tokens = .{ .token_ids = self.wp_token_ids_bind },
@@ -3377,7 +3474,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, self.wp_token_ids_host, self.wp_x_host, false);
         }
 
         for (self.layers, 0..) |layer, l| {
@@ -3945,9 +4042,34 @@ pub const Qwen3Model = struct {
                     .num_experts = self.config.num_experts,
                     .hidden_size = h,
                 }, true),
+                .quant_format => |qfr| {
+                    if (num_nodes == 1) {
+                        try qfr.qf_pipes.encodeGemv(frame, qfr.dtype, qfr.group_size, .{
+                            .x = self.x_norm_bind,
+                            .qweight = qfr.qweight,
+                            .params = qfr.params,
+                            .y = logits_bind,
+                            .n = self.config.num_experts,
+                            .k = h,
+                            .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                        }, true);
+                    } else {
+                        try qfr.qf_pipes.encodeGemvBatch(frame, qfr.dtype, qfr.group_size, .{
+                            .x = self.x_norm_bind,
+                            .qweight = qfr.qweight,
+                            .params = qfr.params,
+                            .y = logits_bind,
+                            .m = num_nodes,
+                            .n = self.config.num_experts,
+                            .k = h,
+                            .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                        }, true);
+                    }
+                },
                 .logits => return error.InvalidArgument,
             }
-            try self.moe_pipes.encodeRouteTopK(frame, .f32, .{
+            const pred_logits_dt: moe.LogitsDType = if (layer.router == .quant_format) .f16 else .f32;
+            try self.moe_pipes.encodeRouteTopK(frame, pred_logits_dt, .{
                 .logits = logits_bind,
                 .workspace = &ws,
                 .workspace_buf = self.scratch_buf,
@@ -4049,7 +4171,7 @@ pub const Qwen3Model = struct {
 
         var frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
-        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+        try self.encodeEmbedLookupUnified(&frame, .{
             .weight = self.embed.weight,
             .scale_bias = self.embed.scale_bias,
             .tokens = .{ .token_ids = self.tree_token_ids_bind },
@@ -4057,7 +4179,7 @@ pub const Qwen3Model = struct {
             .m = m,
             .vocab_size = self.config.vocab_size,
             .hidden_size = self.config.hidden_size,
-        }, false);
+        }, self.tree_token_ids_host, self.x_host, false);
         try self.runPredictMoEExpertsFrame(&frame, self.x_bind, m, sampled, true);
         const sig = try frame.commit();
         try self.compute.wait(sig, self.timeout_ms);
@@ -4068,6 +4190,24 @@ pub const Qwen3Model = struct {
 
     fn lookupEmbeddingsCpuF32(self: *const Qwen3Model, token_ids: []const u32, out_f32: []f32) StepError!void {
         const h: usize = self.config.hidden_size;
+        const emb_amf = self.embed.effectiveAmfDType();
+        if (dequant.usesQuantFormats(emb_amf, self.embed.group_size)) {
+            const qf_dt = quant_formats.DType.fromAmf(emb_amf) orelse return error.InvalidArgument;
+            const p_bytes: []const u8 = self.embed.scale_bias_host orelse &.{};
+            for (token_ids, 0..) |tid, r| {
+                quant_formats.dequantRowCpuRef(
+                    qf_dt,
+                    self.embed.group_size,
+                    self.embed.weight_host,
+                    p_bytes,
+                    tid,
+                    self.embed.n,
+                    h,
+                    out_f32[r * h .. (r + 1) * h],
+                ) catch return error.InvalidArgument;
+            }
+            return;
+        }
         const shard_bytes = self.shards[self.embed_shard_idx].arena.bytes();
         const w_off: usize = @intCast(self.embed.weight.offset);
 
@@ -4288,7 +4428,7 @@ pub const Qwen3Model = struct {
         cache_hint: sme.CacheHint,
     ) StepError!void {
         const srt = self.sme_rt.?;
-        const pdt = weightDTypeToPanelDType(lin.dtype);
+        const pdt = lin.panelDType();
         const packed_w = lin.sme_packed.?;
         const m_u: usize = m;
         const k_u: usize = lin.k;
@@ -4352,7 +4492,7 @@ pub const Qwen3Model = struct {
     ) StepError!u32 {
         const srt = self.sme_rt.?;
         const experts = layer.expert_sme_blobs.?;
-        const pdt = weightDTypeToPanelDType(layer.expert_dtype);
+        const pdt = sme.panelDTypeFromAmf(layer.expert_amf_dtype) catch weightDTypeToPanelDType(layer.expert_dtype);
         const pkind = amfParamKindToSme(layer.expert_param_kind);
         const m_u: usize = m;
         const h: usize = self.config.hidden_size;
@@ -4436,7 +4576,10 @@ pub const Qwen3Model = struct {
             // Gather this expert's rows into contiguous `x_f32_scratch` (reinterpreted as u16)
             // or slice directly when `cnt == 1` and activation dtype matches (`M = 1` zero-copy fast path!).
             const e_triple = experts[eid];
-            const e_pdt = if (layer.is_heterogeneous_moe) weightDTypeToPanelDType(e_triple.dtype) else pdt;
+            const e_pdt = if (layer.is_heterogeneous_moe)
+                (sme.panelDTypeFromAmf(e_triple.amf_dtype) catch weightDTypeToPanelDType(e_triple.dtype))
+            else
+                pdt;
             const e_pkind = if (layer.is_heterogeneous_moe) amfParamKindToSme(e_triple.param_kind) else pkind;
             const e_act_matches = (e_pdt.activationIsBf16() == pdt.activationIsBf16());
             const hint: sme.CacheHint = if (e_triple.is_cold) .non_temporal else .temporal;
@@ -4562,7 +4705,7 @@ pub const Qwen3Model = struct {
 
         {
             const f = try self.ensureOptionalFrame(&frame_opt);
-            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+            try self.encodeEmbedLookupUnified(f, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
                 .tokens = .{ .token_id = token_id },
@@ -4570,7 +4713,7 @@ pub const Qwen3Model = struct {
                 .m = 1,
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, null, null, false);
         }
 
         for (self.layers, 0..) |layer, l| {
@@ -4769,7 +4912,7 @@ pub const Qwen3Model = struct {
 
         {
             const f = try self.ensureOptionalFrame(&frame_opt);
-            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+            try self.encodeEmbedLookupUnified(f, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
                 .tokens = .{ .token_ids = self.tree_token_ids_bind },
@@ -4777,7 +4920,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, self.tree_token_ids_host, self.x_host, false);
         }
 
         var total_unique: u64 = 0;
@@ -5134,10 +5277,35 @@ pub const Qwen3Model = struct {
                 .num_experts = self.config.num_experts,
                 .hidden_size = self.config.hidden_size,
             }, barrier_before),
+            .quant_format => |qfr| {
+                if (m == 1) {
+                    try qfr.qf_pipes.encodeGemv(frame, qfr.dtype, qfr.group_size, .{
+                        .x = x_norm,
+                        .qweight = qfr.qweight,
+                        .params = qfr.params,
+                        .y = logits_bind,
+                        .n = self.config.num_experts,
+                        .k = self.config.hidden_size,
+                        .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                    }, barrier_before);
+                } else {
+                    try qfr.qf_pipes.encodeGemvBatch(frame, qfr.dtype, qfr.group_size, .{
+                        .x = x_norm,
+                        .qweight = qfr.qweight,
+                        .params = qfr.params,
+                        .y = logits_bind,
+                        .m = m,
+                        .n = self.config.num_experts,
+                        .k = self.config.hidden_size,
+                        .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                    }, barrier_before);
+                }
+            },
             .logits => return error.InvalidArgument,
         }
+        const r_logits_dt: moe.LogitsDType = if (layer.router == .quant_format) .f16 else .f32;
         if (layer.is_heterogeneous_moe) {
-            try self.moe_pipes.encodeRouteTopKBucketed(frame, .f32, .{
+            try self.moe_pipes.encodeRouteTopKBucketed(frame, r_logits_dt, .{
                 .logits = logits_bind,
                 .expert_schemes = layer.expert_schemes_bind,
                 .workspace = ws,
@@ -5148,7 +5316,7 @@ pub const Qwen3Model = struct {
                 .norm_topk_prob = self.config.norm_topk_prob,
             }, true);
         } else {
-            try self.moe_pipes.encodeRouteTopK(frame, .f32, .{
+            try self.moe_pipes.encodeRouteTopK(frame, r_logits_dt, .{
                 .logits = logits_bind,
                 .workspace = ws,
                 .workspace_buf = ws_buf,
@@ -5412,7 +5580,7 @@ pub const Qwen3Model = struct {
         {
             var frame = try self.compute.beginFrame(self.timeout_ms);
             errdefer frame.abort();
-            try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            try self.encodeEmbedLookupUnified(&frame, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
                 .tokens = .{ .token_id = token_id },
@@ -5420,7 +5588,7 @@ pub const Qwen3Model = struct {
                 .m = 1,
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, null, null, false);
             try self.encodeLayerAttentionDecode(&frame, 0, pos, cur_seq_len, chunk_idx, true);
             try self.encodeLayerRouter(&frame, 0, ws, self.scratch_buf, self.x_norm_bind, 1, true);
             const sig = try frame.commit();
@@ -5548,7 +5716,7 @@ pub const Qwen3Model = struct {
         {
             var frame = try self.compute.beginFrame(self.timeout_ms);
             errdefer frame.abort();
-            try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            try self.encodeEmbedLookupUnified(&frame, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
                 .tokens = .{ .token_ids = self.tree_token_ids_bind },
@@ -5556,7 +5724,7 @@ pub const Qwen3Model = struct {
                 .m = m,
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, self.tree_token_ids_host, self.x_host, false);
             try self.encodeLayerAttentionTree(&frame, 0, m, base_pos, true);
             try self.encodeLayerRouter(&frame, 0, ws, self.scratch_buf, self.x_norm_bind, m, true);
             const sig = try frame.commit();
@@ -5719,7 +5887,7 @@ pub const Qwen3Model = struct {
         var frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
 
-        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+        try self.encodeEmbedLookupUnified(&frame, .{
             .weight = self.embed.weight,
             .scale_bias = self.embed.scale_bias,
             .tokens = .{ .token_ids = self.tree_token_ids_bind },
@@ -5727,7 +5895,7 @@ pub const Qwen3Model = struct {
             .m = m,
             .vocab_size = self.config.vocab_size,
             .hidden_size = h,
-        }, false);
+        }, self.tree_token_ids_host, self.x_host, false);
 
         for (self.layers, 0..) |layer, l| {
             try self.attn_pipes.encodeRmsNorm(&frame, .{
@@ -5951,7 +6119,7 @@ pub const Qwen3Model = struct {
         cache_hint: sme.CacheHint,
     ) StepError!void {
         const srt = self.sme_rt.?;
-        const pdt = weightDTypeToPanelDType(lin.dtype);
+        const pdt = lin.panelDType();
         const packed_w = lin.sme_packed.?;
         const m_u: usize = m;
         const k_u: usize = lin.k;
@@ -5976,6 +6144,27 @@ pub const Qwen3Model = struct {
     fn cpuEmbedLookup(self: *Qwen3Model, token_ids: []const u32) void {
         const h: usize = self.config.hidden_size;
         const w_bytes = self.embed.weight_host;
+        const emb_amf = self.embed.effectiveAmfDType();
+        if (dequant.usesQuantFormats(emb_amf, self.embed.group_size)) {
+            const qf_dt = quant_formats.DType.fromAmf(emb_amf) orelse unreachable;
+            const p_bytes: []const u8 = self.embed.scale_bias_host orelse &.{};
+            const tmp_f32 = self.embed_dequant_f32.?;
+            for (token_ids, 0..) |tid, r| {
+                quant_formats.dequantRowCpuRef(
+                    qf_dt,
+                    self.embed.group_size,
+                    w_bytes,
+                    p_bytes,
+                    tid,
+                    self.embed.n,
+                    h,
+                    tmp_f32,
+                ) catch unreachable;
+                const row_dst = self.x_host[r * h ..][0..h];
+                for (0..h) |c| row_dst[c] = @floatCast(tmp_f32[c]);
+            }
+            return;
+        }
         switch (self.embed.dtype) {
             .f16 => {
                 const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, w_bytes));
@@ -6800,7 +6989,7 @@ pub const Qwen3Model = struct {
         const eff_k: usize = @min(@as(usize, top_k), moe.MAX_TOP_K);
 
         if (self.lm_head.layout == .sme2_panel64) {
-            const pdt = weightDTypeToPanelDType(self.lm_head.dtype);
+            const pdt = self.lm_head.panelDType();
             const packed_w = self.lm_head.sme_packed.?;
             const ps = sme.panelStrideBytes(pdt, h) catch return error.InvalidArgument;
             const a_u16: []const u16 = if (pdt.activationIsBf16()) blk: {
@@ -7337,7 +7526,7 @@ pub const Qwen3Model = struct {
         }
         const x_b: metal.BufferBinding = .{ .buffer = hrt.x_tiles[slot].aliasBuffer().?, .offset = 0 };
         const xn_b: metal.BufferBinding = .{ .buffer = hrt.x_norm_tiles[slot].aliasBuffer().?, .offset = 0 };
-        try self.moe_pipes.encodeEmbedLookup(frame, self.embed.dtype, .{
+        try self.encodeEmbedLookupUnified(frame, .{
             .weight = self.embed.weight,
             .scale_bias = self.embed.scale_bias,
             .tokens = .{ .token_ids = hrt.chunk_token_ids_bind },
@@ -7345,7 +7534,7 @@ pub const Qwen3Model = struct {
             .m = hrt.chunk_tokens,
             .vocab_size = self.config.vocab_size,
             .hidden_size = self.config.hidden_size,
-        }, barrier_before);
+        }, hrt.chunk_token_ids_host, null, barrier_before);
         try self.attn_pipes.encodeRmsNorm(frame, .{
             .x = x_b,
             .w = self.layers[0].input_layernorm.binding,
@@ -7625,7 +7814,7 @@ pub const Qwen3Model = struct {
         errdefer allocator.free(out);
         if (lin.layout == .sme2_panel64) {
             try unpackPanel64ToF16(
-                weightDTypeToPanelDType(lin.dtype),
+                lin.panelDType(),
                 amfParamKindToSme(lin.param_kind),
                 lin.sme_packed.?,
                 n,
@@ -7796,6 +7985,7 @@ pub const Qwen3Model = struct {
                         for (0..h) |c| w_f16[e * h + c] = @floatCast(@as(f32, @floatCast(raw_f16[e * h + c])) * ln_f32[c]);
                     }
                 },
+                .quant_format => return error.InvalidConfig,
                 .logits => return error.InvalidConfig,
             }
             out[l] = w_f16;
@@ -7873,7 +8063,7 @@ pub const Qwen3Model = struct {
         {
             var frame = try self.compute.beginFrame(self.timeout_ms);
             errdefer frame.abort();
-            try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+            try self.encodeEmbedLookupUnified(&frame, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
                 .tokens = .{ .token_id = token_id },
@@ -7881,7 +8071,7 @@ pub const Qwen3Model = struct {
                 .m = 1,
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = self.config.hidden_size,
-            }, false);
+            }, null, null, false);
             try self.encodeLayerAttentionDecode(&frame, 0, pos, cur_seq_len, chunk_idx, true);
             try self.encodeLayerRouter(&frame, 0, ws, self.scratch_buf, self.x_norm_bind, 1, true);
             const sig = try frame.commit();
@@ -8051,6 +8241,7 @@ pub const Qwen3Model = struct {
                     for (0..h) |c| out_f32[e * h + c] = @as(f32, @floatCast(tmp[e * h + c])) * ln_f32[c];
                 }
             },
+            .quant_format => return error.InvalidConfig,
             .logits => return error.InvalidConfig,
         }
     }
@@ -8351,14 +8542,7 @@ fn weightDTypeToPanelDType(wdt: quant.WeightDType) sme.PanelDType {
 }
 
 fn amfDTypeToPanelDType(dt: amf.DType) LoadError!sme.PanelDType {
-    return switch (dt) {
-        .f16 => .f16,
-        .bf16 => .bf16,
-        .q4_affine => .q4_affine,
-        .q3_affine => .q3_affine,
-        .q2_affine => .q2_affine,
-        else => error.UnexpectedTensorDType,
-    };
+    return sme.panelDTypeFromAmf(dt) catch return error.UnexpectedTensorDType;
 }
 
 fn amfParamKindToSme(pk: amf.QuantParamKind) sme.QuantParamKind {
@@ -8534,24 +8718,13 @@ fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) LoadError!qua
     if (entry.rank != 2 or entry.shape[0] != n or entry.shape[1] != k) return error.UnexpectedTensorShape;
     const layout = try entry.tensorLayout();
     _ = try entry.quantParamKind();
-    if (layout == .sme2_panel64 and (k % sme.GROUP_SIZE) != 0) return error.UnalignedK;
-    return switch (dt) {
-        .f16 => .f16,
-        .bf16 => .bf16,
-        .q4_affine => blk: {
-            if ((k % 64) != 0) return error.UnalignedK;
-            break :blk .q4_affine;
-        },
-        .q3_affine => blk: {
-            if ((k % 64) != 0) return error.UnalignedK;
-            break :blk .q3_affine;
-        },
-        .q2_affine => blk: {
-            if ((k % 64) != 0) return error.UnalignedK;
-            break :blk .q2_affine;
-        },
-        else => error.UnexpectedTensorDType,
-    };
+    if (layout == .sme2_panel64) {
+        if ((k % sme.GROUP_SIZE) != 0) return error.UnalignedK;
+        _ = try amfDTypeToPanelDType(dt);
+        return dequant.legacyWeightDTypeForAmf(dt);
+    }
+    try dequant.validateLinearAmfShape(dt, n, k, entry.group_size);
+    return dequant.legacyWeightDTypeForAmf(dt);
 }
 
 fn validateRouter2D(entry: *const amf.TensorEntry, num_experts: u32, hidden_size: u32) LoadError!amf.DType {
@@ -8563,18 +8736,11 @@ fn validateRouter2D(entry: *const amf.TensorEntry, num_experts: u32, hidden_size
     _ = try entry.quantParamKind();
     if (layout == .sme2_panel64) {
         if ((hidden_size % sme.GROUP_SIZE) != 0) return error.UnalignedK;
-        switch (dt) {
-            .f16, .bf16, .q4_affine, .q3_affine, .q2_affine => {},
-            else => return error.UnexpectedTensorDType,
-        }
+        _ = try amfDTypeToPanelDType(dt);
+        return dt;
     }
-    switch (dt) {
-        .f16, .bf16, .f32 => {},
-        .q4_affine, .q3_affine, .q2_affine => {
-            if ((hidden_size % 64) != 0) return error.UnalignedK;
-        },
-        else => return error.UnexpectedTensorDType,
-    }
+    if (dt == .f32) return dt;
+    try dequant.validateLinearAmfShape(dt, num_experts, hidden_size, entry.group_size);
     return dt;
 }
 
@@ -8599,24 +8765,25 @@ const LoadedBlob = struct {
     fn asLinearBinding(self: LoadedBlob, dtype: quant.WeightDType) LoadError!LinearBinding {
         const layout = try self.entry.tensorLayout();
         const param_kind = try self.entry.quantParamKind();
-        const sb: ?metal.BufferBinding = if (layout == .sme2_panel64)
-            null
-        else switch (dtype) {
-            .f16, .bf16 => null,
-            .q4_affine, .q3_affine, .q2_affine => .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset },
-        };
-        const sb_host: ?[]const u8 = if (layout == .sme2_panel64)
-            null
-        else switch (dtype) {
-            .f16, .bf16 => null,
-            .q4_affine, .q3_affine, .q2_affine => self.slice[@intCast(self.entry.params_offset)..][0..@intCast(self.entry.params_bytes)],
-        };
+        const amf_dt = try self.entry.dataType();
+        const has_params = (layout != .sme2_panel64 and self.entry.params_bytes > 0);
+        const sb: ?metal.BufferBinding = if (has_params)
+            .{ .buffer = self.buffer, .offset = self.offset + self.entry.params_offset }
+        else
+            null;
+        const sb_host: ?[]const u8 = if (has_params)
+            self.slice[@intCast(self.entry.params_offset)..][0..@intCast(self.entry.params_bytes)]
+        else
+            null;
         return .{
             .weight = .{ .buffer = self.buffer, .offset = self.offset },
             .scale_bias = sb,
             .n = self.entry.shape[0],
             .k = self.entry.shape[1],
             .dtype = dtype,
+            .amf_dtype = amf_dt,
+            .group_size = self.entry.group_size,
+            .tensor_scale_per_row = dequant.isTensorScalePerRow(amf_dt, self.entry.shape[0], self.entry.params_bytes),
             .alg_bytes = self.entry.data_bytes + self.entry.params_bytes,
             .layout = layout,
             .param_kind = param_kind,
@@ -8914,17 +9081,21 @@ fn loadCore(
                         layer_exp_layout = gp_layout;
                     }
 
-                    // ADR-0017 strict per-expert uniformity: gate/up/down within expert (l, e)
-                    // MUST share one WeightDType, TensorLayout, and QuantParamKind.
+                    // gate_proj and up_proj within expert (l, e) must share one format & layout;
+                    // down_proj may use a distinct row_major G23 format (e.g. dynamic GGUFs where
+                    // `moe_intermediate_size % 256 != 0` switches down_proj to Q2_0/NVFP4/MXFP4).
+                    const gp_amf_dt = try gp.dataType();
                     const up = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
-                    if ((try validateLinear2D(up, config.moe_intermediate_size, h)) != gp_dt) return error.UnexpectedTensorDType;
+                    _ = try validateLinear2D(up, config.moe_intermediate_size, h);
+                    if ((try up.dataType()) != gp_amf_dt or up.group_size != gp.group_size) return error.UnexpectedTensorDType;
                     if ((try up.tensorLayout()) != gp_layout) return error.InvalidTensorLayout;
                     if ((try up.quantParamKind()) != gp_pk) return error.InvalidQuantParamKind;
 
                     const dp = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
-                    if ((try validateLinear2D(dp, h, config.moe_intermediate_size)) != gp_dt) return error.UnexpectedTensorDType;
+                    _ = try validateLinear2D(dp, h, config.moe_intermediate_size);
                     if ((try dp.tensorLayout()) != gp_layout) return error.InvalidTensorLayout;
                     if ((try dp.quantParamKind()) != gp_pk) return error.InvalidQuantParamKind;
+                    if (gp_layout == .sme2_panel64 and (try dp.dataType()) != gp_amf_dt) return error.UnexpectedTensorDType;
 
                     if (layer_exp_layout.? == .sme2_panel64) {
                         // Single-owner SME2 experts live in wired shard RAM; cold-tagged ones
@@ -9320,12 +9491,132 @@ fn loadCore(
     const moe_pipes = try moe.MoePipelines.init(device, library);
     errdefer moe_pipes.close();
 
+    // M8.1 (`G23`/`G24`): collect unique non-legacy quantized specs present in `.amf`
+    // and compile `QuantFormatPipelines` + preallocated 16 KiB-aligned staging buffers
+    // strictly at startup (`0` extra cost when unused and `act_quant_policy == .none`).
+    var qf_specs_buf: [quant_formats.ALL_FORMAT_SPECS.len]quant_formats.FormatSpec = undefined;
+    var qf_specs_len: usize = 0;
+    var need_qf_moe: bool = false;
+    var max_qf_tile_elems: u64 = 0;
+    for (parsed.entries) |*e| {
+        if (amf.isMetaEntry(e)) continue;
+        const e_layout = try e.tensorLayout();
+        if (e_layout != .row_major) continue;
+        const e_dt = try e.dataType();
+        if (!dequant.usesQuantFormats(e_dt, e.group_size)) continue;
+        const qf_dt = quant_formats.DType.fromAmf(e_dt) orelse continue;
+        const spec = quant_formats.FormatSpec.normalized(qf_dt, e.group_size);
+        var exists = false;
+        for (qf_specs_buf[0..qf_specs_len]) |s| {
+            if (s.dtype == spec.dtype and s.group_size == spec.group_size) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists and qf_specs_len < qf_specs_buf.len) {
+            qf_specs_buf[qf_specs_len] = spec;
+            qf_specs_len += 1;
+        }
+        const e_kind = try e.tensorKind();
+        if (e_kind == .hot_expert or e_kind == .cold_expert or e_kind == .shared_expert) {
+            need_qf_moe = true;
+        } else if (e.rank == 2 and e_kind != .embedding) {
+            const elems = @as(u64, e.shape[0]) * @as(u64, e.shape[1]);
+            if (elems <= 16 * 1024 * 1024) {
+                max_qf_tile_elems = @max(max_qf_tile_elems, elems);
+            }
+        }
+    }
+
+    var qf_pipes: ?quant_formats.QuantFormatPipelines = null;
+    errdefer if (qf_pipes) |*qfp| qfp.close();
+    if (qf_specs_len > 0 or options.act_quant_policy.isEnabled()) {
+        qf_pipes = try quant_formats.QuantFormatPipelines.initWithOptions(device, library, .{
+            .specs = qf_specs_buf[0..qf_specs_len],
+            .include_moe = need_qf_moe,
+            .include_act_quant = options.act_quant_policy.isEnabled(),
+        });
+    }
+
+    var qf_tile_region: ?page.WiredRegion = null;
+    errdefer if (qf_tile_region) |tr| tr.deinit();
+    var qf_tile_buf: ?metal.Buffer = null;
+    errdefer if (qf_tile_buf) |tb| tb.close();
+    var qf_tile_bytes: u64 = 0;
+    if (qf_specs_len > 0 and wide_enabled and max_qf_tile_elems > 0) {
+        const want_tile = @min(max_qf_tile_elems * @sizeOf(f16), 32 * 1024 * 1024);
+        const tr = try page.WiredRegion.init(@intCast(want_tile));
+        qf_tile_region = tr;
+        qf_tile_buf = try metal.Buffer.wrap(device, tr.bytes);
+        qf_tile_bytes = tr.bytes.len;
+    }
+
+    var act_quant_region: ?page.WiredRegion = null;
+    errdefer if (act_quant_region) |ar| ar.deinit();
+    var act_quant_buf: ?metal.Buffer = null;
+    errdefer if (act_quant_buf) |ab| ab.close();
+    var act_quant_bytes: u64 = 0;
+    if (options.act_quant_policy.isEnabled()) {
+        const max_rows: u64 = @max(@as(u64, m_cap), @as(u64, w_cap));
+        const max_act_k: u64 = @max(
+            @as(u64, h),
+            @max(@as(u64, q_dim), @max(@as(u64, config.intermediate_size), @as(u64, config.moe_intermediate_size))),
+        );
+        const max_moe_inter_rows: u64 = if (config.arch == .qwen3_moe) max_rows * config.num_experts_per_tok else max_rows;
+        const need_act = @max(max_rows * max_act_k, max_moe_inter_rows * config.moe_intermediate_size) * @sizeOf(f16);
+        if (need_act > 0) {
+            const ar = try page.WiredRegion.init(@intCast(need_act));
+            act_quant_region = ar;
+            act_quant_buf = try metal.Buffer.wrap(device, ar.bytes);
+            act_quant_bytes = ar.bytes.len;
+        }
+    }
+
+    const embed_amf_dt = try embed_entry.dataType();
+    var embed_dequant_f32: ?[]f32 = null;
+    errdefer if (embed_dequant_f32) |ed| allocator.free(ed);
+    if (dequant.usesQuantFormats(embed_amf_dt, embed_entry.group_size)) {
+        embed_dequant_f32 = try allocator.alloc(f32, h);
+    }
+
+    // W24: Auto-load embedded `__meta.chat_template_json` (`+ __aminfer_chat_template__`)
+    // or explicit/sidecar `chat_template.json` when present.
+    var loaded_chat_template: ?chat_template_mod.ChatTemplate = null;
+    switch (source) {
+        .file => |f| {
+            const resolved_ct_opt: ?amf.ResolvedMetadata = amf.resolveChatTemplateJsonAlloc(
+                allocator,
+                f.handle,
+                f.path,
+                options.chat_template_json_path,
+            ) catch |err| switch (err) {
+                error.MetadataNotFound, error.OpenFailed => null,
+                else => null,
+            };
+            if (resolved_ct_opt) |resolved_ct_val| {
+                var rct = resolved_ct_val;
+                defer rct.deinit(allocator);
+                loaded_chat_template = chat_template_mod.ChatTemplate.detectFromConfigJson(rct.bytes) catch null;
+            }
+        },
+        .bytes => |b| {
+            const embedded_opt = (b.parsed.extractMetadataFromBytes(b.raw, amf.META_CHAT_TEMPLATE_JSON) catch null) orelse
+                (b.parsed.extractMetadataFromBytes(b.raw, amf.LEGACY_CHAT_TEMPLATE_METADATA_NAME) catch null);
+            if (embedded_opt) |ct_bytes| {
+                loaded_chat_template = chat_template_mod.ChatTemplate.detectFromConfigJson(ct_bytes) catch null;
+            }
+        },
+    }
+
     var compute = try metal.Compute.initWithFrames(device, 2);
     errdefer compute.close();
 
-    // Register every weight shard buffer, scratch buffer, and KV tile in MTLResidencySet.
+    // Register every weight shard buffer, scratch buffer, KV tile, and M8.1 G23/G24 buffer in MTLResidencySet.
     for (shards) |shard| try compute.makeResident(&.{shard.buffer});
     try compute.makeResident(&.{scratch_buf});
+    if (qf_pipes) |*qfp| try qfp.makeResident(compute);
+    if (qf_tile_buf) |tb| try compute.makeResident(&.{tb});
+    if (act_quant_buf) |ab| try compute.makeResident(&.{ab});
     try compute.makeTilesResident(kv_tiles);
 
     // G16 + G17 (`P2`, ADR-0020, ADR-0021): startup `.metallib` numerical canary
@@ -9798,11 +10089,21 @@ fn loadCore(
                 const router_b = try loadBlobIntoShard(source, router_e, l_shard, options.verify_crcs);
                 layer_w.router_layout = router_layout;
                 layer_w.router_param_kind = router_pk;
+                layer_w.router_amf_dtype = router_dt;
+                layer_w.router_group_size = router_e.group_size;
+                layer_w.router_tensor_scale_per_row = dequant.isTensorScalePerRow(router_dt, config.num_experts, router_e.params_bytes);
                 if (router_layout == .sme2_panel64) {
                     has_sme2_weights = true;
                     layer_w.router_panel_dtype = try amfDTypeToPanelDType(router_dt);
                     layer_w.router_sme_packed = router_b.slice[0..@intCast(router_e.data_bytes)];
                     layer_w.router = .{ .logits = .{ .binding = .{ .buffer = scratch_buf, .offset = 0 }, .dtype = .f32 } };
+                } else if (dequant.usesQuantFormats(router_dt, router_e.group_size)) {
+                    layer_w.router_weight = router_b.asBinding();
+                    layer_w.router_params = if (router_e.params_bytes > 0)
+                        .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset }
+                    else
+                        null;
+                    layer_w.router = .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .f16 } };
                 } else {
                     layer_w.router = switch (router_dt) {
                         .f16 => .{ .weights = .{ .binding = router_b.asBinding(), .dtype = .f16 } },
@@ -9837,16 +10138,42 @@ fn loadCore(
                 layer_w.expert_schemes_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(schemes_raw.ptr) };
 
                 var exp_dt: quant.WeightDType = .q3_affine;
+                var exp_amf_dt: amf.DType = .q3_affine;
                 var exp_layout: amf.TensorLayout = .row_major;
                 var exp_pk: amf.QuantParamKind = .affine_scale_bias;
                 var layer_exp_bytes_sum: u64 = 0;
                 const n_exp_usize: usize = config.num_experts;
+
+                // Determine whether this layer uses any G23 multi-format / asymmetric expert scheme.
+                var layer_uses_qf_moe = false;
+                var custom_desc_count: usize = 0;
+                for (0..n_exp_usize) |e_idx| {
+                    const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
+                    const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
+                    const gp_amf = try gp_e.dataType();
+                    const dp_amf = try dp_e.dataType();
+                    if (dequant.usesQuantFormats(gp_amf, gp_e.group_size) or
+                        dequant.usesQuantFormats(dp_amf, dp_e.group_size) or
+                        gp_amf != dp_amf or gp_e.group_size != dp_e.group_size)
+                    {
+                        layer_uses_qf_moe = true;
+                        break;
+                    }
+                }
+                layer_w.uses_quant_formats_moe = layer_uses_qf_moe;
+
                 for (0..n_exp_usize) |e_idx| {
                     const gp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e_idx }) catch unreachable);
                     const gp_dt = try validateLinear2D(gp_e, config.moe_intermediate_size, h);
+                    const gp_amf = try gp_e.dataType();
                     const gp_pk = try gp_e.quantParamKind();
+                    const up_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
+                    const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
+                    const dp_amf = try dp_e.dataType();
+
                     if (e_idx == 0) {
                         exp_dt = gp_dt;
+                        exp_amf_dt = gp_amf;
                         exp_layout = try gp_e.tensorLayout();
                         exp_pk = gp_pk;
                         if (exp_layout == .sme2_panel64) {
@@ -9854,18 +10181,47 @@ fn loadCore(
                             layer_w.expert_sme_blobs = try allocator.alloc(SmeExpertTriple, config.num_experts);
                         }
                     }
-                    const one_exp_e: u64 = try moe.singleExpertBytesForDType(gp_dt, h, config.moe_intermediate_size);
+                    const one_exp_e: u64 = gp_e.data_bytes + gp_e.params_bytes +
+                        up_e.data_bytes + up_e.params_bytes +
+                        dp_e.data_bytes + dp_e.params_bytes;
                     const flat_idx = l * n_exp_usize + e_idx;
                     expert_dtypes[flat_idx] = gp_dt;
                     expert_bytes[flat_idx] = one_exp_e;
                     expert_bytes_u32[flat_idx] = @intCast(@min(one_exp_e, std.math.maxInt(u32)));
                     layer_exp_bytes_sum += one_exp_e;
                     total_expert_bytes_sum += one_exp_e;
-                    schemes_raw[e_idx] = @backingInt(gp_dt);
-                    layer_w.expert_scheme_counts[@backingInt(gp_dt)] += 1;
 
-                    const up_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.up_proj", .{ l, e_idx }) catch unreachable);
-                    const dp_e = try findLinear(parsed, std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e_idx }) catch unreachable);
+                    if (layer_uses_qf_moe) {
+                        const desc: moe.MoeSchemeDesc = .{
+                            .gate_up_dtype = gp_amf,
+                            .gate_up_group_size = gp_e.group_size,
+                            .gate_up_tensor_scale_per_row = dequant.isTensorScalePerRow(gp_amf, config.moe_intermediate_size, gp_e.params_bytes),
+                            .down_dtype = dp_amf,
+                            .down_group_size = dp_e.group_size,
+                            .down_tensor_scale_per_row = dequant.isTensorScalePerRow(dp_amf, h, dp_e.params_bytes),
+                        };
+                        var bucket_idx: ?usize = null;
+                        for (0..custom_desc_count) |bi| {
+                            if (layer_w.expert_scheme_descs[bi].eql(desc)) {
+                                bucket_idx = bi;
+                                break;
+                            }
+                        }
+                        if (bucket_idx == null) {
+                            if (custom_desc_count >= moe.NUM_SCHEME_BUCKETS) return error.UnexpectedTensorDType;
+                            bucket_idx = custom_desc_count;
+                            layer_w.expert_scheme_descs[custom_desc_count] = desc;
+                            custom_desc_count += 1;
+                        }
+                        const bi = bucket_idx.?;
+                        schemes_raw[e_idx] = @intCast(bi);
+                        layer_w.expert_scheme_counts[bi] += 1;
+                    } else {
+                        const bi = @backingInt(gp_dt);
+                        schemes_raw[e_idx] = bi;
+                        layer_w.expert_scheme_counts[bi] += 1;
+                        layer_w.expert_scheme_descs[bi] = moe.MoeSchemeDesc.uniform(gp_amf, gp_e.group_size, false);
+                    }
 
                     if (exp_layout == .sme2_panel64) {
                         const gp_b = try loadBlobIntoShard(source, gp_e, l_shard, options.verify_crcs);
@@ -9879,6 +10235,7 @@ fn loadCore(
                             .up = up_b.slice[0..@intCast(up_e.data_bytes)],
                             .down = dp_b.slice[0..@intCast(dp_e.data_bytes)],
                             .dtype = gp_dt,
+                            .amf_dtype = gp_amf,
                             .param_kind = gp_pk,
                             .is_cold = is_cold,
                         };
@@ -9899,14 +10256,13 @@ fn loadCore(
                     const up_b = try loadBlobIntoShard(source, up_e, l_shard, options.verify_crcs);
                     const dp_b = try loadBlobIntoShard(source, dp_e, l_shard, options.verify_crcs);
 
-                    const is_float = (gp_dt == .f16 or gp_dt == .bf16);
                     const ew: moe.ExpertWeights = .{
                         .gate_qweight_offset = gp_b.offset,
-                        .gate_sb_offset = if (is_float) 0 else gp_b.offset + gp_e.params_offset,
+                        .gate_sb_offset = if (gp_e.params_bytes > 0) gp_b.offset + gp_e.params_offset else 0,
                         .up_qweight_offset = up_b.offset,
-                        .up_sb_offset = if (is_float) 0 else up_b.offset + up_e.params_offset,
+                        .up_sb_offset = if (up_e.params_bytes > 0) up_b.offset + up_e.params_offset else 0,
                         .down_qweight_offset = dp_b.offset,
-                        .down_sb_offset = if (is_float) 0 else dp_b.offset + dp_e.params_offset,
+                        .down_sb_offset = if (dp_e.params_bytes > 0) dp_b.offset + dp_e.params_offset else 0,
                     };
                     exp_tbl[e_idx] = ew;
 
@@ -9926,7 +10282,11 @@ fn loadCore(
                 }
                 layer_w.is_heterogeneous_moe = (active_schemes > 1);
                 if (layer_w.is_heterogeneous_moe) model_is_heterogeneous_moe = true;
+                if (!layer_uses_qf_moe and !layer_w.is_heterogeneous_moe) {
+                    layer_w.expert_scheme_descs[0] = moe.MoeSchemeDesc.uniform(exp_amf_dt, 64, false);
+                }
                 layer_w.expert_dtype = exp_dt;
+                layer_w.expert_amf_dtype = exp_amf_dt;
                 layer_w.expert_layout = exp_layout;
                 layer_w.expert_param_kind = exp_pk;
 
@@ -10112,6 +10472,16 @@ fn loadCore(
         .enable_g18_fusion = options.enable_g18_fusion,
         .g18_qkv_gemm_min_m = options.g18_qkv_gemm_min_m,
         .g18_swiglu_gemm_min_m = options.g18_swiglu_gemm_min_m,
+        .qf_pipes = qf_pipes,
+        .act_quant_policy = options.act_quant_policy,
+        .qf_tile_region = qf_tile_region,
+        .qf_tile_buf = qf_tile_buf,
+        .qf_tile_bytes = qf_tile_bytes,
+        .act_quant_region = act_quant_region,
+        .act_quant_buf = act_quant_buf,
+        .act_quant_bytes = act_quant_bytes,
+        .embed_dequant_f32 = embed_dequant_f32,
+        .chat_template = loaded_chat_template,
     };
 }
 
@@ -11268,7 +11638,7 @@ pub const Qwen3BatchRuntime = struct {
         var frame = try model.compute.beginFrame(model.timeout_ms);
         errdefer frame.abort();
 
-        try model.moe_pipes.encodeEmbedLookup(&frame, model.embed.dtype, .{
+        try model.encodeEmbedLookupUnified(&frame, .{
             .weight = model.embed.weight,
             .scale_bias = model.embed.scale_bias,
             .tokens = .{ .token_ids = model.wp_token_ids_bind },
@@ -11276,7 +11646,7 @@ pub const Qwen3BatchRuntime = struct {
             .m = m,
             .vocab_size = model.config.vocab_size,
             .hidden_size = h,
-        }, false);
+        }, model.wp_token_ids_host, model.wp_x_host, false);
 
         for (model.layers, 0..) |layer, l| {
             const is_last_layer = (l == last_l);
@@ -11572,7 +11942,7 @@ pub const Qwen3BatchRuntime = struct {
 
         {
             const f = try model.ensureOptionalFrame(&frame_opt);
-            try model.moe_pipes.encodeEmbedLookup(f, model.embed.dtype, .{
+            try model.encodeEmbedLookupUnified(f, .{
                 .weight = model.embed.weight,
                 .scale_bias = model.embed.scale_bias,
                 .tokens = .{ .token_ids = model.wp_token_ids_bind },
@@ -11580,7 +11950,7 @@ pub const Qwen3BatchRuntime = struct {
                 .m = m,
                 .vocab_size = model.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, model.wp_token_ids_host, model.wp_x_host, false);
         }
 
         for (model.layers, 0..) |layer, l| {
@@ -11826,7 +12196,7 @@ pub const Qwen3BatchRuntime = struct {
 
         {
             const f = try model.ensureOptionalFrame(&frame_opt);
-            try model.moe_pipes.encodeEmbedLookup(f, model.embed.dtype, .{
+            try model.encodeEmbedLookupUnified(f, .{
                 .weight = model.embed.weight,
                 .scale_bias = model.embed.scale_bias,
                 .tokens = .{ .token_ids = model.tree_token_ids_bind },
@@ -11834,7 +12204,7 @@ pub const Qwen3BatchRuntime = struct {
                 .m = m,
                 .vocab_size = model.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, model.tree_token_ids_host, model.x_host, false);
         }
 
         for (model.layers, 0..) |layer, l| {
@@ -12249,7 +12619,7 @@ pub const Qwen3BatchRuntime = struct {
 
         {
             const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
-            model.moe_pipes.encodeEmbedLookup(f, model.embed.dtype, .{
+            model.encodeEmbedLookupUnified(f, .{
                 .weight = model.embed.weight,
                 .scale_bias = model.embed.scale_bias,
                 .tokens = .{ .token_ids = model.tree_token_ids_bind },
@@ -12257,7 +12627,7 @@ pub const Qwen3BatchRuntime = struct {
                 .m = b_u32,
                 .vocab_size = model.config.vocab_size,
                 .hidden_size = h,
-            }, false) catch return error.DecodeFailed;
+            }, model.tree_token_ids_host, model.x_host, false) catch return error.DecodeFailed;
         }
 
         const ret_pool_bind: ?metal.BufferBinding = if (self.retired_pool) |rp| rp.binding(self.batch_buf) else null;
@@ -12510,7 +12880,7 @@ pub const Qwen3BatchRuntime = struct {
 
         {
             const f = model.ensureOptionalFrame(&frame_opt) catch return error.DecodeFailed;
-            model.moe_pipes.encodeEmbedLookup(f, model.embed.dtype, .{
+            model.encodeEmbedLookupUnified(f, .{
                 .weight = model.embed.weight,
                 .scale_bias = model.embed.scale_bias,
                 .tokens = .{ .token_ids = model.tree_token_ids_bind },
@@ -12518,7 +12888,7 @@ pub const Qwen3BatchRuntime = struct {
                 .m = b_u32,
                 .vocab_size = model.config.vocab_size,
                 .hidden_size = h,
-            }, false) catch return error.DecodeFailed;
+            }, model.tree_token_ids_host, model.x_host, false) catch return error.DecodeFailed;
         }
 
         const ret_pool_bind: ?metal.BufferBinding = if (self.retired_pool) |rp| rp.binding(self.batch_buf) else null;

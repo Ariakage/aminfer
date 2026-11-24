@@ -3,14 +3,13 @@
 //! (G24) host pipeline manager, CPU reference parity decoders, and `M = 1` bus
 //! bandwidth calibration helper (ADR-0024).
 //!
-//! Imports only `std`, `../bridge/metal.zig`, and `../mem/page.zig` so Phase 1
-//! builds and tests stand completely independently of `src/root.zig`,
-//! `src/format/amf.zig`, and `src/quant/spec.zig`. Zero steady-state heap
+//! Unified with `src/format/amf.zig` (`DType 0..37`); zero steady-state heap
 //! allocations; every GPU buffer is 16 KiB page-aligned and wired.
 
 const std = @import("std");
 const metal = @import("../bridge/metal.zig");
 const page = @import("../mem/page.zig");
+const amf = @import("../format/amf.zig");
 
 pub const APPLE_PAGE_SIZE: usize = page.APPLE_PAGE_SIZE;
 
@@ -50,6 +49,17 @@ pub const DType = enum(u8) {
     gguf_tq2_0 = 35,
     gguf_mxfp4 = 36,
     gguf_q2_0 = 37,
+
+    pub fn fromAmf(dt: amf.DType) ?DType {
+        return switch (dt) {
+            .f16, .f32, .bf16, .u32 => null,
+            else => @fromBackingInt(@backingInt(dt)),
+        };
+    }
+
+    pub fn toAmf(self: DType) amf.DType {
+        return @fromBackingInt(@backingInt(self));
+    }
 
     pub fn isAffine(self: DType) bool {
         return switch (self) {
@@ -302,6 +312,78 @@ pub const ActQuantMode = enum(u8) {
             .fp8_g128 => 128,
             .nvfp4_g16, .nvfp4_fouroversix_mae => 16,
         };
+    }
+
+    pub fn label(self: ActQuantMode) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .mxfp8_g32 => "mxfp8_g32",
+            .fp8_g128 => "fp8_g128",
+            .nvfp4_g16 => "nvfp4_g16",
+            .nvfp4_fouroversix_mae => "fouroversix_mae",
+        };
+    }
+};
+
+/// CLI / runtime activation-quantization emulation policy (`G24`).
+/// `.none` is the default (`0` extra dispatches). `.emulate` auto-selects
+/// the matching mode from the tensor's quantized `amf.DType` (`nvfp4_g16` for
+/// FP4 tensors, `mxfp8_g32` for `mxfp8_g32`, `fp8_g128` for FP8 tensors, and
+/// falls back to the tightest K-aligned mode among `nvfp4_g16`/`mxfp8_g32`/`fp8_g128`).
+pub const ActQuantPolicy = enum(u8) {
+    none = 0,
+    emulate = 1,
+    mxfp8_g32 = 2,
+    fp8_g128 = 3,
+    nvfp4_g16 = 4,
+    fouroversix_mae = 5,
+
+    pub fn parse(raw: []const u8) ?ActQuantPolicy {
+        if (std.mem.eql(u8, raw, "none")) return .none;
+        if (std.mem.eql(u8, raw, "emulate")) return .emulate;
+        if (std.mem.eql(u8, raw, "mxfp8_g32")) return .mxfp8_g32;
+        if (std.mem.eql(u8, raw, "fp8_g128")) return .fp8_g128;
+        if (std.mem.eql(u8, raw, "nvfp4_g16")) return .nvfp4_g16;
+        if (std.mem.eql(u8, raw, "fouroversix_mae") or std.mem.eql(u8, raw, "nvfp4_fouroversix_mae")) {
+            return .fouroversix_mae;
+        }
+        return null;
+    }
+
+    pub fn label(self: ActQuantPolicy) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .emulate => "emulate",
+            .mxfp8_g32 => "mxfp8_g32",
+            .fp8_g128 => "fp8_g128",
+            .nvfp4_g16 => "nvfp4_g16",
+            .fouroversix_mae => "fouroversix_mae",
+        };
+    }
+
+    pub fn isEnabled(self: ActQuantPolicy) bool {
+        return self != .none;
+    }
+
+    /// Resolves the concrete `ActQuantMode` for a linear/MoE projection of
+    /// weight `dtype` and inner dimension `k`. Returns `.none` when `self == .none`
+    /// or when `k` is not divisible by the selected mode's block alignment.
+    pub fn resolveForTensor(self: ActQuantPolicy, dtype: amf.DType, k: u32) ActQuantMode {
+        const candidate: ActQuantMode = switch (self) {
+            .none => return .none,
+            .mxfp8_g32 => .mxfp8_g32,
+            .fp8_g128 => .fp8_g128,
+            .nvfp4_g16 => .nvfp4_g16,
+            .fouroversix_mae => .nvfp4_fouroversix_mae,
+            .emulate => switch (dtype) {
+                .nvfp4_g16, .gguf_mxfp4 => .nvfp4_g16,
+                .mxfp8_g32 => .mxfp8_g32,
+                .fp8_e4m3_block, .fp8_e4m3_row, .fp8_e4m3_tensor => if (k % 128 == 0) .fp8_g128 else .mxfp8_g32,
+                else => if (k % 16 == 0) .nvfp4_g16 else if (k % 32 == 0) .mxfp8_g32 else .fp8_g128,
+            },
+        };
+        if (k == 0 or (k % candidate.requiredKAlign()) != 0) return .none;
+        return candidate;
     }
 };
 
@@ -2375,6 +2457,7 @@ pub const MoeGateUpArgs = struct {
     swiglu_limit: f32 = 0.0,
     tensor_scale_per_row: bool = false,
     nvfp4_outer_scale: ?f32 = null,
+    indirect_args: ?metal.BufferBinding = null,
 };
 
 pub const MoeDownArgs = struct {
@@ -2394,6 +2477,7 @@ pub const MoeDownArgs = struct {
     top_k: u32,
     tensor_scale_per_row: bool = false,
     nvfp4_outer_scale: ?f32 = null,
+    indirect_args: ?metal.BufferBinding = null,
 };
 
 pub const ActQuantArgs = struct {
@@ -2856,42 +2940,38 @@ pub const QuantFormatPipelines = struct {
         const groups_x: u64 = (@as(u64, args.intermediate_size) + 7) / 8;
         if (dtype.needsCodebook()) {
             const cb = metal.BufferBinding{ .buffer = self.codebook_buf, .offset = dtype.codebookOffset() };
-            try frame.encodeThreadgroups(
-                pipe,
-                &.{
-                    args.x,
-                    args.weights_base,
-                    args.expert_table,
-                    args.sched_hdr,
-                    args.unique_experts,
-                    args.expert_token_offsets,
-                    args.token_indices,
-                    args.inter,
-                    cb,
-                },
-                std.mem.asBytes(&mp),
-                .{ groups_x, args.num_unique_experts, 1 },
-                .{ 128, 1, 1 },
-                insert_barrier_before,
-            );
+            const bindings = [_]metal.BufferBinding{
+                args.x,
+                args.weights_base,
+                args.expert_table,
+                args.sched_hdr,
+                args.unique_experts,
+                args.expert_token_offsets,
+                args.token_indices,
+                args.inter,
+                cb,
+            };
+            if (args.indirect_args) |ind| {
+                try frame.encodeThreadgroupsIndirect(pipe, &bindings, std.mem.asBytes(&mp), ind, .{ 128, 1, 1 }, insert_barrier_before);
+            } else {
+                try frame.encodeThreadgroups(pipe, &bindings, std.mem.asBytes(&mp), .{ groups_x, args.num_unique_experts, 1 }, .{ 128, 1, 1 }, insert_barrier_before);
+            }
         } else {
-            try frame.encodeThreadgroups(
-                pipe,
-                &.{
-                    args.x,
-                    args.weights_base,
-                    args.expert_table,
-                    args.sched_hdr,
-                    args.unique_experts,
-                    args.expert_token_offsets,
-                    args.token_indices,
-                    args.inter,
-                },
-                std.mem.asBytes(&mp),
-                .{ groups_x, args.num_unique_experts, 1 },
-                .{ 128, 1, 1 },
-                insert_barrier_before,
-            );
+            const bindings = [_]metal.BufferBinding{
+                args.x,
+                args.weights_base,
+                args.expert_table,
+                args.sched_hdr,
+                args.unique_experts,
+                args.expert_token_offsets,
+                args.token_indices,
+                args.inter,
+            };
+            if (args.indirect_args) |ind| {
+                try frame.encodeThreadgroupsIndirect(pipe, &bindings, std.mem.asBytes(&mp), ind, .{ 128, 1, 1 }, insert_barrier_before);
+            } else {
+                try frame.encodeThreadgroups(pipe, &bindings, std.mem.asBytes(&mp), .{ groups_x, args.num_unique_experts, 1 }, .{ 128, 1, 1 }, insert_barrier_before);
+            }
         }
     }
 
@@ -2928,46 +3008,42 @@ pub const QuantFormatPipelines = struct {
         const groups_x: u64 = (@as(u64, args.hidden_size) + 7) / 8;
         if (dtype.needsCodebook()) {
             const cb = metal.BufferBinding{ .buffer = self.codebook_buf, .offset = dtype.codebookOffset() };
-            try frame.encodeThreadgroups(
-                pipe,
-                &.{
-                    args.inter,
-                    args.weights_base,
-                    args.expert_table,
-                    args.sched_hdr,
-                    args.unique_experts,
-                    args.expert_token_offsets,
-                    args.token_indices,
-                    args.routing_weights,
-                    args.slot_k_indices,
-                    args.down_out,
-                    cb,
-                },
-                std.mem.asBytes(&mp),
-                .{ groups_x, args.num_unique_experts, 1 },
-                .{ 128, 1, 1 },
-                insert_barrier_before,
-            );
+            const bindings = [_]metal.BufferBinding{
+                args.inter,
+                args.weights_base,
+                args.expert_table,
+                args.sched_hdr,
+                args.unique_experts,
+                args.expert_token_offsets,
+                args.token_indices,
+                args.routing_weights,
+                args.slot_k_indices,
+                args.down_out,
+                cb,
+            };
+            if (args.indirect_args) |ind| {
+                try frame.encodeThreadgroupsIndirect(pipe, &bindings, std.mem.asBytes(&mp), ind, .{ 128, 1, 1 }, insert_barrier_before);
+            } else {
+                try frame.encodeThreadgroups(pipe, &bindings, std.mem.asBytes(&mp), .{ groups_x, args.num_unique_experts, 1 }, .{ 128, 1, 1 }, insert_barrier_before);
+            }
         } else {
-            try frame.encodeThreadgroups(
-                pipe,
-                &.{
-                    args.inter,
-                    args.weights_base,
-                    args.expert_table,
-                    args.sched_hdr,
-                    args.unique_experts,
-                    args.expert_token_offsets,
-                    args.token_indices,
-                    args.routing_weights,
-                    args.slot_k_indices,
-                    args.down_out,
-                },
-                std.mem.asBytes(&mp),
-                .{ groups_x, args.num_unique_experts, 1 },
-                .{ 128, 1, 1 },
-                insert_barrier_before,
-            );
+            const bindings = [_]metal.BufferBinding{
+                args.inter,
+                args.weights_base,
+                args.expert_table,
+                args.sched_hdr,
+                args.unique_experts,
+                args.expert_token_offsets,
+                args.token_indices,
+                args.routing_weights,
+                args.slot_k_indices,
+                args.down_out,
+            };
+            if (args.indirect_args) |ind| {
+                try frame.encodeThreadgroupsIndirect(pipe, &bindings, std.mem.asBytes(&mp), ind, .{ 128, 1, 1 }, insert_barrier_before);
+            } else {
+                try frame.encodeThreadgroups(pipe, &bindings, std.mem.asBytes(&mp), .{ groups_x, args.num_unique_experts, 1 }, .{ 128, 1, 1 }, insert_barrier_before);
+            }
         }
     }
 

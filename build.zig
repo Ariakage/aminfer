@@ -212,49 +212,24 @@ pub fn build(b: *std.Build) void {
     const run_sdk_test = b.addRunArtifact(sdk_test);
     b.step("test-sdk", "Run M7.5 C17 libaminfer C-ABI unit tests").dependOn(&run_sdk_test.step);
 
-    // Dedicated M8.1 G23/G24 multi-format quantization module tests (`zig build test-quant-formats`),
-    // plus sequential inclusion in `zig build test` without editing `src/root.zig` in Phase 1.
-    // Stage the three files under a single synthetic `src/` tree in `WriteFile` so `quant_formats.zig`
-    // and `metal.zig` resolve `../bridge/metal.zig` and `../mem/page.zig` cleanly inside one module.
-    const qf_wf = b.addWriteFiles();
-    _ = qf_wf.addCopyFile(b.path("src/mem/page.zig"), "mem/page.zig");
-    _ = qf_wf.addCopyFile(b.path("src/bridge/metal.zig"), "bridge/metal.zig");
-    _ = qf_wf.addCopyFile(b.path("src/gpu/quant_formats.zig"), "gpu/quant_formats.zig");
-    const qf_root = qf_wf.add("quant_formats_test_root.zig",
-        \\test {
-        \\    _ = @import("gpu/quant_formats.zig");
-        \\}
-        \\
-    );
-    const quant_formats_mod = b.createModule(.{
-        .root_source_file = qf_root,
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
+    // Dedicated M8.1 G23/G24 multi-format quantization test step (`zig build test-quant-formats`),
+    // filtering `gpu.quant_formats.*` and `quant.formats.*` from the unified root library module.
+    const quant_formats_test = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{ "gpu.quant_formats.", "quant.formats." },
     });
-    quant_formats_mod.addImport("apple_bridge", bridge_mod);
-    quant_formats_mod.addAnonymousImport("aminfer_metallib", .{ .root_source_file = metallib });
-    quant_formats_mod.addIncludePath(b.path("src/bridge"));
-    addMacosSdkPaths(b, quant_formats_mod, sdk);
-    quant_formats_mod.addCSourceFiles(.{ .files = &.{"src/bridge/apple_bridge.m"}, .flags = &objc_flags });
-    for (frameworks) |name| quant_formats_mod.linkFramework(name, .{});
-
-    const quant_formats_test = b.addTest(.{ .root_module = quant_formats_mod });
     const run_quant_formats_test = b.addRunArtifact(quant_formats_test);
     b.step("test-quant-formats", "Run M8.1 G23/G24 multi-format Metal 4 quantization tests").dependOn(&run_quant_formats_test.step);
 
     const run_mod_test = b.addRunArtifact(b.addTest(.{ .root_module = mod }));
     const run_exe_test = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
-    const run_quant_formats_in_all = b.addRunArtifact(quant_formats_test);
     run_exe_test.step.dependOn(&run_mod_test.step);
     run_sdk_test.step.dependOn(&run_exe_test.step);
-    run_quant_formats_in_all.step.dependOn(&run_sdk_test.step);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_test.step);
     test_step.dependOn(&run_exe_test.step);
     test_step.dependOn(&run_sdk_test.step);
-    test_step.dependOn(&run_quant_formats_in_all.step);
 }
 
 /// Resolves the active macOS SDK path once per build invocation.

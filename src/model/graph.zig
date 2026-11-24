@@ -27,9 +27,11 @@ const arena_mod = @import("../mem/arena.zig");
 const quant = @import("../quant/spec.zig");
 const amf = @import("../format/amf.zig");
 const dequant = @import("../gpu/dequant.zig");
+const quant_formats = @import("../gpu/quant_formats.zig");
 const attention = @import("../gpu/attention.zig");
 const moe = @import("../gpu/moe.zig");
 const hybrid = @import("../gpu/hybrid.zig");
+const chat_template_mod = @import("chat_template.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const chip_profile_mod = @import("../platform/chip_profile.zig");
 const aio = @import("../storage/aio.zig");
@@ -1183,6 +1185,10 @@ pub const GraphLoadOptions = struct {
     vision_max_patches: u32 = 1024,
     /// Force the zero-overhead `VisionTowerRuntime.initTextOnly()` fast path even on multimodal `.amf` files.
     disable_vision_tower: bool = false,
+
+    // M8.1 Multi-format Quantization (`G23`), Activation Quantization (`G24`), and ChatTemplate (`W24`)
+    act_quant_policy: quant_formats.ActQuantPolicy = .none,
+    chat_template_json_path: ?[]const u8 = null,
 };
 
 pub const M7Stats = struct {
@@ -1238,6 +1244,7 @@ pub const GraphLoadError = error{
     OutOfMemory,
 } || amf.ParseError || amf.IoError || metal.Error || sysinfo.Error || vmstat.Error ||
     budget_mod.PlanError || dequant.InitError || dequant.CanaryError ||
+    quant_formats.InitError || quant_formats.ShapeError ||
     page.ShareError || expert.NvmeExpert.InitError || expert.PeerExpert.InitError ||
     expert_parallel.PlanError || expert_parallel.ClusterError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError || hybrid.ArenaError || hybrid.HybridKvRing.InitError ||
@@ -1488,6 +1495,9 @@ const GraphLayerWeights = struct {
     router_binding: metal.BufferBinding = undefined,
     router_dtype: moe.RouterWeightDType = .bf16,
     router_quant_dtype: ?quant.WeightDType = null,
+    router_amf_dtype: amf.DType = .bf16,
+    router_group_size: u16 = 64,
+    router_tensor_scale_per_row: bool = false,
     router_scale_bias: ?metal.BufferBinding = null,
     expert_weights_buf: metal.Buffer = undefined,
     expert_table: metal.BufferBinding = undefined,
@@ -1495,6 +1505,10 @@ const GraphLayerWeights = struct {
     expert_weight_dtype: quant.WeightDType = .q3_affine,
     expert_dtypes_binding: ?metal.BufferBinding = null,
     expert_scheme_counts: [moe.NUM_SCHEME_BUCKETS]u32 = @splat(0),
+    expert_scheme_descs: [moe.NUM_SCHEME_BUCKETS]moe.MoeSchemeDesc = .{
+        .{}, .{}, .{}, .{}, .{},
+    },
+    uses_quant_formats_moe: bool = false,
     is_hetero_moe: bool = false,
     has_cold_experts: bool = false,
     cold_expert_count: u32 = 0,
@@ -1503,6 +1517,9 @@ const GraphLayerWeights = struct {
     shared_expert: ?moe.ExpertWeights = null,
     shared_expert_buf: ?metal.Buffer = null,
     shared_expert_dtype: ?quant.WeightDType = null,
+    shared_expert_amf_dtype: ?amf.DType = null,
+    shared_expert_group_size: u16 = 64,
+    shared_expert_tensor_scale_per_row: bool = false,
     shared_gate_weight: ?metal.BufferBinding = null,
     shared_gate_dtype: moe.RouterWeightDType = .bf16,
 };
@@ -1774,6 +1791,18 @@ pub const GraphModel = struct {
     // M7.8 Native Full Vision Tower (`W20`, `G22`, `C16`/`D5`, ADR-0023 §5)
     vision_state: GraphVisionState = .{},
 
+    // M8.1 Multi-format Quantization (`G23`), Activation Quantization (`G24`), and ChatTemplate (`W24`)
+    qf_pipes: ?quant_formats.QuantFormatPipelines = null,
+    act_quant_policy: quant_formats.ActQuantPolicy = .none,
+    qf_tile_region: ?page.WiredRegion = null,
+    qf_tile_buf: ?metal.Buffer = null,
+    qf_tile_bytes: u64 = 0,
+    act_quant_region: ?page.WiredRegion = null,
+    act_quant_buf: ?metal.Buffer = null,
+    act_quant_bytes: u64 = 0,
+    embed_dequant_f32: ?[]f32 = null,
+    chat_template: ?chat_template_mod.ChatTemplate = null,
+
     pub fn hasVisionTower(self: *const GraphModel) bool {
         return self.vision_state.runtime.isActive();
     }
@@ -1921,6 +1950,12 @@ pub const GraphModel = struct {
         allocator.free(self.token_history);
         allocator.free(self.ple_row_indices_host);
         if (self.active_tile_phys_ring.len > 0) allocator.free(self.active_tile_phys_ring);
+        if (self.embed_dequant_f32) |ed| allocator.free(ed);
+        if (self.qf_pipes) |*qfp| qfp.close();
+        if (self.qf_tile_buf) |tb| tb.close();
+        if (self.qf_tile_region) |tr| tr.deinit();
+        if (self.act_quant_buf) |ab| ab.close();
+        if (self.act_quant_region) |ar| ar.deinit();
 
         self.hybrid_pipes.close();
         self.moe_pipes.close();
@@ -2325,51 +2360,26 @@ pub const GraphModel = struct {
         residual: ?metal.BufferBinding,
         barrier_before: bool,
     ) dequant.EncodeError!void {
-        switch (lin.dtype) {
-            .q2_affine => try self.dequant_pipes.encodeGemv(frame, .q2, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-            .q3_affine => try self.dequant_pipes.encodeGemv(frame, .q3, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-            .q4_affine => try self.dequant_pipes.encodeGemv(frame, .q4, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-            .f16 => try self.dequant_pipes.encodeDenseGemv(frame, .f16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-            .bf16 => try self.dequant_pipes.encodeDenseGemv(frame, .bf16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-        }
+        const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+        const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        return self.dequant_pipes.encodeLinearUnified(frame, .{
+            .amf_dtype = lin.effectiveAmfDType(),
+            .group_size = lin.group_size,
+            .tensor_scale_per_row = lin.tensor_scale_per_row,
+            .weight = lin.weight,
+            .params = lin.scale_bias,
+            .x = x,
+            .y = y,
+            .residual = residual,
+            .m = 1,
+            .n = lin.n,
+            .k = lin.k,
+            .mode = .gemv,
+            .qf_pipes = qf_ptr,
+            .act_quant_policy = self.act_quant_policy,
+            .act_scratch = act_b,
+            .act_scratch_bytes = self.act_quant_bytes,
+        }, barrier_before);
     }
 
     pub fn encodeLinearBatched(
@@ -2397,56 +2407,26 @@ pub const GraphModel = struct {
         if (m == 1) {
             return self.encodeLinearGemvResidual(frame, lin, x, y, residual, barrier_before);
         }
-        switch (lin.dtype) {
-            .q2_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q2, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-            .q3_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q3, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-            .q4_affine => try self.dequant_pipes.encodeGemvBatch(frame, .q4, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-            .f16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .f16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-            .bf16 => try self.dequant_pipes.encodeDenseGemvBatch(frame, .bf16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .residual = residual,
-            }, barrier_before),
-        }
+        const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+        const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        return self.dequant_pipes.encodeLinearUnified(frame, .{
+            .amf_dtype = lin.effectiveAmfDType(),
+            .group_size = lin.group_size,
+            .tensor_scale_per_row = lin.tensor_scale_per_row,
+            .weight = lin.weight,
+            .params = lin.scale_bias,
+            .x = x,
+            .y = y,
+            .residual = residual,
+            .m = m,
+            .n = lin.n,
+            .k = lin.k,
+            .mode = .batched,
+            .qf_pipes = qf_ptr,
+            .act_quant_policy = self.act_quant_policy,
+            .act_scratch = act_b,
+            .act_scratch_bytes = self.act_quant_bytes,
+        }, barrier_before);
     }
 
     pub fn encodeLinearGemmWithTile(
@@ -2476,61 +2456,29 @@ pub const GraphModel = struct {
         if (m < 16) {
             return self.encodeLinearBatchedResidual(frame, lin, x, y, residual, m, barrier_before);
         }
-        switch (lin.dtype) {
-            .q2_affine => try self.dequant_pipes.encodeGemm(frame, .q2, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, barrier_before),
-            .q3_affine => try self.dequant_pipes.encodeGemm(frame, .q3, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, barrier_before),
-            .q4_affine => try self.dequant_pipes.encodeGemm(frame, .q4, .{
-                .x = x,
-                .qweight = lin.weight,
-                .scale_bias = lin.scale_bias.?,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, barrier_before),
-            .f16 => try self.dequant_pipes.encodeDenseGemm(frame, .f16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, barrier_before),
-            .bf16 => try self.dequant_pipes.encodeDenseGemm(frame, .bf16, .{
-                .x = x,
-                .weight = lin.weight,
-                .y = y,
-                .m = m,
-                .n = lin.n,
-                .k = lin.k,
-                .wide_tile = wide_tile,
-                .residual = residual,
-            }, barrier_before),
-        }
+        const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+        const tile_b: ?metal.BufferBinding = if (self.qf_tile_buf) |tb| .{ .buffer = tb, .offset = 0 } else null;
+        const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        return self.dequant_pipes.encodeLinearUnified(frame, .{
+            .amf_dtype = lin.effectiveAmfDType(),
+            .group_size = lin.group_size,
+            .tensor_scale_per_row = lin.tensor_scale_per_row,
+            .weight = lin.weight,
+            .params = lin.scale_bias,
+            .x = x,
+            .y = y,
+            .residual = residual,
+            .m = m,
+            .n = lin.n,
+            .k = lin.k,
+            .mode = if (wide_tile) .gemm_wide else .gemm32,
+            .qf_pipes = qf_ptr,
+            .tile_f16 = tile_b,
+            .tile_f16_bytes = self.qf_tile_bytes,
+            .act_quant_policy = self.act_quant_policy,
+            .act_scratch = act_b,
+            .act_scratch_bytes = self.act_quant_bytes,
+        }, barrier_before);
     }
 
     fn encodeLinearByModeResidual(
@@ -2575,12 +2523,15 @@ pub const GraphModel = struct {
         mode: qwen3.Qwen3Model.LinearDispatchMode,
         barrier_before: bool,
     ) dequant.EncodeError!void {
-        const q_amf = dequant.weightDTypeToAmf(q_proj.dtype);
-        const k_amf = dequant.weightDTypeToAmf(k_proj.dtype);
-        const v_amf = dequant.weightDTypeToAmf(v_proj.dtype);
+        const q_amf = q_proj.effectiveAmfDType();
+        const k_amf = k_proj.effectiveAmfDType();
+        const v_amf = v_proj.effectiveAmfDType();
+        const any_qf = dequant.usesQuantFormats(q_amf, q_proj.group_size) or
+            dequant.usesQuantFormats(k_amf, k_proj.group_size) or
+            dequant.usesQuantFormats(v_amf, v_proj.group_size);
         const use_nax_wide = mode == .gemm_wide and m >= 64 and self.dequant_pipes.activeBackend().isNax();
         const allow_fused_m = (m == 1) or (mode != .batched_gemv and m >= self.g18_qkv_gemm_min_m);
-        if (self.enable_g18_fusion and allow_fused_m and !use_nax_wide and dequant.canFuseQkv(q_amf, k_amf, v_amf)) {
+        if (self.enable_g18_fusion and !self.act_quant_policy.isEnabled() and !any_qf and allow_fused_m and !use_nax_wide and dequant.canFuseQkv(q_amf, k_amf, v_amf)) {
             const path = self.dequant_pipes.encodeFusedQkvGemm(frame, .{
                 .x = x,
                 .q = qkvProjBinding(q_proj, q_out),
@@ -2595,9 +2546,10 @@ pub const GraphModel = struct {
             };
             if (path == .fused) return;
         }
+        const seq_barrier = self.act_quant_policy.isEnabled() or (any_qf and m >= 16);
         try self.encodeLinearByModeResidual(frame, q_proj, x, q_out, null, m, mode, barrier_before);
-        try self.encodeLinearByModeResidual(frame, k_proj, x, k_out, null, m, mode, false);
-        try self.encodeLinearByModeResidual(frame, v_proj, x, v_out, null, m, mode, false);
+        try self.encodeLinearByModeResidual(frame, k_proj, x, k_out, null, m, mode, seq_barrier);
+        try self.encodeLinearByModeResidual(frame, v_proj, x, v_out, null, m, mode, seq_barrier);
     }
 
     fn encodeDenseGateUpAct(
@@ -2613,10 +2565,12 @@ pub const GraphModel = struct {
         mode: qwen3.Qwen3Model.LinearDispatchMode,
         barrier_before: bool,
     ) GraphStepError!void {
-        const g_amf = dequant.weightDTypeToAmf(gate_proj.dtype);
-        const u_amf = dequant.weightDTypeToAmf(up_proj.dtype);
+        const g_amf = gate_proj.effectiveAmfDType();
+        const u_amf = up_proj.effectiveAmfDType();
+        const any_qf = dequant.usesQuantFormats(g_amf, gate_proj.group_size) or
+            dequant.usesQuantFormats(u_amf, up_proj.group_size);
         const allow_fused_m = (mode != .batched_gemv and m >= self.g18_swiglu_gemm_min_m);
-        if (self.enable_g18_fusion and allow_fused_m and dequant.canFuseGateUp(g_amf, u_amf)) {
+        if (self.enable_g18_fusion and !self.act_quant_policy.isEnabled() and !any_qf and allow_fused_m and dequant.canFuseGateUp(g_amf, u_amf)) {
             var used_fused = true;
             self.dequant_pipes.encodeDenseGateUpSwiglu(frame, .{
                 .x = x_norm,
@@ -2638,8 +2592,9 @@ pub const GraphModel = struct {
             };
             if (used_fused) return;
         }
+        const seq_barrier = self.act_quant_policy.isEnabled() or (any_qf and m >= 16);
         try self.encodeLinearByModeResidual(frame, gate_proj, x_norm, gate_out, null, m, mode, barrier_before);
-        try self.encodeLinearByModeResidual(frame, up_proj, x_norm, up_out, null, m, mode, false);
+        try self.encodeLinearByModeResidual(frame, up_proj, x_norm, up_out, null, m, mode, seq_barrier);
         try self.moe_pipes.encodeSiluMul(frame, .{
             .gate = gate_out,
             .up = up_out,
@@ -2962,7 +2917,7 @@ pub const GraphModel = struct {
         var frame = try self.compute.beginFrame(self.timeout_ms);
         errdefer frame.abort();
 
-        try self.moe_pipes.encodeEmbedLookup(&frame, self.embed.dtype, .{
+        try self.encodeEmbedLookupUnified(&frame, .{
             .weight = self.embed.weight,
             .scale_bias = self.embed.scale_bias,
             .tokens = .{ .token_ids = self.wp_token_ids_bind },
@@ -2970,7 +2925,7 @@ pub const GraphModel = struct {
             .m = m,
             .vocab_size = self.config.vocab_size,
             .hidden_size = h,
-        }, false);
+        }, self.wp_token_ids_host, self.wp_x_host, false);
 
         if (self.wp_gr_arena) |*gr| {
             try self.hybrid_pipes.encodeGrInitStream0(&frame, .{
@@ -4246,20 +4201,8 @@ pub const GraphModel = struct {
                     var f_opt: ?metal.Compute.Frame = frame.*;
                     try self.execClusterMoeFfn(&f_opt, l, layer, ws_ptr, router_src, self.wp_x_norm_bind, self.wp_x_norm_host, self.wp_proj_out_bind, self.wp_proj_out_host, eff_x_bind, eff_m, layer_top_k, needs_proj_out);
                     frame.* = f_opt orelse try self.compute.beginFrame(self.timeout_ms);
-                } else if (layer.is_hetero_moe) {
-                    try self.moe_pipes.encodeMoELayerHetero(frame, .{
-                        .base = moe_args,
-                        .expert_schemes = layer.expert_dtypes_binding.?,
-                        .scheme_counts = layer.expert_scheme_counts,
-                    }, true);
                 } else {
-                    switch (layer.expert_weight_dtype) {
-                        .q2_affine => try self.moe_pipes.encodeMoELayer(frame, .q2, moe_args, true),
-                        .q3_affine => try self.moe_pipes.encodeMoELayer(frame, .q3, moe_args, true),
-                        .q4_affine => try self.moe_pipes.encodeMoELayer(frame, .q4, moe_args, true),
-                        .f16 => try self.moe_pipes.encodeMoELayerFloat(frame, .f16, moe_args, true),
-                        .bf16 => try self.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, true),
-                    }
+                    try self.encodeMoELayerDispatch(frame, layer, moe_args, true);
                 }
                 if (self.wp_mhc_arena) |*mhc| {
                     try self.encodeMhcPost(frame, mhc.binding(self.scratch_buf), self.wp_proj_out_bind, layer.mhc.?, eff_m, true);
@@ -5322,7 +5265,7 @@ pub const GraphModel = struct {
         // 1. Token embedding lookup `[m, H]` + optional GPU visual token override (`G14`).
         {
             const f = try self.ensureFrame(&frame_opt);
-            try self.moe_pipes.encodeEmbedLookup(f, self.embed.dtype, .{
+            try self.encodeEmbedLookupUnified(f, .{
                 .weight = self.embed.weight,
                 .scale_bias = self.embed.scale_bias,
                 .tokens = .{ .token_ids = self.token_ids_bind },
@@ -5330,7 +5273,7 @@ pub const GraphModel = struct {
                 .m = m,
                 .vocab_size = self.config.vocab_size,
                 .hidden_size = h,
-            }, false);
+            }, self.token_ids_host, self.x_host, false);
 
             if (vis_override) |vov| {
                 const row_bytes: u64 = @as(u64, h) * @sizeOf(f16);
@@ -6509,6 +6452,30 @@ pub const GraphModel = struct {
                         .num_experts = self.config.num_experts,
                         .hidden_size = h,
                     }, true),
+                    .quant_format => |qfr| {
+                        if (m == 1) {
+                            try qfr.qf_pipes.encodeGemv(f, qfr.dtype, qfr.group_size, .{
+                                .x = self.x_norm_bind,
+                                .qweight = qfr.qweight,
+                                .params = qfr.params,
+                                .y = logits_bind,
+                                .n = self.config.num_experts,
+                                .k = h,
+                                .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                            }, true);
+                        } else {
+                            try qfr.qf_pipes.encodeGemvBatch(f, qfr.dtype, qfr.group_size, .{
+                                .x = self.x_norm_bind,
+                                .qweight = qfr.qweight,
+                                .params = qfr.params,
+                                .y = logits_bind,
+                                .m = m,
+                                .n = self.config.num_experts,
+                                .k = h,
+                                .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                            }, true);
+                        }
+                    },
                     .logits => {},
                 }
             }
@@ -6661,27 +6628,120 @@ pub const GraphModel = struct {
         }
     }
 
-    fn encodeMoELayerDispatch(
+    pub fn encodeMoELayerDispatch(
         self: *const GraphModel,
         frame: *metal.Compute.Frame,
         layer: *const GraphLayerWeights,
         args: moe.MoELayerArgs,
         barrier_before: bool,
     ) moe.EncodeError!void {
+        var resolved_args = args;
+        const router_uses_qf = dequant.usesQuantFormats(layer.router_amf_dtype, layer.router_group_size);
+        if (router_uses_qf and resolved_args.router != .logits) {
+            const qfp = if (self.qf_pipes) |*p| p else return error.PipelineNotInitialized;
+            const r_dt = quant_formats.DType.fromAmf(layer.router_amf_dtype) orelse return error.InvalidArgument;
+            resolved_args.router = .{ .quant_format = .{
+                .dtype = r_dt,
+                .group_size = layer.router_group_size,
+                .tensor_scale_per_row = layer.router_tensor_scale_per_row,
+                .qweight = layer.router_binding,
+                .params = layer.router_scale_bias,
+                .qf_pipes = qfp,
+            } };
+        }
+        const se_uses_qf = if (layer.shared_expert_amf_dtype) |se_dt|
+            dequant.usesQuantFormats(se_dt, layer.shared_expert_group_size)
+        else
+            false;
+        if (layer.uses_quant_formats_moe or self.act_quant_policy.isEnabled() or router_uses_qf or se_uses_qf) {
+            const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
+            const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+            return self.moe_pipes.encodeMoELayerMultiFormat(frame, .{
+                .base = resolved_args,
+                .is_heterogeneous = layer.is_hetero_moe,
+                .expert_schemes = if (layer.is_hetero_moe) layer.expert_dtypes_binding else null,
+                .scheme_counts = layer.expert_scheme_counts,
+                .scheme_descs = layer.expert_scheme_descs,
+                .qf_pipes = qf_ptr,
+                .act_quant_policy = self.act_quant_policy,
+                .act_scratch = act_b,
+                .act_scratch_bytes = self.act_quant_bytes,
+                .shared_expert_amf_dtype = layer.shared_expert_amf_dtype,
+                .shared_expert_group_size = layer.shared_expert_group_size,
+                .shared_expert_tensor_scale_per_row = layer.shared_expert_tensor_scale_per_row,
+            }, barrier_before);
+        }
         if (layer.is_hetero_moe) {
             return self.moe_pipes.encodeMoELayerHetero(frame, .{
-                .base = args,
+                .base = resolved_args,
                 .expert_schemes = layer.expert_dtypes_binding.?,
                 .scheme_counts = layer.expert_scheme_counts,
             }, barrier_before);
         }
         return switch (layer.expert_weight_dtype) {
-            .q2_affine => self.moe_pipes.encodeMoELayer(frame, .q2, args, barrier_before),
-            .q3_affine => self.moe_pipes.encodeMoELayer(frame, .q3, args, barrier_before),
-            .q4_affine => self.moe_pipes.encodeMoELayer(frame, .q4, args, barrier_before),
-            .f16 => self.moe_pipes.encodeMoELayerFloat(frame, .f16, args, barrier_before),
-            .bf16 => self.moe_pipes.encodeMoELayerFloat(frame, .bf16, args, barrier_before),
+            .q2_affine => self.moe_pipes.encodeMoELayer(frame, .q2, resolved_args, barrier_before),
+            .q3_affine => self.moe_pipes.encodeMoELayer(frame, .q3, resolved_args, barrier_before),
+            .q4_affine => self.moe_pipes.encodeMoELayer(frame, .q4, resolved_args, barrier_before),
+            .f16 => self.moe_pipes.encodeMoELayerFloat(frame, .f16, resolved_args, barrier_before),
+            .bf16 => self.moe_pipes.encodeMoELayerFloat(frame, .bf16, resolved_args, barrier_before),
         };
+    }
+
+    pub fn encodeEmbedLookupUnified(
+        self: *const GraphModel,
+        frame: *metal.Compute.Frame,
+        args: moe.EmbedLookupArgs,
+        host_token_ids: ?[]const u32,
+        host_out_f16: ?[]f16,
+        barrier_before: bool,
+    ) moe.EncodeError!void {
+        const emb_amf = self.embed.effectiveAmfDType();
+        if (!dequant.usesQuantFormats(emb_amf, self.embed.group_size)) {
+            return self.moe_pipes.encodeEmbedLookup(frame, self.embed.dtype, args, barrier_before);
+        }
+        const qf_dt = quant_formats.DType.fromAmf(emb_amf) orelse return error.InvalidArgument;
+        switch (args.tokens) {
+            .token_id => |tok| {
+                const qf = if (self.qf_pipes) |*qfp| qfp else return error.PipelineNotInitialized;
+                try qf.encodeDequantTileF16(frame, qf_dt, self.embed.group_size, .{
+                    .qweight = self.embed.weight,
+                    .params = self.embed.scale_bias,
+                    .dst_f16 = args.out,
+                    .n_total = self.embed.n,
+                    .k_total = self.embed.k,
+                    .tile_n_start = tok,
+                    .tile_n = 1,
+                    .tile_k_start = 0,
+                    .tile_k = self.embed.k,
+                    .tensor_scale_per_row = self.embed.tensor_scale_per_row,
+                }, barrier_before);
+            },
+            .token_ids => {
+                if (host_token_ids != null and host_out_f16 != null and self.embed_dequant_f32 != null) {
+                    const tids = host_token_ids.?[0..args.m];
+                    const dst_f16 = host_out_f16.?;
+                    const tmp_f32 = self.embed_dequant_f32.?;
+                    const h: usize = self.embed.k;
+                    const p_bytes: []const u8 = self.embed.scale_bias_host orelse &.{};
+                    for (tids, 0..) |tok, r| {
+                        quant_formats.dequantRowCpuRef(
+                            qf_dt,
+                            self.embed.group_size,
+                            self.embed.weight_host,
+                            p_bytes,
+                            tok,
+                            self.embed.n,
+                            h,
+                            tmp_f32,
+                        ) catch return error.InvalidArgument;
+                        const row_out = dst_f16[r * h ..][0..h];
+                        for (0..h) |j| row_out[j] = @floatCast(tmp_f32[j]);
+                    }
+                    return;
+                }
+                return error.InvalidArgument;
+            },
+        }
     }
 
     fn encodeMoEFfnOnlyDispatch(
@@ -7685,9 +7745,34 @@ pub const GraphModel = struct {
                     .num_experts = self.config.num_experts,
                     .hidden_size = h,
                 }, true),
+                .quant_format => |qfr| {
+                    if (m == 1) {
+                        try qfr.qf_pipes.encodeGemv(f, qfr.dtype, qfr.group_size, .{
+                            .x = x_norm_bind,
+                            .qweight = qfr.qweight,
+                            .params = qfr.params,
+                            .y = logits_bind,
+                            .n = self.config.num_experts,
+                            .k = h,
+                            .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                        }, true);
+                    } else {
+                        try qfr.qf_pipes.encodeGemvBatch(f, qfr.dtype, qfr.group_size, .{
+                            .x = x_norm_bind,
+                            .qweight = qfr.qweight,
+                            .params = qfr.params,
+                            .y = logits_bind,
+                            .m = m,
+                            .n = self.config.num_experts,
+                            .k = h,
+                            .tensor_scale_per_row = qfr.tensor_scale_per_row,
+                        }, true);
+                    }
+                },
                 .logits => {},
             }
-            try self.moe_pipes.encodeRouteTopK(f, .f32, .{
+            const r_logits_dt: moe.LogitsDType = if (router_src == .quant_format) .f16 else .f32;
+            try self.moe_pipes.encodeRouteTopK(f, r_logits_dt, .{
                 .logits = logits_bind,
                 .workspace = layer_ws,
                 .workspace_buf = self.scratch_buf,
@@ -8365,25 +8450,39 @@ pub const GraphModel = struct {
                 if (si == std.math.maxInt(u16)) return error.MissingTensor;
                 if (e.shape[0] != expected_n or e.shape[1] != expected_k) return error.TensorShapeMismatch;
                 const dt = try e.dataType();
-                const wdt = amfToWeightDType(dt) orelse return error.UnsupportedDType;
+                if (!dequant.isSupportedLinearAmfDType(dt)) return error.UnsupportedDType;
+                dequant.validateLinearAmfShape(dt, expected_n, expected_k, e.group_size) catch |err| switch (err) {
+                    error.UnexpectedTensorDType => return error.UnsupportedDType,
+                    else => |se| return se,
+                };
+                const wdt = dequant.legacyWeightDTypeForAmf(dt);
                 const buf = shards[si].buffer;
                 const off = e_off[idx];
                 const raw = e_slice[idx];
-                const sb_bind: ?metal.BufferBinding = if (wdt.isQuantized())
+                const has_params = (e.params_bytes > 0);
+                const sb_bind: ?metal.BufferBinding = if (has_params)
                     .{ .buffer = buf, .offset = off + e.params_offset }
                 else
                     null;
-                const alg_b: u64 = e.blob_bytes;
+                const sb_host: ?[]const u8 = if (has_params and raw.len >= e.params_offset + e.params_bytes)
+                    raw[@intCast(e.params_offset)..][0..@intCast(e.params_bytes)]
+                else
+                    null;
+                const alg_b: u64 = e.data_bytes + e.params_bytes;
                 return .{
                     .weight = .{ .buffer = buf, .offset = off },
                     .scale_bias = sb_bind,
                     .n = expected_n,
                     .k = expected_k,
                     .dtype = wdt,
+                    .amf_dtype = dt,
+                    .group_size = e.group_size,
+                    .tensor_scale_per_row = dequant.isTensorScalePerRow(dt, expected_n, e.params_bytes),
                     .alg_bytes = alg_b,
                     .layout = try e.tensorLayout(),
                     .param_kind = try e.quantParamKind(),
-                    .weight_host = raw,
+                    .weight_host = raw[0..@min(raw.len, @as(usize, @intCast(e.data_bytes)))],
+                    .scale_bias_host = sb_host,
                 };
             }
         }.call;
@@ -8907,6 +9006,120 @@ pub const GraphModel = struct {
         errdefer scratch_buf.close();
         try compute.makeResident(&.{scratch_buf});
         total_wired_bytes += scratch_bytes;
+
+        // M8.1 (`G23`/`G24`/`W24`): compile `QuantFormatPipelines`, optional staging
+        // buffers, and auto-load embedded `__meta.chat_template_json` once at startup.
+        var qf_specs_buf: [quant_formats.ALL_FORMAT_SPECS.len]quant_formats.FormatSpec = undefined;
+        var qf_specs_len: usize = 0;
+        var need_qf_moe: bool = false;
+        var max_qf_tile_elems: u64 = 0;
+        for (entries) |*e| {
+            if (amf.isMetaEntry(e)) continue;
+            const e_layout = try e.tensorLayout();
+            if (e_layout != .row_major) continue;
+            const e_dt = try e.dataType();
+            if (!dequant.usesQuantFormats(e_dt, e.group_size)) continue;
+            const qf_dt = quant_formats.DType.fromAmf(e_dt) orelse continue;
+            const spec = quant_formats.FormatSpec.normalized(qf_dt, e.group_size);
+            var exists = false;
+            for (qf_specs_buf[0..qf_specs_len]) |s| {
+                if (s.dtype == spec.dtype and s.group_size == spec.group_size) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists and qf_specs_len < qf_specs_buf.len) {
+                qf_specs_buf[qf_specs_len] = spec;
+                qf_specs_len += 1;
+            }
+            const e_kind = try e.tensorKind();
+            if (e_kind == .hot_expert or e_kind == .cold_expert or e_kind == .shared_expert) {
+                need_qf_moe = true;
+            } else if (e.rank == 2 and e_kind != .embedding) {
+                const elems = @as(u64, e.shape[0]) * @as(u64, e.shape[1]);
+                if (elems <= 16 * 1024 * 1024) max_qf_tile_elems = @max(max_qf_tile_elems, elems);
+            }
+        }
+
+        var qf_pipes: ?quant_formats.QuantFormatPipelines = null;
+        errdefer if (qf_pipes) |*qfp| qfp.close();
+        if (qf_specs_len > 0 or options.act_quant_policy.isEnabled()) {
+            qf_pipes = try quant_formats.QuantFormatPipelines.initWithOptions(device, library, .{
+                .specs = qf_specs_buf[0..qf_specs_len],
+                .include_moe = need_qf_moe,
+                .include_act_quant = options.act_quant_policy.isEnabled(),
+            });
+            try qf_pipes.?.makeResident(compute);
+        }
+
+        var qf_tile_region: ?page.WiredRegion = null;
+        errdefer if (qf_tile_region) |tr| tr.deinit();
+        var qf_tile_buf: ?metal.Buffer = null;
+        errdefer if (qf_tile_buf) |tb| tb.close();
+        var qf_tile_bytes: u64 = 0;
+        if (qf_specs_len > 0 and wide_prefill_max_tokens > 0 and max_qf_tile_elems > 0) {
+            const want_tile = @min(max_qf_tile_elems * @sizeOf(f16), 32 * 1024 * 1024);
+            const tr = try page.WiredRegion.init(@intCast(want_tile));
+            qf_tile_region = tr;
+            qf_tile_buf = try metal.Buffer.wrap(device, tr.bytes);
+            try compute.makeResident(&.{qf_tile_buf.?});
+            qf_tile_bytes = tr.bytes.len;
+        }
+
+        var act_quant_region: ?page.WiredRegion = null;
+        errdefer if (act_quant_region) |ar| ar.deinit();
+        var act_quant_buf: ?metal.Buffer = null;
+        errdefer if (act_quant_buf) |ab| ab.close();
+        var act_quant_bytes: u64 = 0;
+        if (options.act_quant_policy.isEnabled()) {
+            const max_rows: u64 = @max(@as(u64, max_m), @as(u64, wide_prefill_max_tokens));
+            const max_act_k: u64 = @max(
+                @as(u64, h),
+                @max(@as(u64, max_q_dim), @max(@as(u64, config.intermediate_size), @as(u64, config.moe_intermediate_size))),
+            );
+            const max_moe_rows: u64 = if (config.num_experts > 0) max_rows * config.num_experts_per_tok else max_rows;
+            const need_act = @max(max_rows * max_act_k, max_moe_rows * config.moe_intermediate_size) * @sizeOf(f16);
+            if (need_act > 0) {
+                const ar = try page.WiredRegion.init(@intCast(need_act));
+                act_quant_region = ar;
+                act_quant_buf = try metal.Buffer.wrap(device, ar.bytes);
+                try compute.makeResident(&.{act_quant_buf.?});
+                act_quant_bytes = ar.bytes.len;
+            }
+        }
+
+        var embed_dequant_f32: ?[]f32 = null;
+        errdefer if (embed_dequant_f32) |ed| allocator.free(ed);
+        if (dequant.usesQuantFormats(embed.effectiveAmfDType(), embed.group_size)) {
+            embed_dequant_f32 = try allocator.alloc(f32, h);
+        }
+
+        var loaded_chat_template: ?chat_template_mod.ChatTemplate = null;
+        switch (source) {
+            .file => |f| {
+                const resolved_ct_opt: ?amf.ResolvedMetadata = amf.resolveChatTemplateJsonAlloc(
+                    allocator,
+                    f.file,
+                    f.path,
+                    options.chat_template_json_path,
+                ) catch |err| switch (err) {
+                    error.MetadataNotFound, error.OpenFailed => null,
+                    else => null,
+                };
+                if (resolved_ct_opt) |resolved_ct_val| {
+                    var rct = resolved_ct_val;
+                    defer rct.deinit(allocator);
+                    loaded_chat_template = chat_template_mod.ChatTemplate.detectFromConfigJson(rct.bytes) catch null;
+                }
+            },
+            .bytes => |b| {
+                const embedded_opt = (b.parsed.extractMetadataFromBytes(b.raw, amf.META_CHAT_TEMPLATE_JSON) catch null) orelse
+                    (b.parsed.extractMetadataFromBytes(b.raw, amf.LEGACY_CHAT_TEMPLATE_METADATA_NAME) catch null);
+                if (embedded_opt) |ct_bytes| {
+                    loaded_chat_template = chat_template_mod.ChatTemplate.detectFromConfigJson(ct_bytes) catch null;
+                }
+            },
+        }
 
         // G16 + G17 (`P2`, ADR-0020, ADR-0021): startup `.metallib` numerical canary over
         // the resident `scratch_buf` BEFORE carving any sub-arena, atomically demoting
@@ -9884,7 +10097,16 @@ pub const GraphModel = struct {
                     const r_si = entry_shard[r_idx];
                     lw.router_binding = .{ .buffer = weight_shards[r_si].buffer, .offset = entry_offsets[r_idx] };
                     const rdt = try re.dataType();
-                    if (amfToWeightDType(rdt)) |wdt| {
+                    lw.router_amf_dtype = rdt;
+                    lw.router_group_size = re.group_size;
+                    lw.router_tensor_scale_per_row = dequant.isTensorScalePerRow(rdt, config.num_experts, re.params_bytes);
+                    if (dequant.usesQuantFormats(rdt, re.group_size)) {
+                        lw.router_scale_bias = if (re.params_bytes > 0)
+                            .{ .buffer = weight_shards[r_si].buffer, .offset = entry_offsets[r_idx] + re.params_offset }
+                        else
+                            null;
+                        lw.router_dtype = .f16;
+                    } else if (amfToWeightDType(rdt)) |wdt| {
                         if (wdt.isQuantized()) {
                             lw.router_quant_dtype = wdt;
                             lw.router_scale_bias = .{ .buffer = weight_shards[r_si].buffer, .offset = entry_offsets[r_idx] + re.params_offset };
@@ -9914,6 +10136,9 @@ pub const GraphModel = struct {
                         };
                         lw.shared_expert_buf = sg.weight.buffer;
                         lw.shared_expert_dtype = sg.dtype;
+                        lw.shared_expert_amf_dtype = sg.effectiveAmfDType();
+                        lw.shared_expert_group_size = sg.group_size;
+                        lw.shared_expert_tensor_scale_per_row = sg.tensor_scale_per_row;
                         layer_attn_bytes += sg.alg_bytes + su.alg_bytes + sd.alg_bytes;
 
                         const sgate_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.shared_expert_gate.weight", .{l}) catch unreachable;
@@ -9933,11 +10158,34 @@ pub const GraphModel = struct {
                     const tbl_raw = try scratch_arena.allocAligned(@as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights), 64);
                     const tbl: []moe.ExpertWeights = @alignCast(std.mem.bytesAsSlice(moe.ExpertWeights, tbl_raw[0 .. @as(usize, config.num_experts) * @sizeOf(moe.ExpertWeights)]));
                     const dt_raw = try scratch_arena.allocAligned(config.num_experts, 64);
+                    @memset(dt_raw, 0);
                     lw.expert_table = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tbl_raw.ptr) };
                     lw.expert_table_host = tbl;
 
                     var first_dt: ?quant.WeightDType = null;
+                    var first_amf_dt: ?amf.DType = null;
                     var hetero = false;
+                    var layer_uses_qf_moe = false;
+                    var custom_desc_count: usize = 0;
+                    for (0..config.num_experts) |e| {
+                        const is_remote_peer = if (effective_cluster_plan) |plan| !plan.isLocal(@intCast(e)) else false;
+                        if (is_remote_peer) continue;
+                        const g_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.gate_proj", .{ l, e }) catch unreachable;
+                        const ge = source.find(g_nm) orelse return error.MissingTensor;
+                        const d_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable;
+                        const de = source.find(d_nm) orelse return error.MissingTensor;
+                        const g_amf = try ge.dataType();
+                        const d_amf = try de.dataType();
+                        if (dequant.usesQuantFormats(g_amf, ge.group_size) or
+                            dequant.usesQuantFormats(d_amf, de.group_size) or
+                            g_amf != d_amf or ge.group_size != de.group_size)
+                        {
+                            layer_uses_qf_moe = true;
+                            break;
+                        }
+                    }
+                    lw.uses_quant_formats_moe = layer_uses_qf_moe;
+
                     var exp_buf: metal.Buffer = weight_shards[0].buffer;
                     if (effective_cluster_plan != null) {
                         lw.expert_sources = try allocator.alloc(expert.ExpertSource, config.num_experts);
@@ -9948,7 +10196,7 @@ pub const GraphModel = struct {
                             const plan = effective_cluster_plan.?;
                             lw.has_remote_experts = true;
                             tbl[e] = std.mem.zeroes(moe.ExpertWeights);
-                            dt_raw[e] = @backingInt(first_dt orelse .q3_affine);
+                            dt_raw[e] = if (layer_uses_qf_moe) 0 else @backingInt(first_dt orelse .q3_affine);
                             const remote_len: u64 = if (single_expert_bytes > 0)
                                 try page.alignUp(single_expert_bytes)
                             else
@@ -9963,21 +10211,47 @@ pub const GraphModel = struct {
                         const d_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.mlp.experts.{d}.down_proj", .{ l, e }) catch unreachable;
                         const de = source.find(d_nm) orelse return error.MissingTensor;
 
-                        const wdt = amfToWeightDType(try ge.dataType()) orelse return error.UnsupportedDType;
-                        if (first_dt) |fdt| {
-                            if (fdt != wdt) hetero = true;
-                        } else {
-                            first_dt = wdt;
+                        const g_amf = try ge.dataType();
+                        const d_amf = try de.dataType();
+                        if (!dequant.isSupportedLinearAmfDType(g_amf) or !dequant.isSupportedLinearAmfDType(d_amf)) {
+                            return error.UnsupportedDType;
                         }
-                        dt_raw[e] = @backingInt(wdt);
-                        if (wdt.isQuantized()) {
-                            const bucket: usize = switch (wdt) {
-                                .q2_affine => 0,
-                                .q3_affine => 1,
-                                .q4_affine => 2,
-                                else => 0,
+                        const wdt = dequant.legacyWeightDTypeForAmf(g_amf);
+                        if (first_dt == null) {
+                            first_dt = wdt;
+                            first_amf_dt = g_amf;
+                        }
+                        if (layer_uses_qf_moe) {
+                            const desc: moe.MoeSchemeDesc = .{
+                                .gate_up_dtype = g_amf,
+                                .gate_up_group_size = ge.group_size,
+                                .gate_up_tensor_scale_per_row = dequant.isTensorScalePerRow(g_amf, config.moe_intermediate_size, ge.params_bytes),
+                                .down_dtype = d_amf,
+                                .down_group_size = de.group_size,
+                                .down_tensor_scale_per_row = dequant.isTensorScalePerRow(d_amf, h, de.params_bytes),
                             };
-                            lw.expert_scheme_counts[bucket] += 1;
+                            var bucket_idx: ?usize = null;
+                            for (0..custom_desc_count) |bi| {
+                                if (lw.expert_scheme_descs[bi].eql(desc)) {
+                                    bucket_idx = bi;
+                                    break;
+                                }
+                            }
+                            if (bucket_idx == null) {
+                                if (custom_desc_count >= moe.NUM_SCHEME_BUCKETS) return error.UnsupportedDType;
+                                bucket_idx = custom_desc_count;
+                                lw.expert_scheme_descs[custom_desc_count] = desc;
+                                custom_desc_count += 1;
+                            }
+                            const bi = bucket_idx.?;
+                            dt_raw[e] = @intCast(bi);
+                            lw.expert_scheme_counts[bi] += 1;
+                            if (custom_desc_count > 1) hetero = true;
+                        } else {
+                            if (first_dt.? != wdt) hetero = true;
+                            dt_raw[e] = @backingInt(wdt);
+                            lw.expert_scheme_counts[@backingInt(wdt)] += 1;
+                            lw.expert_scheme_descs[@backingInt(wdt)] = moe.MoeSchemeDesc.uniform(g_amf, ge.group_size, false);
                         }
 
                         if ((try ge.tensorKind()) == .cold_expert) {
@@ -9996,7 +10270,14 @@ pub const GraphModel = struct {
                             const u_idx = entryIndexOf(entry_base_ptr, ue);
                             const d_idx = entryIndexOf(entry_base_ptr, de);
                             exp_buf = weight_shards[entry_shard[g_idx]].buffer;
-                            const ew = makeExpertWeights(wdt, entry_offsets[g_idx], ge.params_offset, entry_offsets[u_idx], ue.params_offset, entry_offsets[d_idx], de.params_offset);
+                            const ew: moe.ExpertWeights = .{
+                                .gate_qweight_offset = entry_offsets[g_idx],
+                                .gate_sb_offset = if (ge.params_bytes > 0) entry_offsets[g_idx] + ge.params_offset else 0,
+                                .up_qweight_offset = entry_offsets[u_idx],
+                                .up_sb_offset = if (ue.params_bytes > 0) entry_offsets[u_idx] + ue.params_offset else 0,
+                                .down_qweight_offset = entry_offsets[d_idx],
+                                .down_sb_offset = if (de.params_bytes > 0) entry_offsets[d_idx] + de.params_offset else 0,
+                            };
                             tbl[e] = ew;
                             if (lw.expert_sources.len > 0) {
                                 lw.expert_sources[e] = .{ .local_wired_ram = try expert.WiredExpert.init(entry_page_slices[g_idx]) };
@@ -10017,6 +10298,9 @@ pub const GraphModel = struct {
                     }
                     lw.expert_weights_buf = exp_buf;
                     lw.expert_weight_dtype = first_dt orelse .q3_affine;
+                    if (!layer_uses_qf_moe and !hetero) {
+                        lw.expert_scheme_descs[0] = moe.MoeSchemeDesc.uniform(first_amf_dt orelse .q3_affine, 64, false);
+                    }
                     lw.is_hetero_moe = hetero;
                     if (hetero) {
                         lw.expert_dtypes_binding = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(dt_raw.ptr) };
@@ -10351,6 +10635,16 @@ pub const GraphModel = struct {
             .g18_qkv_gemm_min_m = options.g18_qkv_gemm_min_m,
             .g18_swiglu_gemm_min_m = options.g18_swiglu_gemm_min_m,
             .vision_state = vision_state,
+            .qf_pipes = qf_pipes,
+            .act_quant_policy = options.act_quant_policy,
+            .qf_tile_region = qf_tile_region,
+            .qf_tile_buf = qf_tile_buf,
+            .qf_tile_bytes = qf_tile_bytes,
+            .act_quant_region = act_quant_region,
+            .act_quant_buf = act_quant_buf,
+            .act_quant_bytes = act_quant_bytes,
+            .embed_dequant_f32 = embed_dequant_f32,
+            .chat_template = loaded_chat_template,
         };
     }
 };
@@ -11906,7 +12200,7 @@ pub const GraphBatchRuntime = struct {
         var frame = try model.compute.beginFrame(model.timeout_ms);
         errdefer frame.abort();
 
-        try model.moe_pipes.encodeEmbedLookup(&frame, model.embed.dtype, .{
+        try model.encodeEmbedLookupUnified(&frame, .{
             .weight = model.embed.weight,
             .scale_bias = model.embed.scale_bias,
             .tokens = .{ .token_ids = model.wp_token_ids_bind },
@@ -11914,7 +12208,7 @@ pub const GraphBatchRuntime = struct {
             .m = m,
             .vocab_size = model.config.vocab_size,
             .hidden_size = h,
-        }, false);
+        }, model.wp_token_ids_host, model.wp_x_host, false);
 
         if (model.wp_gr_arena) |*gr| {
             try model.hybrid_pipes.encodeGrInitStream0(&frame, .{
@@ -12470,21 +12764,7 @@ pub const GraphBatchRuntime = struct {
                         .shared_gate_weight = layer.shared_gate_weight,
                         .shared_gate_dtype = layer.shared_gate_dtype,
                     };
-                    if (layer.is_hetero_moe) {
-                        try model.moe_pipes.encodeMoELayerHetero(&frame, .{
-                            .base = moe_args,
-                            .expert_schemes = layer.expert_dtypes_binding.?,
-                            .scheme_counts = layer.expert_scheme_counts,
-                        }, true);
-                    } else {
-                        switch (layer.expert_weight_dtype) {
-                            .q2_affine => try model.moe_pipes.encodeMoELayer(&frame, .q2, moe_args, true),
-                            .q3_affine => try model.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
-                            .q4_affine => try model.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
-                            .f16 => try model.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
-                            .bf16 => try model.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
-                        }
-                    }
+                    try model.encodeMoELayerDispatch(&frame, layer, moe_args, true);
                     if (model.wp_gr_arena) |*gr| {
                         const stream_eff: metal.BufferBinding = if (tail_m1_last)
                             .{ .buffer = model.scratch_buf, .offset = gr.base_offset + @as(u64, m - 1) * h * @sizeOf(f16) }
@@ -12591,7 +12871,7 @@ pub const GraphBatchRuntime = struct {
         var frame = try model.compute.beginFrame(model.timeout_ms);
         errdefer frame.abort();
 
-        try model.moe_pipes.encodeEmbedLookup(&frame, model.embed.dtype, .{
+        try model.encodeEmbedLookupUnified(&frame, .{
             .weight = model.embed.weight,
             .scale_bias = model.embed.scale_bias,
             .tokens = .{ .token_ids = model.token_ids_bind },
@@ -12599,7 +12879,7 @@ pub const GraphBatchRuntime = struct {
             .m = m,
             .vocab_size = model.config.vocab_size,
             .hidden_size = h,
-        }, false);
+        }, model.token_ids_host, model.x_host, false);
 
         if (model.gr_arena) |*gr| {
             try model.hybrid_pipes.encodeGrInitStream0(&frame, .{
@@ -13078,21 +13358,7 @@ pub const GraphBatchRuntime = struct {
                     .shared_gate_weight = layer.shared_gate_weight,
                     .shared_gate_dtype = layer.shared_gate_dtype,
                 };
-                if (layer.is_hetero_moe) {
-                    try model.moe_pipes.encodeMoELayerHetero(frame, .{
-                        .base = moe_args,
-                        .expert_schemes = layer.expert_dtypes_binding.?,
-                        .scheme_counts = layer.expert_scheme_counts,
-                    }, true);
-                } else {
-                    switch (layer.expert_weight_dtype) {
-                        .q2_affine => try model.moe_pipes.encodeMoELayer(frame, .q2, moe_args, true),
-                        .q3_affine => try model.moe_pipes.encodeMoELayer(frame, .q3, moe_args, true),
-                        .q4_affine => try model.moe_pipes.encodeMoELayer(frame, .q4, moe_args, true),
-                        .f16 => try model.moe_pipes.encodeMoELayerFloat(frame, .f16, moe_args, true),
-                        .bf16 => try model.moe_pipes.encodeMoELayerFloat(frame, .bf16, moe_args, true),
-                    }
-                }
+                try model.encodeMoELayerDispatch(frame, layer, moe_args, true);
                 if (model.gr_arena) |*gr| {
                     try model.hybrid_pipes.encodeGrWriteGate(frame, .{
                         .stream = gr.binding(model.scratch_buf),
@@ -13327,7 +13593,7 @@ pub const GraphBatchRuntime = struct {
         var frame = model.compute.beginFrame(model.timeout_ms) catch return error.DecodeFailed;
         errdefer frame.abort();
 
-        model.moe_pipes.encodeEmbedLookup(&frame, model.embed.dtype, .{
+        model.encodeEmbedLookupUnified(&frame, .{
             .weight = model.embed.weight,
             .scale_bias = model.embed.scale_bias,
             .tokens = .{ .token_ids = model.token_ids_bind },
@@ -13335,7 +13601,7 @@ pub const GraphBatchRuntime = struct {
             .m = b_u32,
             .vocab_size = model.config.vocab_size,
             .hidden_size = h,
-        }, false) catch return error.DecodeFailed;
+        }, model.token_ids_host, model.x_host, false) catch return error.DecodeFailed;
 
         if (model.gr_arena) |*gr| {
             model.hybrid_pipes.encodeGrInitStream0(&frame, .{

@@ -46,6 +46,21 @@ const theme_mod = @import("../monitor/theme.zig");
 const tui = @import("../monitor/tui.zig");
 const chat_repl = @import("../cli/chat_repl.zig");
 const sampler_mod = @import("../gpu/sampler.zig");
+const quant_formats = @import("../gpu/quant_formats.zig");
+pub const m81 = @import("m81.zig");
+
+pub const KlStepMetrics = m81.KlStepMetrics;
+pub const computeLogitsKlAndTop1F32 = m81.computeLogitsKlAndTop1F32;
+pub const computeLogitsKlAndTop1F16 = m81.computeLogitsKlAndTop1F16;
+pub const QualityGatePairResult = m81.QualityGatePairResult;
+pub const QualityGateConfig = m81.QualityGateConfig;
+pub const QualityGateReport = m81.QualityGateReport;
+pub const runFileQualityGate = m81.runFileQualityGate;
+pub const runQualityGate = m81.runQualityGate;
+pub const M81Config = m81.M81Config;
+pub const M81Report = m81.M81Report;
+pub const runM81WithConfig = m81.runM81WithConfig;
+pub const runM81 = m81.runM81;
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -295,7 +310,7 @@ pub const Error = error{
     InvalidConfig,
     NonFiniteOutput,
     OutOfMemory,
-} || quant.ShapeError || vmstat.Error || vmstat.SwapError || sysinfo.Error || metal.WrapError ||
+} || quant.ShapeError || quant_formats.EncodeError || vmstat.Error || vmstat.SwapError || sysinfo.Error || metal.WrapError ||
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError;
 
 const CaseLayout = struct {
@@ -16790,4 +16805,8 @@ test "runM78WithConfig verifies G18-G22 and C23-C24 M7.8 benchmark tracks with z
     const rendered = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "bench.m78.g18.canary") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "bench.m78.g22.vit_tower") != null);
+}
+
+test {
+    _ = m81;
 }

@@ -48,14 +48,20 @@ const usage =
     \\  inspect <path>    print header, metadata, dtype breakdown, wired estimate and tier fit of an .amf file (W18)
     \\  monitor           start the rootless btop-style TrueColor TUI hardware & inference monitor (C19)
     \\                    [-1hj] [-t|--theme <path.theme>] [-i|--interval-ms N] [-1|--once] [-j|--json] [-s|--server <host:port>]
-    \\  chat              start the plain scrolling CLI chat REPL or stdin pipe mode (C20)
+    \\  chat              start the plain scrolling CLI chat REPL or stdin pipe mode (C20, W24)
     \\                    [-CHhqNSV] -m|--model <path.amf> [-c|--config <path>] [-k|--tokenizer <path>] [-s|--system <text>]
     \\                    [-L|--lora <name>=<path.amlora>] [-N|--no-think] [-H|--hide-think] [-C|--no-color] [-q|--no-stats]
+    \\                    [--reasoning-effort <none|no_think|minimal|low|medium|high|xhigh|max|0.0..0.99>]
+    \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
     \\                    [-n|--max-tokens N] [-t|--temperature T] [--seed N] [--image <path>] [--video <path>]
     \\                    [--max-seq-len N] [--prefix-cache-chunks N] [-D|--disk-prefix-cache <dir>]
     \\                    [-W|--wired-cap-mib N] [-S|--strict-live-ram] [-V|--no-verify-crc]
     \\  verify-amf <path> validate an .amf v0 file's alignment, CRCs and wired budget fit
-    \\  bench             run full M1–M7.8 benchmark suites
+    \\  quality-gate      run W24 f64 KL divergence, top-1 agreement and greedy rollout parity gate vs BF16/FP16 reference
+    \\                    [-h] [--ref <ref.amf> --cand <cand.amf>] [-c|--config <path>] [-k|--tokenizer <path>]
+    \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
+    \\                    [--steps N] [--no-synthetic]
+    \\  bench             run full M1–M8.1 benchmark suites
     \\  bench-m1          run M1 C9 kernel bandwidth calibration and Spike S2 hot-path probe
     \\  bench-m2          run M2 Spike S1, G3 MoE, G4 GQA and end-to-end .amf decode benchmarks
     \\  bench-m25         run M2.5 native FP16/BF16 GEMV/GEMM calibration and BF16 .amf decode
@@ -72,6 +78,8 @@ const usage =
     \\                    [--bus-bandwidth-gbs F]
     \\  bench-m75         run M7.5 W18 single-file AMF, W19 multi-LoRA, C22 grammar bitmask, C19 monitor, C21 embed/rerank, R10 DiskPrefixCache & C17 C-ABI SDK suite
     \\  bench-m78         run M7.8 G18 fusion/canary, G19 MMA FlashAttn, G20 indirect MoE, G21 248K sampler+C22 spec, C23 NEON, C24 SME2 luti2 & G22/W20 ViT suite
+    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
+    \\  bench-m81         run M8.1 W21/W22/W24 multi-format G23 GEMV+prefill, G24 act-quant, C25 SME2, Inkling2/Hy4 tokenizer+template, C18 HTTP/SSE & W24 KL gate
     \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
@@ -106,6 +114,8 @@ const usage =
     \\                    [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
+    \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
+    \\                    [--reasoning-effort <none|no_think|minimal|low|medium|high|xhigh|max|0.0..0.99>]
     \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
     \\                    [-A|--no-ane-predictor] [-V|--no-verify-crc]
     \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent/DSpark)
@@ -125,13 +135,17 @@ const usage =
     \\                    [-W|--wired-cap-mib N] [--io-backend auto|aio|pread]
     \\                    [--prefill-mode auto|gpu|hybrid] [--gpu-prefill-mode wide|tree64]
     \\                    [--prefill-matmul-backend auto|simdgroup|nax] [-N|--strict-nax] [--bus-bandwidth-gbs F]
+    \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
+    \\                    [--reasoning-effort <none|no_think|minimal|low|medium|high|xhigh|max|0.0..0.99>]
     \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
     \\                    [-A|--no-ane-predictor] [-n|--max-tokens N] [-e|--ignore-eos] [-V|--no-verify-crc]
-    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15, C18, C21, C22, W19, R10)
+    \\  serve             start the zero-allocation kqueue HTTP/SSE inference server (C7, C8, C14, C15, C18, C21, C22, W19, W24, R10)
     \\                    [-ABEhMNPSV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>]
     \\                    [-H|--host 127.0.0.1] [-p|--port 8080] [-u|--unix-socket <path>] [-a|--api-key <secret>]
     \\                    [--model-id <id>] [-L|--lora <name>=<path.amlora>] [-D|--disk-prefix-cache <dir>]
     \\                    [--max-seq-len N] [--max-conns N] [--max-active-requests N]
+    \\                    [--max-response-bytes N] [--http-read-timeout-ms N]
+    \\                    [--act-quant <none|emulate|mxfp8_g32|fp8_g128|nvfp4_g16|fouroversix_mae>]
     \\                    [--batch-mode auto|continuous|serial] [--prefix-cache-chunks N]
     \\                    [--decode-share F] [-M|--adaptive-prefill-narrow on|off]
     \\                    [-B|--message-boundary-cache on|off]
@@ -202,6 +216,12 @@ pub fn main(init: std.process.Init) !void {
         } else {
             try verifyAmf(arena, args[2], out);
         }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "quality-gate")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runQualityGate(arena, args[2..], out);
+        }
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
         try runBenchAll(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m1")) {
@@ -243,6 +263,12 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM78(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m81")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM81(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -701,6 +727,133 @@ fn parseM69Args(args: []const [:0]const u8) !M69CliFlags {
     return m69;
 }
 
+const M81CliFlags = struct {
+    act_quant_policy: aminfer.quant_formats.ActQuantPolicy = .none,
+    reasoning_effort: ?aminfer.chat_template.ReasoningEffort = null,
+    max_response_bytes: ?usize = null,
+    http_read_timeout_ms: u32 = 30_000,
+
+    fn tryParseFlag(self: *M81CliFlags, args: []const [:0]const u8, i: *usize, allow_http_flags: bool) !bool {
+        const flag = args[i.*];
+        if (std.mem.eql(u8, flag, "--act-quant")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            self.act_quant_policy = aminfer.quant_formats.ActQuantPolicy.parse(args[i.*]) orelse
+                return error.InvalidActQuantPolicy;
+            return true;
+        } else if (std.mem.startsWith(u8, flag, "--act-quant=")) {
+            const val = flag["--act-quant=".len..];
+            self.act_quant_policy = aminfer.quant_formats.ActQuantPolicy.parse(val) orelse
+                return error.InvalidActQuantPolicy;
+            return true;
+        } else if (std.mem.eql(u8, flag, "--reasoning-effort")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            self.reasoning_effort = try aminfer.chat_template.ReasoningEffort.parseCliArg(args[i.*]);
+            return true;
+        } else if (std.mem.startsWith(u8, flag, "--reasoning-effort=")) {
+            const val = flag["--reasoning-effort=".len..];
+            self.reasoning_effort = try aminfer.chat_template.ReasoningEffort.parseCliArg(val);
+            return true;
+        } else if (allow_http_flags and std.mem.eql(u8, flag, "--max-response-bytes")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            const n = try std.fmt.parseInt(usize, args[i.*], 10);
+            if (n == 0) return error.InvalidFlagValue;
+            self.max_response_bytes = n;
+            return true;
+        } else if (allow_http_flags and std.mem.startsWith(u8, flag, "--max-response-bytes=")) {
+            const val = flag["--max-response-bytes=".len..];
+            const n = try std.fmt.parseInt(usize, val, 10);
+            if (n == 0) return error.InvalidFlagValue;
+            self.max_response_bytes = n;
+            return true;
+        } else if (allow_http_flags and std.mem.eql(u8, flag, "--http-read-timeout-ms")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            const n = try std.fmt.parseInt(u32, args[i.*], 10);
+            if (n == 0) return error.InvalidFlagValue;
+            self.http_read_timeout_ms = n;
+            return true;
+        } else if (allow_http_flags and std.mem.startsWith(u8, flag, "--http-read-timeout-ms=")) {
+            const val = flag["--http-read-timeout-ms=".len..];
+            const n = try std.fmt.parseInt(u32, val, 10);
+            if (n == 0) return error.InvalidFlagValue;
+            self.http_read_timeout_ms = n;
+            return true;
+        }
+        return false;
+    }
+};
+
+fn resolveChatTemplateForAmf(
+    allocator: std.mem.Allocator,
+    amf_path: [:0]const u8,
+    tok: *const aminfer.tokenizer.Tokenizer,
+) !aminfer.chat_template.ChatTemplate {
+    if (aminfer.amf.AmfFile.open(allocator, amf_path)) |opened| {
+        var amf_file = opened;
+        defer amf_file.close(allocator);
+        if (aminfer.amf.resolveChatTemplateJsonAlloc(allocator, &amf_file, amf_path, null)) |resolved| {
+            var r = resolved;
+            defer r.deinit(allocator);
+            if (aminfer.chat_template.ChatTemplate.fromSpecJson(r.bytes)) |tpl| {
+                return tpl;
+            } else |err| switch (err) {
+                error.BufferTooSmall,
+                error.InvalidJson,
+                error.InvalidSpec,
+                error.UnsupportedDialect,
+                error.InvalidReasoningEffort,
+                error.UnsupportedContent,
+                error.MissingToolName,
+                error.DepthExceeded,
+                => {},
+            }
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MetadataNotFound, error.OpenFailed => {},
+            else => {},
+        }
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    }
+    return aminfer.chat_template.ChatTemplate.fromTokenizer(tok);
+}
+
+fn renderPromptWithChatTemplateAlloc(
+    allocator: std.mem.Allocator,
+    tpl: *const aminfer.chat_template.ChatTemplate,
+    user_prompt: []const u8,
+    effort: aminfer.chat_template.ReasoningEffort,
+) ![]u8 {
+    const cap: usize = @max(@as(usize, 4096), user_prompt.len * 2 + 2048);
+    const buf = try allocator.alloc(u8, cap);
+    errdefer allocator.free(buf);
+    var fw = aminfer.chat_template.FixedWriter.init(buf);
+    var renderer = aminfer.chat_template.PromptRenderer.init(
+        tpl,
+        &fw,
+        .{
+            .reasoning_effort = effort,
+            .add_generation_prompt = true,
+        },
+        false,
+        0,
+    );
+    try renderer.begin();
+    const parts = [_]aminfer.chat_template.ContentPart{.{ .text = user_prompt }};
+    try renderer.pushMessage(.{
+        .role = .user,
+        .parts = &parts,
+    }, 0);
+    try renderer.finish();
+    const out_slice = try allocator.dupe(u8, fw.written());
+    allocator.free(buf);
+    return out_slice;
+}
+
 const ParsedHostPort = struct {
     host: [4]u8,
     port: u16,
@@ -1025,6 +1178,7 @@ const DecodeCliArgs = struct {
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
     m7: M7ClusterCliFlags = .{},
+    m81: M81CliFlags = .{},
 };
 
 fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
@@ -1054,12 +1208,14 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
     var m7: M7ClusterCliFlags = .{};
+    var m81: M81CliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
         if (try m69.tryParseFlag(args, &i)) continue;
         if (try m7.tryParseFlag(args, &i)) continue;
+        if (try m81.tryParseFlag(args, &i, false)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf") or std.mem.eql(u8, flag, "-m")) {
             i += 1;
@@ -1193,6 +1349,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .m6 = m6,
         .m69 = m69,
         .m7 = m7,
+        .m81 = m81,
     };
 }
 
@@ -1462,7 +1619,13 @@ fn runDecodeGraph(
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
-    var prompt_ids = try tok.encodeAlloc(allocator, cli.prompt);
+    const rendered_prompt: ?[]u8 = if (cli.m81.reasoning_effort) |eff| blk: {
+        const chat_tpl = try resolveChatTemplateForAmf(allocator, cli.amf_path, &tok);
+        break :blk try renderPromptWithChatTemplateAlloc(allocator, &chat_tpl, cli.prompt, eff);
+    } else null;
+    defer if (rendered_prompt) |rp| allocator.free(rp);
+
+    var prompt_ids = try tok.encodeAlloc(allocator, rendered_prompt orelse cli.prompt);
     defer allocator.free(prompt_ids);
     if (prompt_ids.len == 0) {
         allocator.free(prompt_ids);
@@ -1509,6 +1672,7 @@ fn runDecodeGraph(
         .prefill_backend_mode = cli.m69.prefill_backend_mode,
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+        .act_quant_policy = cli.m81.act_quant_policy,
         .cluster_coordinator = if (cluster_ctx) |cc| &cc.coordinator else null,
     });
     defer model.deinit(allocator);
@@ -1778,7 +1942,13 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
-    var prompt_ids = try tok.encodeAlloc(allocator, cli.prompt);
+    const rendered_prompt: ?[]u8 = if (cli.m81.reasoning_effort) |eff| blk: {
+        const chat_tpl = try resolveChatTemplateForAmf(allocator, cli.amf_path, &tok);
+        break :blk try renderPromptWithChatTemplateAlloc(allocator, &chat_tpl, cli.prompt, eff);
+    } else null;
+    defer if (rendered_prompt) |rp| allocator.free(rp);
+
+    var prompt_ids = try tok.encodeAlloc(allocator, rendered_prompt orelse cli.prompt);
     defer allocator.free(prompt_ids);
     if (prompt_ids.len == 0) {
         allocator.free(prompt_ids);
@@ -1810,6 +1980,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
         .prefill_backend_mode = cli.m69.prefill_backend_mode,
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+        .act_quant_policy = cli.m81.act_quant_policy,
     });
     defer model.deinit(allocator);
 
@@ -2154,6 +2325,78 @@ fn runBenchM78(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
     try report.write(out);
 }
 
+fn runBenchM81(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    var cfg: aminfer.bench.M81Config = .{};
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        const flag = raw_args[i];
+        if (std.mem.eql(u8, flag, "--skip-real")) {
+            cfg.skip_real_checkpoints = true;
+        } else if (std.mem.eql(u8, flag, "--bus-bandwidth-gbs")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cfg.bus_bandwidth_gbs_override = try std.fmt.parseFloat(f64, raw_args[i]);
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    const report = try aminfer.bench.runM81WithConfig(allocator, cfg);
+    try report.write(out);
+}
+
+fn parseQualityGateArgs(args: []const [:0]const u8) !aminfer.bench.QualityGateConfig {
+    var cfg: aminfer.bench.QualityGateConfig = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const flag = args[i];
+        if (std.mem.eql(u8, flag, "--ref")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cfg.ref_amf_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--cand")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cfg.cand_amf_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--config") or std.mem.eql(u8, flag, "-c")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cfg.config_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--tokenizer") or std.mem.eql(u8, flag, "-k")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cfg.tokenizer_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--act-quant")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cfg.act_quant_policy = aminfer.quant_formats.ActQuantPolicy.parse(args[i]) orelse
+                return error.InvalidActQuantPolicy;
+        } else if (std.mem.startsWith(u8, flag, "--act-quant=")) {
+            cfg.act_quant_policy = aminfer.quant_formats.ActQuantPolicy.parse(flag["--act-quant=".len..]) orelse
+                return error.InvalidActQuantPolicy;
+        } else if (std.mem.eql(u8, flag, "--steps")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            const n = try std.fmt.parseInt(u32, args[i], 10);
+            if (n == 0) return error.InvalidFlagValue;
+            cfg.steps = n;
+        } else if (std.mem.eql(u8, flag, "--no-synthetic")) {
+            cfg.include_synthetic_sweep = false;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    if ((cfg.ref_amf_path == null) != (cfg.cand_amf_path == null)) {
+        return error.MissingRequiredFlag;
+    }
+    return cfg;
+}
+
+fn runQualityGate(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cfg = try parseQualityGateArgs(raw_args);
+    const report = try aminfer.bench.runQualityGate(allocator, cfg);
+    try report.write(out);
+}
+
 const PeerWorkerCliArgs = struct {
     host: [4]u8,
     port: u16,
@@ -2388,6 +2631,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM75(allocator, out);
     try out.flush();
     try runBenchM78(allocator, &.{}, out);
+    try out.flush();
+    try runBenchM81(allocator, &.{}, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -2428,6 +2673,7 @@ const SpecDecodeCliArgs = struct {
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
     m7: M7ClusterCliFlags = .{},
+    m81: M81CliFlags = .{},
 };
 
 fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
@@ -2468,12 +2714,14 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
     var m7: M7ClusterCliFlags = .{};
+    var m81: M81CliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
         if (try m69.tryParseFlag(args, &i)) continue;
         if (try m7.tryParseFlag(args, &i)) continue;
+        if (try m81.tryParseFlag(args, &i, false)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf") or std.mem.eql(u8, flag, "-m")) {
             i += 1;
@@ -2662,6 +2910,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .m6 = m6,
         .m69 = m69,
         .m7 = m7,
+        .m81 = m81,
     };
 }
 
@@ -2678,7 +2927,13 @@ fn runSpecDecodeGraph(
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
-    var prompt_ids = try tok.encodeAlloc(allocator, cli.prompt);
+    const rendered_prompt: ?[]u8 = if (cli.m81.reasoning_effort) |eff| blk: {
+        const chat_tpl = try resolveChatTemplateForAmf(allocator, cli.amf_path, &tok);
+        break :blk try renderPromptWithChatTemplateAlloc(allocator, &chat_tpl, cli.prompt, eff);
+    } else null;
+    defer if (rendered_prompt) |rp| allocator.free(rp);
+
+    var prompt_ids = try tok.encodeAlloc(allocator, rendered_prompt orelse cli.prompt);
     defer allocator.free(prompt_ids);
     if (prompt_ids.len == 0) {
         allocator.free(prompt_ids);
@@ -2759,6 +3014,7 @@ fn runSpecDecodeGraph(
         .prefill_backend_mode = cli.m69.prefill_backend_mode,
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+        .act_quant_policy = cli.m81.act_quant_policy,
         .cluster_coordinator = if (cluster_ctx) |cc| &cc.coordinator else null,
     });
     defer model.deinit(allocator);
@@ -3061,7 +3317,13 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
     defer tok.deinit(allocator);
 
-    var prompt_ids = try tok.encodeAlloc(allocator, cli.prompt);
+    const rendered_prompt: ?[]u8 = if (cli.m81.reasoning_effort) |eff| blk: {
+        const chat_tpl = try resolveChatTemplateForAmf(allocator, cli.amf_path, &tok);
+        break :blk try renderPromptWithChatTemplateAlloc(allocator, &chat_tpl, cli.prompt, eff);
+    } else null;
+    defer if (rendered_prompt) |rp| allocator.free(rp);
+
+    var prompt_ids = try tok.encodeAlloc(allocator, rendered_prompt orelse cli.prompt);
     defer allocator.free(prompt_ids);
     if (prompt_ids.len == 0) {
         allocator.free(prompt_ids);
@@ -3101,6 +3363,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
         .prefill_backend_mode = cli.m69.prefill_backend_mode,
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+        .act_quant_policy = cli.m81.act_quant_policy,
     });
     defer model.deinit(allocator);
 
@@ -3524,6 +3787,7 @@ const ServeCliArgs = struct {
     enable_ane_predictor: bool = true,
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
+    m81: M81CliFlags = .{},
 };
 
 fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
@@ -3577,11 +3841,13 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
     var enable_ane_predictor = true;
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
+    var m81: M81CliFlags = .{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (try m6.tryParseFlag(args, &i)) continue;
         if (try m69.tryParseFlag(args, &i)) continue;
+        if (try m81.tryParseFlag(args, &i, true)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--amf") or std.mem.eql(u8, flag, "-m")) {
             i += 1;
@@ -3838,6 +4104,7 @@ fn parseServeArgs(args: []const [:0]const u8) !ServeCliArgs {
         .enable_ane_predictor = enable_ane_predictor,
         .m6 = m6,
         .m69 = m69,
+        .m81 = m81,
     };
 }
 
@@ -5272,6 +5539,7 @@ fn runServeGraph(
         .prefill_backend_mode = cli.m69.prefill_backend_mode,
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+        .act_quant_policy = cli.m81.act_quant_policy,
         .continuous_batch_only = use_continuous,
     });
     defer model.deinit(allocator);
@@ -5412,6 +5680,7 @@ fn runServeGraph(
         (if (ngram_reg_ptr) |nr| (if (spec_eng_ptr == null) nr.totalWiredBytes() else 0) else 0);
     const total_wired_mib: u64 = total_wired_bytes >> 20;
     const model_id_str = cli.model_id orelse std.fs.path.stem(cli.amf_path);
+    const serve_chat_tpl = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(&tok);
 
     const srv = try aminfer.server.Server.init(allocator, .{
         .host = host_ipv4,
@@ -5429,6 +5698,9 @@ fn runServeGraph(
         .api_key = cli.api_key,
         .unix_socket_path = cli.unix_socket_path,
         .tokenizer = &tok,
+        .chat_template = serve_chat_tpl,
+        .max_response_bytes = cli.m81.max_response_bytes,
+        .http_read_timeout_ms = cli.m81.http_read_timeout_ms,
     });
     defer srv.deinit(allocator);
 
@@ -5662,6 +5934,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .prefill_backend_mode = cli.m69.prefill_backend_mode,
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
+        .act_quant_policy = cli.m81.act_quant_policy,
         .continuous_batch_only = use_continuous,
     });
     defer model.deinit(allocator);
@@ -5875,6 +6148,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         (if (ngram_reg_ptr) |nr| (if (spec_eng_ptr == null) nr.totalWiredBytes() else 0) else 0);
     const total_wired_mib: u64 = total_wired_bytes >> 20;
     const model_id_str = cli.model_id orelse std.fs.path.stem(cli.amf_path);
+    const serve_chat_tpl = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(&tok);
 
     const srv = try aminfer.server.Server.init(allocator, .{
         .host = host_ipv4,
@@ -5892,6 +6166,9 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         .api_key = cli.api_key,
         .unix_socket_path = cli.unix_socket_path,
         .tokenizer = &tok,
+        .chat_template = serve_chat_tpl,
+        .max_response_bytes = cli.m81.max_response_bytes,
+        .http_read_timeout_ms = cli.m81.http_read_timeout_ms,
         .embedding_handler = embed_ctx.embeddingHandler(),
         .rerank_handler = embed_ctx.rerankHandler(),
     });
@@ -6227,6 +6504,7 @@ const ChatCliArgs = struct {
     wired_cap_mib: ?u64 = null,
     strict_live_ram: bool = false,
     verify_crcs: bool = true,
+    act_quant_policy: aminfer.quant_formats.ActQuantPolicy = .none,
     chat_cfg: aminfer.chat_repl.ChatConfig = .{},
 };
 
@@ -6277,6 +6555,14 @@ fn parseChatCliArgs(args: []const [:0]const u8) !ChatCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             out.wired_cap_mib = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--act-quant")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.act_quant_policy = aminfer.quant_formats.ActQuantPolicy.parse(args[i]) orelse
+                return error.InvalidActQuantPolicy;
+        } else if (std.mem.startsWith(u8, flag, "--act-quant=")) {
+            out.act_quant_policy = aminfer.quant_formats.ActQuantPolicy.parse(flag["--act-quant=".len..]) orelse
+                return error.InvalidActQuantPolicy;
         } else if (std.mem.eql(u8, flag, "--strict-live-ram") or std.mem.eql(u8, flag, "-S")) {
             out.strict_live_ram = true;
         } else if (std.mem.eql(u8, flag, "--no-verify-crc") or std.mem.eql(u8, flag, "-V")) {
@@ -6348,8 +6634,13 @@ const ChatEngineRunner = struct {
 
         var stop_tokens: [4]u32 = @splat(0);
         var stop_cnt: usize = 0;
+        const tpl_eos_id: ?u32 = if (model.chat_template) |tpl| blk: {
+            const s = tpl.eos_token.slice();
+            break :blk if (s.len > 0) tok.addedTokenId(s) else null;
+        } else null;
         const candidates = [_]?u32{
             model.config.eos_token_id,
+            tpl_eos_id,
             tok.addedTokenId("<|im_end|>"),
             tok.addedTokenId("<|endoftext|>"),
         };
@@ -6607,6 +6898,7 @@ fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
         .verify_crcs = cli.verify_crcs,
         .budget_override = budget_override,
         .strict_live_ram = cli.strict_live_ram,
+        .act_quant_policy = cli.act_quant_policy,
         .continuous_batch_only = true,
     });
     defer model.deinit(allocator);
@@ -6661,7 +6953,9 @@ fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
     var chat_runner = try ChatEngineRunner.init(allocator, &model, &batch_rt, &tok, max_seq_len);
     defer chat_runner.deinit(allocator);
 
-    try aminfer.chat_repl.runReplOrPipe(allocator, cli.chat_cfg, chat_runner.turnRunner(), 0, 1, 2, null);
+    var effective_chat_cfg = cli.chat_cfg;
+    effective_chat_cfg.chat_template = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(&tok);
+    try aminfer.chat_repl.runReplOrPipe(allocator, effective_chat_cfg, chat_runner.turnRunner(), 0, 1, 2, null);
 }
 
 /// Auto-clamps default `batch_slots` (when `--max-active-requests` was not
@@ -7513,4 +7807,69 @@ test "M7.5 CLI parsers handle W18 optional metadata flags, C18 --api-key/--unix-
     try std.testing.expect(srv_posix.strict_live_ram);
     try std.testing.expect(!srv_posix.verify_crcs);
     try std.testing.expectEqual(@as(u16, 8081), srv_posix.port);
+}
+
+test "M8.1 CLI flags parse act-quant, reasoning-effort, HTTP limits, and quality-gate" {
+    const dec = try parseDecodeArgs(&.{
+        "-m",                 "m.amf",
+        "-p",                 "2+2=?",
+        "--act-quant",        "fouroversix_mae",
+        "--reasoning-effort", "high",
+    });
+    try std.testing.expectEqual(aminfer.quant_formats.ActQuantPolicy.fouroversix_mae, dec.m81.act_quant_policy);
+    try std.testing.expectEqual(@as(?aminfer.chat_template.ReasoningEffort, .high), dec.m81.reasoning_effort);
+
+    const spec = try parseSpecDecodeArgs(&.{
+        "-m",                  "m.amf",
+        "-p",                  "hi",
+        "--act-quant=emulate", "--reasoning-effort=0.45",
+    });
+    try std.testing.expectEqual(aminfer.quant_formats.ActQuantPolicy.emulate, spec.m81.act_quant_policy);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.45), spec.m81.reasoning_effort.?.numeric, 1e-6);
+
+    const srv = try parseServeArgs(&.{
+        "-m",                     "m.amf",
+        "--act-quant",            "mxfp8_g32",
+        "--max-response-bytes",   "524288",
+        "--http-read-timeout-ms", "15000",
+    });
+    try std.testing.expectEqual(aminfer.quant_formats.ActQuantPolicy.mxfp8_g32, srv.m81.act_quant_policy);
+    try std.testing.expectEqual(@as(?usize, 524288), srv.m81.max_response_bytes);
+    try std.testing.expectEqual(@as(u32, 15000), srv.m81.http_read_timeout_ms);
+
+    const chat_cli = try parseChatCliArgs(&.{
+        "-m",                 "m.amf",
+        "--act-quant",        "fp8_g128",
+        "--reasoning-effort", "xhigh",
+    });
+    try std.testing.expectEqual(aminfer.quant_formats.ActQuantPolicy.fp8_g128, chat_cli.act_quant_policy);
+    try std.testing.expectEqual(@as(?aminfer.chat_template.ReasoningEffort, .xhigh), chat_cli.chat_cfg.reasoning_effort);
+
+    const qg = try parseQualityGateArgs(&.{
+        "--ref",          "ref.amf",
+        "--cand",         "cand.amf",
+        "--config",       "config.json",
+        "--tokenizer",    "tokenizer.json",
+        "--act-quant",    "nvfp4_g16",
+        "--steps",        "12",
+        "--no-synthetic",
+    });
+    try std.testing.expectEqualStrings("ref.amf", qg.ref_amf_path.?);
+    try std.testing.expectEqualStrings("cand.amf", qg.cand_amf_path.?);
+    try std.testing.expectEqual(aminfer.quant_formats.ActQuantPolicy.nvfp4_g16, qg.act_quant_policy);
+    try std.testing.expectEqual(@as(u32, 12), qg.steps);
+    try std.testing.expect(!qg.include_synthetic_sweep);
+    try std.testing.expectError(error.MissingRequiredFlag, parseQualityGateArgs(&.{ "--ref", "only_ref.amf" }));
+    try std.testing.expectError(error.InvalidActQuantPolicy, parseQualityGateArgs(&.{ "--act-quant", "bogus" }));
+
+    const gpa = std.testing.allocator;
+    const ink_tpl = aminfer.chat_template.ChatTemplate.preset(.inkling2);
+    const rendered_ink = try renderPromptWithChatTemplateAlloc(gpa, &ink_tpl, "Solve 6*7", .{ .numeric = 0.5 });
+    defer gpa.free(rendered_ink);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_ink, "Solve 6*7") != null);
+
+    const hy_tpl = aminfer.chat_template.ChatTemplate.preset(.hy4);
+    const rendered_hy = try renderPromptWithChatTemplateAlloc(gpa, &hy_tpl, "Explain M4", .high);
+    defer gpa.free(rendered_hy);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_hy, "reasoning_effort:high") != null);
 }

@@ -20,6 +20,7 @@ const vmstat = aminfer.vmstat;
 const metal = aminfer.metal;
 const amf_mod = aminfer.amf;
 const tokenizer_mod = aminfer.tokenizer;
+const chat_template_mod = aminfer.chat_template;
 const qwen3 = aminfer.qwen3;
 const graph = aminfer.graph;
 const vision_mod = aminfer.vision;
@@ -803,6 +804,7 @@ pub const SdkEngine = struct {
     backend: ModelBackend,
     graph_cfg: ?graph.GraphConfig,
     owned_tokenizer: ?*SdkTokenizer,
+    chat_template: chat_template_mod.ChatTemplate = chat_template_mod.ChatTemplate.preset(.chatml),
 
     vocab_size: u32,
     hidden_size: u32,
@@ -1565,9 +1567,27 @@ pub export fn ami_sdk_engine_create(
         eos_token_id = qcfg.eos_token_id orelse TOKEN_NONE;
     }
 
+    // Resolve optional W24 ChatTemplate (`__meta.chat_template_json` / `__aminfer_chat_template__` / sidecar -> tokenizer auto-detect).
+    var resolved_chat_tpl: chat_template_mod.ChatTemplate = if (owned_tokenizer) |t|
+        chat_template_mod.ChatTemplate.fromTokenizer(&t.tok)
+    else
+        chat_template_mod.ChatTemplate.preset(.chatml);
+    if (amf_mod.resolveChatTemplateJsonAlloc(gpa, &amf_file, amf_path, null)) |resolved_ct_val| {
+        var resolved_ct = resolved_ct_val;
+        defer resolved_ct.deinit(gpa);
+        if (chat_template_mod.ChatTemplate.detectFromConfigJson(resolved_ct.bytes)) |tpl| {
+            resolved_chat_tpl = tpl;
+        } else |_| {}
+    } else |err| switch (err) {
+        error.MetadataNotFound, error.OpenFailed => {},
+        else => {},
+    }
+
     if (eos_token_id == TOKEN_NONE) {
         if (owned_tokenizer) |t| {
-            eos_token_id = t.tok.addedTokenId("<|im_end|>") orelse
+            const tpl_eos = resolved_chat_tpl.eos_token.slice();
+            eos_token_id = (if (tpl_eos.len > 0) t.tok.addedTokenId(tpl_eos) else null) orelse
+                t.tok.addedTokenId("<|im_end|>") orelse
                 t.tok.addedTokenId("<|endoftext|>") orelse
                 t.tok.addedTokenId("<｜end▁of▁sentence｜>") orelse TOKEN_NONE;
         }
@@ -1706,6 +1726,7 @@ pub export fn ami_sdk_engine_create(
         .backend = backend,
         .graph_cfg = maybe_gcfg,
         .owned_tokenizer = owned_tokenizer,
+        .chat_template = resolved_chat_tpl,
         .vocab_size = vocab_size,
         .hidden_size = hidden_size,
         .num_layers = num_layers,
@@ -2435,6 +2456,32 @@ pub export fn ami_sdk_generate_tokens(
     return generateTokensImpl(eng, pids[0..prompt_len], params, stream_cb, user_data, out_slice, out_result);
 }
 
+fn sdkReasoningEffortToTemplate(effort: u32, effort_val: f32) ?chat_template_mod.ReasoningEffort {
+    return switch (effort) {
+        @backingInt(ReasoningEffort.default) => null,
+        @backingInt(ReasoningEffort.none) => .none,
+        @backingInt(ReasoningEffort.no_think) => .no_think,
+        @backingInt(ReasoningEffort.minimal) => .minimal,
+        @backingInt(ReasoningEffort.low) => .low,
+        @backingInt(ReasoningEffort.medium) => .medium,
+        @backingInt(ReasoningEffort.high) => .high,
+        @backingInt(ReasoningEffort.xhigh) => .xhigh,
+        @backingInt(ReasoningEffort.max) => .max,
+        @backingInt(ReasoningEffort.custom_float) => .{ .numeric = @floatCast(effort_val) },
+        else => null,
+    };
+}
+
+fn hasPreFormattedTemplateMarkers(tpl: *const chat_template_mod.ChatTemplate, text: []const u8) bool {
+    return switch (tpl.dialect) {
+        .inkling2 => std.mem.indexOf(u8, text, "<|message_user|>") != null or
+            std.mem.indexOf(u8, text, "<|message_system|>") != null,
+        .hy4 => std.mem.indexOf(u8, text, "<\xef\xbd\x9chy_start:opensource\xef\xbd\x9c>") != null,
+        .deepseek => std.mem.indexOf(u8, text, "<\xef\xbd\x9cUser\xef\xbd\x9c>") != null,
+        .chatml, .custom => std.mem.indexOf(u8, text, "<|im_start|>") != null,
+    };
+}
+
 pub export fn ami_sdk_generate_text(
     engine: ?*SdkEngine,
     prompt_utf8: ?[*]const u8,
@@ -2457,11 +2504,33 @@ pub export fn ami_sdk_generate_text(
     const param_st = validateGenParams(params);
     if (param_st != AMI_SDK_OK) return param_st;
 
+    var eff_params = params.*;
+    var effective_prompt: []const u8 = pstr[0..prompt_len];
+    if (sdkReasoningEffortToTemplate(params.reasoning_effort, params.reasoning_effort_value)) |effort| {
+        if (!hasPreFormattedTemplateMarkers(&eng.chat_template, effective_prompt)) {
+            var fw = chat_template_mod.FixedWriter.init(eng.rerank_buf);
+            var renderer = chat_template_mod.PromptRenderer.init(
+                &eng.chat_template,
+                &fw,
+                .{ .reasoning_effort = effort },
+                false,
+                0,
+            );
+            renderer.begin() catch return fail(AMI_SDK_ERR_SEQUENCE_FULL, "chat template prompt exceeds SDK scratch capacity");
+            renderer.pushMessage(.{ .role = .user, .content = effective_prompt }, 0) catch return fail(AMI_SDK_ERR_SEQUENCE_FULL, "chat template prompt exceeds SDK scratch capacity");
+            renderer.finish() catch return fail(AMI_SDK_ERR_SEQUENCE_FULL, "chat template prompt exceeds SDK scratch capacity");
+            effective_prompt = fw.written();
+            if (renderer.starts_in_think) {
+                eff_params.start_in_think = 1;
+            }
+        }
+    }
+
     var tok_len: usize = 0;
     const tok_st = ami_sdk_tokenize(
         stok,
-        pstr,
-        prompt_len,
+        effective_prompt.ptr,
+        effective_prompt.len,
         1,
         eng.prompt_ids_scratch.ptr,
         eng.prompt_ids_scratch.len,
@@ -2474,7 +2543,7 @@ pub export fn ami_sdk_generate_text(
     if (tok_len == 0) return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "prompt tokenized to 0 tokens");
 
     const out_slice: ?[]u32 = if (out_token_ids) |p| p[0..out_token_cap] else null;
-    return generateTokensImpl(eng, eng.prompt_ids_scratch[0..tok_len], params, stream_cb, user_data, out_slice, out_result);
+    return generateTokensImpl(eng, eng.prompt_ids_scratch[0..tok_len], &eff_params, stream_cb, user_data, out_slice, out_result);
 }
 
 // ---------------------------------------------------------------------------
@@ -3707,21 +3776,7 @@ fn prefillVisionQwen3(
                         .intermediate_size = m.config.moe_intermediate_size,
                         .norm_topk_prob = m.config.norm_topk_prob,
                     };
-                    if (layer.is_heterogeneous_moe) {
-                        try m.moe_pipes.encodeMoELayerHetero(&frame, .{
-                            .base = moe_args,
-                            .expert_schemes = layer.expert_schemes_bind,
-                            .scheme_counts = layer.expert_scheme_counts,
-                        }, true);
-                    } else {
-                        switch (layer.expert_dtype) {
-                            .q2_affine => try m.moe_pipes.encodeMoELayer(&frame, .q2, moe_args, true),
-                            .q3_affine => try m.moe_pipes.encodeMoELayer(&frame, .q3, moe_args, true),
-                            .q4_affine => try m.moe_pipes.encodeMoELayer(&frame, .q4, moe_args, true),
-                            .f16 => try m.moe_pipes.encodeMoELayerFloat(&frame, .f16, moe_args, true),
-                            .bf16 => try m.moe_pipes.encodeMoELayerFloat(&frame, .bf16, moe_args, true),
-                        }
-                    }
+                    try m.encodeMoELayerDispatch(&frame, layer, moe_args, true);
                 },
                 .qwen3_dense => {
                     try m.encodeLinearGemv(&frame, layer.dense_gate, m.x_norm_bind, m.dense_gate_bind, true);
