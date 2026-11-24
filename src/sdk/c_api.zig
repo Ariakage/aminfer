@@ -26,6 +26,7 @@ const graph = aminfer.graph;
 const vision_mod = aminfer.vision;
 const attention = aminfer.attention;
 const moe = aminfer.moe;
+const quant_rco = aminfer.quant_rco;
 const rng_mod = aminfer.rng;
 const sampler_mod = aminfer.sampler;
 const sampling_mod = aminfer.sampling;
@@ -389,6 +390,8 @@ comptime {
     std.debug.assert(@sizeOf(VisionInfo) == @sizeOf(sdk_c.ami_sdk_vision_info));
     std.debug.assert(@sizeOf(VisionParams) == @sizeOf(sdk_c.ami_sdk_vision_params));
     std.debug.assert(@sizeOf(VisionResult) == @sizeOf(sdk_c.ami_sdk_vision_result));
+    std.debug.assert(@hasDecl(sdk_c, "ami_sdk_quantize_rows_affine_raw"));
+    std.debug.assert(@typeInfo(@TypeOf(sdk_c.ami_sdk_quantize_rows_affine_raw)).@"fn".param_types.len == 13);
 }
 
 // ---------------------------------------------------------------------------
@@ -4134,6 +4137,73 @@ pub export fn ami_sdk_prefill_vision(
 }
 
 // ---------------------------------------------------------------------------
+// Native Multi-Threaded Weighted OLS RCO Affine Quantizer (gsq-convert)
+// ---------------------------------------------------------------------------
+
+pub export fn ami_sdk_quantize_rows_affine_raw(
+    src_bytes: ?*const anyopaque,
+    src_dtype: u32,
+    n_rows: u32,
+    k: u32,
+    bits: u32,
+    group_size: u32,
+    use_rco: u32,
+    rco_iters: u32,
+    col_weights: ?[*]const f32,
+    num_threads: u32,
+    dst_qweight: ?[*]u8,
+    dst_params: ?[*]u8,
+    out_mean_mse: ?*f64,
+) callconv(.c) Status {
+    clearLastError();
+
+    const parsed_dtype = quant_rco.SrcDType.fromU32(src_dtype) catch {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "invalid src_dtype (expected 0=F32, 1=F16, 2=BF16)");
+    };
+    const parsed_bits = quant_rco.bitsFromU32(bits) catch {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "invalid bits (expected 2, 3, 4, 5, 6, or 8)");
+    };
+    if (group_size != 32 and group_size != 64 and group_size != 128) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "invalid group_size (expected 32, 64, or 128)");
+    }
+    const gs_u16: u16 = @intCast(group_size);
+    const k_usize: usize = k;
+    if (k_usize == 0 or (k_usize % gs_u16) != 0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "k must be a positive multiple of group_size");
+    }
+
+    const cw_slice: ?[]align(1) const f32 = if (col_weights) |cw|
+        @as([*]align(1) const f32, @ptrCast(cw))[0..k_usize]
+    else
+        null;
+    const src_ptr: ?[*]const u8 = if (src_bytes) |p| @ptrCast(p) else null;
+
+    const mean_mse = quant_rco.quantizeRowsAffineRaw(.{
+        .src_dtype = parsed_dtype,
+        .n_rows = n_rows,
+        .k = k_usize,
+        .bits = parsed_bits,
+        .group_size = gs_u16,
+        .use_rco = use_rco != 0,
+        .rco_iters = rco_iters,
+        .col_weights = cw_slice,
+        .num_threads = num_threads,
+    }, src_ptr, dst_qweight, dst_params) catch |err| return switch (err) {
+        error.InvalidSrcDType => fail(AMI_SDK_ERR_INVALID_ARGUMENT, "invalid src_dtype"),
+        error.InvalidBits => fail(AMI_SDK_ERR_INVALID_ARGUMENT, "invalid bits"),
+        error.InvalidGroupSize => fail(AMI_SDK_ERR_INVALID_ARGUMENT, "invalid group_size"),
+        error.ZeroDimension => fail(AMI_SDK_ERR_INVALID_ARGUMENT, "k must be > 0"),
+        error.UnalignedK => fail(AMI_SDK_ERR_INVALID_ARGUMENT, "k must be divisible by group_size"),
+        error.NullBuffer => fail(AMI_SDK_ERR_INVALID_ARGUMENT, "required src/dst buffer pointer is NULL"),
+        error.Overflow => fail(AMI_SDK_ERR_INVALID_ARGUMENT, "tensor dimensions overflow buffer size"),
+        error.ThreadSpawnFailed => fail(AMI_SDK_ERR_OUT_OF_MEMORY, "worker thread spawn failed"),
+    };
+
+    if (out_mean_mse) |out| out.* = mean_mse;
+    return AMI_SDK_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Zig Unit Tests (`zig build test`)
 // ---------------------------------------------------------------------------
 
@@ -4970,4 +5040,136 @@ test "sdk.c_api: StreamTagClassifier handles Inkling 2 and Hy4 dialect tags with
     try std.testing.expectEqualStrings("", col_hy.text_buf[0..col_hy.text_len]);
     try std.testing.expect(std.mem.indexOf(u8, col_hy.tool_buf[0..col_hy.tool_len], "Kyoto") != null);
     try std.testing.expectEqual(@as(usize, 1), col_hy.tool_ends);
+}
+
+test "sdk.c_api: ami_sdk_quantize_rows_affine_raw parity, multi-thread consistency, and arg guards" {
+    const allocator = std.testing.allocator;
+    const n_rows: u32 = 40;
+    const k: u32 = 128;
+
+    var dummy_src: [n_rows * k * 4]u8 = @splat(0);
+    var dummy_q: [n_rows * k]u8 = @splat(0);
+    var dummy_p: [n_rows * 4 * 4]u8 = @splat(0);
+    var out_mse: f64 = 0.0;
+
+    // 1. Invalid arguments must return AMI_SDK_ERR_INVALID_ARGUMENT.
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_quantize_rows_affine_raw(&dummy_src, 3, 1, 64, 4, 64, 1, 3, null, 1, &dummy_q, &dummy_p, &out_mse),
+    );
+    for ([_]u32{ 0, 1, 7, 9, 16 }) |bad_bits| {
+        try std.testing.expectEqual(
+            AMI_SDK_ERR_INVALID_ARGUMENT,
+            ami_sdk_quantize_rows_affine_raw(&dummy_src, 0, 1, 64, bad_bits, 64, 1, 3, null, 1, &dummy_q, &dummy_p, &out_mse),
+        );
+    }
+    for ([_]u32{ 0, 16, 48, 256 }) |bad_gs| {
+        try std.testing.expectEqual(
+            AMI_SDK_ERR_INVALID_ARGUMENT,
+            ami_sdk_quantize_rows_affine_raw(&dummy_src, 0, 1, 64, 4, bad_gs, 1, 3, null, 1, &dummy_q, &dummy_p, &out_mse),
+        );
+    }
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_quantize_rows_affine_raw(&dummy_src, 0, 1, 0, 4, 64, 1, 3, null, 1, &dummy_q, &dummy_p, &out_mse),
+    );
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_quantize_rows_affine_raw(&dummy_src, 0, 1, 96, 4, 64, 1, 3, null, 1, &dummy_q, &dummy_p, &out_mse),
+    );
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_quantize_rows_affine_raw(null, 0, 1, 64, 4, 64, 1, 3, null, 1, &dummy_q, &dummy_p, &out_mse),
+    );
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_quantize_rows_affine_raw(&dummy_src, 0, 1, 64, 4, 64, 1, 3, null, 1, null, &dummy_p, &out_mse),
+    );
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_quantize_rows_affine_raw(&dummy_src, 0, 1, 64, 4, 64, 1, 3, null, 1, &dummy_q, null, &out_mse),
+    );
+
+    // 2. n_rows == 0 succeeds cleanly with out_mean_mse = 0.0 and optional NULL out_mean_mse.
+    out_mse = 123.0;
+    try std.testing.expectEqual(
+        AMI_SDK_OK,
+        ami_sdk_quantize_rows_affine_raw(null, 2, 0, 64, 4, 64, 1, 3, null, 0, null, null, &out_mse),
+    );
+    try std.testing.expectEqual(@as(f64, 0.0), out_mse);
+    try std.testing.expectEqual(
+        AMI_SDK_OK,
+        ami_sdk_quantize_rows_affine_raw(null, 2, 0, 64, 4, 64, 1, 3, null, 0, null, null, null),
+    );
+
+    // 3. All dtypes x bits x group_sizes x {unweighted, weighted} + multi-thread vs 1-thread parity.
+    var prng = std.Random.DefaultPrng.init(20261124);
+    const rng = prng.random();
+    var col_weights: [k]f32 = undefined;
+    for (0..k) |c| {
+        col_weights[c] = if ((c % 64) < 16) 80.0 else 1e-3;
+    }
+
+    for ([_]u32{ 0, 1, 2 }) |sdt| {
+        const elem_bytes: usize = if (sdt == 0) 4 else 2;
+        const src = try allocator.alloc(u8, n_rows * k * elem_bytes);
+        defer allocator.free(src);
+        for (0..n_rows) |r| {
+            for (0..k) |c| {
+                const base = (rng.float(f64) * 2.0 - 1.0) * 0.25;
+                const val: f32 = if (c % 32 == 31) @as(f32, 1.9) else @floatCast(base);
+                const off = (r * k + c) * elem_bytes;
+                switch (sdt) {
+                    0 => std.mem.writeInt(u32, src[off..][0..4], @bitCast(val), .little),
+                    1 => std.mem.writeInt(u16, src[off..][0..2], @bitCast(@as(f16, @floatCast(val))), .little),
+                    2 => std.mem.writeInt(u16, src[off..][0..2], aminfer.quant.f32ToBf16(val), .little),
+                    else => unreachable,
+                }
+            }
+        }
+
+        for ([_]u32{ 32, 64, 128 }) |gs| {
+            const groups = k / gs;
+            for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| {
+                const q_len = n_rows * groups * ((gs * bits) / 8);
+                const p_len = n_rows * groups * 4;
+                const q_mm = try allocator.alloc(u8, q_len);
+                defer allocator.free(q_mm);
+                const p_mm = try allocator.alloc(u8, p_len);
+                defer allocator.free(p_mm);
+                const q_1t = try allocator.alloc(u8, q_len);
+                defer allocator.free(q_1t);
+                const p_1t = try allocator.alloc(u8, p_len);
+                defer allocator.free(p_1t);
+                const q_mt = try allocator.alloc(u8, q_len);
+                defer allocator.free(q_mt);
+                const p_mt = try allocator.alloc(u8, p_len);
+                defer allocator.free(p_mt);
+
+                for ([_]?[*]const f32{ null, &col_weights }) |cw| {
+                    var mse_mm: f64 = 0.0;
+                    var mse_1t: f64 = 0.0;
+                    var mse_mt: f64 = 0.0;
+
+                    try std.testing.expectEqual(
+                        AMI_SDK_OK,
+                        ami_sdk_quantize_rows_affine_raw(src.ptr, sdt, n_rows, k, bits, gs, 0, 3, cw, 1, q_mm.ptr, p_mm.ptr, &mse_mm),
+                    );
+                    try std.testing.expectEqual(
+                        AMI_SDK_OK,
+                        ami_sdk_quantize_rows_affine_raw(src.ptr, sdt, n_rows, k, bits, gs, 1, 3, cw, 1, q_1t.ptr, p_1t.ptr, &mse_1t),
+                    );
+                    try std.testing.expectEqual(
+                        AMI_SDK_OK,
+                        ami_sdk_quantize_rows_affine_raw(src.ptr, sdt, n_rows, k, bits, gs, 1, 3, cw, 0, q_mt.ptr, p_mt.ptr, &mse_mt),
+                    );
+
+                    try std.testing.expect(mse_1t <= mse_mm + 1e-15);
+                    try std.testing.expectEqualSlices(u8, q_1t, q_mt);
+                    try std.testing.expectEqualSlices(u8, p_1t, p_mt);
+                    try std.testing.expectApproxEqAbs(mse_1t, mse_mt, 1e-14);
+                }
+            }
+        }
+    }
 }

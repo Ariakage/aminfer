@@ -9,6 +9,7 @@ pub const arena = @import("mem/arena.zig");
 pub const prefix_cache = @import("mem/prefix_cache.zig");
 pub const quant = @import("quant/spec.zig");
 pub const quant_ref = @import("quant/formats.zig");
+pub const quant_rco = @import("quant/rco.zig");
 pub const amf = @import("format/amf.zig");
 pub const dequant = @import("gpu/dequant.zig");
 pub const quant_formats = @import("gpu/quant_formats.zig");
@@ -64,6 +65,7 @@ test {
     _ = prefix_cache;
     _ = quant;
     _ = quant_ref;
+    _ = quant_rco;
     _ = amf;
     _ = dequant;
     _ = quant_formats;

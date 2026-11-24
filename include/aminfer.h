@@ -509,6 +509,32 @@ ami_sdk_status ami_sdk_prefill_vision(ami_sdk_engine *engine,
                                       const ami_sdk_vision_params *params,
                                       ami_sdk_vision_result *out_result);
 
+/* -------------------------------------------------------------------------
+ * Native Multi-Threaded Weighted OLS RCO Affine Quantizer (gsq-convert)
+ * ------------------------------------------------------------------------- */
+
+/* src_dtype: 0 = F32, 1 = F16, 2 = BF16.
+ * bits: 2, 3, 4, 5, 6, or 8. group_size: 32, 64, or 128 (k % group_size == 0).
+ * col_weights: optional float[k] per-column activation variance E[x_c^2] (NULL for unweighted).
+ * num_threads: 0 = auto (clamped to min(cpu_count, n_rows)).
+ * dst_qweight: caller buffer of size n_rows * ((k * bits) / 8) bytes (LSB-first MLX affine packing).
+ * dst_params: caller buffer of size n_rows * (k / group_size) * 4 bytes (packed little-endian [f16 scale, f16 bias]).
+ * out_mean_mse: optional double* receiving mean per-group (weighted or unweighted) MSE. */
+ami_sdk_status ami_sdk_quantize_rows_affine_raw(
+    const void *src_bytes,
+    uint32_t src_dtype,
+    uint32_t n_rows,
+    uint32_t k,
+    uint32_t bits,
+    uint32_t group_size,
+    uint32_t use_rco,
+    uint32_t rco_iters,
+    const float *col_weights,
+    uint32_t num_threads,
+    uint8_t *dst_qweight,
+    uint8_t *dst_params,
+    double *out_mean_mse);
+
 #ifdef __cplusplus
 }
 #endif
