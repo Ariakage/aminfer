@@ -1,0 +1,1877 @@
+"""Pure standard-library GGUF v2/v3 streaming reader and `.amf` v0 repacker (W22).
+
+Zero third-party dependencies (`ADR-0006`, `ADR-0024`). Streams GGUF tensors directly
+into 16 KiB-aligned `.amf` blobs with IEEE CRC-32 without double-quantizing raw
+GGML blocks, while verifying per-tensor byte spans against sorted offsets / EOF to
+hard-fail on unknown or colliding fork types (`STQ1_0` on type 43, `VQ-GGUF`, `EXL3`).
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import math
+import os
+import pathlib
+import re
+import struct
+import zlib
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from aminfer_tools import APPLE_PAGE_SIZE
+from aminfer_tools.amf import (
+    DType,
+    ENTRY_STRUCT,
+    FLAG_EMBEDDED_METADATA,
+    LEGACY_CHAT_TEMPLATE_METADATA_NAME,
+    META_CHAT_TEMPLATE_JSON,
+    META_CONFIG_JSON,
+    META_PREFIX,
+    META_TOKENIZER_JSON,
+    NO_EXPERT,
+    NO_LAYER,
+    PackedTensorMeta,
+    QuantParamKind,
+    TensorKind,
+    TensorLayout,
+    _align_up,
+    _bf16_to_f32_bytes,
+    _BlobWriter,
+    _classify_tensor,
+    _crc32,
+    _natural_key,
+    _normalize_name,
+    _pack_directory,
+    _pack_header,
+    _set_nocache,
+    bf16_bytes_to_f16_bytes,
+    f16_bytes_to_bf16_bytes,
+    is_vision_tensor,
+    pack_vision_tower_amf,
+)
+from aminfer_tools.chat_template import compile_chat_template_spec
+
+GGUF_MAGIC = b"GGUF"
+GGUF_SUPPORTED_VERSIONS = (2, 3)
+
+# Standard upstream GGUF Metadata Value Types
+_GGUF_TYPE_UINT8 = 0
+_GGUF_TYPE_INT8 = 1
+_GGUF_TYPE_UINT16 = 2
+_GGUF_TYPE_INT16 = 3
+_GGUF_TYPE_UINT32 = 4
+_GGUF_TYPE_INT32 = 5
+_GGUF_TYPE_FLOAT32 = 6
+_GGUF_TYPE_BOOL = 7
+_GGUF_TYPE_STRING = 8
+_GGUF_TYPE_ARRAY = 9
+_GGUF_TYPE_UINT64 = 10
+_GGUF_TYPE_INT64 = 11
+_GGUF_TYPE_FLOAT64 = 12
+
+_SCALAR_STRUCTS: dict[int, struct.Struct] = {
+    _GGUF_TYPE_UINT8: struct.Struct("<B"),
+    _GGUF_TYPE_INT8: struct.Struct("<b"),
+    _GGUF_TYPE_UINT16: struct.Struct("<H"),
+    _GGUF_TYPE_INT16: struct.Struct("<h"),
+    _GGUF_TYPE_UINT32: struct.Struct("<I"),
+    _GGUF_TYPE_INT32: struct.Struct("<i"),
+    _GGUF_TYPE_FLOAT32: struct.Struct("<f"),
+    _GGUF_TYPE_BOOL: struct.Struct("<B"),
+    _GGUF_TYPE_UINT64: struct.Struct("<Q"),
+    _GGUF_TYPE_INT64: struct.Struct("<q"),
+    _GGUF_TYPE_FLOAT64: struct.Struct("<d"),
+}
+
+# Canonical upstream ggml_type IDs -> (name, block_size, block_bytes, amf_dtype_or_None)
+_GGML_TYPE_INFO: dict[int, tuple[str, int, int, DType | None]] = {
+    0: ("F32", 1, 4, DType.F32),
+    1: ("F16", 1, 2, DType.F16),
+    2: ("Q4_0", 32, 18, DType.GGUF_Q4_0),
+    3: ("Q4_1", 32, 20, DType.GGUF_Q4_1),
+    6: ("Q5_0", 32, 22, DType.GGUF_Q5_0),
+    7: ("Q5_1", 32, 24, DType.GGUF_Q5_1),
+    8: ("Q8_0", 32, 34, DType.GGUF_Q8_0),
+    10: ("Q2_K", 256, 84, DType.GGUF_Q2_K),
+    11: ("Q3_K", 256, 110, DType.GGUF_Q3_K),
+    12: ("Q4_K", 256, 144, DType.GGUF_Q4_K),
+    13: ("Q5_K", 256, 176, DType.GGUF_Q5_K),
+    14: ("Q6_K", 256, 210, DType.GGUF_Q6_K),
+    16: ("IQ2_XXS", 256, 66, DType.GGUF_IQ2_XXS),
+    17: ("IQ2_XS", 256, 74, DType.GGUF_IQ2_XS),
+    18: ("IQ3_XXS", 256, 98, DType.GGUF_IQ3_XXS),
+    19: ("IQ1_S", 256, 50, DType.GGUF_IQ1_S),
+    20: ("IQ4_NL", 32, 18, DType.GGUF_IQ4_NL),
+    21: ("IQ3_S", 256, 110, DType.GGUF_IQ3_S),
+    22: ("IQ2_S", 256, 82, DType.GGUF_IQ2_S),
+    23: ("IQ4_XS", 256, 136, DType.GGUF_IQ4_XS),
+    29: ("IQ1_M", 256, 56, DType.GGUF_IQ1_M),
+    30: ("BF16", 1, 2, DType.BF16),
+    34: ("TQ1_0", 256, 54, DType.GGUF_TQ1_0),
+    35: ("TQ2_0", 256, 66, DType.GGUF_TQ2_0),
+    39: ("MXFP4", 32, 17, DType.GGUF_MXFP4),
+    40: ("NVFP4", 64, 36, DType.NVFP4_G16),
+    42: ("Q2_0", 64, 18, DType.GGUF_Q2_0),
+    43: ("F8_E4M3", 1, 1, DType.FP8_E4M3_TENSOR),
+}
+
+_AMF_GGUF_BLOCK_INFO: dict[DType, tuple[int, int]] = {
+    amf_dt: (bs, bb)
+    for g_id, (_gname, bs, bb, amf_dt) in _GGML_TYPE_INFO.items()
+    if amf_dt is not None and amf_dt >= DType.GGUF_Q4_0
+}
+
+# Nominal quant_bits recorded in `.amf` directory (`src/quant/formats.zig:ggufBlockInfo`).
+_AMF_GGUF_QUANT_BITS: dict[DType, int] = {
+    DType.GGUF_Q4_0: 4,
+    DType.GGUF_Q4_1: 4,
+    DType.GGUF_Q5_0: 5,
+    DType.GGUF_Q5_1: 5,
+    DType.GGUF_Q8_0: 8,
+    DType.GGUF_Q2_K: 2,
+    DType.GGUF_Q3_K: 3,
+    DType.GGUF_Q4_K: 4,
+    DType.GGUF_Q5_K: 5,
+    DType.GGUF_Q6_K: 6,
+    DType.GGUF_IQ1_S: 1,
+    DType.GGUF_IQ1_M: 1,
+    DType.GGUF_IQ2_XXS: 2,
+    DType.GGUF_IQ2_XS: 2,
+    DType.GGUF_IQ2_S: 2,
+    DType.GGUF_IQ3_XXS: 3,
+    DType.GGUF_IQ3_S: 3,
+    DType.GGUF_IQ4_NL: 4,
+    DType.GGUF_IQ4_XS: 4,
+    DType.GGUF_TQ1_0: 2,
+    DType.GGUF_TQ2_0: 2,
+    DType.GGUF_MXFP4: 4,
+    DType.GGUF_Q2_0: 2,
+}
+
+_FORK_SIGNATURES = ("stq1_0", "vq-gguf", "vq_gguf", "exl3", "exllama3")
+
+# Verbatim IQ lookup tables extracted from `src/quant/formats.zig` (`33792 B` = 256+512+1024 u64 + 256+512 u32 + 2048 u64).
+_IQ_TABLES_B64 = (
+    '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'
+    't2jAcqLA/vnARsKg6SkeGLw/JRDscIcaGz2mYgfeYJVyggEleGiV1KhX8I16PTICahYtAQEDa3V6NWct1etheHOiwkQJNXQc+69Q'
+    'B5/VWpmIoz8E4QrwMbuxvsLAbyU8RNLaaspWcyVKBjsH0CxHpfV+CWFWnd/vqqXTB35px1D//+G/O7cnt8vl5+fB7fciN+/cLg/u'
+    '+cfH78/Pi9uFPw9u4+E7t8v98vO6y4t3bpfn5ef5WoOMz5Pb5SID3rldHvefB7dfbpcX99xev/c58i+3Memd2+vO338fPPSTu+fP'
+    '88n968lrefLzT37+xc+/eF5ur9fP6/H+eb7f/P7vz5Pbm9vj+ftzef/OFT9k+WPJYzljGXMzPM3lyU2HnJsbKx5/Y5P3u3wZqxpv'
+    'j8+4+fPgb7+y+bsS4PJ4XN5Pbm/+zqt4cft5cbu/Lk9ubybO5ffF9988BBPpKYQa1LkICSfRBqned5mU6T8nHkvl5U1ijhWMz5j6'
+    'wUP9cmOaTyKP1y9zdCH4+GNaMyPuTCZZ+Nj98yJMeHJ7PZ5MRm5M9d87c/T54vuDs7987/fOtLy/nrLZn7lz2fRgJdPs8XrzPWXe'
+    'XRk4Pk+e5M1tbI1vTmrzEnhCbr9CsPHHjGK2Pvkec2Jy8sUrfj1eL17Z5f0YnwcT9fFggXgPaZiUe74e3HNjEeDlsoj8srDc55ZY'
+    'YLi97ywSfM0TvJ68HH7k8mJJej95h+POawoVS9JzSMB9SMFj9D/MMBUwltL3aPcLL4ffvszVC6F46+PDEsQLfrIY87C/zyHRr8tj'
+    'COWbqfo7ifm8//CsP+83t+d7CMDlPT7MJ76+MwXnDt9jdeNFZpZs+ud3cnhoAy/ml9VwCLQwhlfI65oCP6RxTDZWNjSWF/A7CPbz'
+    'fvAUgzLPqcVD21gWmSTvX+K/Hbc9tzO3m97YcdtzO3G76gM7bmduhwNfn/gWtzO3G7cdv3wYA1z5PrcdD3TidtMBx2fP7aSD77id'
+    'dZIDtxu33YHvcTvxpDue9Mxtf5PJx9tnbjddyIHbldtuz/f3Y1F7OnHbn/ia243bjhd7GAu+cT8af3a7A8/LG9gfaM9tx5s5cLty'
+    'O534/pnvc7td+bcbP3uTzR52J7px2/GmT9z2B970ie9z2ykRxgpPg4p7Xim3K7cDE2V3OvOazvwI37vyvRv3/Nntrjwu94crv8L9'
+    '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'
+)
+
+_IQ_LOADED = False
+_IQ2XXS_GRID: tuple[int, ...] = ()
+_IQ2XS_GRID: tuple[int, ...] = ()
+_IQ2S_GRID: tuple[int, ...] = ()
+_IQ3XXS_GRID: tuple[int, ...] = ()
+_IQ3S_GRID: tuple[int, ...] = ()
+_IQ1S_GRID: tuple[int, ...] = ()
+
+_KSIGNS_IQ2XS: tuple[int, ...] = tuple(i | (0x80 if i.bit_count() & 1 else 0) for i in range(128))
+_KMASK_IQ2XS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+_KVALUES_IQ4NL: tuple[int, ...] = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
+_KVALUES_MXFP4: tuple[int, ...] = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
+
+
+def _ensure_iq_tables() -> None:
+    global _IQ_LOADED, _IQ2XXS_GRID, _IQ2XS_GRID, _IQ2S_GRID, _IQ3XXS_GRID, _IQ3S_GRID, _IQ1S_GRID
+    if _IQ_LOADED:
+        return
+    raw = zlib.decompress(base64.b64decode(_IQ_TABLES_B64))
+    off = 0
+
+    def take_u64(n: int) -> tuple[int, ...]:
+        nonlocal off
+        res = struct.unpack_from(f"<{n}Q", raw, off)
+        off += n * 8
+        return res
+
+    def take_u32(n: int) -> tuple[int, ...]:
+        nonlocal off
+        res = struct.unpack_from(f"<{n}I", raw, off)
+        off += n * 4
+        return res
+
+    _IQ2XXS_GRID = take_u64(256)
+    _IQ2XS_GRID = take_u64(512)
+    _IQ2S_GRID = take_u64(1024)
+    _IQ3XXS_GRID = take_u32(256)
+    _IQ3S_GRID = take_u32(512)
+    _IQ1S_GRID = take_u64(2048)
+    assert off == len(raw)
+    _IQ_LOADED = True
+
+
+@dataclass(frozen=True)
+class GgufTensorInfo:
+    name: str
+    dims: tuple[int, ...]  # GGML order `[ne0, ne1, ...]` (`ne0` = innermost row width K)
+    ggml_type: int
+    offset: int  # relative to shard `data_offset`
+    expected_bytes: int
+    actual_span_bytes: int
+
+    @property
+    def amf_shape(self) -> tuple[int, ...]:
+        """Convert GGML inner-first `dims` to row-major `.amf` `[N, K]` shape."""
+        return tuple(reversed(self.dims))
+
+    @property
+    def numel(self) -> int:
+        p = 1
+        for d in self.dims:
+            p *= d
+        return p
+
+
+@dataclass(frozen=True)
+class GgufShard:
+    path: pathlib.Path
+    version: int
+    tensor_count: int
+    kv: dict[str, Any]
+    alignment: int
+    data_offset: int
+    file_size: int
+    tensors: tuple[GgufTensorInfo, ...]
+
+
+class _GgufStreamCursor:
+    """Bounded-buffer forward reader for GGUF headers and KV sections."""
+
+    def __init__(self, fh) -> None:
+        self._fh = fh
+        self.pos = 0
+
+    def read_exact(self, n: int) -> bytes:
+        if n == 0:
+            return b""
+        buf = self._fh.read(n)
+        if len(buf) != n:
+            raise ValueError(f"unexpected EOF in GGUF header at offset {self.pos} (wanted {n}, got {len(buf)})")
+        self.pos += n
+        return buf
+
+    def read_u8(self) -> int:
+        return self.read_exact(1)[0]
+
+    def read_u32(self) -> int:
+        return struct.unpack("<I", self.read_exact(4))[0]
+
+    def read_u64(self) -> int:
+        return struct.unpack("<Q", self.read_exact(8))[0]
+
+    def read_str(self) -> str:
+        n = self.read_u64()
+        if n > (64 << 20):
+            raise ValueError(f"implausible GGUF string length {n}")
+        return self.read_exact(n).decode("utf-8", errors="replace")
+
+    def read_value(self, vtype: int) -> Any:
+        if vtype == _GGUF_TYPE_STRING:
+            return self.read_str()
+        if vtype == _GGUF_TYPE_BOOL:
+            return bool(self.read_u8())
+        if vtype == _GGUF_TYPE_ARRAY:
+            elem_type = self.read_u32()
+            count = self.read_u64()
+            if count > 10_000_000:
+                raise ValueError(f"implausible GGUF array length {count}")
+            if elem_type in _SCALAR_STRUCTS:
+                st = _SCALAR_STRUCTS[elem_type]
+                raw = self.read_exact(count * st.size)
+                return list(struct.unpack(f"<{count}{st.format[-1]}", raw)) if count else []
+            if elem_type == _GGUF_TYPE_STRING:
+                return [self.read_str() for _ in range(count)]
+            return [self.read_value(elem_type) for _ in range(count)]
+        st = _SCALAR_STRUCTS.get(vtype)
+        if st is None:
+            raise ValueError(f"unknown GGUF metadata value type {vtype}")
+        return st.unpack(self.read_exact(st.size))[0]
+
+
+def _check_fork_metadata(kv: dict[str, Any]) -> None:
+    for k, v in kv.items():
+        lk = k.lower()
+        lv = str(v).lower() if not isinstance(v, list) else ""
+        for sig in _FORK_SIGNATURES:
+            if sig in lk or sig in lv:
+                raise ValueError(f"unsupported GGUF fork metadata detected ({sig!r} in {k!r})")
+
+
+def expected_ggml_tensor_bytes(ggml_type: int, dims: Sequence[int], name: str = "<tensor>") -> int:
+    """Compute exact GGML packed byte count for `dims = (ne0, ne1, ...)`."""
+    spec = _GGML_TYPE_INFO.get(ggml_type)
+    if spec is None:
+        raise ValueError(
+            f"unsupported or colliding fork ggml_type {ggml_type} on tensor {name!r} "
+            "(supported: F32/F16/BF16, standard Q*/K*/IQ*/TQ*/MXFP4/Q2_0, NVFP4=40, F8_E4M3=43)"
+        )
+    tname, bs, bb, _ = spec
+    if not dims or any(d <= 0 for d in dims):
+        raise ValueError(f"tensor {name!r} has invalid non-positive dims {list(dims)}")
+    ne0 = dims[0]
+    if ne0 % bs != 0:
+        raise ValueError(f"tensor {name!r} ({tname}) row width ne0={ne0} not divisible by block size {bs}")
+    rows = 1
+    for d in dims[1:]:
+        rows *= d
+    return (ne0 // bs) * bb * rows
+
+
+def read_gguf_header(path: pathlib.Path) -> GgufShard:
+    """Read and validate one GGUF v2/v3 shard header, KV table, and exact tensor byte spans."""
+    p = pathlib.Path(path)
+    file_size = p.stat().st_size
+    if file_size < 24:
+        raise ValueError(f"file is too small to be GGUF: {p}")
+
+    with p.open("rb") as fh:
+        cur = _GgufStreamCursor(fh)
+        magic = cur.read_exact(4)
+        if magic != GGUF_MAGIC:
+            raise ValueError(f"invalid GGUF magic {magic!r} in {p}")
+        version = cur.read_u32()
+        if version not in GGUF_SUPPORTED_VERSIONS:
+            raise ValueError(f"unsupported GGUF version {version} in {p} (expected 2 or 3)")
+        tensor_count = cur.read_u64()
+        kv_count = cur.read_u64()
+        if tensor_count > 1_000_000 or kv_count > 1_000_000:
+            raise ValueError(f"implausible GGUF counts tensors={tensor_count} kv={kv_count} in {p}")
+
+        kv: dict[str, Any] = {}
+        for _ in range(kv_count):
+            key = cur.read_str()
+            vtype = cur.read_u32()
+            kv[key] = cur.read_value(vtype)
+        _check_fork_metadata(kv)
+
+        alignment = int(kv.get("general.alignment", 32))
+        if alignment <= 0 or (alignment & (alignment - 1)) != 0:
+            raise ValueError(f"invalid GGUF general.alignment={alignment} in {p}")
+
+        raw_infos: list[tuple[str, tuple[int, ...], int, int]] = []
+        seen_names: set[str] = set()
+        for _ in range(tensor_count):
+            tname = cur.read_str()
+            if not tname or tname in seen_names:
+                raise ValueError(f"invalid or duplicate GGUF tensor name {tname!r} in {p}")
+            seen_names.add(tname)
+            ndims = cur.read_u32()
+            if not (1 <= ndims <= 4):
+                raise ValueError(f"GGUF tensor {tname!r} has invalid n_dims={ndims} in {p}")
+            dims = tuple(cur.read_u64() for _ in range(ndims))
+            gtype = cur.read_u32()
+            toff = cur.read_u64()
+            raw_infos.append((tname, dims, gtype, toff))
+
+        data_offset = _align_up(cur.pos, alignment)
+        if data_offset > file_size:
+            raise ValueError(f"GGUF data_offset {data_offset} exceeds file size {file_size} in {p}")
+
+    # Mandatory per-tensor actual_tensor_bytes == expected_ggml_bytes verification across sorted offsets/EOF.
+    sorted_idx = sorted(range(len(raw_infos)), key=lambda i: raw_infos[i][3])
+    validated: list[GgufTensorInfo | None] = [None] * len(raw_infos)
+    total_data_area = file_size - data_offset
+    for rank_i, orig_idx in enumerate(sorted_idx):
+        tname, dims, gtype, toff = raw_infos[orig_idx]
+        if toff % alignment != 0:
+            raise ValueError(f"GGUF tensor {tname!r} offset {toff} misaligned to general.alignment={alignment}")
+        exp_bytes = expected_ggml_tensor_bytes(gtype, dims, name=tname)
+        next_off = raw_infos[sorted_idx[rank_i + 1]][3] if rank_i + 1 < len(sorted_idx) else total_data_area
+        actual_span = next_off - toff
+        padded_expected = _align_up(exp_bytes, alignment)
+        if actual_span < exp_bytes:
+            extra_hint = (
+                " (colliding fork type such as STQ1_0 overloading type 43 at ~1.312 bpw rejected)"
+                if gtype == 43
+                else ""
+            )
+            raise ValueError(
+                f"GGUF byte-size mismatch for {tname!r} (ggml_type={gtype} {_GGML_TYPE_INFO[gtype][0]}): "
+                f"actual_tensor_bytes={actual_span} < expected_ggml_bytes={exp_bytes}{extra_hint}"
+            )
+        if actual_span > padded_expected:
+            raise ValueError(
+                f"GGUF byte-size mismatch for {tname!r} (ggml_type={gtype} {_GGML_TYPE_INFO[gtype][0]}): "
+                f"actual_tensor_bytes={actual_span} > expected_ggml_bytes={exp_bytes} (aligned {padded_expected})"
+            )
+        validated[orig_idx] = GgufTensorInfo(
+            name=tname,
+            dims=dims,
+            ggml_type=gtype,
+            offset=toff,
+            expected_bytes=exp_bytes,
+            actual_span_bytes=actual_span,
+        )
+
+    return GgufShard(
+        path=p,
+        version=version,
+        tensor_count=tensor_count,
+        kv=kv,
+        alignment=alignment,
+        data_offset=data_offset,
+        file_size=file_size,
+        tensors=tuple(v for v in validated if v is not None),
+    )
+
+
+_SPLIT_GGUF_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
+
+
+def resolve_gguf_shards(input_path: pathlib.Path) -> list[GgufShard]:
+    """Resolve a single `.gguf`, split multi-shard `-00001-of-0000N.gguf`, or directory."""
+    p = pathlib.Path(input_path)
+    if p.is_dir():
+        ggufs = sorted(p.glob("*.gguf"))
+        if not ggufs:
+            raise FileNotFoundError(f"no .gguf files found in directory {p}")
+        split_matches = [m for m in (_SPLIT_GGUF_RE.match(g.name) for g in ggufs) if m is not None]
+        if split_matches:
+            first = min((g for g in ggufs if _SPLIT_GGUF_RE.match(g.name)), key=lambda g: g.name)
+            return resolve_gguf_shards(first)
+        if len(ggufs) == 1:
+            return [read_gguf_header(ggufs[0])]
+        raise ValueError(f"ambiguous multiple non-split .gguf files in {p}: {[g.name for g in ggufs]}")
+
+    if not p.is_file():
+        raise FileNotFoundError(f"GGUF file not found: {p}")
+
+    m = _SPLIT_GGUF_RE.match(p.name)
+    if m is not None:
+        prefix, _, total_str = m.group(1), int(m.group(2)), m.group(3)
+        total = int(total_str)
+        shard_paths: list[pathlib.Path] = []
+        for i in range(1, total + 1):
+            cand = p.with_name(f"{prefix}-{i:05d}-of-{total_str}.gguf")
+            if not cand.is_file():
+                raise FileNotFoundError(f"missing split GGUF shard: {cand}")
+            shard_paths.append(cand)
+        return [read_gguf_header(sp) for sp in shard_paths]
+    return [read_gguf_header(p)]
+
+
+# ---------------------------------------------------------------------------
+# GGUF Block Layout Metadata & Pure-Stdlib Exact fp32 Row Decoders (`15..37`)
+# ---------------------------------------------------------------------------
+
+
+def gguf_row_bytes_for_amf_dtype(dtype: DType, k: int) -> int:
+    spec = _AMF_GGUF_BLOCK_INFO.get(dtype)
+    if spec is None:
+        raise ValueError(f"{dtype.name} is not a raw GGUF block dtype")
+    bs, bb = spec
+    if k <= 0 or k % bs != 0:
+        raise ValueError(f"{dtype.name} requires k > 0 divisible by {bs}, got {k}")
+    return (k // bs) * bb
+
+
+def _read_f16(raw: memoryview | bytes, off: int) -> float:
+    return float(struct.unpack_from("<e", raw, off)[0])
+
+
+def _read_u16(raw: memoryview | bytes, off: int) -> int:
+    return struct.unpack_from("<H", raw, off)[0]
+
+
+def _read_u32(raw: memoryview | bytes, off: int) -> int:
+    return struct.unpack_from("<I", raw, off)[0]
+
+
+def _read_i8(raw: memoryview | bytes, off: int) -> int:
+    b = raw[off]
+    return b - 256 if b >= 128 else b
+
+
+def _get_scale_min_k4(j: int, q: memoryview) -> tuple[int, int]:
+    if j < 4:
+        return q[j] & 63, q[j + 4] & 63
+    return (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4)
+
+
+def dequantize_gguf_amf_row_f32(dtype: DType, row_bytes: bytes | bytearray | memoryview, k: int) -> list[float]:
+    """Decode one row of raw GGML blocks (`DType.GGUF_Q4_0..GGUF_Q2_0`) to fp32."""
+    bs, bb = _AMF_GGUF_BLOCK_INFO[dtype]
+    if k <= 0 or k % bs != 0:
+        raise ValueError(f"{dtype.name} row width k={k} not divisible by block size {bs}")
+    nb = k // bs
+    if len(row_bytes) != nb * bb:
+        raise ValueError(f"{dtype.name} row length {len(row_bytes)} != expected {nb * bb}")
+    mv = memoryview(row_bytes)
+    out = [0.0] * k
+
+    if dtype == DType.GGUF_Q4_0:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            base = b * 32
+            for j in range(16):
+                byte = blk[2 + j]
+                out[base + j] = ((byte & 0x0F) - 8) * d
+                out[base + j + 16] = ((byte >> 4) - 8) * d
+        return out
+
+    if dtype == DType.GGUF_Q4_1:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            m = _read_f16(blk, 2)
+            base = b * 32
+            for j in range(16):
+                byte = blk[4 + j]
+                out[base + j] = (byte & 0x0F) * d + m
+                out[base + j + 16] = (byte >> 4) * d + m
+        return out
+
+    if dtype == DType.GGUF_Q5_0:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            qh = _read_u32(blk, 2)
+            base = b * 32
+            for j in range(16):
+                byte = blk[6 + j]
+                xh0 = ((qh >> j) << 4) & 0x10
+                xh1 = (qh >> (j + 12)) & 0x10
+                out[base + j] = (((byte & 0x0F) | xh0) - 16) * d
+                out[base + j + 16] = (((byte >> 4) | xh1) - 16) * d
+        return out
+
+    if dtype == DType.GGUF_Q5_1:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            m = _read_f16(blk, 2)
+            qh = _read_u32(blk, 4)
+            base = b * 32
+            for j in range(16):
+                byte = blk[8 + j]
+                xh0 = ((qh >> j) << 4) & 0x10
+                xh1 = (qh >> (j + 12)) & 0x10
+                out[base + j] = ((byte & 0x0F) | xh0) * d + m
+                out[base + j + 16] = ((byte >> 4) | xh1) * d + m
+        return out
+
+    if dtype == DType.GGUF_Q8_0:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            base = b * 32
+            for j in range(32):
+                out[base + j] = _read_i8(blk, 2 + j) * d
+        return out
+
+    if dtype == DType.GGUF_Q2_0:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            base = b * 64
+            for j in range(64):
+                q = (blk[2 + j // 4] >> ((j % 4) * 2)) & 0x03
+                out[base + j] = (q - 1) * d
+        return out
+
+    if dtype == DType.GGUF_MXFP4:
+        tbl = _KVALUES_MXFP4
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            e = blk[0]
+            d = math.nan if e == 0xFF else math.ldexp(1.0, e - 127) * 0.5
+            base = b * 32
+            for j in range(16):
+                byte = blk[1 + j]
+                out[base + j] = tbl[byte & 0x0F] * d
+                out[base + j + 16] = tbl[byte >> 4] * d
+        return out
+
+    if dtype == DType.GGUF_Q2_K:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            scales = blk[0:16]
+            d = _read_f16(blk, 80)
+            mn = _read_f16(blk, 82)
+            y_off = b * 256
+            q_off = 16
+            is_i = 0
+            for _ in range(2):
+                shift = 0
+                for _ in range(4):
+                    sc0 = scales[is_i]
+                    is_i += 1
+                    dl0 = d * (sc0 & 0x0F)
+                    ml0 = mn * (sc0 >> 4)
+                    for l in range(16):
+                        out[y_off + l] = dl0 * ((blk[q_off + l] >> shift) & 3) - ml0
+                    y_off += 16
+                    sc1 = scales[is_i]
+                    is_i += 1
+                    dl1 = d * (sc1 & 0x0F)
+                    ml1 = mn * (sc1 >> 4)
+                    for l in range(16):
+                        out[y_off + l] = dl1 * ((blk[q_off + 16 + l] >> shift) & 3) - ml1
+                    y_off += 16
+                    shift += 2
+                q_off += 32
+        return out
+
+    if dtype == DType.GGUF_Q3_K:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            hm = blk[0:32]
+            qs = blk[32:96]
+            d_all = _read_f16(blk, 108)
+            a0, a1, a2 = struct.unpack_from("<3I", blk, 96)
+            km1, km2 = 0x03030303, 0x0F0F0F0F
+            aux = [
+                (a0 & km2) | (((a2 >> 0) & km1) << 4),
+                (a1 & km2) | (((a2 >> 2) & km1) << 4),
+                ((a0 >> 4) & km2) | (((a2 >> 4) & km1) << 4),
+                ((a1 >> 4) & km2) | (((a2 >> 6) & km1) << 4),
+            ]
+            sc_bytes = struct.unpack("<16b", struct.pack("<4I", *aux))
+            y_off = b * 256
+            q_off = 0
+            is_i = 0
+            m = 1
+            for _ in range(2):
+                shift = 0
+                for _ in range(4):
+                    dl0 = d_all * (sc_bytes[is_i] - 32)
+                    is_i += 1
+                    for l in range(16):
+                        q2 = (qs[q_off + l] >> shift) & 3
+                        out[y_off + l] = dl0 * (q2 - (0 if (hm[l] & m) else 4))
+                    y_off += 16
+                    dl1 = d_all * (sc_bytes[is_i] - 32)
+                    is_i += 1
+                    for l in range(16):
+                        q2 = (qs[q_off + 16 + l] >> shift) & 3
+                        out[y_off + l] = dl1 * (q2 - (0 if (hm[16 + l] & m) else 4))
+                    y_off += 16
+                    shift += 2
+                    m <<= 1
+                q_off += 32
+        return out
+
+    if dtype == DType.GGUF_Q4_K:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            mn = _read_f16(blk, 2)
+            scales = blk[4:16]
+            qs = blk[16:144]
+            y_off = b * 256
+            q_off = 0
+            is_i = 0
+            for _ in range(4):
+                sc0, m0 = _get_scale_min_k4(is_i, scales)
+                sc1, m1 = _get_scale_min_k4(is_i + 1, scales)
+                d1, mm1 = d * sc0, mn * m0
+                d2, mm2 = d * sc1, mn * m1
+                for l in range(32):
+                    out[y_off + l] = d1 * (qs[q_off + l] & 0x0F) - mm1
+                    out[y_off + 32 + l] = d2 * (qs[q_off + l] >> 4) - mm2
+                q_off += 32
+                y_off += 64
+                is_i += 2
+        return out
+
+    if dtype == DType.GGUF_Q5_K:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            mn = _read_f16(blk, 2)
+            scales = blk[4:16]
+            qh = blk[16:48]
+            ql = blk[48:176]
+            y_off = b * 256
+            q_off = 0
+            is_i = 0
+            mask1, mask2 = 1, 2
+            for _ in range(4):
+                sc0, m0 = _get_scale_min_k4(is_i, scales)
+                sc1, m1 = _get_scale_min_k4(is_i + 1, scales)
+                d1, mm1 = d * sc0, mn * m0
+                d2, mm2 = d * sc1, mn * m1
+                for l in range(32):
+                    h1 = 16 if (qh[l] & mask1) else 0
+                    h2 = 16 if (qh[l] & mask2) else 0
+                    out[y_off + l] = d1 * ((ql[q_off + l] & 0x0F) + h1) - mm1
+                    out[y_off + 32 + l] = d2 * ((ql[q_off + l] >> 4) + h2) - mm2
+                q_off += 32
+                y_off += 64
+                is_i += 2
+                mask1 <<= 2
+                mask2 <<= 2
+        return out
+
+    if dtype == DType.GGUF_Q6_K:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 208)
+            ql_off, qh_off, sc_off, y_off = 0, 128, 192, b * 256
+            for _ in range(2):
+                for l in range(32):
+                    is_i = l // 16
+                    qh_b = blk[qh_off + l]
+                    q1 = ((blk[ql_off + l] & 0x0F) | (((qh_b >> 0) & 3) << 4)) - 32
+                    q2 = ((blk[ql_off + l + 32] & 0x0F) | (((qh_b >> 2) & 3) << 4)) - 32
+                    q3 = ((blk[ql_off + l] >> 4) | (((qh_b >> 4) & 3) << 4)) - 32
+                    q4 = ((blk[ql_off + l + 32] >> 4) | (((qh_b >> 6) & 3) << 4)) - 32
+                    out[y_off + l + 0] = d * _read_i8(blk, sc_off + is_i + 0) * q1
+                    out[y_off + l + 32] = d * _read_i8(blk, sc_off + is_i + 2) * q2
+                    out[y_off + l + 64] = d * _read_i8(blk, sc_off + is_i + 4) * q3
+                    out[y_off + l + 96] = d * _read_i8(blk, sc_off + is_i + 6) * q4
+                y_off += 128
+                ql_off += 64
+                qh_off += 32
+                sc_off += 8
+        return out
+
+    if dtype == DType.GGUF_IQ4_NL:
+        tbl4 = _KVALUES_IQ4NL
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            base = b * 32
+            for j in range(16):
+                byte = blk[2 + j]
+                out[base + j] = d * tbl4[byte & 0x0F]
+                out[base + j + 16] = d * tbl4[byte >> 4]
+        return out
+
+    if dtype == DType.GGUF_IQ4_XS:
+        tbl4 = _KVALUES_IQ4NL
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            scales_h = _read_u16(blk, 2)
+            scales_l = blk[4:8]
+            qs = blk[8:136]
+            base = b * 256
+            for ib in range(8):
+                ls = ((scales_l[ib // 2] >> (4 * (ib % 2))) & 0x0F) | (((scales_h >> (2 * ib)) & 3) << 4)
+                dl = d * (ls - 32)
+                q_sub = qs[ib * 16 : (ib + 1) * 16]
+                y_sub = base + ib * 32
+                for j in range(16):
+                    out[y_sub + j] = dl * tbl4[q_sub[j] & 0x0F]
+                    out[y_sub + j + 16] = dl * tbl4[q_sub[j] >> 4]
+        return out
+
+    if dtype == DType.GGUF_TQ1_0:
+        pow3 = (1, 3, 9, 27, 81)
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            qs, qh = blk[0:48], blk[48:52]
+            d = _read_f16(blk, 52)
+            y_off = b * 256
+            for n in range(5):
+                for m in range(32):
+                    xi = (((qs[m] * pow3[n]) & 0xFF) * 3) >> 8
+                    out[y_off] = (xi - 1) * d
+                    y_off += 1
+            for n in range(5):
+                for m in range(16):
+                    xi = (((qs[32 + m] * pow3[n]) & 0xFF) * 3) >> 8
+                    out[y_off] = (xi - 1) * d
+                    y_off += 1
+            for n in range(4):
+                for j in range(4):
+                    xi = (((qh[j] * pow3[n]) & 0xFF) * 3) >> 8
+                    out[y_off] = (xi - 1) * d
+                    y_off += 1
+        return out
+
+    if dtype == DType.GGUF_TQ2_0:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            qs = blk[0:64]
+            d = _read_f16(blk, 64)
+            y_off = b * 256
+            for j in (0, 32):
+                for l in range(4):
+                    for m in range(32):
+                        q = (qs[j + m] >> (l * 2)) & 3
+                        out[y_off] = (q - 1) * d
+                        y_off += 1
+        return out
+
+    _ensure_iq_tables()
+    ksigns = _KSIGNS_IQ2XS
+    kmask = _KMASK_IQ2XS
+
+    if dtype == DType.GGUF_IQ1_S:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            qs = blk[2:34]
+            q_off, y_off = 0, b * 256
+            for ib in range(8):
+                qh_w = _read_u16(blk, 34 + ib * 2)
+                dl = d * (2 * ((qh_w >> 12) & 7) + 1)
+                delta = -0.125 if (qh_w & 0x8000) else 0.125
+                for l in range(4):
+                    grid = _IQ1S_GRID[qs[q_off + l] | (((qh_w >> (3 * l)) & 7) << 8)]
+                    for j in range(8):
+                        gb = (grid >> (j * 8)) & 0xFF
+                        gs = gb - 256 if gb >= 128 else gb
+                        out[y_off + j] = dl * (gs + delta)
+                    y_off += 8
+                q_off += 4
+        return out
+
+    if dtype == DType.GGUF_IQ1_M:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            sc_bytes = blk[48:56]
+            sc0, sc1, sc2, sc3 = struct.unpack_from("<4H", sc_bytes, 0)
+            d_bits = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0) | ((sc2 >> 4) & 0x0F00) | (sc3 & 0xF000)
+            d = float(struct.unpack("<e", struct.pack("<H", d_bits))[0])
+            qs, qh = blk[0:32], blk[32:48]
+            q_off, qh_off, y_off = 0, 0, b * 256
+            for ib in range(8):
+                sc_w = _read_u16(sc_bytes, (ib // 2) * 2)
+                sb = 6 * (ib % 2)
+                dl1 = d * (2 * ((sc_w >> sb) & 7) + 1)
+                dl2 = d * (2 * ((sc_w >> (sb + 3)) & 7) + 1)
+                idxs = (
+                    qs[q_off + 0] | ((qh[qh_off + 0] << 8) & 0x700),
+                    qs[q_off + 1] | ((qh[qh_off + 0] << 4) & 0x700),
+                    qs[q_off + 2] | ((qh[qh_off + 1] << 8) & 0x700),
+                    qs[q_off + 3] | ((qh[qh_off + 1] << 4) & 0x700),
+                )
+                deltas = (
+                    -0.125 if (qh[qh_off + 0] & 0x08) else 0.125,
+                    -0.125 if (qh[qh_off + 0] & 0x80) else 0.125,
+                    -0.125 if (qh[qh_off + 1] & 0x08) else 0.125,
+                    -0.125 if (qh[qh_off + 1] & 0x80) else 0.125,
+                )
+                for l in range(4):
+                    dl = dl1 if l < 2 else dl2
+                    grid = _IQ1S_GRID[idxs[l]]
+                    dl_d = deltas[l]
+                    for j in range(8):
+                        gb = (grid >> (j * 8)) & 0xFF
+                        gs = gb - 256 if gb >= 128 else gb
+                        out[y_off + j] = dl * (gs + dl_d)
+                    y_off += 8
+                q_off += 4
+                qh_off += 2
+        return out
+
+    if dtype == DType.GGUF_IQ2_XXS:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            y_off = b * 256
+            for ib32 in range(8):
+                aux0, aux1 = struct.unpack_from("<2I", blk, 2 + ib32 * 8)
+                db = d * (0.5 + (aux1 >> 28)) * 0.25
+                for l in range(4):
+                    grid = _IQ2XXS_GRID[(aux0 >> (l * 8)) & 0xFF]
+                    signs = ksigns[(aux1 >> (7 * l)) & 127]
+                    for j in range(8):
+                        gb = (grid >> (j * 8)) & 0xFF
+                        out[y_off + j] = db * gb * (-1.0 if (signs & kmask[j]) else 1.0)
+                    y_off += 8
+        return out
+
+    if dtype == DType.GGUF_IQ2_XS:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            scales = blk[66:74]
+            y_off = b * 256
+            for ib32 in range(8):
+                db = (d * (0.5 + (scales[ib32] & 0x0F)) * 0.25, d * (0.5 + (scales[ib32] >> 4)) * 0.25)
+                for l in range(4):
+                    qsw = _read_u16(blk, 2 + (4 * ib32 + l) * 2)
+                    grid = _IQ2XS_GRID[qsw & 511]
+                    signs = ksigns[qsw >> 9]
+                    dl = db[l // 2]
+                    for j in range(8):
+                        gb = (grid >> (j * 8)) & 0xFF
+                        out[y_off + j] = dl * gb * (-1.0 if (signs & kmask[j]) else 1.0)
+                    y_off += 8
+        return out
+
+    if dtype == DType.GGUF_IQ2_S:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            qs_all, qh, scales = blk[2:66], blk[66:74], blk[74:82]
+            qs_off, signs_off, y_off = 0, 32, b * 256
+            for ib32 in range(8):
+                db = (d * (0.5 + (scales[ib32] & 0x0F)) * 0.25, d * (0.5 + (scales[ib32] >> 4)) * 0.25)
+                for l in range(4):
+                    dl = db[l // 2]
+                    qh_hi = (qh[ib32] << (8 - 2 * l)) & 0x300
+                    grid = _IQ2S_GRID[qs_all[qs_off + l] | qh_hi]
+                    sb = qs_all[signs_off + l]
+                    for j in range(8):
+                        gb = (grid >> (j * 8)) & 0xFF
+                        out[y_off + j] = dl * gb * (-1.0 if (sb & kmask[j]) else 1.0)
+                    y_off += 8
+                qs_off += 4
+                signs_off += 4
+        return out
+
+    if dtype == DType.GGUF_IQ3_XXS:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            qs, sc_signs = blk[2:66], blk[66:98]
+            qs_off, y_off = 0, b * 256
+            for ib32 in range(8):
+                aux32 = _read_u32(sc_signs, 4 * ib32)
+                db = d * (0.5 + (aux32 >> 28)) * 0.5
+                for l in range(4):
+                    signs = ksigns[(aux32 >> (7 * l)) & 127]
+                    g1 = _IQ3XXS_GRID[qs[qs_off + 2 * l]]
+                    g2 = _IQ3XXS_GRID[qs[qs_off + 2 * l + 1]]
+                    for j in range(4):
+                        out[y_off + j] = db * ((g1 >> (j * 8)) & 0xFF) * (-1.0 if (signs & kmask[j]) else 1.0)
+                        out[y_off + 4 + j] = db * ((g2 >> (j * 8)) & 0xFF) * (-1.0 if (signs & kmask[4 + j]) else 1.0)
+                    y_off += 8
+                qs_off += 8
+        return out
+
+    if dtype == DType.GGUF_IQ3_S:
+        for b in range(nb):
+            blk = mv[b * bb : (b + 1) * bb]
+            d = _read_f16(blk, 0)
+            qs, qh, signs_all, scales = blk[2:66], blk[66:74], blk[74:106], blk[106:110]
+            qs_off, qh_off, signs_off, y_off = 0, 0, 0, b * 256
+            for pair in range(4):
+                sc_b = scales[pair]
+                dbs = (d * (1 + 2 * (sc_b & 0x0F)), d * (1 + 2 * (sc_b >> 4)))
+                for half_i in range(2):
+                    db = dbs[half_i]
+                    qb = qh[qh_off + half_i]
+                    for l in range(4):
+                        g1 = _IQ3S_GRID[qs[qs_off + 2 * l] | ((qb << (8 - 2 * l)) & 256)]
+                        g2 = _IQ3S_GRID[qs[qs_off + 2 * l + 1] | ((qb << (7 - 2 * l)) & 256)]
+                        sb = signs_all[signs_off + l]
+                        for j in range(4):
+                            out[y_off + j] = db * ((g1 >> (j * 8)) & 0xFF) * (-1.0 if (sb & kmask[j]) else 1.0)
+                            out[y_off + 4 + j] = db * ((g2 >> (j * 8)) & 0xFF) * (-1.0 if (sb & kmask[4 + j]) else 1.0)
+                        y_off += 8
+                    qs_off += 8
+                    signs_off += 4
+                qh_off += 2
+        return out
+
+    raise ValueError(f"unsupported GGUF AMF dtype {dtype.name}")
+
+
+# ---------------------------------------------------------------------------
+# Tensor Name Normalization, Unrolled Recurrent Deduplication & Metadata Sync
+# ---------------------------------------------------------------------------
+
+_GGUF_BLK_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
+_GGUF_VISION_BLK_RE = re.compile(r"^v\.blk\.(\d+)\.(.+)$")
+_GGUF_EXP_RE = re.compile(r"^(ffn_gate|ffn_up|ffn_down)\.(\d+)\.(weight|bias)$")
+
+_GGUF_LEAF_MAP = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "attn_norm.bias": "input_layernorm.bias",
+    "ffn_norm.weight": "post_attention_layernorm.weight",
+    "ffn_norm.bias": "post_attention_layernorm.bias",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_q.bias": "self_attn.q_proj.bias",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_k.bias": "self_attn.k_proj.bias",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_v.bias": "self_attn.v_proj.bias",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "attn_output.bias": "self_attn.o_proj.bias",
+    "attn_qkv.weight": "self_attn.qkv_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "attn_gate.weight": "self_attn.gate_proj.weight",
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "ffn_gate_inp.weight": "mlp.gate.weight",
+    "ffn_gate_inp.bias": "mlp.gate.bias",
+    "ffn_exp_probs_b.bias": "mlp.gate.e_score_correction_bias",
+    "ffn_gate_shexp.weight": "mlp.shared_expert.gate_proj.weight",
+    "ffn_up_shexp.weight": "mlp.shared_expert.up_proj.weight",
+    "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
+    "ffn_gate_shexp_inp.weight": "mlp.shared_expert_gate.weight",
+    "ffn_gate_inp_shexp.weight": "mlp.shared_expert_gate.weight",
+}
+
+_GGUF_VISION_LEAF_MAP = {
+    "attn_qkv.weight": "attn.qkv.weight",
+    "attn_qkv.bias": "attn.qkv.bias",
+    "attn_q.weight": "attn.q_proj.weight",
+    "attn_q.bias": "attn.q_proj.bias",
+    "attn_k.weight": "attn.k_proj.weight",
+    "attn_k.bias": "attn.k_proj.bias",
+    "attn_v.weight": "attn.v_proj.weight",
+    "attn_v.bias": "attn.v_proj.bias",
+    "attn_out.weight": "attn.proj.weight",
+    "attn_out.bias": "attn.proj.bias",
+    "ln1.weight": "norm1.weight",
+    "ln1.bias": "norm1.bias",
+    "ln2.weight": "norm2.weight",
+    "ln2.bias": "norm2.bias",
+    "ffn_up.weight": "mlp.fc1.weight",
+    "ffn_up.bias": "mlp.fc1.bias",
+    "ffn_down.weight": "mlp.fc2.weight",
+    "ffn_down.bias": "mlp.fc2.bias",
+}
+
+_GGUF_TOP_MAP = {
+    "token_embd.weight": "embed_tokens.weight",
+    "output_norm.weight": "norm.weight",
+    "output_norm.bias": "norm.bias",
+    "output.weight": "lm_head.weight",
+    "output.bias": "lm_head.bias",
+    "v.patch_embd.weight": "vision.patch_embed.proj.weight",
+    "v.patch_embd.bias": "vision.patch_embed.proj.bias",
+    "v.position_embd.weight": "vision.pos_embed.weight",
+    "v.post_ln.weight": "vision.norm.weight",
+    "v.post_ln.bias": "vision.norm.bias",
+}
+
+
+def normalize_gguf_tensor_name(raw_name: str, *, is_clip: bool = False) -> str:
+    """Normalize a GGUF tensor name (`blk.N.*`, `v.blk.N.*`, `mm.*`) to canonical `.amf` naming."""
+    if raw_name in _GGUF_TOP_MAP:
+        return _normalize_name(_GGUF_TOP_MAP[raw_name])
+    mv = _GGUF_VISION_BLK_RE.match(raw_name)
+    if mv is not None:
+        blk_idx, rest = mv.group(1), mv.group(2)
+        leaf = _GGUF_VISION_LEAF_MAP.get(rest, rest)
+        return _normalize_name(f"vision.blocks.{blk_idx}.{leaf}")
+    if raw_name.startswith("mm."):
+        return _normalize_name("vision.merger." + raw_name[3:])
+    if is_clip and not is_vision_tensor(raw_name):
+        return _normalize_name(f"vision.{raw_name}")
+    mb = _GGUF_BLK_RE.match(raw_name)
+    if mb is not None:
+        blk_idx, rest = mb.group(1), mb.group(2)
+        if rest in _GGUF_LEAF_MAP:
+            return _normalize_name(f"layers.{blk_idx}.{_GGUF_LEAF_MAP[rest]}")
+        me = _GGUF_EXP_RE.match(rest)
+        if me is not None:
+            proj_map = {"ffn_gate": "gate_proj", "ffn_up": "up_proj", "ffn_down": "down_proj"}
+            return _normalize_name(f"layers.{blk_idx}.mlp.experts.{me.group(2)}.{proj_map[me.group(1)]}.{me.group(3)}")
+        return _normalize_name(f"layers.{blk_idx}.{rest}")
+    return _normalize_name(raw_name)
+
+
+def _tensor_content_digest(fh, data_offset: int, t: GgufTensorInfo) -> bytes:
+    """Compute SHA-256 of one tensor payload incrementally without buffering huge arrays."""
+    h = hashlib.sha256()
+    fh.seek(data_offset + t.offset)
+    left = t.expected_bytes
+    while left > 0:
+        chunk = fh.read(min(1 << 20, left))
+        if not chunk:
+            raise ValueError(f"unexpected EOF reading {t.name!r}")
+        h.update(chunk)
+        left -= len(chunk)
+    return h.digest()
+
+
+def _deduplicate_unrolled_recurrent_layers(
+    entries: Sequence[tuple[int, GgufShard, GgufTensorInfo]],
+    kv: dict[str, Any],
+) -> tuple[list[tuple[int, GgufShard, GgufTensorInfo]], int, int]:
+    """Deduplicate unrolled recurrent `blk.N.*` aliases (e.g. `block_count=48` -> `24` physical layers)."""
+    arch = str(kv.get("general.architecture") or "")
+    reported_blocks = kv.get(f"{arch}.block_count") if arch else None
+    layer_buckets: dict[int, list[tuple[int, GgufShard, GgufTensorInfo]]] = {}
+    non_layer: list[tuple[int, GgufShard, GgufTensorInfo]] = []
+    for item in entries:
+        _, _, t = item
+        m = _GGUF_BLK_RE.match(t.name)
+        if m is None:
+            non_layer.append(item)
+        else:
+            layer_buckets.setdefault(int(m.group(1)), []).append(item)
+
+    if len(layer_buckets) <= 1:
+        return list(entries), len(layer_buckets), 0
+
+    sig_to_first_layer: dict[tuple[tuple[str, tuple[int, ...], int, int | bytes], ...], int] = {}
+    opened: dict[int, Any] = {}
+    kept_layers: dict[int, list[tuple[int, GgufShard, GgufTensorInfo]]] = {}
+    dedup_count = 0
+    try:
+        for _, sh, _ in entries:
+            if id(sh) not in opened:
+                opened[id(sh)] = sh.path.open("rb")
+        for l_idx in sorted(layer_buckets):
+            items = sorted(layer_buckets[l_idx], key=lambda x: x[2].name)
+            # Build layer signature using (leaf_name, dims, ggml_type, physical_ptr_or_digest).
+            sig_parts: list[tuple[str, tuple[int, ...], int, int | bytes]] = []
+            for s_idx, sh, t in items:
+                m = _GGUF_BLK_RE.match(t.name)
+                assert m is not None
+                leaf = m.group(2)
+                digest = _tensor_content_digest(opened[id(sh)], sh.data_offset, t)
+                sig_parts.append((leaf, t.dims, t.ggml_type, digest))
+            sig = tuple(sig_parts)
+            # Only collapse duplicate layers cleanly in the upper recurrent unrolled band or alias offsets.
+            prev_layer = sig_to_first_layer.get(sig)
+            if prev_layer is not None and (
+                reported_blocks is None or l_idx >= len(layer_buckets) // 2 or int(reported_blocks) > 24
+            ):
+                dedup_count += 1
+                continue
+            sig_to_first_layer[sig] = l_idx
+            kept_layers[l_idx] = items
+    finally:
+        for fh in opened.values():
+            fh.close()
+
+    kept: list[tuple[int, GgufShard, GgufTensorInfo]] = list(non_layer)
+    for l_idx in sorted(kept_layers):
+        kept.extend(kept_layers[l_idx])
+    return kept, len(kept_layers), dedup_count
+
+
+def _build_synthesized_hf_tokenizer_bytes(kv: dict[str, Any]) -> bytes | None:
+    tokens = kv.get("tokenizer.ggml.tokens")
+    if not isinstance(tokens, list) or not tokens:
+        return None
+    vocab = {str(tok): idx for idx, tok in enumerate(tokens)}
+    scores = kv.get("tokenizer.ggml.scores")
+    merges = kv.get("tokenizer.ggml.merges")
+    tok_model = str(kv.get("tokenizer.ggml.model") or "gpt2")
+    added: list[dict[str, Any]] = []
+    for id_key in ("tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id", "tokenizer.ggml.unk_token_id"):
+        if id_key in kv:
+            tid = int(kv[id_key])
+            if 0 <= tid < len(tokens):
+                added.append({"id": tid, "content": str(tokens[tid]), "special": True})
+    model_obj: dict[str, Any]
+    if tok_model == "llama" and isinstance(scores, list) and len(scores) == len(tokens):
+        model_obj = {
+            "type": "Unigram",
+            "unk_id": int(kv.get("tokenizer.ggml.unk_token_id", 0)),
+            "vocab": [[str(tok), float(sc)] for tok, sc in zip(tokens, scores)],
+        }
+    else:
+        model_obj = {
+            "type": "BPE",
+            "vocab": vocab,
+            "merges": [str(m) for m in merges] if isinstance(merges, list) else [],
+        }
+    payload = {
+        "version": "1.0",
+        "added_tokens": added,
+        "model": model_obj,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _build_synthesized_config_bytes(
+    kv: dict[str, Any],
+    *,
+    physical_layers: int,
+    dedup_layers: int,
+) -> bytes:
+    arch = str(kv.get("general.architecture") or "llama")
+    cfg: dict[str, Any] = {
+        "model_type": arch,
+    }
+    if arch == "dflash":
+        cfg["architectures"] = ["DFlashForCausalLM"]
+        cfg["draft_kind"] = "dflash"
+    elif arch == "clip":
+        cfg["architectures"] = ["ClipVisionModel"]
+    else:
+        cfg["architectures"] = [f"{arch[:1].upper()}{arch[1:]}ForCausalLM"]
+
+    map_fields = (
+        (f"{arch}.embedding_length", "hidden_size"),
+        (f"{arch}.feed_forward_length", "intermediate_size"),
+        (f"{arch}.attention.head_count", "num_attention_heads"),
+        (f"{arch}.attention.head_count_kv", "num_key_value_heads"),
+        (f"{arch}.attention.key_length", "head_dim"),
+        (f"{arch}.attention.layer_norm_rms_epsilon", "rms_norm_eps"),
+        (f"{arch}.context_length", "max_position_embeddings"),
+        (f"{arch}.rope.freq_base", "rope_theta"),
+        (f"{arch}.expert_count", "num_local_experts"),
+        (f"{arch}.expert_used_count", "num_experts_per_tok"),
+        (f"{arch}.block_count", "num_hidden_layers"),
+    )
+    for g_k, h_k in map_fields:
+        if g_k in kv:
+            cfg[h_k] = kv[g_k]
+    if physical_layers > 0:
+        cfg["physical_num_hidden_layers"] = physical_layers
+        if dedup_layers > 0:
+            cfg["deduplicated_unrolled_layers"] = dedup_layers
+    tokens = kv.get("tokenizer.ggml.tokens")
+    if isinstance(tokens, list) and tokens:
+        cfg["vocab_size"] = len(tokens)
+    for g_k, h_k in (
+        ("tokenizer.ggml.bos_token_id", "bos_token_id"),
+        ("tokenizer.ggml.eos_token_id", "eos_token_id"),
+    ):
+        if g_k in kv:
+            cfg[h_k] = int(kv[g_k])
+    return json.dumps(cfg, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _extract_hf_vocab_size_and_specials(tokenizer_json_bytes: bytes) -> tuple[int, dict[str, int]]:
+    obj = json.loads(tokenizer_json_bytes.decode("utf-8"))
+    vocab_obj = obj.get("model", {}).get("vocab") if isinstance(obj, dict) else None
+    specials: dict[str, int] = {}
+    max_id = -1
+    if isinstance(vocab_obj, dict):
+        for tok, tid in vocab_obj.items():
+            if isinstance(tid, int) and tid > max_id:
+                max_id = tid
+        base_len = len(vocab_obj)
+    elif isinstance(vocab_obj, list):
+        base_len = len(vocab_obj)
+        max_id = base_len - 1
+    else:
+        raise ValueError("external tokenizer.json missing valid model.vocab")
+    added = obj.get("added_tokens") or []
+    added_extra = 0
+    if isinstance(added, list):
+        for item in added:
+            if isinstance(item, dict) and isinstance(item.get("id"), int) and isinstance(item.get("content"), str):
+                tid = int(item["id"])
+                specials[item["content"]] = tid
+                if tid > max_id:
+                    max_id = tid
+                if isinstance(vocab_obj, dict) and item["content"] not in vocab_obj:
+                    added_extra += 1
+    return max(base_len + added_extra, max_id + 1), specials
+
+
+def _cross_check_hf_tokenizer_with_gguf(tokenizer_json_bytes: bytes, kv: dict[str, Any]) -> None:
+    ggml_tokens = kv.get("tokenizer.ggml.tokens")
+    if not isinstance(ggml_tokens, list) or not ggml_tokens:
+        return
+    hf_vocab_size, hf_specials = _extract_hf_vocab_size_and_specials(tokenizer_json_bytes)
+    if hf_vocab_size != len(ggml_tokens):
+        raise ValueError(
+            f"external HF tokenizer.json vocab size ({hf_vocab_size}) disagrees with "
+            f"GGUF tokenizer.ggml.tokens ({len(ggml_tokens)})"
+        )
+    for id_key in ("tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id"):
+        if id_key in kv:
+            tid = int(kv[id_key])
+            if 0 <= tid < len(ggml_tokens):
+                expected_tok = str(ggml_tokens[tid])
+                if expected_tok in hf_specials and hf_specials[expected_tok] != tid:
+                    raise ValueError(
+                        f"external HF tokenizer.json token {expected_tok!r} id={hf_specials[expected_tok]} "
+                        f"conflicts with GGUF {id_key}={tid}"
+                    )
+
+
+def _unsplit_nvfp4_row(row_raw: bytes | memoryview, k: int) -> tuple[bytes, bytes]:
+    """Losslessly convert one GGUF `NVFP4` row (`36B/64` split-half nibbles) to planar `nvfp4_g16`."""
+    blocks = k // 64
+    data_out = bytearray(k // 2)
+    scale_out = bytearray(k // 16)
+    mv = memoryview(row_raw)
+    d_pos = 0
+    s_pos = 0
+    for b in range(blocks):
+        blk = mv[b * 36 : (b + 1) * 36]
+        scale_out[s_pos : s_pos + 4] = blk[0:4]
+        s_pos += 4
+        qs = blk[4:36]
+        for sb in range(4):
+            qsub = qs[sb * 8 : (sb + 1) * 8]
+            nib = [qsub[j] & 0x0F for j in range(8)] + [qsub[j] >> 4 for j in range(8)]
+            for i in range(8):
+                data_out[d_pos + i] = nib[2 * i] | (nib[2 * i + 1] << 4)
+            d_pos += 8
+    return bytes(data_out), bytes(scale_out)
+
+
+@dataclass(frozen=True)
+class _PlannedGgufEntry:
+    name: str
+    kind: TensorKind
+    dtype: DType
+    quant_bits: int
+    group_size: int
+    layer: int
+    expert: int
+    shape: tuple[int, ...]
+    shard: GgufShard
+    src_offset: int
+    src_bytes: int
+    src_ggml_type: int
+    data_convert: str | None  # None, "f16_to_bf16", "bf16_to_f16", "gguf_nvfp4"
+    scale_shard: GgufShard | None
+    scale_info: GgufTensorInfo | None
+    fp8_mode: str | None  # None, "fp8_row", "fp8_tensor"
+    data_bytes: int
+    params_offset: int
+    params_bytes: int
+    blob_bytes: int
+
+
+def _decode_gguf_float_array(shard: GgufShard, info: GgufTensorInfo) -> bytes:
+    with shard.path.open("rb") as fh:
+        fh.seek(shard.data_offset + info.offset)
+        raw = fh.read(info.expected_bytes)
+    if info.ggml_type == 0:  # F32
+        return raw
+    if info.ggml_type == 30:  # BF16 -> F32 lossless
+        return bytes(_bf16_to_f32_bytes(raw))
+    if info.ggml_type == 1:  # F16 -> F32 exact
+        cnt = info.expected_bytes // 2
+        return struct.pack(f"<{cnt}f", *struct.unpack(f"<{cnt}e", raw))
+    raise ValueError(f"unsupported FP8 companion scale type {info.ggml_type} on {info.name!r}")
+
+
+def pack_amf_from_gguf(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    *,
+    model_id: str | None = None,
+    dtype_mode: str = "auto",
+    cold_experts: Iterable[tuple[int, int]] = (),
+    all_experts_cold: bool = False,
+    exclude_tensors: Iterable[str] = (),
+    embed_metadata: bool = False,
+    config_path: pathlib.Path | None = None,
+    tokenizer_path: pathlib.Path | None = None,
+    tokenizer_config_path: pathlib.Path | None = None,
+    chat_template_path: pathlib.Path | None = None,
+    vision_block_dtype: str = "auto",
+    group_size: int = 64,
+    strict_vocab_check: bool = True,
+    deduplicate_recurrent: bool = True,
+    stats_out: dict[str, int] | None = None,
+) -> list[PackedTensorMeta]:
+    """Stream-convert a GGUF v2/v3 file (or split shards) into a 16 KiB-aligned `.amf` v0."""
+    in_path = pathlib.Path(input_path)
+    out_path = pathlib.Path(output_path)
+    shards = resolve_gguf_shards(in_path)
+    kv = dict(shards[0].kv)
+    arch = str(kv.get("general.architecture") or "llama").lower()
+    is_clip = arch == "clip"
+
+    eff_model_id = model_id or str(kv.get("general.name") or out_path.stem)[:63]
+    eff_model_id = eff_model_id[:63]
+    if not eff_model_id:
+        raise ValueError("model_id must be non-empty")
+
+    flat_items: list[tuple[int, GgufShard, GgufTensorInfo]] = []
+    for s_idx, sh in enumerate(shards):
+        for t in sh.tensors:
+            flat_items.append((s_idx, sh, t))
+
+    physical_layers = 0
+    dedup_layers = 0
+    if deduplicate_recurrent and not is_clip:
+        flat_items, physical_layers, dedup_layers = _deduplicate_unrolled_recurrent_layers(flat_items, kv)
+
+    if stats_out is not None:
+        stats_out["physical_layers"] = physical_layers
+        stats_out["deduplicated_layers"] = dedup_layers
+        stats_out["gguf_arch"] = hash(arch) & 0x7FFFFFFF
+
+    raw_by_name = {t.name: (s_idx, sh, t) for s_idx, sh, t in flat_items}
+    excluded = {tok.strip() for tok in exclude_tensors if tok.strip()}
+    cold_set = set(cold_experts)
+    consumed_scales: set[str] = set()
+    planned: list[_PlannedGgufEntry] = []
+
+    def _find_fp8_scale(t_name: str) -> tuple[int, GgufShard, GgufTensorInfo] | None:
+        base = t_name[:-7] if t_name.endswith(".weight") else t_name
+        for cand in (f"{t_name}.scale", f"{t_name}_scale", f"{base}.scale", f"{base}.weight_scale", f"{base}_scale"):
+            hit = raw_by_name.get(cand)
+            if hit is not None and hit[2].ggml_type in (0, 1, 30):
+                return hit
+        return None
+
+    # Pre-scan F8_E4M3 tensors to reserve companion scales cleanly before planning.
+    fp8_pairs: dict[str, tuple[int, GgufShard, GgufTensorInfo] | None] = {}
+    for _, _, t in flat_items:
+        if t.ggml_type == 43:
+            sc_hit = _find_fp8_scale(t.name)
+            fp8_pairs[t.name] = sc_hit
+            if sc_hit is not None:
+                consumed_scales.add(sc_hit[2].name)
+
+    for s_idx, sh, t in flat_items:
+        if t.name in excluded or t.name in consumed_scales:
+            continue
+        spec = _GGML_TYPE_INFO[t.ggml_type]
+        _gname, bs, bb, base_amf_dt = spec
+        assert base_amf_dt is not None
+
+        # Handle stacked 3D expert tensors `(K, M, E)` -> split per expert `e in 0..E-1`.
+        amf_shape_full = t.amf_shape
+        ex_m = re.match(r"^blk\.(\d+)\.(ffn_gate|ffn_up|ffn_down)_exps\.(weight)$", t.name)
+        if ex_m is not None and len(amf_shape_full) == 3:
+            layer_i = int(ex_m.group(1))
+            proj = {"ffn_gate": "gate_proj", "ffn_up": "up_proj", "ffn_down": "down_proj"}[ex_m.group(2)]
+            num_experts, n_r, k_c = amf_shape_full
+            exp_slice_bytes = t.expected_bytes // num_experts
+            slices = [
+                (
+                    f"layers.{layer_i}.mlp.experts.{e}.{proj}.weight",
+                    (TensorKind.COLD_EXPERT if (all_experts_cold or (layer_i, e) in cold_set) else TensorKind.HOT_EXPERT),
+                    layer_i,
+                    e,
+                    (n_r, k_c),
+                    t.offset + e * exp_slice_bytes,
+                    exp_slice_bytes,
+                )
+                for e in range(num_experts)
+            ]
+        else:
+            norm_name = normalize_gguf_tensor_name(t.name, is_clip=is_clip)
+            if norm_name in excluded:
+                continue
+            kind, layer_i, exp_i = _classify_tensor(norm_name, cold_set, all_experts_cold)
+            slices = [(norm_name, kind, layer_i, exp_i, amf_shape_full, t.offset, t.expected_bytes)]
+
+        for out_name, out_kind, layer_i, exp_i, shp, src_off, src_len in slices:
+            convert: str | None = None
+            out_dt = base_amf_dt
+            q_bits = 0
+            g_size = 0
+            data_bytes = src_len
+            params_offset = 0
+            params_bytes = 0
+            scale_sh: GgufShard | None = None
+            scale_info: GgufTensorInfo | None = None
+            fp8_mode: str | None = None
+
+            if out_dt == DType.F16 and dtype_mode == "bf16":
+                out_dt = DType.BF16
+                convert = "f16_to_bf16"
+            elif out_dt == DType.BF16 and dtype_mode == "f16":
+                out_dt = DType.F16
+                convert = "bf16_to_f16"
+            elif t.ggml_type == 40:  # GGUF NVFP4 -> planar nvfp4_g16
+                if len(shp) != 2:
+                    raise ValueError(f"GGUF NVFP4 tensor {t.name!r} must be 2D (or 3D expert stack), got {shp}")
+                n_r, k_c = shp
+                out_dt = DType.NVFP4_G16
+                q_bits = 4
+                g_size = 16
+                convert = "gguf_nvfp4"
+                data_bytes = n_r * (k_c // 2)
+                params_offset = _align_up(data_bytes, 64)
+                params_bytes = _align_up(n_r * (k_c // 16), 4) + 4
+            elif t.ggml_type == 43:  # GGUF F8_E4M3 -> fp8_e4m3_tensor or fp8_e4m3_row
+                q_bits = 8
+                g_size = 0
+                sc_hit = fp8_pairs.get(t.name)
+                if sc_hit is not None:
+                    _, scale_sh, scale_info = sc_hit
+                    if len(shp) == 2 and (scale_info.amf_shape == (shp[0],) or scale_info.amf_shape == (shp[0], 1)):
+                        out_dt = DType.FP8_E4M3_ROW
+                        fp8_mode = "fp8_row"
+                        params_offset = _align_up(data_bytes, 64)
+                        params_bytes = shp[0] * 4
+                    elif scale_info.numel == 1:
+                        out_dt = DType.FP8_E4M3_TENSOR
+                        fp8_mode = "fp8_tensor"
+                        params_offset = _align_up(data_bytes, 64)
+                        params_bytes = 4
+                    else:
+                        raise ValueError(
+                            f"GGUF F8_E4M3 companion scale {scale_info.name!r} shape {scale_info.amf_shape} "
+                            f"incompatible with weight shape {shp}"
+                        )
+                else:
+                    out_dt = DType.FP8_E4M3_TENSOR
+                    fp8_mode = "fp8_tensor"
+                    params_offset = _align_up(data_bytes, 64)
+                    params_bytes = 4
+            elif out_dt >= DType.GGUF_Q4_0:
+                if len(shp) != 2:
+                    raise ValueError(f"GGUF quantized tensor {t.name!r} must be 2D or 3D exps, got {shp}")
+                q_bits = _AMF_GGUF_QUANT_BITS[out_dt]
+                g_size = bs
+
+            content = (params_offset + params_bytes) if params_bytes > 0 else data_bytes
+            planned.append(
+                _PlannedGgufEntry(
+                    name=out_name,
+                    kind=out_kind,
+                    dtype=out_dt,
+                    quant_bits=q_bits,
+                    group_size=g_size,
+                    layer=layer_i,
+                    expert=exp_i,
+                    shape=shp,
+                    shard=sh,
+                    src_offset=src_off,
+                    src_bytes=src_len,
+                    src_ggml_type=t.ggml_type,
+                    data_convert=convert,
+                    scale_shard=scale_sh,
+                    scale_info=scale_info,
+                    fp8_mode=fp8_mode,
+                    data_bytes=data_bytes,
+                    params_offset=params_offset,
+                    params_bytes=params_bytes,
+                    blob_bytes=_align_up(max(content, 1), APPLE_PAGE_SIZE),
+                )
+            )
+
+    planned.sort(key=lambda e: _natural_key(e.name))
+    seen_out: set[str] = set()
+    for e in planned:
+        if e.name in seen_out:
+            raise ValueError(f"duplicate normalized output tensor name {e.name!r} in GGUF {in_path}")
+        seen_out.add(e.name)
+
+    # Resolve metadata (external HF tokenizer.json / chat_template.jinja preferred over GGUF KV).
+    base_dir = in_path if in_path.is_dir() else in_path.parent
+    meta_blobs: list[tuple[str, bytes]] = []
+    want_meta = (
+        embed_metadata
+        or is_clip
+        or arch == "dflash"
+        or config_path is not None
+        or tokenizer_path is not None
+        or chat_template_path is not None
+    )
+    if want_meta:
+        ext_cfg = pathlib.Path(config_path) if config_path is not None else (base_dir / "config.json")
+        if ext_cfg.is_file():
+            cfg_bytes = ext_cfg.read_bytes()
+        else:
+            cfg_bytes = _build_synthesized_config_bytes(kv, physical_layers=physical_layers, dedup_layers=dedup_layers)
+        if embed_metadata or is_clip or arch == "dflash" or config_path is not None:
+            meta_blobs.append((META_CONFIG_JSON, cfg_bytes))
+
+        ext_tok = pathlib.Path(tokenizer_path) if tokenizer_path is not None else (base_dir / "tokenizer.json")
+        tok_bytes: bytes | None = None
+        if ext_tok.is_file():
+            tok_bytes = ext_tok.read_bytes()
+            if strict_vocab_check:
+                _cross_check_hf_tokenizer_with_gguf(tok_bytes, kv)
+        elif tokenizer_path is not None:
+            raise FileNotFoundError(f"tokenizer.json not found: {ext_tok}")
+        elif embed_metadata:
+            tok_bytes = _build_synthesized_hf_tokenizer_bytes(kv)
+        if tok_bytes is not None and (embed_metadata or tokenizer_path is not None):
+            meta_blobs.append((META_TOKENIZER_JSON, tok_bytes))
+
+        ext_tpl = pathlib.Path(chat_template_path) if chat_template_path is not None else (base_dir / "chat_template.jinja")
+        ext_tok_cfg = (
+            pathlib.Path(tokenizer_config_path)
+            if tokenizer_config_path is not None
+            else (base_dir / "tokenizer_config.json")
+        )
+        tpl_text: str | None = None
+        if ext_tpl.is_file():
+            tpl_text = ext_tpl.read_text(encoding="utf-8")
+        elif chat_template_path is not None:
+            raise FileNotFoundError(f"chat_template.jinja not found: {ext_tpl}")
+        tok_cfg_dict = json.loads(ext_tok_cfg.read_text(encoding="utf-8")) if ext_tok_cfg.is_file() else {}
+        mod_cfg_dict = json.loads(cfg_bytes.decode("utf-8"))
+        if not tpl_text and isinstance(kv.get("tokenizer.chat_template"), str):
+            tpl_text = kv["tokenizer.chat_template"]
+        if tpl_text or (isinstance(tok_cfg_dict, dict) and tok_cfg_dict.get("chat_template")):
+            spec = compile_chat_template_spec(
+                jinja_text=tpl_text,
+                tokenizer_config=tok_cfg_dict if isinstance(tok_cfg_dict, dict) else {},
+                model_config=mod_cfg_dict if isinstance(mod_cfg_dict, dict) else {},
+            )
+            meta_blobs.append(
+                (META_CHAT_TEMPLATE_JSON, json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            )
+
+    def _write_staged(target_amf: pathlib.Path) -> list[PackedTensorMeta]:
+        tensor_count = len(planned) + len(meta_blobs)
+        dir_offset = APPLE_PAGE_SIZE
+        dir_raw_len = tensor_count * ENTRY_STRUCT.size
+        dir_bytes = 0 if tensor_count == 0 else _align_up(dir_raw_len, APPLE_PAGE_SIZE)
+        cursor = dir_offset + dir_bytes
+        offsets: list[int] = []
+        for e in planned:
+            offsets.append(cursor)
+            cursor += e.blob_bytes
+        m_offsets: list[tuple[str, bytes, int, int]] = []
+        for m_name, m_bytes in meta_blobs:
+            m_blob = _align_up(len(m_bytes), APPLE_PAGE_SIZE)
+            m_offsets.append((m_name, m_bytes, cursor, m_blob))
+            cursor += m_blob
+
+        target_amf.parent.mkdir(parents=True, exist_ok=True)
+        partial = target_amf.with_name(target_amf.name + ".partial")
+        in_fhs = {sh.path: sh.path.open("rb") for sh in shards}
+        metas: list[PackedTensorMeta] = []
+        try:
+            with partial.open("wb") as out_fh:
+                _set_nocache(out_fh.fileno())
+                _BlobWriter(out_fh).zeros(dir_offset + dir_bytes)
+
+                for e, blob_offset in zip(planned, offsets):
+                    w = _BlobWriter(out_fh)
+                    sfh = in_fhs[e.shard.path]
+                    sfh.seek(e.shard.data_offset + e.src_offset)
+
+                    if e.data_convert is None:
+                        left = e.src_bytes
+                        while left > 0:
+                            take = min(8 * 1024 * 1024, left)
+                            chunk = sfh.read(take)
+                            if len(chunk) != take:
+                                raise ValueError(f"unexpected EOF streaming {e.name!r}")
+                            w.write(chunk)
+                            left -= take
+                    elif e.data_convert in ("f16_to_bf16", "bf16_to_f16"):
+                        left = e.src_bytes
+                        while left > 0:
+                            take = min((1 << 20) * 2, left)
+                            chunk = sfh.read(take)
+                            if len(chunk) != take:
+                                raise ValueError(f"unexpected EOF converting {e.name!r}")
+                            w.write(
+                                f16_bytes_to_bf16_bytes(chunk)
+                                if e.data_convert == "f16_to_bf16"
+                                else bf16_bytes_to_f16_bytes(chunk, what=e.name)
+                            )
+                            left -= take
+                    elif e.data_convert == "gguf_nvfp4":
+                        n_r, k_c = e.shape
+                        row_src_b = (k_c // 64) * 36
+                        scales_acc = bytearray()
+                        for _ in range(n_r):
+                            r_raw = sfh.read(row_src_b)
+                            if len(r_raw) != row_src_b:
+                                raise ValueError(f"unexpected EOF reading GGUF NVFP4 row for {e.name!r}")
+                            d_row, s_row = _unsplit_nvfp4_row(r_raw, k_c)
+                            w.write(d_row)
+                            scales_acc.extend(s_row)
+                        w.zeros(e.params_offset - e.data_bytes)
+                        w.write(scales_acc)
+                        pad4 = _align_up(len(scales_acc), 4) - len(scales_acc)
+                        if pad4 > 0:
+                            w.zeros(pad4)
+                        w.write(struct.pack("<f", 1.0))
+
+                    if e.fp8_mode is not None:
+                        w.zeros(e.params_offset - e.data_bytes)
+                        if e.scale_shard is not None and e.scale_info is not None:
+                            w.write(_decode_gguf_float_array(e.scale_shard, e.scale_info))
+                        else:
+                            w.write(struct.pack("<f", 1.0))
+
+                    content_done = (e.params_offset + e.params_bytes) if e.params_bytes > 0 else e.data_bytes
+                    w.zeros(e.blob_bytes - content_done)
+                    if w.written != e.blob_bytes:
+                        raise AssertionError(f"wrote {w.written} != planned {e.blob_bytes} for {e.name!r}")
+
+                    metas.append(
+                        PackedTensorMeta(
+                            name=e.name,
+                            kind=e.kind,
+                            dtype=e.dtype,
+                            quant_bits=e.quant_bits,
+                            group_size=e.group_size,
+                            layer=e.layer,
+                            expert=e.expert,
+                            shape=e.shape,
+                            blob_offset=blob_offset,
+                            blob_bytes=e.blob_bytes,
+                            data_bytes=e.data_bytes,
+                            params_offset=e.params_offset,
+                            params_bytes=e.params_bytes,
+                            blob_crc32=w.crc & 0xFFFFFFFF,
+                            layout=TensorLayout.ROW_MAJOR,
+                            quant_param_kind=QuantParamKind.AFFINE_SCALE_BIAS,
+                        )
+                    )
+
+                for m_name, m_bytes, m_off, m_blob in m_offsets:
+                    w = _BlobWriter(out_fh)
+                    w.write(m_bytes)
+                    if m_blob > len(m_bytes):
+                        w.zeros(m_blob - len(m_bytes))
+                    metas.append(
+                        PackedTensorMeta(
+                            name=m_name,
+                            kind=TensorKind.METADATA,
+                            dtype=DType.U32,
+                            quant_bits=0,
+                            group_size=0,
+                            layer=NO_LAYER,
+                            expert=NO_EXPERT,
+                            shape=(len(m_bytes),),
+                            blob_offset=m_off,
+                            blob_bytes=m_blob,
+                            data_bytes=len(m_bytes),
+                            params_offset=0,
+                            params_bytes=0,
+                            blob_crc32=w.crc & 0xFFFFFFFF,
+                            layout=TensorLayout.ROW_MAJOR,
+                            quant_param_kind=QuantParamKind.AFFINE_SCALE_BIAS,
+                        )
+                    )
+
+                if out_fh.tell() != cursor:
+                    raise AssertionError(f"GGUF pack final size {out_fh.tell()} != planned {cursor}")
+                dir_raw = _pack_directory(metas)
+                hdr_flags = FLAG_EMBEDDED_METADATA if m_offsets else 0
+                hdr = _pack_header(
+                    eff_model_id.encode("utf-8"),
+                    tensor_count,
+                    dir_offset,
+                    dir_bytes,
+                    _crc32(dir_raw),
+                    flags=hdr_flags,
+                )
+                out_fh.seek(0)
+                out_fh.write(hdr)
+                if dir_raw:
+                    out_fh.seek(dir_offset)
+                    out_fh.write(dir_raw)
+                out_fh.flush()
+                os.fsync(out_fh.fileno())
+            os.replace(partial, target_amf)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+        finally:
+            for fh in in_fhs.values():
+                fh.close()
+        return metas
+
+    if is_clip:
+        staged = out_path.with_name(out_path.name + ".clip_stage.amf")
+        try:
+            _write_staged(staged)
+            return pack_vision_tower_amf(
+                staged,
+                out_path,
+                model_id=eff_model_id,
+                dtype_mode=dtype_mode,
+                vision_block_dtype=vision_block_dtype,
+                group_size=group_size,
+                embed_metadata=embed_metadata,
+                config_path=config_path,
+                stats_out=stats_out,
+            )
+        finally:
+            staged.unlink(missing_ok=True)
+
+    return _write_staged(out_path)

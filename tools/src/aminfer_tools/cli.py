@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
+    AFFINE_GROUP_SIZES,
     DTYPE_MODES,
     QUANT_PROFILES,
     SME2_PACK_MODES,
@@ -28,6 +29,8 @@ from aminfer_tools.amf import (
     repack_amf_sme2,
     retag_amf_cold_experts,
 )
+from aminfer_tools.chat_template import compile_chat_template_bytes
+from aminfer_tools.gguf import pack_amf_from_gguf
 from aminfer_tools.lora import (
     LORA_DTYPES,
     LORA_LAYOUTS,
@@ -142,7 +145,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     pack.add_argument("--output", required=True, type=pathlib.Path, help="Output .amf path")
     pack.add_argument("--model-id", default="aminfer-model", help="Model identifier stored in header")
-    pack.add_argument("--group-size", type=int, default=64, help="Quantization group size (default: 64)")
+    pack.add_argument(
+        "--group-size",
+        type=int,
+        choices=AFFINE_GROUP_SIZES,
+        default=None,
+        help="Quantization group size (32, 64, or 128; default: auto from config.json or 64)",
+    )
     pack.add_argument(
         "--dtype",
         choices=DTYPE_MODES,
@@ -321,6 +330,54 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Explicit tokenizer.json path to embed into __meta.tokenizer_json (implies --embed-metadata)",
     )
+    pack.add_argument(
+        "--chat-template",
+        type=pathlib.Path,
+        default=None,
+        help="Explicit chat_template.jinja path to compile into __meta.chat_template_json",
+    )
+    pack.add_argument(
+        "--imatrix",
+        type=pathlib.Path,
+        default=None,
+        help="Optional GGUF/.dat imatrix file weighting --quant-profile gsq-rco sensitivity",
+    )
+    pack.add_argument(
+        "--no-strict-vocab",
+        action="store_true",
+        help="Skip cross-checking external tokenizer.json vocab against GGUF tokenizer.ggml.tokens",
+    )
+
+    pack_gguf = sub.add_parser(
+        "pack-gguf",
+        help="Convert a GGUF v2/v3 file (or split shards) directly into a 16 KiB-aligned .amf v0 file (W22)",
+    )
+    pack_gguf.add_argument("--input", required=True, type=pathlib.Path, help="Input .gguf path, split shard 00001-of-N, or directory")
+    pack_gguf.add_argument("--output", required=True, type=pathlib.Path, help="Output .amf path")
+    pack_gguf.add_argument("--model-id", default=None, help="Override model identifier stored in header")
+    pack_gguf.add_argument("--dtype", choices=DTYPE_MODES, default="auto", help="Float fallback dtype: auto, f16, or bf16")
+    pack_gguf.add_argument("--cold-experts", default=None, help="Comma-separated LAYER:EXPERT pairs marked cold_expert")
+    pack_gguf.add_argument("--all-experts-cold", action="store_true", help="Mark all MoE expert tensors as cold_expert")
+    pack_gguf.add_argument("--exclude-tensors", default="", help="Comma-separated raw or normalized tensor names to skip")
+    pack_gguf.add_argument("--embed-metadata", action="store_true", help="Embed config, tokenizer, and compiled chat_template_spec")
+    pack_gguf.add_argument("--config", type=pathlib.Path, default=None, help="Optional HF config.json override")
+    pack_gguf.add_argument("--tokenizer", type=pathlib.Path, default=None, help="Preferred external HF tokenizer.json")
+    pack_gguf.add_argument("--tokenizer-config", type=pathlib.Path, default=None, help="Optional HF tokenizer_config.json")
+    pack_gguf.add_argument("--chat-template", type=pathlib.Path, default=None, help="Preferred external chat_template.jinja")
+    pack_gguf.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto", help="W20 policy for clip mmproj blocks")
+    pack_gguf.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=64, help="Group size for clip W20 q4 blocks")
+    pack_gguf.add_argument("--no-strict-vocab", action="store_true", help="Disable GGUF vs external HF vocab size check")
+    pack_gguf.add_argument("--no-dedup-recurrent", action="store_true", help="Do not collapse unrolled recurrent layers")
+
+    ct_cmd = sub.add_parser(
+        "compile-chat-template",
+        help="Compile HF chat_template.jinja / tokenizer_config.json into declarative chat_template_spec JSON (W24)",
+    )
+    ct_cmd.add_argument("--input", required=True, type=pathlib.Path, help="Checkpoint directory or chat_template.jinja path")
+    ct_cmd.add_argument("--output", type=pathlib.Path, default=None, help="Optional output JSON path (prints to stdout if omitted)")
+    ct_cmd.add_argument("--chat-template", type=pathlib.Path, default=None, help="Explicit chat_template.jinja path")
+    ct_cmd.add_argument("--tokenizer-config", type=pathlib.Path, default=None, help="Explicit tokenizer_config.json path")
+    ct_cmd.add_argument("--config", type=pathlib.Path, default=None, help="Explicit config.json path")
 
     gsq = sub.add_parser(
         "gsq-convert",
@@ -349,7 +406,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional W8 schema-v1 heat.json profile guiding MoE expert sensitivity & cold tagging",
     )
     gsq.add_argument("--model-id", default=None, help="Override model identifier stored in header")
-    gsq.add_argument("--group-size", type=int, default=64, help="Quantization group size (default: 64)")
+    gsq.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=64, help="Quantization group size (default: 64)")
+    gsq.add_argument("--imatrix", type=pathlib.Path, default=None, help="Optional GGUF/.dat imatrix file weighting sensitivity")
     gsq.add_argument(
         "--dtype",
         choices=DTYPE_MODES,
@@ -1107,11 +1165,88 @@ def _resolve_cli_vision_flags(
     return inc, strip
 
 
+def _is_gguf_input(path: pathlib.Path) -> bool:
+    """Return True when `path` is a `.gguf` file/shard or a directory containing only `.gguf` shards."""
+    if path.is_file():
+        if path.suffix.lower() == ".gguf":
+            return True
+        with path.open("rb") as fh:
+            return fh.read(4) == b"GGUF"
+    if path.is_dir():
+        has_gguf = any(path.glob("*.gguf"))
+        has_sf = any(path.glob("*.safetensors")) or (path / "model.safetensors.index.json").is_file()
+        return has_gguf and not has_sf
+    return path.suffix.lower() == ".gguf"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "build-ngram":
         return ngram_mod.run_args(args)
+
+    if args.command == "compile-chat-template":
+        compiled = compile_chat_template_bytes(
+            args.input,
+            tokenizer_config_path=args.tokenizer_config,
+            config_path=args.config,
+            chat_template_path=args.chat_template,
+        )
+        if compiled is None:
+            raise FileNotFoundError(
+                f"no chat_template.jinja, tokenizer_config.json, or config.json found for {args.input}"
+            )
+        pretty = json.dumps(json.loads(compiled.decode("utf-8")), ensure_ascii=False, indent=2) + "\n"
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(pretty, encoding="utf-8")
+            print(f"wrote chat_template_spec JSON to {args.output} ({len(compiled)} compact bytes)")
+        else:
+            print(pretty, end="")
+        return 0
+
+    if args.command == "pack-gguf":
+        cold = _parse_cold_experts(args.cold_experts)
+        excludes = _parse_csv(args.exclude_tensors)
+        started = time.monotonic()
+        gguf_stats: dict[str, int] = {}
+        metas = pack_amf_from_gguf(
+            args.input,
+            args.output,
+            model_id=args.model_id,
+            dtype_mode=args.dtype,
+            cold_experts=cold,
+            all_experts_cold=args.all_experts_cold,
+            exclude_tensors=excludes,
+            embed_metadata=args.embed_metadata
+            or args.config is not None
+            or args.tokenizer is not None
+            or args.chat_template is not None,
+            config_path=args.config,
+            tokenizer_path=args.tokenizer,
+            tokenizer_config_path=args.tokenizer_config,
+            chat_template_path=args.chat_template,
+            vision_block_dtype=args.vision_block_dtype,
+            group_size=args.group_size,
+            strict_vocab_check=not args.no_strict_vocab,
+            deduplicate_recurrent=not args.no_dedup_recurrent,
+            stats_out=gguf_stats,
+        )
+        elapsed = time.monotonic() - started
+        total_bytes = args.output.stat().st_size
+        by_dtype: dict[str, int] = {}
+        for m in metas:
+            by_dtype[m.dtype.name.lower()] = by_dtype.get(m.dtype.name.lower(), 0) + 1
+        dtype_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_dtype.items()))
+        notes: list[str] = []
+        if gguf_stats.get("deduplicated_layers", 0) > 0:
+            notes.append(f"dedup_layers={gguf_stats['deduplicated_layers']}")
+        note_str = (", " + ", ".join(notes)) if notes else ""
+        print(
+            f"packed {len(metas)} tensors from GGUF into {args.output} ({total_bytes} bytes) "
+            f"in {elapsed:.1f} s [{dtype_summary}{note_str}]"
+        )
+        return 0
 
     if args.command == "pack-amf":
         cold = _parse_cold_experts(args.cold_experts)
@@ -1127,12 +1262,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         stripped_vision = 0
         extra_notes: list[str] = []
-        if use_qwen4_pipeline:
+        if not use_qwen4_pipeline and _is_gguf_input(args.input):
+            gguf_stats: dict[str, int] = {}
+            metas = pack_amf_from_gguf(
+                args.input,
+                args.output,
+                model_id=args.model_id,
+                dtype_mode=args.dtype,
+                cold_experts=cold,
+                all_experts_cold=args.all_experts_cold,
+                exclude_tensors=excludes,
+                embed_metadata=args.embed_metadata
+                or args.config is not None
+                or args.tokenizer is not None
+                or args.chat_template is not None,
+                config_path=args.config,
+                tokenizer_path=args.tokenizer,
+                chat_template_path=args.chat_template,
+                vision_block_dtype=args.vision_block_dtype,
+                group_size=args.group_size or 64,
+                strict_vocab_check=not args.no_strict_vocab,
+                stats_out=gguf_stats,
+            )
+            if gguf_stats.get("deduplicated_layers", 0) > 0:
+                extra_notes.append(f"dedup_layers={gguf_stats['deduplicated_layers']}")
+        elif use_qwen4_pipeline:
             rep_q4 = pack_qwen4_checkpoint(
                 args.input,
                 args.output,
                 model_id=args.model_id,
-                group_size=args.group_size,
+                group_size=args.group_size or 64,
                 cold_experts=cold,
                 all_experts_cold=args.all_experts_cold,
                 dtype_mode=args.dtype,
@@ -1207,6 +1366,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 embed_metadata=args.embed_metadata,
                 config_path=args.config,
                 tokenizer_path=args.tokenizer,
+                chat_template_path=args.chat_template,
+                imatrix_path=args.imatrix,
                 stats_out=stats_map,
             )
             stripped_vision = stats_map.get("stripped_vision_tensors", 0)
@@ -1277,6 +1438,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 include_vision=inc_vis,
                 vision_sidecar=args.vision_sidecar,
                 vision_block_dtype=args.vision_block_dtype,
+                imatrix_path=args.imatrix,
                 stats_out=vis_stats,
             )
             elapsed = time.monotonic() - started
@@ -1322,6 +1484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest_path=args.manifest,
             workers=args.workers,
             strip_vision=True,
+            imatrix_path=args.imatrix,
         )
         elapsed = time.monotonic() - started
         total_bytes = args.output.stat().st_size

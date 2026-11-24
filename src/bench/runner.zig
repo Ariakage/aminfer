@@ -1163,7 +1163,7 @@ pub fn writeSyntheticQwen3AmfFile(
         .q3_affine => 0.35,
         .q4_affine => 0.17,
         .f16, .bf16 => 0.5,
-        .f32, .u32 => unreachable,
+        else => unreachable,
     };
 
     var plans: std.ArrayList(StreamTensorPlan) = .empty;
@@ -1184,7 +1184,7 @@ pub fn writeSyntheticQwen3AmfFile(
             .q3_affine => 0.06,
             .q4_affine => 0.03,
             .f16, .bf16 => 0.15,
-            .f32, .u32 => unreachable,
+            else => unreachable,
         },
     ));
 

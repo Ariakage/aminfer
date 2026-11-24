@@ -1722,7 +1722,7 @@ fn rowGeometry(dtype: amf.DType, embed_dim: u32) Error!struct { code_bytes: usiz
             .code_bytes = Q2.rowWeightBytes(dim) catch return error.InvalidShape,
             .param_bytes = Q2.scaleBiasBytes(1, dim) catch return error.InvalidShape,
         },
-        .f32, .u32 => error.UnsupportedDType,
+        else => error.UnsupportedDType,
     };
 }
 

@@ -25,6 +25,11 @@ pub const META_PREFIX: []const u8 = "__meta.";
 pub const META_CONFIG_JSON: []const u8 = "__meta.config_json";
 pub const META_TOKENIZER_JSON: []const u8 = "__meta.tokenizer_json";
 pub const META_ADAPTER_CONFIG_JSON: []const u8 = "__meta.adapter_config_json";
+pub const META_CHAT_TEMPLATE_JSON: []const u8 = "__meta.chat_template_json";
+/// Canonical W24 `.amf` embedded chat-template spec metadata entry name.
+pub const CHAT_TEMPLATE_METADATA_NAME: []const u8 = META_CHAT_TEMPLATE_JSON;
+/// Tolerated read alias for `.amf` chat-template spec payloads.
+pub const LEGACY_CHAT_TEMPLATE_METADATA_NAME: []const u8 = "__aminfer_chat_template__";
 
 /// ARMv9 SME2 `sme2_panel64` geometry constants (ADR-0018, W15).
 pub const SME2_PANEL_COLS: u64 = 16;
@@ -91,7 +96,8 @@ pub const TensorKind = enum(u8) {
 };
 
 pub fn isMetaName(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, META_PREFIX);
+    return std.mem.startsWith(u8, name, META_PREFIX) or
+        std.mem.eql(u8, name, LEGACY_CHAT_TEMPLATE_METADATA_NAME);
 }
 
 pub fn isMetaEntry(entry: *const TensorEntry) bool {
@@ -99,7 +105,8 @@ pub fn isMetaEntry(entry: *const TensorEntry) bool {
 }
 
 /// Builds a canonical `TensorKind.metadata` directory record for a non-empty
-/// UTF-8 metadata blob (`__meta.*`) of exact unpadded length `payload_len`.
+/// UTF-8 metadata blob (`__meta.*` or `LEGACY_CHAT_TEMPLATE_METADATA_NAME`) of
+/// exact unpadded length `payload_len`.
 pub fn makeMetadataEntry(name_str: []const u8, payload_len: u64) ParseError!TensorEntry {
     if (!isMetaName(name_str) or name_str.len >= 48) return error.InvalidTensorKind;
     if (payload_len == 0 or payload_len > std.math.maxInt(u32)) return error.InvalidShape;
@@ -120,16 +127,55 @@ pub const DType = enum(u8) {
     /// Unquantized 32-bit unsigned integer (e.g. EAGLE-3 `d2t` vocab maps,
     /// ADR-0013): `quant_bits = 0`, 4 bytes per element.
     u32 = 5,
-    /// MLX-compatible 2-bit affine group-64 quantization (ADR-0017, W14/G13):
-    /// `quant_bits = 2`, 16 B packed codes + 4 B `half2(scale, bias)` per 64 weights.
+    /// MLX-compatible 2-bit affine group quantization (ADR-0017, W14/G13):
+    /// `quant_bits = 2`, packed codes + `half2(scale, bias)` per group.
     q2_affine = 6,
+    /// MLX-compatible 5/6/8-bit affine group quantization (`group_size in {32, 64, 128}`).
+    q5_affine = 7,
+    q6_affine = 8,
+    q8_affine = 9,
+    /// `128x128` block-scaled FP8 (`E4M3FN` 1 B/el + `[ceil(N/128), ceil(K/128)]` `f32` scales).
+    fp8_e4m3_block = 10,
+    /// Per-row FP8 (`E4M3FN` 1 B/el + `f32[N]` scales, e.g. Engram tables).
+    fp8_e4m3_row = 11,
+    /// Per-tensor/per-channel FP8 (`E4M3FN` 1 B/el + `f32[1]` or `f32[N]` scale).
+    fp8_e4m3_tensor = 12,
+    /// OCP `MXFP8` (`E4M3FN` 1 B/el + `u8` `UE8M0` scale per 32 weights).
+    mxfp8_g32 = 13,
+    /// NVIDIA `NVFP4` (`E2M1` low-nibble-first `0.5 B/el` + `[N, K/16]` `u8` `E4M3`
+    /// micro-scales padded to 4B + trailing `f32[1]` multiplicative outer scale).
+    nvfp4_g16 = 14,
+    /// Standard upstream `GGUF` raw block dtypes (`15..37`, zero double-quantization).
+    gguf_q4_0 = 15,
+    gguf_q4_1 = 16,
+    gguf_q5_0 = 17,
+    gguf_q5_1 = 18,
+    gguf_q8_0 = 19,
+    gguf_q2_k = 20,
+    gguf_q3_k = 21,
+    gguf_q4_k = 22,
+    gguf_q5_k = 23,
+    gguf_q6_k = 24,
+    gguf_iq1_s = 25,
+    gguf_iq1_m = 26,
+    gguf_iq2_xxs = 27,
+    gguf_iq2_xs = 28,
+    gguf_iq2_s = 29,
+    gguf_iq3_xxs = 30,
+    gguf_iq3_s = 31,
+    gguf_iq4_nl = 32,
+    gguf_iq4_xs = 33,
+    gguf_tq1_0 = 34,
+    gguf_tq2_0 = 35,
+    gguf_mxfp4 = 36,
+    gguf_q2_0 = 37,
 
-    /// Bytes per element for unquantized dtypes; `null` for affine-quantized ones.
+    /// Bytes per element for unquantized dtypes; `null` for quantized/block ones.
     pub fn unquantizedElemSize(self: DType) ?u64 {
         return switch (self) {
             .f16, .bf16 => 2,
             .f32, .u32 => 4,
-            .q4_affine, .q3_affine, .q2_affine => null,
+            else => null,
         };
     }
 };
@@ -258,7 +304,7 @@ pub fn sme2Panel64BlobBytes(dtype: DType, n: u64, k: u64, group_size: u16) Parse
             if (group_size != SME2_GROUP_K) return error.InvalidQuantization;
             break :blk SME2_Q2_GROUP_BYTES;
         },
-        .f32, .u32 => return error.InvalidTensorLayout,
+        else => return error.InvalidTensorLayout,
     };
     const n_plus_pad = std.math.add(u64, n, SME2_PANEL_COLS - 1) catch return error.InvalidShape;
     const panels = n_plus_pad / SME2_PANEL_COLS;
@@ -360,14 +406,17 @@ pub const Parsed = struct {
         @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(Header)]);
         try validateHeader(&hdr, bytes.len);
 
-        const count: usize = hdr.tensor_count;
+        const count = std.math.cast(usize, hdr.tensor_count) orelse return error.DirectoryOutOfBounds;
+        const dir_raw_len = std.math.mul(usize, count, @sizeOf(TensorEntry)) catch return error.DirectoryOutOfBounds;
+        const dir_off = std.math.cast(usize, hdr.directory_offset) orelse return error.DirectoryOutOfBounds;
+        const dir_end = std.math.add(usize, dir_off, dir_raw_len) catch return error.DirectoryOutOfBounds;
+        if (dir_end > bytes.len) return error.DirectoryOutOfBounds;
+
         const entries = try allocator.alloc(TensorEntry, count);
         errdefer allocator.free(entries);
 
-        const dir_raw_len = count * @sizeOf(TensorEntry);
-        const dir_off: usize = @intCast(hdr.directory_offset);
         if (count > 0) {
-            const dir_slice = bytes[dir_off .. dir_off + dir_raw_len];
+            const dir_slice = bytes[dir_off..dir_end];
             if (std.hash.Crc32.hash(dir_slice) != hdr.directory_crc32) {
                 return error.DirectoryChecksumMismatch;
             }
@@ -385,9 +434,11 @@ pub const Parsed = struct {
     pub fn verifyAllBlobsFromBytes(self: *const Parsed, bytes: []const u8) ParseError!void {
         if (bytes.len < self.file_size) return error.BlobOutOfBounds;
         for (self.entries) |*entry| {
-            const start: usize = @intCast(entry.blob_offset);
-            const len: usize = @intCast(entry.blob_bytes);
-            if (std.hash.Crc32.hash(bytes[start .. start + len]) != entry.blob_crc32) {
+            const start = std.math.cast(usize, entry.blob_offset) orelse return error.BlobOutOfBounds;
+            const len = std.math.cast(usize, entry.blob_bytes) orelse return error.BlobOutOfBounds;
+            const end = std.math.add(usize, start, len) catch return error.BlobOutOfBounds;
+            if (end > bytes.len) return error.BlobOutOfBounds;
+            if (std.hash.Crc32.hash(bytes[start..end]) != entry.blob_crc32) {
                 return error.BlobChecksumMismatch;
             }
         }
@@ -445,8 +496,14 @@ pub const Parsed = struct {
         return self.hasEmbeddedMetadata(META_TOKENIZER_JSON);
     }
 
-    /// Returns a zero-copy slice of an embedded metadata payload (`__meta.*`) from
-    /// an in-memory `.amf` image after verifying its 16 KiB-aligned blob CRC-32.
+    pub fn hasEmbeddedChatTemplate(self: *const Parsed) bool {
+        return self.hasEmbeddedMetadata(META_CHAT_TEMPLATE_JSON) or
+            self.hasEmbeddedMetadata(LEGACY_CHAT_TEMPLATE_METADATA_NAME);
+    }
+
+    /// Returns a zero-copy slice of an embedded metadata payload (`__meta.*` or
+    /// `LEGACY_CHAT_TEMPLATE_METADATA_NAME`) from an in-memory `.amf` image after
+    /// verifying its 16 KiB-aligned blob CRC-32.
     pub fn extractMetadataFromBytes(
         self: *const Parsed,
         bytes: []const u8,
@@ -454,11 +511,12 @@ pub const Parsed = struct {
     ) ParseError!?[]const u8 {
         const entry = self.find(meta_name) orelse return null;
         if ((try entry.tensorKind()) != .metadata) return error.InvalidTensorKind;
-        const start: usize = @intCast(entry.blob_offset);
-        const blob_len: usize = @intCast(entry.blob_bytes);
-        const data_len: usize = @intCast(entry.data_bytes);
-        if (start + blob_len > bytes.len or data_len > blob_len) return error.BlobOutOfBounds;
-        if (std.hash.Crc32.hash(bytes[start .. start + blob_len]) != entry.blob_crc32) {
+        const start = std.math.cast(usize, entry.blob_offset) orelse return error.BlobOutOfBounds;
+        const blob_len = std.math.cast(usize, entry.blob_bytes) orelse return error.BlobOutOfBounds;
+        const data_len = std.math.cast(usize, entry.data_bytes) orelse return error.BlobOutOfBounds;
+        const blob_end = std.math.add(usize, start, blob_len) catch return error.BlobOutOfBounds;
+        if (blob_end > bytes.len or data_len > blob_len) return error.BlobOutOfBounds;
+        if (std.hash.Crc32.hash(bytes[start..blob_end]) != entry.blob_crc32) {
             return error.BlobChecksumMismatch;
         }
         return bytes[start .. start + data_len];
@@ -494,11 +552,12 @@ pub const Parsed = struct {
         arena: *arena_mod.WiredArena,
     ) (ParseError || arena_mod.WiredArena.AllocError)![]align(page.APPLE_PAGE_SIZE) u8 {
         _ = self;
-        const start: usize = @intCast(entry.blob_offset);
-        const len: usize = @intCast(entry.blob_bytes);
-        if (start + len > bytes.len) return error.BlobOutOfBounds;
+        const start = std.math.cast(usize, entry.blob_offset) orelse return error.BlobOutOfBounds;
+        const len = std.math.cast(usize, entry.blob_bytes) orelse return error.BlobOutOfBounds;
+        const end = std.math.add(usize, start, len) catch return error.BlobOutOfBounds;
+        if (end > bytes.len) return error.BlobOutOfBounds;
         const dst = try arena.allocPages(len);
-        @memcpy(dst, bytes[start .. start + len]);
+        @memcpy(dst, bytes[start..end]);
         if (std.hash.Crc32.hash(dst) != entry.blob_crc32) {
             return error.BlobChecksumMismatch;
         }
@@ -720,11 +779,13 @@ fn validateHeader(hdr: *const Header, file_size: u64) ParseError!void {
 
     if (hdr.directory_offset != page.APPLE_PAGE_SIZE) return error.MisalignedDirectory;
     if (hdr.directory_bytes % page.APPLE_PAGE_SIZE != 0) return error.MisalignedDirectory;
-    const raw_dir = @as(u64, hdr.tensor_count) * @sizeOf(TensorEntry);
+    const raw_dir = std.math.mul(u64, @as(u64, hdr.tensor_count), @sizeOf(TensorEntry)) catch return error.DirectoryOutOfBounds;
     const expected_dir_bytes: u64 = if (raw_dir == 0)
         0
-    else
-        ((raw_dir + page.APPLE_PAGE_SIZE - 1) / page.APPLE_PAGE_SIZE) * page.APPLE_PAGE_SIZE;
+    else blk: {
+        const padded = std.math.add(u64, raw_dir, page.APPLE_PAGE_SIZE - 1) catch return error.DirectoryOutOfBounds;
+        break :blk (padded / page.APPLE_PAGE_SIZE) * page.APPLE_PAGE_SIZE;
+    };
     if (hdr.directory_bytes != expected_dir_bytes) return error.MisalignedDirectory;
     const dir_end = std.math.add(u64, hdr.directory_offset, hdr.directory_bytes) catch return error.DirectoryOutOfBounds;
     if (dir_end > file_size) return error.DirectoryOutOfBounds;
@@ -824,22 +885,30 @@ fn validateEntries(
                             return error.InvalidShape;
                         }
                     },
-                    .q4_affine, .q3_affine, .q2_affine => {
+                    .q2_affine, .q3_affine, .q4_affine, .q5_affine, .q6_affine, .q8_affine => {
                         const expected_bits: u8 = switch (dtype) {
-                            .q4_affine => 4,
-                            .q3_affine => 3,
                             .q2_affine => 2,
+                            .q3_affine => 3,
+                            .q4_affine => 4,
+                            .q5_affine => 5,
+                            .q6_affine => 6,
+                            .q8_affine => 8,
                             else => unreachable,
                         };
                         if (entry.rank != 2) return error.InvalidRank;
-                        if (entry.quant_bits != expected_bits or entry.group_size != 64) {
+                        if (entry.quant_bits != expected_bits or
+                            (entry.group_size != 32 and entry.group_size != 64 and entry.group_size != 128))
+                        {
                             return error.InvalidQuantization;
                         }
                         const n: u64 = entry.shape[0];
                         const k: u64 = entry.shape[1];
                         if (n == 0 or k == 0 or k % entry.group_size != 0) return error.InvalidShape;
-                        const expected_data = n * ((k * expected_bits) / 8);
-                        const expected_params = n * (k / entry.group_size) * @sizeOf(quant.ScaleBias);
+                        const k_bits = std.math.mul(u64, k, expected_bits) catch return error.InvalidShape;
+                        const row_data = k_bits / 8;
+                        const expected_data = std.math.mul(u64, n, row_data) catch return error.InvalidShape;
+                        const groups = std.math.mul(u64, n, k / entry.group_size) catch return error.InvalidShape;
+                        const expected_params = std.math.mul(u64, groups, @sizeOf(quant.ScaleBias)) catch return error.InvalidShape;
                         if (entry.data_bytes != expected_data or entry.params_bytes != expected_params) {
                             return error.InvalidShape;
                         }
@@ -848,6 +917,113 @@ fn validateEntries(
                         }
                         const end_in_blob = std.math.add(u64, entry.params_offset, entry.params_bytes) catch return error.BlobOutOfBounds;
                         if (end_in_blob > entry.blob_bytes) return error.BlobOutOfBounds;
+                    },
+                    .fp8_e4m3_block => {
+                        if (entry.rank != 2) return error.InvalidRank;
+                        if (entry.quant_bits != 8 or entry.group_size != 128) return error.InvalidQuantization;
+                        const n: u64 = entry.shape[0];
+                        const k: u64 = entry.shape[1];
+                        if (n == 0 or k == 0) return error.InvalidShape;
+                        const expected_data = std.math.mul(u64, n, k) catch return error.InvalidShape;
+                        const nb_cnt = (n + 127) / 128;
+                        const kb_cnt = (k + 127) / 128;
+                        const scale_elems = std.math.mul(u64, nb_cnt, kb_cnt) catch return error.InvalidShape;
+                        const expected_params = std.math.mul(u64, scale_elems, 4) catch return error.InvalidShape;
+                        if (entry.data_bytes != expected_data or entry.params_bytes != expected_params) {
+                            return error.InvalidShape;
+                        }
+                        if (entry.params_offset < entry.data_bytes or entry.params_offset % 64 != 0) {
+                            return error.MisalignedParams;
+                        }
+                        const end_in_blob = std.math.add(u64, entry.params_offset, entry.params_bytes) catch return error.BlobOutOfBounds;
+                        if (end_in_blob > entry.blob_bytes) return error.BlobOutOfBounds;
+                    },
+                    .fp8_e4m3_row => {
+                        if (entry.rank != 2) return error.InvalidRank;
+                        if (entry.quant_bits != 8 or entry.group_size != 0) return error.InvalidQuantization;
+                        const n: u64 = entry.shape[0];
+                        const k: u64 = entry.shape[1];
+                        if (n == 0 or k == 0) return error.InvalidShape;
+                        const expected_data = std.math.mul(u64, n, k) catch return error.InvalidShape;
+                        const expected_params = std.math.mul(u64, n, 4) catch return error.InvalidShape;
+                        if (entry.data_bytes != expected_data or entry.params_bytes != expected_params) {
+                            return error.InvalidShape;
+                        }
+                        if (entry.params_offset < entry.data_bytes or entry.params_offset % 64 != 0) {
+                            return error.MisalignedParams;
+                        }
+                        const end_in_blob = std.math.add(u64, entry.params_offset, entry.params_bytes) catch return error.BlobOutOfBounds;
+                        if (end_in_blob > entry.blob_bytes) return error.BlobOutOfBounds;
+                    },
+                    .fp8_e4m3_tensor => {
+                        if (entry.rank != 1 and entry.rank != 2) return error.InvalidRank;
+                        if (entry.quant_bits != 8 or entry.group_size != 0) return error.InvalidQuantization;
+                        var elems: u64 = 1;
+                        for (0..entry.rank) |d| {
+                            if (entry.shape[d] == 0) return error.InvalidShape;
+                            elems = std.math.mul(u64, elems, entry.shape[d]) catch return error.InvalidShape;
+                        }
+                        const row_params = std.math.mul(u64, entry.shape[0], 4) catch return error.InvalidShape;
+                        const params_ok = entry.params_bytes == 4 or (entry.rank == 2 and entry.params_bytes == row_params);
+                        if (entry.data_bytes != elems or !params_ok) return error.InvalidShape;
+                        if (entry.params_offset < entry.data_bytes or entry.params_offset % 64 != 0) {
+                            return error.MisalignedParams;
+                        }
+                        const end_in_blob = std.math.add(u64, entry.params_offset, entry.params_bytes) catch return error.BlobOutOfBounds;
+                        if (end_in_blob > entry.blob_bytes) return error.BlobOutOfBounds;
+                    },
+                    .mxfp8_g32 => {
+                        if (entry.rank != 2) return error.InvalidRank;
+                        if (entry.quant_bits != 8 or entry.group_size != 32) return error.InvalidQuantization;
+                        const n: u64 = entry.shape[0];
+                        const k: u64 = entry.shape[1];
+                        if (n == 0 or k == 0 or k % 32 != 0) return error.InvalidShape;
+                        const expected_data = std.math.mul(u64, n, k) catch return error.InvalidShape;
+                        const expected_params = std.math.mul(u64, n, k / 32) catch return error.InvalidShape;
+                        if (entry.data_bytes != expected_data or entry.params_bytes != expected_params) {
+                            return error.InvalidShape;
+                        }
+                        if (entry.params_offset < entry.data_bytes or entry.params_offset % 64 != 0) {
+                            return error.MisalignedParams;
+                        }
+                        const end_in_blob = std.math.add(u64, entry.params_offset, entry.params_bytes) catch return error.BlobOutOfBounds;
+                        if (end_in_blob > entry.blob_bytes) return error.BlobOutOfBounds;
+                    },
+                    .nvfp4_g16 => {
+                        if (entry.rank != 2) return error.InvalidRank;
+                        if (entry.quant_bits != 4 or entry.group_size != 16) return error.InvalidQuantization;
+                        const n: u64 = entry.shape[0];
+                        const k: u64 = entry.shape[1];
+                        if (n == 0 or k == 0 or k % 16 != 0) return error.InvalidShape;
+                        const expected_data = std.math.mul(u64, n, k / 2) catch return error.InvalidShape;
+                        const micro_bytes = std.math.mul(u64, n, k / 16) catch return error.InvalidShape;
+                        const padded_micro = (std.math.add(u64, micro_bytes, 3) catch return error.InvalidShape) & ~@as(u64, 3);
+                        const expected_params = std.math.add(u64, padded_micro, 4) catch return error.InvalidShape;
+                        if (entry.data_bytes != expected_data or entry.params_bytes != expected_params) {
+                            return error.InvalidShape;
+                        }
+                        if (entry.params_offset < entry.data_bytes or entry.params_offset % 64 != 0) {
+                            return error.MisalignedParams;
+                        }
+                        const end_in_blob = std.math.add(u64, entry.params_offset, entry.params_bytes) catch return error.BlobOutOfBounds;
+                        if (end_in_blob > entry.blob_bytes) return error.BlobOutOfBounds;
+                    },
+                    else => {
+                        const info = quant.formats.ggufBlockInfo(dtype) orelse return error.InvalidDType;
+                        if (entry.rank != 1 and entry.rank != 2) return error.InvalidRank;
+                        if (entry.quant_bits != info.quant_bits or entry.group_size != info.block_elems) {
+                            return error.InvalidQuantization;
+                        }
+                        if (entry.params_offset != 0 or entry.params_bytes != 0) return error.MisalignedParams;
+                        const n: u64 = if (entry.rank == 2) entry.shape[0] else 1;
+                        const k: u64 = if (entry.rank == 2) entry.shape[1] else entry.shape[0];
+                        if (n == 0 or k == 0 or k % info.block_elems != 0) return error.InvalidShape;
+                        const blocks_per_row = k / info.block_elems;
+                        const row_bytes = std.math.mul(u64, blocks_per_row, info.block_bytes) catch return error.InvalidShape;
+                        const expected_data = std.math.mul(u64, n, row_bytes) catch return error.InvalidShape;
+                        if (entry.data_bytes != expected_data or entry.data_bytes > entry.blob_bytes) {
+                            return error.InvalidShape;
+                        }
                     },
                 }
             },
@@ -874,7 +1050,7 @@ fn validateEntries(
                             return error.InvalidQuantization;
                         }
                     },
-                    .f32, .u32 => return error.InvalidTensorLayout,
+                    else => return error.InvalidTensorLayout,
                 }
                 const expected_data = try sme2Panel64BlobBytes(dtype, entry.shape[0], entry.shape[1], entry.group_size);
                 if (entry.data_bytes != expected_data) return error.InvalidShape;
@@ -1036,6 +1212,38 @@ pub fn resolveTokenizerJsonAlloc(
     );
 }
 
+pub fn resolveChatTemplateJsonAlloc(
+    allocator: std.mem.Allocator,
+    amf_file: *const AmfFile,
+    amf_path: []const u8,
+    explicit_chat_template_path: ?[]const u8,
+) ResolveMetadataError!ResolvedMetadata {
+    if (explicit_chat_template_path) |ov_path| {
+        const bytes = try readRegularFileAlloc(allocator, ov_path);
+        return .{
+            .bytes = bytes,
+            .source = .explicit_override,
+            .crc32 = std.hash.Crc32.hash(bytes),
+        };
+    }
+    if (try amf_file.readMetadataAlloc(allocator, META_CHAT_TEMPLATE_JSON)) |embedded_bytes| {
+        const entry = amf_file.parsed.find(META_CHAT_TEMPLATE_JSON).?;
+        return .{
+            .bytes = embedded_bytes,
+            .source = .embedded,
+            .crc32 = entry.blob_crc32,
+        };
+    }
+    return resolveMetadataAlloc(
+        allocator,
+        amf_file,
+        amf_path,
+        LEGACY_CHAT_TEMPLATE_METADATA_NAME,
+        "chat_template.json",
+        null,
+    );
+}
+
 pub const MetadataAttachment = struct {
     name: []const u8,
     payload: []const u8,
@@ -1144,7 +1352,7 @@ pub fn embedMetadataIntoAmfBytes(
     return out;
 }
 
-pub const DTYPE_COUNT: usize = 7;
+pub const DTYPE_COUNT: usize = 38;
 
 pub const DTypeStats = struct {
     tensor_count: u32 = 0,
@@ -2268,7 +2476,7 @@ test "validator rejects invalid bf16 metadata" {
     n += 1;
 
     e = bf16TestEntry();
-    e.dtype = 7; // unknown dtype past q2_affine
+    e.dtype = DTYPE_COUNT; // unknown dtype past gguf_q2_0
     cases[n] = .{ .err = error.InvalidDType, .entry = e };
     n += 1;
 
@@ -3122,4 +3330,112 @@ test "W18 single-file embedded metadata, sidecar override precedence, and zero-m
     const meta_e = parsed_sf.find(META_CONFIG_JSON).?;
     corrupted[@intCast(meta_e.blob_offset)] ^= 0xFF;
     try std.testing.expectError(error.BlobChecksumMismatch, parsed_sf.extractMetadataFromBytes(corrupted, META_CONFIG_JSON));
+}
+
+test "M8.1 DType enum discriminants 0..37, generalized affine group_size, FP8/MXFP8/NVFP4, GGUF blocks, and chat_template metadata" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 38), DTYPE_COUNT);
+    try std.testing.expectEqual(@as(u8, 7), @backingInt(DType.q5_affine));
+    try std.testing.expectEqual(@as(u8, 10), @backingInt(DType.fp8_e4m3_block));
+    try std.testing.expectEqual(@as(u8, 13), @backingInt(DType.mxfp8_g32));
+    try std.testing.expectEqual(@as(u8, 14), @backingInt(DType.nvfp4_g16));
+    try std.testing.expectEqual(@as(u8, 15), @backingInt(DType.gguf_q4_0));
+    try std.testing.expectEqual(@as(u8, 36), @backingInt(DType.gguf_mxfp4));
+    try std.testing.expectEqual(@as(u8, 37), @backingInt(DType.gguf_q2_0));
+
+    // Affine q2..q8 across group_size in {32, 64, 128}
+    inline for (.{
+        .{ .dt = DType.q2_affine, .bits = @as(u8, 2) },
+        .{ .dt = DType.q5_affine, .bits = @as(u8, 5) },
+        .{ .dt = DType.q6_affine, .bits = @as(u8, 6) },
+        .{ .dt = DType.q8_affine, .bits = @as(u8, 8) },
+    }) |case| {
+        inline for (.{ @as(u16, 32), @as(u16, 64), @as(u16, 128) }) |gs| {
+            const n: u64 = 4;
+            const k: u64 = 128;
+            const data_len: usize = @intCast(n * ((k * case.bits) / 8));
+            const params_off: usize = align64(data_len);
+            const params_len: usize = @intCast(n * (k / gs) * @sizeOf(quant.ScaleBias));
+            const blob = try gpa.alloc(u8, params_off + params_len);
+            defer gpa.free(blob);
+            @memset(blob, 0x11);
+
+            var e = TensorEntry.zeroed("layers.0.self_attn.q_proj", .dense, case.dt);
+            e.quant_bits = case.bits;
+            e.rank = 2;
+            e.group_size = gs;
+            e.shape = .{ @intCast(n), @intCast(k), 0, 0 };
+            e.data_bytes = data_len;
+            e.params_offset = params_off;
+            e.params_bytes = params_len;
+            const img = try buildTestAmf(gpa, e, blob);
+            defer gpa.free(img);
+            var parsed = try Parsed.parseBytes(gpa, img);
+            defer parsed.deinit(gpa);
+            try std.testing.expectEqual(case.dt, try parsed.find("layers.0.self_attn.q_proj").?.dataType());
+        }
+    }
+
+    // NVFP4 (N=1, K=32 -> 2 micro-scale bytes padded to 4 + 4B outer f32 = 8B params)
+    {
+        var e = TensorEntry.zeroed("layers.0.mlp.experts.0.down_proj", .cold_expert, .nvfp4_g16);
+        e.quant_bits = 4;
+        e.rank = 2;
+        e.group_size = 16;
+        e.shape = .{ 1, 32, 0, 0 };
+        e.data_bytes = 16;
+        e.params_offset = 64;
+        e.params_bytes = 8;
+        const blob = try gpa.alloc(u8, 72);
+        defer gpa.free(blob);
+        @memset(blob, 0);
+        const img = try buildTestAmf(gpa, e, blob);
+        defer gpa.free(img);
+        var parsed = try Parsed.parseBytes(gpa, img);
+        defer parsed.deinit(gpa);
+        try std.testing.expectEqual(DType.nvfp4_g16, try parsed.find("layers.0.mlp.experts.0.down_proj").?.dataType());
+    }
+
+    // GGUF raw block entry validation (`gguf_q2_0`)
+    {
+        var e = TensorEntry.zeroed("layers.0.mlp.experts.0.down_proj", .hot_expert, .gguf_q2_0);
+        e.quant_bits = 2;
+        e.rank = 2;
+        e.group_size = 64;
+        e.shape = .{ 2, 128, 0, 0 };
+        e.data_bytes = 2 * 2 * 18;
+        const blob = try gpa.alloc(u8, 72);
+        defer gpa.free(blob);
+        @memset(blob, 0);
+        const img = try buildTestAmf(gpa, e, blob);
+        defer gpa.free(img);
+        var parsed = try Parsed.parseBytes(gpa, img);
+        defer parsed.deinit(gpa);
+        try std.testing.expectEqual(DType.gguf_q2_0, try parsed.find("layers.0.mlp.experts.0.down_proj").?.dataType());
+    }
+
+    // Chat template metadata (`CHAT_TEMPLATE_METADATA_NAME` + legacy alias)
+    {
+        var norm_e = TensorEntry.zeroed("norm.weight", .norm, .f16);
+        norm_e.rank = 1;
+        norm_e.shape = .{ 8, 0, 0, 0 };
+        norm_e.data_bytes = 16;
+        var norm_bytes: [16]u8 = @splat(0);
+        const base = try buildTestAmf(gpa, norm_e, &norm_bytes);
+        defer gpa.free(base);
+
+        const spec_json = "{\"schema_version\":1,\"dialect\":\"inkling2\"}";
+        const with_ct = try embedMetadataIntoAmfBytes(gpa, base, &.{
+            .{ .name = CHAT_TEMPLATE_METADATA_NAME, .payload = spec_json },
+            .{ .name = LEGACY_CHAT_TEMPLATE_METADATA_NAME, .payload = spec_json },
+        });
+        defer gpa.free(with_ct);
+        var parsed = try Parsed.parseBytes(gpa, with_ct);
+        defer parsed.deinit(gpa);
+        try std.testing.expect(parsed.hasEmbeddedChatTemplate());
+        const got = (try parsed.extractMetadataFromBytes(with_ct, CHAT_TEMPLATE_METADATA_NAME)).?;
+        try std.testing.expectEqualStrings(spec_json, got);
+        const got_legacy = (try parsed.extractMetadataFromBytes(with_ct, LEGACY_CHAT_TEMPLATE_METADATA_NAME)).?;
+        try std.testing.expectEqualStrings(spec_json, got_legacy);
+    }
 }

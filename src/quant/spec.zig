@@ -154,12 +154,14 @@ pub fn denseGemmCpuRef(
     }
 }
 
+pub const formats = @import("formats.zig");
+
 /// Generates branch-free, compile-time-specialized quantization helpers and
 /// CPU fp32 reference math for `spec`. Unsupported configurations are compile
 /// errors.
 pub fn QuantOps(comptime spec: QuantSpec) type {
-    if (spec.group_size != 64) {
-        @compileError("aminfer v0 currently specializes group_size = 64 only");
+    if (spec.group_size != 32 and spec.group_size != 64 and spec.group_size != 128) {
+        @compileError("aminfer specializes group_size in {32, 64, 128} only");
     }
     const bits: usize = spec.bits.bitWidth();
     const gs: usize = spec.group_size;
@@ -513,4 +515,34 @@ test "QuantOps 2-bit computes exact byte sizes, LSB-first packing, dequant and m
             try std.testing.expectApproxEqAbs(expected, y[mi * n + ni], 1e-4);
         }
     }
+}
+
+test "QuantOps supports group_size 32 and 128 across q2, q3, and q4" {
+    inline for (.{ @as(u16, 32), @as(u16, 128) }) |gs| {
+        inline for (.{ QuantBits.q2, QuantBits.q3, QuantBits.q4 }) |bits| {
+            const Q = QuantOps(.{ .bits = bits, .group_size = gs });
+            const bw: usize = bits.bitWidth();
+            try std.testing.expectEqual((@as(usize, gs) * bw) / 8, Q.groupWeightBytes());
+            try std.testing.expectEqual(@as(usize, 2), try Q.groupsPerRow(gs * 2));
+
+            var codes: [gs]u8 = undefined;
+            const mask: usize = (@as(usize, 1) << @intCast(bw)) - 1;
+            for (&codes, 0..) |*c, idx| c.* = @intCast((idx * 3 + 1) & mask);
+
+            var packed_buf: [Q.groupWeightBytes()]u8 = undefined;
+            Q.packGroup(&codes, &packed_buf);
+
+            const sb: ScaleBias = .{ .scale = @floatCast(0.25), .bias = @floatCast(-0.5) };
+            var deq: [gs]f32 = undefined;
+            Q.dequantizeGroup(&packed_buf, sb, &deq);
+            for (deq, 0..) |val, idx| {
+                const expected: f32 = @as(f32, @floatFromInt(codes[idx])) * 0.25 - 0.5;
+                try std.testing.expectApproxEqAbs(expected, val, 1e-6);
+            }
+        }
+    }
+}
+
+test {
+    std.testing.refAllDecls(formats);
 }

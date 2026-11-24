@@ -1852,7 +1852,7 @@ fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) DraftLoadErro
             if ((k % 64) != 0) return error.UnalignedK;
             break :blk .q2_affine;
         },
-        .f32, .u32 => error.UnexpectedTensorDType,
+        else => error.UnexpectedTensorDType,
     };
 }
 

@@ -36,6 +36,8 @@ from dataclasses import dataclass
 
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
+    _AFFINE_DEQUANT_SPEC,
+    AFFINE_GROUP_SIZES,
     DTYPE_MODES,
     ENTRY_STRUCT,
     NO_EXPERT,
@@ -56,6 +58,7 @@ from aminfer_tools.amf import (
     _BlobWriter,
     _collect_tensors,
     _crc32,
+    _decode_scalar_f32_at,
     _load_tie_flag,
     _pack_directory,
     _pack_header,
@@ -67,15 +70,24 @@ from aminfer_tools.amf import (
     _stream_entry,
     bf16_bytes_to_f16_bytes,
     bf16_bytes_to_f32_list,
+    dequantize_fp8_block_row_f32,
+    dequantize_fp8_row_f32,
+    dequantize_fp8_tensor_f32,
+    dequantize_mxfp8_row_f32,
+    dequantize_nvfp4_row_f32,
     dequantize_q2_row_f32,
     dequantize_q3_row_f32,
     dequantize_q4_row_f32,
+    dequantize_q5_row_f32,
+    dequantize_q6_row_f32,
+    dequantize_q8_row_f32,
     dequantize_sme2_panel64_q2_panel_f32,
     dequantize_sme2_panel64_q3_panel_f32,
     dequantize_sme2_panel64_q4_panel_f32,
     f16_bytes_to_bf16_bytes,
     f16_bytes_to_f32_list,
     f32_bytes_to_f32_list,
+    is_vision_tensor,
     load_cold_experts_from_heat_profile,
     pack_mlx_affine_3bit,
     pack_mlx_affine_4bit,
@@ -100,6 +112,14 @@ _DTYPE_BITS_RANK = {
     DType.Q2_AFFINE: 2,
     DType.Q3_AFFINE: 3,
     DType.Q4_AFFINE: 4,
+    DType.NVFP4_G16: 4,
+    DType.Q5_AFFINE: 5,
+    DType.Q6_AFFINE: 6,
+    DType.Q8_AFFINE: 8,
+    DType.FP8_E4M3_BLOCK: 8,
+    DType.FP8_E4M3_ROW: 8,
+    DType.FP8_E4M3_TENSOR: 8,
+    DType.MXFP8_G32: 8,
     DType.F16: 16,
     DType.BF16: 16,
     DType.F32: 32,
@@ -1296,9 +1316,29 @@ def _effective_payload_bytes(dtype: DType, shape: tuple[int, ...], group_size: i
         return numel * 2, 0, 0
     if dtype in (DType.F32, DType.U32):
         return numel * 4, 0, 0
+    if dtype == DType.FP8_E4M3_TENSOR:
+        return numel, _align_up(numel, 64), 4
     if len(shape) != 2:
         raise ValueError(f"quantized dtype {dtype.name} requires 2D shape, got {shape}")
     n, k = shape
+    if dtype == DType.FP8_E4M3_BLOCK:
+        data_bytes = n * k
+        params_bytes = ((n + 127) // 128) * ((k + 127) // 128) * 4
+        return data_bytes, _align_up(data_bytes, 64), params_bytes
+    if dtype == DType.FP8_E4M3_ROW:
+        data_bytes = n * k
+        return data_bytes, _align_up(data_bytes, 64), n * 4
+    if dtype == DType.MXFP8_G32:
+        data_bytes = n * k
+        return data_bytes, _align_up(data_bytes, 64), n * (k // 32)
+    if dtype == DType.NVFP4_G16:
+        data_bytes = n * (k // 2)
+        params_bytes = _align_up(n * (k // 16), 4) + 4
+        return data_bytes, _align_up(data_bytes, 64), params_bytes
+    if dtype >= DType.GGUF_Q4_0:
+        from aminfer_tools.gguf import gguf_row_bytes_for_amf_dtype
+
+        return n * gguf_row_bytes_for_amf_dtype(dtype, k), 0, 0
     if k % group_size != 0:
         raise ValueError(f"shape ({n}, {k}) incompatible with group_size={group_size}")
     bits = _DTYPE_BITS_RANK[dtype]
@@ -1314,15 +1354,16 @@ def _algorithmic_bytes(dtype: DType, shape: tuple[int, ...], group_size: int) ->
 
 
 def _role_of_tensor(name: str, kind: TensorKind) -> str:
-    if kind == TensorKind.NORM:
+    lower = name.lower()
+    if kind == TensorKind.NORM or "norm" in lower:
         return "norm"
-    if kind == TensorKind.ROUTER:
+    if kind == TensorKind.ROUTER or lower.endswith(".gate") or lower.endswith(".gate.weight") or "router" in lower:
         return "router"
     if kind == TensorKind.EMBEDDING:
         return "embedding"
     if kind == TensorKind.LM_HEAD:
         return "lm_head"
-    if kind == TensorKind.SHARED_EXPERT:
+    if kind == TensorKind.SHARED_EXPERT or "shared_expert" in lower or "shared_exp" in lower:
         return "shared_expert"
     if kind == TensorKind.SPARSE_TABLE:
         return "sparse_table"
@@ -1330,14 +1371,37 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
         return "loop_adapter"
     if kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT):
         return "moe_expert"
-    if ".self_attn." in name or ".linear_attn." in name:
-        if ".v_proj" in name or ".g_proj" in name:
+    if "controller" in lower or "controllers" in lower:
+        return "controller"
+    if "sconv" in lower or "conv1d" in lower:
+        return "sconv"
+    if (
+        "hc_" in lower
+        or "_hc" in lower
+        or "hyper_connection" in lower
+        or "attn_res" in lower
+        or ".phi" in lower
+        or ".in_mix_" in lower
+        or ".blk_inj." in lower
+    ):
+        return "ihc"
+    if (
+        lower.startswith(("mtp.", "mtp_layers.", "dflare.", "dfly.", "dfly_layers."))
+        or ".mtp" in lower
+        or "dflare" in lower
+        or "dfly" in lower
+    ):
+        return "mtp_dflare"
+    if is_vision_tensor(name):
+        return "vision"
+    if ".self_attn." in lower or ".linear_attn." in lower or ".attn." in lower:
+        if any(tok in lower for tok in (".v_proj", ".g_proj", ".wv_")):
             return "attn_v"
-        if ".o_proj" in name or ".out_proj" in name:
+        if any(tok in lower for tok in (".o_proj", ".out_proj", ".wo_")):
             return "attn_o"
         return "attn_qk"
-    if ".mlp." in name:
-        if ".down_proj" in name:
+    if ".mlp." in lower or ".ffn." in lower:
+        if ".down_proj" in lower or ".w2." in lower:
             return "ffn_down"
         return "dense_ffn"
     return "dense"
@@ -1346,6 +1410,11 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
 _ROLE_WEIGHT = {
     "router": 10.0,
     "loop_adapter": 8.0,
+    "controller": 8.0,
+    "sconv": 8.0,
+    "ihc": 8.0,
+    "mtp_dflare": 7.0,
+    "vision": 6.0,
     "embedding": 6.0,
     "lm_head": 6.0,
     "shared_expert": 5.0,
@@ -1360,6 +1429,122 @@ _ROLE_WEIGHT = {
     "sparse_table": 1.0,
     "norm": 100.0,
 }
+
+_PROTECTED_HIGH_PRECISION_ROLES = frozenset(
+    {
+        "router",
+        "controller",
+        "sconv",
+        "ihc",
+        "mtp_dflare",
+        "vision",
+        "embedding",
+        "lm_head",
+        "shared_expert",
+        "attn_v",
+        "attn_o",
+        "attn_vo",
+        "attn_qk",
+        "norm",
+    }
+)
+
+
+def parse_gguf_imatrix(path: pathlib.Path) -> dict[str, list[float]]:
+    """Parse importance matrix weights from llama.cpp `.gguf`, legacy `.dat`, or JSON imatrix.
+
+    Returns `{normalized_tensor_name: [channel_importance, ...]}` where each channel entry
+    tracks mean squared calibration activation `E[x^2]`.
+    """
+    p = pathlib.Path(path)
+    raw = p.read_bytes()
+    if len(raw) < 4:
+        raise ValueError(f"imatrix file is too small: {p}")
+
+    out: dict[str, list[float]] = {}
+    if raw[:4] == b"GGUF":
+        from aminfer_tools.gguf import normalize_gguf_tensor_name, read_gguf_header
+
+        g = read_gguf_header(p)
+        by_name = {t.name: t for t in g.tensors}
+        with p.open("rb") as fh:
+            for t in g.tensors:
+                if t.ggml_type != 0:  # F32
+                    continue
+                if t.name.endswith(".counts"):
+                    continue
+                base_raw = t.name[: -len(".in_sum2")] if t.name.endswith(".in_sum2") else t.name
+                fh.seek(g.data_offset + t.offset)
+                vals = list(struct.unpack(f"<{t.numel}f", fh.read(t.numel * 4)))
+                cnt_t = by_name.get(f"{base_raw}.counts")
+                if cnt_t is not None and cnt_t.ggml_type == 0 and cnt_t.numel in (1, t.numel):
+                    fh.seek(g.data_offset + cnt_t.offset)
+                    cnts = struct.unpack(f"<{cnt_t.numel}f", fh.read(cnt_t.numel * 4))
+                    if len(cnts) == 1:
+                        denom = cnts[0] if cnts[0] > 0.0 else 1.0
+                        vals = [v / denom for v in vals]
+                    else:
+                        vals = [v / (c if c > 0.0 else 1.0) for v, c in zip(vals, cnts)]
+                norm = normalize_gguf_tensor_name(base_raw)
+                out[norm] = vals
+        return out
+
+    if raw[:1] in (b"{", b"["):
+        loaded = json.loads(raw.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"JSON imatrix in {p} must be an object mapping tensor names")
+        for k, v in loaded.items():
+            vals = [float(v)] if isinstance(v, (int, float)) else [float(x) for x in v]
+            out[str(k)] = vals
+        return out
+
+    # Legacy llama.cpp binary `.dat` format:
+    # `int32 n_entries`, then per entry: `int32 name_len, bytes name, int32 ncall, int32 nval, float32[nval]`.
+    off = 0
+    (n_entries,) = struct.unpack_from("<i", raw, off)
+    off += 4
+    if n_entries < 0 or n_entries > 1_000_000:
+        raise ValueError(f"implausible imatrix entry count {n_entries} in {p}")
+    from aminfer_tools.gguf import normalize_gguf_tensor_name
+
+    for _ in range(n_entries):
+        if off + 4 > len(raw):
+            raise ValueError(f"truncated imatrix .dat header in {p}")
+        (name_len,) = struct.unpack_from("<i", raw, off)
+        off += 4
+        if name_len <= 0 or off + name_len + 8 > len(raw):
+            raise ValueError(f"corrupt imatrix entry name_len={name_len} in {p}")
+        raw_name = raw[off : off + name_len].decode("utf-8")
+        off += name_len
+        ncall, nval = struct.unpack_from("<2i", raw, off)
+        off += 8
+        if nval < 0 or off + nval * 4 > len(raw):
+            raise ValueError(f"corrupt imatrix entry nval={nval} for {raw_name!r} in {p}")
+        vals_raw = struct.unpack_from(f"<{nval}f", raw, off)
+        off += nval * 4
+        denom = float(ncall) if ncall > 0 else 1.0
+        vals = [float(v) / denom for v in vals_raw]
+        out[normalize_gguf_tensor_name(raw_name)] = vals
+    return out
+
+
+def _imatrix_tensor_multipliers(imatrix: dict[str, list[float]]) -> dict[str, float]:
+    """Convert raw `imatrix` activation vectors into median-normalized `[0.5, 4.0]` GSQ priors."""
+    means: dict[str, float] = {}
+    for k, vec in imatrix.items():
+        if vec:
+            pos = [max(0.0, float(v)) for v in vec]
+            m = sum(pos) / len(pos)
+            if m > 0.0:
+                means[k] = m
+    if not means:
+        return {}
+    s = sorted(means.values())
+    mid = len(s) // 2
+    med = s[mid] if (len(s) & 1) else 0.5 * (s[mid - 1] + s[mid])
+    if med <= 0.0:
+        return {}
+    return {k: max(0.5, min(4.0, v / med)) for k, v in means.items()}
 
 
 @dataclass(frozen=True)
@@ -1478,8 +1663,9 @@ def solve_gsq_allocation(
                 target_j = j
         return target_j
 
-    # Protection pass 2: protect embedding / lm_head / shared_expert at >= q4_affine
-    # (or lossless source q3_affine on 3-bit checkpoints) when budget allows.
+    # Protection pass 2: protect critical architectural components (`embedding`, `lm_head`,
+    # `shared_expert`, recurrent `controller`s, `sconv`, `ihc`, `mtp_dflare`, `vision`)
+    # at >= q4_affine (or lossless source q3_affine on 3-bit checkpoints) when budget allows.
     for idx, u in enumerate(units):
         if u.role in ("embedding", "lm_head", "shared_expert"):
             target_j = _best_floor_candidate_idx(u, chosen_idx[idx])
@@ -1489,9 +1675,8 @@ def solve_gsq_allocation(
                     chosen_idx[idx] = target_j
                     cur_bytes += extra
 
-    # Protection pass 3: protect boundary layers (layer 0 and final layer, critical
-    # for lexical/multilingual encoding and final logit projection) and attention
-    # projections at >= q4_affine (or source q3_affine) when budget permits.
+    # Protection pass 3: protect recurrent controllers/sconv/iHC/MTP/DFlare/vision, boundary
+    # layers (layer 0 and final layer), and attention projections at >= q4_affine when budget permits.
     layer_indices = [u.layer for u in units if u.layer != NO_LAYER]
     max_unit_layer = max(layer_indices) if layer_indices else -1
     has_boundary_layers = max_unit_layer >= 3
@@ -1514,6 +1699,7 @@ def solve_gsq_allocation(
                     chosen_idx[idx] = target_j
                     cur_bytes += extra
 
+    _protect_floor(lambda u: u.role in ("controller", "sconv", "ihc", "mtp_dflare", "vision"))
     if has_boundary_layers:
         _protect_floor(
             lambda u: u.role != "moe_expert" and u.layer in (0, max_unit_layer)
@@ -1744,29 +1930,18 @@ class _UnifiedSource:
             return f32_bytes_to_f32_list(raw)
         raise ValueError(f"unsupported 1D safetensors dtype {e.data.dtype} for {e.name}")
 
-    def read_rows_f32(self, t: _SourceTensor, row_indices: Sequence[int]) -> list[list[float]]:
-        if self._amf_reader is not None:
-            assert t.amf_meta is not None
-            return self._amf_reader.read_rows_f32(t.amf_meta, row_indices)
-        assert self._sf_readers is not None and t.sf_entry is not None
-        e = t.sf_entry
+    def _decode_sf_quant_rows(self, e: _PlannedEntry, row_indices: Sequence[int]) -> list[list[float]]:
+        assert self._sf_readers is not None
         n_rows, k = e.shape
         fh = self._sf_readers.get(e.data.path)
         out: list[list[float]] = []
 
-        if e.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
+        if e.dtype in _AFFINE_DEQUANT_SPEC:
             assert e.scales is not None and e.biases is not None
+            row_data_fn, deq = _AFFINE_DEQUANT_SPEC[e.dtype]
             gs = e.group_size
             groups = k // gs
-            if e.dtype == DType.Q2_AFFINE:
-                row_d = k // 4
-                deq = dequantize_q2_row_f32
-            elif e.dtype == DType.Q3_AFFINE:
-                row_d = (k * 3) // 8
-                deq = dequantize_q3_row_f32
-            else:
-                row_d = k // 2
-                deq = dequantize_q4_row_f32
+            row_d = row_data_fn(k)
             sb_elem = 2 if e.scales.dtype in ("F16", "BF16") else 4
             row_sb = groups * sb_elem
             s_fh = self._sf_readers.get(e.scales.path)
@@ -1784,6 +1959,102 @@ class _UnifiedSource:
                     _F16_PAIR_STRUCT.pack_into(p_buf, g_idx * 4, _clamp_f16(s_vals[g_idx]), _clamp_f16(b_vals[g_idx]))
                 out.append(deq(d_raw, p_buf, k, group_size=gs))
             return out
+
+        if e.dtype == DType.FP8_E4M3_BLOCK:
+            assert e.scales is not None
+            s_fh = self._sf_readers.get(e.scales.path)
+            sc_raw = _read_exact(s_fh, e.scales.offset, e.scales.length)
+            sc_f32 = _decode_sf_floats(sc_raw, e.scales.dtype)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                d_raw = _read_exact(fh, e.data.offset + r * k, k)
+                out.append(dequantize_fp8_block_row_f32(d_raw, r, sc_f32, n_rows, k))
+            return out
+
+        if e.dtype == DType.FP8_E4M3_ROW:
+            assert e.scales is not None
+            s_fh = self._sf_readers.get(e.scales.path)
+            sc_raw = _read_exact(s_fh, e.scales.offset, e.scales.length)
+            sc_f32 = _decode_sf_floats(sc_raw, e.scales.dtype)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                d_raw = _read_exact(fh, e.data.offset + r * k, k)
+                out.append(dequantize_fp8_row_f32(d_raw, sc_f32[r], k))
+            return out
+
+        if e.dtype == DType.FP8_E4M3_TENSOR:
+            sc_val = _decode_scalar_f32_at(self._sf_readers, e.scales, 0) if e.scales is not None else e.outer_scale_const
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                d_raw = _read_exact(fh, e.data.offset + r * k, k)
+                out.append(dequantize_fp8_tensor_f32(d_raw, sc_val, k))
+            return out
+
+        if e.dtype == DType.MXFP8_G32:
+            assert e.scales is not None
+            groups = k // 32
+            s_fh = self._sf_readers.get(e.scales.path)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                d_raw = _read_exact(fh, e.data.offset + r * k, k)
+                if e.scale_tile_shape is not None:
+                    t_row = r // 32
+                    p_raw = _read_exact(s_fh, e.scales.offset + t_row * groups, groups)
+                else:
+                    p_raw = _read_exact(s_fh, e.scales.offset + r * groups, groups)
+                out.append(dequantize_mxfp8_row_f32(d_raw, p_raw, k))
+            return out
+
+        if e.dtype == DType.NVFP4_G16:
+            assert e.scales is not None
+            groups = k // 16
+            row_d = k // 2
+            s_fh = self._sf_readers.get(e.scales.path)
+            idx = max(0, e.outer_scale_expert_index)
+            if e.outer_scale is not None:
+                val = _decode_scalar_f32_at(self._sf_readers, e.outer_scale, idx)
+                if e.outer_scale_denom is not None:
+                    denom = _decode_scalar_f32_at(self._sf_readers, e.outer_scale_denom, idx)
+                    outer_val = val / denom
+                elif e.outer_scale_divisor_mode:
+                    outer_val = 1.0 / val
+                else:
+                    outer_val = val / e.outer_scale_denom_const
+            else:
+                outer_val = e.outer_scale_const
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {e.name}")
+                d_raw = _read_exact(fh, e.data.offset + r * row_d, row_d)
+                p_raw = _read_exact(s_fh, e.scales.offset + r * groups, groups)
+                out.append(dequantize_nvfp4_row_f32(d_raw, p_raw, outer_val, k))
+            return out
+
+        raise ValueError(f"unsupported quantized safetensors dtype {e.dtype.name} for {e.name}")
+
+    def read_rows_f32(self, t: _SourceTensor, row_indices: Sequence[int]) -> list[list[float]]:
+        if self._amf_reader is not None:
+            assert t.amf_meta is not None
+            return self._amf_reader.read_rows_f32(t.amf_meta, row_indices)
+        assert self._sf_readers is not None and t.sf_entry is not None
+        e = t.sf_entry
+        n_rows, k = e.shape
+        fh = self._sf_readers.get(e.data.path)
+        out: list[list[float]] = []
+
+        if e.dtype in (
+            *_AFFINE_DEQUANT_SPEC,
+            DType.FP8_E4M3_BLOCK,
+            DType.FP8_E4M3_ROW,
+            DType.FP8_E4M3_TENSOR,
+            DType.MXFP8_G32,
+            DType.NVFP4_G16,
+        ):
+            return self._decode_sf_quant_rows(e, row_indices)
 
         elem_b = 2 if e.data.dtype in ("F16", "BF16") else 4
         row_b = k * elem_b
@@ -1828,70 +2099,32 @@ class _UnifiedSource:
                     yield [conv(mv[i * row_b : (i + 1) * row_b]) for i in range(cnt)]
                 return
 
-            if m.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
-                gs = m.group_size
-                groups = k // gs
-                if m.dtype == DType.Q2_AFFINE:
-                    row_d = k // 4
-                    deq = dequantize_q2_row_f32
-                elif m.dtype == DType.Q3_AFFINE:
-                    row_d = (k * 3) // 8
-                    deq = dequantize_q3_row_f32
-                else:
-                    row_d = k // 2
-                    deq = dequantize_q4_row_f32
-                row_p = groups * 4
+            if (
+                m.dtype in _AFFINE_DEQUANT_SPEC
+                or m.dtype
+                in (DType.FP8_E4M3_BLOCK, DType.FP8_E4M3_ROW, DType.FP8_E4M3_TENSOR, DType.MXFP8_G32, DType.NVFP4_G16)
+                or m.dtype >= DType.GGUF_Q4_0
+            ):
                 for r0 in range(0, n_rows, batch_rows):
                     cnt = min(batch_rows, n_rows - r0)
-                    d_raw = _read_exact(fh, m.blob_offset + r0 * row_d, cnt * row_d)
-                    p_raw = _read_exact(fh, m.blob_offset + m.params_offset + r0 * row_p, cnt * row_p)
-                    d_mv = memoryview(d_raw)
-                    p_mv = memoryview(p_raw)
-                    yield [
-                        deq(d_mv[i * row_d : (i + 1) * row_d], p_mv[i * row_p : (i + 1) * row_p], k, group_size=gs)
-                        for i in range(cnt)
-                    ]
+                    yield self._amf_reader.read_rows_f32(m, range(r0, r0 + cnt))
                 return
             raise ValueError(f"unsupported AMF dtype {m.dtype.name} for {m.name}")
 
         assert self._sf_readers is not None and t.sf_entry is not None
         e = t.sf_entry
         fh = self._sf_readers.get(e.data.path)
-        if e.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
-            assert e.scales is not None and e.biases is not None
-            gs = e.group_size
-            groups = k // gs
-            if e.dtype == DType.Q2_AFFINE:
-                row_d = k // 4
-                deq = dequantize_q2_row_f32
-            elif e.dtype == DType.Q3_AFFINE:
-                row_d = (k * 3) // 8
-                deq = dequantize_q3_row_f32
-            else:
-                row_d = k // 2
-                deq = dequantize_q4_row_f32
-            sb_elem = 2 if e.scales.dtype in ("F16", "BF16") else 4
-            row_sb = groups * sb_elem
-            s_fh = self._sf_readers.get(e.scales.path)
-            b_fh = self._sf_readers.get(e.biases.path)
+        if e.dtype in (
+            *_AFFINE_DEQUANT_SPEC,
+            DType.FP8_E4M3_BLOCK,
+            DType.FP8_E4M3_ROW,
+            DType.FP8_E4M3_TENSOR,
+            DType.MXFP8_G32,
+            DType.NVFP4_G16,
+        ):
             for r0 in range(0, n_rows, batch_rows):
                 cnt = min(batch_rows, n_rows - r0)
-                d_raw = _read_exact(fh, e.data.offset + r0 * row_d, cnt * row_d)
-                s_raw = _read_exact(s_fh, e.scales.offset + r0 * row_sb, cnt * row_sb)
-                b_raw = _read_exact(b_fh, e.biases.offset + r0 * row_sb, cnt * row_sb)
-                s_vals = _decode_sf_float_tuple(s_raw, e.scales.dtype)
-                b_vals = _decode_sf_float_tuple(b_raw, e.biases.dtype)
-                d_mv = memoryview(d_raw)
-                batch_out: list[list[float]] = []
-                for i in range(cnt):
-                    g0 = i * groups
-                    p_buf = bytearray(groups * 4)
-                    for g_idx in range(groups):
-                        _F16_PAIR_STRUCT.pack_into(
-                            p_buf, g_idx * 4, _clamp_f16(s_vals[g0 + g_idx]), _clamp_f16(b_vals[g0 + g_idx])
-                        )
-                    batch_out.append(deq(d_mv[i * row_d : (i + 1) * row_d], p_buf, k, group_size=gs))
-                yield batch_out
+                yield self._decode_sf_quant_rows(e, range(r0, r0 + cnt))
             return
 
         elem_b = 2 if e.data.dtype in ("F16", "BF16") else 4
@@ -2520,6 +2753,7 @@ def gsq_convert(
     manifest_path: pathlib.Path | None = None,
     workers: int = 1,
     strip_vision: bool = True,
+    imatrix_path: pathlib.Path | None = None,
     stats_out: dict[str, int] | None = None,
 ) -> GsqConvertReport:
     """Convert a float/quantized safetensors checkpoint or `.amf` into a GSQ+RCO `.amf` v0.
@@ -2529,14 +2763,18 @@ def gsq_convert(
     page-aligned blobs with IEEE CRC-32 atomically, and optionally emits a JSON
     allocation manifest (`manifest_path`).
     """
-    if group_size != 64:
-        raise ValueError(f"ADR-0017 / ADR-0014 requires group_size == 64, got {group_size}")
+    if group_size not in AFFINE_GROUP_SIZES:
+        raise ValueError(f"aminfer GSQ requires group_size in {AFFINE_GROUP_SIZES}, got {group_size}")
     if dtype_mode not in DTYPE_MODES:
         raise ValueError(f"dtype_mode must be one of {DTYPE_MODES}, got {dtype_mode!r}")
     if sme2_pack not in SME2_PACK_MODES:
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
     if target_bits <= 0.0:
         raise ValueError(f"target_bits must be positive, got {target_bits}")
+
+    imatrix_mults: dict[str, float] = {}
+    if imatrix_path is not None:
+        imatrix_mults = _imatrix_tensor_multipliers(parse_gguf_imatrix(pathlib.Path(imatrix_path)))
 
     eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
 
@@ -2610,11 +2848,22 @@ def gsq_convert(
         expert_groups: dict[tuple[int, int], list[_SourceTensor]] = {}
         standalone_quant: list[_SourceTensor] = []
 
+        _QUANTIZABLE_SRC_DTYPES = (
+            DType.F16,
+            DType.BF16,
+            DType.F32,
+            *_AFFINE_DEQUANT_SPEC,
+            DType.FP8_E4M3_BLOCK,
+            DType.FP8_E4M3_ROW,
+            DType.FP8_E4M3_TENSOR,
+            DType.MXFP8_G32,
+            DType.NVFP4_G16,
+        )
         for t in src.tensors:
             is_quantizable = (
                 len(t.shape) == 2
-                and t.kind not in (TensorKind.NORM, TensorKind.SPARSE_TABLE, TensorKind.LOOP_ADAPTER)
-                and t.dtype in (DType.F16, DType.BF16, DType.F32, DType.Q4_AFFINE, DType.Q3_AFFINE, DType.Q2_AFFINE)
+                and t.kind not in (TensorKind.NORM, TensorKind.SPARSE_TABLE, TensorKind.LOOP_ADAPTER, TensorKind.METADATA)
+                and (t.dtype in _QUANTIZABLE_SRC_DTYPES or t.dtype >= DType.GGUF_Q4_0)
                 and t.shape[1] > 0
                 and t.shape[1] % group_size == 0
             )
@@ -2665,7 +2914,7 @@ def gsq_convert(
         def _build_unit(unit_id: str, members: list[_SourceTensor], role: str, layer: int, expert: int) -> QuantUnitInput:
             # Cap candidate precision at the lowest source precision among members so we never
             # fabricate bits by upscaling an already-quantized input tensor.
-            max_bits = min(_DTYPE_BITS_RANK[m.dtype] for m in members)
+            max_bits = min(_DTYPE_BITS_RANK.get(m.dtype, 4) for m in members)
             f_target = _float_target_for(members[0])
 
             total_numel = 0
@@ -2697,24 +2946,46 @@ def gsq_convert(
             if role == "moe_expert" and (layer, expert) in heat_probs:
                 heat_mult = 0.25 + 2.5 * heat_probs[(layer, expert)]
 
+            im_mult = 1.0
+            if imatrix_mults:
+                found_im = [
+                    imatrix_mults.get(m.name) or imatrix_mults.get(m.name.removesuffix(".weight"))
+                    for m in members
+                ]
+                pos_im = [v for v in found_im if v is not None]
+                if pos_im:
+                    im_mult = max(pos_im)
+                elif unit_id in imatrix_mults:
+                    im_mult = imatrix_mults[unit_id]
+
             sensitivity = (
                 _ROLE_WEIGHT.get(role, 1.0)
                 * _layer_u_curve(layer)
                 * _hessian_proxy(role, layer)
                 * mean_outlier
                 * heat_mult
+                * im_mult
             )
 
             cand_dtypes: list[DType] = []
             for qdt, qb in ((DType.Q2_AFFINE, 2), (DType.Q3_AFFINE, 3), (DType.Q4_AFFINE, 4)):
                 if qb <= max_bits:
                     cand_dtypes.append(qdt)
+            src_dt = members[0].dtype
+            if (
+                all(m.dtype == src_dt for m in members)
+                and src_dt not in _QUANT_DTYPES
+                and src_dt not in (DType.F16, DType.BF16, DType.F32)
+            ):
+                # Allow preserving native non-affine-lowbit source precision (FP8, MXFP8, NVFP4, Q5..Q8) on protected units.
+                cand_dtypes.append(src_dt)
             if max_bits >= 16:
                 cand_dtypes.append(f_target)
 
             candidates: list[QuantUnitCandidate] = []
             for cdt in cand_dtypes:
-                alg_b = sum(_algorithmic_bytes(cdt, m.shape, group_size) for m in members)
+                eff_gs = members[0].group_size if (cdt == src_dt and members[0].group_size) else group_size
+                alg_b = sum(_algorithmic_bytes(cdt, m.shape, eff_gs) for m in members)
                 if cdt in _QUANT_DTYPES:
                     raw_mse = mse_weighted[cdt] / max(1, total_numel)
                 else:
@@ -2799,10 +3070,22 @@ def gsq_convert(
             out_name = _output_name_for_tensor(t.name, target_dtype, existing_names | used_out_names)
             used_out_names.add(out_name)
 
-            q_bits = _DTYPE_BITS_RANK[target_dtype] if target_dtype in _QUANT_DTYPES else 0
-            g_size = group_size if target_dtype in _QUANT_DTYPES else 0
-            use_sme2 = _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack) or (
-                t.kind == TensorKind.LOOP_ADAPTER and t.layout == TensorLayout.SME2_PANEL64
+            if target_dtype in _QUANT_DTYPES:
+                q_bits = _DTYPE_BITS_RANK[target_dtype]
+                g_size = group_size
+            elif target_dtype == t.dtype:
+                q_bits = t.quant_bits
+                g_size = t.group_size
+            else:
+                q_bits = 0
+                g_size = 0
+            use_sme2 = (
+                target_dtype in (DType.F16, DType.BF16, DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
+                and (target_dtype not in _QUANT_DTYPES or g_size == SME2_GROUP_K)
+                and (
+                    _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack)
+                    or (t.kind == TensorKind.LOOP_ADAPTER and t.layout == TensorLayout.SME2_PANEL64)
+                )
             )
             if use_sme2:
                 layout = TensorLayout.SME2_PANEL64
@@ -2818,7 +3101,9 @@ def gsq_convert(
             else:
                 layout = TensorLayout.ROW_MAJOR
                 param_kind = QuantParamKind.AFFINE_SCALE_BIAS
-                data_bytes, params_offset, params_bytes = _effective_payload_bytes(target_dtype, t.shape, group_size)
+                data_bytes, params_offset, params_bytes = _effective_payload_bytes(
+                    target_dtype, t.shape, g_size or group_size
+                )
                 content = (params_offset + params_bytes) if params_bytes > 0 else data_bytes
 
             blob_bytes = _align_up(max(content, 1), APPLE_PAGE_SIZE)

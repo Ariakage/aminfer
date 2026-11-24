@@ -8357,7 +8357,7 @@ fn amfDTypeToPanelDType(dt: amf.DType) LoadError!sme.PanelDType {
         .q4_affine => .q4_affine,
         .q3_affine => .q3_affine,
         .q2_affine => .q2_affine,
-        .f32, .u32 => error.UnexpectedTensorDType,
+        else => error.UnexpectedTensorDType,
     };
 }
 
@@ -8550,7 +8550,7 @@ fn validateLinear2D(entry: *const amf.TensorEntry, n: u32, k: u32) LoadError!qua
             if ((k % 64) != 0) return error.UnalignedK;
             break :blk .q2_affine;
         },
-        .f32, .u32 => error.UnexpectedTensorDType,
+        else => error.UnexpectedTensorDType,
     };
 }
 
@@ -8563,14 +8563,17 @@ fn validateRouter2D(entry: *const amf.TensorEntry, num_experts: u32, hidden_size
     _ = try entry.quantParamKind();
     if (layout == .sme2_panel64) {
         if ((hidden_size % sme.GROUP_SIZE) != 0) return error.UnalignedK;
-        if (dt == .f32 or dt == .u32) return error.UnexpectedTensorDType;
+        switch (dt) {
+            .f16, .bf16, .q4_affine, .q3_affine, .q2_affine => {},
+            else => return error.UnexpectedTensorDType,
+        }
     }
     switch (dt) {
         .f16, .bf16, .f32 => {},
         .q4_affine, .q3_affine, .q2_affine => {
             if ((hidden_size % 64) != 0) return error.UnalignedK;
         },
-        .u32 => return error.UnexpectedTensorDType,
+        else => return error.UnexpectedTensorDType,
     }
     return dt;
 }
@@ -9820,7 +9823,7 @@ fn loadCore(
                             .scale_bias = .{ .buffer = router_b.buffer, .offset = router_b.offset + router_e.params_offset },
                             .bits = .q2,
                         } },
-                        .u32 => unreachable,
+                        else => return error.UnexpectedTensorDType,
                     };
                 }
 
@@ -13130,7 +13133,7 @@ pub fn buildSyntheticAmfImageWithSpec(
                 .q2_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q2_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.45 * inv_sqrt_h, seed + t_idx),
                 .q3_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q3_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.25 * inv_sqrt_h, seed + t_idx),
                 .q4_affine => try addWeight2D(allocator, &recs, router_base, false, .router, .q4_affine, l, amf.NO_EXPERT, cfg.num_experts, h, 0.12 * inv_sqrt_h, seed + t_idx),
-                .f32, .u32 => return error.UnexpectedTensorDType,
+                else => return error.UnexpectedTensorDType,
             }
             t_idx += 1;
             const inv_sqrt_mi = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.moe_intermediate_size)));
@@ -13355,7 +13358,7 @@ const CpuTransformerRef = struct {
                     y[row] = acc;
                 }
             },
-            .u32 => return error.UnexpectedTensorDType,
+            else => return error.UnexpectedTensorDType,
         }
     }
 
@@ -13428,7 +13431,7 @@ const CpuTransformerRef = struct {
                     for (0..64) |j| out_f16[g * 64 + j] = @floatCast(tmp[j]);
                 }
             },
-            .f32, .u32 => return error.UnexpectedTensorDType,
+            else => return error.UnexpectedTensorDType,
         }
     }
 

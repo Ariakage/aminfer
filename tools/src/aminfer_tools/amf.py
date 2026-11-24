@@ -27,9 +27,12 @@ import random
 import re
 import struct
 import sys
+import urllib.error
+import urllib.request
 import zlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from aminfer_tools import APPLE_PAGE_SIZE
 
@@ -45,6 +48,9 @@ META_PREFIX = "__meta."
 META_CONFIG_JSON = "__meta.config_json"
 META_TOKENIZER_JSON = "__meta.tokenizer_json"
 META_ADAPTER_CONFIG_JSON = "__meta.adapter_config_json"
+META_CHAT_TEMPLATE_JSON = "__meta.chat_template_json"
+CHAT_TEMPLATE_METADATA_NAME = META_CHAT_TEMPLATE_JSON
+LEGACY_CHAT_TEMPLATE_METADATA_NAME = "__aminfer_chat_template__"
 
 HEADER_STRUCT = struct.Struct("<8sIIIIIIQQII64sQ")
 ENTRY_STRUCT = struct.Struct("<48sBBBBHHHHI4IQQQQQQ")
@@ -60,7 +66,11 @@ _VISION_TOWER_BLOCK_RE = re.compile(
 _EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
 _LOOP_STEP_RE = re.compile(r"(?:^|\.)loop\.step\.(\d+)\.")
 _SWITCH_MLP_RE = re.compile(
-    r"^(?:model\.)?(?:language_model\.)?(?:model\.)?layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)$"
+    r"^(?:model\.)?(?:language_model\.)?(?:model\.)?(?:llm\.)?layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)$"
+)
+_EXPERTS_STACK_RE = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?(?:model\.)?(?:llm\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\."
+    r"(gate_proj|up_proj|down_proj|gate_up_proj|w13|w2|w1|w3)$"
 )
 VISION_TENSOR_PREFIXES = (
     "visual.",
@@ -250,7 +260,7 @@ class TensorKind(enum.IntEnum):
 
 
 def is_meta_name(name: str) -> bool:
-    return name.startswith(META_PREFIX)
+    return name.startswith(META_PREFIX) or name == LEGACY_CHAT_TEMPLATE_METADATA_NAME
 
 
 def make_metadata_record(name: str, payload: bytes | str) -> tuple:
@@ -284,6 +294,49 @@ class DType(enum.IntEnum):
     BF16 = 4
     U32 = 5
     Q2_AFFINE = 6
+    Q5_AFFINE = 7
+    Q6_AFFINE = 8
+    Q8_AFFINE = 9
+    FP8_E4M3_BLOCK = 10
+    FP8_E4M3_ROW = 11
+    FP8_E4M3_TENSOR = 12
+    MXFP8_G32 = 13
+    NVFP4_G16 = 14
+    GGUF_Q4_0 = 15
+    GGUF_Q4_1 = 16
+    GGUF_Q5_0 = 17
+    GGUF_Q5_1 = 18
+    GGUF_Q8_0 = 19
+    GGUF_Q2_K = 20
+    GGUF_Q3_K = 21
+    GGUF_Q4_K = 22
+    GGUF_Q5_K = 23
+    GGUF_Q6_K = 24
+    GGUF_IQ1_S = 25
+    GGUF_IQ1_M = 26
+    GGUF_IQ2_XXS = 27
+    GGUF_IQ2_XS = 28
+    GGUF_IQ2_S = 29
+    GGUF_IQ3_XXS = 30
+    GGUF_IQ3_S = 31
+    GGUF_IQ4_NL = 32
+    GGUF_IQ4_XS = 33
+    GGUF_TQ1_0 = 34
+    GGUF_TQ2_0 = 35
+    GGUF_MXFP4 = 36
+    GGUF_Q2_0 = 37
+
+
+AFFINE_DTYPES = (
+    DType.Q2_AFFINE,
+    DType.Q3_AFFINE,
+    DType.Q4_AFFINE,
+    DType.Q5_AFFINE,
+    DType.Q6_AFFINE,
+    DType.Q8_AFFINE,
+)
+
+AFFINE_GROUP_SIZES = (32, 64, 128)
 
 
 class TensorLayout(enum.IntEnum):
@@ -528,15 +581,114 @@ def pack_mlx_affine_2bit(codes: Sequence[int]) -> bytes:
     return bytes(out)
 
 
+def pack_mlx_affine_5bit(codes: Sequence[int]) -> bytes:
+    """Pack 5-bit unsigned codes LSB-first (8 values in 5 bytes, MLX uint32 compatible)."""
+    if len(codes) % 8 != 0:
+        raise ValueError("5-bit code count must be a multiple of 8")
+    out = bytearray((len(codes) // 8) * 5)
+    for blk in range(len(codes) // 8):
+        c = codes[blk * 8 : blk * 8 + 8]
+        word = 0
+        for j in range(8):
+            word |= (c[j] & 0x1F) << (5 * j)
+        for b_i in range(5):
+            out[blk * 5 + b_i] = (word >> (8 * b_i)) & 0xFF
+    return bytes(out)
+
+
+def pack_mlx_affine_6bit(codes: Sequence[int]) -> bytes:
+    """Pack 6-bit unsigned codes LSB-first (4 values in 3 bytes, MLX uint32 compatible)."""
+    if len(codes) % 4 != 0:
+        raise ValueError("6-bit code count must be a multiple of 4")
+    out = bytearray((len(codes) // 4) * 3)
+    for blk in range(len(codes) // 4):
+        c = codes[blk * 4 : blk * 4 + 4]
+        word = 0
+        for j in range(4):
+            word |= (c[j] & 0x3F) << (6 * j)
+        out[blk * 3 + 0] = word & 0xFF
+        out[blk * 3 + 1] = (word >> 8) & 0xFF
+        out[blk * 3 + 2] = (word >> 16) & 0xFF
+    return bytes(out)
+
+
+def pack_mlx_affine_8bit(codes: Sequence[int]) -> bytes:
+    """Pack 8-bit unsigned codes (1 byte per element, MLX uint32 compatible)."""
+    if len(codes) % 4 != 0:
+        raise ValueError("8-bit code count must be a multiple of 4")
+    return bytes((c & 0xFF) for c in codes)
+
+
+_E2M1_TABLE = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)
+
+
+def e2m1_nibble_to_f32(q: int) -> float:
+    return _E2M1_TABLE[q & 0x0F]
+
+
+def ue8m0_byte_to_f32(b: int) -> float:
+    b &= 0xFF
+    if b == 0xFF:
+        return math.nan
+    return math.ldexp(1.0, b - 127)
+
+
+def e4m3_byte_to_f32(b: int) -> float:
+    """Decode OCP FP8 E4M3 (S.E4.M3, bias=7, NaN=0x7F/0xFF, no Inf)."""
+    b &= 0xFF
+    if (b & 0x7F) == 0x7F:
+        return math.nan
+    sign = -1.0 if (b & 0x80) else 1.0
+    exp = (b >> 3) & 0x0F
+    mant = b & 0x07
+    if exp == 0:
+        return sign * math.ldexp(float(mant), -9)
+    return sign * math.ldexp(1.0 + (mant / 8.0), exp - 7)
+
+
+_E4M3_LUT: tuple[float, ...] = tuple(e4m3_byte_to_f32(i) for i in range(256))
+_UE8M0_LUT: tuple[float, ...] = tuple(ue8m0_byte_to_f32(i) for i in range(256))
+
+
 def _strip_model_prefix(raw_name: str) -> str:
-    for prefix in ("model.language_model.", "language_model.model.", "language_model.", "model."):
+    for prefix in ("model.language_model.", "model.llm.", "language_model.model.", "language_model.", "model."):
         if raw_name.startswith(prefix):
             return raw_name[len(prefix) :]
     return raw_name
 
 
+_LONG_NAME_COMPACT_RULES: tuple[tuple[str, str], ...] = (
+    (".attn_hyper_connection.", ".attn_hc."),
+    (".mlp_hyper_connection.", ".mlp_hc."),
+    (".input_mix_weight_down.", ".in_mix_dn."),
+    (".input_mix_weight_up.", ".in_mix_up."),
+    (".block_inject_weight.", ".blk_inj."),
+    (".compressed_indexer.", ".cidx."),
+    (".head_weight_projection.", ".hw_proj."),
+    (".kv_a_proj_with_mqa.", ".kv_a_mqa."),
+    (".mlp_message_gate.", ".mlp_mgate."),
+    (".message_gate_proj.", ".mgate_proj."),
+    (".self_attn.", ".attn."),
+    (".shared_experts.", ".shared_exp."),
+    (".input_layernorm.", ".in_norm."),
+    (".post_attention_layernorm.", ".post_norm."),
+    ("mtp_layers.", "mtp."),
+    ("dfly_layers.", "dfly."),
+)
+
+
 def _normalize_name(raw_name: str) -> str:
     name = normalize_vision_name(raw_name) if is_vision_tensor(raw_name) else _strip_model_prefix(raw_name)
+    if len(name.encode("utf-8")) > 47:
+        compacted = name
+        for src_seg, dst_seg in _LONG_NAME_COMPACT_RULES:
+            if len(compacted.encode("utf-8")) <= 47:
+                break
+            compacted = compacted.replace(src_seg, dst_seg)
+        name = compacted
     encoded = name.encode("utf-8")
     if len(encoded) == 0 or len(encoded) > 47:
         raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(encoded)}: {name!r}")
@@ -732,12 +884,160 @@ DTYPE_MODES = ("auto", "f16", "bf16")
 QUANT_PROFILES = ("uniform", "gsq-rco")
 
 
+class RangeStreamReader(Protocol):
+    """Random-access byte-range source for bounded-disk safetensors stream packing."""
+
+    def size(self) -> int: ...
+
+    def read_range(self, offset: int, length: int) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+class LocalFileRangeReader:
+    """`F_NOCACHE` `os.pread`-backed RangeStreamReader for local shard files."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = pathlib.Path(path)
+        self._fh = self.path.open("rb", buffering=0)
+        try:
+            _set_nocache(self._fh.fileno())
+            self._size = self.path.stat().st_size
+        except BaseException:
+            self._fh.close()
+            raise
+
+    def size(self) -> int:
+        return self._size
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        if offset < 0 or length < 0 or offset + length > self._size:
+            raise ValueError(f"range [{offset}, {offset + length}) out of bounds for {self.path} ({self._size} B)")
+        if length == 0:
+            return b""
+        return _read_fd_exact(self._fh, offset, length)
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.close()
+
+
+class MemoryRangeReader:
+    """In-memory RangeStreamReader (useful for stream testing and buffers)."""
+
+    def __init__(self, data: bytes | bytearray | memoryview, name: str = "<memory>") -> None:
+        self._mv = memoryview(data)
+        self.name = name
+
+    def size(self) -> int:
+        return len(self._mv)
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        if offset < 0 or length < 0 or offset + length > len(self._mv):
+            raise ValueError(f"range [{offset}, {offset + length}) out of bounds for {self.name} ({len(self._mv)} B)")
+        return bytes(self._mv[offset : offset + length])
+
+    def close(self) -> None:
+        pass
+
+
+class HttpRangeStreamReader:
+    """HTTP `Range` stream reader using stdlib `urllib.request` with bounded chunks."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float = 30.0,
+        max_chunk_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        self.url = url
+        self._headers = dict(headers or {})
+        self._timeout = float(timeout)
+        self._max_chunk = int(max_chunk_bytes)
+        self._size: int | None = None
+
+    def size(self) -> int:
+        if self._size is not None:
+            return self._size
+        req = urllib.request.Request(self.url, headers=self._headers, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                cl = resp.headers.get("Content-Length")
+                if cl is not None:
+                    self._size = int(cl)
+                    return self._size
+        except urllib.error.HTTPError:
+            pass
+        # Probe with 1-byte Range GET (`Content-Range: bytes 0-0/<total>`).
+        probe_headers = dict(self._headers)
+        probe_headers["Range"] = "bytes=0-0"
+        req2 = urllib.request.Request(self.url, headers=probe_headers, method="GET")
+        with urllib.request.urlopen(req2, timeout=self._timeout) as resp:
+            cr = resp.headers.get("Content-Range")
+            if cr and "/" in cr:
+                total_str = cr.rsplit("/", 1)[-1].strip()
+                if total_str != "*":
+                    self._size = int(total_str)
+                    return self._size
+            cl = resp.headers.get("Content-Length")
+            if cl is not None and resp.status == 200:
+                self._size = int(cl)
+                return self._size
+        raise ValueError(f"HTTP server at {self.url!r} did not report Content-Length or Content-Range")
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        total = self.size()
+        if offset < 0 or length < 0 or offset + length > total:
+            raise ValueError(f"range [{offset}, {offset + length}) out of bounds for {self.url!r} ({total} B)")
+        if length == 0:
+            return b""
+        parts: list[bytes] = []
+        done = 0
+        while done < length:
+            take = min(self._max_chunk, length - done)
+            start = offset + done
+            end = start + take - 1
+            hdrs = dict(self._headers)
+            hdrs["Range"] = f"bytes={start}-{end}"
+            req = urllib.request.Request(self.url, headers=hdrs, method="GET")
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                status = getattr(resp, "status", 206)
+                raw = resp.read()
+                if status == 200:
+                    if len(raw) >= start + take:
+                        raw = raw[start : start + take]
+                    else:
+                        raise ValueError(f"short HTTP 200 response for {self.url!r}")
+                elif status != 206:
+                    raise ValueError(f"unexpected HTTP status {status} for Range {start}-{end} on {self.url!r}")
+            if len(raw) != take:
+                raise ValueError(
+                    f"HTTP Range {start}-{end} on {self.url!r} returned {len(raw)} bytes, expected {take}"
+                )
+            parts.append(raw)
+            done += take
+        return b"".join(parts) if len(parts) > 1 else parts[0]
+
+    def close(self) -> None:
+        pass
+
+
+@dataclass(frozen=True)
+class ShardStreamSource:
+    """Named shard stream descriptor for bounded-disk `.amf` conversion."""
+
+    source_id: str | pathlib.Path
+    reader_factory: Callable[[], RangeStreamReader]
+
+
 @dataclass(frozen=True)
 class _ShardTensor:
     """One tensor as described by its shard's JSON header (no data loaded)."""
 
     name: str
-    path: pathlib.Path
+    path: pathlib.Path | str
     dtype: str
     shape: tuple[int, ...]
     offset: int  # absolute byte offset of the tensor data inside `path`
@@ -746,7 +1046,7 @@ class _ShardTensor:
 
 @dataclass(frozen=True)
 class _ByteRange:
-    path: pathlib.Path
+    path: pathlib.Path | str
     offset: int
     length: int
     dtype: str
@@ -772,6 +1072,14 @@ class _PlannedEntry:
     blob_bytes: int
     layout: TensorLayout = TensorLayout.ROW_MAJOR
     quant_param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS
+    params_mode: str = "affine_scale_bias"  # affine_scale_bias, fp8_block, fp8_row, fp8_tensor, mxfp8, nvfp4
+    outer_scale: _ByteRange | None = None
+    outer_scale_denom: _ByteRange | None = None
+    outer_scale_const: float = 1.0
+    outer_scale_denom_const: float = 1.0
+    outer_scale_divisor_mode: bool = False
+    outer_scale_expert_index: int = -1
+    scale_tile_shape: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -815,22 +1123,23 @@ def resolve_checkpoint(input_path: pathlib.Path) -> ResolvedCheckpoint:
     return ResolvedCheckpoint((input_path,), config)
 
 
-def _read_shard_header(path: pathlib.Path) -> list[_ShardTensor]:
-    """Read only the JSON header of a safetensors shard (kilobytes, never tensor data)."""
-    file_size = path.stat().st_size
-    with path.open("rb") as f:
-        hdr_len_bytes = f.read(8)
-        if len(hdr_len_bytes) != 8:
-            raise ValueError(f"truncated safetensors header in {path}")
-        (hdr_len,) = struct.unpack("<Q", hdr_len_bytes)
-        if hdr_len > file_size - 8 or hdr_len > (256 << 20):
-            raise ValueError(f"implausible safetensors header length {hdr_len} in {path}")
-        hdr_raw = f.read(hdr_len)
-        if len(hdr_raw) != hdr_len:
-            raise ValueError(f"truncated safetensors JSON in {path}")
+def _read_shard_header_from_reader(source_id: pathlib.Path | str, reader: RangeStreamReader) -> list[_ShardTensor]:
+    """Read only the JSON header from any `RangeStreamReader` (kilobytes, never tensor data)."""
+    file_size = reader.size()
+    if file_size < 8:
+        raise ValueError(f"truncated safetensors header in {source_id}")
+    hdr_len_bytes = reader.read_range(0, 8)
+    if len(hdr_len_bytes) != 8:
+        raise ValueError(f"truncated safetensors header in {source_id}")
+    (hdr_len,) = struct.unpack("<Q", hdr_len_bytes)
+    if hdr_len > file_size - 8 or hdr_len > (256 << 20):
+        raise ValueError(f"implausible safetensors header length {hdr_len} in {source_id}")
+    hdr_raw = reader.read_range(8, hdr_len)
+    if len(hdr_raw) != hdr_len:
+        raise ValueError(f"truncated safetensors JSON in {source_id}")
     header = json.loads(hdr_raw.decode("utf-8"))
     if not isinstance(header, dict):
-        raise ValueError(f"safetensors header must be a JSON object in {path}")
+        raise ValueError(f"safetensors header must be a JSON object in {source_id}")
     data_base = 8 + hdr_len
     out: list[_ShardTensor] = []
     for name, spec in header.items():
@@ -841,16 +1150,27 @@ def _read_shard_header(path: pathlib.Path) -> list[_ShardTensor]:
         start, end = (int(x) for x in spec["data_offsets"])
         elem = _SAFETENSORS_DTYPE_BYTES.get(dtype)
         if elem is None:
-            raise ValueError(f"unsupported safetensors dtype {dtype} for {name} in {path}")
+            raise ValueError(f"unsupported safetensors dtype {dtype} for {name} in {source_id}")
         numel = 1
         for d in shape:
             numel *= d
         if end < start or end - start != numel * elem:
-            raise ValueError(f"tensor {name} in {path}: data_offsets {start}..{end} do not match {dtype}{list(shape)}")
+            raise ValueError(
+                f"tensor {name} in {source_id}: data_offsets {start}..{end} do not match {dtype}{list(shape)}"
+            )
         if data_base + end > file_size:
-            raise ValueError(f"tensor {name} in {path} extends past end of file")
-        out.append(_ShardTensor(name, path, dtype, shape, data_base + start, end - start))
+            raise ValueError(f"tensor {name} in {source_id} extends past end of file")
+        out.append(_ShardTensor(name, source_id, dtype, shape, data_base + start, end - start))
     return out
+
+
+def _read_shard_header(path: pathlib.Path) -> list[_ShardTensor]:
+    """Read only the JSON header of a safetensors shard (kilobytes, never tensor data)."""
+    reader = LocalFileRangeReader(path)
+    try:
+        return _read_shard_header_from_reader(path, reader)
+    finally:
+        reader.close()
 
 
 def _collect_tensors(shards: Sequence[pathlib.Path]) -> dict[str, _ShardTensor]:
@@ -863,8 +1183,38 @@ def _collect_tensors(shards: Sequence[pathlib.Path]) -> dict[str, _ShardTensor]:
     return tensors
 
 
+def _collect_tensors_from_sources(
+    sources: Iterable[ShardStreamSource],
+) -> tuple[dict[str, _ShardTensor], dict[pathlib.Path | str, Callable[[], RangeStreamReader]]]:
+    tensors: dict[str, _ShardTensor] = {}
+    factories: dict[pathlib.Path | str, Callable[[], RangeStreamReader]] = {}
+    for src in sources:
+        if src.source_id in factories:
+            raise ValueError(f"duplicate shard source_id: {src.source_id!r}")
+        factories[src.source_id] = src.reader_factory
+        reader = src.reader_factory()
+        try:
+            for t in _read_shard_header_from_reader(src.source_id, reader):
+                if t.name in tensors:
+                    raise ValueError(f"tensor {t.name!r} appears in both {tensors[t.name].path} and {src.source_id}")
+                tensors[t.name] = t
+        finally:
+            reader.close()
+    return tensors, factories
+
+
 def _natural_key(name: str) -> tuple[tuple[int, int, str], ...]:
     return tuple((0, int(tok), "") if tok.isdigit() else (1, 0, tok) for tok in name.split("."))
+
+
+_AFFINE_BITS_DTYPE = {
+    2: DType.Q2_AFFINE,
+    3: DType.Q3_AFFINE,
+    4: DType.Q4_AFFINE,
+    5: DType.Q5_AFFINE,
+    6: DType.Q6_AFFINE,
+    8: DType.Q8_AFFINE,
+}
 
 
 def _quant_bits_for(prefix: str, packed_cols: int, groups: int, group_size: int) -> tuple[int, DType]:
@@ -873,13 +1223,10 @@ def _quant_bits_for(prefix: str, packed_cols: int, groups: int, group_size: int)
     if k == 0 or bits_num % k != 0:
         raise ValueError(f"cannot infer bit width for {prefix}: packed={packed_cols}, k={k}")
     bits = bits_num // k
-    if bits == 4:
-        return 4, DType.Q4_AFFINE
-    if bits == 3:
-        return 3, DType.Q3_AFFINE
-    if bits == 2:
-        return 2, DType.Q2_AFFINE
-    raise ValueError(f"unsupported bit width {bits} for {prefix} (expected 2, 3, or 4)")
+    dt = _AFFINE_BITS_DTYPE.get(bits)
+    if dt is not None:
+        return bits, dt
+    raise ValueError(f"unsupported bit width {bits} for {prefix} (expected 2, 3, 4, 5, 6, or 8)")
 
 
 def _unquantized_target(dtype_str: str, dtype_mode: str, name: str) -> tuple[DType, str | None]:
@@ -956,14 +1303,23 @@ def _make_entry(
     *,
     sme2_pack: str = "none",
     sme2_pack_loop_adapters: bool = True,
+    params_mode: str = "affine_scale_bias",
+    params_bytes_override: int | None = None,
+    outer_scale: _ByteRange | None = None,
+    outer_scale_denom: _ByteRange | None = None,
+    outer_scale_const: float = 1.0,
+    outer_scale_denom_const: float = 1.0,
+    outer_scale_divisor_mode: bool = False,
+    outer_scale_expert_index: int = -1,
+    scale_tile_shape: tuple[int, int] | None = None,
 ) -> _PlannedEntry:
-    name_bytes = name.encode("utf-8")
-    if len(name_bytes) == 0 or len(name_bytes) > 47:
-        raise ValueError(f"AMF tensor name must be 1..47 UTF-8 bytes, got {len(name_bytes)}: {name!r}")
+    name = _normalize_name(name)
     if not (1 <= len(shape) <= 4):
         raise ValueError(f"tensor rank must be 1..4 for {name!r}, got {len(shape)}")
     use_sme2 = (
         not is_vision_tensor(name)
+        and dtype in (DType.F16, DType.BF16, DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
+        and (dtype not in AFFINE_DTYPES or group_size == SME2_GROUP_K)
         and _should_sme2_pack(
             kind,
             dtype,
@@ -985,8 +1341,12 @@ def _make_entry(
         if data_convert == "d2t_i64_to_u32":
             data_bytes = (data.length // 8) * 4
         else:
-            data_bytes = data.length  # f16<->bf16, i32->u32 and raw copies preserve byte length
-        if scales is not None:
+            data_bytes = data.length  # f16<->bf16, i32->u32, packed nibbles and raw copies preserve length
+        if params_bytes_override is not None:
+            params_offset = _align_up(data_bytes, 64) if params_bytes_override > 0 else 0
+            params_bytes = params_bytes_override
+            content = params_offset + params_bytes if params_bytes > 0 else data_bytes
+        elif scales is not None:
             params_offset = _align_up(data_bytes, 64)
             groups = scales.length // _SAFETENSORS_DTYPE_BYTES[scales.dtype]
             params_bytes = groups * 4  # half2(scale, bias)
@@ -1014,6 +1374,14 @@ def _make_entry(
         blob_bytes=_align_up(max(content, 1), APPLE_PAGE_SIZE),
         layout=layout,
         quant_param_kind=param_kind,
+        params_mode=params_mode,
+        outer_scale=outer_scale,
+        outer_scale_denom=outer_scale_denom,
+        outer_scale_const=outer_scale_const,
+        outer_scale_denom_const=outer_scale_denom_const,
+        outer_scale_divisor_mode=outer_scale_divisor_mode,
+        outer_scale_expert_index=outer_scale_expert_index,
+        scale_tile_shape=scale_tile_shape,
     )
 
 
@@ -1030,6 +1398,230 @@ def _full_range(t: _ShardTensor) -> _ByteRange:
     return _ByteRange(t.path, t.offset, t.length, t.dtype)
 
 
+def _split_quant_weight_base(weight_name: str) -> tuple[str, str] | None:
+    """Split a candidate quantized weight key into `(canonical_prefix, suffix_style)`."""
+    if weight_name.endswith(".weight_packed"):
+        return weight_name[: -len(".weight_packed")], "dot_weight"
+    if weight_name.endswith(".weight"):
+        return weight_name[: -len(".weight")], "dot_weight"
+    if weight_name.endswith("_weight"):
+        return weight_name[: -len("_weight")], "underscore_weight"
+    return None
+
+
+def _pick_companion(tensors: dict[str, _ShardTensor], candidates: Sequence[str]) -> _ShardTensor | None:
+    for key in candidates:
+        t = tensors.get(key)
+        if t is not None:
+            return t
+    return None
+
+
+def _resolve_stacked_expert_meta(raw_prefix: str) -> tuple[int, str] | None:
+    sw = _SWITCH_MLP_RE.match(raw_prefix)
+    if sw is not None:
+        return int(sw.group(1)), sw.group(2)
+    ex = _EXPERTS_STACK_RE.match(raw_prefix)
+    if ex is not None:
+        proj_map = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+        raw_proj = ex.group(2)
+        return int(ex.group(1)), proj_map.get(raw_proj, raw_proj)
+    return None
+
+
+def _plan_nvfp4_slice(
+    *,
+    name: str,
+    kind: TensorKind,
+    layer: int,
+    expert: int,
+    n_rows: int,
+    k_packed_cols: int,
+    w_dtype: str,
+    w_range: _ByteRange,
+    s_range: _ByteRange,
+    s_shape_2d: tuple[int, ...],
+    outer_range: _ByteRange | None,
+    denom_range: _ByteRange | None,
+    outer_const: float,
+    denom_const: float,
+    divisor_mode: bool,
+    outer_expert_idx: int,
+    prefix_desc: str,
+) -> _PlannedEntry:
+    if w_dtype == "U8":
+        k = k_packed_cols * 2
+    elif w_dtype in ("U32", "I32"):
+        k = k_packed_cols * 8
+    else:
+        raise ValueError(f"unsupported NVFP4 weight dtype {w_dtype} for {prefix_desc}")
+    if k == 0 or k % 16 != 0:
+        raise ValueError(f"NVFP4 tensor {prefix_desc} K={k} must be positive and divisible by 16")
+    if len(s_shape_2d) != 2 or s_shape_2d[0] != n_rows or s_shape_2d[1] != k // 16:
+        raise ValueError(
+            f"NVFP4 micro-scale shape mismatch for {prefix_desc}: weight={(n_rows, k)}, scales={list(s_shape_2d)}"
+        )
+    params_bytes = _align_up(n_rows * (k // 16), 4) + 4
+    return _make_entry(
+        name,
+        kind,
+        DType.NVFP4_G16,
+        4,
+        16,
+        layer,
+        expert,
+        (n_rows, k),
+        w_range,
+        None,
+        s_range,
+        None,
+        sme2_pack="none",
+        params_mode="nvfp4",
+        params_bytes_override=params_bytes,
+        outer_scale=outer_range,
+        outer_scale_denom=denom_range,
+        outer_scale_const=outer_const,
+        outer_scale_denom_const=denom_const,
+        outer_scale_divisor_mode=divisor_mode,
+        outer_scale_expert_index=outer_expert_idx,
+    )
+
+
+def _plan_fp8_or_mxfp8_slice(
+    *,
+    name: str,
+    kind: TensorKind,
+    layer: int,
+    expert: int,
+    n_rows: int,
+    k: int,
+    w_range: _ByteRange,
+    s_tensor: _ShardTensor | None,
+    s_range: _ByteRange | None,
+    s_slice_shape: tuple[int, ...],
+    prefix_desc: str,
+) -> _PlannedEntry:
+    if n_rows <= 0 or k <= 0:
+        raise ValueError(f"FP8/MXFP8 tensor {prefix_desc} must have positive 2D shape, got {(n_rows, k)}")
+    if s_tensor is None or s_range is None:
+        return _make_entry(
+            name,
+            kind,
+            DType.FP8_E4M3_TENSOR,
+            8,
+            0,
+            layer,
+            expert,
+            (n_rows, k),
+            w_range,
+            None,
+            None,
+            None,
+            sme2_pack="none",
+            params_mode="fp8_tensor",
+            params_bytes_override=4,
+            outer_scale_const=1.0,
+        )
+    if s_tensor.dtype == "U8":
+        if k % 32 != 0:
+            raise ValueError(f"MXFP8 tensor {prefix_desc} K={k} must be divisible by 32")
+        tile_shape: tuple[int, int] | None = None
+        nb32 = (n_rows + 31) // 32
+        kb32 = k // 32
+        if s_slice_shape == (n_rows, kb32):
+            tile_shape = None
+        elif len(s_slice_shape) == 2 and s_slice_shape == (nb32, kb32):
+            tile_shape = s_slice_shape
+        else:
+            raise ValueError(
+                f"MXFP8 UE8M0 scale shape mismatch for {prefix_desc}: weight={(n_rows, k)}, scales={list(s_slice_shape)}"
+            )
+        return _make_entry(
+            name,
+            kind,
+            DType.MXFP8_G32,
+            8,
+            32,
+            layer,
+            expert,
+            (n_rows, k),
+            w_range,
+            None,
+            s_range,
+            None,
+            sme2_pack="none",
+            params_mode="mxfp8",
+            params_bytes_override=n_rows * kb32,
+            scale_tile_shape=tile_shape,
+        )
+    if s_tensor.dtype not in ("F32", "BF16", "F16"):
+        raise ValueError(f"unsupported FP8 scale dtype {s_tensor.dtype} for {s_tensor.name}")
+    nb128 = (n_rows + 127) // 128
+    kb128 = (k + 127) // 128
+    if s_slice_shape in ((), (1,), (1, 1)) and not (n_rows == 1 and len(s_slice_shape) == 1):
+        # Single scalar tensor scale (note `(1, 1)` when `nb128 == kb128 == 1` is numerically equivalent to block 1x1;
+        # treat 2D `(nb128, kb128)` as block when K > 128 or N > 128, and `(1,)` / `()` as tensor scale).
+        if len(s_slice_shape) == 2 and (nb128, kb128) == (1, 1) and "scale_inv" in s_tensor.name:
+            pass
+        else:
+            return _make_entry(
+                name,
+                kind,
+                DType.FP8_E4M3_TENSOR,
+                8,
+                0,
+                layer,
+                expert,
+                (n_rows, k),
+                w_range,
+                None,
+                s_range,
+                None,
+                sme2_pack="none",
+                params_mode="fp8_tensor",
+                params_bytes_override=4,
+            )
+    if s_slice_shape == (n_rows,) or (s_slice_shape == (n_rows, 1) and kb128 > 1):
+        return _make_entry(
+            name,
+            kind,
+            DType.FP8_E4M3_ROW,
+            8,
+            0,
+            layer,
+            expert,
+            (n_rows, k),
+            w_range,
+            None,
+            s_range,
+            None,
+            sme2_pack="none",
+            params_mode="fp8_row",
+            params_bytes_override=n_rows * 4,
+        )
+    if s_slice_shape == (nb128, kb128):
+        return _make_entry(
+            name,
+            kind,
+            DType.FP8_E4M3_BLOCK,
+            8,
+            128,
+            layer,
+            expert,
+            (n_rows, k),
+            w_range,
+            None,
+            s_range,
+            None,
+            sme2_pack="none",
+            params_mode="fp8_block",
+            params_bytes_override=nb128 * kb128 * 4,
+        )
+    raise ValueError(
+        f"FP8 scale shape {list(s_slice_shape)} does not match tensor/row/128x128-block for {prefix_desc} {(n_rows, k)}"
+    )
+
+
 def plan_amf_entries(
     tensors: dict[str, _ShardTensor],
     *,
@@ -1043,11 +1635,12 @@ def plan_amf_entries(
     strip_vision: bool | None = None,
     include_vision: bool | None = None,
     sme2_pack_loop_adapters: bool = True,
+    nvfp4_global_scale_is_divisor: bool = False,
     stats_out: dict[str, int] | None = None,
 ) -> list[_PlannedEntry]:
     """Pass 1: plan every output entry from shard headers alone."""
-    if group_size != 64:
-        raise ValueError(f"aminfer v0 supports group_size=64 only, got {group_size}")
+    if group_size not in AFFINE_GROUP_SIZES:
+        raise ValueError(f"aminfer supports group_size in {AFFINE_GROUP_SIZES}, got {group_size}")
     if dtype_mode not in DTYPE_MODES:
         raise ValueError(f"dtype_mode must be one of {DTYPE_MODES}, got {dtype_mode!r}")
     if sme2_pack not in SME2_PACK_MODES:
@@ -1085,12 +1678,17 @@ def plan_amf_entries(
         stats_out["included_vision_tensors"] = included_vision
     tensors = filtered_tensors
 
-    quant_prefixes: set[str] = set()
+    # Separate MLX affine triples (`weight` + `scales` + `biases`) from MLX NVFP4 / ModelOpt / FP8 pairs.
+    affine_prefixes: set[str] = set()
+    mlx_nvfp4_prefixes: set[str] = set()
     for name in tensors:
         if name.endswith(".scales"):
             prefix = name[: -len(".scales")]
-            if f"{prefix}.weight" in tensors and f"{prefix}.biases" in tensors:
-                quant_prefixes.add(prefix)
+            w = tensors.get(f"{prefix}.weight")
+            if w is not None and f"{prefix}.biases" in tensors:
+                affine_prefixes.add(prefix)
+            elif w is not None and w.dtype == "U32" and tensors[name].dtype in ("U8", "F8_E4M3"):
+                mlx_nvfp4_prefixes.add(prefix)
 
     def is_lm_head(name: str) -> bool:
         norm = _normalize_lenient(name)
@@ -1108,7 +1706,8 @@ def plan_amf_entries(
     entries: list[_PlannedEntry] = []
     consumed: set[str] = set()
 
-    for prefix in sorted(quant_prefixes):
+    # 1) MLX Affine quantized groups (`q2..q8_affine`, `group_size in {32, 64, 128}`)
+    for prefix in sorted(affine_prefixes):
         w = tensors[f"{prefix}.weight"]
         s = tensors[f"{prefix}.scales"]
         b = tensors[f"{prefix}.biases"]
@@ -1125,17 +1724,16 @@ def plan_amf_entries(
         if s.shape != b.shape or s.dtype != b.dtype:
             raise ValueError(f"scales/biases mismatch for {prefix}: {s.dtype}{list(s.shape)} vs {b.dtype}{list(b.shape)}")
 
-        switch = _SWITCH_MLP_RE.match(prefix)
         if len(w.shape) == 3:
-            if switch is None:
+            stacked = _resolve_stacked_expert_meta(prefix)
+            if stacked is None:
                 raise ValueError(f"3D quantized tensor {prefix} is not an MLX switch_mlp expert stack")
             if len(s.shape) != 3 or w.shape[:2] != s.shape[:2]:
                 raise ValueError(f"inconsistent stacked expert shapes for {prefix}: {list(w.shape)}, {list(s.shape)}")
             num_experts, n, packed = w.shape
             groups = s.shape[2]
             bits, amf_dtype = _quant_bits_for(prefix, packed, groups, group_size)
-            layer = int(switch.group(1))
-            proj = switch.group(2)
+            layer, proj = stacked
             for e in range(num_experts):
                 entries.append(
                     _make_entry(
@@ -1182,6 +1780,295 @@ def plan_amf_entries(
             )
         )
 
+    # 2) MLX NVFP4 (`mode: "nvfp4"` — `.weight` U32 + `.scales` U8/F8_E4M3 + optional `.global_scale`)
+    for prefix in sorted(mlx_nvfp4_prefixes):
+        w = tensors[f"{prefix}.weight"]
+        s = tensors[f"{prefix}.scales"]
+        gs = tensors.get(f"{prefix}.global_scale")
+        consumed.update((w.name, s.name))
+        if gs is not None:
+            consumed.add(gs.name)
+        if is_excluded(prefix) or is_excluded(w.name):
+            continue
+        if skip_lm_head and is_lm_head(prefix) and (embed_rows is None or w.shape[0] == embed_rows):
+            continue
+        gs_range = _full_range(gs) if gs is not None else None
+        denom_const = 2688.0 if gs is not None else 1.0  # mlx_fp_quantized.h: *global_scale / (448*6)
+        if len(w.shape) == 3:
+            stacked = _resolve_stacked_expert_meta(prefix)
+            if stacked is None:
+                raise ValueError(f"3D MLX nvfp4 tensor {prefix} is not an expert stack")
+            if len(s.shape) != 3 or w.shape[:2] != s.shape[:2]:
+                raise ValueError(f"inconsistent 3D MLX nvfp4 shapes for {prefix}: {list(w.shape)}, {list(s.shape)}")
+            num_experts, n, k_packed = w.shape
+            layer, proj = stacked
+            gs_numel = 1
+            if gs is not None:
+                for d in gs.shape:
+                    gs_numel *= d
+                if gs_numel not in (1, num_experts):
+                    raise ValueError(f"MLX global_scale shape {list(gs.shape)} incompatible with E={num_experts} on {prefix}")
+            for e in range(num_experts):
+                exp_idx = 0 if (gs is None or gs_numel == 1) else e
+                entries.append(
+                    _plan_nvfp4_slice(
+                        name=f"layers.{layer}.mlp.experts.{e}.{proj}",
+                        kind=_expert_kind(layer, e, cold_set, all_experts_cold),
+                        layer=layer,
+                        expert=e,
+                        n_rows=n,
+                        k_packed_cols=k_packed,
+                        w_dtype=w.dtype,
+                        w_range=_slice_range(w, e, num_experts),
+                        s_range=_slice_range(s, e, num_experts),
+                        s_shape_2d=s.shape[1:],
+                        outer_range=gs_range,
+                        denom_range=None,
+                        outer_const=1.0,
+                        denom_const=denom_const,
+                        divisor_mode=False,
+                        outer_expert_idx=exp_idx,
+                        prefix_desc=prefix,
+                    )
+                )
+            continue
+        if len(w.shape) != 2:
+            raise ValueError(f"expected 2D MLX nvfp4 tensor for {prefix}, got {list(w.shape)}")
+        norm_name = _normalize_name(prefix)
+        kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
+        entries.append(
+            _plan_nvfp4_slice(
+                name=norm_name,
+                kind=kind,
+                layer=layer,
+                expert=expert,
+                n_rows=w.shape[0],
+                k_packed_cols=w.shape[1],
+                w_dtype=w.dtype,
+                w_range=_full_range(w),
+                s_range=_full_range(s),
+                s_shape_2d=s.shape,
+                outer_range=gs_range,
+                denom_range=None,
+                outer_const=1.0,
+                denom_const=denom_const,
+                divisor_mode=False,
+                outer_expert_idx=0,
+                prefix_desc=prefix,
+            )
+        )
+
+    # 3) ModelOpt / compressed-tensors / Inkling-2 NVFP4 + ModelOpt MXFP8 + Block/Row/Tensor FP8
+    for w_name in sorted(tensors):
+        if w_name in consumed:
+            continue
+        w = tensors[w_name]
+        if w.dtype not in ("U8", "U32", "I32", "F8_E4M3"):
+            continue
+        split = _split_quant_weight_base(w_name)
+        if split is None:
+            continue
+        base, style = split
+        if style == "dot_weight":
+            s = _pick_companion(
+                tensors,
+                (
+                    f"{base}.weight_scale_inv",
+                    f"{base}.weight_scale",
+                    f"{base}.scale_inv",
+                    f"{base}.scale",
+                ),
+            )
+            s2 = _pick_companion(tensors, (f"{base}.weight_scale_2", f"{base}.scale_2"))
+            gscale = _pick_companion(tensors, (f"{base}.weight_global_scale", f"{base}.global_scale"))
+            amax_t = _pick_companion(tensors, (f"{base}.weight_amax", f"{base}.amax"))
+            denom_t = _pick_companion(
+                tensors, (f"{base}.weight_outer_scale_denominator", f"{base}.outer_scale_denominator")
+            )
+        else:
+            s = _pick_companion(
+                tensors,
+                (
+                    f"{base}_weight_scale_inv",
+                    f"{base}_weight_scale",
+                    f"{base}_scale_inv",
+                    f"{base}_scale",
+                ),
+            )
+            s2 = _pick_companion(tensors, (f"{base}_weight_scale_2", f"{base}_scale_2"))
+            gscale = _pick_companion(tensors, (f"{base}_weight_global_scale", f"{base}_global_scale"))
+            amax_t = _pick_companion(tensors, (f"{base}_weight_amax", f"{base}_amax"))
+            denom_t = _pick_companion(
+                tensors, (f"{base}_weight_outer_scale_denominator", f"{base}_outer_scale_denominator")
+            )
+
+        if s is None and w.dtype in ("U8", "U32", "I32"):
+            # Unpaired U32/I32/U8 tensors (e.g. token tables) fall through to unquantized handling.
+            continue
+
+        consumed.add(w_name)
+        for aux in (s, s2, gscale, amax_t, denom_t):
+            if aux is not None:
+                consumed.add(aux.name)
+
+        if is_excluded(base) or is_excluded(w_name):
+            continue
+        if skip_lm_head and is_lm_head(base) and (embed_rows is None or w.shape[0] == embed_rows):
+            continue
+
+        if w.dtype in ("U8", "U32", "I32"):
+            assert s is not None
+            if s2 is not None:
+                outer_r: _ByteRange | None = _full_range(s2)
+                denom_r: _ByteRange | None = None
+                div_mode = False
+                d_const = 1.0
+                src_outer = s2
+            elif amax_t is not None:
+                outer_r = _full_range(amax_t)
+                denom_r = _full_range(denom_t) if denom_t is not None else None
+                div_mode = False
+                d_const = 2688.0 if denom_t is None else 1.0
+                src_outer = amax_t
+            elif gscale is not None:
+                outer_r = _full_range(gscale)
+                denom_r = None
+                div_mode = nvfp4_global_scale_is_divisor
+                d_const = 1.0
+                src_outer = gscale
+            else:
+                outer_r = None
+                denom_r = None
+                div_mode = False
+                d_const = 1.0
+                src_outer = None
+
+            if len(w.shape) == 3:
+                stacked = _resolve_stacked_expert_meta(base)
+                if stacked is None:
+                    raise ValueError(f"3D NVFP4 tensor {w_name} is not an expert stack")
+                if len(s.shape) != 3 or w.shape[:2] != s.shape[:2]:
+                    raise ValueError(f"inconsistent 3D NVFP4 shapes for {w_name}: {list(w.shape)}, {list(s.shape)}")
+                num_experts, n_r, k_p = w.shape
+                layer, proj = stacked
+                outer_numel = 1
+                if src_outer is not None:
+                    for d in src_outer.shape:
+                        outer_numel *= d
+                    if outer_numel not in (1, num_experts):
+                        raise ValueError(
+                            f"outer scale {src_outer.name} shape {list(src_outer.shape)} incompatible with E={num_experts}"
+                        )
+                for e in range(num_experts):
+                    exp_idx = 0 if (src_outer is None or outer_numel == 1) else e
+                    entries.append(
+                        _plan_nvfp4_slice(
+                            name=f"layers.{layer}.mlp.experts.{e}.{proj}",
+                            kind=_expert_kind(layer, e, cold_set, all_experts_cold),
+                            layer=layer,
+                            expert=e,
+                            n_rows=n_r,
+                            k_packed_cols=k_p,
+                            w_dtype=w.dtype,
+                            w_range=_slice_range(w, e, num_experts),
+                            s_range=_slice_range(s, e, num_experts),
+                            s_shape_2d=s.shape[1:],
+                            outer_range=outer_r,
+                            denom_range=denom_r,
+                            outer_const=1.0,
+                            denom_const=d_const,
+                            divisor_mode=div_mode,
+                            outer_expert_idx=exp_idx,
+                            prefix_desc=base,
+                        )
+                    )
+                continue
+
+            if len(w.shape) != 2:
+                raise ValueError(f"NVFP4 weight {w_name} must be 2D or 3D expert stack, got {list(w.shape)}")
+            out_name = _normalize_name(w_name if style == "underscore_weight" else base)
+            kind, layer, expert = _classify_tensor(out_name, cold_set, all_experts_cold)
+            entries.append(
+                _plan_nvfp4_slice(
+                    name=out_name,
+                    kind=kind,
+                    layer=layer,
+                    expert=expert,
+                    n_rows=w.shape[0],
+                    k_packed_cols=w.shape[1],
+                    w_dtype=w.dtype,
+                    w_range=_full_range(w),
+                    s_range=_full_range(s),
+                    s_shape_2d=s.shape,
+                    outer_range=outer_r,
+                    denom_range=denom_r,
+                    outer_const=1.0,
+                    denom_const=d_const,
+                    divisor_mode=div_mode,
+                    outer_expert_idx=0,
+                    prefix_desc=base,
+                )
+            )
+            continue
+
+        # w.dtype == "F8_E4M3"
+        if len(w.shape) == 3:
+            stacked = _resolve_stacked_expert_meta(base)
+            if stacked is None:
+                raise ValueError(f"3D FP8/MXFP8 tensor {w_name} is not an expert stack")
+            num_experts, n_r, k_c = w.shape
+            layer, proj = stacked
+            if s is not None:
+                if len(s.shape) == 3 and s.shape[0] == num_experts:
+                    s_slice_shape = s.shape[1:]
+                    per_exp_scale = True
+                elif s.shape in ((), (1,), (1, 1)):
+                    s_slice_shape = s.shape
+                    per_exp_scale = False
+                else:
+                    raise ValueError(f"inconsistent 3D FP8 scale shape {list(s.shape)} for {w_name}")
+            else:
+                s_slice_shape = ()
+                per_exp_scale = False
+            for e in range(num_experts):
+                sr = None if s is None else (_slice_range(s, e, num_experts) if per_exp_scale else _full_range(s))
+                entries.append(
+                    _plan_fp8_or_mxfp8_slice(
+                        name=f"layers.{layer}.mlp.experts.{e}.{proj}",
+                        kind=_expert_kind(layer, e, cold_set, all_experts_cold),
+                        layer=layer,
+                        expert=e,
+                        n_rows=n_r,
+                        k=k_c,
+                        w_range=_slice_range(w, e, num_experts),
+                        s_tensor=s,
+                        s_range=sr,
+                        s_slice_shape=s_slice_shape,
+                        prefix_desc=base,
+                    )
+                )
+            continue
+
+        if len(w.shape) != 2:
+            raise ValueError(f"FP8/MXFP8 weight {w_name} must be 2D or 3D expert stack, got {list(w.shape)}")
+        out_name = _normalize_name(w_name if s is None else (w_name if style == "underscore_weight" else base))
+        kind, layer, expert = _classify_tensor(out_name, cold_set, all_experts_cold)
+        entries.append(
+            _plan_fp8_or_mxfp8_slice(
+                name=out_name,
+                kind=kind,
+                layer=layer,
+                expert=expert,
+                n_rows=w.shape[0],
+                k=w.shape[1],
+                w_range=_full_range(w),
+                s_tensor=s,
+                s_range=_full_range(s) if s is not None else None,
+                s_slice_shape=s.shape if s is not None else (),
+                prefix_desc=base,
+            )
+        )
+
     for name in sorted(tensors):
         if name in consumed:
             continue
@@ -1199,16 +2086,39 @@ def plan_amf_entries(
                 raise ValueError(f"EAGLE-3 d2t tensor {name!r} must be non-empty 1D, got shape {list(t.shape)}")
             amf_dtype = DType.U32
             convert: str | None = "d2t_i64_to_u32" if t.dtype == "I64" else "d2t_i32_to_u32"
+        elif t.dtype == "F8_E4M3":
+            norm_name = _normalize_name(name)
+            kind, layer, expert = _classify_tensor(norm_name, cold_set, all_experts_cold)
+            entries.append(
+                _make_entry(
+                    norm_name,
+                    kind,
+                    DType.FP8_E4M3_TENSOR,
+                    8,
+                    0,
+                    layer,
+                    expert,
+                    t.shape,
+                    _full_range(t),
+                    None,
+                    None,
+                    None,
+                    sme2_pack="none",
+                    params_mode="fp8_tensor",
+                    params_bytes_override=4,
+                    outer_scale_const=1.0,
+                )
+            )
+            continue
         else:
             amf_dtype, convert = _unquantized_target(t.dtype, dtype_mode, name)
         if name.endswith(".weight"):
-            switch = _SWITCH_MLP_RE.match(name[: -len(".weight")])
+            stacked = _resolve_stacked_expert_meta(name[: -len(".weight")])
         else:
-            switch = None
-        if switch is not None and len(t.shape) == 3:
+            stacked = None
+        if stacked is not None and len(t.shape) == 3:
             num_experts, n, k = t.shape
-            layer = int(switch.group(1))
-            proj = switch.group(2)
+            layer, proj = stacked
             for e in range(num_experts):
                 entries.append(
                     _make_entry(
@@ -1266,16 +2176,25 @@ def _normalize_lenient(raw_name: str) -> str:
 
 
 class _ShardReaders:
-    """Lazily opened, F_NOCACHE read handles for each shard file."""
+    """Lazily opened, F_NOCACHE or RangeStreamReader handles for each shard source."""
 
-    def __init__(self) -> None:
-        self._handles: dict[pathlib.Path, object] = {}
+    def __init__(
+        self,
+        source_factories: dict[pathlib.Path | str, Callable[[], RangeStreamReader]] | None = None,
+    ) -> None:
+        self._handles: dict[pathlib.Path | str, object] = {}
+        self._factories = dict(source_factories or {})
 
-    def get(self, path: pathlib.Path):
+    def get(self, path: pathlib.Path | str):
         fh = self._handles.get(path)
         if fh is None:
-            fh = path.open("rb", buffering=0)
-            _set_nocache(fh.fileno())
+            factory = self._factories.get(path)
+            if factory is not None:
+                fh = factory()
+            else:
+                p = pathlib.Path(path)
+                fh = p.open("rb", buffering=0)
+                _set_nocache(fh.fileno())
             self._handles[path] = fh
         return fh
 
@@ -1292,7 +2211,7 @@ def _set_nocache(fd: int) -> None:
         print(f"aminfer-tools: warning: F_NOCACHE unavailable ({exc}); using the page cache", file=sys.stderr)
 
 
-def _read_exact(fh, offset: int, length: int) -> bytes:
+def _read_fd_exact(fh, offset: int, length: int) -> bytes:
     data = os.pread(fh.fileno(), length, offset)
     if len(data) != length:
         # pread may return short reads for very large requests; finish the rest.
@@ -1306,6 +2225,69 @@ def _read_exact(fh, offset: int, length: int) -> bytes:
             got += len(more)
         data = b"".join(parts)
     return data
+
+
+def _read_exact(fh, offset: int, length: int) -> bytes:
+    if hasattr(fh, "read_range"):
+        return fh.read_range(offset, length)
+    return _read_fd_exact(fh, offset, length)
+
+
+def _decode_scalar_f32_at(readers: _ShardReaders, br: _ByteRange, index: int) -> float:
+    elem = _SAFETENSORS_DTYPE_BYTES[br.dtype]
+    fh = readers.get(br.path)
+    raw = _read_exact(fh, br.offset + index * elem, elem)
+    if br.dtype == "F32":
+        return float(struct.unpack("<f", raw)[0])
+    if br.dtype == "BF16":
+        return float(struct.unpack("<f", _bf16_to_f32_bytes(raw))[0])
+    if br.dtype == "F16":
+        return float(struct.unpack("<e", raw)[0])
+    raise ValueError(f"unsupported float scale dtype {br.dtype}")
+
+
+def _stream_promoted_f32(readers: _ShardReaders, br: _ByteRange, w: _BlobWriter) -> None:
+    elem = _SAFETENSORS_DTYPE_BYTES[br.dtype]
+    fh = readers.get(br.path)
+    step = _CONVERT_CHUNK_ELEMS * elem
+    done = 0
+    while done < br.length:
+        take = min(step, br.length - done)
+        raw = _read_exact(fh, br.offset + done, take)
+        if br.dtype == "F32":
+            w.write(raw)
+        elif br.dtype == "BF16":
+            w.write(_bf16_to_f32_bytes(raw))
+        elif br.dtype == "F16":
+            cnt = take // 2
+            w.write(struct.pack(f"<{cnt}f", *struct.unpack(f"<{cnt}e", raw)))
+        else:
+            raise ValueError(f"unsupported scale dtype {br.dtype} for f32 promotion")
+        done += take
+
+
+def _stream_raw_range_chunked(readers: _ShardReaders, br: _ByteRange, w: _BlobWriter) -> None:
+    fh = readers.get(br.path)
+    done = 0
+    while done < br.length:
+        take = min(_COPY_CHUNK_BYTES, br.length - done)
+        w.write(_read_exact(fh, br.offset + done, take))
+        done += take
+
+
+def _stream_mxfp8_scales(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) -> None:
+    assert entry.scales is not None
+    if entry.scale_tile_shape is None:
+        _stream_raw_range_chunked(readers, entry.scales, w)
+        return
+    nb32, kb32 = entry.scale_tile_shape
+    n_rows = entry.shape[0]
+    fh = readers.get(entry.scales.path)
+    for t_row in range(nb32):
+        tile_raw = _read_exact(fh, entry.scales.offset + t_row * kb32, kb32)
+        rep = min(32, n_rows - t_row * 32)
+        for _ in range(rep):
+            w.write(tile_raw)
 
 
 class _BlobWriter:
@@ -1439,24 +2421,63 @@ def _stream_entry(entry: _PlannedEntry, readers: _ShardReaders, w: _BlobWriter) 
                 raise ValueError(f"unknown conversion {entry.data_convert!r}")
             done += take
 
-    if entry.scales is not None and entry.biases is not None:
+    if entry.params_bytes > 0:
         w.zeros(entry.params_offset - entry.data_bytes)
-        elem = _SAFETENSORS_DTYPE_BYTES[entry.scales.dtype]
-        total = entry.scales.length // elem
-        s_fh = readers.get(entry.scales.path)
-        b_fh = readers.get(entry.biases.path)
-        done = 0
-        while done < total:
-            count = min(_CONVERT_CHUNK_ELEMS, total - done)
-            s_raw = _read_exact(s_fh, entry.scales.offset + done * elem, count * elem)
-            b_raw = _read_exact(b_fh, entry.biases.offset + done * elem, count * elem)
-            w.write(
-                interleave_scale_bias_f16(
-                    _to_f16_chunk(s_raw, entry.scales.dtype, f"{entry.name} scales"),
-                    _to_f16_chunk(b_raw, entry.biases.dtype, f"{entry.name} biases"),
+        if entry.params_mode == "affine_scale_bias":
+            assert entry.scales is not None and entry.biases is not None
+            elem = _SAFETENSORS_DTYPE_BYTES[entry.scales.dtype]
+            total = entry.scales.length // elem
+            s_fh = readers.get(entry.scales.path)
+            b_fh = readers.get(entry.biases.path)
+            done = 0
+            while done < total:
+                count = min(_CONVERT_CHUNK_ELEMS, total - done)
+                s_raw = _read_exact(s_fh, entry.scales.offset + done * elem, count * elem)
+                b_raw = _read_exact(b_fh, entry.biases.offset + done * elem, count * elem)
+                w.write(
+                    interleave_scale_bias_f16(
+                        _to_f16_chunk(s_raw, entry.scales.dtype, f"{entry.name} scales"),
+                        _to_f16_chunk(b_raw, entry.biases.dtype, f"{entry.name} biases"),
+                    )
                 )
+                done += count
+        elif entry.params_mode in ("fp8_block", "fp8_row"):
+            assert entry.scales is not None
+            _stream_promoted_f32(readers, entry.scales, w)
+        elif entry.params_mode == "fp8_tensor":
+            val = (
+                _decode_scalar_f32_at(readers, entry.scales, 0)
+                if entry.scales is not None
+                else entry.outer_scale_const
             )
-            done += count
+            w.write(struct.pack("<f", val))
+        elif entry.params_mode == "mxfp8":
+            _stream_mxfp8_scales(entry, readers, w)
+        elif entry.params_mode == "nvfp4":
+            assert entry.scales is not None
+            _stream_raw_range_chunked(readers, entry.scales, w)
+            pad4 = _align_up(entry.scales.length, 4) - entry.scales.length
+            if pad4 > 0:
+                w.zeros(pad4)
+            idx = max(0, entry.outer_scale_expert_index)
+            if entry.outer_scale is not None:
+                val = _decode_scalar_f32_at(readers, entry.outer_scale, idx)
+                if entry.outer_scale_denom is not None:
+                    denom = _decode_scalar_f32_at(readers, entry.outer_scale_denom, idx)
+                    if denom == 0.0:
+                        raise ValueError(f"{entry.name}: outer_scale_denominator is zero")
+                    eff = val / denom
+                elif entry.outer_scale_divisor_mode:
+                    if val == 0.0:
+                        raise ValueError(f"{entry.name}: NVFP4 weight_global_scale is zero in divisor mode")
+                    eff = 1.0 / val
+                else:
+                    eff = val / entry.outer_scale_denom_const
+            else:
+                eff = entry.outer_scale_const
+            w.write(struct.pack("<f", eff))
+        else:
+            raise ValueError(f"unknown params_mode {entry.params_mode!r} for {entry.name}")
         content = entry.params_offset + entry.params_bytes
     else:
         content = entry.data_bytes
@@ -1490,205 +2511,55 @@ def _validate_r0_loop_alpha_zero(e: _PlannedEntry, readers: _ShardReaders) -> No
         )
 
 
-def pack_amf_from_safetensors(
+def _load_quant_config_hints(
     input_path: pathlib.Path,
+    config_path: pathlib.Path | None,
+) -> tuple[bool, int | None, bool]:
+    """Read `(tie_word_embeddings, config_group_size, nvfp4_global_scale_is_divisor)`."""
+    tie = False
+    cfg_gs: int | None = None
+    gs_is_divisor = False
+    cfg: dict[str, object] = {}
+    if config_path is not None and config_path.is_file():
+        loaded = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            cfg = loaded
+    tie = bool(cfg.get("tie_word_embeddings", False))
+    qc = cfg.get("quantization") or cfg.get("quantization_config")
+    if isinstance(qc, dict):
+        if isinstance(qc.get("group_size"), int) and qc["group_size"] in AFFINE_GROUP_SIZES:
+            cfg_gs = int(qc["group_size"])
+        qm = str(qc.get("quant_method") or "").lower()
+        if qm == "compressed-tensors":
+            gs_is_divisor = True
+    base_dir = input_path if input_path.is_dir() else input_path.parent
+    hf_qc = base_dir / "hf_quant_config.json"
+    if hf_qc.is_file():
+        try:
+            loaded_hf = json.loads(hf_qc.read_text(encoding="utf-8"))
+            if isinstance(loaded_hf, dict):
+                qm = str(loaded_hf.get("quant_method") or "").lower()
+                if qm == "compressed-tensors":
+                    gs_is_divisor = True
+        except ValueError:
+            pass
+    return tie, cfg_gs, gs_is_divisor
+
+
+def _write_planned_amf(
+    plan: Sequence[_PlannedEntry],
+    readers: _ShardReaders,
     output_path: pathlib.Path,
     *,
     model_id: str,
-    group_size: int = 64,
-    cold_experts: Iterable[tuple[int, int]] = (),
-    all_experts_cold: bool = False,
-    dtype_mode: str = "auto",
-    tie_word_embeddings: bool | None = None,
-    exclude_tensors: Iterable[str] = (),
-    heat_profile: pathlib.Path | None = None,
-    cold_experts_per_layer: int | None = None,
-    sme2_pack: str = "none",
+    meta_blobs: Sequence[tuple[str, bytes]] = (),
     lut16_sme2: bool = False,
-    quant_profile: str = "uniform",
-    target_bits: float | None = None,
-    use_rco: bool = True,
-    manifest_path: pathlib.Path | None = None,
     workers: int = 1,
-    strip_vision: bool | None = None,
-    include_vision: bool | None = None,
-    vision_sidecar: pathlib.Path | None = None,
-    vision_block_dtype: str = "auto",
-    sme2_pack_loop_adapters: bool = True,
-    embed_metadata: bool = False,
-    config_path: pathlib.Path | None = None,
-    tokenizer_path: pathlib.Path | None = None,
-    stats_out: dict[str, int] | None = None,
 ) -> list[PackedTensorMeta]:
-    """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
-
-    `input_path` may be a `.safetensors` file, a `model.safetensors.index.json`
-    file, or a checkpoint directory. `quant_profile='uniform'` (default)
-    preserves existing uniform packing behavior bit-exact; `quant_profile='gsq-rco'`
-    runs optional ADR-0017 offline GSQ + RCO per-tensor / per-expert hybrid
-    quantization targeting `target_bits` (default 3.25 when omitted).
-
-    W20 vision-tower modes:
-    - default (`include_vision=None, strip_vision=None, vision_sidecar=None`):
-      automatically includes complete multi-layer ViT towers (`visual.blocks.*` /
-      `vision.blocks.*`) while stripping dangling legacy vision stubs.
-    - `include_vision=True` / `strip_vision=False`: keeps all vision tensors in
-      `output_path`.
-    - `strip_vision=True` / `include_vision=False`: strips all vision tensors.
-    - `vision_sidecar=<path>`: extracts all vision tensors into standalone
-      16 KiB-aligned `vision.amf` and omits them from the backbone `.amf`.
-    """
-    if quant_profile not in QUANT_PROFILES:
-        raise ValueError(f"quant_profile must be one of {QUANT_PROFILES}, got {quant_profile!r}")
-    if vision_block_dtype not in VISION_BLOCK_DTYPES:
-        raise ValueError(
-            f"vision_block_dtype must be one of {VISION_BLOCK_DTYPES}, got {vision_block_dtype!r}"
-        )
-
-    resolved_probe = resolve_checkpoint(pathlib.Path(input_path))
-    probe_tensors = _collect_tensors(resolved_probe.shard_paths)
-    vision_mode = resolve_vision_mode(
-        probe_tensors.keys(),
-        include_vision=include_vision,
-        strip_vision=strip_vision,
-        vision_sidecar=vision_sidecar,
-    )
-    vision_present = any(is_vision_tensor(n) for n in probe_tensors)
-
-    if vision_mode == "sidecar" and vision_sidecar is not None and vision_present:
-        vis_stats: dict[str, int] = {}
-        sidecar_metas = pack_vision_tower_amf(
-            input_path,
-            vision_sidecar,
-            model_id=f"{model_id[:55]}-vision",
-            dtype_mode=dtype_mode,
-            quant_profile=quant_profile,
-            vision_block_dtype=vision_block_dtype,
-            group_size=group_size,
-            use_rco=use_rco,
-            workers=workers,
-            embed_metadata=embed_metadata,
-            config_path=config_path,
-            stats_out=vis_stats,
-        )
-        if stats_out is not None:
-            stats_out["sidecar_vision_tensors"] = len(sidecar_metas)
-
-    eff_strip_for_backbone = vision_mode in ("strip", "sidecar")
-
-    if quant_profile == "gsq-rco":
-        eff_target = 3.25 if target_bits is None else float(target_bits)
-        metas_gsq = gsq_convert_with_vision(
-            input_path,
-            output_path,
-            target_bits=eff_target,
-            model_id=model_id,
-            group_size=group_size,
-            cold_experts=cold_experts,
-            all_experts_cold=all_experts_cold,
-            dtype_mode=dtype_mode,
-            tie_word_embeddings=tie_word_embeddings,
-            exclude_tensors=exclude_tensors,
-            heat_profile=heat_profile,
-            cold_experts_per_layer=cold_experts_per_layer,
-            sme2_pack=sme2_pack,
-            lut16_sme2=lut16_sme2,
-            use_rco=use_rco,
-            manifest_path=manifest_path,
-            workers=workers,
-            strip_vision=eff_strip_for_backbone,
-            include_vision=(vision_mode == "include"),
-            vision_block_dtype=vision_block_dtype,
-            stats_out=stats_out,
-        )
-        if embed_metadata or config_path is not None or tokenizer_path is not None:
-            cfg_p, tok_p = _resolve_metadata_paths(
-                pathlib.Path(input_path),
-                resolved_probe.config_path,
-                config_path=config_path,
-                tokenizer_path=tokenizer_path,
-            )
-            return embed_metadata_into_amf(
-                output_path,
-                config_bytes=cfg_p.read_bytes() if cfg_p is not None else None,
-                tokenizer_bytes=tok_p.read_bytes() if tok_p is not None else None,
-                output_path=output_path,
-            )
-        return metas_gsq
-
-    if vision_mode == "include" and vision_present and vision_block_dtype == "q4_affine":
-        # Pack backbone uniformly + vision with W20 q4_affine block quantization (pins patch_embed/norms/merger).
-        return _pack_uniform_backbone_with_quant_vision(
-            input_path,
-            output_path,
-            resolved=resolved_probe,
-            tensors=probe_tensors,
-            model_id=model_id,
-            group_size=group_size,
-            cold_experts=cold_experts,
-            all_experts_cold=all_experts_cold,
-            dtype_mode=dtype_mode,
-            tie_word_embeddings=tie_word_embeddings,
-            exclude_tensors=exclude_tensors,
-            heat_profile=heat_profile,
-            cold_experts_per_layer=cold_experts_per_layer,
-            sme2_pack=sme2_pack,
-            lut16_sme2=lut16_sme2,
-            use_rco=use_rco,
-            workers=workers,
-            vision_block_dtype=vision_block_dtype,
-            sme2_pack_loop_adapters=sme2_pack_loop_adapters,
-            embed_metadata=embed_metadata,
-            config_path=config_path,
-            tokenizer_path=tokenizer_path,
-            stats_out=stats_out,
-        )
-
+    """Write planned tensors and metadata blobs directly into a 16 KiB-aligned `.amf` v0 file."""
     model_id_bytes = model_id.encode("utf-8")
     if len(model_id_bytes) == 0 or len(model_id_bytes) > 63:
         raise ValueError(f"model_id must be 1..63 UTF-8 bytes: {model_id!r}")
-
-    effective_cold: set[tuple[int, int]] = set(cold_experts)
-    if heat_profile is not None:
-        effective_cold.update(
-            load_cold_experts_from_heat_profile(
-                pathlib.Path(heat_profile),
-                cold_experts_per_layer=cold_experts_per_layer,
-            )
-        )
-    elif cold_experts_per_layer is not None:
-        raise ValueError("cold_experts_per_layer requires heat_profile in pack_amf_from_safetensors")
-
-    eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
-    resolved = resolved_probe
-    tie = _load_tie_flag(resolved.config_path) if tie_word_embeddings is None else tie_word_embeddings
-    tensors = probe_tensors
-    plan = plan_amf_entries(
-        tensors,
-        group_size=group_size,
-        dtype_mode=dtype_mode,
-        cold_experts=effective_cold,
-        all_experts_cold=all_experts_cold,
-        tie_word_embeddings=tie,
-        exclude_tensors=exclude_tensors,
-        sme2_pack=eff_sme2_pack,
-        strip_vision=eff_strip_for_backbone,
-        sme2_pack_loop_adapters=sme2_pack_loop_adapters,
-        stats_out=stats_out,
-    )
-
-    meta_blobs: list[tuple[str, bytes]] = []
-    if embed_metadata or config_path is not None or tokenizer_path is not None:
-        cfg_p, tok_p = _resolve_metadata_paths(
-            pathlib.Path(input_path),
-            resolved.config_path,
-            config_path=config_path,
-            tokenizer_path=tokenizer_path,
-        )
-        if cfg_p is not None:
-            meta_blobs.append((META_CONFIG_JSON, cfg_p.read_bytes()))
-        if tok_p is not None:
-            meta_blobs.append((META_TOKENIZER_JSON, tok_p.read_bytes()))
 
     tensor_count = len(plan) + len(meta_blobs)
     dir_offset = APPLE_PAGE_SIZE
@@ -1710,7 +2581,6 @@ def pack_amf_from_safetensors(
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     partial = output_path.with_name(output_path.name + ".partial")
-    readers = _ShardReaders()
     metas: list[PackedTensorMeta] = []
     try:
         with partial.open("wb") as out:
@@ -1808,9 +2678,348 @@ def pack_amf_from_safetensors(
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
+    return metas
+
+
+def pack_amf_from_stream_sources(
+    sources: Iterable[ShardStreamSource],
+    output_path: pathlib.Path,
+    *,
+    model_id: str,
+    group_size: int = 64,
+    cold_experts: Iterable[tuple[int, int]] = (),
+    all_experts_cold: bool = False,
+    dtype_mode: str = "auto",
+    tie_word_embeddings: bool = False,
+    exclude_tensors: Iterable[str] = (),
+    sme2_pack: str = "none",
+    strip_vision: bool | None = None,
+    include_vision: bool | None = None,
+    sme2_pack_loop_adapters: bool = True,
+    nvfp4_global_scale_is_divisor: bool = False,
+    config_bytes: bytes | None = None,
+    tokenizer_bytes: bytes | None = None,
+    chat_template_bytes: bytes | None = None,
+    extra_metadata: dict[str, bytes] | None = None,
+    stats_out: dict[str, int] | None = None,
+) -> list[PackedTensorMeta]:
+    """Stream-pack safetensors shards straight from local iterators or HTTP `Range` readers without staging copies."""
+    tensors, factories = _collect_tensors_from_sources(sources)
+    eff_tie = tie_word_embeddings
+    eff_divisor = nvfp4_global_scale_is_divisor
+    eff_gs = group_size
+    if config_bytes:
+        try:
+            cfg = json.loads(config_bytes.decode("utf-8"))
+            if isinstance(cfg, dict):
+                if not tie_word_embeddings and cfg.get("tie_word_embeddings"):
+                    eff_tie = True
+                qc = cfg.get("quantization") or cfg.get("quantization_config")
+                if isinstance(qc, dict):
+                    if str(qc.get("quant_method") or "").lower() == "compressed-tensors":
+                        eff_divisor = True
+        except ValueError:
+            pass
+    plan = plan_amf_entries(
+        tensors,
+        group_size=eff_gs,
+        dtype_mode=dtype_mode,
+        cold_experts=cold_experts,
+        all_experts_cold=all_experts_cold,
+        tie_word_embeddings=eff_tie,
+        exclude_tensors=exclude_tensors,
+        sme2_pack=sme2_pack,
+        strip_vision=strip_vision,
+        include_vision=include_vision,
+        sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+        nvfp4_global_scale_is_divisor=eff_divisor,
+        stats_out=stats_out,
+    )
+    meta_blobs: list[tuple[str, bytes]] = []
+    if config_bytes is not None:
+        meta_blobs.append((META_CONFIG_JSON, bytes(config_bytes)))
+    if tokenizer_bytes is not None:
+        meta_blobs.append((META_TOKENIZER_JSON, bytes(tokenizer_bytes)))
+    if chat_template_bytes is not None:
+        meta_blobs.append((META_CHAT_TEMPLATE_JSON, bytes(chat_template_bytes)))
+    if extra_metadata:
+        for k, v in sorted(extra_metadata.items()):
+            if not is_meta_name(k):
+                raise ValueError(f"metadata key must start with {META_PREFIX!r}, got {k!r}")
+            meta_blobs.append((k, bytes(v)))
+
+    readers = _ShardReaders(source_factories=factories)
+    try:
+        return _write_planned_amf(
+            plan,
+            readers,
+            pathlib.Path(output_path),
+            model_id=model_id,
+            meta_blobs=meta_blobs,
+        )
     finally:
         readers.close()
-    return metas
+
+
+def _maybe_compile_chat_template_bytes(
+    input_path: pathlib.Path,
+    *,
+    embed_metadata: bool,
+    config_path: pathlib.Path | None,
+    chat_template_path: pathlib.Path | None,
+) -> bytes | None:
+    if not embed_metadata and chat_template_path is None:
+        return None
+    base_dir = input_path if input_path.is_dir() else input_path.parent
+    has_tpl = chat_template_path is not None or (base_dir / "chat_template.jinja").is_file() or (
+        base_dir / "tokenizer_config.json"
+    ).is_file()
+    if not has_tpl:
+        return None
+    from aminfer_tools.chat_template import compile_chat_template_bytes
+
+    return compile_chat_template_bytes(
+        input_path,
+        config_path=config_path,
+        chat_template_path=chat_template_path,
+    )
+
+
+def pack_amf_from_safetensors(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    *,
+    model_id: str,
+    group_size: int | None = None,
+    cold_experts: Iterable[tuple[int, int]] = (),
+    all_experts_cold: bool = False,
+    dtype_mode: str = "auto",
+    tie_word_embeddings: bool | None = None,
+    exclude_tensors: Iterable[str] = (),
+    heat_profile: pathlib.Path | None = None,
+    cold_experts_per_layer: int | None = None,
+    sme2_pack: str = "none",
+    lut16_sme2: bool = False,
+    quant_profile: str = "uniform",
+    target_bits: float | None = None,
+    use_rco: bool = True,
+    manifest_path: pathlib.Path | None = None,
+    workers: int = 1,
+    strip_vision: bool | None = None,
+    include_vision: bool | None = None,
+    vision_sidecar: pathlib.Path | None = None,
+    vision_block_dtype: str = "auto",
+    sme2_pack_loop_adapters: bool = True,
+    embed_metadata: bool = False,
+    config_path: pathlib.Path | None = None,
+    tokenizer_path: pathlib.Path | None = None,
+    chat_template_path: pathlib.Path | None = None,
+    nvfp4_global_scale_is_divisor: bool | None = None,
+    imatrix_path: pathlib.Path | None = None,
+    stats_out: dict[str, int] | None = None,
+) -> list[PackedTensorMeta]:
+    """Convert a safetensors checkpoint into a 16 KiB-aligned `.amf` v0 file.
+
+    `input_path` may be a `.safetensors` file, a `model.safetensors.index.json`
+    file, or a checkpoint directory. `quant_profile='uniform'` (default)
+    preserves existing uniform packing behavior bit-exact; `quant_profile='gsq-rco'`
+    runs optional ADR-0017 offline GSQ + RCO per-tensor / per-expert hybrid
+    quantization targeting `target_bits` (default 3.25 when omitted).
+
+    W20 vision-tower modes:
+    - default (`include_vision=None, strip_vision=None, vision_sidecar=None`):
+      automatically includes complete multi-layer ViT towers (`visual.blocks.*` /
+      `vision.blocks.*`) while stripping dangling legacy vision stubs.
+    - `include_vision=True` / `strip_vision=False`: keeps all vision tensors in
+      `output_path`.
+    - `strip_vision=True` / `include_vision=False`: strips all vision tensors.
+    - `vision_sidecar=<path>`: extracts all vision tensors into standalone
+      16 KiB-aligned `vision.amf` and omits them from the backbone `.amf`.
+    """
+    if quant_profile not in QUANT_PROFILES:
+        raise ValueError(f"quant_profile must be one of {QUANT_PROFILES}, got {quant_profile!r}")
+    if vision_block_dtype not in VISION_BLOCK_DTYPES:
+        raise ValueError(
+            f"vision_block_dtype must be one of {VISION_BLOCK_DTYPES}, got {vision_block_dtype!r}"
+        )
+
+    in_path = pathlib.Path(input_path)
+    resolved_probe = resolve_checkpoint(in_path)
+    tie_cfg, gs_cfg, div_cfg = _load_quant_config_hints(in_path, config_path or resolved_probe.config_path)
+    eff_group_size = gs_cfg if group_size is None else group_size
+    if eff_group_size is None:
+        eff_group_size = 64
+    eff_divisor = div_cfg if nvfp4_global_scale_is_divisor is None else nvfp4_global_scale_is_divisor
+    probe_tensors = _collect_tensors(resolved_probe.shard_paths)
+    vision_mode = resolve_vision_mode(
+        probe_tensors.keys(),
+        include_vision=include_vision,
+        strip_vision=strip_vision,
+        vision_sidecar=vision_sidecar,
+    )
+    vision_present = any(is_vision_tensor(n) for n in probe_tensors)
+
+    if vision_mode == "sidecar" and vision_sidecar is not None and vision_present:
+        vis_stats: dict[str, int] = {}
+        sidecar_metas = pack_vision_tower_amf(
+            input_path,
+            vision_sidecar,
+            model_id=f"{model_id[:55]}-vision",
+            dtype_mode=dtype_mode,
+            quant_profile=quant_profile,
+            vision_block_dtype=vision_block_dtype,
+            group_size=eff_group_size,
+            use_rco=use_rco,
+            workers=workers,
+            embed_metadata=embed_metadata,
+            config_path=config_path,
+            stats_out=vis_stats,
+        )
+        if stats_out is not None:
+            stats_out["sidecar_vision_tensors"] = len(sidecar_metas)
+
+    eff_strip_for_backbone = vision_mode in ("strip", "sidecar")
+
+    if quant_profile == "gsq-rco":
+        eff_target = 3.25 if target_bits is None else float(target_bits)
+        metas_gsq = gsq_convert_with_vision(
+            input_path,
+            output_path,
+            target_bits=eff_target,
+            model_id=model_id,
+            group_size=eff_group_size,
+            cold_experts=cold_experts,
+            all_experts_cold=all_experts_cold,
+            dtype_mode=dtype_mode,
+            tie_word_embeddings=tie_word_embeddings,
+            exclude_tensors=exclude_tensors,
+            heat_profile=heat_profile,
+            cold_experts_per_layer=cold_experts_per_layer,
+            sme2_pack=sme2_pack,
+            lut16_sme2=lut16_sme2,
+            use_rco=use_rco,
+            manifest_path=manifest_path,
+            workers=workers,
+            strip_vision=eff_strip_for_backbone,
+            include_vision=(vision_mode == "include"),
+            vision_block_dtype=vision_block_dtype,
+            imatrix_path=imatrix_path,
+            stats_out=stats_out,
+        )
+        ct_bytes = _maybe_compile_chat_template_bytes(
+            in_path,
+            embed_metadata=embed_metadata,
+            config_path=config_path or resolved_probe.config_path,
+            chat_template_path=chat_template_path,
+        )
+        if embed_metadata or config_path is not None or tokenizer_path is not None or ct_bytes is not None:
+            cfg_p, tok_p = _resolve_metadata_paths(
+                in_path,
+                resolved_probe.config_path,
+                config_path=config_path,
+                tokenizer_path=tokenizer_path,
+            )
+            return embed_metadata_into_amf(
+                output_path,
+                config_bytes=cfg_p.read_bytes() if cfg_p is not None else None,
+                tokenizer_bytes=tok_p.read_bytes() if tok_p is not None else None,
+                chat_template_bytes=ct_bytes,
+                output_path=output_path,
+            )
+        return metas_gsq
+
+    if vision_mode == "include" and vision_present and vision_block_dtype == "q4_affine":
+        # Pack backbone uniformly + vision with W20 q4_affine block quantization (pins patch_embed/norms/merger).
+        return _pack_uniform_backbone_with_quant_vision(
+            input_path,
+            output_path,
+            resolved=resolved_probe,
+            tensors=probe_tensors,
+            model_id=model_id,
+            group_size=eff_group_size,
+            cold_experts=cold_experts,
+            all_experts_cold=all_experts_cold,
+            dtype_mode=dtype_mode,
+            tie_word_embeddings=tie_word_embeddings,
+            exclude_tensors=exclude_tensors,
+            heat_profile=heat_profile,
+            cold_experts_per_layer=cold_experts_per_layer,
+            sme2_pack=sme2_pack,
+            lut16_sme2=lut16_sme2,
+            use_rco=use_rco,
+            workers=workers,
+            vision_block_dtype=vision_block_dtype,
+            sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+            embed_metadata=embed_metadata,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
+            stats_out=stats_out,
+        )
+
+    effective_cold: set[tuple[int, int]] = set(cold_experts)
+    if heat_profile is not None:
+        effective_cold.update(
+            load_cold_experts_from_heat_profile(
+                pathlib.Path(heat_profile),
+                cold_experts_per_layer=cold_experts_per_layer,
+            )
+        )
+    elif cold_experts_per_layer is not None:
+        raise ValueError("cold_experts_per_layer requires heat_profile in pack_amf_from_safetensors")
+
+    eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
+    resolved = resolved_probe
+    tie = tie_cfg if tie_word_embeddings is None else tie_word_embeddings
+    tensors = probe_tensors
+    plan = plan_amf_entries(
+        tensors,
+        group_size=eff_group_size,
+        dtype_mode=dtype_mode,
+        cold_experts=effective_cold,
+        all_experts_cold=all_experts_cold,
+        tie_word_embeddings=tie,
+        exclude_tensors=exclude_tensors,
+        sme2_pack=eff_sme2_pack,
+        strip_vision=eff_strip_for_backbone,
+        sme2_pack_loop_adapters=sme2_pack_loop_adapters,
+        nvfp4_global_scale_is_divisor=eff_divisor,
+        stats_out=stats_out,
+    )
+
+    meta_blobs: list[tuple[str, bytes]] = []
+    if embed_metadata or config_path is not None or tokenizer_path is not None or chat_template_path is not None:
+        cfg_p, tok_p = _resolve_metadata_paths(
+            in_path,
+            resolved.config_path,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
+        )
+        if cfg_p is not None:
+            meta_blobs.append((META_CONFIG_JSON, cfg_p.read_bytes()))
+        if tok_p is not None:
+            meta_blobs.append((META_TOKENIZER_JSON, tok_p.read_bytes()))
+        ct_bytes = _maybe_compile_chat_template_bytes(
+            in_path,
+            embed_metadata=embed_metadata,
+            config_path=cfg_p,
+            chat_template_path=chat_template_path,
+        )
+        if ct_bytes is not None:
+            meta_blobs.append((META_CHAT_TEMPLATE_JSON, ct_bytes))
+
+    readers = _ShardReaders()
+    try:
+        return _write_planned_amf(
+            plan,
+            readers,
+            pathlib.Path(output_path),
+            model_id=model_id,
+            meta_blobs=meta_blobs,
+            lut16_sme2=lut16_sme2,
+            workers=workers,
+        )
+    finally:
+        readers.close()
 
 
 def _pack_directory(metas: Sequence[PackedTensorMeta]) -> bytes:
@@ -1919,6 +3128,7 @@ def embed_metadata_into_amf(
     *,
     config_bytes: bytes | None = None,
     tokenizer_bytes: bytes | None = None,
+    chat_template_bytes: bytes | None = None,
     extra_metadata: dict[str, bytes] | None = None,
     output_path: pathlib.Path | None = None,
 ) -> list[PackedTensorMeta]:
@@ -1930,6 +3140,8 @@ def embed_metadata_into_amf(
         attachments[META_CONFIG_JSON] = bytes(config_bytes)
     if tokenizer_bytes is not None:
         attachments[META_TOKENIZER_JSON] = bytes(tokenizer_bytes)
+    if chat_template_bytes is not None:
+        attachments[META_CHAT_TEMPLATE_JSON] = bytes(chat_template_bytes)
     if extra_metadata:
         for k, v in extra_metadata.items():
             if not is_meta_name(k):
@@ -2769,6 +3981,207 @@ def dequantize_q4_row_f32(
     return out
 
 
+def dequantize_q5_row_f32(
+    row_data: bytes | bytearray | memoryview,
+    row_params: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    group_size: int = 64,
+) -> list[float]:
+    """Dequantize one row of MLX-compatible 5-bit affine packed weights to floats."""
+    if k <= 0 or group_size <= 0 or group_size % 8 != 0 or k % group_size != 0:
+        raise ValueError(f"invalid q5 geometry: k={k}, group_size={group_size}")
+    groups = k // group_size
+    expected_data = (k * 5) // 8
+    expected_params = groups * 4
+    if len(row_data) != expected_data:
+        raise ValueError(f"q5 row_data length {len(row_data)} != expected {expected_data}")
+    if len(row_params) != expected_params:
+        raise ValueError(f"q5 row_params length {len(row_params)} != expected {expected_params}")
+
+    sbs = struct.unpack(f"<{groups * 2}e", row_params)
+    blocks_per_group = group_size // 8
+    out = [0.0] * k
+    pos = 0
+    off = 0
+    sb_idx = 0
+    for _ in range(groups):
+        s = sbs[sb_idx]
+        b = sbs[sb_idx + 1]
+        sb_idx += 2
+        for _ in range(blocks_per_group):
+            w = (
+                row_data[off]
+                | (row_data[off + 1] << 8)
+                | (row_data[off + 2] << 16)
+                | (row_data[off + 3] << 24)
+                | (row_data[off + 4] << 32)
+            )
+            off += 5
+            for j in range(8):
+                out[pos + j] = b + ((w >> (5 * j)) & 0x1F) * s
+            pos += 8
+    return out
+
+
+def dequantize_q6_row_f32(
+    row_data: bytes | bytearray | memoryview,
+    row_params: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    group_size: int = 64,
+) -> list[float]:
+    """Dequantize one row of MLX-compatible 6-bit affine packed weights to floats."""
+    if k <= 0 or group_size <= 0 or group_size % 4 != 0 or k % group_size != 0:
+        raise ValueError(f"invalid q6 geometry: k={k}, group_size={group_size}")
+    groups = k // group_size
+    expected_data = (k * 3) // 4
+    expected_params = groups * 4
+    if len(row_data) != expected_data:
+        raise ValueError(f"q6 row_data length {len(row_data)} != expected {expected_data}")
+    if len(row_params) != expected_params:
+        raise ValueError(f"q6 row_params length {len(row_params)} != expected {expected_params}")
+
+    sbs = struct.unpack(f"<{groups * 2}e", row_params)
+    blocks_per_group = group_size // 4
+    out = [0.0] * k
+    pos = 0
+    off = 0
+    sb_idx = 0
+    for _ in range(groups):
+        s = sbs[sb_idx]
+        b = sbs[sb_idx + 1]
+        sb_idx += 2
+        for _ in range(blocks_per_group):
+            w = row_data[off] | (row_data[off + 1] << 8) | (row_data[off + 2] << 16)
+            off += 3
+            for j in range(4):
+                out[pos + j] = b + ((w >> (6 * j)) & 0x3F) * s
+            pos += 4
+    return out
+
+
+def dequantize_q8_row_f32(
+    row_data: bytes | bytearray | memoryview,
+    row_params: bytes | bytearray | memoryview,
+    k: int,
+    *,
+    group_size: int = 64,
+) -> list[float]:
+    """Dequantize one row of MLX-compatible 8-bit affine packed weights to floats."""
+    if k <= 0 or group_size <= 0 or group_size % 4 != 0 or k % group_size != 0:
+        raise ValueError(f"invalid q8 geometry: k={k}, group_size={group_size}")
+    groups = k // group_size
+    expected_data = k
+    expected_params = groups * 4
+    if len(row_data) != expected_data:
+        raise ValueError(f"q8 row_data length {len(row_data)} != expected {expected_data}")
+    if len(row_params) != expected_params:
+        raise ValueError(f"q8 row_params length {len(row_params)} != expected {expected_params}")
+
+    sbs = struct.unpack(f"<{groups * 2}e", row_params)
+    out = [0.0] * k
+    pos = 0
+    sb_idx = 0
+    for _ in range(groups):
+        s = sbs[sb_idx]
+        b = sbs[sb_idx + 1]
+        sb_idx += 2
+        for j in range(group_size):
+            out[pos + j] = b + row_data[pos + j] * s
+        pos += group_size
+    return out
+
+
+def dequantize_fp8_block_row_f32(
+    row_data: bytes | bytearray | memoryview,
+    row_idx: int,
+    block_scales_f32: Sequence[float],
+    n_rows: int,
+    k: int,
+) -> list[float]:
+    if len(row_data) != k:
+        raise ValueError(f"fp8 block row length {len(row_data)} != {k}")
+    kb = (k + 127) // 128
+    nb_idx = row_idx // 128
+    base = nb_idx * kb
+    lut = _E4M3_LUT
+    out = [0.0] * k
+    for col in range(k):
+        out[col] = lut[row_data[col]] * block_scales_f32[base + col // 128]
+    return out
+
+
+def dequantize_fp8_row_f32(row_data: bytes | bytearray | memoryview, row_scale: float, k: int) -> list[float]:
+    if len(row_data) != k:
+        raise ValueError(f"fp8 row length {len(row_data)} != {k}")
+    lut = _E4M3_LUT
+    return [lut[row_data[c]] * row_scale for c in range(k)]
+
+
+def dequantize_fp8_tensor_f32(row_data: bytes | bytearray | memoryview, scale: float, k: int) -> list[float]:
+    if len(row_data) != k:
+        raise ValueError(f"fp8 tensor row length {len(row_data)} != {k}")
+    lut = _E4M3_LUT
+    return [lut[row_data[c]] * scale for c in range(k)]
+
+
+def dequantize_mxfp8_row_f32(
+    row_data: bytes | bytearray | memoryview,
+    row_params: bytes | bytearray | memoryview,
+    k: int,
+) -> list[float]:
+    if k <= 0 or k % 32 != 0:
+        raise ValueError(f"invalid mxfp8 row width k={k}")
+    groups = k // 32
+    if len(row_data) != k or len(row_params) != groups:
+        raise ValueError(f"mxfp8 row length mismatch: data={len(row_data)}, params={len(row_params)}")
+    e_lut = _E4M3_LUT
+    u_lut = _UE8M0_LUT
+    out = [0.0] * k
+    for g in range(groups):
+        sc = u_lut[row_params[g]]
+        base = g * 32
+        for j in range(32):
+            out[base + j] = e_lut[row_data[base + j]] * sc
+    return out
+
+
+def dequantize_nvfp4_row_f32(
+    row_data: bytes | bytearray | memoryview,
+    row_scales_e4m3: bytes | bytearray | memoryview,
+    outer_scale: float,
+    k: int,
+) -> list[float]:
+    if k <= 0 or k % 16 != 0:
+        raise ValueError(f"invalid nvfp4 row width k={k}")
+    groups = k // 16
+    if len(row_data) != k // 2 or len(row_scales_e4m3) != groups:
+        raise ValueError(f"nvfp4 row length mismatch: data={len(row_data)}, scales={len(row_scales_e4m3)}")
+    e_lut = _E4M3_LUT
+    n_lut = _E2M1_TABLE
+    out = [0.0] * k
+    for g in range(groups):
+        sc = e_lut[row_scales_e4m3[g]] * outer_scale
+        d_off = g * 8
+        p_off = g * 16
+        for b_i in range(8):
+            byte = row_data[d_off + b_i]
+            out[p_off + 2 * b_i] = n_lut[byte & 0x0F] * sc
+            out[p_off + 2 * b_i + 1] = n_lut[(byte >> 4) & 0x0F] * sc
+    return out
+
+
+_AFFINE_DEQUANT_SPEC = {
+    DType.Q2_AFFINE: (lambda k: k // 4, dequantize_q2_row_f32),
+    DType.Q3_AFFINE: (lambda k: (k * 3) // 8, dequantize_q3_row_f32),
+    DType.Q4_AFFINE: (lambda k: k // 2, dequantize_q4_row_f32),
+    DType.Q5_AFFINE: (lambda k: (k * 5) // 8, dequantize_q5_row_f32),
+    DType.Q6_AFFINE: (lambda k: (k * 3) // 4, dequantize_q6_row_f32),
+    DType.Q8_AFFINE: (lambda k: k, dequantize_q8_row_f32),
+}
+
+
 def _unpack_header(raw_header: bytes, file_size: int, *, verify_crc: bool = True) -> AmfHeader:
     if len(raw_header) != HEADER_STRUCT.size:
         raise ValueError(f"expected {HEADER_STRUCT.size}-byte AMF header, got {len(raw_header)}")
@@ -2948,6 +4361,20 @@ class AmfReader:
                 )
         return raw
 
+    def read_metadata_bytes(self, name: str, *, verify_crc: bool = True) -> bytes:
+        """Read and unpad a cold `__meta.*` JSON/binary blob by name (supports W24 chat template alias)."""
+        entry = self.by_name.get(name)
+        if entry is None and name == META_CHAT_TEMPLATE_JSON:
+            entry = self.by_name.get(LEGACY_CHAT_TEMPLATE_METADATA_NAME)
+        elif entry is None and name == LEGACY_CHAT_TEMPLATE_METADATA_NAME:
+            entry = self.by_name.get(META_CHAT_TEMPLATE_JSON)
+        if entry is None:
+            raise KeyError(f"metadata entry {name!r} not found in {self.path}")
+        if entry.kind != TensorKind.METADATA:
+            raise ValueError(f"entry {name!r} has kind={entry.kind}, expected TensorKind.METADATA")
+        raw = self.read_blob(entry, verify_crc=verify_crc)
+        return raw[: entry.data_bytes]
+
     def _read_sme2_panel_f32(
         self,
         entry: PackedTensorMeta,
@@ -3002,18 +4429,11 @@ class AmfReader:
             return out_sme
         out: list[list[float]] = []
 
-        if entry.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
+        if entry.dtype in _AFFINE_DEQUANT_SPEC:
+            row_data_fn, deq = _AFFINE_DEQUANT_SPEC[entry.dtype]
             gs = entry.group_size
             groups = k // gs
-            if entry.dtype == DType.Q2_AFFINE:
-                row_data_bytes = k // 4
-                deq = dequantize_q2_row_f32
-            elif entry.dtype == DType.Q3_AFFINE:
-                row_data_bytes = (k * 3) // 8
-                deq = dequantize_q3_row_f32
-            else:
-                row_data_bytes = k // 2
-                deq = dequantize_q4_row_f32
+            row_data_bytes = row_data_fn(k)
             row_param_bytes = groups * 4
             for r in row_indices:
                 if r < 0 or r >= n_rows:
@@ -3025,6 +4445,71 @@ class AmfReader:
                     row_param_bytes,
                 )
                 out.append(deq(d_raw, p_raw, k, group_size=gs))
+            return out
+
+        if entry.dtype == DType.FP8_E4M3_BLOCK:
+            kb = (k + 127) // 128
+            nb = (n_rows + 127) // 128
+            scales_raw = _read_exact(self._fh, entry.blob_offset + entry.params_offset, nb * kb * 4)
+            scales_f32 = struct.unpack(f"<{nb * kb}f", scales_raw)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                d_raw = _read_exact(self._fh, entry.blob_offset + r * k, k)
+                out.append(dequantize_fp8_block_row_f32(d_raw, r, scales_f32, n_rows, k))
+            return out
+
+        if entry.dtype == DType.FP8_E4M3_ROW:
+            scales_raw = _read_exact(self._fh, entry.blob_offset + entry.params_offset, n_rows * 4)
+            scales_f32 = struct.unpack(f"<{n_rows}f", scales_raw)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                d_raw = _read_exact(self._fh, entry.blob_offset + r * k, k)
+                out.append(dequantize_fp8_row_f32(d_raw, scales_f32[r], k))
+            return out
+
+        if entry.dtype == DType.FP8_E4M3_TENSOR:
+            sc = struct.unpack("<f", _read_exact(self._fh, entry.blob_offset + entry.params_offset, 4))[0]
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                d_raw = _read_exact(self._fh, entry.blob_offset + r * k, k)
+                out.append(dequantize_fp8_tensor_f32(d_raw, sc, k))
+            return out
+
+        if entry.dtype == DType.MXFP8_G32:
+            groups = k // 32
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                d_raw = _read_exact(self._fh, entry.blob_offset + r * k, k)
+                p_raw = _read_exact(self._fh, entry.blob_offset + entry.params_offset + r * groups, groups)
+                out.append(dequantize_mxfp8_row_f32(d_raw, p_raw, k))
+            return out
+
+        if entry.dtype == DType.NVFP4_G16:
+            groups = k // 16
+            row_data_bytes = k // 2
+            outer_off = entry.blob_offset + entry.params_offset + _align_up(n_rows * groups, 4)
+            outer_scale = struct.unpack("<f", _read_exact(self._fh, outer_off, 4))[0]
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                d_raw = _read_exact(self._fh, entry.blob_offset + r * row_data_bytes, row_data_bytes)
+                p_raw = _read_exact(self._fh, entry.blob_offset + entry.params_offset + r * groups, groups)
+                out.append(dequantize_nvfp4_row_f32(d_raw, p_raw, outer_scale, k))
+            return out
+
+        if entry.dtype >= DType.GGUF_Q4_0:
+            from aminfer_tools.gguf import dequantize_gguf_amf_row_f32, gguf_row_bytes_for_amf_dtype
+
+            row_b = gguf_row_bytes_for_amf_dtype(entry.dtype, k)
+            for r in row_indices:
+                if r < 0 or r >= n_rows:
+                    raise IndexError(f"row {r} out of bounds for {entry.name!r} with {n_rows} rows")
+                raw = _read_exact(self._fh, entry.blob_offset + r * row_b, row_b)
+                out.append(dequantize_gguf_amf_row_f32(entry.dtype, raw, k))
             return out
 
         if entry.dtype == DType.F16:
@@ -3068,31 +4553,15 @@ class AmfReader:
                 valid = min(SME2_PANEL_COLS, n_rows - p * SME2_PANEL_COLS)
                 rows_out.extend(self._read_sme2_panel_f32(entry, p, valid))
             return rows_out
-        if entry.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
-            data_mv = memoryview(_read_exact(self._fh, entry.blob_offset, entry.data_bytes))
-            params_mv = memoryview(
-                _read_exact(self._fh, entry.blob_offset + entry.params_offset, entry.params_bytes)
-            )
-            gs = entry.group_size
-            if entry.dtype == DType.Q2_AFFINE:
-                row_data_bytes = k // 4
-                deq = dequantize_q2_row_f32
-            elif entry.dtype == DType.Q3_AFFINE:
-                row_data_bytes = (k * 3) // 8
-                deq = dequantize_q3_row_f32
-            else:
-                row_data_bytes = k // 2
-                deq = dequantize_q4_row_f32
-            row_param_bytes = (k // gs) * 4
-            return [
-                deq(
-                    data_mv[r * row_data_bytes : (r + 1) * row_data_bytes],
-                    params_mv[r * row_param_bytes : (r + 1) * row_param_bytes],
-                    k,
-                    group_size=gs,
-                )
-                for r in range(n_rows)
-            ]
+        if entry.dtype in (
+            *_AFFINE_DEQUANT_SPEC,
+            DType.FP8_E4M3_BLOCK,
+            DType.FP8_E4M3_ROW,
+            DType.FP8_E4M3_TENSOR,
+            DType.MXFP8_G32,
+            DType.NVFP4_G16,
+        ) or entry.dtype >= DType.GGUF_Q4_0:
+            return self.read_rows_f32(entry, range(n_rows))
 
         raw_mv = memoryview(_read_exact(self._fh, entry.blob_offset, entry.data_bytes))
         if entry.dtype == DType.F16:
@@ -3162,35 +4631,19 @@ class AmfReader:
                 chunks.append(_f32_bytes_to_f16_bytes(raw, entry.name))
                 done += take
             return b"".join(chunks)
-        if entry.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE):
+        if (
+            entry.dtype in _AFFINE_DEQUANT_SPEC
+            or entry.dtype
+            in (DType.FP8_E4M3_BLOCK, DType.FP8_E4M3_ROW, DType.FP8_E4M3_TENSOR, DType.MXFP8_G32, DType.NVFP4_G16)
+            or entry.dtype >= DType.GGUF_Q4_0
+        ):
             if len(entry.shape) != 2:
                 raise ValueError(f"quantized tensor {entry.name!r} must be 2D, got {entry.shape}")
             n_rows, k = entry.shape
-            gs = entry.group_size
-            if entry.dtype == DType.Q2_AFFINE:
-                row_data_bytes = k // 4
-                deq = dequantize_q2_row_f32
-            elif entry.dtype == DType.Q3_AFFINE:
-                row_data_bytes = (k * 3) // 8
-                deq = dequantize_q3_row_f32
-            else:
-                row_data_bytes = k // 2
-                deq = dequantize_q4_row_f32
-            row_param_bytes = (k // gs) * 4
-            data_mv = memoryview(_read_exact(self._fh, entry.blob_offset, entry.data_bytes))
-            params_mv = memoryview(
-                _read_exact(self._fh, entry.blob_offset + entry.params_offset, entry.params_bytes)
-            )
             out = bytearray(n_rows * k * 2)
             row_packer = struct.Struct(f"<{k}e")
             row_out_bytes = k * 2
-            for r in range(n_rows):
-                vals = deq(
-                    data_mv[r * row_data_bytes : (r + 1) * row_data_bytes],
-                    params_mv[r * row_param_bytes : (r + 1) * row_param_bytes],
-                    k,
-                    group_size=gs,
-                )
+            for r, vals in enumerate(self.read_rows_f32(entry, range(n_rows))):
                 try:
                     row_packer.pack_into(out, r * row_out_bytes, *vals)
                 except OverflowError as exc:
@@ -4054,8 +5507,8 @@ def pack_vision_tower_amf(
         raise ValueError(
             f"vision_block_dtype must be one of {VISION_BLOCK_DTYPES}, got {vision_block_dtype!r}"
         )
-    if group_size != 64:
-        raise ValueError(f"aminfer v0 supports group_size=64 only, got {group_size}")
+    if group_size not in AFFINE_GROUP_SIZES:
+        raise ValueError(f"aminfer supports group_size in {AFFINE_GROUP_SIZES}, got {group_size}")
 
     in_path = pathlib.Path(input_path)
     out_path = pathlib.Path(output_path)
@@ -4159,6 +5612,7 @@ def gsq_convert_with_vision(
     include_vision: bool | None = None,
     vision_sidecar: pathlib.Path | None = None,
     vision_block_dtype: str = "auto",
+    imatrix_path: pathlib.Path | None = None,
     stats_out: dict[str, int] | None = None,
 ) -> list[PackedTensorMeta]:
     """Run W14 GSQ+RCO with W20 vision-tower precision policy.
@@ -4232,6 +5686,7 @@ def gsq_convert_with_vision(
             manifest_path=manifest_path,
             workers=workers,
             strip_vision=True,
+            imatrix_path=imatrix_path,
             stats_out=stats_out,
         )
         return rep.metas
@@ -4275,6 +5730,7 @@ def gsq_convert_with_vision(
             manifest_path=manifest_path,
             workers=workers,
             strip_vision=True,
+            imatrix_path=imatrix_path,
         )
         if is_amf_in:
             with AmfReader(in_path, verify_header_crc=True, verify_dir_crc=True) as rdr:
