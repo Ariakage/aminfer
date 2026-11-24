@@ -306,19 +306,45 @@ pub fn extractConciseReasoningSummary(raw: []const u8, out: []u8) []const u8 {
     return w.written();
 }
 
-pub fn computeThinkingSignature(key: *const [32]u8, thinking: []const u8, out_hex: *[64]u8) []const u8 {
+/// Initializes an HMAC-SHA256 state bound to `model_id` (`u32` LE length prefix
+/// + `model_id` bytes) so Anthropic thinking signatures cannot replay across
+/// models sharing `--api-key` (`ADR-0024` L69).
+pub fn initThinkingHmac(key: *const [32]u8, model_id: []const u8) HmacSha256 {
+    var mac = HmacSha256.init(key);
+    var len_le: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_le, @intCast(model_id.len), .little);
+    mac.update(&len_le);
+    mac.update(model_id);
+    return mac;
+}
+
+pub fn computeThinkingSignature(
+    key: *const [32]u8,
+    model_id: []const u8,
+    thinking: []const u8,
+    out_hex: *[64]u8,
+) []const u8 {
+    var mac = initThinkingHmac(key, model_id);
+    mac.update(thinking);
     var tag: [32]u8 = undefined;
-    HmacSha256.create(&tag, thinking, key);
+    mac.final(&tag);
     out_hex.* = std.fmt.bytesToHex(tag, .lower);
     return out_hex[0..];
 }
 
-pub fn verifyThinkingSignature(key: *const [32]u8, thinking: []const u8, sig_hex: []const u8) bool {
+pub fn verifyThinkingSignature(
+    key: *const [32]u8,
+    model_id: []const u8,
+    thinking: []const u8,
+    sig_hex: []const u8,
+) bool {
     if (sig_hex.len != 64) return false;
     var provided: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&provided, sig_hex) catch return false;
+    var mac = initThinkingHmac(key, model_id);
+    mac.update(thinking);
     var expected: [32]u8 = undefined;
-    HmacSha256.create(&expected, thinking, key);
+    mac.final(&expected);
     return std.crypto.timing_safe.eql([32]u8, expected, provided);
 }
 
@@ -1104,6 +1130,7 @@ pub const ToolCallParser = struct {
     const CLOSE_HY4 = "</tool_call:opensource>";
     const WRAP_HY4_OPEN = "<tool_calls:opensource>";
     const WRAP_HY4_CLOSE = "</tool_calls:opensource>";
+    const INKLING_MODEL_TAG = "<|message_model|>";
     const INKLING_TEXT_TAG = "<|content_text|>";
     const INKLING_EOS_TAG = "<|content_model_end_sampling|>";
     const MAX_TAG_LEN: usize = 32;
@@ -1120,6 +1147,7 @@ pub const ToolCallParser = struct {
         streaming_args = 2,
         inside_tail = 3,
         inside_hy4_xml = 4,
+        inkling_header = 5,
     };
 
     dialect: chat_template.Dialect = .chatml,
@@ -1127,6 +1155,9 @@ pub const ToolCallParser = struct {
     mode: Mode = .outside,
     pending: [MAX_TAG_LEN]u8 = undefined,
     pending_len: u8 = 0,
+    header_buf: [MAX_TOOL_NAME_BYTES]u8 = undefined,
+    header_len: u8 = 0,
+    has_header_name: bool = false,
     preamble_buf: [512]u8 = undefined,
     preamble_len: u16 = 0,
     hy4_buf: [2048]u8 = undefined,
@@ -1154,6 +1185,8 @@ pub const ToolCallParser = struct {
         self.active_format = .qwen;
         self.mode = .outside;
         self.pending_len = 0;
+        self.header_len = 0;
+        self.has_header_name = false;
         self.preamble_len = 0;
         self.hy4_len = 0;
         self.name_len = 0;
@@ -1205,6 +1238,7 @@ pub const ToolCallParser = struct {
         open_qwen,
         open_inkling,
         open_hy4,
+        inkling_model,
         strip_tag,
     } {
         if (std.mem.eql(u8, cand, OPEN_TAG)) return .open_qwen;
@@ -1214,6 +1248,7 @@ pub const ToolCallParser = struct {
         const strip_hy4 = (self.dialect == .hy4);
         const strip_ink = (self.dialect == .inkling2);
         if (strip_hy4 and (std.mem.eql(u8, cand, WRAP_HY4_OPEN) or std.mem.eql(u8, cand, WRAP_HY4_CLOSE))) return .strip_tag;
+        if (strip_ink and std.mem.eql(u8, cand, INKLING_MODEL_TAG)) return .inkling_model;
         if (strip_ink and (std.mem.eql(u8, cand, INKLING_TEXT_TAG) or std.mem.eql(u8, cand, INKLING_EOS_TAG) or std.mem.eql(u8, cand, CLOSE_INKLING))) return .strip_tag;
 
         if ((cand.len < OPEN_TAG.len and std.mem.startsWith(u8, OPEN_TAG, cand)) or
@@ -1221,7 +1256,8 @@ pub const ToolCallParser = struct {
             (cand.len < OPEN_HY4.len and std.mem.startsWith(u8, OPEN_HY4, cand)) or
             (strip_hy4 and ((cand.len < WRAP_HY4_OPEN.len and std.mem.startsWith(u8, WRAP_HY4_OPEN, cand)) or
                 (cand.len < WRAP_HY4_CLOSE.len and std.mem.startsWith(u8, WRAP_HY4_CLOSE, cand)))) or
-            (strip_ink and ((cand.len < INKLING_TEXT_TAG.len and std.mem.startsWith(u8, INKLING_TEXT_TAG, cand)) or
+            (strip_ink and ((cand.len < INKLING_MODEL_TAG.len and std.mem.startsWith(u8, INKLING_MODEL_TAG, cand)) or
+                (cand.len < INKLING_TEXT_TAG.len and std.mem.startsWith(u8, INKLING_TEXT_TAG, cand)) or
                 (cand.len < INKLING_EOS_TAG.len and std.mem.startsWith(u8, INKLING_EOS_TAG, cand)) or
                 (cand.len < CLOSE_INKLING.len and std.mem.startsWith(u8, CLOSE_INKLING, cand)))))
         {
@@ -1236,7 +1272,22 @@ pub const ToolCallParser = struct {
         self.mode = if (fmt == .hy4) .inside_hy4_xml else .inside_preamble;
         self.preamble_len = 0;
         self.hy4_len = 0;
-        self.name_len = 0;
+        if (fmt == .inkling2 and self.header_len > 0) {
+            const trimmed = std.mem.trim(u8, self.header_buf[0..self.header_len], " \t\r\n");
+            if (trimmed.len > 0) {
+                const nlen = @min(trimmed.len, self.name_buf.len);
+                @memcpy(self.name_buf[0..nlen], trimmed[0..nlen]);
+                self.name_len = @intCast(nlen);
+                self.has_header_name = true;
+            } else {
+                self.name_len = 0;
+                self.has_header_name = false;
+            }
+        } else {
+            self.name_len = 0;
+            self.has_header_name = false;
+        }
+        self.header_len = 0;
         self.args_is_string = false;
         self.args_brace_depth = 0;
         self.args_in_string = false;
@@ -1253,7 +1304,42 @@ pub const ToolCallParser = struct {
     ) !void {
         var i: usize = 0;
         while (i < chunk.len) {
-            if (self.mode == .outside) {
+            if (self.mode == .inkling_header and self.pending_len == 0) {
+                if (std.mem.indexOfScalarPos(u8, chunk, i, '<')) |lt| {
+                    const seg = chunk[i..lt];
+                    if (self.header_len + seg.len <= self.header_buf.len) {
+                        @memcpy(self.header_buf[self.header_len..][0..seg.len], seg);
+                        self.header_len += @intCast(seg.len);
+                        self.pending[0] = '<';
+                        self.pending_len = 1;
+                        i = lt + 1;
+                    } else {
+                        const prev_h = self.header_buf[0..self.header_len];
+                        self.header_len = 0;
+                        self.mode = .outside;
+                        if (prev_h.len > 0) try emit_fn(ctx, ToolCallStreamEvent{ .text = prev_h });
+                        if (seg.len > 0) try emit_fn(ctx, ToolCallStreamEvent{ .text = seg });
+                        self.pending[0] = '<';
+                        self.pending_len = 1;
+                        i = lt + 1;
+                    }
+                } else {
+                    const seg = chunk[i..];
+                    if (self.header_len + seg.len <= self.header_buf.len) {
+                        @memcpy(self.header_buf[self.header_len..][0..seg.len], seg);
+                        self.header_len += @intCast(seg.len);
+                        return;
+                    }
+                    const prev_h = self.header_buf[0..self.header_len];
+                    self.header_len = 0;
+                    self.mode = .outside;
+                    if (prev_h.len > 0) try emit_fn(ctx, ToolCallStreamEvent{ .text = prev_h });
+                    if (seg.len > 0) try emit_fn(ctx, ToolCallStreamEvent{ .text = seg });
+                    return;
+                }
+                continue;
+            }
+            if (self.mode == .outside or self.mode == .inkling_header) {
                 if (self.pending_len == 0) {
                     if (std.mem.indexOfScalarPos(u8, chunk, i, '<')) |lt| {
                         if (lt > i) {
@@ -1288,17 +1374,37 @@ pub const ToolCallParser = struct {
                                 i += 1;
                                 self.beginOpenToolCall(.hy4);
                             },
+                            .inkling_model => {
+                                self.pending_len = 0;
+                                self.header_len = 0;
+                                self.mode = .inkling_header;
+                                i += 1;
+                            },
                             .strip_tag => {
                                 self.pending_len = 0;
+                                self.header_len = 0;
+                                self.mode = .outside;
                                 i += 1;
                             },
                             .none => {
+                                if (self.mode == .inkling_header) {
+                                    const prev_h = self.header_buf[0..self.header_len];
+                                    self.header_len = 0;
+                                    self.mode = .outside;
+                                    if (prev_h.len > 0) try emit_fn(ctx, ToolCallStreamEvent{ .text = prev_h });
+                                }
                                 const flushed = self.pending[0..self.pending_len];
                                 self.pending_len = 0;
                                 try emit_fn(ctx, ToolCallStreamEvent{ .text = flushed });
                             },
                         }
                     } else {
+                        if (self.mode == .inkling_header) {
+                            const prev_h = self.header_buf[0..self.header_len];
+                            self.header_len = 0;
+                            self.mode = .outside;
+                            if (prev_h.len > 0) try emit_fn(ctx, ToolCallStreamEvent{ .text = prev_h });
+                        }
                         const flushed = self.pending[0..self.pending_len];
                         self.pending_len = 0;
                         try emit_fn(ctx, ToolCallStreamEvent{ .text = flushed });
@@ -1354,7 +1460,7 @@ pub const ToolCallParser = struct {
         comptime emit_fn: anytype,
     ) !void {
         switch (self.mode) {
-            .outside => unreachable,
+            .outside, .inkling_header => unreachable,
             .inside_tail => {},
             .inside_hy4_xml => {
                 if (self.hy4_len < self.hy4_buf.len) {
@@ -1390,9 +1496,27 @@ pub const ToolCallParser = struct {
         if (self.name_len == 0) return;
 
         // Locate `"arguments"`, `"args"` (Inkling 2), or `"input"` key followed by `:` and first value byte!
-        const val_pos = findJsonFieldValueStart(buf, "arguments") orelse
+        var val_pos_opt = findJsonFieldValueStart(buf, "arguments") orelse
             findJsonFieldValueStart(buf, "args") orelse
-            findJsonFieldValueStart(buf, "input") orelse return;
+            findJsonFieldValueStart(buf, "input");
+        if (val_pos_opt == null and self.active_format == .inkling2 and self.has_header_name) {
+            // Inkling 2 recipient-header form: `<|message_model|>{tool_name}<|content_invoke_tool_json|>{"city":"Tokyo"}<|end_message|>`
+            // When the first JSON key is NOT `"name"`/`"args"`/`"arguments"`/`"input"`, stream the raw JSON object directly!
+            const trimmed_start = std.mem.indexOfScalar(u8, buf, '{');
+            if (trimmed_start) |brace_pos| {
+                const rest = buf[brace_pos + 1 ..];
+                if (std.mem.indexOfScalar(u8, rest, ':') != null or std.mem.indexOfScalar(u8, rest, '}') != null) {
+                    const has_wrapper_key = (findJsonFieldValueStart(buf, "name") != null) or
+                        (std.mem.indexOf(u8, rest, "\"args\"") != null) or
+                        (std.mem.indexOf(u8, rest, "\"arguments\"") != null) or
+                        (std.mem.indexOf(u8, rest, "\"input\"") != null);
+                    if (!has_wrapper_key) {
+                        val_pos_opt = brace_pos;
+                    }
+                }
+            }
+        }
+        const val_pos = val_pos_opt orelse return;
         if (val_pos >= buf.len) return;
 
         const first_b = buf[val_pos];
@@ -1613,9 +1737,10 @@ pub const ToolCallParser = struct {
             return;
         }
         if (self.mode == .inside_preamble) {
-            // Arguments omitted (`{"name": "ping"}`): still emit a valid `{}` tool call if name found!
+            const raw_pre = std.mem.trim(u8, self.preamble_buf[0..self.preamble_len], " \t\r\n");
+            // Arguments omitted (`{"name": "ping"}`) or raw Inkling 2 header-named args (`{"city":"Tokyo"}`):
             if (self.name_len == 0) {
-                if (findJsonStringField(self.preamble_buf[0..self.preamble_len], "name", &self.name_buf)) |ns| {
+                if (findJsonStringField(raw_pre, "name", &self.name_buf)) |ns| {
                     self.name_len = @intCast(ns.len);
                 }
             }
@@ -1628,10 +1753,14 @@ pub const ToolCallParser = struct {
                     .id = call_id,
                     .name = self.nameSlice(),
                 } });
+                const raw_args: []const u8 = if (self.active_format == .inkling2 and self.has_header_name and raw_pre.len > 0 and raw_pre[0] == '{')
+                    raw_pre
+                else
+                    "{}";
                 try emit_fn(ctx, ToolCallStreamEvent{ .tool_args_delta = .{
                     .index = self.active_index,
                     .id = call_id,
-                    .delta = "{}",
+                    .delta = raw_args,
                 } });
                 try emit_fn(ctx, ToolCallStreamEvent{ .tool_end = .{
                     .index = self.active_index,
@@ -1640,6 +1769,7 @@ pub const ToolCallParser = struct {
                 } });
             }
             self.preamble_len = 0;
+            self.has_header_name = false;
             return;
         }
 
@@ -1658,6 +1788,7 @@ pub const ToolCallParser = struct {
             } });
         }
         self.args_started = false;
+        self.has_header_name = false;
         self.preamble_len = 0;
     }
 
@@ -1666,6 +1797,20 @@ pub const ToolCallParser = struct {
         ctx: anytype,
         comptime emit_fn: anytype,
     ) !void {
+        if (self.mode == .inkling_header) {
+            if (self.header_len > 0) {
+                const fl_h = self.header_buf[0..self.header_len];
+                self.header_len = 0;
+                try emit_fn(ctx, ToolCallStreamEvent{ .text = fl_h });
+            }
+            if (self.pending_len > 0) {
+                const fl = self.pending[0..self.pending_len];
+                self.pending_len = 0;
+                try emit_fn(ctx, ToolCallStreamEvent{ .text = fl });
+            }
+            self.mode = .outside;
+            return;
+        }
         if (self.mode == .outside) {
             if (self.pending_len > 0) {
                 const fl = self.pending[0..self.pending_len];
@@ -2854,6 +2999,7 @@ fn parseMessageContentForTemplate(
     scratch: []u8,
     scratch_pos: *usize,
     signature_key: ?*const [32]u8,
+    signature_model_id: []const u8,
     out_cache_control: *bool,
 ) ParseError!void {
     var r = JsonReader{ .src = content_json };
@@ -2958,7 +3104,7 @@ fn parseMessageContentForTemplate(
             if (signature_key) |key| {
                 const sr = sig_raw orelse return error.InvalidFieldValue;
                 const sig_txt = try unescapeQuotedJson(sr, scratch, scratch_pos);
-                if (!verifyThinkingSignature(key, th_txt, sig_txt)) {
+                if (!verifyThinkingSignature(key, signature_model_id, th_txt, sig_txt)) {
                     return error.InvalidFieldValue;
                 }
             }
@@ -3114,6 +3260,7 @@ fn renderProtocolToTemplate(
     preserved_thinking: ?bool,
     unescape_scratch: ?[]u8,
     signature_key: ?*const [32]u8,
+    signature_model_id: []const u8,
     out_cache_control: *bool,
 ) ParseError!struct { prompt_len: usize, last_user_msg_byte_offset: ?usize, starts_in_think: bool } {
     var stack_scratch: [32 * 1024]u8 = undefined;
@@ -3217,6 +3364,7 @@ fn renderProtocolToTemplate(
             scratch,
             &scratch_pos,
             signature_key,
+            signature_model_id,
             out_cache_control,
         );
         renderer.pushMessage(.{
@@ -3374,6 +3522,7 @@ fn renderProtocolToTemplate(
                             scratch,
                             &scratch_pos,
                             signature_key,
+                            signature_model_id,
                             out_cache_control,
                         );
                     }
@@ -4135,6 +4284,7 @@ pub fn parseInferenceRequestWithTemplate(
         kw_preserved_thinking,
         unescape_scratch,
         signature_key,
+        model_buf[0..model_len],
         &cache_control_pin,
     );
     const starts_in_think = rendered.starts_in_think;
@@ -5310,6 +5460,14 @@ pub const TokenStream = struct {
         return self.emitBytes(bytes, 1);
     }
 
+    /// Emits a zero-token-count synthetic dialect control delimiter (e.g. closing
+    /// `</think>` injected into the model's KV state after `thinking_budget_tokens`
+    /// cutoff) so the network-side `ThinkSplitter` transitions cleanly to `.content`
+    /// without inflating `completion_tokens` or skewing `TTFT`/`TPOT`.
+    pub fn emitControlBytes(self: *TokenStream, bytes: []const u8) bool {
+        return self.emitBytes(bytes, 0);
+    }
+
     /// Convenience wrapper for emitting already-valid UTF-8 text.
     pub fn emitText(self: *TokenStream, text: []const u8, token_delta: u32) bool {
         return self.emitBytes(text, token_delta);
@@ -5977,6 +6135,14 @@ pub const Server = struct {
 
     pub fn setTbPeers(self: *Server, peers: u32) void {
         self.tb_peers.store(peers, .release);
+    }
+
+    /// Lock-free query used by continuous-batching workers (`BatchServeRunner`)
+    /// to check whether `slot_id` has exceeded its `thinking_budget_tokens` and
+    /// requires injecting the dialect thinking-close delimiter into KV state.
+    pub fn isBatchSlotThinkingBudgetExceeded(self: *const Server, slot_id: u16) bool {
+        if (slot_id >= batch_sched.MAX_BATCH_SLOTS) return false;
+        return self.batch_slot_streams[slot_id].thinkingBudgetExceeded();
     }
 
     pub fn setTokenizer(self: *Server, tok: ?*const tokenizer_mod.Tokenizer) void {
@@ -8204,7 +8370,7 @@ pub const Server = struct {
         slot.thinking_budget_exhausted = false;
         slot.reasoning_summary = parsed.reasoning_summary;
         slot.template_dialect = parsed.template_dialect;
-        slot.thinking_hmac = HmacSha256.init(&self.signature_key);
+        slot.thinking_hmac = initThinkingHmac(&self.signature_key, slot.modelSlice());
         slot.anthropic_block_had_delta = false;
         slot.sent_first_chunk = false;
         slot.preamble_sent = false;
@@ -8447,17 +8613,16 @@ pub const Server = struct {
                     }
                 },
                 .token_text => {
-                    if (slot.first_generated_token_ns == 0) {
-                        slot.first_generated_token_ns = if (ev.timestamp_ns != 0) ev.timestamp_ns else monotonicNowNs();
+                    const text = ev.textSlice();
+                    if (ev.token_count > 0) {
+                        slot.completion_tokens +|= ev.token_count;
+                        if (text.len > 0 and slot.first_generated_token_ns == 0) {
+                            slot.first_generated_token_ns = if (ev.timestamp_ns != 0) ev.timestamp_ns else monotonicNowNs();
+                        }
                     }
-                    if (slot.first_token_ns == 0) {
-                        slot.first_token_ns = slot.first_generated_token_ns;
-                    }
-                    slot.completion_tokens +|= ev.token_count;
                     if (slot.stream) {
                         self.ensureStreamPreamble(slot);
                     }
-                    const text = ev.textSlice();
                     if (text.len > 0) {
                         self.feedSlotText(slot, text, ev.token_count);
                         if (slot.stop_holdback.stopped) {
@@ -8472,9 +8637,6 @@ pub const Server = struct {
                 },
                 .finished => {
                     if (ev.token_count > 0) slot.prompt_tokens = ev.token_count;
-                    if (slot.first_generated_token_ns == 0 and slot.first_token_ns == 0) {
-                        slot.first_token_ns = monotonicNowNs();
-                    }
                     const final_reason: FinishReason = if (slot.stop_holdback.stopped)
                         .stop_sequence
                     else
@@ -8581,10 +8743,12 @@ pub const Server = struct {
         channel: StreamChannel,
         span: []const u8,
     ) error{BufferTooSmall}!void {
-        if (slot.first_emitted_ns == 0) {
-            slot.first_emitted_ns = monotonicNowNs();
-        }
         if (channel == .reasoning) {
+            if (span.len > 0 and slot.first_emitted_ns == 0) {
+                const now = monotonicNowNs();
+                slot.first_emitted_ns = now;
+                if (slot.first_token_ns == 0) slot.first_token_ns = now;
+            }
             slot.thinking_hmac.update(span);
             self.appendNonStreamSpan(slot, .reasoning, span);
             if (slot.stream) {
@@ -8612,12 +8776,22 @@ pub const Server = struct {
         switch (tev) {
             .text => |txt| {
                 if (txt.len == 0) return;
+                if (slot.first_emitted_ns == 0) {
+                    const now = monotonicNowNs();
+                    slot.first_emitted_ns = now;
+                    if (slot.first_token_ns == 0) slot.first_token_ns = now;
+                }
                 self.appendNonStreamSpan(slot, .content, txt);
                 if (slot.stream) {
                     try self.appendStreamDelta(slot, .content, txt);
                 }
             },
             .tool_start => |st| {
+                if (slot.first_emitted_ns == 0) {
+                    const now = monotonicNowNs();
+                    slot.first_emitted_ns = now;
+                    if (slot.first_token_ns == 0) slot.first_token_ns = now;
+                }
                 if (slot.stored_tool_call_count < MAX_STORED_TOOL_CALLS) {
                     const dst = &slot.stored_tool_calls[slot.stored_tool_call_count];
                     const il = @min(st.id.len, dst.id_buf.len);
@@ -8840,7 +9014,7 @@ pub const Server = struct {
                 "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{s}\"}}}}\n\n",
                 .{ slot.anthropic_block_idx, sig_hex[0..] },
             );
-            slot.thinking_hmac = HmacSha256.init(&self.signature_key);
+            slot.thinking_hmac = initThinkingHmac(&self.signature_key, slot.modelSlice());
         }
         try w.print(
             "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{d}}}\n\n",
@@ -9215,32 +9389,36 @@ pub const Server = struct {
     };
 
     fn computeTimings(slot: *const ConnectionSlot, end_ns: u64) Timings {
-        const first_gen_ns = if (slot.first_generated_token_ns > 0)
-            slot.first_generated_token_ns
-        else if (slot.first_token_ns > 0)
-            slot.first_token_ns
-        else if (slot.first_emitted_ns > 0)
-            slot.first_emitted_ns
+        const ttft_ms: f64 = if (slot.first_emitted_ns > 0)
+            @as(f64, @floatFromInt(slot.first_emitted_ns -| slot.admit_ns)) / 1_000_000.0
         else
-            end_ns;
-        const ttft_ns = first_gen_ns -| slot.admit_ns;
-        const ttft_ms = @as(f64, @floatFromInt(ttft_ns)) / 1_000_000.0;
+            0.0;
 
         if (slot.completion_tokens > 1) {
-            const decode_ns = end_ns -| first_gen_ns;
-            if (decode_ns > 0) {
-                const denom = @as(f64, @floatFromInt(slot.completion_tokens - 1));
-                const decode_s = @as(f64, @floatFromInt(decode_ns)) / 1_000_000_000.0;
-                return .{
-                    .ttft_ms = ttft_ms,
-                    .tpot_ms = (decode_s * 1000.0) / denom,
-                    .tok_per_s = denom / decode_s,
-                };
+            const gen_anchor: u64 = if (slot.first_generated_token_ns > 0)
+                slot.first_generated_token_ns
+            else if (slot.prefill_done_ns > 0)
+                slot.prefill_done_ns
+            else
+                0;
+            if (gen_anchor > 0) {
+                const decode_ns = end_ns -| gen_anchor;
+                if (decode_ns > 0) {
+                    const denom = @as(f64, @floatFromInt(slot.completion_tokens - 1));
+                    const decode_s = @as(f64, @floatFromInt(decode_ns)) / 1_000_000_000.0;
+                    return .{
+                        .ttft_ms = ttft_ms,
+                        .tpot_ms = (decode_s * 1000.0) / denom,
+                        .tok_per_s = denom / decode_s,
+                    };
+                }
             }
         }
         if (slot.completion_tokens >= 1) {
             const decode_anchor = if (slot.prefill_done_ns > 0 and slot.prefill_done_ns <= end_ns)
                 slot.prefill_done_ns
+            else if (slot.first_generated_token_ns > 0 and slot.first_generated_token_ns <= end_ns)
+                slot.first_generated_token_ns
             else
                 slot.admit_ns;
             const total_ns = end_ns -| decode_anchor;
@@ -9699,7 +9877,7 @@ pub const Server = struct {
                     var need_comma = false;
                     if (reasoning.len > 0) {
                         var sig_hex: [64]u8 = undefined;
-                        const sig = computeThinkingSignature(&self.signature_key, reasoning, &sig_hex);
+                        const sig = computeThinkingSignature(&self.signature_key, slot.modelSlice(), reasoning, &sig_hex);
                         bw.writeAll("{\"type\":\"thinking\",\"thinking\":\"") catch break :blk false;
                         bw.writeJsonEscaped(reasoning) catch break :blk false;
                         bw.writeAll("\",\"signature\":\"") catch break :blk false;
@@ -9932,6 +10110,22 @@ fn testHttpPostJson(port: u16, path: []const u8, json_body: []const u8, req_buf:
     w.print(
         "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ path, json_body.len, json_body },
+    ) catch return error.BufferTooSmall;
+    return testHttpExchange(port, w.written(), resp_buf);
+}
+
+fn testHttpPostJsonWithHeaders(
+    port: u16,
+    path: []const u8,
+    extra_headers: []const u8,
+    json_body: []const u8,
+    req_buf: []u8,
+    resp_buf: []u8,
+) TestClientError![]const u8 {
+    var w = FixedWriter.init(req_buf);
+    w.print(
+        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\n{s}Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ path, extra_headers, json_body.len, json_body },
     ) catch return error.BufferTooSmall;
     return testHttpExchange(port, w.written(), resp_buf);
 }
@@ -12568,6 +12762,8 @@ test "W24 (a)+(b) reasoning_effort, chat_template_kwargs, contradiction 400 reje
     const ink_json = extractHttpBody(ink_resp) orelse return error.TestUnexpectedResult;
     try expectValidJson(ink_json);
     try std.testing.expect(std.mem.indexOf(u8, ink_json, "\"reasoning_content\":\"plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ink_json, "\"content\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ink_json, "<|message_model|>") == null);
     try std.testing.expect(std.mem.indexOf(u8, ink_json, "\"name\":\"get_weather\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ink_json, "Tokyo") != null);
     try std.testing.expect(std.mem.indexOf(u8, ink_json, "\"finish_reason\":\"tool_calls\"") != null);
@@ -13157,4 +13353,208 @@ test "C18 (k)+(l) http_read_timeout_ms 408 across headers/Content-Length/chunked
         try std.testing.expectEqual(@as(usize, 0), eof_tail.len);
         try std.testing.expectEqual(before_cancels, srv.stats().cancelled_count);
     }
+}
+
+test "C18 M8.1 hardening: Inkling2 recipient-header tool call, model_id-bound HMAC, and zero-output TTFT" {
+    const gpa = std.testing.allocator;
+
+    // 1. Model-bound HMAC-SHA256 prevents cross-model signature replay sharing `--api-key`.
+    var key: [32]u8 = @splat(0x42);
+    var sig_a: [64]u8 = undefined;
+    const s_a = computeThinkingSignature(&key, "model-a", "chain of thought", &sig_a);
+    try std.testing.expect(verifyThinkingSignature(&key, "model-a", "chain of thought", s_a));
+    try std.testing.expect(!verifyThinkingSignature(&key, "model-b", "chain of thought", s_a));
+    try std.testing.expect(!verifyThinkingSignature(&key, "model-a", "tampered", s_a));
+
+    // HTTP-level cross-model replay rejection (shared api_key, different model_id -> 400).
+    const EchoMock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(4);
+            _ = stream.emitTokenBytes("<think>secret thought</think>answer");
+            stream.finish(.stop, 4);
+        }
+    };
+    var dummy: u8 = 0;
+    const srv_a = try Server.init(gpa, .{ .port = 0, .model_id = "model-a", .api_key = "shared-key", .apply_qos = false });
+    defer srv_a.deinit(gpa);
+    try srv_a.start(.{ .ctx = &dummy, .generateFn = EchoMock.generate });
+    defer srv_a.stop();
+
+    const srv_b = try Server.init(gpa, .{ .port = 0, .model_id = "model-b", .api_key = "shared-key", .apply_qos = false });
+    defer srv_b.deinit(gpa);
+    try srv_b.start(.{ .ctx = &dummy, .generateFn = EchoMock.generate });
+    defer srv_b.stop();
+
+    var req_buf: [4096]u8 = undefined;
+    var resp_buf: [16 * 1024]u8 = undefined;
+
+    // Turn 1 on model-a produces a valid model-a signature.
+    const r_a = try testHttpPostJsonWithHeaders(
+        srv_a.boundPort(),
+        "/v1/messages",
+        "x-api-key: shared-key\r\n",
+        "{\"model\":\"model-a\",\"max_tokens\":32,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":16},\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r_a, "HTTP/1.1 200 OK\r\n"));
+    const body_a = extractHttpBody(r_a) orelse return error.TestUnexpectedResult;
+    const sig_marker = "\"signature\":\"";
+    const sig_pos = (std.mem.indexOf(u8, body_a, sig_marker) orelse return error.TestUnexpectedResult) + sig_marker.len;
+    const sig_from_a = body_a[sig_pos .. sig_pos + 64];
+    var saved_sig: [64]u8 = undefined;
+    @memcpy(&saved_sig, sig_from_a);
+
+    var replay_body_buf: [1024]u8 = undefined;
+    const replay_a_json = try std.fmt.bufPrint(
+        &replay_body_buf,
+        "{{\"model\":\"model-a\",\"max_tokens\":16,\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}},{{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"secret thought\",\"signature\":\"{s}\"}},{{\"type\":\"text\",\"text\":\"answer\"}}]}},{{\"role\":\"user\",\"content\":\"next\"}}]}}",
+        .{saved_sig[0..]},
+    );
+    const ok_replay = try testHttpPostJsonWithHeaders(
+        srv_a.boundPort(),
+        "/v1/messages",
+        "x-api-key: shared-key\r\n",
+        replay_a_json,
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, ok_replay, "HTTP/1.1 200 OK\r\n"));
+
+    const replay_b_json = try std.fmt.bufPrint(
+        &replay_body_buf,
+        "{{\"model\":\"model-b\",\"max_tokens\":16,\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}},{{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"secret thought\",\"signature\":\"{s}\"}},{{\"type\":\"text\",\"text\":\"answer\"}}]}},{{\"role\":\"user\",\"content\":\"next\"}}]}}",
+        .{saved_sig[0..]},
+    );
+    const bad_replay = try testHttpPostJsonWithHeaders(
+        srv_b.boundPort(),
+        "/v1/messages",
+        "x-api-key: shared-key\r\n",
+        replay_b_json,
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, bad_replay, "HTTP/1.1 400 Bad Request\r\n"));
+
+    // 2. Inkling 2 `<|message_model|>{tool_name}<|content_invoke_tool_json|>{args}` leaves `content:null`!
+    const InkHeaderMock = struct {
+        fn generate(_: *anyopaque, _: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(6);
+            const parts = [_][]const u8{
+                "<|message_model|><|content_thinking|>check<|end_message|>",
+                "<|message_model|>get_wea",
+                "ther<|content_invoke_tool_json|>{\"city\":\"Osaka\"}<|end_message|><|content_model_end_sampling|>",
+            };
+            for (parts) |p| _ = stream.emitTokenBytes(p);
+            stream.finish(.stop, 6);
+        }
+    };
+    const srv_ink = try Server.init(gpa, .{
+        .port = 0,
+        .model_id = "inkling-2",
+        .chat_template = chat_template.ChatTemplate.preset(.inkling2),
+        .apply_qos = false,
+    });
+    defer srv_ink.deinit(gpa);
+    try srv_ink.start(.{ .ctx = &dummy, .generateFn = InkHeaderMock.generate });
+    defer srv_ink.stop();
+
+    const r_ink = try testHttpPostJson(
+        srv_ink.boundPort(),
+        "/v1/chat/completions",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Osaka?\"}],\"stream\":false}",
+        &req_buf,
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.startsWith(u8, r_ink, "HTTP/1.1 200 OK\r\n"));
+    const j_ink = extractHttpBody(r_ink) orelse return error.TestUnexpectedResult;
+    try expectValidJson(j_ink);
+    try std.testing.expect(std.mem.indexOf(u8, j_ink, "\"content\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j_ink, "\"reasoning_content\":\"check\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j_ink, "\"name\":\"get_weather\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j_ink, "Osaka") != null);
+
+    // 3. `computeTimings` & live TTFT regression: immediate EOS, empty chunk, and stop-buffered zero visible output.
+    const TimingMock = struct {
+        fn generate(_: *anyopaque, job: *const InferenceJob, stream: *TokenStream) void {
+            _ = stream.setPromptTokens(5);
+            if (std.mem.indexOf(u8, job.prompt, "IMMEDIATE_EOS") != null) {
+                // Sleep briefly so `end_ns - admit_ns > 5 ms`: TTFT must still be 0.000!
+                var ts = std.c.timespec{ .sec = 0, .nsec = 10 * 1_000_000 };
+                _ = std.c.nanosleep(&ts, null);
+                stream.finish(.stop, 5);
+                return;
+            }
+            if (std.mem.indexOf(u8, job.prompt, "STOP_ZERO_VIS") != null) {
+                var ts = std.c.timespec{ .sec = 0, .nsec = 10 * 1_000_000 };
+                _ = std.c.nanosleep(&ts, null);
+                _ = stream.emitTokenBytes("HALT");
+                stream.finish(.stop, 5);
+                return;
+            }
+            // Empty chunk followed by 25ms pause then visible token: TTFT must reflect visible token (>= 20ms)!
+            _ = stream.emitBytes("", 1);
+            var ts = std.c.timespec{ .sec = 0, .nsec = 25 * 1_000_000 };
+            _ = std.c.nanosleep(&ts, null);
+            _ = stream.emitTokenBytes("hello");
+            stream.finish(.stop, 5);
+        }
+    };
+    const srv_t = try Server.init(gpa, .{ .port = 0, .model_id = "timing-test", .apply_qos = false });
+    defer srv_t.deinit(gpa);
+    try srv_t.start(.{ .ctx = &dummy, .generateFn = TimingMock.generate });
+    defer srv_t.stop();
+
+    // 3a. Immediate EOS (0 generated tokens): ttft_ms == 0.000, tpot_ms == 0.000
+    const r_eos = try testHttpPostJson(
+        srv_t.boundPort(),
+        "/v1/chat/completions",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"IMMEDIATE_EOS\"}],\"stream\":false}",
+        &req_buf,
+        &resp_buf,
+    );
+    const j_eos = extractHttpBody(r_eos) orelse return error.TestUnexpectedResult;
+    try expectValidJson(j_eos);
+    try std.testing.expect(std.mem.indexOf(u8, j_eos, "\"ttft_ms\":0.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, j_eos, "\"tpot_ms\":0.000") != null);
+
+    // 3b. Stop-sequence buffered zero visible output: ttft_ms == 0.000
+    const r_stop = try testHttpPostJson(
+        srv_t.boundPort(),
+        "/v1/chat/completions",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"STOP_ZERO_VIS\"}],\"stop\":[\"HALT\"],\"stream\":false}",
+        &req_buf,
+        &resp_buf,
+    );
+    const j_stop = extractHttpBody(r_stop) orelse return error.TestUnexpectedResult;
+    try expectValidJson(j_stop);
+    try std.testing.expect(std.mem.indexOf(u8, j_stop, "\"ttft_ms\":0.000") != null);
+
+    // 3c. Empty chunk before 25ms-delayed visible text: ttft_ms >= 20.0ms (NOT skewed by empty chunk!)
+    const r_emp = try testHttpPostJson(
+        srv_t.boundPort(),
+        "/v1/chat/completions",
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"EMPTY_THEN_TEXT\"}],\"stream\":false}",
+        &req_buf,
+        &resp_buf,
+    );
+    const j_emp = extractHttpBody(r_emp) orelse return error.TestUnexpectedResult;
+    try expectValidJson(j_emp);
+    const ttft_tag = "\"ttft_ms\":";
+    const tpos = (std.mem.indexOf(u8, j_emp, ttft_tag) orelse return error.TestUnexpectedResult) + ttft_tag.len;
+    const tend = std.mem.indexOfAnyPos(u8, j_emp, tpos, ",}") orelse return error.TestUnexpectedResult;
+    const measured_ttft = try std.fmt.parseFloat(f64, j_emp[tpos..tend]);
+    try std.testing.expect(measured_ttft >= 20.0);
+
+    // 3d. Direct `computeTimings` unit check: `max_tokens == 0` / zero emitted bytes yields `ttft_ms == 0.0`.
+    var zero_slot: ConnectionSlot = undefined;
+    zero_slot.admit_ns = 1_000_000;
+    zero_slot.prefill_done_ns = 12_000_000;
+    zero_slot.first_emitted_ns = 0;
+    zero_slot.first_generated_token_ns = 0;
+    zero_slot.completion_tokens = 0;
+    const zt = Server.computeTimings(&zero_slot, 25_000_000);
+    try std.testing.expectEqual(@as(f64, 0.0), zt.ttft_ms);
+    try std.testing.expectEqual(@as(f64, 0.0), zt.tpot_ms);
+    try std.testing.expectEqual(@as(f64, 0.0), zt.tok_per_s);
 }

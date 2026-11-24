@@ -974,6 +974,64 @@ pub const ChatTemplate = struct {
         };
     }
 
+    /// Returns `true` when `tok_text` is a dialect structural control tag (thinking,
+    /// tool call, or assistant message framing) that must pass through `isSpecialToken`
+    /// filtering into `ThinkSplitter`, `ToolCallParser`, or `StreamTagClassifier`.
+    /// Note: EOS stop tokens (`<|im_end|>`, `<|content_model_end_sampling|>`, etc.)
+    /// are checked before special-token filtering by `isStopToken`.
+    pub fn isStructuralControlToken(self: *const ChatTemplate, tok_text: []const u8) bool {
+        if (tok_text.len == 0) return false;
+        const trimmed = std.mem.trim(u8, tok_text, "\r\n");
+        if (trimmed.len == 0) return false;
+        const eq = struct {
+            fn matches(a: []const u8, b: []const u8) bool {
+                const bt = std.mem.trim(u8, b, "\r\n");
+                return bt.len > 0 and std.mem.eql(u8, a, bt);
+            }
+        }.matches;
+        if (eq(trimmed, self.thinking.open_tag.slice()) or
+            eq(trimmed, self.thinking.close_tag.slice()) or
+            eq(trimmed, self.tool_calling.call_open.slice()) or
+            eq(trimmed, self.tool_calling.call_close.slice()) or
+            eq(trimmed, self.role_tokens.header_assistant.slice()) or
+            eq(trimmed, self.role_tokens.content_text_tag.slice()) or
+            eq(trimmed, self.role_tokens.end_message_tag.slice()))
+        {
+            return true;
+        }
+        return switch (self.dialect) {
+            .inkling2 => std.mem.eql(u8, trimmed, "<|message_model|>") or
+                std.mem.eql(u8, trimmed, "<|content_text|>") or
+                std.mem.eql(u8, trimmed, "<|content_thinking|>") or
+                std.mem.eql(u8, trimmed, "<|content_invoke_tool_json|>") or
+                std.mem.eql(u8, trimmed, "<|end_message|>"),
+            .hy4 => std.mem.eql(u8, trimmed, "<think:opensource>") or
+                std.mem.eql(u8, trimmed, "</think:opensource>") or
+                std.mem.eql(u8, trimmed, "<tool_calls:opensource>") or
+                std.mem.eql(u8, trimmed, "</tool_calls:opensource>") or
+                std.mem.eql(u8, trimmed, "<tool_call:opensource>") or
+                std.mem.eql(u8, trimmed, "</tool_call:opensource>") or
+                std.mem.eql(u8, trimmed, "<arg_key:opensource>") or
+                std.mem.eql(u8, trimmed, "</arg_key:opensource>") or
+                std.mem.eql(u8, trimmed, "<arg_value:opensource>") or
+                std.mem.eql(u8, trimmed, "</arg_value:opensource>"),
+            .chatml, .deepseek, .custom => std.mem.eql(u8, trimmed, "<think>") or
+                std.mem.eql(u8, trimmed, "</think>") or
+                std.mem.eql(u8, trimmed, "<tool_call>") or
+                std.mem.eql(u8, trimmed, "</tool_call>"),
+        };
+    }
+
+    /// Returns the dialect-appropriate closing sequence injected into the model's
+    /// KV cache when `thinking_budget_tokens` is exhausted mid-thought (`ADR-0024` L65).
+    pub fn thinkingCloseInjection(self: *const ChatTemplate) []const u8 {
+        return switch (self.dialect) {
+            .inkling2 => "<|end_message|><|message_model|><|content_text|>",
+            .hy4 => if (!self.thinking.close_tag.isEmpty()) self.thinking.close_tag.slice() else "</think:opensource>",
+            .chatml, .deepseek, .custom => if (!self.thinking.close_tag.isEmpty()) self.thinking.close_tag.slice() else "</think>",
+        };
+    }
+
     /// Auto-detects `ChatTemplate` preset from any duck-typed `Tokenizer` (`dialect` or `addedTokenId`).
     pub fn fromTokenizer(tok: anytype) ChatTemplate {
         const T = @TypeOf(tok.*);

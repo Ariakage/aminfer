@@ -191,6 +191,11 @@ pub const QualityGatePairResult = struct {
     max_kl: f64 = 0.0,
     greedy_rollout_steps: u32 = 0,
     greedy_rollout_matches: u32 = 0,
+    math_greedy_steps: u32 = 0,
+    math_greedy_matches: u32 = 0,
+    code_greedy_steps: u32 = 0,
+    code_greedy_matches: u32 = 0,
+    tokenizer_resolved: bool = false,
     all_finite: bool = true,
     executed: bool = false,
     status: []const u8 = "ok",
@@ -250,7 +255,7 @@ pub const QualityGateReport = struct {
         }
         if (self.file_pair) |*fp| {
             try w.print(
-                "quality_gate.real.{s:<21} status={s} mean_kl={d:.6} max_kl={d:.6} top1={d:.1}% ({d}/{d}) greedy={d}/{d} act_quant={s} finite={s}\n",
+                "quality_gate.real.{s:<21} status={s} mean_kl={d:.6} max_kl={d:.6} top1={d:.1}% ({d}/{d}) greedy={d}/{d} math={d}/{d} code={d}/{d} tok={s} act_quant={s} finite={s}\n",
                 .{
                     fp.label(),
                     fp.status,
@@ -261,6 +266,11 @@ pub const QualityGateReport = struct {
                     fp.steps_evaluated,
                     fp.greedy_rollout_matches,
                     fp.greedy_rollout_steps,
+                    fp.math_greedy_matches,
+                    fp.math_greedy_steps,
+                    fp.code_greedy_matches,
+                    fp.code_greedy_steps,
+                    if (fp.tokenizer_resolved) "resolved" else "fallback",
                     fp.act_quant.label(),
                     if (fp.all_finite) "yes" else "no",
                 },
@@ -976,7 +986,11 @@ pub fn runFileQualityGate(
         .act_quant = act_quant_policy,
         .status = "skipped_missing",
     };
-    res.setLabel("qwen3-0.6b-bf16_vs_gsq");
+    var dyn_label_buf: [64]u8 = undefined;
+    const ref_stem = std.fs.path.stem(ref_amf_path);
+    const cand_stem = std.fs.path.stem(cand_amf_path);
+    const dyn_label = std.fmt.bufPrint(&dyn_label_buf, "{s}_vs_{s}", .{ ref_stem, cand_stem }) catch ref_stem;
+    res.setLabel(dyn_label);
 
     // Check file existence cleanly before touching Metal or wired memory.
     var ref_file = amf.AmfFile.open(allocator, ref_amf_path) catch {
@@ -995,6 +1009,21 @@ pub fn runFileQualityGate(
         return res;
     };
     defer cfg_meta.deinit(allocator);
+
+    const tok_path_opt: ?[]const u8 = if (tokenizer_path) |tp| @as([]const u8, tp) else null;
+    var tok_meta_opt: ?amf.ResolvedMetadata = if (amf.resolveTokenizerJsonAlloc(
+        allocator,
+        &ref_file,
+        ref_amf_path,
+        tok_path_opt,
+    )) |tm| tm else |err| switch (err) {
+        error.OutOfMemory => {
+            ref_file.close(allocator);
+            return error.OutOfMemory;
+        },
+        else => null,
+    };
+    defer if (tok_meta_opt) |*tm| tm.deinit(allocator);
     ref_file.close(allocator);
 
     var cand_file = amf.AmfFile.open(allocator, cand_amf_path) catch {
@@ -1002,6 +1031,20 @@ pub fn runFileQualityGate(
         return res;
     };
     const cand_file_bytes = cand_file.parsed.file_size;
+    if (tok_meta_opt == null) {
+        tok_meta_opt = if (amf.resolveTokenizerJsonAlloc(
+            allocator,
+            &cand_file,
+            cand_amf_path,
+            tok_path_opt,
+        )) |tm| tm else |err| switch (err) {
+            error.OutOfMemory => {
+                cand_file.close(allocator);
+                return error.OutOfMemory;
+            },
+            else => null,
+        };
+    }
     cand_file.close(allocator);
 
     // R9 live zero-swap RAM headroom check (`>= max(ref, cand) + 1.0 GiB`).
@@ -1017,32 +1060,46 @@ pub fn runFileQualityGate(
     const steps: u32 = @max(@as(u32, 1), @min(steps_in, 16));
     const seq_cap: u32 = @min(cfg.max_position_embeddings, @max(max_seq_len, 64));
 
-    // Resolve deterministic math + code prompt tokens (via tokenizer.json if present).
-    var owned_prompt: ?[]u32 = null;
-    defer if (owned_prompt) |op| allocator.free(op);
-    const default_fallback = [_]u32{ 1, 17, 23, 42, 100 };
-    var prompt_slice: []const u32 = explicit_tokens orelse &default_fallback;
+    // Resolve deterministic multi-prompt math + code eval tokens (via explicit `-k`,
+    // embedded `__meta.tokenizer_json`, or sidecar `tokenizer.json` before fallback).
+    var owned_math_prompt: ?[]u32 = null;
+    defer if (owned_math_prompt) |op| allocator.free(op);
+    var owned_code_prompt: ?[]u32 = null;
+    defer if (owned_code_prompt) |op| allocator.free(op);
+
+    const fallback_math = [_]u32{ 1, 17, 23, 42, 100 };
+    const fallback_code = [_]u32{ 2, 11, 29, 53, 89 };
+    var math_slice: []const u32 = explicit_tokens orelse &fallback_math;
+    var code_slice: []const u32 = explicit_tokens orelse &fallback_code;
+
     if (explicit_tokens == null) {
-        if (tokenizer_path) |tp| {
-            if (readSmallFileAlloc(allocator, tp, 32 * 1024 * 1024)) |tok_bytes| {
-                defer allocator.free(tok_bytes);
-                if (tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes)) |tok_val| {
-                    var tok = tok_val;
-                    defer tok.deinit(allocator);
-                    const prompt_text = "Compute 17 * 23 = 391. Now write def fib(n):\n";
-                    var scratch = try tokenizer_mod.EncodeScratch.init(allocator, 4096);
-                    defer scratch.deinit(allocator);
-                    var ids_buf: [64]u32 = undefined;
-                    if (tok.encodeWithScratch(&scratch, prompt_text, &ids_buf)) |encoded| {
-                        if (encoded.len > 0) {
-                            const copy = try allocator.alloc(u32, encoded.len);
-                            @memcpy(copy, encoded);
-                            owned_prompt = copy;
-                            prompt_slice = copy;
-                        }
-                    } else |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => {},
+        if (tok_meta_opt) |tm| {
+            if (tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, tm.bytes)) |tok_val| {
+                var tok = tok_val;
+                defer tok.deinit(allocator);
+                res.tokenizer_resolved = true;
+                var scratch = try tokenizer_mod.EncodeScratch.init(allocator, 4096);
+                defer scratch.deinit(allocator);
+                var ids_buf: [64]u32 = undefined;
+                const math_text = "Compute 17 * 23 = ";
+                if (tok.encodeWithScratch(&scratch, math_text, &ids_buf)) |encoded| {
+                    if (encoded.len > 0) {
+                        const copy = try allocator.alloc(u32, encoded.len);
+                        @memcpy(copy, encoded);
+                        owned_math_prompt = copy;
+                        math_slice = copy;
+                    }
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                }
+                const code_text = "def fib(n):\n    if n <= 1:\n        return n\n    return ";
+                if (tok.encodeWithScratch(&scratch, code_text, &ids_buf)) |encoded| {
+                    if (encoded.len > 0) {
+                        const copy = try allocator.alloc(u32, encoded.len);
+                        @memcpy(copy, encoded);
+                        owned_code_prompt = copy;
+                        code_slice = copy;
                     }
                 } else |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -1055,13 +1112,20 @@ pub fn runFileQualityGate(
         }
     }
 
+    const math_steps: u32 = if (explicit_tokens != null or steps == 1) steps else (steps + 1) / 2;
+    const code_steps: u32 = steps - math_steps;
+    const prompt_slices = [_][]const u32{ math_slice, code_slice };
+    const prompt_steps = [_]u32{ math_steps, code_steps };
+    const prompt_count: usize = if (code_steps > 0) 2 else 1;
+
     const vocab: usize = cfg.vocab_size;
     const ref_logits_all = try allocator.alloc(f32, @as(usize, steps) * vocab);
     defer allocator.free(ref_logits_all);
     const ref_greedy = try allocator.alloc(u32, steps);
     defer allocator.free(ref_greedy);
 
-    // Phase 1: Load reference, record teacher-forced logits & greedy rollout, then DEINIT immediately!
+    // Phase 1: Load reference, record teacher-forced logits & greedy rollouts across
+    // math + code prompts, then DEINIT immediately!
     {
         var ref_model = try qwen3.Qwen3Model.loadFromFile(allocator, ref_amf_path, cfg, .{
             .max_seq_len = seq_cap,
@@ -1072,20 +1136,27 @@ pub fn runFileQualityGate(
         });
         defer ref_model.deinit(allocator);
 
-        var pos: u32 = 0;
-        var last_tok: u32 = prompt_slice[0];
-        for (prompt_slice) |tid| {
-            last_tok = try ref_model.stepDecode(tid, pos);
-            pos += 1;
-        }
-        for (0..steps) |s| {
-            const lg = ref_model.readLastLogitsF16();
-            for (0..vocab) |v| ref_logits_all[s * vocab + v] = @floatCast(lg[v]);
-            ref_greedy[s] = last_tok;
-            if (s + 1 < steps) {
-                last_tok = try ref_model.stepDecode(last_tok, pos);
+        var step_off: usize = 0;
+        for (0..prompt_count) |pi| {
+            ref_model.resetKvCache();
+            const pslice = prompt_slices[pi];
+            const psteps = prompt_steps[pi];
+            var pos: u32 = 0;
+            var last_tok: u32 = pslice[0];
+            for (pslice) |tid| {
+                last_tok = try ref_model.stepDecode(tid, pos);
                 pos += 1;
             }
+            for (0..psteps) |s| {
+                const lg = ref_model.readLastLogitsF16();
+                for (0..vocab) |v| ref_logits_all[(step_off + s) * vocab + v] = @floatCast(lg[v]);
+                ref_greedy[step_off + s] = last_tok;
+                if (s + 1 < psteps) {
+                    last_tok = try ref_model.stepDecode(last_tok, pos);
+                    pos += 1;
+                }
+            }
+            step_off += psteps;
         }
     }
 
@@ -1104,45 +1175,63 @@ pub fn runFileQualityGate(
         var sum_kl: f64 = 0.0;
         var max_kl: f64 = 0.0;
         var top1_matches: u32 = 0;
+        var greedy_matches: u32 = 0;
+        var math_matches: u32 = 0;
+        var code_matches: u32 = 0;
         var all_finite = true;
         const cand_tmp = try allocator.alloc(f32, vocab);
         defer allocator.free(cand_tmp);
 
-        var pos: u32 = 0;
-        var cand_tok: u32 = prompt_slice[0];
-        for (prompt_slice) |tid| {
-            cand_tok = try cand_model.stepDecode(tid, pos);
-            pos += 1;
-        }
-        for (0..steps) |s| {
-            const lg = cand_model.readLastLogitsF16();
-            for (0..vocab) |v| cand_tmp[v] = @floatCast(lg[v]);
-            const m = computeLogitsKlAndTop1F32(ref_logits_all[s * vocab ..][0..vocab], cand_tmp);
-            if (!m.all_finite) all_finite = false;
-            sum_kl += m.kl_divergence;
-            if (m.kl_divergence > max_kl) max_kl = m.kl_divergence;
-            if (m.top1_match) top1_matches += 1;
-            if (s + 1 < steps) {
-                cand_tok = try cand_model.stepDecode(ref_greedy[s], pos);
-                pos += 1;
-            }
-        }
+        var step_off: usize = 0;
+        for (0..prompt_count) |pi| {
+            const pslice = prompt_slices[pi];
+            const psteps = prompt_steps[pi];
 
-        // Free-running greedy rollout parity.
-        cand_model.resetKvCache();
-        pos = 0;
-        var free_tok: u32 = prompt_slice[0];
-        for (prompt_slice) |tid| {
-            free_tok = try cand_model.stepDecode(tid, pos);
-            pos += 1;
-        }
-        var greedy_matches: u32 = 0;
-        for (0..steps) |s| {
-            if (free_tok == ref_greedy[s]) greedy_matches += 1;
-            if (s + 1 < steps) {
-                free_tok = try cand_model.stepDecode(free_tok, pos);
+            // Teacher-forced KL divergence & top-1 agreement on this prompt.
+            cand_model.resetKvCache();
+            var pos: u32 = 0;
+            var cand_tok: u32 = pslice[0];
+            for (pslice) |tid| {
+                cand_tok = try cand_model.stepDecode(tid, pos);
                 pos += 1;
             }
+            for (0..psteps) |s| {
+                const lg = cand_model.readLastLogitsF16();
+                for (0..vocab) |v| cand_tmp[v] = @floatCast(lg[v]);
+                const m = computeLogitsKlAndTop1F32(ref_logits_all[(step_off + s) * vocab ..][0..vocab], cand_tmp);
+                if (!m.all_finite) all_finite = false;
+                sum_kl += m.kl_divergence;
+                if (m.kl_divergence > max_kl) max_kl = m.kl_divergence;
+                if (m.top1_match) top1_matches += 1;
+                if (s + 1 < psteps) {
+                    cand_tok = try cand_model.stepDecode(ref_greedy[step_off + s], pos);
+                    pos += 1;
+                }
+            }
+
+            // Free-running greedy rollout parity on this prompt.
+            cand_model.resetKvCache();
+            pos = 0;
+            var free_tok: u32 = pslice[0];
+            for (pslice) |tid| {
+                free_tok = try cand_model.stepDecode(tid, pos);
+                pos += 1;
+            }
+            var p_greedy: u32 = 0;
+            for (0..psteps) |s| {
+                if (free_tok == ref_greedy[step_off + s]) p_greedy += 1;
+                if (s + 1 < psteps) {
+                    free_tok = try cand_model.stepDecode(free_tok, pos);
+                    pos += 1;
+                }
+            }
+            greedy_matches += p_greedy;
+            if (pi == 0) {
+                math_matches = p_greedy;
+            } else {
+                code_matches = p_greedy;
+            }
+            step_off += psteps;
         }
 
         res.steps_evaluated = steps;
@@ -1152,6 +1241,10 @@ pub fn runFileQualityGate(
         res.max_kl = max_kl;
         res.greedy_rollout_steps = steps;
         res.greedy_rollout_matches = greedy_matches;
+        res.math_greedy_steps = math_steps;
+        res.math_greedy_matches = math_matches;
+        res.code_greedy_steps = code_steps;
+        res.code_greedy_matches = code_matches;
         res.all_finite = all_finite;
         res.executed = true;
         res.status = "ok";

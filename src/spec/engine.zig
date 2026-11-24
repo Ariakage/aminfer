@@ -877,7 +877,7 @@ const PearlRuntime = struct {
         return res;
     }
 
-    fn waitIdle(self: *PearlRuntime) void {
+    pub fn waitIdle(self: *PearlRuntime) void {
         _ = std.c.pthread_mutex_lock(&self.mutex);
         while (self.state == .running) {
             _ = std.c.pthread_cond_wait(&self.done_cond, &self.mutex);

@@ -381,6 +381,14 @@ pub const TurnStream = struct {
                 }
             },
             .content => {
+                if (self.splitter.mode == .inkling2 and
+                    (std.mem.eql(u8, span, "<|message_model|>") or
+                        std.mem.eql(u8, span, "<|content_text|>") or
+                        std.mem.eql(u8, span, "<|end_message|>") or
+                        std.mem.eql(u8, span, "<|content_model_end_sampling|>")))
+                {
+                    return;
+                }
                 if (self.dim_active) {
                     try self.out_sink.writeAll("\x1b[0m");
                     self.dim_active = false;

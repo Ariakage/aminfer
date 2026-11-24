@@ -4161,11 +4161,14 @@ const ServeRunner = struct {
     spec_engine: ?*aminfer.engine.SpecEngine,
     ngram_registry: ?*aminfer.ngram_nvme.DomainNgramRegistry,
     tok: *const aminfer.tokenizer.Tokenizer,
+    chat_template: aminfer.chat_template.ChatTemplate,
+    thinking_close_ids: [16]u32,
+    thinking_close_len: u8,
     vocab_size: u32,
     bos_token_id: ?u32,
     eos_token_id: ?u32,
     max_seq_len: u32,
-    stop_tokens: [4]u32,
+    stop_tokens: [6]u32,
     stop_token_count: usize,
     encode_scratch: aminfer.tokenizer.EncodeScratch,
     prompt_ids_buf: []u32,
@@ -4192,6 +4195,7 @@ const ServeRunner = struct {
         spec_engine: ?*aminfer.engine.SpecEngine,
         ngram_registry: ?*aminfer.ngram_nvme.DomainNgramRegistry,
         tok: *const aminfer.tokenizer.Tokenizer,
+        chat_tpl: aminfer.chat_template.ChatTemplate,
         vocab_size: u32,
         bos_token_id: ?u32,
         eos_token_id: ?u32,
@@ -4212,10 +4216,15 @@ const ServeRunner = struct {
         errdefer allocator.destroy(penalty_tracker);
         penalty_tracker.* = aminfer.sampling.DefaultPenaltyTracker.init();
 
-        var stop_tokens: [4]u32 = @splat(0);
+        var stop_tokens: [6]u32 = @splat(0);
         var stop_cnt: usize = 0;
+        const tpl_eos_id: ?u32 = blk: {
+            const s = chat_tpl.eos_token.slice();
+            break :blk if (s.len > 0) tok.addedTokenId(s) else null;
+        };
         const candidates = [_]?u32{
             eos_token_id,
+            tpl_eos_id,
             tok.addedTokenId("<|im_end|>"),
             tok.addedTokenId("<|endoftext|>"),
         };
@@ -4232,6 +4241,16 @@ const ServeRunner = struct {
                 stop_tokens[stop_cnt] = id;
                 stop_cnt += 1;
             }
+        }
+
+        // Pre-tokenize the dialect thinking-close delimiter once at startup (0 hot-path allocs).
+        var thinking_close_ids: [16]u32 = @splat(0);
+        var thinking_close_len: u8 = 0;
+        const close_str = chat_tpl.thinkingCloseInjection();
+        if (close_str.len > 0) {
+            if (tok.encodeWithScratch(&encode_scratch, close_str, &thinking_close_ids)) |ids| {
+                thinking_close_len = @intCast(ids.len);
+            } else |_| {}
         }
 
         const vocab_index: ?aminfer.grammar.VocabIndex = if (aminfer.grammar.VocabIndex.initFromTokenizer(
@@ -4264,6 +4283,9 @@ const ServeRunner = struct {
             .spec_engine = spec_engine,
             .ngram_registry = ngram_registry,
             .tok = tok,
+            .chat_template = chat_tpl,
+            .thinking_close_ids = thinking_close_ids,
+            .thinking_close_len = thinking_close_len,
             .vocab_size = vocab_size,
             .bos_token_id = bos_token_id,
             .eos_token_id = eos_token_id,
@@ -4336,8 +4358,8 @@ const ServeRunner = struct {
         ignore_eos: bool,
     ) EmitResult {
         if (!ignore_eos and self.isStopToken(tid)) return .stop;
-        if (self.tok.isSpecialToken(tid)) return .ok;
         const piece = self.tok.tokenBytes(tid) catch return .ok;
+        if (self.tok.isSpecialToken(tid) and !self.chat_template.isStructuralControlToken(piece)) return .ok;
         if (!stream.emitTokenBytes(piece)) return .cancelled;
         return .ok;
     }
@@ -4351,8 +4373,8 @@ const ServeRunner = struct {
         stop_hb: *aminfer.sampling.StopHoldback,
     ) EmitResult {
         if (!ignore_eos and self.isStopToken(tid)) return .stop;
-        if (self.tok.isSpecialToken(tid)) return .ok;
         const piece = self.tok.tokenBytes(tid) catch return .ok;
+        if (self.tok.isSpecialToken(tid) and !self.chat_template.isStructuralControlToken(piece)) return .ok;
         if (!stream.emitTokenBytes(piece)) return .cancelled;
         if (stop_cfg.count > 0) {
             const Noop = struct {
@@ -4362,6 +4384,59 @@ const ServeRunner = struct {
             if (!cont) return .stop;
         }
         return .ok;
+    }
+
+    /// Commits pending `next_tok` at `pos`, injects the dialect thinking-close
+    /// delimiter tokens (`</think>`, `<|end_message|><|message_model|><|content_text|>`,
+    /// or `</think:opensource>`) into the model's KV state, updates `next_tok` to the
+    /// final close token so the next decode step predicts post-think answer text, and
+    /// signals the network `ThinkSplitter` via zero-token `emitControlBytes` (`ADR-0024` L65).
+    fn injectThinkingCutoffIntoKv(
+        self: *ServeRunner,
+        next_tok: *u32,
+        pos: *u32,
+        stream: *aminfer.server.TokenStream,
+    ) bool {
+        if (self.thinking_close_len == 0) return true;
+        const close_ids = self.thinking_close_ids[0..self.thinking_close_len];
+        if (pos.* + close_ids.len + 1 >= self.max_seq_len) return false;
+        // Commit the last generated thinking token at `pos`.
+        switch (self.target) {
+            .qwen3 => |m| {
+                _ = m.stepDecode(next_tok.*, pos.*) catch {
+                    stream.fail("decode step failed during thinking budget cutoff");
+                    return false;
+                };
+            },
+            .graph => |g| {
+                _ = g.stepDecode(next_tok.*, pos.*) catch {
+                    stream.fail("graph decode step failed during thinking budget cutoff");
+                    return false;
+                };
+            },
+        }
+        pos.* += 1;
+        // Commit all but the last close-delimiter token into KV; the final token
+        // becomes `next_tok` so the next loop step commits it and samples answer text.
+        for (close_ids[0 .. close_ids.len - 1]) |cid| {
+            switch (self.target) {
+                .qwen3 => |m| {
+                    _ = m.stepDecode(cid, pos.*) catch {
+                        stream.fail("decode step failed during thinking budget cutoff");
+                        return false;
+                    };
+                },
+                .graph => |g| {
+                    _ = g.stepDecode(cid, pos.*) catch {
+                        stream.fail("graph decode step failed during thinking budget cutoff");
+                        return false;
+                    };
+                },
+            }
+            pos.* += 1;
+        }
+        next_tok.* = close_ids[close_ids.len - 1];
+        return stream.emitControlBytes(self.chat_template.thinkingCloseInjection());
     }
 
     fn sampleConstrainedStep(
@@ -4543,7 +4618,57 @@ const ServeRunner = struct {
                 .ok => {},
             }
             var emitted: u32 = 1;
+            var spec_cutoff_injected = false;
+            var fallback_pos: u32 = eng.next_pos;
+            var fallback_tok: u32 = eng.last_token;
+            if (!spec_cutoff_injected and stream.thinkingBudgetExceeded()) {
+                spec_cutoff_injected = true;
+                if (eng.pearl_rt) |prt| prt.waitIdle();
+                if (!self.injectThinkingCutoffIntoKv(&fallback_tok, &fallback_pos, stream)) return;
+            }
             while (emitted < max_gen and !stream.isCancelled()) {
+                if (spec_cutoff_injected) {
+                    fallback_tok = switch (self.target) {
+                        .qwen3 => |m| blk: {
+                            const t = m.stepDecode(fallback_tok, fallback_pos) catch {
+                                stream.fail("decode step failed");
+                                return;
+                            };
+                            break :blk if (job.temperature > 0.0)
+                                m.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                                    stream.fail("sampling failed");
+                                    return;
+                                }
+                            else
+                                t;
+                        },
+                        .graph => |g| blk: {
+                            const t = g.stepDecode(fallback_tok, fallback_pos) catch {
+                                stream.fail("graph decode step failed");
+                                return;
+                            };
+                            break :blk if (job.temperature > 0.0)
+                                g.sampleFromLastLogits(job.temperature, job.rng.random(), self.p_res) catch {
+                                    stream.fail("sampling failed");
+                                    return;
+                                }
+                            else
+                                t;
+                        },
+                    };
+                    self.recordSteadyStep();
+                    fallback_pos += 1;
+                    switch (self.emitTokenWithStop(stream, fallback_tok, job.ignore_eos, job.stop_config, &stop_hb)) {
+                        .stop => {
+                            stream.finish(.stop, prompt_len_u32);
+                            return;
+                        },
+                        .cancelled => return,
+                        .ok => {},
+                    }
+                    emitted += 1;
+                    continue;
+                }
                 const rem: usize = max_gen - emitted;
                 const cap = @min(rem, self.round_buf.len);
                 const rs = eng.stepRound(rng_opt, self.round_buf[0..cap]) catch {
@@ -4562,6 +4687,13 @@ const ServeRunner = struct {
                     }
                     emitted += 1;
                     if (emitted >= max_gen) break;
+                }
+                if (!spec_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
+                    spec_cutoff_injected = true;
+                    if (eng.pearl_rt) |prt| prt.waitIdle();
+                    fallback_pos = eng.next_pos;
+                    fallback_tok = eng.last_token;
+                    if (!self.injectThinkingCutoffIntoKv(&fallback_tok, &fallback_pos, stream)) return;
                 }
             }
             if (!stream.isCancelled()) {
@@ -4618,6 +4750,11 @@ const ServeRunner = struct {
             }
             var pos: u32 = prompt_len_u32;
             var emitted: u32 = 1;
+            var thinking_cutoff_injected = false;
+            if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
+                thinking_cutoff_injected = true;
+                if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
+            }
             while (emitted < max_gen and !stream.isCancelled()) {
                 next_tok = switch (self.target) {
                     .qwen3 => |m| blk: {
@@ -4658,6 +4795,10 @@ const ServeRunner = struct {
                     .ok => {},
                 }
                 emitted += 1;
+                if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
+                    thinking_cutoff_injected = true;
+                    if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
+                }
             }
             if (!stream.isCancelled()) {
                 stream.finish(.length, prompt_len_u32);
@@ -4705,6 +4846,11 @@ const ServeRunner = struct {
         }
         var pos: u32 = prompt_len_u32;
         var emitted: u32 = 1;
+        var thinking_cutoff_injected = false;
+        if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
+            thinking_cutoff_injected = true;
+            if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
+        }
         while (emitted < max_gen and !stream.isCancelled()) {
             switch (self.target) {
                 .qwen3 => |m| {
@@ -4735,6 +4881,10 @@ const ServeRunner = struct {
                 .ok => {},
             }
             emitted += 1;
+            if (!thinking_cutoff_injected and emitted < max_gen and stream.thinkingBudgetExceeded()) {
+                thinking_cutoff_injected = true;
+                if (!self.injectThinkingCutoffIntoKv(&next_tok, &pos, stream)) return;
+            }
         }
         if (!stream.isCancelled()) {
             stream.finish(.length, prompt_len_u32);
@@ -4761,6 +4911,12 @@ const BatchServeRunner = struct {
         rng: ?*aminfer.rng.RequestRng = null,
     };
 
+    const SlotThinkingCutoff = struct {
+        injected: bool = false,
+        next_idx: u8 = 0,
+        len: u8 = 0,
+    };
+
     inner_backend: aminfer.batch_scheduler.BatchBackend,
     qwen3_batch_rt: ?*aminfer.qwen3.Qwen3BatchRuntime = null,
     graph_batch_rt: ?*aminfer.graph.GraphBatchRuntime = null,
@@ -4771,6 +4927,9 @@ const BatchServeRunner = struct {
     server_ptr: ?*aminfer.server.Server = null,
     ngram_registry: ?*aminfer.ngram_nvme.DomainNgramRegistry,
     tok: *const aminfer.tokenizer.Tokenizer,
+    chat_template: aminfer.chat_template.ChatTemplate,
+    thinking_close_ids: [16]u32,
+    thinking_close_len: u8,
     bos_token_id: ?u32,
     max_seq_len: u32,
     stop_tokens: [aminfer.batch_scheduler.MAX_STOP_TOKENS]u32,
@@ -4785,6 +4944,7 @@ const BatchServeRunner = struct {
     pending_head: usize = 0,
     pending_tail: usize = 0,
     slot_constraints: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]SlotConstraint = @splat(.{}),
+    slot_thinking_cutoff: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]SlotThinkingCutoff = @splat(.{}),
     boundary_fallback_count: u64 = 0,
     steady_steps: u64 = 0,
     steady_heap_start: ?aminfer.vmstat.Snapshot = null,
@@ -4797,6 +4957,7 @@ const BatchServeRunner = struct {
         inner_backend: aminfer.batch_scheduler.BatchBackend,
         ngram_registry: ?*aminfer.ngram_nvme.DomainNgramRegistry,
         tok: *const aminfer.tokenizer.Tokenizer,
+        chat_tpl: aminfer.chat_template.ChatTemplate,
         bos_token_id: ?u32,
         eos_token_id: ?u32,
         max_seq_len: u32,
@@ -4819,8 +4980,13 @@ const BatchServeRunner = struct {
 
         var stop_tokens: [aminfer.batch_scheduler.MAX_STOP_TOKENS]u32 = @splat(0);
         var stop_cnt: u8 = 0;
+        const tpl_eos_id: ?u32 = blk: {
+            const s = chat_tpl.eos_token.slice();
+            break :blk if (s.len > 0) tok.addedTokenId(s) else null;
+        };
         const candidates = [_]?u32{
             eos_token_id,
+            tpl_eos_id,
             tok.addedTokenId("<|im_end|>"),
             tok.addedTokenId("<|endoftext|>"),
         };
@@ -4839,6 +5005,16 @@ const BatchServeRunner = struct {
             }
         }
 
+        // Pre-tokenize dialect thinking-close delimiter once at startup (0 hot-path allocs).
+        var thinking_close_ids: [16]u32 = @splat(0);
+        var thinking_close_len: u8 = 0;
+        const close_str = chat_tpl.thinkingCloseInjection();
+        if (close_str.len > 0) {
+            if (tok.encodeWithScratch(&encode_scratch, close_str, &thinking_close_ids)) |ids| {
+                thinking_close_len = @intCast(ids.len);
+            } else |_| {}
+        }
+
         const vocab_index: ?aminfer.grammar.VocabIndex = if (aminfer.grammar.VocabIndex.initFromTokenizer(
             allocator,
             tok,
@@ -4849,6 +5025,9 @@ const BatchServeRunner = struct {
             .inner_backend = inner_backend,
             .ngram_registry = ngram_registry,
             .tok = tok,
+            .chat_template = chat_tpl,
+            .thinking_close_ids = thinking_close_ids,
+            .thinking_close_len = thinking_close_len,
             .bos_token_id = bos_token_id,
             .max_seq_len = max_seq_len,
             .stop_tokens = stop_tokens,
@@ -5077,8 +5256,9 @@ const BatchServeRunner = struct {
         _: []u8,
     ) []const u8 {
         const self: *BatchServeRunner = @ptrCast(@alignCast(ctx));
-        if (self.tok.isSpecialToken(token_id)) return &.{};
-        return self.tok.tokenBytes(token_id) catch &.{};
+        const piece = self.tok.tokenBytes(token_id) catch return &.{};
+        if (self.tok.isSpecialToken(token_id) and !self.chat_template.isStructuralControlToken(piece)) return &.{};
+        return piece;
     }
 
     fn lookupPrefixCallback(
@@ -5187,9 +5367,38 @@ const BatchServeRunner = struct {
             _ = std.c.pthread_mutex_unlock(mtx);
         };
         try self.inner_backend.stepDecodeBatch(view, out_next_tokens);
+        // Active `thinking_budget_tokens` cutoff (`ADR-0024` L65): when a slot exceeds
+        // its thinking budget, force-inject the pre-tokenized dialect closing delimiter
+        // tokens into `out_next_tokens` so `BatchScheduler` commits them into the slot's
+        // KV cache and transitions `ThinkSplitter` into answer generation.
+        var forced_mask: [aminfer.batch_scheduler.MAX_BATCH_SLOTS]bool = @splat(false);
+        if (self.thinking_close_len > 0) {
+            for (0..view.batchSize()) |bi| {
+                const sid = view.slot_ids[bi];
+                if (sid >= self.slot_thinking_cutoff.len) continue;
+                var sc = &self.slot_thinking_cutoff[sid];
+                if (!sc.injected) {
+                    if (self.server_ptr) |srv| {
+                        if (srv.isBatchSlotThinkingBudgetExceeded(sid)) {
+                            sc.* = .{
+                                .injected = true,
+                                .next_idx = 0,
+                                .len = self.thinking_close_len,
+                            };
+                        }
+                    }
+                }
+                if (sc.next_idx < sc.len) {
+                    out_next_tokens[bi] = self.thinking_close_ids[sc.next_idx];
+                    sc.next_idx += 1;
+                    forced_mask[bi] = true;
+                }
+            }
+        }
         if (self.qwen3_batch_rt) |brt| {
             const v_size: usize = brt.model.config.vocab_size;
             for (0..view.batchSize()) |bi| {
+                if (forced_mask[bi]) continue;
                 const sid = view.slot_ids[bi];
                 if (sid < self.slot_constraints.len and self.slot_constraints[sid].active) {
                     const row_bind: aminfer.metal.BufferBinding = .{
@@ -5208,6 +5417,7 @@ const BatchServeRunner = struct {
         } else if (self.graph_batch_rt) |grt| {
             const v_size: usize = grt.model.config.vocab_size;
             for (0..view.batchSize()) |bi| {
+                if (forced_mask[bi]) continue;
                 const sid = view.slot_ids[bi];
                 if (sid < self.slot_constraints.len and self.slot_constraints[sid].active) {
                     const row_bind: aminfer.metal.BufferBinding = .{
@@ -5252,6 +5462,9 @@ const BatchServeRunner = struct {
         }
         if (slot_id < self.slot_constraints.len) {
             self.slot_constraints[slot_id] = .{};
+        }
+        if (slot_id < self.slot_thinking_cutoff.len) {
+            self.slot_thinking_cutoff[slot_id] = .{};
         }
         self.inner_backend.releaseSlot(slot_id, prefix_handle);
     }
@@ -5638,6 +5851,7 @@ fn runServeGraph(
 
     const bos_opt: ?u32 = if (gcfg.bos_token_id < gcfg.vocab_size) gcfg.bos_token_id else null;
     const eos_opt: ?u32 = if (gcfg.eos_token_id < gcfg.vocab_size) gcfg.eos_token_id else null;
+    const serve_chat_tpl = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(&tok);
     if (use_continuous) {
         batch_rt_storage = try aminfer.graph.GraphBatchRuntime.init(allocator, &model, .{
             .max_slots = @intCast(batch_slots),
@@ -5652,6 +5866,7 @@ fn runServeGraph(
             batch_rt_storage.batchBackend(),
             ngram_reg_ptr,
             &tok,
+            serve_chat_tpl,
             bos_opt,
             eos_opt,
             max_seq_len,
@@ -5666,6 +5881,7 @@ fn runServeGraph(
             spec_eng_ptr,
             ngram_reg_ptr,
             &tok,
+            serve_chat_tpl,
             gcfg.vocab_size,
             bos_opt,
             eos_opt,
@@ -5680,7 +5896,6 @@ fn runServeGraph(
         (if (ngram_reg_ptr) |nr| (if (spec_eng_ptr == null) nr.totalWiredBytes() else 0) else 0);
     const total_wired_mib: u64 = total_wired_bytes >> 20;
     const model_id_str = cli.model_id orelse std.fs.path.stem(cli.amf_path);
-    const serve_chat_tpl = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(&tok);
 
     const srv = try aminfer.server.Server.init(allocator, .{
         .host = host_ipv4,
@@ -5703,6 +5918,8 @@ fn runServeGraph(
         .http_read_timeout_ms = cli.m81.http_read_timeout_ms,
     });
     defer srv.deinit(allocator);
+    if (batch_runner_ptr) |br| br.server_ptr = srv;
+    if (runner_ptr) |r| r.server_ptr = srv;
 
     g_active_serve_ptr.store(@intFromPtr(srv), .release);
     defer g_active_serve_ptr.store(0, .release);
@@ -6101,6 +6318,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
     var runner_ptr: ?*ServeRunner = null;
     defer if (runner_ptr) |r| r.deinit(allocator);
 
+    const serve_chat_tpl = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(&tok);
     if (use_continuous) {
         batch_rt_storage = try aminfer.qwen3.Qwen3BatchRuntime.init(allocator, &model, .{
             .max_slots = @intCast(batch_slots),
@@ -6117,6 +6335,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
             batch_rt_storage.batchBackend(),
             ngram_reg_ptr,
             &tok,
+            serve_chat_tpl,
             cfg.bos_token_id,
             cfg.eos_token_id,
             max_seq_len,
@@ -6132,6 +6351,7 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
             spec_eng_ptr,
             ngram_reg_ptr,
             &tok,
+            serve_chat_tpl,
             cfg.vocab_size,
             cfg.bos_token_id,
             cfg.eos_token_id,
@@ -6148,7 +6368,6 @@ fn runServe(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *
         (if (ngram_reg_ptr) |nr| (if (spec_eng_ptr == null) nr.totalWiredBytes() else 0) else 0);
     const total_wired_mib: u64 = total_wired_bytes >> 20;
     const model_id_str = cli.model_id orelse std.fs.path.stem(cli.amf_path);
-    const serve_chat_tpl = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(&tok);
 
     const srv = try aminfer.server.Server.init(allocator, .{
         .host = host_ipv4,
@@ -6607,6 +6826,7 @@ const ChatEngineRunner = struct {
     model: *aminfer.qwen3.Qwen3Model,
     batch_rt: *aminfer.qwen3.Qwen3BatchRuntime,
     tok: *const aminfer.tokenizer.Tokenizer,
+    chat_template: aminfer.chat_template.ChatTemplate,
     max_seq_len: u32,
     bos_token_id: u32,
     stop_tokens: [4]u32,
@@ -6632,12 +6852,13 @@ const ChatEngineRunner = struct {
         const boundary_verify_buf = try allocator.alloc(u32, max_seq_len);
         errdefer allocator.free(boundary_verify_buf);
 
+        const chat_tpl = model.chat_template orelse aminfer.chat_template.ChatTemplate.fromTokenizer(tok);
         var stop_tokens: [4]u32 = @splat(0);
         var stop_cnt: usize = 0;
-        const tpl_eos_id: ?u32 = if (model.chat_template) |tpl| blk: {
-            const s = tpl.eos_token.slice();
+        const tpl_eos_id: ?u32 = blk: {
+            const s = chat_tpl.eos_token.slice();
             break :blk if (s.len > 0) tok.addedTokenId(s) else null;
-        } else null;
+        };
         const candidates = [_]?u32{
             model.config.eos_token_id,
             tpl_eos_id,
@@ -6663,6 +6884,7 @@ const ChatEngineRunner = struct {
             .model = model,
             .batch_rt = batch_rt,
             .tok = tok,
+            .chat_template = chat_tpl,
             .max_seq_len = max_seq_len,
             .bos_token_id = model.config.bos_token_id orelse 0,
             .stop_tokens = stop_tokens,
@@ -6821,9 +7043,9 @@ const ChatEngineRunner = struct {
         var cur_tok: u32 = first_tok;
 
         if (max_gen > 0 and !self.isStopToken(cur_tok)) {
-            if (!self.tok.isSpecialToken(cur_tok)) {
-                const piece = self.tok.tokenBytes(cur_tok) catch "";
-                try stream.emitText(piece);
+            const first_piece = self.tok.tokenBytes(cur_tok) catch "";
+            if (!self.tok.isSpecialToken(cur_tok) or self.chat_template.isStructuralControlToken(first_piece)) {
+                try stream.emitText(first_piece);
             }
             emitted = 1;
             var pos: u32 = prompt_len_u32;
@@ -6854,8 +7076,8 @@ const ChatEngineRunner = struct {
                 cur_tok = next_out[0];
                 pos += 1;
                 if (self.isStopToken(cur_tok)) break;
-                if (!self.tok.isSpecialToken(cur_tok)) {
-                    const piece = self.tok.tokenBytes(cur_tok) catch "";
+                const piece = self.tok.tokenBytes(cur_tok) catch "";
+                if (!self.tok.isSpecialToken(cur_tok) or self.chat_template.isStructuralControlToken(piece)) {
                     try stream.emitText(piece);
                 }
                 emitted += 1;
@@ -7872,4 +8094,103 @@ test "M8.1 CLI flags parse act-quant, reasoning-effort, HTTP limits, and quality
     const rendered_hy = try renderPromptWithChatTemplateAlloc(gpa, &hy_tpl, "Explain M4", .high);
     defer gpa.free(rendered_hy);
     try std.testing.expect(std.mem.indexOf(u8, rendered_hy, "reasoning_effort:high") != null);
+}
+
+test "M8.1 BatchServeRunner preserves Inkling 2 special structural tags, registers template EOS, and injects thinking cutoff" {
+    const gpa = std.testing.allocator;
+    const ink_tok_json =
+        \\{"model":{"type":"BPE","vocab":{"a":0,"b":1,"<|pad|>":2,"<|message_model|>":3,"<|content_text|>":4,"<|content_model_end_sampling|>":5,"<|content_thinking|>":6,"<|end_message|>":7,"<|content_invoke_tool_json|>":8},"merges":[]},"added_tokens":[
+        \\{"id":2,"content":"<|pad|>","special":true},
+        \\{"id":3,"content":"<|message_model|>","special":true},
+        \\{"id":4,"content":"<|content_text|>","special":true},
+        \\{"id":5,"content":"<|content_model_end_sampling|>","special":true},
+        \\{"id":6,"content":"<|content_thinking|>","special":true},
+        \\{"id":7,"content":"<|end_message|>","special":true},
+        \\{"id":8,"content":"<|content_invoke_tool_json|>","special":true}]}
+    ;
+    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(gpa, ink_tok_json);
+    defer tok.deinit(gpa);
+    const ink_tpl = aminfer.chat_template.ChatTemplate.preset(.inkling2);
+
+    const DummyBackend = struct {
+        fn prefill(_: *anyopaque, _: *const aminfer.batch_scheduler.PrefillChunkView) aminfer.batch_scheduler.BackendError!aminfer.batch_scheduler.PrefillResult {
+            return .{ .first_token = 0 };
+        }
+        fn decode(_: *anyopaque, view: *const aminfer.batch_scheduler.BatchStepView, out: []u32) aminfer.batch_scheduler.BackendError!void {
+            for (0..view.batchSize()) |i| out[i] = 0;
+        }
+        fn release(_: *anyopaque, _: u16, _: u64) void {}
+    };
+    var dummy_ctx: u8 = 0;
+    const backend: aminfer.batch_scheduler.BatchBackend = .{
+        .ctx = &dummy_ctx,
+        .prefillSlotFn = DummyBackend.prefill,
+        .stepDecodeBatchFn = DummyBackend.decode,
+        .releaseSlotFn = DummyBackend.release,
+    };
+
+    var br = try BatchServeRunner.init(gpa, backend, null, &tok, ink_tpl, null, null, 64);
+    defer br.deinit(gpa);
+
+    // 1. Template EOS (`<|content_model_end_sampling|>` = 5) registered in `stop_tokens`!
+    var has_ink_eos = false;
+    for (br.stop_tokens[0..br.stop_token_count]) |sid| {
+        if (sid == 5) has_ink_eos = true;
+    }
+    try std.testing.expect(has_ink_eos);
+
+    // 2. Structural `"special": true` tags pass through `detokenizeCallback`, while `<|pad|>` is stripped!
+    var dummy_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("", BatchServeRunner.detokenizeCallback(&br, 2, &dummy_buf));
+    try std.testing.expectEqualStrings("<|message_model|>", BatchServeRunner.detokenizeCallback(&br, 3, &dummy_buf));
+    try std.testing.expectEqualStrings("<|content_text|>", BatchServeRunner.detokenizeCallback(&br, 4, &dummy_buf));
+    try std.testing.expectEqualStrings("<|content_thinking|>", BatchServeRunner.detokenizeCallback(&br, 6, &dummy_buf));
+    try std.testing.expectEqualStrings("<|end_message|>", BatchServeRunner.detokenizeCallback(&br, 7, &dummy_buf));
+    try std.testing.expectEqualStrings("<|content_invoke_tool_json|>", BatchServeRunner.detokenizeCallback(&br, 8, &dummy_buf));
+
+    // 3. Pre-tokenized Inkling 2 thinking-close injection sequence: `[7, 3, 4]`
+    //    (`<|end_message|><|message_model|><|content_text|>`)!
+    try std.testing.expectEqualSlices(u32, &.{ 7, 3, 4 }, br.thinking_close_ids[0..br.thinking_close_len]);
+
+    // 4. Active `thinking_budget_tokens` cutoff injects `[7, 3, 4]` into `stepDecodeBatchCallback`!
+    const srv = try aminfer.server.Server.init(gpa, .{
+        .port = 0,
+        .model_id = "inkling-2-test",
+        .chat_template = ink_tpl,
+        .apply_qos = false,
+    });
+    defer srv.deinit(gpa);
+    br.server_ptr = srv;
+    srv.batch_slot_streams[0].thinking_budget_reached.store(true, .release);
+
+    const sids = [_]u16{0};
+    const rids = [_]u64{1};
+    const utags = [_]u64{0};
+    const in_t = [_]u32{0};
+    const spos = [_]u32{4};
+    const temps = [_]f32{0.0};
+    var rng0 = try aminfer.rng.RequestRng.init(1);
+    const rngs = [_]*aminfer.rng.RequestRng{&rng0};
+    const ndoms = [_][]const u8{""};
+    const phs = [_]u64{0};
+    const view: aminfer.batch_scheduler.BatchStepView = .{
+        .slot_ids = &sids,
+        .request_ids = &rids,
+        .user_tags = &utags,
+        .input_tokens = &in_t,
+        .seq_positions = &spos,
+        .temperatures = &temps,
+        .rngs = &rngs,
+        .ngram_domains = &ndoms,
+        .prefix_handles = &phs,
+    };
+    var out_t = [_]u32{99};
+    try BatchServeRunner.stepDecodeBatchCallback(&br, &view, &out_t);
+    try std.testing.expectEqual(@as(u32, 7), out_t[0]); // <|end_message|>
+    try BatchServeRunner.stepDecodeBatchCallback(&br, &view, &out_t);
+    try std.testing.expectEqual(@as(u32, 3), out_t[0]); // <|message_model|>
+    try BatchServeRunner.stepDecodeBatchCallback(&br, &view, &out_t);
+    try std.testing.expectEqual(@as(u32, 4), out_t[0]); // <|content_text|>
+    try BatchServeRunner.stepDecodeBatchCallback(&br, &view, &out_t);
+    try std.testing.expectEqual(@as(u32, 0), out_t[0]); // resumes normal model output
 }

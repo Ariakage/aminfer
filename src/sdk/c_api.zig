@@ -556,29 +556,128 @@ pub const StreamTagClassifier = struct {
     const TOOL_OPEN = "<tool_call>";
     const TOOL_CLOSE = "</tool_call>";
 
+    const HY4_THINK_OPEN = "<think:opensource>";
+    const HY4_THINK_CLOSE = "</think:opensource>";
+    const HY4_TOOL_OPEN = "<tool_call:opensource>";
+    const HY4_TOOL_CLOSE = "</tool_call:opensource>";
+    const HY4_WRAP_OPEN = "<tool_calls:opensource>";
+    const HY4_WRAP_CLOSE = "</tool_calls:opensource>";
+
+    const INK_MODEL = "<|message_model|>";
+    const INK_TEXT = "<|content_text|>";
+    const INK_THINK_OPEN = "<|content_thinking|>";
+    const INK_TOOL_OPEN = "<|content_invoke_tool_json|>";
+    const INK_END = "<|end_message|>";
+    const INK_EOS = "<|content_model_end_sampling|>";
+    const MAX_TAG_LEN: usize = INK_EOS.len; // 30 bytes
+
     const Mode = enum(u8) {
         text = 0,
         reasoning = 1,
         tool_call = 2,
+        inkling_header = 3,
     };
 
+    dialect: chat_template_mod.Dialect = .chatml,
     mode: Mode = .text,
-    pending: [TOOL_CLOSE.len]u8 = undefined,
+    pending: [MAX_TAG_LEN]u8 = undefined,
     pending_len: u8 = 0,
+    header_buf: [128]u8 = undefined,
+    header_len: u8 = 0,
     saw_tool_call: bool = false,
 
     pub fn reset(self: *StreamTagClassifier, start_in_think: bool) void {
+        self.resetForDialect(.chatml, start_in_think);
+    }
+
+    pub fn resetForDialect(self: *StreamTagClassifier, dialect: chat_template_mod.Dialect, start_in_think: bool) void {
+        self.dialect = dialect;
         self.mode = if (start_in_think) .reasoning else .text;
         self.pending_len = 0;
+        self.header_len = 0;
         self.saw_tool_call = false;
     }
 
     fn currentDeltaKind(mode: Mode) DeltaKind {
         return switch (mode) {
-            .text => .text,
+            .text, .inkling_header => .text,
             .reasoning => .reasoning,
             .tool_call => .tool_call,
         };
+    }
+
+    inline fn thinkCloseTag(self: *const StreamTagClassifier) []const u8 {
+        return switch (self.dialect) {
+            .inkling2 => INK_END,
+            .hy4 => HY4_THINK_CLOSE,
+            .chatml, .deepseek, .custom => THINK_CLOSE,
+        };
+    }
+
+    inline fn toolCloseTag(self: *const StreamTagClassifier) []const u8 {
+        return switch (self.dialect) {
+            .inkling2 => INK_END,
+            .hy4 => HY4_TOOL_CLOSE,
+            .chatml, .deepseek, .custom => TOOL_CLOSE,
+        };
+    }
+
+    const OutsideMatch = enum {
+        none,
+        prefix,
+        think_open,
+        tool_open,
+        strip_tag,
+        inkling_model,
+    };
+
+    fn matchOutsideTag(self: *const StreamTagClassifier, cand: []const u8) OutsideMatch {
+        switch (self.dialect) {
+            .inkling2 => {
+                if (std.mem.eql(u8, cand, INK_THINK_OPEN)) return .think_open;
+                if (std.mem.eql(u8, cand, INK_TOOL_OPEN)) return .tool_open;
+                if (std.mem.eql(u8, cand, INK_MODEL)) return .inkling_model;
+                if (std.mem.eql(u8, cand, INK_TEXT) or
+                    std.mem.eql(u8, cand, INK_END) or
+                    std.mem.eql(u8, cand, INK_EOS)) return .strip_tag;
+
+                if ((cand.len < INK_THINK_OPEN.len and std.mem.startsWith(u8, INK_THINK_OPEN, cand)) or
+                    (cand.len < INK_TOOL_OPEN.len and std.mem.startsWith(u8, INK_TOOL_OPEN, cand)) or
+                    (cand.len < INK_MODEL.len and std.mem.startsWith(u8, INK_MODEL, cand)) or
+                    (cand.len < INK_TEXT.len and std.mem.startsWith(u8, INK_TEXT, cand)) or
+                    (cand.len < INK_END.len and std.mem.startsWith(u8, INK_END, cand)) or
+                    (cand.len < INK_EOS.len and std.mem.startsWith(u8, INK_EOS, cand)))
+                {
+                    return .prefix;
+                }
+                return .none;
+            },
+            .hy4 => {
+                if (std.mem.eql(u8, cand, HY4_THINK_OPEN)) return .think_open;
+                if (std.mem.eql(u8, cand, HY4_TOOL_OPEN)) return .tool_open;
+                if (std.mem.eql(u8, cand, HY4_WRAP_OPEN) or
+                    std.mem.eql(u8, cand, HY4_WRAP_CLOSE)) return .strip_tag;
+
+                if ((cand.len < HY4_THINK_OPEN.len and std.mem.startsWith(u8, HY4_THINK_OPEN, cand)) or
+                    (cand.len < HY4_TOOL_OPEN.len and std.mem.startsWith(u8, HY4_TOOL_OPEN, cand)) or
+                    (cand.len < HY4_WRAP_OPEN.len and std.mem.startsWith(u8, HY4_WRAP_OPEN, cand)) or
+                    (cand.len < HY4_WRAP_CLOSE.len and std.mem.startsWith(u8, HY4_WRAP_CLOSE, cand)))
+                {
+                    return .prefix;
+                }
+                return .none;
+            },
+            .chatml, .deepseek, .custom => {
+                if (std.mem.eql(u8, cand, THINK_OPEN)) return .think_open;
+                if (std.mem.eql(u8, cand, TOOL_OPEN)) return .tool_open;
+                if ((cand.len < THINK_OPEN.len and std.mem.startsWith(u8, THINK_OPEN, cand)) or
+                    (cand.len < TOOL_OPEN.len and std.mem.startsWith(u8, TOOL_OPEN, cand)))
+                {
+                    return .prefix;
+                }
+                return .none;
+            },
+        }
     }
 
     pub fn feed(
@@ -589,6 +688,43 @@ pub const StreamTagClassifier = struct {
     ) bool {
         var i: usize = 0;
         while (i < chunk.len) {
+            if (self.mode == .inkling_header and self.pending_len == 0) {
+                if (std.mem.indexOfScalarPos(u8, chunk, i, '<')) |lt_pos| {
+                    const seg = chunk[i..lt_pos];
+                    if (self.header_len + seg.len <= self.header_buf.len) {
+                        @memcpy(self.header_buf[self.header_len..][0..seg.len], seg);
+                        self.header_len += @intCast(seg.len);
+                        self.pending[0] = '<';
+                        self.pending_len = 1;
+                        i = lt_pos + 1;
+                        continue;
+                    }
+                    // Header overflow: flush accumulated bytes as normal text and exit header mode.
+                    const prev_h = self.header_buf[0..self.header_len];
+                    self.header_len = 0;
+                    self.mode = .text;
+                    if (prev_h.len > 0 and !emit_fn(ctx, .text, prev_h)) return false;
+                    if (seg.len > 0 and !emit_fn(ctx, .text, seg)) return false;
+                    self.pending[0] = '<';
+                    self.pending_len = 1;
+                    i = lt_pos + 1;
+                    continue;
+                } else {
+                    const seg = chunk[i..];
+                    if (self.header_len + seg.len <= self.header_buf.len) {
+                        @memcpy(self.header_buf[self.header_len..][0..seg.len], seg);
+                        self.header_len += @intCast(seg.len);
+                        return true;
+                    }
+                    const prev_h = self.header_buf[0..self.header_len];
+                    self.header_len = 0;
+                    self.mode = .text;
+                    if (prev_h.len > 0 and !emit_fn(ctx, .text, prev_h)) return false;
+                    if (seg.len > 0 and !emit_fn(ctx, .text, seg)) return false;
+                    return true;
+                }
+            }
+
             if (self.pending_len == 0) {
                 if (std.mem.indexOfScalarPos(u8, chunk, i, '<')) |lt_pos| {
                     if (lt_pos > i) {
@@ -608,44 +744,73 @@ pub const StreamTagClassifier = struct {
 
             const b = chunk[i];
             switch (self.mode) {
-                .text => {
+                .text, .inkling_header => {
                     const plen: usize = self.pending_len;
-                    const match_think = plen < THINK_OPEN.len and
-                        std.mem.eql(u8, self.pending[0..plen], THINK_OPEN[0..plen]) and
-                        b == THINK_OPEN[plen];
-                    const match_tool = plen < TOOL_OPEN.len and
-                        std.mem.eql(u8, self.pending[0..plen], TOOL_OPEN[0..plen]) and
-                        b == TOOL_OPEN[plen];
-
-                    if (match_think or match_tool) {
+                    if (plen < MAX_TAG_LEN) {
                         self.pending[plen] = b;
-                        self.pending_len = @intCast(plen + 1);
-                        i += 1;
-                        if (self.pending_len == THINK_OPEN.len and
-                            std.mem.eql(u8, self.pending[0..THINK_OPEN.len], THINK_OPEN))
-                        {
-                            self.pending_len = 0;
-                            self.mode = .reasoning;
-                        } else if (self.pending_len == TOOL_OPEN.len and
-                            std.mem.eql(u8, self.pending[0..TOOL_OPEN.len], TOOL_OPEN))
-                        {
-                            self.pending_len = 0;
-                            self.mode = .tool_call;
-                            self.saw_tool_call = true;
+                        const cand = self.pending[0 .. plen + 1];
+                        switch (self.matchOutsideTag(cand)) {
+                            .prefix => {
+                                self.pending_len = @intCast(plen + 1);
+                                i += 1;
+                            },
+                            .think_open => {
+                                self.pending_len = 0;
+                                self.header_len = 0;
+                                self.mode = .reasoning;
+                                i += 1;
+                            },
+                            .tool_open => {
+                                self.pending_len = 0;
+                                self.header_len = 0;
+                                self.mode = .tool_call;
+                                self.saw_tool_call = true;
+                                i += 1;
+                            },
+                            .inkling_model => {
+                                self.pending_len = 0;
+                                self.header_len = 0;
+                                self.mode = .inkling_header;
+                                i += 1;
+                            },
+                            .strip_tag => {
+                                self.pending_len = 0;
+                                self.header_len = 0;
+                                self.mode = .text;
+                                i += 1;
+                            },
+                            .none => {
+                                if (self.mode == .inkling_header) {
+                                    const prev_h = self.header_buf[0..self.header_len];
+                                    self.header_len = 0;
+                                    self.mode = .text;
+                                    if (prev_h.len > 0 and !emit_fn(ctx, .text, prev_h)) return false;
+                                }
+                                const flushed = self.pending[0..self.pending_len];
+                                self.pending_len = 0;
+                                if (!emit_fn(ctx, .text, flushed)) return false;
+                            },
                         }
                     } else {
+                        if (self.mode == .inkling_header) {
+                            const prev_h = self.header_buf[0..self.header_len];
+                            self.header_len = 0;
+                            self.mode = .text;
+                            if (prev_h.len > 0 and !emit_fn(ctx, .text, prev_h)) return false;
+                        }
                         const flushed = self.pending[0..self.pending_len];
                         self.pending_len = 0;
                         if (!emit_fn(ctx, .text, flushed)) return false;
                     }
                 },
                 .reasoning => {
+                    const ctag = self.thinkCloseTag();
                     const plen: usize = self.pending_len;
-                    if (plen < THINK_CLOSE.len and b == THINK_CLOSE[plen]) {
+                    if (plen < ctag.len and b == ctag[plen]) {
                         self.pending[plen] = b;
                         self.pending_len = @intCast(plen + 1);
                         i += 1;
-                        if (self.pending_len == THINK_CLOSE.len) {
+                        if (self.pending_len == ctag.len) {
                             self.pending_len = 0;
                             self.mode = .text;
                         }
@@ -656,12 +821,13 @@ pub const StreamTagClassifier = struct {
                     }
                 },
                 .tool_call => {
+                    const ctag = self.toolCloseTag();
                     const plen: usize = self.pending_len;
-                    if (plen < TOOL_CLOSE.len and b == TOOL_CLOSE[plen]) {
+                    if (plen < ctag.len and b == ctag[plen]) {
                         self.pending[plen] = b;
                         self.pending_len = @intCast(plen + 1);
                         i += 1;
-                        if (self.pending_len == TOOL_CLOSE.len) {
+                        if (self.pending_len == ctag.len) {
                             self.pending_len = 0;
                             self.mode = .text;
                             if (!emit_fn(ctx, .tool_call_end, "")) return false;
@@ -682,6 +848,12 @@ pub const StreamTagClassifier = struct {
         ctx: anytype,
         comptime emit_fn: fn (@TypeOf(ctx), DeltaKind, []const u8) bool,
     ) bool {
+        if (self.mode == .inkling_header and self.header_len > 0) {
+            const h = self.header_buf[0..self.header_len];
+            self.header_len = 0;
+            self.mode = .text;
+            if (!emit_fn(ctx, .text, h)) return false;
+        }
         if (self.pending_len == 0) return true;
         const kind = currentDeltaKind(self.mode);
         const flushed = self.pending[0..self.pending_len];
@@ -811,6 +983,7 @@ pub const SdkEngine = struct {
     num_layers: u32,
     max_seq_len: u32,
     eos_token_id: u32,
+    tpl_eos_token_id: u32 = TOKEN_NONE,
     wired_budget_bytes: u64,
     live_reclaimable_bytes: u64,
     live_budget_bytes: u64,
@@ -1583,10 +1756,14 @@ pub export fn ami_sdk_engine_create(
         else => {},
     }
 
-    if (eos_token_id == TOKEN_NONE) {
-        if (owned_tokenizer) |t| {
-            const tpl_eos = resolved_chat_tpl.eos_token.slice();
-            eos_token_id = (if (tpl_eos.len > 0) t.tok.addedTokenId(tpl_eos) else null) orelse
+    var tpl_eos_token_id: u32 = TOKEN_NONE;
+    if (owned_tokenizer) |t| {
+        const tpl_eos = resolved_chat_tpl.eos_token.slice();
+        if (tpl_eos.len > 0) {
+            if (t.tok.addedTokenId(tpl_eos)) |tid| tpl_eos_token_id = tid;
+        }
+        if (eos_token_id == TOKEN_NONE) {
+            eos_token_id = (if (tpl_eos_token_id != TOKEN_NONE) tpl_eos_token_id else null) orelse
                 t.tok.addedTokenId("<|im_end|>") orelse
                 t.tok.addedTokenId("<|endoftext|>") orelse
                 t.tok.addedTokenId("<｜end▁of▁sentence｜>") orelse TOKEN_NONE;
@@ -1732,6 +1909,7 @@ pub export fn ami_sdk_engine_create(
         .num_layers = num_layers,
         .max_seq_len = max_seq_len,
         .eos_token_id = eos_token_id,
+        .tpl_eos_token_id = tpl_eos_token_id,
         .wired_budget_bytes = full_budget.limit_bytes,
         .live_reclaimable_bytes = live_reclaimable,
         .live_budget_bytes = sdk_live_plan.live_budget_bytes,
@@ -2192,8 +2370,9 @@ fn sampleNextToken(
 }
 
 fn isStopToken(eng: *const SdkEngine, params: *const GenParams, tok: u32) bool {
-    if (params.ignore_eos == 0 and eng.eos_token_id != TOKEN_NONE and tok == eng.eos_token_id) {
-        return true;
+    if (params.ignore_eos == 0) {
+        if (eng.eos_token_id != TOKEN_NONE and tok == eng.eos_token_id) return true;
+        if (eng.tpl_eos_token_id != TOKEN_NONE and tok == eng.tpl_eos_token_id) return true;
     }
     const n = @min(@as(usize, params.stop_token_count), MAX_STOP_TOKENS);
     for (params.stop_token_ids[0..n]) |sid| {
@@ -2310,7 +2489,7 @@ fn generateTokensImpl(
 
     var utf8_asm: Utf8Assembler = .{};
     var tag_cls: StreamTagClassifier = .{};
-    tag_cls.reset(params.start_in_think != 0);
+    tag_cls.resetForDialect(eng.chat_template.dialect, params.start_in_think != 0);
 
     var generated: u32 = 0;
     var finish: FinishReason = .length;
@@ -2356,9 +2535,10 @@ fn generateTokensImpl(
 
         if (stream_cb) |cb| {
             if (eng.owned_tokenizer) |stok| {
-                const skip_spec = (params.skip_special_tokens != 0) and stok.tok.isSpecialToken(sampled);
+                const piece = stok.tok.tokenBytes(sampled) catch |err| return mapAnyError(err);
+                const keep_structural = eng.chat_template.isStructuralControlToken(piece);
+                const skip_spec = (params.skip_special_tokens != 0) and stok.tok.isSpecialToken(sampled) and !keep_structural;
                 if (!skip_spec) {
-                    const piece = stok.tok.tokenBytes(sampled) catch |err| return mapAnyError(err);
                     var dctx: StreamDispatchCtx = .{
                         .cb = cb,
                         .user_data = user_data,
@@ -4723,4 +4903,71 @@ test "sdk.c_api: C17 parameter validation, reasoning_effort bounds, max_tokens=0
         AMI_SDK_ERR_INVALID_ARGUMENT,
         ami_sdk_detokenize(tok, &bad_detok, bad_detok.len, 1, null, 0, &need_bytes),
     );
+}
+
+test "sdk.c_api: StreamTagClassifier handles Inkling 2 and Hy4 dialect tags without leaking framing" {
+    const Collector = struct {
+        text_buf: [256]u8 = undefined,
+        text_len: usize = 0,
+        reason_buf: [256]u8 = undefined,
+        reason_len: usize = 0,
+        tool_buf: [256]u8 = undefined,
+        tool_len: usize = 0,
+        tool_ends: usize = 0,
+
+        fn onDelta(self: *@This(), kind: DeltaKind, bytes: []const u8) bool {
+            switch (kind) {
+                .text => {
+                    @memcpy(self.text_buf[self.text_len..][0..bytes.len], bytes);
+                    self.text_len += bytes.len;
+                },
+                .reasoning => {
+                    @memcpy(self.reason_buf[self.reason_len..][0..bytes.len], bytes);
+                    self.reason_len += bytes.len;
+                },
+                .tool_call => {
+                    @memcpy(self.tool_buf[self.tool_len..][0..bytes.len], bytes);
+                    self.tool_len += bytes.len;
+                },
+                .tool_call_end => self.tool_ends += 1,
+            }
+            return true;
+        }
+    };
+
+    // Inkling 2: fragmented `<|message_model|>`, `<|content_thinking|>`, `<|message_model|>get_weather<|content_invoke_tool_json|>`, `<|content_text|>`, `<|end_message|>`
+    var cls: StreamTagClassifier = .{};
+    cls.resetForDialect(.inkling2, false);
+    var col: Collector = .{};
+    const ink_chunks = [_][]const u8{
+        "<|message_mod",
+        "el|><|content_thin",
+        "king|>plan<|end_mes",
+        "sage|><|message_model|>get_weather<|content_invoke_tool_json|>{\"city\":\"Tokyo\"}<|end_message|><|message_model|><|content_text|>Done<|end_message|><|content_model_end_sampling|>",
+    };
+    for (ink_chunks) |c| {
+        try std.testing.expect(cls.feed(c, &col, Collector.onDelta));
+    }
+    try std.testing.expect(cls.flush(&col, Collector.onDelta));
+    try std.testing.expectEqualStrings("plan", col.reason_buf[0..col.reason_len]);
+    try std.testing.expectEqualStrings("{\"city\":\"Tokyo\"}", col.tool_buf[0..col.tool_len]);
+    try std.testing.expectEqual(@as(usize, 1), col.tool_ends);
+    try std.testing.expectEqualStrings("Done", col.text_buf[0..col.text_len]);
+    try std.testing.expect(cls.saw_tool_call);
+
+    // Hy4: `starts_in_think == true` + `<tool_calls:opensource><tool_call:opensource>...</tool_call:opensource></tool_calls:opensource>`
+    cls.resetForDialect(.hy4, true);
+    var col_hy: Collector = .{};
+    const hy_chunks = [_][]const u8{
+        "hy_plan</think:open",
+        "source><tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Kyoto</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+    };
+    for (hy_chunks) |c| {
+        try std.testing.expect(cls.feed(c, &col_hy, Collector.onDelta));
+    }
+    try std.testing.expect(cls.flush(&col_hy, Collector.onDelta));
+    try std.testing.expectEqualStrings("hy_plan", col_hy.reason_buf[0..col_hy.reason_len]);
+    try std.testing.expectEqualStrings("", col_hy.text_buf[0..col_hy.text_len]);
+    try std.testing.expect(std.mem.indexOf(u8, col_hy.tool_buf[0..col_hy.tool_len], "Kyoto") != null);
+    try std.testing.expectEqual(@as(usize, 1), col_hy.tool_ends);
 }
