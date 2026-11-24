@@ -5,14 +5,17 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import pathlib
 import random
 import re
 import struct
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
@@ -21,6 +24,7 @@ from aminfer_tools.amf import (
     QuantParamKind,
     TensorKind,
     TensorLayout,
+    bf16_bytes_to_f32_list,
     dequantize_q2_row_f32,
     dequantize_q3_row_f32,
     dequantize_q4_row_f32,
@@ -28,6 +32,8 @@ from aminfer_tools.amf import (
     dequantize_q6_row_f32,
     dequantize_q8_row_f32,
     dequantize_sme2_panel64_q2_panel_f32,
+    f16_bytes_to_f32_list,
+    f32_bytes_to_f32_list,
     load_amf_metadata,
     pack_amf_from_safetensors,
     pack_mlx_affine_2bit,
@@ -42,12 +48,18 @@ from aminfer_tools.gsq_rco import (
     _BACKBONE_PROTECTED_ROLES,
     QuantUnitCandidate,
     QuantUnitInput,
+    _UnifiedSource,
+    _analyze_tensor_sample,
     _imatrix_col_weights,
     _imatrix_tensor_multipliers,
+    _is_native_rco_disabled,
+    _load_native_rco_lib,
+    _reset_native_rco_lib_cache,
     gsq_convert,
     parse_gguf_imatrix,
     quantize_group_minmax,
     quantize_group_rco,
+    quantize_raw_rows_affine_native,
     quantize_rows_affine,
     solve_gsq_allocation,
 )
@@ -1643,6 +1655,311 @@ class M5GsqRcoTests(unittest.TestCase):
                 bos_id = int(cfg_dict.get("bos_token_id", 0))
                 ref_tokens = _cpu_fp32_qwen3_greedy(out_amf, cfg_dict, [bos_id], max_new=4)
                 self.assertEqual(zig_tokens, ref_tokens, msg=f"{label} tokens {zig_tokens} != {ref_tokens}")
+
+    def test_native_rco_fallback_and_raw_float_row_streaming(self) -> None:
+        rng = random.Random(20261124)
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            sf_dir = tmp / "raw_stream_ckpt"
+            sf_dir.mkdir()
+            bf16_raw = _rand_bf16_bytes(rng, 40 * 128, 0.25, outlier_prob=0.05)
+            f16_vals = [rng.gauss(0.0, 0.25) for _ in range(40 * 128)]
+            f16_raw = struct.pack(f"<{len(f16_vals)}e", *f16_vals)
+            f32_vals = [rng.gauss(0.0, 0.25) for _ in range(40 * 128)]
+            f32_raw = struct.pack(f"<{len(f32_vals)}f", *f32_vals)
+            ones_bf16 = _rand_bf16_bytes(rng, 128, 0.05)
+
+            _write_safetensors(
+                sf_dir / "model.safetensors",
+                {
+                    "model.embed_tokens.weight": ("BF16", (64, 128), _rand_bf16_bytes(rng, 64 * 128, 0.1)),
+                    "model.layers.0.input_layernorm.weight": ("BF16", (128,), ones_bf16),
+                    "model.layers.0.post_attention_layernorm.weight": ("BF16", (128,), ones_bf16),
+                    "model.layers.0.self_attn.q_proj.weight": ("BF16", (40, 128), bf16_raw),
+                    "model.layers.0.self_attn.k_proj.weight": ("F16", (40, 128), f16_raw),
+                    "model.layers.0.self_attn.v_proj.weight": ("F32", (40, 128), f32_raw),
+                    "model.norm.weight": ("BF16", (128,), ones_bf16),
+                },
+            )
+            (sf_dir / "config.json").write_text(json.dumps({"tie_word_embeddings": True}), encoding="utf-8")
+
+            src = _UnifiedSource(sf_dir, group_size=64, cold_experts=set())
+            try:
+                by_name = {t.name: t for t in src.tensors}
+                expected_codes = {
+                    "layers.0.self_attn.q_proj.weight": (2, bf16_raw),
+                    "layers.0.self_attn.k_proj.weight": (1, f16_raw),
+                    "layers.0.self_attn.v_proj.weight": (0, f32_raw),
+                }
+                for t_name, (exp_code, exp_bytes) in expected_codes.items():
+                    t_obj = by_name[t_name]
+                    self.assertTrue(src.can_stream_raw_float_rows(t_obj))
+                    chunks: list[bytes] = []
+                    total_rows = 0
+                    for raw_b, code, cnt in src.iter_raw_float_row_batches(t_obj, batch_rows=16):
+                        self.assertEqual(code, exp_code)
+                        chunks.append(raw_b)
+                        total_rows += cnt
+                    self.assertEqual(total_rows, 40)
+                    self.assertEqual(b"".join(chunks), exp_bytes)
+
+                    # Contiguous and strided `read_raw_float_rows` match `read_rows_f32`.
+                    for idxs in ([0, 1, 2, 3], [0, 13, 27, 39]):
+                        sub_raw, sub_code = src.read_raw_float_rows(t_obj, idxs)
+                        self.assertEqual(sub_code, exp_code)
+                        dec_fn = (
+                            f32_bytes_to_f32_list
+                            if exp_code == 0
+                            else (f16_bytes_to_f32_list if exp_code == 1 else bf16_bytes_to_f32_list)
+                        )
+                        flat_dec = dec_fn(sub_raw)
+                        ref_rows = src.read_rows_f32(t_obj, idxs)
+                        for r_i, ref_r in enumerate(ref_rows):
+                            self.assertEqual(flat_dec[r_i * 128 : (r_i + 1) * 128], ref_r)
+            finally:
+                src.close()
+
+            # Row-major `.amf` supports raw float streaming; SME2-packed `.amf` cleanly declines it.
+            rm_amf = tmp / "rm.amf"
+            sme2_amf = tmp / "sme2.amf"
+            pack_amf_from_safetensors(sf_dir, rm_amf, model_id="rm", sme2_pack="none")
+            pack_amf_from_safetensors(sf_dir, sme2_amf, model_id="sme2", sme2_pack="all-linear")
+            src_rm = _UnifiedSource(rm_amf, group_size=64, cold_experts=set())
+            src_sme2 = _UnifiedSource(sme2_amf, group_size=64, cold_experts=set())
+            try:
+                t_rm = {t.name: t for t in src_rm.tensors}["layers.0.self_attn.q_proj.weight"]
+                self.assertTrue(src_rm.can_stream_raw_float_rows(t_rm))
+                joined_rm = b"".join(b for b, _, _ in src_rm.iter_raw_float_row_batches(t_rm, batch_rows=16))
+                self.assertEqual(joined_rm, bf16_raw)
+
+                t_s2 = {t.name: t for t in src_sme2.tensors}["layers.0.self_attn.q_proj.weight"]
+                self.assertFalse(src_sme2.can_stream_raw_float_rows(t_s2))
+            finally:
+                src_rm.close()
+                src_sme2.close()
+
+            # Graceful `None` fallback when disabled, missing file, or symbol absent in dylib.
+            with mock.patch.dict(os.environ, {"AMINFER_DISABLE_NATIVE_RCO": "1"}, clear=False):
+                _reset_native_rco_lib_cache()
+                self.assertIsNone(_load_native_rco_lib())
+                with self.assertRaises(RuntimeError):
+                    quantize_raw_rows_affine_native(bf16_raw[: 2 * 128], 2, 1, 128, 4, 64)
+                out_fb = tmp / "fb_disabled.amf"
+                rep_fb = gsq_convert(sf_dir, out_fb, target_bits=4.15, model_id="fb")
+                self.assertGreater(len(rep_fb.metas), 0)
+
+            for bad_lib in (str(tmp / "missing_libaminfer.dylib"), "/usr/lib/libSystem.B.dylib"):
+                with mock.patch.dict(
+                    os.environ,
+                    {"AMINFER_DISABLE_NATIVE_RCO": "0", "AMINFER_LIB_PATH": bad_lib},
+                    clear=False,
+                ):
+                    _reset_native_rco_lib_cache()
+                    self.assertIsNone(_load_native_rco_lib())
+            _reset_native_rco_lib_cache()
+
+    def test_native_rco_parity_all_bits_groups_dtypes_weighted_and_unweighted(self) -> None:
+        if _is_native_rco_disabled():
+            self.skipTest("AMINFER_DISABLE_NATIVE_RCO is set")
+        _reset_native_rco_lib_cache()
+        self.assertIsNotNone(
+            _load_native_rco_lib(),
+            "libaminfer.dylib with ami_sdk_quantize_rows_affine_raw not found; run `zig build` first",
+        )
+
+        dequant_by_bits = {
+            2: dequantize_q2_row_f32,
+            3: dequantize_q3_row_f32,
+            4: dequantize_q4_row_f32,
+            5: dequantize_q5_row_f32,
+            6: dequantize_q6_row_f32,
+            8: dequantize_q8_row_f32,
+        }
+        rng = random.Random(81501)
+        n_rows = 8
+        k = 128
+
+        # Build deterministic raw buffers for F32 (0), F16 (1), and BF16 (2) with outliers.
+        base_floats = [
+            rng.gauss(0.0, 0.35) * (5.5 if rng.random() < 0.06 else 1.0)
+            for _ in range(n_rows * k)
+        ]
+        f32_raw = struct.pack(f"<{len(base_floats)}f", *base_floats)
+        f16_raw = struct.pack(f"<{len(base_floats)}e", *base_floats)
+        bf16_raw = bytearray(len(base_floats) * 2)
+        bf16_raw[0::2] = f32_raw[2::4]
+        bf16_raw[1::2] = f32_raw[3::4]
+
+        dtype_inputs = (
+            (0, bytes(f32_raw), f32_bytes_to_f32_list(f32_raw)),
+            (1, bytes(f16_raw), f16_bytes_to_f32_list(f16_raw)),
+            (2, bytes(bf16_raw), bf16_bytes_to_f32_list(bf16_raw)),
+        )
+        col_weights_skewed = [
+            (25.0 if (c % 32) < 8 else (0.0 if c == 9 else (-1.0 if c == 10 else 0.05)))
+            for c in range(k)
+        ]
+
+        for code, raw_buf, flat_vals in dtype_inputs:
+            rows_f32 = [flat_vals[r * k : (r + 1) * k] for r in range(n_rows)]
+            for group_size in (32, 64, 128):
+                row_p_bytes = (k // group_size) * 4
+                for bits in (2, 3, 4, 5, 6, 8):
+                    row_d_bytes = (k * bits) // 8
+                    deq_fn = dequant_by_bits[bits]
+                    for cw in (None, col_weights_skewed):
+                        qb_mm, pb_mm, mse_mm_nat = quantize_raw_rows_affine_native(
+                            raw_buf, code, n_rows, k, bits, group_size, False, 3, cw, 1
+                        )
+                        qb_nat, pb_nat, mse_nat = quantize_raw_rows_affine_native(
+                            raw_buf, code, n_rows, k, bits, group_size, True, 3, cw, 1
+                        )
+                        qb_py, pb_py, mse_py, _ = quantize_rows_affine(
+                            rows_f32,
+                            bits,
+                            group_size=group_size,
+                            use_rco=True,
+                            rco_iters=3,
+                            col_weights=cw,
+                        )
+                        qb_py_mm, pb_py_mm, mse_py_mm, _ = quantize_rows_affine(
+                            rows_f32,
+                            bits,
+                            group_size=group_size,
+                            use_rco=False,
+                            rco_iters=3,
+                            col_weights=cw,
+                        )
+
+                        # Minmax is closed-form and must match pure Python tightly.
+                        self.assertAlmostEqual(mse_mm_nat, mse_py_mm, places=5)
+                        # RCO invariant: mse_rco <= mse_minmax everywhere.
+                        self.assertLessEqual(mse_nat, mse_mm_nat + 1e-9)
+                        # Native RCO MSE matches pure Python closely (<= 1e-4 absolute diff).
+                        self.assertLessEqual(
+                            abs(mse_nat - mse_py),
+                            1e-4,
+                            msg=f"MSE mismatch dtype={code} gs={group_size} bits={bits} cw={cw is not None}: {mse_nat} vs {mse_py}",
+                        )
+
+                        # Dequantized row-by-row parity check against pure Python.
+                        max_deq_diff = 0.0
+                        for r in range(n_rows):
+                            d_n = qb_nat[r * row_d_bytes : (r + 1) * row_d_bytes]
+                            p_n = pb_nat[r * row_p_bytes : (r + 1) * row_p_bytes]
+                            d_p = qb_py[r * row_d_bytes : (r + 1) * row_d_bytes]
+                            p_p = pb_py[r * row_p_bytes : (r + 1) * row_p_bytes]
+                            dec_n = deq_fn(d_n, p_n, k, group_size=group_size)
+                            dec_p = deq_fn(d_p, p_p, k, group_size=group_size)
+                            for vn, vp in zip(dec_n, dec_p):
+                                max_deq_diff = max(max_deq_diff, abs(vn - vp))
+                        if qb_nat != qb_py or pb_nat != pb_py:
+                            # Even if an IEEE rounding boundary picks an adjacent step, native MSE must match!
+                            self.assertLessEqual(mse_nat, mse_py + 1e-6)
+                        else:
+                            self.assertLessEqual(max_deq_diff, 1e-4)
+
+        # Multi-threaded determinism (n_rows=64 >= 32 triggers std.Thread pool in Zig).
+        mt_bf16 = _rand_bf16_bytes(rng, 64 * 256, 0.3, outlier_prob=0.05)
+        mt_cw = [1.0 + (c % 17) * 0.5 for c in range(256)]
+        qb_1t, pb_1t, mse_1t = quantize_raw_rows_affine_native(mt_bf16, 2, 64, 256, 3, 64, True, 3, mt_cw, 1)
+        qb_4t, pb_4t, mse_4t = quantize_raw_rows_affine_native(mt_bf16, 2, 64, 256, 3, 64, True, 3, mt_cw, 4)
+        self.assertEqual(qb_1t, qb_4t)
+        self.assertEqual(pb_1t, pb_4t)
+        self.assertAlmostEqual(mse_1t, mse_4t, places=11)
+
+        # Edge-case imatrix weights (NaN, +inf, all-zero) must not produce NaN/inf params or crash.
+        weird_cw = [float("nan"), float("inf"), 0.0, -5.0] * 64
+        qb_w, pb_w, mse_w = quantize_raw_rows_affine_native(mt_bf16[: 4 * 256 * 2], 2, 4, 256, 4, 64, True, 3, weird_cw, 1)
+        self.assertTrue(math.isfinite(mse_w))
+        self.assertEqual(len(qb_w), 4 * 128)
+        self.assertEqual(len(pb_w), 4 * 4 * 4)
+
+    def test_native_gsq_convert_sensitivity_parity_and_speedup(self) -> None:
+        if _is_native_rco_disabled():
+            self.skipTest("AMINFER_DISABLE_NATIVE_RCO is set")
+        _reset_native_rco_lib_cache()
+        self.assertIsNotNone(_load_native_rco_lib())
+
+        rng = random.Random(90909)
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            sf_dir = tmp / "moe_native_ckpt"
+            _build_synthetic_bf16_qwen3_checkpoint(
+                sf_dir,
+                is_moe=True,
+                seed=777,
+                num_layers=2,
+                num_experts=6,
+                top_k=2,
+            )
+
+            # 1. Sensitivity probing (`_analyze_tensor_sample`) parity: native vs pure-Python fallback.
+            src = _UnifiedSource(sf_dir, group_size=64, cold_experts=set())
+            try:
+                cand_specs = [(DType.Q2_AFFINE, 64), (DType.Q3_AFFINE, 64), (DType.Q4_AFFINE, 64), (DType.Q6_AFFINE, 32)]
+                two_d = [t for t in src.tensors if len(t.shape) == 2][:6]
+                for idx_t, t_obj in enumerate(two_d):
+                    cw = [1.0 + (c % 11) * 0.8 for c in range(t_obj.shape[1])] if idx_t % 2 == 1 else None
+                    var_n, out_n, mse_n = _analyze_tensor_sample(
+                        src, t_obj, cand_specs=cand_specs, sample_rows=16, use_rco=True, rco_iters=3, col_weights=cw
+                    )
+                    with mock.patch.dict(os.environ, {"AMINFER_DISABLE_NATIVE_RCO": "1"}, clear=False):
+                        var_p, out_p, mse_p = _analyze_tensor_sample(
+                            src, t_obj, cand_specs=cand_specs, sample_rows=16, use_rco=True, rco_iters=3, col_weights=cw
+                        )
+                    self.assertAlmostEqual(var_n, var_p, places=6)
+                    self.assertAlmostEqual(out_n, out_p, places=6)
+                    for spec_k in mse_p:
+                        self.assertLessEqual(abs(mse_n[spec_k] - mse_p[spec_k]), 1e-4)
+            finally:
+                src.close()
+
+            # 2. Full `gsq_convert` parity across ROW_MAJOR (`sme2_pack="none"`) and SME2_PANEL64 (`all-linear`).
+            for sme2_mode in ("none", "all-linear"):
+                amf_nat = tmp / f"out_nat_{sme2_mode}.amf"
+                amf_py = tmp / f"out_py_{sme2_mode}.amf"
+                rep_nat = gsq_convert(
+                    sf_dir, amf_nat, target_bits=3.50, sme2_pack=sme2_mode, fine_rungs=(sme2_mode == "none"), workers=4
+                )
+                with mock.patch.dict(os.environ, {"AMINFER_DISABLE_NATIVE_RCO": "1"}, clear=False):
+                    rep_py = gsq_convert(
+                        sf_dir, amf_py, target_bits=3.50, sme2_pack=sme2_mode, fine_rungs=(sme2_mode == "none"), workers=1
+                    )
+                self.assertAlmostEqual(rep_nat.effective_bits, rep_py.effective_bits, places=5)
+                self.assertAlmostEqual(rep_nat.mean_quant_mse, rep_py.mean_quant_mse, places=5)
+                with AmfReader(amf_nat) as r_n, AmfReader(amf_py) as r_p:
+                    self.assertEqual([m.name for m in r_n.entries], [m.name for m in r_p.entries])
+                    for m_n, m_p in zip(r_n.entries, r_p.entries):
+                        self.assertEqual(m_n.dtype, m_p.dtype)
+                        self.assertEqual(m_n.layout, m_p.layout)
+                        self.assertEqual(m_n.group_size, m_p.group_size)
+                        if len(m_n.shape) == 2:
+                            mat_n = r_n.read_matrix_f32(m_n)
+                            mat_p = r_p.read_matrix_f32(m_p)
+                            max_diff = max(
+                                abs(vn - vp) for rn, rp in zip(mat_n, mat_p) for vn, vp in zip(rn, rp)
+                            )
+                            self.assertLessEqual(max_diff, 1e-3)
+
+            # 3. Throughput benchmark: native multi-threaded RCO vs pure-Python `quantize_rows_affine`.
+            bench_rows, bench_k = 256, 512
+            bench_bf16 = _rand_bf16_bytes(rng, bench_rows * bench_k, 0.25, outlier_prob=0.05)
+            bench_flat = bf16_bytes_to_f32_list(bench_bf16)
+            bench_mat = [bench_flat[r * bench_k : (r + 1) * bench_k] for r in range(bench_rows)]
+
+            t0 = time.perf_counter()
+            quantize_rows_affine(bench_mat, 3, group_size=64, use_rco=True, rco_iters=3)
+            py_sec = time.perf_counter() - t0
+
+            # Warm up CDLL call path once, then measure native multi-threaded call.
+            quantize_raw_rows_affine_native(bench_bf16, 2, bench_rows, bench_k, 3, 64, True, 3, None, 0)
+            t1 = time.perf_counter()
+            for _ in range(10):
+                quantize_raw_rows_affine_native(bench_bf16, 2, bench_rows, bench_k, 3, 64, True, 3, None, 0)
+            nat_sec = (time.perf_counter() - t1) / 10.0
+            speedup = py_sec / max(1e-9, nat_sec)
+            self.assertGreater(speedup, 5.0, msg=f"expected >5x native RCO speedup, got {speedup:.2f}x")
 
 
 if __name__ == "__main__":

@@ -22,9 +22,13 @@ dependencies). Implements:
 
 from __future__ import annotations
 
+import array
 import bisect
 import concurrent.futures
+import ctypes
+import ctypes.util
 import heapq
+import itertools
 import json
 import math
 import os
@@ -140,6 +144,21 @@ _DTYPE_BITS_RANK = {
     DType.U32: 32,
 }
 _ROW_BATCH_SIZE = 128  # multiple of SME2_PANEL_COLS (16); bounds streaming RAM
+_NATIVE_ROW_BATCH_MAX = 1024  # multiple of SME2_PANEL_COLS (16)
+_NATIVE_BATCH_MAX_BYTES = 16 * 1024 * 1024  # <= 16 MiB raw input keeps host RSS < 32 MiB
+_NATIVE_DTYPE_F32 = 0
+_NATIVE_DTYPE_F16 = 1
+_NATIVE_DTYPE_BF16 = 2
+_NATIVE_FLOAT_DTYPES = {
+    DType.F32: _NATIVE_DTYPE_F32,
+    DType.F16: _NATIVE_DTYPE_F16,
+    DType.BF16: _NATIVE_DTYPE_BF16,
+}
+_SF_FLOAT_DTYPE_CODES = {
+    "F32": _NATIVE_DTYPE_F32,
+    "F16": _NATIVE_DTYPE_F16,
+    "BF16": _NATIVE_DTYPE_BF16,
+}
 
 
 def _clamp_f16(val: float) -> float:
@@ -720,6 +739,313 @@ def _quantize_worker_task(
         col_weights=col_weights,
     )
     return q_bytes, p_bytes, mse
+
+
+# ---------------------------------------------------------------------------
+# Optional Zero-Dependency `ctypes` Bridge to `libaminfer.dylib` Native RCO
+# ---------------------------------------------------------------------------
+
+_NATIVE_RCO_LIB_CACHE: dict[str, ctypes.CDLL | None] = {}
+_ACCELERATE_LIB_CACHE: list[ctypes.CDLL | None] = []
+_STATS_SCRATCH: dict[str, object] = {}
+
+
+class _VImageBuffer(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("height", ctypes.c_ulong),
+        ("width", ctypes.c_ulong),
+        ("rowBytes", ctypes.c_size_t),
+    ]
+
+
+def _is_native_rco_disabled() -> bool:
+    flag = os.environ.get("AMINFER_DISABLE_NATIVE_RCO", "")
+    return flag.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _reset_native_rco_lib_cache() -> None:
+    _NATIVE_RCO_LIB_CACHE.clear()
+
+
+def _load_native_rco_lib() -> ctypes.CDLL | None:
+    """Locate and cache `libaminfer.dylib` exposing `ami_sdk_quantize_rows_affine_raw`.
+
+    Returns `None` gracefully when `AMINFER_DISABLE_NATIVE_RCO=1`, `libaminfer.dylib`
+    has not been built, or an older library lacks `ami_sdk_quantize_rows_affine_raw`.
+    """
+    if _is_native_rco_disabled():
+        return None
+
+    env_path = os.environ.get("AMINFER_LIB_PATH", "").strip()
+    repo_cand = pathlib.Path(__file__).resolve().parents[3] / "zig-out" / "lib" / "libaminfer.dylib"
+    cache_key = env_path
+    if cache_key in _NATIVE_RCO_LIB_CACHE:
+        cached = _NATIVE_RCO_LIB_CACHE[cache_key]
+        if cached is not None or env_path or not repo_cand.is_file():
+            return cached
+
+    candidates: list[str] = []
+    if env_path:
+        candidates.append(str(pathlib.Path(env_path).expanduser()))
+    else:
+        if repo_cand.is_file():
+            candidates.append(str(repo_cand))
+        candidates.append("libaminfer.dylib")
+        found = ctypes.util.find_library("aminfer")
+        if found:
+            candidates.append(found)
+
+    for cand in candidates:
+        try:
+            lib = ctypes.CDLL(cand)
+        except OSError:
+            continue
+        fn = getattr(lib, "ami_sdk_quantize_rows_affine_raw", None)
+        if fn is None:
+            continue
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        fn.restype = ctypes.c_int32
+        _NATIVE_RCO_LIB_CACHE[cache_key] = lib
+        return lib
+
+    _NATIVE_RCO_LIB_CACHE[cache_key] = None
+    return None
+
+
+def _load_accelerate_lib() -> ctypes.CDLL | None:
+    """Load macOS `Accelerate.framework` (`vDSP` / `vImage`) for raw float row statistics."""
+    if _is_native_rco_disabled():
+        return None
+    if _ACCELERATE_LIB_CACHE:
+        return _ACCELERATE_LIB_CACHE[0]
+    try:
+        accel = ctypes.CDLL("/System/Library/Frameworks/Accelerate.framework/Accelerate")
+        accel.vDSP_vspdp.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.c_ulong,
+        ]
+        accel.vDSP_sveD.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_ulong,
+        ]
+        accel.vDSP_svesqD.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_ulong,
+        ]
+        accel.vDSP_maxmgvD.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_ulong,
+        ]
+        accel.vImageConvert_Planar16FtoPlanarF.argtypes = [
+            ctypes.POINTER(_VImageBuffer),
+            ctypes.POINTER(_VImageBuffer),
+            ctypes.c_uint32,
+        ]
+        accel.vImageConvert_Planar16FtoPlanarF.restype = ctypes.c_long
+    except (OSError, AttributeError):
+        accel = None
+    _ACCELERATE_LIB_CACHE.append(accel)
+    return accel
+
+
+def _raw_float_stats_fast(
+    raw_bytes: bytes,
+    src_dtype_code: int,
+    n_vals: int,
+) -> tuple[float, float, float]:
+    """Compute `(sum_w, sum_w2, max_abs)` in float64 directly from raw float bytes."""
+    if n_vals <= 0:
+        return 0.0, 0.0, 0.0
+    accel = _load_accelerate_lib()
+    if accel is not None:
+        f32_ref: object
+        f32_ok = True
+        if src_dtype_code == _NATIVE_DTYPE_F32:
+            f32_ref = ctypes.c_char_p(raw_bytes)
+        elif src_dtype_code == _NATIVE_DTYPE_BF16:
+            prev_ba = _STATS_SCRATCH.get("bf16_f32")
+            if not isinstance(prev_ba, bytearray) or len(prev_ba) < n_vals * 4:
+                prev_ba = bytearray(n_vals * 4)
+                _STATS_SCRATCH["bf16_f32"] = prev_ba
+            prev_ba[2 : n_vals * 4 : 4] = raw_bytes[0::2]
+            prev_ba[3 : n_vals * 4 : 4] = raw_bytes[1::2]
+            f32_ref = (ctypes.c_char * (n_vals * 4)).from_buffer(prev_ba)
+        else:
+            f32_arr = (ctypes.c_float * n_vals)()
+            src_vb = _VImageBuffer(
+                ctypes.cast(ctypes.c_char_p(raw_bytes), ctypes.c_void_p),
+                1,
+                n_vals,
+                n_vals * 2,
+            )
+            dst_vb = _VImageBuffer(
+                ctypes.cast(f32_arr, ctypes.c_void_p),
+                1,
+                n_vals,
+                n_vals * 4,
+            )
+            if accel.vImageConvert_Planar16FtoPlanarF(ctypes.byref(src_vb), ctypes.byref(dst_vb), 0) != 0:
+                f32_ok = False
+            f32_ref = f32_arr
+
+        if f32_ok:
+            prev_f64 = _STATS_SCRATCH.get("f64")
+            if not isinstance(prev_f64, ctypes.Array) or len(prev_f64) < n_vals:
+                prev_f64 = (ctypes.c_double * n_vals)()
+                _STATS_SCRATCH["f64"] = prev_f64
+            accel.vDSP_vspdp(f32_ref, 1, prev_f64, 1, n_vals)
+            out_sum = ctypes.c_double(0.0)
+            out_sq = ctypes.c_double(0.0)
+            out_max = ctypes.c_double(0.0)
+            accel.vDSP_sveD(prev_f64, 1, ctypes.byref(out_sum), n_vals)
+            accel.vDSP_svesqD(prev_f64, 1, ctypes.byref(out_sq), n_vals)
+            accel.vDSP_maxmgvD(prev_f64, 1, ctypes.byref(out_max), n_vals)
+            s_v = float(out_sum.value)
+            sq_v = float(out_sq.value)
+            mx_v = float(out_max.value)
+            if math.isfinite(s_v) and math.isfinite(sq_v) and math.isfinite(mx_v):
+                return s_v, sq_v, mx_v
+
+    vals = (
+        f32_bytes_to_f32_list(raw_bytes)
+        if src_dtype_code == _NATIVE_DTYPE_F32
+        else (f16_bytes_to_f32_list(raw_bytes) if src_dtype_code == _NATIVE_DTYPE_F16 else bf16_bytes_to_f32_list(raw_bytes))
+    )
+    sum_w = math.fsum(vals)
+    sum_w2 = math.sumprod(vals, vals)
+    max_abs = max(abs(min(vals)), abs(max(vals))) if vals else 0.0
+    return sum_w, sum_w2, max_abs
+
+
+def _pack_col_weights_c_f32(
+    col_weights: Sequence[float] | ctypes.Array[ctypes.c_float] | None,
+    k: int,
+) -> ctypes.Array[ctypes.c_float] | None:
+    if col_weights is None:
+        return None
+    if isinstance(col_weights, ctypes.Array):
+        if len(col_weights) != k:
+            raise ValueError(f"col_weights length {len(col_weights)} != row width k={k}")
+        return col_weights
+    if len(col_weights) != k:
+        raise ValueError(f"col_weights length {len(col_weights)} != row width k={k}")
+    try:
+        arr = array.array("f", col_weights)
+    except OverflowError:
+        clamped = [
+            float(x) if (not math.isfinite(float(x)) or abs(float(x)) <= 3.4e38) else math.copysign(3.4e38, float(x))
+            for x in col_weights
+        ]
+        arr = array.array("f", clamped)
+    return (ctypes.c_float * k).from_buffer(arr)
+
+
+def quantize_raw_rows_affine_native(
+    raw_bytes: bytes | bytearray | memoryview,
+    src_dtype_code: int,
+    n_rows: int,
+    k: int,
+    bits: int,
+    group_size: int = 64,
+    use_rco: bool = True,
+    rco_iters: int = 3,
+    col_weights: Sequence[float] | ctypes.Array[ctypes.c_float] | None = None,
+    num_threads: int = 0,
+) -> tuple[bytes, bytes, float]:
+    """Quantize raw contiguous `[n_rows, k]` F32/F16/BF16 bytes via `libaminfer.dylib`.
+
+    `src_dtype_code`: `0 = F32`, `1 = F16`, `2 = BF16`.
+    Returns `(qweight_bytes, scale_bias_f16_bytes, mean_mse)` with zero `PyFloatObject`
+    allocations on the weight matrix.
+    """
+    if src_dtype_code not in (_NATIVE_DTYPE_F32, _NATIVE_DTYPE_F16, _NATIVE_DTYPE_BF16):
+        raise ValueError(f"unsupported native src_dtype_code {src_dtype_code} (expected 0=F32, 1=F16, 2=BF16)")
+    if bits not in _SUPPORTED_AFFINE_BITS:
+        raise ValueError(f"unsupported quant bits {bits}")
+    if group_size not in AFFINE_GROUP_SIZES:
+        raise ValueError(f"unsupported quant group_size {group_size} (expected {AFFINE_GROUP_SIZES})")
+    if k <= 0 or k % group_size != 0:
+        raise ValueError(f"quantized row width k={k} must be a positive multiple of {group_size}")
+    if n_rows < 0:
+        raise ValueError(f"n_rows must be non-negative, got {n_rows}")
+
+    elem_bytes = 4 if src_dtype_code == _NATIVE_DTYPE_F32 else 2
+    expected_bytes = n_rows * k * elem_bytes
+    raw_mv = memoryview(raw_bytes)
+    if raw_mv.nbytes != expected_bytes:
+        raise ValueError(
+            f"raw_bytes length {raw_mv.nbytes} != expected {expected_bytes} for [{n_rows}, {k}] (dtype_code={src_dtype_code})"
+        )
+    cw_c = _pack_col_weights_c_f32(col_weights, k)
+    if n_rows == 0:
+        return b"", b"", 0.0
+
+    lib = _load_native_rco_lib()
+    if lib is None:
+        raise RuntimeError("libaminfer native RCO helper (ami_sdk_quantize_rows_affine_raw) is not available")
+
+    src_keepalive: object
+    if isinstance(raw_bytes, bytes):
+        src_keepalive = raw_bytes
+        src_arg: object = ctypes.c_char_p(raw_bytes)
+    elif not raw_mv.readonly and raw_mv.contiguous:
+        src_keepalive = raw_mv
+        src_arg = (ctypes.c_char * expected_bytes).from_buffer(raw_mv)
+    else:
+        raw_copy = raw_mv.tobytes()
+        src_keepalive = raw_copy
+        src_arg = ctypes.c_char_p(raw_copy)
+
+    q_len = n_rows * ((k * bits) // 8)
+    p_len = n_rows * (k // group_size) * 4
+    q_buf = ctypes.create_string_buffer(q_len)
+    p_buf = ctypes.create_string_buffer(p_len)
+    mse_out = ctypes.c_double(0.0)
+    eff_threads = max(0, int(num_threads))
+
+    rc = lib.ami_sdk_quantize_rows_affine_raw(
+        src_arg,
+        src_dtype_code,
+        n_rows,
+        k,
+        bits,
+        group_size,
+        1 if use_rco else 0,
+        max(0, int(rco_iters)),
+        cw_c,
+        eff_threads,
+        q_buf,
+        p_buf,
+        ctypes.byref(mse_out),
+    )
+    _ = src_keepalive
+    if rc != 0:
+        raise RuntimeError(f"ami_sdk_quantize_rows_affine_raw failed with status {rc}")
+    return q_buf.raw, p_buf.raw, float(mse_out.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2597,6 +2923,90 @@ class _UnifiedSource:
             mv = memoryview(raw)
             yield [_decode_sf_floats(mv[i * row_b : (i + 1) * row_b], e.data.dtype) for i in range(cnt)]
 
+    def can_stream_raw_float_rows(self, t: _SourceTensor) -> bool:
+        """Return True when `t` is stored on disk as contiguous row-major F32/F16/BF16 rows."""
+        if len(t.shape) != 2 or t.dtype not in _NATIVE_FLOAT_DTYPES:
+            return False
+        if self._amf_reader is not None:
+            m = t.amf_meta
+            return m is not None and m.layout == TensorLayout.ROW_MAJOR and m.dtype in _NATIVE_FLOAT_DTYPES
+        if self._sf_readers is not None:
+            e = t.sf_entry
+            return (
+                e is not None
+                and e.dtype in _NATIVE_FLOAT_DTYPES
+                and e.scales is None
+                and e.data.dtype in _SF_FLOAT_DTYPE_CODES
+            )
+        return False
+
+    def _raw_float_source_info(self, t: _SourceTensor) -> tuple[object, int, int, int]:
+        """Return `(fh, base_offset, src_dtype_code, elem_bytes)` for a raw row-major float tensor."""
+        if self._amf_reader is not None:
+            m = t.amf_meta
+            if m is None or m.layout != TensorLayout.ROW_MAJOR or m.dtype not in _NATIVE_FLOAT_DTYPES:
+                raise ValueError(f"tensor {t.name} is not a contiguous row-major float AMF entry")
+            code = _NATIVE_FLOAT_DTYPES[m.dtype]
+            elem_b = 4 if code == _NATIVE_DTYPE_F32 else 2
+            return self._amf_reader._fh, m.blob_offset, code, elem_b
+        assert self._sf_readers is not None and t.sf_entry is not None
+        e = t.sf_entry
+        if e.dtype not in _NATIVE_FLOAT_DTYPES or e.scales is not None or e.data.dtype not in _SF_FLOAT_DTYPE_CODES:
+            raise ValueError(f"tensor {t.name} is not a contiguous row-major float safetensors entry")
+        code = _SF_FLOAT_DTYPE_CODES[e.data.dtype]
+        elem_b = 4 if code == _NATIVE_DTYPE_F32 else 2
+        return self._sf_readers.get(e.data.path), e.data.offset, code, elem_b
+
+    def read_raw_float_rows(self, t: _SourceTensor, row_indices: Sequence[int]) -> tuple[bytes, int]:
+        """Read selected 2D rows directly as contiguous raw float bytes `(raw_bytes, src_dtype_code)`."""
+        n_rows, k = t.shape
+        fh, base_off, code, elem_b = self._raw_float_source_info(t)
+        if not row_indices:
+            return b"", code
+        row_b = k * elem_b
+        first = row_indices[0]
+        if (
+            0 <= first
+            and first + len(row_indices) <= n_rows
+            and all(r == first + idx for idx, r in enumerate(row_indices))
+        ):
+            return _read_exact(fh, base_off + first * row_b, len(row_indices) * row_b), code  # type: ignore[arg-type]
+        out = bytearray(len(row_indices) * row_b)
+        fileno_fn = getattr(fh, "fileno", None)
+        fd: int | None = None
+        if callable(fileno_fn):
+            try:
+                fd = int(fileno_fn())
+            except OSError:
+                fd = None
+        for idx, r in enumerate(row_indices):
+            if r < 0 or r >= n_rows:
+                raise IndexError(f"row {r} out of bounds for {t.name}")
+            off = base_off + r * row_b
+            if fd is not None:
+                chunk = os.pread(fd, row_b, off)
+                if len(chunk) != row_b:
+                    raise ValueError(f"truncated pread at offset {off} for {t.name}")
+                out[idx * row_b : (idx + 1) * row_b] = chunk
+            else:
+                out[idx * row_b : (idx + 1) * row_b] = _read_exact(fh, off, row_b)  # type: ignore[arg-type]
+        return bytes(out), code
+
+    def iter_raw_float_row_batches(
+        self,
+        t: _SourceTensor,
+        batch_rows: int = _NATIVE_ROW_BATCH_MAX,
+    ) -> Iterator[tuple[bytes, int, int]]:
+        """Stream contiguous raw F32/F16/BF16 row batches `(raw_bytes, src_dtype_code, row_count)`."""
+        if batch_rows <= 0:
+            raise ValueError(f"batch_rows must be positive, got {batch_rows}")
+        n_rows, k = t.shape
+        fh, base_off, code, elem_b = self._raw_float_source_info(t)
+        row_b = k * elem_b
+        for r0 in range(0, n_rows, batch_rows):
+            cnt = min(batch_rows, n_rows - r0)
+            yield _read_exact(fh, base_off + r0 * row_b, cnt * row_b), code, cnt  # type: ignore[arg-type]
+
     def read_q3_raw_slices(self, t: _SourceTensor) -> tuple[bytes, bytes, bytes | None, str] | None:
         """Read contiguous raw `q3_affine` data & scales/biases in <=3 `pread`s when row-major."""
         if t.dtype != DType.Q3_AFFINE or t.group_size != 64 or len(t.shape) != 2:
@@ -2941,6 +3351,77 @@ def _analyze_tensor_sample(
             return var_f, out_f, {(dt, 64): mse_map[dt] for dt, _ in quant_specs if dt in mse_map}
     n_rows, k = t.shape
     row_ids = _sample_row_indices(n_rows, sample_rows)
+    native_lib = _load_native_rco_lib()
+    if native_lib is not None and src.can_stream_raw_float_rows(t):
+        raw_rows, src_dtype_code = src.read_raw_float_rows(t, row_ids)
+        elem_b = 4 if src_dtype_code == _NATIVE_DTYPE_F32 else 2
+        n_sampled_rows = len(row_ids)
+        n_vals = n_sampled_rows * k
+        sum_w, sum_w2, max_abs = _raw_float_stats_fast(raw_rows, src_dtype_code, n_vals)
+        mean = sum_w / max(1, n_vals)
+        var = max(1e-12, sum_w2 / max(1, n_vals) - mean * mean)
+        rms = math.sqrt(sum_w2 / max(1, n_vals))
+        outlier_ratio = max_abs / max(1e-8, rms)
+
+        raw_mv = memoryview(raw_rows)
+        row_b = k * elem_b
+        max_groups = 64
+        has_cw = col_weights is not None and len(col_weights) == k
+        sampled_raw_by_gs: dict[int, tuple[bytes, ctypes.Array[ctypes.c_float] | None, int]] = {}
+
+        def _get_sampled_raw_groups(gs: int) -> tuple[bytes, ctypes.Array[ctypes.c_float] | None, int]:
+            cached_raw = sampled_raw_by_gs.get(gs)
+            if cached_raw is not None:
+                return cached_raw
+            groups_per_row = k // gs
+            total_avail = n_sampled_rows * groups_per_row
+            if total_avail <= 0:
+                res_empty: tuple[bytes, ctypes.Array[ctypes.c_float] | None, int] = (b"", None, 0)
+                sampled_raw_by_gs[gs] = res_empty
+                return res_empty
+            stride = max(1, total_avail // max_groups)
+            m_cnt = min(max_groups, (total_avail + stride - 1) // stride)
+            grp_b = gs * elem_b
+            s_buf = bytearray(m_cnt * grp_b)
+            cw_flat: list[float] | None = [] if has_cw else None
+            for idx_m in range(m_cnt):
+                r_i, g_i = divmod(idx_m * stride, groups_per_row)
+                off = r_i * row_b + g_i * grp_b
+                s_buf[idx_m * grp_b : (idx_m + 1) * grp_b] = raw_mv[off : off + grp_b]
+                if cw_flat is not None and col_weights is not None:
+                    cw_flat.extend(col_weights[g_i * gs : (g_i + 1) * gs])
+            cw_c = _pack_col_weights_c_f32(cw_flat, m_cnt * gs) if cw_flat is not None else None
+            res = (bytes(s_buf), cw_c, m_cnt)
+            sampled_raw_by_gs[gs] = res
+            return res
+
+        mse_by_spec_fast: dict[tuple[DType, int], float] = {}
+        for dt, gs in quant_specs:
+            if t.dtype == dt and (t.group_size or gs) == gs:
+                mse_by_spec_fast[(dt, gs)] = 0.0
+                continue
+            bits = _DTYPE_BITS_RANK[dt]
+            s_bytes, s_cw_c, m_cnt = _get_sampled_raw_groups(gs)
+            if m_cnt == 0:
+                mse_by_spec_fast[(dt, gs)] = 0.0
+                continue
+            _, _, m_mean = quantize_raw_rows_affine_native(
+                s_bytes,
+                src_dtype_code,
+                1,
+                m_cnt * gs,
+                bits,
+                gs,
+                use_rco,
+                rco_iters,
+                s_cw_c,
+                1,
+            )
+            mse_by_spec_fast[(dt, gs)] = m_mean
+
+        outlier_factor = 1.0 + 0.12 * max(0.0, outlier_ratio - 3.0)
+        return var, outlier_factor, mse_by_spec_fast
+
     rows = src.read_rows_f32(t, row_ids)
 
     n_vals = 0
@@ -2990,6 +3471,24 @@ def _analyze_tensor_sample(
             continue
         bits = _DTYPE_BITS_RANK[dt]
         s_grps, s_wts = _get_sampled_groups(gs)
+        if native_lib is not None and s_grps:
+            m_cnt = len(s_grps)
+            f32_bytes = array.array("f", itertools.chain.from_iterable(s_grps)).tobytes()
+            cw_flat_dec = list(itertools.chain.from_iterable(s_wts)) if s_wts is not None else None
+            _, _, m_mean = quantize_raw_rows_affine_native(
+                f32_bytes,
+                _NATIVE_DTYPE_F32,
+                1,
+                m_cnt * gs,
+                bits,
+                gs,
+                use_rco,
+                rco_iters,
+                cw_flat_dec,
+                1,
+            )
+            mse_by_spec[(dt, gs)] = m_mean
+            continue
         m_sum = 0.0
         qmax = (1 << bits) - 1
         for idx_g, grp in enumerate(s_grps):
@@ -3034,6 +3533,7 @@ def _stream_quantize_tensor(
     col_weights: Sequence[float] | None = None,
     w: _BlobWriter,
     pool: concurrent.futures.ProcessPoolExecutor | None,
+    workers: int | None = None,
 ) -> float:
     """Stream-quantize a 2D tensor into `row_major`, affine `sme2_panel64`, or `lut16_codebook` `sme2_panel64`."""
     n_rows, k = t.shape
@@ -3113,8 +3613,50 @@ def _stream_quantize_tensor(
             return mse_fast
 
     col_w_list = list(col_weights) if col_weights is not None else None
+    native_lib = _load_native_rco_lib()
 
     def _iter_quantized_batches() -> Iterator[tuple[bytes, bytes, float]]:
+        if native_lib is not None:
+            native_threads = max(1, workers or os.cpu_count() or 4)
+            cw_c = _pack_col_weights_c_f32(col_w_list, k)
+            if src.can_stream_raw_float_rows(t):
+                elem_b = 4 if t.dtype == DType.F32 else 2
+                row_b = max(1, k * elem_b)
+                raw_cap = max(SME2_PANEL_COLS, min(_NATIVE_ROW_BATCH_MAX, _NATIVE_BATCH_MAX_BYTES // row_b))
+                native_batch_rows = max(SME2_PANEL_COLS, (raw_cap // SME2_PANEL_COLS) * SME2_PANEL_COLS)
+                for raw_batch, src_dtype_code, cnt in src.iter_raw_float_row_batches(t, native_batch_rows):
+                    yield quantize_raw_rows_affine_native(
+                        raw_batch,
+                        src_dtype_code,
+                        cnt,
+                        k,
+                        bits,
+                        group_size,
+                        use_rco,
+                        rco_iters,
+                        cw_c,
+                        native_threads,
+                    )
+                return
+
+            dec_cap = max(SME2_PANEL_COLS, min(512, _NATIVE_BATCH_MAX_BYTES // max(1, k * 4)))
+            dec_batch_rows = max(SME2_PANEL_COLS, (dec_cap // SME2_PANEL_COLS) * SME2_PANEL_COLS)
+            for batch in src.iter_row_batches_f32(t, dec_batch_rows):
+                f32_bytes = array.array("f", itertools.chain.from_iterable(batch)).tobytes()
+                yield quantize_raw_rows_affine_native(
+                    f32_bytes,
+                    _NATIVE_DTYPE_F32,
+                    len(batch),
+                    k,
+                    bits,
+                    group_size,
+                    use_rco,
+                    rco_iters,
+                    cw_c,
+                    native_threads,
+                )
+            return
+
         if pool is None or n_rows < _ROW_BATCH_SIZE * 2:
             for batch in src.iter_row_batches_f32(t, _ROW_BATCH_SIZE):
                 qb, pb, mse, _ = quantize_rows_affine(
@@ -3147,12 +3689,12 @@ def _stream_quantize_tensor(
             packer = pack_sme2_panel64_q3_panel
         else:
             packer = pack_sme2_panel64_q2_from_mlx_panel
-        mse_acc = 0.0
-        n_batches = 0
+        mse_row_sum = 0.0
+        rows_seen = 0
         for qb, pb, mse in _iter_quantized_batches():
-            mse_acc += mse
-            n_batches += 1
             b_rows = len(qb) // row_data_bytes
+            mse_row_sum += mse * b_rows
+            rows_seen += b_rows
             d_mv = memoryview(qb)
             p_mv = memoryview(pb)
             for p0 in range(0, b_rows, SME2_PANEL_COLS):
@@ -3161,19 +3703,20 @@ def _stream_quantize_tensor(
                 p_rows = [p_mv[(p0 + c) * row_param_bytes : (p0 + c + 1) * row_param_bytes] for c in range(cnt)]
                 w.write(packer(d_rows, p_rows, k))
         w.zeros(blob_bytes - w.written)
-        return mse_acc / max(1, n_batches)
+        return mse_row_sum / max(1, rows_seen)
 
     # ROW_MAJOR layout: `qweight` (`data_bytes`) -> 64 B pad -> `scale_bias` (`params_bytes`) -> 16 KiB pad.
     # Buffer only `params_bytes` (~4 B per 64 weights = 6.25% of float size, e.g. <= 10 MiB for 151936x1024).
     data_bytes, params_offset, params_bytes = _effective_payload_bytes(target_dtype, (n_rows, k), group_size)
     params_chunks: list[bytes] = []
-    mse_acc = 0.0
-    n_batches = 0
+    mse_row_sum = 0.0
+    rows_seen = 0
     for qb, pb, mse in _iter_quantized_batches():
+        b_rows = len(qb) // row_data_bytes
         w.write(qb)
         params_chunks.append(pb)
-        mse_acc += mse
-        n_batches += 1
+        mse_row_sum += mse * b_rows
+        rows_seen += b_rows
     if w.written != data_bytes:
         raise AssertionError(f"wrote {w.written} qweight bytes for {t.name}, expected {data_bytes}")
     w.zeros(params_offset - data_bytes)
@@ -3182,7 +3725,7 @@ def _stream_quantize_tensor(
     if w.written != params_offset + params_bytes:
         raise AssertionError(f"wrote {w.written} payload bytes for {t.name}, expected {params_offset + params_bytes}")
     w.zeros(blob_bytes - w.written)
-    return mse_acc / max(1, n_batches)
+    return mse_row_sum / max(1, rows_seen)
 
 
 @dataclass(frozen=True)
@@ -3806,7 +4349,17 @@ def gsq_convert(
         quant_tensor_count = 0
         lut16_tensor_count = 0
 
-        pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
+        native_rco_avail = _load_native_rco_lib() is not None
+        needs_py_pool = False
+        if workers > 1:
+            for t_s, _, t_dt, _, gs_s, _, pk_s, *_ in out_specs:
+                if t_dt in _QUANT_DTYPES and (
+                    t_dt != t_s.dtype or gs_s != t_s.group_size or pk_s == QuantParamKind.LUT16_CODEBOOK
+                ):
+                    if pk_s == QuantParamKind.LUT16_CODEBOOK or not native_rco_avail or t_s.dtype == DType.Q3_AFFINE:
+                        needs_py_pool = True
+                        break
+        pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers) if (workers > 1 and needs_py_pool) else None
         try:
             with partial.open("wb") as out_fh:
                 _set_nocache(out_fh.fileno())
@@ -3902,6 +4455,7 @@ def gsq_convert(
                             col_weights=col_weights_by_tensor.get(t.name),
                             w=w,
                             pool=pool,
+                            workers=workers if workers > 1 else None,
                         )
                         quant_mse_sum += mse_t
                         quant_tensor_count += 1
