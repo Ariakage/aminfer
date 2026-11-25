@@ -663,6 +663,106 @@ pub const Inkling2LoopController = struct {
         self.sme_ops_dispatched += 3;
     }
 
+    /// Executes exact `Inkling2LoopMessageGate` (HuggingFace `modeling_inkling2_loop.py`):
+    ///   `gate_in = [UnweightedRMSNorm(cur), UnweightedRMSNorm(msg)]` (`[m, 2*state_dim]`),
+    ///   `z = down_weight @ gate_in` (`[m, 64]`, L2-resident SME2),
+    ///   `forget = tanh(forget_weight @ z)`, `gain = tanh(gain_weight @ z)` (`[m, state_dim]`, SME2),
+    ///   `out = (1 - forget) * cur + gain * msg`.
+    /// Zero GPU dispatches and zero dynamic heap allocations.
+    pub fn stepMessageGate(
+        self: *Inkling2LoopController,
+        dispatcher: *sme.SmeDispatcher,
+        branch: ControllerBranch,
+        cur_f32: []const f32,
+        msg_f32: []const f32,
+        out_f32: []f32,
+        m: usize,
+        backend_override: ?sme.ExecutionBackend,
+    ) Error!void {
+        if (m == 0 or m > self.config.max_m) return error.InvalidArgument;
+        const cb = &self.branches[@backingInt(branch)];
+        const h: usize = self.config.hidden_size;
+        const r: usize = GATE_RANK;
+        const sd: usize = cb.config.state_dim;
+
+        const mh = std.math.mul(usize, m, h) catch return error.Overflow;
+        const mr = std.math.mul(usize, m, r) catch return error.Overflow;
+        const msd = std.math.mul(usize, m, sd) catch return error.Overflow;
+        if (cur_f32.len < msd or msg_f32.len < msd or out_f32.len < msd) {
+            return error.BufferTooSmall;
+        }
+
+        const down_is_bf16 = cb.down_weight.dtype.activationIsBf16();
+        const x_norm = if (down_is_bf16) self.x_norm_bf16.?[0..mh] else self.x_norm_f16.?[0..mh];
+        const act_dt_down: quant.FloatDType = if (down_is_bf16) .bf16 else .f16;
+        for (0..m) |row| {
+            const c_row = cur_f32[row * sd ..][0..sd];
+            const m_row = msg_f32[row * sd ..][0..sd];
+            if (h == sd * 2) {
+                rmsNormRowFast(c_row, null, self.config.rms_eps, act_dt_down, x_norm[row * h ..][0..sd]);
+                rmsNormRowFast(m_row, null, self.config.rms_eps, act_dt_down, x_norm[row * h + sd ..][0..sd]);
+            } else if (h == sd) {
+                rmsNormRowFast(c_row, null, self.config.rms_eps, act_dt_down, x_norm[row * h ..][0..sd]);
+            } else {
+                return error.InvalidArgument;
+            }
+        }
+
+        const z_out = self.z_f32[0..mr];
+        const down_op = [_]sme.BatchLinearOp{.{
+            .weight = cb.down_weight,
+            .a_u16 = x_norm,
+            .out_bytes = std.mem.sliceAsBytes(z_out),
+            .m = m,
+            .out_dtype = .f32,
+            .cache_hint = .temporal,
+        }};
+        try dispatcher.evalLinearBatchHoisted(&down_op, backend_override);
+
+        const forget_is_bf16 = cb.forget_weight.dtype.activationIsBf16();
+        const gain_is_bf16 = cb.gain_weight.dtype.activationIsBf16();
+        const z_forget_u16 = if (forget_is_bf16) self.z_u16_bf16.?[0..mr] else self.z_u16_f16.?[0..mr];
+        convertF32ToFloatBitsSlice(z_out, if (forget_is_bf16) .bf16 else .f16, z_forget_u16);
+        const z_gain_u16 = if (gain_is_bf16 == forget_is_bf16)
+            z_forget_u16
+        else blk: {
+            const dst = if (gain_is_bf16) self.z_u16_bf16.?[0..mr] else self.z_u16_f16.?[0..mr];
+            convertF32ToFloatBitsSlice(z_out, if (gain_is_bf16) .bf16 else .f16, dst);
+            break :blk dst;
+        };
+
+        const forget_raw = self.forget_raw_f32[0..msd];
+        const gain_raw = self.gain_raw_f32[0..msd];
+        const gate_ops = [_]sme.BatchLinearOp{
+            .{
+                .weight = cb.forget_weight,
+                .a_u16 = z_forget_u16,
+                .out_bytes = std.mem.sliceAsBytes(forget_raw),
+                .m = m,
+                .out_dtype = .f32,
+                .cache_hint = .temporal,
+            },
+            .{
+                .weight = cb.gain_weight,
+                .a_u16 = z_gain_u16,
+                .out_bytes = std.mem.sliceAsBytes(gain_raw),
+                .m = m,
+                .out_dtype = .f32,
+                .cache_hint = .temporal,
+            },
+        };
+        try dispatcher.evalLinearBatchHoisted(&gate_ops, backend_override);
+
+        for (0..msd) |i| {
+            const fg = std.math.tanh(forget_raw[i]);
+            const mg = std.math.tanh(gain_raw[i]);
+            out_f32[i] = (1.0 - fg) * cur_f32[i] + mg * msg_f32[i];
+        }
+
+        self.passes_executed += 1;
+        self.sme_ops_dispatched += 3;
+    }
+
     /// Executes all 4 branches (`attn`, `k`, `v`, `mlp`) sequentially on shared `h_f32`
     /// when each branch has `state_dim == hidden_size`.
     pub fn stepAllBranches(

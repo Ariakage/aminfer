@@ -105,7 +105,7 @@ pub const Sconv4Params = extern struct {
     conv_w_f16: u32,
     serial_tiles: u32,
     rms_eps: f32,
-    _pad0: u32 = 0,
+    post_residual_scale: f32 = 0.0,
 };
 
 pub const Inkling2RelGqaParams = extern struct {
@@ -146,7 +146,7 @@ pub const Inkling2MoeRouteParams = extern struct {
     norm_topk_prob: u32,
     route_scale: f32,
     router_softcap: f32,
-    _pad0: u32 = 0,
+    scoring_sigmoid: u32 = 0,
     _pad1: u32 = 0,
 };
 
@@ -155,6 +155,10 @@ pub const Inkling2MoeSwigluParams = extern struct {
     intermediate_size: u32,
     interleaved_gate_up: u32,
     softcap: f32,
+    gate_softcap: f32 = 0.0,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
 };
 
 pub const Inkling2MoeEpilogueParams = extern struct {
@@ -278,7 +282,7 @@ comptime {
     if (@sizeOf(Sconv4Params) != 48) @compileError("Sconv4Params must be 48 bytes");
     if (@sizeOf(Inkling2RelGqaParams) != 96) @compileError("Inkling2RelGqaParams must be 96 bytes");
     if (@sizeOf(Inkling2MoeRouteParams) != 48) @compileError("Inkling2MoeRouteParams must be 48 bytes");
-    if (@sizeOf(Inkling2MoeSwigluParams) != 16) @compileError("Inkling2MoeSwigluParams must be 16 bytes");
+    if (@sizeOf(Inkling2MoeSwigluParams) != 32) @compileError("Inkling2MoeSwigluParams must be 32 bytes");
     if (@sizeOf(Inkling2MoeEpilogueParams) != 32) @compileError("Inkling2MoeEpilogueParams must be 32 bytes");
     if (@sizeOf(Inkling2AttnResParams) != 80) @compileError("Inkling2AttnResParams must be 80 bytes");
     if (@sizeOf(Hy4IndexCompressParams) != 32) @compileError("Hy4IndexCompressParams must be 32 bytes");
@@ -698,6 +702,7 @@ pub const RmsNormSconv4Args = struct {
     apply_rms_norm: bool = true,
     apply_silu: bool = false,
     rms_eps: f32 = 1e-6,
+    post_residual_scale: f32 = 0.0,
 };
 
 pub const Inkling2RelGqaAttnArgs = struct {
@@ -721,6 +726,7 @@ pub const Inkling2RelGqaAttnArgs = struct {
     d_rel: u32 = DEFAULT_REL_DIM,
     rel_extent: u32 = DEFAULT_REL_EXTENT,
     rel_per_head: bool = false,
+    rel_zero_oob: bool = false,
     use_log_scaling: bool = false,
     log_scale_alpha: f32 = 1.0,
     scale: ?f32 = null,
@@ -736,6 +742,7 @@ pub const Inkling2MoeRouteArgs = struct {
     bias: ?metal.BufferBinding = null,
     bias_f16: bool = false,
     bias_add_to_logits: bool = true,
+    scoring_sigmoid: bool = false,
     topk_experts: metal.BufferBinding,
     topk_weights: metal.BufferBinding,
     m: u32,
@@ -753,7 +760,9 @@ pub const Inkling2MoeSwigluArgs = struct {
     num_rows: u32,
     intermediate_size: u32,
     interleaved_gate_up: bool = false,
+    pair_interleaved: bool = false,
     softcap: f32 = INKLING2_DEFAULT_MLP_SOFTCAP,
+    gate_softcap: f32 = 0.0,
 };
 
 pub const Inkling2MoeEpilogueArgs = struct {
@@ -1067,6 +1076,7 @@ pub const Inkling2Hy4Pipelines = struct {
             .conv_w_f16 = if (args.conv_w_f16) 1 else 0,
             .serial_tiles = if (in_place_multi_tile) 1 else 0,
             .rms_eps = args.rms_eps,
+            .post_residual_scale = args.post_residual_scale,
         };
         const groups_x: u64 = if (in_place_multi_tile) 1 else (@as(u64, args.m) + 63) / 64;
         const pipe = self.rmsnorm_sconv4[@backingInt(args.norm_dtype)];
@@ -1123,7 +1133,7 @@ pub const Inkling2Hy4Pipelines = struct {
             .causal_q_start_pos = args.causal_q_start_pos orelse 0xFFFF_FFFF,
             .d_rel = args.d_rel,
             .rel_extent = args.rel_extent,
-            .rel_per_head = if (args.rel_per_head) 1 else 0,
+            .rel_per_head = (@as(u32, if (args.rel_per_head) 1 else 0)) | (@as(u32, if (args.rel_zero_oob) 2 else 0)),
             .use_log_scaling = if (args.use_log_scaling) 1 else 0,
             .has_sink = if (args.sink_logits != null) 1 else 0,
             .sink_per_token = if (args.sink_per_token) 1 else 0,
@@ -1186,6 +1196,7 @@ pub const Inkling2Hy4Pipelines = struct {
             .norm_topk_prob = if (args.norm_topk_prob) 1 else 0,
             .route_scale = args.route_scale,
             .router_softcap = args.router_softcap,
+            .scoring_sigmoid = if (args.scoring_sigmoid) 1 else 0,
         };
         try frame.encodeThreadgroups(
             self.inkling2_moe_route,
@@ -1209,13 +1220,14 @@ pub const Inkling2Hy4Pipelines = struct {
         insert_barrier_before: bool,
     ) EncodeError!void {
         if (args.num_rows == 0 or args.intermediate_size == 0) return error.ZeroDimension;
-        if (!args.interleaved_gate_up and args.up_in == null) return error.MissingInputs;
+        if (!args.interleaved_gate_up and !args.pair_interleaved and args.up_in == null) return error.MissingInputs;
 
         const params: Inkling2MoeSwigluParams = .{
             .num_rows = args.num_rows,
             .intermediate_size = args.intermediate_size,
-            .interleaved_gate_up = if (args.interleaved_gate_up) 1 else 0,
+            .interleaved_gate_up = if (args.pair_interleaved) 2 else if (args.interleaved_gate_up) 1 else 0,
             .softcap = args.softcap,
+            .gate_softcap = args.gate_softcap,
         };
         const tg_x: u64 = @min(@as(u64, args.intermediate_size), 256);
         try frame.encodeThreads(

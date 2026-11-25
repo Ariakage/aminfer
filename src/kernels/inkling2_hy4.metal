@@ -66,7 +66,7 @@ struct Sconv4Params {
     uint conv_w_f16;
     uint serial_tiles;
     float rms_eps;
-    uint _pad0;
+    float post_residual_scale;
 };
 static_assert(sizeof(Sconv4Params) == 48, "Sconv4Params must be 48 bytes");
 
@@ -109,7 +109,7 @@ struct Inkling2MoeRouteParams {
     uint norm_topk_prob;
     float route_scale;
     float router_softcap;
-    uint _pad0;
+    uint scoring_sigmoid;
     uint _pad1;
 };
 static_assert(sizeof(Inkling2MoeRouteParams) == 48, "Inkling2MoeRouteParams must be 48 bytes");
@@ -119,8 +119,12 @@ struct Inkling2MoeSwigluParams {
     uint intermediate_size;
     uint interleaved_gate_up;
     float softcap;
+    float gate_softcap;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
 };
-static_assert(sizeof(Inkling2MoeSwigluParams) == 16, "Inkling2MoeSwigluParams must be 16 bytes");
+static_assert(sizeof(Inkling2MoeSwigluParams) == 32, "Inkling2MoeSwigluParams must be 32 bytes");
 
 struct Inkling2MoeEpilogueParams {
     uint m;
@@ -557,6 +561,9 @@ kernel void ami_inkling2_rmsnorm_sconv4(const device half *x [[buffer(0)]],
                 acc = fma(w1, h_m2, acc);
                 acc = fma(w2, h_m1, acc);
                 acc = fma(w3, h_cur, acc);
+                if (p.post_residual_scale > 0.0f) {
+                    acc = (acc + h_cur) * p.post_residual_scale;
+                }
                 if (p.apply_silu != 0u) {
                     acc = ink_silu(acc);
                 }
@@ -605,6 +612,7 @@ static inline float ink_rel_gqa_score(float4 q0,
                                         float scale_eff,
                                         float rel_scale,
                                         float attn_softcap,
+                                        bool rel_zero_oob,
                                         uint lane) {
     float k_clip_fac = 1.0f;
     if (qk_l2_clip > 0.0f) {
@@ -618,19 +626,22 @@ static inline float ink_rel_gqa_score(float4 q0,
 
     float rel_score = 0.0f;
     if (d_rel > 0u && rel_extent > 0u) {
-        const uint dist = (q_pos >= k_pos) ? min(q_pos - k_pos, rel_extent - 1u) : 0u;
-        const float rk = (lane < d_rel)
-            ? float(rel_emb[(rel_head_off + dist) * d_rel + lane])
-            : 0.0f;
-        float rk_clip = 1.0f;
-        if (rel_l2_clip > 0.0f) {
-            const float rk_sq = simd_sum(rk * rk);
-            const float rk_norm = sqrt(rk_sq);
-            if (rk_norm > rel_l2_clip) {
-                rk_clip = rel_l2_clip / rk_norm;
+        const bool in_range = (q_pos >= k_pos) && ((q_pos - k_pos) < rel_extent);
+        if (!rel_zero_oob || in_range) {
+            const uint dist = (q_pos >= k_pos) ? min(q_pos - k_pos, rel_extent - 1u) : 0u;
+            const float rk = (lane < d_rel)
+                ? float(rel_emb[(rel_head_off + dist) * d_rel + lane])
+                : 0.0f;
+            float rk_clip = 1.0f;
+            if (rel_l2_clip > 0.0f) {
+                const float rk_sq = simd_sum(rk * rk);
+                const float rk_norm = sqrt(rk_sq);
+                if (rk_norm > rel_l2_clip) {
+                    rk_clip = rel_l2_clip / rk_norm;
+                }
             }
+            rel_score = simd_sum(q_rel_v * rk) * rk_clip * rel_scale;
         }
-        rel_score = simd_sum(q_rel_v * rk) * rk_clip * rel_scale;
     }
 
     return ink_softcap(qk_dot * scale_eff + rel_score, attn_softcap);
@@ -731,9 +742,10 @@ kernel void ami_inkling2_rel_gqa_attn(const device half *q [[buffer(0)]],
             q_rel_v *= (p.rel_l2_clip / qr_norm);
         }
     }
-    const ulong rel_head_off = (p.rel_per_head != 0u)
+    const ulong rel_head_off = ((p.rel_per_head & 1u) != 0u)
         ? (ulong(qh) * p.rel_extent)
         : 0ul;
+    const bool rel_zero_oob = ((p.rel_per_head & 2u) != 0u);
 
     float m_val = -INFINITY;
     float l_val = 0.0f;
@@ -780,7 +792,7 @@ kernel void ami_inkling2_rel_gqa_attn(const device half *q [[buffer(0)]],
                 const float score = ink_rel_gqa_score(
                     q0, q1, k0, k1, q_rel_v, rel_emb, rel_head_off,
                     q_pos, tile_t + dt, p.d_rel, p.rel_extent,
-                    p.qk_l2_clip, p.rel_l2_clip, scale_eff, p.rel_scale, p.attn_softcap, lane);
+                    p.qk_l2_clip, p.rel_l2_clip, scale_eff, p.rel_scale, p.attn_softcap, rel_zero_oob, lane);
 
                 const float score_log2 = score * LOG2E;
                 const float new_m = max(m_val, score_log2);
@@ -820,7 +832,7 @@ kernel void ami_inkling2_rel_gqa_attn(const device half *q [[buffer(0)]],
             const float score = ink_rel_gqa_score(
                 q0, q1, k0, k1, q_rel_v, rel_emb, rel_head_off,
                 q_pos, k_pos_j, p.d_rel, p.rel_extent,
-                p.qk_l2_clip, p.rel_l2_clip, scale_eff, p.rel_scale, p.attn_softcap, lane);
+                p.qk_l2_clip, p.rel_l2_clip, scale_eff, p.rel_scale, p.attn_softcap, rel_zero_oob, lane);
 
             const float score_log2 = score * LOG2E;
             const float new_m = max(m_val, score_log2);
@@ -898,62 +910,80 @@ kernel void ami_inkling2_moe_route(const device uchar *logits_raw [[buffer(0)]],
     const ulong row_base = ulong(tok) * p.num_experts;
     const uint k_eff = min(p.top_k, min(p.num_experts, 16u));
 
-    float local_max = -INFINITY;
-    for (uint e = tid; e < p.num_experts; e += 256u) {
-        float v = (p.logits_f16 != 0u)
-            ? float(((const device half *)logits_raw)[row_base + e])
-            : ((const device float *)logits_raw)[row_base + e];
-        v = ink_softcap(v, p.router_softcap);
-        if (p.has_bias != 0u && p.bias_mode == 0u) {
-            const float b = (p.bias_f16 != 0u)
-                ? float(((const device half *)bias_raw)[e])
-                : ((const device float *)bias_raw)[e];
-            v += b;
+    if (p.scoring_sigmoid != 0u) {
+        for (uint e = tid; e < p.num_experts; e += 256u) {
+            float v = (p.logits_f16 != 0u)
+                ? float(((const device half *)logits_raw)[row_base + e])
+                : ((const device float *)logits_raw)[row_base + e];
+            v = ink_softcap(v, p.router_softcap);
+            if (p.has_bias != 0u && p.bias_mode == 0u) {
+                const float b = (p.bias_f16 != 0u)
+                    ? float(((const device half *)bias_raw)[e])
+                    : ((const device float *)bias_raw)[e];
+                v += b;
+            }
+            tg_probs[e] = ink_sigmoid(v);
+            tg_picked[e] = 0u;
         }
-        tg_probs[e] = v;
-        tg_picked[e] = 0u;
-        local_max = max(local_max, v);
-    }
-    const float sg_max = simd_max(local_max);
-    if (lane == 0u) {
-        tg_freduce[sg_id] = sg_max;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        float gm = -INFINITY;
-        for (uint s = 0u; s < 8u; s++) {
-            gm = max(gm, tg_freduce[s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        float local_max = -INFINITY;
+        for (uint e = tid; e < p.num_experts; e += 256u) {
+            float v = (p.logits_f16 != 0u)
+                ? float(((const device half *)logits_raw)[row_base + e])
+                : ((const device float *)logits_raw)[row_base + e];
+            v = ink_softcap(v, p.router_softcap);
+            if (p.has_bias != 0u && p.bias_mode == 0u) {
+                const float b = (p.bias_f16 != 0u)
+                    ? float(((const device half *)bias_raw)[e])
+                    : ((const device float *)bias_raw)[e];
+                v += b;
+            }
+            tg_probs[e] = v;
+            tg_picked[e] = 0u;
+            local_max = max(local_max, v);
         }
-        tg_freduce[0] = gm;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float max_v = tg_freduce[0];
+        const float sg_max = simd_max(local_max);
+        if (lane == 0u) {
+            tg_freduce[sg_id] = sg_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float gm = -INFINITY;
+            for (uint s = 0u; s < 8u; s++) {
+                gm = max(gm, tg_freduce[s]);
+            }
+            tg_freduce[0] = gm;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float max_v = tg_freduce[0];
 
-    float local_sum = 0.0f;
-    for (uint e = tid; e < p.num_experts; e += 256u) {
-        const float ex = exp(tg_probs[e] - max_v);
-        tg_probs[e] = ex;
-        local_sum += ex;
-    }
-    const float sg_sum = simd_sum(local_sum);
-    if (lane == 0u) {
-        tg_freduce[sg_id] = sg_sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        float tot = 0.0f;
-        for (uint s = 0u; s < 8u; s++) {
-            tot += tg_freduce[s];
+        float local_sum = 0.0f;
+        for (uint e = tid; e < p.num_experts; e += 256u) {
+            const float ex = exp(tg_probs[e] - max_v);
+            tg_probs[e] = ex;
+            local_sum += ex;
         }
-        tg_freduce[0] = (tot > 0.0f) ? (1.0f / tot) : 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv_sum = tg_freduce[0];
+        const float sg_sum = simd_sum(local_sum);
+        if (lane == 0u) {
+            tg_freduce[sg_id] = sg_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            float tot = 0.0f;
+            for (uint s = 0u; s < 8u; s++) {
+                tot += tg_freduce[s];
+            }
+            tg_freduce[0] = (tot > 0.0f) ? (1.0f / tot) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv_sum = tg_freduce[0];
 
-    for (uint e = tid; e < p.num_experts; e += 256u) {
-        tg_probs[e] *= inv_sum;
+        for (uint e = tid; e < p.num_experts; e += 256u) {
+            tg_probs[e] *= inv_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint k = 0u; k < k_eff; k++) {
         float best_s = -INFINITY;
@@ -1037,7 +1067,11 @@ kernel void ami_inkling2_moe_swiglu_softcap(const device half *gate_in [[buffer(
 
     float g;
     float u;
-    if (p.interleaved_gate_up != 0u) {
+    if (p.interleaved_gate_up == 2u) {
+        const ulong base = ulong(row) * (2ul * p.intermediate_size);
+        g = float(gate_in[base + 2ul * col]);
+        u = float(gate_in[base + 2ul * col + 1ul]);
+    } else if (p.interleaved_gate_up != 0u) {
         const ulong base = ulong(row) * (2ul * p.intermediate_size);
         g = float(gate_in[base + col]);
         u = float(gate_in[base + p.intermediate_size + col]);
@@ -1046,7 +1080,9 @@ kernel void ami_inkling2_moe_swiglu_softcap(const device half *gate_in [[buffer(
         g = float(gate_in[idx]);
         u = float(up_in[idx]);
     }
-    const float v = ink_softcap(ink_silu(g) * u, p.softcap);
+    const float v = (p.gate_softcap > 0.0f)
+        ? (ink_softcap(g, p.gate_softcap) * ink_sigmoid(g) * ink_softcap(u, p.softcap))
+        : ink_softcap(ink_silu(g) * u, p.softcap);
     out[ulong(row) * p.intermediate_size + col] = half(v);
 }
 

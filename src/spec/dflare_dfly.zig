@@ -118,6 +118,76 @@ pub const TokEmbedHook = union(enum) {
     callback: TokEmbedCallback,
 };
 
+/// Zero-allocation historical target-tap reader registered by `GraphModel` so
+/// `DFlareProposer` can maintain an incremental multi-token context KV cache
+/// across the full prompt + accepted-token history without changing `SpecEngine`.
+pub const ContextHistoryFn = *const fn (
+    ctx: *const anyopaque,
+    out_len: *u32,
+    out_epoch: *u64,
+    pos: u32,
+    tap_idx: usize,
+    dst_f32: []f32,
+) bool;
+
+const ContextHistorySlot = struct {
+    ctx: ?*const anyopaque = null,
+    read_fn: ?ContextHistoryFn = null,
+};
+
+var ctx_hist_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var ctx_hist_slots: [16]ContextHistorySlot = @splat(.{});
+
+fn acquireCtxHistLock() void {
+    while (ctx_hist_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn releaseCtxHistLock() void {
+    ctx_hist_lock.store(false, .release);
+}
+
+pub fn registerContextHistoryProvider(ctx: *const anyopaque, read_fn: ContextHistoryFn) void {
+    acquireCtxHistLock();
+    defer releaseCtxHistLock();
+    for (&ctx_hist_slots) |*s| {
+        if (s.ctx == ctx) {
+            s.read_fn = read_fn;
+            return;
+        }
+    }
+    for (&ctx_hist_slots) |*s| {
+        if (s.ctx == null) {
+            s.ctx = ctx;
+            s.read_fn = read_fn;
+            return;
+        }
+    }
+    ctx_hist_slots[0] = .{ .ctx = ctx, .read_fn = read_fn };
+}
+
+pub fn unregisterContextHistoryProvider(ctx: *const anyopaque) void {
+    acquireCtxHistLock();
+    defer releaseCtxHistLock();
+    for (&ctx_hist_slots) |*s| {
+        if (s.ctx == ctx) {
+            s.ctx = null;
+            s.read_fn = null;
+        }
+    }
+}
+
+fn lookupContextHistoryProvider(ctx: ?*anyopaque) ?ContextHistoryFn {
+    const key: *const anyopaque = ctx orelse return null;
+    acquireCtxHistLock();
+    defer releaseCtxHistLock();
+    for (ctx_hist_slots) |s| {
+        if (s.ctx == key) return s.read_fn;
+    }
+    return null;
+}
+
 pub const DraftKindDetected = enum {
     dflare,
     dfly2,
@@ -257,6 +327,9 @@ pub const DFlareConfig = struct {
     num_target_taps: u8 = 3,
     target_layer_ids: [MAX_TARGET_TAPS]u16 = .{ 2, 11, 20, 0, 0, 0, 0, 0 },
     rms_eps: f32 = 1e-6,
+    rope_theta: f32 = 0.0,
+    unpadded_vocab_size: u32 = 0,
+    final_logit_softcapping: f32 = 0.0,
     temperature: f32 = 1.0,
     l1_seed_step_prob: f32 = 0.90,
     l1_branch_step_prob: f32 = 0.55,
@@ -355,6 +428,9 @@ pub const DFlareConfig = struct {
         const block_size: u8 = @intCast(jsonU32Opt(obj, "block_size") orelse DFLARE_BLOCK_SIZE);
         const markov_rank: u32 = jsonU32Opt(obj, "markov_rank") orelse DFLARE_MARKOV_RANK;
         const rms_eps: f32 = jsonF32Opt(obj, "rms_norm_eps") orelse 1e-6;
+        const rope_theta: f32 = jsonF32Opt(obj, "rope_theta") orelse 0.0;
+        const unpadded_vocab: u32 = jsonU32Opt(obj, "unpadded_vocab_size") orelse 0;
+        const final_softcap: f32 = jsonF32Opt(obj, "final_logit_softcapping") orelse 0.0;
 
         var tap_ids: [MAX_TARGET_TAPS]u16 = .{ 5, 23, 41, 48, 0, 0, 0, 0 };
         var num_taps: u8 = 4;
@@ -387,6 +463,9 @@ pub const DFlareConfig = struct {
             .num_target_taps = num_taps,
             .target_layer_ids = tap_ids,
             .rms_eps = rms_eps,
+            .rope_theta = rope_theta,
+            .unpadded_vocab_size = unpadded_vocab,
+            .final_logit_softcapping = final_softcap,
         };
         try cfg.validate();
         return cfg;
@@ -506,6 +585,7 @@ pub const DFlareWeights = struct {
 pub const DFlareWorkspace = struct {
     arena: arena_mod.WiredArena,
     config: DFlareConfig,
+    max_ctx_len: u32,
     taps_flat: []f32,
     ctx_hidden: []f32,
     ctx_markov: []f32,
@@ -515,6 +595,8 @@ pub const DFlareWorkspace = struct {
     q_buf: []f32,
     k_buf: []f32,
     v_buf: []f32,
+    ctx_k_cache: []f16,
+    ctx_v_cache: []f16,
     attn_out: []f32,
     attn_scores: []f32,
     mlp_gate: []f32,
@@ -522,8 +604,10 @@ pub const DFlareWorkspace = struct {
     mlp_down: []f32,
     node_rnn_hidden: []f32,
     markov_u: []f32,
+    markov_out: []f32,
     markov_concat: []f32,
     head_hidden: []f32,
+    base_logits_buf: []f32,
     logits_buf: []f32,
     topk_tokens: []u32,
     topk_probs: []f32,
@@ -541,6 +625,8 @@ pub const DFlareWorkspace = struct {
         const q_dim: usize = cfg.qDim();
         const kv_dim: usize = cfg.kvDim();
         const max_nodes: usize = cfg.max_tree_nodes;
+        const max_ctx: usize = if (cfg.hidden_size >= 1024) 1024 else 64;
+        const ctx_kv_elems: usize = @as(usize, cfg.num_layers) * max_ctx * kv_dim;
 
         const chunks = [_]usize{
             try alignUp64((taps * h) * @sizeOf(f32)), // taps_flat
@@ -552,15 +638,19 @@ pub const DFlareWorkspace = struct {
             try alignUp64((w * q_dim) * @sizeOf(f32)), // q_buf
             try alignUp64(((w + 1) * kv_dim) * @sizeOf(f32)), // k_buf (ctx + block)
             try alignUp64(((w + 1) * kv_dim) * @sizeOf(f32)), // v_buf
+            try alignUp64(ctx_kv_elems * @sizeOf(f16)), // ctx_k_cache
+            try alignUp64(ctx_kv_elems * @sizeOf(f16)), // ctx_v_cache
             try alignUp64((w * q_dim) * @sizeOf(f32)), // attn_out
-            try alignUp64((w + 1) * @sizeOf(f32)), // attn_scores
+            try alignUp64((max_ctx + w) * @sizeOf(f32)), // attn_scores
             try alignUp64((w * inter) * @sizeOf(f32)), // mlp_gate
             try alignUp64((w * inter) * @sizeOf(f32)), // mlp_up
             try alignUp64((w * h) * @sizeOf(f32)), // mlp_down
             try alignUp64((max_nodes * mr) * @sizeOf(f32)), // node_rnn_hidden
             try alignUp64((3 * mr) * @sizeOf(f32)), // markov_u (3-gate GRU or 1x rank)
+            try alignUp64(mr * @sizeOf(f32)), // markov_out
             try alignUp64((2 * h + 2 * mr) * @sizeOf(f32)), // markov_concat
             try alignUp64(h * @sizeOf(f32)), // head_hidden
+            try alignUp64((w * v) * @sizeOf(f32)), // base_logits_buf
             try alignUp64(v * @sizeOf(f32)), // logits_buf
             try alignUp64(cfg.top_k_per_pos * @sizeOf(u32)), // topk_tokens
             try alignUp64(cfg.top_k_per_pos * @sizeOf(f32)), // topk_probs
@@ -589,6 +679,8 @@ pub const DFlareWorkspace = struct {
         const q_dim: usize = cfg.qDim();
         const kv_dim: usize = cfg.kvDim();
         const max_nodes: usize = cfg.max_tree_nodes;
+        const max_ctx: usize = if (cfg.hidden_size >= 1024) 1024 else 64;
+        const ctx_kv_elems: usize = @as(usize, cfg.num_layers) * max_ctx * kv_dim;
 
         const taps_flat = try allocArenaSlice(f32, &mem_arena, taps * h);
         const ctx_hidden = try allocArenaSlice(f32, &mem_arena, h);
@@ -599,15 +691,19 @@ pub const DFlareWorkspace = struct {
         const q_buf = try allocArenaSlice(f32, &mem_arena, w * q_dim);
         const k_buf = try allocArenaSlice(f32, &mem_arena, (w + 1) * kv_dim);
         const v_buf = try allocArenaSlice(f32, &mem_arena, (w + 1) * kv_dim);
+        const ctx_k_cache = try allocArenaSlice(f16, &mem_arena, ctx_kv_elems);
+        const ctx_v_cache = try allocArenaSlice(f16, &mem_arena, ctx_kv_elems);
         const attn_out = try allocArenaSlice(f32, &mem_arena, w * q_dim);
-        const attn_scores = try allocArenaSlice(f32, &mem_arena, w + 1);
+        const attn_scores = try allocArenaSlice(f32, &mem_arena, max_ctx + w);
         const mlp_gate = try allocArenaSlice(f32, &mem_arena, w * inter);
         const mlp_up = try allocArenaSlice(f32, &mem_arena, w * inter);
         const mlp_down = try allocArenaSlice(f32, &mem_arena, w * h);
         const node_rnn_hidden = try allocArenaSlice(f32, &mem_arena, max_nodes * mr);
         const markov_u = try allocArenaSlice(f32, &mem_arena, 3 * mr);
+        const markov_out = try allocArenaSlice(f32, &mem_arena, mr);
         const markov_concat = try allocArenaSlice(f32, &mem_arena, 2 * h + 2 * mr);
         const head_hidden = try allocArenaSlice(f32, &mem_arena, h);
+        const base_logits_buf = try allocArenaSlice(f32, &mem_arena, w * v);
         const logits_buf = try allocArenaSlice(f32, &mem_arena, v);
         const topk_tokens = try allocArenaSlice(u32, &mem_arena, cfg.top_k_per_pos);
         const topk_probs = try allocArenaSlice(f32, &mem_arena, cfg.top_k_per_pos);
@@ -616,10 +712,13 @@ pub const DFlareWorkspace = struct {
 
         @memset(node_log_probs, 0.0);
         @memset(node_rnn_hidden, 0.0);
+        @memset(ctx_k_cache, 0.0);
+        @memset(ctx_v_cache, 0.0);
 
         return .{
             .arena = mem_arena,
             .config = cfg,
+            .max_ctx_len = @intCast(max_ctx),
             .taps_flat = taps_flat,
             .ctx_hidden = ctx_hidden,
             .ctx_markov = ctx_markov,
@@ -629,6 +728,8 @@ pub const DFlareWorkspace = struct {
             .q_buf = q_buf,
             .k_buf = k_buf,
             .v_buf = v_buf,
+            .ctx_k_cache = ctx_k_cache,
+            .ctx_v_cache = ctx_v_cache,
             .attn_out = attn_out,
             .attn_scores = attn_scores,
             .mlp_gate = mlp_gate,
@@ -636,8 +737,10 @@ pub const DFlareWorkspace = struct {
             .mlp_down = mlp_down,
             .node_rnn_hidden = node_rnn_hidden,
             .markov_u = markov_u,
+            .markov_out = markov_out,
             .markov_concat = markov_concat,
             .head_hidden = head_hidden,
+            .base_logits_buf = base_logits_buf,
             .logits_buf = logits_buf,
             .topk_tokens = topk_tokens,
             .topk_probs = topk_probs,
@@ -656,6 +759,8 @@ pub const DFlareWorkspace = struct {
         self.q_buf = &.{};
         self.k_buf = &.{};
         self.v_buf = &.{};
+        self.ctx_k_cache = &.{};
+        self.ctx_v_cache = &.{};
         self.attn_out = &.{};
         self.attn_scores = &.{};
         self.mlp_gate = &.{};
@@ -663,8 +768,10 @@ pub const DFlareWorkspace = struct {
         self.mlp_down = &.{};
         self.node_rnn_hidden = &.{};
         self.markov_u = &.{};
+        self.markov_out = &.{};
         self.markov_concat = &.{};
         self.head_hidden = &.{};
+        self.base_logits_buf = &.{};
         self.logits_buf = &.{};
         self.topk_tokens = &.{};
         self.topk_probs = &.{};
@@ -703,6 +810,13 @@ pub const DFlareProposer = struct {
     workspace: *DFlareWorkspace,
     backbone_runs: u64 = 0,
     markov_steps: u64 = 0,
+    ctx_cache_len: u32 = 0,
+    ctx_cache_epoch: u64 = 0,
+    base_logits_ready: bool = false,
+
+    inline fn isRealGru(self: *const DFlareProposer) bool {
+        return self.weights.markov_gru_proj_bf16 != null or self.weights.markov_gru_proj_f32 != null;
+    }
 
     pub fn init(
         config: DFlareConfig,
@@ -738,19 +852,150 @@ pub const DFlareProposer = struct {
         self: *DFlareProposer,
         target_hiddens: []const []const f32,
     ) Error!void {
+        return self.runBlockBackboneOnceForRoot(0, target_hiddens);
+    }
+
+    fn projectCtxKvOnePos(
+        self: *DFlareProposer,
+        layer: TransformerBlockWeights,
+        li: usize,
+        taps_flat: []const f32,
+        pos: u32,
+        dst_k: []f32,
+        dst_v: []f32,
+    ) void {
+        const taps: usize = self.config.num_target_taps;
+        const h: usize = self.config.hidden_size;
+        const kv_dim: usize = self.config.kvDim();
+        if (self.weights.fuse_scalar_weights) |fsw| {
+            const row_idx = if ((li + 1) * taps <= fsw.len) li else 0;
+            mixScalarTaps(fsw[row_idx * taps ..][0..taps], taps_flat[0 .. taps * h], taps, h, self.workspace.ctx_hidden[0..h]);
+            if (layer.ctx_norm_weight) |cnw| {
+                applyRmsNormInPlace(self.workspace.ctx_hidden[0..h], cnw, self.config.rms_eps);
+            }
+        } else if (layer.ctx_norm_weight) |cnw| {
+            @memcpy(self.workspace.norm_buf[0..h], self.workspace.ctx_hidden[0..h]);
+            applyRmsNormInPlace(self.workspace.norm_buf[0..h], cnw, self.config.rms_eps);
+        }
+        const ctx_in = if (self.weights.fuse_scalar_weights == null and layer.ctx_norm_weight != null)
+            self.workspace.norm_buf[0..h]
+        else
+            self.workspace.ctx_hidden[0..h];
+
+        if (layer.k_proj_ctx_bf16) |kb| {
+            matVecBf16(kb, ctx_in, kv_dim, h, dst_k[0..kv_dim]);
+        } else if (layer.k_proj_ctx) |kf| {
+            matVecF32(kf, ctx_in, kv_dim, h, dst_k[0..kv_dim]);
+        } else if (layer.k_proj_bf16) |kb| {
+            matVecBf16(kb, ctx_in, kv_dim, h, dst_k[0..kv_dim]);
+        } else {
+            matVecF32(layer.k_proj, ctx_in, kv_dim, h, dst_k[0..kv_dim]);
+        }
+
+        if (layer.v_proj_ctx_bf16) |vb| {
+            matVecBf16(vb, ctx_in, kv_dim, h, dst_v[0..kv_dim]);
+        } else if (layer.v_proj_ctx) |vf| {
+            matVecF32(vf, ctx_in, kv_dim, h, dst_v[0..kv_dim]);
+        } else if (layer.v_proj_bf16) |vb| {
+            matVecBf16(vb, ctx_in, kv_dim, h, dst_v[0..kv_dim]);
+        } else {
+            matVecF32(layer.v_proj, ctx_in, kv_dim, h, dst_v[0..kv_dim]);
+        }
+
+        if (layer.k_norm_ctx_weight orelse layer.k_norm_weight) |kn| {
+            applyHeadRmsNorm(dst_k[0..kv_dim], self.config.num_key_value_heads, self.config.head_dim, kn, self.config.rms_eps);
+        }
+        if (self.config.rope_theta > 0.0) {
+            applyRopeNeoXInPlace(dst_k[0..kv_dim], self.config.num_key_value_heads, self.config.head_dim, pos, self.config.rope_theta);
+        }
+    }
+
+    fn runBlockBackboneOnceForRoot(
+        self: *DFlareProposer,
+        root_token: u32,
+        target_hiddens: []const []const f32,
+    ) Error!void {
         const taps: usize = self.config.num_target_taps;
         const h: usize = self.config.hidden_size;
         const w: usize = self.config.block_size;
+        const v: usize = self.config.vocab_size;
+        const kv_dim: usize = self.config.kvDim();
+        const is_real = self.isRealGru();
         if (target_hiddens.len != taps) return error.DimensionMismatch;
 
+        // 0. For real DFlare/DSpark, resolve the anchor token embedding FIRST
+        //    (this also registers GraphModel's context tap history provider on the exact target pointer).
+        if (is_real) {
+            const raw_anchor = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_hook, root_token, h, self.workspace.tok_embed_tmp);
+            if (raw_anchor.ptr != self.workspace.tok_embed_tmp.ptr) {
+                @memcpy(self.workspace.tok_embed_tmp[0..h], raw_anchor[0..h]);
+            }
+            if (self.weights.tok_embed_hook == null) {
+                if (self.weights.token_embd_norm) |ten| {
+                    applyRmsNormInPlace(self.workspace.tok_embed_tmp[0..h], ten, self.config.rms_eps);
+                }
+            }
+        }
+
+        // 1. Check for full committed-token context history (prompt + accepted decode tokens).
+        var use_cached_ctx: bool = false;
+        var active_ctx_len: usize = 1;
+        var anchor_pos: u32 = if (self.config.rope_theta > 0.0) 1 else 0;
+        const max_ctx: usize = self.workspace.max_ctx_len;
+
+        if (is_real) {
+            const cb_ctx: ?*anyopaque = if (self.weights.tok_embed_hook) |hk| switch (hk) {
+                .callback => |cb| cb.ctx,
+                .dense_f32 => null,
+            } else null;
+            if (lookupContextHistoryProvider(cb_ctx)) |prov_fn| {
+                var hist_len: u32 = 0;
+                var hist_epoch: u64 = 0;
+                if (prov_fn(cb_ctx.?, &hist_len, &hist_epoch, 0, 0, &.{}) and hist_len > 0) {
+                    if (hist_epoch != self.ctx_cache_epoch or hist_len < self.ctx_cache_len) {
+                        self.ctx_cache_len = 0;
+                        self.ctx_cache_epoch = hist_epoch;
+                    }
+                    const win_start: u32 = if (hist_len > self.workspace.max_ctx_len) hist_len - self.workspace.max_ctx_len else 0;
+                    var p: u32 = @max(self.ctx_cache_len, win_start);
+                    while (p < hist_len) : (p += 1) {
+                        var ok_all = true;
+                        for (0..taps) |ti| {
+                            var tmp_l: u32 = 0;
+                            var tmp_e: u64 = 0;
+                            if (!prov_fn(cb_ctx.?, &tmp_l, &tmp_e, p, ti, self.workspace.taps_flat[ti * h ..][0..h])) {
+                                ok_all = false;
+                                break;
+                            }
+                        }
+                        if (!ok_all) break;
+                        const slot: usize = @intCast(p % self.workspace.max_ctx_len);
+                        for (self.weights.layers, 0..) |layer, li| {
+                            self.projectCtxKvOnePos(layer, li, self.workspace.taps_flat, p, self.workspace.k_buf[0..kv_dim], self.workspace.v_buf[0..kv_dim]);
+                            const base_off = (li * max_ctx + slot) * kv_dim;
+                            const dst_k = self.workspace.ctx_k_cache[base_off .. base_off + kv_dim];
+                            const dst_v = self.workspace.ctx_v_cache[base_off .. base_off + kv_dim];
+                            for (0..kv_dim) |d| {
+                                dst_k[d] = @floatCast(self.workspace.k_buf[d]);
+                                dst_v[d] = @floatCast(self.workspace.v_buf[d]);
+                            }
+                        }
+                    }
+                    self.ctx_cache_len = hist_len;
+                    active_ctx_len = @min(@as(usize, hist_len), max_ctx);
+                    anchor_pos = hist_len;
+                    use_cached_ctx = active_ctx_len > 0;
+                }
+            }
+        }
+
+        // 2. Copy current anchor-conditioning `target_hiddens` into `taps_flat` and compute `ctx_hidden` / `ctx_markov` (`f_rnn`).
         for (target_hiddens, 0..) |tap, ti| {
             if (tap.len != h) return error.DimensionMismatch;
             @memcpy(self.workspace.taps_flat[ti * h ..][0..h], tap);
         }
 
-        // 1. Fuse multi-layer target hidden states into `ctx_hidden` (and `ctx_markov`).
         if (self.weights.fuse_scalar_weights) |fsw| {
-            // Mix row 0 as initial seed `ctx_hidden`, and final row (or row 0) as `ctx_markov`.
             mixScalarTaps(fsw[0..taps], self.workspace.taps_flat[0 .. taps * h], taps, h, self.workspace.ctx_hidden[0..h]);
             const m_row = if (fsw.len >= (self.weights.layers.len + 1) * taps) self.weights.layers.len else 0;
             mixScalarTaps(fsw[m_row * taps ..][0..taps], self.workspace.taps_flat[0 .. taps * h], taps, h, self.workspace.ctx_markov[0..h]);
@@ -768,101 +1013,127 @@ pub const DFlareProposer = struct {
             applyRmsNormInPlace(self.workspace.ctx_hidden[0..h], fnw, self.config.rms_eps);
         }
 
-        // 2. Seed positions `0..block_size-1` with `ctx_hidden + mask_embed`.
+        // 3. Seed noise block `slot_hiddens[0..w-1]`.
         const per_pos_mask = self.weights.mask_embed.len == w * h;
         const tail_pos_mask = (w > 1 and self.weights.mask_embed.len == (w - 1) * h);
-        for (0..w) |pos| {
-            const dst = self.workspace.slot_hiddens[pos * h ..][0..h];
-            if (tail_pos_mask) {
-                if (pos == 0) {
-                    @memcpy(dst, self.workspace.ctx_hidden[0..h]);
-                } else {
-                    const m_slice = self.weights.mask_embed[(pos - 1) * h ..][0..h];
-                    for (0..h) |d| dst[d] = self.workspace.ctx_hidden[d] + m_slice[d];
-                }
-            } else {
-                const m_slice = if (per_pos_mask)
+        if (is_real) {
+            // Exact `dspark.cpp:build_dspark_inp_block`:
+            // slot 0 = normed anchor token embedding; slots 1..w-1 = pure mask_embed (NO +ctx_hidden!).
+            @memcpy(self.workspace.slot_hiddens[0..h], self.workspace.tok_embed_tmp[0..h]);
+            for (1..w) |pos| {
+                const dst = self.workspace.slot_hiddens[pos * h ..][0..h];
+                const m_slice = if (tail_pos_mask)
+                    self.weights.mask_embed[(pos - 1) * h ..][0..h]
+                else if (per_pos_mask)
                     self.weights.mask_embed[pos * h ..][0..h]
                 else
                     self.weights.mask_embed[0..h];
-                for (0..h) |d| {
-                    dst[d] = self.workspace.ctx_hidden[d] + m_slice[d];
+                @memcpy(dst, m_slice);
+            }
+        } else {
+            for (0..w) |pos| {
+                const dst = self.workspace.slot_hiddens[pos * h ..][0..h];
+                if (tail_pos_mask) {
+                    if (pos == 0) {
+                        @memcpy(dst, self.workspace.ctx_hidden[0..h]);
+                    } else {
+                        const m_slice = self.weights.mask_embed[(pos - 1) * h ..][0..h];
+                        for (0..h) |d| dst[d] = self.workspace.ctx_hidden[d] + m_slice[d];
+                    }
+                } else {
+                    const m_slice = if (per_pos_mask)
+                        self.weights.mask_embed[pos * h ..][0..h]
+                    else
+                        self.weights.mask_embed[0..h];
+                    for (0..h) |d| {
+                        dst[d] = self.workspace.ctx_hidden[d] + m_slice[d];
+                    }
                 }
             }
         }
 
-        // 3. Execute `3L`/`5L` block-parallel transformer layers with `ctx_hidden`
-        //    projected as single-token context KV prepended to self-attention.
-        const kv_dim: usize = self.config.kvDim();
+        // 4. Execute `3L`/`5L` block-parallel transformer layers with cached context KV (or single-token fallback) + NeoX RoPE.
         for (self.weights.layers, 0..) |layer, li| {
-            if (self.weights.fuse_scalar_weights) |fsw| {
-                const row_idx = if ((li + 1) * taps <= fsw.len) li else 0;
-                mixScalarTaps(fsw[row_idx * taps ..][0..taps], self.workspace.taps_flat[0 .. taps * h], taps, h, self.workspace.ctx_hidden[0..h]);
-                if (layer.ctx_norm_weight) |cnw| {
-                    applyRmsNormInPlace(self.workspace.ctx_hidden[0..h], cnw, self.config.rms_eps);
-                }
-            } else if (layer.ctx_norm_weight) |cnw| {
-                // Non-destructively normalize into `norm_buf[0..h]`? Use ctx_hidden directly on first layer.
-                @memcpy(self.workspace.norm_buf[0..h], self.workspace.ctx_hidden[0..h]);
-                applyRmsNormInPlace(self.workspace.norm_buf[0..h], cnw, self.config.rms_eps);
-            }
-            const ctx_in = if (self.weights.fuse_scalar_weights == null and layer.ctx_norm_weight != null)
-                self.workspace.norm_buf[0..h]
-            else
-                self.workspace.ctx_hidden[0..h];
-
-            if (layer.k_proj_ctx_bf16) |kb| {
-                matVecBf16(kb, ctx_in, kv_dim, h, self.workspace.k_buf[0..kv_dim]);
-            } else if (layer.k_proj_ctx) |kf| {
-                matVecF32(kf, ctx_in, kv_dim, h, self.workspace.k_buf[0..kv_dim]);
-            } else if (layer.k_proj_bf16) |kb| {
-                matVecBf16(kb, ctx_in, kv_dim, h, self.workspace.k_buf[0..kv_dim]);
+            if (use_cached_ctx) {
+                const layer_off = li * max_ctx * kv_dim;
+                try runTransformerBlock(
+                    layer,
+                    self.workspace.slot_hiddens[0 .. w * h],
+                    w,
+                    h,
+                    self.config.intermediate_size,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    self.config.rms_eps,
+                    &.{},
+                    &.{},
+                    active_ctx_len,
+                    self.workspace.norm_buf,
+                    self.workspace.q_buf,
+                    self.workspace.k_buf[kv_dim..],
+                    self.workspace.v_buf[kv_dim..],
+                    self.workspace.attn_out,
+                    self.workspace.attn_scores,
+                    self.workspace.mlp_gate,
+                    self.workspace.mlp_up,
+                    self.workspace.mlp_down,
+                    self.config.rope_theta,
+                    anchor_pos,
+                    self.workspace.ctx_k_cache[layer_off .. layer_off + active_ctx_len * kv_dim],
+                    self.workspace.ctx_v_cache[layer_off .. layer_off + active_ctx_len * kv_dim],
+                );
             } else {
-                matVecF32(layer.k_proj, ctx_in, kv_dim, h, self.workspace.k_buf[0..kv_dim]);
+                self.projectCtxKvOnePos(layer, li, self.workspace.taps_flat, 0, self.workspace.k_buf[0..kv_dim], self.workspace.v_buf[0..kv_dim]);
+                try runTransformerBlock(
+                    layer,
+                    self.workspace.slot_hiddens[0 .. w * h],
+                    w,
+                    h,
+                    self.config.intermediate_size,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    self.config.rms_eps,
+                    self.workspace.k_buf[0..kv_dim],
+                    self.workspace.v_buf[0..kv_dim],
+                    1,
+                    self.workspace.norm_buf,
+                    self.workspace.q_buf,
+                    self.workspace.k_buf[kv_dim..],
+                    self.workspace.v_buf[kv_dim..],
+                    self.workspace.attn_out,
+                    self.workspace.attn_scores,
+                    self.workspace.mlp_gate,
+                    self.workspace.mlp_up,
+                    self.workspace.mlp_down,
+                    self.config.rope_theta,
+                    anchor_pos,
+                    null,
+                    null,
+                );
             }
-
-            if (layer.v_proj_ctx_bf16) |vb| {
-                matVecBf16(vb, ctx_in, kv_dim, h, self.workspace.v_buf[0..kv_dim]);
-            } else if (layer.v_proj_ctx) |vf| {
-                matVecF32(vf, ctx_in, kv_dim, h, self.workspace.v_buf[0..kv_dim]);
-            } else if (layer.v_proj_bf16) |vb| {
-                matVecBf16(vb, ctx_in, kv_dim, h, self.workspace.v_buf[0..kv_dim]);
-            } else {
-                matVecF32(layer.v_proj, ctx_in, kv_dim, h, self.workspace.v_buf[0..kv_dim]);
-            }
-
-            if (layer.k_norm_ctx_weight orelse layer.k_norm_weight) |kn| {
-                applyHeadRmsNorm(self.workspace.k_buf[0..kv_dim], self.config.num_key_value_heads, self.config.head_dim, kn, self.config.rms_eps);
-            }
-            try runTransformerBlock(
-                layer,
-                self.workspace.slot_hiddens[0 .. w * h],
-                w,
-                h,
-                self.config.intermediate_size,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-                self.config.rms_eps,
-                self.workspace.k_buf[0..kv_dim],
-                self.workspace.v_buf[0..kv_dim],
-                1,
-                self.workspace.norm_buf,
-                self.workspace.q_buf,
-                self.workspace.k_buf[kv_dim..],
-                self.workspace.v_buf[kv_dim..],
-                self.workspace.attn_out,
-                self.workspace.attn_scores,
-                self.workspace.mlp_gate,
-                self.workspace.mlp_up,
-                self.workspace.mlp_down,
-            );
         }
 
         if (self.weights.final_norm) |fnw| {
             for (0..w) |pos| {
                 applyRmsNormInPlace(self.workspace.slot_hiddens[pos * h ..][0..h], fnw, self.config.rms_eps);
             }
+        }
+
+        // 5. For `dflash-Q8` (`markov_w2_vocab_bf16`), pre-score `base_logits = lm_head(slot_hiddens[1..w])` in ONE batched GPU call!
+        self.base_logits_ready = false;
+        if (is_real and self.weights.markov_w2_vocab_bf16 != null and w > 1 and hasLmHeadHook(self.weights.lm_head)) {
+            const n_draft: u8 = @intCast(w - 1);
+            try evalLmHead(
+                self.weights.lm_head,
+                self.workspace.slot_hiddens[h .. w * h],
+                n_draft,
+                self.config.hidden_size,
+                self.config.vocab_size,
+                self.workspace.base_logits_buf[0 .. @as(usize, n_draft) * v],
+            );
+            self.base_logits_ready = true;
         }
 
         self.backbone_runs += 1;
@@ -885,20 +1156,20 @@ pub const DFlareProposer = struct {
 
         const b_j = self.workspace.slot_hiddens[@as(usize, pos) * h ..][0..h];
 
-        if (self.weights.markov_gru_proj_bf16 != null or self.weights.markov_gru_proj_f32 != null) {
-            // Real `Inkling-2-Mini` 3-gate GRU Markov head (`[3*mr, 2*h + 2*mr]`):
-            // joint_in = [b_j (h) || ctx_markov (h) || markov_w1[prev_token] (mr) || parent_rnn (mr)]
-            const joint_len = 2 * h + 2 * mr;
-            @memcpy(self.workspace.markov_concat[0..h], b_j);
-            @memcpy(self.workspace.markov_concat[h .. 2 * h], self.workspace.ctx_markov[0..h]);
+        if (self.isRealGru()) {
+            // Exact `dspark.cpp:365-380` 3-chunk Inkling2 Markov RNN head (`[3*mr, 2*mr + 2*h]`):
+            // joint_in = [parent_rnn (mr) || markov_w1[prev_token] (mr) || b_j (h) || f_rnn (h)]
+            const joint_len = 2 * mr + 2 * h;
+            @memcpy(self.workspace.markov_concat[0..mr], parent_rnn[0..mr]);
             const w1_rows = self.weights.markov_w1_vocab_rows;
             const tok_clamped: usize = if (prev_token < w1_rows) prev_token else 0;
             const w1_tbl = self.weights.markov_w1_vocab_bf16.?;
             const w1_row = w1_tbl[tok_clamped * mr ..][0..mr];
             for (0..mr) |i| {
-                self.workspace.markov_concat[2 * h + i] = quant.bf16ToF32(w1_row[i]);
+                self.workspace.markov_concat[mr + i] = quant.bf16ToF32(w1_row[i]);
             }
-            @memcpy(self.workspace.markov_concat[2 * h + mr .. joint_len], parent_rnn[0..mr]);
+            @memcpy(self.workspace.markov_concat[2 * mr .. 2 * mr + h], b_j);
+            @memcpy(self.workspace.markov_concat[2 * mr + h .. joint_len], self.workspace.ctx_markov[0..h]);
 
             const gates = self.workspace.markov_u[0 .. 3 * mr];
             if (self.weights.markov_gru_proj_bf16) |gb| {
@@ -909,19 +1180,30 @@ pub const DFlareProposer = struct {
             if (self.weights.markov_gru_bias) |gbias| {
                 for (0..3 * mr) |i| gates[i] += gbias[i];
             }
+            const markov_vec = self.workspace.markov_out[0..mr];
             for (0..mr) |i| {
-                const r_g = sigmoidF32(gates[i]);
-                const z_g = sigmoidF32(gates[mr + i]);
-                const n_g = std.math.tanh(gates[2 * mr + i] * r_g);
-                out_rnn[i] = (1.0 - z_g) * n_g + z_g * parent_rnn[i];
+                const gate = sigmoidF32(gates[i]);
+                const cand = std.math.tanh(gates[mr + i]);
+                out_rnn[i] = gate * parent_rnn[i] + (1.0 - gate) * cand;
+                markov_vec[i] = std.math.tanh(gates[2 * mr + i]);
             }
 
             if (self.weights.markov_w2_vocab_bf16) |w2_vocab| {
-                // Direct low-rank vocab logits (`dflash-Q8` GGUF): `logits[tok] = dot(w2[tok], out_rnn) + bias[tok]`.
+                // Exact `dspark.cpp:382-401`: `logits = base_logits[pos-1] + w2_vocab @ markov + w2_bias`.
                 const v_rows: usize = @min(@as(usize, self.weights.markov_w2_vocab_rows), v);
-                matVecBf16(w2_vocab[0 .. v_rows * mr], out_rnn[0..mr], v_rows, mr, self.workspace.logits_buf[0..v_rows]);
+                matVecBf16(w2_vocab[0 .. v_rows * mr], markov_vec, v_rows, mr, self.workspace.logits_buf[0..v_rows]);
                 if (self.weights.markov_w2_vocab_bias) |wb| {
                     for (0..v_rows) |ti| self.workspace.logits_buf[ti] += wb[ti];
+                }
+                if (self.base_logits_ready and pos >= 1 and pos < self.config.block_size) {
+                    const base_row = self.workspace.base_logits_buf[@as(usize, pos - 1) * v ..][0..v_rows];
+                    for (0..v_rows) |ti| self.workspace.logits_buf[ti] += base_row[ti];
+                }
+                if (self.config.final_logit_softcapping > 0.0) {
+                    const cap = self.config.final_logit_softcapping;
+                    for (0..v_rows) |ti| {
+                        self.workspace.logits_buf[ti] = cap * std.math.tanh(self.workspace.logits_buf[ti] / cap);
+                    }
                 }
                 if (v_rows < v) {
                     @memset(self.workspace.logits_buf[v_rows..v], -1e30);
@@ -929,40 +1211,72 @@ pub const DFlareProposer = struct {
                 self.markov_steps += 1;
                 return;
             }
+
+            // `mtp.safetensors` `hidden_out`: `lm_head(b_j + hidden_out @ markov + hidden_out_bias)`.
+            matVecF32(self.weights.markov_w2, markov_vec, h, mr, self.workspace.head_hidden[0..h]);
+            if (self.weights.markov_hidden_bias) |hb| {
+                for (0..h) |d| self.workspace.head_hidden[d] += hb[d];
+            }
+            for (0..h) |d| {
+                self.workspace.head_hidden[d] += b_j[d];
+            }
+            try evalLmHead(
+                self.weights.lm_head,
+                self.workspace.head_hidden[0..h],
+                1,
+                self.config.hidden_size,
+                self.config.vocab_size,
+                self.workspace.logits_buf[0..v],
+            );
+            const eff_v: usize = if (self.config.unpadded_vocab_size > 0 and self.config.unpadded_vocab_size < v)
+                self.config.unpadded_vocab_size
+            else
+                v;
+            if (self.config.final_logit_softcapping > 0.0) {
+                const cap = self.config.final_logit_softcapping;
+                for (0..eff_v) |ti| {
+                    self.workspace.logits_buf[ti] = cap * std.math.tanh(self.workspace.logits_buf[ti] / cap);
+                }
+            }
+            if (eff_v < v) {
+                @memset(self.workspace.logits_buf[eff_v..v], -1e30);
+            }
+            self.markov_steps += 1;
+            return;
+        }
+
+        const tok_e = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_hook, prev_token, h, self.workspace.tok_embed_tmp);
+        if (self.weights.token_embd_norm) |ten| {
+            @memcpy(self.workspace.tok_embed_tmp[0..h], tok_e);
+            applyRmsNormInPlace(self.workspace.tok_embed_tmp[0..h], ten, self.config.rms_eps);
+        }
+        const eff_tok_e = if (self.weights.token_embd_norm != null) self.workspace.tok_embed_tmp[0..h] else tok_e;
+
+        if (self.weights.markov_w1.len == mr * 2 * h) {
+            @memcpy(self.workspace.markov_concat[0..h], b_j);
+            @memcpy(self.workspace.markov_concat[h .. 2 * h], eff_tok_e);
+            matVecF32(self.weights.markov_w1, self.workspace.markov_concat[0 .. 2 * h], mr, 2 * h, self.workspace.markov_u[0..mr]);
         } else {
-            const tok_e = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_hook, prev_token, h, self.workspace.tok_embed_tmp);
-            if (self.weights.token_embd_norm) |ten| {
-                @memcpy(self.workspace.tok_embed_tmp[0..h], tok_e);
-                applyRmsNormInPlace(self.workspace.tok_embed_tmp[0..h], ten, self.config.rms_eps);
+            for (0..h) |d| {
+                self.workspace.markov_concat[d] = b_j[d] + eff_tok_e[d];
             }
-            const eff_tok_e = if (self.weights.token_embd_norm != null) self.workspace.tok_embed_tmp[0..h] else tok_e;
+            matVecF32(self.weights.markov_w1, self.workspace.markov_concat[0..h], mr, h, self.workspace.markov_u[0..mr]);
+        }
 
-            if (self.weights.markov_w1.len == mr * 2 * h) {
-                @memcpy(self.workspace.markov_concat[0..h], b_j);
-                @memcpy(self.workspace.markov_concat[h .. 2 * h], eff_tok_e);
-                matVecF32(self.weights.markov_w1, self.workspace.markov_concat[0 .. 2 * h], mr, 2 * h, self.workspace.markov_u[0..mr]);
-            } else {
-                for (0..h) |d| {
-                    self.workspace.markov_concat[d] = b_j[d] + eff_tok_e[d];
-                }
-                matVecF32(self.weights.markov_w1, self.workspace.markov_concat[0..h], mr, h, self.workspace.markov_u[0..mr]);
-            }
-
-            if (self.weights.markov_rnn_proj) |rp| {
-                matVecAccumF32(rp, parent_rnn, mr, mr, self.workspace.markov_u[0..mr]);
-            } else {
-                for (0..mr) |i| {
-                    self.workspace.markov_u[i] += parent_rnn[i];
-                }
-            }
-            if (self.weights.markov_b1) |b1| {
-                for (0..mr) |i| {
-                    self.workspace.markov_u[i] += b1[i];
-                }
-            }
+        if (self.weights.markov_rnn_proj) |rp| {
+            matVecAccumF32(rp, parent_rnn, mr, mr, self.workspace.markov_u[0..mr]);
+        } else {
             for (0..mr) |i| {
-                out_rnn[i] = siluF32(self.workspace.markov_u[i]);
+                self.workspace.markov_u[i] += parent_rnn[i];
             }
+        }
+        if (self.weights.markov_b1) |b1| {
+            for (0..mr) |i| {
+                self.workspace.markov_u[i] += b1[i];
+            }
+        }
+        for (0..mr) |i| {
+            out_rnn[i] = siluF32(self.workspace.markov_u[i]);
         }
 
         matVecF32(self.weights.markov_w2, out_rnn, h, mr, self.workspace.head_hidden[0..h]);
@@ -1074,9 +1388,11 @@ pub const DFlareProposer = struct {
         const base_markov = self.markov_steps;
 
         // 1. Run the 3L/5L block-parallel backbone strictly ONCE.
-        try self.runBlockBackboneOnce(target_hiddens);
+        try self.runBlockBackboneOnceForRoot(root_token, target_hiddens);
 
-        // 2. Decode sequential draft steps j = 0..block_size-1 through the low-rank Markov head.
+        // 2. Decode sequential draft steps through the low-rank Markov head.
+        //    For real Inkling2 DFlare/DSpark (`sample_from_anchor = false`), slot 0 is the anchor
+        //    token and draft slots are `1..block_size-1` (7 drafted tokens -> M = 8 total tree nodes).
         var frontier_cur: [tree_mod.MAX_SUPPORTED_NODES]u16 = undefined;
         var frontier_next: [tree_mod.MAX_SUPPORTED_NODES]u16 = undefined;
         var cur_len: usize = 1;
@@ -1087,7 +1403,8 @@ pub const DFlareProposer = struct {
         if (mr > next_rnn_scratch.len) return error.BufferTooSmall;
         const next_rnn = next_rnn_scratch[0..mr];
 
-        for (0..w) |pos_usize| {
+        const pos_beg: usize = if (self.isRealGru() and w > 1) 1 else 0;
+        for (pos_beg..w) |pos_usize| {
             const pos: u8 = @intCast(pos_usize);
             sortFrontierDescending(max_nodes, out_tree, frontier_cur[0..cur_len]);
 
@@ -1323,6 +1640,26 @@ pub const LoadedDFlareBundle = struct {
             if (vec.len == cfg.num_target_taps * h * h) {
                 fc = vec;
             } else if (vec.len >= cfg.num_target_taps and (vec.len % cfg.num_target_taps) == 0) {
+                // `mtp.safetensors` stores raw pre-softmax `fuse_weight [rows, taps]` logits;
+                // apply row-wise softmax to match `dflash-Q8` `ctx_mix.weight` probabilities.
+                const taps_us: usize = cfg.num_target_taps;
+                const n_rows: usize = vec.len / taps_us;
+                for (0..n_rows) |ri| {
+                    const row = vec[ri * taps_us ..][0..taps_us];
+                    var mx: f32 = -std.math.inf(f32);
+                    for (row) |val| {
+                        if (val > mx) mx = val;
+                    }
+                    var sum: f32 = 0.0;
+                    for (row) |*val| {
+                        val.* = @exp(val.* - mx);
+                        sum += val.*;
+                    }
+                    if (sum > 0.0) {
+                        const inv = 1.0 / sum;
+                        for (row) |*val| val.* *= inv;
+                    }
+                }
                 fuse_scalar = vec;
             } else {
                 return error.DimensionMismatch;
@@ -1486,6 +1823,13 @@ pub const LoadedDFlareBundle = struct {
         const owned_u16 = try allocator.alloc([]u16, u16_len);
         errdefer allocator.free(owned_u16);
         @memcpy(owned_u16, u16_pool[0..u16_len]);
+
+        if (is_real_gru) {
+            if (cfg.rope_theta <= 0.0) cfg.rope_theta = 1_000_000.0;
+            if (cfg.unpadded_vocab_size == 0 and markov_w2_vocab_rows > 0 and markov_w2_vocab_rows < v) {
+                cfg.unpadded_vocab_size = markov_w2_vocab_rows;
+            }
+        }
 
         var ws = try DFlareWorkspace.init(cfg, budget_override);
         errdefer ws.deinit();
@@ -2105,6 +2449,10 @@ pub const DFly2Proposer = struct {
                 self.workspace.mlp_gate,
                 self.workspace.mlp_up,
                 self.workspace.mlp_down,
+                0.0,
+                0,
+                null,
+                null,
             );
         }
 
@@ -2615,6 +2963,35 @@ fn mergeOptionalL1Sam(
     };
 }
 
+fn hasLmHeadHook(hook: LmHeadHook) bool {
+    return switch (hook) {
+        .dense_f32 => |w| w.len > 0,
+        .dense_f16 => |w| w.len > 0,
+        .dense_bf16 => |w| w.len > 0,
+        .callback => true,
+    };
+}
+
+fn applyRopeNeoXInPlace(buf: []f32, num_heads: u32, head_dim: u32, pos: u32, theta: f32) void {
+    const hd: usize = head_dim;
+    const half: usize = hd / 2;
+    const pos_f: f32 = @floatFromInt(pos);
+    const inv_hd: f32 = 2.0 / @as(f32, @floatFromInt(hd));
+    for (0..num_heads) |hi| {
+        const head = buf[hi * hd ..][0..hd];
+        for (0..half) |i| {
+            const freq: f32 = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(i)) * inv_hd);
+            const angle = pos_f * freq;
+            const c = @cos(angle);
+            const s = @sin(angle);
+            const x0 = head[i];
+            const x1 = head[i + half];
+            head[i] = x0 * c - x1 * s;
+            head[i + half] = x0 * s + x1 * c;
+        }
+    }
+}
+
 fn runTransformerBlock(
     layer: TransformerBlockWeights,
     hiddens: []f32,
@@ -2637,6 +3014,10 @@ fn runTransformerBlock(
     mlp_gate: []f32,
     mlp_up: []f32,
     mlp_down: []f32,
+    rope_theta: f32,
+    anchor_pos: u32,
+    ctx_k_f16: ?[]const f16,
+    ctx_v_f16: ?[]const f16,
 ) Error!void {
     if (layer.mla) |mla| {
         try runMlaTransformerBlock(
@@ -2696,6 +3077,11 @@ fn runTransformerBlock(
         if (layer.k_norm_weight) |kn| {
             applyHeadRmsNorm(k_buf[pos * kv_dim ..][0..kv_dim], num_kv_heads, head_dim, kn, rms_eps);
         }
+        if (rope_theta > 0.0) {
+            const tok_pos: u32 = anchor_pos + @as(u32, @intCast(pos));
+            applyRopeNeoXInPlace(q_buf[pos * q_dim ..][0..q_dim], num_heads, head_dim, tok_pos, rope_theta);
+            applyRopeNeoXInPlace(k_buf[pos * kv_dim ..][0..kv_dim], num_kv_heads, head_dim, tok_pos, rope_theta);
+        }
     }
 
     // Bidirectional block-parallel attention over `[ctx_kv (0..ctx_len), block_kv (0..seq_len)]`.
@@ -2707,13 +3093,24 @@ fn runTransformerBlock(
             const q_head = q_row[qh * hd ..][0..hd];
             var max_s: f32 = -std.math.inf(f32);
 
-            for (0..ctx_len) |kp| {
-                const k_head = ctx_k[kp * kv_dim + kvh * hd ..][0..hd];
-                var dot: f32 = 0.0;
-                for (0..hd) |d| dot += q_head[d] * k_head[d];
-                const sc = dot * inv_sqrt_hd;
-                attn_scores[kp] = sc;
-                if (sc > max_s) max_s = sc;
+            if (ctx_k_f16) |ck16| {
+                for (0..ctx_len) |kp| {
+                    const k_head = ck16[kp * kv_dim + kvh * hd ..][0..hd];
+                    var dot: f32 = 0.0;
+                    for (0..hd) |d| dot += q_head[d] * @as(f32, @floatCast(k_head[d]));
+                    const sc = dot * inv_sqrt_hd;
+                    attn_scores[kp] = sc;
+                    if (sc > max_s) max_s = sc;
+                }
+            } else {
+                for (0..ctx_len) |kp| {
+                    const k_head = ctx_k[kp * kv_dim + kvh * hd ..][0..hd];
+                    var dot: f32 = 0.0;
+                    for (0..hd) |d| dot += q_head[d] * k_head[d];
+                    const sc = dot * inv_sqrt_hd;
+                    attn_scores[kp] = sc;
+                    if (sc > max_s) max_s = sc;
+                }
             }
             for (0..seq_len) |kp| {
                 const k_head = k_buf[kp * kv_dim + kvh * hd ..][0..hd];
@@ -2734,10 +3131,18 @@ fn runTransformerBlock(
 
             const dst_head = out_row[qh * hd ..][0..hd];
             @memset(dst_head, 0.0);
-            for (0..ctx_len) |kp| {
-                const p = attn_scores[kp] * inv_sum;
-                const v_head = ctx_v[kp * kv_dim + kvh * hd ..][0..hd];
-                for (0..hd) |d| dst_head[d] += p * v_head[d];
+            if (ctx_v_f16) |cv16| {
+                for (0..ctx_len) |kp| {
+                    const p = attn_scores[kp] * inv_sum;
+                    const v_head = cv16[kp * kv_dim + kvh * hd ..][0..hd];
+                    for (0..hd) |d| dst_head[d] += p * @as(f32, @floatCast(v_head[d]));
+                }
+            } else {
+                for (0..ctx_len) |kp| {
+                    const p = attn_scores[kp] * inv_sum;
+                    const v_head = ctx_v[kp * kv_dim + kvh * hd ..][0..hd];
+                    for (0..hd) |d| dst_head[d] += p * v_head[d];
+                }
             }
             for (0..seq_len) |kp| {
                 const p = attn_scores[ctx_len + kp] * inv_sum;

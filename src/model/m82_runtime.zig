@@ -902,6 +902,7 @@ pub const M82Runtime = struct {
     ink_layers: []Inkling2LayerWeights = &.{},
     ink_steps: []Inkling2StepState = &.{},
     ink_embed_norm: ?qwen3.NormBinding = null,
+    ink_embed_norm_f32: ?[]const f32 = null,
     ink_attn_res_out_q: ?metal.BufferBinding = null,
     ink_cross_pass_q_f32: ?[]const f32 = null,
     ink_cross_pass_kv_q_f32: ?[]const f32 = null,
@@ -916,10 +917,23 @@ pub const M82Runtime = struct {
     ctrl_state_k: []f32 = &.{},
     ctrl_state_v: []f32 = &.{},
     ctrl_state_mlp: []f32 = &.{},
+    /// Preallocated CPU scratch for `Inkling2Loop` cross-pass message bank & 4 attended messages.
+    ink_msg_bank_f32: []f32 = &.{},
+    ink_msg_buf_f32: []f32 = &.{},
+    ink_prelude_cur_off: u64 = 0,
+    ink_inp_sa_off: u64 = 0,
     /// Multi-layer `DFlare` target hidden taps `[num_taps][max_tree_nodes * H]` f32.
     dflare_tap_storage: []f32 = &.{},
     dflare_tap_slices: [dflare_dfly.MAX_TARGET_TAPS][]const f32 = @splat(&.{}),
     dflare_tap_count: usize = 0,
+    /// Full committed-token `DFlare` context tap history `[cap, num_taps, H]` bf16
+    /// (preallocated once at startup, `0` hot-path allocs, `0` wired GPU RAM).
+    dflare_ctx_hist_bf16: []u16 = &.{},
+    dflare_ctx_hist_cap: u32 = 0,
+    dflare_ctx_hist_len: u32 = 0,
+    dflare_ctx_hist_taps: u8 = 0,
+    dflare_ctx_hist_hidden: u32 = 0,
+    dflare_ctx_hist_epoch: u64 = 0,
 
     // Hy4 state
     hy4_layers: []Hy4LayerWeights = &.{},
@@ -999,6 +1013,45 @@ pub const M82Runtime = struct {
         return self.dflare_tap_slices[0..self.dflare_tap_count];
     }
 
+    /// Reads one historical committed token's `DFlare` target tap `[H]` into `dst_f32`
+    /// with zero heap allocations (used by `DFlareProposer`'s incremental context KV cache).
+    pub fn readDFlareCtxTapF32(self: *const M82Runtime, pos: u32, tap_idx: usize, dst_f32: []f32) bool {
+        if (self.dflare_ctx_hist_bf16.len == 0 or self.dflare_ctx_hist_cap == 0) return false;
+        if (pos >= self.dflare_ctx_hist_len) return false;
+        if (self.dflare_ctx_hist_len > self.dflare_ctx_hist_cap and pos + self.dflare_ctx_hist_cap < self.dflare_ctx_hist_len) {
+            return false;
+        }
+        const taps: usize = self.dflare_ctx_hist_taps;
+        const h: usize = self.dflare_ctx_hist_hidden;
+        if (tap_idx >= taps or dst_f32.len < h) return false;
+        const slot: usize = @intCast(pos % self.dflare_ctx_hist_cap);
+        const base: usize = (slot * taps + tap_idx) * h;
+        const src = self.dflare_ctx_hist_bf16[base .. base + h];
+        for (src, 0..) |bits, i| {
+            dst_f32[i] = quant.bf16ToF32(bits);
+        }
+        return true;
+    }
+
+    fn recordDFlareCtxTapRow(self: *M82Runtime, pos: u32, node_idx: usize, h: usize) void {
+        if (self.dflare_ctx_hist_bf16.len == 0 or self.dflare_ctx_hist_cap == 0) return;
+        const taps: usize = @min(self.dflare_tap_count, @as(usize, self.dflare_ctx_hist_taps));
+        if (taps == 0 or h != self.dflare_ctx_hist_hidden) return;
+        const stride: usize = @as(usize, self.max_tree_nodes) * h;
+        if ((node_idx + 1) * h > stride) return;
+        const slot: usize = @intCast(pos % self.dflare_ctx_hist_cap);
+        for (0..taps) |ti| {
+            const src = self.dflare_tap_storage[ti * stride + node_idx * h ..][0..h];
+            const dst = self.dflare_ctx_hist_bf16[(slot * @as(usize, self.dflare_ctx_hist_taps) + ti) * h ..][0..h];
+            for (src, 0..) |fv, i| {
+                dst[i] = @truncate(@as(u32, @bitCast(fv)) >> 16);
+            }
+        }
+        if (pos + 1 > self.dflare_ctx_hist_len) {
+            self.dflare_ctx_hist_len = pos + 1;
+        }
+    }
+
     pub fn dflyTargetKvViews(self: *const M82Runtime) []const dflare_dfly.TargetKvLayerView {
         return self.dfly_kv_views[0..self.dfly_kv_view_count];
     }
@@ -1018,6 +1071,8 @@ pub const M82Runtime = struct {
         if (self.ctrl_state_k.len > 0) @memset(self.ctrl_state_k, 0);
         if (self.ctrl_state_v.len > 0) @memset(self.ctrl_state_v, 0);
         if (self.ctrl_state_mlp.len > 0) @memset(self.ctrl_state_mlp, 0);
+        self.dflare_ctx_hist_len = 0;
+        self.dflare_ctx_hist_epoch +%= 1;
     }
 
     pub fn deinit(self: *M82Runtime, allocator: std.mem.Allocator, compute: metal.Compute) void {
@@ -1054,7 +1109,10 @@ pub const M82Runtime = struct {
         if (self.ctrl_state_k.len > 0) allocator.free(self.ctrl_state_k);
         if (self.ctrl_state_v.len > 0) allocator.free(self.ctrl_state_v);
         if (self.ctrl_state_mlp.len > 0) allocator.free(self.ctrl_state_mlp);
+        if (self.ink_msg_bank_f32.len > 0) allocator.free(self.ink_msg_bank_f32);
+        if (self.ink_msg_buf_f32.len > 0) allocator.free(self.ink_msg_buf_f32);
         if (self.dflare_tap_storage.len > 0) allocator.free(self.dflare_tap_storage);
+        if (self.dflare_ctx_hist_bf16.len > 0) allocator.free(self.dflare_ctx_hist_bf16);
         if (self.hy4_hc_tmp_f32.len > 0) allocator.free(self.hy4_hc_tmp_f32);
         if (self.dfly_kv_k_buf.len > 0) allocator.free(self.dfly_kv_k_buf);
         if (self.dfly_kv_v_buf.len > 0) allocator.free(self.dfly_kv_v_buf);
@@ -1333,101 +1391,157 @@ pub const M82Runtime = struct {
             }
         }
 
-        // Reset AttnRes block ring for this token batch (block 0 = embedded x).
+        // Reset AttnRes block stack for this token batch (starts EMPTY at layer 0 per Inkling2 spec).
         const block_layers: u32 = @max(@as(u32, 1), m82c.n_layers_per_attn_res_block);
-        var cur_block: u32 = 0;
+        var num_blocks: u32 = 0;
         if (self.attn_res_ring) |*ring| {
-            ring.count = 1;
-            ring.head = 1 % ring.spec.max_blocks;
-            const f = try ensureFrame(model, &frame_opt);
-            try model.moe_pipes.encodeCopyStrided(f, .{
-                .src = model.x_bind,
-                .dst = attnResBlockBind(ring, self.buf, 0),
-                .num_rows = m,
-                .copy_cols = h,
-                .src_stride = h,
-                .dst_stride = h,
-            }, true);
+            ring.count = 0;
+            ring.head = 0;
         }
+        self.dflare_tap_count = 0;
 
-        // Reset SME2 loop controller states for this step.
-        const max_kv_h = @max(h, kv_dim);
-        if (self.ctrl_state_attn.len > 0) @memset(self.ctrl_state_attn[0..@min(self.ctrl_state_attn.len, @as(usize, m) * h)], 0);
-        if (self.ctrl_state_k.len > 0) @memset(self.ctrl_state_k[0..@min(self.ctrl_state_k.len, @as(usize, m) * max_kv_h)], 0);
-        if (self.ctrl_state_v.len > 0) @memset(self.ctrl_state_v[0..@min(self.ctrl_state_v.len, @as(usize, m) * max_kv_h)], 0);
-        if (self.ctrl_state_mlp.len > 0) @memset(self.ctrl_state_mlp[0..@min(self.ctrl_state_mlp.len, @as(usize, m) * h)], 0);
-
-        // 2. Execute schedule: Prelude -> Core x R -> Coda.
+        // 2. Execute schedule: Prelude -> Core x R (with pass restart + message bank) -> Coda.
         var eff_step: u32 = 0;
-        // Prelude [0 .. core_start)
         if (R > 1) {
+            // Prelude [0 .. core_start)
             for (0..core_start) |l| {
-                try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, base_pos, m, commit_state, &cur_block, block_layers, q_dim, kv_dim);
-                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step + 1, m);
+                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_host);
+                try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, 0, base_pos, positions, m, commit_state, &num_blocks, block_layers, q_dim, kv_dim, 0);
                 eff_step += 1;
             }
-            // Core [core_start .. core_end) x R passes
-            var r: u32 = 0;
-            while (r < R) : (r += 1) {
-                for (core_start..core_end) |l| {
-                    try self.execInkling2Step(model, &frame_opt, l, eff_step, r, base_pos, m, commit_state, &cur_block, block_layers, q_dim, kv_dim);
-                    try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step + 1, m);
-                    eff_step += 1;
-                }
-            }
-            // Coda [core_end .. num_hidden_layers)
-            for (core_end..cfg.num_hidden_layers) |l| {
-                try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, base_pos, m, commit_state, &cur_block, block_layers, q_dim, kv_dim);
-                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step + 1, m);
-                eff_step += 1;
-            }
-        } else {
-            for (0..cfg.num_hidden_layers) |l| {
-                try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, base_pos, m, commit_state, &cur_block, block_layers, q_dim, kv_dim);
-                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step + 1, m);
-                eff_step += 1;
-            }
-        }
 
-        // 3. Final AttnRes output query + final RMSNorm + `lm_head` + softcap.
-        if (self.attn_res_ring) |*ring| {
-            if (self.ink_attn_res_out_q) |oq| {
+            // Save prelude output (`prelude_cur`) and block count (`prelude_num_blocks`) so passes `1..R-1` restart cleanly.
+            const prelude_num_blocks: u32 = num_blocks;
+            {
                 const f = try ensureFrame(model, &frame_opt);
-                const slot_idx = @min(cur_block + 1, ring.spec.max_blocks - 1);
                 try model.moe_pipes.encodeCopyStrided(f, .{
                     .src = model.x_bind,
-                    .dst = attnResBlockBind(ring, self.buf, slot_idx),
+                    .dst = self.bindAt(self.ink_prelude_cur_off),
                     .num_rows = m,
                     .copy_cols = h,
                     .src_stride = h,
                     .dst_stride = h,
                 }, true);
-                ring.count = slot_idx + 1;
-                ring.head = ring.count % ring.spec.max_blocks;
+            }
+
+            // Core [core_start .. core_end) x R passes
+            var r: u32 = 0;
+            while (r < R) : (r += 1) {
+                var bank_len: usize = 0;
+                if (r > 0) {
+                    // Build normalized message bank from previous pass: `blocks[prelude_num_blocks + 1 .. num_blocks]` + `cur`.
+                    try flushFrame(model, &frame_opt);
+                    if (self.attn_res_ring) |*ring| {
+                        const start_blk: u32 = @min(prelude_num_blocks + 1, num_blocks);
+                        bank_len = stageMsgBankF32(
+                            ring,
+                            self.arena.bytes(),
+                            model.x_host[0 .. @as(usize, m) * h],
+                            start_blk,
+                            num_blocks,
+                            m,
+                            h,
+                            cfg.rms_norm_eps,
+                            self.ink_msg_bank_f32,
+                        );
+                    }
+                    // Restart `cur = prelude_cur` and `blocks = prelude_blocks`.
+                    num_blocks = prelude_num_blocks;
+                    const f = try ensureFrame(model, &frame_opt);
+                    try model.moe_pipes.encodeCopyStrided(f, .{
+                        .src = self.bindAt(self.ink_prelude_cur_off),
+                        .dst = model.x_bind,
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = h,
+                    }, true);
+                }
+
+                for (core_start..core_end) |l| {
+                    try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_host);
+                    try self.execInkling2Step(model, &frame_opt, l, eff_step, r, l - core_start, base_pos, positions, m, commit_state, &num_blocks, block_layers, q_dim, kv_dim, bank_len);
+                    eff_step += 1;
+                }
+            }
+
+            // Coda [core_end .. num_hidden_layers)
+            for (core_end..cfg.num_hidden_layers) |l| {
+                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_host);
+                try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, 0, base_pos, positions, m, commit_state, &num_blocks, block_layers, q_dim, kv_dim, 0);
+                eff_step += 1;
+            }
+        } else {
+            for (0..cfg.num_hidden_layers) |l| {
+                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_host);
+                try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, 0, base_pos, positions, m, commit_state, &num_blocks, block_layers, q_dim, kv_dim, 0);
+                eff_step += 1;
+            }
+        }
+
+        // 3. Final AttnRes output query + final RMSNorm + capture DFlare final tap (`eff_steps`, e.g. 48).
+        const attn_res_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
+        if (self.attn_res_ring) |*ring| {
+            if (self.ink_attn_res_out_q) |oq| {
+                const f = try ensureFrame(model, &frame_opt);
+                const partial_slot = @min(num_blocks, ring.spec.max_blocks - 1);
+                try model.moe_pipes.encodeCopyStrided(f, .{
+                    .src = model.x_bind,
+                    .dst = attnResBlockBind(ring, self.buf, partial_slot),
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+                ring.count = partial_slot + 1;
+                ring.head = 0;
                 try self.pipes.encodeInkling2AttnRes(f, .{
                     .ring = ring,
                     .ring_buf = self.buf,
                     .query = oq,
                     .out = model.x_bind,
                     .m = m,
-                    .num_blocks_override = slot_idx + 1,
+                    .num_blocks_override = partial_slot + 1,
                     .apply_rms_norm = true,
                     .normalize_values = m82c.attn_res_normalize_values,
                     .rms_eps = cfg.rms_norm_eps,
+                    .scale = attn_res_scale,
                 }, true);
                 self.stats.inkling2_attn_res_dispatches += 1;
             }
         }
+        {
+            const f = try ensureFrame(model, &frame_opt);
+            try model.attn_pipes.encodeRmsNorm(f, .{
+                .x = model.x_bind,
+                .w = model.final_norm.binding,
+                .y = model.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = cfg.rms_norm_eps,
+                .w_dtype = model.final_norm.dtype,
+            }, true);
+        }
 
-        // Snapshot final hidden state (`f32`) for `SpecEngine` / `DFlare`.
+        // Snapshot final normed hidden state (`f32`) for `SpecEngine` / `DFlare` (`t_layer_inp[eff_steps]`).
         try flushFrame(model, &frame_opt);
-        f16SliceToF32(model.x_host[0 .. @as(usize, m) * h], self.last_hidden_f32[0 .. @as(usize, m) * h]);
+        try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_norm_host);
+        f16SliceToF32(model.x_norm_host[0 .. @as(usize, m) * h], self.last_hidden_f32[0 .. @as(usize, m) * h]);
 
         if (commit_state) {
+            if (base_pos == 0) {
+                self.dflare_ctx_hist_len = 0;
+                self.dflare_ctx_hist_epoch +%= 1;
+            }
+            if (self.dflare_ctx_hist_bf16.len > 0) {
+                for (0..m) |tok| {
+                    self.recordDFlareCtxTapRow(positions[tok], tok, h);
+                }
+            }
             self.sconv_pos = base_pos + m;
         }
 
-        return self.finalizeLogits(model, &frame_opt, m, compute_logits, m82c.final_logit_softcapping, m82c.unpadded_vocab_size);
+        return self.finalizeLogits(model, &frame_opt, m, compute_logits, m82c.final_logit_softcapping, m82c.unpadded_vocab_size, true);
     }
 
     fn execInkling2Step(
@@ -1437,184 +1551,195 @@ pub const M82Runtime = struct {
         l: usize,
         eff_step: u32,
         loop_pass: u32,
+        loop_layer_idx: usize,
         base_pos: u32,
+        positions: []const u32,
         m: u32,
         commit_state: bool,
-        cur_block: *u32,
+        num_blocks: *u32,
         block_layers: u32,
         q_dim: u32,
         kv_dim: u32,
+        msg_bank_len: usize,
     ) graph.GraphStepError!void {
         const cfg = &model.config;
         const m82c = &cfg.m82_cfg;
         const h: u32 = cfg.hidden_size;
+        const mh: usize = @as(usize, m) * h;
         const layer = &self.ink_layers[l];
         const step_st = &self.ink_steps[eff_step];
+        const attn_res_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
+        const is_block_boundary: bool = ((l % block_layers) == 0);
+        const use_messages: bool = (loop_pass >= 1 and layer.loop_ctrl != null and msg_bank_len > 0 and self.ink_cross_pass_q_f32 != null);
 
-        // --- A. AttnRes block commit & pre-attention residual query (`G25`) ---
-        const x_attn_in_bind: metal.BufferBinding = blk: {
-            if (self.attn_res_ring) |*ring| {
-                if (eff_step > 0 and (eff_step % block_layers) == 0 and cur_block.* + 1 < ring.spec.max_blocks - 1) {
-                    cur_block.* += 1;
-                    const f = try ensureFrame(model, frame_opt);
-                    try model.moe_pipes.encodeCopyStrided(f, .{
-                        .src = model.x_bind,
-                        .dst = attnResBlockBind(ring, self.buf, cur_block.*),
-                        .num_rows = m,
-                        .copy_cols = h,
-                        .src_stride = h,
-                        .dst_stride = h,
-                    }, true);
-                }
-                if (layer.attn_res_attn_q) |aq| {
-                    const f = try ensureFrame(model, frame_opt);
-                    const partial_slot = @min(cur_block.* + 1, ring.spec.max_blocks - 1);
-                    try model.moe_pipes.encodeCopyStrided(f, .{
-                        .src = model.x_bind,
-                        .dst = attnResBlockBind(ring, self.buf, partial_slot),
-                        .num_rows = m,
-                        .copy_cols = h,
-                        .src_stride = h,
-                        .dst_stride = h,
-                    }, true);
-                    ring.count = partial_slot + 1;
-                    ring.head = ring.count % ring.spec.max_blocks;
-                    const aq_pass_bind: metal.BufferBinding = .{
-                        .buffer = aq.buffer,
-                        .offset = aq.offset + @as(u64, loop_pass % @max(layer.attn_res_attn_q_passes, @as(u32, 1))) * h * 2,
+        // Compute `[msg_q, msg_k, msg_v, msg_mlp]` from the previous pass's bank if `loop_pass >= 1`.
+        if (use_messages) {
+            computeCrossPassMessagesF32(
+                self.ink_msg_bank_f32,
+                msg_bank_len,
+                self.ink_cross_pass_q_f32.?,
+                self.ink_cross_pass_kv_q_f32,
+                loop_layer_idx,
+                m,
+                h,
+                self.ink_msg_buf_f32,
+            );
+        }
+
+        // Save `inpSA` (`block_residual = cur`) before attention.
+        {
+            const f = try ensureFrame(model, frame_opt);
+            try model.moe_pipes.encodeCopyStrided(f, .{
+                .src = model.x_bind,
+                .dst = self.bindAt(self.ink_inp_sa_off),
+                .num_rows = m,
+                .copy_cols = h,
+                .src_stride = h,
+                .dst_stride = h,
+            }, true);
+        }
+
+        // --- A. Pre-Attention AttnRes (`G25`, 1 query on SWA or 3 queries [Q,K,V] on global) ---
+        var pre_q_bind = model.x_bind;
+        var pre_k_bind = model.x_bind;
+        var pre_v_bind = model.x_bind;
+        var kv_differ: bool = false;
+        if (self.attn_res_ring) |*ring| {
+            if (layer.attn_res_attn_q) |aq| {
+                const f = try ensureFrame(model, frame_opt);
+                const partial_slot = @min(num_blocks.*, ring.spec.max_blocks - 1);
+                try model.moe_pipes.encodeCopyStrided(f, .{
+                    .src = model.x_bind,
+                    .dst = attnResBlockBind(ring, self.buf, partial_slot),
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+                ring.count = partial_slot + 1;
+                ring.head = 0;
+
+                if (layer.attn_res_attn_q_passes >= 3) {
+                    const out_binds = [3]metal.BufferBinding{
+                        self.bindAt(self.x_alt_off),
+                        self.bindAt(self.x_norm_k_off),
+                        self.bindAt(self.x_norm_v_off),
                     };
+                    for (0..3) |qi| {
+                        try self.pipes.encodeInkling2AttnRes(f, .{
+                            .ring = ring,
+                            .ring_buf = self.buf,
+                            .query = .{ .buffer = aq.buffer, .offset = aq.offset + @as(u64, qi) * h * 2 },
+                            .out = out_binds[qi],
+                            .m = m,
+                            .num_blocks_override = partial_slot + 1,
+                            .apply_rms_norm = true,
+                            .normalize_values = m82c.attn_res_normalize_values,
+                            .rms_eps = cfg.rms_norm_eps,
+                            .scale = attn_res_scale,
+                        }, qi == 0);
+                        self.stats.inkling2_attn_res_dispatches += 1;
+                    }
+                    pre_q_bind = out_binds[0];
+                    pre_k_bind = out_binds[1];
+                    pre_v_bind = out_binds[2];
+                    kv_differ = true;
+                } else {
                     const out_b = self.bindAt(self.x_alt_off);
                     try self.pipes.encodeInkling2AttnRes(f, .{
                         .ring = ring,
                         .ring_buf = self.buf,
-                        .query = aq_pass_bind,
+                        .query = aq,
                         .out = out_b,
                         .m = m,
                         .num_blocks_override = partial_slot + 1,
                         .apply_rms_norm = true,
                         .normalize_values = m82c.attn_res_normalize_values,
                         .rms_eps = cfg.rms_norm_eps,
+                        .scale = attn_res_scale,
                     }, true);
                     self.stats.inkling2_attn_res_dispatches += 1;
-                    break :blk out_b;
+                    pre_q_bind = out_b;
+                    pre_k_bind = out_b;
+                    pre_v_bind = out_b;
                 }
-            }
-            break :blk model.x_bind;
-        };
-
-        // --- B. Pre-Attention RMSNorm + optional `attn_sconv` (`G25`) ---
-        {
-            const f = try ensureFrame(model, frame_opt);
-            if (layer.attn_sconv_w) |sw| {
-                const sring = &(self.sconv_h_ring.?);
-                const state_b = try sring.layerBinding(step_st.sconv_attn_slot, self.buf);
-                // Save post-RMSNorm input for tree commit when `!commit_state`.
-                if (!commit_state) {
-                    try model.attn_pipes.encodeRmsNorm(f, .{
-                        .x = x_attn_in_bind,
-                        .w = layer.attn_norm.binding,
-                        .y = self.bindAt(step_st.tree_attn_sconv_in_off),
-                        .num_rows = m,
-                        .hidden_dim = h,
-                        .eps = cfg.rms_norm_eps,
-                        .w_dtype = layer.attn_norm.dtype,
-                    }, true);
-                }
-                try self.pipes.encodeRmsNormSconv4(f, .{
-                    .x = x_attn_in_bind,
-                    .norm_w = layer.attn_norm.binding,
-                    .norm_dtype = layer.attn_norm.dtype,
-                    .conv_w = sw,
-                    .conv_w_f16 = false,
-                    .conv_state_in = state_b,
-                    .conv_state_out = state_b,
-                    .out = model.x_norm_bind,
-                    .m = m,
-                    .hidden_dim = h,
-                    .state_pos = self.sconv_pos,
-                    .write_state = commit_state,
-                    .apply_rms_norm = true,
-                    .apply_silu = false,
-                    .rms_eps = cfg.rms_norm_eps,
-                }, true);
-                self.stats.inkling2_sconv_dispatches += 1;
-            } else {
-                try model.attn_pipes.encodeRmsNorm(f, .{
-                    .x = x_attn_in_bind,
-                    .w = layer.attn_norm.binding,
-                    .y = model.x_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = cfg.rms_norm_eps,
-                    .w_dtype = layer.attn_norm.dtype,
-                }, true);
             }
         }
 
-        // Optional separate Q/K/V input norms on global layers (fallback to `x_norm_bind`).
-        var q_in_bind = model.x_norm_bind;
+        // --- B. Optional `C26` L2 `SME2` Message Gate (`loop_pass >= 1`, `0` GPU dispatches!) ---
+        if (use_messages) {
+            try flushFrame(model, frame_opt);
+            const ctrl = &(layer.loop_ctrl.?);
+            const q_src_f16: []const f16 = if (pre_q_bind.buffer.handle == self.buf.handle)
+                self.sliceF16(pre_q_bind.offset, mh)
+            else
+                model.x_host[0..mh];
+            const k_src_f16: []const f16 = if (kv_differ) self.sliceF16(pre_k_bind.offset, mh) else q_src_f16;
+            const v_src_f16: []const f16 = if (kv_differ) self.sliceF16(pre_v_bind.offset, mh) else q_src_f16;
+
+            // Compute K and V gates BEFORE overwriting `x_alt_off` (in case SWA shares `q_src_f16 == x_alt_off`).
+            if (ctrl.branches[1].config.state_dim == h) {
+                try self.applySme2MessageGate(ctrl, .k, k_src_f16, self.ink_msg_buf_f32[1 * mh ..][0..mh], self.sliceF16(self.x_norm_k_off, mh), m, h);
+                pre_k_bind = self.bindAt(self.x_norm_k_off);
+            } else {
+                @memcpy(self.sliceF16(self.x_norm_k_off, mh), k_src_f16);
+                pre_k_bind = self.bindAt(self.x_norm_k_off);
+            }
+            if (ctrl.branches[2].config.state_dim == h) {
+                try self.applySme2MessageGate(ctrl, .v, v_src_f16, self.ink_msg_buf_f32[2 * mh ..][0..mh], self.sliceF16(self.x_norm_v_off, mh), m, h);
+                pre_v_bind = self.bindAt(self.x_norm_v_off);
+            } else {
+                @memcpy(self.sliceF16(self.x_norm_v_off, mh), v_src_f16);
+                pre_v_bind = self.bindAt(self.x_norm_v_off);
+            }
+            try self.applySme2MessageGate(ctrl, .attn, q_src_f16, self.ink_msg_buf_f32[0..mh], self.sliceF16(self.x_alt_off, mh), m, h);
+            pre_q_bind = self.bindAt(self.x_alt_off);
+            kv_differ = true;
+        }
+
+        // --- C. Pre-Attention Input RMSNorms (`attn_norm` on SWA, separate `{q,k,v}_input_norm` on global) ---
+        const q_in_bind = model.x_norm_bind;
         var k_in_bind = model.x_norm_bind;
         var v_in_bind = model.x_norm_bind;
-        if (layer.q_input_norm != null or layer.k_input_norm != null or layer.v_input_norm != null) {
+        {
             const f = try ensureFrame(model, frame_opt);
-            if (layer.q_input_norm) |qn| {
-                q_in_bind = self.bindAt(self.x_norm2_off);
-                try model.attn_pipes.encodeRmsNorm(f, .{
-                    .x = x_attn_in_bind,
-                    .w = qn.binding,
-                    .y = q_in_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = cfg.rms_norm_eps,
-                    .w_dtype = qn.dtype,
-                }, true);
-            }
-            if (layer.k_input_norm) |kn| {
+            const q_norm = layer.q_input_norm orelse layer.attn_norm;
+            const k_norm = layer.k_input_norm orelse layer.attn_norm;
+            const v_norm = layer.v_input_norm orelse layer.attn_norm;
+            try model.attn_pipes.encodeRmsNorm(f, .{
+                .x = pre_q_bind,
+                .w = q_norm.binding,
+                .y = q_in_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = cfg.rms_norm_eps,
+                .w_dtype = q_norm.dtype,
+            }, true);
+            if (kv_differ or layer.k_input_norm != null or layer.v_input_norm != null) {
                 k_in_bind = self.bindAt(self.x_norm_k_off);
+                v_in_bind = self.bindAt(self.x_norm_v_off);
                 try model.attn_pipes.encodeRmsNorm(f, .{
-                    .x = x_attn_in_bind,
-                    .w = kn.binding,
+                    .x = pre_k_bind,
+                    .w = k_norm.binding,
                     .y = k_in_bind,
                     .num_rows = m,
                     .hidden_dim = h,
                     .eps = cfg.rms_norm_eps,
-                    .w_dtype = kn.dtype,
+                    .w_dtype = k_norm.dtype,
                 }, false);
-            }
-            if (layer.v_input_norm) |vn| {
-                v_in_bind = self.bindAt(self.x_norm_v_off);
                 try model.attn_pipes.encodeRmsNorm(f, .{
-                    .x = x_attn_in_bind,
-                    .w = vn.binding,
+                    .x = pre_v_bind,
+                    .w = v_norm.binding,
                     .y = v_in_bind,
                     .num_rows = m,
                     .hidden_dim = h,
                     .eps = cfg.rms_norm_eps,
-                    .w_dtype = vn.dtype,
+                    .w_dtype = v_norm.dtype,
                 }, false);
             }
         }
 
-        // Pre-projection `C26` L2 `SME2` K/V controllers when checkpoint has `state_dim == H` (real Inkling-2-Mini).
-        if (layer.loop_ctrl) |*ctrl| {
-            if (ctrl.branches[1].config.state_dim == h and h != kv_dim) {
-                try flushFrame(model, frame_opt);
-                const k_in_slice = self.sliceF16(self.x_norm_k_off, @as(usize, m) * h);
-                const v_in_slice = self.sliceF16(self.x_norm_v_off, @as(usize, m) * h);
-                if (k_in_bind.offset != self.x_norm_k_off or k_in_bind.buffer.handle != self.buf.handle) {
-                    @memcpy(k_in_slice, model.x_norm_host[0 .. @as(usize, m) * h]);
-                    k_in_bind = self.bindAt(self.x_norm_k_off);
-                }
-                if (v_in_bind.offset != self.x_norm_v_off or v_in_bind.buffer.handle != self.buf.handle) {
-                    @memcpy(v_in_slice, model.x_norm_host[0 .. @as(usize, m) * h]);
-                    v_in_bind = self.bindAt(self.x_norm_v_off);
-                }
-                try self.applySme2Branch(ctrl, .k, model.x_norm_host, k_in_slice, self.ctrl_state_k, m, h, h, loop_pass);
-                try self.applySme2Branch(ctrl, .v, model.x_norm_host, v_in_slice, self.ctrl_state_v, m, h, h, loop_pass);
-            }
-        }
-
-        // --- C. Q, K, V, Q_rel, Sink, Gate projections (`G23` multi-scheme) ---
+        // --- D. Q, K, V, Q_rel, Sink, Gate projections (`G23` multi-scheme) ---
         {
             const f = try ensureFrame(model, frame_opt);
             try model.encodeLinearBatched(f, layer.wq, q_in_bind, model.q_bind, m, true);
@@ -1624,69 +1749,79 @@ pub const M82Runtime = struct {
                 try model.encodeLinearBatched(f, wr, q_in_bind, self.bindAt(self.q_rel_off), m, false);
             }
             if (layer.attn_sink_proj) |sp| {
-                try model.encodeLinearBatched(f, sp, model.x_norm_bind, self.bindAt(self.sink_f16_off), m, false);
+                try model.encodeLinearBatched(f, sp, q_in_bind, self.bindAt(self.sink_f16_off), m, false);
             }
             if (layer.gate_attn) |ga| {
-                try model.encodeLinearBatched(f, ga, model.x_norm_bind, self.bindAt(self.gate_attn_off), m, false);
+                try model.encodeLinearBatched(f, ga, q_in_bind, self.bindAt(self.gate_attn_off), m, false);
             }
         }
 
-        // Optional K/V `sconv4` (static on local layers, dynamic `weight_proj` on global layers).
+        // K/V `sconv4` (static `/ sqrt(5)` on SWA layers, dynamic `weight_proj` `/ 3.0` on global layers).
         if (layer.k_sconv_w != null or layer.k_sconv_dyn_proj != null) {
-            try self.applyInkling2KvSconv(model, frame_opt, layer, step_st, true, model.k_bind, step_st.tree_k_sconv_in_off, m, kv_dim, commit_state);
+            try self.applyInkling2KvSconv(model, frame_opt, layer, step_st, true, k_in_bind, model.k_bind, step_st.tree_k_sconv_in_off, m, kv_dim, commit_state);
         }
         if (layer.v_sconv_w != null or layer.v_sconv_dyn_proj != null) {
-            try self.applyInkling2KvSconv(model, frame_opt, layer, step_st, false, model.v_bind, step_st.tree_v_sconv_in_off, m, kv_dim, commit_state);
+            try self.applyInkling2KvSconv(model, frame_opt, layer, step_st, false, v_in_bind, model.v_bind, step_st.tree_v_sconv_in_off, m, kv_dim, commit_state);
         }
 
-        // Convert `sink_f16` -> `sink_f32` (tiny `[m, n_q]`), optional per-channel `q/rel_l2_clip.scale`,
-        // optional `use_value_norm_no_gamma`, AND `C26` L2 `SME2` K/V loop controllers (`0` GPU dispatches on Core layers!).
-        const needs_cpu_kv_step = (layer.attn_sink_proj != null) or
-            (layer.q_l2_scale_vec != null) or
-            (layer.rel_l2_scale_vec != null) or
-            m82c.use_value_norm_no_gamma or
-            (layer.loop_ctrl != null);
-        if (needs_cpu_kv_step) {
+        // Exact Q/K/R ScaledL2Clip + optional LogScale (`!is_local`) + V UnweightedRMSNorm + sink f16->f32.
+        {
             try flushFrame(model, frame_opt);
-            if (layer.q_l2_scale_vec) |qsv| {
-                const qd: usize = q_dim;
-                for (0..m) |tok| {
-                    const qrow = model.q_host[tok * qd ..][0..qd];
-                    for (0..qd) |i| qrow[i] = @floatCast(@as(f32, @floatCast(qrow[i])) * qsv[i]);
-                }
-            }
-            if (layer.rel_l2_scale_vec) |rsv| {
-                if (layer.wr != null) {
-                    const rd: usize = @as(usize, cfg.num_attention_heads) * m82c.d_rel;
-                    const qr = self.sliceF16(self.q_rel_off, @as(usize, m) * rd);
-                    for (0..m) |tok| {
-                        const rrow = qr[tok * rd ..][0..rd];
-                        for (0..rd) |i| rrow[i] = @floatCast(@as(f32, @floatCast(rrow[i])) * rsv[i]);
-                    }
-                }
+            const log_pos: ?[]const u32 = if (!layer.is_local and m82c.log_scaling_n_floor > 0 and m82c.log_scaling_alpha > 0.0)
+                positions[0..m]
+            else
+                null;
+            const q_clip = m82c.qk_l2_clip_threshold * layer.q_l2_clip_scale;
+            applyScaledL2ClipPerHeadF16(
+                model.q_host[0 .. @as(usize, m) * q_dim],
+                layer.q_l2_scale_vec,
+                m,
+                cfg.num_attention_heads,
+                cfg.head_dim,
+                q_clip,
+                log_pos,
+                m82c.log_scaling_n_floor,
+                m82c.log_scaling_alpha,
+            );
+            applyScaledL2ClipPerHeadF16(
+                model.k_host[0 .. @as(usize, m) * kv_dim],
+                null,
+                m,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                m82c.qk_l2_clip_threshold,
+                null,
+                0,
+                0.0,
+            );
+            if (layer.wr != null) {
+                const rd: usize = @as(usize, cfg.num_attention_heads) * m82c.d_rel;
+                const r_clip = m82c.rel_l2_clip_threshold * layer.rel_l2_clip_scale;
+                applyScaledL2ClipPerHeadF16(
+                    self.sliceF16(self.q_rel_off, @as(usize, m) * rd),
+                    layer.rel_l2_scale_vec,
+                    m,
+                    cfg.num_attention_heads,
+                    m82c.d_rel,
+                    r_clip,
+                    log_pos,
+                    m82c.log_scaling_n_floor,
+                    m82c.log_scaling_alpha,
+                );
             }
             if (layer.attn_sink_proj != null) {
                 const nq = cfg.num_attention_heads;
-                const s16 = self.sliceF16(self.sink_f16_off, @as(usize, m) * nq);
-                const s32 = self.sliceF32(self.sink_f32_off, @as(usize, m) * nq);
-                f16SliceToF32(s16, s32);
-            }
-            if (layer.loop_ctrl) |*ctrl| {
-                if (ctrl.branches[1].config.state_dim == kv_dim) {
-                    try self.applySme2Branch(ctrl, .k, model.x_norm_host, model.k_host, self.ctrl_state_k, m, h, kv_dim, loop_pass);
-                    try self.applySme2Branch(ctrl, .v, model.x_norm_host, model.v_host, self.ctrl_state_v, m, h, kv_dim, loop_pass);
-                }
+                f16SliceToF32(self.sliceF16(self.sink_f16_off, @as(usize, m) * nq), self.sliceF32(self.sink_f32_off, @as(usize, m) * nq));
             }
             if (m82c.use_value_norm_no_gamma) {
                 applyUnitRmsNormPerHeadF16(model.v_host[0 .. @as(usize, m) * kv_dim], m, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps);
             }
         }
 
-        // --- D. KV Cache Write / Tree Scratch + Single-Pass `G25` `encodeInkling2RelGqaAttn` ---
+        // --- E. KV Cache Write / Tree Scratch + Single-Pass `G25` `encodeInkling2RelGqaAttn` + `wo_ud` ---
         {
             const f = try ensureFrame(model, frame_opt);
             const kv_ring = &step_st.kv_ring;
-            const use_log_scale = (base_pos + m > m82c.log_scaling_n_floor);
             if (commit_state) {
                 try model.hybrid_pipes.encodeQsaPrefillKvRingCommit(f, .{
                     .k = model.k_bind,
@@ -1717,13 +1852,14 @@ pub const M82Runtime = struct {
                     .causal_q_start_pos = base_pos,
                     .d_rel = if (layer.wr != null and layer.rel_emb_f16 != null) m82c.d_rel else 0,
                     .rel_extent = m82c.rel_extent,
-                    .use_log_scaling = use_log_scale,
-                    .log_scale_alpha = m82c.log_scaling_alpha,
-                    .qk_l2_clip = m82c.qk_l2_clip_threshold * layer.q_l2_clip_scale,
-                    .rel_l2_clip = m82c.rel_l2_clip_threshold * layer.rel_l2_clip_scale,
+                    .rel_zero_oob = true,
+                    .use_log_scaling = false,
+                    .qk_l2_clip = 0.0,
+                    .rel_l2_clip = 0.0,
+                    .rel_scale = 1.0,
+                    .attn_softcap = 0.0,
                 }, true);
             } else {
-                // Speculative tree verify: preserve committed KV ring untouched, save to per-step `tree_k`/`tree_v`.
                 const tk_bind = self.bindAt(step_st.tree_k_off);
                 const tv_bind = self.bindAt(step_st.tree_v_off);
                 try model.moe_pipes.encodeCopyStrided(f, .{
@@ -1762,124 +1898,150 @@ pub const M82Runtime = struct {
                     .kv_len = base_pos,
                     .d_rel = if (layer.wr != null and layer.rel_emb_f16 != null) m82c.d_rel else 0,
                     .rel_extent = m82c.rel_extent,
-                    .use_log_scaling = use_log_scale,
-                    .log_scale_alpha = m82c.log_scaling_alpha,
-                    .qk_l2_clip = m82c.qk_l2_clip_threshold * layer.q_l2_clip_scale,
-                    .rel_l2_clip = m82c.rel_l2_clip_threshold * layer.rel_l2_clip_scale,
+                    .rel_zero_oob = true,
+                    .use_log_scaling = false,
+                    .qk_l2_clip = 0.0,
+                    .rel_l2_clip = 0.0,
+                    .rel_scale = 1.0,
+                    .attn_softcap = 0.0,
                 }, true);
             }
             self.stats.inkling2_rel_gqa_dispatches += 1;
 
-            // Output projection `wo_ud`
+            // Output projection `wo_ud` -> `model.proj_out_bind`
             try model.encodeLinearBatched(f, layer.wo, model.attn_out_bind, model.proj_out_bind, m, true);
-        }
 
-        // Apply `C26` L2 `SME2` `.attn` controller (`0` GPU dispatches) if Core layer, then residual add.
-        if (layer.loop_ctrl) |*ctrl| {
-            try flushFrame(model, frame_opt);
-            try self.applySme2Branch(ctrl, .attn, model.x_norm_host, model.proj_out_host, self.ctrl_state_attn, m, h, h, loop_pass);
-        }
-        {
-            const f = try ensureFrame(model, frame_opt);
-            try model.moe_pipes.encodeResidualAdd(f, .{
-                .x = model.x_bind,
-                .delta = model.proj_out_bind,
-                .count = m * h,
-            }, true);
-        }
-
-        // --- E. MLP AttnRes Query + `mlp_sconv` + Multi-Scheme MoE (`G25` + `G23` + `C3`-`C5`) ---
-        const x_mlp_in_bind: metal.BufferBinding = blk: {
-            if (self.attn_res_ring) |*ring| {
-                if (layer.attn_res_mlp_q) |mq| {
-                    const f = try ensureFrame(model, frame_opt);
-                    const partial_slot = @min(cur_block.* + 1, ring.spec.max_blocks - 1);
+            // Post-attention convolution (`attn_sconv.weight`: `(conv(y) + y) / sqrt(5)`)!
+            if (layer.attn_sconv_w) |sw| {
+                const sring = &(self.sconv_h_ring.?);
+                const state_b = try sring.layerBinding(step_st.sconv_attn_slot, self.buf);
+                if (!commit_state) {
                     try model.moe_pipes.encodeCopyStrided(f, .{
-                        .src = model.x_bind,
-                        .dst = attnResBlockBind(ring, self.buf, partial_slot),
+                        .src = model.proj_out_bind,
+                        .dst = self.bindAt(step_st.tree_attn_sconv_in_off),
                         .num_rows = m,
                         .copy_cols = h,
                         .src_stride = h,
                         .dst_stride = h,
                     }, true);
-                    ring.count = partial_slot + 1;
-                    ring.head = ring.count % ring.spec.max_blocks;
-                    const mq_pass_bind: metal.BufferBinding = .{
-                        .buffer = mq.buffer,
-                        .offset = mq.offset + @as(u64, loop_pass % @max(layer.attn_res_mlp_q_passes, @as(u32, 1))) * h * 2,
-                    };
-                    const out_b = self.bindAt(self.x_alt_off);
-                    try self.pipes.encodeInkling2AttnRes(f, .{
-                        .ring = ring,
-                        .ring_buf = self.buf,
-                        .query = mq_pass_bind,
-                        .out = out_b,
-                        .m = m,
-                        .num_blocks_override = partial_slot + 1,
-                        .apply_rms_norm = true,
-                        .normalize_values = m82c.attn_res_normalize_values,
-                        .rms_eps = cfg.rms_norm_eps,
-                    }, true);
-                    self.stats.inkling2_attn_res_dispatches += 1;
-                    break :blk out_b;
-                }
-            }
-            break :blk model.x_bind;
-        };
-
-        {
-            const f = try ensureFrame(model, frame_opt);
-            if (layer.mlp_sconv_w) |sw| {
-                const sring = &(self.sconv_h_ring.?);
-                const state_b = try sring.layerBinding(step_st.sconv_mlp_slot, self.buf);
-                if (!commit_state) {
-                    try model.attn_pipes.encodeRmsNorm(f, .{
-                        .x = x_mlp_in_bind,
-                        .w = layer.mlp_norm.binding,
-                        .y = self.bindAt(step_st.tree_mlp_sconv_in_off),
-                        .num_rows = m,
-                        .hidden_dim = h,
-                        .eps = cfg.rms_norm_eps,
-                        .w_dtype = layer.mlp_norm.dtype,
-                    }, true);
                 }
                 try self.pipes.encodeRmsNormSconv4(f, .{
-                    .x = x_mlp_in_bind,
-                    .norm_w = layer.mlp_norm.binding,
-                    .norm_dtype = layer.mlp_norm.dtype,
+                    .x = model.proj_out_bind,
                     .conv_w = sw,
                     .conv_w_f16 = false,
                     .conv_state_in = state_b,
                     .conv_state_out = state_b,
-                    .out = model.x_norm_bind,
+                    .out = model.proj_out_bind,
                     .m = m,
                     .hidden_dim = h,
                     .state_pos = self.sconv_pos,
                     .write_state = commit_state,
-                    .apply_rms_norm = true,
+                    .apply_rms_norm = false,
                     .apply_silu = false,
-                    .rms_eps = cfg.rms_norm_eps,
+                    .post_residual_scale = 1.0 / @sqrt(@as(f32, 5.0)),
                 }, true);
                 self.stats.inkling2_sconv_dispatches += 1;
-            } else {
-                try model.attn_pipes.encodeRmsNorm(f, .{
-                    .x = x_mlp_in_bind,
-                    .w = layer.mlp_norm.binding,
-                    .y = model.x_norm_bind,
-                    .num_rows = m,
-                    .hidden_dim = h,
-                    .eps = cfg.rms_norm_eps,
-                    .w_dtype = layer.mlp_norm.dtype,
-                }, true);
             }
 
-            // Router logits + `G25` `encodeInkling2MoeRoute`
+            // Block boundary rule: if `l % block_layers == 0`, push `inpSA` to `blocks` and start fresh partial block (`cur = attn_out`);
+            // otherwise accumulate into partial block (`cur = inpSA + attn_out`).
+            if (is_block_boundary) {
+                if (self.attn_res_ring) |*ring| {
+                    if (num_blocks.* < ring.spec.max_blocks - 1) {
+                        try model.moe_pipes.encodeCopyStrided(f, .{
+                            .src = self.bindAt(self.ink_inp_sa_off),
+                            .dst = attnResBlockBind(ring, self.buf, num_blocks.*),
+                            .num_rows = m,
+                            .copy_cols = h,
+                            .src_stride = h,
+                            .dst_stride = h,
+                        }, true);
+                        num_blocks.* += 1;
+                    }
+                }
+                try model.moe_pipes.encodeCopyStrided(f, .{
+                    .src = model.proj_out_bind,
+                    .dst = model.x_bind,
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+            } else {
+                try model.moe_pipes.encodeResidualAdd(f, .{
+                    .x = model.x_bind,
+                    .delta = model.proj_out_bind,
+                    .count = m * h,
+                }, true);
+            }
+        }
+
+        // --- F. MLP AttnRes Query + optional SME2 Message Gate + `mlp_norm` + Multi-Scheme MoE + `mlp_sconv` ---
+        var pre_mlp_bind: metal.BufferBinding = model.x_bind;
+        if (self.attn_res_ring) |*ring| {
+            if (layer.attn_res_mlp_q) |mq| {
+                const f = try ensureFrame(model, frame_opt);
+                const partial_slot = @min(num_blocks.*, ring.spec.max_blocks - 1);
+                try model.moe_pipes.encodeCopyStrided(f, .{
+                    .src = model.x_bind,
+                    .dst = attnResBlockBind(ring, self.buf, partial_slot),
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+                ring.count = partial_slot + 1;
+                ring.head = 0;
+                const out_b = self.bindAt(self.x_alt_off);
+                try self.pipes.encodeInkling2AttnRes(f, .{
+                    .ring = ring,
+                    .ring_buf = self.buf,
+                    .query = mq,
+                    .out = out_b,
+                    .m = m,
+                    .num_blocks_override = partial_slot + 1,
+                    .apply_rms_norm = true,
+                    .normalize_values = m82c.attn_res_normalize_values,
+                    .rms_eps = cfg.rms_norm_eps,
+                    .scale = attn_res_scale,
+                }, true);
+                self.stats.inkling2_attn_res_dispatches += 1;
+                pre_mlp_bind = out_b;
+            }
+        }
+
+        if (use_messages) {
+            try flushFrame(model, frame_opt);
+            const ctrl = &(layer.loop_ctrl.?);
+            const mlp_src_f16: []const f16 = if (pre_mlp_bind.buffer.handle == self.buf.handle)
+                self.sliceF16(pre_mlp_bind.offset, mh)
+            else
+                model.x_host[0..mh];
+            try self.applySme2MessageGate(ctrl, .mlp, mlp_src_f16, self.ink_msg_buf_f32[3 * mh ..][0..mh], self.sliceF16(self.x_alt_off, mh), m, h);
+            pre_mlp_bind = self.bindAt(self.x_alt_off);
+        }
+
+        {
+            const f = try ensureFrame(model, frame_opt);
+            try model.attn_pipes.encodeRmsNorm(f, .{
+                .x = pre_mlp_bind,
+                .w = layer.mlp_norm.binding,
+                .y = model.x_norm_bind,
+                .num_rows = m,
+                .hidden_dim = h,
+                .eps = cfg.rms_norm_eps,
+                .w_dtype = layer.mlp_norm.dtype,
+            }, true);
+
+            // Router logits + exact `Inkling2LoopTopKRouter` (sigmoid + selection-only bias + top-k norm * route_scale)
             try model.encodeLinearBatched(f, layer.router, model.x_norm_bind, self.bindAt(self.router_logits_off), m, true);
             try self.pipes.encodeInkling2MoeRoute(f, .{
                 .logits = self.bindAt(self.router_logits_off),
                 .logits_f16 = true,
                 .bias = if (m82c.use_gate_bias) layer.router_bias_f32 else null,
                 .bias_f16 = false,
+                .bias_add_to_logits = false,
+                .scoring_sigmoid = true,
                 .topk_experts = self.bindAt(self.topk_ids_off),
                 .topk_weights = self.bindAt(self.topk_w_off),
                 .m = m,
@@ -1887,7 +2049,7 @@ pub const M82Runtime = struct {
                 .top_k = cfg.num_experts_per_tok,
                 .norm_topk_prob = cfg.norm_topk_prob,
                 .route_scale = m82c.route_scale,
-                .router_softcap = m82c.mlp_gate_softcap,
+                .router_softcap = 0.0,
             }, true);
         }
 
@@ -1949,6 +2111,7 @@ pub const M82Runtime = struct {
                             .intermediate_size = inter,
                             .interleaved_gate_up = false,
                             .softcap = m82c.mlp_up_softcap,
+                            .gate_softcap = m82c.mlp_gate_softcap,
                         }, true);
                     } else {
                         try model.encodeLinearGemv(f, resolved.w1, x_tok_bind, self.bindAt(self.exp_gate_up_off), true);
@@ -1957,8 +2120,9 @@ pub const M82Runtime = struct {
                             .out = self.bindAt(self.exp_act_off),
                             .num_rows = 1,
                             .intermediate_size = inter,
-                            .interleaved_gate_up = true,
+                            .pair_interleaved = true,
                             .softcap = m82c.mlp_up_softcap,
+                            .gate_softcap = m82c.mlp_gate_softcap,
                         }, true);
                     }
                     try model.encodeLinearGemv(f, resolved.w2, self.bindAt(self.exp_act_off), out_slot_bind, true);
@@ -1966,42 +2130,56 @@ pub const M82Runtime = struct {
             }
         }
 
-        // `G25` MoE epilogue (weighted reduce + softcap + optional residual).
-        if (layer.loop_ctrl) |*ctrl| {
-            {
-                const f = try ensureFrame(model, frame_opt);
-                try self.pipes.encodeInkling2MoeEpilogue(f, .{
-                    .expert_out = self.bindAt(self.exp_out_off),
-                    .topk_weights = self.bindAt(self.topk_w_off),
-                    .weights_f16 = false,
-                    .residual = null,
-                    .out = model.proj_out_bind,
-                    .m = m,
-                    .hidden_dim = h,
-                    .top_k = top_k,
-                    .mlp_softcap = 0.0,
-                }, true);
-            }
-            try flushFrame(model, frame_opt);
-            try self.applySme2Branch(ctrl, .mlp, model.x_norm_host, model.proj_out_host, self.ctrl_state_mlp, m, h, h, loop_pass);
-            const f = try ensureFrame(model, frame_opt);
-            try model.moe_pipes.encodeResidualAdd(f, .{
-                .x = model.x_bind,
-                .delta = model.proj_out_bind,
-                .count = m * h,
-            }, true);
-        } else {
+        // `G25` MoE weighted combine -> optional post-MLP `mlp_sconv` (`/ sqrt(5)`) -> residual add (`cur = ffn_inp + mlp_out`).
+        {
             const f = try ensureFrame(model, frame_opt);
             try self.pipes.encodeInkling2MoeEpilogue(f, .{
                 .expert_out = self.bindAt(self.exp_out_off),
                 .topk_weights = self.bindAt(self.topk_w_off),
                 .weights_f16 = false,
-                .residual = model.x_bind,
-                .out = model.x_bind,
+                .residual = null,
+                .out = model.proj_out_bind,
                 .m = m,
                 .hidden_dim = h,
                 .top_k = top_k,
                 .mlp_softcap = 0.0,
+            }, true);
+
+            if (layer.mlp_sconv_w) |sw| {
+                const sring = &(self.sconv_h_ring.?);
+                const state_b = try sring.layerBinding(step_st.sconv_mlp_slot, self.buf);
+                if (!commit_state) {
+                    try model.moe_pipes.encodeCopyStrided(f, .{
+                        .src = model.proj_out_bind,
+                        .dst = self.bindAt(step_st.tree_mlp_sconv_in_off),
+                        .num_rows = m,
+                        .copy_cols = h,
+                        .src_stride = h,
+                        .dst_stride = h,
+                    }, true);
+                }
+                try self.pipes.encodeRmsNormSconv4(f, .{
+                    .x = model.proj_out_bind,
+                    .conv_w = sw,
+                    .conv_w_f16 = false,
+                    .conv_state_in = state_b,
+                    .conv_state_out = state_b,
+                    .out = model.proj_out_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .state_pos = self.sconv_pos,
+                    .write_state = commit_state,
+                    .apply_rms_norm = false,
+                    .apply_silu = false,
+                    .post_residual_scale = 1.0 / @sqrt(@as(f32, 5.0)),
+                }, true);
+                self.stats.inkling2_sconv_dispatches += 1;
+            }
+
+            try model.moe_pipes.encodeResidualAdd(f, .{
+                .x = model.x_bind,
+                .delta = model.proj_out_bind,
+                .count = m * h,
             }, true);
         }
     }
@@ -2013,6 +2191,7 @@ pub const M82Runtime = struct {
         layer: *const Inkling2LayerWeights,
         step_st: *const Inkling2StepState,
         is_k: bool,
+        kv_in_bind: metal.BufferBinding,
         kv_bind: metal.BufferBinding,
         tree_in_off: u64,
         m: u32,
@@ -2038,10 +2217,11 @@ pub const M82Runtime = struct {
         }
 
         if (dyn_proj) |dp| {
-            // Global layer dynamic sconv: compute `[m, dp.n]` (`4` or `num_kv_heads * 4`) from `x_norm` and broadcast.
+            // Global layer `Inkling2LoopDynamicShortConvolution`: `weight_proj` outputs lag `0..3`
+            // (lag 0 = current token), reversed to kernel `[t-3, t-2, t-1, t]` order, scaled by `1 / 3`.
             {
                 const f = try ensureFrame(model, frame_opt);
-                try model.encodeLinearBatched(f, dp, model.x_norm_bind, self.bindAt(self.dyn_sconv_proj_off), m, true);
+                try model.encodeLinearBatched(f, dp, kv_in_bind, self.bindAt(self.dyn_sconv_proj_off), m, true);
             }
             try flushFrame(model, frame_opt);
             const proj_n: usize = dp.n;
@@ -2060,21 +2240,23 @@ pub const M82Runtime = struct {
                         (tok * n_kvh + (c / hd)) * 4
                     else
                         tok * 4;
-                    const p0: f32 = @floatCast(proj_h[p_off + 0]);
-                    const p1: f32 = @floatCast(proj_h[p_off + 1]);
-                    const p2: f32 = @floatCast(proj_h[p_off + 2]);
-                    const p3: f32 = @floatCast(proj_h[p_off + 3]);
+                    // `proj_h[p_off + lag]` has lag 0 = current token, lag 3 = t-3.
+                    const lag0: f32 = @floatCast(proj_h[p_off + 0]);
+                    const lag1: f32 = @floatCast(proj_h[p_off + 1]);
+                    const lag2: f32 = @floatCast(proj_h[p_off + 2]);
+                    const lag3: f32 = @floatCast(proj_h[p_off + 3]);
                     const base = (tok * kv_dim + c) * 4;
                     if (static_f32) |sf| {
-                        dyn_w[base + 0] = @floatCast(sf[c * 4 + 0] + p0);
-                        dyn_w[base + 1] = @floatCast(sf[c * 4 + 1] + p1);
-                        dyn_w[base + 2] = @floatCast(sf[c * 4 + 2] + p2);
-                        dyn_w[base + 3] = @floatCast(sf[c * 4 + 3] + p3);
+                        // `sf` is already stored in `[t-3, t-2, t-1, t]` order by `loadSconvF32TransposedIfNeeded`.
+                        dyn_w[base + 0] = @floatCast(sf[c * 4 + 0] + lag3);
+                        dyn_w[base + 1] = @floatCast(sf[c * 4 + 1] + lag2);
+                        dyn_w[base + 2] = @floatCast(sf[c * 4 + 2] + lag1);
+                        dyn_w[base + 3] = @floatCast(sf[c * 4 + 3] + lag0);
                     } else {
-                        dyn_w[base + 0] = @floatCast(p0);
-                        dyn_w[base + 1] = @floatCast(p1);
-                        dyn_w[base + 2] = @floatCast(p2);
-                        dyn_w[base + 3] = @floatCast(p3);
+                        dyn_w[base + 0] = @floatCast(lag3);
+                        dyn_w[base + 1] = @floatCast(lag2);
+                        dyn_w[base + 2] = @floatCast(lag1);
+                        dyn_w[base + 3] = @floatCast(lag0);
                     }
                 }
             }
@@ -2092,6 +2274,7 @@ pub const M82Runtime = struct {
                 .is_dynamic = true,
                 .apply_rms_norm = false,
                 .apply_silu = false,
+                .post_residual_scale = 1.0 / 3.0,
             }, true);
             self.stats.inkling2_sconv_dispatches += 1;
         } else if (static_w) |sw| {
@@ -2110,71 +2293,35 @@ pub const M82Runtime = struct {
                 .is_dynamic = false,
                 .apply_rms_norm = false,
                 .apply_silu = false,
+                .post_residual_scale = 1.0 / @sqrt(@as(f32, 5.0)),
             }, true);
             self.stats.inkling2_sconv_dispatches += 1;
         }
     }
 
-    fn applySme2Branch(
+    fn applySme2MessageGate(
         self: *M82Runtime,
         ctrl: *ink_ctrl.Inkling2LoopController,
         branch: ink_ctrl.ControllerBranch,
-        x_norm_f16: []const f16,
-        val_f16: []f16,
-        state_f32: []f32,
+        cur_f16: []const f16,
+        msg_f32: []const f32,
+        out_f16: []f16,
         m: u32,
-        in_dim: u32,
-        out_dim: u32,
-        loop_pass: u32,
+        dim: u32,
     ) graph.GraphStepError!void {
-        const ctrl_in_dim: usize = ctrl.config.hidden_size;
-        const mn_in: usize = @as(usize, m) * ctrl_in_dim;
-        const mn_out: usize = @as(usize, m) * out_dim;
-        if (ctrl_in_dim == @as(usize, in_dim) * 2) {
-            // Real Inkling-2-Mini `[x_cur || s_prev]` concatenated controller input (`2 * H`).
-            for (0..m) |tok| {
-                const dst_row = self.ctrl_x_f32[tok * ctrl_in_dim ..][0..ctrl_in_dim];
-                f16SliceToF32(x_norm_f16[tok * in_dim ..][0..in_dim], dst_row[0..in_dim]);
-                const copy_s = @min(@as(usize, in_dim), @as(usize, out_dim));
-                @memcpy(dst_row[in_dim .. in_dim + copy_s], state_f32[tok * out_dim ..][0..copy_s]);
-                if (copy_s < in_dim) @memset(dst_row[in_dim + copy_s ..], 0);
-            }
-        } else {
-            f16SliceToF32(x_norm_f16[0 .. @as(usize, m) * in_dim], self.ctrl_x_f32[0..mn_in]);
-        }
-        f16SliceToF32(val_f16[0..mn_out], self.ctrl_val_f32[0..mn_out]);
-
-        // Cross-pass query blend on `loop_pass >= 1` using `middle_cycle_cross_pass_{kv_}queries`.
-        if (loop_pass >= 1) {
-            const q_opt = if (branch == .k or branch == .v) self.ink_cross_pass_kv_q_f32 else self.ink_cross_pass_q_f32;
-            if (q_opt) |cq| {
-                const q_len = @min(cq.len, @as(usize, out_dim));
-                for (0..m) |tok| {
-                    var dot_v: f32 = 0.0;
-                    const row = state_f32[tok * out_dim ..][0..q_len];
-                    for (0..q_len) |c| dot_v += row[c] * cq[c];
-                    const alpha: f32 = 1.0 / (1.0 + @exp(-std.math.clamp(dot_v * 0.05, -10.0, 10.0)));
-                    for (0..out_dim) |c| {
-                        state_f32[tok * out_dim + c] *= alpha;
-                    }
-                }
-            }
-        }
-
+        const mn: usize = @as(usize, m) * dim;
+        f16SliceToF32(cur_f16[0..mn], self.ctrl_val_f32[0..mn]);
         const disp = &(self.sme_dispatcher.?);
-        ctrl.stepBranchWithValue(
+        ctrl.stepMessageGate(
             disp,
             branch,
-            self.ctrl_x_f32[0..mn_in],
-            self.ctrl_val_f32[0..mn_out],
-            state_f32[0..mn_out],
-            self.ctrl_out_f32[0..mn_out],
+            self.ctrl_val_f32[0..mn],
+            msg_f32[0..mn],
+            self.ctrl_out_f32[0..mn],
             m,
             null,
         ) catch return error.InvalidArgument;
-
-        @memcpy(state_f32[0..mn_out], self.ctrl_out_f32[0..mn_out]);
-        f32SliceToF16(self.ctrl_out_f32[0..mn_out], val_f16[0..mn_out]);
+        f32SliceToF16(self.ctrl_out_f32[0..mn], out_f16[0..mn]);
         self.stats.inkling2_sme2_ctrl_calls += 1;
     }
 
@@ -2182,18 +2329,19 @@ pub const M82Runtime = struct {
         self: *M82Runtime,
         model: *graph.GraphModel,
         frame_opt: *?metal.Compute.Frame,
-        step_1based: u32,
+        visit_idx: u32,
         m: u32,
+        src_host: []const f16,
     ) graph.GraphStepError!void {
         const m82c = &model.config.m82_cfg;
         if (m82c.dflare_target_layer_count == 0 or self.dflare_tap_storage.len == 0) return;
         const h: usize = model.config.hidden_size;
         const stride: usize = @as(usize, self.max_tree_nodes) * h;
         for (0..m82c.dflare_target_layer_count) |ti| {
-            if (m82c.dflare_target_layer_ids[ti] == step_1based) {
+            if (m82c.dflare_target_layer_ids[ti] == visit_idx) {
                 try flushFrame(model, frame_opt);
                 const dst = self.dflare_tap_storage[ti * stride ..][0 .. @as(usize, m) * h];
-                f16SliceToF32(model.x_host[0 .. @as(usize, m) * h], dst);
+                f16SliceToF32(src_host[0 .. @as(usize, m) * h], dst);
                 self.dflare_tap_slices[ti] = dst;
                 if (ti + 1 > self.dflare_tap_count) self.dflare_tap_count = ti + 1;
             }
@@ -2317,7 +2465,7 @@ pub const M82Runtime = struct {
             self.refreshDFly2TargetKvViews(cfg, base_pos + m);
         }
 
-        return self.finalizeLogits(model, &frame_opt, m, compute_logits, 0.0, 0);
+        return self.finalizeLogits(model, &frame_opt, m, compute_logits, 0.0, 0, false);
     }
 
     fn execHy4Layer(
@@ -3243,9 +3391,17 @@ pub const M82Runtime = struct {
             }
             self.sconv_pos = base_pos + k_len;
 
+            // Record all accepted tree nodes into full DFlare context history before compacting.
+            const h_us: usize = h;
+            if (self.dflare_ctx_hist_bf16.len > 0) {
+                for (accepted_nodes, 0..) |nid, idx| {
+                    self.recordDFlareCtxTapRow(base_pos + @as(u32, @intCast(idx)), nid, h_us);
+                }
+                self.dflare_ctx_hist_len = base_pos + @as(u32, @intCast(accepted_nodes.len));
+            }
+
             // Compact `last_hidden_f32` and `dflare_taps` to the last accepted node!
             const last_node: usize = accepted_nodes[accepted_nodes.len - 1];
-            const h_us: usize = h;
             if (last_node != 0 and (last_node + 1) * h_us <= self.last_hidden_f32.len) {
                 @memcpy(self.last_hidden_f32[0..h_us], self.last_hidden_f32[last_node * h_us ..][0..h_us]);
             }
@@ -3311,6 +3467,7 @@ pub const M82Runtime = struct {
         compute_logits: bool,
         logit_softcap: f32,
         unpadded_vocab_size: u32,
+        already_normed: bool,
     ) graph.GraphStepError!qwen3.VerifyTreeResult {
         const cfg = &model.config;
         const h = cfg.hidden_size;
@@ -3330,15 +3487,17 @@ pub const M82Runtime = struct {
 
         {
             const f = try ensureFrame(model, frame_opt);
-            try model.attn_pipes.encodeRmsNorm(f, .{
-                .x = model.x_bind,
-                .w = model.final_norm.binding,
-                .y = model.x_norm_bind,
-                .num_rows = m,
-                .hidden_dim = h,
-                .eps = cfg.rms_norm_eps,
-                .w_dtype = model.final_norm.dtype,
-            }, true);
+            if (!already_normed) {
+                try model.attn_pipes.encodeRmsNorm(f, .{
+                    .x = model.x_bind,
+                    .w = model.final_norm.binding,
+                    .y = model.x_norm_bind,
+                    .num_rows = m,
+                    .hidden_dim = h,
+                    .eps = cfg.rms_norm_eps,
+                    .w_dtype = model.final_norm.dtype,
+                }, true);
+            }
             try model.encodeLinearBatched(f, model.lm_head, model.x_norm_bind, model.logits_bind, m, true);
         }
         try flushFrame(model, frame_opt);
@@ -3512,6 +3671,7 @@ fn computeArenaBytes(
     bytes += amf.align64(max_m * top_k * h * 2);
 
     if (cfg.m82_family.isInkling2()) {
+        bytes += 2 * amf.align64(max_m * h * 2); // ink_prelude_cur + ink_inp_sa
         bytes += amf.align64(max_m * cfg.num_attention_heads * m82c.d_rel * 2);
         bytes += amf.align64(max_m * cfg.num_attention_heads * 6);
         bytes += amf.align64(max_m * q_dim * 2);
@@ -3621,6 +3781,8 @@ fn loadInkling2(
     const num_layers = cfg.num_hidden_layers;
     const num_experts = cfg.num_experts;
 
+    rt.ink_prelude_cur_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
+    rt.ink_inp_sa_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
     rt.q_rel_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * cfg.num_attention_heads * m82c.d_rel * 2);
     rt.sink_f16_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * cfg.num_attention_heads * 2);
     rt.sink_f32_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * cfg.num_attention_heads * 4);
@@ -3644,6 +3806,7 @@ fn loadInkling2(
     // Optional top-level `embed_norm.weight`, `attn_res.output_query`, `middle_cycle_cross_pass_*`.
     if (ctx.source.find("embed_norm.weight") != null) {
         rt.ink_embed_norm = try bindNormCtx(ctx, "embed_norm.weight", h);
+        rt.ink_embed_norm_f32 = try loadTensorF32Slice(allocator, ctx, f32_pool, "embed_norm.weight", h);
     }
     if (ctx.source.find("attn_res.output_query") != null) {
         rt.ink_attn_res_out_q = try loadConvertedF16Binding(ctx, &rt.arena, rt.buf, "attn_res.output_query", h);
@@ -3666,16 +3829,28 @@ fn loadInkling2(
         rt.ctrl_state_k = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
         rt.ctrl_state_v = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
         rt.ctrl_state_mlp = try allocator.alloc(f32, @as(usize, max_m) * h);
+        rt.ink_msg_bank_f32 = try allocator.alloc(f32, @as(usize, ink_gpu.MAX_ATTN_RES_BLOCKS) * max_m * h);
+        rt.ink_msg_buf_f32 = try allocator.alloc(f32, 4 * @as(usize, max_m) * h);
         @memset(rt.ctrl_state_attn, 0);
         @memset(rt.ctrl_state_k, 0);
         @memset(rt.ctrl_state_v, 0);
         @memset(rt.ctrl_state_mlp, 0);
+        @memset(rt.ink_msg_bank_f32, 0);
+        @memset(rt.ink_msg_buf_f32, 0);
     }
 
-    // Preallocate `DFlare` target tap storage.
+    // Preallocate `DFlare` target tap storage and full committed-token context tap history (`1024`-tok SWA ring).
     if (m82c.dflare_target_layer_count > 0) {
         rt.dflare_tap_storage = try allocator.alloc(f32, @as(usize, m82c.dflare_target_layer_count) * max_m * h);
         @memset(rt.dflare_tap_storage, 0);
+        const hist_cap: u32 = @min(ctx.max_seq_len, if (h >= 1024) @as(u32, 1024) else @as(u32, 128));
+        if (hist_cap > 0) {
+            rt.dflare_ctx_hist_bf16 = try allocator.alloc(u16, @as(usize, hist_cap) * @as(usize, m82c.dflare_target_layer_count) * h);
+            @memset(rt.dflare_ctx_hist_bf16, 0);
+            rt.dflare_ctx_hist_cap = hist_cap;
+            rt.dflare_ctx_hist_taps = m82c.dflare_target_layer_count;
+            rt.dflare_ctx_hist_hidden = h;
+        }
     }
 
     // Load physical layers `0 .. num_layers`.
@@ -4522,8 +4697,10 @@ fn loadSconvF32TransposedIfNeeded(
         const tmp = try allocator.alloc(f32, total);
         defer allocator.free(tmp);
         try decodeEntryToF32(e, ctx.entry_slices[idx], tmp);
+        // `static_w` `[4, dim]` stores lag 0 (current token) at row 0 and lag 3 at row 3;
+        // reverse into `[t-3, t-2, t-1, t]` kernel tap order.
         for (0..dim) |c| {
-            for (0..4) |t| dst[c * 4 + t] = tmp[t * dim + c];
+            for (0..4) |lag| dst[c * 4 + (3 - lag)] = tmp[lag * dim + c];
         }
     } else {
         try decodeEntryToF32(e, ctx.entry_slices[idx], dst);
@@ -4764,6 +4941,158 @@ fn applyUnitRmsNormPerHeadF16(buf: []f16, m: u32, num_heads: u32, head_dim: u32,
             const inv_rms: f32 = 1.0 / @sqrt(sq / @as(f32, @floatFromInt(head_dim)) + eps);
             for (row) |*v| {
                 v.* = @floatCast(@as(f32, @floatCast(v.*)) * inv_rms);
+            }
+        }
+    }
+}
+
+fn applyScaledL2ClipPerHeadF16(
+    buf: []f16,
+    scale_vec: ?[]const f32,
+    m: u32,
+    num_heads: u32,
+    head_dim: u32,
+    threshold: f32,
+    log_positions: ?[]const u32,
+    log_floor: u32,
+    log_alpha: f32,
+) void {
+    const hd: usize = head_dim;
+    const nh_total: usize = num_heads;
+    const floor_f: f32 = if (log_floor > 0) @floatFromInt(log_floor) else 1.0;
+    for (0..m) |tok| {
+        const tau: f32 = if (log_positions) |lp| blk: {
+            const ratio: f32 = @max(1.0, (@as(f32, @floatFromInt(lp[tok])) + 1.0) / floor_f);
+            break :blk 1.0 + log_alpha * @log(ratio);
+        } else 1.0;
+        for (0..nh_total) |nh| {
+            const row = buf[(tok * nh_total + nh) * hd ..][0..hd];
+            const sv_off = nh * hd;
+            var sq: f32 = 0.0;
+            for (0..hd) |i| {
+                var fv: f32 = @floatCast(row[i]);
+                if (scale_vec) |sv| fv *= sv[sv_off + i];
+                sq += fv * fv;
+            }
+            const norm = @sqrt(sq);
+            const clip: f32 = if (threshold > 0.0) @min(1.0, threshold / (norm + 1e-6)) else 1.0;
+            const fac: f32 = clip * tau;
+            for (0..hd) |i| {
+                var fv: f32 = @floatCast(row[i]);
+                if (scale_vec) |sv| fv *= sv[sv_off + i];
+                row[i] = @floatCast(fv * fac);
+            }
+        }
+    }
+}
+
+fn stageMsgBankF32(
+    ring: *const ink_gpu.AttnResRingArena,
+    raw: []const u8,
+    cur_host: []const f16,
+    start_slot: u32,
+    end_slot: u32,
+    m: u32,
+    h: u32,
+    rms_eps: f32,
+    dst_bank_norm: []f32,
+) usize {
+    const h_us: usize = h;
+    const m_us: usize = m;
+    const mh: usize = m_us * h_us;
+    var bank_len: usize = 0;
+
+    var slot: u32 = start_slot;
+    while (slot < end_slot and bank_len + 1 < ink_gpu.MAX_ATTN_RES_BLOCKS) : (slot += 1) {
+        const b_off: usize = @intCast(ring.base_off + @as(u64, slot) * ring.block_stride_elems * 2);
+        const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, raw[b_off..][0 .. mh * 2]));
+        const dst = dst_bank_norm[bank_len * mh ..][0..mh];
+        for (0..m_us) |tok| {
+            var sq: f32 = 0.0;
+            for (0..h_us) |c| {
+                const v: f32 = @floatCast(src[tok * h_us + c]);
+                dst[tok * h_us + c] = v;
+                sq += v * v;
+            }
+            const inv_rms = 1.0 / @sqrt(sq / @as(f32, @floatFromInt(h)) + rms_eps);
+            for (0..h_us) |c| dst[tok * h_us + c] *= inv_rms;
+        }
+        bank_len += 1;
+    }
+
+    // Append `previous_hidden_states` (`cur_host`).
+    const dst_cur = dst_bank_norm[bank_len * mh ..][0..mh];
+    for (0..m_us) |tok| {
+        var sq: f32 = 0.0;
+        for (0..h_us) |c| {
+            const v: f32 = @floatCast(cur_host[tok * h_us + c]);
+            dst_cur[tok * h_us + c] = v;
+            sq += v * v;
+        }
+        const inv_rms = 1.0 / @sqrt(sq / @as(f32, @floatFromInt(h)) + rms_eps);
+        for (0..h_us) |c| dst_cur[tok * h_us + c] *= inv_rms;
+    }
+    bank_len += 1;
+    return bank_len;
+}
+
+fn computeCrossPassMessagesF32(
+    bank_norm_f32: []const f32,
+    bank_len: usize,
+    q_src: []const f32,
+    kv_q_src: ?[]const f32,
+    loop_layer_idx: usize,
+    m: u32,
+    h: u32,
+    out_msgs: []f32,
+) void {
+    const h_us: usize = h;
+    const m_us: usize = m;
+    const mh: usize = m_us * h_us;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
+    const q_rows: usize = @max(@as(usize, 1), q_src.len / h_us);
+    const kv_slice = kv_q_src orelse q_src;
+    const kv_rows: usize = @max(@as(usize, 1), kv_slice.len / h_us);
+
+    // Per `Inkling2LoopMergeMessageQueries`:
+    //   `middle_cycle_cross_pass_queries` stores `[query, mlp]` for each loop layer (`2*k`, `2*k+1`);
+    //   `middle_cycle_cross_pass_kv_queries` stores `[key, value]` for each loop layer (`2*k`, `2*k+1`).
+    const queries = [4][]const f32{
+        q_src[((2 * loop_layer_idx + 0) % q_rows) * h_us ..][0..h_us],
+        kv_slice[((2 * loop_layer_idx + 0) % kv_rows) * h_us ..][0..h_us],
+        kv_slice[((2 * loop_layer_idx + 1) % kv_rows) * h_us ..][0..h_us],
+        q_src[((2 * loop_layer_idx + 1) % q_rows) * h_us ..][0..h_us],
+    };
+
+    var scores: [ink_gpu.MAX_ATTN_RES_BLOCKS]f32 = undefined;
+    var weights: [ink_gpu.MAX_ATTN_RES_BLOCKS]f32 = undefined;
+    for (0..4) |qi| {
+        const qv = queries[qi];
+        for (0..m_us) |tok| {
+            var max_s: f32 = -std.math.inf(f32);
+            for (0..bank_len) |b| {
+                const bv = bank_norm_f32[b * mh + tok * h_us ..][0..h_us];
+                var dot_v: f32 = 0.0;
+                for (0..h_us) |c| dot_v += qv[c] * bv[c];
+                const s = dot_v * scale;
+                scores[b] = s;
+                if (s > max_s) max_s = s;
+            }
+            var exp_sum: f32 = 0.0;
+            for (0..bank_len) |b| {
+                const e = @exp(scores[b] - max_s);
+                weights[b] = e;
+                exp_sum += e;
+            }
+            const inv_sum: f32 = if (exp_sum > 0.0) 1.0 / exp_sum else 0.0;
+            for (0..bank_len) |b| weights[b] *= inv_sum;
+
+            const dst = out_msgs[qi * mh + tok * h_us ..][0..h_us];
+            @memset(dst, 0.0);
+            for (0..bank_len) |b| {
+                const w = weights[b];
+                const bv = bank_norm_f32[b * mh + tok * h_us ..][0..h_us];
+                for (0..h_us) |c| dst[c] += w * bv[c];
             }
         }
     }

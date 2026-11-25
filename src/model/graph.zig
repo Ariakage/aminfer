@@ -49,6 +49,7 @@ const transport = @import("../cluster/transport.zig");
 const expert_parallel = @import("../cluster/expert_parallel.zig");
 const ink_gpu = @import("../gpu/inkling2_hy4.zig");
 const ink_ctrl = @import("../cpu/inkling2_ctrl.zig");
+const dflare_dfly = @import("../spec/dflare_dfly.zig");
 const m82_rt = @import("m82_runtime.zig");
 
 /// Maximum wired bytes per GPU weight shard (matches `qwen3.zig` to stay below
@@ -1948,6 +1949,7 @@ pub const GraphModel = struct {
     }
 
     pub fn deinit(self: *GraphModel, allocator: std.mem.Allocator) void {
+        dflare_dfly.unregisterContextHistoryProvider(self);
         if (self.m82) |rt| {
             rt.deinit(allocator, self.compute);
             self.m82 = null;
@@ -2379,6 +2381,35 @@ pub const GraphModel = struct {
                 ) catch return error.UnsupportedDType;
             },
         }
+        if (self.m82) |rt| {
+            if (rt.dflare_ctx_hist_bf16.len > 0) {
+                dflare_dfly.registerContextHistoryProvider(self, graphDFlareContextHistoryCb);
+            }
+            if (rt.ink_embed_norm_f32) |enw| {
+                var sq: f32 = 0.0;
+                for (out_f32[0..h]) |val| sq += val * val;
+                const inv_rms = 1.0 / @sqrt(sq / @as(f32, @floatFromInt(h)) + self.config.rms_norm_eps);
+                for (0..h) |i| {
+                    out_f32[i] = out_f32[i] * inv_rms * enw[i];
+                }
+            }
+        }
+    }
+
+    fn graphDFlareContextHistoryCb(
+        ctx: *const anyopaque,
+        out_len: *u32,
+        out_epoch: *u64,
+        pos: u32,
+        tap_idx: usize,
+        dst_f32: []f32,
+    ) bool {
+        const gm: *const GraphModel = @ptrCast(@alignCast(ctx));
+        const rt = gm.m82 orelse return false;
+        out_len.* = rt.dflare_ctx_hist_len;
+        out_epoch.* = rt.dflare_ctx_hist_epoch;
+        if (dst_f32.len == 0) return rt.dflare_ctx_hist_bf16.len > 0;
+        return rt.readDFlareCtxTapF32(pos, tap_idx, dst_f32);
     }
 
     pub fn bytesPerDecodeToken(self: *const GraphModel, seq_len: u32) u64 {
