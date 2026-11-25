@@ -4189,6 +4189,8 @@ pub const M82Runtime = struct {
             };
         }
 
+        const eff_vocab: u32 = if (unpadded_vocab_size > 0 and unpadded_vocab_size < v) unpadded_vocab_size else v;
+
         {
             const f = try ensureFrame(model, frame_opt);
             if (!already_normed) {
@@ -4203,35 +4205,20 @@ pub const M82Runtime = struct {
                 }, true);
             }
             try model.encodeLinearBatched(f, model.lm_head, model.x_norm_bind, model.logits_bind, m, true);
+            // GPU logit softcap + padded-vocab `-inf` mask + per-row greedy argmax inside the
+            // same `MTL4CommandBuffer` (`0` scalar CPU `tanh` loops over `m * vocab_size`!).
+            try self.pipes.encodeInkling2LogitFinalize(f, .{
+                .logits = model.logits_bind,
+                .out_tokens = model.out_token_id_bind,
+                .m = m,
+                .vocab_size = v,
+                .eff_vocab = eff_vocab,
+                .logit_softcap = logit_softcap,
+            }, true);
         }
         try flushFrame(model, frame_opt);
 
-        const logits_mut: []f16 = @constCast(model.logits_host[0 .. @as(usize, m) * v]);
-        const eff_vocab: u32 = if (unpadded_vocab_size > 0 and unpadded_vocab_size < v) unpadded_vocab_size else v;
-
-        for (0..m) |tok| {
-            const row = logits_mut[tok * v ..][0..v];
-            var best_id: u32 = 0;
-            var best_val: f32 = -std.math.inf(f32);
-            for (0..eff_vocab) |vi| {
-                var lv: f32 = @floatCast(row[vi]);
-                if (logit_softcap > 0.0 and std.math.isFinite(lv)) {
-                    lv = logit_softcap * std.math.tanh(lv / logit_softcap);
-                    row[vi] = @floatCast(lv);
-                }
-                if (lv > best_val) {
-                    best_val = lv;
-                    best_id = @intCast(vi);
-                }
-            }
-            if (eff_vocab < v) {
-                const neg_inf: f16 = @floatCast(-std.math.inf(f32));
-                @memset(row[eff_vocab..v], neg_inf);
-            }
-            model.out_token_ids_host[tok] = best_id;
-        }
         model.last_logits_row = if (m > 0) (m - 1) else 0;
-        _ = self;
         return .{
             .num_nodes = m,
             .argmax_tokens = model.out_token_ids_host[0..m],

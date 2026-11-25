@@ -34,6 +34,8 @@ pub const M825Config = struct {
     include_real: bool = true,
     include_kl: bool = true,
     include_spec: bool = true,
+    include_m4_spec: bool = true,
+    spec_tree_nodes: u16 = 8,
     kl_steps_per_prompt: u32 = 8,
     ref_cold_slots: u32 = 64,
     /// When set, runs the 16-prompt 48-step loop-folded `W8` router-trace capture
@@ -109,6 +111,7 @@ pub const DecodeBenchPoint = struct {
 
 pub const SpecBenchPoint = struct {
     ran: bool = false,
+    tree_nodes: u16 = 0,
     max_tokens: u32 = 0,
     generated: u32 = 0,
     draft_wired_mib: u64 = 0,
@@ -148,8 +151,10 @@ pub const OptionEvalResult = struct {
     bytes_per_tok: u64 = 0,
     dec64: DecodeBenchPoint = .{},
     dec128: DecodeBenchPoint = .{},
+    dflare4_64: SpecBenchPoint = .{},
     dflare64: SpecBenchPoint = .{},
     dflare128: SpecBenchPoint = .{},
+    dflash4_64: SpecBenchPoint = .{},
     dflash64: SpecBenchPoint = .{},
     dflash128: SpecBenchPoint = .{},
     kl: KlMultiPromptResult = .{},
@@ -294,14 +299,34 @@ fn writeOptionReport(w: *Io.Writer, tag: []const u8, opt: *const OptionEvalResul
             opt.dec128.swapouts_delta,
         });
     }
+    if (opt.dflare4_64.ran) {
+        try w.print(
+            \\bench.m825.{s}.dflare3l_m4_n64            {d:.2} tok/s ({d:.2} ms/tok, M={d}, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
+            \\
+        , .{
+            tag,
+            opt.dflare4_64.tok_per_s,
+            opt.dflare4_64.ms_per_tok,
+            opt.dflare4_64.tree_nodes,
+            opt.dflare4_64.mean_accept_len,
+            opt.dflare4_64.rounds,
+            yesNo(opt.dflare4_64.greedy_parity_ok),
+            opt.dflare4_64.matched_tokens,
+            opt.dflare4_64.generated,
+            opt.dflare4_64.draft_wired_mib,
+            opt.dflare4_64.mid_pass_flushes,
+            opt.dflare4_64.swapouts_delta,
+        });
+    }
     if (opt.dflare64.ran) {
         try w.print(
-            \\bench.m825.{s}.dflare3l_n64               {d:.2} tok/s ({d:.2} ms/tok, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
+            \\bench.m825.{s}.dflare3l_n64               {d:.2} tok/s ({d:.2} ms/tok, M={d}, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
             \\
         , .{
             tag,
             opt.dflare64.tok_per_s,
             opt.dflare64.ms_per_tok,
+            opt.dflare64.tree_nodes,
             opt.dflare64.mean_accept_len,
             opt.dflare64.rounds,
             yesNo(opt.dflare64.greedy_parity_ok),
@@ -314,12 +339,13 @@ fn writeOptionReport(w: *Io.Writer, tag: []const u8, opt: *const OptionEvalResul
     }
     if (opt.dflare128.ran) {
         try w.print(
-            \\bench.m825.{s}.dflare3l_n128              {d:.2} tok/s ({d:.2} ms/tok, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
+            \\bench.m825.{s}.dflare3l_n128              {d:.2} tok/s ({d:.2} ms/tok, M={d}, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
             \\
         , .{
             tag,
             opt.dflare128.tok_per_s,
             opt.dflare128.ms_per_tok,
+            opt.dflare128.tree_nodes,
             opt.dflare128.mean_accept_len,
             opt.dflare128.rounds,
             yesNo(opt.dflare128.greedy_parity_ok),
@@ -330,14 +356,34 @@ fn writeOptionReport(w: *Io.Writer, tag: []const u8, opt: *const OptionEvalResul
             opt.dflare128.swapouts_delta,
         });
     }
+    if (opt.dflash4_64.ran) {
+        try w.print(
+            \\bench.m825.{s}.dflash_q8_m4_n64           {d:.2} tok/s ({d:.2} ms/tok, M={d}, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
+            \\
+        , .{
+            tag,
+            opt.dflash4_64.tok_per_s,
+            opt.dflash4_64.ms_per_tok,
+            opt.dflash4_64.tree_nodes,
+            opt.dflash4_64.mean_accept_len,
+            opt.dflash4_64.rounds,
+            yesNo(opt.dflash4_64.greedy_parity_ok),
+            opt.dflash4_64.matched_tokens,
+            opt.dflash4_64.generated,
+            opt.dflash4_64.draft_wired_mib,
+            opt.dflash4_64.mid_pass_flushes,
+            opt.dflash4_64.swapouts_delta,
+        });
+    }
     if (opt.dflash64.ran) {
         try w.print(
-            \\bench.m825.{s}.dflash_q8_n64              {d:.2} tok/s ({d:.2} ms/tok, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
+            \\bench.m825.{s}.dflash_q8_n64              {d:.2} tok/s ({d:.2} ms/tok, M={d}, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
             \\
         , .{
             tag,
             opt.dflash64.tok_per_s,
             opt.dflash64.ms_per_tok,
+            opt.dflash64.tree_nodes,
             opt.dflash64.mean_accept_len,
             opt.dflash64.rounds,
             yesNo(opt.dflash64.greedy_parity_ok),
@@ -350,12 +396,13 @@ fn writeOptionReport(w: *Io.Writer, tag: []const u8, opt: *const OptionEvalResul
     }
     if (opt.dflash128.ran) {
         try w.print(
-            \\bench.m825.{s}.dflash_q8_n128             {d:.2} tok/s ({d:.2} ms/tok, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
+            \\bench.m825.{s}.dflash_q8_n128             {d:.2} tok/s ({d:.2} ms/tok, M={d}, tau={d:.3}, rounds={d}, parity={s} {d}/{d}, draft_mib={d}, mid_flushes={d}, swap={d})
             \\
         , .{
             tag,
             opt.dflash128.tok_per_s,
             opt.dflash128.ms_per_tok,
+            opt.dflash128.tree_nodes,
             opt.dflash128.mean_accept_len,
             opt.dflash128.rounds,
             yesNo(opt.dflash128.greedy_parity_ok),
@@ -1004,7 +1051,7 @@ fn evalCandidateOption(
     const vm_all0 = try vmstat.Snapshot.capture();
     var model = try graph.GraphModel.loadFromFile(allocator, amf_p, gcfg, .{
         .max_seq_len = 512,
-        .max_tree_nodes = if (cfg.include_spec) 8 else 1,
+        .max_tree_nodes = if (cfg.include_spec) @max(@as(u32, 8), cfg.spec_tree_nodes) else 1,
         .enable_feature_taps = cfg.include_spec,
         .startup_canary = false,
     });
@@ -1110,8 +1157,11 @@ fn evalCandidateOption(
                     var loaded = try engine_mod.LoadedDFlareProposer.loadFromFile(allocator, &model, df_p, dbytes, null, null);
                     defer loaded.deinit(allocator);
                     const dmib = dsizes.wired >> 20;
-                    out.dflare64 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..64], dmib);
-                    out.dflare128 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..128], dmib);
+                    if (cfg.include_m4_spec and cfg.spec_tree_nodes != 4) {
+                        out.dflare4_64 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..64], dmib, 4);
+                    }
+                    out.dflare64 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..64], dmib, cfg.spec_tree_nodes);
+                    out.dflare128 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..128], dmib, cfg.spec_tree_nodes);
                 }
             }
         }
@@ -1125,8 +1175,11 @@ fn evalCandidateOption(
                     var loaded = try engine_mod.LoadedDFlareProposer.loadFromFile(allocator, &model, df_p, dbytes, null, null);
                     defer loaded.deinit(allocator);
                     const dmib = dsizes.wired >> 20;
-                    out.dflash64 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..64], dmib);
-                    out.dflash128 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..128], dmib);
+                    if (cfg.include_m4_spec and cfg.spec_tree_nodes != 4) {
+                        out.dflash4_64 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..64], dmib, 4);
+                    }
+                    out.dflash64 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..64], dmib, cfg.spec_tree_nodes);
+                    out.dflash128 = try runSpecPoint(allocator, &model, loaded.proposer(), speed_prompt_ids, dec_tokens_128[0..128], dmib, cfg.spec_tree_nodes);
                 }
             }
         }
@@ -1207,16 +1260,18 @@ fn runSpecPoint(
     prompt_ids: []const u32,
     ref_tokens: []const u32,
     draft_wired_mib: u64,
+    tree_nodes: u16,
 ) !SpecBenchPoint {
     var pt: SpecBenchPoint = .{
         .ran = true,
+        .tree_nodes = tree_nodes,
         .max_tokens = @intCast(ref_tokens.len),
         .draft_wired_mib = draft_wired_mib,
     };
     const vm0 = try vmstat.Snapshot.capture();
     var se = try engine_mod.SpecEngine.initWithDFlare(allocator, model, proposer, .{
         .mode = .dflare,
-        .max_tree_nodes = 8,
+        .max_tree_nodes = tree_nodes,
         .temperature = 0.0,
         .enable_pruning = false,
     });
@@ -1436,8 +1491,10 @@ fn optionPassed(opt: *const OptionEvalResult) bool {
     if (opt.swapouts_delta != 0) return false;
     if (opt.dec64.ran and (opt.dec64.mid_pass_flushes != 0 or opt.dec64.swapouts_delta != 0)) return false;
     if (opt.dec128.ran and (opt.dec128.mid_pass_flushes != 0 or opt.dec128.swapouts_delta != 0)) return false;
+    if (opt.dflare4_64.ran and (!opt.dflare4_64.greedy_parity_ok or opt.dflare4_64.mid_pass_flushes != 0)) return false;
     if (opt.dflare64.ran and (!opt.dflare64.greedy_parity_ok or opt.dflare64.mid_pass_flushes != 0)) return false;
     if (opt.dflare128.ran and (!opt.dflare128.greedy_parity_ok or opt.dflare128.mid_pass_flushes != 0)) return false;
+    if (opt.dflash4_64.ran and (!opt.dflash4_64.greedy_parity_ok or opt.dflash4_64.mid_pass_flushes != 0)) return false;
     if (opt.dflash64.ran and (!opt.dflash64.greedy_parity_ok or opt.dflash64.mid_pass_flushes != 0)) return false;
     if (opt.dflash128.ran and (!opt.dflash128.greedy_parity_ok or opt.dflash128.mid_pass_flushes != 0)) return false;
     if (opt.kl.ran and !opt.kl.all_finite) return false;

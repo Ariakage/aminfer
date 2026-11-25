@@ -449,6 +449,13 @@ pub const Inkling2MoeGateUpSoftcapParams = extern struct {
     up_softcap: f32,
 };
 
+pub const Inkling2LogitFinalizeParams = extern struct {
+    m: u32,
+    vocab_size: u32,
+    eff_vocab: u32,
+    logit_softcap: f32,
+};
+
 comptime {
     if (@sizeOf(Sconv4Params) != 56) @compileError("Sconv4Params must be 56 bytes");
     if (@sizeOf(Inkling2RelGqaParams) != 96) @compileError("Inkling2RelGqaParams must be 96 bytes");
@@ -474,6 +481,7 @@ comptime {
     if (@sizeOf(Inkling2ScatterRowsParams) != 16) @compileError("Inkling2ScatterRowsParams must be 16 bytes");
     if (@sizeOf(Inkling2MoeRouteCsrParams) != 80) @compileError("Inkling2MoeRouteCsrParams must be 80 bytes");
     if (@sizeOf(Inkling2MoeGateUpSoftcapParams) != 48) @compileError("Inkling2MoeGateUpSoftcapParams must be 48 bytes");
+    if (@sizeOf(Inkling2LogitFinalizeParams) != 16) @compileError("Inkling2LogitFinalizeParams must be 16 bytes");
 }
 
 // ===========================================================================
@@ -1609,6 +1617,15 @@ fn softcapKernelNameFor(dtype: quant_formats.DType) [:0]const u8 {
     return "ami_inkling2_moe_gate_up_softcap_iq";
 }
 
+pub const Inkling2LogitFinalizeArgs = struct {
+    logits: metal.BufferBinding,
+    out_tokens: metal.BufferBinding,
+    m: u32,
+    vocab_size: u32,
+    eff_vocab: u32 = 0,
+    logit_softcap: f32 = 0.0,
+};
+
 pub const Inkling2Hy4Pipelines = struct {
     rmsnorm_sconv4: [2]metal.Pipeline,
     rel_gqa_attn_d64: metal.Pipeline,
@@ -1639,6 +1656,7 @@ pub const Inkling2Hy4Pipelines = struct {
     inkling2_moe_route_csr: [2]metal.Pipeline,
     inkling2_moe_gate_up_softcap_float: [2]metal.Pipeline,
     inkling2_moe_gate_up_softcap_quant: [SOFTCAP_QUANT_SLOTS]?metal.Pipeline,
+    inkling2_logit_softcap_argmax: metal.Pipeline,
 
     pub fn init(device: metal.Device, library: metal.Library) metal.Error!Inkling2Hy4Pipelines {
         const sconv_f16 = try metal.Pipeline.initSpecialized(device, library, "ami_inkling2_rmsnorm_sconv4", &.{
@@ -1798,6 +1816,9 @@ pub const Inkling2Hy4Pipelines = struct {
             );
         }
 
+        const ink_logit_finalize = try metal.Pipeline.init(device, library, "ami_inkling2_logit_softcap_argmax_f16");
+        errdefer ink_logit_finalize.close();
+
         return .{
             .rmsnorm_sconv4 = .{ sconv_f16, sconv_bf16 },
             .rel_gqa_attn_d64 = rel_d64,
@@ -1828,10 +1849,12 @@ pub const Inkling2Hy4Pipelines = struct {
             .inkling2_moe_route_csr = .{ ink_route_csr_f32, ink_route_csr_f16 },
             .inkling2_moe_gate_up_softcap_float = .{ softcap_f16, softcap_bf16 },
             .inkling2_moe_gate_up_softcap_quant = softcap_quant,
+            .inkling2_logit_softcap_argmax = ink_logit_finalize,
         };
     }
 
     pub fn close(self: Inkling2Hy4Pipelines) void {
+        self.inkling2_logit_softcap_argmax.close();
         for (self.inkling2_moe_gate_up_softcap_quant) |maybe_p| {
             if (maybe_p) |p| p.close();
         }
@@ -3435,6 +3458,32 @@ pub const Inkling2Hy4Pipelines = struct {
                 .slot_stride = args.slot_stride,
             }, true);
         }
+    }
+
+    /// Fused in-place logit softcap + padded-vocab `-inf` mask + deterministic per-row
+    /// greedy argmax (`M8.25`), encoded inside the same single `MTL4CommandBuffer`.
+    pub fn encodeInkling2LogitFinalize(
+        self: Inkling2Hy4Pipelines,
+        frame: *metal.Compute.Frame,
+        args: Inkling2LogitFinalizeArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        if (args.m == 0 or args.vocab_size == 0) return error.ZeroDimension;
+        const eff: u32 = if (args.eff_vocab > 0 and args.eff_vocab < args.vocab_size) args.eff_vocab else args.vocab_size;
+        const params: Inkling2LogitFinalizeParams = .{
+            .m = args.m,
+            .vocab_size = args.vocab_size,
+            .eff_vocab = eff,
+            .logit_softcap = args.logit_softcap,
+        };
+        try frame.encodeThreadgroups(
+            self.inkling2_logit_softcap_argmax,
+            &.{ args.logits, args.out_tokens },
+            std.mem.asBytes(&params),
+            .{ args.m, 1, 1 },
+            .{ 256, 1, 1 },
+            insert_barrier_before,
+        );
     }
 };
 
@@ -7990,6 +8039,144 @@ test "gpu.inkling2_hy4. rmsnorm_sconv4 tree-aware branching parity matches seria
             h_m3 = h_m2;
             h_m2 = h_m1;
             h_m1 = h_cur;
+        }
+    }
+}
+
+test "gpu.inkling2_hy4. logit_softcap_argmax_f16 fuses softcap, padded -inf mask, and lowest-index tie-breaking" {
+    const ctx = try TestMetalCtx.init();
+    defer ctx.deinit();
+    var compute = try metal.Compute.init(ctx.device);
+    defer compute.close();
+
+    var arena = try makeTestArena(256 * 1024);
+    defer arena.deinit();
+    const buf = try metal.Buffer.wrap(ctx.device, arena.bytes());
+    defer buf.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch unreachable;
+
+    // Case 1: 4-aligned vocab_size = 516, non-4-aligned eff_vocab = 510, logit_softcap = 30.0.
+    {
+        const m: u32 = 4;
+        const v: u32 = 516;
+        const eff: u32 = 510;
+        const cap: f32 = 30.0;
+        const logits_raw = try arena.allocAligned(@as(usize, m) * v * @sizeOf(f16), 16);
+        const out_raw = try arena.allocAligned(@as(usize, m) * @sizeOf(u32), 16);
+        const logits: []f16 = @alignCast(std.mem.bytesAsSlice(f16, logits_raw));
+        const out_toks: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_raw));
+
+        var ref_logits: [m * v]f16 = undefined;
+        var ref_toks: [m]u32 = undefined;
+        for (0..m) |r| {
+            for (0..v) |j| {
+                const base = @sin(@as(f32, @floatFromInt(r * 97 + j * 13 + 5))) * 18.0;
+                logits[r * v + j] = @floatCast(base);
+            }
+            // Place a larger value in the padded tail (must be masked to -inf and ignored!).
+            logits[r * v + eff + 1] = @floatCast(@as(f32, 999.0));
+        }
+        // Row 0: unique peak near end of eff_vocab (index 509, outside vec_end=508!).
+        logits[0 * v + 509] = @floatCast(@as(f32, 42.0));
+        // Row 1: exact tie between indices 17 and 401 -> lowest index 17 must win.
+        logits[1 * v + 17] = @floatCast(@as(f32, 35.0));
+        logits[1 * v + 401] = @floatCast(@as(f32, 35.0));
+        // Row 2: saturation tie above cap (+1000 vs +1000 at 311 and 88) -> lowest index 88 wins.
+        logits[2 * v + 311] = @floatCast(@as(f32, 1000.0));
+        logits[2 * v + 88] = @floatCast(@as(f32, 1000.0));
+        // Row 3: all -inf -> index 0 wins.
+        for (0..v) |j| logits[3 * v + j] = -std.math.inf(f16);
+
+        for (0..m) |r| {
+            var best_v: f32 = -std.math.inf(f32);
+            var best_i: u32 = 0;
+            for (0..eff) |j| {
+                const raw: f32 = @floatCast(logits[r * v + j]);
+                const capped: f32 = cap * std.math.tanh(std.math.clamp(raw / cap, -20.0, 20.0));
+                ref_logits[r * v + j] = @floatCast(capped);
+                if (capped > best_v) {
+                    best_v = capped;
+                    best_i = @intCast(j);
+                }
+            }
+            for (eff..v) |j| ref_logits[r * v + j] = -std.math.inf(f16);
+            ref_toks[r] = best_i;
+        }
+
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try ctx.pipes.encodeInkling2LogitFinalize(&f, .{
+            .logits = .{ .buffer = buf, .offset = arena.offsetOf(logits_raw.ptr) },
+            .out_tokens = .{ .buffer = buf, .offset = arena.offsetOf(out_raw.ptr) },
+            .m = m,
+            .vocab_size = v,
+            .eff_vocab = eff,
+            .logit_softcap = cap,
+        }, false);
+        try compute.wait(try f.commit(), 5000);
+
+        try std.testing.expectEqual(@as(u32, 509), out_toks[0]);
+        try std.testing.expectEqual(@as(u32, 17), out_toks[1]);
+        try std.testing.expectEqual(@as(u32, 88), out_toks[2]);
+        try std.testing.expectEqual(@as(u32, 0), out_toks[3]);
+        for (0..m) |r| {
+            try std.testing.expectEqual(ref_toks[r], out_toks[r]);
+            for (0..eff) |j| {
+                const got: f32 = @floatCast(logits[r * v + j]);
+                const exp: f32 = @floatCast(ref_logits[r * v + j]);
+                if (std.math.isInf(exp)) {
+                    try std.testing.expect(std.math.isInf(got) and got < 0.0);
+                } else {
+                    try std.testing.expectApproxEqAbs(exp, got, 2e-2);
+                }
+            }
+            for (eff..v) |j| {
+                const got: f32 = @floatCast(logits[r * v + j]);
+                try std.testing.expect(std.math.isInf(got) and got < 0.0);
+            }
+        }
+    }
+
+    // Case 2: unaligned vocab_size = 37, eff_vocab = 31, logit_softcap = 0.0 (mask + argmax only).
+    {
+        const m: u32 = 3;
+        const v: u32 = 37;
+        const eff: u32 = 31;
+        const logits_raw = try arena.allocAligned(@as(usize, m) * v * @sizeOf(f16), 16);
+        const out_raw = try arena.allocAligned(@as(usize, m) * @sizeOf(u32), 16);
+        const logits: []f16 = @alignCast(std.mem.bytesAsSlice(f16, logits_raw));
+        const out_toks: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out_raw));
+
+        for (0..m) |r| {
+            for (0..v) |j| logits[r * v + j] = @floatCast(@as(f32, -10.0) + @as(f32, @floatFromInt((j + r * 3) % 11)));
+            logits[r * v + eff + 2] = @floatCast(@as(f32, 500.0));
+        }
+        logits[0 * v + 30] = @floatCast(@as(f32, 12.5));
+        logits[1 * v + 5] = @floatCast(@as(f32, 9.0));
+        logits[1 * v + 29] = @floatCast(@as(f32, 9.0));
+        logits[2 * v + 0] = @floatCast(@as(f32, 7.25));
+
+        var f = try compute.beginFrame(5000);
+        errdefer f.abort();
+        try ctx.pipes.encodeInkling2LogitFinalize(&f, .{
+            .logits = .{ .buffer = buf, .offset = arena.offsetOf(logits_raw.ptr) },
+            .out_tokens = .{ .buffer = buf, .offset = arena.offsetOf(out_raw.ptr) },
+            .m = m,
+            .vocab_size = v,
+            .eff_vocab = eff,
+            .logit_softcap = 0.0,
+        }, false);
+        try compute.wait(try f.commit(), 5000);
+
+        try std.testing.expectEqual(@as(u32, 30), out_toks[0]);
+        try std.testing.expectEqual(@as(u32, 5), out_toks[1]);
+        try std.testing.expectEqual(@as(u32, 0), out_toks[2]);
+        for (0..m) |r| {
+            for (eff..v) |j| {
+                const got: f32 = @floatCast(logits[r * v + j]);
+                try std.testing.expect(std.math.isInf(got) and got < 0.0);
+            }
         }
     }
 }

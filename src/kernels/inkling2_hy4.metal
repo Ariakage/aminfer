@@ -2771,8 +2771,7 @@ kernel void ami_inkling2_msg_gate_up(const device float *z_in [[buffer(0)]],
     constexpr uint TB = 4u;
     constexpr uint RPS = 2u;
     const uint m_base = tg_pos.y * TB;
-    const uint row0 = tg_pos.x * 8u + sg_id * RPS;
-    if (m_base >= p.m || row0 >= p.state_dim || p.gate_rank == 0u) {
+    if (m_base >= p.m || p.state_dim == 0u || p.gate_rank == 0u) {
         return;
     }
     const uint tile_m = min(TB, p.m - m_base);
@@ -2788,6 +2787,11 @@ kernel void ami_inkling2_msg_gate_up(const device float *z_in [[buffer(0)]],
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row0 = tg_pos.x * 8u + sg_id * RPS;
+    if (row0 >= sd) {
+        return;
+    }
 
     for (uint r = 0u; r < RPS; r++) {
         const uint row = row0 + r;
@@ -2944,7 +2948,7 @@ kernel void ami_inkling2_moe_route_csr(const device uchar *logits_raw [[buffer(0
                                        uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint NUM_SCHEMES = 5u;
     threadgroup atomic_uint s_counts[1024];
-    threadgroup atomic_uint s_cursors[1024];
+    threadgroup uint s_cursors[1024];
     threadgroup uint tg_sel_e[8][16];
     threadgroup float tg_sel_w[8][16];
     threadgroup uint s_prefix_tmp[8];
@@ -3127,7 +3131,7 @@ kernel void ami_inkling2_moe_route_csr(const device uchar *logits_raw [[buffer(0
 
             if (in_s != 0u) {
                 const uint slot_off = running_a_base + a_cnt_s + a_in_blk;
-                atomic_store_explicit(&s_cursors[e], slot_off, memory_order_relaxed);
+                s_cursors[e] = slot_off;
                 if (p.is_heterogeneous != 0u) {
                     bucket_unique_experts[u_base_off + u_cnt_s + u_in_blk] = e;
                     bucket_expert_token_offsets[o_base_off + u_cnt_s + u_in_blk] = slot_off;
@@ -3168,17 +3172,20 @@ kernel void ami_inkling2_moe_route_csr(const device uchar *logits_raw [[buffer(0
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 3: scatter token assignments into contiguous CSR slots.
+    // Phase 3: deterministically scatter token assignments in ascending `(tok, k)` order
+    // so CSR slot assignment is 100% invariant across runs (no atomic slot-order jitter).
     const uint total_assign = p.m * k_eff;
-    for (uint idx = tid; idx < total_assign; idx += 256u) {
-        const uint tok = idx / k_eff;
-        const uint k_idx = idx - tok * k_eff;
-        const uint e = scratch_topk_experts[idx];
-        const float w = scratch_topk_weights[idx];
-        const uint dst = atomic_fetch_add_explicit(&s_cursors[e], 1u, memory_order_relaxed);
-        token_indices[dst] = tok;
-        routing_weights[dst] = w;
-        slot_k_indices[dst] = k_idx;
+    if (tid == 0u) {
+        for (uint idx = 0u; idx < total_assign; idx++) {
+            const uint tok = idx / k_eff;
+            const uint k_idx = idx - tok * k_eff;
+            const uint e = scratch_topk_experts[idx];
+            const float w = scratch_topk_weights[idx];
+            const uint dst = s_cursors[e]++;
+            token_indices[dst] = tok;
+            routing_weights[dst] = w;
+            slot_k_indices[dst] = k_idx;
+        }
     }
 }
 
@@ -4373,5 +4380,104 @@ kernel void ami_inkling2_moe_gate_up_softcap_iq(const device half *x [[buffer(0)
             }
         }
         t_base += rem;
+    }
+}
+
+// ===========================================================================
+// Fused Logit Softcap + Padded-Vocab Mask + Greedy Argmax Epilogue (`M8.25`)
+// ===========================================================================
+// Runs inside the same single `MTL4CommandBuffer` immediately after `lm_head`
+// so `M82Runtime.finalizeLogits` performs ZERO scalar CPU `tanh` / argmax loops
+// over `m * vocab_size` (`~201,024` logits/row).
+// Grid: `(m, 1, 1)` threadgroups of `(256, 1, 1)` threads (8 simdgroups/row).
+// Tie-breaking is deterministic by lowest token index (`0 <= idx < eff_vocab`).
+struct Inkling2LogitFinalizeParams {
+    uint m;
+    uint vocab_size;
+    uint eff_vocab;
+    float logit_softcap;
+};
+
+kernel void ami_inkling2_logit_softcap_argmax_f16(
+    device half *logits                         [[buffer(0)]],
+    device uint *out_tokens                     [[buffer(1)]],
+    constant Inkling2LogitFinalizeParams &p     [[buffer(2)]],
+    uint row                                    [[threadgroup_position_in_grid]],
+    uint tid                                    [[thread_index_in_threadgroup]],
+    uint simd_lane                              [[thread_index_in_simdgroup]],
+    uint simd_id                                [[simdgroup_index_in_threadgroup]]
+) {
+    if (row >= p.m) return;
+
+    const uint v = p.vocab_size;
+    const uint eff_v = (p.eff_vocab > 0u && p.eff_vocab < v) ? p.eff_vocab : v;
+    const float cap = p.logit_softcap;
+    const bool do_cap = (cap > 0.0f);
+    const float inv_cap = do_cap ? (1.0f / cap) : 0.0f;
+
+    device half *row_ptr = logits + ulong(row) * ulong(v);
+
+    float best_val = -INFINITY;
+    uint best_idx = 0xFFFFFFFFu;
+
+    if ((v & 3u) == 0u) {
+        const uint vec_end = eff_v & ~3u;
+        for (uint base = tid * 4u; base < vec_end; base += 256u * 4u) {
+            float4 x4 = float4(*(device half4 *)(row_ptr + base));
+            if (do_cap) {
+                x4 = cap * tanh(clamp(x4 * inv_cap, float4(-20.0f), float4(20.0f)));
+                *(device half4 *)(row_ptr + base) = half4(x4);
+            }
+            if (x4.x > best_val || (x4.x == best_val && (base + 0u) < best_idx)) { best_val = x4.x; best_idx = base + 0u; }
+            if (x4.y > best_val || (x4.y == best_val && (base + 1u) < best_idx)) { best_val = x4.y; best_idx = base + 1u; }
+            if (x4.z > best_val || (x4.z == best_val && (base + 2u) < best_idx)) { best_val = x4.z; best_idx = base + 2u; }
+            if (x4.w > best_val || (x4.w == best_val && (base + 3u) < best_idx)) { best_val = x4.w; best_idx = base + 3u; }
+        }
+        for (uint j = vec_end + tid; j < eff_v; j += 256u) {
+            float x = float(row_ptr[j]);
+            if (do_cap) {
+                x = cap * tanh(clamp(x * inv_cap, -20.0f, 20.0f));
+                row_ptr[j] = half(x);
+            }
+            if (x > best_val || (x == best_val && j < best_idx)) { best_val = x; best_idx = j; }
+        }
+    } else {
+        for (uint j = tid; j < eff_v; j += 256u) {
+            float x = float(row_ptr[j]);
+            if (do_cap) {
+                x = cap * tanh(clamp(x * inv_cap, -20.0f, 20.0f));
+                row_ptr[j] = half(x);
+            }
+            if (x > best_val || (x == best_val && j < best_idx)) { best_val = x; best_idx = j; }
+        }
+    }
+
+    for (uint j = eff_v + tid; j < v; j += 256u) {
+        row_ptr[j] = half(-INFINITY);
+    }
+
+    const float sg_max = simd_max(best_val);
+    const uint sg_idx = simd_min((best_val == sg_max) ? best_idx : 0xFFFFFFFFu);
+
+    threadgroup float tg_val[8];
+    threadgroup uint tg_idx[8];
+    if (simd_lane == 0u && simd_id < 8u) {
+        tg_val[simd_id] = sg_max;
+        tg_idx[simd_id] = sg_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float fv = -INFINITY;
+        uint fi = 0xFFFFFFFFu;
+        for (uint s = 0u; s < 8u; s++) {
+            const float sv = tg_val[s];
+            const uint si = tg_idx[s];
+            if (sv > fv || (sv == fv && si < fi)) {
+                fv = sv;
+                fi = si;
+            }
+        }
+        out_tokens[row] = (fi < eff_v) ? fi : 0u;
     }
 }

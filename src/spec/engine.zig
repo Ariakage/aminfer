@@ -2923,6 +2923,9 @@ pub const SpecEngine = struct {
             } else if (self.config.mode == .dflare) {
                 if (self.dflare_proposer) |dfp| {
                     if (max_allowed_depth >= 1 and candidate_cap > 1) {
+                        const saved_max_nodes = dfp.config.max_tree_nodes;
+                        dfp.config.max_tree_nodes = @min(saved_max_nodes, candidate_cap);
+                        defer dfp.config.max_tree_nodes = saved_max_nodes;
                         const g = self.target.graph;
                         const need_taps: usize = dfp.config.num_target_taps;
                         var df_state = self.grammar_state.snapshot();

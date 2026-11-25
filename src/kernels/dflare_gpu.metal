@@ -879,6 +879,16 @@ kernel void dflare_markov_gru_assemble(const device float *parent_rnn_f32 [[buff
             val = float(((const device bfloat *)w1_vocab_raw)[elem]);
         } else if (p.w1_dtype == 1u) {
             val = float(((const device half *)w1_vocab_raw)[elem]);
+        } else if (p.w1_dtype == 3u) {
+            // Native GGUF Q8_0 row lookup: 34 B per 32-element block (f16 scale + 32 x int8).
+            const uint col = gid - mr;
+            const uint blks_per_row = mr >> 5;
+            const uint blk_idx = col >> 5;
+            const uint in_blk = col & 31u;
+            const device uchar *bp = w1_vocab_raw + (ulong(tok_clamped) * blks_per_row + blk_idx) * 34ul;
+            const ushort d_bits = ushort(bp[0]) | (ushort(bp[1]) << 8);
+            const float d_sc = float(as_type<half>(d_bits));
+            val = float(as_type<char>(bp[2u + in_blk])) * d_sc;
         } else {
             val = ((const device float *)w1_vocab_raw)[elem];
         }

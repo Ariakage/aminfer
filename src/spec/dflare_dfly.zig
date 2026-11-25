@@ -1897,12 +1897,13 @@ pub const DFlareProposer = struct {
 
         if (self.weights.markov_w1_vocab_raw) |r| {
             ctx.markov_w1_vocab_rows = self.weights.markov_w1_vocab_rows;
-            if (r.amf_dtype == .bf16 or r.amf_dtype == .f16 or r.amf_dtype == .f32) {
+            if (r.amf_dtype == .bf16 or r.amf_dtype == .f16 or r.amf_dtype == .f32 or (r.amf_dtype == .gguf_q8_0 and (mr % 32) == 0)) {
                 ctx.markov_w1_vocab = try bind_ctx.bindSlice(r.data);
                 ctx.markov_w1_vocab_dtype = switch (r.amf_dtype) {
                     .bf16 => 0,
                     .f16 => 1,
                     .f32 => 2,
+                    .gguf_q8_0 => 3,
                     else => 0,
                 };
             } else {
@@ -4128,7 +4129,8 @@ pub const DFlareProposer = struct {
             (has_gpu_w2_vocab or has_gpu_lm_head) and
             (!has_gpu_w2_vocab or has_gpu_lm_head or !has_any_lm_head);
 
-        if (can_single_frame_chain and pos_beg < w) {
+        const chain_end: usize = @min(@as(usize, w), pos_beg + @as(usize, node_limit -| 1));
+        if (can_single_frame_chain and pos_beg < chain_end) {
             // SINGLE-FRAME FULLY-CHAINED METAL 4 PATH:
             // Context KV update + 3L/5L backbone + base_logits + all Markov steps + Top-1 reduction
             // execute in ONE `MTL4CommandBuffer` with ZERO intermediate CPU-GPU flushes!
@@ -4169,20 +4171,20 @@ pub const DFlareProposer = struct {
             );
 
             self.base_logits_ready = false;
-            if (self.isRealGru() and has_gpu_w2_vocab and w > 1) {
+            if (self.isRealGru() and has_gpu_w2_vocab and chain_end > 1) {
                 if (gpu.lm_head) |lmh| {
                     const slot_draft_b = metal.BufferBinding{
                         .buffer = wb,
                         .offset = ws.sliceBinding(wb, ws.gpu_slot_hiddens_f16).offset + self.config.hidden_size * @sizeOf(f16),
                     };
-                    try encodeGpuLinear(gpu, &frame, lmh, slot_draft_b, ws.sliceBinding(wb, ws.gpu_base_logits_f16), @intCast(w - 1), null, false, true);
+                    try encodeGpuLinear(gpu, &frame, lmh, slot_draft_b, ws.sliceBinding(wb, ws.gpu_base_logits_f16), @intCast(chain_end - 1), null, false, true);
                     self.base_logits_ready = true;
                 }
             }
 
             const ping_base_b = ws.sliceBinding(wb, ws.gpu_markov_rnn_ping_f32);
             const ping_stride: u64 = mr * @sizeOf(f32);
-            for (pos_beg..w) |pos_usize| {
+            for (pos_beg..chain_end) |pos_usize| {
                 const step_idx: u32 = @intCast(pos_usize - pos_beg);
                 const in_ping: metal.BufferBinding = .{ .buffer = wb, .offset = ping_base_b.offset + (step_idx & 1) * ping_stride };
                 const out_ping: metal.BufferBinding = .{ .buffer = wb, .offset = ping_base_b.offset + ((step_idx + 1) & 1) * ping_stride };
@@ -4211,7 +4213,7 @@ pub const DFlareProposer = struct {
                     softcap_arg,
                     false,
                     step_idx,
-                    pos_usize + 1 < w,
+                    pos_usize + 1 < chain_end,
                     step_idx + 1,
                 );
             }
@@ -4221,7 +4223,7 @@ pub const DFlareProposer = struct {
             self.backbone_runs += 1;
 
             var parent: u16 = 0;
-            for (pos_beg..w) |pos_usize| {
+            for (pos_beg..chain_end) |pos_usize| {
                 const step_idx = pos_usize - pos_beg;
                 const cand = ws.gpu_topk_cands[step_idx];
                 self.markov_steps += 1;
@@ -9046,6 +9048,194 @@ test "D16 Metal 4 GPU arch=dflash (gguf_q8_0 layers + markov_w2_vocab + final_lo
             try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
             try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
         }
+    }
+}
+
+test "D16 Metal 4 GPU arch=dflash gguf_q8_0 markov_w1 stays zero-copy single-frame with CPU parity" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+
+    const h: usize = 64;
+    const inter: usize = 128;
+    const nh: u32 = 4;
+    const nkvh: u32 = 2;
+    const hd: u32 = 16;
+    const q_dim: usize = @as(usize, nh) * hd;
+    const kv_dim: usize = @as(usize, nkvh) * hd;
+    const mr: usize = 64; // multiple of 32 (2 GGUF Q8_0 blocks per vocab row)
+    const v: usize = 48;
+    const unpadded_v: usize = 40;
+    const taps: usize = 4;
+    const w: u8 = 8;
+
+    const cfg: DFlareConfig = .{
+        .variant = .dflash_standalone,
+        .num_layers = 2,
+        .block_size = w,
+        .top_k_per_pos = 1,
+        .max_tree_nodes = 4, // exercises M=4 chain_end cap as well!
+        .hidden_size = @intCast(h),
+        .intermediate_size = @intCast(inter),
+        .num_attention_heads = nh,
+        .num_key_value_heads = nkvh,
+        .head_dim = hd,
+        .vocab_size = @intCast(v),
+        .unpadded_vocab_size = @intCast(unpadded_v),
+        .final_logit_softcapping = 30.0,
+        .markov_rank = @intCast(mr),
+        .num_target_taps = @intCast(taps),
+        .rms_eps = 1e-5,
+        .rope_theta = 1_000_000.0,
+    };
+
+    var items: std.ArrayListUnmanaged(TypedAmfItem) = .empty;
+    defer {
+        for (items.items) |it| gpa.free(it.blob);
+        items.deinit(gpa);
+    }
+
+    const scratch = try gpa.alloc(f32, @max(v * h, 3 * mr * (2 * h + 2 * mr)));
+    defer gpa.free(scratch);
+
+    fillDetWeight(scratch[0 .. (w - 1) * h], 302, 0.25);
+    try pushTypedF32(gpa, &items, "mask_embd.weight", scratch[0 .. (w - 1) * h], w - 1, @intCast(h), 2, .embedding);
+    fillDetWeight(scratch[0 .. v * h], 303, 0.35);
+    try pushTypedF16(gpa, &items, "token_embd.weight", scratch[0 .. v * h], @intCast(v), @intCast(h), 2, .embedding);
+    fillDetNorm(scratch[0..h], 304);
+    try pushTypedF32(gpa, &items, "token_embd_norm.weight", scratch[0..h], @intCast(h), 0, 1, .norm);
+    fillDetNorm(scratch[0..h], 305);
+    try pushTypedF32(gpa, &items, "output_norm.weight", scratch[0..h], @intCast(h), 0, 1, .norm);
+    fillDetNorm(scratch[0..h], 306);
+    try pushTypedF32(gpa, &items, "markov_ctx_norm.weight", scratch[0..h], @intCast(h), 0, 1, .norm);
+    fillDetNorm(scratch[0..h], 307);
+    try pushTypedF32(gpa, &items, "markov_norm.weight", scratch[0..h], @intCast(h), 0, 1, .norm);
+
+    var nbuf: [64]u8 = undefined;
+    for (0..cfg.num_layers) |l| {
+        const sbase: u64 = 3000 + l * 100;
+        fillDetWeight(scratch[0..taps], sbase + 0, 0.5);
+        for (scratch[0..taps]) |*val| val.* = 0.25 + 0.1 * @abs(val.*);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.ctx_mix.weight", .{l}), scratch[0..taps], @intCast(taps), 0, 1, .norm);
+        fillDetNorm(scratch[0..h], sbase + 1);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_norm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..h], sbase + 2);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.ffn_norm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..h], sbase + 3);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.ctx_norm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 4);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_q_norm.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 5);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_k_norm.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 6);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_k_ctx_norm.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+
+        fillDetWeight(scratch[0 .. q_dim * h], sbase + 10, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj.weight", .{l}), scratch[0 .. q_dim * h], @intCast(q_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 11, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 12, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. h * q_dim], sbase + 13, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj.weight", .{l}), scratch[0 .. h * q_dim], @intCast(h), @intCast(q_dim), .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 14, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj_ctx.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 15, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj_ctx.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. inter * h], sbase + 20, 0.10);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj.weight", .{l}), scratch[0 .. inter * h], @intCast(inter), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. inter * h], sbase + 21, 0.10);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj.weight", .{l}), scratch[0 .. inter * h], @intCast(inter), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. h * inter], sbase + 22, 0.10);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj.weight", .{l}), scratch[0 .. h * inter], @intCast(h), @intCast(inter), .dense);
+    }
+    fillDetWeight(scratch[0..taps], 3399, 0.5);
+    for (scratch[0..taps]) |*val| val.* = 0.25 + 0.1 * @abs(val.*);
+    try pushTypedF32(gpa, &items, "markov_ctx_mix.weight", scratch[0..taps], @intCast(taps), 0, 1, .norm);
+
+    const joint_in = 2 * h + 2 * mr;
+    fillDetWeight(scratch[0 .. 3 * mr * joint_in], 701, 0.14);
+    try pushTypedBf16(gpa, &items, "joint_proj.weight", scratch[0 .. 3 * mr * joint_in], @intCast(3 * mr), @intCast(joint_in), 2, .dense);
+    fillDetWeight(scratch[0 .. 3 * mr], 702, 0.08);
+    try pushTypedF32(gpa, &items, "joint_proj.bias", scratch[0 .. 3 * mr], @intCast(3 * mr), 0, 1, .norm);
+    fillDetWeight(scratch[0 .. v * mr], 703, 0.35);
+    try pushTypedGgufQ8_0(gpa, &items, "markov_w1.weight", scratch[0 .. v * mr], @intCast(v), @intCast(mr), .dense);
+    fillDetWeight(scratch[0 .. unpadded_v * mr], 704, 0.25);
+    for (0..unpadded_v) |tok| scratch[tok * mr + (tok % mr)] += 0.45;
+    try pushTypedBf16(gpa, &items, "markov_w2.weight", scratch[0 .. unpadded_v * mr], @intCast(unpadded_v), @intCast(mr), 2, .dense);
+    fillDetWeight(scratch[0..unpadded_v], 705, 0.10);
+    try pushTypedF32(gpa, &items, "markov_w2.bias", scratch[0..unpadded_v], @intCast(unpadded_v), 0, 1, .norm);
+
+    const img = try assembleTypedAmf(gpa, items.items);
+    defer gpa.free(img);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dflash-q8-w1.amf", .data = img });
+    var p_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p_raw = try std.fmt.bufPrint(p_buf[0 .. p_buf.len - 1], ".zig-cache/tmp/{s}/dflash-q8-w1.amf", .{tmp.sub_path});
+    p_buf[p_raw.len] = 0;
+
+    const tgt_arena_bytes = try page.alignUp(v * h * @sizeOf(u16) + 4 * taps * h * @sizeOf(f16) + taps * h * @sizeOf(f16));
+    var ext_arena = try arena_mod.WiredArena.init(tgt_arena_bytes, testBudget(tgt_arena_bytes + page.APPLE_PAGE_SIZE));
+    defer ext_arena.deinit();
+    const lm_bf16 = try allocArenaSlice(u16, &ext_arena, v * h);
+    var lm_f32: [v * h]f32 = undefined;
+    fillDetWeight(&lm_f32, 706, 0.16);
+    for (0..v) |tok| lm_f32[tok * h + (tok % h)] += 0.30;
+    for (lm_f32, 0..) |fv, i| lm_bf16[i] = @truncate(@as(u32, @bitCast(fv)) >> 16);
+
+    const step_taps_f16 = try allocArenaSlice(f16, &ext_arena, taps * h);
+    var step_taps_f32: [taps * h]f32 = undefined;
+    fillDetWeight(&step_taps_f32, 707, 0.40);
+    for (step_taps_f32, 0..) |val, i| step_taps_f16[i] = @floatCast(val);
+
+    const ext_buf = try metal.Buffer.wrap(device, ext_arena.bytes());
+    defer ext_buf.close();
+
+    const bundle_cpu = try LoadedDFlareBundle.loadFromAmfFile(gpa, p_buf[0..p_raw.len :0], cfg, .{ .dense_f32 = &lm_f32 }, null);
+    defer bundle_cpu.deinit(gpa);
+    const bundle_gpu = try LoadedDFlareBundle.loadFromAmfFile(gpa, p_buf[0..p_raw.len :0], cfg, null, null);
+    defer bundle_gpu.deinit(gpa);
+
+    try bundle_gpu.proposer.attachGpu(.{
+        .device = device,
+        .library = library,
+        .target_lm_head = .{
+            .amf_dtype = .bf16,
+            .weight = .{ .buffer = ext_buf, .offset = ext_arena.offsetOf(std.mem.sliceAsBytes(lm_bf16).ptr) },
+            .n = @intCast(v),
+            .k = @intCast(h),
+        },
+    });
+    const gctx = bundle_gpu.proposer.gpu_ctx orelse return error.InvalidWeights;
+    try std.testing.expect(gctx.weight_buf != null);
+    try std.testing.expect(gctx.staging_buf == null);
+    try std.testing.expect(gctx.markov_w1_vocab != null);
+    try std.testing.expect(gctx.markov_w1_vocab_raw == null);
+    try std.testing.expectEqual(@as(u32, 3), gctx.markov_w1_vocab_dtype);
+
+    var tap_slices: [taps][]const f32 = undefined;
+    var gpu_taps_views: [taps]metal.BufferBinding = undefined;
+    const base_taps_off = ext_arena.offsetOf(std.mem.sliceAsBytes(step_taps_f16).ptr);
+    for (0..taps) |ti| {
+        tap_slices[ti] = step_taps_f32[ti * h ..][0..h];
+        gpu_taps_views[ti] = .{ .buffer = ext_buf, .offset = base_taps_off + ti * h * @sizeOf(f16) };
+    }
+
+    var cpu_tree = CandidateTree.init(0);
+    var gpu_tree = CandidateTree.init(0);
+    const cpu_res = try bundle_cpu.proposer.propose(5, &tap_slices, null, &cpu_tree);
+    const gpu_res = try bundle_gpu.proposer.proposeWithGpuTaps(5, .{ .dtype = .f16, .taps = &gpu_taps_views }, null, null, &gpu_tree);
+
+    try std.testing.expectEqual(@as(u16, 4), gpu_res.tree_nodes);
+    try std.testing.expectEqual(@as(u64, 3), gpu_res.markov_steps); // M=4 runs 3 Markov steps, not 7!
+    try std.testing.expectEqual(cpu_res.tree_nodes, gpu_res.tree_nodes);
+    for (0..cpu_tree.count) |ni| {
+        try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
+        try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
     }
 }
 

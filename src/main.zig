@@ -2878,6 +2878,14 @@ fn parseM825Args(raw_args: []const [:0]const u8) !M825CliFlags {
             i += 1;
             if (i >= raw_args.len) return error.MissingFlagValue;
             cli.cfg.ref_cold_slots = try std.fmt.parseInt(u32, raw_args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--spec-tree-nodes")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            const n_nodes = try std.fmt.parseInt(u16, raw_args[i], 10);
+            if (n_nodes < 2 or n_nodes > 16) return error.InvalidArgument;
+            cli.cfg.spec_tree_nodes = n_nodes;
+        } else if (std.mem.eql(u8, flag, "--skip-m4-spec")) {
+            cli.cfg.include_m4_spec = false;
         } else {
             return error.UnknownFlag;
         }
@@ -9369,6 +9377,9 @@ test "M8.25 CLI flags parse --sme2-controllers and bench-m825 options" {
         "/tmp/rt.jsonl",
         "--coding-out",
         "/tmp/code.jsonl",
+        "--spec-tree-nodes",
+        "4",
+        "--skip-m4-spec",
     });
     try std.testing.expectEqualStrings("/tmp/models", b.cfg.models_dir.?);
     try std.testing.expectEqual(aminfer.bench.m825.OptionSelect.b, b.cfg.option);
@@ -9376,6 +9387,8 @@ test "M8.25 CLI flags parse --sme2-controllers and bench-m825 options" {
     try std.testing.expectEqual(@as(u32, 12), b.cfg.kl_steps_per_prompt);
     try std.testing.expectEqualStrings("/tmp/rt.jsonl", b.cfg.capture_trace_path.?);
     try std.testing.expectEqualStrings("/tmp/code.jsonl", b.cfg.coding_out_path.?);
+    try std.testing.expectEqual(@as(u16, 4), b.cfg.spec_tree_nodes);
+    try std.testing.expect(!b.cfg.include_m4_spec);
 }
 
 test "M8.1 BatchServeRunner preserves Inkling 2 special structural tags, registers template EOS, and injects thinking cutoff" {

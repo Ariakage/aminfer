@@ -2552,8 +2552,11 @@ pub const GraphModel = struct {
     ) dequant.EncodeError!void {
         const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
         const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        const eff_dt = lin.effectiveAmfDType();
+        const eff_barrier = barrier_before or
+            (self.act_quant_policy.resolveForTensor(eff_dt, lin.k) != .none);
         return self.dequant_pipes.encodeLinearUnified(frame, .{
-            .amf_dtype = lin.effectiveAmfDType(),
+            .amf_dtype = eff_dt,
             .group_size = lin.group_size,
             .tensor_scale_per_row = lin.tensor_scale_per_row,
             .weight = lin.weight,
@@ -2569,7 +2572,7 @@ pub const GraphModel = struct {
             .act_quant_policy = self.act_quant_policy,
             .act_scratch = act_b,
             .act_scratch_bytes = self.act_quant_bytes,
-        }, barrier_before);
+        }, eff_barrier);
     }
 
     pub fn encodeLinearBatched(
@@ -2599,8 +2602,12 @@ pub const GraphModel = struct {
         }
         const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
         const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        const eff_dt = lin.effectiveAmfDType();
+        const eff_barrier = barrier_before or
+            (self.act_quant_policy.resolveForTensor(eff_dt, lin.k) != .none) or
+            (m >= 16 and self.qf_tile_buf != null);
         return self.dequant_pipes.encodeLinearUnified(frame, .{
-            .amf_dtype = lin.effectiveAmfDType(),
+            .amf_dtype = eff_dt,
             .group_size = lin.group_size,
             .tensor_scale_per_row = lin.tensor_scale_per_row,
             .weight = lin.weight,
@@ -2616,7 +2623,7 @@ pub const GraphModel = struct {
             .act_quant_policy = self.act_quant_policy,
             .act_scratch = act_b,
             .act_scratch_bytes = self.act_quant_bytes,
-        }, barrier_before);
+        }, eff_barrier);
     }
 
     pub fn encodeLinearGemmWithTile(
@@ -2649,8 +2656,12 @@ pub const GraphModel = struct {
         const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (self.qf_pipes) |*qfp| qfp else null;
         const tile_b: ?metal.BufferBinding = if (self.qf_tile_buf) |tb| .{ .buffer = tb, .offset = 0 } else null;
         const act_b: ?metal.BufferBinding = if (self.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        const eff_dt = lin.effectiveAmfDType();
+        const eff_barrier = barrier_before or
+            (self.act_quant_policy.resolveForTensor(eff_dt, lin.k) != .none) or
+            (tile_b != null);
         return self.dequant_pipes.encodeLinearUnified(frame, .{
-            .amf_dtype = lin.effectiveAmfDType(),
+            .amf_dtype = eff_dt,
             .group_size = lin.group_size,
             .tensor_scale_per_row = lin.tensor_scale_per_row,
             .weight = lin.weight,
@@ -2668,7 +2679,7 @@ pub const GraphModel = struct {
             .act_quant_policy = self.act_quant_policy,
             .act_scratch = act_b,
             .act_scratch_bytes = self.act_quant_bytes,
-        }, barrier_before);
+        }, eff_barrier);
     }
 
     fn encodeLinearByModeResidual(
