@@ -507,6 +507,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         help="Target average effective bits/weight across all model weights (default: auto 4.15 Dense / 3.50 MoE)",
     )
+    gsq.add_argument(
+        "--target-wired-gib",
+        default=None,
+        type=float,
+        help="Hard wired `.amf` size cap in GiB (e.g. 10.6 for full-wired 24 GB M4)",
+    )
     _add_gsq_safety_args(gsq)
     gsq.add_argument(
         "--heat-profile",
@@ -900,7 +906,10 @@ def _build_parser() -> argparse.ArgumentParser:
     pi2.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=None)
     pi2.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform")
     pi2.add_argument("--target-bits", type=float, default=None)
+    pi2.add_argument("--target-wired-gib", type=float, default=None, help="Hard wired `.amf` size ceiling in GiB")
     pi2.add_argument("--target-tier", choices=VALID_INKLING2_TIERS, default="auto", help="GSQ-RCO v2 tier profile")
+    _add_gsq_safety_args(pi2)
+    pi2.add_argument("--imatrix", type=pathlib.Path, default=None, help="Optional GGUF/.dat imatrix file weighting GSQ-RCO v2")
     pi2.add_argument("--no-rco", action="store_true")
     pi2.add_argument("--manifest", type=pathlib.Path, default=None)
     pi2.add_argument("--cold-experts", default=None)
@@ -916,6 +925,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pi2.add_argument("--dflare-output", type=pathlib.Path, default=None)
     pi2.add_argument("--dflare-config-output", type=pathlib.Path, default=None)
     pi2.add_argument("--config-output", type=pathlib.Path, default=None)
+    pi2.add_argument("--config-dir", type=pathlib.Path, default=None, help="Directory holding HF config.json/tokenizer.json/chat_template.jinja")
+    pi2.add_argument("--config", type=pathlib.Path, default=None, help="Explicit HF config.json path")
+    pi2.add_argument("--tokenizer", type=pathlib.Path, default=None, help="Explicit HF tokenizer.json path")
+    pi2.add_argument("--tokenizer-config", type=pathlib.Path, default=None, help="Explicit HF tokenizer_config.json path")
+    pi2.add_argument("--chat-template", type=pathlib.Path, default=None, help="Explicit chat_template.jinja path")
+    pi2.add_argument("--no-strict-vocab", action="store_true", help="Disable GGUF vs external HF vocab size check")
     pi2.add_argument("--no-embed-metadata", action="store_true")
     pi2.add_argument("--workers", type=int, default=1)
 
@@ -1646,10 +1661,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         started = time.monotonic()
         use_vision_wrapper = (
-            inc_vis is True
-            or args.vision_sidecar is not None
-            or args.vision_block_dtype != "auto"
-            or (strip_vis is None)
+            args.target_wired_gib is None
+            and (
+                inc_vis is True
+                or args.vision_sidecar is not None
+                or args.vision_block_dtype != "auto"
+                or (strip_vis is None)
+            )
         )
         if use_vision_wrapper:
             vis_stats: dict[str, int] = {}
@@ -1707,10 +1725,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"in {elapsed:.1f} s [{dtype_summary}]"
             )
             return 0
+        if args.target_wired_gib is not None and args.vision_sidecar is not None:
+            from aminfer_tools.amf import (
+                AmfReader,
+                TensorKind,
+                _collect_tensors,
+                is_vision_tensor,
+                pack_vision_tower_amf,
+                resolve_checkpoint,
+            )
+
+            in_p = pathlib.Path(args.input)
+            if in_p.is_file() and in_p.suffix == ".amf":
+                with AmfReader(in_p, verify_header_crc=False, verify_dir_crc=False) as vrdr:
+                    has_vis_t = any(is_vision_tensor(m.name) for m in vrdr.entries if m.kind != TensorKind.METADATA)
+            else:
+                has_vis_t = any(is_vision_tensor(n) for n in _collect_tensors(resolve_checkpoint(in_p).shard_paths))
+            if has_vis_t:
+                pack_vision_tower_amf(
+                    in_p,
+                    args.vision_sidecar,
+                    model_id=f"{(args.model_id or args.output.stem)[:55]}-vision",
+                    dtype_mode=args.dtype,
+                    quant_profile="gsq-rco",
+                    vision_block_dtype=args.vision_block_dtype,
+                    group_size=args.group_size,
+                    use_rco=not args.no_rco,
+                    workers=args.workers,
+                )
+
         rep = gsq_convert(
             args.input,
             args.output,
             target_bits=args.target_bits,
+            target_wired_gib=args.target_wired_gib,
             model_id=args.model_id,
             group_size=args.group_size,
             dtype_mode=args.dtype,
@@ -1728,7 +1776,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sample_rows=args.sample_rows,
             manifest_path=args.manifest,
             workers=args.workers,
-            strip_vision=True,
+            strip_vision=(inc_vis is not True),
             imatrix_path=args.imatrix,
             enforce_backbone_floor=enforce_floor,
             max_q2_share=max_q2,
@@ -2217,6 +2265,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "pack-inkling2":
         cold = _parse_cold_experts(args.cold_experts)
         inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
+        enforce_floor = not args.allow_unsafe_q2
+        eff_max_q2 = (
+            1.0 if args.allow_unsafe_q2 else args.max_q2_share
+        ) if (args.allow_unsafe_q2 or args.max_q2_share is not None) else None
+        eff_fine_rungs = True if args.fine_rungs else None
         rep = convert_inkling2_checkpoint(
             args.input,
             args.output,
@@ -2225,6 +2278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             group_size=args.group_size,
             quant_profile=args.quant_profile,
             target_bits=args.target_bits,
+            target_wired_gib=args.target_wired_gib,
             target_tier=args.target_tier,
             use_rco=not args.no_rco,
             manifest_path=args.manifest,
@@ -2240,6 +2294,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             dflare_output=args.dflare_output,
             dflare_config_output=args.dflare_config_output,
             config_output=args.config_output,
+            config_dir=args.config_dir,
+            config_path=args.config,
+            tokenizer_path=args.tokenizer,
+            tokenizer_config_path=args.tokenizer_config,
+            chat_template_path=args.chat_template,
+            strict_vocab_check=not args.no_strict_vocab,
+            imatrix_path=args.imatrix,
+            enforce_backbone_floor=enforce_floor,
+            max_q2_share=eff_max_q2,
+            allow_lowbit_q2_retranscode=bool(args.allow_retranscode_lowbit),
+            fine_rungs=eff_fine_rungs,
             embed_metadata=not args.no_embed_metadata,
             workers=args.workers,
         )

@@ -25,6 +25,9 @@ from dataclasses import dataclass, field
 from aminfer_tools import APPLE_PAGE_SIZE
 from aminfer_tools.amf import (
     DTYPE_MODES,
+    META_CHAT_TEMPLATE_JSON,
+    META_CONFIG_JSON,
+    META_TOKENIZER_JSON,
     NO_EXPERT,
     NO_LAYER,
     QUANT_PROFILES,
@@ -64,11 +67,19 @@ from aminfer_tools.chat_template import compile_chat_template_spec
 from aminfer_tools.gguf import export_dflare_bundle_from_gguf, pack_amf_from_gguf
 
 INKLING2_MODEL_TYPES = ("inkling2", "inkling2_loop", "inkling2_loop_text", "inkling2_text")
-VALID_INKLING2_TIERS = ("auto", "24gb-m4", "128gb-max", "256gb-studio", "512gb-ultra")
+VALID_INKLING2_TIERS = (
+    "auto",
+    "24gb-m4",
+    "24gb-m4-full-wired",
+    "128gb-max",
+    "256gb-studio",
+    "512gb-ultra",
+)
 
 # Wired budgets mirror ADR-0012 (24 GB M4 = 18,186 MiB = 17.76 GiB) and Mac Studio/Ultra ceilings.
 INKLING2_TIER_WIRED_BUDGET_BYTES: dict[str, int] = {
     "24gb-m4": 18_186 * 1024 * 1024,
+    "24gb-m4-full-wired": int(10.8 * (1024**3)),
     "128gb-max": 108 * 1024 * 1024 * 1024,
     "256gb-studio": 218 * 1024 * 1024 * 1024,
     "512gb-ultra": 440 * 1024 * 1024 * 1024,
@@ -109,6 +120,16 @@ INKLING2_GSQ_RCO_PROFILES: dict[str, Inkling2TierProfile] = {
         max_q2_share=0.78,
         cold_tail_fraction=0.75,
         vision_sidecar_recommended=True,
+    ),
+    "24gb-m4-full-wired": Inkling2TierProfile(
+        tier="24gb-m4-full-wired",
+        wired_budget_bytes=INKLING2_TIER_WIRED_BUDGET_BYTES["24gb-m4-full-wired"],
+        target_bits=3.42,
+        max_q2_share=0.30,
+        cold_tail_fraction=0.0,
+        vision_sidecar_recommended=True,
+        enforce_backbone_floor=True,
+        fine_rungs=True,
     ),
     "128gb-max": Inkling2TierProfile(
         tier="128gb-max",
@@ -427,7 +448,7 @@ def validate_hf_metadata_dir(
     n_exp = int(tc.get("n_routed_experts", tc.get("num_experts", 128)) or 128)
     inter = int(tc.get("intermediate_size", 1152) or 1152)
     tier_info: dict[str, dict[str, object]] = {}
-    for t_name in ("24gb-m4", "128gb-max", "256gb-studio", "512gb-ultra"):
+    for t_name in ("24gb-m4", "24gb-m4-full-wired", "128gb-max", "256gb-studio", "512gb-ultra"):
         prof = resolve_inkling2_tier_profile(t_name, num_hidden_layers=num_layers, n_routed_experts=n_exp)
         d_obj = prof.to_dict()
         # Estimate always-active + cold/hot expert split for quick admission summary.
@@ -634,6 +655,28 @@ class Inkling2ConvertReport:
     tier_profile: Inkling2TierProfile | None
 
 
+def _resolve_companion_metadata_files(
+    *,
+    base_dir: pathlib.Path,
+    config_dir: pathlib.Path | None,
+    config_path: pathlib.Path | None,
+    tokenizer_path: pathlib.Path | None,
+    tokenizer_config_path: pathlib.Path | None,
+    chat_template_path: pathlib.Path | None,
+) -> tuple[pathlib.Path | None, pathlib.Path | None, pathlib.Path | None, pathlib.Path | None]:
+    cfg_root = pathlib.Path(config_dir) if config_dir is not None else base_dir
+    eff_cfg = pathlib.Path(config_path) if config_path is not None else (cfg_root / "config.json")
+    eff_tok = pathlib.Path(tokenizer_path) if tokenizer_path is not None else (cfg_root / "tokenizer.json")
+    eff_tok_cfg = pathlib.Path(tokenizer_config_path) if tokenizer_config_path is not None else (cfg_root / "tokenizer_config.json")
+    eff_tpl = pathlib.Path(chat_template_path) if chat_template_path is not None else (cfg_root / "chat_template.jinja")
+    return (
+        eff_cfg if eff_cfg.is_file() else None,
+        eff_tok if eff_tok.is_file() else None,
+        eff_tok_cfg if eff_tok_cfg.is_file() else None,
+        eff_tpl if eff_tpl.is_file() else None,
+    )
+
+
 def convert_inkling2_checkpoint(
     input_path: pathlib.Path,
     output_path: pathlib.Path,
@@ -643,6 +686,7 @@ def convert_inkling2_checkpoint(
     group_size: int | None = None,
     quant_profile: str = "uniform",
     target_bits: float | None = None,
+    target_wired_gib: float | None = None,
     target_tier: str = "auto",
     use_rco: bool = True,
     manifest_path: pathlib.Path | None = None,
@@ -658,10 +702,21 @@ def convert_inkling2_checkpoint(
     dflare_output: pathlib.Path | None = None,
     dflare_config_output: pathlib.Path | None = None,
     config_output: pathlib.Path | None = None,
+    config_dir: pathlib.Path | None = None,
+    config_path: pathlib.Path | None = None,
+    tokenizer_path: pathlib.Path | None = None,
+    tokenizer_config_path: pathlib.Path | None = None,
+    chat_template_path: pathlib.Path | None = None,
+    strict_vocab_check: bool = True,
+    imatrix_path: pathlib.Path | None = None,
+    enforce_backbone_floor: bool = True,
+    max_q2_share: float | None = None,
+    allow_lowbit_q2_retranscode: bool = True,
+    fine_rungs: bool | None = None,
     embed_metadata: bool = True,
     workers: int = 1,
 ) -> Inkling2ConvertReport:
-    """Convert an Inkling 2 safetensors or GGUF checkpoint into 16 KiB-aligned `.amf` bundles (`W23`)."""
+    """Convert an Inkling 2 safetensors, `.amf`, or GGUF checkpoint into 16 KiB-aligned `.amf` bundles (`W23`, `W29`)."""
     if quant_profile not in QUANT_PROFILES:
         raise ValueError(f"quant_profile must be one of {QUANT_PROFILES}, got {quant_profile!r}")
     if sme2_pack is not None and sme2_pack not in SME2_PACK_MODES:
@@ -672,7 +727,7 @@ def convert_inkling2_checkpoint(
     in_path = pathlib.Path(input_path)
     out_path = pathlib.Path(output_path)
 
-    # GGUF pathway (`unsloth/Inkling-2-Mini-GGUF` `inkling2` unrolled deduplication or `dflash` draft).
+    # GGUF pathway (`unsloth/Inkling-2-Mini-GGUF` `inkling2_loop`/`inkling2` deduplication or `dflash` draft).
     if (in_path.is_file() and in_path.suffix.lower() == ".gguf") or (
         in_path.is_dir() and any(in_path.glob("*.gguf")) and not (in_path / "model.safetensors.index.json").is_file()
     ):
@@ -680,12 +735,22 @@ def convert_inkling2_checkpoint(
 
         shards = resolve_gguf_shards(in_path)
         arch = str(shards[0].kv.get("general.architecture") or "").lower()
+        base_dir = in_path if in_path.is_dir() else in_path.parent
+        eff_cfg_p, eff_tok_p, eff_tok_cfg_p, eff_tpl_p = _resolve_companion_metadata_files(
+            base_dir=base_dir,
+            config_dir=config_dir,
+            config_path=config_path,
+            tokenizer_path=tokenizer_path,
+            tokenizer_config_path=tokenizer_config_path,
+            chat_template_path=chat_template_path,
+        )
         if arch == "dflash":
             d_amf, d_cfg, d_metas = export_dflare_bundle_from_gguf(
                 in_path,
                 out_path.parent if out_path.suffix == ".amf" else out_path,
                 model_id=model_id,
                 dtype_mode=dtype_mode,
+                config_path=eff_cfg_p,
             )
             return Inkling2ConvertReport(
                 backbone_amf=d_amf,
@@ -700,6 +765,43 @@ def convert_inkling2_checkpoint(
                 cold_expert_count=0,
                 tier_profile=None,
             )
+
+        tier_prof: Inkling2TierProfile | None = None
+        if target_tier != "auto":
+            kv0 = shards[0].kv
+            n_l = int(kv0.get(f"{arch}.block_count", 24) or 24)
+            n_e = int(kv0.get(f"{arch}.expert_count", 128) or 128)
+            tier_prof = resolve_inkling2_tier_profile(target_tier, num_hidden_layers=n_l, n_routed_experts=n_e)
+
+        eff_cold_per_layer = cold_experts_per_layer
+        if eff_cold_per_layer is None and tier_prof is not None and target_tier == "24gb-m4-full-wired":
+            eff_cold_per_layer = 0
+
+        eff_strip_vis = (
+            False
+            if include_vision is True
+            else (
+                True
+                if (
+                    vision_sidecar is not None
+                    or strip_vision is True
+                    or (strip_vision is None and tier_prof is not None and tier_prof.vision_sidecar_recommended)
+                )
+                else False
+            )
+        )
+
+        meta_override: bytes | None = None
+        if eff_cfg_p is not None:
+            loaded_cfg = json.loads(eff_cfg_p.read_text(encoding="utf-8"))
+            if isinstance(loaded_cfg, dict):
+                tc0 = _effective_text_config(loaded_cfg)
+                n_layers_cfg = int(tc0.get("num_hidden_layers", shards[0].kv.get(f"{arch}.block_count", 24)) or 24)
+                has_ctrls_gguf = any("_ctrl_" in t.name or "loop_attn_" in t.name for sh in shards for t in sh.tensors)
+                sme2_ctrls = (sme2_pack != "none") and (has_ctrls_gguf or bool(tc0.get("loop_config")))
+                enriched = build_inkling2_config_json(loaded_cfg, num_layers=n_layers_cfg, sme2_controllers=sme2_ctrls)
+                meta_override = (json.dumps(enriched, indent=2) + "\n").encode("utf-8")
+
         stats: dict[str, int] = {}
         metas = pack_amf_from_gguf(
             in_path,
@@ -707,77 +809,137 @@ def convert_inkling2_checkpoint(
             model_id=model_id,
             dtype_mode=dtype_mode,
             cold_experts=cold_experts,
+            cold_experts_per_layer=eff_cold_per_layer,
+            heat_profile=heat_profile,
             all_experts_cold=all_experts_cold,
             embed_metadata=embed_metadata,
+            config_path=eff_cfg_p,
+            tokenizer_path=eff_tok_p,
+            tokenizer_config_path=eff_tok_cfg_p,
+            chat_template_path=eff_tpl_p,
+            strip_vision=eff_strip_vis,
+            vision_sidecar=vision_sidecar,
             vision_block_dtype=vision_block_dtype,
+            strict_vocab_check=strict_vocab_check,
             sme2_pack=sme2_pack,
+            draft_config_output=config_output,
+            meta_config_override=meta_override,
             stats_out=stats,
         )
+        vis_metas_gguf: list[PackedTensorMeta] = []
+        vis_out_gguf: pathlib.Path | None = None
+        if vision_sidecar is not None and pathlib.Path(vision_sidecar).is_file():
+            vis_out_gguf = pathlib.Path(vision_sidecar)
+            with AmfReader(vis_out_gguf) as vr:
+                vis_metas_gguf = list(vr.entries)
         ctrl_cnt = sum(1 for m in metas if m.layout == TensorLayout.SME2_PANEL64 and is_inkling2_controller_tensor(m.name))
         cold_cnt = sum(1 for m in metas if m.kind == TensorKind.COLD_EXPERT)
         return Inkling2ConvertReport(
             backbone_amf=out_path,
             backbone_metas=metas,
-            vision_amf=None,
-            vision_metas=[],
+            vision_amf=vis_out_gguf,
+            vision_metas=vis_metas_gguf,
             dflare_amf=None,
             dflare_config_path=None,
             dflare_metas=[],
-            config_path=None,
+            config_path=pathlib.Path(config_output) if config_output is not None else None,
             sme2_controller_count=ctrl_cnt,
             cold_expert_count=cold_cnt,
-            tier_profile=None,
+            tier_profile=tier_prof,
         )
 
-    resolved = resolve_checkpoint(in_path)
+    is_amf_in = in_path.is_file() and in_path.suffix.lower() == ".amf"
+    base_dir = in_path if in_path.is_dir() else in_path.parent
+    eff_cfg_p, eff_tok_p, eff_tok_cfg_p, eff_tpl_p = _resolve_companion_metadata_files(
+        base_dir=base_dir,
+        config_dir=config_dir,
+        config_path=config_path,
+        tokenizer_path=tokenizer_path,
+        tokenizer_config_path=tokenizer_config_path,
+        chat_template_path=chat_template_path,
+    )
+
     src_cfg: dict[str, object] = {}
-    if resolved.config_path is not None and resolved.config_path.is_file():
-        loaded = json.loads(resolved.config_path.read_text(encoding="utf-8"))
+    backbone_tensors: dict[str, _ShardTensor] = {}
+    mtp_tensors: dict[str, _ShardTensor] = {}
+    all_names: list[str] = []
+
+    if is_amf_in:
+        with AmfReader(in_path, verify_header_crc=False, verify_dir_crc=False) as amf_rdr:
+            all_names = [m.name for m in amf_rdr.entries if m.kind != TensorKind.METADATA]
+            if META_CONFIG_JSON in amf_rdr.by_name and eff_cfg_p is None:
+                loaded = json.loads(amf_rdr.read_metadata_bytes(META_CONFIG_JSON, verify_crc=True).decode("utf-8"))
+                if isinstance(loaded, dict):
+                    src_cfg = loaded
+    else:
+        resolved = resolve_checkpoint(in_path)
+        cfg_candidate = eff_cfg_p or resolved.config_path
+        if cfg_candidate is not None and cfg_candidate.is_file():
+            loaded = json.loads(cfg_candidate.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                src_cfg = loaded
+        all_tensors = _collect_tensors(resolved.shard_paths)
+        for k, v in all_tensors.items():
+            if _is_inkling2_mtp_tensor(k):
+                mtp_tensors[k] = v
+            else:
+                backbone_tensors[k] = v
+        mtp_file = base_dir / "mtp.safetensors"
+        if not mtp_tensors and mtp_file.is_file():
+            mtp_tensors = _collect_tensors((mtp_file,))
+        all_names = list(backbone_tensors.keys())
+
+    if not src_cfg and eff_cfg_p is not None and eff_cfg_p.is_file():
+        loaded = json.loads(eff_cfg_p.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
             src_cfg = loaded
+
     tc = _effective_text_config(src_cfg)
-    num_layers = int(tc.get("num_hidden_layers", 24) or 24)
-    num_experts = int(tc.get("n_routed_experts", tc.get("num_experts", 128)) or 128)
+    if tc.get("num_hidden_layers"):
+        num_layers = int(tc["num_hidden_layers"])
+    else:
+        layer_ids = {int(m.group(1)) for n in all_names if (m := re.search(r"layers\.(\d+)\.", n)) is not None}
+        num_layers = (max(layer_ids) + 1) if layer_ids else 24
+    if tc.get("n_routed_experts") or tc.get("num_experts"):
+        num_experts = int(tc.get("n_routed_experts", tc.get("num_experts")) or 128)
+    else:
+        exp_ids = {int(m.group(1)) for n in all_names if (m := re.search(r"\.experts\.(\d+)\.", n)) is not None}
+        num_experts = (max(exp_ids) + 1) if exp_ids else 128
+
     tier_prof = resolve_inkling2_tier_profile(target_tier, num_hidden_layers=num_layers, n_routed_experts=num_experts)
 
+    eff_quant_profile = quant_profile
+    if eff_quant_profile == "uniform" and (
+        is_amf_in or target_tier == "24gb-m4-full-wired" or target_wired_gib is not None or imatrix_path is not None
+    ):
+        eff_quant_profile = "gsq-rco"
+
     eff_cold: set[tuple[int, int]] = set(cold_experts)
+    eff_cold_per_layer = cold_experts_per_layer
+    if eff_cold_per_layer is None and target_tier == "24gb-m4-full-wired" and not eff_cold:
+        eff_cold_per_layer = 0
     if heat_profile is not None:
         eff_cold.update(
             load_cold_experts_from_heat_profile(
                 pathlib.Path(heat_profile),
-                cold_experts_per_layer=cold_experts_per_layer,
+                cold_experts_per_layer=eff_cold_per_layer,
             )
         )
-    elif cold_experts_per_layer is not None:
-        eff_cold.update(_tail_cold_experts(num_layers, num_experts, cold_experts_per_layer))
-    elif quant_profile == "gsq-rco" and target_tier != "auto" and tier_prof.cold_tail_fraction > 0.0:
+    elif eff_cold_per_layer is not None:
+        eff_cold.update(_tail_cold_experts(num_layers, num_experts, eff_cold_per_layer))
+    elif eff_quant_profile == "gsq-rco" and target_tier != "auto" and tier_prof.cold_tail_fraction > 0.0:
         tail_cnt = int(round(num_experts * tier_prof.cold_tail_fraction))
         eff_cold.update(_tail_cold_experts(num_layers, num_experts, tail_cnt))
 
-    all_tensors = _collect_tensors(resolved.shard_paths)
-    backbone_tensors: dict[str, _ShardTensor] = {}
-    mtp_tensors: dict[str, _ShardTensor] = {}
-    for k, v in all_tensors.items():
-        if _is_inkling2_mtp_tensor(k):
-            mtp_tensors[k] = v
-        else:
-            backbone_tensors[k] = v
-
-    # Check companion `mtp.safetensors` alongside `model.safetensors.index.json` (real Inkling-2 layout).
-    base_dir = in_path if in_path.is_dir() else in_path.parent
-    mtp_file = base_dir / "mtp.safetensors"
-    if not mtp_tensors and mtp_file.is_file():
-        mtp_tensors = _collect_tensors((mtp_file,))
-
     if sme2_pack is None:
         is_loop_mt = str(src_cfg.get("model_type", tc.get("model_type", ""))).lower() in ("inkling2_loop", "inkling2_loop_text")
-        has_ctrls = any(is_inkling2_controller_tensor(k) for k in backbone_tensors)
+        has_ctrls = any(is_inkling2_controller_tensor(k) for k in all_names)
         eff_sme2 = "controllers" if (is_loop_mt or has_ctrls) else "none"
     else:
         eff_sme2 = sme2_pack
 
     vision_mode = resolve_vision_mode(
-        backbone_tensors.keys(),
+        all_names,
         include_vision=include_vision,
         strip_vision=strip_vision,
         vision_sidecar=vision_sidecar,
@@ -787,42 +949,130 @@ def convert_inkling2_checkpoint(
         eff_vis_sidecar = out_path.with_name("vision.amf")
 
     eff_target_bits = target_bits
-    eff_max_q2 = None
-    if quant_profile == "gsq-rco" and eff_target_bits is None and target_tier != "auto":
-        eff_target_bits = tier_prof.target_bits
-        eff_max_q2 = tier_prof.max_q2_share
+    eff_target_wired_gib = target_wired_gib
+    eff_max_q2 = max_q2_share
+    if eff_quant_profile == "gsq-rco" and target_tier != "auto":
+        if eff_target_bits is None and eff_target_wired_gib is None:
+            eff_target_bits = tier_prof.target_bits
+        if eff_target_wired_gib is None and target_tier == "24gb-m4-full-wired":
+            eff_target_wired_gib = tier_prof.wired_budget_bytes / (1024**3)
+        if eff_max_q2 is None:
+            eff_max_q2 = tier_prof.max_q2_share
 
-    # Pack backbone (including optional vision sidecar & GSQ-RCO v2).
-    if mtp_tensors and all(_is_inkling2_mtp_tensor(k) for k in mtp_tensors):
-        # Write temporary filtered index? Even cleaner: write via `pack_amf_from_safetensors` directly
-        # when no inline mtp.* keys pollute `all_tensors`, otherwise pass `exclude_tensors`.
-        excl_mtp = tuple(mtp_tensors.keys())
-    else:
-        excl_mtp = ()
+    eff_fine_rungs = (eff_quant_profile == "gsq-rco") if fine_rungs is None else fine_rungs
+    excl_mtp = tuple(mtp_tensors.keys()) if (mtp_tensors and all(_is_inkling2_mtp_tensor(k) for k in mtp_tensors)) else ()
 
-    metas = pack_amf_from_safetensors(
-        in_path,
-        out_path,
-        model_id=model_id[:63],
-        group_size=group_size,
-        cold_experts=eff_cold,
-        all_experts_cold=all_experts_cold,
-        dtype_mode=dtype_mode,
-        exclude_tensors=excl_mtp,
-        sme2_pack=eff_sme2,
-        quant_profile=quant_profile,
-        target_bits=eff_target_bits,
-        use_rco=use_rco,
-        manifest_path=manifest_path,
-        workers=workers,
-        strip_vision=strip_vision,
-        include_vision=include_vision,
-        vision_sidecar=eff_vis_sidecar,
-        vision_block_dtype=vision_block_dtype,
-        max_q2_share=eff_max_q2,
-        fine_rungs=(quant_profile == "gsq-rco"),
-        embed_metadata=embed_metadata,
+    has_ctrls_eff = eff_sme2 != "none" and (
+        any(is_inkling2_controller_tensor(k) for k in all_names)
+        or str(src_cfg.get("model_type", tc.get("model_type", ""))).lower() in ("inkling2_loop", "inkling2_loop_text")
     )
+    enriched_cfg = build_inkling2_config_json(src_cfg, num_layers=num_layers, sme2_controllers=has_ctrls_eff)
+    enriched_bytes = (json.dumps(enriched_cfg, indent=2) + "\n").encode("utf-8")
+
+    # Decide between direct single-pass `gsq_convert` vs `pack_amf_from_safetensors`.
+    use_direct_gsq = eff_quant_profile == "gsq-rco" and (
+        is_amf_in
+        or eff_target_wired_gib is not None
+        or imatrix_path is not None
+        or target_tier == "24gb-m4-full-wired"
+        or include_vision is not True
+    )
+    embedded_single_pass = False
+    if use_direct_gsq:
+        from aminfer_tools.gsq_rco import gsq_convert
+
+        has_vision = any(is_vision_tensor(n) for n in all_names)
+        if vision_mode == "sidecar" and eff_vis_sidecar is not None and has_vision:
+            pack_vision_tower_amf(
+                in_path,
+                eff_vis_sidecar,
+                model_id=f"{model_id[:55]}-vision",
+                dtype_mode=dtype_mode,
+                quant_profile="gsq-rco",
+                vision_block_dtype=vision_block_dtype,
+                group_size=group_size if group_size is not None else 64,
+                use_rco=use_rco,
+                workers=workers,
+                embed_metadata=embed_metadata,
+                config_path=eff_cfg_p,
+            )
+
+        gsq_meta_blobs: list[tuple[str, bytes]] = []
+        if embed_metadata:
+            gsq_meta_blobs.append((META_CONFIG_JSON, enriched_bytes))
+            if eff_tok_p is not None:
+                gsq_meta_blobs.append((META_TOKENIZER_JSON, eff_tok_p.read_bytes()))
+            elif is_amf_in:
+                with AmfReader(in_path, verify_header_crc=False, verify_dir_crc=False) as amf_rdr:
+                    if META_TOKENIZER_JSON in amf_rdr.by_name:
+                        gsq_meta_blobs.append((META_TOKENIZER_JSON, amf_rdr.read_metadata_bytes(META_TOKENIZER_JSON)))
+                    if META_CHAT_TEMPLATE_JSON in amf_rdr.by_name:
+                        gsq_meta_blobs.append((META_CHAT_TEMPLATE_JSON, amf_rdr.read_metadata_bytes(META_CHAT_TEMPLATE_JSON)))
+            tpl_txt = eff_tpl_p.read_text(encoding="utf-8") if eff_tpl_p is not None else None
+            tok_cfg_d = json.loads(eff_tok_cfg_p.read_text(encoding="utf-8")) if eff_tok_cfg_p is not None else {}
+            if tpl_txt or (isinstance(tok_cfg_d, dict) and tok_cfg_d.get("chat_template")):
+                spec = compile_chat_template_spec(
+                    jinja_text=tpl_txt,
+                    tokenizer_config=tok_cfg_d if isinstance(tok_cfg_d, dict) else {},
+                    model_config=enriched_cfg,
+                )
+                gsq_meta_blobs.append(
+                    (META_CHAT_TEMPLATE_JSON, json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                )
+            embedded_single_pass = True
+
+        eff_tie = bool(tc.get("tie_word_embeddings", False)) if not is_amf_in else None
+        rep_gsq = gsq_convert(
+            in_path,
+            out_path,
+            target_bits=eff_target_bits,
+            target_wired_gib=eff_target_wired_gib,
+            model_id=model_id[:63],
+            group_size=group_size if group_size is not None else 64,
+            dtype_mode=dtype_mode,
+            heat_profile=heat_profile,
+            cold_experts=eff_cold,
+            cold_experts_per_layer=(eff_cold_per_layer if heat_profile is not None else None),
+            all_experts_cold=all_experts_cold,
+            tie_word_embeddings=eff_tie,
+            exclude_tensors=excl_mtp,
+            sme2_pack=eff_sme2,
+            use_rco=use_rco,
+            manifest_path=manifest_path,
+            workers=workers,
+            strip_vision=(include_vision is not True),
+            imatrix_path=imatrix_path,
+            enforce_backbone_floor=enforce_backbone_floor,
+            max_q2_share=eff_max_q2,
+            allow_lowbit_q2_retranscode=allow_lowbit_q2_retranscode,
+            fine_rungs=eff_fine_rungs,
+            meta_blobs=gsq_meta_blobs,
+        )
+        metas = rep_gsq.metas
+    else:
+        metas = pack_amf_from_safetensors(
+            in_path,
+            out_path,
+            model_id=model_id[:63],
+            group_size=group_size,
+            cold_experts=eff_cold,
+            all_experts_cold=all_experts_cold,
+            dtype_mode=dtype_mode,
+            exclude_tensors=excl_mtp,
+            sme2_pack=eff_sme2,
+            quant_profile=eff_quant_profile,
+            target_bits=eff_target_bits,
+            use_rco=use_rco,
+            manifest_path=manifest_path,
+            workers=workers,
+            strip_vision=strip_vision,
+            include_vision=include_vision,
+            vision_sidecar=eff_vis_sidecar,
+            vision_block_dtype=vision_block_dtype,
+            max_q2_share=eff_max_q2,
+            fine_rungs=eff_fine_rungs,
+            embed_metadata=embed_metadata,
+        )
 
     vis_metas: list[PackedTensorMeta] = []
     vis_out: pathlib.Path | None = None
@@ -833,9 +1083,10 @@ def convert_inkling2_checkpoint(
 
     ctrl_cnt = sum(1 for m in metas if m.layout == TensorLayout.SME2_PANEL64 and is_inkling2_controller_tensor(m.name))
     cold_cnt = sum(1 for m in metas if m.kind == TensorKind.COLD_EXPERT)
-    enriched_cfg = build_inkling2_config_json(src_cfg, num_layers=num_layers, sme2_controllers=ctrl_cnt > 0)
-    enriched_bytes = (json.dumps(enriched_cfg, indent=2) + "\n").encode("utf-8")
-    if embed_metadata:
+    if ctrl_cnt == 0 and has_ctrls_eff:
+        enriched_cfg = build_inkling2_config_json(src_cfg, num_layers=num_layers, sme2_controllers=False)
+        enriched_bytes = (json.dumps(enriched_cfg, indent=2) + "\n").encode("utf-8")
+    if embed_metadata and not embedded_single_pass:
         metas = embed_metadata_into_amf(out_path, config_bytes=enriched_bytes, output_path=out_path)
 
     cfg_out_path: pathlib.Path | None = None
