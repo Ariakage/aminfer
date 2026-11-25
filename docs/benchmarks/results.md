@@ -6151,8 +6151,72 @@ assert is_prime(4) == False
 assert is_prime(17)
 ```
 
+## M8.25: Zero-Flush Single-Frame Inkling 2 Hot Path, GPU DFlare, and Option A vs Option B Parity
 
+Recorded on Apple M4 (`Mac16,12`, `Apple9` GPU, `24 GiB` unified memory,
+`120.0 GB/s` bus) during Milestone M8.25
+([ADR-0026](../decisions/0026-m825-inkling2-single-frame-hot-path-and-full-wired-quant-parity.md);
+commits `b984e4e`, `e000b01`, `b9a5429`, `f0a2e67`, `706f0a8`, `9cc672c`).
 
+### 1. Verification gate summary (`b984e4e`..`9cc672c`)
 
+| Gate / Suite | Scope | Measured Result (M4) |
+| --- | --- | --- |
+| **Metal 4 Zero-Spill Shader Compile (`G29`, `D16`)** | `xcrun -sdk macosx metal -std=metal4.0 -Wall -Werror -Wframe-larger-than=0 -mmacosx-version-min=26.0` on `inkling2_hy4.metal`, `moe_ffn.metal`, and `dflare_gpu.metal` | **Exit `0` (`0` warnings, `0` stack spills)** across all M8.25 kernels (incl. `ami_inkling2_logit_softcap_argmax_f16` and `w1_dtype == 3` `gguf_q8_0`) |
+| **Metal Validation (`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`)** | `test-m82-gpu` (`22/22`), `test-m82-draft` (`24/24`), `aminfer bench-m825 --skip-real`, and Option A `decode` | **Pass (`0` Metal API or shader validation errors)** |
+| **Full Zig Build & Test Gates (`9cc672c`)** | `zig fmt --check build.zig src`, `zig build` (Debug & ReleaseFast), `zig build test -j1` (Debug & `-Doptimize=ReleaseSafe`), `rg '/Volumes/' src tools`, `catch {}` audit | **`522/522` passed** (`495` mod + `18` exe + `9` sdk; up from `520/520` on `706f0a8`), `test-m82-gpu` `22/22`, `test-m82-draft` `24/24`, `0` `/Volumes/` paths, `0` `catch {}` |
+| **Offline Python `tools/` & Python SDK Suites** | `uv run --directory tools python -m unittest discover -s tests` & `python3 -m unittest discover -s python/tests -v` | **`135` OK (`1` skipped)** in `tools/tests` (`17/17` in `test_m82_inkling2_hy4.py`) and **`7/7` passed** in `python/tests` |
+| **M8.2 Regression Gate (`aminfer bench-m82`)** | `./zig-out/bin/aminfer bench-m82 --models-dir /Volumes/AriDisk/models` (`ReleaseFast`) | **`all_passed = true`, `swapouts_delta = 0`** |
+| **Determinism & Post-Fix Speculative Parity (`9cc672c`)** | Deterministic ascending Phase 3 CSR scatter in `ami_inkling2_moe_route_csr` + shared-buffer barriers in `graph.zig` + GPU `ami_inkling2_logit_softcap_argmax_f16` | **`10/10` bit-identical** Option A cold-load `decode` runs, **`3/3` bit-exact** `m = 8` prefill hashes (`after_attn=0x24c8a038168456bf`, `inter_h=0xb12b40776c491f1c`), and **`12/12` (`100%`)** Option A & B speculative greedy parity (`64/64` & `128/128`, `0` flips) |
 
+### 2. Staged inputs, 48-step router-trace calibration, and Option A / Option B spot-checks
+
+- **SHA256-verified `unsloth/Inkling-2-Mini-GGUF` staged artifacts (`/Volumes/AriDisk/models/Inkling-2-Mini-GGUF/`)**:
+  - `Inkling-2-Mini-UD-IQ3_XXS.gguf`: `11,663,310,784 B` (`10.862 GiB`), SHA256 `fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657`, GGUF v3 `744` tensors / `63` KV keys (`general.architecture = inkling2_loop`, `24` blocks, `loop.count = 3`, `loop.start = 6`, `loop.end = 18`, `loop.gate_rank = 64`, `vocab_size = 201024`; dtype distribution `518 F32`, `100 Q8_0`, `32 BF16`, `28 Q6_K`, `20 TYPE_40` (`4.5 bpe` `NVFP4`), `14 Q5_K`, `13 IQ3_XXS`, `9 IQ2_S`, `4 Q4_K`, `4 IQ4_NL`, `1 IQ2_XXS`, `1 IQ2_XS`).
+  - `imatrix_unsloth.gguf_file`: `45,380,640 B` (`42 MiB`), SHA256 `6f5364dd452a2c0bf4ee17f039ae3c06667c7eb34679053347e1449d67b8c44b`, GGUF v3 `784` tensors (`392` `.in_sum2`+`.counts` pairs across native `blk.0..23`, `imatrix.chunk_count = 8238`, `imatrix.chunk_size = 512`).
+- **48-step loop-folded `W8` router-trace calibration (`/Volumes/AriDisk/models/amf/`)**:
+  - `inkling-2-mini-router-trace.jsonl`: `78,000` loop-folded 48-step records captured across `16` diverse prompts (`1,625` tokens, `T = 0`, `mid_pass_flushes = 0`), folded onto physical layers `0..23` into `inkling-2-mini-heat.json` (`calibration_mode = router_trace`, `sample_tokens = 3250`, `24 x 128` experts).
+- **Full-wired (`cold = 0`, `W20` ViT sidecar stripped) exported `.amf` bundles**:
+  - **Option A (`inkling-2-mini-ud-iq3-xxs.amf`)**: lossless `W22` conversion of `Inkling-2-Mini-UD-IQ3_XXS.gguf` in `77.06 s` real (`32.39 s` user after vectorized `_unsplit_nvfp4_batch`, `b9a5429`); `11,686,723,584 B` (`10.884 GiB`) on disk, `11,659,608,064 B` (`11,119.47 MiB` = `10.859 GiB`) AMF wired (`11,298 MiB` runtime wired), `cold_bytes = 0`, `meta_bytes = 26,214,400`, `6,793` tensors (`144` `sme2_panel64` controllers), `3.08 GB/tok` active, `verify-amf ok`.
+  - **Option B (`inkling-2-mini-gsq-rco-v2.amf`)**: native `GSQ-RCO v2` (`24gb-m4-full-wired`, `(layer, role)` `imatrix` normalization + `router_trace` heat + native `ami_sdk_dequant_nvfp4_rows_f32` `~10x` speedup); `11,376,951,296 B` (`10.596 GiB`) on disk, `10,824.05 MiB` AMF wired (`11,003 MiB` runtime wired, `-295 MiB` vs Option A), `cold_bytes = 0`, `6,793` tensors, `2.34 GB/tok` active, `verify-amf ok`.
+
+#### Option A (`inkling-2-mini-ud-iq3-xxs.amf`) numerical spot-check vs native `Inkling-2-Mini` safetensors
+
+| Tensor | Packed `.amf` DType | Cosine Similarity vs Native Safetensors (sampled rows) |
+| --- | --- | --- |
+| `layers.0.mlp.experts.0.w13.weight` (`pair_interleaved`) | `GGUF_IQ2_XXS` | `[0.93583, 0.9359, 0.93305, 0.93968]` |
+| `layers.1.mlp.experts.0.w13.weight` (`pair_interleaved`) | `GGUF_IQ2_S` | `[0.96586, 0.9632, 0.9646, 0.96582]` |
+| `layers.10.mlp.experts.0.w13.weight` / `layers.20...w13.weight` | `GGUF_IQ3_XXS` | `[0.98159, 0.98211]` / `[0.98222, 0.98284]` |
+| `layers.0.mlp.experts.0.down_proj.weight` | `NVFP4_G16` + `.scale` | `[1.0, 1.0]` |
+| `layers.20.mlp.experts.0.down_proj.weight` | `GGUF_IQ4_NL` | `[0.99734, 0.99724]` |
+| `layers.0.attn.wq_du.weight` | `GGUF_Q6_K` | `[0.99984, 0.99982]` |
+| `layers.6.controllers.attn.down_weight` (`SME2_PANEL64`) & `middle_cycle_cross_pass_queries` (`F32`) | `BF16` / `F32` | `[1.0, 1.0]` / `[1.0, 1.0]` |
+| `embed_tokens.weight` / `lm_head.weight` | `GGUF_Q4_K` / `GGUF_Q5_K` | `[0.99735, 0.99745]` / `[0.99922, 0.99936]` |
+
+### 3. Live `24 GB` M4 head-to-head A/B: Option A (`UD-IQ3_XXS`) vs Option B (`GSQ-RCO v2`)
+
+All post-fix (`9cc672c`) throughput rows execute with **`mid_pass_flushes = 0`**, **`zig_allocs = 0`**, **`swapouts_delta = 0`** (steady-state), and **`100%` (`64/64` & `128/128`, `12/12` points) greedy parity** against `decode -t 0`. Clean uncontended `bench-m825` runs (`9cc672c`, incorporating GPU `ami_inkling2_logit_softcap_argmax_f16` and `M = 4` `chain_end` cap) recover the desktop GPU/RAM contention drop seen during initial `706f0a8` runs (`3.06–3.22 tok/s` contended -> `13.90 / 13.46 tok/s` uncontended, `4.2x–4.5x`).
+
+| Metric (`ReleaseFast`, `24 GB` M4) | Option A (`inkling-2-mini-ud-iq3-xxs.amf`) | Option B (`inkling-2-mini-gsq-rco-v2.amf`) |
+| --- | --- | --- |
+| Disk / AMF Wired / Runtime Wired | `11,686,723,584 B` / `11,119.47 MiB` / `11,298 MiB` | `11,376,951,296 B` / `10,824.05 MiB` / `11,003 MiB` (`-295 MiB`) |
+| Active Bytes/Tok / `mid_pass_flushes` / `zig_allocs` / `swapouts_delta` | `3.08 GB/tok` / `0` / `0` / `0` (steady-state) | `2.34 GB/tok` / `0` / `0` / `0` (`all_passed = yes`) |
+| Standalone uncontended `M = 1` `decode` (`706f0a8`) | `12.70–14.09 tok/s` (`71–79 ms/tok`) | `14.05 tok/s` (`71.18 ms/tok`, `32.95 GB/s`) |
+| Isolated uncontended `bench-m825` `decode` `n = 64` / `n = 128` (`9cc672c`) | **`12.81`** / **`12.45 tok/s`** | **`13.90`** / **`13.46 tok/s`** (`4.5x` / `4.2x` vs contended `706f0a8`) |
+| GPU `3L DFlare` (`+606 MiB`) `M = 4` `n = 64` (`9cc672c`) | **`11.48 tok/s`** (standalone **`14.67 tok/s`**, `64/64`) | **`11.60 tok/s`** (`tau = 2.172`, `64/64`, **`+12.5%`** vs `M = 8`) |
+| GPU `3L DFlare` (`+606 MiB`) `M = 8` `n = 64` / `n = 128` (`9cc672c`) | `10.04` (`64/64`) / `7.77 tok/s` (`128/128`) | `10.31` (`tau = 3.316`, `64/64`) / `8.31 tok/s` (`tau = 3.098`, `128/128`) |
+| GPU `DFlash-Q8` (`+469 MiB`) `M = 4` `n = 64` (`9cc672c`) | `8.87 tok/s` (`64/64`) | **`9.14 tok/s`** (`tau = 2.172`, `64/64`, **`+23.0%`** vs `M = 8`) |
+| GPU `DFlash-Q8` (`+469 MiB`) `M = 8` `n = 64` / `n = 128` (`9cc672c`) | `7.33 tok/s` (`64/64`) | `7.43` (`tau = 3.150`, `64/64`) / `6.16 tok/s` (`tau = 3.024`, `128/128`) |
+| 8-prompt KL vs native `NVFP4` (`ref = 4,662 MiB`, `64` steps, `swap = 0`) | **`mean_kl = 0.017008`**, `max_kl = 0.141966`, **`top1 = 98.44% (63/64)`**, `greedy = 98.44% (63/64)`, `4gram = 1`, `loops = 0/8` | `mean_kl = 0.032843`, `max_kl = 0.303253`, `top1 = 95.31% (61/64)`, `greedy = 85.94% (55/64)`, `4gram = 1`, `loops = 0/8` |
+| `aminfer quality-gate` (`12` steps vs native `NVFP4`, `swap = 0`) | **`mean_kl = 0.009655`**, `max_kl = 0.034168`, **`top1 = 100.0% (12/12)`**, **`greedy = 12/12`** (`4/4, 4/4, 4/4`) | `mean_kl = 0.019135`, `max_kl = 0.085460`, `top1 = 91.7% (11/12)`, `greedy = 11/12` (`3/4, 4/4, 4/4`) |
+| 6-problem Executable Python Coding (`T = 0`, `python3` asserts) | **`6/6` (`100%`) PASS** (`is_prime`, `merge_intervals`, `rle_encode`, `longest_unique_substr`, `eval_rpn`, `topological_sort`) | **`6/6` (`100%`) PASS** (`106–244` tokens across all 6 problems) |
+
+#### Why `M = 4` outperforms `M = 8` and when GPU `DFlare`/`DFlash` wins
+
+On a full-wired `128`-expert top-`8` MoE (`48` effective loop steps), batching `M = 4` or `M = 8` speculative tokens per verification round activates approximately `~27..52 / 128` unique experts per step versus `8 / 128` at `M = 1`. Because M4 `M = 1` decode is purely DRAM-bandwidth-bound (`120 GB/s`), multiplying unique active expert weights by `~3.4x–6.5x` outstrips the `tau = 2.17–3.32` accepted-token gain on full-wired `Inkling-2-Mini`, making `M = 4` `+12.5%` to `+23.0%` faster than `M = 8` (and standalone `3L DFlare M = 4` up to `14.67 tok/s` on Option A) while full-wired `M = 1` `decode` remains fastest on `120 GB/s` M4 (`13.90–14.05 tok/s` Option B; `12.81–14.09 tok/s` Option A). GPU `DFlare`/`DFlash` (`D16`) instead delivers net wall-clock acceleration on higher-latency `cold > 0` NVMe-streamed configurations or dense / higher-memory targets (`128 GB+` Max/Ultra) where per-round target latency dominates draft cost.
+
+#### Dual-candidate selection guidance
+
+- **Option A (`inkling-2-mini-ud-iq3-xxs.amf`, `11,119.47 MiB` wired)**: preferred when maximum logit fidelity against native `NVFP4` (`mean_kl 0.0170` vs `0.0328`, `top1 98.44%` vs `95.31%`, `12/12` `quality-gate`) is prioritized on hosts with headroom for `~11.3 GiB` runtime wired RAM.
+- **Option B (`inkling-2-mini-gsq-rco-v2.amf`, `10,824.05 MiB` wired)**: preferred on tighter live `24 GB` macOS desktops (`-295 MiB` lower wired footprint, `2.34` vs `3.08 GB/tok` active, `13.90–14.05 tok/s` `M = 1`, `all_passed = yes` and `total_swapouts_delta = 0` even when stacking `+606 MiB` `3L DFlare`, matching `6/6` executable Python coding).
 
