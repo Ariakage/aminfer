@@ -507,6 +507,94 @@ class TestInkling2FormatsAndConverters(unittest.TestCase):
             _verify_amf_with_zig(self, out_vis, len(rep.vision_metas))
             _verify_amf_with_zig(self, out_df, len(rep.dflare_metas))
 
+    def test_nvfp4_stacked_experts_scalar_denom_broadcast_and_oob_reject(self) -> None:
+        from aminfer_tools.amf import _ByteRange, _ShardReaders, _decode_scalar_f32_at
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            src_dir = root / "hf_nvfp4_scalar_denom"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            cfg = {
+                "architectures": ["Inkling2LoopForConditionalGeneration"],
+                "model_type": "inkling2_loop",
+                "text_config": {
+                    "model_type": "inkling2_loop_text",
+                    "hidden_size": 64,
+                    "num_hidden_layers": 1,
+                    "vocab_size": 64,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 32,
+                    "intermediate_size": 32,
+                    "n_routed_experts": 4,
+                    "num_experts_per_tok": 2,
+                    "local_layer_ids": [0],
+                },
+            }
+            (src_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+            # 4 stacked NVFP4 experts (`[4, 64, 32]` U8 -> K=64) with per-expert `[4]` amax
+            # and a scalar `[1]` outer_scale_denominator (`2688.0`) placed immediately before
+            # an adjacent sentinel tensor (`-999.0` bytes) that would corrupt OOB reads.
+            num_exp = 4
+            amax_vals = [0.125, 0.25, 0.375, 0.5]
+            denom_val = 2688.0
+            w13_packed = bytes((i * 13 + 7) & 0xFF for i in range(num_exp * 64 * 32))
+            w13_scale = bytes([0x38] * (num_exp * 64 * 4))
+            bb_tensors: dict[str, tuple[str, list[int], bytes]] = {
+                "model.llm.embed_tokens.weight": ("BF16", [64, 64], _f32_to_bf16_bytes(_make_f32_vals(1, 64 * 64))),
+                "model.llm.norm.weight": ("BF16", [64], _f32_to_bf16_bytes(_make_f32_vals(2, 64, centered_one=True))),
+                "lm_head.weight": ("BF16", [64, 64], _f32_to_bf16_bytes(_make_f32_vals(3, 64 * 64))),
+                "model.llm.layers.0.mlp.experts.w13_weight": ("U8", [num_exp, 64, 32], w13_packed),
+                "model.llm.layers.0.mlp.experts.w13_weight_scale": ("F8_E4M3", [num_exp, 64, 4], w13_scale),
+                "model.llm.layers.0.mlp.experts.w13_weight_amax": ("F32", [num_exp], struct.pack("<4f", *amax_vals)),
+                "model.llm.layers.0.mlp.experts.w13_weight_outer_scale_denominator": (
+                    "F32",
+                    [1],
+                    struct.pack("<f", denom_val),
+                ),
+                # Adjacent negative/NaN sentinel right after scalar denom in safetensors stream.
+                "model.llm.layers.0.mlp.gate.bias": (
+                    "F32",
+                    [num_exp],
+                    struct.pack("<4f", -999.0, -777.0, float("nan"), -555.0),
+                ),
+            }
+            sf_path = src_dir / "model.safetensors"
+            _write_safetensors(sf_path, bb_tensors)
+
+            out_amf = root / "out" / "model.amf"
+            convert_inkling2_checkpoint(src_dir, out_amf, strip_vision=True)
+
+            with AmfReader(out_amf) as r:
+                by_name = {m.name: m for m in r.entries}
+                with out_amf.open("rb") as f:
+                    for e in range(num_exp):
+                        meta = by_name[f"layers.0.mlp.experts.{e}.w13"]
+                        self.assertEqual(meta.dtype, DType.NVFP4_G16)
+                        f.seek(meta.blob_offset + meta.params_offset + meta.params_bytes - 4)
+                        got_outer = struct.unpack("<f", f.read(4))[0]
+                        self.assertAlmostEqual(got_outer, amax_vals[e] / denom_val, places=7)
+
+            # Direct unit check on `_decode_scalar_f32_at`: scalar `[1]` broadcasts, vector `[2]` rejects OOB.
+            vec_path = root / "vec.bin"
+            vec_path.write_bytes(struct.pack("<3f", 10.0, 20.0, 30.0))
+            readers = _ShardReaders()
+            try:
+                br_scalar = _ByteRange(path=vec_path, offset=0, length=4, dtype="F32")
+                self.assertEqual(_decode_scalar_f32_at(readers, br_scalar, 0), 10.0)
+                self.assertEqual(_decode_scalar_f32_at(readers, br_scalar, 127), 10.0)
+                with self.assertRaises(ValueError):
+                    _decode_scalar_f32_at(readers, br_scalar, -1)
+
+                br_vec2 = _ByteRange(path=vec_path, offset=0, length=8, dtype="F32")
+                self.assertEqual(_decode_scalar_f32_at(readers, br_vec2, 0), 10.0)
+                self.assertEqual(_decode_scalar_f32_at(readers, br_vec2, 1), 20.0)
+                with self.assertRaises(ValueError):
+                    _decode_scalar_f32_at(readers, br_vec2, 2)
+            finally:
+                readers.close()
+
     def test_mlx_inkling2_long_names_and_gguf_loop_dedup_plus_dflash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

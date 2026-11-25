@@ -2122,6 +2122,14 @@ def plan_amf_entries(
                         raise ValueError(
                             f"outer scale {src_outer.name} shape {list(src_outer.shape)} incompatible with E={num_experts}"
                         )
+                if denom_t is not None:
+                    denom_numel = 1
+                    for d in denom_t.shape:
+                        denom_numel *= d
+                    if denom_numel not in (1, num_experts):
+                        raise ValueError(
+                            f"outer scale denominator {denom_t.name} shape {list(denom_t.shape)} incompatible with E={num_experts}"
+                        )
                 for e in range(num_experts):
                     exp_idx = 0 if (src_outer is None or outer_numel == 1) else e
                     entries.append(
@@ -2400,8 +2408,23 @@ def _read_exact(fh, offset: int, length: int) -> bytes:
 
 def _decode_scalar_f32_at(readers: _ShardReaders, br: _ByteRange, index: int) -> float:
     elem = _SAFETENSORS_DTYPE_BYTES[br.dtype]
+    if br.length < elem or (br.length % elem) != 0:
+        raise ValueError(
+            f"invalid scalar scale byte range length {br.length} for dtype {br.dtype}"
+        )
+    if index < 0:
+        raise ValueError(f"scalar scale index {index} must be non-negative")
+    count = br.length // elem
+    if count == 1:
+        eff_index = 0
+    elif index < count:
+        eff_index = index
+    else:
+        raise ValueError(
+            f"scalar scale index {index} out of bounds for count {count} ({br.dtype}, len={br.length})"
+        )
     fh = readers.get(br.path)
-    raw = _read_exact(fh, br.offset + index * elem, elem)
+    raw = _read_exact(fh, br.offset + eff_index * elem, elem)
     if br.dtype == "F32":
         return float(struct.unpack("<f", raw)[0])
     if br.dtype == "BF16":
