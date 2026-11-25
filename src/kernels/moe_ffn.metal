@@ -44,15 +44,17 @@ struct MoeIndirectDispatchArgs {
 static_assert(sizeof(MoeIndirectDispatchArgs) == 12, "MoeIndirectDispatchArgs must be 12 bytes");
 
 // Writes exact G20 `[ceil(N / BN), active_experts, 1]` indirect threadgroup grids
-// into bytes 16..51 of a 64-byte schedule slot (`sched_hdr` or `bucket_headers + s * 64`).
+// into bytes 16..63 of a 64-byte schedule slot (`sched_hdr` or `bucket_headers + s * 64`).
 static inline void write_schedule_indirect(device uchar *slot_base,
                                            uint active_experts,
                                            uint gate_up_groups_x_q,
                                            uint gate_up_groups_x_f,
-                                           uint down_groups_x) {
+                                           uint down_groups_x,
+                                           uint down_groups_x_q8) {
     device MoeIndirectDispatchArgs *gu_q = (device MoeIndirectDispatchArgs *)(slot_base + 16ul);
     device MoeIndirectDispatchArgs *gu_f = (device MoeIndirectDispatchArgs *)(slot_base + 28ul);
     device MoeIndirectDispatchArgs *dn   = (device MoeIndirectDispatchArgs *)(slot_base + 40ul);
+    device MoeIndirectDispatchArgs *dn8  = (device MoeIndirectDispatchArgs *)(slot_base + 52ul);
     gu_q->threadgroups_per_grid[0] = gate_up_groups_x_q;
     gu_q->threadgroups_per_grid[1] = active_experts;
     gu_q->threadgroups_per_grid[2] = 1u;
@@ -62,6 +64,9 @@ static inline void write_schedule_indirect(device uchar *slot_base,
     dn->threadgroups_per_grid[0]   = down_groups_x;
     dn->threadgroups_per_grid[1]   = active_experts;
     dn->threadgroups_per_grid[2]   = 1u;
+    dn8->threadgroups_per_grid[0]  = down_groups_x_q8;
+    dn8->threadgroups_per_grid[1]  = active_experts;
+    dn8->threadgroups_per_grid[2]  = 1u;
 }
 
 struct RouterProjParams {
@@ -79,7 +84,7 @@ struct RouteParams {
     uint gate_up_groups_x_q;
     uint gate_up_groups_x_f;
     uint down_groups_x;
-    uint reserved;
+    uint down_groups_x_q8;
 };
 
 static_assert(sizeof(RouteParams) == 32, "RouteParams must be 32 bytes");
@@ -542,7 +547,8 @@ kernel void ami_moe_route_topk(const device uchar *logits_raw [[buffer(0)]],
                                 u_base,
                                 p.gate_up_groups_x_q,
                                 p.gate_up_groups_x_f,
-                                p.down_groups_x);
+                                p.down_groups_x,
+                                p.down_groups_x_q8);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2278,7 +2284,7 @@ struct BucketRouteParams {
     uint gate_up_groups_x_q;
     uint gate_up_groups_x_f;
     uint down_groups_x;
-    uint _pad0;
+    uint down_groups_x_q8;
     uint _pad1;
     uint _pad2;
 };
@@ -2563,7 +2569,8 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
                                     u_cnt_s,
                                     p.gate_up_groups_x_q,
                                     p.gate_up_groups_x_f,
-                                    p.down_groups_x);
+                                    p.down_groups_x,
+                                    p.down_groups_x_q8);
         }
         running_u_base += u_cnt_s;
         running_a_base += a_cnt_s;
@@ -2580,7 +2587,8 @@ kernel void ami_moe_route_topk_bucketed(const device uchar *logits_raw [[buffer(
                                 running_u_base,
                                 p.gate_up_groups_x_q,
                                 p.gate_up_groups_x_f,
-                                p.down_groups_x);
+                                p.down_groups_x,
+                                p.down_groups_x_q8);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

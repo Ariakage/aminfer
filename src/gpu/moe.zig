@@ -36,12 +36,13 @@ pub const MAX_WIDE_PREFILL_TOKENS: u32 = 1024;
 pub const NUM_SCHEME_BUCKETS: usize = quant.WeightDType.COUNT;
 /// Byte stride between adjacent `ScheduleHeader` records inside `bucket_headers`.
 pub const BUCKET_HEADER_STRIDE: usize = 64;
-/// Byte offsets of the three G20 `metal.IndirectDispatchArgs` (`[3]u32`, 12 B each)
+/// Byte offsets of the four G20 `metal.IndirectDispatchArgs` (`[3]u32`, 12 B each)
 /// embedded inside every 64-byte schedule slot (`schedule_header_off` and
 /// `bucket_headers_off + s * BUCKET_HEADER_STRIDE`, ADR-0023 §3).
 pub const INDIRECT_GATE_UP_Q_OFFSET: u64 = 16;
 pub const INDIRECT_GATE_UP_F_OFFSET: u64 = 28;
 pub const INDIRECT_DOWN_OFFSET: u64 = 40;
+pub const INDIRECT_DOWN_Q8_OFFSET: u64 = 52;
 
 /// M7.8 G20 static-grid crossover guard (ADR-0023 §3):
 /// When `M == 1` and all routed experts in the layer share a single homogeneous
@@ -62,16 +63,20 @@ pub inline fn countActiveSchemeBuckets(scheme_counts: [NUM_SCHEME_BUCKETS]u32) u
     return active;
 }
 
-inline fn gateUpGroupsXQ(intermediate_size: u32) u32 {
+pub inline fn gateUpGroupsXQ(intermediate_size: u32) u32 {
     return @intCast((@as(u64, intermediate_size) + 7) / 8);
 }
 
-inline fn gateUpGroupsXF(intermediate_size: u32) u32 {
+pub inline fn gateUpGroupsXF(intermediate_size: u32) u32 {
     return @intCast((@as(u64, intermediate_size) + 15) / 16);
 }
 
-inline fn downGroupsX(hidden_size: u32) u32 {
+pub inline fn downGroupsX(hidden_size: u32) u32 {
     return @intCast((@as(u64, hidden_size) + 15) / 16);
+}
+
+pub inline fn downGroupsXQ8(hidden_size: u32) u32 {
+    return @intCast((@as(u64, hidden_size) + 7) / 8);
 }
 
 inline fn writeScheduleSlotIndirect(
@@ -83,9 +88,11 @@ inline fn writeScheduleSlotIndirect(
     const gu_q: *metal.IndirectDispatchArgs = @ptrCast(@alignCast(slot_base + INDIRECT_GATE_UP_Q_OFFSET));
     const gu_f: *metal.IndirectDispatchArgs = @ptrCast(@alignCast(slot_base + INDIRECT_GATE_UP_F_OFFSET));
     const dn: *metal.IndirectDispatchArgs = @ptrCast(@alignCast(slot_base + INDIRECT_DOWN_OFFSET));
+    const dn8: *metal.IndirectDispatchArgs = @ptrCast(@alignCast(slot_base + INDIRECT_DOWN_Q8_OFFSET));
     gu_q.* = metal.IndirectDispatchArgs.init(gateUpGroupsXQ(intermediate_size), active_experts, 1);
     gu_f.* = metal.IndirectDispatchArgs.init(gateUpGroupsXF(intermediate_size), active_experts, 1);
     dn.* = metal.IndirectDispatchArgs.init(downGroupsX(hidden_size), active_experts, 1);
+    dn8.* = metal.IndirectDispatchArgs.init(downGroupsXQ8(hidden_size), active_experts, 1);
 }
 
 /// Device-memory expert weight offset table entry (48 bytes, zero padding).
@@ -129,7 +136,7 @@ pub const RouteParams = extern struct {
     gate_up_groups_x_q: u32 = 0,
     gate_up_groups_x_f: u32 = 0,
     down_groups_x: u32 = 0,
-    reserved: u32 = 0,
+    down_groups_x_q8: u32 = 0,
 };
 
 pub const MoeGateUpParams = extern struct {
@@ -254,7 +261,7 @@ pub const BucketRouteParams = extern struct {
     gate_up_groups_x_q: u32 = 0,
     gate_up_groups_x_f: u32 = 0,
     down_groups_x: u32 = 0,
-    _pad0: u32 = 0,
+    down_groups_x_q8: u32 = 0,
     _pad1: u32 = 0,
     _pad2: u32 = 0,
 };
@@ -605,6 +612,10 @@ pub const MoeWorkspace = struct {
         return @ptrCast(@alignCast(self.schedule_header_raw.ptr + INDIRECT_DOWN_OFFSET));
     }
 
+    pub fn scheduleIndirectDownQ8(self: *const MoeWorkspace) *const metal.IndirectDispatchArgs {
+        return @ptrCast(@alignCast(self.schedule_header_raw.ptr + INDIRECT_DOWN_Q8_OFFSET));
+    }
+
     pub fn bucketIndirectGateUpQ(self: *const MoeWorkspace, scheme: quant.WeightDType) *const metal.IndirectDispatchArgs {
         const off: usize = @as(usize, @backingInt(scheme)) * BUCKET_HEADER_STRIDE + INDIRECT_GATE_UP_Q_OFFSET;
         return @ptrCast(@alignCast(self.bucket_headers_raw.ptr + off));
@@ -617,6 +628,11 @@ pub const MoeWorkspace = struct {
 
     pub fn bucketIndirectDown(self: *const MoeWorkspace, scheme: quant.WeightDType) *const metal.IndirectDispatchArgs {
         const off: usize = @as(usize, @backingInt(scheme)) * BUCKET_HEADER_STRIDE + INDIRECT_DOWN_OFFSET;
+        return @ptrCast(@alignCast(self.bucket_headers_raw.ptr + off));
+    }
+
+    pub fn bucketIndirectDownQ8(self: *const MoeWorkspace, scheme: quant.WeightDType) *const metal.IndirectDispatchArgs {
+        const off: usize = @as(usize, @backingInt(scheme)) * BUCKET_HEADER_STRIDE + INDIRECT_DOWN_Q8_OFFSET;
         return @ptrCast(@alignCast(self.bucket_headers_raw.ptr + off));
     }
 
@@ -1624,6 +1640,7 @@ pub const MoePipelines = struct {
             .gate_up_groups_x_q = gateUpGroupsXQ(eff_inter),
             .gate_up_groups_x_f = gateUpGroupsXF(eff_inter),
             .down_groups_x = downGroupsX(eff_hidden),
+            .down_groups_x_q8 = downGroupsXQ8(eff_hidden),
         };
         try frame.encodeThreadgroups(
             pipe,
@@ -1684,6 +1701,7 @@ pub const MoePipelines = struct {
             .gate_up_groups_x_q = gateUpGroupsXQ(eff_inter),
             .gate_up_groups_x_f = gateUpGroupsXF(eff_inter),
             .down_groups_x = downGroupsX(eff_hidden),
+            .down_groups_x_q8 = downGroupsXQ8(eff_hidden),
         };
         try frame.encodeThreadgroups(
             pipe,
@@ -2628,7 +2646,7 @@ pub const MoePipelines = struct {
             .intermediate_size = base.intermediate_size,
             .top_k = base.top_k,
             .tensor_scale_per_row = desc.down_tensor_scale_per_row,
-            .indirect_args = if (use_indirect) .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(scheme_bucket, INDIRECT_DOWN_OFFSET) } else null,
+            .indirect_args = if (use_indirect) .{ .buffer = wb, .offset = ws.scheduleIndirectOffset(scheme_bucket, INDIRECT_DOWN_Q8_OFFSET) } else null,
         }, insert_barrier_before);
     }
 
@@ -2684,16 +2702,7 @@ pub const MoePipelines = struct {
                 first_gu = false;
             }
 
-            var first_dn = true;
-            for (0..NUM_SCHEME_BUCKETS) |s_idx| {
-                const cap = args.scheme_counts[s_idx];
-                if (cap == 0) continue;
-                const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
-                const desc = args.scheme_descs[s_idx];
-                const inter_bind = metal.BufferBinding{ .buffer = base.workspace_buf, .offset = base.workspace.inter_off };
-                try self.encodeBucketDownOne(frame, base, inter_bind, desc, scheme, cap, use_indirect, args.qf_pipes, first_dn);
-                first_dn = false;
-            }
+            try self.encodeDownAndReduceMultiFormat(frame, args, true);
         } else {
             try self.encodeRouting(frame, base, insert_barrier_before);
             const desc = args.scheme_descs[0];
@@ -2719,8 +2728,39 @@ pub const MoePipelines = struct {
                 }
             }
             try self.encodeBucketGateUpOne(frame, base, x_eff, desc, null, base.num_experts, use_indirect, args.qf_pipes, gu_barrier);
+            try self.encodeDownAndReduceMultiFormat(frame, args, true);
+        }
+    }
+
+    /// Encodes the multi-format DownProj stage (all populated heterogeneous buckets
+    /// or single homogeneous pool), optional `G24` intermediate activation quant
+    /// emulation, `ami_moe_reduce_f16`, and optional shared expert accumulation.
+    /// Shared by `encodeMoELayerMultiFormat` and `Inkling2Hy4Pipelines.encodeInkling2MoeLayerIndirect`.
+    pub fn encodeDownAndReduceMultiFormat(
+        self: MoePipelines,
+        frame: *metal.Compute.Frame,
+        args: MoELayerMultiFormatArgs,
+        insert_barrier_before: bool,
+    ) EncodeError!void {
+        const base = args.base;
+        if (args.is_heterogeneous) {
+            const num_buckets = countActiveSchemeBuckets(args.scheme_counts);
+            const use_indirect = shouldUseIndirectDispatch(base.m, num_buckets);
+            var first_dn = insert_barrier_before;
+            for (0..NUM_SCHEME_BUCKETS) |s_idx| {
+                const cap = args.scheme_counts[s_idx];
+                if (cap == 0) continue;
+                const scheme: quant.WeightDType = @fromBackingInt(@intCast(s_idx));
+                const desc = args.scheme_descs[s_idx];
+                const inter_bind = metal.BufferBinding{ .buffer = base.workspace_buf, .offset = base.workspace.inter_off };
+                try self.encodeBucketDownOne(frame, base, inter_bind, desc, scheme, cap, use_indirect, args.qf_pipes, first_dn);
+                first_dn = false;
+            }
+        } else {
+            const desc = args.scheme_descs[0];
+            const use_indirect = shouldUseIndirectDispatch(base.m, 1);
             var inter_eff = metal.BufferBinding{ .buffer = base.workspace_buf, .offset = base.workspace.inter_off };
-            var dn_barrier = true;
+            var dn_barrier = insert_barrier_before;
             const aq_dn = args.act_quant_policy.resolveForTensor(desc.down_dtype, base.intermediate_size);
             if (aq_dn != .none and desc.usesQuantFormatsDown()) {
                 const rows = base.m * base.top_k;
@@ -2733,7 +2773,7 @@ pub const MoePipelines = struct {
                                 .x_out = scratch,
                                 .m = rows,
                                 .k = base.intermediate_size,
-                            }, true);
+                            }, dn_barrier);
                             inter_eff = scratch;
                             dn_barrier = true;
                         }
