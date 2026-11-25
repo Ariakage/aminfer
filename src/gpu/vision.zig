@@ -1684,6 +1684,11 @@ pub const VisionNormWeight = struct {
 pub const VisionBlockWeights = struct {
     norm1: VisionNormWeight,
     qkv: VisionLinearWeight,
+    /// Optional split Q/K/V projections (Inkling 2 `23L` ViT & Hy4 `27L`/`40L` ViT).
+    /// When set, `q_proj`/`k_proj`/`v_proj` run instead of fused `qkv` + `qkv_rope_2d`.
+    q_proj: ?VisionLinearWeight = null,
+    k_proj: ?VisionLinearWeight = null,
+    v_proj: ?VisionLinearWeight = null,
     proj: VisionLinearWeight,
     norm2: VisionNormWeight,
     /// `linear_fc1` / `w1` for GELU MLP, or `gate_proj` / `w1` for SwiGLU MLP.
@@ -1699,7 +1704,8 @@ pub const VisionMergerWeights = struct {
     norm: ?VisionNormWeight = null,
     norm_placement: MergerNormPlacement = .post_merge,
     fc1: VisionLinearWeight,
-    fc2: VisionLinearWeight,
+    /// Optional second linear layer; `null` for single-layer projectors (`vision.merger.proj.0`).
+    fc2: ?VisionLinearWeight = null,
     merger_hidden_size: u32,
     act_kind: VisionLinearAct = .gelu_tanh,
 };
@@ -2841,24 +2847,31 @@ pub const VisionTowerRuntime = struct {
 
         // 1. Pre-attention LayerNorm / RMSNorm -> sc.norm
         try pipes.encodeNorm(frame, in_hidden, block.norm1, sc.normBinding(), num_patches, cfg.vis_hidden, insert_barrier_before);
-        // 2. QKV linear projection: [S, D] -> [S, 3*D]
-        try pipes.encodeLinear(frame, sc.normBinding(), block.qkv, null, sc.qkvBinding(), num_patches, 3 * cfg.vis_hidden, cfg.vis_hidden, .none, true);
-        // 3. Fused QKV split + 2D-RoPE -> Q, K, V
-        try pipes.encodeQkvRope2D(
-            frame,
-            sc.qkvBinding(),
-            sc.coordsBinding(),
-            sc.qBinding(),
-            sc.kBinding(),
-            sc.vBinding(),
-            num_patches,
-            cfg.num_heads,
-            cfg.head_dim,
-            cfg.qkv_layout,
-            cfg.rope_interleaved,
-            cfg.rope_theta,
-            true,
-        );
+        // 2-3. QKV projection (split Q/K/V for Inkling 2 / Hy4 ViTs, or fused QKV + 2D-RoPE).
+        if (block.q_proj != null and block.k_proj != null and block.v_proj != null) {
+            try pipes.encodeLinear(frame, sc.normBinding(), block.q_proj.?, null, sc.qBinding(), num_patches, cfg.vis_hidden, cfg.vis_hidden, .none, true);
+            try pipes.encodeLinear(frame, sc.normBinding(), block.k_proj.?, null, sc.kBinding(), num_patches, cfg.vis_hidden, cfg.vis_hidden, .none, false);
+            try pipes.encodeLinear(frame, sc.normBinding(), block.v_proj.?, null, sc.vBinding(), num_patches, cfg.vis_hidden, cfg.vis_hidden, .none, false);
+        } else {
+            // 2. QKV linear projection: [S, D] -> [S, 3*D]
+            try pipes.encodeLinear(frame, sc.normBinding(), block.qkv, null, sc.qkvBinding(), num_patches, 3 * cfg.vis_hidden, cfg.vis_hidden, .none, true);
+            // 3. Fused QKV split + 2D-RoPE -> Q, K, V
+            try pipes.encodeQkvRope2D(
+                frame,
+                sc.qkvBinding(),
+                sc.coordsBinding(),
+                sc.qBinding(),
+                sc.kBinding(),
+                sc.vBinding(),
+                num_patches,
+                cfg.num_heads,
+                cfg.head_dim,
+                cfg.qkv_layout,
+                cfg.rope_interleaved,
+                cfg.rope_theta,
+                true,
+            );
+        }
         // 4. Bidirectional full/windowed FlashAttention-2 (MMA / NAX) -> sc.attn_out
         const win_opt: ?metal.BufferBinding = if (block.use_window_attn) sc.windowBoundsBinding() else null;
         try pipes.encodeBidirFlashAttn(
@@ -2946,31 +2959,46 @@ pub const VisionTowerRuntime = struct {
             }
         }
 
-        // 2-layer PatchMerger / Aligner MLP: `Linear -> GELU -> Linear`.
-        try pipes.encodeLinear(
-            frame,
-            fc1_in,
-            merger.fc1,
-            null,
-            sc.mergerMidBinding(),
-            merged_tokens,
-            merger.merger_hidden_size,
-            merged_in_dim,
-            merger.act_kind,
-            true,
-        );
-        try pipes.encodeLinear(
-            frame,
-            sc.mergerMidBinding(),
-            merger.fc2,
-            null,
-            sc.lmEmbedsBinding(),
-            merged_tokens,
-            cfg.lm_hidden,
-            merger.merger_hidden_size,
-            .none,
-            true,
-        );
+        // 1-layer or 2-layer PatchMerger / Aligner MLP.
+        if (merger.fc2) |fc2| {
+            try pipes.encodeLinear(
+                frame,
+                fc1_in,
+                merger.fc1,
+                null,
+                sc.mergerMidBinding(),
+                merged_tokens,
+                merger.merger_hidden_size,
+                merged_in_dim,
+                merger.act_kind,
+                true,
+            );
+            try pipes.encodeLinear(
+                frame,
+                sc.mergerMidBinding(),
+                fc2,
+                null,
+                sc.lmEmbedsBinding(),
+                merged_tokens,
+                cfg.lm_hidden,
+                merger.merger_hidden_size,
+                .none,
+                true,
+            );
+        } else {
+            try pipes.encodeLinear(
+                frame,
+                fc1_in,
+                merger.fc1,
+                null,
+                sc.lmEmbedsBinding(),
+                merged_tokens,
+                cfg.lm_hidden,
+                merged_in_dim,
+                .none,
+                true,
+            );
+        }
         return merged_tokens;
     }
 

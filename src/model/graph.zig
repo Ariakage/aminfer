@@ -47,6 +47,9 @@ const vmstat = @import("../platform/vmstat.zig");
 const rng_mod = @import("../runtime/rng.zig");
 const transport = @import("../cluster/transport.zig");
 const expert_parallel = @import("../cluster/expert_parallel.zig");
+const ink_gpu = @import("../gpu/inkling2_hy4.zig");
+const ink_ctrl = @import("../cpu/inkling2_ctrl.zig");
+const m82_rt = @import("m82_runtime.zig");
 
 /// Maximum wired bytes per GPU weight shard (matches `qwen3.zig` to stay below
 /// macOS single-`MTLBuffer` maxBufferLength on 24 GiB–512 GiB Apple Silicon).
@@ -397,6 +400,10 @@ pub const GraphConfig = struct {
     dspark_top_k_per_pos: u8 = 2,
     dspark_max_tree_nodes: u8 = 32,
 
+    // M8.2 (`Inkling 2` & `Hy4`) architecture family & operator config
+    m82_family: m82_rt.M82Family = .none,
+    m82_cfg: m82_rt.M82Config = .{},
+
     pub const ConfigError = error{
         InvalidJson,
         InvalidConfig,
@@ -434,6 +441,7 @@ pub const GraphConfig = struct {
             allocator.free(s);
             self.dspark_config_file = null;
         }
+        self.m82_cfg.deinit(allocator);
     }
 
     pub fn isCausalEncDec(self: GraphConfig) bool {
@@ -492,6 +500,26 @@ pub const GraphConfig = struct {
 
     pub fn validate(self: GraphConfig) ConfigError!void {
         if (self.vocab_size == 0 or self.hidden_size == 0 or self.num_hidden_layers == 0) return error.InvalidConfig;
+        if (self.m82_family != .none) {
+            if (self.m82_family.isInkling2()) {
+                if (self.num_attention_heads == 0 or self.num_key_value_heads == 0 or self.head_dim == 0) return error.InvalidConfig;
+                if ((self.num_attention_heads % self.num_key_value_heads) != 0) return error.InvalidConfig;
+                if ((self.head_dim % 4) != 0 or self.head_dim > ink_gpu.MAX_INKLING2_HEAD_DIM) return error.InvalidConfig;
+                if (self.num_experts == 0 or self.num_experts > moe.MAX_EXPERTS) return error.InvalidConfig;
+                if (self.num_experts_per_tok == 0 or self.num_experts_per_tok > moe.MAX_TOP_K or self.num_experts_per_tok > self.num_experts) return error.InvalidConfig;
+                if (self.intermediate_size == 0) return error.InvalidConfig;
+            } else if (self.m82_family.isHy4()) {
+                if (self.num_attention_heads == 0 or self.kv_lora_rank == 0 or self.q_lora_rank == 0 or
+                    self.qk_nope_head_dim == 0 or self.v_head_dim == 0)
+                {
+                    return error.InvalidConfig;
+                }
+                if ((self.kv_lora_rank % 2) != 0 or self.kv_lora_rank > ink_gpu.MAX_HY4_KV_LORA_RANK) return error.InvalidConfig;
+                if ((self.qk_rope_head_dim % 2) != 0 or self.qk_rope_head_dim > 256) return error.InvalidConfig;
+            }
+            try self.axes.loop_schedule.validate(self.num_hidden_layers);
+            return;
+        }
         if (self.axes.layer_attention_kinds.len != self.num_hidden_layers) return error.InvalidConfig;
         if (self.axes.backbone_kind == .causal_enc_dec) {
             if (self.num_encoder_layers == 0 or self.num_decoder_layers == 0) return error.InvalidConfig;
@@ -591,6 +619,7 @@ pub const GraphConfig = struct {
     /// `Step-LoRA`, hybrid GDN/QSA/MLA-CSA2, 4-branch GR, Mega-mHC, PLE/Engram,
     /// or `max_loops > 1`).
     pub fn isGraphConfigJson(json_bytes: []const u8) bool {
+        if (m82_rt.M82Config.isM82ConfigJson(json_bytes)) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"qwen4_exp\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"deepseek41\"") != null) return true;
         if (std.mem.indexOf(u8, json_bytes, "\"causal_enc_dec\"") != null) return true;
@@ -629,19 +658,27 @@ pub const GraphConfig = struct {
             if (num_attn_heads > 0) (hidden_size / num_attn_heads) else 0;
 
         const model_type = jsonStr(obj, "model_type") orelse jsonStr(root, "model_type") orelse "";
+        const m82_family = m82_rt.M82Config.detectFamily(root, obj);
         const is_qwen4 = std.mem.eql(u8, model_type, "qwen4_exp");
         const is_deepseek41 = std.mem.eql(u8, model_type, "deepseek41");
         const is_looplm = std.mem.eql(u8, model_type, "looplm") or
             std.mem.eql(u8, model_type, "huginn") or
             std.mem.eql(u8, model_type, "ouro");
+        const raw_num_experts: u32 = jsonU32(obj, "num_experts") orelse jsonU32(obj, "n_routed_experts") orelse 0;
+        var m82_cfg = if (m82_family != .none)
+            try m82_rt.M82Config.parseFromJson(allocator, m82_family, root, obj, num_layers, raw_num_experts)
+        else
+            m82_rt.M82Config{};
+        errdefer m82_cfg.deinit(allocator);
 
         var backbone_kind: BackboneKind = if (is_deepseek41) .causal_enc_dec else .decoder_only;
         if (jsonStr(obj, "backbone_kind") orelse jsonStr(root, "backbone_kind")) |s| {
             backbone_kind = BackboneKind.parse(s) catch return error.UnsupportedOperatorAxis;
         }
-        var ffn_kind: FfnKind = if ((jsonU32(obj, "num_experts") orelse 0) > 0) .moe_swiglu else .dense_swiglu;
+        var ffn_kind: FfnKind = if (raw_num_experts > 0) .moe_swiglu else .dense_swiglu;
         var has_shared_expert: bool = jsonBool(obj, "has_shared_expert") orelse
-            ((jsonU32(obj, "shared_expert_intermediate_size") orelse 0) > 0);
+            ((jsonU32(obj, "shared_expert_intermediate_size") orelse 0) > 0) or
+            ((jsonU32(obj, "n_shared_experts") orelse 0) > 0);
         const mhc_num_streams: u32 = jsonU32(obj, "mhc_num_streams") orelse hybrid.DEFAULT_MHC_STREAMS;
         var residual_branches: u32 = jsonU32(obj, "residual_branches") orelse
             (if (is_deepseek41) mhc_num_streams else if (is_qwen4) @as(u32, 4) else 1);
@@ -676,40 +713,44 @@ pub const GraphConfig = struct {
                 .gqa_full;
         }
 
-        // Override from `layer_types` if provided.
-        if (obj.get("layer_types") orelse root.get("layer_types")) |lt_val| {
-            if (lt_val == .array and lt_val.array.items.len == num_layers) {
-                for (lt_val.array.items, 0..) |item, l| {
-                    if (item == .string) {
-                        layer_attns[l] = AttentionKind.parse(item.string) catch return error.UnsupportedOperatorAxis;
+        // Override from `layer_types` if provided (skip M8.2 custom strings handled by `M82Config`).
+        if (m82_family == .none) {
+            if (obj.get("layer_types") orelse root.get("layer_types")) |lt_val| {
+                if (lt_val == .array and lt_val.array.items.len == num_layers) {
+                    for (lt_val.array.items, 0..) |item, l| {
+                        if (item == .string) {
+                            layer_attns[l] = AttentionKind.parse(item.string) catch return error.UnsupportedOperatorAxis;
+                        }
                     }
                 }
             }
         }
 
-        // Override from canonical `operator_axes` if present.
-        if (obj.get("operator_axes") orelse root.get("operator_axes")) |oa_val| {
-            if (oa_val == .object) {
-                const oa = oa_val.object;
-                if (jsonStr(oa, "backbone_kind")) |s| {
-                    backbone_kind = BackboneKind.parse(s) catch return error.UnsupportedOperatorAxis;
-                }
-                if (jsonStr(oa, "ffn_kind")) |s| {
-                    ffn_kind = FfnKind.parse(s) catch return error.UnsupportedOperatorAxis;
-                }
-                if (jsonBool(oa, "has_shared_expert")) |b| has_shared_expert = b;
-                if (jsonStr(oa, "residual_kind")) |s| {
-                    residual_kind = ResidualKind.parse(s) catch return error.UnsupportedOperatorAxis;
-                }
-                if (jsonU32(oa, "residual_branches")) |rb| residual_branches = rb;
-                if (jsonStr(oa, "memory_lookup_kind")) |s| {
-                    mem_kind = MemoryLookupKind.parse(s) catch return error.UnsupportedOperatorAxis;
-                }
-                if (oa.get("layer_attention_kinds")) |lak| {
-                    if (lak == .array and lak.array.items.len == num_layers) {
-                        for (lak.array.items, 0..) |item, l| {
-                            if (item == .string) {
-                                layer_attns[l] = AttentionKind.parse(item.string) catch return error.UnsupportedOperatorAxis;
+        // Override from canonical `operator_axes` if present (non-M8.2).
+        if (m82_family == .none) {
+            if (obj.get("operator_axes") orelse root.get("operator_axes")) |oa_val| {
+                if (oa_val == .object) {
+                    const oa = oa_val.object;
+                    if (jsonStr(oa, "backbone_kind")) |s| {
+                        backbone_kind = BackboneKind.parse(s) catch return error.UnsupportedOperatorAxis;
+                    }
+                    if (jsonStr(oa, "ffn_kind")) |s| {
+                        ffn_kind = FfnKind.parse(s) catch return error.UnsupportedOperatorAxis;
+                    }
+                    if (jsonBool(oa, "has_shared_expert")) |b| has_shared_expert = b;
+                    if (jsonStr(oa, "residual_kind")) |s| {
+                        residual_kind = ResidualKind.parse(s) catch return error.UnsupportedOperatorAxis;
+                    }
+                    if (jsonU32(oa, "residual_branches")) |rb| residual_branches = rb;
+                    if (jsonStr(oa, "memory_lookup_kind")) |s| {
+                        mem_kind = MemoryLookupKind.parse(s) catch return error.UnsupportedOperatorAxis;
+                    }
+                    if (oa.get("layer_attention_kinds")) |lak| {
+                        if (lak == .array and lak.array.items.len == num_layers) {
+                            for (lak.array.items, 0..) |item, l| {
+                                if (item == .string) {
+                                    layer_attns[l] = AttentionKind.parse(item.string) catch return error.UnsupportedOperatorAxis;
+                                }
                             }
                         }
                     }
@@ -793,15 +834,18 @@ pub const GraphConfig = struct {
             .end_layer = num_layers,
             .max_loops = 1,
         };
-        if (obj.get("loop_schedule") orelse root.get("loop_schedule")) |ls_val| {
+        if (obj.get("loop_schedule") orelse root.get("loop_schedule") orelse obj.get("loop_config")) |ls_val| {
             if (ls_val == .object) {
                 const lo = ls_val.object;
                 if (jsonStr(lo, "mode")) |s| {
                     ls.mode = LoopMode.parse(s) catch return error.InvalidConfig;
                 }
-                ls.start_layer = jsonU32(lo, "start_layer") orelse 0;
-                ls.end_layer = jsonU32(lo, "end_layer") orelse num_layers;
-                ls.max_loops = jsonU32(lo, "max_loops") orelse 1;
+                ls.start_layer = jsonU32(lo, "start_layer") orelse jsonU32(lo, "core_start") orelse 0;
+                ls.end_layer = jsonU32(lo, "end_layer") orelse jsonU32(lo, "core_end") orelse num_layers;
+                ls.max_loops = jsonU32(lo, "max_loops") orelse jsonU32(lo, "num_passes") orelse 1;
+                if (ls.max_loops > 1 and ls.mode == .single_pass) {
+                    ls.mode = .native_recurrent;
+                }
                 ls.inject_x_init = jsonBool(lo, "inject_x_init") orelse false;
                 if (jsonStr(lo, "adapter_kind")) |s| {
                     ls.adapter_kind = LoopAdapterKind.parse(s) catch return error.InvalidConfig;
@@ -995,14 +1039,21 @@ pub const GraphConfig = struct {
             .num_key_value_heads = num_kv_heads,
             .head_dim = head_dim,
             .intermediate_size = jsonU32(obj, "intermediate_size") orelse 0,
-            .moe_intermediate_size = jsonU32(obj, "moe_intermediate_size") orelse 0,
+            .moe_intermediate_size = jsonU32(obj, "moe_intermediate_size") orelse (if (m82_family.isInkling2()) (jsonU32(obj, "intermediate_size") orelse 0) else 0),
             .shared_expert_intermediate_size = jsonU32(obj, "shared_expert_intermediate_size") orelse 0,
-            .num_experts = jsonU32(obj, "num_experts") orelse 0,
+            .num_experts = raw_num_experts,
             .num_experts_per_tok = raw_top_k,
             .norm_topk_prob = jsonBool(obj, "norm_topk_prob") orelse true,
             .rms_norm_eps = jsonF32(obj, "rms_norm_eps") orelse 1e-6,
-            .rope_theta = jsonF32(obj, "rope_theta") orelse 1_000_000.0,
-            .max_position_embeddings = jsonU32(obj, "max_position_embeddings") orelse 32768,
+            .rope_theta = jsonF32(obj, "rope_theta") orelse blk_rt: {
+                if (obj.get("rope_parameters")) |rp| {
+                    if (rp == .object) {
+                        if (jsonF32(rp.object, "rope_theta")) |v| break :blk_rt v;
+                    }
+                }
+                break :blk_rt 1_000_000.0;
+            },
+            .max_position_embeddings = jsonU32(obj, "max_position_embeddings") orelse jsonU32(obj, "model_max_length") orelse 32768,
             .tie_word_embeddings = jsonBool(obj, "tie_word_embeddings") orelse false,
             .bos_token_id = jsonU32(obj, "bos_token_id") orelse jsonU32(root, "bos_token_id") orelse 151643,
             .eos_token_id = jsonU32(obj, "eos_token_id") orelse jsonU32(root, "eos_token_id") orelse 151645,
@@ -1050,6 +1101,8 @@ pub const GraphConfig = struct {
             .dspark_block_width = dspark_block_width,
             .dspark_top_k_per_pos = dspark_top_k_per_pos,
             .dspark_max_tree_nodes = dspark_max_tree_nodes,
+            .m82_family = m82_family,
+            .m82_cfg = m82_cfg,
         };
         try cfg.validate();
         return cfg;
@@ -1250,7 +1303,8 @@ pub const GraphLoadError = error{
     arena_mod.WiredArena.InitError || arena_mod.WiredArena.AllocError || hybrid.ArenaError || hybrid.HybridKvRing.InitError ||
     attention.RetiredKvQ8PoolError ||
     moe.WorkspaceError || ple_mod.Error || sme.WiredScratchError || vision_mod.Error ||
-    cache_mod.PoolError || cache_mod.CacheError || aio.EcorePoolError;
+    cache_mod.PoolError || cache_mod.CacheError || aio.EcorePoolError ||
+    ink_gpu.EncodeError || ink_gpu.ArenaError || ink_ctrl.Error;
 
 pub const GraphStepError = error{
     SequenceFull,
@@ -1260,16 +1314,19 @@ pub const GraphStepError = error{
     InvalidBatchSize,
     InvalidLoopStep,
     Overflow,
+    InvalidArgument,
+    IoFailed,
 } || metal.Error || dequant.EncodeError || moe.EncodeError ||
     hybrid.EncodeError || hybrid.ArenaError || ple_mod.Error ||
     attention.RetiredKvQ8PoolError || expert_parallel.ClusterError ||
-    sme.Error || cache_mod.CacheError || accept_mod.VerifyError;
+    sme.Error || cache_mod.CacheError || accept_mod.VerifyError ||
+    ink_gpu.EncodeError || ink_gpu.ArenaError;
 
 // ===========================================================================
 // Section 4: Internal Layer & Runtime Structures
 // ===========================================================================
 
-const WeightShard = struct {
+pub const WeightShard = struct {
     arena: arena_mod.WiredArena,
     buffer: metal.Buffer,
 };
@@ -1524,7 +1581,7 @@ const GraphLayerWeights = struct {
     shared_gate_dtype: moe.RouterWeightDType = .bf16,
 };
 
-const PleRuntime = struct {
+pub const PleRuntime = struct {
     store: ple_mod.PleStore,
     scratch: ple_mod.LoopPleScratch,
     f32_tmp: []f32,
@@ -1803,6 +1860,17 @@ pub const GraphModel = struct {
     embed_dequant_f32: ?[]f32 = null,
     chat_template: ?chat_template_mod.ChatTemplate = null,
 
+    // M8.2 (`Inkling 2` & `Hy4`) unified runtime (`G25`, `C26`, `D14`)
+    m82: ?*m82_rt.M82Runtime = null,
+
+    pub fn m82Runtime(self: *const GraphModel) ?*m82_rt.M82Runtime {
+        return self.m82;
+    }
+
+    pub fn m82Stats(self: *const GraphModel) ?m82_rt.M82Stats {
+        return if (self.m82) |rt| rt.stats else null;
+    }
+
     pub fn hasVisionTower(self: *const GraphModel) bool {
         return self.vision_state.runtime.isActive();
     }
@@ -1831,25 +1899,25 @@ pub const GraphModel = struct {
     // Loading & Teardown
     // -----------------------------------------------------------------------
 
-    const AmfSource = union(enum) {
+    pub const AmfSource = union(enum) {
         bytes: struct { parsed: *const amf.Parsed, raw: []const u8 },
         file: struct { file: *amf.AmfFile, path: [:0]const u8 },
 
-        fn entries(self: AmfSource) []const amf.TensorEntry {
+        pub fn entries(self: AmfSource) []const amf.TensorEntry {
             return switch (self) {
                 .bytes => |b| b.parsed.entries,
                 .file => |f| f.file.parsed.entries,
             };
         }
 
-        fn find(self: AmfSource, name: []const u8) ?*const amf.TensorEntry {
+        pub fn find(self: AmfSource, name: []const u8) ?*const amf.TensorEntry {
             return switch (self) {
                 .bytes => |b| b.parsed.find(name),
                 .file => |f| f.file.parsed.find(name),
             };
         }
 
-        fn loadIntoArena(self: AmfSource, entry: *const amf.TensorEntry, arena: *arena_mod.WiredArena) (amf.ParseError || amf.IoError || arena_mod.WiredArena.AllocError)![]align(page.APPLE_PAGE_SIZE) u8 {
+        pub fn loadIntoArena(self: AmfSource, entry: *const amf.TensorEntry, arena: *arena_mod.WiredArena) (amf.ParseError || amf.IoError || arena_mod.WiredArena.AllocError)![]align(page.APPLE_PAGE_SIZE) u8 {
             return switch (self) {
                 .bytes => |b| b.parsed.loadBlobFromBytes(b.raw, entry, arena),
                 .file => |f| f.file.loadBlob(entry, arena),
@@ -1880,6 +1948,10 @@ pub const GraphModel = struct {
     }
 
     pub fn deinit(self: *GraphModel, allocator: std.mem.Allocator) void {
+        if (self.m82) |rt| {
+            rt.deinit(allocator, self.compute);
+            self.m82 = null;
+        }
         self.vision_state.deinit(allocator, self.compute);
         if (self.adapter_rt) |art| {
             art.deinit(allocator);
@@ -1967,6 +2039,7 @@ pub const GraphModel = struct {
     }
 
     pub fn resetKvCache(self: *GraphModel) void {
+        if (self.m82) |rt| rt.resetKvCache();
         self.seq_len = 0;
         self.ced_encoder_prefix_len = 0;
         self.mrope_next_pos = 0;
@@ -2217,6 +2290,7 @@ pub const GraphModel = struct {
 
     /// Most recently accepted decoder top hidden state (`[hidden_size]` FP32) for `DSpark` (`D10`).
     pub fn lastDecoderHiddenF32(self: *const GraphModel) []const f32 {
+        if (self.m82) |rt| return rt.lastHiddenF32(0, self.config.hidden_size);
         return self.ced_last_decoder_hidden_host;
     }
 
@@ -2246,6 +2320,64 @@ pub const GraphModel = struct {
         try self.compute.wait(sig, self.timeout_ms);
         for (0..@as(usize, w) * v) |i| {
             out_logits[i] = @floatCast(self.logits_host[i]);
+        }
+    }
+
+    /// Reads one row of `embed_tokens` directly from wired weight memory into `out_f32`
+    /// with zero GPU dispatches and zero dynamic heap allocations (shared by `DFlare` / `DFly2`).
+    pub fn readTokenEmbedF32(
+        self: *const GraphModel,
+        token_id: u32,
+        out_f32: []f32,
+    ) GraphStepError!void {
+        const h: usize = self.config.hidden_size;
+        const v: usize = self.config.vocab_size;
+        if (token_id >= v or out_f32.len < h) return error.TokenOutOfRange;
+
+        var shard_bytes: ?[]const u8 = null;
+        for (self.weight_shards) |*ws| {
+            if (ws.buffer.handle == self.embed.weight.buffer.handle) {
+                shard_bytes = ws.arena.bytes();
+                break;
+            }
+        }
+        const bytes = shard_bytes orelse return error.InvalidBatchSize;
+        const base: usize = @intCast(self.embed.weight.offset);
+        const dt = self.embed.effectiveAmfDType();
+        switch (dt) {
+            .f32 => {
+                const row_off = base + @as(usize, token_id) * h * 4;
+                const row: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, bytes[row_off..][0 .. h * 4]));
+                @memcpy(out_f32[0..h], row);
+            },
+            .f16 => {
+                const row_off = base + @as(usize, token_id) * h * 2;
+                const row: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, bytes[row_off..][0 .. h * 2]));
+                for (row, 0..) |val, i| out_f32[i] = @floatCast(val);
+            },
+            .bf16 => {
+                const row_off = base + @as(usize, token_id) * h * 2;
+                const row: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, bytes[row_off..][0 .. h * 2]));
+                for (row, 0..) |bits, i| out_f32[i] = @bitCast(@as(u32, bits) << 16);
+            },
+            else => {
+                const qf_dt = quant_formats.DType.fromAmf(dt) orelse return error.UnsupportedDType;
+                const gs: u16 = if (self.embed.group_size > 0) self.embed.group_size else 64;
+                const params_slice: []const u8 = if (self.embed.scale_bias) |sb| blk: {
+                    const p_off: usize = @intCast(sb.offset);
+                    break :blk if (p_off < bytes.len) bytes[p_off..] else &.{};
+                } else &.{};
+                quant_formats.dequantRowCpuRef(
+                    qf_dt,
+                    gs,
+                    bytes[base..],
+                    params_slice,
+                    token_id,
+                    v,
+                    h,
+                    out_f32[0..h],
+                ) catch return error.UnsupportedDType;
+            },
         }
     }
 
@@ -2643,7 +2775,8 @@ pub const GraphModel = struct {
     }
 
     pub fn usesWideGpuPrefill(self: *const GraphModel) bool {
-        return self.gpu_prefill_mode == .wide and
+        return self.m82 == null and
+            self.gpu_prefill_mode == .wide and
             self.wide_prefill_max_tokens > 0 and
             self.supports_wide_prefill and
             self.cold_rt == null and
@@ -4361,6 +4494,17 @@ pub const GraphModel = struct {
         if (accepted_nodes.len == 0) return;
         if (accepted_nodes.len > self.max_tree_nodes) return error.TreeTooLarge;
         if (base_pos + accepted_nodes.len > self.max_seq_len) return error.SequenceFull;
+        if (self.m82) |rt| {
+            try rt.commitTreeKv(self, base_pos, accepted_nodes);
+            for (accepted_nodes, 0..) |nid, i| {
+                if (nid < self.last_verified_nodes) {
+                    self.token_history[base_pos + @as(u32, @intCast(i))] = self.last_verified_tokens[nid];
+                }
+            }
+            self.seq_len = base_pos + @as(u32, @intCast(accepted_nodes.len));
+            self.mrope_next_pos = self.seq_len;
+            return;
+        }
         try self.retireBeforeCommitRange(base_pos, @intCast(accepted_nodes.len));
 
         var frame = try self.compute.beginFrame(self.timeout_ms);
@@ -5223,6 +5367,22 @@ pub const GraphModel = struct {
         phase: ForwardPhase,
         kv_len_override: ?u32,
     ) GraphStepError!qwen3.VerifyTreeResult {
+        if (self.m82) |rt| {
+            return rt.forward(
+                self,
+                token_ids,
+                positions,
+                ancestor_masks,
+                base_pos,
+                num_loops,
+                compute_logits,
+                commit_state_on_final,
+                if (vis_override) |v| v.src_bind else null,
+                if (vis_override) |v| v.src_row_offset else 0,
+                if (vis_override) |v| v.local_start else 0,
+                if (vis_override) |v| v.count else 0,
+            );
+        }
         const m: u32 = @intCast(token_ids.len);
         const h: u32 = self.config.hidden_size;
         const ls = self.config.axes.loop_schedule;
@@ -8261,6 +8421,7 @@ pub const GraphModel = struct {
             if (kind == .metadata or kind == .sparse_table) continue;
             if (options.disable_vision_tower and isVisionAmfName(e.nameSlice())) continue;
             if (kind == .cold_expert) {
+                if (config.m82_family != .none) continue;
                 if (effective_cluster_plan) |plan| {
                     if (e.expert != amf.NO_EXPERT and !plan.isLocal(e.expert)) continue;
                 }
@@ -8556,22 +8717,24 @@ pub const GraphModel = struct {
         var num_mla_layers: u32 = 0;
         var num_mla_full_layers: u32 = 0;
         var num_mla_index_layers: u32 = 0;
-        for (config.axes.layer_attention_kinds, 0..) |ak, l_idx| {
-            switch (ak) {
-                .gated_deltanet => num_gdn_layers += 1,
-                .qsa_sparse => num_qsa_layers += 1,
-                .gqa_full => num_gqa_layers += 1,
-                .mla_csa2 => {
-                    num_mla_layers += 1;
-                    switch (config.csa2_modes[l_idx]) {
-                        .full => {
-                            num_mla_full_layers += 1;
-                            num_mla_index_layers += 1;
-                        },
-                        .reindex => num_mla_index_layers += 1,
-                        .reuse => {},
-                    }
-                },
+        if (config.m82_family == .none) {
+            for (config.axes.layer_attention_kinds, 0..) |ak, l_idx| {
+                switch (ak) {
+                    .gated_deltanet => num_gdn_layers += 1,
+                    .qsa_sparse => num_qsa_layers += 1,
+                    .gqa_full => num_gqa_layers += 1,
+                    .mla_csa2 => {
+                        num_mla_layers += 1;
+                        switch (config.csa2_modes[l_idx]) {
+                            .full => {
+                                num_mla_full_layers += 1;
+                                num_mla_index_layers += 1;
+                            },
+                            .reindex => num_mla_index_layers += 1,
+                            .reuse => {},
+                        }
+                    },
+                }
             }
         }
         const num_chunks: u32 = (options.max_seq_len + options.chunk_tokens - 1) / options.chunk_tokens;
@@ -9517,7 +9680,7 @@ pub const GraphModel = struct {
             allocator.free(gqa_kv_tiles);
         }
 
-        const layers = try allocator.alloc(GraphLayerWeights, config.num_hidden_layers);
+        const layers = try allocator.alloc(GraphLayerWeights, if (config.m82_family != .none) 0 else config.num_hidden_layers);
         var layers_built: usize = 0;
         errdefer {
             for (0..layers_built) |li| {
@@ -9552,7 +9715,35 @@ pub const GraphModel = struct {
         var total_layers_non_expert_bytes: u64 = 0;
         var total_layers_static_bytes: u64 = 0;
 
-        for (0..config.num_hidden_layers) |l| {
+        var m82_runtime: ?*m82_rt.M82Runtime = null;
+        errdefer if (m82_runtime) |rt| rt.deinit(allocator, compute);
+        if (config.m82_family != .none) {
+            const amf_path_opt: ?[:0]const u8 = switch (source) {
+                .file => |f| f.path,
+                .bytes => null,
+            };
+            m82_runtime = try m82_rt.M82Runtime.load(allocator, .{
+                .source = &source,
+                .amf_path = amf_path_opt,
+                .config = &config,
+                .device = device,
+                .library = library,
+                .compute = compute,
+                .weight_shards = weight_shards,
+                .entry_shard = entry_shard,
+                .entry_offsets = entry_offsets,
+                .entry_slices = entry_slices,
+                .entry_base_ptr = entry_base_ptr,
+                .max_seq_len = options.max_seq_len,
+                .max_tree_nodes = max_m,
+                .chunk_tokens = options.chunk_tokens,
+                .wired_budget = wired_budget,
+                .cold_slot_count = options.cold_slot_count,
+            });
+            total_wired_bytes += m82_runtime.?.totalWiredBytes();
+        }
+
+        for (0..layers.len) |l| {
             const in_ln_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.input_layernorm.weight", .{l}) catch unreachable;
             const in_ln = try bindNorm(source, weight_shards, entry_shard, entry_offsets, entry_slices, entry_base_ptr, in_ln_nm, h);
             const post_ln_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.post_attention_layernorm.weight", .{l}) catch unreachable;
@@ -10325,15 +10516,17 @@ pub const GraphModel = struct {
         if (options.ple_paths.len > 0) {
             const prt = try allocator.create(PleRuntime);
             errdefer allocator.destroy(prt);
+            const use_hy4_engram = config.m82_family.isHy4();
             var store = try ple_mod.PleStore.open(allocator, options.ple_paths, .{
-                .table_kind = if (config.axes.memory_lookup_kind == .engram) .engram_conditional else null,
+                .table_kind = if (use_hy4_engram) .ple_ngram else if (config.axes.memory_lookup_kind == .engram) .engram_conditional else null,
                 .cache = .{
                     .cache_pages = eff_ple_cache_pages,
                     .budget_override = wired_budget,
                 },
             });
             errdefer store.deinit(allocator);
-            var ple_scratch = if (config.axes.memory_lookup_kind == .engram)
+            const ple_dim: u32 = if (use_hy4_engram) @max(h, store.embed_dim) else h;
+            var ple_scratch = if (!use_hy4_engram and config.axes.memory_lookup_kind == .engram)
                 try ple_mod.LoopPleScratch.initEngram(
                     allocator,
                     @intCast(config.num_hidden_layers),
@@ -10347,11 +10540,11 @@ pub const GraphModel = struct {
                     allocator,
                     @intCast(config.num_hidden_layers),
                     @intCast(ple_max_m),
-                    h,
+                    ple_dim,
                     wired_budget,
                 );
             errdefer ple_scratch.deinit(allocator);
-            const f32_tmp = try allocator.alloc(f32, @as(usize, ple_max_m) * h);
+            const f32_tmp = try allocator.alloc(f32, @as(usize, ple_max_m) * ple_dim);
             errdefer allocator.free(f32_tmp);
             total_wired_bytes += store.totalWiredBytes() + ple_scratch.totalWiredBytes();
             prt.* = .{ .store = store, .scratch = ple_scratch, .f32_tmp = f32_tmp };
@@ -10645,6 +10838,7 @@ pub const GraphModel = struct {
             .act_quant_bytes = act_quant_bytes,
             .embed_dequant_f32 = embed_dequant_f32,
             .chat_template = loaded_chat_template,
+            .m82 = m82_runtime,
         };
     }
 };
@@ -14331,9 +14525,11 @@ fn inferVisionConfigFromEntries(
 
     var pe0_buf: [128]u8 = undefined;
     var pe1_buf: [128]u8 = undefined;
+    var pe2_buf: [128]u8 = undefined;
     const pe_stems = [_][]const u8{
         std.fmt.bufPrint(&pe0_buf, "{s}patch_embed.proj", .{pfx}) catch unreachable,
         std.fmt.bufPrint(&pe1_buf, "{s}patch_embed", .{pfx}) catch unreachable,
+        std.fmt.bufPrint(&pe2_buf, "{s}embed.patch_embedding", .{pfx}) catch unreachable,
     };
     const pe = (findVisionStemFirst(vsrc, &pe_stems) orelse return error.MissingTensor).entry;
     var t_patch: u32 = 1;
@@ -14364,9 +14560,11 @@ fn inferVisionConfigFromEntries(
         "visual.merger.linear_fc1",
         "visual.merger.fc1",
         "visual.merger.w1",
+        "visual.proj_in",
         "vision.merger.linear_fc1",
         "vision.merger.fc1",
         "vision.merger.w1",
+        "vision.merger.proj.0",
         "aligner.linear_fc1",
         "aligner.fc1",
         "aligner.w1",
@@ -14499,9 +14697,11 @@ fn bindVisionWeights(
 
     var pe0_b: [128]u8 = undefined;
     var pe1_b: [128]u8 = undefined;
+    var pe2_b: [128]u8 = undefined;
     const pe_stems = [_][]const u8{
         std.fmt.bufPrint(&pe0_b, "{s}patch_embed.proj", .{pfx}) catch unreachable,
         std.fmt.bufPrint(&pe1_b, "{s}patch_embed", .{pfx}) catch unreachable,
+        std.fmt.bufPrint(&pe2_b, "{s}embed.patch_embedding", .{pfx}) catch unreachable,
     };
     const pe_found = findVisionStemFirst(res.vsrc, &pe_stems) orelse return error.MissingTensor;
     const expected_in_dim = 3 * cfg.t_patch * cfg.patch_size * cfg.patch_size;
@@ -14544,7 +14744,21 @@ fn bindVisionWeights(
             std.fmt.bufPrint(&b0, "{s}blocks.{d}.attn.qkv", .{ pfx, l }) catch unreachable,
             std.fmt.bufPrint(&b1, "{s}blocks.{d}.attn.wqkv", .{ pfx, l }) catch unreachable,
         };
-        const qkv = try res.bindLinear(&qkv_stems, 3 * vis_h, vis_h);
+        var qkv: vision_mod.VisionLinearWeight = undefined;
+        var q_proj_opt: ?vision_mod.VisionLinearWeight = null;
+        var k_proj_opt: ?vision_mod.VisionLinearWeight = null;
+        var v_proj_opt: ?vision_mod.VisionLinearWeight = null;
+        if (findVisionStemFirst(res.vsrc, &qkv_stems) != null) {
+            qkv = try res.bindLinear(&qkv_stems, 3 * vis_h, vis_h);
+        } else {
+            const q_s = [_][]const u8{std.fmt.bufPrint(&b0, "{s}blocks.{d}.attn.q_proj", .{ pfx, l }) catch unreachable};
+            const k_s = [_][]const u8{std.fmt.bufPrint(&b1, "{s}blocks.{d}.attn.k_proj", .{ pfx, l }) catch unreachable};
+            const v_s = [_][]const u8{std.fmt.bufPrint(&b2, "{s}blocks.{d}.attn.v_proj", .{ pfx, l }) catch unreachable};
+            q_proj_opt = try res.bindLinear(&q_s, vis_h, vis_h);
+            k_proj_opt = try res.bindLinear(&k_s, vis_h, vis_h);
+            v_proj_opt = try res.bindLinear(&v_s, vis_h, vis_h);
+            qkv = q_proj_opt.?;
+        }
 
         const proj_stems = [_][]const u8{
             std.fmt.bufPrint(&b0, "{s}blocks.{d}.attn.proj", .{ pfx, l }) catch unreachable,
@@ -14589,6 +14803,9 @@ fn bindVisionWeights(
         blocks[l] = .{
             .norm1 = norm1,
             .qkv = qkv,
+            .q_proj = q_proj_opt,
+            .k_proj = k_proj_opt,
+            .v_proj = v_proj_opt,
             .proj = proj,
             .norm2 = norm2,
             .mlp_fc1 = mlp_fc1,
@@ -14603,9 +14820,11 @@ fn bindVisionWeights(
         "visual.merger.linear_fc1",
         "visual.merger.fc1",
         "visual.merger.w1",
+        "visual.proj_in",
         "vision.merger.linear_fc1",
         "vision.merger.fc1",
         "vision.merger.w1",
+        "vision.merger.proj.0",
         "aligner.linear_fc1",
         "aligner.fc1",
         "aligner.w1",
@@ -14617,6 +14836,7 @@ fn bindVisionWeights(
         "visual.merger.linear_fc2",
         "visual.merger.fc2",
         "visual.merger.w2",
+        "visual.proj_out",
         "vision.merger.linear_fc2",
         "vision.merger.fc2",
         "vision.merger.w2",
@@ -14625,7 +14845,12 @@ fn bindVisionWeights(
         "aligner.w2",
         "multi_modal_projector.linear_2",
     };
-    const m_fc2 = try res.bindLinear(&m2_stems, cfg.lm_hidden, cfg.merger_hidden);
+    const m_fc2: ?vision_mod.VisionLinearWeight = if (findVisionStemFirst(res.vsrc, &m2_stems) != null)
+        try res.bindLinear(&m2_stems, cfg.lm_hidden, cfg.merger_hidden)
+    else if (cfg.merger_hidden == cfg.lm_hidden)
+        null
+    else
+        return error.MissingTensor;
 
     const mnorm_stems = [_][]const u8{
         "visual.merger.norm",

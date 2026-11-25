@@ -29,6 +29,7 @@ const tree_mod = @import("tree.zig");
 const accept_mod = @import("accept.zig");
 const draft_mod = @import("draft.zig");
 const dspark_mod = @import("dspark.zig");
+const dflare_dfly = @import("dflare_dfly.zig");
 const amf = @import("../format/amf.zig");
 const ngram_nvme = @import("ngram_nvme.zig");
 const rng_mod = @import("../runtime/rng.zig");
@@ -167,6 +168,14 @@ pub const SpecStats = struct {
     // D10 DSpark semi-autoregressive telemetry
     dspark_rounds: u64 = 0,
     dspark_inserted_nodes: u64 = 0,
+    // D14 DFlare & DFly2 speculative telemetry (`M8.2`)
+    dflare_rounds: u64 = 0,
+    dflare_inserted_nodes: u64 = 0,
+    dflare_core3_batches: u64 = 0,
+    dfly2_rounds: u64 = 0,
+    dfly2_inserted_nodes: u64 = 0,
+    dfly2_early_stops: u64 = 0,
+    dfly2_total_drafted_steps: u64 = 0,
 
     pub fn meanAcceptanceLength(self: *const SpecStats) f64 {
         if (self.rounds == 0) return 0.0;
@@ -227,7 +236,7 @@ pub const RunError = error{
     OutputBufferTooSmall,
     TokenOutOfRange,
     MissingRng,
-} || qwen3.StepError || graph.GraphStepError || draft_mod.DraftStepError || dspark_mod.Error || tree_mod.PruneError ||
+} || qwen3.StepError || graph.GraphStepError || draft_mod.DraftStepError || dspark_mod.Error || dflare_dfly.Error || tree_mod.PruneError ||
     accept_mod.VerifyError || accept_mod.ConstrainedVerifyError || gpu_sampler_mod.Error || ngram_nvme.RegistryQueryError;
 
 /// Startup-loaded `D10` `DSpark` proposer bundle backed by a `dspark.amf` weight
@@ -413,6 +422,218 @@ pub const LoadedDSparkProposer = struct {
         if (self.slot_norm) |p| allocator.free(p);
         allocator.free(self.slot_projs);
         allocator.free(self.slot_embed);
+        allocator.destroy(self);
+    }
+};
+
+/// Startup-loaded `D14` `DFlare` proposer bundle (`Inkling 2` `3L`/`5L` or `GGUF arch=dflash`)
+/// sharing the target `GraphModel`'s wired `embed_tokens` and GPU `lm_head` (`0` duplicate vocab RAM).
+pub const LoadedDFlareProposer = struct {
+    bundle: *dflare_dfly.LoadedDFlareBundle,
+
+    pub const LoadError = dflare_dfly.LoadedDFlareBundle.LoadError || error{InvalidConfig};
+
+    fn evalTargetLmHeadCb(
+        ctx: ?*anyopaque,
+        hiddens: []const f32,
+        batch_rows: u8,
+        hidden_size: u32,
+        vocab_size: u32,
+        out_logits: []f32,
+    ) dflare_dfly.Error!void {
+        const gm: *graph.GraphModel = @ptrCast(@alignCast(ctx orelse return error.InvalidWeights));
+        if (gm.config.hidden_size != hidden_size or gm.config.vocab_size != vocab_size) {
+            return error.DimensionMismatch;
+        }
+        gm.evalLmHeadBatchF32(hiddens, batch_rows, out_logits) catch return error.CallbackFailed;
+    }
+
+    fn readTargetTokEmbedCb(
+        ctx: ?*anyopaque,
+        token_id: u32,
+        out_f32: []f32,
+    ) dflare_dfly.Error!void {
+        const gm: *const graph.GraphModel = @ptrCast(@alignCast(ctx orelse return error.InvalidWeights));
+        gm.readTokenEmbedF32(token_id, out_f32) catch return error.TokenOutOfRange;
+    }
+
+    pub fn loadFromFile(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        amf_path: [:0]const u8,
+        config_json_bytes: ?[]const u8,
+        cfg_override: ?dflare_dfly.DFlareConfig,
+        budget_override: ?budget_mod.Budget,
+    ) LoadError!*LoadedDFlareProposer {
+        var amf_file = try amf.AmfFile.open(allocator, amf_path);
+        defer amf_file.close(allocator);
+
+        var owned_meta_cfg: ?[]u8 = null;
+        defer if (owned_meta_cfg) |b| allocator.free(b);
+        const cfg_bytes: ?[]const u8 = config_json_bytes orelse blk: {
+            if (amf_file.parsed.find("__meta.config_json")) |me| {
+                const raw = try allocator.alloc(u8, @intCast(me.data_bytes));
+                errdefer allocator.free(raw);
+                var done: usize = 0;
+                while (done < raw.len) {
+                    const rc = std.c.pread(amf_file.fd, raw.ptr + done, raw.len - done, @intCast(me.blob_offset + done));
+                    if (rc < 0) {
+                        if (std.c.errno(rc) == .INTR) continue;
+                        return error.ReadFailed;
+                    }
+                    if (rc == 0) return error.ShortRead;
+                    done += @intCast(rc);
+                }
+                owned_meta_cfg = raw;
+                break :blk raw;
+            }
+            break :blk null;
+        };
+
+        var cfg: dflare_dfly.DFlareConfig = if (cfg_override) |co|
+            co
+        else if (cfg_bytes) |jb|
+            try dflare_dfly.DFlareConfig.fromJson(allocator, jb, target.config.hidden_size, target.config.vocab_size)
+        else
+            dflare_dfly.DFlareConfig.miniDefault(
+                target.config.hidden_size,
+                target.config.hidden_size * 4,
+                target.config.num_attention_heads,
+                target.config.num_key_value_heads,
+                target.config.head_dim,
+                target.config.vocab_size,
+            );
+        cfg.vocab_size = target.config.vocab_size;
+        cfg.max_tree_nodes = @intCast(@min(@as(u32, cfg.max_tree_nodes), target.max_tree_nodes));
+        if (target.m82) |rt| {
+            if (rt.dflare_tap_count > 0 and rt.dflare_tap_count <= dflare_dfly.MAX_TARGET_TAPS) {
+                cfg.num_target_taps = @intCast(rt.dflare_tap_count);
+            }
+        }
+
+        const tok_hook: dflare_dfly.TokEmbedHook = .{ .callback = .{
+            .ctx = target,
+            .read_fn = readTargetTokEmbedCb,
+        } };
+        const lm_hook: dflare_dfly.LmHeadHook = .{ .callback = .{
+            .ctx = target,
+            .eval_fn = evalTargetLmHeadCb,
+        } };
+
+        const bundle = try dflare_dfly.LoadedDFlareBundle.loadFromAmfWithHooks(
+            allocator,
+            &amf_file,
+            cfg,
+            tok_hook,
+            lm_hook,
+            budget_override,
+        );
+        errdefer bundle.deinit(allocator);
+
+        const out = try allocator.create(LoadedDFlareProposer);
+        out.* = .{ .bundle = bundle };
+        return out;
+    }
+
+    pub fn proposer(self: *LoadedDFlareProposer) *dflare_dfly.DFlareProposer {
+        return &self.bundle.proposer;
+    }
+
+    pub fn deinit(self: *LoadedDFlareProposer, allocator: std.mem.Allocator) void {
+        self.bundle.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+/// Startup-loaded `D14` `DFly2` proposer bundle (`Hy4` `5L` / `1L` MLA + `confidence_head` early-stop)
+/// sharing the target `GraphModel`'s wired `embed_tokens` and GPU `lm_head`.
+pub const LoadedDFly2Proposer = struct {
+    bundle: *dflare_dfly.LoadedDFly2Bundle,
+
+    pub const LoadError = dflare_dfly.LoadedDFly2Bundle.LoadError || error{InvalidConfig};
+
+    pub fn loadFromFile(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        amf_path: [:0]const u8,
+        config_json_bytes: ?[]const u8,
+        cfg_override: ?dflare_dfly.DFly2Config,
+        confidence_threshold_override: ?f32,
+        budget_override: ?budget_mod.Budget,
+    ) LoadError!*LoadedDFly2Proposer {
+        var amf_file = try amf.AmfFile.open(allocator, amf_path);
+        defer amf_file.close(allocator);
+
+        var owned_meta_cfg: ?[]u8 = null;
+        defer if (owned_meta_cfg) |b| allocator.free(b);
+        const cfg_bytes: ?[]const u8 = config_json_bytes orelse blk: {
+            if (amf_file.parsed.find("__meta.config_json")) |me| {
+                const raw = try allocator.alloc(u8, @intCast(me.data_bytes));
+                errdefer allocator.free(raw);
+                var done: usize = 0;
+                while (done < raw.len) {
+                    const rc = std.c.pread(amf_file.fd, raw.ptr + done, raw.len - done, @intCast(me.blob_offset + done));
+                    if (rc < 0) {
+                        if (std.c.errno(rc) == .INTR) continue;
+                        return error.ReadFailed;
+                    }
+                    if (rc == 0) return error.ShortRead;
+                    done += @intCast(rc);
+                }
+                owned_meta_cfg = raw;
+                break :blk raw;
+            }
+            break :blk null;
+        };
+
+        var cfg: dflare_dfly.DFly2Config = if (cfg_override) |co|
+            co
+        else if (cfg_bytes) |jb|
+            try dflare_dfly.DFly2Config.fromJson(allocator, jb, target.config.hidden_size, target.config.vocab_size, target.max_seq_len)
+        else
+            .{
+                .hidden_size = target.config.hidden_size,
+                .intermediate_size = target.config.intermediate_size,
+                .num_attention_heads = target.config.num_attention_heads,
+                .num_key_value_heads = target.config.num_key_value_heads,
+                .head_dim = target.config.head_dim,
+                .vocab_size = target.config.vocab_size,
+                .max_target_kv_len = @max(target.max_seq_len, @as(u32, 64)),
+            };
+        cfg.vocab_size = target.config.vocab_size;
+        cfg.max_tree_nodes = @intCast(@min(@as(u32, cfg.max_tree_nodes), target.max_tree_nodes));
+        if (confidence_threshold_override) |ct| cfg.confidence_threshold = ct;
+
+        const tok_hook: dflare_dfly.TokEmbedHook = .{ .callback = .{
+            .ctx = target,
+            .read_fn = LoadedDFlareProposer.readTargetTokEmbedCb,
+        } };
+        const lm_hook: dflare_dfly.LmHeadHook = .{ .callback = .{
+            .ctx = target,
+            .eval_fn = LoadedDFlareProposer.evalTargetLmHeadCb,
+        } };
+
+        const bundle = try dflare_dfly.LoadedDFly2Bundle.loadFromAmfWithHooks(
+            allocator,
+            &amf_file,
+            cfg,
+            tok_hook,
+            lm_hook,
+            budget_override,
+        );
+        errdefer bundle.deinit(allocator);
+
+        const out = try allocator.create(LoadedDFly2Proposer);
+        out.* = .{ .bundle = bundle };
+        return out;
+    }
+
+    pub fn proposer(self: *LoadedDFly2Proposer) *dflare_dfly.DFly2Proposer {
+        return &self.bundle.proposer;
+    }
+
+    pub fn deinit(self: *LoadedDFly2Proposer, allocator: std.mem.Allocator) void {
+        self.bundle.deinit(allocator);
         allocator.destroy(self);
     }
 };
@@ -1249,6 +1470,8 @@ pub const SpecEngine = struct {
     draft_head: ?*draft_mod.DraftHead,
     small_draft: ?*draft_mod.SmallDraftModel,
     dspark_proposer: ?*dspark_mod.DSparkProposer,
+    dflare_proposer: ?*dflare_dfly.DFlareProposer = null,
+    dfly2_proposer: ?*dflare_dfly.DFly2Proposer = null,
     ngram_table: ?*ngram_nvme.NvmeNgramTable,
     ngram_registry: ?*ngram_nvme.DomainNgramRegistry,
     active_ngram_domain: ?[]const u8,
@@ -1329,7 +1552,7 @@ pub const SpecEngine = struct {
         draft_head: ?*draft_mod.DraftHead,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, .{ .qwen3 = target }, draft_head, null, null, config);
+        return initInternal(allocator, .{ .qwen3 = target }, draft_head, null, null, null, null, config);
     }
 
     /// Initializes `SpecEngine` backed by a composable `GraphModel` (`qwen4_exp`,
@@ -1341,7 +1564,7 @@ pub const SpecEngine = struct {
         draft_head: ?*draft_mod.DraftHead,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, .{ .graph = target }, draft_head, null, null, config);
+        return initInternal(allocator, .{ .graph = target }, draft_head, null, null, null, null, config);
     }
 
     /// Initializes `SpecEngine` backed by a `GraphModel` (`deepseek41` CED or decoder-only)
@@ -1352,7 +1575,29 @@ pub const SpecEngine = struct {
         proposer: *dspark_mod.DSparkProposer,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, .{ .graph = target }, null, null, proposer, config);
+        return initInternal(allocator, .{ .graph = target }, null, null, proposer, null, null, config);
+    }
+
+    /// Initializes `SpecEngine` backed by an `Inkling 2` `GraphModel` paired with
+    /// a `D14` `DFlareProposer` (`M = 8` batched `Core x 3` block/tree verification).
+    pub fn initWithDFlare(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        proposer: *dflare_dfly.DFlareProposer,
+        config: SpecConfig,
+    ) InitError!SpecEngine {
+        return initInternal(allocator, .{ .graph = target }, null, null, null, proposer, null, config);
+    }
+
+    /// Initializes `SpecEngine` backed by a `Hy4` `GraphModel` paired with a `D14`
+    /// `DFly2Proposer` (`block_size = 7` + `confidence_head` early-stop tree verification).
+    pub fn initWithDFly2(
+        allocator: std.mem.Allocator,
+        target: *graph.GraphModel,
+        proposer: *dflare_dfly.DFly2Proposer,
+        config: SpecConfig,
+    ) InitError!SpecEngine {
+        return initInternal(allocator, .{ .graph = target }, null, null, null, null, proposer, config);
     }
 
     /// Initializes `SpecEngine` paired with a standalone same-family small draft
@@ -1364,7 +1609,7 @@ pub const SpecEngine = struct {
         small_draft: *draft_mod.SmallDraftModel,
         config: SpecConfig,
     ) InitError!SpecEngine {
-        return initInternal(allocator, .{ .qwen3 = target }, null, small_draft, null, config);
+        return initInternal(allocator, .{ .qwen3 = target }, null, small_draft, null, null, null, config);
     }
 
     fn computeInitialPearlEnabled(
@@ -1387,6 +1632,8 @@ pub const SpecEngine = struct {
         draft_head: ?*draft_mod.DraftHead,
         small_draft: ?*draft_mod.SmallDraftModel,
         dspark_proposer: ?*dspark_mod.DSparkProposer,
+        dflare_proposer: ?*dflare_dfly.DFlareProposer,
+        dfly2_proposer: ?*dflare_dfly.DFly2Proposer,
         config: SpecConfig,
     ) InitError!SpecEngine {
         if (target.maxTreeNodes() <= 1) return error.TreeNotEnabled;
@@ -1403,21 +1650,31 @@ pub const SpecEngine = struct {
             .l1_only => {},
             .self_recurrent => {
                 if (target != .graph) return error.DraftModeMismatch;
-                if (draft_head != null or small_draft != null or dspark_proposer != null) return error.DraftModeMismatch;
+                if (draft_head != null or small_draft != null or dspark_proposer != null or dflare_proposer != null or dfly2_proposer != null) return error.DraftModeMismatch;
             },
             .dspark => {
                 if (target != .graph) return error.DraftModeMismatch;
                 if (dspark_proposer == null) return error.DraftHeadRequired;
-                if (draft_head != null or small_draft != null) return error.DraftModeMismatch;
+                if (draft_head != null or small_draft != null or dflare_proposer != null or dfly2_proposer != null) return error.DraftModeMismatch;
+            },
+            .dflare => {
+                if (target != .graph) return error.DraftModeMismatch;
+                if (dflare_proposer == null) return error.DraftHeadRequired;
+                if (draft_head != null or small_draft != null or dspark_proposer != null or dfly2_proposer != null) return error.DraftModeMismatch;
+            },
+            .dfly2 => {
+                if (target != .graph) return error.DraftModeMismatch;
+                if (dfly2_proposer == null) return error.DraftHeadRequired;
+                if (draft_head != null or small_draft != null or dspark_proposer != null or dflare_proposer != null) return error.DraftModeMismatch;
             },
             .small_draft => {
                 if (target != .qwen3) return error.DraftModeMismatch;
                 if (small_draft == null) return error.DraftHeadRequired;
-                if (draft_head != null or dspark_proposer != null) return error.DraftModeMismatch;
+                if (draft_head != null or dspark_proposer != null or dflare_proposer != null or dfly2_proposer != null) return error.DraftModeMismatch;
             },
             .eagle3, .eagle2, .mtp => {
                 const dh = draft_head orelse return error.DraftHeadRequired;
-                if (small_draft != null or dspark_proposer != null) return error.DraftModeMismatch;
+                if (small_draft != null or dspark_proposer != null or dflare_proposer != null or dfly2_proposer != null) return error.DraftModeMismatch;
                 if (dh.config.format != config.mode) return error.DraftModeMismatch;
                 if (!target.enableFeatureTaps()) return error.FeatureTapsRequired;
             },
@@ -1435,6 +1692,10 @@ pub const SpecEngine = struct {
             sd.totalWiredBytes()
         else if (dspark_proposer) |dp|
             dp.workspace.totalWiredBytes()
+        else if (dflare_proposer) |dfp|
+            dfp.workspace.totalWiredBytes()
+        else if (dfly2_proposer) |df2|
+            df2.workspace.totalWiredBytes()
         else
             0;
         const existing_wired: u64 = target.totalWiredBytes() + draft_wired;
@@ -1561,6 +1822,8 @@ pub const SpecEngine = struct {
             .draft_head = draft_head,
             .small_draft = small_draft,
             .dspark_proposer = dspark_proposer,
+            .dflare_proposer = dflare_proposer,
+            .dfly2_proposer = dfly2_proposer,
             .ngram_table = config.ngram_table,
             .ngram_registry = config.ngram_registry,
             .active_ngram_domain = null,
@@ -1745,6 +2008,10 @@ pub const SpecEngine = struct {
             sd.totalWiredBytes()
         else if (self.dspark_proposer) |dp|
             dp.workspace.totalWiredBytes()
+        else if (self.dflare_proposer) |dfp|
+            dfp.workspace.totalWiredBytes()
+        else if (self.dfly2_proposer) |df2|
+            df2.workspace.totalWiredBytes()
         else
             0;
         const ngram_bytes: u64 = (if (self.ngram_table) |nt| nt.totalWiredBytes() else 0) +
@@ -1775,7 +2042,7 @@ pub const SpecEngine = struct {
         return switch (dh.config.format) {
             .eagle3 => self.target.acceptedAuxBind(),
             .eagle2, .mtp => self.target.acceptedTopBind(),
-            .l1_only, .small_draft, .self_recurrent, .dspark => unreachable,
+            .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
         };
     }
 
@@ -2609,6 +2876,88 @@ pub const SpecEngine = struct {
                         self.stats.dspark_rounds += 1;
                         self.stats.dspark_inserted_nodes += pr.dspark_inserted;
                         // Respect remaining sequence/output budget depth & node cap cleanly.
+                        if (self.draft_tree.count > candidate_cap or pr.max_depth > max_allowed_depth) {
+                            self.eval_tree.copyTruncatedFrom(&self.draft_tree, max_allowed_depth, candidate_cap);
+                            self.draft_tree = self.eval_tree;
+                        }
+                        if (grammar_active) self.syncTreeGrammarStates();
+                    }
+                }
+            } else if (self.config.mode == .dflare) {
+                if (self.dflare_proposer) |dfp| {
+                    if (max_allowed_depth >= 1 and candidate_cap > 1) {
+                        const g = self.target.graph;
+                        var tap_buf: [dflare_dfly.MAX_TARGET_TAPS][]const f32 = undefined;
+                        const need_taps: usize = dfp.config.num_target_taps;
+                        const raw_taps: []const []const f32 = if (g.m82) |rt| rt.dflareTargetTaps() else &.{};
+                        const fallback_h = g.lastDecoderHiddenF32();
+                        for (0..need_taps) |ti| {
+                            tap_buf[ti] = if (ti < raw_taps.len and raw_taps[ti].len == dfp.config.hidden_size)
+                                raw_taps[ti]
+                            else
+                                fallback_h;
+                        }
+                        var df_state = self.grammar_state.snapshot();
+                        const pr = if (grammar_active)
+                            try dfp.proposeIntoConstrained(
+                                MAX_TREE_NODES,
+                                self.last_token,
+                                tap_buf[0..need_taps],
+                                &self.sam,
+                                self.makeGrammarAdapter(&df_state),
+                                &self.draft_tree,
+                            )
+                        else
+                            try dfp.proposeInto(
+                                MAX_TREE_NODES,
+                                self.last_token,
+                                tap_buf[0..need_taps],
+                                &self.sam,
+                                &self.draft_tree,
+                            );
+                        self.stats.dflare_rounds += 1;
+                        self.stats.dflare_inserted_nodes += self.draft_tree.count -| 1;
+                        if (g.config.m82_family == .inkling2_loop) {
+                            self.stats.dflare_core3_batches += 1;
+                        }
+                        if (self.draft_tree.count > candidate_cap or pr.max_depth > max_allowed_depth) {
+                            self.eval_tree.copyTruncatedFrom(&self.draft_tree, max_allowed_depth, candidate_cap);
+                            self.draft_tree = self.eval_tree;
+                        }
+                        if (grammar_active) self.syncTreeGrammarStates();
+                    }
+                }
+            } else if (self.config.mode == .dfly2) {
+                if (self.dfly2_proposer) |df2| {
+                    if (max_allowed_depth >= 1 and candidate_cap > 1) {
+                        const g = self.target.graph;
+                        const kv_views: []const dflare_dfly.TargetKvLayerView = if (g.m82) |rt| rt.dflyTargetKvViews() else &.{};
+                        var df2_state = self.grammar_state.snapshot();
+                        const pr = if (grammar_active)
+                            try df2.proposeIntoConstrained(
+                                MAX_TREE_NODES,
+                                self.last_token,
+                                g.lastDecoderHiddenF32(),
+                                kv_views,
+                                &self.sam,
+                                self.makeGrammarAdapter(&df2_state),
+                                &self.draft_tree,
+                            )
+                        else
+                            try df2.proposeInto(
+                                MAX_TREE_NODES,
+                                self.last_token,
+                                g.lastDecoderHiddenF32(),
+                                kv_views,
+                                &self.sam,
+                                &self.draft_tree,
+                            );
+                        self.stats.dfly2_rounds += 1;
+                        self.stats.dfly2_inserted_nodes += self.draft_tree.count -| 1;
+                        self.stats.dfly2_total_drafted_steps += pr.active_steps;
+                        if (pr.truncated_tail_steps > 0) {
+                            self.stats.dfly2_early_stops += 1;
+                        }
                         if (self.draft_tree.count > candidate_cap or pr.max_depth > max_allowed_depth) {
                             self.eval_tree.copyTruncatedFrom(&self.draft_tree, max_allowed_depth, candidate_cap);
                             self.draft_tree = self.eval_tree;

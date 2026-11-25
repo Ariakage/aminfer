@@ -516,6 +516,36 @@ class TestAminferPythonSdk(unittest.TestCase):
             eff_out = engine.generate([1, 2, 3], GenerationConfig(max_tokens=2, ignore_eos=True, reasoning_effort=0.7))
             self.assertEqual(eff_out.generated_tokens, 2)
 
+    def test_07_speculative_configuration_and_l1_exact_parity(self) -> None:
+        from aminfer import DraftMode
+
+        with Engine(self.amf_path, max_seq_len=64, startup_canary=False) as engine:
+            self.assertEqual(engine.spec_stats.active_draft_mode, DraftMode.NONE)
+            base_out = engine.generate(
+                [1, 2, 3, 1, 2, 3],
+                GenerationConfig(max_tokens=8, temperature=0.0, ignore_eos=True),
+            )
+
+            with self.assertRaises(InvalidArgumentError):
+                engine.configure_speculative("bogus_mode")
+            with self.assertRaises(InvalidArgumentError):
+                engine.configure_speculative("l1", confidence_threshold=1.5)
+
+            engine.configure_speculative("auto")
+            self.assertEqual(engine.spec_stats.active_draft_mode, DraftMode.L1)
+            spec_out = engine.generate(
+                [1, 2, 3, 1, 2, 3],
+                GenerationConfig(max_tokens=8, temperature=0.0, ignore_eos=True),
+            )
+            self.assertEqual(spec_out.token_ids, base_out.token_ids)
+            st = engine.spec_stats
+            self.assertEqual(st.active_draft_mode, DraftMode.L1)
+            self.assertGreater(st.rounds, 0)
+            self.assertGreaterEqual(st.mean_accept_len, 1.0)
+
+            engine.configure_speculative(DraftMode.NONE)
+            self.assertEqual(engine.spec_stats.active_draft_mode, DraftMode.NONE)
+
 
 if __name__ == "__main__":
     unittest.main()

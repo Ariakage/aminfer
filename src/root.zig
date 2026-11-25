@@ -32,6 +32,7 @@ pub const qwen3 = @import("model/qwen3.zig");
 pub const lora = @import("model/lora.zig");
 pub const embed_rerank = @import("model/embed_rerank.zig");
 pub const graph = @import("model/graph.zig");
+pub const m82_runtime = @import("model/m82_runtime.zig");
 pub const bench = @import("bench/runner.zig");
 pub const sam = @import("spec/sam.zig");
 pub const tree = @import("spec/tree.zig");
@@ -91,6 +92,7 @@ test {
     _ = lora;
     _ = embed_rerank;
     _ = graph;
+    _ = m82_runtime;
     _ = bench;
     _ = sam;
     _ = tree;

@@ -39,6 +39,8 @@ pub const DraftMode = enum {
     small_draft,
     self_recurrent,
     dspark,
+    dflare,
+    dfly2,
 
     pub fn label(self: DraftMode) []const u8 {
         return switch (self) {
@@ -49,6 +51,8 @@ pub const DraftMode = enum {
             .small_draft => "small",
             .self_recurrent => "self-recurrent",
             .dspark => "dspark",
+            .dflare => "dflare",
+            .dfly2 => "dfly2",
         };
     }
 
@@ -60,6 +64,8 @@ pub const DraftMode = enum {
         if (std.mem.eql(u8, str, "small") or std.mem.eql(u8, str, "small_draft")) return .small_draft;
         if (std.mem.eql(u8, str, "self-recurrent") or std.mem.eql(u8, str, "self_recurrent")) return .self_recurrent;
         if (std.mem.eql(u8, str, "dspark")) return .dspark;
+        if (std.mem.eql(u8, str, "dflare") or std.mem.eql(u8, str, "dflash")) return .dflare;
+        if (std.mem.eql(u8, str, "dfly2") or std.mem.eql(u8, str, "dfly")) return .dfly2;
         return error.InvalidDraftMode;
     }
 };
@@ -128,7 +134,7 @@ pub const DraftConfig = struct {
     }
 
     pub fn validate(self: DraftConfig) ConfigError!void {
-        if (self.format == .l1_only or self.format == .small_draft or self.format == .self_recurrent or self.format == .dspark) return error.UnsupportedFormat;
+        if (self.format == .l1_only or self.format == .small_draft or self.format == .self_recurrent or self.format == .dspark or self.format == .dflare or self.format == .dfly2) return error.UnsupportedFormat;
         if (self.vocab_size == 0 or self.draft_vocab_size == 0 or self.draft_vocab_size > self.vocab_size) {
             return error.InvalidConfig;
         }
@@ -1259,7 +1265,7 @@ pub const DraftHead = struct {
                     }, false);
                     try self.encodeDraftLinearBatched(target, &frame, self.eh_proj.?, self.x_cat_bind, self.x_bind, m, true);
                 },
-                .l1_only, .small_draft, .self_recurrent, .dspark => unreachable,
+                .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
             }
         }
 
@@ -2514,7 +2520,7 @@ fn loadInternal(
             break :blk e;
         },
         .mtp => null,
-        .l1_only, .small_draft, .self_recurrent, .dspark => unreachable,
+        .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
     };
 
     const enorm_entry: ?*const amf.TensorEntry = if (config.format == .mtp) blk: {
@@ -2948,7 +2954,7 @@ fn loadInternal(
                     sme_gpu_out_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(x_raw.ptr) };
                 }
             },
-            .l1_only, .small_draft, .self_recurrent, .dspark => {},
+            .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => {},
         }
     }
 
@@ -3226,7 +3232,7 @@ pub fn buildSyntheticDraftAmfImage(allocator: std.mem.Allocator, cfg: DraftConfi
             try add2d(allocator, &recs, "eh_proj.weight", .dense, h, 2 * h, 0.5 / @sqrt(@as(f32, @floatFromInt(2 * h))), seed + tidx);
             tidx += 1;
         },
-        .l1_only, .small_draft, .self_recurrent, .dspark => unreachable,
+        .l1_only, .small_draft, .self_recurrent, .dspark, .dflare, .dfly2 => unreachable,
     }
 
     var nbuf: [64]u8 = undefined;

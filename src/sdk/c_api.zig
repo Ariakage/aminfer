@@ -30,6 +30,9 @@ const quant_rco = aminfer.quant_rco;
 const rng_mod = aminfer.rng;
 const sampler_mod = aminfer.sampler;
 const sampling_mod = aminfer.sampling;
+const draft_mod = aminfer.draft;
+const dflare_dfly = aminfer.dflare_dfly;
+const spec_engine = aminfer.engine;
 
 // ---------------------------------------------------------------------------
 // Objective-C Runtime, CoreVideo & IOSurface C Declarations (macOS Frameworks)
@@ -351,6 +354,38 @@ pub const VisionResult = extern struct {
     vision_encode_us: f64,
 };
 
+pub const DraftMode = enum(u32) {
+    none = 0,
+    auto = 1,
+    l1 = 2,
+    dflare = 3,
+    dfly2 = 4,
+};
+
+pub const SpecOptions = extern struct {
+    struct_size: u32,
+    draft_mode: u32,
+    draft_amf_path: ?[*:0]const u8,
+    draft_config_path: ?[*:0]const u8,
+    max_tree_nodes: u32,
+    enable_pruning: u32,
+    confidence_threshold: f32,
+    reserved: u32,
+};
+
+pub const SpecStats = extern struct {
+    struct_size: u32,
+    active_draft_mode: u32,
+    rounds: u64,
+    emitted_tokens: u64,
+    drafted_nodes: u64,
+    dflare_rounds: u64,
+    dflare_core3_batches: u64,
+    dfly2_rounds: u64,
+    dfly2_early_stops: u64,
+    mean_accept_len: f64,
+};
+
 comptime {
     std.debug.assert(ABI_VERSION == sdk_c.AMI_SDK_ABI_VERSION);
     std.debug.assert(@sizeOf(HostVmInfo) == @sizeOf(sdk_c.ami_sdk_host_vm_info));
@@ -390,6 +425,17 @@ comptime {
     std.debug.assert(@sizeOf(VisionInfo) == @sizeOf(sdk_c.ami_sdk_vision_info));
     std.debug.assert(@sizeOf(VisionParams) == @sizeOf(sdk_c.ami_sdk_vision_params));
     std.debug.assert(@sizeOf(VisionResult) == @sizeOf(sdk_c.ami_sdk_vision_result));
+    std.debug.assert(@sizeOf(SpecOptions) == @sizeOf(sdk_c.ami_sdk_spec_options));
+    std.debug.assert(@offsetOf(SpecOptions, "draft_mode") == @offsetOf(sdk_c.ami_sdk_spec_options, "draft_mode"));
+    std.debug.assert(@offsetOf(SpecOptions, "draft_amf_path") == @offsetOf(sdk_c.ami_sdk_spec_options, "draft_amf_path"));
+    std.debug.assert(@offsetOf(SpecOptions, "confidence_threshold") == @offsetOf(sdk_c.ami_sdk_spec_options, "confidence_threshold"));
+    std.debug.assert(@sizeOf(SpecStats) == @sizeOf(sdk_c.ami_sdk_spec_stats));
+    std.debug.assert(@offsetOf(SpecStats, "active_draft_mode") == @offsetOf(sdk_c.ami_sdk_spec_stats, "active_draft_mode"));
+    std.debug.assert(@offsetOf(SpecStats, "dflare_core3_batches") == @offsetOf(sdk_c.ami_sdk_spec_stats, "dflare_core3_batches"));
+    std.debug.assert(@offsetOf(SpecStats, "mean_accept_len") == @offsetOf(sdk_c.ami_sdk_spec_stats, "mean_accept_len"));
+    std.debug.assert(@backingInt(DraftMode.none) == sdk_c.AMI_SDK_DRAFT_NONE);
+    std.debug.assert(@backingInt(DraftMode.dflare) == sdk_c.AMI_SDK_DRAFT_DFLARE);
+    std.debug.assert(@backingInt(DraftMode.dfly2) == sdk_c.AMI_SDK_DRAFT_DFLY2);
     std.debug.assert(@hasDecl(sdk_c, "ami_sdk_quantize_rows_affine_raw"));
     std.debug.assert(@typeInfo(@TypeOf(sdk_c.ami_sdk_quantize_rows_affine_raw)).@"fn".param_types.len == 13);
 }
@@ -978,8 +1024,13 @@ const RERANK_PROMPT_CAP: usize = 64 * 1024;
 pub const SdkEngine = struct {
     backend: ModelBackend,
     graph_cfg: ?graph.GraphConfig,
+    amf_path_owned: [:0]u8,
     owned_tokenizer: ?*SdkTokenizer,
     chat_template: chat_template_mod.ChatTemplate = chat_template_mod.ChatTemplate.preset(.chatml),
+    spec_mode: DraftMode = .none,
+    dflare_loaded: ?*spec_engine.LoadedDFlareProposer = null,
+    dfly2_loaded: ?*spec_engine.LoadedDFly2Proposer = null,
+    spec_eng: ?*spec_engine.SpecEngine = null,
 
     vocab_size: u32,
     hidden_size: u32,
@@ -1109,7 +1160,25 @@ pub const SdkEngine = struct {
         }
     }
 
+    fn clearSpeculative(self: *SdkEngine, allocator: std.mem.Allocator) void {
+        if (self.spec_eng) |se| {
+            se.deinit(allocator);
+            allocator.destroy(se);
+            self.spec_eng = null;
+        }
+        if (self.dflare_loaded) |dl| {
+            dl.deinit(allocator);
+            self.dflare_loaded = null;
+        }
+        if (self.dfly2_loaded) |dl| {
+            dl.deinit(allocator);
+            self.dfly2_loaded = null;
+        }
+        self.spec_mode = .none;
+    }
+
     fn destroy(self: *SdkEngine, allocator: std.mem.Allocator) void {
+        self.clearSpeculative(allocator);
         if (self.gpu_sampler) |*gs| {
             gs.close();
             self.gpu_sampler = null;
@@ -1134,6 +1203,7 @@ pub const SdkEngine = struct {
             gcfg.deinit(allocator);
             self.graph_cfg = null;
         }
+        allocator.free(self.amf_path_owned);
         allocator.destroy(self);
     }
 };
@@ -1389,6 +1459,20 @@ pub export fn ami_sdk_vision_params_init(params_ptr: ?*VisionParams) callconv(.c
         .compute_logits = 1,
         .reserved = 0,
         .cancel_token = null,
+    };
+}
+
+pub export fn ami_sdk_spec_options_init(opts_ptr: ?*SpecOptions) callconv(.c) void {
+    const opts = opts_ptr orelse return;
+    opts.* = .{
+        .struct_size = @sizeOf(SpecOptions),
+        .draft_mode = @backingInt(DraftMode.auto),
+        .draft_amf_path = null,
+        .draft_config_path = null,
+        .max_tree_nodes = 16,
+        .enable_pruning = 0,
+        .confidence_threshold = 0.0,
+        .reserved = 0,
     };
 }
 
@@ -1820,8 +1904,49 @@ pub export fn ami_sdk_engine_create(
     const wide_chunk_toks: u32 = @min(@as(u32, 512), max_seq_len);
     const tree_nodes: u32 = @min(@as(u32, 64), max_seq_len);
 
+    const amf_path_owned = std.fmt.allocPrintSentinel(gpa, "{s}", .{amf_path}, 0) catch
+        return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "amf_path alloc failed");
+    errdefer gpa.free(amf_path_owned);
+
     var backend: ModelBackend = undefined;
     if (is_graph) {
+        var auto_ple_owned: [8][:0]u8 = undefined;
+        var auto_ple_views: [8][:0]const u8 = undefined;
+        var auto_ple_count: usize = 0;
+        defer for (0..auto_ple_count) |pi| gpa.free(auto_ple_owned[pi]);
+
+        if (maybe_gcfg.?.m82_family.isHy4() and maybe_gcfg.?.m82_cfg.engram_fp8_embedding) {
+            for ([_]usize{ 1, 2, 4, 8 }) |total_shards| {
+                var probe_buf: [64]u8 = undefined;
+                const probe_leaf = std.fmt.bufPrint(&probe_buf, "engram-00000-of-{d:0>5}.amf", .{total_shards}) catch break;
+                const probe_path = buildSiblingPathZ(gpa, amf_path, probe_leaf) catch break;
+                const exists = fileExistsPosix(probe_path);
+                gpa.free(probe_path);
+                if (exists) {
+                    var ok_all = true;
+                    for (0..total_shards) |si| {
+                        var leaf_buf: [64]u8 = undefined;
+                        const leaf = std.fmt.bufPrint(&leaf_buf, "engram-{d:0>5}-of-{d:0>5}.amf", .{ si, total_shards }) catch {
+                            ok_all = false;
+                            break;
+                        };
+                        const sp = buildSiblingPathZ(gpa, amf_path, leaf) catch {
+                            ok_all = false;
+                            break;
+                        };
+                        auto_ple_owned[auto_ple_count] = sp;
+                        auto_ple_views[auto_ple_count] = sp;
+                        auto_ple_count += 1;
+                    }
+                    if (!ok_all) {
+                        for (0..auto_ple_count) |pi| gpa.free(auto_ple_owned[pi]);
+                        auto_ple_count = 0;
+                    }
+                    break;
+                }
+            }
+        }
+
         const gmodel = graph.GraphModel.loadFromFile(gpa, amf_path, maybe_gcfg.?, .{
             .max_seq_len = max_seq_len,
             .max_tree_nodes = tree_nodes,
@@ -1832,6 +1957,7 @@ pub export fn ami_sdk_engine_create(
             .live_safety_margin_bytes = safety_margin,
             .live_reclaimable_override = rem_live_reclaimable,
             .wide_prefill_chunk_tokens = wide_chunk_toks,
+            .ple_paths = auto_ple_views[0..auto_ple_count],
         }) catch |err| return mapAnyError(err);
         backend = .{ .graph = gmodel };
     } else {
@@ -1905,6 +2031,7 @@ pub export fn ami_sdk_engine_create(
     eng.* = .{
         .backend = backend,
         .graph_cfg = maybe_gcfg,
+        .amf_path_owned = amf_path_owned,
         .owned_tokenizer = owned_tokenizer,
         .chat_template = resolved_chat_tpl,
         .vocab_size = vocab_size,
@@ -1983,6 +2110,261 @@ pub export fn ami_sdk_engine_query_stats(
 pub export fn ami_sdk_engine_tokenizer(engine: ?*const SdkEngine) callconv(.c) ?*const SdkTokenizer {
     const eng = engine orelse return null;
     return eng.owned_tokenizer;
+}
+
+fn readEmbeddedMetaConfigJson(allocator: std.mem.Allocator, amf_path: [:0]const u8) ?[]u8 {
+    var af = amf_mod.AmfFile.open(allocator, amf_path) catch return null;
+    defer af.close(allocator);
+    const me = af.parsed.find("__meta.config_json") orelse return null;
+    if (me.data_bytes == 0 or me.data_bytes > 4 * 1024 * 1024) return null;
+    const raw = allocator.alloc(u8, @intCast(me.data_bytes)) catch return null;
+    var done: usize = 0;
+    while (done < raw.len) {
+        const rc = std.c.pread(af.fd, raw.ptr + done, raw.len - done, @intCast(me.blob_offset + done));
+        if (rc < 0) {
+            if (std.c.errno(rc) == .INTR) continue;
+            allocator.free(raw);
+            return null;
+        }
+        if (rc == 0) {
+            allocator.free(raw);
+            return null;
+        }
+        done += @intCast(rc);
+    }
+    return raw;
+}
+
+pub export fn ami_sdk_engine_configure_speculative(
+    engine: ?*SdkEngine,
+    opts_ptr: ?*const SpecOptions,
+) callconv(.c) Status {
+    const pool = objc_autoreleasePoolPush();
+    defer objc_autoreleasePoolPop(pool);
+
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    const opts = opts_ptr orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "opts is NULL");
+    if (opts.struct_size != @sizeOf(SpecOptions)) {
+        return fail(AMI_SDK_ERR_ABI_MISMATCH, "SpecOptions struct_size mismatch");
+    }
+    if (!std.math.isFinite(opts.confidence_threshold) or opts.confidence_threshold < 0.0 or opts.confidence_threshold > 1.0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "confidence_threshold must be finite in [0.0, 1.0]");
+    }
+
+    const req_mode: DraftMode = switch (opts.draft_mode) {
+        0 => .none,
+        1 => .auto,
+        2 => .l1,
+        3 => .dflare,
+        4 => .dfly2,
+        else => return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "invalid draft_mode"),
+    };
+    if (req_mode == .none) {
+        eng.clearSpeculative(gpa);
+        return AMI_SDK_OK;
+    }
+
+    const explicit_amf: ?[:0]const u8 = if (opts.draft_amf_path) |p| blk: {
+        const s = std.mem.span(p);
+        break :blk if (s.len > 0) s else null;
+    } else null;
+    const explicit_cfg: ?[:0]const u8 = if (opts.draft_config_path) |p| blk: {
+        const s = std.mem.span(p);
+        break :blk if (s.len > 0) s else null;
+    } else null;
+
+    var cfg_bytes_owned: ?[]u8 = null;
+    defer if (cfg_bytes_owned) |b| gpa.free(b);
+
+    var resolved_mode: DraftMode = req_mode;
+    if (explicit_cfg) |cfg_p| {
+        cfg_bytes_owned = readFileAllocPosix(gpa, cfg_p, 4 * 1024 * 1024) catch |err| return mapAnyError(err);
+        if (resolved_mode == .auto) {
+            if (dflare_dfly.detectDraftKindFromJson(cfg_bytes_owned.?)) |dk| {
+                resolved_mode = if (dk == .dflare) .dflare else .dfly2;
+            }
+        }
+    }
+    if (resolved_mode == .auto and explicit_amf != null) {
+        if (readEmbeddedMetaConfigJson(gpa, explicit_amf.?)) |raw| {
+            if (dflare_dfly.detectDraftKindFromJson(raw)) |dk| {
+                resolved_mode = if (dk == .dflare) .dflare else .dfly2;
+                if (cfg_bytes_owned == null) cfg_bytes_owned = raw else gpa.free(raw);
+            } else {
+                gpa.free(raw);
+            }
+        }
+    }
+
+    var resolved_amf_owned: ?[:0]u8 = null;
+    defer if (resolved_amf_owned) |p| gpa.free(p);
+
+    if (resolved_mode == .auto) {
+        if (eng.graph_cfg) |*gcfg| {
+            if (gcfg.m82_family.isInkling2()) {
+                const sib = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflare.amf") catch return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
+                if (fileExistsPosix(sib)) {
+                    resolved_mode = .dflare;
+                    resolved_amf_owned = sib;
+                } else {
+                    gpa.free(sib);
+                }
+            } else if (gcfg.m82_family.isHy4()) {
+                const sib = buildSiblingPathZ(gpa, eng.amf_path_owned, "dfly2.amf") catch return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
+                if (fileExistsPosix(sib)) {
+                    resolved_mode = .dfly2;
+                    resolved_amf_owned = sib;
+                } else {
+                    gpa.free(sib);
+                }
+            }
+        }
+        if (resolved_mode == .auto) resolved_mode = .l1;
+    }
+
+    const max_nodes_u32: u32 = if (opts.max_tree_nodes == 0) 16 else opts.max_tree_nodes;
+    const max_nodes: u16 = @intCast(@min(max_nodes_u32, @as(u32, spec_engine.MAX_TREE_NODES)));
+    const enable_pruning = (opts.enable_pruning != 0);
+
+    var new_dflare: ?*spec_engine.LoadedDFlareProposer = null;
+    errdefer if (new_dflare) |dl| dl.deinit(gpa);
+    var new_dfly2: ?*spec_engine.LoadedDFly2Proposer = null;
+    errdefer if (new_dfly2) |dl| dl.deinit(gpa);
+
+    const new_se = gpa.create(spec_engine.SpecEngine) catch return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "SpecEngine alloc failed");
+    errdefer gpa.destroy(new_se);
+
+    switch (resolved_mode) {
+        .l1 => {
+            const scfg: spec_engine.SpecConfig = .{
+                .mode = .l1_only,
+                .max_tree_nodes = max_nodes,
+                .enable_pruning = enable_pruning,
+            };
+            new_se.* = switch (eng.backend) {
+                .qwen3 => |*m| spec_engine.SpecEngine.init(gpa, m, null, scfg) catch |err| return mapAnyError(err),
+                .graph => |*m| spec_engine.SpecEngine.initWithGraph(gpa, m, null, scfg) catch |err| return mapAnyError(err),
+            };
+        },
+        .dflare => {
+            const gm = switch (eng.backend) {
+                .graph => |*m| m,
+                .qwen3 => return fail(AMI_SDK_ERR_UNSUPPORTED, "DFlare requires a GraphModel target"),
+            };
+            const draft_amf: [:0]const u8 = explicit_amf orelse blk: {
+                if (resolved_amf_owned == null) {
+                    resolved_amf_owned = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflare.amf") catch
+                        return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
+                }
+                break :blk resolved_amf_owned.?;
+            };
+            if (cfg_bytes_owned == null) {
+                const sib_cfg = buildSiblingPathZ(gpa, eng.amf_path_owned, "dflare_config.json") catch
+                    return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
+                defer gpa.free(sib_cfg);
+                if (fileExistsPosix(sib_cfg)) {
+                    cfg_bytes_owned = readFileAllocPosix(gpa, sib_cfg, 4 * 1024 * 1024) catch |err| return mapAnyError(err);
+                }
+            }
+            new_dflare = spec_engine.LoadedDFlareProposer.loadFromFile(
+                gpa,
+                gm,
+                draft_amf,
+                cfg_bytes_owned,
+                null,
+                null,
+            ) catch |err| return mapAnyError(err);
+            new_se.* = spec_engine.SpecEngine.initWithDFlare(gpa, gm, new_dflare.?.proposer(), .{
+                .mode = .dflare,
+                .max_tree_nodes = max_nodes,
+                .enable_pruning = enable_pruning,
+            }) catch |err| return mapAnyError(err);
+        },
+        .dfly2 => {
+            const gm = switch (eng.backend) {
+                .graph => |*m| m,
+                .qwen3 => return fail(AMI_SDK_ERR_UNSUPPORTED, "DFly2 requires a GraphModel target"),
+            };
+            const draft_amf: [:0]const u8 = explicit_amf orelse blk: {
+                if (resolved_amf_owned == null) {
+                    resolved_amf_owned = buildSiblingPathZ(gpa, eng.amf_path_owned, "dfly2.amf") catch
+                        return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
+                }
+                break :blk resolved_amf_owned.?;
+            };
+            if (cfg_bytes_owned == null) {
+                const sib_cfg = buildSiblingPathZ(gpa, eng.amf_path_owned, "dfly2_config.json") catch
+                    return fail(AMI_SDK_ERR_OUT_OF_MEMORY, "path alloc failed");
+                defer gpa.free(sib_cfg);
+                if (fileExistsPosix(sib_cfg)) {
+                    cfg_bytes_owned = readFileAllocPosix(gpa, sib_cfg, 4 * 1024 * 1024) catch |err| return mapAnyError(err);
+                }
+            }
+            const conf_override: ?f32 = if (opts.confidence_threshold > 0.0) opts.confidence_threshold else null;
+            new_dfly2 = spec_engine.LoadedDFly2Proposer.loadFromFile(
+                gpa,
+                gm,
+                draft_amf,
+                cfg_bytes_owned,
+                null,
+                conf_override,
+                null,
+            ) catch |err| return mapAnyError(err);
+            new_se.* = spec_engine.SpecEngine.initWithDFly2(gpa, gm, new_dfly2.?.proposer(), .{
+                .mode = .dfly2,
+                .max_tree_nodes = max_nodes,
+                .enable_pruning = enable_pruning,
+            }) catch |err| return mapAnyError(err);
+        },
+        .none, .auto => unreachable,
+    }
+
+    eng.clearSpeculative(gpa);
+    eng.dflare_loaded = new_dflare;
+    eng.dfly2_loaded = new_dfly2;
+    eng.spec_eng = new_se;
+    eng.spec_mode = resolved_mode;
+    return AMI_SDK_OK;
+}
+
+pub export fn ami_sdk_engine_query_spec_stats(
+    engine: ?*const SdkEngine,
+    out_stats: ?*SpecStats,
+) callconv(.c) Status {
+    const eng = engine orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "engine is NULL");
+    const stats = out_stats orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "out_stats is NULL");
+    if (stats.struct_size != 0 and stats.struct_size < @sizeOf(SpecStats)) {
+        return fail(AMI_SDK_ERR_ABI_MISMATCH, "SpecStats struct_size mismatch");
+    }
+    if (eng.spec_eng) |se| {
+        const s = se.stats;
+        stats.* = .{
+            .struct_size = @sizeOf(SpecStats),
+            .active_draft_mode = @backingInt(eng.spec_mode),
+            .rounds = s.rounds,
+            .emitted_tokens = s.emitted_tokens,
+            .drafted_nodes = s.drafted_nodes,
+            .dflare_rounds = s.dflare_rounds,
+            .dflare_core3_batches = s.dflare_core3_batches,
+            .dfly2_rounds = s.dfly2_rounds,
+            .dfly2_early_stops = s.dfly2_early_stops,
+            .mean_accept_len = s.meanAcceptanceLength(),
+        };
+    } else {
+        stats.* = .{
+            .struct_size = @sizeOf(SpecStats),
+            .active_draft_mode = @backingInt(DraftMode.none),
+            .rounds = 0,
+            .emitted_tokens = 0,
+            .drafted_nodes = 0,
+            .dflare_rounds = 0,
+            .dflare_core3_batches = 0,
+            .dfly2_rounds = 0,
+            .dfly2_early_stops = 0,
+            .mean_accept_len = 0.0,
+        };
+    }
+    return AMI_SDK_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -2457,6 +2839,187 @@ fn validateGenParams(params: *const GenParams) Status {
     return AMI_SDK_OK;
 }
 
+fn dispatchStreamToken(
+    eng: *const SdkEngine,
+    params: *const GenParams,
+    stream_cb: ?StreamCallback,
+    user_data: ?*anyopaque,
+    utf8_asm: *Utf8Assembler,
+    tag_cls: *StreamTagClassifier,
+    tok: u32,
+    cur_step: u32,
+    stopped_by_cb: *bool,
+) Status {
+    const cb = stream_cb orelse return AMI_SDK_OK;
+    if (eng.owned_tokenizer) |stok| {
+        const piece = stok.tok.tokenBytes(tok) catch |err| return mapAnyError(err);
+        const keep_structural = eng.chat_template.isStructuralControlToken(piece);
+        const skip_spec = (params.skip_special_tokens != 0) and stok.tok.isSpecialToken(tok) and !keep_structural;
+        if (!skip_spec) {
+            var dctx: StreamDispatchCtx = .{
+                .cb = cb,
+                .user_data = user_data,
+                .classifier = tag_cls,
+                .token_id = tok,
+                .step_index = cur_step,
+                .is_final_flush = 0,
+            };
+            if (!utf8_asm.feed(piece, &dctx, StreamDispatchCtx.onUtf8)) {
+                if (dctx.stopped_by_cb) stopped_by_cb.* = true;
+            }
+        }
+    } else {
+        const empty: [1]u8 = .{0};
+        const ev: StreamEvent = .{
+            .struct_size = @sizeOf(StreamEvent),
+            .token_id = tok,
+            .step_index = cur_step,
+            .delta_kind = @backingInt(DeltaKind.text),
+            .utf8_ptr = &empty,
+            .utf8_len = 0,
+            .is_final_flush = 0,
+            .reserved = 0,
+        };
+        if (cb(&ev, user_data) != 0) stopped_by_cb.* = true;
+    }
+    return AMI_SDK_OK;
+}
+
+fn generateTokensSpeculativeImpl(
+    eng: *SdkEngine,
+    se: *spec_engine.SpecEngine,
+    prompt_ids: []const u32,
+    params: *const GenParams,
+    stream_cb: ?StreamCallback,
+    user_data: ?*anyopaque,
+    out_token_ids: ?[]u32,
+    out_result: ?*GenResult,
+) Status {
+    const explicit_seed: ?u64 = if (params.has_seed != 0) params.seed else null;
+    var req_rng = rng_mod.RequestRng.init(explicit_seed) catch |err| return mapAnyError(err);
+    const rng_opt: ?std.Random = if (params.temperature > 0.0) req_rng.random() else null;
+
+    if (SdkCancelToken.isCancelled(params.cancel_token)) {
+        return fail(AMI_SDK_ERR_CANCELLED, "generation cancelled");
+    }
+
+    se.config.temperature = params.temperature;
+    eng.history_len = 0;
+    eng.invalidateViews();
+
+    const t0 = vmstat.nowNs() catch |err| return mapAnyError(err);
+    const first_tok = se.prefill(prompt_ids, rng_opt) catch |err| return mapAnyError(err);
+    const t_prefill = vmstat.nowNs() catch |err| return mapAnyError(err);
+
+    for (prompt_ids) |tid| eng.recordToken(tid);
+    eng.has_step_state = true;
+
+    var utf8_asm: Utf8Assembler = .{};
+    var tag_cls: StreamTagClassifier = .{};
+    tag_cls.resetForDialect(eng.chat_template.dialect, params.start_in_think != 0);
+
+    var generated: u32 = 0;
+    var finish: FinishReason = .length;
+
+    // Emit first token from prefill.
+    if (SdkCancelToken.isCancelled(params.cancel_token)) {
+        finish = .cancelled;
+    } else if (isStopToken(eng, params, first_tok)) {
+        finish = if (tag_cls.saw_tool_call) .tool_calls else .stop;
+    } else {
+        if (out_token_ids) |dst| {
+            if (generated < dst.len) dst[generated] = first_tok;
+        }
+        eng.recordToken(first_tok);
+        var cb_stop = false;
+        const dst_st = dispatchStreamToken(eng, params, stream_cb, user_data, &utf8_asm, &tag_cls, first_tok, generated, &cb_stop);
+        if (dst_st != AMI_SDK_OK) return dst_st;
+        generated += 1;
+        if (cb_stop) finish = .callback_stop;
+    }
+
+    var round_buf: [spec_engine.MAX_TREE_NODES]u32 = undefined;
+    while (finish == .length and generated < params.max_tokens) {
+        if (SdkCancelToken.isCancelled(params.cancel_token)) {
+            finish = .cancelled;
+            break;
+        }
+        if (eng.currentSeqLen() >= eng.max_seq_len) {
+            finish = .length;
+            break;
+        }
+        const rem: usize = @min(@as(usize, params.max_tokens - generated), round_buf.len);
+        const rs = se.stepRound(rng_opt, round_buf[0..rem]) catch |err| {
+            if (err == error.SequenceFull) {
+                finish = .length;
+                break;
+            }
+            return mapAnyError(err);
+        };
+        if (rs.emitted_count == 0) break;
+
+        for (round_buf[0..rs.emitted_count]) |tok| {
+            if (isStopToken(eng, params, tok)) {
+                finish = if (tag_cls.saw_tool_call) .tool_calls else .stop;
+                break;
+            }
+            if (out_token_ids) |dst| {
+                if (generated < dst.len) dst[generated] = tok;
+            }
+            eng.recordToken(tok);
+            var cb_stop = false;
+            const dst_st = dispatchStreamToken(eng, params, stream_cb, user_data, &utf8_asm, &tag_cls, tok, generated, &cb_stop);
+            if (dst_st != AMI_SDK_OK) return dst_st;
+            generated += 1;
+            if (cb_stop) {
+                finish = .callback_stop;
+                break;
+            }
+            if (generated >= params.max_tokens) break;
+        }
+    }
+
+    eng.invalidateViews();
+    eng.has_step_state = true;
+    captureLatestHiddenState(eng, 1);
+
+    if (stream_cb) |cb| {
+        if (finish != .callback_stop and finish != .cancelled and eng.owned_tokenizer != null) {
+            var fctx: StreamDispatchCtx = .{
+                .cb = cb,
+                .user_data = user_data,
+                .classifier = &tag_cls,
+                .token_id = TOKEN_NONE,
+                .step_index = generated,
+                .is_final_flush = 1,
+            };
+            _ = utf8_asm.flush(&fctx, StreamDispatchCtx.onUtf8);
+            if (!fctx.stopped_by_cb) {
+                _ = tag_cls.flush(&fctx, StreamDispatchCtx.onClassified);
+            }
+            if (fctx.stopped_by_cb) finish = .callback_stop;
+        }
+    }
+    if (finish == .length and tag_cls.saw_tool_call and generated < params.max_tokens) {
+        finish = .tool_calls;
+    }
+
+    const t_end = vmstat.nowNs() catch |err| return mapAnyError(err);
+    if (out_result) |res| {
+        res.* = .{
+            .struct_size = @sizeOf(GenResult),
+            .prompt_tokens = @intCast(prompt_ids.len),
+            .generated_tokens = generated,
+            .finish_reason = @backingInt(finish),
+            .seed_used = req_rng.seed_used,
+            .prefill_ns = @floatFromInt(t_prefill -| t0),
+            .decode_ns = @floatFromInt(t_end -| t_prefill),
+        };
+    }
+    if (finish == .cancelled) return fail(AMI_SDK_ERR_CANCELLED, "generation cancelled");
+    return AMI_SDK_OK;
+}
+
 fn generateTokensImpl(
     eng: *SdkEngine,
     prompt_ids: []const u32,
@@ -2471,6 +3034,21 @@ fn generateTokensImpl(
     if (out_result) |res| {
         if (res.struct_size != 0 and res.struct_size < @sizeOf(GenResult)) {
             return fail(AMI_SDK_ERR_ABI_MISMATCH, "GenResult struct_size mismatch");
+        }
+    }
+
+    if (eng.spec_eng) |se| {
+        const spec_compatible = prompt_ids.len > 0 and
+            params.max_tokens > 0 and
+            params.reset_kv_cache != 0 and
+            params.top_p >= 1.0 and
+            params.top_k == 0 and
+            params.min_p <= 0.0 and
+            params.repetition_penalty == 1.0 and
+            params.presence_penalty == 0.0 and
+            params.frequency_penalty == 0.0;
+        if (spec_compatible) {
+            return generateTokensSpeculativeImpl(eng, se, prompt_ids, params, stream_cb, user_data, out_token_ids, out_result);
         }
     }
 
@@ -5172,4 +5750,29 @@ test "sdk.c_api: ami_sdk_quantize_rows_affine_raw parity, multi-thread consisten
             }
         }
     }
+}
+
+test "sdk: SpecOptions and SpecStats ABI defaults and validation" {
+    var sopts: SpecOptions = undefined;
+    ami_sdk_spec_options_init(&sopts);
+    try std.testing.expectEqual(@as(u32, @sizeOf(SpecOptions)), sopts.struct_size);
+    try std.testing.expectEqual(@backingInt(DraftMode.auto), sopts.draft_mode);
+    try std.testing.expectEqual(@as(u32, 16), sopts.max_tree_nodes);
+    try std.testing.expectEqual(@as(f32, 0.0), sopts.confidence_threshold);
+
+    // Null argument guards.
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_configure_speculative(null, &sopts));
+    var sstats: SpecStats = .{
+        .struct_size = @sizeOf(SpecStats),
+        .active_draft_mode = 0,
+        .rounds = 0,
+        .emitted_tokens = 0,
+        .drafted_nodes = 0,
+        .dflare_rounds = 0,
+        .dflare_core3_batches = 0,
+        .dfly2_rounds = 0,
+        .dfly2_early_stops = 0,
+        .mean_accept_len = 0.0,
+    };
+    try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_query_spec_stats(null, &sstats));
 }

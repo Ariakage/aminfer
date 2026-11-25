@@ -119,6 +119,41 @@ typedef enum ami_sdk_vision_format {
     AMI_SDK_VISION_FMT_F16   = 3
 } ami_sdk_vision_format;
 
+/* Speculative draft mode for ami_sdk_engine_configure_speculative (M8.2 D14). */
+typedef enum ami_sdk_draft_mode {
+    AMI_SDK_DRAFT_NONE   = 0,
+    AMI_SDK_DRAFT_AUTO   = 1,
+    AMI_SDK_DRAFT_L1     = 2,
+    AMI_SDK_DRAFT_DFLARE = 3,
+    AMI_SDK_DRAFT_DFLY2  = 4
+} ami_sdk_draft_mode;
+
+/* Speculative decoding configuration attached to an engine handle (M8.2). */
+typedef struct ami_sdk_spec_options {
+    uint32_t struct_size;
+    uint32_t draft_mode;              /* ami_sdk_draft_mode */
+    const char *draft_amf_path;       /* NULL => auto-discover sibling dflare.amf / dfly2.amf */
+    const char *draft_config_path;    /* NULL => auto-discover sibling JSON or embedded __meta */
+    uint32_t max_tree_nodes;          /* 0 => 16 default */
+    uint32_t enable_pruning;          /* 0 => disabled, 1 => D7 expert-budget pruning */
+    float confidence_threshold;       /* <= 0.0f => config default (0.5f for DFly2) */
+    uint32_t reserved;
+} ami_sdk_spec_options;
+
+/* Speculative decoding telemetry snapshot from an engine handle (M8.2). */
+typedef struct ami_sdk_spec_stats {
+    uint32_t struct_size;
+    uint32_t active_draft_mode;       /* ami_sdk_draft_mode */
+    uint64_t rounds;
+    uint64_t emitted_tokens;
+    uint64_t drafted_nodes;
+    uint64_t dflare_rounds;
+    uint64_t dflare_core3_batches;
+    uint64_t dfly2_rounds;
+    uint64_t dfly2_early_stops;
+    double mean_accept_len;
+} ami_sdk_spec_stats;
+
 /* Opaque SDK handles. */
 typedef struct ami_sdk_engine ami_sdk_engine;
 typedef struct ami_sdk_tokenizer ami_sdk_tokenizer;
@@ -316,6 +351,13 @@ void ami_sdk_gen_params_init(ami_sdk_gen_params *params);
 void ami_sdk_embed_params_init(ami_sdk_embed_params *params);
 void ami_sdk_rerank_params_init(ami_sdk_rerank_params *params);
 void ami_sdk_vision_params_init(ami_sdk_vision_params *params);
+void ami_sdk_spec_options_init(ami_sdk_spec_options *opts);
+
+/* Configure or disable speculative decoding (L1 / DFlare / DFly2 / Auto) on an engine. */
+ami_sdk_status ami_sdk_engine_configure_speculative(ami_sdk_engine *engine,
+                                                    const ami_sdk_spec_options *opts);
+ami_sdk_status ami_sdk_engine_query_spec_stats(const ami_sdk_engine *engine,
+                                               ami_sdk_spec_stats *out_stats);
 
 /* -------------------------------------------------------------------------
  * Cooperative Cancellation Token (atomic flag, zero POSIX signal changes)

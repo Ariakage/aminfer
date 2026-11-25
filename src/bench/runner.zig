@@ -48,6 +48,7 @@ const chat_repl = @import("../cli/chat_repl.zig");
 const sampler_mod = @import("../gpu/sampler.zig");
 const quant_formats = @import("../gpu/quant_formats.zig");
 pub const m81 = @import("m81.zig");
+pub const m82 = @import("m82.zig");
 
 pub const KlStepMetrics = m81.KlStepMetrics;
 pub const computeLogitsKlAndTop1F32 = m81.computeLogitsKlAndTop1F32;
@@ -61,6 +62,10 @@ pub const M81Config = m81.M81Config;
 pub const M81Report = m81.M81Report;
 pub const runM81WithConfig = m81.runM81WithConfig;
 pub const runM81 = m81.runM81;
+pub const M82Config = m82.M82Config;
+pub const M82Report = m82.M82Report;
+pub const runM82WithConfig = m82.runM82WithConfig;
+pub const runM82 = m82.runM82;
 
 /// Apple M4 unified memory bus peak bandwidth in decimal GB/s
 /// (docs/architecture/hardware.md).
@@ -16809,4 +16814,5 @@ test "runM78WithConfig verifies G18-G22 and C23-C24 M7.8 benchmark tracks with z
 
 test {
     _ = m81;
+    _ = m82;
 }

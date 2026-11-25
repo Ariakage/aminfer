@@ -34,6 +34,13 @@ AMI_SDK_EFFORT_XHIGH: Final[int] = 7
 AMI_SDK_EFFORT_MAX: Final[int] = 8
 AMI_SDK_EFFORT_CUSTOM_FLOAT: Final[int] = 9
 
+# Speculative draft modes (must match include/aminfer.h, M8.2 D14).
+AMI_SDK_DRAFT_NONE: Final[int] = 0
+AMI_SDK_DRAFT_AUTO: Final[int] = 1
+AMI_SDK_DRAFT_L1: Final[int] = 2
+AMI_SDK_DRAFT_DFLARE: Final[int] = 3
+AMI_SDK_DRAFT_DFLY2: Final[int] = 4
+
 # Status codes (must match include/aminfer.h).
 AMI_SDK_OK: Final[int] = 0
 AMI_SDK_ERR_INVALID_ARGUMENT: Final[int] = -1
@@ -132,6 +139,34 @@ class EngineStatsC(ctypes.Structure):
         ("wired_budget_bytes", ctypes.c_uint64),
         ("live_reclaimable_bytes", ctypes.c_uint64),
         ("live_budget_bytes", ctypes.c_uint64),
+    ]
+
+
+class SpecOptionsC(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("draft_mode", ctypes.c_uint32),
+        ("draft_amf_path", ctypes.c_char_p),
+        ("draft_config_path", ctypes.c_char_p),
+        ("max_tree_nodes", ctypes.c_uint32),
+        ("enable_pruning", ctypes.c_uint32),
+        ("confidence_threshold", ctypes.c_float),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
+class SpecStatsC(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("active_draft_mode", ctypes.c_uint32),
+        ("rounds", ctypes.c_uint64),
+        ("emitted_tokens", ctypes.c_uint64),
+        ("drafted_nodes", ctypes.c_uint64),
+        ("dflare_rounds", ctypes.c_uint64),
+        ("dflare_core3_batches", ctypes.c_uint64),
+        ("dfly2_rounds", ctypes.c_uint64),
+        ("dfly2_early_stops", ctypes.c_uint64),
+        ("mean_accept_len", ctypes.c_double),
     ]
 
 
@@ -419,6 +454,20 @@ def _configure_cdll(lib: ctypes.CDLL) -> None:
     lib.ami_sdk_engine_query_stats.restype = ctypes.c_int32
     lib.ami_sdk_engine_tokenizer.argtypes = [ctypes.c_void_p]
     lib.ami_sdk_engine_tokenizer.restype = ctypes.c_void_p
+
+    # Speculative Decoding (M8.2 D14: L1 / DFlare / DFly2 / Auto)
+    lib.ami_sdk_spec_options_init.argtypes = [ctypes.POINTER(SpecOptionsC)]
+    lib.ami_sdk_spec_options_init.restype = None
+    lib.ami_sdk_engine_configure_speculative.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(SpecOptionsC),
+    ]
+    lib.ami_sdk_engine_configure_speculative.restype = ctypes.c_int32
+    lib.ami_sdk_engine_query_spec_stats.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(SpecStatsC),
+    ]
+    lib.ami_sdk_engine_query_spec_stats.restype = ctypes.c_int32
 
     lib.ami_sdk_prefill_tokens.argtypes = [
         ctypes.c_void_p,

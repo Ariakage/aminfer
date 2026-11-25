@@ -83,6 +83,8 @@ const usage =
     \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
     \\  bench-m81         run M8.1 W21/W22/W24 multi-format G23 GEMV+prefill, G24 act-quant, C25 SME2, Inkling2/Hy4 tokenizer+template, C18 HTTP/SSE & W24 KL gate
     \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
+    \\  bench-m82         run M8.2 Inkling 2 & Hy4 G25 fused kernels, 40/48 SWA KV, IndexCache/IndexPool, LatentMoE, C26 SME2+FP8 Engram, D14 DFlare/DFly2 parity & speedup
+    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -121,10 +123,10 @@ const usage =
     \\                    [--dump-router-trace <path.jsonl>]
     \\                    [-S|--strict-live-ram] [--ane-predictor <path>]
     \\                    [-A|--no-ane-predictor] [-V|--no-verify-crc]
-    \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent/DSpark)
+    \\  spec-decode       run speculative decoding (L1 SAM + C6 N-gram + EAGLE/MTP/Small/Self-Recurrent/DSpark/DFlare/DFly2)
     \\                    [-AEehlNPRSV] -m|--amf <path> [-c|--config <path>] [-k|--tokenizer <path>] -p|--prompt <text>
     \\                    [-d|--draft-amf <path> --draft-config <path>]
-    \\                    [-M|--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark]
+    \\                    [-M|--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark|dflare|dfly2]
     \\                    [--placement auto|gpu|ane|sme2] [--kv-retire-q8-after-chunks N]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
     \\                    [-E|--loop-early-exit] [--peer <ip:port>] [--rank N] [--world-size N]
@@ -154,7 +156,7 @@ const usage =
     \\                    [-B|--message-boundary-cache on|off]
     \\                    [--kv-retire-q8-after-chunks N] [--ngram-pack <domain>=<path.ang>]
     \\                    [-d|--draft-amf <path> --draft-config <path>]
-    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent]
+    \\                    [--draft-mode l1|eagle3|eagle2|mtp|small|self-recurrent|dspark|dflare|dfly2]
     \\                    [--placement auto|gpu|ane|sme2]
     \\                    [--ple-amf <path>] [--max-loops N] [--loop-adapter-amf <path>]
     \\                    [-E|--loop-early-exit]
@@ -272,6 +274,12 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM81(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m82")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM82(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -642,6 +650,7 @@ const M6GraphCliFlags = struct {
     ple_amf_count: usize = 0,
     max_loops: ?u32 = null,
     loop_adapter_amf_path: ?[:0]const u8 = null,
+    vision_sidecar_path: ?[:0]const u8 = null,
     loop_early_exit: bool = false,
 
     fn pleSlice(self: *const M6GraphCliFlags) []const [:0]const u8 {
@@ -672,6 +681,11 @@ const M6GraphCliFlags = struct {
             i.* += 1;
             if (i.* >= args.len) return error.MissingFlagValue;
             self.loop_adapter_amf_path = args[i.*];
+            return true;
+        } else if (std.mem.eql(u8, flag, "--vision-sidecar")) {
+            i.* += 1;
+            if (i.* >= args.len) return error.MissingFlagValue;
+            self.vision_sidecar_path = args[i.*];
             return true;
         } else if (std.mem.eql(u8, flag, "--loop-early-exit")) {
             self.loop_early_exit = true;
@@ -1083,9 +1097,143 @@ fn shouldUseGraphModel(
     }
     if (m7.hasPeers()) return true;
     if (draft_mode) |dm| {
-        if (dm == .self_recurrent or dm == .dspark) return true;
+        if (dm == .self_recurrent or dm == .dspark or dm == .dflare or dm == .dfly2) return true;
     }
     return false;
+}
+
+const ResolvedM82Draft = struct {
+    mode: aminfer.draft.DraftMode,
+    amf_path: ?[:0]u8 = null,
+    config_bytes: ?[]u8 = null,
+
+    fn deinit(self: *ResolvedM82Draft, allocator: std.mem.Allocator) void {
+        if (self.amf_path) |p| allocator.free(p);
+        if (self.config_bytes) |b| allocator.free(b);
+    }
+};
+
+fn fileExistsPosix(path_z: [:0]const u8) bool {
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return false;
+    _ = std.c.close(fd);
+    return true;
+}
+
+/// Auto-resolves `DFlare` (`dflare_config.json` / `dflare.amf` / `arch=dflash`) and
+/// `DFly2` (`dfly2_config.json` / `dfly2.amf`) from explicit flags or sibling model files.
+fn resolveM82DraftSpecAlloc(
+    allocator: std.mem.Allocator,
+    explicit_mode: ?aminfer.draft.DraftMode,
+    draft_amf_override: ?[:0]const u8,
+    draft_config_override: ?[:0]const u8,
+    anchor_path: []const u8,
+    gcfg: *const aminfer.graph.GraphConfig,
+) !?ResolvedM82Draft {
+    const dir = std.fs.path.dirname(anchor_path) orelse ".";
+
+    var cfg_bytes: ?[]u8 = null;
+    errdefer if (cfg_bytes) |b| allocator.free(b);
+    var detected_mode: ?aminfer.draft.DraftMode = explicit_mode;
+
+    if (draft_config_override) |dc_path| {
+        const raw = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
+        if (aminfer.dflare_dfly.detectDraftKindFromJson(raw)) |dk| {
+            cfg_bytes = raw;
+            if (detected_mode == null) {
+                detected_mode = if (dk == .dflare) .dflare else .dfly2;
+            }
+        } else {
+            allocator.free(raw);
+        }
+    }
+
+    // Check embedded `__meta.config_json` inside explicit `--draft-amf` (e.g. `dflash-Q8` GGUF-packed AMF).
+    if (detected_mode == null) {
+        if (draft_amf_override) |da_path| {
+            var af_opt: ?aminfer.amf.AmfFile = aminfer.amf.AmfFile.open(allocator, da_path) catch null;
+            if (af_opt) |*af| {
+                defer af.close(allocator);
+                if (af.parsed.find("__meta.config_json")) |me| {
+                    if (me.data_bytes > 0 and me.data_bytes <= 4 * 1024 * 1024) {
+                        const raw = try allocator.alloc(u8, @intCast(me.data_bytes));
+                        var done: usize = 0;
+                        var ok = true;
+                        while (done < raw.len) {
+                            const rc = std.c.pread(af.fd, raw.ptr + done, raw.len - done, @intCast(me.blob_offset + done));
+                            if (rc <= 0) {
+                                ok = false;
+                                break;
+                            }
+                            done += @intCast(rc);
+                        }
+                        if (ok) {
+                            if (aminfer.dflare_dfly.detectDraftKindFromJson(raw)) |dk| {
+                                detected_mode = if (dk == .dflare) .dflare else .dfly2;
+                                if (cfg_bytes == null) cfg_bytes = raw else allocator.free(raw);
+                            } else {
+                                allocator.free(raw);
+                            }
+                        } else {
+                            allocator.free(raw);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Auto-discover sibling `dflare.amf` / `dfly2.amf` when model family is M8.2.
+    if (detected_mode == null) {
+        if (gcfg.m82_family.isInkling2()) {
+            const sib_amf = try std.fmt.allocPrintSentinel(allocator, "{s}/dflare.amf", .{dir}, 0);
+            if (fileExistsPosix(sib_amf)) {
+                if (cfg_bytes == null) {
+                    const sib_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/dflare_config.json", .{dir}, 0);
+                    defer allocator.free(sib_cfg);
+                    if (fileExistsPosix(sib_cfg)) {
+                        cfg_bytes = try readFileAllocPosix(allocator, sib_cfg, 4 * 1024 * 1024);
+                    }
+                }
+                return .{ .mode = .dflare, .amf_path = sib_amf, .config_bytes = cfg_bytes };
+            }
+            allocator.free(sib_amf);
+        } else if (gcfg.m82_family.isHy4()) {
+            const sib_amf = try std.fmt.allocPrintSentinel(allocator, "{s}/dfly2.amf", .{dir}, 0);
+            if (fileExistsPosix(sib_amf)) {
+                if (cfg_bytes == null) {
+                    const sib_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/dfly2_config.json", .{dir}, 0);
+                    defer allocator.free(sib_cfg);
+                    if (fileExistsPosix(sib_cfg)) {
+                        cfg_bytes = try readFileAllocPosix(allocator, sib_cfg, 4 * 1024 * 1024);
+                    }
+                }
+                return .{ .mode = .dfly2, .amf_path = sib_amf, .config_bytes = cfg_bytes };
+            }
+            allocator.free(sib_amf);
+        }
+    }
+
+    const mode = detected_mode orelse return null;
+    if (mode != .dflare and mode != .dfly2) return null;
+
+    const amf_path: [:0]u8 = if (draft_amf_override) |p|
+        try std.fmt.allocPrintSentinel(allocator, "{s}", .{p}, 0)
+    else
+        try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, if (mode == .dflare) "dflare.amf" else "dfly2.amf" }, 0);
+    errdefer allocator.free(amf_path);
+
+    if (cfg_bytes == null) {
+        const sib_cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{
+            dir,
+            if (mode == .dflare) "dflare_config.json" else "dfly2_config.json",
+        }, 0);
+        defer allocator.free(sib_cfg);
+        if (fileExistsPosix(sib_cfg)) {
+            cfg_bytes = try readFileAllocPosix(allocator, sib_cfg, 4 * 1024 * 1024);
+        }
+    }
+    return .{ .mode = mode, .amf_path = amf_path, .config_bytes = cfg_bytes };
 }
 
 fn resolvePlePathsAlloc(
@@ -1101,10 +1249,25 @@ fn resolvePlePathsAlloc(
         }
         return out;
     }
+    const dir = std.fs.path.dirname(config_path) orelse ".";
     if (gcfg.ple_shard_files.len == 0) {
+        // Auto-discover `engram-00000-of-NNNNN.amf` shards for `Hy4-flash` FP8 Engram models.
+        if (gcfg.m82_family.isHy4() and gcfg.m82_cfg.engram_fp8_embedding) {
+            for ([_]usize{ 1, 2, 4, 8 }) |total_shards| {
+                const probe_p = try std.fmt.allocPrintSentinel(allocator, "{s}/engram-00000-of-{d:0>5}.amf", .{ dir, total_shards }, 0);
+                const exists = fileExistsPosix(probe_p);
+                allocator.free(probe_p);
+                if (exists) {
+                    const out = try allocator.alloc([:0]u8, total_shards);
+                    for (0..total_shards) |si| {
+                        out[si] = try std.fmt.allocPrintSentinel(allocator, "{s}/engram-{d:0>5}-of-{d:0>5}.amf", .{ dir, si, total_shards }, 0);
+                    }
+                    return out;
+                }
+            }
+        }
         return try allocator.alloc([:0]u8, 0);
     }
-    const dir = std.fs.path.dirname(config_path) orelse ".";
     const out = try allocator.alloc([:0]u8, gcfg.ple_shard_files.len);
     for (gcfg.ple_shard_files, 0..) |fname, idx| {
         if (std.fs.path.isAbsolute(fname)) {
@@ -1179,6 +1342,9 @@ const DecodeCliArgs = struct {
     image_path: ?[:0]const u8 = null,
     vt_test_video: ?aminfer.metal.VtCodec = null,
     dump_router_trace_path: ?[:0]const u8 = null,
+    draft_mode: ?aminfer.draft.DraftMode = null,
+    draft_amf_path: ?[:0]const u8 = null,
+    draft_config_path: ?[:0]const u8 = null,
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
     m7: M7ClusterCliFlags = .{},
@@ -1210,6 +1376,9 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var image_path: ?[:0]const u8 = null;
     var vt_test_video: ?aminfer.metal.VtCodec = null;
     var dump_router_trace_path: ?[:0]const u8 = null;
+    var draft_mode: ?aminfer.draft.DraftMode = null;
+    var draft_amf_path: ?[:0]const u8 = null;
+    var draft_config_path: ?[:0]const u8 = null;
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
     var m7: M7ClusterCliFlags = .{};
@@ -1307,6 +1476,18 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             vt_test_video = try parseVtCodec(args[i]);
+        } else if (std.mem.eql(u8, flag, "--draft-mode") or std.mem.eql(u8, flag, "-M")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            draft_mode = try aminfer.draft.DraftMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--draft-amf") or std.mem.eql(u8, flag, "-d")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            draft_amf_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--draft-config")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            draft_config_path = args[i];
         } else if (std.mem.eql(u8, flag, "--dump-router-trace")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -1361,6 +1542,9 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .image_path = image_path,
         .vt_test_video = vt_test_video,
         .dump_router_trace_path = dump_router_trace_path,
+        .draft_mode = draft_mode,
+        .draft_amf_path = draft_amf_path,
+        .draft_config_path = draft_config_path,
         .m6 = m6,
         .m69 = m69,
         .m7 = m7,
@@ -1678,6 +1862,7 @@ fn runDecodeGraph(
         .wired_budget_override = budget_override,
         .ple_paths = ple_paths,
         .loop_adapter_amf_path = cli.m6.loop_adapter_amf_path,
+        .vision_amf_path = cli.m6.vision_sidecar_path,
         .max_loops_override = cli.m6.max_loops,
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
@@ -1886,6 +2071,24 @@ fn runDecodeGraph(
             \\
         , .{ ps.nvme_reads, ps.cache_hits });
     }
+    if (model.m82Stats()) |ms| {
+        try out.print(
+            \\decode.m82.family                {s}
+            \\decode.m82.sme2_ctrl_calls       {d}
+            \\decode.m82.index_full_dispatches {d}
+            \\decode.m82.index_shared_reuses   {d}
+            \\decode.m82.cold_expert_fetches   {d}
+            \\decode.m82.cold_expert_hits      {d}
+            \\
+        , .{
+            gcfg.m82_family.label(),
+            ms.inkling2_sme2_ctrl_calls,
+            ms.hy4_index_full_dispatches,
+            ms.hy4_index_shared_reuses,
+            ms.cold_expert_fetches,
+            ms.cold_expert_cache_hits,
+        });
+    }
     if (model.coldExpertStats()) |cs| {
         try writeColdExpertStats("decode", cs, out);
     }
@@ -1940,7 +2143,37 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
     const cfg_bytes = meta.config.bytes;
     const tok_bytes = meta.tokenizer.bytes;
 
-    if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, null)) {
+    if (cli.draft_mode != null or cli.draft_amf_path != null or cli.draft_config_path != null) {
+        const spec_cli: SpecDecodeCliArgs = .{
+            .amf_path = cli.amf_path,
+            .config_path = cli.config_path,
+            .tokenizer_path = cli.tokenizer_path,
+            .prompt = cli.prompt,
+            .max_tokens = cli.max_tokens,
+            .draft_mode = cli.draft_mode,
+            .draft_amf_path = cli.draft_amf_path,
+            .draft_config_path = cli.draft_config_path,
+            .temperature = cli.temperature,
+            .seed = cli.seed,
+            .ignore_eos = cli.ignore_eos,
+            .verify_crcs = cli.verify_crcs,
+            .cold_slots = cli.cold_slots,
+            .wired_cap_mib = cli.wired_cap_mib,
+            .io_backend = cli.io_backend,
+            .prefill_mode = cli.prefill_mode,
+            .gpu_prefill_mode = cli.gpu_prefill_mode,
+            .strict_live_ram = cli.strict_live_ram,
+            .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+            .m6 = cli.m6,
+            .m69 = cli.m69,
+            .m7 = cli.m7,
+            .m81 = cli.m81,
+        };
+        if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, cli.draft_mode)) {
+            return runSpecDecodeGraph(allocator, spec_cli, cfg_bytes, tok_bytes, out);
+        }
+    }
+    if (shouldUseGraphModel(cfg_bytes, cli.m6, cli.m7, cli.draft_mode)) {
         return runDecodeGraph(allocator, cli, cfg_bytes, tok_bytes, out);
     }
     if (cli.image_path != null or cli.vt_test_video != null) {
@@ -2412,6 +2645,28 @@ fn runBenchM81(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
     try report.write(out);
 }
 
+fn runBenchM82(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    var cfg: aminfer.bench.M82Config = .{};
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        const flag = raw_args[i];
+        if (std.mem.eql(u8, flag, "--skip-synths")) {
+            cfg.include_python_synths = false;
+        } else if (std.mem.eql(u8, flag, "--tokens")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cfg.synth_tokens = try std.fmt.parseInt(u32, raw_args[i], 10);
+            if (cfg.synth_tokens < 2) return error.InvalidFlagValue;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    const report = try aminfer.bench.runM82WithConfig(allocator, cfg);
+    try report.write(out);
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
 fn parseQualityGateArgs(args: []const [:0]const u8) !aminfer.bench.QualityGateConfig {
     var cfg: aminfer.bench.QualityGateConfig = .{};
     var i: usize = 0;
@@ -2701,6 +2956,8 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try runBenchM78(allocator, &.{}, out);
     try out.flush();
     try runBenchM81(allocator, &.{}, out);
+    try out.flush();
+    try runBenchM82(allocator, &.{}, out);
 }
 
 const SpecDecodeCliArgs = struct {
@@ -3010,17 +3267,30 @@ fn runSpecDecodeGraph(
     }
 
     var draft_cfg_opt: ?aminfer.draft.DraftConfig = null;
-    var mode: aminfer.draft.DraftMode = cli.draft_mode orelse blk: {
-        const has_dspark_file = if (gcfg.dspark_amf_file) |f| f.len > 0 else false;
-        if (gcfg.axes.backbone_kind == .causal_enc_dec and (cli.draft_amf_path != null or has_dspark_file)) {
-            break :blk .dspark;
-        }
-        if (cli.draft_amf_path == null and gcfg.axes.loop_schedule.isRecurrent()) break :blk .self_recurrent;
-        break :blk .l1_only;
-    };
+    var m82_draft = try resolveM82DraftSpecAlloc(
+        allocator,
+        cli.draft_mode,
+        cli.draft_amf_path,
+        cli.draft_config_path,
+        cli.config_path orelse cli.amf_path,
+        &gcfg,
+    );
+    defer if (m82_draft) |*d| d.deinit(allocator);
+
+    var mode: aminfer.draft.DraftMode = if (m82_draft) |d|
+        d.mode
+    else
+        cli.draft_mode orelse blk: {
+            const has_dspark_file = if (gcfg.dspark_amf_file) |f| f.len > 0 else false;
+            if (gcfg.axes.backbone_kind == .causal_enc_dec and (cli.draft_amf_path != null or has_dspark_file)) {
+                break :blk .dspark;
+            }
+            if (cli.draft_amf_path == null and gcfg.axes.loop_schedule.isRecurrent()) break :blk .self_recurrent;
+            break :blk .l1_only;
+        };
 
     if (cli.draft_config_path) |dc_path| {
-        if (mode != .dspark) {
+        if (mode != .dspark and mode != .dflare and mode != .dfly2) {
             const dcfg_bytes = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
             defer allocator.free(dcfg_bytes);
             draft_cfg_opt = try aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes);
@@ -3031,7 +3301,7 @@ fn runSpecDecodeGraph(
             }
         }
     }
-    if (mode != .l1_only and mode != .self_recurrent and mode != .dspark) {
+    if (mode != .l1_only and mode != .self_recurrent and mode != .dspark and mode != .dflare and mode != .dfly2) {
         if (cli.draft_amf_path == null or draft_cfg_opt == null) return error.MissingRequiredFlag;
         draft_cfg_opt.?.format = mode;
     }
@@ -3047,7 +3317,7 @@ fn runSpecDecodeGraph(
         @as(u32, cli.max_tree_nodes);
     const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
     const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc| dc.aux_layer_ids else null;
-    const needs_taps = (mode != .l1_only and mode != .self_recurrent and mode != .dspark);
+    const needs_taps = (mode != .l1_only and mode != .self_recurrent and mode != .dspark and mode != .dflare and mode != .dfly2);
 
     if (!cli.m7.hasPeers() and cli.m7.effectiveTransport() == .tb5_rdma) {
         _ = try aminfer.transport.selectTransport(.tb5_rdma);
@@ -3073,6 +3343,7 @@ fn runSpecDecodeGraph(
         .wired_budget_override = budget_override,
         .ple_paths = ple_paths,
         .loop_adapter_amf_path = cli.m6.loop_adapter_amf_path,
+        .vision_amf_path = cli.m6.vision_sidecar_path,
         .max_loops_override = cli.m6.max_loops,
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
@@ -3120,6 +3391,43 @@ fn runSpecDecodeGraph(
         );
     }
 
+    var dflare_loaded: ?*aminfer.engine.LoadedDFlareProposer = null;
+    defer if (dflare_loaded) |df| df.deinit(allocator);
+    if (mode == .dflare) {
+        const d_path: [:0]const u8 = if (m82_draft) |d|
+            (d.amf_path orelse return error.MissingRequiredFlag)
+        else
+            (cli.draft_amf_path orelse return error.MissingRequiredFlag);
+        const d_cfg: ?[]const u8 = if (m82_draft) |d| d.config_bytes else null;
+        dflare_loaded = try aminfer.engine.LoadedDFlareProposer.loadFromFile(
+            allocator,
+            &model,
+            d_path,
+            d_cfg,
+            null,
+            budget_override,
+        );
+    }
+
+    var dfly2_loaded: ?*aminfer.engine.LoadedDFly2Proposer = null;
+    defer if (dfly2_loaded) |df2| df2.deinit(allocator);
+    if (mode == .dfly2) {
+        const d_path: [:0]const u8 = if (m82_draft) |d|
+            (d.amf_path orelse return error.MissingRequiredFlag)
+        else
+            (cli.draft_amf_path orelse return error.MissingRequiredFlag);
+        const d_cfg: ?[]const u8 = if (m82_draft) |d| d.config_bytes else null;
+        dfly2_loaded = try aminfer.engine.LoadedDFly2Proposer.loadFromFile(
+            allocator,
+            &model,
+            d_path,
+            d_cfg,
+            null,
+            null,
+            budget_override,
+        );
+    }
+
     var ngram_tbl_storage: aminfer.ngram_nvme.NvmeNgramTable = undefined;
     var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
     defer if (ngram_tbl_ptr) |nt| nt.deinit(allocator);
@@ -3153,6 +3461,10 @@ fn runSpecDecodeGraph(
     };
     var eng = if (dspark_loaded) |dp|
         try aminfer.engine.SpecEngine.initWithDSpark(allocator, &model, &dp.proposer, eng_opts)
+    else if (dflare_loaded) |df|
+        try aminfer.engine.SpecEngine.initWithDFlare(allocator, &model, df.proposer(), eng_opts)
+    else if (dfly2_loaded) |df2|
+        try aminfer.engine.SpecEngine.initWithDFly2(allocator, &model, df2.proposer(), eng_opts)
     else
         try aminfer.engine.SpecEngine.initWithGraph(allocator, &model, draft_head_ptr, eng_opts);
     defer eng.deinit(allocator);
@@ -3299,6 +3611,40 @@ fn runSpecDecodeGraph(
             m7_stats.encoder_layer_dispatches_prefill,
             m7_stats.encoder_layer_dispatches_decode,
             m7_stats.decoder_layer_dispatches_decode,
+        });
+    }
+    if (eng.stats.dflare_rounds > 0 or eng.stats.dfly2_rounds > 0) {
+        try out.print(
+            \\spec.dflare_rounds               {d}
+            \\spec.dflare_core3_batches        {d}
+            \\spec.dfly2_rounds                {d}
+            \\spec.dfly2_early_stops           {d}
+            \\spec.dfly2_total_drafted_steps   {d}
+            \\
+        , .{
+            eng.stats.dflare_rounds,
+            eng.stats.dflare_core3_batches,
+            eng.stats.dfly2_rounds,
+            eng.stats.dfly2_early_stops,
+            eng.stats.dfly2_total_drafted_steps,
+        });
+    }
+    if (model.m82Stats()) |ms| {
+        try out.print(
+            \\spec.m82.family                  {s}
+            \\spec.m82.sme2_ctrl_calls         {d}
+            \\spec.m82.index_full_dispatches   {d}
+            \\spec.m82.index_shared_reuses     {d}
+            \\spec.m82.cold_expert_fetches     {d}
+            \\spec.m82.cold_expert_hits        {d}
+            \\
+        , .{
+            gcfg.m82_family.label(),
+            ms.inkling2_sme2_ctrl_calls,
+            ms.hy4_index_full_dispatches,
+            ms.hy4_index_shared_reuses,
+            ms.cold_expert_fetches,
+            ms.cold_expert_cache_hits,
         });
     }
     if (model.pleStats()) |ps| {
@@ -5909,18 +6255,30 @@ fn runServeGraph(
     else
         1;
     var draft_cfg_opt: ?aminfer.draft.DraftConfig = null;
-    var mode: aminfer.draft.DraftMode = cli.draft_mode orelse .l1_only;
+    var m82_draft = if (use_spec) try resolveM82DraftSpecAlloc(
+        allocator,
+        cli.draft_mode,
+        cli.draft_amf_path,
+        cli.draft_config_path,
+        cli.config_path orelse cli.amf_path,
+        &gcfg,
+    ) else null;
+    defer if (m82_draft) |*d| d.deinit(allocator);
+
+    var mode: aminfer.draft.DraftMode = if (m82_draft) |d| d.mode else (cli.draft_mode orelse .l1_only);
     if (cli.draft_config_path) |dc_path| {
-        const dcfg_bytes = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
-        defer allocator.free(dcfg_bytes);
-        draft_cfg_opt = try aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes);
-        if (cli.draft_mode == null) {
-            mode = draft_cfg_opt.?.format;
-        } else {
-            draft_cfg_opt.?.format = mode;
+        if (mode != .dspark and mode != .dflare and mode != .dfly2) {
+            const dcfg_bytes = try readFileAllocPosix(allocator, dc_path, 4 * 1024 * 1024);
+            defer allocator.free(dcfg_bytes);
+            draft_cfg_opt = try aminfer.draft.DraftConfig.fromJson(allocator, dcfg_bytes);
+            if (cli.draft_mode == null) {
+                mode = draft_cfg_opt.?.format;
+            } else {
+                draft_cfg_opt.?.format = mode;
+            }
         }
     }
-    if (use_spec and mode != .l1_only and mode != .self_recurrent) {
+    if (use_spec and mode != .l1_only and mode != .self_recurrent and mode != .dspark and mode != .dflare and mode != .dfly2) {
         if (cli.draft_amf_path == null or draft_cfg_opt == null) return error.MissingRequiredFlag;
         draft_cfg_opt.?.format = mode;
     }
@@ -5938,7 +6296,7 @@ fn runServeGraph(
         @as(u32, cli.max_tree_nodes);
     const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
     const aux_ids: ?[3]u32 = if (draft_cfg_opt) |dc| dc.aux_layer_ids else null;
-    const needs_taps = use_spec and mode != .l1_only and mode != .self_recurrent;
+    const needs_taps = use_spec and mode != .l1_only and mode != .self_recurrent and mode != .dspark and mode != .dflare and mode != .dfly2;
 
     var model = try aminfer.graph.GraphModel.loadFromFile(allocator, cli.amf_path, gcfg, .{
         .max_seq_len = max_seq_len,
@@ -5948,6 +6306,7 @@ fn runServeGraph(
         .wired_budget_override = budget_override,
         .ple_paths = ple_paths,
         .loop_adapter_amf_path = cli.m6.loop_adapter_amf_path,
+        .vision_amf_path = cli.m6.vision_sidecar_path,
         .max_loops_override = cli.m6.max_loops,
         .enable_loop_early_exit = cli.m6.loop_early_exit,
         .cold_slot_count = cli.cold_slots,
@@ -5965,6 +6324,11 @@ fn runServeGraph(
     var draft_head_storage: aminfer.draft.DraftHead = undefined;
     var draft_head_ptr: ?*aminfer.draft.DraftHead = null;
     defer if (draft_head_ptr) |dh| dh.deinitForGraph(allocator, &model);
+
+    var dflare_loaded: ?*aminfer.engine.LoadedDFlareProposer = null;
+    defer if (dflare_loaded) |df| df.deinit(allocator);
+    var dfly2_loaded: ?*aminfer.engine.LoadedDFly2Proposer = null;
+    defer if (dfly2_loaded) |df2| df2.deinit(allocator);
 
     var ngram_tbl_storage: aminfer.ngram_nvme.NvmeNgramTable = undefined;
     var ngram_tbl_ptr: ?*aminfer.ngram_nvme.NvmeNgramTable = null;
@@ -6024,8 +6388,16 @@ fn runServeGraph(
                 },
             );
             draft_head_ptr = &draft_head_storage;
+        } else if (mode == .dflare) {
+            const d_path: [:0]const u8 = if (m82_draft) |d| (d.amf_path orelse return error.MissingRequiredFlag) else (cli.draft_amf_path orelse return error.MissingRequiredFlag);
+            const d_cfg: ?[]const u8 = if (m82_draft) |d| d.config_bytes else null;
+            dflare_loaded = try aminfer.engine.LoadedDFlareProposer.loadFromFile(allocator, &model, d_path, d_cfg, null, budget_override);
+        } else if (mode == .dfly2) {
+            const d_path: [:0]const u8 = if (m82_draft) |d| (d.amf_path orelse return error.MissingRequiredFlag) else (cli.draft_amf_path orelse return error.MissingRequiredFlag);
+            const d_cfg: ?[]const u8 = if (m82_draft) |d| d.config_bytes else null;
+            dfly2_loaded = try aminfer.engine.LoadedDFly2Proposer.loadFromFile(allocator, &model, d_path, d_cfg, null, null, budget_override);
         }
-        spec_eng_storage = try aminfer.engine.SpecEngine.initWithGraph(allocator, &model, draft_head_ptr, .{
+        const srv_spec_opts: aminfer.engine.SpecConfig = .{
             .mode = mode,
             .placement = cli.placement,
             .max_tree_nodes = cli.max_tree_nodes,
@@ -6038,7 +6410,13 @@ fn runServeGraph(
             .pearl_min_target_us = cli.pearl_min_target_ms * 1000.0,
             .ngram_table = ngram_tbl_ptr,
             .ngram_registry = ngram_reg_ptr,
-        });
+        };
+        spec_eng_storage = if (dflare_loaded) |df|
+            try aminfer.engine.SpecEngine.initWithDFlare(allocator, &model, df.proposer(), srv_spec_opts)
+        else if (dfly2_loaded) |df2|
+            try aminfer.engine.SpecEngine.initWithDFly2(allocator, &model, df2.proposer(), srv_spec_opts)
+        else
+            try aminfer.engine.SpecEngine.initWithGraph(allocator, &model, draft_head_ptr, srv_spec_opts);
         spec_eng_ptr = &spec_eng_storage;
     }
 
@@ -6929,6 +7307,11 @@ const ChatCliArgs = struct {
     strict_live_ram: bool = false,
     verify_crcs: bool = true,
     act_quant_policy: aminfer.quant_formats.ActQuantPolicy = .none,
+    draft_mode: ?aminfer.draft.DraftMode = null,
+    draft_amf_path: ?[:0]const u8 = null,
+    draft_config_path: ?[:0]const u8 = null,
+    cold_slots: u32 = 64,
+    m6: M6GraphCliFlags = .{},
     chat_cfg: aminfer.chat_repl.ChatConfig = .{},
 };
 
@@ -6939,6 +7322,7 @@ fn parseChatCliArgs(args: []const [:0]const u8) !ChatCliArgs {
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
+        if (try out.m6.tryParseFlag(args, &i)) continue;
         const flag = args[i];
         if (std.mem.eql(u8, flag, "--model") or std.mem.eql(u8, flag, "-m") or std.mem.eql(u8, flag, "--amf")) {
             i += 1;
@@ -6956,6 +7340,22 @@ fn parseChatCliArgs(args: []const [:0]const u8) !ChatCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             out.tokenizer_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--draft-mode") or std.mem.eql(u8, flag, "-M")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.draft_mode = try aminfer.draft.DraftMode.parse(args[i]);
+        } else if (std.mem.eql(u8, flag, "--draft-amf") or std.mem.eql(u8, flag, "-d")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.draft_amf_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--draft-config")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.draft_config_path = args[i];
+        } else if (std.mem.eql(u8, flag, "--cold-slots")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            out.cold_slots = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, flag, "--lora") or std.mem.eql(u8, flag, "-L")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -7374,6 +7774,318 @@ const ChatEngineRunner = struct {
     }
 };
 
+const GraphChatEngineRunner = struct {
+    model: *aminfer.graph.GraphModel,
+    spec_eng: ?*aminfer.engine.SpecEngine,
+    tok: *const aminfer.tokenizer.Tokenizer,
+    chat_template: aminfer.chat_template.ChatTemplate,
+    max_seq_len: u32,
+    bos_token_id: u32,
+    stop_tokens: [6]u32,
+    stop_token_count: usize,
+    encode_scratch: aminfer.tokenizer.EncodeScratch,
+    prompt_ids_buf: []u32,
+    p_res: []f32,
+    sampler_cand_ids: []u32,
+    penalty_tracker: *aminfer.sampling.DefaultPenaltyTracker,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        model: *aminfer.graph.GraphModel,
+        spec_eng: ?*aminfer.engine.SpecEngine,
+        tok: *const aminfer.tokenizer.Tokenizer,
+        chat_tpl: aminfer.chat_template.ChatTemplate,
+        max_seq_len: u32,
+    ) !GraphChatEngineRunner {
+        var encode_scratch = try aminfer.tokenizer.EncodeScratch.init(
+            allocator,
+            @max(@as(usize, 8192), @as(usize, max_seq_len) * 2),
+        );
+        errdefer encode_scratch.deinit(allocator);
+        const prompt_ids_buf = try allocator.alloc(u32, max_seq_len);
+        errdefer allocator.free(prompt_ids_buf);
+        const v_cap = @max(@as(usize, 1), @as(usize, model.config.vocab_size));
+        const p_res = try allocator.alloc(f32, v_cap);
+        errdefer allocator.free(p_res);
+        const sampler_cand_ids = try allocator.alloc(u32, v_cap);
+        errdefer allocator.free(sampler_cand_ids);
+        const penalty_tracker = try allocator.create(aminfer.sampling.DefaultPenaltyTracker);
+        errdefer allocator.destroy(penalty_tracker);
+        penalty_tracker.* = aminfer.sampling.DefaultPenaltyTracker.init();
+
+        var stop_tokens: [6]u32 = @splat(0);
+        var stop_cnt: usize = 0;
+        const tpl_eos_id: ?u32 = blk: {
+            const s = chat_tpl.eos_token.slice();
+            break :blk if (s.len > 0) tok.addedTokenId(s) else null;
+        };
+        const candidates = [_]?u32{
+            model.config.eos_token_id,
+            tpl_eos_id,
+            tok.addedTokenId("<|content_model_end_sampling|>"),
+            tok.addedTokenId("<|im_end|>"),
+            tok.addedTokenId("<|endoftext|>"),
+            tok.addedTokenId("<｜end▁of▁sentence｜>"),
+        };
+        for (candidates) |maybe_id| {
+            const id = maybe_id orelse continue;
+            var dup = false;
+            for (stop_tokens[0..stop_cnt]) |existing| {
+                if (existing == id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup and stop_cnt < stop_tokens.len) {
+                stop_tokens[stop_cnt] = id;
+                stop_cnt += 1;
+            }
+        }
+        return .{
+            .model = model,
+            .spec_eng = spec_eng,
+            .tok = tok,
+            .chat_template = chat_tpl,
+            .max_seq_len = max_seq_len,
+            .bos_token_id = if (model.config.bos_token_id < model.config.vocab_size) model.config.bos_token_id else 0,
+            .stop_tokens = stop_tokens,
+            .stop_token_count = stop_cnt,
+            .encode_scratch = encode_scratch,
+            .prompt_ids_buf = prompt_ids_buf,
+            .p_res = p_res,
+            .sampler_cand_ids = sampler_cand_ids,
+            .penalty_tracker = penalty_tracker,
+        };
+    }
+
+    fn deinit(self: *GraphChatEngineRunner, allocator: std.mem.Allocator) void {
+        allocator.destroy(self.penalty_tracker);
+        allocator.free(self.sampler_cand_ids);
+        allocator.free(self.p_res);
+        allocator.free(self.prompt_ids_buf);
+        self.encode_scratch.deinit(allocator);
+    }
+
+    fn isStopToken(self: *const GraphChatEngineRunner, tid: u32) bool {
+        for (self.stop_tokens[0..self.stop_token_count]) |st| {
+            if (tid == st) return true;
+        }
+        return false;
+    }
+
+    fn turnRunner(self: *GraphChatEngineRunner) aminfer.chat_repl.TurnRunner {
+        return .{
+            .ctx = self,
+            .runTurnFn = runTurnCallback,
+            .onClearFn = onClearCallback,
+        };
+    }
+
+    fn onClearCallback(ctx: *anyopaque) void {
+        const self: *GraphChatEngineRunner = @ptrCast(@alignCast(ctx));
+        self.model.resetKvCache();
+    }
+
+    fn runTurnCallback(
+        ctx: *anyopaque,
+        req: *const aminfer.chat_repl.TurnRequest,
+        stream: *aminfer.chat_repl.TurnStream,
+    ) aminfer.chat_repl.Error!aminfer.chat_repl.TurnStats {
+        const self: *GraphChatEngineRunner = @ptrCast(@alignCast(ctx));
+        const t0 = try aminfer.vmstat.nowNs();
+
+        var prompt_ids = self.tok.encodeWithScratch(
+            &self.encode_scratch,
+            req.chatml_prompt,
+            self.prompt_ids_buf,
+        ) catch return error.PromptTooLarge;
+        if (prompt_ids.len == 0) {
+            self.prompt_ids_buf[0] = self.bos_token_id;
+            prompt_ids = self.prompt_ids_buf[0..1];
+        }
+        if (prompt_ids.len + 1 >= self.max_seq_len) return error.PromptTooLarge;
+
+        const sampling_params: aminfer.sampling.SamplingParams = .{
+            .temperature = req.temperature,
+            .top_p = req.top_p,
+            .top_k = req.top_k,
+            .min_p = req.min_p,
+            .repetition_penalty = req.repetition_penalty,
+            .presence_penalty = req.presence_penalty,
+            .frequency_penalty = req.frequency_penalty,
+        };
+        const use_constrained = !sampling_params.isUnconstrainedGreedy();
+        self.penalty_tracker.reset();
+        if (sampling_params.hasPenalties()) self.penalty_tracker.recordSlice(prompt_ids);
+
+        var req_rng = aminfer.rng.RequestRng.init(req.seed) catch return error.BackendFailed;
+        const prompt_len_u32: u32 = @intCast(prompt_ids.len);
+        const room: u32 = self.max_seq_len - prompt_len_u32 - 1;
+        const max_gen: u32 = @min(req.max_tokens, room);
+        var emitted: u32 = 0;
+
+        if (self.spec_eng) |eng| {
+            eng.reset();
+            eng.config.temperature = req.temperature;
+            const rng_opt: ?std.Random = if (req.temperature > 0.0) req_rng.random() else null;
+            const first_tok = eng.prefill(prompt_ids, rng_opt) catch return error.BackendFailed;
+            if (max_gen > 0 and !self.isStopToken(first_tok)) {
+                const p0 = self.tok.tokenBytes(first_tok) catch "";
+                if (!self.tok.isSpecialToken(first_tok) or self.chat_template.isStructuralControlToken(p0)) {
+                    try stream.emitText(p0);
+                }
+                emitted = 1;
+                var round_buf: [aminfer.engine.MAX_TREE_NODES]u32 = undefined;
+                while (emitted < max_gen) {
+                    const rem = max_gen - emitted;
+                    const rr = eng.stepRound(rng_opt, round_buf[0..@min(@as(usize, rem), round_buf.len)]) catch return error.BackendFailed;
+                    var hit_stop = false;
+                    for (round_buf[0..rr.emitted_count]) |tid| {
+                        if (self.isStopToken(tid)) {
+                            hit_stop = true;
+                            break;
+                        }
+                        const piece = self.tok.tokenBytes(tid) catch "";
+                        if (!self.tok.isSpecialToken(tid) or self.chat_template.isStructuralControlToken(piece)) {
+                            try stream.emitText(piece);
+                        }
+                        emitted += 1;
+                        if (emitted >= max_gen) break;
+                    }
+                    if (hit_stop or rr.emitted_count == 0) break;
+                }
+            }
+        } else {
+            self.model.resetKvCache();
+            var cur_tok = self.model.prefillChunk(prompt_ids, 0, true) catch return error.BackendFailed;
+            const v_size: usize = @min(@as(usize, self.model.config.vocab_size), self.p_res.len);
+            if (use_constrained) {
+                const raw_lg = self.model.readLastLogitsF16();
+                const seen = if (sampling_params.hasPenalties()) self.penalty_tracker.activeEntries() else &.{};
+                const s_out = aminfer.sampling.sampleToken(f16, raw_lg[0..@min(raw_lg.len, v_size)], sampling_params, seen, &req_rng, .{
+                    .logits_f32 = self.p_res[0..v_size],
+                    .cand_ids = self.sampler_cand_ids[0..v_size],
+                }) catch return error.BackendFailed;
+                cur_tok = s_out.token_id;
+                if (sampling_params.hasPenalties()) self.penalty_tracker.recordToken(cur_tok);
+            }
+            if (max_gen > 0 and !self.isStopToken(cur_tok)) {
+                const p0 = self.tok.tokenBytes(cur_tok) catch "";
+                if (!self.tok.isSpecialToken(cur_tok) or self.chat_template.isStructuralControlToken(p0)) {
+                    try stream.emitText(p0);
+                }
+                emitted = 1;
+                var pos: u32 = prompt_len_u32;
+                while (emitted < max_gen) {
+                    cur_tok = self.model.stepDecode(cur_tok, pos) catch return error.BackendFailed;
+                    if (use_constrained) {
+                        const raw_lg = self.model.readLastLogitsF16();
+                        const seen = if (sampling_params.hasPenalties()) self.penalty_tracker.activeEntries() else &.{};
+                        const s_out = aminfer.sampling.sampleToken(f16, raw_lg[0..@min(raw_lg.len, v_size)], sampling_params, seen, &req_rng, .{
+                            .logits_f32 = self.p_res[0..v_size],
+                            .cand_ids = self.sampler_cand_ids[0..v_size],
+                        }) catch return error.BackendFailed;
+                        cur_tok = s_out.token_id;
+                        if (sampling_params.hasPenalties()) self.penalty_tracker.recordToken(cur_tok);
+                    }
+                    pos += 1;
+                    if (self.isStopToken(cur_tok)) break;
+                    const piece = self.tok.tokenBytes(cur_tok) catch "";
+                    if (!self.tok.isSpecialToken(cur_tok) or self.chat_template.isStructuralControlToken(piece)) {
+                        try stream.emitText(piece);
+                    }
+                    emitted += 1;
+                }
+            }
+        }
+
+        const t1 = try aminfer.vmstat.nowNs();
+        const ttft_ns: u64 = if (stream.first_token_ns) |ft| (ft -| t0) else (t1 -| t0);
+        return .{
+            .prompt_tokens = prompt_len_u32,
+            .generated_tokens = emitted,
+            .prefix_hit_tokens = 0,
+            .ttft_ns = ttft_ns,
+            .total_ns = t1 -| t0,
+        };
+    }
+};
+
+fn runChatGraph(
+    allocator: std.mem.Allocator,
+    cli: ChatCliArgs,
+    amf_path: [:0]const u8,
+    cfg_bytes: []const u8,
+    tok_bytes: []const u8,
+) !void {
+    var gcfg = try aminfer.graph.GraphConfig.fromJson(allocator, cfg_bytes);
+    defer gcfg.deinit(allocator);
+
+    var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
+    defer tok.deinit(allocator);
+
+    const ple_paths = try resolvePlePathsAlloc(allocator, &cli.m6, cli.config_path orelse amf_path, &gcfg);
+    defer freePlePaths(allocator, ple_paths);
+
+    var m82_draft = if (cli.draft_mode != null or cli.draft_amf_path != null or cli.draft_config_path != null)
+        try resolveM82DraftSpecAlloc(allocator, cli.draft_mode, cli.draft_amf_path, cli.draft_config_path, cli.config_path orelse amf_path, &gcfg)
+    else
+        null;
+    defer if (m82_draft) |*d| d.deinit(allocator);
+
+    const max_seq_len: u32 = @min(gcfg.max_position_embeddings, @max(@as(u32, 512), cli.max_seq_len));
+    const budget_override = try buildBudgetOverride(cli.wired_cap_mib);
+
+    var model = try aminfer.graph.GraphModel.loadFromFile(allocator, amf_path, gcfg, .{
+        .max_seq_len = max_seq_len,
+        .max_tree_nodes = 16,
+        .wired_budget_override = budget_override,
+        .ple_paths = ple_paths,
+        .loop_adapter_amf_path = cli.m6.loop_adapter_amf_path,
+        .vision_amf_path = cli.m6.vision_sidecar_path,
+        .max_loops_override = cli.m6.max_loops,
+        .enable_loop_early_exit = cli.m6.loop_early_exit,
+        .cold_slot_count = cli.cold_slots,
+        .strict_live_ram = cli.strict_live_ram,
+        .act_quant_policy = cli.act_quant_policy,
+    });
+    defer model.deinit(allocator);
+
+    var dflare_loaded: ?*aminfer.engine.LoadedDFlareProposer = null;
+    defer if (dflare_loaded) |df| df.deinit(allocator);
+    var dfly2_loaded: ?*aminfer.engine.LoadedDFly2Proposer = null;
+    defer if (dfly2_loaded) |df2| df2.deinit(allocator);
+    var spec_eng_storage: aminfer.engine.SpecEngine = undefined;
+    var spec_eng_ptr: ?*aminfer.engine.SpecEngine = null;
+    defer if (spec_eng_ptr) |se| se.deinit(allocator);
+
+    if (m82_draft) |d| {
+        const d_path = d.amf_path orelse return error.MissingRequiredFlag;
+        const spec_opts: aminfer.engine.SpecConfig = .{
+            .mode = d.mode,
+            .max_tree_nodes = 16,
+            .enable_pruning = false,
+        };
+        if (d.mode == .dflare) {
+            dflare_loaded = try aminfer.engine.LoadedDFlareProposer.loadFromFile(allocator, &model, d_path, d.config_bytes, null, budget_override);
+            spec_eng_storage = try aminfer.engine.SpecEngine.initWithDFlare(allocator, &model, dflare_loaded.?.proposer(), spec_opts);
+            spec_eng_ptr = &spec_eng_storage;
+        } else if (d.mode == .dfly2) {
+            dfly2_loaded = try aminfer.engine.LoadedDFly2Proposer.loadFromFile(allocator, &model, d_path, d.config_bytes, null, null, budget_override);
+            spec_eng_storage = try aminfer.engine.SpecEngine.initWithDFly2(allocator, &model, dfly2_loaded.?.proposer(), spec_opts);
+            spec_eng_ptr = &spec_eng_storage;
+        }
+    }
+
+    const chat_tpl = try resolveChatTemplateForAmf(allocator, amf_path, &tok);
+    var chat_runner = try GraphChatEngineRunner.init(allocator, &model, spec_eng_ptr, &tok, chat_tpl, max_seq_len);
+    defer chat_runner.deinit(allocator);
+
+    var effective_chat_cfg = cli.chat_cfg;
+    effective_chat_cfg.chat_template = chat_tpl;
+    try aminfer.chat_repl.runReplOrPipe(allocator, effective_chat_cfg, chat_runner.turnRunner(), 0, 1, 2, null);
+}
+
 fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
     const cli = try parseChatCliArgs(raw_args);
     if (cli.chat_cfg.show_help) {
@@ -7384,6 +8096,9 @@ fn runChat(allocator: std.mem.Allocator, raw_args: []const [:0]const u8) !void {
 
     var meta = try resolveConfigAndTokenizerAlloc(allocator, amf_path, cli.config_path, cli.tokenizer_path);
     defer meta.deinit(allocator);
+    if (shouldUseGraphModel(meta.config.bytes, cli.m6, .{}, cli.draft_mode)) {
+        return runChatGraph(allocator, cli, amf_path, meta.config.bytes, meta.tokenizer.bytes);
+    }
     const cfg = try aminfer.qwen3.ModelConfig.fromJson(allocator, meta.config.bytes);
 
     var tok = try aminfer.tokenizer.Tokenizer.fromHuggingFaceJson(allocator, meta.tokenizer.bytes);
@@ -8823,4 +9538,41 @@ test "M8.15 C18 BatchServeRunner isolates concurrent out-of-order slot binding a
     try std.testing.expectEqual(@as(u64, 101), br.slot_constraints[1].request_id);
     try std.testing.expect(!br.slot_constraints[1].active);
     try std.testing.expectEqual(@as(usize, 0), br.slot_penalties[1].activeEntries().len);
+}
+
+test "m82: CLI parses --draft-mode dflare|dfly2, --vision-sidecar, and chat --reasoning-effort" {
+    const spec_dflare = try parseSpecDecodeArgs(&.{
+        "-m",             "inkling2.amf",
+        "--draft-mode",   "dflare",
+        "--draft-amf",    "dflare.amf",
+        "--draft-config", "dflare_config.json",
+        "-p",             "hello",
+        "-n",             "16",
+    });
+    try std.testing.expectEqual(aminfer.draft.DraftMode.dflare, spec_dflare.draft_mode.?);
+    try std.testing.expectEqualStrings("dflare.amf", spec_dflare.draft_amf_path.?);
+    try std.testing.expectEqualStrings("dflare_config.json", spec_dflare.draft_config_path.?);
+
+    const spec_dfly2 = try parseSpecDecodeArgs(&.{
+        "-m",           "hy4.amf",
+        "--draft-mode", "dfly2",
+        "-p",           "hello",
+    });
+    try std.testing.expectEqual(aminfer.draft.DraftMode.dfly2, spec_dfly2.draft_mode.?);
+
+    const dec_vis = try parseDecodeArgs(&.{
+        "-m",               "inkling2.amf",
+        "--vision-sidecar", "inkling2-vision.amf",
+        "-p",               "hi",
+    });
+    try std.testing.expectEqualStrings("inkling2-vision.amf", dec_vis.m6.vision_sidecar_path.?);
+
+    const chat_hi = try parseChatCliArgs(&.{
+        "-m",                 "inkling2.amf",
+        "--reasoning-effort", "high",
+        "--draft-mode",       "dflare",
+        "-n",                 "32",
+    });
+    try std.testing.expectEqual(@as(?aminfer.chat_template.ReasoningEffort, .high), chat_hi.chat_cfg.reasoning_effort);
+    try std.testing.expectEqual(aminfer.draft.DraftMode.dflare, chat_hi.draft_mode.?);
 }

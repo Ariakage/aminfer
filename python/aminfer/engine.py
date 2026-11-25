@@ -26,6 +26,11 @@ from aminfer._bindings import (
     AMI_SDK_DIALECT_HY4,
     AMI_SDK_DIALECT_INKLING2,
     AMI_SDK_DIALECT_QWEN,
+    AMI_SDK_DRAFT_AUTO,
+    AMI_SDK_DRAFT_DFLARE,
+    AMI_SDK_DRAFT_DFLY2,
+    AMI_SDK_DRAFT_L1,
+    AMI_SDK_DRAFT_NONE,
     AMI_SDK_EFFORT_CUSTOM_FLOAT,
     AMI_SDK_EFFORT_DEFAULT,
     AMI_SDK_EFFORT_HIGH,
@@ -49,6 +54,8 @@ from aminfer._bindings import (
     HostVmInfoC,
     InvalidArgumentError,
     RerankParamsC,
+    SpecOptionsC,
+    SpecStatsC,
     StreamEventC,
     TensorViewC,
     VisionInfoC,
@@ -139,6 +146,33 @@ class VisionFormat(enum.IntEnum):
     F16 = 3
 
 
+class DraftMode(enum.IntEnum):
+    NONE = AMI_SDK_DRAFT_NONE
+    AUTO = AMI_SDK_DRAFT_AUTO
+    L1 = AMI_SDK_DRAFT_L1
+    DFLARE = AMI_SDK_DRAFT_DFLARE
+    DFLY2 = AMI_SDK_DRAFT_DFLY2
+
+
+def _coerce_draft_mode(mode: DraftMode | str) -> DraftMode:
+    if isinstance(mode, DraftMode):
+        return mode
+    if not isinstance(mode, str):
+        raise _invalid_arg(f"unsupported draft_mode: {mode!r}")
+    norm = mode.strip().lower()
+    if norm in ("none", "off", "disabled"):
+        return DraftMode.NONE
+    if norm == "auto":
+        return DraftMode.AUTO
+    if norm in ("l1", "l1_only", "sam"):
+        return DraftMode.L1
+    if norm in ("dflare", "dflash"):
+        return DraftMode.DFLARE
+    if norm in ("dfly2", "dfly"):
+        return DraftMode.DFLY2
+    raise _invalid_arg(f"unsupported draft_mode: {mode!r}")
+
+
 def _coerce_dtype(dtype: DType | str) -> DType:
     if isinstance(dtype, DType):
         return dtype
@@ -211,6 +245,19 @@ class EngineStats:
     wired_budget_bytes: int
     live_reclaimable_bytes: int
     live_budget_bytes: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SpecStats:
+    active_draft_mode: DraftMode
+    rounds: int
+    emitted_tokens: int
+    drafted_nodes: int
+    dflare_rounds: int
+    dflare_core3_batches: int
+    dfly2_rounds: int
+    dfly2_early_stops: int
+    mean_accept_len: float
 
 
 _EFFORT_NAME_MAP: dict[str, int] = {
@@ -832,6 +879,12 @@ class Engine:
         max_seq_len: int = 2048,
         verify_crcs: bool = True,
         startup_canary: bool = True,
+        draft_mode: DraftMode | str | None = None,
+        draft_amf_path: str | os.PathLike[str] | None = None,
+        draft_config_path: str | os.PathLike[str] | None = None,
+        spec_max_tree_nodes: int = 16,
+        spec_enable_pruning: bool = False,
+        spec_confidence_threshold: float = 0.0,
         lib_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self._lib = load_lib(lib_path)
@@ -873,6 +926,19 @@ class Engine:
                 self._lib, ctypes.c_void_p(tok_ptr), _owned=False, _owner=self
             )
         self._vocab_size: int = self.stats.vocab_size
+        if draft_mode is not None or draft_amf_path is not None or draft_config_path is not None:
+            try:
+                self.configure_speculative(
+                    draft_mode=draft_mode if draft_mode is not None else DraftMode.AUTO,
+                    draft_amf_path=draft_amf_path,
+                    draft_config_path=draft_config_path,
+                    max_tree_nodes=spec_max_tree_nodes,
+                    enable_pruning=spec_enable_pruning,
+                    confidence_threshold=spec_confidence_threshold,
+                )
+            except Exception:
+                self.close()
+                raise
 
     @staticmethod
     def host_vm_snapshot(*, lib_path: str | os.PathLike[str] | None = None) -> HostVmSnapshot:
@@ -940,6 +1006,57 @@ class Engine:
             wired_budget_bytes=int(raw.wired_budget_bytes),
             live_reclaimable_bytes=int(raw.live_reclaimable_bytes),
             live_budget_bytes=int(raw.live_budget_bytes),
+        )
+
+    def configure_speculative(
+        self,
+        draft_mode: DraftMode | str = DraftMode.AUTO,
+        *,
+        draft_amf_path: str | os.PathLike[str] | None = None,
+        draft_config_path: str | os.PathLike[str] | None = None,
+        max_tree_nodes: int = 16,
+        enable_pruning: bool = False,
+        confidence_threshold: float = 0.0,
+    ) -> None:
+        mode = _coerce_draft_mode(draft_mode)
+        max_nodes_u32 = _validate_u32(max_tree_nodes, "max_tree_nodes")
+        conf_f = _validate_finite_float(confidence_threshold, "confidence_threshold")
+        if conf_f < 0.0 or conf_f > 1.0:
+            raise _invalid_arg(f"confidence_threshold must be in [0.0, 1.0], got {conf_f}")
+
+        opts = SpecOptionsC()
+        self._lib.ami_sdk_spec_options_init(ctypes.byref(opts))
+        opts.struct_size = ctypes.sizeof(SpecOptionsC)
+        opts.draft_mode = int(mode)
+        amf_b = os.fsencode(os.fspath(draft_amf_path)) if draft_amf_path is not None else None
+        cfg_b = os.fsencode(os.fspath(draft_config_path)) if draft_config_path is not None else None
+        opts.draft_amf_path = amf_b
+        opts.draft_config_path = cfg_b
+        opts.max_tree_nodes = max_nodes_u32
+        opts.enable_pruning = 1 if enable_pruning else 0
+        opts.confidence_threshold = float(conf_f)
+        check_status(
+            self._lib,
+            self._lib.ami_sdk_engine_configure_speculative(self._require_open(), ctypes.byref(opts)),
+        )
+
+    @property
+    def spec_stats(self) -> SpecStats:
+        raw = SpecStatsC(struct_size=ctypes.sizeof(SpecStatsC))
+        check_status(
+            self._lib,
+            self._lib.ami_sdk_engine_query_spec_stats(self._require_open(), ctypes.byref(raw)),
+        )
+        return SpecStats(
+            active_draft_mode=DraftMode(int(raw.active_draft_mode)),
+            rounds=int(raw.rounds),
+            emitted_tokens=int(raw.emitted_tokens),
+            drafted_nodes=int(raw.drafted_nodes),
+            dflare_rounds=int(raw.dflare_rounds),
+            dflare_core3_batches=int(raw.dflare_core3_batches),
+            dfly2_rounds=int(raw.dfly2_rounds),
+            dfly2_early_stops=int(raw.dfly2_early_stops),
+            mean_accept_len=float(raw.mean_accept_len),
         )
 
     @property
