@@ -823,6 +823,17 @@ def _load_native_rco_lib() -> ctypes.CDLL | None:
             ctypes.POINTER(ctypes.c_double),
         ]
         fn.restype = ctypes.c_int32
+        deq_nvfp4 = getattr(lib, "ami_sdk_dequant_nvfp4_rows_f32", None)
+        if deq_nvfp4 is not None:
+            deq_nvfp4.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_float,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ]
+            deq_nvfp4.restype = ctypes.c_int32
         _NATIVE_RCO_LIB_CACHE[cache_key] = lib
         return lib
 
@@ -1049,6 +1060,37 @@ def quantize_raw_rows_affine_native(
     if rc != 0:
         raise RuntimeError(f"ami_sdk_quantize_rows_affine_raw failed with status {rc}")
     return q_buf.raw, p_buf.raw, float(mse_out.value)
+
+
+def dequant_nvfp4_rows_f32_native(
+    data_raw: bytes | bytearray | memoryview,
+    scales_raw: bytes | bytearray | memoryview,
+    outer_scale: float,
+    n_rows: int,
+    k: int,
+) -> bytearray:
+    """Batch-dequantize row-major NVFP4_G16 bytes into contiguous float32 bytearray via `libaminfer.dylib`."""
+    if n_rows == 0:
+        return bytearray()
+    lib = _load_native_rco_lib()
+    fn = getattr(lib, "ami_sdk_dequant_nvfp4_rows_f32", None) if lib is not None else None
+    if fn is None:
+        raise RuntimeError("libaminfer native NVFP4 dequant helper is not available")
+    out_buf = bytearray(n_rows * k * 4)
+    out_c = (ctypes.c_char * len(out_buf)).from_buffer(out_buf)
+    d_keep = data_raw if isinstance(data_raw, bytes) else bytes(data_raw)
+    s_keep = scales_raw if isinstance(scales_raw, bytes) else bytes(scales_raw)
+    rc = fn(
+        ctypes.c_char_p(d_keep),
+        ctypes.c_char_p(s_keep),
+        ctypes.c_float(outer_scale),
+        ctypes.c_uint32(n_rows),
+        ctypes.c_uint32(k),
+        out_c,
+    )
+    if rc != 0:
+        raise RuntimeError(f"ami_sdk_dequant_nvfp4_rows_f32 failed with status {rc}")
+    return out_buf
 
 
 # ---------------------------------------------------------------------------
@@ -3111,6 +3153,27 @@ class _UnifiedSource:
                     outer_val = val / e.outer_scale_denom_const
             else:
                 outer_val = e.outer_scale_const
+            if (
+                row_indices
+                and isinstance(row_indices, range)
+                and row_indices.step == 1
+                and 0 <= row_indices.start
+                and row_indices.stop <= n_rows
+            ):
+                cnt = len(row_indices)
+                r0 = row_indices.start
+                d_all = memoryview(_read_exact(fh, e.data.offset + r0 * row_d, cnt * row_d))
+                p_all = memoryview(_read_exact(s_fh, e.scales.offset + r0 * groups, cnt * groups))
+                for i in range(cnt):
+                    out.append(
+                        dequantize_nvfp4_row_f32(
+                            d_all[i * row_d : (i + 1) * row_d],
+                            p_all[i * groups : (i + 1) * groups],
+                            outer_val,
+                            k,
+                        )
+                    )
+                return out
             for r in row_indices:
                 if r < 0 or r >= n_rows:
                     raise IndexError(f"row {r} out of bounds for {e.name}")
@@ -3219,6 +3282,46 @@ class _UnifiedSource:
             raw = _read_exact(fh, e.data.offset + r0 * row_b, cnt * row_b)
             mv = memoryview(raw)
             yield [_decode_sf_floats(mv[i * row_b : (i + 1) * row_b], e.data.dtype) for i in range(cnt)]
+
+    def can_stream_raw_nvfp4_rows(self, t: _SourceTensor) -> bool:
+        """Return True when `t` is a contiguous row-major `NVFP4_G16` safetensors entry."""
+        if len(t.shape) != 2 or t.dtype != DType.NVFP4_G16 or (t.shape[1] % 16) != 0:
+            return False
+        if self._sf_readers is not None and t.sf_entry is not None:
+            return t.sf_entry.dtype == DType.NVFP4_G16 and t.sf_entry.scales is not None
+        return False
+
+    def iter_raw_nvfp4_row_batches(
+        self,
+        t: _SourceTensor,
+        batch_rows: int,
+    ) -> Iterator[tuple[bytes, bytes, float, int]]:
+        """Stream contiguous `[cnt, k]` raw NVFP4 data + E4M3 scales + outer_scale with 2 reads/batch."""
+        assert self._sf_readers is not None and t.sf_entry is not None
+        e = t.sf_entry
+        assert e.scales is not None
+        n_rows, k = e.shape
+        groups = k // 16
+        row_d = k // 2
+        fh = self._sf_readers.get(e.data.path)
+        s_fh = self._sf_readers.get(e.scales.path)
+        idx = max(0, e.outer_scale_expert_index)
+        if e.outer_scale is not None:
+            val = _decode_scalar_f32_at(self._sf_readers, e.outer_scale, idx)
+            if e.outer_scale_denom is not None:
+                denom = _decode_scalar_f32_at(self._sf_readers, e.outer_scale_denom, idx)
+                outer_val = val / denom
+            elif e.outer_scale_divisor_mode:
+                outer_val = 1.0 / val
+            else:
+                outer_val = val / e.outer_scale_denom_const
+        else:
+            outer_val = e.outer_scale_const
+        for r0 in range(0, n_rows, batch_rows):
+            cnt = min(batch_rows, n_rows - r0)
+            d_raw = _read_exact(fh, e.data.offset + r0 * row_d, cnt * row_d)
+            s_raw = _read_exact(s_fh, e.scales.offset + r0 * groups, cnt * groups)
+            yield d_raw, s_raw, outer_val, cnt
 
     def can_stream_raw_float_rows(self, t: _SourceTensor) -> bool:
         """Return True when `t` is stored on disk as contiguous row-major F32/F16/BF16 rows."""
@@ -3925,6 +4028,25 @@ def _stream_quantize_tensor(
                     yield quantize_raw_rows_affine_native(
                         raw_batch,
                         src_dtype_code,
+                        cnt,
+                        k,
+                        bits,
+                        group_size,
+                        use_rco,
+                        rco_iters,
+                        cw_c,
+                        native_threads,
+                    )
+                return
+
+            if getattr(native_lib, "ami_sdk_dequant_nvfp4_rows_f32", None) is not None and src.can_stream_raw_nvfp4_rows(t):
+                raw_cap = max(SME2_PANEL_COLS, min(_NATIVE_ROW_BATCH_MAX, _NATIVE_BATCH_MAX_BYTES // max(1, k * 4)))
+                nv_batch_rows = max(SME2_PANEL_COLS, (raw_cap // SME2_PANEL_COLS) * SME2_PANEL_COLS)
+                for d_raw, s_raw, outer_val, cnt in src.iter_raw_nvfp4_row_batches(t, nv_batch_rows):
+                    f32_buf = dequant_nvfp4_rows_f32_native(d_raw, s_raw, outer_val, cnt, k)
+                    yield quantize_raw_rows_affine_native(
+                        f32_buf,
+                        _NATIVE_DTYPE_F32,
                         cnt,
                         k,
                         bits,

@@ -531,6 +531,42 @@ pub const LoadedDFlareProposer = struct {
         );
         errdefer bundle.deinit(allocator);
 
+        // Attach Metal 4 GPU acceleration (`D16`, ADR-0026) sharing `target`'s `Compute`,
+        // `DequantPipelines`, `QuantFormatPipelines`, and zero-copy `lm_head` so drafting runs
+        // inside ONE `MTL4CommandBuffer` with zero scalar CPU `matVecBf16` loops.
+        const target_lm_head_gpu: dflare_dfly.GpuLinearBinding = .{
+            .amf_dtype = target.lm_head.amf_dtype,
+            .group_size = target.lm_head.group_size,
+            .tensor_scale_per_row = target.lm_head.tensor_scale_per_row,
+            .weight = target.lm_head.weight,
+            .params = target.lm_head.scale_bias,
+            .n = target.lm_head.n,
+            .k = target.lm_head.k,
+        };
+        const target_embed_gpu: ?dflare_dfly.GpuLinearBinding = switch (target.embed.amf_dtype) {
+            .f32, .f16, .bf16 => .{
+                .amf_dtype = target.embed.amf_dtype,
+                .group_size = target.embed.group_size,
+                .tensor_scale_per_row = target.embed.tensor_scale_per_row,
+                .weight = target.embed.weight,
+                .params = target.embed.scale_bias,
+                .n = target.embed.n,
+                .k = target.embed.k,
+            },
+            else => null,
+        };
+        try bundle.proposer.attachGpu(.{
+            .device = target.device,
+            .library = target.library,
+            .compute = &target.compute,
+            .dequant_pipes = &target.dequant_pipes,
+            .qf_pipes = if (target.qf_pipes) |*qfp| qfp else null,
+            .target_lm_head = target_lm_head_gpu,
+            .target_embed_tokens = target_embed_gpu,
+            .target_embed_norm_f32 = if (target.m82) |rt| rt.ink_embed_norm_f32 else null,
+            .timeout_ms = target.timeout_ms,
+        });
+
         const out = try allocator.create(LoadedDFlareProposer);
         out.* = .{ .bundle = bundle };
         return out;
@@ -2888,34 +2924,65 @@ pub const SpecEngine = struct {
                 if (self.dflare_proposer) |dfp| {
                     if (max_allowed_depth >= 1 and candidate_cap > 1) {
                         const g = self.target.graph;
-                        var tap_buf: [dflare_dfly.MAX_TARGET_TAPS][]const f32 = undefined;
                         const need_taps: usize = dfp.config.num_target_taps;
-                        const raw_taps: []const []const f32 = if (g.m82) |rt| rt.dflareTargetTaps() else &.{};
-                        const fallback_h = g.lastDecoderHiddenF32();
-                        for (0..need_taps) |ti| {
-                            tap_buf[ti] = if (ti < raw_taps.len and raw_taps[ti].len == dfp.config.hidden_size)
-                                raw_taps[ti]
-                            else
-                                fallback_h;
-                        }
                         var df_state = self.grammar_state.snapshot();
-                        const pr = if (grammar_active)
-                            try dfp.proposeIntoConstrained(
-                                MAX_TREE_NODES,
-                                self.last_token,
-                                tap_buf[0..need_taps],
-                                &self.sam,
-                                self.makeGrammarAdapter(&df_state),
-                                &self.draft_tree,
-                            )
-                        else
-                            try dfp.proposeInto(
-                                MAX_TREE_NODES,
-                                self.last_token,
-                                tap_buf[0..need_taps],
-                                &self.sam,
-                                &self.draft_tree,
-                            );
+                        const gpu_taps_opt: ?dflare_dfly.GpuTargetTaps = if (dfp.hasGpu()) blk: {
+                            if (g.m82) |rt| {
+                                if (rt.dflareGpuTargetTaps()) |gt| {
+                                    if (gt.taps.len == need_taps) break :blk gt;
+                                }
+                            }
+                            break :blk null;
+                        } else null;
+                        const pr = if (gpu_taps_opt) |gt| blk: {
+                            const gch = if (g.m82) |rt| rt.dflareGpuContextHistory() else null;
+                            break :blk if (grammar_active)
+                                try dfp.proposeIntoConstrainedGpu(
+                                    MAX_TREE_NODES,
+                                    self.last_token,
+                                    gt,
+                                    gch,
+                                    &self.sam,
+                                    self.makeGrammarAdapter(&df_state),
+                                    &self.draft_tree,
+                                )
+                            else
+                                try dfp.proposeIntoWithGpuTaps(
+                                    MAX_TREE_NODES,
+                                    self.last_token,
+                                    gt,
+                                    gch,
+                                    &self.sam,
+                                    &self.draft_tree,
+                                );
+                        } else blk: {
+                            var tap_buf: [dflare_dfly.MAX_TARGET_TAPS][]const f32 = undefined;
+                            const raw_taps: []const []const f32 = if (g.m82) |rt| rt.dflareTargetTaps() else &.{};
+                            const fallback_h = g.lastDecoderHiddenF32();
+                            for (0..need_taps) |ti| {
+                                tap_buf[ti] = if (ti < raw_taps.len and raw_taps[ti].len == dfp.config.hidden_size)
+                                    raw_taps[ti]
+                                else
+                                    fallback_h;
+                            }
+                            break :blk if (grammar_active)
+                                try dfp.proposeIntoConstrained(
+                                    MAX_TREE_NODES,
+                                    self.last_token,
+                                    tap_buf[0..need_taps],
+                                    &self.sam,
+                                    self.makeGrammarAdapter(&df_state),
+                                    &self.draft_tree,
+                                )
+                            else
+                                try dfp.proposeInto(
+                                    MAX_TREE_NODES,
+                                    self.last_token,
+                                    tap_buf[0..need_taps],
+                                    &self.sam,
+                                    &self.draft_tree,
+                                );
+                        };
                         self.stats.dflare_rounds += 1;
                         self.stats.dflare_inserted_nodes += self.draft_tree.count -| 1;
                         if (g.config.m82_family == .inkling2_loop) {

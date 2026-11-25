@@ -118,6 +118,8 @@ pub const Sconv4Params = extern struct {
     serial_tiles: u32,
     rms_eps: f32,
     post_residual_scale: f32 = 0.0,
+    has_tree: u32 = 0,
+    _pad0: u32 = 0,
 };
 
 pub const Inkling2RelGqaParams = extern struct {
@@ -448,7 +450,7 @@ pub const Inkling2MoeGateUpSoftcapParams = extern struct {
 };
 
 comptime {
-    if (@sizeOf(Sconv4Params) != 48) @compileError("Sconv4Params must be 48 bytes");
+    if (@sizeOf(Sconv4Params) != 56) @compileError("Sconv4Params must be 56 bytes");
     if (@sizeOf(Inkling2RelGqaParams) != 96) @compileError("Inkling2RelGqaParams must be 96 bytes");
     if (@sizeOf(Inkling2MoeRouteParams) != 48) @compileError("Inkling2MoeRouteParams must be 48 bytes");
     if (@sizeOf(Inkling2MoeSwigluParams) != 32) @compileError("Inkling2MoeSwigluParams must be 32 bytes");
@@ -875,6 +877,7 @@ pub const RmsNormSconv4Args = struct {
     conv_state_in: metal.BufferBinding,
     conv_state_out: metal.BufferBinding,
     out: metal.BufferBinding,
+    ancestor_masks: ?metal.BufferBinding = null,
     m: u32,
     hidden_dim: u32,
     state_pos: u32 = 0,
@@ -1880,6 +1883,8 @@ pub const Inkling2Hy4Pipelines = struct {
         if (!args.is_dynamic and args.conv_w == null) return error.MissingInputs;
         if (args.is_dynamic and args.dyn_w == null) return error.MissingInputs;
 
+        if (args.ancestor_masks != null and args.m > MAX_TREE_NODES) return error.InvalidNodeCount;
+
         const in_place_multi_tile = args.m > 64 and args.write_state and sameBinding(args.conv_state_in, args.conv_state_out);
         const params: Sconv4Params = .{
             .m = args.m,
@@ -1894,6 +1899,7 @@ pub const Inkling2Hy4Pipelines = struct {
             .serial_tiles = if (in_place_multi_tile) 1 else 0,
             .rms_eps = args.rms_eps,
             .post_residual_scale = args.post_residual_scale,
+            .has_tree = if (args.ancestor_masks != null) 1 else 0,
         };
         const groups_x: u64 = if (in_place_multi_tile) 1 else (@as(u64, args.m) + 63) / 64;
         const pipe = self.rmsnorm_sconv4[@backingInt(args.norm_dtype)];
@@ -1908,6 +1914,7 @@ pub const Inkling2Hy4Pipelines = struct {
                 args.conv_state_in,
                 args.conv_state_out,
                 args.out,
+                args.ancestor_masks orelse args.x,
             },
             std.mem.asBytes(&params),
             .{ groups_x, 1, 1 },
@@ -7893,4 +7900,96 @@ test "gpu.inkling2_hy4. G29 zero hot-path heap allocations across all new sublay
     }, true);
     try compute.wait(try f.commit(), 5000);
     try std.testing.expectEqual(@as(usize, 0), fail_alloc.allocated_bytes);
+}
+
+test "gpu.inkling2_hy4. rmsnorm_sconv4 tree-aware branching parity matches serial branch paths" {
+    const ctx = try TestMetalCtx.init();
+    defer ctx.deinit();
+    var compute = try metal.Compute.initWithFrames(ctx.device, 2);
+    defer compute.close();
+
+    const d: u32 = 64;
+    const m: u32 = 6;
+    // Branching tree:
+    //   0 (root)
+    //   1 -> parent 0 (path 0->1)
+    //   2 -> parent 1 (path 0->1->2)
+    //   3 -> parent 0 (sibling branch! path 0->3)
+    //   4 -> parent 3 (path 0->3->4)
+    //   5 -> parent 4 (path 0->3->4->5)
+    const masks = [_]u64{
+        0b000001, // 0
+        0b000011, // 1
+        0b000111, // 2
+        0b001001, // 3 (sibling of 1!)
+        0b011001, // 4
+        0b111001, // 5
+    };
+    const state_pos: u32 = 1;
+    const post_scale: f32 = 1.0 / @sqrt(@as(f32, 5.0));
+
+    var arena = try makeTestArena(256 * 1024);
+    defer arena.deinit();
+    const buf = try metal.Buffer.wrap(ctx.device, arena.bytes());
+    defer buf.close();
+    try compute.makeResident(&.{buf});
+    defer compute.removeResident(&.{buf}) catch unreachable;
+
+    const x_raw = try arena.allocAligned(m * d * 2, 16);
+    const out_raw = try arena.allocAligned(m * d * 2, 16);
+    const w_raw = try arena.allocAligned(d * 4 * 4, 16);
+    const st_raw = try arena.allocAligned(3 * d * 2, 16);
+    const mask_raw = try arena.allocAligned(m * 8, 16);
+
+    const x_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, x_raw));
+    const out_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, out_raw));
+    const w_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, w_raw));
+    const st_f16: []f16 = @alignCast(std.mem.bytesAsSlice(f16, st_raw));
+    const mask_u64: []u64 = @alignCast(std.mem.bytesAsSlice(u64, mask_raw));
+    @memcpy(mask_u64, &masks);
+
+    for (x_f16, 0..) |*v, i| v.* = @floatCast(@sin(@as(f32, @floatFromInt(i + 1)) * 0.13) * 0.8);
+    for (w_f32, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i + 3)) * 0.21) * 0.5;
+    for (st_f16, 0..) |*v, i| v.* = @floatCast(@sin(@as(f32, @floatFromInt(i + 7)) * 0.17) * 0.6);
+
+    var f = try compute.beginFrame(5000);
+    errdefer f.abort();
+    try ctx.pipes.encodeRmsNormSconv4(&f, .{
+        .x = .{ .buffer = buf, .offset = arena.offsetOf(x_raw.ptr) },
+        .conv_w = .{ .buffer = buf, .offset = arena.offsetOf(w_raw.ptr) },
+        .conv_w_f16 = false,
+        .conv_state_in = .{ .buffer = buf, .offset = arena.offsetOf(st_raw.ptr) },
+        .conv_state_out = .{ .buffer = buf, .offset = arena.offsetOf(st_raw.ptr) },
+        .out = .{ .buffer = buf, .offset = arena.offsetOf(out_raw.ptr) },
+        .ancestor_masks = .{ .buffer = buf, .offset = arena.offsetOf(mask_raw.ptr) },
+        .m = m,
+        .hidden_dim = d,
+        .state_pos = state_pos,
+        .write_state = false,
+        .is_dynamic = false,
+        .apply_rms_norm = false,
+        .apply_silu = false,
+        .post_residual_scale = post_scale,
+    }, false);
+    try compute.wait(try f.commit(), 5000);
+
+    // Compare branch B (nodes 0 -> 3 -> 4 -> 5) against CPU exact causal reference along [0, 3, 4, 5].
+    const path_b = [_]usize{ 0, 3, 4, 5 };
+    const s0 = (state_pos + 0) % 3;
+    const s1 = (state_pos + 1) % 3;
+    const s2 = (state_pos + 2) % 3;
+    for (0..d) |c| {
+        var h_m3: f32 = @floatCast(st_f16[s0 * d + c]);
+        var h_m2: f32 = @floatCast(st_f16[s1 * d + c]);
+        var h_m1: f32 = @floatCast(st_f16[s2 * d + c]);
+        for (path_b) |nid| {
+            const h_cur: f32 = @floatCast(x_f16[nid * d + c]);
+            const acc = (w_f32[c * 4 + 0] * h_m3 + w_f32[c * 4 + 1] * h_m2 + w_f32[c * 4 + 2] * h_m1 + w_f32[c * 4 + 3] * h_cur + h_cur) * post_scale;
+            const got: f32 = @floatCast(out_f16[nid * d + c]);
+            try std.testing.expectApproxEqAbs(acc, got, 2e-3);
+            h_m3 = h_m2;
+            h_m2 = h_m1;
+            h_m1 = h_cur;
+        }
+    }
 }

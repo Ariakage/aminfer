@@ -392,6 +392,10 @@ pub const M82Stats = struct {
     inkling2_rel_gqa_dispatches: u64 = 0,
     inkling2_attn_res_dispatches: u64 = 0,
     inkling2_sme2_ctrl_calls: u64 = 0,
+    inkling2_gpu_ctrl_calls: u64 = 0,
+    inkling2_indirect_moe_dispatches: u64 = 0,
+    inkling2_grouped_moe_dispatches: u64 = 0,
+    mid_pass_flushes: u64 = 0,
     inkling2_core3_batched_verify_calls: u64 = 0,
     inkling2_swa_kv_bytes: u64 = 0,
     inkling2_global_kv_bytes: u64 = 0,
@@ -470,6 +474,15 @@ const ColdSlotBindings = struct {
     w2: qwen3.LinearBinding,
 };
 
+pub const ColdPrefetchHandle = struct {
+    total_reqs: usize = 0,
+    submitted: usize = 0,
+    completed: usize = 0,
+    miss_count: usize = 0,
+    total_read_bytes: u64 = 0,
+    t0: std.Io.Timestamp = .{ .nanoseconds = 0 },
+};
+
 pub const M82ColdExpertCache = struct {
     amf_file: amf.AmfFile,
     reader: aio.AsyncExpertReader,
@@ -481,6 +494,10 @@ pub const M82ColdExpertCache = struct {
     slot_w2_bytes: usize,
     slot_stride_bytes: usize,
     slots: []ColdSlotState,
+    slot_pinned: []bool,
+    req_buf: []aio.ReadRequest,
+    miss_slots: []u32,
+    miss_metas: []M82ColdExpertMeta,
     clock: u64 = 0,
 
     pub fn init(
@@ -497,7 +514,7 @@ pub const M82ColdExpertCache = struct {
         var amf_file = try amf.AmfFile.open(allocator, amf_path);
         errdefer amf_file.close(allocator);
 
-        var reader = try aio.AsyncExpertReader.init(allocator, .{ .max_inflight = 16 });
+        var reader = try aio.AsyncExpertReader.init(allocator, .{ .max_inflight = 64 });
         errdefer reader.deinit(allocator);
 
         const w1_al = try page.alignUp(@max(max_w1_bytes, APPLE_PAGE_SIZE));
@@ -513,7 +530,21 @@ pub const M82ColdExpertCache = struct {
         try compute.makeResident(&.{pool_buf});
 
         const slots = try allocator.alloc(ColdSlotState, num_slots);
+        errdefer allocator.free(slots);
         @memset(slots, .{});
+
+        const slot_pinned = try allocator.alloc(bool, num_slots);
+        errdefer allocator.free(slot_pinned);
+        @memset(slot_pinned, false);
+
+        const req_buf = try allocator.alloc(aio.ReadRequest, @as(usize, num_slots) * 3);
+        errdefer allocator.free(req_buf);
+
+        const miss_slots = try allocator.alloc(u32, num_slots);
+        errdefer allocator.free(miss_slots);
+
+        const miss_metas = try allocator.alloc(M82ColdExpertMeta, num_slots);
+        errdefer allocator.free(miss_metas);
 
         return .{
             .amf_file = amf_file,
@@ -526,6 +557,10 @@ pub const M82ColdExpertCache = struct {
             .slot_w2_bytes = w2_al,
             .slot_stride_bytes = stride,
             .slots = slots,
+            .slot_pinned = slot_pinned,
+            .req_buf = req_buf,
+            .miss_slots = miss_slots,
+            .miss_metas = miss_metas,
         };
     }
 
@@ -537,11 +572,161 @@ pub const M82ColdExpertCache = struct {
         self.pool_arena.deinit();
         self.reader.deinit(allocator);
         self.amf_file.close(allocator);
+        allocator.free(self.miss_metas);
+        allocator.free(self.miss_slots);
+        allocator.free(self.req_buf);
+        allocator.free(self.slot_pinned);
         allocator.free(self.slots);
     }
 
     pub fn totalWiredBytes(self: *const M82ColdExpertCache) u64 {
         return self.pool_arena.bytes().len;
+    }
+
+    /// Starts asynchronous `F_NOCACHE` prefetch for a window of `metas` (`metas.len <= num_slots`),
+    /// pinning cache hits first so misses never overwrite another expert in the same window.
+    /// Zero dynamic heap allocations; pair with `finishPrefetchWindow` before encoding GPU kernels
+    /// over `out_bindings`.
+    pub fn beginPrefetchWindow(
+        self: *M82ColdExpertCache,
+        metas: []const M82ColdExpertMeta,
+        out_bindings: []ColdSlotBindings,
+        stats: *M82Stats,
+    ) !ColdPrefetchHandle {
+        if (metas.len > self.num_slots or out_bindings.len < metas.len) return error.InvalidArgument;
+        self.clock += 1;
+        @memset(self.slot_pinned, false);
+
+        var is_hit: [256]bool = @splat(false);
+        if (metas.len > is_hit.len) return error.InvalidArgument;
+
+        // Pass 1: resolve and pin all cache hits in this window first.
+        for (metas, 0..) |meta, mi| {
+            for (self.slots, 0..) |*s, idx| {
+                if (s.valid and s.layer == meta.layer and s.expert == meta.expert) {
+                    s.last_use = self.clock;
+                    self.slot_pinned[idx] = true;
+                    is_hit[mi] = true;
+                    stats.cold_expert_cache_hits += 1;
+                    out_bindings[mi] = self.bindingsForSlot(@intCast(idx), meta);
+                    break;
+                }
+            }
+        }
+
+        // Pass 2: assign unpinned LRU victim slots for all misses and queue F_NOCACHE reads.
+        var handle: ColdPrefetchHandle = .{
+            .t0 = std.Io.Timestamp.now(std.Options.debug_io, .awake),
+        };
+        const pool_bytes = self.pool_arena.bytes();
+        for (metas, 0..) |meta, mi| {
+            if (is_hit[mi]) continue;
+            var victim_opt: ?usize = null;
+            var oldest: u64 = std.math.maxInt(u64);
+            for (self.slots, 0..) |s, idx| {
+                if (self.slot_pinned[idx]) continue;
+                if (!s.valid) {
+                    victim_opt = idx;
+                    break;
+                }
+                if (s.last_use < oldest) {
+                    oldest = s.last_use;
+                    victim_opt = idx;
+                }
+            }
+            const victim = victim_opt orelse return error.InvalidArgument;
+            self.slot_pinned[victim] = true;
+            self.slots[victim].valid = false;
+            self.miss_slots[handle.miss_count] = @intCast(victim);
+            self.miss_metas[handle.miss_count] = meta;
+            handle.miss_count += 1;
+
+            const base_off: usize = victim * self.slot_stride_bytes;
+            const w1_al: usize = page.alignUp(@intCast(meta.w1_bytes)) catch return error.Overflow;
+            const w1_dst: []align(APPLE_PAGE_SIZE) u8 = @alignCast(pool_bytes[base_off..][0..w1_al]);
+            self.req_buf[handle.total_reqs] = .{
+                .fd = self.amf_file.fd,
+                .offset = meta.w1_offset,
+                .dst = w1_dst,
+                .user_data = handle.total_reqs,
+            };
+            handle.total_reqs += 1;
+            handle.total_read_bytes += w1_al;
+
+            if (meta.has_separate_up and meta.w_up_bytes > 0) {
+                const wu_al: usize = page.alignUp(@intCast(meta.w_up_bytes)) catch return error.Overflow;
+                const wu_dst: []align(APPLE_PAGE_SIZE) u8 = @alignCast(pool_bytes[base_off + self.slot_w1_bytes ..][0..wu_al]);
+                self.req_buf[handle.total_reqs] = .{
+                    .fd = self.amf_file.fd,
+                    .offset = meta.w_up_offset,
+                    .dst = wu_dst,
+                    .user_data = handle.total_reqs,
+                };
+                handle.total_reqs += 1;
+                handle.total_read_bytes += wu_al;
+            }
+
+            const w2_al: usize = page.alignUp(@intCast(meta.w2_bytes)) catch return error.Overflow;
+            const w2_dst: []align(APPLE_PAGE_SIZE) u8 = @alignCast(pool_bytes[base_off + self.slot_w1_bytes + self.slot_w_up_bytes ..][0..w2_al]);
+            self.req_buf[handle.total_reqs] = .{
+                .fd = self.amf_file.fd,
+                .offset = meta.w2_offset,
+                .dst = w2_dst,
+                .user_data = handle.total_reqs,
+            };
+            handle.total_reqs += 1;
+            handle.total_read_bytes += w2_al;
+
+            out_bindings[mi] = self.bindingsForSlot(@intCast(victim), meta);
+        }
+
+        // Submit as many reads as fit in the async queue right now so NVMe I/O overlaps GPU work.
+        while (handle.submitted < handle.total_reqs and self.reader.availableSlots() > 0) {
+            try self.reader.submit(self.req_buf[handle.submitted]);
+            handle.submitted += 1;
+        }
+        return handle;
+    }
+
+    pub fn finishPrefetchWindow(
+        self: *M82ColdExpertCache,
+        handle: *ColdPrefetchHandle,
+        stats: *M82Stats,
+    ) !void {
+        if (handle.miss_count == 0) {
+            @memset(self.slot_pinned, false);
+            return;
+        }
+        var comps: [32]aio.Completion = undefined;
+        while (handle.completed < handle.total_reqs) {
+            while (handle.submitted < handle.total_reqs and self.reader.availableSlots() > 0) {
+                try self.reader.submit(self.req_buf[handle.submitted]);
+                handle.submitted += 1;
+            }
+            const want = @min(handle.total_reqs - handle.completed, comps.len);
+            const got = try self.reader.wait(comps[0..want], null);
+            for (comps[0..got]) |c| {
+                _ = try c.check();
+            }
+            handle.completed += got;
+        }
+        const t1 = std.Io.Timestamp.now(std.Options.debug_io, .awake);
+        const dt_ns: u64 = @intCast(@max(@as(i96, 0), handle.t0.durationTo(t1).toNanoseconds()));
+
+        for (0..handle.miss_count) |mi| {
+            const slot_idx = self.miss_slots[mi];
+            const meta = self.miss_metas[mi];
+            self.slots[slot_idx] = .{
+                .valid = true,
+                .layer = meta.layer,
+                .expert = meta.expert,
+                .last_use = self.clock,
+            };
+        }
+        @memset(self.slot_pinned, false);
+        stats.cold_expert_fetches += handle.miss_count;
+        stats.cold_expert_bytes_read += handle.total_read_bytes;
+        stats.cold_expert_io_ns += dt_ns;
     }
 
     pub fn pinExpert(
@@ -709,6 +894,31 @@ const M82ExpertWeight = union(enum) {
 // Inkling 2 Layer & Step Structures
 // ============================================================================
 
+const Inkling2GpuBranchCtrl = struct {
+    down_weight: metal.BufferBinding,
+    forget_weight: metal.BufferBinding,
+    gain_weight: metal.BufferBinding,
+    weight_dtype: quant.FloatDType,
+    state_dim: u32,
+    down_in_dim: u32,
+    gate_rank: u32,
+};
+
+const Inkling2GpuController = struct {
+    branches: [ink_ctrl.NUM_BRANCHES]Inkling2GpuBranchCtrl,
+};
+
+const Inkling2IndirectMoeMeta = struct {
+    weights_base: metal.BufferBinding,
+    expert_table: metal.BufferBinding,
+    expert_schemes: ?metal.BufferBinding = null,
+    is_heterogeneous: bool = false,
+    pair_interleaved: bool = true,
+    bucket_pair_interleaved: ?[moe.NUM_SCHEME_BUCKETS]bool = null,
+    scheme_counts: [moe.NUM_SCHEME_BUCKETS]u32 = .{ 0, 0, 0, 0, 0 },
+    scheme_descs: [moe.NUM_SCHEME_BUCKETS]moe.MoeSchemeDesc = .{ .{}, .{}, .{}, .{}, .{} },
+};
+
 const Inkling2LayerWeights = struct {
     attn_norm: qwen3.NormBinding,
     q_input_norm: ?qwen3.NormBinding = null,
@@ -737,6 +947,8 @@ const Inkling2LayerWeights = struct {
     rel_l2_clip_scale: f32 = 1.0,
     q_l2_scale_vec: ?[]const f32 = null, // `[q_dim]` per-head per-channel scale on real Inkling-2-Mini
     rel_l2_scale_vec: ?[]const f32 = null, // `[n_q * d_rel]` per-head per-dim scale on real Inkling-2-Mini
+    q_l2_scale_vec_gpu: ?metal.BufferBinding = null, // GPU f32 binding for `encodeInkling2AttnPostProj`
+    rel_l2_scale_vec_gpu: ?metal.BufferBinding = null, // GPU f32 binding for `encodeInkling2AttnPostProj`
 
     // AttnRes queries (`f16 [passes, H]` pre-converted in M82 arena)
     attn_res_attn_q: ?metal.BufferBinding = null,
@@ -744,13 +956,16 @@ const Inkling2LayerWeights = struct {
     attn_res_mlp_q: ?metal.BufferBinding = null,
     attn_res_mlp_q_passes: u32 = 1,
 
-    // C26 L2 SME2 Loop Controller (for Core layers)
+    // Loop Controllers (GPU zero-flush default `G29`, or opt-in C26 L2 SME2 CPU fallback)
     loop_ctrl: ?ink_ctrl.Inkling2LoopController = null,
+    gpu_ctrl: ?Inkling2GpuController = null,
 
-    // MoE router + experts
+    // MoE router + experts (+ optional zero-readback `G29` indirect descriptor when `cold == 0`)
     router: qwen3.LinearBinding,
     router_bias_f32: ?metal.BufferBinding = null, // `[E]` f32
     experts: []M82ExpertWeight,
+    indirect_moe: ?Inkling2IndirectMoeMeta = null,
+    cold_expert_count: u32 = 0,
     is_local: bool = false,
 };
 
@@ -877,6 +1092,8 @@ pub const M82LoadContext = struct {
     chunk_tokens: u32,
     wired_budget: budget_mod.Budget,
     cold_slot_count: u32,
+    use_sme2_controllers: bool = false,
+    enable_router_trace: bool = false,
 };
 
 // ============================================================================
@@ -891,6 +1108,8 @@ pub const M82Runtime = struct {
     max_seq_len: u32,
     max_tree_nodes: u32,
     effective_steps: u32,
+    use_sme2_controllers: bool = false,
+    enable_router_trace: bool = false,
     sconv_pos: u32 = 0,
     stats: M82Stats = .{},
 
@@ -901,15 +1120,26 @@ pub const M82Runtime = struct {
     // Inkling 2 state
     ink_layers: []Inkling2LayerWeights = &.{},
     ink_steps: []Inkling2StepState = &.{},
+    ink_moe_ws: ?moe.MoeWorkspace = null,
     ink_embed_norm: ?qwen3.NormBinding = null,
     ink_embed_norm_f32: ?[]const f32 = null,
     ink_attn_res_out_q: ?metal.BufferBinding = null,
     ink_cross_pass_q_f32: ?[]const f32 = null,
     ink_cross_pass_kv_q_f32: ?[]const f32 = null,
+    ink_cross_pass_q_gpu: ?metal.BufferBinding = null,
+    ink_cross_pass_q_rows: u32 = 0,
+    ink_cross_pass_kv_q_gpu: ?metal.BufferBinding = null,
+    ink_cross_pass_kv_q_rows: u32 = 0,
+    ink_msg_bank_gpu_off: u64 = 0,
+    ink_msg_buf_gpu_off: u64 = 0,
+    ink_ctrl_z_gpu_off: u64 = 0,
+    x_ctrl_q_off: u64 = 0,
+    x_ctrl_k_off: u64 = 0,
+    x_ctrl_v_off: u64 = 0,
     sconv_h_ring: ?ink_gpu.SconvRingArena = null,
     sconv_kv_ring: ?ink_gpu.SconvRingArena = null,
     attn_res_ring: ?ink_gpu.AttnResRingArena = null,
-    /// Preallocated CPU scratch for `C26` L2 `SME2` controllers (`0` hot-path allocs).
+    /// Preallocated CPU scratch for opt-in `C26` L2 `SME2` controllers (`0` hot-path allocs).
     ctrl_x_f32: []f32 = &.{},
     ctrl_val_f32: []f32 = &.{},
     ctrl_out_f32: []f32 = &.{},
@@ -917,23 +1147,33 @@ pub const M82Runtime = struct {
     ctrl_state_k: []f32 = &.{},
     ctrl_state_v: []f32 = &.{},
     ctrl_state_mlp: []f32 = &.{},
-    /// Preallocated CPU scratch for `Inkling2Loop` cross-pass message bank & 4 attended messages.
+    /// Preallocated CPU scratch for opt-in `SME2` `Inkling2Loop` cross-pass message bank & 4 attended messages.
     ink_msg_bank_f32: []f32 = &.{},
     ink_msg_buf_f32: []f32 = &.{},
     ink_prelude_cur_off: u64 = 0,
     ink_inp_sa_off: u64 = 0,
-    /// Multi-layer `DFlare` target hidden taps `[num_taps][max_tree_nodes * H]` f32.
+    /// Multi-layer `DFlare` target hidden taps:
+    /// - GPU wired `[num_taps, max_tree_nodes, H]` `f16` at `dflare_taps_gpu_off` (`0` mid-pass flushes)
+    /// - CPU `f32` mirror `[num_taps][H]` for fallback `dflareTargetTaps()`.
+    dflare_taps_gpu_off: u64 = 0,
+    dflare_tap_gpu_binds: [dflare_dfly.MAX_TARGET_TAPS]metal.BufferBinding = undefined,
     dflare_tap_storage: []f32 = &.{},
     dflare_tap_slices: [dflare_dfly.MAX_TARGET_TAPS][]const f32 = @splat(&.{}),
     dflare_tap_count: usize = 0,
-    /// Full committed-token `DFlare` context tap history `[cap, num_taps, H]` bf16
-    /// (preallocated once at startup, `0` hot-path allocs, `0` wired GPU RAM).
-    dflare_ctx_hist_bf16: []u16 = &.{},
+    /// Full committed-token `DFlare` context tap history `[cap, num_taps, H]` `f16`
+    /// stored zero-copy inside `self.arena` (`self.buf`) for direct `D16` `GpuContextHistory`!
+    dflare_ctx_hist_off: u64 = 0,
     dflare_ctx_hist_cap: u32 = 0,
     dflare_ctx_hist_len: u32 = 0,
     dflare_ctx_hist_taps: u8 = 0,
     dflare_ctx_hist_hidden: u32 = 0,
     dflare_ctx_hist_epoch: u64 = 0,
+    /// Preallocated `W8` loop-folded router trace buffers (`0` hot-path allocs).
+    router_trace_topks: []u32 = &.{},
+    router_trace_valid: []bool = &.{},
+    router_trace_top_k: u32 = 0,
+    router_trace_gpu_off: u64 = 0,
+    router_trace_gpu_mask: u64 = 0,
 
     // Hy4 state
     hy4_layers: []Hy4LayerWeights = &.{},
@@ -986,13 +1226,18 @@ pub const M82Runtime = struct {
     router_logits_off: u64 = 0, // `[max_tree_nodes, E]` f16
     topk_ids_off: u64 = 0, // `[max_tree_nodes, top_k]` u32
     topk_w_off: u64 = 0, // `[max_tree_nodes, top_k]` f32
-    exp_gate_up_off: u64 = 0, // `[2 * inter]` f16 (or `[inter]` gate + `[inter]` up)
-    exp_up_off: u64 = 0, // `[inter]` f16
-    exp_act_off: u64 = 0, // `[inter]` f16
+    exp_gate_up_off: u64 = 0, // `[max_tree_nodes * 2 * inter]` f16
+    exp_up_off: u64 = 0, // `[max_tree_nodes * inter]` f16
+    exp_act_off: u64 = 0, // `[max_tree_nodes * inter]` f16
     exp_out_off: u64 = 0, // `[max_tree_nodes * top_k, H]` f16
+    exp_gathered_x_off: u64 = 0, // `[max_tree_nodes, H]` f16
+    exp_down_tmp_off: u64 = 0, // `[max_tree_nodes, H]` f16
+    exp_tok_idx_off: u64 = 0, // `[max_tree_nodes * top_k]` u32
+    exp_dst_slot_off: u64 = 0, // `[max_tree_nodes * top_k]` u32
     last_hidden_f32: []f32 = &.{}, // `[max_tree_nodes * H]` f32
     owned_f32_slices: [][]f32 = &.{},
     total_kv_wired_bytes: u64 = 0,
+    active_weight_bytes_per_tok: u64 = 0,
 
     pub fn totalWiredBytes(self: *const M82Runtime) u64 {
         var total: u64 = self.arena.bytes().len + self.total_kv_wired_bytes;
@@ -1001,6 +1246,24 @@ pub const M82Runtime = struct {
             if (l.loop_ctrl) |*ctrl| total += ctrl.totalWiredBytes();
         }
         return total;
+    }
+
+    pub fn activeDecodeBytes(self: *const M82Runtime, cfg: *const graph.GraphConfig, seq_len: u32) u64 {
+        var kv_bytes: u64 = 0;
+        if (self.family.isInkling2()) {
+            const per_tok: u64 = 2 * @as(u64, cfg.num_key_value_heads) * cfg.head_dim * @sizeOf(f16);
+            for (self.ink_steps) |st| {
+                const vis: u64 = if (st.kv_ring.window_size > 0)
+                    @min(@as(u64, seq_len), st.kv_ring.window_size)
+                else
+                    @as(u64, seq_len);
+                kv_bytes += vis * per_tok;
+            }
+        } else if (self.family.isHy4()) {
+            const per_tok: u64 = (@as(u64, cfg.kv_lora_rank) + cfg.qk_rope_head_dim) * @sizeOf(f16);
+            kv_bytes = @as(u64, self.hy4_layers.len) * @as(u64, seq_len) * per_tok;
+        }
+        return self.active_weight_bytes_per_tok + kv_bytes;
     }
 
     pub fn lastHiddenF32(self: *const M82Runtime, node_idx: usize, h: usize) []const f32 {
@@ -1013,10 +1276,33 @@ pub const M82Runtime = struct {
         return self.dflare_tap_slices[0..self.dflare_tap_count];
     }
 
+    pub fn hasDFlareCtxHistory(self: *const M82Runtime) bool {
+        return self.dflare_ctx_hist_cap > 0 and self.dflare_ctx_hist_off > 0;
+    }
+
+    pub fn dflareGpuTargetTaps(self: *const M82Runtime) ?dflare_dfly.GpuTargetTaps {
+        if (self.dflare_tap_count == 0 or self.dflare_taps_gpu_off == 0) return null;
+        return .{
+            .dtype = .f16,
+            .taps = self.dflare_tap_gpu_binds[0..self.dflare_tap_count],
+        };
+    }
+
+    pub fn dflareGpuContextHistory(self: *const M82Runtime) ?dflare_dfly.GpuContextHistory {
+        if (!self.hasDFlareCtxHistory()) return null;
+        return .{
+            .taps_ring = self.bindAt(self.dflare_ctx_hist_off),
+            .dtype = .f16,
+            .cap = self.dflare_ctx_hist_cap,
+            .len = self.dflare_ctx_hist_len,
+            .epoch = self.dflare_ctx_hist_epoch,
+        };
+    }
+
     /// Reads one historical committed token's `DFlare` target tap `[H]` into `dst_f32`
-    /// with zero heap allocations (used by `DFlareProposer`'s incremental context KV cache).
+    /// with zero heap allocations (used by `DFlareProposer`'s CPU fallback context KV cache).
     pub fn readDFlareCtxTapF32(self: *const M82Runtime, pos: u32, tap_idx: usize, dst_f32: []f32) bool {
-        if (self.dflare_ctx_hist_bf16.len == 0 or self.dflare_ctx_hist_cap == 0) return false;
+        if (!self.hasDFlareCtxHistory()) return false;
         if (pos >= self.dflare_ctx_hist_len) return false;
         if (self.dflare_ctx_hist_len > self.dflare_ctx_hist_cap and pos + self.dflare_ctx_hist_cap < self.dflare_ctx_hist_len) {
             return false;
@@ -1025,31 +1311,67 @@ pub const M82Runtime = struct {
         const h: usize = self.dflare_ctx_hist_hidden;
         if (tap_idx >= taps or dst_f32.len < h) return false;
         const slot: usize = @intCast(pos % self.dflare_ctx_hist_cap);
+        const total_elems: usize = @as(usize, self.dflare_ctx_hist_cap) * taps * h;
+        const hist_f16 = self.sliceF16(self.dflare_ctx_hist_off, total_elems);
         const base: usize = (slot * taps + tap_idx) * h;
-        const src = self.dflare_ctx_hist_bf16[base .. base + h];
-        for (src, 0..) |bits, i| {
-            dst_f32[i] = quant.bf16ToF32(bits);
+        const src = hist_f16[base .. base + h];
+        for (src, 0..) |hv, i| {
+            dst_f32[i] = @floatCast(hv);
         }
         return true;
     }
 
     fn recordDFlareCtxTapRow(self: *M82Runtime, pos: u32, node_idx: usize, h: usize) void {
-        if (self.dflare_ctx_hist_bf16.len == 0 or self.dflare_ctx_hist_cap == 0) return;
+        if (!self.hasDFlareCtxHistory() or self.dflare_taps_gpu_off == 0) return;
         const taps: usize = @min(self.dflare_tap_count, @as(usize, self.dflare_ctx_hist_taps));
         if (taps == 0 or h != self.dflare_ctx_hist_hidden) return;
         const stride: usize = @as(usize, self.max_tree_nodes) * h;
         if ((node_idx + 1) * h > stride) return;
         const slot: usize = @intCast(pos % self.dflare_ctx_hist_cap);
+        const total_hist: usize = @as(usize, self.dflare_ctx_hist_cap) * @as(usize, self.dflare_ctx_hist_taps) * h;
+        const hist_f16 = self.sliceF16(self.dflare_ctx_hist_off, total_hist);
+        const all_taps = self.sliceF16(self.dflare_taps_gpu_off, @as(usize, self.dflare_ctx_hist_taps) * stride);
         for (0..taps) |ti| {
-            const src = self.dflare_tap_storage[ti * stride + node_idx * h ..][0..h];
-            const dst = self.dflare_ctx_hist_bf16[(slot * @as(usize, self.dflare_ctx_hist_taps) + ti) * h ..][0..h];
-            for (src, 0..) |fv, i| {
-                dst[i] = @truncate(@as(u32, @bitCast(fv)) >> 16);
-            }
+            const src = all_taps[ti * stride + node_idx * h ..][0..h];
+            const dst = hist_f16[(slot * @as(usize, self.dflare_ctx_hist_taps) + ti) * h ..][0..h];
+            @memcpy(dst, src);
         }
         if (pos + 1 > self.dflare_ctx_hist_len) {
             self.dflare_ctx_hist_len = pos + 1;
         }
+    }
+
+    fn syncDFlareActiveRow(self: *M82Runtime, row_idx: usize, h: usize) void {
+        if (self.dflare_tap_count == 0 or self.dflare_taps_gpu_off == 0) return;
+        const stride: usize = @as(usize, self.max_tree_nodes) * h;
+        if ((row_idx + 1) * h > stride) return;
+        const row_bytes: u64 = @as(u64, row_idx) * h * @sizeOf(f16);
+        const stride_bytes: u64 = @as(u64, stride) * @sizeOf(f16);
+        for (0..self.dflare_tap_count) |ti| {
+            const gpu_off = self.dflare_taps_gpu_off + @as(u64, ti) * stride_bytes + row_bytes;
+            self.dflare_tap_gpu_binds[ti] = self.bindAt(gpu_off);
+            if (self.dflare_tap_storage.len >= (ti + 1) * stride) {
+                const src_f16 = self.sliceF16(gpu_off, h);
+                const dst_f32 = self.dflare_tap_storage[ti * stride ..][0..h];
+                f16SliceToF32(src_f16, dst_f32);
+                self.dflare_tap_slices[ti] = dst_f32;
+            }
+        }
+    }
+
+    /// Returns the last-step router top-k expert IDs for effective step `eff_step`
+    /// (`0 .. self.effective_steps`) when `enable_router_trace` is enabled (`W8`).
+    pub fn lastStepRouterTopKForStep(self: *const M82Runtime, eff_step: u32) ?[]const u32 {
+        if (!self.enable_router_trace or self.router_trace_top_k == 0) return null;
+        if (eff_step >= self.router_trace_valid.len or !self.router_trace_valid[eff_step]) return null;
+        const tk: usize = self.router_trace_top_k;
+        const base: usize = @as(usize, eff_step) * tk;
+        if (base + tk > self.router_trace_topks.len) return null;
+        return self.router_trace_topks[base .. base + tk];
+    }
+
+    pub fn physicalLayerForStepPublic(self: *const M82Runtime, step_idx: u32, cfg: *const graph.GraphConfig) usize {
+        return self.physicalLayerForStep(step_idx, cfg);
     }
 
     pub fn dflyTargetKvViews(self: *const M82Runtime) []const dflare_dfly.TargetKvLayerView {
@@ -1112,7 +1434,8 @@ pub const M82Runtime = struct {
         if (self.ink_msg_bank_f32.len > 0) allocator.free(self.ink_msg_bank_f32);
         if (self.ink_msg_buf_f32.len > 0) allocator.free(self.ink_msg_buf_f32);
         if (self.dflare_tap_storage.len > 0) allocator.free(self.dflare_tap_storage);
-        if (self.dflare_ctx_hist_bf16.len > 0) allocator.free(self.dflare_ctx_hist_bf16);
+        if (self.router_trace_topks.len > 0) allocator.free(self.router_trace_topks);
+        if (self.router_trace_valid.len > 0) allocator.free(self.router_trace_valid);
         if (self.hy4_hc_tmp_f32.len > 0) allocator.free(self.hy4_hc_tmp_f32);
         if (self.dfly_kv_k_buf.len > 0) allocator.free(self.dfly_kv_k_buf);
         if (self.dfly_kv_v_buf.len > 0) allocator.free(self.dfly_kv_v_buf);
@@ -1220,6 +1543,8 @@ pub const M82Runtime = struct {
             .max_seq_len = ctx.max_seq_len,
             .max_tree_nodes = max_m,
             .effective_steps = eff_steps,
+            .use_sme2_controllers = ctx.use_sme2_controllers,
+            .enable_router_trace = ctx.enable_router_trace,
             .cold_cache = cold_cache,
         };
         errdefer {
@@ -1241,12 +1566,25 @@ pub const M82Runtime = struct {
         rt.router_logits_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * num_experts * 2);
         rt.topk_ids_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * top_k * 4);
         rt.topk_w_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * top_k * 4);
-        rt.exp_gate_up_off = try allocArenaOff(&rt.arena, @as(usize, 2) * max_inter * 2);
-        rt.exp_up_off = try allocArenaOff(&rt.arena, @as(usize, max_inter) * 2);
-        rt.exp_act_off = try allocArenaOff(&rt.arena, @as(usize, max_inter) * 2);
+        rt.exp_gate_up_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * 2 * max_inter * 2);
+        rt.exp_up_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * max_inter * 2);
+        rt.exp_act_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * max_inter * 2);
         rt.exp_out_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * top_k * h * 2);
+        rt.exp_gathered_x_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
+        rt.exp_down_tmp_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
+        rt.exp_tok_idx_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * top_k * 4);
+        rt.exp_dst_slot_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * top_k * 4);
         rt.last_hidden_f32 = try allocator.alloc(f32, @as(usize, max_m) * h);
         @memset(rt.last_hidden_f32, 0);
+
+        if (ctx.enable_router_trace) {
+            rt.router_trace_topks = try allocator.alloc(u32, @as(usize, eff_steps) * top_k);
+            @memset(rt.router_trace_topks, 0);
+            rt.router_trace_valid = try allocator.alloc(bool, eff_steps);
+            @memset(rt.router_trace_valid, false);
+            rt.router_trace_top_k = top_k;
+            rt.router_trace_gpu_off = try allocArenaOff(&rt.arena, @as(usize, eff_steps) * top_k * @sizeOf(u32));
+        }
 
         if (family.isInkling2()) {
             try loadInkling2(allocator, rt, ctx, &f32_pool, q_dim, kv_dim, eff_steps);
@@ -1255,6 +1593,31 @@ pub const M82Runtime = struct {
         } else {
             return error.InvalidConfig;
         }
+
+        // Precompute active weight bytes streamed per `M = 1` decode token across all effective steps.
+        var active_w: u64 = 0;
+        for (ctx.source.entries()) |*e| {
+            if (amf.isMetaEntry(e)) continue;
+            const tk = e.tensorKind() catch continue;
+            const nm = e.nameSlice();
+            if (tk == .embedding or std.mem.indexOf(u8, nm, "lm_head") != null or std.mem.indexOf(u8, nm, "embed_tokens") != null) {
+                continue;
+            }
+            const nb: u64 = e.data_bytes + e.params_bytes;
+            const mult: u64 = if (ls.isRecurrent() and e.layer != 0xFFFF_FFFF and e.layer >= core_start and e.layer < core_end)
+                num_passes
+            else
+                1;
+            if (tk == .hot_expert or tk == .cold_expert) {
+                active_w += (nb * top_k * mult) / num_experts;
+            } else if (std.mem.indexOf(u8, nm, ".controllers.") != null) {
+                const c_mult: u64 = if (num_passes > 1) (num_passes - 1) else 0;
+                active_w += nb * c_mult;
+            } else {
+                active_w += nb * mult;
+            }
+        }
+        rt.active_weight_bytes_per_tok = active_w;
 
         rt.owned_f32_slices = try f32_pool.toOwnedSlice(allocator);
         return rt;
@@ -1399,13 +1762,26 @@ pub const M82Runtime = struct {
             ring.head = 0;
         }
         self.dflare_tap_count = 0;
+        self.router_trace_gpu_mask = 0;
+        if (self.enable_router_trace and self.router_trace_valid.len > 0) {
+            @memset(self.router_trace_valid, false);
+        }
+
+        // Prefill GPU watchdog guard (ADR-0026): fuse all 48 effective steps into ONE
+        // `MTL4CommandBuffer` for `m <= 16` (decode & `DFlare` verify), while splitting
+        // large prefill chunks (`m > 16`) every 6 effective steps so no single command
+        // buffer approaches macOS's ~5 s GPU watchdog timeout.
+        const watchdog_flush_interval: u32 = if (m > 16) 6 else 0;
 
         // 2. Execute schedule: Prelude -> Core x R (with pass restart + message bank) -> Coda.
         var eff_step: u32 = 0;
         if (R > 1) {
             // Prelude [0 .. core_start)
             for (0..core_start) |l| {
-                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_host);
+                if (watchdog_flush_interval > 0 and eff_step > 0 and (eff_step % watchdog_flush_interval) == 0) {
+                    try self.flushMidPass(model, &frame_opt);
+                }
+                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_bind);
                 try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, 0, base_pos, positions, m, commit_state, &num_blocks, block_layers, q_dim, kv_dim, 0);
                 eff_step += 1;
             }
@@ -1430,20 +1806,35 @@ pub const M82Runtime = struct {
                 var bank_len: usize = 0;
                 if (r > 0) {
                     // Build normalized message bank from previous pass: `blocks[prelude_num_blocks + 1 .. num_blocks]` + `cur`.
-                    try flushFrame(model, &frame_opt);
                     if (self.attn_res_ring) |*ring| {
                         const start_blk: u32 = @min(prelude_num_blocks + 1, num_blocks);
-                        bank_len = stageMsgBankF32(
-                            ring,
-                            self.arena.bytes(),
-                            model.x_host[0 .. @as(usize, m) * h],
-                            start_blk,
-                            num_blocks,
-                            m,
-                            h,
-                            cfg.rms_norm_eps,
-                            self.ink_msg_bank_f32,
-                        );
+                        if (self.use_sme2_controllers) {
+                            try self.flushMidPass(model, &frame_opt);
+                            bank_len = stageMsgBankF32(
+                                ring,
+                                self.arena.bytes(),
+                                model.x_host[0 .. @as(usize, m) * h],
+                                start_blk,
+                                num_blocks,
+                                m,
+                                h,
+                                cfg.rms_norm_eps,
+                                self.ink_msg_bank_f32,
+                            );
+                        } else {
+                            const f = try ensureFrame(model, &frame_opt);
+                            bank_len = try self.pipes.encodeInkling2MsgBankNorm(f, .{
+                                .ring = ring,
+                                .ring_buf = self.buf,
+                                .cur = model.x_bind,
+                                .msg_bank_out = self.bindAt(self.ink_msg_bank_gpu_off),
+                                .m = m,
+                                .start_slot = start_blk,
+                                .end_slot = num_blocks,
+                                .append_cur = true,
+                                .rms_eps = cfg.rms_norm_eps,
+                            }, true);
+                        }
                     }
                     // Restart `cur = prelude_cur` and `blocks = prelude_blocks`.
                     num_blocks = prelude_num_blocks;
@@ -1459,7 +1850,10 @@ pub const M82Runtime = struct {
                 }
 
                 for (core_start..core_end) |l| {
-                    try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_host);
+                    if (watchdog_flush_interval > 0 and eff_step > 0 and (eff_step % watchdog_flush_interval) == 0) {
+                        try self.flushMidPass(model, &frame_opt);
+                    }
+                    try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_bind);
                     try self.execInkling2Step(model, &frame_opt, l, eff_step, r, l - core_start, base_pos, positions, m, commit_state, &num_blocks, block_layers, q_dim, kv_dim, bank_len);
                     eff_step += 1;
                 }
@@ -1467,19 +1861,26 @@ pub const M82Runtime = struct {
 
             // Coda [core_end .. num_hidden_layers)
             for (core_end..cfg.num_hidden_layers) |l| {
-                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_host);
+                if (watchdog_flush_interval > 0 and eff_step > 0 and (eff_step % watchdog_flush_interval) == 0) {
+                    try self.flushMidPass(model, &frame_opt);
+                }
+                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_bind);
                 try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, 0, base_pos, positions, m, commit_state, &num_blocks, block_layers, q_dim, kv_dim, 0);
                 eff_step += 1;
             }
         } else {
             for (0..cfg.num_hidden_layers) |l| {
-                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_host);
+                if (watchdog_flush_interval > 0 and eff_step > 0 and (eff_step % watchdog_flush_interval) == 0) {
+                    try self.flushMidPass(model, &frame_opt);
+                }
+                try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_bind);
                 try self.execInkling2Step(model, &frame_opt, l, eff_step, 0, 0, base_pos, positions, m, commit_state, &num_blocks, block_layers, q_dim, kv_dim, 0);
                 eff_step += 1;
             }
         }
 
-        // 3. Final AttnRes output query + final RMSNorm + capture DFlare final tap (`eff_steps`, e.g. 48).
+        // 3. Final AttnRes output query + final RMSNorm + GPU DFlare final tap (`eff_steps`, e.g. 48)
+        //    all encoded inside the SAME `MTL4CommandBuffer` as `lm_head` (`0` mid-pass flushes!).
         const attn_res_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
         if (self.attn_res_ring) |*ring| {
             if (self.ink_attn_res_out_q) |oq| {
@@ -1522,26 +1923,44 @@ pub const M82Runtime = struct {
                 .w_dtype = model.final_norm.dtype,
             }, true);
         }
+        try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_norm_bind);
 
-        // Snapshot final normed hidden state (`f32`) for `SpecEngine` / `DFlare` (`t_layer_inp[eff_steps]`).
-        try flushFrame(model, &frame_opt);
-        try self.maybeCaptureDFlareTap(model, &frame_opt, eff_step, m, model.x_norm_host);
-        f16SliceToF32(model.x_norm_host[0 .. @as(usize, m) * h], self.last_hidden_f32[0 .. @as(usize, m) * h]);
+        // Execute `lm_head` + SINGLE end-of-forward commit+wait.
+        const res = try self.finalizeLogits(model, &frame_opt, m, compute_logits, m82c.final_logit_softcapping, m82c.unpadded_vocab_size, true);
 
+        // Unified memory is now coherent: harvest zero-flush GPU router-trace selections (if enabled).
+        if (self.enable_router_trace and self.router_trace_gpu_mask != 0 and self.router_trace_gpu_off > 0) {
+            const tk_us: usize = self.router_trace_top_k;
+            const gpu_topks = self.sliceU32(self.router_trace_gpu_off, self.router_trace_valid.len * tk_us);
+            const limit: usize = @min(self.router_trace_valid.len, @as(usize, 64));
+            for (0..limit) |si| {
+                if ((self.router_trace_gpu_mask & (@as(u64, 1) << @intCast(si))) != 0) {
+                    @memcpy(self.router_trace_topks[si * tk_us ..][0..tk_us], gpu_topks[si * tk_us ..][0..tk_us]);
+                }
+            }
+        }
+
+        // Unified memory is now coherent: snapshot final normed hidden state (`f32`) and update DFlare taps / history.
+        const h_us: usize = h;
+        f16SliceToF32(model.x_norm_host[0 .. @as(usize, m) * h_us], self.last_hidden_f32[0 .. @as(usize, m) * h_us]);
         if (commit_state) {
+            if (m > 1) {
+                const last_row: usize = @as(usize, m) - 1;
+                @memcpy(self.last_hidden_f32[0..h_us], self.last_hidden_f32[last_row * h_us ..][0..h_us]);
+            }
             if (base_pos == 0) {
                 self.dflare_ctx_hist_len = 0;
                 self.dflare_ctx_hist_epoch +%= 1;
             }
-            if (self.dflare_ctx_hist_bf16.len > 0) {
+            if (self.hasDFlareCtxHistory()) {
                 for (0..m) |tok| {
-                    self.recordDFlareCtxTapRow(positions[tok], tok, h);
+                    self.recordDFlareCtxTapRow(positions[tok], tok, h_us);
                 }
             }
+            self.syncDFlareActiveRow(if (m > 0) @as(usize, m) - 1 else 0, h_us);
             self.sconv_pos = base_pos + m;
         }
-
-        return self.finalizeLogits(model, &frame_opt, m, compute_logits, m82c.final_logit_softcapping, m82c.unpadded_vocab_size, true);
+        return res;
     }
 
     fn execInkling2Step(
@@ -1562,6 +1981,8 @@ pub const M82Runtime = struct {
         kv_dim: u32,
         msg_bank_len: usize,
     ) graph.GraphStepError!void {
+        _ = positions;
+        _ = q_dim;
         const cfg = &model.config;
         const m82c = &cfg.m82_cfg;
         const h: u32 = cfg.hidden_size;
@@ -1570,20 +1991,39 @@ pub const M82Runtime = struct {
         const step_st = &self.ink_steps[eff_step];
         const attn_res_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(h)));
         const is_block_boundary: bool = ((l % block_layers) == 0);
-        const use_messages: bool = (loop_pass >= 1 and layer.loop_ctrl != null and msg_bank_len > 0 and self.ink_cross_pass_q_f32 != null);
+        const has_ctrl = if (self.use_sme2_controllers) (layer.loop_ctrl != null) else (layer.gpu_ctrl != null);
+        const has_cp_q = if (self.use_sme2_controllers) (self.ink_cross_pass_q_f32 != null) else (self.ink_cross_pass_q_gpu != null);
+        const use_messages: bool = (loop_pass >= 1 and has_ctrl and msg_bank_len > 0 and has_cp_q);
 
         // Compute `[msg_q, msg_k, msg_v, msg_mlp]` from the previous pass's bank if `loop_pass >= 1`.
         if (use_messages) {
-            computeCrossPassMessagesF32(
-                self.ink_msg_bank_f32,
-                msg_bank_len,
-                self.ink_cross_pass_q_f32.?,
-                self.ink_cross_pass_kv_q_f32,
-                loop_layer_idx,
-                m,
-                h,
-                self.ink_msg_buf_f32,
-            );
+            if (self.use_sme2_controllers) {
+                computeCrossPassMessagesF32(
+                    self.ink_msg_bank_f32,
+                    msg_bank_len,
+                    self.ink_cross_pass_q_f32.?,
+                    self.ink_cross_pass_kv_q_f32,
+                    loop_layer_idx,
+                    m,
+                    h,
+                    self.ink_msg_buf_f32,
+                );
+            } else {
+                const f = try ensureFrame(model, frame_opt);
+                try self.pipes.encodeInkling2CrossPassMsgs(f, .{
+                    .msg_bank = self.bindAt(self.ink_msg_bank_gpu_off),
+                    .q_src = self.ink_cross_pass_q_gpu.?,
+                    .kv_q_src = self.ink_cross_pass_kv_q_gpu,
+                    .queries_f16 = false,
+                    .out_msgs = self.bindAt(self.ink_msg_buf_gpu_off),
+                    .m = m,
+                    .hidden_dim = h,
+                    .bank_len = @intCast(msg_bank_len),
+                    .q_rows = self.ink_cross_pass_q_rows,
+                    .kv_rows = self.ink_cross_pass_kv_q_rows,
+                    .loop_layer_idx = @intCast(loop_layer_idx),
+                }, true);
+            }
         }
 
         // Save `inpSA` (`block_residual = cur`) before attention.
@@ -1666,35 +2106,110 @@ pub const M82Runtime = struct {
             }
         }
 
-        // --- B. Optional `C26` L2 `SME2` Message Gate (`loop_pass >= 1`, `0` GPU dispatches!) ---
+        // --- B. Optional Cross-Pass Message Gate (`G29` GPU zero-flush default, or opt-in C26 SME2) ---
         if (use_messages) {
-            try flushFrame(model, frame_opt);
-            const ctrl = &(layer.loop_ctrl.?);
-            const q_src_f16: []const f16 = if (pre_q_bind.buffer.handle == self.buf.handle)
-                self.sliceF16(pre_q_bind.offset, mh)
-            else
-                model.x_host[0..mh];
-            const k_src_f16: []const f16 = if (kv_differ) self.sliceF16(pre_k_bind.offset, mh) else q_src_f16;
-            const v_src_f16: []const f16 = if (kv_differ) self.sliceF16(pre_v_bind.offset, mh) else q_src_f16;
+            if (self.use_sme2_controllers) {
+                try self.flushMidPass(model, frame_opt);
+                const ctrl = &(layer.loop_ctrl.?);
+                const q_src_f16: []const f16 = if (pre_q_bind.buffer.handle == self.buf.handle)
+                    self.sliceF16(pre_q_bind.offset, mh)
+                else
+                    model.x_host[0..mh];
+                const k_src_f16: []const f16 = if (kv_differ) self.sliceF16(pre_k_bind.offset, mh) else q_src_f16;
+                const v_src_f16: []const f16 = if (kv_differ) self.sliceF16(pre_v_bind.offset, mh) else q_src_f16;
 
-            // Compute K and V gates BEFORE overwriting `x_alt_off` (in case SWA shares `q_src_f16 == x_alt_off`).
-            if (ctrl.branches[1].config.state_dim == h) {
-                try self.applySme2MessageGate(ctrl, .k, k_src_f16, self.ink_msg_buf_f32[1 * mh ..][0..mh], self.sliceF16(self.x_norm_k_off, mh), m, h);
-                pre_k_bind = self.bindAt(self.x_norm_k_off);
+                // Compute K and V gates BEFORE overwriting `x_alt_off` (in case SWA shares `q_src_f16 == x_alt_off`).
+                if (ctrl.branches[1].config.state_dim == h) {
+                    try self.applySme2MessageGate(ctrl, .k, k_src_f16, self.ink_msg_buf_f32[1 * mh ..][0..mh], self.sliceF16(self.x_norm_k_off, mh), m, h);
+                    pre_k_bind = self.bindAt(self.x_norm_k_off);
+                } else {
+                    @memcpy(self.sliceF16(self.x_norm_k_off, mh), k_src_f16);
+                    pre_k_bind = self.bindAt(self.x_norm_k_off);
+                }
+                if (ctrl.branches[2].config.state_dim == h) {
+                    try self.applySme2MessageGate(ctrl, .v, v_src_f16, self.ink_msg_buf_f32[2 * mh ..][0..mh], self.sliceF16(self.x_norm_v_off, mh), m, h);
+                    pre_v_bind = self.bindAt(self.x_norm_v_off);
+                } else {
+                    @memcpy(self.sliceF16(self.x_norm_v_off, mh), v_src_f16);
+                    pre_v_bind = self.bindAt(self.x_norm_v_off);
+                }
+                try self.applySme2MessageGate(ctrl, .attn, q_src_f16, self.ink_msg_buf_f32[0..mh], self.sliceF16(self.x_alt_off, mh), m, h);
+                pre_q_bind = self.bindAt(self.x_alt_off);
+                kv_differ = true;
             } else {
-                @memcpy(self.sliceF16(self.x_norm_k_off, mh), k_src_f16);
-                pre_k_bind = self.bindAt(self.x_norm_k_off);
+                const f = try ensureFrame(model, frame_opt);
+                const gctrl = &(layer.gpu_ctrl.?);
+                const msg_stride_b: u64 = @as(u64, mh) * @sizeOf(f32);
+                const z_b = self.bindAt(self.ink_ctrl_z_gpu_off);
+
+                const q_out_b = self.bindAt(self.x_ctrl_q_off);
+                const br_q = gctrl.branches[0];
+                try self.pipes.encodeInkling2MessageGate(f, .{
+                    .cur = pre_q_bind,
+                    .msg = self.bindAt(self.ink_msg_buf_gpu_off + 0 * msg_stride_b),
+                    .down_weight = br_q.down_weight,
+                    .forget_weight = br_q.forget_weight,
+                    .gain_weight = br_q.gain_weight,
+                    .weight_dtype = br_q.weight_dtype,
+                    .z_scratch = z_b,
+                    .out = q_out_b,
+                    .m = m,
+                    .state_dim = br_q.state_dim,
+                    .down_in_dim = br_q.down_in_dim,
+                    .gate_rank = br_q.gate_rank,
+                    .gain_act = .tanh,
+                    .rms_eps = cfg.rms_norm_eps,
+                }, true);
+                self.stats.inkling2_gpu_ctrl_calls += 1;
+
+                const br_k = gctrl.branches[1];
+                const k_out_b = self.bindAt(self.x_ctrl_k_off);
+                if (br_k.state_dim == h) {
+                    try self.pipes.encodeInkling2MessageGate(f, .{
+                        .cur = pre_k_bind,
+                        .msg = self.bindAt(self.ink_msg_buf_gpu_off + 1 * msg_stride_b),
+                        .down_weight = br_k.down_weight,
+                        .forget_weight = br_k.forget_weight,
+                        .gain_weight = br_k.gain_weight,
+                        .weight_dtype = br_k.weight_dtype,
+                        .z_scratch = z_b,
+                        .out = k_out_b,
+                        .m = m,
+                        .state_dim = br_k.state_dim,
+                        .down_in_dim = br_k.down_in_dim,
+                        .gate_rank = br_k.gate_rank,
+                        .gain_act = .tanh,
+                        .rms_eps = cfg.rms_norm_eps,
+                    }, true);
+                    self.stats.inkling2_gpu_ctrl_calls += 1;
+                    pre_k_bind = k_out_b;
+                }
+
+                const br_v = gctrl.branches[2];
+                const v_out_b = self.bindAt(self.x_ctrl_v_off);
+                if (br_v.state_dim == h) {
+                    try self.pipes.encodeInkling2MessageGate(f, .{
+                        .cur = pre_v_bind,
+                        .msg = self.bindAt(self.ink_msg_buf_gpu_off + 2 * msg_stride_b),
+                        .down_weight = br_v.down_weight,
+                        .forget_weight = br_v.forget_weight,
+                        .gain_weight = br_v.gain_weight,
+                        .weight_dtype = br_v.weight_dtype,
+                        .z_scratch = z_b,
+                        .out = v_out_b,
+                        .m = m,
+                        .state_dim = br_v.state_dim,
+                        .down_in_dim = br_v.down_in_dim,
+                        .gate_rank = br_v.gate_rank,
+                        .gain_act = .tanh,
+                        .rms_eps = cfg.rms_norm_eps,
+                    }, true);
+                    self.stats.inkling2_gpu_ctrl_calls += 1;
+                    pre_v_bind = v_out_b;
+                }
+                pre_q_bind = q_out_b;
+                kv_differ = true;
             }
-            if (ctrl.branches[2].config.state_dim == h) {
-                try self.applySme2MessageGate(ctrl, .v, v_src_f16, self.ink_msg_buf_f32[2 * mh ..][0..mh], self.sliceF16(self.x_norm_v_off, mh), m, h);
-                pre_v_bind = self.bindAt(self.x_norm_v_off);
-            } else {
-                @memcpy(self.sliceF16(self.x_norm_v_off, mh), v_src_f16);
-                pre_v_bind = self.bindAt(self.x_norm_v_off);
-            }
-            try self.applySme2MessageGate(ctrl, .attn, q_src_f16, self.ink_msg_buf_f32[0..mh], self.sliceF16(self.x_alt_off, mh), m, h);
-            pre_q_bind = self.bindAt(self.x_alt_off);
-            kv_differ = true;
         }
 
         // --- C. Pre-Attention Input RMSNorms (`attn_norm` on SWA, separate `{q,k,v}_input_norm` on global) ---
@@ -1764,58 +2279,35 @@ pub const M82Runtime = struct {
             try self.applyInkling2KvSconv(model, frame_opt, layer, step_st, false, v_in_bind, model.v_bind, step_st.tree_v_sconv_in_off, m, kv_dim, commit_state);
         }
 
-        // Exact Q/K/R ScaledL2Clip + optional LogScale (`!is_local`) + V UnweightedRMSNorm + sink f16->f32.
+        // Exact Q/K/R ScaledL2Clip + optional LogScale (`!is_local`) + V UnweightedRMSNorm + sink f16->f32 on GPU (`G29`, `0` CPU flush).
         {
-            try flushFrame(model, frame_opt);
-            const log_pos: ?[]const u32 = if (!layer.is_local and m82c.log_scaling_n_floor > 0 and m82c.log_scaling_alpha > 0.0)
-                positions[0..m]
-            else
-                null;
-            const q_clip = m82c.qk_l2_clip_threshold * layer.q_l2_clip_scale;
-            applyScaledL2ClipPerHeadF16(
-                model.q_host[0 .. @as(usize, m) * q_dim],
-                layer.q_l2_scale_vec,
-                m,
-                cfg.num_attention_heads,
-                cfg.head_dim,
-                q_clip,
-                log_pos,
-                m82c.log_scaling_n_floor,
-                m82c.log_scaling_alpha,
-            );
-            applyScaledL2ClipPerHeadF16(
-                model.k_host[0 .. @as(usize, m) * kv_dim],
-                null,
-                m,
-                cfg.num_key_value_heads,
-                cfg.head_dim,
-                m82c.qk_l2_clip_threshold,
-                null,
-                0,
-                0.0,
-            );
-            if (layer.wr != null) {
-                const rd: usize = @as(usize, cfg.num_attention_heads) * m82c.d_rel;
-                const r_clip = m82c.rel_l2_clip_threshold * layer.rel_l2_clip_scale;
-                applyScaledL2ClipPerHeadF16(
-                    self.sliceF16(self.q_rel_off, @as(usize, m) * rd),
-                    layer.rel_l2_scale_vec,
-                    m,
-                    cfg.num_attention_heads,
-                    m82c.d_rel,
-                    r_clip,
-                    log_pos,
-                    m82c.log_scaling_n_floor,
-                    m82c.log_scaling_alpha,
-                );
-            }
-            if (layer.attn_sink_proj != null) {
-                const nq = cfg.num_attention_heads;
-                f16SliceToF32(self.sliceF16(self.sink_f16_off, @as(usize, m) * nq), self.sliceF32(self.sink_f32_off, @as(usize, m) * nq));
-            }
-            if (m82c.use_value_norm_no_gamma) {
-                applyUnitRmsNormPerHeadF16(model.v_host[0 .. @as(usize, m) * kv_dim], m, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps);
-            }
+            const f = try ensureFrame(model, frame_opt);
+            const use_log = (!layer.is_local and m82c.log_scaling_n_floor > 0 and m82c.log_scaling_alpha > 0.0);
+            try self.pipes.encodeInkling2AttnPostProj(f, .{
+                .q = model.q_bind,
+                .k = model.k_bind,
+                .q_rel = if (layer.wr != null) self.bindAt(self.q_rel_off) else null,
+                .v = if (m82c.use_value_norm_no_gamma) model.v_bind else null,
+                .q_scale_vec = layer.q_l2_scale_vec_gpu,
+                .rel_scale_vec = layer.rel_l2_scale_vec_gpu,
+                .positions = if (use_log) model.positions_bind else null,
+                .sink_f16 = if (layer.attn_sink_proj != null) self.bindAt(self.sink_f16_off) else null,
+                .sink_f32 = if (layer.attn_sink_proj != null) self.bindAt(self.sink_f32_off) else null,
+                .m = m,
+                .num_q_heads = cfg.num_attention_heads,
+                .num_kv_heads = cfg.num_key_value_heads,
+                .head_dim = cfg.head_dim,
+                .d_rel = m82c.d_rel,
+                .q_clip = m82c.qk_l2_clip_threshold * layer.q_l2_clip_scale,
+                .k_clip = m82c.qk_l2_clip_threshold,
+                .rel_clip = m82c.rel_l2_clip_threshold * layer.rel_l2_clip_scale,
+                .use_log_scaling = use_log,
+                .base_pos = base_pos,
+                .log_floor = m82c.log_scaling_n_floor,
+                .log_alpha = m82c.log_scaling_alpha,
+                .do_v_norm = m82c.use_value_norm_no_gamma,
+                .rms_eps = cfg.rms_norm_eps,
+            }, true);
         }
 
         // --- E. KV Cache Write / Tree Scratch + Single-Pass `G25` `encodeInkling2RelGqaAttn` + `wo_ud` ---
@@ -1926,12 +2418,13 @@ pub const M82Runtime = struct {
                     }, true);
                 }
                 try self.pipes.encodeRmsNormSconv4(f, .{
-                    .x = model.proj_out_bind,
+                    .x = if (!commit_state) self.bindAt(step_st.tree_attn_sconv_in_off) else model.proj_out_bind,
                     .conv_w = sw,
                     .conv_w_f16 = false,
                     .conv_state_in = state_b,
                     .conv_state_out = state_b,
                     .out = model.proj_out_bind,
+                    .ancestor_masks = if (!commit_state) model.ancestor_masks_bind else null,
                     .m = m,
                     .hidden_dim = h,
                     .state_pos = self.sconv_pos,
@@ -2011,15 +2504,47 @@ pub const M82Runtime = struct {
         }
 
         if (use_messages) {
-            try flushFrame(model, frame_opt);
-            const ctrl = &(layer.loop_ctrl.?);
-            const mlp_src_f16: []const f16 = if (pre_mlp_bind.buffer.handle == self.buf.handle)
-                self.sliceF16(pre_mlp_bind.offset, mh)
-            else
-                model.x_host[0..mh];
-            try self.applySme2MessageGate(ctrl, .mlp, mlp_src_f16, self.ink_msg_buf_f32[3 * mh ..][0..mh], self.sliceF16(self.x_alt_off, mh), m, h);
-            pre_mlp_bind = self.bindAt(self.x_alt_off);
+            if (self.use_sme2_controllers) {
+                try self.flushMidPass(model, frame_opt);
+                const ctrl = &(layer.loop_ctrl.?);
+                const mlp_src_f16: []const f16 = if (pre_mlp_bind.buffer.handle == self.buf.handle)
+                    self.sliceF16(pre_mlp_bind.offset, mh)
+                else
+                    model.x_host[0..mh];
+                try self.applySme2MessageGate(ctrl, .mlp, mlp_src_f16, self.ink_msg_buf_f32[3 * mh ..][0..mh], self.sliceF16(self.x_alt_off, mh), m, h);
+                pre_mlp_bind = self.bindAt(self.x_alt_off);
+            } else {
+                const f = try ensureFrame(model, frame_opt);
+                const gctrl = &(layer.gpu_ctrl.?);
+                const br_m = gctrl.branches[3];
+                const msg_stride_b: u64 = @as(u64, mh) * @sizeOf(f32);
+                const mlp_out_b = self.bindAt(self.x_norm2_off);
+                try self.pipes.encodeInkling2MessageGate(f, .{
+                    .cur = pre_mlp_bind,
+                    .msg = self.bindAt(self.ink_msg_buf_gpu_off + 3 * msg_stride_b),
+                    .down_weight = br_m.down_weight,
+                    .forget_weight = br_m.forget_weight,
+                    .gain_weight = br_m.gain_weight,
+                    .weight_dtype = br_m.weight_dtype,
+                    .z_scratch = self.bindAt(self.ink_ctrl_z_gpu_off),
+                    .out = mlp_out_b,
+                    .m = m,
+                    .state_dim = br_m.state_dim,
+                    .down_in_dim = br_m.down_in_dim,
+                    .gate_rank = br_m.gate_rank,
+                    .gain_act = .tanh,
+                    .rms_eps = cfg.rms_norm_eps,
+                }, true);
+                self.stats.inkling2_gpu_ctrl_calls += 1;
+                pre_mlp_bind = mlp_out_b;
+            }
         }
+
+        const top_k = cfg.num_experts_per_tok;
+        const inter = cfg.intermediate_size;
+        const qf_ptr: ?*const quant_formats.QuantFormatPipelines = if (model.qf_pipes) |*qfp| qfp else null;
+        const act_b: ?metal.BufferBinding = if (model.act_quant_buf) |ab| .{ .buffer = ab, .offset = 0 } else null;
+        const tile_b: ?metal.BufferBinding = if (model.qf_tile_buf) |tb| .{ .buffer = tb, .offset = 0 } else null;
 
         {
             const f = try ensureFrame(model, frame_opt);
@@ -2033,118 +2558,315 @@ pub const M82Runtime = struct {
                 .w_dtype = layer.mlp_norm.dtype,
             }, true);
 
-            // Router logits + exact `Inkling2LoopTopKRouter` (sigmoid + selection-only bias + top-k norm * route_scale)
+            // Router logits (`model.x_norm_bind` -> `router_logits_off`)
             try model.encodeLinearBatched(f, layer.router, model.x_norm_bind, self.bindAt(self.router_logits_off), m, true);
-            try self.pipes.encodeInkling2MoeRoute(f, .{
-                .logits = self.bindAt(self.router_logits_off),
-                .logits_f16 = true,
+        }
+
+        const use_indirect_moe = (layer.cold_expert_count == 0) and
+            (!self.enable_router_trace or self.router_trace_gpu_off > 0) and
+            (layer.indirect_moe != null) and
+            (self.ink_moe_ws != null);
+
+        if (use_indirect_moe) {
+            // Zero-CPU-readback `G29` indirect Softcap MoE (`cold == 0`, 0 mid-pass flushes!).
+            const f = try ensureFrame(model, frame_opt);
+            const im = layer.indirect_moe.?;
+            const ws = &(self.ink_moe_ws.?);
+            try self.pipes.encodeInkling2MoeLayerIndirect(f, .{
+                .moe_pipes = &model.moe_pipes,
+                .qf_pipes = qf_ptr,
+                .dequant_pipes = &model.dequant_pipes,
+                .x = model.x_norm_bind,
+                .router = .{ .logits = .{
+                    .binding = self.bindAt(self.router_logits_off),
+                    .f16 = true,
+                } },
                 .bias = if (m82c.use_gate_bias) layer.router_bias_f32 else null,
                 .bias_f16 = false,
                 .bias_add_to_logits = false,
                 .scoring_sigmoid = true,
-                .topk_experts = self.bindAt(self.topk_ids_off),
-                .topk_weights = self.bindAt(self.topk_w_off),
-                .m = m,
-                .num_experts = cfg.num_experts,
-                .top_k = cfg.num_experts_per_tok,
                 .norm_topk_prob = cfg.norm_topk_prob,
                 .route_scale = m82c.route_scale,
                 .router_softcap = 0.0,
-            }, true);
-        }
-
-        // Flush to read selected expert IDs and execute hot wired + cold NVMe experts.
-        try flushFrame(model, frame_opt);
-        const top_k = cfg.num_experts_per_tok;
-        const inter = cfg.intermediate_size;
-        const topk_ids = self.sliceU32(self.topk_ids_off, @as(usize, m) * top_k);
-        const x_row_bytes: u64 = @as(u64, h) * 2;
-
-        // Deduplicate active experts across all `m * top_k` assignments so each
-        // hot/cold expert's weights stream ONCE per `M = 8` batched block (`C3`–`C5` + SLC reuse).
-        const total_assign = @as(usize, m) * top_k;
-        var unique_eids: [256]u32 = undefined;
-        var unique_cnt: usize = 0;
-        for (0..total_assign) |ai| {
-            const eid = topk_ids[ai];
-            if (eid >= layer.experts.len) return error.InvalidArgument;
-            var seen = false;
-            for (unique_eids[0..unique_cnt]) |u| {
-                if (u == eid) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen and unique_cnt < unique_eids.len) {
-                unique_eids[unique_cnt] = eid;
-                unique_cnt += 1;
-            }
-        }
-        for (unique_eids[0..unique_cnt]) |eid| {
-            const ew = layer.experts[eid];
-            const resolved: ColdSlotBindings = switch (ew) {
-                .hot => |hw| .{ .w1 = hw.w1, .w_up = hw.w_up, .w2 = hw.w2 },
-                .cold => |cm| blk: {
-                    try flushFrame(model, frame_opt);
-                    const cc = &(self.cold_cache.?);
-                    const pinned = cc.pinExpert(cm, &self.stats) catch return error.IoFailed;
-                    break :blk pinned;
-                },
-            };
-            const f = try ensureFrame(model, frame_opt);
-            for (0..m) |tok| {
-                const x_tok_bind: metal.BufferBinding = .{
-                    .buffer = model.x_norm_bind.buffer,
-                    .offset = model.x_norm_bind.offset + @as(u64, tok) * x_row_bytes,
-                };
-                for (0..top_k) |ki| {
-                    if (topk_ids[tok * top_k + ki] != eid) continue;
-                    const out_slot_bind = self.bindAt(self.exp_out_off + @as(u64, tok * top_k + ki) * x_row_bytes);
-                    if (resolved.w_up) |wu| {
-                        try model.encodeLinearGemv(f, resolved.w1, x_tok_bind, self.bindAt(self.exp_gate_up_off), true);
-                        try model.encodeLinearGemv(f, wu, x_tok_bind, self.bindAt(self.exp_up_off), false);
-                        try self.pipes.encodeInkling2MoeSwigluSoftcap(f, .{
-                            .gate_in = self.bindAt(self.exp_gate_up_off),
-                            .up_in = self.bindAt(self.exp_up_off),
-                            .out = self.bindAt(self.exp_act_off),
-                            .num_rows = 1,
-                            .intermediate_size = inter,
-                            .interleaved_gate_up = false,
-                            .softcap = m82c.mlp_up_softcap,
-                            .gate_softcap = m82c.mlp_gate_softcap,
-                        }, true);
-                    } else {
-                        try model.encodeLinearGemv(f, resolved.w1, x_tok_bind, self.bindAt(self.exp_gate_up_off), true);
-                        try self.pipes.encodeInkling2MoeSwigluSoftcap(f, .{
-                            .gate_in = self.bindAt(self.exp_gate_up_off),
-                            .out = self.bindAt(self.exp_act_off),
-                            .num_rows = 1,
-                            .intermediate_size = inter,
-                            .pair_interleaved = true,
-                            .softcap = m82c.mlp_up_softcap,
-                            .gate_softcap = m82c.mlp_gate_softcap,
-                        }, true);
-                    }
-                    try model.encodeLinearGemv(f, resolved.w2, self.bindAt(self.exp_act_off), out_slot_bind, true);
-                }
-            }
-        }
-
-        // `G25` MoE weighted combine -> optional post-MLP `mlp_sconv` (`/ sqrt(5)`) -> residual add (`cur = ffn_inp + mlp_out`).
-        {
-            const f = try ensureFrame(model, frame_opt);
-            try self.pipes.encodeInkling2MoeEpilogue(f, .{
-                .expert_out = self.bindAt(self.exp_out_off),
-                .topk_weights = self.bindAt(self.topk_w_off),
-                .weights_f16 = false,
+                .gate_softcap = m82c.mlp_gate_softcap,
+                .up_softcap = m82c.mlp_up_softcap,
+                .pair_interleaved = im.pair_interleaved,
+                .bucket_pair_interleaved = im.bucket_pair_interleaved,
+                .weights_base = im.weights_base,
+                .expert_table = im.expert_table,
+                .workspace = ws,
+                .workspace_buf = self.buf,
+                .is_heterogeneous = im.is_heterogeneous,
+                .expert_schemes = im.expert_schemes,
+                .scheme_counts = im.scheme_counts,
+                .scheme_descs = im.scheme_descs,
                 .residual = null,
                 .out = model.proj_out_bind,
                 .m = m,
-                .hidden_dim = h,
+                .num_experts = cfg.num_experts,
                 .top_k = top_k,
-                .mlp_softcap = 0.0,
+                .hidden_size = h,
+                .intermediate_size = inter,
+                .act_quant_policy = model.act_quant_policy,
+                .act_scratch = act_b,
+                .act_scratch_bytes = model.act_quant_bytes,
+                .router_tile_f16 = tile_b,
+                .router_tile_f16_bytes = model.qf_tile_bytes,
             }, true);
+            if (self.enable_router_trace and m == 1 and eff_step < self.router_trace_valid.len and eff_step < 64 and top_k <= self.router_trace_top_k and self.router_trace_gpu_off > 0) {
+                const dst_off = self.router_trace_gpu_off + @as(u64, eff_step) * @as(u64, self.router_trace_top_k) * @sizeOf(u32);
+                try model.moe_pipes.encodeCopyStrided(f, .{
+                    .src = .{ .buffer = self.buf, .offset = ws.scratch_topk_experts_off },
+                    .dst = self.bindAt(dst_off),
+                    .num_rows = 1,
+                    .copy_cols = top_k * 2,
+                    .src_stride = top_k * 2,
+                    .dst_stride = top_k * 2,
+                }, false);
+                self.router_trace_valid[eff_step] = true;
+                self.router_trace_gpu_mask |= (@as(u64, 1) << @intCast(eff_step));
+            }
+            self.stats.inkling2_indirect_moe_dispatches += 1;
+        } else {
+            // Router top-k + CPU readback path for `cold > 0` (with windowed async NVMe prefetch
+            // overlapping hot GPU execution + grouped `M_e`-row dispatch) or `W8` router trace capture.
+            {
+                const f = try ensureFrame(model, frame_opt);
+                try self.pipes.encodeInkling2MoeRoute(f, .{
+                    .logits = self.bindAt(self.router_logits_off),
+                    .logits_f16 = true,
+                    .bias = if (m82c.use_gate_bias) layer.router_bias_f32 else null,
+                    .bias_f16 = false,
+                    .bias_add_to_logits = false,
+                    .scoring_sigmoid = true,
+                    .topk_experts = self.bindAt(self.topk_ids_off),
+                    .topk_weights = self.bindAt(self.topk_w_off),
+                    .m = m,
+                    .num_experts = cfg.num_experts,
+                    .top_k = top_k,
+                    .norm_topk_prob = cfg.norm_topk_prob,
+                    .route_scale = m82c.route_scale,
+                    .router_softcap = 0.0,
+                }, true);
+            }
 
+            try self.flushMidPass(model, frame_opt);
+            const topk_ids = self.sliceU32(self.topk_ids_off, @as(usize, m) * top_k);
+
+            if (self.enable_router_trace and m == 1 and eff_step < self.router_trace_valid.len and top_k <= self.router_trace_top_k) {
+                const tk_us: usize = self.router_trace_top_k;
+                @memcpy(self.router_trace_topks[@as(usize, eff_step) * tk_us ..][0..top_k], topk_ids[0..top_k]);
+                self.router_trace_valid[eff_step] = true;
+            }
+
+            // Deduplicate active experts across all `m * top_k` assignments and partition into hot vs cold,
+            // packing disjoint `(tok_idx, dst_slot)` slices so each active expert streams ONCE per step (`M_e` rows).
+            const total_assign = @as(usize, m) * top_k;
+            const tok_idx_all = self.sliceU32(self.exp_tok_idx_off, total_assign);
+            const dst_slot_all = self.sliceU32(self.exp_dst_slot_off, total_assign);
+            var unique_eids: [256]u32 = undefined;
+            var unique_cnt: usize = 0;
+            for (0..total_assign) |ai| {
+                const eid = topk_ids[ai];
+                if (eid >= layer.experts.len) return error.InvalidArgument;
+                var seen = false;
+                for (unique_eids[0..unique_cnt]) |u| {
+                    if (u == eid) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen and unique_cnt < unique_eids.len) {
+                    unique_eids[unique_cnt] = eid;
+                    unique_cnt += 1;
+                }
+            }
+
+            const GroupedAssign = struct {
+                eid: u32,
+                start: u32,
+                count: u32,
+                single_tok: u32,
+                single_slot: u32,
+            };
+            var hot_list: [256]GroupedAssign = undefined;
+            var hot_cnt: usize = 0;
+            var cold_list: [256]GroupedAssign = undefined;
+            var cold_cnt: usize = 0;
+            var cursor: u32 = 0;
+            for (unique_eids[0..unique_cnt]) |eid| {
+                const start = cursor;
+                var single_tok: u32 = 0;
+                var single_slot: u32 = 0;
+                for (0..m) |tok| {
+                    for (0..top_k) |ki| {
+                        const slot_idx: u32 = @intCast(tok * top_k + ki);
+                        if (topk_ids[slot_idx] != eid) continue;
+                        tok_idx_all[cursor] = @intCast(tok);
+                        dst_slot_all[cursor] = slot_idx;
+                        single_tok = @intCast(tok);
+                        single_slot = slot_idx;
+                        cursor += 1;
+                    }
+                }
+                const ga: GroupedAssign = .{
+                    .eid = eid,
+                    .start = start,
+                    .count = cursor - start,
+                    .single_tok = single_tok,
+                    .single_slot = single_slot,
+                };
+                switch (layer.experts[eid]) {
+                    .hot => {
+                        hot_list[hot_cnt] = ga;
+                        hot_cnt += 1;
+                    },
+                    .cold => {
+                        cold_list[cold_cnt] = ga;
+                        cold_cnt += 1;
+                    },
+                }
+            }
+
+            const x_row_bytes: u64 = @as(u64, h) * 2;
+            const encodeOneGrouped = struct {
+                fn run(
+                    rt_s: *M82Runtime,
+                    m_ptr: *graph.GraphModel,
+                    f: *metal.Compute.Frame,
+                    ga: GroupedAssign,
+                    resolved: ColdSlotBindings,
+                    h_dim: u32,
+                    inter_dim: u32,
+                    row_bytes: u64,
+                    gate_sc: f32,
+                    up_sc: f32,
+                    qfp: ?*const quant_formats.QuantFormatPipelines,
+                    tile_opt: ?metal.BufferBinding,
+                    act_opt: ?metal.BufferBinding,
+                ) graph.GraphStepError!void {
+                    if (ga.count == 0) return;
+                    const single_out_bind = rt_s.bindAt(rt_s.exp_out_off + @as(u64, ga.single_slot) * row_bytes);
+                    try rt_s.pipes.encodeInkling2GroupedExpertMlp(f, .{
+                        .dequant_pipes = &m_ptr.dequant_pipes,
+                        .qf_pipes = qfp,
+                        .x = m_ptr.x_norm_bind,
+                        .w1 = linearToInkling2Desc(resolved.w1),
+                        .w_up = if (resolved.w_up) |wu| linearToInkling2Desc(wu) else null,
+                        .w2 = linearToInkling2Desc(resolved.w2),
+                        .m_e = ga.count,
+                        .hidden_size = h_dim,
+                        .intermediate_size = inter_dim,
+                        .single_token_idx = ga.single_tok,
+                        .token_indices_dev = if (ga.count > 1) rt_s.bindAt(rt_s.exp_tok_idx_off + @as(u64, ga.start) * 4) else null,
+                        .dst_slots_or_tok_dev = if (ga.count > 1) rt_s.bindAt(rt_s.exp_dst_slot_off + @as(u64, ga.start) * 4) else null,
+                        .slot_k_indices_dev = null,
+                        .slot_stride = 0,
+                        .gathered_x = if (ga.count > 1) rt_s.bindAt(rt_s.exp_gathered_x_off) else null,
+                        .gate_up_buf = rt_s.bindAt(rt_s.exp_gate_up_off),
+                        .up_buf = if (resolved.w_up != null) rt_s.bindAt(rt_s.exp_up_off) else null,
+                        .act_buf = rt_s.bindAt(rt_s.exp_act_off),
+                        .down_tmp_buf = if (ga.count > 1) rt_s.bindAt(rt_s.exp_down_tmp_off) else null,
+                        .expert_out = if (ga.count == 1) single_out_bind else rt_s.bindAt(rt_s.exp_out_off),
+                        .gate_softcap = gate_sc,
+                        .up_softcap = up_sc,
+                        .tile_f16 = tile_opt,
+                        .tile_f16_bytes = m_ptr.qf_tile_bytes,
+                        .act_quant_policy = m_ptr.act_quant_policy,
+                        .act_scratch = act_opt,
+                        .act_scratch_bytes = m_ptr.act_quant_bytes,
+                    }, true);
+                    rt_s.stats.inkling2_grouped_moe_dispatches += 1;
+                }
+            }.run;
+
+            if (cold_cnt == 0) {
+                const f = try ensureFrame(model, frame_opt);
+                for (hot_list[0..hot_cnt]) |ga| {
+                    const hw = layer.experts[ga.eid].hot;
+                    try encodeOneGrouped(self, model, f, ga, .{ .w1 = hw.w1, .w_up = hw.w_up, .w2 = hw.w2 }, h, inter, x_row_bytes, m82c.mlp_gate_softcap, m82c.mlp_up_softcap, qf_ptr, tile_b, act_b);
+                }
+            } else {
+                // Windowed async cold-expert prefetch (`W = min(remaining_cold, cold_cache.num_slots)`)
+                // submitting window 0's `F_NOCACHE` reads BEFORE encoding hot experts on GPU so NVMe I/O
+                // overlaps hot GPU compute, while preventing `ColdCache` slot overwrite across windows!
+                const cc = &(self.cold_cache.?);
+                const max_win: usize = @max(@as(usize, 1), @min(@as(usize, cc.num_slots), 256));
+                var win_metas: [256]M82ColdExpertMeta = undefined;
+                var win_binds: [256]ColdSlotBindings = undefined;
+
+                const w0_len: usize = @min(cold_cnt, max_win);
+                for (0..w0_len) |wi| {
+                    win_metas[wi] = layer.experts[cold_list[wi].eid].cold;
+                }
+                var w0_handle = cc.beginPrefetchWindow(win_metas[0..w0_len], win_binds[0..w0_len], &self.stats) catch return error.IoFailed;
+
+                // Encode hot experts and submit asynchronously while window 0 NVMe reads complete!
+                var hot_sig_opt: ?u64 = null;
+                if (hot_cnt > 0) {
+                    const hf = try ensureFrame(model, frame_opt);
+                    for (hot_list[0..hot_cnt]) |ga| {
+                        const hw = layer.experts[ga.eid].hot;
+                        try encodeOneGrouped(self, model, hf, ga, .{ .w1 = hw.w1, .w_up = hw.w_up, .w2 = hw.w2 }, h, inter, x_row_bytes, m82c.mlp_gate_softcap, m82c.mlp_up_softcap, qf_ptr, tile_b, act_b);
+                    }
+                    hot_sig_opt = try hf.commit();
+                    frame_opt.* = null;
+                    self.stats.mid_pass_flushes += 1;
+                }
+
+                // Wait for window 0 NVMe reads (overlapping with GPU hot-expert execution above!),
+                // then ensure hot GPU scratch is complete before dispatching window 0 cold experts.
+                cc.finishPrefetchWindow(&w0_handle, &self.stats) catch return error.IoFailed;
+                if (hot_sig_opt) |hsig| {
+                    try model.compute.wait(hsig, model.timeout_ms);
+                }
+
+                {
+                    const cf = try ensureFrame(model, frame_opt);
+                    for (0..w0_len) |wi| {
+                        try encodeOneGrouped(self, model, cf, cold_list[wi], win_binds[wi], h, inter, x_row_bytes, m82c.mlp_gate_softcap, m82c.mlp_up_softcap, qf_ptr, tile_b, act_b);
+                    }
+                }
+
+                // Remaining cold windows (when `cold_cnt > cc.num_slots`): flush previous window's GPU
+                // command buffer before reusing `ColdCache` slots so no in-flight kernel reads overwritten weights.
+                var w_start: usize = w0_len;
+                while (w_start < cold_cnt) {
+                    try self.flushMidPass(model, frame_opt);
+                    const w_len: usize = @min(cold_cnt - w_start, max_win);
+                    for (0..w_len) |wi| {
+                        win_metas[wi] = layer.experts[cold_list[w_start + wi].eid].cold;
+                    }
+                    var wh = cc.beginPrefetchWindow(win_metas[0..w_len], win_binds[0..w_len], &self.stats) catch return error.IoFailed;
+                    cc.finishPrefetchWindow(&wh, &self.stats) catch return error.IoFailed;
+                    const cf = try ensureFrame(model, frame_opt);
+                    for (0..w_len) |wi| {
+                        try encodeOneGrouped(self, model, cf, cold_list[w_start + wi], win_binds[wi], h, inter, x_row_bytes, m82c.mlp_gate_softcap, m82c.mlp_up_softcap, qf_ptr, tile_b, act_b);
+                    }
+                    w_start += w_len;
+                }
+            }
+
+            // `G25` MoE weighted combine -> `model.proj_out_bind`
+            {
+                const f = try ensureFrame(model, frame_opt);
+                try self.pipes.encodeInkling2MoeEpilogue(f, .{
+                    .expert_out = self.bindAt(self.exp_out_off),
+                    .topk_weights = self.bindAt(self.topk_w_off),
+                    .weights_f16 = false,
+                    .residual = null,
+                    .out = model.proj_out_bind,
+                    .m = m,
+                    .hidden_dim = h,
+                    .top_k = top_k,
+                    .mlp_softcap = 0.0,
+                }, true);
+            }
+        }
+
+        // Optional post-MLP `mlp_sconv` (`/ sqrt(5)`) -> residual add (`cur = ffn_inp + mlp_out`).
+        {
+            const f = try ensureFrame(model, frame_opt);
             if (layer.mlp_sconv_w) |sw| {
                 const sring = &(self.sconv_h_ring.?);
                 const state_b = try sring.layerBinding(step_st.sconv_mlp_slot, self.buf);
@@ -2159,12 +2881,13 @@ pub const M82Runtime = struct {
                     }, true);
                 }
                 try self.pipes.encodeRmsNormSconv4(f, .{
-                    .x = model.proj_out_bind,
+                    .x = if (!commit_state) self.bindAt(step_st.tree_mlp_sconv_in_off) else model.proj_out_bind,
                     .conv_w = sw,
                     .conv_w_f16 = false,
                     .conv_state_in = state_b,
                     .conv_state_out = state_b,
                     .out = model.proj_out_bind,
+                    .ancestor_masks = if (!commit_state) model.ancestor_masks_bind else null,
                     .m = m,
                     .hidden_dim = h,
                     .state_pos = self.sconv_pos,
@@ -2217,56 +2940,29 @@ pub const M82Runtime = struct {
         }
 
         if (dyn_proj) |dp| {
-            // Global layer `Inkling2LoopDynamicShortConvolution`: `weight_proj` outputs lag `0..3`
-            // (lag 0 = current token), reversed to kernel `[t-3, t-2, t-1, t]` order, scaled by `1 / 3`.
-            {
-                const f = try ensureFrame(model, frame_opt);
-                try model.encodeLinearBatched(f, dp, kv_in_bind, self.bindAt(self.dyn_sconv_proj_off), m, true);
-            }
-            try flushFrame(model, frame_opt);
-            const proj_n: usize = dp.n;
-            const proj_h = self.sliceF16(self.dyn_sconv_proj_off, @as(usize, m) * proj_n);
-            const dyn_w = self.sliceF16(self.dyn_sconv_w_off, @as(usize, m) * kv_dim * 4);
-            const static_f32: ?[]const f32 = if (static_w) |sw|
-                self.sliceF32(sw.offset, @as(usize, kv_dim) * 4)
-            else
-                null;
-            const n_kvh: usize = model.config.num_key_value_heads;
-            const hd: usize = model.config.head_dim;
-            const per_head: bool = (proj_n == n_kvh * 4 and hd > 0);
-            for (0..m) |tok| {
-                for (0..kv_dim) |c| {
-                    const p_off: usize = if (per_head)
-                        (tok * n_kvh + (c / hd)) * 4
-                    else
-                        tok * 4;
-                    // `proj_h[p_off + lag]` has lag 0 = current token, lag 3 = t-3.
-                    const lag0: f32 = @floatCast(proj_h[p_off + 0]);
-                    const lag1: f32 = @floatCast(proj_h[p_off + 1]);
-                    const lag2: f32 = @floatCast(proj_h[p_off + 2]);
-                    const lag3: f32 = @floatCast(proj_h[p_off + 3]);
-                    const base = (tok * kv_dim + c) * 4;
-                    if (static_f32) |sf| {
-                        // `sf` is already stored in `[t-3, t-2, t-1, t]` order by `loadSconvF32TransposedIfNeeded`.
-                        dyn_w[base + 0] = @floatCast(sf[c * 4 + 0] + lag3);
-                        dyn_w[base + 1] = @floatCast(sf[c * 4 + 1] + lag2);
-                        dyn_w[base + 2] = @floatCast(sf[c * 4 + 2] + lag1);
-                        dyn_w[base + 3] = @floatCast(sf[c * 4 + 3] + lag0);
-                    } else {
-                        dyn_w[base + 0] = @floatCast(lag3);
-                        dyn_w[base + 1] = @floatCast(lag2);
-                        dyn_w[base + 2] = @floatCast(lag1);
-                        dyn_w[base + 3] = @floatCast(lag0);
-                    }
-                }
-            }
+            // Global layer `Inkling2LoopDynamicShortConvolution` on GPU (`G29`, `0` CPU flush):
+            // `weight_proj` outputs lag `0..3` (lag 0 = current token), reversed to `[t-3..t]` on GPU, scaled by `1 / 3`.
             const f = try ensureFrame(model, frame_opt);
+            try model.encodeLinearBatched(f, dp, kv_in_bind, self.bindAt(self.dyn_sconv_proj_off), m, true);
+            try self.pipes.encodeInkling2DynSconvAssemble(f, .{
+                .proj = self.bindAt(self.dyn_sconv_proj_off),
+                .static_w = static_w,
+                .static_w_f16 = false,
+                .dyn_w = self.bindAt(self.dyn_sconv_w_off),
+                .m = m,
+                .kv_dim = kv_dim,
+                .num_kv_heads = model.config.num_key_value_heads,
+                .head_dim = model.config.head_dim,
+                .proj_n = dp.n,
+                .weight_scale = 1.0,
+            }, true);
             try self.pipes.encodeRmsNormSconv4(f, .{
-                .x = kv_bind,
+                .x = if (!commit_state) self.bindAt(tree_in_off) else kv_bind,
                 .dyn_w = self.bindAt(self.dyn_sconv_w_off),
                 .conv_state_in = state_b,
                 .conv_state_out = state_b,
                 .out = kv_bind,
+                .ancestor_masks = if (!commit_state) model.ancestor_masks_bind else null,
                 .m = m,
                 .hidden_dim = kv_dim,
                 .state_pos = self.sconv_pos,
@@ -2280,12 +2976,13 @@ pub const M82Runtime = struct {
         } else if (static_w) |sw| {
             const f = try ensureFrame(model, frame_opt);
             try self.pipes.encodeRmsNormSconv4(f, .{
-                .x = kv_bind,
+                .x = if (!commit_state) self.bindAt(tree_in_off) else kv_bind,
                 .conv_w = sw,
                 .conv_w_f16 = false,
                 .conv_state_in = state_b,
                 .conv_state_out = state_b,
                 .out = kv_bind,
+                .ancestor_masks = if (!commit_state) model.ancestor_masks_bind else null,
                 .m = m,
                 .hidden_dim = kv_dim,
                 .state_pos = self.sconv_pos,
@@ -2325,24 +3022,38 @@ pub const M82Runtime = struct {
         self.stats.inkling2_sme2_ctrl_calls += 1;
     }
 
+    fn flushMidPass(self: *M82Runtime, model: *graph.GraphModel, frame_opt: *?metal.Compute.Frame) graph.GraphStepError!void {
+        if (frame_opt.* != null) {
+            try flushFrame(model, frame_opt);
+            self.stats.mid_pass_flushes += 1;
+        }
+    }
+
     fn maybeCaptureDFlareTap(
         self: *M82Runtime,
         model: *graph.GraphModel,
         frame_opt: *?metal.Compute.Frame,
         visit_idx: u32,
         m: u32,
-        src_host: []const f16,
+        src_bind: metal.BufferBinding,
     ) graph.GraphStepError!void {
         const m82c = &model.config.m82_cfg;
-        if (m82c.dflare_target_layer_count == 0 or self.dflare_tap_storage.len == 0) return;
-        const h: usize = model.config.hidden_size;
-        const stride: usize = @as(usize, self.max_tree_nodes) * h;
+        if (m82c.dflare_target_layer_count == 0 or self.dflare_taps_gpu_off == 0) return;
+        const h: u32 = model.config.hidden_size;
+        const stride_bytes: u64 = @as(u64, self.max_tree_nodes) * h * @sizeOf(f16);
         for (0..m82c.dflare_target_layer_count) |ti| {
             if (m82c.dflare_target_layer_ids[ti] == visit_idx) {
-                try flushFrame(model, frame_opt);
-                const dst = self.dflare_tap_storage[ti * stride ..][0 .. @as(usize, m) * h];
-                f16SliceToF32(src_host[0 .. @as(usize, m) * h], dst);
-                self.dflare_tap_slices[ti] = dst;
+                const f = try ensureFrame(model, frame_opt);
+                const dst_off = self.dflare_taps_gpu_off + @as(u64, ti) * stride_bytes;
+                try model.moe_pipes.encodeCopyStrided(f, .{
+                    .src = src_bind,
+                    .dst = self.bindAt(dst_off),
+                    .num_rows = m,
+                    .copy_cols = h,
+                    .src_stride = h,
+                    .dst_stride = h,
+                }, true);
+                self.dflare_tap_gpu_binds[ti] = self.bindAt(dst_off);
                 if (ti + 1 > self.dflare_tap_count) self.dflare_tap_count = ti + 1;
             }
         }
@@ -3393,26 +4104,19 @@ pub const M82Runtime = struct {
 
             // Record all accepted tree nodes into full DFlare context history before compacting.
             const h_us: usize = h;
-            if (self.dflare_ctx_hist_bf16.len > 0) {
+            if (self.hasDFlareCtxHistory()) {
                 for (accepted_nodes, 0..) |nid, idx| {
                     self.recordDFlareCtxTapRow(base_pos + @as(u32, @intCast(idx)), nid, h_us);
                 }
                 self.dflare_ctx_hist_len = base_pos + @as(u32, @intCast(accepted_nodes.len));
             }
 
-            // Compact `last_hidden_f32` and `dflare_taps` to the last accepted node!
+            // Compact `last_hidden_f32` and point GPU + CPU `dflare_taps` at the last accepted node!
             const last_node: usize = accepted_nodes[accepted_nodes.len - 1];
             if (last_node != 0 and (last_node + 1) * h_us <= self.last_hidden_f32.len) {
                 @memcpy(self.last_hidden_f32[0..h_us], self.last_hidden_f32[last_node * h_us ..][0..h_us]);
             }
-            const stride: usize = @as(usize, self.max_tree_nodes) * h_us;
-            for (0..self.dflare_tap_count) |ti| {
-                const base_s = self.dflare_tap_storage[ti * stride ..];
-                if (last_node != 0 and (last_node + 1) * h_us <= stride) {
-                    @memcpy(base_s[0..h_us], base_s[last_node * h_us ..][0..h_us]);
-                }
-                self.dflare_tap_slices[ti] = base_s[0..h_us];
-            }
+            self.syncDFlareActiveRow(last_node, h_us);
         } else if (self.family.isHy4()) {
             const kv_rank = cfg.kv_lora_rank;
             const qk_rope = cfg.qk_rope_head_dim;
@@ -3667,11 +4371,18 @@ fn computeArenaBytes(
     bytes += 4 * amf.align64(max_m * h * 2);
     bytes += amf.align64(max_m * num_exp * 2);
     bytes += 2 * amf.align64(max_m * top_k * 4);
-    bytes += 4 * amf.align64(2 * inter * 2);
+    bytes += amf.align64(max_m * 2 * inter * 2);
+    bytes += 2 * amf.align64(max_m * inter * 2);
     bytes += amf.align64(max_m * top_k * h * 2);
+    bytes += 2 * amf.align64(max_m * h * 2); // exp_gathered_x + exp_down_tmp
+    bytes += 2 * amf.align64(max_m * top_k * 4); // exp_tok_idx + exp_dst_slot
+    if (ctx.enable_router_trace) {
+        bytes += amf.align64(@as(usize, eff_steps) * top_k * @sizeOf(u32));
+    }
 
     if (cfg.m82_family.isInkling2()) {
         bytes += 2 * amf.align64(max_m * h * 2); // ink_prelude_cur + ink_inp_sa
+        bytes += 3 * amf.align64(max_m * h * 2); // x_ctrl_{q,k,v}
         bytes += amf.align64(max_m * cfg.num_attention_heads * m82c.d_rel * 2);
         bytes += amf.align64(max_m * cfg.num_attention_heads * 6);
         bytes += amf.align64(max_m * q_dim * 2);
@@ -3687,9 +4398,57 @@ fn computeArenaBytes(
             .max_tokens = ctx.max_tree_nodes,
             .hidden_dim = cfg.hidden_size,
         });
-        // Per-layer converted small weights (`sconv`, `rel_emb`, multi-pass `attn_res`, `bias`)
+        // GPU cross-pass message bank / attended messages / controller z scratch + cross-pass queries
+        if (cfg.m82_family == .inkling2_loop) {
+            bytes += amf.align64(@as(usize, max_blks) * max_m * h * 4);
+            bytes += amf.align64(4 * max_m * h * 4);
+            bytes += amf.align64(max_m * @max(@as(usize, m82c.loop_gate_rank), 64) * 4);
+            if (ctx.source.find("middle_cycle_cross_pass_queries")) |cpq_e| {
+                bytes += amf.align64(@as(usize, entryElemCount(cpq_e)) * 4);
+            }
+            if (ctx.source.find("middle_cycle_cross_pass_kv_queries")) |cpkv_e| {
+                bytes += amf.align64(@as(usize, entryElemCount(cpkv_e)) * 4);
+            }
+            if (!ctx.use_sme2_controllers) {
+                for (ctx.source.entries()) |*e| {
+                    const nm = e.nameSlice();
+                    if (std.mem.indexOf(u8, nm, ".controllers.") != null and
+                        (std.mem.endsWith(u8, nm, ".down_weight") or
+                            std.mem.endsWith(u8, nm, ".forget_weight") or
+                            std.mem.endsWith(u8, nm, ".gain_weight")))
+                    {
+                        const layout = e.tensorLayout() catch .row_major;
+                        if (layout == .sme2_panel64) {
+                            bytes += amf.align64(@as(usize, entryElemCount(e)) * 2) + 64;
+                        }
+                    }
+                }
+            }
+        }
+        // `G29` indirect MoE workspace + per-layer expert offset/scheme tables
+        bytes += (try moe.MoeWorkspace.requiredBytes(.{
+            .max_tokens = ctx.max_tree_nodes,
+            .num_experts = cfg.num_experts,
+            .top_k = cfg.num_experts_per_tok,
+            .hidden_size = cfg.hidden_size,
+            .intermediate_size = cfg.intermediate_size,
+            .shared_intermediate_size = 0,
+        })) + 4096;
+        bytes += num_layers * (amf.align64(num_exp * @sizeOf(moe.ExpertWeights)) + amf.align64(num_exp) + 128);
+        // GPU DFlare taps (`[num_taps, max_m, H]` f16) and committed context ring (`[hist_cap, num_taps, H]` f16)
+        if (m82c.dflare_target_layer_count > 0) {
+            bytes += amf.align64(@as(usize, m82c.dflare_target_layer_count) * max_m * h * 2);
+            if (max_m > 1) {
+                const hist_cap: usize = @min(max_seq, if (h >= 1024) @as(usize, 1024) else @as(usize, 128));
+                if (hist_cap > 0) {
+                    bytes += amf.align64(hist_cap * @as(usize, m82c.dflare_target_layer_count) * h * 2);
+                }
+            }
+        }
+        // Per-layer converted small weights (`sconv`, `rel_emb`, multi-pass `attn_res`, `bias`, `l2_scale_vec`)
         const per_l_small = 2 * amf.align64(h * 4 * 4) + 2 * amf.align64(kv_dim * 4 * 4) +
             amf.align64(@as(usize, m82c.rel_extent) * m82c.d_rel * 2) +
+            amf.align64(q_dim * 4) + amf.align64(@as(usize, cfg.num_attention_heads) * m82c.d_rel * 4) +
             6 * amf.align64(h * 2) + amf.align64(num_exp * 4) + 4096;
         bytes += num_layers * per_l_small + amf.align64(h * 2);
         // Per-step KV tile tables + tree scratch
@@ -3783,6 +4542,9 @@ fn loadInkling2(
 
     rt.ink_prelude_cur_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
     rt.ink_inp_sa_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
+    rt.x_ctrl_q_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
+    rt.x_ctrl_k_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
+    rt.x_ctrl_v_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * h * 2);
     rt.q_rel_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * cfg.num_attention_heads * m82c.d_rel * 2);
     rt.sink_f16_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * cfg.num_attention_heads * 2);
     rt.sink_f32_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * cfg.num_attention_heads * 4);
@@ -3790,6 +4552,15 @@ fn loadInkling2(
     rt.dyn_sconv_w_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * kv_dim * 4 * 2);
     const dyn_proj_max: usize = @max(@as(usize, cfg.num_key_value_heads) * 4, @as(usize, 4));
     rt.dyn_sconv_proj_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * dyn_proj_max * 2);
+
+    rt.ink_moe_ws = try moe.MoeWorkspace.init(&rt.arena, .{
+        .max_tokens = max_m,
+        .num_experts = num_experts,
+        .top_k = cfg.num_experts_per_tok,
+        .hidden_size = h,
+        .intermediate_size = cfg.intermediate_size,
+        .shared_intermediate_size = 0,
+    });
 
     rt.sconv_h_ring = try ink_gpu.SconvRingArena.init(&rt.arena, .{ .num_layers = eff_steps * 2, .hidden_dim = h });
     @memset(rt.sconv_h_ring.?.bytes(), 0);
@@ -3812,44 +4583,58 @@ fn loadInkling2(
         rt.ink_attn_res_out_q = try loadConvertedF16Binding(ctx, &rt.arena, rt.buf, "attn_res.output_query", h);
     }
     if (ctx.source.find("middle_cycle_cross_pass_queries")) |cpq_e| {
-        rt.ink_cross_pass_q_f32 = try loadTensorF32Slice(allocator, ctx, f32_pool, "middle_cycle_cross_pass_queries", entryElemCount(cpq_e));
+        const elems = entryElemCount(cpq_e);
+        rt.ink_cross_pass_q_f32 = try loadTensorF32Slice(allocator, ctx, f32_pool, "middle_cycle_cross_pass_queries", elems);
+        rt.ink_cross_pass_q_gpu = try loadConvertedF32Binding(ctx, &rt.arena, rt.buf, "middle_cycle_cross_pass_queries", elems);
+        rt.ink_cross_pass_q_rows = @max(@as(u32, 1), elems / h);
     }
     if (ctx.source.find("middle_cycle_cross_pass_kv_queries")) |cpkv_e| {
-        rt.ink_cross_pass_kv_q_f32 = try loadTensorF32Slice(allocator, ctx, f32_pool, "middle_cycle_cross_pass_kv_queries", entryElemCount(cpkv_e));
+        const elems = entryElemCount(cpkv_e);
+        rt.ink_cross_pass_kv_q_f32 = try loadTensorF32Slice(allocator, ctx, f32_pool, "middle_cycle_cross_pass_kv_queries", elems);
+        rt.ink_cross_pass_kv_q_gpu = try loadConvertedF32Binding(ctx, &rt.arena, rt.buf, "middle_cycle_cross_pass_kv_queries", elems);
+        rt.ink_cross_pass_kv_q_rows = @max(@as(u32, 1), elems / h);
     }
 
-    // Preallocate CPU scratch & SME2 dispatcher for `C26` L2 `SME2` loop controllers.
+    // Preallocate GPU cross-pass scratch (default zero-flush `G29`) or CPU SME2 scratch (opt-in `--sme2-controllers`).
     if (cfg.m82_family == .inkling2_loop) {
-        rt.sme_dispatcher = try sme.SmeDispatcher.init(allocator, .{});
-        const max_kv_h = @max(h, kv_dim);
-        rt.ctrl_x_f32 = try allocator.alloc(f32, @as(usize, max_m) * h * 2);
-        rt.ctrl_val_f32 = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
-        rt.ctrl_out_f32 = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
-        rt.ctrl_state_attn = try allocator.alloc(f32, @as(usize, max_m) * h);
-        rt.ctrl_state_k = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
-        rt.ctrl_state_v = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
-        rt.ctrl_state_mlp = try allocator.alloc(f32, @as(usize, max_m) * h);
-        rt.ink_msg_bank_f32 = try allocator.alloc(f32, @as(usize, ink_gpu.MAX_ATTN_RES_BLOCKS) * max_m * h);
-        rt.ink_msg_buf_f32 = try allocator.alloc(f32, 4 * @as(usize, max_m) * h);
-        @memset(rt.ctrl_state_attn, 0);
-        @memset(rt.ctrl_state_k, 0);
-        @memset(rt.ctrl_state_v, 0);
-        @memset(rt.ctrl_state_mlp, 0);
-        @memset(rt.ink_msg_bank_f32, 0);
-        @memset(rt.ink_msg_buf_f32, 0);
+        rt.ink_msg_bank_gpu_off = try allocArenaOff(&rt.arena, @as(usize, max_blks) * max_m * h * 4);
+        rt.ink_msg_buf_gpu_off = try allocArenaOff(&rt.arena, 4 * @as(usize, max_m) * h * 4);
+        rt.ink_ctrl_z_gpu_off = try allocArenaOff(&rt.arena, @as(usize, max_m) * @max(@as(usize, m82c.loop_gate_rank), 64) * 4);
+        if (rt.use_sme2_controllers) {
+            rt.sme_dispatcher = try sme.SmeDispatcher.init(allocator, .{});
+            const max_kv_h = @max(h, kv_dim);
+            rt.ctrl_x_f32 = try allocator.alloc(f32, @as(usize, max_m) * h * 2);
+            rt.ctrl_val_f32 = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
+            rt.ctrl_out_f32 = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
+            rt.ctrl_state_attn = try allocator.alloc(f32, @as(usize, max_m) * h);
+            rt.ctrl_state_k = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
+            rt.ctrl_state_v = try allocator.alloc(f32, @as(usize, max_m) * max_kv_h);
+            rt.ctrl_state_mlp = try allocator.alloc(f32, @as(usize, max_m) * h);
+            rt.ink_msg_bank_f32 = try allocator.alloc(f32, @as(usize, ink_gpu.MAX_ATTN_RES_BLOCKS) * max_m * h);
+            rt.ink_msg_buf_f32 = try allocator.alloc(f32, 4 * @as(usize, max_m) * h);
+            @memset(rt.ctrl_state_attn, 0);
+            @memset(rt.ctrl_state_k, 0);
+            @memset(rt.ctrl_state_v, 0);
+            @memset(rt.ctrl_state_mlp, 0);
+            @memset(rt.ink_msg_bank_f32, 0);
+            @memset(rt.ink_msg_buf_f32, 0);
+        }
     }
 
-    // Preallocate `DFlare` target tap storage and full committed-token context tap history (`1024`-tok SWA ring).
+    // Preallocate `DFlare` GPU target taps (`f16`) + zero-copy GPU committed context tap ring (`1024`-tok SWA ring) + CPU mirror.
     if (m82c.dflare_target_layer_count > 0) {
-        rt.dflare_tap_storage = try allocator.alloc(f32, @as(usize, m82c.dflare_target_layer_count) * max_m * h);
+        const ntaps: usize = m82c.dflare_target_layer_count;
+        rt.dflare_taps_gpu_off = try allocArenaOff(&rt.arena, ntaps * max_m * h * 2);
+        rt.dflare_tap_storage = try allocator.alloc(f32, ntaps * max_m * h);
         @memset(rt.dflare_tap_storage, 0);
-        const hist_cap: u32 = @min(ctx.max_seq_len, if (h >= 1024) @as(u32, 1024) else @as(u32, 128));
-        if (hist_cap > 0) {
-            rt.dflare_ctx_hist_bf16 = try allocator.alloc(u16, @as(usize, hist_cap) * @as(usize, m82c.dflare_target_layer_count) * h);
-            @memset(rt.dflare_ctx_hist_bf16, 0);
-            rt.dflare_ctx_hist_cap = hist_cap;
-            rt.dflare_ctx_hist_taps = m82c.dflare_target_layer_count;
-            rt.dflare_ctx_hist_hidden = h;
+        if (max_m > 1) {
+            const hist_cap: u32 = @min(ctx.max_seq_len, if (h >= 1024) @as(u32, 1024) else @as(u32, 128));
+            if (hist_cap > 0) {
+                rt.dflare_ctx_hist_off = try allocArenaOff(&rt.arena, @as(usize, hist_cap) * ntaps * h * 2);
+                rt.dflare_ctx_hist_cap = hist_cap;
+                rt.dflare_ctx_hist_taps = m82c.dflare_target_layer_count;
+                rt.dflare_ctx_hist_hidden = h;
+            }
         }
     }
 
@@ -3934,10 +4719,12 @@ fn loadInkling2(
         const qclip_nm = std.fmt.bufPrint(&nb, "layers.{d}.attn.q_l2_clip.scale", .{l}) catch unreachable;
         var qclip_scale: f32 = 1.0;
         var q_l2_scale_vec: ?[]const f32 = null;
+        var q_l2_scale_vec_gpu: ?metal.BufferBinding = null;
         if (ctx.source.find(qclip_nm)) |qe| {
             const qelems = entryElemCount(qe);
             if (qelems == q_dim) {
                 q_l2_scale_vec = try loadTensorF32Slice(allocator, ctx, f32_pool, qclip_nm, q_dim);
+                q_l2_scale_vec_gpu = try loadConvertedF32Binding(ctx, &rt.arena, rt.buf, qclip_nm, q_dim);
             } else {
                 qclip_scale = readOptionalScalarF32(ctx, qclip_nm) orelse 1.0;
             }
@@ -3945,11 +4732,13 @@ fn loadInkling2(
         const rclip_nm = std.fmt.bufPrint(&nb, "layers.{d}.attn.rel_l2_clip.scale", .{l}) catch unreachable;
         var rclip_scale: f32 = 1.0;
         var rel_l2_scale_vec: ?[]const f32 = null;
+        var rel_l2_scale_vec_gpu: ?metal.BufferBinding = null;
         const rel_q_elems: u32 = cfg.num_attention_heads * m82c.d_rel;
         if (ctx.source.find(rclip_nm)) |re| {
             const relems = entryElemCount(re);
             if (relems == rel_q_elems) {
                 rel_l2_scale_vec = try loadTensorF32Slice(allocator, ctx, f32_pool, rclip_nm, rel_q_elems);
+                rel_l2_scale_vec_gpu = try loadConvertedF32Binding(ctx, &rt.arena, rt.buf, rclip_nm, rel_q_elems);
             } else {
                 rclip_scale = readOptionalScalarF32(ctx, rclip_nm) orelse 1.0;
             }
@@ -3978,54 +4767,70 @@ fn loadInkling2(
             ar_mlp_q = try loadConvertedF16Binding(ctx, &rt.arena, rt.buf, arm_nm, ar_mlp_passes * h);
         }
 
-        // C26 L2 SME2 Loop Controller (for Core layers when controller tensors are present)
+        // Loop Controller (`G29` GPU default with one-time `sme2_panel64` deinterleave, or opt-in C26 L2 SME2)
         const ctrl_probe = std.fmt.bufPrint(&nb, "layers.{d}.controllers.attn.down_weight", .{l}) catch unreachable;
         var loop_ctrl: ?ink_ctrl.Inkling2LoopController = null;
+        var gpu_ctrl: ?Inkling2GpuController = null;
         if (ctx.source.find(ctrl_probe)) |probe_e| {
             const p_dt: sme.PanelDType = switch (try probe_e.dataType()) {
                 .f16 => .f16,
                 .q4_affine => .q4_affine,
+                .q3_affine => .q3_affine,
+                .q2_affine => .q2_affine,
                 else => .bf16,
             };
             const ctrl_in_dim: u32 = if (probe_e.rank >= 2 and probe_e.shape[1] > 0) probe_e.shape[1] else h;
+            const gate_rank: u32 = if (probe_e.rank >= 2 and probe_e.shape[0] > 0) probe_e.shape[0] else ink_ctrl.GATE_RANK;
             var nb_kfg: [96]u8 = undefined;
             const kfg_nm = std.fmt.bufPrint(&nb_kfg, "layers.{d}.controllers.k.forget_weight", .{l}) catch unreachable;
             const kv_ctrl_dim: u32 = if (ctx.source.find(kfg_nm)) |ke| ke.shape[0] else kv_dim;
             const out_dims = [ink_ctrl.NUM_BRANCHES]u32{ h, kv_ctrl_dim, kv_ctrl_dim, h };
-            var branches: [ink_ctrl.NUM_BRANCHES]ink_ctrl.BranchConfig = undefined;
-            for (0..ink_ctrl.NUM_BRANCHES) |bi| {
-                branches[bi] = .{
-                    .state_dim = out_dims[bi],
-                    .down_dtype = p_dt,
-                    .forget_dtype = p_dt,
-                    .gain_dtype = p_dt,
-                    .gain_activation = .silu,
+            if (rt.use_sme2_controllers) {
+                var branches: [ink_ctrl.NUM_BRANCHES]ink_ctrl.BranchConfig = undefined;
+                for (0..ink_ctrl.NUM_BRANCHES) |bi| {
+                    branches[bi] = .{
+                        .state_dim = out_dims[bi],
+                        .down_dtype = p_dt,
+                        .forget_dtype = p_dt,
+                        .gain_dtype = p_dt,
+                        .gain_activation = .silu,
+                    };
+                }
+                const ctrl_cfg: ink_ctrl.ControllerConfig = .{
+                    .hidden_size = ctrl_in_dim,
+                    .gate_rank = gate_rank,
+                    .max_m = max_m,
+                    .rms_eps = cfg.rms_norm_eps,
+                    .l2_limit_bytes = 8 * 1024 * 1024,
+                    .branches = branches,
+                    .budget_override = ctx.wired_budget,
                 };
-            }
-            const ctrl_cfg: ink_ctrl.ControllerConfig = .{
-                .hidden_size = ctrl_in_dim,
-                .gate_rank = ink_ctrl.GATE_RANK,
-                .max_m = max_m,
-                .rms_eps = cfg.rms_norm_eps,
-                .l2_limit_bytes = 8 * 1024 * 1024,
-                .branches = branches,
-                .budget_override = ctx.wired_budget,
-            };
-            if (ctx.amf_path) |ap| {
-                var af = try amf.AmfFile.open(allocator, ap);
-                defer af.close(allocator);
-                loop_ctrl = try ink_ctrl.Inkling2LoopController.loadFromAmfLayer(allocator, &af, @intCast(l), ctrl_cfg);
+                if (ctx.amf_path) |ap| {
+                    var af = try amf.AmfFile.open(allocator, ap);
+                    defer af.close(allocator);
+                    loop_ctrl = try ink_ctrl.Inkling2LoopController.loadFromAmfLayer(allocator, &af, @intCast(l), ctrl_cfg);
+                } else {
+                    loop_ctrl = try loadControllerFromParsedBytes(allocator, ctx, @intCast(l), ctrl_cfg);
+                }
             } else {
-                loop_ctrl = try loadControllerFromParsedBytes(allocator, ctx, @intCast(l), ctrl_cfg);
+                gpu_ctrl = try loadGpuControllerToArena(ctx, &rt.arena, rt.buf, @intCast(l), ctrl_in_dim, gate_rank, out_dims);
             }
         }
 
-        // Router + experts
+        // Router + experts + optional zero-readback `G29` indirect MoE descriptor (`cold == 0`)
         const router = try bindLinearCtx(ctx, std.fmt.bufPrint(&nb, "layers.{d}.mlp.gate", .{l}) catch unreachable, num_experts, h);
         const rb_nm = std.fmt.bufPrint(&nb, "layers.{d}.mlp.gate.bias", .{l}) catch unreachable;
         const rb_f32 = if (ctx.source.find(rb_nm) != null) try loadConvertedF32Binding(ctx, &rt.arena, rt.buf, rb_nm, num_experts) else null;
 
         const experts = try bindLayerExperts(allocator, ctx, l, num_experts, h, cfg.intermediate_size, "w13");
+        var cold_cnt_l: u32 = 0;
+        for (experts) |ew| {
+            if (ew == .cold) cold_cnt_l += 1;
+        }
+        const indirect_moe = if (cold_cnt_l == 0)
+            try buildInkling2IndirectMoeMeta(&rt.arena, rt.buf, experts)
+        else
+            null;
 
         rt.ink_layers[l] = .{
             .attn_norm = attn_norm,
@@ -4051,14 +4856,19 @@ fn loadInkling2(
             .rel_l2_clip_scale = if (rclip_scale > 0.0 and std.math.isFinite(rclip_scale)) rclip_scale else 1.0,
             .q_l2_scale_vec = q_l2_scale_vec,
             .rel_l2_scale_vec = rel_l2_scale_vec,
+            .q_l2_scale_vec_gpu = q_l2_scale_vec_gpu,
+            .rel_l2_scale_vec_gpu = rel_l2_scale_vec_gpu,
             .attn_res_attn_q = ar_attn_q,
             .attn_res_attn_q_passes = ar_attn_passes,
             .attn_res_mlp_q = ar_mlp_q,
             .attn_res_mlp_q_passes = ar_mlp_passes,
             .loop_ctrl = loop_ctrl,
+            .gpu_ctrl = gpu_ctrl,
             .router = router,
             .router_bias_f32 = rb_f32,
             .experts = experts,
+            .indirect_moe = indirect_moe,
+            .cold_expert_count = cold_cnt_l,
             .is_local = (l < m82c.local_layer_flags.len and m82c.local_layer_flags[l]),
         };
         built_layers += 1;
@@ -4080,7 +4890,8 @@ fn loadInkling2(
         rt.ink_steps = &.{};
     }
 
-    const swa_tiles: u32 = @max(@as(u32, 1), (m82c.sliding_window_size + hybrid.QSA_SWA_WINDOW_TOKENS - 1) / hybrid.QSA_SWA_WINDOW_TOKENS);
+    const eff_swa_win: u32 = @max(@as(u32, 1), @min(m82c.sliding_window_size, ctx.max_seq_len));
+    const swa_tiles: u32 = @max(@as(u32, 1), (eff_swa_win + hybrid.QSA_SWA_WINDOW_TOKENS - 1) / hybrid.QSA_SWA_WINDOW_TOKENS);
     const full_tiles: u32 = @max(@as(u32, 1), (ctx.max_seq_len + hybrid.QSA_FULL_CHUNK_TOKENS - 1) / hybrid.QSA_FULL_CHUNK_TOKENS);
 
     for (0..eff_steps) |si| {
@@ -4091,7 +4902,7 @@ fn loadInkling2(
             .num_kv_heads = cfg.num_key_value_heads,
             .head_dim = cfg.head_dim,
             .num_tiles = if (is_local) swa_tiles else full_tiles,
-            .window_size_override = if (is_local) m82c.sliding_window_size else null,
+            .window_size_override = if (is_local) eff_swa_win else null,
         });
         errdefer kv_ring.deinit(allocator);
         try kv_ring.makeResident(ctx.compute);
@@ -4843,6 +5654,247 @@ fn unpackHy4KvBProj(
             }
         }
     }
+}
+
+fn linearToInkling2Desc(lin: qwen3.LinearBinding) ink_gpu.Inkling2LinearDesc {
+    return .{
+        .amf_dtype = lin.amf_dtype,
+        .group_size = lin.group_size,
+        .tensor_scale_per_row = lin.tensor_scale_per_row,
+        .weight = lin.weight,
+        .params = lin.scale_bias,
+        .n = lin.n,
+        .k = lin.k,
+    };
+}
+
+fn loadControllerMatrixToGpu(
+    ctx: M82LoadContext,
+    arena: *arena_mod.WiredArena,
+    buf: metal.Buffer,
+    e: *const amf.TensorEntry,
+    rows: u32,
+    cols: u32,
+    out_dt: quant.FloatDType,
+) !metal.BufferBinding {
+    const idx = entryIndex(ctx, e);
+    const raw = ctx.entry_slices[idx];
+    const lay = try e.tensorLayout();
+    const dt = try e.dataType();
+    if (lay == .sme2_panel64) {
+        const p_dt: sme.PanelDType = switch (dt) {
+            .f16 => .f16,
+            .bf16 => .bf16,
+            .q4_affine => .q4_affine,
+            .q3_affine => .q3_affine,
+            .q2_affine => .q2_affine,
+            else => return error.UnsupportedDType,
+        };
+        const dw = try ink_gpu.deinterleavePanel64ToArena(arena, p_dt, raw, rows, cols, out_dt);
+        return dw.binding(buf);
+    }
+    if (lay == .row_major and ((out_dt == .f16 and dt == .f16) or (out_dt == .bf16 and dt == .bf16))) {
+        return .{
+            .buffer = ctx.weight_shards[ctx.entry_shard[idx]].buffer,
+            .offset = ctx.entry_offsets[idx],
+        };
+    }
+    const count: usize = @as(usize, rows) * cols;
+    const off = try allocArenaOff(arena, count * @sizeOf(u16));
+    const dst_u16: []u16 = @alignCast(std.mem.bytesAsSlice(u16, arena.bytes()[@intCast(off)..][0 .. count * 2]));
+    switch (dt) {
+        .f16 => {
+            const src: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, raw[0 .. count * 2]));
+            if (out_dt == .f16) {
+                @memcpy(@as([]f16, @ptrCast(dst_u16)), src);
+            } else {
+                for (src, 0..) |v, i| {
+                    const fv: f32 = @floatCast(v);
+                    dst_u16[i] = quant.f32ToBf16(fv);
+                }
+            }
+        },
+        .bf16 => {
+            const src: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw[0 .. count * 2]));
+            if (out_dt == .bf16) {
+                @memcpy(dst_u16, src);
+            } else {
+                const dst_f16: []f16 = @ptrCast(dst_u16);
+                for (src, 0..) |v, i| dst_f16[i] = @floatCast(quant.bf16ToF32(v));
+            }
+        },
+        .f32 => {
+            const src: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, raw[0 .. count * 4]));
+            if (out_dt == .f16) {
+                const dst_f16: []f16 = @ptrCast(dst_u16);
+                for (src, 0..) |v, i| dst_f16[i] = @floatCast(v);
+            } else {
+                for (src, 0..) |v, i| dst_u16[i] = quant.f32ToBf16(v);
+            }
+        },
+        else => return error.UnsupportedDType,
+    }
+    return .{ .buffer = buf, .offset = off };
+}
+
+fn loadGpuControllerToArena(
+    ctx: M82LoadContext,
+    arena: *arena_mod.WiredArena,
+    buf: metal.Buffer,
+    layer_idx: u32,
+    ctrl_in_dim: u32,
+    gate_rank: u32,
+    out_dims: [ink_ctrl.NUM_BRANCHES]u32,
+) !Inkling2GpuController {
+    var name_buf: [96]u8 = undefined;
+    var out: Inkling2GpuController = undefined;
+    for (0..ink_ctrl.NUM_BRANCHES) |bi| {
+        const br: ink_ctrl.ControllerBranch = @fromBackingInt(@intCast(bi));
+        const sd = out_dims[bi];
+        const dn_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.controllers.{s}.down_weight", .{ layer_idx, br.label() }) catch unreachable;
+        const dn_e = ctx.source.find(dn_nm) orelse return error.MissingTensor;
+        const fg_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.controllers.{s}.forget_weight", .{ layer_idx, br.label() }) catch unreachable;
+        const fg_e = ctx.source.find(fg_nm) orelse return error.MissingTensor;
+        const gn_nm = std.fmt.bufPrint(&name_buf, "layers.{d}.controllers.{s}.gain_weight", .{ layer_idx, br.label() }) catch unreachable;
+        const gn_e = ctx.source.find(gn_nm) orelse return error.MissingTensor;
+
+        const out_dt: quant.FloatDType = if ((try dn_e.dataType()) == .f16) .f16 else .bf16;
+        const dn_bind = try loadControllerMatrixToGpu(ctx, arena, buf, dn_e, gate_rank, ctrl_in_dim, out_dt);
+        const fg_bind = try loadControllerMatrixToGpu(ctx, arena, buf, fg_e, sd, gate_rank, out_dt);
+        const gn_bind = try loadControllerMatrixToGpu(ctx, arena, buf, gn_e, sd, gate_rank, out_dt);
+
+        out.branches[bi] = .{
+            .down_weight = dn_bind,
+            .forget_weight = fg_bind,
+            .gain_weight = gn_bind,
+            .weight_dtype = out_dt,
+            .state_dim = sd,
+            .down_in_dim = ctrl_in_dim,
+            .gate_rank = gate_rank,
+        };
+    }
+    return out;
+}
+
+fn buildInkling2IndirectMoeMeta(
+    arena: *arena_mod.WiredArena,
+    arena_buf: metal.Buffer,
+    experts: []const M82ExpertWeight,
+) !?Inkling2IndirectMoeMeta {
+    if (experts.len == 0) return null;
+    const first_hot = switch (experts[0]) {
+        .hot => |hw| hw,
+        .cold => return null,
+    };
+    const base_buf = first_hot.w1.weight.buffer;
+
+    var scheme_descs: [moe.NUM_SCHEME_BUCKETS]moe.MoeSchemeDesc = .{ .{}, .{}, .{}, .{}, .{} };
+    var scheme_counts: [moe.NUM_SCHEME_BUCKETS]u32 = .{ 0, 0, 0, 0, 0 };
+    var bucket_pair: [moe.NUM_SCHEME_BUCKETS]bool = .{ true, true, true, true, true };
+    var bucket_count: usize = 0;
+
+    // Pre-scan to validate single-buffer residency, row_major layout, supported dtypes, and <= 5 scheme buckets.
+    for (experts) |ew| {
+        const hw = switch (ew) {
+            .hot => |h| h,
+            .cold => return null,
+        };
+        if (hw.w1.layout != .row_major or hw.w2.layout != .row_major) return null;
+        if (hw.w1.amf_dtype == .f32 or hw.w1.amf_dtype == .u32) return null;
+        if (hw.w2.amf_dtype == .f32 or hw.w2.amf_dtype == .u32) return null;
+        if (hw.w1.weight.buffer.handle != base_buf.handle or hw.w2.weight.buffer.handle != base_buf.handle) return null;
+        if (hw.w1.scale_bias) |sb| if (sb.buffer.handle != base_buf.handle) return null;
+        if (hw.w2.scale_bias) |sb| if (sb.buffer.handle != base_buf.handle) return null;
+        if (hw.w_up) |wu| {
+            if (wu.layout != .row_major or wu.weight.buffer.handle != base_buf.handle) return null;
+            if (wu.scale_bias) |sb| if (sb.buffer.handle != base_buf.handle) return null;
+            if (wu.amf_dtype != hw.w1.amf_dtype or wu.group_size != hw.w1.group_size or
+                wu.tensor_scale_per_row != hw.w1.tensor_scale_per_row)
+            {
+                return null;
+            }
+        }
+        const desc: moe.MoeSchemeDesc = .{
+            .gate_up_dtype = hw.w1.amf_dtype,
+            .gate_up_group_size = hw.w1.group_size,
+            .gate_up_tensor_scale_per_row = hw.w1.tensor_scale_per_row,
+            .down_dtype = hw.w2.amf_dtype,
+            .down_group_size = hw.w2.group_size,
+            .down_tensor_scale_per_row = hw.w2.tensor_scale_per_row,
+        };
+        const is_pair = (hw.w_up == null);
+        var found: ?usize = null;
+        for (0..bucket_count) |bi| {
+            if (scheme_descs[bi].eql(desc) and bucket_pair[bi] == is_pair) {
+                found = bi;
+                break;
+            }
+        }
+        if (found == null) {
+            if (bucket_count >= moe.NUM_SCHEME_BUCKETS) return null;
+            scheme_descs[bucket_count] = desc;
+            bucket_pair[bucket_count] = is_pair;
+            bucket_count += 1;
+        }
+    }
+    if (bucket_count == 0) return null;
+
+    const tbl_off = try allocArenaOff(arena, experts.len * @sizeOf(moe.ExpertWeights));
+    const tbl: []moe.ExpertWeights = @alignCast(std.mem.bytesAsSlice(
+        moe.ExpertWeights,
+        arena.bytes()[@intCast(tbl_off)..][0 .. experts.len * @sizeOf(moe.ExpertWeights)],
+    ));
+    const is_hetero = (bucket_count > 1);
+    var schemes_bind: ?metal.BufferBinding = null;
+    var schemes_slice: []u8 = &.{};
+    if (is_hetero) {
+        const sc_off = try allocArenaOff(arena, amf.align64(experts.len));
+        schemes_slice = arena.bytes()[@intCast(sc_off)..][0..experts.len];
+        schemes_bind = .{ .buffer = arena_buf, .offset = sc_off };
+    }
+
+    for (experts, 0..) |ew, ei| {
+        const hw = ew.hot;
+        tbl[ei] = .{
+            .gate_qweight_offset = hw.w1.weight.offset,
+            .gate_sb_offset = if (hw.w1.scale_bias) |sb| sb.offset else 0,
+            .up_qweight_offset = if (hw.w_up) |wu| wu.weight.offset else 0,
+            .up_sb_offset = if (hw.w_up) |wu| (if (wu.scale_bias) |sb| sb.offset else 0) else 0,
+            .down_qweight_offset = hw.w2.weight.offset,
+            .down_sb_offset = if (hw.w2.scale_bias) |sb| sb.offset else 0,
+        };
+        const desc: moe.MoeSchemeDesc = .{
+            .gate_up_dtype = hw.w1.amf_dtype,
+            .gate_up_group_size = hw.w1.group_size,
+            .gate_up_tensor_scale_per_row = hw.w1.tensor_scale_per_row,
+            .down_dtype = hw.w2.amf_dtype,
+            .down_group_size = hw.w2.group_size,
+            .down_tensor_scale_per_row = hw.w2.tensor_scale_per_row,
+        };
+        const is_pair = (hw.w_up == null);
+        var bid: usize = 0;
+        for (0..bucket_count) |bi| {
+            if (scheme_descs[bi].eql(desc) and bucket_pair[bi] == is_pair) {
+                bid = bi;
+                break;
+            }
+        }
+        scheme_counts[bid] += 1;
+        if (is_hetero) {
+            schemes_slice[ei] = @intCast(bid);
+        }
+    }
+
+    return .{
+        .weights_base = .{ .buffer = base_buf, .offset = 0 },
+        .expert_table = .{ .buffer = arena_buf, .offset = tbl_off },
+        .expert_schemes = schemes_bind,
+        .is_heterogeneous = is_hetero,
+        .pair_interleaved = bucket_pair[0],
+        .bucket_pair_interleaved = if (is_hetero) bucket_pair else null,
+        .scheme_counts = scheme_counts,
+        .scheme_descs = scheme_descs,
+    };
 }
 
 fn loadControllerFromParsedBytes(

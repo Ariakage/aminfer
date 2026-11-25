@@ -2247,8 +2247,8 @@ kernel void ami_qf_gguf_k_moe_down_proj(const device half *inter [[buffer(0)]],
 // ===========================================================================
 
 struct IqCodebookSmem {
-    uint16_t grid16[4096]; // 8,192 B (indexed as uint32_t via grid32 or uint16_t pairs)
-    uint8_t signs[128];    // 128 B (ksigns_iq2xs)
+    alignas(16) uint32_t grid32[2048]; // 8,192 B (direct 32-bit reads, 16-byte aligned for uint4 staging)
+    uint8_t signs[128];                // 128 B (ksigns_iq2xs)
 };
 
 static_assert(sizeof(IqCodebookSmem) == 8320u, "IqCodebookSmem must fit within 16 KiB");
@@ -2286,10 +2286,12 @@ static inline bool qf_iq_needs_signs(uint dtype) {
 static inline void qf_iq_stage_codebook(const device uchar *codebook,
                                         threadgroup IqCodebookSmem &smem,
                                         uint tid) {
-    const device uint16_t *src16 = (const device uint16_t *)codebook;
     const uint n16 = qf_iq_grid_u16_count(QF_DTYPE);
-    for (uint i = tid; i < n16; i += 128u) {
-        smem.grid16[i] = src16[i];
+    const uint n_vec4 = n16 >> 3;
+    const device uint4 *src4 = (const device uint4 *)codebook;
+    threadgroup uint4 *dst4 = (threadgroup uint4 *)smem.grid32;
+    for (uint i = tid; i < n_vec4; i += 128u) {
+        dst4[i] = src4[i];
     }
     if (qf_iq_needs_signs(QF_DTYPE)) {
         const device uchar *signs_src = codebook + ulong(n16) * 2ul;
@@ -2301,7 +2303,7 @@ static inline void qf_iq_stage_codebook(const device uchar *codebook,
 }
 
 static inline uint qf_smem_read_u32(threadgroup const IqCodebookSmem &smem, uint u32_idx) {
-    return uint(smem.grid16[u32_idx * 2u]) | (uint(smem.grid16[u32_idx * 2u + 1u]) << 16);
+    return smem.grid32[u32_idx];
 }
 
 static inline void qf_iq_dequant8(const device uchar *blk,
@@ -2684,22 +2686,26 @@ kernel void ami_qf_iq_moe_down_proj(const device half *inter [[buffer(0)]],
                                     uint tid [[thread_index_in_threadgroup]],
                                     uint sg_id [[simdgroup_index_in_threadgroup]],
                                     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup IqCodebookSmem smem;
-    qf_iq_stage_codebook(codebook, smem, tid);
-
     constexpr uint ROWS_PER_SG = 2u;
     const uint u = tg_pos.y;
     if (u >= sched_hdr->num_unique_experts) {
         return;
     }
-    const uint row0 = tg_pos.x * 8u + sg_id * ROWS_PER_SG;
-    if (row0 >= p.hidden_size) {
+    if (tg_pos.x * 8u >= p.hidden_size) {
         return;
     }
     const uint s0 = expert_token_offsets[u];
     const uint s1 = expert_token_offsets[u + 1u];
     const uint count_u = s1 - s0;
     if (count_u == 0u) {
+        return;
+    }
+
+    threadgroup IqCodebookSmem smem;
+    qf_iq_stage_codebook(codebook, smem, tid);
+
+    const uint row0 = tg_pos.x * 8u + sg_id * ROWS_PER_SG;
+    if (row0 >= p.hidden_size) {
         return;
     }
     const QfExpertWeights ew = expert_table[unique_experts[u]];

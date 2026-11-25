@@ -3865,13 +3865,39 @@ pub const DFlareProposer = struct {
                         self.ctx_cache_epoch = gch.epoch;
                     }
                     const win_start: u32 = if (gch.len > max_ctx) gch.len - max_ctx else 0;
-                    const start_p: u32 = @max(self.ctx_cache_len, win_start);
-                    if (start_p < gch.len) {
-                        final_chunk_pos = start_p;
-                        final_chunk_len = gch.len - start_p;
-                        ring_cap = gch.cap;
-                        ring_start = start_p % gch.cap;
-                        taps_dtype = @backingInt(gch.dtype);
+                    var p: u32 = @max(self.ctx_cache_len, win_start);
+                    const gch_dtype: u32 = @backingInt(gch.dtype);
+                    while (p < gch.len) {
+                        const rem = gch.len - p;
+                        const take: u32 = @min(rem, ws.ctx_batch_cap);
+                        if (p + take < gch.len) {
+                            // Early catch-up chunk (> ctx_batch_cap): commit & wait so `gpu_ctx_in_f16` stays in bounds.
+                            var cf = try gpu.compute_ptr.beginFrame(gpu.timeout_ms);
+                            errdefer cf.abort();
+                            try self.encodeGpuContextKvBatch(
+                                gpu,
+                                &cf,
+                                gch.taps_ring,
+                                gch_dtype,
+                                gch.cap,
+                                p % gch.cap,
+                                take,
+                                p,
+                                false,
+                                false,
+                                false,
+                            );
+                            const sig = try cf.commit();
+                            try gpu.compute_ptr.wait(sig, gpu.timeout_ms);
+                            p += take;
+                        } else {
+                            final_chunk_pos = p;
+                            final_chunk_len = take;
+                            ring_cap = gch.cap;
+                            ring_start = p % gch.cap;
+                            taps_dtype = gch_dtype;
+                            break;
+                        }
                     }
                     self.ctx_cache_len = gch.len;
                     active_ctx_len = @min(gch.len, max_ctx);

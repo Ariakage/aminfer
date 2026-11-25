@@ -438,6 +438,8 @@ comptime {
     std.debug.assert(@backingInt(DraftMode.dfly2) == sdk_c.AMI_SDK_DRAFT_DFLY2);
     std.debug.assert(@hasDecl(sdk_c, "ami_sdk_quantize_rows_affine_raw"));
     std.debug.assert(@typeInfo(@TypeOf(sdk_c.ami_sdk_quantize_rows_affine_raw)).@"fn".param_types.len == 13);
+    std.debug.assert(@hasDecl(sdk_c, "ami_sdk_dequant_nvfp4_rows_f32"));
+    std.debug.assert(@typeInfo(@TypeOf(sdk_c.ami_sdk_dequant_nvfp4_rows_f32)).@"fn".param_types.len == 6);
 }
 
 // ---------------------------------------------------------------------------
@@ -4781,6 +4783,71 @@ pub export fn ami_sdk_quantize_rows_affine_raw(
     return AMI_SDK_OK;
 }
 
+const NVFP4_E2M1_LUT: [16]f32 = .{
+    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+};
+
+const NVFP4_E4M3_LUT: [256]f32 = blk: {
+    @setEvalBranchQuota(4096);
+    var tbl: [256]f32 = undefined;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if ((b & 0x7F) == 0x7F) {
+            tbl[i] = std.math.nan(f32);
+            continue;
+        }
+        const sign: f32 = if ((b & 0x80) != 0) -1.0 else 1.0;
+        const exp: u32 = (b >> 3) & 0x0F;
+        const mant: f32 = @floatFromInt(b & 0x07);
+        if (exp == 0) {
+            tbl[i] = sign * (mant * (1.0 / 512.0));
+        } else {
+            const p: f32 = @bitCast((exp + 120) << 23);
+            tbl[i] = sign * (1.0 + mant * 0.125) * p;
+        }
+    }
+    break :blk tbl;
+};
+
+pub export fn ami_sdk_dequant_nvfp4_rows_f32(
+    data_bytes: ?[*]const u8,
+    scale_bytes: ?[*]const u8,
+    outer_scale: f32,
+    n_rows: u32,
+    k: u32,
+    dst_f32: ?[*]f32,
+) callconv(.c) Status {
+    clearLastError();
+    if (k == 0 or (k % 16) != 0) {
+        return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "k must be a positive multiple of 16");
+    }
+    if (n_rows == 0) return AMI_SDK_OK;
+    const d_ptr = data_bytes orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "data_bytes is NULL");
+    const s_ptr = scale_bytes orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "scale_bytes is NULL");
+    const out_ptr = dst_f32 orelse return fail(AMI_SDK_ERR_INVALID_ARGUMENT, "dst_f32 is NULL");
+
+    const groups: usize = k / 16;
+    const row_d: usize = k / 2;
+    const k_us: usize = k;
+    for (0..n_rows) |r| {
+        const rd = d_ptr + r * row_d;
+        const rs = s_ptr + r * groups;
+        const ro = out_ptr + r * k_us;
+        for (0..groups) |g| {
+            const sc: f32 = NVFP4_E4M3_LUT[rs[g]] * outer_scale;
+            const d_off = g * 8;
+            const p_off = g * 16;
+            inline for (0..8) |bi| {
+                const byte = rd[d_off + bi];
+                ro[p_off + 2 * bi] = NVFP4_E2M1_LUT[byte & 0x0F] * sc;
+                ro[p_off + 2 * bi + 1] = NVFP4_E2M1_LUT[(byte >> 4) & 0x0F] * sc;
+            }
+        }
+    }
+    return AMI_SDK_OK;
+}
+
 // ---------------------------------------------------------------------------
 // Zig Unit Tests (`zig build test`)
 // ---------------------------------------------------------------------------
@@ -5775,4 +5842,34 @@ test "sdk: SpecOptions and SpecStats ABI defaults and validation" {
         .mean_accept_len = 0.0,
     };
     try std.testing.expectEqual(AMI_SDK_ERR_INVALID_ARGUMENT, ami_sdk_engine_query_spec_stats(null, &sstats));
+}
+
+test "sdk.c_api: ami_sdk_dequant_nvfp4_rows_f32 exact E2M1xE4M3 decoding and arg guards" {
+    // 1 row, k = 16 (8 packed bytes, 1 E4M3 scale byte).
+    // Byte 0x29 -> low nibble 9 (-0.5), high nibble 2 (1.0).
+    // E4M3 0x38 = 2^(7-7) * (1 + 0/8) = 1.0, outer_scale = 0.5 -> eff_scale = 0.5.
+    var data: [8]u8 = .{ 0x29, 0x31, 0xF7, 0x00, 0x45, 0x68, 0xAB, 0xCD };
+    const scales: [1]u8 = .{0x38};
+    var dst: [16]f32 = @splat(0.0);
+
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_dequant_nvfp4_rows_f32(&data, &scales, 0.5, 1, 12, &dst),
+    );
+    try std.testing.expectEqual(
+        AMI_SDK_ERR_INVALID_ARGUMENT,
+        ami_sdk_dequant_nvfp4_rows_f32(null, &scales, 0.5, 1, 16, &dst),
+    );
+    try std.testing.expectEqual(
+        AMI_SDK_OK,
+        ami_sdk_dequant_nvfp4_rows_f32(&data, &scales, 0.5, 1, 16, &dst),
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, -0.25), dst[0], 1e-6); // -0.5 * 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), dst[1], 1e-6); // 1.0 * 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), dst[2], 1e-6); // 0.5 * 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), dst[3], 1e-6); // 1.5 * 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), dst[4], 1e-6); // 6.0 * 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, -3.0), dst[5], 1e-6); // -6.0 * 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), dst[6], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), dst[7], 1e-6);
 }

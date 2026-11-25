@@ -1243,6 +1243,12 @@ pub const GraphLoadOptions = struct {
     // M8.1 Multi-format Quantization (`G23`), Activation Quantization (`G24`), and ChatTemplate (`W24`)
     act_quant_policy: quant_formats.ActQuantPolicy = .none,
     chat_template_json_path: ?[]const u8 = null,
+
+    // M8.25 Zero-flush `Inkling 2` GPU controllers (`G29`) & loop-folded router trace (`W8`)
+    /// Opt-in CPU SME2 controller path (`--sme2-controllers`) for parity testing; defaults to `false` (GPU zero-flush).
+    use_sme2_controllers: bool = false,
+    /// Enable zero-alloc per-step top-k router trace capture for `inkling2_loop` / `inkling2` (`--dump-router-trace`).
+    enable_router_trace: bool = false,
 };
 
 pub const M7Stats = struct {
@@ -1305,7 +1311,7 @@ pub const GraphLoadError = error{
     attention.RetiredKvQ8PoolError ||
     moe.WorkspaceError || ple_mod.Error || sme.WiredScratchError || vision_mod.Error ||
     cache_mod.PoolError || cache_mod.CacheError || aio.EcorePoolError ||
-    ink_gpu.EncodeError || ink_gpu.ArenaError || ink_ctrl.Error;
+    ink_gpu.EncodeError || ink_gpu.ArenaError || ink_gpu.DeinterleaveError || ink_ctrl.Error;
 
 pub const GraphStepError = error{
     SequenceFull,
@@ -1321,7 +1327,7 @@ pub const GraphStepError = error{
     hybrid.EncodeError || hybrid.ArenaError || ple_mod.Error ||
     attention.RetiredKvQ8PoolError || expert_parallel.ClusterError ||
     sme.Error || cache_mod.CacheError || accept_mod.VerifyError ||
-    ink_gpu.EncodeError || ink_gpu.ArenaError;
+    ink_gpu.EncodeError || ink_gpu.ArenaError || quant_formats.ShapeError;
 
 // ===========================================================================
 // Section 4: Internal Layer & Runtime Structures
@@ -1872,6 +1878,24 @@ pub const GraphModel = struct {
         return if (self.m82) |rt| rt.stats else null;
     }
 
+    pub fn resetM82Stats(self: *GraphModel) void {
+        if (self.m82) |rt| rt.stats.resetCounters();
+    }
+
+    pub fn m82EffectiveSteps(self: *const GraphModel) u32 {
+        return if (self.m82) |rt| rt.effective_steps else self.config.num_hidden_layers;
+    }
+
+    pub fn m82PhysicalLayerForStep(self: *const GraphModel, eff_step: u32) usize {
+        if (self.m82) |rt| return rt.physicalLayerForStepPublic(eff_step, &self.config);
+        return @min(eff_step, self.config.num_hidden_layers -| 1);
+    }
+
+    pub fn lastStepRouterTopKForStep(self: *const GraphModel, eff_step: u32) ?[]const u32 {
+        if (self.m82) |rt| return rt.lastStepRouterTopKForStep(eff_step);
+        return null;
+    }
+
     pub fn hasVisionTower(self: *const GraphModel) bool {
         return self.vision_state.runtime.isActive();
     }
@@ -2382,7 +2406,7 @@ pub const GraphModel = struct {
             },
         }
         if (self.m82) |rt| {
-            if (rt.dflare_ctx_hist_bf16.len > 0) {
+            if (rt.hasDFlareCtxHistory()) {
                 dflare_dfly.registerContextHistoryProvider(self, graphDFlareContextHistoryCb);
             }
             if (rt.ink_embed_norm_f32) |enw| {
@@ -2408,11 +2432,14 @@ pub const GraphModel = struct {
         const rt = gm.m82 orelse return false;
         out_len.* = rt.dflare_ctx_hist_len;
         out_epoch.* = rt.dflare_ctx_hist_epoch;
-        if (dst_f32.len == 0) return rt.dflare_ctx_hist_bf16.len > 0;
+        if (dst_f32.len == 0) return rt.hasDFlareCtxHistory();
         return rt.readDFlareCtxTapF32(pos, tap_idx, dst_f32);
     }
 
     pub fn bytesPerDecodeToken(self: *const GraphModel, seq_len: u32) u64 {
+        if (self.m82) |rt| {
+            return rt.activeDecodeBytes(&self.config, seq_len) + self.global_head_bytes;
+        }
         const loops: u64 = self.effective_max_loops;
         var kv_bytes: u64 = 0;
         const dec_start: usize = if (self.config.isCausalEncDec()) self.config.num_encoder_layers else 0;
@@ -8819,7 +8846,7 @@ pub const GraphModel = struct {
             .full_chunk_512 => (options.max_seq_len + config.qsa_block_size - 1) / config.qsa_block_size,
         };
 
-        const supports_wide_prefill = (num_gqa_layers == 0) or (config.head_dim == 64 or config.head_dim == 128);
+        const supports_wide_prefill = (config.m82_family == .none) and ((num_gqa_layers == 0) or (config.head_dim == 64 or config.head_dim == 128));
         const req_wide_cap: u32 = @min(attention.MAX_WIDE_PREFILL_TOKENS, @max(@as(u32, 1), options.wide_prefill_chunk_tokens));
         const ple_limited_wide: u32 = if (options.ple_paths.len > 0)
             @min(req_wide_cap, @as(u32, ple_mod.MAX_BATCH_TOKENS))
@@ -8889,35 +8916,37 @@ pub const GraphModel = struct {
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4 * 4);
         }
+        const is_m82 = (config.m82_family != .none);
+        const is_inkling2 = config.m82_family.isInkling2();
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4); // token_ids
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * 4); // positions
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * @sizeOf(hybrid.Pos3D)); // pos3d
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * 8); // ancestor_masks
-        addAligned(&tree_scratch_bytes, @as(usize, config.num_hidden_layers) * max_m * h * 2); // ple_f16
+        addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, config.num_hidden_layers) * max_m * h * 2); // ple_f16
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * h * 2); // x
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * h * 2); // x_init
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * h * 2); // x_norm
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_q_dim * 2); // q
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // k
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // v
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_q_dim * 2); // q_conv
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // k_conv
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_kv_dim * 2); // v_conv
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_attn_out * 2); // gdn_z
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // gdn_g
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // gdn_beta
+        addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, max_m) * max_q_dim * 2); // q_conv
+        addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, max_m) * max_kv_dim * 2); // k_conv
+        addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, max_m) * max_kv_dim * 2); // v_conv
+        addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, max_m) * max_attn_out * 2); // gdn_z
+        addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // gdn_g
+        addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4); // gdn_beta
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_attn_out * 2); // attn_out
         addAligned(&tree_scratch_bytes, @as(usize, max_m) * h * 2); // proj_out
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_gate
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_up
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * max_inter * 2); // dense_act
-        addAligned(&tree_scratch_bytes, @as(usize, max_m) * 3 * h * 2); // aux_tree
+        addAligned(&tree_scratch_bytes, if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2); // dense_gate
+        addAligned(&tree_scratch_bytes, if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2); // dense_up
+        addAligned(&tree_scratch_bytes, if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2); // dense_act
+        addAligned(&tree_scratch_bytes, if (is_m82) 64 else @as(usize, max_m) * 3 * h * 2); // aux_tree
         if (num_gqa_layers > 0) {
             addAligned(&tree_scratch_bytes, @as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (config.head_dim + 2) * 4);
         } else {
             addAligned(&tree_scratch_bytes, 64);
         }
-        if (config.axes.ffn_kind == .moe_swiglu) {
+        if (config.axes.ffn_kind == .moe_swiglu and !is_m82) {
             addAligned(&tree_scratch_bytes, (try moe.MoeWorkspace.requiredBytes(moe_ws_spec)) + 4096);
         }
         if (num_gdn_layers > 0) {
@@ -9530,7 +9559,7 @@ pub const GraphModel = struct {
         const pos_raw = try tr_arena.allocAligned(@as(usize, max_m) * 4, 64);
         const pos3d_raw = try tr_arena.allocAligned(@as(usize, max_m) * @sizeOf(hybrid.Pos3D), 64);
         const msk_raw = try tr_arena.allocAligned(@as(usize, max_m) * 8, 64);
-        const ple_f16_raw = try tr_arena.allocAligned(@as(usize, config.num_hidden_layers) * max_m * h * 2, 64);
+        const ple_f16_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, config.num_hidden_layers) * max_m * h * 2, 64);
         @memset(ple_f16_raw, 0);
         const x_raw = try tr_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
         const x_init_raw = try tr_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
@@ -9538,24 +9567,24 @@ pub const GraphModel = struct {
         const q_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_q_dim * 2, 64);
         const k_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
         const v_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
-        const q_conv_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_q_dim * 2, 64);
-        const k_conv_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
-        const v_conv_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_kv_dim * 2, 64);
-        const gdn_z_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_attn_out * 2, 64);
-        const gdn_g_raw = try tr_arena.allocAligned(@as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
-        const gdn_beta_raw = try tr_arena.allocAligned(@as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
+        const q_conv_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, max_m) * max_q_dim * 2, 64);
+        const k_conv_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, max_m) * max_kv_dim * 2, 64);
+        const v_conv_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, max_m) * max_kv_dim * 2, 64);
+        const gdn_z_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, max_m) * max_attn_out * 2, 64);
+        const gdn_g_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
+        const gdn_beta_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, max_m) * @max(@as(u32, 1), config.linear_num_value_heads) * 4, 64);
         const attn_out_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_attn_out * 2, 64);
         const proj_out_raw = try tr_arena.allocAligned(@as(usize, max_m) * h * 2, 64);
-        const dgate_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
-        const dup_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
-        const dact_raw = try tr_arena.allocAligned(@as(usize, max_m) * max_inter * 2, 64);
-        const aux_tree_raw = try tr_arena.allocAligned(@as(usize, max_m) * 3 * h * 2, 64);
+        const dgate_raw = try tr_arena.allocAligned(if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2, 64);
+        const dup_raw = try tr_arena.allocAligned(if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2, 64);
+        const dact_raw = try tr_arena.allocAligned(if (is_inkling2) 64 else @as(usize, max_m) * max_inter * 2, 64);
+        const aux_tree_raw = try tr_arena.allocAligned(if (is_m82) 64 else @as(usize, max_m) * 3 * h * 2, 64);
         const gqa_scratch_raw = if (num_gqa_layers > 0)
             try tr_arena.allocAligned(@as(usize, max_m) * config.num_attention_heads * attention.MAX_SPLITS * (config.head_dim + 2) * 4, 64)
         else
             try tr_arena.allocAligned(64, 64);
 
-        const moe_ws: ?moe.MoeWorkspace = if (config.axes.ffn_kind == .moe_swiglu)
+        const moe_ws: ?moe.MoeWorkspace = if (config.axes.ffn_kind == .moe_swiglu and !is_m82)
             try moe.MoeWorkspace.init(tr_arena, moe_ws_spec)
         else
             null;
@@ -9770,6 +9799,8 @@ pub const GraphModel = struct {
                 .chunk_tokens = options.chunk_tokens,
                 .wired_budget = wired_budget,
                 .cold_slot_count = options.cold_slot_count,
+                .use_sme2_controllers = options.use_sme2_controllers,
+                .enable_router_trace = options.enable_router_trace,
             });
             total_wired_bytes += m82_runtime.?.totalWiredBytes();
         }
@@ -10722,7 +10753,7 @@ pub const GraphModel = struct {
             .logits_host = @alignCast(std.mem.bytesAsSlice(f16, logits_raw[0 .. logits_cap * config.vocab_size * 2])),
             .topk_host = @alignCast(std.mem.bytesAsSlice(moe.TopKCandidate, topk_raw[0 .. @as(usize, max_m) * moe.MAX_TOP_K * @sizeOf(moe.TopKCandidate)])),
             .ple_row_indices_host = ple_row_indices_host,
-            .ple_f16_host = @alignCast(std.mem.bytesAsSlice(f16, ple_f16_raw[0 .. @as(usize, config.num_hidden_layers) * max_m * h * 2])),
+            .ple_f16_host = if (is_m82) &.{} else @alignCast(std.mem.bytesAsSlice(f16, ple_f16_raw[0 .. @as(usize, config.num_hidden_layers) * max_m * h * 2])),
             .x_host = @alignCast(std.mem.bytesAsSlice(f16, x_raw[0 .. @as(usize, max_m) * h * 2])),
             .x_norm_host = @alignCast(std.mem.bytesAsSlice(f16, x_norm_raw[0 .. @as(usize, max_m) * h * 2])),
             .q_host = @alignCast(std.mem.bytesAsSlice(f16, q_raw[0 .. @as(usize, max_m) * max_q_dim * 2])),
@@ -10730,9 +10761,9 @@ pub const GraphModel = struct {
             .v_host = @alignCast(std.mem.bytesAsSlice(f16, v_raw[0 .. @as(usize, max_m) * max_kv_dim * 2])),
             .attn_out_host = @alignCast(std.mem.bytesAsSlice(f16, attn_out_raw[0 .. @as(usize, max_m) * max_attn_out * 2])),
             .proj_out_host = @alignCast(std.mem.bytesAsSlice(f16, proj_out_raw[0 .. @as(usize, max_m) * h * 2])),
-            .dense_gate_host = @alignCast(std.mem.bytesAsSlice(f16, dgate_raw[0 .. @as(usize, max_m) * max_inter * 2])),
-            .dense_up_host = @alignCast(std.mem.bytesAsSlice(f16, dup_raw[0 .. @as(usize, max_m) * max_inter * 2])),
-            .dense_act_host = @alignCast(std.mem.bytesAsSlice(f16, dact_raw[0 .. @as(usize, max_m) * max_inter * 2])),
+            .dense_gate_host = if (is_m82) &.{} else @alignCast(std.mem.bytesAsSlice(f16, dgate_raw[0 .. @as(usize, max_m) * max_inter * 2])),
+            .dense_up_host = if (is_m82) &.{} else @alignCast(std.mem.bytesAsSlice(f16, dup_raw[0 .. @as(usize, max_m) * max_inter * 2])),
+            .dense_act_host = if (is_m82) &.{} else @alignCast(std.mem.bytesAsSlice(f16, dact_raw[0 .. @as(usize, max_m) * max_inter * 2])),
             .accepted_top_host = @alignCast(std.mem.bytesAsSlice(f16, acc_top_raw[0 .. feat_cap * h * 2])),
             .accepted_aux_host = @alignCast(std.mem.bytesAsSlice(f16, acc_aux_raw[0 .. feat_cap * 3 * h * 2])),
             .token_ids_bind = .{ .buffer = scratch_buf, .offset = scratch_arena.offsetOf(tok_raw.ptr) },

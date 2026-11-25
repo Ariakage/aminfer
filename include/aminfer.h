@@ -577,6 +577,17 @@ ami_sdk_status ami_sdk_quantize_rows_affine_raw(
     uint8_t *dst_params,
     double *out_mean_mse);
 
+/* Batch-dequantize row-major NVFP4_G16 (`k % 16 == 0`) rows into float32
+ * `[n_rows, k]` (`data_bytes`: `n_rows * (k / 2)`, `scale_bytes`: `n_rows * (k / 16)`
+ * OCP FP8 E4M3FN bytes, multiplied by `outer_scale`). */
+ami_sdk_status ami_sdk_dequant_nvfp4_rows_f32(
+    const uint8_t *data_bytes,
+    const uint8_t *scale_bytes,
+    float outer_scale,
+    uint32_t n_rows,
+    uint32_t k,
+    float *dst_f32);
+
 #ifdef __cplusplus
 }
 #endif

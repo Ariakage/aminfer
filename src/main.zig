@@ -87,6 +87,7 @@ const usage =
     \\  bench-m81         run M8.1 W21/W22/W24 multi-format G23 GEMV+prefill, G24 act-quant, C25 SME2, Inkling2/Hy4 tokenizer+template, C18 HTTP/SSE & W24 KL gate
     \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F] [--models-dir <dir>]
     \\  bench-m82         run M8.2 Inkling 2 & Hy4 G25 fused kernels, 40/48 SWA KV, IndexCache/IndexPool, LatentMoE, C26 SME2+FP8 Engram, D14 DFlare/DFly2 parity & speedup
+    \\  bench-m825        run M8.25 single-frame Inkling 2 parity gate, W8 48-step router-trace capture, and live 24 GB M4 Option A vs Option B A/B benchmark (--models-dir)
     \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F] [--models-dir <dir>]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
@@ -295,6 +296,12 @@ pub fn main(init: std.process.Init) !void {
             try out.writeAll(usage);
         } else {
             try runBenchM82(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m825")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM825(arena, args[2..], out);
         }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "peer-worker")) {
         if (hasHelpFlag(args[2..])) {
@@ -1357,6 +1364,7 @@ const DecodeCliArgs = struct {
     image_path: ?[:0]const u8 = null,
     vt_test_video: ?aminfer.metal.VtCodec = null,
     dump_router_trace_path: ?[:0]const u8 = null,
+    use_sme2_controllers: bool = false,
     draft_mode: ?aminfer.draft.DraftMode = null,
     draft_amf_path: ?[:0]const u8 = null,
     draft_config_path: ?[:0]const u8 = null,
@@ -1391,6 +1399,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
     var image_path: ?[:0]const u8 = null;
     var vt_test_video: ?aminfer.metal.VtCodec = null;
     var dump_router_trace_path: ?[:0]const u8 = null;
+    var use_sme2_controllers = false;
     var draft_mode: ?aminfer.draft.DraftMode = null;
     var draft_amf_path: ?[:0]const u8 = null;
     var draft_config_path: ?[:0]const u8 = null;
@@ -1512,6 +1521,8 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
             const val: [:0]const u8 = flag["--dump-router-trace=".len..];
             if (val.len == 0) return error.InvalidFlagValue;
             dump_router_trace_path = val;
+        } else if (std.mem.eql(u8, flag, "--sme2-controllers")) {
+            use_sme2_controllers = true;
         } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
             for (flag[1..]) |ch| {
                 switch (ch) {
@@ -1557,6 +1568,7 @@ fn parseDecodeArgs(args: []const [:0]const u8) !DecodeCliArgs {
         .image_path = image_path,
         .vt_test_video = vt_test_video,
         .dump_router_trace_path = dump_router_trace_path,
+        .use_sme2_controllers = use_sme2_controllers,
         .draft_mode = draft_mode,
         .draft_amf_path = draft_amf_path,
         .draft_config_path = draft_config_path,
@@ -1585,6 +1597,7 @@ const BenchDecodeCliArgs = struct {
     ane_predictor_path: ?[:0]const u8 = null,
     enable_ane_predictor: bool = true,
     kv_retire_q8_after_chunks: u32 = 0,
+    use_sme2_controllers: bool = false,
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
     m7: M7ClusterCliFlags = .{},
@@ -1608,6 +1621,7 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
     var ane_predictor_path: ?[:0]const u8 = null;
     var enable_ane_predictor = true;
     var kv_retire_q8_after_chunks: u32 = 0;
+    var use_sme2_controllers = false;
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
     var m7: M7ClusterCliFlags = .{};
@@ -1680,6 +1694,8 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             kv_retire_q8_after_chunks = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--sme2-controllers")) {
+            use_sme2_controllers = true;
         } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
             for (flag[1..]) |ch| {
                 switch (ch) {
@@ -1717,6 +1733,7 @@ fn parseBenchDecodeArgs(args: []const [:0]const u8) !BenchDecodeCliArgs {
         .ane_predictor_path = ane_predictor_path,
         .enable_ane_predictor = enable_ane_predictor,
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
+        .use_sme2_controllers = use_sme2_controllers,
         .m6 = m6,
         .m69 = m69,
         .m7 = m7,
@@ -1888,9 +1905,56 @@ fn runDecodeGraph(
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
         .act_quant_policy = cli.m81.act_quant_policy,
+        .use_sme2_controllers = cli.use_sme2_controllers,
+        .enable_router_trace = (cli.dump_router_trace_path != null),
         .cluster_coordinator = if (cluster_ctx) |cc| &cc.coordinator else null,
     });
     defer model.deinit(allocator);
+
+    var trace_fd: std.c.fd_t = -1;
+    defer if (trace_fd >= 0) {
+        _ = std.c.close(trace_fd);
+    };
+    if (cli.dump_router_trace_path) |tpath| {
+        if (!gcfg.m82_family.isInkling2()) return error.InvalidArgument;
+        trace_fd = std.c.open(
+            tpath.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            @as(std.c.mode_t, 0o644),
+        );
+        if (trace_fd < 0) return error.OpenFailed;
+    }
+    const writeGraphTraceStep = struct {
+        fn emit(fd: std.c.fd_t, m_ptr: *const aminfer.graph.GraphModel) !void {
+            if (fd < 0) return;
+            var line_buf: [512]u8 = undefined;
+            const eff_steps = m_ptr.m82EffectiveSteps();
+            for (0..eff_steps) |si| {
+                const exps = m_ptr.lastStepRouterTopKForStep(@intCast(si)) orelse continue;
+                const phys_l = m_ptr.m82PhysicalLayerForStep(@intCast(si));
+                var pos_b: usize = 0;
+                const hdr = try std.fmt.bufPrint(line_buf[pos_b..], "{{\"layer\":{d},\"experts\":[", .{phys_l});
+                pos_b += hdr.len;
+                for (exps, 0..) |eid, ki| {
+                    const seg = if (ki == 0)
+                        try std.fmt.bufPrint(line_buf[pos_b..], "{d}", .{eid})
+                    else
+                        try std.fmt.bufPrint(line_buf[pos_b..], ",{d}", .{eid});
+                    pos_b += seg.len;
+                }
+                const tail = "]}\n";
+                if (pos_b + tail.len > line_buf.len) return error.NoSpaceLeft;
+                @memcpy(line_buf[pos_b .. pos_b + tail.len], tail);
+                pos_b += tail.len;
+                var off_w: usize = 0;
+                while (off_w < pos_b) {
+                    const rc = std.c.write(fd, line_buf[off_w..].ptr, pos_b - off_w);
+                    if (rc <= 0) return error.WriteFailed;
+                    off_w += @intCast(rc);
+                }
+            }
+        }
+    }.emit;
 
     const generated = try allocator.alloc(u32, cli.max_tokens);
     defer allocator.free(generated);
@@ -1940,6 +2004,11 @@ fn runDecodeGraph(
         vision_source_label = if (codec == .hevc) "vt-hevc-nv12" else "vt-h264-nv12";
         next_tok = mm.first_token;
         pos = mm.total_prompt_tokens;
+    } else if (trace_fd >= 0) {
+        for (prompt_ids, 0..) |ptid, pidx| {
+            next_tok = try model.stepDecode(ptid, @intCast(pidx));
+            try writeGraphTraceStep(trace_fd, &model);
+        }
     } else {
         next_tok = try model.prefillChunk(prompt_ids, 0, true);
     }
@@ -1958,10 +2027,12 @@ fn runDecodeGraph(
         if (!hit_eos and gen_count < cli.max_tokens) {
             model.resetColdTelemetry();
             model.resetLoopIsolationStats();
+            model.resetM82Stats();
             const heap_before = try aminfer.vmstat.Snapshot.capture();
             const dec_t0 = try aminfer.vmstat.nowNs();
             while (gen_count < cli.max_tokens) {
                 next_tok = try model.stepDecode(next_tok, pos);
+                try writeGraphTraceStep(trace_fd, &model);
                 if (cli.temperature > 0.0) {
                     next_tok = try model.sampleFromLastLogits(cli.temperature, req_rng.?.random(), p_res);
                 }
@@ -2090,6 +2161,10 @@ fn runDecodeGraph(
         try out.print(
             \\decode.m82.family                {s}
             \\decode.m82.sme2_ctrl_calls       {d}
+            \\decode.m82.gpu_ctrl_calls        {d}
+            \\decode.m82.mid_pass_flushes      {d}
+            \\decode.m82.indirect_moe          {d}
+            \\decode.m82.grouped_moe           {d}
             \\decode.m82.index_full_dispatches {d}
             \\decode.m82.index_shared_reuses   {d}
             \\decode.m82.cold_expert_fetches   {d}
@@ -2098,6 +2173,10 @@ fn runDecodeGraph(
         , .{
             gcfg.m82_family.label(),
             ms.inkling2_sme2_ctrl_calls,
+            ms.inkling2_gpu_ctrl_calls,
+            ms.mid_pass_flushes,
+            ms.inkling2_indirect_moe_dispatches,
+            ms.inkling2_grouped_moe_dispatches,
             ms.hy4_index_full_dispatches,
             ms.hy4_index_shared_reuses,
             ms.cold_expert_fetches,
@@ -2179,6 +2258,7 @@ fn runDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: 
             .gpu_prefill_mode = cli.gpu_prefill_mode,
             .strict_live_ram = cli.strict_live_ram,
             .kv_retire_q8_after_chunks = cli.kv_retire_q8_after_chunks,
+            .use_sme2_controllers = cli.use_sme2_controllers,
             .m6 = cli.m6,
             .m69 = cli.m69,
             .m7 = cli.m7,
@@ -2742,6 +2822,81 @@ fn runBenchM82(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out
     if (!report.all_passed) return error.BenchmarkGateFailed;
 }
 
+const M825CliFlags = struct {
+    cfg: aminfer.bench.M825Config = .{},
+    models_dir: ?[:0]const u8 = null,
+};
+
+fn parseM825Args(raw_args: []const [:0]const u8) !M825CliFlags {
+    var cli: M825CliFlags = .{};
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        if (try tryParseModelsDirFlag(raw_args, &i, &cli.models_dir)) continue;
+        const flag = raw_args[i];
+        if (std.mem.eql(u8, flag, "--skip-real")) {
+            cli.cfg.include_real = false;
+        } else if (std.mem.eql(u8, flag, "--skip-synth") or std.mem.eql(u8, flag, "--skip-synths")) {
+            cli.cfg.include_synth_gate = false;
+        } else if (std.mem.eql(u8, flag, "--skip-kl")) {
+            cli.cfg.include_kl = false;
+        } else if (std.mem.eql(u8, flag, "--skip-spec")) {
+            cli.cfg.include_spec = false;
+        } else if (std.mem.eql(u8, flag, "--option")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            const v = raw_args[i];
+            if (std.mem.eql(u8, v, "a") or std.mem.eql(u8, v, "A")) {
+                cli.cfg.option = .a;
+            } else if (std.mem.eql(u8, v, "b") or std.mem.eql(u8, v, "B")) {
+                cli.cfg.option = .b;
+            } else if (std.mem.eql(u8, v, "both")) {
+                cli.cfg.option = .both;
+            } else {
+                return error.InvalidArgument;
+            }
+        } else if (std.mem.eql(u8, flag, "--capture-trace")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cli.cfg.capture_trace_path = raw_args[i];
+        } else if (std.mem.eql(u8, flag, "--trace-tokens")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cli.cfg.trace_tokens_per_prompt = try std.fmt.parseInt(u32, raw_args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--coding-out")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cli.cfg.coding_out_path = raw_args[i];
+        } else if (std.mem.eql(u8, flag, "--coding-tokens")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cli.cfg.coding_max_tokens = try std.fmt.parseInt(u32, raw_args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--kl-steps")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cli.cfg.kl_steps_per_prompt = try std.fmt.parseInt(u32, raw_args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--cold-slots")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cli.cfg.ref_cold_slots = try std.fmt.parseInt(u32, raw_args[i], 10);
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    cli.cfg.models_dir = if (cli.models_dir) |d| d else null;
+    return cli;
+}
+
+fn runBenchM825(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const cli = try parseM825Args(raw_args);
+    if (cli.models_dir) |dir| {
+        if (setenv("AMINFER_MODELS_DIR", dir.ptr, 1) != 0) return error.SetEnvFailed;
+    }
+    const report = try aminfer.bench.runM825WithConfig(allocator, cli.cfg);
+    try report.write(out);
+    try out.flush();
+    if (!report.all_passed) return error.BenchmarkGateFailed;
+}
+
 fn parseQualityGateArgs(args: []const [:0]const u8) !aminfer.bench.QualityGateConfig {
     var cfg: aminfer.bench.QualityGateConfig = .{};
     var i: usize = 0;
@@ -3070,6 +3225,7 @@ const SpecDecodeCliArgs = struct {
     ane_predictor_path: ?[:0]const u8 = null,
     enable_ane_predictor: bool = true,
     kv_retire_q8_after_chunks: u32 = 0,
+    use_sme2_controllers: bool = false,
     m6: M6GraphCliFlags = .{},
     m69: M69CliFlags = .{},
     m7: M7ClusterCliFlags = .{},
@@ -3111,6 +3267,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
     var ane_predictor_path: ?[:0]const u8 = null;
     var enable_ane_predictor = true;
     var kv_retire_q8_after_chunks: u32 = 0;
+    var use_sme2_controllers = false;
     var m6: M6GraphCliFlags = .{};
     var m69: M69CliFlags = .{};
     var m7: M7ClusterCliFlags = .{};
@@ -3251,6 +3408,8 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             kv_retire_q8_after_chunks = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, flag, "--sme2-controllers")) {
+            use_sme2_controllers = true;
         } else if (flag.len >= 2 and flag[0] == '-' and flag[1] != '-') {
             for (flag[1..]) |ch| {
                 switch (ch) {
@@ -3307,6 +3466,7 @@ fn parseSpecDecodeArgs(args: []const [:0]const u8) !SpecDecodeCliArgs {
         .ane_predictor_path = ane_predictor_path,
         .enable_ane_predictor = enable_ane_predictor,
         .kv_retire_q8_after_chunks = kv_retire_q8_after_chunks,
+        .use_sme2_controllers = use_sme2_controllers,
         .m6 = m6,
         .m69 = m69,
         .m7 = m7,
@@ -3386,7 +3546,7 @@ fn runSpecDecodeGraph(
 
     const needed_seq: u32 = @intCast(prompt_ids.len + cli.max_tokens + cli.max_tree_nodes + 32);
     const max_seq_len: u32 = @min(gcfg.max_position_embeddings, @max(@as(u32, 512), needed_seq));
-    const target_tree_cap: u32 = if (cli.enable_pruning)
+    const target_tree_cap: u32 = if (cli.enable_pruning and mode != .dflare and mode != .dfly2)
         @min(@as(u32, aminfer.engine.MAX_TREE_NODES), @max(@as(u32, cli.max_tree_nodes) * 2, 24))
     else
         @as(u32, cli.max_tree_nodes);
@@ -3429,6 +3589,7 @@ fn runSpecDecodeGraph(
         .strict_nax = cli.m69.strict_nax,
         .bus_bandwidth_gbs_override = cli.m69.bus_bandwidth_gbs,
         .act_quant_policy = cli.m81.act_quant_policy,
+        .use_sme2_controllers = cli.use_sme2_controllers,
         .cluster_coordinator = if (cluster_ctx) |cc| &cc.coordinator else null,
     });
     defer model.deinit(allocator);
@@ -3708,6 +3869,10 @@ fn runSpecDecodeGraph(
         try out.print(
             \\spec.m82.family                  {s}
             \\spec.m82.sme2_ctrl_calls         {d}
+            \\spec.m82.gpu_ctrl_calls          {d}
+            \\spec.m82.mid_pass_flushes        {d}
+            \\spec.m82.indirect_moe            {d}
+            \\spec.m82.grouped_moe             {d}
             \\spec.m82.index_full_dispatches   {d}
             \\spec.m82.index_shared_reuses     {d}
             \\spec.m82.cold_expert_fetches     {d}
@@ -3716,6 +3881,10 @@ fn runSpecDecodeGraph(
         , .{
             gcfg.m82_family.label(),
             ms.inkling2_sme2_ctrl_calls,
+            ms.inkling2_gpu_ctrl_calls,
+            ms.mid_pass_flushes,
+            ms.inkling2_indirect_moe_dispatches,
+            ms.inkling2_grouped_moe_dispatches,
             ms.hy4_index_full_dispatches,
             ms.hy4_index_shared_reuses,
             ms.cold_expert_fetches,
@@ -3822,7 +3991,7 @@ fn runSpecDecode(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, o
 
     const needed_seq: u32 = @intCast(prompt_ids.len + cli.max_tokens + 64);
     const max_seq_len: u32 = @min(cfg.max_position_embeddings, @max(@as(u32, 512), needed_seq));
-    const target_tree_cap: u32 = if (cli.enable_pruning)
+    const target_tree_cap: u32 = if (cli.enable_pruning and mode != .dflare and mode != .dfly2)
         @min(@as(u32, aminfer.engine.MAX_TREE_NODES), @max(@as(u32, cli.max_tree_nodes) * 2, 24))
     else
         @as(u32, cli.max_tree_nodes);
@@ -9162,6 +9331,51 @@ test "M8.1 CLI flags parse act-quant, reasoning-effort, HTTP limits, and quality
     const rendered_hy = try renderPromptWithChatTemplateAlloc(gpa, &hy_tpl, "Explain M4", .high);
     defer gpa.free(rendered_hy);
     try std.testing.expect(std.mem.indexOf(u8, rendered_hy, "reasoning_effort:high") != null);
+}
+
+test "M8.25 CLI flags parse --sme2-controllers and bench-m825 options" {
+    const dec = try parseDecodeArgs(&.{
+        "-m",
+        "m.amf",
+        "-p",
+        "hi",
+        "--sme2-controllers",
+        "--dump-router-trace",
+        "/tmp/trace.jsonl",
+    });
+    try std.testing.expect(dec.use_sme2_controllers);
+    try std.testing.expectEqualStrings("/tmp/trace.jsonl", dec.dump_router_trace_path.?);
+
+    const spec = try parseSpecDecodeArgs(&.{
+        "-m",
+        "m.amf",
+        "-p",
+        "hi",
+        "-M",
+        "dflare",
+        "--sme2-controllers",
+    });
+    try std.testing.expect(spec.use_sme2_controllers);
+
+    const b = try parseM825Args(&.{
+        "--models-dir",
+        "/tmp/models",
+        "--option",
+        "b",
+        "--skip-synth",
+        "--kl-steps",
+        "12",
+        "--capture-trace",
+        "/tmp/rt.jsonl",
+        "--coding-out",
+        "/tmp/code.jsonl",
+    });
+    try std.testing.expectEqualStrings("/tmp/models", b.cfg.models_dir.?);
+    try std.testing.expectEqual(aminfer.bench.m825.OptionSelect.b, b.cfg.option);
+    try std.testing.expect(!b.cfg.include_synth_gate);
+    try std.testing.expectEqual(@as(u32, 12), b.cfg.kl_steps_per_prompt);
+    try std.testing.expectEqualStrings("/tmp/rt.jsonl", b.cfg.capture_trace_path.?);
+    try std.testing.expectEqualStrings("/tmp/code.jsonl", b.cfg.coding_out_path.?);
 }
 
 test "M8.1 BatchServeRunner preserves Inkling 2 special structural tags, registers template EOS, and injects thinking cutoff" {

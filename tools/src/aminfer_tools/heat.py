@@ -231,9 +231,12 @@ class _ModelHeatSource:
         self.model_id = model_id_override or self._amf.header.model_id or self.path.stem
         for entry in self._amf.entries:
             if entry.kind == TensorKind.ROUTER:
-                if entry.layer == NO_LAYER or len(entry.shape) != 2:
+                if entry.name.endswith(".bias") and len(entry.shape) == 1:
+                    pass
+                elif entry.layer == NO_LAYER or len(entry.shape) != 2:
                     raise ValueError(f"malformed router tensor {entry.name!r} in {self.path}")
-                self._amf_routers[entry.layer] = entry
+                else:
+                    self._amf_routers[entry.layer] = entry
             elif entry.kind == TensorKind.EMBEDDING and self._amf_embed is None:
                 if len(entry.shape) == 2:
                     self._amf_embed = entry

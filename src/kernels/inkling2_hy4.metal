@@ -76,8 +76,10 @@ struct Sconv4Params {
     uint serial_tiles;
     float rms_eps;
     float post_residual_scale;
+    uint has_tree;
+    uint _pad0;
 };
-static_assert(sizeof(Sconv4Params) == 48, "Sconv4Params must be 48 bytes");
+static_assert(sizeof(Sconv4Params) == 56, "Sconv4Params must be 56 bytes");
 
 struct Inkling2RelGqaParams {
     uint num_nodes;
@@ -439,7 +441,8 @@ kernel void ami_inkling2_rmsnorm_sconv4(const device half *x [[buffer(0)]],
                                         const device half *conv_state_in [[buffer(5)]],
                                         device half *conv_state_out [[buffer(6)]],
                                         device half *out [[buffer(7)]],
-                                        constant Sconv4Params &p [[buffer(8)]],
+                                        const device ulong *ancestor_masks [[buffer(8)]],
+                                        constant Sconv4Params &p [[buffer(9)]],
                                         uint tg_x [[threadgroup_position_in_grid]],
                                         uint tid [[thread_index_in_threadgroup]],
                                         uint sg_id [[simdgroup_index_in_threadgroup]],
@@ -451,8 +454,10 @@ kernel void ami_inkling2_rmsnorm_sconv4(const device half *x [[buffer(0)]],
     constexpr uint T_TILE = 64u;
     threadgroup float tg_inv_rms[68];
     threadgroup float tg_reduce[8];
+    threadgroup short tg_anc[64][3];
 
     const uint d = p.hidden_dim;
+    const bool use_tree = (p.has_tree != 0u) && (p.m <= T_TILE);
     const uint num_tiles = (p.serial_tiles != 0u) ? ((p.m + T_TILE - 1u) / T_TILE) : 1u;
     const uint start_tile = (p.serial_tiles != 0u) ? 0u : tg_x;
 
@@ -465,6 +470,38 @@ kernel void ami_inkling2_rmsnorm_sconv4(const device half *x [[buffer(0)]],
         const uint tile_len = min(T_TILE, p.m - t_base);
         const uint halo = (t_base >= 3u) ? 3u : 0u;
         const uint total_rms_toks = halo + tile_len;
+
+        if (use_tree && t_base == 0u && tid < tile_len) {
+            ulong rem = ancestor_masks[tid] & ~(1ul << tid);
+            short a1 = -1;
+            short a2 = -2;
+            short a3 = -3;
+            if (rem != 0ul) {
+                const uint b1 = 63u - uint(clz(rem));
+                rem &= ~(1ul << b1);
+                if (rem != 0ul) {
+                    const uint b2 = 63u - uint(clz(rem));
+                    rem &= ~(1ul << b2);
+                    if (rem != 0ul) {
+                        const uint b3 = 63u - uint(clz(rem));
+                        a3 = short(b3);
+                        a2 = short(b2);
+                        a1 = short(b1);
+                    } else {
+                        a3 = -1;
+                        a2 = short(b2);
+                        a1 = short(b1);
+                    }
+                } else {
+                    a3 = -2;
+                    a2 = -1;
+                    a1 = short(b1);
+                }
+            }
+            tg_anc[tid][0] = a3;
+            tg_anc[tid][1] = a2;
+            tg_anc[tid][2] = a1;
+        }
 
         // Compute inverse RMS scalar per token in the tile (+ 3 halo tokens if t_base > 0).
         for (uint u = 0u; u < total_rms_toks; u++) {
@@ -549,38 +586,81 @@ kernel void ami_inkling2_rmsnorm_sconv4(const device half *x [[buffer(0)]],
             }
             const float bias_c = (p.has_bias != 0u) ? conv_bias[c] : 0.0f;
 
-            for (uint u = 0u; u < tile_len; u++) {
-                const uint tok = t_base + u;
-                const float h_cur = float(x[ulong(tok) * d + c]) * tg_inv_rms[halo + u] * nw;
+            if (!use_tree) {
+                for (uint u = 0u; u < tile_len; u++) {
+                    const uint tok = t_base + u;
+                    const float h_cur = float(x[ulong(tok) * d + c]) * tg_inv_rms[halo + u] * nw;
 
-                float w0 = sw0;
-                float w1 = sw1;
-                float w2 = sw2;
-                float w3 = sw3;
-                if (p.is_dynamic != 0u) {
-                    const ulong dw_off = (ulong(tok) * d + c) * 4ul;
-                    w0 = float(dyn_w[dw_off + 0ul]);
-                    w1 = float(dyn_w[dw_off + 1ul]);
-                    w2 = float(dyn_w[dw_off + 2ul]);
-                    w3 = float(dyn_w[dw_off + 3ul]);
-                }
+                    float w0 = sw0;
+                    float w1 = sw1;
+                    float w2 = sw2;
+                    float w3 = sw3;
+                    if (p.is_dynamic != 0u) {
+                        const ulong dw_off = (ulong(tok) * d + c) * 4ul;
+                        w0 = float(dyn_w[dw_off + 0ul]);
+                        w1 = float(dyn_w[dw_off + 1ul]);
+                        w2 = float(dyn_w[dw_off + 2ul]);
+                        w3 = float(dyn_w[dw_off + 3ul]);
+                    }
 
-                float acc = bias_c;
-                acc = fma(w0, h_m3, acc);
-                acc = fma(w1, h_m2, acc);
-                acc = fma(w2, h_m1, acc);
-                acc = fma(w3, h_cur, acc);
-                if (p.post_residual_scale > 0.0f) {
-                    acc = (acc + h_cur) * p.post_residual_scale;
-                }
-                if (p.apply_silu != 0u) {
-                    acc = ink_silu(acc);
-                }
-                out[ulong(tok) * d + c] = half(acc);
+                    float acc = bias_c;
+                    acc = fma(w0, h_m3, acc);
+                    acc = fma(w1, h_m2, acc);
+                    acc = fma(w2, h_m1, acc);
+                    acc = fma(w3, h_cur, acc);
+                    if (p.post_residual_scale > 0.0f) {
+                        acc = (acc + h_cur) * p.post_residual_scale;
+                    }
+                    if (p.apply_silu != 0u) {
+                        acc = ink_silu(acc);
+                    }
+                    out[ulong(tok) * d + c] = half(acc);
 
-                h_m3 = h_m2;
-                h_m2 = h_m1;
-                h_m1 = h_cur;
+                    h_m3 = h_m2;
+                    h_m2 = h_m1;
+                    h_m1 = h_cur;
+                }
+            } else {
+                const float st_m3 = h_m3;
+                const float st_m2 = h_m2;
+                const float st_m1 = h_m1;
+                for (uint u = 0u; u < tile_len; u++) {
+                    const float h_cur = float(x[ulong(u) * d + c]) * tg_inv_rms[u] * nw;
+                    const short i0 = tg_anc[u][0];
+                    const short i1 = tg_anc[u][1];
+                    const short i2 = tg_anc[u][2];
+                    const float lag0 = (i0 >= 0) ? (float(x[ulong(i0) * d + c]) * tg_inv_rms[i0] * nw)
+                                                 : ((i0 == -3) ? st_m3 : ((i0 == -2) ? st_m2 : st_m1));
+                    const float lag1 = (i1 >= 0) ? (float(x[ulong(i1) * d + c]) * tg_inv_rms[i1] * nw)
+                                                 : ((i1 == -2) ? st_m2 : st_m1);
+                    const float lag2 = (i2 >= 0) ? (float(x[ulong(i2) * d + c]) * tg_inv_rms[i2] * nw)
+                                                 : st_m1;
+
+                    float w0 = sw0;
+                    float w1 = sw1;
+                    float w2 = sw2;
+                    float w3 = sw3;
+                    if (p.is_dynamic != 0u) {
+                        const ulong dw_off = (ulong(u) * d + c) * 4ul;
+                        w0 = float(dyn_w[dw_off + 0ul]);
+                        w1 = float(dyn_w[dw_off + 1ul]);
+                        w2 = float(dyn_w[dw_off + 2ul]);
+                        w3 = float(dyn_w[dw_off + 3ul]);
+                    }
+
+                    float acc = bias_c;
+                    acc = fma(w0, lag0, acc);
+                    acc = fma(w1, lag1, acc);
+                    acc = fma(w2, lag2, acc);
+                    acc = fma(w3, h_cur, acc);
+                    if (p.post_residual_scale > 0.0f) {
+                        acc = (acc + h_cur) * p.post_residual_scale;
+                    }
+                    if (p.apply_silu != 0u) {
+                        acc = ink_silu(acc);
+                    }
+                    out[ulong(u) * d + c] = half(acc);
+                }
             }
 
             if (p.write_state != 0u && (t_base + tile_len == p.m)) {
@@ -4041,7 +4121,7 @@ kernel void ami_inkling2_moe_gate_up_softcap_gguf_k(const device half *x [[buffe
 
 // 6. GGUF IQ Codebook-SRAM Formats (iq1_s..iq3_s), Grid X: ceil(intermediate_size / 8).
 struct InkIqCodebookSmem {
-    uint16_t grid16[4096];
+    alignas(16) uint32_t grid32[2048];
     uint8_t signs[128];
 };
 static_assert(sizeof(InkIqCodebookSmem) == 8320u, "InkIqCodebookSmem must fit within 16 KiB");
@@ -4079,10 +4159,12 @@ static inline bool ink_iq_needs_signs(uint dtype) {
 static inline void ink_iq_stage_codebook(const device uchar *codebook,
                                          threadgroup InkIqCodebookSmem &smem,
                                          uint tid) {
-    const device uint16_t *src16 = (const device uint16_t *)codebook;
     const uint n16 = ink_iq_grid_u16_count(INK_MOE_DTYPE);
-    for (uint i = tid; i < n16; i += 128u) {
-        smem.grid16[i] = src16[i];
+    const uint n_vec4 = n16 >> 3;
+    const device uint4 *src4 = (const device uint4 *)codebook;
+    threadgroup uint4 *dst4 = (threadgroup uint4 *)smem.grid32;
+    for (uint i = tid; i < n_vec4; i += 128u) {
+        dst4[i] = src4[i];
     }
     if (ink_iq_needs_signs(INK_MOE_DTYPE)) {
         const device uchar *signs_src = codebook + ulong(n16) * 2ul;
@@ -4094,7 +4176,7 @@ static inline void ink_iq_stage_codebook(const device uchar *codebook,
 }
 
 static inline uint ink_smem_read_u32(threadgroup const InkIqCodebookSmem &smem, uint u32_idx) {
-    return uint(smem.grid16[u32_idx * 2u]) | (uint(smem.grid16[u32_idx * 2u + 1u]) << 16);
+    return smem.grid32[u32_idx];
 }
 
 static inline void ink_iq_dequant8(const device uchar *blk,
@@ -4231,18 +4313,20 @@ kernel void ami_inkling2_moe_gate_up_softcap_iq(const device half *x [[buffer(0)
                                                 uint tid [[thread_index_in_threadgroup]],
                                                 uint sg_id [[simdgroup_index_in_threadgroup]],
                                                 uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup InkIqCodebookSmem smem;
-    ink_iq_stage_codebook(codebook, smem, tid);
-
     constexpr uint ROWS_PER_SG = 2u;
     const uint u = tg_pos.y;
     if (u >= sched_hdr->num_unique_experts) return;
-    const uint row0 = tg_pos.x * 8u + sg_id * ROWS_PER_SG;
-    if (row0 >= p.intermediate_size) return;
+    if (tg_pos.x * 8u >= p.intermediate_size) return;
     const uint s0 = expert_token_offsets[u];
     const uint s1 = expert_token_offsets[u + 1u];
     const uint count_u = s1 - s0;
     if (count_u == 0u) return;
+
+    threadgroup InkIqCodebookSmem smem;
+    ink_iq_stage_codebook(codebook, smem, tid);
+
+    const uint row0 = tg_pos.x * 8u + sg_id * ROWS_PER_SG;
+    if (row0 >= p.intermediate_size) return;
 
     const InkExpertWeights ew = expert_table[unique_experts[u]];
     const device uchar *gate_qw = weights_base + ew.gate_qweight_offset;

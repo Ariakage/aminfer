@@ -49,6 +49,8 @@ pub const E2eSynthResult = struct {
     spec_rounds: u64 = 0,
     dflare_core3_batches: u64 = 0,
     sme2_ctrl_calls: u64 = 0,
+    gpu_ctrl_calls: u64 = 0,
+    mid_pass_flushes: u64 = 0,
     cold_expert_fetches: u64 = 0,
     index_shared_reuses: u64 = 0,
     engram_nvme_reads: u64 = 0,
@@ -248,12 +250,16 @@ fn writeE2eCase(
         try w.print(
             \\bench.m82.e2e.{s}.dflare_core3_batches   {d}
             \\bench.m82.e2e.{s}.sme2_ctrl_calls        {d}
+            \\bench.m82.e2e.{s}.gpu_ctrl_calls         {d}
+            \\bench.m82.e2e.{s}.mid_pass_flushes       {d}
             \\bench.m82.e2e.{s}.cold_expert_fetches    {d}
             \\bench.m82.e2e.{s}.batch8_core3_verify_us {d:.2} (vs serial8 {d:.2} us, speedup={d:.2}x)
             \\
         , .{
             label,               r.dflare_core3_batches,
             label,               r.sme2_ctrl_calls,
+            label,               r.gpu_ctrl_calls,
+            label,               r.mid_pass_flushes,
             label,               r.cold_expert_fetches,
             label,               r.batch8_verify_us,
             r.serial8_decode_us, r.batch8_core3_speedup,
@@ -1576,6 +1582,8 @@ fn runE2eSynthCase(
 
     if (model.m82Stats()) |ms| {
         out.sme2_ctrl_calls = ms.inkling2_sme2_ctrl_calls;
+        out.gpu_ctrl_calls = ms.inkling2_gpu_ctrl_calls;
+        out.mid_pass_flushes = ms.mid_pass_flushes;
         out.cold_expert_fetches = ms.cold_expert_fetches;
         out.index_shared_reuses = ms.hy4_index_shared_reuses;
     }
@@ -1664,6 +1672,8 @@ fn runE2eSynthCase(
         out.greedy_parity_ok = (produced == n_tokens) and std.mem.eql(u32, dec_tokens, spec_tokens);
         if (model.m82Stats()) |ms| {
             out.sme2_ctrl_calls = ms.inkling2_sme2_ctrl_calls;
+            out.gpu_ctrl_calls = ms.inkling2_gpu_ctrl_calls;
+            out.mid_pass_flushes = ms.mid_pass_flushes;
             out.cold_expert_fetches = ms.cold_expert_fetches;
         }
     } else {
@@ -1854,7 +1864,8 @@ pub fn runM82WithConfig(allocator: std.mem.Allocator, cfg: M82Config) !M82Report
         true
     else
         (report.e2e_inkling2_mini.verify_amf_ok and report.e2e_inkling2_mini.greedy_parity_ok and
-            report.e2e_inkling2_mini.dflare_core3_batches > 0 and report.e2e_inkling2_mini.sme2_ctrl_calls > 0 and
+            report.e2e_inkling2_mini.dflare_core3_batches > 0 and
+            (report.e2e_inkling2_mini.sme2_ctrl_calls + report.e2e_inkling2_mini.gpu_ctrl_calls) > 0 and
             report.e2e_inkling2_small.verify_amf_ok and report.e2e_inkling2_small.greedy_parity_ok and
             report.e2e_hy4.verify_amf_ok and report.e2e_hy4.greedy_parity_ok and report.e2e_hy4.early_stop_parity_ok and
             report.e2e_hy4.index_shared_reuses > 0 and

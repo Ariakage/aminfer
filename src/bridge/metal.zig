@@ -2714,7 +2714,7 @@ test "KvTile texture binding via MTL4ArgumentTable writes RGBA16Float zero-copy 
 }
 
 test "UNIFORM_SLOTS_PER_FRAME accommodates 48-layer tree verification and in-CB drafting" {
-    try std.testing.expectEqual(@as(u32, 2048), UNIFORM_SLOTS_PER_FRAME);
+    try std.testing.expectEqual(@as(u32, 4096), UNIFORM_SLOTS_PER_FRAME);
 }
 
 test "CoreML ANE zero-copy IOSurface conv1x1 and innerProduct match CPU reference with zero-copy outputBackings" {

@@ -20,6 +20,7 @@ const dequant = @import("../gpu/dequant.zig");
 const quant_formats = @import("../gpu/quant_formats.zig");
 const sme = @import("../cpu/sme.zig");
 const qwen3 = @import("../model/qwen3.zig");
+const graph = @import("../model/graph.zig");
 const draft_mod = @import("../spec/draft.zig");
 const tokenizer_mod = @import("../model/tokenizer.zig");
 const chat_template_mod = @import("../model/chat_template.zig");
@@ -1068,7 +1069,7 @@ pub fn runFileQualityGate(
         res.status = "skipped_ref_missing";
         return res;
     };
-    const ref_file_bytes = ref_file.parsed.file_size;
+    const ref_wired_bytes = computeAmfWiredBytes(&ref_file);
     var cfg_meta = amf.resolveConfigJsonAlloc(
         allocator,
         &ref_file,
@@ -1101,7 +1102,7 @@ pub fn runFileQualityGate(
         res.status = "skipped_cand_missing";
         return res;
     };
-    const cand_file_bytes = cand_file.parsed.file_size;
+    const cand_wired_bytes = computeAmfWiredBytes(&cand_file);
     if (tok_meta_opt == null) {
         tok_meta_opt = if (amf.resolveTokenizerJsonAlloc(
             allocator,
@@ -1118,13 +1119,34 @@ pub fn runFileQualityGate(
     }
     cand_file.close(allocator);
 
-    // R9 live zero-swap RAM headroom check (`>= max(ref, cand) + 1.0 GiB`).
+    // R9 live zero-swap RAM headroom check (`>= max(ref_wired, cand_wired) + 512 MiB`).
     const vm_now = try vmstat.Snapshot.capture();
     const live_avail = vm_now.liveZeroSwapReclaimableBytes();
-    const peak_need = @max(ref_file_bytes, cand_file_bytes) + (1024 * 1024 * 1024);
+    const peak_need = @max(ref_wired_bytes, cand_wired_bytes) + (512 * 1024 * 1024);
     if (live_avail < peak_need) {
         res.status = "skipped_low_live_ram";
         return res;
+    }
+
+    // Dispatch to `GraphModel` when the config belongs to `M8.2` (`Inkling 2` / `Hy4`) or non-Qwen3 graph arch.
+    const use_graph_model = blk: {
+        var gcfg_probe = graph.GraphConfig.fromJson(allocator, cfg_meta.bytes) catch break :blk false;
+        defer gcfg_probe.deinit(allocator);
+        break :blk (gcfg_probe.m82_family != .none);
+    };
+    if (use_graph_model) {
+        return runGraphFileQualityGate(
+            allocator,
+            ref_amf_path,
+            cand_amf_path,
+            cfg_meta.bytes,
+            if (tok_meta_opt) |tm| tm.bytes else null,
+            act_quant_policy,
+            steps_in,
+            max_seq_len,
+            explicit_tokens,
+            res,
+        );
     }
 
     const cfg = try qwen3.ModelConfig.fromJson(allocator, cfg_meta.bytes);
@@ -1311,6 +1333,263 @@ pub fn runFileQualityGate(
             }
 
             // Free-running greedy rollout parity + n-gram loop detection on this prompt.
+            cand_model.resetKvCache();
+            pos = 0;
+            var free_tok: u32 = pslice[0];
+            for (pslice) |tid| {
+                free_tok = try cand_model.stepDecode(tid, pos);
+                pos += 1;
+            }
+            var p_greedy: u32 = 0;
+            for (0..psteps) |s| {
+                cand_greedy[step_off + s] = free_tok;
+                if (free_tok == ref_greedy[step_off + s]) p_greedy += 1;
+                if (s + 1 < psteps) {
+                    free_tok = try cand_model.stepDecode(free_tok, pos);
+                    pos += 1;
+                }
+            }
+            const ref_seg = ref_greedy[step_off .. step_off + psteps];
+            const cand_seg = cand_greedy[step_off .. step_off + psteps];
+            const seg_4g = computeMaxNgramRepeatCount(cand_seg, 4);
+            if (seg_4g > max_4gram_rep) max_4gram_rep = seg_4g;
+            if (hasDegenerateRepetitionLoop(ref_seg, cand_seg)) {
+                loop_detected = true;
+            }
+            greedy_matches += p_greedy;
+            if (pi == 0) {
+                math_matches = p_greedy;
+            } else if (pi == 1) {
+                code_matches = p_greedy;
+            } else {
+                reason_matches = p_greedy;
+            }
+            step_off += psteps;
+        }
+
+        res.steps_evaluated = steps;
+        res.top1_matches = top1_matches;
+        res.top1_agreement_pct = 100.0 * @as(f64, @floatFromInt(top1_matches)) / @as(f64, @floatFromInt(steps));
+        res.mean_kl = sum_kl / @as(f64, @floatFromInt(steps));
+        res.max_kl = max_kl;
+        res.greedy_rollout_steps = steps;
+        res.greedy_rollout_matches = greedy_matches;
+        res.math_greedy_steps = math_steps;
+        res.math_greedy_matches = math_matches;
+        res.code_greedy_steps = code_steps;
+        res.code_greedy_matches = code_matches;
+        res.reasoning_greedy_steps = reason_steps;
+        res.reasoning_greedy_matches = reason_matches;
+        res.cand_max_4gram_repeats = max_4gram_rep;
+        res.repetition_loop_detected = loop_detected;
+        res.all_finite = all_finite;
+        res.executed = true;
+        res.status = if (loop_detected) "fail_repetition_loop" else "ok";
+    }
+
+    return res;
+}
+
+fn computeAmfWiredBytes(af: *const amf.AmfFile) u64 {
+    var total: u64 = 0;
+    for (af.parsed.entries) |*e| {
+        if (amf.isMetaEntry(e)) continue;
+        const tk = e.tensorKind() catch continue;
+        if (tk == .cold_expert) continue;
+        total += e.blob_bytes;
+    }
+    return total;
+}
+
+fn runGraphFileQualityGate(
+    allocator: std.mem.Allocator,
+    ref_amf_path: [:0]const u8,
+    cand_amf_path: [:0]const u8,
+    cfg_bytes: []const u8,
+    tok_bytes_opt: ?[]const u8,
+    act_quant_policy: quant_formats.ActQuantPolicy,
+    steps_in: u32,
+    max_seq_len: u32,
+    explicit_tokens: ?[]const u32,
+    res_in: QualityGatePairResult,
+) !QualityGatePairResult {
+    var res = res_in;
+    var gcfg = try graph.GraphConfig.fromJson(allocator, cfg_bytes);
+    defer gcfg.deinit(allocator);
+
+    const steps: u32 = @max(@as(u32, 1), @min(steps_in, 48));
+    const seq_cap: u32 = @min(gcfg.max_position_embeddings, @max(max_seq_len, 256));
+
+    var owned_math_prompt: ?[]u32 = null;
+    defer if (owned_math_prompt) |op| allocator.free(op);
+    var owned_code_prompt: ?[]u32 = null;
+    defer if (owned_code_prompt) |op| allocator.free(op);
+    var owned_reason_prompt: ?[]u32 = null;
+    defer if (owned_reason_prompt) |op| allocator.free(op);
+
+    const fallback_math = [_]u32{ 1, 17, 23, 42, 100 };
+    const fallback_code = [_]u32{ 2, 11, 29, 53, 89 };
+    const fallback_reason = [_]u32{ 3, 13, 31, 61, 97 };
+    var math_slice: []const u32 = explicit_tokens orelse &fallback_math;
+    var code_slice: []const u32 = explicit_tokens orelse &fallback_code;
+    var reason_slice: []const u32 = explicit_tokens orelse &fallback_reason;
+
+    if (explicit_tokens == null) {
+        if (tok_bytes_opt) |tb| {
+            if (tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, tb)) |tok_val| {
+                var tok = tok_val;
+                defer tok.deinit(allocator);
+                res.tokenizer_resolved = true;
+                var scratch = try tokenizer_mod.EncodeScratch.init(allocator, 4096);
+                defer scratch.deinit(allocator);
+                var ids_buf: [96]u32 = undefined;
+                if (tok.encodeWithScratch(&scratch, "Compute 17 * 23 = ", &ids_buf)) |encoded| {
+                    if (encoded.len > 0) {
+                        const copy = try allocator.alloc(u32, encoded.len);
+                        @memcpy(copy, encoded);
+                        owned_math_prompt = copy;
+                        math_slice = copy;
+                    }
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                }
+                if (tok.encodeWithScratch(&scratch, "def fib(n):\n    if n <= 1:\n        return n\n    return ", &ids_buf)) |encoded| {
+                    if (encoded.len > 0) {
+                        const copy = try allocator.alloc(u32, encoded.len);
+                        @memcpy(copy, encoded);
+                        owned_code_prompt = copy;
+                        code_slice = copy;
+                    }
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                }
+                if (tok.encodeWithScratch(&scratch, "The Riemann zeta function zeta(s) has a simple pole at s = 1 and its nontrivial zeros are conjectured to satisfy Re(s) = ", &ids_buf)) |encoded| {
+                    if (encoded.len > 0) {
+                        const copy = try allocator.alloc(u32, encoded.len);
+                        @memcpy(copy, encoded);
+                        owned_reason_prompt = copy;
+                        reason_slice = copy;
+                    }
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                }
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            }
+        }
+    }
+
+    var math_steps: u32 = steps;
+    var code_steps: u32 = 0;
+    var reason_steps: u32 = 0;
+    if (explicit_tokens == null and steps >= 3) {
+        math_steps = (steps + 2) / 3;
+        code_steps = (steps - math_steps + 1) / 2;
+        reason_steps = steps - math_steps - code_steps;
+    } else if (explicit_tokens == null and steps == 2) {
+        math_steps = 1;
+        code_steps = 1;
+    }
+    const prompt_slices = [_][]const u32{ math_slice, code_slice, reason_slice };
+    const prompt_steps = [_]u32{ math_steps, code_steps, reason_steps };
+    const prompt_count: usize = if (reason_steps > 0) 3 else if (code_steps > 0) 2 else 1;
+
+    const vocab: usize = if (gcfg.m82_cfg.unpadded_vocab_size > 0 and gcfg.m82_cfg.unpadded_vocab_size < gcfg.vocab_size)
+        gcfg.m82_cfg.unpadded_vocab_size
+    else
+        gcfg.vocab_size;
+    const ref_logits_all = try allocator.alloc(f32, @as(usize, steps) * vocab);
+    defer allocator.free(ref_logits_all);
+    const ref_greedy = try allocator.alloc(u32, steps);
+    defer allocator.free(ref_greedy);
+    const cand_greedy = try allocator.alloc(u32, steps);
+    defer allocator.free(cand_greedy);
+
+    {
+        var ref_model = try graph.GraphModel.loadFromFile(allocator, ref_amf_path, gcfg, .{
+            .max_seq_len = seq_cap,
+            .max_tree_nodes = 1,
+            .startup_canary = false,
+            .cold_slot_count = 64,
+        });
+        defer ref_model.deinit(allocator);
+
+        var step_off: usize = 0;
+        for (0..prompt_count) |pi| {
+            ref_model.resetKvCache();
+            const pslice = prompt_slices[pi];
+            const psteps = prompt_steps[pi];
+            var pos: u32 = 0;
+            var last_tok: u32 = pslice[0];
+            for (pslice) |tid| {
+                last_tok = try ref_model.stepDecode(tid, pos);
+                pos += 1;
+            }
+            for (0..psteps) |s| {
+                const lg = ref_model.readLastLogitsF16();
+                for (0..vocab) |v| ref_logits_all[(step_off + s) * vocab + v] = @floatCast(lg[v]);
+                ref_greedy[step_off + s] = last_tok;
+                if (s + 1 < psteps) {
+                    last_tok = try ref_model.stepDecode(last_tok, pos);
+                    pos += 1;
+                }
+            }
+            step_off += psteps;
+        }
+    }
+
+    {
+        var cand_model = try graph.GraphModel.loadFromFile(allocator, cand_amf_path, gcfg, .{
+            .max_seq_len = seq_cap,
+            .max_tree_nodes = 1,
+            .startup_canary = false,
+            .cold_slot_count = 64,
+            .act_quant_policy = act_quant_policy,
+        });
+        defer cand_model.deinit(allocator);
+
+        var sum_kl: f64 = 0.0;
+        var max_kl: f64 = 0.0;
+        var top1_matches: u32 = 0;
+        var greedy_matches: u32 = 0;
+        var math_matches: u32 = 0;
+        var code_matches: u32 = 0;
+        var reason_matches: u32 = 0;
+        var max_4gram_rep: u32 = 0;
+        var loop_detected = false;
+        var all_finite = true;
+        const cand_tmp = try allocator.alloc(f32, vocab);
+        defer allocator.free(cand_tmp);
+
+        var step_off: usize = 0;
+        for (0..prompt_count) |pi| {
+            const pslice = prompt_slices[pi];
+            const psteps = prompt_steps[pi];
+
+            cand_model.resetKvCache();
+            var pos: u32 = 0;
+            for (pslice) |tid| {
+                _ = try cand_model.stepDecode(tid, pos);
+                pos += 1;
+            }
+            for (0..psteps) |s| {
+                const lg = cand_model.readLastLogitsF16();
+                for (0..vocab) |v| cand_tmp[v] = @floatCast(lg[v]);
+                const m = computeLogitsKlAndTop1F32(ref_logits_all[(step_off + s) * vocab ..][0..vocab], cand_tmp);
+                if (!m.all_finite) all_finite = false;
+                sum_kl += m.kl_divergence;
+                if (m.kl_divergence > max_kl) max_kl = m.kl_divergence;
+                if (m.top1_match) top1_matches += 1;
+                if (s + 1 < psteps) {
+                    _ = try cand_model.stepDecode(ref_greedy[step_off + s], pos);
+                    pos += 1;
+                }
+            }
+
             cand_model.resetKvCache();
             pos = 0;
             var free_tok: u32 = pslice[0];
