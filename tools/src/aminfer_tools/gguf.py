@@ -1823,6 +1823,37 @@ def _interleave_split_rows(
     return bytes(out)
 
 
+_NVFP4_MASK_CACHE: dict[int, tuple[int, int]] = {}
+
+
+def _unsplit_nvfp4_batch(raw_buf: bytes | bytearray | memoryview) -> tuple[bytes, bytes]:
+    """Vectorized C-speed conversion of N packed GGUF NVFP4 blocks (`N * 36B`) to planar `nvfp4_g16`."""
+    n = len(raw_buf) // 36
+    if n == 0:
+        return b"", b""
+    masks = _NVFP4_MASK_CACHE.get(n)
+    if masks is None:
+        all_ones = ((1 << (8 * n)) - 1) // 255
+        masks = (all_ones * 0x0F, all_ones * 0xF0)
+        if len(_NVFP4_MASK_CACHE) < 64:
+            _NVFP4_MASK_CACHE[n] = masks
+    mask0f, maskf0 = masks
+    mv = memoryview(raw_buf)
+    scales = bytearray(n * 4)
+    for j in range(4):
+        scales[j::4] = mv[j::36]
+    data_out = bytearray(n * 32)
+    for sb in range(4):
+        sbase = 4 + sb * 8
+        dbase = sb * 8
+        for i in range(4):
+            i0 = int.from_bytes(mv[sbase + 2 * i :: 36], "little")
+            i1 = int.from_bytes(mv[sbase + 2 * i + 1 :: 36], "little")
+            data_out[dbase + i :: 32] = ((i0 & mask0f) | ((i1 & mask0f) << 4)).to_bytes(n, "little")
+            data_out[dbase + 4 + i :: 32] = (((i0 & maskf0) >> 4) | (i1 & maskf0)).to_bytes(n, "little")
+    return bytes(data_out), bytes(scales)
+
+
 def _decode_gguf_float_array(shard: GgufShard, info: GgufTensorInfo) -> bytes:
     with shard.path.open("rb") as fh:
         fh.seek(shard.data_offset + info.offset)
@@ -2710,20 +2741,24 @@ def pack_amf_from_gguf(
                         scales_acc = bytearray()
                         if e.pair_interleave_rows or e.second_shard is not None:
                             full_raw = memoryview(_prepare_expert_raw(e, in_fhs))
-                            for r in range(n_r):
-                                r_raw = full_raw[r * row_src_b : (r + 1) * row_src_b]
-                                d_row, s_row = _unsplit_nvfp4_row(r_raw, k_c)
-                                w.write(d_row)
-                                scales_acc.extend(s_row)
+                            step = 4096
+                            for r0 in range(0, n_r, step):
+                                r1 = min(n_r, r0 + step)
+                                d_chunk, s_chunk = _unsplit_nvfp4_batch(full_raw[r0 * row_src_b : r1 * row_src_b])
+                                w.write(d_chunk)
+                                scales_acc.extend(s_chunk)
                         else:
                             assert e.shard is not None
                             sfh = in_fhs[e.shard.path]
                             sfh.seek(e.shard.data_offset + e.src_offset)
-                            for _ in range(n_r):
-                                r_raw = _read_exact(sfh, row_src_b, e.name)
-                                d_row, s_row = _unsplit_nvfp4_row(r_raw, k_c)
-                                w.write(d_row)
-                                scales_acc.extend(s_row)
+                            left_rows = n_r
+                            while left_rows > 0:
+                                take_rows = min(4096, left_rows)
+                                chunk_raw = _read_exact(sfh, take_rows * row_src_b, e.name)
+                                d_chunk, s_chunk = _unsplit_nvfp4_batch(chunk_raw)
+                                w.write(d_chunk)
+                                scales_acc.extend(s_chunk)
+                                left_rows -= take_rows
                         w.zeros(e.params_offset - e.data_bytes)
                         w.write(scales_acc)
                         pad4 = _align_up(len(scales_acc), 4) - len(scales_acc)
