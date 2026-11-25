@@ -43,6 +43,7 @@ items. ADRs record decisions, not capability status — that lives in
 | [0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md) | Native Metal 4 sublayer fusion, MMA FlashAttention-2, GPU indirect MoE dispatch, and NEON/SME2 accelerators (M7.8) | Accepted | 2026-11-23 |
 | [0024](0024-quantized-format-parity-and-inkling2-hy4-adaptation.md) | Zero-loss quantized-format compatibility (`FP8` / `MXFP8` / `NVFP4` / `GGUF` / `MLX` / sub-4-bit) and `Inkling 2` + `Hy4` family adaptation (M8.1–M8.2) | Accepted | 2026-11-23 |
 | [0025](0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md) | Deep architecture-specific optimizations for `Inkling 2` (`Mini` & `Small`) and staged `M9.1`–`M9.3` frontier roadmap (`MiMo-V2.6`, `GLM-5`, `Ling-3.1`) | Accepted | 2026-11-24 |
+| [0026](0026-m825-inkling2-single-frame-hot-path-and-full-wired-quant-parity.md) | Zero-flush single-frame `Inkling 2` Metal 4 hot path, GPU `DFlare` drafting, and full-wired `UD-IQ3_XXS` vs `GSQ-RCO v2` parity (`M8.25`) | Accepted | 2026-11-25 |
 
 ## Template
 

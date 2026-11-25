@@ -1,0 +1,66 @@
+# ADR-0026: Zero-flush single-frame `Inkling 2` Metal 4 hot path, GPU `DFlare` drafting, and full-wired `UD-IQ3_XXS` vs `GSQ-RCO v2` parity (`M8.25`)
+
+- Status: Accepted
+- Date: 2026-11-25
+- Source: user confirmation following live `24 GB` M4 desktop profiling and source-level hot-path audit on `Inkling-2-Mini` (`275b423`)
+
+## Context
+
+Milestone `M8.2` (`f8622c8..275b423`, [ADR-0024](0024-quantized-format-parity-and-inkling2-hy4-adaptation.md), [ADR-0025](0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md)) achieved 100% reference-faithful numerical parity on real `thinkingmachines/Inkling-2-Mini` (`24` physical layers, `Core 6..17` executed `3` passes = `48` effective steps, `128` experts top-8) and `3L` `DFlare` / `DFlash-Q8` (`mean_accept_len = 3.150–3.750` at `T = 0`, `100%` bit-exact token agreement). However, interactive desktop profiling on the `24 GB` M4 baseline (`inkling-2-mini-hot72.amf` `11.55 GiB` wired + `3L` `DFlare`) and a full source audit of `src/model/m82_runtime.zig`, `src/spec/dflare_dfly.zig`, `src/main.zig`, and `tools/src/aminfer_tools/gsq_rco.py` identified seven compounding bottlenecks that hold interactive wall-clock throughput far below hardware potential:
+
+1. **Live-desktop wired-memory pressure and macOS swap storm (`disk0` `2,019 IOPS`):** On an active `24 GB` macOS desktop where the IDE, browser, and WindowServer already occupy `8–10 GiB`, locking `11.55 GiB` (`72 / 128` hot experts) drove system `wired + compressor` pages to `20.46 GiB` (`16.24 GiB` wired + `4.22 GiB` compressor), triggering `+4.69 GiB` of swapouts in `15 s` on `disk0`.
+2. **External `10 Gbps` USB cold-expert bandwidth saturation (`disk6` `438.9 MB/s`):** Leaving `56 / 128` (`43.75%`) experts cold on USB (`0.51–0.97 GB/s`) across `48` effective steps (`384` expert assignments/token at `M = 1`, up to `3,072` per `M = 8` `DFlare` batch) saturates the external link.
+3. **`160+` per-token `flushFrame()` CPU-GPU synchronization stalls (`src/model/m82_runtime.zig`):** To guarantee initial bit-level reference alignment in `M8.2`, each forward pass commits and blocks on `MTL4CommandBuffer` completion four times per step:
+   - `L1671` and `L2014`: `48` flushes/token (`loop_pass >= 1`) to run CPU `applySme2MessageGate` (`sme2_panel64` controller weights);
+   - `L1769` and `L2226`: `48` flushes/token for CPU `applyScaledL2ClipPerHeadF16` + `LogScale` + `V` unweighted RMSNorm, plus `16` flushes/token on global layers (`5, 11, 17, 23` across `3` passes) to assemble reversed-lag `dyn_sconv` `[t-3..t]` weights;
+   - `L2057` and `L2088`: `48` flushes/token to read `topk_ids` on the CPU, plus one additional `flushFrame()` and synchronous `cc.pinExpert()` wait per cold expert (`0%` overlap between GPU compute and `AsyncExpertReader` disk I/O).
+4. **Per-token `encodeLinearGemv` inside batched `M = 8` MoE (`src/model/m82_runtime.zig:2095-2130`):** Although `unique_eids` deduplicates active expert IDs, the inner loop iterates `for (0..m) |tok|` issuing single-row `encodeLinearGemv` over `num_rows = 1` scratch offsets (`exp_gate_up_off`, `exp_act_off`), re-streaming an expert's weights whenever multiple draft tokens route to the same expert, while `G20` indirect MoE (`src/gpu/moe.zig`) does not yet specialize `Inkling 2`'s `pair_interleaved + SoftcappedSwiGLU(gate = 4.0, up = 25.0)` epilogue.
+5. **Single-threaded scalar CPU loops inside `DFlareProposer` (`src/spec/dflare_dfly.zig:1176-1230, 3052-3150`):** `DFlareProposer` currently runs its `3`-layer `M = 8` transformer (`hidden = 2304, inter = 9216`, `~600 MiB` weights streamed `8` times = `4.8 GiB` scalar `matVecBf16` reads) and `dflash-Q8` `markov_w2_vocab_bf16` (`201,024 x 256` streamed `7` times = `720 MiB`) on a single CPU thread, adding `200–400 ms` per draft round even if target verification were instantaneous.
+6. **`--dump-router-trace` (`W8`) gated exclusively on `qwen3_moe` (`src/main.zig:2256`):** `aminfer decode --dump-router-trace` currently rejects `inkling2_loop` (`if (cfg.arch != .qwen3_moe) return error.InvalidArgument`), preventing 48-step (`Core 6..17 x 3` folded onto physical layers `0..23`) empirical router-heat capture for `Inkling-2-Mini`.
+7. **Unmapped looped GGUF `imatrix` in `tools/src/aminfer_tools/gsq_rco.py`:** `unsloth/Inkling-2-Mini-GGUF` provides both a community dynamic-quantized `Inkling-2-Mini-UD-IQ3_XXS.gguf` (`10.862 GiB`) and an official `imatrix_unsloth.gguf_file` (`42 MiB`). Because `Inkling-2-Mini` GGUF unrolls `block_count = 48` (`blk.0..47`) over `24` physical layers and uses `w13` (`2304`) / `w2` (`1152`) expert projections, `gsq_rco.py` requires `48 -> 24` loop-folded `imatrix` aggregation and per-layer multiplier normalization to avoid shallow-layer `q2_affine` over-allocation.
+
+The user confirmed inserting Milestone **`M8.25`** immediately before `M8.3`, fixing all runtime/drafter hot-path bottlenecks with strict safety guards and building **both** full-wired (`<= 11.0 GiB`, `cold = 0`, `swapouts_delta = 0` on a live `24 GB` desktop) quantization candidates — **Option A (`UD-IQ3_XXS`)** and **Option B (calibrated `GSQ-RCO v2`)** — for head-to-head speed and coding/quality evaluation.
+
+## Decision
+
+### 1. Zero-flush single-frame `Inkling 2` Metal 4 pipeline & grouped/indirect MoE (`G29`)
+
+- **Single-frame GPU sublayer completion (`src/kernels/inkling2_hy4.metal`, `src/gpu/inkling2_hy4.zig`, `src/model/m82_runtime.zig`):**
+  - Replace CPU `applyScaledL2ClipPerHeadF16` + `LogScale` + `V` unweighted RMSNorm (`L1769`), CPU global `dyn_sconv` `[t-3..t]` lag reversal/scaling (`L2226`), and CPU `applySme2MessageGate` (`L1671`, `L2014`) with zero-spill (`-Wframe-larger-than=0`) Metal 4 kernels inside the active compute pass.
+  - **Backward-compatible `sme2_panel64` controller loading:** When an `.amf` bundle stores `controllers.*` in `sme2_panel64` layout (`--sme2-pack controllers`), deinterleave a contiguous GPU view once at model load (`< 2 ms`, `3.4 MiB` wired) so existing `.amf` files require zero repacking, while retaining an opt-in `--sme2-controllers` path for CPU SME2 parity tests.
+- **Zero-readback `G20` indirect Softcap MoE (`cold == 0`) & grouped multi-row gather (`M > 1`):**
+  - Specialize `G20` indirect MoE (`src/gpu/moe.zig` / `inkling2_hy4.metal`) with a dedicated function-constant path for `Inkling 2`'s `pair_interleaved + SoftcappedSwiGLU(gate = 4.0, up = 25.0)` (leaving `Qwen3` and `Hy4` PSOs untouched). When `cold_expert_count == 0`, all `48` effective steps of `M = 1` decode and `M = 8` `DFlare` verification execute inside **one `MTL4CommandBuffer` with `0` mid-pass `flushFrame()` calls** ([ADR-0011](0011-metal4-zero-allocation-hot-path.md), [ADR-0023](0023-native-kernel-barrier-fusion-mma-flashattn-and-simd-accelerators.md)).
+  - Statically size `M82Workspace` expert intermediate buffers (`exp_gate_up_off`, `exp_up_off`, `exp_act_off`) for `max_batch_m * inter` (`+72 KiB` on `Inkling-2-Mini`, `0` hot-path heap allocs) and group multi-token assignments per active expert into a single `M_e`-row matrix/multi-row dispatch so each selected expert streams once per step.
+- **Windowed async cold-expert prefetch + hot-expert GPU overlap (`cold > 0`):**
+  - When cold experts are present, partition unique cold expert IDs per step into windows of `W = min(unique_cold_count, cold_cache.num_slots)` (preventing `ColdCache` slot overwrite when `unique_cold_count > cold_slots`), submit all `W` `F_NOCACHE` reads concurrently to `AsyncExpertReader` (`QD = 8..16`) **before** encoding hot-expert GPU kernels so NVMe I/O overlaps hot-expert GPU execution, and dispatch the fetched cold window in grouped `M_e`-row batches.
+- **Prefill GPU watchdog guard & Metal validation redline:**
+  - Restrict full 48-step single-command-buffer fusion to decode and `M <= 16` speculative verification (`~10–30 ms`/buffer); split multi-hundred/thousand-token prefill command buffers across chunk/step boundaries so no single GPU submission approaches macOS's `~5 s` `MTLCommandBuffer` watchdog timeout, and verify `0` data-hazard/barrier errors under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`.
+
+### 2. Metal 4 GPU acceleration of `DFlareProposer` (`D16`)
+
+- Bind `3L`/`5L` `DFlare` and `arch = dflash` weights (`BF16`, `F16`, `GGUF Q8_0` / `W21`–`W22` dtypes, `~500–636 MiB`) directly as zero-copy `WiredArena` `MTLBuffer`s in `src/spec/dflare_dfly.zig` / `src/model/m82_runtime.zig`.
+- Execute context feature fusion (`target_layer_ids`), incremental `ctx_kv` projection, all `3`/`5` `M = 8` transformer blocks (batched `QKV`, Q/K RMSNorm + NeoX RoPE, `ctx_kv + block_kv` GQA, SwiGLU MLP), and `markov_gru_proj` + `markov_w2_vocab` / `lm_head` scoring on Metal 4 (`0` single-threaded scalar CPU `matVecBf16` loops on the GPU fast path; CPU fallback retained for synthetic unit tests without Metal).
+
+### 3. Loop-aware `--dump-router-trace` & dual `< 11 GiB` full-wired `Inkling-2-Mini` A/B (`W8`, `W29`)
+
+- **Loop-folded `--dump-router-trace` (`W8`):** Extend `aminfer decode --dump-router-trace <path.jsonl>` (`src/main.zig`, `src/model/graph.zig`, `src/model/m82_runtime.zig`) to `inkling2_loop` and `inkling2`, recording all `48` effective step top-k selections mapped onto physical `layer = 0..23` (`Core` passes `r = 0..2` accumulated onto `layer = 6..17`) with `0` steady-state heap allocations.
+- **Loop-folded GGUF `imatrix` + per-layer normalization (`W14`/`W29`, `tools/src/aminfer_tools/gsq_rco.py`):** Fold unrolled `blk.0..47` entries in `unsloth/Inkling-2-Mini-GGUF`'s `imatrix_unsloth.gguf_file` (`42 MiB`) onto physical layers `0..23`, map `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps` channel statistics onto `Inkling 2`'s `pair_interleaved` `w13` (`2304`) and `w2` (`1152`) expert inputs, and normalize `_imatrix_tensor_multipliers` within each layer/role so Pre-LN depth variance growth does not over-assign `q2_affine` to shallow layers (`L0..L3`).
+- **Dual full-wired (`cold = 0`, `--vision-sidecar` stripped, `<= 11.0 GiB` wired) exports & head-to-head benchmark (`W29`):**
+  1. **Option A (`inkling-2-mini-ud-iq3-xxs.amf`)**: lossless `W22` conversion of `unsloth/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-IQ3_XXS.gguf` (`10.862 GiB`, `48 -> 24` loop dedup, `0` double quantization);
+  2. **Option B (`inkling-2-mini-gsq-rco-v2.amf`)**: native `GSQ-RCO v2` export from `thinkingmachines/Inkling-2-Mini` (`NVFP4`/`MXFP8`/`BF16`) calibrated with a multi-domain 48-step `router_trace` + `imatrix_unsloth.gguf_file` (`~10.2–10.8 GiB` wired, backbone floor `>= q4_affine`, `--fine-rungs` `<= 5` buckets/layer).
+  3. **Mandatory A/B acceptance gate (`aminfer bench-m825` + live desktop run):** Evaluate Option A vs Option B (+ `3L DFlare` & `DFlash-Q8`) on the live `24 GB` M4 desktop across `decode` and `spec-decode -M dflare` throughput (`0` mid-pass `flushFrame()`, `malloc_blocks_delta = 0`, `swapouts_delta = 0`), `W24` `aminfer quality-gate` (`KL`, top-1, loop check vs native `NVFP4`), and executable multi-problem Python coding/math/reasoning accuracy, archiving all measurements in [../benchmarks/results.md](../benchmarks/results.md).
+
+## Consequences
+
+- **Positive:** Eliminates `160+` per-token CPU-GPU `MTL4CommandBuffer` stalls and `5.5 GiB`/round of single-core scalar CPU draft math; fits `100%` of `Inkling-2-Mini` + `3L DFlare` inside `~10.8–11.4 GiB` wired RAM (`>= 12.5 GiB` OS/desktop headroom, `0` swapouts, `0` USB cold-expert I/O on a busy `24 GB` M4 desktop); preserves `cold > 0` NVMe streaming with true GPU/I/O overlap and window-safe `ColdCache` pinning for larger models (`Inkling-2-Small`); and establishes an empirical, benchmark-backed choice between community `UD-IQ3_XXS` and native `imatrix + router_trace` `GSQ-RCO v2`.
+- **Negative / trade-offs:** Adds Metal 4 PSO variants for `Inkling 2` GPU controllers and `pair_interleaved` Softcap indirect MoE (`src/kernels/inkling2_hy4.metal`, `src/gpu/moe.zig`), and stages an additional `~10.9 GiB` GGUF + two `~10.5 GiB` `.amf` bundles on `/Volumes/AriDisk` (`~900+ GiB` free).
+
+## Evidence
+
+- Live `24 GB` M4 desktop `vm_stat` / `iostat` trace and line-verified source audit (`275b423`): `src/model/m82_runtime.zig` (`L1671`, `L1769`, `L2014`, `L2057`, `L2088`, `L2095–2130`, `L2226`), `src/spec/dflare_dfly.zig` (`L1176–1230`, `L3052–3150`), `src/main.zig` (`L2256`), and `tools/src/aminfer_tools/gsq_rco.py` (`L2093–2232`).
+- ModelScope / Hugging Face `unsloth/Inkling-2-Mini-GGUF` file audit (`2026-11-25`): `Inkling-2-Mini-UD-IQ3_XXS.gguf` (`10.862 GiB`) and `imatrix_unsloth.gguf_file` (`0.042 GiB` = `42 MiB`) verified live alongside staged `/Volumes/AriDisk/models/Inkling-2-Mini` (`18.805 GiB`) and `dspark-Inkling-2-Mini-Q8_0.gguf` (`480.55 MiB`).
+- M8.2 baseline measurements in [../benchmarks/results.md](../benchmarks/results.md) confirming `100%` bit-exact `decode == 3L DFlare == DFlash-Q8` parity and `mean_accept_len = 3.150–3.750` on real `Inkling-2-Mini`.
+
+## Open items
+
+- Measure exact `M = 1` decode and `M = 8` `3L DFlare` / `DFlash-Q8` wall-clock `tok/s`, `KL` divergence, and executable Python coding pass rates between Option A (`UD-IQ3_XXS`) and Option B (`GSQ-RCO v2`) during `M8.25`, and record capability completion in [../status.md](../status.md) and [../process.md](../process.md).
