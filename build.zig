@@ -39,6 +39,7 @@ const kernel_sources = [_][]const u8{
     "src/kernels/vision_ingress.metal",
     "src/kernels/nax_tensorops.metal",
     "src/kernels/sampling.metal",
+    "src/kernels/inkling2_hy4.metal",
 };
 
 pub fn build(b: *std.Build) void {
@@ -220,6 +221,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_quant_formats_test = b.addRunArtifact(quant_formats_test);
     b.step("test-quant-formats", "Run M8.1 G23/G24 multi-format Metal 4 quantization tests").dependOn(&run_quant_formats_test.step);
+
+    // Dedicated M8.2 G25 Inkling 2 and Hy4 GPU operator test step (`zig build test-m82-gpu`),
+    // filtering `gpu.inkling2_hy4.` from the unified root library module.
+    const m82_gpu_test = b.addTest(.{
+        .root_module = mod,
+        .filters = &.{"gpu.inkling2_hy4."},
+    });
+    const run_m82_gpu_test = b.addRunArtifact(m82_gpu_test);
+    b.step("test-m82-gpu", "Run M8.2 G25 Inkling 2 and Hy4 fused Metal 4 operator tests").dependOn(&run_m82_gpu_test.step);
 
     const run_mod_test = b.addRunArtifact(b.addTest(.{ .root_module = mod }));
     const run_exe_test = b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module }));
