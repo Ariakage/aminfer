@@ -1,7 +1,7 @@
 # ADR-0024: Zero-loss quantized-format compatibility (`FP8` / `MXFP8` / `NVFP4` / `GGUF` / `MLX` / sub-4-bit) and `Inkling 2` + `Hy4` family adaptation (`M8.1`–`M8.2`)
 
 - Status: Accepted
-- Date: 2026-11-23 (updated 2026-11-24)
+- Date: 2026-11-23 (updated 2026-11-25)
 - Source: user roadmap, `M8.1`/`M8.2` staging, and declarative JSON `ChatTemplate` confirmation following Hugging Face checkpoint & GGUF header verification
 
 ## Context
@@ -111,7 +111,8 @@ The user therefore confirmed scheduling **Milestone `M8`** after `M7.8` in two s
 
 ## Open items
 
-- Measure `M = 1` bus-% vs `q4_affine` (`98.8 GB/s`), prefill tile throughput, KL divergence, and top-1 agreement for every new `W21`/`W22`/`G23`/`G24` kernel and determine whether `--act-quant emulate` defaults off or per-model during `M8` implementation.
+- Resolved in `M8.1` (`5da4f9e`) & `M8.15` (`7bcab5a`–`468cede`): `M = 1` bus-% vs `q4_affine`, prefill tile throughput, `KL` divergence, top-1 agreement, and `--act-quant emulate` (kept opt-in, default `none`) are archived in [../benchmarks/results.md](../benchmarks/results.md#m81-multi-format-quantization-parity-chattemplate-c18-hardening-and-w24-kl-quality-gate).
+- Resolved on M4 in `M8.2` (`f8622c8`, `fa36784`, `ff70b55`, `fb3be54`, `b38439c`, `13218e9`, `0f5477f`): `Inkling 2` and `Hy4` converters (`W23`), zero-spill fused Metal 4 operators (`G25`), `DFlare`/`DFly2` block-parallel draft heads (`D14`), L2 `SME2` loop controllers + NVMe cold-expert/FP8 Engram placement (`C26`), portable `--models-dir`/`AMINFER_MODELS_DIR`/`TMPDIR` paths (`0` `/Volumes/` paths in `src/` and `tools/`), `aminfer bench-m82`, and local `yujiepan/hy4-preview-tiny-random` + reference-aligned `thinkingmachines/Inkling-2-Mini` verification (coherent English/math/Python output, `100%` bit-exact `decode == 3L DFlare == DFlash-Q8` parity with `mean_accept_len = 3.750` at `n = 16` and `3.150` at `n = 64`, `swapouts_delta = 0`) are archived in [../benchmarks/results.md](../benchmarks/results.md#m82--inkling-2--hy4-fused-operators-dflaredfly2-block-drafting-sme2-loop-controllers-and-real-m4-execution).
 - Inspect the `24` Engram scale/aux tensors (`BF16(4)+F32(20)`) accompanying `F8_E4M3` `per_layer_token_embd.weight` inside `AngelSlim/Hy4-flash-GGUF` before finalizing Engram GGUF import (`W22`).
 - Audit uninspected custom-titled GGUF repos (`Hy4-flash-SPARK-4Bit*`, `Hy4-IQ2`, `anemll/Hy4-preview-FlashMoE-STQ1_0`, `Baekpica/Inkling-2-Small-VQ-GGUF`) before adding or maintaining explicit rejection.
 - Execute full `Inkling-2-Small` (`363.27 GiB` native; `78.7`–`190.9 GiB` 2-bit/IQ1), `Hy4-flash` (`76.3`–`267.4 GiB`), and `Hy4`/`Hy4-preview` (`219.2`–`757.9 GiB`) end-to-end benchmarks once `128–512 GB` Mac / `TB5` cluster hardware is available.

@@ -60,6 +60,24 @@ uv run aminfer-tools --help
 uv run python -m unittest discover -s tests
 ```
 
+## Benchmark & test path configuration
+
+Neither the Zig engine nor `tools/` hardcodes local volume mounts. Real
+checkpoint benchmarks, metadata dry-runs, and temporary scratch files resolve
+through explicit CLI flags and environment variables (`src/platform/paths.zig`):
+
+| Interface | Resolution Order | Notes |
+| --- | --- | --- |
+| `--models-dir <dir>` (`--models-dir=<dir>`) | CLI flag -> `AMINFER_MODELS_DIR` -> unset | Supported on `bench-m65`, `bench-m68`, `bench-m75`, `bench-m78`, `bench-m81`, and `bench-m82`; when unset or absent, benchmarks fall back to synthetic fixtures and opportunistic tests skip cleanly |
+| `AMINFER_METADATA_DIR` | `AMINFER_METADATA_DIR` -> `<models_dir>/metadata` -> unset | Optional root for offline Hugging Face `config.json` / `tokenizer.json` / `model.safetensors.index.json` metadata tests in `src/model/tokenizer.zig` and `tools/tests/` |
+| `TMPDIR` | `TMPDIR` (trailing `/` trimmed) -> `/tmp` | Shared zero-allocation temp-directory root for benchmark probes, cold-expert/N-gram temp stores, and unit tests |
+
+```sh
+AMINFER_MODELS_DIR=/path/to/models ./zig-out/bin/aminfer bench-m82
+./zig-out/bin/aminfer bench-m81 --models-dir /path/to/models
+AMINFER_MODELS_DIR=/path/to/models AMINFER_METADATA_DIR=/path/to/metadata uv run --directory tools python -m unittest discover -s tests
+```
+
 ## Repository index
 
 Agents orient through the local ikat index; see the "ikat repository index"

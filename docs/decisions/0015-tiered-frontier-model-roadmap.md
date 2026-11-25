@@ -1,7 +1,7 @@
 # ADR-0015: Tiered frontier model roadmap (`Qwen3.8-Flash-Next` and `DeepSeek-V4.1-Flash-1017`)
 
 - Status: Accepted
-- Date: 2026-11-20
+- Date: 2026-11-20 (empirical addendum 2026-11-25)
 - Source: user roadmap direction (post-M2 session)
 
 ## Context
@@ -89,9 +89,41 @@ streams), while differing sharply in physical memory footprint (~54.7 GiB vs
   `13,639 MiB` single-`MTLBuffer` limit, IOSurface `KvTile` GQA at `85.6 GB/s`,
   and deduplicated MoE gather saving up to `62.5%` expert weight traffic.
 
+## Post-release empirical note (2026-11-25)
+
+Live Hugging Face `config.json` and `model.safetensors.index.json` verification
+(`cd72273` and side-branch audit `ff7b26fc`) refined both pre-release parameter
+estimates above:
+
+- **`Qwen/Qwen3.8-Flash-Next` (`qwen4_exp`)**: actual published geometry
+  (`hidden_size = 2560`, `512` routed experts `top_k = 10`,
+  `moe_intermediate_size = 640`) activates `2.36B` routed parameters per token
+  (vs the pre-release `6B` estimate) and introduces `300` long
+  `hyper_connection` tensor names exceeding `.amf`'s `47`-byte limit, full
+  `hc_count = 4` mixer projections, separate dense PLE conditioning tensors vs
+  `128` external N-gram shards, and 3D stacked MoE / QSA indexer / MTP keys.
+- **`deepseek-ai/DeepSeek-V4.1-Flash-1017` (`deepseek41`)**: actual published
+  geometry (`hidden_size = 5120`, `384` routed experts `top_k = 6` + `1` shared
+  expert, `20` encoder + `20` decoder layers) activates only `4.25B` routed
+  parameters per token during Decoder decode (vs the pre-release `hidden = 7168`,
+  `512E`, `top_k = 16` -> `16B/tok` estimate). On a `24 GB` M4, holding only
+  Decoder hot experts wired leaves `~11.7–13.3 GiB` for the hot-expert cache,
+  making cold-NVMe Decoder tiering viable (`~2.5–3.0 tok/s` lossless FP4 or
+  `~6–9 tok/s` `Q2_K` + speculative dedup) on `3.2–3.8 GB/s` internal or
+  `40 Gb/s` TB4 PCIe NVMe (`--io-backend pread`) once real-HF alignment lands;
+  full wired residency still targets `512 GB` Ultra or multi-Mac TB5 RDMA
+  clusters.
+
+Full real-HF schema, safetensors-header pre-flight gating, and `24 GB` M4
+cold-tier parity for both models are scheduled as Milestone **`M9.4`** (`W28`),
+tracked in [../status.md](../status.md) and
+[../process.md](../process.md#milestones).
+
 ## Open items
 
-- Exact PLE / Engram `.amf` shard index layout and E-core prefetch batching
-  (design in M6 after Spike S3 settles NVMe queue-depth behavior in M4).
-- FP4 (`E2M1` + `E4M3` scale) KV cache storage representation on Apple9/Apple10
-  GPUs (`MTLBuffer` vs packed texture tiles) for Tier 3 CSA2 — deferred to M7.
+- Resolved in M6/M7 (`C10`, `R7`, `G11`): PLE / Engram `.amf` shard layout,
+  E-core prefetch batching, and FP4 (`E2M1` + `E4M3` scale) KV cache
+  representation.
+- Scheduled in `M9.4` (`W28`): `Qwen3.8-Flash-Next` (`4` items) and
+  `DeepSeek-V4.1-Flash-1017` (`3` items) real Hugging Face safetensors-header
+  and `24 GB` M4 cold-tier alignment before running full published HF shards.

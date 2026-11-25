@@ -1,7 +1,7 @@
 # ADR-0025: Deep architecture-specific optimizations for `Inkling 2` (`Mini` & `Small`) and staged `M9.1`–`M9.3` frontier roadmap (`MiMo-V2.6`, `GLM-5`, `Ling-3.1`)
 
 - Status: Accepted
-- Date: 2026-11-24
+- Date: 2026-11-24 (updated 2026-11-25)
 - Source: user roadmap confirmation (`2026-11-24`) following live Hugging Face `config.json` and checkpoint byte-budget audits
 
 ## Context
@@ -65,6 +65,7 @@ The user confirmed inserting Milestone **`M8.15`** ([ADR-0017](0017-optional-gsq
 
 ## Open items
 
-- Benchmark fused vs unfused `Inkling 2` sublayer occupancy (`-Wframe-larger-than=1` zero-spill invariant) and `3L`/`5L` `DFlare` acceptance `τ` during `M8.2`.
+- Resolved on M4 in `M8.2` (`f8622c8`, `fa36784`, `ff70b55`, `fb3be54`, `b38439c`, `13218e9`, `0f5477f`): `src/kernels/inkling2_hy4.metal` (`12` kernels / `18` PSOs) compiled cleanly with `-std=metal4.0 -Wall -Werror -Wframe-larger-than=1` (`0` warnings, `0` stack spills), `rmsnorm_sconv4` achieved `3.60x` (`39.99` vs `143.98 us`), `M = 8` `Core x 3` batch verification achieved `2.67x–4.13x`, `retag_amf_cold_experts` verified `cold = 24/128` (`15,489.84 MiB <= 18,186 MiB`, `m4_24gb = yes`), and reference-aligned real `Inkling-2-Mini` produced coherent English/math/Python output with `100%` bit-exact `decode == 3L DFlare == DFlash-Q8` greedy parity and real acceptance `mean_accept_len = 3.750` (`n = 16`, both `3L DFlare` & `DFlash-Q8`) and `3.150` (`n = 64`, `3L DFlare`, `swapouts_delta = 0`) ([../benchmarks/results.md](../benchmarks/results.md#m82--inkling-2--hy4-fused-operators-dflaredfly2-block-drafting-sme2-loop-controllers-and-real-m4-execution)).
+- **Mandatory `M9.1`–`M9.4` pre-implementation safetensors JSON header gate (`W28`)**: before implementing any `M9.1`–`M9.4` converter (`MiMo-V2.6`, `GLM-5`, `Ling-3.1`, `Qwen3.8-Flash-Next`, `DeepSeek-V4.1-Flash-1017`), fetch `config.json` + `model.safetensors.index.json` + HTTP Range first-64–256 KB safetensors JSON headers (including `DFlash`/`DFlash2`/`MTP`/`DSpark` shards) and lock exact tensor names (`long_backbone_names == 0`), tensor `shape`s, and scale/broadcast ranks in `tools/tests/test_hf_metadata_validation.py`. (Milestone `M8.3` `C28` runs before `M9.1`, and `M9.4` `W28` follows `M9.3` per [../process.md](../process.md#milestones).)
 - Verify exact `DFlash` / `DFlash2` tensor schemas across `ggml-org/MiMo-V2.6-Flash-RL-GGUF` and `GLM-5.3-Flash` against `D14` `arch = dflash` draft bundles before `M9.1`/`M9.2`.
 - Calibrate `W24` `KL`/code-math curves for `RCO-Q3` dense `KDA` (`Ling-3.1`) and opt-in `--cold-expert-min-weight` (`C27`) on synthetic and tiny/distilled reference fixtures.

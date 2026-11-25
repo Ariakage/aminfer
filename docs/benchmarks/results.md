@@ -6029,6 +6029,130 @@ quality_gate.real.qwen3-0.6b-bf16_vs_qwen3-0.6b-gsq-rco status=ok mean_kl=0.3132
 
 - Diagnostic note logged to [process.md](../process.md#deferred-improvements--temporary-todo-backlog): `imatrix_unsloth.dat` exhibits Pre-LN variance growth (`L0` `ffn_down_exps` peak `0.269` vs `L1` peak `204.56`), causing global cross-layer normalization in `_imatrix_tensor_multipliers` to clip `L0` to `0.5` and assign `60.2%` `q2_affine` at `L0` (vs `32.9%` global MoE expert mean, `0/128` zero-hit experts at `L0`, `226/6,144 = 3.7%` zero-hit overall across the 6-prompt trace).
 
+## M8.2 — Inkling 2 & Hy4 Fused Operators, DFlare/DFly2 Block Drafting, SME2 Loop Controllers, and Real M4 Execution
+
+Recorded on Apple M4 (`Mac16,12`, `Apple9` GPU, `24 GiB` unified memory,
+`120.0 GB/s` bus) during Milestone M8.2
+([ADR-0024](../decisions/0024-quantized-format-parity-and-inkling2-hy4-adaptation.md),
+[ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md);
+commits `f8622c8`, `fa36784`, `ff70b55`, `fb3be54`, `b38439c`, `13218e9`,
+`0f5477f`).
+
+### 1. Verification gate summary (`f8622c8`..`0f5477f`)
+
+| Gate / Suite | Scope | Measured Result (M4) |
+| --- | --- | --- |
+| **Metal 4 Zero-Spill Shader Compile (`G25`)** | `xcrun -sdk macosx metal -std=metal4.0 -Wall -Werror -Wframe-larger-than=1 -mmacosx-version-min=26.0 -c src/kernels/inkling2_hy4.metal` | **Exit `0` (`0` warnings, `0` stack spills)** across `12` Metal 4 kernels (`18` specialized PSOs; re-verified after `0f5477f`) |
+| **Filtered M8.2 GPU & Draft/SME Suites** | `zig build test-m82-gpu` & `zig build test-m82-draft` (Debug & `-Doptimize=ReleaseSafe`) | **`16/16`** `test-m82-gpu` and **`21/21`** `test-m82-draft` in both Debug and ReleaseSafe |
+| **Full Zig Build, Test & Portability Gates** | `zig build` (Debug & ReleaseFast), `zig build test -j1` (Debug & `-Doptimize=ReleaseSafe`), `zig fmt --check build.zig src`, `rg -n '/Volumes/' src tools` | **`507/507` passed** (`482` root `mod_test` + `17` main `exe_test` + `8` C-ABI `sdk_test` on `13218e9` & `0f5477f`; `504/504` = `480 + 16 + 8` on `b38439c`), `0` `/Volumes/` matches across `src/` & `tools/`, `0` `catch {}`, `zig fmt --check` clean, `test-m82-gpu` `16/16` & `test-m82-draft` `21/21` in Debug & ReleaseSafe (note: under live busy-desktop WindowServer load, untouched `< 350 us` `G16`/`G18` microbench canaries can jitter once and pass cleanly on retry) |
+| **Offline Python `tools/` Suite (`W23`)** | `uv run --directory tools python -m unittest discover -s tests` | **`131/131` passed** (all `8` HF metadata dirs `0` `> 47 B` names + `hy4-preview-tiny-random` smoke conversion + `fb3be54` scalar `[1]` NVFP4 `outer_scale_denominator` broadcast & OOB rejection; portable `AMINFER_MODELS_DIR`/`AMINFER_METADATA_DIR` skips cleanly when unset) |
+| **Python `ctypes` SDK Suite (`C17`)** | `python3 -m unittest discover -s python/tests -v` | **`7/7` passed** (adding `test_07_speculative_configuration_and_l1_exact_parity`) |
+
+### 2. External `/Volumes/AriDisk` APFS `F_NOCACHE` I/O baseline (`C26`)
+
+Measured prior to staging M8.2 checkpoints (`954 GiB` free pre-staging; `934 GiB`
+free after staging all M8.2 sources) using a `256 MiB`, `16 KiB`-aligned probe on
+USB 10Gbps APFS (`io_probe.bin` removed immediately after measurement):
+
+| Access Pattern (`F_NOCACHE=1`) | Queue Depth / Flags | Throughput | Latency (`avg / p50 / p95 / p99`) |
+| --- | --- | --- | --- |
+| Sequential `4 MiB` write | `F_FULLFSYNC` | `0.981 GB/s` (`0.913 GiB/s`) | — |
+| Sequential `4 MiB` read | `F_RDAHEAD=1` | `0.938 GB/s` | — |
+| Sequential `4 MiB` read | `F_RDAHEAD=0` | `0.981 GB/s` | — |
+| Random `64 KiB` `pread` | `QD = 1` | `0.223 GB/s` | `293.8 / 289.5 / 343.2 / 378.0 us` |
+| Random `64 KiB` `pread` | `QD = 4` | `0.652 GB/s` | `401.1 us` avg |
+| Random `256 KiB` `pread` | `QD = 1` | `0.506 GB/s` | `518.5 / 514.5 / 577.2 / 613.8 us` |
+| Random `256 KiB` `pread` | `QD = 4` / `QD = 8` | `0.956 GB/s` / `0.972 GB/s` | — |
+
+### 3. Phase-1 `G25`, `D14`, and `C26` microbenchmarks (`f8622c8`, `fa36784`)
+
+- **`G25` `src/kernels/inkling2_hy4.metal` (`f8622c8`)**: `12` Metal 4 kernels (`18` specialized PSOs) verified against FP32 CPU references across `M = 1`, `M = 8` (tree/block verify), `M = 33` (`1152` non-256 width), `M = 65` multi-tile `sconv4`, `1024`-token `HybridKvRing` SWA wrap, `IndexCache` period-4 `0`-dispatch `.shared` reuse, `IndexPool` `compress_ratio = 4` (`tiny` & `512`/`2048`), `16 KiB` alignment, and zero hot-path allocations (`0` compiler warnings, `0` stack spills).
+- **`C26` `Inkling2LoopController` L2 `SME2` standalone microbenchmark (`fa36784`, `ReleaseFast`)**: `hidden = 2048`, `gate_rank = 64`, `3.00 MiB` `sme2_panel64` `BF16` wired in P-cluster L2 (`cpu_sme2`, `0` Metal dispatches): `M = 1` `77.05 us/branch` (`308.19 us/4-branch`), `M = 8` `160.82 us/branch` (`643.28 us/4-branch`, `20.10 us/tok`), numerical parity `max_abs_err <= 2e-3` (`8.86e-4` observed on `hidden = 2048` `BF16`).
+- **`C26` `PleStore` native `fp8_e4m3_row` `F_NOCACHE` probe (`fa36784`)**: verified on `/Volumes/AriDisk` with `r0_reads = 3`, `r1_reads = 3` (`0` NVMe reads on `r >= 1`), `0` hot-path allocations, `parity_ok = true`.
+
+### 4. `ReleaseFast` `aminfer bench-m82` results (`b38439c` & post-reference-alignment `0f5477f`)
+
+Run status on both commits: **`bench.m82.all_passed = true`**, **`bench.m82.swapouts_delta = 0`**, **`16/16` greedy parity across all 4 E2E suites**.
+
+#### `G25` & `C26` operator and subsystem benchmarks
+
+| Track | Benchmark | Initial `b38439c` (`ReleaseFast`) | Post-Alignment `0f5477f` (`ReleaseFast`) | Speedup / Savings / Guard |
+| --- | --- | --- | --- | --- |
+| `G25` | `rmsnorm_sconv4` (fused vs unfused) | `39.99` vs `143.98 us` (`3.60x`) | Pass (`0` stack spills) | **`3.60x`** fused vs unfused |
+| `G25` | `swa40_kv` (`40/48` `1024`-tok `HybridKvRing` SWA vs full KV) | `104.00 vs 384.00 MiB` (`8K`); `296.00 vs 1536.00 MiB` (`32K`) | Pass | **`-72.9%`** at `8K`; **`-80.7%`** at `32K` |
+| `G25` | `rel_gqa_attn` (single-pass fused relative GQA) | `m1 = 675.89 us`, `m8 = 622.76 us` | Pass | `0` intermediate global writes |
+| `G25` | `inkling2_moe_attnres` (MoE epilogue + 6-layer `attn_res`) | `m8 = 149.54 us` | Pass | `0` stack spills |
+| `G25` | `hy4_index_cache` (period-4 `.full`/`.shared`) | `2692.49` vs `10196.77 us` (`3.79x`) | **`3.78x`**, `shared_dispatch = 0` | `0` dispatches on `.shared` layers |
+| `G25` | `hy4_index_pool` (`compress_ratio = 4` compressed indexer) | `2692.49` vs `10665.57 us` (`3.96x`) | **`4.15x`** | `compress_ratio = 4` radix top-k |
+| `G25` | `hy4_latent_moe` (LatentMoE vs standard width) | `831.57` vs `1373.73 us` (`1.65x`) | **`1.28x`**, `3.00x` smaller weights | `3.00x` smaller weight bytes |
+| `C26` | `sme2_ctrl` (`cpu_sme2`, `fits_l2 = true`, `3456.0 KiB`) | `119.85 us/branch`; `479.40 us/4b` (`M=1`); `1224.70 us/4b` (`M=8`) | `126.17 us/branch` | `gpu_dispatches = 0` |
+| `C26` | `engram_fp8` (`fp8_e4m3_row` NVMe `F_NOCACHE`) | `cold_us = 36.44`, `r0 = 64`, `r>=1 = 0` | `cold_us = 32.29`, `r>=1 = 0` | `parity_ok = true` |
+| `C26` | `cold_expert` (`F_NOCACHE` expert fetch) | `32` fetches, `284.66 us/expert`, `10.53 GB/s` | `487.08 us/expert`, `6.16 GB/s` | `0` hot-path allocs |
+
+#### `W23 + D14` synthetic end-to-end pipelines (`bench-m82`)
+
+| Pipeline | `verify-amf` & Greedy `T = 0` Parity | Initial `b38439c` (`decode` / `spec`) | Post-Alignment `0f5477f` Telemetry & Speedup |
+| --- | --- | --- | --- |
+| `inkling2_mini_dflare3` | `verify_amf_ok = true`, `16/16` exact | `48.70` / `17.27 tok/s`, `batch8_core3` `4.13x` (`58.45` vs `241.40 ms`), `sme2_ctrl_calls = 2376` | `16/16` exact, `tau = 1.500`, `batch8_core3` **`2.67x`** (`105.10` vs `280.52 ms`) |
+| `inkling2_small_dflare5` | `verify_amf_ok = true`, `16/16` exact | `126.68` / `58.85 tok/s` (`rounds = 15`) | `16/16` exact (`5L` `DFlare` + `384E`-style synthetic graph) |
+| `hy4_dfly2` | `verify_amf_ok = true`, `16/16` exact | `89.71` / `22.19 tok/s` (`tau = 1.154`, `index_shared_reuses = 132`, `early_stops = 7`) | `16/16` exact, `index_shared_reuses = 132`, early-stop **`1.45x`** |
+| `hy4_flash_engram_dfly2` | `verify_amf_ok = true`, `16/16` exact | `32.79` / `27.17 tok/s` (`engram_nvme_reads = 4`, `r >= 1 = 0`, early-stop `1.36x`) | `16/16` exact, `engram_nvme_reads = 4` (`r >= 1 = 0`), early-stop **`1.58x`** |
+
+### 5. Real-checkpoint `ReleaseFast` M4 execution (`/Volumes/AriDisk/models/amf/`)
+
+#### Real `yujiepan/hy4-preview-tiny-random`
+
+- **Staged source (`/Volumes/AriDisk/models/hy4-preview-tiny-random`)**: `10/10` files exact size (`29.77 MiB`, `model.safetensors` `21,805,284 B`, SHA256 verified).
+- **`aminfer verify-amf`**: `ok` (`823` tensors, `38,764,544 B` file, `29,229,056 B` wired, `9,404,416 B` metadata).
+- **End-to-end execution**:
+
+| Command (`ReleaseFast`, `-t 0`) | Wired RAM | Throughput | Key Telemetry | Parity & Swap |
+| --- | --- | --- | --- | --- |
+| `decode -n 16` (`b38439c`, Run 1 & Run 2 bit-identical) | `48 MiB` | `61.54 tok/s` (`16.249 ms/tok`) | `index_full_dispatches = 64`, `index_shared_reuses = 96` | `swapouts_delta = 0`; `token_ids = [51940, 103565, 18567, 28129, 91979, 51940, 16148, 16148, 16148, 16148, 16148, 16148, 5748, 20548, 2852, 26058]` |
+| `spec-decode --draft-mode dfly2 -n 16 -P` (`b38439c`) | `53 MiB` | `18.79 tok/s` | `rounds = 13`, `mean_accept_len = 1.154`, `index_shared_reuses = 84` | **`16/16` exact bit-for-bit token match**, `swapouts_delta = 0` |
+| `decode -n 12` (`0f5477f` post-alignment re-check) | `48 MiB` | `23.68 tok/s` | `index_full = 48`, `index_shared = 72` | `12/12` finite deterministic tokens, `swapouts_delta = 0` |
+
+#### Real `thinkingmachines/Inkling-2-Mini` (reference-aligned `0f5477f`, external USB 10Gbps `/Volumes/AriDisk`)
+
+- **Staged sources**: `/Volumes/AriDisk/models/Inkling-2-Mini` (`14/14` files, `20,191,643,866 B` = `18.805 GiB`, SHA256 verified matching official HF: `model-00001-of-00001.safetensors` `19,526,019,168 B`, `mtp.safetensors` `635,801,416 B`) and `/Volumes/AriDisk/models/Inkling-2-Mini-dspark-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf` (`503,889,952 B` = `480.55 MiB`, `general.architecture = dflash`, SHA256 verified).
+- **Converter P0 fix (`fb3be54`) & `verify-amf` x4 (`all ok`)**: fixed `_decode_scalar_f32_at` scalar `[1]` `outer_scale_denominator` broadcast and OOB scale-read rejection in `tools/src/aminfer_tools/amf.py`, confirming all `5,120 / 5,120` NVFP4 expert `outer_scale` values finite and positive in `[3.773407e-05, 3.169864e-04]`:
+  - `inkling-2-mini.amf`: `6,793` tensors, `19,003,031,552 B` file (`4,206,723,072 B` wired, `14,769,192,960 B` cold at `cold = 120/128`).
+  - `inkling-2-mini-vision.amf`: `423` tensors, `640,483,328 B`.
+  - `inkling-2-mini-dflare.amf`: `55` tensors, `636,174,336 B`.
+  - `inkling-2-mini-dflash-q8.amf`: `61` tensors, `501,628,928 B`.
+- **Official reference alignment (`0f5477f` vs `modeling_inkling2_loop.py`, `inkling2.cpp`, `inkling2-loop.cpp`, `dflash.cpp`, `dspark.cpp`)**:
+  - **Inkling 2 Loop forward pass**: empty initial `attn_res` stack + `1/sqrt(H)` scaling + 3-query `[Q,K,V]` on global layers `5, 11, 17, 23` + `l % 6 == 0` boundary push; Core pass restart from `prelude_cur` + normalized cross-pass message bank into `SME2` `stepMessageGate` (`tanh(forget)`, `tanh(gain)`, `0` GPU dispatches) before RMSNorm; post-attention/post-MLP `sconv4` (`1/sqrt(5)` residual scale) and reversed-lag dynamic `k_sconv`/`v_sconv` (`1/3` scale); `ScaledL2Clip` + global `LogScale(floor=8192, alpha=0.1)` + OOB-zeroed relative-position bias; sigmoid top-8 router (`bias_mode = 1`) + pair-interleaved `w13` `SoftcappedSwiGLU(4.0, 25.0)`.
+  - **`DFlare` / `DSpark` proposer (`dflare_dfly.zig` + `graph.zig` + `m82_runtime.zig`)**: row-wise `softmax` on `mtp.safetensors` `fuse_weight [4, 4]` (matching `dflash-Q8` `ctx_mix` to 4 decimals); exact noise-block seeding (`slot 0 = embed_norm(embed(root))`, `slots 1..7 = pure mask_embed`); incremental ring-buffered multi-token context KV cache + NeoX RoPE (`theta = 1e6`, context `0..N-1`, block `N..N+7`); `sample_from_anchor = false` (`slots 1..7`, exact `M = 8` tree); exact Markov RNN input order `[state (256), w1[prev] (256), hidden[pos] (2304), f_rnn (2304)]` and 3-chunk gate (`gate = sigmoid(c0)`, `cand = tanh(c1)`, `state = gate * state + (1 - gate) * cand`, `markov = tanh(c2)`); batched `base_logits = lm_head(hidden[1..7])` added to `dflash-Q8` `markov_w2` bias + padded vocab masking `>= 200058`.
+- **Wired RAM / cold-expert tiering note**: `retag_amf_cold_experts` verified `cold = 24/128` (`104/128 = 81.25%` hot -> `inspect.wired_weight_bytes = 15,279.84 MiB`, `estimated_total_wired = 15,489.84 MiB <= 18,186 MiB`, `m4_24gb = yes`). On the busy live desktop host (`wire.global_limit = 18,677 MiB`, OS/desktop holding `4.0–4.4 GiB` wired + `6.0–8.6 GiB` internal + `2.0–3.3 GiB` compressor), `cold = 24` hit kernel `WireLimitExceeded` and `cold = 48/80/104` triggered macOS `SwapOccurred`, so `/Volumes/AriDisk/models/amf/inkling-2-mini.amf` was retagged back to `cold = 120/128` (`4,842 MiB` wired, `m4_16gb = yes`) for strict `swapouts_delta = 0` on the desktop host (a clean 24 GiB M4 can retag in-place to `cold = 24` in `< 0.1 s` via `retag_amf_cold_experts`).
+- **Quality-gate & speculative parity verification (`ReleaseFast`, `-t 0`, `swapouts_delta = 0`)**:
+
+| Task / Command (`-t 0`) | Prompt | Measured Telemetry | Output / Parity Proof |
+| --- | --- | --- | --- |
+| **English `decode`** | `"The capital of France is"` | `swapouts_delta = 0` | `" Paris.\n\nA. Noun clause\n\nB. "` |
+| **English `chat --reasoning-effort none`** | `"Explain in two clear sentences why the sky is blue."` | `swapouts_delta = 0` | `"<|message_model|>The user asks for two clear sentences explaining why the sky is blue. Need answer concise. Need ensure accuracy: sunlight contains all wavelengths; air molecules scatter shorter blue wavelengths more strongly (Rayleigh scattering), so blue"` |
+| **Math `chat --reasoning-effort high`** | `"What is 17 * 23? Answer briefly."` | `swapouts_delta = 0` | `"<|message_model|>The user asks for 17 * 23. Compute: 17*20=340, 17*3=51, total 391. Need answer briefly. Ensure no extra."` |
+| **Python `decode -n 16`** | `"Write a Python function is_prime(n) that returns True if n is prime:\n\ndef is_prime(n):"` | `0.33 tok/s`, `sme2_ctrl_calls = 1632`, `malloc_blocks_delta = 0`, `swapouts_delta = 0` | `token_ids = [198, 149862, 172706, 72358, 151663, 150003, 149934, 149884, 152200, 11, 150506, 152486, 13, 70646, 198, 149862]` (`'\n    """Return True if n is prime, else False."""\n    '`) |
+| **Python `3L DFlare` (`inkling-2-mini-dflare.amf`, `-n 16`)** | Same `is_prime(n)` prompt | **`mean_accept_len = 3.750`** (`4` rounds, `dflare_core3_batches = 4`), `sme2_ctrl_calls = 576`, `0.29 tok/s`, `malloc_blocks_delta = 0`, `swapouts_delta = 0` | **`16/16` (`100%`) bit-exact `token_ids` match vs `decode`** |
+| **Python `DFlash-Q8` (`inkling-2-mini-dflash-q8.amf`, `-n 16`)** | Same `is_prime(n)` prompt | **`mean_accept_len = 3.750`** (`4` rounds, `dflare_core3_batches = 4`), `sme2_ctrl_calls = 576`, `0.28 tok/s`, `malloc_blocks_delta = 0`, `swapouts_delta = 0` | **`16/16` (`100%`) bit-exact `token_ids` match vs `decode`** |
+| **Python `3L DFlare` (`inkling-2-mini-dflare.amf`, `-n 64`)** | Same `is_prime(n)` prompt | **`mean_accept_len = 3.150`** (`20` rounds, `dflare_core3_batches = 19`), `0.24 tok/s`, `swapouts_delta = 0` | Coherent Python docstring + `assert is_prime(2) == True` / `assert is_prime(3) == True` / `assert is_prime(4) == False` / `assert is_prime(17)` |
+| **Vision sidecar (`decode --vision-sidecar inkling-2-mini-vision.amf -n 4 --cold-slots 64`)** | Smoke check (`b38439c`) | `wired_mib = 5,453`, `0.33 tok/s`, `malloc_blocks_delta = 0`, `swapouts_delta = 0` | `W20`/`G22` `23L` ViT sidecar mounted cleanly |
+
+Verbatim `n = 64` `3L DFlare` decoded Python output (`0f5477f`, `-t 0`, `mean_accept_len = 3.150`, `swapouts_delta = 0`):
+
+```python
+    """Return True if n is prime, else False."""
+    # Your code here
+    pass
+
+# Tests
+assert is_prime(2) == True
+assert is_prime(3) == True
+assert is_prime(4) == False
+assert is_prime(17)
+```
+
+
+
 
 
 

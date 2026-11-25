@@ -37,7 +37,7 @@ matching M1/M2 `.amf` packing).
 | **Tier 2** (M6) | **`Qwen3.8-Flash-Next`** (`qwen4_exp`) | 125B backbone (6B active/tok; `2.36B` routed/tok) + 51B PLE + 4B MTP | ~54.7 GiB `3.5b` / ~36.3 GiB `GSQ-RCO` + NVMe PLE | **128 GB+ Max / Ultra** (full backbone wired) · **24 GB M4** (`~11.2–11.6 GiB` hot experts wired + NVMe cold experts & PLE) |
 | **Tier 2B** (M8.2) | **`Inkling-2-Mini`** (`inkling2_loop`, 24L × 3 core passes = 48 eff. steps, 128E top-8) | ~26.4B params (`~5.7B` eff. active; `NVFP4`/`MXFP8` + `0.59 GiB` ViT + `0.59 GiB` `3L` DFlare) | `18.78 GiB` native (`17.60 GiB` excl. ViT); `10.9 GiB` (`UD-IQ3_XXS`) / `16.4 GiB` (`UD-Q4_K_XL`) | **24 GB M4 baseline** (`W20` ViT sidecar stripped + `~10%` cold-expert `F_NOCACHE` spill or `GSQ-RCO`/`UD-Q4`, `40/48` `1024`-token SWA ring unlocking `128K–256K` context, `SME2` `gate_rank=64` controllers + `3L` `DFlare`) |
 | **Tier 2C** (M8.2 & M9.1–M9.3) | **`MiMo-V2.6-Flash`** (`309B`, `mimo_v2`), **`GLM-5.3-Flash`** (`320B`, `glm5_next`), **`Inkling-2-Small`** (`~597B`, `inkling2`), **`Ling-3.1-flash-1019`** (`572B`, `bailing_hybrid`) | `309B–597B` total (`7.96B–24.51B` always-active; `8.46B–12.23B` routed/tok) | `GSQ-RCO`: `~92–94 GiB` (`MiMo`/`GLM` Flash), `~155–172 GiB` (`Inkling-Small`/`Ling-3.1`); native `155.8–533 GiB` | **`128 GB` Max** (`MiMo`/`GLM` Flash `GSQ-RCO` 100% wired; `Inkling-Small` hybrid) · **`256 GB` Studio** (`MiMo`/`GLM` native 4-bit, `Inkling-Small` & `Ling-3.1` `GSQ-RCO` 100% wired) · **`24 GB` M4 internal/TB NVMe** (`3.4–12.1 GiB` wired hot pool + `Q2`/`IQ1_S` cold NVMe + `DFlash`/`DFlare`/`MTP` + `D7`, [ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md)) |
-| **Tier 3** (M7) | **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`) | 552B CED MoE (8B prefill / 16B decode) + 196B Engram (~748B total) | ~241.5 GiB backbone + ~86 GiB Engram (>330 GiB on disk; ~7.0 GiB/tok decode reads) | **512 GB Ultra** (full backbone wired on 800 GB/s bus) · **Multi-Mac 128–256 GB Thunderbolt 5 RDMA cluster** (`thunderbolt_peer`); **not viable on 24 GB M4** (< 0.7 tok/s NVMe bound) |
+| **Tier 3** (M7 & M9.4 HF alignment) | **`DeepSeek-V4.1-Flash-1017`** (`deepseek41`) | 552B CED MoE (pre-release est. 8B/16B; actual published HF `hidden=5120`, `384E`, `top_k=6`, 20L Enc + 20L Dec -> `4.25B` Decoder routed/tok) + 196B Engram (~748B total) | ~241.5 GiB backbone + ~86 GiB Engram (>330 GiB on disk; actual HF `224.8 GiB` `q3_affine` est.) | **512 GB Ultra** (full backbone wired on 800 GB/s bus) · **Multi-Mac 128–256 GB Thunderbolt 5 RDMA cluster** (`thunderbolt_peer`) · **24 GB M4 internal/TB4 PCIe NVMe (`3.2–3.8 GB/s`)** becomes viable for cold-NVMe Decoder tiering (`~11.7–13.3 GiB` hot cache, `~2.5–3.0 tok/s` FP4 / `~6–9 tok/s` `Q2_K` + spec dedup) once `M9.4` (`W28`) real-HF alignment lands ([ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md)) |
 | **Tier 3B** (M8.2 & M9.1–M9.2 / HW-gated) | **`Hy4-flash`** (`220B`), **`Hy4` / `Hy4-preview`** (`770B`), **`GLM-5.2` / `GLM-5.3`** (`753B`, `glm_moe_dsa`), **`MiMo-V2.6-Pro`** (`1.02T`, `mimo_v2`) | `220B–1,024B` total (`Hy4-flash` `11.3B` active; `753B–1.02T` flagships `24.0B–28.6B` always-active & `20.8B–49B` active/tok) | `Hy4-flash` `76.3–267 GiB`; `GLM-5.2/5.3` `~280 GiB` `GSQ-RCO` (`432 GiB` `NVFP4`); `MiMo-Pro` `~350 GiB` `GSQ-RCO` (`515.9 GiB` `MXFP4`) | `Hy4-flash` on **`128–256 GB`**; **`GLM-5.2/5.3` (`753B`) & `MiMo-V2.6-Pro` (`1.02T`) `GSQ-RCO` 100% wired on a single `512 GB` Ultra** (native `FP8`/`MXFP4` & `Hy4` `4-bit` on **multi-Mac `TB5 RDMA` cluster**; `hy4-preview-tiny-random` on **24 GB M4**) |
 
 ### Optional GSQ-RCO footprint reduction across Tiers 1–3
@@ -229,14 +229,28 @@ operator axes without sacrificing runtime alignment or conversion fidelity:
   `LatentMoE`, sigmoid routing with correction bias, `linear_gate`,
   `learnable_sink_param`, `swiglu_limit = 10`, `sandwich_norm`, and `5L` `DFly2`
   block-parallel drafting (`D14`), parity-validated locally on
-  `yujiepan/hy4-preview-tiny-random` (`21 MB`).
+  `yujiepan/hy4-preview-tiny-random` (`29.77 MiB` source / `38.8 MiB` `.amf`)
+  alongside reference-aligned real `thinkingmachines/Inkling-2-Mini`
+  (`3L DFlare` & `dspark-Q8` GGUF `mean_accept_len = 3.150–3.750`, `100%`
+  bit-exact greedy parity, coherent English/math/Python output, `cold = 24/128`
+  `15,489.84 MiB` `m4_24gb = yes` verified and `cold = 120/128` `4,842 MiB`
+  desktop-headroom profile running at `0` swapouts) in
+  [../benchmarks/results.md](../benchmarks/results.md#m82--inkling-2--hy4-fused-operators-dflaredfly2-block-drafting-sme2-loop-controllers-and-real-m4-execution).
 
-## Staged `M9.1`–`M9.3` frontier deep-optimization roadmap (`ADR-0025`)
+## Staged `M9.1`–`M9.4` frontier deep-optimization and real-HF parity roadmap (`ADR-0025`, `ADR-0015`)
 
-Following `M8.2`, three sequential milestones ([ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md);
-capabilities `W25`–`W27`, `G26`–`G28`, `D15`, `C27` in [../status.md](../status.md);
-ordering in [../process.md](../process.md)) extend model-specific co-design
-across `MiMo-V2.6`, `GLM-5`, and `Ling-3.1` with zero primitive rework:
+Following `M8.2` and the HTTP/SSE serving milestone `M8.3` (`C28`,
+[../process.md](../process.md#milestones)), four sequential milestones
+([ADR-0025](../decisions/0025-staged-frontier-deep-optimization-inkling2-mimo-glm5-ling3.md),
+[ADR-0015](../decisions/0015-tiered-frontier-model-roadmap.md); capabilities
+`W25`–`W28`, `G26`–`G28`, `D15`, `C27` in [../status.md](../status.md)) extend
+model-specific co-design across `MiMo-V2.6`, `GLM-5`, `Ling-3.1`, and real-HF
+`Qwen3.8-Flash-Next` / `DeepSeek-V4.1-Flash-1017` checkpoints with zero
+primitive rework. Across all four stages (`M9.1`–`M9.4`), a mandatory
+safetensors JSON header pre-flight gate (`W28`) validates `config.json`,
+`model.safetensors.index.json`, and HTTP Range safetensors headers in
+`tools/tests/test_hf_metadata_validation.py` (`long_backbone_names == 0` plus
+exact tensor shapes and scale/broadcast ranks) before converter implementation:
 
 - **`M9.1` — `MiMo-V2.6` (`Flash` `309B`, `Pro` `1.02T`, `Distill-Qwen-9B` `9.4B`):**
   Exploits `40/48` (`Flash`) and `60/70` (`Pro`) `128`-token `HybridKvRing` SWA
@@ -263,3 +277,12 @@ across `MiMo-V2.6`, `GLM-5`, and `Ling-3.1` with zero primitive rework:
   on `256 GB` Studio), and introduces `C27` across all cold-NVMe MoEs: lossless
   session-local hot-expert working-set promotion in `WiredArena` plus opt-in
   `--cold-expert-min-weight <float>` (default `0.0` lossless) cold-tail skipping.
+- **`M9.4` — Real Hugging Face checkpoint schema & `24 GB` M4 cold-tier parity (`Qwen3.8-Flash-Next` & `DeepSeek-V4.1-Flash-1017`, `W28`):**
+  Aligns `qwen4_exp` (`< 47 B` name compaction eliminating all `300` long
+  `hyper_connection` names, full `hc_count = 4` mixer projections, dense PLE
+  conditioning vs `shard_{0..127}` external `SPARSE_TABLE` split, 3D stacked MoE /
+  QSA indexer / MTP keys) and `deepseek41` (`24gb-m4` encoder-cold/decoder-hot
+  wired budget + `--allow-tier-override`, `[32, 32]` `ue8m0` `fp8`+`fp4` scales
+  and `layers.N.{hc_*,attn.{wkv,wo_a,wo_b},ffn.*}` mapping, `graph.zig`
+  `wo_a`/`wo_b`/`compressor`/`sqrtsoftplus` + cold-tiered / `GSQ-RCO` `3L DSpark`)
+  with published Hugging Face shard headers.
