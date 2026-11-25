@@ -27,11 +27,21 @@ from aminfer_tools.amf import (
     pack_amf_from_safetensors,
 )
 from aminfer_tools.cli import main as cli_main
-from aminfer_tools.gguf import export_dflare_bundle_from_gguf, pack_amf_from_gguf
+from aminfer_tools.gguf import (
+    _GGML_TYPE_INFO,
+    _build_synthesized_config_bytes,
+    export_dflare_bundle_from_gguf,
+    normalize_gguf_tensor_name,
+    pack_amf_from_gguf,
+    read_gguf_header,
+)
 from aminfer_tools.gsq_rco import (
     _PROTECTED_HIGH_PRECISION_ROLES,
+    _imatrix_col_weights,
+    _imatrix_tensor_multipliers,
     _role_of_tensor,
     gsq_convert,
+    parse_gguf_imatrix,
 )
 from aminfer_tools.hy4 import (
     convert_hy4_checkpoint,
@@ -1147,6 +1157,483 @@ class TestGsqRcoV2AndRealMetadata(unittest.TestCase):
             self.assertTrue(any("experts." in m.name and ".down_proj." in m.name for m in entries))
             self.assertTrue(any("q_a_proj" in m.name or "kv_a_proj_with_mqa" in m.name or "kv_a_mqa" in m.name for m in entries))
             _verify_amf_with_zig(self, rep.backbone_amf, len(rep.backbone_metas))
+
+
+def _resolve_real_inkling2_gguf_dir() -> pathlib.Path | None:
+    models_env = os.environ.get("AMINFER_MODELS_DIR")
+    if models_env:
+        cand = pathlib.Path(models_env) / "Inkling-2-Mini-GGUF"
+        if cand.is_dir():
+            return cand
+    return None
+
+
+REAL_INKLING2_GGUF_DIR = _resolve_real_inkling2_gguf_dir()
+
+
+class TestM825Inkling2W29Tools(unittest.TestCase):
+    """Milestone M8.25 W29 tests: 48->24 imatrix folding, UD-IQ3_XXS lossless pack, and full-wired GSQ-RCO v2."""
+
+    def test_unrolled_48_to_24_imatrix_folding_and_layer_role_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            im_path = root / "unrolled_48.gguf"
+
+            tensors: list[tuple[str, tuple[int, ...], int, bytes]] = []
+            # 48 unrolled steps (`0..5` stem, `6..17` + `18..29` + `30..41` core passes, `42..47` coda).
+            # Include 760x depth growth between step 0 and step 47 to verify per-(layer, role) normalization.
+            for step in range(48):
+                depth_scale = 1.0 + (759.0 * step) / 47.0
+                phys = step if step < 6 else (6 + ((step - 6) % 12) if step < 42 else 18 + (step - 42))
+                pass_idx = 0 if (step < 6 or step >= 42) else ((step - 6) // 12)
+
+                # Attention Q (`256` cols) with non-uniform counts across core passes (`cnt = 10, 20, 30`).
+                c_q = 10.0 * (pass_idx + 1)
+                q_vals = [depth_scale * (1.0 + 0.01 * i) * c_q for i in range(256)]
+                tensors.append((f"blk.{step}.attn_q.weight.in_sum2", (256,), 0, struct.pack("<256f", *q_vals)))
+                tensors.append((f"blk.{step}.attn_q.weight.counts", (1,), 0, struct.pack("<f", c_q)))
+
+                # Attention O (`256` cols) same layer-role bucket `"attn"` with 4x lower variance so q != o.
+                o_vals = [0.25 * depth_scale * c_q for _ in range(256)]
+                tensors.append((f"blk.{step}.attn_output.weight.in_sum2", (256,), 0, struct.pack("<256f", *o_vals)))
+                tensors.append((f"blk.{step}.attn_output.weight.counts", (1,), 0, struct.pack("<f", c_q)))
+
+                # Loop controller (`loop_q_ctrl_down`) marks this GGUF as unrolled loop for auto-detection.
+                ctrl_vals = [depth_scale * 2.0 * c_q for _ in range(512)]
+                tensors.append((f"blk.{step}.loop_q_ctrl_down.weight.in_sum2", (512,), 0, struct.pack("<512f", *ctrl_vals)))
+                tensors.append((f"blk.{step}.loop_q_ctrl_down.weight.counts", (1,), 0, struct.pack("<f", c_q)))
+
+                # Stacked MoE `ffn_gate_up_exps` (2 experts x 256 cols) + `ffn_down_exps` (2 experts x 128 cols).
+                e_cnt = 10.0 * (pass_idx + 1)
+                gup_vals = [((e + 1) * (1.0 + 0.05 * phys) * depth_scale) * e_cnt for e in range(2) for _ in range(256)]
+                tensors.append((f"blk.{step}.ffn_gate_up_exps.weight.in_sum2", (256, 2), 0, struct.pack("<512f", *gup_vals)))
+                tensors.append((f"blk.{step}.ffn_gate_up_exps.weight.counts", (2,), 0, struct.pack("<2f", e_cnt, e_cnt)))
+                dn_vals = [((e + 1) * 0.5 * depth_scale) * e_cnt for e in range(2) for _ in range(128)]
+                tensors.append((f"blk.{step}.ffn_down_exps.weight.in_sum2", (128, 2), 0, struct.pack("<256f", *dn_vals)))
+                tensors.append((f"blk.{step}.ffn_down_exps.weight.counts", (2,), 0, struct.pack("<2f", e_cnt, e_cnt)))
+
+            _write_gguf_file(im_path, version=3, kv=[], tensors=tensors)
+
+            folded = parse_gguf_imatrix(im_path, loop_schedule=(6, 18, 3))
+            auto_folded = parse_gguf_imatrix(im_path)
+            self.assertEqual(folded.keys(), auto_folded.keys())
+            self.assertEqual(len(folded), 24 * 5)
+            # No layers >= 24 survive folding.
+            self.assertFalse(any(f"layers.{l}." in k for l in range(24, 48) for k in folded))
+            # Core layer 6 pools passes blk.6 (cnt=10), blk.18 (cnt=20), blk.30 (cnt=30) with sample-count weighting.
+            exp_mean = (
+                (1.0 + 759.0 * 6 / 47.0) * 10.0
+                + (1.0 + 759.0 * 18 / 47.0) * 20.0
+                + (1.0 + 759.0 * 30 / 47.0) * 30.0
+            ) / 60.0
+            self.assertAlmostEqual(folded["layers.6.self_attn.q_proj.weight"][0], exp_mean, places=3)
+            # Coda blk.47 remaps cleanly onto physical layer 23.
+            self.assertAlmostEqual(folded["layers.23.self_attn.q_proj.weight"][0], 760.0, places=3)
+
+            # Channel-weight lookup maps `w13` (`256` cols), `down_proj` (`128` cols), `wq_du`, `controllers`.
+            w13_vec = _imatrix_col_weights(folded, "layers.6.mlp.experts.1.w13.weight", 256, layer=6, expert=1)
+            dn_vec = _imatrix_col_weights(folded, "layers.6.mlp.experts.0.down_proj.weight", 128, layer=6, expert=0)
+            wq_vec = _imatrix_col_weights(folded, "layers.6.attn.wq_du.weight", 256)
+            ctrl_vec = _imatrix_col_weights(folded, "layers.6.controllers.attn.down_weight", 512)
+            self.assertIsNotNone(w13_vec)
+            self.assertEqual(len(w13_vec or []), 256)
+            self.assertIsNotNone(dn_vec)
+            self.assertEqual(len(dn_vec or []), 128)
+            self.assertIsNotNone(wq_vec)
+            self.assertIsNotNone(ctrl_vec)
+
+            # Global median normalization clips L0 `attn_q` down to 0.5 under 760x depth growth;
+            # default `layer_role` normalization preserves intra-layer discrimination without clipping L0!
+            mults_global = _imatrix_tensor_multipliers(folded, normalize_by="global")
+            mults_lr = _imatrix_tensor_multipliers(folded, normalize_by="layer_role")
+            self.assertEqual(mults_global["layers.0.self_attn.q_proj.weight"], 0.5)
+            self.assertGreater(mults_lr["layers.0.self_attn.q_proj.weight"], 1.0)
+            self.assertGreater(
+                mults_lr["layers.0.self_attn.q_proj.weight"],
+                mults_lr["layers.0.self_attn.o_proj.weight"],
+            )
+
+            # Non-loop 48-layer GGUF (no loop markers, no loop_schedule) must NOT collapse layers 18..41.
+            non_loop_path = root / "non_loop_48.gguf"
+            non_loop_tensors = [t for t in tensors if "loop_q_ctrl" not in t[0]]
+            _write_gguf_file(non_loop_path, version=3, kv=[], tensors=non_loop_tensors)
+            parsed_48 = parse_gguf_imatrix(non_loop_path)
+            self.assertTrue(any("layers.47." in k for k in parsed_48))
+
+    def test_synthetic_48_block_inkling2_loop_gguf_lossless_w13_interleave_and_scales(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            gguf_path = root / "synth_inkling2_48.gguf"
+            out_amf = root / "out" / "inkling2_gguf.amf"
+            out_cfg = root / "out" / "config.json"
+
+            # Shapes valid across block sizes (`H=256` -> 1 IQ3_XXS block / 4 NVFP4 blocks; `inter=128` -> 2 NVFP4 blocks).
+            h_dim, inter_dim, num_exp = 256, 128, 2
+            vocab = 64
+
+            def _iq3_xxs_rows(n_rows: int, n_cols: int, d_val: float, tag: int) -> bytes:
+                nb = n_cols // 256
+                out = bytearray()
+                for r in range(n_rows):
+                    for b in range(nb):
+                        out.extend(struct.pack("<e", d_val))
+                        # Embed deterministic row tag so pair_interleave order is bit-verifiable after repack.
+                        out.extend(bytes([(tag + r + b + j) & 0xFF for j in range(96)]))
+                return bytes(out)
+
+            def _nvfp4_rows(n_rows: int, n_cols: int, tag: int) -> bytes:
+                nb = n_cols // 64
+                out = bytearray()
+                for r in range(n_rows):
+                    for b in range(nb):
+                        out.extend(bytes([0x38, 0x38, 0x38, 0x38]))
+                        out.extend(bytes([(tag + r + b + j) & 0xFF for j in range(32)]))
+                return bytes(out)
+
+            kv = [
+                ("general.architecture", 8, "inkling2_loop"),
+                ("general.name", 8, "Synth-Inkling2-48"),
+                ("inkling2_loop.block_count", 4, 48),
+                ("inkling2_loop.embedding_length", 4, h_dim),
+                ("inkling2_loop.feed_forward_length", 4, inter_dim),
+                ("inkling2_loop.attention.head_count", 9, (4, [4] * 24)),
+                ("inkling2_loop.attention.head_count_kv", 9, (4, [2] * 24)),
+                ("inkling2_loop.attention.key_length", 4, 64),
+                ("inkling2_loop.attention.layer_norm_rms_epsilon", 6, 1e-6),
+                ("inkling2_loop.attention.sliding_window", 4, 128),
+                ("inkling2_loop.attention.sliding_window_pattern", 9, (4, [1, 1, 1, 1, 1, 0] * 4)),
+                ("inkling2_loop.context_length", 4, 2048),
+                ("inkling2_loop.expert_count", 4, num_exp),
+                ("inkling2_loop.expert_used_count", 4, 1),
+                ("inkling2_loop.expert_weights_scale", 6, 8.0),
+                ("inkling2_loop.vocab_size", 4, vocab),
+                ("inkling2_loop.vocab_size_unpadded", 4, 60),
+                ("inkling2_loop.loop.start", 4, 6),
+                ("inkling2_loop.loop.end", 4, 18),
+                ("inkling2_loop.loop.count", 4, 3),
+                ("inkling2_loop.loop.gate_rank", 4, 64),
+            ]
+
+            tensors: list[tuple[str, tuple[int, ...], int, bytes]] = [
+                ("token_embd.weight", (h_dim, vocab), 12, bytes(vocab * (h_dim // 256) * 144)),  # Q4_K
+                ("token_embd_norm.weight", (h_dim,), 0, struct.pack(f"<{h_dim}f", *([1.0] * h_dim))),
+                ("output_norm.weight", (h_dim,), 0, struct.pack(f"<{h_dim}f", *([1.0] * h_dim))),
+                ("output.weight", (h_dim, vocab), 13, bytes(vocab * (h_dim // 256) * 176)),  # Q5_K
+                ("output_res_query.weight", (h_dim,), 0, struct.pack(f"<{h_dim}f", *([0.2] * h_dim))),
+            ]
+
+            def _make_layer_tensors(step: int, phys: int, pass_idx: int) -> list[tuple[str, tuple[int, ...], int, bytes]]:
+                items: list[tuple[str, tuple[int, ...], int, bytes]] = []
+                # F32 norms + router + controllers (must convert to BF16/SME2_PANEL64; exp_probs_b.bias stays F32).
+                items.append((f"blk.{step}.attn_norm.weight", (h_dim,), 0, struct.pack(f"<{h_dim}f", *([1.0] * h_dim))))
+                items.append((f"blk.{step}.ffn_norm.weight", (h_dim,), 0, struct.pack(f"<{h_dim}f", *([1.0] * h_dim))))
+                items.append((f"blk.{step}.attn_q.weight", (h_dim, h_dim), 8, bytes(h_dim * (h_dim // 32) * 34)))  # Q8_0
+                items.append((f"blk.{step}.attn_k.weight", (h_dim, 128), 8, bytes(128 * (h_dim // 32) * 34)))
+                items.append((f"blk.{step}.attn_v.weight", (h_dim, 128), 8, bytes(128 * (h_dim // 32) * 34)))
+                items.append((f"blk.{step}.attn_output.weight", (h_dim, h_dim), 8, bytes(h_dim * (h_dim // 32) * 34)))
+                items.append((f"blk.{step}.attn_k_conv.weight", (4, 128), 0, struct.pack(f"<{128 * 4}f", *([0.5] * 512))))
+                items.append((f"blk.{step}.ffn_gate_inp.weight", (h_dim, num_exp), 0, struct.pack(f"<{num_exp * h_dim}f", *([0.1] * (num_exp * h_dim)))))
+                items.append((f"blk.{step}.exp_probs_b.bias", (num_exp,), 0, struct.pack(f"<{num_exp}f", 0.25, -0.25)))
+                items.append((f"blk.{step}.loop_q_ctrl_down.weight", (2 * h_dim, 64), 0, struct.pack(f"<{64 * 2 * h_dim}f", *([0.05] * (64 * 2 * h_dim)))))
+                items.append((f"blk.{step}.ffn_res_query.weight", (h_dim,), 0, struct.pack(f"<{h_dim}f", *([0.3] * h_dim))))
+                if step >= 1:
+                    # Boundary layer 11 unrolls at steps 11, 23, 35 with per-pass distinct values -> stacked `(3, H)`.
+                    val_r = 0.4 + 0.1 * pass_idx
+                    items.append((f"blk.{step}.attn_res_query.weight", (h_dim,), 0, struct.pack(f"<{h_dim}f", *([val_r] * h_dim))))
+                if 6 <= step < 18:
+                    rows = [float((step - 6) * 10 + r) for r in range(4) for _ in range(h_dim)]
+                    items.append((f"blk.{step}.loop_msg_query.weight", (h_dim, 4), 0, struct.pack(f"<{4 * h_dim}f", *rows)))
+
+                # Test BOTH fused `ffn_gate_up_exps` (even layers) AND split `ffn_gate_exps`+`ffn_up_exps` (odd layers).
+                if phys % 2 == 0:
+                    gup_bytes = b"".join(_iq3_xxs_rows(2 * inter_dim, h_dim, 2.0, tag=(phys * 3 + e * 17)) for e in range(num_exp))
+                    items.append((f"blk.{step}.ffn_gate_up_exps.weight", (h_dim, 2 * inter_dim, num_exp), 18, gup_bytes))
+                    items.append((f"blk.{step}.ffn_gate_up_exps.scale", (num_exp,), 0, struct.pack("<2f", 0.25, 0.5)))
+                else:
+                    gate_b = b"".join(_iq3_xxs_rows(inter_dim, h_dim, 4.0, tag=(phys * 3 + 10 + e)) for e in range(num_exp))
+                    up_b = b"".join(_iq3_xxs_rows(inter_dim, h_dim, 4.0, tag=(phys * 3 + 90 + e)) for e in range(num_exp))
+                    items.append((f"blk.{step}.ffn_gate_exps.weight", (h_dim, inter_dim, num_exp), 18, gate_b))
+                    items.append((f"blk.{step}.ffn_up_exps.weight", (h_dim, inter_dim, num_exp), 18, up_b))
+                    items.append((f"blk.{step}.ffn_gate_exps.scale", (num_exp,), 0, struct.pack("<2f", 0.5, 0.25)))
+                    items.append((f"blk.{step}.ffn_up_exps.scale", (num_exp,), 0, struct.pack("<2f", 0.25, 0.5)))
+
+                dn_b = b"".join(_nvfp4_rows(h_dim, inter_dim, tag=30 + e) for e in range(num_exp))
+                items.append((f"blk.{step}.ffn_down_exps.weight", (inter_dim, h_dim, num_exp), 40, dn_b))
+                items.append((f"blk.{step}.ffn_down_exps.scale", (num_exp,), 0, struct.pack("<2f", 0.125, 0.375)))
+                return items
+
+            for step in range(48):
+                phys = step if step < 6 else (6 + ((step - 6) % 12) if step < 42 else 18 + (step - 42))
+                pass_idx = 0 if (step < 6 or step >= 42) else ((step - 6) // 12)
+                tensors.extend(_make_layer_tensors(step, phys, pass_idx))
+
+            _write_gguf_file(gguf_path, version=3, kv=kv, tensors=tensors)
+
+            rep = convert_inkling2_checkpoint(
+                gguf_path,
+                out_amf,
+                model_id="synth-ink2-gguf",
+                target_tier="24gb-m4-full-wired",
+                config_output=out_cfg,
+                strip_vision=True,
+            )
+            self.assertEqual(rep.cold_expert_count, 0)
+            self.assertGreater(rep.sme2_controller_count, 0)
+
+            with AmfReader(out_amf) as r:
+                by_name = {m.name: m for m in r.entries}
+                self.assertIn("layers.0.attn.wq_du.weight", by_name)
+                self.assertIn("layers.23.attn.wq_du.weight", by_name)
+                self.assertFalse(any(k.startswith("layers.24.") for k in by_name))
+                self.assertEqual(by_name["embed_norm.weight"].dtype, DType.BF16)
+                self.assertEqual(by_name["norm.weight"].dtype, DType.BF16)
+                self.assertEqual(by_name["layers.0.attn_norm.weight"].dtype, DType.BF16)
+                self.assertEqual(by_name["layers.0.mlp.gate.weight"].dtype, DType.BF16)
+                self.assertEqual(by_name["layers.0.mlp.gate.bias"].dtype, DType.F32)
+                self.assertEqual(by_name["layers.0.controllers.attn.down_weight"].dtype, DType.BF16)
+                self.assertEqual(by_name["layers.0.controllers.attn.down_weight"].layout, TensorLayout.SME2_PANEL64)
+                # Loop message queries assembled into `[24, H]` top-level tensors (`rows 0,3` vs `rows 1,2`).
+                self.assertEqual(by_name["middle_cycle_cross_pass_queries"].shape, (24, h_dim))
+                self.assertEqual(by_name["middle_cycle_cross_pass_kv_queries"].shape, (24, h_dim))
+                cpq_r01 = r.read_rows_f32(by_name["middle_cycle_cross_pass_queries"], [0, 1])
+                cpkv_r01 = r.read_rows_f32(by_name["middle_cycle_cross_pass_kv_queries"], [0, 1])
+                self.assertAlmostEqual(cpq_r01[0][0], 0.0)
+                self.assertAlmostEqual(cpq_r01[1][0], 3.0)
+                self.assertAlmostEqual(cpkv_r01[0][0], 1.0)
+                self.assertAlmostEqual(cpkv_r01[1][0], 2.0)
+
+                # Unrolled core layer 11 had 3 differing `attn_res_query` passes -> stacked `(3, H)`.
+                ar10 = by_name["attn_res.attn_queries.10"]
+                self.assertEqual(ar10.shape, (3, h_dim))
+                ar10_rows = r.read_rows_f32(ar10, [0, 1, 2])
+                self.assertAlmostEqual(ar10_rows[0][0], 0.4, places=5)
+                self.assertAlmostEqual(ar10_rows[1][0], 0.5, places=5)
+                self.assertAlmostEqual(ar10_rows[2][0], 0.6, places=5)
+
+                # Check pair_interleaved order + `.scale` scaling on both fused (L0) and split (L1) w13,
+                # plus NVFP4 outer_scale on down_proj.
+                with out_amf.open("rb") as fh:
+                    # Layer 0 expert 0 w13 (`d_val=2.0 * 0.25 = 0.5`, tag=0: row 0 = gate[0], row 1 = up[0] = raw row 128).
+                    e0_w13 = by_name["layers.0.mlp.experts.0.w13.weight"]
+                    self.assertEqual(e0_w13.dtype, DType.GGUF_IQ3_XXS)
+                    fh.seek(e0_w13.blob_offset)
+                    raw_w13 = fh.read(2 * 98)
+                    d_g0 = struct.unpack("<e", raw_w13[0:2])[0]
+                    d_u0 = struct.unpack("<e", raw_w13[98:100])[0]
+                    self.assertAlmostEqual(d_g0, 0.5, places=4)
+                    self.assertAlmostEqual(d_u0, 0.5, places=4)
+                    self.assertEqual(raw_w13[2], 0)
+                    self.assertEqual(raw_w13[100], 128)  # original row 128 moved to pair row 1!
+
+                    # Layer 1 expert 1 split gate/up w13 (`gate d=4.0*0.25=1.0`, `up d=4.0*0.5=2.0`, phys=1 -> tag+3).
+                    e1_w13 = by_name["layers.1.mlp.experts.1.w13.weight"]
+                    fh.seek(e1_w13.blob_offset)
+                    raw_l1 = fh.read(2 * 98)
+                    self.assertAlmostEqual(struct.unpack("<e", raw_l1[0:2])[0], 1.0, places=4)
+                    self.assertAlmostEqual(struct.unpack("<e", raw_l1[98:100])[0], 2.0, places=4)
+                    self.assertEqual(raw_l1[2], 14)
+                    self.assertEqual(raw_l1[100], 94)
+
+                    # Layer 0 expert 1 NVFP4 down_proj `outer_scale == 0.375`.
+                    e1_dn = by_name["layers.0.mlp.experts.1.down_proj.weight"]
+                    self.assertEqual(e1_dn.dtype, DType.NVFP4_G16)
+                    fh.seek(e1_dn.blob_offset + e1_dn.params_offset + e1_dn.params_bytes - 4)
+                    self.assertAlmostEqual(struct.unpack("<f", fh.read(4))[0], 0.375, places=6)
+
+            cfg_out_obj = json.loads(out_cfg.read_text(encoding="utf-8"))
+            self.assertEqual(cfg_out_obj["model_type"], "inkling2_loop")
+            self.assertEqual(cfg_out_obj["num_hidden_layers"], 24)
+            self.assertEqual(cfg_out_obj["num_attention_heads"], 4)
+            self.assertEqual(cfg_out_obj["vocab_size"], vocab)
+            self.assertEqual(cfg_out_obj["unpadded_vocab_size"], 60)
+            self.assertEqual(cfg_out_obj["operator_axes"]["loop_controllers"], "sme2_panel64")
+            self.assertEqual(cfg_out_obj["loop_schedule"]["effective_num_steps"], 48)
+            _verify_amf_with_zig(self, out_amf, len(rep.backbone_metas))
+
+    def test_nvfp4_mxfp8_amf_and_safetensors_gsq_rco_full_wired_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            src_dir = root / "hf_mix_ink2"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            h_dim, inter_dim, num_exp = 64, 128, 4
+            cfg = {
+                "architectures": ["Inkling2LoopForConditionalGeneration"],
+                "model_type": "inkling2_loop",
+                "text_config": {
+                    "model_type": "inkling2_loop_text",
+                    "hidden_size": h_dim,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 64,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "head_dim": 32,
+                    "intermediate_size": inter_dim,
+                    "n_routed_experts": num_exp,
+                    "num_experts_per_tok": 2,
+                    "local_layer_ids": [0, 1],
+                    "loop_config": {"core_start": 0, "core_end": 2, "num_passes": 2, "gate_rank": 16, "is_varloop": False},
+                },
+            }
+            (src_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+            # Include L0 NVFP4_G16 experts, L1 MXFP8_G32 experts, BF16 attention/controllers/norms, + ViT.
+            n_w13 = 2 * inter_dim
+            tensors: dict[str, tuple[str, list[int], bytes]] = {
+                "model.llm.embed_tokens.weight": ("BF16", [64, h_dim], _f32_to_bf16_bytes(_make_f32_vals(1, 64 * h_dim))),
+                "model.llm.norm.weight": ("BF16", [h_dim], _f32_to_bf16_bytes(_make_f32_vals(2, h_dim, centered_one=True))),
+                "lm_head.weight": ("BF16", [64, h_dim], _f32_to_bf16_bytes(_make_f32_vals(3, 64 * h_dim))),
+                "model.llm.layers.0.attn_norm.weight": ("BF16", [h_dim], _f32_to_bf16_bytes(_make_f32_vals(4, h_dim, centered_one=True))),
+                "model.llm.layers.0.attn.wq_du.weight": ("BF16", [h_dim, h_dim], _f32_to_bf16_bytes(_make_f32_vals(5, h_dim * h_dim))),
+                "model.llm.layers.0.attn.wo_ud.weight": ("BF16", [h_dim, h_dim], _f32_to_bf16_bytes(_make_f32_vals(6, h_dim * h_dim))),
+                "model.llm.layers.0.controllers.attn.down_weight": ("BF16", [16, 2 * h_dim], _f32_to_bf16_bytes(_make_f32_vals(7, 16 * 2 * h_dim))),
+                "model.llm.layers.0.controllers.attn.forget_weight": ("BF16", [h_dim, 16], _f32_to_bf16_bytes(_make_f32_vals(8, h_dim * 16))),
+                "model.llm.layers.0.controllers.attn.gain_weight": ("BF16", [h_dim, 16], _f32_to_bf16_bytes(_make_f32_vals(9, h_dim * 16))),
+                "model.llm.layers.0.mlp.gate.weight": ("BF16", [num_exp, h_dim], _f32_to_bf16_bytes(_make_f32_vals(10, num_exp * h_dim))),
+                "model.llm.layers.0.mlp.experts.w13_weight": ("U8", [num_exp, n_w13, h_dim // 2], bytes((i * 19 + 5) & 0xFF for i in range(num_exp * n_w13 * (h_dim // 2)))),
+                "model.llm.layers.0.mlp.experts.w13_weight_scale": ("F8_E4M3", [num_exp, n_w13, h_dim // 16], bytes([0x38] * (num_exp * n_w13 * (h_dim // 16)))),
+                "model.llm.layers.0.mlp.experts.w13_weight_amax": ("F32", [num_exp], struct.pack("<4f", 0.4, 0.5, 0.6, 0.3)),
+                "model.llm.layers.0.mlp.experts.w13_weight_outer_scale_denominator": ("F32", [1], struct.pack("<f", 1.0)),
+                "model.llm.layers.1.attn_norm.weight": ("BF16", [h_dim], _f32_to_bf16_bytes(_make_f32_vals(11, h_dim, centered_one=True))),
+                "model.llm.layers.1.attn.wq_du.weight": ("BF16", [h_dim, h_dim], _f32_to_bf16_bytes(_make_f32_vals(12, h_dim * h_dim))),
+                "model.llm.layers.1.mlp.gate.weight": ("BF16", [num_exp, h_dim], _f32_to_bf16_bytes(_make_f32_vals(13, num_exp * h_dim))),
+                "model.llm.layers.1.mlp.experts.w13_weight": ("F8_E4M3", [num_exp, n_w13, h_dim], bytes([0x38, 0xB8] * (num_exp * n_w13 * h_dim // 2))),
+                "model.llm.layers.1.mlp.experts.w13_weight_scale": ("U8", [num_exp, n_w13, h_dim // 32], bytes([127] * (num_exp * n_w13 * (h_dim // 32)))),
+                "model.visual.backbone.layers.0.attn.qkv.weight": ("BF16", [192, 64], _f32_to_bf16_bytes(_make_f32_vals(14, 192 * 64))),
+            }
+            _write_safetensors(src_dir / "model.safetensors", tensors)
+
+            heat_p = root / "heat.json"
+            heat_p.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "num_layers": 2,
+                        "num_experts": num_exp,
+                        "top_k": 2,
+                        "cold_experts_per_layer": 2,  # Deliberately 2 to prove full-wired keeps cold == 0!
+                        "layers": [
+                            {
+                                "layer": l_i,
+                                "ranked_hot_to_cold": [0, 1, 2, 3],
+                                "cold_experts": [2, 3],
+                                "activation_probs": [0.45, 0.35, 0.12, 0.08],
+                            }
+                            for l_i in range(2)
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            im_p = root / "imatrix.json"
+            im_p.write_text(
+                json.dumps(
+                    {
+                        "layers.0.attn.wq_du": [1.0] * h_dim,
+                        "layers.0.ffn_gate_up_exps": [2.0] * (num_exp * h_dim),
+                        "layers.1.ffn_gate_up_exps": [4.0] * (num_exp * h_dim),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            out_amf = root / "out_gsq" / "model.amf"
+            vis_amf = root / "out_gsq" / "vision.amf"
+            cfg_out = root / "out_gsq" / "config.json"
+            manifest_out = root / "out_gsq" / "manifest.json"
+            rep = convert_inkling2_checkpoint(
+                src_dir,
+                out_amf,
+                model_id="ink2-full-wired",
+                quant_profile="gsq-rco",
+                target_tier="24gb-m4-full-wired",
+                target_bits=3.70,
+                heat_profile=heat_p,
+                imatrix_path=im_p,
+                vision_sidecar=vis_amf,
+                config_output=cfg_out,
+                manifest_path=manifest_out,
+            )
+            self.assertEqual(rep.cold_expert_count, 0)
+            self.assertGreater(rep.sme2_controller_count, 0)
+            self.assertTrue(vis_amf.is_file() and cfg_out.is_file() and manifest_out.is_file())
+            with AmfReader(out_amf) as r:
+                by_name = {m.name: m for m in r.entries}
+                self.assertFalse(any(is_vision_tensor(n) for n in by_name))
+                # Controllers keep uniform precision per layer and SME2_PANEL64 layout.
+                ctrl_dts = {
+                    by_name[n].dtype
+                    for n in (
+                        "layers.0.controllers.attn.down_weight",
+                        "layers.0.controllers.attn.forget_weight",
+                        "layers.0.controllers.attn.gain_weight",
+                    )
+                }
+                self.assertEqual(len(ctrl_dts), 1)
+                self.assertIn(next(iter(ctrl_dts)), (DType.BF16, DType.F16, DType.Q4_AFFINE))
+                self.assertEqual(by_name["layers.0.controllers.attn.down_weight"].layout, TensorLayout.SME2_PANEL64)
+                # Verify per-layer unique scheme count <= 5 (`--fine-rungs` cap).
+                for l_i in (0, 1):
+                    schemes = {
+                        (m.dtype, m.group_size)
+                        for m in r.entries
+                        if m.layer == l_i and m.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT)
+                    }
+                    self.assertLessEqual(len(schemes), 5)
+
+            _verify_amf_with_zig(self, out_amf, len(rep.backbone_metas))
+
+            # Also verify `.amf` (`NVFP4_G16` + `MXFP8_G32`) -> `gsq_convert(..., target_wired_gib=...)` round-trip!
+            uniform_amf = root / "uniform.amf"
+            convert_inkling2_checkpoint(src_dir, uniform_amf, quant_profile="uniform", strip_vision=True)
+            tight_amf = root / "tight.amf"
+            gsq_rep = gsq_convert(
+                uniform_amf,
+                tight_amf,
+                target_wired_gib=0.002,
+                heat_profile=heat_p,
+                cold_experts_per_layer=0,
+                imatrix_path=im_p,
+                fine_rungs=True,
+                sme2_pack="controllers",
+            )
+            self.assertLessEqual(tight_amf.stat().st_size, int(0.002 * (1024**3)))
+            _verify_amf_with_zig(self, tight_amf, len(gsq_rep.metas))
+
+    @unittest.skipUnless(
+        REAL_INKLING2_GGUF_DIR is not None and (REAL_INKLING2_GGUF_DIR / "imatrix_unsloth.gguf_file").is_file(),
+        "staged Inkling-2-Mini-GGUF absent (set AMINFER_MODELS_DIR)",
+    )
+    def test_real_inkling2_gguf_header_and_imatrix_normalization(self) -> None:
+        assert REAL_INKLING2_GGUF_DIR is not None
+        im_path = REAL_INKLING2_GGUF_DIR / "imatrix_unsloth.gguf_file"
+        im = parse_gguf_imatrix(im_path)
+        self.assertEqual(len(im), 392)
+        self.assertFalse(any(f"layers.{l}." in k for l in range(24, 48) for k in im))
+        mults = _imatrix_tensor_multipliers(im)
+        # Depth growth must NOT clip shallow L0 attention projections down to global 0.5 floor.
+        self.assertAlmostEqual(mults["layers.0.self_attn.q_proj.weight"], 1.0, places=5)
+        self.assertAlmostEqual(mults["layers.23.self_attn.q_proj.weight"], 1.0, places=5)
+
+        gguf_path = REAL_INKLING2_GGUF_DIR / "Inkling-2-Mini-UD-IQ3_XXS.gguf"
+        if gguf_path.is_file():
+            sh = read_gguf_header(gguf_path)
+            cfg = json.loads(_build_synthesized_config_bytes(sh.kv, physical_layers=24, dedup_layers=0).decode("utf-8"))
+            self.assertEqual(cfg["model_type"], "inkling2_loop")
+            self.assertEqual(cfg["num_hidden_layers"], 24)
+            self.assertEqual(cfg["num_attention_heads"], 24)
+            self.assertEqual(cfg["num_key_value_heads"], 8)
+            self.assertEqual(cfg["vocab_size"], 201024)
+            self.assertEqual(cfg["unpadded_vocab_size"], 200058)
+            self.assertEqual(len(cfg["local_layer_ids"]), 20)
+            for t in sh.tensors:
+                if ".scale" in t.name or "_exps" in t.name or "loop_msg_query" in t.name:
+                    continue
+                norm = normalize_gguf_tensor_name(
+                    t.name,
+                    inkling2_runtime_names=True,
+                    attn_res_shifted_by_1=True,
+                )
+                self.assertLessEqual(len(norm.encode("utf-8")), 47, msg=f"name >47B: {norm}")
 
 
 if __name__ == "__main__":

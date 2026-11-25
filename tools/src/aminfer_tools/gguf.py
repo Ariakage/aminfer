@@ -55,8 +55,11 @@ from aminfer_tools.amf import (
     bf16_bytes_to_f32_list,
     f16_bytes_to_bf16_bytes,
     f16_bytes_to_f32_list,
+    f32_to_bf16_bytes,
+    f32_to_f16_bytes,
     is_inkling2_controller_tensor,
     is_vision_tensor,
+    load_cold_experts_from_heat_profile,
     pack_sme2_panel64_f16_panel,
     pack_vision_tower_amf,
     quantize_row_f32_to_e4m3_row,
@@ -1091,10 +1094,41 @@ def dequantize_gguf_amf_row_f32(dtype: DType, row_bytes: bytes | bytearray | mem
 _GGUF_BLK_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
 _GGUF_VISION_BLK_RE = re.compile(r"^v\.blk\.(\d+)\.(.+)$")
 _GGUF_EXP_RE = re.compile(r"^(ffn_gate_up|ffn_gate|ffn_up|ffn_down)\.(\d+)\.(weight|bias)$")
+_GGUF_INKLING2_CTRL_RE = re.compile(
+    r"^loop_(?:(q|k|v|ffn)_ctrl_(down|forget|gain)|(attn|k|v|mlp)_(down|forget|gain))\.weight$"
+)
+
+# Per-block `(offset_of_d, optional_offset_of_min)` for scaling GGUF blocks by a per-expert F32 multiplier.
+_GGUF_BLOCK_SCALE_OFFSETS: dict[DType, tuple[int, ...]] = {
+    DType.GGUF_Q4_0: (0,),
+    DType.GGUF_Q4_1: (0, 2),
+    DType.GGUF_Q5_0: (0,),
+    DType.GGUF_Q5_1: (0, 2),
+    DType.GGUF_Q8_0: (0,),
+    DType.GGUF_Q2_K: (80, 82),
+    DType.GGUF_Q3_K: (108,),
+    DType.GGUF_Q4_K: (0, 2),
+    DType.GGUF_Q5_K: (0, 2),
+    DType.GGUF_Q6_K: (208,),
+    DType.GGUF_IQ1_S: (0,),
+    DType.GGUF_IQ2_XXS: (0,),
+    DType.GGUF_IQ2_XS: (0,),
+    DType.GGUF_IQ2_S: (0,),
+    DType.GGUF_IQ3_XXS: (0,),
+    DType.GGUF_IQ3_S: (0,),
+    DType.GGUF_IQ4_NL: (0,),
+    DType.GGUF_IQ4_XS: (0,),
+    DType.GGUF_TQ1_0: (52,),
+    DType.GGUF_TQ2_0: (64,),
+    DType.GGUF_Q2_0: (0,),
+}
 
 _GGUF_LEAF_MAP = {
     "attn_norm.weight": "input_layernorm.weight",
     "attn_norm.bias": "input_layernorm.bias",
+    "attn_q_inp_norm.weight": "q_input_norm.weight",
+    "attn_k_inp_norm.weight": "k_input_norm.weight",
+    "attn_v_inp_norm.weight": "v_input_norm.weight",
     "ffn_norm.weight": "post_attention_layernorm.weight",
     "ffn_norm.bias": "post_attention_layernorm.bias",
     "post_attention_norm.weight": "post_attention_layernorm.weight",
@@ -1106,6 +1140,7 @@ _GGUF_LEAF_MAP = {
     "attn_v.weight": "self_attn.v_proj.weight",
     "attn_v.bias": "self_attn.v_proj.bias",
     "attn_r.weight": "attn.wr_du.weight",
+    "attn_rel.weight": "attn.wr_du.weight",
     "attn_output.weight": "self_attn.o_proj.weight",
     "attn_output.bias": "self_attn.o_proj.bias",
     "attn_qkv.weight": "self_attn.qkv_proj.weight",
@@ -1118,12 +1153,21 @@ _GGUF_LEAF_MAP = {
     "attn_sinks.weight": "attn.attn_sink_proj.weight",
     "attn_rel_logits.weight": "attn.rel_logits_proj.proj",
     "attn_rel_b.weight": "attn.rel_logits_proj.proj",
+    "attn_rel_bias.weight": "attn.rel_logits_proj.proj",
     "attn_q_clip.scale": "attn.q_l2_clip.scale",
+    "attn_q_clip.weight": "attn.q_l2_clip.scale",
     "attn_rel_clip.scale": "attn.rel_l2_clip.scale",
+    "attn_rel_clip.weight": "attn.rel_l2_clip.scale",
     "attn_sconv.weight": "attn_sconv.weight",
+    "attn_post_conv.weight": "attn_sconv.weight",
     "mlp_sconv.weight": "mlp_sconv.weight",
+    "ffn_post_conv.weight": "mlp_sconv.weight",
     "attn_k_sconv.weight": "attn.k_sconv.weight",
+    "attn_k_conv.weight": "attn.k_sconv.weight",
     "attn_v_sconv.weight": "attn.v_sconv.weight",
+    "attn_v_conv.weight": "attn.v_sconv.weight",
+    "attn_k_conv_proj.weight": "attn.k_sconv.weight_proj",
+    "attn_v_conv_proj.weight": "attn.v_sconv.weight_proj",
     "dflare_norm.weight": "dflare_norm.weight",
     "attn_k_norm_ctx.weight": "self_attn.k_norm_ctx.weight",
     "attn_k_ctx.weight": "self_attn.k_proj_ctx.weight",
@@ -1145,12 +1189,25 @@ _GGUF_LEAF_MAP = {
     "ffn_down.weight": "mlp.down_proj.weight",
     "ffn_gate_inp.weight": "mlp.gate.weight",
     "ffn_gate_inp.bias": "mlp.gate.bias",
+    "exp_probs_b.bias": "mlp.gate.bias",
     "ffn_exp_probs_b.bias": "mlp.gate.e_score_correction_bias",
     "ffn_gate_shexp.weight": "mlp.shared_expert.gate_proj.weight",
     "ffn_up_shexp.weight": "mlp.shared_expert.up_proj.weight",
     "ffn_down_shexp.weight": "mlp.shared_expert.down_proj.weight",
     "ffn_gate_shexp_inp.weight": "mlp.shared_expert_gate.weight",
     "ffn_gate_inp_shexp.weight": "mlp.shared_expert_gate.weight",
+}
+
+# Inkling 2 `M82Runtime` (`src/model/m82_runtime.zig`) overrides generic `self_attn.*` names.
+_GGUF_INKLING2_LEAF_MAP = {
+    "attn_norm.weight": "attn_norm.weight",
+    "ffn_norm.weight": "mlp_norm.weight",
+    "attn_q.weight": "attn.wq_du.weight",
+    "attn_k.weight": "attn.wk_dv.weight",
+    "attn_v.weight": "attn.wv_dv.weight",
+    "attn_output.weight": "attn.wo_ud.weight",
+    "attn_rel.weight": "attn.wr_du.weight",
+    "attn_gate.weight": "attn.gate_attn.weight",
 }
 
 _GGUF_VISION_LEAF_MAP = {
@@ -1176,11 +1233,13 @@ _GGUF_VISION_LEAF_MAP = {
 
 _GGUF_TOP_MAP = {
     "token_embd.weight": "embed_tokens.weight",
+    "token_embd_norm.weight": "embed_norm.weight",
     "embed_norm.weight": "embed_norm.weight",
     "output_norm.weight": "norm.weight",
     "output_norm.bias": "norm.bias",
     "output.weight": "lm_head.weight",
     "output.bias": "lm_head.bias",
+    "output_res_query.weight": "attn_res.output_query",
     "per_layer_token_embd.weight": "engram.per_layer_token_embd.weight",
     "dflash.fuse_weight": "fuse_weight",
     "fuse_weight": "fuse_weight",
@@ -1201,6 +1260,8 @@ def normalize_gguf_tensor_name(
     *,
     is_clip: bool = False,
     layer_remap: dict[int, int] | None = None,
+    inkling2_runtime_names: bool = False,
+    attn_res_shifted_by_1: bool = False,
 ) -> str:
     """Normalize a GGUF tensor name (`blk.N.*`, `v.blk.N.*`, `mm.*`) to canonical `.amf` naming."""
     if raw_name in _GGUF_TOP_MAP:
@@ -1217,8 +1278,25 @@ def normalize_gguf_tensor_name(
     mb = _GGUF_BLK_RE.match(raw_name)
     if mb is not None:
         raw_blk_idx = int(mb.group(1))
-        blk_idx = str(layer_remap.get(raw_blk_idx, raw_blk_idx) if layer_remap is not None else raw_blk_idx)
+        phys_blk_idx = layer_remap.get(raw_blk_idx, raw_blk_idx) if layer_remap is not None else raw_blk_idx
+        blk_idx = str(phys_blk_idx)
         rest = mb.group(2)
+        if rest == "ffn_res_query.weight":
+            return _normalize_name(f"attn_res.mlp_queries.{blk_idx}")
+        if rest == "attn_res_query.weight":
+            aq_idx = max(0, phys_blk_idx - 1) if attn_res_shifted_by_1 else phys_blk_idx
+            return _normalize_name(f"attn_res.attn_queries.{aq_idx}")
+        mc = _GGUF_INKLING2_CTRL_RE.match(rest)
+        if mc is not None:
+            if mc.group(1) is not None:
+                slot = {"q": "attn", "k": "k", "v": "v", "ffn": "mlp"}[mc.group(1)]
+                part = mc.group(2)
+            else:
+                slot = mc.group(3)
+                part = mc.group(4)
+            return _normalize_name(f"layers.{blk_idx}.controllers.{slot}.{part}_weight")
+        if inkling2_runtime_names and rest in _GGUF_INKLING2_LEAF_MAP:
+            return _normalize_name(f"layers.{blk_idx}.{_GGUF_INKLING2_LEAF_MAP[rest]}")
         if rest in _GGUF_LEAF_MAP:
             return _normalize_name(f"layers.{blk_idx}.{_GGUF_LEAF_MAP[rest]}")
         me = _GGUF_EXP_RE.match(rest)
@@ -1227,7 +1305,7 @@ def normalize_gguf_tensor_name(
                 "ffn_gate": "gate_proj",
                 "ffn_up": "up_proj",
                 "ffn_down": "down_proj",
-                "ffn_gate_up": "gate_up_proj",
+                "ffn_gate_up": "w13" if inkling2_runtime_names else "gate_up_proj",
             }
             return _normalize_name(f"layers.{blk_idx}.mlp.experts.{me.group(2)}.{proj_map[me.group(1)]}.{me.group(3)}")
         return _normalize_name(f"layers.{blk_idx}.{rest}")
@@ -1248,12 +1326,37 @@ def _tensor_content_digest(fh, data_offset: int, t: GgufTensorInfo) -> bytes:
     return h.digest()
 
 
-def _deduplicate_unrolled_recurrent_layers(
+def _inkling2_loop_params(kv: dict[str, Any], arch: str, total_layers: int) -> tuple[int, int, int] | None:
+    """Return `(core_start, core_end, num_passes)` if GGUF KV or layer count reflects an Inkling 2 loop."""
+    c_start = kv.get(f"{arch}.loop.start", kv.get(f"{arch}.loop.core_start"))
+    c_end = kv.get(f"{arch}.loop.end", kv.get(f"{arch}.loop.core_end"))
+    n_pass = kv.get(f"{arch}.loop.count", kv.get(f"{arch}.loop.num_passes"))
+    if c_start is not None and c_end is not None and n_pass is not None:
+        return int(c_start), int(c_end), int(n_pass)
+    if arch in ("inkling2", "inkling2_loop", "inkling2_loop_text") and total_layers == 48:
+        return 6, 18, 3
+    return None
+
+
+def _is_inkling2_per_pass_leaf(leaf: str) -> bool:
+    if leaf in ("attn_res_query.weight", "ffn_res_query.weight", "loop_msg_query.weight"):
+        return True
+    if _GGUF_INKLING2_CTRL_RE.match(leaf) is not None:
+        return True
+    return leaf.endswith("_norm.weight") or leaf.endswith("_norm.bias")
+
+
+def _deduplicate_unrolled_recurrent_layers_ex(
     entries: Sequence[tuple[int, GgufShard, GgufTensorInfo]],
     kv: dict[str, Any],
-) -> tuple[list[tuple[int, GgufShard, GgufTensorInfo]], int, int]:
-    """Deduplicate unrolled recurrent `blk.N.*` aliases (e.g. `block_count=48` -> `24` physical layers)."""
-    arch = str(kv.get("general.architecture") or "")
+) -> tuple[
+    list[tuple[int, GgufShard, GgufTensorInfo]],
+    dict[tuple[int, str], list[tuple[int, tuple[int, GgufShard, GgufTensorInfo]]]],
+    int,
+    int,
+]:
+    """Deduplicate unrolled recurrent `blk.N.*` aliases (`48 -> 24`), preserving per-pass deltas."""
+    arch = str(kv.get("general.architecture") or "").lower()
     reported_blocks = kv.get(f"{arch}.block_count") if arch else None
     layer_buckets: dict[int, list[tuple[int, GgufShard, GgufTensorInfo]]] = {}
     non_layer: list[tuple[int, GgufShard, GgufTensorInfo]] = []
@@ -1266,9 +1369,16 @@ def _deduplicate_unrolled_recurrent_layers(
             layer_buckets.setdefault(int(m.group(1)), []).append(item)
 
     if len(layer_buckets) <= 1:
-        return list(entries), len(layer_buckets), 0
+        return list(entries), {}, len(layer_buckets), 0
+
+    loop_params = _inkling2_loop_params(kv, arch, len(layer_buckets))
+    core_start, core_end, n_passes = loop_params if loop_params is not None else (0, 0, 1)
+    core_len = max(0, core_end - core_start)
+    max_unrolled_idx = core_start + core_len * n_passes if core_len > 0 and n_passes > 1 else -1
 
     sig_to_first_layer: dict[tuple[tuple[str, tuple[int, ...], int, int | bytes], ...], int] = {}
+    first_core_sigs: dict[int, dict[str, tuple[tuple[int, ...], int, bytes]]] = {}
+    per_pass_deltas: dict[tuple[int, str], list[tuple[int, tuple[int, GgufShard, GgufTensorInfo]]]] = {}
     opened: dict[int, Any] = {}
     kept_layers: dict[int, list[tuple[int, GgufShard, GgufTensorInfo]]] = {}
     dedup_count = 0
@@ -1280,22 +1390,68 @@ def _deduplicate_unrolled_recurrent_layers(
             items = sorted(layer_buckets[l_idx], key=lambda x: x[2].name)
             # Build layer signature using (leaf_name, dims, ggml_type, physical_ptr_or_digest).
             sig_parts: list[tuple[str, tuple[int, ...], int, int | bytes]] = []
+            leaf_sigs: dict[str, tuple[tuple[int, ...], int, bytes]] = {}
             for s_idx, sh, t in items:
                 m = _GGUF_BLK_RE.match(t.name)
                 assert m is not None
                 leaf = m.group(2)
                 digest = _tensor_content_digest(opened[id(sh)], sh.data_offset, t)
                 sig_parts.append((leaf, t.dims, t.ggml_type, digest))
+                leaf_sigs[leaf] = (t.dims, t.ggml_type, digest)
             sig = tuple(sig_parts)
-            # Only collapse duplicate layers cleanly in the upper recurrent unrolled band or alias offsets.
+            # Only collapse duplicate layers in the repeated unrolled core band (when loop schedule is known)
+            # or in the upper half / alias band for generic unrolled GGUFs.
             prev_layer = sig_to_first_layer.get(sig)
-            if prev_layer is not None and (
+            in_unrolled_loop_tail = (
+                core_len > 0
+                and n_passes > 1
+                and core_start + core_len <= l_idx < max_unrolled_idx
+            )
+            in_generic_alias_band = (core_len == 0 or n_passes <= 1) and (
                 reported_blocks is None or l_idx >= len(layer_buckets) // 2 or int(reported_blocks) > 24
-            ):
+            )
+            if prev_layer is not None and (in_unrolled_loop_tail or in_generic_alias_band):
                 dedup_count += 1
                 continue
+
+            # Partial match inside unrolled Inkling 2 loop core (`blk.18..41` vs `blk.6..17`):
+            # deduplicate shared linear/expert weights while preserving differing per-pass tensors.
+            if (
+                core_len > 0
+                and n_passes > 1
+                and core_start + core_len <= l_idx < max_unrolled_idx
+            ):
+                base_core = core_start + ((l_idx - core_start) % core_len)
+                pass_idx = (l_idx - core_start) // core_len
+                base_map = first_core_sigs.get(base_core)
+                if base_map is not None:
+                    matched_shared = False
+                    divergent_shared: list[str] = []
+                    pass_only: list[tuple[str, tuple[int, GgufShard, GgufTensorInfo]]] = []
+                    for item in items:
+                        leaf = _GGUF_BLK_RE.match(item[2].name).group(2)  # type: ignore[union-attr]
+                        if leaf_sigs[leaf] == base_map.get(leaf):
+                            if not _is_inkling2_per_pass_leaf(leaf):
+                                matched_shared = True
+                        elif _is_inkling2_per_pass_leaf(leaf):
+                            pass_only.append((leaf, item))
+                        else:
+                            divergent_shared.append(leaf)
+                    if matched_shared and divergent_shared:
+                        raise ValueError(
+                            f"unrolled core block blk.{l_idx} shares weights with blk.{base_core} "
+                            f"but diverges on shared tensor(s): {divergent_shared}"
+                        )
+                    if matched_shared and not divergent_shared:
+                        for leaf, item in pass_only:
+                            per_pass_deltas.setdefault((base_core, leaf), []).append((pass_idx, item))
+                        dedup_count += 1
+                        continue
+
             sig_to_first_layer[sig] = l_idx
             kept_layers[l_idx] = items
+            if core_len > 0 and core_start <= l_idx < core_end:
+                first_core_sigs[l_idx] = leaf_sigs
     finally:
         for fh in opened.values():
             fh.close()
@@ -1303,7 +1459,16 @@ def _deduplicate_unrolled_recurrent_layers(
     kept: list[tuple[int, GgufShard, GgufTensorInfo]] = list(non_layer)
     for l_idx in sorted(kept_layers):
         kept.extend(kept_layers[l_idx])
-    return kept, len(kept_layers), dedup_count
+    return kept, per_pass_deltas, len(kept_layers), dedup_count
+
+
+def _deduplicate_unrolled_recurrent_layers(
+    entries: Sequence[tuple[int, GgufShard, GgufTensorInfo]],
+    kv: dict[str, Any],
+) -> tuple[list[tuple[int, GgufShard, GgufTensorInfo]], int, int]:
+    """Deduplicate unrolled recurrent `blk.N.*` aliases (e.g. `block_count=48` -> `24` physical layers)."""
+    kept, _deltas, phys_layers, dedup_count = _deduplicate_unrolled_recurrent_layers_ex(entries, kv)
+    return kept, phys_layers, dedup_count
 
 
 def _build_synthesized_hf_tokenizer_bytes(kv: dict[str, Any]) -> bytes | None:
@@ -1341,6 +1506,12 @@ def _build_synthesized_hf_tokenizer_bytes(kv: dict[str, Any]) -> bytes | None:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def _gguf_scalar_kv(val: Any) -> Any:
+    if isinstance(val, list):
+        return val[0] if val else None
+    return val
+
+
 def _build_synthesized_config_bytes(
     kv: dict[str, Any],
     *,
@@ -1348,6 +1519,7 @@ def _build_synthesized_config_bytes(
     dedup_layers: int,
 ) -> bytes:
     arch = str(kv.get("general.architecture") or "llama")
+    arch_lower = arch.lower()
     cfg: dict[str, Any] = {
         "model_type": arch,
     }
@@ -1369,7 +1541,7 @@ def _build_synthesized_config_bytes(
     else:
         cfg["architectures"] = [f"{arch[:1].upper()}{arch[1:]}ForCausalLM"]
 
-    map_fields = (
+    scalar_map_fields = (
         (f"{arch}.embedding_length", "hidden_size"),
         (f"{arch}.feed_forward_length", "intermediate_size"),
         (f"{arch}.attention.head_count", "num_attention_heads"),
@@ -1382,38 +1554,97 @@ def _build_synthesized_config_bytes(
         (f"{arch}.expert_count", "num_local_experts"),
         (f"{arch}.expert_used_count", "num_experts_per_tok"),
         (f"{arch}.block_count", "num_hidden_layers"),
+        (f"{arch}.vocab_size", "vocab_size"),
+        (f"{arch}.vocab_size_unpadded", "unpadded_vocab_size"),
+        (f"{arch}.attention.relative_length", "d_rel"),
+        (f"{arch}.attention.relative_extent", "rel_extent"),
+        (f"{arch}.shortconv.l_cache", "sconv_kernel_size"),
+        (f"{arch}.attn_res.block_size", "n_layers_per_attn_res_block"),
+        (f"{arch}.attention.log_scale_floor", "log_scaling_n_floor"),
+        (f"{arch}.attention.log_scale_alpha", "log_scaling_alpha"),
+        (f"{arch}.attention.qk_clip", "qk_l2_clip_threshold"),
+        (f"{arch}.attention.relative_clip", "rel_l2_clip_threshold"),
+        (f"{arch}.activation.situ_beta", "mlp_gate_softcap"),
+        (f"{arch}.activation.situ_linear_beta", "mlp_up_softcap"),
+        (f"{arch}.final_logit_softcapping", "final_logit_softcapping"),
+        (f"{arch}.expert_weights_scale", "route_scale"),
     )
-    for g_k, h_k in map_fields:
+    for g_k, h_k in scalar_map_fields:
         if g_k in kv:
-            cfg[h_k] = kv[g_k]
+            sv = _gguf_scalar_kv(kv[g_k])
+            if sv is not None:
+                cfg[h_k] = sv
+    if "num_local_experts" in cfg and "n_routed_experts" not in cfg:
+        cfg["n_routed_experts"] = cfg["num_local_experts"]
+
+    swa_pat = kv.get(f"{arch}.attention.sliding_window_pattern")
+    if isinstance(swa_pat, list) and swa_pat:
+        cfg["local_layer_ids"] = [idx for idx, flag in enumerate(swa_pat) if int(flag) != 0]
+
     if physical_layers > 0:
         cfg["physical_num_hidden_layers"] = physical_layers
         if dedup_layers > 0:
             cfg["deduplicated_unrolled_layers"] = dedup_layers
-        reported_blocks = int(kv.get(f"{arch}.block_count", 0) or 0)
-        if arch in ("inkling2", "inkling2_loop") and reported_blocks > physical_layers:
-            cfg["model_type"] = "inkling2_loop"
-            cfg["effective_num_steps"] = reported_blocks
-            cfg["num_hidden_layers"] = physical_layers
-            c_start = int(kv.get(f"{arch}.loop.core_start", 6) or 6)
-            c_end = int(kv.get(f"{arch}.loop.core_end", 18) or 18)
-            n_passes = int(kv.get(f"{arch}.loop.num_passes", 3) or 3)
-            g_rank = int(kv.get(f"{arch}.loop.gate_rank", 64) or 64)
-            cfg["loop_config"] = {
-                "core_start": c_start,
-                "core_end": c_end,
-                "num_passes": n_passes,
-                "gate_rank": g_rank,
-                "is_varloop": False,
-            }
+    reported_blocks = int(kv.get(f"{arch}.block_count", 0) or 0)
+    eff_layers = physical_layers if physical_layers > 0 else reported_blocks
+    has_loop_kv = any(
+        k in kv
+        for k in (
+            f"{arch}.loop.start",
+            f"{arch}.loop.core_start",
+            f"{arch}.loop.count",
+            f"{arch}.loop.num_passes",
+        )
+    )
+    if arch_lower in ("inkling2", "inkling2_loop", "inkling2_loop_text") and (
+        (physical_layers > 0 and reported_blocks > physical_layers) or has_loop_kv or arch_lower == "inkling2_loop"
+    ):
+        cfg["model_type"] = "inkling2_loop"
+        if eff_layers > 0:
+            cfg["num_hidden_layers"] = eff_layers
+        c_start = int(kv.get(f"{arch}.loop.start", kv.get(f"{arch}.loop.core_start", 6)) or 6)
+        c_end = int(kv.get(f"{arch}.loop.end", kv.get(f"{arch}.loop.core_end", 18)) or 18)
+        n_passes = int(kv.get(f"{arch}.loop.count", kv.get(f"{arch}.loop.num_passes", 3)) or 3)
+        g_rank = int(kv.get(f"{arch}.loop.gate_rank", 64) or 64)
+        is_var = bool(kv.get(f"{arch}.loop.varying", False))
+        eff_steps = eff_layers + max(0, c_end - c_start) * max(0, n_passes - 1) if eff_layers > 0 else reported_blocks
+        cfg["effective_num_steps"] = max(eff_steps, reported_blocks)
+        cfg["loop_config"] = {
+            "core_start": c_start,
+            "core_end": c_end,
+            "num_passes": n_passes,
+            "gate_rank": g_rank,
+            "is_varloop": is_var,
+        }
+        cfg["loop_schedule"] = {
+            "core_start": c_start,
+            "core_end": c_end,
+            "num_passes": n_passes,
+            "gate_rank": g_rank,
+            "effective_num_steps": cfg["effective_num_steps"],
+            "controllers": ["attn", "k", "v", "mlp"],
+        }
+        cfg["operator_axes"] = {
+            "attention": "rel_gqa_swa_sconv",
+            "ffn": "moe_softcap",
+            "kv_layout": "hybrid_swa_1024",
+            "sparse_memory": "none",
+            "residual": "attn_res_6",
+            "loop_controllers": "sme2_panel64" if g_rank > 0 else "row_major",
+        }
+        cfg.setdefault("use_gate_bias", True)
+        cfg.setdefault("attn_res_normalize_values", True)
     tokens = kv.get("tokenizer.ggml.tokens")
     if isinstance(tokens, list) and tokens:
-        cfg["vocab_size"] = len(tokens)
+        if "vocab_size" not in cfg:
+            cfg["vocab_size"] = len(tokens)
+        elif arch_lower in ("inkling2", "inkling2_loop") and "unpadded_vocab_size" not in cfg:
+            cfg["unpadded_vocab_size"] = len(tokens)
     for g_k, h_k in (
         ("tokenizer.ggml.bos_token_id", "bos_token_id"),
         ("tokenizer.ggml.eos_token_id", "eos_token_id"),
     ):
-        if g_k in kv:
+        if g_k in kv and kv[g_k] is not None:
             cfg[h_k] = int(kv[g_k])
     return json.dumps(cfg, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -1501,11 +1732,11 @@ class _PlannedGgufEntry:
     layer: int
     expert: int
     shape: tuple[int, ...]
-    shard: GgufShard
+    shard: GgufShard | None
     src_offset: int
     src_bytes: int
     src_ggml_type: int
-    data_convert: str | None  # None, "f16_to_bf16", "bf16_to_f16", "gguf_nvfp4"
+    data_convert: str | None  # None, "f16_to_bf16", "bf16_to_f16", "f32_to_bf16", "f32_to_f16", "gguf_nvfp4", "sme2_*"
     scale_shard: GgufShard | None
     scale_info: GgufTensorInfo | None
     fp8_mode: str | None  # None, "fp8_row", "fp8_tensor"
@@ -1517,6 +1748,79 @@ class _PlannedGgufEntry:
     scale_row_count: int = 0
     layout: TensorLayout = TensorLayout.ROW_MAJOR
     quant_param_kind: QuantParamKind = QuantParamKind.AFFINE_SCALE_BIAS
+    pair_interleave_rows: bool = False
+    second_shard: GgufShard | None = None
+    second_src_offset: int = 0
+    expert_scale: float | None = None
+    second_expert_scale: float | None = None
+    synthetic_bytes: bytes | None = None
+
+
+def _scale_gguf_blocks_in_place(buf: bytearray, dtype: DType, bb: int, scale_f: float, name: str) -> None:
+    """Multiply every block's fp16 `d` (and optional `dmin`) in-place by `scale_f`."""
+    if not math.isfinite(scale_f):
+        raise ValueError(f"non-finite expert scale {scale_f} for {name!r}")
+    if scale_f == 1.0:
+        return
+    offsets = _GGUF_BLOCK_SCALE_OFFSETS.get(dtype)
+    if offsets is None:
+        raise ValueError(f"cannot apply expert .scale to unsupported GGUF dtype {dtype.name} on {name!r}")
+    for off in offsets:
+        b0 = buf[off::bb]
+        b1 = buf[off + 1 :: bb]
+        cache: dict[tuple[int, int], bytes] = {}
+        out_chunks: list[bytes] = []
+        append = out_chunks.append
+        for pair in zip(b0, b1):
+            packed = cache.get(pair)
+            if packed is None:
+                val = struct.unpack("<e", bytes(pair))[0] * scale_f
+                if val > 65504.0:
+                    val = 65504.0
+                elif val < -65504.0:
+                    val = -65504.0
+                packed = struct.pack("<e", val)
+                cache[pair] = packed
+            append(packed)
+        merged = b"".join(out_chunks)
+        buf[off::bb] = merged[0::2]
+        buf[off + 1 :: bb] = merged[1::2]
+
+
+def _interleave_pair_rows(raw_concat: bytes | bytearray | memoryview, n_rows: int, row_bytes: int) -> bytes:
+    """Reorder `[gate[0..H-1], up[0..H-1]]` row blocks into `pair_interleaved` `[g0, u0, g1, u1, ...]`."""
+    if n_rows % 2 != 0:
+        raise ValueError(f"pair_interleaved w13 requires even row count, got {n_rows}")
+    half = n_rows // 2
+    mv = memoryview(raw_concat)
+    out = bytearray(n_rows * row_bytes)
+    out_mv = memoryview(out)
+    for r in range(half):
+        src_g = r * row_bytes
+        src_u = (half + r) * row_bytes
+        dst_p = (2 * r) * row_bytes
+        out_mv[dst_p : dst_p + row_bytes] = mv[src_g : src_g + row_bytes]
+        out_mv[dst_p + row_bytes : dst_p + 2 * row_bytes] = mv[src_u : src_u + row_bytes]
+    return bytes(out)
+
+
+def _interleave_split_rows(
+    gate_buf: bytes | bytearray | memoryview,
+    up_buf: bytes | bytearray | memoryview,
+    half_rows: int,
+    row_bytes: int,
+) -> bytes:
+    """Interleave separate `gate[0..H-1]` and `up[0..H-1]` row buffers into `[g0, u0, g1, u1, ...]`."""
+    g_mv = memoryview(gate_buf)
+    u_mv = memoryview(up_buf)
+    out = bytearray(2 * half_rows * row_bytes)
+    out_mv = memoryview(out)
+    for r in range(half_rows):
+        src = r * row_bytes
+        dst_p = (2 * r) * row_bytes
+        out_mv[dst_p : dst_p + row_bytes] = g_mv[src : src + row_bytes]
+        out_mv[dst_p + row_bytes : dst_p + 2 * row_bytes] = u_mv[src : src + row_bytes]
+    return bytes(out)
 
 
 def _decode_gguf_float_array(shard: GgufShard, info: GgufTensorInfo) -> bytes:
@@ -1533,6 +1837,32 @@ def _decode_gguf_float_array(shard: GgufShard, info: GgufTensorInfo) -> bytes:
     raise ValueError(f"unsupported FP8 companion scale type {info.ggml_type} on {info.name!r}")
 
 
+def _extract_expert_scales(shard: GgufShard, info: GgufTensorInfo) -> tuple[float, ...]:
+    raw = _decode_gguf_float_array(shard, info)
+    cnt = len(raw) // 4
+    return struct.unpack(f"<{cnt}f", raw)
+
+
+def _decode_gguf_tensor_f32(shard: GgufShard, info: GgufTensorInfo) -> tuple[float, ...]:
+    if info.ggml_type == 0:
+        with shard.path.open("rb") as fh:
+            fh.seek(shard.data_offset + info.offset)
+            raw = fh.read(info.expected_bytes)
+        return struct.unpack(f"<{len(raw) // 4}f", raw)
+    if info.ggml_type == 30:
+        with shard.path.open("rb") as fh:
+            fh.seek(shard.data_offset + info.offset)
+            raw = fh.read(info.expected_bytes)
+        f32_b = _bf16_to_f32_bytes(raw)
+        return struct.unpack(f"<{len(f32_b) // 4}f", f32_b)
+    if info.ggml_type == 1:
+        with shard.path.open("rb") as fh:
+            fh.seek(shard.data_offset + info.offset)
+            raw = fh.read(info.expected_bytes)
+        return tuple(f16_bytes_to_f32_list(raw))
+    raise ValueError(f"expected float tensor (F32/F16/BF16) for {info.name!r}, got ggml_type={info.ggml_type}")
+
+
 def pack_amf_from_gguf(
     input_path: pathlib.Path,
     output_path: pathlib.Path,
@@ -1540,6 +1870,8 @@ def pack_amf_from_gguf(
     model_id: str | None = None,
     dtype_mode: str = "auto",
     cold_experts: Iterable[tuple[int, int]] = (),
+    cold_experts_per_layer: int | None = None,
+    heat_profile: pathlib.Path | None = None,
     all_experts_cold: bool = False,
     exclude_tensors: Iterable[str] = (),
     embed_metadata: bool = False,
@@ -1547,6 +1879,8 @@ def pack_amf_from_gguf(
     tokenizer_path: pathlib.Path | None = None,
     tokenizer_config_path: pathlib.Path | None = None,
     chat_template_path: pathlib.Path | None = None,
+    strip_vision: bool = False,
+    vision_sidecar: pathlib.Path | None = None,
     vision_block_dtype: str = "auto",
     group_size: int = 64,
     strict_vocab_check: bool = True,
@@ -1555,6 +1889,7 @@ def pack_amf_from_gguf(
     draft_config_output: pathlib.Path | None = None,
     engram_output: pathlib.Path | None = None,
     engram_shards: int = 1,
+    meta_config_override: bytes | None = None,
     stats_out: dict[str, int] | None = None,
 ) -> list[PackedTensorMeta]:
     """Stream-convert a GGUF v2/v3 file (or split shards) into a 16 KiB-aligned `.amf` v0."""
@@ -1580,8 +1915,11 @@ def pack_amf_from_gguf(
     physical_layers = 0
     dedup_layers = 0
     layer_remap: dict[int, int] = {}
+    pass_deltas: dict[tuple[int, str], list[tuple[int, tuple[int, GgufShard, GgufTensorInfo]]]] = {}
     if deduplicate_recurrent and not is_clip:
-        flat_items, physical_layers, dedup_layers = _deduplicate_unrolled_recurrent_layers(flat_items, kv)
+        flat_items, pass_deltas, physical_layers, dedup_layers = _deduplicate_unrolled_recurrent_layers_ex(
+            flat_items, kv
+        )
         kept_ids = sorted(
             {
                 int(m.group(1))
@@ -1596,11 +1934,54 @@ def pack_amf_from_gguf(
         stats_out["deduplicated_layers"] = dedup_layers
         stats_out["gguf_arch"] = hash(arch) & 0x7FFFFFFF
 
+    is_inkling2_arch = arch in ("inkling2", "inkling2_loop", "inkling2_text", "inkling2_loop_text")
+    use_inkling2_runtime_names = (
+        arch in ("inkling2_loop", "inkling2_loop_text")
+        or (
+            is_inkling2_arch
+            and any(
+                any(
+                    tok in t.name
+                    for tok in (
+                        "attn_q_clip",
+                        "attn_post_conv",
+                        "attn_rel_clip",
+                        "attn_rel_bias",
+                        "attn_res_query",
+                        "ffn_res_query",
+                        "loop_msg_query",
+                        "loop_q_ctrl",
+                        "loop_ffn_ctrl",
+                        "attn_k_conv",
+                        "ffn_gate_up_exps",
+                        "ffn_gate_exps",
+                        "token_embd_norm",
+                    )
+                )
+                for _, _, t in flat_items
+            )
+        )
+    )
+    blk_res_layers = {
+        layer_remap.get(int(m.group(1)), int(m.group(1)))
+        for _, _, t in flat_items
+        if (m := _GGUF_BLK_RE.match(t.name)) is not None and m.group(2) == "attn_res_query.weight"
+    }
+    attn_res_shifted_by_1 = use_inkling2_runtime_names and (0 not in blk_res_layers) and (1 in blk_res_layers)
+
     if sme2_pack is None:
         eff_sme2_pack = (
             "controllers"
             if any(
-                is_inkling2_controller_tensor(normalize_gguf_tensor_name(t.name, is_clip=is_clip, layer_remap=layer_remap))
+                is_inkling2_controller_tensor(
+                    normalize_gguf_tensor_name(
+                        t.name,
+                        is_clip=is_clip,
+                        layer_remap=layer_remap,
+                        inkling2_runtime_names=use_inkling2_runtime_names,
+                        attn_res_shifted_by_1=attn_res_shifted_by_1,
+                    )
+                )
                 for _, _, t in flat_items
             )
             else "none"
@@ -1613,68 +1994,360 @@ def pack_amf_from_gguf(
     raw_by_name = {t.name: (s_idx, sh, t) for s_idx, sh, t in flat_items}
     excluded = {tok.strip() for tok in exclude_tensors if tok.strip()}
     cold_set = set(cold_experts)
-    consumed_scales: set[str] = set()
+    if not cold_set and not all_experts_cold:
+        if heat_profile is not None:
+            cold_set = load_cold_experts_from_heat_profile(
+                heat_profile,
+                cold_experts_per_layer=cold_experts_per_layer,
+            )
+        elif cold_experts_per_layer is not None and cold_experts_per_layer > 0:
+            n_l = physical_layers if physical_layers > 0 else int(kv.get(f"{arch}.block_count", 0) or 0)
+            n_e = int(kv.get(f"{arch}.expert_count", 0) or 0)
+            if n_e <= 0:
+                for _, _, t in flat_items:
+                    if len(t.amf_shape) == 3 and "_exps" in t.name:
+                        n_e = max(n_e, t.amf_shape[0])
+            take = min(cold_experts_per_layer, n_e)
+            if n_l > 0 and take > 0:
+                cold_set = {(l, e) for l in range(n_l) for e in range(n_e - take, n_e)}
+
+    consumed_names: set[str] = set()
     planned: list[_PlannedGgufEntry] = []
+    planned_vision: list[_PlannedGgufEntry] = []
     planned_engram: list[_PlannedGgufEntry] = []
 
-    def _find_fp8_scale(t_name: str) -> tuple[int, GgufShard, GgufTensorInfo] | None:
+    def _find_scalar_or_vec_scale(t_name: str, *, exps_mode: bool = False) -> tuple[int, GgufShard, GgufTensorInfo] | None:
         base = t_name[:-7] if t_name.endswith(".weight") else t_name
-        for cand in (f"{t_name}.scale", f"{t_name}_scale", f"{base}.scale", f"{base}.weight_scale", f"{base}_scale"):
+        cands = (
+            (f"{base}.scale", f"{t_name}.scale", f"{base}.weight_scale")
+            if exps_mode
+            else (f"{t_name}.scale", f"{t_name}_scale", f"{base}.scale", f"{base}.weight_scale", f"{base}_scale")
+        )
+        for cand in cands:
             hit = raw_by_name.get(cand)
             if hit is not None and hit[2].ggml_type in (0, 1, 30):
                 return hit
         return None
 
-    # Pre-scan F8_E4M3 tensors to reserve companion scales cleanly before planning.
+    # Pre-scan F8_E4M3 companion scales and expert `.scale` arrays cleanly before planning.
     fp8_pairs: dict[str, tuple[int, GgufShard, GgufTensorInfo] | None] = {}
+    exps_scale_vals: dict[str, tuple[float, ...]] = {}
     for _, _, t in flat_items:
         if t.ggml_type == 43:
-            sc_hit = _find_fp8_scale(t.name)
+            sc_hit = _find_scalar_or_vec_scale(t.name)
             fp8_pairs[t.name] = sc_hit
             if sc_hit is not None:
-                consumed_scales.add(sc_hit[2].name)
+                consumed_names.add(sc_hit[2].name)
+        elif re.match(r"^blk\.\d+\.(ffn_gate_up|ffn_gate|ffn_up|ffn_down)_exps(?:\.weight)?$", t.name):
+            sc_hit = _find_scalar_or_vec_scale(t.name, exps_mode=True)
+            if sc_hit is not None:
+                consumed_names.add(sc_hit[2].name)
+                exps_scale_vals[t.name] = _extract_expert_scales(sc_hit[1], sc_hit[2])
 
-    for s_idx, sh, t in flat_items:
-        if t.name in excluded or t.name in consumed_scales:
+    # Pre-scan Inkling 2 `blk.N.loop_msg_query.weight` -> assemble `middle_cycle_cross_pass_{,kv_}queries`.
+    if use_inkling2_runtime_names:
+        loop_msg_entries: list[tuple[int, GgufShard, GgufTensorInfo]] = []
+        for _, sh, t in flat_items:
+            mm = _GGUF_BLK_RE.match(t.name)
+            if mm is not None and mm.group(2) == "loop_msg_query.weight":
+                raw_li = int(mm.group(1))
+                phys_li = layer_remap.get(raw_li, raw_li)
+                loop_msg_entries.append((phys_li, sh, t))
+        if (
+            loop_msg_entries
+            and "middle_cycle_cross_pass_queries" not in raw_by_name
+            and "middle_cycle_cross_pass_kv_queries" not in raw_by_name
+        ):
+            loop_msg_entries.sort(key=lambda x: x[0])
+            cpq_floats: list[float] = []
+            cpkv_floats: list[float] = []
+            h_dim = loop_msg_entries[0][2].amf_shape[-1]
+            for _, sh, t in loop_msg_entries:
+                if len(t.amf_shape) != 2 or t.amf_shape[0] != 4 or t.amf_shape[1] != h_dim:
+                    raise ValueError(f"expected (4, {h_dim}) for {t.name!r}, got {t.amf_shape}")
+                vals = _decode_gguf_tensor_f32(sh, t)
+                cpq_floats.extend(vals[0:h_dim])
+                cpq_floats.extend(vals[3 * h_dim : 4 * h_dim])
+                cpkv_floats.extend(vals[h_dim : 2 * h_dim])
+                cpkv_floats.extend(vals[2 * h_dim : 3 * h_dim])
+                consumed_names.add(t.name)
+            k_rows = 2 * len(loop_msg_entries)
+            for synth_name, flt_list in (
+                ("middle_cycle_cross_pass_queries", cpq_floats),
+                ("middle_cycle_cross_pass_kv_queries", cpkv_floats),
+            ):
+                if synth_name in excluded:
+                    continue
+                synth_b = struct.pack(f"<{len(flt_list)}f", *flt_list)
+                s_kind, s_layer, s_exp = _classify_tensor(synth_name, cold_set, all_experts_cold)
+                planned.append(
+                    _PlannedGgufEntry(
+                        name=synth_name,
+                        kind=s_kind,
+                        dtype=DType.F32,
+                        quant_bits=0,
+                        group_size=0,
+                        layer=s_layer,
+                        expert=s_exp,
+                        shape=(k_rows, h_dim),
+                        shard=None,
+                        src_offset=0,
+                        src_bytes=len(synth_b),
+                        src_ggml_type=0,
+                        data_convert=None,
+                        scale_shard=None,
+                        scale_info=None,
+                        fp8_mode=None,
+                        data_bytes=len(synth_b),
+                        params_offset=0,
+                        params_bytes=0,
+                        blob_bytes=_align_up(max(len(synth_b), 1), APPLE_PAGE_SIZE),
+                        synthetic_bytes=synth_b,
+                    )
+                )
+
+    # Pre-scan split `blk.N.ffn_gate_exps.weight` + `blk.N.ffn_up_exps.weight` -> fused `w13.weight` if matching.
+    fused_split_gate_ups: dict[str, tuple[int, GgufShard, GgufTensorInfo]] = {}
+    if use_inkling2_runtime_names:
+        for t_name, (_s_i, _g_sh, g_t) in raw_by_name.items():
+            gm = re.match(r"^blk\.(\d+)\.ffn_gate_exps(?:\.(weight))?$", t_name)
+            if gm is None or len(g_t.amf_shape) != 3:
+                continue
+            up_cand = f"blk.{gm.group(1)}.ffn_up_exps" + (".weight" if gm.group(2) else "")
+            up_hit = raw_by_name.get(up_cand)
+            if up_hit is None:
+                continue
+            up_t = up_hit[2]
+            if up_t.ggml_type != g_t.ggml_type or up_t.amf_shape != g_t.amf_shape:
+                continue
+            if g_t.ggml_type == 40:
+                g_sc = exps_scale_vals.get(g_t.name)
+                u_sc = exps_scale_vals.get(up_t.name)
+                if g_sc != u_sc and (g_sc is not None or u_sc is not None):
+                    continue
+            fused_split_gate_ups[t_name] = up_hit
+            consumed_names.add(up_cand)
+
+    # Synthesize stacked multi-pass `attn_res_query.weight` / `ffn_res_query.weight` or pass deltas if present.
+    synthetic_override_items: dict[str, tuple[str, tuple[int, ...], bytes]] = {}
+    extra_pass_items: list[tuple[str, tuple[int, GgufShard, GgufTensorInfo]]] = []
+    if pass_deltas:
+        for (base_core, leaf), delta_list in sorted(pass_deltas.items()):
+            delta_list_sorted = sorted(delta_list, key=lambda x: x[0])
+            base_name = f"blk.{base_core}.{leaf}"
+            base_hit = raw_by_name.get(base_name)
+            if (
+                use_inkling2_runtime_names
+                and base_hit is not None
+                and leaf in ("attn_res_query.weight", "ffn_res_query.weight")
+                and len(base_hit[2].amf_shape) == 1
+                and all(len(it[1][2].amf_shape) == 1 and it[1][2].amf_shape == base_hit[2].amf_shape for it in delta_list_sorted)
+            ):
+                base_vals = _decode_gguf_tensor_f32(base_hit[1], base_hit[2])
+                stacked_vals = list(base_vals)
+                for _p_i, (_si, d_sh, d_t) in delta_list_sorted:
+                    stacked_vals.extend(_decode_gguf_tensor_f32(d_sh, d_t))
+                out_nm = normalize_gguf_tensor_name(
+                    base_name,
+                    is_clip=is_clip,
+                    layer_remap=layer_remap,
+                    inkling2_runtime_names=use_inkling2_runtime_names,
+                    attn_res_shifted_by_1=attn_res_shifted_by_1,
+                )
+                n_rows_p = 1 + len(delta_list_sorted)
+                synthetic_override_items[base_name] = (
+                    out_nm,
+                    (n_rows_p, base_hit[2].amf_shape[0]),
+                    struct.pack(f"<{len(stacked_vals)}f", *stacked_vals),
+                )
+            else:
+                for p_i, item in delta_list_sorted:
+                    base_out = normalize_gguf_tensor_name(
+                        f"blk.{base_core}.{leaf}",
+                        is_clip=is_clip,
+                        layer_remap=layer_remap,
+                        inkling2_runtime_names=use_inkling2_runtime_names,
+                        attn_res_shifted_by_1=attn_res_shifted_by_1,
+                    )
+                    extra_pass_items.append((f"{base_out}.pass{p_i}", item))
+
+    def _convert_ink2_f32_needed(out_nm: str, out_k: TensorKind, g_type: int) -> bool:
+        if not use_inkling2_runtime_names or g_type != 0:
+            return False
+        if out_k == TensorKind.NORM or is_inkling2_controller_tensor(out_nm):
+            return True
+        return out_nm.endswith(".mlp.gate.weight") or out_nm.endswith(".mlp.gate")
+
+    target_f16_dt = DType.F16 if dtype_mode == "f16" else DType.BF16
+
+    all_planning_items: list[tuple[str | None, int, GgufShard, GgufTensorInfo]] = [
+        (None, s_idx, sh, t) for s_idx, sh, t in flat_items
+    ] + [(ov_name, s_idx, sh, t) for ov_name, (s_idx, sh, t) in extra_pass_items]
+
+    for override_out_name, s_idx, sh, t in all_planning_items:
+        if override_out_name is None and (t.name in excluded or t.name in consumed_names):
             continue
+        if override_out_name is None and t.name in synthetic_override_items:
+            ov_nm, ov_shp, ov_bytes = synthetic_override_items[t.name]
+            if ov_nm in excluded:
+                continue
+            ov_kind, ov_layer, ov_exp = _classify_tensor(ov_nm, cold_set, all_experts_cold)
+            planned.append(
+                _PlannedGgufEntry(
+                    name=ov_nm,
+                    kind=ov_kind,
+                    dtype=DType.F32,
+                    quant_bits=0,
+                    group_size=0,
+                    layer=ov_layer,
+                    expert=ov_exp,
+                    shape=ov_shp,
+                    shard=None,
+                    src_offset=0,
+                    src_bytes=len(ov_bytes),
+                    src_ggml_type=0,
+                    data_convert=None,
+                    scale_shard=None,
+                    scale_info=None,
+                    fp8_mode=None,
+                    data_bytes=len(ov_bytes),
+                    params_offset=0,
+                    params_bytes=0,
+                    blob_bytes=_align_up(max(len(ov_bytes), 1), APPLE_PAGE_SIZE),
+                    synthetic_bytes=ov_bytes,
+                )
+            )
+            continue
+
         spec = _GGML_TYPE_INFO[t.ggml_type]
         _gname, bs, bb, base_amf_dt = spec
         assert base_amf_dt is not None
 
-        # Handle stacked 3D expert tensors `(K, M, E)` -> split per expert `e in 0..E-1`.
         amf_shape_full = t.amf_shape
-        ex_m = re.match(r"^blk\.(\d+)\.(ffn_gate_up|ffn_gate|ffn_up|ffn_down)_exps(?:\.(weight))?$", t.name)
+        ex_m = (
+            re.match(r"^blk\.(\d+)\.(ffn_gate_up|ffn_gate|ffn_up|ffn_down)_exps(?:\.(weight))?$", t.name)
+            if override_out_name is None
+            else None
+        )
+        # Each tuple: (out_name, out_kind, layer_i, exp_i, shape, src_off, src_len,
+        #              pair_interleave, second_sh, second_off, exp_scale, second_exp_scale)
+        slices: list[
+            tuple[
+                str,
+                TensorKind,
+                int,
+                int,
+                tuple[int, ...],
+                int,
+                int,
+                bool,
+                GgufShard | None,
+                int,
+                float | None,
+                float | None,
+            ]
+        ]
         if ex_m is not None and len(amf_shape_full) == 3:
             raw_layer_i = int(ex_m.group(1))
             layer_i = layer_remap.get(raw_layer_i, raw_layer_i)
-            proj = {
-                "ffn_gate": "gate_proj",
-                "ffn_up": "up_proj",
-                "ffn_down": "down_proj",
-                "ffn_gate_up": "gate_up_proj",
-            }[ex_m.group(2)]
+            raw_proj = ex_m.group(2)
             num_experts, n_r, k_c = amf_shape_full
             exp_slice_bytes = t.expected_bytes // num_experts
-            slices = [
-                (
-                    f"layers.{layer_i}.mlp.experts.{e}.{proj}.weight",
-                    (TensorKind.COLD_EXPERT if (all_experts_cold or (layer_i, e) in cold_set) else TensorKind.HOT_EXPERT),
-                    layer_i,
-                    e,
-                    (n_r, k_c),
-                    t.offset + e * exp_slice_bytes,
-                    exp_slice_bytes,
-                )
-                for e in range(num_experts)
-            ]
+            sc_arr = exps_scale_vals.get(t.name)
+
+            if raw_proj == "ffn_gate" and t.name in fused_split_gate_ups:
+                _, up_sh, up_t = fused_split_gate_ups[t.name]
+                up_exp_bytes = up_t.expected_bytes // num_experts
+                up_sc_arr = exps_scale_vals.get(up_t.name)
+                if exp_slice_bytes != up_exp_bytes or exp_slice_bytes % n_r != 0:
+                    raise ValueError(f"cannot fuse split gate/up experts for blk.{raw_layer_i}: {exp_slice_bytes} vs {up_exp_bytes}")
+                slices = []
+                for e in range(num_experts):
+                    e_name = f"layers.{layer_i}.mlp.experts.{e}.w13.weight"
+                    if e_name in excluded:
+                        continue
+                    e_kind = TensorKind.COLD_EXPERT if (all_experts_cold or (layer_i, e) in cold_set) else TensorKind.HOT_EXPERT
+                    slices.append(
+                        (
+                            e_name,
+                            e_kind,
+                            layer_i,
+                            e,
+                            (2 * n_r, k_c),
+                            t.offset + e * exp_slice_bytes,
+                            exp_slice_bytes + up_exp_bytes,
+                            False,
+                            up_sh,
+                            up_t.offset + e * up_exp_bytes,
+                            sc_arr[e] if sc_arr is not None else None,
+                            up_sc_arr[e] if up_sc_arr is not None else None,
+                        )
+                    )
+            else:
+                proj = {
+                    "ffn_gate": "gate_proj",
+                    "ffn_up": "up_proj",
+                    "ffn_down": "down_proj",
+                    "ffn_gate_up": "w13" if use_inkling2_runtime_names else "gate_up_proj",
+                }[raw_proj]
+                is_pair_interleave = raw_proj == "ffn_gate_up" and use_inkling2_runtime_names
+                if is_pair_interleave and (n_r % 2 != 0 or exp_slice_bytes % n_r != 0):
+                    raise ValueError(
+                        f"cannot pair_interleave {t.name!r} with shape {(n_r, k_c)} and {exp_slice_bytes} B/expert"
+                    )
+                slices = []
+                for e in range(num_experts):
+                    e_name = f"layers.{layer_i}.mlp.experts.{e}.{proj}.weight"
+                    if e_name in excluded:
+                        continue
+                    e_kind = TensorKind.COLD_EXPERT if (all_experts_cold or (layer_i, e) in cold_set) else TensorKind.HOT_EXPERT
+                    slices.append(
+                        (
+                            e_name,
+                            e_kind,
+                            layer_i,
+                            e,
+                            (n_r, k_c),
+                            t.offset + e * exp_slice_bytes,
+                            exp_slice_bytes,
+                            is_pair_interleave,
+                            None,
+                            0,
+                            sc_arr[e] if sc_arr is not None else None,
+                            None,
+                        )
+                    )
         else:
-            norm_name = normalize_gguf_tensor_name(t.name, is_clip=is_clip, layer_remap=layer_remap)
+            norm_name = (
+                override_out_name
+                if override_out_name is not None
+                else normalize_gguf_tensor_name(
+                    t.name,
+                    is_clip=is_clip,
+                    layer_remap=layer_remap,
+                    inkling2_runtime_names=use_inkling2_runtime_names,
+                    attn_res_shifted_by_1=attn_res_shifted_by_1,
+                )
+            )
             if norm_name in excluded:
                 continue
             kind, layer_i, exp_i = _classify_tensor(norm_name, cold_set, all_experts_cold)
-            slices = [(norm_name, kind, layer_i, exp_i, amf_shape_full, t.offset, t.expected_bytes)]
+            slices = [(norm_name, kind, layer_i, exp_i, amf_shape_full, t.offset, t.expected_bytes, False, None, 0, None, None)]
 
-        for out_name, out_kind, layer_i, exp_i, shp, src_off, src_len in slices:
+        for (
+            out_name,
+            out_kind,
+            layer_i,
+            exp_i,
+            shp,
+            src_off,
+            src_len,
+            pair_interleave,
+            second_sh,
+            second_off,
+            exp_scale,
+            second_exp_scale,
+        ) in slices:
             convert: str | None = None
             out_dt = base_amf_dt
             q_bits = 0
@@ -1699,6 +2372,10 @@ def pack_amf_from_gguf(
                 data_bytes = shp[0] * shp[1]
                 params_offset = _align_up(data_bytes, 64)
                 params_bytes = shp[0] * 4
+            elif _convert_ink2_f32_needed(out_name, out_kind, t.ggml_type):
+                out_dt = target_f16_dt
+                convert = "f32_to_f16" if target_f16_dt == DType.F16 else "f32_to_bf16"
+                data_bytes = src_len // 2
             elif out_dt == DType.F16 and dtype_mode == "bf16":
                 out_dt = DType.BF16
                 convert = "f16_to_bf16"
@@ -1763,11 +2440,16 @@ def pack_amf_from_gguf(
                 data_bytes = sme2_panel64_data_bytes(out_dt, shp[0], shp[1], 0)
                 params_offset = 0
                 params_bytes = 0
-                convert = (
-                    "sme2_f16_to_bf16"
-                    if convert == "f16_to_bf16"
-                    else ("sme2_bf16_to_f16" if convert == "bf16_to_f16" else "sme2_f16")
-                )
+                if convert == "f16_to_bf16":
+                    convert = "sme2_f16_to_bf16"
+                elif convert == "bf16_to_f16":
+                    convert = "sme2_bf16_to_f16"
+                elif convert == "f32_to_bf16":
+                    convert = "sme2_f32_to_bf16"
+                elif convert == "f32_to_f16":
+                    convert = "sme2_f32_to_f16"
+                else:
+                    convert = "sme2_f16"
 
             content = (params_offset + params_bytes) if params_bytes > 0 else data_bytes
             entry_obj = _PlannedGgufEntry(
@@ -1792,9 +2474,17 @@ def pack_amf_from_gguf(
                 params_bytes=params_bytes,
                 blob_bytes=_align_up(max(content, 1), APPLE_PAGE_SIZE),
                 layout=out_layout,
+                pair_interleave_rows=pair_interleave,
+                second_shard=second_sh,
+                second_src_offset=second_off,
+                expert_scale=exp_scale,
+                second_expert_scale=second_exp_scale,
             )
             if engram_output is not None and out_kind == TensorKind.SPARSE_TABLE:
                 planned_engram.append(entry_obj)
+            elif not is_clip and is_vision_tensor(out_name) and (strip_vision or vision_sidecar is not None):
+                if vision_sidecar is not None:
+                    planned_vision.append(entry_obj)
             else:
                 planned.append(entry_obj)
 
@@ -1815,10 +2505,13 @@ def pack_amf_from_gguf(
         or config_path is not None
         or tokenizer_path is not None
         or chat_template_path is not None
+        or meta_config_override is not None
     )
     if want_meta or draft_config_output is not None:
         ext_cfg = pathlib.Path(config_path) if config_path is not None else (base_dir / "config.json")
-        if ext_cfg.is_file():
+        if meta_config_override is not None:
+            cfg_bytes = meta_config_override
+        elif ext_cfg.is_file():
             cfg_bytes = ext_cfg.read_bytes()
         else:
             cfg_bytes = _build_synthesized_config_bytes(kv, physical_layers=physical_layers, dedup_layers=dedup_layers)
@@ -1826,7 +2519,9 @@ def pack_amf_from_gguf(
             dcfg_p = pathlib.Path(draft_config_output)
             dcfg_p.parent.mkdir(parents=True, exist_ok=True)
             dcfg_p.write_bytes(cfg_bytes + (b"" if cfg_bytes.endswith(b"\n") else b"\n"))
-        if want_meta and (embed_metadata or is_clip or arch == "dflash" or config_path is not None):
+        if want_meta and (
+            embed_metadata or is_clip or arch == "dflash" or config_path is not None or meta_config_override is not None
+        ):
             meta_blobs.append((META_CONFIG_JSON, cfg_bytes))
 
         ext_tok = pathlib.Path(tokenizer_path) if tokenizer_path is not None else (base_dir / "tokenizer.json")
@@ -1867,6 +2562,46 @@ def pack_amf_from_gguf(
                 (META_CHAT_TEMPLATE_JSON, json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             )
 
+    def _read_exact(sfh, n_bytes: int, what: str) -> bytes:
+        buf = sfh.read(n_bytes)
+        if len(buf) != n_bytes:
+            raise ValueError(f"unexpected EOF reading {what}")
+        return buf
+
+    def _prepare_expert_raw(e: _PlannedGgufEntry, fhs: dict[pathlib.Path, Any]) -> bytes:
+        """Assemble optionally-scaled / pair-interleaved raw bytes for GGUF MoE experts."""
+        if e.shard is None:
+            assert e.synthetic_bytes is not None
+            return e.synthetic_bytes
+        if e.second_shard is not None:
+            half_len = e.src_bytes // 2
+            sfh1 = fhs[e.shard.path]
+            sfh1.seek(e.shard.data_offset + e.src_offset)
+            g_buf = bytearray(_read_exact(sfh1, half_len, e.name))
+            sfh2 = fhs[e.second_shard.path]
+            sfh2.seek(e.second_shard.data_offset + e.second_src_offset)
+            u_buf = bytearray(_read_exact(sfh2, half_len, e.name))
+            if e.dtype >= DType.GGUF_Q4_0:
+                _, bb_exp = _AMF_GGUF_BLOCK_INFO[e.dtype]
+                if e.expert_scale is not None and e.expert_scale != 1.0:
+                    _scale_gguf_blocks_in_place(g_buf, e.dtype, bb_exp, e.expert_scale, e.name)
+                if e.second_expert_scale is not None and e.second_expert_scale != 1.0:
+                    _scale_gguf_blocks_in_place(u_buf, e.dtype, bb_exp, e.second_expert_scale, e.name)
+            half_rows = e.shape[0] // 2
+            row_b = half_len // half_rows
+            return _interleave_split_rows(g_buf, u_buf, half_rows, row_b)
+
+        sfh = fhs[e.shard.path]
+        sfh.seek(e.shard.data_offset + e.src_offset)
+        buf = bytearray(_read_exact(sfh, e.src_bytes, e.name))
+        if e.dtype >= DType.GGUF_Q4_0 and e.expert_scale is not None and e.expert_scale != 1.0:
+            _, bb_exp = _AMF_GGUF_BLOCK_INFO[e.dtype]
+            _scale_gguf_blocks_in_place(buf, e.dtype, bb_exp, e.expert_scale, e.name)
+        if e.pair_interleave_rows:
+            n_r = e.shape[0]
+            return _interleave_pair_rows(buf, n_r, e.src_bytes // n_r)
+        return bytes(buf)
+
     def _write_staged(
         target_amf: pathlib.Path,
         entries_list: Sequence[_PlannedGgufEntry],
@@ -1899,74 +2634,113 @@ def pack_amf_from_gguf(
 
                 for e, blob_offset in zip(entries_list, offsets):
                     w = _BlobWriter(out_fh)
-                    sfh = in_fhs[e.shard.path]
-                    sfh.seek(e.shard.data_offset + e.src_offset)
-
-                    if e.data_convert is None:
+                    needs_expert_buf = (
+                        e.synthetic_bytes is not None
+                        or e.pair_interleave_rows
+                        or e.second_shard is not None
+                        or (e.expert_scale is not None and e.expert_scale != 1.0 and e.data_convert != "gguf_nvfp4")
+                    )
+                    if e.synthetic_bytes is not None:
+                        w.write(e.synthetic_bytes)
+                    elif e.data_convert is None and needs_expert_buf:
+                        w.write(_prepare_expert_raw(e, in_fhs))
+                    elif e.data_convert is None:
+                        assert e.shard is not None
+                        sfh = in_fhs[e.shard.path]
+                        sfh.seek(e.shard.data_offset + e.src_offset)
                         left = e.src_bytes
                         while left > 0:
                             take = min(8 * 1024 * 1024, left)
-                            chunk = sfh.read(take)
-                            if len(chunk) != take:
-                                raise ValueError(f"unexpected EOF streaming {e.name!r}")
+                            chunk = _read_exact(sfh, take, e.name)
                             w.write(chunk)
                             left -= take
                     elif e.data_convert in ("f16_to_bf16", "bf16_to_f16"):
+                        assert e.shard is not None
+                        sfh = in_fhs[e.shard.path]
+                        sfh.seek(e.shard.data_offset + e.src_offset)
                         left = e.src_bytes
                         while left > 0:
                             take = min((1 << 20) * 2, left)
-                            chunk = sfh.read(take)
-                            if len(chunk) != take:
-                                raise ValueError(f"unexpected EOF converting {e.name!r}")
+                            chunk = _read_exact(sfh, take, e.name)
                             w.write(
                                 f16_bytes_to_bf16_bytes(chunk)
                                 if e.data_convert == "f16_to_bf16"
                                 else bf16_bytes_to_f16_bytes(chunk, what=e.name)
                             )
                             left -= take
-                    elif e.data_convert in ("sme2_f16", "sme2_f16_to_bf16", "sme2_bf16_to_f16"):
+                    elif e.data_convert in ("f32_to_bf16", "f32_to_f16"):
+                        assert e.shard is not None
+                        sfh = in_fhs[e.shard.path]
+                        sfh.seek(e.shard.data_offset + e.src_offset)
+                        raw = _read_exact(sfh, e.src_bytes, e.name)
+                        vals = struct.unpack(f"<{e.src_bytes // 4}f", raw)
+                        w.write(f32_to_f16_bytes(vals) if e.data_convert == "f32_to_f16" else f32_to_bf16_bytes(vals))
+                    elif e.data_convert in (
+                        "sme2_f16",
+                        "sme2_f16_to_bf16",
+                        "sme2_bf16_to_f16",
+                        "sme2_f32_to_bf16",
+                        "sme2_f32_to_f16",
+                    ):
+                        assert e.shard is not None
+                        sfh = in_fhs[e.shard.path]
+                        sfh.seek(e.shard.data_offset + e.src_offset)
                         n_r, k_c = e.shape
-                        row_bytes = k_c * 2
+                        src_row_bytes = k_c * 4 if e.data_convert in ("sme2_f32_to_bf16", "sme2_f32_to_f16") else k_c * 2
+                        dst_row_bytes = k_c * 2
                         panels = (n_r + SME2_PANEL_COLS - 1) // SME2_PANEL_COLS
                         for p in range(panels):
                             r0 = p * SME2_PANEL_COLS
                             cnt = min(SME2_PANEL_COLS, n_r - r0)
-                            raw = sfh.read(cnt * row_bytes)
-                            if len(raw) != cnt * row_bytes:
-                                raise ValueError(f"unexpected EOF packing SME2 panel for {e.name!r}")
+                            raw = _read_exact(sfh, cnt * src_row_bytes, e.name)
                             if e.data_convert == "sme2_f16_to_bf16":
                                 raw = f16_bytes_to_bf16_bytes(raw)
                             elif e.data_convert == "sme2_bf16_to_f16":
                                 raw = bf16_bytes_to_f16_bytes(raw, what=e.name)
+                            elif e.data_convert == "sme2_f32_to_bf16":
+                                raw = f32_to_bf16_bytes(struct.unpack(f"<{cnt * k_c}f", raw))
+                            elif e.data_convert == "sme2_f32_to_f16":
+                                raw = f32_to_f16_bytes(struct.unpack(f"<{cnt * k_c}f", raw))
                             mv = memoryview(raw)
-                            rows_mv = [mv[c * row_bytes : (c + 1) * row_bytes] for c in range(cnt)]
+                            rows_mv = [mv[c * dst_row_bytes : (c + 1) * dst_row_bytes] for c in range(cnt)]
                             w.write(pack_sme2_panel64_f16_panel(rows_mv, k_c))
                     elif e.data_convert == "gguf_nvfp4":
                         n_r, k_c = e.shape
                         row_src_b = (k_c // 64) * 36
                         scales_acc = bytearray()
-                        for _ in range(n_r):
-                            r_raw = sfh.read(row_src_b)
-                            if len(r_raw) != row_src_b:
-                                raise ValueError(f"unexpected EOF reading GGUF NVFP4 row for {e.name!r}")
-                            d_row, s_row = _unsplit_nvfp4_row(r_raw, k_c)
-                            w.write(d_row)
-                            scales_acc.extend(s_row)
+                        if e.pair_interleave_rows or e.second_shard is not None:
+                            full_raw = memoryview(_prepare_expert_raw(e, in_fhs))
+                            for r in range(n_r):
+                                r_raw = full_raw[r * row_src_b : (r + 1) * row_src_b]
+                                d_row, s_row = _unsplit_nvfp4_row(r_raw, k_c)
+                                w.write(d_row)
+                                scales_acc.extend(s_row)
+                        else:
+                            assert e.shard is not None
+                            sfh = in_fhs[e.shard.path]
+                            sfh.seek(e.shard.data_offset + e.src_offset)
+                            for _ in range(n_r):
+                                r_raw = _read_exact(sfh, row_src_b, e.name)
+                                d_row, s_row = _unsplit_nvfp4_row(r_raw, k_c)
+                                w.write(d_row)
+                                scales_acc.extend(s_row)
                         w.zeros(e.params_offset - e.data_bytes)
                         w.write(scales_acc)
                         pad4 = _align_up(len(scales_acc), 4) - len(scales_acc)
                         if pad4 > 0:
                             w.zeros(pad4)
-                        w.write(struct.pack("<f", 1.0))
+                        outer_sc = e.expert_scale if e.expert_scale is not None else 1.0
+                        w.write(struct.pack("<f", outer_sc))
                     elif e.data_convert == "quant_fp8_row":
+                        assert e.shard is not None
+                        sfh = in_fhs[e.shard.path]
+                        sfh.seek(e.shard.data_offset + e.src_offset)
                         n_r, k_c = e.shape
                         elem_b = 4 if e.src_ggml_type == 0 else 2
                         row_src_b = k_c * elem_b
                         scales_f32: list[float] = []
                         for _ in range(n_r):
-                            r_raw = sfh.read(row_src_b)
-                            if len(r_raw) != row_src_b:
-                                raise ValueError(f"unexpected EOF quantizing Engram row for {e.name!r}")
+                            r_raw = _read_exact(sfh, row_src_b, e.name)
                             if e.src_ggml_type == 0:
                                 vals = list(struct.unpack(f"<{k_c}f", r_raw))
                             elif e.src_ggml_type == 1:
@@ -2131,6 +2905,26 @@ def pack_amf_from_gguf(
                         shard_entries.append(pe)
                 if shard_entries:
                     _write_staged(shard_path, shard_entries, [], f"{eff_model_id[:52]}-engram-{s_idx}")
+
+    if vision_sidecar is not None and planned_vision:
+        planned_vision.sort(key=lambda e: _natural_key(e.name))
+        vis_out = pathlib.Path(vision_sidecar)
+        vis_staged = vis_out.with_name(vis_out.name + ".vision_stage.amf")
+        try:
+            _write_staged(vis_staged, planned_vision, [], f"{eff_model_id[:55]}-vision")
+            pack_vision_tower_amf(
+                vis_staged,
+                vis_out,
+                model_id=f"{eff_model_id[:55]}-vision",
+                dtype_mode=dtype_mode,
+                vision_block_dtype=vision_block_dtype,
+                group_size=group_size,
+                embed_metadata=embed_metadata,
+                config_path=config_path,
+                stats_out=stats_out,
+            )
+        finally:
+            vis_staged.unlink(missing_ok=True)
 
     if is_clip:
         staged = out_path.with_name(out_path.name + ".clip_stage.amf")

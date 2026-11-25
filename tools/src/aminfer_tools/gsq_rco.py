@@ -33,6 +33,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import struct
 from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
@@ -44,6 +45,7 @@ from aminfer_tools.amf import (
     AFFINE_GROUP_SIZES,
     DTYPE_MODES,
     ENTRY_STRUCT,
+    FLAG_EMBEDDED_METADATA,
     NO_EXPERT,
     NO_LAYER,
     SME2_GROUP_K,
@@ -2078,8 +2080,91 @@ _STRICT_Q4_FLOOR_ROLES = frozenset(
 )
 
 
-def parse_gguf_imatrix(path: pathlib.Path) -> dict[str, list[float]]:
+_INKLING2_IMATRIX_BLK_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
+_INKLING2_LOOP_MARKER_RE = re.compile(r"(?:^|\.)(?:loop_|controllers\.|.*_message_gate\.)")
+_IMATRIX_LAYER_RE = re.compile(r"(?:^|\.)(?:layers|blk)\.(\d+)\.")
+
+
+def _resolve_unrolled_loop_layer(
+    blk_idx: int,
+    loop_schedule: tuple[int, int, int] | None,
+) -> int:
+    """Fold an unrolled recurrent step index `blk_idx` onto its physical layer index."""
+    if loop_schedule is None:
+        return blk_idx
+    core_start, core_end, num_passes = loop_schedule
+    core_len = core_end - core_start
+    if core_len <= 0 or num_passes <= 1 or blk_idx < core_start:
+        return blk_idx
+    loop_end_step = core_start + core_len * num_passes
+    if blk_idx < loop_end_step:
+        return core_start + ((blk_idx - core_start) % core_len)
+    return core_end + (blk_idx - loop_end_step)
+
+
+def _detect_unrolled_loop_schedule(
+    raw_names: Iterable[str],
+    loop_schedule: tuple[int, int, int] | None = None,
+) -> tuple[int, int, int] | None:
+    """Return `(core_start, core_end, num_passes)` only when unrolled steps exist."""
+    blk_indices: list[int] = []
+    has_loop_markers = False
+    for nm in raw_names:
+        m = _INKLING2_IMATRIX_BLK_RE.match(nm)
+        if m is not None:
+            blk_indices.append(int(m.group(1)))
+            if _INKLING2_LOOP_MARKER_RE.search(m.group(2)):
+                has_loop_markers = True
+    if not blk_indices:
+        return None
+    max_blk = max(blk_indices)
+    if loop_schedule is not None:
+        core_start, core_end, num_passes = loop_schedule
+        if core_end > core_start and num_passes > 1:
+            # Already-folded 24-layer GGUF (`blk.0..23`) has max_blk < core_start + core_len * num_passes.
+            physical_blocks = core_end + (core_end - core_start) * 0
+            loop_end_step = core_start + (core_end - core_start) * num_passes
+            if max_blk + 1 >= loop_end_step and max_blk >= physical_blocks:
+                return loop_schedule
+        return None
+    if max_blk == 47 and has_loop_markers:
+        return (6, 18, 3)
+    return None
+
+
+def _pool_folded_imatrix_vectors(
+    buckets: dict[str, tuple[list[float], list[float] | None]],
+) -> dict[str, list[float]]:
+    """Divide accumulated `sum_sq` vectors by pooled sample `counts`."""
+    out: dict[str, list[float]] = {}
+    for norm, (vals, cnts) in buckets.items():
+        if cnts is None or len(cnts) == 0:
+            out[norm] = vals
+        elif len(cnts) == 1:
+            denom = cnts[0] if (math.isfinite(cnts[0]) and cnts[0] > 0.0) else 1.0
+            out[norm] = [v / denom for v in vals]
+        elif len(cnts) == len(vals):
+            out[norm] = [v / (c if (math.isfinite(c) and c > 0.0) else 1.0) for v, c in zip(vals, cnts)]
+        elif len(vals) % len(cnts) == 0:
+            stride = len(vals) // len(cnts)
+            denoms = [c if (math.isfinite(c) and c > 0.0) else 1.0 for c in cnts]
+            out[norm] = [v / denoms[i // stride] for i, v in enumerate(vals)]
+        else:
+            out[norm] = vals
+    return out
+
+
+def parse_gguf_imatrix(
+    path: pathlib.Path,
+    *,
+    loop_schedule: tuple[int, int, int] | None = None,
+) -> dict[str, list[float]]:
     """Parse importance matrix weights from llama.cpp `.gguf`, legacy `.dat`, or JSON imatrix.
+
+    Automatically folds unrolled recurrent `48 -> 24` `inkling2_loop` entries (e.g.
+    `blk.6..17`, `blk.18..29`, `blk.30..41` -> physical layers `6..17`) using
+    sample-count-weighted pooling `(sum_sq_0 + sum_sq_1 + sum_sq_2) / (cnt_0 + cnt_1 + cnt_2)`
+    while keeping natively folded `blk.0..23` GGUFs (`imatrix_unsloth.gguf_file`) intact.
 
     Returns `{normalized_tensor_name: [channel_importance, ...]}` where each channel entry
     tracks mean squared calibration activation `E[x^2]`.
@@ -2089,46 +2174,63 @@ def parse_gguf_imatrix(path: pathlib.Path) -> dict[str, list[float]]:
     if len(raw) < 4:
         raise ValueError(f"imatrix file is too small: {p}")
 
-    out: dict[str, list[float]] = {}
     if raw[:4] == b"GGUF":
         from aminfer_tools.gguf import normalize_gguf_tensor_name, read_gguf_header
 
         g = read_gguf_header(p)
         by_name = {t.name: t for t in g.tensors}
+        base_names = [
+            t.name[: -len(".in_sum2")] if t.name.endswith(".in_sum2") else t.name
+            for t in g.tensors
+            if t.ggml_type == 0 and not t.name.endswith(".counts")
+        ]
+        eff_sched = _detect_unrolled_loop_schedule(base_names, loop_schedule=loop_schedule)
+        accum: dict[str, tuple[list[float], list[float] | None]] = {}
         with p.open("rb") as fh:
             for t in g.tensors:
-                if t.ggml_type != 0:  # F32
-                    continue
-                if t.name.endswith(".counts"):
+                if t.ggml_type != 0 or t.name.endswith(".counts"):  # F32 only
                     continue
                 base_raw = t.name[: -len(".in_sum2")] if t.name.endswith(".in_sum2") else t.name
                 fh.seek(g.data_offset + t.offset)
                 vals = list(struct.unpack(f"<{t.numel}f", fh.read(t.numel * 4)))
+                cnts: list[float] | None = None
                 cnt_t = by_name.get(f"{base_raw}.counts")
+                if cnt_t is None and base_raw.endswith(".weight"):
+                    cnt_t = by_name.get(f"{base_raw[:-7]}.counts")
                 if cnt_t is not None and cnt_t.ggml_type == 0 and cnt_t.numel > 0 and t.numel % cnt_t.numel == 0:
                     fh.seek(g.data_offset + cnt_t.offset)
-                    cnts = struct.unpack(f"<{cnt_t.numel}f", fh.read(cnt_t.numel * 4))
-                    if len(cnts) == 1:
-                        denom = cnts[0] if (math.isfinite(cnts[0]) and cnts[0] > 0.0) else 1.0
-                        vals = [v / denom for v in vals]
-                    elif len(cnts) == len(vals):
-                        vals = [v / (c if (math.isfinite(c) and c > 0.0) else 1.0) for v, c in zip(vals, cnts)]
-                    else:
-                        stride = len(vals) // len(cnts)
-                        denoms = [c if (math.isfinite(c) and c > 0.0) else 1.0 for c in cnts]
-                        vals = [v / denoms[i // stride] for i, v in enumerate(vals)]
-                norm = normalize_gguf_tensor_name(base_raw)
-                out[norm] = vals
-        return out
+                    cnts = [float(c) if math.isfinite(c) and c > 0.0 else 0.0 for c in struct.unpack(f"<{cnt_t.numel}f", fh.read(cnt_t.numel * 4))]
+                mb = _INKLING2_IMATRIX_BLK_RE.match(base_raw)
+                if mb is not None and eff_sched is not None:
+                    phys_l = _resolve_unrolled_loop_layer(int(mb.group(1)), eff_sched)
+                    folded_raw = f"blk.{phys_l}.{mb.group(2)}"
+                else:
+                    folded_raw = base_raw
+                norm = normalize_gguf_tensor_name(folded_raw)
+                prev = accum.get(norm)
+                if prev is None:
+                    accum[norm] = (vals, list(cnts) if cnts is not None else None)
+                else:
+                    p_vals, p_cnts = prev
+                    if len(p_vals) == len(vals):
+                        for i, v in enumerate(vals):
+                            p_vals[i] += v
+                    if p_cnts is not None and cnts is not None and len(p_cnts) == len(cnts):
+                        for i, c in enumerate(cnts):
+                            p_cnts[i] += c
+                    elif p_cnts is None and cnts is not None:
+                        accum[norm] = (p_vals, list(cnts))
+        return _pool_folded_imatrix_vectors(accum)
 
     if raw[:1] in (b"{", b"["):
         loaded = json.loads(raw.decode("utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError(f"JSON imatrix in {p} must be an object mapping tensor names")
+        out_json: dict[str, list[float]] = {}
         for k, v in loaded.items():
             vals = [float(v)] if isinstance(v, (int, float)) else [float(x) for x in v]
-            out[str(k)] = vals
-        return out
+            out_json[str(k)] = vals
+        return out_json
 
     # Legacy llama.cpp binary `.dat` format:
     # `int32 n_entries`, then per entry: `int32 name_len, bytes name, int32 ncall, int32 nval, float32[nval]`.
@@ -2139,6 +2241,7 @@ def parse_gguf_imatrix(path: pathlib.Path) -> dict[str, list[float]]:
         raise ValueError(f"implausible imatrix entry count {n_entries} in {p}")
     from aminfer_tools.gguf import normalize_gguf_tensor_name
 
+    parsed_entries: list[tuple[str, int, tuple[float, ...]]] = []
     for _ in range(n_entries):
         if off + 4 > len(raw):
             raise ValueError(f"truncated imatrix .dat header in {p}")
@@ -2154,14 +2257,67 @@ def parse_gguf_imatrix(path: pathlib.Path) -> dict[str, list[float]]:
             raise ValueError(f"corrupt imatrix entry nval={nval} for {raw_name!r} in {p}")
         vals_raw = struct.unpack_from(f"<{nval}f", raw, off)
         off += nval * 4
+        parsed_entries.append((raw_name, ncall, vals_raw))
+
+    eff_sched_dat = _detect_unrolled_loop_schedule((e[0] for e in parsed_entries), loop_schedule=loop_schedule)
+    accum_dat: dict[str, tuple[list[float], list[float] | None]] = {}
+    for raw_name, ncall, vals_raw in parsed_entries:
+        mb = _INKLING2_IMATRIX_BLK_RE.match(raw_name)
+        if mb is not None and eff_sched_dat is not None:
+            phys_l = _resolve_unrolled_loop_layer(int(mb.group(1)), eff_sched_dat)
+            folded_raw = f"blk.{phys_l}.{mb.group(2)}"
+        else:
+            folded_raw = raw_name
+        norm = normalize_gguf_tensor_name(folded_raw)
         denom = float(ncall) if ncall > 0 else 1.0
-        vals = [float(v) / denom for v in vals_raw]
-        out[normalize_gguf_tensor_name(raw_name)] = vals
-    return out
+        vals_f = [float(v) for v in vals_raw]
+        prev = accum_dat.get(norm)
+        if prev is None:
+            accum_dat[norm] = (vals_f, [denom])
+        else:
+            p_vals, p_cnts = prev
+            if len(p_vals) == len(vals_f):
+                for i, v in enumerate(vals_f):
+                    p_vals[i] += v
+            if p_cnts is not None:
+                p_cnts[0] += denom
+    return _pool_folded_imatrix_vectors(accum_dat)
 
 
-def _imatrix_tensor_multipliers(imatrix: dict[str, list[float]]) -> dict[str, float]:
-    """Convert raw `imatrix` activation vectors into median-normalized `[0.5, 4.0]` GSQ priors."""
+def _imatrix_layer_and_role(key: str) -> tuple[int, str]:
+    """Classify an imatrix key into `(layer_idx, role_group)` for depth-invariant normalization."""
+    m = _IMATRIX_LAYER_RE.search(key)
+    layer = int(m.group(1)) if m is not None else NO_LAYER
+    lower = key.lower()
+    if any(tok in lower for tok in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps", ".experts.", "switch_mlp")):
+        return layer, "moe_expert"
+    if "controller" in lower or "loop_" in lower or "message_gate" in lower:
+        return layer, "controller"
+    if "sconv" in lower or "conv_proj" in lower or "conv1d" in lower:
+        return layer, "sconv"
+    if "ffn_gate_inp" in lower or lower.endswith((".mlp.gate", ".mlp.gate.weight", ".ffn.gate", ".ffn.gate.weight")):
+        return layer, "router"
+    if any(tok in lower for tok in (".attn.", ".self_attn.", "attn_", "wq_du", "wk_dv", "wv_dv", "wo_ud", "wr_du", "gate_attn")):
+        return layer, "attn"
+    if any(tok in lower for tok in ("ffn_", ".mlp.", "gate_proj", "up_proj", "down_proj", ".w13", ".w2")):
+        return layer, "ffn"
+    return layer, "dense"
+
+
+def _imatrix_tensor_multipliers(
+    imatrix: dict[str, list[float]],
+    *,
+    normalize_by: str = "layer_role",
+) -> dict[str, float]:
+    """Convert raw `imatrix` activation vectors into median-normalized `[0.5, 4.0]` GSQ priors.
+
+    `normalize_by='layer_role'` (default) normalizes within each `(layer_idx, role_group)` bucket
+    so Pre-LN depth activation growth across layers (`~760x` in `Inkling-2-Mini` / `Qwen3-30B-A3B`)
+    does not clip shallow layers (`L0..L3`) to `0.5` and over-allocate `q2_affine` to `L0`.
+    Pass `normalize_by='global'` for legacy cross-layer median normalization.
+    """
+    if normalize_by not in ("layer_role", "global"):
+        raise ValueError(f"normalize_by must be 'layer_role' or 'global', got {normalize_by!r}")
     means: dict[str, float] = {}
     for k, vec in imatrix.items():
         if vec:
@@ -2171,19 +2327,67 @@ def _imatrix_tensor_multipliers(imatrix: dict[str, list[float]]) -> dict[str, fl
                 means[k] = m
     if not means:
         return {}
-    s = sorted(means.values())
-    mid = len(s) // 2
-    med = s[mid] if (len(s) & 1) else 0.5 * (s[mid - 1] + s[mid])
-    if not math.isfinite(med) or med <= 0.0:
-        return {}
-    return {k: max(0.5, min(4.0, v / med)) for k, v in means.items()}
+
+    def _median_of(vals: list[float]) -> float:
+        s = sorted(vals)
+        mid = len(s) // 2
+        return s[mid] if (len(s) & 1) else 0.5 * (s[mid - 1] + s[mid])
+
+    if normalize_by == "global":
+        med = _median_of(list(means.values()))
+        if not math.isfinite(med) or med <= 0.0:
+            return {}
+        return {k: max(0.5, min(4.0, v / med)) for k, v in means.items()}
+
+    buckets: dict[tuple[int, str], list[str]] = {}
+    for k in means:
+        buckets.setdefault(_imatrix_layer_and_role(k), []).append(k)
+
+    out: dict[str, float] = {}
+    for keys in buckets.values():
+        med = _median_of([means[k] for k in keys])
+        if not math.isfinite(med) or med <= 0.0:
+            continue
+        for k in keys:
+            out[k] = max(0.5, min(4.0, means[k] / med))
+    return out
 
 
 _MOE_PROJ_TO_GGUF_EXPS = {
     "gate_proj": ("ffn_gate_exps", "ffn_gate_up_exps"),
     "up_proj": ("ffn_up_exps", "ffn_gate_up_exps"),
     "down_proj": ("ffn_down_exps",),
-    "gate_up_proj": ("ffn_gate_up_exps",),
+    "w2": ("ffn_down_exps",),
+    "gate_up_proj": ("ffn_gate_up_exps", "ffn_gate_exps", "ffn_up_exps"),
+    "w13": ("ffn_gate_up_exps", "ffn_gate_exps", "ffn_up_exps"),
+}
+
+_INKLING2_CTRL_SLOT_ALIASES: dict[tuple[str, str], tuple[str, ...]] = {
+    ("attn", "down_weight"): ("loop_attn_down", "loop_q_ctrl_down"),
+    ("attn", "forget_weight"): ("loop_attn_forget", "loop_q_ctrl_forget"),
+    ("attn", "gain_weight"): ("loop_attn_gain", "loop_q_ctrl_gain"),
+    ("k", "down_weight"): ("loop_k_down", "loop_k_ctrl_down"),
+    ("k", "forget_weight"): ("loop_k_forget", "loop_k_ctrl_forget"),
+    ("k", "gain_weight"): ("loop_k_gain", "loop_k_ctrl_gain"),
+    ("v", "down_weight"): ("loop_v_down", "loop_v_ctrl_down"),
+    ("v", "forget_weight"): ("loop_v_forget", "loop_v_ctrl_forget"),
+    ("v", "gain_weight"): ("loop_v_gain", "loop_v_ctrl_gain"),
+    ("mlp", "down_weight"): ("loop_mlp_down", "loop_ffn_ctrl_down"),
+    ("mlp", "forget_weight"): ("loop_mlp_forget", "loop_ffn_ctrl_forget"),
+    ("mlp", "gain_weight"): ("loop_mlp_gain", "loop_ffn_ctrl_gain"),
+}
+
+_INKLING2_BACKBONE_IMATRIX_ALIASES: dict[str, tuple[str, ...]] = {
+    "attn.wq_du": ("self_attn.q_proj", "attn.q_proj", "attn_q"),
+    "attn.wk_dv": ("self_attn.k_proj", "attn.k_proj", "attn_k"),
+    "attn.wv_dv": ("self_attn.v_proj", "attn.v_proj", "attn_v"),
+    "attn.wo_ud": ("self_attn.o_proj", "attn.o_proj", "attn_output"),
+    "attn.wr_du": ("attn.wr_du", "attn_rel", "self_attn.attn_rel", "attn.attn_rel"),
+    "attn.gate_attn": ("self_attn.gate_proj", "attn.gate_proj", "attn_gate"),
+    "attn.attn_sink_proj": ("self_attn.attn_sink_proj", "attn_sink_proj"),
+    "attn.k_sconv.weight_proj": ("attn.k_sconv.weight_proj", "attn_k_conv_proj"),
+    "attn.v_sconv.weight_proj": ("attn.v_sconv.weight_proj", "attn_v_conv_proj"),
+    "mlp.gate": ("mlp.gate", "ffn_gate_inp"),
 }
 
 
@@ -2195,6 +2399,20 @@ def _imatrix_direct_candidates(tensor_name: str) -> tuple[str, ...]:
     else:
         stripped = base[len("model.") :]
         cands.extend((stripped, f"{stripped}.weight"))
+
+    # Inkling 2 backbone & controller GGUF imatrix aliases (`wq_du <-> q_proj`, `controllers.* <-> loop_*`)
+    ml = _IMATRIX_LAYER_RE.search(base)
+    if ml is not None:
+        layer_str = ml.group(1)
+        rest = base[ml.end() :]
+        for sub_alias in _INKLING2_BACKBONE_IMATRIX_ALIASES.get(rest, ()):
+            for prefix in (f"layers.{layer_str}", f"model.layers.{layer_str}", f"blk.{layer_str}"):
+                cands.extend((f"{prefix}.{sub_alias}.weight", f"{prefix}.{sub_alias}"))
+        ctrl_m = re.match(r"^controllers\.(attn|k|v|mlp)\.(down_weight|forget_weight|gain_weight)$", rest)
+        if ctrl_m is not None:
+            for g_stem in _INKLING2_CTRL_SLOT_ALIASES.get((ctrl_m.group(1), ctrl_m.group(2)), ()):
+                for prefix in (f"layers.{layer_str}", f"model.layers.{layer_str}", f"blk.{layer_str}"):
+                    cands.extend((f"{prefix}.{g_stem}.weight", f"{prefix}.{g_stem}"))
     return tuple(dict.fromkeys(cands))
 
 
@@ -2214,8 +2432,8 @@ def _imatrix_stacked_moe_candidates(tensor_name: str, layer: int) -> tuple[str, 
                 f"blk.{layer}.{g_name}",
             )
         )
-    proj_names = (proj, "gate_up_proj") if proj in ("gate_proj", "up_proj") else (proj,)
-    for p_name in proj_names:
+    proj_names = (proj, "gate_up_proj", "w13") if proj in ("gate_proj", "up_proj", "w13", "gate_up_proj") else (proj, "down_proj")
+    for p_name in dict.fromkeys(proj_names):
         cands.extend(
             (
                 f"layers.{layer}.mlp.switch_mlp.{p_name}.weight",
@@ -2243,8 +2461,9 @@ def _imatrix_col_weights(
 
     Supports exact 2D / per-expert vectors (`len == cols`) as well as stacked 3D MoE
     imatrix entries (`blk.<L>.ffn_*_exps.weight`, `layers.<L>.mlp.switch_mlp.*`,
-    `layers.<L>.mlp.experts.*`) stored either as shared `[cols]` broadcasts or contiguous
-    per-expert `[num_experts * cols]` slices (`vec[expert * cols : (expert + 1) * cols]`).
+    `layers.<L>.mlp.experts.*`, plus `Inkling 2` `w13` <-> `ffn_gate_up_exps`/`ffn_gate_exps`/`ffn_up_exps`
+    and `w2`/`down_proj` <-> `ffn_down_exps`) stored either as shared `[cols]` broadcasts
+    or contiguous per-expert `[num_experts * cols]` slices (`vec[expert * cols : (expert + 1) * cols]`).
     """
     if not imatrix or cols <= 0:
         return None
@@ -2256,6 +2475,42 @@ def _imatrix_col_weights(
             return [max(1e-12, float(v)) if math.isfinite(v) else 1e-12 for v in vec]
 
     if layer != NO_LAYER and expert != NO_EXPERT and expert >= 0:
+        base = tensor_name.removesuffix(".weight")
+        proj = base.rsplit(".", 1)[-1]
+        # If fused `w13` / `gate_up_proj` has no fused imatrix entry but separate `ffn_gate_exps`
+        # and `ffn_up_exps` exist (they share the exact same input hidden activation `x`), pool them.
+        if proj in ("w13", "gate_up_proj"):
+            fused_hits = [
+                k
+                for k in (
+                    f"layers.{layer}.ffn_gate_up_exps.weight",
+                    f"layers.{layer}.ffn_gate_up_exps",
+                    f"blk.{layer}.ffn_gate_up_exps.weight",
+                    f"blk.{layer}.ffn_gate_up_exps",
+                )
+                if k in imatrix
+            ]
+            if not fused_hits:
+                g_vec = _imatrix_col_weights(
+                    imatrix,
+                    f"layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+                    cols,
+                    layer=layer,
+                    expert=expert,
+                )
+                u_vec = _imatrix_col_weights(
+                    imatrix,
+                    f"layers.{layer}.mlp.experts.{expert}.up_proj.weight",
+                    cols,
+                    layer=layer,
+                    expert=expert,
+                )
+                if g_vec is not None and u_vec is not None:
+                    return [0.5 * (a + b) for a, b in zip(g_vec, u_vec)]
+                if g_vec is not None:
+                    return g_vec
+                if u_vec is not None:
+                    return u_vec
         for key in _imatrix_stacked_moe_candidates(tensor_name, layer):
             vec = imatrix.get(key)
             if vec is None:
@@ -2659,6 +2914,7 @@ class _UnifiedSource:
         self._amf_reader: AmfReader | None = None
         self._sf_readers: _ShardReaders | None = None
         self.tensors: list[_SourceTensor] = []
+        self.metadata_blobs: list[tuple[str, bytes]] = []
 
         if self.input_path.is_file() and self.input_path.suffix == ".amf":
             reader = AmfReader(self.input_path)
@@ -2666,6 +2922,9 @@ class _UnifiedSource:
             self.model_id = model_id_override or reader.header.model_id
             excl = set(exclude_tensors)
             for m in reader.entries:
+                if m.kind == TensorKind.METADATA:
+                    self.metadata_blobs.append((m.name, reader.read_metadata_bytes(m.name, verify_crc=True)))
+                    continue
                 if m.name in excl:
                     continue
                 kind = m.kind
@@ -3815,11 +4074,69 @@ class GsqConvertReport:
         }
 
 
+def _compute_layer_expert_im_mults(
+    imatrix_raw: dict[str, list[float]],
+    expert_groups: dict[tuple[int, int], list[_SourceTensor]],
+) -> dict[tuple[int, int], float]:
+    """Compute per-layer median-normalized `[0.5, 4.0]` expert multipliers from `imatrix_raw`."""
+    if not imatrix_raw or not expert_groups:
+        return {}
+    by_layer: dict[int, dict[int, float]] = {}
+    for (layer_i, exp_i), members in expert_groups.items():
+        proj_means: list[float] = []
+        for m in members:
+            cw = _imatrix_col_weights(imatrix_raw, m.name, m.shape[1], layer=m.layer, expert=m.expert)
+            if cw is None or not cw:
+                continue
+            mean_v = math.fsum(v for v in cw if math.isfinite(v) and v > 0.0) / len(cw)
+            if math.isfinite(mean_v) and mean_v > 0.0:
+                proj_means.append(mean_v)
+        if proj_means:
+            by_layer.setdefault(layer_i, {})[exp_i] = max(proj_means)
+
+    out: dict[tuple[int, int], float] = {}
+    for layer_i, exp_vals in by_layer.items():
+        if len(exp_vals) < 2:
+            continue
+        s = sorted(exp_vals.values())
+        mid = len(s) // 2
+        med = s[mid] if (len(s) & 1) else 0.5 * (s[mid - 1] + s[mid])
+        if not math.isfinite(med) or med <= 0.0:
+            continue
+        for exp_i, val in exp_vals.items():
+            out[(layer_i, exp_i)] = max(0.5, min(4.0, val / med))
+    return out
+
+
+def _read_loop_schedule_from_config(input_path: pathlib.Path) -> tuple[int, int, int] | None:
+    p = pathlib.Path(input_path)
+    cfg_path = (p / "config.json") if p.is_dir() else (p.parent / "config.json")
+    if not cfg_path.is_file():
+        return None
+    try:
+        loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    tc = loaded.get("text_config") if isinstance(loaded.get("text_config"), dict) else loaded
+    lc = tc.get("loop_config") or loaded.get("loop_schedule")
+    if not isinstance(lc, dict):
+        return None
+    cs = int(lc.get("core_start", 0) or 0)
+    ce = int(lc.get("core_end", 0) or 0)
+    np = int(lc.get("num_passes", 1) or 1)
+    if ce > cs and np > 1:
+        return (cs, ce, np)
+    return None
+
+
 def gsq_convert(
     input_path: pathlib.Path,
     output_path: pathlib.Path,
     *,
     target_bits: float | None = None,
+    target_wired_gib: float | None = None,
     model_id: str | None = None,
     group_size: int = 64,
     dtype_mode: str = "auto",
@@ -3843,6 +4160,7 @@ def gsq_convert(
     max_q2_share: float | None = None,
     allow_lowbit_q2_retranscode: bool = True,
     fine_rungs: bool = False,
+    meta_blobs: Sequence[tuple[str, bytes]] = (),
     stats_out: dict[str, int] | None = None,
 ) -> GsqConvertReport:
     """Convert a float/quantized safetensors checkpoint or `.amf` into a GSQ+RCO `.amf` v0.
@@ -3860,13 +4178,16 @@ def gsq_convert(
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
     if target_bits is not None and (not math.isfinite(target_bits) or target_bits <= 0.0):
         raise ValueError(f"target_bits must be positive, got {target_bits}")
+    if target_wired_gib is not None and (not math.isfinite(target_wired_gib) or target_wired_gib <= 0.0):
+        raise ValueError(f"target_wired_gib must be positive, got {target_wired_gib}")
     if max_q2_share is not None and (not math.isfinite(max_q2_share) or max_q2_share < 0.0 or max_q2_share > 1.0):
         raise ValueError(f"max_q2_share must be in [0.0, 1.0], got {max_q2_share}")
 
     imatrix_raw: dict[str, list[float]] = {}
     imatrix_mults: dict[str, float] = {}
     if imatrix_path is not None:
-        imatrix_raw = parse_gguf_imatrix(pathlib.Path(imatrix_path))
+        cfg_sched = _read_loop_schedule_from_config(pathlib.Path(input_path))
+        imatrix_raw = parse_gguf_imatrix(pathlib.Path(imatrix_path), loop_schedule=cfg_sched)
         imatrix_mults = _imatrix_tensor_multipliers(imatrix_raw)
 
     effective_cold: set[tuple[int, int]] = set(cold_experts)
@@ -3880,7 +4201,7 @@ def gsq_convert(
                 cold_experts_per_layer=cold_experts_per_layer,
             )
         )
-    elif cold_experts_per_layer is not None:
+    elif cold_experts_per_layer is not None and cold_experts_per_layer > 0:
         raise ValueError("cold_experts_per_layer requires heat_profile in gsq_convert")
 
     src = _UnifiedSource(
@@ -3939,9 +4260,10 @@ def gsq_convert(
         med_ln_post = _median(ln_post_peak.values())
 
         # 2. Partition tensors into pinned (unquantizable) vs atomic QuantUnits.
-        #    MoE experts `(layer, expert)` are grouped so gate/up/down share ONE uniform DType!
+        #    MoE experts `(layer, expert)` and Inkling 2 `controllers` per layer each share ONE uniform DType!
         pinned_tensors: list[_SourceTensor] = []
         expert_groups: dict[tuple[int, int], list[_SourceTensor]] = {}
+        controller_groups: dict[int, list[_SourceTensor]] = {}
         standalone_quant: list[_SourceTensor] = []
 
         _QUANTIZABLE_SRC_DTYPES = (
@@ -3956,17 +4278,24 @@ def gsq_convert(
             DType.NVFP4_G16,
         )
         for t in src.tensors:
+            is_pinned_inkling_table = t.name.startswith(("attn_res.", "middle_cycle_cross_pass")) or t.name.endswith(
+                (".q_l2_clip.scale", ".rel_l2_clip.scale", ".rel_logits_proj.proj", ".static_w")
+            )
+            is_ctrl = is_inkling2_controller_tensor(t.name) and t.layer != NO_LAYER
             is_quantizable = (
                 len(t.shape) == 2
+                and not is_pinned_inkling_table
                 and t.kind not in (TensorKind.NORM, TensorKind.SPARSE_TABLE, TensorKind.LOOP_ADAPTER, TensorKind.METADATA)
                 and (t.dtype in _QUANTIZABLE_SRC_DTYPES or t.dtype >= DType.GGUF_Q4_0)
                 and t.shape[1] > 0
-                and t.shape[1] % group_size == 0
+                and (is_ctrl or (t.shape[1] % group_size == 0))
             )
             if not is_quantizable:
                 pinned_tensors.append(t)
             elif t.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) and t.expert != NO_EXPERT:
                 expert_groups.setdefault((t.layer, t.expert), []).append(t)
+            elif is_ctrl:
+                controller_groups.setdefault(t.layer, []).append(t)
             else:
                 standalone_quant.append(t)
 
@@ -3977,6 +4306,8 @@ def gsq_convert(
         else:
             eff_target_bits = float(target_bits)
             eff_max_q2_share = max_q2_share
+
+        expert_im_mults = _compute_layer_expert_im_mults(imatrix_raw, expert_groups) if imatrix_raw else {}
 
         # Build QuantUnitInput list with sensitivity & empirical distortion curves.
         unit_inputs: list[QuantUnitInput] = []
@@ -4031,6 +4362,8 @@ def gsq_convert(
             def _add_spec(cdt: DType, gs: int) -> None:
                 if (cdt, gs) in seen_specs:
                     return
+                if cdt != src_dt and _DTYPE_BITS_RANK.get(cdt, 16) > max_bits:
+                    return
                 if cdt in _QUANT_DTYPES and any(m.shape[1] % gs != 0 for m in members):
                     return
                 if enforce_backbone_floor and cdt != src_dt:
@@ -4045,11 +4378,26 @@ def gsq_convert(
                 seen_specs.add((cdt, gs))
                 cand_specs.append((cdt, gs))
 
-            if fine_rungs and is_float_src:
+            if role == "controller":
+                # Inkling 2 `gate_rank=64` controllers in `M82Runtime` support Q4_AFFINE (g=64) or BF16/F16 only.
+                if all(m.shape[1] % SME2_GROUP_K == 0 for m in members):
+                    _add_spec(DType.Q4_AFFINE, SME2_GROUP_K)
+                if is_float_src:
+                    _add_spec(f_target, 0)
+                elif all_same_src:
+                    _add_spec(src_dt, members[0].group_size or SME2_GROUP_K)
+            elif fine_rungs and max_bits >= 4:
                 if role == "moe_expert":
                     # Strictly cap per-layer expert schemes <= 5 (`NUM_SCHEME_BUCKETS = 5` in `src/model/qwen3.zig`).
-                    if group_size == 64:
+                    if all_same_src and src_dt == DType.NVFP4_G16:
                         expert_rungs: tuple[tuple[DType, int], ...] = (
+                            (DType.Q2_AFFINE, group_size),
+                            (DType.Q2_AFFINE, 32),
+                            (DType.Q3_AFFINE, group_size),
+                            (DType.NVFP4_G16, 16),
+                        )
+                    elif group_size == 64:
+                        expert_rungs = (
                             (DType.Q2_AFFINE, 64),
                             (DType.Q2_AFFINE, 32),
                             (DType.Q3_AFFINE, 64),
@@ -4059,8 +4407,8 @@ def gsq_convert(
                     else:
                         top_exp = (
                             (DType.Q6_AFFINE, 64)
-                            if all(m.shape[1] % 64 == 0 for m in members)
-                            else (f_target, 0)
+                            if (max_bits >= 6 and all(m.shape[1] % 64 == 0 for m in members))
+                            else ((f_target, 0) if is_float_src else (src_dt, members[0].group_size or group_size))
                         )
                         expert_rungs = (
                             (DType.Q2_AFFINE, group_size),
@@ -4071,14 +4419,8 @@ def gsq_convert(
                         )
                     for cdt, gs in expert_rungs:
                         _add_spec(cdt, gs)
-                elif (
-                    role == "controller"
-                    and eff_sme2_pack in ("controllers", "routers", "all-linear")
-                    and all(m.shape[1] % SME2_GROUP_K == 0 for m in members)
-                ):
-                    # Inkling 2 `gate_rank=64` controllers in SME2_PANEL64 support Q4_AFFINE (g=64) or BF16/F16.
-                    _add_spec(DType.Q4_AFFINE, SME2_GROUP_K)
-                    _add_spec(f_target, 0)
+                    if not cand_specs and all_same_src and not is_float_src:
+                        _add_spec(src_dt, members[0].group_size or group_size)
                 else:
                     for cdt, gs in (
                         (DType.Q2_AFFINE, group_size),
@@ -4092,13 +4434,16 @@ def gsq_convert(
                         (DType.Q8_AFFINE, 64),
                     ):
                         _add_spec(cdt, gs)
-                    _add_spec(f_target, 0)
+                    if is_float_src:
+                        _add_spec(f_target, 0)
+                    elif all_same_src:
+                        _add_spec(src_dt, members[0].group_size or group_size)
             else:
                 for qdt, qb in ((DType.Q2_AFFINE, 2), (DType.Q3_AFFINE, 3), (DType.Q4_AFFINE, 4)):
                     if qb <= max_bits:
                         _add_spec(qdt, group_size)
                 if all_same_src and src_dt not in (DType.F16, DType.BF16, DType.F32):
-                    src_gs = (members[0].group_size or group_size) if src_dt in _QUANT_DTYPES else (members[0].group_size or group_size)
+                    src_gs = members[0].group_size or group_size
                     _add_spec(src_dt, src_gs)
                 if max_bits >= 16:
                     _add_spec(f_target, 0)
@@ -4143,7 +4488,9 @@ def gsq_convert(
                 heat_mult = 0.25 + 2.5 * heat_probs[(layer, expert)]
 
             im_mult = 1.0
-            if imatrix_mults:
+            if role == "moe_expert" and (layer, expert) in expert_im_mults:
+                im_mult = expert_im_mults[(layer, expert)]
+            elif imatrix_mults:
                 pos_im: list[float] = []
                 for m in members:
                     val: float | None = None
@@ -4209,6 +4556,9 @@ def gsq_convert(
         for t in standalone_quant:
             role = _role_of_tensor(t.name, t.kind)
             unit_inputs.append(_build_unit(t.name, [t], role, t.layer, t.expert))
+        for l_idx, members in sorted(controller_groups.items()):
+            uid = f"layers.{l_idx}.controllers"
+            unit_inputs.append(_build_unit(uid, members, "controller", l_idx, NO_EXPERT))
         for (l_idx, e_idx), members in sorted(expert_groups.items()):
             uid = f"layers.{l_idx}.mlp.experts.{e_idx}"
             unit_inputs.append(_build_unit(uid, members, "moe_expert", l_idx, e_idx))
@@ -4222,10 +4572,9 @@ def gsq_convert(
             pinned_weights += numel_t
             pinned_alg_bytes += _algorithmic_bytes(t.dtype, t.shape, t.group_size or group_size)
 
+        total_w = pinned_weights + sum(u.numel for u in unit_inputs)
         if not allow_lowbit_q2_retranscode:
             src_by_name = {t.name: t for t in src.tensors}
-            total_w = pinned_weights + sum(u.numel for u in unit_inputs)
-            budget_b = int(math.floor(eff_target_bits * total_w / 8.0 + 1e-9)) if total_w > 0 else 0
             filtered_units: list[QuantUnitInput] = []
             min_no_lowbit_q2 = pinned_alg_bytes
             lowbit_q2_blocked = False
@@ -4253,7 +4602,8 @@ def gsq_convert(
                     )
                 filtered_units.append(u)
                 min_no_lowbit_q2 += u.candidates[0].alg_bytes
-            if lowbit_q2_blocked and min_no_lowbit_q2 > budget_b:
+            budget_b = int(math.floor(eff_target_bits * total_w / 8.0 + 1e-9)) if total_w > 0 else 0
+            if lowbit_q2_blocked and target_wired_gib is None and min_no_lowbit_q2 > budget_b:
                 min_bpw = (8.0 * min_no_lowbit_q2) / max(1, total_w)
                 raise ValueError(
                     f"refusing to double-quantize low-bit (q2/q3/q4_affine) weights to q2_affine under "
@@ -4261,6 +4611,158 @@ def gsq_convert(
                     "pass --allow-retranscode-lowbit to override)"
                 )
             unit_inputs = filtered_units
+
+        merged_meta_map: dict[str, bytes] = dict(src.metadata_blobs)
+        for m_name, m_bytes in meta_blobs:
+            merged_meta_map[m_name] = bytes(m_bytes)
+        eff_meta_blobs = list(merged_meta_map.items())
+
+        existing_names = {t.name for t in src.tensors}
+        tensor_count = len(src.tensors) + len(eff_meta_blobs)
+        dir_offset = APPLE_PAGE_SIZE
+        dir_raw_len = tensor_count * ENTRY_STRUCT.size
+        dir_bytes = 0 if tensor_count == 0 else _align_up(dir_raw_len, APPLE_PAGE_SIZE)
+        meta_blob_total = sum(_align_up(len(m_bytes), APPLE_PAGE_SIZE) for _, m_bytes in eff_meta_blobs)
+
+        def _plan_layout(chosen_by_unit: dict[str, tuple[DType, int]]) -> tuple[list[tuple[
+            _SourceTensor,
+            str,
+            DType,
+            int,
+            int,
+            TensorLayout,
+            QuantParamKind,
+            int,
+            int,
+            int,
+            int,
+            int,
+        ]], int]:
+            specs: list[
+                tuple[
+                    _SourceTensor,
+                    str,
+                    DType,
+                    int,
+                    int,
+                    TensorLayout,
+                    QuantParamKind,
+                    int,
+                    int,
+                    int,
+                    int,
+                    int,
+                ]
+            ] = []
+            cur = dir_offset + dir_bytes
+            used_out_names: set[str] = set()
+
+            # MoE layers in `src/model/qwen3.zig` require uniform `TensorLayout` across all experts
+            # in the same layer (`layer_w.expert_layout`). If any expert in a layer chose a non-SME2
+            # scheme (e.g. `q2_affine g=32` or `q5/q6/q8_affine` under `--fine-rungs`), keep every
+            # expert in that layer in `ROW_MAJOR` while non-expert linears may still use `SME2_PANEL64`.
+            moe_layer_sme2_allowed: dict[int, bool] = {}
+            for t in src.tensors:
+                if t.kind not in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) or t.layer == NO_LAYER:
+                    continue
+                uid = tensor_to_unit.get(t.name)
+                if uid is not None:
+                    t_dt, t_gs = chosen_by_unit[uid]
+                else:
+                    t_dt, t_gs = t.dtype, t.group_size
+                eff_gs_t = (t_gs if t_gs > 0 else group_size) if t_dt in _QUANT_DTYPES else (t.group_size if t_dt == t.dtype else 0)
+                exp_sme2_ok = (
+                    t_dt in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
+                    and (t_dt not in _QUANT_DTYPES or eff_gs_t == SME2_GROUP_K)
+                    and _should_sme2_pack(t.kind, t_dt, t.shape, eff_sme2_pack, name=t.name)
+                )
+                if t.layer not in moe_layer_sme2_allowed:
+                    moe_layer_sme2_allowed[t.layer] = exp_sme2_ok
+                elif not exp_sme2_ok:
+                    moe_layer_sme2_allowed[t.layer] = False
+
+            for t in src.tensors:
+                uid = tensor_to_unit.get(t.name)
+                if uid is not None:
+                    target_dtype, chosen_gs = chosen_by_unit[uid]
+                else:
+                    target_dtype, chosen_gs = t.dtype, t.group_size
+                out_name = _output_name_for_tensor(t.name, target_dtype, existing_names | used_out_names)
+                used_out_names.add(out_name)
+
+                if target_dtype in _QUANT_DTYPES:
+                    q_bits = _DTYPE_BITS_RANK[target_dtype]
+                    g_size = chosen_gs if chosen_gs > 0 else group_size
+                elif target_dtype == t.dtype:
+                    q_bits = t.quant_bits
+                    g_size = t.group_size
+                else:
+                    q_bits = 0
+                    g_size = 0
+                layer_allows_sme2 = (
+                    moe_layer_sme2_allowed.get(t.layer, True)
+                    if t.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) and t.layer != NO_LAYER
+                    else True
+                )
+                use_sme2 = (
+                    layer_allows_sme2
+                    and target_dtype in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
+                    and (target_dtype not in _QUANT_DTYPES or g_size == SME2_GROUP_K)
+                    and (
+                        _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack, name=t.name)
+                        or (t.kind == TensorKind.LOOP_ADAPTER and t.layout == TensorLayout.SME2_PANEL64)
+                    )
+                )
+                if use_sme2:
+                    layout = TensorLayout.SME2_PANEL64
+                    param_kind = (
+                        QuantParamKind.LUT16_CODEBOOK
+                        if (lut16_sme2 and target_dtype in _SME2_QUANT_DTYPES and g_size == SME2_GROUP_K)
+                        else QuantParamKind.AFFINE_SCALE_BIAS
+                    )
+                    data_bytes = sme2_panel64_data_bytes(target_dtype, t.shape[0], t.shape[1], g_size)
+                    params_offset = 0
+                    params_bytes = 0
+                    content = data_bytes
+                else:
+                    layout = TensorLayout.ROW_MAJOR
+                    param_kind = QuantParamKind.AFFINE_SCALE_BIAS
+                    data_bytes, params_offset, params_bytes = _effective_payload_bytes(
+                        target_dtype, t.shape, g_size or group_size
+                    )
+                    content = (params_offset + params_bytes) if params_bytes > 0 else data_bytes
+
+                blob_bytes = _align_up(max(content, 1), APPLE_PAGE_SIZE)
+                specs.append(
+                    (
+                        t,
+                        out_name,
+                        target_dtype,
+                        q_bits,
+                        g_size,
+                        layout,
+                        param_kind,
+                        cur,
+                        blob_bytes,
+                        data_bytes,
+                        params_offset,
+                        params_bytes,
+                    )
+                )
+                cur += blob_bytes
+            return specs, cur
+
+        if target_wired_gib is not None:
+            target_wired_bytes = int(target_wired_gib * (1024**3))
+            if target_bits is None:
+                overhead_est = dir_offset + dir_bytes + meta_blob_total + len(src.tensors) * (APPLE_PAGE_SIZE // 2)
+                avail_w_bytes = target_wired_bytes - overhead_est
+                if avail_w_bytes <= 0:
+                    raise ValueError(
+                        f"target_wired_gib={target_wired_gib:.3f} ({target_wired_bytes} B) is smaller than "
+                        f"AMF header/padding overhead ({overhead_est} B)"
+                    )
+                eff_target_bits = (8.0 * avail_w_bytes) / max(1, total_w)
 
         alloc = solve_gsq_allocation(
             unit_inputs,
@@ -4270,126 +4772,37 @@ def gsq_convert(
             enforce_backbone_floor=enforce_backbone_floor,
             max_q2_share=eff_max_q2_share,
         )
-        chosen_by_unit = {u.unit_id: (u.chosen_dtype, u.group_size) for u in alloc.units}
+        out_specs, cursor = _plan_layout({u.unit_id: (u.chosen_dtype, u.group_size) for u in alloc.units})
 
-        # 3. Plan final `.amf` directory layout (16 KiB-aligned blobs) before streaming writes.
-        existing_names = {t.name for t in src.tensors}
-        out_specs: list[
-            tuple[
-                _SourceTensor,
-                str,
-                DType,
-                int,
-                int,
-                TensorLayout,
-                QuantParamKind,
-                int,
-                int,
-                int,
-                int,
-                int,
-            ]
-        ] = []
-        tensor_count = len(src.tensors)
-        dir_offset = APPLE_PAGE_SIZE
-        dir_raw_len = tensor_count * ENTRY_STRUCT.size
-        dir_bytes = 0 if tensor_count == 0 else _align_up(dir_raw_len, APPLE_PAGE_SIZE)
-        cursor = dir_offset + dir_bytes
-        used_out_names: set[str] = set()
-
-        # MoE layers in `src/model/qwen3.zig` require uniform `TensorLayout` across all experts
-        # in the same layer (`layer_w.expert_layout`). If any expert in a layer chose a non-SME2
-        # scheme (e.g. `q2_affine g=32` or `q5/q6/q8_affine` under `--fine-rungs`), keep every
-        # expert in that layer in `ROW_MAJOR` while non-expert linears may still use `SME2_PANEL64`.
-        moe_layer_sme2_allowed: dict[int, bool] = {}
-        for t in src.tensors:
-            if t.kind not in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) or t.layer == NO_LAYER:
-                continue
-            uid = tensor_to_unit.get(t.name)
-            if uid is not None:
-                t_dt, t_gs = chosen_by_unit[uid]
-            else:
-                t_dt, t_gs = t.dtype, t.group_size
-            eff_gs_t = (t_gs if t_gs > 0 else group_size) if t_dt in _QUANT_DTYPES else (t.group_size if t_dt == t.dtype else 0)
-            exp_sme2_ok = (
-                t_dt in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
-                and (t_dt not in _QUANT_DTYPES or eff_gs_t == SME2_GROUP_K)
-                and _should_sme2_pack(t.kind, t_dt, t.shape, eff_sme2_pack, name=t.name)
-            )
-            if t.layer not in moe_layer_sme2_allowed:
-                moe_layer_sme2_allowed[t.layer] = exp_sme2_ok
-            elif not exp_sme2_ok:
-                moe_layer_sme2_allowed[t.layer] = False
-
-        for t in src.tensors:
-            uid = tensor_to_unit.get(t.name)
-            if uid is not None:
-                target_dtype, chosen_gs = chosen_by_unit[uid]
-            else:
-                target_dtype, chosen_gs = t.dtype, t.group_size
-            out_name = _output_name_for_tensor(t.name, target_dtype, existing_names | used_out_names)
-            used_out_names.add(out_name)
-
-            if target_dtype in _QUANT_DTYPES:
-                q_bits = _DTYPE_BITS_RANK[target_dtype]
-                g_size = chosen_gs if chosen_gs > 0 else group_size
-            elif target_dtype == t.dtype:
-                q_bits = t.quant_bits
-                g_size = t.group_size
-            else:
-                q_bits = 0
-                g_size = 0
-            layer_allows_sme2 = (
-                moe_layer_sme2_allowed.get(t.layer, True)
-                if t.kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT) and t.layer != NO_LAYER
-                else True
-            )
-            use_sme2 = (
-                layer_allows_sme2
-                and target_dtype in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
-                and (target_dtype not in _QUANT_DTYPES or g_size == SME2_GROUP_K)
-                and (
-                    _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack, name=t.name)
-                    or (t.kind == TensorKind.LOOP_ADAPTER and t.layout == TensorLayout.SME2_PANEL64)
+        if target_wired_gib is not None:
+            target_wired_bytes = int(target_wired_gib * (1024**3))
+            for _ in range(6):
+                total_planned_bytes = cursor + meta_blob_total
+                if total_planned_bytes <= target_wired_bytes:
+                    break
+                excess_bytes = total_planned_bytes - target_wired_bytes
+                delta_bits = max(0.005, ((excess_bytes + APPLE_PAGE_SIZE) * 8.0) / max(1, total_w))
+                eff_target_bits = max(1e-3, eff_target_bits - delta_bits)
+                alloc = solve_gsq_allocation(
+                    unit_inputs,
+                    target_bits=eff_target_bits,
+                    pinned_weights=pinned_weights,
+                    pinned_alg_bytes=pinned_alg_bytes,
+                    enforce_backbone_floor=enforce_backbone_floor,
+                    max_q2_share=eff_max_q2_share,
                 )
-            )
-            if use_sme2:
-                layout = TensorLayout.SME2_PANEL64
-                param_kind = (
-                    QuantParamKind.LUT16_CODEBOOK
-                    if (lut16_sme2 and target_dtype in _SME2_QUANT_DTYPES and g_size == SME2_GROUP_K)
-                    else QuantParamKind.AFFINE_SCALE_BIAS
+                out_specs, cursor = _plan_layout({u.unit_id: (u.chosen_dtype, u.group_size) for u in alloc.units})
+            if cursor + meta_blob_total > target_wired_bytes:
+                raise ValueError(
+                    f"unable to fit .amf within target_wired_gib={target_wired_gib:.3f} "
+                    f"(planned {(cursor + meta_blob_total) / (1024**3):.3f} GiB)"
                 )
-                data_bytes = sme2_panel64_data_bytes(target_dtype, t.shape[0], t.shape[1], g_size)
-                params_offset = 0
-                params_bytes = 0
-                content = data_bytes
-            else:
-                layout = TensorLayout.ROW_MAJOR
-                param_kind = QuantParamKind.AFFINE_SCALE_BIAS
-                data_bytes, params_offset, params_bytes = _effective_payload_bytes(
-                    target_dtype, t.shape, g_size or group_size
-                )
-                content = (params_offset + params_bytes) if params_bytes > 0 else data_bytes
 
-            blob_bytes = _align_up(max(content, 1), APPLE_PAGE_SIZE)
-            out_specs.append(
-                (
-                    t,
-                    out_name,
-                    target_dtype,
-                    q_bits,
-                    g_size,
-                    layout,
-                    param_kind,
-                    cursor,
-                    blob_bytes,
-                    data_bytes,
-                    params_offset,
-                    params_bytes,
-                )
-            )
-            cursor += blob_bytes
+        m_offsets: list[tuple[str, bytes, int, int]] = []
+        for m_name, m_bytes in eff_meta_blobs:
+            m_blob = _align_up(len(m_bytes), APPLE_PAGE_SIZE)
+            m_offsets.append((m_name, m_bytes, cursor, m_blob))
+            cursor += m_blob
 
         # 4. Stream tensors straight into `<output>.partial`, compute CRC-32, fsync, atomic rename.
         out_path = pathlib.Path(output_path)
@@ -4538,11 +4951,40 @@ def gsq_convert(
                         )
                     )
 
+                for m_name, m_bytes, m_off, m_blob in m_offsets:
+                    if out_fh.tell() != m_off:
+                        raise AssertionError(f"planned metadata offset {m_off} != pos {out_fh.tell()} for {m_name}")
+                    mw = _BlobWriter(out_fh)
+                    mw.write(m_bytes)
+                    if m_blob > len(m_bytes):
+                        mw.zeros(m_blob - len(m_bytes))
+                    metas.append(
+                        PackedTensorMeta(
+                            name=m_name,
+                            kind=TensorKind.METADATA,
+                            dtype=DType.U32,
+                            quant_bits=0,
+                            group_size=0,
+                            layer=NO_LAYER,
+                            expert=NO_EXPERT,
+                            shape=(len(m_bytes),),
+                            blob_offset=m_off,
+                            blob_bytes=m_blob,
+                            data_bytes=len(m_bytes),
+                            params_offset=0,
+                            params_bytes=0,
+                            blob_crc32=mw.crc & 0xFFFFFFFF,
+                            layout=TensorLayout.ROW_MAJOR,
+                            quant_param_kind=QuantParamKind.AFFINE_SCALE_BIAS,
+                        )
+                    )
+
                 if out_fh.tell() != cursor:
                     raise AssertionError(f"final size {out_fh.tell()} != planned {cursor}")
 
                 dir_raw = _pack_directory(metas)
-                header = _pack_header(model_id_bytes, tensor_count, dir_offset, dir_bytes, _crc32(dir_raw))
+                hdr_flags = FLAG_EMBEDDED_METADATA if m_offsets else 0
+                header = _pack_header(model_id_bytes, tensor_count, dir_offset, dir_bytes, _crc32(dir_raw), flags=hdr_flags)
                 out_fh.seek(0)
                 out_fh.write(header)
                 if dir_raw:
