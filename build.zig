@@ -40,6 +40,7 @@ const kernel_sources = [_][]const u8{
     "src/kernels/nax_tensorops.metal",
     "src/kernels/sampling.metal",
     "src/kernels/inkling2_hy4.metal",
+    "src/kernels/dflare_gpu.metal",
 };
 
 pub fn build(b: *std.Build) void {
