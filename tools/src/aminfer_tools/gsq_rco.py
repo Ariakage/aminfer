@@ -72,6 +72,7 @@ from aminfer_tools.amf import (
     _ShardReaders,
     _should_sme2_pack,
     _stream_entry,
+    is_inkling2_controller_tensor,
     bf16_bytes_to_f16_bytes,
     bf16_bytes_to_f32_list,
     dequantize_fp8_block_row_f32,
@@ -1936,9 +1937,13 @@ def _algorithmic_bytes(dtype: DType, shape: tuple[int, ...], group_size: int) ->
 
 def _role_of_tensor(name: str, kind: TensorKind) -> str:
     lower = name.lower()
-    if kind == TensorKind.NORM or "norm" in lower:
+    if kind == TensorKind.NORM or "norm" in lower or ".ln_" in lower or lower.endswith(".unified_pre_gamma"):
         return "norm"
-    if kind == TensorKind.ROUTER or lower.endswith(".gate") or lower.endswith(".gate.weight") or "router" in lower:
+    if (
+        kind == TensorKind.ROUTER
+        or lower.endswith((".gate", ".gate.weight", ".gate.bias", ".gate.e_score_correction_bias"))
+        or "router" in lower
+    ):
         return "router"
     if kind == TensorKind.EMBEDDING:
         return "embedding"
@@ -1952,15 +1957,22 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
         return "loop_adapter"
     if kind in (TensorKind.HOT_EXPERT, TensorKind.COLD_EXPERT):
         return "moe_expert"
-    if "controller" in lower or "controllers" in lower:
+    if (
+        "controller" in lower
+        or "controllers" in lower
+        or "message_gate" in lower
+        or "_mgate" in lower
+        or is_inkling2_controller_tensor(name)
+    ):
         return "controller"
-    if "sconv" in lower or "conv1d" in lower:
+    if "sconv" in lower or "conv1d" in lower or "convolution" in lower:
         return "sconv"
     if (
         "hc_" in lower
         or "_hc" in lower
         or "hyper_connection" in lower
         or "attn_res" in lower
+        or "middle_cycle" in lower
         or ".phi" in lower
         or ".in_mix_" in lower
         or ".blk_inj." in lower
@@ -1971,8 +1983,20 @@ def _role_of_tensor(name: str, kind: TensorKind) -> str:
         or ".mtp" in lower
         or "dflare" in lower
         or "dfly" in lower
+        or "markov_head" in lower
+        or "confidence_head" in lower
+        or "hidden_correction" in lower
+        or "fuse_weight" in lower
+        or "mask_embed" in lower
     ):
         return "mtp_dflare"
+    if (
+        "routed_expert_up_proj" in lower
+        or "routed_expert_down_proj" in lower
+        or ".engram_layer." in lower
+        or ".engram." in lower
+    ):
+        return "latent_moe_proj"
     if is_vision_tensor(name):
         return "vision"
     if ".self_attn." in lower or ".linear_attn." in lower or ".attn." in lower:
@@ -1995,6 +2019,7 @@ _ROLE_WEIGHT = {
     "sconv": 8.0,
     "ihc": 8.0,
     "mtp_dflare": 7.0,
+    "latent_moe_proj": 6.0,
     "vision": 6.0,
     "embedding": 6.0,
     "lm_head": 6.0,
@@ -2018,6 +2043,7 @@ _PROTECTED_HIGH_PRECISION_ROLES = frozenset(
         "sconv",
         "ihc",
         "mtp_dflare",
+        "latent_moe_proj",
         "vision",
         "embedding",
         "lm_head",
@@ -2036,6 +2062,18 @@ _BACKBONE_PROTECTED_ROLES = _PROTECTED_HIGH_PRECISION_ROLES | frozenset(
         "embed_head",
         "attn_qkv_o",
         "ssm_proj",
+    }
+)
+
+# GSQ-RCO v2: architectural control, conv, iHC/AttnRes, draft, and LatentMoE/Engram bridge
+# projections must not fall into Q2 or Q3 when quantizing higher-precision sources.
+_STRICT_Q4_FLOOR_ROLES = frozenset(
+    {
+        "controller",
+        "sconv",
+        "ihc",
+        "mtp_dflare",
+        "latent_moe_proj",
     }
 )
 
@@ -2468,7 +2506,7 @@ def solve_gsq_allocation(
                 if cur_bytes + extra <= budget_bytes:
                     _set_choice(idx, target_j)
 
-    _protect_floor(lambda u: u.role in ("controller", "sconv", "ihc", "mtp_dflare", "vision"))
+    _protect_floor(lambda u: u.role in ("controller", "sconv", "ihc", "mtp_dflare", "latent_moe_proj", "vision"))
     if has_boundary_layers:
         _protect_floor(
             lambda u: u.role != "moe_expert" and u.layer in (0, max_unit_layer)
@@ -3791,7 +3829,7 @@ def gsq_convert(
     all_experts_cold: bool = False,
     tie_word_embeddings: bool | None = None,
     exclude_tensors: Iterable[str] = (),
-    sme2_pack: str = "none",
+    sme2_pack: str | None = None,
     lut16_sme2: bool = False,
     use_rco: bool = True,
     rco_iters: int = 3,
@@ -3818,7 +3856,7 @@ def gsq_convert(
         raise ValueError(f"aminfer GSQ requires group_size in {AFFINE_GROUP_SIZES}, got {group_size}")
     if dtype_mode not in DTYPE_MODES:
         raise ValueError(f"dtype_mode must be one of {DTYPE_MODES}, got {dtype_mode!r}")
-    if sme2_pack not in SME2_PACK_MODES:
+    if sme2_pack is not None and sme2_pack not in SME2_PACK_MODES:
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
     if target_bits is not None and (not math.isfinite(target_bits) or target_bits <= 0.0):
         raise ValueError(f"target_bits must be positive, got {target_bits}")
@@ -3830,8 +3868,6 @@ def gsq_convert(
     if imatrix_path is not None:
         imatrix_raw = parse_gguf_imatrix(pathlib.Path(imatrix_path))
         imatrix_mults = _imatrix_tensor_multipliers(imatrix_raw)
-
-    eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
 
     effective_cold: set[tuple[int, int]] = set(cold_experts)
     heat_probs: dict[tuple[int, int], float] = {}
@@ -3860,6 +3896,11 @@ def gsq_convert(
         stats_out=stats_out,
     )
     try:
+        if sme2_pack is None:
+            req_sme2 = "controllers" if any(is_inkling2_controller_tensor(t.name) for t in src.tensors) else "none"
+        else:
+            req_sme2 = sme2_pack
+        eff_sme2_pack = "all-linear" if (lut16_sme2 and req_sme2 == "none") else req_sme2
         model_id_str = src.model_id
         model_id_bytes = model_id_str.encode("utf-8")
         if len(model_id_bytes) == 0 or len(model_id_bytes) > 63:
@@ -3881,9 +3922,9 @@ def gsq_convert(
                 rms = math.sqrt(mean_sq) if mean_sq > 0.0 else 0.0
                 max_abs = max((abs(v) for v in vals), default=0.0)
                 peakiness = (max_abs / rms) if rms > 0.0 else 1.0
-                if "input_layernorm" in t.name:
+                if "input_layernorm" in t.name or "in_norm" in t.name or "attn_norm" in t.name:
                     ln_in_peak[t.layer] = peakiness
-                elif "post_attention_layernorm" in t.name:
+                elif "post_attention_layernorm" in t.name or "post_norm" in t.name or "mlp_norm" in t.name:
                     ln_post_peak[t.layer] = peakiness
 
         def _median(vals: Iterable[float]) -> float:
@@ -3992,13 +4033,15 @@ def gsq_convert(
                     return
                 if cdt in _QUANT_DTYPES and any(m.shape[1] % gs != 0 for m in members):
                     return
-                if (
-                    enforce_backbone_floor
-                    and role in _BACKBONE_PROTECTED_ROLES
-                    and cdt == DType.Q2_AFFINE
-                    and src_dt != DType.Q2_AFFINE
-                ):
-                    return
+                if enforce_backbone_floor and cdt != src_dt:
+                    if role in _BACKBONE_PROTECTED_ROLES and cdt == DType.Q2_AFFINE:
+                        return
+                    if (
+                        role in _STRICT_Q4_FLOOR_ROLES
+                        and cdt == DType.Q3_AFFINE
+                        and src_dt not in (DType.Q2_AFFINE, DType.Q3_AFFINE)
+                    ):
+                        return
                 seen_specs.add((cdt, gs))
                 cand_specs.append((cdt, gs))
 
@@ -4028,6 +4071,14 @@ def gsq_convert(
                         )
                     for cdt, gs in expert_rungs:
                         _add_spec(cdt, gs)
+                elif (
+                    role == "controller"
+                    and eff_sme2_pack in ("controllers", "routers", "all-linear")
+                    and all(m.shape[1] % SME2_GROUP_K == 0 for m in members)
+                ):
+                    # Inkling 2 `gate_rank=64` controllers in SME2_PANEL64 support Q4_AFFINE (g=64) or BF16/F16.
+                    _add_spec(DType.Q4_AFFINE, SME2_GROUP_K)
+                    _add_spec(f_target, 0)
                 else:
                     for cdt, gs in (
                         (DType.Q2_AFFINE, group_size),
@@ -4263,7 +4314,7 @@ def gsq_convert(
             exp_sme2_ok = (
                 t_dt in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
                 and (t_dt not in _QUANT_DTYPES or eff_gs_t == SME2_GROUP_K)
-                and _should_sme2_pack(t.kind, t_dt, t.shape, eff_sme2_pack)
+                and _should_sme2_pack(t.kind, t_dt, t.shape, eff_sme2_pack, name=t.name)
             )
             if t.layer not in moe_layer_sme2_allowed:
                 moe_layer_sme2_allowed[t.layer] = exp_sme2_ok
@@ -4298,7 +4349,7 @@ def gsq_convert(
                 and target_dtype in (DType.F16, DType.BF16, *_SME2_QUANT_DTYPES)
                 and (target_dtype not in _QUANT_DTYPES or g_size == SME2_GROUP_K)
                 and (
-                    _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack)
+                    _should_sme2_pack(t.kind, target_dtype, t.shape, eff_sme2_pack, name=t.name)
                     or (t.kind == TensorKind.LOOP_ADAPTER and t.layout == TensorLayout.SME2_PANEL64)
                 )
             )

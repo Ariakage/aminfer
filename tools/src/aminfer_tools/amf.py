@@ -60,8 +60,13 @@ assert ENTRY_STRUCT.size == 128
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _VISION_BLOCK_RE = re.compile(r"(?:^|\.)(?:visual|vision)\.blocks\.(\d+)\.")
 _VISION_TOWER_BLOCK_RE = re.compile(
-    r"^(?:model\.)?(?:visual|vision|vision_tower\.vision_model\.encoder|vision_model\.encoder)"
+    r"^(?:model\.)?(?:"
+    r"(?:visual|vision|vision_tower\.vision_model\.encoder|vision_model\.encoder)"
     r"\.(?:blocks|layers)\.\d+\.(?:norm\d?|attn|self_attn|mlp|ffn|layernorm|layer_norm)\."
+    r"|visual\.backbone\.layers\.\d+\.(?:ln_\d|ls_\d|attn|self_attn|mlp)\."
+    r"|vision_tower\.layers\.\d+\.(?:layernorm_before|layernorm_after|norm\d?|attn|self_attn|mlp|lambda_\d)"
+    r"|vit\.layers\.\d+\.(?:input_layernorm|post_attention_layernorm|norm\d?|attn|self_attn|mlp)\."
+    r")"
 )
 _EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
 _LOOP_STEP_RE = re.compile(r"(?:^|\.)loop\.step\.(\d+)\.")
@@ -76,11 +81,13 @@ VISION_TENSOR_PREFIXES = (
     "visual.",
     "vision.",
     "vision_tower.",
+    "vit.",
     "multi_modal_projector.",
     "aligner.",
     "model.visual.",
     "model.vision.",
     "model.vision_tower.",
+    "model.vit.",
     "model.multi_modal_projector.",
     "model.aligner.",
     "vision_model.",
@@ -151,6 +158,18 @@ _VERBOSE_VISION_PREFIX_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^vision_model\.embeddings\.position_embedding\."), "vision.pos_embed."),
     (re.compile(r"^vision_tower\.vision_model\.post_layernorm\."), "vision.norm."),
     (re.compile(r"^vision_model\.post_layernorm\."), "vision.norm."),
+    # Inkling 2 (`visual.backbone.*` & MLX `vision_tower.layers.*`) and Hy4 (`vit.*`)
+    (re.compile(r"^visual\.backbone\.layers\.(\d+)\."), r"visual.blocks.\1."),
+    (re.compile(r"^visual\.backbone\.embeddings\."), "visual.embed."),
+    (re.compile(r"^visual\.backbone\.ln_pre\."), "visual.ln_pre."),
+    (re.compile(r"^vision_tower\.layers\.(\d+)\."), r"vision.blocks.\1."),
+    (re.compile(r"^vision_tower\.embeddings\."), "vision.embed."),
+    (re.compile(r"^vision_tower\.pre_layernorm\."), "vision.ln_pre."),
+    (re.compile(r"^vision_tower\.merger\."), "vision.merger."),
+    (re.compile(r"^vit\.layers\.(\d+)\."), r"vision.blocks.\1."),
+    (re.compile(r"^vit\.embeddings\.patch_embedding\."), "vision.patch_embed.proj."),
+    (re.compile(r"^vit\.embeddings\.position_embedding\."), "vision.pos_embed."),
+    (re.compile(r"^vit\.perceive\."), "vision.merger."),
 )
 
 
@@ -159,7 +178,8 @@ def normalize_vision_name(raw_name: str) -> str:
 
     Preserves native Qwen-VL / Qwen3.8 (`visual.*`) and DeepSeek-V4.1 (`vision.*`,
     `aligner.*`, `image_*`) keys verbatim while compacting verbose HF SigLIP /
-    LLaVA / `vision_tower.*` paths so every name fits the 48-byte `.amf` slot.
+    LLaVA / `vision_tower.*` / Inkling-2 `visual.backbone.*` / Hy4 `vit.*` paths
+    so every name fits the 48-byte `.amf` slot.
     """
     name = _strip_model_prefix(raw_name)
     for pat, repl in _VERBOSE_VISION_PREFIX_RULES:
@@ -175,7 +195,16 @@ def normalize_vision_name(raw_name: str) -> str:
         name = name.replace(".layer_norm2.", ".norm2.")
         name = name.replace(".input_layernorm.", ".norm1.")
         name = name.replace(".post_attention_layernorm.", ".norm2.")
+        name = name.replace(".layernorm_before.", ".norm1.")
+        name = name.replace(".layernorm_after.", ".norm2.")
+        name = name.replace(".ln_1.", ".norm1.")
+        name = name.replace(".ln_2.", ".norm2.")
         name = name.replace(".out_proj.", ".proj.")
+        name = name.replace(".o_proj.", ".proj.")
+        name = name.replace(".dense_h_to_4h.", ".fc1.")
+        name = name.replace(".dense_4h_to_h.", ".fc2.")
+        name = name.replace(".c_fc.", ".fc1.")
+        name = name.replace(".c_proj.", ".fc2.")
         if len(name.encode("utf-8")) > 47:
             name = name.replace(".linear_fc1.", ".fc1.")
             name = name.replace(".linear_fc2.", ".fc2.")
@@ -199,13 +228,30 @@ def is_vision_pinned_float(name: str, shape: Sequence[int] | None = None) -> boo
     lower = norm_name.lower()
     if norm_name in VISION_EXACT_TENSOR_NAMES:
         return True
-    if "patch_embed" in lower or "pos_embed" in lower or "position_embedding" in lower:
+    if (
+        "patch_embed" in lower
+        or "pos_embed" in lower
+        or "position_embedding" in lower
+        or "cls_position_embedding" in lower
+        or "class_embedding" in lower
+        or ".embed." in lower
+    ):
         return True
-    if "norm" in lower or ".ln_" in lower:
+    if "norm" in lower or ".ln_" in lower or ".ls_" in lower or ".lambda_" in lower:
         return True
-    if lower.startswith(("visual.merger.", "vision.merger.", "aligner.", "multi_modal_projector.")):
+    if lower.startswith(
+        (
+            "visual.merger.",
+            "vision.merger.",
+            "aligner.",
+            "multi_modal_projector.",
+            "visual.proj_in.",
+            "visual.proj_out.",
+            "vit.perceive.",
+        )
+    ):
         return True
-    if ".merger." in lower or ".aligner." in lower:
+    if ".merger." in lower or ".aligner." in lower or ".perceive." in lower:
         return True
     return False
 
@@ -360,8 +406,8 @@ SME2_F16_GROUP_BYTES = 2048  # 32 kp chunks * 32 u16 lanes
 SME2_Q4_GROUP_BYTES = 640  # 128 B inline header + 512 B packed codes
 SME2_Q3_GROUP_BYTES = 512  # 128 B inline header + 384 B packed codes
 SME2_Q2_GROUP_BYTES = 384  # 128 B inline header + 256 B packed codes
-SME2_PACK_MODES = ("none", "routers", "all-linear")
-SME2_REPACK_TARGETS = ("routers", "all-linear")
+SME2_PACK_MODES = ("none", "controllers", "routers", "all-linear")
+SME2_REPACK_TARGETS = ("controllers", "routers", "all-linear")
 
 
 def encode_reserved0(
@@ -649,6 +695,45 @@ def e4m3_byte_to_f32(b: int) -> float:
     return sign * math.ldexp(1.0 + (mant / 8.0), exp - 7)
 
 
+def f32_to_e4m3fn_byte(x: float) -> int:
+    """Encode finite float to OCP FP8 E4M3FN byte (`S.E4.M3`, bias=7, max=448.0, NaN=0x7F/0xFF)."""
+    if not math.isfinite(x):
+        return 0x7F
+    if x == 0.0:
+        return 0x80 if math.copysign(1.0, x) < 0.0 else 0x00
+    sign = 0x80 if x < 0.0 else 0x00
+    ax = abs(x)
+    if ax >= 448.0:
+        return sign | 0x7E
+    if ax < 0.015625:
+        q = int(round(ax * 512.0))
+        if q <= 0:
+            return sign
+        if q >= 8:
+            return sign | 0x08
+        return sign | q
+    mant_f, exp_u = math.frexp(ax)
+    e = exp_u - 1
+    m = int(round((mant_f * 2.0 - 1.0) * 8.0))
+    if m >= 8:
+        m = 0
+        e += 1
+    exp_bits = e + 7
+    if exp_bits >= 15 and m >= 7:
+        return sign | 0x7E
+    if exp_bits > 15:
+        return sign | 0x7E
+    return sign | (exp_bits << 3) | m
+
+
+def quantize_row_f32_to_e4m3_row(vals: Sequence[float]) -> tuple[bytes, float]:
+    """Quantize a row of floats into `(e4m3_bytes, row_f32_scale)`."""
+    max_abs = max((abs(v) for v in vals), default=0.0)
+    scale = (max_abs / 448.0) if max_abs > 1e-12 else 1.0
+    inv = 1.0 / scale
+    return bytes(f32_to_e4m3fn_byte(v * inv) for v in vals), scale
+
+
 _E4M3_LUT: tuple[float, ...] = tuple(e4m3_byte_to_f32(i) for i in range(256))
 _UE8M0_LUT: tuple[float, ...] = tuple(ue8m0_byte_to_f32(i) for i in range(256))
 
@@ -668,7 +753,14 @@ _LONG_NAME_COMPACT_RULES: tuple[tuple[str, str], ...] = (
     (".block_inject_weight.", ".blk_inj."),
     (".compressed_indexer.", ".cidx."),
     (".head_weight_projection.", ".hw_proj."),
+    (".key_gate_projection.", ".kg_proj."),
+    (".key_value_projection.", ".kv_proj."),
+    (".query_projection.", ".q_proj."),
+    (".token_key_projection.", ".tk_proj."),
     (".kv_a_proj_with_mqa.", ".kv_a_mqa."),
+    (".engram_layer.", ".engram."),
+    (".lookup_per_head_norms.", ".head_norms."),
+    (".unified_per_hc_scales.", ".hc_scales."),
     (".mlp_message_gate.", ".mlp_mgate."),
     (".message_gate_proj.", ".mgate_proj."),
     (".self_attn.", ".attn."),
@@ -679,9 +771,71 @@ _LONG_NAME_COMPACT_RULES: tuple[tuple[str, str], ...] = (
     ("dfly_layers.", "dfly."),
 )
 
+_INKLING2_CTRL_RE = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?(?:llm\.)?layers\.(\d+)\."
+    r"(?:controllers\.(attn|k|v|mlp)\.(down|forget|gain)_weight"
+    r"|(q|k|v|mlp)_message_gate\.(down_proj|forget_gate_proj|message_gate_proj)(?:\.weight)?)$"
+)
+_INKLING2_SCONV_RE = re.compile(
+    r"^layers\.(\d+)\.(?:"
+    r"post_(attention|mlp)_convolution\.conv1d\.weight"
+    r"|self_attn\.(k|v)_sconv\.(conv1d\.weight|static_weight|weight_proj)"
+    r")$"
+)
+_INKLING2_ATTN_RES_RE = re.compile(r"^layers\.(\d+)\.(attention|mlp)_input\.query$")
+
+
+def is_inkling2_controller_tensor(name: str) -> bool:
+    """Return True if `name` is an Inkling 2 `gate_rank=64` loop controller matrix."""
+    return _INKLING2_CTRL_RE.match(name) is not None
+
+
+def _canonicalize_m82_backbone_name(name: str) -> str:
+    mc = _INKLING2_CTRL_RE.match(name)
+    if mc is not None:
+        layer = mc.group(1)
+        if mc.group(2) is not None:
+            return f"layers.{layer}.controllers.{mc.group(2)}.{mc.group(3)}_weight"
+        slot_map = {"q": "attn", "k": "k", "v": "v", "mlp": "mlp"}
+        part_map = {
+            "down_proj": "down_weight",
+            "forget_gate_proj": "forget_weight",
+            "message_gate_proj": "gain_weight",
+        }
+        return f"layers.{layer}.controllers.{slot_map[mc.group(4)]}.{part_map[mc.group(5)]}"
+
+    ms = _INKLING2_SCONV_RE.match(name)
+    if ms is not None:
+        layer = ms.group(1)
+        if ms.group(2) is not None:
+            kind = "attn" if ms.group(2) == "attention" else "mlp"
+            return f"layers.{layer}.{kind}_sconv.weight"
+        kv = ms.group(3)
+        sub = {"conv1d.weight": "weight", "static_weight": "static_w", "weight_proj": "weight_proj"}[ms.group(4)]
+        return f"layers.{layer}.attn.{kv}_sconv.{sub}"
+
+    ma = _INKLING2_ATTN_RES_RE.match(name)
+    if ma is not None:
+        layer = ma.group(1)
+        sub = "attn_queries" if ma.group(2) == "attention" else "mlp_queries"
+        return f"attn_res.{sub}.{layer}"
+    if name == "final_input.query":
+        return "attn_res.output_query"
+    if name == "unembed.weight":
+        return "lm_head.weight"
+    if name == "unembed":
+        return "lm_head"
+    return name
+
 
 def _normalize_name(raw_name: str) -> str:
-    name = normalize_vision_name(raw_name) if is_vision_tensor(raw_name) else _strip_model_prefix(raw_name)
+    if is_vision_tensor(raw_name):
+        name = normalize_vision_name(raw_name)
+    else:
+        stripped = _strip_model_prefix(raw_name)
+        name = _canonicalize_m82_backbone_name(stripped)
+        if raw_name.startswith("model.llm.") and name == "embed.weight":
+            name = "embed_tokens.weight"
     if len(name.encode("utf-8")) > 47:
         compacted = name
         for src_seg, dst_seg in _LONG_NAME_COMPACT_RULES:
@@ -709,11 +863,12 @@ def _classify_tensor(
     if _LOOP_STEP_RE.search(name) or ".loop_adapter." in lower:
         return (TensorKind.LOOP_ADAPTER, layer, NO_EXPERT)
     if (
-        lower.startswith("ple.")
+        lower.startswith(("ple.", "engram.", "sparse_table."))
         or ".ple." in lower
-        or lower.startswith("engram.")
-        or ".engram." in lower
-        or lower.startswith("sparse_table.")
+        or "multi_head_embedding" in lower
+        or "per_layer_token_embd" in lower
+        or lower.endswith(".lookup_table")
+        or (".engram." in lower and "key_projs" not in lower and "value_proj" not in lower and "norm" not in lower and "hc_scales" not in lower and "unified_pre_gamma" not in lower)
     ):
         return (TensorKind.SPARSE_TABLE, layer, NO_EXPERT)
     if expert != NO_EXPERT:
@@ -722,23 +877,27 @@ def _classify_tensor(
     if (
         ".shared_expert." in lower
         or ".shared_experts." in lower
+        or ".shared_exp." in lower
         or lower.endswith(".shared_expert_gate")
         or lower.endswith(".shared_expert_gate.weight")
     ):
         return (TensorKind.SHARED_EXPERT, layer, NO_EXPERT)
-    if "norm" in lower:
+    if "norm" in lower or ".ln_" in lower or lower.endswith(".unified_pre_gamma"):
         return (TensorKind.NORM, layer, expert)
-    if "embed" in lower:
-        return (TensorKind.EMBEDDING, layer, expert)
-    if "lm_head" in lower or lower in ("head", "head.weight"):
+    if "lm_head" in lower or lower in ("head", "head.weight", "unembed", "unembed.weight"):
         return (TensorKind.LM_HEAD, layer, expert)
+    if "embed" in lower and ".self_attn." not in lower and ".attn." not in lower:
+        return (TensorKind.EMBEDDING, layer, expert)
     if (
         lower.endswith(".mlp.gate")
         or lower.endswith(".mlp.gate.weight")
+        or lower.endswith(".mlp.gate.bias")
+        or lower.endswith(".mlp.gate.e_score_correction_bias")
         or lower.endswith(".ffn.gate")
         or lower.endswith(".ffn.gate.weight")
         or lower.endswith(".ffn.gate.bias")
         or lower.endswith(".ffn.gate.bias_vl")
+        or lower.endswith(".ffn.gate.e_score_correction_bias")
     ):
         return (TensorKind.ROUTER, layer, expert)
     return (TensorKind.DENSE, layer, expert)
@@ -1262,6 +1421,7 @@ def _should_sme2_pack(
     shape: tuple[int, ...],
     sme2_pack: str,
     *,
+    name: str = "",
     sme2_pack_loop_adapters: bool = False,
 ) -> bool:
     if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0 or shape[1] % SME2_GROUP_K != 0:
@@ -1274,8 +1434,10 @@ def _should_sme2_pack(
         return False
     if sme2_pack not in SME2_PACK_MODES:
         raise ValueError(f"sme2_pack must be one of {SME2_PACK_MODES}, got {sme2_pack!r}")
+    if sme2_pack == "controllers":
+        return bool(name) and is_inkling2_controller_tensor(name)
     if sme2_pack == "routers":
-        return kind == TensorKind.ROUTER
+        return kind == TensorKind.ROUTER or (bool(name) and is_inkling2_controller_tensor(name))
     return kind in (
         TensorKind.ROUTER,
         TensorKind.DENSE,
@@ -1325,6 +1487,7 @@ def _make_entry(
             dtype,
             shape,
             sme2_pack,
+            name=name,
             sme2_pack_loop_adapters=sme2_pack_loop_adapters,
         )
     )
@@ -1692,12 +1855,12 @@ def plan_amf_entries(
 
     def is_lm_head(name: str) -> bool:
         norm = _normalize_lenient(name)
-        return norm in ("lm_head", "lm_head.weight") or norm.startswith("lm_head.")
+        return norm in ("lm_head", "lm_head.weight", "unembed", "unembed.weight") or norm.startswith("lm_head.")
 
     embed_rows: int | None = None
     for n, t in tensors.items():
-        if _normalize_lenient(n) in ("embed_tokens.weight", "embed_tokens.scales"):
-            if not is_excluded(n) and not is_excluded("embed_tokens"):
+        if _normalize_lenient(n) in ("embed_tokens.weight", "embed_tokens.scales", "embed.weight"):
+            if not is_excluded(n) and not is_excluded("embed_tokens") and not is_excluded("embed.weight"):
                 embed_rows = t.shape[0] if t.shape else None
                 break
     has_embed = embed_rows is not None
@@ -2114,8 +2277,10 @@ def plan_amf_entries(
             amf_dtype, convert = _unquantized_target(t.dtype, dtype_mode, name)
         if name.endswith(".weight"):
             stacked = _resolve_stacked_expert_meta(name[: -len(".weight")])
+        elif name.endswith("_weight"):
+            stacked = _resolve_stacked_expert_meta(name[: -len("_weight")])
         else:
-            stacked = None
+            stacked = _resolve_stacked_expert_meta(name)
         if stacked is not None and len(t.shape) == 3:
             num_experts, n, k = t.shape
             layer, proj = stacked
@@ -2798,7 +2963,7 @@ def pack_amf_from_safetensors(
     exclude_tensors: Iterable[str] = (),
     heat_profile: pathlib.Path | None = None,
     cold_experts_per_layer: int | None = None,
-    sme2_pack: str = "none",
+    sme2_pack: str | None = None,
     lut16_sme2: bool = False,
     quant_profile: str = "uniform",
     target_bits: float | None = None,
@@ -2855,6 +3020,14 @@ def pack_amf_from_safetensors(
         eff_group_size = 64
     eff_divisor = div_cfg if nvfp4_global_scale_is_divisor is None else nvfp4_global_scale_is_divisor
     probe_tensors = _collect_tensors(resolved_probe.shard_paths)
+    if sme2_pack is None:
+        eff_sme2_requested = (
+            "controllers"
+            if any(is_inkling2_controller_tensor(n) for n in probe_tensors)
+            else "none"
+        )
+    else:
+        eff_sme2_requested = sme2_pack
     vision_mode = resolve_vision_mode(
         probe_tensors.keys(),
         include_vision=include_vision,
@@ -2898,7 +3071,7 @@ def pack_amf_from_safetensors(
             exclude_tensors=exclude_tensors,
             heat_profile=heat_profile,
             cold_experts_per_layer=cold_experts_per_layer,
-            sme2_pack=sme2_pack,
+            sme2_pack=eff_sme2_requested,
             lut16_sme2=lut16_sme2,
             use_rco=use_rco,
             manifest_path=manifest_path,
@@ -2951,7 +3124,7 @@ def pack_amf_from_safetensors(
             exclude_tensors=exclude_tensors,
             heat_profile=heat_profile,
             cold_experts_per_layer=cold_experts_per_layer,
-            sme2_pack=sme2_pack,
+            sme2_pack=eff_sme2_requested,
             lut16_sme2=lut16_sme2,
             use_rco=use_rco,
             workers=workers,
@@ -2974,7 +3147,7 @@ def pack_amf_from_safetensors(
     elif cold_experts_per_layer is not None:
         raise ValueError("cold_experts_per_layer requires heat_profile in pack_amf_from_safetensors")
 
-    eff_sme2_pack = "all-linear" if (lut16_sme2 and sme2_pack == "none") else sme2_pack
+    eff_sme2_pack = "all-linear" if (lut16_sme2 and eff_sme2_requested == "none") else eff_sme2_requested
     resolved = resolved_probe
     tie = tie_cfg if tie_word_embeddings is None else tie_word_embeddings
     tensors = probe_tensors
@@ -4912,7 +5085,7 @@ def repack_amf_sme2(
     planned: list[tuple[PackedTensorMeta, bool, int, int, int, int, int, TensorLayout, QuantParamKind]] = []
     cursor = dir_offset + dir_bytes
     for m in entries:
-        eligible = _should_sme2_pack(m.kind, m.dtype, m.shape, targets)
+        eligible = _should_sme2_pack(m.kind, m.dtype, m.shape, targets, name=m.name)
         want_lut16 = lut16 and m.dtype in (DType.Q2_AFFINE, DType.Q3_AFFINE, DType.Q4_AFFINE)
         needs_repack = eligible and (
             m.layout == TensorLayout.ROW_MAJOR
@@ -5064,6 +5237,16 @@ def _f32_values_to_bf16_bytes(values: Sequence[float]) -> bytes:
             bf = (bits + rounding) >> 16
         struct.pack_into("<H", out, i * 2, bf & 0xFFFF)
     return bytes(out)
+
+
+def f32_to_bf16_bytes(values: Sequence[float]) -> bytes:
+    """Pack float values as little-endian IEEE bfloat16 bytes."""
+    return _f32_values_to_bf16_bytes(values)
+
+
+def f32_to_f16_bytes(values: Sequence[float], *, what: str = "tensor") -> bytes:
+    """Pack float values as little-endian IEEE float16 bytes."""
+    return f32_values_to_f16_bytes(values, what=what)
 
 
 def _read_planned_entry_bytes(
@@ -5457,7 +5640,7 @@ def _pack_uniform_backbone_with_quant_vision(
             exclude_tensors=exclude_tensors,
             heat_profile=heat_profile,
             cold_experts_per_layer=cold_experts_per_layer,
-            sme2_pack=sme2_pack,
+            sme2_pack=eff_sme2_requested,
             lut16_sme2=lut16_sme2,
             quant_profile="uniform",
             strip_vision=True,
@@ -5607,7 +5790,7 @@ def gsq_convert_with_vision(
     all_experts_cold: bool = False,
     tie_word_embeddings: bool | None = None,
     exclude_tensors: Iterable[str] = (),
-    sme2_pack: str = "none",
+    sme2_pack: str | None = None,
     lut16_sme2: bool = False,
     use_rco: bool = True,
     rco_iters: int = 3,
@@ -5657,6 +5840,11 @@ def gsq_convert_with_vision(
     )
     vision_names = [n for n in all_names if is_vision_tensor(n)]
     backbone_names = [n for n in all_names if not is_vision_tensor(n)]
+    eff_sme2_pack = (
+        "controllers"
+        if (sme2_pack is None and any(is_inkling2_controller_tensor(n) for n in all_names))
+        else (sme2_pack or "none")
+    )
 
     if vision_mode == "sidecar" and vision_sidecar is not None and vision_names:
         pack_vision_tower_amf(
@@ -5688,7 +5876,7 @@ def gsq_convert_with_vision(
             all_experts_cold=all_experts_cold,
             tie_word_embeddings=tie_word_embeddings,
             exclude_tensors=exclude_tensors,
-            sme2_pack=sme2_pack,
+            sme2_pack=eff_sme2_pack,
             lut16_sme2=lut16_sme2,
             use_rco=use_rco,
             rco_iters=rco_iters,
@@ -5736,7 +5924,7 @@ def gsq_convert_with_vision(
             all_experts_cold=all_experts_cold,
             tie_word_embeddings=tie_word_embeddings,
             exclude_tensors=exclude_tensors,
-            sme2_pack=sme2_pack,
+            sme2_pack=eff_sme2_pack,
             lut16_sme2=lut16_sme2,
             use_rco=use_rco,
             rco_iters=rco_iters,
@@ -5823,15 +6011,21 @@ def extract_vision_config_summary(
             block_ids.add(int(bm.group(1)))
             if (".attn.proj" in m.name or ".attn.wo" in m.name) and len(m.shape) == 2:
                 vis_hidden = max(vis_hidden, m.shape[0])
-            if (".mlp.linear_fc1" in m.name or ".mlp.w1" in m.name or ".mlp.gate_proj" in m.name) and len(m.shape) == 2:
+            if (".mlp.linear_fc1" in m.name or ".mlp.fc1" in m.name or ".mlp.w1" in m.name or ".mlp.gate_proj" in m.name) and len(m.shape) == 2:
                 vis_inter = max(vis_inter, m.shape[0])
                 if vis_hidden == 0:
                     vis_hidden = m.shape[1]
-        if (m.name.startswith(("visual.merger.linear_fc2", "visual.merger.mlp.2", "aligner.w2"))) and len(m.shape) == 2:
+        if (m.name.startswith(("visual.merger.linear_fc2", "visual.merger.mlp.2", "aligner.w2", "visual.proj_out", "vision.merger.linear_2", "vision.merger.proj.2"))) and len(m.shape) == 2:
             out_hidden = max(out_hidden, m.shape[0])
 
     vcfg = src_config.get("vision_config") if isinstance(src_config, dict) and isinstance(src_config.get("vision_config"), dict) else {}
-    family = "deepseek_v41" if (has_deepseek_vision and not has_qwen_visual) else "qwen_vl"
+    v_mt = str(vcfg.get("model_type", "")).lower()
+    if "inkling2" in v_mt or any(m.name.startswith("visual.proj_in") for m in vis_metas):
+        family = "inkling2"
+    elif "hy_v4" in v_mt or any("perceive" in m.name for m in vis_metas):
+        family = "hy_v4"
+    else:
+        family = "deepseek_v41" if (has_deepseek_vision and not has_qwen_visual) else "qwen_vl"
     return {
         "family": family,
         "vision_tensor_count": len(vis_metas),

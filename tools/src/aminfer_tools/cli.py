@@ -38,6 +38,22 @@ from aminfer_tools.amf import (
 )
 from aminfer_tools.chat_template import compile_chat_template_bytes
 from aminfer_tools.gguf import pack_amf_from_gguf
+from aminfer_tools.inkling2 import (
+    INKLING2_SYNTH_PRESETS,
+    VALID_INKLING2_TIERS,
+    Inkling2SynthConfig,
+    convert_inkling2_checkpoint,
+    generate_synth_inkling2_bundle,
+    validate_hf_metadata_dir as validate_inkling2_metadata_dir,
+)
+from aminfer_tools.hy4 import (
+    HY4_SYNTH_PRESETS,
+    VALID_HY4_ENGRAM_DTYPES,
+    Hy4SynthConfig,
+    convert_hy4_checkpoint,
+    generate_synth_hy4_bundle,
+    validate_hf_metadata_dir as validate_hy4_metadata_dir,
+)
 from aminfer_tools.lora import (
     LORA_DTYPES,
     LORA_LAYOUTS,
@@ -293,10 +309,11 @@ def _build_parser() -> argparse.ArgumentParser:
     pack.add_argument(
         "--sme2-pack",
         choices=SME2_PACK_MODES,
-        default="none",
+        default=None,
         help=(
             "Pre-pack eligible 2D weights into single-owner ARMv9 SME2 sme2_panel64 layout "
-            "(ADR-0018, W15): none (default, row_major), routers, or all-linear"
+            "(ADR-0018, W15, C26): none, controllers, routers, or all-linear "
+            "(default: controllers for inkling2_loop, none otherwise)"
         ),
     )
     pack.add_argument(
@@ -455,6 +472,10 @@ def _build_parser() -> argparse.ArgumentParser:
     pack_gguf.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=64, help="Group size for clip W20 q4 blocks")
     pack_gguf.add_argument("--no-strict-vocab", action="store_true", help="Disable GGUF vs external HF vocab size check")
     pack_gguf.add_argument("--no-dedup-recurrent", action="store_true", help="Do not collapse unrolled recurrent layers")
+    pack_gguf.add_argument("--sme2-pack", choices=SME2_PACK_MODES, default=None, help="ARMv9 SME2 panel64 pre-packing mode")
+    pack_gguf.add_argument("--draft-config-output", type=pathlib.Path, default=None, help="Optional output path for dflare_config.json (arch=dflash)")
+    pack_gguf.add_argument("--engram-output", type=pathlib.Path, default=None, help="Optional output path for extracted Engram SPARSE_TABLE .amf")
+    pack_gguf.add_argument("--engram-shards", type=int, default=1, help="Number of Engram .amf shards (default: 1)")
 
     ct_cmd = sub.add_parser(
         "compile-chat-template",
@@ -848,6 +869,109 @@ def _build_parser() -> argparse.ArgumentParser:
     pds41.add_argument("--vision-sidecar", type=pathlib.Path, default=None, help="Extract vision.* + aligner.* into standalone vision.amf (W20)")
     pds41.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto", help="Precision for ViT block projections (auto, f16, bf16, q4_affine)")
 
+    si2 = sub.add_parser(
+        "synth-inkling2",
+        help="Generate deterministic tiny inkling2_loop (Mini) or inkling2 (Small) + DFlare + ViT .amf bundles (W23)",
+    )
+    si2.add_argument("--preset", default="tiny-inkling2-mini", choices=sorted(INKLING2_SYNTH_PRESETS.keys()))
+    si2.add_argument("--output-dir", required=True, type=pathlib.Path, help="Output bundle directory")
+    si2.add_argument("--num-layers", type=int, default=None, help="Override physical layer count")
+    si2.add_argument("--hidden-size", type=int, default=None, help="Override hidden_size (multiple of 64)")
+    si2.add_argument("--num-experts", type=int, default=None, help="Override routed expert count")
+    si2.add_argument("--intermediate-size", type=int, default=None, help="Override MoE intermediate_size (multiple of 64)")
+    si2.add_argument("--dflare-layers", type=int, default=None, help="Override DFlare draft layer count (3 or 5)")
+    si2.add_argument("--vision-layers", type=int, default=None, help="Override ViT layer count (default 23)")
+    si2.add_argument("--dtype", choices=("bf16", "f16"), default=None, help="Override float dtype")
+    si2.add_argument("--sme2-pack", choices=SME2_PACK_MODES, default=None, help="SME2 controller packing mode")
+    si2.add_argument("--cold-experts-per-layer", type=int, default=None, help="Tail experts per layer tagged cold_expert")
+    si2.add_argument("--vision-mode", choices=("sidecar", "include", "strip"), default="sidecar")
+    si2.add_argument("--no-dflare", action="store_true", help="Omit DFlare draft bundle")
+    si2.add_argument("--model-id", default=None, help="Override model_id")
+    si2.add_argument("--seed", type=int, default=42)
+
+    pi2 = sub.add_parser(
+        "pack-inkling2",
+        help="Convert Inkling 2 (Mini/Small/MLX/GGUF) checkpoint into 16 KiB-aligned .amf + DFlare + ViT sidecar (W23)",
+    )
+    pi2.add_argument("--input", required=True, type=pathlib.Path, help="Checkpoint dir, index.json, safetensors, or .gguf")
+    pi2.add_argument("--output", required=True, type=pathlib.Path, help="Output backbone .amf path")
+    pi2.add_argument("--model-id", default="inkling2", help="Model identifier stored in .amf header")
+    pi2.add_argument("--dtype", choices=DTYPE_MODES, default="auto")
+    pi2.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=None)
+    pi2.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform")
+    pi2.add_argument("--target-bits", type=float, default=None)
+    pi2.add_argument("--target-tier", choices=VALID_INKLING2_TIERS, default="auto", help="GSQ-RCO v2 tier profile")
+    pi2.add_argument("--no-rco", action="store_true")
+    pi2.add_argument("--manifest", type=pathlib.Path, default=None)
+    pi2.add_argument("--cold-experts", default=None)
+    pi2.add_argument("--heat-profile", type=pathlib.Path, default=None)
+    pi2.add_argument("--cold-experts-per-layer", type=int, default=None)
+    pi2.add_argument("--all-experts-cold", action="store_true")
+    pi2.add_argument("--sme2-pack", choices=SME2_PACK_MODES, default=None)
+    pi2.add_argument("--include-vision", action="store_true")
+    pi2.add_argument("--strip-vision", action="store_true")
+    pi2.add_argument("--no-strip-vision", action="store_true")
+    pi2.add_argument("--vision-sidecar", type=pathlib.Path, default=None)
+    pi2.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto")
+    pi2.add_argument("--dflare-output", type=pathlib.Path, default=None)
+    pi2.add_argument("--dflare-config-output", type=pathlib.Path, default=None)
+    pi2.add_argument("--config-output", type=pathlib.Path, default=None)
+    pi2.add_argument("--no-embed-metadata", action="store_true")
+    pi2.add_argument("--workers", type=int, default=1)
+
+    shy4 = sub.add_parser(
+        "synth-hy4",
+        help="Generate deterministic tiny Hy4 (`hy_v4`, `hy_v4_vl`, `hy_v4_flash`) + Engram + DFly2 .amf bundles (W23)",
+    )
+    shy4.add_argument("--preset", default="tiny-hy4", choices=sorted(HY4_SYNTH_PRESETS.keys()))
+    shy4.add_argument("--output-dir", required=True, type=pathlib.Path, help="Output bundle directory")
+    shy4.add_argument("--num-layers", type=int, default=None)
+    shy4.add_argument("--hidden-size", type=int, default=None)
+    shy4.add_argument("--num-experts", type=int, default=None)
+    shy4.add_argument("--engram-shards", type=int, default=None)
+    shy4.add_argument("--engram-rows", type=int, default=None)
+    shy4.add_argument("--engram-dtype", choices=VALID_HY4_ENGRAM_DTYPES, default=None)
+    shy4.add_argument("--dfly-layers", type=int, default=None)
+    shy4.add_argument("--vision-layers", type=int, default=None)
+    shy4.add_argument("--dtype", choices=("bf16", "f16"), default=None)
+    shy4.add_argument("--cold-experts-per-layer", type=int, default=None)
+    shy4.add_argument("--vision-mode", choices=("sidecar", "include", "strip"), default="sidecar")
+    shy4.add_argument("--no-dfly2", action="store_true")
+    shy4.add_argument("--model-id", default=None)
+    shy4.add_argument("--seed", type=int, default=42)
+
+    phy4 = sub.add_parser(
+        "pack-hy4",
+        help="Convert Hy4 / Hy4-preview / Hy4-flash / Hy4-VL checkpoint into .amf + Engram + DFly2 + ViT sidecar (W23)",
+    )
+    phy4.add_argument("--input", required=True, type=pathlib.Path)
+    phy4.add_argument("--output", required=True, type=pathlib.Path)
+    phy4.add_argument("--model-id", default="hy4")
+    phy4.add_argument("--dtype", choices=DTYPE_MODES, default="auto")
+    phy4.add_argument("--group-size", type=int, choices=AFFINE_GROUP_SIZES, default=None)
+    phy4.add_argument("--quant-profile", choices=QUANT_PROFILES, default="uniform")
+    phy4.add_argument("--target-bits", type=float, default=None)
+    phy4.add_argument("--no-rco", action="store_true")
+    phy4.add_argument("--manifest", type=pathlib.Path, default=None)
+    phy4.add_argument("--cold-experts", default=None)
+    phy4.add_argument("--heat-profile", type=pathlib.Path, default=None)
+    phy4.add_argument("--cold-experts-per-layer", type=int, default=None)
+    phy4.add_argument("--all-experts-cold", action="store_true")
+    phy4.add_argument("--sme2-pack", choices=SME2_PACK_MODES, default="none")
+    phy4.add_argument("--include-vision", action="store_true")
+    phy4.add_argument("--strip-vision", action="store_true")
+    phy4.add_argument("--no-strip-vision", action="store_true")
+    phy4.add_argument("--vision-sidecar", type=pathlib.Path, default=None)
+    phy4.add_argument("--vision-block-dtype", choices=VISION_BLOCK_DTYPES, default="auto")
+    phy4.add_argument("--engram-output", type=pathlib.Path, default=None)
+    phy4.add_argument("--engram-shards", type=int, default=1)
+    phy4.add_argument("--engram-dtype", choices=VALID_HY4_ENGRAM_DTYPES, default="fp8_e4m3_row")
+    phy4.add_argument("--dfly2-output", type=pathlib.Path, default=None)
+    phy4.add_argument("--dfly2-config-output", type=pathlib.Path, default=None)
+    phy4.add_argument("--config-output", type=pathlib.Path, default=None)
+    phy4.add_argument("--no-embed-metadata", action="store_true")
+    phy4.add_argument("--workers", type=int, default=1)
+
     part = sub.add_parser(
         "partition-experts",
         help=(
@@ -885,7 +1009,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     insp.add_argument(
         "--arch",
-        choices=("auto", "qwen4_exp", "deepseek41"),
+        choices=("auto", "qwen4_exp", "deepseek41", "inkling2", "hy4"),
         default="auto",
         help="Architecture validator to invoke (default: auto-detect from config.json)",
     )
@@ -1318,6 +1442,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             group_size=args.group_size,
             strict_vocab_check=not args.no_strict_vocab,
             deduplicate_recurrent=not args.no_dedup_recurrent,
+            sme2_pack=args.sme2_pack,
+            draft_config_output=args.draft_config_output,
+            engram_output=args.engram_output,
+            engram_shards=args.engram_shards,
             stats_out=gguf_stats,
         )
         elapsed = time.monotonic() - started
@@ -1370,6 +1498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 vision_block_dtype=args.vision_block_dtype,
                 group_size=args.group_size or 64,
                 strict_vocab_check=not args.no_strict_vocab,
+                sme2_pack=args.sme2_pack,
                 stats_out=gguf_stats,
             )
             if gguf_stats.get("deduplicated_layers", 0) > 0:
@@ -1397,7 +1526,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 exclude_tensors=excludes,
                 heat_profile=args.heat_profile,
                 cold_experts_per_layer=args.cold_experts_per_layer,
-                sme2_pack=args.sme2_pack,
+                sme2_pack=args.sme2_pack or "none",
                 lut16_sme2=args.lut16_sme2,
                 quant_profile=args.quant_profile,
                 target_bits=args.target_bits,
@@ -2012,7 +2141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 all_experts_cold=args.all_experts_cold,
                 heat_profile=args.heat_profile,
                 cold_experts_per_layer=args.cold_experts_per_layer,
-                sme2_pack=args.sme2_pack,
+                sme2_pack=args.sme2_pack or "none",
                 lut16_sme2=args.lut16_sme2,
                 strip_vision=strip_vis,
                 include_vision=inc_vis,
@@ -2044,6 +2173,158 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{len(rep.dspark_metas)} DSpark tensors{vis_note}, "
             f"tier={rep.tier_check.target_tier} world_size={rep.tier_check.world_size}) "
             f"into {rep.backbone_amf}"
+        )
+        return 0
+
+    if args.command == "synth-inkling2":
+        from dataclasses import replace as dc_replace
+
+        cfg = INKLING2_SYNTH_PRESETS[args.preset]
+        ov: dict[str, object] = {}
+        if args.num_layers is not None:
+            ov["num_hidden_layers"] = args.num_layers
+        if args.hidden_size is not None:
+            ov["hidden_size"] = args.hidden_size
+        if args.num_experts is not None:
+            ov["n_routed_experts"] = args.num_experts
+        if args.intermediate_size is not None:
+            ov["intermediate_size"] = args.intermediate_size
+        if args.dflare_layers is not None:
+            ov["dflare_layers"] = args.dflare_layers
+        if args.vision_layers is not None:
+            ov["vision_layers"] = args.vision_layers
+        if args.dtype is not None:
+            ov["dtype"] = args.dtype
+        if args.sme2_pack is not None:
+            ov["sme2_pack"] = args.sme2_pack
+        if args.cold_experts_per_layer is not None:
+            ov["cold_experts_per_layer"] = args.cold_experts_per_layer
+        ov["vision_mode"] = args.vision_mode
+        if args.no_dflare:
+            ov["include_dflare"] = False
+        if args.model_id is not None:
+            ov["model_id"] = args.model_id
+        if ov:
+            cfg = dc_replace(cfg, **ov)
+        b = generate_synth_inkling2_bundle(args.output_dir, config=cfg, seed=args.seed)
+        print(
+            f"synthesized {cfg.model_type} ({len(b.backbone_metas)} backbone tensors, "
+            f"{len(b.dflare_metas)} DFlare tensors, {len(b.vision_metas)} ViT tensors, "
+            f"{b.total_bytes} bytes) into {b.output_dir}"
+        )
+        return 0
+
+    if args.command == "pack-inkling2":
+        cold = _parse_cold_experts(args.cold_experts)
+        inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
+        rep = convert_inkling2_checkpoint(
+            args.input,
+            args.output,
+            model_id=args.model_id,
+            dtype_mode=args.dtype,
+            group_size=args.group_size,
+            quant_profile=args.quant_profile,
+            target_bits=args.target_bits,
+            target_tier=args.target_tier,
+            use_rco=not args.no_rco,
+            manifest_path=args.manifest,
+            cold_experts=cold,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            heat_profile=args.heat_profile,
+            all_experts_cold=args.all_experts_cold,
+            sme2_pack=args.sme2_pack,
+            strip_vision=strip_vis,
+            include_vision=inc_vis,
+            vision_sidecar=args.vision_sidecar,
+            vision_block_dtype=args.vision_block_dtype,
+            dflare_output=args.dflare_output,
+            dflare_config_output=args.dflare_config_output,
+            config_output=args.config_output,
+            embed_metadata=not args.no_embed_metadata,
+            workers=args.workers,
+        )
+        print(
+            f"packed inkling2 ({len(rep.backbone_metas)} backbone tensors, "
+            f"sme2_controllers={rep.sme2_controller_count}, cold_experts={rep.cold_expert_count}, "
+            f"dflare={len(rep.dflare_metas)}, vision={len(rep.vision_metas)}) into {rep.backbone_amf}"
+        )
+        return 0
+
+    if args.command == "synth-hy4":
+        from dataclasses import replace as dc_replace
+
+        cfg = HY4_SYNTH_PRESETS[args.preset]
+        ov = {}
+        if args.num_layers is not None:
+            ov["num_hidden_layers"] = args.num_layers
+        if args.hidden_size is not None:
+            ov["hidden_size"] = args.hidden_size
+        if args.num_experts is not None:
+            ov["n_routed_experts"] = args.num_experts
+        if args.engram_shards is not None:
+            ov["engram_shards"] = args.engram_shards
+        if args.engram_rows is not None:
+            ov["engram_num_rows"] = args.engram_rows
+        if args.engram_dtype is not None:
+            ov["engram_dtype"] = args.engram_dtype
+        if args.dfly_layers is not None:
+            ov["dfly_layers"] = args.dfly_layers
+        if args.vision_layers is not None:
+            ov["vision_layers"] = args.vision_layers
+        if args.dtype is not None:
+            ov["dtype"] = args.dtype
+        if args.cold_experts_per_layer is not None:
+            ov["cold_experts_per_layer"] = args.cold_experts_per_layer
+        ov["vision_mode"] = args.vision_mode
+        if args.no_dfly2:
+            ov["include_dfly2"] = False
+        if args.model_id is not None:
+            ov["model_id"] = args.model_id
+        if ov:
+            cfg = dc_replace(cfg, **ov)
+        b = generate_synth_hy4_bundle(args.output_dir, config=cfg, seed=args.seed)
+        print(
+            f"synthesized {cfg.model_type} ({len(b.backbone_metas)} backbone tensors, "
+            f"{len(b.engram_paths)} Engram shard(s), {len(b.dfly2_metas)} DFly2 tensors, "
+            f"{len(b.vision_metas)} ViT tensors, {b.total_bytes} bytes) into {b.output_dir}"
+        )
+        return 0
+
+    if args.command == "pack-hy4":
+        cold = _parse_cold_experts(args.cold_experts)
+        inc_vis, strip_vis = _resolve_cli_vision_flags(parser, args)
+        rep = convert_hy4_checkpoint(
+            args.input,
+            args.output,
+            model_id=args.model_id,
+            dtype_mode=args.dtype,
+            group_size=args.group_size,
+            quant_profile=args.quant_profile,
+            target_bits=args.target_bits,
+            use_rco=not args.no_rco,
+            manifest_path=args.manifest,
+            cold_experts=cold,
+            cold_experts_per_layer=args.cold_experts_per_layer,
+            heat_profile=args.heat_profile,
+            all_experts_cold=args.all_experts_cold,
+            sme2_pack=args.sme2_pack,
+            strip_vision=strip_vis,
+            include_vision=inc_vis,
+            vision_sidecar=args.vision_sidecar,
+            vision_block_dtype=args.vision_block_dtype,
+            engram_output=args.engram_output,
+            engram_shards=args.engram_shards,
+            engram_dtype=args.engram_dtype,
+            dfly2_output=args.dfly2_output,
+            dfly2_config_output=args.dfly2_config_output,
+            config_output=args.config_output,
+            embed_metadata=not args.no_embed_metadata,
+            workers=args.workers,
+        )
+        print(
+            f"packed {args.model_id} ({len(rep.backbone_metas)} backbone tensors, "
+            f"{len(rep.engram_paths)} Engram shard(s), dfly2={len(rep.dfly2_metas)}, "
+            f"vision={len(rep.vision_metas)}, cold_experts={rep.cold_expert_count}) into {rep.backbone_amf}"
         )
         return 0
 
@@ -2106,21 +2387,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arch = "deepseek41"
             elif "qwen" in combined_mt:
                 arch = "qwen4_exp"
+            elif "inkling2" in combined_mt:
+                arch = "inkling2"
+            elif "hy_v4" in combined_mt or "hyv4" in combined_mt:
+                arch = "hy4"
             else:
                 print(f"error: cannot auto-detect arch from model_type={mt!r}; pass --arch", file=sys.stderr)
                 return 2
         try:
-            rep = (
-                validate_deepseek41_metadata_dir(base, host_ram_gib=args.host_ram_gib)
-                if arch == "deepseek41"
-                else validate_qwen4_metadata_dir(base, host_ram_gib=args.host_ram_gib)
-            )
+            if arch == "deepseek41":
+                rep = validate_deepseek41_metadata_dir(base, host_ram_gib=args.host_ram_gib)
+            elif arch == "inkling2":
+                rep = validate_inkling2_metadata_dir(base, host_ram_gib=args.host_ram_gib)
+            elif arch == "hy4":
+                rep = validate_hy4_metadata_dir(base)
+            else:
+                rep = validate_qwen4_metadata_dir(base, host_ram_gib=args.host_ram_gib)
         except (FileNotFoundError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         data = rep.to_dict()
         if args.as_json:
             print(json.dumps(data, indent=2))
+        elif arch == "inkling2":
+            print(
+                f"inkling2 metadata OK ({rep.model_type}): "
+                f"layers={rep.num_hidden_layers} (steps={rep.effective_num_steps}), "
+                f"hidden={rep.hidden_size}, experts={rep.n_routed_experts} (top-{rep.num_experts_per_tok}), "
+                f"SWA={rep.local_layer_count}/{rep.num_hidden_layers}, DFlare={rep.dflare_layers}L, ViT={rep.vision_layers}L, "
+                f"controllers={rep.controller_tensor_count}, names>47B={len(rep.long_backbone_names)}"
+            )
+        elif arch == "hy4":
+            print(
+                f"hy4 metadata OK ({rep.model_type}): "
+                f"layers={rep.num_hidden_layers}, hidden={rep.hidden_size}, "
+                f"experts={rep.n_routed_experts} (top-{rep.num_experts_per_tok}), hc={rep.hc_mult}, "
+                f"DFly2={rep.dfly_layers}L, ViT={rep.vision_layers}L, EngramTables={rep.engram_table_tensor_count}, "
+                f"names>47B={len(rep.long_backbone_names)}"
+            )
         elif arch == "qwen4_exp":
             gib = rep.index_total_size_bytes / (1024**3)
             q3_gib = rep.estimated_backbone_q3_bytes / (1024**3)
