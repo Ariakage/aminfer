@@ -17,8 +17,12 @@ const page = @import("../mem/page.zig");
 const arena_mod = @import("../mem/arena.zig");
 const budget_mod = @import("../mem/budget.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
+const vmstat = @import("../platform/vmstat.zig");
 const quant = @import("../quant/spec.zig");
 const quant_formats = @import("../gpu/quant_formats.zig");
+const dequant = @import("../gpu/dequant.zig");
+const moe = @import("../gpu/moe.zig");
+const metal = @import("../bridge/metal.zig");
 const amf = @import("../format/amf.zig");
 const sam_mod = @import("sam.zig");
 const tree_mod = @import("tree.zig");
@@ -51,6 +55,12 @@ pub const Error = arena_mod.WiredArena.InitError ||
     sysinfo.Error ||
     tree_mod.PruneError ||
     accept_mod.VerifyError ||
+    metal.WrapError ||
+    dequant.InitError ||
+    dequant.EncodeError ||
+    quant_formats.InitError ||
+    quant_formats.EncodeError ||
+    quant.ShapeError ||
     error{
         InvalidConfig,
         InvalidWeights,
@@ -59,6 +69,8 @@ pub const Error = arena_mod.WiredArena.InitError ||
         CallbackFailed,
         InvalidLogits,
         Overflow,
+        UnsupportedDType,
+        OutOfMemory,
     };
 
 /// Unified speculative draft source descriptor (`D14`, `ADR-0024`).
@@ -231,6 +243,73 @@ pub const MlaBlockWeights = struct {
     post_proj_norm: ?[]const f32 = null, // [H]
 };
 
+/// Raw zero-copy 2D matrix view (native `.f32`, `.bf16`, `.f16`, `.gguf_q8_0`,
+/// `.q4_affine`, or any `W21`/`W22` quantized `.amf` format) backed by `WiredArena`.
+pub const RawLinearMat = struct {
+    data: []const u8,
+    params: []const u8 = &.{},
+    amf_dtype: amf.DType,
+    group_size: u16 = 64,
+    tensor_scale_per_row: bool = false,
+    n: u32,
+    k: u32,
+
+    pub fn matches(self: RawLinearMat, expected_n: usize, expected_k: usize) bool {
+        if (self.n != expected_n or self.k != expected_k) return false;
+        return switch (self.amf_dtype) {
+            .f32 => self.data.len >= expected_n * expected_k * 4,
+            .f16, .bf16 => self.data.len >= expected_n * expected_k * 2,
+            else => blk: {
+                const qf_dt = quant_formats.DType.fromAmf(self.amf_dtype) orelse break :blk false;
+                qf_dt.validateShape(expected_n, expected_k, self.group_size) catch break :blk false;
+                const wb = qf_dt.packedWeightBytes(expected_n, expected_k, self.group_size) catch break :blk false;
+                const pb = qf_dt.paramsBytes(expected_n, expected_k, self.group_size) catch break :blk false;
+                if (self.data.len < wb) break :blk false;
+                if (pb > 0 and self.params.len < pb) break :blk false;
+                break :blk true;
+            },
+        };
+    }
+};
+
+/// Metal 4 GPU-resident linear matrix binding (`D16`, ADR-0026).
+pub const GpuLinearBinding = struct {
+    amf_dtype: amf.DType,
+    group_size: u16 = 64,
+    tensor_scale_per_row: bool = false,
+    weight: metal.BufferBinding,
+    params: ?metal.BufferBinding = null,
+    n: u32,
+    k: u32,
+};
+
+pub const GpuTapDType = enum(u8) {
+    f16 = 0,
+    f32 = 1,
+};
+
+/// GPU-resident target hidden taps passed directly from target verification / decode
+/// into `DFlareProposer` without host `f16 -> f32` staging copies (`D16`, ADR-0026).
+pub const GpuTargetTaps = struct {
+    dtype: GpuTapDType = .f16,
+    taps: []const metal.BufferBinding,
+};
+
+pub const GpuHistoryTapDType = enum(u8) {
+    f32 = 0,
+    f16 = 1,
+    bf16 = 2,
+};
+
+/// GPU-resident circular ring of committed target context taps (`[cap, num_taps, hidden]`).
+pub const GpuContextHistory = struct {
+    taps_ring: metal.BufferBinding,
+    dtype: GpuHistoryTapDType = .f16,
+    cap: u32,
+    len: u32,
+    epoch: u64,
+};
+
 /// Shared lightweight block-parallel transformer layer weights used by both
 /// `DFlareProposer` (`3L`/`5L`) and `DFly2Proposer` (`5L`).
 pub const TransformerBlockWeights = struct {
@@ -244,11 +323,18 @@ pub const TransformerBlockWeights = struct {
     k_proj_bf16: ?[]const u16 = null,
     v_proj_bf16: ?[]const u16 = null,
     o_proj_bf16: ?[]const u16 = null,
+    /// Optional zero-copy raw `.amf` projections (`f16`, `gguf_q8_0`, `q4_affine`, `W21`/`W22`).
+    q_proj_raw: ?RawLinearMat = null,
+    k_proj_raw: ?RawLinearMat = null,
+    v_proj_raw: ?RawLinearMat = null,
+    o_proj_raw: ?RawLinearMat = null,
     /// Optional dedicated context KV projections (`layers.{l}.self_attn.{k,v}_proj_ctx`).
     k_proj_ctx: ?[]const f32 = null,
     v_proj_ctx: ?[]const f32 = null,
     k_proj_ctx_bf16: ?[]const u16 = null,
     v_proj_ctx_bf16: ?[]const u16 = null,
+    k_proj_ctx_raw: ?RawLinearMat = null,
+    v_proj_ctx_raw: ?RawLinearMat = null,
     k_norm_ctx_weight: ?[]const f32 = null,
     ctx_norm_weight: ?[]const f32 = null,
     q_norm_weight: ?[]const f32 = null, // [head_dim]
@@ -260,6 +346,9 @@ pub const TransformerBlockWeights = struct {
     mlp_gate_bf16: ?[]const u16 = null,
     mlp_up_bf16: ?[]const u16 = null,
     mlp_down_bf16: ?[]const u16 = null,
+    mlp_gate_raw: ?RawLinearMat = null,
+    mlp_up_raw: ?RawLinearMat = null,
+    mlp_down_raw: ?RawLinearMat = null,
     /// Optional Hy4 MLA attention weights (`DFly2` layers).
     mla: ?MlaBlockWeights = null,
 
@@ -281,13 +370,15 @@ pub const TransformerBlockWeights = struct {
             if (w.len != hidden_size) return error.InvalidWeights;
         }
         if (self.mla == null) {
-            const q_ok = (self.q_proj.len == qh) or (if (self.q_proj_bf16) |b| b.len == qh else false);
-            const k_ok = (self.k_proj.len == kvh) or (if (self.k_proj_bf16) |b| b.len == kvh else false);
-            const v_ok = (self.v_proj.len == kvh) or (if (self.v_proj_bf16) |b| b.len == kvh else false);
-            const o_ok = (self.o_proj.len == hq) or (if (self.o_proj_bf16) |b| b.len == hq else false);
+            const q_ok = (self.q_proj.len == qh) or (if (self.q_proj_bf16) |b| b.len == qh else false) or (if (self.q_proj_raw) |r| r.matches(q_dim, hidden_size) else false);
+            const k_ok = (self.k_proj.len == kvh) or (if (self.k_proj_bf16) |b| b.len == kvh else false) or (if (self.k_proj_raw) |r| r.matches(kv_dim, hidden_size) else false);
+            const v_ok = (self.v_proj.len == kvh) or (if (self.v_proj_bf16) |b| b.len == kvh else false) or (if (self.v_proj_raw) |r| r.matches(kv_dim, hidden_size) else false);
+            const o_ok = (self.o_proj.len == hq) or (if (self.o_proj_bf16) |b| b.len == hq else false) or (if (self.o_proj_raw) |r| r.matches(hidden_size, q_dim) else false);
             if (!q_ok or !k_ok or !v_ok or !o_ok) {
                 return error.InvalidWeights;
             }
+            if (self.k_proj_ctx_raw) |r| if (!r.matches(kv_dim, hidden_size)) return error.InvalidWeights;
+            if (self.v_proj_ctx_raw) |r| if (!r.matches(kv_dim, hidden_size)) return error.InvalidWeights;
             if (self.q_norm_weight) |w| {
                 if (w.len != head_dim) return error.InvalidWeights;
             }
@@ -298,9 +389,9 @@ pub const TransformerBlockWeights = struct {
         if (self.post_norm_weight) |w| {
             if (w.len != hidden_size) return error.InvalidWeights;
         }
-        const g_ok = (self.mlp_gate_proj.len == ih) or (if (self.mlp_gate_bf16) |b| b.len == ih else false);
-        const u_ok = (self.mlp_up_proj.len == ih) or (if (self.mlp_up_bf16) |b| b.len == ih else false);
-        const d_ok = (self.mlp_down_proj.len == hi) or (if (self.mlp_down_bf16) |b| b.len == hi else false);
+        const g_ok = (self.mlp_gate_proj.len == ih) or (if (self.mlp_gate_bf16) |b| b.len == ih else false) or (if (self.mlp_gate_raw) |r| r.matches(intermediate_size, hidden_size) else false);
+        const u_ok = (self.mlp_up_proj.len == ih) or (if (self.mlp_up_bf16) |b| b.len == ih else false) or (if (self.mlp_up_raw) |r| r.matches(intermediate_size, hidden_size) else false);
+        const d_ok = (self.mlp_down_proj.len == hi) or (if (self.mlp_down_bf16) |b| b.len == hi else false) or (if (self.mlp_down_raw) |r| r.matches(hidden_size, intermediate_size) else false);
         if (!g_ok or !u_ok or !d_ok) {
             return error.InvalidWeights;
         }
@@ -476,6 +567,7 @@ pub const DFlareWeights = struct {
     /// Multi-layer target tap fusion `[hidden_size, num_target_taps * hidden_size]`.
     /// Optional when `num_target_taps == 1` or `fuse_scalar_weights != null`.
     target_fusion_proj: ?[]const f32 = null,
+    target_fusion_proj_raw: ?RawLinearMat = null,
     /// Optional per-layer scalar tap mixing weights `[rows, num_target_taps]`
     /// (real `Inkling-2-Mini` `fuse_weight [4, 4]` & `dflash-Q8` `ctx_mix`).
     fuse_scalar_weights: ?[]const f32 = null,
@@ -484,6 +576,7 @@ pub const DFlareWeights = struct {
     mask_embed: []const f32,
     /// Token embeddings `[vocab_size, hidden_size]` for sequential Markov conditioning (or empty when `tok_embed_hook` is set).
     tok_embed: []const f32 = &.{},
+    tok_embed_raw: ?RawLinearMat = null,
     tok_embed_hook: ?TokEmbedHook = null,
     token_embd_norm: ?[]const f32 = null,
     /// `3L` / `5L` block-parallel transformer layers.
@@ -491,26 +584,35 @@ pub const DFlareWeights = struct {
     final_norm: ?[]const f32 = null,
     /// Low-rank Markov head `markov_w1`: `[markov_rank, 2*H]`, `[markov_rank, H]`, or empty when `markov_w1_vocab_bf16` is set.
     markov_w1: []const f32 = &.{},
+    markov_w1_raw: ?RawLinearMat = null,
     /// Optional token-ID low-rank embedding table `[vocab_rows, markov_rank]` BF16 (real `Inkling-2-Mini`).
     markov_w1_vocab_bf16: ?[]const u16 = null,
+    markov_w1_vocab_raw: ?RawLinearMat = null,
     markov_w1_vocab_rows: u32 = 0,
     /// Optional 3-gate GRU joint projection `[3 * markov_rank, 2*H + 2*markov_rank]` (`768 x 5120`).
     markov_gru_proj_bf16: ?[]const u16 = null,
     markov_gru_proj_f32: ?[]const f32 = null,
+    markov_gru_proj_raw: ?RawLinearMat = null,
     markov_gru_bias: ?[]const f32 = null,
     markov_ctx_norm: ?[]const f32 = null,
     /// Optional recurrent transition `[markov_rank, markov_rank]` on `rnn_hidden`.
     markov_rnn_proj: ?[]const f32 = null,
+    markov_rnn_proj_raw: ?RawLinearMat = null,
     markov_b1: ?[]const f32 = null,
     /// Output bottleneck expansion `markov_w2`: `[hidden_size, markov_rank]` (or empty when `markov_w2_vocab_bf16` is set).
     markov_w2: []const f32 = &.{},
+    markov_w2_raw: ?RawLinearMat = null,
     markov_hidden_bias: ?[]const f32 = null,
-    /// Optional direct low-rank vocab logits head `[vocab_rows, markov_rank]` BF16 (`dflash-Q8` GGUF).
+    /// Optional direct low-rank vocab logits head `[vocab_rows, markov_rank]` (`dflash-Q8` GGUF).
     markov_w2_vocab_bf16: ?[]const u16 = null,
+    markov_w2_vocab_raw: ?RawLinearMat = null,
     markov_w2_vocab_bias: ?[]const f32 = null,
     markov_w2_vocab_rows: u32 = 0,
     markov_norm: ?[]const f32 = null,
     lm_head: LmHeadHook,
+    lm_head_raw: ?RawLinearMat = null,
+    /// Optional zero-copy `WiredArena` backing slice owning the loaded `.amf` tensors.
+    wired_arena_bytes: ?[]align(page.APPLE_PAGE_SIZE) u8 = null,
 
     pub fn validate(self: DFlareWeights, cfg: DFlareConfig) Error!void {
         const h: usize = cfg.hidden_size;
@@ -524,6 +626,8 @@ pub const DFlareWeights = struct {
         const thh = std.math.mul(usize, taps, std.math.mul(usize, h, h) catch return error.Overflow) catch return error.Overflow;
         if (self.target_fusion_proj) |fp| {
             if (fp.len != thh) return error.InvalidWeights;
+        } else if (self.target_fusion_proj_raw) |fpr| {
+            if (!fpr.matches(h, taps * h)) return error.InvalidWeights;
         } else if (self.fuse_scalar_weights) |fsw| {
             if (fsw.len < taps) return error.InvalidWeights;
         } else if (taps != 1) {
@@ -538,7 +642,10 @@ pub const DFlareWeights = struct {
         if (!mask_ok) return error.InvalidWeights;
 
         const vh = std.math.mul(usize, v, h) catch return error.Overflow;
-        if (self.tok_embed_hook == null and self.tok_embed.len != vh) return error.InvalidWeights;
+        if (self.tok_embed_hook == null) {
+            const tok_ok = (self.tok_embed.len == vh) or (if (self.tok_embed_raw) |tr| tr.matches(v, h) else false);
+            if (!tok_ok) return error.InvalidWeights;
+        }
         if (self.layers.len != cfg.num_layers) return error.InvalidWeights;
         for (self.layers) |layer| {
             try layer.validate(h, inter, q_dim, kv_dim, cfg.head_dim);
@@ -547,16 +654,20 @@ pub const DFlareWeights = struct {
             if (fnw.len != h) return error.InvalidWeights;
         }
 
-        const has_gru = (self.markov_gru_proj_bf16 != null or self.markov_gru_proj_f32 != null);
+        const has_gru = (self.markov_gru_proj_bf16 != null or self.markov_gru_proj_f32 != null or self.markov_gru_proj_raw != null);
         const mr_h = std.math.mul(usize, mr, h) catch return error.Overflow;
         if (!has_gru) {
             const mr_2h = std.math.mul(usize, mr_h, 2) catch return error.Overflow;
-            if (self.markov_w1.len != mr_h and self.markov_w1.len != mr_2h) {
+            const w1_ok = (self.markov_w1.len == mr_h or self.markov_w1.len == mr_2h) or
+                (if (self.markov_w1_raw) |r| (r.matches(mr, h) or r.matches(mr, 2 * h)) else false);
+            if (!w1_ok) {
                 return error.InvalidWeights;
             }
             if (self.markov_rnn_proj) |rp| {
                 const mr2 = std.math.mul(usize, mr, mr) catch return error.Overflow;
                 if (rp.len != mr2) return error.InvalidWeights;
+            } else if (self.markov_rnn_proj_raw) |rpr| {
+                if (!rpr.matches(mr, mr)) return error.InvalidWeights;
             }
             if (self.markov_b1) |b1| {
                 if (b1.len != mr) return error.InvalidWeights;
@@ -568,24 +679,35 @@ pub const DFlareWeights = struct {
                 if (gb.len != req_gru) return error.InvalidWeights;
             } else if (self.markov_gru_proj_f32) |gf| {
                 if (gf.len != req_gru) return error.InvalidWeights;
+            } else if (self.markov_gru_proj_raw) |gr| {
+                if (!gr.matches(3 * mr, joint_in)) return error.InvalidWeights;
             }
-            if (self.markov_w1_vocab_bf16 == null or self.markov_w1_vocab_rows == 0) return error.InvalidWeights;
+            const has_w1v = (self.markov_w1_vocab_bf16 != null or self.markov_w1_vocab_raw != null);
+            if (!has_w1v or self.markov_w1_vocab_rows == 0) return error.InvalidWeights;
         }
-        if (self.markov_w2_vocab_bf16 == null and self.markov_w2.len != mr_h) return error.InvalidWeights;
+        const has_w2v = (self.markov_w2_vocab_bf16 != null or self.markov_w2_vocab_raw != null);
+        if (!has_w2v) {
+            const w2_ok = (self.markov_w2.len == mr_h) or (if (self.markov_w2_raw) |r| r.matches(h, mr) else false);
+            if (!w2_ok) return error.InvalidWeights;
+        }
         if (self.markov_norm) |mn| {
             if (mn.len != h) return error.InvalidWeights;
         }
-        if (self.markov_w2_vocab_bf16 == null) {
+        if (!has_w2v and self.lm_head_raw == null) {
             try validateLmHeadHook(self.lm_head, vh);
+        } else if (self.lm_head_raw) |lhr| {
+            if (!lhr.matches(v, h)) return error.InvalidWeights;
         }
     }
 };
 
-/// Preallocated 16 KiB-aligned `WiredArena` workspace for `DFlareProposer`.
+/// Preallocated 16 KiB-aligned `WiredArena` workspace for `DFlareProposer`
+/// (shared zero-copy CPU + Metal 4 GPU physical pages).
 pub const DFlareWorkspace = struct {
     arena: arena_mod.WiredArena,
     config: DFlareConfig,
     max_ctx_len: u32,
+    ctx_batch_cap: u32,
     taps_flat: []f32,
     ctx_hidden: []f32,
     ctx_markov: []f32,
@@ -613,6 +735,41 @@ pub const DFlareWorkspace = struct {
     topk_probs: []f32,
     node_log_probs: []f32,
     l1_draft_buf: []u32,
+    // GPU zero-copy slices inside `self.arena` (`64`-byte aligned):
+    gpu_taps_flat_f16: []f16,
+    gpu_ctx_taps_f32: []f32,
+    gpu_ctx_in_f16: []f16,
+    gpu_ctx_k_tmp_f16: []f16,
+    gpu_ctx_v_tmp_f16: []f16,
+    gpu_ctx_hidden_f16: []f16,
+    gpu_ctx_markov_f16: []f16,
+    gpu_ctx_markov_f32: []f32,
+    gpu_anchor_f16: []f16,
+    gpu_slot_hiddens_f16: []f16,
+    gpu_norm_f16: []f16,
+    gpu_q_f16: []f16,
+    gpu_k_f16: []f16,
+    gpu_v_f16: []f16,
+    gpu_attn_out_f16: []f16,
+    gpu_mlp_gate_f16: []f16,
+    gpu_mlp_up_f16: []f16,
+    gpu_mlp_down_f16: []f16,
+    gpu_markov_concat_f16: []f16,
+    gpu_markov_concat_f32: []f32,
+    gpu_markov_gates_f16: []f16,
+    gpu_markov_gates_f32: []f32,
+    gpu_markov_rnn_ping_f32: []f32,
+    gpu_markov_vec_f16: []f16,
+    gpu_markov_vec_f32: []f32,
+    gpu_head_hidden_f16: []f16,
+    gpu_base_logits_f16: []f16,
+    gpu_logits_f16: []f16,
+    gpu_logits_f32: []f32,
+    gpu_topk_cands: []moe.TopKCandidate,
+    gpu_token_chain_u32: []u32,
+    gpu_grammar_mask_u32: []u32,
+    gpu_w1_row_f32: []f32,
+    cpu_quant_row_scratch: []f32,
 
     pub fn requiredBytes(cfg: DFlareConfig) Error!usize {
         try cfg.validate();
@@ -626,7 +783,10 @@ pub const DFlareWorkspace = struct {
         const kv_dim: usize = cfg.kvDim();
         const max_nodes: usize = cfg.max_tree_nodes;
         const max_ctx: usize = if (cfg.hidden_size >= 1024) 1024 else 64;
+        const ctx_batch_cap: usize = @min(max_ctx, 64);
         const ctx_kv_elems: usize = @as(usize, cfg.num_layers) * max_ctx * kv_dim;
+        const mask_words: usize = (v + 31) / 32;
+        const row_scratch_elems: usize = @max(taps * h, @max(h, @max(inter, @max(q_dim, 2 * h + 2 * mr))));
 
         const chunks = [_]usize{
             try alignUp64((taps * h) * @sizeOf(f32)), // taps_flat
@@ -646,7 +806,7 @@ pub const DFlareWorkspace = struct {
             try alignUp64((w * inter) * @sizeOf(f32)), // mlp_up
             try alignUp64((w * h) * @sizeOf(f32)), // mlp_down
             try alignUp64((max_nodes * mr) * @sizeOf(f32)), // node_rnn_hidden
-            try alignUp64((3 * mr) * @sizeOf(f32)), // markov_u (3-gate GRU or 1x rank)
+            try alignUp64((3 * mr) * @sizeOf(f32)), // markov_u
             try alignUp64(mr * @sizeOf(f32)), // markov_out
             try alignUp64((2 * h + 2 * mr) * @sizeOf(f32)), // markov_concat
             try alignUp64(h * @sizeOf(f32)), // head_hidden
@@ -656,6 +816,40 @@ pub const DFlareWorkspace = struct {
             try alignUp64(cfg.top_k_per_pos * @sizeOf(f32)), // topk_probs
             try alignUp64(max_nodes * @sizeOf(f32)), // node_log_probs
             try alignUp64(MAX_L1_DRAFT_LEN * @sizeOf(u32)), // l1_draft_buf
+            try alignUp64((taps * h) * @sizeOf(f16)), // gpu_taps_flat_f16
+            try alignUp64((ctx_batch_cap * taps * h) * @sizeOf(f32)), // gpu_ctx_taps_f32
+            try alignUp64((ctx_batch_cap * h) * @sizeOf(f16)), // gpu_ctx_in_f16
+            try alignUp64((ctx_batch_cap * kv_dim) * @sizeOf(f16)), // gpu_ctx_k_tmp_f16
+            try alignUp64((ctx_batch_cap * kv_dim) * @sizeOf(f16)), // gpu_ctx_v_tmp_f16
+            try alignUp64(h * @sizeOf(f16)), // gpu_ctx_hidden_f16
+            try alignUp64(h * @sizeOf(f16)), // gpu_ctx_markov_f16
+            try alignUp64(h * @sizeOf(f32)), // gpu_ctx_markov_f32
+            try alignUp64(h * @sizeOf(f16)), // gpu_anchor_f16
+            try alignUp64((w * h) * @sizeOf(f16)), // gpu_slot_hiddens_f16
+            try alignUp64((w * h) * @sizeOf(f16)), // gpu_norm_f16
+            try alignUp64((w * q_dim) * @sizeOf(f16)), // gpu_q_f16
+            try alignUp64((w * kv_dim) * @sizeOf(f16)), // gpu_k_f16
+            try alignUp64((w * kv_dim) * @sizeOf(f16)), // gpu_v_f16
+            try alignUp64((w * q_dim) * @sizeOf(f16)), // gpu_attn_out_f16
+            try alignUp64((w * inter) * @sizeOf(f16)), // gpu_mlp_gate_f16
+            try alignUp64((w * inter) * @sizeOf(f16)), // gpu_mlp_up_f16
+            try alignUp64((w * h) * @sizeOf(f16)), // gpu_mlp_down_f16
+            try alignUp64((2 * h + 2 * mr) * @sizeOf(f16)), // gpu_markov_concat_f16
+            try alignUp64((2 * h + 2 * mr) * @sizeOf(f32)), // gpu_markov_concat_f32
+            try alignUp64((3 * mr) * @sizeOf(f16)), // gpu_markov_gates_f16
+            try alignUp64((3 * mr) * @sizeOf(f32)), // gpu_markov_gates_f32
+            try alignUp64((2 * mr) * @sizeOf(f32)), // gpu_markov_rnn_ping_f32
+            try alignUp64(mr * @sizeOf(f16)), // gpu_markov_vec_f16
+            try alignUp64(mr * @sizeOf(f32)), // gpu_markov_vec_f32
+            try alignUp64(h * @sizeOf(f16)), // gpu_head_hidden_f16
+            try alignUp64((w * v) * @sizeOf(f16)), // gpu_base_logits_f16
+            try alignUp64(v * @sizeOf(f16)), // gpu_logits_f16
+            try alignUp64(v * @sizeOf(f32)), // gpu_logits_f32
+            try alignUp64((w * MAX_TOP_K_PER_POS) * @sizeOf(moe.TopKCandidate)), // gpu_topk_cands
+            try alignUp64((w + 1) * @sizeOf(u32)), // gpu_token_chain_u32
+            try alignUp64(mask_words * @sizeOf(u32)), // gpu_grammar_mask_u32
+            try alignUp64(mr * @sizeOf(f32)), // gpu_w1_row_f32
+            try alignUp64(row_scratch_elems * @sizeOf(f32)), // cpu_quant_row_scratch
         };
         var total: usize = 0;
         for (chunks) |c| total = std.math.add(usize, total, c) catch return error.Overflow;
@@ -680,7 +874,10 @@ pub const DFlareWorkspace = struct {
         const kv_dim: usize = cfg.kvDim();
         const max_nodes: usize = cfg.max_tree_nodes;
         const max_ctx: usize = if (cfg.hidden_size >= 1024) 1024 else 64;
+        const ctx_batch_cap: usize = @min(max_ctx, 64);
         const ctx_kv_elems: usize = @as(usize, cfg.num_layers) * max_ctx * kv_dim;
+        const mask_words: usize = (v + 31) / 32;
+        const row_scratch_elems: usize = @max(taps * h, @max(h, @max(inter, @max(q_dim, 2 * h + 2 * mr))));
 
         const taps_flat = try allocArenaSlice(f32, &mem_arena, taps * h);
         const ctx_hidden = try allocArenaSlice(f32, &mem_arena, h);
@@ -710,15 +907,53 @@ pub const DFlareWorkspace = struct {
         const node_log_probs = try allocArenaSlice(f32, &mem_arena, max_nodes);
         const l1_draft_buf = try allocArenaSlice(u32, &mem_arena, MAX_L1_DRAFT_LEN);
 
+        const gpu_taps_flat_f16 = try allocArenaSlice(f16, &mem_arena, taps * h);
+        const gpu_ctx_taps_f32 = try allocArenaSlice(f32, &mem_arena, ctx_batch_cap * taps * h);
+        const gpu_ctx_in_f16 = try allocArenaSlice(f16, &mem_arena, ctx_batch_cap * h);
+        const gpu_ctx_k_tmp_f16 = try allocArenaSlice(f16, &mem_arena, ctx_batch_cap * kv_dim);
+        const gpu_ctx_v_tmp_f16 = try allocArenaSlice(f16, &mem_arena, ctx_batch_cap * kv_dim);
+        const gpu_ctx_hidden_f16 = try allocArenaSlice(f16, &mem_arena, h);
+        const gpu_ctx_markov_f16 = try allocArenaSlice(f16, &mem_arena, h);
+        const gpu_ctx_markov_f32 = try allocArenaSlice(f32, &mem_arena, h);
+        const gpu_anchor_f16 = try allocArenaSlice(f16, &mem_arena, h);
+        const gpu_slot_hiddens_f16 = try allocArenaSlice(f16, &mem_arena, w * h);
+        const gpu_norm_f16 = try allocArenaSlice(f16, &mem_arena, w * h);
+        const gpu_q_f16 = try allocArenaSlice(f16, &mem_arena, w * q_dim);
+        const gpu_k_f16 = try allocArenaSlice(f16, &mem_arena, w * kv_dim);
+        const gpu_v_f16 = try allocArenaSlice(f16, &mem_arena, w * kv_dim);
+        const gpu_attn_out_f16 = try allocArenaSlice(f16, &mem_arena, w * q_dim);
+        const gpu_mlp_gate_f16 = try allocArenaSlice(f16, &mem_arena, w * inter);
+        const gpu_mlp_up_f16 = try allocArenaSlice(f16, &mem_arena, w * inter);
+        const gpu_mlp_down_f16 = try allocArenaSlice(f16, &mem_arena, w * h);
+        const gpu_markov_concat_f16 = try allocArenaSlice(f16, &mem_arena, 2 * h + 2 * mr);
+        const gpu_markov_concat_f32 = try allocArenaSlice(f32, &mem_arena, 2 * h + 2 * mr);
+        const gpu_markov_gates_f16 = try allocArenaSlice(f16, &mem_arena, 3 * mr);
+        const gpu_markov_gates_f32 = try allocArenaSlice(f32, &mem_arena, 3 * mr);
+        const gpu_markov_rnn_ping_f32 = try allocArenaSlice(f32, &mem_arena, 2 * mr);
+        const gpu_markov_vec_f16 = try allocArenaSlice(f16, &mem_arena, mr);
+        const gpu_markov_vec_f32 = try allocArenaSlice(f32, &mem_arena, mr);
+        const gpu_head_hidden_f16 = try allocArenaSlice(f16, &mem_arena, h);
+        const gpu_base_logits_f16 = try allocArenaSlice(f16, &mem_arena, w * v);
+        const gpu_logits_f16 = try allocArenaSlice(f16, &mem_arena, v);
+        const gpu_logits_f32 = try allocArenaSlice(f32, &mem_arena, v);
+        const gpu_topk_cands = try allocArenaSlice(moe.TopKCandidate, &mem_arena, w * MAX_TOP_K_PER_POS);
+        const gpu_token_chain_u32 = try allocArenaSlice(u32, &mem_arena, w + 1);
+        const gpu_grammar_mask_u32 = try allocArenaSlice(u32, &mem_arena, mask_words);
+        const gpu_w1_row_f32 = try allocArenaSlice(f32, &mem_arena, mr);
+        const cpu_quant_row_scratch = try allocArenaSlice(f32, &mem_arena, row_scratch_elems);
+
         @memset(node_log_probs, 0.0);
         @memset(node_rnn_hidden, 0.0);
         @memset(ctx_k_cache, 0.0);
         @memset(ctx_v_cache, 0.0);
+        @memset(gpu_markov_rnn_ping_f32, 0.0);
+        @memset(gpu_token_chain_u32, 0);
 
         return .{
             .arena = mem_arena,
             .config = cfg,
             .max_ctx_len = @intCast(max_ctx),
+            .ctx_batch_cap = @intCast(ctx_batch_cap),
             .taps_flat = taps_flat,
             .ctx_hidden = ctx_hidden,
             .ctx_markov = ctx_markov,
@@ -746,6 +981,40 @@ pub const DFlareWorkspace = struct {
             .topk_probs = topk_probs,
             .node_log_probs = node_log_probs,
             .l1_draft_buf = l1_draft_buf,
+            .gpu_taps_flat_f16 = gpu_taps_flat_f16,
+            .gpu_ctx_taps_f32 = gpu_ctx_taps_f32,
+            .gpu_ctx_in_f16 = gpu_ctx_in_f16,
+            .gpu_ctx_k_tmp_f16 = gpu_ctx_k_tmp_f16,
+            .gpu_ctx_v_tmp_f16 = gpu_ctx_v_tmp_f16,
+            .gpu_ctx_hidden_f16 = gpu_ctx_hidden_f16,
+            .gpu_ctx_markov_f16 = gpu_ctx_markov_f16,
+            .gpu_ctx_markov_f32 = gpu_ctx_markov_f32,
+            .gpu_anchor_f16 = gpu_anchor_f16,
+            .gpu_slot_hiddens_f16 = gpu_slot_hiddens_f16,
+            .gpu_norm_f16 = gpu_norm_f16,
+            .gpu_q_f16 = gpu_q_f16,
+            .gpu_k_f16 = gpu_k_f16,
+            .gpu_v_f16 = gpu_v_f16,
+            .gpu_attn_out_f16 = gpu_attn_out_f16,
+            .gpu_mlp_gate_f16 = gpu_mlp_gate_f16,
+            .gpu_mlp_up_f16 = gpu_mlp_up_f16,
+            .gpu_mlp_down_f16 = gpu_mlp_down_f16,
+            .gpu_markov_concat_f16 = gpu_markov_concat_f16,
+            .gpu_markov_concat_f32 = gpu_markov_concat_f32,
+            .gpu_markov_gates_f16 = gpu_markov_gates_f16,
+            .gpu_markov_gates_f32 = gpu_markov_gates_f32,
+            .gpu_markov_rnn_ping_f32 = gpu_markov_rnn_ping_f32,
+            .gpu_markov_vec_f16 = gpu_markov_vec_f16,
+            .gpu_markov_vec_f32 = gpu_markov_vec_f32,
+            .gpu_head_hidden_f16 = gpu_head_hidden_f16,
+            .gpu_base_logits_f16 = gpu_base_logits_f16,
+            .gpu_logits_f16 = gpu_logits_f16,
+            .gpu_logits_f32 = gpu_logits_f32,
+            .gpu_topk_cands = gpu_topk_cands,
+            .gpu_token_chain_u32 = gpu_token_chain_u32,
+            .gpu_grammar_mask_u32 = gpu_grammar_mask_u32,
+            .gpu_w1_row_f32 = gpu_w1_row_f32,
+            .cpu_quant_row_scratch = cpu_quant_row_scratch,
         };
     }
 
@@ -777,11 +1046,506 @@ pub const DFlareWorkspace = struct {
         self.topk_probs = &.{};
         self.node_log_probs = &.{};
         self.l1_draft_buf = &.{};
+        self.gpu_taps_flat_f16 = &.{};
+        self.gpu_ctx_taps_f32 = &.{};
+        self.gpu_ctx_in_f16 = &.{};
+        self.gpu_ctx_k_tmp_f16 = &.{};
+        self.gpu_ctx_v_tmp_f16 = &.{};
+        self.gpu_ctx_hidden_f16 = &.{};
+        self.gpu_ctx_markov_f16 = &.{};
+        self.gpu_ctx_markov_f32 = &.{};
+        self.gpu_anchor_f16 = &.{};
+        self.gpu_slot_hiddens_f16 = &.{};
+        self.gpu_norm_f16 = &.{};
+        self.gpu_q_f16 = &.{};
+        self.gpu_k_f16 = &.{};
+        self.gpu_v_f16 = &.{};
+        self.gpu_attn_out_f16 = &.{};
+        self.gpu_mlp_gate_f16 = &.{};
+        self.gpu_mlp_up_f16 = &.{};
+        self.gpu_mlp_down_f16 = &.{};
+        self.gpu_markov_concat_f16 = &.{};
+        self.gpu_markov_concat_f32 = &.{};
+        self.gpu_markov_gates_f16 = &.{};
+        self.gpu_markov_gates_f32 = &.{};
+        self.gpu_markov_rnn_ping_f32 = &.{};
+        self.gpu_markov_vec_f16 = &.{};
+        self.gpu_markov_vec_f32 = &.{};
+        self.gpu_head_hidden_f16 = &.{};
+        self.gpu_base_logits_f16 = &.{};
+        self.gpu_logits_f16 = &.{};
+        self.gpu_logits_f32 = &.{};
+        self.gpu_topk_cands = &.{};
+        self.gpu_token_chain_u32 = &.{};
+        self.gpu_grammar_mask_u32 = &.{};
+        self.gpu_w1_row_f32 = &.{};
+        self.cpu_quant_row_scratch = &.{};
         self.arena.deinit();
     }
 
     pub fn totalWiredBytes(self: *const DFlareWorkspace) u64 {
         return self.arena.bytes().len;
+    }
+
+    inline fn sliceBinding(self: *const DFlareWorkspace, buf: metal.Buffer, ptr: anytype) metal.BufferBinding {
+        const byte_ptr: [*]const u8 = @ptrCast(ptr.ptr);
+        return .{ .buffer = buf, .offset = self.arena.offsetOf(byte_ptr) };
+    }
+};
+
+// Metal 4 uniform payloads (exact ABI match with `src/kernels/dflare_gpu.metal`)
+const PackTapsParams = extern struct {
+    num_taps: u32,
+    hidden_size: u32,
+    src_is_f16: u32,
+    dst_is_f16: u32,
+};
+
+const MixTapsParams = extern struct {
+    num_pos: u32,
+    num_taps: u32,
+    hidden_size: u32,
+    taps_dtype: u32,
+    ring_cap: u32,
+    ring_start: u32,
+    has_mix_w: u32,
+    apply_norm: u32,
+    has_norm_w: u32,
+    write_f32: u32,
+    rms_eps: f32,
+    _pad0: u32 = 0,
+};
+
+const SeedBlockParams = extern struct {
+    block_size: u32,
+    hidden_size: u32,
+    is_real_gru: u32,
+    mask_rows: u32,
+    anchor_is_f16: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
+const DFlareRmsNormParams = extern struct {
+    num_rows: u32,
+    dim: u32,
+    x_is_f32: u32,
+    has_weight: u32,
+    write_f32: u32,
+    eps: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+const DFlareQkNormRopeParams = extern struct {
+    seq_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    anchor_pos: u32,
+    has_q_norm: u32,
+    has_k_norm: u32,
+    _pad0: u32 = 0,
+    rms_eps: f32,
+    rope_theta: f32,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
+const DFlareCtxKvStoreParams = extern struct {
+    num_pos: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    max_ctx: u32,
+    layer_elem_off: u32,
+    has_k_norm: u32,
+    rope_zero_pos: u32,
+    rms_eps: f32,
+    rope_theta: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+const DFlareBlockGqaParams = extern struct {
+    seq_len: u32,
+    active_ctx_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    layer_elem_off: u32,
+    scale: f32,
+    _pad0: u32 = 0,
+};
+
+const DFlareElemParams = extern struct {
+    count: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
+const DFlareGemvF32Params = extern struct {
+    m: u32,
+    n: u32,
+    k: u32,
+    has_residual: u32,
+    x_is_f32: u32,
+    y_is_f32: u32,
+    res_is_f32: u32,
+    _pad0: u32 = 0,
+};
+
+const DFlareMarkovAssembleParams = extern struct {
+    hidden_size: u32,
+    markov_rank: u32,
+    slot_pos: u32,
+    w1_rows: u32,
+    w1_dtype: u32,
+    use_tok_buf: u32,
+    tok_slot: u32,
+    imm_tok: u32,
+    write_f32: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
+const DFlareMarkovGruUpdateParams = extern struct {
+    markov_rank: u32,
+    gates_is_f32: u32,
+    has_bias: u32,
+    _pad0: u32 = 0,
+};
+
+const DFlareSimpleMarkovPrepParams = extern struct {
+    hidden_size: u32,
+    vocab_size: u32,
+    slot_pos: u32,
+    use_tok_buf: u32,
+    tok_slot: u32,
+    imm_tok: u32,
+    tok_dtype: u32,
+    has_tok_norm: u32,
+    concat_2h: u32,
+    write_f32: u32,
+    rms_eps: f32,
+    _pad0: u32 = 0,
+};
+
+const DFlareSimpleMarkovSiluParams = extern struct {
+    markov_rank: u32,
+    u_is_f32: u32,
+    add_parent_rnn: u32,
+    has_b1: u32,
+};
+
+const DFlareMarkovCombineParams = extern struct {
+    hidden_size: u32,
+    w2_is_f32: u32,
+    has_bias: u32,
+    has_norm: u32,
+    slot_pos: u32,
+    rms_eps: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+const DFlareW2VocabParams = extern struct {
+    vocab_size: u32,
+    v_rows: u32,
+    markov_rank: u32,
+    w2_dtype: u32,
+    has_bias: u32,
+    has_base_logits: u32,
+    base_row_elem_off: u32,
+    softcap: f32,
+};
+
+const DFlareLogitsEpilogueParams = extern struct {
+    vocab_size: u32,
+    v_rows: u32,
+    has_bias: u32,
+    has_base_logits: u32,
+    base_row_elem_off: u32,
+    in_is_f16: u32,
+    softcap: f32,
+    _pad0: u32 = 0,
+};
+
+const DFlareTopKParams = extern struct {
+    eff_vocab_size: u32,
+    top_k: u32,
+    logits_is_f16: u32,
+    has_mask: u32,
+    out_cand_offset: u32,
+    write_next_tok: u32,
+    next_tok_slot: u32,
+    aligned_vec4: u32,
+    inv_temp: f32,
+    softcap: f32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(PackTapsParams) != 16) @compileError("PackTapsParams size");
+    if (@sizeOf(MixTapsParams) != 48) @compileError("MixTapsParams size");
+    if (@sizeOf(SeedBlockParams) != 32) @compileError("SeedBlockParams size");
+    if (@sizeOf(DFlareRmsNormParams) != 32) @compileError("DFlareRmsNormParams size");
+    if (@sizeOf(DFlareQkNormRopeParams) != 48) @compileError("DFlareQkNormRopeParams size");
+    if (@sizeOf(DFlareCtxKvStoreParams) != 48) @compileError("DFlareCtxKvStoreParams size");
+    if (@sizeOf(DFlareBlockGqaParams) != 32) @compileError("DFlareBlockGqaParams size");
+    if (@sizeOf(DFlareElemParams) != 16) @compileError("DFlareElemParams size");
+    if (@sizeOf(DFlareGemvF32Params) != 32) @compileError("DFlareGemvF32Params size");
+    if (@sizeOf(DFlareMarkovAssembleParams) != 48) @compileError("DFlareMarkovAssembleParams size");
+    if (@sizeOf(DFlareMarkovGruUpdateParams) != 16) @compileError("DFlareMarkovGruUpdateParams size");
+    if (@sizeOf(DFlareSimpleMarkovPrepParams) != 48) @compileError("DFlareSimpleMarkovPrepParams size");
+    if (@sizeOf(DFlareSimpleMarkovSiluParams) != 16) @compileError("DFlareSimpleMarkovSiluParams size");
+    if (@sizeOf(DFlareMarkovCombineParams) != 32) @compileError("DFlareMarkovCombineParams size");
+    if (@sizeOf(DFlareW2VocabParams) != 32) @compileError("DFlareW2VocabParams size");
+    if (@sizeOf(DFlareLogitsEpilogueParams) != 32) @compileError("DFlareLogitsEpilogueParams size");
+    if (@sizeOf(DFlareTopKParams) != 48) @compileError("DFlareTopKParams size");
+}
+
+/// Startup-compiled Metal 4 compute pipelines for `src/kernels/dflare_gpu.metal`.
+pub const DFlareGpuPipelines = struct {
+    pack_taps8: metal.Pipeline,
+    mix_taps_rmsnorm: metal.Pipeline,
+    seed_block: metal.Pipeline,
+    rmsnorm_rows: metal.Pipeline,
+    qk_norm_rope: metal.Pipeline,
+    ctx_kv_norm_rope_store: metal.Pipeline,
+    block_gqa_attn: metal.Pipeline,
+    swiglu_mul: metal.Pipeline,
+    gemv_batch_f32: metal.Pipeline,
+    markov_gru_assemble: metal.Pipeline,
+    markov_gru_update: metal.Pipeline,
+    simple_markov_prep: metal.Pipeline,
+    simple_markov_silu: metal.Pipeline,
+    markov_head_combine: metal.Pipeline,
+    markov_w2_vocab_score: metal.Pipeline,
+    logits_epilogue: metal.Pipeline,
+    top1_logits: metal.Pipeline,
+    topk_logits: metal.Pipeline,
+
+    pub fn init(device: metal.Device, library: metal.Library) metal.Error!DFlareGpuPipelines {
+        const pack_taps8 = try metal.Pipeline.init(device, library, "dflare_pack_taps8");
+        errdefer pack_taps8.close();
+        const mix_taps_rmsnorm = try metal.Pipeline.init(device, library, "dflare_mix_taps_rmsnorm");
+        errdefer mix_taps_rmsnorm.close();
+        const seed_block = try metal.Pipeline.init(device, library, "dflare_seed_block");
+        errdefer seed_block.close();
+        const rmsnorm_rows = try metal.Pipeline.init(device, library, "dflare_rmsnorm_rows");
+        errdefer rmsnorm_rows.close();
+        const qk_norm_rope = try metal.Pipeline.init(device, library, "dflare_qk_norm_rope");
+        errdefer qk_norm_rope.close();
+        const ctx_kv_norm_rope_store = try metal.Pipeline.init(device, library, "dflare_ctx_kv_norm_rope_store");
+        errdefer ctx_kv_norm_rope_store.close();
+        const block_gqa_attn = try metal.Pipeline.init(device, library, "dflare_block_gqa_attn");
+        errdefer block_gqa_attn.close();
+        const swiglu_mul = try metal.Pipeline.init(device, library, "dflare_swiglu_mul");
+        errdefer swiglu_mul.close();
+        const gemv_batch_f32 = try metal.Pipeline.init(device, library, "dflare_gemv_batch_f32");
+        errdefer gemv_batch_f32.close();
+        const markov_gru_assemble = try metal.Pipeline.init(device, library, "dflare_markov_gru_assemble");
+        errdefer markov_gru_assemble.close();
+        const markov_gru_update = try metal.Pipeline.init(device, library, "dflare_markov_gru_update");
+        errdefer markov_gru_update.close();
+        const simple_markov_prep = try metal.Pipeline.init(device, library, "dflare_simple_markov_prep");
+        errdefer simple_markov_prep.close();
+        const simple_markov_silu = try metal.Pipeline.init(device, library, "dflare_simple_markov_silu");
+        errdefer simple_markov_silu.close();
+        const markov_head_combine = try metal.Pipeline.init(device, library, "dflare_markov_head_combine");
+        errdefer markov_head_combine.close();
+        const markov_w2_vocab_score = try metal.Pipeline.init(device, library, "dflare_markov_w2_vocab_score");
+        errdefer markov_w2_vocab_score.close();
+        const logits_epilogue = try metal.Pipeline.init(device, library, "dflare_logits_epilogue");
+        errdefer logits_epilogue.close();
+        const top1_logits = try metal.Pipeline.init(device, library, "dflare_top1_logits");
+        errdefer top1_logits.close();
+        const topk_logits = try metal.Pipeline.init(device, library, "dflare_topk_logits");
+        errdefer topk_logits.close();
+
+        return .{
+            .pack_taps8 = pack_taps8,
+            .mix_taps_rmsnorm = mix_taps_rmsnorm,
+            .seed_block = seed_block,
+            .rmsnorm_rows = rmsnorm_rows,
+            .qk_norm_rope = qk_norm_rope,
+            .ctx_kv_norm_rope_store = ctx_kv_norm_rope_store,
+            .block_gqa_attn = block_gqa_attn,
+            .swiglu_mul = swiglu_mul,
+            .gemv_batch_f32 = gemv_batch_f32,
+            .markov_gru_assemble = markov_gru_assemble,
+            .markov_gru_update = markov_gru_update,
+            .simple_markov_prep = simple_markov_prep,
+            .simple_markov_silu = simple_markov_silu,
+            .markov_head_combine = markov_head_combine,
+            .markov_w2_vocab_score = markov_w2_vocab_score,
+            .logits_epilogue = logits_epilogue,
+            .top1_logits = top1_logits,
+            .topk_logits = topk_logits,
+        };
+    }
+
+    pub fn close(self: DFlareGpuPipelines) void {
+        self.topk_logits.close();
+        self.top1_logits.close();
+        self.logits_epilogue.close();
+        self.markov_w2_vocab_score.close();
+        self.markov_head_combine.close();
+        self.simple_markov_silu.close();
+        self.simple_markov_prep.close();
+        self.markov_gru_update.close();
+        self.markov_gru_assemble.close();
+        self.gemv_batch_f32.close();
+        self.swiglu_mul.close();
+        self.block_gqa_attn.close();
+        self.ctx_kv_norm_rope_store.close();
+        self.qk_norm_rope.close();
+        self.rmsnorm_rows.close();
+        self.seed_block.close();
+        self.mix_taps_rmsnorm.close();
+        self.pack_taps8.close();
+    }
+};
+
+/// Options for attaching Metal 4 GPU acceleration (`D16`, ADR-0026) to `DFlareProposer`.
+pub const DFlareGpuAttachOptions = struct {
+    device: metal.Device,
+    library: metal.Library,
+    /// Optional borrowed Metal 4 compute ring (e.g., target `GraphModel.compute`).
+    /// When `null`, `DFlareProposer` creates and owns its own `metal.Compute`.
+    compute: ?*metal.Compute = null,
+    /// Optional borrowed `DequantPipelines` (e.g., target `GraphModel.dequant_pipes`).
+    dequant_pipes: ?*const dequant.DequantPipelines = null,
+    /// Optional borrowed `QuantFormatPipelines` (e.g., target `GraphModel.qf_pipes`).
+    qf_pipes: ?*const quant_formats.QuantFormatPipelines = null,
+    /// Optional GPU binding for target `lm_head` so `3L`/`5L` Markov scoring and
+    /// `dflash` `base_logits` stay inside the same `MTL4CommandBuffer`.
+    target_lm_head: ?GpuLinearBinding = null,
+    /// Optional GPU binding for target `embed_tokens`.
+    target_embed_tokens: ?GpuLinearBinding = null,
+    /// Optional target embedding RMSNorm weight `[hidden_size]` `f32`.
+    target_embed_norm_f32: ?[]const f32 = null,
+    timeout_ms: u64 = 30_000,
+};
+
+const GpuLayerBindings = struct {
+    in_norm_w: ?metal.BufferBinding = null,
+    q_proj: GpuLinearBinding,
+    k_proj: GpuLinearBinding,
+    v_proj: GpuLinearBinding,
+    o_proj: GpuLinearBinding,
+    k_proj_ctx: ?GpuLinearBinding = null,
+    v_proj_ctx: ?GpuLinearBinding = null,
+    ctx_norm_w: ?metal.BufferBinding = null,
+    k_norm_ctx_w: ?metal.BufferBinding = null,
+    q_norm_w: ?metal.BufferBinding = null,
+    k_norm_w: ?metal.BufferBinding = null,
+    post_norm_w: ?metal.BufferBinding = null,
+    mlp_gate: GpuLinearBinding,
+    mlp_up: GpuLinearBinding,
+    mlp_down: GpuLinearBinding,
+};
+
+/// Zero-copy `WiredArena` Metal 4 runtime context bound to `DFlareProposer`.
+pub const DFlareGpuContext = struct {
+    device: metal.Device,
+    library: metal.Library,
+    compute_ptr: *metal.Compute,
+    owned_compute: ?metal.Compute = null,
+    dequant_ptr: *const dequant.DequantPipelines,
+    owned_dequant: ?dequant.DequantPipelines = null,
+    borrowed_qf: ?*const quant_formats.QuantFormatPipelines = null,
+    owned_qf: ?quant_formats.QuantFormatPipelines = null,
+    pipes: DFlareGpuPipelines,
+    ws_buf: metal.Buffer,
+    weight_buf: ?metal.Buffer = null,
+    staging_arena: ?arena_mod.WiredArena = null,
+    staging_buf: ?metal.Buffer = null,
+    resident_bufs: [32]metal.Buffer = undefined,
+    resident_count: usize = 0,
+    timeout_ms: u64 = 30_000,
+
+    layers: [MAX_LAYERS]GpuLayerBindings = undefined,
+    num_layers: usize = 0,
+    target_fusion_proj: ?GpuLinearBinding = null,
+    fuse_scalar_weights: ?metal.BufferBinding = null,
+    fuse_rows: u32 = 0,
+    target_fusion_norm: ?metal.BufferBinding = null,
+    mask_embed: metal.BufferBinding = undefined,
+    mask_rows: u32 = 1,
+    tok_embed: ?metal.BufferBinding = null,
+    tok_embed_dtype: u32 = 0,
+    token_embd_norm: ?metal.BufferBinding = null,
+    final_norm: ?metal.BufferBinding = null,
+    markov_w1: ?GpuLinearBinding = null,
+    markov_w1_vocab: ?metal.BufferBinding = null,
+    markov_w1_vocab_dtype: u32 = 0,
+    markov_w1_vocab_rows: u32 = 0,
+    markov_w1_vocab_raw: ?RawLinearMat = null,
+    markov_gru_proj: ?GpuLinearBinding = null,
+    markov_gru_bias: ?metal.BufferBinding = null,
+    markov_ctx_norm: ?metal.BufferBinding = null,
+    markov_rnn_proj: ?GpuLinearBinding = null,
+    markov_b1: ?metal.BufferBinding = null,
+    markov_w2: ?GpuLinearBinding = null,
+    markov_hidden_bias: ?metal.BufferBinding = null,
+    markov_w2_vocab: ?GpuLinearBinding = null,
+    markov_w2_vocab_bias: ?metal.BufferBinding = null,
+    markov_w2_vocab_rows: u32 = 0,
+    markov_norm: ?metal.BufferBinding = null,
+    lm_head: ?GpuLinearBinding = null,
+    target_embed_norm: ?metal.BufferBinding = null,
+
+    fn qfPipesFor(self: *const DFlareGpuContext, dtype: amf.DType, group_size: u16) ?*const quant_formats.QuantFormatPipelines {
+        const qf_dt = quant_formats.DType.fromAmf(dtype) orelse return null;
+        if (self.borrowed_qf) |bqf| {
+            if (bqf.pipelineFor(qf_dt, group_size, .gemv) != null and
+                bqf.pipelineFor(qf_dt, group_size, .gemv_batch) != null)
+            {
+                return bqf;
+            }
+        }
+        if (self.owned_qf) |*oqf| {
+            if (oqf.pipelineFor(qf_dt, group_size, .gemv) != null and
+                oqf.pipelineFor(qf_dt, group_size, .gemv_batch) != null)
+            {
+                return oqf;
+            }
+        }
+        return null;
+    }
+
+    fn ensureResident(self: *DFlareGpuContext, buf: metal.Buffer) Error!void {
+        if (self.owned_compute == null) return;
+        for (self.resident_bufs[0..self.resident_count]) |existing| {
+            if (existing.handle == buf.handle) return;
+        }
+        if (self.resident_count >= self.resident_bufs.len) return error.Overflow;
+        try self.compute_ptr.makeResident(&.{buf});
+        self.resident_bufs[self.resident_count] = buf;
+        self.resident_count += 1;
+    }
+
+    pub fn close(self: *DFlareGpuContext) void {
+        if (self.owned_compute == null and self.resident_count > 0) {
+            self.compute_ptr.removeResident(self.resident_bufs[0..self.resident_count]) catch |err| {
+                std.debug.panic("DFlareGpuContext removeResident failed: {}", .{err});
+            };
+            self.resident_count = 0;
+        }
+        self.pipes.close();
+        if (self.owned_qf) |*oqf| oqf.close();
+        if (self.owned_dequant) |*odq| odq.close();
+        if (self.staging_buf) |sb| sb.close();
+        if (self.staging_arena) |*sa| sa.deinit();
+        if (self.weight_buf) |wb| wb.close();
+        self.ws_buf.close();
+        if (self.owned_compute) |oc| oc.close();
     }
 };
 
@@ -802,12 +1566,15 @@ pub const Core3BatchVerifyResult = struct {
     accept: accept_mod.AcceptResult,
 };
 
-/// D14 `DFlare` block-parallel speculative proposer (`Inkling 2` `3L`/`5L`,
+/// D14 / D16 `DFlare` block-parallel speculative proposer (`Inkling 2` `3L`/`5L`,
 /// `block_size = 8`, `markov_rank = 256` sequential `rnn_hidden` Markov head).
+/// Executes on Metal 4 GPU when attached via `attachGpu` and falls back to
+/// the scalar CPU path automatically when no GPU context is attached.
 pub const DFlareProposer = struct {
     config: DFlareConfig,
     weights: DFlareWeights,
     workspace: *DFlareWorkspace,
+    gpu_ctx: ?*DFlareGpuContext = null,
     backbone_runs: u64 = 0,
     markov_steps: u64 = 0,
     ctx_cache_len: u32 = 0,
@@ -815,7 +1582,17 @@ pub const DFlareProposer = struct {
     base_logits_ready: bool = false,
 
     inline fn isRealGru(self: *const DFlareProposer) bool {
-        return self.weights.markov_gru_proj_bf16 != null or self.weights.markov_gru_proj_f32 != null;
+        return self.weights.markov_gru_proj_bf16 != null or
+            self.weights.markov_gru_proj_f32 != null or
+            self.weights.markov_gru_proj_raw != null;
+    }
+
+    inline fn hasMarkovW2Vocab(self: *const DFlareProposer) bool {
+        return self.weights.markov_w2_vocab_bf16 != null or self.weights.markov_w2_vocab_raw != null;
+    }
+
+    pub inline fn hasGpu(self: *const DFlareProposer) bool {
+        return self.gpu_ctx != null;
     }
 
     pub fn init(
@@ -845,6 +1622,426 @@ pub const DFlareProposer = struct {
         };
     }
 
+    /// Attaches a Metal 4 GPU execution context (`D16`, ADR-0026) over the
+    /// `WiredArena`-backed weights and workspace. Safe to re-call; call
+    /// `detachGpu()` before `workspace.deinit()` or `LoadedDFlareBundle.deinit()`.
+    pub fn attachGpu(self: *DFlareProposer, opts: DFlareGpuAttachOptions) Error!void {
+        self.detachGpu();
+        if (self.config.head_dim > 256) return error.InvalidConfig;
+
+        const ctx = try std.heap.c_allocator.create(DFlareGpuContext);
+        errdefer std.heap.c_allocator.destroy(ctx);
+
+        const ws_buf = try metal.Buffer.wrap(opts.device, self.workspace.arena.bytes());
+        errdefer ws_buf.close();
+
+        var weight_buf: ?metal.Buffer = null;
+        errdefer if (weight_buf) |wb| wb.close();
+        if (self.weights.wired_arena_bytes) |wab| {
+            weight_buf = try metal.Buffer.wrap(opts.device, wab);
+        }
+
+        var owned_compute: ?metal.Compute = null;
+        errdefer if (owned_compute) |oc| oc.close();
+        if (opts.compute == null) {
+            owned_compute = try metal.Compute.initWithFrames(opts.device, 2);
+        }
+
+        var owned_dequant: ?dequant.DequantPipelines = null;
+        errdefer if (owned_dequant) |*odq| odq.close();
+        if (opts.dequant_pipes == null) {
+            owned_dequant = try dequant.DequantPipelines.init(opts.device, opts.library);
+        }
+
+        const pipes = try DFlareGpuPipelines.init(opts.device, opts.library);
+        errdefer pipes.close();
+
+        // Collect missing QuantFormatPipelines specs across all DFlare weights + target hooks.
+        var missing_specs: [quant_formats.ALL_FORMAT_SPECS.len]quant_formats.FormatSpec = undefined;
+        var missing_len: usize = 0;
+        const h: u32 = self.config.hidden_size;
+        const inter: u32 = self.config.intermediate_size;
+        const q_dim: u32 = self.config.qDim();
+        const kv_dim: u32 = self.config.kvDim();
+        const mr: u32 = self.config.markov_rank;
+
+        try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.target_fusion_proj_raw);
+        for (self.weights.layers) |ly| {
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.q_proj_raw);
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.k_proj_raw);
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.v_proj_raw);
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.o_proj_raw);
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.k_proj_ctx_raw);
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.v_proj_ctx_raw);
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.mlp_gate_raw);
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.mlp_up_raw);
+            try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, ly.mlp_down_raw);
+        }
+        try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.markov_w1_raw);
+        try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.markov_gru_proj_raw);
+        try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.markov_rnn_proj_raw);
+        try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.markov_w2_raw);
+        try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.markov_w2_vocab_raw);
+        try collectMissingQfSpec(opts.qf_pipes, &missing_specs, &missing_len, self.weights.lm_head_raw);
+        if (opts.target_lm_head) |tlh| {
+            try collectMissingQfSpecDType(opts.qf_pipes, &missing_specs, &missing_len, tlh.amf_dtype, tlh.group_size);
+        }
+
+        var owned_qf: ?quant_formats.QuantFormatPipelines = null;
+        errdefer if (owned_qf) |*oqf| oqf.close();
+        if (missing_len > 0) {
+            owned_qf = try quant_formats.QuantFormatPipelines.initWithOptions(opts.device, opts.library, .{
+                .specs = missing_specs[0..missing_len],
+                .include_moe = false,
+                .include_act_quant = false,
+            });
+        }
+
+        // Pass 1: measure staging bytes needed for any host slices NOT inside `wired_arena_bytes`.
+        const wired_opt = self.weights.wired_arena_bytes;
+        var stage_bytes: usize = 0;
+        stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(self.weights.mask_embed));
+        if (self.weights.fuse_scalar_weights) |fsw| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(fsw));
+        if (self.weights.target_fusion_norm) |fnw| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(fnw));
+        if (self.weights.target_fusion_proj_raw) |r| {
+            stage_bytes += stageMeasureRaw(wired_opt, r);
+        } else if (self.weights.target_fusion_proj) |fp| {
+            stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(fp));
+        }
+        if (self.weights.token_embd_norm) |ten| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(ten));
+        if (self.weights.final_norm) |fnw| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(fnw));
+        if (opts.target_embed_norm_f32) |tenf| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(tenf));
+
+        if (opts.target_embed_tokens == null and self.weights.tok_embed_hook == null) {
+            if (self.weights.tok_embed_raw) |tr| {
+                stage_bytes += stageMeasureRaw(wired_opt, tr);
+            } else if (self.weights.tok_embed.len > 0) {
+                stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(self.weights.tok_embed));
+            }
+        } else if (self.weights.tok_embed_hook) |hk| {
+            if (hk == .dense_f32) stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(hk.dense_f32));
+        }
+
+        for (self.weights.layers) |ly| {
+            if (ly.in_norm_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
+            if (ly.ctx_norm_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
+            if (ly.k_norm_ctx_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
+            if (ly.q_norm_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
+            if (ly.k_norm_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
+            if (ly.post_norm_weight) |w| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(w));
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.q_proj, ly.q_proj_bf16, ly.q_proj_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.k_proj, ly.k_proj_bf16, ly.k_proj_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.v_proj, ly.v_proj_bf16, ly.v_proj_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.o_proj, ly.o_proj_bf16, ly.o_proj_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.k_proj_ctx orelse &.{}, ly.k_proj_ctx_bf16, ly.k_proj_ctx_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.v_proj_ctx orelse &.{}, ly.v_proj_ctx_bf16, ly.v_proj_ctx_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.mlp_gate_proj, ly.mlp_gate_bf16, ly.mlp_gate_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.mlp_up_proj, ly.mlp_up_bf16, ly.mlp_up_raw);
+            stage_bytes += stageMeasureLayerProj(wired_opt, ly.mlp_down_proj, ly.mlp_down_bf16, ly.mlp_down_raw);
+        }
+
+        if (self.weights.markov_gru_bias) |b| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(b));
+        if (self.weights.markov_ctx_norm) |b| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(b));
+        if (self.weights.markov_b1) |b| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(b));
+        if (self.weights.markov_hidden_bias) |b| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(b));
+        if (self.weights.markov_w2_vocab_bias) |b| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(b));
+        if (self.weights.markov_norm) |b| stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(b));
+        stage_bytes += stageMeasureLayerProj(wired_opt, self.weights.markov_w1, null, self.weights.markov_w1_raw);
+        stage_bytes += stageMeasureLayerProj(wired_opt, &.{}, self.weights.markov_w1_vocab_bf16, self.weights.markov_w1_vocab_raw);
+        stage_bytes += stageMeasureLayerProj(wired_opt, self.weights.markov_gru_proj_f32 orelse &.{}, self.weights.markov_gru_proj_bf16, self.weights.markov_gru_proj_raw);
+        stage_bytes += stageMeasureLayerProj(wired_opt, self.weights.markov_rnn_proj orelse &.{}, null, self.weights.markov_rnn_proj_raw);
+        stage_bytes += stageMeasureLayerProj(wired_opt, self.weights.markov_w2, null, self.weights.markov_w2_raw);
+        stage_bytes += stageMeasureLayerProj(wired_opt, &.{}, self.weights.markov_w2_vocab_bf16, self.weights.markov_w2_vocab_raw);
+
+        if (opts.target_lm_head == null) {
+            if (self.weights.lm_head_raw) |lhr| {
+                stage_bytes += stageMeasureRaw(wired_opt, lhr);
+            } else switch (self.weights.lm_head) {
+                .dense_f32 => |m| if (m.len > 0) {
+                    stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(m));
+                },
+                .dense_f16 => |m| if (m.len > 0) {
+                    stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(m));
+                },
+                .dense_bf16 => |m| if (m.len > 0) {
+                    stage_bytes += stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(m));
+                },
+                .callback => {},
+            }
+        }
+
+        var staging_arena: ?arena_mod.WiredArena = null;
+        errdefer if (staging_arena) |*sa| sa.deinit();
+        var staging_buf: ?metal.Buffer = null;
+        errdefer if (staging_buf) |sb| sb.close();
+        if (stage_bytes > 0) {
+            const aligned_stage = try page.alignUp(stage_bytes);
+            const st_budget = try defaultWiredBudget();
+            staging_arena = try arena_mod.WiredArena.init(aligned_stage, st_budget);
+            staging_buf = try metal.Buffer.wrap(opts.device, staging_arena.?.bytes());
+        }
+
+        ctx.* = .{
+            .device = opts.device,
+            .library = opts.library,
+            .compute_ptr = undefined,
+            .owned_compute = owned_compute,
+            .dequant_ptr = undefined,
+            .owned_dequant = owned_dequant,
+            .borrowed_qf = opts.qf_pipes,
+            .owned_qf = owned_qf,
+            .pipes = pipes,
+            .ws_buf = ws_buf,
+            .weight_buf = weight_buf,
+            .staging_arena = staging_arena,
+            .staging_buf = staging_buf,
+            .timeout_ms = opts.timeout_ms,
+            .num_layers = self.config.num_layers,
+        };
+        ctx.compute_ptr = if (ctx.owned_compute) |*oc| oc else opts.compute.?;
+        ctx.dequant_ptr = if (ctx.owned_dequant) |*odq| odq else opts.dequant_pipes.?;
+        // Ownership moved into `ctx`; clear local errdefers and guard remaining setup with `errdefer ctx.close()`.
+        owned_compute = null;
+        owned_dequant = null;
+        owned_qf = null;
+        staging_arena = null;
+        staging_buf = null;
+        weight_buf = null;
+        errdefer ctx.close();
+
+        // Pass 2: bind zero-copy `weight_buf` or stage into `staging_buf`.
+        const bind_ctx = BindHelper{
+            .wired = wired_opt,
+            .weight_buf = ctx.weight_buf,
+            .st_arena = if (ctx.staging_arena) |*sa| sa else null,
+            .st_buf = ctx.staging_buf,
+        };
+
+        ctx.mask_embed = try bind_ctx.bindSlice(std.mem.sliceAsBytes(self.weights.mask_embed));
+        ctx.mask_rows = @intCast(self.weights.mask_embed.len / h);
+        if (self.weights.fuse_scalar_weights) |fsw| {
+            ctx.fuse_scalar_weights = try bind_ctx.bindSlice(std.mem.sliceAsBytes(fsw));
+            ctx.fuse_rows = @intCast(fsw.len / self.config.num_target_taps);
+        }
+        if (self.weights.target_fusion_norm) |fnw| ctx.target_fusion_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(fnw));
+        if (self.weights.target_fusion_proj_raw) |fpr| {
+            ctx.target_fusion_proj = try bind_ctx.bindRaw(fpr);
+        } else if (self.weights.target_fusion_proj) |fp| {
+            ctx.target_fusion_proj = try bind_ctx.bindF32Mat(fp, h, self.config.num_target_taps * h);
+        }
+        if (self.weights.token_embd_norm) |ten| ctx.token_embd_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(ten));
+        if (self.weights.final_norm) |fnw| ctx.final_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(fnw));
+        if (opts.target_embed_norm_f32) |tenf| ctx.target_embed_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(tenf));
+
+        if (opts.target_embed_tokens) |tet| {
+            ctx.tok_embed = tet.weight;
+            ctx.tok_embed_dtype = switch (tet.amf_dtype) {
+                .f32 => 0,
+                .f16 => 1,
+                .bf16 => 2,
+                else => 0,
+            };
+        } else if (self.weights.tok_embed_hook) |hk| {
+            if (hk == .dense_f32) {
+                ctx.tok_embed = try bind_ctx.bindSlice(std.mem.sliceAsBytes(hk.dense_f32));
+                ctx.tok_embed_dtype = 0;
+            }
+        } else if (self.weights.tok_embed_raw) |tr| {
+            if (tr.amf_dtype == .f32 or tr.amf_dtype == .f16 or tr.amf_dtype == .bf16) {
+                ctx.tok_embed = try bind_ctx.bindSlice(tr.data);
+                ctx.tok_embed_dtype = switch (tr.amf_dtype) {
+                    .f32 => 0,
+                    .f16 => 1,
+                    .bf16 => 2,
+                    else => 0,
+                };
+            }
+        } else if (self.weights.tok_embed.len > 0) {
+            ctx.tok_embed = try bind_ctx.bindSlice(std.mem.sliceAsBytes(self.weights.tok_embed));
+            ctx.tok_embed_dtype = 0;
+        }
+
+        for (self.weights.layers, 0..) |ly, li| {
+            ctx.layers[li] = .{
+                .in_norm_w = if (ly.in_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
+                .q_proj = try bind_ctx.bindLayerProj(ly.q_proj, ly.q_proj_bf16, ly.q_proj_raw, q_dim, h),
+                .k_proj = try bind_ctx.bindLayerProj(ly.k_proj, ly.k_proj_bf16, ly.k_proj_raw, kv_dim, h),
+                .v_proj = try bind_ctx.bindLayerProj(ly.v_proj, ly.v_proj_bf16, ly.v_proj_raw, kv_dim, h),
+                .o_proj = try bind_ctx.bindLayerProj(ly.o_proj, ly.o_proj_bf16, ly.o_proj_raw, h, q_dim),
+                .k_proj_ctx = try bind_ctx.bindLayerProjOpt(ly.k_proj_ctx, ly.k_proj_ctx_bf16, ly.k_proj_ctx_raw, kv_dim, h),
+                .v_proj_ctx = try bind_ctx.bindLayerProjOpt(ly.v_proj_ctx, ly.v_proj_ctx_bf16, ly.v_proj_ctx_raw, kv_dim, h),
+                .ctx_norm_w = if (ly.ctx_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
+                .k_norm_ctx_w = if (ly.k_norm_ctx_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
+                .q_norm_w = if (ly.q_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
+                .k_norm_w = if (ly.k_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
+                .post_norm_w = if (ly.post_norm_weight) |w| try bind_ctx.bindSlice(std.mem.sliceAsBytes(w)) else null,
+                .mlp_gate = try bind_ctx.bindLayerProj(ly.mlp_gate_proj, ly.mlp_gate_bf16, ly.mlp_gate_raw, inter, h),
+                .mlp_up = try bind_ctx.bindLayerProj(ly.mlp_up_proj, ly.mlp_up_bf16, ly.mlp_up_raw, inter, h),
+                .mlp_down = try bind_ctx.bindLayerProj(ly.mlp_down_proj, ly.mlp_down_bf16, ly.mlp_down_raw, h, inter),
+            };
+        }
+
+        if (self.weights.markov_gru_bias) |b| ctx.markov_gru_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+        if (self.weights.markov_ctx_norm) |b| ctx.markov_ctx_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+        if (self.weights.markov_b1) |b| ctx.markov_b1 = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+        if (self.weights.markov_hidden_bias) |b| ctx.markov_hidden_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+        if (self.weights.markov_w2_vocab_bias) |b| ctx.markov_w2_vocab_bias = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+        if (self.weights.markov_norm) |b| ctx.markov_norm = try bind_ctx.bindSlice(std.mem.sliceAsBytes(b));
+
+        if (self.weights.markov_w1_raw) |r| {
+            ctx.markov_w1 = try bind_ctx.bindRaw(r);
+        } else if (self.weights.markov_w1.len > 0) {
+            const w1_k: u32 = @intCast(self.weights.markov_w1.len / mr);
+            ctx.markov_w1 = try bind_ctx.bindF32Mat(self.weights.markov_w1, mr, w1_k);
+        }
+
+        if (self.weights.markov_w1_vocab_raw) |r| {
+            ctx.markov_w1_vocab_rows = self.weights.markov_w1_vocab_rows;
+            if (r.amf_dtype == .bf16 or r.amf_dtype == .f16 or r.amf_dtype == .f32) {
+                ctx.markov_w1_vocab = try bind_ctx.bindSlice(r.data);
+                ctx.markov_w1_vocab_dtype = switch (r.amf_dtype) {
+                    .bf16 => 0,
+                    .f16 => 1,
+                    .f32 => 2,
+                    else => 0,
+                };
+            } else {
+                ctx.markov_w1_vocab_raw = r;
+                ctx.markov_w1_vocab_dtype = 2;
+            }
+        } else if (self.weights.markov_w1_vocab_bf16) |wb| {
+            ctx.markov_w1_vocab = try bind_ctx.bindSlice(std.mem.sliceAsBytes(wb));
+            ctx.markov_w1_vocab_dtype = 0;
+            ctx.markov_w1_vocab_rows = self.weights.markov_w1_vocab_rows;
+        }
+
+        ctx.markov_gru_proj = try bind_ctx.bindLayerProjOpt(self.weights.markov_gru_proj_f32, self.weights.markov_gru_proj_bf16, self.weights.markov_gru_proj_raw, 3 * mr, 2 * h + 2 * mr);
+        ctx.markov_rnn_proj = try bind_ctx.bindLayerProjOpt(self.weights.markov_rnn_proj, null, self.weights.markov_rnn_proj_raw, mr, mr);
+        if (self.weights.markov_w2_raw) |r| {
+            ctx.markov_w2 = try bind_ctx.bindRaw(r);
+        } else if (self.weights.markov_w2.len > 0) {
+            ctx.markov_w2 = try bind_ctx.bindF32Mat(self.weights.markov_w2, h, mr);
+        }
+
+        if (self.weights.markov_w2_vocab_raw) |r| {
+            ctx.markov_w2_vocab = try bind_ctx.bindRaw(r);
+            ctx.markov_w2_vocab_rows = self.weights.markov_w2_vocab_rows;
+        } else if (self.weights.markov_w2_vocab_bf16) |w2b| {
+            ctx.markov_w2_vocab = try bind_ctx.bindBf16Mat(w2b, self.weights.markov_w2_vocab_rows, mr);
+            ctx.markov_w2_vocab_rows = self.weights.markov_w2_vocab_rows;
+        }
+
+        if (opts.target_lm_head) |tlh| {
+            ctx.lm_head = tlh;
+        } else if (self.weights.lm_head_raw) |lhr| {
+            ctx.lm_head = try bind_ctx.bindRaw(lhr);
+        } else switch (self.weights.lm_head) {
+            .dense_f32 => |m| if (m.len > 0) {
+                ctx.lm_head = try bind_ctx.bindF32Mat(m, self.config.vocab_size, h);
+            },
+            .dense_f16 => |m| if (m.len > 0) {
+                ctx.lm_head = .{ .amf_dtype = .f16, .weight = try bind_ctx.bindSlice(std.mem.sliceAsBytes(m)), .n = self.config.vocab_size, .k = h };
+            },
+            .dense_bf16 => |m| if (m.len > 0) {
+                ctx.lm_head = try bind_ctx.bindBf16Mat(m, self.config.vocab_size, h);
+            },
+            .callback => {},
+        }
+
+        // Make owned/wrapped buffers resident on `compute_ptr`.
+        ctx.resident_bufs[ctx.resident_count] = ctx.ws_buf;
+        ctx.resident_count += 1;
+        if (ctx.weight_buf) |wb| {
+            ctx.resident_bufs[ctx.resident_count] = wb;
+            ctx.resident_count += 1;
+        }
+        if (ctx.staging_buf) |sb| {
+            ctx.resident_bufs[ctx.resident_count] = sb;
+            ctx.resident_count += 1;
+        }
+        if (ctx.owned_qf) |*oqf| {
+            ctx.resident_bufs[ctx.resident_count] = oqf.codebook_buf;
+            ctx.resident_count += 1;
+        }
+        // Only register external buffers when we own `Compute` (`opts.compute == null`).
+        if (ctx.owned_compute != null) {
+            if (opts.target_lm_head) |tlh| {
+                appendUniqueResident(&ctx.resident_bufs, &ctx.resident_count, tlh.weight.buffer);
+                if (tlh.params) |pb| appendUniqueResident(&ctx.resident_bufs, &ctx.resident_count, pb.buffer);
+            }
+            if (opts.target_embed_tokens) |tet| {
+                appendUniqueResident(&ctx.resident_bufs, &ctx.resident_count, tet.weight.buffer);
+                if (tet.params) |pb| appendUniqueResident(&ctx.resident_bufs, &ctx.resident_count, pb.buffer);
+            }
+        }
+        try ctx.compute_ptr.makeResident(ctx.resident_bufs[0..ctx.resident_count]);
+
+        self.gpu_ctx = ctx;
+    }
+
+    pub fn detachGpu(self: *DFlareProposer) void {
+        if (self.gpu_ctx) |ctx| {
+            ctx.close();
+            std.heap.c_allocator.destroy(ctx);
+            self.gpu_ctx = null;
+        }
+    }
+
+    /// Updates or attaches a GPU target `lm_head` binding after `attachGpu`.
+    pub fn setTargetLmHeadGpu(self: *DFlareProposer, binding: ?GpuLinearBinding) Error!void {
+        const gpu = self.gpu_ctx orelse return error.InvalidWeights;
+        if (binding) |tlh| {
+            if (dequant.usesQuantFormats(tlh.amf_dtype, tlh.group_size) and gpu.qfPipesFor(tlh.amf_dtype, tlh.group_size) == null) {
+                var specs: [quant_formats.ALL_FORMAT_SPECS.len]quant_formats.FormatSpec = undefined;
+                var n_specs: usize = 0;
+                if (gpu.owned_qf) |*oqf| {
+                    for (quant_formats.ALL_FORMAT_SPECS) |s| {
+                        if (oqf.pipelineFor(s.dtype, s.group_size, .gemv) != null) {
+                            specs[n_specs] = s;
+                            n_specs += 1;
+                        }
+                    }
+                }
+                try collectMissingQfSpecDType(gpu.borrowed_qf, &specs, &n_specs, tlh.amf_dtype, tlh.group_size);
+                const new_qf = try quant_formats.QuantFormatPipelines.initWithOptions(gpu.device, gpu.library, .{
+                    .specs = specs[0..n_specs],
+                    .include_moe = false,
+                    .include_act_quant = false,
+                });
+                if (gpu.owned_qf) |*old_qf| {
+                    gpu.compute_ptr.removeResident(&.{old_qf.codebook_buf}) catch |err| {
+                        std.debug.panic("removeResident(old_qf) failed: {}", .{err});
+                    };
+                    var wi: usize = 0;
+                    while (wi < gpu.resident_count) {
+                        if (gpu.resident_bufs[wi].handle == old_qf.codebook_buf.handle) {
+                            gpu.resident_bufs[wi] = gpu.resident_bufs[gpu.resident_count - 1];
+                            gpu.resident_count -= 1;
+                        } else {
+                            wi += 1;
+                        }
+                    }
+                    old_qf.close();
+                }
+                gpu.owned_qf = new_qf;
+                if (gpu.resident_count < gpu.resident_bufs.len) {
+                    gpu.resident_bufs[gpu.resident_count] = new_qf.codebook_buf;
+                    gpu.resident_count += 1;
+                }
+                try gpu.compute_ptr.makeResident(&.{new_qf.codebook_buf});
+            }
+            if (gpu.owned_compute != null) {
+                try gpu.compute_ptr.makeResident(&.{tlh.weight.buffer});
+                appendUniqueResident(&gpu.resident_bufs, &gpu.resident_count, tlh.weight.buffer);
+                if (tlh.params) |pb| {
+                    try gpu.compute_ptr.makeResident(&.{pb.buffer});
+                    appendUniqueResident(&gpu.resident_bufs, &gpu.resident_count, pb.buffer);
+                }
+            }
+        }
+        gpu.lm_head = binding;
+    }
+
     /// Runs the `3L` / `5L` block-parallel backbone ONCE across `0..block_size-1`
     /// conditioned on fused `target_layer_ids` hidden taps (`target_hiddens`).
     /// Results stay in `self.workspace.slot_hiddens` for sequential Markov decoding.
@@ -853,6 +2050,18 @@ pub const DFlareProposer = struct {
         target_hiddens: []const []const f32,
     ) Error!void {
         return self.runBlockBackboneOnceForRoot(0, target_hiddens);
+    }
+
+    /// Runs the `3L` / `5L` block-parallel backbone ONCE from GPU-resident target hidden taps.
+    pub fn runBlockBackboneOnceGpuTaps(
+        self: *DFlareProposer,
+        root_token: u32,
+        gpu_taps: GpuTargetTaps,
+        gpu_ctx_history: ?GpuContextHistory,
+    ) Error!void {
+        const gpu = self.gpu_ctx orelse return error.InvalidWeights;
+        if (gpu_taps.taps.len != self.config.num_target_taps) return error.DimensionMismatch;
+        try self.runBlockBackboneGpuImpl(gpu, root_token, null, gpu_taps, gpu_ctx_history, true);
     }
 
     fn projectCtxKvOnePos(
@@ -882,24 +2091,56 @@ pub const DFlareProposer = struct {
         else
             self.workspace.ctx_hidden[0..h];
 
-        if (layer.k_proj_ctx_bf16) |kb| {
-            matVecBf16(kb, ctx_in, kv_dim, h, dst_k[0..kv_dim]);
-        } else if (layer.k_proj_ctx) |kf| {
-            matVecF32(kf, ctx_in, kv_dim, h, dst_k[0..kv_dim]);
-        } else if (layer.k_proj_bf16) |kb| {
-            matVecBf16(kb, ctx_in, kv_dim, h, dst_k[0..kv_dim]);
+        if (layer.k_proj_ctx_bf16 != null or layer.k_proj_ctx != null or layer.k_proj_ctx_raw != null) {
+            matVecLayer(
+                layer.k_proj_ctx orelse &.{},
+                layer.k_proj_ctx_bf16,
+                layer.k_proj_ctx_raw,
+                ctx_in,
+                kv_dim,
+                h,
+                dst_k[0..kv_dim],
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
         } else {
-            matVecF32(layer.k_proj, ctx_in, kv_dim, h, dst_k[0..kv_dim]);
+            matVecLayer(
+                layer.k_proj,
+                layer.k_proj_bf16,
+                layer.k_proj_raw,
+                ctx_in,
+                kv_dim,
+                h,
+                dst_k[0..kv_dim],
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
         }
 
-        if (layer.v_proj_ctx_bf16) |vb| {
-            matVecBf16(vb, ctx_in, kv_dim, h, dst_v[0..kv_dim]);
-        } else if (layer.v_proj_ctx) |vf| {
-            matVecF32(vf, ctx_in, kv_dim, h, dst_v[0..kv_dim]);
-        } else if (layer.v_proj_bf16) |vb| {
-            matVecBf16(vb, ctx_in, kv_dim, h, dst_v[0..kv_dim]);
+        if (layer.v_proj_ctx_bf16 != null or layer.v_proj_ctx != null or layer.v_proj_ctx_raw != null) {
+            matVecLayer(
+                layer.v_proj_ctx orelse &.{},
+                layer.v_proj_ctx_bf16,
+                layer.v_proj_ctx_raw,
+                ctx_in,
+                kv_dim,
+                h,
+                dst_v[0..kv_dim],
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
         } else {
-            matVecF32(layer.v_proj, ctx_in, kv_dim, h, dst_v[0..kv_dim]);
+            matVecLayer(
+                layer.v_proj,
+                layer.v_proj_bf16,
+                layer.v_proj_raw,
+                ctx_in,
+                kv_dim,
+                h,
+                dst_v[0..kv_dim],
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
         }
 
         if (layer.k_norm_ctx_weight orelse layer.k_norm_weight) |kn| {
@@ -915,6 +2156,9 @@ pub const DFlareProposer = struct {
         root_token: u32,
         target_hiddens: []const []const f32,
     ) Error!void {
+        if (self.gpu_ctx) |gpu| {
+            return self.runBlockBackboneGpuImpl(gpu, root_token, target_hiddens, null, null, true);
+        }
         const taps: usize = self.config.num_target_taps;
         const h: usize = self.config.hidden_size;
         const w: usize = self.config.block_size;
@@ -926,7 +2170,7 @@ pub const DFlareProposer = struct {
         // 0. For real DFlare/DSpark, resolve the anchor token embedding FIRST
         //    (this also registers GraphModel's context tap history provider on the exact target pointer).
         if (is_real) {
-            const raw_anchor = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_hook, root_token, h, self.workspace.tok_embed_tmp);
+            const raw_anchor = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_raw, self.weights.tok_embed_hook, root_token, h, self.workspace.tok_embed_tmp);
             if (raw_anchor.ptr != self.workspace.tok_embed_tmp.ptr) {
                 @memcpy(self.workspace.tok_embed_tmp[0..h], raw_anchor[0..h]);
             }
@@ -1002,8 +2246,18 @@ pub const DFlareProposer = struct {
             if (self.weights.markov_ctx_norm) |mcn| {
                 applyRmsNormInPlace(self.workspace.ctx_markov[0..h], mcn, self.config.rms_eps);
             }
-        } else if (self.weights.target_fusion_proj) |fp| {
-            matVecF32(fp, self.workspace.taps_flat[0 .. taps * h], h, taps * h, self.workspace.ctx_hidden[0..h]);
+        } else if (self.weights.target_fusion_proj != null or self.weights.target_fusion_proj_raw != null) {
+            matVecLayer(
+                self.weights.target_fusion_proj orelse &.{},
+                null,
+                self.weights.target_fusion_proj_raw,
+                self.workspace.taps_flat[0 .. taps * h],
+                h,
+                taps * h,
+                self.workspace.ctx_hidden[0..h],
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
             @memcpy(self.workspace.ctx_markov[0..h], self.workspace.ctx_hidden[0..h]);
         } else {
             @memcpy(self.workspace.ctx_hidden[0..h], self.workspace.taps_flat[0..h]);
@@ -1082,6 +2336,7 @@ pub const DFlareProposer = struct {
                     anchor_pos,
                     self.workspace.ctx_k_cache[layer_off .. layer_off + active_ctx_len * kv_dim],
                     self.workspace.ctx_v_cache[layer_off .. layer_off + active_ctx_len * kv_dim],
+                    self.workspace.cpu_quant_row_scratch,
                 );
             } else {
                 self.projectCtxKvOnePos(layer, li, self.workspace.taps_flat, 0, self.workspace.k_buf[0..kv_dim], self.workspace.v_buf[0..kv_dim]);
@@ -1111,6 +2366,7 @@ pub const DFlareProposer = struct {
                     anchor_pos,
                     null,
                     null,
+                    self.workspace.cpu_quant_row_scratch,
                 );
             }
         }
@@ -1121,17 +2377,19 @@ pub const DFlareProposer = struct {
             }
         }
 
-        // 5. For `dflash-Q8` (`markov_w2_vocab_bf16`), pre-score `base_logits = lm_head(slot_hiddens[1..w])` in ONE batched GPU call!
+        // 5. For `dflash-Q8` (`markov_w2_vocab`), pre-score `base_logits = lm_head(slot_hiddens[1..w])` in ONE batched GPU call!
         self.base_logits_ready = false;
-        if (is_real and self.weights.markov_w2_vocab_bf16 != null and w > 1 and hasLmHeadHook(self.weights.lm_head)) {
+        if (is_real and self.hasMarkovW2Vocab() and w > 1 and (hasLmHeadHook(self.weights.lm_head) or self.weights.lm_head_raw != null)) {
             const n_draft: u8 = @intCast(w - 1);
             try evalLmHead(
                 self.weights.lm_head,
+                self.weights.lm_head_raw,
                 self.workspace.slot_hiddens[h .. w * h],
                 n_draft,
                 self.config.hidden_size,
                 self.config.vocab_size,
                 self.workspace.base_logits_buf[0 .. @as(usize, n_draft) * v],
+                self.workspace.cpu_quant_row_scratch,
             );
             self.base_logits_ready = true;
         }
@@ -1163,20 +2421,31 @@ pub const DFlareProposer = struct {
             @memcpy(self.workspace.markov_concat[0..mr], parent_rnn[0..mr]);
             const w1_rows = self.weights.markov_w1_vocab_rows;
             const tok_clamped: usize = if (prev_token < w1_rows) prev_token else 0;
-            const w1_tbl = self.weights.markov_w1_vocab_bf16.?;
-            const w1_row = w1_tbl[tok_clamped * mr ..][0..mr];
-            for (0..mr) |i| {
-                self.workspace.markov_concat[mr + i] = quant.bf16ToF32(w1_row[i]);
+            if (self.weights.markov_w1_vocab_bf16) |w1_tbl| {
+                const w1_row = w1_tbl[tok_clamped * mr ..][0..mr];
+                for (0..mr) |i| {
+                    self.workspace.markov_concat[mr + i] = quant.bf16ToF32(w1_row[i]);
+                }
+            } else if (self.weights.markov_w1_vocab_raw) |w1r| {
+                try readRawRowF32(w1r, tok_clamped, self.workspace.markov_concat[mr .. 2 * mr]);
+            } else {
+                return error.InvalidWeights;
             }
             @memcpy(self.workspace.markov_concat[2 * mr .. 2 * mr + h], b_j);
             @memcpy(self.workspace.markov_concat[2 * mr + h .. joint_len], self.workspace.ctx_markov[0..h]);
 
             const gates = self.workspace.markov_u[0 .. 3 * mr];
-            if (self.weights.markov_gru_proj_bf16) |gb| {
-                matVecBf16(gb, self.workspace.markov_concat[0..joint_len], 3 * mr, joint_len, gates);
-            } else {
-                matVecF32(self.weights.markov_gru_proj_f32.?, self.workspace.markov_concat[0..joint_len], 3 * mr, joint_len, gates);
-            }
+            matVecLayer(
+                self.weights.markov_gru_proj_f32 orelse &.{},
+                self.weights.markov_gru_proj_bf16,
+                self.weights.markov_gru_proj_raw,
+                self.workspace.markov_concat[0..joint_len],
+                3 * mr,
+                joint_len,
+                gates,
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
             if (self.weights.markov_gru_bias) |gbias| {
                 for (0..3 * mr) |i| gates[i] += gbias[i];
             }
@@ -1188,10 +2457,20 @@ pub const DFlareProposer = struct {
                 markov_vec[i] = std.math.tanh(gates[2 * mr + i]);
             }
 
-            if (self.weights.markov_w2_vocab_bf16) |w2_vocab| {
+            if (self.hasMarkovW2Vocab()) {
                 // Exact `dspark.cpp:382-401`: `logits = base_logits[pos-1] + w2_vocab @ markov + w2_bias`.
                 const v_rows: usize = @min(@as(usize, self.weights.markov_w2_vocab_rows), v);
-                matVecBf16(w2_vocab[0 .. v_rows * mr], markov_vec, v_rows, mr, self.workspace.logits_buf[0..v_rows]);
+                matVecLayer(
+                    &.{},
+                    self.weights.markov_w2_vocab_bf16,
+                    self.weights.markov_w2_vocab_raw,
+                    markov_vec,
+                    v_rows,
+                    mr,
+                    self.workspace.logits_buf[0..v_rows],
+                    false,
+                    self.workspace.cpu_quant_row_scratch,
+                );
                 if (self.weights.markov_w2_vocab_bias) |wb| {
                     for (0..v_rows) |ti| self.workspace.logits_buf[ti] += wb[ti];
                 }
@@ -1213,7 +2492,17 @@ pub const DFlareProposer = struct {
             }
 
             // `mtp.safetensors` `hidden_out`: `lm_head(b_j + hidden_out @ markov + hidden_out_bias)`.
-            matVecF32(self.weights.markov_w2, markov_vec, h, mr, self.workspace.head_hidden[0..h]);
+            matVecLayer(
+                self.weights.markov_w2,
+                null,
+                self.weights.markov_w2_raw,
+                markov_vec,
+                h,
+                mr,
+                self.workspace.head_hidden[0..h],
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
             if (self.weights.markov_hidden_bias) |hb| {
                 for (0..h) |d| self.workspace.head_hidden[d] += hb[d];
             }
@@ -1222,11 +2511,13 @@ pub const DFlareProposer = struct {
             }
             try evalLmHead(
                 self.weights.lm_head,
+                self.weights.lm_head_raw,
                 self.workspace.head_hidden[0..h],
                 1,
                 self.config.hidden_size,
                 self.config.vocab_size,
                 self.workspace.logits_buf[0..v],
+                self.workspace.cpu_quant_row_scratch,
             );
             const eff_v: usize = if (self.config.unpadded_vocab_size > 0 and self.config.unpadded_vocab_size < v)
                 self.config.unpadded_vocab_size
@@ -1245,26 +2536,57 @@ pub const DFlareProposer = struct {
             return;
         }
 
-        const tok_e = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_hook, prev_token, h, self.workspace.tok_embed_tmp);
+        const tok_e = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_raw, self.weights.tok_embed_hook, prev_token, h, self.workspace.tok_embed_tmp);
         if (self.weights.token_embd_norm) |ten| {
             @memcpy(self.workspace.tok_embed_tmp[0..h], tok_e);
             applyRmsNormInPlace(self.workspace.tok_embed_tmp[0..h], ten, self.config.rms_eps);
         }
         const eff_tok_e = if (self.weights.token_embd_norm != null) self.workspace.tok_embed_tmp[0..h] else tok_e;
 
-        if (self.weights.markov_w1.len == mr * 2 * h) {
+        const w1_cols = if (self.weights.markov_w1_raw) |r| r.k else (self.weights.markov_w1.len / mr);
+        if (w1_cols == 2 * h) {
             @memcpy(self.workspace.markov_concat[0..h], b_j);
             @memcpy(self.workspace.markov_concat[h .. 2 * h], eff_tok_e);
-            matVecF32(self.weights.markov_w1, self.workspace.markov_concat[0 .. 2 * h], mr, 2 * h, self.workspace.markov_u[0..mr]);
+            matVecLayer(
+                self.weights.markov_w1,
+                null,
+                self.weights.markov_w1_raw,
+                self.workspace.markov_concat[0 .. 2 * h],
+                mr,
+                2 * h,
+                self.workspace.markov_u[0..mr],
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
         } else {
             for (0..h) |d| {
                 self.workspace.markov_concat[d] = b_j[d] + eff_tok_e[d];
             }
-            matVecF32(self.weights.markov_w1, self.workspace.markov_concat[0..h], mr, h, self.workspace.markov_u[0..mr]);
+            matVecLayer(
+                self.weights.markov_w1,
+                null,
+                self.weights.markov_w1_raw,
+                self.workspace.markov_concat[0..h],
+                mr,
+                h,
+                self.workspace.markov_u[0..mr],
+                false,
+                self.workspace.cpu_quant_row_scratch,
+            );
         }
 
-        if (self.weights.markov_rnn_proj) |rp| {
-            matVecAccumF32(rp, parent_rnn, mr, mr, self.workspace.markov_u[0..mr]);
+        if (self.weights.markov_rnn_proj != null or self.weights.markov_rnn_proj_raw != null) {
+            matVecLayer(
+                self.weights.markov_rnn_proj orelse &.{},
+                null,
+                self.weights.markov_rnn_proj_raw,
+                parent_rnn,
+                mr,
+                mr,
+                self.workspace.markov_u[0..mr],
+                true,
+                self.workspace.cpu_quant_row_scratch,
+            );
         } else {
             for (0..mr) |i| {
                 self.workspace.markov_u[i] += parent_rnn[i];
@@ -1279,7 +2601,17 @@ pub const DFlareProposer = struct {
             out_rnn[i] = siluF32(self.workspace.markov_u[i]);
         }
 
-        matVecF32(self.weights.markov_w2, out_rnn, h, mr, self.workspace.head_hidden[0..h]);
+        matVecLayer(
+            self.weights.markov_w2,
+            null,
+            self.weights.markov_w2_raw,
+            out_rnn,
+            h,
+            mr,
+            self.workspace.head_hidden[0..h],
+            false,
+            self.workspace.cpu_quant_row_scratch,
+        );
         if (self.weights.markov_hidden_bias) |hb| {
             for (0..h) |d| self.workspace.head_hidden[d] += hb[d];
         }
@@ -1292,11 +2624,13 @@ pub const DFlareProposer = struct {
 
         try evalLmHead(
             self.weights.lm_head,
+            self.weights.lm_head_raw,
             self.workspace.head_hidden[0..h],
             1,
             self.config.hidden_size,
             self.config.vocab_size,
             self.workspace.logits_buf[0..v],
+            self.workspace.cpu_quant_row_scratch,
         );
 
         self.markov_steps += 1;
@@ -1337,10 +2671,67 @@ pub const DFlareProposer = struct {
         );
     }
 
+    /// Executes `DFlare` drafting directly from GPU-resident target hidden taps
+    /// (and optional GPU-resident circular context tap ring) with zero host tap copies.
+    pub fn proposeWithGpuTaps(
+        self: *DFlareProposer,
+        root_token: u32,
+        gpu_taps: GpuTargetTaps,
+        gpu_ctx_history: ?GpuContextHistory,
+        sam: ?*const sam_mod.SuffixAutomaton,
+        out_tree: *CandidateTree,
+    ) Error!DFlareProposeResult {
+        return self.proposeIntoConstrainedGpu(
+            CandidateTree.capacity,
+            root_token,
+            gpu_taps,
+            gpu_ctx_history,
+            sam,
+            null,
+            out_tree,
+        );
+    }
+
+    pub fn proposeIntoWithGpuTaps(
+        self: *DFlareProposer,
+        comptime max_nodes: u16,
+        root_token: u32,
+        gpu_taps: GpuTargetTaps,
+        gpu_ctx_history: ?GpuContextHistory,
+        sam: ?*const sam_mod.SuffixAutomaton,
+        out_tree: *tree_mod.DraftTree(max_nodes),
+    ) Error!DFlareProposeResult {
+        return self.proposeIntoConstrainedGpu(
+            max_nodes,
+            root_token,
+            gpu_taps,
+            gpu_ctx_history,
+            sam,
+            null,
+            out_tree,
+        );
+    }
+
+    pub fn proposeIntoConstrainedGpu(
+        self: *DFlareProposer,
+        comptime max_nodes: u16,
+        root_token: u32,
+        gpu_taps: GpuTargetTaps,
+        gpu_ctx_history: ?GpuContextHistory,
+        sam: ?*const sam_mod.SuffixAutomaton,
+        grammar_opt: ?accept_mod.GrammarTreeAdapter,
+        out_tree: *tree_mod.DraftTree(max_nodes),
+    ) Error!DFlareProposeResult {
+        const gpu = self.gpu_ctx orelse return error.InvalidWeights;
+        if (gpu_taps.taps.len != self.config.num_target_taps) return error.DimensionMismatch;
+        return self.proposeIntoConstrainedGpuImpl(max_nodes, gpu, root_token, null, gpu_taps, gpu_ctx_history, sam, grammar_opt, out_tree);
+    }
+
     /// Populates `DraftTree(max_nodes)` with a linear chain (`top_k_per_pos == 1`,
     /// length `block_size = 8`) or a breadth-first top-k tree (`<= max_tree_nodes`),
     /// executing the `3L`/`5L` backbone ONCE and stepping the low-rank `rnn_hidden`
     /// Markov head sequentially with zero dynamic heap allocations.
+    /// Automatically uses Metal 4 GPU when `attachGpu` has been called.
     pub fn proposeIntoConstrained(
         self: *DFlareProposer,
         comptime max_nodes: u16,
@@ -1350,6 +2741,9 @@ pub const DFlareProposer = struct {
         grammar_opt: ?accept_mod.GrammarTreeAdapter,
         out_tree: *tree_mod.DraftTree(max_nodes),
     ) Error!DFlareProposeResult {
+        if (self.gpu_ctx) |gpu| {
+            return self.proposeIntoConstrainedGpuImpl(max_nodes, gpu, root_token, target_hiddens, null, null, sam, grammar_opt, out_tree);
+        }
         out_tree.reset(root_token);
         const node_limit: u16 = @min(@as(u16, self.config.max_tree_nodes), max_nodes);
         const mr: usize = self.config.markov_rank;
@@ -1481,6 +2875,1525 @@ pub const DFlareProposer = struct {
         };
     }
 
+    // ========================================================================
+    // Metal 4 GPU Execution Path (`D16`, ADR-0026)
+    // ========================================================================
+
+    fn encodeGpuLinear(
+        gpu: *const DFlareGpuContext,
+        frame: *metal.Compute.Frame,
+        lin: GpuLinearBinding,
+        x: metal.BufferBinding,
+        y: metal.BufferBinding,
+        m: u32,
+        residual: ?metal.BufferBinding,
+        y_is_f32_if_f32: bool,
+        insert_barrier_before: bool,
+    ) Error!void {
+        if (lin.amf_dtype == .f32) {
+            const p: DFlareGemvF32Params = .{
+                .m = m,
+                .n = lin.n,
+                .k = lin.k,
+                .has_residual = if (residual != null) 1 else 0,
+                .x_is_f32 = 0,
+                .y_is_f32 = if (y_is_f32_if_f32) 1 else 0,
+                .res_is_f32 = 0,
+            };
+            const gx: u64 = (@as(u64, lin.n) + 3) / 4;
+            try frame.encodeThreadgroups(
+                gpu.pipes.gemv_batch_f32,
+                &.{ x, lin.weight, y, residual orelse y },
+                std.mem.asBytes(&p),
+                .{ gx, m, 1 },
+                .{ 128, 1, 1 },
+                insert_barrier_before,
+            );
+            return;
+        }
+        const qf_ptr = gpu.qfPipesFor(lin.amf_dtype, lin.group_size);
+        try gpu.dequant_ptr.encodeLinearUnified(frame, .{
+            .amf_dtype = lin.amf_dtype,
+            .group_size = lin.group_size,
+            .tensor_scale_per_row = lin.tensor_scale_per_row,
+            .weight = lin.weight,
+            .params = lin.params,
+            .x = x,
+            .y = y,
+            .residual = residual,
+            .m = m,
+            .n = lin.n,
+            .k = lin.k,
+            .mode = if (m == 1) .gemv else .batched,
+            .qf_pipes = qf_ptr,
+        }, insert_barrier_before);
+    }
+
+    fn encodeGpuContextKvBatch(
+        self: *const DFlareProposer,
+        gpu: *const DFlareGpuContext,
+        frame: *metal.Compute.Frame,
+        taps_src: metal.BufferBinding,
+        taps_dtype: u32,
+        ring_cap: u32,
+        ring_start: u32,
+        num_pos: u32,
+        kv_start_pos: u32,
+        rope_zero_pos: bool,
+        use_ctx_hidden_direct: bool,
+        first_barrier: bool,
+    ) Error!void {
+        const ws = self.workspace;
+        const wb = gpu.ws_buf;
+        const h: u32 = self.config.hidden_size;
+        const taps: u32 = self.config.num_target_taps;
+        const kv_dim: u32 = self.config.kvDim();
+        const max_ctx: u32 = ws.max_ctx_len;
+        const ctx_in_b = ws.sliceBinding(wb, ws.gpu_ctx_in_f16);
+        const k_tmp_b = ws.sliceBinding(wb, ws.gpu_ctx_k_tmp_f16);
+        const v_tmp_b = ws.sliceBinding(wb, ws.gpu_ctx_v_tmp_f16);
+        const ctx_k_b = ws.sliceBinding(wb, ws.ctx_k_cache);
+        const ctx_v_b = ws.sliceBinding(wb, ws.ctx_v_cache);
+        const ctx_h_b = ws.sliceBinding(wb, ws.gpu_ctx_hidden_f16);
+        const dummy_b = ctx_h_b;
+
+        for (0..self.config.num_layers) |li| {
+            const gl = gpu.layers[li];
+            const barrier = if (li == 0) first_barrier else true;
+            var kv_input = ctx_in_b;
+            var kv_barrier = true;
+
+            if (use_ctx_hidden_direct) {
+                if (gl.ctx_norm_w) |cnw| {
+                    const np: DFlareRmsNormParams = .{
+                        .num_rows = 1,
+                        .dim = h,
+                        .x_is_f32 = 0,
+                        .has_weight = 1,
+                        .write_f32 = 0,
+                        .eps = self.config.rms_eps,
+                    };
+                    try frame.encodeThreadgroups(
+                        gpu.pipes.rmsnorm_rows,
+                        &.{ ctx_h_b, cnw, ctx_in_b, dummy_b },
+                        std.mem.asBytes(&np),
+                        .{ 1, 1, 1 },
+                        .{ 256, 1, 1 },
+                        barrier,
+                    );
+                } else {
+                    kv_input = ctx_h_b;
+                    kv_barrier = barrier;
+                }
+            } else {
+                const fsw_opt = gpu.fuse_scalar_weights;
+                const mix_b: metal.BufferBinding = if (fsw_opt) |fsw| blk: {
+                    const row_idx: u64 = if ((li + 1) * taps <= gpu.fuse_rows * taps) li else 0;
+                    break :blk .{ .buffer = fsw.buffer, .offset = fsw.offset + row_idx * taps * @sizeOf(f32) };
+                } else dummy_b;
+                const mp: MixTapsParams = .{
+                    .num_pos = num_pos,
+                    .num_taps = taps,
+                    .hidden_size = h,
+                    .taps_dtype = taps_dtype,
+                    .ring_cap = ring_cap,
+                    .ring_start = ring_start,
+                    .has_mix_w = if (fsw_opt != null) 1 else 0,
+                    .apply_norm = if (gl.ctx_norm_w != null) 1 else 0,
+                    .has_norm_w = if (gl.ctx_norm_w != null) 1 else 0,
+                    .write_f32 = 0,
+                    .rms_eps = self.config.rms_eps,
+                };
+                try frame.encodeThreadgroups(
+                    gpu.pipes.mix_taps_rmsnorm,
+                    &.{ taps_src, mix_b, gl.ctx_norm_w orelse dummy_b, ctx_in_b, dummy_b },
+                    std.mem.asBytes(&mp),
+                    .{ num_pos, 1, 1 },
+                    .{ 256, 1, 1 },
+                    barrier,
+                );
+            }
+
+            try encodeGpuLinear(gpu, frame, gl.k_proj_ctx orelse gl.k_proj, kv_input, k_tmp_b, num_pos, null, false, kv_barrier);
+            try encodeGpuLinear(gpu, frame, gl.v_proj_ctx orelse gl.v_proj, kv_input, v_tmp_b, num_pos, null, false, false);
+
+            const kn_w = gl.k_norm_ctx_w orelse gl.k_norm_w;
+            const sp: DFlareCtxKvStoreParams = .{
+                .num_pos = num_pos,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .start_pos = kv_start_pos,
+                .max_ctx = max_ctx,
+                .layer_elem_off = @intCast(li * max_ctx * kv_dim),
+                .has_k_norm = if (kn_w != null) 1 else 0,
+                .rope_zero_pos = if (rope_zero_pos) 1 else 0,
+                .rms_eps = self.config.rms_eps,
+                .rope_theta = self.config.rope_theta,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.ctx_kv_norm_rope_store,
+                &.{ k_tmp_b, v_tmp_b, kn_w orelse dummy_b, ctx_k_b, ctx_v_b },
+                std.mem.asBytes(&sp),
+                .{ self.config.num_key_value_heads, num_pos, 1 },
+                .{ 128, 1, 1 },
+                true,
+            );
+        }
+    }
+
+    fn encodeGpuBackboneIntoFrame(
+        self: *DFlareProposer,
+        gpu: *const DFlareGpuContext,
+        frame: *metal.Compute.Frame,
+        anchor_pos: u32,
+        active_ctx_len: u32,
+        need_ctx_kv_single: bool,
+        gpu_taps_opt: ?GpuTargetTaps,
+        first_barrier: bool,
+    ) Error!void {
+        const ws = self.workspace;
+        const wb = gpu.ws_buf;
+        const h: u32 = self.config.hidden_size;
+        const w: u32 = self.config.block_size;
+        const inter: u32 = self.config.intermediate_size;
+        const q_dim: u32 = self.config.qDim();
+        const kv_dim: u32 = self.config.kvDim();
+        const taps: u32 = self.config.num_target_taps;
+        const is_real = self.isRealGru();
+
+        const taps_f32_b = ws.sliceBinding(wb, ws.taps_flat);
+        const taps_f16_b = ws.sliceBinding(wb, ws.gpu_taps_flat_f16);
+        const ctx_h_b = ws.sliceBinding(wb, ws.gpu_ctx_hidden_f16);
+        const ctx_mf16_b = ws.sliceBinding(wb, ws.gpu_ctx_markov_f16);
+        const ctx_mf32_b = ws.sliceBinding(wb, ws.gpu_ctx_markov_f32);
+        const anchor_b = ws.sliceBinding(wb, ws.gpu_anchor_f16);
+        const slot_b = ws.sliceBinding(wb, ws.gpu_slot_hiddens_f16);
+        const norm_b = ws.sliceBinding(wb, ws.gpu_norm_f16);
+        const q_b = ws.sliceBinding(wb, ws.gpu_q_f16);
+        const k_b = ws.sliceBinding(wb, ws.gpu_k_f16);
+        const v_b = ws.sliceBinding(wb, ws.gpu_v_f16);
+        const ctx_k_b = ws.sliceBinding(wb, ws.ctx_k_cache);
+        const ctx_v_b = ws.sliceBinding(wb, ws.ctx_v_cache);
+        const attn_out_b = ws.sliceBinding(wb, ws.gpu_attn_out_f16);
+        const mlp_gate_b = ws.sliceBinding(wb, ws.gpu_mlp_gate_f16);
+        const mlp_up_b = ws.sliceBinding(wb, ws.gpu_mlp_up_f16);
+        const mlp_down_b = ws.sliceBinding(wb, ws.gpu_mlp_down_f16);
+        const dummy_b = ctx_h_b;
+
+        var taps_src_b = taps_f32_b;
+        var taps_dtype: u32 = 0;
+        var cur_barrier = first_barrier;
+
+        if (gpu_taps_opt) |gt| {
+            var pack_binds: [9]metal.BufferBinding = undefined;
+            for (0..8) |ti| {
+                pack_binds[ti] = if (ti < gt.taps.len) gt.taps[ti] else gt.taps[0];
+            }
+            pack_binds[8] = taps_f16_b;
+            const pp: PackTapsParams = .{
+                .num_taps = taps,
+                .hidden_size = h,
+                .src_is_f16 = if (gt.dtype == .f16) 1 else 0,
+                .dst_is_f16 = 1,
+            };
+            try frame.encodeThreads(
+                gpu.pipes.pack_taps8,
+                &pack_binds,
+                std.mem.asBytes(&pp),
+                .{ h, taps, 1 },
+                .{ @min(h, 256), 1, 1 },
+                cur_barrier,
+            );
+            taps_src_b = taps_f16_b;
+            taps_dtype = 1;
+            cur_barrier = true;
+        }
+
+        // Compute `ctx_hidden` and `ctx_markov` (`f_rnn`).
+        if (gpu.fuse_scalar_weights) |fsw| {
+            const mp0: MixTapsParams = .{
+                .num_pos = 1,
+                .num_taps = taps,
+                .hidden_size = h,
+                .taps_dtype = taps_dtype,
+                .ring_cap = 0,
+                .ring_start = 0,
+                .has_mix_w = 1,
+                .apply_norm = if (gpu.target_fusion_norm != null) 1 else 0,
+                .has_norm_w = if (gpu.target_fusion_norm != null) 1 else 0,
+                .write_f32 = 0,
+                .rms_eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.mix_taps_rmsnorm,
+                &.{ taps_src_b, fsw, gpu.target_fusion_norm orelse dummy_b, ctx_h_b, dummy_b },
+                std.mem.asBytes(&mp0),
+                .{ 1, 1, 1 },
+                .{ 256, 1, 1 },
+                cur_barrier,
+            );
+            const m_row: u64 = if (gpu.fuse_rows >= self.config.num_layers + 1) self.config.num_layers else 0;
+            const m_fsw: metal.BufferBinding = .{ .buffer = fsw.buffer, .offset = fsw.offset + m_row * taps * @sizeOf(f32) };
+            const mp1: MixTapsParams = .{
+                .num_pos = 1,
+                .num_taps = taps,
+                .hidden_size = h,
+                .taps_dtype = taps_dtype,
+                .ring_cap = 0,
+                .ring_start = 0,
+                .has_mix_w = 1,
+                .apply_norm = if (gpu.markov_ctx_norm != null) 1 else 0,
+                .has_norm_w = if (gpu.markov_ctx_norm != null) 1 else 0,
+                .write_f32 = 1,
+                .rms_eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.mix_taps_rmsnorm,
+                &.{ taps_src_b, m_fsw, gpu.markov_ctx_norm orelse dummy_b, ctx_mf16_b, ctx_mf32_b },
+                std.mem.asBytes(&mp1),
+                .{ 1, 1, 1 },
+                .{ 256, 1, 1 },
+                false,
+            );
+        } else if (gpu.target_fusion_proj) |fp| {
+            // For `target_fusion_proj`, input is `taps_f16_b` (already packed if `gpu_taps_opt`, else converted on host).
+            try encodeGpuLinear(gpu, frame, fp, taps_f16_b, ctx_h_b, 1, null, false, cur_barrier);
+            const copy_p: MixTapsParams = .{
+                .num_pos = 1,
+                .num_taps = 1,
+                .hidden_size = h,
+                .taps_dtype = 1,
+                .ring_cap = 0,
+                .ring_start = 0,
+                .has_mix_w = 0,
+                .apply_norm = 0,
+                .has_norm_w = 0,
+                .write_f32 = 1,
+                .rms_eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.mix_taps_rmsnorm,
+                &.{ ctx_h_b, dummy_b, dummy_b, ctx_mf16_b, ctx_mf32_b },
+                std.mem.asBytes(&copy_p),
+                .{ 1, 1, 1 },
+                .{ 256, 1, 1 },
+                true,
+            );
+            if (gpu.target_fusion_norm) |fnw| {
+                const np: DFlareRmsNormParams = .{
+                    .num_rows = 1,
+                    .dim = h,
+                    .x_is_f32 = 0,
+                    .has_weight = 1,
+                    .write_f32 = 0,
+                    .eps = self.config.rms_eps,
+                };
+                try frame.encodeThreadgroups(
+                    gpu.pipes.rmsnorm_rows,
+                    &.{ ctx_h_b, fnw, ctx_h_b, dummy_b },
+                    std.mem.asBytes(&np),
+                    .{ 1, 1, 1 },
+                    .{ 256, 1, 1 },
+                    true,
+                );
+            }
+        } else {
+            const cp_m: MixTapsParams = .{
+                .num_pos = 1,
+                .num_taps = 1,
+                .hidden_size = h,
+                .taps_dtype = taps_dtype,
+                .ring_cap = 0,
+                .ring_start = 0,
+                .has_mix_w = 0,
+                .apply_norm = 0,
+                .has_norm_w = 0,
+                .write_f32 = 1,
+                .rms_eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.mix_taps_rmsnorm,
+                &.{ taps_src_b, dummy_b, dummy_b, ctx_mf16_b, ctx_mf32_b },
+                std.mem.asBytes(&cp_m),
+                .{ 1, 1, 1 },
+                .{ 256, 1, 1 },
+                cur_barrier,
+            );
+            const cp_h: MixTapsParams = .{
+                .num_pos = 1,
+                .num_taps = 1,
+                .hidden_size = h,
+                .taps_dtype = taps_dtype,
+                .ring_cap = 0,
+                .ring_start = 0,
+                .has_mix_w = 0,
+                .apply_norm = if (gpu.target_fusion_norm != null) 1 else 0,
+                .has_norm_w = if (gpu.target_fusion_norm != null) 1 else 0,
+                .write_f32 = 0,
+                .rms_eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.mix_taps_rmsnorm,
+                &.{ taps_src_b, dummy_b, gpu.target_fusion_norm orelse dummy_b, ctx_h_b, dummy_b },
+                std.mem.asBytes(&cp_h),
+                .{ 1, 1, 1 },
+                .{ 256, 1, 1 },
+                false,
+            );
+        }
+
+        // Single-position fallback context KV if no context history provider was active.
+        if (need_ctx_kv_single) {
+            try self.encodeGpuContextKvBatch(
+                gpu,
+                frame,
+                taps_src_b,
+                taps_dtype,
+                0,
+                0,
+                1,
+                0,
+                true,
+                gpu.fuse_scalar_weights == null,
+                true,
+            );
+        }
+
+        // Seed `slot_hiddens[0..w-1]`.
+        const seed_p: SeedBlockParams = .{
+            .block_size = w,
+            .hidden_size = h,
+            .is_real_gru = if (is_real) 1 else 0,
+            .mask_rows = gpu.mask_rows,
+            .anchor_is_f16 = 1,
+        };
+        try frame.encodeThreads(
+            gpu.pipes.seed_block,
+            &.{ anchor_b, ctx_h_b, gpu.mask_embed, slot_b },
+            std.mem.asBytes(&seed_p),
+            .{ h, w, 1 },
+            .{ @min(h, 256), 1, 1 },
+            true,
+        );
+
+        // Execute all `num_layers` (`3L` / `5L`) block-parallel transformer layers.
+        const max_ctx: u32 = ws.max_ctx_len;
+        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.config.head_dim)));
+        for (0..self.config.num_layers) |li| {
+            const gl = gpu.layers[li];
+            const in_np: DFlareRmsNormParams = .{
+                .num_rows = w,
+                .dim = h,
+                .x_is_f32 = 0,
+                .has_weight = if (gl.in_norm_w != null) 1 else 0,
+                .write_f32 = 0,
+                .eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.rmsnorm_rows,
+                &.{ slot_b, gl.in_norm_w orelse dummy_b, norm_b, dummy_b },
+                std.mem.asBytes(&in_np),
+                .{ w, 1, 1 },
+                .{ 256, 1, 1 },
+                true,
+            );
+
+            try encodeGpuLinear(gpu, frame, gl.q_proj, norm_b, q_b, w, null, false, true);
+            try encodeGpuLinear(gpu, frame, gl.k_proj, norm_b, k_b, w, null, false, false);
+            try encodeGpuLinear(gpu, frame, gl.v_proj, norm_b, v_b, w, null, false, false);
+
+            if (gl.q_norm_w != null or gl.k_norm_w != null or self.config.rope_theta > 0.0) {
+                const qp: DFlareQkNormRopeParams = .{
+                    .seq_len = w,
+                    .num_q_heads = self.config.num_attention_heads,
+                    .num_kv_heads = self.config.num_key_value_heads,
+                    .head_dim = self.config.head_dim,
+                    .anchor_pos = anchor_pos,
+                    .has_q_norm = if (gl.q_norm_w != null) 1 else 0,
+                    .has_k_norm = if (gl.k_norm_w != null) 1 else 0,
+                    .rms_eps = self.config.rms_eps,
+                    .rope_theta = self.config.rope_theta,
+                };
+                try frame.encodeThreadgroups(
+                    gpu.pipes.qk_norm_rope,
+                    &.{ q_b, k_b, gl.q_norm_w orelse dummy_b, gl.k_norm_w orelse dummy_b },
+                    std.mem.asBytes(&qp),
+                    .{ self.config.num_attention_heads + self.config.num_key_value_heads, w, 1 },
+                    .{ 128, 1, 1 },
+                    true,
+                );
+            }
+
+            const gqa_p: DFlareBlockGqaParams = .{
+                .seq_len = w,
+                .active_ctx_len = active_ctx_len,
+                .num_q_heads = self.config.num_attention_heads,
+                .num_kv_heads = self.config.num_key_value_heads,
+                .head_dim = self.config.head_dim,
+                .layer_elem_off = @intCast(li * max_ctx * kv_dim),
+                .scale = attn_scale,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.block_gqa_attn,
+                &.{ q_b, ctx_k_b, ctx_v_b, k_b, v_b, attn_out_b },
+                std.mem.asBytes(&gqa_p),
+                .{ self.config.num_attention_heads, w, 1 },
+                .{ 128, 1, 1 },
+                true,
+            );
+
+            // `o_proj` + fused residual into `slot_hiddens`.
+            try encodeGpuLinear(gpu, frame, gl.o_proj, attn_out_b, slot_b, w, slot_b, false, true);
+
+            // Post-attention RMSNorm + SwiGLU MLP + fused residual.
+            const post_np: DFlareRmsNormParams = .{
+                .num_rows = w,
+                .dim = h,
+                .x_is_f32 = 0,
+                .has_weight = if (gl.post_norm_w != null) 1 else 0,
+                .write_f32 = 0,
+                .eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.rmsnorm_rows,
+                &.{ slot_b, gl.post_norm_w orelse dummy_b, norm_b, dummy_b },
+                std.mem.asBytes(&post_np),
+                .{ w, 1, 1 },
+                .{ 256, 1, 1 },
+                true,
+            );
+
+            try encodeGpuLinear(gpu, frame, gl.mlp_gate, norm_b, mlp_gate_b, w, null, false, true);
+            try encodeGpuLinear(gpu, frame, gl.mlp_up, norm_b, mlp_up_b, w, null, false, false);
+
+            const sw_cnt: u32 = w * inter;
+            const sw_p: DFlareElemParams = .{ .count = sw_cnt };
+            try frame.encodeThreads(
+                gpu.pipes.swiglu_mul,
+                &.{ mlp_gate_b, mlp_up_b },
+                std.mem.asBytes(&sw_p),
+                .{ sw_cnt, 1, 1 },
+                .{ @min(sw_cnt, 256), 1, 1 },
+                true,
+            );
+
+            try encodeGpuLinear(gpu, frame, gl.mlp_down, mlp_gate_b, slot_b, w, slot_b, false, true);
+            _ = mlp_down_b;
+            _ = q_dim;
+        }
+
+        if (gpu.final_norm) |fnw| {
+            const fnp: DFlareRmsNormParams = .{
+                .num_rows = w,
+                .dim = h,
+                .x_is_f32 = 0,
+                .has_weight = 1,
+                .write_f32 = 0,
+                .eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.rmsnorm_rows,
+                &.{ slot_b, fnw, slot_b, dummy_b },
+                std.mem.asBytes(&fnp),
+                .{ w, 1, 1 },
+                .{ 256, 1, 1 },
+                true,
+            );
+        }
+    }
+
+    fn encodeGpuMarkovHeadStep(
+        self: *const DFlareProposer,
+        gpu: *const DFlareGpuContext,
+        frame: *metal.Compute.Frame,
+        pos: u8,
+        use_tok_buf: bool,
+        tok_slot: u32,
+        imm_tok: u32,
+        parent_rnn_b: metal.BufferBinding,
+        out_rnn_b: metal.BufferBinding,
+        score_on_gpu: bool,
+        first_barrier: bool,
+    ) Error!struct { logits_b: metal.BufferBinding, logits_is_f16: bool, softcap_done: bool, eff_vocab: u32 } {
+        const ws = self.workspace;
+        const wb = gpu.ws_buf;
+        const h: u32 = self.config.hidden_size;
+        const mr: u32 = self.config.markov_rank;
+        const v: u32 = self.config.vocab_size;
+
+        const slot_b = ws.sliceBinding(wb, ws.gpu_slot_hiddens_f16);
+        const ctx_mf16_b = ws.sliceBinding(wb, ws.gpu_ctx_markov_f16);
+        const tok_chain_b = ws.sliceBinding(wb, ws.gpu_token_chain_u32);
+        const concat_f16_b = ws.sliceBinding(wb, ws.gpu_markov_concat_f16);
+        const concat_f32_b = ws.sliceBinding(wb, ws.gpu_markov_concat_f32);
+        const gates_f16_b = ws.sliceBinding(wb, ws.gpu_markov_gates_f16);
+        const gates_f32_b = ws.sliceBinding(wb, ws.gpu_markov_gates_f32);
+        const mvec_f16_b = ws.sliceBinding(wb, ws.gpu_markov_vec_f16);
+        const mvec_f32_b = ws.sliceBinding(wb, ws.gpu_markov_vec_f32);
+        const head_h_b = ws.sliceBinding(wb, ws.gpu_head_hidden_f16);
+        const base_log_b = ws.sliceBinding(wb, ws.gpu_base_logits_f16);
+        const logits_f16_b = ws.sliceBinding(wb, ws.gpu_logits_f16);
+        const logits_f32_b = ws.sliceBinding(wb, ws.gpu_logits_f32);
+        const w1_row_b = ws.sliceBinding(wb, ws.gpu_w1_row_f32);
+        const dummy_b = mvec_f32_b;
+
+        if (self.isRealGru()) {
+            const w1_b = gpu.markov_w1_vocab orelse w1_row_b;
+            const w1_rows_eff: u32 = if (gpu.markov_w1_vocab != null) gpu.markov_w1_vocab_rows else 1;
+            const ap: DFlareMarkovAssembleParams = .{
+                .hidden_size = h,
+                .markov_rank = mr,
+                .slot_pos = pos,
+                .w1_rows = w1_rows_eff,
+                .w1_dtype = gpu.markov_w1_vocab_dtype,
+                .use_tok_buf = if (use_tok_buf and gpu.markov_w1_vocab != null) 1 else 0,
+                .tok_slot = tok_slot,
+                .imm_tok = if (gpu.markov_w1_vocab != null) imm_tok else 0,
+                .write_f32 = 0,
+            };
+            const joint_len: u32 = 2 * mr + 2 * h;
+            try frame.encodeThreads(
+                gpu.pipes.markov_gru_assemble,
+                &.{ parent_rnn_b, w1_b, slot_b, ctx_mf16_b, tok_chain_b, concat_f16_b, concat_f32_b },
+                std.mem.asBytes(&ap),
+                .{ joint_len, 1, 1 },
+                .{ @min(joint_len, 256), 1, 1 },
+                first_barrier,
+            );
+
+            const gp = gpu.markov_gru_proj.?;
+            const gates_is_f32 = (gp.amf_dtype == .f32);
+            try encodeGpuLinear(
+                gpu,
+                frame,
+                gp,
+                concat_f16_b,
+                if (gates_is_f32) gates_f32_b else gates_f16_b,
+                1,
+                null,
+                gates_is_f32,
+                true,
+            );
+
+            const up_p: DFlareMarkovGruUpdateParams = .{
+                .markov_rank = mr,
+                .gates_is_f32 = if (gates_is_f32) 1 else 0,
+                .has_bias = if (gpu.markov_gru_bias != null) 1 else 0,
+            };
+            try frame.encodeThreads(
+                gpu.pipes.markov_gru_update,
+                &.{
+                    if (gates_is_f32) gates_f32_b else gates_f16_b,
+                    gpu.markov_gru_bias orelse dummy_b,
+                    parent_rnn_b,
+                    out_rnn_b,
+                    mvec_f16_b,
+                    mvec_f32_b,
+                },
+                std.mem.asBytes(&up_p),
+                .{ mr, 1, 1 },
+                .{ @min(mr, 256), 1, 1 },
+                true,
+            );
+
+            if (gpu.markov_w2_vocab) |w2v| {
+                const v_rows: u32 = @min(gpu.markov_w2_vocab_rows, v);
+                const has_base: u32 = if (self.base_logits_ready and pos >= 1 and pos < self.config.block_size) 1 else 0;
+                const base_off: u32 = if (has_base != 0) @as(u32, pos - 1) * v else 0;
+                if (w2v.amf_dtype == .bf16 or w2v.amf_dtype == .f16 or w2v.amf_dtype == .f32) {
+                    const w2_dt: u32 = switch (w2v.amf_dtype) {
+                        .bf16 => 0,
+                        .f16 => 1,
+                        .f32 => 2,
+                        else => 0,
+                    };
+                    const wp: DFlareW2VocabParams = .{
+                        .vocab_size = v,
+                        .v_rows = v_rows,
+                        .markov_rank = mr,
+                        .w2_dtype = w2_dt,
+                        .has_bias = if (gpu.markov_w2_vocab_bias != null) 1 else 0,
+                        .has_base_logits = has_base,
+                        .base_row_elem_off = base_off,
+                        .softcap = self.config.final_logit_softcapping,
+                    };
+                    try frame.encodeThreadgroups(
+                        gpu.pipes.markov_w2_vocab_score,
+                        &.{ mvec_f32_b, w2v.weight, gpu.markov_w2_vocab_bias orelse dummy_b, base_log_b, logits_f32_b },
+                        std.mem.asBytes(&wp),
+                        .{ (v + 3) / 4, 1, 1 },
+                        .{ 128, 1, 1 },
+                        true,
+                    );
+                } else {
+                    try encodeGpuLinear(gpu, frame, w2v, mvec_f16_b, logits_f16_b, 1, null, false, true);
+                    const ep: DFlareLogitsEpilogueParams = .{
+                        .vocab_size = v,
+                        .v_rows = v_rows,
+                        .has_bias = if (gpu.markov_w2_vocab_bias != null) 1 else 0,
+                        .has_base_logits = has_base,
+                        .base_row_elem_off = base_off,
+                        .in_is_f16 = 1,
+                        .softcap = self.config.final_logit_softcapping,
+                    };
+                    try frame.encodeThreads(
+                        gpu.pipes.logits_epilogue,
+                        &.{ logits_f16_b, gpu.markov_w2_vocab_bias orelse dummy_b, base_log_b, logits_f32_b },
+                        std.mem.asBytes(&ep),
+                        .{ v, 1, 1 },
+                        .{ 256, 1, 1 },
+                        true,
+                    );
+                }
+                return .{ .logits_b = logits_f32_b, .logits_is_f16 = false, .softcap_done = true, .eff_vocab = v_rows };
+            }
+
+            // `mtp.safetensors` `hidden_out`: `b_j + hidden_out @ markov_vec + bias` -> `lm_head`.
+            const w2_lin = gpu.markov_w2.?;
+            const w2_is_f32 = (w2_lin.amf_dtype == .f32);
+            const w2_out_b = if (w2_is_f32) concat_f32_b else concat_f16_b;
+            try encodeGpuLinear(gpu, frame, w2_lin, mvec_f16_b, w2_out_b, 1, null, w2_is_f32, true);
+
+            const cp: DFlareMarkovCombineParams = .{
+                .hidden_size = h,
+                .w2_is_f32 = if (w2_is_f32) 1 else 0,
+                .has_bias = if (gpu.markov_hidden_bias != null) 1 else 0,
+                .has_norm = 0,
+                .slot_pos = pos,
+                .rms_eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.markov_head_combine,
+                &.{ w2_out_b, gpu.markov_hidden_bias orelse dummy_b, slot_b, dummy_b, head_h_b },
+                std.mem.asBytes(&cp),
+                .{ 1, 1, 1 },
+                .{ 256, 1, 1 },
+                true,
+            );
+
+            const eff_v: u32 = if (self.config.unpadded_vocab_size > 0 and self.config.unpadded_vocab_size < v)
+                self.config.unpadded_vocab_size
+            else
+                v;
+            if (score_on_gpu) {
+                if (gpu.lm_head) |lmh| {
+                    try encodeGpuLinear(gpu, frame, lmh, head_h_b, logits_f16_b, 1, null, false, true);
+                    return .{ .logits_b = logits_f16_b, .logits_is_f16 = true, .softcap_done = false, .eff_vocab = eff_v };
+                }
+            }
+            return .{ .logits_b = head_h_b, .logits_is_f16 = true, .softcap_done = false, .eff_vocab = eff_v };
+        }
+
+        // Non-GRU simple SiLU Markov head.
+        const tok_b = gpu.tok_embed orelse return error.InvalidWeights;
+        const w1_lin = gpu.markov_w1.?;
+        const concat_2h: u32 = if (w1_lin.k == 2 * h) 1 else 0;
+        const has_tnorm: u32 = if (self.weights.tok_embed_hook == null and gpu.token_embd_norm != null) 1 else 0;
+        const sp: DFlareSimpleMarkovPrepParams = .{
+            .hidden_size = h,
+            .vocab_size = v,
+            .slot_pos = pos,
+            .use_tok_buf = if (use_tok_buf) 1 else 0,
+            .tok_slot = tok_slot,
+            .imm_tok = imm_tok,
+            .tok_dtype = gpu.tok_embed_dtype,
+            .has_tok_norm = has_tnorm,
+            .concat_2h = concat_2h,
+            .write_f32 = 0,
+            .rms_eps = self.config.rms_eps,
+        };
+        try frame.encodeThreadgroups(
+            gpu.pipes.simple_markov_prep,
+            &.{ tok_b, gpu.token_embd_norm orelse dummy_b, slot_b, tok_chain_b, concat_f16_b, concat_f32_b },
+            std.mem.asBytes(&sp),
+            .{ 1, 1, 1 },
+            .{ 256, 1, 1 },
+            first_barrier,
+        );
+
+        const u_is_f32 = (w1_lin.amf_dtype == .f32);
+        const u_out_b = if (u_is_f32) gates_f32_b else gates_f16_b;
+        try encodeGpuLinear(gpu, frame, w1_lin, concat_f16_b, u_out_b, 1, null, u_is_f32, true);
+
+        const add_parent_direct = (gpu.markov_rnn_proj == null);
+        if (gpu.markov_rnn_proj) |rp_lin| {
+            // Note: `parent_rnn_b` is `f32`, while `encodeGpuLinear` expects `f16` x; copy/cast via `mix_taps_rmsnorm` (`f32 -> f16`) or use `mvec_f16_b`!
+            const cast_p: MixTapsParams = .{
+                .num_pos = 1,
+                .num_taps = 1,
+                .hidden_size = mr,
+                .taps_dtype = 0,
+                .ring_cap = 0,
+                .ring_start = 0,
+                .has_mix_w = 0,
+                .apply_norm = 0,
+                .has_norm_w = 0,
+                .write_f32 = 0,
+                .rms_eps = self.config.rms_eps,
+            };
+            try frame.encodeThreadgroups(
+                gpu.pipes.mix_taps_rmsnorm,
+                &.{ parent_rnn_b, dummy_b, dummy_b, mvec_f16_b, dummy_b },
+                std.mem.asBytes(&cast_p),
+                .{ 1, 1, 1 },
+                .{ 256, 1, 1 },
+                false,
+            );
+            // Accumulate `rp @ mvec_f16_b` into `u_out_b` (`gates_f32_b` or `gates_f16_b`) via residual!
+            if (rp_lin.amf_dtype == .f32 and u_is_f32) {
+                const gp_acc: DFlareGemvF32Params = .{
+                    .m = 1,
+                    .n = rp_lin.n,
+                    .k = rp_lin.k,
+                    .has_residual = 1,
+                    .x_is_f32 = 0,
+                    .y_is_f32 = 1,
+                    .res_is_f32 = 1,
+                };
+                try frame.encodeThreadgroups(
+                    gpu.pipes.gemv_batch_f32,
+                    &.{ mvec_f16_b, rp_lin.weight, gates_f32_b, gates_f32_b },
+                    std.mem.asBytes(&gp_acc),
+                    .{ (rp_lin.n + 3) / 4, 1, 1 },
+                    .{ 128, 1, 1 },
+                    true,
+                );
+            } else {
+                // Convert `u_out_b` -> `gates_f16_b` if needed, or run `encodeGpuLinear` with residual `gates_f16_b`!
+                if (u_is_f32) {
+                    const cast_u: MixTapsParams = .{
+                        .num_pos = 1,
+                        .num_taps = 1,
+                        .hidden_size = mr,
+                        .taps_dtype = 0,
+                        .ring_cap = 0,
+                        .ring_start = 0,
+                        .has_mix_w = 0,
+                        .apply_norm = 0,
+                        .has_norm_w = 0,
+                        .write_f32 = 0,
+                        .rms_eps = self.config.rms_eps,
+                    };
+                    try frame.encodeThreadgroups(
+                        gpu.pipes.mix_taps_rmsnorm,
+                        &.{ gates_f32_b, dummy_b, dummy_b, gates_f16_b, dummy_b },
+                        std.mem.asBytes(&cast_u),
+                        .{ 1, 1, 1 },
+                        .{ 256, 1, 1 },
+                        true,
+                    );
+                }
+                try encodeGpuLinear(gpu, frame, rp_lin, mvec_f16_b, gates_f16_b, 1, gates_f16_b, false, true);
+            }
+        }
+
+        const silu_u_is_f32: u32 = if (u_is_f32 and (gpu.markov_rnn_proj == null or gpu.markov_rnn_proj.?.amf_dtype == .f32)) 1 else 0;
+        const silu_p: DFlareSimpleMarkovSiluParams = .{
+            .markov_rank = mr,
+            .u_is_f32 = silu_u_is_f32,
+            .add_parent_rnn = if (add_parent_direct) 1 else 0,
+            .has_b1 = if (gpu.markov_b1 != null) 1 else 0,
+        };
+        try frame.encodeThreads(
+            gpu.pipes.simple_markov_silu,
+            &.{
+                if (silu_u_is_f32 != 0) gates_f32_b else gates_f16_b,
+                parent_rnn_b,
+                gpu.markov_b1 orelse dummy_b,
+                out_rnn_b,
+                mvec_f16_b,
+            },
+            std.mem.asBytes(&silu_p),
+            .{ mr, 1, 1 },
+            .{ @min(mr, 256), 1, 1 },
+            true,
+        );
+
+        const w2_lin = gpu.markov_w2.?;
+        const w2_is_f32 = (w2_lin.amf_dtype == .f32);
+        const w2_out_b = if (w2_is_f32) concat_f32_b else concat_f16_b;
+        try encodeGpuLinear(gpu, frame, w2_lin, mvec_f16_b, w2_out_b, 1, null, w2_is_f32, true);
+
+        const cp: DFlareMarkovCombineParams = .{
+            .hidden_size = h,
+            .w2_is_f32 = if (w2_is_f32) 1 else 0,
+            .has_bias = if (gpu.markov_hidden_bias != null) 1 else 0,
+            .has_norm = if (gpu.markov_norm != null) 1 else 0,
+            .slot_pos = pos,
+            .rms_eps = self.config.rms_eps,
+        };
+        try frame.encodeThreadgroups(
+            gpu.pipes.markov_head_combine,
+            &.{ w2_out_b, gpu.markov_hidden_bias orelse dummy_b, slot_b, gpu.markov_norm orelse dummy_b, head_h_b },
+            std.mem.asBytes(&cp),
+            .{ 1, 1, 1 },
+            .{ 256, 1, 1 },
+            true,
+        );
+
+        if (score_on_gpu) {
+            if (gpu.lm_head) |lmh| {
+                try encodeGpuLinear(gpu, frame, lmh, head_h_b, logits_f16_b, 1, null, false, true);
+                return .{ .logits_b = logits_f16_b, .logits_is_f16 = true, .softcap_done = true, .eff_vocab = v };
+            }
+        }
+        return .{ .logits_b = head_h_b, .logits_is_f16 = true, .softcap_done = true, .eff_vocab = v };
+    }
+
+    fn encodeGpuTopK(
+        gpu: *const DFlareGpuContext,
+        ws: *const DFlareWorkspace,
+        frame: *metal.Compute.Frame,
+        logits_b: metal.BufferBinding,
+        logits_is_f16: bool,
+        eff_vocab: u32,
+        top_k: u32,
+        inv_temp: f32,
+        softcap: f32,
+        has_mask: bool,
+        out_cand_offset: u32,
+        write_next_tok: bool,
+        next_tok_slot: u32,
+    ) Error!void {
+        const wb = gpu.ws_buf;
+        const mask_b = ws.sliceBinding(wb, ws.gpu_grammar_mask_u32);
+        const cands_b = ws.sliceBinding(wb, ws.gpu_topk_cands);
+        const tok_chain_b = ws.sliceBinding(wb, ws.gpu_token_chain_u32);
+        const align_req: u64 = if (logits_is_f16) 8 else 16;
+        const kp: DFlareTopKParams = .{
+            .eff_vocab_size = eff_vocab,
+            .top_k = top_k,
+            .logits_is_f16 = if (logits_is_f16) 1 else 0,
+            .has_mask = if (has_mask) 1 else 0,
+            .out_cand_offset = out_cand_offset,
+            .write_next_tok = if (write_next_tok) 1 else 0,
+            .next_tok_slot = next_tok_slot,
+            .aligned_vec4 = if ((logits_b.offset % align_req) == 0) 1 else 0,
+            .inv_temp = inv_temp,
+            .softcap = softcap,
+        };
+        if (top_k == 1) {
+            try frame.encodeThreadgroups(
+                gpu.pipes.top1_logits,
+                &.{ logits_b, mask_b, cands_b, tok_chain_b },
+                std.mem.asBytes(&kp),
+                .{ 1, 1, 1 },
+                .{ 256, 1, 1 },
+                true,
+            );
+        } else {
+            try frame.encodeThreadgroups(
+                gpu.pipes.topk_logits,
+                &.{ logits_b, mask_b, cands_b, tok_chain_b },
+                std.mem.asBytes(&kp),
+                .{ 1, 1, 1 },
+                .{ 128, 1, 1 },
+                true,
+            );
+        }
+    }
+
+    fn prepareAnchorAndContextGpu(
+        self: *DFlareProposer,
+        gpu: *DFlareGpuContext,
+        root_token: u32,
+        host_taps_opt: ?[]const []const f32,
+        gpu_taps_opt: ?GpuTargetTaps,
+        gpu_ctx_hist_opt: ?GpuContextHistory,
+    ) Error!struct {
+        use_cached_ctx: bool,
+        active_ctx_len: u32,
+        anchor_pos: u32,
+        final_chunk_pos: u32,
+        final_chunk_len: u32,
+        ring_cap: u32,
+        ring_start: u32,
+        taps_dtype: u32,
+    } {
+        if (gpu_taps_opt) |gt| {
+            for (gt.taps) |tb| try gpu.ensureResident(tb.buffer);
+        }
+        if (gpu_ctx_hist_opt) |gch| {
+            try gpu.ensureResident(gch.taps_ring.buffer);
+        }
+        const ws = self.workspace;
+        const h: usize = self.config.hidden_size;
+        const taps: usize = self.config.num_target_taps;
+        const max_ctx: u32 = ws.max_ctx_len;
+        const is_real = self.isRealGru();
+
+        // 0. Resolve anchor token embedding -> `ws.gpu_anchor_f16` (and register ContextHistoryProvider).
+        if (is_real) {
+            const raw_anchor = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_raw, self.weights.tok_embed_hook, root_token, h, ws.tok_embed_tmp);
+            if (raw_anchor.ptr != ws.tok_embed_tmp.ptr) {
+                @memcpy(ws.tok_embed_tmp[0..h], raw_anchor[0..h]);
+            }
+            if (self.weights.tok_embed_hook == null) {
+                if (self.weights.token_embd_norm) |ten| {
+                    applyRmsNormInPlace(ws.tok_embed_tmp[0..h], ten, self.config.rms_eps);
+                }
+            }
+            for (0..h) |d| ws.gpu_anchor_f16[d] = @floatCast(ws.tok_embed_tmp[d]);
+        }
+
+        // Copy host taps into `ws.taps_flat` and `ws.gpu_taps_flat_f16`.
+        if (host_taps_opt) |ht| {
+            if (ht.len != taps) return error.DimensionMismatch;
+            for (ht, 0..) |tap, ti| {
+                if (tap.len != h) return error.DimensionMismatch;
+                @memcpy(ws.taps_flat[ti * h ..][0..h], tap);
+            }
+            if (gpu.target_fusion_proj != null) {
+                for (0..taps * h) |i| ws.gpu_taps_flat_f16[i] = @floatCast(ws.taps_flat[i]);
+            }
+        }
+
+        var use_cached_ctx: bool = false;
+        var active_ctx_len: u32 = 1;
+        var anchor_pos: u32 = if (self.config.rope_theta > 0.0) 1 else 0;
+        var final_chunk_pos: u32 = 0;
+        var final_chunk_len: u32 = 0;
+        var ring_cap: u32 = 0;
+        var ring_start: u32 = 0;
+        var taps_dtype: u32 = 0;
+
+        if (is_real) {
+            if (gpu_ctx_hist_opt) |gch| {
+                if (gch.len > 0 and gch.cap > 0) {
+                    if (gch.epoch != self.ctx_cache_epoch or gch.len < self.ctx_cache_len) {
+                        self.ctx_cache_len = 0;
+                        self.ctx_cache_epoch = gch.epoch;
+                    }
+                    const win_start: u32 = if (gch.len > max_ctx) gch.len - max_ctx else 0;
+                    const start_p: u32 = @max(self.ctx_cache_len, win_start);
+                    if (start_p < gch.len) {
+                        final_chunk_pos = start_p;
+                        final_chunk_len = gch.len - start_p;
+                        ring_cap = gch.cap;
+                        ring_start = start_p % gch.cap;
+                        taps_dtype = @backingInt(gch.dtype);
+                    }
+                    self.ctx_cache_len = gch.len;
+                    active_ctx_len = @min(gch.len, max_ctx);
+                    anchor_pos = gch.len;
+                    use_cached_ctx = active_ctx_len > 0;
+                }
+            } else {
+                const cb_ctx: ?*anyopaque = if (self.weights.tok_embed_hook) |hk| switch (hk) {
+                    .callback => |cb| cb.ctx,
+                    .dense_f32 => null,
+                } else null;
+                if (lookupContextHistoryProvider(cb_ctx)) |prov_fn| {
+                    var hist_len: u32 = 0;
+                    var hist_epoch: u64 = 0;
+                    if (prov_fn(cb_ctx.?, &hist_len, &hist_epoch, 0, 0, &.{}) and hist_len > 0) {
+                        if (hist_epoch != self.ctx_cache_epoch or hist_len < self.ctx_cache_len) {
+                            self.ctx_cache_len = 0;
+                            self.ctx_cache_epoch = hist_epoch;
+                        }
+                        const win_start: u32 = if (hist_len > max_ctx) hist_len - max_ctx else 0;
+                        var p: u32 = @max(self.ctx_cache_len, win_start);
+                        const wb = gpu.ws_buf;
+                        const ctx_taps_b = ws.sliceBinding(wb, ws.gpu_ctx_taps_f32);
+                        while (p < hist_len) {
+                            const rem = hist_len - p;
+                            const take: u32 = @min(rem, ws.ctx_batch_cap);
+                            var actual: u32 = 0;
+                            while (actual < take) : (actual += 1) {
+                                var ok_all = true;
+                                for (0..taps) |ti| {
+                                    var tmp_l: u32 = 0;
+                                    var tmp_e: u64 = 0;
+                                    const dst = ws.gpu_ctx_taps_f32[(@as(usize, actual) * taps + ti) * h ..][0..h];
+                                    if (!prov_fn(cb_ctx.?, &tmp_l, &tmp_e, p + actual, ti, dst)) {
+                                        ok_all = false;
+                                        break;
+                                    }
+                                }
+                                if (!ok_all) break;
+                            }
+                            if (actual == 0) break;
+                            if (p + actual < hist_len) {
+                                // Early catch-up chunk (> ctx_batch_cap): commit & wait before overwriting staging buffer.
+                                var cf = try gpu.compute_ptr.beginFrame(gpu.timeout_ms);
+                                errdefer cf.abort();
+                                try self.encodeGpuContextKvBatch(gpu, &cf, ctx_taps_b, 0, 0, 0, actual, p, false, false, false);
+                                const sig = try cf.commit();
+                                try gpu.compute_ptr.wait(sig, gpu.timeout_ms);
+                                p += actual;
+                            } else {
+                                // Final chunk stays in the main draft MTL4CommandBuffer!
+                                final_chunk_pos = p;
+                                final_chunk_len = actual;
+                                p += actual;
+                                break;
+                            }
+                        }
+                        self.ctx_cache_len = hist_len;
+                        active_ctx_len = @min(hist_len, max_ctx);
+                        anchor_pos = hist_len;
+                        use_cached_ctx = active_ctx_len > 0;
+                    }
+                }
+            }
+        }
+
+        return .{
+            .use_cached_ctx = use_cached_ctx,
+            .active_ctx_len = active_ctx_len,
+            .anchor_pos = anchor_pos,
+            .final_chunk_pos = final_chunk_pos,
+            .final_chunk_len = final_chunk_len,
+            .ring_cap = ring_cap,
+            .ring_start = ring_start,
+            .taps_dtype = taps_dtype,
+        };
+    }
+
+    fn runBlockBackboneGpuImpl(
+        self: *DFlareProposer,
+        gpu: *DFlareGpuContext,
+        root_token: u32,
+        host_taps_opt: ?[]const []const f32,
+        gpu_taps_opt: ?GpuTargetTaps,
+        gpu_ctx_hist_opt: ?GpuContextHistory,
+        sync_host_outputs: bool,
+    ) Error!void {
+        const ws = self.workspace;
+        const wb = gpu.ws_buf;
+        const h: usize = self.config.hidden_size;
+        const w: usize = self.config.block_size;
+        const v: usize = self.config.vocab_size;
+
+        const prep = try self.prepareAnchorAndContextGpu(gpu, root_token, host_taps_opt, gpu_taps_opt, gpu_ctx_hist_opt);
+        var frame = try gpu.compute_ptr.beginFrame(gpu.timeout_ms);
+        errdefer frame.abort();
+
+        var first_b = false;
+        if (prep.final_chunk_len > 0) {
+            const taps_b = if (gpu_ctx_hist_opt) |gch| gch.taps_ring else ws.sliceBinding(wb, ws.gpu_ctx_taps_f32);
+            try self.encodeGpuContextKvBatch(
+                gpu,
+                &frame,
+                taps_b,
+                prep.taps_dtype,
+                prep.ring_cap,
+                prep.ring_start,
+                prep.final_chunk_len,
+                prep.final_chunk_pos,
+                false,
+                false,
+                false,
+            );
+            first_b = true;
+        }
+
+        try self.encodeGpuBackboneIntoFrame(
+            gpu,
+            &frame,
+            prep.anchor_pos,
+            prep.active_ctx_len,
+            !prep.use_cached_ctx,
+            gpu_taps_opt,
+            first_b,
+        );
+
+        self.base_logits_ready = false;
+        const need_base = self.isRealGru() and self.hasMarkovW2Vocab() and w > 1;
+        var base_computed_gpu = false;
+        if (need_base) {
+            if (gpu.lm_head) |lmh| {
+                const slot_draft_b = metal.BufferBinding{
+                    .buffer = wb,
+                    .offset = ws.sliceBinding(wb, ws.gpu_slot_hiddens_f16).offset + h * @sizeOf(f16),
+                };
+                try encodeGpuLinear(gpu, &frame, lmh, slot_draft_b, ws.sliceBinding(wb, ws.gpu_base_logits_f16), @intCast(w - 1), null, false, true);
+                self.base_logits_ready = true;
+                base_computed_gpu = true;
+            }
+        }
+
+        const sig = try frame.commit();
+        try gpu.compute_ptr.wait(sig, gpu.timeout_ms);
+
+        if (sync_host_outputs or (need_base and !base_computed_gpu and (hasLmHeadHook(self.weights.lm_head) or self.weights.lm_head_raw != null))) {
+            for (0..w * h) |i| ws.slot_hiddens[i] = @floatCast(ws.gpu_slot_hiddens_f16[i]);
+            @memcpy(ws.ctx_markov[0..h], ws.gpu_ctx_markov_f32[0..h]);
+            for (0..h) |d| ws.ctx_hidden[d] = @floatCast(ws.gpu_ctx_hidden_f16[d]);
+        }
+        if (need_base and !base_computed_gpu and (hasLmHeadHook(self.weights.lm_head) or self.weights.lm_head_raw != null)) {
+            const n_draft: u8 = @intCast(w - 1);
+            try evalLmHead(
+                self.weights.lm_head,
+                self.weights.lm_head_raw,
+                ws.slot_hiddens[h .. w * h],
+                n_draft,
+                self.config.hidden_size,
+                self.config.vocab_size,
+                ws.base_logits_buf[0 .. @as(usize, n_draft) * v],
+                ws.cpu_quant_row_scratch,
+            );
+            for (0..@as(usize, n_draft) * v) |i| ws.gpu_base_logits_f16[i] = @floatCast(ws.base_logits_buf[i]);
+            self.base_logits_ready = true;
+        }
+        self.backbone_runs += 1;
+    }
+
+    fn proposeIntoConstrainedGpuImpl(
+        self: *DFlareProposer,
+        comptime max_nodes: u16,
+        gpu: *DFlareGpuContext,
+        root_token: u32,
+        host_taps_opt: ?[]const []const f32,
+        gpu_taps_opt: ?GpuTargetTaps,
+        gpu_ctx_hist_opt: ?GpuContextHistory,
+        sam: ?*const sam_mod.SuffixAutomaton,
+        grammar_opt: ?accept_mod.GrammarTreeAdapter,
+        out_tree: *tree_mod.DraftTree(max_nodes),
+    ) Error!DFlareProposeResult {
+        out_tree.reset(root_token);
+        const ws = self.workspace;
+        const wb = gpu.ws_buf;
+        const node_limit: u16 = @min(@as(u16, self.config.max_tree_nodes), max_nodes);
+        const mr: usize = self.config.markov_rank;
+        const v: usize = self.config.vocab_size;
+        const w: u8 = self.config.block_size;
+        const k: usize = self.config.top_k_per_pos;
+
+        @memset(ws.node_log_probs[0..node_limit], 0.0);
+        @memset(ws.node_rnn_hidden[0..mr], 0.0);
+
+        const gram_active = if (grammar_opt) |ga| ga.isActive() else false;
+        var node_states: [tree_mod.MAX_SUPPORTED_NODES]grammar_mod.GrammarState = undefined;
+        var node_valid: [tree_mod.MAX_SUPPORTED_NODES]bool = @splat(false);
+        node_valid[0] = true;
+        if (grammar_opt) |ga| {
+            if (ga.isActive()) node_states[0] = ga.state.snapshot();
+        }
+
+        const l1 = mergeOptionalL1Sam(
+            max_nodes,
+            out_tree,
+            sam,
+            self.config.l1_max_draft_len,
+            node_limit,
+            self.config.l1_seed_step_prob,
+            self.config.l1_branch_step_prob,
+            ws.l1_draft_buf,
+            ws.node_log_probs,
+            gram_active,
+            grammar_opt,
+            &node_states,
+            &node_valid,
+        );
+
+        const base_backbone = self.backbone_runs;
+        const base_markov = self.markov_steps;
+        const pos_beg: usize = if (self.isRealGru() and w > 1) 1 else 0;
+        const inv_temp: f32 = 1.0 / self.config.temperature;
+
+        const has_gpu_w2_vocab = (gpu.markov_w2_vocab != null);
+        const has_gpu_lm_head = (gpu.lm_head != null);
+        const has_any_lm_head = hasLmHeadHook(self.weights.lm_head) or self.weights.lm_head_raw != null;
+        const can_gpu_score = has_gpu_w2_vocab or has_gpu_lm_head;
+        const can_single_frame_chain = (k == 1) and
+            (!gram_active) and
+            (gpu.markov_w1_vocab_raw == null) and
+            (has_gpu_w2_vocab or has_gpu_lm_head) and
+            (!has_gpu_w2_vocab or has_gpu_lm_head or !has_any_lm_head);
+
+        if (can_single_frame_chain and pos_beg < w) {
+            // SINGLE-FRAME FULLY-CHAINED METAL 4 PATH:
+            // Context KV update + 3L/5L backbone + base_logits + all Markov steps + Top-1 reduction
+            // execute in ONE `MTL4CommandBuffer` with ZERO intermediate CPU-GPU flushes!
+            const prep = try self.prepareAnchorAndContextGpu(gpu, root_token, host_taps_opt, gpu_taps_opt, gpu_ctx_hist_opt);
+            ws.gpu_token_chain_u32[0] = root_token;
+            @memset(ws.gpu_markov_rnn_ping_f32[0..mr], 0.0);
+
+            var frame = try gpu.compute_ptr.beginFrame(gpu.timeout_ms);
+            errdefer frame.abort();
+
+            var first_b = false;
+            if (prep.final_chunk_len > 0) {
+                const taps_b = if (gpu_ctx_hist_opt) |gch| gch.taps_ring else ws.sliceBinding(wb, ws.gpu_ctx_taps_f32);
+                try self.encodeGpuContextKvBatch(
+                    gpu,
+                    &frame,
+                    taps_b,
+                    prep.taps_dtype,
+                    prep.ring_cap,
+                    prep.ring_start,
+                    prep.final_chunk_len,
+                    prep.final_chunk_pos,
+                    false,
+                    false,
+                    false,
+                );
+                first_b = true;
+            }
+
+            try self.encodeGpuBackboneIntoFrame(
+                gpu,
+                &frame,
+                prep.anchor_pos,
+                prep.active_ctx_len,
+                !prep.use_cached_ctx,
+                gpu_taps_opt,
+                first_b,
+            );
+
+            self.base_logits_ready = false;
+            if (self.isRealGru() and has_gpu_w2_vocab and w > 1) {
+                if (gpu.lm_head) |lmh| {
+                    const slot_draft_b = metal.BufferBinding{
+                        .buffer = wb,
+                        .offset = ws.sliceBinding(wb, ws.gpu_slot_hiddens_f16).offset + self.config.hidden_size * @sizeOf(f16),
+                    };
+                    try encodeGpuLinear(gpu, &frame, lmh, slot_draft_b, ws.sliceBinding(wb, ws.gpu_base_logits_f16), @intCast(w - 1), null, false, true);
+                    self.base_logits_ready = true;
+                }
+            }
+
+            const ping_base_b = ws.sliceBinding(wb, ws.gpu_markov_rnn_ping_f32);
+            const ping_stride: u64 = mr * @sizeOf(f32);
+            for (pos_beg..w) |pos_usize| {
+                const step_idx: u32 = @intCast(pos_usize - pos_beg);
+                const in_ping: metal.BufferBinding = .{ .buffer = wb, .offset = ping_base_b.offset + (step_idx & 1) * ping_stride };
+                const out_ping: metal.BufferBinding = .{ .buffer = wb, .offset = ping_base_b.offset + ((step_idx + 1) & 1) * ping_stride };
+                const scored = try self.encodeGpuMarkovHeadStep(
+                    gpu,
+                    &frame,
+                    @intCast(pos_usize),
+                    true,
+                    step_idx,
+                    0,
+                    in_ping,
+                    out_ping,
+                    true,
+                    true,
+                );
+                const softcap_arg: f32 = if (scored.softcap_done) 0.0 else self.config.final_logit_softcapping;
+                try encodeGpuTopK(
+                    gpu,
+                    ws,
+                    &frame,
+                    scored.logits_b,
+                    scored.logits_is_f16,
+                    scored.eff_vocab,
+                    1,
+                    inv_temp,
+                    softcap_arg,
+                    false,
+                    step_idx,
+                    pos_usize + 1 < w,
+                    step_idx + 1,
+                );
+            }
+
+            const sig = try frame.commit();
+            try gpu.compute_ptr.wait(sig, gpu.timeout_ms);
+            self.backbone_runs += 1;
+
+            var parent: u16 = 0;
+            for (pos_beg..w) |pos_usize| {
+                const step_idx = pos_usize - pos_beg;
+                const cand = ws.gpu_topk_cands[step_idx];
+                self.markov_steps += 1;
+                if (cand.token_id == std.math.maxInt(u32) or cand.token_id >= v) break;
+                const child = if (out_tree.findChild(parent, cand.token_id)) |existing| blk: {
+                    break :blk out_tree.insertChild(parent, cand.token_id, cand.prob, .l2) orelse existing;
+                } else blk: {
+                    if (out_tree.count >= node_limit) break :blk null;
+                    break :blk out_tree.insertChild(parent, cand.token_id, cand.prob, .l2);
+                };
+                if (child) |c_idx| {
+                    ws.node_log_probs[c_idx] = cand.log_prob;
+                    parent = c_idx;
+                } else break;
+            }
+
+            return .{
+                .tree_nodes = out_tree.count,
+                .max_depth = out_tree.max_depth,
+                .l1_match_len = l1.match_len,
+                .l1_inserted = l1.inserted,
+                .l1_is_seed = l1.is_seed,
+                .backbone_runs = self.backbone_runs - base_backbone,
+                .markov_steps = self.markov_steps - base_markov,
+                .expected_tokens = out_tree.expectedTokens(),
+            };
+        }
+
+        // General GPU path for `top_k > 1`, `gram_active`, or host `LmHeadHook.callback` fallback.
+        try self.runBlockBackboneGpuImpl(gpu, root_token, host_taps_opt, gpu_taps_opt, gpu_ctx_hist_opt, !can_gpu_score);
+
+        var frontier_cur: [tree_mod.MAX_SUPPORTED_NODES]u16 = undefined;
+        var frontier_next: [tree_mod.MAX_SUPPORTED_NODES]u16 = undefined;
+        var cur_len: usize = 1;
+        frontier_cur[0] = 0;
+
+        const ping_base_b = ws.sliceBinding(wb, ws.gpu_markov_rnn_ping_f32);
+        const in_ping_b = ping_base_b;
+        const out_ping_b: metal.BufferBinding = .{ .buffer = wb, .offset = ping_base_b.offset + mr * @sizeOf(f32) };
+
+        for (pos_beg..w) |pos_usize| {
+            const pos: u8 = @intCast(pos_usize);
+            sortFrontierDescending(max_nodes, out_tree, frontier_cur[0..cur_len]);
+
+            var next_len: usize = 0;
+            for (frontier_cur[0..cur_len]) |parent| {
+                if (gram_active and !node_valid[parent]) continue;
+                const parent_tok = out_tree.nodes[parent].token_id;
+                if (parent_tok >= v) return error.TokenOutOfRange;
+                const parent_rnn = ws.node_rnn_hidden[@as(usize, parent) * mr ..][0..mr];
+                @memcpy(ws.gpu_markov_rnn_ping_f32[0..mr], parent_rnn);
+
+                if (gpu.markov_w1_vocab_raw) |w1r| {
+                    if (gpu.markov_w1_vocab == null) {
+                        const tok_clamped: usize = if (parent_tok < self.weights.markov_w1_vocab_rows) parent_tok else 0;
+                        try readRawRowF32(w1r, tok_clamped, ws.gpu_w1_row_f32[0..mr]);
+                    }
+                }
+
+                var mask_opt: ?[]const u32 = null;
+                if (gram_active) {
+                    var parent_ga = grammar_opt.?;
+                    var pstate = node_states[parent].snapshot();
+                    parent_ga.state = &pstate;
+                    mask_opt = parent_ga.fillBitmask(v) catch return error.InvalidLogits;
+                    if (mask_opt) |mwords| {
+                        const copy_w = @min(mwords.len, ws.gpu_grammar_mask_u32.len);
+                        @memcpy(ws.gpu_grammar_mask_u32[0..copy_w], mwords[0..copy_w]);
+                        if (copy_w < ws.gpu_grammar_mask_u32.len) {
+                            @memset(ws.gpu_grammar_mask_u32[copy_w..], 0);
+                        }
+                    }
+                }
+
+                var frame = try gpu.compute_ptr.beginFrame(gpu.timeout_ms);
+                errdefer frame.abort();
+                const scored = try self.encodeGpuMarkovHeadStep(
+                    gpu,
+                    &frame,
+                    pos,
+                    false,
+                    0,
+                    parent_tok,
+                    in_ping_b,
+                    out_ping_b,
+                    can_gpu_score,
+                    false,
+                );
+                if (can_gpu_score) {
+                    const softcap_arg: f32 = if (scored.softcap_done) 0.0 else self.config.final_logit_softcapping;
+                    try encodeGpuTopK(
+                        gpu,
+                        ws,
+                        &frame,
+                        scored.logits_b,
+                        scored.logits_is_f16,
+                        scored.eff_vocab,
+                        @intCast(k),
+                        inv_temp,
+                        softcap_arg,
+                        gram_active and mask_opt != null,
+                        0,
+                        false,
+                        0,
+                    );
+                }
+                const sig = try frame.commit();
+                try gpu.compute_ptr.wait(sig, gpu.timeout_ms);
+
+                const next_rnn = ws.gpu_markov_rnn_ping_f32[mr .. 2 * mr];
+                self.markov_steps += 1;
+
+                var cand_count: usize = 0;
+                if (can_gpu_score) {
+                    for (0..k) |ki| {
+                        const c = ws.gpu_topk_cands[ki];
+                        if (c.token_id == std.math.maxInt(u32) or c.token_id >= v) break;
+                        ws.topk_tokens[cand_count] = c.token_id;
+                        ws.topk_probs[cand_count] = c.prob;
+                        cand_count += 1;
+                    }
+                } else {
+                    const h: usize = self.config.hidden_size;
+                    for (0..h) |d| ws.head_hidden[d] = @floatCast(ws.gpu_head_hidden_f16[d]);
+                    try evalLmHead(
+                        self.weights.lm_head,
+                        self.weights.lm_head_raw,
+                        ws.head_hidden[0..h],
+                        1,
+                        self.config.hidden_size,
+                        self.config.vocab_size,
+                        ws.logits_buf[0..v],
+                        ws.cpu_quant_row_scratch,
+                    );
+                    const eff_v: usize = scored.eff_vocab;
+                    if (self.isRealGru() and self.config.final_logit_softcapping > 0.0) {
+                        const cap = self.config.final_logit_softcapping;
+                        for (0..eff_v) |ti| ws.logits_buf[ti] = cap * std.math.tanh(ws.logits_buf[ti] / cap);
+                    }
+                    if (eff_v < v) @memset(ws.logits_buf[eff_v..v], -1e30);
+                    cand_count = try extractDeterministicTopKMasked(
+                        ws.logits_buf[0..v],
+                        inv_temp,
+                        mask_opt,
+                        ws.topk_tokens[0..k],
+                        ws.topk_probs[0..k],
+                    );
+                }
+
+                for (0..cand_count) |ki| {
+                    const tok = ws.topk_tokens[ki];
+                    const prob = ws.topk_probs[ki];
+                    var child_state: grammar_mod.GrammarState = undefined;
+                    if (gram_active) {
+                        child_state = node_states[parent].snapshot();
+                        if (!grammar_opt.?.advanceTokenOnState(&child_state, tok)) continue;
+                    }
+
+                    const child = if (out_tree.findChild(parent, tok)) |existing| blk: {
+                        break :blk out_tree.insertChild(parent, tok, prob, .l2) orelse existing;
+                    } else blk: {
+                        if (out_tree.count >= node_limit) break :blk null;
+                        break :blk out_tree.insertChild(parent, tok, prob, .l2);
+                    };
+
+                    if (child) |c_idx| {
+                        ws.node_log_probs[c_idx] = logProbOf(prob);
+                        @memcpy(ws.node_rnn_hidden[@as(usize, c_idx) * mr ..][0..mr], next_rnn);
+                        if (gram_active) {
+                            node_states[c_idx] = child_state;
+                            node_valid[c_idx] = true;
+                        }
+                        if (next_len < tree_mod.MAX_SUPPORTED_NODES and
+                            !containsNode(frontier_next[0..next_len], c_idx))
+                        {
+                            frontier_next[next_len] = c_idx;
+                            next_len += 1;
+                        }
+                    }
+                }
+            }
+            if (next_len == 0) break;
+            @memcpy(frontier_cur[0..next_len], frontier_next[0..next_len]);
+            cur_len = next_len;
+        }
+
+        return .{
+            .tree_nodes = out_tree.count,
+            .max_depth = out_tree.max_depth,
+            .l1_match_len = l1.match_len,
+            .l1_inserted = l1.inserted,
+            .l1_is_seed = l1.is_seed,
+            .backbone_runs = self.backbone_runs - base_backbone,
+            .markov_steps = self.markov_steps - base_markov,
+            .expected_tokens = out_tree.expectedTokens(),
+        };
+    }
+
     /// Returns token log-prob `ln(step_prob)` recorded for node `idx`.
     pub inline fn nodeLogProb(self: *const DFlareProposer, node_idx: u16) f32 {
         return self.workspace.node_log_probs[node_idx];
@@ -1555,9 +4468,11 @@ pub const DFlareProposer = struct {
 // Standalone `arch = dflash` Bundle Loader
 // ============================================================================
 
-/// Startup-loaded standalone `DFlare` / `arch = dflash` `.amf` bundle owning decoded
-/// draft weights (compact BF16 for large models, FP32 for small models) and a 16 KiB-aligned `DFlareWorkspace`.
+/// Startup-loaded standalone `DFlare` / `arch = dflash` `.amf` bundle owning
+/// zero-copy `WiredArena`-backed weights (native `.bf16`/`.f16`/`.f32`/`.gguf_q8_0`/affine/W21/W22)
+/// and a 16 KiB-aligned `DFlareWorkspace`.
 pub const LoadedDFlareBundle = struct {
+    weight_arena: ?arena_mod.WiredArena = null,
     owned_f32_bufs: [][]f32,
     owned_u16_bufs: [][]u16,
     layers: []TransformerBlockWeights,
@@ -1567,6 +4482,25 @@ pub const LoadedDFlareBundle = struct {
     pub const LoadError = Error || amf.ParseError || amf.IoError || error{
         MissingTensor,
         OutOfMemory,
+    };
+
+    const LayerEntryRefs = struct {
+        in_norm: ?*const amf.TensorEntry = null,
+        post_norm: ?*const amf.TensorEntry = null,
+        ctx_norm: ?*const amf.TensorEntry = null,
+        q_norm: ?*const amf.TensorEntry = null,
+        k_norm: ?*const amf.TensorEntry = null,
+        k_norm_ctx: ?*const amf.TensorEntry = null,
+        q_proj: *const amf.TensorEntry = undefined,
+        k_proj: *const amf.TensorEntry = undefined,
+        v_proj: *const amf.TensorEntry = undefined,
+        o_proj: *const amf.TensorEntry = undefined,
+        k_proj_ctx: ?*const amf.TensorEntry = null,
+        v_proj_ctx: ?*const amf.TensorEntry = null,
+        mlp_gate: *const amf.TensorEntry = undefined,
+        mlp_up: *const amf.TensorEntry = undefined,
+        mlp_down: *const amf.TensorEntry = undefined,
+        ctx_mix: ?*const amf.TensorEntry = null,
     };
 
     pub fn loadFromAmfFile(
@@ -1612,6 +4546,7 @@ pub const LoadedDFlareBundle = struct {
     ) LoadError!*LoadedDFlareBundle {
         var cfg = cfg_in;
         try cfg.validate();
+        if (cfg.num_layers > 64) return error.InvalidConfig;
 
         const h: usize = cfg.hidden_size;
         const inter: usize = cfg.intermediate_size;
@@ -1619,210 +4554,188 @@ pub const LoadedDFlareBundle = struct {
         const kv_dim: usize = cfg.kvDim();
         const mr: usize = cfg.markov_rank;
         const v: usize = cfg.vocab_size;
-        const use_bf16_layers: bool = (h >= 1024);
 
-        var f32_pool: [256][]f32 = undefined;
-        var f32_len: usize = 0;
-        errdefer {
-            for (0..f32_len) |i| allocator.free(f32_pool[i]);
-        }
-        var u16_pool: [256][]u16 = undefined;
-        var u16_len: usize = 0;
-        errdefer {
-            for (0..u16_len) |i| allocator.free(u16_pool[i]);
-        }
+        // Pass 1: resolve every `.amf` tensor entry, validate shapes/dtypes, and compute exact `WiredArena` size.
+        var weight_bytes: usize = 0;
+        var max_small_blob: usize = 0;
 
-        // Target tap fusion: dense `[h, taps*h]` OR per-layer scalar `[rows, taps]` (`fuse_weight` / `ctx_mix`).
-        var fc: ?[]const f32 = null;
-        var fuse_scalar: ?[]const f32 = null;
+        var fc_entry_raw: ?*const amf.TensorEntry = null;
+        var fuse_scalar_entry: ?*const amf.TensorEntry = null;
+        var fuse_scalar_elems: usize = 0;
+        var has_ctx_mix: bool = false;
+        var markov_ctx_mix_entry: ?*const amf.TensorEntry = null;
         if (findAnyEntry(amf_file, &.{ "dflare.fc.weight", "fc.weight", "fuse_weight" })) |fe| {
-            const vec = try loadEntryIntoF32Pool(allocator, amf_file, fe, &f32_pool, &f32_len);
-            if (vec.len == cfg.num_target_taps * h * h) {
-                fc = vec;
-            } else if (vec.len >= cfg.num_target_taps and (vec.len % cfg.num_target_taps) == 0) {
-                // `mtp.safetensors` stores raw pre-softmax `fuse_weight [rows, taps]` logits;
-                // apply row-wise softmax to match `dflash-Q8` `ctx_mix.weight` probabilities.
-                const taps_us: usize = cfg.num_target_taps;
-                const n_rows: usize = vec.len / taps_us;
-                for (0..n_rows) |ri| {
-                    const row = vec[ri * taps_us ..][0..taps_us];
-                    var mx: f32 = -std.math.inf(f32);
-                    for (row) |val| {
-                        if (val > mx) mx = val;
-                    }
-                    var sum: f32 = 0.0;
-                    for (row) |*val| {
-                        val.* = @exp(val.* - mx);
-                        sum += val.*;
-                    }
-                    if (sum > 0.0) {
-                        const inv = 1.0 / sum;
-                        for (row) |*val| val.* *= inv;
-                    }
-                }
-                fuse_scalar = vec;
+            const fc_elems = try entryElems(fe);
+            if (fc_elems == cfg.num_target_taps * h * h) {
+                fc_entry_raw = fe;
+                try planRawBytes(&weight_bytes, fe, h, cfg.num_target_taps * h, true);
+            } else if (fc_elems >= cfg.num_target_taps and (fc_elems % cfg.num_target_taps) == 0) {
+                fuse_scalar_entry = fe;
+                fuse_scalar_elems = try planF32Bytes(&weight_bytes, &max_small_blob, fe, null);
             } else {
                 return error.DimensionMismatch;
             }
         } else if (amf_file.parsed.find("layers.0.ctx_mix.weight") != null) {
-            // `dflash-Q8` GGUF stores per-layer `layers.{l}.ctx_mix.weight [taps]` + `markov_ctx_mix.weight [taps]`.
+            has_ctx_mix = true;
             const rows: usize = @as(usize, cfg.num_layers) + 1;
-            const mix = try allocator.alloc(f32, rows * cfg.num_target_taps);
-            if (f32_len >= f32_pool.len) {
-                allocator.free(mix);
-                return error.Overflow;
+            const mix_elems = std.math.mul(usize, rows, cfg.num_target_taps) catch return error.Overflow;
+            weight_bytes = std.math.add(usize, weight_bytes, try alignUp64(mix_elems * @sizeOf(f32))) catch return error.Overflow;
+            markov_ctx_mix_entry = amf_file.parsed.find("markov_ctx_mix.weight");
+            if (markov_ctx_mix_entry) |me| {
+                max_small_blob = @max(max_small_blob, @as(usize, @intCast(me.blob_bytes)));
             }
-            f32_pool[f32_len] = mix;
-            f32_len += 1;
-            @memset(mix, 1.0 / @as(f32, @floatFromInt(cfg.num_target_taps)));
-            var nb: [64]u8 = undefined;
-            for (0..cfg.num_layers) |l| {
-                const nm = std.fmt.bufPrint(&nb, "layers.{d}.ctx_mix.weight", .{l}) catch return error.Overflow;
-                if (amf_file.parsed.find(nm)) |ce| {
-                    const cvec = try readEntryAsF32(allocator, amf_file, ce);
-                    defer allocator.free(cvec);
-                    const ncopy = @min(cvec.len, @as(usize, cfg.num_target_taps));
-                    @memcpy(mix[l * cfg.num_target_taps ..][0..ncopy], cvec[0..ncopy]);
-                }
-            }
-            if (amf_file.parsed.find("markov_ctx_mix.weight")) |me| {
-                const mvec = try readEntryAsF32(allocator, amf_file, me);
-                defer allocator.free(mvec);
-                const ncopy = @min(mvec.len, @as(usize, cfg.num_target_taps));
-                @memcpy(mix[@as(usize, cfg.num_layers) * cfg.num_target_taps ..][0..ncopy], mvec[0..ncopy]);
-            }
-            fuse_scalar = mix;
         }
-        const fc_norm = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{ "dflare.fc_norm.weight", "fc_norm.weight" }, h, &f32_pool, &f32_len);
 
-        const mask_embed = try loadAmfTensorAnyLen256(allocator, amf_file, &.{ "dflare.mask_embed.weight", "dflare.mask_embed", "mask_embed", "mask_embd.weight" }, &f32_pool, &f32_len);
-        const tok_embed_norm = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{"token_embd_norm.weight"}, h, &f32_pool, &f32_len);
+        const fc_norm_entry = findAnyEntry(amf_file, &.{ "dflare.fc_norm.weight", "fc_norm.weight" });
+        if (fc_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
 
-        var tok_embed: []const f32 = &.{};
+        const mask_entry = findAnyEntry(amf_file, &.{ "dflare.mask_embed.weight", "dflare.mask_embed", "mask_embed", "mask_embd.weight" }) orelse return error.MissingTensor;
+        const mask_elems = try planF32Bytes(&weight_bytes, &max_small_blob, mask_entry, null);
+
+        const tok_embed_norm_entry = findAnyEntry(amf_file, &.{"token_embd_norm.weight"});
+        if (tok_embed_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
+
+        var tok_embed_entry: ?*const amf.TensorEntry = null;
         if (tok_embed_override == null) {
-            if (findAnyEntry(amf_file, &.{ "dflare.tok_embed.weight", "token_embd.weight", "embed_tokens.weight" })) |te| {
-                const tv = try loadEntryIntoF32Pool(allocator, amf_file, te, &f32_pool, &f32_len);
-                if (tv.len != v * h) return error.DimensionMismatch;
-                tok_embed = tv;
-            } else {
-                return error.MissingTensor;
-            }
+            const te = findAnyEntry(amf_file, &.{ "dflare.tok_embed.weight", "token_embd.weight", "embed_tokens.weight" }) orelse return error.MissingTensor;
+            tok_embed_entry = te;
+            try planRawBytes(&weight_bytes, te, v, h, true);
         }
-        const final_norm = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{ "dflare.norm.weight", "output_norm.weight", "norm.weight" }, h, &f32_pool, &f32_len);
 
-        const layers = try allocator.alloc(TransformerBlockWeights, cfg.num_layers);
-        errdefer allocator.free(layers);
+        const final_norm_entry = findAnyEntry(amf_file, &.{ "dflare.norm.weight", "output_norm.weight", "norm.weight" });
+        if (final_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
 
+        var layer_refs: [64]LayerEntryRefs = undefined;
         var nb0: [80]u8 = undefined;
         var nb1: [80]u8 = undefined;
         var nb2: [80]u8 = undefined;
         for (0..cfg.num_layers) |l| {
-            const in_norm = try loadLayerF32Opt(allocator, amf_file, l, &.{ "input_layernorm.weight", "attn_norm.weight" }, h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-            const post_norm = try loadLayerF32Opt(allocator, amf_file, l, &.{ "post_attention_layernorm.weight", "post_norm.weight", "ffn_norm.weight" }, h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-            const ctx_norm = try loadLayerF32Opt(allocator, amf_file, l, &.{ "dflare_norm.weight", "ctx_norm.weight" }, h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-            const q_norm = try loadLayerF32Opt(allocator, amf_file, l, &.{ "self_attn.q_norm.weight", "attn.q_norm.weight", "attn_q_norm.weight" }, cfg.head_dim, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-            const k_norm = try loadLayerF32Opt(allocator, amf_file, l, &.{ "self_attn.k_norm.weight", "attn.k_norm.weight", "attn_k_norm.weight" }, cfg.head_dim, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-            const k_norm_ctx = try loadLayerF32Opt(allocator, amf_file, l, &.{ "self_attn.k_norm_ctx.weight", "attn_k_ctx_norm.weight" }, cfg.head_dim, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
+            var refs: LayerEntryRefs = .{};
+            refs.in_norm = try findLayerEntry(amf_file, l, &.{ "input_layernorm.weight", "attn_norm.weight" }, &nb0, &nb1, &nb2);
+            if (refs.in_norm) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
+            refs.post_norm = try findLayerEntry(amf_file, l, &.{ "post_attention_layernorm.weight", "post_norm.weight", "ffn_norm.weight" }, &nb0, &nb1, &nb2);
+            if (refs.post_norm) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
+            refs.ctx_norm = try findLayerEntry(amf_file, l, &.{ "dflare_norm.weight", "ctx_norm.weight" }, &nb0, &nb1, &nb2);
+            if (refs.ctx_norm) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
+            refs.q_norm = try findLayerEntry(amf_file, l, &.{ "self_attn.q_norm.weight", "attn.q_norm.weight", "attn_q_norm.weight" }, &nb0, &nb1, &nb2);
+            if (refs.q_norm) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, cfg.head_dim);
+            refs.k_norm = try findLayerEntry(amf_file, l, &.{ "self_attn.k_norm.weight", "attn.k_norm.weight", "attn_k_norm.weight" }, &nb0, &nb1, &nb2);
+            if (refs.k_norm) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, cfg.head_dim);
+            refs.k_norm_ctx = try findLayerEntry(amf_file, l, &.{ "self_attn.k_norm_ctx.weight", "attn_k_ctx_norm.weight" }, &nb0, &nb1, &nb2);
+            if (refs.k_norm_ctx) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, cfg.head_dim);
 
-            var tb: TransformerBlockWeights = .{
-                .in_norm_weight = in_norm,
-                .q_norm_weight = q_norm,
-                .k_norm_weight = k_norm,
-                .k_norm_ctx_weight = k_norm_ctx,
-                .ctx_norm_weight = ctx_norm,
-                .post_norm_weight = post_norm,
-            };
-            if (use_bf16_layers) {
-                tb.q_proj_bf16 = try loadLayerBf16(allocator, amf_file, l, &.{ "self_attn.q_proj.weight", "attn.q_proj.weight", "attn_q.weight" }, q_dim * h, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-                tb.k_proj_bf16 = try loadLayerBf16(allocator, amf_file, l, &.{ "self_attn.k_proj.weight", "attn.k_proj.weight", "attn_k.weight" }, kv_dim * h, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-                tb.v_proj_bf16 = try loadLayerBf16(allocator, amf_file, l, &.{ "self_attn.v_proj.weight", "attn.v_proj.weight", "attn_v.weight" }, kv_dim * h, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-                tb.o_proj_bf16 = try loadLayerBf16(allocator, amf_file, l, &.{ "self_attn.o_proj.weight", "attn.o_proj.weight", "attn_output.weight" }, h * q_dim, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-                tb.k_proj_ctx_bf16 = try loadLayerBf16Opt(allocator, amf_file, l, &.{ "self_attn.k_proj_ctx.weight", "attn.k_proj_ctx.weight" }, kv_dim * h, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-                tb.v_proj_ctx_bf16 = try loadLayerBf16Opt(allocator, amf_file, l, &.{ "self_attn.v_proj_ctx.weight", "attn.v_proj_ctx.weight" }, kv_dim * h, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-                tb.mlp_gate_bf16 = try loadLayerBf16(allocator, amf_file, l, &.{ "mlp.gate_proj.weight", "ffn_gate.weight" }, inter * h, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-                tb.mlp_up_bf16 = try loadLayerBf16(allocator, amf_file, l, &.{ "mlp.up_proj.weight", "ffn_up.weight" }, inter * h, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-                tb.mlp_down_bf16 = try loadLayerBf16(allocator, amf_file, l, &.{ "mlp.down_proj.weight", "ffn_down.weight" }, h * inter, &nb0, &nb1, &nb2, &u16_pool, &u16_len);
-            } else {
-                tb.q_proj = try loadLayerF32(allocator, amf_file, l, &.{ "self_attn.q_proj.weight", "attn.q_proj.weight", "attn_q.weight" }, q_dim * h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-                tb.k_proj = try loadLayerF32(allocator, amf_file, l, &.{ "self_attn.k_proj.weight", "attn.k_proj.weight", "attn_k.weight" }, kv_dim * h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-                tb.v_proj = try loadLayerF32(allocator, amf_file, l, &.{ "self_attn.v_proj.weight", "attn.v_proj.weight", "attn_v.weight" }, kv_dim * h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-                tb.o_proj = try loadLayerF32(allocator, amf_file, l, &.{ "self_attn.o_proj.weight", "attn.o_proj.weight", "attn_output.weight" }, h * q_dim, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-                tb.k_proj_ctx = try loadLayerF32Opt(allocator, amf_file, l, &.{ "self_attn.k_proj_ctx.weight", "attn.k_proj_ctx.weight" }, kv_dim * h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-                tb.v_proj_ctx = try loadLayerF32Opt(allocator, amf_file, l, &.{ "self_attn.v_proj_ctx.weight", "attn.v_proj_ctx.weight" }, kv_dim * h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-                tb.mlp_gate_proj = try loadLayerF32(allocator, amf_file, l, &.{ "mlp.gate_proj.weight", "ffn_gate.weight" }, inter * h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-                tb.mlp_up_proj = try loadLayerF32(allocator, amf_file, l, &.{ "mlp.up_proj.weight", "ffn_up.weight" }, inter * h, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
-                tb.mlp_down_proj = try loadLayerF32(allocator, amf_file, l, &.{ "mlp.down_proj.weight", "ffn_down.weight" }, h * inter, &nb0, &nb1, &nb2, &f32_pool, &f32_len);
+            refs.q_proj = (try findLayerEntry(amf_file, l, &.{ "self_attn.q_proj.weight", "attn.q_proj.weight", "attn_q.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
+            try planRawBytes(&weight_bytes, refs.q_proj, q_dim, h, false);
+            refs.k_proj = (try findLayerEntry(amf_file, l, &.{ "self_attn.k_proj.weight", "attn.k_proj.weight", "attn_k.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
+            try planRawBytes(&weight_bytes, refs.k_proj, kv_dim, h, false);
+            refs.v_proj = (try findLayerEntry(amf_file, l, &.{ "self_attn.v_proj.weight", "attn.v_proj.weight", "attn_v.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
+            try planRawBytes(&weight_bytes, refs.v_proj, kv_dim, h, false);
+            refs.o_proj = (try findLayerEntry(amf_file, l, &.{ "self_attn.o_proj.weight", "attn.o_proj.weight", "attn_output.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
+            try planRawBytes(&weight_bytes, refs.o_proj, h, q_dim, false);
+
+            refs.k_proj_ctx = try findLayerEntry(amf_file, l, &.{ "self_attn.k_proj_ctx.weight", "attn.k_proj_ctx.weight" }, &nb0, &nb1, &nb2);
+            if (refs.k_proj_ctx) |e| try planRawBytes(&weight_bytes, e, kv_dim, h, false);
+            refs.v_proj_ctx = try findLayerEntry(amf_file, l, &.{ "self_attn.v_proj_ctx.weight", "attn.v_proj_ctx.weight" }, &nb0, &nb1, &nb2);
+            if (refs.v_proj_ctx) |e| try planRawBytes(&weight_bytes, e, kv_dim, h, false);
+
+            refs.mlp_gate = (try findLayerEntry(amf_file, l, &.{ "mlp.gate_proj.weight", "ffn_gate.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
+            try planRawBytes(&weight_bytes, refs.mlp_gate, inter, h, false);
+            refs.mlp_up = (try findLayerEntry(amf_file, l, &.{ "mlp.up_proj.weight", "ffn_up.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
+            try planRawBytes(&weight_bytes, refs.mlp_up, inter, h, false);
+            refs.mlp_down = (try findLayerEntry(amf_file, l, &.{ "mlp.down_proj.weight", "ffn_down.weight" }, &nb0, &nb1, &nb2)) orelse return error.MissingTensor;
+            try planRawBytes(&weight_bytes, refs.mlp_down, h, inter, false);
+
+            if (has_ctx_mix) {
+                const nm = std.fmt.bufPrint(&nb0, "layers.{d}.ctx_mix.weight", .{l}) catch return error.Overflow;
+                refs.ctx_mix = amf_file.parsed.find(nm);
+                if (refs.ctx_mix) |ce| max_small_blob = @max(max_small_blob, @as(usize, @intCast(ce.blob_bytes)));
             }
-            layers[l] = tb;
+            layer_refs[l] = refs;
         }
 
-        // Markov head: detect real 3-gate GRU (`[3*mr, 2*h + 2*mr]`) vs standard simple Markov head!
+        // Markov head entries.
         const gru_entry = findAnyEntry(amf_file, &.{ "markov_head.rnn_proj.weight", "joint_proj.weight" });
         const is_real_gru: bool = if (gru_entry) |ge| (ge.shape[0] == 3 * mr and ge.shape[1] == 2 * h + 2 * mr) else false;
 
-        var markov_w1: []const f32 = &.{};
-        var markov_w1_vocab_bf16: ?[]const u16 = null;
+        const markov_ctx_norm_entry = findAnyEntry(amf_file, &.{ "markov_head.dflare_norm.weight", "markov_ctx_norm.weight" });
+        if (markov_ctx_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
+        const markov_norm_entry = findAnyEntry(amf_file, &.{ "dflare.markov_norm.weight", "markov_norm.weight" });
+        if (markov_norm_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
+
+        var markov_gru_bias_entry: ?*const amf.TensorEntry = null;
+        var markov_w1_vocab_entry: ?*const amf.TensorEntry = null;
         var markov_w1_vocab_rows: u32 = 0;
-        var markov_gru_bf16: ?[]const u16 = null;
-        var markov_gru_f32: ?[]const f32 = null;
-        var markov_gru_bias: ?[]const f32 = null;
-        var markov_rnn: ?[]const f32 = null;
-        var markov_b1: ?[]const f32 = null;
-        var markov_w2: []const f32 = &.{};
-        var markov_hidden_bias: ?[]const f32 = null;
-        var markov_w2_vocab_bf16: ?[]const u16 = null;
-        var markov_w2_vocab_bias: ?[]const f32 = null;
+        var markov_hidden_out_entry: ?*const amf.TensorEntry = null;
+        var markov_hidden_bias_entry: ?*const amf.TensorEntry = null;
+        var markov_w2_vocab_entry: ?*const amf.TensorEntry = null;
+        var markov_w2_vocab_bias_entry: ?*const amf.TensorEntry = null;
         var markov_w2_vocab_rows: u32 = 0;
-        const markov_ctx_norm = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{ "markov_head.dflare_norm.weight", "markov_ctx_norm.weight" }, h, &f32_pool, &f32_len);
-        const markov_norm = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{ "dflare.markov_norm.weight", "markov_norm.weight" }, h, &f32_pool, &f32_len);
+
+        var markov_w1_entry: ?*const amf.TensorEntry = null;
+        var markov_w1_k: usize = h;
+        var markov_rnn_entry: ?*const amf.TensorEntry = null;
+        var markov_b1_entry: ?*const amf.TensorEntry = null;
+        var markov_w2_entry: ?*const amf.TensorEntry = null;
 
         if (is_real_gru) {
-            const ge = gru_entry.?;
-            if (use_bf16_layers) {
-                markov_gru_bf16 = try loadEntryIntoBf16Pool(allocator, amf_file, ge, &u16_pool, &u16_len);
-            } else {
-                markov_gru_f32 = try loadEntryIntoF32Pool(allocator, amf_file, ge, &f32_pool, &f32_len);
-            }
-            markov_gru_bias = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{ "markov_head.rnn_proj.bias", "joint_proj.bias" }, 3 * mr, &f32_pool, &f32_len);
+            try planRawBytes(&weight_bytes, gru_entry.?, 3 * mr, 2 * h + 2 * mr, false);
+            markov_gru_bias_entry = findAnyEntry(amf_file, &.{ "markov_head.rnn_proj.bias", "joint_proj.bias" });
+            if (markov_gru_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, 3 * mr);
+
             const w1e = findAnyEntry(amf_file, &.{ "markov_head.markov_w1.weight", "markov_w1.weight" }) orelse return error.MissingTensor;
-            markov_w1_vocab_bf16 = try loadEntryIntoBf16Pool(allocator, amf_file, w1e, &u16_pool, &u16_len);
+            if (w1e.rank < 2 or w1e.shape[0] == 0 or w1e.shape[1] != mr) return error.DimensionMismatch;
+            markov_w1_vocab_entry = w1e;
             markov_w1_vocab_rows = w1e.shape[0];
+            try planRawBytes(&weight_bytes, w1e, w1e.shape[0], mr, false);
 
             if (findAnyEntry(amf_file, &.{ "markov_head.hidden_out.weight", "dflare.markov_w2.weight" })) |hoe| {
-                markov_w2 = try loadEntryIntoF32Pool(allocator, amf_file, hoe, &f32_pool, &f32_len);
-                markov_hidden_bias = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{"markov_head.hidden_out.bias"}, h, &f32_pool, &f32_len);
+                markov_hidden_out_entry = hoe;
+                try planRawBytes(&weight_bytes, hoe, h, mr, false);
+                markov_hidden_bias_entry = findAnyEntry(amf_file, &.{"markov_head.hidden_out.bias"});
+                if (markov_hidden_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
             } else if (amf_file.parsed.find("markov_w2.weight")) |w2e| {
-                markov_w2_vocab_bf16 = try loadEntryIntoBf16Pool(allocator, amf_file, w2e, &u16_pool, &u16_len);
+                if (w2e.rank < 2 or w2e.shape[0] == 0 or w2e.shape[1] != mr) return error.DimensionMismatch;
+                markov_w2_vocab_entry = w2e;
                 markov_w2_vocab_rows = w2e.shape[0];
-                if (amf_file.parsed.find("markov_w2.bias")) |w2b| {
-                    markov_w2_vocab_bias = try loadEntryIntoF32Pool(allocator, amf_file, w2b, &f32_pool, &f32_len);
-                }
+                try planRawBytes(&weight_bytes, w2e, w2e.shape[0], mr, false);
+                markov_w2_vocab_bias_entry = amf_file.parsed.find("markov_w2.bias");
+                if (markov_w2_vocab_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, w2e.shape[0]);
             } else {
                 return error.MissingTensor;
             }
         } else {
-            markov_w1 = try loadAmfTensorAnyLen256(allocator, amf_file, &.{ "dflare.markov_w1.weight", "markov_head.markov_w1.weight", "markov_w1.weight" }, &f32_pool, &f32_len);
-            markov_rnn = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{ "dflare.rnn_proj.weight", "markov_head.rnn_proj.weight", "markov_rnn_proj.weight" }, mr * mr, &f32_pool, &f32_len);
-            markov_b1 = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{ "dflare.markov_b1", "markov_head.rnn_proj.bias", "markov_b1" }, mr, &f32_pool, &f32_len);
-            markov_w2 = try loadAmfTensorAsF32256(allocator, amf_file, &.{ "dflare.markov_w2.weight", "markov_head.hidden_out.weight", "markov_w2.weight" }, h * mr, &f32_pool, &f32_len);
-            markov_hidden_bias = try loadAmfTensorAsF32Opt256(allocator, amf_file, &.{"markov_head.hidden_out.bias"}, h, &f32_pool, &f32_len);
+            const w1e = findAnyEntry(amf_file, &.{ "dflare.markov_w1.weight", "markov_head.markov_w1.weight", "markov_w1.weight" }) orelse return error.MissingTensor;
+            const w1_elems = try entryElems(w1e);
+            if (w1_elems == mr * 2 * h) {
+                markov_w1_k = 2 * h;
+            } else if (w1_elems == mr * h) {
+                markov_w1_k = h;
+            } else {
+                return error.DimensionMismatch;
+            }
+            markov_w1_entry = w1e;
+            try planRawBytes(&weight_bytes, w1e, mr, markov_w1_k, true);
+
+            markov_rnn_entry = findAnyEntry(amf_file, &.{ "dflare.rnn_proj.weight", "markov_head.rnn_proj.weight", "markov_rnn_proj.weight" });
+            if (markov_rnn_entry) |e| try planRawBytes(&weight_bytes, e, mr, mr, false);
+
+            markov_b1_entry = findAnyEntry(amf_file, &.{ "dflare.markov_b1", "markov_head.rnn_proj.bias", "markov_b1" });
+            if (markov_b1_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, mr);
+
+            const w2e = findAnyEntry(amf_file, &.{ "dflare.markov_w2.weight", "markov_head.hidden_out.weight", "markov_w2.weight" }) orelse return error.MissingTensor;
+            markov_w2_entry = w2e;
+            try planRawBytes(&weight_bytes, w2e, h, mr, false);
+
+            markov_hidden_bias_entry = findAnyEntry(amf_file, &.{"markov_head.hidden_out.bias"});
+            if (markov_hidden_bias_entry) |e| _ = try planF32Bytes(&weight_bytes, &max_small_blob, e, h);
         }
 
-        const lm_head: LmHeadHook = lm_head_override orelse blk: {
-            if (markov_w2_vocab_bf16 != null) {
-                break :blk .{ .dense_f32 = &.{} };
-            }
-            const lm_w = try loadAmfTensorAsF32256(allocator, amf_file, &.{ "dflare.lm_head.weight", "output.weight", "lm_head.weight" }, v * h, &f32_pool, &f32_len);
-            break :blk .{ .dense_f32 = lm_w };
-        };
-
-        const owned_f32 = try allocator.alloc([]f32, f32_len);
-        errdefer allocator.free(owned_f32);
-        @memcpy(owned_f32, f32_pool[0..f32_len]);
-
-        const owned_u16 = try allocator.alloc([]u16, u16_len);
-        errdefer allocator.free(owned_u16);
-        @memcpy(owned_u16, u16_pool[0..u16_len]);
+        var lm_head_entry: ?*const amf.TensorEntry = null;
+        if (lm_head_override == null and markov_w2_vocab_entry == null) {
+            const lme = findAnyEntry(amf_file, &.{ "dflare.lm_head.weight", "output.weight", "lm_head.weight" }) orelse return error.MissingTensor;
+            lm_head_entry = lme;
+            try planRawBytes(&weight_bytes, lme, v, h, true);
+        }
 
         if (is_real_gru) {
             if (cfg.rope_theta <= 0.0) cfg.rope_theta = 1_000_000.0;
@@ -1831,53 +4744,207 @@ pub const LoadedDFlareBundle = struct {
             }
         }
 
+        // Single 16 KiB-aligned `WiredArena` for all draft weights (`0` per-tensor heap allocations).
+        const weight_cap = try page.alignUp(@max(weight_bytes, page.APPLE_PAGE_SIZE));
+        const wired_budget = budget_override orelse try defaultWiredBudget();
+        try wired_budget.checkPlan(weight_cap);
+        var weight_arena = try arena_mod.WiredArena.init(weight_cap, wired_budget);
+        errdefer weight_arena.deinit();
+
+        var empty_small_scratch: [0]u8 = .{};
+        const small_scratch: []u8 = if (max_small_blob > 0)
+            try allocator.alloc(u8, max_small_blob)
+        else
+            &empty_small_scratch;
+        defer if (max_small_blob > 0) allocator.free(small_scratch);
+
+        // Pass 2: pread directly into `weight_arena`.
+        var fc_raw: ?RawLinearMat = null;
+        var fuse_scalar: ?[]const f32 = null;
+        if (fc_entry_raw) |fe| {
+            fc_raw = try readRawEntryIntoArena(&weight_arena, amf_file, fe, h, cfg.num_target_taps * h, true);
+        } else if (fuse_scalar_entry) |fe| {
+            const vec = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, fe, fuse_scalar_elems);
+            const taps_us: usize = cfg.num_target_taps;
+            const n_rows: usize = vec.len / taps_us;
+            for (0..n_rows) |ri| {
+                const row = vec[ri * taps_us ..][0..taps_us];
+                var mx: f32 = -std.math.inf(f32);
+                for (row) |val| {
+                    if (val > mx) mx = val;
+                }
+                var sum: f32 = 0.0;
+                for (row) |*val| {
+                    val.* = @exp(val.* - mx);
+                    sum += val.*;
+                }
+                if (sum > 0.0) {
+                    const inv = 1.0 / sum;
+                    for (row) |*val| val.* *= inv;
+                }
+            }
+            fuse_scalar = vec;
+        } else if (has_ctx_mix) {
+            const rows: usize = @as(usize, cfg.num_layers) + 1;
+            const mix = try allocArenaSlice(f32, &weight_arena, rows * cfg.num_target_taps);
+            @memset(mix, 1.0 / @as(f32, @floatFromInt(cfg.num_target_taps)));
+            var ctx_tmp: [128]f32 = undefined;
+            for (0..cfg.num_layers) |l| {
+                if (layer_refs[l].ctx_mix) |ce| {
+                    const ce_elems = try entryElems(ce);
+                    if (ce_elems > ctx_tmp.len) return error.DimensionMismatch;
+                    try readF32EntryIntoSlice(small_scratch, amf_file, ce, ctx_tmp[0..ce_elems]);
+                    const ncopy = @min(ce_elems, @as(usize, cfg.num_target_taps));
+                    @memcpy(mix[l * cfg.num_target_taps ..][0..ncopy], ctx_tmp[0..ncopy]);
+                }
+            }
+            if (markov_ctx_mix_entry) |me| {
+                const me_elems = try entryElems(me);
+                if (me_elems > ctx_tmp.len) return error.DimensionMismatch;
+                try readF32EntryIntoSlice(small_scratch, amf_file, me, ctx_tmp[0..me_elems]);
+                const ncopy = @min(me_elems, @as(usize, cfg.num_target_taps));
+                @memcpy(mix[@as(usize, cfg.num_layers) * cfg.num_target_taps ..][0..ncopy], ctx_tmp[0..ncopy]);
+            }
+            fuse_scalar = mix;
+        }
+
+        const fc_norm = if (fc_norm_entry) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null;
+        const mask_embed = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, mask_entry, mask_elems);
+        const tok_embed_norm = if (tok_embed_norm_entry) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null;
+        const tok_embed_raw: ?RawLinearMat = if (tok_embed_entry) |te|
+            try readRawEntryIntoArena(&weight_arena, amf_file, te, v, h, true)
+        else
+            null;
+        const final_norm = if (final_norm_entry) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null;
+
+        const layers = try allocator.alloc(TransformerBlockWeights, cfg.num_layers);
+        errdefer allocator.free(layers);
+
+        for (0..cfg.num_layers) |l| {
+            const refs = layer_refs[l];
+            layers[l] = .{
+                .in_norm_weight = if (refs.in_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null,
+                .q_norm_weight = if (refs.q_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, cfg.head_dim) else null,
+                .k_norm_weight = if (refs.k_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, cfg.head_dim) else null,
+                .k_norm_ctx_weight = if (refs.k_norm_ctx) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, cfg.head_dim) else null,
+                .ctx_norm_weight = if (refs.ctx_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null,
+                .post_norm_weight = if (refs.post_norm) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null,
+                .q_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.q_proj, q_dim, h, false),
+                .k_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.k_proj, kv_dim, h, false),
+                .v_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.v_proj, kv_dim, h, false),
+                .o_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.o_proj, h, q_dim, false),
+                .k_proj_ctx_raw = if (refs.k_proj_ctx) |e| try readRawEntryIntoArena(&weight_arena, amf_file, e, kv_dim, h, false) else null,
+                .v_proj_ctx_raw = if (refs.v_proj_ctx) |e| try readRawEntryIntoArena(&weight_arena, amf_file, e, kv_dim, h, false) else null,
+                .mlp_gate_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.mlp_gate, inter, h, false),
+                .mlp_up_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.mlp_up, inter, h, false),
+                .mlp_down_raw = try readRawEntryIntoArena(&weight_arena, amf_file, refs.mlp_down, h, inter, false),
+            };
+        }
+
+        const markov_ctx_norm = if (markov_ctx_norm_entry) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null;
+        const markov_norm = if (markov_norm_entry) |e| try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h) else null;
+
+        var markov_w1_raw: ?RawLinearMat = null;
+        var markov_w1_vocab_raw: ?RawLinearMat = null;
+        var markov_gru_proj_raw: ?RawLinearMat = null;
+        var markov_gru_bias: ?[]const f32 = null;
+        var markov_rnn_proj_raw: ?RawLinearMat = null;
+        var markov_b1: ?[]const f32 = null;
+        var markov_w2_raw: ?RawLinearMat = null;
+        var markov_hidden_bias: ?[]const f32 = null;
+        var markov_w2_vocab_raw: ?RawLinearMat = null;
+        var markov_w2_vocab_bias: ?[]const f32 = null;
+
+        if (is_real_gru) {
+            markov_gru_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, gru_entry.?, 3 * mr, 2 * h + 2 * mr, false);
+            if (markov_gru_bias_entry) |e| markov_gru_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, 3 * mr);
+            markov_w1_vocab_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w1_vocab_entry.?, markov_w1_vocab_rows, mr, false);
+            if (markov_hidden_out_entry) |hoe| {
+                markov_w2_raw = try readRawEntryIntoArena(&weight_arena, amf_file, hoe, h, mr, false);
+                if (markov_hidden_bias_entry) |e| markov_hidden_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h);
+            } else if (markov_w2_vocab_entry) |w2e| {
+                markov_w2_vocab_raw = try readRawEntryIntoArena(&weight_arena, amf_file, w2e, markov_w2_vocab_rows, mr, false);
+                if (markov_w2_vocab_bias_entry) |e| markov_w2_vocab_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, markov_w2_vocab_rows);
+            }
+        } else {
+            markov_w1_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w1_entry.?, mr, markov_w1_k, true);
+            if (markov_rnn_entry) |e| markov_rnn_proj_raw = try readRawEntryIntoArena(&weight_arena, amf_file, e, mr, mr, false);
+            if (markov_b1_entry) |e| markov_b1 = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, mr);
+            markov_w2_raw = try readRawEntryIntoArena(&weight_arena, amf_file, markov_w2_entry.?, h, mr, false);
+            if (markov_hidden_bias_entry) |e| markov_hidden_bias = try readF32EntryIntoArena(&weight_arena, small_scratch, amf_file, e, h);
+        }
+
+        const lm_head_raw: ?RawLinearMat = if (lm_head_entry) |lme|
+            try readRawEntryIntoArena(&weight_arena, amf_file, lme, v, h, true)
+        else
+            null;
+        const lm_head: LmHeadHook = lm_head_override orelse .{ .dense_f32 = &.{} };
+
+        const owned_f32 = try allocator.alloc([]f32, 0);
+        errdefer allocator.free(owned_f32);
+        const owned_u16 = try allocator.alloc([]u16, 0);
+        errdefer allocator.free(owned_u16);
+
         var ws = try DFlareWorkspace.init(cfg, budget_override);
         errdefer ws.deinit();
 
         const weights: DFlareWeights = .{
-            .target_fusion_proj = fc,
+            .target_fusion_proj_raw = fc_raw,
             .fuse_scalar_weights = fuse_scalar,
             .target_fusion_norm = fc_norm,
             .mask_embed = mask_embed,
-            .tok_embed = tok_embed,
+            .tok_embed_raw = tok_embed_raw,
             .tok_embed_hook = tok_embed_override,
             .token_embd_norm = tok_embed_norm,
             .layers = layers,
             .final_norm = final_norm,
-            .markov_w1 = markov_w1,
-            .markov_w1_vocab_bf16 = markov_w1_vocab_bf16,
+            .markov_w1_raw = markov_w1_raw,
+            .markov_w1_vocab_raw = markov_w1_vocab_raw,
             .markov_w1_vocab_rows = markov_w1_vocab_rows,
-            .markov_gru_proj_bf16 = markov_gru_bf16,
-            .markov_gru_proj_f32 = markov_gru_f32,
+            .markov_gru_proj_raw = markov_gru_proj_raw,
             .markov_gru_bias = markov_gru_bias,
             .markov_ctx_norm = markov_ctx_norm,
-            .markov_rnn_proj = markov_rnn,
+            .markov_rnn_proj_raw = markov_rnn_proj_raw,
             .markov_b1 = markov_b1,
-            .markov_w2 = markov_w2,
+            .markov_w2_raw = markov_w2_raw,
             .markov_hidden_bias = markov_hidden_bias,
-            .markov_w2_vocab_bf16 = markov_w2_vocab_bf16,
+            .markov_w2_vocab_raw = markov_w2_vocab_raw,
             .markov_w2_vocab_bias = markov_w2_vocab_bias,
             .markov_w2_vocab_rows = markov_w2_vocab_rows,
             .markov_norm = markov_norm,
             .lm_head = lm_head,
+            .lm_head_raw = lm_head_raw,
+            .wired_arena_bytes = weight_arena.bytes(),
         };
 
         const bundle = try allocator.create(LoadedDFlareBundle);
         errdefer allocator.destroy(bundle);
 
         bundle.* = .{
+            .weight_arena = weight_arena,
             .owned_f32_bufs = owned_f32,
             .owned_u16_bufs = owned_u16,
             .layers = layers,
             .workspace = ws,
             .proposer = undefined,
         };
-        bundle.proposer = try DFlareProposer.init(cfg, weights, &bundle.workspace);
+        // Ownership of `weight_arena`, `layers`, `ws`, `owned_f32`, `owned_u16` moved into `bundle`.
+        bundle.proposer = DFlareProposer.init(cfg, weights, &bundle.workspace) catch |err| {
+            bundle.deinit(allocator);
+            return err;
+        };
         return bundle;
     }
 
+    pub fn totalWiredBytes(self: *const LoadedDFlareBundle) u64 {
+        const wa_bytes: u64 = if (self.weight_arena) |wa| @intCast(wa.bytes().len) else 0;
+        return self.workspace.totalWiredBytes() + wa_bytes;
+    }
+
     pub fn deinit(self: *LoadedDFlareBundle, allocator: std.mem.Allocator) void {
+        self.proposer.detachGpu();
         self.workspace.deinit();
+        if (self.weight_arena) |*wa| wa.deinit();
         allocator.free(self.layers);
         for (self.owned_f32_bufs) |b| allocator.free(b);
         allocator.free(self.owned_f32_bufs);
@@ -2381,7 +5448,7 @@ pub const DFly2Proposer = struct {
         );
 
         // 1. `mtp_fusion`: concat(RMSNorm(tok_embed[root]), RMSNorm(last_target_hidden)) -> fused_hidden.
-        const root_e = try resolveTokEmbed(self.weights.tok_embed, self.weights.tok_embed_hook, root_token, h, self.workspace.tok_embed_tmp);
+        const root_e = try resolveTokEmbed(self.weights.tok_embed, null, self.weights.tok_embed_hook, root_token, h, self.workspace.tok_embed_tmp);
         @memcpy(self.workspace.mtp_concat[0..h], root_e);
         @memcpy(self.workspace.mtp_concat[h .. 2 * h], last_target_hidden);
         applyRmsNormInPlace(self.workspace.mtp_concat[0..h], self.weights.mtp_enorm_weight, self.config.rms_eps);
@@ -2453,6 +5520,7 @@ pub const DFly2Proposer = struct {
                 0,
                 null,
                 null,
+                null,
             );
         }
 
@@ -2490,11 +5558,13 @@ pub const DFly2Proposer = struct {
             const logits = self.workspace.logits_buf[0 .. act_usize * v];
             try evalLmHead(
                 self.weights.lm_head,
+                null,
                 self.workspace.slot_hiddens[0 .. act_usize * h],
                 active_steps,
                 self.config.hidden_size,
                 self.config.vocab_size,
                 logits,
+                null,
             );
 
             const inv_temp: f32 = 1.0 / self.config.temperature;
@@ -3018,6 +6088,7 @@ fn runTransformerBlock(
     anchor_pos: u32,
     ctx_k_f16: ?[]const f16,
     ctx_v_f16: ?[]const f16,
+    quant_row_scratch: ?[]f32,
 ) Error!void {
     if (layer.mla) |mla| {
         try runMlaTransformerBlock(
@@ -3048,6 +6119,8 @@ fn runTransformerBlock(
     const inv_sqrt_hd: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const total_kv = ctx_len + seq_len;
     if (attn_scores.len < total_kv) return error.BufferTooSmall;
+    var empty_row_scratch: [0]f32 = .{};
+    const scratch: []f32 = quant_row_scratch orelse &empty_row_scratch;
 
     for (0..seq_len) |pos| {
         const src = hiddens[pos * hidden_size ..][0..hidden_size];
@@ -3055,21 +6128,9 @@ fn runTransformerBlock(
         @memcpy(dst, src);
         applyRmsNormInPlace(dst, layer.in_norm_weight, rms_eps);
 
-        if (layer.q_proj_bf16) |qb| {
-            matVecBf16(qb, dst, q_dim, hidden_size, q_buf[pos * q_dim ..][0..q_dim]);
-        } else {
-            matVecF32(layer.q_proj, dst, q_dim, hidden_size, q_buf[pos * q_dim ..][0..q_dim]);
-        }
-        if (layer.k_proj_bf16) |kb| {
-            matVecBf16(kb, dst, kv_dim, hidden_size, k_buf[pos * kv_dim ..][0..kv_dim]);
-        } else {
-            matVecF32(layer.k_proj, dst, kv_dim, hidden_size, k_buf[pos * kv_dim ..][0..kv_dim]);
-        }
-        if (layer.v_proj_bf16) |vb| {
-            matVecBf16(vb, dst, kv_dim, hidden_size, v_buf[pos * kv_dim ..][0..kv_dim]);
-        } else {
-            matVecF32(layer.v_proj, dst, kv_dim, hidden_size, v_buf[pos * kv_dim ..][0..kv_dim]);
-        }
+        matVecLayer(layer.q_proj, layer.q_proj_bf16, layer.q_proj_raw, dst, q_dim, hidden_size, q_buf[pos * q_dim ..][0..q_dim], false, scratch);
+        matVecLayer(layer.k_proj, layer.k_proj_bf16, layer.k_proj_raw, dst, kv_dim, hidden_size, k_buf[pos * kv_dim ..][0..kv_dim], false, scratch);
+        matVecLayer(layer.v_proj, layer.v_proj_bf16, layer.v_proj_raw, dst, kv_dim, hidden_size, v_buf[pos * kv_dim ..][0..kv_dim], false, scratch);
 
         if (layer.q_norm_weight) |qn| {
             applyHeadRmsNorm(q_buf[pos * q_dim ..][0..q_dim], num_heads, head_dim, qn, rms_eps);
@@ -3153,11 +6214,7 @@ fn runTransformerBlock(
 
         // Residual connection after attention projection.
         const h_row = hiddens[q_pos * hidden_size ..][0..hidden_size];
-        if (layer.o_proj_bf16) |ob| {
-            matVecBf16Accum(ob, out_row, hidden_size, q_dim, h_row);
-        } else {
-            matVecAccumF32(layer.o_proj, out_row, hidden_size, q_dim, h_row);
-        }
+        matVecLayer(layer.o_proj, layer.o_proj_bf16, layer.o_proj_raw, out_row, hidden_size, q_dim, h_row, true, scratch);
     }
 
     // SwiGLU MLP + residual add across all block slots.
@@ -3169,25 +6226,13 @@ fn runTransformerBlock(
 
         const g_row = mlp_gate[pos * intermediate_size ..][0..intermediate_size];
         const u_row = mlp_up[pos * intermediate_size ..][0..intermediate_size];
-        if (layer.mlp_gate_bf16) |gb| {
-            matVecBf16(gb, norm_row, intermediate_size, hidden_size, g_row);
-        } else {
-            matVecF32(layer.mlp_gate_proj, norm_row, intermediate_size, hidden_size, g_row);
-        }
-        if (layer.mlp_up_bf16) |ub| {
-            matVecBf16(ub, norm_row, intermediate_size, hidden_size, u_row);
-        } else {
-            matVecF32(layer.mlp_up_proj, norm_row, intermediate_size, hidden_size, u_row);
-        }
+        matVecLayer(layer.mlp_gate_proj, layer.mlp_gate_bf16, layer.mlp_gate_raw, norm_row, intermediate_size, hidden_size, g_row, false, scratch);
+        matVecLayer(layer.mlp_up_proj, layer.mlp_up_bf16, layer.mlp_up_raw, norm_row, intermediate_size, hidden_size, u_row, false, scratch);
         for (0..intermediate_size) |i| {
             g_row[i] = siluF32(g_row[i]) * u_row[i];
         }
         const d_row = mlp_down[pos * hidden_size ..][0..hidden_size];
-        if (layer.mlp_down_bf16) |db| {
-            matVecBf16(db, g_row, hidden_size, intermediate_size, d_row);
-        } else {
-            matVecF32(layer.mlp_down_proj, g_row, hidden_size, intermediate_size, d_row);
-        }
+        matVecLayer(layer.mlp_down_proj, layer.mlp_down_bf16, layer.mlp_down_raw, g_row, hidden_size, intermediate_size, d_row, false, scratch);
         for (0..hidden_size) |d| h_row[d] += d_row[d];
     }
 }
@@ -3360,14 +6405,26 @@ fn runMlaTransformerBlock(
 
 fn evalLmHead(
     hook: LmHeadHook,
+    lm_head_raw: ?RawLinearMat,
     hiddens: []const f32,
     batch_rows: u8,
     hidden_size: u32,
     vocab_size: u32,
     out_logits: []f32,
+    row_scratch: ?[]f32,
 ) Error!void {
     const h: usize = hidden_size;
     const v: usize = vocab_size;
+    if (!hasLmHeadHook(hook)) {
+        if (lm_head_raw) |lhr| {
+            var empty_row_scratch: [0]f32 = .{};
+            const scratch: []f32 = row_scratch orelse &empty_row_scratch;
+            for (0..batch_rows) |s| {
+                matVecRaw(lhr, hiddens[s * h ..][0..h], v, h, out_logits[s * v ..][0..v], false, scratch);
+            }
+            return;
+        }
+    }
     switch (hook) {
         .dense_f32 => |mat| {
             for (0..batch_rows) |s| {
@@ -3648,6 +6705,7 @@ fn mixScalarTaps(weights: []const f32, taps_flat: []const f32, num_taps: usize, 
 
 fn resolveTokEmbed(
     tok_embed: []const f32,
+    tok_embed_raw: ?RawLinearMat,
     hook_opt: ?TokEmbedHook,
     token_id: u32,
     h: usize,
@@ -3665,6 +6723,11 @@ fn resolveTokEmbed(
                 return scratch[0..h];
             },
         }
+    }
+    if (tok_embed_raw) |tr| {
+        if (token_id >= tr.n) return error.TokenOutOfRange;
+        try readRawRowF32(tr, token_id, scratch[0..h]);
+        return scratch[0..h];
     }
     const off = @as(usize, token_id) * h;
     if (off + h > tok_embed.len) return error.TokenOutOfRange;
@@ -4014,6 +7077,533 @@ fn loadLayerBf16Opt(
     return vec;
 }
 
+fn collectMissingQfSpec(
+    borrowed: ?*const quant_formats.QuantFormatPipelines,
+    out_specs: *[quant_formats.ALL_FORMAT_SPECS.len]quant_formats.FormatSpec,
+    out_len: *usize,
+    raw_opt: ?RawLinearMat,
+) Error!void {
+    const r = raw_opt orelse return;
+    return collectMissingQfSpecDType(borrowed, out_specs, out_len, r.amf_dtype, r.group_size);
+}
+
+fn collectMissingQfSpecDType(
+    borrowed: ?*const quant_formats.QuantFormatPipelines,
+    out_specs: *[quant_formats.ALL_FORMAT_SPECS.len]quant_formats.FormatSpec,
+    out_len: *usize,
+    amf_dtype: amf.DType,
+    group_size: u16,
+) Error!void {
+    if (!dequant.usesQuantFormats(amf_dtype, group_size)) return;
+    const qf_dt = quant_formats.DType.fromAmf(amf_dtype) orelse return error.InvalidWeights;
+    const eff_gs = qf_dt.effectiveGroupSize(group_size);
+    if (borrowed) |bp| {
+        if (bp.pipelineFor(qf_dt, eff_gs, .gemv) != null) return;
+    }
+    for (out_specs[0..out_len.*]) |existing| {
+        if (existing.dtype == qf_dt and existing.group_size == eff_gs) return;
+    }
+    if (out_len.* >= out_specs.len) return error.Overflow;
+    out_specs[out_len.*] = .{ .dtype = qf_dt, .group_size = eff_gs };
+    out_len.* += 1;
+}
+
+fn isSubSliceOfWired(wired_opt: ?[]align(page.APPLE_PAGE_SIZE) u8, bytes: []const u8) bool {
+    const w = wired_opt orelse return false;
+    if (bytes.len == 0) return false;
+    const w_start = @intFromPtr(w.ptr);
+    const w_end = w_start + w.len;
+    const b_start = @intFromPtr(bytes.ptr);
+    const b_end = b_start + bytes.len;
+    return b_start >= w_start and b_end <= w_end;
+}
+
+fn stageMeasureSlice(wired_opt: ?[]align(page.APPLE_PAGE_SIZE) u8, bytes: []const u8) usize {
+    if (bytes.len == 0 or isSubSliceOfWired(wired_opt, bytes)) return 0;
+    return alignUp64(bytes.len) catch std.math.maxInt(usize) / 2;
+}
+
+fn stageMeasureRaw(wired_opt: ?[]align(page.APPLE_PAGE_SIZE) u8, r: RawLinearMat) usize {
+    const d_sz = stageMeasureSlice(wired_opt, r.data);
+    const p_sz = if (r.params.len > 0) stageMeasureSlice(wired_opt, r.params) else 0;
+    return d_sz + p_sz;
+}
+
+fn stageMeasureLayerProj(
+    wired_opt: ?[]align(page.APPLE_PAGE_SIZE) u8,
+    f32_s: []const f32,
+    bf16_opt: ?[]const u16,
+    raw_opt: ?RawLinearMat,
+) usize {
+    if (raw_opt) |r| return stageMeasureRaw(wired_opt, r);
+    if (bf16_opt) |b| return stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(b));
+    if (f32_s.len > 0) return stageMeasureSlice(wired_opt, std.mem.sliceAsBytes(f32_s));
+    return 0;
+}
+
+fn appendUniqueResident(arr: *[32]metal.Buffer, count: *usize, buf: metal.Buffer) void {
+    for (arr[0..count.*]) |existing| {
+        if (existing.handle == buf.handle) return;
+    }
+    if (count.* < arr.len) {
+        arr[count.*] = buf;
+        count.* += 1;
+    }
+}
+
+const BindHelper = struct {
+    wired: ?[]align(page.APPLE_PAGE_SIZE) u8,
+    weight_buf: ?metal.Buffer,
+    st_arena: ?*arena_mod.WiredArena,
+    st_buf: ?metal.Buffer,
+
+    fn bindSlice(self: BindHelper, bytes: []const u8) Error!metal.BufferBinding {
+        if (bytes.len == 0) return error.InvalidWeights;
+        if (isSubSliceOfWired(self.wired, bytes)) {
+            const wb = self.weight_buf orelse return error.InvalidWeights;
+            const off = @intFromPtr(bytes.ptr) - @intFromPtr(self.wired.?.ptr);
+            return .{ .buffer = wb, .offset = off };
+        }
+        const sa = self.st_arena orelse return error.InvalidWeights;
+        const sb = self.st_buf orelse return error.InvalidWeights;
+        const dst = try sa.allocAligned(bytes.len, CACHELINE_ALIGN);
+        @memcpy(dst, bytes);
+        return .{ .buffer = sb, .offset = sa.offsetOf(dst.ptr) };
+    }
+
+    fn bindRaw(self: BindHelper, r: RawLinearMat) Error!GpuLinearBinding {
+        const wb = try self.bindSlice(r.data);
+        const pb: ?metal.BufferBinding = if (r.params.len > 0) try self.bindSlice(r.params) else null;
+        return .{
+            .amf_dtype = r.amf_dtype,
+            .group_size = r.group_size,
+            .tensor_scale_per_row = r.tensor_scale_per_row,
+            .weight = wb,
+            .params = pb,
+            .n = r.n,
+            .k = r.k,
+        };
+    }
+
+    fn bindF32Mat(self: BindHelper, slice: []const f32, n: usize, k: usize) Error!GpuLinearBinding {
+        if (slice.len != n * k) return error.InvalidWeights;
+        return .{
+            .amf_dtype = .f32,
+            .group_size = 64,
+            .weight = try self.bindSlice(std.mem.sliceAsBytes(slice)),
+            .n = @intCast(n),
+            .k = @intCast(k),
+        };
+    }
+
+    fn bindBf16Mat(self: BindHelper, slice: []const u16, n: usize, k: usize) Error!GpuLinearBinding {
+        if (slice.len != n * k) return error.InvalidWeights;
+        return .{
+            .amf_dtype = .bf16,
+            .group_size = 64,
+            .weight = try self.bindSlice(std.mem.sliceAsBytes(slice)),
+            .n = @intCast(n),
+            .k = @intCast(k),
+        };
+    }
+
+    fn bindLayerProj(
+        self: BindHelper,
+        f32_s: []const f32,
+        bf16_opt: ?[]const u16,
+        raw_opt: ?RawLinearMat,
+        n: usize,
+        k: usize,
+    ) Error!GpuLinearBinding {
+        if (raw_opt) |r| {
+            if (!r.matches(n, k)) return error.InvalidWeights;
+            return self.bindRaw(r);
+        }
+        if (bf16_opt) |b| return self.bindBf16Mat(b, n, k);
+        if (f32_s.len == 0) return error.InvalidWeights;
+        return self.bindF32Mat(f32_s, n, k);
+    }
+
+    fn bindLayerProjOpt(
+        self: BindHelper,
+        f32_opt: ?[]const f32,
+        bf16_opt: ?[]const u16,
+        raw_opt: ?RawLinearMat,
+        n: usize,
+        k: usize,
+    ) Error!?GpuLinearBinding {
+        const f32_len: usize = if (f32_opt) |s| s.len else 0;
+        if (raw_opt == null and bf16_opt == null and f32_len == 0) return null;
+        return try self.bindLayerProj(f32_opt orelse &.{}, bf16_opt, raw_opt, n, k);
+    }
+};
+
+fn readRawRowF32(raw: RawLinearMat, row: usize, out_f32: []f32) Error!void {
+    const cols: usize = raw.k;
+    if (row >= raw.n or out_f32.len < cols) return error.DimensionMismatch;
+    switch (raw.amf_dtype) {
+        .f32 => {
+            const byte_off = row * cols * 4;
+            if (byte_off + cols * 4 > raw.data.len) return error.InvalidWeights;
+            const row_bytes = raw.data[byte_off..][0 .. cols * 4];
+            for (0..cols) |c| {
+                out_f32[c] = @bitCast(std.mem.readInt(u32, row_bytes[c * 4 ..][0..4], .little));
+            }
+        },
+        .f16 => {
+            const byte_off = row * cols * 2;
+            if (byte_off + cols * 2 > raw.data.len) return error.InvalidWeights;
+            const row_bytes = raw.data[byte_off..][0 .. cols * 2];
+            for (0..cols) |c| {
+                out_f32[c] = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, row_bytes[c * 2 ..][0..2], .little))));
+            }
+        },
+        .bf16 => {
+            const byte_off = row * cols * 2;
+            if (byte_off + cols * 2 > raw.data.len) return error.InvalidWeights;
+            const row_bytes = raw.data[byte_off..][0 .. cols * 2];
+            for (0..cols) |c| {
+                out_f32[c] = quant.bf16ToF32(std.mem.readInt(u16, row_bytes[c * 2 ..][0..2], .little));
+            }
+        },
+        else => {
+            const qf_dt = quant_formats.DType.fromAmf(raw.amf_dtype) orelse return error.InvalidWeights;
+            quant_formats.dequantRowCpuRef(qf_dt, raw.group_size, raw.data, raw.params, row, raw.n, cols, out_f32[0..cols]) catch return error.InvalidWeights;
+        },
+    }
+}
+
+fn matVecRaw(
+    raw: RawLinearMat,
+    vec: []const f32,
+    rows: usize,
+    cols: usize,
+    out: []f32,
+    accum: bool,
+    row_scratch: []f32,
+) void {
+    switch (raw.amf_dtype) {
+        .f32 => {
+            if (@intFromPtr(raw.data.ptr) % @alignOf(f32) == 0) {
+                const mat: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, raw.data[0 .. rows * cols * 4]));
+                if (accum) {
+                    matVecAccumF32(mat, vec, rows, cols, out);
+                } else {
+                    matVecF32(mat, vec, rows, cols, out);
+                }
+                return;
+            }
+            for (0..rows) |r| {
+                const row_bytes = raw.data[r * cols * 4 ..][0 .. cols * 4];
+                var acc: f32 = 0.0;
+                for (0..cols) |c| {
+                    const wf: f32 = @bitCast(std.mem.readInt(u32, row_bytes[c * 4 ..][0..4], .little));
+                    acc += wf * vec[c];
+                }
+                if (accum) out[r] += acc else out[r] = acc;
+            }
+        },
+        .bf16 => {
+            if (@intFromPtr(raw.data.ptr) % @alignOf(u16) == 0) {
+                const mat: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, raw.data[0 .. rows * cols * 2]));
+                if (accum) {
+                    matVecBf16Accum(mat, vec, rows, cols, out);
+                } else {
+                    matVecBf16(mat, vec, rows, cols, out);
+                }
+                return;
+            }
+            for (0..rows) |r| {
+                const row_bytes = raw.data[r * cols * 2 ..][0 .. cols * 2];
+                var acc: f32 = 0.0;
+                for (0..cols) |c| {
+                    acc += quant.bf16ToF32(std.mem.readInt(u16, row_bytes[c * 2 ..][0..2], .little)) * vec[c];
+                }
+                if (accum) out[r] += acc else out[r] = acc;
+            }
+        },
+        .f16 => {
+            for (0..rows) |r| {
+                const row_bytes = raw.data[r * cols * 2 ..][0 .. cols * 2];
+                var acc: f32 = 0.0;
+                for (0..cols) |c| {
+                    const wf: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, row_bytes[c * 2 ..][0..2], .little))));
+                    acc += wf * vec[c];
+                }
+                if (accum) out[r] += acc else out[r] = acc;
+            }
+        },
+        else => {
+            const qf_dt = quant_formats.DType.fromAmf(raw.amf_dtype) orelse std.debug.panic("matVecRaw unsupported amf_dtype={s}", .{@tagName(raw.amf_dtype)});
+            if (row_scratch.len < cols) std.debug.panic("matVecRaw scratch too small: {} < {}", .{ row_scratch.len, cols });
+            const scratch = row_scratch[0..cols];
+            for (0..rows) |r| {
+                quant_formats.dequantRowCpuRef(qf_dt, raw.group_size, raw.data, raw.params, r, rows, cols, scratch) catch |err| {
+                    std.debug.panic("matVecRaw dequant failed: {}", .{err});
+                };
+                var acc: f32 = 0.0;
+                for (0..cols) |c| acc += scratch[c] * vec[c];
+                if (accum) out[r] += acc else out[r] = acc;
+            }
+        },
+    }
+}
+
+fn matVecLayer(
+    f32_w: []const f32,
+    bf16_w: ?[]const u16,
+    raw_w: ?RawLinearMat,
+    vec: []const f32,
+    rows: usize,
+    cols: usize,
+    out: []f32,
+    accum: bool,
+    row_scratch: []f32,
+) void {
+    if (raw_w) |rw| {
+        matVecRaw(rw, vec, rows, cols, out, accum, row_scratch);
+        return;
+    }
+    if (bf16_w) |bw| {
+        if (accum) {
+            matVecBf16Accum(bw, vec, rows, cols, out);
+        } else {
+            matVecBf16(bw, vec, rows, cols, out);
+        }
+        return;
+    }
+    if (accum) {
+        matVecAccumF32(f32_w, vec, rows, cols, out);
+    } else {
+        matVecF32(f32_w, vec, rows, cols, out);
+    }
+}
+
+fn entryElems(entry: *const amf.TensorEntry) LoadedDFlareBundle.LoadError!usize {
+    var elems: usize = 1;
+    for (0..entry.rank) |d| {
+        elems = std.math.mul(usize, elems, entry.shape[d]) catch return error.Overflow;
+    }
+    return elems;
+}
+
+fn validateRawShapeAndType(
+    entry: *const amf.TensorEntry,
+    expected_n: usize,
+    expected_k: usize,
+    allow_rank1: bool,
+) LoadedDFlareBundle.LoadError!usize {
+    const dt = try entry.dataType();
+    if (entry.rank == 2) {
+        if (entry.shape[0] != expected_n or entry.shape[1] != expected_k) return error.DimensionMismatch;
+    } else if (entry.rank == 1 and allow_rank1) {
+        const elems = try entryElems(entry);
+        if (elems != expected_n * expected_k) return error.DimensionMismatch;
+    } else {
+        return error.DimensionMismatch;
+    }
+    const gs: u16 = if (entry.group_size > 0) entry.group_size else 64;
+    switch (dt) {
+        .f32 => {
+            const need = expected_n * expected_k * 4;
+            if (entry.data_bytes < need or entry.blob_bytes < need) return error.InvalidWeights;
+        },
+        .f16, .bf16 => {
+            const need = expected_n * expected_k * 2;
+            if (entry.data_bytes < need or entry.blob_bytes < need) return error.InvalidWeights;
+        },
+        else => {
+            const qf_dt = quant_formats.DType.fromAmf(dt) orelse return error.InvalidWeights;
+            qf_dt.validateShape(@intCast(expected_n), @intCast(expected_k), gs) catch return error.DimensionMismatch;
+            const wb = qf_dt.packedWeightBytes(@intCast(expected_n), @intCast(expected_k), gs) catch return error.InvalidWeights;
+            const pb = qf_dt.paramsBytes(@intCast(expected_n), @intCast(expected_k), gs) catch return error.InvalidWeights;
+            if (entry.data_bytes < wb or entry.blob_bytes < entry.data_bytes) return error.InvalidWeights;
+            if (pb > 0 and (entry.params_bytes < pb or entry.params_offset + entry.params_bytes > entry.blob_bytes)) return error.InvalidWeights;
+        },
+    }
+    const payload_end: u64 = if (entry.params_bytes > 0)
+        @max(entry.data_bytes, entry.params_offset + entry.params_bytes)
+    else
+        entry.data_bytes;
+    if (payload_end > entry.blob_bytes) return error.InvalidWeights;
+    return @intCast(payload_end);
+}
+
+fn planRawBytes(
+    total_bytes: *usize,
+    entry: *const amf.TensorEntry,
+    expected_n: usize,
+    expected_k: usize,
+    allow_rank1: bool,
+) LoadedDFlareBundle.LoadError!void {
+    const payload_len = try validateRawShapeAndType(entry, expected_n, expected_k, allow_rank1);
+    const aligned = try alignUp64(payload_len);
+    total_bytes.* = std.math.add(usize, total_bytes.*, aligned) catch return error.Overflow;
+}
+
+fn planF32Bytes(
+    total_bytes: *usize,
+    max_small_blob: *usize,
+    entry: *const amf.TensorEntry,
+    expected_elems: ?usize,
+) LoadedDFlareBundle.LoadError!usize {
+    const dt = try entry.dataType();
+    const elems = try entryElems(entry);
+    if (expected_elems) |ee| {
+        if (elems != ee) return error.DimensionMismatch;
+    }
+    switch (dt) {
+        .f32 => if (entry.data_bytes < elems * 4) return error.InvalidWeights,
+        .f16, .bf16 => if (entry.data_bytes < elems * 2) return error.InvalidWeights,
+        else => {
+            if (quant_formats.DType.fromAmf(dt) == null) return error.InvalidWeights;
+        },
+    }
+    const blob_len: usize = @intCast(entry.blob_bytes);
+    max_small_blob.* = @max(max_small_blob.*, blob_len);
+    const aligned = try alignUp64(std.math.mul(usize, elems, @sizeOf(f32)) catch return error.Overflow);
+    total_bytes.* = std.math.add(usize, total_bytes.*, aligned) catch return error.Overflow;
+    return elems;
+}
+
+fn preadExact(fd: @FieldType(amf.AmfFile, "fd"), dst: []u8, file_off: u64) LoadedDFlareBundle.LoadError!void {
+    var done: usize = 0;
+    while (done < dst.len) {
+        const rc = std.c.pread(fd, dst.ptr + done, dst.len - done, @intCast(file_off + done));
+        if (rc < 0) {
+            if (std.c.errno(rc) == .INTR) continue;
+            return error.ReadFailed;
+        }
+        if (rc == 0) return error.ShortRead;
+        done += @intCast(rc);
+    }
+}
+
+fn verifyTrailingCrc(
+    fd: @FieldType(amf.AmfFile, "fd"),
+    hasher: *std.hash.Crc32,
+    entry: *const amf.TensorEntry,
+    payload_len: usize,
+) LoadedDFlareBundle.LoadError!void {
+    const blob_len: usize = @intCast(entry.blob_bytes);
+    var rem: usize = blob_len - payload_len;
+    var off: u64 = entry.blob_offset + payload_len;
+    var tail_buf: [4096]u8 = undefined;
+    while (rem > 0) {
+        const chunk = @min(rem, tail_buf.len);
+        try preadExact(fd, tail_buf[0..chunk], off);
+        hasher.update(tail_buf[0..chunk]);
+        off += chunk;
+        rem -= chunk;
+    }
+    if (hasher.final() != entry.blob_crc32) return error.BlobChecksumMismatch;
+}
+
+fn readRawEntryIntoArena(
+    arena: *arena_mod.WiredArena,
+    amf_file: *const amf.AmfFile,
+    entry: *const amf.TensorEntry,
+    expected_n: usize,
+    expected_k: usize,
+    allow_rank1: bool,
+) LoadedDFlareBundle.LoadError!RawLinearMat {
+    const dt = try entry.dataType();
+    const payload_len = try validateRawShapeAndType(entry, expected_n, expected_k, allow_rank1);
+    const dst = try allocArenaSlice(u8, arena, payload_len);
+    try preadExact(amf_file.fd, dst, entry.blob_offset);
+    var hasher = std.hash.Crc32.init();
+    hasher.update(dst);
+    try verifyTrailingCrc(amf_file.fd, &hasher, entry, payload_len);
+
+    const data_len: usize = @intCast(entry.data_bytes);
+    const params: []const u8 = if (entry.params_bytes > 0 and entry.params_offset + entry.params_bytes <= dst.len)
+        dst[@intCast(entry.params_offset)..][0..@intCast(entry.params_bytes)]
+    else
+        &.{};
+    const gs: u16 = if (entry.group_size > 0) entry.group_size else 64;
+    return .{
+        .data = dst[0..data_len],
+        .params = params,
+        .amf_dtype = dt,
+        .group_size = gs,
+        .tensor_scale_per_row = dequant.isTensorScalePerRow(dt, @intCast(expected_n), @intCast(params.len)),
+        .n = @intCast(expected_n),
+        .k = @intCast(expected_k),
+    };
+}
+
+fn decodeBlobToF32(
+    dt: amf.DType,
+    entry: *const amf.TensorEntry,
+    raw: []const u8,
+    out: []f32,
+) LoadedDFlareBundle.LoadError!void {
+    const elems = out.len;
+    switch (dt) {
+        .f32 => {
+            if (entry.data_bytes < elems * 4) return error.InvalidWeights;
+            for (0..elems) |i| {
+                out[i] = @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little));
+            }
+        },
+        .f16 => {
+            if (entry.data_bytes < elems * 2) return error.InvalidWeights;
+            for (0..elems) |i| {
+                out[i] = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, raw[i * 2 ..][0..2], .little))));
+            }
+        },
+        .bf16 => {
+            if (entry.data_bytes < elems * 2) return error.InvalidWeights;
+            for (0..elems) |i| {
+                out[i] = quant.bf16ToF32(std.mem.readInt(u16, raw[i * 2 ..][0..2], .little));
+            }
+        },
+        else => {
+            const qf_dt = quant_formats.DType.fromAmf(dt) orelse return error.InvalidWeights;
+            const rows: usize = entry.shape[0];
+            const cols: usize = if (entry.rank >= 2) entry.shape[1] else 1;
+            if (rows * cols != elems) return error.InvalidWeights;
+            const gs: u16 = if (entry.group_size > 0) entry.group_size else 64;
+            const params_slice: []const u8 = if (entry.params_offset > 0 and entry.params_offset <= raw.len)
+                raw[@intCast(entry.params_offset)..]
+            else
+                &.{};
+            for (0..rows) |r| {
+                quant_formats.dequantRowCpuRef(qf_dt, gs, raw, params_slice, r, rows, cols, out[r * cols ..][0..cols]) catch return error.InvalidWeights;
+            }
+        },
+    }
+}
+
+fn readF32EntryIntoSlice(
+    scratch_buf: []u8,
+    amf_file: *const amf.AmfFile,
+    entry: *const amf.TensorEntry,
+    out: []f32,
+) LoadedDFlareBundle.LoadError!void {
+    const dt = try entry.dataType();
+    const blob_len: usize = @intCast(entry.blob_bytes);
+    if (scratch_buf.len < blob_len) return error.BufferTooSmall;
+    const raw = scratch_buf[0..blob_len];
+    try preadExact(amf_file.fd, raw, entry.blob_offset);
+    if (std.hash.Crc32.hash(raw) != entry.blob_crc32) return error.BlobChecksumMismatch;
+    try decodeBlobToF32(dt, entry, raw, out);
+}
+
+fn readF32EntryIntoArena(
+    arena: *arena_mod.WiredArena,
+    scratch_buf: []u8,
+    amf_file: *const amf.AmfFile,
+    entry: *const amf.TensorEntry,
+    expected_elems: usize,
+) LoadedDFlareBundle.LoadError![]f32 {
+    const elems = try entryElems(entry);
+    if (elems != expected_elems) return error.DimensionMismatch;
+    const out = try allocArenaSlice(f32, arena, elems);
+    try readF32EntryIntoSlice(scratch_buf, amf_file, entry, out);
+    return out;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -4206,7 +7796,8 @@ fn writeSyntheticDFlareAmf(
         next_off += blob_bytes;
     }
 
-    const image = try allocator.alloc(u8, next_off);
+    const total_size = try page.alignUp(next_off);
+    const image = try allocator.alloc(u8, total_size);
     errdefer allocator.free(image);
     @memset(image, 0);
     for (0..count) |i| {
@@ -4636,4 +8227,935 @@ test "D14 DFly2Proposer (5L, block_size=7) consumes dfly_target_kv_layers + hidd
     );
     try std.testing.expect(pruned.kept_nodes <= 5);
     try verifyTreeInvariants(CandidateTree.capacity, &tree);
+}
+
+const TypedAmfItem = struct {
+    name: [64]u8 = @splat(0),
+    name_len: usize = 0,
+    blob: []u8,
+    data_bytes: u64,
+    dtype: amf.DType,
+    quant_bits: u8 = 0,
+    group_size: u16 = 0,
+    shape: [4]u32,
+    rank: u8,
+    kind: amf.TensorKind,
+};
+
+fn fillDetWeight(dst: []f32, seed: u64, scale: f32) void {
+    var st = seed;
+    for (dst) |*v| {
+        st = st *% 6364136223846793005 +% 1442695040888963407;
+        const bits: i32 = @as(i32, @intCast((st >> 40) & 0xFF)) - 128;
+        v.* = @as(f32, @floatFromInt(bits)) * (scale / 128.0);
+    }
+}
+
+fn fillDetNorm(dst: []f32, seed: u64) void {
+    var st = seed;
+    for (dst) |*v| {
+        st = st *% 6364136223846793005 +% 1442695040888963407;
+        const frac = @as(f32, @floatFromInt((st >> 40) & 0xFF)) / 255.0;
+        v.* = 0.85 + 0.3 * frac;
+    }
+}
+
+fn pushTypedF32(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(TypedAmfItem),
+    nm: []const u8,
+    vals: []const f32,
+    s0: u32,
+    s1: u32,
+    rank: u8,
+    kind: amf.TensorKind,
+) !void {
+    const data_bytes = vals.len * 4;
+    const blob = try allocator.alloc(u8, try page.alignUp(@max(data_bytes, page.APPLE_PAGE_SIZE)));
+    errdefer allocator.free(blob);
+    @memset(blob, 0);
+    for (vals, 0..) |val, i| {
+        std.mem.writeInt(u32, blob[i * 4 ..][0..4], @bitCast(val), .little);
+    }
+    var it: TypedAmfItem = .{
+        .blob = blob,
+        .data_bytes = data_bytes,
+        .dtype = .f32,
+        .quant_bits = 0,
+        .group_size = 0,
+        .shape = .{ s0, s1, 0, 0 },
+        .rank = rank,
+        .kind = kind,
+    };
+    @memcpy(it.name[0..nm.len], nm);
+    it.name_len = nm.len;
+    try items.append(allocator, it);
+}
+
+fn pushTypedBf16(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(TypedAmfItem),
+    nm: []const u8,
+    vals: []const f32,
+    s0: u32,
+    s1: u32,
+    rank: u8,
+    kind: amf.TensorKind,
+) !void {
+    const data_bytes = vals.len * 2;
+    const blob = try allocator.alloc(u8, try page.alignUp(@max(data_bytes, page.APPLE_PAGE_SIZE)));
+    errdefer allocator.free(blob);
+    @memset(blob, 0);
+    for (vals, 0..) |val, i| {
+        const b16: u16 = @truncate(@as(u32, @bitCast(val)) >> 16);
+        std.mem.writeInt(u16, blob[i * 2 ..][0..2], b16, .little);
+    }
+    var it: TypedAmfItem = .{
+        .blob = blob,
+        .data_bytes = data_bytes,
+        .dtype = .bf16,
+        .quant_bits = 0,
+        .group_size = 0,
+        .shape = .{ s0, s1, 0, 0 },
+        .rank = rank,
+        .kind = kind,
+    };
+    @memcpy(it.name[0..nm.len], nm);
+    it.name_len = nm.len;
+    try items.append(allocator, it);
+}
+
+fn pushTypedF16(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(TypedAmfItem),
+    nm: []const u8,
+    vals: []const f32,
+    s0: u32,
+    s1: u32,
+    rank: u8,
+    kind: amf.TensorKind,
+) !void {
+    const data_bytes = vals.len * 2;
+    const blob = try allocator.alloc(u8, try page.alignUp(@max(data_bytes, page.APPLE_PAGE_SIZE)));
+    errdefer allocator.free(blob);
+    @memset(blob, 0);
+    for (vals, 0..) |val, i| {
+        const h16: u16 = @bitCast(@as(f16, @floatCast(val)));
+        std.mem.writeInt(u16, blob[i * 2 ..][0..2], h16, .little);
+    }
+    var it: TypedAmfItem = .{
+        .blob = blob,
+        .data_bytes = data_bytes,
+        .dtype = .f16,
+        .quant_bits = 0,
+        .group_size = 0,
+        .shape = .{ s0, s1, 0, 0 },
+        .rank = rank,
+        .kind = kind,
+    };
+    @memcpy(it.name[0..nm.len], nm);
+    it.name_len = nm.len;
+    try items.append(allocator, it);
+}
+
+fn pushTypedGgufQ8_0(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(TypedAmfItem),
+    nm: []const u8,
+    vals: []const f32,
+    rows: u32,
+    cols: u32,
+    kind: amf.TensorKind,
+) !void {
+    std.debug.assert(cols % 32 == 0 and vals.len == @as(usize, rows) * cols);
+    const blocks_per_row = cols / 32;
+    const data_bytes: usize = @as(usize, rows) * blocks_per_row * 34;
+    const blob = try allocator.alloc(u8, try page.alignUp(@max(data_bytes, page.APPLE_PAGE_SIZE)));
+    errdefer allocator.free(blob);
+    @memset(blob, 0);
+    for (0..rows) |r| {
+        for (0..blocks_per_row) |b| {
+            const src_blk = vals[r * cols + b * 32 ..][0..32];
+            var max_abs: f32 = 0.0;
+            for (src_blk) |x| max_abs = @max(max_abs, @abs(x));
+            const scale_f32: f32 = if (max_abs > 0.0) max_abs / 127.0 else 1.0 / 127.0;
+            const scale_f16: f16 = @floatCast(scale_f32);
+            const eff_scale: f32 = @floatCast(scale_f16);
+            const dst_blk = blob[(r * blocks_per_row + b) * 34 ..][0..34];
+            std.mem.writeInt(u16, dst_blk[0..2], @bitCast(scale_f16), .little);
+            for (0..32) |j| {
+                const q_f = if (eff_scale > 0.0) std.math.round(src_blk[j] / eff_scale) else 0.0;
+                const q_i8: i8 = @intFromFloat(std.math.clamp(q_f, -127.0, 127.0));
+                dst_blk[2 + j] = @bitCast(q_i8);
+            }
+        }
+    }
+    var it: TypedAmfItem = .{
+        .blob = blob,
+        .data_bytes = data_bytes,
+        .dtype = .gguf_q8_0,
+        .quant_bits = 8,
+        .group_size = 32,
+        .shape = .{ rows, cols, 0, 0 },
+        .rank = 2,
+        .kind = kind,
+    };
+    @memcpy(it.name[0..nm.len], nm);
+    it.name_len = nm.len;
+    try items.append(allocator, it);
+}
+
+fn assembleTypedAmf(allocator: std.mem.Allocator, items: []const TypedAmfItem) ![]u8 {
+    const dir_offset: usize = page.APPLE_PAGE_SIZE;
+    const dir_raw = items.len * @sizeOf(amf.TensorEntry);
+    const dir_bytes = try page.alignUp(dir_raw);
+
+    const entries = try allocator.alloc(amf.TensorEntry, items.len);
+    defer allocator.free(entries);
+
+    var next_off: usize = dir_offset + dir_bytes;
+    for (items, 0..) |it, i| {
+        var e = amf.TensorEntry.zeroed(it.name[0..it.name_len], it.kind, it.dtype);
+        e.rank = it.rank;
+        e.shape = it.shape;
+        e.quant_bits = it.quant_bits;
+        e.group_size = it.group_size;
+        e.data_bytes = it.data_bytes;
+        e.blob_offset = next_off;
+        e.blob_bytes = it.blob.len;
+        e.blob_crc32 = std.hash.Crc32.hash(it.blob);
+        entries[i] = e;
+        next_off += it.blob.len;
+    }
+
+    const total_size = try page.alignUp(next_off);
+    const image = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(image);
+    @memset(image, 0);
+    for (items, 0..) |it, i| {
+        @memcpy(image[dir_offset + i * @sizeOf(amf.TensorEntry) ..][0..@sizeOf(amf.TensorEntry)], std.mem.asBytes(&entries[i]));
+        @memcpy(image[@intCast(entries[i].blob_offset)..][0..it.blob.len], it.blob);
+    }
+    var hdr: amf.Header = .{
+        .magic = amf.MAGIC,
+        .version = amf.FORMAT_VERSION,
+        .flags = 0,
+        .page_size = page.APPLE_PAGE_SIZE,
+        .checksum_algo = amf.CHECKSUM_CRC32_IEEE,
+        .tensor_count = @intCast(items.len),
+        .reserved0 = 0,
+        .directory_offset = dir_offset,
+        .directory_bytes = dir_bytes,
+        .directory_crc32 = std.hash.Crc32.hash(image[dir_offset..][0..dir_raw]),
+        .header_crc32 = 0,
+        .model_id = @splat(0),
+        .reserved1 = 0,
+    };
+    const model_name = "synthetic-d16-gpu";
+    @memcpy(hdr.model_id[0..model_name.len], model_name);
+    hdr.header_crc32 = amf.computeHeaderCrc32(&hdr);
+    @memcpy(image[0..@sizeOf(amf.Header)], std.mem.asBytes(&hdr));
+    return image;
+}
+
+test "D16 Metal 4 GPU 3L DFlare (bf16 + f16 + 3-gate GRU + fuse_weight + GpuTargetTaps + GpuContextHistory) parity and zero steady-state malloc" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+
+    const h: usize = 64;
+    const inter: usize = 128;
+    const nh: u32 = 4;
+    const nkvh: u32 = 2;
+    const hd: u32 = 16;
+    const q_dim: usize = @as(usize, nh) * hd;
+    const kv_dim: usize = @as(usize, nkvh) * hd;
+    const mr: usize = 32;
+    const v: usize = 48;
+    const taps: usize = 4;
+    const w: u8 = 8;
+
+    const cfg: DFlareConfig = .{
+        .variant = .inkling2_mini_3l,
+        .num_layers = 3,
+        .block_size = w,
+        .top_k_per_pos = 1,
+        .max_tree_nodes = 16,
+        .hidden_size = @intCast(h),
+        .intermediate_size = @intCast(inter),
+        .num_attention_heads = nh,
+        .num_key_value_heads = nkvh,
+        .head_dim = hd,
+        .vocab_size = @intCast(v),
+        .markov_rank = @intCast(mr),
+        .num_target_taps = @intCast(taps),
+        .rms_eps = 1e-5,
+        .rope_theta = 10_000.0,
+    };
+
+    var items: std.ArrayListUnmanaged(TypedAmfItem) = .empty;
+    defer {
+        for (items.items) |it| gpa.free(it.blob);
+        items.deinit(gpa);
+    }
+
+    const scratch = try gpa.alloc(f32, @max(v * h, 3 * mr * (2 * h + 2 * mr)));
+    defer gpa.free(scratch);
+
+    // Pre-softmax `fuse_weight [4, 4]` (BF16).
+    const fuse_w = scratch[0 .. (cfg.num_layers + 1) * taps];
+    fillDetWeight(fuse_w, 101, 1.5);
+    try pushTypedBf16(gpa, &items, "fuse_weight", fuse_w, cfg.num_layers + 1, @intCast(taps), 2, .norm);
+
+    const mask_w = scratch[0 .. (w - 1) * h];
+    fillDetWeight(mask_w, 102, 0.25);
+    try pushTypedBf16(gpa, &items, "dflare.mask_embed.weight", mask_w, w - 1, @intCast(h), 2, .embedding);
+
+    const tok_w = scratch[0 .. v * h];
+    fillDetWeight(tok_w, 103, 0.35);
+    try pushTypedBf16(gpa, &items, "dflare.tok_embed.weight", tok_w, @intCast(v), @intCast(h), 2, .embedding);
+
+    const norm_h = scratch[0..h];
+    fillDetNorm(norm_h, 104);
+    try pushTypedBf16(gpa, &items, "fc_norm.weight", norm_h, @intCast(h), 0, 1, .norm);
+    fillDetNorm(norm_h, 105);
+    try pushTypedBf16(gpa, &items, "dflare.norm.weight", norm_h, @intCast(h), 0, 1, .norm);
+    fillDetNorm(norm_h, 106);
+    try pushTypedBf16(gpa, &items, "markov_head.dflare_norm.weight", norm_h, @intCast(h), 0, 1, .norm);
+    fillDetNorm(norm_h, 107);
+    try pushTypedBf16(gpa, &items, "dflare.markov_norm.weight", norm_h, @intCast(h), 0, 1, .norm);
+
+    var nbuf: [64]u8 = undefined;
+    for (0..cfg.num_layers) |l| {
+        const sbase: u64 = 1000 + l * 100;
+        fillDetNorm(scratch[0..h], sbase + 1);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.input_layernorm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..h], sbase + 2);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.post_attention_layernorm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..h], sbase + 3);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.dflare_norm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 4);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_norm.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 5);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_norm.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 6);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_norm_ctx.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+
+        fillDetWeight(scratch[0 .. q_dim * h], sbase + 10, 0.12);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj.weight", .{l}), scratch[0 .. q_dim * h], @intCast(q_dim), @intCast(h), 2, .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 11, 0.12);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), 2, .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 12, 0.12);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), 2, .dense);
+        fillDetWeight(scratch[0 .. h * q_dim], sbase + 13, 0.12);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj.weight", .{l}), scratch[0 .. h * q_dim], @intCast(h), @intCast(q_dim), 2, .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 14, 0.12);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj_ctx.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), 2, .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 15, 0.12);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj_ctx.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), 2, .dense);
+
+        fillDetWeight(scratch[0 .. inter * h], sbase + 20, 0.10);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj.weight", .{l}), scratch[0 .. inter * h], @intCast(inter), @intCast(h), 2, .dense);
+        fillDetWeight(scratch[0 .. inter * h], sbase + 21, 0.10);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj.weight", .{l}), scratch[0 .. inter * h], @intCast(inter), @intCast(h), 2, .dense);
+        fillDetWeight(scratch[0 .. h * inter], sbase + 22, 0.10);
+        try pushTypedBf16(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj.weight", .{l}), scratch[0 .. h * inter], @intCast(h), @intCast(inter), 2, .dense);
+    }
+
+    const joint_in = 2 * h + 2 * mr;
+    fillDetWeight(scratch[0 .. 3 * mr * joint_in], 501, 0.14);
+    try pushTypedBf16(gpa, &items, "markov_head.rnn_proj.weight", scratch[0 .. 3 * mr * joint_in], @intCast(3 * mr), @intCast(joint_in), 2, .dense);
+    fillDetWeight(scratch[0 .. 3 * mr], 502, 0.08);
+    try pushTypedBf16(gpa, &items, "markov_head.rnn_proj.bias", scratch[0 .. 3 * mr], @intCast(3 * mr), 0, 1, .norm);
+    fillDetWeight(scratch[0 .. v * mr], 503, 0.25);
+    try pushTypedBf16(gpa, &items, "markov_head.markov_w1.weight", scratch[0 .. v * mr], @intCast(v), @intCast(mr), 2, .dense);
+    fillDetWeight(scratch[0 .. h * mr], 504, 0.22);
+    try pushTypedBf16(gpa, &items, "markov_head.hidden_out.weight", scratch[0 .. h * mr], @intCast(h), @intCast(mr), 2, .dense);
+    fillDetWeight(scratch[0..h], 505, 0.05);
+    try pushTypedBf16(gpa, &items, "markov_head.hidden_out.bias", scratch[0..h], @intCast(h), 0, 1, .norm);
+
+    // Distinct diagonal boost on `f16` `lm_head` so greedy argmax has clear margins > FP16 noise.
+    fillDetWeight(scratch[0 .. v * h], 506, 0.18);
+    for (0..v) |tok| scratch[tok * h + (tok % h)] += 0.35;
+    try pushTypedF16(gpa, &items, "dflare.lm_head.weight", scratch[0 .. v * h], @intCast(v), @intCast(h), 2, .lm_head);
+
+    const img = try assembleTypedAmf(gpa, items.items);
+    defer gpa.free(img);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dflare-3l-d16.amf", .data = img });
+    var p_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p_raw = try std.fmt.bufPrint(p_buf[0 .. p_buf.len - 1], ".zig-cache/tmp/{s}/dflare-3l-d16.amf", .{tmp.sub_path});
+    p_buf[p_raw.len] = 0;
+
+    const bundle_cpu = try LoadedDFlareBundle.loadFromAmfFile(gpa, p_buf[0..p_raw.len :0], cfg, null, null);
+    defer bundle_cpu.deinit(gpa);
+    const bundle_gpu = try LoadedDFlareBundle.loadFromAmfFile(gpa, p_buf[0..p_raw.len :0], cfg, null, null);
+    defer bundle_gpu.deinit(gpa);
+
+    try bundle_gpu.proposer.attachGpu(.{ .device = device, .library = library });
+    const gctx = bundle_gpu.proposer.gpu_ctx orelse return error.InvalidWeights;
+    try std.testing.expect(gctx.weight_buf != null);
+    try std.testing.expect(gctx.staging_buf == null); // 0-byte staging copy!
+
+    // Prepare host & GPU context tap history (len grows 2 -> 5 -> 7 across 3 rounds).
+    const max_hist: usize = 7;
+    var hist_f32: [max_hist * taps * h]f32 = undefined;
+    fillDetWeight(&hist_f32, 701, 0.45);
+    const hist_cap: usize = 8;
+    const tap_arena_bytes = try page.alignUp(hist_cap * taps * h * @sizeOf(f16) + taps * h * @sizeOf(f16));
+    var tap_arena = try arena_mod.WiredArena.init(tap_arena_bytes, testBudget(tap_arena_bytes + page.APPLE_PAGE_SIZE));
+    defer tap_arena.deinit();
+    const ring_f16 = try allocArenaSlice(f16, &tap_arena, hist_cap * taps * h);
+    const step_taps_f16 = try allocArenaSlice(f16, &tap_arena, taps * h);
+    for (hist_f32, 0..) |val, i| ring_f16[i] = @floatCast(val);
+    const tap_buf = try metal.Buffer.wrap(device, tap_arena.bytes());
+    defer tap_buf.close();
+
+    const HistBox = struct {
+        data: []const f32,
+        len: u32 = 2,
+        epoch: u64 = 1,
+        fn read(raw_ctx: *const anyopaque, out_len: *u32, out_epoch: *u64, pos: u32, tap_idx: usize, dst: []f32) bool {
+            const box: *const @This() = @ptrCast(@alignCast(raw_ctx));
+            out_len.* = box.len;
+            out_epoch.* = box.epoch;
+            if (dst.len == 0) return true;
+            if (pos >= box.len or tap_idx >= taps or dst.len < h) return false;
+            @memcpy(dst[0..h], box.data[(@as(usize, pos) * taps + tap_idx) * h ..][0..h]);
+            return true;
+        }
+    };
+    var hbox: HistBox = .{ .data = &hist_f32 };
+    var tok_f32: [v * h]f32 = undefined;
+    for (0..v) |ti| {
+        const raw = bundle_cpu.proposer.weights.tok_embed_raw.?;
+        try readRawRowF32(raw, ti, tok_f32[ti * h ..][0..h]);
+    }
+    const DualCtx = struct {
+        tbl: []const f32,
+        hist: *const HistBox,
+        fn readTok(c: ?*anyopaque, tok_id: u32, dst: []f32) Error!void {
+            const dc: *@This() = @ptrCast(@alignCast(c.?));
+            if (tok_id >= v) return error.TokenOutOfRange;
+            @memcpy(dst[0..h], dc.tbl[@as(usize, tok_id) * h ..][0..h]);
+        }
+        fn readHist(c: *const anyopaque, out_len: *u32, out_epoch: *u64, pos: u32, tap_idx: usize, dst: []f32) bool {
+            const dc: *const @This() = @ptrCast(@alignCast(c));
+            return HistBox.read(dc.hist, out_len, out_epoch, pos, tap_idx, dst);
+        }
+    };
+    var dual_ctx: DualCtx = .{ .tbl = &tok_f32, .hist = &hbox };
+    registerContextHistoryProvider(&dual_ctx, DualCtx.readHist);
+    defer unregisterContextHistoryProvider(&dual_ctx);
+    bundle_cpu.proposer.weights.tok_embed_hook = .{ .callback = .{ .ctx = &dual_ctx, .read_fn = DualCtx.readTok } };
+    bundle_gpu.proposer.weights.tok_embed_hook = .{ .callback = .{ .ctx = &dual_ctx, .read_fn = DualCtx.readTok } };
+
+    var cpu_tree: CandidateTree = undefined;
+    var gpu_tree: CandidateTree = undefined;
+    const round_lens = [_]u32{ 2, 3, 5, 7 };
+    var gpu_taps_views: [taps]metal.BufferBinding = undefined;
+    for (0..taps) |ti| {
+        gpu_taps_views[ti] = .{
+            .buffer = tap_buf,
+            .offset = tap_arena.offsetOf(std.mem.sliceAsBytes(step_taps_f16[ti * h ..][0..h]).ptr),
+        };
+    }
+
+    var warm_gpu_blocks: i64 = 0;
+    for (round_lens, 0..) |cur_len, ri| {
+        hbox.len = cur_len;
+        const pos_off = (cur_len - 1) * taps * h;
+        var tap_slices: [taps][]const f32 = undefined;
+        for (0..taps) |ti| {
+            tap_slices[ti] = hist_f32[pos_off + ti * h ..][0..h];
+            for (0..h) |d| step_taps_f16[ti * h + d] = @floatCast(tap_slices[ti][d]);
+        }
+
+        const root_tok: u32 = @intCast((ri * 5 + 3) % v);
+        const cpu_snap0 = try vmstat.Snapshot.capture();
+        const cpu_res = try bundle_cpu.proposer.propose(root_tok, &tap_slices, null, &cpu_tree);
+        const cpu_delta = vmstat.heapDelta(cpu_snap0, try vmstat.Snapshot.capture());
+
+        const snap_before = try vmstat.Snapshot.capture();
+        const gpu_res = try bundle_gpu.proposer.proposeWithGpuTaps(
+            root_tok,
+            .{ .dtype = .f16, .taps = &gpu_taps_views },
+            .{
+                .taps_ring = .{ .buffer = tap_buf, .offset = tap_arena.offsetOf(std.mem.sliceAsBytes(ring_f16).ptr) },
+                .dtype = .f16,
+                .cap = hist_cap,
+                .len = cur_len,
+                .epoch = 1,
+            },
+            null,
+            &gpu_tree,
+        );
+        const gpu_delta = vmstat.heapDelta(snap_before, try vmstat.Snapshot.capture());
+        if (std.c.getenv("MTL_DEBUG_LAYER") == null and std.c.getenv("MTL_SHADER_VALIDATION") == null) {
+            try std.testing.expect(cpu_delta.blocks_in_use <= 0);
+            if (ri == 2) {
+                warm_gpu_blocks = gpu_delta.blocks_in_use;
+                try std.testing.expect(warm_gpu_blocks <= 8);
+            } else if (ri >= 3) {
+                // O(1) constant Metal 4 runtime submit record only; 0 per-dispatch or Zig heap growth.
+                try std.testing.expect(gpu_delta.blocks_in_use <= warm_gpu_blocks);
+            }
+        }
+
+        try std.testing.expectEqual(@as(u64, 1), gpu_res.backbone_runs);
+        try std.testing.expectEqual(cpu_res.tree_nodes, gpu_res.tree_nodes);
+        try std.testing.expectEqual(cur_len, bundle_gpu.proposer.ctx_cache_len);
+        for (0..cpu_tree.count) |ni| {
+            try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
+            try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
+        }
+    }
+
+    // Verify multi-branch `top_k = 2` GPU tree expansion + hidden-state parity on host-tap path.
+    var cfg_k2 = cfg;
+    cfg_k2.top_k_per_pos = 2;
+    const bundle_cpu_k2 = try LoadedDFlareBundle.loadFromAmfFile(gpa, p_buf[0..p_raw.len :0], cfg_k2, null, null);
+    defer bundle_cpu_k2.deinit(gpa);
+    const bundle_gpu_k2 = try LoadedDFlareBundle.loadFromAmfFile(gpa, p_buf[0..p_raw.len :0], cfg_k2, null, null);
+    defer bundle_gpu_k2.deinit(gpa);
+    try bundle_gpu_k2.proposer.attachGpu(.{ .device = device, .library = library });
+    bundle_cpu_k2.proposer.weights.tok_embed_hook = .{ .callback = .{ .ctx = &dual_ctx, .read_fn = DualCtx.readTok } };
+    bundle_gpu_k2.proposer.weights.tok_embed_hook = .{ .callback = .{ .ctx = &dual_ctx, .read_fn = DualCtx.readTok } };
+    hbox.epoch = 2;
+    hbox.len = 4;
+    var tap_slices_k2: [taps][]const f32 = undefined;
+    for (0..taps) |ti| tap_slices_k2[ti] = hist_f32[3 * taps * h + ti * h ..][0..h];
+    _ = try bundle_cpu_k2.proposer.propose(7, &tap_slices_k2, null, &cpu_tree);
+    _ = try bundle_gpu_k2.proposer.propose(7, &tap_slices_k2, null, &gpu_tree);
+    try std.testing.expectEqual(cpu_tree.count, gpu_tree.count);
+    for (0..cpu_tree.count) |ni| {
+        try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
+        try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
+    }
+    // Check backbone hidden state parity (`slot_hiddens` max abs diff < 1e-2) via `runBlockBackboneOnceGpuTaps`.
+    try bundle_cpu_k2.proposer.runBlockBackboneOnceForRoot(7, &tap_slices_k2);
+    try bundle_gpu_k2.proposer.runBlockBackboneOnceGpuTaps(
+        7,
+        .{ .dtype = .f16, .taps = &gpu_taps_views },
+        .{
+            .taps_ring = .{ .buffer = tap_buf, .offset = tap_arena.offsetOf(std.mem.sliceAsBytes(ring_f16).ptr) },
+            .dtype = .f16,
+            .cap = hist_cap,
+            .len = 4,
+            .epoch = 2,
+        },
+    );
+    var max_h_diff: f32 = 0.0;
+    for (bundle_cpu_k2.proposer.workspace.slot_hiddens[0 .. w * h], bundle_gpu_k2.proposer.workspace.slot_hiddens[0 .. w * h]) |a, b| {
+        max_h_diff = @max(max_h_diff, @abs(a - b));
+    }
+    try std.testing.expect(max_h_diff < 1e-2);
+}
+
+test "D16 Metal 4 GPU arch=dflash (gguf_q8_0 layers + markov_w2_vocab + final_logit_softcapping + target_lm_head GPU binding) parity" {
+    const gpa = std.testing.allocator;
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+
+    const h: usize = 64;
+    const inter: usize = 128;
+    const nh: u32 = 4;
+    const nkvh: u32 = 2;
+    const hd: u32 = 16;
+    const q_dim: usize = @as(usize, nh) * hd;
+    const kv_dim: usize = @as(usize, nkvh) * hd;
+    const mr: usize = 32;
+    const v: usize = 48;
+    const unpadded_v: usize = 40;
+    const taps: usize = 4;
+    const w: u8 = 8;
+
+    const cfg: DFlareConfig = .{
+        .variant = .dflash_standalone,
+        .num_layers = 3,
+        .block_size = w,
+        .top_k_per_pos = 1,
+        .max_tree_nodes = 16,
+        .hidden_size = @intCast(h),
+        .intermediate_size = @intCast(inter),
+        .num_attention_heads = nh,
+        .num_key_value_heads = nkvh,
+        .head_dim = hd,
+        .vocab_size = @intCast(v),
+        .unpadded_vocab_size = @intCast(unpadded_v),
+        .final_logit_softcapping = 30.0,
+        .markov_rank = @intCast(mr),
+        .num_target_taps = @intCast(taps),
+        .rms_eps = 1e-5,
+        .rope_theta = 1_000_000.0,
+    };
+
+    var items: std.ArrayListUnmanaged(TypedAmfItem) = .empty;
+    defer {
+        for (items.items) |it| gpa.free(it.blob);
+        items.deinit(gpa);
+    }
+
+    const scratch = try gpa.alloc(f32, @max(v * h, 3 * mr * (2 * h + 2 * mr)));
+    defer gpa.free(scratch);
+
+    const mask_w = scratch[0 .. (w - 1) * h];
+    fillDetWeight(mask_w, 202, 0.25);
+    try pushTypedF32(gpa, &items, "mask_embd.weight", mask_w, w - 1, @intCast(h), 2, .embedding);
+
+    const tok_w = scratch[0 .. v * h];
+    fillDetWeight(tok_w, 203, 0.35);
+    try pushTypedF16(gpa, &items, "token_embd.weight", tok_w, @intCast(v), @intCast(h), 2, .embedding);
+
+    fillDetNorm(scratch[0..h], 204);
+    try pushTypedF32(gpa, &items, "token_embd_norm.weight", scratch[0..h], @intCast(h), 0, 1, .norm);
+    fillDetNorm(scratch[0..h], 205);
+    try pushTypedF32(gpa, &items, "output_norm.weight", scratch[0..h], @intCast(h), 0, 1, .norm);
+    fillDetNorm(scratch[0..h], 206);
+    try pushTypedF32(gpa, &items, "markov_ctx_norm.weight", scratch[0..h], @intCast(h), 0, 1, .norm);
+    fillDetNorm(scratch[0..h], 207);
+    try pushTypedF32(gpa, &items, "markov_norm.weight", scratch[0..h], @intCast(h), 0, 1, .norm);
+
+    var nbuf: [64]u8 = undefined;
+    for (0..cfg.num_layers) |l| {
+        const sbase: u64 = 2000 + l * 100;
+        fillDetWeight(scratch[0..taps], sbase + 0, 0.5);
+        for (scratch[0..taps]) |*val| val.* = 0.25 + 0.1 * @abs(val.*);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.ctx_mix.weight", .{l}), scratch[0..taps], @intCast(taps), 0, 1, .norm);
+        fillDetNorm(scratch[0..h], sbase + 1);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_norm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..h], sbase + 2);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.ffn_norm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..h], sbase + 3);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.ctx_norm.weight", .{l}), scratch[0..h], @intCast(h), 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 4);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_q_norm.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 5);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_k_norm.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+        fillDetNorm(scratch[0..hd], sbase + 6);
+        try pushTypedF32(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.attn_k_ctx_norm.weight", .{l}), scratch[0..hd], hd, 0, 1, .norm);
+
+        fillDetWeight(scratch[0 .. q_dim * h], sbase + 10, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.q_proj.weight", .{l}), scratch[0 .. q_dim * h], @intCast(q_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 11, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 12, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. h * q_dim], sbase + 13, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.o_proj.weight", .{l}), scratch[0 .. h * q_dim], @intCast(h), @intCast(q_dim), .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 14, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.k_proj_ctx.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. kv_dim * h], sbase + 15, 0.12);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.self_attn.v_proj_ctx.weight", .{l}), scratch[0 .. kv_dim * h], @intCast(kv_dim), @intCast(h), .dense);
+
+        fillDetWeight(scratch[0 .. inter * h], sbase + 20, 0.10);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.gate_proj.weight", .{l}), scratch[0 .. inter * h], @intCast(inter), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. inter * h], sbase + 21, 0.10);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.up_proj.weight", .{l}), scratch[0 .. inter * h], @intCast(inter), @intCast(h), .dense);
+        fillDetWeight(scratch[0 .. h * inter], sbase + 22, 0.10);
+        try pushTypedGgufQ8_0(gpa, &items, try std.fmt.bufPrint(&nbuf, "layers.{d}.mlp.down_proj.weight", .{l}), scratch[0 .. h * inter], @intCast(h), @intCast(inter), .dense);
+    }
+    fillDetWeight(scratch[0..taps], 2399, 0.5);
+    for (scratch[0..taps]) |*val| val.* = 0.25 + 0.1 * @abs(val.*);
+    try pushTypedF32(gpa, &items, "markov_ctx_mix.weight", scratch[0..taps], @intCast(taps), 0, 1, .norm);
+
+    const joint_in = 2 * h + 2 * mr;
+    fillDetWeight(scratch[0 .. 3 * mr * joint_in], 601, 0.14);
+    try pushTypedBf16(gpa, &items, "joint_proj.weight", scratch[0 .. 3 * mr * joint_in], @intCast(3 * mr), @intCast(joint_in), 2, .dense);
+    fillDetWeight(scratch[0 .. 3 * mr], 602, 0.08);
+    try pushTypedF32(gpa, &items, "joint_proj.bias", scratch[0 .. 3 * mr], @intCast(3 * mr), 0, 1, .norm);
+    fillDetWeight(scratch[0 .. v * mr], 603, 0.22);
+    try pushTypedBf16(gpa, &items, "markov_w1.weight", scratch[0 .. v * mr], @intCast(v), @intCast(mr), 2, .dense);
+    fillDetWeight(scratch[0 .. unpadded_v * mr], 604, 0.25);
+    for (0..unpadded_v) |tok| scratch[tok * mr + (tok % mr)] += 0.45;
+    try pushTypedBf16(gpa, &items, "markov_w2.weight", scratch[0 .. unpadded_v * mr], @intCast(unpadded_v), @intCast(mr), 2, .dense);
+    fillDetWeight(scratch[0..unpadded_v], 605, 0.10);
+    try pushTypedF32(gpa, &items, "markov_w2.bias", scratch[0..unpadded_v], @intCast(unpadded_v), 0, 1, .norm);
+
+    const img = try assembleTypedAmf(gpa, items.items);
+    defer gpa.free(img);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dflash-q8-d16.amf", .data = img });
+    var p_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p_raw = try std.fmt.bufPrint(p_buf[0 .. p_buf.len - 1], ".zig-cache/tmp/{s}/dflash-q8-d16.amf", .{tmp.sub_path});
+    p_buf[p_raw.len] = 0;
+
+    // External target `lm_head [v, h]` shared cleanly as BF16 on GPU and F32 on CPU.
+    const tgt_arena_bytes = try page.alignUp(v * h * @sizeOf(u16) + 8 * taps * h * @sizeOf(f16) + taps * h * @sizeOf(f16));
+    var ext_arena = try arena_mod.WiredArena.init(tgt_arena_bytes, testBudget(tgt_arena_bytes + page.APPLE_PAGE_SIZE));
+    defer ext_arena.deinit();
+    const lm_bf16 = try allocArenaSlice(u16, &ext_arena, v * h);
+    var lm_f32: [v * h]f32 = undefined;
+    fillDetWeight(&lm_f32, 606, 0.16);
+    for (0..v) |tok| lm_f32[tok * h + (tok % h)] += 0.30;
+    for (lm_f32, 0..) |fv, i| lm_bf16[i] = @truncate(@as(u32, @bitCast(fv)) >> 16);
+
+    const hist_cap: usize = 8;
+    const ring_f16 = try allocArenaSlice(f16, &ext_arena, hist_cap * taps * h);
+    const step_taps_f16 = try allocArenaSlice(f16, &ext_arena, taps * h);
+    var hist_f32: [6 * taps * h]f32 = undefined;
+    fillDetWeight(&hist_f32, 709, 0.40);
+    for (hist_f32, 0..) |val, i| ring_f16[i] = @floatCast(val);
+
+    const ext_buf = try metal.Buffer.wrap(device, ext_arena.bytes());
+    defer ext_buf.close();
+
+    const bundle_cpu = try LoadedDFlareBundle.loadFromAmfFile(gpa, p_buf[0..p_raw.len :0], cfg, .{ .dense_f32 = &lm_f32 }, null);
+    defer bundle_cpu.deinit(gpa);
+    const bundle_gpu = try LoadedDFlareBundle.loadFromAmfFile(gpa, p_buf[0..p_raw.len :0], cfg, null, null);
+    defer bundle_gpu.deinit(gpa);
+
+    try bundle_gpu.proposer.attachGpu(.{
+        .device = device,
+        .library = library,
+        .target_lm_head = .{
+            .amf_dtype = .bf16,
+            .weight = .{ .buffer = ext_buf, .offset = ext_arena.offsetOf(std.mem.sliceAsBytes(lm_bf16).ptr) },
+            .n = @intCast(v),
+            .k = @intCast(h),
+        },
+    });
+    const gctx = bundle_gpu.proposer.gpu_ctx orelse return error.InvalidWeights;
+    try std.testing.expect(gctx.weight_buf != null);
+    try std.testing.expect(gctx.staging_buf == null);
+
+    var tok_f32: [v * h]f32 = undefined;
+    for (0..v) |ti| {
+        try readRawRowF32(bundle_cpu.proposer.weights.tok_embed_raw.?, ti, tok_f32[ti * h ..][0..h]);
+    }
+    const CpuDualCtx = struct {
+        tbl: []const f32,
+        norm: ?[]const f32,
+        eps: f32,
+        hist: []const f32,
+        len: u32 = 2,
+        fn readTok(c: ?*anyopaque, tok_id: u32, dst: []f32) Error!void {
+            const dc: *@This() = @ptrCast(@alignCast(c.?));
+            if (tok_id >= v) return error.TokenOutOfRange;
+            @memcpy(dst[0..h], dc.tbl[@as(usize, tok_id) * h ..][0..h]);
+            if (dc.norm) |nw| applyRmsNormInPlace(dst[0..h], nw, dc.eps);
+        }
+        fn readHist(c: *const anyopaque, out_len: *u32, out_epoch: *u64, pos: u32, tap_idx: usize, dst: []f32) bool {
+            const dc: *const @This() = @ptrCast(@alignCast(c));
+            out_len.* = dc.len;
+            out_epoch.* = 1;
+            if (dst.len == 0) return true;
+            if (pos >= dc.len or tap_idx >= taps or dst.len < h) return false;
+            @memcpy(dst[0..h], dc.hist[(@as(usize, pos) * taps + tap_idx) * h ..][0..h]);
+            return true;
+        }
+    };
+    var dual_ctx: CpuDualCtx = .{
+        .tbl = &tok_f32,
+        .norm = bundle_cpu.proposer.weights.token_embd_norm,
+        .eps = cfg.rms_eps,
+        .hist = &hist_f32,
+    };
+    registerContextHistoryProvider(&dual_ctx, CpuDualCtx.readHist);
+    defer unregisterContextHistoryProvider(&dual_ctx);
+    bundle_cpu.proposer.weights.tok_embed_hook = .{ .callback = .{ .ctx = &dual_ctx, .read_fn = CpuDualCtx.readTok } };
+
+    var gpu_taps_views: [taps]metal.BufferBinding = undefined;
+    for (0..taps) |ti| {
+        gpu_taps_views[ti] = .{
+            .buffer = ext_buf,
+            .offset = ext_arena.offsetOf(std.mem.sliceAsBytes(step_taps_f16[ti * h ..][0..h]).ptr),
+        };
+    }
+
+    var cpu_tree: CandidateTree = undefined;
+    var gpu_tree: CandidateTree = undefined;
+    const round_lens = [_]u32{ 2, 3, 4, 5, 6 };
+    var warm_gpu_blocks: i64 = 0;
+    for (round_lens, 0..) |cur_len, ri| {
+        dual_ctx.len = cur_len;
+        const pos_off = (cur_len - 1) * taps * h;
+        var tap_slices: [taps][]const f32 = undefined;
+        for (0..taps) |ti| {
+            tap_slices[ti] = hist_f32[pos_off + ti * h ..][0..h];
+            for (0..h) |d| step_taps_f16[ti * h + d] = @floatCast(tap_slices[ti][d]);
+        }
+
+        const root_tok: u32 = @intCast((ri * 7 + 1) % unpadded_v);
+        const cpu_snap0 = try vmstat.Snapshot.capture();
+        const cpu_res = try bundle_cpu.proposer.propose(root_tok, &tap_slices, null, &cpu_tree);
+        const cpu_delta = vmstat.heapDelta(cpu_snap0, try vmstat.Snapshot.capture());
+
+        const snap_before = try vmstat.Snapshot.capture();
+        const gpu_res = try bundle_gpu.proposer.proposeWithGpuTaps(
+            root_tok,
+            .{ .dtype = .f16, .taps = &gpu_taps_views },
+            .{
+                .taps_ring = .{ .buffer = ext_buf, .offset = ext_arena.offsetOf(std.mem.sliceAsBytes(ring_f16).ptr) },
+                .dtype = .f16,
+                .cap = hist_cap,
+                .len = cur_len,
+                .epoch = 1,
+            },
+            null,
+            &gpu_tree,
+        );
+        const gpu_delta = vmstat.heapDelta(snap_before, try vmstat.Snapshot.capture());
+        if (std.c.getenv("MTL_DEBUG_LAYER") == null and std.c.getenv("MTL_SHADER_VALIDATION") == null) {
+            try std.testing.expect(cpu_delta.blocks_in_use <= 0);
+            if (ri == 2) {
+                warm_gpu_blocks = gpu_delta.blocks_in_use;
+                try std.testing.expect(warm_gpu_blocks <= 8);
+            } else if (ri >= 3) {
+                try std.testing.expect(gpu_delta.blocks_in_use <= warm_gpu_blocks);
+            }
+        }
+
+        try std.testing.expectEqual(@as(u64, 1), gpu_res.backbone_runs);
+        try std.testing.expectEqual(cpu_res.tree_nodes, gpu_res.tree_nodes);
+        for (0..cpu_tree.count) |ni| {
+            try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
+            try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
+        }
+    }
+}
+
+test "D16 Metal 4 GPU simple non-GRU DFlare (dense fc + markov_w1/rnn_proj/w2 + top_k=1 and top_k=2) parity" {
+    const device = try metal.Device.open();
+    defer device.close();
+    const library = try metal.Library.openEmbedded(device);
+    defer library.close();
+
+    const h: usize = 32;
+    const inter: usize = 64;
+    const nh: u32 = 2;
+    const nkvh: u32 = 2;
+    const hd: u32 = 16;
+    const q_dim: usize = @as(usize, nh) * hd;
+    const kv_dim: usize = @as(usize, nkvh) * hd;
+    const mr: usize = 32;
+    const v: usize = 24;
+    const taps: usize = 2;
+    const w: u8 = 4;
+
+    const cfg: DFlareConfig = .{
+        .variant = .dflash_standalone,
+        .num_layers = 3,
+        .block_size = w,
+        .top_k_per_pos = 1,
+        .max_tree_nodes = 15,
+        .hidden_size = @intCast(h),
+        .intermediate_size = @intCast(inter),
+        .num_attention_heads = nh,
+        .num_key_value_heads = nkvh,
+        .head_dim = hd,
+        .vocab_size = @intCast(v),
+        .markov_rank = @intCast(mr),
+        .num_target_taps = @intCast(taps),
+        .rms_eps = 1e-5,
+    };
+
+    var l_q: [3 * q_dim * h]f32 = undefined;
+    var l_k: [3 * kv_dim * h]f32 = undefined;
+    var l_v: [3 * kv_dim * h]f32 = undefined;
+    var l_o: [3 * h * q_dim]f32 = undefined;
+    var l_gate: [3 * inter * h]f32 = undefined;
+    var l_up: [3 * inter * h]f32 = undefined;
+    var l_down: [3 * h * inter]f32 = undefined;
+    var layers: [3]TransformerBlockWeights = undefined;
+    for (0..3) |li| {
+        fillDetWeight(l_q[li * q_dim * h ..][0 .. q_dim * h], 3000 + li * 10 + 1, 0.14);
+        fillDetWeight(l_k[li * kv_dim * h ..][0 .. kv_dim * h], 3000 + li * 10 + 2, 0.14);
+        fillDetWeight(l_v[li * kv_dim * h ..][0 .. kv_dim * h], 3000 + li * 10 + 3, 0.14);
+        fillDetWeight(l_o[li * h * q_dim ..][0 .. h * q_dim], 3000 + li * 10 + 4, 0.14);
+        fillDetWeight(l_gate[li * inter * h ..][0 .. inter * h], 3000 + li * 10 + 5, 0.12);
+        fillDetWeight(l_up[li * inter * h ..][0 .. inter * h], 3000 + li * 10 + 6, 0.12);
+        fillDetWeight(l_down[li * h * inter ..][0 .. h * inter], 3000 + li * 10 + 7, 0.12);
+        layers[li] = .{
+            .q_proj = l_q[li * q_dim * h ..][0 .. q_dim * h],
+            .k_proj = l_k[li * kv_dim * h ..][0 .. kv_dim * h],
+            .v_proj = l_v[li * kv_dim * h ..][0 .. kv_dim * h],
+            .o_proj = l_o[li * h * q_dim ..][0 .. h * q_dim],
+            .mlp_gate_proj = l_gate[li * inter * h ..][0 .. inter * h],
+            .mlp_up_proj = l_up[li * inter * h ..][0 .. inter * h],
+            .mlp_down_proj = l_down[li * h * inter ..][0 .. h * inter],
+        };
+    }
+
+    var fc: [h * taps * h]f32 = undefined;
+    fillDetWeight(&fc, 801, 0.18);
+    var mask_embed: [w * h]f32 = undefined;
+    fillDetWeight(&mask_embed, 802, 0.30);
+    var tok_embed: [v * h]f32 = undefined;
+    fillDetWeight(&tok_embed, 803, 0.35);
+    var mw1: [mr * 2 * h]f32 = undefined;
+    fillDetWeight(&mw1, 804, 0.20);
+    var mrnn: [mr * mr]f32 = undefined;
+    fillDetWeight(&mrnn, 805, 0.22);
+    var mb1: [mr]f32 = undefined;
+    fillDetWeight(&mb1, 806, 0.05);
+    var mw2: [h * mr]f32 = undefined;
+    fillDetWeight(&mw2, 807, 0.22);
+    var lm_head: [v * h]f32 = undefined;
+    fillDetWeight(&lm_head, 808, 0.18);
+    for (0..v) |tok| lm_head[tok * h + (tok % h)] += 0.40;
+
+    const weights: DFlareWeights = .{
+        .target_fusion_proj = &fc,
+        .mask_embed = &mask_embed,
+        .tok_embed = &tok_embed,
+        .layers = &layers,
+        .markov_w1 = &mw1,
+        .markov_rnn_proj = &mrnn,
+        .markov_b1 = &mb1,
+        .markov_w2 = &mw2,
+        .lm_head = .{ .dense_f32 = &lm_head },
+    };
+
+    var ws_cpu = try DFlareWorkspace.init(cfg, null);
+    defer ws_cpu.deinit();
+    var ws_gpu = try DFlareWorkspace.init(cfg, null);
+    defer ws_gpu.deinit();
+
+    var cpu_proposer = try DFlareProposer.init(cfg, weights, &ws_cpu);
+    var gpu_proposer = try DFlareProposer.init(cfg, weights, &ws_gpu);
+    try gpu_proposer.attachGpu(.{ .device = device, .library = library });
+    defer gpu_proposer.detachGpu();
+
+    var tap0: [h]f32 = undefined;
+    var tap1: [h]f32 = undefined;
+    fillDetWeight(&tap0, 901, 0.45);
+    fillDetWeight(&tap1, 902, 0.45);
+    var cpu_tree: CandidateTree = undefined;
+    var gpu_tree: CandidateTree = undefined;
+
+    _ = try cpu_proposer.propose(2, &.{ &tap0, &tap1 }, null, &cpu_tree);
+    _ = try gpu_proposer.propose(2, &.{ &tap0, &tap1 }, null, &gpu_tree);
+    try std.testing.expectEqual(cpu_tree.count, gpu_tree.count);
+    for (0..cpu_tree.count) |ni| {
+        try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
+        try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
+    }
+
+    var cfg_k2 = cfg;
+    cfg_k2.top_k_per_pos = 2;
+    var ws_cpu_k2 = try DFlareWorkspace.init(cfg_k2, null);
+    defer ws_cpu_k2.deinit();
+    var ws_gpu_k2 = try DFlareWorkspace.init(cfg_k2, null);
+    defer ws_gpu_k2.deinit();
+    var cpu_proposer_k2 = try DFlareProposer.init(cfg_k2, weights, &ws_cpu_k2);
+    var gpu_proposer_k2 = try DFlareProposer.init(cfg_k2, weights, &ws_gpu_k2);
+    try gpu_proposer_k2.attachGpu(.{ .device = device, .library = library });
+    defer gpu_proposer_k2.detachGpu();
+
+    _ = try cpu_proposer_k2.propose(5, &.{ &tap0, &tap1 }, null, &cpu_tree);
+    _ = try gpu_proposer_k2.propose(5, &.{ &tap0, &tap1 }, null, &gpu_tree);
+    try std.testing.expectEqual(cpu_tree.count, gpu_tree.count);
+    for (0..cpu_tree.count) |ni| {
+        try std.testing.expectEqual(cpu_tree.nodes[ni].token_id, gpu_tree.nodes[ni].token_id);
+        try std.testing.expect(@abs(cpu_tree.nodes[ni].step_prob - gpu_tree.nodes[ni].step_prob) < 1e-2);
+    }
 }
