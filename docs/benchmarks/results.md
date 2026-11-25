@@ -6202,6 +6202,7 @@ All post-fix (`9cc672c`) throughput rows execute with **`mid_pass_flushes = 0`**
 | Disk / AMF Wired / Runtime Wired | `11,686,723,584 B` / `11,119.47 MiB` / `11,298 MiB` | `11,376,951,296 B` / `10,824.05 MiB` / `11,003 MiB` (`-295 MiB`) |
 | Active Bytes/Tok / `mid_pass_flushes` / `zig_allocs` / `swapouts_delta` | `3.08 GB/tok` / `0` / `0` / `0` (steady-state) | `2.34 GB/tok` / `0` / `0` / `0` (`all_passed = yes`) |
 | Standalone uncontended `M = 1` `decode` (`706f0a8`) | `12.70–14.09 tok/s` (`71–79 ms/tok`) | `14.05 tok/s` (`71.18 ms/tok`, `32.95 GB/s`) |
+| Independent verifier uncontended spot-check (`n = 24`, `T = 0`, `Rayleigh scattering`) | — | **`18.30 tok/s`** `decode` (`54.646 ms/tok`, `42.85 GB/s`, `wired_mib = 11016`) / **`13.81 tok/s`** `3L DFlare` (`rounds = 7`, `mean_accept_len = 3.286`, `wired_mib = 11045`, **`24/24` `100%` bit-exact**, `mid_pass_flushes = 0`, `swapouts_delta = 0`) |
 | Isolated uncontended `bench-m825` `decode` `n = 64` / `n = 128` (`9cc672c`) | **`12.81`** / **`12.45 tok/s`** | **`13.90`** / **`13.46 tok/s`** (`4.5x` / `4.2x` vs contended `706f0a8`) |
 | GPU `3L DFlare` (`+606 MiB`) `M = 4` `n = 64` (`9cc672c`) | **`11.48 tok/s`** (standalone **`14.67 tok/s`**, `64/64`) | **`11.60 tok/s`** (`tau = 2.172`, `64/64`, **`+12.5%`** vs `M = 8`) |
 | GPU `3L DFlare` (`+606 MiB`) `M = 8` `n = 64` / `n = 128` (`9cc672c`) | `10.04` (`64/64`) / `7.77 tok/s` (`128/128`) | `10.31` (`tau = 3.316`, `64/64`) / `8.31 tok/s` (`tau = 3.098`, `128/128`) |
