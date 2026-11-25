@@ -22,6 +22,7 @@ pub const sampler = @import("gpu/sampler.zig");
 pub const ring = @import("runtime/ring.zig");
 pub const batch_scheduler = @import("runtime/batch_scheduler.zig");
 pub const qos = @import("platform/qos.zig");
+pub const paths = @import("platform/paths.zig");
 pub const sysinfo = @import("platform/sysinfo.zig");
 pub const chip_profile = @import("platform/chip_profile.zig");
 pub const vmstat = @import("platform/vmstat.zig");
@@ -82,6 +83,7 @@ test {
     _ = ring;
     _ = batch_scheduler;
     _ = qos;
+    _ = paths;
     _ = sysinfo;
     _ = chip_profile;
     _ = vmstat;

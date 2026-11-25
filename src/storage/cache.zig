@@ -23,6 +23,7 @@ const expert = @import("../expert/source.zig");
 const amf = @import("../format/amf.zig");
 const moe = @import("../gpu/moe.zig");
 const vmstat = @import("../platform/vmstat.zig");
+const paths = @import("../platform/paths.zig");
 const aio = @import("aio.zig");
 
 const INVALID_SLOT: u32 = std.math.maxInt(u32);
@@ -1245,14 +1246,12 @@ const SyntheticColdPack = struct {
         };
         const pid = std.c.getpid();
         const stamp = monotonicNowNs();
-        const s = try std.fmt.bufPrint(
-            pack.path_buf[0 .. pack.path_buf.len - 1],
-            "/Volumes/Akari/.tmp/aminfer_cache_test_{s}_{d}_{d}.bin",
+        const path_z = try paths.tmpPathFmtZ(
+            &pack.path_buf,
+            "aminfer_cache_test_{s}_{d}_{d}.bin",
             .{ tag, pid, stamp },
         );
-        pack.path_buf[s.len] = 0;
-        pack.path_len = s.len;
-        const path_z: [:0]const u8 = pack.path_buf[0..s.len :0];
+        pack.path_len = path_z.len;
 
         const fd = std.c.open(
             path_z.ptr,

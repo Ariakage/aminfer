@@ -5,6 +5,7 @@
 const std = @import("std");
 const c = @import("apple_bridge");
 const page = @import("../mem/page.zig");
+const paths = @import("../platform/paths.zig");
 
 /// The kernel library compiled from `src/kernels/*.metal` by `build.zig`.
 const embedded_metallib = @embedFile("aminfer_metallib");
@@ -2840,14 +2841,8 @@ test "CoreML ANE zero-copy IOSurface conv1x1 and innerProduct match CPU referenc
         });
         defer gpa.free(spec_bytes);
 
-        const tmp_dir = std.c.getenv("TMPDIR") orelse "/Volumes/Akari/.tmp";
         var path_buf: [512]u8 = undefined;
-        const path_slice = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}/aminfer_test_ip_{d}.mlmodel", .{
-            std.mem.sliceTo(tmp_dir, 0),
-            std.c.getpid(),
-        });
-        path_buf[path_slice.len] = 0;
-        const path_z: [:0]const u8 = path_buf[0..path_slice.len :0];
+        const path_z = try paths.tmpPathFmtZ(&path_buf, "aminfer_test_ip_{d}.mlmodel", .{std.c.getpid()});
         const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         defer _ = std.c.unlink(path_z.ptr);
@@ -3395,7 +3390,6 @@ test "emitCoreMlQkvProjectionBlock, emitCoreMlRouterPredictor (linear & SiLU MLP
         defer gpa.free(spec_bytes);
 
         // Write a real CoreML .mlpackage directory bundle in TMPDIR and load via AneModel.loadPath!
-        const tmp_root = std.mem.sliceTo(std.c.getenv("TMPDIR") orelse "/Volumes/Akari/.tmp", 0);
         const pid = std.c.getpid();
         var pkg_buf: [512]u8 = undefined;
         var data_dir_buf: [512]u8 = undefined;
@@ -3403,9 +3397,8 @@ test "emitCoreMlQkvProjectionBlock, emitCoreMlRouterPredictor (linear & SiLU MLP
         var manifest_buf: [512]u8 = undefined;
         var model_buf: [512]u8 = undefined;
 
-        const pkg_str = try std.fmt.bufPrint(pkg_buf[0 .. pkg_buf.len - 1], "{s}/aminfer_test_pred_{d}.mlpackage", .{ tmp_root, pid });
-        pkg_buf[pkg_str.len] = 0;
-        const pkg_z: [:0]const u8 = pkg_buf[0..pkg_str.len :0];
+        const pkg_z = try paths.tmpPathFmtZ(&pkg_buf, "aminfer_test_pred_{d}.mlpackage", .{pid});
+        const pkg_str: []const u8 = pkg_z;
 
         const data_dir = try std.fmt.bufPrint(data_dir_buf[0 .. data_dir_buf.len - 1], "{s}/Data", .{pkg_str});
         data_dir_buf[data_dir.len] = 0;

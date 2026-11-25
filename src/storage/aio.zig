@@ -22,6 +22,7 @@ const qos = @import("../platform/qos.zig");
 const ring = @import("../runtime/ring.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const vmstat = @import("../platform/vmstat.zig");
+const paths = @import("../platform/paths.zig");
 
 /// Maximum concurrent in-flight reads supported by a single engine instance.
 pub const MAX_INFLIGHT: usize = 64;
@@ -1116,7 +1117,8 @@ pub const DEFAULT_S3_IO_POLICIES = [_]qos.DiskIoPolicy{ .important, .standard };
 
 pub const SpikeS3Config = struct {
     /// Directory for the temporary `F_NOCACHE` test file (removed on exit).
-    temp_dir: []const u8 = "/Volumes/Akari/.tmp",
+    /// When `null`, resolves `TMPDIR` with fallback to `"/tmp"`.
+    temp_dir: ?[]const u8 = null,
     /// Total file size in bytes (16 KiB aligned; default 192 MiB).
     file_bytes: usize = 192 * 1024 * 1024,
     /// Expert blob sizes to benchmark (default: Q3 2,064,384 B and Q4 2,654,208 B).
@@ -1539,13 +1541,13 @@ pub fn runSpikeS3(allocator: std.mem.Allocator, config: SpikeS3Config) SpikeS3Er
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const pid = std.c.getpid();
     const stamp = monotonicNowNs();
-    const path_slice = std.fmt.bufPrint(
-        path_buf[0 .. path_buf.len - 1],
-        "{s}/aminfer_spike_s3_{d}_{d}.bin",
-        .{ config.temp_dir, pid, stamp },
+    const resolved_dir = paths.resolveTmpDir(config.temp_dir);
+    const path_z = paths.joinPathFmtZ(
+        &path_buf,
+        resolved_dir,
+        "aminfer_spike_s3_{d}_{d}.bin",
+        .{ pid, stamp },
     ) catch return error.InvalidArgument;
-    path_buf[path_slice.len] = 0;
-    const path_z: [:0]const u8 = path_buf[0..path_slice.len :0];
 
     try createSpikeFile(path_z, config.file_bytes);
     defer _ = std.c.unlink(path_z.ptr);
@@ -1664,13 +1666,11 @@ pub fn runSpikeS3(allocator: std.mem.Allocator, config: SpikeS3Config) SpikeS3Er
 fn makeTestTempFile(name_tag: []const u8, total_bytes: usize, path_buf: *[std.fs.max_path_bytes]u8) ![:0]const u8 {
     const pid = std.c.getpid();
     const stamp = monotonicNowNs();
-    const s = try std.fmt.bufPrint(
-        path_buf[0 .. path_buf.len - 1],
-        "/Volumes/Akari/.tmp/aminfer_aio_test_{s}_{d}_{d}.bin",
+    const path_z = try paths.tmpPathFmtZ(
+        path_buf,
+        "aminfer_aio_test_{s}_{d}_{d}.bin",
         .{ name_tag, pid, stamp },
     );
-    path_buf[s.len] = 0;
-    const path_z: [:0]const u8 = path_buf[0..s.len :0];
 
     const fd = std.c.open(
         path_z.ptr,
@@ -1955,7 +1955,7 @@ test "AsyncExpertReader resolves auto backend and reads identically across backe
     }
 }
 
-test "runSpikeS3 executes compact end-to-end sweep in /Volumes/Akari/.tmp with zero swapouts" {
+test "runSpikeS3 executes compact end-to-end sweep in TMPDIR with zero swapouts" {
     const gpa = std.testing.allocator;
     const blobs = [_]usize{256 * 1024};
     const qds = [_]usize{ 1, 4 };
@@ -1963,7 +1963,7 @@ test "runSpikeS3 executes compact end-to-end sweep in /Volumes/Akari/.tmp with z
     const policies = [_]qos.DiskIoPolicy{.important};
 
     var report = try runSpikeS3(gpa, .{
-        .temp_dir = "/Volumes/Akari/.tmp",
+        .temp_dir = null,
         .file_bytes = 4 * 1024 * 1024,
         .blob_sizes = &blobs,
         .queue_depths = &qds,

@@ -7,6 +7,7 @@ import http.server
 import io
 import json
 import math
+import os
 import pathlib
 import random
 import struct
@@ -51,9 +52,19 @@ from aminfer_tools.gguf import (
 )
 from aminfer_tools.gsq_rco import gsq_convert, parse_gguf_imatrix
 
+def _resolve_metadata_root() -> pathlib.Path | None:
+    meta_env = os.environ.get("AMINFER_METADATA_DIR")
+    if meta_env:
+        return pathlib.Path(meta_env)
+    models_env = os.environ.get("AMINFER_MODELS_DIR")
+    if models_env:
+        return pathlib.Path(models_env) / "metadata"
+    return None
+
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 AMINFER_BIN = REPO_ROOT / "zig-out" / "bin" / "aminfer"
-REAL_METADATA_ROOT = pathlib.Path("/Volumes/Akari/models/metadata")
+REAL_METADATA_ROOT = _resolve_metadata_root()
 
 
 def _f32_to_bf16_bytes(vals: list[float]) -> bytes:
@@ -910,6 +921,9 @@ class M81ChatTemplateSpecTests(unittest.TestCase):
         self._td.cleanup()
 
     def test_real_metadata_checkpoints_and_deterministic_embedding(self) -> None:
+        meta_root = _resolve_metadata_root()
+        if meta_root is None or not meta_root.is_dir():
+            self.skipTest("AMINFER_METADATA_DIR / AMINFER_MODELS_DIR metadata dir not present")
         expected_dialects = {
             "thinkingmachines__Inkling-2-Mini": "inkling2",
             "tencent__Hy4-flash": "hy4",
@@ -918,7 +932,7 @@ class M81ChatTemplateSpecTests(unittest.TestCase):
             "deepseek-ai__DeepSeek-V4.1-Flash-1017": "deepseek",
         }
         for model_dir_name, exp_dialect in expected_dialects.items():
-            d = REAL_METADATA_ROOT / model_dir_name
+            d = meta_root / model_dir_name
             if not d.is_dir():
                 continue
             spec1 = compile_chat_template_from_dir(d)

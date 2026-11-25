@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import pathlib
 import random
 import struct
@@ -45,10 +46,27 @@ from aminfer_tools.inkling2 import (
     validate_hf_metadata_dir as validate_inkling2_metadata_dir,
 )
 
+def _resolve_metadata_root() -> pathlib.Path | None:
+    meta_env = os.environ.get("AMINFER_METADATA_DIR")
+    if meta_env:
+        return pathlib.Path(meta_env)
+    models_env = os.environ.get("AMINFER_MODELS_DIR")
+    if models_env:
+        return pathlib.Path(models_env) / "metadata"
+    return None
+
+
+def _resolve_hy4_tiny_random() -> pathlib.Path | None:
+    models_env = os.environ.get("AMINFER_MODELS_DIR")
+    if models_env:
+        return pathlib.Path(models_env) / "hy4-preview-tiny-random"
+    return None
+
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 AMINFER_BIN = REPO_ROOT / "zig-out" / "bin" / "aminfer"
-REAL_METADATA_ROOT = pathlib.Path("/Volumes/Akari/models/metadata")
-REAL_HY4_TINY_RANDOM = pathlib.Path("/Volumes/AriDisk/models/hy4-preview-tiny-random")
+REAL_METADATA_ROOT = _resolve_metadata_root()
+REAL_HY4_TINY_RANDOM = _resolve_hy4_tiny_random()
 
 
 def _f32_to_bf16_bytes(vals: list[float]) -> bytes:
@@ -1039,8 +1057,12 @@ class TestGsqRcoV2AndRealMetadata(unittest.TestCase):
         p_mini_24 = resolve_inkling2_tier_profile("24gb-m4", num_hidden_layers=24, n_routed_experts=128)
         self.assertAlmostEqual(p_mini_24.cold_tail_fraction, 0.125, places=3)
 
-    @unittest.skipUnless(REAL_METADATA_ROOT.is_dir(), "real Hugging Face metadata cache not present")
+    @unittest.skipUnless(
+        REAL_METADATA_ROOT is not None and REAL_METADATA_ROOT.is_dir(),
+        "real Hugging Face metadata cache not present (set AMINFER_METADATA_DIR or AMINFER_MODELS_DIR)",
+    )
     def test_validate_all_real_metadata_dirs(self) -> None:
+        assert REAL_METADATA_ROOT is not None
         mini = validate_inkling2_metadata_dir(REAL_METADATA_ROOT / "thinkingmachines__Inkling-2-Mini")
         self.assertEqual(mini.model_type, "inkling2_loop")
         self.assertEqual(mini.num_hidden_layers, 24)
@@ -1103,8 +1125,12 @@ class TestGsqRcoV2AndRealMetadata(unittest.TestCase):
             payload = json.loads(buf.getvalue())
             self.assertEqual(payload["index"]["long_backbone_names"], [])
 
-    @unittest.skipUnless((REAL_HY4_TINY_RANDOM / "model.safetensors").is_file(), "staged hy4-preview-tiny-random absent")
+    @unittest.skipUnless(
+        REAL_HY4_TINY_RANDOM is not None and (REAL_HY4_TINY_RANDOM / "model.safetensors").is_file(),
+        "staged hy4-preview-tiny-random absent (set AMINFER_MODELS_DIR)",
+    )
     def test_real_hy4_tiny_random_smoke(self) -> None:
+        assert REAL_HY4_TINY_RANDOM is not None
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = pathlib.Path(tmp) / "hy4_tiny"
             rep = convert_hy4_checkpoint(

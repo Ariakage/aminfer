@@ -7,6 +7,7 @@
 
 const std = @import("std");
 pub const chat_template = @import("chat_template.zig");
+const paths = @import("../platform/paths.zig");
 
 pub const UNICODE_TO_BYTE_LEN: usize = 0x144;
 
@@ -3559,17 +3560,26 @@ test "fromHuggingFaceJson auto-detects DeepSeek pre_tokenizer dialect" {
     try std.testing.expectEqual(PreTokenizerKind.deepseek, tok.pre_tokenizer_kind);
 }
 
+fn readOptionalMetadataTokenizerAlloc(gpa: std.mem.Allocator, io: std.Io, subpath: []const u8) !?[]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = (try paths.resolveMetadataFileZ(null, &path_buf, subpath)) orelse return null;
+    return std.Io.Dir.readFileAlloc(
+        std.Io.Dir.cwd(),
+        io,
+        path,
+        gpa,
+        .limited(64 * 1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => null,
+        else => return err,
+    };
+}
+
 test "opportunistic live Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash-1017 tokenizer.json compatibility" {
     const gpa = std.testing.allocator;
 
     // 1. Qwen/Qwen3.8-Flash-Next
-    if (std.Io.Dir.readFileAlloc(
-        std.Io.Dir.cwd(),
-        std.testing.io,
-        "/Volumes/Akari/models/metadata/Qwen__Qwen3.8-Flash-Next/tokenizer.json",
-        gpa,
-        .limited(64 * 1024 * 1024),
-    )) |bytes| {
+    if (try readOptionalMetadataTokenizerAlloc(gpa, std.testing.io, "Qwen__Qwen3.8-Flash-Next/tokenizer.json")) |bytes| {
         defer gpa.free(bytes);
         var tok = try Tokenizer.fromHuggingFaceJson(gpa, bytes);
         defer tok.deinit(gpa);
@@ -3594,19 +3604,10 @@ test "opportunistic live Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash-1017 tokeniz
         try std.testing.expectEqualStrings(sample, decoded);
         const plain = try tok.decodeSkippingSpecial(ids, &out_buf);
         try std.testing.expectEqualStrings("user\nQwen3.8-Flash-Next 2026 16 KiB 对齐！\n", plain);
-    } else |err| switch (err) {
-        error.FileNotFound, error.NotDir => {},
-        else => return err,
     }
 
     // 2. deepseek-ai/DeepSeek-V4.1-Flash-1017
-    if (std.Io.Dir.readFileAlloc(
-        std.Io.Dir.cwd(),
-        std.testing.io,
-        "/Volumes/Akari/models/metadata/deepseek-ai__DeepSeek-V4.1-Flash-1017/tokenizer.json",
-        gpa,
-        .limited(64 * 1024 * 1024),
-    )) |bytes| {
+    if (try readOptionalMetadataTokenizerAlloc(gpa, std.testing.io, "deepseek-ai__DeepSeek-V4.1-Flash-1017/tokenizer.json")) |bytes| {
         defer gpa.free(bytes);
         var tok = try Tokenizer.fromHuggingFaceJson(gpa, bytes);
         defer tok.deinit(gpa);
@@ -3635,9 +3636,6 @@ test "opportunistic live Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash-1017 tokeniz
         try std.testing.expectEqualStrings(sample, decoded);
         const plain = try tok.decodeSkippingSpecial(ids, &out_buf);
         try std.testing.expect(!std.mem.containsAtLeast(u8, plain, 1, "begin▁of▁sentence"));
-    } else |err| switch (err) {
-        error.FileNotFound, error.NotDir => {},
-        else => return err,
     }
 }
 
@@ -4071,10 +4069,7 @@ test "W24 live tokenizer.json parity for Inkling-2-Mini and Hy4-flash when exter
     const gpa = std.testing.allocator;
 
     // 1. thinkingmachines/Inkling-2-Mini
-    const inkling_path = "/Volumes/Akari/models/metadata/thinkingmachines__Inkling-2-Mini/tokenizer.json";
-    if (std.Io.Dir.cwd().openFile(std.Options.debug_io, inkling_path, .{})) |file| {
-        file.close(std.Options.debug_io);
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, inkling_path, gpa, .limited(64 * 1024 * 1024));
+    if (try readOptionalMetadataTokenizerAlloc(gpa, std.Options.debug_io, "thinkingmachines__Inkling-2-Mini/tokenizer.json")) |bytes| {
         defer gpa.free(bytes);
 
         var tok = try Tokenizer.fromHuggingFaceJson(gpa, bytes);
@@ -4103,16 +4098,10 @@ test "W24 live tokenizer.json parity for Inkling-2-Mini and Hy4-flash when exter
         const decoded = try tok.decodeAlloc(gpa, ids);
         defer gpa.free(decoded);
         try std.testing.expectEqualStrings(sample, decoded);
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
     }
 
     // 2. tencent/Hy4-flash
-    const hy4_path = "/Volumes/Akari/models/metadata/tencent__Hy4-flash/tokenizer.json";
-    if (std.Io.Dir.cwd().openFile(std.Options.debug_io, hy4_path, .{})) |file| {
-        file.close(std.Options.debug_io);
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, hy4_path, gpa, .limited(64 * 1024 * 1024));
+    if (try readOptionalMetadataTokenizerAlloc(gpa, std.Options.debug_io, "tencent__Hy4-flash/tokenizer.json")) |bytes| {
         defer gpa.free(bytes);
 
         var tok = try Tokenizer.fromHuggingFaceJson(gpa, bytes);
@@ -4140,8 +4129,5 @@ test "W24 live tokenizer.json parity for Inkling-2-Mini and Hy4-flash when exter
         const decoded = try tok.decodeAlloc(gpa, ids);
         defer gpa.free(decoded);
         try std.testing.expectEqualStrings(sample, decoded);
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
     }
 }

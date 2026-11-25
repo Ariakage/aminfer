@@ -5,6 +5,7 @@ and pure-stdlib CoreML ANE `vision-tower` static-bucket export.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -138,19 +139,27 @@ class M78VisionTowerTests(unittest.TestCase):
             resolve_vision_mode(qwen_keys, strip_vision=True, vision_sidecar=pathlib.Path("v.amf"))
 
         # Opportunistic check on live HF metadata JSONs if present on disk.
-        for meta_dir in (
-            pathlib.Path("/Volumes/Akari/models/metadata/Qwen__Qwen3.8-Flash-Next"),
-            pathlib.Path("/Volumes/Akari/models/metadata/deepseek-ai__DeepSeek-V4.1-Flash-1017"),
-        ):
-            idx_path = meta_dir / "model.safetensors.index.json"
-            if idx_path.is_file():
-                wm = json.loads(idx_path.read_text(encoding="utf-8"))["weight_map"]
-                vis_keys = [k for k in wm if is_vision_tensor(k)]
-                self.assertTrue(has_vision_tower(vis_keys))
-                normed = [normalize_vision_name(k) for k in vis_keys]
-                self.assertEqual(len(normed), len(set(normed)), f"duplicate normalized names in {meta_dir.name}")
-                for n in normed:
-                    self.assertLessEqual(len(n.encode("utf-8")), 47, f"name > 47B in {meta_dir.name}: {n!r}")
+        meta_env = os.environ.get("AMINFER_METADATA_DIR")
+        models_env = os.environ.get("AMINFER_MODELS_DIR")
+        meta_root = (
+            pathlib.Path(meta_env)
+            if meta_env
+            else (pathlib.Path(models_env) / "metadata" if models_env else None)
+        )
+        if meta_root is not None:
+            for meta_dir in (
+                meta_root / "Qwen__Qwen3.8-Flash-Next",
+                meta_root / "deepseek-ai__DeepSeek-V4.1-Flash-1017",
+            ):
+                idx_path = meta_dir / "model.safetensors.index.json"
+                if idx_path.is_file():
+                    wm = json.loads(idx_path.read_text(encoding="utf-8"))["weight_map"]
+                    vis_keys = [k for k in wm if is_vision_tensor(k)]
+                    self.assertTrue(has_vision_tower(vis_keys))
+                    normed = [normalize_vision_name(k) for k in vis_keys]
+                    self.assertEqual(len(normed), len(set(normed)), f"duplicate normalized names in {meta_dir.name}")
+                    for n in normed:
+                        self.assertLessEqual(len(n.encode("utf-8")), 47, f"name > 47B in {meta_dir.name}: {n!r}")
 
     def test_qwen_vl_27layer_default_include_strip_sidecar_and_5d_patch_embed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -27,6 +27,7 @@ const ring = @import("../runtime/ring.zig");
 const rng_mod = @import("../runtime/rng.zig");
 const batch_sched = @import("../runtime/batch_scheduler.zig");
 const ngram_nvme = @import("../spec/ngram_nvme.zig");
+const paths = @import("../platform/paths.zig");
 const grammar_mod = @import("../spec/grammar.zig");
 const sampling_mod = @import("../spec/sampling.zig");
 const tokenizer_mod = @import("../model/tokenizer.zig");
@@ -11173,14 +11174,7 @@ test "parseIpv4, QoS USER_INITIATED startup, finish_reason length, and connectio
 }
 
 fn testTmpAngPathServer(buf: *[256]u8, name: []const u8) ![:0]const u8 {
-    const dir_slice: []const u8 = if (std.c.getenv("TMPDIR")) |raw|
-        std.mem.sliceTo(raw, 0)
-    else
-        "/Volumes/Akari/.tmp";
-    const trimmed = std.mem.trimEnd(u8, dir_slice, "/");
-    const s = try std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/{s}", .{ trimmed, name });
-    buf[s.len] = 0;
-    return buf[0..s.len :0];
+    return paths.tmpPathZ(buf, name);
 }
 
 /// Extracts concatenated `delta.content` strings from an OpenAI SSE response into `out`.

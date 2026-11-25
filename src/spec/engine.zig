@@ -28,6 +28,7 @@ const sam_mod = @import("sam.zig");
 const tree_mod = @import("tree.zig");
 const accept_mod = @import("accept.zig");
 const draft_mod = @import("draft.zig");
+const paths = @import("../platform/paths.zig");
 const dspark_mod = @import("dspark.zig");
 const dflare_dfly = @import("dflare_dfly.zig");
 const amf = @import("../format/amf.zig");
@@ -4187,7 +4188,8 @@ test "M4 SpecEngine on cold-expert NVMe MoE target applies D7 cold penalty and m
     }, 0xC01D_0001);
     defer allocator.free(image);
 
-    const tmp_path: [:0]const u8 = "/Volumes/Akari/.tmp/aminfer-test-m4-spec-cold.amf";
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try paths.tmpPathFmtZ(&tmp_buf, "aminfer-test-m4-spec-cold-{d}.amf", .{std.c.getpid()});
     {
         const fd = std.c.open(tmp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
@@ -4432,9 +4434,10 @@ test "M5 C6 SpecEngine with F_NOCACHE NvmeNgramTable produces seed hits and 100%
         expected[s] = try ref.stepDecode(expected[s - 1], @intCast(prompt.len - 1 + s));
     }
 
-    // 2. Build an `.ang` v1 table on `/Volumes/Akari/.tmp` indexing the corpus continuation
+    // 2. Build an `.ang` v1 table under `TMPDIR` indexing the corpus continuation
     //    after `[prompt[3], prompt[4], prompt[5], expected[0]]` -> `expected[1..9]` plus a second hop!
-    const tmp_ang: [:0]const u8 = "/Volumes/Akari/.tmp/aminfer-test-m5-c6-engine.ang";
+    var tmp_ang_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_ang = try paths.tmpPathFmtZ(&tmp_ang_buf, "aminfer-test-m5-c6-engine-{d}.ang", .{std.c.getpid()});
     defer _ = std.c.unlink(tmp_ang.ptr);
 
     const ctx1 = [_]u32{ prompt[3], prompt[4], prompt[5], expected[0] };

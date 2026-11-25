@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import struct
 import tempfile
@@ -260,7 +261,10 @@ class M5NgramTests(unittest.TestCase):
             self.assertTrue(found)
 
     def test_real_qwen3_tokenizer_if_present(self) -> None:
-        tok_path = pathlib.Path("/Volumes/Akari/models/Qwen3-0.6B/tokenizer.json")
+        models_dir = os.environ.get("AMINFER_MODELS_DIR")
+        if not models_dir:
+            self.skipTest("AMINFER_MODELS_DIR not set")
+        tok_path = pathlib.Path(models_dir) / "Qwen3-0.6B" / "tokenizer.json"
         if not tok_path.exists():
             self.skipTest("Qwen3-0.6B tokenizer.json not present")
         tok = ByteLevelBpeTokenizer.from_file(tok_path)

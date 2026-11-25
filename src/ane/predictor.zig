@@ -22,6 +22,7 @@ const std = @import("std");
 const metal = @import("../bridge/metal.zig");
 const ring = @import("../runtime/ring.zig");
 const qos = @import("../platform/qos.zig");
+const paths = @import("../platform/paths.zig");
 const vmstat = @import("../platform/vmstat.zig");
 const tree_mod = @import("../spec/tree.zig");
 
@@ -1665,12 +1666,9 @@ test "AneExpertPredictor loadFromPath auto-discovers feature names from .mlpacka
         });
         defer gpa.free(spec);
 
-        const tmp_root = std.mem.sliceTo(std.c.getenv("TMPDIR") orelse "/Volumes/Akari/.tmp", 0);
         const pid = std.c.getpid();
         var path_buf: [512]u8 = undefined;
-        const p_str = try std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}/aminfer_a2_ext_{d}.mlmodel", .{ tmp_root, pid });
-        path_buf[p_str.len] = 0;
-        const p_z: [:0]const u8 = path_buf[0..p_str.len :0];
+        const p_z = try paths.tmpPathFmtZ(&path_buf, "aminfer_a2_ext_{d}.mlmodel", .{pid});
         const fd = std.c.open(p_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         defer _ = std.c.unlink(p_z.ptr);

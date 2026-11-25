@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -192,7 +193,17 @@ class HfMetadataValidatorTests(unittest.TestCase):
             self.assertIn("deepseek41 metadata OK", buf.getvalue())
 
     def test_opportunistic_live_hf_metadata_directories(self) -> None:
-        qwen_dir = pathlib.Path("/Volumes/Akari/models/metadata/Qwen__Qwen3.8-Flash-Next")
+        meta_env = os.environ.get("AMINFER_METADATA_DIR")
+        models_env = os.environ.get("AMINFER_MODELS_DIR")
+        meta_root = (
+            pathlib.Path(meta_env)
+            if meta_env
+            else (pathlib.Path(models_env) / "metadata" if models_env else None)
+        )
+        if meta_root is None or not meta_root.is_dir():
+            self.skipTest("AMINFER_METADATA_DIR / AMINFER_MODELS_DIR metadata dir not present")
+
+        qwen_dir = meta_root / "Qwen__Qwen3.8-Flash-Next"
         if (qwen_dir / "config.json").is_file() and (qwen_dir / "model.safetensors.index.json").is_file():
             q_rep = validate_qwen4_metadata_dir(qwen_dir)
             self.assertEqual(q_rep.num_hidden_layers, 48)
@@ -205,7 +216,7 @@ class HfMetadataValidatorTests(unittest.TestCase):
             self.assertEqual(q_rep.operator_axes.memory_lookup_kind, "ple_ngram")
             self.assertEqual(q_rep.vision_tensor_count, 333)
 
-        ds_dir = pathlib.Path("/Volumes/Akari/models/metadata/deepseek-ai__DeepSeek-V4.1-Flash-1017")
+        ds_dir = meta_root / "deepseek-ai__DeepSeek-V4.1-Flash-1017"
         if (ds_dir / "config.json").is_file() and (ds_dir / "model.safetensors.index.json").is_file():
             d_rep = validate_deepseek41_metadata_dir(ds_dir)
             self.assertEqual(d_rep.num_hidden_layers, 40)

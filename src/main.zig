@@ -73,18 +73,21 @@ const usage =
     \\  bench-m5          run M5 G13 q2/hetero-MoE, C6 F_NOCACHE ngram, D8 PEARL & C7/C8 kqueue server
     \\  bench-m6          run M6 G7/G8/G9/G10, C10 PLE, scale-qwen4-512e+MTP, D12 & D13 cpu_sme2
     \\  bench-m65         run M6.5 G14 HW VideoToolbox vision, R5 32K q8 KV, R8 PrefixCache & C14 batch/ngram
+    \\                    [-h] [--models-dir <dir>]
     \\  bench-m68         run M6.8 G16 canary/Apple10, G15 wide prefill/tail-pruning A/B, C15 QoS/boundary & R9 live-RAM
+    \\                    [-h] [--models-dir <dir>]
     \\  bench-m69         run M6.9 C16 ChipProfile, G17 NAX metallib/fallback/demotion gates & Apple10+ Spike S8 sweep
     \\                    [-hN] [--prefill-matmul-backend auto|simdgroup|nax] [--strict-nax] [--bus-bandwidth-gbs F]
     \\  bench-m7          run M7 R7/G11 MLA+CSA2 FP4, G10 Mega-mHC, C10 Engram, W11/D10 deepseek41 CED+DSpark & X1-X3 cluster
     \\                    [--bus-bandwidth-gbs F]
     \\  bench-m75         run M7.5 W18 single-file AMF, W19 multi-LoRA, C22 grammar bitmask, C19 monitor, C21 embed/rerank, R10 DiskPrefixCache & C17 C-ABI SDK suite
+    \\                    [-h] [--models-dir <dir>]
     \\  bench-m78         run M7.8 G18 fusion/canary, G19 MMA FlashAttn, G20 indirect MoE, G21 248K sampler+C22 spec, C23 NEON, C24 SME2 luti2 & G22/W20 ViT suite
-    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
+    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F] [--models-dir <dir>]
     \\  bench-m81         run M8.1 W21/W22/W24 multi-format G23 GEMV+prefill, G24 act-quant, C25 SME2, Inkling2/Hy4 tokenizer+template, C18 HTTP/SSE & W24 KL gate
-    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
+    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F] [--models-dir <dir>]
     \\  bench-m82         run M8.2 Inkling 2 & Hy4 G25 fused kernels, 40/48 SWA KV, IndexCache/IndexPool, LatentMoE, C26 SME2+FP8 Engram, D14 DFlare/DFly2 parity & speedup
-    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F]
+    \\                    [-h] [--skip-real] [--bus-bandwidth-gbs F] [--models-dir <dir>]
     \\  peer-worker       start a zero-allocation kqueue expert-parallel peer worker (M7 X1-X3)
     \\                    [-hRV] -l|--listen <ip:port> -m|--amf <path> -c|--config <path> -r|--rank N -w|--world-size N
     \\                    [--partition contiguous|round-robin] [--cluster-transport auto|tcp|rdma]
@@ -245,10 +248,18 @@ pub fn main(init: std.process.Init) !void {
         try runBenchM5(arena, out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m6")) {
         try runBenchM6(arena, out);
-    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m65")) {
-        try runBenchM65(arena, out);
-    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m68")) {
-        try runBenchM68(arena, out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m65")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM65(arena, args[2..], out);
+        }
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m68")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM68(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m69")) {
         if (hasHelpFlag(args[2..])) {
             try out.writeAll(usage);
@@ -261,8 +272,12 @@ pub fn main(init: std.process.Init) !void {
         } else {
             try runBenchM7(arena, args[2..], out);
         }
-    } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench-m75")) {
-        try runBenchM75(arena, out);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m75")) {
+        if (hasHelpFlag(args[2..])) {
+            try out.writeAll(usage);
+        } else {
+            try runBenchM75(arena, args[2..], out);
+        }
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-m78")) {
         if (hasHelpFlag(args[2..])) {
             try out.writeAll(usage);
@@ -2574,13 +2589,99 @@ fn runBenchM6(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try report.write(out);
 }
 
-fn runBenchM65(allocator: std.mem.Allocator, out: *Io.Writer) !void {
-    const report = try aminfer.bench.runM65(allocator);
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+fn tryParseModelsDirFlag(args: []const [:0]const u8, i: *usize, out_dir: *?[:0]const u8) !bool {
+    const flag = args[i.*];
+    if (std.mem.eql(u8, flag, "--models-dir")) {
+        i.* += 1;
+        if (i.* >= args.len) return error.MissingFlagValue;
+        if (args[i.*].len == 0) return error.InvalidFlagValue;
+        out_dir.* = args[i.*];
+        return true;
+    }
+    if (std.mem.startsWith(u8, flag, "--models-dir=")) {
+        const val = flag["--models-dir=".len..];
+        if (val.len == 0) return error.InvalidFlagValue;
+        out_dir.* = val;
+        return true;
+    }
+    return false;
+}
+
+fn parseModelsDirOnlyArgs(raw_args: []const [:0]const u8) !?[:0]const u8 {
+    var models_dir: ?[:0]const u8 = null;
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        if (try tryParseModelsDirFlag(raw_args, &i, &models_dir)) continue;
+        return error.UnknownFlag;
+    }
+    return models_dir;
+}
+
+const BenchRealCliFlags = struct {
+    skip_real_checkpoints: bool = false,
+    bus_bandwidth_gbs_override: ?f64 = null,
+    models_dir: ?[:0]const u8 = null,
+};
+
+fn parseBenchRealArgs(raw_args: []const [:0]const u8) !BenchRealCliFlags {
+    var cli: BenchRealCliFlags = .{};
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        if (try tryParseModelsDirFlag(raw_args, &i, &cli.models_dir)) continue;
+        const flag = raw_args[i];
+        if (std.mem.eql(u8, flag, "--skip-real")) {
+            cli.skip_real_checkpoints = true;
+        } else if (std.mem.eql(u8, flag, "--bus-bandwidth-gbs")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cli.bus_bandwidth_gbs_override = try std.fmt.parseFloat(f64, raw_args[i]);
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    return cli;
+}
+
+const M82CliFlags = struct {
+    cfg: aminfer.bench.M82Config = .{},
+    models_dir: ?[:0]const u8 = null,
+};
+
+fn parseM82Args(raw_args: []const [:0]const u8) !M82CliFlags {
+    var cli: M82CliFlags = .{};
+    var i: usize = 0;
+    while (i < raw_args.len) : (i += 1) {
+        if (try tryParseModelsDirFlag(raw_args, &i, &cli.models_dir)) continue;
+        const flag = raw_args[i];
+        if (std.mem.eql(u8, flag, "--skip-synths")) {
+            cli.cfg.include_python_synths = false;
+        } else if (std.mem.eql(u8, flag, "--tokens")) {
+            i += 1;
+            if (i >= raw_args.len) return error.MissingFlagValue;
+            cli.cfg.synth_tokens = try std.fmt.parseInt(u32, raw_args[i], 10);
+            if (cli.cfg.synth_tokens < 2) return error.InvalidFlagValue;
+        } else {
+            return error.UnknownFlag;
+        }
+    }
+    return cli;
+}
+
+fn runBenchM65(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const models_dir = try parseModelsDirOnlyArgs(raw_args);
+    const report = try aminfer.bench.runM65WithConfig(allocator, .{
+        .models_dir = if (models_dir) |d| d else null,
+    });
     try report.write(out);
 }
 
-fn runBenchM68(allocator: std.mem.Allocator, out: *Io.Writer) !void {
-    const report = try aminfer.bench.runM68(allocator);
+fn runBenchM68(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const models_dir = try parseModelsDirOnlyArgs(raw_args);
+    const report = try aminfer.bench.runM68WithConfig(allocator, .{
+        .models_dir = if (models_dir) |d| d else null,
+    });
     try report.write(out);
 }
 
@@ -2602,66 +2703,40 @@ fn runBenchM7(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out:
     try report.write(out);
 }
 
-fn runBenchM75(allocator: std.mem.Allocator, out: *Io.Writer) !void {
-    const report = try aminfer.bench.runM75(allocator);
+fn runBenchM75(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
+    const models_dir = try parseModelsDirOnlyArgs(raw_args);
+    const report = try aminfer.bench.runM75WithConfig(allocator, .{
+        .models_dir = if (models_dir) |d| d else null,
+    });
     try report.write(out);
 }
 
 fn runBenchM78(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
-    var cfg: aminfer.bench.M78Config = .{};
-    var i: usize = 0;
-    while (i < raw_args.len) : (i += 1) {
-        const flag = raw_args[i];
-        if (std.mem.eql(u8, flag, "--skip-real")) {
-            cfg.skip_real_checkpoints = true;
-        } else if (std.mem.eql(u8, flag, "--bus-bandwidth-gbs")) {
-            i += 1;
-            if (i >= raw_args.len) return error.MissingFlagValue;
-            cfg.bus_bandwidth_gbs_override = try std.fmt.parseFloat(f64, raw_args[i]);
-        } else {
-            return error.UnknownFlag;
-        }
-    }
-    const report = try aminfer.bench.runM78WithConfig(allocator, cfg);
+    const cli = try parseBenchRealArgs(raw_args);
+    const report = try aminfer.bench.runM78WithConfig(allocator, .{
+        .skip_real_checkpoints = cli.skip_real_checkpoints,
+        .bus_bandwidth_gbs_override = cli.bus_bandwidth_gbs_override,
+        .models_dir = if (cli.models_dir) |d| d else null,
+    });
     try report.write(out);
 }
 
 fn runBenchM81(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
-    var cfg: aminfer.bench.M81Config = .{};
-    var i: usize = 0;
-    while (i < raw_args.len) : (i += 1) {
-        const flag = raw_args[i];
-        if (std.mem.eql(u8, flag, "--skip-real")) {
-            cfg.skip_real_checkpoints = true;
-        } else if (std.mem.eql(u8, flag, "--bus-bandwidth-gbs")) {
-            i += 1;
-            if (i >= raw_args.len) return error.MissingFlagValue;
-            cfg.bus_bandwidth_gbs_override = try std.fmt.parseFloat(f64, raw_args[i]);
-        } else {
-            return error.UnknownFlag;
-        }
-    }
-    const report = try aminfer.bench.runM81WithConfig(allocator, cfg);
+    const cli = try parseBenchRealArgs(raw_args);
+    const report = try aminfer.bench.runM81WithConfig(allocator, .{
+        .skip_real_checkpoints = cli.skip_real_checkpoints,
+        .bus_bandwidth_gbs_override = cli.bus_bandwidth_gbs_override,
+        .models_dir = if (cli.models_dir) |d| d else null,
+    });
     try report.write(out);
 }
 
 fn runBenchM82(allocator: std.mem.Allocator, raw_args: []const [:0]const u8, out: *Io.Writer) !void {
-    var cfg: aminfer.bench.M82Config = .{};
-    var i: usize = 0;
-    while (i < raw_args.len) : (i += 1) {
-        const flag = raw_args[i];
-        if (std.mem.eql(u8, flag, "--skip-synths")) {
-            cfg.include_python_synths = false;
-        } else if (std.mem.eql(u8, flag, "--tokens")) {
-            i += 1;
-            if (i >= raw_args.len) return error.MissingFlagValue;
-            cfg.synth_tokens = try std.fmt.parseInt(u32, raw_args[i], 10);
-            if (cfg.synth_tokens < 2) return error.InvalidFlagValue;
-        } else {
-            return error.UnknownFlag;
-        }
+    const cli = try parseM82Args(raw_args);
+    if (cli.models_dir) |dir| {
+        if (setenv("AMINFER_MODELS_DIR", dir.ptr, 1) != 0) return error.SetEnvFailed;
     }
-    const report = try aminfer.bench.runM82WithConfig(allocator, cfg);
+    const report = try aminfer.bench.runM82WithConfig(allocator, cli.cfg);
     try report.write(out);
     try out.flush();
     if (!report.all_passed) return error.BenchmarkGateFailed;
@@ -2943,15 +3018,15 @@ fn runBenchAll(allocator: std.mem.Allocator, out: *Io.Writer) !void {
     try out.flush();
     try runBenchM6(allocator, out);
     try out.flush();
-    try runBenchM65(allocator, out);
+    try runBenchM65(allocator, &.{}, out);
     try out.flush();
-    try runBenchM68(allocator, out);
+    try runBenchM68(allocator, &.{}, out);
     try out.flush();
     try runBenchM69(allocator, &.{}, out);
     try out.flush();
     try runBenchM7(allocator, &.{}, out);
     try out.flush();
-    try runBenchM75(allocator, out);
+    try runBenchM75(allocator, &.{}, out);
     try out.flush();
     try runBenchM78(allocator, &.{}, out);
     try out.flush();
@@ -9575,4 +9650,41 @@ test "m82: CLI parses --draft-mode dflare|dfly2, --vision-sidecar, and chat --re
     });
     try std.testing.expectEqual(@as(?aminfer.chat_template.ReasoningEffort, .high), chat_hi.chat_cfg.reasoning_effort);
     try std.testing.expectEqual(aminfer.draft.DraftMode.dflare, chat_hi.draft_mode.?);
+}
+
+test "benchmark CLI subcommands parse --models-dir and reject empty or missing values" {
+    try std.testing.expectEqual(@as(?[:0]const u8, null), try parseModelsDirOnlyArgs(&.{}));
+    try std.testing.expectEqualStrings(
+        "/tmp/custom-models",
+        (try parseModelsDirOnlyArgs(&.{ "--models-dir", "/tmp/custom-models" })).?,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/eq-models",
+        (try parseModelsDirOnlyArgs(&.{"--models-dir=/tmp/eq-models"})).?,
+    );
+    try std.testing.expectError(error.MissingFlagValue, parseModelsDirOnlyArgs(&.{"--models-dir"}));
+    try std.testing.expectError(error.InvalidFlagValue, parseModelsDirOnlyArgs(&.{ "--models-dir", "" }));
+    try std.testing.expectError(error.InvalidFlagValue, parseModelsDirOnlyArgs(&.{"--models-dir="}));
+    try std.testing.expectError(error.UnknownFlag, parseModelsDirOnlyArgs(&.{"--bogus"}));
+
+    const real_cli = try parseBenchRealArgs(&.{
+        "--skip-real",
+        "--bus-bandwidth-gbs",
+        "120.5",
+        "--models-dir",
+        "/opt/models",
+    });
+    try std.testing.expect(real_cli.skip_real_checkpoints);
+    try std.testing.expectEqual(@as(?f64, 120.5), real_cli.bus_bandwidth_gbs_override);
+    try std.testing.expectEqualStrings("/opt/models", real_cli.models_dir.?);
+
+    const m82_cli = try parseM82Args(&.{
+        "--skip-synths",
+        "--tokens",
+        "8",
+        "--models-dir=/opt/m82-models",
+    });
+    try std.testing.expect(!m82_cli.cfg.include_python_synths);
+    try std.testing.expectEqual(@as(u32, 8), m82_cli.cfg.synth_tokens);
+    try std.testing.expectEqualStrings("/opt/m82-models", m82_cli.models_dir.?);
 }

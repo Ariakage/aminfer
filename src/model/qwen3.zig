@@ -24,6 +24,7 @@ const chat_template_mod = @import("chat_template.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const chip_profile_mod = @import("../platform/chip_profile.zig");
 const vmstat = @import("../platform/vmstat.zig");
+const paths = @import("../platform/paths.zig");
 const tree_mod = @import("../spec/tree.zig");
 const expert_mod = @import("../expert/source.zig");
 const aio = @import("../storage/aio.zig");
@@ -14645,8 +14646,9 @@ test "M4 cold-expert NVMe streaming decode and verifyTree match all-hot bit-for-
     }, 4040);
     defer gpa.free(image);
 
-    // Write temporary `.amf` under `/Volumes/Akari/.tmp` (never `/tmp` or repo!).
-    const tmp_path: [:0]const u8 = "/Volumes/Akari/.tmp/aminfer-test-m4-cold.amf";
+    // Write temporary `.amf` under `TMPDIR` (fallback `/tmp`, never repo!).
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try paths.tmpPathFmtZ(&tmp_buf, "aminfer-test-m4-cold-{d}.amf", .{std.c.getpid()});
     {
         const fd = std.c.open(tmp_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);

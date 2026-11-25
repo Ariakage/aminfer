@@ -5,6 +5,7 @@ const std = @import("std");
 const quant = @import("../quant/spec.zig");
 const amf = @import("../format/amf.zig");
 const vmstat = @import("../platform/vmstat.zig");
+const paths = @import("../platform/paths.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const chip_profile_mod = @import("../platform/chip_profile.zig");
 const metal = @import("../bridge/metal.zig");
@@ -3035,7 +3036,7 @@ pub const M4Config = struct {
     hybrid_num_experts: u32 = 16,
     hybrid_top_k: u32 = 4,
     hybrid_timed_iters: u32 = 2,
-    cold_temp_dir: []const u8 = "/Volumes/Akari/.tmp",
+    cold_temp_dir: ?[]const u8 = null,
     cold_gen_tokens: u32 = 12,
     d4_gen_tokens: u32 = 12,
 };
@@ -3228,7 +3229,7 @@ pub fn runHybridPrefillVsGpuBench(allocator: std.mem.Allocator, config: M4Config
 
 pub fn runColdSynthBench(
     allocator: std.mem.Allocator,
-    temp_dir: []const u8,
+    temp_dir: ?[]const u8,
     gen_tokens: u32,
 ) M4Error!ColdSynthResult {
     const cfg: qwen3.ModelConfig = .{
@@ -3253,13 +3254,13 @@ pub fn runColdSynthBench(
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const pid = std.c.getpid();
     const stamp = try vmstat.nowNs();
-    const path_slice = std.fmt.bufPrint(
-        path_buf[0 .. path_buf.len - 1],
-        "{s}/aminfer_m4_cold_{d}_{d}.amf",
-        .{ temp_dir, pid, stamp },
+    const resolved_dir = paths.resolveTmpDir(temp_dir);
+    const amf_path = paths.joinPathFmtZ(
+        &path_buf,
+        resolved_dir,
+        "aminfer_m4_cold_{d}_{d}.amf",
+        .{ pid, stamp },
     ) catch return error.InvalidConfig;
-    path_buf[path_slice.len] = 0;
-    const amf_path: [:0]const u8 = path_buf[0..path_slice.len :0];
 
     try writeSyntheticQwen3AmfFile(allocator, amf_path, cfg, 0x0004_C01D);
     defer _ = std.c.unlink(amf_path.ptr);
@@ -4755,7 +4756,7 @@ pub const M5Config = struct {
     hetero_moe_timed_batches: u32 = 8,
     hetero_moe_dispatches_per_batch: u32 = 8,
 
-    ngram_temp_dir: []const u8 = "/Volumes/Akari/.tmp",
+    ngram_temp_dir: ?[]const u8 = null,
     ngram_buckets: u32 = 256,
     ngram_entries_per_bucket: u32 = 4,
     ngram_cache_pages: usize = 32,
@@ -5505,13 +5506,13 @@ fn runM5HeteroMoeBench(config: M5Config) M5Error![8]HeteroMoeRow {
 
 fn runM5NgramBench(allocator: std.mem.Allocator, config: M5Config) M5Error!NgramBenchResult {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const raw_path = std.fmt.bufPrint(
-        path_buf[0 .. path_buf.len - 1],
-        "{s}/aminfer_m5_ngram_bench_{d}.ang",
-        .{ config.ngram_temp_dir, @as(u64, @intCast(try vmstat.nowNs())) & 0xFFFF_FFFF },
+    const resolved_dir = paths.resolveTmpDir(config.ngram_temp_dir);
+    const ang_path = paths.joinPathFmtZ(
+        &path_buf,
+        resolved_dir,
+        "aminfer_m5_ngram_bench_{d}.ang",
+        .{@as(u64, @intCast(try vmstat.nowNs())) & 0xFFFF_FFFF},
     ) catch return error.PathTooLong;
-    path_buf[raw_path.len] = 0;
-    const ang_path: [:0]const u8 = path_buf[0..raw_path.len :0];
     defer _ = std.c.unlink(ang_path.ptr);
 
     const total_n: usize = @as(usize, config.ngram_buckets) * config.ngram_entries_per_bucket;
@@ -6654,15 +6655,14 @@ fn removeDirRecursiveBestEffort(allocator: std.mem.Allocator, dir_path: []const 
 }
 
 fn makeM6TempDir(allocator: std.mem.Allocator, tag: []const u8) ![]u8 {
-    const base_env = std.c.getenv("TMPDIR");
-    const root: []const u8 = if (base_env) |p| std.mem.span(p) else "/Volumes/Akari/.tmp";
+    const root = paths.tmpDir();
     const root_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{root}, 0);
     defer allocator.free(root_z);
     _ = std.c.mkdir(root_z.ptr, 0o755);
-    const dir = try std.fmt.allocPrint(allocator, "{s}/aminfer_m6_{s}_{d}", .{ root, tag, std.c.getpid() });
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_z = try paths.joinPathFmtZ(&dir_buf, root, "aminfer_m6_{s}_{d}", .{ tag, std.c.getpid() });
+    const dir = try allocator.dupe(u8, dir_z);
     errdefer allocator.free(dir);
-    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{dir}, 0);
-    defer allocator.free(dir_z);
     _ = std.c.mkdir(dir_z.ptr, 0o755);
     return dir;
 }
@@ -8169,6 +8169,7 @@ pub const M65Config = struct {
     c14_decode_steps: u32 = 16,
     c14_ngram_queries: u32 = 32,
     use_synthetic_ngram_packs: bool = false,
+    models_dir: ?[]const u8 = null,
 
     timeout_ms: u32 = 30_000,
 };
@@ -9585,15 +9586,17 @@ fn extractAngSampleKeys(path: [:0]const u8, out_keys: [][4]u32) usize {
 }
 
 fn runM65NgramBench(allocator: std.mem.Allocator, cfg: M65Config) !M65NgramReport {
-    const real_repo_path: [:0]const u8 = "/Volumes/Akari/models/amf/aminfer-repo.ang";
-    const real_docs_path: [:0]const u8 = "/Volumes/Akari/models/amf/aminfer-docs.ang";
+    var real_repo_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var real_docs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_repo_opt = try paths.resolveModelFileZ(cfg.models_dir, &real_repo_buf, "amf/aminfer-repo.ang");
+    const real_docs_opt = try paths.resolveModelFileZ(cfg.models_dir, &real_docs_buf, "amf/aminfer-docs.ang");
 
     var use_real = false;
-    if (!cfg.use_synthetic_ngram_packs) {
-        const fd1 = std.c.open(real_repo_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (!cfg.use_synthetic_ngram_packs and real_repo_opt != null and real_docs_opt != null) {
+        const fd1 = std.c.open(real_repo_opt.?.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd1 >= 0) {
             _ = std.c.close(fd1);
-            const fd2 = std.c.open(real_docs_path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+            const fd2 = std.c.open(real_docs_opt.?.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
             if (fd2 >= 0) {
                 _ = std.c.close(fd2);
                 use_real = true;
@@ -9617,7 +9620,7 @@ fn runM65NgramBench(allocator: std.mem.Allocator, cfg: M65Config) !M65NgramRepor
     var repo_key_cnt: usize = 0;
     var docs_key_cnt: usize = 0;
 
-    const repo_path: [:0]const u8 = if (use_real) real_repo_path else blk: {
+    const repo_path: [:0]const u8 = if (use_real) real_repo_opt.? else blk: {
         const td = try makeM6TempDir(allocator, "m65_ngram");
         tmp_dir_opt = td;
         const p_repo = try std.fmt.allocPrintSentinel(allocator, "{s}/repo.ang", .{td}, 0);
@@ -9655,7 +9658,7 @@ fn runM65NgramBench(allocator: std.mem.Allocator, cfg: M65Config) !M65NgramRepor
         docs_key_cnt = 32;
         break :blk p_repo;
     };
-    const docs_path: [:0]const u8 = if (use_real) real_docs_path else synth_docs_opt.?;
+    const docs_path: [:0]const u8 = if (use_real) real_docs_opt.? else synth_docs_opt.?;
 
     if (use_real) {
         repo_key_cnt = extractAngSampleKeys(repo_path, &repo_keys);
@@ -10203,7 +10206,7 @@ test "runM4WithConfig exercises Spike S3, Spike S6, A2, A1/G6 hybrid prefill, co
 
     var report = try runM4WithConfig(gpa, .{
         .s3 = .{
-            .temp_dir = "/Volumes/Akari/.tmp",
+            .temp_dir = null,
             .file_bytes = 512 * 1024,
             .blob_sizes = &s3_blobs,
             .queue_depths = &s3_qds,
@@ -10254,7 +10257,7 @@ test "runM4WithConfig exercises Spike S3, Spike S6, A2, A1/G6 hybrid prefill, co
         .hybrid_num_experts = 8,
         .hybrid_top_k = 2,
         .hybrid_timed_iters = 1,
-        .cold_temp_dir = "/Volumes/Akari/.tmp",
+        .cold_temp_dir = null,
         .cold_gen_tokens = 4,
         .d4_gen_tokens = 4,
     });
@@ -10359,7 +10362,7 @@ test "runM5WithConfig exercises G13 q2/hetero-MoE, C6 F_NOCACHE ngram, D8 PEARL 
         .hetero_moe_warmup_batches = 1,
         .hetero_moe_timed_batches = 2,
         .hetero_moe_dispatches_per_batch = 2,
-        .ngram_temp_dir = "/Volumes/Akari/.tmp",
+        .ngram_temp_dir = null,
         .ngram_buckets = 16,
         .ngram_entries_per_bucket = 2,
         .ngram_cache_pages = 4,
@@ -10604,9 +10607,11 @@ test "runM65WithConfig exercises G14 vision, R5 q8 KV, R8 PrefixCache+GDN clone,
 // ===========================================================================
 
 pub const M68Config = struct {
-    /// Use real local `/Volumes/Akari/models/amf/*.amf` checkpoints when present.
+    /// Use real local `<models_dir>/amf/*.amf` checkpoints when present
+    /// (resolved via `--models-dir` or `AMINFER_MODELS_DIR`).
     /// Unit tests set `false` for fast synthetic execution.
     use_real_checkpoints: bool = true,
+    models_dir: ?[]const u8 = null,
     /// Prompt lengths for small `0.6B` checkpoints (`512` and `2048` by default).
     small_prompt_short: u32 = 512,
     small_prompt_long: u32 = 2048,
@@ -11500,10 +11505,15 @@ fn runM68QosPass(
 }
 
 fn runM68C15Bench(allocator: std.mem.Allocator, cfg: M68Config) !M68C15Report {
-    const real_amf: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-0.6b-gsq-rco.amf";
-    const real_cfg: [:0]const u8 = "/Volumes/Akari/models/Qwen3-0.6B/config.json";
-    const real_tok: [:0]const u8 = "/Volumes/Akari/models/Qwen3-0.6B/tokenizer.json";
-    const use_real = cfg.use_real_checkpoints and posixFileExists(real_amf) and posixFileExists(real_cfg) and posixFileExists(real_tok);
+    var real_amf_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var real_cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var real_tok_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_amf_opt = try paths.resolveModelFileZ(cfg.models_dir, &real_amf_buf, "amf/qwen3-0.6b-gsq-rco.amf");
+    const real_cfg_opt = try paths.resolveModelFileZ(cfg.models_dir, &real_cfg_buf, "Qwen3-0.6B/config.json");
+    const real_tok_opt = try paths.resolveModelFileZ(cfg.models_dir, &real_tok_buf, "Qwen3-0.6B/tokenizer.json");
+    const use_real = cfg.use_real_checkpoints and
+        real_amf_opt != null and real_cfg_opt != null and real_tok_opt != null and
+        posixFileExists(real_amf_opt.?) and posixFileExists(real_cfg_opt.?) and posixFileExists(real_tok_opt.?);
 
     var tmp_dir_opt: ?[]u8 = null;
     defer if (tmp_dir_opt) |td| {
@@ -11514,12 +11524,12 @@ fn runM68C15Bench(allocator: std.mem.Allocator, cfg: M68Config) !M68C15Report {
     defer if (synth_path_opt) |p| allocator.free(p);
 
     var mcfg: qwen3.ModelConfig = undefined;
-    var amf_path: [:0]const u8 = real_amf;
+    var amf_path: [:0]const u8 = if (use_real) real_amf_opt.? else undefined;
     const bg_tokens: u32 = if (use_real) cfg.qos_bg_prefill_tokens else 512;
     const chunk_toks: u32 = if (use_real) 512 else 64;
 
     if (use_real) {
-        const cfg_bytes = try readPosixFileAlloc(allocator, real_cfg, 4 * 1024 * 1024);
+        const cfg_bytes = try readPosixFileAlloc(allocator, real_cfg_opt.?, 4 * 1024 * 1024);
         defer allocator.free(cfg_bytes);
         mcfg = try qwen3.ModelConfig.fromJson(allocator, cfg_bytes);
     } else {
@@ -11571,7 +11581,7 @@ fn runM68C15Bench(allocator: std.mem.Allocator, cfg: M68Config) !M68C15Report {
     var boundary_pos: u32 = 0;
 
     if (use_real) {
-        const tok_bytes = try readPosixFileAlloc(allocator, real_tok, 64 * 1024 * 1024);
+        const tok_bytes = try readPosixFileAlloc(allocator, real_tok_opt.?, 64 * 1024 * 1024);
         defer allocator.free(tok_bytes);
         var tok = try tokenizer.Tokenizer.fromHuggingFaceJson(allocator, tok_bytes);
         defer tok.deinit(allocator);
@@ -11873,62 +11883,74 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
     var row_14b: M68PrefillRow = .{};
     var row_30b: M68PrefillRow = .{};
 
-    const p06_bf16: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf";
-    const p06_gsq: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-0.6b-gsq-rco.amf";
-    const c06: [:0]const u8 = "/Volumes/Akari/models/Qwen3-0.6B/config.json";
-    const p14: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-14b-4bit.amf";
-    const c14: [:0]const u8 = "/Volumes/Akari/models/Qwen3-14B-4bit/config.json";
-    const p30: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-30b-a3b-gsq-rco.amf";
-    const c30: [:0]const u8 = "/Volumes/Akari/models/Qwen3-30B-A3B-3bit/config.json";
-    const t30: [:0]const u8 = "/Volumes/Akari/models/Qwen3-30B-A3B-3bit/tokenizer.json";
-    const h30: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-30b-a3b-heat.json";
-    const pe3: [:0]const u8 = "/Volumes/Akari/models/amf/qwen3-30b-a3b-eagle3.amf";
-    const ce3: [:0]const u8 = "/Volumes/Akari/models/Qwen3-30B-A3B-Eagle3/config.json";
+    const models_root_opt = if (cfg.use_real_checkpoints) paths.resolveModelsDir(cfg.models_dir) else null;
+    var p_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var c_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var p30_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var c30_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var t30_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var h30_buf: [std.fs.max_path_bytes]u8 = undefined;
 
-    if (cfg.use_real_checkpoints and posixFileExists(p06_bf16) and posixFileExists(c06)) {
-        const cb = try readPosixFileAlloc(allocator, c06, 4 * 1024 * 1024);
-        defer allocator.free(cb);
-        const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
-        var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(allocator, "qwen3-0.6b-bf16", "qwen3-0.6b-bf16", p06_bf16, mcfg, true, cfg.small_prompt_short, cfg.small_prompt_long, &pair, &infer_swap_acc, &infer_page_acc, null);
-        for (0..n) |i| {
-            rows[row_cnt] = pair[i];
-            row_cnt += 1;
-        }
-    }
-    if (cfg.use_real_checkpoints and posixFileExists(p06_gsq) and posixFileExists(c06)) {
-        const cb = try readPosixFileAlloc(allocator, c06, 4 * 1024 * 1024);
-        defer allocator.free(cb);
-        const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
-        var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(allocator, "qwen3-0.6b-gsq-rco", "qwen3-0.6b-gsq-rco", p06_gsq, mcfg, true, cfg.small_prompt_short, cfg.small_prompt_long, &pair, &infer_swap_acc, &infer_page_acc, null);
-        for (0..n) |i| {
-            rows[row_cnt] = pair[i];
-            row_cnt += 1;
+    if (models_root_opt) |models_root| {
+        const c06 = try paths.joinPathZ(&c_buf, models_root, "Qwen3-0.6B/config.json");
+        if (posixFileExists(c06)) {
+            const p06_bf16 = try paths.joinPathZ(&p_buf, models_root, "amf/qwen3-0.6b-bf16.amf");
+            if (posixFileExists(p06_bf16)) {
+                const cb = try readPosixFileAlloc(allocator, c06, 4 * 1024 * 1024);
+                defer allocator.free(cb);
+                const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
+                var pair: [2]M68PrefillRow = @splat(.{});
+                const n = try benchQwen3PrefillPair(allocator, "qwen3-0.6b-bf16", "qwen3-0.6b-bf16", p06_bf16, mcfg, true, cfg.small_prompt_short, cfg.small_prompt_long, &pair, &infer_swap_acc, &infer_page_acc, null);
+                for (0..n) |i| {
+                    rows[row_cnt] = pair[i];
+                    row_cnt += 1;
+                }
+            }
+            const p06_gsq = try paths.joinPathZ(&p_buf, models_root, "amf/qwen3-0.6b-gsq-rco.amf");
+            if (posixFileExists(p06_gsq)) {
+                const cb = try readPosixFileAlloc(allocator, c06, 4 * 1024 * 1024);
+                defer allocator.free(cb);
+                const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
+                var pair: [2]M68PrefillRow = @splat(.{});
+                const n = try benchQwen3PrefillPair(allocator, "qwen3-0.6b-gsq-rco", "qwen3-0.6b-gsq-rco", p06_gsq, mcfg, true, cfg.small_prompt_short, cfg.small_prompt_long, &pair, &infer_swap_acc, &infer_page_acc, null);
+                for (0..n) |i| {
+                    rows[row_cnt] = pair[i];
+                    row_cnt += 1;
+                }
+            }
         }
     }
     var cfg_30b_opt: ?qwen3.ModelConfig = null;
-    if (cfg.use_real_checkpoints and posixFileExists(p30) and posixFileExists(c30)) {
-        const cb = try readPosixFileAlloc(allocator, c30, 4 * 1024 * 1024);
-        defer allocator.free(cb);
-        const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
-        cfg_30b_opt = mcfg;
-        var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(
-            allocator,
-            "qwen3-30b-a3b-gsq",
-            null,
-            p30,
-            mcfg,
-            true,
-            cfg.large_prompt_tokens,
-            null,
-            &pair,
-            &infer_swap_acc,
-            &infer_page_acc,
-            h30,
-        );
-        if (n > 0) row_30b = pair[0];
+    var p30_opt: ?[:0]const u8 = null;
+    var h30_opt: ?[:0]const u8 = null;
+    if (models_root_opt) |models_root| {
+        const p30 = try paths.joinPathZ(&p30_buf, models_root, "amf/qwen3-30b-a3b-gsq-rco.amf");
+        const c30 = try paths.joinPathZ(&c30_buf, models_root, "Qwen3-30B-A3B-3bit/config.json");
+        const h30 = try paths.joinPathZ(&h30_buf, models_root, "amf/qwen3-30b-a3b-heat.json");
+        if (posixFileExists(p30) and posixFileExists(c30)) {
+            p30_opt = p30;
+            h30_opt = h30;
+            const cb = try readPosixFileAlloc(allocator, c30, 4 * 1024 * 1024);
+            defer allocator.free(cb);
+            const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
+            cfg_30b_opt = mcfg;
+            var pair: [2]M68PrefillRow = @splat(.{});
+            const n = try benchQwen3PrefillPair(
+                allocator,
+                "qwen3-30b-a3b-gsq",
+                null,
+                p30,
+                mcfg,
+                true,
+                cfg.large_prompt_tokens,
+                null,
+                &pair,
+                &infer_swap_acc,
+                &infer_page_acc,
+                h30,
+            );
+            if (n > 0) row_30b = pair[0];
+        }
     }
 
     // Synthetic `qwen4_exp` (`GDN + QSA + 512-expert MoE + LoopSchedule R=2`, `512` tokens).
@@ -11942,6 +11964,10 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
     // Run `30B + EAGLE-3` AFTER `30B` prefill A/B (`max_tree_nodes=64`) has released its wired pages,
     // sizing `cold_experts_per_layer` via R9 live zero-swap RAM so total wired RAM never triggers swap.
     if (cfg_30b_opt) |mcfg| {
+        const models_root = models_root_opt.?;
+        const pe3 = try paths.joinPathZ(&p_buf, models_root, "amf/qwen3-30b-a3b-eagle3.amf");
+        const ce3 = try paths.joinPathZ(&c_buf, models_root, "Qwen3-30B-A3B-Eagle3/config.json");
+        const t30 = try paths.joinPathZ(&t30_buf, models_root, "Qwen3-30B-A3B-3bit/tokenizer.json");
         if (posixFileExists(pe3) and posixFileExists(ce3) and posixFileExists(t30)) {
             const ecb = try readPosixFileAlloc(allocator, ce3, 4 * 1024 * 1024);
             defer allocator.free(ecb);
@@ -11949,12 +11975,12 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
             ecfg.format = .eagle3;
             eagle3_rep = try benchRealEagle3WideSpec(
                 allocator,
-                p30,
+                p30_opt.?,
                 mcfg,
                 pe3,
                 ecfg,
                 t30,
-                h30,
+                h30_opt.?,
                 cfg.large_prompt_tokens,
                 cfg.eagle3_gen_tokens,
                 r9.live_reclaimable_mib,
@@ -11973,13 +11999,17 @@ pub fn runM68WithConfig(allocator: std.mem.Allocator, cfg: M68Config) !M68Report
     infer_page_acc += vmstat.Snapshot.pageoutDelta(c15_b, c15_a);
 
     // Run `14B-4bit` (`8.2 GiB`) after `C15` so `30B+EAGLE-3` pages have fully returned to free pool.
-    if (cfg.use_real_checkpoints and posixFileExists(p14) and posixFileExists(c14)) {
-        const cb = try readPosixFileAlloc(allocator, c14, 4 * 1024 * 1024);
-        defer allocator.free(cb);
-        const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
-        var pair: [2]M68PrefillRow = @splat(.{});
-        const n = try benchQwen3PrefillPair(allocator, "qwen3-14b-4bit", null, p14, mcfg, true, cfg.large_prompt_tokens, null, &pair, &infer_swap_acc, &infer_page_acc, null);
-        if (n > 0) row_14b = pair[0];
+    if (models_root_opt) |models_root| {
+        const p14 = try paths.joinPathZ(&p_buf, models_root, "amf/qwen3-14b-4bit.amf");
+        const c14 = try paths.joinPathZ(&c_buf, models_root, "Qwen3-14B-4bit/config.json");
+        if (posixFileExists(p14) and posixFileExists(c14)) {
+            const cb = try readPosixFileAlloc(allocator, c14, 4 * 1024 * 1024);
+            defer allocator.free(cb);
+            const mcfg = try qwen3.ModelConfig.fromJson(allocator, cb);
+            var pair: [2]M68PrefillRow = @splat(.{});
+            const n = try benchQwen3PrefillPair(allocator, "qwen3-14b-4bit", null, p14, mcfg, true, cfg.large_prompt_tokens, null, &pair, &infer_swap_acc, &infer_page_acc, null);
+            if (n > 0) row_14b = pair[0];
+        }
     }
 
     if (row_14b.present and row_cnt < rows.len) {
@@ -14354,6 +14384,7 @@ pub const M75Config = struct {
     disk_prefix_kv_bytes: usize = 256 * 1024,
     sdk_create_destroy_iters: u32 = 4,
     skip_real_checkpoints: bool = false,
+    models_dir: ?[]const u8 = null,
 };
 
 pub const M75CheckpointCheck = struct {
@@ -15211,21 +15242,25 @@ pub fn runM75WithConfig(allocator: std.mem.Allocator, cfg: M75Config) !M75Report
     else
         0;
 
-    // Optional real checkpoint checks (`/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf` & `qwen3-14b-4bit.amf`)
+    // Optional real checkpoint checks (`<models_dir>/amf/qwen3-0.6b-bf16.amf` & `qwen3-14b-4bit.amf`)
     var q06b: M75CheckpointCheck = .{ .present = false, .executed = false, .status = "skipped_in_unit_test" };
     var q14b: M75CheckpointCheck = .{ .present = false, .executed = false, .status = "skipped_in_unit_test" };
     if (!cfg.skip_real_checkpoints) {
-        // Release synthetic `model` and `ref_model` arenas before loading multi-GB real checkpoints!
-        q06b = runOptionalRealCheckpointM75(
-            allocator,
-            "/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf",
-            "/Volumes/Akari/models/Qwen3-0.6B/config.json",
-        );
-        q14b = runOptionalRealCheckpointM75(
-            allocator,
-            "/Volumes/Akari/models/amf/qwen3-14b-4bit.amf",
-            "/Volumes/Akari/models/Qwen3-14B-4bit/config.json",
-        );
+        var amf06_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var cfg06_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var amf14_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var cfg14_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (try paths.resolveModelFileZ(cfg.models_dir, &amf06_buf, "amf/qwen3-0.6b-bf16.amf")) |amf06| {
+            const cfg06 = (try paths.resolveModelFileZ(cfg.models_dir, &cfg06_buf, "Qwen3-0.6B/config.json")).?;
+            const amf14 = (try paths.resolveModelFileZ(cfg.models_dir, &amf14_buf, "amf/qwen3-14b-4bit.amf")).?;
+            const cfg14 = (try paths.resolveModelFileZ(cfg.models_dir, &cfg14_buf, "Qwen3-14B-4bit/config.json")).?;
+            // Release synthetic `model` and `ref_model` arenas before loading multi-GB real checkpoints!
+            q06b = runOptionalRealCheckpointM75(allocator, amf06, cfg06);
+            q14b = runOptionalRealCheckpointM75(allocator, amf14, cfg14);
+        } else {
+            q06b = .{ .present = false, .executed = false, .status = "absent" };
+            q14b = .{ .present = false, .executed = false, .status = "absent" };
+        }
     }
 
     const vm_after = try vmstat.Snapshot.capture();
@@ -15346,6 +15381,7 @@ pub const M78Config = struct {
     g21_iters: u32 = 16,
     bus_bandwidth_gbs_override: ?f64 = null,
     skip_real_checkpoints: bool = false,
+    models_dir: ?[]const u8 = null,
 };
 
 pub const M78CheckpointAB = struct {
@@ -16748,21 +16784,29 @@ pub fn runM78WithConfig(allocator: std.mem.Allocator, cfg: M78Config) !M78Report
     report.qwen3_14b = .{ .present = false, .executed = false, .status = "skipped" };
     report.qwen3_30b = .{ .present = false, .executed = false, .status = "skipped" };
     if (!cfg.skip_real_checkpoints) {
-        report.qwen3_06b = runOptionalRealCheckpointM78G18(
-            allocator,
-            "/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf",
-            "/Volumes/Akari/models/Qwen3-0.6B/config.json",
-        );
-        report.qwen3_14b = runOptionalRealCheckpointM78G18(
-            allocator,
-            "/Volumes/Akari/models/amf/qwen3-14b-4bit.amf",
-            "/Volumes/Akari/models/Qwen3-14B-4bit/config.json",
-        );
-        report.qwen3_30b = runOptionalRealCheckpointM78G18(
-            allocator,
-            "/Volumes/Akari/models/amf/qwen3-30b-a3b-3bit.amf",
-            "/Volumes/Akari/models/Qwen3-30B-A3B-3bit/config.json",
-        );
+        var amf_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (paths.resolveModelsDir(cfg.models_dir)) |models_root| {
+            report.qwen3_06b = runOptionalRealCheckpointM78G18(
+                allocator,
+                try paths.joinPathZ(&amf_buf, models_root, "amf/qwen3-0.6b-bf16.amf"),
+                try paths.joinPathZ(&cfg_buf, models_root, "Qwen3-0.6B/config.json"),
+            );
+            report.qwen3_14b = runOptionalRealCheckpointM78G18(
+                allocator,
+                try paths.joinPathZ(&amf_buf, models_root, "amf/qwen3-14b-4bit.amf"),
+                try paths.joinPathZ(&cfg_buf, models_root, "Qwen3-14B-4bit/config.json"),
+            );
+            report.qwen3_30b = runOptionalRealCheckpointM78G18(
+                allocator,
+                try paths.joinPathZ(&amf_buf, models_root, "amf/qwen3-30b-a3b-3bit.amf"),
+                try paths.joinPathZ(&cfg_buf, models_root, "Qwen3-30B-A3B-3bit/config.json"),
+            );
+        } else {
+            report.qwen3_06b = .{ .present = false, .executed = false, .status = "absent" };
+            report.qwen3_14b = .{ .present = false, .executed = false, .status = "absent" };
+            report.qwen3_30b = .{ .present = false, .executed = false, .status = "absent" };
+        }
     }
 
     report.vm_before = vm_before;

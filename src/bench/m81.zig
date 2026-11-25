@@ -13,6 +13,7 @@ const budget_mod = @import("../mem/budget.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const chip_profile_mod = @import("../platform/chip_profile.zig");
 const vmstat = @import("../platform/vmstat.zig");
+const paths = @import("../platform/paths.zig");
 const quant = @import("../quant/spec.zig");
 const amf = @import("../format/amf.zig");
 const dequant = @import("../gpu/dequant.zig");
@@ -1475,6 +1476,7 @@ pub const M81Config = struct {
     quality_steps: u32 = 8,
     skip_real_checkpoints: bool = false,
     bus_bandwidth_gbs_override: ?f64 = null,
+    models_dir: ?[]const u8 = null,
 };
 
 pub const G23GemvRow = struct {
@@ -2435,46 +2437,116 @@ fn connectLoopback(port: u16) !std.c.fd_t {
     return fd;
 }
 
+fn readOptionalMetaTokenizerAlloc(
+    allocator: std.mem.Allocator,
+    models_dir_override: ?[]const u8,
+    subpath: []const u8,
+    max_bytes: usize,
+) !?[]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = (try paths.resolveMetadataFileZ(models_dir_override, &path_buf, subpath)) orelse return null;
+    return readSmallFileAlloc(allocator, path, max_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+}
+
+fn appendJsonStringM81(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(allocator, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, ch),
+        }
+    }
+    try out.append(allocator, '"');
+}
+
+fn buildInlineByteLevelTokenizerJsonAlloc(
+    allocator: std.mem.Allocator,
+    dialect: chat_template_mod.Dialect,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"model\":{\"type\":\"BPE\",");
+    if (dialect == .inkling2) {
+        try out.appendSlice(allocator, "\"ignore_merges\":true,");
+    }
+    try out.appendSlice(allocator, "\"vocab\":{");
+    var bl_buf: [8]u8 = undefined;
+    for (0..256) |b| {
+        if (b > 0) try out.append(allocator, ',');
+        const bl = try tokenizer_mod.encodeByteLevelString(&.{@intCast(b)}, &bl_buf);
+        try appendJsonStringM81(allocator, &out, bl);
+        try out.print(allocator, ":{d}", .{b});
+    }
+    try out.appendSlice(allocator, ",\"th\":256,\"the\":257,\"quick\":258,\"brown\":259,\"fox\":260");
+    if (dialect == .inkling2) {
+        try out.appendSlice(
+            allocator,
+            ",\"<|message_user|>\":261,\"<|content_model_end_sampling|>\":262" ++
+                "},\"merges\":[\"t h\",\"th e\"]}," ++
+                "\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":[" ++
+                "{\"type\":\"Split\",\"pattern\":{\"Regex\":\"[^\\\\r\\\\n\\\\p{L}\\\\p{N}]?[\\\\p{Lu}\\\\p{Lt}\\\\p{Lm}\\\\p{Lo}\\\\p{M}]*[\\\\p{Ll}\\\\p{Lm}\\\\p{Lo}\\\\p{M}]+\"},\"behavior\":\"Isolated\"}," ++
+                "{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":false,\"use_regex\":false}]}," ++
+                "\"added_tokens\":[{\"id\":261,\"content\":\"<|message_user|>\",\"special\":true},{\"id\":262,\"content\":\"<|content_model_end_sampling|>\",\"special\":true}]}",
+        );
+    } else {
+        try out.appendSlice(
+            allocator,
+            ",\"<｜hy_start:opensource｜>\":261,\"<｜hy_end:opensource｜>\":262" ++
+                "},\"merges\":[\"t h\",\"th e\"]}," ++
+                "\"added_tokens\":[{\"id\":261,\"content\":\"<｜hy_start:opensource｜>\",\"special\":true},{\"id\":262,\"content\":\"<｜hy_end:opensource｜>\",\"special\":true}]}",
+        );
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn benchM81W24AndC18(allocator: std.mem.Allocator, cfg: M81Config, report: *M81Report) !void {
     // 1. Inkling 2 (`o200k` + `ignore_merges`) & Hy4 tokenizers (live metadata when present).
-    const ink_path: [:0]const u8 = "/Volumes/Akari/models/metadata/thinkingmachines__Inkling-2-Mini/tokenizer.json";
-    if (readSmallFileAlloc(allocator, ink_path, 48 * 1024 * 1024)) |bytes| {
+    if (try readOptionalMetaTokenizerAlloc(
+        allocator,
+        cfg.models_dir,
+        "thinkingmachines__Inkling-2-Mini/tokenizer.json",
+        48 * 1024 * 1024,
+    )) |bytes| {
         defer allocator.free(bytes);
         var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, bytes);
         defer tok.deinit(allocator);
         report.w24_inkling2_live = true;
         report.w24_inkling2_mbs = try benchTokenizerThroughput(allocator, &tok);
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            const inline_ink =
-                \\{"model":{"type":"BPE","ignore_merges":true,"vocab":{"a":0,"b":1,"c":2," ":3,"e":4,"t":5,"h":6,"i":7,"n":8,"o":9,"r":10,"s":11,"l":12,"d":13,"u":14,"m":15,"p":16,"f":17,"g":18,"y":19,"w":20,"k":21,"v":22,"x":23,"z":24,"q":25,"j":26,"0":27,"1":28,"2":29,"3":30,"4":31,"5":32,"6":33,"7":34,"8":35,"9":36,".":37,",":38,"!":39,":":40,"(":41,")":42,"_":43,"-":44,"/":45,"\n":46,"the":47,"quick":48,"brown":49,"fox":50,"<|message_user|>":51,"<|content_model_end_sampling|>":52},"merges":["t h","th e"]},"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+"},"behavior":"Isolated"},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},"added_tokens":[{"id":51,"content":"<|message_user|>","special":true},{"id":52,"content":"<|content_model_end_sampling|>","special":true}]}
-            ;
-            var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, inline_ink);
-            defer tok.deinit(allocator);
-            report.w24_inkling2_live = false;
-            report.w24_inkling2_mbs = try benchTokenizerThroughput(allocator, &tok);
-        },
+    } else {
+        const inline_ink = try buildInlineByteLevelTokenizerJsonAlloc(allocator, .inkling2);
+        defer allocator.free(inline_ink);
+        var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, inline_ink);
+        defer tok.deinit(allocator);
+        report.w24_inkling2_live = false;
+        report.w24_inkling2_mbs = try benchTokenizerThroughput(allocator, &tok);
     }
 
-    const hy4_path: [:0]const u8 = "/Volumes/Akari/models/metadata/tencent__Hy4-flash/tokenizer.json";
-    if (readSmallFileAlloc(allocator, hy4_path, 32 * 1024 * 1024)) |bytes| {
+    if (try readOptionalMetaTokenizerAlloc(
+        allocator,
+        cfg.models_dir,
+        "tencent__Hy4-flash/tokenizer.json",
+        32 * 1024 * 1024,
+    )) |bytes| {
         defer allocator.free(bytes);
         var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, bytes);
         defer tok.deinit(allocator);
         report.w24_hy4_live = true;
         report.w24_hy4_mbs = try benchTokenizerThroughput(allocator, &tok);
-    } else |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            const inline_hy4 =
-                \\{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2," ":3,"e":4,"t":5,"h":6,"i":7,"n":8,"o":9,"r":10,"s":11,"<｜hy_start:opensource｜>":12,"<｜hy_end:opensource｜>":13},"merges":["t h","th e"]},"added_tokens":[{"id":12,"content":"<｜hy_start:opensource｜>","special":true},{"id":13,"content":"<｜hy_end:opensource｜>","special":true}]}
-            ;
-            var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, inline_hy4);
-            defer tok.deinit(allocator);
-            report.w24_hy4_live = false;
-            report.w24_hy4_mbs = try benchTokenizerThroughput(allocator, &tok);
-        },
+    } else {
+        const inline_hy4 = try buildInlineByteLevelTokenizerJsonAlloc(allocator, .hy4);
+        defer allocator.free(inline_hy4);
+        var tok = try tokenizer_mod.Tokenizer.fromHuggingFaceJson(allocator, inline_hy4);
+        defer tok.deinit(allocator);
+        report.w24_hy4_live = false;
+        report.w24_hy4_mbs = try benchTokenizerThroughput(allocator, &tok);
     }
 
     // 2. Zero-alloc `ChatTemplate` render latency (`us`) across ChatML, Inkling 2, Hy4.
@@ -2594,11 +2666,16 @@ fn benchM81W24AndC18(allocator: std.mem.Allocator, cfg: M81Config, report: *M81R
     }
 
     // 4. W24 Quality Gate (synthetic multi-format sweep + optional real on-disk Qwen3-0.6B BF16 vs GSQ-RCO).
+    var qg_ref_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var qg_cand_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var qg_cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var qg_tok_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const use_real_qg = !cfg.skip_real_checkpoints and paths.resolveModelsDir(cfg.models_dir) != null;
     report.quality_gate = try runQualityGate(allocator, .{
-        .ref_amf_path = if (cfg.skip_real_checkpoints) null else "/Volumes/Akari/models/amf/qwen3-0.6b-bf16.amf",
-        .cand_amf_path = if (cfg.skip_real_checkpoints) null else "/Volumes/Akari/models/amf/qwen3-0.6b-gsq-rco.amf",
-        .config_path = if (cfg.skip_real_checkpoints) null else "/Volumes/Akari/models/Qwen3-0.6B/config.json",
-        .tokenizer_path = if (cfg.skip_real_checkpoints) null else "/Volumes/Akari/models/Qwen3-0.6B/tokenizer.json",
+        .ref_amf_path = if (use_real_qg) try paths.resolveModelFileZ(cfg.models_dir, &qg_ref_buf, "amf/qwen3-0.6b-bf16.amf") else null,
+        .cand_amf_path = if (use_real_qg) try paths.resolveModelFileZ(cfg.models_dir, &qg_cand_buf, "amf/qwen3-0.6b-gsq-rco.amf") else null,
+        .config_path = if (use_real_qg) try paths.resolveModelFileZ(cfg.models_dir, &qg_cfg_buf, "Qwen3-0.6B/config.json") else null,
+        .tokenizer_path = if (use_real_qg) try paths.resolveModelFileZ(cfg.models_dir, &qg_tok_buf, "Qwen3-0.6B/tokenizer.json") else null,
         .steps = cfg.quality_steps,
         .include_synthetic_sweep = true,
     });

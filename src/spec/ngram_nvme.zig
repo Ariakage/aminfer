@@ -15,6 +15,7 @@ const budget_mod = @import("../mem/budget.zig");
 const arena_mod = @import("../mem/arena.zig");
 const sysinfo = @import("../platform/sysinfo.zig");
 const vmstat = @import("../platform/vmstat.zig");
+const paths = @import("../platform/paths.zig");
 const aio = @import("../storage/aio.zig");
 const sam_mod = @import("sam.zig");
 
@@ -1912,7 +1913,8 @@ test "ANG v1 hashContext matches cross-language golden vectors" {
 
 test "NvmeNgramTable F_NOCACHE open, exact verification, 4->3->2 fallback, LRU cache, and async prefetch" {
     const gpa = std.testing.allocator;
-    const tmp_path: [:0]const u8 = "/Volumes/Akari/.tmp/aminfer-test-c6-ngram.ang";
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try paths.tmpPathFmtZ(&tmp_buf, "aminfer-test-c6-ngram-{d}.ang", .{std.c.getpid()});
     defer _ = std.c.unlink(tmp_path.ptr);
 
     const entries = [_]BuildEntry{
@@ -2021,7 +2023,8 @@ test "NvmeNgramTable F_NOCACHE open, exact verification, 4->3->2 fallback, LRU c
 
 test "NvmeNgramTable rejects corrupted header CRC and corrupted table CRC" {
     const gpa = std.testing.allocator;
-    const tmp_path: [:0]const u8 = "/Volumes/Akari/.tmp/aminfer-test-c6-corrupt.ang";
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try paths.tmpPathFmtZ(&tmp_buf, "aminfer-test-c6-corrupt-{d}.ang", .{std.c.getpid()});
     defer _ = std.c.unlink(tmp_path.ptr);
 
     const entries = [_]BuildEntry{
@@ -2077,14 +2080,7 @@ const TestMallocStatistics = extern struct {
 extern "c" fn malloc_zone_statistics(zone: ?*anyopaque, stats: *TestMallocStatistics) void;
 
 fn testTmpAngPath(buf: *[256]u8, name: []const u8) ![:0]const u8 {
-    const dir_slice: []const u8 = if (std.c.getenv("TMPDIR")) |raw|
-        std.mem.sliceTo(raw, 0)
-    else
-        "/Volumes/Akari/.tmp";
-    const trimmed = std.mem.trimEnd(u8, dir_slice, "/");
-    const s = try std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/{s}", .{ trimmed, name });
-    buf[s.len] = 0;
-    return buf[0..s.len :0];
+    return paths.tmpPathZ(buf, name);
 }
 
 test "DomainNgramRegistry multi-pack F_NOCACHE routing, default switching, async prefetch, and zero steady-state malloc" {
